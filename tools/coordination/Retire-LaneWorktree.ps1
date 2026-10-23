@@ -29,6 +29,7 @@
       kept     in-use                  (r7) the worktree root could not be renamed to <root>.retiring: some handle is open beneath it
       kept     cannot-determine        (r7) <root>.retiring already exists, or the rename failed for a reason other than a handle
       kept     remove-failed           (r7) the removal failed after a good rename: the root is renamed back and git repointed at it
+      kept     stranded-retiring       (r8) WorkDir is a <root>.retiring, or WorkDir is absent and its <root>.retiring could not be restored
       kept     dirty                  `git status --porcelain -uall` is non-empty
       kept     unpushed                HEAD has commits not on any remote
       kept     unmerged                HEAD is on a remote but not an ancestor of -MergeTarget
@@ -122,13 +123,30 @@
       removal, so nothing can step into it between the probe and the delete, and `git worktree remove` / `list` / `prune` agree
       with the disk at every moment), and the existing clean / quarantine / `git worktree remove` / retry steps run on the renamed
       path. Any outcome but `retired` renames the root BACK and repairs again, so a kept worktree is never left as .retiring;
-      the outcome is in disposition.renameRestore (state: not-renamed | restored | failed | gone, note). Only a rename-back that
-      itself fails leaves <root>.retiring behind (stderr: LEFT-RETIRING ...); while git still lists it, which it does unless `git worktree
-      remove` had already half-failed and deregistered it, the next sweep judges it under -Root like any other worktree. A leftover <root>.retiring from a crash between the rename and the repair is never overwritten (kept,
-      cannot-determine). -WhatIf never renames: its would-retire says renameProbe 'not-run: WhatIf' and means "retires unless the
-      rename finds a handle". RESIDUAL RISK, accepted: a handle opened in the moment between the rename and the rename-back is
-      refused by the rename-back, not prevented; one rename attempt per call (a transient scanner handle keeps the worktree for
-      this sweep, the next lane exit asks again).
+      the outcome is in disposition.renameRestore (state: not-renamed | restored | failed | gone | refused, note, attempts). A leftover
+      <root>.retiring from a crash between the rename and the repair is never overwritten (kept, cannot-determine). -WhatIf never
+      renames: its would-retire says renameProbe 'not-run: WhatIf' and means "retires unless the rename finds a handle". One rename-probe
+      attempt per call (a transient scanner handle keeps the worktree as in-use for this sweep; the next lane exit asks again).
+
+    RENAME BACK (r8, 2026-10-23, sol r2 blocker on PR #603; catalogue row: successful rename -> persistent late handle beneath .retiring
+      -> failed removal): a handle opened AFTER the rename (a scanner, the indexer) fails the removal, and git half-fails there (it deletes the
+      admin entry and the `.git` link, then stops with files left). The same handle then refused the ONE rename back, so <root>.retiring was
+      stranded, deregistered, for good. Now (Restore-LaneWorktreeRename):
+        a. the rename back is retried like the removal: only RemoveRetryablePattern failures, bounded by RestoreRetryBudgetMs (15 s) /
+           RestoreRetryMaxAttempts, counted in renameRestore.attempts. Once back, a registration git deleted is restored too: the admin entry
+           from a copy taken before the rename, the `.git` link, `git worktree repair`, then `git checkout-index -a`, which re-creates only
+           MISSING tracked files (never overwrites one), so the tree is again the clean, merged checkout the gate passed.
+        b. a RENAME RECORD (<git common dir>\mlv-retire-pending\<id>\: record.json + the admin copy) is written BEFORE the rename (no record,
+           no rename) and dropped once the tree is retired or restored. If a handle outlives (a) as well, the record stays (stderr:
+           LEFT-RETIRING ...) and the NEXT invocation restores the tree first, before any gate decision: the sweep for every record under
+           -Root (summary.strandedRestore) before it reads the worktree list, and Invoke-RetireLaneWorktree for an absent WorkDir whose
+           <WorkDir>.retiring exists (disposition.strandedRestore; record found via -RepoRoot or the tree's own `.git` link).
+           Refused, both paths left alone: the original path exists again (refused), or no record names the .retiring (not a rename this
+           tool made). A <root>.retiring is never a retirement candidate: as WorkDir it is kept (stranded-retiring), listed in the sweep it
+           is counted kept{stranded-retiring} and never gated. -WhatIf restores nothing (state 'not-run: WhatIf').
+      RESIDUAL RISK, accepted: a handle that outlives the rename-back budget leaves <root>.retiring (registered or not) until the next lane
+      exit's sweep, whose restore runs under the same budget; a record whose admin copy cannot be taken refuses the rename probe, so that
+      worktree is kept as cannot-determine.
       Get-CwdUnknownRefusal keeps its fail-closed default for its other caller (Remove-LaneBulkScratch.ps1, which has no rename
       to lean on); this function opts in with -DeferUnreadableCwd.
 
@@ -180,6 +198,12 @@ $script:RemoveRetryablePattern = 'Permission denied|Access is denied|Access to t
 $script:RemoveRetryBudgetMs = 15000
 $script:RemoveRetryDelayMs = 250
 $script:RemoveRetryMaxAttempts = 40
+# r8 (sol r2 blocker on PR #603): the rename BACK after a failed removal is retried the same way (same pattern, its own budget), and a
+# rename record under <git common dir>\mlv-retire-pending lets the next call or sweep restore a <root>.retiring this budget could not.
+$script:RestoreRetryBudgetMs = 15000
+$script:RestoreRetryDelayMs = 250
+$script:RestoreRetryMaxAttempts = 40
+$script:RetirePendingDirName = 'mlv-retire-pending'
 
 if (-not ('MlvProcCwd' -as [type])) {
     # Current directory of another process: Win32_Process does not expose it. Reads PEB->ProcessParameters->CurrentDirectory
@@ -647,6 +671,112 @@ function Repair-LaneWorktreePath {
     return $null
 }
 
+function New-RetirePendingRecord {
+    # r8: written BEFORE the rename probe renames anything; it is the proof that THIS tool renamed <root> to <root>.retiring. It also holds
+    # what a restore needs after `git worktree remove` half-fails (git deletes the admin entry and the `.git` link even when files stay):
+    # a copy of the admin entry and the `.git` link text. Returns { Dir; Record }; throws on any failure, leaving no partial record.
+    param([string]$CommonDir, [string]$Main, [string]$Original, [string]$Retiring, [string]$AdminDir)
+    $dir = Join-Path (Join-Path $CommonDir $script:RetirePendingDirName) ('{0}-{1}' -f (Split-Path $AdminDir -Leaf), (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ'))
+    try {
+        New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
+        Copy-Item -LiteralPath $AdminDir -Destination (Join-Path $dir 'admin') -Recurse -ErrorAction Stop
+        $rec = [ordered]@{
+            schema = 'mlv-app/retire-rename-record/v1'; original = $Original; retiring = $Retiring; main = $Main; adminDir = $AdminDir
+            gitLink = [IO.File]::ReadAllText((Join-Path $Original '.git')); utc = (Get-Date).ToUniversalTime().ToString('o')
+        }
+        [IO.File]::WriteAllText((Join-Path $dir 'record.json'), ($rec | ConvertTo-Json))
+    } catch { Remove-RetirePendingRecord $dir; throw }
+    return [pscustomobject]@{ Dir = $dir; Record = [pscustomobject]$rec }
+}
+
+function Remove-RetirePendingRecord {
+    # r8: drop a rename record once its rename is settled (retired or restored). Best effort: a record whose <root>.retiring is gone is only
+    # removed by the next sweep.
+    param([string]$Dir)
+    if ($Dir -and (Test-Path -LiteralPath $Dir)) { try { [IO.Directory]::Delete($Dir, $true) } catch { } }
+}
+
+function Get-RetirePendingRecords {
+    # r8: every rename record under <CommonDir>\mlv-retire-pending as { Dir; Record; Error } (Record = $null when record.json is unreadable).
+    param([string]$CommonDir)
+    $root = Join-Path $CommonDir $script:RetirePendingDirName
+    if (-not (Test-Path -LiteralPath $root)) { return @() }
+    @(Get-ChildItem -LiteralPath $root -Directory -ErrorAction Stop | Sort-Object Name | ForEach-Object {
+        $rec = $null; $err = $null
+        try { $rec = Get-Content -LiteralPath (Join-Path $_.FullName 'record.json') -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { $err = $_.Exception.Message }
+        [pscustomobject]@{ Dir = $_.FullName; Record = $rec; Error = $err }
+    })
+}
+
+function Restore-LaneWorktreeRename {
+    # r8 (sol r2 blocker on PR #603): put <root>.retiring back at <root>, from its rename record. Called by the retire call itself (its finally)
+    # and, for a rename an earlier call could not undo, by the next call or sweep before any gate decision. Never throws.
+    # state: restored | failed (the rename back kept failing; the record stays for the next try) | refused (<root> exists again; neither path
+    # is touched) | gone (<root>.retiring no longer exists; the record is dropped).
+    # The rename back is retried like the removal: only a failure matching RemoveRetryablePattern (a handle still open beneath it), bounded by
+    # RestoreRetryBudgetMs and RestoreRetryMaxAttempts. Once back, a registration a half-failed `git worktree remove` deleted is put back: the
+    # admin entry from the record's copy, the `.git` link, `git worktree repair`, then `git checkout-index -a`, which re-creates only tracked
+    # files that are MISSING and never overwrites one that exists, so the tree is again the clean, merged checkout the gate passed.
+    param([object]$Record, [string]$RecordDir)
+    $res = [ordered]@{ state = 'failed'; note = $null; attempts = 0 }
+    try {
+        $orig = [string]$Record.original; $ret = [string]$Record.retiring
+        if (-not (Test-Path -LiteralPath $ret)) { $res.state = 'gone'; $res.note = "$ret no longer exists"; Remove-RetirePendingRecord $RecordDir; return $res }
+        if (Test-Path -LiteralPath $orig) { $res.state = 'refused'; $res.note = "$orig exists again; $ret is not moved over it (both left as they are)"; return $res }
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while ($true) {
+            $res.attempts++
+            $e = Move-LaneWorktreeRoot -From $ret -To $orig
+            if (-not $e -or $e -notmatch $script:RemoveRetryablePattern) { break }
+            if ($sw.ElapsedMilliseconds -ge $script:RestoreRetryBudgetMs -or $res.attempts -ge $script:RestoreRetryMaxAttempts) { break }
+            Start-Sleep -Milliseconds $script:RestoreRetryDelayMs
+        }
+        if ($e) {
+            $res.note = "rename back to $orig failed after $($res.attempts) attempt(s) over $($sw.ElapsedMilliseconds) ms; budget $($script:RestoreRetryBudgetMs) ms ($e); the directory stays at $ret and the next call or the next sweep restores it first"
+            return $res
+        }
+        $notes = @(); $reRegistered = $false
+        $admin = [string]$Record.adminDir
+        if (-not (Test-Path -LiteralPath $admin)) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $admin -Parent) -ErrorAction Stop | Out-Null
+            Copy-Item -LiteralPath (Join-Path $RecordDir 'admin') -Destination $admin -Recurse -ErrorAction Stop
+            $notes += 'git admin entry restored from the pre-rename copy'; $reRegistered = $true
+        }
+        $link = Join-Path $orig '.git'
+        if (-not (Test-Path -LiteralPath $link)) { [IO.File]::WriteAllText($link, [string]$Record.gitLink); $notes += '.git link rewritten'; $reRegistered = $true }
+        $fix = Repair-LaneWorktreePath -Main ([string]$Record.main) -Path $orig
+        if ($fix) { $notes += "git repoint after the rename back: $fix" }
+        elseif ($reRegistered) {
+            & git.exe -c core.longpaths=true -C $orig checkout-index -a -q 2>$null | Out-Null
+            $st = @(& git.exe -c core.quotepath=false -C $orig status --porcelain 2>&1 | ForEach-Object { "$_" } | Where-Object { $_ })
+            $notes += $(if ($LASTEXITCODE) { 'status after the re-checkout failed: ' + ($st -join ' | ') }
+                        elseif ($st.Count) { "$($st.Count) path(s) still differ from HEAD after the re-checkout, first: $($st[0])" }
+                        else { 'missing tracked files re-checked-out; status clean' })
+        }
+        $res.state = 'restored'; $res.note = $(if ($notes.Count) { $notes -join '; ' } else { $null })
+        if (-not $fix) { Remove-RetirePendingRecord $RecordDir }
+    } catch { $res.state = 'failed'; $res.note = "cannot-determine: $($_.Exception.Message)" }
+    return $res
+}
+
+function Restore-StrandedRetiring {
+    # r8: <Original> is absent and <Original>.retiring exists. Restore it if a rename record of this repository names it; otherwise this tool
+    # did not rename it and nothing is touched (state refused). Records are looked up under the git common dir of -RepoRoot, else of the
+    # .retiring tree itself while it still has its `.git` link.
+    param([string]$Original, [string]$RepoRoot)
+    $ret = $Original + '.retiring'
+    $common = $null
+    foreach ($c in @($RepoRoot, $(if (Test-Path -LiteralPath (Join-Path $ret '.git')) { $ret }))) {
+        if (-not $c) { continue }
+        $o = @(& git.exe -C $c rev-parse --path-format=absolute --git-common-dir 2>$null)
+        if (-not $LASTEXITCODE -and $o.Count) { $common = ($o[0] -replace '/', '\'); break }
+    }
+    if (-not $common) { return [ordered]@{ state = 'refused'; note = "$ret exists but there is no repository to find its rename record in (pass -RepoRoot); not touched"; attempts = 0 } }
+    $hit = @(Get-RetirePendingRecords -CommonDir $common | Where-Object { $_.Record -and ([string]$_.Record.original).TrimEnd('\') -ieq $Original })
+    if (-not $hit.Count) { return [ordered]@{ state = 'refused'; note = "$ret exists but no rename record names it, so this tool did not rename it; not touched"; attempts = 0 } }
+    return Restore-LaneWorktreeRename -Record $hit[-1].Record -RecordDir $hit[-1].Dir
+}
+
 function Write-RefusedHolders {
     # One REFUSED line per holder pid, on stderr (stdout carries the caller's pipeline objects).
     param([string]$WorktreePath, [object[]]$Holders)
@@ -666,6 +796,8 @@ function Invoke-RetireLaneWorktree {
         # own snapshot, so a lone caller behaves exactly as before; the sweep passes one so N worktrees
         # cost one process scan instead of N.
         [object]$ProcessSnapshot = $null,
+        # r8: where to look for the rename record of a stranded <WorkDir>.retiring whose own `.git` link is gone (the sweep passes its -RepoRoot).
+        [string]$RepoRoot = '',
         [switch]$WhatIf
     )
     $d = [ordered]@{
@@ -679,7 +811,9 @@ function Invoke-RetireLaneWorktree {
         removeAttempts = 0; removeNotes = @()
         # r7 (RENAME PROBE): 'not-run' | 'not-run: WhatIf ...' | 'ok' | 'in-use: <why>'. renameRestore is a nested table on purpose: the finally
         # block fills it after a `return` has already copied the top-level fields (state: not-renamed | restored | failed | gone).
-        renameProbe = 'not-run'; renameRestore = [ordered]@{ state = 'not-renamed'; note = $null }
+        # r8: renameRestore.attempts counts the rename-back tries; strandedRestore is $null unless WorkDir was absent with a <WorkDir>.retiring
+        # left by an earlier call, which is restored (Restore-StrandedRetiring) before any gate decision.
+        renameProbe = 'not-run'; renameRestore = [ordered]@{ state = 'not-renamed'; note = $null; attempts = 0 }; strandedRestore = $null
         utc = (Get-Date).ToUniversalTime().ToString('o')
     }
     function Get-FsmonitorStepNote([object]$Result) {
@@ -707,9 +841,17 @@ function Invoke-RetireLaneWorktree {
         $o = & git.exe -C $C @A 2>&1
         [pscustomobject]@{ code = $LASTEXITCODE; out = @($o | ForEach-Object { "$_" }) }
     }
-    $wd = $null; $origWd = $null; $renamed = $false
+    $wd = $null; $origWd = $null; $renamed = $false; $rec = $null
     try {
-        if (-not (Test-Path -LiteralPath $WorkDir -PathType Container)) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: path absent'; return [pscustomobject]$d }
+        # r8: a <root>.retiring is a rename-probe leftover, never a retirement candidate; only its restore (below, or in the sweep) touches it.
+        if ($WorkDir -match '\.retiring[\\/]*$') { $d.reason = "stranded-retiring: $WorkDir is a rename-probe leftover, never a retirement candidate; it is restored to its own path when a rename record names it"; return [pscustomobject]$d }
+        if (-not (Test-Path -LiteralPath $WorkDir -PathType Container)) {
+            $full = [IO.Path]::GetFullPath(($WorkDir -replace '/', '\')).TrimEnd('\')
+            if (-not (Test-Path -LiteralPath ($full + '.retiring') -PathType Container)) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: path absent'; return [pscustomobject]$d }
+            $d.strandedRestore = if ($WhatIf) { [ordered]@{ state = 'not-run: WhatIf'; note = 'a real call restores it first'; attempts = 0 } }
+                                 else { Restore-StrandedRetiring -Original $full -RepoRoot $RepoRoot }
+            if ($d.strandedRestore.state -ne 'restored') { $d.reason = "stranded-retiring: $full.retiring $($d.strandedRestore.state): $($d.strandedRestore.note)"; return [pscustomobject]$d }
+        }
         $wd = (Resolve-Path -LiteralPath $WorkDir).Path.TrimEnd('\')
         $gd = Run-Git $wd @('rev-parse', '--path-format=absolute', '--git-dir')
         $cd = Run-Git $wd @('rev-parse', '--path-format=absolute', '--git-common-dir')
@@ -791,8 +933,12 @@ function Invoke-RetireLaneWorktree {
         $origWd = $wd
         $retiring = $wd + '.retiring'
         if (Test-Path -LiteralPath $retiring) { $d.reason = "cannot-determine: $retiring already exists (left by an earlier run); not overwritten"; return [pscustomobject]$d }
+        # r8: the rename record first, so a rename this call cannot undo is still restorable by the next call or sweep. No record, no rename.
+        try { $rec = New-RetirePendingRecord -CommonDir ($cd.out[0] -replace '/', '\') -Main $main -Original $wd -Retiring $retiring -AdminDir ($gd.out[0] -replace '/', '\') }
+        catch { $d.reason = "cannot-determine: the rename record could not be written ($($_.Exception.Message)); nothing renamed"; return [pscustomobject]$d }
         $mv = Move-LaneWorktreeRoot -From $wd -To $retiring
         if ($mv) {
+            Remove-RetirePendingRecord $rec.Dir
             $d.renameProbe = 'in-use: ' + $mv
             $d.reason = if ($mv -match $script:RemoveRetryablePattern) { "in-use: the worktree root cannot be renamed to $retiring, so a handle is open beneath it ($mv)" }
                         else { "cannot-determine: renaming the worktree root to $retiring failed ($mv)" }
@@ -874,27 +1020,22 @@ function Invoke-RetireLaneWorktree {
         }
         if (Test-Path -LiteralPath $wd) { $d.reason = 'remove-failed: the directory is still there after the removal'; return [pscustomobject]$d }
         $d.action = 'retired'; $d.reason = 'ok'; $d.renameRestore.state = 'retired'
+        if ($rec) { Remove-RetirePendingRecord $rec.Dir }
     } catch {
         $d.action = 'kept'; $d.reason = "cannot-determine: $($_.Exception.Message)"
     } finally {
         # r7: undo the rename probe's rename for every outcome but `retired` (the early `return`s above all pass through here). The rename
         # back comes first: the fsmonitor stop below, and the caller, address the worktree by its own path. Never throws.
+        # r8: Restore-LaneWorktreeRename retries the rename back within its own budget and re-registers a tree git half-removed; if the handle
+        # outlives that budget too, the rename record stays and the next call or sweep restores the tree before any gate decision.
         if ($renamed -and $d.action -ne 'retired') {
             $rs = $d.renameRestore
-            try {
-                if (-not (Test-Path -LiteralPath $wd)) { $rs.state = 'gone'; $rs.note = "$wd no longer exists" }
-                else {
-                    $back = Move-LaneWorktreeRoot -From $wd -To $origWd
-                    if ($back) {
-                        $rs.state = 'failed'; $rs.note = "rename back to $origWd failed ($back); the directory stays at $wd"
-                        try { [Console]::Error.WriteLine("LEFT-RETIRING worktree-rename-back path=$wd wanted=$origWd utc=$((Get-Date).ToUniversalTime().ToString('o')) why=$back") } catch { }
-                    } else {
-                        $wd = $origWd; $renamed = $false
-                        $fix = Repair-LaneWorktreePath -Main $main -Path $wd
-                        $rs.state = 'restored'; $rs.note = $(if ($fix) { "git repoint after the rename back: $fix" } else { $null })
-                    }
-                }
-            } catch { $rs.state = 'failed'; $rs.note = "cannot-determine: $($_.Exception.Message)" }
+            $back = Restore-LaneWorktreeRename -Record $rec.Record -RecordDir $rec.Dir
+            $rs.state = $back.state; $rs.note = $back.note; $rs.attempts = $back.attempts
+            if ($back.state -eq 'restored') { $wd = $origWd; $renamed = $false }
+            elseif ($back.state -eq 'failed') {
+                try { [Console]::Error.WriteLine("LEFT-RETIRING worktree-rename-back path=$wd wanted=$origWd attempts=$($back.attempts) utc=$((Get-Date).ToUniversalTime().ToString('o')) why=$($back.note)") } catch { }
+            }
         }
         # Every path that leaves the worktree standing (kept, would-retire) tries to leave no daemon in it; a retired worktree is gone. Best effort,
         # never throws, and not a guarantee: a failed stop is recorded in fsmonitorStop, and a daemon may still be running.
@@ -942,6 +1083,8 @@ function Invoke-SweepMergedLaneWorktrees {
         schema = 'mlv-app/merged-worktree-sweep/v1'; root = $Root; mergeTarget = $MergeTarget
         considered = 0; retired = @(); young = 0; kept = $kept; notReached = 0; error = $null
         examined = 0; stampWriteFailed = 0; elapsedMs = 0
+        # r8: one row { original; state; note; attempts } per rename record under -Root, settled before any candidate is judged.
+        strandedRestore = @()
         utc = (Get-Date).ToUniversalTime().ToString('o')
     }
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -971,6 +1114,20 @@ function Invoke-SweepMergedLaneWorktrees {
     try {
         $rootFull = Get-FullNoSlash $Root
         $excl = @($Exclude | Where-Object { $_ } | ForEach-Object { Get-FullNoSlash $_ })
+        # r8 RESTORE FIRST: a <root>.retiring an earlier call could not rename back (a handle outlived its budget) is put back at <root> before
+        # the worktree list is read, so it is judged at its own path in this same sweep. Only records this tool wrote, only under -Root, never
+        # an excluded path; a refused or failed restore leaves both paths as they are. -WhatIf renames nothing, so it only reports them.
+        $cdo = @(& git.exe -C $RepoRoot rev-parse --path-format=absolute --git-common-dir 2>$null)
+        if (-not $LASTEXITCODE -and $cdo.Count) {
+            foreach ($pr in @(Get-RetirePendingRecords -CommonDir ($cdo[0] -replace '/', '\'))) {
+                if ($null -eq $pr.Record) { $sum.strandedRestore += [pscustomobject]@{ original = $null; state = 'failed'; note = "unreadable rename record $($pr.Dir): $($pr.Error)"; attempts = 0 }; continue }
+                $po = Get-FullNoSlash ([string]$pr.Record.original)
+                if (-not $po.StartsWith($rootFull + '\', [StringComparison]::OrdinalIgnoreCase) -or @($excl | Where-Object { $_ -ieq $po }).Count) { continue }
+                $r = if ($WhatIf) { [ordered]@{ state = 'not-run: WhatIf'; note = 'a real sweep restores it first'; attempts = 0 } }
+                     else { Restore-LaneWorktreeRename -Record $pr.Record -RecordDir $pr.Dir }
+                $sum.strandedRestore += [pscustomobject]@{ original = $po; state = $r.state; note = $r.note; attempts = $r.attempts }
+            }
+        }
         $o = @(& git.exe -C $RepoRoot worktree list --porcelain 2>&1 | ForEach-Object { "$_" })
         if ($LASTEXITCODE -ne 0) { $sum.error = 'cannot-determine: worktree list: ' + ($o -join ' | '); $sum.elapsedMs = [int]$sw.ElapsedMilliseconds; return [pscustomobject]$sum }
 
@@ -995,6 +1152,8 @@ function Invoke-SweepMergedLaneWorktrees {
         for ($i = 0; $i -lt $cands.Count; $i++) {
             $wt = $cands[$i]
             if ($sw.Elapsed.TotalSeconds -ge $BudgetSeconds -or ($MaxExamine -gt 0 -and $sum.examined -ge $MaxExamine)) { $sum.notReached = $cands.Count - $i; break }
+            # r8: a listed <root>.retiring is one the restore above could not put back; it is never gated, so never removed.
+            if ($wt -match '\.retiring$') { Add-Kept "stranded-retiring: $wt"; continue }
 
             # YOUNG guard: `git worktree add` leaves a clean tree already at the merge target that
             # no process names yet; the SAFE gate alone would retire it before its lane starts.
@@ -1022,7 +1181,7 @@ function Invoke-SweepMergedLaneWorktrees {
                     $snap = try { Get-LaneProcessSnapshot } catch { $null }
                 }
                 $d = Invoke-RetireLaneWorktree -WorkDir $wt -MergeTarget $MergeTarget -QuarantineRoot $QuarantineRoot `
-                    -ProtectPath $ProtectPath -ProcessSnapshot $snap -WhatIf:$WhatIf
+                    -ProtectPath $ProtectPath -ProcessSnapshot $snap -RepoRoot $RepoRoot -WhatIf:$WhatIf
                 $action = $d.action
                 if ($d.action -in @('retired', 'would-retire')) { $retired.Add($wt) } else { Add-Kept $d.reason }
             } catch {

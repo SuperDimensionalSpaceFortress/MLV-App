@@ -506,14 +506,15 @@ def _stop(p):
     p.wait(timeout=30)
 
 
-def _gate_real(workdir, *, whatif=True, prelude=""):
-    """Gate with the REAL process snapshot. Returns (disposition, stderr). `prelude` runs after the helper is dot-sourced."""
+def _gate_real(workdir, *, whatif=True, prelude="", extra=""):
+    """Gate with the REAL process snapshot. Returns (disposition, stderr). `prelude` runs after the helper is dot-sourced; `extra` is
+    appended to the Invoke-RetireLaneWorktree arguments."""
     quarantine = Path(workdir).parent / "q"
     script = (
         "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
         f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}{prelude} "
         f"Invoke-RetireLaneWorktree -WorkDir '{workdir}' -MergeTarget 'origin/master' -QuarantineRoot '{quarantine}'"
-        f"{' -WhatIf' if whatif else ''} | ConvertTo-Json -Depth 4"
+        f"{' -WhatIf' if whatif else ''}{extra} | ConvertTo-Json -Depth 4"
     )
     r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
                        check=True, capture_output=True, text=True)
@@ -637,8 +638,12 @@ def _spawn_file_handle_holder(path, ready, release, tmp, trigger=None):
     like a handle that outlives its process's visibility.
     r7 (rename probe): a handle open BEFORE the gate runs now keeps the worktree as in-use (the rename is refused), so the cases that
     exercise the removal RETRY need the handle to appear AFTER the rename. With `trigger` the child waits for that file, then opens
-    `path` (the renamed location) and writes `ready`; the caller does not wait for it (see _handle_appears_after_the_rename)."""
-    script = (("while (-not (Test-Path -LiteralPath $env:HOLD_TRIGGER)) { Start-Sleep -Milliseconds 20 }; " if trigger else "")
+    `path` (the renamed location) and writes `ready`; the caller does not wait for it (see _handle_appears_after_the_rename).
+    r4 (sol r2 hardening on PR #603): the wait for `trigger` is bounded (60 s) and also ends on `release`, so a retirement that returns
+    before the rename never leaves the child polling; callers clean up with _finish_holder, which kills a child that does not exit."""
+    script = (("$w = [Diagnostics.Stopwatch]::StartNew(); while (-not (Test-Path -LiteralPath $env:HOLD_TRIGGER)) { "
+               "if ((Test-Path -LiteralPath $env:HOLD_RELEASE) -or $w.Elapsed.TotalSeconds -ge 60) { exit 0 }; Start-Sleep -Milliseconds 20 }; "
+               if trigger else "")
               + "$f = [IO.File]::Open($env:HOLD_FILE, 'Open', 'Read', 'Read'); "
               "[IO.File]::WriteAllText($env:HOLD_READY, 'open'); "
               "$t = [Diagnostics.Stopwatch]::StartNew(); "
@@ -649,11 +654,26 @@ def _spawn_file_handle_holder(path, ready, release, tmp, trigger=None):
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if trigger:
         return p
-    deadline = datetime.datetime.now() + datetime.timedelta(seconds=60)
-    while not Path(ready).exists():
-        assert p.poll() is None and datetime.datetime.now() < deadline, "holder child did not open the file"
-        time.sleep(0.05)
+    try:
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=60)
+        while not Path(ready).exists():
+            assert p.poll() is None and datetime.datetime.now() < deadline, "holder child did not open the file"
+            time.sleep(0.05)
+    except BaseException:
+        _finish_holder(p, release)
+        raise
     return p
+
+
+def _finish_holder(p, release):
+    """Let a holder child go and reap it. A child still alive after 60 s is killed, so no case can leak a pwsh process."""
+    try:
+        Path(release).write_text("go")
+        p.wait(timeout=60)
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait(timeout=30)
 
 
 def _handle_appears_after_the_rename(trigger, ready):
@@ -693,28 +713,158 @@ def test_a_handle_that_outlives_the_holder_is_waited_out_and_the_worktree_is_rea
     try:
         d, _ = _gate_real(wt, whatif=False, prelude=_release_on_first_wait(release) + _handle_appears_after_the_rename(trigger, ready))
     finally:
-        release.write_text("go")
-        p.wait(timeout=60)
+        _finish_holder(p, release)
     assert (d["action"], d["reason"]) == ("retired", "ok"), d
     assert not wt.exists() and not _retiring_of(wt).exists(), "retired must mean the directory is gone"
     assert d["removeAttempts"] >= 2 and d["removeNotes"], d
 
 
-def test_a_handle_that_never_lets_go_ends_remove_failed_naming_the_attempts(repo):
+def _release_on_first_failed_rename_back(release):
+    """Prelude: wraps the rename seam. The first rename BACK that fails (the late handle still open) creates `release`, so the holder lets
+    go while the tool is still inside its rename-back budget. A tool that tries the rename back only once never sees it drop."""
+    return ("$origMoveBack = ${function:Move-LaneWorktreeRoot}; "
+            "function Move-LaneWorktreeRoot { param([string]$From, [string]$To) $e = & $origMoveBack -From $From -To $To; "
+            f"if ($e -and $From -like '*.retiring' -and -not (Test-Path -LiteralPath '{release}')) {{ [IO.File]::WriteAllText('{release}', 'go') }}; $e }}; ")
+
+
+def _assert_back_at_its_own_path(main, wt):
+    """The acceptance end state of a kept worktree after a rename probe: at its own path, registered there, usable, no .retiring."""
+    assert wt.exists() and (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be back at its own path"
+    assert not _retiring_of(wt).exists(), "no .retiring directory may be left behind"
+    paths = _worktree_paths(main)
+    assert _norm(wt) in paths and not any(p.endswith(".retiring") for p in paths), paths
+    st = subprocess.run([GIT, "-C", str(wt), "status", "--porcelain"], capture_output=True, text=True)
+    assert st.returncode == 0 and st.stdout.strip() == "", (st.returncode, st.stdout, st.stderr)
+    assert _pending_records(main) == [], "a settled rename leaves no rename record"
+
+
+def _pending_records(main):
+    root = Path(main) / ".git" / "mlv-retire-pending"
+    return sorted(os.listdir(root)) if root.exists() else []
+
+
+def _strand_with_a_late_handle(wt, tmp, restore_budget_ms):
+    """Rename ok -> a handle opens beneath <wt>.retiring and is still open through the removal budget AND the rename-back budget.
+    Returns (disposition, stderr, holder, release); the holder is still holding."""
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
+    try:
+        d, err = _gate_real(wt, whatif=False, prelude=ONLY_PYTEST_CHILDREN + "$script:RemoveRetryBudgetMs = 1500; $script:RemoveRetryDelayMs = 100; "
+                            f"$script:RestoreRetryBudgetMs = {restore_budget_ms}; $script:RestoreRetryDelayMs = 100; "
+                            + _handle_appears_after_the_rename(trigger, ready))
+    except BaseException:
+        _finish_holder(p, release)
+        raise
+    return d, err, p, release
+
+
+def test_a_late_handle_that_fails_the_removal_is_waited_out_by_the_rename_back(repo):
+    """NEW CATALOGUE ROW (sol r2 blocker on PR #603): successful rename -> persistent late handle beneath .retiring -> failed removal.
+    The handle outlives the whole removal budget, so the removal fails (git half-removes: deregistered, `.git` link gone, files left);
+    it lets go while the rename back is being retried. End state: kept / remove-failed, back at its own path, registered and clean."""
     tmp, main = repo
-    wt = _add_wt(main, tmp / "wt-stuck")
+    wt = _add_wt(main, tmp / "wt-late-restore")
     ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
     p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
     try:
         d, _ = _gate_real(wt, whatif=False, prelude=ONLY_PYTEST_CHILDREN + "$script:RemoveRetryBudgetMs = 1500; $script:RemoveRetryDelayMs = 100; "
-                          + _handle_appears_after_the_rename(trigger, ready))
+                          "$script:RestoreRetryBudgetMs = 15000; $script:RestoreRetryDelayMs = 300; "
+                          + _handle_appears_after_the_rename(trigger, ready) + _release_on_first_failed_rename_back(release))
     finally:
-        release.write_text("go")
-        p.wait(timeout=60)
+        _finish_holder(p, release)
     assert d["action"] == "kept" and d["reason"].startswith("remove-failed: "), d
     assert "attempt" in d["reason"] and d["removeAttempts"] >= 2, d
-    # the same open handle that failed the removal refuses the rename back: said loudly, never silently left as a lost directory
-    assert d["renameRestore"]["state"] == "failed" and "rename back" in d["renameRestore"]["note"], d
+    assert d["renameRestore"]["state"] == "restored" and d["renameRestore"]["attempts"] >= 2, d
+    assert "admin entry restored" in d["renameRestore"]["note"], d   # git had half-removed it; the registration is back too
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_a_handle_that_outlives_the_rename_back_budget_is_restored_first_by_the_next_sweep(repo):
+    """The same row, with a handle that outlives the rename-back budget too: this call cannot put it back, says so loudly, and leaves a
+    rename record; once the handle is gone the NEXT sweep restores <wt>.retiring to <wt> before any gate decision (registration and the
+    files git had deleted included), and only then judges the worktree at its own path."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-stuck")
+    d, err, p, release = _strand_with_a_late_handle(wt, tmp, restore_budget_ms=800)
+    _finish_holder(p, release)
+    assert d["action"] == "kept" and d["reason"].startswith("remove-failed: "), d
+    assert d["renameRestore"]["state"] == "failed" and d["renameRestore"]["attempts"] >= 2, d
+    assert "rename back" in d["renameRestore"]["note"] and "next sweep" in d["renameRestore"]["note"], d
+    assert "LEFT-RETIRING" in err, err
+    assert _retiring_of(wt).exists() and not wt.exists() and len(_pending_records(main)) == 1
+    # -WhatIf renames nothing, not even back: it only reports the stranded tree.
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"), WhatIf=True)
+    assert [r["state"] for r in s["strandedRestore"]] == ["not-run: WhatIf"] and _retiring_of(wt).exists(), s
+    # A real sweep with no gate budget at all: the restore is not budgeted by -BudgetSeconds, it runs before any candidate.
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"), BudgetSeconds=0)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and _norm(rows[0]["original"]) == _norm(wt) and rows[0]["state"] == "restored", s
+    assert "admin entry restored" in rows[0]["note"] and "status clean" in rows[0]["note"], rows   # git had half-removed it
+    assert s["retired"] == [] and s["notReached"] == 1, s
+    _assert_back_at_its_own_path(main, wt)
+    d, _ = _gate_real(wt, whatif=True)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d   # judged at its own path once restored: clean and merged
+
+
+def _strand_registered(main, wt):
+    """A cheap stranded state with git still registering the tree (at <wt>.retiring): a LOCKED worktree makes `git worktree remove` refuse
+    up front (nothing deleted), and a seam makes every rename back fail with a sharing violation."""
+    _git(main, "worktree", "lock", "--reason", "strand-test", str(wt))
+    prelude = ("$script:RestoreRetryBudgetMs = 300; $script:RestoreRetryDelayMs = 50; $origMoveSeam = ${function:Move-LaneWorktreeRoot}; "
+               "function Move-LaneWorktreeRoot { param([string]$From, [string]$To) if ($From -like '*.retiring') { "
+               "return 'The process cannot access the file because it is being used by another process. (seam)' }; & $origMoveSeam -From $From -To $To }; ")
+    d, _ = _gate_real(wt, whatif=False, prelude=prelude)
+    assert d["action"] == "kept" and d["reason"].startswith("remove-failed: "), d
+    assert d["renameRestore"]["state"] == "failed" and d["renameRestore"]["attempts"] >= 2, d
+    assert _retiring_of(wt).exists() and not wt.exists()
+    _git(main, "worktree", "unlock", str(_retiring_of(wt)))
+
+
+def test_the_next_call_for_a_stranded_worktree_restores_it_before_the_gate(repo):
+    """Per candidate: the next Invoke-RetireLaneWorktree for <wt> finds <wt>.retiring and its rename record, restores it first (receipt
+    field strandedRestore), and only then runs the gate on <wt>."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-strand-call")
+    _strand_registered(main, wt)
+    d, _ = _gate_real(wt, whatif=True)
+    assert d["strandedRestore"]["state"] == "not-run: WhatIf" and d["reason"].startswith("stranded-retiring: "), d
+    assert _retiring_of(wt).exists() and not wt.exists(), "-WhatIf renames nothing"
+    d, _ = _gate_real(wt, whatif=False)
+    assert d["strandedRestore"]["state"] == "restored", d
+    # restored first, then the whole gate ran on <wt> itself: rename probe, removal, nothing left under either name
+    assert (d["action"], d["reason"], d["renameProbe"]) == ("retired", "ok", "ok"), d
+    assert not wt.exists() and not _retiring_of(wt).exists()
+    assert not any(p.startswith(_norm(wt)) for p in _worktree_paths(main)) and _pending_records(main) == [], _worktree_paths(main)
+
+
+def test_a_stranded_retiring_whose_original_path_exists_again_is_refused_and_left_alone(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-strand-taken")
+    _strand_registered(main, wt)
+    wt.mkdir()
+    (wt / "newcomer.txt").write_text("someone else's", encoding="utf-8")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"))
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "refused" and "exists again" in rows[0]["note"], s
+    assert (wt / "newcomer.txt").read_text(encoding="utf-8") == "someone else's" and sorted(os.listdir(wt)) == ["newcomer.txt"]
+    assert (_retiring_of(wt) / ".git").exists() and (_retiring_of(wt) / "a.txt").exists(), "the .retiring tree must be untouched"
+    assert s["retired"] == [] and s["kept"] == {"stranded-retiring": 1}, s   # the listed .retiring entry is never gated
+
+
+def test_a_retiring_directory_this_tool_did_not_rename_is_never_restored_or_gated(repo):
+    tmp, main = repo
+    wt = tmp / "wt-strand-foreign"
+    _retiring_of(wt).mkdir()
+    (_retiring_of(wt) / "marker.txt").write_text("not ours", encoding="utf-8")
+    d, _ = _gate_real(wt, whatif=False, extra=f" -RepoRoot '{main}'")
+    assert d["action"] == "kept" and d["reason"].startswith("stranded-retiring: ") and "no rename record" in d["reason"], d
+    assert d["strandedRestore"]["state"] == "refused", d
+    assert not wt.exists() and (_retiring_of(wt) / "marker.txt").read_text(encoding="utf-8") == "not ours"
+    d2, _ = _gate_real(_retiring_of(wt), whatif=False)
+    assert d2["action"] == "kept" and d2["reason"].startswith("stranded-retiring: "), d2
+    assert (_retiring_of(wt) / "marker.txt").exists()
 
 
 # r2 (Sol r1 B1/B2): a holder that appears AFTER the first decision must stop the retry too. The retry window is where the worktree is
@@ -747,8 +897,7 @@ def test_an_unreadable_cwd_process_that_appears_during_the_retry_no_longer_stops
         d, err = _gate_real(wt, whatif=False, prelude=prelude)
     finally:
         _stop(late)
-        release.write_text("go")
-        p.wait(timeout=60)
+        _finish_holder(p, release)
     assert (d["action"], d["reason"]) == ("retired", "ok"), d
     assert any(u.startswith(f"{late.pid} ") for u in d["cwdUnknown"]), d   # named at the retry scan that saw it
     assert f"pid={late.pid}" not in err, err                               # but not a REFUSED line
@@ -772,8 +921,7 @@ def test_a_cwd_holder_that_appears_after_the_first_leftover_deletion_keeps_the_w
     try:
         d, err = _gate_real(wt, whatif=False, prelude=prelude)
     finally:
-        release.write_text("go")
-        p.wait(timeout=60)
+        _finish_holder(p, release)
     assert d["action"] == "kept" and d["reason"].startswith("live-process: 999990 late-holder.exe"), d
     assert "999990 late-holder.exe cwd" in d["holders"], d
     assert d["removeAttempts"] == 3, d   # stopped at the third attempt, before its deletion
