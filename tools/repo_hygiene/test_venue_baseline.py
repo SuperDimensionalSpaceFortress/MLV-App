@@ -47,7 +47,7 @@ LEG_IDS = ("m16-1243-look", "m16-1243-display-fullscreen-s1")
 EXIT = {"OK": 0, "USAGE": 2, "AGENT_BUSY": 20, "SHARE_UNREACHABLE": 21, "BUILD_NOT_STAGED": 22, "GATE_REFUSED": 23,
         "BASELINE_CAP_EXCEEDED": 24, "LEG_FAILED": 25, "SOURCE_COMMIT_UNRESOLVED": 26, "CHAIN_FAILED": 27, "FETCH_TIMEOUT": 28}
 
-# Invoke-VenueChain.ps1 stand-in. FAKE_CHAIN_MODE: ok | legfail | deadline | gate | noresult | sleep | ranfail | randeadline. It logs each call to FAKE_CHAIN_LOG and, for ok,
+# Invoke-VenueChain.ps1 stand-in. FAKE_CHAIN_MODE: ok | legfail | deadline | gate | noresult | sleep | ranfail | randeadline | emptyok (exit 0, every leg NOT_RUN). It logs each call to FAKE_CHAIN_LOG and, for ok,
 # writes a receipt per leg with the metrics the real receipt carries and prints CHAIN_RESULT= exactly as the real chain does. ranfail / randeadline: the FIRST leg RAN with a
 # readable receipt, then a later leg died (chain exit 7) / the deadline hit (chain exit 3): a documented exit that agrees with its CHAIN_RESULT.
 FAKE_CHAIN = r"""
@@ -75,8 +75,13 @@ $legs = foreach ($s in $specs) {
             New-Item -ItemType Directory -Force -Path $rd | Out-Null
             $rp = Join-Path $rd ("rcpt-$Backend-$n.json")
             $outc = $(if ($env:FAKE_RECEIPT_OUTCOME) { $env:FAKE_RECEIPT_OUTCOME } else { 'PASS' })
-            $rc = [ordered]@{ schema = 'mlv-app/dual-venue-receipt/v1'; receiptId = "rcpt-$Backend-$n"; legId = $legId; outcome = $outc
-                venue = [ordered]@{ name = $Venue; role = 'supplementary' }
+            # FAKE_RECEIPT_IDENTITY: stale | wrongid | wrongleg | wrongbuild | wrongvenue -- a receipt that is NOT the one this run's leg wrote (it still parses and carries figures)
+            $idm = $env:FAKE_RECEIPT_IDENTITY
+            $rc = [ordered]@{ schema = 'mlv-app/dual-venue-receipt/v1'; receiptId = $(if ($idm -ceq 'wrongid') { 'someone-elses-receipt' } else { "rcpt-$Backend-$n" })
+                legId = $(if ($idm -ceq 'wrongleg') { 'some-other-leg' } else { $legId }); outcome = $outc
+                startedUtc = $(if ($idm -ceq 'stale') { [DateTime]::UtcNow.AddDays(-1).ToString('o') } else { [DateTime]::UtcNow.ToString('o') })
+                subject = [ordered]@{ buildManifestSha256 = $(if ($idm -ceq 'wrongbuild') { 'e' * 64 } else { $BuildManifestSha256 }) }
+                venue = [ordered]@{ name = $(if ($idm -ceq 'wrongvenue') { 'bachelor' } else { $Venue }); role = 'supplementary' }
                 metrics = [ordered]@{ cpuFrames = 389; gpuFramesTotal = $(if ($Backend -eq 'cuda') { 600 } else { 0 }); skippedOrUnpresentedRatio = 0.35058430717863104; cpuPaceTimelineFps = $(if ($Backend -eq 'cpu') { 11.185 } else { $null })
                     presentMonTemporalMaxGapMs = 41.7; presentMonTemporalGapKind = 'positive-interval-rows'; presentMonStatus = 'ok'
                     presentMonStats = [ordered]@{ count = 12; meanMs = 16.7; p99Ms = 33.4; fpsEquivalentMean = $(if ($Backend -eq 'cuda') { 59.9 } else { $null }) } }
@@ -98,6 +103,7 @@ switch ($mode) {
     'legfail' { Emit $legs 7 $null }
     'ranfail' { Emit $legs 7 $null }
     'randeadline' { Emit $legs 3 'DEADLINE' }
+    'emptyok' { Emit $legs 0 $null }
     'deadline' { Emit $legs 3 'DEADLINE' }
     'gate' { Emit $legs 4 'GATE_UNREADABLE' }
     'noresult' { 'the chain died'; exit 0 }
@@ -117,6 +123,7 @@ switch ($env:FAKE_VALIDATOR_MODE) {
     'unknown' { '{"status":"SOMETHING_NEW","valid":true,"reasons":[]}' }
     'nosignal' { '{"status":"NO_SIGNAL","valid":true,"reasons":[]}' }
     'error' { exit 3 }
+    'hang' { Start-Sleep -Seconds 30; '{"status":"ADVISORY","valid":false,"reasons":[]}' }
     default { '{"status":"ADVISORY","valid":false,"reasons":["VENUE_ANCHOR_ABSENT"]}' }
 }
 """
@@ -418,7 +425,7 @@ class VenueBaselineTests(unittest.TestCase):
         # exit-0 chain, RAN legs, receipt outcome INVALID (the tracked writer rewrote a PASS/FAIL it refuses) with its metrics kept, and the read-side validator
         # returns NO_SIGNAL valid=true for any non-PASS/FAIL outcome (DualVenueRunner.psm1 Test-DvReceiptValid). NO_SIGNAL must not carry the refused run's figures.
         p = self.run_baseline(validator="nosignal", outcome="INVALID")
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)      # an unmeasured run still exits OK here: that is BASELINE-EXIT-NO-MEASUREMENT-1, not this fix
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)      # an unmeasured run still exits 0 (BASELINE-EXIT-NO-MEASUREMENT-1 owns that code), but its reason is NO_MEASUREMENT, never OK (test_i3_*)
         rows = self.trend_rows()
         self.assert_typed_no_figure_rows(rows, "RECEIPT_NO_SIGNAL", "INVALID")
         for r in rows:
@@ -620,6 +627,154 @@ class VenueBaselineTests(unittest.TestCase):
             time.sleep(0.5)
         self.assertFalse(pid_alive(pid), "the chain process outlived the cap")
         self.assertFalse(self.trend.exists())
+
+    # ---------------------------------------------------------------- UM-REGULAR-BASELINE-HARDENING-1 (Dot's #506 record: I1, I2, I3, F, nit)
+    def write_process_probe(self, verdict: str) -> Path:
+        probe = self.case / "fake-process-probe.ps1"
+        probe.write_text(f"param([int]$ProcessId, [string]$StartUtc = '')\n'{verdict}'\n", encoding="utf-8")
+        return probe
+
+    def run_with_env(self, args: list[str], timeout: int = 240, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=self.env(**env), stdin=subprocess.DEVNULL)
+
+    # I1: the CIM / counter / validator reads are bounded, and the output states what is not.
+    def test_i1_a_hub_load_sample_that_never_returns_is_bounded_and_recorded_as_unknown(self) -> None:
+        self.hub.write_text("Start-Sleep -Seconds 45\n", encoding="utf-8")      # both samples (start and end) would sleep 45 s if unbounded
+        t0 = time.monotonic()
+        p = self.run_baseline("-ProbeTimeoutSec", "2", timeout=200)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertLess(elapsed, 40, "the hub-load samples were not bounded by -ProbeTimeoutSec (the stub sleeps 45 s per sample)")
+        rows = self.trend_rows()
+        self.assertEqual(len(rows), 4, rows)
+        for r in rows:
+            for end in ("start", "end"):
+                self.assertEqual((r["hubLoad"][end]["commitGiB"], r["hubLoad"][end]["cpuPercent"]), (None, None), r["hubLoad"])      # unknown, never zero
+
+    def test_i1_a_validator_that_never_returns_is_bounded_and_the_row_is_typed(self) -> None:
+        t0 = time.monotonic()
+        p = self.run_baseline("-ProbeTimeoutSec", "2", validator="hang", timeout=300)      # 4 receipts x 30 s if unbounded
+        elapsed = time.monotonic() - t0
+        self.assertEqual(p.returncode, EXIT["LEG_FAILED"], p.stdout + p.stderr)
+        self.assertLess(elapsed, 75, "the receipt validator read was not bounded by -ProbeTimeoutSec")
+        self.assert_no_ran_row_and_no_figures(self.trend_rows(), 4)
+
+    def test_i1_the_wall_clock_promise_is_qualified_in_the_help_and_the_output(self) -> None:
+        self.assertIn("BASELINE_BOUND", BASELINE.read_text(encoding="utf-8"))
+        p = self.run_baseline()
+        self.assertTrue([l for l in p.stdout.splitlines() if l.startswith("BASELINE_BOUND ")], p.stdout)
+        self.assertIn("wallClockBound", self.result(p.stdout))
+
+    # I2: an attempted kill is not a confirmed termination.
+    def test_i2_a_killed_chain_reports_a_confirmed_termination_separately(self) -> None:
+        p = self.run_baseline("-MaxTotalSec", "10", "-KillGraceSec", "0", mode="sleep", timeout=120)
+        self.assertEqual(p.returncode, EXIT["BASELINE_CAP_EXCEEDED"], p.stdout + p.stderr)
+        chain = self.result(p.stdout)["chains"][0]
+        self.assertEqual((chain["killAttempted"], chain["terminationConfirmed"]), (True, True), chain)
+        self.assertIn("termination confirmed", p.stdout)
+
+    def test_i2_a_kill_that_cannot_be_confirmed_is_not_reported_as_a_termination(self) -> None:
+        probe = self.write_process_probe("ALIVE")
+        p = self.run_baseline("-MaxTotalSec", "10", "-KillGraceSec", "0", "-ProcessProbeScript", str(probe), mode="sleep", timeout=120)
+        self.assertEqual(p.returncode, EXIT["BASELINE_CAP_EXCEEDED"], p.stdout + p.stderr)      # the typed exit is unchanged
+        chain = self.result(p.stdout)["chains"][0]
+        self.assertEqual((chain["killAttempted"], chain["terminationConfirmed"]), (True, False), chain)
+        self.assertIn("termination NOT confirmed", p.stdout)
+        self.assertNotIn("termination confirmed", p.stdout)
+
+    def test_i2_a_chain_that_ends_on_its_own_reports_no_kill(self) -> None:
+        chain = self.result(self.run_baseline().stdout)["chains"][0]
+        self.assertEqual((chain["killAttempted"], chain["terminationConfirmed"]), (False, None), chain)
+
+    def test_i2_a_killed_fetch_reports_confirmed_and_unconfirmed_terminations(self) -> None:
+        fx = self.make_fetch_fixture(sleep_sec=120)
+        args = self.fetch_args(fx, "-MaxTotalSec", "10", "-KillGraceSec", "0")
+        p = subprocess.run(args, capture_output=True, text=True, timeout=120, env=self.fetch_env(fx), stdin=subprocess.DEVNULL)
+        self.assertEqual(p.returncode, EXIT["FETCH_TIMEOUT"], p.stdout + p.stderr)
+        self.assertIn("termination confirmed", p.stdout)
+        probe = self.write_process_probe("ALIVE")
+        p2 = subprocess.run(args + ["-ProcessProbeScript", str(probe)], capture_output=True, text=True, timeout=120, env=self.fetch_env(fx), stdin=subprocess.DEVNULL)
+        self.assertEqual(p2.returncode, EXIT["FETCH_TIMEOUT"], p2.stdout + p2.stderr)
+        self.assertIn("termination NOT confirmed", p2.stdout)
+
+    # I3: an all-unmeasured run never reports OK; the exit code stays 0 (BASELINE-EXIT-NO-MEASUREMENT-1 owns changing it).
+    def test_i3_an_all_unmeasured_run_never_reports_ok_and_keeps_exit_zero(self) -> None:
+        cases = {"writer-refused": dict(validator="nosignal", outcome="INVALID"), "no-signal-pass": dict(validator="nosignal"),
+                 "not-a-measurement": dict(validator="advisory", outcome="DEVICE_UNAVAILABLE"), "no-leg-ran": dict(mode="emptyok")}
+        for label, kw in cases.items():
+            with self.subTest(case=label):
+                self.trend.unlink(missing_ok=True)
+                p = self.run_baseline(**kw)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertNotIn("reason=OK", p.stdout)
+                self.assertIn("reason=NO_MEASUREMENT", p.stdout)
+                res = self.result(p.stdout)
+                self.assertEqual((res["exitCode"], res["reason"], res["measuredRows"]), (0, "NO_MEASUREMENT", 0), res)
+                self.assertEqual(self.result_file()["reason"], "NO_MEASUREMENT")
+
+    def test_i3_a_measured_run_still_reports_ok_with_its_measured_row_count(self) -> None:
+        p = self.run_baseline()
+        self.assertIn("reason=OK", p.stdout)
+        res = self.result(p.stdout)
+        self.assertEqual((res["reason"], res["rowsAppended"], res["measuredRows"]), ("OK", 4, 4), res)
+
+    # F: the receipt read must be the one this run's leg wrote.
+    def test_f_a_receipt_that_is_not_the_one_this_run_wrote_yields_no_figures(self) -> None:
+        for ident in ("stale", "wrongid", "wrongleg", "wrongbuild", "wrongvenue"):
+            with self.subTest(identity=ident):
+                self.trend.unlink(missing_ok=True)
+                self.validator_log.unlink(missing_ok=True)
+                p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_RECEIPT_IDENTITY=ident)
+                self.assertEqual(p.returncode, EXIT["LEG_FAILED"], p.stdout + p.stderr)
+                rows = self.trend_rows()
+                self.assertEqual(len(rows), 4, rows)
+                for r in rows:
+                    self.assertEqual((r["status"], r["outcome"]), ("EVIDENCE_INCOMPLETE", "INVALID"), r)
+                    self.assertTrue(str(r["failure"]).startswith("EVIDENCE_INCOMPLETE: receipt identity"), r)
+                    self.assertTrue(r["fps"] is None and r["drops"] is None and r["stall"] is None, r)
+                self.assertEqual(self.validator_calls(), [], "a receipt of another run is never validated, let alone trusted")
+
+    # F: the trend append is safe under concurrency.
+    def test_f_an_appender_holding_the_trend_file_open_does_not_lose_the_rows(self) -> None:
+        self.trend.parent.mkdir(parents=True)
+        with open(self.trend, "ab") as held:
+            held.write(b'{"pre":"existing"}\n')
+            held.flush()
+            p = self.run_baseline()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        lines = self.trend.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 5, lines)
+        self.assertEqual(json.loads(lines[0]), {"pre": "existing"})
+        self.assertEqual(len({(json.loads(l)["leg"], json.loads(l)["backend"]) for l in lines[1:]}), 4)
+
+    def test_f_two_concurrent_runs_append_whole_lines_to_one_trend_file(self) -> None:
+        run2 = self.state / "dual-venue" / "baseline-runs" / "run2"
+        args2 = self.args()
+        args2[args2.index("-RunDir") + 1] = str(run2)
+        env2 = self.env(FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_CHAIN_LOG=str(self.case / "chain-calls-2.log"),
+                        FAKE_ROOT=str(self.case / "fake-root-2"), FAKE_HUB_COUNT=str(self.case / "hub-count-2.txt"))
+        (self.case / "fake-root-2").mkdir()
+        env1 = self.env(FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS")
+        procs = [subprocess.Popen(a, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, stdin=subprocess.DEVNULL) for a, e in ((self.args(), env1), (args2, env2))]
+        outs = [p.communicate(timeout=300) for p in procs]
+        for p, (o, e) in zip(procs, outs):
+            self.assertEqual(p.returncode, 0, o + e)
+        lines = self.trend.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 8, lines)
+        parsed = [json.loads(l) for l in lines]      # every line is whole JSON: none interleaved, none truncated
+        self.assertEqual(len({(r["runDir"], r["leg"], r["backend"]) for r in parsed}), 8)
+
+    def test_f_the_trend_append_is_serialised_and_shares_the_file(self) -> None:
+        text = BASELINE.read_text(encoding="utf-8")
+        code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+        self.assertIn("Threading.Mutex", code)
+        self.assertNotIn("[IO.FileShare]::Read)", code, "the trend file is opened so that a second appender is refused")
+
+    # nit: NO_SIGNAL is readable but carries no figure.
+    def test_nit_no_signal_is_not_listed_among_the_figure_bearing_verdicts(self) -> None:
+        text = BASELINE.read_text(encoding="utf-8")
+        self.assertNotIn("ADVISORY / NO_SIGNAL / VERIFIED", text)
+        self.assertTrue([l for l in text.splitlines() if l.lstrip().startswith("#") and "NO_SIGNAL" in l and "no figure" in l], "no comment says NO_SIGNAL carries no figure")
 
     # ---------------------------------------------------------------- static guards
     def test_the_runner_never_starts_the_app_or_a_scheduled_task_or_edits_the_autopilot(self) -> None:
