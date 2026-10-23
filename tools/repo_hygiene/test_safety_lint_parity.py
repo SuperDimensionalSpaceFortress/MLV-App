@@ -50,9 +50,9 @@ ALWAYS_ALLOW_HOOK ="def decide(payload, project_dir):\n    return 0, ''\n\n\ndef
 ALWAYS_THROW_HOOK = "def decide(payload, project_dir):\n    raise RuntimeError('synthetic rule crash')\n\n\ndef main():\n    return 0\n"
 
 # Pinned floors. A shrinking corpus is a red test; raise these when rows are added, never lower them.
-MIN_STATIC_ROWS = 517      # the JSON corpus: 205 kept static rows + the 180-row #455 sweep when this card landed (385), + the 25 r5 CoS #465 B5/B6 rows (410), + the 107 SAFETY-LINT-DEFEATER-CORPUS-1 hook defeater rows (517)
+MIN_STATIC_ROWS = 652      # the JSON corpus: 205 kept static rows + the 180-row #455 sweep when this card landed (385), + the 25 r5 CoS #465 B5/B6 rows (410), + the 107 SAFETY-LINT-DEFEATER-CORPUS-1 hook defeater rows (517), + the 135 PLAYBACK-LINT-DEFEATER-CORPUS-1 playback defeater rows (652)
 MIN_HOOK_ROWS = 354        # hook share of the JSON corpus: 67 static #455 rows + the 180-row sweep (247 when this card landed), + 107 defeater rows (354)
-MIN_PLAYBACK_ROWS = 163    # playback share: the #465 RULE4 rows master refuses + the authored spaced-clip rows (138 when this card landed), + 25 r5 B5/B6 rows (163)
+MIN_PLAYBACK_ROWS = 298    # playback share: the #465 RULE4 rows master refuses + the authored spaced-clip rows (138 when this card landed), + 25 r5 B5/B6 rows (163), + 135 playback defeater rows (298)
 MIN_DERIVED_HOOK_ROWS = 200  # DENY rows of test_mlv_never_authorized.CASES (203 when this card landed)
 # SAFETY-LINT-DEFEATER-CORPUS-1: rows per hook defeater family (corpus group id prefix), measured against fork/master 530d70e9. The
 # playback-lint families are deferred to PLAYBACK-LINT-DEFEATER-CORPUS-1.
@@ -62,6 +62,16 @@ EXACT_HOOK_DEFEATER_FAMILY_ROWS = {
     "defeater-quoting": 14,
     "defeater-argument-position": 24,
     "defeater-extensionless": 20,
+}
+# PLAYBACK-LINT-DEFEATER-CORPUS-1: rows per playback-lint defeater family (corpus group id prefix), measured against fork/master f2d6d69d.
+# The prefixes share "defeater-" with the hook families above; the "defeater-pb-" ones never match a hook prefix (or the reverse).
+EXACT_PLAYBACK_DEFEATER_FAMILY_ROWS = {
+    "defeater-pb-glued-switch": 22,
+    "defeater-pb-delimiter": 24,
+    "defeater-pb-quoting": 23,
+    "defeater-pb-argument-position": 24,
+    "defeater-pb-extensionless": 22,
+    "defeater-pb-shell-indirection": 20,
 }
 
 # r4 EXACT pins (sol r1 HARDENING: the floor of 200 let three existing DENY rows vanish with the count pin still green, and the
@@ -280,6 +290,36 @@ class CorpusPinTests(unittest.TestCase):
                 self.assertEqual(len(group), count)
                 self.assertTrue(all(r["lint"] == "hook" for r in group), family)
                 self.assertTrue(all("mlv-safety-lint-exemption-defeater-corpus-r1" in r["why"] for r in group), family)
+
+    def test_each_playback_defeater_family_keeps_its_exact_row_count(self):
+        # PLAYBACK-LINT-DEFEATER-CORPUS-1: one group per playback-lint family, every row one fork/master DENIED when it was kept. A family
+        # that loses a row is a red test; raise its number in the commit that ADDS a master-denied row.
+        rows = slp.load_corpus(slp.DEFAULT_CORPUS)
+        for family, count in sorted(EXACT_PLAYBACK_DEFEATER_FAMILY_ROWS.items()):
+            with self.subTest(family=family):
+                group = [r for r in rows if r["id"].startswith(family + "-")]
+                self.assertEqual(len(group), count)
+                self.assertTrue(all(r["lint"] == "playback" for r in group), family)
+                self.assertTrue(all("mlv-safety-lint-exemption-defeater-corpus-r1" in r["why"] for r in group), family)
+                self.assertTrue(all("PLAYBACK-LINT-DEFEATER-CORPUS-1" in r["why"] for r in group), family)
+
+    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    def test_the_baseline_playback_lint_denies_every_playback_defeater_row(self):
+        # Dot's #596 advisory c6cde1fb (hub ACK 6358238095): a count, a lint type and a `why` do not prove a row is refused. Every row of
+        # the playback defeater groups is judged by the BASELINE's lint (the merge-base with fork/master, as Cos465ProbeRowsTests does),
+        # and a row it allows is named. A row the baseline allows can only read `same` or `tightened`, so it could never catch a loosening.
+        sha = _baseline_sha()
+        if sha is None:
+            self.skipTest("no baseline ref resolves (fork/master, origin/master, master)")
+        rows = [{k: v for k, v in r.items() if k != "source"} for r in slp.load_corpus(slp.DEFAULT_CORPUS)
+                if any(r["id"].startswith(f + "-") for f in EXACT_PLAYBACK_DEFEATER_FAMILY_ROWS)]
+        self.assertEqual(len(rows), sum(EXACT_PLAYBACK_DEFEATER_FAMILY_ROWS.values()))
+        tmp = Path(tempfile.mkdtemp(prefix="parity-defeater-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        corpus = _write(tmp / "corpus.json", json.dumps({"schema": slp.CORPUS_SCHEMA, "rows": rows}))
+        report = slp.run(sha, ("playback",), corpus, _write(tmp / "allow.json", "[]"), derived=False)
+        self.assertEqual(report["rows"], len(rows))
+        self.assertEqual([r["id"] for r in report["results"] if r.get("master") != slp.DENY], [], "the baseline lint must DENY every row")
 
     def test_the_derived_hook_rows_cannot_silently_shrink(self):
         self.assertGreaterEqual(len(slp.derived_hook_cases(REPO_ROOT)), MIN_DERIVED_HOOK_ROWS)
