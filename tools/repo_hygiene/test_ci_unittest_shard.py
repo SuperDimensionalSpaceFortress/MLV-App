@@ -687,6 +687,25 @@ class TimingsTests(unittest.TestCase):
             {"tools.repo_hygiene.test_x.AlphaTests": 3.5, "tools.repo_hygiene.test_x.BetaTests": 0.5},
         )
 
+    def test_a_docstring_test_that_logs_a_line_keeps_its_whole_runtime(self) -> None:
+        # CoS on #449: a stamped line between the id line and "<docstring> ... ok" (a logged
+        # warning) cleared the pending test, so its result line was never counted. The test
+        # keeps head -> result, the warning's line included; only a new id line replaces it.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.AlphaTests.test_a)\n"
+            "2026-10-04T00:00:03.0000000Z WARNING: something the test logged\n"
+            "2026-10-04T00:00:06.0000000Z the docstring first line ... ok\n"
+            "2026-10-04T00:00:06.0000000Z test_b (tools.repo_hygiene.test_x.BetaTests.test_b)\n"
+            "2026-10-04T00:00:07.0000000Z WARNING: logged by a test whose id line is replaced\n"
+            "2026-10-04T00:00:08.0000000Z test_c (tools.repo_hygiene.test_x.GammaTests.test_c)\n"
+            "2026-10-04T00:00:09.5000000Z another docstring ... ok\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.AlphaTests": 5.0, "tools.repo_hygiene.test_x.GammaTests": 1.5},
+        )
+
     def test_average_is_over_the_jobs_that_ran_the_class(self) -> None:
         self.assertEqual(
             timings.average([{"a.A": 10.0, "b.B": 4.0}, {"a.A": 20.0}]), {"a.A": 15.0, "b.B": 4.0}
