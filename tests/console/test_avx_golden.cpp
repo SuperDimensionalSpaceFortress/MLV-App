@@ -12,6 +12,7 @@
 #include <QProcessEnvironment>
 #include <QStandardPaths>
 #include <QStringList>
+#include <QTemporaryDir>
 
 static bool running_on_x86()
 {
@@ -127,6 +128,37 @@ static const int kHelperTimeoutMs = 5 * 60 * 1000;
 static_assert(kHelperTimeoutMs <= 10 * 60 * 1000 && kHelperTimeoutMs < kBuildProcessTimeoutMs,
               "the helper bound must stay well under the build bound");
 static const int kOutputTailBytes = 4096;
+// What the parent keeps of a child's merged output, so a chatty child cannot grow it without bound.
+static const qsizetype kRetainedOutputBytes = 64 * 1024;
+static_assert(kRetainedOutputBytes >= kOutputTailBytes, "the retained tail must cover the diagnostic print");
+
+// The last `capacity` bytes a child printed, plus the exact count of everything it printed.
+class OutputTail {
+public:
+    explicit OutputTail(qsizetype capacity) : capacity_(capacity) {}
+
+    void append(const QByteArray & chunk)
+    {
+        total_bytes_ += chunk.size();
+        if (chunk.size() >= capacity_) {
+            bytes_ = chunk.right(capacity_);
+            return;
+        }
+        bytes_ += chunk;
+        if (bytes_.size() > capacity_) {
+            bytes_.remove(0, bytes_.size() - capacity_);
+        }
+    }
+
+    const QByteArray & bytes() const { return bytes_; }
+    qint64 total_bytes() const { return total_bytes_; }
+    qsizetype capacity() const { return capacity_; }
+
+private:
+    qsizetype capacity_;
+    qint64 total_bytes_ = 0;
+    QByteArray bytes_;
+};
 
 struct ProcessRunResult {
     bool started = false;
@@ -135,6 +167,7 @@ struct ProcessRunResult {
     int exit_code = -1;
     qint64 elapsed_ms = 0;
     QByteArray output;
+    qint64 output_total_bytes = 0;
     QString error_string;
     bool ok() const { return started && !timed_out && !crashed && exit_code == 0; }
 };
@@ -163,8 +196,9 @@ static ProcessRunResult run_process_bounded(const QString & program,
     result.started = true;
 
     // Drain the merged channel while waiting, so a chatty child never stalls on a full pipe.
+    OutputTail output(kRetainedOutputBytes);
     while (!process.waitForFinished(250)) {
-        result.output += process.readAll();
+        output.append(process.readAll());
         if (process.state() == QProcess::NotRunning) {
             break;
         }
@@ -175,7 +209,9 @@ static ProcessRunResult run_process_bounded(const QString & program,
             break;
         }
     }
-    result.output += process.readAll();
+    output.append(process.readAll());
+    result.output = output.bytes();
+    result.output_total_bytes = output.total_bytes();
     result.elapsed_ms = timer.elapsed();
     if (!result.timed_out) {
         result.crashed = process.exitStatus() == QProcess::CrashExit;
@@ -211,6 +247,11 @@ static bool run_process(const QString & program,
         } else if (result.timed_out) {
             *combined_output = QStringLiteral("Timed out after %1 s waiting for process: %2\n%3")
                                    .arg(elapsed_seconds(result), program, output_tail(result.output));
+        } else if (result.output_total_bytes > result.output.size()) {
+            *combined_output = QStringLiteral("(%1 bytes total, last %2 shown)\n%3")
+                                   .arg(QString::number(result.output_total_bytes),
+                                        QString::number(result.output.size()),
+                                        QString::fromLocal8Bit(result.output));
         } else {
             *combined_output = QString::fromLocal8Bit(result.output);
         }
@@ -234,12 +275,13 @@ static QString describe_process_failure(const QString & label,
                 .arg(QString::number(result.exit_code),
                      result.timed_out ? QStringLiteral("yes") : QStringLiteral("no"),
                      QFileInfo::exists(output_path) ? QStringLiteral("yes") : QStringLiteral("no"),
-                     QString::number(result.output.size()));
+                     QString::number(result.output_total_bytes));
     if (!result.error_string.isEmpty()) {
         text += QStringLiteral(" error=") + result.error_string;
     }
-    text += QStringLiteral("\n--- helper output tail (last %1 bytes) ---\n")
-                .arg(qMin<qint64>(result.output.size(), kOutputTailBytes));
+    text += QStringLiteral("\n--- helper output tail (last %1 bytes of %2 bytes total) ---\n")
+                .arg(qMin<qint64>(result.output.size(), kOutputTailBytes))
+                .arg(result.output_total_bytes);
     text += output_tail(result.output);
     return text;
 }
@@ -460,12 +502,23 @@ static QStringList chatty_failure_arguments()
                        "echo AVX_PARITY_TAIL_MARKER; exit 7"));
 }
 
-static QString missing_output_json()
-{
-    const QString path = QDir(QDir::tempPath()).filePath(QStringLiteral("avx_parity_runner_missing_output.json"));
-    QFile::remove(path);
-    return path;
-}
+// The first-run marker and hash json paths one runner test uses. Each run gets its own fresh
+// directory under `root`, so two console_tests processes running at once never read or delete each
+// other's files; the run removes only that directory when it ends.
+class RunnerScratch {
+public:
+    explicit RunnerScratch(const QString & root)
+        : dir_(QDir(root).filePath(QStringLiteral("avx_parity_runner-XXXXXX")))
+    {
+        ASSERT_TRUE(dir_.isValid());
+    }
+
+    QString marker() const { return dir_.filePath(QStringLiteral("first_run.marker")); }
+    QString output_json() const { return dir_.filePath(QStringLiteral("hashes.json")); }
+
+private:
+    QTemporaryDir dir_;
+};
 
 TEST(AvxParityRunner, BoundedRunKillsAHungChildWithinItsTimeout)
 {
@@ -498,7 +551,8 @@ TEST(AvxParityRunner, FailingHelperDiagnosticNamesHelperExitCodeAndOutputTail)
         SKIP_TEST("no shell found to stand in for a failing helper");
     }
 
-    const QString output_path = missing_output_json();
+    const RunnerScratch scratch(QDir::tempPath());
+    const QString output_path = scratch.output_json();
     std::ostringstream diagnostics;
     const ProcessRunResult result = run_helper_with_retry(QStringLiteral("default"),
                                                           shell,
@@ -512,7 +566,10 @@ TEST(AvxParityRunner, FailingHelperDiagnosticNamesHelperExitCodeAndOutputTail)
     ASSERT_FALSE(result.ok());
     ASSERT_FALSE(result.timed_out);
     ASSERT_EQ(7, result.exit_code);
-    ASSERT_TRUE(result.output.size() > 1000000);
+    ASSERT_TRUE(result.output_total_bytes > 1000000);
+    // The parent keeps a bounded tail of a chatty child, never all of it.
+    ASSERT_TRUE(result.output.size() <= kRetainedOutputBytes);
+    ASSERT_TRUE(result.output.contains("AVX_PARITY_TAIL_MARKER"));
     // A non-zero exit is reported as is; only a timeout earns the single retry.
     ASSERT_TRUE(diagnostics.str().find("AVX_PARITY_HELPER_TIMEOUT_RETRY") == std::string::npos);
 
@@ -522,6 +579,8 @@ TEST(AvxParityRunner, FailingHelperDiagnosticNamesHelperExitCodeAndOutputTail)
     ASSERT_TRUE(text.contains(QStringLiteral("elapsed_s=")));
     ASSERT_TRUE(text.contains(QStringLiteral("output_json_exists=no")));
     ASSERT_TRUE(text.contains(QStringLiteral("AVX_PARITY_TAIL_MARKER")));
+    ASSERT_TRUE(text.contains(QStringLiteral("output_bytes=%1").arg(result.output_total_bytes)));
+    ASSERT_TRUE(text.contains(QStringLiteral("of %1 bytes total").arg(result.output_total_bytes)));
     ASSERT_TRUE(text.size() < 6000);
 }
 
@@ -532,6 +591,7 @@ TEST(AvxParityRunner, HelperTimeoutRetriesOnceAndReportsTheFirstAttempt)
         SKIP_TEST("no shell found to stand in for a hung helper");
     }
 
+    const RunnerScratch scratch(QDir::tempPath());
     std::ostringstream diagnostics;
     QElapsedTimer timer;
     timer.start();
@@ -541,7 +601,7 @@ TEST(AvxParityRunner, HelperTimeoutRetriesOnceAndReportsTheFirstAttempt)
                                                           QDir::tempPath(),
                                                           QProcessEnvironment::systemEnvironment(),
                                                           1500,
-                                                          missing_output_json(),
+                                                          scratch.output_json(),
                                                           diagnostics);
 
     ASSERT_TRUE(result.timed_out);
@@ -577,19 +637,17 @@ TEST(AvxParityRunner, FirstHelperTimeoutFailsEvenWhenTheRetryWouldPass)
         SKIP_TEST("no shell found to stand in for a hung helper");
     }
 
-    const QString marker = QDir(QDir::tempPath()).filePath(QStringLiteral("avx_parity_runner_first_run.marker"));
-    QFile::remove(marker);
-    const QString output_path = missing_output_json();
+    const RunnerScratch scratch(QDir::tempPath());
+    const QString output_path = scratch.output_json();
     std::ostringstream diagnostics;
     const ProcessRunResult result = run_helper_with_retry(QStringLiteral("default"),
                                                           shell,
-                                                          hang_then_pass_arguments(marker, output_path),
+                                                          hang_then_pass_arguments(scratch.marker(), output_path),
                                                           QDir::tempPath(),
                                                           QProcessEnvironment::systemEnvironment(),
                                                           8000,
                                                           output_path,
                                                           diagnostics);
-    QFile::remove(marker);
 
     // The first attempt hung, so the run fails however the second attempt ends.
     ASSERT_TRUE(result.timed_out);
@@ -599,4 +657,70 @@ TEST(AvxParityRunner, FirstHelperTimeoutFailsEvenWhenTheRetryWouldPass)
     const std::string text = diagnostics.str();
     ASSERT_TRUE(text.find("AVX_PARITY_HELPER_TIMEOUT_RETRY attempt=1") != std::string::npos);
     ASSERT_TRUE(text.find("AVX_PARITY_HELPER_DIAGNOSTIC_RERUN attempt=2 outcome=ok") != std::string::npos);
+}
+
+// Two runs against one temp root stand in for two console_tests processes running at once.
+TEST(AvxParityRunner, RunsSharingATempRootNeverShareOrRemoveEachOthersFiles)
+{
+    QTemporaryDir root;
+    ASSERT_TRUE(root.isValid());
+
+    const auto write_file = [](const QString & path) {
+        QFile file(path);
+        return file.open(QIODevice::WriteOnly) && file.write("x") == 1;
+    };
+
+    QString first_marker;
+    QString first_output_json;
+    {
+        const RunnerScratch first(root.path());
+        first_marker = first.marker();
+        first_output_json = first.output_json();
+        ASSERT_TRUE(write_file(first_marker));
+        ASSERT_TRUE(write_file(first_output_json));
+        {
+            const RunnerScratch second(root.path());
+            // Starting the second run leaves the first run's files alone.
+            ASSERT_TRUE(QFileInfo::exists(first_marker));
+            ASSERT_TRUE(QFileInfo::exists(first_output_json));
+            ASSERT_TRUE(second.marker() != first_marker);
+            ASSERT_TRUE(second.output_json() != first_output_json);
+            ASSERT_TRUE(write_file(second.marker()));
+            ASSERT_TRUE(write_file(second.output_json()));
+        }
+        // Finishing the second run leaves them alone too.
+        ASSERT_TRUE(QFileInfo::exists(first_marker));
+        ASSERT_TRUE(QFileInfo::exists(first_output_json));
+    }
+    // Each run removes what it created.
+    ASSERT_FALSE(QFileInfo::exists(first_marker));
+    ASSERT_FALSE(QFileInfo::exists(first_output_json));
+    ASSERT_TRUE(QDir(root.path()).entryList(QDir::AllEntries | QDir::NoDotAndDotDot | QDir::Hidden).isEmpty());
+}
+
+TEST(AvxParityRunner, OutputTailStaysBoundedAndCountsEveryByte)
+{
+    const qsizetype capacity = 2 * kOutputTailBytes;
+    OutputTail tail(capacity);
+    qint64 fed = 0;
+    QByteArray last_chunk;
+    for (int i = 0; i < 1000; ++i) {
+        last_chunk = QByteArray(97, static_cast<char>('a' + (i % 26)));
+        tail.append(last_chunk);
+        fed += last_chunk.size();
+        ASSERT_TRUE(tail.bytes().size() <= capacity);
+    }
+    ASSERT_EQ(fed, tail.total_bytes());
+    ASSERT_EQ(capacity, tail.bytes().size());
+    ASSERT_TRUE(tail.bytes().endsWith(last_chunk));
+
+    // One chunk larger than the whole buffer keeps only its own last bytes.
+    QByteArray big(3 * capacity, 'y');
+    big.append("END");
+    tail.append(big);
+    fed += big.size();
+    ASSERT_EQ(fed, tail.total_bytes());
+    ASSERT_EQ(capacity, tail.bytes().size());
+    ASSERT_TRUE(tail.bytes().endsWith("yEND"));
+    ASSERT_FALSE(tail.bytes().contains(last_chunk.left(1)));
 }
