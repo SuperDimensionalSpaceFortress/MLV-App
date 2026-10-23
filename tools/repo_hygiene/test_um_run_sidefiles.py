@@ -83,14 +83,20 @@ def skip_if_claim_wait_inconclusive(test: unittest.TestCase, claim_lo: float, cl
 
 
 _SEAM_CALL_ARGS = ["self", "claim_lo", "claim_hi", "verdict_time", "timeout_sec", "timing_facts"]
+_SEAM_CALL_METHOD = "test_a_clock_skewed_claim_marker_observed_at_the_queue_deadline_does_not_shrink_the_clients_patience"
 
 
-def seam_call_position_problem(source: str, class_name: str) -> str | None:
+def seam_call_position_problem(source: str, class_name: str, method_name: str | None = None) -> str | None:
     """UMRUN-SEAM-CALL-POSITION-PIN-1: None when `class_name` in `source` calls
     skip_if_claim_wait_inconclusive exactly once, as the FINAL top-level statement of a method body
     and with the live test's own arguments; otherwise a sentence saying what is wrong. The seam only
     skips after every other check has run, so a call placed earlier would skip past the UNRESOLVED /
-    started-marker asserts below it. Takes source text so a test can feed it a mutated copy."""
+    started-marker asserts below it. Takes source text so a test can feed it a mutated copy. When
+    `method_name` is given, the call must also sit in the method of that name.
+
+    Final-statement placement is a positional contract only: it does not prove the call is reached at
+    run time (an early return, a raised skip or an exception above it still bypasses it). The live
+    test's own asserts are what make it reachable."""
     classes = [node for node in ast.walk(ast.parse(source))
                if isinstance(node, ast.ClassDef) and node.name == class_name]
     if len(classes) != 1:
@@ -103,6 +109,8 @@ def seam_call_position_problem(source: str, class_name: str) -> str | None:
     method, call = calls[0]
     if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
         return "the seam call is not inside a method body"
+    if method_name is not None and method.name != method_name:
+        return f"the seam call is in {method.name}, not in the expected method {method_name}"
     if [ast.unparse(arg) for arg in call.args] != _SEAM_CALL_ARGS or call.keywords:
         return f"{method.name} calls the seam with unexpected arguments: {ast.unparse(call)}"
     final = method.body[-1]
@@ -2374,7 +2382,27 @@ class UmRunClaimWaitSkipWiringTests(unittest.TestCase):
         return "\n".join(lines) + "\n"
 
     def test_the_live_wait_tests_final_statement_is_the_seam_call(self) -> None:
-        self.assertIsNone(seam_call_position_problem(self._real_source(), "UmRunEndToEndTests"))
+        self.assertIsNone(seam_call_position_problem(
+            self._real_source(), "UmRunEndToEndTests", method_name=_SEAM_CALL_METHOD))
+
+    # UMRUN-SIBLING-1122-SLACK-COMMENT-SAME-CLOCK-1 (Dot c91c2dda on #597, H1): bind the method name.
+    def test_the_seam_call_moved_into_a_differently_named_method_is_rejected_when_the_name_is_bound(self) -> None:
+        source = self._synth(self._SEAM_CALL).replace("def test_it(", "def test_other(")
+        problem = seam_call_position_problem(source, "Live", method_name="test_it")
+        self.assertIsNotNone(problem)
+        self.assertIn("test_other", problem)
+        self.assertIn("test_it", problem)
+
+    def test_the_seam_call_in_the_renamed_real_live_wait_test_is_rejected_when_the_name_is_bound(self) -> None:
+        mutated = self._real_source().replace(f"def {_SEAM_CALL_METHOD}(", "def test_renamed_live_wait(", 1)
+        self.assertNotEqual(mutated, self._real_source())
+        problem = seam_call_position_problem(mutated, "UmRunEndToEndTests", method_name=_SEAM_CALL_METHOD)
+        self.assertIsNotNone(problem)
+        self.assertIn("test_renamed_live_wait", problem)
+        self.assertIn(_SEAM_CALL_METHOD, problem)
+
+    def test_a_seam_call_in_the_bound_method_name_is_accepted(self) -> None:
+        self.assertIsNone(seam_call_position_problem(self._synth(self._SEAM_CALL), "Live", method_name="test_it"))
 
     def test_the_seam_call_moved_above_the_unresolved_assert_is_rejected_though_the_count_still_passes(self) -> None:
         for marker in ('self.assertIn("UNRESOLVED:"', 'self.assertIn("its own started marker is gone too"'):
