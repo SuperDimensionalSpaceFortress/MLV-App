@@ -1843,6 +1843,7 @@ function Read-DvVisualCaptures {
     }
     $notJudgedNote = $null   # set once the frames are read; kept after a verdict reason rather than replaced by it
     $stripNote = $null       # set when the strip cannot be composed; kept the same way, after the not-judged note
+    $reasonBeforeStrip = $null   # the step reason standing when the strip failed (a NOT_CAPTURED leg keeps it between the capture count and the strip failure)
     $finish = {
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
@@ -1850,7 +1851,9 @@ function Read-DvVisualCaptures {
         # a gate reason replaces a step's reason, except that a NOT_CAPTURED leg keeps the step that says WHY nothing was captured
         # (the verdict reason comes first, then the note that some saved play frames were not judged, then the strip failure)
         $notes = (@($notJudgedNote, $stripNote) | Where-Object { $_ }) -join '; '
-        if ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
+        # a NOT_CAPTURED leg whose strip also failed keeps both: the capture count, any step reason from before the strip, then the strip failure
+        if ($v.verdict -ceq 'NOT_CAPTURED' -and $stripNote) { $block.reason = (@($v.reason, $reasonBeforeStrip, $stripNote) | Where-Object { $_ }) -join '; ' }
+        elseif ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -1943,6 +1946,7 @@ function Read-DvVisualCaptures {
             $block.stripSha256 = Get-DvSha256OfFile $block.stripPath
         } catch {
             $stripNote = "the strip could not be composed: $($_.Exception.GetType().Name)"
+            $reasonBeforeStrip = $block.reason
             $block.reason = $(if ($block.reason) { "$($block.reason); $stripNote" } else { $stripNote })   # a plain OK keeps the not-judged note beside it
         }
     }
