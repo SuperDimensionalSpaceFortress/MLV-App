@@ -596,6 +596,8 @@ function Get-JobMetadata {
     # JSON object: the defaults, as before (a torn claim still runs), UNLESS those bytes name notAfterUtc. That job carried a
     # deadline this agent cannot see, and so does one whose bytes cannot be read at all (it cannot tell): the defaults plus
     # metaUnreadable and metaReadError, which Get-JobNotAfterVerdict fails CLOSED. Such a job is refused, never run unbounded.
+    # LEASE-NOT-AFTER-HARDENING-2 (key3 on #648): that flag holds once ANY of the reads names the key, in any case (property access
+    # on the parsed object is case-insensitive too), or cannot be read; a later torn read that stops before the key cannot clear it.
     $meta = $null
     $readError = $null
     $deadlineUnknown = $false
@@ -610,7 +612,7 @@ function Get-JobMetadata {
                 $meta = $null
                 if ($null -eq $readError) { $readError = "does not hold a JSON object" }
             }
-            $deadlineUnknown = ($null -eq $text -or $text.Contains("notAfterUtc"))
+            if ($null -eq $text -or $text.IndexOf("notAfterUtc", [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $deadlineUnknown = $true }
             if ($try -lt 3) { Start-Sleep -Milliseconds 200 }
         }
         if ($null -eq $meta) { Add-AgentLogLine "json read failed path=$metaPath error=$readError deadlineUnknown=$deadlineUnknown" }
@@ -2487,7 +2489,9 @@ function Update-QuietLeaseRenew {
     # One renew step for an ACTIVE lease: collects (or, past LeaseRenewTimeoutSec, kills) the renew in flight, and starts the
     # next one once LeaseRenewSec has passed since the last. Never waits on a renew and never ends the lease: a slow or failed
     # renew is logged and counted (renewSlow / renewFailures), and the lease simply goes stale at 120 s if none succeeds.
-    param([Parameter(Mandatory = $true)]$Lease)
+    # LEASE-NOT-AFTER-HARDENING-2 (Dot R18 on #648): CollectOnly (a waiting lease past its notAfterUtc) does the first half only:
+    # the renew in flight is still collected or killed, and no new one starts.
+    param([Parameter(Mandatory = $true)]$Lease, [switch]$CollectOnly)
     $now = Get-Date
     if ($null -ne $Lease.renewCall) {
         $c = $Lease.renewCall
@@ -2508,7 +2512,7 @@ function Update-QuietLeaseRenew {
         }
         else { return }
     }
-    if ($null -eq $Lease.active -or $Lease.proc.HasExited) { return }
+    if ($CollectOnly -or $null -eq $Lease.active -or $Lease.proc.HasExited) { return }
     $gap = ($now - $Lease.lastRenewStart).TotalSeconds
     if ($gap -lt $LeaseRenewSec) { return }
     if ($gap -gt $Lease.renewMaxGapSec) { $Lease.renewMaxGapSec = [Math]::Round($gap, 1) }
@@ -2528,13 +2532,16 @@ function Invoke-QuietLeaseRenewTick {
     # LEASE-NOT-AFTER-HARDENING-1 (key3 hardening 2): a WAITING lease whose job's notAfterUtc has passed is neither read nor
     # renewed again (typed once): it is not kept fresh past the deadline. The wait releases it at its next loop top. The
     # admitted lease is the running job's and renews as before.
+    # LEASE-NOT-AFTER-HARDENING-2 (Dot R18 on #648): a renew already in flight as that deadline passes is still collected, or
+    # killed at LeaseRenewTimeoutSec, here (Update-QuietLeaseRenew -CollectOnly), not left running until the release.
     foreach ($l in @($script:QuietLease, $script:QuietLeaseWaiting)) {
         if ($null -eq $l) { continue }
         if ([object]::ReferenceEquals($l, $script:QuietLeaseWaiting) -and (Get-JobNotAfterVerdict -Metadata $l).state -eq "passed") {
             if ($l.notAfterStopLogged -ne $true) {
                 $l | Add-Member -NotePropertyName notAfterStopLogged -NotePropertyValue $true -Force
-                Add-AgentLogLine "quiet-lease: not-after passed job=$($l.jobId) notAfterUtc=$($l.notAfterUtc) active=$($null -ne $l.active) while waiting; no more renews, released at the wait's next loop top"
+                Add-AgentLogLine "quiet-lease: not-after passed job=$($l.jobId) notAfterUtc=$($l.notAfterUtc) active=$($null -ne $l.active) while waiting; no more renews (one in flight is still collected or killed), released at the wait's next loop top"
             }
+            Update-QuietLeaseRenew -Lease $l -CollectOnly
             continue
         }
         if ($null -eq $l.active -and -not $l.proc.HasExited) { $null = Update-QuietLeaseRequest -Lease $l }
