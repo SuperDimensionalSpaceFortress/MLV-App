@@ -10,11 +10,17 @@ body therefore passed ``test_every_emitted_template_parses_and_trips_no_rule``
 The scan now takes ``-SpliceSource`` (generators / modules whose splice call sites enumerate the
 spliced function names) and reports what its rules (R1 to R6) find in every body the real extractor
 returns. This file pins that, and carries the policy: the INERT_* lists (pure computation, stream
-plumbing, read-only members, which cannot write) and the reviewed ALLOWLIST. The helpers that ARE the
+plumbing, read-only members, admitted by member NAME, not by receiver type) and the reviewed ALLOWLIST. The helpers that ARE the
 runtime safety boundary (Publish-AttrCuda*, New-AttrCudaDirectory, Remove-AttrCuda*) legitimately hold
 the raw writes and deletes the templates may not, so each (function, rule, offending token) is listed
 with a count and a one-line reason. A finding not on the list fails; a row whose count no longer
 matches fails; a row that matches nothing fails.
+
+Grammar and non-promises (declared before r2, written in the scan's header and pinned by
+SplicedBodyScanHeaderTests): the scan is the PowerShell language AST over the template and over each
+body Get-AttrCudaEmbeddedFunctionSource splices. It does no runtime evaluation, does not scan code a job
+dot-sources or imports at runtime, and trusts the allowlist rows as reviewed. A test below that says a
+body is "clean" means clean under that grammar, and no more.
 """
 
 from __future__ import annotations
@@ -354,6 +360,28 @@ def describe(findings: list[dict]) -> str:
         [{k: f[k] for k in ("function", "rule", "token", "line", "module", "text", "reason")} for f in findings],
         indent=2,
     )
+
+
+class SplicedBodyScanHeaderTests(unittest.TestCase):
+    """The scan's header declares its grammar and its non-promises (guard contract)."""
+
+    def test_the_header_names_the_ast_grammar_and_lists_the_runtime_limits(self) -> None:
+        text = SCANNER.read_text(encoding="ascii")
+        header = text.split("[CmdletBinding()]", 1)[0]
+        flat = re.sub(r"\s*\n#\s*", " ", header)
+        self.assertIn("GRAMMAR", header)
+        self.assertIn("System.Management.Automation.Language.Parser", header)
+        self.assertRegex(flat, r"ParseInput\s*/\s*ParseFile")
+        self.assertIn("Get-AttrCudaEmbeddedFunctionSource", header)
+        self.assertRegex(flat, r"EXPLICIT LIMITS\s*/\s*NON-PROMISES")
+        limits = flat[flat.index("EXPLICIT LIMITS"):]
+        for needle in ("No runtime evaluation", "Invoke-Expression", "dot-sources or imports at runtime",
+                       "reference-frame-runner-job.ps1", "Attr3Footage", "child executables",
+                       "trusted as reviewed"):
+            self.assertIn(needle, limits, f"the scan header's EXPLICIT LIMITS block lost: {needle}")
+        # The parser calls the header names are the ones the scan really makes.
+        self.assertGreaterEqual(text.count("[System.Management.Automation.Language.Parser]::ParseInput("), 1)
+        self.assertGreaterEqual(text.count("[System.Management.Automation.Language.Parser]::ParseFile("), 1)
 
 
 @requires_pwsh

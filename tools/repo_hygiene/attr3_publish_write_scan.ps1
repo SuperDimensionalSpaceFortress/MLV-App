@@ -45,19 +45,33 @@
 # its per-function, per-rule, per-token reviewed allowlist), not here. This script reports every
 # finding; it never decides one is acceptable.
 #
-# EXPLICIT LIMITS (booked as ATTR3-SCANNER-HARDEN-1, sol PR #133 r7): arguments passed to child
-# executables, Start-Process -FilePath/-ArgumentList, and `reg` verbs are not constrained; instance
-# methods are allowlisted by NAME, not by receiver type; trusted-helper arguments other than
-# Remove-AttrCudaTree -TrustedRoot are not constrained; the scan reads the generator's template with
-# placeholders neutralised, not the emitted job text. Still a limit after ATTR3-SCANNER-HARDEN-1: a
-# spliced body is scanned as a standalone function, so a $Pub/$Work/$Cache variable inside it is
-# judged by the same name-based rules as in a template, not by what the caller binds it to; helper
-# text spliced by a means other than Get-AttrCudaEmbeddedFunctionSource (string concatenation,
-# -replace, a here-string literal) is invisible; and the templates of jobs whose generators are not
-# passed as -GeneratorPath (reference-frame-runner-job.ps1, the Attr3Footage*Job.psm1 modules) are
-# still not template-scanned at all -- only their spliced helper names are enumerated. A hostile
-# author can defeat any static lint of PowerShell -- including by editing this file -- so review of
-# the template diff remains required.
+# GRAMMAR (declared before ATTR3-SCANNER-HARDEN-1 r2). The scan judges the PowerShell language AST,
+# System.Management.Automation.Language.Parser ParseInput / ParseFile, over (a) the generator template
+# with its placeholders neutralised and (b) each helper body that Get-AttrCudaEmbeddedFunctionSource
+# splices into the emitted job, read with the extractor's own regex. Rules R1 to R6 above apply to both;
+# a spliced body skips only the top-level "$Work assigned once" half of R5.
+#
+# EXPLICIT LIMITS / NON-PROMISES (booked as ATTR3-SCANNER-HARDEN-1, sol PR #133 r7; restated r2). A
+# counterexample outside this grammar is debt against these lines, not a defect in the scan:
+#   - No runtime evaluation. Invoke-Expression or a string built at runtime, `& $var` on a value computed
+#     at runtime, and members reached through a variable that holds a type object are judged only by the
+#     R3 / R4 name rules.
+#   - Code a job dot-sources or imports at runtime is not scanned.
+#   - Helpers that reach the job by any route other than Get-AttrCudaEmbeddedFunctionSource (string
+#     concatenation, -replace, a here-string literal) are not scanned.
+#   - The templates of reference-frame-runner-job.ps1 and the Attr3Footage*Job.psm1 modules (generators
+#     not passed as -GeneratorPath) are not template-scanned; only their spliced helper names are
+#     enumerated.
+#   - Arguments passed to child executables, Start-Process -FilePath / -ArgumentList, and `reg` verbs are
+#     not judged. Instance methods are allowlisted by NAME, not by receiver type. Trusted-helper
+#     arguments other than the -TrustedRoot ones named under R2 are not constrained.
+#   - A spliced body is scanned as a standalone function, so a $Pub / $Work / $Cache variable inside it is
+#     judged by the same name-based rules as in a template, not by what the caller binds it to.
+#   - The scan reads the template with placeholders neutralised, not the emitted job text.
+#   - Allowlist rows in the caller (test_attr3_spliced_body_scan.py) are trusted as reviewed; their
+#     reasons are not re-proven here.
+# A hostile author can defeat any static lint of PowerShell -- including by editing this file -- so review
+# of the template diff remains required.
 #
 # Output: JSON { templates: [...], violations: [ { source, line, rule, text, reason } ],
 #                spliced: [ { module, name, line, bodyLength, bodySha256, callers } ],
