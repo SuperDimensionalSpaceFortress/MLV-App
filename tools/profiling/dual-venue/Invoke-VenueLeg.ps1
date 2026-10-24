@@ -28,7 +28,8 @@
 #   5. P6: the declared -Venue must agree with Get-AttrCudaMeasurementVenue on the host the probe ran
 #      on, and the host must be the venue table's expectedHost -> VENUE_HOST_MISMATCH;
 #   6. the staged build and smoke-runner closure must be the ones named (never a different build)
-#      -> DEVICE_UNAVAILABLE; submit THROUGH um-run.ps1 (NA-7). (No registry snapshot is taken any more: master
+#      -> DEVICE_UNAVAILABLE; submit THROUGH um-run.ps1 (NA-7), with -NotAfterUtc at the end of this call's own wait
+#      (Get-DvJobNotAfter; the probe's submit too). (No registry snapshot is taken any more: master
 #      isolates an automation run's settings store; the receipt proves it from the run log.)
 #   7. read summary.json / evidence-manifest.json / artifact-index.json plus the launcher's result.json and the app's
 #      run log, copy metrics VERBATIM, RE-DERIVE the receipt oracle's verdict from the run log (source_advanced /
@@ -302,9 +303,12 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
 function Submit-VenueJob([string]$ScriptPath, [string]$JobId, [int]$TimeoutSec, [int]$QueueSec, [int]$ClaimedExtraSec) {
     # um-run.ps1 is the ONLY writer to a venue share (NA-7). Its three outcomes: a receipt object,
     # RETRACTED, or UNRESOLVED -- a thrown UNRESOLVED/RETRACTED is data here, never an error.
+    # LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1: the job's notAfterUtc is the end of this call's own wait (DualVenueRunner.psm1: no later reader needs the job
+    # run), and the admission wait it assumes (um-run's default) is passed by name.
     try {
+        $notAfter = Get-DvJobNotAfter -TimeoutSec $TimeoutSec -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec
         $out = @(& $UmRunScript -ScriptPath $ScriptPath -JobId $JobId -AgentShare $agentShare -TimeoutSec $TimeoutSec `
-            -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec 6>$null)
+            -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec -MaxAdmissionWaitSec $notAfter.maxAdmissionWaitSec -NotAfterUtc $notAfter.notAfterUtc 6>$null)
         $r = if ($out.Count -gt 0) { $out[-1] } else { $null }
         [pscustomobject]@{ umOutcome = 'RECEIPT'; result = $r; message = $null }
     } catch {
