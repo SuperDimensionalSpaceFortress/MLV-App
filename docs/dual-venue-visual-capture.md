@@ -14,16 +14,23 @@ read perfect while the display is frozen. So the capture runs after the measured
    REACHED its own stop condition: `finishPlaybackSmokeTelemetry("visual-capture")` closes the measured session (the
    `playback_smoke.summary` / `gate` lines, and every oracle number, are written there), while the SAME Play keeps running -- no
    new Play, no restart, no loop (the clip-length gate's stop-site pin counts this one pause). Then, untimed:
-   * 6 capture pairs evenly spaced across a ~3 s tail (the centres of six 500 ms slices): first unforced, `play-unbound-<k>.png`,
-     then bound, `play-<k>.png`;
+   * 6 forced, bound play captures, `play-<k>.png`, across the FIRST half of a ~3 s tail (the centres of six equal slices of it);
+   * then 6 unforced play captures, `play-unbound-<k>.png`, across the SECOND half (the centres of six equal slices of it): what the
+     display itself shows, and what the frozen check judges;
    * 2 captures the instant Play is paused, before any event is processed (still the playback-path frame): first unforced,
      `stop-unbound.png` (what a build before PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 captured), then bound, `stop.png`;
    * 2 captures after the paused full-quality path re-renders that same frame (`seekAndSettleLoadedClip`): unforced
      `paused-unbound.png`, then bound `paused.png`.
 
-   Every forced capture is paired with an unforced twin taken just before it, with no event handled between
-   (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2, Dot `6d0e710f` B2): the forced paint draws the frame the label names even when the
-   display's own deferred paint never lands, so a forced capture alone can never show a frozen display.
+   Why the unforced captures exist (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2, Dot `6d0e710f` B2): the forced paint draws the frame the
+   label names even when the display's own deferred paint never lands, so a forced capture alone can never show a frozen display. Why
+   they come after all the forced ones (r3, Dot `7dc103f1` B2): a forced paint stays on screen when the display's own paint is stuck,
+   so it is what the NEXT unforced capture shows. r2 took an unforced capture then a forced one in each slice, and over a frozen
+   display unforced k+1 showed forced k's paint: six moving pictures. Now no forced paint falls between two unforced play captures, or
+   between the last of them and `stop-unbound.png`. Every capture records `forced_paints_before` (how many forced paints preceded it),
+   and the runner judges only the unforced play captures that record the same count as the first of them. Forced `play-<k>` and
+   unforced `play-unbound-<k>` are therefore about half a tail apart: they are NOT twins of one instant, and on a healthy display they
+   show different frames.
 
    Each capture is the WHOLE window via `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)` -- the compositor's view of the window,
    GL child windows included, never an in-app readback -- saved at most 1920 wide after Play has stopped, with the video
@@ -71,14 +78,20 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   paused re-render and against the bound stop (the strip adds its tile, labelled "unforced"); `pausedUnboundVsPausedMeanAbsDiff`
   for `paused-unbound.png` against `paused.png`;
 * `frozenJudgedOn`: `play_unbound` when the app published unforced play captures (the play-frame numbers above are then computed
-  from THEM: the frozen check never judges a force-painted set), else `play`. Beside it, `forcedPlayDistinctContentHashes` and
-  `playForcedUnforcedDifferFrames` (pairs whose forced and unforced viewports differ); a forced set that moved over an unforced
-  one that did not is said in the reason ("the force-paint would have masked this").
+  from THEM: the frozen check never judges a force-painted set), else `play`. Beside it, `forcedPlayDistinctContentHashes`; a
+  forced set that moved over an unforced one that did not is said in the reason ("the force-paint would have masked this"). (r5:
+  no forced-k vs unforced-k pairing is reported; under the r3 order such a pair compares two moments half a tail apart.)
+* `observerPaintedPlayFrames`: unforced play captures not judged because they record another `forced_paints_before` than the
+  first (or none: an r2 build); `stopUnboundObserverClean`: whether `stop-unbound.png` also follows them with no forced paint;
+* `repeatedPlayFrames`: judged unforced captures that show the same picture as the one before them while the app's label
+  advanced (`null` over source frames the app records as identical); `repeatedPlayFramesNote` says so in words, and is set
+  whatever note `reason` already holds (`reason` keeps the first note).
 
 | verdict | when | counted |
 |---|---|---|
 | `FROZEN_DISPLAY` | the play frames show ONE picture while the app presented more than one frame across them AND the source frames are known to differ (`sourceDifference` `known-differ`) | **no**: the receipt is `INVALID` |
 | `FROZEN_DISPLAY_SUSPECTED` | the same one picture, but nothing records whether the source frames differ (`sourceDifference` `unknown`): a static clip shows one picture legitimately | yes, and the detail says so |
+| `PARTIAL_FREEZE` | more than one picture, but `repeatedPlayFrames` is 2 or more AND the source frames are known to differ: the display's own paint stopped landing for part of the tail. One repeat is `OK`; over an `unknown` source the repeats stay a note (`repeatedPlayFramesNote`) on an `OK` block | yes, and the detail says so; a self-heal pre-launch with it is `INVALID` |
 | `VISUAL_ASSESSMENT_UNAVAILABLE` | play frames have no usable viewport rectangle in `visual.json` (absent, empty or outside the image) AND fewer than two play frames with one remain: the whole window, with its timecode and chrome, is never judged in its place. With two or more usable frames those are judged as above (a known-differ leg with one frame lacking a rectangle is still `FROZEN_DISPLAY`) | yes, and the detail says so |
 | `CAPTURE_UNBOUND` | a capture the divergence compares is not shown bound to its label: on a binding build (either side carries `label_bound`), the stop OR the paused capture's `label_bound` is false or missing; the stop-vs-paused difference then compares two moments | yes, and the detail says so |
 | `VISUAL_DIVERGENCE` | the playback frame is further than the threshold from its paused full-quality re-render | yes, and the detail says so |

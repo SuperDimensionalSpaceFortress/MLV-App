@@ -815,9 +815,10 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     if ($receipt.visual.verdict -ceq 'FROZEN_DISPLAY') {
         $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY: $($receipt.visual.reason). A leg whose display did not change is not counted, whatever its cadence numbers say"
         $outcome = 'INVALID'
-    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE', 'CAPTURE_UNBOUND')) {
+    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE', 'CAPTURE_UNBOUND', 'PARTIAL_FREEZE')) {
         # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: a single picture over an unknown source, and a leg with no viewport rectangle, are counted and surfaced like a divergence)
         # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: an unbound paused-instant capture is surfaced the same way (counted; its difference judges nothing).
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5: so is a partial freeze over source frames known to differ (counted; the display's paint stopped part-way).
         $detail += "; $($receipt.visual.verdict) (counted for speed, surfaced for review): $($receipt.visual.reason)"
     }
 }

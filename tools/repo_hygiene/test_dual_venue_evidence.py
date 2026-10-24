@@ -7182,22 +7182,27 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     paused capture too): bound also carries the paused capture's binding (label_bound true) and every bound entry its label_bound_basis;
     bound-paused-unbound (paused label_bound false) and bound-paused-missing (paused without binding fields); paired-ok (unforced and forced play
     frames both move); masked (the unforced play frames show ONE picture over a known-differ source while the forced ones move: the frozen display
-    the force-paint used to hide)."""
+    the force-paint used to hide). r5 (Grok G1/G3 on #456): the paired modes model the r3 order -- the unforced captures are taken half a tail
+    after the forced ones, so on a healthy display (paired-ok) unforced k shows a LATER frame than forced k, never the same picture; masked shows
+    the last forced paint (play 5's picture) on every unforced capture; partial-freeze (over a known-differ source) shows three moving unforced
+    pictures and then repeats the third, the display's own paint stopping part-way through the unforced half."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     calls = []
     frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport")
-    paired = mode in ("paired-ok", "masked")
+    paired = mode in ("paired-ok", "masked", "partial-freeze")
     bound = mode in ("bound", "bound-paused-unbound", "bound-paused-missing")
     viewport = None if mode == "noviewport" else VIEWPORT
     source_difference = {"frozen": "differ", "frozen-partial": "differ", "frozen-identical": "identical",
-                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL", "masked": "differ"}.get(mode)
+                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL", "masked": "differ", "partial-freeze": "differ"}.get(mode)
     for k in range(6):
         seed = 1 if frozen else k
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
         if paired:
-            calls.append(f"New-VisPng '{dest / f'play-unbound-{k}.png'}' {1 if mode == 'masked' else k} {60 + k * 10} 0 $false")
+            # (seed, bias): bias 30 marks a frame of the unforced half (later than every forced capture's frame); masked repeats forced play 5's paint
+            unforced_seed, unforced_bias = {"masked": (5, 0), "partial-freeze": (min(k, 2), 30)}.get(mode, (k, 30))
+            calls.append(f"New-VisPng '{dest / f'play-unbound-{k}.png'}' {unforced_seed} {60 + k * 10} {unforced_bias} $false")
     if bound:
         calls.append(f"New-VisPng '{dest / 'stop-unbound.png'}' 5 120 40 $false")
     calls.append(f"New-VisPng '{dest / 'stop.png'}' 5 120 {40 if mode == 'lagged' else 0} ${'true' if mode == 'blank' else 'false'}")
@@ -7241,7 +7246,8 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
                                                                   "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
 
 
-def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal: bool = True, record_source: bool = True) -> dict:
+def stateful_visual_model(order: str, natural: str, ordinal: bool = True, record_source: bool = True,
+                          observer: tuple[int, ...] = (), no_viewport: tuple[int, ...] = ()) -> tuple[list[tuple[str, int, int, int]], dict, dict]:
     """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): a STATEFUL model of the window surface the captures print. A forced capture paints
     the frame its label names onto the surface, then prints it, so it CHANGES what the next unforced capture sees; an unforced capture prints the
     surface as it stands. Before every capture the display's own (natural) paint lands the current frame only while it works. natural: healthy
@@ -7250,10 +7256,10 @@ def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal
     r2 build b35aa308: unforced k, then forced k, in each slice) or forced-first (r3: the six forced play captures across the first half of the tail,
     then the six unforced ones across the second, then stop_unbound, stop). ordinal writes each entry's forced_paints_before (an r3 build); without
     it the entries have the r2 shape. record_source=False leaves source_difference out of visual.json (nothing records whether the source frames
-    differ). Returns the unforced play pictures the model produced (index -> picture) for the trace assertions."""
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
+    differ). r5: observer lists unforced play indexes whose entry records one forced paint more than the model counted (the reader must leave them
+    unjudged); no_viewport lists unforced play indexes whose entry carries no viewport rectangle.
+    Pure (r5, Dot f589cdbf): no file and no pwsh. Returns (pictures, visual, unforced): one (file, seed, chrome, bias) per capture for New-VisPng,
+    the visual.json body, and the unforced play pictures the model produced (index -> picture) for the trace assertions."""
     if order == "interleaved":
         plays = [op for k in range(6) for op in (("play_unbound", k, 240 + 500 * k, 600 + 2 * k), ("play", k, 250 + 500 * k, 600 + 2 * k))]
         last = 610
@@ -7268,7 +7274,7 @@ def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal
 
     surface = (3, 120)   # what was on screen before the tail: no frame's picture
     forced_paints = 0
-    calls, frames, unforced = [], [], {}
+    pictures, frames, unforced = [], [], {}
     for i, (kind, k, t, label) in enumerate(ops):
         if natural in ("healthy", "static") or (natural == "partial" and t < cut):
             surface = picture(label)
@@ -7276,27 +7282,40 @@ def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal
         if forced:
             surface = picture(label)
         file = f"{kind.replace('_', '-')}-{k}.png" if kind.startswith("play") else f"{kind.replace('_', '-')}.png"
-        calls.append(f"New-VisPng '{dest / file}' {surface[0]} {60 + 5 * i} {surface[1]} $false")
+        pictures.append((file, surface[0], 60 + 5 * i, surface[1]))
         if kind == "play_unbound":
             unforced[k] = surface
         entry = {"kind": kind, "index": k, "file": file, "display_frame": label, "serial": 900 + label - 600, "play_active": kind.startswith("play"),
-                 "tail_elapsed_ms": t, "capture_ms": 40.0, "viewport": VIEWPORT, "saved": True, "reason": ""}
+                 "tail_elapsed_ms": t, "capture_ms": 40.0, "viewport": None if kind == "play_unbound" and k in no_viewport else VIEWPORT,
+                 "saved": True, "reason": ""}
         if kind in ("stop", "paused"):
             entry.update({"painted_serial": 900 + label - 600, "painted_serial_valid": True, "label_bound": True, "label_bound_basis": "gl_window_paint"})
         if kind == "paused":
             entry.update({"settled": True, "settled_frame": label})
         if ordinal:
-            entry["forced_paints_before"] = forced_paints
+            entry["forced_paints_before"] = forced_paints + (1 if kind == "play_unbound" and k in observer else 0)
         frames.append(entry)
         if forced:
             forced_paints += 1
-    proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
-    assert proc.returncode == 0, proc.stdout + proc.stderr
     visual = {"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
               "tail_begin_utc": "2026-10-13T22:00:00.000Z", "tail_end_utc": "2026-10-13T22:00:03.100Z", "frames": frames, "frames_written": len(frames),
               "error": ""}
     if record_source:
         visual["source_difference"] = "identical" if natural == "static" else "differ"
+    return pictures, visual, unforced
+
+
+def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal: bool = True, record_source: bool = True,
+                                   observer: tuple[int, ...] = (), no_viewport: tuple[int, ...] = ()) -> dict:
+    """stateful_visual_model's captures written as the job publishes them: one PNG per capture (New-VisPng, through pwsh), visual.json and the job's
+    visual-capture-request.json. Returns the model's unforced play pictures (index -> picture)."""
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    pictures, visual, unforced = stateful_visual_model(order, natural, ordinal, record_source, observer, no_viewport)
+    calls = [f"New-VisPng '{dest / file}' {seed} {chrome} {bias} $false" for file, seed, chrome, bias in pictures]
+    proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
     (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
     (dest / "visual-capture-request.json").write_text(json.dumps({"schema": "mlv-app/visual-capture-request/v1", "requested": True, "probe": "supported",
                                                                   "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
@@ -7308,22 +7327,33 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
     isolate the NEXT unforced capture from the forced paint. With the display's own paint stuck, unforced k+1 shows forced k's paint (trace: initial,
     F0, F1, F2, F3, F4), so six distinct unforced pictures read as a moving display and neither FROZEN_DISPLAY nor the masking note fires. Driven by
     write_stateful_visual_captures, whose surface each forced capture mutates. The tests that read real PNGs are requires_windows_imaging (r4); the
-    model's own trace and the count-only verdict gate run on every OS."""
+    model's own trace (pure Python since r5: stateful_visual_model writes no file) and the count-only verdict gate run on every OS."""
 
-    def read(self, d: str, order: str, natural: str, ordinal: bool = True, record_source: bool = True) -> tuple[dict, dict]:
+    def read(self, d: str, order: str, natural: str, ordinal: bool = True, record_source: bool = True,
+             observer: tuple[int, ...] = (), no_viewport: tuple[int, ...] = ()) -> tuple[dict, dict]:
         art = Path(d) / "artifacts"
-        unforced = write_stateful_visual_captures(art / "visual", order, natural, ordinal, record_source)
+        unforced = write_stateful_visual_captures(art / "visual", order, natural, ordinal, record_source, observer, no_viewport)
         proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
                                   "| ConvertTo-Json -Depth 8 -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return unforced, out
 
     def test_the_visual_model_reproduces_dots_trace_on_the_r2_interleaved_order(self) -> None:
-        # the model itself: on the r2 order with the natural paint stuck, unforced k+1 shows forced k's picture
-        with tempfile.TemporaryDirectory(prefix="vis-trace-") as d:
-            unforced = write_stateful_visual_captures(Path(d) / "visual", "interleaved", "stuck")
+        # the model itself: on the r2 order with the natural paint stuck, unforced k+1 shows forced k's picture (no file, no pwsh: r5, Dot f589cdbf)
+        _, _, unforced = stateful_visual_model("interleaved", "stuck")
         self.assertEqual([unforced[k] for k in range(6)], [(3, 120)] + [((600 + 2 * k) % 7, (2 * k // 7) * 30) for k in range(5)])
         self.assertEqual(len(set(unforced.values())), 6, "six distinct unforced pictures over a frozen display")
+
+    def test_the_visual_model_traces_the_r3_order(self) -> None:
+        # r3 order: stuck shows forced play 5's paint on every unforced capture; partial moves three times, then repeats the third
+        pictures = {natural: stateful_visual_model("forced-first", natural)[2] for natural in ("stuck", "partial", "healthy")}
+        self.assertEqual(set(pictures["stuck"].values()), {(605 % 7, 0)})
+        self.assertEqual([pictures["partial"][k] for k in range(6)], [(4, 0), (5, 30), (6, 30), (6, 30), (6, 30), (6, 30)])
+        self.assertEqual(len(set(pictures["healthy"].values())), 6)
+        _, visual, _ = stateful_visual_model("forced-first", "partial", observer=(5,), no_viewport=(0,))
+        unforced = {f["index"]: f for f in visual["frames"] if f["kind"] == "play_unbound"}
+        self.assertEqual([unforced[k]["forced_paints_before"] for k in range(6)], [6, 6, 6, 6, 6, 7])
+        self.assertEqual([unforced[k]["viewport"] is None for k in range(6)], [True] + [False] * 5)
 
     @requires_windows_imaging
     def test_the_visual_reader_never_says_ok_over_unforced_captures_a_forced_paint_reached(self) -> None:
@@ -7361,18 +7391,21 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
     @requires_windows_imaging
     def test_the_visual_reader_reports_a_partial_freeze_on_the_r3_order(self) -> None:
         # the display's own paint stops landing at the fourth unforced capture: three unforced pictures repeat their predecessor while the app's label
-        # advanced. Not the whole-tail FROZEN_DISPLAY (three pictures differ), but the receipt counts and says it.
+        # advanced. Not the whole-tail FROZEN_DISPLAY (three pictures differ); r5 (hub ruling, ACK 6388020454): over source frames known to differ it
+        # is PARTIAL_FREEZE -- never OK -- counted and surfaced
         with tempfile.TemporaryDirectory(prefix="vis-r3-partial-") as d:
             _, out = self.read(d, "forced-first", "partial")
-            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
             self.assertEqual((out["playFrames"], out["distinctContentHashes"], out["repeatedPlayFrames"]), (6, 3, 3))
-            self.assertIn("3 of the 6 unforced play captures repeat", out["reason"])
+            self.assertIn("3 of the 6 judged play frames repeat the picture before them", out["reason"])
             self.assertIn("the display's own paint stopped landing for part of the tail", out["reason"], "the source frames are known to differ")
+            self.assertEqual(out["reason"].count("repeat the picture before them"), 1, "the verdict reason is not followed by the same repeat note")
+            self.assertIn("3 of the 6 unforced play captures repeat", out["repeatedPlayFramesNote"])
 
     @requires_windows_imaging
     def test_the_visual_reader_names_no_cause_for_a_repeat_over_unknown_source_content(self) -> None:
         # r4 (Dot a5acb3c8, hub ACK 6386874544): the same repeats, but nothing records whether the source frames differ, so a repeat may be the
-        # source's own picture: the receipt says what it saw and does not name the display as the cause
+        # source's own picture: the receipt says what it saw and does not name the display as the cause (r5: still a note on an OK block)
         with tempfile.TemporaryDirectory(prefix="vis-r3-partial-unknown-") as d:
             _, out = self.read(d, "forced-first", "partial", record_source=False)
             self.assertEqual(out["verdict"], "OK", out["reason"])
@@ -7380,6 +7413,36 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
             self.assertIn("3 of the 6 unforced play captures repeat the picture before them while the app's label advanced", out["reason"])
             self.assertIn("a possible partial freeze or repeated source pictures, not a proven cause", out["reason"])
             self.assertNotIn("the display's own paint stopped landing", out["reason"])
+            self.assertEqual(out["repeatedPlayFramesNote"], out["reason"])
+
+    @requires_windows_imaging
+    def test_the_repeat_note_is_reported_whatever_reason_was_set_first(self) -> None:
+        # r5 (Grok G4 6386577997, G3 6386571526): the repeat note used to be set only when no earlier note held `reason`, so an observer-painted or
+        # viewport-unavailable note hid it and a half-tail freeze read as a plain OK note. repeatedPlayFramesNote carries it on its own; `reason`
+        # keeps its first-wins rule. (observer / no_viewport: unforced play indexes; see stateful_visual_model)
+        rows = [  # observer, no_viewport, the note that wins `reason`, judged, repeats, verdict over a known-differ source
+            ((5,), (), "1 unforced play frame(s) followed a forced paint the others did not and were not judged", 5, 2, "PARTIAL_FREEZE"),
+            ((), (0,), "1 saved play frame(s) have no usable viewport rectangle and were not judged", 5, 3, "PARTIAL_FREEZE"),
+            ((4, 5), (), "2 unforced play frame(s) followed a forced paint the others did not and were not judged", 4, 1, "OK"),   # one repeat alone: OK
+        ]
+        for observer, no_viewport, first_note, judged, repeats, known_verdict in rows:
+            for record_source in (False, True):
+                with self.subTest(observer=observer, no_viewport=no_viewport, record_source=record_source), \
+                        tempfile.TemporaryDirectory(prefix="vis-r5-repeat-note-") as d:
+                    _, out = self.read(d, "forced-first", "partial", record_source=record_source, observer=observer, no_viewport=no_viewport)
+                    self.assertEqual((out["playFrames"], out["repeatedPlayFrames"]), (judged, repeats))
+                    note = out["repeatedPlayFramesNote"]
+                    self.assertIsNotNone(note, out["reason"])
+                    self.assertTrue(note.startswith(f"{repeats} of the {judged} unforced play captures repeat the picture before them"), note)
+                    self.assertIn(first_note, out["reason"])
+                    if record_source:
+                        self.assertEqual((out["verdict"], out["counted"]), (known_verdict, True), out["reason"])
+                        self.assertIn("the display's own paint stopped landing for part of the tail", note)
+                    else:
+                        self.assertEqual(out["verdict"], "OK", out["reason"])
+                        self.assertTrue(out["reason"].startswith(first_note), "reason keeps its first-wins rule")
+                        self.assertNotIn(note, out["reason"], "the earlier note still holds reason; the repeat note is in its own field")
+                        self.assertIn("not a proven cause", note)
 
     @requires_windows_imaging
     def test_the_visual_reader_waives_a_repeated_source_on_the_r3_order(self) -> None:
@@ -7703,11 +7766,13 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                   "-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true | ConvertTo-Json -Compress")
         self.assertEqual((proc.returncode, out["verdict"]), (0, "FROZEN_DISPLAY_SUSPECTED"), "ViewportUnavailablePlayFrames defaults to 0")
 
-    def visual_verdict(self, src, play, unavailable, distinct):
-        """One Get-DvVisualVerdict call over `play` judged (viewport) play frames; src None omits -SourceDifference (the default)."""
+    def visual_verdict(self, src, play, unavailable, distinct, repeats=None, extra=""):
+        """One Get-DvVisualVerdict call over `play` judged (viewport) play frames; src None omits -SourceDifference (the default); repeats None omits
+        -RepeatedPlayFrames (the default, 0)."""
         src_arg = f"-SourceDifference {src} " if src else ""
+        repeats_arg = f"-RepeatedPlayFrames {repeats} " if repeats is not None else ""
         proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames 6 "
-                                  f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true {src_arg}-ViewportUnavailablePlayFrames {unavailable} | ConvertTo-Json -Compress")
+                                  f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true {src_arg}{repeats_arg}{extra}-ViewportUnavailablePlayFrames {unavailable} | ConvertTo-Json -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return out
 
@@ -7721,11 +7786,16 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         self.assertIsNone(self.visual_verdict("known-differ", 6, 0, 6)["reason"])
 
     # Prevention (CoS #474): when a pure verdict function gains a verdict, add rows that pair it with EVERY verdict that sets counted = false, and say which wins.
-    # (source difference, judged play frames, play frames without a viewport, distinct, winner); each pair must show BOTH of its verdicts winning somewhere.
+    # (source difference, judged play frames, play frames without a viewport, distinct[, repeated play frames], winner); each pair must show BOTH of its
+    # verdicts winning somewhere.
     NEW_VISUAL_VERDICT_PAIRINGS = {
         ("FROZEN_DISPLAY_SUSPECTED", "FROZEN_DISPLAY"): [("unknown", 6, 0, 1, "FROZEN_DISPLAY_SUSPECTED"), ("known-differ", 6, 0, 1, "FROZEN_DISPLAY")],
         ("VISUAL_ASSESSMENT_UNAVAILABLE", "FROZEN_DISPLAY"): [("known-differ", 5, 1, 1, "FROZEN_DISPLAY"), ("known-differ", 1, 5, 1, "VISUAL_ASSESSMENT_UNAVAILABLE"),
                                                               ("known-differ", 0, 6, 0, "VISUAL_ASSESSMENT_UNAVAILABLE")],
+        # r5: one picture while the label advances is the whole-tail freeze (every judged frame after the first repeats); more than one picture with two or
+        # more repeats is the partial one
+        ("PARTIAL_FREEZE", "FROZEN_DISPLAY"): [("known-differ", 6, 0, 1, 5, "FROZEN_DISPLAY"), ("known-differ", 6, 0, 3, 3, "PARTIAL_FREEZE"),
+                                               ("known-differ", 5, 1, 2, 2, "PARTIAL_FREEZE")],
     }
 
     def test_every_new_visual_verdict_is_paired_with_every_excluding_verdict(self) -> None:
@@ -7733,16 +7803,38 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         body = text[text.index("function Get-DvVisualVerdict {"):text.index("function New-DvVisualStrip {")]
         excluding = set(re.findall(r"verdict = '([A-Z_]+)'; counted = \$false", body))
         self.assertTrue(excluding, "the verdict function names no counted = $false verdict (the pairing check lost its subject)")
-        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE"):
+        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE", "PARTIAL_FREEZE"):
             for ex in sorted(excluding):
                 with self.subTest(new=new, excluding=ex):
                     rows = self.NEW_VISUAL_VERDICT_PAIRINGS.get((new, ex))
                     self.assertTrue(rows, f"add rows pairing {new} with the excluding verdict {ex} to NEW_VISUAL_VERDICT_PAIRINGS")
                     self.assertEqual({r[-1] for r in rows}, {new, ex}, "both verdicts of the pair must win somewhere")
-                    for src, play, unavailable, distinct, winner in rows:
-                        out = self.visual_verdict(src, play, unavailable, distinct)
-                        self.assertEqual(out["verdict"], winner, f"{src} play={play} unavailable={unavailable} distinct={distinct}: {out['reason']}")
+                    for *args, winner in rows:
+                        out = self.visual_verdict(*args)
+                        self.assertEqual(out["verdict"], winner, f"{args}: {out['reason']}")
         self.assertEqual({k[1] for k in self.NEW_VISUAL_VERDICT_PAIRINGS}, excluding, "a pairing names a verdict that no longer excludes")
+
+    def test_the_visual_gate_says_partial_freeze_for_repeats_over_source_frames_known_to_differ(self) -> None:
+        """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5 (hub ruling, ACK 6388020454 on #456): two or more repeated play frames while the label advanced, over
+        source frames KNOWN to differ, are PARTIAL_FREEZE (counted, never OK). One repeat stays OK; over an unknown or identical source the repeats stay a
+        note (the r4 wording) and the verdict does not change."""
+        rows = [  # source difference, distinct, repeats -> verdict
+            ("known-differ", 4, 2, "PARTIAL_FREEZE"), ("known-differ", 3, 3, "PARTIAL_FREEZE"), ("known-differ", 2, 4, "PARTIAL_FREEZE"),
+            ("known-differ", 5, 1, "OK"), ("known-differ", 6, 0, "OK"), ("known-differ", 6, None, "OK"),
+            ("unknown", 3, 3, "OK"), (None, 3, 3, "OK"), ("known-identical", 3, 3, "OK"),
+            ("known-differ", 1, 5, "FROZEN_DISPLAY"), ("unknown", 1, 5, "FROZEN_DISPLAY_SUSPECTED"),
+        ]
+        for src, distinct, repeats, verdict in rows:
+            with self.subTest(source=src, distinct=distinct, repeats=repeats):
+                out = self.visual_verdict(src, 6, 0, distinct, repeats)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, verdict != "FROZEN_DISPLAY"), out["reason"])
+                if verdict == "PARTIAL_FREEZE":
+                    self.assertIn(f"{repeats} of the 6 judged play frames repeat the picture before them", out["reason"])
+        # a partial freeze is judged on the play frames, so it outranks the paused-capture verdicts, as the frozen ones do
+        for extra in ("-LabelBound $false -PausedLabelBound $true ", "-Threshold 1 "):
+            with self.subTest(extra=extra):
+                self.assertEqual(self.visual_verdict("known-differ", 6, 0, 3, 3, extra)["verdict"], "PARTIAL_FREEZE")
+                self.assertIn(self.visual_verdict("known-differ", 6, 0, 3, 1, extra)["verdict"], ("CAPTURE_UNBOUND", "VISUAL_DIVERGENCE"))
 
     def test_the_default_divergence_threshold_is_six_not_twelve(self) -> None:
         # The gate table above passes -Threshold explicitly, so it cannot see the module default. These rows pass none: a same-position
@@ -7878,7 +7970,7 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
             self.assertEqual(out["frozenJudgedOn"], "play_unbound")
             self.assertEqual((out["playFrames"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"]), (6, 1, 6))
-            self.assertEqual(out["playForcedUnforcedDifferFrames"], 5, "play 1 is the one index whose forced and unforced pictures agree")
+            self.assertEqual(out["repeatedPlayFrames"], 5, "the whole-tail FROZEN_DISPLAY outranks the repeats it implies")
             self.assertIn("the force-paint would have masked this", out["reason"])
             names = sorted(f["file"] for f in out["frames"])
             self.assertEqual(names, sorted([f"unit-leg-play-{k}.png" for k in range(6)] + [f"unit-leg-play-unbound-{k}.png" for k in range(6)]
@@ -7886,14 +7978,22 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             for f in out["frames"]:
                 self.assertEqual(f["sha256"], hashlib.sha256((ev / "visual" / f["file"]).read_bytes()).hexdigest())
         with tempfile.TemporaryDirectory(prefix="vis-paired-") as d:
-            _, out = self.read_visual_mode("paired-ok", d)
-            self.assertEqual(out["verdict"], "OK", out["reason"])
-            self.assertEqual((out["frozenJudgedOn"], out["distinctContentHashes"], out["playForcedUnforcedDifferFrames"]), ("play_unbound", 6, 0))
+            # r5 (Grok G1/G3): the r3 order takes unforced k half a tail after forced k, so a healthy display shows them DIFFERENT pictures; the r2
+            # index pairing (playForcedUnforcedDifferFrames) read that as six disagreements and is no longer reported
+            ev, out = self.read_visual_mode("paired-ok", d)
+            self.assertEqual((out["verdict"], out["reason"]), ("OK", None))
+            self.assertEqual((out["frozenJudgedOn"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"], out["repeatedPlayFrames"]),
+                             ("play_unbound", 6, 6, 0))
+            frames = {(f["kind"], f["index"]): f for f in out["frames"]}
+            self.assertTrue(all(frames[("play", k)]["contentHash"] != frames[("play_unbound", k)]["contentHash"] for k in range(6)),
+                            "the fixture models the r3 order: no unforced capture is a same-instant twin of a forced one")
+            self.assertNotIn("playForcedUnforcedDifferFrames", out)
             self.assertTrue(Path(out["stripPath"]).is_file())
         with tempfile.TemporaryDirectory(prefix="vis-old-") as d:
             _, out = self.read_visual_mode("ok", d)
-            self.assertEqual((out["frozenJudgedOn"], out["forcedPlayDistinctContentHashes"], out["playForcedUnforcedDifferFrames"]), ("play", None, None),
+            self.assertEqual((out["frozenJudgedOn"], out["forcedPlayDistinctContentHashes"]), ("play", None),
                              "a build without unforced play captures is judged on its play captures, as before")
+            self.assertNotIn("playForcedUnforcedDifferFrames", out)
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;
@@ -8072,6 +8172,18 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["outcome"], "INVALID")
         self.assertIn("FROZEN_DISPLAY", receipt["outcomeDetail"])
         self.assertFalse(receipt["visual"]["counted"])
+
+    def test_a_partial_freeze_leg_is_counted_and_surfaced_never_read_as_ok(self) -> None:
+        """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5 (hub ruling, ACK 6388020454): the measured run's PARTIAL_FREEZE is surfaced in the outcome detail like the
+        other counted non-OK verdicts, and a self-heal pre-launch with one makes the leg INVALID (that gate needs OK)."""
+        _, receipt, _ = self.run_visual("partial-freeze")
+        self.assertEqual((receipt["visual"]["verdict"], receipt["visual"]["counted"], receipt["visual"]["repeatedPlayFrames"]), ("PARTIAL_FREEZE", True, 3))
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("PARTIAL_FREEZE (counted for speed, surfaced for review)", receipt["outcomeDetail"])
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "partial-freeze"})
+        self.assertEqual(receipt["selfHealVisual"]["pre-1"]["verdict"], "PARTIAL_FREEZE")
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("PARTIAL_FREEZE on self-heal pre-launch pre-1", receipt["outcomeDetail"])
 
     def run_self_heal_visual(self, measured: str, launches: dict, declared: int | None = None, **spec_fields):
         """launches: pre-<n> -> a write_visual_captures mode, or None for a pre-launch that published its self-heal\\pre-<n> but no visual\\.
