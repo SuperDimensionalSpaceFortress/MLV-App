@@ -107,9 +107,10 @@ param(
     # VenueChain) still want such a job run.
     [string]$NotAfterUtc = '',
     # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: the same notAfterUtc RELATIVE to the drop (see UmRunDrop.psm1): the drop writes
-    # min(its own UtcNow, read immediately before the claim, + -NotAfterBudgetSec, -NotAfterCapUtc). A submitter that sizes the
-    # bound from this client's waits passes them here, so a slow start or share before the drop never leaves the bound short of
-    # the waits that follow it. 0 / '' (the defaults) send none; passing either with -NotAfterUtc is UMRUN_NOT_AFTER_CONFLICT.
+    # min(its own UtcNow, read immediately before the job's rename into view, + -NotAfterBudgetSec, -NotAfterCapUtc) (r3: after
+    # every side-file and job copy, not before the claim). A submitter that sizes the bound from this client's waits passes them
+    # here, so neither a slow start nor slow share placement leaves the bound short of the waits that follow visibility (they start
+    # at $submittedAt below). 0 / '' (the defaults) send none; passing either with -NotAfterUtc is UMRUN_NOT_AFTER_CONFLICT.
     [int]$NotAfterBudgetSec = 0,
     [string]$NotAfterCapUtc = '',
     # Test-only: invoked with no arguments the instant the queue deadline is judged reached and no

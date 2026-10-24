@@ -479,7 +479,14 @@ function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]
     if ($remain -lt 30) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "only $remain s of the $MaxTotalSec s cap left before the $Step submission; nothing was submitted" }
     $timeoutSec = [Math]::Min($JobTimeoutSec, $remain); $admissionSec = [Math]::Min(7200, $remain)
     if ($TestNotAfterSampleDelayMs -gt 0) { Start-Sleep -Milliseconds $TestNotAfterSampleDelayMs }
-    $notAfter = Get-DvJobNotAfter -TimeoutSec $timeoutSec -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $admissionSec -MaxClaimedWaitSec $remain -CallerCapSec $remain -CallerDeadlineUtc $script:Deadline -LaterHarvest:$LaterHarvest
+    # r3 (STAGE-NOTAFTER-THROW-TYPED-EXIT-1): a deadline that passes between the sample and the bound is the cap running out, so it is the typed cap exit,
+    # never an untyped throw out of the driver.
+    try {
+        $notAfter = Get-DvJobNotAfter -TimeoutSec $timeoutSec -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $admissionSec -MaxClaimedWaitSec $remain -CallerCapSec $remain -CallerDeadlineUtc $script:Deadline -LaterHarvest:$LaterHarvest
+    } catch {
+        if ([string]$_.Exception.Message -match '^DVE_NOT_AFTER_DEADLINE_PASSED') { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s deadline passed before the $Step submission's bound was computed; nothing was submitted ($($_.Exception.Message))" }
+        throw
+    }
     # um-run.ps1 reports every non-receipt end by THROWING; pwsh's own error view wraps and decorates that text, so the child catches it and prints the message
     # on ONE line (UMRUN_ERROR <message>). The returned result object is discarded: the outbox result.json is read by name afterwards.
     $lit = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }

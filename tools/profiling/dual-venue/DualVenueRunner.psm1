@@ -2319,9 +2319,11 @@ $script:DvUmRunMaxAdmissionWaitSec = 7200
 # Added to an uncapped bound: um-run reads the outbox every -PollSeconds (3 s), so the client can still be waiting a little past its waits.
 # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r2 (hub ruling on sol's r1 blocker): the uncapped bound is no longer counted from this helper's clock. The
 # submitter passes it as um-run.ps1 -NotAfterBudgetSec (budgetSec below), and UmRunDrop.psm1 counts it from its own clock read immediately before the claim
-# is written, so a slow setup or share before the drop is absorbed a priori, whatever its length. The slack is then only the room between that clock read
-# and um-run's 'submitted' line (the job file's own copy; side-files, which the stage driver's cap bounds anyway) plus the poll above. It is no longer a
-# tolerance for a late drop, and the measured witness (Test-DvNotAfterCoversDrop, DVE_NOT_AFTER_DROP_LATE) must never fire on the uncapped path.
+# is written, so a slow setup or share before the drop is absorbed a priori, whatever its length. r3 (sol r2 blocker): the drop reads its clock AGAIN
+# immediately before the job's rename into view, after every side-file and the job's own copy, and re-publishes the value it re-derives, so slow placement
+# is absorbed too. The slack is then only the room between that last read and um-run's 'submitted' line (a fixed few small share operations: the
+# metadata re-publish and the job's rename, whatever the files' sizes) plus the poll above. It is no longer a tolerance for a late drop, and the measured
+# witness (Test-DvNotAfterCoversDrop, DVE_NOT_AFTER_DROP_LATE) must never fire on the uncapped path.
 $script:DvNotAfterSlackSec = 60
 
 function Get-DvJobNotAfter {
@@ -2481,7 +2483,7 @@ function Test-DvNotAfterCoversDrop {
         $margin = [Math]::Round(($judged - $drop.AddSeconds([double]$NotAfter.waitSec)).TotalSeconds, 3)
         $covered = $margin -ge 0
         $why = $(if ($relative -and $covered) { "the drop counted notAfterUtc from its own clock$(if ($sampled) { " ($sampled)" }), the job visible $delay s after the bound's anchor: every um-run wait ends before notAfterUtc" }
-            elseif ($relative) { "DVE_NOT_AFTER_DROP_LATE (defect: a drop-relative bound always covers) the drop reported notAfterUtc $($judged.ToString('o')), $(-$margin) s short of the job's visibility ($delay s after the anchor) + every um-run wait" }
+            elseif ($relative) { "DVE_NOT_AFTER_DROP_LATE (defect: the drop's last clock read$(if ($sampled) { " ($sampled)" }) was more than the slack before the job was visible, or the drop did not count from it) the drop reported notAfterUtc $($judged.ToString('o')), $(-$margin) s short of the job's visibility ($delay s after the anchor) + every um-run wait" }
             elseif ($covered) { "the job was visible $delay s after the bound's anchor, inside its $($NotAfter.dropToleranceSec) s tolerance: every um-run wait ends before notAfterUtc" }
             else { "DVE_NOT_AFTER_DROP_LATE the job was visible $delay s after the bound's anchor, past its $($NotAfter.dropToleranceSec) s tolerance: the agent stops taking it $(-$margin) s before um-run's last wait ends" })
     }

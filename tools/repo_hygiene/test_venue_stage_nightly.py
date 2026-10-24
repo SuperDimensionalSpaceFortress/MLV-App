@@ -943,5 +943,48 @@ class VenueStageReuseModuleTests(unittest.TestCase):
         self.assertTrue(other.startswith("SOURCE-mismatch"), other)
 
 
+@requires_windows_pwsh
+class StageNotAfterTypedExitTests(unittest.TestCase):
+    """LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r3 (STAGE-NOTAFTER-THROW-TYPED-EXIT-1, sol/fable r2 hardening): the driver's Invoke-UmRun, lifted out of the
+    driver as it is, with its collaborators stubbed. The remaining-budget sample says 600 s are left, but the absolute deadline has already passed when the
+    not-after helper runs (a scheduling delay between the two): the helper's DVE_NOT_AFTER_DEADLINE_PASSED is the typed STAGE_CAP_EXCEEDED exit, never an
+    untyped throw, and nothing reaches um-run."""
+
+    def lifted(self, deadline_offset_sec: int, later_harvest: bool = False) -> subprocess.CompletedProcess:
+        text = DRIVER.read_text(encoding="utf-8")
+        fn = text[text.index("function Invoke-UmRun("):text.index("# ------------------------------------------------------------------ 6. DLL pair")]
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force -DisableNameChecking\n"
+            "function Assert-VenueFree { param($w) }\n"
+            "function Assert-StagePackageSideFile { param($Side, $JobId, $FailToken) }\n"
+            "function Get-RemainingSec { 600 }\n"
+            "function Say { param($m) [Console]::Out.WriteLine(\"SAY $m\") }\n"
+            "function Invoke-Child { [Console]::Out.WriteLine('CHILD_STARTED'); [pscustomobject]@{ timedOut = $false; exit = 0; out = 'UMRUN_RETURNED'; err = '' } }\n"
+            "function Stop-Nightly([string]$Reason, [string]$Detail = '') { [Console]::Out.WriteLine(\"STOP $Reason $Detail\"); exit 50 }\n"
+            "$UmRun = 'C:\\nowhere\\um-run.ps1'; $MaxTotalSec = 600; $TestNotAfterSampleDelayMs = 0\n"
+            f"$script:Deadline = [DateTime]::UtcNow.AddSeconds({deadline_offset_sec})\n"
+            + fn +
+            f"\n$r = Invoke-UmRun 'stage' 'C:\\nowhere\\job.ps1' @() 'stage-job' 'C:\\nowhere\\share' 3600 'STAGE_FAILED'{' -LaterHarvest' if later_harvest else ''}\n"
+            "[Console]::Out.WriteLine(\"RETURNED $r\")\n"
+        )
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120,
+                              stdin=subprocess.DEVNULL)
+
+    def test_a_deadline_passed_at_the_bound_is_the_typed_cap_exit_and_submits_nothing(self) -> None:
+        p = self.lifted(-5)
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 50, out)
+        self.assertRegex(p.stdout, r"(?m)^STOP STAGE_CAP_EXCEEDED .*deadline passed before the stage submission's bound was computed; nothing was submitted")
+        self.assertIn("DVE_NOT_AFTER_DEADLINE_PASSED", p.stdout)
+        self.assertNotIn("CHILD_STARTED", out, "um-run is never started")
+
+    def test_a_live_deadline_still_submits(self) -> None:
+        p = self.lifted(3600)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("CHILD_STARTED", p.stdout)
+        self.assertIn("RETURNED OK", p.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
