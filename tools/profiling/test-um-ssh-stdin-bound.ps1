@@ -200,7 +200,11 @@ function Test-KnownHostsPath([string]$Script, [string]$Tag) {
         $opt = @($r.Args | Where-Object { $_ -like 'UserKnownHostsFile=*' })
         if ($opt.Count -ne 1) { return @("known_hosts: expected exactly one UserKnownHostsFile option, got $($opt.Count)") }
         $sshExe = $ProbeSshPath
-        if (-not $sshExe) { $sshExe = [string](Get-Command ssh.exe -ErrorAction SilentlyContinue).Source }
+        if (-not $sshExe) {
+            # No ssh.exe on PATH leaves $null here; strict mode forbids .Source on it, so test first.
+            $found = Get-Command ssh.exe -ErrorAction SilentlyContinue
+            if ($found) { $sshExe = [string]$found.Source }
+        }
         if ($sshExe) {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = $sshExe
@@ -208,13 +212,16 @@ function Test-KnownHostsPath([string]$Script, [string]$Tag) {
             $psi.UseShellExecute = $false
             $psi.CreateNoWindow = $true
             $psi.RedirectStandardOutput = $true
+            $probeClock = [System.Diagnostics.Stopwatch]::StartNew()
             $p = [System.Diagnostics.Process]::Start($psi)
             # Read stdout asynchronously so ONE deadline covers the probe: a blocking ReadToEnd would
-            # wait on a hung probe that holds stdout open and the bound could never fire.
+            # wait on a hung probe that holds stdout open and the bound could never fire. The wait and the
+            # drain share that one deadline (the drain gets whatever time is left, never a second grace).
             $outTask = $p.StandardOutput.ReadToEndAsync()
-            if (-not ($p.WaitForExit($ProbeDeadlineSeconds * 1000) -and $outTask.Wait(5000))) {
+            $left = { [int][Math]::Max(0, $ProbeDeadlineSeconds * 1000 - $probeClock.ElapsedMilliseconds) }
+            if (-not ($p.WaitForExit((& $left)) -and $outTask.Wait((& $left)))) {
                 try { $p.Kill($true) } catch { }
-                $p.WaitForExit()
+                [void]$p.WaitForExit(5000)
                 return @("known_hosts: ssh -G did not exit within $ProbeDeadlineSeconds s; the probe tree was killed")
             }
             $text = $outTask.Result

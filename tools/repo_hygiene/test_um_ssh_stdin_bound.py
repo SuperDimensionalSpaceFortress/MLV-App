@@ -42,7 +42,10 @@ class UmSshStdinBoundTests(unittest.TestCase):
         pwsh = shutil.which("pwsh")
         if not pwsh:
             self.skipTest("pwsh not installed")
-        deadline = 3
+        deadline = 5  # cmd.exe + a cold pwsh must write the pidfile before it, or the test fails on a loaded host
+        # Measured 6.4-6.8 s at a 3 s deadline on the loaded hub VM (~3.5 s of pwsh start-up and the guard's own
+        # um-ssh scenario); 15 s of headroom is ~4x that and still far below a delayed-failure mutant (30 s).
+        allowance = deadline + 15
         with tempfile.TemporaryDirectory() as tmp:
             pidfile = Path(tmp) / "hung-probe.pid"
             env = dict(os.environ, MLV_HUNG_PROBE_PIDFILE=str(pidfile))
@@ -57,7 +60,7 @@ class UmSshStdinBoundTests(unittest.TestCase):
                     stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, env=env,
                 )
                 try:
-                    guard.wait(timeout=45)
+                    guard.wait(timeout=allowance)
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     subprocess.run(["taskkill.exe", "/T", "/F", "/PID", str(guard.pid)], capture_output=True)
@@ -74,8 +77,28 @@ class UmSshStdinBoundTests(unittest.TestCase):
         self.assertEqual(guard.returncode, 1, text)
         self.assertIn("ssh -G did not exit within %d s" % deadline, text)
         self.assertIn("OVERALL FAIL", text)
-        self.assertLess(elapsed, 45, "the guard took %.1f s for a %d s deadline" % (elapsed, deadline))
+        self.assertLess(elapsed, allowance, "the guard took %.1f s for a %d s deadline (allowance %d s)" % (elapsed, deadline, allowance))
         self.assertFalse(still_alive, "the hung probe (pid %s) was left running after the deadline" % probe_pid)
+
+    @unittest.skipUnless(sys.platform == "win32", "um-ssh.ps1 is Windows-only")
+    def test_guard_without_ssh_exe_on_path_takes_the_argv_fallback(self):
+        """UM-SSH-G-PROBE-DEADLINE-1 r2: no ssh.exe on PATH must reach the argv check, not throw under strict mode."""
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            # The seam is PATH itself: the guard looks ssh.exe up with Get-Command, and the only PATH entry
+            # is an empty directory. pwsh is launched by absolute path, so it needs no PATH to start.
+            env = dict(os.environ, PATH=tmp)
+            result = subprocess.run(
+                [pwsh, "-NoProfile", "-NonInteractive", "-File", str(GUARD), "-KnownHostsOnly"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120, env=env, cwd=tmp,
+            )
+        text = result.stdout + result.stderr
+        self.assertNotIn("cannot be found on this object", text)
+        self.assertEqual(result.returncode, 0, text)
+        self.assertIn("PASS known_hosts path with space and ! stays one file", text)
+        self.assertIn("OVERALL PASS", text)
 
     @staticmethod
     def _pid_alive(pid):
