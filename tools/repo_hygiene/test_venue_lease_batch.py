@@ -64,6 +64,15 @@ switch ($mode) {
     'FOREIGN' { 'FOREIGN_FLOOR owners=explorer:1,textinputhost:2,bloody7:3 floorMean=32.0% waitedSec=1 probes=3'; "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'BUSY' { 'GATE_BUSY quiet-probe waitedSec=1'; exit 3 }
     'UNKNOWN' { "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=1 reason=probe-failed"; exit 6 }
+    'STEAL' {
+        # r5b (Grok G1): another owner's claim replaces the run's mid-batch (another nonce; its owner pid is dead, so the next batch may break it). The probe
+        # itself reads QUIET; it waits long enough for a 1 s claim keeper to see the claim NOT_OURS.
+        for ($i = 0; $i -lt 20; $i++) {
+            try { $t = [IO.File]::ReadAllText($env:FAKE_CLAIM_PATH); [IO.File]::WriteAllText($env:FAKE_CLAIM_PATH, ($t -replace '"nonce":"[^"]*"', '"nonce":"stolen00000000"' -replace '"ownerPid":\d+', '"ownerPid":99999999')); break } catch { Start-Sleep -Milliseconds 100 }
+        }
+        Start-Sleep -Seconds 3
+        "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0
+    }
 }
 """
 
@@ -77,6 +86,9 @@ $st = $(if (Test-Path -LiteralPath $stateFile) { Get-Content -LiteralPath $state
 $held = [bool]($env:FAKE_CLAIM_PATH -and (Test-Path -LiteralPath $env:FAKE_CLAIM_PATH))
 # r4: -NotAfterUtc as passed ('<unset>' when the runner did not pass it), which the real um-run writes as meta.json notAfterUtc
 Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} UMRUN {1} claimHeld={2} notAfter={3} body={4}" -f [DateTime]::UtcNow.Ticks, $JobId, $held, $NotAfterUtc, ((Get-Content -LiteralPath $ScriptPath -Raw) -replace '\s+', ' ').Trim())
+# r5b: the job is dropped into <share>\inbox\<jobId>.job.ps1 first, as the real um-run does (um-run.ps1 $jobFile)
+New-Item -ItemType Directory -Force -Path (Join-Path $AgentShare 'inbox') | Out-Null
+Copy-Item -LiteralPath $ScriptPath -Destination (Join-Path $AgentShare "inbox\$JobId.job.ps1")
 $now = [DateTimeOffset]::UtcNow
 $token = $JobId.Substring($JobId.Length - 12)
 function Pick([string]$List, [int]$I, [string]$Default) { $v = @(([string]$List) -split ',' | Where-Object { $_ }); if ($v.Count -eq 0) { return $Default }; $v[[Math]::Min($I, $v.Count - 1)] }
@@ -92,7 +104,11 @@ if ($JobId -like 'lease-batch-open-*') {
     [pscustomobject]@{ opens = $n + 1; leaseId = $lid; token = $token } | ConvertTo-Json | Set-Content -LiteralPath $stateFile
     # r5: FAKE_OPEN_SLEEP per open: um-run blocks this long first, as it does while the agent re-asks a refused (exit 75) request for the open
     $sleep = [int](Pick $env:FAKE_OPEN_SLEEP $n '0')
+    # r5b: FAKE_OPEN_CLAIM_READONLY per open (1 = the claim file is read-only for that wait, so every renewal comes back BUSY; writable again after it)
+    $ro = (Pick $env:FAKE_OPEN_CLAIM_READONLY $n '0') -eq '1'
+    if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $true }
     if ($sleep -gt 0) { Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} OPENWAIT {1} sec={2}" -f [DateTime]::UtcNow.Ticks, $JobId, $sleep); Start-Sleep -Seconds $sleep; $now = [DateTimeOffset]::UtcNow }
+    if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $false }
     $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
     if ($mode -eq 'gatehold') {
         # r3: um-run gave up while the agent still holds the open in its gate, and NO result lands: the agent keeps re-asking until it is cancelled.
@@ -112,6 +128,8 @@ if ($JobId -like 'lease-batch-close-*') {
     $cf = Join-Path $AgentShare 'fake-close-count.txt'
     $c = $(if (Test-Path -LiteralPath $cf) { [int](Get-Content -LiteralPath $cf) } else { 0 })
     Set-Content -LiteralPath $cf -Value ($c + 1)
+    # r5b: the cancel files already present when the close was submitted
+    Add-Content -LiteralPath (Join-Path $AgentShare 'fake-close-cancels.txt') -Value ("{0} {1}" -f $JobId, (@(Get-ChildItem -LiteralPath (Join-Path $AgentShare 'cancel') -Filter '*.cancel' -Name) -join ','))
     if ((Pick $env:FAKE_CLOSE_MODES $c 'ok') -eq 'timeout') { throw "UNRESOLVED: $JobId (fake) was not taken by the agent before -MaxQueueWaitSec" }
     $logs = Join-Path $AgentShare 'logs'
     New-Item -ItemType Directory -Force -Path $logs | Out-Null
@@ -165,7 +183,9 @@ $nRef = [int](Pick $env:FAKE_LEG_REFUSALS $k '0')
 if ($nRef -gt 0) { $res.admission['leaseRefusals'] = @(1..$nRef | ForEach-Object { [ordered]@{ reason = 'refused'; rc = 75; why = 'quiet lease cooldown' } }) }
 $stop = Pick $env:FAKE_LEG_STOPS $k 'none'
 if ($stop -ne 'none') { $res.exitCode = 124; $res.admission['slotContinuity'] = 'lost'; $res.admission['leaseStop'] = [ordered]@{ reason = $stop; why = 'fake' } }
-$res | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outbox "$jobId.result.json")
+# r5b: FAKE_LEG_MODES 'unresolved' = um-run said UNRESOLVED for the leg's job (um-run.ps1:480-501): no agent result lands by name, and Invoke-VenueLeg still
+# writes its receipt (DVE_OUTCOME=UNRESOLVED) and exits 0
+if ($legMode -ne 'unresolved') { $res | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outbox "$jobId.result.json") }
 $id = [guid]::NewGuid().ToString()
 $rdir = Join-Path $env:FAKE_LEG_ROOT "receipts\CARD-1\$leaf\$Venue"
 New-Item -ItemType Directory -Force -Path $rdir | Out-Null
@@ -173,7 +193,7 @@ $rp = Join-Path $rdir "$id.json"; Set-Content -LiteralPath $rp -Value '{}'
 $edir = Join-Path $env:FAKE_LEG_ROOT "evidence\$id"; New-Item -ItemType Directory -Force -Path $edir | Out-Null
 $pre = Pick $env:FAKE_LEG_PRELOADS $k '5'
 if ($pre -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $pre + '}}') }
-"DVE_OUTCOME=$(Pick $env:FAKE_LEG_OUTCOMES $k 'PASS')"
+"DVE_OUTCOME=$(if ($legMode -eq 'unresolved') { 'UNRESOLVED' } else { Pick $env:FAKE_LEG_OUTCOMES $k 'PASS' })"
 "DVE_RECEIPT_PATH=$rp"
 exit 0
 """
@@ -823,6 +843,126 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         got = json.loads(out.stdout)
         self.assertEqual((got["other"], got["same"], got["mine"], got["live"], got["rel"], got["gone"]), ("NOT_OURS", True, "RENEWED", "LIVE", "RELEASED", "ABSENT"), got)
         self.assertGreater(got["ttlLeft"], 500, got)
+
+    # ---------------------------------------------------------------- r5b: no sidecar, no open (dot ef5805a4 residual B1)
+    def _deny_writes(self, folder: Path) -> None:
+        """The first sidecar write fails: this user may not create files in the folder (a deny ACE). Removed again at cleanup."""
+        who = f"{os.environ['USERDOMAIN']}\\{os.environ['USERNAME']}"
+        subprocess.run(["icacls", str(folder), "/deny", f"{who}:(OI)(CI)(WD,AD)"], check=True, capture_output=True, text=True, timeout=60)
+        self.addCleanup(subprocess.run, ["icacls", str(folder), "/remove:d", who], capture_output=True, text=True, timeout=60)
+
+    def _assert_no_open_submitted(self, r: subprocess.CompletedProcess, first: str) -> dict:
+        self.assertEqual(r.returncode, 9, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["openOutcome"], b["leaseId"], b["openCancel"], b["closeJobId"], b["ledger"]), ("LIVENESS_UNAVAILABLE", "NOT_SUBMITTED", None, None, None, None), b)
+        self.assertIn(f"first liveness write {first}", b["endDetail"])
+        self.assertEqual(self.kinds(), [], "no open, close, probe or leg once the first sidecar write failed")
+        self.assertEqual(list((self.share / "inbox").glob("*.job.ps1")) if (self.share / "inbox").exists() else [], [], "a job reached the inbox")
+        self.assertEqual(b["openLiveness"]["end"], "ABSENT", b["openLiveness"])
+        self.assertEqual(b["legsAttempted"], 0)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["stopReason"], res["ran"], res["counted"], res["notRun"]), ("LIVENESS_UNAVAILABLE", 0, 0, 2))
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn(f" BATCH_OPEN_LIVENESS batch=1 job={b['openJobId']} first={first} ", log)
+        return b
+
+    def test_r5b_a_missing_notafter_folder_submits_no_open(self) -> None:
+        # RED on 3da8db54: the open is submitted with no sidecar (the run goes on to its legs, exit 0).
+        (self.share / "notafter").rmdir()
+        b = self._assert_no_open_submitted(self.run_batch(self.specs[:2]), "NO_NOTAFTER_DIR")
+        self.assertIn("no notafter folder", b["endDetail"])
+
+    def test_r5b_a_failed_first_sidecar_write_submits_no_open(self) -> None:
+        # The folder is there but the write is denied: UNKNOWN. RED on 3da8db54 twice over: the writer said WRITTEN for a denied write (a .NET exception in
+        # try/finally with no catch ran on to '<WRITTEN>'), and the open was submitted anyway.
+        self._deny_writes(self.share / "notafter")
+        b = self._assert_no_open_submitted(self.run_batch(self.specs[:2]), "UNKNOWN")
+        self.assertIn("denied", b["endDetail"])
+
+    def test_r5b_a_runner_killed_right_after_a_failed_first_write_leaves_no_open_in_the_inbox(self) -> None:
+        # The early-death case: the first write is denied, and the runner is killed (process tree) 2 s after it logs that write, while an open it had
+        # submitted would be blocked in um-run (FAKE_OPEN_SLEEP). No OPEN job file is ever in the agent's inbox. RED on 3da8db54: the open is in the inbox.
+        self._deny_writes(self.share / "notafter")
+        args, e = self.batch_cmd([self.specs[0]], FAKE_OPEN_SLEEP="200")
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        try:
+            log = self.run_dir / "batch.log"
+            end = time.monotonic() + 60
+            while time.monotonic() < end and not (log.exists() and " BATCH_OPEN_LIVENESS " in log.read_text(encoding="utf-8")):
+                time.sleep(0.1)
+            time.sleep(2)
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+            p.wait(timeout=60)
+            time.sleep(2)   # anything in flight at the kill lands, or not
+            inbox = self.share / "inbox"
+            self.assertEqual(sorted(f.name for f in inbox.glob("lease-batch-open-*")) if inbox.exists() else [], [], "an OPEN reached the inbox after a failed first write")
+            self.assertNotIn("OPEN:", " ".join(self.kinds()))
+            self.assertIn(" first=UNKNOWN ", log.read_text(encoding="utf-8"))
+            self.assertFalse(_pid_alive(p.pid))
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+            p.stdout.close()
+            p.stderr.close()
+
+    # ---------------------------------------------------------------- r5b: no probe or leg without the claim (Grok G1, 6389240991)
+    def test_r5b_a_claim_taken_over_mid_batch_ends_the_batch_claim_lost_and_keeps_the_legs_already_run(self) -> None:
+        # Leg 1 runs and counts. Leg 2's probe replaces the claim file with another owner's (NOT_OURS); the 1 s keeper sees it, and the check before leg 2
+        # ends batch 1 CLAIM_LOST with leg 1 kept. Batch 2 breaks the dead owner's claim and runs leg 2. RED on 3da8db54: leg 2 runs in batch 1 with no claim.
+        r = self.run_batch(self.specs[:2], "-ClaimRenewSec", "1", FAKE_QUIET_MODES="QUIET,STEAL,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsRan"], b1["legsCounted"], b1["claimRenew"]["lost"]), ("CLAIM_LOST", 1, 1, "NOT_OURS"), b1)
+        self.assertIn("claim=NOT_OURS", b1["endDetail"])
+        self.assertTrue(b1["endDetail"].startswith("before leg 02-fx-b-spec:"), b1["endDetail"])
+        self.assertEqual([(l["status"], l["counted"]) for l in b1["legs"]], [("RAN", True)], "the leg already run stays as measured")
+        self.assertEqual((b2["endReason"], b2["legsCounted"]), ("ALL_LEGS_DONE", 1))
+        legs = [k for k in self.kinds() if k.startswith("LEG:")]
+        self.assertEqual(legs, [f"LEG:fx-a:{b1['token']}", f"LEG:fx-b:{b2['token']}"])
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn(" CLAIM_LOST batch=1 leg=02-fx-b-spec phase=leg claim=NOT_OURS ", log)
+        self.assertIn(" CLAIM_STALE_BROKEN venue=bachelor reason=dead-pid ", log)
+
+    def test_r5b_a_claim_past_its_last_good_expiry_ends_the_batch_claim_lost(self) -> None:
+        # -ClaimTtlSec 60, renewed every 20 s, but the claim file is read-only while um-run blocks 66 s on the open: every renewal comes back BUSY and the
+        # last good expiry (the one the claim was taken with) passes. The check before the first probe ends batch 1 CLAIM_LOST with nothing probed or run;
+        # batch 2 takes a fresh claim and runs the leg. RED on 3da8db54: batch 1 probes and runs the leg on an expired claim.
+        r = self.run_batch([self.specs[0]], "-ClaimTtlSec", "60", "-ClaimRenewSec", "20", FAKE_OPEN_SLEEP="66,0", FAKE_OPEN_CLAIM_READONLY="1,0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsAttempted"], b1["probeRetries"], b1["claimRenew"]["renews"], b1["claimRenew"]["lost"]), ("CLAIM_LOST", 0, 0, 0, None), b1)
+        self.assertIn("claim=EXPIRED", b1["endDetail"])
+        self.assertIn("lastRenew=BUSY", b1["endDetail"])
+        self.assertTrue(b1["endDetail"].startswith("before the probe of leg 01-fx-a-spec:"), b1["endDetail"])
+        self.assertEqual((b2["endReason"], b2["legsCounted"]), ("ALL_LEGS_DONE", 1))
+        k = self.kinds()
+        self.assertEqual(k, [f"OPEN:{b1['token']}", f"CLOSE:{b1['token']}", f"OPEN:{b2['token']}", "QUIET:QUIET", f"LEG:fx-a:{b2['token']}", f"CLOSE:{b2['token']}"])
+
+    # ---------------------------------------------------------------- r5b: an UNRESOLVED leg is withdrawn (hub 13:21Z B2 clause, dot 242171b3)
+    def test_r5b_a_leg_with_no_agent_result_is_withdrawn_before_the_close(self) -> None:
+        # um-run said UNRESOLVED for the leg's job (no result by name) and Invoke-VenueLeg exited 0 with its receipt. The leg is LEASE_LOST (uncounted) and its
+        # job is WITHDRAWN: its cancel file is written before the batch's close job is submitted. RED on 3da8db54: no cancel file, the job is left in place.
+        r = self.run_batch([self.specs[0]], FAKE_LEG_MODES="unresolved")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [leg] = b["legs"]
+        self.assertEqual((leg["outcome"], leg["class"], leg["counted"], leg.get("withdraw"), b["endReason"]), ("UNRESOLVED", "LEASE_LOST", False, "REQUESTED", "LEASE_LOST"), leg)
+        self.assertTrue((self.share / "cancel" / f"{leg['jobId']}.cancel").exists(), "the leg's job was left in place")
+        [close] = (self.share / "fake-close-cancels.txt").read_text(encoding="utf-8").splitlines()
+        self.assertIn(f"{leg['jobId']}.cancel", close.split(" ", 1)[1], "the leg was withdrawn only after the close was submitted")
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn(f" LEG_WITHDRAWN leg=01-fx-a-spec batch=1 jobId={leg['jobId']} result=ABSENT printedOutcome=UNRESOLVED cancel=REQUESTED", log)
+
+    def test_r5b_a_leg_with_its_result_is_never_withdrawn(self) -> None:
+        # The guard: a leg whose result is in hand gets no cancel file.
+        r = self.run_batch([self.specs[0]])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertNotIn("withdraw", b["legs"][0])
+        self.assertEqual(list((self.share / "cancel").iterdir()), [])
 
     # ---------------------------------------------------------------- the job-id contract with the agent
     def test_invoke_venue_leg_tags_its_job_with_the_batch_token_the_agent_reads(self) -> None:

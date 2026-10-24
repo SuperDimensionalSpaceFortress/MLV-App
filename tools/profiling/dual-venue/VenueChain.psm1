@@ -799,6 +799,22 @@ $r.state
     Start-VenueKeeper -StepText $step -Argument ([pscustomobject]@{ venue = $Venue; nonce = $Nonce; ttlSec = $TtlSec; claimDir = $ClaimDir }) -EverySec $RenewSec -State @{ renews = 0; expiresUtc = $null; lost = $null; renewSec = $RenewSec; ttlSec = $TtlSec }
 }
 
+function Get-VenueClaimKeeperLoss {
+    <#
+    .SYNOPSIS
+    r5b (Grok G1, 6389240991): is a claim held under Start-VenueClaimKeeper still the holder's? $null while it is. Lost when the keeper found it NOT_OURS or ABSENT, or
+    when the last good expiry has passed (the keeper's last renewal, else -ClaimExpiresUtc, the expiry the claim was taken with; an unreadable one counts as passed):
+    renewals that keep coming back BUSY or throwing leave the claim to expire. Returns @{ reason (NOT_OURS | ABSENT | EXPIRED); lastGoodExpiresUtc; detail }.
+    #>
+    param([Parameter(Mandatory)]$Keeper, $ClaimExpiresUtc = $null, $NowUtc = $null)
+    $s = $Keeper.state
+    $exp = ConvertTo-VenueUtc $(if ($s.expiresUtc) { $s.expiresUtc } else { $ClaimExpiresUtc })
+    $why = $(if ($s.lost) { [string]$s.lost } elseif ($null -eq $exp -or (Resolve-VenueNow $NowUtc) -ge $exp) { 'EXPIRED' } else { $null })
+    if ($null -eq $why) { return $null }
+    $expText = $(if ($null -ne $exp) { $exp.ToString('o') } else { 'UNKNOWN' })
+    [pscustomobject]@{ reason = $why; lastGoodExpiresUtc = $(if ($null -ne $exp) { $expText }); detail = "claim=$why lastGoodExpiresUtc=$expText renews=$($s.renews) errors=$($s.errors) lastRenew=$($s.last)$(if ($s.lastError) { " lastError=$($s.lastError)" })" }
+}
+
 # r5 (sol B1, the runner side of LEASE-BATCH-OPEN-RUNNER-LIVENESS-1 #663): the open's runner-liveness sidecar, <AgentShare>\notafter\<jobId>.json, in exactly the shape
 # the agent's Read-JobNotAfterSidecar / Get-JobNotAfterVerdict read (schema mlv-app/job-notafter-sidecar/v1, an object root, UTF-8, under 4096 bytes). Written to a tmp
 # name beside it and moved over it in one replacing rename (the agent reads with FileShare ReadWrite|Delete, so the rename never waits on a read). The notafter folder
@@ -808,11 +824,12 @@ param($A)
 $dir = Split-Path -Parent $A.path
 if (-not (Test-Path -LiteralPath $dir -PathType Container)) { '<NO_NOTAFTER_DIR>'; return }
 $tmp = $A.path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+# r5b: '<WRITTEN>' only after both calls returned. A .NET exception is statement-terminating, so try/finally alone ran on past a denied write and said WRITTEN.
 try {
     [IO.File]::WriteAllText($tmp, $A.json, [Text.UTF8Encoding]::new($false))
     [IO.File]::Move($tmp, $A.path, $true)
-} finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
-'<WRITTEN>'
+    '<WRITTEN>'
+} catch { '<WRITE_FAILED> ' + ($_.Exception.Message -replace '\s+', ' ') } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
 '@
 
 function New-VenueJobLivenessWrite {
@@ -834,7 +851,7 @@ function Write-VenueJobLiveness {
     $r = Invoke-VenueBoundedRead -ScriptText $script:LivenessWriteText -Argument $w -TimeoutSec $TimeoutSec
     $said = [string](@($r.value) -join '')
     $state = $(if (-not $r.answered) { 'UNKNOWN' } elseif ($said -ceq '<WRITTEN>') { 'WRITTEN' } elseif ($said -ceq '<NO_NOTAFTER_DIR>') { 'NO_NOTAFTER_DIR' } else { 'UNKNOWN' })
-    [pscustomobject]@{ state = $state; path = $w.path; aliveUntilUtc = $AliveUntilUtc.ToUniversalTime().ToString('o'); error = $(if ($state -ceq 'NO_NOTAFTER_DIR') { 'the agent share has no notafter folder' } else { $r.error }) }
+    [pscustomobject]@{ state = $state; path = $w.path; aliveUntilUtc = $AliveUntilUtc.ToUniversalTime().ToString('o'); error = $(if ($state -ceq 'NO_NOTAFTER_DIR') { 'the agent share has no notafter folder' } elseif ($said -clike '<WRITE_FAILED>*') { $said.Substring(15) } else { $r.error }) }
 }
 
 function Start-VenueJobLiveness {
@@ -1034,4 +1051,4 @@ Export-ModuleMember -Function Get-VenueDriverScriptMissing, Get-VenueMainRoot, G
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
     Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait,
-    Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Start-VenueJobLiveness, Stop-VenueJobLiveness
+    Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Start-VenueJobLiveness, Stop-VenueJobLiveness
