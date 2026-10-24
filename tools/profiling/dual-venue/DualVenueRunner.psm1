@@ -2324,6 +2324,10 @@ $script:DvUmRunMaxAdmissionWaitSec = 7200
 # is absorbed too. The slack is then only the room between that last read and um-run's 'submitted' line (a fixed few small share operations: the
 # metadata re-publish and the job's rename, whatever the files' sizes) plus the poll above. It is no longer a tolerance for a late drop, and the measured
 # witness (Test-DvNotAfterCoversDrop, DVE_NOT_AFTER_DROP_LATE) must never fire on the uncapped path.
+# r5 (Dot 180721e3 on r4): um-run.ps1 now ends its queue and admission waits at absolute deadlines counted from the drop's sampledUtc, so time after the job
+# is visible (the drop's return, um-run's own lines) no longer comes out of the slack either: what the slack still covers is the drop's measured placement
+# bound (UmRunDrop.psm1 UmRunNotAfterPlacementStallSec) and um-run's poll. The witness still judges from um-run's 'submitted' line, so a stall after
+# visibility longer than the slack is reported DVE_NOT_AFTER_DROP_LATE: conservative (the waits did not overrun), never the reverse.
 $script:DvNotAfterSlackSec = 60
 
 function Get-DvJobNotAfter {

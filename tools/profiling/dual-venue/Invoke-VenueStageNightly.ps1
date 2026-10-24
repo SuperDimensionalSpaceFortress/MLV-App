@@ -56,7 +56,8 @@
 #   2  USAGE (bad venue table, a receipt file outside .claude-state, a non-canonical receipt for the real venue share, a build root inside the checkout)
 #   3  capacity: DISK_FLOOR_REFUSED | HOST_COMMIT_REFUSED | BUILD_GUARD_REFUSED (the refusal text is printed verbatim)
 #   40 AGENT_BUSY (a live claim or queued ticket, another driver holds the venue lock, or um-run RETRACTED a job the agent never claimed)
-#   41 SHARE_UNREACHABLE (the share did not answer by name inside -ProbeTimeoutSec, or the agent has no heartbeat)
+#   41 SHARE_UNREACHABLE (the share did not answer by name inside -ProbeTimeoutSec, the agent has no heartbeat, or the share stalled through placement:
+#      UMRUN_NOT_AFTER_PLACEMENT_STALL, the job never visible)
 #   42 SOURCE_COMMIT_UNRESOLVED   43 GATE_UNAVAILABLE   44 DLLPAIR_FAILED   45 ASSEMBLE_FAILED   46 STAGE_FAILED   47 STAGE_VERIFY_MISMATCH
 #   48 SMOKE_RUNNER_STAGE_FAILED  49 STAGE_UNRESOLVED (um-run stopped while the agent may still own the job; not retried)  50 STAGE_CAP_EXCEEDED (-MaxTotalSec ran out)
 #   51 RECEIPT_IO_FAILED (the receipt could not be read for the night check, the reservation could not be persisted -- staging did not start -- or the closing
@@ -511,8 +512,12 @@ function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]
     if ($msg -match '^UNRESOLVED:') { Stop-Nightly 'STAGE_UNRESOLVED' "um-run $Step ($JobId): $msg (not retried in this call)" }
     if ($msg -match '^RETRACTED:') { Stop-Nightly 'AGENT_BUSY' "um-run $Step ($JobId) was never claimed: $msg" }
     if ($msg -match '^No agent heartbeat') { Stop-Nightly 'SHARE_UNREACHABLE' "um-run $Step : $msg" }
-    # r2: the drop refuses a cap (this call's deadline) that passed before its claim, before any share write.
-    if ($msg -match '^UMRUN_NOT_AFTER_CAP_PASSED') { Stop-Nightly 'STAGE_CAP_EXCEEDED' "um-run $Step ($JobId): the $MaxTotalSec s deadline passed before the drop; nothing was submitted ($msg)" }
+    # r2: the drop refuses a cap (this call's deadline) that passed before its claim, before any share write; r3/r4: or during placement, before the job's
+    # rename. r5 (Grok G5): the text says what holds in every case: the job was never made visible.
+    if ($msg -match '^UMRUN_NOT_AFTER_CAP_PASSED') { Stop-Nightly 'STAGE_CAP_EXCEEDED' "um-run $Step ($JobId): the $MaxTotalSec s deadline passed before the job was made visible; nothing was submitted ($msg)" }
+    # r5 (Grok G5): r4's placement-stall refusal means the share stalled through every re-derivation and the drop rolled its claim back, the job never visible.
+    # That is the share not answering in time with nothing submitted, so SHARE_UNREACHABLE, never the step's generic failure.
+    if ($msg -match '^UMRUN_NOT_AFTER_PLACEMENT_STALL') { Stop-Nightly 'SHARE_UNREACHABLE' "um-run $Step ($JobId): the share stalled while the job was being placed; the job was never made visible, nothing was submitted ($msg)" }
     $last = $(if ($msg) { $msg } else { Get-LastLine ($c.out + "`n" + $c.err) '\S' })
     Stop-Nightly $FailToken "um-run $Step ($JobId) exit $($c.exit): $(if ($last) { ([string]$last).Trim() })"
 }

@@ -936,6 +936,111 @@ class NotAfterInputOrderTests(unittest.TestCase):
                 self.assertFalse(r["copied"])
 
 
+@requires_windows_pwsh
+class PostVisibilityTailNotAfterTests(unittest.TestCase):
+    """r5 (Dot 180721e3 on 4f6c17cb, accepted by the hub as a defect): r4 bounded everything up to the job's rename, but the rename is followed by the drop's
+    own cleanup (UmRunDrop.psm1 at 4f6c17cb: the job temporary's handle dispose and a Test-Path on it, :976-979) and um-run starts its relative waits only
+    after Invoke-UmRunDrop returns (um-run.ps1 :187 buffers the call, :224 starts the clocks). Dot's trace: sample 05:00, budget 7560, a 300 s stall in that
+    tail -> notAfterUtc stays 07:06 while queue 120 + admission 7200 counted from 05:05 run to 07:07.
+    The REAL um-run.ps1 and the REAL drop, on a temp share with a heartbeat and no agent. um-run has no clock seam, so the trace is SCALED onto the wall
+    clock with Dot's ordering kept (stall > slack, stall > queue): queue QUEUE_SEC, admission ADMIT_SEC, budget = those plus TAIL_SLACK_SEC, and a
+    STALL_SEC sleep. The stall is a global function shadowing Test-Path and Write-Host (PowerShell resolves a function before a cmdlet, from the module and the
+    script alike), so it fires at the FIRST such call after the job file is visible, wherever that is: at 4f6c17cb the Test-Path at :979; the test needs no
+    seam the old code lacks. The admission-wait marker lands at um-run's queue deadline (its existing TestHookAtQueueDeadline seam), the latest an
+    admission wait can start. The assertion is the caller's: the last wait um-run runs (its admission ceiling, UNRESOLVED) ends at or before the visible job's
+    notAfterUtc."""
+    QUEUE_SEC = 6
+    ADMIT_SEC = 8
+    TAIL_SLACK_SEC = 6
+    STALL_SEC = 12
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="dv-na-tail-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(os.path.realpath(tmp.name))
+        self.share = self.tmp / "agent"
+        self.inbox = self.share / "inbox"
+        for d in (self.inbox, self.share / "outbox", self.share / "running"):
+            d.mkdir(parents=True)
+        (self.share / "heartbeat.txt").write_text("alive", encoding="utf-8")
+        local = self.tmp / "local"
+        local.mkdir()
+        self.job = local / "job-x.job.ps1"
+        self.job.write_text("Write-Output 'hi'\n", encoding="utf-8")
+
+    def run_tail(self, *, mode: str, stall_sec: float) -> dict:
+        """mode 'um-run': um-run.ps1 end to end (budget form, the waits above); 'drop': Invoke-UmRunDrop alone with the same budget. Returns {threw,
+        endUtc (the instant the call returned or threw), meta, fired (the command the stall fired in, '' if none), stallAtUtc, markerAtUtc,
+        tmpChecksAfterVisible (Test-Path calls naming the job's temporary after the job was visible)}."""
+        budget = self.QUEUE_SEC + self.ADMIT_SEC + self.TAIL_SLACK_SEC
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "$c = [Console]::In.ReadToEnd() | ConvertFrom-Json\n"
+            f"$global:TailStall = @{{ sec = [double]$c.stall; job = '{self.inbox / 'job-x.job.ps1'}'; fired = ''; atUtc = ''; markerAtUtc = ''; tmpChecks = 0 }}\n"
+            "function global:Invoke-TailStall([string]$Command, [object[]]$ArgList) {\n"
+            "  $s = $global:TailStall\n"
+            "  if (-not [IO.File]::Exists($s.job)) { return }\n"
+            "  if ($Command -eq 'Test-Path' -and @($ArgList | Where-Object { [string]$_ -like '*.job.tmp' }).Count -gt 0) { $s.tmpChecks = 1 + [int]$s.tmpChecks }\n"
+            "  if ($s.fired) { return }\n"
+            "  $s.fired = $Command; $s.atUtc = [DateTime]::UtcNow.ToString('o')\n"
+            "  if ($s.sec -gt 0) { Start-Sleep -Milliseconds ([int]($s.sec * 1000)) } }\n"
+            "function global:Test-Path { Invoke-TailStall 'Test-Path' $args; Microsoft.PowerShell.Management\\Test-Path @args }\n"
+            "function global:Write-Host { Invoke-TailStall 'Write-Host' $args; Microsoft.PowerShell.Utility\\Write-Host @args }\n"
+            f"$marker = '{self.share / 'running' / 'job-x.started.json'}'\n"
+            "$threw = ''\n"
+            "try {\n"
+            "  if ($c.mode -eq 'um-run') {\n"
+            f"    $p = @{{ ScriptPath = '{self.job}'; AgentShare = '{self.share}'; JobId = 'job-x'; TimeoutSec = 60; PollSeconds = 1; MaxClaimedWaitSec = 60\n"
+            "      MaxQueueWaitSec = [int]$c.queue; MaxAdmissionWaitSec = [int]$c.admit; NotAfterBudgetSec = [int]$c.budget\n"
+            "      TestHookAtQueueDeadline = { if (-not [IO.File]::Exists($marker)) { [IO.File]::WriteAllText($marker, '{\"jobId\":\"job-x\",\"phase\":\"admission-wait\",\"childPid\":null}')\n"
+            "        $global:TailStall.markerAtUtc = [DateTime]::UtcNow.ToString('o') } } }\n"
+            f"    $null = & '{UM_RUN}' @p\n"
+            "  } else {\n"
+            f"    Import-Module '{DROP_MODULE}' -Force\n"
+            f"    $null = Invoke-UmRunDrop -Inbox '{self.inbox}' -Outbox '{self.share / 'outbox'}' -ScriptPath '{self.job}' -JobId 'job-x' -NotAfterBudgetSec ([int]$c.budget)\n"
+            "  }\n"
+            "} catch { $threw = [string]$_.Exception.Message }\n"
+            "$endUtc = [DateTime]::UtcNow.ToString('o')\n"
+            f"$metaPath = '{self.inbox / 'job-x.meta.json'}'\n"
+            "$meta = $(if ([IO.File]::Exists($metaPath)) { [IO.File]::ReadAllText($metaPath) } else { '' })\n"
+            "$s = $global:TailStall\n"
+            "[Console]::Out.WriteLine('TAIL_RESULT=' + (ConvertTo-Json -Compress -InputObject ([ordered]@{ threw = $threw; endUtc = $endUtc; meta = $meta;\n"
+            "  fired = $s.fired; stallAtUtc = $s.atUtc; markerAtUtc = $s.markerAtUtc; tmpChecksAfterVisible = [int]$s.tmpChecks })))\n"
+        )
+        payload = {"mode": mode, "stall": stall_sec, "queue": self.QUEUE_SEC, "admit": self.ADMIT_SEC, "budget": budget}
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], input=json.dumps(payload), capture_output=True, text=True,
+                           timeout=180)
+        lines = [l for l in p.stdout.splitlines() if l.startswith("TAIL_RESULT=")]
+        self.assertEqual(len(lines), 1, p.stdout + p.stderr)
+        r = json.loads(lines[0][len("TAIL_RESULT="):])
+        r["stdout"] = p.stdout
+        return r
+
+    def test_dots_tail_a_stall_after_visibility_never_runs_a_wait_past_the_visible_jobs_not_after(self) -> None:
+        r = self.run_tail(mode="um-run", stall_sec=self.STALL_SEC)
+        self.assertTrue(r["threw"].startswith("UNRESOLVED:") and "-MaxAdmissionWaitSec" in r["threw"], r)
+        self.assertNotEqual(r["fired"], "", "the stall fired after the job became visible")
+        self.assertNotEqual(r["markerAtUtc"], "", "the admission-wait marker landed at um-run's queue deadline")
+        budget = self.QUEUE_SEC + self.ADMIT_SEC + self.TAIL_SLACK_SEC
+        not_after = parse_o(json.loads(r["meta"])["notAfterUtc"])
+        sampled = not_after - timedelta(seconds=budget)
+        stalled = parse_o(r["stallAtUtc"])
+        self.assertLess(stalled - sampled, timedelta(seconds=self.TAIL_SLACK_SEC), "the stall began after visibility, inside the r4 bound")
+        end = parse_o(r["endUtc"])
+        self.assertLessEqual(end, not_after, f"the admission wait ended {(end - not_after).total_seconds():.3f} s AFTER notAfterUtc ({utc_o(not_after)}): "
+                                             f"the agent stops taking the job while um-run still waits (stall in {r['fired']} at {r['stallAtUtc']})")
+        self.assertGreaterEqual(end, sampled + timedelta(seconds=self.QUEUE_SEC + self.ADMIT_SEC),
+                                "the waits still run to their absolute ceiling (sampledUtc + queue + admission), never cut shorter")
+
+    def test_the_drops_success_path_does_no_share_io_on_its_temporary_after_the_job_is_visible(self) -> None:
+        # the bound on the post-visibility tail: the rename moved the temporary away, so the success path never checks or removes it again (4f6c17cb: one
+        # Test-Path at :979, unbounded share I/O after visibility)
+        r = self.run_tail(mode="drop", stall_sec=0)
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["tmpChecksAfterVisible"], 0, r)
+        self.assertEqual(sorted(p.name for p in self.inbox.iterdir()), ["job-x.job.ps1", "job-x.meta.json"])
+
+
 def run_um_run_args_cases(cases: list[dict]) -> list[dict]:
     """Each case is a Get-DvJobNotAfter-shaped result (budgetSec, notAfterUtc, capUtc, source); each answer is Get-DvUmRunNotAfterArgs' splat (sorted keys),
     or {'error': <message>} when it threw."""

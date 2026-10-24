@@ -310,10 +310,13 @@ function Submit-VenueJob([string]$ScriptPath, [string]$JobId, [int]$TimeoutSec, 
     # information stream (its host lines; collected here, still never shown) carries the 'submitted <id>' line it prints after the drop, so each submit also
     # returns the bound judged against that measured drop (notAfter; the caller prints it as DVE_NOT_AFTER). Records are collected as they arrive, so a
     # um-run that throws (UNRESOLVED / RETRACTED) after its drop still leaves the drop measured.
-    # r2 (hub ruling on sol's r1 blocker): the bound is passed DROP-RELATIVE, -NotAfterBudgetSec (the waits plus the slack, Get-DvJobNotAfter's budgetSec):
-    # UmRunDrop.psm1 counts it from its own clock just before the claim, so however late the drop lands, notAfterUtc >= drop + every um-run wait a priori.
-    # The drop's own value comes back on um-run's 'job not-after:' line and is what the witness judges. Only those two information records are kept (um-run
-    # also logs a line per poll for hours of admission wait).
+    # r2 (hub ruling on sol's r1 blocker): the bound is passed DROP-RELATIVE, -NotAfterBudgetSec (the waits plus the slack, Get-DvJobNotAfter's budgetSec).
+    # r5 (Dot 180721e3 on r4) states what that guarantees: UmRunDrop.psm1 writes notAfterUtc = sampledUtc + budgetSec, sampledUtc being a clock read at most
+    # 15 s before the job's rename into view (r3/r4), and um-run.ps1 ends its queue and admission waits by sampledUtc + queue + admission, absolute
+    # deadlines, so however late the drop lands and however long its return takes after the job is visible, those waits end before notAfterUtc by at least
+    # the slack. The one step this does not measure is um-run's poll: each deadline is checked once per -PollSeconds, after that poll's own share reads.
+    # (The claimed wait starts once the job is launched, when notAfterUtc no longer applies.) The drop's own value comes back on um-run's 'job not-after:'
+    # line and is what the witness judges. Only those two information records are kept (um-run also logs a line per poll for hours of admission wait).
     # r4 (Grok G1): the not-after arguments come from Get-DvUmRunNotAfterArgs, which fails closed (DVE_NOT_AFTER_BUDGET_MISSING, an ERROR outcome, nothing
     # submitted) where a null budgetSec would have bound to [int] 0 and dropped the bound silently.
     $records = [Collections.Generic.List[object]]::new()

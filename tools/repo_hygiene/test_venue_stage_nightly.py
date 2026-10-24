@@ -155,6 +155,7 @@ $sha = $env:FAKE_SHA
 if ($mode -eq 'unresolved') { throw "UNRESOLVED: $JobId was claimed by the agent, but it stopped proving liveness (fixture) -- this client is stopping, not failing" }
 if ($mode -eq 'retracted') { throw "RETRACTED: $JobId reached its queue wait ceiling (fixture); not a failure, retry with a new -JobId if desired" }
 if ($mode -eq 'cappassed') { throw "UMRUN_NOT_AFTER_CAP_PASSED -NotAfterCapUtc '$NotAfterCapUtc' is not later than now (fixture); nothing was placed" }
+if ($mode -eq 'placementstall') { throw "UMRUN_NOT_AFTER_PLACEMENT_STALL 300 s passed between the not-after clock read and the job's rename, more than 15 s on each of 4 reads (fixture); the job was not made visible" }
 $code = 0
 if ($mode -eq 'fail') { $code = 5; $out = 'RESULT=STAGE_FAILED STEP=fixture EXIT=5' }
 elseif ($kind -eq 'DLLPAIR') {
@@ -510,8 +511,17 @@ class VenueStageNightlyTests(unittest.TestCase):
         # write. The driver maps that to STAGE_CAP_EXCEEDED, never the step's generic failure.
         p = self.run_driver(env={"FAKE_UMRUN_STAGE": "cappassed"})
         self.assert_exit(p, "STAGE_CAP_EXCEEDED")
-        self.assertIn("deadline passed before the drop; nothing was submitted", p.stdout + p.stderr)
+        # r5 (Grok G5): since r3/r4 the cap can also pass during placement, so the text says what the drop guarantees in both cases
+        self.assertIn("deadline passed before the job was made visible; nothing was submitted", p.stdout + p.stderr)
         self.assertIn("UMRUN_NOT_AFTER_CAP_PASSED", p.stdout + p.stderr)
+
+    def test_a_placement_stall_the_drop_refuses_is_a_typed_nothing_submitted_exit(self) -> None:
+        # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r5 (Grok G5): UMRUN_NOT_AFTER_PLACEMENT_STALL (r4) means the share stalled through every re-derivation and
+        # the job never became visible, so it is SHARE_UNREACHABLE (nothing was submitted), never the step's generic failure
+        p = self.run_driver(env={"FAKE_UMRUN_STAGE": "placementstall"})
+        self.assert_exit(p, "SHARE_UNREACHABLE")
+        self.assertIn("the share stalled while the job was being placed; the job was never made visible, nothing was submitted", p.stdout + p.stderr)
+        self.assertIn("UMRUN_NOT_AFTER_PLACEMENT_STALL", p.stdout + p.stderr)
 
     # ---------------------------------------------------------------- the owner-footage gate: side files are the build package, never anything else
     def test_side_files_are_only_this_shas_build_package_under_the_build_root(self) -> None:

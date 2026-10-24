@@ -634,10 +634,13 @@ function Invoke-UmRunDrop {
         [scriptblock]$Copier = { param($Source, $Destination) Copy-Item -LiteralPath $Source -Destination $Destination },
         [scriptblock]$PostAdmissionHook = { param($Source) },
         [scriptblock]$PreRenameRaceHook = { param($PartPath) },
-        # Test-only: invoked with no arguments immediately before the job's own rename into view,
-        # i.e. the last instant at which "is metadata already published?" is the real contract this
-        # module owes the agent (metadata-before-VISIBILITY, not metadata-before-the-job's-own-
-        # temporary-copy, which sol's round-4 review named as the wrong thing to have proved).
+        # Test-only: invoked with no arguments before the job's own rename into view, where "is
+        # metadata already published?" is the real contract this module owes the agent
+        # (metadata-before-VISIBILITY, not metadata-before-the-job's-own-temporary-copy, which sol's
+        # round-4 review named as the wrong thing to have proved). r5 (Grok G6): since r4 it runs
+        # inside the not-after placement loop, ONCE PER PASS (up to 1 + UmRunNotAfterPlacementRetries
+        # times with -NotAfterBudgetSec) and before that pass's measured clock read, so only its
+        # LAST call is followed by the rename; without -NotAfterBudgetSec it runs once.
         [scriptblock]$TestHookBeforeJobVisible = $null,
         # Test-only: invoked with the metadata temp file's path immediately after it is written,
         # before the write-back verification -- lets a test corrupt it to prove that verification
@@ -880,6 +883,7 @@ function Invoke-UmRunDrop {
         # governs it (claimed before a single side-file or job byte was copied).
         $jobLocalSha = (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256).Hash
         $tmp = Join-Path $Inbox "$id.$nonce.job.tmp"
+        $jobPlaced = $false
         try {
             try {
                 & $Copier $ScriptPath $tmp
@@ -920,7 +924,12 @@ function Invoke-UmRunDrop {
                 # UMRUN_NOT_AFTER_PLACEMENT_STALL. A cap that passed (at either read) -> UMRUN_NOT_AFTER_CAP_PASSED. Either refusal rolls the
                 # claim back and the job is never visible. THE CONTRACT: the visible job's value was derived from a clock read at most
                 # $script:UmRunNotAfterPlacementStallSec before a measured read that is followed only by the job's single rename; that one
-                # rename is the only unmeasured operation, and the submitter's slack less that bound covers it and um-run's poll.
+                # rename is the only unmeasured operation before visibility, and the submitter's slack less that bound covers it and um-run's poll.
+                # r5 (Dot 180721e3 on r4): AFTER visibility, the time until um-run starts waiting is no longer taken out of the waits at all:
+                # um-run anchors its queue and admission deadlines to the sampledUtc this call reports (the read the visible value was derived
+                # from), not to when this call returns. The post-visibility tail is bounded too: on success the temporary was renamed away, so the
+                # finally below no longer checks or removes it ($jobPlaced); the only share operation left after the rename is closing this
+                # call's own read handle on the job ($tmpStream, one close), then the output lines below.
                 $placementRetry = 0
                 while ($true) {
                     if ($null -ne $notAfterSampled) {
@@ -969,6 +978,7 @@ function Invoke-UmRunDrop {
                 }
                 try {
                     Move-Item -LiteralPath $tmp -Destination $final -ErrorAction Stop   # no -Force: a job is never replaced
+                    $jobPlaced = $true
                 } catch {
                     throw "UMRUN_JOBID_IN_USE inbox\$id.job.ps1 appeared concurrently; refusing to replace it"
                 }
@@ -976,7 +986,8 @@ function Invoke-UmRunDrop {
                 $tmpStream.Dispose()
             }
         } finally {
-            if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+            # r5: after a successful rename there is no temporary left, so no share I/O on it after visibility (the bound above)
+            if (-not $jobPlaced -and (Test-Path -LiteralPath $tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         }
     } catch {
         # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 6 (sol minor): a rollback deletion failure here
