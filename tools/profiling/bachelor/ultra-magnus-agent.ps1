@@ -5,7 +5,7 @@
 # Protocol (all under <agent root>, which is this script's folder):
 #   inbox\<jobId>.job.ps1        - VM drops a PowerShell script here (atomic rename)
 #   inbox\<jobId>.meta.json      - VM submit metadata written before the job is visible
-#                                  not-after r1: optional notAfterUtc (ISO-8601 UTC string); past it the job is never leased or run
+#                                  not-after r1: optional notAfterUtc (ISO-8601 UTC string); past it the job is not leased or started (see block 6)
 #   running\<jobId>.started.json - agent-owned durable claim marker: phase=admission-wait (held in the
 #                                  heavy-slot gate, childPid null, NOT launched), then phase=launching
 #                                  (about to create the child, childPid null, NOT launched yet), then
@@ -591,9 +591,32 @@ function Get-JobMetadata {
     param([Parameter(Mandatory = $true)][string]$JobId)
 
     $metaPath = Join-Path $inbox "$JobId.meta.json"
-    $meta = Read-JsonFile -Path $metaPath
+    # LEASE-NOT-AFTER-HARDENING-1 (key3 hardening 3): ABSENT and UNREADABLE are different answers. Read and parsed up to 3
+    # times, 200 ms apart (a write in flight). No file: the defaults, as before. A file whose bytes read but do not parse as a
+    # JSON object: the defaults, as before (a torn claim still runs), UNLESS those bytes name notAfterUtc. That job carried a
+    # deadline this agent cannot see, and so does one whose bytes cannot be read at all (it cannot tell): the defaults plus
+    # metaUnreadable and metaReadError, which Get-JobNotAfterVerdict fails CLOSED. Such a job is refused, never run unbounded.
+    $meta = $null
+    $readError = $null
+    $deadlineUnknown = $false
+    if (Test-Path -LiteralPath $metaPath -PathType Leaf) {
+        for ($try = 1; $try -le 3; $try++) {
+            $text = $null
+            try { $text = [System.IO.File]::ReadAllText($metaPath) } catch { $readError = "cannot be read: $($_.Exception.Message)" }
+            if ($null -ne $text) {
+                $readError = $null
+                try { $meta = $text | ConvertFrom-Json -ErrorAction Stop } catch { $meta = $null; $readError = "does not parse: $($_.Exception.Message)" }
+                if ($meta -is [System.Management.Automation.PSCustomObject]) { break }
+                $meta = $null
+                if ($null -eq $readError) { $readError = "does not hold a JSON object" }
+            }
+            $deadlineUnknown = ($null -eq $text -or $text.Contains("notAfterUtc"))
+            if ($try -lt 3) { Start-Sleep -Milliseconds 200 }
+        }
+        if ($null -eq $meta) { Add-AgentLogLine "json read failed path=$metaPath error=$readError deadlineUnknown=$deadlineUnknown" }
+    }
     if ($null -eq $meta) {
-        return [pscustomobject]@{
+        $defaults = [pscustomobject]@{
             jobId          = $JobId
             submitUtc      = $null
             timeoutSec     = $JobTimeoutSec
@@ -601,6 +624,11 @@ function Get-JobMetadata {
             metadataPath   = $metaPath
             missing        = $true
         }
+        if ($deadlineUnknown) {
+            $defaults | Add-Member -NotePropertyName metaUnreadable -NotePropertyValue $true
+            $defaults | Add-Member -NotePropertyName metaReadError -NotePropertyValue (([string]$readError) -replace '[^\x20-\x7E]', '?')
+        }
+        return $defaults
     }
     $parsedTimeoutSec = 0
     if ($null -eq $meta.timeoutSec -or
@@ -656,8 +684,12 @@ function Get-JobNotAfterVerdict {
     # Missing or blank = none: today's behaviour. A [DateTime] is read as Get-QueueAgeSeconds reads submitUtc (ConvertFrom-Json
     # turns an ISO string into one); a string with no offset is read as UTC, the same as an Unspecified [DateTime]. A value that
     # does not parse FAILS CLOSED (callers treat it as passed): a submitter that wrote a bound wanted one.
+    # LEASE-NOT-AFTER-HARDENING-1: a meta.json Get-JobMetadata marked metaUnreadable (it may carry a deadline) is unparseable too.
     param([Parameter(Mandatory = $true)]$Metadata, [DateTime]$NowUtc = [DateTime]::MinValue)
     $now = if ($NowUtc -eq [DateTime]::MinValue) { [DateTime]::UtcNow } elseif ($NowUtc.Kind -eq [DateTimeKind]::Local) { $NowUtc.ToUniversalTime() } else { [DateTime]::SpecifyKind($NowUtc, [DateTimeKind]::Utc) }
+    if ($Metadata.metaUnreadable -eq $true) {
+        return [pscustomobject]@{ state = "unparseable"; notAfterUtc = $null; remainingSec = $null; why = "meta.json $($Metadata.metaReadError); it may carry a notAfterUtc, so fail closed (treated as passed)" }
+    }
     $raw = $Metadata.notAfterUtc
     if ($null -eq $raw -or ($raw -is [string] -and [string]::IsNullOrWhiteSpace($raw))) {
         return [pscustomobject]@{ state = "none"; notAfterUtc = $null; remainingSec = $null; why = "no notAfterUtc" }
@@ -859,9 +891,10 @@ function New-AdmissionWaitMarker {
 function Complete-AdmissionWaitMarker {
     # A job the gate never launched (cancelled / queue-expired) retires its admission-wait claim AFTER its
     # result is published -- the same order as every other outcome, so a client never sees neither.
-    # r2b: a launching marker reaching here is also unlaunched -- every caller runs before this agent's own
+    # r2b: a launching marker reaching here is also unlaunched -- every caller but one runs before this agent's own
     # launching write, so such a marker is one a restart re-queued on proof that nothing launched (see
-    # Resolve-LaunchingMarker) whose admission-wait rewrite did not verify.
+    # Resolve-LaunchingMarker) whose admission-wait rewrite did not verify. The one (LEASE-NOT-AFTER-HARDENING-1) is
+    # Invoke-QueuedJob's pre-launch not-after exit: it follows that write and returns before Start-WindowlessRedirectedProcess.
     param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Status)
     $markerPath = Join-Path $running "$JobId.started.json"
     $marker = Read-JsonFile -Path $markerPath
@@ -1046,6 +1079,7 @@ function Publish-NotAfterExpiredResult {
         notAfterExpired  = $true
         notAfterUtc      = $Verdict.notAfterUtc
         notAfterState    = [string]$Verdict.state
+        notAfterWhy      = [string]$Verdict.why
         orphaned         = $false
         adopted          = $false
         killedProcessIds = @()
@@ -2203,6 +2237,10 @@ function Wait-HeavySlotAdmission {
 #   6. NOT-AFTER (not-after r1, 2026-10-24). meta.json notAfterUtc is the job's absolute deadline. Past it (or unreadable) no
 #      request is made and a pending one is released; --admit-timeout is the seconds left when fewer than LeasePendingMaxSec
 #      (none under LeaseNotAfterMinAdmitSec); a lease that turns active after it, or after a cancel file, is released at once.
+#      LEASE-NOT-AFTER-HARDENING-1: it is checked again immediately before the child is created; a waiting lease is not
+#      renewed past it (a light job run from the wait cannot keep it fresh); and a meta.json that may carry it but cannot be
+#      read fails closed (Get-JobMetadata). Not promised: clock skew between submitter and agent, a frozen agent, another
+#      agent, or the few statements between that last check and Process.Start.
 # KNOWN LIMIT: a lease cannot drain a holder that outlives heavy-slot.py's 30-min pending cap. Such a request is refused
 # (exit 75) and re-asked every LeaseRetrySec, so the job waits behind that holder until the queue-age ceiling.
 # A job whose timeout is over LeaseMaxMinutes minutes is admitted with admission.leaseCoversTimeout=false and a typed line:
@@ -2487,8 +2525,18 @@ function Update-QuietLeaseRenew {
 function Invoke-QuietLeaseRenewTick {
     # Called from the job monitor loop and the gate wait (so from inside a light job run during a wait too): renews the
     # admitted lease, and a waiting lease that has turned active. In-process only, so it cannot outlive this agent.
+    # LEASE-NOT-AFTER-HARDENING-1 (key3 hardening 2): a WAITING lease whose job's notAfterUtc has passed is neither read nor
+    # renewed again (typed once): it is not kept fresh past the deadline. The wait releases it at its next loop top. The
+    # admitted lease is the running job's and renews as before.
     foreach ($l in @($script:QuietLease, $script:QuietLeaseWaiting)) {
         if ($null -eq $l) { continue }
+        if ([object]::ReferenceEquals($l, $script:QuietLeaseWaiting) -and (Get-JobNotAfterVerdict -Metadata $l).state -eq "passed") {
+            if ($l.notAfterStopLogged -ne $true) {
+                $l | Add-Member -NotePropertyName notAfterStopLogged -NotePropertyValue $true -Force
+                Add-AgentLogLine "quiet-lease: not-after passed job=$($l.jobId) notAfterUtc=$($l.notAfterUtc) active=$($null -ne $l.active) while waiting; no more renews, released at the wait's next loop top"
+            }
+            continue
+        }
         if ($null -eq $l.active -and -not $l.proc.HasExited) { $null = Update-QuietLeaseRequest -Lease $l }
         Update-QuietLeaseRenew -Lease $l
     }
@@ -2615,10 +2663,13 @@ function Wait-QuietLeaseAdmission {
             # unreadable ends the wait here, releasing a pending request first.
             $v = Get-JobNotAfterVerdict -Metadata $Metadata
             if ($v.state -in @("passed", "unparseable")) {
-                $phase = if ($null -ne $lease) { "pending" } else { "pre-request" }
+                # LEASE-NOT-AFTER-HARDENING-1 (key3 hardening 2): the request may have turned active since the last read (inside
+                # a light job run from this wait, say), so it is read once more and the phase says which: pending | post-active.
+                if ($null -ne $lease) { $null = Update-QuietLeaseRequest -Lease $lease }
+                $phase = if ($null -eq $lease) { "pre-request" } elseif ($null -ne $lease.active) { "post-active" } else { "pending" }
                 $rel = $null
                 if ($null -ne $lease) {
-                    $rel = Stop-QuietLease -Lease $lease -Why "not-after passed while pending"
+                    $rel = Stop-QuietLease -Lease $lease -Why "not-after passed while waiting ($phase)"
                     $lease = $null
                     $script:QuietLeaseWaiting = $null
                 }
@@ -2633,7 +2684,9 @@ function Wait-QuietLeaseAdmission {
                 $at = Get-QuietLeaseAdmitTimeout -Verdict $v
                 if (-not $at.ok) { return (& $notAfterExpired "pre-request" $v $null $at.why) }
                 $l = Start-QuietLeaseRequest -JobId $JobId -Minutes $minutes -AdmitTimeoutSec $at.sec -AdmitTimeoutSource $at.source
-                if ($l.ok) { $lease = $l; $script:QuietLeaseWaiting = $l; $requests++; $state = "lease-pending"; $why = "lease request pid=$($l.pid) pending" }
+                # LEASE-NOT-AFTER-HARDENING-1: the waiting lease carries its job's deadline, so the renew tick (run from inside a
+                # light job too) stops renewing it once that deadline passes.
+                if ($l.ok) { $l | Add-Member -NotePropertyName notAfterUtc -NotePropertyValue $v.notAfterUtc -Force; $lease = $l; $script:QuietLeaseWaiting = $l; $requests++; $state = "lease-pending"; $why = "lease request pid=$($l.pid) pending" }
                 else {
                     $state = "lease-unavailable"; $why = $l.why; $nextRequestAt = $now.AddSeconds($LeaseRetrySec)
                     Add-AgentLogLine "quiet-lease: unavailable job=$JobId why=[$why]; the job is NOT run unleased; asking again in ${LeaseRetrySec}s"
@@ -2810,7 +2863,7 @@ function Invoke-QueuedJob {
         return
     }
     if ($script:Admission.label -eq "expired-not-after") {
-        $gateVerdict = [pscustomobject]@{ state = $script:Admission.notAfterState; notAfterUtc = $script:Admission.notAfterUtc }
+        $gateVerdict = [pscustomobject]@{ state = $script:Admission.notAfterState; notAfterUtc = $script:Admission.notAfterUtc; why = $script:Admission.why }
         Publish-NotAfterExpiredResult -Job $Job -Metadata $metadata -Admission $script:Admission -QueueAgeSec $queueAgeSec -Verdict $gateVerdict
         Complete-AdmissionWaitMarker -JobId $jobId -Status "expired-not-after"
         return
@@ -2829,22 +2882,29 @@ function Invoke-QueuedJob {
         Complete-AdmissionWaitMarker -JobId $jobId -Status "cancelled-in-gate"
         return
     }
-    # not-after r1: the last notAfterUtc check, before the launching marker (status mode's own wait does not poll it).
-    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata
-    if ($notAfter.state -in @("passed", "unparseable")) {
+    # not-after r1: the not-after exit once the job is admitted, taken at the post-admission check below and (LEASE-NOT-AFTER-
+    # HARDENING-1, Dot R18 improvement 1) at the last check before the child is created. The lease is released (its release
+    # recorded) before Exit-HeavySlot, nothing is launched, the expired result is published, then the claim is retired.
+    $notAfterAdmitted = {
+        param([string]$Phase, $Verdict, [string]$When)
         $rel = $null
-        if ($null -ne $script:QuietLease) { $rel = Stop-QuietLease -Lease $script:QuietLease -Why "not-after passed after admission, before launch"; $script:QuietLease = $null }
+        if ($null -ne $script:QuietLease) { $rel = Stop-QuietLease -Lease $script:QuietLease -Why "not-after passed $When"; $script:QuietLease = $null }
         Exit-HeavySlot
         $script:Admission | Add-Member -NotePropertyName label -NotePropertyValue "expired-not-after" -Force
         $script:Admission | Add-Member -NotePropertyName state -NotePropertyValue "expired" -Force
-        $script:Admission | Add-Member -NotePropertyName phase -NotePropertyValue "post-admission" -Force
-        $script:Admission | Add-Member -NotePropertyName why -NotePropertyValue "$($notAfter.why) after admission, before launch" -Force
+        $script:Admission | Add-Member -NotePropertyName phase -NotePropertyValue $Phase -Force
+        $script:Admission | Add-Member -NotePropertyName why -NotePropertyValue "$($Verdict.why) $When" -Force
         $script:Admission | Add-Member -NotePropertyName slot -NotePropertyValue $null -Force
-        $script:Admission | Add-Member -NotePropertyName notAfterUtc -NotePropertyValue $notAfter.notAfterUtc -Force
-        $script:Admission | Add-Member -NotePropertyName notAfterState -NotePropertyValue $notAfter.state -Force
-        $script:Admission | Add-Member -NotePropertyName leaseRelease -NotePropertyValue (New-LeaseReleaseRecord -Phase "post-admission" -Release $rel) -Force
-        Publish-NotAfterExpiredResult -Job $Job -Metadata $metadata -Admission $script:Admission -QueueAgeSec $queueAgeSec -Verdict $notAfter
+        $script:Admission | Add-Member -NotePropertyName notAfterUtc -NotePropertyValue $Verdict.notAfterUtc -Force
+        $script:Admission | Add-Member -NotePropertyName notAfterState -NotePropertyValue $Verdict.state -Force
+        $script:Admission | Add-Member -NotePropertyName leaseRelease -NotePropertyValue (New-LeaseReleaseRecord -Phase $Phase -Release $rel) -Force
+        Publish-NotAfterExpiredResult -Job $Job -Metadata $metadata -Admission $script:Admission -QueueAgeSec $queueAgeSec -Verdict $Verdict
         Complete-AdmissionWaitMarker -JobId $jobId -Status "expired-not-after"
+    }
+    # not-after r1: the notAfterUtc check before the launching marker (status mode's own wait does not poll it).
+    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata
+    if ($notAfter.state -in @("passed", "unparseable")) {
+        & $notAfterAdmitted "post-admission" $notAfter "after admission, before launch"
         return
     }
     if ([int]$metadata.maxQueueAgeSec -gt 0 -and $queueAgeSec -gt [int]$metadata.maxQueueAgeSec) {
@@ -2907,6 +2967,15 @@ function Invoke-QueuedJob {
             Write-AgentHeartbeat -Activity "launch-refused job=$jobId $($pre.reason)"
             return
         }
+    }
+    # LEASE-NOT-AFTER-HARDENING-1 (Dot R18 improvement 1): the LAST notAfterUtc check, after the two steps above that can
+    # block (the launching write retries; the slot re-confirm renews to completion) and immediately before the child is
+    # created. Passed: the same exit as post-admission (phase pre-launch); this agent's own launching marker is retired as
+    # expired-not-after (nothing launched: the out file was never created).
+    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata
+    if ($notAfter.state -in @("passed", "unparseable")) {
+        & $notAfterAdmitted "pre-launch" $notAfter "at the last check before launch"
+        return
     }
     $launchedPersisted = $false
     try {
