@@ -43,6 +43,9 @@
 # BOUNDED. Every child (generators, um-run, the assembler) runs as a process bounded by what is left of -MaxTotalSec and is killed, with its tree, past it. um-run gets
 # the same remaining budget as its queue / admission / claimed waits, so it normally ends itself first; an um-run killed at the cap is STAGE_UNRESOLVED (the agent may
 # still own the job), never retried in the same call.
+# NOT-AFTER (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1). The stage job is submitted with -NotAfterUtc at this call's deadline, so a job still queued or gated when
+# um-run is killed never takes a Bachelor lease later (a later call re-stages it under a suffix). The DLL pair and the smoke runner get none: a later call
+# harvests them by name and cannot re-submit their single-use JobId (the DLL pair runs on Ultra-Magnus, whose agent ignores the field anyway).
 #
 #   pwsh -NoProfile -File "<repo>\tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1" [-Venue ultra-magnus] [-SourceCommit <40-hex>] [-WhatIf]
 #
@@ -454,21 +457,26 @@ function Assert-StagePackageSideFile([string[]]$Side, [string]$JobId, [string]$F
     }
 }
 
-function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]$JobId, [string]$Share, [int]$JobTimeoutSec, [string]$FailToken) {
+function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]$JobId, [string]$Share, [int]$JobTimeoutSec, [string]$FailToken, [switch]$LaterHarvest) {
     # Returns 'OK' (um-run returned; the caller reads the outbox result BY NAME) or 'IN_USE' (the outbox already holds this JobId). Every other end is a typed exit:
     # UNRESOLVED (or killed at the cap) -> STAGE_UNRESOLVED, never retried here; RETRACTED (never claimed) -> AGENT_BUSY; no heartbeat -> SHARE_UNREACHABLE.
+    # LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1: the job's -NotAfterUtc is this call's deadline (um-run is killed at it: the helper's -CallerCapSec), except
+    # for -LaterHarvest: a job a LATER call harvests by name and cannot re-submit (single-use JobId, no suffix) gets none.
     Assert-VenueFree "before the $Step submission"
     Assert-StagePackageSideFile -Side $Side -JobId $JobId -FailToken $FailToken
     $remain = Get-RemainingSec
     if ($remain -lt 30) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "only $remain s of the $MaxTotalSec s cap left before the $Step submission; nothing was submitted" }
+    $timeoutSec = [Math]::Min($JobTimeoutSec, $remain); $admissionSec = [Math]::Min(7200, $remain)
+    $notAfter = Get-DvJobNotAfter -TimeoutSec $timeoutSec -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $admissionSec -MaxClaimedWaitSec $remain -CallerCapSec $remain -LaterHarvest:$LaterHarvest
     # um-run.ps1 reports every non-receipt end by THROWING; pwsh's own error view wraps and decorates that text, so the child catches it and prints the message
     # on ONE line (UMRUN_ERROR <message>). The returned result object is discarded: the outbox result.json is read by name afterwards.
     $lit = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
     $call = '& ' + (& $lit $UmRun) + ' -ScriptPath ' + (& $lit $JobFile) + ' -JobId ' + (& $lit $JobId) + ' -AgentShare ' + (& $lit $Share) +
-        " -TimeoutSec $([Math]::Min($JobTimeoutSec, $remain)) -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $([Math]::Min(7200, $remain)) -MaxClaimedWaitSec $remain"
+        " -TimeoutSec $timeoutSec -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $admissionSec -MaxClaimedWaitSec $remain"
+    if ($notAfter.notAfterUtc) { $call += ' -NotAfterUtc ' + (& $lit $notAfter.notAfterUtc) }
     if (@($Side).Count -gt 0) { $call += ' -SideFile @(' + ((@($Side) | ForEach-Object { & $lit $_ }) -join ', ') + ')' }
     $text = "try { `$null = $call; [Console]::Out.WriteLine('UMRUN_RETURNED'); exit 0 } catch { [Console]::Out.WriteLine('UMRUN_ERROR ' + (`$_.Exception.Message -replace '\s+', ' ')); exit 1 }"
-    Say "submit $Step $JobId -> $Share"
+    Say "submit $Step $JobId -> $Share notAfterUtc=$(if ($notAfter.notAfterUtc) { $notAfter.notAfterUtc } else { 'none' }) ($($notAfter.source))"
     $c = Invoke-Child "umrun-$Step" '' @() -CommandText $text
     if ($c.timedOut) { Stop-Nightly 'STAGE_UNRESOLVED' "um-run for $JobId was still waiting at the $MaxTotalSec s cap and was killed; the agent may still own $JobId (not retried)" }
     if ($c.exit -eq 0 -and $c.out -match '(?m)^UMRUN_RETURNED\s*$') { return 'OK' }
@@ -505,7 +513,7 @@ if ($buildInCache) {
         if ($gen.timedOut) { Stop-Nightly 'STAGE_CAP_EXCEEDED' 'the DLL-pair generator outlived the cap' }
         $dllJob = Join-Path $dllOut "$dllId.job.ps1"; $dllZip = Join-Path $dllOut "$dllId-source.zip"
         if ($gen.exit -ne 0 -or -not (Test-Path -LiteralPath $dllJob -PathType Leaf) -or -not (Test-Path -LiteralPath $dllZip -PathType Leaf)) { Stop-Nightly 'DLLPAIR_FAILED' "the DLL-pair generator exit $($gen.exit) did not emit $dllId.job.ps1 + -source.zip (see $($script:WorkDir)\dllpair-gen.log)" }
-        $u = Invoke-UmRun 'dllpair' $dllJob @($dllZip) $dllId $dllShare 3600 'DLLPAIR_FAILED'
+        $u = Invoke-UmRun 'dllpair' $dllJob @($dllZip) $dllId $dllShare 3600 'DLLPAIR_FAILED' -LaterHarvest
         if ($u -ceq 'IN_USE') { Stop-Nightly 'DLLPAIR_FAILED' "$dllId became in use between the by-name check and the submission; not re-submitted" }
         $pair = Read-Share "$dllOutbox\$dllId.result.json" $DllReuseByName @($reuseModule, $dllOutbox, $dllId, $commit)
         if (-not $pair.Reusable) { Stop-Nightly 'DLLPAIR_FAILED' "the DLL-pair job ended but its result is not a clean pair for $commit ($($pair.Reason))" }
@@ -612,7 +620,7 @@ if ($runnerPresent) {
         }
         $script:Row.steps.smokeRunner = 'in-cache'
     } else {
-        $u = Invoke-UmRun 'smoke-runner' $runnerJob @() $runnerId $share 1800 'SMOKE_RUNNER_STAGE_FAILED'
+        $u = Invoke-UmRun 'smoke-runner' $runnerJob @() $runnerId $share 1800 'SMOKE_RUNNER_STAGE_FAILED' -LaterHarvest
         if ($u -ceq 'IN_USE') { Stop-Nightly 'SMOKE_RUNNER_STAGE_FAILED' "$runnerId became in use between the by-name check and the submission; not re-submitted" }
         $sr = Read-Share $runnerResult $StageReuseByName @($reuseModule, $runnerResult, $runnerId, $commit, 'SmokeRunner')
         if (-not $sr.Staged) { Stop-Nightly 'SMOKE_RUNNER_STAGE_FAILED' "the smoke-runner job $runnerId ended without RESULT=SMOKE_RUNNER_STAGE_OK ($($sr.Reason))" }

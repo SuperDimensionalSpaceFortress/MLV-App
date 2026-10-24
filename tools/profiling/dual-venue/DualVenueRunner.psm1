@@ -2312,6 +2312,59 @@ function Test-DvReceiptValid {
     [pscustomobject]@{ valid = ($status -in @('VERIFIED', 'VERIFIED_OFFLINE_TEST')); status = $status; reasons = $reasons; unbound = $unbound; evidenceDir = $ev.dir; legType = $(if ($null -ne $spec) { [string](Get-DvProp $spec 'legType') } else { $null }) }
 }
 
+# --- the job's notAfterUtc (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1) --------------------------------
+# um-run.ps1's own -MaxAdmissionWaitSec default. A submitter that does not choose one passes this by name, so the wait it bounds is the wait um-run uses
+# (test_venue_not_after.py reads the default out of um-run.ps1's param block and pins the two equal).
+$script:DvUmRunMaxAdmissionWaitSec = 7200
+# Added to an uncapped bound: um-run's clock starts after its drop to the share and it reads the outbox every -PollSeconds (3 s), so the client can still
+# be waiting a little past submit + the sum of its waits.
+$script:DvNotAfterSlackSec = 60
+
+function Get-DvJobNotAfter {
+    <#
+    .SYNOPSIS
+    Pure. The notAfterUtc a venue submitter passes um-run.ps1 -NotAfterUtc: the instant after which no caller reads the job's result any more. Past it the
+    Bachelor agent never leases or launches the job (LEASE-REQUEST-CHILD-NOT-AFTER-1); a launched job is never stopped by it, and the Ultra-Magnus agent
+    ignores the field. The bound is never earlier than a wait the caller passes (a job must not be refused while its submitter still waits) and never later
+    than the last read:
+      - no kill bound of its own (-CallerCapSec 0; Invoke-VenueLeg): um-run waits at most Queue + Admission + Timeout + Claimed after submit (QUEUED, then
+        held in the gate, then CLAIMED to its outer ceiling), so the bound is that sum plus the slack. Source 'um-run-waits'. VenueChain's later by-name read
+        of a killed leg's job (Get-VenueRemoteJobState) is PRESENCE only, and an expired job publishes a result, so it needs no later bound.
+      - a caller that kills its um-run at now + -CallerCapSec (Invoke-VenueStageNightly's remaining -MaxTotalSec): nobody waits past the cap, so the bound
+        is the cap when that is lower. Source 'caller-cap'. A wait over the cap is a caller bug (it would be cut short): DVE_NOT_AFTER_WAIT_OVER_CAP.
+      - -LaterHarvest: a LATER call reads the result by name, wants the job RUN, and cannot re-submit its single-use JobId (the stage driver's DLL pair and
+        smoke runner). That reader comes at a time this call cannot bound, so the later bound is none: notAfterUtc '' and nothing is passed. Source
+        'later-harvest'.
+    -MaxAdmissionWaitSec defaults to um-run.ps1's own default; the result echoes the one used so the caller passes the same value by name.
+    .OUTPUTS
+    [pscustomobject]@{ notAfterUtc ('o' UTC text ending in Z, or ''); source; boundSec; waitSec; longestWaitSec; maxAdmissionWaitSec; why }
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
+        [Parameter(Mandatory)][ValidateRange(0, 86400)][int]$MaxQueueWaitSec,
+        [ValidateRange(0, 86400)][int]$MaxAdmissionWaitSec = $script:DvUmRunMaxAdmissionWaitSec,
+        [Parameter(Mandatory)][ValidateRange(0, 86400)][int]$MaxClaimedWaitSec,
+        [ValidateRange(0, 86400)][int]$CallerCapSec = 0,
+        [switch]$LaterHarvest,
+        $NowUtc = $null
+    )
+    $waits = @($TimeoutSec, $MaxQueueWaitSec, $MaxAdmissionWaitSec, $MaxClaimedWaitSec)
+    $waitSec = ($waits | Measure-Object -Sum).Sum
+    $longest = ($waits | Measure-Object -Maximum).Maximum
+    if ($CallerCapSec -gt 0 -and $longest -gt $CallerCapSec) {
+        throw "DVE_NOT_AFTER_WAIT_OVER_CAP a $longest s um-run wait is longer than the caller's $CallerCapSec s cap: the caller would kill um-run first"
+    }
+    $result = { param($text, $source, $bound, $why) [pscustomobject]@{ notAfterUtc = $text; source = $source; boundSec = $bound; waitSec = $waitSec; longestWaitSec = $longest; maxAdmissionWaitSec = $MaxAdmissionWaitSec; why = $why } }
+    if ($LaterHarvest) { return (& $result '' 'later-harvest' $null 'a later call harvests this result by name and cannot re-submit its single-use JobId: no notAfter') }
+    # (-NowUtc is a test seam: a [DateTime] of any Kind; Local is converted, Unspecified is taken as UTC)
+    $now = $(if ($null -eq $NowUtc) { [DateTime]::UtcNow } elseif (([datetime]$NowUtc).Kind -eq [DateTimeKind]::Local) { ([datetime]$NowUtc).ToUniversalTime() } else { [DateTime]::SpecifyKind([datetime]$NowUtc, [DateTimeKind]::Utc) })
+    $uncapped = $waitSec + $script:DvNotAfterSlackSec
+    if ($CallerCapSec -gt 0 -and $CallerCapSec -lt $uncapped) {
+        return (& $result $now.AddSeconds($CallerCapSec).ToString('o') 'caller-cap' $CallerCapSec "the caller kills um-run $CallerCapSec s after submit")
+    }
+    & $result $now.AddSeconds($uncapped).ToString('o') 'um-run-waits' $uncapped "um-run waits at most $waitSec s (queue $MaxQueueWaitSec + admission $MaxAdmissionWaitSec + timeout $TimeoutSec + claimed $MaxClaimedWaitSec) + $($script:DvNotAfterSlackSec) s slack"
+}
+
 # --- health (P5) ----------------------------------------------------------------------------------
 function Get-DvHealthVerdict {
     <#
@@ -2618,6 +2671,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
