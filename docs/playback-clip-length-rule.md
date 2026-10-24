@@ -215,7 +215,7 @@ and reported as `PLAY_SAFETY_TIMEOUT`), then reads the app's receipt and applies
 |---|---|---|
 | `run-release-gui-smoke.ps1` (the choke point; its process budget is `Get-GuiSmokePlaySafetyMs` + open / settle) | `playback_smoke.summary` | exit 43 (`validation.ok = false`) |
 | `validate-visible-playback.ps1` (the filmstrip capturer; it used to kill the app after `SettleMs + Captures x IntervalMs`, ~14 s) | `playback_smoke.summary` in its log dir | exit 43 |
-| `capture-reference-frame.ps1` | `playback_smoke.summary` in `-OutDir`; the manifest records `sourceFrames` | exit 43 (a non-zero app exit stays exit 4) |
+| `capture-reference-frame.ps1` | `playback_smoke.summary` in `-OutDir`; the manifest records `sourceFrames` | exit 43 (failures have one code each: 4 process-never-started, 45 exit-code-lost, 46 PINNED_FRAME_NOT_PRESENTED, 47 any other non-zero app exit) |
 | `run-release-playback-profile.ps1` (a play-capable option) | `metadata` of the `--output` profile receipt: `programmatic_play_admitted` must be PRESENT and > 0 (ENFORCE-4: an absent field is INVALID, never "nothing was played") plus every oracle field | exit 43 |
 | `lookassist-wb-determinism.ps1`, `lookassist-wb-multiclip-probe.ps1`, `measure-wb-solve-distribution.ps1` (consumers; see ENFORCE-4) | the launcher's exit code | an invalid run is excluded and the SCRIPT exits 43 |
 | `bachelor/playback-attr-3-cuda-job.ps1` | the measured session's summary line | exit 29 |
