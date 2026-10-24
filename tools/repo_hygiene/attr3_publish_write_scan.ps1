@@ -29,20 +29,61 @@
 #                    assignment is a plain '=' of a provable expression.
 #   R8 directives    no `using` statements and no `#requires` in a template.
 #
-# EXPLICIT LIMITS (booked as ATTR3-SCANNER-HARDEN-1, sol PR #133 r7): arguments passed to child
-# executables, Start-Process -FilePath/-ArgumentList, and `reg` verbs are not constrained; instance
-# methods are allowlisted by NAME, not by receiver type; trusted-helper arguments other than
-# Remove-AttrCudaTree -TrustedRoot are not constrained; the scan reads the generator's template with
-# placeholders neutralised, not the emitted job text. A hostile author can defeat any static lint of
-# PowerShell -- including by editing this file -- so review of the template diff remains required.
+# SPLICED HELPER BODIES (ATTR3-SCANNER-HARDEN-1, CoS Prevention note on #432). A generator also
+# splices module helpers into the emitted job (Get-AttrCudaEmbeddedFunctionSource -Name @(...)). The
+# template scan sees such a helper by NAME only (it is a known command), so a raw write into $Pub
+# inside its body used to pass. With -SpliceSource <files> the scan enumerates every
+# Get-AttrCudaEmbeddedFunctionSource call site in those files (every literal -Name; a name list that
+# is not literal, or a name no -ModulePath module defines, is a 'splice' finding, never a silent
+# skip), reads each body with the extractor's own regex, and runs R1 R2 R3 R4 R5 R6 over it exactly as
+# over a template, minus the "$Work assigned once at top level" half of R5 (a function body is not a
+# job). Findings are reported separately as splicedViolations with the function, its module line and
+# the offending token; the template verdict in `violations` is unchanged. The helpers that ARE the
+# runtime boundary (Publish-AttrCuda*, New-AttrCudaDirectory, Remove-AttrCuda*) legitimately hold the
+# raw writes and deletes a template may not, so the policy that decides which findings are accepted
+# lives in the caller (tools/repo_hygiene/test_attr3_spliced_body_scan.py: its inert-member lists and
+# its per-function, per-rule, per-token reviewed allowlist), not here. This script reports every
+# finding; it never decides one is acceptable.
 #
-# Output: JSON { templates: [...], violations: [ { source, line, rule, text, reason } ] }.
+# GRAMMAR (declared before ATTR3-SCANNER-HARDEN-1 r2). The scan judges the PowerShell language AST,
+# System.Management.Automation.Language.Parser ParseInput / ParseFile, over (a) the generator template
+# with its placeholders neutralised and (b) each helper body that Get-AttrCudaEmbeddedFunctionSource
+# splices into the emitted job, read with the extractor's own regex. Rules R1 to R6 above apply to both;
+# a spliced body skips only the top-level "$Work assigned once" half of R5.
+#
+# EXPLICIT LIMITS / NON-PROMISES (booked as ATTR3-SCANNER-HARDEN-1, sol PR #133 r7; restated r2). A
+# counterexample outside this grammar is debt against these lines, not a defect in the scan:
+#   - No runtime evaluation. Invoke-Expression or a string built at runtime, `& $var` on a value computed
+#     at runtime, and members reached through a variable that holds a type object are judged only by the
+#     R3 / R4 name rules.
+#   - Code a job dot-sources or imports at runtime is not scanned.
+#   - Helpers that reach the job by any route other than Get-AttrCudaEmbeddedFunctionSource (string
+#     concatenation, -replace, a here-string literal) are not scanned.
+#   - The templates of reference-frame-runner-job.ps1 and the Attr3Footage*Job.psm1 modules (generators
+#     not passed as -GeneratorPath) are not template-scanned; only their spliced helper names are
+#     enumerated.
+#   - Arguments passed to child executables, Start-Process -FilePath / -ArgumentList, and `reg` verbs are
+#     not judged. Instance methods are allowlisted by NAME, not by receiver type. Trusted-helper
+#     arguments other than the -TrustedRoot ones named under R2 are not constrained.
+#   - A spliced body is scanned as a standalone function, so a $Pub / $Work / $Cache variable inside it is
+#     judged by the same name-based rules as in a template, not by what the caller binds it to.
+#   - The scan reads the template with placeholders neutralised, not the emitted job text.
+#   - Allowlist rows in the caller (test_attr3_spliced_body_scan.py) are trusted as reviewed; their
+#     reasons are not re-proven here.
+# A hostile author can defeat any static lint of PowerShell -- including by editing this file -- so review
+# of the template diff remains required.
+#
+# Output: JSON { templates: [...], violations: [ { source, line, rule, text, reason } ],
+#                spliced: [ { module, name, line, bodyLength, bodySha256, callers } ],
+#                splicedViolations: [ { source, module, function, line, rule, token, text, reason } ] }.
+# spliced / splicedViolations are empty unless -SpliceSource is given.
 
 [CmdletBinding()]
 param(
     [string[]]$GeneratorPath = @(),
     [string[]]$TemplateFile = @(),
-    [string[]]$ModulePath = @()
+    [string[]]$ModulePath = @(),
+    [string[]]$SpliceSource = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +93,7 @@ Set-StrictMode -Version Latest
 $GeneratorPath = @($GeneratorPath | ForEach-Object { $_ -split ';' } | Where-Object { $_ })
 $TemplateFile = @($TemplateFile | ForEach-Object { $_ -split ';' } | Where-Object { $_ })
 $ModulePath = @($ModulePath | ForEach-Object { $_ -split ';' } | Where-Object { $_ })
+$SpliceSource = @($SpliceSource | ForEach-Object { $_ -split ';' } | Where-Object { $_ })
 if ($ModulePath.Count -eq 0) {
     # ATTR3-FOOTAGE-BIND-1 PR-B round 4b: playback-attr-3-cuda-job.ps1 also embeds functions from
     # AttrCudaOwnerFootage.psm1 (the private owner-footage workspace), moved out of
@@ -83,7 +125,7 @@ $childExecutables = @('vsLocator', 'psExe', 'cuobjdump', 'exportTool', 'nvcc')
 $allowedStatic = @(
     'double::Parse', 'double::TryParse', 'Environment::GetEnvironmentVariable',
     'Globalization.CultureInfo::InvariantCulture', 'Globalization.NumberStyles::Float',
-    'Guid::NewGuid',
+    'Guid::NewGuid', 'int::MaxValue', 'int::MinValue',
     'IO.File::ReadAllText', 'IO.Path::GetFileNameWithoutExtension', 'IO.Path::GetFullPath',
     'math::Ceiling', 'math::Floor', 'math::Pow', 'math::Round', 'math::Sqrt', 'regex::Escape', 'regex::Matches',
     'string::IsNullOrWhiteSpace', 'StringComparison::OrdinalIgnoreCase',
@@ -97,11 +139,41 @@ $allowedEnv = @('TEMP', 'TMP')
 
 $violations = [System.Collections.Generic.List[object]]::new()
 $scanned = [System.Collections.Generic.List[string]]::new()
+$script:bodyMode = $false
 
 function Add-Violation([string]$Source, $Ast, [string]$Rule, [string]$Reason) {
     $text = ($Ast.Extent.Text -replace '\s+', ' ')
     if ($text.Length -gt 160) { $text = $text.Substring(0, 160) }
-    $violations.Add([ordered]@{ source = $Source; line = $Ast.Extent.StartLineNumber; rule = $Rule; text = $text; reason = $Reason })
+    $record = [ordered]@{ source = $Source; line = $Ast.Extent.StartLineNumber; rule = $Rule; text = $text; reason = $Reason }
+    if ($script:bodyMode) { $record['token'] = Get-ViolationToken $Ast }
+    $violations.Add($record)
+}
+
+function Get-ViolationToken($Ast) {
+    # The offending construct in one short stable word, so a reviewed allowlist row can name it
+    # (spliced-body findings only): the command name, Type::Member, .Method(), or the assignment target.
+    if ($Ast -is [System.Management.Automation.Language.CommandAst]) {
+        $first = $Ast.CommandElements[0]
+        $name = $Ast.GetCommandName()
+        if ($Ast.InvocationOperator -eq 'Dot') { return '. (dot-source)' }
+        if ($Ast.InvocationOperator -eq 'Ampersand') { return '& ' + $first.Extent.Text }
+        if ([string]::IsNullOrEmpty($name)) { return $first.Extent.Text }
+        if ($name -ieq 'New-Object') {
+            # New-Object can instantiate any type (a StreamWriter is a file write), so the type is part of the token.
+            $typeArgs = Get-NamedArguments $Ast @('TypeName')
+            if ($typeArgs.Count -eq 1 -and $null -ne $typeArgs[0]) { return "$name $($typeArgs[0].Extent.Text)" }
+            if ($Ast.CommandElements.Count -gt 1 -and $Ast.CommandElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { return "$name $($Ast.CommandElements[1].Extent.Text)" }
+        }
+        return $name
+    }
+    if ($Ast -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and -not $Ast.Static) { return '.' + $Ast.Member.Extent.Text + '()' }
+    if ($Ast -is [System.Management.Automation.Language.MemberExpressionAst]) {
+        if ($Ast.Static -and $Ast.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) { return $Ast.Expression.TypeName.FullName + '::' + $Ast.Member.Extent.Text }
+        return $Ast.Extent.Text
+    }
+    if ($Ast -is [System.Management.Automation.Language.AssignmentStatementAst]) { return $Ast.Left.Extent.Text }
+    if ($Ast -is [System.Management.Automation.Language.FileRedirectionAst]) { return 'redirection' }
+    return $Ast.GetType().Name
 }
 
 function Get-ModuleFunctionNames([string]$Path) {
@@ -214,13 +286,13 @@ function Test-Provable($Ast, $Root, $Visiting) {
     return $false
 }
 
-function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions) {
+function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions, [switch]$FunctionBody) {
     $tokens = $null; $errors = $null
     $root = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
     foreach ($err in @($errors)) {
         $violations.Add([ordered]@{ source = $Source; line = $err.Extent.StartLineNumber; rule = 'parse'; text = $err.Message; reason = 'template does not parse' })
     }
-    $scanned.Add($Source)
+    if (-not $FunctionBody) { $scanned.Add($Source) }
     # R8 directives: `using module/assembly/namespace` and `#requires` pull in code the lint never sees.
     foreach ($using in @($root.UsingStatements)) {
         Add-Violation $Source $using 'R8' 'using statements are not allowed in a job template'
@@ -341,7 +413,9 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions)
 
     # R5 assignments
     $workAssignments = @(Get-AssignmentsTo $root 'Work')
-    if ($workAssignments.Count -ne 1) {
+    if ($FunctionBody) {
+        # A function body is not a job: the "$Work assigned exactly once, at top level" proof belongs to the template.
+    } elseif ($workAssignments.Count -ne 1) {
         $anchor = if ($workAssignments.Count -gt 1) { $workAssignments[1] } else { $root }
         Add-Violation $Source $anchor 'R5' "`$Work must be assigned exactly once (found $($workAssignments.Count))"
     } else {
@@ -419,4 +493,104 @@ foreach ($file in $TemplateFile) {
     Invoke-Scan $file ([IO.File]::ReadAllText($file)) $moduleFunctions
 }
 
-[ordered]@{ templates = @($scanned); violations = @($violations) } | ConvertTo-Json -Depth 6
+# ---- spliced helper bodies (-SpliceSource) ----
+$spliced = [System.Collections.Generic.List[object]]::new()
+$splicedViolations = [System.Collections.Generic.List[object]]::new()
+$repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path.TrimEnd('\') + '\'
+
+function Get-RepoRelativePath([string]$Path) {
+    $full = (Resolve-Path -LiteralPath $Path).Path
+    if ($full.StartsWith($repoRoot, [StringComparison]::OrdinalIgnoreCase)) { $full = $full.Substring($repoRoot.Length) }
+    return ($full -replace '\\', '/')
+}
+
+function Add-SpliceFinding([string]$Source, [int]$Line, [string]$Function, [string]$Text, [string]$Reason) {
+    $splicedViolations.Add([ordered]@{ source = $Source; module = ''; function = $Function; line = $Line; rule = 'splice'; token = 'splice'; text = $Text; reason = $Reason })
+}
+
+function Get-SpliceCallSites([string]$Path) {
+    # Every Get-AttrCudaEmbeddedFunctionSource call in the file, with the literal function names it asks for.
+    $tokens = $null; $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $Path).Path, [ref]$tokens, [ref]$errors)
+    $source = Get-RepoRelativePath $Path
+    foreach ($err in @($errors)) {
+        Add-SpliceFinding $source $err.Extent.StartLineNumber '' $err.Message 'splice source does not parse; its splice call sites cannot be enumerated'
+    }
+    # Command names are case-insensitive and a module-qualified name (<Module>\Get-AttrCudaEmbeddedFunctionSource)
+    # resolves to the same command: compare the part after the last backslash, ignoring case.
+    $extractorCalls = $ast.FindAll({
+        param($n)
+        if ($n -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
+        $commandName = $n.GetCommandName()
+        if ($null -eq $commandName) { return $false }
+        return $commandName.Substring($commandName.LastIndexOf('\') + 1) -ieq 'Get-AttrCudaEmbeddedFunctionSource'
+    }, $true)
+    foreach ($call in $extractorCalls) {
+        $text = ($call.Extent.Text -replace '\s+', ' ')
+        if ($text.Length -gt 160) { $text = $text.Substring(0, 160) }
+        $named = Get-NamedArguments $call @('Name')
+        $argument = $null
+        if ($named.Count -eq 1) { $argument = $named[0] }
+        elseif ($named.Count -eq 0 -and $call.CommandElements.Count -gt 1 -and $call.CommandElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $argument = $call.CommandElements[1] }
+        $dynamic = $null -eq $argument -or @($argument.FindAll({
+            param($n) ($n -is [System.Management.Automation.Language.VariableExpressionAst]) -or ($n -is [System.Management.Automation.Language.SubExpressionAst]) -or
+                      ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -or ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -or
+                      ($n -is [System.Management.Automation.Language.CommandAst])
+        }, $true)).Count -gt 0
+        $names = @()
+        if (-not $dynamic) {
+            $names = @($argument.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value })
+            if ($argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $names = @([string]$argument.Value) }
+        }
+        if ($dynamic -or $names.Count -eq 0) {
+            Add-SpliceFinding $source $call.Extent.StartLineNumber '' $text 'the -Name list is not a literal list of function names, so the spliced bodies cannot be enumerated'
+            continue
+        }
+        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names }
+    }
+}
+
+if ($SpliceSource.Count -gt 0) {
+    $moduleTexts = [ordered]@{}
+    foreach ($modulePath in $ModulePath) { $moduleTexts[(Get-RepoRelativePath $modulePath)] = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $modulePath).Path) }
+    $entries = [ordered]@{}
+    foreach ($spliceSource in $SpliceSource) {
+        foreach ($site in @(Get-SpliceCallSites $spliceSource)) {
+            foreach ($functionName in $site.names) {
+                # The extractor's own pattern (Get-AttrCudaEmbeddedFunctionSource in AttrCudaArtifacts.psm1).
+                $pattern = '(?ms)^function\s+' + [regex]::Escape($functionName) + '\s*\{.*?^\}'
+                $found = 0
+                foreach ($module in $moduleTexts.Keys) {
+                    $match = [regex]::Match($moduleTexts[$module], $pattern)
+                    if (-not $match.Success) { continue }
+                    $found++
+                    $key = "$module::$functionName"
+                    if (-not $entries.Contains($key)) {
+                        $line = 1 + ([regex]::Matches($moduleTexts[$module].Substring(0, $match.Index), "`n")).Count
+                        $entries[$key] = [ordered]@{ module = $module; name = $functionName; line = $line; body = $match.Value; callers = [System.Collections.Generic.List[string]]::new() }
+                    }
+                    if (-not $entries[$key].callers.Contains($site.source)) { $entries[$key].callers.Add($site.source) }
+                }
+                if ($found -eq 0) {
+                    Add-SpliceFinding $site.source $site.line $functionName $site.text "no -ModulePath module defines an extractable function named '$functionName'"
+                }
+            }
+        }
+    }
+    foreach ($entry in $entries.Values) {
+        $bytes = [Text.Encoding]::UTF8.GetBytes([string]$entry.body)
+        $sha = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($bytes)).Replace('-', '').ToLowerInvariant()
+        $spliced.Add([ordered]@{ module = $entry.module; name = $entry.name; line = $entry.line; bodyLength = $bytes.Length; bodySha256 = $sha; callers = @($entry.callers) })
+        $before = $violations.Count
+        $script:bodyMode = $true
+        try { Invoke-Scan "$($entry.module)::$($entry.name)" ([string]$entry.body) $moduleFunctions -FunctionBody } finally { $script:bodyMode = $false }
+        foreach ($finding in @($violations.GetRange($before, $violations.Count - $before))) {
+            $token = if ($finding.Contains('token')) { $finding.token } else { [string]$finding.rule }
+            $absolute = if ($finding.line -ge 1) { $entry.line + $finding.line - 1 } else { $entry.line }
+            $splicedViolations.Add([ordered]@{ source = $finding.source; module = $entry.module; function = $entry.name; line = $absolute; rule = $finding.rule; token = $token; text = $finding.text; reason = $finding.reason })
+        }
+        $violations.RemoveRange($before, $violations.Count - $before)
+    }
+}
+
+[ordered]@{ templates = @($scanned); violations = @($violations); spliced = @($spliced); splicedViolations = @($splicedViolations) } | ConvertTo-Json -Depth 6

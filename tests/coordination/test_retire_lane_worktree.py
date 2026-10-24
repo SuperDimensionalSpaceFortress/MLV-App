@@ -8,6 +8,7 @@ import base64
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -815,7 +816,9 @@ def _strand_registered(main, wt):
     """A cheap stranded state with git still registering the tree (at <wt>.retiring): a LOCKED worktree makes `git worktree remove` refuse
     up front (nothing deleted), and a seam makes every rename back fail with a sharing violation."""
     _git(main, "worktree", "lock", "--reason", "strand-test", str(wt))
-    prelude = ("$script:RestoreRetryBudgetMs = 300; $script:RestoreRetryDelayMs = 50; $origMoveSeam = ${function:Move-LaneWorktreeRoot}; "
+    # ONLY_PYTEST_CHILDREN: this fixture is about the rename back, not the host; an unrelated live pwsh whose cwd cannot be read would otherwise
+    # refuse the removal as cwd-unknown here, in setup, before any case reaches the behaviour it is written for.
+    prelude = (ONLY_PYTEST_CHILDREN + "$script:RestoreRetryBudgetMs = 300; $script:RestoreRetryDelayMs = 50; $origMoveSeam = ${function:Move-LaneWorktreeRoot}; "
                "function Move-LaneWorktreeRoot { param([string]$From, [string]$To) if ($From -like '*.retiring') { "
                "return 'The process cannot access the file because it is being used by another process. (seam)' }; & $origMoveSeam -From $From -To $To }; ")
     d, _ = _gate_real(wt, whatif=False, prelude=prelude)
@@ -1037,6 +1040,167 @@ def test_a_half_removed_tree_whose_first_repair_fails_is_re_checked_out_by_the_r
     assert [r["state"] for r in rows] == ["restored"] and "status clean" in rows[0]["note"], s
     assert (wt / "a.txt").exists() and (wt / ".gitignore").exists(), "every tracked file is back"
     _assert_back_at_its_own_path(main, wt)
+
+
+def _git_failure_shim(log, flag, sub, cap=None):
+    """Prelude: a `git.exe` FUNCTION (PowerShell resolves a function before the executable, so the script's `& git.exe ...` lands here, no
+    seam in the script). While `flag` exists, a git call carrying the subcommand `sub` (status | checkout-index) appends a line to `log`,
+    exits 128 and prints a fatal line; every other call, and every call once `flag` is deleted, goes to the real git. `cap` shrinks
+    $script:RestoreCheckoutMaxAttempts (the owed-checkout attempt cap) so the capped case needs few sweeps."""
+    return ("$global:realGit = (Get-Command git.exe -CommandType Application | Select-Object -First 1).Source; "
+            + (f"$script:RestoreCheckoutMaxAttempts = {cap}; " if cap else "")
+            + "function git.exe { "
+            f"if ((Test-Path -LiteralPath '{flag}') -and (@($args) -contains '{sub}')) {{ "
+            f"[IO.File]::AppendAllText('{log}', '{sub}' + [Environment]::NewLine); $global:LASTEXITCODE = 128; 'fatal: seam failure'; return }}; "
+            "& $global:realGit @args }; ")
+
+
+def _owed_checkout_fixture(repo, name):
+    """A half-removed, stranded tree (admin entry, `.git` link and tracked files gone) with its rename record. Returns (tmp, main, root, wt, record dir)."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / name)
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    assert len(recs) == 1, recs
+    shutil.rmtree(_admin_dir(main, wt))
+    for f in (".git", "a.txt", ".gitignore"):
+        (_retiring_of(wt) / f).unlink()
+    return tmp, main, root, wt, Path(main) / ".git" / "mlv-retire-pending" / recs[0]
+
+
+def _sweep_with(main, root, tmp, prelude):
+    return json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", _sweep_script(main, root, tmp, prelude)],
+                                     check=True, capture_output=True, text=True).stdout)
+
+
+def _record_of(rec_dir):
+    return json.loads((rec_dir / "record.json").read_text(encoding="utf-8-sig"))
+
+
+@pytest.mark.parametrize("failing,files_back,note", [("status", True, "status after the re-checkout failed"),
+                                                     ("checkout-index", False, "checkout-index after the re-registration failed")])
+def test_a_git_failure_after_the_re_registration_keeps_the_owed_checkout_and_the_retry_settles_it(repo, failing, files_back, note):
+    """Dot R18 advisory 4e08bf9a on PR #632 (RETIRE-RESTORE-CHECKOUT-STATUS-FAILURE-FIXTURES-1, card A). The admin entry and link are
+    re-created and the repair works, then `git checkout-index -a` (or the `git status` after it) fails. The call is restored-unrepaired,
+    the record keeps checkoutOwed and survives, and a retry with git working re-checks the tree out and drops the record. COVERAGE: the
+    branch already behaves this way on c1e0da63; no committed fixture forced it."""
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, f"wt-git-{failing}")
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    s = _sweep_with(main, root, tmp, _git_failure_shim(log, flag, failing))
+    rows = s["strandedRestore"]
+    assert [r["state"] for r in rows] == ["restored-unrepaired"], s
+    assert note in rows[0]["note"], rows
+    assert "seam failure" in rows[0]["note"] and "re-checks it out" in rows[0]["note"], rows
+    assert log.read_text(encoding="utf-8").split() == [failing], "the shim must have forced exactly the one failure"
+    assert rec_dir.is_dir() and _record_of(rec_dir).get("checkoutOwed") is True, "the record and its debt survive the failure"
+    assert (wt / "a.txt").exists() is files_back, "checkout-index ran before the failing status, or never ran"
+    flag.unlink()
+    s = _sweep_with(main, root, tmp, _git_failure_shim(log, flag, failing))
+    rows = s["strandedRestore"]
+    assert [r["state"] for r in rows] == ["restored"] and "status clean" in rows[0]["note"], rows
+    assert (wt / "a.txt").exists() and (wt / ".gitignore").exists(), "every tracked file is back"
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_an_owed_checkout_that_keeps_failing_gives_up_visibly_after_the_cap_and_never_re_runs_git(repo):
+    """RETIRE-RESTORE-OWED-CHECKOUT-ATTEMPT-CAP-1 (card B; fable r1 hardening on PR #632). An owed re-checkout whose git call keeps failing
+    used to stay restored-unrepaired for ever, running both git calls on every later call or sweep. Each failing run now counts in
+    record.json (checkoutAttempts); the run that reaches the cap reports restored-checkout-gave-up, the record stays on disk as a visible
+    terminal state, and later sweeps report the same state WITHOUT running git again, even once git works."""
+    cap = 3
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-cap")
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap)
+    states = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0]["state"] for _ in range(cap)]
+    assert states == ["restored-unrepaired"] * (cap - 1) + ["restored-checkout-gave-up"], states
+    assert _record_of(rec_dir).get("checkoutAttempts") == cap and _record_of(rec_dir).get("checkoutOwed") is True
+    assert len(log.read_text(encoding="utf-8").split()) == cap
+    for working in (False, True):   # still failing, then git works again: terminal either way
+        if working:
+            flag.unlink()
+        s = _sweep_with(main, root, tmp, shim)
+        row = s["strandedRestore"][0]
+        assert row["state"] == "restored-checkout-gave-up" and "checkout-index -a" in row["note"] and str(rec_dir) in row["note"], s
+        assert rec_dir.is_dir(), "a terminal record is kept on disk, never silently dropped"
+    assert len(log.read_text(encoding="utf-8").split()) == cap, "no git call after the cap"
+    assert not (wt / "a.txt").exists(), "the tree is left as it is for the owner; nothing re-ran"
+
+
+RECORD_WRITE_FAILS = ("function Write-RetirePendingRecordFile { param([string]$Dir, [object]$Record) "
+                      "throw 'seam: record.json is held open by a reader' }; ")
+
+
+def _seed_record(rec_dir, **fields):
+    rec = _record_of(rec_dir)
+    rec.update(fields)
+    (rec_dir / "record.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+def test_a_record_write_that_fails_never_yields_a_terminal_claim_that_the_next_call_contradicts(repo):
+    """RETIRE-RESTORE-CHECKOUT-STATUS-FAILURE-FIXTURES-1 r2 (sol blocker on PR #645; catalogue row R-03: never claim terminal suppression while
+    later calls still execute git). checkoutOwed with 4 of 5 attempts recorded, git checkout-index failing, and record.json cannot be
+    rewritten (a reader holds it). The count used to be saved AFTER git ran: the failed save was only a note, the call still returned
+    restored-checkout-gave-up ('git is not run again'), and the next call ran git again from the unchanged count of 4. The count is now saved
+    BEFORE git runs; when that save fails git is not run at all and the state is the non-terminal restored-unrepaired, naming the save failure."""
+    cap = 5
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-save-fails")
+    _seed_record(rec_dir, checkoutOwed=True, checkoutAttempts=cap - 1)
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap) + RECORD_WRITE_FAILS
+    rows = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0] for _ in range(2)]
+    ran = len(log.read_text(encoding="utf-8").split()) if log.exists() else 0
+    assert not any(r["state"] == "restored-checkout-gave-up" for r in rows) or ran == 0, \
+        f"a terminal claim was made while git ran {ran} time(s): {rows}"
+    assert [r["state"] for r in rows] == ["restored-unrepaired"] * 2, rows
+    assert all("attempt count could not be saved" in r["note"] and "git was not run" in r["note"] for r in rows), rows
+    assert ran == 0, "an attempt that cannot be recorded is not made"
+    assert _record_of(rec_dir).get("checkoutAttempts") == cap - 1 and rec_dir.is_dir(), "the record is untouched and kept"
+
+
+def test_a_record_that_never_saves_cannot_run_git_for_ever_nor_lose_the_cap(repo):
+    """Opus hardening RETIRE-RESTORE-ATTEMPT-COUNT-PERSIST-FAIL-1 on PR #645: if the record cannot be written on any run, the count never
+    advanced past 1 and the cap never fired, so git re-ran on every call. Now git does not run while the count cannot be saved (bounded by
+    zero, not by the cap), every call says so, and once the record can be written again the cap counts from where it was and still fires."""
+    cap = 3
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-never-saves")
+    _seed_record(rec_dir, checkoutOwed=True)
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap)
+    states = []
+    for _ in range(cap + 2):
+        row = _sweep_with(main, root, tmp, shim + RECORD_WRITE_FAILS)["strandedRestore"][0]
+        states.append(row["state"])
+        assert "attempt count could not be saved" in row["note"], row
+    assert states == ["restored-unrepaired"] * (cap + 2), states
+    assert not log.exists() and "checkoutAttempts" not in _record_of(rec_dir), "no git call, nothing counted"
+    states = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0]["state"] for _ in range(cap)]   # the record can be written again
+    assert states == ["restored-unrepaired"] * (cap - 1) + ["restored-checkout-gave-up"], states
+    assert len(log.read_text(encoding="utf-8").split()) == cap and _record_of(rec_dir).get("checkoutAttempts") == cap
+
+
+def test_the_owed_checkout_attempt_cap_is_a_named_script_constant_of_five():
+    # Exact: a substring match also accepted 50 or 500.
+    assert re.search(r"(?m)^\$script:RestoreCheckoutMaxAttempts = 5\s*(#.*)?$", HELPER.read_text(encoding="utf-8"))
+
+
+def test_the_helper_requires_powershell_7():
+    """RETIRE-RESTORE-PWSH7-REQUIRES-PIN-1 (card C). Write-RetirePendingRecordFile calls [IO.File]::Move($src, $dst, $true), a .NET Core-only
+    overload; every caller (Invoke-Lane, Invoke-Workstream, Remove-LaneBulkScratch) starts under pwsh 7, so the file says so instead of
+    failing inside a restore under Windows PowerShell 5.1."""
+    text = HELPER.read_text(encoding="utf-8")
+    assert any(l.strip() == "#Requires -Version 7" for l in text.splitlines()), "missing '#Requires -Version 7'"
+    assert text.isascii()
+
+
+@pytest.mark.skipif(not shutil.which("powershell"), reason="requires Windows PowerShell 5.1")
+def test_dot_sourcing_the_helper_under_windows_powershell_5_1_is_refused_up_front():
+    r = subprocess.run([shutil.which("powershell"), "-NoProfile", "-NonInteractive", "-Command", f". '{HELPER}'"], capture_output=True, text=True)
+    assert r.returncode != 0 and "requires" in (r.stderr + r.stdout).lower(), (r.returncode, r.stdout, r.stderr)
 
 
 def _restore_with_snapshot(rec_dir, snapshot):
@@ -2263,3 +2427,404 @@ def test_rename_probe_refuses_a_delete_sharing_file_holder_in_a_subdirectory_of_
     assert d["action"] == "kept" and d["reason"].startswith("in-use"), d
     assert held.exists() and (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
     assert not _retiring_of(wt).exists() and _norm(wt) in _worktree_paths(main) and _pending_records(main) == []
+
+
+# --- LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: a live DETACHED driver that names only its RUN DIR ---
+# 2026-10-24 06:02Z the mlvtmp retention pass removed C:\mlvtmp\lane-CPU-17V9-FPS-GAP-AB-1-20261024 while the detached r5 venue
+# driver (pid 43484, `pwsh -File <run dir>\venue-cpu17v9-ab.ps1`, pid in <run dir>\venue-cpu17v9-ab.pid) still ran Wait-VenueQuiet.ps1
+# from it: its command line named the run dir, never the worktree, and the lane that launched it had exited (receipt state=complete).
+# Get-WorktreeLiveRefusal is the one guard every remover calls; the process table is always FAKED here (pids 99998x are not real).
+
+def _live_refusal(wt, snapshot_expr=None, runs_root=None, prelude=""):
+    args = f"-WorktreePath '{wt}'"
+    if snapshot_expr:
+        args += f" -Snapshot ({snapshot_expr})"
+    if runs_root:
+        args += f" -RunsRoot '{runs_root}'"
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; {prelude} "
+        f"$r = Get-WorktreeLiveRefusal {args}; "
+        "if ($null -eq $r) { 'FREE' } else { $r | ConvertTo-Json -Depth 4 -Compress }"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    out = p.stdout.strip()
+    return (None if out == "FREE" else json.loads(out)), p.stderr
+
+
+def _fake_proc(pid, cmdline, name="pwsh.exe"):
+    cl = str(cmdline).replace("'", "''")
+    return f"[pscustomobject]@{{ ProcessId = {pid}; Name = '{name}'; CommandLine = '{cl}' }}"
+
+
+def _fake_snapshot(*procs):
+    return f"[pscustomobject]@{{ Procs = @({', '.join(procs)}); SelfPids = @($PID) }}"
+
+
+def _driver_run_dir(runs, name, pid, *, workdir=None, pid_file="venue-driver.pid", child_json=False):
+    """A run dir as a detached venue driver leaves it: its driver script (which does NOT name the worktree), its pid file, and the
+    launching lane's TERMINAL receipt naming the worktree as its workDir."""
+    rd = runs / name
+    rd.mkdir(parents=True)
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    if child_json:
+        (rd / pid_file).write_text(json.dumps({"schema": "mlv-lane-child/v1", "pid": pid}), encoding="utf-8")
+    else:
+        (rd / pid_file).write_text(f"{pid}\n", encoding="utf-8")
+    if workdir is not None:
+        (rd / "opus-001.receipt.json").write_text(json.dumps({"state": "complete", "exitCode": 0, "workDir": str(workdir)}), encoding="utf-8")
+    return rd
+
+
+def _driver_cmdline(rd):
+    return f'"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoProfile -NonInteractive -File "{rd}\\venue-driver.ps1"'
+
+
+def test_live_refusal_a_process_naming_the_worktree_is_refused_with_a_typed_line(tmp_path):
+    """(a) a live process whose command line names the worktree."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc(999981, f"git -C {wt} status", "git.exe")))
+    assert r is not None and r["reason"] == "live-process" and r["processId"] == 999981, r
+    assert r["matchedPath"].lower() == str(wt).lower(), r
+    assert re.search(r"REFUSED worktree-removal reason=live-process path=.* pid=999981 .*matched=", err), err
+
+
+def test_live_refusal_a_driver_named_only_by_its_run_dir_pid_file_is_refused(tmp_path):
+    """(b) the 2026-10-24 shape: only the run dir's pid file + terminal receipt tie the live driver to the worktree."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r5-20261024T0110Z", 999982, workdir=wt)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc(999982, _driver_cmdline(rd))), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999982, r
+    assert r["via"] == "rundir-pid:venue-driver.pid", r
+    assert r["matchedPath"].lower() == str(rd).lower(), r
+    assert "reason=live-driver" in err and "pid=999982" in err and f"matched={rd}".lower() in err.lower(), err
+
+
+def test_live_refusal_a_receipt_child_pid_record_counts_like_a_pid_file(tmp_path):
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r2", 999983, workdir=wt, pid_file="opus-001.child.json", child_json=True)
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc(999983, _driver_cmdline(rd))), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["via"] == "rundir-pid:opus-001.child.json", r
+
+
+def test_gate_keeps_a_worktree_whose_live_driver_names_only_its_run_dir(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-DRV-1")
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-DRV-1-r5", 999984, workdir=wt)
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; $snap = {_fake_snapshot(_fake_proc(999984, _driver_cmdline(rd)))}; "
+        f"Invoke-RetireLaneWorktree -WorkDir '{wt}' -MergeTarget 'origin/master' -WhatIf -ProcessSnapshot $snap -RunsRoot '{runs}' "
+        "| ConvertTo-Json -Depth 4"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    d = json.loads(p.stdout)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: 999984 pwsh.exe [rundir-pid:venue-driver.pid"), d
+    assert wt.exists()
+
+
+def test_a_dead_driver_pid_and_no_live_reference_still_retire_the_worktree(repo):
+    """(c) no regression: a stale pid file (its pid is not running) never holds a worktree."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-DEAD-1")
+    runs = tmp / "fleet-runs"
+    _driver_run_dir(runs, "lane-DEAD-1-r5", 999985, workdir=wt)
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc(999986, "x.exe C:\\somewhere\\else", "x.exe")), runs)
+    assert r is None, r
+    d = _retire(wt, MergeTarget="origin/master", QuarantineRoot=str(tmp / "q"), RunsRoot=str(runs))
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert not wt.exists()
+
+
+def test_prefix_sibling_lane_x_10_never_holds_lane_x_1(repo):
+    """(d) C:\\mlvtmp\\lane-X-1 must not match C:\\mlvtmp\\lane-X-10 on a command line or through a run dir's receipt."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-X-1")
+    sibling = tmp / "lane-X-10"
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-10-r1", 999987, workdir=sibling)
+    snap = _fake_snapshot(_fake_proc(999988, f"git -C {sibling} status", "git.exe"),
+                          _fake_proc(999989, f"git -C {str(sibling).replace(chr(92), '/').upper()} log", "git.exe"),
+                          _fake_proc(999987, _driver_cmdline(rd)))
+    r, _ = _live_refusal(wt, snap, runs)
+    assert r is None, r
+    d = _gate_with_snapshot(wt, snap)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+
+
+def test_live_refusal_matches_case_and_separator_variants_of_the_worktree(tmp_path):
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    variant = str(wt).replace("\\", "/").upper() + "/tools/x.ps1"
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc(999990, f"pwsh -File {variant}")))
+    assert r is not None and r["reason"] == "live-process", r
+
+
+def test_live_refusal_fails_closed_when_the_process_census_fails(tmp_path):
+    """(e) an unreadable process table is never 'free'."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    r, err = _live_refusal(wt, prelude="function Get-LaneProcessSnapshot { throw 'WMI provider down' };")
+    assert r is not None and r["reason"] == "census-failed" and "WMI provider down" in r["detail"], r
+    assert "reason=census-failed" in err, err
+
+
+def test_live_refusal_fails_closed_when_the_run_dir_census_fails(tmp_path):
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    runs.write_text("not a directory", encoding="utf-8")
+    r, _ = _live_refusal(wt, _fake_snapshot(), runs)
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+
+
+def test_gate_fails_closed_with_a_typed_reason_when_the_process_census_fails(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-CENSUS-1")
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; function Get-LaneProcessSnapshot {{ throw 'WMI provider down' }}; "
+        f"Invoke-RetireLaneWorktree -WorkDir '{wt}' -MergeTarget 'origin/master' -QuarantineRoot '{tmp / 'q'}' | ConvertTo-Json -Depth 4"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    d = json.loads(p.stdout)
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: process census failed"), d
+    assert wt.exists()
+
+
+# --- r2 (PR #654 sol r1 BLOCKER + key3 hardening): a run-dir record that cannot be READ is unknown, never absent ---
+# Sol's repro: a live driver named only by its run dir is live-driver while its pid record reads, and was FREE once the same read threw a
+# sharing IOException (the catch dropped the error and cached an empty index). Every read failure other than "the file is gone" now refuses
+# reason=rundir-census-failed naming the file and the error class. The lock below is a real FileShare.None handle held by the test's own
+# pwsh on a temp file; the seam (Read-RunDirRecordText) fakes the error classes a lock cannot produce. No real driver, no real process table.
+
+def _locked(path):
+    p = str(path).replace("'", "''")
+    return f"$lock = [IO.File]::Open('{p}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None);"
+
+
+def _seam_throws(leaf, exc_expr):
+    return ("function Read-RunDirRecordText { param([string]$Path) "
+            f"if ((Split-Path -Leaf $Path) -eq '{leaf}') {{ throw ({exc_expr}) }}; return [IO.File]::ReadAllText($Path) }};")
+
+
+def _blocker_fixture(tmp_path, *, workdir=None):
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r5-20261024T0110Z", 999982, workdir=wt if workdir is None else workdir)
+    return wt, runs, rd, _fake_snapshot(_fake_proc(999982, _driver_cmdline(rd)))
+
+
+def test_live_refusal_rundir_record_readable_is_live_driver(tmp_path):
+    """(a) the readable half of sol's pair."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    r, _ = _live_refusal(wt, snap, runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999982, r
+
+
+def test_live_refusal_rundir_pid_record_held_by_a_sharing_violation_is_census_failed_never_free(tmp_path):
+    """(b) sol's repro with a REAL sharing violation: the pid record is open FileShare.None while the guard reads it."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    rec = rd / "venue-driver.pid"
+    r, err = _live_refusal(wt, snap, runs, prelude=_locked(rec))
+    assert r is not None, "an unreadable pid record of a live run-dir driver was read as FREE"
+    assert r["reason"] == "rundir-census-failed", r
+    assert str(rec).lower() in r["detail"].lower() and "IOException" in r["detail"], r
+    assert "REFUSED worktree-removal reason=rundir-census-failed" in err and "venue-driver.pid" in err, err
+
+
+@pytest.mark.parametrize("exc", ["[UnauthorizedAccessException]::new('Access to the path is denied.')",
+                                 "[IO.IOException]::new('The process cannot access the file because it is being used by another process.')",
+                                 "[InvalidOperationException]::new('anything else')"])
+def test_live_refusal_rundir_pid_record_read_error_of_any_class_is_census_failed(tmp_path, exc):
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    r, _ = _live_refusal(wt, snap, runs, prelude=_seam_throws("venue-driver.pid", exc))
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+    cls = exc.split("]")[0].strip("[").split(".")[-1]
+    assert cls in r["detail"] and "venue-driver.pid" in r["detail"], r
+
+
+def test_live_refusal_rundir_tie_receipt_held_by_a_sharing_violation_is_census_failed_never_free(tmp_path):
+    """The pid record reads, the only file tying the run dir to the worktree (the receipt) cannot be read."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    rec = rd / "opus-001.receipt.json"
+    r, err = _live_refusal(wt, snap, runs, prelude=_locked(rec))
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+    assert "opus-001.receipt.json" in r["detail"] and "IOException" in r["detail"], r
+    assert "reason=rundir-census-failed" in err, err
+
+
+def test_live_refusal_rundir_record_gone_between_listing_and_read_is_absent_not_census_failed(tmp_path):
+    """A file that no longer exists is absent evidence, not a failure: the dead-record case stays FREE."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    r, _ = _live_refusal(wt, snap, runs, prelude=_seam_throws("venue-driver.pid", "[IO.FileNotFoundException]::new('gone')"))
+    assert r is None, r
+
+
+def test_live_refusal_unreadable_record_in_a_run_dir_naming_another_worktree_does_not_refuse_this_one(tmp_path):
+    """The unreadable record is read as naming EVERY live pid: it refuses exactly the worktrees such a pid could hold, not every worktree."""
+    other = tmp_path / "lane-Y-1"
+    wt, runs, rd, snap = _blocker_fixture(tmp_path, workdir=other)
+    r, _ = _live_refusal(wt, snap, runs, prelude=_locked(rd / "venue-driver.pid"))
+    assert r is None, r
+    other.mkdir()
+    r2, _ = _live_refusal(other, snap, runs, prelude=_locked(rd / "venue-driver.pid"))
+    assert r2 is not None and r2["reason"] == "rundir-census-failed", r2
+
+
+def test_live_refusal_rundir_tie_cap_reached_without_a_tie_is_census_failed_never_free(tmp_path):
+    """(c) key3 H3: RunDirTieMaxFiles files read without finding the tie is unknown, not free."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    for i in range(5):
+        (rd / f"leg-{i:02d}.json").write_text('{"leg": %d}' % i, encoding="utf-8")
+    r, err = _live_refusal(wt, snap, runs, prelude="$script:RunDirTieMaxFiles = 3;")
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+    assert "rundir-tie-cap" in r["detail"] and str(rd).lower() in r["detail"].lower(), r
+    assert "reason=rundir-census-failed" in err, err
+
+
+def test_live_refusal_rundir_tie_reads_the_receipt_before_bulk_leg_output(tmp_path):
+    """key3 H3 repro shape: NTFS lists leg-*.out.txt before opus-001.receipt.json; the receipt is read first, so the cap is not reached."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    for i in range(5):
+        (rd / f"leg-{i:02d}.out.txt").write_text(f"leg {i}\n", encoding="utf-8")
+    r, _ = _live_refusal(wt, snap, runs, prelude="$script:RunDirTieMaxFiles = 3;")
+    assert r is not None and r["reason"] == "live-driver", r
+
+
+def _gate_err(wt, snapshot_expr, runs=None, prelude="", whatif=True):
+    extra = (f" -RunsRoot '{runs}'" if runs is not None else "") + (" -WhatIf" if whatif else "")
+    snap = f"-ProcessSnapshot ({snapshot_expr})" if snapshot_expr else ""
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; {prelude} "
+        f"Invoke-RetireLaneWorktree -WorkDir '{wt}' -MergeTarget 'origin/master' {snap}{extra} | ConvertTo-Json -Depth 4"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return json.loads(p.stdout), p.stderr
+
+
+def test_gate_refused_line_carries_reason_live_driver_or_live_process(repo):
+    """(d) key3 H4: the gate's REFUSED line carries reason= like the shared guard's line."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-DRV-2")
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-DRV-2-r5", 999991, workdir=wt)
+    d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999991, _driver_cmdline(rd))), runs)
+    assert d["action"] == "kept", d
+    assert re.search(r"REFUSED worktree-removal reason=live-driver path=.* pid=999991 .*via=rundir-pid:venue-driver\.pid", err), err
+    d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999992, f"git -C {wt} status", "git.exe")), runs)
+    assert d["action"] == "kept", d
+    assert re.search(r"REFUSED worktree-removal reason=live-process path=.* pid=999992 .*via=cmdline", err), err
+
+
+def test_gate_census_failures_write_a_typed_refused_line(repo):
+    """key3 H4: a gate census failure writes a REFUSED line, not only the disposition reason."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-CENSUS-2")
+    d, err = _gate_err(wt, None, prelude="function Get-LaneProcessSnapshot { throw 'WMI provider down' };", whatif=False)
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: process census failed"), d
+    assert re.search(r"REFUSED worktree-removal reason=census-failed path=.* pid=unknown .*WMI provider down", err), err
+    runs = tmp / "fleet-runs-file"
+    runs.write_text("not a directory", encoding="utf-8")
+    d, err = _gate_err(wt, _fake_snapshot(), runs)
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: run-dir census failed"), d
+    assert re.search(r"REFUSED worktree-removal reason=rundir-census-failed path=.* pid=unknown ", err), err
+    assert wt.exists()
+
+
+def test_gate_keeps_a_worktree_whose_live_driver_record_is_locked(repo):
+    """The blocker through Invoke-RetireLaneWorktree: kept as cannot-determine, with a typed REFUSED line."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-DRV-3")
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-DRV-3-r5", 999993, workdir=wt)
+    d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999993, _driver_cmdline(rd))), runs, prelude=_locked(rd / "venue-driver.pid"))
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: run-dir census failed"), d
+    assert "venue-driver.pid" in d["reason"], d
+    assert "REFUSED worktree-removal reason=rundir-census-failed" in err, err
+
+
+# --- r3 (PR #654 key3 r2 BLOCKER B1): a file that is only held open for WRITING is read, never refused ---
+# r2 read run-dir files with [IO.File]::ReadAllText, which asks for FileShare.Read and so cannot open a file another process holds open for
+# writing. Every live Invoke-Lane lane (dispatch.out.txt) and every Start-HiddenDetached driver (cmd /c ... > out.txt 2> err.txt) keeps its
+# logs write-held for its whole life, and their command lines name their run dirs, so r2 refused EVERY unrelated free worktree while anything
+# ran. The run-dir read now opens with FileShare.ReadWrite|Delete: a write-held file reads; a real FileShare.None lock still fails closed.
+# The write handle is held by the test's own pwsh on a temp file; the process table is faked (pids 99997x are not real).
+
+def _write_held(path):
+    p = str(path).replace("'", "''")
+    return f"$wh_{re.sub(r'[^A-Za-z0-9]', '_', path.name)} = [IO.File]::Open('{p}', [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::Read);"
+
+
+def _lane_cmdline(rd):
+    return f'"C:\\Users\\x\\.local\\bin\\claude.exe" -p --settings "{rd}\\opus-001.settings.json" --model opus'
+
+
+def _unrelated_live_run_dir(tmp_path, shape):
+    """A live lane or detached driver working on ANOTHER worktree (lane-Y-1), with its log write-held, as on the real board."""
+    other = tmp_path / "lane-Y-1"
+    runs = tmp_path / "fleet-runs"
+    if shape == "detached-driver":
+        rd = _driver_run_dir(runs, "lane-Y-1-r5-20261024T0110Z", 999971, workdir=other)
+        log, cl = rd / "driver.out.txt", _driver_cmdline(rd)
+    else:
+        rd = _driver_run_dir(runs, "lane-Y-1-r1-20261024T1100Z", 999971, workdir=other, pid_file="opus-001.child.json", child_json=True)
+        (rd / "opus-001.settings.json").write_text('{"hooks": {}}', encoding="utf-8")
+        log, cl = rd / "dispatch.out.txt", _lane_cmdline(rd)
+    log.write_text("lane output so far\n", encoding="utf-8")
+    return runs, rd, log, _fake_proc(999971, cl)
+
+
+@pytest.mark.parametrize("shape", ["detached-driver", "invoke-lane"])
+def test_live_refusal_write_held_log_in_an_unrelated_live_run_dir_is_free_for_another_worktree(tmp_path, shape):
+    """(a) B1: an unrelated live run dir whose log is held open for writing leaves a different free worktree FREE."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs, rd, log, proc = _unrelated_live_run_dir(tmp_path, shape)
+    r, err = _live_refusal(wt, _fake_snapshot(proc), runs, prelude=_write_held(log))
+    assert r is None, f"a write-held log in an unrelated live run dir refused a free worktree: {r}"
+    assert "REFUSED" not in err, err
+
+
+def test_gate_retires_a_free_worktree_while_an_unrelated_live_run_dir_holds_its_log_open(repo):
+    """(a) B1 through Invoke-RetireLaneWorktree: would-retire, not cannot-determine."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-FREE-1")
+    runs, rd, log, proc = _unrelated_live_run_dir(tmp, "detached-driver")
+    d, err = _gate_err(wt, _fake_snapshot(proc), runs, prelude=_write_held(log))
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert "REFUSED" not in err, err
+
+
+def test_live_refusal_tied_record_under_a_real_lock_is_census_failed_beside_a_write_held_log(tmp_path):
+    """(b) sol r1's case still holds after the share change: a tied record under FileShare.None is unknown, never FREE."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    log = rd / "driver.out.txt"
+    log.write_text("driver output\n", encoding="utf-8")
+    rec = rd / "opus-001.receipt.json"
+    r, err = _live_refusal(wt, snap, runs, prelude=_write_held(log) + _locked(rec))
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+    assert "opus-001.receipt.json" in r["detail"] and "IOException" in r["detail"] and "driver.out.txt" not in r["detail"], r
+    assert "reason=rundir-census-failed" in err, err
+
+
+@pytest.mark.parametrize("leaf", ["opus-001.receipt.json", "venue-driver.pid"])
+def test_live_refusal_write_held_tied_record_is_still_read_and_refuses_as_live_driver(tmp_path, leaf):
+    """(c) a write-held record that ties the run dir to the worktree is READ: the holder is seen as live-driver, not census-failed."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    r, err = _live_refusal(wt, snap, runs, prelude=_write_held(rd / leaf))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999982, r
+    assert r["matchedPath"].lower() == str(rd).lower(), r
+    assert "reason=live-driver" in err, err

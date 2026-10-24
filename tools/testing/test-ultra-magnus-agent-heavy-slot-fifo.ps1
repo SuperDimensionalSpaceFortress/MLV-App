@@ -232,12 +232,13 @@ try {
         Move-Item -LiteralPath $Job.FullName -Destination $mdProcessed
         Write-Output 'stray'
     }
-    foreach ($n in @('j1', 'jO', 'agent-swap-U1', 'venue-quiet-probe-U2', 'agent-swap-Q', 'dve-p-health')) { [IO.File]::WriteAllText((Join-Path $inbox "$n.job.ps1"), '# mock') }
+    # STAGE-JOB-LEASE-EXEMPT-1: a staging job skips the gate when it is next, but is never run from inside another job's wait.
+    foreach ($n in @('j1', 'jO', 'agent-swap-U1', 'venue-quiet-probe-U2', 'agent-swap-Q', 'dve-p-health', 'playback-attr-3-cuda-stage-8ea38dff267b')) { [IO.File]::WriteAllText((Join-Path $inbox "$n.job.ps1"), '# mock') }
     Reset-Mock "1:$PID" @("slot 1: mlv j1 (pid $PID, since 2026-10-11 18:00:00) [exclusive]", 'slot 2: suite X (pid 77, since 2026-10-11 18:00:01) [exclusive]') $false
     $adm = Wait-HeavySlotAdmission -JobId 'j1' -Job ([pscustomobject]@{}) -Metadata ([pscustomobject]@{ maxQueueAgeSec = 1 })
     $dispatched = @($script:Mock.dispatched)
     Assert-True (($dispatched -join ',') -eq 'agent-swap-U1,venue-quiet-probe-U2') "maint-dispatch: exactly the two eligible light jobs ran, in Name order: [$($dispatched -join ',')]"
-    foreach ($n in @('j1', 'jO', 'agent-swap-Q', 'dve-p-health')) { Assert-True (Test-Path -LiteralPath (Join-Path $inbox "$n.job.ps1") -PathType Leaf) "maint-dispatch: $n was left in inbox\" }
+    foreach ($n in @('j1', 'jO', 'agent-swap-Q', 'dve-p-health', 'playback-attr-3-cuda-stage-8ea38dff267b')) { Assert-True (Test-Path -LiteralPath (Join-Path $inbox "$n.job.ps1") -PathType Leaf) "maint-dispatch: $n was left in inbox\" }
     Assert-True ($adm -isnot [array] -and $adm.label -eq 'queue-expired') "maint-dispatch: the wait returns ONE admission object (the dispatched job's output is not part of it): $(@($adm).Count) item(s), label $($adm.label)"
     Assert-True (@($script:Mock.log | Where-Object { $_ -match '^heavy-slot-gate: maint-dispatch exempt job=' }).Count -eq 2) "maint-dispatch: two maint-dispatch log lines"
     Assert-True ($null -eq $script:ExemptDuringWaitOf) "maint-dispatch: the during-wait marker is cleared"
@@ -472,6 +473,11 @@ $leaseTest = Join-Path $PSScriptRoot 'test-ultra-magnus-agent-quiet-lease.ps1'
 $leaseOut = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive -File $leaseTest -RepoRoot $RepoRoot -AgentScript $agentScript 2>&1
 Assert-True ($LASTEXITCODE -eq 0) "quiet-lease cases ($leaseTest) pass: $($leaseOut -join ' | ')"
 $results.quietLease = ($leaseOut -join "`n") | ConvertFrom-Json
+# STAGE-JOB-LEASE-EXEMPT-1: the staging-job exemption runs the same way (its own process, its own fake heavy-slot.py).
+$stageTest = Join-Path $PSScriptRoot 'test-ultra-magnus-agent-stage-exempt.ps1'
+$stageOut = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive -File $stageTest -RepoRoot $RepoRoot -AgentScript $agentScript 2>&1
+Assert-True ($LASTEXITCODE -eq 0) "stage-exempt cases ($stageTest) pass: $($stageOut -join ' | ')"
+$results.stageExempt = ($stageOut -join "`n") | ConvertFrom-Json
 
 if ($UnitOnly) {
     [pscustomobject]@{ status = 'PASS'; mode = 'unit-only'; results = $results } | ConvertTo-Json -Depth 8

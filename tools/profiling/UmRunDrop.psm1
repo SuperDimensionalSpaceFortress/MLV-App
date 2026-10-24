@@ -597,8 +597,12 @@ function Invoke-UmRunDrop {
         # job's own budget for a caller that does state one.
         [int]$JobTimeoutSec = 0,
         # LEASE-REQUEST-CHILD-NOT-AFTER-1: the AGENT's absolute deadline for this job, written to
-        # inbox\<id>.meta.json as notAfterUtc. Past it the Bachelor agent never takes a quiet lease
-        # for the job and never runs it (result exitCode 125, notAfterExpired). An ISO-8601 instant
+        # inbox\<id>.meta.json as notAfterUtc. The Bachelor agent takes no quiet lease for the job
+        # and does not start it after notAfterUtc, up to its prelaunch window (result exitCode 125,
+        # notAfterExpired). A lease requested before notAfterUtc that turns active inside a light job
+        # the agent runs during that wait is not renewed after it (a renew in flight is collected or
+        # killed) but stays held, unrenewed, until that light job returns (stale at 120 s). Clock
+        # skew between this host and the agent, a frozen agent and another agent are out of scope. An ISO-8601 instant
         # with an explicit Z or +hh:mm offset, later than now; '' (the default) writes no field, so
         # the claim's bytes are exactly what they were without it.
         [string]$NotAfterUtc = '',
