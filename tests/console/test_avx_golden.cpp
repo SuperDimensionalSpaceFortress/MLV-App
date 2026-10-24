@@ -353,7 +353,6 @@ static void assert_cpu_sampled(const char * file, int line, const char * express
 }
 
 #define ASSERT_CPU_SAMPLED(SAMPLE) assert_cpu_sampled(__FILE__, __LINE__, #SAMPLE, (SAMPLE))
-#define CPU_QUERY_DENIED(SAMPLE) note_cpu_query_denied(__FILE__, __LINE__, #SAMPLE, (SAMPLE))
 
 // What the parent had seen when a run's bound expired, frozen before the kill. The final drain after
 // the kill may still add late output to the shown tail, but never moves these, so the timeout report
@@ -1104,6 +1103,32 @@ static double snapshot_number(const QString & text, const QString & key)
     return match.hasMatch() ? match.captured(1).toDouble() : std::nan("");
 }
 
+// Both CPU samples come from before the kill, so the interval between them in the snapshot `text` is
+// never negative. Each sample is asserted on its own first, so a refused query on one never hides the
+// other missing for another reason; only with either query refused is there no interval to check.
+static void assert_cpu_since_last_stage(const char * file,
+                                        int line,
+                                        const char * stage_expression,
+                                        const char * kill_expression,
+                                        const ChildSample & at_stage,
+                                        const ChildSample & at_kill,
+                                        const QString & text)
+{
+    assert_cpu_sampled(file, line, stage_expression, at_stage);
+    assert_cpu_sampled(file, line, kill_expression, at_kill);
+    if (cpu_sample_verdict(at_stage) == CpuSampleVerdict::sampled
+        && cpu_sample_verdict(at_kill) == CpuSampleVerdict::sampled) {
+        ::minitest::note_assertion();
+        const double interval = snapshot_number(text, QStringLiteral("child_cpu_since_last_stage_s"));
+        if (!(interval >= 0.0)) {
+            ::minitest::fail(file, line, "child_cpu_since_last_stage_s >= 0", "value=" + std::to_string(interval));
+        }
+    }
+}
+
+#define ASSERT_CPU_SINCE_LAST_STAGE(AT_STAGE, AT_KILL, TEXT) \
+    assert_cpu_since_last_stage(__FILE__, __LINE__, #AT_STAGE, #AT_KILL, (AT_STAGE), (AT_KILL), (TEXT))
+
 TEST(AvxParityRunner, OutputAfterTheKillNeverMovesTheTimeoutSnapshot)
 {
     const QString shell = stand_in_shell();
@@ -1161,14 +1186,7 @@ TEST(AvxParityRunner, OutputAfterTheKillNeverMovesTheTimeoutSnapshot)
     ASSERT_TRUE(result.last_output_ms > result.killed_at_ms);
     ASSERT_TRUE(result.last_stage_line == QByteArray("avx_parity_helper t=2ms stage=late-after-kill stand-in"));
 #ifdef Q_OS_WIN
-    ASSERT_CPU_SAMPLED(snapshot.child_at_last_stage);
-    // Both CPU samples come from before the kill, so the interval between them is never negative.
-    // With either query refused there is no interval to check.
-    const bool stage_cpu_denied = cpu_sample_verdict(snapshot.child_at_last_stage) == CpuSampleVerdict::query_denied;
-    const bool kill_cpu_denied = CPU_QUERY_DENIED(result.child_at_kill);
-    if (!stage_cpu_denied && !kill_cpu_denied) {
-        ASSERT_TRUE(snapshot_number(text, QStringLiteral("child_cpu_since_last_stage_s")) >= 0.0);
-    }
+    ASSERT_CPU_SINCE_LAST_STAGE(snapshot.child_at_last_stage, result.child_at_kill, text);
 #endif
 }
 
@@ -1191,20 +1209,20 @@ public:
     ~ForcedChildSample() { g_sample_child_override = nullptr; }
 };
 
-// What ASSERT_CPU_SAMPLED printed for `sample`, and whether it failed (with its message).
+// What a CPU-sample assertion printed, and whether it failed (with its message).
 struct CpuAssertOutcome {
     bool failed = false;
     std::string failure;
     std::string printed;
 };
 
-static CpuAssertOutcome run_cpu_assert(const ChildSample & sample)
+static CpuAssertOutcome run_cpu_assertion(const std::function<void()> & assertion)
 {
     CpuAssertOutcome outcome;
     std::ostringstream captured;
     std::streambuf * const original = std::cout.rdbuf(captured.rdbuf());
     try {
-        ASSERT_CPU_SAMPLED(sample);
+        assertion();
     } catch (const ::minitest::Failure & failure) {
         outcome.failed = true;
         outcome.failure = failure.message;
@@ -1213,6 +1231,18 @@ static CpuAssertOutcome run_cpu_assert(const ChildSample & sample)
     outcome.printed = captured.str();
     std::cout << outcome.printed;
     return outcome;
+}
+
+static CpuAssertOutcome run_cpu_assert(const ChildSample & sample)
+{
+    return run_cpu_assertion([&sample] { ASSERT_CPU_SAMPLED(sample); });
+}
+
+// What sample_child returns while it is forced to `status`.
+static ChildSample forced_child_sample(CpuSampleStatus status, unsigned long error)
+{
+    const ForcedChildSample forced(status, error);
+    return sample_child(4242);
 }
 
 TEST(AvxParityRunner, CpuSamplerRecordsWhyACpuSampleIsMissing)
@@ -1307,6 +1337,68 @@ TEST(AvxParityRunner, ForcedDeniedSamplerReachesTheTimeoutSnapshot)
                                                   result,
                                                   QDir(QDir::tempPath()).filePath(QStringLiteral("no-such-hashes.json")));
     ASSERT_TRUE(text.contains(QStringLiteral("child_cpu_s=unknown")));
+}
+
+// The interval check in OutputAfterTheKillNeverMovesTheTimeoutSnapshot: a refused query on one sample
+// must not hide the other sample missing for an unrelated reason. Each sample is asserted on its own,
+// and the interval is skipped only when every sample that has no CPU time was refused.
+TEST(AvxParityRunner, DeniedStageSampleNeverMasksAnUnrelatedKillSampleFailure)
+{
+    const QString interval_text = QStringLiteral("AVX_PARITY_HELPER_TIMEOUT_SNAPSHOT child_cpu_since_last_stage_s=0.3 x");
+    const QString unknown_text = QStringLiteral("AVX_PARITY_HELPER_TIMEOUT_SNAPSHOT child_cpu_since_last_stage_s=unknown x");
+    const ChildSample refused = forced_child_sample(CpuSampleStatus::open_denied, kErrorAccessDenied);
+    ChildSample sampled;
+    sampled.has_cpu = true;
+    sampled.cpu_status = CpuSampleStatus::ok;
+
+    const struct {
+        CpuSampleStatus status;
+        unsigned long error;
+    } unrelated_failures[] = {
+        {CpuSampleStatus::times_failed, kErrorAccessDenied},
+        {CpuSampleStatus::open_failed_other, kErrorInvalidParameter},
+        {CpuSampleStatus::not_sampled, 0},
+        {CpuSampleStatus::pid_zero, 0},
+        {CpuSampleStatus::not_windows, 0},
+    };
+    for (const auto & forced_case : unrelated_failures) {
+        const ChildSample failed = forced_child_sample(forced_case.status, forced_case.error);
+        const std::string reason = std::string("cpu_status=") + cpu_sample_status_name(forced_case.status)
+            + " error=" + std::to_string(forced_case.error);
+        // The stage query was refused and the kill sample failed otherwise: the kill sample fails.
+        const CpuAssertOutcome kill_failed = run_cpu_assertion(
+            [&] { ASSERT_CPU_SINCE_LAST_STAGE(refused, failed, unknown_text); });
+        ASSERT_TRUE(kill_failed.failed);
+        ASSERT_TRUE(kill_failed.failure.find("failed.has_cpu (" + reason + ")") != std::string::npos);
+        // And the other way round.
+        const CpuAssertOutcome stage_failed = run_cpu_assertion(
+            [&] { ASSERT_CPU_SINCE_LAST_STAGE(failed, refused, unknown_text); });
+        ASSERT_TRUE(stage_failed.failed);
+        ASSERT_TRUE(stage_failed.failure.find("failed.has_cpu (" + reason + ")") != std::string::npos);
+    }
+
+    // Either or both refused, the other sampled: noted, and there is no interval to check.
+    const CpuAssertOutcome stage_refused = run_cpu_assertion(
+        [&] { ASSERT_CPU_SINCE_LAST_STAGE(refused, sampled, unknown_text); });
+    ASSERT_FALSE(stage_refused.failed);
+    ASSERT_TRUE(stage_refused.printed.find("CPU_QUERY_DENIED ") != std::string::npos);
+    const CpuAssertOutcome kill_refused = run_cpu_assertion(
+        [&] { ASSERT_CPU_SINCE_LAST_STAGE(sampled, refused, unknown_text); });
+    ASSERT_FALSE(kill_refused.failed);
+    ASSERT_TRUE(kill_refused.printed.find("CPU_QUERY_DENIED ") != std::string::npos);
+    const CpuAssertOutcome both_refused = run_cpu_assertion(
+        [&] { ASSERT_CPU_SINCE_LAST_STAGE(refused, refused, unknown_text); });
+    ASSERT_FALSE(both_refused.failed);
+
+    // Both sampled: the interval is checked, so a missing one still fails.
+    const CpuAssertOutcome measured = run_cpu_assertion(
+        [&] { ASSERT_CPU_SINCE_LAST_STAGE(sampled, sampled, interval_text); });
+    ASSERT_FALSE(measured.failed);
+    ASSERT_EQ(std::string(), measured.printed);
+    const CpuAssertOutcome unmeasured = run_cpu_assertion(
+        [&] { ASSERT_CPU_SINCE_LAST_STAGE(sampled, sampled, unknown_text); });
+    ASSERT_TRUE(unmeasured.failed);
+    ASSERT_TRUE(unmeasured.failure.find("child_cpu_since_last_stage_s >= 0") != std::string::npos);
 }
 
 // Hangs on the first run; on the second run writes a valid hash json and exits 0.
