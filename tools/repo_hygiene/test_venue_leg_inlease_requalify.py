@@ -7,9 +7,12 @@ WHAT IS PINNED (HUB RULING subject-ledger.md 2026-10-24T15:40:56Z action (1), pr
   * the <= 180 s path, the cooldown gate (any base class other than QUIET_PRELOAD_OK) and a missing admission wait are unchanged under both rules.
   * the Look Assist arm check mirrors the r6 lane analyze.ps1:100-106; a missing field is never proven.
   * purity: the module's code reads no file, path or share and starts nothing.
+  * VENUE-LEG-COUNTING-HARDENING-1: a NaN in-lease pre-load is NOT_COUNTED_INVALID_MEASUREMENT (G2); every numeric input is pinned
+    against NaN, +Inf, -Inf, an empty string and a non-numeric string (a string never binds to 0 and counts); the module header and
+    docs/cuda-playback-present-cadence.md say which analyzers import it and that stale-discard-180 also refuses invalid waits (G3).
 
 Offline only: every call goes through pwsh -NoProfile with JSON in and out. Nothing here reaches a venue, the share or a fleet-runs dir.
-Windows-only (PowerShell tools).
+Runs wherever pwsh is on PATH (the hosted Windows and ubuntu runners both have it), so every shard runs the pins (G1).
 """
 
 from __future__ import annotations
@@ -19,14 +22,15 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "tools" / "profiling" / "dual-venue" / "VenueLegCounting.psm1"
+DOC = ROOT / "docs" / "cuda-playback-present-cadence.md"
 PWSH = shutil.which("pwsh")
-requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32", "needs pwsh on Windows")
+# G1: gated on pwsh alone. The module is pure PowerShell, so the platform does not matter, and a win32 gate left the ubuntu shards with no pins.
+requires_pwsh = unittest.skipIf(PWSH is None, "needs pwsh")
 
 INLEASE = "inlease-requalify-1"
 STALE180 = "stale-discard-180"
@@ -34,21 +38,23 @@ OK = "QUIET_PRELOAD_OK"
 COOL = "throttled 0/60, mean 59.8 C, max15 84 C, 26 W"
 HOT_S1 = "throttled 6/60, mean 67.2 C, max15 60 C, 9 W"
 
-# One pwsh process per call list. A string 'NaN' argument becomes [double]::NaN (JSON has no NaN).
+# One pwsh process per call list. A string 'NaN' / 'Infinity' / '-Infinity' becomes that [double] (JSON has none), at the top level and
+# inside an object argument such as Admission, so a non-finite admission.throttled or .rows is a real double, not a string.
 HARNESS = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module -Name $env:VLC_MODULE -Force -DisableNameChecking
+function ConvertTo-HarnessValue([object]$v) {
+    if ($v -is [string] -and $v -ceq 'NaN') { return [double]::NaN }
+    if ($v -is [string] -and $v -ceq 'Infinity') { return [double]::PositiveInfinity }
+    if ($v -is [string] -and $v -ceq '-Infinity') { return [double]::NegativeInfinity }
+    if ($v -is [System.Management.Automation.PSCustomObject]) { foreach ($q in $v.PSObject.Properties) { $q.Value = ConvertTo-HarnessValue $q.Value } }
+    , $v
+}
 $ops = [Console]::In.ReadToEnd() | ConvertFrom-Json
 $out = [System.Collections.Generic.List[object]]::new()
 foreach ($op in @($ops)) {
     $a = @{}
-    foreach ($p in $op.args.PSObject.Properties) {
-        $v = $p.Value
-        if ($v -is [string] -and $v -ceq 'NaN') { $v = [double]::NaN }
-        if ($v -is [string] -and $v -ceq 'Infinity') { $v = [double]::PositiveInfinity }
-        if ($v -is [string] -and $v -ceq '-Infinity') { $v = [double]::NegativeInfinity }
-        $a[$p.Name] = $v
-    }
+    foreach ($p in $op.args.PSObject.Properties) { $a[$p.Name] = ConvertTo-HarnessValue $p.Value }
     $out.Add((& $op.fn @a))
 }
 ConvertTo-Json -InputObject @($out.ToArray()) -Depth 6 -Compress
@@ -77,7 +83,7 @@ def la(arm: str, log, vq, arg, forced) -> tuple[str, dict]:
                                            "LookAssistForced": forced})
 
 
-@requires_windows_pwsh
+@requires_pwsh
 class InLeaseRequalificationTests(unittest.TestCase):
     def assertRow(self, row: dict, cls: str, eligible: bool, requalified: bool = False) -> None:
         self.assertEqual(row["class"], cls, row)
@@ -100,9 +106,10 @@ class InLeaseRequalificationTests(unittest.TestCase):
             self.assertEqual(r["throttledAtGrant"], 6)
 
     def test_03_inlease_preload_high_and_nan_refuse(self) -> None:
+        # G2: a NaN pre-load is not a measurement, so it is typed INVALID, not HIGH (it refused before, under the wrong reason)
         a, b, c = call(req(INLEASE, 912, COOL, 31.0), req(INLEASE, 912, COOL, "NaN"), req(INLEASE, 912, COOL, 30.0))
         self.assertRow(a, "NOT_COUNTED_INLEASE_PRELOAD_HIGH", False)
-        self.assertRow(b, "NOT_COUNTED_INLEASE_PRELOAD_HIGH", False)
+        self.assertRow(b, "NOT_COUNTED_INVALID_MEASUREMENT", False)
         self.assertRow(c, "QUIET_PRELOAD_REQUALIFIED_IN_LEASE", True, True)
 
     def test_04_missing_inlease_probe_by_kind(self) -> None:
@@ -148,7 +155,7 @@ class InLeaseRequalificationTests(unittest.TestCase):
             self.assertRow(r, "QUIET_PRELOAD_UNVERIFIED_ADMISSION", False)
 
 
-@requires_windows_pwsh
+@requires_pwsh
 class AdmissionThermalTests(unittest.TestCase):
     def test_numeric_wins_over_string(self) -> None:
         a, b, c = call(("ConvertFrom-VenueAdmissionThermal", {"Admission": {"throttled": 2, "rows": 60, "thermal": HOT_S1}}),
@@ -160,7 +167,7 @@ class AdmissionThermalTests(unittest.TestCase):
         self.assertIsNone(c["throttled"])
 
 
-@requires_windows_pwsh
+@requires_pwsh
 class LookAssistArmTests(unittest.TestCase):
     def test_10_look_assist_arm(self) -> None:
         on_off, on_ok, on_noforced, off_ok, off_vq1, on_arg, on_missing = call(
@@ -185,7 +192,7 @@ def call_raw(*ops: tuple[str, dict]) -> subprocess.CompletedProcess:
                           text=True, timeout=120, env=env)
 
 
-@requires_windows_pwsh
+@requires_pwsh
 class CaseExactEnumTests(unittest.TestCase):
     """Dot 80f0e297 B1: ValidateSet was case-insensitive while the branches use -ceq. Chosen fix: reject (IgnoreCase = $false)."""
 
@@ -214,7 +221,7 @@ class CaseExactEnumTests(unittest.TestCase):
         self.assertEqual((on_arm["proven"], on_arm["violation"]), (False, True))
 
 
-@requires_windows_pwsh
+@requires_pwsh
 class InvalidMeasurementTests(unittest.TestCase):
     def test_15_fractional_negative_or_nonfinite_throttled_is_thermal_unknown(self) -> None:
         cases = [{"throttled": 0.4}, {"throttled": 1.5}, {"throttled": -1}, {"throttled": "NaN"}, {"throttled": "Infinity"},
@@ -254,6 +261,110 @@ class InvalidMeasurementTests(unittest.TestCase):
         ok180, cool = call(req(INLEASE, 100, COOL, -1), req(INLEASE, -5, COOL, 15.4, base="COOLDOWN_UNMET"))
         self.assertEqual(ok180["class"], OK)
         self.assertEqual(cool["class"], "COOLDOWN_UNMET")
+
+
+# VENUE-LEG-COUNTING-HARDENING-1 (Dot 258ad5e5 nit): direct fixtures for every numeric input. A string is not a measurement: before this
+# card an empty string bound to 0 (a wait of "" was QUIET_PRELOAD_OK, a pre-load of "" REQUALIFIED) and "abc" threw at the binder.
+NON_FINITE = ("NaN", "Infinity", "-Infinity")
+NOT_A_NUMBER = ("", "   ", "abc", "912", True)
+
+
+@requires_pwsh
+class NonFiniteInputFixtureTests(unittest.TestCase):
+    def assertInvalid(self, row: dict, what) -> None:
+        self.assertEqual(row["class"], "NOT_COUNTED_INVALID_MEASUREMENT", (what, row))
+        self.assertIs(row["eligible"], False, (what, row))
+        self.assertIs(row["requalified"], False, (what, row))
+        self.assertEqual(row["notCountedReason"], "NOT_COUNTED_INVALID_MEASUREMENT", (what, row))
+
+    def test_19_admission_wait_non_finite_or_not_a_number(self) -> None:
+        for rule in (INLEASE, STALE180):
+            nan, pinf, ninf = call(*(req(rule, w, COOL, 15.4) for w in NON_FINITE))
+            self.assertEqual((nan["class"], nan["eligible"]), ("QUIET_PRELOAD_UNVERIFIED_ADMISSION", False))   # a NaN wait is a missing wait (test_09)
+            self.assertInvalid(pinf, (rule, "+Inf"))
+            self.assertInvalid(ninf, (rule, "-Inf"))
+            for w, r in zip(NOT_A_NUMBER, call(*(req(rule, w, COOL, 15.4) for w in NOT_A_NUMBER))):
+                self.assertInvalid(r, (rule, w))
+
+    def test_20_inlease_preload_non_finite_or_not_a_number(self) -> None:
+        values = NON_FINITE + NOT_A_NUMBER
+        for p, r in zip(values, call(*(req(INLEASE, 912, COOL, p) for p in values))):
+            self.assertInvalid(r, p)
+        # the pre-load is consulted only for a stale leg under inlease-requalify-1 (test_18): the old rule and the <= 180 s path ignore it
+        for p, r in zip(values, call(*(req(STALE180, 912, COOL, p) for p in values))):
+            self.assertEqual((r["class"], r["eligible"]), ("QUIET_PRELOAD_STALE", False), (p, r))
+        for p, r in zip(values, call(*(req(INLEASE, 100, COOL, p) for p in values))):
+            self.assertEqual((r["class"], r["eligible"]), (OK, True), (p, r))
+
+    def test_21_throttled_non_finite_or_not_a_number(self) -> None:
+        values = NON_FINITE + NOT_A_NUMBER + ("0",)
+        cases = [{"throttled": v, "thermal": COOL} for v in values]
+        rows = call(*(req(INLEASE, 912, pre=15.4, admission=a) for a in cases))
+        thermal = call(*(("ConvertFrom-VenueAdmissionThermal", {"Admission": a}) for a in cases))
+        for a, r, t in zip(cases, rows, thermal):
+            self.assertEqual((r["class"], r["eligible"], r["throttledAtGrant"]), ("NOT_COUNTED_THERMAL_UNKNOWN", False, None), (a, r))
+            self.assertEqual((t["known"], t["throttled"], t["source"]), (False, None, "numeric-invalid"), (a, t))
+
+    def test_22_rows_non_finite_or_not_a_number_is_no_window(self) -> None:
+        # rows is the heat window, informational only: an invalid one is dropped (window null) and never makes a valid throttled count unknown
+        values = NON_FINITE + NOT_A_NUMBER + (-1, 1.5)
+        cases = [{"throttled": 0, "rows": v} for v in values]
+        thermal = call(*(("ConvertFrom-VenueAdmissionThermal", {"Admission": a}) for a in cases))
+        rows = call(*(req(INLEASE, 912, pre=15.4, admission=a) for a in cases))
+        for a, t, r in zip(cases, thermal, rows):
+            self.assertEqual(t, {"throttled": 0, "window": None, "known": True, "source": "numeric"}, a)
+            self.assertEqual(r["class"], "QUIET_PRELOAD_REQUALIFIED_IN_LEASE", (a, r))
+
+    def test_23_finite_numeric_inputs_keep_their_verdicts(self) -> None:
+        # hardening, not a defect fix: a finite, valid (numeric-typed) input classes exactly as before this card
+        got = call(req(INLEASE, 0, COOL, 15.4), req(INLEASE, 180, COOL, 99.0), req(INLEASE, 180.0001, COOL, 30.0),
+                   req(INLEASE, 912, COOL, 30.0001), req(STALE180, 181, COOL, 0), req(INLEASE, 912, None, 15.4, admission={"throttled": 1}))
+        self.assertEqual([r["class"] for r in got], [OK, OK, "QUIET_PRELOAD_REQUALIFIED_IN_LEASE", "NOT_COUNTED_INLEASE_PRELOAD_HIGH",
+                                                     "QUIET_PRELOAD_STALE", "NOT_COUNTED_THROTTLED_AT_GRANT"])
+
+
+def _tracked_importers() -> list[str]:
+    """Tracked tools/ scripts that import VenueLegCounting.psm1 (the module and this test excluded)."""
+    hits = []
+    for path in sorted((ROOT / "tools").rglob("*")):
+        if path.suffix.lower() not in (".ps1", ".psm1") or path == MODULE:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "VenueLegCounting.psm1" in text and re.search(r"\bImport-Module\b", text, flags=re.I):
+            hits.append(path.relative_to(ROOT).as_posix())
+    return hits
+
+
+class ImporterAndDocPinTests(unittest.TestCase):
+    """Dot 258ad5e5 nit and Grok G3: the header and the doc state facts, re-derived here from the tree."""
+
+    def test_24_header_names_exactly_its_importers(self) -> None:
+        header = MODULE.read_text(encoding="ascii").splitlines()[0]
+        self.assertNotIn("every bench analyzer", header)
+        importers = _tracked_importers()
+        if importers:
+            for path in importers:
+                self.assertIn(path, MODULE.read_text(encoding="ascii"), "the module header must name each tracked importer")
+        else:
+            self.assertIn("No tracked driver or analyzer imports it", MODULE.read_text(encoding="ascii"))
+            self.assertIn("No tracked driver or analyzer imports it", DOC.read_text(encoding="utf-8"))
+
+    def test_25_doc_says_stale_discard_180_refuses_invalid_waits(self) -> None:
+        doc = DOC.read_text(encoding="utf-8").replace("\r\n", "\n")
+        flat = " ".join(doc.split())
+        self.assertIn("under `stale-discard-180` as under `inlease-requalify-1`", flat)
+        self.assertIn("is typed `NOT_COUNTED_INVALID_MEASUREMENT`", flat)
+        self.assertNotIn("no driver or analyzer imports it yet", flat)
+
+
+class SkipGatePinTests(unittest.TestCase):
+    def test_26_pins_are_gated_on_pwsh_only(self) -> None:
+        # G1: a platform gate here left the ubuntu shards with no pins; the module is pure PowerShell
+        src = Path(__file__).read_text(encoding="utf-8")
+        gates = re.findall(r"skipIf\((.*)\)", src)
+        self.assertTrue(gates)
+        for gate in gates:
+            self.assertNotIn("platform", gate)
 
 
 class ModulePurityPinTests(unittest.TestCase):
