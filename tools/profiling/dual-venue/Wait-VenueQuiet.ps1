@@ -513,17 +513,31 @@ $identityProjects = @(
 # REDACTION, in this order, counted once per rule match (a text two rules both touch counts twice; the key-like rule skips a value that is already <redacted>):
 #   (a) URL userinfo (b) an Authorization header: the scheme AND the credential, run BEFORE the key-like rule (which would redact the scheme word only and leave `Basic <b64>`)
 #   (c) bearer values (d) key-like arguments: a key name may be followed by an optional closing quote (JSON keys `"password":"x"`, `'token':'x'`, escaped `\"k\":\"x\"`) or by a
-#   URL-encoded separator (`password%3Dx`, `%22k%22%3A%22x%22`) (e) known token prefixes and JWTs (f) opaque 40+ runs; then a 200-char cap.
+#   URL-encoded separator (`password%3Dx`, `%22k%22%3A%22x%22`); a QUOTED value is redacted through its closing quote (backslash-escaped quotes honoured, an unterminated quote runs to
+#   the end), an unquoted one stops at '&' only inside a URL query string and runs to whitespace elsewhere; the short keys pass / pw / pwd match as whole names; and mysql-style `-p<value>`
+#   / `-p <value>` are redacted (over-redacting `mkdir -p dir`) (e) known token prefixes and JWTs (f) opaque 40+ runs; then a 200-char cap.
 # KNOWN LIMIT: an Authorization: Digest header redacts its first parameter only. A shape this set cannot catch is a gap, not a guarantee: the wall of defence is the 200-char cap, the
 # opaque-run rule, and that no command line is ever printed to a gate text line.
 function Protect-IdentText($Text) {
     if ($null -eq $Text) { return $null }
     $s = [string]$Text; $n = 0
+    # a quoted value is redacted THROUGH ITS CLOSING quote: \"...\" ends at the next \", "..." honours a backslash-escaped quote inside it, '...' doubles ''. An unterminated quote runs to the end.
+    $quoted = '(?:\\"(?:[^\\]|\\(?!"))*(?:\\"|$)|"(?:\\.|[^"\\])*(?:"|$)|''(?:''''|[^''])*(?:''|$))'
+    $keyName = '((?<![a-z0-9_.-])(?:--?|/)?(?:pass|pw|pwd)(?![a-z0-9_.-])|(?:--?|/)?[a-z0-9_.-]*(?:key|token|secret|password|passwd|pwd|auth|credential|signature|sig|session|cookie)[a-z0-9_.-]*)'
+    $keySep = '((?:(?:\\?["'']|%22|%27)?\s*(?:[=:]|%3[ad])\s*)|\s+)(?!<redacted>)'
+    $inUrlQuery = '://[^\s?]*\?\S*'
+    # key-like arguments: inside a URL query string an unquoted value stops at '&'; on any other command line it runs to whitespace (`--password=a&b` is one value)
+    $keyLikeUrl = @(('(?i)' + $keyName + '(?<=' + $inUrlQuery + ')' + $keySep + '(' + $quoted + '|[^\s&]+)'), '$1$2<redacted>')
+    $keyLikePlain = @(('(?i)' + $keyName + '(?<!' + $inUrlQuery + ')' + $keySep + '(' + $quoted + '|\S+)'), '$1$2<redacted>')
+    # mysql-style -p<value> and -p <value> (lower-case only: -P is a port); skips a token a key-like rule already redacted. Over-redacts `mkdir -p dir` and `-print`: the safe direction.
+    $pFlag = @(('(?<![\w-])(-p)(\s*)(?!\S*<redacted>)(' + $quoted + '|\S+)'), '$1$2<redacted>')
     $rules = @(
         @('(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@', '$1<redacted>@'),
         @('(?i)(\bauthorization(?:\\?["'']|%22|%27)?\s*(?:[=:]|%3[ad])\s*(?:\\?["'']|%22|%27)?)(?:(?:basic|bearer|digest|negotiate|ntlm|token)\s+)?[^\s"''&\\]+', '$1<redacted>'),
         @('(?i)\bbearer\s+(?!<redacted>)\S+', 'Bearer <redacted>'),
-        @('(?i)((?:--?|/)?[a-z0-9_.-]*(?:key|token|secret|password|passwd|pwd|auth|credential|signature|sig|session|cookie)[a-z0-9_.-]*)((?:(?:\\?["'']|%22|%27)?\s*(?:[=:]|%3[ad])\s*)|\s+)(?!<redacted>)("[^"]*"|''[^'']*''|[^\s&]+)', '$1$2<redacted>'),
+        $keyLikeUrl,
+        $keyLikePlain,
+        $pFlag,
         @('(sk-|ghp_|gho_|ghs_|github_pat_|xox[abps]-|AKIA)[A-Za-z0-9_-]{10,}', '<redacted>'),
         @('eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '<redacted>'),
         @('[A-Za-z0-9+/=]{40,}', '<redacted>')

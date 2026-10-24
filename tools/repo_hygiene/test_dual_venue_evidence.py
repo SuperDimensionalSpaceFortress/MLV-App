@@ -8974,5 +8974,118 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertLess(worst_s, 110, worst_s)
 
 
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r3: Dot B1 (a quoted value is redacted through its CLOSING quote), Grok G1 (short credential keys, -p<value>) and G2 (an unquoted value on a
+# non-URL command line runs to whitespace, not to '&'). Synthetic values only; each case FAILS on 8f483df5 and passes on the r3 head.
+@requires_windows_pwsh
+class VenueProbeIdentityRedactionR3Tests(unittest.TestCase):
+    def check(self, cmd: str, gone: tuple, kept: tuple = ()) -> None:
+        r = _protect_ident_text([cmd])[0]
+        for secret in gone:
+            self.assertNotIn(secret, r["text"], f"{cmd!r} -> {r['text']!r}")
+        for keep in kept:
+            self.assertIn(keep, r["text"], f"{cmd!r} -> {r['text']!r}")
+        self.assertGreaterEqual(r["redactions"], 1, f"{cmd!r} -> {r['text']!r}")
+
+    def test_b1_a_quoted_value_with_a_space_is_redacted_through_its_closing_quote(self) -> None:
+        for cmd, gone, kept in (
+            (r'tool {\"password\":\"prefix demoValue42\"}', (SYNTH_SECRET, "prefix"), ("tool",)),
+            (r'tool {\"password\":\"two demoValue42 words\",\"n\":1}', (SYNTH_SECRET, "two", "words"), (r'\"n\":1',)),
+            (r'tool {"password":"abc\"demoValue42 tail","n":1}', (SYNTH_SECRET, "abc", "tail"), ('"n":1',)),
+            ('app --password "two demoValue42 words" --verbose', (SYNTH_SECRET, "two", "words"), ("--verbose",)),
+            ("app --token 'it''s demoValue42 here' --verbose", (SYNTH_SECRET, "here"), ("--verbose",)),
+            ('app --password "demoValue42 unterminated', (SYNTH_SECRET, "unterminated"), ("app",)),
+        ):
+            with self.subTest(cmd=cmd):
+                self.check(cmd, gone, kept)
+
+    def test_g1_the_short_credential_keys_pass_pw_pwd_are_redacted(self) -> None:
+        for cmd, kept in (("app --pass demoValue42 --verbose", ("--verbose",)), ('app {"pass":"demoValue42"}', ("app",)), ("app --pw=demoValue42 --verbose", ("--verbose",)),
+                          ("app --pwd demoValue42 --verbose", ("--verbose",)), ("app -pass=demoValue42", ("app",))):
+            with self.subTest(cmd=cmd):
+                self.check(cmd, (SYNTH_SECRET,), kept)
+
+    def test_g1_the_mysql_style_p_flag_attached_and_separated_is_redacted(self) -> None:
+        for cmd, gone, kept in (("mysql -u root -pdemoValue42", (SYNTH_SECRET,), ("-u root",)), ("mysql -u root -p demoValue42 mydb", (SYNTH_SECRET,), ("-u root", "mydb")),
+                                ("mysql -u root -pdemoValue42 mydb", (SYNTH_SECRET,), ("mydb",)), ('mysql -u root -p"demo Value42" mydb', (SYNTH_SECRET, "Value42"), ("mydb",))):
+            with self.subTest(cmd=cmd):
+                self.check(cmd, gone, kept)
+
+    def test_g1_whole_name_matching_keeps_unrelated_words_and_an_upper_case_port_flag(self) -> None:
+        for cmd in ("python tool.py --passenger 3 --pwned yes", "mysql -u root -P3306 mydb", "python C:\\x\\tool.py --card lane-playback-1 --bypass"):
+            with self.subTest(cmd=cmd):
+                r = _protect_ident_text([cmd])[0]
+                self.assertEqual((r["text"], r["redactions"]), (cmd, 0), r)
+
+    def test_g1_an_already_redacted_dash_p_token_is_not_redacted_twice(self) -> None:
+        r = _protect_ident_text(["tool -password=demoValue42 --verbose"])[0]
+        self.assertNotIn(SYNTH_SECRET, r["text"])
+        self.assertIn("-password=<redacted>", r["text"])
+        self.assertEqual(r["redactions"], 1, r)
+
+    def test_g2_an_unquoted_value_on_a_plain_command_line_runs_to_whitespace_not_to_an_ampersand(self) -> None:
+        for cmd in ("tool --password=demo&Value42 --verbose", "tool --token demoValue42&tail --verbose", "tool secret=demo&Value42&more x"):
+            with self.subTest(cmd=cmd):
+                r = _protect_ident_text([cmd])[0]
+                for leak in ("&Value42", "&tail", "&more", SYNTH_SECRET):
+                    self.assertNotIn(leak, r["text"], r)
+
+    def test_g2_a_url_query_string_keeps_its_ampersand_rule(self) -> None:
+        r = _protect_ident_text(["curl https://h.example/x?user=a&password=demoValue42&z=1 --verbose"])[0]
+        self.assertNotIn(SYNTH_SECRET, r["text"])
+        self.assertIn("&z=1", r["text"], "the next query parameter survives")
+        self.assertIn("--verbose", r["text"])
+
+
+# r3 Dot B2: Summarize-VenueBusyProbes.ps1 judges every input as TEXT before any Test-Path, Get-Item or read; a UNC or provider-qualified path is refused with a typed exit 2.
+UNC_PROBE = r"\\192.0.2.1\mlv-agent\processed\venue-quiet-probe-20261024T010000000Z.json"   # TEST-NET-1: nothing answers there, so a touch would hang or throw
+
+
+@requires_windows_pwsh
+class VenueBusyProbeSummaryPathRefusalR3Tests(unittest.TestCase):
+    setUp = VenueBusyProbeSummaryTests.setUp
+    summarize = VenueBusyProbeSummaryTests.summarize
+    write = VenueBusyProbeSummaryTests.write
+    fixtures = VenueBusyProbeSummaryTests.fixtures
+
+    def assert_refused(self, *args: str, code: str = "PROBE_PATH_UNC") -> None:
+        import time
+        started = time.monotonic()
+        proc = self.summarize(*args)
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn(code, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertLess(elapsed, 20, f"the refusal took {elapsed:.1f} s: a remote path was touched before it")
+
+    def test_b2_a_unc_probe_json_is_refused_typed_and_never_touched(self) -> None:
+        for spelling in (UNC_PROBE, UNC_PROBE.replace("\\", "/"), "FileSystem::" + UNC_PROBE, "Microsoft.PowerShell.Core\\FileSystem::" + UNC_PROBE, "\\\\?\\UNC\\192.0.2.1\\mlv-agent\\x.json"):
+            with self.subTest(spelling=spelling):
+                self.assert_refused("-ProbeJson", spelling)
+
+    def test_b2_a_unc_part_of_a_comma_joined_list_refuses_the_whole_call_before_the_local_part_is_read(self) -> None:
+        self.fixtures()
+        local = self.probes / "venue-quiet-probe-20261024T010000000Z.json"
+        self.assert_refused("-ProbeJson", f"{local},{UNC_PROBE}")
+        self.assert_refused("-ProbeJson", f"{UNC_PROBE},{local}")
+
+    def test_b2_a_unc_probe_dir_is_refused_typed_and_never_listed(self) -> None:
+        self.assert_refused("-ProbeDir", r"\\192.0.2.1\mlv-agent\processed")
+
+    def test_b2_a_comma_joined_venue_share_path_is_still_refused_typed(self) -> None:
+        inside = self.share / "venue-quiet-probe-20261024T010000000Z.json"
+        self.assert_refused("-ProbeJson", f"{inside},{self.probes / 'x.json'}", code="PROBE_PATH_IN_VENUE_SHARE")
+
+    def test_b2_the_script_orders_the_text_refusals_before_every_filesystem_call_on_an_input(self) -> None:
+        text = (DV / "Summarize-VenueBusyProbes.ps1").read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        fs_any = re.search(r"Test-Path|Get-Item|Get-ChildItem|Resolve-Path|ReadAllText|Get-Content", code)
+        fs_probe = re.search(r"Test-Path|Get-Item|Get-ChildItem|Resolve-Path|ReadAllText\(\$f\)|Get-Content", code)
+        unc, share = code.index("PROBE_PATH_UNC"), code.index("PROBE_PATH_IN_VENUE_SHARE")
+        self.assertLess(unc, fs_any.start(), "the UNC refusal comes before the first filesystem call of any kind")
+        self.assertLess(share, fs_probe.start(), "the venue-share refusal comes before the first filesystem call on an input")
+        self.assertLess(share, code.index("$ProbeJson = @($ProbeJson | ForEach-Object"), "the -ProbeJson split (which asks Test-Path about each entry) comes after both refusals")
+
+
 if __name__ == "__main__":
     unittest.main()

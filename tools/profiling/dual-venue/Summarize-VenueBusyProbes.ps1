@@ -22,7 +22,9 @@
 #
 # READ-ONLY and share-safe: it opens only the files it is given (-ProbeDir: only venue-quiet-probe-*.json directly in that directory, which are the VM-side raw-retention files),
 # never lists a venue share, and refuses with exit 2 PROBE_PATH_IN_VENUE_SHARE any path under a venue's agentShare / agentRoot in venues.json.
-# Exit codes: 0 summarized; 2 usage error or PROBE_PATH_IN_VENUE_SHARE; 3 DECISION_LIFT_FAILED.
+# Every input (each -ProbeJson entry as given and its comma parts, and -ProbeDir) is judged as TEXT before any Test-Path, Get-Item or read: a UNC (\\host\...) or provider-qualified
+# (FileSystem::...) path is refused PROBE_PATH_UNC, so a hung or dead remote share is never touched.
+# Exit codes: 0 summarized; 2 usage error, PROBE_PATH_UNC or PROBE_PATH_IN_VENUE_SHARE; 3 DECISION_LIFT_FAILED.
 [CmdletBinding()]
 param(
     [string[]]$ProbeJson = @(),
@@ -33,7 +35,7 @@ param(
     [string]$DecisionSource = ''
 )
 $ErrorActionPreference = 'Stop'
-$ProbeJson = @($ProbeJson | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })   # -File passes 'a','b' as one comma-joined string
+# (-ProbeJson is split in step 1b, only after every spelling has been judged as text)
 $here = $PSScriptRoot
 $identitySchemaV1 = 'mlv-app/venue-quiet-probe-identity/v1'
 if (-not $DecisionSource) { $DecisionSource = Join-Path $here 'Wait-VenueQuiet.ps1' }
@@ -48,7 +50,16 @@ function Test-UnderOrEqual([string]$Key, [string]$Root) { $Root -ne '' -and ($Ke
 function ConvertTo-IdentToken($v) { $s = [string]$v; if ([string]::IsNullOrEmpty($s)) { return 'n/a' }; $s -replace '[\s,]', '_' }
 function Format-Num([double]$v, [string]$Fmt) { $v.ToString($Fmt, [Globalization.CultureInfo]::InvariantCulture) }
 
-if ($ProbeJson.Count -eq 0 -and -not $ProbeDir) { Stop-Usage 'USAGE give -ProbeJson <path[]> or -ProbeDir <dir>' }
+# 0. every spelling of every input -- the entry as given AND its comma parts -- is judged as TEXT first, so a forbidden path is never tested, resolved, opened or listed by a later step
+$spellings = @()
+foreach ($raw in (@($ProbeJson) + @($ProbeDir))) {
+    if ([string]::IsNullOrWhiteSpace([string]$raw)) { continue }
+    $spellings += ([string]$raw).Trim()
+    $spellings += @(([string]$raw) -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+foreach ($p in $spellings) {
+    if ($p -match '^[\\/]{2}' -or $p.Contains('::')) { Stop-Usage "PROBE_PATH_UNC '$p' is a UNC or provider-qualified path; copy the raw probe files to a local directory first (this script never touches a remote or provider path)" }
+}
 
 # 1. refuse venue-share paths BEFORE anything is read or listed
 $shareKeys = @()
@@ -58,13 +69,17 @@ try {
         foreach ($p in @($v.Value.agentShare, $v.Value.agentRoot)) { $k = ConvertTo-PathKey ([string]$p); if ($k) { $shareKeys += $k } }
     }
 } catch { Stop-Usage "USAGE venues.json could not be read from '$here': $($_.Exception.Message)" }
-foreach ($p in @($ProbeJson) + @($ProbeDir)) {
+foreach ($p in $spellings) {
     if (-not $p) { continue }
     $pk = ConvertTo-PathKey $p
     foreach ($k in $shareKeys) {
         if (Test-UnderOrEqual $pk $k) { Stop-Usage "PROBE_PATH_IN_VENUE_SHARE '$p' is inside a venue's agent storage; copy the raw probe files out first (this script never lists or reads a venue share)" }
     }
 }
+
+# 1b. only now, with every spelling cleared, may the filesystem be asked: a path that exists as given is never split
+$ProbeJson = @($ProbeJson | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })   # -File passes 'a','b' as one comma-joined string
+if ($ProbeJson.Count -eq 0 -and -not $ProbeDir) { Stop-Usage 'USAGE give -ProbeJson <path[]> or -ProbeDir <dir>' }
 
 # 2. the gate's decision function, lifted by AST
 $lifted = $false
