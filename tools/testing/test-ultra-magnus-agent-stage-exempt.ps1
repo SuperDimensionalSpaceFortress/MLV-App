@@ -47,7 +47,7 @@ $lift = @('Resolve-HeavySlotPython', 'Get-ProcessIdentity', 'Test-EpochMillisClo
     'Stop-ProcessTree', 'Move-FileChecked', 'Write-JsonFileAtomic', 'Read-JsonFile', 'Get-SustainedHeatVerdict', 'Stop-HeavySlotHolder', 'Exit-HeavySlot',
     'Resolve-HeavySlotMode', 'Get-QuietLeaseMinutes', 'ConvertFrom-QuietLeaseActiveLine', 'Start-HeavySlotCli', 'Receive-HeavySlotCli', 'Stop-HeavySlotCli',
     'Complete-HeavySlotCli', 'Start-QuietLeaseRequest', 'Test-QuietLeaseOwnerPid', 'Update-QuietLeaseRequest', 'Stop-QuietLease', 'Wait-QuietLeaseAdmission',
-    'Get-JobNotAfterVerdict', 'Get-QuietLeaseAdmitTimeout', 'New-LeaseReleaseRecord', 'Invoke-ExemptJobsDuringWait', 'Invoke-QueuedJob')
+    'Get-JobNotAfterVerdict', 'Get-QuietLeaseAdmitTimeout', 'New-LeaseReleaseRecord', 'Invoke-ExemptJobsDuringWait', 'Invoke-QueuedJob', 'Read-JobNotAfterSidecar')
 foreach ($name in $lift) { $fn = Find-Function $name; Assert-True ($null -ne $fn) "agent defines $name"; . ([scriptblock]::Create($fn.Extent.Text)) }
 # The function under change: lifted when present, so a base agent runs every behavioural case and fails each on behaviour.
 $classifyFn = Find-Function 'Get-GateExemptClass'
@@ -92,6 +92,8 @@ $inbox = Join-Path $fx 'inbox'
 $processed = Join-Path $fx 'processed'
 $running = Join-Path $fx 'running'
 $cancel = Join-Path $fx 'cancel'
+# LEASE-BATCH-OPEN-RUNNER-LIVENESS-1: Invoke-QueuedJob and the lease wait read notafter\<jobId>.json (none here: absent).
+$notAfterDir = Join-Path $fx 'notafter'
 $heavySlotModeFile = Join-Path $fx 'heavy-slot-mode.txt'
 $HeavySlotMode = [string]$paramDefaults['HeavySlotMode']
 $LeaseMaxMinutes = [int]$paramDefaults['LeaseMaxMinutes']
