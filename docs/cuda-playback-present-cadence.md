@@ -207,7 +207,11 @@ records the load but does not label a contended run. COUNTED is decided lane-sid
 preLoad <= 30 %), so this leg is evidence-only.
 
 The pre-registered rule `inlease-requalify-1` for bench round r7 on is available as a pure module,
-`tools/profiling/dual-venue/VenueLegCounting.psm1`; no driver or analyzer imports it yet, and wiring it into the r7 driver and
-analyzers is a separate hub follow-up. Under that rule, a leg whose admission wait exceeded 180 s will count only if
+`tools/profiling/dual-venue/VenueLegCounting.psm1`. No tracked driver or analyzer imports it; the CPU-17V9-FPS-GAP-AB-1 r7 run-dir
+analyzer (untracked) is its first importer. Under that rule, a leg whose admission wait exceeded 180 s will count only if
 it was already `QUIET_PRELOAD_OK`, its in-job post-grant pre-load is <= 30 %, and it was throttled 0 at the lease grant. Every other
 stale leg is typed `NOT_COUNTED_<reason>`. Rows from r1-r6 keep the `stale-discard-180` rule.
+Both rules refuse a wait that is not a measurement: under `stale-discard-180` as under `inlease-requalify-1`, a negative, infinite,
+string or bool admission wait is typed `NOT_COUNTED_INVALID_MEASUREMENT` and never reaches the <= 180 s path. A missing or NaN wait
+stays `QUIET_PRELOAD_UNVERIFIED_ADMISSION`, and a NaN, infinite, negative, string or bool in-lease pre-load is also
+`NOT_COUNTED_INVALID_MEASUREMENT`.
