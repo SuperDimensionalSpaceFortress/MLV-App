@@ -686,7 +686,22 @@ function Invoke-VenueBoundedProcess {
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
 }
 
-Export-ModuleMember -Function Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
+function Get-VenueDriverScriptMissing {
+    <#
+    .SYNOPSIS
+    LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: '' when every script a venue driver is about to launch exists, else the typed line
+    `VENUE_DRIVER_SCRIPT_MISSING path=<first missing path>`. A driver (Invoke-VenueChain, or a lane-local detached driver that imported
+    this module at start, so the check survives its worktree being removed) calls it before each launch and STOPS on a non-empty answer:
+    a missing script is not "the venue was not measured" (2026-10-24: a driver logged VENUE_QUIET_UNKNOWN every 5 min for 40 min instead).
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Path)
+    foreach ($p in $Path) {
+        if ($p -and -not (Test-Path -LiteralPath $p -PathType Leaf)) { return "VENUE_DRIVER_SCRIPT_MISSING path=$p" }
+    }
+    return ''
+}
+
+Export-ModuleMember -Function Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess

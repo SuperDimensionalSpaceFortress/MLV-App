@@ -4100,6 +4100,65 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertTrue(candidate["evidence"]["is_reparse_point"])
         self.assertTrue(candidate["evidence"]["inventory"]["refused_reparse_point"])
 
+    # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: apply_worktree_remove asks the shared live-reference guard (Get-WorktreeLiveRefusal in
+    # tools/coordination/Retire-LaneWorktree.ps1) right before `git worktree remove`. The guard's process table is faked here.
+    def test_worktree_live_refusal_is_none_when_the_guard_answers_free(self) -> None:
+        from .core import worktree_live_refusal
+
+        calls = []
+
+        def runner(args, **kw):
+            calls.append((args, kw))
+            return subprocess.CompletedProcess(args, 0, stdout="FREE\n", stderr="")
+
+        self.assertIsNone(worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"), runner=runner))
+        self.assertEqual(calls[0][1]["env"]["MLV_GUARD_PATH"], str(Path("C:/mlvtmp/lane-X-1")))
+        self.assertEqual(calls[0][1]["env"]["MLV_GUARD_RUNS"], str(Path("C:/r") / ".claude-state" / "fleet-runs"))
+
+    def test_worktree_live_refusal_returns_the_typed_refusal(self) -> None:
+        from .core import worktree_live_refusal
+
+        refusal = {"reason": "live-driver", "processId": 43484, "via": "rundir-pid:venue-cpu17v9-ab.pid",
+                   "matchedPath": "C:\\run", "line": "REFUSED worktree-removal reason=live-driver pid=43484"}
+
+        def runner(args, **kw):
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(refusal) + "\n", stderr="")
+
+        self.assertEqual(worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"), runner=runner), refusal)
+
+    def test_worktree_live_refusal_fails_closed_on_every_unknown(self) -> None:
+        from .core import worktree_live_refusal
+
+        def nonzero(args, **kw):
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="boom")
+
+        def garbage(args, **kw):
+            return subprocess.CompletedProcess(args, 0, stdout="not json\n", stderr="")
+
+        def timeout(args, **kw):
+            raise subprocess.TimeoutExpired(args, 1)
+
+        for runner in (nonzero, garbage, timeout):
+            r = worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"), runner=runner)
+            self.assertEqual(r["reason"], "census-failed", runner.__name__)
+        with patch("tools.repo_hygiene.core.shutil.which", return_value=None):
+            self.assertEqual(worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"))["reason"], "census-failed")
+
+    def test_apply_worktree_remove_refuses_a_live_reference_and_never_runs_git_remove(self) -> None:
+        from .core import apply_worktree_remove
+
+        repo = self.init_repo()
+        wt = repo.parent / f"{repo.name}-lane-X-1"
+        git(repo, "worktree", "add", "--detach", str(wt))
+        self.addCleanup(lambda: subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)], capture_output=True))
+        refusal = {"reason": "live-driver", "line": "REFUSED worktree-removal reason=live-driver pid=43484"}
+        with patch("tools.repo_hygiene.core.worktree_live_refusal", return_value=refusal) as guard:
+            with self.assertRaises(HygieneError) as ctx:
+                apply_worktree_remove(repo, load_config(repo), {"path": str(wt)})
+        guard.assert_called_once()
+        self.assertIn("reason=live-driver", str(ctx.exception))
+        self.assertTrue(wt.exists(), "a refused worktree must not be removed")
+
 
 if __name__ == "__main__":
     unittest.main()
