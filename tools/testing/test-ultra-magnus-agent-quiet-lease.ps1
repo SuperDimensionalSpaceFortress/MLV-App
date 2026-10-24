@@ -32,6 +32,10 @@ param(
 #               last check before the child is created), each refusing, releasing and retiring; a waiting lease is not renewed
 #               past the deadline from inside a light job, and its true phase is recorded; a meta.json that may carry a deadline
 #               but cannot be read fails closed. Invoke-QueuedJob is lifted and driven with its disk and launch steps stubbed.
+#   not-after hardening 2 - LEASE-NOT-AFTER-HARDENING-2 r1 (cases queuedjob-cancel-post-admission, notafter-renew-crosses-deadline,
+#               notafter-meta-sticky): the cancel exit after admission RUNS (released and recorded before Exit-HeavySlot); a
+#               renew in flight as the deadline passes is still collected or killed; Get-JobMetadata's deadline flag holds over
+#               its reads and matches the key in any case.
 # Prints one JSON object with status PASS, or throws.
 
 $ErrorActionPreference = 'Stop'
@@ -415,7 +419,8 @@ try {
     $notAfterCases = @('notafter-before-request', 'notafter-while-pending', 'notafter-active-then-expired', 'cancel-active-race',
         'notafter-absent-unchanged', 'notafter-pure', 'notafter-source-shape',
         'notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker',
-        'notafter-prelaunch-confirm', 'notafter-renew-in-light-job', 'notafter-meta-unreadable')
+        'notafter-prelaunch-confirm', 'notafter-renew-in-light-job', 'notafter-meta-unreadable',
+        'queuedjob-cancel-post-admission', 'notafter-renew-crosses-deadline', 'notafter-meta-sticky')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -655,9 +660,10 @@ function Exit-HeavySlot {
     # is recorded and throws (no child is ever created). The REAL Get-JobMetadata reads a meta.json written to inbox\; the
     # wrapper keeps the object it returned, so a case moves that job's notAfterUtc into the past at a chosen step, which is
     # what the verdict sees when the clock passes the deadline there.
-    $qjCases = @('notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker', 'notafter-prelaunch-confirm', 'notafter-meta-unreadable')
+    $qjCases = @('notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker', 'notafter-prelaunch-confirm', 'notafter-meta-unreadable',
+        'queuedjob-cancel-post-admission', 'notafter-meta-sticky')
     if (@($qjCases | Where-Object { Test-Case $_ }).Count -gt 0) {
-        foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
+        foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
         . ([scriptblock]::Create(((Get-FunctionBody 'Get-JobMetadata') -replace '^function Get-JobMetadata', 'function Get-JobMetadataReal')))
         $inbox = Join-Path $fx 'inbox'; $running = Join-Path $fx 'running'; $outbox = Join-Path $fx 'outbox'; $processed = Join-Path $fx 'processed'
         New-Item -ItemType Directory -Force -Path $inbox, $running, $outbox | Out-Null
@@ -766,6 +772,31 @@ function Exit-HeavySlot {
         $results.notAfterQueuedJobPostAdmission = [ordered]@{ releaseRc = $script:QJ.published[0].admission.leaseRelease.releaseRc }
     }
 
+    # ------------------------------------------------------------ queuedjob-cancel-post-admission: a cancel file lands once the job is admitted
+    # LEASE-NOT-AFTER-HARDENING-2 H1 (key3 on #648): the cancel exit after admission releases the lease, and records that release,
+    # before Exit-HeavySlot. Stop-QuietLease moved after Exit-HeavySlot (which then ends the lease as "job done"), or the
+    # leaseRelease record dropped, leaves admission.leaseRelease null: this case fails on either.
+    if (Test-Case 'queuedjob-cancel-post-admission') {
+        $job = Reset-QueuedJobCase @{ request = 'active' } 'jQx' (New-NotAfterMetaJson 600)
+        $script:CancelFile = Join-Path $cancel 'jQx.cancel'
+        $script:QJ.admittedHook = { [IO.File]::WriteAllText($script:CancelFile, 'x') }
+        try { $null = Invoke-QueuedJob -Job $job }
+        finally { Remove-Item -LiteralPath $script:CancelFile -Force -ErrorAction SilentlyContinue }
+        $p = @($script:QJ.published)
+        Assert-True ($p.Count -eq 1 -and $p[0].jobId -ceq 'jQx' -and $p[0].exitCode -eq 130 -and $p[0].cancelled -eq $true -and $null -eq $p[0].startedUtc -and $p[0].notAfterExpired -ne $true) "queuedjob-cancel-post-admission: one cancelled result, never started: $($p | ConvertTo-Json -Compress -Depth 5)"
+        $a = $p[0].admission
+        Assert-True ($a.label -ceq 'cancelled-in-gate' -and $a.why -ceq 'cancel file present after admission, before launch' -and $null -eq $a.slot) "queuedjob-cancel-post-admission: the admission reads cancelled-in-gate after admission: $($a | ConvertTo-Json -Compress -Depth 4)"
+        $lr = $a.leaseRelease
+        Assert-True ($null -ne $lr -and $lr.phase -ceq 'post-admission' -and [string]$lr.releaseRc -ceq '0' -and (Get-Released).Count -eq 1) "queuedjob-cancel-post-admission: the lease released once, the release recorded in phase post-admission: $($lr | ConvertTo-Json -Compress) releases=$((Get-Released).Count)"
+        $ended = @($script:Log | Where-Object { $_.StartsWith('quiet-lease: ended job=jQx ') })
+        Assert-True ($ended.Count -eq 1 -and $ended[0].EndsWith('why=[cancel file present after admission, before launch]')) "queuedjob-cancel-post-admission: the lease is ended by the cancel exit, not by Exit-HeavySlot: $($ended -join ' | ')"
+        Assert-True ($script:QJ.launches.Count -eq 0 -and $script:QJ.launchingMarkers.Count -eq 0 -and $script:QJ.claims.Count -eq 1) "queuedjob-cancel-post-admission: claimed once, NO launching marker, NO child launch: $($script:QJ.launches -join ' | ')"
+        Assert-True ($script:QJ.moved.Count -eq 1 -and $script:QJ.moved[0] -ceq "jQx|$processed" -and ($script:QJ.retired -join ';') -ceq 'jQx.started.json|admission-wait|cancelled-in-gate' -and -not (Test-Path -LiteralPath (Join-Path $running 'jQx.started.json'))) "queuedjob-cancel-post-admission: artifacts moved, the claim retired as cancelled-in-gate: [$($script:QJ.retired -join ';')]"
+        $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        Assert-True ($reqs.Count -eq 1 -and (Wait-Until { -not (Test-PidAlive ([int]$reqs[0].pid)) } 5) -and $null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting -and @(Get-ChildItem -LiteralPath $fx -Filter '*.lease.json' -File).Count -eq 0) "queuedjob-cancel-post-admission: the wrapper is gone, its record removed, no lease kept"
+        $results.queuedJobCancelPostAdmission = [ordered]@{ label = $a.label; releasePhase = $lr.phase; releaseRc = $lr.releaseRc }
+    }
+
     # ------------------------------------------------------------ notafter-prelaunch-marker: the deadline passes while the launching marker is written
     if (Test-Case 'notafter-prelaunch-marker') {
         $job = Reset-QueuedJobCase @{ request = 'active' } 'jQm' (New-NotAfterMetaJson 600)
@@ -850,6 +881,83 @@ function Exit-HeavySlot {
         $results.notAfterRenewInLightJob = [ordered]@{ renewsBefore = $lightA.renewsBefore; renewsAfter = $lightA.renewsAfter; ticksAfter = $lightA.ticksAfter; phase = $adm.phase; phaseB = $admB.phase }
     }
 
+    # ------------------------------------------------------------ notafter-renew-crosses-deadline: a renew in flight as the deadline passes
+    # LEASE-NOT-AFTER-HARDENING-2 H3 (Dot R18 on #648): past notAfterUtc the tick starts no renew for the waiting lease, but the one
+    # already in flight is still collected (it returned) or killed at LeaseRenewTimeoutSec (it hangs) by the tick, inside the light
+    # job, not left to the wait's release. hang: the renew never returns -> killed, renewSlow. slow: it returns late -> collected.
+    if (Test-Case 'notafter-renew-crosses-deadline') {
+        $savedRenewTimeout = $LeaseRenewTimeoutSec
+        $crossRun = [ordered]@{}
+        $crossAdm = [ordered]@{}
+        $crossLog = [ordered]@{}
+        $crossReleased = [ordered]@{}
+        try {
+            foreach ($v in @(
+                    @{ n = 'hang'; fake = @{ request = 'active'; active_after = 2; renew_hang = $true }; timeout = 3; window = 6 },
+                    @{ n = 'slow'; fake = @{ request = 'active'; active_after = 2; renew_sleep = 1.5 }; timeout = 15; window = 6 })) {
+                Reset-Case $v.fake
+                $LeaseRenewTimeoutSec = $v.timeout
+                $script:LeaseNotAfterMinAdmitSec = 1
+                $script:AgeAfter = (Get-Date).AddSeconds(60)
+                $script:CrossMeta = New-NotAfterMeta 600
+                $script:CrossWindow = $v.window
+                $script:Cross = @{ ran = 0; inFlight = $false; renewPid = 0; startsAtDeadline = -1; ticksAfter = 0; renewCallLeft = $null; renewAlive = $null; startsAfter = $null; renewsOk = $null; renewSlow = $null; renewCalls = $null }
+                function Invoke-ExemptJobsDuringWait {
+                    param([string]$WaitingJobId, [double]$WaitedSec)
+                    $c = $script:Cross
+                    $c.ran++
+                    $w = $script:QuietLeaseWaiting
+                    if ($null -eq $w -or $c.ran -gt 1) { return 0 }
+                    # The light job's monitor loop ticks the renew: the waiting lease turns active and its first renew starts.
+                    $dl = (Get-Date).AddSeconds(20)
+                    while ($null -eq $w.renewCall -and (Get-Date) -lt $dl) { Invoke-QuietLeaseRenewTick; Start-Sleep -Milliseconds 100 }
+                    if ($null -eq $w.renewCall) { return 1 }
+                    $c.inFlight = $true
+                    $c.renewPid = $w.renewCall.proc.Id
+                    $c.startsAtDeadline = $w.renewStarts
+                    # The deadline passes with that renew in flight (the tick reads the lease's copy, the wait the metadata's).
+                    $past = [DateTime]::UtcNow.AddSeconds(-1).ToString('o')
+                    $w | Add-Member -NotePropertyName notAfterUtc -NotePropertyValue $past -Force
+                    $script:CrossMeta | Add-Member -NotePropertyName notAfterUtc -NotePropertyValue $past -Force
+                    $end = (Get-Date).AddSeconds($script:CrossWindow)
+                    while ((Get-Date) -lt $end) { Invoke-QuietLeaseRenewTick; $c.ticksAfter++; Start-Sleep -Milliseconds 100 }
+                    # Read before the light job returns: the wait's release would end the call anyway.
+                    $c.renewCallLeft = $null -ne $w.renewCall
+                    $c.renewAlive = Test-PidAlive $c.renewPid
+                    $c.startsAfter = $w.renewStarts - $c.startsAtDeadline
+                    $c.renewsOk = $w.renewsOk
+                    $c.renewSlow = $w.renewSlow
+                    $c.renewCalls = @(Get-Calls | Where-Object { $_.cmd -eq 'renew' }).Count
+                    return 1
+                }
+                $crossAdm[$v.n] = Wait-QuietLeaseAdmission -JobId "jX$($v.n)" -Job ([pscustomobject]@{}) -Metadata $script:CrossMeta
+                $crossRun[$v.n] = $script:Cross
+                $crossLog[$v.n] = @($script:Log)
+                $crossReleased[$v.n] = (Get-Released).Count
+                $reqsX = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+                $null = Wait-Until { -not (Test-PidAlive ([int]$reqsX[0].pid)) } 5
+            }
+        }
+        finally {
+            $LeaseRenewTimeoutSec = $savedRenewTimeout
+            function Invoke-ExemptJobsDuringWait { param([string]$WaitingJobId, [double]$WaitedSec) $script:Exempt++; return 0 }
+        }
+        foreach ($n in @('hang', 'slow')) {
+            $c = $crossRun[$n]; $a = $crossAdm[$n]
+            Assert-True ($c.ran -ge 1 -and $c.inFlight -and $c.ticksAfter -ge 5) "notafter-renew-crosses-deadline (${n}): the race landed: a renew was in flight inside the light job as the deadline passed: $($c | ConvertTo-Json -Compress)"
+            Assert-True ($c.startsAfter -eq 0 -and $c.renewCalls -eq 1) "notafter-renew-crosses-deadline (${n}): no renew started past the deadline: $($c | ConvertTo-Json -Compress)"
+            Assert-True ($a.label -eq 'expired-not-after' -and $a.phase -ceq 'post-active' -and $null -ne $a.leaseRelease -and $a.leaseRelease.phase -ceq 'post-active' -and [string]$a.leaseRelease.releaseRc -ceq '0' -and $crossReleased[$n] -eq 1) "notafter-renew-crosses-deadline (${n}): the wait then releases the lease once, post-active: label=$($a.label) phase=$($a.phase) release=$($a.leaseRelease | ConvertTo-Json -Compress)"
+        }
+        $h = $crossRun['hang']; $s = $crossRun['slow']
+        $crossBad = [System.Collections.Generic.List[string]]::new()
+        if (-not (-not $h.renewCallLeft -and -not $h.renewAlive -and $h.renewSlow -eq 1)) { $crossBad.Add("hang: the hung renew is not killed at LeaseRenewTimeoutSec by the tick: $($h | ConvertTo-Json -Compress)") }
+        if (-not (-not $s.renewCallLeft -and $s.renewsOk -eq 1 -and $s.renewSlow -eq 0)) { $crossBad.Add("slow: the late renew is not collected by the tick: $($s | ConvertTo-Json -Compress)") }
+        Assert-True ($crossBad.Count -eq 0) "notafter-renew-crosses-deadline: the renew in flight is cleaned up past the deadline, not left to the release: $($crossBad -join ' ; ')"
+        Assert-True (@($crossLog['hang'] | Where-Object { $_ -like 'quiet-lease: renew-slow job=jXhang killed after 3s*' }).Count -eq 1) "notafter-renew-crosses-deadline (hang): typed renew-slow once"
+        Assert-True (@($crossLog['slow'] | Where-Object { $_ -like 'quiet-lease: not-after passed job=jXslow * active=True while waiting; no more renews*' }).Count -eq 1) "notafter-renew-crosses-deadline (slow): the stop is typed once"
+        $results.notAfterRenewCrossesDeadline = [ordered]@{ hang = [ordered]@{ renewSlow = $h.renewSlow; renewCallLeft = $h.renewCallLeft; renewAlive = $h.renewAlive }; slow = [ordered]@{ renewsOk = $s.renewsOk; renewCallLeft = $s.renewCallLeft } }
+    }
+
     # ------------------------------------------------------------ notafter-meta-unreadable: a deadline the agent cannot read fails closed
     # key3 hardening 3. The rule (Get-JobMetadata): no file = defaults, no deadline; bytes that read but do not parse = defaults,
     # unless they name notAfterUtc; bytes that cannot be read (3 tries) = cannot tell. The last two fail closed (refused).
@@ -883,6 +991,67 @@ function Exit-HeavySlot {
         Assert-True ($p.notAfterState -ceq 'unparseable' -and $p.notAfterWhy -like 'meta.json does not parse:*' -and $p.stderr -ceq 'notAfterUtc could not be read (fail closed) before launch (pre-gate); job was not executed') "notafter-meta-unreadable: the result says why: state=$($p.notAfterState) why=[$($p.notAfterWhy)] stderr=[$($p.stderr)]"
         Assert-True (@($script:Log | Where-Object { $_ -like "json read failed path=$(Join-Path $inbox 'jMq.meta.json') error=does not parse:* deadlineUnknown=True" }).Count -eq 1) "notafter-meta-unreadable: the read failure is typed once"
         $results.notAfterMetaUnreadable = [ordered]@{ absent = $vAbs.state; tornNoDeadline = $vTorn.state; tornWithDeadline = $vCut.state; locked = $vLock.state; why = $p.notAfterWhy }
+    }
+
+    # ------------------------------------------------------------ notafter-meta-sticky: Get-JobMetadata's deadline flag over its 3 reads
+    # LEASE-NOT-AFTER-HARDENING-2 H2 (key3 on #648). The bytes change between the agent's own reads, at its 200 ms wait (Start-Sleep
+    # is shadowed for the case): once any read names notAfterUtc, in any case, or cannot be read, a later read that names no key and
+    # still does not parse cannot clear that. A read that parses wins, as before. A step 'LOCKED:<bytes>' holds the file unshared.
+    if (Test-Case 'notafter-meta-sticky') {
+        $null = Reset-QueuedJobCase @{ request = 'active' } 'jMs' $null
+        $script:MetaLock = $null
+        $script:MetaSteps = $null
+        function Set-MetaStep([string]$Path, [string]$Step) {
+            if ($null -ne $script:MetaLock) { $script:MetaLock.Dispose(); $script:MetaLock = $null }
+            $locked = $Step.StartsWith('LOCKED:')
+            [IO.File]::WriteAllText($Path, $(if ($locked) { $Step.Substring(7) } else { $Step }))
+            if ($locked) { $script:MetaLock = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+        }
+        function Start-Sleep {
+            param([int]$Milliseconds)
+            $st = $script:MetaSteps
+            if ($null -eq $st) { Microsoft.PowerShell.Utility\Start-Sleep -Milliseconds $Milliseconds; return }
+            $st.i++
+            Set-MetaStep $st.path $st.steps[[Math]::Min($st.i, $st.steps.Count - 1)]
+        }
+        function Get-JobMetadataSteps([string]$JobId, [string[]]$Steps) {
+            $script:MetaSteps = [pscustomobject]@{ path = (Join-Path $inbox "$JobId.meta.json"); steps = $Steps; i = 0 }
+            try { Set-MetaStep $script:MetaSteps.path $Steps[0]; return (Get-JobMetadata -JobId $JobId) }
+            finally {
+                if ($null -ne $script:MetaLock) { $script:MetaLock.Dispose(); $script:MetaLock = $null }
+                $script:MetaSteps = $null
+            }
+        }
+        $future = [DateTime]::UtcNow.AddSeconds(600).ToString('o')
+        $pastZ = [DateTime]::UtcNow.AddSeconds(-60).ToString('o')
+        $sticky = @(
+            @{ n = 'key-then-torn-prefix'; steps = @('{"timeoutSec":60,"notAfterUtc":"2026-10-2', '{"timeoutSec":60,"no', '{"timeoutSec":60,"no'); unknown = $true; state = 'unparseable' }
+            @{ n = 'key-in-the-middle-read'; steps = @('{"timeo', '{"timeoutSec":60,"notAfterUtc":"20', '{"timeo'); unknown = $true; state = 'unparseable' }
+            @{ n = 'locked-then-torn-prefix'; steps = @('LOCKED:{"timeoutSec":60}', '{"timeo', '{"timeo'); unknown = $true; state = 'unparseable' }
+            @{ n = 'torn-mixed-NotAfterUtc'; steps = @('{"timeoutSec":60,"NotAfterUtc":"2026-10-2'); unknown = $true; state = 'unparseable' }
+            @{ n = 'torn-upper-NOTAFTERUTC'; steps = @('{"NOTAFTERUTC":"2026-1'); unknown = $true; state = 'unparseable' }
+            @{ n = 'parsed-mixed-NotAfterUtc-past'; steps = @("{`"timeoutSec`":60,`"NotAfterUtc`":`"$pastZ`"}"); unknown = $false; state = 'passed' }
+            @{ n = 'parsed-upper-NOTAFTERUTC-future'; steps = @("{`"timeoutSec`":60,`"NOTAFTERUTC`":`"$future`"}"); unknown = $false; state = 'open' }
+            @{ n = 'key-then-parsed'; steps = @('{"timeoutSec":60,"notAfterUtc":"2026-1', "{`"timeoutSec`":60,`"notAfterUtc`":`"$future`"}"); unknown = $false; state = 'open' }
+            @{ n = 'torn-prefix-only'; steps = @('{"timeo'); unknown = $false; state = 'none' }
+        )
+        $stickyGot = [ordered]@{}
+        $stickyBad = [System.Collections.Generic.List[string]]::new()
+        try {
+            foreach ($c in $sticky) {
+                $script:Log.Clear()
+                $m = Get-JobMetadataSteps "jMs-$($c.n)" $c.steps
+                $vS = Get-JobNotAfterVerdict -Metadata $m
+                $unknown = ($m.metaUnreadable -eq $true)
+                $stickyGot[$c.n] = "$($vS.state)|unknown=$unknown"
+                $ok = ($unknown -eq $c.unknown -and $vS.state -ceq $c.state)
+                if ($c.unknown) { $ok = $ok -and @($script:Log | Where-Object { $_ -like '*json read failed path=* deadlineUnknown=True' }).Count -eq 1 }
+                if (-not $ok) { $stickyBad.Add("$($c.n): want $($c.state)|unknown=$($c.unknown) got $($stickyGot[$c.n])") }
+            }
+        }
+        finally { Remove-Item -LiteralPath Function:\Start-Sleep -ErrorAction SilentlyContinue }
+        Assert-True ($stickyBad.Count -eq 0) "notafter-meta-sticky: a deadline once seen (any case) or unreadable stays unknown over the reads; a parsed read wins: $($stickyBad -join ' ; ')"
+        $results.notAfterMetaSticky = $stickyGot
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }
