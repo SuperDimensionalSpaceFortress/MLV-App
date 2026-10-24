@@ -65,6 +65,33 @@ param(
     [int]$GateIdleSampleSec = 60,
     # r1g/r1h: job ids the gate does not hold (light: ~1 s load probes, ~5 s venue health probes dve-*-health, agent maintenance). Anchored.
     [string]$GateExemptJobPattern = '^(venue-quiet-probe|agent-swap)-|^dve-[A-Za-z0-9._-]+-health$',
+    # STAGE-JOB-LEASE-EXEMPT-1: build-artifact STAGING steps, which copy hash-pinned bytes into cache\ and measure nothing, take
+    # no slot and no quiet lease either (2026-10-24: a ~4.5 s stage waited 6889 s for a lease of up to 45 min). Each branch is one
+    # generator's exact id grammar, matched case-sensitively and anchored at both ends: playback-attr-3-cuda-stage-job.ps1
+    # (sha12, optional -JobIdSuffix), attr3-stage-smoke-runner-job.ps1 (sha12-digest12), attr3-stage-fixture-job.ps1 (a tracked
+    # fixture stem, sha12). attr3-footage-stage-* stays gated: it moves owner footage (GBs, 1800 s default). Read only by
+    # Get-GateExemptClass for the job about to run; Invoke-ExemptJobsDuringWait never runs a staging job from inside another
+    # job's gate-wait, so a staging job never runs while this agent's own lease is pending or held.
+    # An override is refused at binding unless it compiles (1 s match timeout) and matches none of the measured probe ids
+    # below: widening it to a measured leg would run that leg without a quiet machine. Narrowing it is safe (more jobs gated).
+    [ValidateScript({
+            $gatedProbeIds = @('job-1', 'x-stage-1', 'playback-attr-3-cuda-0123456789ab-M16-1243-20261024T051948Z',
+                'playback-attr-3-cuda-0123456789ab-stage-20261024T051948Z', 'playback-attr-3-cuda-build-0123456789ab',
+                'attr3-footage-stage-M16-1243-0123456789ab-n1', 'reference-frame-0123456789ab-M16-1243-0123456789ab')
+            $why = $null
+            if ([string]::IsNullOrWhiteSpace($_)) { $why = 'it is empty or blank (an empty pattern matches every id)' }
+            else {
+                try {
+                    $re = [regex]::new($_, [System.Text.RegularExpressions.RegexOptions]::None, [TimeSpan]::FromSeconds(1))
+                    $hit = @($gatedProbeIds | Where-Object { $re.IsMatch($_) })
+                    if ($hit.Count -gt 0) { $why = "it matches measured job id(s) $($hit -join ', ')" }
+                }
+                catch { $why = "it does not compile or match within 1 s ($($_.Exception.Message))" }
+            }
+            if ($why) { throw "HEAVY_SLOT_OVERRIDE_OUT_OF_BOUNDS: -GateStageJobPattern '$_' refused: $why" }
+            $true
+        })]
+    [string]$GateStageJobPattern = '^(playback-attr-3-cuda-stage-[0-9a-f]{12}(-[A-Za-z0-9-]{1,32})?|attr3-stage-smoke-runner-[0-9a-f]{12}-[0-9a-f]{12}|attr3-stage-fixture-(tiny|large)_dual_iso-[0-9a-f]{12})\z',
     # AGENT-HEAVY-SLOT-2.3-ADAPT-1: a gated job whose effective timeout is over GateLongJobSec, or whose id names a stage,
     # build or soak, is labelled "mlv-long <id>" (see Get-HeavySlotLabel). 900 s is heavy-slot.py 2.3.1's 15 min cap.
     # Override bounds (AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1): GateLongJobSec must stay at or below 900. A larger value files
@@ -1540,7 +1567,8 @@ function Resolve-StartedMarkers {
 # Once the holder has acquired, the agent re-checks with its own slot excluded: busy == 0 and
 # sustained heat clear. If either fails, or the feed or status cannot be read, the holder is released
 # and the job re-joins the FIFO: a job that is not running never keeps a slot. Light probes
-# (GateExemptJobPattern) are not gated and take no slot.
+# (GateExemptJobPattern) are not gated and take no slot. Nor are build-artifact staging steps (GateStageJobPattern,
+# STAGE-JOB-LEASE-EXEMPT-1), but those run only when they are next in the inbox loop, never from inside a gate-wait.
 # maint-dispatch r1: light jobs are also run inline from inside another job's gate-wait (Invoke-ExemptJobsDuringWait),
 # once per GateProbeSec, in Name order, so a job waiting on an unknown feed cannot starve probes, dve health checks or
 # agent-swap. No ordinary job is touched by that scan, so ordinary order is unchanged. A slot the waiting holder
@@ -1568,7 +1596,7 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + not-after r1 (2026-10-24)"
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + not-after r1 (2026-10-24) + stage-exempt r1 (2026-10-24)"
 $script:QuietLeaseLabel = "quiet-lease mlv"
 $script:QuietLease = $null
 $script:QuietLeaseWaiting = $null
@@ -2067,6 +2095,16 @@ function Get-RecoveredAdmission {
     $o.slotContinuity = "lost"
     $o.why = "agent restarted mid-job; its heavy slot was released while the agent was down; original: $($Admission.why)"
     return [pscustomobject]$o
+}
+
+function Get-GateExemptClass {
+    # STAGE-JOB-LEASE-EXEMPT-1: "light" (GateExemptJobPattern: probes, dve health, agent-swap), "stage" (GateStageJobPattern:
+    # build-artifact staging steps), or $null (gated). Both classes skip the gate and the lease; only "light" may also run
+    # from inside another job's gate-wait (Invoke-ExemptJobsDuringWait reads GateExemptJobPattern alone).
+    param([Parameter(Mandatory = $true)][string]$JobId)
+    if ($JobId -match $GateExemptJobPattern) { return "light" }
+    if ($JobId -cmatch $GateStageJobPattern) { return "stage" }
+    return $null
 }
 
 function Invoke-ExemptJobsDuringWait {
@@ -2845,10 +2883,16 @@ function Invoke-QueuedJob {
 
     # Heavy-slot admission: wait (heartbeating) for a slot and a clear thermal feed; see the gate block.
     # r1g: a LIGHT job class is not held (it takes no slot): the venue's own quiet/load probe and agent maintenance.
-    if ($jobId -match $GateExemptJobPattern) {
+    # STAGE-JOB-LEASE-EXEMPT-1: nor is a staging step (same "exempt-light" label, so result readers are unchanged).
+    $exemptClass = Get-GateExemptClass -JobId $jobId
+    if ($exemptClass -eq "light") {
         $script:Admission = [pscustomobject]@{ gate = $script:GateVersion; label = "exempt-light"; state = "exempt"; waitedSec = 0; probes = 0; requeues = 0; slot = $null; thermal = $null; why = "job id matches GateExemptJobPattern ($GateExemptJobPattern): light job, not gated, holds no slot" }
         if ($null -ne $script:ExemptDuringWaitOf) { $script:Admission | Add-Member -NotePropertyName waitingFor -NotePropertyValue $script:ExemptDuringWaitOf -Force }
         Add-AgentLogLine "heavy-slot-gate: exempt job=$jobId (light class, no slot)"
+    }
+    elseif ($exemptClass -eq "stage") {
+        $script:Admission = [pscustomobject]@{ gate = $script:GateVersion; label = "exempt-light"; state = "exempt"; exemptClass = "stage"; waitedSec = 0; probes = 0; requeues = 0; slot = $null; thermal = $null; why = "job id matches GateStageJobPattern ($GateStageJobPattern): staging step, measures nothing, not gated, holds no slot or lease" }
+        Add-AgentLogLine "heavy-slot-gate: exempt job=$jobId (staging step, no slot, no lease)"
     }
     else {
         # GATE-2: claim the job (phase=admission-wait, no child) BEFORE the gate holds it.

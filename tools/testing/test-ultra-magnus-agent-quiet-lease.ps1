@@ -663,13 +663,17 @@ function Exit-HeavySlot {
     $qjCases = @('notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker', 'notafter-prelaunch-confirm', 'notafter-meta-unreadable',
         'queuedjob-cancel-post-admission', 'notafter-meta-sticky')
     if (@($qjCases | Where-Object { Test-Case $_ }).Count -gt 0) {
-        foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
+        # STAGE-JOB-LEASE-EXEMPT-1 r2: Invoke-QueuedJob classifies the job through Get-GateExemptClass, which reads both patterns.
+        foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult', 'Get-GateExemptClass')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
         . ([scriptblock]::Create(((Get-FunctionBody 'Get-JobMetadata') -replace '^function Get-JobMetadata', 'function Get-JobMetadataReal')))
         $inbox = Join-Path $fx 'inbox'; $running = Join-Path $fx 'running'; $outbox = Join-Path $fx 'outbox'; $processed = Join-Path $fx 'processed'
         New-Item -ItemType Directory -Force -Path $inbox, $running, $outbox | Out-Null
         $JobTimeoutSec = 1800; $PollSeconds = 2; $Root = $fx; $psExe = 'unit-pwsh.exe'
         $GateExemptJobPattern = [string]$paramDefaults['GateExemptJobPattern']
         Assert-True ($GateExemptJobPattern -and 'jQp' -notmatch $GateExemptJobPattern) "the agent's GateExemptJobPattern is read and does not match the case job ids: '$GateExemptJobPattern'"
+        # Unset, -cmatch $null matches every id as "stage" and every case below would skip the gate.
+        $GateStageJobPattern = [string]$paramDefaults['GateStageJobPattern']
+        Assert-True ($GateStageJobPattern -and 'jQp' -cnotmatch $GateStageJobPattern) "the agent's GateStageJobPattern is read and does not match the case job ids: '$GateStageJobPattern'"
         function Get-JobMetadata { param([string]$JobId) $m = Get-JobMetadataReal -JobId $JobId; $script:LastMeta = $m; return $m }
         function New-AdmissionWaitMarker { param([string]$JobId, $Job, $Metadata, [string]$GateReason) $script:QJ.claims.Add($JobId); [IO.File]::WriteAllText((Join-Path $running "$JobId.started.json"), '{"phase":"admission-wait"}'); return $true }
         function New-LaunchingMarker {
