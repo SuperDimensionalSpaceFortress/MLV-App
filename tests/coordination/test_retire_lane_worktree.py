@@ -3000,3 +3000,101 @@ def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir(
     assert '$controlPath = "$base.child.json"' in t and "pid=$child.Id" in t, "child pid is no longer recorded in the run dir"
     host = t.split("$hostSource = @'", 1)[1].split("'@", 1)[0]
     assert "-File" not in host and "Start-Process" not in host and "WaitForExit()" in host, "the encoded host must only wait on its child"
+
+
+# --- LANE-RETIRE-LAUNCH-SITE-CENSUS-1 / LAUNCHER-CENSUS-ROOTS-AND-DOCTRINE-SCOPE-1: the census classifies launch SITES, not files.
+# These fixtures run against synthetic source text through the same seam the real census uses (_encoded_sites, _detached_sites,
+# _census_problems), so a site the census cannot see fails here without anyone adding a real launcher script to the repo.
+
+B64 = "UwB0AGEAcgB0AC0AUwBsAGUAZQBwACAAMQAw"
+
+
+def _encoded_sites(text):
+    return [(i, ln) for i, ln in enumerate(text.splitlines(), 1) if ENCODED_RX.search(ln)]
+
+
+def _detached_sites(text):
+    return [(i, ln) for i, ln in enumerate(text.splitlines(), 1) if DETACHED_RX.search(ln)]
+
+
+def _census_problems(sources, encoded_inventory, detached_inventory):
+    problems = []
+    for kind, finder, inventory in (("encoded", _encoded_sites, encoded_inventory), ("detached", _detached_sites, detached_inventory)):
+        found = {p for p, t in sources.items() if finder(t)}
+        problems += [f"{kind}: unclassified {p}" for p in sorted(found - set(inventory))]
+        problems += [f"{kind}: vanished {p}" for p in sorted(set(inventory) - found)]
+    return problems
+
+
+_ENC_LAUNCH_A = "$args1 = @('-NoLogo', '-NoProfile', '-EncodedCommand', $encodedA)"
+_ENC_LAUNCH_B = "$args2 = @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedB)"
+_DET_LAUNCH_A = "Start-Process -FilePath $exeA -ArgumentList $listA -WindowStyle Hidden | Out-Null"
+_DET_LAUNCH_B = "Start-Process -FilePath $exeB -ArgumentList $listB -WindowStyle Hidden | Out-Null"
+_SYNTH = "tools/synthetic/Launch.ps1"
+
+
+def test_launcher_census_second_encoded_launch_in_a_classified_file_is_unclassified():
+    inventory = {_SYNTH: [(_ENC_LAUNCH_A, "classified")]}
+    one = {_SYNTH: _ENC_LAUNCH_A + "\n"}
+    assert _census_problems(one, inventory, {}) == [], "the fixture's one classified site must pass"
+    two = {_SYNTH: _ENC_LAUNCH_A + "\n# between\n" + _ENC_LAUNCH_B + "\n"}
+    assert _census_problems(two, inventory, {}), "a second -EncodedCommand launch added to a classified file slipped through the census"
+
+
+def test_launcher_census_identical_second_encoded_launch_line_is_counted():
+    inventory = {_SYNTH: [(_ENC_LAUNCH_A, "classified")]}
+    twice = {_SYNTH: _ENC_LAUNCH_A + "\n" + _ENC_LAUNCH_A + "\n"}
+    assert _census_problems(twice, inventory, {}), "a duplicated classified launch line slipped through the census"
+
+
+def test_launcher_census_second_detached_launch_in_a_classified_file_is_unclassified():
+    inventory = {_SYNTH: [(_DET_LAUNCH_A, "classified")]}
+    assert _census_problems({_SYNTH: _DET_LAUNCH_A + "\n"}, {}, inventory) == []
+    two = {_SYNTH: _DET_LAUNCH_A + "\n" + _DET_LAUNCH_B + "\n"}
+    assert _census_problems(two, {}, inventory), "a second detached launch added to a classified file slipped through the census"
+
+
+def test_launcher_census_detached_launch_split_over_backtick_continuation_lines_is_found():
+    text = "$p = Start-Process -FilePath $exe -ArgumentList $list `\n    -PassThru -WindowStyle Hidden\n"
+    assert len(_detached_sites(text)) == 1, "a hidden Start-Process split across continuation lines is not seen"
+
+
+@pytest.mark.parametrize("line", [
+    "& pwsh -NoProfile -e " + B64,
+    "& pwsh.exe -NoProfile -enc " + B64,
+    "powershell.exe -NoProfile -ec " + B64,
+    "pwsh -encodedc " + B64,
+    "pwsh /EncodedCommand " + B64,
+    "pwsh /enc " + B64,
+    "pwsh /e " + B64,
+    "$a = @('-NoProfile', '-enc', $encoded)",
+    "$a = @('-NoProfile', '-e', $encoded)",
+    "$a = @('-ec', $encoded)",
+    "$cl = '\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoProfile -EncodedCommand ' + $encoded",
+])
+def test_launcher_census_every_pwsh_spelling_of_the_encoded_switch_is_matched(line):
+    assert len(_encoded_sites(line + "\n")) == 1, f"encoded-command spelling not matched: {line}"
+
+
+@pytest.mark.parametrize("line", [
+    "Get-Process -ErrorAction SilentlyContinue",
+    "Get-ChildItem -Path $p -Exclude '*.log'",
+    "if ($a -eq 1) { $b }",
+    "Set-Content -Path $f -Encoding utf8 -Value $v",
+    "Set-Content -Path $f -enc utf8 -Value $v",
+    "# pwsh -NoProfile -e " + B64,
+    "git cat-file -e abcdef1234",
+    "$r = Invoke-Git @('cat-file', '-e', \"$sha^{commit}\")",
+    "$msg = 'usage: tool -e " + B64 + "'",
+    "Write-Host 'the -EncodedCommand switch is documented elsewhere'",
+])
+def test_launcher_census_look_alikes_of_the_encoded_switch_are_not_matched(line):
+    assert _encoded_sites(line + "\n") == [], f"look-alike matched as an encoded-command launch: {line}"
+
+
+def test_launcher_census_roots_cover_tracked_launch_sites_outside_the_old_roots():
+    src = _census_sources()
+    for p in ("tools/agent-bridge/wake_codex.ps1", "tools/closeout/start-closeout-dashboard.ps1"):
+        assert p in src, f"{p} is a tracked launch site outside the census roots"
+    assert "tools/coordination/Retire-LaneWorktree.ps1" not in src
+    assert not [p for p in src if "/test" in p.lower() or Path(p).name.lower().startswith("test")], "test scripts must stay out of the census"
