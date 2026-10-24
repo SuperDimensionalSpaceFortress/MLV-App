@@ -10,6 +10,7 @@
 #include <QJsonObject>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTemporaryDir>
@@ -17,6 +18,17 @@
 #include <chrono>
 #include <future>
 #include <thread>
+
+#ifdef Q_OS_WIN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <tlhelp32.h>
+#endif
 
 static bool running_on_x86()
 {
@@ -132,9 +144,12 @@ static const int kHelperTimeoutMs = 5 * 60 * 1000;
 static_assert(kHelperTimeoutMs <= 10 * 60 * 1000 && kHelperTimeoutMs < kBuildProcessTimeoutMs,
               "the helper bound must stay well under the build bound");
 static const int kOutputTailBytes = 4096;
+// A timed-out helper's tail holds its stall reports (stage, clip state, thread dump), so it prints more.
+static const int kTimeoutOutputTailBytes = 16 * 1024;
 // What the parent keeps of a child's merged output, so a chatty child cannot grow it without bound.
 static const qsizetype kRetainedOutputBytes = 64 * 1024;
 static_assert(kRetainedOutputBytes >= kOutputTailBytes, "the retained tail must cover the diagnostic print");
+static_assert(kRetainedOutputBytes >= kTimeoutOutputTailBytes, "the retained tail must cover the timeout print");
 
 // The last `capacity` bytes a child printed, plus the exact count of everything it printed.
 class OutputTail {
@@ -164,6 +179,85 @@ private:
     QByteArray bytes_;
 };
 
+// The last helper stage line ("avx_parity_helper t=...ms stage=...") seen in a child's output, and
+// when it arrived on the run clock. Lines split across reads are joined; a partial line is bounded.
+class StageTracker {
+public:
+    // True when the chunk completed a new stage line.
+    bool append(const QByteArray & chunk, qint64 now_ms)
+    {
+        bool saw_stage = false;
+        partial_ += chunk;
+        qsizetype newline = partial_.indexOf('\n');
+        while (newline >= 0) {
+            const QByteArray line = partial_.left(newline).trimmed();
+            partial_.remove(0, newline + 1);
+            if (line.startsWith("avx_parity_helper t=")) {
+                last_line_ = line.left(kMaxLineBytes);
+                last_ms_ = now_ms;
+                saw_stage = true;
+            }
+            newline = partial_.indexOf('\n');
+        }
+        if (partial_.size() > kMaxLineBytes) {
+            partial_ = partial_.right(kMaxLineBytes);
+        }
+        return saw_stage;
+    }
+
+    const QByteArray & last_line() const { return last_line_; }
+    qint64 last_ms() const { return last_ms_; }
+
+private:
+    static const qsizetype kMaxLineBytes = 1024;
+    QByteArray partial_;
+    QByteArray last_line_;
+    qint64 last_ms_ = -1;
+};
+
+// A child's CPU time and thread count as seen from the parent (-1 where unknown or not Windows).
+// Two CPU samples tell a spinning child (time grows) from a blocked one (time stands still).
+struct ChildSample {
+    qint64 cpu_ms = -1;
+    int threads = -1;
+};
+
+static ChildSample sample_child(qint64 pid)
+{
+    ChildSample sample;
+#ifdef Q_OS_WIN
+    if (pid <= 0) {
+        return sample;
+    }
+    const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (process) {
+        FILETIME created, exited, kernel, user;
+        if (GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+            const auto as_u64 = [](const FILETIME & time) {
+                return (static_cast<quint64>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
+            };
+            sample.cpu_ms = static_cast<qint64>((as_u64(kernel) + as_u64(user)) / 10000u);
+        }
+        CloseHandle(process);
+    }
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W entry;
+        entry.dwSize = sizeof(entry);
+        for (BOOL more = Process32FirstW(snapshot, &entry); more; more = Process32NextW(snapshot, &entry)) {
+            if (entry.th32ProcessID == static_cast<DWORD>(pid)) {
+                sample.threads = static_cast<int>(entry.cntThreads);
+                break;
+            }
+        }
+        CloseHandle(snapshot);
+    }
+#else
+    Q_UNUSED(pid);
+#endif
+    return sample;
+}
+
 struct ProcessRunResult {
     bool started = false;
     bool timed_out = false;
@@ -173,6 +267,16 @@ struct ProcessRunResult {
     QByteArray output;
     qint64 output_total_bytes = 0;
     QString error_string;
+    // On the run clock: when the last output arrived and when the last helper stage line arrived
+    // (-1 if none), and the stage line itself.
+    qint64 last_output_ms = -1;
+    qint64 last_stage_ms = -1;
+    QByteArray last_stage_line;
+    // Recorded at the moment the bound expired, before the kill.
+    qint64 killed_at_ms = -1;
+    bool output_channel_open = false;  // the merged stdout+stderr pipe
+    ChildSample child_at_kill;
+    ChildSample child_at_last_stage;
     bool ok() const { return started && !timed_out && !crashed && exit_code == 0; }
 };
 
@@ -189,6 +293,10 @@ static ProcessRunResult run_process_bounded(const QString & program,
     process.setWorkingDirectory(working_directory);
     process.setProcessEnvironment(environment);
     process.setProcessChannelMode(QProcess::MergedChannels);
+    bool output_channel_closed = false;
+    QObject::connect(&process, &QProcess::readChannelFinished, [&output_channel_closed] {
+        output_channel_closed = true;
+    });
     QElapsedTimer timer;
     timer.start();
     process.start();
@@ -198,22 +306,40 @@ static ProcessRunResult run_process_bounded(const QString & program,
         return result;
     }
     result.started = true;
+    const qint64 pid = process.processId();
 
     // Drain the merged channel while waiting, so a chatty child never stalls on a full pipe.
     OutputTail output(kRetainedOutputBytes);
+    StageTracker stages;
+    const auto drain = [&] {
+        const QByteArray chunk = process.readAll();
+        if (chunk.isEmpty()) {
+            return;
+        }
+        output.append(chunk);
+        result.last_output_ms = timer.elapsed();
+        if (stages.append(chunk, result.last_output_ms)) {
+            result.child_at_last_stage = sample_child(pid);
+        }
+    };
     while (!process.waitForFinished(250)) {
-        output.append(process.readAll());
+        drain();
         if (process.state() == QProcess::NotRunning) {
             break;
         }
         if (timer.elapsed() >= timeout_ms) {
             result.timed_out = true;
+            result.killed_at_ms = timer.elapsed();
+            result.output_channel_open = !output_channel_closed;
+            result.child_at_kill = sample_child(pid);
             process.kill();
             process.waitForFinished(10 * 1000);
             break;
         }
     }
-    output.append(process.readAll());
+    drain();
+    result.last_stage_line = stages.last_line();
+    result.last_stage_ms = stages.last_ms();
     result.output = output.bytes();
     result.output_total_bytes = output.total_bytes();
     result.elapsed_ms = timer.elapsed();
@@ -283,10 +409,36 @@ static QString describe_process_failure(const QString & label,
     if (!result.error_string.isEmpty()) {
         text += QStringLiteral(" error=") + result.error_string;
     }
+    int tail_bytes = kOutputTailBytes;
+    if (result.timed_out) {
+        // What the parent saw just before the kill: how long the child had been silent, the last stage
+        // it named, whether its output pipe was still open, and its CPU time (growing = spin).
+        const auto seconds_since = [&result](qint64 at_ms) {
+            return at_ms < 0 ? QStringLiteral("none")
+                             : QString::number((result.killed_at_ms - at_ms) / 1000.0, 'f', 1);
+        };
+        const auto cpu_seconds = [](qint64 cpu_ms) {
+            return cpu_ms < 0 ? QStringLiteral("unknown") : QString::number(cpu_ms / 1000.0, 'f', 1);
+        };
+        const bool have_cpu_delta = result.child_at_kill.cpu_ms >= 0 && result.child_at_last_stage.cpu_ms >= 0;
+        text += QStringLiteral("\nAVX_PARITY_HELPER_TIMEOUT_SNAPSHOT since_last_output_s=%1 since_last_stage_s=%2"
+                               " merged_output_channel=%3 child_threads=%4 child_cpu_s=%5 child_cpu_since_last_stage_s=%6"
+                               " last_stage=\"%7\"")
+                    .arg(seconds_since(result.last_output_ms),
+                         seconds_since(result.last_stage_ms),
+                         result.output_channel_open ? QStringLiteral("open") : QStringLiteral("closed"),
+                         result.child_at_kill.threads < 0 ? QStringLiteral("unknown")
+                                                          : QString::number(result.child_at_kill.threads),
+                         cpu_seconds(result.child_at_kill.cpu_ms),
+                         have_cpu_delta ? cpu_seconds(result.child_at_kill.cpu_ms - result.child_at_last_stage.cpu_ms)
+                                        : QStringLiteral("unknown"),
+                         QString::fromLocal8Bit(result.last_stage_line));
+        tail_bytes = kTimeoutOutputTailBytes;
+    }
     text += QStringLiteral("\n--- helper output tail (last %1 bytes of %2 bytes total) ---\n")
-                .arg(qMin<qint64>(result.output.size(), kOutputTailBytes))
+                .arg(qMin<qint64>(result.output.size(), tail_bytes))
                 .arg(result.output_total_bytes);
-    text += output_tail(result.output);
+    text += QString::fromLocal8Bit(result.output.right(tail_bytes));
     return text;
 }
 
@@ -348,6 +500,10 @@ static QJsonObject load_json_file(const QString & path)
     return QJsonDocument::fromJson(file.readAll()).object();
 }
 
+// The default helper this console_tests process built, so the stall test reuses the parity test's
+// fresh build rather than whatever an earlier checkout left in the build directory.
+static QString g_default_helper_built_this_run;
+
 static QString build_helper(bool enable_avx)
 {
     const QString root = find_repo_root();
@@ -405,14 +561,14 @@ static QString build_helper(bool enable_avx)
 
     const QString helper_path = find_built_helper(build_directory);
     ASSERT_FALSE(helper_path.isEmpty());
+    if (!enable_avx) {
+        g_default_helper_built_this_run = helper_path;
+    }
     return helper_path;
 }
 
-static QJsonObject run_helper_and_collect(const QString & helper_path, const QString & label)
+static QProcessEnvironment helper_environment()
 {
-    const QString output_path = QDir(QFileInfo(helper_path).absolutePath()).filePath(QStringLiteral("avx_parity_hashes.json"));
-    QFile::remove(output_path);
-
     QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
     const QString qmake = find_tool(QStringLiteral("QMAKE"),
                                     {QStringLiteral("qmake6"), QStringLiteral("qmake"), QStringLiteral("qmake-qt5")});
@@ -423,6 +579,16 @@ static QJsonObject run_helper_and_collect(const QString & helper_path, const QSt
     environment.insert(QStringLiteral("MLVAPP_FORCE_THREADS"), QStringLiteral("1"));
     environment.insert(QStringLiteral("OMP_NUM_THREADS"), QStringLiteral("1"));
     environment.insert(QStringLiteral("OMP_DYNAMIC"), QStringLiteral("FALSE"));
+    environment.remove(QStringLiteral("AVX_PARITY_HELPER_FAULT"));
+    return environment;
+}
+
+static QJsonObject run_helper_and_collect(const QString & helper_path, const QString & label)
+{
+    const QString output_path = QDir(QFileInfo(helper_path).absolutePath()).filePath(QStringLiteral("avx_parity_hashes.json"));
+    QFile::remove(output_path);
+
+    const QProcessEnvironment environment = helper_environment();
 
     const ProcessRunResult result = run_helper_with_retry(label,
                                                           helper_path,
@@ -466,6 +632,55 @@ TEST(AvxParity, DefaultAndAvxBuildsProduceMatchingFrameHashes)
     avx_output.remove(QStringLiteral("build_avx"));
 
     ASSERT_TRUE(default_output == avx_output);
+}
+
+// The real helper, driven into the open-clip hang the CI logs showed (merge_group 40043249058: one
+// open-clip stage line, then 300 s of silence). The injected fault parks the cache workers that
+// openMlvClip starts, so the fixture's disableMlvCaching waits for them forever. The helper's stall
+// report must then name that state, and the parent's timeout snapshot must name the stage.
+TEST(AvxParity, InjectedOpenClipStallIsNamedByTheHelperStallReport)
+{
+    QString helper = g_default_helper_built_this_run;
+    if (helper.isEmpty()) {
+        helper = build_helper(false);
+    }
+
+    QTemporaryDir scratch;
+    ASSERT_TRUE(scratch.isValid());
+    const QString output_path = scratch.filePath(QStringLiteral("hashes.json"));
+    QProcessEnvironment environment = helper_environment();
+    environment.insert(QStringLiteral("AVX_PARITY_HELPER_FAULT"), QStringLiteral("cache-worker-start-pause"));
+    environment.insert(QStringLiteral("AVX_PARITY_HELPER_STALL_MS"), QStringLiteral("1000"));
+
+    const ProcessRunResult result = run_process_bounded(helper,
+                                                        {QStringLiteral("--output"), output_path},
+                                                        QFileInfo(helper).absolutePath(),
+                                                        environment,
+                                                        9000);
+    const QString text = describe_process_failure(QStringLiteral("default"), helper, result, output_path);
+    const QString output = QString::fromLocal8Bit(result.output);
+    // Some report caught disableMlvCaching waiting: stop set, workers still counted.
+    const bool named_quiesce_wait =
+        QRegularExpression(QStringLiteral("cache_thread_count=[1-9][0-9]* stop_caching=1 ")).match(output).hasMatch();
+#ifdef Q_OS_WIN
+    const bool named_main_frame =
+        QRegularExpression(QStringLiteral("thread tid=\\d+ main=yes [^\\n]*disableMlvCaching")).match(output).hasMatch();
+#else
+    const bool named_main_frame = true;
+#endif
+    if (!result.timed_out || !named_quiesce_wait || !named_main_frame) {
+        std::cerr << text.toStdString() << "\n";
+    }
+
+    ASSERT_TRUE(result.timed_out);
+    ASSERT_FALSE(output.contains(QStringLiteral("stage=load-receipt")));
+    ASSERT_TRUE(result.last_stage_line.contains("stage=open-clip "));
+    ASSERT_TRUE(output.contains(QStringLiteral("AVX_PARITY_HELPER_STALL report=1 ")));
+    ASSERT_TRUE(named_quiesce_wait);
+    ASSERT_TRUE(named_main_frame);
+    ASSERT_TRUE(text.contains(QStringLiteral("AVX_PARITY_HELPER_TIMEOUT_SNAPSHOT ")));
+    ASSERT_TRUE(text.contains(QStringLiteral("last_stage=\"avx_parity_helper t=")));
+    ASSERT_TRUE(text.contains(QStringLiteral("merged_output_channel=open")));
 }
 
 // A shell stands in for the helper, so these tests pin the runner without a real hang.
@@ -654,6 +869,55 @@ TEST(AvxParityRunner, HelperTimeoutRetriesOnceAndReportsTheFirstAttempt)
     ASSERT_TRUE(text.find(marker, first + marker.size()) == std::string::npos);
     ASSERT_TRUE(text.find("helper=avx") != std::string::npos);
     ASSERT_TRUE(text.find("timed_out=yes") != std::string::npos);
+}
+
+// Prints one helper stage line on stderr, then hangs silently: the shape of the 2026-10-24 hang.
+static QStringList stage_then_hang_arguments()
+{
+    return stand_in_arguments(
+        QStringLiteral("[Console]::Error.WriteLine('avx_parity_helper t=1ms stage=open-clip stand-in'); "
+                       "[Console]::Error.Flush(); Start-Sleep -Seconds 60"),
+        QStringLiteral("echo 'avx_parity_helper t=1ms stage=open-clip stand-in' >&2; sleep 60"));
+}
+
+TEST(AvxParityRunner, TimeoutSnapshotNamesTheLastStageAndHowLongTheChildWasSilent)
+{
+    const QString shell = stand_in_shell();
+    if (shell.isEmpty()) {
+        SKIP_TEST("no shell found to stand in for a hung helper");
+    }
+
+    const ProcessRunResult result = run_process_bounded(shell,
+                                                        stage_then_hang_arguments(),
+                                                        QDir::tempPath(),
+                                                        QProcessEnvironment::systemEnvironment(),
+                                                        8000);
+    ASSERT_TRUE(result.timed_out);
+    ASSERT_TRUE(result.last_stage_line == QByteArray("avx_parity_helper t=1ms stage=open-clip stand-in"));
+    ASSERT_TRUE(result.last_stage_ms >= 0);
+    ASSERT_TRUE(result.last_output_ms >= result.last_stage_ms);
+    // The child printed its stage line, then nothing, and the parent measured the silence.
+    ASSERT_TRUE(result.killed_at_ms - result.last_stage_ms >= 1000);
+    // The child was alive with its pipe open when it was killed: a hang, not a lost line.
+    ASSERT_TRUE(result.output_channel_open);
+#ifdef Q_OS_WIN
+    ASSERT_TRUE(result.child_at_kill.threads > 0);
+    ASSERT_TRUE(result.child_at_kill.cpu_ms >= 0);
+    ASSERT_TRUE(result.child_at_last_stage.cpu_ms >= 0);
+#endif
+
+    const QString text = describe_process_failure(QStringLiteral("avx"),
+                                                  shell,
+                                                  result,
+                                                  QDir(QDir::tempPath()).filePath(QStringLiteral("no-such-hashes.json")));
+    const QString since = QString::number((result.killed_at_ms - result.last_stage_ms) / 1000.0, 'f', 1);
+    ASSERT_TRUE(text.contains(QStringLiteral("AVX_PARITY_HELPER_TIMEOUT_SNAPSHOT ")));
+    ASSERT_TRUE(text.contains(QStringLiteral("since_last_stage_s=%1 ").arg(since)));
+    ASSERT_TRUE(text.contains(QStringLiteral("merged_output_channel=open")));
+    ASSERT_TRUE(text.contains(QStringLiteral("last_stage=\"avx_parity_helper t=1ms stage=open-clip stand-in\"")));
+#ifdef Q_OS_WIN
+    ASSERT_FALSE(text.contains(QStringLiteral("child_threads=unknown")));
+#endif
 }
 
 // Hangs on the first run; on the second run writes a valid hash json and exits 0.
