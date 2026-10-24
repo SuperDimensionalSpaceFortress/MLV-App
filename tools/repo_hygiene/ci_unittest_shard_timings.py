@@ -33,13 +33,25 @@ TEST_LINE = re.compile(rf"^\S+ \(([A-Za-z0-9_.]+)\) \.\.\. {RESULT}$")
 KEY_PREFIX = "tools.repo_hygiene.test_"
 # A test with a docstring prints ``name (module.Class.name)`` on its own line and
 # ``<first docstring line> ... ok`` on the next, so TEST_LINE alone never sees it.
-DOC_HEAD = re.compile(r"^\S+ \(([A-Za-z0-9_.]+)\)$")
+DOC_HEAD = re.compile(r"^(\S+) \(([A-Za-z0-9_.]+)\)$")
 DOC_RESULT = re.compile(rf"^.* \.\.\. {RESULT}$")
 
 
 def _seconds(stamp: re.Match[str]) -> float:
     whole = datetime.strptime(stamp.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
     return whole.timestamp() + float("0." + stamp.group(2))
+
+
+def _doc_head(text: str) -> str | None:
+    """The test id of a docstring id line, or None for any other line.
+
+    A logged line such as ``Running (1.2)`` has the same shape, so the id must be under
+    ``KEY_PREFIX`` or the displayed name must be the id's last component.
+    """
+    head = DOC_HEAD.match(text)
+    if head and (head.group(2).startswith(KEY_PREFIX) or head.group(2).rsplit(".", 1)[-1] == head.group(1)):
+        return head.group(2)
+    return None
 
 
 def class_seconds(log_text: str) -> dict[str, float]:
@@ -54,13 +66,13 @@ def class_seconds(log_text: str) -> dict[str, float]:
         now = _seconds(stamp)
         text = stamp.group(3)
         test = TEST_LINE.match(text)
-        doc_head = None if test else DOC_HEAD.match(text)
+        doc_head = None if test else _doc_head(text)
         if test:
             # A plain result line while a docstring test is pending: that test never printed
             # its result, so it keeps head -> this line and the plain test is not charged.
             name, pending = (pending or test.group(1)), None
         elif doc_head:
-            name, pending = None, doc_head.group(1)
+            name, pending = None, doc_head
         elif pending is not None and DOC_RESULT.match(text):
             name, pending = pending, None
         elif pending is not None:
