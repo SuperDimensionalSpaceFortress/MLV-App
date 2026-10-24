@@ -25,12 +25,14 @@ body is "clean" means clean under that grammar, and no more.
 
 from __future__ import annotations
 
+import ast
 import functools
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -314,10 +316,42 @@ def run_scan(*, generators=(), templates=(), modules=(), splice_sources=()) -> d
         command += ["-ModulePath", ";".join(str(m) for m in modules)]
     if splice_sources:
         command += ["-SpliceSource", ";".join(str(s) for s in splice_sources)]
-    proc = subprocess.run(command, capture_output=True, text=True)
+    proc = run_bounded(command, SCAN_TIMEOUT_SECONDS)
     if proc.returncode != 0:
         raise AssertionError(f"scan exited {proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}")
     return json.loads(proc.stdout)
+
+
+def run_bounded(command: list[str], timeout: float) -> "subprocess.CompletedProcess[str]":
+    """subprocess.run with a bound: a hung pwsh fails this test instead of stalling the shard."""
+    try:
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(f"{Path(command[0]).name} did not finish within {timeout:g}s: {' '.join(command[1:4])} ...") from exc
+
+
+# The real scan parses ~100 helper bodies and five templates (tens of seconds on a loaded host);
+# the bound only has to be finite and well above that.
+SCAN_TIMEOUT_SECONDS = 600
+PROBE_TIMEOUT_SECONDS = 300
+
+
+# A call to the extractor, however it is spelled: PowerShell command names are case-insensitive and
+# a module-qualified name (Module\Get-AttrCudaEmbeddedFunctionSource) resolves to the same command.
+# The argument shape is irrelevant (named, positional, splatted). A comment-only line is not a call.
+EXTRACTOR_NAME = re.compile(r"(?i)(?<![\w-])Get-AttrCudaEmbeddedFunctionSource(?![\w-])")
+
+
+def files_that_call_the_extractor(tools_root: Path, excluded=()) -> set[Path]:
+    found = set()
+    for path in tools_root.rglob("*"):
+        if path.suffix.lower() not in (".ps1", ".psm1") or path in excluded:
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if not line.lstrip().startswith("#") and EXTRACTOR_NAME.search(line):
+                found.add(path)
+                break
+    return found
 
 
 @functools.lru_cache(maxsize=1)
@@ -394,13 +428,7 @@ class SplicedBodyScanOnRealSourcesTests(unittest.TestCase):
         return real_scan_result()
 
     def test_every_file_that_splices_helpers_is_a_listed_splice_source(self) -> None:
-        call = re.compile(r"Get-AttrCudaEmbeddedFunctionSource\s+-(?:Name|ModulePath)\b")
-        found = set()
-        for path in (ROOT / "tools").rglob("*"):
-            if path.suffix.lower() not in (".ps1", ".psm1") or path in SPLICE_DEFINITION_FILES:
-                continue
-            if call.search(path.read_text(encoding="utf-8", errors="replace")):
-                found.add(path)
+        found = files_that_call_the_extractor(ROOT / "tools", SPLICE_DEFINITION_FILES)
         self.assertEqual(
             sorted(found), sorted(SPLICE_SOURCES),
             "a generator splices helper text into a job but is not a listed splice source (or the reverse)",
@@ -437,8 +465,7 @@ class SplicedBodyScanOnRealSourcesTests(unittest.TestCase):
                 "}",
             ]
             script.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)],
-                                  capture_output=True, text=True)
+            proc = run_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], PROBE_TIMEOUT_SECONDS)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             real = dict(line.split(" ", 1) for line in proc.stdout.split("\n") if line.strip())
             for entry in entries:
@@ -588,6 +615,96 @@ class SplicedBodyScanFixtureTests(unittest.TestCase):
         result = self.template_only_scan(generator, module)
         self.assertEqual(result["spliced"], [])
         self.assertEqual(result["splicedViolations"], [])
+
+    SNEAKY = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
+
+    def build_beside_an_ordinary_call(self, variant_call: str):
+        """An ordinary extractor call plus one more spelling of it; only the second names the sneaky helper."""
+        module = self.tmp / "FixtureModule.psm1"
+        module.write_text(
+            "function Publish-AttrCudaFixtureOrdinary {\n    Get-Date\n}\n\n"
+            f"function Publish-AttrCudaFixtureHelper {{\n{self.SNEAKY}\n}}\n",
+            encoding="utf-8",
+        )
+        generator = self.tmp / "fixture-gen.ps1"
+        generator.write_text(
+            "$embedded = Get-AttrCudaEmbeddedFunctionSource -Name @('Publish-AttrCudaFixtureOrdinary')\n"
+            f"$embedded = $embedded + (\"`r`n\" + ({variant_call}))\n"
+            "$template = @'\n" + self.TEMPLATE + "'@\n",
+            encoding="utf-8",
+        )
+        return generator, module
+
+    def assert_the_variant_call_is_scanned(self, variant_call: str) -> None:
+        generator, module = self.build_beside_an_ordinary_call(variant_call)
+        result = self.spliced_scan(generator, module)
+        self.assertEqual([(f["function"], f["rule"], f["token"]) for f in result["splicedViolations"]],
+                         [("Publish-AttrCudaFixtureHelper", "R2", "New-Item")], describe(result["splicedViolations"]))
+        self.assertEqual(sorted(s["name"] for s in result["spliced"]),
+                         ["Publish-AttrCudaFixtureHelper", "Publish-AttrCudaFixtureOrdinary"])
+
+    def test_a_lowercase_extractor_call_is_scanned_like_the_exact_case_one(self) -> None:
+        self.assert_the_variant_call_is_scanned("get-attrcudaembeddedfunctionsource -Name @('Publish-AttrCudaFixtureHelper')")
+
+    def test_a_module_qualified_extractor_call_is_scanned_like_the_bare_one(self) -> None:
+        self.assert_the_variant_call_is_scanned("FixtureModule\\Get-AttrCudaEmbeddedFunctionSource -Name @('Publish-AttrCudaFixtureHelper')")
+
+    def test_a_lowercase_module_qualified_extractor_call_with_a_positional_list_is_scanned(self) -> None:
+        self.assert_the_variant_call_is_scanned("attrcudaartifacts\\GET-ATTRCUDAEMBEDDEDFUNCTIONSOURCE @('Publish-AttrCudaFixtureHelper')")
+
+
+class SpliceInventoryCallShapeTests(unittest.TestCase):
+    """The census of splice sources, and the bound on the subprocesses, in a throwaway tree (never the real one)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="attr3-splice-inventory-")
+        self.addCleanup(self._tmp.cleanup)
+        self.tools = _long_path(Path(self._tmp.name)) / "tools"
+        self.tools.mkdir()
+
+    def census(self, files: dict[str, str], excluded=()) -> set[str]:
+        for name, text in files.items():
+            (self.tools / name).write_text(text, encoding="utf-8")
+        return {p.name for p in files_that_call_the_extractor(self.tools, {self.tools / e for e in excluded})}
+
+    def test_every_spelling_and_argument_shape_of_the_call_is_found(self) -> None:
+        found = self.census({
+            "exact.ps1": "$e = Get-AttrCudaEmbeddedFunctionSource -Name @('A')\n",
+            "lower.ps1": "$e = get-attrcudaembeddedfunctionsource -Name @('A')\n",
+            "upper.psm1": "$e = GET-ATTRCUDAEMBEDDEDFUNCTIONSOURCE -Name @('A')\n",
+            "positional.ps1": "$e = Get-AttrCudaEmbeddedFunctionSource @('A')\n",
+            "splat.ps1": "$e = Get-AttrCudaEmbeddedFunctionSource @splat\n",
+            "bare.ps1": "$e = Get-AttrCudaEmbeddedFunctionSource\n",
+            "qualified.ps1": "$e = AttrCudaArtifacts\\Get-AttrCudaEmbeddedFunctionSource @('A')\n",
+            "qualified-lower.psm1": "$e = attrcudaartifacts\\get-attrcudaembeddedfunctionsource $names\n",
+            "parenthesised.ps1": "$j = $a + (Get-AttrCudaEmbeddedFunctionSource -ModulePath $m -Name @('A'))\n",
+        })
+        self.assertEqual(found, {
+            "exact.ps1", "lower.ps1", "upper.psm1", "positional.ps1", "splat.ps1", "bare.ps1",
+            "qualified.ps1", "qualified-lower.psm1", "parenthesised.ps1",
+        })
+
+    def test_a_file_that_only_mentions_the_name_or_is_not_powershell_is_not_a_splice_source(self) -> None:
+        found = self.census({
+            "comment.ps1": "# splices come from Get-AttrCudaEmbeddedFunctionSource\nGet-Date\n",
+            "other-command.ps1": "Get-AttrCudaEmbeddedFunctionSourceCount\nInvoke-Get-AttrCudaEmbeddedFunctionSource\n",
+            "notes.md": "Get-AttrCudaEmbeddedFunctionSource @splat\n",
+            "defines.ps1": "function Get-AttrCudaEmbeddedFunctionSource { }\n",
+        }, excluded=("defines.ps1",))
+        self.assertEqual(found, set())
+
+    def test_every_subprocess_run_in_this_file_carries_a_timeout(self) -> None:
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "run" and isinstance(n.func.value, ast.Name) and n.func.value.id == "subprocess"]
+        self.assertGreaterEqual(len(calls), 1)
+        for call in calls:
+            self.assertIn("timeout", [k.arg for k in call.keywords], f"subprocess.run at line {call.lineno} has no timeout=")
+
+    def test_a_process_that_outlives_its_bound_fails_the_test_instead_of_hanging(self) -> None:
+        with self.assertRaises(AssertionError) as caught:
+            run_bounded([sys.executable, "-I", "-c", "import time; time.sleep(60)"], 1)
+        self.assertIn("did not finish within 1s", str(caught.exception))
 
 
 if __name__ == "__main__":

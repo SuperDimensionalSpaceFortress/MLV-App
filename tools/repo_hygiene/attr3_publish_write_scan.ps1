@@ -516,7 +516,16 @@ function Get-SpliceCallSites([string]$Path) {
     foreach ($err in @($errors)) {
         Add-SpliceFinding $source $err.Extent.StartLineNumber '' $err.Message 'splice source does not parse; its splice call sites cannot be enumerated'
     }
-    foreach ($call in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Get-AttrCudaEmbeddedFunctionSource' }, $true)) {
+    # Command names are case-insensitive and a module-qualified name (<Module>\Get-AttrCudaEmbeddedFunctionSource)
+    # resolves to the same command: compare the part after the last backslash, ignoring case.
+    $extractorCalls = $ast.FindAll({
+        param($n)
+        if ($n -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
+        $commandName = $n.GetCommandName()
+        if ($null -eq $commandName) { return $false }
+        return $commandName.Substring($commandName.LastIndexOf('\') + 1) -ieq 'Get-AttrCudaEmbeddedFunctionSource'
+    }, $true)
+    foreach ($call in $extractorCalls) {
         $text = ($call.Extent.Text -replace '\s+', ' ')
         if ($text.Length -gt 160) { $text = $text.Substring(0, 160) }
         $named = Get-NamedArguments $call @('Name')
