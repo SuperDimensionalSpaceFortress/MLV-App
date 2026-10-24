@@ -40,8 +40,10 @@
 #   - LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: -NotAfterBudgetSec (with an optional -NotAfterCapUtc) is the same field in a
 #     RELATIVE form: notAfterUtc = min(UtcNow + budget, cap), read when the claim is written and read AGAIN immediately before the job's
 #     rename into view (r3): the value is re-derived and re-published into the claim then, so neither a slow setup before the drop nor
-#     slow side-file / job placement after the claim can leave the bound short of the waits that follow visibility. A cap already passed
-#     refuses before the share is touched (or, passing during placement, before the job is visible); both forms is UMRUN_NOT_AFTER_CONFLICT.
+#     slow side-file / job placement after the claim can leave the bound short of the waits that follow visibility. r4: a stall in that
+#     re-publish itself is measured by one more read before the rename and re-derived (bounded; else UMRUN_NOT_AFTER_PLACEMENT_STALL), so only
+#     the job's single rename is unmeasured. A cap already passed refuses before the share is touched (or, passing during placement, before
+#     the job is visible); both forms is UMRUN_NOT_AFTER_CONFLICT, checked first.
 #
 # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 10 (hub scope ruling reversed: sol proved BOTH round-9
 # premises false -- see summary.md). OWNERSHIP OF A JobId IS NOW CLAIMED ATOMICALLY, BY
@@ -565,6 +567,13 @@ function Assert-UmRunSideFileName {
     return $full
 }
 
+# LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r4 (Dot B1): the longest a -NotAfterBudgetSec value may have been derived before the
+# measured clock read that precedes the job's rename (see Invoke-UmRunDrop's re-publish loop), and how many times a longer stall is
+# re-derived and re-published before UMRUN_NOT_AFTER_PLACEMENT_STALL. 15 s is a quarter of the venue submitters' 60 s slack
+# (DualVenueRunner.psm1 $script:DvNotAfterSlackSec; test_venue_not_after.py pins the ratio); the rest covers the rename and um-run's poll.
+$script:UmRunNotAfterPlacementStallSec = 15
+$script:UmRunNotAfterPlacementRetries = 3
+
 function Invoke-UmRunDrop {
     <#
     .SYNOPSIS
@@ -622,7 +631,7 @@ function Invoke-UmRunDrop {
         # Test-only: returns the current UTC instant ([DateTimeOffset] or [DateTime]) for the -NotAfterBudgetSec form, so a test
         # can place the drop at a chosen instant. Production never passes it (the wall clock). The -NotAfterUtc form ignores it.
         [scriptblock]$TestUtcNow = $null,
-        [scriptblock]$Copier ={ param($Source, $Destination) Copy-Item -LiteralPath $Source -Destination $Destination },
+        [scriptblock]$Copier = { param($Source, $Destination) Copy-Item -LiteralPath $Source -Destination $Destination },
         [scriptblock]$PostAdmissionHook = { param($Source) },
         [scriptblock]$PreRenameRaceHook = { param($PartPath) },
         # Test-only: invoked with no arguments immediately before the job's own rename into view,
@@ -635,7 +644,10 @@ function Invoke-UmRunDrop {
         # actually rejects a torn write rather than merely being present and untested, OR (round 10)
         # plant a competing winner's metadata directly at $metaFinal to prove a losing concurrent
         # claim never overwrites it.
-        [scriptblock]$TestHookAfterMetaTmpWritten = $null
+        [scriptblock]$TestHookAfterMetaTmpWritten = $null,
+        # Test-only (r4): invoked with the not-after re-publish's temp file's path immediately after it is written, before its
+        # read-back -- lets a test stall the clock inside the re-publish, tear the write, or plant another submission's claim.
+        [scriptblock]$TestHookAfterNotAfterRepublishTmpWritten = $null
     )
 
     if ($JobId -and $JobId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { throw "UMRUN_JOBID_INVALID '$JobId'" }
@@ -645,6 +657,11 @@ function Invoke-UmRunDrop {
     # possibly multi-GB side-file transfer.
     if ($JobTimeoutSec -ne 0 -and ($JobTimeoutSec -lt 1 -or $JobTimeoutSec -gt 86400)) {
         throw "UMRUN_JOB_TIMEOUT_INVALID $JobTimeoutSec is outside the agent's accepted 1..86400 range"
+    }
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r4 (Grok G2): both forms is the caller's mistake whatever the absolute value
+    # is, so it is reported before that value is validated (a past or malformed -NotAfterUtc must not hide it).
+    if ($NotAfterUtc -and ($NotAfterBudgetSec -ne 0 -or $NotAfterCapUtc)) {
+        throw "UMRUN_NOT_AFTER_CONFLICT -NotAfterUtc and -NotAfterBudgetSec/-NotAfterCapUtc are two forms of the same notAfterUtc; pass one"
     }
     # LEASE-REQUEST-CHILD-NOT-AFTER-1: checked here for the same reason. An offset-less time is
     # ambiguous local time on whichever machine reads it, so it is refused rather than guessed.
@@ -665,9 +682,6 @@ function Invoke-UmRunDrop {
     }
     # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: the relative form is validated here too, before the share is touched; its
     # value is computed at the claim below. A cap that passes between here and the claim is refused there, before any write.
-    if ($NotAfterUtc -and ($NotAfterBudgetSec -ne 0 -or $NotAfterCapUtc)) {
-        throw "UMRUN_NOT_AFTER_CONFLICT -NotAfterUtc and -NotAfterBudgetSec/-NotAfterCapUtc are two forms of the same notAfterUtc; pass one"
-    }
     if ($NotAfterCapUtc -and $NotAfterBudgetSec -eq 0) {
         throw "UMRUN_NOT_AFTER_INVALID -NotAfterCapUtc '$NotAfterCapUtc' caps a -NotAfterBudgetSec bound and needs one"
     }
@@ -896,42 +910,63 @@ function Invoke-UmRunDrop {
                 }
                 # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r3 (sol r2 blocker): the budget counts from VISIBILITY, not from the claim. Every
                 # side-file and the job's own copy and verification are share I/O of unbounded length after the claim's clock read, so the clock
-                # is read again HERE, after all of it and immediately before the rename that makes the job visible; the value is re-derived
-                # from that read (capped as before) and re-published into this call's own claim before the rename, so the only metadata the
-                # agent can ever read with the job carries it. What remains between this read and visibility is a fixed number of small
-                # share operations (one write, its read-back, one replace, the job's rename), whatever the side-files' and job's sizes: the
-                # submitter's slack covers that and um-run's poll. A cap that passed during placement refuses here, the job never visible.
-                if ($null -ne $notAfterSampled) {
-                    $notAfterSampled = & $utcNow
-                    $relDto = $notAfterSampled.AddSeconds($NotAfterBudgetSec)
-                    if ($null -ne $notAfterCapDto -and $notAfterCapDto -lt $relDto) { $relDto = $notAfterCapDto }
-                    if ($relDto -le $notAfterSampled) {
-                        throw "UMRUN_NOT_AFTER_CAP_PASSED -NotAfterCapUtc '$NotAfterCapUtc' passed during placement (now $($notAfterSampled.UtcDateTime.ToString('o'))); the job was not made visible"
-                    }
-                    $republished = $relDto.UtcDateTime.ToString('o')
-                    if ($republished -cne $notAfterText) {
-                        $metaObj['notAfterUtc'] = $republished
-                        $metaJson = $metaObj | ConvertTo-Json -Compress
-                        $repubTmp = Join-Path $Inbox "$id.$nonce.meta.tmp"
-                        try {
-                            Set-Content -LiteralPath $repubTmp -Value $metaJson -Encoding ascii -NoNewline
-                            if ((Get-Content -LiteralPath $repubTmp -Raw -Encoding ascii) -ne $metaJson) {
-                                throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json did not round-trip to the share (not-after re-publish)"
-                            }
-                            # Only this call's OWN claim is ever replaced (the rollback's nonce rule, the same single-rename-width race), and in
-                            # one atomic replacing rename, so metadata for this JobId never stops existing.
-                            $current = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json
-                            if ($null -eq $current -or $current.nonce -ne $nonce) {
-                                throw "UMRUN_JOBID_IN_USE inbox\$id.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it"
-                            }
-                            [IO.File]::Move($repubTmp, $metaFinal, $true)
-                        } finally {
-                            if (Test-Path -LiteralPath $repubTmp) { Remove-Item -LiteralPath $repubTmp -Force -ErrorAction SilentlyContinue }
+                # is read again HERE, after all of it; the value is re-derived from that read (capped as before) and re-published into this
+                # call's own claim before the rename, so the only metadata the agent can ever read with the job carries it.
+                # r4 (Dot B1 on r3): that re-publish is itself share I/O (a write, its read-back, a read of the claim, a replace) whose COUNT
+                # is fixed but whose DURATION is not, so a stall in it took time out of the waits again (sample 05:00, 300 s stall, visible
+                # 05:05 carrying 07:06 while queue + admission run to 07:07). So the clock is read once more AFTER the re-publish, immediately
+                # before the rename: if more than $script:UmRunNotAfterPlacementStallSec passed since the read the value was derived from, the
+                # value is re-derived from a fresh read and re-published, at most $script:UmRunNotAfterPlacementRetries times; still stalled ->
+                # UMRUN_NOT_AFTER_PLACEMENT_STALL. A cap that passed (at either read) -> UMRUN_NOT_AFTER_CAP_PASSED. Either refusal rolls the
+                # claim back and the job is never visible. THE CONTRACT: the visible job's value was derived from a clock read at most
+                # $script:UmRunNotAfterPlacementStallSec before a measured read that is followed only by the job's single rename; that one
+                # rename is the only unmeasured operation, and the submitter's slack less that bound covers it and um-run's poll.
+                $placementRetry = 0
+                while ($true) {
+                    if ($null -ne $notAfterSampled) {
+                        $notAfterSampled = & $utcNow
+                        $relDto = $notAfterSampled.AddSeconds($NotAfterBudgetSec)
+                        if ($null -ne $notAfterCapDto -and $notAfterCapDto -lt $relDto) { $relDto = $notAfterCapDto }
+                        if ($relDto -le $notAfterSampled) {
+                            throw "UMRUN_NOT_AFTER_CAP_PASSED -NotAfterCapUtc '$NotAfterCapUtc' passed during placement (now $($notAfterSampled.UtcDateTime.ToString('o'))); the job was not made visible"
                         }
-                        $notAfterText = $republished
+                        $republished = $relDto.UtcDateTime.ToString('o')
+                        if ($republished -cne $notAfterText) {
+                            $metaObj['notAfterUtc'] = $republished
+                            $metaJson = $metaObj | ConvertTo-Json -Compress
+                            $repubTmp = Join-Path $Inbox "$id.$nonce.meta.tmp"
+                            try {
+                                Set-Content -LiteralPath $repubTmp -Value $metaJson -Encoding ascii -NoNewline
+                                if ($TestHookAfterNotAfterRepublishTmpWritten) { & $TestHookAfterNotAfterRepublishTmpWritten $repubTmp }
+                                if ((Get-Content -LiteralPath $repubTmp -Raw -Encoding ascii) -ne $metaJson) {
+                                    throw "UMRUN_JOB_METADATA_VERIFY_FAILED $id.meta.json did not round-trip to the share (not-after re-publish)"
+                                }
+                                # Only this call's OWN claim is ever replaced (the rollback's nonce rule, the same single-rename-width race), and in
+                                # one atomic replacing rename, so metadata for this JobId never stops existing.
+                                $current = (Get-Content -LiteralPath $metaFinal -Raw -Encoding ascii) | ConvertFrom-Json
+                                if ($null -eq $current -or $current.nonce -ne $nonce) {
+                                    throw "UMRUN_JOBID_IN_USE inbox\$id.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it"
+                                }
+                                [IO.File]::Move($repubTmp, $metaFinal, $true)
+                            } finally {
+                                if (Test-Path -LiteralPath $repubTmp) { Remove-Item -LiteralPath $repubTmp -Force -ErrorAction SilentlyContinue }
+                            }
+                            $notAfterText = $republished
+                        }
+                    }
+                    if ($TestHookBeforeJobVisible) { & $TestHookBeforeJobVisible }
+                    if ($null -eq $notAfterSampled) { break }
+                    $placedCheck = & $utcNow
+                    if ($null -ne $notAfterCapDto -and $relDto -eq $notAfterCapDto -and $relDto -le $placedCheck) {
+                        throw "UMRUN_NOT_AFTER_CAP_PASSED -NotAfterCapUtc '$NotAfterCapUtc' passed during the not-after re-publish (now $($placedCheck.UtcDateTime.ToString('o'))); the job was not made visible"
+                    }
+                    $stallSec = ($placedCheck - $notAfterSampled).TotalSeconds
+                    if ($stallSec -le $script:UmRunNotAfterPlacementStallSec -and $relDto -gt $placedCheck) { break }
+                    $placementRetry++
+                    if ($placementRetry -gt $script:UmRunNotAfterPlacementRetries) {
+                        throw "UMRUN_NOT_AFTER_PLACEMENT_STALL $([Math]::Round($stallSec, 3)) s passed between the not-after clock read ($($notAfterSampled.UtcDateTime.ToString('o'))) and the job's rename, more than $($script:UmRunNotAfterPlacementStallSec) s on each of $($placementRetry) reads; the job was not made visible"
                     }
                 }
-                if ($TestHookBeforeJobVisible) { & $TestHookBeforeJobVisible }
                 try {
                     Move-Item -LiteralPath $tmp -Destination $final -ErrorAction Stop   # no -Force: a job is never replaced
                 } catch {

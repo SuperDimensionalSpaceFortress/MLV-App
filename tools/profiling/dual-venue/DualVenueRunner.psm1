@@ -2394,6 +2394,28 @@ function Get-DvJobNotAfter {
     & $result $now.AddSeconds($uncapped).ToString('o') 'um-run-waits' $uncapped $script:DvNotAfterSlackSec $uncapped $capText "um-run waits at most $waitSec s (queue $MaxQueueWaitSec + admission $MaxAdmissionWaitSec + timeout $TimeoutSec + claimed $MaxClaimedWaitSec) from its drop + $($script:DvNotAfterSlackSec) s slack; the drop counts the $uncapped s from its own clock$(if ($capText) { ", capped at $capText" })"
 }
 
+function Get-DvUmRunNotAfterArgs {
+    <#
+    .SYNOPSIS
+    Pure. The um-run.ps1 arguments that carry a Get-DvJobNotAfter result (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r4, Grok G1, card
+    NOT-AFTER-BUDGET-NULL-FAIL-CLOSED-1): a budgetSec >= 1 -> NotAfterBudgetSec (plus NotAfterCapUtc when capUtc is set); else a notAfterUtc -> NotAfterUtc;
+    else source 'later-harvest' -> none, by design. Anything else would bind -NotAfterBudgetSec to [int] 0, which um-run reads as 'not given', and drop the
+    bound silently: DVE_NOT_AFTER_BUDGET_MISSING, before anything is submitted.
+    .OUTPUTS
+    [hashtable] to splat onto um-run.ps1
+    #>
+    param([Parameter(Mandatory)]$NotAfter)
+    if ($null -ne $NotAfter.budgetSec) {
+        if ([int]$NotAfter.budgetSec -lt 1) { throw "DVE_NOT_AFTER_BUDGET_MISSING budgetSec $($NotAfter.budgetSec) would reach um-run as 'not given' and drop the bound (source '$($NotAfter.source)')" }
+        $a = @{ NotAfterBudgetSec = [int]$NotAfter.budgetSec }
+        if ($NotAfter.capUtc) { $a.NotAfterCapUtc = [string]$NotAfter.capUtc }
+        return $a
+    }
+    if ($NotAfter.notAfterUtc) { return @{ NotAfterUtc = [string]$NotAfter.notAfterUtc } }
+    if ($NotAfter.source -eq 'later-harvest') { return @{} }
+    throw "DVE_NOT_AFTER_BUDGET_MISSING the bound (source '$($NotAfter.source)') has neither budgetSec nor notAfterUtc; um-run would get no notAfterUtc"
+}
+
 function Get-DvUmRunDropVisibleUtc {
     <#
     .SYNOPSIS
@@ -2800,6 +2822,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

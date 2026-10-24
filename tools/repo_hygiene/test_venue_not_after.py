@@ -541,13 +541,18 @@ class DropRelativeNotAfterTests(unittest.TestCase):
 
     def drop(self, *, clock: list[datetime] | None = None, bound: dict | None = None, budget_from_bound: bool = False,
              not_after_utc: str | None = None, budget: int | None = None, cap: datetime | str | None = None, drop_at: datetime | None = None,
-             advance: dict | None = None, side_file: Path | None = None) -> dict:
+             advance: dict | None = None, side_file: Path | None = None, repub: dict | None = None) -> dict:
         """One Invoke-UmRunDrop for job-x. Returns {threw, lines, meta (raw text or ''), names, copied, bound, judge, seen}; judge is
         Test-DvNotAfterCoversDrop on the bound, the drop at drop_at and the drop's own reported value (only when bound and drop_at are given).
         r3 (sol r2 blocker): advance = {'job': s, 'side': s} turns the clock into a SIMULATED one that starts at clock[0] and that the existing Copier seam
         moves on by s seconds while it copies the job's temporary (or a side-file's .sidepart): share I/O after the drop's first clock read. The job then
         becomes visible at the simulated instant once the drop returns (the judge's drop instant, unless drop_at is given), and seen is what the agent could
-        read at visibility: the simulated instant and meta.json's text at the job's rename (TestHookBeforeJobVisible)."""
+        read at visibility: the simulated instant and meta.json's text at the job's rename (TestHookBeforeJobVisible).
+        r4 (Dot B1): advance 'meta': s moves the simulated clock on by s seconds in TestHookBeforeJobVisible's FIRST call, 'metaEvery': s in every call: share
+        I/O after the drop's final clock read (the re-publish's write, read-back, claim read and replace), which no seam inside it existed for at 6b542fe8.
+        seen.calls counts the hook's calls; seen is the LAST call's view (the one the rename follows). repub = {'advance': s} or {'fault': 'corrupt'} or
+        {'fault': 'steal', 'other': <meta.json text>} acts in TestHookAfterNotAfterRepublishTmpWritten's first call (the re-publish's temp just written):
+        the clock moves on, the temp is torn, or another submission's claim replaces meta.json."""
         script = (
             "$ErrorActionPreference = 'Stop'\n"
             f"Import-Module '{DROP_MODULE}' -Force\n"
@@ -575,7 +580,15 @@ class DropRelativeNotAfterTests(unittest.TestCase):
             "if ($null -ne $c.cap) { $p.NotAfterCapUtc = ([string]$c.cap).Substring(1) }\n"
             "if ($null -ne $c.side) { $p.SideFile = @([string]$c.side) }\n"
             f"$metaPath = Join-Path '{self.inbox}' 'job-x.meta.json'\n"
-            "if ($null -ne $sim) { $p.TestHookBeforeJobVisible = { $seen.atUtc = $sim.now.UtcDateTime.ToString('o'); $seen.meta = [IO.File]::ReadAllText($metaPath) } }\n"
+            "if ($null -ne $sim) { $p.TestHookBeforeJobVisible = { $seen.calls = 1 + [int]$seen.calls\n"
+            "  if ($null -ne $c.advance.metaEvery) { $sim.now = $sim.now.AddSeconds([double]$c.advance.metaEvery) }\n"
+            "  elseif ($seen.calls -eq 1 -and $null -ne $c.advance.meta) { $sim.now = $sim.now.AddSeconds([double]$c.advance.meta) }\n"
+            "  $seen.atUtc = $sim.now.UtcDateTime.ToString('o'); $seen.meta = [IO.File]::ReadAllText($metaPath) } }\n"
+            "if ($null -ne $c.repub) { $p.TestHookAfterNotAfterRepublishTmpWritten = { param($tmpPath) $seen.repubCalls = 1 + [int]$seen.repubCalls\n"
+            "  if ($seen.repubCalls -eq 1) {\n"
+            "    if ($null -ne $c.repub.advance) { $sim.now = $sim.now.AddSeconds([double]$c.repub.advance) }\n"
+            "    if ($c.repub.fault -eq 'corrupt') { [IO.File]::WriteAllText($tmpPath, '{\"torn\":') }\n"
+            "    if ($c.repub.fault -eq 'steal') { [IO.File]::WriteAllText($metaPath, [string]$c.repub.other) } } } }\n"
             "$threw = ''; $lines = @()\n"
             "try { $lines = @(Invoke-UmRunDrop @p | ForEach-Object { [string]$_ }) } catch { $threw = [string]$_.Exception.Message }\n"
             "$meta = $(if (Test-Path -LiteralPath $metaPath) { [IO.File]::ReadAllText($metaPath) } else { '' })\n"
@@ -597,7 +610,7 @@ class DropRelativeNotAfterTests(unittest.TestCase):
                    "notAfterUtc": None if not_after_utc is None else "#" + not_after_utc, "budget": budget,
                    "cap": None if cap_text is None else "#" + cap_text,
                    "dropAt": ms(drop_at) if drop_at is not None else None, "advance": advance,
-                   "side": None if side_file is None else str(side_file)}
+                   "side": None if side_file is None else str(side_file), "repub": repub}
         p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], input=json.dumps(payload), capture_output=True, text=True,
                            timeout=120)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
@@ -797,6 +810,183 @@ class PlacementDelayNotAfterTests(unittest.TestCase):
         self.assertEqual(parse_o(meta["notAfterUtc"]), self.ANCHOR + timedelta(seconds=645))
 
 
+STALL_SEC = 15          # UmRunDrop.psm1 $script:UmRunNotAfterPlacementStallSec: a quarter of SLACK_SEC
+STALL_RETRIES = 3       # UmRunDrop.psm1 $script:UmRunNotAfterPlacementRetries
+
+
+@requires_windows_pwsh
+class PostSampleStallNotAfterTests(unittest.TestCase):
+    """r4 (Dot B1 on 6b542fe8, accepted by the hub as a defect): r3's final clock read is followed by the re-publish's own share I/O (the metadata write, its
+    read-back, the claim read, the replace) and the job's rename, and r3's comment bounded their COUNT, not their DURATION. Dot's trace: final sample
+    05:00:00Z, budget 7560, a 300 s metadata-I/O stall -> visible 05:05:00Z carrying 07:06:00Z, while queue + admission (120 + 7200) can keep um-run waiting
+    to 07:07:00Z. The visible job must carry a notAfterUtc covering every wait from the VISIBLE instant, or the drop must refuse typed with the job never
+    visible. Same real-drop fixture as DropRelativeNotAfterTests."""
+    ANCHOR = DropRelativeNotAfterTests.ANCHOR
+    SOL = DropRelativeNotAfterTests.SOL
+    setUp = DropRelativeNotAfterTests.setUp
+    names = DropRelativeNotAfterTests.names
+    drop = DropRelativeNotAfterTests.drop
+
+    def test_dots_trace_a_300_s_stall_after_the_final_sample_still_covers_every_wait_from_visibility(self) -> None:
+        # the claim at 04:59:00Z, a 60 s job copy, so r3's final sample is 05:00:00Z and it re-publishes 07:06:00Z; then 300 s of metadata I/O before the
+        # rename. RED at 6b542fe8: visible 05:05:00Z with 07:06:00Z, 240 s short of visibility + 7500 s.
+        r = self.drop(clock=[self.ANCHOR - timedelta(seconds=60)], bound=self.SOL, budget_from_bound=True, advance={"job": 60, "meta": 300})
+        self.assertEqual(r["threw"], "", r)
+        visible = parse_o(r["seen"]["atUtc"])
+        self.assertEqual(visible, self.ANCHOR + timedelta(seconds=300), "Dot's visible instant: 05:05:00Z")
+        seen = parse_o(json.loads(r["seen"]["meta"])["notAfterUtc"])
+        self.assertGreaterEqual(seen, visible + timedelta(seconds=120 + 7200), "queue + admission from visibility (Dot: pending to 07:07:00Z)")
+        self.assertGreaterEqual(seen, visible + timedelta(seconds=7500), "every um-run wait from visibility")
+        self.assertEqual(seen, visible + timedelta(seconds=7500 + SLACK_SEC), "re-derived from the clock read after the stall: 07:11:00Z")
+        self.assertEqual(r["seen"]["calls"], 2, "one stalled pass, then one re-derived and re-published pass")
+        self.assertEqual(json.loads(r["meta"])["notAfterUtc"], json.loads(r["seen"]["meta"])["notAfterUtc"], "nothing changes it after visibility")
+        self.assertEqual(r["names"], ["job-x.job.ps1", "job-x.meta.json"], "no temporary left")
+        self.assertEqual((r["judge"]["covered"], r["judge"]["marginSec"]), (True, SLACK_SEC), r["judge"])
+        self.assertEqual([l for l in r["lines"] if l.startswith("job not-after:")],
+                         [f"job not-after: job-x.meta.json notAfterUtc={utc_o(seen)} sampledUtc={utc_o(visible)} budgetSec=7560 capUtc=none"])
+
+    def test_a_stall_inside_the_re_publish_write_itself_is_measured_too(self) -> None:
+        # the same 300 s, spent between the re-publish's temp write and its read-back (TestHookAfterNotAfterRepublishTmpWritten, new in r4)
+        r = self.drop(clock=[self.ANCHOR - timedelta(seconds=60)], bound=self.SOL, budget_from_bound=True, advance={"job": 60}, repub={"advance": 300})
+        self.assertEqual(r["threw"], "", r)
+        visible = parse_o(r["seen"]["atUtc"])
+        self.assertEqual(visible, self.ANCHOR + timedelta(seconds=300))
+        self.assertEqual(parse_o(json.loads(r["seen"]["meta"])["notAfterUtc"]), visible + timedelta(seconds=7500 + SLACK_SEC))
+        self.assertEqual((r["seen"]["calls"], r["seen"]["repubCalls"]), (2, 2), "re-published twice: the stalled value never reached the rename")
+        self.assertTrue(r["judge"]["covered"], r["judge"])
+
+    def test_a_stall_within_the_stated_bound_proceeds_on_the_first_pass(self) -> None:
+        # STALL_SEC is the stated bound: a post-sample stall of at most that long is absorbed by the slack, not re-published
+        r = self.drop(clock=[self.ANCHOR - timedelta(seconds=60)], bound=self.SOL, budget_from_bound=True, advance={"job": 60, "meta": STALL_SEC})
+        self.assertEqual(r["threw"], "", r)
+        self.assertEqual(r["seen"]["calls"], 1)
+        visible = parse_o(r["seen"]["atUtc"])
+        seen = parse_o(json.loads(r["seen"]["meta"])["notAfterUtc"])
+        self.assertEqual(seen, self.ANCHOR + timedelta(seconds=7500 + SLACK_SEC), "the final sample's value (05:00:00Z + 7560 s)")
+        self.assertEqual(seen - visible, timedelta(seconds=7500 + SLACK_SEC - STALL_SEC), "the slack minus the stall still covers every wait")
+
+    def test_a_stall_that_never_ends_refuses_typed_and_the_job_never_becomes_visible(self) -> None:
+        r = self.drop(clock=[self.ANCHOR], bound=self.SOL, budget_from_bound=True, advance={"job": 60, "metaEvery": 300})
+        self.assertIn("UMRUN_NOT_AFTER_PLACEMENT_STALL", r["threw"], r)
+        self.assertEqual(r["seen"]["calls"], 1 + STALL_RETRIES, "bounded: the first pass and STALL_RETRIES re-derivations")
+        self.assertEqual(r["names"], [], "the claim is rolled back and no job or temporary is left")
+        self.assertFalse(any(l.startswith(("job not-after:", "submitted ")) for l in r["lines"]), r["lines"])
+
+    def test_a_cap_that_passes_during_the_post_sample_stall_refuses_and_the_job_never_becomes_visible(self) -> None:
+        # min(05:00:00Z + 7560 s, cap 05:03:00Z) is the cap; 300 s of metadata I/O after the final sample passes it. RED at 6b542fe8: visible with 05:03:00Z.
+        r = self.drop(clock=[self.ANCHOR], budget=7560, cap=self.ANCHOR + timedelta(seconds=180), advance={"meta": 300})
+        self.assertIn("UMRUN_NOT_AFTER_CAP_PASSED", r["threw"], r)
+        self.assertEqual(r["names"], [], "the claim is rolled back and no job or temporary is left")
+
+    def test_the_stall_bound_is_a_stated_fraction_of_the_submitters_slack(self) -> None:
+        drop_src = DROP_MODULE.read_text(encoding="ascii")
+        runner_src = RUNNER_MODULE.read_text(encoding="utf-8")
+        stall = int(re.search(r"^\$script:UmRunNotAfterPlacementStallSec = (\d+)", drop_src, re.M).group(1))
+        retries = int(re.search(r"^\$script:UmRunNotAfterPlacementRetries = (\d+)", drop_src, re.M).group(1))
+        slack = int(re.search(r"^\$script:DvNotAfterSlackSec = (\d+)", runner_src, re.M).group(1))
+        self.assertEqual((stall, retries, slack), (STALL_SEC, STALL_RETRIES, SLACK_SEC))
+        self.assertEqual(stall * 4, slack, "a quarter of the slack: the rest covers the single unmeasured rename and um-run's poll")
+
+
+@requires_windows_pwsh
+class RepublishRefusalTests(unittest.TestCase):
+    """r4 (Grok G4 on 6b542fe8): the re-publish's two refusals had no tests. Each must leave the job never visible; a nonce mismatch must leave the OTHER
+    submission's claim exactly as it found it (the rollback's nonce rule), never removed or rewritten."""
+    ANCHOR = DropRelativeNotAfterTests.ANCHOR
+    setUp = DropRelativeNotAfterTests.setUp
+    names = DropRelativeNotAfterTests.names
+    drop = DropRelativeNotAfterTests.drop
+
+    def test_a_torn_re_publish_write_refuses_and_the_job_never_becomes_visible(self) -> None:
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"fault": "corrupt"})
+        self.assertIn("UMRUN_JOB_METADATA_VERIFY_FAILED job-x.meta.json did not round-trip to the share (not-after re-publish)", r["threw"], r)
+        self.assertNotIn("atUtc", r["seen"], "the job never reached its rename")
+        self.assertEqual(r["names"], [], "this submission's own claim is rolled back; no job, no temporary")
+        self.assertFalse(any(l.startswith(("job not-after:", "submitted ")) for l in r["lines"]), r["lines"])
+
+    def test_a_nonce_mismatch_refuses_and_the_other_submissions_claim_survives_the_rollback_untouched(self) -> None:
+        other = '{"jobId":"job-x","nonce":"0123456789abcdef0123456789abcdef","notAfterUtc":"2026-10-24T09:00:00.0000000Z"}'
+        r = self.drop(clock=[self.ANCHOR], budget=7560, advance={"job": 30}, repub={"fault": "steal", "other": other})
+        self.assertIn("UMRUN_JOBID_IN_USE inbox\\job-x.meta.json is no longer this submission's own claim (nonce mismatch); refusing to re-publish it",
+                      r["threw"], r)
+        self.assertIn("was left untouched, not removed during rollback", r["threw"], "the rollback saw the other nonce and kept its hands off")
+        self.assertNotIn("atUtc", r["seen"], "the job never reached its rename")
+        self.assertEqual(r["names"], ["job-x.meta.json"], "only the other submission's claim: no job, no temporary")
+        self.assertEqual(r["meta"], other, "byte for byte the other submission's claim")
+
+
+@requires_windows_pwsh
+class NotAfterInputOrderTests(unittest.TestCase):
+    """r4 (Grok G2): passing both forms is UMRUN_NOT_AFTER_CONFLICT whatever the absolute value is. At 6b542fe8 the absolute value was validated first, so a
+    past or malformed -NotAfterUtc with -NotAfterBudgetSec reported UMRUN_NOT_AFTER_INVALID and hid the real mistake."""
+    ANCHOR = DropRelativeNotAfterTests.ANCHOR
+    setUp = DropRelativeNotAfterTests.setUp
+    names = DropRelativeNotAfterTests.names
+    drop = DropRelativeNotAfterTests.drop
+
+    def test_both_forms_is_a_conflict_even_when_the_absolute_value_is_invalid(self) -> None:
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for name, kw in (("past absolute + budget", {"not_after_utc": past, "budget": 600}),
+                         ("unparseable absolute + budget", {"not_after_utc": "not-a-time", "budget": 600}),
+                         ("offset-less absolute + cap", {"not_after_utc": "2099-01-01T00:00:00", "budget": 600, "cap": "2099-01-01T00:00:00Z"})):
+            with self.subTest(case=name):
+                r = self.drop(**kw)
+                self.assertIn("UMRUN_NOT_AFTER_CONFLICT", r["threw"], r)
+                self.assertEqual(r["names"], [])
+                self.assertFalse(r["copied"])
+
+
+def run_um_run_args_cases(cases: list[dict]) -> list[dict]:
+    """Each case is a Get-DvJobNotAfter-shaped result (budgetSec, notAfterUtc, capUtc, source); each answer is Get-DvUmRunNotAfterArgs' splat (sorted keys),
+    or {'error': <message>} when it threw."""
+    script = (
+        "$cases = [Console]::In.ReadToEnd() | ConvertFrom-Json\n"
+        "$out = foreach ($c in $cases) {\n"
+        "  try { $a = Get-DvUmRunNotAfterArgs -NotAfter ([pscustomobject]@{ budgetSec = $c.budgetSec; notAfterUtc = ([string]$c.notAfterUtc).TrimStart('#');\n"
+        "          capUtc = ([string]$c.capUtc).TrimStart('#'); source = [string]$c.source })\n"
+        "        $o = [ordered]@{}; foreach ($k in @($a.Keys | Sort-Object)) { $o[$k] = $(if ($a[$k] -is [int]) { $a[$k] } else { [string]$a[$k] }) }; $o }\n"
+        "  catch { [ordered]@{ error = [string]$_.Exception.Message } }\n"
+        "}\n"
+        "ConvertTo-Json -InputObject @($out) -Depth 4 -Compress\n"
+    )
+    return run_pwsh_json(script, cases)
+
+
+@requires_windows_pwsh
+class UmRunNotAfterArgsTests(unittest.TestCase):
+    """r4 (Grok G1, card NOT-AFTER-BUDGET-NULL-FAIL-CLOSED-1): Invoke-VenueLeg.ps1 passed '-NotAfterBudgetSec $notAfter.budgetSec' unconditionally, so a
+    bound with budgetSec $null bound to [int] 0, which um-run reads as 'no budget given': the job went out with NO notAfterUtc, silently. The submitter's
+    um-run arguments now come from one helper that fails closed (DVE_NOT_AFTER_BUDGET_MISSING) when a bound would be dropped."""
+    CAP = "#2026-10-24T07:00:00.0000000Z"
+
+    def test_a_null_budget_with_no_absolute_value_fails_closed(self) -> None:
+        for source in ("um-run-waits", "caller-deadline", ""):
+            with self.subTest(source=source):
+                (r,) = run_um_run_args_cases([{"budgetSec": None, "notAfterUtc": "", "capUtc": "", "source": source}])
+                self.assertIn("DVE_NOT_AFTER_BUDGET_MISSING", r.get("error", ""), r)
+
+    def test_a_zero_budget_fails_closed_too(self) -> None:
+        (r,) = run_um_run_args_cases([{"budgetSec": 0, "notAfterUtc": "", "capUtc": "", "source": "um-run-waits"}])
+        self.assertIn("DVE_NOT_AFTER_BUDGET_MISSING", r.get("error", ""), r)
+
+    def test_each_form_maps_to_its_own_um_run_arguments(self) -> None:
+        rs = run_um_run_args_cases([
+            {"budgetSec": 7560, "notAfterUtc": "", "capUtc": "", "source": "um-run-waits"},
+            {"budgetSec": 7560, "notAfterUtc": "", "capUtc": self.CAP, "source": "caller-deadline"},
+            {"budgetSec": None, "notAfterUtc": self.CAP, "capUtc": "", "source": "caller-cap"},
+            {"budgetSec": None, "notAfterUtc": "", "capUtc": "", "source": "later-harvest"},
+        ])
+        self.assertEqual(rs[0], {"NotAfterBudgetSec": 7560})
+        self.assertEqual(rs[1], {"NotAfterBudgetSec": 7560, "NotAfterCapUtc": self.CAP[1:]})
+        self.assertEqual(rs[2], {"NotAfterUtc": self.CAP[1:]})
+        self.assertEqual(rs[3], {}, "later-harvest passes no bound, by design")
+
+    def test_the_leg_takes_its_um_run_not_after_arguments_from_the_helper(self) -> None:
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="ascii")
+        self.assertTrue("Get-DvUmRunNotAfterArgs -NotAfter $notAfter" in leg, "Invoke-VenueLeg.ps1 Submit-VenueJob uses the fail-closed helper")
+        self.assertFalse("-NotAfterBudgetSec $notAfter.budgetSec" in leg, "never the unconditional [int] binding again")
+
+
 # The leg's um-run stand-in: records, per submit, every wait and the -NotAfterUtc it was handed, then answers like the shared STUB_UM_RUN (a healthy probe;
 # the leg itself ends UNRESOLVED, which is enough: the argv is what is pinned). A non-advanced param block, like every other leg stub, so an unknown name
 # would not fail binding: the record says what arrived.
@@ -967,7 +1157,9 @@ class VenueLegNotAfterTests(unittest.TestCase):
         fn = text[text.index("function Submit-VenueJob("):text.index("function ConvertTo-ShareSidePath(")]
         code = "\n".join(l for l in fn.splitlines() if not l.strip().startswith("#"))
         self.assertEqual(code.count("Get-DvJobNotAfter"), 1, "the one helper computes the bound")
-        self.assertIn("-NotAfterBudgetSec $notAfter.budgetSec", code, "r2: handed drop-relative")
+        # r2: handed drop-relative; r4 (Grok G1): through the fail-closed helper, which maps the leg's 'um-run-waits' bound to -NotAfterBudgetSec
+        self.assertIn("$notAfterArgs = Get-DvUmRunNotAfterArgs -NotAfter $notAfter", code)
+        self.assertIn("@notAfterArgs", code)
         self.assertNotIn("-NotAfterUtc", code, "r2: never the absolute form, which counts from before the drop")
         self.assertIn("-MaxAdmissionWaitSec", code)
         self.assertIn("Get-DvUmRunDropNotAfter", code, "the witness judges the drop's own value")

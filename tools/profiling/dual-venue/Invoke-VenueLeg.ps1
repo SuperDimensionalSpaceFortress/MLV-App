@@ -314,12 +314,15 @@ function Submit-VenueJob([string]$ScriptPath, [string]$JobId, [int]$TimeoutSec, 
     # UmRunDrop.psm1 counts it from its own clock just before the claim, so however late the drop lands, notAfterUtc >= drop + every um-run wait a priori.
     # The drop's own value comes back on um-run's 'job not-after:' line and is what the witness judges. Only those two information records are kept (um-run
     # also logs a line per poll for hours of admission wait).
+    # r4 (Grok G1): the not-after arguments come from Get-DvUmRunNotAfterArgs, which fails closed (DVE_NOT_AFTER_BUDGET_MISSING, an ERROR outcome, nothing
+    # submitted) where a null budgetSec would have bound to [int] 0 and dropped the bound silently.
     $records = [Collections.Generic.List[object]]::new()
     $notAfter = $null
     $submitted = try {
         $notAfter = Get-DvJobNotAfter -TimeoutSec $TimeoutSec -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec
+        $notAfterArgs = Get-DvUmRunNotAfterArgs -NotAfter $notAfter
         & $UmRunScript -ScriptPath $ScriptPath -JobId $JobId -AgentShare $agentShare -TimeoutSec $TimeoutSec `
-            -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec -MaxAdmissionWaitSec $notAfter.maxAdmissionWaitSec -NotAfterBudgetSec $notAfter.budgetSec 6>&1 |
+            -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec -MaxAdmissionWaitSec $notAfter.maxAdmissionWaitSec @notAfterArgs 6>&1 |
             ForEach-Object { if ($_ -isnot [System.Management.Automation.InformationRecord] -or [string]$_.MessageData -cmatch '^(submitted |job not-after: )') { $records.Add($_) } }
         $out = @($records | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
         $r = if ($out.Count -gt 0) { $out[-1] } else { $null }
