@@ -9039,8 +9039,13 @@ R5_VECTORS = [
 
 @requires_windows_pwsh
 class VenueProbeIdentityNoArgumentTextR5Tests(IdentityProbeMixin, unittest.TestCase):
-    setUp = VenueQuietAttributionTests.setUp
-    CHUNK = 5   # Summarize reads the top-5 CPU rows, so every vector of a chunk reaches its output too
+    CHUNK = 5
+
+    def setUp(self) -> None:
+        VenueQuietAttributionTests.setUp(self)
+        # r7: fixture paths use the temp dir's LONG spelling. A GitHub Windows runner's TEMP is C:\Users\RUNNER~1\..., and an 8.3 '~' name is now rejected as text (and
+        # GetFullPath, which expands it, would never equal the slot text either), so a fixture spelled through it could never be named.
+        self.tmp = self.tmp.resolve()   # Summarize reads the top-5 CPU rows, so every vector of a chunk reaches its output too
 
     def gate(self, probe: dict) -> subprocess.CompletedProcess:
         import os
@@ -9209,7 +9214,7 @@ class VenueBusyProbeSummaryPathRefusalR3Tests(unittest.TestCase):
 # ONE bounded worker call, walks the components without following a reparse point, and each row says why in script_check.
 @requires_windows_pwsh
 class VenueProbeScriptCheckR6Tests(IdentityProbeMixin, unittest.TestCase):
-    setUp = VenueQuietAttributionTests.setUp
+    setUp = VenueProbeIdentityNoArgumentTextR5Tests.setUp
     gate = VenueProbeIdentityNoArgumentTextR5Tests.gate
     real_file = VenueProbeIdentityNoArgumentTextR5Tests.real_file
     SLOW_MS = 20000
@@ -9322,6 +9327,140 @@ class VenueProbeScriptCheckR6Tests(IdentityProbeMixin, unittest.TestCase):
                 for token in line.split("cpuSeconds=", 1)[1].split()[1:]:
                     self.assertRegex(token, r"^[a-z_]+=\S+$", line)
                     self.assertNotIn(",", token)
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r7 (Grok G7, comment 6388632165; dot 7d1194c7): r5/r6 admitted '.' and '..' segments in the script slot, validated GetFullPath (the NORMALIZED
+# path) and persisted the ORIGINAL slot text, so C:\tok-demoValue42\..\tools\run.py validated C:\tools\run.py and wrote the ghost segment into script, cmdline, the raw JSON and the
+# gate text. Ghost spellings are now rejected as text, and what is persisted is the worker's validated full path, only when it equals the slot text case-insensitively.
+@requires_windows_pwsh
+class VenueProbeScriptGhostSegmentR7Tests(IdentityProbeMixin, unittest.TestCase):
+    setUp = VenueProbeIdentityNoArgumentTextR5Tests.setUp
+    gate = VenueProbeIdentityNoArgumentTextR5Tests.gate
+    summarize = VenueProbeIdentityNoArgumentTextR5Tests.summarize
+    persist = VenueProbeIdentityNoArgumentTextR5Tests.persist
+    real_file = VenueProbeIdentityNoArgumentTextR5Tests.real_file
+    CHUNK = 5   # Summarize reads the top-5 CPU rows
+    CALL_MS = 1500
+    LATE_MS = 250
+    SEAM = "$IdentityScriptCheckDelayMs = 0"
+
+    def vectors(self) -> list:
+        target = str(self.real_file("lane", "run.py"))                # an existing file a ghost segment walks back to
+        named = str(self.real_file("lane", f"{R5_SECRET}.py"))        # an existing file whose NAME holds the secret: r6 named it through any spelling
+        self.assertRegex(target, r"^[A-Za-z]:\\[^~/]+$", "the fixtures are long, backslash-only paths")
+        head, leaf = named.rsplit("\\", 1)
+        return [
+            # the brief's five
+            ("ghost .. over a real file", f"{target[:2]}\\tok-{R5_SECRET}\\..\\{target[3:]}"),
+            (". segment over a real file", f"{named[:2]}\\.\\{named[3:]}"),
+            ("forward slashes", f"C:/x/{R5_SECRET}.py"),
+            ("doubled backslash", f"C:\\a\\\\{R5_SECRET}.py"),
+            ("\\\\?\\ prefix", f"\\\\?\\C:\\{R5_SECRET}.py"),
+            # the same spellings of an EXISTING file (r6 validated and persisted these), plus the rule-2-only spelling and an 8.3 name
+            ("forward slashes, existing", named.replace("\\", "/")),
+            ("doubled backslash, existing", f"{head}\\\\{leaf}"),
+            ("\\\\?\\ prefix, existing", "\\\\?\\" + named),
+            ("\\\\.\\ prefix, existing", "\\\\.\\" + named),
+            ("trailing-dot segment, existing (passes every shape rule; GetFullPath drops the dot)", f"{head}.\\{leaf}"),
+            ("8.3 short name", f"C:\\PROGRA~1\\{R5_SECRET}.py"),
+        ]
+
+    def test_no_ghost_spelling_persists_its_text_and_each_is_rejected(self) -> None:
+        vecs = self.vectors()
+        for at in range(0, len(vecs), self.CHUNK):
+            chunk = vecs[at:at + self.CHUNK]
+            rows, texts = self.persist([f"python {v}" for _l, v in chunk], name="python.exe")
+            for (label, v), r in zip(chunk, rows):
+                with self.subTest(vector=label, slot=v):
+                    self.assertIsNotNone(r, label)
+                    leaked = [s for s in _r4_strings(r) if R5_SECRET in s or "tok-" in s]
+                    self.assertEqual(leaked, [], f"{label}: {v!r} persisted {leaked!r}")
+                    self.assertEqual((r["script"], r["script_check"], r["cmdline"]), (None, "rejected", "python.exe args=1 script=<none>"), r)
+            for where, text in texts:
+                with self.subTest(chunk=at, where=where):
+                    self.assertNotIn(R5_SECRET, text)
+                    self.assertNotIn("tok-", text)
+
+    def test_a_clean_real_path_is_still_named_ok_as_the_workers_validated_text(self) -> None:
+        good = str(self.real_file("lane", "run.py"))
+        lower = good[0].lower() + good[1:]
+        rows, _texts = self.persist([f"python {good} --frames 9", f"python {lower}"], name="python.exe")
+        self.assertEqual((rows[0]["script"], rows[0]["script_check"], rows[0]["cmdline"]), (good, "ok", f"python.exe args=3 script={good}"))
+        # drive-letter case is the one difference allowed; the two spellings are one candidate, so either validated spelling may be the one persisted
+        self.assertEqual(rows[1]["script_check"], "ok", rows[1])
+        self.assertIn(rows[1]["script"], (good, lower), rows[1])
+
+    def test_the_shape_rules_reject_every_ghost_spelling_as_text(self) -> None:
+        body = _ident_probe_body()
+        code = "\n".join([re.search(p, body, re.M).group(0) for p in (r"^\$identScriptShape = .*$", r"^\$identScriptRelShape = .*$", r"^\$identScriptGhostShape = .*$")]
+                         + [re.search(r"^function Get-IdentScriptSlot\(.*?\r?\n\}", body, re.S | re.M).group(0)])
+        cases = [
+            (r"C:\a\.\x.py", None, "rejected"), (r"C:\a\..\x.py", None, "rejected"), (r"C:\.\x.py", None, "rejected"), (r"C:\..\x.py", None, "rejected"),
+            ("C:/x/y.py", None, "rejected"), (r"C:\a/x.py", None, "rejected"), (r"C:\a\\x.py", None, "rejected"), (r"C:\\x.py", None, "rejected"),
+            (r"\\?\C:\x.py", None, "rejected"), (r"\\.\C:\x.py", None, "rejected"), (r"\\.\x.py", None, "rejected"), (r"C:\x.py\\", None, "rejected"), (r"C:\x\x.py/", None, "rejected"),
+            (r"C:\PROGRA~1\x.py", None, "rejected"), (r"C:\a\RUN~12.py", None, "rejected"), (r".\x.py", None, "rejected"), ("//h/s/a.py", None, "rejected"),
+            # still candidates for the worker, or typed exactly as r6 typed them
+            (r"C:\a\x.py", r"C:\a\x.py", None), (r"C:\a.b\x.py", r"C:\a.b\x.py", None), (r"C:\..a\x.py", r"C:\..a\x.py", None), (r"C:\a~b\x.py", r"C:\a~b\x.py", None),
+            (r"\\192.0.2.1\share\a.py", None, "nonfixed"), ("bench.py", None, "relative"), (r"lane\run.py", None, "relative"),
+        ]
+        harness = code + "\n" + r"""$cases = ConvertFrom-Json -InputObject $env:R7_SLOTS
+$out = foreach ($c in $cases) { $s = Get-IdentScriptSlot @('python.exe', [string]$c) 'python.exe'; [pscustomobject]@{ path = $s.path; check = $s.check } }
+ConvertTo-Json -InputObject @($out) -Compress"""
+        import os
+        job = self.tmp / "slot-shapes.ps1"
+        job.write_text(harness, encoding="utf-8")
+        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=120, env=dict(os.environ, R7_SLOTS=json.dumps([c for c, _p, _k in cases])))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        got = json.loads(proc.stdout)
+        self.assertEqual(len(got), len(cases), proc.stdout)
+        for (slot, path, check), g in zip(cases, got):
+            with self.subTest(slot=slot):
+                self.assertEqual((g["path"], g["check"]), (path, check))
+
+    def test_no_persisted_field_is_built_from_the_pre_validation_slot_text(self) -> None:
+        body = _ident_probe_body()
+        fn = re.search(r"function Protect-IdentCmdLine\(.*?\r?\n\}\r?\n", body, re.S).group(0)
+        code = "\n".join(ln for ln in fn.splitlines() if not ln.lstrip().startswith("#"))
+        # the slot text is only ever a lookup key or the comparand of the equality check
+        self.assertIn("$rc.slot.path", code, "Protect-IdentCmdLine reads the slot")
+        for m in re.finditer(r"\$rc\.slot\.path\b", code):
+            ctx = code[max(0, m.start() - 20):m.end() + 1]
+            self.assertRegex(ctx, r"ContainsKey\(\$rc\.slot\.path\)|\$ScriptChecks\[\$rc\.slot\.path\]|-ieq \$rc\.slot\.path", ctx)
+        self.assertEqual(sorted(set(re.findall(r"\$script = ([^;}\n]+)", code))), ["$null", "[string]$v.full "], "script is null or the worker's validated full path")
+        self.assertRegex(code, r"text = \$lim\.text; script = \$\(if \(\$script\)", "both persisted fields come from that $script")
+        self.assertNotIn(".slot.path", body.replace(fn, "").replace("(Read-IdentCmdLine $cim[$_].CommandLine $cim[$_].ExecutablePath $cim[$_].Name).slot.path", ""),
+                         "outside Protect-IdentCmdLine the slot text only feeds the worker's candidate list")
+        worker = re.search(r"\$IdentScriptCheckScript = \{.*?\n\}\.ToString\(\)", body, re.S).group(0)
+        self.assertIn("$full = [IO.Path]::GetFullPath([string]$p)", worker)
+        self.assertIn("$full -ine [string]$p", worker, "the worker rejects a path GetFullPath rewrites")
+        self.assertIn("full = $(if ($r -ceq 'ok') { $full } else { $null })", worker, "and hands back the full path only for ok")
+
+    def test_the_worker_table_is_copied_once_under_its_lock_and_never_read_again(self) -> None:
+        body = _ident_probe_body()
+        fn = re.search(r"function Test-IdentScriptPaths\(.*?\r?\n\}\r?\n", body, re.S).group(0)
+        code = "\n".join(ln for ln in fn.splitlines() if not ln.lstrip().startswith("#"))
+        after = code[code.index("$w = Invoke-IdentBounded $IdentScriptCheckScript"):]
+        self.assertIn("[Threading.Monitor]::Enter($out.SyncRoot)", after)
+        self.assertIn("finally { [Threading.Monitor]::Exit($out.SyncRoot) }", after)
+        reads = [ln for ln in after.split("\n")[1:] if "$out" in ln]
+        self.assertEqual(len(reads), 2, reads)   # Enter, then the one copy and its Exit
+        self.assertEqual(sum(ln.count("$out[") for ln in reads), 1, "ONE indexed read of the worker's table, inside the locked copy")
+        self.assertRegex(reads[1], r"^\s*try \{ foreach \(\$k in @\(\$out\.Keys\)\) \{ \$got\[\$k\] = \$out\[\$k\] \} \}")
+
+    def test_an_answer_just_after_the_deadline_is_ignored_and_reads_timeout(self) -> None:
+        self.assertIn(self.SEAM, _ident_probe_body())
+        script = str(self.real_file("lane", "late.py"))
+        t = IDENT_T0
+        procs = [(16892, "python", 29.1, t), (500, "pwsh", 1.0, t)]
+        cim = [_ident_cim(16892, 500, "python.exe", t, f"python {script}", r"C:\Python\python.exe"), _ident_cim(500, 0, "pwsh.exe", t, "pwsh")]
+        # the injected worker answers ok for the path LATE_MS after the call deadline
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS, body=_ident_probe_body().replace(self.SEAM, f"$IdentityScriptCheckDelayMs = {self.CALL_MS + self.LATE_MS}"),
+                                    call_ms=self.CALL_MS)
+        r = self.row(p, 16892)
+        self.assertEqual((r["script"], r["script_check"], r["cmdline"]), (None, "timeout", r"C:\Python\python.exe args=1 script=<none>"), r)
+        self.assertIn("script_check_unresolved", p["identity"]["notes"])
+        self.assertEqual((r["owner"], r["owner_status"]), ("BACHELOR\\layib", "ok"), "the next call still gets a fresh worker")
 
 
 if __name__ == "__main__":

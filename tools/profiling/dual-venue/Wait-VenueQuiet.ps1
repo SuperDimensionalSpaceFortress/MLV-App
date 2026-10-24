@@ -51,7 +51,9 @@
 #          `script` is that same path or null. SCRIPT CHECK (r6): every filesystem call for that slot (drive type, ONE attribute read per path component from the drive root,
 #          existence) runs in the bounded identity worker under the call deadline, never on the main path, so a slow or dead volume behind a local-looking path cannot hold the
 #          probe; a component that is a reparse point (junction, symlink, mount point) is never followed. Each row's `script_check` says why: ok | notfound | reparse | nonfixed
-#          | relative | rejected | timeout | error (null when the row has no readable command line; cmdline_status says why); only ok fills script. The old token scan is only the diagnostic integer cmdline_token_hits and gates nothing. Then a 200-character cap keeps the first 200
+#          | relative | rejected | timeout | error (null when the row has no readable command line; cmdline_status says why); only ok fills script. NO GHOST SEGMENTS (r7): a
+#          slot holding a '.' or '..' segment, a '/', a doubled '\', a trailing separator, a \\?\ or \\.\ prefix or an 8.3 '~<digit>' name is rejected as text, and `script` is
+#          the worker-validated full path, persisted only when it equals the slot text case-insensitively (else rejected). The old token scan is only the diagnostic integer cmdline_token_hits and gates nothing. Then a 200-character cap keeps the first 200
 #          and appends `...[+N]` (cmdline_truncated_chars = N). The contract is documented at Protect-IdentCmdLine.
 #        NON-ELEVATED DEGRADATION: the probe runs as the agent account, not elevated. What it cannot read is a TYPED status, never a guess: owner_status access-denied | exited |
 #          error-<ReturnValue> | budget-exceeded, cmdline_status / exe_status unreadable | exited, gpu_status counter-unavailable: <why> | no-gpu-context | disabled: <why>. A null
@@ -529,6 +531,8 @@ $identityProjects = @(
 #      relative path cannot be checked, the working directory is not collected) holding no whitespace, '=', '@', '?', '#', quote or ':' past the drive letter, ending in
 #      .ps1 .psm1 .py .js .mjs .cmd .bat, on a FIXED local drive, reached through NO reparse point, and naming a file that EXISTS on this host. The text test runs here; every
 #      filesystem call runs in the bounded worker (Test-IdentScriptPaths; nothing is written). Otherwise <none>, and script_check says why.
+#      r7: the text test also rejects a '.' or '..' segment, any '/', a doubled '\' after the drive root, a trailing separator, a \\?\ or \\.\ prefix and an 8.3 '~<digit>'
+#      name, and what is persisted is the WORKER's validated full path, only when it equals the slot text case-insensitively: the slot text itself is never persisted.
 #   3. the row's `script` field is that same path or null; then the 200-character cap. The token scan survives ONLY as the diagnostic integer cmdline_token_hits and gates
 #      nothing. Project attribution reads the unredacted line in memory only (Get-IdentProject) and emits a table name, never text.
 $identSecretTokens = @('pass', 'pwd', 'pw', 'secret', 'token', 'key', 'auth', 'credential', 'bearer', 'cookie', 'session')
@@ -584,14 +588,18 @@ function Split-IdentArgv([string]$s) {
 $identScriptShape = '(?i)^[a-z]:[\\/][^\s=@?#:"''*<>|]+\.(?:ps1|psm1|py|js|mjs|cmd|bat)$'
 # the same, NOT drive-rooted (no drive letter, so no ':' at all): a relative path (the working directory is not collected) or, with a leading '\\' or '//', a UNC path
 $identScriptRelShape = '(?i)^[^\s=@?#:"''*<>|-][^\s=@?#:"''*<>|]*\.(?:ps1|psm1|py|js|mjs|cmd|bat)$'
+# r7: spellings that name a file other than the text (GetFullPath would rewrite them), each rejected before any worker call: a \\?\ or \\.\ prefix, any '/', a '.' or '..'
+# segment, a doubled '\' after the drive root, a trailing separator, an 8.3 short name ('~' then a digit)
+$identScriptGhostShape = '^[\\/]{2}[?.][\\/]|/|(?:^|\\)\.{1,2}(?:\\|$)|^[A-Za-z]:.*\\\\|[\\/]$|~[0-9]'
 # rule 2 as TEXT ONLY (no filesystem call here): ONLY the first argument after the executable (or, for pwsh / powershell, the one after a first-slot -File), never a later one.
 # Returns { path, check }: path is the candidate the bounded worker must check (check $null), else path is $null and check is final: rejected (no slot argument, or its text fails
-# the allowlist), relative, or nonfixed (a UNC path is never a fixed local drive, so it is never touched).
+# the allowlist or matches a ghost shape), relative, or nonfixed (a UNC path is never a fixed local drive, so it is never touched).
 function Get-IdentScriptSlot($Argv, [string]$ExeLeaf) {
     $j = 1
     if ($ExeLeaf -match '(?i)^(pwsh|powershell)(\.exe)?$' -and $Argv.Count -gt 2 -and [string]$Argv[1] -ieq '-File') { $j = 2 }
     if ($Argv.Count -le $j) { return @{ path = $null; check = 'rejected' } }
     $p = [string]$Argv[$j]
+    if ($p -match $identScriptGhostShape) { return @{ path = $null; check = 'rejected' } }
     if ($p -match $identScriptShape) { return @{ path = $p; check = $null } }
     if ($p -match $identScriptRelShape) { return @{ path = $null; check = $(if ($p -match '^[\\/]{2}') { 'nonfixed' } else { 'relative' }) } }
     @{ path = $null; check = 'rejected' }
@@ -604,13 +612,17 @@ function Read-IdentCmdLine($CmdLine, $ExePath, $ImageName) {
     [pscustomobject]@{ argv = $argv; exe = $exe; slot = (Get-IdentScriptSlot $argv $leaf) }
 }
 # the persisted command line (contract above): { text, script, script_check, redactions, truncated, args, token_hits }. No argument text reaches `text` except the rule-2 script
-# path, and only when the worker's check of it ($ScriptChecks: path -> script_check, from Test-IdentScriptPaths) is ok; a candidate the worker never answered is error.
+# path, and only when the worker's check of it ($ScriptChecks: path -> { check, full }, from Test-IdentScriptPaths) is ok; a candidate the worker never answered is error.
+# r7: the slot text is only a lookup key and a comparand here. What is persisted is the worker's validated full path, and only when it equals the slot text case-insensitively.
 function Protect-IdentCmdLine($CmdLine, $ExePath, $ImageName, $ScriptChecks) {
     $raw = [string]$CmdLine
     $rc = Read-IdentCmdLine $raw $ExePath $ImageName
-    $check = $rc.slot.check
-    if ($null -eq $check) { $check = $(if ($null -ne $ScriptChecks -and $ScriptChecks.ContainsKey($rc.slot.path)) { [string]$ScriptChecks[$rc.slot.path] } else { 'error' }) }
-    $script = $(if ($check -ceq 'ok') { [string]$rc.slot.path } else { $null })
+    $check = $rc.slot.check; $script = $null
+    if ($null -eq $check) {
+        $v = $(if ($null -ne $ScriptChecks -and $ScriptChecks.ContainsKey($rc.slot.path)) { $ScriptChecks[$rc.slot.path] } else { $null })
+        $check = $(if ($null -ne $v) { [string]$v.check } else { 'error' })
+        if ($check -ceq 'ok') { if ([string]$v.full -ieq $rc.slot.path) { $script = [string]$v.full } else { $check = 'rejected' } }
+    }
     $nArgs = $rc.argv.Count - 1
     $lim = Limit-IdentText ("$($rc.exe) args=$nArgs script=" + $(if ($script) { $script } else { '<none>' }))
     [pscustomobject]@{
@@ -637,19 +649,20 @@ $IdentOwnerScript = {
     try { $o = Invoke-CimMethod -InputObject $args[0] -MethodName GetOwner -ErrorAction Stop; [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ ReturnValue = [int]$o.ReturnValue; Domain = [string]$o.Domain; User = [string]$o.User }; msg = $null } }
     catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
 }.ToString()
-# The script-slot check: the ONLY place a script candidate touches the filesystem. $args[0] = the candidate paths, $args[1] = a synchronized table it fills path -> script_check AS
-# IT GOES (so a deadline keeps what was already answered), $args[2] = the test seam delay. Per path: the drive must be Fixed (else nonfixed); then each component from the drive
-# root to the file has its attributes read ONCE (a GetAttributes call does not follow the component it names): a ReparsePoint stops the walk unfollowed (reparse), a missing
-# component, a non-directory before the end or a directory at the end is notfound, anything else that throws is error.
+# The script-slot check: the ONLY place a script candidate touches the filesystem. $args[0] = the candidate paths, $args[1] = a synchronized table it fills
+# path -> { check, full } AS IT GOES (so a deadline keeps what was already answered), $args[2] = the test seam delay. Per path: the full path must equal the candidate
+# case-insensitively (r7: GetFullPath expands 8.3 names, so it runs here; else rejected), the drive must be Fixed (else nonfixed); then each component from the drive root to
+# the file has its attributes read ONCE (a GetAttributes call does not follow the component it names): a ReparsePoint stops the walk unfollowed (reparse), a missing
+# component, a non-directory before the end or a directory at the end is notfound, anything else that throws is error. full is the validated path, set only for ok.
 $IdentScriptCheckScript = {
     $paths = @($args[0]); $out = $args[1]; $delayMs = [int]$args[2]
     try {
         foreach ($p in $paths) {
-            $r = 'error'
+            $r = 'error'; $full = $null
             try {
                 if ($delayMs -gt 0) { [Threading.Thread]::Sleep($delayMs) }
                 $full = [IO.Path]::GetFullPath([string]$p)
-                if ($full -notmatch '^[A-Za-z]:\\') { $r = 'rejected' }
+                if ($full -notmatch '^[A-Za-z]:\\' -or $full -ine [string]$p) { $r = 'rejected' }
                 elseif (([IO.DriveInfo]::new($full.Substring(0, 1))).DriveType -ne [IO.DriveType]::Fixed) { $r = 'nonfixed' }
                 else {
                     $parts = @($full.Substring(3).Split([char[]]@('\'), [StringSplitOptions]::RemoveEmptyEntries))
@@ -663,7 +676,7 @@ $IdentScriptCheckScript = {
                     }
                 }
             } catch { $r = 'error' }
-            $out[[string]$p] = $r
+            $out[[string]$p] = @{ check = $r; full = $(if ($r -ceq 'ok') { $full } else { $null }) }
         }
         [pscustomobject]@{ ok = $true; v = $null; msg = $null }
     } catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
@@ -732,15 +745,22 @@ function Get-IdentOwner($Row) {
         return @{ owner = $null; status = "error-$rv" }
     } finally { $osw.Stop(); $script:IdentOwnerMs += $osw.ElapsedMilliseconds }
 }
-# ONE bounded worker call for every script candidate: path -> script_check. Read back once, so an abandoned worker's late answer can never change a row: a path it had not answered
-# by the deadline is timeout, and one it never reached after a worker failure is error.
+# ONE bounded worker call for every script candidate: path -> { check, full }. As the call returns or times out, the worker's table is copied ONCE under its lock (the lock its
+# writes take), and only that copy is read: an answer the abandoned worker writes after the copy is never seen. A path missing from the copy is timeout after a deadline, else
+# error (the worker failed before reaching it).
 function Test-IdentScriptPaths($Paths) {
     $res = @{}
     $ps = @($Paths | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
     if ($ps.Count -eq 0) { return $res }
     $out = [hashtable]::Synchronized(@{})
     $w = Invoke-IdentBounded $IdentScriptCheckScript @($ps, $out, $IdentityScriptCheckDelayMs) $IdentityCallMs
-    foreach ($p in $ps) { $v = $out[$p]; $res[$p] = $(if ($null -ne $v) { [string]$v } elseif ($w.timeout) { 'timeout' } else { 'error' }) }
+    $got = @{}
+    [Threading.Monitor]::Enter($out.SyncRoot)
+    try { foreach ($k in @($out.Keys)) { $got[$k] = $out[$k] } } finally { [Threading.Monitor]::Exit($out.SyncRoot) }
+    foreach ($p in $ps) {
+        $v = $got[$p]
+        $res[$p] = $(if ($null -ne $v) { @{ check = [string]$v.check; full = $(if ($null -ne $v.full) { [string]$v.full } else { $null }) } } else { @{ check = $(if ($w.timeout) { 'timeout' } else { 'error' }); full = $null } })
+    }
     $res
 }
 # parent / grandparent: no CIM row = exited; a parent that STARTED AFTER its child is a reused pid (never named); no parent pid or no dates to compare = none
