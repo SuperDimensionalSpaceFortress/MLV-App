@@ -2951,7 +2951,7 @@ CENSUS_EXCLUDED = ("tools/coordination/Retire-LaneWorktree.ps1",)  # the guard d
 # The encoded-switch matcher is grammar-aware and lives in _encoded_sites (below); detached launches match per statement.
 DETACHED_RX = re.compile(r"Start-Process\b.*?-WindowStyle\s+['\"]?Hidden|Win32_Process.*?\bCreate\b|\[wmiclass\]|Invoke-(?:Cim|Wmi)Method\b.*?\bCreate\b", re.I)
 # Per-SITE inventories: {path: [(pin, reason), ...]}. The pin is a stable substring of the launching statement (backtick continuations joined,
-# comments dropped); the list length is the expected site COUNT in that file. A new site in a classified file, or a pinned site that moved or
+# comments dropped, `;`-separated statements split); the list length is the expected site COUNT in that file. A new site in a classified file, or a pinned site that moved or
 # vanished, fails the census just as a new file does.
 ENCODED_LAUNCH_SITES = {
     "tools/agent-bridge/wake_codex.ps1": [
@@ -3071,41 +3071,97 @@ def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir(
 B64 = "UwB0AGEAcgB0AC0AUwBsAGUAZQBwACAAMQAw"
 
 
-def _strip_comment(line):
-    """Cut a trailing `# ...` comment that sits outside any quote (backtick escapes the next char inside double quotes)."""
-    quote = None
-    i = 0
-    while i < len(line):
-        ch = line[i]
-        if quote:
-            if ch == "`" and quote == '"':
+_HERE_OPEN_RX = re.compile(r"@(['\"])[ \t]*\r?\n")
+_CONTINUATION_RX = re.compile(r"`[ \t]*\r?\n[ \t]*")
+
+
+def _statements(text):
+    """[(first physical line, statement text)] from ONE quote-aware pass over PowerShell source. Tracks '...' and "..." literals (a backtick
+    escapes inside double quotes), @'...'@ / @"..."@ here-strings, `#` line comments and `<# #>` block comments (recognised only outside
+    strings), backtick line continuations, and `;` statement separators (only outside strings and comments). A newline ends a candidate even
+    inside a multi-line string, and a here-string body is emitted line by line and split on `;` with no quote tracking, so an inner script is
+    over-reported rather than hidden. Strings stay verbatim in the statement text; comments are dropped."""
+    out, buf, start = [], [], None
+    line, i, n, quote = 1, 0, len(text), None
+
+    def put(ch):
+        nonlocal start
+        if start is None and not ch.isspace():
+            start = line
+        buf.append(ch)
+
+    def flush():
+        nonlocal buf, start
+        stmt = "".join(buf).strip()
+        if stmt:
+            out.append((start, stmt))
+        buf, start = [], None
+
+    while i < n:
+        ch = text[i]
+        if ch == "\r":
+            i += 1
+        elif ch == "\n":
+            line += 1
+            i += 1
+            flush()
+        elif quote:
+            put(ch)
+            if ch == "`" and quote == '"' and i + 1 < n and text[i + 1] not in "\r\n":
+                put(text[i + 1])
                 i += 1
             elif ch == quote:
                 quote = None
+            i += 1
+        elif text.startswith("<#", i):
+            end = text.find("#>", i + 2)
+            end = n if end < 0 else end + 2
+            line += text.count("\n", i, end)
+            put(" ")
+            i = end
+        elif ch == "#" and (not buf or buf[-1].isspace() or buf[-1] in ";({"):
+            while i < n and text[i] != "\n":
+                i += 1
+        elif ch == "`":
+            m = _CONTINUATION_RX.match(text, i)
+            if m:
+                while buf and buf[-1].isspace():
+                    buf.pop()
+                put(" ")
+                line += 1
+                i = m.end()
+            else:
+                put(ch)
+                if i + 1 < n:
+                    put(text[i + 1])
+                i += 2
+        elif (m := _HERE_OPEN_RX.match(text, i)):
+            put("@" + m.group(1))
+            flush()
+            line += 1
+            close = re.compile(r"^" + m.group(1) + "@", re.M).search(text, m.end())
+            body_end = close.start() if close else n
+            for raw in text[m.end():body_end].split("\n"):
+                if raw.strip() and not raw.lstrip().startswith("#"):
+                    out.extend((line, seg.strip()) for seg in raw.rstrip("\r").split(";") if seg.strip())
+                line += 1
+            line -= 1
+            i = body_end
+            if close:
+                put(m.group(1) + "@")
+                i += 2
         elif ch in "'\"":
             quote = ch
-        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
-            return line[:i]
-        i += 1
-    return line
-
-
-def _logical_lines(text):
-    """[(first physical line number, statement text)]: <# block #> and # comments dropped, backtick continuations joined."""
-    text = re.sub(r"<#.*?#>", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
-    out, pending, start = [], "", 0
-    for n, raw in enumerate(text.splitlines(), 1):
-        line = _strip_comment(raw).rstrip()
-        if not pending:
-            start = n
-        if line.endswith("`"):
-            pending += (line[:-1].strip() if pending else line[:-1].rstrip()) + " "
-            continue
-        out.append((start, (pending + line.lstrip() if pending else line)))
-        pending = ""
-    if pending:
-        out.append((start, pending))
-    return [(n, ln) for n, ln in out if ln.strip()]
+            put(ch)
+            i += 1
+        elif ch == ";":
+            flush()
+            i += 1
+        else:
+            put(ch)
+            i += 1
+    flush()
+    return out
 
 
 def _is_encoded_switch(word):
@@ -3123,7 +3179,7 @@ def _encoded_sites(text):
     """Launch sites that hand PowerShell a base64 program, one (line, statement) per statement. Grammar-aware: an unquoted switch only counts
     on a statement that names pwsh/powershell or another pwsh-only switch; a quoted argv element -e/-en/-enc needs that context within 4
     statements, while -ec and spellings of 4+ letters (-encodedc, -EncodedCommand) are distinctive enough to count alone."""
-    stmts = _logical_lines(text)
+    stmts = _statements(text)
     out = []
     for idx, (n, ln) in enumerate(stmts):
         for m in _SWITCH_RX.finditer(ln):
@@ -3142,7 +3198,7 @@ def _encoded_sites(text):
 
 
 def _detached_sites(text):
-    return [(n, ln) for n, ln in _logical_lines(text) if DETACHED_RX.search(ln)]
+    return [(n, ln) for n, ln in _statements(text) if DETACHED_RX.search(ln)]
 
 
 def _census_problems(sources, encoded_inventory, detached_inventory, kinds=("encoded", "detached")):
