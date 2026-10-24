@@ -777,6 +777,14 @@ if ($outcome -in @('PASS', 'FAIL') -and $unpacedVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but UNPACED_NOT_HONOURED: $($unpacedVerdict.reason). A paced run is no throughput measurement"
     $outcome = 'INVALID'
 }
+# PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON (a look leg, or generatorArgs.forceLookAssist) but whose run log does
+# not show the app running with it on (gui_smoke.visual_state look_assist_enabled=1; 0 or missing blocks) measured another look: a typed INVALID, never a PASS or FAIL.
+$lookAssistVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $runLogText
+if ($lookAssistVerdict.requested) { $receipt['lookAssist'] = [ordered]@{ requested = $true; reported = $lookAssistVerdict.reported; verdict = $lookAssistVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $lookAssistVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but LOOK_ASSIST_NOT_HONOURED: $($lookAssistVerdict.reason). A leg that did not run the look it names is no measurement under it"
+    $outcome = 'INVALID'
+}
 # A signal needs its proof. A PASS or FAIL whose receipt-oracle verdict is not valid (under 20 s of source frames, a wrap,
 # a foreign run, a fixture, or the verdict simply absent) is INVALID: a FAIL on footage that cannot be shown to be long
 # enough is not a product result either. A product FAIL the job reached AFTER its oracle passed (GPU_RECON_FRAMES_ZERO,

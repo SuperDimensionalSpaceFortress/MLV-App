@@ -260,6 +260,9 @@ private:
     // a ring scan) answer the session-summary questions (count/fps/max gap).
     static const int kSwapTelemetryRingCapacity = 2048;
     void noteRealSwap(void);
+    /* The ONE manual swap site (real swap path 2 of 3): swaps a frame painted outside Qt's paint-event cycle
+     * (grabPresentedFramebufferIfActive, paintPendingNowIfActive) and records it. Context already current. */
+    static void swapOutsidePaintEventAndRecord(GpuDisplayWindow *win, QOpenGLContext *glContext);
     /* Fate telemetry (CUDA-PLAYBACK-PRESENT-CADENCE-1): called at the START of
      * setPresentedImage()/setPresentedGpuPlaybackReconAmazePostWbTexture(), before either
      * mutates any pending state, with the NEW submission's presentationSerial. If the

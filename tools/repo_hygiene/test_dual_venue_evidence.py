@@ -1236,12 +1236,14 @@ class RunnerHarness:
                         nonce: str | None = NONCE, sheet: bool = False, line: dict | None = None, observed_nonce: str | None | bool = True,
                         manifest_nonce: str | None | bool = True, log: bool = True, result: bool = True, isolated: str | None = "run_scoped",
                         declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False,
-                        exact_summary: dict | None = None, extra_log_lines: list[str] | None = None) -> None:
+                        exact_summary: dict | None = None, extra_log_lines: list[str] | None = None,
+                        look_assist_state: str | None = "look_assist_enabled=1") -> None:
         """Write the job's artifacts the way master's generator does, INCLUDING the run's own records the receipt is re-derived
         from: the launcher's result.json (evidence.runNonce = the nonce it generated, the sha256 of the log snapshot) and
         logs/smoke-run.log (the app's playback_smoke.summary line carrying source_advanced / required_source_frames / native_fps /
         pace_fps / fps_override / wrapped / wrap_count and the run_nonce it echoed). `line` overrides summary-line fields;
-        `nonce` is the launcher's (expected) nonce, `observed_nonce` what the app echoed (True = the same one, None = none)."""
+        `nonce` is the launcher's (expected) nonce, `observed_nonce` what the app echoed (True = the same one, None = none).
+        `look_assist_state` is the app's gui_smoke.visual_state fields (Look Assist on by default, as the app ships; None = no visual_state line)."""
         self.artifacts.mkdir(parents=True, exist_ok=True)
         for stale in ("logs/smoke-run.log", "result.json", "contact-sheet/sheet.png", "contact-sheet/compose-status.txt"):
             (self.artifacts / stale).unlink(missing_ok=True)   # a case that omits a record must not inherit the previous case's
@@ -1255,6 +1257,8 @@ class RunnerHarness:
         log_lines = []
         if isolated is not None:
             log_lines.append(f"interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store={isolated}")
+        if look_assist_state is not None:
+            log_lines.append(f"interaction_trace event=gui_smoke.visual_state {look_assist_state}".rstrip())
         # a DECOY earlier session with another nonce: the measured session (the marker) is the one that counts
         log_lines += list(extra_log_lines or [])
         log_lines += ["playback_smoke.summary session=1 reason=warmup source_advanced=1 required_source_frames=1 native_fps=23.976 pace_fps=23.976 fps_override=0 wrapped=0 wrap_count=0 run_nonce=" + "0" * 32,
@@ -5031,6 +5035,55 @@ class UnpacedEvidenceTests(unittest.TestCase):
 
 
 @requires_windows_pwsh
+class LookAssistEvidenceTests(unittest.TestCase):
+    """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON counts only when the app's own LAST
+    gui_smoke.visual_state line says look_assist_enabled=1."""
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvLookAssistEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stderr)
+        return out
+
+    @staticmethod
+    def log(*state: str) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", *(f"[INFO] interaction_trace event=gui_smoke.visual_state {s}" for s in state),
+                          "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+
+    def test_a_forced_or_look_leg_is_honoured_only_with_look_assist_enabled_1(self) -> None:
+        for spec in ({"generatorArgs": {"forceLookAssist": True}}, {"legType": "look", "look": {"contactSheetFrames": 2}}):
+            with self.subTest(spec=spec):
+                v = self.verdict(spec, self.log("look_assist_enabled=1 look_assist_diagnostics_valid=1 look_assist_flavor=classic"))
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"], v["reported"]), (True, "HONOURED", False, "1"))
+
+    def test_off_missing_field_or_missing_line_blocks(self) -> None:
+        spec = {"generatorArgs": {"forceLookAssist": True}}
+        for log, needle in ((self.log("look_assist_enabled=0 look_assist_flavor=none"), "look_assist_enabled=0"),
+                            (self.log("look_assist_diagnostics_valid=1"), "carries no look_assist_enabled"),
+                            (self.log(), "no gui_smoke.visual_state line"), ("", "no gui_smoke.visual_state line")):
+            with self.subTest(needle=needle):
+                v = self.verdict(spec, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True))
+                self.assertIn(needle, v["reason"])
+
+    def test_the_last_visual_state_line_is_the_one_that_counts(self) -> None:
+        spec = {"generatorArgs": {"forceLookAssist": True}}
+        self.assertTrue(self.verdict(spec, self.log("look_assist_enabled=1", "look_assist_enabled=0"))["blocks"])
+        self.assertFalse(self.verdict(spec, self.log("look_assist_enabled=0", "look_assist_enabled=1"))["blocks"])
+
+    def test_a_leg_that_does_not_ask_never_blocks(self) -> None:
+        for spec in ({}, {"generatorArgs": {"forceLookAssist": False}}, {"generatorArgs": {"disableLookAssist": True}}):
+            v = self.verdict(spec, self.log("look_assist_enabled=0"))
+            self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), spec)
+
+    def test_the_runner_gates_on_it(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$lookAssistVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("if ($outcome -in @('PASS', 'FAIL') -and $lookAssistVerdict.blocks) {", runner)
+        self.assertIn("LOOK_ASSIST_NOT_HONOURED", runner)
+
+
+@requires_windows_pwsh
 class DisplayMatrixLegSetTests(unittest.TestCase):
     """The standard display matrix: the shipped leg set expands to the twelve cells, interleaved across repeats, every cell is an ordinary committed leg spec, and
     the leg set refuses what would not be one matrix."""
@@ -7118,19 +7171,28 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     frozen-upper-differ / frozen-upper-identical (the same record in the wrong case: "DIFFER" / "IDENTICAL"), partial-ok (six distinct pictures, but play
     frame 5 alone carries no viewport rectangle: a plain OK with a not-judged note). PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 adds two modes whose stop
     entry carries the app's binding fields: lagged (the stop capture shows an older picture than its label names: painted_serial != serial,
-    label_bound false) and bound (the unforced stop-unbound.png shows the older picture; the forced, bound stop.png matches paused.png)."""
+    label_bound false) and bound (the unforced stop-unbound.png shows the older picture; the forced, bound stop.png matches paused.png).
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 modes (a build that pairs each forced play capture with an unforced play-unbound-<k>.png, and binds the
+    paused capture too): bound also carries the paused capture's binding (label_bound true) and every bound entry its label_bound_basis;
+    bound-paused-unbound (paused label_bound false) and bound-paused-missing (paused without binding fields); paired-ok (unforced and forced play
+    frames both move); masked (the unforced play frames show ONE picture over a known-differ source while the forced ones move: the frozen display
+    the force-paint used to hide)."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     calls = []
     frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport")
+    paired = mode in ("paired-ok", "masked")
+    bound = mode in ("bound", "bound-paused-unbound", "bound-paused-missing")
     viewport = None if mode == "noviewport" else VIEWPORT
     source_difference = {"frozen": "differ", "frozen-partial": "differ", "frozen-identical": "identical",
-                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL"}.get(mode)
+                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL", "masked": "differ"}.get(mode)
     for k in range(6):
         seed = 1 if frozen else k
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
-    if mode == "bound":
+        if paired:
+            calls.append(f"New-VisPng '{dest / f'play-unbound-{k}.png'}' {1 if mode == 'masked' else k} {60 + k * 10} 0 $false")
+    if bound:
         calls.append(f"New-VisPng '{dest / 'stop-unbound.png'}' 5 120 40 $false")
     calls.append(f"New-VisPng '{dest / 'stop.png'}' 5 120 {40 if mode == 'lagged' else 0} ${'true' if mode == 'blank' else 'false'}")
     calls.append(f"New-VisPng '{dest / 'paused.png'}' 5 120 {40 if mode == 'diverge' else 0} ${'true' if mode == 'blank' else 'false'}")
@@ -7139,15 +7201,25 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     frames = [{"kind": "play", "index": k, "file": f"play-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
                "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if mode in ("frozen-partial", "partial-ok") and k == 5 else viewport), "saved": True, "reason": ""}
               for k in range(6)]
-    if mode == "bound":
+    if paired:
+        frames += [{"kind": "play_unbound", "index": k, "file": f"play-unbound-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
+                    "tail_elapsed_ms": 240 + 500 * k, "capture_ms": 40.0, "viewport": viewport, "saved": True, "reason": ""} for k in range(6)]
+    if bound:
         frames.append({"kind": "stop_unbound", "index": 0, "file": "stop-unbound.png", "display_frame": 612, "serial": 912, "painted_serial": 911,
-                       "painted_serial_valid": True, "label_bound": False, "play_active": False, "viewport": viewport, "saved": True, "reason": ""})
+                       "painted_serial_valid": True, "label_bound": False, "label_bound_basis": "gl_viewport_paint", "play_active": False, "viewport": viewport,
+                       "saved": True, "reason": ""})
     stop = {"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""}
-    if mode in ("lagged", "bound"):
-        stop.update({"serial": 912, "painted_serial": 911 if mode == "lagged" else 912, "painted_serial_valid": True, "label_bound": mode == "bound"})
+    if mode == "lagged" or bound:
+        stop.update({"serial": 912, "painted_serial": 911 if mode == "lagged" else 912, "painted_serial_valid": True, "label_bound": bound})
+    if bound:
+        stop["label_bound_basis"] = "pixmap_item_by_construction"
     frames.append(stop)
-    frames.append({"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
-                   "viewport": viewport, "saved": True, "reason": ""})
+    paused = {"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
+              "viewport": viewport, "saved": True, "reason": ""}
+    if mode in ("bound", "bound-paused-unbound"):
+        paused.update({"serial": 913, "painted_serial": 913 if mode == "bound" else 912, "painted_serial_valid": True, "label_bound": mode == "bound",
+                       "label_bound_basis": "pixmap_item_by_construction"})
+    frames.append(paused)
     visual = {"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
               "tail_begin_utc": "2026-10-13T22:00:00.000Z", "tail_end_utc": "2026-10-13T22:00:03.100Z",
               "frames": frames, "frames_written": 8, "error": ""}
@@ -7356,13 +7428,15 @@ class VisualCaptureVenueHelperTests(unittest.TestCase):
             src = Path(d, "src")
             src.mkdir()
             Path(d, "pub").mkdir()
-            for name in ("play-0.png", "stop-unbound.png", "stop.png", "paused.png", "visual.json", "stray.png", "stop-unbound.png.tmp"):
+            # (TIMING-2 r2: the unforced play captures, play-unbound-<k>.png, the frozen check is judged on, and paused-unbound.png are published too)
+            for name in ("play-0.png", "play-unbound-0.png", "stop-unbound.png", "stop.png", "paused-unbound.png", "paused.png", "visual.json", "stray.png",
+                         "stop-unbound.png.tmp", "play-unbound.png"):
                 Path(src, name).write_bytes(b"x")
             proc = self.run_module(f"$pub = Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}'; "
                                    "(Get-ChildItem -LiteralPath $pub -File | ForEach-Object Name | Sort-Object) -join ','")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.strip().splitlines()[-1],
-                             "paused.png,play-0.png,stop-unbound.png,stop.png,visual-capture-request.json,visual.json")
+                             "paused-unbound.png,paused.png,play-0.png,play-unbound-0.png,stop-unbound.png,stop.png,visual-capture-request.json,visual.json")
 
     def test_the_visual_tail_is_cut_off_the_presentmon_window_and_never_extends_it(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-pm-") as d:
@@ -7582,17 +7656,22 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             self.assertEqual(files["unit-leg-stop-unbound.png"]["sha256"], hashlib.sha256(local.read_bytes()).hexdigest())
             self.assertEqual((files["unit-leg-stop.png"]["paintedSerial"], files["unit-leg-stop.png"]["serial"]), (912, 912))
             self.assertTrue(Path(out["stripPath"]).is_file())
+            self.assertIs(out["pausedLabelBound"], True)
 
     def test_the_visual_gate_says_capture_unbound_before_divergence(self) -> None:
-        rows = [  # labelBound, mad -> verdict
-            ("$false", "30.0", "CAPTURE_UNBOUND"), ("$false", "2.0", "CAPTURE_UNBOUND"),
-            ("$true", "30.0", "VISUAL_DIVERGENCE"), ("$true", "2.0", "OK"),
-            ("$null", "30.0", "VISUAL_DIVERGENCE"), ("$null", "2.0", "OK"),
+        rows = [  # labelBound (stop), pausedLabelBound, mad -> verdict
+            ("$false", "$true", "30.0", "CAPTURE_UNBOUND"), ("$false", "$true", "2.0", "CAPTURE_UNBOUND"),
+            ("$true", "$true", "30.0", "VISUAL_DIVERGENCE"), ("$true", "$true", "2.0", "OK"),
+            ("$null", "$null", "30.0", "VISUAL_DIVERGENCE"), ("$null", "$null", "2.0", "OK"),
+            # r2 (bound paused capture): the divergence compares two captures, so BOTH must be bound; a binding build missing one side fails closed
+            ("$true", "$false", "30.0", "CAPTURE_UNBOUND"), ("$true", "$false", "2.0", "CAPTURE_UNBOUND"),
+            ("$true", "$null", "30.0", "CAPTURE_UNBOUND"), ("$true", "$null", "2.0", "CAPTURE_UNBOUND"),
+            ("$null", "$true", "30.0", "CAPTURE_UNBOUND"), ("$false", "$false", "2.0", "CAPTURE_UNBOUND"),
         ]
-        for bound, mad, verdict in rows:
-            with self.subTest(bound=bound, mad=mad):
+        for bound, paused_bound, mad, verdict in rows:
+            with self.subTest(bound=bound, paused=paused_bound, mad=mad):
                 proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 6 -AppDistinctDisplayFrames 6 "
-                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff {mad} -SamePosition $true -LabelBound {bound} | ConvertTo-Json -Compress")
+                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff {mad} -SamePosition $true -LabelBound {bound} -PausedLabelBound {paused_bound} | ConvertTo-Json -Compress")
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual((out["verdict"], out["counted"]), (verdict, True))
         # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: FROZEN_DISPLAY needs source frames known to differ; over an unknown source it is SUSPECTED, which outranks too)
@@ -7602,6 +7681,50 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                           f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true -SourceDifference {source} -LabelBound $false | ConvertTo-Json -Compress")
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual(out["verdict"], frozen, "a frozen display outranks an unbound stop capture")
+
+    def test_the_visual_reader_requires_the_paused_capture_bound_before_a_divergence_verdict(self) -> None:
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f improvement; DualVenueRunner.psm1 Read-DvVisualCaptures): the stop-vs-paused difference is only
+        # a verdict when BOTH of its captures are bound to their labels. r1 required it of the stop capture alone.
+        for mode, paused_bound in (("bound-paused-unbound", False), ("bound-paused-missing", None)):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
+                _, out = self.read_visual_mode(mode, d)
+                self.assertEqual((out["verdict"], out["counted"]), ("CAPTURE_UNBOUND", True), out["reason"])
+                self.assertIs(out["labelBound"], True)
+                self.assertIs(out["pausedLabelBound"], paused_bound)
+                self.assertIn("paused re-render capture", out["reason"])
+        with tempfile.TemporaryDirectory(prefix="vis-bound-both-") as d:
+            _, out = self.read_visual_mode("bound", d)
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertEqual((out["labelBound"], out["pausedLabelBound"]), (True, True))
+            # label_bound_basis (Dot improvement: the pixmap route's binding holds by construction) is carried, never dropped
+            self.assertEqual((out["labelBoundBasis"], out["pausedLabelBoundBasis"]), ("pixmap_item_by_construction", "pixmap_item_by_construction"))
+            files = {f["file"]: f for f in out["frames"]}
+            self.assertEqual(files["unit-leg-stop-unbound.png"]["labelBoundBasis"], "gl_viewport_paint")
+
+    def test_the_visual_reader_judges_a_frozen_display_on_the_unforced_play_captures(self) -> None:
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f B2, CoS 6219217683): the forced play captures paint the frame the label names first, so a display
+        # whose own deferred paint never lands still showed six moving pictures. The app now pairs each with an unforced capture; the gate judges those.
+        with tempfile.TemporaryDirectory(prefix="vis-masked-") as d:
+            ev, out = self.read_visual_mode("masked", d)
+            self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+            self.assertEqual(out["frozenJudgedOn"], "play_unbound")
+            self.assertEqual((out["playFrames"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"]), (6, 1, 6))
+            self.assertEqual(out["playForcedUnforcedDifferFrames"], 5, "play 1 is the one index whose forced and unforced pictures agree")
+            self.assertIn("the force-paint would have masked this", out["reason"])
+            names = sorted(f["file"] for f in out["frames"])
+            self.assertEqual(names, sorted([f"unit-leg-play-{k}.png" for k in range(6)] + [f"unit-leg-play-unbound-{k}.png" for k in range(6)]
+                                           + ["unit-leg-stop.png", "unit-leg-paused.png"]))
+            for f in out["frames"]:
+                self.assertEqual(f["sha256"], hashlib.sha256((ev / "visual" / f["file"]).read_bytes()).hexdigest())
+        with tempfile.TemporaryDirectory(prefix="vis-paired-") as d:
+            _, out = self.read_visual_mode("paired-ok", d)
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertEqual((out["frozenJudgedOn"], out["distinctContentHashes"], out["playForcedUnforcedDifferFrames"]), ("play_unbound", 6, 0))
+            self.assertTrue(Path(out["stripPath"]).is_file())
+        with tempfile.TemporaryDirectory(prefix="vis-old-") as d:
+            _, out = self.read_visual_mode("ok", d)
+            self.assertEqual((out["frozenJudgedOn"], out["forcedPlayDistinctContentHashes"], out["playForcedUnforcedDifferFrames"]), ("play", None, None),
+                             "a build without unforced play captures is judged on its play captures, as before")
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;
@@ -7866,6 +7989,35 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
         self.assertIn("CAPTURE_UNBOUND", receipt["outcomeDetail"])
         self.assertEqual((receipt["visual"]["verdict"], receipt["visual"]["labelBound"]), ("CAPTURE_UNBOUND", False))
+
+    def test_a_frozen_display_the_force_paint_would_have_masked_is_not_counted(self) -> None:
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f B2): judged on the unforced play captures, end to end through the runner
+        _, receipt, _ = self.run_visual("masked")
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("FROZEN_DISPLAY", receipt["outcomeDetail"])
+        self.assertIn("would have masked", receipt["outcomeDetail"])
+        self.assertEqual((receipt["visual"]["frozenJudgedOn"], receipt["visual"]["counted"]), ("play_unbound", False))
+
+    def test_a_look_assist_on_leg_that_ran_without_it_is_invalid(self) -> None:
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b): a speed leg whose spec forces Look Assist on fails closed unless the app's own visual_state says
+        # look_assist_enabled=1; 0 or a missing record is a typed INVALID. A leg that does not ask is unchanged.
+        spec = self.speed_spec(generatorArgs={"forceLookAssist": True})
+        for state, outcome in (("look_assist_enabled=1", "PASS"), ("look_assist_enabled=0", "INVALID"), ("", "INVALID"), (None, "INVALID")):
+            with self.subTest(state=state):
+                self.write_artifacts(look_assist_state=state)
+                write_visual_captures(self.artifacts / "visual", "ok")
+                _, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
+                self.assertEqual(receipt["outcome"], outcome, receipt["outcomeDetail"])
+                self.assertEqual(receipt["lookAssist"]["requested"], True)
+                if outcome == "INVALID":
+                    self.assertIn("LOOK_ASSIST_NOT_HONOURED", receipt["outcomeDetail"])
+                else:
+                    self.assertEqual((receipt["lookAssist"]["reported"], receipt["lookAssist"]["verdict"]), ("1", "HONOURED"))
+        self.write_artifacts(look_assist_state="look_assist_enabled=0")
+        write_visual_captures(self.artifacts / "visual", "ok")
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertNotIn("lookAssist", receipt, "a leg that does not ask for Look Assist records nothing about it")
 
     def test_a_single_picture_over_an_unknown_or_identical_source_is_counted_and_surfaced(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: only a source KNOWN to differ voids the leg. Unknown is surfaced in the detail (counted); identical is OK;
@@ -8134,7 +8286,7 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         block = body[body.index("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"):body.index("// Contact-sheet files. Deliberately placed AFTER")]
         self.assertGreater(body.index("if( !options.visualCaptureDir.isEmpty()"), reached, "the capture only follows a measured Play that REACHED its stop")
         close = block.index('finishPlaybackSmokeTelemetry( "visual-capture" );')
-        self.assertLess(close, block.index('grabVisual( QStringLiteral("play"), k, false );'), "the measured session closes before the first capture")
+        self.assertLess(close, block.index('grabVisual( QStringLiteral("play_unbound"), k, false );'), "the measured session closes before the first capture")
         self.assertLess(block.index('grabVisual( QStringLiteral("play"), k, false );'), block.index("ui->actionPlay->setChecked( false );"))
         self.assertLess(block.index("ui->actionPlay->setChecked( false );"), block.index('grabVisual( QStringLiteral("stop"), 0, false );'))
         self.assertLess(block.index('grabVisual( QStringLiteral("stop"), 0, false );'), block.index('seekAndSettleLoadedClip( visualStopFrame, "gui-smoke-visual-capture-paused"'))
@@ -8160,8 +8312,21 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         self.assertLess(block.index("ui->actionPlay->setChecked( false );"), block.index(unbound))
         self.assertLess(block.index(unbound), block.index('grabVisual( QStringLiteral("stop"), 0, false );'))
         self.assertNotIn("processEvents(", block[block.index(unbound):block.index('grabVisual( QStringLiteral("stop"), 0, false );')])
-        for field in ('"painted_serial"', '"painted_serial_valid"', '"label_bound"'):
+        for field in ('"painted_serial"', '"painted_serial_valid"', '"label_bound"', '"label_bound_basis"'):
             self.assertIn(f"QStringLiteral({field})", block)
+        # TIMING-2 r2 (Dot 6d0e710f B2): every forced play capture is paired with an unforced one taken just before it, with no event between, and only
+        # the "_unbound" kinds skip the paint -- the frozen check is judged on them, so the force-paint can no longer mask a frozen display
+        play_unbound = 'grabVisual( QStringLiteral("play_unbound"), k, false );'
+        play = 'grabVisual( QStringLiteral("play"), k, false );'
+        paused_unbound = 'grabVisual( QStringLiteral("paused_unbound"), 0, visualSettled );'
+        paused = 'grabVisual( QStringLiteral("paused"), 0, visualSettled );'
+        for unforced, forced in ((play_unbound, play), (paused_unbound, paused)):
+            self.assertLess(block.index(unforced), block.index(forced))
+            self.assertNotIn("processEvents(", block[block.index(unforced):block.index(forced)])
+        self.assertIn('!kind.endsWith( QStringLiteral("_unbound") )', lam)
+        # where the painted serial came from is named (the pixmap route's binding holds by construction)
+        for basis in ('"gl_window_paint"', '"gl_viewport_paint"', '"pixmap_item_by_construction"', '"none"'):
+            self.assertIn(f"QStringLiteral({basis})", src)
 
 
 if __name__ == "__main__":
