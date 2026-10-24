@@ -16,6 +16,8 @@
 #include <QTemporaryDir>
 
 #include <chrono>
+#include <cmath>
+#include <functional>
 #include <future>
 #include <thread>
 
@@ -266,6 +268,19 @@ static ChildSample sample_child(qint64 pid)
     return sample;
 }
 
+// What the parent had seen when a run's bound expired, frozen before the kill. The final drain after
+// the kill may still add late output to the shown tail, but never moves these, so the timeout report
+// measures silence and CPU intervals against that one instant.
+struct TimeoutSnapshot {
+    bool saw_output = false;
+    qint64 last_output_ms = 0;
+    bool saw_stage = false;
+    qint64 last_stage_ms = 0;
+    QByteArray last_stage_line;
+    qint64 output_bytes = 0;
+    ChildSample child_at_last_stage;
+};
+
 struct ProcessRunResult {
     bool started = false;
     bool timed_out = false;
@@ -276,7 +291,8 @@ struct ProcessRunResult {
     qint64 output_total_bytes = 0;
     QString error_string;
     // On the run clock: when the last output arrived and when the last helper stage line arrived
-    // (each only if one did), and the stage line itself.
+    // (each only if one did), and the stage line itself. These include the final drain after a kill;
+    // a timeout report reads `at_kill` instead.
     bool saw_output = false;
     qint64 last_output_ms = 0;
     bool saw_stage = false;
@@ -287,14 +303,17 @@ struct ProcessRunResult {
     bool output_channel_open = false;  // the merged stdout+stderr pipe
     ChildSample child_at_kill;
     ChildSample child_at_last_stage;
+    TimeoutSnapshot at_kill;
     bool ok() const { return started && !timed_out && !crashed && exit_code == 0; }
 };
 
+// `kill_child` replaces QProcess::kill when the bound expires; only tests pass one.
 static ProcessRunResult run_process_bounded(const QString & program,
                                             const QStringList & arguments,
                                             const QString & working_directory,
                                             const QProcessEnvironment & environment,
-                                            int timeout_ms)
+                                            int timeout_ms,
+                                            const std::function<void(QProcess &)> & kill_child = {})
 {
     ProcessRunResult result;
     QProcess process;
@@ -329,7 +348,8 @@ static ProcessRunResult run_process_bounded(const QString & program,
         output.append(chunk);
         result.saw_output = true;
         result.last_output_ms = timer.elapsed();
-        if (stages.append(chunk, result.last_output_ms)) {
+        // After the kill the pid may already name another process, so it is not sampled again.
+        if (stages.append(chunk, result.last_output_ms) && !result.timed_out) {
             result.child_at_last_stage = sample_child(pid);
         }
     };
@@ -343,7 +363,18 @@ static ProcessRunResult run_process_bounded(const QString & program,
             result.killed_at_ms = timer.elapsed();
             result.output_channel_open = !output_channel_closed;
             result.child_at_kill = sample_child(pid);
-            process.kill();
+            result.at_kill.saw_output = result.saw_output;
+            result.at_kill.last_output_ms = result.last_output_ms;
+            result.at_kill.saw_stage = stages.seen();
+            result.at_kill.last_stage_ms = stages.last_ms();
+            result.at_kill.last_stage_line = stages.last_line();
+            result.at_kill.output_bytes = output.total_bytes();
+            result.at_kill.child_at_last_stage = result.child_at_last_stage;
+            if (kill_child) {
+                kill_child(process);
+            } else {
+                process.kill();
+            }
             process.waitForFinished(10 * 1000);
             break;
         }
@@ -423,25 +454,29 @@ static QString describe_process_failure(const QString & label,
     }
     int tail_bytes = kOutputTailBytes;
     if (result.timed_out) {
-        // What the parent saw just before the kill: how long the child had been silent, the last stage
-        // it named, whether its output pipe was still open, and its CPU time (growing = spin).
+        // What the parent saw just before the kill, all from the snapshot taken then: how long the child
+        // had been silent, the last stage it named, whether its output pipe was still open, its CPU time
+        // (growing = spin), and how much it printed by then and after.
+        const TimeoutSnapshot & snapshot = result.at_kill;
         const auto seconds_since = [&result](bool seen, qint64 at_ms) {
             return seen ? QString::number((result.killed_at_ms - at_ms) / 1000.0, 'f', 1) : QStringLiteral("none");
         };
         const ChildSample & at_kill = result.child_at_kill;
-        const ChildSample & at_stage = result.child_at_last_stage;
+        const ChildSample & at_stage = snapshot.child_at_last_stage;
         text += QStringLiteral("\nAVX_PARITY_HELPER_TIMEOUT_SNAPSHOT since_last_output_s=%1 since_last_stage_s=%2"
                                " merged_output_channel=%3 child_threads=%4 child_cpu_s=%5 child_cpu_since_last_stage_s=%6"
-                               " last_stage=\"%7\"")
-                    .arg(seconds_since(result.saw_output, result.last_output_ms),
-                         seconds_since(result.saw_stage, result.last_stage_ms),
+                               " output_bytes_at_kill=%7 late_output_bytes=%8 last_stage=\"%9\"")
+                    .arg(seconds_since(snapshot.saw_output, snapshot.last_output_ms),
+                         seconds_since(snapshot.saw_stage, snapshot.last_stage_ms),
                          result.output_channel_open ? QStringLiteral("open") : QStringLiteral("closed"),
                          at_kill.has_threads ? QString::number(at_kill.threads) : QStringLiteral("unknown"),
                          at_kill.has_cpu ? QString::number(at_kill.cpu_ms / 1000.0, 'f', 1) : QStringLiteral("unknown"),
                          at_kill.has_cpu && at_stage.has_cpu
                              ? QString::number((at_kill.cpu_ms - at_stage.cpu_ms) / 1000.0, 'f', 1)
                              : QStringLiteral("unknown"),
-                         QString::fromLocal8Bit(result.last_stage_line));
+                         QString::number(snapshot.output_bytes),
+                         QString::number(result.output_total_bytes - snapshot.output_bytes),
+                         QString::fromLocal8Bit(snapshot.last_stage_line));
         tail_bytes = kTimeoutOutputTailBytes;
     }
     text += QStringLiteral("\n--- helper output tail (last %1 bytes of %2 bytes total) ---\n")
@@ -687,6 +722,12 @@ TEST(AvxParity, InjectedOpenClipStallIsNamedByTheHelperStallReport)
     ASSERT_TRUE(output.contains(QStringLiteral("AVX_PARITY_HELPER_STALL report=1 ")));
     ASSERT_TRUE(named_quiesce_wait);
     ASSERT_TRUE(named_main_frame);
+    // The clip fields are read without the clip lock and without synchronization, and say so.
+    ASSERT_TRUE(output.contains(QStringLiteral("AVX_PARITY_HELPER_STALL probe read=\"unsynchronized best-effort read\" fixture=open ")));
+#ifdef Q_OS_WIN
+    // The stack words are scanned, not unwound, and say so.
+    ASSERT_TRUE(output.contains(QStringLiteral("return-address candidates (stack scan, not unwound)")));
+#endif
     ASSERT_TRUE(text.contains(QStringLiteral("AVX_PARITY_HELPER_TIMEOUT_SNAPSHOT ")));
     ASSERT_TRUE(text.contains(QStringLiteral("last_stage=\"avx_parity_helper t=")));
     ASSERT_TRUE(text.contains(QStringLiteral("merged_output_channel=open")));
@@ -921,13 +962,121 @@ TEST(AvxParityRunner, TimeoutSnapshotNamesTheLastStageAndHowLongTheChildWasSilen
                                                   shell,
                                                   result,
                                                   QDir(QDir::tempPath()).filePath(QStringLiteral("no-such-hashes.json")));
-    const QString since = QString::number((result.killed_at_ms - result.last_stage_ms) / 1000.0, 'f', 1);
+    const QString since = QString::number((result.killed_at_ms - result.at_kill.last_stage_ms) / 1000.0, 'f', 1);
     ASSERT_TRUE(text.contains(QStringLiteral("AVX_PARITY_HELPER_TIMEOUT_SNAPSHOT ")));
     ASSERT_TRUE(text.contains(QStringLiteral("since_last_stage_s=%1 ").arg(since)));
     ASSERT_TRUE(text.contains(QStringLiteral("merged_output_channel=open")));
     ASSERT_TRUE(text.contains(QStringLiteral("last_stage=\"avx_parity_helper t=1ms stage=open-clip stand-in\"")));
 #ifdef Q_OS_WIN
     ASSERT_FALSE(text.contains(QStringLiteral("child_threads=unknown")));
+#endif
+}
+
+// Prints one stage line, then hangs silently until `kill_signal` exists; it then prints a late stage
+// line and a marker before it dies. That output reaches the parent only in the final drain.
+static QStringList stage_hang_then_late_output_arguments(const QString & kill_signal)
+{
+    return stand_in_arguments(
+        QStringLiteral("[Console]::Error.WriteLine('avx_parity_helper t=1ms stage=open-clip stand-in'); "
+                       "[Console]::Error.Flush(); "
+                       "while (-not (Test-Path -LiteralPath '%1')) { Start-Sleep -Milliseconds 50 }; "
+                       "[Console]::Error.WriteLine('avx_parity_helper t=2ms stage=late-after-kill stand-in'); "
+                       "[Console]::Error.WriteLine('AVX_PARITY_LATE_OUTPUT_MARKER'); [Console]::Error.Flush(); "
+                       "Start-Sleep -Seconds 60")
+            .arg(kill_signal),
+        QStringLiteral("echo 'avx_parity_helper t=1ms stage=open-clip stand-in' >&2; "
+                       "while [ ! -e '%1' ]; do sleep 0.05; done; "
+                       "echo 'avx_parity_helper t=2ms stage=late-after-kill stand-in' >&2; "
+                       "echo AVX_PARITY_LATE_OUTPUT_MARKER >&2; sleep 60")
+            .arg(kill_signal));
+}
+
+// Stands in for the kill: lets the run clock move on, signals the child that it is being killed,
+// waits until its late output is buffered, then kills it.
+static void kill_after_late_output(QProcess & process, const QString & kill_signal)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    QFile signal_file(kill_signal);
+    ASSERT_TRUE(signal_file.open(QIODevice::WriteOnly));
+    signal_file.close();
+    QElapsedTimer waited;
+    waited.start();
+    while (!process.peek(process.bytesAvailable()).contains("AVX_PARITY_LATE_OUTPUT_MARKER")
+           && waited.elapsed() < 10000) {
+        process.waitForReadyRead(250);
+    }
+    process.kill();
+}
+
+// The number after `key=` in `text`, or NaN when it is missing or not a number.
+static double snapshot_number(const QString & text, const QString & key)
+{
+    const QRegularExpressionMatch match =
+        QRegularExpression(QStringLiteral("[ \\n]%1=(-?[0-9]+(?:\\.[0-9]+)?)[ \\n]").arg(QRegularExpression::escape(key)))
+            .match(text);
+    return match.hasMatch() ? match.captured(1).toDouble() : std::nan("");
+}
+
+TEST(AvxParityRunner, OutputAfterTheKillNeverMovesTheTimeoutSnapshot)
+{
+    const QString shell = stand_in_shell();
+    if (shell.isEmpty()) {
+        SKIP_TEST("no shell found to stand in for a hung helper");
+    }
+
+    QTemporaryDir scratch;
+    ASSERT_TRUE(scratch.isValid());
+    const QString kill_signal = scratch.filePath(QStringLiteral("kill.signal"));
+    const ProcessRunResult result = run_process_bounded(shell,
+                                                        stage_hang_then_late_output_arguments(kill_signal),
+                                                        QDir::tempPath(),
+                                                        QProcessEnvironment::systemEnvironment(),
+                                                        4000,
+                                                        [&kill_signal](QProcess & process) {
+                                                            kill_after_late_output(process, kill_signal);
+                                                        });
+    const QString text = describe_process_failure(QStringLiteral("default"),
+                                                  shell,
+                                                  result,
+                                                  QDir(QDir::tempPath()).filePath(QStringLiteral("no-such-hashes.json")));
+    std::cout << "AVX_LATE_OUTPUT_EVIDENCE " << text.toStdString() << "\n";
+
+    ASSERT_TRUE(result.timed_out);
+    // The late output is still shown in the tail.
+    ASSERT_TRUE(result.output.contains("AVX_PARITY_LATE_OUTPUT_MARKER"));
+    ASSERT_TRUE(text.contains(QStringLiteral("AVX_PARITY_LATE_OUTPUT_MARKER")));
+    // The snapshot reports what the parent saw when the bound expired: silence is never negative,
+    // and the last stage is the one printed before the kill.
+    const double since_output = snapshot_number(text, QStringLiteral("since_last_output_s"));
+    const double since_stage = snapshot_number(text, QStringLiteral("since_last_stage_s"));
+    ASSERT_TRUE(since_output >= 0.0);
+    ASSERT_TRUE(since_stage >= 0.0);
+    ASSERT_TRUE(text.contains(QStringLiteral("last_stage=\"avx_parity_helper t=1ms stage=open-clip stand-in\"")));
+    ASSERT_FALSE(text.contains(QStringLiteral("last_stage=\"avx_parity_helper t=2ms stage=late-after-kill")));
+    // The byte count at the kill, and how much arrived after it.
+    const double bytes_at_kill = snapshot_number(text, QStringLiteral("output_bytes_at_kill"));
+    const double late_bytes = snapshot_number(text, QStringLiteral("late_output_bytes"));
+    ASSERT_TRUE(bytes_at_kill > 0.0);
+    ASSERT_TRUE(late_bytes > 0.0);
+    ASSERT_TRUE(bytes_at_kill + late_bytes == static_cast<double>(result.output_total_bytes));
+    // The snapshot holds what was seen before the kill, and the final drain did not move it.
+    const TimeoutSnapshot & snapshot = result.at_kill;
+    ASSERT_TRUE(snapshot.saw_output);
+    ASSERT_TRUE(snapshot.saw_stage);
+    ASSERT_TRUE(snapshot.last_output_ms <= result.killed_at_ms);
+    ASSERT_TRUE(snapshot.last_stage_ms <= result.killed_at_ms);
+    ASSERT_TRUE(snapshot.last_stage_line == QByteArray("avx_parity_helper t=1ms stage=open-clip stand-in"));
+    ASSERT_EQ(static_cast<qint64>(bytes_at_kill), snapshot.output_bytes);
+    ASSERT_TRUE(result.output.left(snapshot.output_bytes).contains("stage=open-clip"));
+    ASSERT_FALSE(result.output.left(snapshot.output_bytes).contains("AVX_PARITY_LATE_OUTPUT_MARKER"));
+    ASSERT_TRUE(result.output.mid(snapshot.output_bytes).contains("stage=late-after-kill"));
+    // The run-wide fields did see the late output, after the kill.
+    ASSERT_TRUE(result.last_output_ms > result.killed_at_ms);
+    ASSERT_TRUE(result.last_stage_line == QByteArray("avx_parity_helper t=2ms stage=late-after-kill stand-in"));
+#ifdef Q_OS_WIN
+    ASSERT_TRUE(snapshot.child_at_last_stage.has_cpu);
+    // Both CPU samples come from before the kill, so the interval between them is never negative.
+    ASSERT_TRUE(snapshot_number(text, QStringLiteral("child_cpu_since_last_stage_s")) >= 0.0);
 #endif
 }
 

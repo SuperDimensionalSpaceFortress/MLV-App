@@ -98,8 +98,10 @@ param(
     [int]$MaxAdmissionWaitSec = 7200,
     # LEASE-REQUEST-CHILD-NOT-AFTER-1: the agent's absolute deadline for this job (an ISO-8601 instant with a Z or +hh:mm
     # offset; see UmRunDrop.psm1). The Bachelor agent takes no lease for the job and does not start it after notAfterUtc, up to
-    # its prelaunch window (its last check sits just before the child is created); clock skew between this host and the agent,
-    # a frozen agent and another agent are out of scope. '' (the default) sends none, and
+    # its prelaunch window (its last check sits just before the child is created). A lease it requested before notAfterUtc that
+    # turns active inside a light job the agent runs during that wait is not renewed after notAfterUtc (a renew already in flight
+    # is collected or killed), but stays held, unrenewed, until that light job returns (heavy-slot.py marks it stale at 120 s).
+    # Clock skew between this host and the agent, a frozen agent and another agent are out of scope. '' (the default) sends none, and
     # this script never derives one: callers that read the result by name after this client stops waiting (#633,
     # VenueChain) still want such a job run.
     [string]$NotAfterUtc = '',
