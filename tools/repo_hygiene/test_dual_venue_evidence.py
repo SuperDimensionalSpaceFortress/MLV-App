@@ -8102,6 +8102,7 @@ import datetime as _ident_dt
 
 IDENT_SCHEMA = "mlv-app/venue-quiet-probe-identity/v1"
 IDENT_T0 = _ident_dt.datetime(2026, 10, 24, 1, 2, 3, tzinfo=_ident_dt.timezone.utc)
+R6_SCRIPT_CHECKS = ("ok", "notfound", "reparse", "nonfixed", "relative", "rejected", "timeout", "error")   # the closed script_check enum (r6)
 _IDENT_EPOCH = _ident_dt.datetime(1601, 1, 1, tzinfo=_ident_dt.timezone.utc)
 
 # Get-Counter shadow that also accepts -MaxSamples (the identity block's GPU read passes it); a canned set past the end of the list answers with no samples
@@ -8172,14 +8173,19 @@ def _ident_probe_body() -> str:
 
 
 def _ident_run_reaped(cmd: list, timeout: float, env: dict | None = None) -> subprocess.CompletedProcess:
-    """subprocess.run, except that a child still alive at the timeout (or on any error) is killed WITH its process tree (r5: an r4 probe child outlived its test)."""
+    """subprocess.run, except that a child still alive at the timeout (or on any error) is killed WITH its process tree (r5: an r4 probe child outlived its test).
+    r6: the final drain is bounded too, so a grandchild that still holds the pipes cannot hold the test."""
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
     try:
         out, err = proc.communicate(timeout=timeout)
     except BaseException:
         if proc.poll() is None:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=60)
-        proc.communicate()
+        try:
+            proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=60)
         raise
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
@@ -8510,7 +8516,7 @@ class VenueProbeIdentityTests(IdentityProbeMixin, unittest.TestCase):
     def test_the_real_probe_job_emits_a_typed_identity_with_a_status_for_every_null(self) -> None:
         job = self.tmp / "real-probe-job.ps1"
         job.write_text(_ident_probe_body().replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0"), encoding="utf-8")
-        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], capture_output=True, text=True, timeout=240)
+        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
         self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
         p = json.loads(lines[0][len("VENUE_QUIET="):])
@@ -8537,6 +8543,9 @@ class VenueProbeIdentityTests(IdentityProbeMixin, unittest.TestCase):
                 self.assertEqual(r["owner_status"], "ok")
             for value, status in (("cmdline", "cmdline_status"), ("exe", "exe_status")):
                 self.assertTrue((r[value] is None) == (r[status] != "ok"), (value, r))
+            # r6: this host's real processes go through the real worker-side script check
+            self.assertIn(r["script_check"], R6_SCRIPT_CHECKS if r["cmdline_status"] == "ok" else (None,), r)
+            self.assertEqual(r["script"] is not None, r["script_check"] == "ok", r)
             self.assertTrue((r["gpu_percent"] is None) == (r["gpu_status"] not in ("ok", "no-gpu-context")), r)
             self.assertIn(r["project"], ("mlv-app", "agent-bridge", "adobe-ingester", "fleet-doctrine", "adversarialllm", "virtual-ten", "airmypc", "unknown"))
             self.assertIn(r["parent"]["status"], ("ok", "exited", "pid-reused", "none"))
@@ -8922,8 +8931,10 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         body = _ident_probe_body()
         m = re.search(r"\$IdentityCallMs = (\d+)", body)
         self.assertIsNotNone(m)
-        # GPU + 3 WQL queries + budget-gated GetOwner calls (the last may start just under the budget): the identity worst case, plus the 24 s sample window, stays inside 120 s
-        worst_s = (int(m.group(1)) * 4 + int(re.search(r"\$IdentityBudgetMs = (\d+)", body).group(1)) + int(m.group(1))) / 1000.0 + 24
+        # GPU + 3 WQL queries + the r6 script-slot check + budget-gated GetOwner calls (the last may start just under the budget): the identity worst case, plus the 24 s
+        # sample window, stays inside 120 s
+        self.assertEqual(body.count("Invoke-IdentBounded $IdentScriptCheckScript"), 1, "r6: ONE bounded script-slot call per probe, not one per row")
+        worst_s = (int(m.group(1)) * 5 + int(re.search(r"\$IdentityBudgetMs = (\d+)", body).group(1)) + int(m.group(1))) / 1000.0 + 24
         self.assertLess(worst_s, 110, worst_s)
 
 
@@ -9190,6 +9201,127 @@ class VenueBusyProbeSummaryPathRefusalR3Tests(unittest.TestCase):
         self.assertLess(unc, fs_any.start(), "the UNC refusal comes before the first filesystem call of any kind")
         self.assertLess(share, fs_probe.start(), "the venue-share refusal comes before the first filesystem call on an input")
         self.assertLess(share, code.index("$ProbeJson = @($ProbeJson | ForEach-Object"), "the -ProbeJson split (which asks Test-Path about each entry) comes after both refusals")
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r6 (dot advisory 581ad0fa): r5 checked the script slot with DriveInfo.DriveType and File.Exists on the MAIN path, outside the bounded identity
+# worker, so a drive-rooted path through a local link to a dead share (C: is Fixed) could hold the probe past the identity budget. Every filesystem call for the slot now runs in
+# ONE bounded worker call, walks the components without following a reparse point, and each row says why in script_check.
+@requires_windows_pwsh
+class VenueProbeScriptCheckR6Tests(IdentityProbeMixin, unittest.TestCase):
+    setUp = VenueQuietAttributionTests.setUp
+    gate = VenueProbeIdentityNoArgumentTextR5Tests.gate
+    real_file = VenueProbeIdentityNoArgumentTextR5Tests.real_file
+    SLOW_MS = 20000
+    CALL_MS = 1500
+    SEAM = "$IdentityScriptCheckDelayMs = 0"
+
+    def junction(self, name: str, target: Path) -> Path:
+        import os
+        link = self.tmp / name
+        proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.addCleanup(os.rmdir, link)   # removes the junction itself, never its target; runs before the temp dir's own cleanup
+        return link
+
+    def test_a_slow_metadata_call_is_bounded_into_script_check_timeout_and_the_verdict_and_counters_are_intact(self) -> None:
+        import time
+        self.assertIn(self.SEAM, _ident_probe_body(), "the slow-metadata seam is a literal of the probe body, 0 in production")
+        script = self.real_file("lane", "slow.py")
+        t = IDENT_T0
+        procs = [(16892, "python", 29.1, t), (500, "pwsh", 1.0, t)]
+        cim = [_ident_cim(16892, 500, "python.exe", t, f"python {script} --frames 9", r"C:\Python\python.exe"), _ident_cim(500, 0, "pwsh.exe", t, "pwsh")]
+        # control: the same probe without the delay names the script, and its time is the baseline the bounded run is held to
+        started = time.monotonic()
+        fast = self.run_identity_probe(procs, cim, CHAIN_OWNERS, call_ms=self.CALL_MS)
+        baseline = time.monotonic() - started
+        self.assertEqual((self.row(fast, 16892)["script"], self.row(fast, 16892)["script_check"]), (str(script), "ok"))
+        started = time.monotonic()
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS, body=_ident_probe_body().replace(self.SEAM, f"$IdentityScriptCheckDelayMs = {self.SLOW_MS}"), call_ms=self.CALL_MS)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, self.SLOW_MS / 1000.0 - 2, f"the probe waited for the slow metadata call ({elapsed:.1f} s)")
+        self.assertLess(elapsed - baseline, self.CALL_MS / 1000.0 + 4, f"budget + margin: {elapsed:.1f} s against a {baseline:.1f} s baseline")
+        r = self.row(p, 16892)
+        self.assertEqual((r["script"], r["script_check"], r["cmdline"], r["cmdline_status"]), (None, "timeout", r"C:\Python\python.exe args=3 script=<none>", "ok"))
+        self.assertEqual((r["owner"], r["owner_status"]), ("BACHELOR\\layib", "ok"), "a later call gets a fresh worker")
+        self.assertEqual(self.row(p, 500)["script_check"], "rejected")
+        self.assertIn("script_check_unresolved", p["identity"]["notes"])
+        self.assertIn("calls_abandoned", p["identity"]["notes"])
+        # the measured fields equal the same probe with identity cut out
+        cut = re.sub(r"# IDENTITY \(VENUE-PROBE-PROCESS-ATTRIBUTION-1\).*?(?=Write-Output \('VENUE_QUIET=')", "", _ident_probe_body(), flags=re.S).replace("    identity = $identity\r\n", "").replace("    identity = $identity\n", "")
+        ref = self.run_identity_probe(procs, cim, CHAIN_OWNERS, body=cut)
+        for k, v in ref.items():
+            self.assertEqual(p[k], v, f"{k} changed because the script check was slow")
+        # and through the gate: the verdict, the top line and the retained raw JSON all carry it
+        proc = self.gate(dict(p, host="BACHELOR", samples=[50.0, 50.0, 50.0]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% threshold=20(\.0)?% waitedSec=\d+$")
+        self.assertRegex(proc.stdout, r"(?m)^  top python pid=16892 cpuSeconds=\S+ owner=BACHELOR\\layib project=\S+ script=n/a script_check=timeout parent=")
+        self.assertRegex(proc.stdout, r"(?m)^  ident note script_check_unresolved: ")
+        raw = json.loads(next(self.work.glob("venue-quiet-probe-*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(self.row(raw, 16892)["script_check"], "timeout")
+        self.assertNotIn("--frames", proc.stdout + json.dumps(raw))
+
+    def test_a_junction_is_reparse_never_followed_and_every_other_reason_is_typed(self) -> None:
+        real = self.real_file("real", "probe.py").parent
+        missing_target = self.tmp / "nowhere"
+        j_missing = self.junction("j-missing", missing_target)
+        j_real = self.junction("j-real", real)
+        cases = [
+            (3001, f"python {j_missing}\\probe.py", None, "reparse"),     # a junction to a missing target (the dead-share stand-in)
+            (3002, f"python {j_real}\\probe.py", None, "reparse"),        # a junction to a real file: r5 followed it and named the script
+            (3003, f"python {real}\\probe.py", str(real / "probe.py"), "ok"),
+            (3004, f"python {real}\\missing.py", None, "notfound"),
+            (3005, f"python {real}\\probe.py\\x.py", None, "notfound"),   # a file where a directory must be
+            (3006, "python bench.py --x", None, "relative"),
+            (3007, r"python \\192.0.2.1\share\a.py", None, "nonfixed"),   # UNC: text only, never touched
+            (3008, "python --verbose a.py", None, "rejected"),
+        ]
+        t = IDENT_T0
+        procs = [(pid, "python", 30.0 - i, t) for i, (pid, _c, _s, _k) in enumerate(cases)]
+        cim = [_ident_cim(pid, 0, "python.exe", t, cmd, r"C:\Python\python.exe") for (pid, cmd, _s, _k) in cases]
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS)
+        for pid, cmd, script, check in cases:
+            with self.subTest(cmd=cmd):
+                r = self.row(p, pid)
+                self.assertEqual(r["script"], script, r)   # first, on its own: r5 followed j-real and named the file behind it
+                self.assertEqual(r.get("script_check"), check, r)
+                self.assertTrue(r["cmdline"].endswith(f" script={script or '<none>'}"), r)
+                self.assertIn(r["script_check"], R6_SCRIPT_CHECKS)
+        self.assertFalse(missing_target.exists(), "the walk never created or followed the junction's target")
+        self.assertNotIn("script_check_unresolved", p["identity"]["notes"])
+
+    def test_no_filesystem_call_for_the_script_slot_runs_outside_the_worker_body(self) -> None:
+        body = _ident_probe_body()
+        code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+        m = re.search(r"\$IdentScriptCheckScript = \{.*?\n\}\.ToString\(\)", code, re.S)
+        self.assertIsNotNone(m, "the script-slot filesystem calls live in ONE worker body")
+        worker = m.group(0)
+        rest = code.replace(worker, "")
+        fs = r"DriveInfo|File\]::Exists|Directory\]::Exists|GetAttributes|FileInfo|DirectoryInfo|GetFileAttributes|\bTest-Path\b|\bGet-Item\b|\bResolve-Path\b"
+        self.assertEqual(re.findall(fs, rest), [], "nothing on the main path touches the filesystem for the script slot")
+        for needle in ("DriveInfo", "GetAttributes", "ReparsePoint"):
+            self.assertIn(needle, worker)
+        self.assertEqual(re.findall(r"\$IdentScriptCheckScript\b", rest), ["$IdentScriptCheckScript"], "the worker body is used once")
+        self.assertRegex(rest, r"Invoke-IdentBounded \$IdentScriptCheckScript @\([^)]*\) \$IdentityCallMs", "and only through the bounded call, under the call deadline")
+        self.assertRegex(body, r"(?m)^\$IdentityScriptCheckDelayMs = 0$", "the seam is 0 in production")
+        self.assertEqual(sorted(set(re.findall(r"\$env:(\w+)", code))), ["COMPUTERNAME"], "no environment variable can reach the probe, so none can set the seam")
+
+    def test_script_check_is_printed_on_the_top_attr_and_ident_lines_of_a_row_that_carries_it(self) -> None:
+        block = dict(IDENT_BLOCK, processes=[dict(IDENT_ROW, script_check="ok"), dict(IDENT_GPU_ROW, script_check="rejected"), dict(IDENT_DENIED_ROW, script_check=None), IDENT_MISMATCH_ROW])
+        proc = self.gate(dict(V2_PROBE, top=IDENT_TOP, identity=block, top_processes=[{"instance": "python", "pid": 16892, "percent": 6.0}]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = proc.stdout.replace("\r\n", "\n")
+        self.assertIn("  top python pid=16892 cpuSeconds=29.1 owner=BACHELOR\\layib project=mlv-app script=bench.py script_check=ok parent=pwsh:500|ok gparent=explorer:400|ok started=2026-10-24T01:02:03Z gpu=40.0%\n", out)
+        self.assertIn("  top system pid=4 cpuSeconds=3.5 owner=unreadable(access-denied) project=unknown script=n/a script_check=n/a parent=", out)
+        self.assertIn("  top pwsh pid=4242 cpuSeconds=12.5 ident=pid-reused\n", out)
+        self.assertIn("  attr proc python pid=16892 pct=6.0% owner=BACHELOR\\layib project=mlv-app script_check=ok\n", out)
+        self.assertIn("  ident gpu wmiprvse pid=7777 gpu=12.0% engtype=3d owner=NT_AUTHORITY\\NETWORK_SERVICE project=unknown script_check=rejected\n", out)
+        for line in out.split("\n"):
+            if line.startswith("  top ") and "cpuSeconds=" in line:
+                for token in line.split("cpuSeconds=", 1)[1].split()[1:]:
+                    self.assertRegex(token, r"^[a-z_]+=\S+$", line)
+                    self.assertNotIn(",", token)
 
 
 if __name__ == "__main__":
