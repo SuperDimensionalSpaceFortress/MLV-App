@@ -406,6 +406,47 @@ class EvidenceReportTests(unittest.TestCase):
         self.assertEqual(0, code, out)
         self.assertIn("PASS: 1 citation(s) resolved", out)
 
+    def run_cli_while_the_cited_file_changes(self, reads, *flags):
+        """Run ``--check-evidence`` while ``mod.psm1`` returns ``reads[n]`` on its n-th read (the last one repeats)."""
+        (self.root / "manifest.json").write_text(json.dumps(self.manifest({"line": 8, "contains": "'only-here'"})),
+                                                 encoding="utf-8")
+        real, seen = Path.read_text, []
+
+        def read_text(path, *args, **kwargs):
+            if path.name != "mod.psm1":
+                return real(path, *args, **kwargs)
+            seen.append(path)
+            return reads[min(len(seen), len(reads)) - 1]
+
+        buffer = io.StringIO()
+        with mock.patch.object(Path, "read_text", read_text), contextlib.redirect_stdout(buffer):
+            code = rfs.main(["--worktree", str(self.root), "--manifest", str(self.root / "manifest.json"),
+                             "--check-evidence", *flags])
+        return code, buffer.getvalue(), len(seen)
+
+    def test_report_and_verdict_come_from_one_read_of_the_cited_file(self):
+        gone = "# the cited text was edited away\n"
+        for name, reads, resolves in (("resolves then vanishes", [CITED_MODULE, gone], True),
+                                      ("vanishes then resolves", [gone, CITED_MODULE], False)):
+            with self.subTest(name):
+                code, out, nreads = self.run_cli_while_the_cited_file_changes(reads)
+                self.assertEqual(resolves, "UNRESOLVED" not in out, out)
+                self.assertEqual(0 if resolves else 1, code, out)
+                self.assertIn("PASS: 1 citation(s) resolved" if resolves else "FAIL: 1 of 1 citation(s) unresolved", out)
+                self.assertEqual(1, nreads, out)
+
+    def test_json_evidence_and_verdict_agree_when_the_cited_file_changes_between_reads(self):
+        gone = "# the cited text was edited away\n"
+        for name, reads, resolves in (("resolves then vanishes", [CITED_MODULE, gone], True),
+                                      ("vanishes then resolves", [gone, CITED_MODULE], False)):
+            with self.subTest(name):
+                code, out, nreads = self.run_cli_while_the_cited_file_changes(reads, "--json")
+                result = json.loads(out)
+                self.assertEqual(resolves, not any("UNRESOLVED" in line for line in result["evidence"]), out)
+                self.assertEqual("PASS" if resolves else "FAIL", result["verdict"], out)
+                self.assertEqual(0 if resolves else 1, code, out)
+                self.assertEqual(1, nreads, out)
+
     def test_check_evidence_flag_passes_on_the_checked_in_manifest(self):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):

@@ -225,29 +225,42 @@ def _scope_end(lines: list[str], start: int, see_through_comments: bool) -> int:
     return end
 
 
-def _walk_evidence(manifest: dict, root: Path):
-    """Yield (row id, evidence item, resolved 1-based line or None, problem or None) for every citation."""
+def citation_snapshot(manifest: dict, root: Path) -> list[tuple]:
+    """Resolve every citation ONCE: [(row id, evidence item, resolved 1-based line or None, problem or None)].
+
+    The report and the verdict are both derived from one snapshot, so a cited file edited while the check runs can
+    never leave them disagreeing."""
+    snapshot = []
     for row in manifest["rows"]:
         for item in row.get("evidence", []):
             target = Path(root) / item["file"]
             if not target.is_file():
-                yield row["id"], item, None, f"evidence file missing: {item['file']}"
+                snapshot.append((row["id"], item, None, f"evidence file missing: {item['file']}"))
                 continue
             lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
             resolved, problem = resolve_evidence(item, lines)
-            yield row["id"], item, resolved, (f"{item['file']}: {problem}" if problem else None)
+            snapshot.append((row["id"], item, resolved, (f"{item['file']}: {problem}" if problem else None)))
+    return snapshot
+
+
+def snapshot_problems(snapshot: list[tuple]) -> list[str]:
+    return [f"{row_id}: {problem}" for row_id, _, _, problem in snapshot if problem]
 
 
 def check_evidence(manifest: dict, root: Path) -> list[str]:
     """Each declared floor must cite, by a unique text anchor, a real file that contains the quoted text."""
-    return [f"{row_id}: {problem}" for row_id, _, _, problem in _walk_evidence(manifest, root) if problem]
+    return snapshot_problems(citation_snapshot(manifest, root))
 
 
 def evidence_report(manifest: dict, root: Path) -> list[str]:
     """One line per citation: the resolved line beside its ``line`` hint. Drift is advice, never a failure; only an
     UNRESOLVED citation (the problems ``check_evidence`` returns) is one."""
+    return snapshot_report(citation_snapshot(manifest, root))
+
+
+def snapshot_report(snapshot: list[tuple]) -> list[str]:
     report = []
-    for row_id, item, resolved, problem in _walk_evidence(manifest, root):
+    for row_id, item, resolved, problem in snapshot:
         if problem:
             report.append(f"{row_id}: UNRESOLVED {problem}")
             continue
@@ -542,11 +555,12 @@ def main(argv: list[str] | None = None, detect=detect_runtime) -> int:
     try:
         manifest = load_manifest(Path(args.manifest) if args.manifest else worktree / DEFAULT_MANIFEST)
         if args.check_evidence:
-            report = evidence_report(manifest, worktree)
+            snapshot = citation_snapshot(manifest, worktree)
+            report = snapshot_report(snapshot)
             result["evidence"] = report
             if not args.json:
                 print("\n".join(report))
-            bad = len(check_evidence(manifest, worktree))
+            bad = len(snapshot_problems(snapshot))
             if bad:
                 return emit(1, "FAIL", f"{bad} of {len(report)} citation(s) unresolved")
             return emit(0, "PASS", f"{len(report)} citation(s) resolved")
