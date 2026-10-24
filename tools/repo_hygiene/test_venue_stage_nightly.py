@@ -438,11 +438,43 @@ class VenueStageNightlyTests(unittest.TestCase):
         for jid in (f"playback-attr-3-cuda-dllpair-{S12}", f"attr3-stage-smoke-runner-{S12}-bbbbbbbbbbbb"):
             self.assertEqual(seen[jid][4], "", f"{jid} is harvested by name by a later call that cannot re-submit it: no notAfter")
 
+    def test_a_scheduling_delay_before_the_bound_never_lets_it_pass_the_deadline(self) -> None:
+        # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 (CoS Dot 07bd1383 (b)): the driver samples what is left of its deadline, then computes the bound.
+        # -TestNotAfterSampleDelayMs holds it between the two (a scheduling delay); the bound is still the ORIGINAL deadline, never the sample counted
+        # again from a later now (which would overshoot by the delay).
+        p = self.run_driver("-MaxTotalSec", "600", "-TestNotAfterSampleDelayMs", "2500")
+        self.assert_exit(p, "STAGE_OK")
+        o_utc = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z"
+
+        def parse_o(text: str) -> datetime:
+            m = re.match(r"^(.*T\d{2}:\d{2}:\d{2})\.(\d{7})Z$", text)
+            self.assertIsNotNone(m, text)
+            return datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc) + timedelta(microseconds=int(m.group(2)[:6]))
+
+        stage_id = f"playback-attr-3-cuda-stage-{S12}"
+        said = [l for l in p.stdout.splitlines() if f" submit stage {stage_id} " in l]
+        self.assertEqual(len(said), 1, p.stdout)
+        m = re.search(rf" notAfterUtc=({o_utc}) \(caller-deadline\) deadline=({o_utc})$", said[0])
+        self.assertIsNotNone(m, said[0])
+        na, deadline = parse_o(m.group(1)), parse_o(m.group(2))
+        self.assertLessEqual(na, deadline, "never later than the driver's own deadline")
+        self.assertEqual(na, deadline, "the deadline itself: um-run is killed there")
+        handed = [c for c in self.submissions() if f" job={stage_id} " in c]
+        self.assertEqual(len(handed), 1)
+        self.assertIn(f" notAfter={m.group(1)} ", handed[0], "um-run is handed exactly that bound")
+        # the delay really sat between the sample and um-run: the queue wait is floor(deadline - sample) and um-run was called at least 2.5 s after the
+        # sample, so the queue wait outlasts what was left at the call by more than 1.5 s (the old bound, sample + later now, lands past the deadline)
+        called = parse_o(re.search(rf" called=({o_utc})$", handed[0]).group(1))
+        queue = int(re.search(r" queue=(\d+) ", handed[0]).group(1))
+        self.assertGreaterEqual(queue, (deadline - called).total_seconds() + 1.5 - 0.01)
+
     def test_the_driver_bounds_each_submit_through_the_one_helper(self) -> None:
         text = DRIVER.read_text(encoding="utf-8")
         fn = text[text.index("function Invoke-UmRun("):text.index("# ------------------------------------------------------------------ 6. DLL pair")]
         self.assertEqual(fn.count("Get-DvJobNotAfter"), 1)
         self.assertIn("-CallerCapSec $remain", fn)
+        # the bound is the ORIGINAL absolute deadline (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1), not the sampled remaining counted from a later now
+        self.assertIn("-CallerDeadlineUtc $script:Deadline", fn)
         self.assertIn("-NotAfterUtc", fn)
         self.assertEqual(len(re.findall(r"Invoke-UmRun '(?:dllpair|smoke-runner)' .*-LaterHarvest", text)), 2, "the two harvested submits say so")
         self.assertEqual(len(re.findall(r"Invoke-UmRun 'stage' .*-LaterHarvest", text)), 0)

@@ -45,7 +45,8 @@
 # still own the job), never retried in the same call.
 # NOT-AFTER (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1). The stage job is submitted with -NotAfterUtc at this call's deadline, so a job still queued or gated when
 # um-run is killed never takes a Bachelor lease later (a later call re-stages it under a suffix). The DLL pair and the smoke runner get none: a later call
-# harvests them by name and cannot re-submit their single-use JobId (the DLL pair runs on Ultra-Magnus, whose agent ignores the field anyway).
+# harvests them by name and cannot re-submit their single-use JobId (the DLL pair runs on Ultra-Magnus, whose agent ignores the field anyway). The bound is
+# the ORIGINAL deadline passed as an instant (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1), so a delay before the bound is computed never moves it later.
 #
 #   pwsh -NoProfile -File "<repo>\tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1" [-Venue ultra-magnus] [-SourceCommit <40-hex>] [-WhatIf]
 #
@@ -69,7 +70,8 @@
 # Roles come from venues.json and are never set here. Scheduling is NOT here: UM-REGULAR-BASELINE-SCHEDULE-1 makes one call per night (fetch fork, this driver, then
 # Invoke-VenueBaseline.ps1 on exit 0).
 # -UmRunScript / -DllJobScript / -AssembleScript / -StageJobScript / -SmokeRunnerJobScript / -GitExe / -AgentShare (replaces every share this driver touches) / -ClaimDir /
-# -VenueTablePath / -RepoRoot / -GateDir / -NowUtc are seams for the offline tests (tools/repo_hygiene/test_venue_stage_nightly.py); production passes none.
+# -VenueTablePath / -RepoRoot / -GateDir / -NowUtc / -TestNotAfterSampleDelayMs are seams for the offline tests (tools/repo_hygiene/test_venue_stage_nightly.py);
+# production passes none.
 [CmdletBinding()]
 param(
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'ultra-magnus',
@@ -91,7 +93,10 @@ param(
     [string]$VenueTablePath = '',
     [string]$RepoRoot = '',
     [string]$GateDir = '',
-    [string]$NowUtc = ''
+    [string]$NowUtc = '',
+    # Test-only (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): sleeps this long between each submission's remaining-budget sample and its not-after bound,
+    # a scheduling delay test_venue_stage_nightly.py injects to prove the bound never passes the deadline. Production passes none.
+    [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -460,14 +465,20 @@ function Assert-StagePackageSideFile([string[]]$Side, [string]$JobId, [string]$F
 function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]$JobId, [string]$Share, [int]$JobTimeoutSec, [string]$FailToken, [switch]$LaterHarvest) {
     # Returns 'OK' (um-run returned; the caller reads the outbox result BY NAME) or 'IN_USE' (the outbox already holds this JobId). Every other end is a typed exit:
     # UNRESOLVED (or killed at the cap) -> STAGE_UNRESOLVED, never retried here; RETRACTED (never claimed) -> AGENT_BUSY; no heartbeat -> SHARE_UNREACHABLE.
-    # LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1: the job's -NotAfterUtc is this call's deadline (um-run is killed at it: the helper's -CallerCapSec), except
+    # LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1: the job's -NotAfterUtc is this call's deadline (um-run is killed at it: the helper's -CallerDeadlineUtc), except
     # for -LaterHarvest: a job a LATER call harvests by name and cannot re-submit (single-use JobId, no suffix) gets none.
     Assert-VenueFree "before the $Step submission"
     Assert-StagePackageSideFile -Side $Side -JobId $JobId -FailToken $FailToken
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: the waits are sized from a SAMPLE of what is left ($remain), but the bound is the ORIGINAL deadline
+    # (-CallerDeadlineUtc $script:Deadline), never $remain counted again from the helper's later now: a delay between the sample and the call can then only
+    # shorten what um-run is given, never move the bound past the deadline. ($remain still proves the waits fit: -CallerCapSec.) Invoke-Child kills um-run
+    # at the cap from its own sample just before the child starts, so the kill can land up to the child's start-up time after the deadline; a job the
+    # agent refuses in that sub-second window was going to be cut off anyway.
     $remain = Get-RemainingSec
     if ($remain -lt 30) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "only $remain s of the $MaxTotalSec s cap left before the $Step submission; nothing was submitted" }
     $timeoutSec = [Math]::Min($JobTimeoutSec, $remain); $admissionSec = [Math]::Min(7200, $remain)
-    $notAfter = Get-DvJobNotAfter -TimeoutSec $timeoutSec -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $admissionSec -MaxClaimedWaitSec $remain -CallerCapSec $remain -LaterHarvest:$LaterHarvest
+    if ($TestNotAfterSampleDelayMs -gt 0) { Start-Sleep -Milliseconds $TestNotAfterSampleDelayMs }
+    $notAfter = Get-DvJobNotAfter -TimeoutSec $timeoutSec -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $admissionSec -MaxClaimedWaitSec $remain -CallerCapSec $remain -CallerDeadlineUtc $script:Deadline -LaterHarvest:$LaterHarvest
     # um-run.ps1 reports every non-receipt end by THROWING; pwsh's own error view wraps and decorates that text, so the child catches it and prints the message
     # on ONE line (UMRUN_ERROR <message>). The returned result object is discarded: the outbox result.json is read by name afterwards.
     $lit = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
@@ -476,7 +487,7 @@ function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]
     if ($notAfter.notAfterUtc) { $call += ' -NotAfterUtc ' + (& $lit $notAfter.notAfterUtc) }
     if (@($Side).Count -gt 0) { $call += ' -SideFile @(' + ((@($Side) | ForEach-Object { & $lit $_ }) -join ', ') + ')' }
     $text = "try { `$null = $call; [Console]::Out.WriteLine('UMRUN_RETURNED'); exit 0 } catch { [Console]::Out.WriteLine('UMRUN_ERROR ' + (`$_.Exception.Message -replace '\s+', ' ')); exit 1 }"
-    Say "submit $Step $JobId -> $Share notAfterUtc=$(if ($notAfter.notAfterUtc) { $notAfter.notAfterUtc } else { 'none' }) ($($notAfter.source))"
+    Say "submit $Step $JobId -> $Share notAfterUtc=$(if ($notAfter.notAfterUtc) { $notAfter.notAfterUtc } else { 'none' }) ($($notAfter.source)) deadline=$($script:Deadline.ToString('o'))"
     $c = Invoke-Child "umrun-$Step" '' @() -CommandText $text
     if ($c.timedOut) { Stop-Nightly 'STAGE_UNRESOLVED' "um-run for $JobId was still waiting at the $MaxTotalSec s cap and was killed; the agent may still own $JobId (not retried)" }
     if ($c.exit -eq 0 -and $c.out -match '(?m)^UMRUN_RETURNED\s*$') { return 'OK' }

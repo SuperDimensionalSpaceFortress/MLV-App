@@ -1462,7 +1462,12 @@ class VenueChainSupplementaryTests(unittest.TestCase):
             self.assertIsNotNone(printed, f"the statement before the submit must print the job id on stdout: {code[k]}")
             self.assertEqual(printed.group(1), submitted.group(1).strip('"'), "the printed id is the submitted one")
         self.assertEqual(len([l for l in code if "DVE_JOB_ID=" in l]), 2, "one print per submit")
-        self.assertIn("6>$null", text)   # um-run's own output stays suppressed: only the id line is added
+        # um-run's own output stays suppressed: only the id line is added. Since LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 the information stream is
+        # collected (6>&1 into the submit's records, to measure the drop) instead of discarded (6>$null); either way it is never written out.
+        fn = text[text.index("function Submit-VenueJob("):text.index("function Write-NotAfterVerdict(")]
+        self.assertIn("6>&1 |", fn)
+        self.assertIn("ForEach-Object { $records.Add($_) }", fn)
+        self.assertNotRegex(fn, r"Write-(Host|Output|Information)\b", "the collected records are never written out")
 
     def test_a_real_leg_killed_at_the_chain_timeout_leaves_its_printed_id_to_reconcile_not_unknown(self) -> None:
         # The real Invoke-VenueLeg.ps1 (offline test mode, stub generator, a stub um-run that submits and then never returns) is the ultra-magnus leg; the fake leg stays Bachelor's.
