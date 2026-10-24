@@ -267,6 +267,17 @@ $script:RetirePendingDirName = 'mlv-retire-pending'
 # r9 (fable r4 + sol r4 blocker on PR #603): a record's owner.lock is held open (FileShare.None) by the operation that owns the record; a
 # restorer must open it the same way first. The OS closes the handle when the owner exits or crashes, so an orphaned record is claimable.
 $script:RetirePendingLockName = 'owner.lock'
+# LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: run-dir driver evidence. Only run dirs whose own entry list changed in the last RunDirMaxAgeDays are
+# read (measured 2026-10-24 on a loaded host: 4245 of 8046 dirs at 14 d, ~4.5k records, index 3-4 s, built once per snapshot); in them pid records count at any age (a pid that no
+# longer runs, or now runs something that names neither the worktree nor the run dir, holds nothing), receipts when written in the last
+# RunDirReceiptMaxAgeHours.
+$script:RunDirPidPatterns = @('*.pid', '*.child.json')
+$script:RunDirMaxAgeDays = 14
+$script:RunDirReceiptMaxAgeHours = 72
+$script:RunDirTieExt = @('.ps1', '.psm1', '.json', '.jsonl', '.txt', '.md', '.args')
+$script:RunDirTieBulkExt = @('.txt', '.jsonl')
+$script:RunDirTieMaxFiles = 200
+$script:RunDirTieMaxBytes = 1048576
 
 if (-not ('MlvProcCwd' -as [type])) {
     # Current directory of another process: Win32_Process does not expose it. Reads PEB->ProcessParameters->CurrentDirectory
@@ -465,7 +476,7 @@ function Get-ScriptCorpus {
             if ($FileCache.ContainsKey($full.ToLowerInvariant())) { $text = $FileCache[$full.ToLowerInvariant()] }
             else {
                 $fi = New-Object IO.FileInfo $full
-                $text = if ($fi.Exists -and $fi.Length -le $script:HolderMaxBytes) { [IO.File]::ReadAllText($full) } else { $null }
+                $text = if ($fi.Exists -and $fi.Length -le $script:HolderMaxBytes) { Read-SharedText -Path $full } else { $null }
                 $FileCache[$full.ToLowerInvariant()] = $text
             }
         } catch { continue }
@@ -566,11 +577,12 @@ function Find-WorktreeHolders {
         $procId = [int]$p.ProcessId
         $via = $null
         $cl = [string]$p.CommandLine   # null when the command line is unreadable: nothing to match, but the cwd probe still runs
-        if ($cl.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $cl.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $via = 'cmdline' }
+        # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: a path-prefix match (lane-X-1 is not named by lane-X-10), not a substring.
+        if (Test-PathNamed -Text $cl -Path $wd) { $via = 'cmdline' }
         # A holder index built by a caller (a -SnapshotProvider) predates Decoded: read it only when present (StrictMode throws on a missing property).
         if (-not $via -and $idx.PSObject.Properties['Decoded'] -and $idx.Decoded.ContainsKey($procId)) {
             $dt = [string]$idx.Decoded[$procId]   # r6: the same path test over the decoded -EncodedCommand text
-            if ($dt.IndexOf($wd, [StringComparison]::OrdinalIgnoreCase) -ge 0 -or $dt.IndexOf($slash, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $via = 'cmdline-encoded' }
+            if (Test-PathNamed -Text $dt -Path $wd) { $via = 'cmdline-encoded' }
         }
         if (-not $via -and $idx.Cwd.ContainsKey($procId)) {
             $c = [string]$idx.Cwd[$procId]
@@ -585,9 +597,224 @@ function Find-WorktreeHolders {
                 if ($via) { break }
             }
         }
-        if ($via) { $rows.Add([pscustomobject]@{ ProcessId = $procId; Name = [string]$p.Name; Via = $via }) }
+        if ($via) { $rows.Add([pscustomobject]@{ ProcessId = $procId; Name = [string]$p.Name; Via = $via; MatchedPath = $wd }) }
     }
     return $rows.ToArray()
+}
+
+# ---- LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1 (2026-10-24) ----
+# 06:02Z the mlvtmp retention pass removed C:\mlvtmp\lane-CPU-17V9-FPS-GAP-AB-1-20261024 under a live DETACHED venue driver (pid 43484) that ran
+# Wait-VenueQuiet.ps1 from it. The driver's command line named only its run dir, its pid sat in <run dir>\venue-cpu17v9-ab.pid, and the lane
+# that launched it had exited (receipt state=complete), so no command-line or running-receipt check saw it. Every remover calls
+# Get-WorktreeLiveRefusal right before it removes.
+
+function ConvertTo-PathMatchText([string]$Text) {
+    # Separator-normalised: '/' -> '\', and a run of '\' (a JSON- or regex-escaped spelling) -> one '\'.
+    return [regex]::Replace(($Text -replace '/', '\'), '\\{2,}', '\')
+}
+
+function Test-PathNamed {
+    # True when $Text names $Path or a path under it: case-insensitive, either separator, and a path-PREFIX match, so C:\mlvtmp\lane-X-1
+    # is named by 'C:/MLVTMP/lane-X-1/tools/x.ps1' but never by C:\mlvtmp\lane-X-10 or C:\mlvtmp\lane-X-1.retiring.
+    param([string]$Text, [string]$Path)
+    if ([string]::IsNullOrEmpty($Text) -or [string]::IsNullOrEmpty($Path)) { return $false }
+    $p = (ConvertTo-PathMatchText $Path).TrimEnd('\')
+    if (-not $p) { return $false }
+    $rx = '(?<![A-Za-z0-9_])' + [regex]::Escape($p) + '(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_])'
+    return [regex]::IsMatch((ConvertTo-PathMatchText $Text), $rx, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}
+
+function Get-PidsFromRecordText([string]$Text) {
+    # A pid record: a bare number (venue-cpu17v9-ab.pid), or JSON whose pid / childPid / driverPid / runnerPid / ownerPid fields carry one
+    # (opus-001.child.json, *.receipt.json). Pids 0-4 are kernel pseudo-processes and never a driver.
+    # Plain loops, no pipeline: this runs once per record (thousands per index).
+    $ids = New-Object System.Collections.Generic.List[int]
+    if ([string]::IsNullOrWhiteSpace($Text)) { return , $ids.ToArray() }
+    $m = $script:PidBareRx.Match($Text)
+    if ($m.Success) { $n = [int]$m.Groups[1].Value; if ($n -gt 4) { $ids.Add($n) }; return , $ids.ToArray() }
+    foreach ($m in $script:PidJsonRx.Matches($Text)) { $n = [int]$m.Groups[1].Value; if ($n -gt 4 -and -not $ids.Contains($n)) { $ids.Add($n) } }
+    return , $ids.ToArray()
+}
+$script:PidBareRx = [regex]::new('^\s*(\d{1,7})\s*$', 'Compiled')
+$script:PidJsonRx = [regex]::new('"(?:pid|childPid|driverPid|runnerPid|ownerPid)"\s*:\s*"?(\d{1,7})\b', 'Compiled')
+
+function Read-SharedText {
+    # r3 (PR #654 key3 r2 B1): read a file another process may hold open for WRITING. [IO.File]::ReadAllText asks for FileShare.Read, so it
+    # fails on every log a live lane or detached driver keeps write-held (dispatch.out.txt, cmd /c ... > out.txt); this open shares
+    # ReadWrite|Delete, so such a file reads. A real exclusive lock (FileShare.None, or a writer that does not share Read) still throws.
+    param([string]$Path)
+    $fs = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+        $sr = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8, $true)
+        try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+    } finally { $fs.Dispose() }
+}
+
+function Read-RunDirRecordText {
+    # The one read of a run-dir file (pid record or tie file). A seam: a test redefines it to throw an error class a real lock cannot produce.
+    param([string]$Path)
+    return Read-SharedText -Path $Path
+}
+
+function Get-RunDirReadFailure {
+    # r2 (PR #654 sol r1 blocker): $null when the read failed because the file is GONE (removed since the listing: absent evidence), else
+    # '<error class>: <message>'. Any other failure (sharing violation, access denied, anything) is unknown, never absent.
+    param([System.Management.Automation.ErrorRecord]$ErrorRecord)
+    $e = $ErrorRecord.Exception
+    while ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+    if ($e -is [IO.FileNotFoundException] -or $e -is [IO.DirectoryNotFoundException]) { return $null }
+    return "$($e.GetType().FullName): $($e.Message)"
+}
+
+function Get-RunDirPidIndex {
+    # Every pid record in a run dir directly under -RunsRoot (<RunsRoot>\<run dir>\<file>) whose entry list changed in the last RunDirMaxAgeDays:
+    # pid files and child records at any age, receipts written in the last RunDirReceiptMaxAgeHours. Rows {RunDir; File; Pid; Error}. Cached on the
+    # snapshot, so a sweep lists the run dirs once per snapshot. An absent -RunsRoot has no run dirs; one that exists but cannot be listed
+    # THROWS (the caller fails closed). A run dir removed between the listing and its read holds nothing, and so does a record removed since the
+    # listing. r2: a record that exists but cannot be READ is a row with Pid 0 and Error '<path> <error class>: <message>', never an absent
+    # record: Find-RunDirDriverHolders reads it as naming every live pid.
+    param([object]$Snapshot, [string]$RunsRoot)
+    $key = 'RunDirIndex:' + $RunsRoot.ToLowerInvariant()
+    if ($Snapshot.PSObject.Properties[$key] -and $null -ne $Snapshot.$key) { return $Snapshot.$key }
+    $rows = New-Object System.Collections.Generic.List[object]
+    if (Test-Path -LiteralPath $RunsRoot) {
+        if (-not (Test-Path -LiteralPath $RunsRoot -PathType Container)) { throw "run-dir root $RunsRoot is not a directory" }
+        $dirCut = [DateTime]::UtcNow.AddDays(-$script:RunDirMaxAgeDays)
+        $cut = [DateTime]::UtcNow.AddHours(-$script:RunDirReceiptMaxAgeHours)
+        $patterns = @($script:RunDirPidPatterns) + '*.receipt.json'
+        foreach ($dir in [IO.DirectoryInfo]::new($RunsRoot).EnumerateDirectories()) {
+            if ($dir.LastWriteTimeUtc -lt $dirCut) { continue }
+            $files = New-Object System.Collections.Generic.List[IO.FileInfo]
+            try { foreach ($pat in $patterns) { foreach ($f in $dir.EnumerateFiles($pat)) { $files.Add($f) } } }
+            catch [IO.DirectoryNotFoundException] { continue }
+            foreach ($f in $files) {
+                if ($f.Name.EndsWith('.receipt.json', [StringComparison]::OrdinalIgnoreCase) -and $f.LastWriteTimeUtc -lt $cut) { continue }
+                $text = $null
+                try { $text = Read-RunDirRecordText -Path $f.FullName }
+                catch {
+                    $why = Get-RunDirReadFailure $_
+                    if ($why) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = 0; Error = "$($f.FullName) $why" }) }
+                    continue
+                }
+                foreach ($id in (Get-PidsFromRecordText $text)) { $rows.Add([pscustomobject]@{ RunDir = $dir.FullName; File = $f.Name; Pid = $id; Error = $null }) }
+            }
+        }
+    }
+    $idx = $rows.ToArray()
+    $Snapshot | Add-Member -NotePropertyName $key -NotePropertyValue $idx -Force
+    return $idx
+}
+
+function Test-RunDirNamesPath {
+    # True when a small text file at the top of $RunDir (its receipt's workDir, the driver script, its args file, the prompt) names $Path.
+    # r2 (key3 H3): the likely tie files (.json receipts and records, .ps1/.psm1, .args, .md) are read before bulk output (.txt, .jsonl), so a run
+    # dir with hundreds of leg logs, which NTFS lists before opus-001.receipt.json, still reaches its receipt. THROWS when the answer is unknown
+    # (unknown is never "does not name it"): RunDirTieMaxFiles files read and none names $Path while more remain (rundir-tie-cap), or a file
+    # that exists could not be read and no other file names $Path (rundir-tie-unreadable, sol r1 blocker). A file gone since the listing is absent.
+    param([string]$RunDir, [string]$Path)
+    $first = New-Object System.Collections.Generic.List[IO.FileInfo]
+    $bulk = New-Object System.Collections.Generic.List[IO.FileInfo]
+    foreach ($f in [IO.DirectoryInfo]::new($RunDir).EnumerateFiles()) {
+        $ext = $f.Extension.ToLowerInvariant()
+        if ($script:RunDirTieExt -notcontains $ext -or $f.Length -gt $script:RunDirTieMaxBytes) { continue }
+        if ($script:RunDirTieBulkExt -contains $ext) { $bulk.Add($f) } else { $first.Add($f) }
+    }
+    $n = 0
+    $unread = $null
+    foreach ($f in @($first) + @($bulk)) {
+        if (++$n -gt $script:RunDirTieMaxFiles) {
+            if ($unread) { throw "rundir-tie-unreadable path=$unread" }
+            throw "rundir-tie-cap path=$RunDir read=$($script:RunDirTieMaxFiles) of $($first.Count + $bulk.Count) files and none names $Path, so an unread one may"
+        }
+        $t = $null
+        try { $t = Read-RunDirRecordText -Path $f.FullName }
+        catch { $why = Get-RunDirReadFailure $_; if ($why -and -not $unread) { $unread = "$($f.FullName) $why" }; continue }
+        if ($t -and (Test-PathNamed -Text $t -Path $Path)) { return $true }
+    }
+    if ($unread) { throw "rundir-tie-unreadable path=$unread" }
+    return $false
+}
+
+function Find-RunDirDriverHolders {
+    # A live process recorded by a pid record in a run dir under -RunsRoot whose command line names the worktree, or names THAT run dir
+    # while the run dir names the worktree. A recorded live pid whose command line cannot be read holds it when its run dir names the
+    # worktree (unknown is never free). Rows {ProcessId; Name; Via = 'rundir-pid:<file>'; MatchedPath}. Throws when the run dirs cannot be listed.
+    # r2 (PR #654 sol r1 blocker): also THROWS, with the file and the error class, when the answer is unknown and no definite holder was found:
+    # a run dir whose tie cannot be settled (Test-RunDirNamesPath), or a pid record that exists but cannot be read. Such a record may name ANY
+    # pid, so it is read as naming every live non-self pid: it refuses exactly when one of them would hold the worktree through that run dir.
+    param([string]$WorktreePath, [object]$Snapshot, [string]$RunsRoot)
+    $rows = New-Object System.Collections.Generic.List[object]
+    if (-not $RunsRoot) { return $rows.ToArray() }
+    $wd = $WorktreePath.TrimEnd('\')
+    $self = @($Snapshot.SelfPids)
+    $byPid = @{}
+    foreach ($p in @($Snapshot.Procs)) { $byPid[[int]$p.ProcessId] = $p }
+    $seen = @{}
+    $fail = $null
+    $unreadable = New-Object System.Collections.Generic.List[object]
+    foreach ($rec in @(Get-RunDirPidIndex -Snapshot $Snapshot -RunsRoot $RunsRoot)) {
+        if ($rec.Error) { $unreadable.Add($rec); continue }
+        if ($seen.ContainsKey($rec.Pid) -or $self -contains $rec.Pid -or -not $byPid.ContainsKey($rec.Pid)) { continue }
+        $p = $byPid[$rec.Pid]
+        $cl = [string]$p.CommandLine
+        $matched = $null
+        try {
+            if (Test-PathNamed -Text $cl -Path $wd) { $matched = $wd }
+            elseif ((-not $cl -or (Test-PathNamed -Text $cl -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) { $matched = $rec.RunDir }
+        } catch { if (-not $fail) { $fail = "$($_.Exception.Message) (live pid $($rec.Pid) recorded by $($rec.File))" }; continue }
+        if (-not $matched) { continue }
+        $seen[$rec.Pid] = $true
+        $rows.Add([pscustomobject]@{ ProcessId = [int]$rec.Pid; Name = [string]$p.Name; Via = "rundir-pid:$($rec.File)"; MatchedPath = $matched })
+    }
+    if ($rows.Count) { return $rows.ToArray() }   # a definite holder outranks an unknown: both refuse, this one names the pid
+    if ($fail) { throw $fail }
+    foreach ($rec in $unreadable) {
+        $tied = $null   # does the record's run dir name the worktree; asked once, and only when a live pid could be tied through it
+        foreach ($p in @($Snapshot.Procs)) {
+            if ($self -contains [int]$p.ProcessId) { continue }
+            $cl = [string]$p.CommandLine
+            $hit = Test-PathNamed -Text $cl -Path $wd
+            if (-not $hit -and (-not $cl -or (Test-PathNamed -Text $cl -Path $rec.RunDir))) {
+                if ($null -eq $tied) { $tied = [bool](Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd) }   # throws when unknown: fails closed too
+                $hit = $tied
+            }
+            if ($hit) { throw "rundir-record-unreadable path=$($rec.Error)" }
+        }
+    }
+    return $rows.ToArray()
+}
+
+function Get-WorktreeLiveRefusal {
+    # THE guard every lane-worktree remover calls right before it removes. $null = nothing live references the worktree. Otherwise ONE typed
+    # refusal {reason; worktreePath; processId; name; via; matchedPath; detail; line} (receipt-ready JSON names), and line goes to stderr:
+    #   REFUSED worktree-removal reason=<reason> path=<worktree> pid=<n> name=<image> via=<how> matched=<path> utc=<iso>
+    # reason: live-process          a live process holds it by command line (path-prefix match), cwd or a script it runs (Find-WorktreeHolders)
+    #         live-driver           a live process recorded by a pid file / child record / receipt pid in a run dir (Find-RunDirDriverHolders)
+    #         census-failed         the process table could not be read      } fail closed: unknown is never free
+    #         rundir-census-failed  the run dirs could not be read, or (r2) a  }
+    #                               record or tie file in one could not be read, or its tie hit RunDirTieMaxFiles; detail names the file and error class
+    # -Snapshot: a Get-LaneProcessSnapshot result (a sweep passes one); taken here when absent. -RunsRoot: the fleet-runs root ('' skips the run-dir check).
+    param([Parameter(Mandatory = $true)][string]$WorktreePath, [object]$Snapshot = $null, [string]$RunsRoot = '')
+    $wd = ([IO.Path]::GetFullPath(($WorktreePath -replace '/', '\'))).TrimEnd('\')
+    $new = {
+        param([string]$Reason, $Row, [string]$Detail)
+        $procId = if ($Row) { [int]$Row.ProcessId } else { $null }
+        $name = if ($Row) { [string]$Row.Name } else { '' }
+        $via = if ($Row) { [string]$Row.Via } else { '' }
+        $matched = if ($Row -and $Row.PSObject.Properties['MatchedPath']) { [string]$Row.MatchedPath } else { '' }
+        $line = "REFUSED worktree-removal reason=$Reason path=$wd pid=$(if ($null -ne $procId) { $procId } else { 'unknown' }) name=$name via=$via matched=$matched utc=$((Get-Date).ToUniversalTime().ToString('o'))$(if ($Detail) { " detail=$Detail" })"
+        try { [Console]::Error.WriteLine($line) } catch { }
+        [pscustomobject]@{ reason = $Reason; worktreePath = $wd; processId = $procId; name = $name; via = $via; matchedPath = $matched; detail = $Detail; line = $line }
+    }
+    try {
+        if ($null -eq $Snapshot) { $Snapshot = Get-LaneProcessSnapshot }
+        $h = @(Find-WorktreeHolders -WorktreePath $wd -Snapshot $Snapshot)
+    } catch { return (& $new 'census-failed' $null $_.Exception.Message) }
+    if ($h.Count) { return (& $new 'live-process' $h[0] '') }
+    try { $r = @(Find-RunDirDriverHolders -WorktreePath $wd -Snapshot $Snapshot -RunsRoot $RunsRoot) }
+    catch { return (& $new 'rundir-census-failed' $null $_.Exception.Message) }
+    if ($r.Count) { return (& $new 'live-driver' $r[0] '') }
+    return $null
 }
 
 function Get-RunningServiceRows {
@@ -1024,11 +1251,20 @@ function Restore-StrandedRetiring {
 }
 
 function Write-RefusedHolders {
-    # One REFUSED line per holder pid, on stderr (stdout carries the caller's pipeline objects).
-    param([string]$WorktreePath, [object[]]$Holders)
+    # One REFUSED line per holder pid, on stderr (stdout carries the caller's pipeline objects). r2 (key3 H4): each line carries reason= like
+    # Get-WorktreeLiveRefusal's: -Reason when given (cwd-unknown / cwd-probe-unavailable), else live-driver for a run-dir record, else live-process.
+    param([string]$WorktreePath, [object[]]$Holders, [string]$Reason = '')
     foreach ($h in $Holders) {
-        try { [Console]::Error.WriteLine("REFUSED worktree-removal path=$WorktreePath pid=$($h.ProcessId) name=$($h.Name) via=$($h.Via) utc=$((Get-Date).ToUniversalTime().ToString('o'))") } catch { }
+        $m = if ($h.PSObject.Properties['MatchedPath'] -and $h.MatchedPath) { " matched=$($h.MatchedPath)" } else { '' }
+        $why = if ($Reason) { $Reason } elseif ([string]$h.Via -like 'rundir-pid:*') { 'live-driver' } else { 'live-process' }
+        try { [Console]::Error.WriteLine("REFUSED worktree-removal reason=$why path=$WorktreePath pid=$($h.ProcessId) name=$($h.Name) via=$($h.Via)$m utc=$((Get-Date).ToUniversalTime().ToString('o'))") } catch { }
     }
+}
+
+function Write-RefusedCensus {
+    # r2 (key3 H4): a gate census failure writes a REFUSED line too, not only the disposition reason (pid unknown: no holder was named).
+    param([string]$WorktreePath, [string]$Reason, [string]$Detail)
+    try { [Console]::Error.WriteLine("REFUSED worktree-removal reason=$Reason path=$WorktreePath pid=unknown name= via= matched= utc=$((Get-Date).ToUniversalTime().ToString('o')) detail=$Detail") } catch { }
 }
 
 function Invoke-RetireLaneWorktree {
@@ -1044,6 +1280,9 @@ function Invoke-RetireLaneWorktree {
         [object]$ProcessSnapshot = $null,
         # r8: where to look for the rename record of a stranded <WorkDir>.retiring whose own `.git` link is gone (the sweep passes its -RepoRoot).
         [string]$RepoRoot = '',
+        # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: the fleet-runs root whose run-dir pid records are checked (Find-RunDirDriverHolders).
+        # Default (not passed) <main checkout>\.claude-state\fleet-runs; an explicit '' skips the run-dir check.
+        [string]$RunsRoot = '',
         [switch]$WhatIf
     )
     $d = [ordered]@{
@@ -1079,7 +1318,7 @@ function Invoke-RetireLaneWorktree {
         $d.cwdOwnerProbe = $r.OwnerProbe
         $d.cwdOwnerSkipped = @($r.OwnerSkipped)
         if (-not @($r.Unknown).Count) { return $false }
-        Write-RefusedHolders -WorktreePath $wd -Holders $r.Rows
+        Write-RefusedHolders -WorktreePath $wd -Holders $r.Rows -Reason ([string]$r.Reason -replace ':.*$', '')
         $d.reason = $r.Reason
         return $true
     }
@@ -1087,7 +1326,30 @@ function Invoke-RetireLaneWorktree {
         $o = & git.exe -C $C @A 2>&1
         [pscustomobject]@{ code = $LASTEXITCODE; out = @($o | ForEach-Object { "$_" }) }
     }
-    $wd = $null; $origWd = $null; $renamed = $false; $rec = $null
+    # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: positive holders (command line, cwd, script), then live drivers recorded in a run dir. The run-dir
+    # records name the ORIGINAL root even after the rename probe. $null, with the disposition's reason set, when the run dirs cannot be read.
+    # -ReuseRunIndex (the removal retry loop only, whose budget is seconds): the run-dir records read by the last call are reused; liveness
+    # still comes from $Sn, the fresh snapshot.
+    function Get-GateHolders([object]$Sn, [string]$Path, [switch]$ReuseRunIndex) {
+        $rows = @(Find-WorktreeHolders -WorktreePath $Path -Snapshot $Sn)
+        if ($rows.Count -or -not $runs) { return , $rows }
+        $key = 'RunDirIndex:' + $runs.ToLowerInvariant()
+        if ($ReuseRunIndex -and $null -ne $gateRunIndex.last -and -not $Sn.PSObject.Properties[$key]) { $Sn | Add-Member -NotePropertyName $key -NotePropertyValue $gateRunIndex.last -Force }
+        try {
+            $found = @(Find-RunDirDriverHolders -WorktreePath $(if ($origWd) { $origWd } else { $Path }) -Snapshot $Sn -RunsRoot $runs)
+            $gateRunIndex.last = $Sn.$key
+            return , $found
+        } catch {
+            $d.reason = "cannot-determine: run-dir census failed: $($_.Exception.Message)"
+            Write-RefusedCensus -WorktreePath $Path -Reason 'rundir-census-failed' -Detail $_.Exception.Message
+            return $null
+        }
+    }
+    $gateRunIndex = @{ last = $null }
+    function Format-HolderReason([object[]]$Rows) {
+        'live-process: ' + (($Rows | ForEach-Object { "$($_.ProcessId) $($_.Name) [$($_.Via)$(if ($_.Via -like 'rundir-pid:*') { " matched=$($_.MatchedPath)" })]" }) -join ', ')
+    }
+    $wd = $null; $origWd = $null; $renamed = $false; $rec = $null; $runs = ''
     try {
         # r8: a <root>.retiring is a rename-probe leftover, never a retirement candidate; only its restore (below, or in the sweep) touches it.
         if ($WorkDir -match '\.retiring[\\/]*$') { $d.reason = "stranded-retiring: $WorkDir is a rename-probe leftover, never a retirement candidate; it is restored to its own path when a rename record names it"; return [pscustomobject]$d }
@@ -1106,6 +1368,7 @@ function Invoke-RetireLaneWorktree {
         if ($gd.out[0] -eq $cd.out[0]) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: main checkout'; return [pscustomobject]$d }
         if (($top.out[0] -replace '/', '\').TrimEnd('\') -ne $wd) { $d.action = 'skipped'; $d.reason = 'not-a-linked-worktree: WorkDir is a subdirectory'; return [pscustomobject]$d }
         $main = Split-Path -Parent ($cd.out[0] -replace '/', '\')
+        $runs = if ($PSBoundParameters.ContainsKey('RunsRoot')) { $RunsRoot } else { Join-Path $main '.claude-state\fleet-runs' }
         # HOST-FSMONITOR-DAEMON-LEAK-1 (a): off BEFORE the gate's own `status` calls, which would otherwise start a daemon in a worktree kept for any reason.
         $disableResult = $null
         if (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue) { $disableResult = Disable-LaneWorktreeFsmonitor -WorkDir $wd }
@@ -1125,13 +1388,23 @@ function Invoke-RetireLaneWorktree {
             if ($p -and ([IO.Path]::GetFullPath($p) + '\').StartsWith($wd + '\', [StringComparison]::OrdinalIgnoreCase)) { $d.reason = "rundir-inside: $p"; return [pscustomobject]$d }
         }
 
-        $snap = if ($null -ne $ProcessSnapshot) { $ProcessSnapshot } else { Get-LaneProcessSnapshot }
-        $live = @(Find-WorktreeHolders -WorktreePath $wd -Snapshot $snap)
+        # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: a census that fails is typed, never folded into "no live process".
+        $snap = if ($null -ne $ProcessSnapshot) { $ProcessSnapshot } else {
+            try { Get-LaneProcessSnapshot }
+            catch {
+                $d.reason = "cannot-determine: process census failed: $($_.Exception.Message)"
+                Write-RefusedCensus -WorktreePath $wd -Reason 'census-failed' -Detail $_.Exception.Message
+                return [pscustomobject]$d
+            }
+        }
+        $live = Get-GateHolders $snap $wd
+        if ($null -eq $live) { return [pscustomobject]$d }
+        $live = @($live)
         $d.cwdProbe = [string](Get-LaneHolderIndex -Snapshot $snap).CwdProbe
         if ($live.Count) {
             $d.holders = @($live | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Via)" })
             Write-RefusedHolders -WorktreePath $wd -Holders $live
-            $d.reason = 'live-process: ' + (($live | ForEach-Object { "$($_.ProcessId) $($_.Name) [$($_.Via)]" }) -join ', ')
+            $d.reason = Format-HolderReason $live
             return [pscustomobject]$d
         }
 
@@ -1164,13 +1437,20 @@ function Invoke-RetireLaneWorktree {
 
         # Last look before anything is moved or deleted, on a FRESH scan: the gate above took seconds (a sweep reuses a
         # snapshot up to 30 s old), and a holder that started since is not in it. A failed scan is not an all-clear.
-        $fresh = try { Get-LaneProcessSnapshot } catch { $null }
-        if ($null -eq $fresh) { $d.reason = 'cannot-determine: process rescan before removal'; return [pscustomobject]$d }
-        $live = @(Find-WorktreeHolders -WorktreePath $wd -Snapshot $fresh)
+        $scanErr = $null
+        $fresh = try { Get-LaneProcessSnapshot } catch { $scanErr = $_.Exception.Message; $null }
+        if ($null -eq $fresh) {
+            $d.reason = 'cannot-determine: process rescan before removal'
+            Write-RefusedCensus -WorktreePath $wd -Reason 'census-failed' -Detail "process rescan before removal: $scanErr"
+            return [pscustomobject]$d
+        }
+        $live = Get-GateHolders $fresh $wd
+        if ($null -eq $live) { return [pscustomobject]$d }
+        $live = @($live)
         if ($live.Count) {
             $d.holders = @($live | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Via)" })
             Write-RefusedHolders -WorktreePath $wd -Holders $live
-            $d.reason = 'live-process: ' + (($live | ForEach-Object { "$($_.ProcessId) $($_.Name) [$($_.Via)]" }) -join ', ')
+            $d.reason = Format-HolderReason $live
             return [pscustomobject]$d
         }
         if (Test-CwdRefusal $fresh) { return [pscustomobject]$d }
@@ -1234,13 +1514,20 @@ function Invoke-RetireLaneWorktree {
                 # holders, then the cwd probe - on a snapshot taken now. A holder that started during the retry window refuses here, as it would have
                 # at the gate; the worktree is kept and nothing more is deleted. A failed scan is not an all-clear.
                 if ($stillRegistered -or (Test-Path -LiteralPath $wd)) {
-                    $fresh2 = try { Get-LaneProcessSnapshot } catch { $null }
-                    if ($null -eq $fresh2) { $last = 'cannot-determine: process rescan before the removal retry'; break }
-                    $live2 = @(Find-WorktreeHolders -WorktreePath $wd -Snapshot $fresh2)
+                    $scanErr = $null
+                    $fresh2 = try { Get-LaneProcessSnapshot } catch { $scanErr = $_.Exception.Message; $null }
+                    if ($null -eq $fresh2) {
+                        $last = 'cannot-determine: process rescan before the removal retry'
+                        Write-RefusedCensus -WorktreePath $wd -Reason 'census-failed' -Detail "process rescan before the removal retry: $scanErr"
+                        break
+                    }
+                    $live2 = Get-GateHolders $fresh2 $wd -ReuseRunIndex
+                    if ($null -eq $live2) { return [pscustomobject]$d }
+                    $live2 = @($live2)
                     if ($live2.Count) {
                         $d.holders = @($live2 | ForEach-Object { "$($_.ProcessId) $($_.Name) $($_.Via)" })
                         Write-RefusedHolders -WorktreePath $wd -Holders $live2
-                        $d.reason = 'live-process: ' + (($live2 | ForEach-Object { "$($_.ProcessId) $($_.Name) [$($_.Via)]" }) -join ', ')
+                        $d.reason = Format-HolderReason $live2
                         return [pscustomobject]$d
                     }
                     if (Test-CwdRefusal $fresh2) { return [pscustomobject]$d }
