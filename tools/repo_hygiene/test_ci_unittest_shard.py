@@ -222,6 +222,44 @@ class JobCapPinTests(unittest.TestCase):
         self.assertEqual(shard.TOP_CLASSES, 10)
 
 
+class JobStartEpochStepPinTests(unittest.TestCase):
+    """CI-SHARD-JOB-START-EPOCH-WORKFLOW-STEP-1: the runner reads ``CI_SHARD_JOB_START_EPOCH``, so
+    each unittest shard job's FIRST step must export it, before checkout, or the budget clock
+    silently starts at main() again and the 75 % warning fires late."""
+
+    # job name -> the command that reads the clock on that runner's default (ubuntu) or declared (windows) shell
+    CLOCKS = {
+        UBUNTU_SHARD_JOB: "date +%s",
+        WINDOWS_SHARD_JOB: "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()",
+    }
+
+    def _first_step(self, job_name: str) -> str:
+        job = _workflow_job(job_name)
+        steps = re.search(r"(?m)^    steps:\n", job)
+        self.assertIsNotNone(steps, job_name)
+        body = job[steps.end() :]
+        following = re.search(r"(?m)^      - ", body[len("      - ") :])
+        return body[: following.start() + len("      - ") if following else len(body)]
+
+    def test_each_unittest_shard_job_starts_by_exporting_the_job_start_epoch(self) -> None:
+        for job_name, clock in self.CLOCKS.items():
+            with self.subTest(job=job_name):
+                first = self._first_step(job_name)
+                self.assertTrue(first.startswith("      - name: "), first)
+                self.assertNotIn("uses:", first, "the epoch step must run before checkout")
+                self.assertIn(shard.JOB_START_ENV, first)
+                self.assertIn("GITHUB_ENV", first)
+                self.assertIn(clock, first)
+                self.assertNotIn("continue-on-error", first)
+
+    def test_the_epoch_step_precedes_checkout(self) -> None:
+        for job_name in self.CLOCKS:
+            with self.subTest(job=job_name):
+                job = _workflow_job(job_name)
+                self.assertIn(shard.JOB_START_ENV, job)
+                self.assertLess(job.index(shard.JOB_START_ENV), job.index("actions/checkout@"))
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.now = 0.0
