@@ -8085,6 +8085,20 @@ UNREADABLE_L3_COUNTERS = {
 }
 
 
+# GPU-SELFHEAL-TEST-GATE-NITS-1 (CoS #437): the L3 fault row's cuda_code as a field log could carry it unreadable. Only a JSON integer inside Int32 is a fault code;
+# on 4e258a92 the Int64 2147483648 reached `[int]$code`, which THROWS, so the metrics never existed instead of naming FAULT_CODE_NOT_NUMERIC.
+UNREADABLE_L3_FAULT_CODES = {
+    "fault-code-string-l3": "cudaErrorLaunchTimeout",
+    "fault-code-numeric-string-l3": "702",
+    "fault-code-high-l3": 2147483648,
+    "fault-code-low-l3": -2147483649,
+    "fault-code-float-l3": 702.5,
+}
+
+# The same extremes one step inside the range: a fault code, so L3's eq 0 reports the value it read, not a COULD-NOT-CHECK.
+IN_RANGE_L3_FAULT_CODES = {"fault-code-int32-max-l3": 2147483647, "fault-code-int32-min-l3": -2147483648, "fault-code-negative-l3": -1}
+
+
 def write_self_heal_evidence(root: Path, case: str = "good") -> None:
     """<artifacts>\\self-heal as the r5 job published it on Bachelor (d3ed879b), reduced to the lines the metrics read: L1 and L2 inject 702 (L2's
     second loss sets the flag), L3 starts on the CPU, the measured run L4 clears the flag. `case` breaks exactly one fact."""
@@ -8109,6 +8123,11 @@ def write_self_heal_evidence(root: Path, case: str = "good") -> None:
         refused = 397 if case == "refused-recon-l3" and n == 3 else 0
         if case == "slow-l1" and n == 1:
             fps = 10.6
+        fps_field = f"presented_fps={fps} "
+        if n == 3 and case == "fps-word-l3":
+            fps_field = "presented_fps=n/a "
+        if n == 3 and case == "fps-absent-l3":
+            fps_field = ""
         counters = (f"gpu_preview_frames={preview} gpu_recon_readback_frames=0 gpu_texture_readback_frames=0 "
                     f"gpu_texture_no_readback_frames={cuda}")
         if n == 3 and case in UNREADABLE_L3_COUNTERS:
@@ -8117,7 +8136,7 @@ def write_self_heal_evidence(root: Path, case: str = "good") -> None:
             refused = ""
         (d / "result.json.run.log").write_text("\n".join([
             "[2026-10-15T08:27:10.400Z] [INFO] [0xd900] playback_smoke.measured_session id=1",
-            f"[2026-10-15T08:27:36.324Z] [INFO] [0xd900] playback_smoke.summary session=1 reason=visual-capture presented_frames=586 presented_fps={fps} last_presented_frame=597",
+            f"[2026-10-15T08:27:36.324Z] [INFO] [0xd900] playback_smoke.summary session=1 reason=visual-capture presented_frames=586 {fps_field}last_presented_frame=597",
             f"[2026-10-15T08:27:36.326Z] [INFO] [0xd900] playback_smoke.gpu_summary session=1 cpu_frames={cpu} {counters}",
             f"[2026-10-15T08:27:36.336Z] [INFO] [0xd900] playback_smoke.debayered16_recon_reuse_summary session=1 scope=presented_frames refused_acquisition_failed=0 "
             f"refused_gpu_playback_recon={refused} reduced_consumed_frames={cpu}", ""]), encoding="utf-8")
@@ -8128,6 +8147,10 @@ def write_self_heal_evidence(root: Path, case: str = "good") -> None:
             rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "device_loss", "outcome": "cuda_suppressed_session"})
         if case == "fault-code-absent-l3" and n == 3:
             rows.append({"schema": "gpu-field-telemetry.v1", "kind": "fault", "dll": "inject", "stage": "recon:run", "rc": -1,
+                         "site": "MLVAPP_GPU_FAULT_INJECT", "fault_utc_ms": 1792052833762.0, "device_loss": True, "role": "primary"})
+        if n == 3 and case in {**UNREADABLE_L3_FAULT_CODES, **IN_RANGE_L3_FAULT_CODES}:
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "fault", "dll": "inject", "stage": "recon:run", "rc": -1,
+                         "cuda_code": {**UNREADABLE_L3_FAULT_CODES, **IN_RANGE_L3_FAULT_CODES}[case],
                          "site": "MLVAPP_GPU_FAULT_INJECT", "fault_utc_ms": 1792052833762.0, "device_loss": True, "role": "primary"})
         if n == 2:
             rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "safe_start_flag", "outcome": "set"})
@@ -8175,13 +8198,17 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
         "counters-string-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames"], "COUNTER_NOT_NUMERIC"),
         "counters-word-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames"], "COUNTER_NOT_NUMERIC"),
         "fault-code-absent-l3": (["selfHealL3InjectedFaultCode"], "FAULT_CODE_ABSENT"),
+        **{case: (["selfHealL3InjectedFaultCode"], "FAULT_CODE_NOT_NUMERIC") for case in UNREADABLE_L3_FAULT_CODES},
+        # an unreadable launch presented_fps leaves the ratio null; it reuses the counter reader, so its tokens are the counter tokens
+        "fps-word-l3": (["selfHealL3FpsRatio"], "COUNTER_NOT_NUMERIC"),
+        "fps-absent-l3": (["selfHealL3FpsRatio"], "COUNTER_ABSENT"),
     }
 
-    def evaluate(self, cases) -> dict:
+    def evaluate(self, cases, measured_fps: str = "23.201") -> dict:
         with tempfile.TemporaryDirectory(prefix="sh-gate-") as d:
             measured = Path(d) / "measured.log"
             measured.write_text("playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 "
-                                "presented_fps=23.201\n", encoding="utf-8")
+                                f"presented_fps={measured_fps}\n", encoding="utf-8")
             for case in cases:
                 if case != "l4-counters-only":
                     write_self_heal_evidence(Path(d) / case / "self-heal", "good" if case == "good" else case)
@@ -8243,6 +8270,31 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                     self.assertIn(f": COULD-NOT-CHECK {token} ", failure, case)
                 for metric in expected:
                     self.assertIsNone(got["metrics"][metric], f"{case}: {metric} is never a default")
+
+    def test_an_in_range_fault_code_is_read_as_the_value_never_could_not_check(self) -> None:
+        """GPU-SELFHEAL-TEST-GATE-NITS-1: the range check refuses only what an Int32 cannot hold. Int32.MaxValue, Int32.MinValue and -1 are fault codes
+        -- L3's eq 0 fails on the value it read ('actual N'), with no COULD-NOT-CHECK reason and a non-null metric."""
+        out = self.evaluate(list(IN_RANGE_L3_FAULT_CODES))
+        for case, code in IN_RANGE_L3_FAULT_CODES.items():
+            with self.subTest(case):
+                got = out[case]
+                self.assertEqual(got["failures"], [f"selfHealL3InjectedFaultCode eq 0 failed (actual {code})"])
+                self.assertEqual(got["metrics"]["selfHealL3InjectedFaultCode"], code)
+                self.assertIsNone(got["metrics"]["selfHealL3InjectedFaultCodeCouldNotCheck"])
+
+    def test_an_unusable_measured_fps_is_could_not_check_for_every_launch_ratio(self) -> None:
+        """GPU-SELFHEAL-TEST-GATE-NITS-1: the measured run's presented_fps is the denominator of L1-L3's ratio. A zero or non-decimal one leaves all three
+        ratios null with MEASURED_FPS_UNUSABLE (never a divide-by-zero or a default), while the launches' own PresentedFps stay readable."""
+        for measured_fps, detail in (("0", "summary.presented_fps=0"), ("n/a", "COUNTER_NOT_NUMERIC summary.presented_fps='n/a'")):
+            with self.subTest(measured_fps=measured_fps):
+                got = self.evaluate(["good"], measured_fps=measured_fps)["good"]
+                self.assertFalse(got["pass"])
+                self.assertEqual(sorted({f.split(" ")[0].rstrip(":") for f in got["failures"]}), [f"selfHealL{n}FpsRatio" for n in (1, 2, 3)], got["failures"])
+                for failure in got["failures"]:
+                    self.assertIn(f": COULD-NOT-CHECK MEASURED_FPS_UNUSABLE {detail}", failure)
+                for n in (1, 2, 3):
+                    self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
+                    self.assertIsNotNone(got["metrics"][f"selfHealL{n}PresentedFps"])
 
 
 class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
