@@ -3197,6 +3197,57 @@ def test_launcher_census_detached_launch_split_over_backtick_continuation_lines_
     assert len(_detached_sites(text)) == 1, "a hidden Start-Process split across continuation lines is not seen"
 
 
+# --- r2 (Dot advisory 6390752487): the census scanner is statement- and quote-aware.
+# B1: `;` separates statements, so `<pinned launch A>; <launch B>` on ONE line is two sites, not one.
+# B2: `<#` / `#>` only open and close a block comment outside a string, so a quoted '<#' ... '#>' pair cannot hide the code between them.
+
+def test_launcher_census_b1_same_line_semicolon_second_encoded_launch_is_unclassified():
+    inventory = {_SYNTH: [(_ENC_LAUNCH_A, "classified")]}
+    text = _ENC_LAUNCH_A + "; " + _ENC_LAUNCH_B + "\n"
+    assert len(_encoded_sites(text)) == 2, "a `;`-separated second -EncodedCommand launch was folded into the first site"
+    problems = _census_problems({_SYNTH: text}, inventory, {})
+    assert problems and any("unclassified" in p for p in problems), "the pinned first launch consumed the unpinned second one on the same line"
+
+
+def test_launcher_census_b1_same_line_semicolon_second_detached_launch_is_unclassified():
+    inventory = {_SYNTH: [(_DET_LAUNCH_A, "classified")]}
+    text = _DET_LAUNCH_A + "; " + _DET_LAUNCH_B + "\n"
+    assert len(_detached_sites(text)) == 2, "a `;`-separated second detached launch was folded into the first site"
+    problems = _census_problems({_SYNTH: text}, {}, inventory)
+    assert problems and any("unclassified" in p for p in problems), "the pinned first launch consumed the unpinned second one on the same line"
+
+
+def test_launcher_census_b2_quoted_block_comment_markers_cannot_hide_an_encoded_launch():
+    text = "Write-Host '<#'\n" + _ENC_LAUNCH_B + "\nWrite-Host '#>'\n"
+    assert len(_encoded_sites(text)) == 1, "a quoted '<#' ... '#>' pair hid the -EncodedCommand launch between them"
+    assert _census_problems({_SYNTH: text}, {}, {}), "the census passes a file whose only launch sits between quoted comment markers"
+
+
+def test_launcher_census_b2_quoted_block_comment_markers_cannot_hide_a_detached_launch():
+    text = "Write-Host '<#'\n" + _DET_LAUNCH_B + "\nWrite-Host '#>'\n"
+    assert len(_detached_sites(text)) == 1, "a quoted '<#' ... '#>' pair hid the detached launch between them"
+    assert _census_problems({_SYNTH: text}, {}, {}), "the census passes a file whose only launch sits between quoted comment markers"
+
+
+def test_launcher_census_b1_semicolon_inside_a_quoted_string_is_not_a_statement_split():
+    first = "Start-Process -FilePath $exeA -ArgumentList 'x;y' -WindowStyle Hidden"
+    sites = _detached_sites(first + "; " + _DET_LAUNCH_B + "\n")
+    assert len(sites) == 2, "the `;` after the quoted argument was not treated as a statement separator"
+    assert "'x;y'" in sites[0][1] and sites[0][1].endswith("-WindowStyle Hidden"), "a `;` inside a quoted string split its own statement"
+    assert len(_detached_sites(first + "\n")) == 1, "a `;` inside a quoted string produced a false second site"
+
+
+def test_launcher_census_b2_real_comments_and_comment_markers_inside_strings_and_here_strings():
+    block = "<#\n" + _ENC_LAUNCH_A + "\n#>\n# " + _ENC_LAUNCH_B + "\n"
+    assert _encoded_sites(block) == [], "a launch inside a real comment was counted"
+    quoted = '$m = "see <# not a comment"\n' + _DET_LAUNCH_A + "\n"
+    assert len(_detached_sites(quoted)) == 1, "a `<#` inside a double-quoted string swallowed the launch after it"
+    here = "$h = @'\n<# not a comment in a here-string\n'@\n" + _DET_LAUNCH_B + "\n"
+    assert len(_detached_sites(here)) == 1, "a `<#` inside a here-string swallowed the launch after it"
+    trailing = _DET_LAUNCH_A + " # trailing comment; " + _DET_LAUNCH_B + "\n"
+    assert len(_detached_sites(trailing)) == 1, "a launch inside a trailing # comment was counted"
+
+
 @pytest.mark.parametrize("line", [
     "& pwsh -NoProfile -e " + B64,
     "& pwsh.exe -NoProfile -enc " + B64,
