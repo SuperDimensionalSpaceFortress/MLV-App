@@ -125,7 +125,7 @@ $childExecutables = @('vsLocator', 'psExe', 'cuobjdump', 'exportTool', 'nvcc')
 $allowedStatic = @(
     'double::Parse', 'double::TryParse', 'Environment::GetEnvironmentVariable',
     'Globalization.CultureInfo::InvariantCulture', 'Globalization.NumberStyles::Float',
-    'Guid::NewGuid',
+    'Guid::NewGuid', 'int::MaxValue', 'int::MinValue',
     'IO.File::ReadAllText', 'IO.Path::GetFileNameWithoutExtension', 'IO.Path::GetFullPath',
     'math::Ceiling', 'math::Floor', 'math::Pow', 'math::Round', 'math::Sqrt', 'regex::Escape', 'regex::Matches',
     'string::IsNullOrWhiteSpace', 'StringComparison::OrdinalIgnoreCase',

@@ -584,6 +584,19 @@ class SplicedBodyScanFixtureTests(unittest.TestCase):
         found = self.spliced_scan(generator, module)["splicedViolations"]
         self.assertEqual([(f["rule"], f["token"]) for f in found], [("R4", "IO.File::WriteAllText")], describe(found))
 
+    def test_int_min_and_max_value_scan_clean_but_the_allowlist_does_not_widen_to_the_whole_type(self) -> None:
+        # The range-checked Int32 cast in Get-AttrCudaSelfHealMetrics (#659) reads both constants.
+        generator, module = self.build(
+            "    param([long]$code)\n"
+            "    $code -ge [int]::MinValue -and $code -le [int]::MaxValue"
+        )
+        clean = self.spliced_scan(generator, module)["splicedViolations"]
+        self.assertEqual(clean, [], describe(clean))
+        # Another static member of the same type is still judged on its own name.
+        generator, module = self.build("    [int]::Parse('1')")
+        found = self.spliced_scan(generator, module)["splicedViolations"]
+        self.assertEqual([(f["rule"], f["token"]) for f in found], [("R4", "int::Parse")], describe(found))
+
     def test_a_redirection_into_pub_is_flagged_r6(self) -> None:
         generator, module = self.build("    Get-Date > (Join-Path $Pub 'x')")
         found = self.spliced_scan(generator, module)["splicedViolations"]
