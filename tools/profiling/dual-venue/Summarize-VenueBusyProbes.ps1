@@ -9,6 +9,9 @@
 #
 #   pwsh -NoProfile -File "<repo>\tools\profiling\dual-venue\Summarize-VenueBusyProbes.ps1" -ProbeDir <work dir> [-ThresholdPercent 20] [-IncludeQuiet] [-Json]
 #   pwsh -NoProfile -File "<repo>\tools\profiling\dual-venue\Summarize-VenueBusyProbes.ps1" -ProbeJson <file>,<file>
+# -ProbeJson takes a comma-joined list (under `pwsh -File` a list reaches a [string[]] as ONE string, so it is split here; a path that exists as given is never split, so a comma
+# in a file name is safe). A probe is identified by its normalised full path: a file named twice (two spellings, or by -ProbeJson and again by -ProbeDir) counts once, and the
+# same file name in two directories counts as two probes.
 #
 # THE DECISION IS THE GATE'S OWN. Get-VenueQuietDecision is LIFTED from Wait-VenueQuiet.ps1 by AST (there is no second copy of the quiet rule); when it cannot be lifted this
 # exits 3 DECISION_LIFT_FAILED. QUIET and UNKNOWN probes are skipped (and counted) unless -IncludeQuiet keeps the QUIET ones. A file that does not parse is counted `unreadable`.
@@ -30,6 +33,7 @@ param(
     [string]$DecisionSource = ''
 )
 $ErrorActionPreference = 'Stop'
+$ProbeJson = @($ProbeJson | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })   # -File passes 'a','b' as one comma-joined string
 $here = $PSScriptRoot
 $identitySchemaV1 = 'mlv-app/venue-quiet-probe-identity/v1'
 if (-not $DecisionSource) { $DecisionSource = Join-Path $here 'Wait-VenueQuiet.ps1' }
@@ -73,11 +77,19 @@ try {
 if (-not $lifted) { Stop-Usage "DECISION_LIFT_FAILED Get-VenueQuietDecision could not be lifted from '$DecisionSource'; there is no second copy of the quiet rule" 3 }
 
 # 3. the files
-$files = @()
-foreach ($p in $ProbeJson) { if ($p) { $files += $p } }
+$candidates = @()
+foreach ($p in $ProbeJson) { if ($p) { $candidates += $p } }
 if ($ProbeDir) {
     if (-not (Test-Path -LiteralPath $ProbeDir -PathType Container)) { Stop-Usage "USAGE -ProbeDir '$ProbeDir' is not a directory" }
-    $files += @(Get-ChildItem -LiteralPath $ProbeDir -Filter 'venue-quiet-probe-*.json' -File | Sort-Object Name | ForEach-Object { $_.FullName })
+    $candidates += @(Get-ChildItem -LiteralPath $ProbeDir -Filter 'venue-quiet-probe-*.json' -File | Sort-Object Name | ForEach-Object { $_.FullName })
+}
+# one probe = one normalised full path: a file named twice (two spellings, or by -ProbeJson and by -ProbeDir) is read once, and the key that counts a probe per project is that
+# path, never the basename (the same name in two directories is two probes)
+$files = @(); $fileKey = @{}; $seenKeys = @{}
+foreach ($c in $candidates) {
+    $k = ConvertTo-PathKey $c
+    if ($seenKeys.ContainsKey($k)) { continue }
+    $seenKeys[$k] = $true; $files += $c; $fileKey[$c] = $k
 }
 $unreadable = 0; $quietSkipped = 0; $unknownSkipped = 0; $busy = 0
 $byProject = @{}; $gpuHeavy = @{}
@@ -93,7 +105,7 @@ foreach ($f in $files) {
         $map = @{}
         foreach ($r in @($probe.identity.processes)) { if ($null -ne $r -and $null -ne $r.pid) { $map["$($r.pid)"] = $r } }
     }
-    $probeKey = [IO.Path]::GetFileName($f)
+    $probeKey = $fileKey[$f]
     foreach ($t in @($probe.top)) {
         $row = $(if ($null -ne $map -and $null -ne $t.pid -and $map.ContainsKey("$($t.pid)")) { $map["$($t.pid)"] } else { $null })
         $project = 'unknown(no-identity)'; $script = 'n/a'; $owner = 'n/a'

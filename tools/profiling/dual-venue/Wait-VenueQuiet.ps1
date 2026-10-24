@@ -45,13 +45,16 @@
 #          UNREDACTED command line and executable path (held in memory only), the process itself first, then its parent, then its grandparent; only the table's name is emitted.
 #          A user-profile root is not a project (the owner field covers it). The working directory is NOT collected: Win32_Process does not expose it and reading the process
 #          environment block or memory is out of scope. No environment block is ever read.
-#        REDACTION, in order, before anything is written: URL userinfo, bearer values, key-like arguments (key, token, secret, password, auth, credential, signature, session, cookie ...),
-#          known token prefixes and JWTs, opaque 40+ character runs; then a 200-character cap that keeps the first 200 and appends `...[+N]` (cmdline_truncated_chars = N).
-#          Hyphenated or underscored card and worktree names survive.
+#        REDACTION, in order, before anything is written: URL userinfo, an Authorization header (scheme AND credential), bearer values, key-like arguments (key, token, secret, password,
+#          auth, credential, signature, session, cookie ...; the name may be followed by a closing quote, so JSON keys count, or by a URL-encoded separator), known token prefixes and JWTs,
+#          opaque 40+ character runs; then a 200-character cap that keeps the first 200 and appends `...[+N]` (cmdline_truncated_chars = N). Hyphenated or underscored card and
+#          worktree names survive. Rule order and the counting are documented at Protect-IdentText.
 #        NON-ELEVATED DEGRADATION: the probe runs as the agent account, not elevated. What it cannot read is a TYPED status, never a guess: owner_status access-denied | exited |
 #          error-<ReturnValue> | budget-exceeded, cmdline_status / exe_status unreadable | exited, gpu_status counter-unavailable: <why> | no-gpu-context | disabled: <why>. A null
 #          always has its reason. WALL-CLOCK BUDGET: past 25 s of identity time no further GetOwner call is made (owner_status budget-exceeded), so identity can never push the
-#          probe job toward its 120 s submission timeout, which would turn a measured busy venue into UNKNOWN.
+#          probe job toward its 120 s submission timeout, which would turn a measured busy venue into UNKNOWN. CALL DEADLINE: the budget gates only later GetOwner calls, so every
+#          synchronous call (the GPU read, each Win32_Process query, each GetOwner) ALSO runs in a worker runspace with a 5 s deadline of its own and is abandoned past it: gpu_status
+#          `timeout: ...`, owner_status `timeout`, or (a query) identity = { schema, error }; the measured samples and the quiet decision are never touched.
 #        GATE TEXT: each `top` line keeps its prefix byte for byte and appends comma-free, whitespace-free key=value pairs (owner project script parent gparent started gpu); `attr proc`
 #          lines append owner and project; `ident probe` (user, elevated, cost), `ident gpu` (GPU-heavy pids not already in top), `ident note` and `ident error` follow the attr lines.
 #          No command line is ever printed. Summarize-VenueBusyProbes.ps1 (read-only) groups the busy probes' raw files by project using this script's own decision function.
@@ -492,6 +495,14 @@ $IdentityGpuDisabledWhy = ''
 # WALL-CLOCK BUDGET: identity must never push the probe job toward its 120 s submission timeout (a timed-out probe is UNKNOWN, a changed decision). Past this many ms of identity
 # time no further GetOwner call is made: the remaining rows say owner_status budget-exceeded. Command line, parent chain and project do not need a call and are still filled.
 $IdentityBudgetMs = 25000
+# CALL DEADLINE: the budget above gates only LATER GetOwner calls, so each synchronous call (the GPU Engine read, every Win32_Process query, every GetOwner) also has a deadline of its own.
+# Each runs in a WORKER RUNSPACE and is abandoned after this many ms: a GPU read becomes gpu_status `timeout: ...`, a GetOwner becomes owner_status `timeout`, a Win32_Process query becomes
+# identity = { schema, error } (the same typed degradation as any other identity failure). The measured samples, top and every v2 figure are read BEFORE any of this and never change.
+# Worst case: GPU + 3 queries + the budget-gated GetOwner calls + one more = 4 x 5 s + 25 s + 5 s = 50 s on top of the 24 s sample window, inside the 120 s submission timeout.
+# A worker thread stuck in a native call is a FOREGROUND thread, so the job ends with [Environment]::Exit after its line is written when any call was abandoned.
+# $IdentityWorkerPrelude is PowerShell run once in each new worker (empty in production): the workers are separate runspaces, so it is the seam a test uses to re-declare its shadows there.
+$IdentityCallMs = 5000
+$IdentityWorkerPrelude = ''
 $identitySchema = 'mlv-app/venue-quiet-probe-identity/v1'
 # the pinned project table: first match wins, case-insensitive substring on the UNREDACTED command line + executable path (held in memory only; only the name is emitted)
 $identityProjects = @(
@@ -499,14 +510,20 @@ $identityProjects = @(
     @('agent-bridge', 'agent-bridge'), @('Adobe Document Cloud Ingester', 'adobe-ingester'), @('softwarefactory-fleet-doctrine', 'fleet-doctrine'),
     @('AdversarialLLM', 'adversarialllm'), @('VIRTUAL-TEN', 'virtual-ten'), @('AirMyPC', 'airmypc')
 )
-# REDACTION, in this order, counted: (a) URL userinfo (b) bearer values (c) key-like arguments (d) known token prefixes and JWTs (e) opaque 40+ runs; then a 200-char cap.
+# REDACTION, in this order, counted once per rule match (a text two rules both touch counts twice; the key-like rule skips a value that is already <redacted>):
+#   (a) URL userinfo (b) an Authorization header: the scheme AND the credential, run BEFORE the key-like rule (which would redact the scheme word only and leave `Basic <b64>`)
+#   (c) bearer values (d) key-like arguments: a key name may be followed by an optional closing quote (JSON keys `"password":"x"`, `'token':'x'`, escaped `\"k\":\"x\"`) or by a
+#   URL-encoded separator (`password%3Dx`, `%22k%22%3A%22x%22`) (e) known token prefixes and JWTs (f) opaque 40+ runs; then a 200-char cap.
+# KNOWN LIMIT: an Authorization: Digest header redacts its first parameter only. A shape this set cannot catch is a gap, not a guarantee: the wall of defence is the 200-char cap, the
+# opaque-run rule, and that no command line is ever printed to a gate text line.
 function Protect-IdentText($Text) {
     if ($null -eq $Text) { return $null }
     $s = [string]$Text; $n = 0
     $rules = @(
         @('(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@', '$1<redacted>@'),
-        @('(?i)\bbearer\s+\S+', 'Bearer <redacted>'),
-        @('(?i)((?:--?|/)?[a-z0-9_.-]*(?:key|token|secret|password|passwd|pwd|auth|credential|signature|sig|session|cookie)[a-z0-9_.-]*)(\s*[=:]\s*|\s+)("[^"]*"|''[^'']*''|[^\s&]+)', '$1$2<redacted>'),
+        @('(?i)(\bauthorization(?:\\?["'']|%22|%27)?\s*(?:[=:]|%3[ad])\s*(?:\\?["'']|%22|%27)?)(?:(?:basic|bearer|digest|negotiate|ntlm|token)\s+)?[^\s"''&\\]+', '$1<redacted>'),
+        @('(?i)\bbearer\s+(?!<redacted>)\S+', 'Bearer <redacted>'),
+        @('(?i)((?:--?|/)?[a-z0-9_.-]*(?:key|token|secret|password|passwd|pwd|auth|credential|signature|sig|session|cookie)[a-z0-9_.-]*)((?:(?:\\?["'']|%22|%27)?\s*(?:[=:]|%3[ad])\s*)|\s+)(?!<redacted>)("[^"]*"|''[^'']*''|[^\s&]+)', '$1$2<redacted>'),
         @('(sk-|ghp_|gho_|ghs_|github_pat_|xox[abps]-|AKIA)[A-Za-z0-9_-]{10,}', '<redacted>'),
         @('eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '<redacted>'),
         @('[A-Za-z0-9+/=]{40,}', '<redacted>')
@@ -534,6 +551,52 @@ function Get-IdentProject($Row) {
     foreach ($e in $identityProjects) { if ($t.IndexOf($e[0], [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $e[1] } }
     $null
 }
+# The three bounded calls, as the text each worker runs ($args[0] is the call's one argument). Each returns { ok, v, msg } and never throws.
+$IdentGpuScript = {
+    try { [pscustomobject]@{ ok = $true; v = @((Get-Counter -Counter '\GPU Engine(*)\Utilization Percentage' -MaxSamples 1 -ErrorAction SilentlyContinue).CounterSamples | Where-Object { $null -ne $_ }); msg = $null } }
+    catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
+}.ToString()
+$IdentCimScript = {
+    try { [pscustomobject]@{ ok = $true; v = @(Get-CimInstance -ClassName Win32_Process -Filter $args[0] -ErrorAction Stop); msg = $null } }
+    catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
+}.ToString()
+$IdentOwnerScript = {
+    try { $o = Invoke-CimMethod -InputObject $args[0] -MethodName GetOwner -ErrorAction Stop; [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ ReturnValue = [int]$o.ReturnValue; Domain = [string]$o.Domain; User = [string]$o.User }; msg = $null } }
+    catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
+}.ToString()
+$script:IdentRs = $null
+$script:IdentAbandoned = 0
+function Get-IdentWorker {
+    if ($null -eq $script:IdentRs) {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.Open()
+        if ($IdentityWorkerPrelude) { $pp = [powershell]::Create(); try { $pp.Runspace = $rs; [void]$pp.AddScript($IdentityWorkerPrelude); [void]$pp.Invoke() } finally { $pp.Dispose() } }
+        $script:IdentRs = $rs
+    }
+    $script:IdentRs
+}
+# one call with a deadline of its own: { timeout, ok, v, msg }. A call past the deadline is ABANDONED (its worker is left to die with the process and the next call gets a fresh one).
+function Invoke-IdentBounded([string]$Script, [object[]]$ArgList, [int]$TimeoutMs) {
+    $ps = [powershell]::Create()
+    try {
+        $ps.Runspace = Get-IdentWorker
+        [void]$ps.AddScript($Script)
+        foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }
+        $ar = $ps.BeginInvoke()
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            $script:IdentRs = $null; $script:IdentAbandoned++
+            try { [void]$ps.BeginStop($null, $null) } catch { }
+            $ps = $null
+            return [pscustomobject]@{ timeout = $true; ok = $false; v = $null; msg = "timed out after $TimeoutMs ms" }
+        }
+        $o = @($ps.EndInvoke($ar)) | Select-Object -Last 1
+        if ($null -eq $o) { return [pscustomobject]@{ timeout = $false; ok = $false; v = $null; msg = 'the worker returned nothing' } }
+        [pscustomobject]@{ timeout = $false; ok = [bool]$o.ok; v = $o.v; msg = [string]$o.msg }
+    } catch {
+        [pscustomobject]@{ timeout = $false; ok = $false; v = $null; msg = [string]$_.Exception.Message }
+    } finally { if ($null -ne $ps) { $ps.Dispose() } }
+}
+function Close-IdentWorker { if ($null -ne $script:IdentRs) { try { $script:IdentRs.Dispose() } catch { }; $script:IdentRs = $null } }
 # ONE WQL query for a set of pids (validated integers, so nothing but digits reaches the filter); never a full-table enumeration
 function Get-IdentCim($Ids) {
     $h = @{}
@@ -541,25 +604,28 @@ function Get-IdentCim($Ids) {
     if ($ids.Count -eq 0) { return $h }
     $filter = ($ids | ForEach-Object { "ProcessId=$_" }) -join ' OR '
     $csw = [Diagnostics.Stopwatch]::StartNew()
-    try { $rows = @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction Stop) } finally { $csw.Stop(); $script:IdentCimMs += $csw.ElapsedMilliseconds; $script:IdentCimQueries++ }
-    foreach ($r in $rows) { if ($null -ne $r) { $h["$([int64]$r.ProcessId)"] = $r } }
+    try { $w = Invoke-IdentBounded $IdentCimScript @($filter) $IdentityCallMs } finally { $csw.Stop(); $script:IdentCimMs += $csw.ElapsedMilliseconds; $script:IdentCimQueries++ }
+    if ($w.timeout) { throw "Win32_Process query timed out after $IdentityCallMs ms" }
+    if (-not $w.ok) { throw [string]$w.msg }
+    foreach ($r in @($w.v)) { if ($null -ne $r) { $h["$([int64]$r.ProcessId)"] = $r } }
     $h
 }
 function Get-IdentOwner($Row) {
     $osw = [Diagnostics.Stopwatch]::StartNew()
     try {
-        try {
-            $r = Invoke-CimMethod -InputObject $Row -MethodName GetOwner -ErrorAction Stop
-            $rv = [int]$r.ReturnValue
-            if ($rv -eq 0 -and -not [string]::IsNullOrEmpty([string]$r.User)) { return @{ owner = $(if ([string]$r.Domain) { "$($r.Domain)\$($r.User)" } else { [string]$r.User }); status = 'ok' } }
-            if ($rv -eq 2) { return @{ owner = $null; status = 'access-denied' } }
-            return @{ owner = $null; status = "error-$rv" }
-        } catch {
-            $msg = [string]$_.Exception.Message
+        $w = Invoke-IdentBounded $IdentOwnerScript @($Row) $IdentityCallMs
+        if ($w.timeout) { return @{ owner = $null; status = 'timeout' } }
+        if (-not $w.ok) {
+            $msg = [string]$w.msg
             if ($msg -match '(?i)access is denied|access denied|0x80041003') { return @{ owner = $null; status = 'access-denied' } }
             if ($msg -match '(?i)not found|0x80041002|invalid object') { return @{ owner = $null; status = 'exited' } }
             return @{ owner = $null; status = 'error-exception' }
         }
+        $r = $w.v
+        $rv = [int]$r.ReturnValue
+        if ($rv -eq 0 -and -not [string]::IsNullOrEmpty([string]$r.User)) { return @{ owner = $(if ([string]$r.Domain) { "$($r.Domain)\$($r.User)" } else { [string]$r.User }); status = 'ok' } }
+        if ($rv -eq 2) { return @{ owner = $null; status = 'access-denied' } }
+        return @{ owner = $null; status = "error-$rv" }
     } finally { $osw.Stop(); $script:IdentOwnerMs += $osw.ElapsedMilliseconds }
 }
 # parent / grandparent: no CIM row = exited; a parent that STARTED AFTER its child is a reused pid (never named); no parent pid or no dates to compare = none
@@ -592,23 +658,28 @@ try {
     else {
         $gsw = [Diagnostics.Stopwatch]::StartNew()
         try {
-            $gs = @((Get-Counter -Counter '\GPU Engine(*)\Utilization Percentage' -MaxSamples 1 -ErrorAction SilentlyContinue).CounterSamples | Where-Object { $null -ne $_ })
-            $engSum = @{}; $engType = @{}; $gpuInstances = 0
-            foreach ($s in $gs) {
-                $lp = ([string]$s.Path).ToLowerInvariant()
-                if ($lp -notmatch '\(pid_(\d+)_luid_(0x[0-9a-f]+)_(0x[0-9a-f]+)_phys_(\d+)_eng_(\d+)_engtype_([^)]*)\)\\utilization percentage$') { continue }
-                $gPid = $Matches[1]; $gEng = "$gPid|$($Matches[2])_$($Matches[3])_$($Matches[4])_$($Matches[5])"; $gType = $Matches[6]
-                $gpuInstances++
-                $gv = Get-GoodValue $s
-                if ($null -eq $gv) { continue }
-                $engSum[$gEng] = [double]$engSum[$gEng] + $gv; $engType[$gEng] = $gType
+            $gw = Invoke-IdentBounded $IdentGpuScript @() $IdentityCallMs
+            if ($gw.timeout) { $gpuStatus = "timeout: GPU Engine read exceeded $IdentityCallMs ms" }
+            elseif (-not $gw.ok) { throw [string]$gw.msg }
+            else {
+                $gs = @($gw.v | Where-Object { $null -ne $_ })
+                $engSum = @{}; $engType = @{}; $gpuInstances = 0
+                foreach ($s in $gs) {
+                    $lp = ([string]$s.Path).ToLowerInvariant()
+                    if ($lp -notmatch '\(pid_(\d+)_luid_(0x[0-9a-f]+)_(0x[0-9a-f]+)_phys_(\d+)_eng_(\d+)_engtype_([^)]*)\)\\utilization percentage$') { continue }
+                    $gPid = $Matches[1]; $gEng = "$gPid|$($Matches[2])_$($Matches[3])_$($Matches[4])_$($Matches[5])"; $gType = $Matches[6]
+                    $gpuInstances++
+                    $gv = Get-GoodValue $s
+                    if ($null -eq $gv) { continue }
+                    $engSum[$gEng] = [double]$engSum[$gEng] + $gv; $engType[$gEng] = $gType
+                }
+                if ($gpuInstances -eq 0) { $gpuStatus = 'counter-unavailable: no GPU Engine instance' }
+                foreach ($e in $engSum.Keys) {
+                    $gPid = $e.Substring(0, $e.IndexOf('|'))
+                    if (-not $gpuBest.ContainsKey($gPid) -or $engSum[$e] -gt $gpuBest[$gPid].percent) { $gpuBest[$gPid] = @{ percent = $engSum[$e]; engtype = $engType[$e] } }
+                }
+                $gpuTop = @($gpuBest.Keys | Where-Object { $gpuBest[$_].percent -gt 0 } | Sort-Object @{ Expression = { $gpuBest[$_].percent }; Descending = $true }, @{ Expression = { [int64]$_ } } | Select-Object -First 3 | ForEach-Object { [int64]$_ })
             }
-            if ($gpuInstances -eq 0) { $gpuStatus = 'counter-unavailable: no GPU Engine instance' }
-            foreach ($e in $engSum.Keys) {
-                $gPid = $e.Substring(0, $e.IndexOf('|'))
-                if (-not $gpuBest.ContainsKey($gPid) -or $engSum[$e] -gt $gpuBest[$gPid].percent) { $gpuBest[$gPid] = @{ percent = $engSum[$e]; engtype = $engType[$e] } }
-            }
-            $gpuTop = @($gpuBest.Keys | Where-Object { $gpuBest[$_].percent -gt 0 } | Sort-Object @{ Expression = { $gpuBest[$_].percent }; Descending = $true }, @{ Expression = { [int64]$_ } } | Select-Object -First 3 | ForEach-Object { [int64]$_ })
         } catch { $gpuStatus = 'counter-unavailable: ' + (([string]$_.Exception.Message) -replace '\s+', ' ') }
         $gsw.Stop(); $gpuMs = $gsw.ElapsedMilliseconds
     }
@@ -693,6 +764,7 @@ try {
     $identNotes['cim_queries'] = "$($script:IdentCimQueries) WQL queries for $($targets.Count) target pid(s) (bound: 3); GetOwner once per target"
     if ($ownerBad -gt 0) { $identNotes['owner_unreadable'] = "$ownerBad of $($targets.Count) target(s) have no owner: see owner_status per row (a non-elevated probe cannot read other users' processes)" }
     if ($cmdBad -gt 0) { $identNotes['cmdline_unreadable'] = "$cmdBad of $($targets.Count) target(s) have no command line: see cmdline_status per row" }
+    if ($script:IdentAbandoned -gt 0) { $identNotes['calls_abandoned'] = "$($script:IdentAbandoned) identity call(s) passed their $IdentityCallMs ms deadline and were abandoned: see the *_status fields" }
     $idSw.Stop()
     $identity = [ordered]@{
         schema = $identitySchema; probe_user = $probeUser; elevated = $elevated; project_roots = 'r1'
@@ -705,7 +777,7 @@ try {
     $identity['notes'] = $identNotes
 } catch {
     $identity = [ordered]@{ schema = $identitySchema; error = (([string]$_.Exception.Message) -replace '\s+', ' ') }
-}
+} finally { Close-IdentWorker }
 Write-Output ('VENUE_QUIET=' + ([ordered]@{
     schema = 'mlv-app/venue-quiet-probe/v2'; host = $env:COMPUTERNAME; samples = $samples; top = $top
     cpu_count = $cpuCount
@@ -720,6 +792,8 @@ Write-Output ('VENUE_QUIET=' + ([ordered]@{
     notes = $notes
     identity = $identity
 } | ConvertTo-Json -Compress -Depth 6))
+# an abandoned worker may still be inside a native call, and a runspace thread is a foreground thread: end the process now that the line is written
+if ($script:IdentAbandoned -gt 0) { [Console]::Out.Flush(); [Environment]::Exit(0) }
 '@
 
 # v2 attribution, printed AFTER the verdict and top lines so the gate log says what kept the venue busy. Display only: nothing here feeds the decision, and a

@@ -8114,8 +8114,11 @@ $script:CimOwners = ConvertFrom-Json -InputObject @'
 __CIMOWNERS__
 '@
 $script:CimThrow = __CIMTHROW__
+$script:CimDelayMs = __CIMDELAY__
+$script:OwnerDelayMs = __OWNERDELAY__
 function Get-CimInstance {
     [CmdletBinding()] param($ClassName, $Filter)
+    if ($script:CimDelayMs) { [Threading.Thread]::Sleep($script:CimDelayMs) }
     if ($script:CimThrow) { throw 'canned CIM failure' }
     [IO.File]::AppendAllText('__CIMLOG__', "$ClassName|$Filter`n")
     $ids = @([regex]::Matches([string]$Filter, 'ProcessId=(\d+)') | ForEach-Object { [int64]$_.Groups[1].Value })
@@ -8128,10 +8131,25 @@ function Get-CimInstance {
 }
 function Invoke-CimMethod {
     [CmdletBinding()] param($InputObject, $MethodName)
+    if ($script:OwnerDelayMs) { [Threading.Thread]::Sleep($script:OwnerDelayMs) }
     [IO.File]::AppendAllText('__OWNERLOG__', "$($InputObject.ProcessId)`n")
     $o = $script:CimOwners.PSObject.Properties["$($InputObject.ProcessId)"]
     if ($null -eq $o) { return [pscustomobject]@{ ReturnValue = [uint32]2; Domain = $null; User = $null } }
     [pscustomobject]@{ ReturnValue = [uint32]$o.Value.rv; Domain = $o.Value.domain; User = $o.Value.user }
+}
+"""
+
+
+# The identity workers (VENUE-PROBE-PROCESS-ATTRIBUTION-1 r2) are SEPARATE runspaces, so a test's command shadows are re-declared there through $IdentityWorkerPrelude. The GPU read is
+# the only Get-Counter call a worker makes; __GPUDELAY__ is an uninterruptible sleep that stands in for a hung PDH read.
+WORKER_COUNTER_PRELUDE = r"""$script:GpuSet = @(ConvertFrom-Json -InputObject @'
+__GPUSET__
+'@)
+$script:GpuDelayMs = __GPUDELAY__
+function Get-Counter {
+    [CmdletBinding()] param($Counter, $MaxSamples)
+    if ($script:GpuDelayMs) { [Threading.Thread]::Sleep($script:GpuDelayMs) }
+    [pscustomobject]@{ CounterSamples = @($script:GpuSet | ForEach-Object { [pscustomobject]@{ Path = $_.Path; CookedValue = [double]$_.CookedValue; Status = [uint32]$_.Status } }) }
 }
 """
 
@@ -8157,8 +8175,12 @@ class IdentityProbeMixin:
     """Runs the REAL probe body (12 s sleeps -> 0) against canned process, counter and CIM data."""
 
     def run_identity_probe(self, procs: list, cim: list, owners: dict | None = None, gpu: list | None = None, throw: bool = False, cpus: int = 4,
-                           body: str | None = None, old_counter_shadow: bool = False, after_start_ft: dict | None = None) -> dict:
+                           body: str | None = None, old_counter_shadow: bool = False, after_start_ft: dict | None = None,
+                           delays: dict | None = None, call_ms: int | None = None) -> dict:
+        delays = delays or {}
         body = (_ident_probe_body() if body is None else body).replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
+        if call_ms is not None:
+            body = body.replace("$IdentityCallMs = 5000", f"$IdentityCallMs = {call_ms}")
         sets = []
         for _ in range(3):
             seen: dict = {}
@@ -8176,15 +8198,25 @@ class IdentityProbeMixin:
         for f in (self.cim_log, self.owner_log):
             f.write_text("", encoding="utf-8")
         counter_prelude = (GET_COUNTER_PRELUDE if old_counter_shadow else GET_COUNTER_PRELUDE_MAXSAMPLES).replace("__CANNED__", json.dumps(sets))
-        prelude = (counter_prelude + GET_PROCESS_PRELUDE.replace("__SNAPSHOTS__", json.dumps([before, after]))
-                   + GET_CIM_PRELUDE.replace("__CIMROWS__", json.dumps(cim)).replace("__CIMOWNERS__", json.dumps({str(k): {"rv": v[0], "domain": v[1], "user": v[2]} for k, v in (owners or {}).items()}))
-                   .replace("__CIMTHROW__", "$true" if throw else "$false").replace("__CIMLOG__", str(self.cim_log)).replace("__OWNERLOG__", str(self.owner_log)))
+        if delays.get("gpu"):   # the decision reads are calls 1-3; the 4th is the GPU read
+            counter_prelude = counter_prelude.replace("$set = $script:Canned[$script:CallNo]; $script:CallNo++",
+                                                      "if ($script:CallNo -eq 3) { [Threading.Thread]::Sleep(%d) }; $set = $script:Canned[$script:CallNo]; $script:CallNo++" % delays["gpu"])
+        cim_prelude = (GET_CIM_PRELUDE.replace("__CIMROWS__", json.dumps(cim)).replace("__CIMOWNERS__", json.dumps({str(k): {"rv": v[0], "domain": v[1], "user": v[2]} for k, v in (owners or {}).items()}))
+                       .replace("__CIMTHROW__", "$true" if throw else "$false").replace("__CIMLOG__", str(self.cim_log)).replace("__OWNERLOG__", str(self.owner_log))
+                       .replace("__CIMDELAY__", str(delays.get("cim", 0))).replace("__OWNERDELAY__", str(delays.get("owner", 0))))
+        prelude = counter_prelude + GET_PROCESS_PRELUDE.replace("__SNAPSHOTS__", json.dumps([before, after])) + cim_prelude
+        worker_counter = WORKER_COUNTER_PRELUDE.replace("__GPUSET__", json.dumps(sets[3]["s"] if gpu is not None else [])).replace("__GPUDELAY__", str(delays.get("gpu", 0)))
+        if old_counter_shadow:
+            worker_counter = worker_counter.replace("param($Counter, $MaxSamples)", "param($Counter)")
+        worker_b64 = _ident_base64.b64encode((cim_prelude + worker_counter).encode("utf-8")).decode("ascii")
+        body = body.replace("$IdentityWorkerPrelude = ''", f"$IdentityWorkerPrelude = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{worker_b64}'))")
         job = self.tmp / "identity-probe-job.ps1"
         job.write_text(prelude + body, encoding="utf-8")
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], capture_output=True, text=True, timeout=240)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
         self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
-        return json.loads(lines[0][len("VENUE_QUIET="):])
+        self.last_line = lines[0][len("VENUE_QUIET="):]   # the line exactly as the gate retains it (Wait-VenueQuiet.ps1 RAW RETENTION)
+        return json.loads(self.last_line)
 
     def cim_queries(self) -> list:
         return [ln for ln in self.cim_log.read_text(encoding="utf-8").splitlines() if ln]
@@ -8736,12 +8768,210 @@ class VenueBusyProbeSummaryTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.splitlines()[0], "- Busy probes summarized: 3 (quiet skipped 1, unknown skipped 0, unreadable 1)")
 
+    def test_a_comma_joined_probe_json_list_reaches_the_script_as_separate_files(self) -> None:
+        # under `pwsh -File` a comma list reaches a [string[]] parameter as ONE string (CI: test_pwsh_string_array_file_params.py); the script must split it itself
+        self.fixtures()
+        a = self.probes / "venue-quiet-probe-20261024T010000000Z.json"
+        b = self.probes / "venue-quiet-probe-20261024T010100000Z.json"
+        proc = self.summarize("-ProbeJson", f"{a},{b}", "-Json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        j = json.loads(proc.stdout)
+        self.assertEqual((j["busy_probes"], j["unreadable"]), (2, 0), j)
+        self.assertEqual((j["projects"][0]["project"], j["projects"][0]["probes"], j["projects"][0]["cpu_seconds"]), ("mlv-app", 2, 58.1))
+
+    def test_a_path_that_holds_a_comma_is_one_file_not_two(self) -> None:
+        self.fixtures()
+        odd = self.probes / "venue-quiet-probe-20261024T010900000Z,odd.json"
+        odd.write_text((self.probes / "venue-quiet-probe-20261024T010000000Z.json").read_text(encoding="utf-8"), encoding="utf-8")
+        proc = self.summarize("-ProbeJson", str(odd), "-Json")
+        j = json.loads(proc.stdout)
+        self.assertEqual((j["busy_probes"], j["unreadable"]), (1, 0), j)
+
+    def test_overlapping_probe_json_and_probe_dir_inputs_are_counted_once(self) -> None:
+        self.fixtures()
+        a = self.probes / "venue-quiet-probe-20261024T010000000Z.json"
+        only_dir = json.loads(self.summarize("-ProbeDir", str(self.probes), "-Json").stdout)
+        both = json.loads(self.summarize("-ProbeJson", f"{a},{str(a).upper()}", "-ProbeDir", str(self.probes), "-Json").stdout)
+        self.assertEqual(both, only_dir, "the same file by two spellings and by the directory is ONE probe")
+        self.assertEqual(both["busy_probes"], 3)
+        self.assertEqual(both["projects"][0]["cpu_seconds"], 58.1, "seconds are not doubled")
+        self.assertEqual(both["unreadable"], 0)
+
+    def test_the_same_basename_in_two_directories_is_two_probes_and_not_one(self) -> None:
+        self.fixtures()
+        name = "venue-quiet-probe-20261024T010000000Z.json"
+        d1 = self.tmp / "run-1"; d2 = self.tmp / "run-2"
+        for d in (d1, d2):
+            d.mkdir()
+            shutil.copyfile(self.probes / name, d / name)
+        j = json.loads(self.summarize("-ProbeJson", f"{d1 / name},{d2 / name}", "-Json").stdout)
+        self.assertEqual(j["busy_probes"], 2)
+        mlv = next(p for p in j["projects"] if p["project"] == "mlv-app")
+        self.assertEqual((mlv["probes"], mlv["cpu_seconds"]), (2, 58.2), "two probes held the project, not one")
+        gpu = next(g for g in j["gpu_heavy"] if g["pid"] == 16892)
+        self.assertEqual(gpu["probes"], 2)
+
     def test_no_input_is_a_usage_error_and_the_script_never_references_the_submitter(self) -> None:
         proc = self.summarize()
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         code = (DV / "Summarize-VenueBusyProbes.ps1").read_text(encoding="utf-8")
         self.assertNotIn("um-run.ps1", code, "read-only: it is not a submitter and must not name the one writer to a venue share")
         self.assertNotRegex(code, r"(?i)Remove-Item|Set-Content|Add-Content|Out-File|WriteAllText|New-Item|Move-Item|Copy-Item")
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r2: Dot B1 -- the redacted command line is retained, emitted and persisted as raw JSON, so every ordinary credential SHAPE must be gone from
+# it. Protect-IdentText is lifted out of the REAL probe body and run in pwsh against synthetic values only (no real credential appears in a test or a receipt).
+def _protect_ident_text(texts: list) -> list:
+    body = _ident_probe_body()
+    m = re.search(r"function Protect-IdentText\(\$Text\) \{\r?\n.*?\r?\n\}\r?\n", body, re.S)
+    assert m, "Protect-IdentText not found in the probe body"
+    with tempfile.TemporaryDirectory(prefix="venue-protect-ident-") as d:
+        tmp = Path(d)
+        (tmp / "in.json").write_text(json.dumps(texts), encoding="utf-8")
+        (tmp / "run.ps1").write_text(m.group(0) + "\n$in = @(ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($args[0])))\n"
+                                     "$out = @(foreach ($t in $in) { $r = Protect-IdentText ([string]$t); [pscustomobject]@{ text = $r.text; redactions = $r.redactions } })\n"
+                                     "ConvertTo-Json -InputObject $out -Compress -Depth 4\n", encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(tmp / "run.ps1"), str(tmp / "in.json")], capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        return json.loads(proc.stdout)
+
+
+SYNTH_SECRET = "demoValue42"
+SYNTH_BASIC = "QWxhZGRpbjpvcGVu"   # the RFC 7617 example credential (Aladdin:open): public and synthetic
+SYNTH_TOKEN = "demoTok123abc"
+
+
+@requires_windows_pwsh
+class VenueProbeIdentityRedactionR2Tests(IdentityProbeMixin, unittest.TestCase):
+    setUp = VenueQuietAttributionTests.setUp
+    gate = VenueQuietAttributionTests.gate
+
+    def assert_redacted(self, cmd: str, secrets: tuple = (SYNTH_SECRET,)) -> None:
+        r = _protect_ident_text([cmd])[0]
+        for secret in secrets:
+            self.assertNotIn(secret, r["text"], f"{cmd!r} -> {r['text']!r}")
+        self.assertGreaterEqual(r["redactions"], 1, f"{cmd!r} -> {r['text']!r}")
+
+    def test_json_keys_in_double_and_single_quotes_with_and_without_spaces_are_redacted(self) -> None:
+        for cmd in ('python x.py {"password":"demoValue42"}', 'python x.py {"password": "demoValue42"}', 'python x.py {"api_key" : "demoValue42"}',
+                    "python x.py {'token':'demoValue42'}", "python x.py {'token' : 'demoValue42'}", 'python x.py {"client_secret":"demoValue42","n":1}',
+                    r'python x.py {\"password\":\"demoValue42\"}', 'python x.py {"password":demoValue42}', 'python x.py {"password":"demo Value42 two"}'):
+            with self.subTest(cmd=cmd):
+                self.assert_redacted(cmd, (SYNTH_SECRET, "Value42"))
+
+    def test_authorization_headers_lose_the_scheme_and_the_credential_in_every_quoting(self) -> None:
+        for scheme, cred in (("Basic", SYNTH_BASIC), ("Bearer", SYNTH_TOKEN)):
+            for fmt in ('curl -H "Authorization: {s} {c}" https://h.example/x', "curl -H 'Authorization: {s} {c}' https://h.example/x", "curl -H Authorization: {s} {c} https://h.example/x",
+                        'curl -H "authorization:{s} {c}" https://h.example/x', 'curl -d {{"Authorization":"{s} {c}"}} https://h.example/x'):
+                cmd = fmt.format(s=scheme, c=cred)
+                with self.subTest(cmd=cmd):
+                    self.assert_redacted(cmd, (cred,))
+                    text = _protect_ident_text([cmd])[0]["text"]
+                    if scheme == "Basic":
+                        self.assertNotIn("Basic", text, "the scheme goes with the credential")
+                    self.assertIn("https://h.example/x", text, "the rest of the command line survives")
+
+    def test_a_dashed_password_argument_is_still_redacted_a_regression_pin(self) -> None:
+        self.assert_redacted("tool --password=demoValue42 --verbose")
+        self.assertIn("--verbose", _protect_ident_text(["tool --password=demoValue42 --verbose"])[0]["text"])
+
+    def test_url_encoded_key_values_in_a_query_string_are_redacted(self) -> None:
+        for cmd in ("curl https://h.example/x?user=a&password%3DdemoValue42&z=1", "curl https://h.example/x?password%3DdemoValue42", "curl https://h.example/x?api_key%3ademoValue42&z=1",
+                    "curl https://h.example/x?%22password%22%3A%22demoValue42%22"):
+            with self.subTest(cmd=cmd):
+                self.assert_redacted(cmd)
+
+    def test_a_hyphenated_card_name_and_a_plain_script_still_survive_the_wider_rules(self) -> None:
+        r = _protect_ident_text(["python C:\\x\\tool.py --card lane-CPU-17V9-FPS-GAP-AB-1-r5x"])[0]
+        self.assertIn("lane-CPU-17V9-FPS-GAP-AB-1-r5x", r["text"])
+        self.assertEqual(r["redactions"], 0)
+
+    def test_the_header_documents_the_rule_order_and_the_counting(self) -> None:
+        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        for needle in ("Authorization", "optional closing quote", "BEFORE the key-like rule", "counted once per rule match"):
+            self.assertIn(needle, text)
+
+    def test_the_persisted_raw_json_holds_no_secret_for_the_json_and_the_basic_shapes(self) -> None:
+        t = IDENT_T0
+        cmd = ('python C:\\mlvtmp\\lane-X-1\\tools\\bench.py {"password":"demoValue42","api_key" : "demoValue42"} '
+               '--hdr "Authorization: Basic QWxhZGRpbjpvcGVu" --q password%3DdemoValue42')
+        cim = [_ident_cim(16892, 0, "python.exe", t, cmd, r"C:\Python\python.exe")]
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS)
+        for secret in (SYNTH_SECRET, SYNTH_BASIC):
+            self.assertNotIn(secret, self.last_line, "the probe line the gate retains verbatim")
+        self.assertGreaterEqual(self.row(p, 16892)["cmdline_redactions"], 3)
+        self.assertIn("bench.py", self.row(p, 16892)["cmdline"])
+        # and through the gate: the raw file Wait-VenueQuiet.ps1 writes next to the job file
+        proc = self.gate(dict(p, host="BACHELOR"))
+        raws = [f for f in self.work.glob("venue-quiet-probe-*.json")]
+        self.assertEqual(len(raws), 1, raws)
+        raw = raws[0].read_text(encoding="utf-8")
+        for secret in (SYNTH_SECRET, SYNTH_BASIC):
+            self.assertNotIn(secret, raw)
+        self.assertNotIn(SYNTH_SECRET, proc.stdout)
+
+
+# r2 improvement: every synchronous call in the identity block has a deadline of its OWN (a hung CIM / owner / GPU read must not hold the probe toward its 120 s submission
+# timeout). The forced-slow call is an UNINTERRUPTIBLE .NET sleep in the shadow (what a hung native call looks like), not an already-expired budget.
+@requires_windows_pwsh
+class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase):
+    DELAY_MS = 20000
+    CALL_MS = 1500
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-probe-deadline-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        t = IDENT_T0
+        self.procs = [(16892, "python", 29.1, t), (500, "pwsh", 1.0, t)]
+        self.cim = [_ident_cim(16892, 500, "python.exe", t, r"C:\mlvtmp\lane-X-1\bench.py"), _ident_cim(500, 0, "pwsh.exe", t, "pwsh")]
+
+    def reference(self) -> dict:
+        """The same probe with identity cut out: samples, top and every v2 field must equal it whatever happened to identity."""
+        body = re.sub(r"# IDENTITY \(VENUE-PROBE-PROCESS-ATTRIBUTION-1\).*?(?=Write-Output \('VENUE_QUIET=')", "", _ident_probe_body(), flags=re.S).replace("    identity = $identity\r\n", "").replace("    identity = $identity\n", "")
+        return self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, body=body)
+
+    def slow(self, which: str) -> tuple:
+        import time
+        started = time.monotonic()
+        p = self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], delays={which: self.DELAY_MS}, call_ms=self.CALL_MS)
+        return p, time.monotonic() - started
+
+    def assert_measurement_unchanged(self, p: dict, elapsed: float) -> None:
+        ref = self.reference()
+        for k, v in ref.items():
+            self.assertEqual(p[k], v, f"{k} changed because an identity call was slow")
+        self.assertLess(elapsed, self.DELAY_MS / 1000.0 - 2, f"the probe waited for the slow call instead of bounding it ({elapsed:.1f} s)")
+
+    def test_a_slow_gpu_read_times_out_into_a_status_and_the_rest_of_identity_is_still_filled(self) -> None:
+        p, elapsed = self.slow("gpu")
+        self.assertTrue(p["identity"]["gpu_status"].startswith("timeout: "), p["identity"])
+        r = self.row(p, 16892)
+        self.assertEqual((r["gpu_percent"], r["gpu_status"]), (None, p["identity"]["gpu_status"]))
+        self.assertEqual((r["owner"], r["project"], r["script"]), ("BACHELOR\\layib", "mlv-app", "bench.py"), "the CIM half still works")
+        self.assert_measurement_unchanged(p, elapsed)
+
+    def test_a_slow_getowner_times_out_into_owner_status_timeout_and_the_row_keeps_everything_else(self) -> None:
+        p, elapsed = self.slow("owner")
+        r = self.row(p, 16892)
+        self.assertEqual((r["owner"], r["owner_status"]), (None, "timeout"))
+        self.assertEqual((r["project"], r["script"], r["cmdline_status"], r["gpu_percent"]), ("mlv-app", "bench.py", "ok", 40.0))
+        self.assert_measurement_unchanged(p, elapsed)
+
+    def test_a_slow_win32_process_query_degrades_identity_to_a_typed_error_and_nothing_else_moves(self) -> None:
+        p, elapsed = self.slow("cim")
+        self.assertEqual(set(p["identity"]), {"schema", "error"}, p["identity"])
+        self.assertIn("timed out", p["identity"]["error"])
+        self.assert_measurement_unchanged(p, elapsed)
+
+    def test_the_call_deadline_is_a_pinned_literal_inside_the_identity_budget_arithmetic(self) -> None:
+        body = _ident_probe_body()
+        m = re.search(r"\$IdentityCallMs = (\d+)", body)
+        self.assertIsNotNone(m)
+        # GPU + 3 WQL queries + budget-gated GetOwner calls (the last may start just under the budget): the identity worst case, plus the 24 s sample window, stays inside 120 s
+        worst_s = (int(m.group(1)) * 4 + int(re.search(r"\$IdentityBudgetMs = (\d+)", body).group(1)) + int(m.group(1))) / 1000.0 + 24
+        self.assertLess(worst_s, 110, worst_s)
 
 
 if __name__ == "__main__":
