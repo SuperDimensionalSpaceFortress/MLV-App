@@ -45,10 +45,11 @@
 #          UNREDACTED command line and executable path (held in memory only), the process itself first, then its parent, then its grandparent; only the table's name is emitted.
 #          A user-profile root is not a project (the owner field covers it). The working directory is NOT collected: Win32_Process does not expose it and reading the process
 #          environment block or memory is out of scope. No environment block is ever read.
-#        REDACTION, in order, before anything is written: URL userinfo, an Authorization header (scheme AND credential), bearer values, key-like arguments (key, token, secret, password,
-#          auth, credential, signature, session, cookie ...; the name may be followed by a closing quote, so JSON keys count, or by a URL-encoded separator), known token prefixes and JWTs,
-#          opaque 40+ character runs; then a 200-character cap that keeps the first 200 and appends `...[+N]` (cmdline_truncated_chars = N). Hyphenated or underscored card and
-#          worktree names survive. Rule order and the counting are documented at Protect-IdentText.
+#        REDACTION IS FAIL-CLOSED (r4): cmdline carries only the executable path, the script or module path and `args=<count>`. The other argument text is kept ONLY when a
+#          case-insensitive SUBSTRING scan of the RAW, unparsed command line finds none of pass pwd pw secret token key auth credential bearer cookie session (nor URL userinfo, a
+#          known token prefix, a JWT, an opaque 40+ character run or a lower-case `-p`); otherwise every argument but the script path becomes <redacted> and args_redacted = fail-closed. Over-redaction
+#          (`--keyframe`, `mkdir -p`, `-ExecutionPolicy Bypass`) is the accepted, safe direction. Then a 200-character cap keeps the first 200 and appends `...[+N]`
+#          (cmdline_truncated_chars = N). The contract is documented at Protect-IdentCmdLine.
 #        NON-ELEVATED DEGRADATION: the probe runs as the agent account, not elevated. What it cannot read is a TYPED status, never a guess: owner_status access-denied | exited |
 #          error-<ReturnValue> | budget-exceeded, cmdline_status / exe_status unreadable | exited, gpu_status counter-unavailable: <why> | no-gpu-context | disabled: <why>. A null
 #          always has its reason. WALL-CLOCK BUDGET: past 25 s of identity time no further GetOwner call is made (owner_status budget-exceeded), so identity can never push the
@@ -510,53 +511,104 @@ $identityProjects = @(
     @('agent-bridge', 'agent-bridge'), @('Adobe Document Cloud Ingester', 'adobe-ingester'), @('softwarefactory-fleet-doctrine', 'fleet-doctrine'),
     @('AdversarialLLM', 'adversarialllm'), @('VIRTUAL-TEN', 'virtual-ten'), @('AirMyPC', 'airmypc')
 )
-# REDACTION, in this order, counted once per rule match (a text two rules both touch counts twice; the key-like rule skips a value that is already <redacted>):
-#   (a) URL userinfo (b) an Authorization header: the scheme AND the credential, run BEFORE the key-like rule (which would redact the scheme word only and leave `Basic <b64>`)
-#   (c) bearer values (d) key-like arguments: a key name may be followed by an optional closing quote (JSON keys `"password":"x"`, `'token':'x'`, escaped `\"k\":\"x\"`) or by a
-#   URL-encoded separator (`password%3Dx`, `%22k%22%3A%22x%22`); a QUOTED value is redacted through its closing quote (backslash-escaped quotes honoured, an unterminated quote runs to
-#   the end), an unquoted one stops at '&' only inside a URL query string and runs to whitespace elsewhere; the short keys pass / pw / pwd match as whole names; and mysql-style `-p<value>`
-#   / `-p <value>` are redacted (over-redacting `mkdir -p dir`) (e) known token prefixes and JWTs (f) opaque 40+ runs; then a 200-char cap.
-# KNOWN LIMIT: an Authorization: Digest header redacts its first parameter only. A shape this set cannot catch is a gap, not a guarantee: the wall of defence is the 200-char cap, the
-# opaque-run rule, and that no command line is ever printed to a gate text line.
-function Protect-IdentText($Text) {
-    if ($null -eq $Text) { return $null }
-    $s = [string]$Text; $n = 0
-    # a quoted value is redacted THROUGH ITS CLOSING quote: \"...\" ends at the next \", "..." honours a backslash-escaped quote inside it, '...' doubles ''. An unterminated quote runs to the end.
-    $quoted = '(?:\\"(?:[^\\]|\\(?!"))*(?:\\"|$)|"(?:\\.|[^"\\])*(?:"|$)|''(?:''''|[^''])*(?:''|$))'
-    $keyName = '((?<![a-z0-9_.-])(?:--?|/)?(?:pass|pw|pwd)(?![a-z0-9_.-])|(?:--?|/)?[a-z0-9_.-]*(?:key|token|secret|password|passwd|pwd|auth|credential|signature|sig|session|cookie)[a-z0-9_.-]*)'
-    $keySep = '((?:(?:\\?["'']|%22|%27)?\s*(?:[=:]|%3[ad])\s*)|\s+)(?!<redacted>)'
-    $inUrlQuery = '://[^\s?]*\?\S*'
-    # key-like arguments: inside a URL query string an unquoted value stops at '&'; on any other command line it runs to whitespace (`--password=a&b` is one value)
-    $keyLikeUrl = @(('(?i)' + $keyName + '(?<=' + $inUrlQuery + ')' + $keySep + '(' + $quoted + '|[^\s&]+)'), '$1$2<redacted>')
-    $keyLikePlain = @(('(?i)' + $keyName + '(?<!' + $inUrlQuery + ')' + $keySep + '(' + $quoted + '|\S+)'), '$1$2<redacted>')
-    # mysql-style -p<value> and -p <value> (lower-case only: -P is a port); skips a token a key-like rule already redacted. Over-redacts `mkdir -p dir` and `-print`: the safe direction.
-    $pFlag = @(('(?<![\w-])(-p)(\s*)(?!\S*<redacted>)(' + $quoted + '|\S+)'), '$1$2<redacted>')
-    $rules = @(
-        @('(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@', '$1<redacted>@'),
-        @('(?i)(\bauthorization(?:\\?["'']|%22|%27)?\s*(?:[=:]|%3[ad])\s*(?:\\?["'']|%22|%27)?)(?:(?:basic|bearer|digest|negotiate|ntlm|token)\s+)?[^\s"''&\\]+', '$1<redacted>'),
-        @('(?i)\bbearer\s+(?!<redacted>)\S+', 'Bearer <redacted>'),
-        $keyLikeUrl,
-        $keyLikePlain,
-        $pFlag,
-        @('(sk-|ghp_|gho_|ghs_|github_pat_|xox[abps]-|AKIA)[A-Za-z0-9_-]{10,}', '<redacted>'),
-        @('eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '<redacted>'),
-        @('[A-Za-z0-9+/=]{40,}', '<redacted>')
-    )
-    foreach ($r in $rules) { $n += [regex]::Matches($s, $r[0]).Count; $s = [regex]::Replace($s, $r[0], $r[1]) }
-    $cut = 0
-    if ($s.Length -gt 200) { $cut = $s.Length - 200; $s = $s.Substring(0, 200) + "...[+$cut]" }
-    [pscustomobject]@{ text = $s; redactions = $n; truncated = $cut }
+# REDACTION IS FAIL-CLOSED (r4). Per-shape regex rules (r1-r3) kept leaking new shapes (a JSON value with escaped quotes, a quoted key then whitespace, compound names such as
+# --db-pass, a quote that opens mid-value), so no shape is guessed any more:
+#   1. SCAN FIRST, before any tokenising: a case-insensitive SUBSTRING scan of the RAW, unparsed command line for any of $identSecretTokens, plus five shapes that carry a credential
+#      with no keyword at all (URL userinfo, a known token prefix, a JWT, an opaque 40+ character run, a mysql-style lower-case `-p`). Any hit makes the line TAINTED.
+#   2. cmdline = `<exe> [<script>] args=<n>`: exe is ExecutablePath (else argv[0] when it is path-shaped and, on a tainted line, holds no token; else <unknown-exe>); script is the
+#      first path-shaped .ps1/.psm1/.py/.js/.mjs/.exe/.cmd/.bat argument that does not follow an argument holding a token; n counts the arguments after argv[0] (Windows argv rules).
+#   3. a CLEAN line appends ` : <the raw argument text after argv[0]>` (args_redacted = none). A TAINTED line appends ` : <redacted>` once per argument other than the script path
+#      (args_redacted = fail-closed, cmdline_redactions = that count). Over-redaction (--keyframe, mkdir -p, -ExecutionPolicy Bypass, any line naming pwsh) is accepted: it is the
+#      safe direction. No shape-specific rewrite of argument text exists any more, so a shape nobody foresaw can still only reach a persisted copy on a line the scan found clean.
+#   4. then a 200-character cap. Project attribution reads the unredacted line in memory only (Get-IdentProject) and emits a table name, never text.
+$identSecretTokens = @('pass', 'pwd', 'pw', 'secret', 'token', 'key', 'auth', 'credential', 'bearer', 'cookie', 'session')
+$identSecretShapes = '(?i)[a-z][a-z0-9+.-]*://[^/@\s]+@|(?:sk-|ghp_|gho_|ghs_|github_pat_|xox[abps]-|AKIA)[A-Za-z0-9_-]{10,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.|[A-Za-z0-9+/=]{40,}|(?-i:(?<![\w-])-p)'
+function Test-IdentTainted($Text) {
+    $s = [string]$Text
+    foreach ($t in $identSecretTokens) { if ($s.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
+    $s -match $identSecretShapes
 }
-# the first argument that is a script file (.py .ps1 .psm1 .js .mjs .cmd .bat), by basename; an .exe alone names no script. Never the whole command line.
+# the 200-character cap for a path or a name (no rule rewrites it): { text, truncated }
+function Limit-IdentText($Text) {
+    if ($null -eq $Text) { return [pscustomobject]@{ text = $null; truncated = 0 } }
+    $s = [string]$Text; $cut = 0
+    if ($s.Length -gt 200) { $cut = $s.Length - 200; $s = $s.Substring(0, 200) + "...[+$cut]" }
+    [pscustomobject]@{ text = $s; truncated = $cut }
+}
+# Windows argv rules (CommandLineToArgvW): argv[0] runs to the next quote when quoted, else to whitespace; later arguments honour 2n / 2n+1 backslashes before a quote and "" inside
+# quotes. Returns { argv, rest } where rest is the raw text after argv[0]. Only ever called AFTER the taint scan.
+function Split-IdentArgv([string]$s) {
+    $argv = New-Object System.Collections.Generic.List[string]
+    $q = [char]34; $bsl = [char]92; $i = 0; $n = $s.Length
+    while ($i -lt $n -and [char]::IsWhiteSpace($s[$i])) { $i++ }
+    $sb = New-Object Text.StringBuilder
+    if ($i -lt $n -and $s[$i] -eq $q) { $i++; while ($i -lt $n -and $s[$i] -ne $q) { [void]$sb.Append($s[$i]); $i++ }; if ($i -lt $n) { $i++ } }
+    else { while ($i -lt $n -and -not [char]::IsWhiteSpace($s[$i])) { [void]$sb.Append($s[$i]); $i++ } }
+    $argv.Add($sb.ToString())
+    $rest = $s.Substring($i).Trim()
+    while ($true) {
+        while ($i -lt $n -and [char]::IsWhiteSpace($s[$i])) { $i++ }
+        if ($i -ge $n) { break }
+        $sb = New-Object Text.StringBuilder; $inQ = $false
+        while ($i -lt $n) {
+            $c = $s[$i]
+            if (-not $inQ -and [char]::IsWhiteSpace($c)) { break }
+            if ($c -eq $bsl) {
+                $nb = 0; while ($i -lt $n -and $s[$i] -eq $bsl) { $nb++; $i++ }
+                if ($i -lt $n -and $s[$i] -eq $q) { [void]$sb.Append($bsl, [int][math]::Floor($nb / 2)); if ($nb % 2 -eq 1) { [void]$sb.Append($q); $i++ } }
+                else { [void]$sb.Append($bsl, $nb) }
+                continue
+            }
+            if ($c -eq $q) {
+                if ($inQ -and $i + 1 -lt $n -and $s[$i + 1] -eq $q) { [void]$sb.Append($q); $i += 2; continue }
+                $inQ = -not $inQ; $i++; continue
+            }
+            [void]$sb.Append($c); $i++
+        }
+        $argv.Add($sb.ToString())
+    }
+    [pscustomobject]@{ argv = $argv.ToArray(); rest = $rest }
+}
+# a token that can only be a file path: no leading switch character, no '=' or ':' past a drive letter, no quote, brace, '%', '&' or wildcard
+function Test-IdentPathShaped([string]$Tok) { $Tok -match '^(?![-/])(?:[A-Za-z]:)?[^=:"''{}%&,;<>|*?\[\]]+$' }
+# the index of the first path-shaped argument with one of $Ext that does not FOLLOW an argument holding a token (so `--password x.py` names no script); -1 when there is none
+function Find-IdentScriptArg($Argv, [int]$From, [string]$Ext) {
+    for ($j = $From; $j -lt $Argv.Count; $j++) {
+        $tok = ([string]$Argv[$j]).Trim([char]39)
+        if ($tok -match ('(?i)\.(' + $Ext + ')$') -and (Test-IdentPathShaped $tok) -and ($j -eq 0 -or -not (Test-IdentTainted $Argv[$j - 1]))) { return $j }
+    }
+    -1
+}
+# the fail-closed command line (contract above): { text, redactions, truncated, args, args_redacted }
+function Protect-IdentCmdLine($CmdLine, $ExePath) {
+    $raw = [string]$CmdLine
+    $tainted = Test-IdentTainted $raw
+    $sp = Split-IdentArgv $raw
+    $argv = @($sp.argv)
+    $a0 = ([string]$argv[0]).Trim([char]39)
+    $exe = $(if (-not [string]::IsNullOrEmpty([string]$ExePath)) { [string]$ExePath } elseif ($a0 -and (Test-IdentPathShaped $a0) -and -not ($tainted -and (Test-IdentTainted $a0))) { $a0 } else { '<unknown-exe>' })
+    $mod = Find-IdentScriptArg $argv 1 'ps1|psm1|py|js|mjs|exe|cmd|bat'
+    $parts = @($exe)
+    if ($mod -gt 0) { $parts += ([string]$argv[$mod]).Trim([char]39) }
+    $nArgs = $argv.Count - 1
+    $parts += "args=$nArgs"
+    $red = 0
+    if (-not $tainted) { if ($sp.rest) { $parts += ': ' + $sp.rest } }
+    else {
+        $red = $nArgs - $(if ($mod -gt 0) { 1 } else { 0 })
+        if ($red -gt 0) { $parts += ': ' + ((@('<redacted>') * $red) -join ' ') }
+    }
+    $lim = Limit-IdentText ($parts -join ' ')
+    [pscustomobject]@{ text = $lim.text; redactions = $red; truncated = $lim.truncated; args = $nArgs; args_redacted = $(if ($tainted) { 'fail-closed' } else { 'none' }) }
+}
+# the first script argument (.py .ps1 .psm1 .js .mjs .cmd .bat; argv[0] included, an .exe names no script), by basename. Never the whole command line.
 function Get-IdentScript($CmdLine) {
     if ([string]::IsNullOrEmpty([string]$CmdLine)) { return $null }
-    foreach ($m in [regex]::Matches([string]$CmdLine, '"([^"]*)"|(\S+)')) {
-        $tok = $(if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }).Trim([char]39)
-        if ($tok -match '(?i)\.(py|ps1|psm1|js|mjs|cmd|bat)$') {
-            $base = $tok -replace '^.*[\\/]', ''
-            if ($base) { return (Protect-IdentText $base).text }
-        }
-    }
+    $argv = @((Split-IdentArgv ([string]$CmdLine)).argv)
+    $j = Find-IdentScriptArg $argv 0 'py|ps1|psm1|js|mjs|cmd|bat'
+    if ($j -lt 0) { return $null }
+    $base = ([string]$argv[$j]).Trim([char]39) -replace '^.*[\\/]', ''
+    if ($base) { return (Limit-IdentText $base).text }
     $null
 }
 function Get-IdentProject($Row) {
@@ -654,7 +706,7 @@ function Get-IdentAncestor($Child, $Cim) {
     $cd = $Child.CreationDate; $pd = $pr.CreationDate
     if ($null -eq $cd -or $null -eq $pd) { $none.info.pid = $ppid; return $none }
     if ($pd.ToUniversalTime() -gt $cd.ToUniversalTime()) { return @{ info = [ordered]@{ pid = $ppid; name = $null; started_utc = $null; status = 'pid-reused' }; row = $null } }
-    $nm = (Protect-IdentText (([string]$pr.Name) -replace '(?i)\.exe$', '')).text
+    $nm = (Limit-IdentText (([string]$pr.Name) -replace '(?i)\.exe$', '')).text
     if (-not $nm) { $nm = 'unknown' }
     @{ info = [ordered]@{ pid = $ppid; name = $nm; started_utc = $pd.ToUniversalTime().ToString('o'); status = 'ok' }; row = $pr }
 }
@@ -747,6 +799,7 @@ try {
             $procRows += [ordered]@{
                 pid = [int64]$k; name = $name; source = @($targets[$k]); started_utc = $null; start_check = $startCheck
                 owner = $null; owner_status = 'exited'; cmdline = $null; cmdline_status = 'exited'; cmdline_redactions = 0; cmdline_truncated_chars = 0
+                cmdline_args = $null; args_redacted = $null
                 exe = $null; exe_status = 'exited'; script = $null; project = 'unknown'; project_from = 'none'
                 parent = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }; grandparent = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }
                 gpu_percent = $gpuPct; gpu_engtype = $gpuEng; gpu_status = $gpuRowStatus
@@ -756,10 +809,13 @@ try {
         }
         $own = $(if ($idSw.ElapsedMilliseconds -gt $IdentityBudgetMs) { @{ owner = $null; status = 'budget-exceeded' } } else { Get-IdentOwner $row })
         if ($null -eq $own.owner) { $ownerBad++ }
-        $cmdText = $null; $cmdRed = 0; $cmdCut = 0; $cmdStatus = 'unreadable'
-        if (-not [string]::IsNullOrEmpty([string]$row.CommandLine)) { $pc = Protect-IdentText $row.CommandLine; $cmdText = $pc.text; $cmdRed = $pc.redactions; $cmdCut = $pc.truncated; $cmdStatus = 'ok' } else { $cmdBad++ }
+        $cmdText = $null; $cmdRed = 0; $cmdCut = 0; $cmdStatus = 'unreadable'; $cmdArgs = $null; $cmdArgsRed = $null
+        if (-not [string]::IsNullOrEmpty([string]$row.CommandLine)) {
+            $pc = Protect-IdentCmdLine $row.CommandLine $row.ExecutablePath
+            $cmdText = $pc.text; $cmdRed = $pc.redactions; $cmdCut = $pc.truncated; $cmdArgs = $pc.args; $cmdArgsRed = $pc.args_redacted; $cmdStatus = 'ok'
+        } else { $cmdBad++ }
         $exeText = $null; $exeStatus = 'unreadable'
-        if (-not [string]::IsNullOrEmpty([string]$row.ExecutablePath)) { $exeText = (Protect-IdentText $row.ExecutablePath).text; $exeStatus = 'ok' }
+        if (-not [string]::IsNullOrEmpty([string]$row.ExecutablePath)) { $exeText = (Limit-IdentText $row.ExecutablePath).text; $exeStatus = 'ok' }
         $par = Get-IdentAncestor $row $cim
         $gpar = $(if ($par.info.status -ceq 'ok') { Get-IdentAncestor $par.row $cim } else { @{ info = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }; row = $null } })
         $project = 'unknown'; $projectFrom = 'none'
@@ -770,6 +826,7 @@ try {
         $procRows += [ordered]@{
             pid = [int64]$k; name = $name; source = @($targets[$k]); started_utc = $startedUtc; start_check = $startCheck
             owner = $own.owner; owner_status = $own.status; cmdline = $cmdText; cmdline_status = $cmdStatus; cmdline_redactions = $cmdRed; cmdline_truncated_chars = $cmdCut
+            cmdline_args = $cmdArgs; args_redacted = $cmdArgsRed
             exe = $exeText; exe_status = $exeStatus; script = (Get-IdentScript $row.CommandLine); project = $project; project_from = $projectFrom
             parent = $par.info; grandparent = $gpar.info
             gpu_percent = $gpuPct; gpu_engtype = $gpuEng; gpu_status = $gpuRowStatus

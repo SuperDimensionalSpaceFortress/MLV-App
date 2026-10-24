@@ -8260,10 +8260,11 @@ class VenueProbeIdentityTests(IdentityProbeMixin, unittest.TestCase):
         self.assertEqual((r["project"], r["project_from"], r["script"]), ("mlv-app", "self", "bench.py"))
         self.assertEqual(r["start_check"], "match")
         self.assertTrue(r["started_utc"].startswith("2026-10-24T01:02:03"), r["started_utc"])
-        self.assertEqual((r["cmdline_status"], r["cmdline_redactions"], r["cmdline_truncated_chars"]), ("ok", 2, 0))
+        # r4 fail-closed: `key` and `token` taint the line, so all three arguments after the script are <redacted> (r1-r3 redacted the two values only)
+        self.assertEqual((r["cmdline_status"], r["cmdline_redactions"], r["cmdline_truncated_chars"], r["args_redacted"], r["cmdline_args"]), ("ok", 3, 0, "fail-closed", 4))
         for secret in ("abc123", "xyz"):
             self.assertNotIn(secret, r["cmdline"])
-        self.assertEqual(r["cmdline"].count("<redacted>"), 2)
+        self.assertEqual(r["cmdline"].count("<redacted>"), 3)
         self.assertIn("bench.py", r["cmdline"])
         self.assertEqual((r["parent"]["pid"], r["parent"]["name"], r["parent"]["status"]), (500, "pwsh", "ok"))
         self.assertEqual((r["grandparent"]["pid"], r["grandparent"]["name"], r["grandparent"]["status"]), (400, "explorer", "ok"))
@@ -8388,18 +8389,21 @@ class VenueProbeIdentityTests(IdentityProbeMixin, unittest.TestCase):
         procs.append((1101, "tool", 9.0, t)); cim.append(_ident_cim(1101, 0, "tool.exe", t, rf"python C:\x\tool.py {card}"))
         procs.append((1102, "tool", 8.0, t)); cim.append(_ident_cim(1102, 0, "tool.exe", t, cap_cmd))
         p = self.run_identity_probe(procs, cim, {})
-        for i, (label, cmd, gone, want) in enumerate(vectors):
+        for i, (label, cmd, gone, _want) in enumerate(vectors):   # r4: the r1 `want` (the text around a redacted value) is retired; a tainted line keeps no argument text
             r = self.row(p, 1001 + i)
             for secret in gone:
                 self.assertNotIn(secret, r["cmdline"], label)
-            self.assertIn(want, r["cmdline"], label)
+            self.assertEqual(r["args_redacted"], "fail-closed", label)
+            self.assertIn("<redacted>", r["cmdline"], label)
             self.assertGreaterEqual(r["cmdline_redactions"], 1, label)
         survivor = self.row(p, 1101)
         self.assertIn(card, survivor["cmdline"], "a hyphenated card or worktree name must survive")
-        self.assertEqual(survivor["cmdline_redactions"], 0)
+        self.assertEqual((survivor["cmdline_redactions"], survivor["args_redacted"]), (0, "none"))
         capped = self.row(p, 1102)
-        self.assertEqual(capped["cmdline"], cap_cmd[:200] + "...[+300]")
-        self.assertEqual(capped["cmdline_truncated_chars"], 300)
+        rest = cap_cmd[len(base):].strip()
+        full = f"python.exe args={len(rest.split())} : {rest}"
+        self.assertEqual(capped["cmdline"], full[:200] + f"...[+{len(full) - 200}]")
+        self.assertEqual(capped["cmdline_truncated_chars"], len(full) - 200)
 
     def test_gpu_is_the_per_process_max_over_engines_and_a_gpu_only_pid_becomes_a_target(self) -> None:
         t = IDENT_T0
@@ -8820,78 +8824,16 @@ class VenueBusyProbeSummaryTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------
-# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r2: Dot B1 -- the redacted command line is retained, emitted and persisted as raw JSON, so every ordinary credential SHAPE must be gone from
-# it. Protect-IdentText is lifted out of the REAL probe body and run in pwsh against synthetic values only (no real credential appears in a test or a receipt).
-def _protect_ident_text(texts: list) -> list:
-    body = _ident_probe_body()
-    m = re.search(r"function Protect-IdentText\(\$Text\) \{\r?\n.*?\r?\n\}\r?\n", body, re.S)
-    assert m, "Protect-IdentText not found in the probe body"
-    with tempfile.TemporaryDirectory(prefix="venue-protect-ident-") as d:
-        tmp = Path(d)
-        (tmp / "in.json").write_text(json.dumps(texts), encoding="utf-8")
-        (tmp / "run.ps1").write_text(m.group(0) + "\n$in = @(ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($args[0])))\n"
-                                     "$out = @(foreach ($t in $in) { $r = Protect-IdentText ([string]$t); [pscustomobject]@{ text = $r.text; redactions = $r.redactions } })\n"
-                                     "ConvertTo-Json -InputObject $out -Compress -Depth 4\n", encoding="utf-8")
-        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(tmp / "run.ps1"), str(tmp / "in.json")], capture_output=True, text=True, timeout=120)
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        return json.loads(proc.stdout)
-
-
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r2: Dot B1 -- the redacted command line is retained, emitted and persisted as raw JSON, so no credential may reach it. r4 retired the r2/r3
+# per-shape rule tests (they pinned the text kept AROUND a redacted value, which fail-closed redaction no longer keeps); their vectors live on in the r4 table below.
 SYNTH_SECRET = "demoValue42"
 SYNTH_BASIC = "QWxhZGRpbjpvcGVu"   # the RFC 7617 example credential (Aladdin:open): public and synthetic
-SYNTH_TOKEN = "demoTok123abc"
 
 
 @requires_windows_pwsh
 class VenueProbeIdentityRedactionR2Tests(IdentityProbeMixin, unittest.TestCase):
     setUp = VenueQuietAttributionTests.setUp
     gate = VenueQuietAttributionTests.gate
-
-    def assert_redacted(self, cmd: str, secrets: tuple = (SYNTH_SECRET,)) -> None:
-        r = _protect_ident_text([cmd])[0]
-        for secret in secrets:
-            self.assertNotIn(secret, r["text"], f"{cmd!r} -> {r['text']!r}")
-        self.assertGreaterEqual(r["redactions"], 1, f"{cmd!r} -> {r['text']!r}")
-
-    def test_json_keys_in_double_and_single_quotes_with_and_without_spaces_are_redacted(self) -> None:
-        for cmd in ('python x.py {"password":"demoValue42"}', 'python x.py {"password": "demoValue42"}', 'python x.py {"api_key" : "demoValue42"}',
-                    "python x.py {'token':'demoValue42'}", "python x.py {'token' : 'demoValue42'}", 'python x.py {"client_secret":"demoValue42","n":1}',
-                    r'python x.py {\"password\":\"demoValue42\"}', 'python x.py {"password":demoValue42}', 'python x.py {"password":"demo Value42 two"}'):
-            with self.subTest(cmd=cmd):
-                self.assert_redacted(cmd, (SYNTH_SECRET, "Value42"))
-
-    def test_authorization_headers_lose_the_scheme_and_the_credential_in_every_quoting(self) -> None:
-        for scheme, cred in (("Basic", SYNTH_BASIC), ("Bearer", SYNTH_TOKEN)):
-            for fmt in ('curl -H "Authorization: {s} {c}" https://h.example/x', "curl -H 'Authorization: {s} {c}' https://h.example/x", "curl -H Authorization: {s} {c} https://h.example/x",
-                        'curl -H "authorization:{s} {c}" https://h.example/x', 'curl -d {{"Authorization":"{s} {c}"}} https://h.example/x'):
-                cmd = fmt.format(s=scheme, c=cred)
-                with self.subTest(cmd=cmd):
-                    self.assert_redacted(cmd, (cred,))
-                    text = _protect_ident_text([cmd])[0]["text"]
-                    if scheme == "Basic":
-                        self.assertNotIn("Basic", text, "the scheme goes with the credential")
-                    self.assertIn("https://h.example/x", text, "the rest of the command line survives")
-
-    def test_a_dashed_password_argument_is_still_redacted_a_regression_pin(self) -> None:
-        self.assert_redacted("tool --password=demoValue42 --verbose")
-        self.assertIn("--verbose", _protect_ident_text(["tool --password=demoValue42 --verbose"])[0]["text"])
-
-    def test_url_encoded_key_values_in_a_query_string_are_redacted(self) -> None:
-        for cmd in ("curl https://h.example/x?user=a&password%3DdemoValue42&z=1", "curl https://h.example/x?password%3DdemoValue42", "curl https://h.example/x?api_key%3ademoValue42&z=1",
-                    "curl https://h.example/x?%22password%22%3A%22demoValue42%22"):
-            with self.subTest(cmd=cmd):
-                self.assert_redacted(cmd)
-
-    def test_a_hyphenated_card_name_and_a_plain_script_still_survive_the_wider_rules(self) -> None:
-        r = _protect_ident_text(["python C:\\x\\tool.py --card lane-CPU-17V9-FPS-GAP-AB-1-r5x"])[0]
-        self.assertIn("lane-CPU-17V9-FPS-GAP-AB-1-r5x", r["text"])
-        self.assertEqual(r["redactions"], 0)
-
-    def test_the_header_documents_the_rule_order_and_the_counting(self) -> None:
-        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
-        for needle in ("Authorization", "optional closing quote", "BEFORE the key-like rule", "counted once per rule match"):
-            self.assertIn(needle, text)
-
     def test_the_persisted_raw_json_holds_no_secret_for_the_json_and_the_basic_shapes(self) -> None:
         t = IDENT_T0
         cmd = ('python C:\\mlvtmp\\lane-X-1\\tools\\bench.py {"password":"demoValue42","api_key" : "demoValue42"} '
@@ -8975,66 +8917,167 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
 
 
 # ---------------------------------------------------------------------------------------------------
-# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r3: Dot B1 (a quoted value is redacted through its CLOSING quote), Grok G1 (short credential keys, -p<value>) and G2 (an unquoted value on a
-# non-URL command line runs to whitespace, not to '&'). Synthetic values only; each case FAILS on 8f483df5 and passes on the r3 head.
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r4: FAIL-CLOSED command-line redaction. Per-shape rules (r1-r3) kept leaking new shapes (dot 93a864e0's escaped-quote JSON value, Grok G3 a quoted
+# key then whitespace, G4 compound names, G5 a quote that opens mid-value), so a line whose RAW text holds any credential token keeps no argument text at all. Every vector goes
+# through the REAL probe body and the REAL gate, and is checked in the probe line, the raw probe JSON the gate persists, and the gate's top / attr / ident text. Synthetic values only.
+R4_MARKER = "Value42"   # every vector's secret holds it (demoValue42, or a split form such as demo"Value42 / demo&Value42 / demo Value42)
+R4_VECTORS = [
+    # r4: the shapes that leaked on 7bca751c
+    ("dot-93a864e0 three-backslash", r'tool {\"password\":\"prefix\\\" demoValue42 tail\"}'),
+    ("dot-93a864e0 one-backslash", r'tool {\"password\":\"prefix\" demoValue42 tail\"}'),
+    ("G3 fully quoted argv", '"tool.exe" "--password" "demoValue42"'),
+    ("G3 quoted json key then whitespace", 'tool {"password" "demoValue42"}'),
+    ("G3 quoted key then whitespace", 'tool "password"  demoValue42 --verbose'),
+    ("G4 --db-pass", "tool --db-pass demoValue42"),
+    ("G4 --passphrase", "tool --passphrase demoValue42"),
+    ("G5 quote opens mid-value", 'tool --password=demo"Value42 tail" --verbose'),
+    # r1
+    ("r1 key and token", r"python C:\mlvtmp\lane-X-1\tools\bench.py --api_key=demoValue42 --token demoValue42"),
+    ("r1 url userinfo", "curl https://user:demoValue42@host.example/x"),
+    ("r1 bearer", "tool --header Bearer demoValue42 go"),
+    ("r1 password=", "app password=demoValue42 run"),
+    ("r1 --secret quoted", 'app --secret "a demoValue42" go'),
+    ("r1 token prefixes", "x sk-demoValue42abcdef ghp_demoValue42abcdef AKIAdemoValue42ABCDEF"),
+    ("r1 jwt", "y eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZW1vIn0.demoValue42sig"),
+    ("r1 opaque run", "z demoValue42" + "A" * 40),
+    # r2 (Dot B1): JSON keys, Authorization headers, a dashed password, URL-encoded keys
+    ("r2 json dq", 'python x.py {"password":"demoValue42"}'),
+    ("r2 json dq space", 'python x.py {"password": "demoValue42"}'),
+    ("r2 json api_key spaced", 'python x.py {"api_key" : "demoValue42"}'),
+    ("r2 json sq", "python x.py {'token':'demoValue42'}"),
+    ("r2 json sq spaced", "python x.py {'token' : 'demoValue42'}"),
+    ("r2 json client_secret", 'python x.py {"client_secret":"demoValue42","n":1}'),
+    ("r2 json escaped", r'python x.py {\"password\":\"demoValue42\"}'),
+    ("r2 json unquoted value", 'python x.py {"password":demoValue42}'),
+    ("r2 json value with spaces", 'python x.py {"password":"demo Value42 two"}'),
+    ("r2 authorization basic dq", 'curl -H "Authorization: Basic demoValue42" https://h.example/x'),
+    ("r2 authorization basic sq", "curl -H 'Authorization: Basic demoValue42' https://h.example/x"),
+    ("r2 authorization basic bare", "curl -H Authorization: Basic demoValue42 https://h.example/x"),
+    ("r2 authorization bearer nospace", 'curl -H "authorization:Bearer demoValue42" https://h.example/x'),
+    ("r2 authorization json", 'curl -d {"Authorization":"Bearer demoValue42"} https://h.example/x'),
+    ("r2 dashed password", "tool --password=demoValue42 --verbose"),
+    ("r2 urlenc password", "curl https://h.example/x?user=a&password%3DdemoValue42&z=1"),
+    ("r2 urlenc password only", "curl https://h.example/x?password%3DdemoValue42"),
+    ("r2 urlenc api_key", "curl https://h.example/x?api_key%3ademoValue42&z=1"),
+    ("r2 urlenc json", "curl https://h.example/x?%22password%22%3A%22demoValue42%22"),
+    ("r2 persisted json and basic", 'python C:\\mlvtmp\\lane-X-1\\tools\\bench.py {"password":"demoValue42","api_key" : "demoValue42"} '
+                                    '--hdr "Authorization: Basic QWxhZGRpbjpvcGVu" --q password%3DdemoValue42'),
+    # r3 (Dot B1 quoted values, Grok G1 short keys and -p, G2 '&')
+    ("r3 b1 escaped quoted value", r'tool {\"password\":\"prefix demoValue42\"}'),
+    ("r3 b1 escaped two words", r'tool {\"password\":\"two demoValue42 words\",\"n\":1}'),
+    ("r3 b1 embedded escaped quote", r'tool {"password":"abc\"demoValue42 tail","n":1}'),
+    ("r3 b1 dq value", 'app --password "two demoValue42 words" --verbose'),
+    ("r3 b1 sq doubled quote", "app --token 'it''s demoValue42 here' --verbose"),
+    ("r3 b1 unterminated", 'app --password "demoValue42 unterminated'),
+    ("r3 g1 --pass", "app --pass demoValue42 --verbose"),
+    ("r3 g1 json pass", 'app {"pass":"demoValue42"}'),
+    ("r3 g1 --pw=", "app --pw=demoValue42 --verbose"),
+    ("r3 g1 --pwd", "app --pwd demoValue42 --verbose"),
+    ("r3 g1 -pass=", "app -pass=demoValue42"),
+    ("r3 g1 mysql -p attached", "mysql -u root -pdemoValue42"),
+    ("r3 g1 mysql -p separated", "mysql -u root -p demoValue42 mydb"),
+    ("r3 g1 mysql -p attached then db", "mysql -u root -pdemoValue42 mydb"),
+    ("r3 g1 mysql -p quoted", 'mysql -u root -p"demo Value42" mydb'),
+    ("r3 g2 ampersand in a password", "tool --password=demo&Value42 --verbose"),
+    ("r3 g2 ampersand in a token", "tool --token demoValue42&tail --verbose"),
+    ("r3 g2 ampersand in a secret", "tool secret=demo&Value42&more x"),
+    ("r3 g2 url query", "curl https://h.example/x?user=a&password=demoValue42&z=1 --verbose"),
+    ("r3 -password=", "tool -password=demoValue42 --verbose"),
+]
+# the rest of a secret that spans words: the marker alone would miss a partial leak (7bca751c persisted G5 as `--password=<redacted> tail"`)
+R4_EXTRA_GONE = {"dot-93a864e0 three-backslash": ("prefix", "tail"), "dot-93a864e0 one-backslash": ("prefix", "tail"), "G5 quote opens mid-value": ("tail",),
+                 "r3 b1 escaped quoted value": ("prefix",), "r3 b1 escaped two words": ("two", "words"), "r3 b1 embedded escaped quote": ("abc", "tail"),
+                 "r3 b1 dq value": ("two", "words"), "r3 b1 sq doubled quote": ("here",), "r3 b1 unterminated": ("unterminated",), "r3 g2 ampersand in a token": ("tail",),
+                 "r3 g2 ampersand in a secret": ("more",)}
+R4_TOKENS = ["pass", "pwd", "pw", "secret", "token", "key", "auth", "credential", "bearer", "cookie", "session"]
+
+
+def _r4_strings(v) -> list:
+    if isinstance(v, dict):
+        return [s for x in v.values() for s in _r4_strings(x)]
+    if isinstance(v, list):
+        return [s for x in v for s in _r4_strings(x)]
+    return [v] if isinstance(v, str) else []
+
+
 @requires_windows_pwsh
-class VenueProbeIdentityRedactionR3Tests(unittest.TestCase):
-    def check(self, cmd: str, gone: tuple, kept: tuple = ()) -> None:
-        r = _protect_ident_text([cmd])[0]
-        for secret in gone:
-            self.assertNotIn(secret, r["text"], f"{cmd!r} -> {r['text']!r}")
-        for keep in kept:
-            self.assertIn(keep, r["text"], f"{cmd!r} -> {r['text']!r}")
-        self.assertGreaterEqual(r["redactions"], 1, f"{cmd!r} -> {r['text']!r}")
+class VenueProbeIdentityRedactionFailClosedR4Tests(IdentityProbeMixin, unittest.TestCase):
+    setUp = VenueQuietAttributionTests.setUp
+    gate = VenueQuietAttributionTests.gate
+    CHUNK = 8   # identity covers the top 10 processes, so a probe carries at most 8 vectors
 
-    def test_b1_a_quoted_value_with_a_space_is_redacted_through_its_closing_quote(self) -> None:
-        for cmd, gone, kept in (
-            (r'tool {\"password\":\"prefix demoValue42\"}', (SYNTH_SECRET, "prefix"), ("tool",)),
-            (r'tool {\"password\":\"two demoValue42 words\",\"n\":1}', (SYNTH_SECRET, "two", "words"), (r'\"n\":1',)),
-            (r'tool {"password":"abc\"demoValue42 tail","n":1}', (SYNTH_SECRET, "abc", "tail"), ('"n":1',)),
-            ('app --password "two demoValue42 words" --verbose', (SYNTH_SECRET, "two", "words"), ("--verbose",)),
-            ("app --token 'it''s demoValue42 here' --verbose", (SYNTH_SECRET, "here"), ("--verbose",)),
-            ('app --password "demoValue42 unterminated', (SYNTH_SECRET, "unterminated"), ("app",)),
-        ):
+    def persist(self, cmds: list) -> tuple:
+        """cmds -> (rows as persisted in the gate's raw probe JSON, the probe line, the raw JSON text, the gate stdout)."""
+        t = IDENT_T0
+        procs = [(2001 + i, "tool", 30.0 - i, t) for i in range(len(cmds))]
+        cim = [_ident_cim(2001 + i, 0, "tool.exe", t, c) for i, c in enumerate(cmds)]
+        p = self.run_identity_probe(procs, cim, {})
+        before = set(self.work.glob("venue-quiet-probe-*.json")) if self.work.exists() else set()
+        proc = self.gate(dict(p, host="BACHELOR"))
+        raws = sorted(set(self.work.glob("venue-quiet-probe-*.json")) - before)
+        self.assertEqual(len(raws), 1, (raws, proc.stdout + proc.stderr))
+        raw = raws[0].read_text(encoding="utf-8")
+        by_pid = {r["pid"]: r for r in json.loads(raw)["identity"]["processes"]}
+        return [by_pid.get(2001 + i) for i in range(len(cmds))], self.last_line, raw, proc.stdout
+
+    def test_fail_closed_redaction_table_no_vector_persists_its_secret(self) -> None:
+        for at in range(0, len(R4_VECTORS), self.CHUNK):
+            chunk = R4_VECTORS[at:at + self.CHUNK]
+            rows, line, raw, out = self.persist([c for _l, c in chunk])
+            for (label, cmd), r in zip(chunk, rows):
+                with self.subTest(vector=label):
+                    self.assertIsNotNone(r, label)
+                    leaked = [s for s in _r4_strings(r) if any(g in s for g in (R4_MARKER,) + R4_EXTRA_GONE.get(label, ()))]
+                    self.assertEqual(leaked, [], f"{label}: {cmd!r} persisted {leaked!r}")
+                    self.assertEqual((r.get("args_redacted"), r["cmdline_status"]), ("fail-closed", "ok"), r)
+                    self.assertRegex(r["cmdline"], r"^\S+( \S+)? args=\d+ : <redacted>( <redacted>)*$", r)
+            with self.subTest(chunk=at):
+                for where, text in (("probe line", line), ("raw probe JSON", raw), ("gate text", out)):
+                    self.assertNotIn(R4_MARKER, text, where)
+
+    def test_a_clean_command_line_keeps_its_arguments(self) -> None:
+        clean = [r"python C:\x\tool.py --card lane-CPU-17V9-FPS-GAP-AB-1-r5x --frames 120", "mysql -u root -P3306 mydb",
+                 r'ffmpeg -i "C:\clips\a b.mov" -vf scale=1920:1080 out.mov']
+        rows, _line, _raw, _out = self.persist(clean)
+        want = [r"python C:\x\tool.py args=5 : C:\x\tool.py --card lane-CPU-17V9-FPS-GAP-AB-1-r5x --frames 120", "mysql args=4 : -u root -P3306 mydb",
+                r'ffmpeg args=5 : -i "C:\clips\a b.mov" -vf scale=1920:1080 out.mov']
+        for cmd, r, w in zip(clean, rows, want):
             with self.subTest(cmd=cmd):
-                self.check(cmd, gone, kept)
+                self.assertEqual((r["cmdline"], r.get("args_redacted"), r["cmdline_redactions"]), (w, "none", 0), r)
+        self.assertEqual(rows[0]["script"], "tool.py")
 
-    def test_g1_the_short_credential_keys_pass_pw_pwd_are_redacted(self) -> None:
-        for cmd, kept in (("app --pass demoValue42 --verbose", ("--verbose",)), ('app {"pass":"demoValue42"}', ("app",)), ("app --pw=demoValue42 --verbose", ("--verbose",)),
-                          ("app --pwd demoValue42 --verbose", ("--verbose",)), ("app -pass=demoValue42", ("app",))):
-            with self.subTest(cmd=cmd):
-                self.check(cmd, (SYNTH_SECRET,), kept)
+    def test_a_tainted_line_still_names_its_exe_script_and_project(self) -> None:
+        t = IDENT_T0
+        cmd = r"pwsh -NoProfile -File C:\mlvtmp\lane-X-1\run.ps1 -Token demoValue42"
+        cim = [_ident_cim(16892, 0, "pwsh.exe", t, cmd, r"C:\Program Files\PowerShell\7\pwsh.exe")]
+        r = self.row(self.run_identity_probe([(16892, "pwsh", 29.1, t)], cim, CHAIN_OWNERS), 16892)
+        self.assertEqual(r["cmdline"], r"C:\Program Files\PowerShell\7\pwsh.exe C:\mlvtmp\lane-X-1\run.ps1 args=5 : <redacted> <redacted> <redacted> <redacted>")
+        self.assertEqual((r["script"], r["project"], r["project_from"], r.get("args_redacted"), r.get("cmdline_args")), ("run.ps1", "mlv-app", "self", "fail-closed", 5))
+        self.assertNotIn(R4_MARKER, self.last_line)
 
-    def test_g1_the_mysql_style_p_flag_attached_and_separated_is_redacted(self) -> None:
-        for cmd, gone, kept in (("mysql -u root -pdemoValue42", (SYNTH_SECRET,), ("-u root",)), ("mysql -u root -p demoValue42 mydb", (SYNTH_SECRET,), ("-u root", "mydb")),
-                                ("mysql -u root -pdemoValue42 mydb", (SYNTH_SECRET,), ("mydb",)), ('mysql -u root -p"demo Value42" mydb', (SYNTH_SECRET, "Value42"), ("mydb",))):
-            with self.subTest(cmd=cmd):
-                self.check(cmd, gone, kept)
+    def test_a_script_shaped_value_after_a_credential_flag_is_not_named_a_script(self) -> None:
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "tool.exe", t, '"tool.exe" "--password" "demoValue42.py"')]
+        r = self.row(self.run_identity_probe([(16892, "tool", 29.1, t)], cim, CHAIN_OWNERS), 16892)
+        self.assertEqual((r["script"], r["cmdline"]), (None, "tool.exe args=2 : <redacted> <redacted>"))
+        self.assertNotIn(R4_MARKER, self.last_line)
 
-    def test_g1_whole_name_matching_keeps_unrelated_words_and_an_upper_case_port_flag(self) -> None:
-        for cmd in ("python tool.py --passenger 3 --pwned yes", "mysql -u root -P3306 mydb", "python C:\\x\\tool.py --card lane-playback-1 --bypass"):
-            with self.subTest(cmd=cmd):
-                r = _protect_ident_text([cmd])[0]
-                self.assertEqual((r["text"], r["redactions"]), (cmd, 0), r)
+    def test_the_scan_is_a_substring_scan_of_the_raw_line_before_any_tokenising(self) -> None:
+        body = _ident_probe_body()
+        m = re.search(r"\$identSecretTokens = @\(([^)]*)\)", body)
+        self.assertIsNotNone(m)
+        self.assertEqual(re.findall(r"'([^']*)'", m.group(1)), R4_TOKENS)
+        self.assertIn("IndexOf($t, [StringComparison]::OrdinalIgnoreCase)", body, "a case-insensitive SUBSTRING scan, not a word match")
+        fn = re.search(r"function Protect-IdentCmdLine\(.*?\r?\n\}\r?\n", body, re.S)
+        self.assertIsNotNone(fn)
+        self.assertLess(fn.group(0).index("Test-IdentTainted $raw"), fn.group(0).index("Split-IdentArgv"), "the scan runs on the raw text before the line is tokenised")
 
-    def test_g1_an_already_redacted_dash_p_token_is_not_redacted_twice(self) -> None:
-        r = _protect_ident_text(["tool -password=demoValue42 --verbose"])[0]
-        self.assertNotIn(SYNTH_SECRET, r["text"])
-        self.assertIn("-password=<redacted>", r["text"])
-        self.assertEqual(r["redactions"], 1, r)
-
-    def test_g2_an_unquoted_value_on_a_plain_command_line_runs_to_whitespace_not_to_an_ampersand(self) -> None:
-        for cmd in ("tool --password=demo&Value42 --verbose", "tool --token demoValue42&tail --verbose", "tool secret=demo&Value42&more x"):
-            with self.subTest(cmd=cmd):
-                r = _protect_ident_text([cmd])[0]
-                for leak in ("&Value42", "&tail", "&more", SYNTH_SECRET):
-                    self.assertNotIn(leak, r["text"], r)
-
-    def test_g2_a_url_query_string_keeps_its_ampersand_rule(self) -> None:
-        r = _protect_ident_text(["curl https://h.example/x?user=a&password=demoValue42&z=1 --verbose"])[0]
-        self.assertNotIn(SYNTH_SECRET, r["text"])
-        self.assertIn("&z=1", r["text"], "the next query parameter survives")
-        self.assertIn("--verbose", r["text"])
+    def test_the_pattern_based_redaction_is_retired(self) -> None:
+        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        for gone in ("Protect-IdentText", "$keyLikePlain", "$keyLikeUrl", "$pFlag"):
+            self.assertNotIn(gone, text)
+        for needle in ("REDACTION IS FAIL-CLOSED", "args_redacted = fail-closed", "Over-redaction"):
+            self.assertIn(needle, text)
 
 
 # r3 Dot B2: Summarize-VenueBusyProbes.ps1 judges every input as TEXT before any Test-Path, Get-Item or read; a UNC or provider-qualified path is refused with a typed exit 2.
