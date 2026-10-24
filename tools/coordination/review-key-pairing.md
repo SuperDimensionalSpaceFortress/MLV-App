@@ -87,6 +87,41 @@ the same change as the patch above**, or `opus` keys are never read, retried or 
 
 `read-key-verdict.ps1` already classes `fable`, `opus` and `sonnet` alike as claude lanes.
 
+## Defect dispositions block (FACTORY-ESCAPE-REGRESSION-DISCIPLINE-1, evidence-only)
+
+Owner ask 2026-10-24 (dot notice on #660): every demonstrated defect (a key BLOCKER, a confirmed Dot/Grok
+finding, a merge_group failure that is not a flake) leaves a row in the landing PR body: the regression test
+that is RED on the old sha and GREEN on the new, the adversarial combination tests (or `none` with a reason),
+and a disposition (`fixed`, `distinguished: <reason>`, `deferred: <CARD>`). The block sits between
+`<!-- defect-dispositions:begin -->` and `<!-- defect-dispositions:end -->` and is built by
+`tools/coordination/defect_ledger.py`; the record schema `defect-ledger.v1` is in its docstring.
+
+**It is record-only, not a gate.** No hook deny, CI check or enqueue refusal reads it. A fix round writes a
+JSON list of records, then `render --pr N --head <40-hex> --records <file>` and
+`splice --body-file <body> --block-file <block> --out <new>` (idempotent; malformed markers are refused,
+exit 2, nothing written), then `gh pr edit --body-file`. An absent field renders `MISSING`; a non-`fixed` row
+states `n/a` explicitly. `check --body-file <f>` prints one line (`DEFECT_LEDGER ok n=<k>`, `WARN missing`,
+`WARN unbound=<n> rows=<ids>`, `WARN incomplete rows=<ids>`, `WARN unreadable <why>`) and always exits 0.
+"Incomplete" means a MISSING cell, a `fixed` row without distinct RED-old / GREEN-new shas or without a
+combination test or reason, or an unknown disposition.
+
+**Binding rule (Dot B1 on #667).** Every record carries `schema`, `pr` and `head_sha` (full 40-hex), and
+`render` compares them with `--pr`, `--head` and `defect-ledger.v1`. A record that differs or lacks one is never
+printed as if it belonged to this PR and head: its Disposition cell starts `UNBOUND: pr 612 != 667` (or
+`head 1a2b3c4d != 95e9ff8f`, `head_sha MISSING`, `schema <x>`) and keeps the record's own disposition after it,
+the row stays visible, and a `Binding check:` line counts bound against UNBOUND rows. A block whose records all
+match reads exactly as before. Still no gate: `check` warns and exits 0.
+
+The hub's daily roadmap line comes from `escapes --merged-log <jsonl> --records-dir <dir> --since-days 7
+[--known-flakes <file>] [--reverts-from-git <repo>] [--now <utc>]`: `ESCAPES window=7d merged_defects=<a>
+reverts=<c> nonflake_merge_group_failures=<b> repeat_failures=<r> undetermined=<u>`, then one `ESCAPE ...` line
+per counted item. A repeat is one test id or normalised claim recorded on two or more distinct PRs inside the
+window; `distinguished` rows and known flakes (events, and records whose regression test is one) never count.
+A merged defect needs the record's `fixed_utc` after the PR's merge event (a defect fixed before landing is not
+an escape); without a usable `fixed_utc` it is `undetermined`, not an escape. `--now` also drops merge events
+dated after it, so a replay never counts a future merge. It also always exits 0 and reads only the files it is
+handed.
+
 ## Checking the posture
 
 `python tools/coordination/check-lane-model-currency.py` reads the lane receipts and reports a lane
@@ -97,3 +132,19 @@ table), and either makes the overall verdict `INCOMPLETE` (exit 3; no lane in th
 also exit 3). `Invoke-Lane.ps1` receipts carry `codexModelsFetchedAt` (age of the model list) and, for a
 pinned read-only codex lane, `codexExe.pinState` (`PIN_MODEL_UNPROBED` = the pin never proved the
 resolved model, so the global CLI ran it).
+
+## Provider/model topology block (PR-PROVIDER-MODEL-TOPOLOGY-1, record-only)
+
+Owner ask 2026-10-24 (dot notice on #660): a PR body shows the provider and exact model for each role.
+`python tools/coordination/pr_topology.py render --pr N --head <40-hex> --card <CARD> --runs-root
+<fleet-runs>` builds the `<!-- pr-topology:begin -->` ... `<!-- pr-topology:end -->` block from the run
+dirs (`lane-<CARD>-r<k>-*`, `design-<CARD>-*`, `review-pr<N>-<seat>[-key3]-r<k>-*`): provider by receipt
+`engine`, `resolvedModel` (else `claimed: <requestedModel>`), `effort`, and the SHA each row is bound to
+(a key's `subject_sha`, a producer's `DONE <sha>`; else `unbound`). A row on another head reads
+`stale (other head)`. A footer is only ever `claimed by footer, unverified`.
+
+**It is not a gate.** `check --body-file <f> --head <sha>` prints one line (`PR_TOPOLOGY ok`, `WARN
+missing`, `WARN stale head=.. section=..`, `WARN unreadable ..`) and always exits 0. The hub refreshes the
+block with `render`, then `splice --body-file <body> --block-file <block> --out <new>` (idempotent; a body with
+malformed markers is refused, exit 2, nothing written), then `gh pr edit --body-file`. Wiring `check` into
+merge-enqueue's log and `render`+`splice` into the key watcher is hub tooling under `.claude-state`.
