@@ -87,6 +87,30 @@ the same change as the patch above**, or `opus` keys are never read, retried or 
 
 `read-key-verdict.ps1` already classes `fable`, `opus` and `sonnet` alike as claude lanes.
 
+## Defect dispositions block (FACTORY-ESCAPE-REGRESSION-DISCIPLINE-1, evidence-only)
+
+Owner ask 2026-10-24 (dot notice on #660): every demonstrated defect (a key BLOCKER, a confirmed Dot/Grok
+finding, a merge_group failure that is not a flake) leaves a row in the landing PR body: the regression test
+that is RED on the old sha and GREEN on the new, the adversarial combination tests (or `none` with a reason),
+and a disposition (`fixed`, `distinguished: <reason>`, `deferred: <CARD>`). The block sits between
+`<!-- defect-dispositions:begin -->` and `<!-- defect-dispositions:end -->` and is built by
+`tools/coordination/defect_ledger.py`; the record schema `defect-ledger.v1` is in its docstring.
+
+**It is record-only, not a gate.** No hook deny, CI check or enqueue refusal reads it. A fix round writes a
+JSON list of records, then `render --pr N --head <40-hex> --records <file>` and
+`splice --body-file <body> --block-file <block> --out <new>` (idempotent; malformed markers are refused,
+exit 2, nothing written), then `gh pr edit --body-file`. An absent field renders `MISSING`; a non-`fixed` row
+states `n/a` explicitly. `check --body-file <f>` prints one line (`DEFECT_LEDGER ok n=<k>`, `WARN missing`,
+`WARN incomplete rows=<ids>`, `WARN unreadable <why>`) and always exits 0. "Incomplete" means a MISSING cell,
+a `fixed` row without distinct RED-old / GREEN-new shas or without a combination test or reason, or an unknown
+disposition.
+
+The hub's daily roadmap line comes from `escapes --merged-log <jsonl> --records-dir <dir> --since-days 7
+[--known-flakes <file>] [--reverts-from-git <repo>]`: `ESCAPES window=7d merged_defects=<a> reverts=<c>
+nonflake_merge_group_failures=<b> repeat_failures=<r>`, then one `ESCAPE ...` line per counted item. A repeat
+is one test id or normalised claim recorded on two or more distinct PRs inside the window; `distinguished`
+rows and known flakes never count. It also always exits 0 and reads only the files it is handed.
+
 ## Checking the posture
 
 `python tools/coordination/check-lane-model-currency.py` reads the lane receipts and reports a lane
