@@ -39,17 +39,17 @@
 #          their parents, then their grandparents; never a full-table enumeration, never polling) + one GetOwner per TARGET + ONE \GPU Engine(*)\Utilization Percentage read. The
 #          GPU read is a separate Get-Counter call, never added to the decision's counter groups, and runs before the CIM batch because its top pids are CIM targets too.
 #          Per target row: owner, started_utc (checked against the sampled process start; a start that differs by more than 1 s is start_check mismatch = a reused pid, and that
-#          row carries pid, name and start_check ONLY), redacted command line, executable, script, project, parent and grandparent (status ok | exited | pid-reused when the
+#          row carries pid, name and start_check ONLY), command line with no argument text, executable, script, project, parent and grandparent (status ok | exited | pid-reused when the
 #          parent STARTED AFTER its child | none = no parent pid or nothing to compare), GPU percent and engine type.
 #        PROJECT: a pinned table (mlv-app, agent-bridge, adobe-ingester, fleet-doctrine, adversarialllm, virtual-ten, airmypc), first match wins, case-insensitive substring on the
 #          UNREDACTED command line and executable path (held in memory only), the process itself first, then its parent, then its grandparent; only the table's name is emitted.
 #          A user-profile root is not a project (the owner field covers it). The working directory is NOT collected: Win32_Process does not expose it and reading the process
 #          environment block or memory is out of scope. No environment block is ever read.
-#        REDACTION IS FAIL-CLOSED (r4): cmdline carries only the executable path, the script or module path and `args=<count>`. The other argument text is kept ONLY when a
-#          case-insensitive SUBSTRING scan of the RAW, unparsed command line finds none of pass pwd pw secret token key auth credential bearer cookie session (nor URL userinfo, a
-#          known token prefix, a JWT, an opaque 40+ character run or a lower-case `-p`); otherwise every argument but the script path becomes <redacted> and args_redacted = fail-closed. Over-redaction
-#          (`--keyframe`, `mkdir -p`, `-ExecutionPolicy Bypass`) is the accepted, safe direction. Then a 200-character cap keeps the first 200 and appends `...[+N]`
-#          (cmdline_truncated_chars = N). The contract is documented at Protect-IdentCmdLine.
+#        REDACTION IS AN ALLOWLIST (r5): NO ARGUMENT TEXT IS EVER PERSISTED. cmdline is `<exe> args=<count> script=<path|<none>>` and nothing else, on every line: the exe path
+#          (ExecutablePath, else the OS image name), the argument count, and a script path taken ONLY from the first argument after the executable, ONLY when it is a drive-rooted
+#          .ps1/.psm1/.py/.js/.mjs/.cmd/.bat path with no whitespace, '=', '@', '?', '#' or ':' past the drive letter that EXISTS on a fixed local drive of the probed host. The row's
+#          `script` is that same path or null. The old token scan is only the diagnostic integer cmdline_token_hits and gates nothing. Then a 200-character cap keeps the first 200
+#          and appends `...[+N]` (cmdline_truncated_chars = N). The contract is documented at Protect-IdentCmdLine.
 #        NON-ELEVATED DEGRADATION: the probe runs as the agent account, not elevated. What it cannot read is a TYPED status, never a guess: owner_status access-denied | exited |
 #          error-<ReturnValue> | budget-exceeded, cmdline_status / exe_status unreadable | exited, gpu_status counter-unavailable: <why> | no-gpu-context | disabled: <why>. A null
 #          always has its reason. WALL-CLOCK BUDGET: past 25 s of identity time no further GetOwner call is made (owner_status budget-exceeded), so identity can never push the
@@ -487,7 +487,7 @@ foreach ($c in ($cores | Group-Object core_class)) {
     $vals = @($c.Group | ForEach-Object { $_.percent })
     $classAgg[$c.Name] = [ordered]@{ count = $vals.Count; mean_percent = Get-Mean $vals; max_percent = ($vals | Measure-Object -Maximum).Maximum }
 }
-# IDENTITY (VENUE-PROBE-PROCESS-ATTRIBUTION-1): WHO (owner, project) and WHAT (script, redacted command line, parent chain, start time, GPU) for the processes named above.
+# IDENTITY (VENUE-PROBE-PROCESS-ATTRIBUTION-1): WHO (owner, project) and WHAT (script, a command line with no argument text, parent chain, start time, GPU) for the processes named above.
 # It runs AFTER the sample window and after every v2 figure (never inside the sample loop, no new sleep), decides nothing, and sits in ONE try/catch: on any failure the line
 # carries identity = { schema, error } and every other field is unchanged. The GPU read comes FIRST here, not last, because its top pids are CIM targets too (one extra WQL
 # query would break the 3-query bound). Bound: at most 3 WQL queries (targets, their parents, their grandparents) + GetOwner per target + ONE GPU Engine read.
@@ -511,22 +511,23 @@ $identityProjects = @(
     @('agent-bridge', 'agent-bridge'), @('Adobe Document Cloud Ingester', 'adobe-ingester'), @('softwarefactory-fleet-doctrine', 'fleet-doctrine'),
     @('AdversarialLLM', 'adversarialllm'), @('VIRTUAL-TEN', 'virtual-ten'), @('AirMyPC', 'airmypc')
 )
-# REDACTION IS FAIL-CLOSED (r4). Per-shape regex rules (r1-r3) kept leaking new shapes (a JSON value with escaped quotes, a quoted key then whitespace, compound names such as
-# --db-pass, a quote that opens mid-value), so no shape is guessed any more:
-#   1. SCAN FIRST, before any tokenising: a case-insensitive SUBSTRING scan of the RAW, unparsed command line for any of $identSecretTokens, plus five shapes that carry a credential
-#      with no keyword at all (URL userinfo, a known token prefix, a JWT, an opaque 40+ character run, a mysql-style lower-case `-p`). Any hit makes the line TAINTED.
-#   2. cmdline = `<exe> [<script>] args=<n>`: exe is ExecutablePath (else argv[0] when it is path-shaped and, on a tainted line, holds no token; else <unknown-exe>); script is the
-#      first path-shaped .ps1/.psm1/.py/.js/.mjs/.exe/.cmd/.bat argument that does not follow an argument holding a token; n counts the arguments after argv[0] (Windows argv rules).
-#   3. a CLEAN line appends ` : <the raw argument text after argv[0]>` (args_redacted = none). A TAINTED line appends ` : <redacted>` once per argument other than the script path
-#      (args_redacted = fail-closed, cmdline_redactions = that count). Over-redaction (--keyframe, mkdir -p, -ExecutionPolicy Bypass, any line naming pwsh) is accepted: it is the
-#      safe direction. No shape-specific rewrite of argument text exists any more, so a shape nobody foresaw can still only reach a persisted copy on a line the scan found clean.
-#   4. then a 200-character cap. Project attribution reads the unredacted line in memory only (Get-IdentProject) and emits a table name, never text.
+# REDACTION IS AN ALLOWLIST (r5): NO ARGUMENT TEXT IS PERSISTED. The r4 token denylist still leaked (`--signature x`, `?sig=x`, `-u user:x`, and a quoted value promoted to the
+# script slot), so no argument text is kept on ANY line, whatever the line holds:
+#   1. cmdline = `<exe> args=<n> script=<path|<none>>` and nothing else. exe is ExecutablePath, else the process image Name (both come from the OS, never from the argument text),
+#      else <unknown-exe>; n counts the arguments after argv[0] (Windows argv rules, Split-IdentArgv).
+#   2. script comes ONLY from the FIRST argument after the executable, never a later one (for pwsh / powershell whose first argument is a literal -File, the argument after it: the
+#      one host switch whose next argument is a script by definition). It is filled only when that argument is a drive-rooted path (so it starts with neither '-' nor '/'; a
+#      relative path cannot be checked, the working directory is not collected) holding no whitespace, '=', '@', '?', '#', quote or ':' past the drive letter, ending in
+#      .ps1 .psm1 .py .js .mjs .cmd .bat, on a FIXED local drive, and naming a file that EXISTS on this host (checked in memory; nothing is written). Otherwise <none>.
+#   3. the row's `script` field is that same path or null; then the 200-character cap. The token scan survives ONLY as the diagnostic integer cmdline_token_hits and gates
+#      nothing. Project attribution reads the unredacted line in memory only (Get-IdentProject) and emits a table name, never text.
 $identSecretTokens = @('pass', 'pwd', 'pw', 'secret', 'token', 'key', 'auth', 'credential', 'bearer', 'cookie', 'session')
 $identSecretShapes = '(?i)[a-z][a-z0-9+.-]*://[^/@\s]+@|(?:sk-|ghp_|gho_|ghs_|github_pat_|xox[abps]-|AKIA)[A-Za-z0-9_-]{10,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.|[A-Za-z0-9+/=]{40,}|(?-i:(?<![\w-])-p)'
-function Test-IdentTainted($Text) {
-    $s = [string]$Text
-    foreach ($t in $identSecretTokens) { if ($s.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
-    $s -match $identSecretShapes
+# diagnostic only: how many of the tokens and shapes the RAW line holds (case-insensitive substring scan). It decides nothing about what is written.
+function Measure-IdentTokenHits($Text) {
+    $s = [string]$Text; $n = 0
+    foreach ($t in $identSecretTokens) { if ($s.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $n++ } }
+    $n + [regex]::Matches($s, $identSecretShapes).Count
 }
 # the 200-character cap for a path or a name (no rule rewrites it): { text, truncated }
 function Limit-IdentText($Text) {
@@ -536,7 +537,7 @@ function Limit-IdentText($Text) {
     [pscustomobject]@{ text = $s; truncated = $cut }
 }
 # Windows argv rules (CommandLineToArgvW): argv[0] runs to the next quote when quoted, else to whitespace; later arguments honour 2n / 2n+1 backslashes before a quote and "" inside
-# quotes. Returns { argv, rest } where rest is the raw text after argv[0]. Only ever called AFTER the taint scan.
+# quotes. Returns { argv, rest } where rest is the raw text after argv[0] (held in memory; never persisted).
 function Split-IdentArgv([string]$s) {
     $argv = New-Object System.Collections.Generic.List[string]
     $q = [char]34; $bsl = [char]92; $i = 0; $n = $s.Length
@@ -569,47 +570,34 @@ function Split-IdentArgv([string]$s) {
     }
     [pscustomobject]@{ argv = $argv.ToArray(); rest = $rest }
 }
-# a token that can only be a file path: no leading switch character, no '=' or ':' past a drive letter, no quote, brace, '%', '&' or wildcard
-function Test-IdentPathShaped([string]$Tok) { $Tok -match '^(?![-/])(?:[A-Za-z]:)?[^=:"''{}%&,;<>|*?\[\]]+$' }
-# the index of the first path-shaped argument with one of $Ext that does not FOLLOW an argument holding a token (so `--password x.py` names no script); -1 when there is none
-function Find-IdentScriptArg($Argv, [int]$From, [string]$Ext) {
-    for ($j = $From; $j -lt $Argv.Count; $j++) {
-        $tok = ([string]$Argv[$j]).Trim([char]39)
-        if ($tok -match ('(?i)\.(' + $Ext + ')$') -and (Test-IdentPathShaped $tok) -and ($j -eq 0 -or -not (Test-IdentTainted $Argv[$j - 1]))) { return $j }
-    }
-    -1
+# rule 2 above, as text: drive-rooted, no whitespace = @ ? # quote or ':' past the drive letter, one of the seven script extensions
+$identScriptShape = '(?i)^[a-z]:[\\/][^\s=@?#:"''*<>|]+\.(?:ps1|psm1|py|js|mjs|cmd|bat)$'
+# the script path of rule 2, or $null: ONLY the first argument after the executable (or, for pwsh / powershell, the one after a first-slot -File), never a later one
+function Get-IdentScriptPath($Argv, [string]$ExeLeaf) {
+    $j = 1
+    if ($ExeLeaf -match '(?i)^(pwsh|powershell)(\.exe)?$' -and $Argv.Count -gt 2 -and [string]$Argv[1] -ieq '-File') { $j = 2 }
+    if ($Argv.Count -le $j) { return $null }
+    $p = [string]$Argv[$j]
+    if ($p -notmatch $identScriptShape) { return $null }
+    try {
+        if (([IO.DriveInfo]::new($p.Substring(0, 1))).DriveType -ne [IO.DriveType]::Fixed) { return $null }
+        if (-not [IO.File]::Exists($p)) { return $null }
+    } catch { return $null }
+    $p
 }
-# the fail-closed command line (contract above): { text, redactions, truncated, args, args_redacted }
-function Protect-IdentCmdLine($CmdLine, $ExePath) {
+# the persisted command line (contract above): { text, script, redactions, truncated, args, token_hits }. No argument text reaches `text` except the rule-2 script path.
+function Protect-IdentCmdLine($CmdLine, $ExePath, $ImageName) {
     $raw = [string]$CmdLine
-    $tainted = Test-IdentTainted $raw
-    $sp = Split-IdentArgv $raw
-    $argv = @($sp.argv)
-    $a0 = ([string]$argv[0]).Trim([char]39)
-    $exe = $(if (-not [string]::IsNullOrEmpty([string]$ExePath)) { [string]$ExePath } elseif ($a0 -and (Test-IdentPathShaped $a0) -and -not ($tainted -and (Test-IdentTainted $a0))) { $a0 } else { '<unknown-exe>' })
-    $mod = Find-IdentScriptArg $argv 1 'ps1|psm1|py|js|mjs|exe|cmd|bat'
-    $parts = @($exe)
-    if ($mod -gt 0) { $parts += ([string]$argv[$mod]).Trim([char]39) }
+    $argv = @((Split-IdentArgv $raw).argv)
+    $exe = $(if (-not [string]::IsNullOrEmpty([string]$ExePath)) { [string]$ExePath } elseif (-not [string]::IsNullOrEmpty([string]$ImageName)) { [string]$ImageName } else { '<unknown-exe>' })
+    $leaf = $(if ($exe -cne '<unknown-exe>') { $exe } else { [string]$argv[0] }) -replace '^.*[\\/]', ''
+    $script = Get-IdentScriptPath $argv $leaf
     $nArgs = $argv.Count - 1
-    $parts += "args=$nArgs"
-    $red = 0
-    if (-not $tainted) { if ($sp.rest) { $parts += ': ' + $sp.rest } }
-    else {
-        $red = $nArgs - $(if ($mod -gt 0) { 1 } else { 0 })
-        if ($red -gt 0) { $parts += ': ' + ((@('<redacted>') * $red) -join ' ') }
+    $lim = Limit-IdentText ("$exe args=$nArgs script=" + $(if ($script) { $script } else { '<none>' }))
+    [pscustomobject]@{
+        text = $lim.text; script = $(if ($script) { (Limit-IdentText $script).text } else { $null }); redactions = $nArgs - $(if ($script) { 1 } else { 0 })
+        truncated = $lim.truncated; args = $nArgs; token_hits = (Measure-IdentTokenHits $raw)
     }
-    $lim = Limit-IdentText ($parts -join ' ')
-    [pscustomobject]@{ text = $lim.text; redactions = $red; truncated = $lim.truncated; args = $nArgs; args_redacted = $(if ($tainted) { 'fail-closed' } else { 'none' }) }
-}
-# the first script argument (.py .ps1 .psm1 .js .mjs .cmd .bat; argv[0] included, an .exe names no script), by basename. Never the whole command line.
-function Get-IdentScript($CmdLine) {
-    if ([string]::IsNullOrEmpty([string]$CmdLine)) { return $null }
-    $argv = @((Split-IdentArgv ([string]$CmdLine)).argv)
-    $j = Find-IdentScriptArg $argv 0 'py|ps1|psm1|js|mjs|cmd|bat'
-    if ($j -lt 0) { return $null }
-    $base = ([string]$argv[$j]).Trim([char]39) -replace '^.*[\\/]', ''
-    if ($base) { return (Limit-IdentText $base).text }
-    $null
 }
 function Get-IdentProject($Row) {
     if ($null -eq $Row) { return $null }
@@ -799,7 +787,7 @@ try {
             $procRows += [ordered]@{
                 pid = [int64]$k; name = $name; source = @($targets[$k]); started_utc = $null; start_check = $startCheck
                 owner = $null; owner_status = 'exited'; cmdline = $null; cmdline_status = 'exited'; cmdline_redactions = 0; cmdline_truncated_chars = 0
-                cmdline_args = $null; args_redacted = $null
+                cmdline_args = $null; args_redacted = $null; cmdline_token_hits = $null
                 exe = $null; exe_status = 'exited'; script = $null; project = 'unknown'; project_from = 'none'
                 parent = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }; grandparent = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }
                 gpu_percent = $gpuPct; gpu_engtype = $gpuEng; gpu_status = $gpuRowStatus
@@ -809,10 +797,10 @@ try {
         }
         $own = $(if ($idSw.ElapsedMilliseconds -gt $IdentityBudgetMs) { @{ owner = $null; status = 'budget-exceeded' } } else { Get-IdentOwner $row })
         if ($null -eq $own.owner) { $ownerBad++ }
-        $cmdText = $null; $cmdRed = 0; $cmdCut = 0; $cmdStatus = 'unreadable'; $cmdArgs = $null; $cmdArgsRed = $null
+        $cmdText = $null; $cmdRed = 0; $cmdCut = 0; $cmdStatus = 'unreadable'; $cmdArgs = $null; $cmdArgsRed = $null; $cmdScript = $null; $cmdHits = $null
         if (-not [string]::IsNullOrEmpty([string]$row.CommandLine)) {
-            $pc = Protect-IdentCmdLine $row.CommandLine $row.ExecutablePath
-            $cmdText = $pc.text; $cmdRed = $pc.redactions; $cmdCut = $pc.truncated; $cmdArgs = $pc.args; $cmdArgsRed = $pc.args_redacted; $cmdStatus = 'ok'
+            $pc = Protect-IdentCmdLine $row.CommandLine $row.ExecutablePath $row.Name
+            $cmdText = $pc.text; $cmdRed = $pc.redactions; $cmdCut = $pc.truncated; $cmdArgs = $pc.args; $cmdArgsRed = 'all'; $cmdScript = $pc.script; $cmdHits = $pc.token_hits; $cmdStatus = 'ok'
         } else { $cmdBad++ }
         $exeText = $null; $exeStatus = 'unreadable'
         if (-not [string]::IsNullOrEmpty([string]$row.ExecutablePath)) { $exeText = (Limit-IdentText $row.ExecutablePath).text; $exeStatus = 'ok' }
@@ -826,8 +814,8 @@ try {
         $procRows += [ordered]@{
             pid = [int64]$k; name = $name; source = @($targets[$k]); started_utc = $startedUtc; start_check = $startCheck
             owner = $own.owner; owner_status = $own.status; cmdline = $cmdText; cmdline_status = $cmdStatus; cmdline_redactions = $cmdRed; cmdline_truncated_chars = $cmdCut
-            cmdline_args = $cmdArgs; args_redacted = $cmdArgsRed
-            exe = $exeText; exe_status = $exeStatus; script = (Get-IdentScript $row.CommandLine); project = $project; project_from = $projectFrom
+            cmdline_args = $cmdArgs; args_redacted = $cmdArgsRed; cmdline_token_hits = $cmdHits
+            exe = $exeText; exe_status = $exeStatus; script = $cmdScript; project = $project; project_from = $projectFrom
             parent = $par.info; grandparent = $gpar.info
             gpu_percent = $gpuPct; gpu_engtype = $gpuEng; gpu_status = $gpuRowStatus
         }

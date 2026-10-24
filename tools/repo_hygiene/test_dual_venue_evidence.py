@@ -8171,6 +8171,19 @@ def _ident_probe_body() -> str:
     return re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
 
 
+def _ident_run_reaped(cmd: list, timeout: float, env: dict | None = None) -> subprocess.CompletedProcess:
+    """subprocess.run, except that a child still alive at the timeout (or on any error) is killed WITH its process tree (r5: an r4 probe child outlived its test)."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except BaseException:
+        if proc.poll() is None:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=60)
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 class IdentityProbeMixin:
     """Runs the REAL probe body (12 s sleeps -> 0) against canned process, counter and CIM data."""
 
@@ -8212,7 +8225,7 @@ class IdentityProbeMixin:
         body = body.replace("$IdentityWorkerPrelude = ''", f"$IdentityWorkerPrelude = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{worker_b64}'))")
         job = self.tmp / "identity-probe-job.ps1"
         job.write_text(prelude + body, encoding="utf-8")
-        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], capture_output=True, text=True, timeout=240)
+        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
         self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
         self.last_line = lines[0][len("VENUE_QUIET="):]   # the line exactly as the gate retains it (Wait-VenueQuiet.ps1 RAW RETENTION)
@@ -8257,15 +8270,14 @@ class VenueProbeIdentityTests(IdentityProbeMixin, unittest.TestCase):
         self.assertEqual(p["schema"], "mlv-app/venue-quiet-probe/v2", "the top-level schema stays v2: identity only adds a field")
         r = self.row(p, 16892)
         self.assertEqual((r["owner"], r["owner_status"]), ("BACHELOR\\layib", "ok"))
-        self.assertEqual((r["project"], r["project_from"], r["script"]), ("mlv-app", "self", "bench.py"))
+        # r5 allowlist: the script path is named only when it EXISTS on the probed host, and C:\mlvtmp\lane-X-1\tools\bench.py does not exist here; no argument text is kept
+        self.assertEqual((r["project"], r["project_from"], r["script"]), ("mlv-app", "self", None))
         self.assertEqual(r["start_check"], "match")
         self.assertTrue(r["started_utc"].startswith("2026-10-24T01:02:03"), r["started_utc"])
-        # r4 fail-closed: `key` and `token` taint the line, so all three arguments after the script are <redacted> (r1-r3 redacted the two values only)
-        self.assertEqual((r["cmdline_status"], r["cmdline_redactions"], r["cmdline_truncated_chars"], r["args_redacted"], r["cmdline_args"]), ("ok", 3, 0, "fail-closed", 4))
-        for secret in ("abc123", "xyz"):
-            self.assertNotIn(secret, r["cmdline"])
-        self.assertEqual(r["cmdline"].count("<redacted>"), 3)
-        self.assertIn("bench.py", r["cmdline"])
+        self.assertEqual((r["cmdline_status"], r["cmdline_redactions"], r["cmdline_truncated_chars"], r["args_redacted"], r["cmdline_args"]), ("ok", 4, 0, "all", 4))
+        self.assertEqual(r["cmdline"], r"C:\Python\python.exe args=4 script=<none>")
+        for secret in ("abc123", "xyz", "bench.py"):
+            self.assertNotIn(secret, self.last_line)
         self.assertEqual((r["parent"]["pid"], r["parent"]["name"], r["parent"]["status"]), (500, "pwsh", "ok"))
         self.assertEqual((r["grandparent"]["pid"], r["grandparent"]["name"], r["grandparent"]["status"]), (400, "explorer", "ok"))
         self.assertEqual(r["source"], ["top", "top_processes", "gpu_top"], "this pid is in all three target sets")
@@ -8387,21 +8399,20 @@ class VenueProbeIdentityTests(IdentityProbeMixin, unittest.TestCase):
         for i, (_label, cmd, _gone, _want) in enumerate(vectors):
             procs.append((1001 + i, "tool", 20.0 - i, t)); cim.append(_ident_cim(1001 + i, 0, "tool.exe", t, cmd))
         procs.append((1101, "tool", 9.0, t)); cim.append(_ident_cim(1101, 0, "tool.exe", t, rf"python C:\x\tool.py {card}"))
-        procs.append((1102, "tool", 8.0, t)); cim.append(_ident_cim(1102, 0, "tool.exe", t, cap_cmd))
+        long_exe = "C:\\" + "\\".join(["d" * 20] * 10) + "\\python.exe"   # r5: only the exe path can be long enough to reach the cap
+        procs.append((1102, "tool", 8.0, t)); cim.append(_ident_cim(1102, 0, "python.exe", t, cap_cmd, long_exe))
         p = self.run_identity_probe(procs, cim, {})
-        for i, (label, cmd, gone, _want) in enumerate(vectors):   # r4: the r1 `want` (the text around a redacted value) is retired; a tainted line keeps no argument text
+        for i, (label, cmd, gone, _want) in enumerate(vectors):   # r5: no line keeps argument text, so the r1 `want` (the text around a redacted value) is retired
             r = self.row(p, 1001 + i)
             for secret in gone:
                 self.assertNotIn(secret, r["cmdline"], label)
-            self.assertEqual(r["args_redacted"], "fail-closed", label)
-            self.assertIn("<redacted>", r["cmdline"], label)
-            self.assertGreaterEqual(r["cmdline_redactions"], 1, label)
-        survivor = self.row(p, 1101)
-        self.assertIn(card, survivor["cmdline"], "a hyphenated card or worktree name must survive")
-        self.assertEqual((survivor["cmdline_redactions"], survivor["args_redacted"]), (0, "none"))
+            self.assertEqual(r["args_redacted"], "all", label)
+            self.assertRegex(r["cmdline"], r"^tool\.exe args=\d+ script=<none>$", label)
+        no_text = self.row(p, 1101)
+        self.assertEqual(no_text["cmdline"], "tool.exe args=2 script=<none>", "r5: even a clean card name is argument text and is not persisted")
         capped = self.row(p, 1102)
-        rest = cap_cmd[len(base):].strip()
-        full = f"python.exe args={len(rest.split())} : {rest}"
+        full = f"{long_exe} args={len(cap_cmd[len(base):].split())} script=<none>"
+        self.assertGreater(len(full), 200)
         self.assertEqual(capped["cmdline"], full[:200] + f"...[+{len(full) - 200}]")
         self.assertEqual(capped["cmdline_truncated_chars"], len(full) - 200)
 
@@ -8478,7 +8489,7 @@ class VenueProbeIdentityTests(IdentityProbeMixin, unittest.TestCase):
         r = self.row(p, 16892)
         self.assertEqual((r["owner"], r["owner_status"]), (None, "budget-exceeded"))
         self.assertEqual(self.owner_calls(), [], "no GetOwner call once the budget is spent")
-        self.assertEqual((r["project"], r["script"], r["cmdline_status"]), ("mlv-app", "bench.py", "ok"), "what needs no call is still filled")
+        self.assertEqual((r["project"], r["cmdline"], r["cmdline_status"]), ("mlv-app", "python.exe args=0 script=<none>", "ok"), "what needs no call is still filled")
 
     def test_the_budget_is_a_pinned_literal_well_inside_the_120_second_submission_timeout(self) -> None:
         m = re.search(r"\$IdentityBudgetMs = (\d+)", _ident_probe_body())
@@ -8843,7 +8854,7 @@ class VenueProbeIdentityRedactionR2Tests(IdentityProbeMixin, unittest.TestCase):
         for secret in (SYNTH_SECRET, SYNTH_BASIC):
             self.assertNotIn(secret, self.last_line, "the probe line the gate retains verbatim")
         self.assertGreaterEqual(self.row(p, 16892)["cmdline_redactions"], 3)
-        self.assertIn("bench.py", self.row(p, 16892)["cmdline"])
+        self.assertRegex(self.row(p, 16892)["cmdline"], r"^C:\\Python\\python\.exe args=\d+ script=<none>$")
         # and through the gate: the raw file Wait-VenueQuiet.ps1 writes next to the job file
         proc = self.gate(dict(p, host="BACHELOR"))
         raws = [f for f in self.work.glob("venue-quiet-probe-*.json")]
@@ -8891,14 +8902,14 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
         self.assertTrue(p["identity"]["gpu_status"].startswith("timeout: "), p["identity"])
         r = self.row(p, 16892)
         self.assertEqual((r["gpu_percent"], r["gpu_status"]), (None, p["identity"]["gpu_status"]))
-        self.assertEqual((r["owner"], r["project"], r["script"]), ("BACHELOR\\layib", "mlv-app", "bench.py"), "the CIM half still works")
+        self.assertEqual((r["owner"], r["project"], r["cmdline_status"]), ("BACHELOR\\layib", "mlv-app", "ok"), "the CIM half still works")
         self.assert_measurement_unchanged(p, elapsed)
 
     def test_a_slow_getowner_times_out_into_owner_status_timeout_and_the_row_keeps_everything_else(self) -> None:
         p, elapsed = self.slow("owner")
         r = self.row(p, 16892)
         self.assertEqual((r["owner"], r["owner_status"]), (None, "timeout"))
-        self.assertEqual((r["project"], r["script"], r["cmdline_status"], r["gpu_percent"]), ("mlv-app", "bench.py", "ok", 40.0))
+        self.assertEqual((r["project"], r["cmdline_status"], r["gpu_percent"]), ("mlv-app", "ok", 40.0))
         self.assert_measurement_unchanged(p, elapsed)
 
     def test_a_slow_win32_process_query_degrades_identity_to_a_typed_error_and_nothing_else_moves(self) -> None:
@@ -8918,8 +8929,8 @@ class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase)
 
 # ---------------------------------------------------------------------------------------------------
 # VENUE-PROBE-PROCESS-ATTRIBUTION-1 r4: FAIL-CLOSED command-line redaction. Per-shape rules (r1-r3) kept leaking new shapes (dot 93a864e0's escaped-quote JSON value, Grok G3 a quoted
-# key then whitespace, G4 compound names, G5 a quote that opens mid-value), so a line whose RAW text holds any credential token keeps no argument text at all. Every vector goes
-# through the REAL probe body and the REAL gate, and is checked in the probe line, the raw probe JSON the gate persists, and the gate's top / attr / ident text. Synthetic values only.
+# key then whitespace, G4 compound names, G5 a quote that opens mid-value). r5 retired the r4 denylist too (no line keeps argument text at all); these vectors live on in the r5
+# table below, which checks every persisted copy. Synthetic values only.
 R4_MARKER = "Value42"   # every vector's secret holds it (demoValue42, or a split form such as demo"Value42 / demo&Value42 / demo Value42)
 R4_VECTORS = [
     # r4: the shapes that leaked on 7bca751c
@@ -9000,83 +9011,134 @@ def _r4_strings(v) -> list:
     return [v] if isinstance(v, str) else []
 
 
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r5: NO ARGUMENT TEXT IS PERSISTED (allowlist). The r4 token denylist still leaked: dot 9b25f619 B1 promoted `"Bearer demoValue42.py"` to the
+# script slot, B2 classed `--signature demoValue42` and `?sig=demoValue42` clean and kept their text, Grok G6 `-u user:demoValue42`. cmdline is now `<exe> args=<n> script=<path|<none>>`
+# on EVERY line; script comes only from the first argument and only when it is an existing, drive-rooted, allowlisted path. Every vector goes through the REAL probe body, the REAL
+# gate (probe line, raw probe JSON, gate text, every file the gate wrote) and the REAL Summarize-VenueBusyProbes.ps1 (text and -Json), and no persisted byte may hold the secret.
+R5_SECRET = "demoValue42"
+R5_VECTORS = [
+    ("dot-9b25f619 B1 bearer value promoted to the script slot", 'tool --header "Bearer demoValue42.py"'),
+    ("dot-9b25f619 B2 --signature", "tool --signature demoValue42"),
+    ("dot-9b25f619 B2 url ?sig=", "curl https://h.example/x?sig=demoValue42"),
+    ("grok G6 curl -u", "curl -u user:demoValue42"),
+    ("grok G6 --user", "curl --user user:demoValue42 https://h.example/x"),
+] + R4_VECTORS   # R4_VECTORS carries every r1-r4 vector
+
+
 @requires_windows_pwsh
-class VenueProbeIdentityRedactionFailClosedR4Tests(IdentityProbeMixin, unittest.TestCase):
+class VenueProbeIdentityNoArgumentTextR5Tests(IdentityProbeMixin, unittest.TestCase):
     setUp = VenueQuietAttributionTests.setUp
-    gate = VenueQuietAttributionTests.gate
-    CHUNK = 8   # identity covers the top 10 processes, so a probe carries at most 8 vectors
+    CHUNK = 5   # Summarize reads the top-5 CPU rows, so every vector of a chunk reaches its output too
 
-    def persist(self, cmds: list) -> tuple:
-        """cmds -> (rows as persisted in the gate's raw probe JSON, the probe line, the raw JSON text, the gate stdout)."""
+    def gate(self, probe: dict) -> subprocess.CompletedProcess:
+        import os
+        return _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                                  "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1"], timeout=180, env=dict(os.environ, UMSTUB_LINE=json.dumps(probe)))
+
+    def summarize(self, *args: str) -> str:
+        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"), *args], timeout=180)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout + proc.stderr
+
+    def persist(self, cmds: list, exe: str | None = None, name: str = "tool.exe") -> tuple:
+        """cmds -> (rows as persisted in the gate's raw probe JSON, [(where, every persisted text)]). Each gate run gets a fresh work dir."""
         t = IDENT_T0
+        self.work = self.tmp / f"work-{len(list(self.tmp.glob('work-*')))}"
         procs = [(2001 + i, "tool", 30.0 - i, t) for i in range(len(cmds))]
-        cim = [_ident_cim(2001 + i, 0, "tool.exe", t, c) for i, c in enumerate(cmds)]
+        cim = [_ident_cim(2001 + i, 0, name, t, c, exe) for i, c in enumerate(cmds)]
         p = self.run_identity_probe(procs, cim, {})
-        before = set(self.work.glob("venue-quiet-probe-*.json")) if self.work.exists() else set()
-        proc = self.gate(dict(p, host="BACHELOR"))
-        raws = sorted(set(self.work.glob("venue-quiet-probe-*.json")) - before)
+        # the canned counters give no decision samples (UNKNOWN prints no identity text at all), so the gate is handed a MEASURED busy reading: then its top / attr / ident
+        # lines and the summary really carry every row, and the raw JSON it retains is this probe's identity verbatim
+        proc = self.gate(dict(p, host="BACHELOR", samples=[50.0, 50.0, 50.0]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^  top tool pid=2001 cpuSeconds=\S+ owner=", "the gate printed the identity suffix")
+        raws = sorted(self.work.glob("venue-quiet-probe-*.json"))
         self.assertEqual(len(raws), 1, (raws, proc.stdout + proc.stderr))
-        raw = raws[0].read_text(encoding="utf-8")
-        by_pid = {r["pid"]: r for r in json.loads(raw)["identity"]["processes"]}
-        return [by_pid.get(2001 + i) for i in range(len(cmds))], self.last_line, raw, proc.stdout
+        by_pid = {r["pid"]: r for r in json.loads(raws[0].read_text(encoding="utf-8"))["identity"]["processes"]}
+        texts = [("probe line", self.last_line), ("gate text", proc.stdout + proc.stderr)]
+        # every DATA file the gate wrote (the .ps1 job file is the probe's own source code, not a persisted copy of identity)
+        texts += [(f"work file {f.name}", f.read_bytes().decode("utf-8", "replace")) for f in sorted(self.work.rglob("*")) if f.is_file() and f.suffix.lower() != ".ps1"]
+        summary_json = self.summarize("-ProbeDir", str(self.work), "-IncludeQuiet", "-Json")
+        self.assertEqual(json.loads(summary_json)["busy_probes"], 1, "the probe reached the summary, so its rows were read")
+        texts += [("summary text", self.summarize("-ProbeDir", str(self.work), "-IncludeQuiet")), ("summary json", summary_json)]
+        return [by_pid.get(2001 + i) for i in range(len(cmds))], texts
 
-    def test_fail_closed_redaction_table_no_vector_persists_its_secret(self) -> None:
-        for at in range(0, len(R4_VECTORS), self.CHUNK):
-            chunk = R4_VECTORS[at:at + self.CHUNK]
-            rows, line, raw, out = self.persist([c for _l, c in chunk])
+    def real_file(self, *parts: str) -> Path:
+        path = self.tmp.joinpath(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# fixture\n", encoding="utf-8")
+        return path
+
+    def test_no_persisted_byte_holds_any_vectors_secret(self) -> None:
+        self.assertEqual(len({c for _l, c in R5_VECTORS}), len(R5_VECTORS))
+        for at in range(0, len(R5_VECTORS), self.CHUNK):
+            chunk = R5_VECTORS[at:at + self.CHUNK]
+            rows, texts = self.persist([c for _l, c in chunk])
             for (label, cmd), r in zip(chunk, rows):
                 with self.subTest(vector=label):
                     self.assertIsNotNone(r, label)
-                    leaked = [s for s in _r4_strings(r) if any(g in s for g in (R4_MARKER,) + R4_EXTRA_GONE.get(label, ()))]
+                    leaked = [s for s in _r4_strings(r) if any(g in s for g in (R5_SECRET, R4_MARKER) + R4_EXTRA_GONE.get(label, ()))]
                     self.assertEqual(leaked, [], f"{label}: {cmd!r} persisted {leaked!r}")
-                    self.assertEqual((r.get("args_redacted"), r["cmdline_status"]), ("fail-closed", "ok"), r)
-                    self.assertRegex(r["cmdline"], r"^\S+( \S+)? args=\d+ : <redacted>( <redacted>)*$", r)
-            with self.subTest(chunk=at):
-                for where, text in (("probe line", line), ("raw probe JSON", raw), ("gate text", out)):
-                    self.assertNotIn(R4_MARKER, text, where)
+                    self.assertEqual((r["cmdline"], r["script"], r["args_redacted"], r["cmdline_status"]), (f"tool.exe args={r['cmdline_args']} script=<none>", None, "all", "ok"), r)
+                    self.assertIsInstance(r["cmdline_token_hits"], int)
+            for where, text in texts:
+                with self.subTest(chunk=at, where=where):
+                    self.assertNotIn(R5_SECRET, text)
+                    self.assertNotIn(R4_MARKER, text)
 
-    def test_a_clean_command_line_keeps_its_arguments(self) -> None:
-        clean = [r"python C:\x\tool.py --card lane-CPU-17V9-FPS-GAP-AB-1-r5x --frames 120", "mysql -u root -P3306 mydb",
-                 r'ffmpeg -i "C:\clips\a b.mov" -vf scale=1920:1080 out.mov']
-        rows, _line, _raw, _out = self.persist(clean)
-        want = [r"python C:\x\tool.py args=5 : C:\x\tool.py --card lane-CPU-17V9-FPS-GAP-AB-1-r5x --frames 120", "mysql args=4 : -u root -P3306 mydb",
-                r'ffmpeg args=5 : -i "C:\clips\a b.mov" -vf scale=1920:1080 out.mov']
-        for cmd, r, w in zip(clean, rows, want):
-            with self.subTest(cmd=cmd):
-                self.assertEqual((r["cmdline"], r.get("args_redacted"), r["cmdline_redactions"]), (w, "none", 0), r)
-        self.assertEqual(rows[0]["script"], "tool.py")
+    def test_a_clean_line_keeps_its_script_and_count_but_none_of_its_argument_text(self) -> None:
+        probe = self.real_file("x", "probe.ps1")
+        self.assertRegex(str(probe), r"^[A-Za-z]:\\[^\s=@?#:]+$", "the fixture path itself must satisfy the allowlist")
+        pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe"
+        rows, texts = self.persist([f"pwsh -File {probe} -Verbose"], exe=pwsh, name="pwsh.exe")
+        r = rows[0]
+        self.assertEqual((r["cmdline"], r["script"], r["cmdline_args"], r["cmdline_redactions"], r["args_redacted"]), (f"{pwsh} args=3 script={probe}", str(probe), 3, 2, "all"))
+        for where, text in texts:
+            with self.subTest(where=where):
+                self.assertNotIn("-Verbose", text)
+                self.assertNotIn("-File", text)
 
-    def test_a_tainted_line_still_names_its_exe_script_and_project(self) -> None:
-        t = IDENT_T0
-        cmd = r"pwsh -NoProfile -File C:\mlvtmp\lane-X-1\run.ps1 -Token demoValue42"
-        cim = [_ident_cim(16892, 0, "pwsh.exe", t, cmd, r"C:\Program Files\PowerShell\7\pwsh.exe")]
-        r = self.row(self.run_identity_probe([(16892, "pwsh", 29.1, t)], cim, CHAIN_OWNERS), 16892)
-        self.assertEqual(r["cmdline"], r"C:\Program Files\PowerShell\7\pwsh.exe C:\mlvtmp\lane-X-1\run.ps1 args=5 : <redacted> <redacted> <redacted> <redacted>")
-        self.assertEqual((r["script"], r["project"], r["project_from"], r.get("args_redacted"), r.get("cmdline_args")), ("run.ps1", "mlv-app", "self", "fail-closed", 5))
-        self.assertNotIn(R4_MARKER, self.last_line)
+    def test_a_script_path_with_whitespace_is_none_even_when_the_file_exists(self) -> None:
+        spaced = self.real_file("a b", "x.py")
+        rows, _texts = self.persist([r'"tool.exe" "C:\a b\x.py"', f'"tool.exe" "{spaced}"'])
+        for r in rows:
+            self.assertEqual((r["cmdline"], r["script"]), ("tool.exe args=1 script=<none>", None), r)
 
-    def test_a_script_shaped_value_after_a_credential_flag_is_not_named_a_script(self) -> None:
-        t = IDENT_T0
-        cim = [_ident_cim(16892, 0, "tool.exe", t, '"tool.exe" "--password" "demoValue42.py"')]
-        r = self.row(self.run_identity_probe([(16892, "tool", 29.1, t)], cim, CHAIN_OWNERS), 16892)
-        self.assertEqual((r["script"], r["cmdline"]), (None, "tool.exe args=2 : <redacted> <redacted>"))
-        self.assertNotIn(R4_MARKER, self.last_line)
+    def test_only_the_first_argument_can_be_the_script_and_only_an_existing_allowlisted_path(self) -> None:
+        good = self.real_file("lane", "run.py")
+        cmds = [
+            f"python {good} --frames 120",            # 0: named
+            f"python --verbose {good}",               # 1: a later argument is never taken
+            f"pwsh -NoProfile -File {good}",          # 2: only a FIRST-slot -File is skipped
+            f"python {good}.missing.py",              # 3: does not exist
+            f"python {self.real_file('k=v', 'a.py')}",   # 4: '=' in the path
+        ]
+        rows, _texts = self.persist(cmds, name="python.exe")
+        self.assertEqual(rows[0]["script"], str(good))
+        self.assertEqual(rows[0]["cmdline"], f"python.exe args=3 script={good}")
+        for i in (1, 2, 3, 4):
+            with self.subTest(cmd=cmds[i]):
+                self.assertEqual(rows[i]["script"], None)
+                self.assertTrue(rows[i]["cmdline"].endswith(" script=<none>"), rows[i])
+        rows, _texts = self.persist([f"python {self.real_file('m@x', 'a.py')}", f"python {self.real_file('q#x', 'a.py')}", f"python {self.real_file('lane', 'notes.txt')}"], name="python.exe")
+        self.assertEqual([r["script"] for r in rows], [None, None, None], "'@', '#' and a non-script extension never fill the slot")
 
-    def test_the_scan_is_a_substring_scan_of_the_raw_line_before_any_tokenising(self) -> None:
+    def test_the_token_scan_is_a_diagnostic_integer_that_gates_nothing(self) -> None:
         body = _ident_probe_body()
+        fn = re.search(r"function Protect-IdentCmdLine\(.*?\r?\n\}\r?\n", body, re.S).group(0)
+        self.assertNotRegex(fn, r"\bif\s*\([^)]*(Measure-IdentTokenHits|token_hits)", "the scan never decides what is written")
+        self.assertNotIn(".rest", fn, "the raw argument text after argv[0] never reaches the persisted line")
+        self.assertIn("Measure-IdentTokenHits", fn)
         m = re.search(r"\$identSecretTokens = @\(([^)]*)\)", body)
-        self.assertIsNotNone(m)
         self.assertEqual(re.findall(r"'([^']*)'", m.group(1)), R4_TOKENS)
-        self.assertIn("IndexOf($t, [StringComparison]::OrdinalIgnoreCase)", body, "a case-insensitive SUBSTRING scan, not a word match")
-        fn = re.search(r"function Protect-IdentCmdLine\(.*?\r?\n\}\r?\n", body, re.S)
-        self.assertIsNotNone(fn)
-        self.assertLess(fn.group(0).index("Test-IdentTainted $raw"), fn.group(0).index("Split-IdentArgv"), "the scan runs on the raw text before the line is tokenised")
 
-    def test_the_pattern_based_redaction_is_retired(self) -> None:
+    def test_every_r4_path_that_appended_argument_text_is_gone(self) -> None:
         text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
-        for gone in ("Protect-IdentText", "$keyLikePlain", "$keyLikeUrl", "$pFlag"):
+        for gone in ("Test-IdentTainted", "Find-IdentScriptArg", "Test-IdentPathShaped", "Get-IdentScript ", "Get-IdentScript(", "': ' + $sp.rest", "<redacted>", "fail-closed",
+                     "Protect-IdentText", "$keyLikePlain", "$keyLikeUrl", "$pFlag"):
             self.assertNotIn(gone, text)
-        for needle in ("REDACTION IS FAIL-CLOSED", "args_redacted = fail-closed", "Over-redaction"):
+        for needle in ("REDACTION IS AN ALLOWLIST (r5)", "NO ARGUMENT TEXT IS EVER PERSISTED", "cmdline_token_hits", "FIRST argument after the executable"):
             self.assertIn(needle, text)
 
 

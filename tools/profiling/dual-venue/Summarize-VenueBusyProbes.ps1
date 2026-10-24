@@ -18,7 +18,8 @@
 # A probe with no identity (v1, v2), or a top row with no identity row, is grouped under `unknown(no-identity)`; a row whose pid was reused since sampling (start_check
 # mismatch) under `unknown(pid-reused)`; a real identity that matches no project under `unknown`. -ThresholdPercent is the quiet threshold the lifted decision uses (default 20)
 # and also the GPU-heavy bar: a pid counts as GPU-heavy in a probe when its gpu_percent reached it.
-# Every value written on a text line has whitespace and commas replaced by '_'. No command line is ever printed (the files hold a redacted, capped one; this script never reads it).
+# Every value written on a text line has whitespace and commas replaced by '_'. No command line is ever printed (the files hold one with no argument text; this script never reads it),
+# and a script value that is not path-shaped (whitespace, '=', '@', '?', '#', a quote, a ':' past a drive letter) prints as n/a.
 #
 # READ-ONLY and share-safe: it opens only the files it is given (-ProbeDir: only venue-quiet-probe-*.json directly in that directory, which are the VM-side raw-retention files),
 # never lists a venue share, and refuses with exit 2 PROBE_PATH_IN_VENUE_SHARE any path under a venue's agentShare / agentRoot in venues.json.
@@ -48,6 +49,9 @@ function ConvertTo-PathKey([string]$Path) {
 }
 function Test-UnderOrEqual([string]$Key, [string]$Root) { $Root -ne '' -and ($Key -ceq $Root -or $Key.StartsWith($Root + '\', [StringComparison]::Ordinal)) }
 function ConvertTo-IdentToken($v) { $s = [string]$v; if ([string]::IsNullOrEmpty($s)) { return 'n/a' }; $s -replace '[\s,]', '_' }
+# r5: a probe writes `script` only as an allowlisted path, but a raw file from an older probe may hold argument text there, so a script value with whitespace, '=', '@', '?',
+# '#', a quote or a ':' past a drive letter is printed as n/a (text only: nothing is resolved or opened)
+function Format-IdentScript($v) { $s = [string]$v; if ($s -notmatch '^(?:[A-Za-z]:)?[^\s=@?#:"'']+$') { return 'n/a' }; ConvertTo-IdentToken $s }
 function Format-Num([double]$v, [string]$Fmt) { $v.ToString($Fmt, [Globalization.CultureInfo]::InvariantCulture) }
 
 # 0. every spelling of every input -- the entry as given AND its comma parts -- is judged as TEXT first, so a forbidden path is never tested, resolved, opened or listed by a later step
@@ -128,7 +132,7 @@ foreach ($f in $files) {
             if ([string]$row.start_check -ceq 'mismatch') { $project = 'unknown(pid-reused)' }
             else {
                 $project = $(if ([string]$row.project) { [string]$row.project } else { 'unknown' })
-                $script = ConvertTo-IdentToken $row.script
+                $script = Format-IdentScript $row.script
                 $owner = $(if ($row.owner) { ConvertTo-IdentToken $row.owner } else { 'unreadable(' + (ConvertTo-IdentToken $row.owner_status) + ')' })
             }
         }
