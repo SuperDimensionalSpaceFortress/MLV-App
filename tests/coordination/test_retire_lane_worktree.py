@@ -2427,3 +2427,175 @@ def test_rename_probe_refuses_a_delete_sharing_file_holder_in_a_subdirectory_of_
     assert d["action"] == "kept" and d["reason"].startswith("in-use"), d
     assert held.exists() and (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
     assert not _retiring_of(wt).exists() and _norm(wt) in _worktree_paths(main) and _pending_records(main) == []
+
+
+# --- LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: a live DETACHED driver that names only its RUN DIR ---
+# 2026-10-24 06:02Z the mlvtmp retention pass removed C:\mlvtmp\lane-CPU-17V9-FPS-GAP-AB-1-20261024 while the detached r5 venue
+# driver (pid 43484, `pwsh -File <run dir>\venue-cpu17v9-ab.ps1`, pid in <run dir>\venue-cpu17v9-ab.pid) still ran Wait-VenueQuiet.ps1
+# from it: its command line named the run dir, never the worktree, and the lane that launched it had exited (receipt state=complete).
+# Get-WorktreeLiveRefusal is the one guard every remover calls; the process table is always FAKED here (pids 99998x are not real).
+
+def _live_refusal(wt, snapshot_expr=None, runs_root=None, prelude=""):
+    args = f"-WorktreePath '{wt}'"
+    if snapshot_expr:
+        args += f" -Snapshot ({snapshot_expr})"
+    if runs_root:
+        args += f" -RunsRoot '{runs_root}'"
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; {prelude} "
+        f"$r = Get-WorktreeLiveRefusal {args}; "
+        "if ($null -eq $r) { 'FREE' } else { $r | ConvertTo-Json -Depth 4 -Compress }"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    out = p.stdout.strip()
+    return (None if out == "FREE" else json.loads(out)), p.stderr
+
+
+def _fake_proc(pid, cmdline, name="pwsh.exe"):
+    cl = str(cmdline).replace("'", "''")
+    return f"[pscustomobject]@{{ ProcessId = {pid}; Name = '{name}'; CommandLine = '{cl}' }}"
+
+
+def _fake_snapshot(*procs):
+    return f"[pscustomobject]@{{ Procs = @({', '.join(procs)}); SelfPids = @($PID) }}"
+
+
+def _driver_run_dir(runs, name, pid, *, workdir=None, pid_file="venue-driver.pid", child_json=False):
+    """A run dir as a detached venue driver leaves it: its driver script (which does NOT name the worktree), its pid file, and the
+    launching lane's TERMINAL receipt naming the worktree as its workDir."""
+    rd = runs / name
+    rd.mkdir(parents=True)
+    (rd / "venue-driver.ps1").write_text("Start-Sleep -Seconds 1\n", encoding="utf-8")
+    if child_json:
+        (rd / pid_file).write_text(json.dumps({"schema": "mlv-lane-child/v1", "pid": pid}), encoding="utf-8")
+    else:
+        (rd / pid_file).write_text(f"{pid}\n", encoding="utf-8")
+    if workdir is not None:
+        (rd / "opus-001.receipt.json").write_text(json.dumps({"state": "complete", "exitCode": 0, "workDir": str(workdir)}), encoding="utf-8")
+    return rd
+
+
+def _driver_cmdline(rd):
+    return f'"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoProfile -NonInteractive -File "{rd}\\venue-driver.ps1"'
+
+
+def test_live_refusal_a_process_naming_the_worktree_is_refused_with_a_typed_line(tmp_path):
+    """(a) a live process whose command line names the worktree."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc(999981, f"git -C {wt} status", "git.exe")))
+    assert r is not None and r["reason"] == "live-process" and r["processId"] == 999981, r
+    assert r["matchedPath"].lower() == str(wt).lower(), r
+    assert re.search(r"REFUSED worktree-removal reason=live-process path=.* pid=999981 .*matched=", err), err
+
+
+def test_live_refusal_a_driver_named_only_by_its_run_dir_pid_file_is_refused(tmp_path):
+    """(b) the 2026-10-24 shape: only the run dir's pid file + terminal receipt tie the live driver to the worktree."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r5-20261024T0110Z", 999982, workdir=wt)
+    r, err = _live_refusal(wt, _fake_snapshot(_fake_proc(999982, _driver_cmdline(rd))), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999982, r
+    assert r["via"] == "rundir-pid:venue-driver.pid", r
+    assert r["matchedPath"].lower() == str(rd).lower(), r
+    assert "reason=live-driver" in err and "pid=999982" in err and f"matched={rd}".lower() in err.lower(), err
+
+
+def test_live_refusal_a_receipt_child_pid_record_counts_like_a_pid_file(tmp_path):
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r2", 999983, workdir=wt, pid_file="opus-001.child.json", child_json=True)
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc(999983, _driver_cmdline(rd))), runs)
+    assert r is not None and r["reason"] == "live-driver" and r["via"] == "rundir-pid:opus-001.child.json", r
+
+
+def test_gate_keeps_a_worktree_whose_live_driver_names_only_its_run_dir(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-DRV-1")
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-DRV-1-r5", 999984, workdir=wt)
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; $snap = {_fake_snapshot(_fake_proc(999984, _driver_cmdline(rd)))}; "
+        f"Invoke-RetireLaneWorktree -WorkDir '{wt}' -MergeTarget 'origin/master' -WhatIf -ProcessSnapshot $snap -RunsRoot '{runs}' "
+        "| ConvertTo-Json -Depth 4"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    d = json.loads(p.stdout)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: 999984 pwsh.exe [rundir-pid:venue-driver.pid"), d
+    assert wt.exists()
+
+
+def test_a_dead_driver_pid_and_no_live_reference_still_retire_the_worktree(repo):
+    """(c) no regression: a stale pid file (its pid is not running) never holds a worktree."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-DEAD-1")
+    runs = tmp / "fleet-runs"
+    _driver_run_dir(runs, "lane-DEAD-1-r5", 999985, workdir=wt)
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc(999986, "x.exe C:\\somewhere\\else", "x.exe")), runs)
+    assert r is None, r
+    d = _retire(wt, MergeTarget="origin/master", QuarantineRoot=str(tmp / "q"), RunsRoot=str(runs))
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert not wt.exists()
+
+
+def test_prefix_sibling_lane_x_10_never_holds_lane_x_1(repo):
+    """(d) C:\\mlvtmp\\lane-X-1 must not match C:\\mlvtmp\\lane-X-10 on a command line or through a run dir's receipt."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-X-1")
+    sibling = tmp / "lane-X-10"
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-10-r1", 999987, workdir=sibling)
+    snap = _fake_snapshot(_fake_proc(999988, f"git -C {sibling} status", "git.exe"),
+                          _fake_proc(999989, f"git -C {str(sibling).replace(chr(92), '/').upper()} log", "git.exe"),
+                          _fake_proc(999987, _driver_cmdline(rd)))
+    r, _ = _live_refusal(wt, snap, runs)
+    assert r is None, r
+    d = _gate_with_snapshot(wt, snap)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+
+
+def test_live_refusal_matches_case_and_separator_variants_of_the_worktree(tmp_path):
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    variant = str(wt).replace("\\", "/").upper() + "/tools/x.ps1"
+    r, _ = _live_refusal(wt, _fake_snapshot(_fake_proc(999990, f"pwsh -File {variant}")))
+    assert r is not None and r["reason"] == "live-process", r
+
+
+def test_live_refusal_fails_closed_when_the_process_census_fails(tmp_path):
+    """(e) an unreadable process table is never 'free'."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    r, err = _live_refusal(wt, prelude="function Get-LaneProcessSnapshot { throw 'WMI provider down' };")
+    assert r is not None and r["reason"] == "census-failed" and "WMI provider down" in r["detail"], r
+    assert "reason=census-failed" in err, err
+
+
+def test_live_refusal_fails_closed_when_the_run_dir_census_fails(tmp_path):
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    runs.write_text("not a directory", encoding="utf-8")
+    r, _ = _live_refusal(wt, _fake_snapshot(), runs)
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+
+
+def test_gate_fails_closed_with_a_typed_reason_when_the_process_census_fails(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-CENSUS-1")
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; function Get-LaneProcessSnapshot {{ throw 'WMI provider down' }}; "
+        f"Invoke-RetireLaneWorktree -WorkDir '{wt}' -MergeTarget 'origin/master' -QuarantineRoot '{tmp / 'q'}' | ConvertTo-Json -Depth 4"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    d = json.loads(p.stdout)
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: process census failed"), d
+    assert wt.exists()

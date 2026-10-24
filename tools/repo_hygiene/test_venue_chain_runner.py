@@ -859,21 +859,40 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, "the mutant must reproduce the defect: three identical unhealthy legs and no stop")
         self.assertEqual(self.started(), 3)
 
-    def test_probe_script_vanishing_under_a_live_chain_is_named_not_undocumented_exit_64(self) -> None:
-        quiet = self.case / "vanishing-quiet.ps1"
-        shutil.copy2(self.fake_quiet, quiet)
-        rd = self.case / "lane-GONE"
-        # leg 1 runs, and deletes the probe script as it exits (the worktree was removed under the chain); leg 2's probe cannot launch
-        r = self.run_chain(rd, self.specs, quiet=quiet, env=self.env(FAKE_LEG_DELETE_PATH=str(quiet)))
-        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
-        res = chain_result(r.stdout)
-        self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "NOT_RUN", "NOT_RUN"])
-        self.assertEqual((res["legs"][1]["verdict"], res["legs"][1]["reason"]), ("VENUE_QUIET_UNKNOWN", "PROBE_SCRIPT_MISSING"))
-        self.assertEqual(res["stopReason"], "VENUE_QUIET_UNKNOWN")
-        log = self.chain_log(rd)
-        self.assertTrue(any(re.search(r"LEG 02-fx-b-spec NOT_RUN VENUE_QUIET_UNKNOWN reason=PROBE_SCRIPT_MISSING phase=pre-claim", l) for l in log), log)
-        self.assertFalse([l for l in log if "undocumented-exit" in l], log)
-        self.assertEqual(self.started(), 1, "no leg and no retry after the probe script vanished")
+    def test_probe_script_vanishing_under_a_live_chain_is_typed_and_stops_in_both_unknown_modes(self) -> None:
+        # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: 2026-10-24 06:05-06:40Z a detached driver whose worktree was removed under it logged
+        # VENUE_QUIET_UNKNOWN every 5 min for 40 min. A missing driver script is not "the venue was not measured": it is typed
+        # VENUE_DRIVER_SCRIPT_MISSING with the path, and the chain STOPS whatever -OnUnknown says.
+        for mode in ("Stop", "Continue"):
+            with self.subTest(onUnknown=mode):
+                quiet = self.case / f"vanishing-quiet-{mode}.ps1"
+                shutil.copy2(self.fake_quiet, quiet)
+                rd = self.case / f"lane-GONE-{mode}"
+                before = self.started()
+                # leg 1 runs, and deletes the probe script as it exits (the worktree was removed under the chain); leg 2's probe cannot launch
+                r = self.run_chain(rd, self.specs, "-OnUnknown", mode, quiet=quiet, env=self.env(FAKE_LEG_DELETE_PATH=str(quiet)))
+                self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+                res = chain_result(r.stdout)
+                self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "NOT_RUN", "NOT_RUN"])
+                self.assertEqual((res["legs"][1]["verdict"], res["legs"][1]["reason"]), ("VENUE_DRIVER_SCRIPT_MISSING", f"path={quiet}"))
+                self.assertEqual(res["stopReason"], "VENUE_DRIVER_SCRIPT_MISSING")
+                log = self.chain_log(rd)
+                self.assertTrue(any(f"VENUE_DRIVER_SCRIPT_MISSING path={quiet}" in l for l in log), log)
+                self.assertTrue(any(re.search(r"LEG 02-fx-b-spec NOT_RUN VENUE_DRIVER_SCRIPT_MISSING ", l) for l in log), log)
+                self.assertFalse([l for l in log if "VENUE_QUIET_UNKNOWN" in l or "undocumented-exit" in l], log)
+                self.assertEqual(self.started() - before, 1, "no leg and no retry after the probe script vanished")
+
+    def test_module_names_a_missing_driver_script_and_passes_present_ones(self) -> None:
+        present = self.case / "present.ps1"
+        present.write_text("# x\n", encoding="utf-8")
+        gone = self.case / "gone" / "Wait-VenueQuiet.ps1"
+        cmd = (f"Import-Module '{MODULE}' -Force -DisableNameChecking; "
+               f"$a = Get-VenueDriverScriptMissing -Path @('{present}'); $b = Get-VenueDriverScriptMissing -Path @('{present}', '{gone}'); "
+               "\"A=[$a]\"; \"B=[$b]\"")
+        r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("A=[]", r.stdout)
+        self.assertIn(f"B=[VENUE_DRIVER_SCRIPT_MISSING path={gone}]", r.stdout)
 
     # ---------------------------------------------------------------- the contract stays in the file
     def test_runner_has_no_process_or_lane_scan_and_documents_its_exit_codes(self) -> None:
