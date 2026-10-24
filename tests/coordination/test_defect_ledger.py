@@ -284,6 +284,117 @@ class AdversarialTests(unittest.TestCase):
         self.assertEqual(forged.count(dl.END), 1)
 
 
+R1_HAPPY_BLOCK = "\n".join([
+    "<!-- defect-dispositions:begin -->",
+    "## Defect dispositions",
+    "",
+    "Evidence-only record (advisory, not a gate; schema `defect-ledger.v1`). PR #700, bound to head `%s`. One row "
+    "per demonstrated defect: a regression test that fails on the old code and passes on the new, the adversarial "
+    "combination tests, and a disposition (`fixed`, `distinguished: <reason>` or `deferred: <CARD>`). A field that "
+    "is not recorded reads `MISSING`." % HEAD,
+    "",
+    "| Defect | Source | Claim | Regression test | Regression evidence | Combination tests | Disposition |",
+    "|---|---|---|---|---|---|---|",
+    "| D1 | key opus run review-pr700-opus-r1-20261024T0300Z | splice drops text after a second marker | "
+    "tests/coordination/test_x.py::test_splice_keeps_tail | old: RED on %s / new: GREEN on %s | "
+    "tests/coordination/test_x.py::test_splice_two_markers_plus_crlf | fixed |" % (OLD[:8], NEW[:8]),
+    "",
+    "<!-- defect-dispositions:end -->"])
+
+
+def disposition_cell(block, defect_id):
+    rows = [r for r in rows_of(block) if r.startswith("| %s |" % defect_id)]
+    assert len(rows) == 1, (defect_id, block)
+    return dl.split_row(rows[0])[6]
+
+
+class BindingTests(unittest.TestCase):
+    """Dot B1 on #667: a record is only presented as bound to this PR and head when it says so itself."""
+
+    def _unbound(self, record, *reasons):
+        block = dl.render(PR, HEAD, [record])
+        cell = disposition_cell(block, record.get("defect_id", "D1"))
+        self.assertTrue(cell.startswith("UNBOUND: "), cell)
+        for reason in reasons:
+            self.assertIn(reason, cell)
+        self.assertNotEqual(cell, "fixed")
+        line = dl.check(dl.splice(b"intro\n", block.encode("utf-8")))
+        self.assertTrue(line.startswith("DEFECT_LEDGER WARN unbound=1"), line)
+        self.assertFalse(line.startswith("DEFECT_LEDGER ok"), line)
+        return block, cell
+
+    def test_a_record_for_a_foreign_pr_is_marked_not_relabelled(self):
+        block, cell = self._unbound(rec(pr=612), "pr 612 != 700")
+        self.assertIn("recorded: fixed", cell)  # the record's own claim stays visible
+        self.assertIn("test_splice_keeps_tail", block)  # and so does its evidence: the row is never dropped
+
+    def test_a_record_for_a_stale_head_is_marked(self):
+        stale = "1a2b3c4d" + "0" * 32
+        self._unbound(rec(head_sha=stale), "head 1a2b3c4d != aaaaaaaa")
+
+    def test_head_comparison_is_case_insensitive_and_needs_the_full_hash(self):
+        block = dl.render(PR, HEAD, [rec(head_sha=HEAD.upper())])
+        self.assertEqual(disposition_cell(block, "D1"), "fixed")
+        self._unbound(rec(head_sha=HEAD[:8]), "head_sha")
+        self._unbound(rec(head_sha=12345), "head_sha")
+
+    def test_missing_pr_and_head_are_named(self):
+        self._unbound(rec(pr=None), "pr MISSING")
+        self._unbound(rec(head_sha=None), "head_sha MISSING")
+        _block, cell = self._unbound(rec(pr=None, head_sha=None), "pr MISSING", "head_sha MISSING")
+        self.assertNotIn("schema", cell)
+
+    def test_a_record_with_a_wrong_or_missing_schema_is_marked(self):
+        self._unbound(rec(schema="defect-ledger.v0"), "schema defect-ledger.v0")
+        self._unbound(rec(schema=None), "schema MISSING")
+        self._unbound(rec(schema="defect-ledger.V1"), "schema defect-ledger.V1")  # near-misses are not the schema
+
+    def test_a_non_integer_pr_is_marked(self):
+        self._unbound(rec(pr="six"), "pr ")
+        self._unbound(rec(pr=True), "pr ")
+
+    def test_a_mixed_list_marks_each_bad_row_and_the_header_counts_them(self):
+        records = [rec(defect_id="OK"), rec(defect_id="FOREIGN", pr=612),
+                   rec(defect_id="STALE", head_sha="1a2b3c4d" + "0" * 32), rec(defect_id="NOBIND", pr=None, head_sha=None)]
+        block = dl.render(PR, HEAD, records)
+        self.assertEqual(disposition_cell(block, "OK"), "fixed")
+        for ident in ("FOREIGN", "STALE", "NOBIND"):
+            self.assertTrue(disposition_cell(block, ident).startswith("UNBOUND: "), ident)
+        self.assertEqual(len(rows_of(block)), 4)  # nothing is dropped
+        self.assertRegex(block, r"1 of 4 records are bound")
+        self.assertRegex(block, r"3 UNBOUND")
+        line = dl.check(dl.splice(b"x\n", block.encode("utf-8")))
+        self.assertEqual(line, "DEFECT_LEDGER WARN unbound=3 rows=FOREIGN,STALE,NOBIND")
+
+    def test_unbound_and_incomplete_rows_are_both_reported(self):
+        block = dl.render(PR, HEAD, [rec(defect_id="F", pr=612), rec(defect_id="BAD", old_red_sha="n/a")])
+        line = dl.check(dl.splice(b"x\n", block.encode("utf-8")))
+        self.assertEqual(line, "DEFECT_LEDGER WARN unbound=1 rows=F incomplete rows=BAD")
+
+    def test_an_unreadable_record_counts_as_not_bound(self):
+        block = dl.render(PR, HEAD, [rec(), "junk"])
+        self.assertRegex(block, r"1 of 2 records are bound")
+
+    def test_well_bound_input_renders_byte_identically_to_r1(self):
+        self.assertEqual(dl.render(PR, HEAD, [rec()]), R1_HAPPY_BLOCK)
+        self.assertEqual(dl.check(body_with([rec(), rec(defect_id="D2")])), "DEFECT_LEDGER ok n=2")
+        self.assertNotIn("UNBOUND", dl.render(PR, HEAD, [rec(), rec(defect_id="D2")]))
+
+    def test_cli_marks_exits_zero_and_check_still_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            recs, body, blk, out = (os.path.join(tmp, n) for n in ("recs.json", "body.md", "block.md", "out.md"))
+            write(recs, json.dumps([rec(), rec(defect_id="F", pr=612)]))
+            write(body, "## Summary\n")
+            r = _run("render", "--pr", str(PR), "--head", HEAD, "--records", recs)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("UNBOUND: pr 612 != 700", r.stdout)
+            write(blk, r.stdout)
+            self.assertEqual(_run("splice", "--body-file", body, "--block-file", blk, "--out", out).returncode, 0)
+            c = _run("check", "--body-file", out)
+            self.assertEqual(c.returncode, 0)
+            self.assertEqual(c.stdout.strip(), "DEFECT_LEDGER WARN unbound=1 rows=F")
+
+
 def _run(*argv, **kw):
     return subprocess.run([sys.executable, TOOL] + list(argv), capture_output=True, text=True, **kw)
 
@@ -340,6 +451,10 @@ class CliTests(unittest.TestCase):
             self.assertIn("unreadable", gone.stdout)
 
 
+def ago(days):
+    return dl.fmt_utc(dl.parse_utc(NOW) - days * 86400)
+
+
 def _event(event, days_ago, **kw):
     utc = dl.fmt_utc(dl.parse_utc(NOW) - days_ago * 86400)
     return dict({"event": event, "utc": utc}, **kw)
@@ -366,11 +481,11 @@ class EscapesTests(unittest.TestCase):
         self._write_log()
         self.records = [
             rec(pr=701, defect_id="A", recorded_utc=dl.fmt_utc(dl.parse_utc(NOW) - 2 * 86400),
-                regression_test="t.py::test_a", claim="claim alpha"),
+                fixed_utc=ago(1.5), regression_test="t.py::test_a", claim="claim alpha"),
             rec(pr=702, defect_id="B", recorded_utc=dl.fmt_utc(dl.parse_utc(NOW) - 3 * 86400),
-                regression_test="t.py::test_b", claim="claim beta"),
+                fixed_utc=ago(2.5), regression_test="t.py::test_b", claim="claim beta"),
             rec(pr=703, defect_id="OLD", recorded_utc=dl.fmt_utc(dl.parse_utc(NOW) - 8 * 86400),
-                regression_test="t.py::test_old", claim="claim gamma"),
+                fixed_utc=ago(8), regression_test="t.py::test_old", claim="claim gamma"),
         ]
         self._write_records(self.records)
 
@@ -388,7 +503,7 @@ class EscapesTests(unittest.TestCase):
     def test_exact_counts_for_a_seven_day_window(self):
         lines = self._escapes()
         self.assertEqual(lines[0], "ESCAPES window=7d merged_defects=2 reverts=1 nonflake_merge_group_failures=1 "
-                                   "repeat_failures=0", lines)
+                                   "repeat_failures=0 undetermined=0", lines)
 
     def test_one_line_per_counted_item_with_its_source(self):
         text = "\n".join(self._escapes())
@@ -461,6 +576,83 @@ class EscapesTests(unittest.TestCase):
         self._write_log()
         self.assertIn("repeat_failures=0", self._escapes()[0])
 
+    def test_records_whose_regression_test_is_a_known_flake_are_not_repeats(self):
+        flaky = "tests.test_flaky::test_sometimes"
+        self._write_records([
+            rec(pr=701, defect_id="A", recorded_utc=ago(2), fixed_utc=ago(1.5), regression_test=flaky, claim="alpha"),
+            rec(pr=702, defect_id="B", recorded_utc=ago(3), fixed_utc=ago(2.5), regression_test=flaky, claim="beta")])
+        lines = self._escapes()
+        self.assertIn("repeat_failures=0", lines[0])
+        self.assertIn("merged_defects=2", lines[0])  # a flaky regression test still names a defect that landed
+        self.assertIn("repeat_failures=1", self._escapes(known_flakes=None)[0])  # control: without the flake list
+
+    def test_a_flake_record_does_not_hide_a_repeat_of_a_different_test(self):
+        flaky = "tests.test_flaky::test_sometimes"
+        self._write_records([
+            rec(pr=701, defect_id="A", recorded_utc=ago(2), regression_test=flaky, claim="alpha"),
+            rec(pr=702, defect_id="B", recorded_utc=ago(3), regression_test=flaky, claim="beta"),
+            rec(pr=701, defect_id="C", recorded_utc=ago(2), regression_test="t.py::test_real", claim="gamma"),
+            rec(pr=702, defect_id="D", recorded_utc=ago(3), regression_test="t.py::test_real", claim="delta")])
+        self.assertIn("repeat_failures=1", self._escapes()[0])
+
+    def test_a_defect_fixed_before_its_pr_merged_is_not_an_escape(self):
+        self._write_records([rec(pr=701, defect_id="A", recorded_utc=ago(2), fixed_utc=ago(2.5))])  # merge is at ago(2)
+        lines = self._escapes()
+        self.assertIn("merged_defects=0", lines[0])
+        self.assertIn("undetermined=0", lines[0])
+        self.assertFalse([ln for ln in lines if ln.startswith("ESCAPE merged_defect")], lines)
+
+    def test_a_fix_at_the_exact_merge_instant_is_not_after_it(self):
+        self._write_records([rec(pr=701, defect_id="A", recorded_utc=ago(2), fixed_utc=ago(2))])
+        self.assertIn("merged_defects=0", self._escapes()[0])
+
+    def test_a_defect_fixed_after_the_merge_is_an_escape(self):
+        self._write_records([rec(pr=701, defect_id="A", recorded_utc=ago(2), fixed_utc=ago(1.9))])
+        lines = self._escapes()
+        self.assertIn("merged_defects=1", lines[0])
+        self.assertIn("undetermined=0", lines[0])
+
+    def test_a_record_with_no_fix_time_is_undetermined_never_a_demonstrated_escape(self):
+        self._write_records([rec(pr=701, defect_id="A", recorded_utc=ago(2)),
+                             rec(pr=702, defect_id="B", recorded_utc=ago(3), fixed_utc="not a time")])
+        lines = self._escapes()
+        self.assertIn("merged_defects=0", lines[0])
+        self.assertTrue(lines[0].endswith("undetermined=2"), lines[0])
+        text = "\n".join(lines)
+        self.assertIn("ESCAPE undetermined_defect A pr=701", text)
+        self.assertIn("ESCAPE undetermined_defect B pr=702", text)
+        self.assertNotIn("ESCAPE merged_defect", text)
+
+    def test_a_merge_event_with_no_usable_time_makes_the_record_undetermined(self):
+        self.events.append({"event": "merged", "pr": 704})
+        self._write_log()
+        self._write_records([rec(pr=704, defect_id="Z", recorded_utc=ago(1), fixed_utc=ago(0.5))])
+        lines = self._escapes()
+        self.assertIn("merged_defects=0", lines[0])
+        self.assertTrue(lines[0].endswith("undetermined=1"), lines[0])
+
+    def test_an_unmerged_pr_is_neither_a_defect_nor_undetermined(self):
+        self._write_records([rec(pr=799, defect_id="U", recorded_utc=ago(1))])
+        self.assertTrue(self._escapes()[0].endswith("merged_defects=0 reverts=1 nonflake_merge_group_failures=1 "
+                                                    "repeat_failures=0 undetermined=0"))
+
+    def test_a_merge_after_now_is_ignored_in_a_replay(self):
+        self.events.append(_event("merged", -1, pr=704))  # one day AFTER NOW
+        self._write_log()
+        self._write_records([rec(pr=704, defect_id="F", recorded_utc=ago(1), fixed_utc=dl.fmt_utc(
+            dl.parse_utc(NOW) + 2 * 86400))])
+        replay = self._escapes()
+        self.assertIn("merged_defects=0", replay[0])
+        self.assertIn("undetermined=0", replay[0])  # not merged yet as of NOW: neither counted nor undetermined
+        later = self._escapes(now=dl.fmt_utc(dl.parse_utc(NOW) + 3 * 86400), since_days=7)
+        self.assertIn("merged_defects=1", later[0])
+
+    def test_a_merge_at_or_before_now_still_counts(self):
+        self._write_records([rec(pr=701, defect_id="A", recorded_utc=ago(2), fixed_utc=ago(1))])
+        self.assertIn("merged_defects=1", self._escapes()[0])
+        # a replay that ends exactly at the merge keeps it (the merge is not AFTER now); the fix is later still
+        self.assertIn("merged_defects=1", self._escapes(now=ago(2), since_days=8)[0])
+
     def test_real_merge_group_failure_matching_a_record_test_on_another_pr_is_a_repeat(self):
         self._write_records([rec(pr=701, defect_id="A", recorded_utc=dl.fmt_utc(dl.parse_utc(NOW) - 2 * 86400),
                                  regression_test="tests.test_real::test_broken", claim="alpha")])
@@ -485,7 +677,8 @@ class EscapesTests(unittest.TestCase):
                     "--known-flakes", self.flakes, "--now", NOW)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.splitlines()[0],
-                         "ESCAPES window=7d merged_defects=2 reverts=1 nonflake_merge_group_failures=1 repeat_failures=0")
+                         "ESCAPES window=7d merged_defects=2 reverts=1 nonflake_merge_group_failures=1 repeat_failures=0 "
+                         "undetermined=0")
         junk = _run("escapes", "--merged-log", os.path.join(self.dir, "x"), "--since-days", "seven")
         self.assertEqual(junk.returncode, 0)
         self.assertTrue(junk.stdout.startswith("ESCAPES "), junk.stdout)
