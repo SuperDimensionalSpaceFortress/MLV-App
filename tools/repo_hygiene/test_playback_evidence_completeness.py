@@ -347,6 +347,11 @@ CONSUMER_ACTS_ON_EXIT: dict[str, str] = {
     # LEG_FAILED / INVALID and the chain exits 7, whatever DVE_OUTCOME the dead leg printed (never recorded as a RAN leg).
     "tools/profiling/dual-venue/Invoke-VenueChain.ps1":
         r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{[\s\S]*?'LEG_FAILED'[\s\S]*?\$exitCode\s*=\s*7\b",
+    # BACHELOR-LEASE-BATCH-LEGS-1: the same rule for the lease-batch runner: a leg process that exits non-zero is LEG_FAILED / INVALID (never RAN,
+    # never counted) and the run exits 7. r3 (sol r2 B2): the exit code is the bounded leg child's own ($lp.exit), not $LASTEXITCODE.
+    "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1":
+        r"\$lp\s*=\s*Invoke-VenueBoundedProcess\s+-FilePath\s+\$pwshExe\s+-ArgumentList\s+\$lArgs\b[\s\S]*?\$legCode\s*=\s*\$lp\.exit\b"
+        r"[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{[\s\S]*?'LEG_FAILED'[\s\S]*?\$exitCode\s*=\s*7\b",
     # UM-REGULAR-BASELINE-1 r2: runs the chain once per backend as a child process and reads its exit code ($p.ExitCode) BEFORE any trend row is
     # built. A leg is RAN only when the chain ended on its own with a documented exit that agrees with its CHAIN_RESULT; otherwise the row is
     # EVIDENCE_INCOMPLETE (no figures) and the run exits CHAIN_FAILED. A dead leg (chain exit 7) stays a typed LEG_FAILED row.

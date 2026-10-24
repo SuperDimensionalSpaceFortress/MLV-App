@@ -665,6 +665,157 @@ function Get-VenueRemoteJobState {
     & $out 'NOT_FINISHED' $pending $null
 }
 
+function Get-VenueJobResult {
+    <#
+    .SYNOPSIS
+    One venue job's result.json, read by NAME (<AgentShare>\outbox\<JobId>.result.json; the share is never listed) on one bounded worker (BACHELOR-LEASE-BATCH-LEGS-1: the
+    batch runner reads a leg's admission from it, to prove the leg ran on the batch's lease).
+    .OUTPUTS
+    [pscustomobject]@{ state (FOUND | ABSENT | UNKNOWN); result (the parsed result when FOUND); error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [string]$JobId = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    if ($JobId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = 'no usable job id' } }
+    $path = $AgentShare.TrimEnd('\') + '\outbox\' + $JobId + '.result.json'
+    $r = Invoke-VenueBoundedRead -ScriptText 'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { [IO.File]::ReadAllText($args[0]) } else { "<ABSENT>" }' -Argument $path -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = $r.error } }
+    $text = [string](@($r.value) -join "`n")
+    if ($text -ceq '<ABSENT>') { return [pscustomobject]@{ state = 'ABSENT'; result = $null; error = $null } }
+    try { return [pscustomobject]@{ state = 'FOUND'; result = ($text | ConvertFrom-Json); error = $null } }
+    catch { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = "result.json does not parse: $($_.Exception.Message)" } }
+}
+
+function Request-VenueJobCancel {
+    <#
+    .SYNOPSIS
+    Ask the venue agent to cancel one job (BACHELOR-LEASE-BATCH-LEGS-1 r3): <AgentShare>\cancel\<JobId>.cancel, the agent's cooperative cancel request (ultra-magnus-agent.ps1
+    header). Created with FileMode.CreateNew, so it never replaces a file, on one bounded worker, then checked by name. The agent reads it at the top of every loop of its
+    admission gate (before any lease request), again after admission and before launch, and every slice of a running job. The cancel folder is the agent's: it is never created here.
+    .OUTPUTS
+    [pscustomobject]@{ state (REQUESTED | UNKNOWN); path; error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [string]$JobId = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    if ($JobId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { return [pscustomobject]@{ state = 'UNKNOWN'; path = $null; error = 'no usable job id' } }
+    $path = $AgentShare.TrimEnd('\') + '\cancel\' + $JobId + '.cancel'
+    $write = @'
+$p = $args[0]
+if (-not (Test-Path -LiteralPath (Split-Path -Parent $p) -PathType Container)) { '<NO_CANCEL_DIR>'; return }
+if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+    try { $fs = [IO.File]::Open($p, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); try { $bytes = [Text.Encoding]::ASCII.GetBytes('cancel'); $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() } } catch [IO.IOException] { }
+}
+if (Test-Path -LiteralPath $p -PathType Leaf) { '<PRESENT>' } else { '<ABSENT>' }
+'@
+    $r = Invoke-VenueBoundedRead -ScriptText $write -Argument $path -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNKNOWN'; path = $path; error = $r.error } }
+    $said = [string](@($r.value) -join '')
+    if ($said -ceq '<PRESENT>') { return [pscustomobject]@{ state = 'REQUESTED'; path = $path; error = $null } }
+    [pscustomobject]@{ state = 'UNKNOWN'; path = $path; error = $(if ($said -ceq '<NO_CANCEL_DIR>') { 'the agent share has no cancel folder' } else { 'the cancel file is not there after the write' }) }
+}
+
+function Read-VenueLeaseBatchReceipt {
+    <#
+    .SYNOPSIS
+    The venue agent's own receipt for one batch lease (ultra-magnus-agent.ps1 lease-batch item 5): the line of <AgentShare>\logs\lease-batch-<Token>.jsonl whose leaseId is
+    -LeaseId, read by NAME on one bounded worker.
+    .OUTPUTS
+    [pscustomobject]@{ state (FOUND | ABSENT | UNKNOWN); record; error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{12}$')][string]$Token, [string]$LeaseId = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    $path = $AgentShare.TrimEnd('\') + '\logs\lease-batch-' + $Token + '.jsonl'
+    $r = Invoke-VenueBoundedRead -ScriptText 'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { [IO.File]::ReadAllLines($args[0]) } else { "<ABSENT>" }' -Argument $path -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNKNOWN'; record = $null; error = $r.error } }
+    $lines = @($r.value | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    if ($lines.Count -eq 1 -and $lines[0] -ceq '<ABSENT>') { return [pscustomobject]@{ state = 'ABSENT'; record = $null; error = $null } }
+    foreach ($line in $lines) {
+        $rec = try { $line | ConvertFrom-Json } catch { $null }
+        if ($null -ne $rec -and [string]$rec.leaseId -ceq $LeaseId) { return [pscustomobject]@{ state = 'FOUND'; record = $rec; error = $null } }
+    }
+    [pscustomobject]@{ state = 'ABSENT'; record = $null; error = "no line for lease $LeaseId among $($lines.Count)" }
+}
+
+function Get-VenueLegPreLoadMean {
+    <#
+    .SYNOPSIS
+    The leg's own pre-load mean, read from the run's summary.json (cpuQuiescence.timeMeanPercent), never from the receipt file. Invoke-VenueLeg writes the receipt as
+    <root>\<card>\<legId>\<venue>\<receiptId>.json and the run evidence to <parent of root>\evidence\<receiptId>. $null when absent. (Same rule as Invoke-VenueChain's own.)
+    #>
+    param([string]$ReceiptPath)
+    try {
+        if (-not $ReceiptPath) { return $null }
+        $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
+        $summary = Join-Path (Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))) 'summary.json'
+        if (-not (Test-Path -LiteralPath $summary -PathType Leaf)) { return $null }
+        $q = ([IO.File]::ReadAllText($summary) | ConvertFrom-Json).cpuQuiescence
+        if ($null -eq $q -or $null -eq $q.timeMeanPercent) { return $null }
+        [double]$q.timeMeanPercent
+    } catch { $null }
+}
+
+function Get-VenueLeaseLedgerPath {
+    # BACHELOR-LEASE-BATCH-LEGS-1 r2: <ClaimDir>\<venue>.lease-ledger.jsonl, one line per quiet lease a lease-batch run took (any run on this host), beside the claim.
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '')
+    Join-Path (Split-Path -Parent (Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir)) "$Venue.lease-ledger.jsonl"
+}
+
+function Read-VenueLeaseLedger {
+    # The ledger's leases that end after -SinceUtc, as @{ startUtc; endUtc; leaseId } (UTC DateTime). A line that does not parse is skipped. Written only under the
+    # venue claim, so one writer at a time.
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $SinceUtc = $null)
+    $path = Get-VenueLeaseLedgerPath -Venue $Venue -ClaimDir $ClaimDir
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @() }
+    $since = $(if ($null -ne $SinceUtc) { ConvertTo-VenueUtc $SinceUtc } else { [DateTime]::MinValue })
+    @(foreach ($line in [IO.File]::ReadAllLines($path)) {
+            $r = try { $line | ConvertFrom-Json } catch { $null }
+            if ($null -eq $r) { continue }
+            $s = ConvertTo-VenueUtc $r.startUtc; $e = ConvertTo-VenueUtc $r.endUtc
+            if ($null -ne $s -and $null -ne $e -and $e -gt $s -and $e -gt $since) { [pscustomobject]@{ startUtc = $s; endUtc = $e; leaseId = [string]$r.leaseId } }
+        })
+}
+
+function Add-VenueLeaseLedger {
+    # Appends one lease to the ledger (the caller holds the venue claim).
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', [Parameter(Mandatory)]$Row)
+    $path = Get-VenueLeaseLedgerPath -Venue $Venue -ClaimDir $ClaimDir
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+    [IO.File]::AppendAllText($path, (($Row | ConvertTo-Json -Compress -Depth 4) + "`n"), [Text.UTF8Encoding]::new($false))
+}
+
+function Get-VenueLeaseBudgetWait {
+    <#
+    .SYNOPSIS
+    How long to wait before asking Bachelor's heavy-slot.py for the next quiet lease (BACHELOR-LEASE-BATCH-LEGS-1 r2; its caps, CAPS-ADDENDUM 2026-10-23: a lease is at
+    most -CapSec (45 min), none starts within -CooldownSec (30 min) of the last one's end, and leased time is at most -BudgetSec (90 min) in any -WindowSec (3 h)).
+    The open time is the first moment, on a -StepSec grid, that is past the cooldown and whose WORST window (the one ending when a full-length lease opened then would
+    end) holds at most BudgetSec - CapSec of the -Leases already taken. Pure: -Leases are @{ startUtc; endUtc }, -NowUtc is passed in.
+    .OUTPUTS
+    [pscustomobject]@{ reason (NONE | COOLDOWN | BUDGET); waitSec; openUtc; usedSec (in that window at openUtc); budgetRoomSec (at most CapSec); lastEndUtc }
+    #>
+    param([object[]]$Leases = @(), [Parameter(Mandatory)]$NowUtc, [int]$CapSec = 2700, [int]$CooldownSec = 1800, [int]$WindowSec = 10800, [int]$BudgetSec = 5400,
+        [ValidateRange(1, 600)][int]$StepSec = 30)
+    $now = ConvertTo-VenueUtc $NowUtc
+    $rows = @(foreach ($l in @($Leases)) {
+            if ($null -eq $l) { continue }
+            $s = ConvertTo-VenueUtc $l.startUtc; $e = ConvertTo-VenueUtc $l.endUtc
+            if ($null -ne $s -and $null -ne $e -and $e -gt $s) { [pscustomobject]@{ s = $s; e = $e } }
+        })
+    $used = {
+        param([DateTime]$T)
+        $from = $T.AddSeconds($CapSec - $WindowSec)
+        $sum = 0.0
+        foreach ($r in $rows) {
+            $a = $(if ($r.s -gt $from) { $r.s } else { $from }); $z = $(if ($r.e -lt $T) { $r.e } else { $T })
+            if ($z -gt $a) { $sum += ($z - $a).TotalSeconds }
+        }
+        $sum
+    }
+    $lastEnd = $(if ($rows.Count -gt 0) { ($rows | Sort-Object e | Select-Object -Last 1).e } else { $null })
+    $t = $now; $reason = 'NONE'
+    if ($null -ne $lastEnd -and $lastEnd.AddSeconds($CooldownSec) -gt $t) { $t = $lastEnd.AddSeconds($CooldownSec); $reason = 'COOLDOWN' }
+    $limit = $t.AddSeconds($WindowSec)
+    while ((& $used $t) + $CapSec -gt $BudgetSec -and $t -lt $limit) { $t = $t.AddSeconds($StepSec); $reason = 'BUDGET' }
+    $u = [int][Math]::Round((& $used $t))
+    [pscustomobject]@{ reason = $reason; waitSec = [int][Math]::Ceiling(($t - $now).TotalSeconds); openUtc = $t; usedSec = $u; budgetRoomSec = [int][Math]::Min($CapSec, $BudgetSec - $u); lastEndUtc = $lastEnd }
+}
+
 function Invoke-VenueBoundedProcess {
     <#
     .SYNOPSIS
@@ -689,4 +840,5 @@ function Invoke-VenueBoundedProcess {
 Export-ModuleMember -Function Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
-    Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess
+    Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait
