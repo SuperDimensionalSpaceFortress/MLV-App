@@ -2828,3 +2828,175 @@ def test_live_refusal_write_held_tied_record_is_still_read_and_refuses_as_live_d
     assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999982, r
     assert r["matchedPath"].lower() == str(rd).lower(), r
     assert "reason=live-driver" in err, err
+
+
+# --- LANE-RETIRE-GUARD-UNKNOWN-CWD-AND-ENCODED-1 (Dot reconciliation 663162dd on PR #654, hub ruling 2026-10-24T14:47:02Z) ---
+# B1: Get-WorktreeLiveRefusal answered FREE for a candidate holder whose cwd could not be read (probe unavailable, or unreadable and newer
+# than the worktree) or whose -EncodedCommand did not decode: the holder index listed it as unknown and nothing read that list. Its callers
+# (repo_hygiene apply_worktree_remove) have no rename probe, so unknown now refuses, typed cwd-unknown / cwd-probe-unavailable.
+# B2: a driver started as `pwsh -EncodedCommand <base64>` whose run dir is named only inside the base64 was not tied to its run dir.
+# The holder rows below are synthetic: $PID (this test's own pwsh, listed as NOT self) stands in for a live holder, pids 99996x are not real.
+
+NO_SCM_SERVICES = "function Get-RunningServiceRows { @() };"
+
+
+def _b64_utf16(text):
+    return base64.b64encode(text.encode("utf-16-le")).decode("ascii")
+
+
+def _encoded_driver_cmdline(script_text):
+    return f'"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoProfile -NonInteractive -EncodedCommand {_b64_utf16(script_text)}'
+
+
+def test_b1_live_refusal_holder_with_unreadable_cwd_newer_than_the_worktree_refuses_cwd_unknown(tmp_path):
+    """Dot B1 (a): the worktree is named nowhere but in the holder's cwd, which cannot be read. Was FREE."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    row = _fake_row("$PID", cmd="shell.exe --serve", created=_wt_created(wt, 5))
+    r, err = _live_refusal(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID + NO_SCM_SERVICES)
+    assert r is not None, "a live holder whose cwd cannot be read was answered FREE"
+    assert r["reason"] == "cwd-unknown" and r["via"] == "cwd-unknown" and r["name"] == "shell.exe", r
+    assert "cwd-unreadable" in r["detail"], r
+    assert re.search(r"REFUSED worktree-removal reason=cwd-unknown path=.* pid=\d+ name=shell\.exe via=cwd-unknown", err), err
+
+
+def test_b1_live_refusal_holder_when_the_cwd_probe_is_unavailable_refuses_cwd_probe_unavailable(tmp_path):
+    """Dot B1 (a), the probe-unavailable half: no exemption applies when the probe itself cannot run. Was FREE."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    row = _fake_row("$PID", cmd="shell.exe --serve", created=_wt_created(wt, -60))
+    r, err = _live_refusal(wt, row, prelude=FORCE_PROBE_UNAVAILABLE + NO_SCM_SERVICES)
+    assert r is not None and r["reason"] == "cwd-probe-unavailable" and r["via"] == "cwd-probe-unavailable", r
+    assert "reason=cwd-probe-unavailable" in err, err
+
+
+def test_b1_live_refusal_holder_whose_encoded_command_does_not_decode_refuses(tmp_path):
+    """Grammar: a holder whose encoded command cannot be read refuses removal with a typed reason. Was FREE."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    row = _fake_row("$PID", cmd="pwsh.exe -NoProfile -EncodedCommand !!not-base64!!", name="pwsh.exe", cwd=str(tmp_path))
+    r, err = _live_refusal(wt, row, prelude=NO_SCM_SERVICES)
+    assert r is not None and r["reason"] == "cwd-unknown" and r["via"] == "encoded-command-undecodable", r
+    assert "encoded-command-undecodable" in r["detail"], r
+
+
+def test_b1_live_refusal_unreadable_cwd_holder_older_than_the_worktree_stays_exempt_and_free(tmp_path):
+    """No over-refusal: the r3 creation-time exemption still applies (a process older than the directory cannot have started in it)."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    row = _fake_row("$PID", cmd="shell.exe --serve", created=_wt_created(wt, -60))
+    r, err = _live_refusal(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID + NO_SCM_SERVICES)
+    assert r is None, r
+    assert "REFUSED" not in err, err
+
+
+def _encoded_driver_fixture(tmp_path, *, workdir=None):
+    """A live pwsh driver whose ONLY link to its run dir is inside -EncodedCommand; the run dir's pid file names it and its receipt
+    names the worktree. The driver script does not name the worktree, so no command-line, cwd or script hit can see it."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r5-20261024T0110Z", 999961, workdir=wt if workdir is None else workdir)
+    cl = _encoded_driver_cmdline(f"Set-Location -LiteralPath '{tmp_path}'; & '{rd}\\venue-driver.ps1'")
+    assert str(rd).lower() not in cl.lower() and "fleet-runs" not in cl
+    return wt, runs, rd, _fake_snapshot(_fake_proc(999961, cl))
+
+
+def test_b2_live_refusal_driver_naming_its_run_dir_only_inside_encoded_command_is_live_driver(tmp_path):
+    """Dot B2 (b), readable record: was FREE."""
+    wt, runs, rd, snap = _encoded_driver_fixture(tmp_path)
+    r, err = _live_refusal(wt, snap, runs)
+    assert r is not None, "a live -EncodedCommand driver named only by its run dir was answered FREE"
+    assert r["reason"] == "live-driver" and r["processId"] == 999961, r
+    assert r["via"] == "rundir-pid:venue-driver.pid+cmdline-encoded", r
+    assert r["matchedPath"].lower() == str(rd).lower(), r
+    assert "reason=live-driver" in err and "via=rundir-pid:venue-driver.pid+cmdline-encoded" in err, err
+
+
+def test_b2_live_refusal_encoded_driver_with_an_unreadable_pid_record_is_census_failed(tmp_path):
+    """Dot B2 (b), unreadable record: the locked record is read as naming every live pid; the encoded driver ties through it. Was FREE."""
+    wt, runs, rd, snap = _encoded_driver_fixture(tmp_path)
+    r, err = _live_refusal(wt, snap, runs, prelude=_locked(rd / "venue-driver.pid"))
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+    assert "rundir-record-unreadable" in r["detail"] and "venue-driver.pid" in r["detail"], r
+
+
+def test_b2_live_refusal_encoded_driver_of_another_worktree_does_not_refuse_this_one(tmp_path):
+    """No over-refusal: the decoded run dir ties to lane-Y-1, so lane-X-1 stays FREE."""
+    wt, runs, rd, snap = _encoded_driver_fixture(tmp_path, workdir=tmp_path / "lane-Y-1")
+    r, _ = _live_refusal(wt, snap, runs)
+    assert r is None, r
+
+
+def test_b2_gate_keeps_a_worktree_whose_encoded_driver_names_only_its_run_dir(repo):
+    """B2 through Invoke-RetireLaneWorktree (it shares Find-RunDirDriverHolders)."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-ENC-1")
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-ENC-1-r5", 999962, workdir=wt)
+    snap = _fake_snapshot(_fake_proc(999962, _encoded_driver_cmdline(f"& '{rd}\\venue-driver.ps1'")))
+    d, err = _gate_err(wt, snap, runs)
+    assert d["action"] == "kept" and "rundir-pid:venue-driver.pid+cmdline-encoded" in d["reason"], d
+    assert "reason=live-driver" in err, err
+
+
+# --- Launcher census: the guard ties a lane driver to its run dir through its COMMAND LINE (raw, or decoded since B2). Every tracked
+# launch site that starts PowerShell from base64 or detaches a process is listed here with the reason it is safe, so a new one fails
+# this census until someone classifies it, instead of slipping past Get-WorktreeLiveRefusal.
+
+CENSUS_ROOTS = ("tools/coordination", "tools/profiling")
+ENCODED_RX = re.compile(r"-EncodedCommand\b|['\"]-ec['\"]", re.I)
+DETACHED_RX = re.compile(r"Start-Process\b[^\n]*-WindowStyle\s+Hidden|Win32_Process[^\n]*\bCreate\b|\[wmiclass\]", re.I)
+ENCODED_LAUNCH_SITES = {
+    "tools/coordination/Invoke-Lane.ps1":
+        "the Claude-engine job host (pwsh -EncodedCommand $hostSource) is not a driver: it waits on its claude.exe child, whose argv "
+        "names <RunDir> through --settings <RunDir>\\<lane>-NNN.settings.json and whose pid is written to <RunDir>\\<lane>-NNN.child.json",
+    "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1":
+        "Invoke-Child -CommandText: a synchronous child, waited for and killed at -MaxTotalSec, never a detached driver",
+    "tools/profiling/bachelor/ultra-magnus-agent.ps1":
+        "the heavy-slot sentinel runs on the venue host, never against a hub lane worktree",
+}
+DETACHED_LAUNCH_SITES = {
+    "tools/coordination/autopilot/product-share.ps1":
+        ("'-File', \"`\"$PSCommandPath`\"\"", "the verdict worker re-launches this script with -File; it holds no lane worktree"),
+    "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1":
+        ("Start-Process -FilePath (Join-Path $Cache $PresentMonName)", "venue-side job: PresentMon / python helpers, not PowerShell drivers"),
+}
+
+
+def _census_sources():
+    out = subprocess.run([GIT, "-C", str(REPO), "ls-files", "--", *[f"{r}/*.ps1" for r in CENSUS_ROOTS], *[f"{r}/*.psm1" for r in CENSUS_ROOTS]],
+                         check=True, capture_output=True, text=True).stdout.split()
+    return {p: (REPO / p).read_text(encoding="utf-8", errors="replace") for p in out
+            if p != "tools/coordination/Retire-LaneWorktree.ps1" and "/test" not in p.lower() and not Path(p).name.lower().startswith("test")}
+
+
+def test_launcher_census_every_encoded_command_launch_site_is_classified():
+    found = {p for p, t in _census_sources().items() if ENCODED_RX.search(t)}
+    new = sorted(found - set(ENCODED_LAUNCH_SITES))
+    assert not new, ("new -EncodedCommand launch site(s): " + ", ".join(new) + ". Start a lane driver with -File and its run dir on the "
+                     "command line, or classify the site in ENCODED_LAUNCH_SITES with the reason the retire guard still sees it.")
+    gone = sorted(set(ENCODED_LAUNCH_SITES) - found)
+    assert not gone, f"classified -EncodedCommand site(s) no longer found, drop them from the census: {gone}"
+
+
+def test_launcher_census_every_detached_launch_site_is_classified():
+    src = _census_sources()
+    found = {p for p, t in src.items() if DETACHED_RX.search(t)}
+    new = sorted(found - set(DETACHED_LAUNCH_SITES))
+    assert not new, ("new detached launch site(s): " + ", ".join(new) + ". Launch PowerShell drivers with -File and the run dir on the "
+                     "command line, then classify the site in DETACHED_LAUNCH_SITES.")
+    for p, (pin, why) in DETACHED_LAUNCH_SITES.items():
+        assert p in found and pin in src[p], f"{p}: pinned launch shape moved ({why}); re-check it against the retire guard"
+        assert not ENCODED_RX.search(src[p]), f"{p} now carries -EncodedCommand; a detached driver must start with -File"
+
+
+def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir():
+    """The one Invoke-Lane -EncodedCommand site is safe only while its child names the run dir and is recorded in it."""
+    t = (REPO / "tools/coordination/Invoke-Lane.ps1").read_text(encoding="utf-8")
+    assert len(re.findall(r"'-EncodedCommand'", t)) == 1, "Invoke-Lane.ps1 gained another -EncodedCommand launch: classify it"
+    assert re.search(r"\$candidate = Join-Path \$RunDir", t) and "$base = $candidate" in t, "lane slot base is no longer under $RunDir"
+    assert '$settingsPath = "$base.settings.json"' in t and "$argv += @('--settings', $settingsPath)" in t, "child argv no longer names the run dir"
+    assert '$controlPath = "$base.child.json"' in t and "pid=$child.Id" in t, "child pid is no longer recorded in the run dir"
+    host = t.split("$hostSource = @'", 1)[1].split("'@", 1)[0]
+    assert "-File" not in host and "Start-Process" not in host and "WaitForExit()" in host, "the encoded host must only wait on its child"

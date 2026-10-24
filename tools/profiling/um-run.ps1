@@ -61,6 +61,9 @@
 # older than GATE-2) reads as launched, so such an agent sees exactly the behaviour it always did.
 #
 # LEASE-REQUEST-CHILD-NOT-AFTER-1: -NotAfterUtc is forwarded to the claim as meta.json notAfterUtc (the agent's deadline for the job).
+# LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: -NotAfterBudgetSec / -NotAfterCapUtc are forwarded as its drop-relative form. r5 (Dot 180721e3): with that
+# form the QUEUED and ADMISSION waits end at ABSOLUTE deadlines counted from the drop's sampledUtc (the clock read the visible notAfterUtc was derived
+# from), so time spent after the job became visible and before this client starts waiting shortens the waits instead of pushing them past notAfterUtc.
 
 [CmdletBinding(DefaultParameterSetName = 'Script')]
 param(
@@ -105,6 +108,14 @@ param(
     # this script never derives one: callers that read the result by name after this client stops waiting (#633,
     # VenueChain) still want such a job run.
     [string]$NotAfterUtc = '',
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: the same notAfterUtc RELATIVE to the drop (see UmRunDrop.psm1): the drop writes
+    # min(its own UtcNow, read immediately before the job's rename into view, + -NotAfterBudgetSec, -NotAfterCapUtc) (r3: after
+    # every side-file and job copy, not before the claim). A submitter that sizes the bound from this client's waits passes them
+    # here, so neither a slow start nor slow share placement leaves the bound short of the waits that follow visibility. r5: those
+    # waits count from the drop's own sampledUtc ($waitAnchor below), not from when the drop returned, so neither does a slow return.
+    # 0 / '' (the defaults) send none; passing either with -NotAfterUtc is UMRUN_NOT_AFTER_CONFLICT.
+    [int]$NotAfterBudgetSec = 0,
+    [string]$NotAfterCapUtc = '',
     # Test-only: invoked with no arguments the instant the queue deadline is judged reached and no
     # claim has been seen yet, immediately BEFORE the recheck that follows it -- lets a test land a
     # claim marker deterministically inside what is otherwise a sub-millisecond window between
@@ -176,13 +187,21 @@ if ($PSCmdlet.ParameterSetName -eq 'Command') {
 }
 if (-not (Test-Path $ScriptPath)) { throw "Script not found: $ScriptPath" }
 
-$dropLines = @(Invoke-UmRunDrop -Inbox $inbox -Outbox $outbox -ScriptPath $ScriptPath -JobId $JobId -SideFile $SideFile -JobTimeoutSec $TimeoutSec -NotAfterUtc $NotAfterUtc)
+# (r5: the fallback wait anchor for the drop-relative form; the drop's own sampledUtc is never earlier than this)
+$preDropAt = [DateTimeOffset]::Now
+$dropLines = @(Invoke-UmRunDrop -Inbox $inbox -Outbox $outbox -ScriptPath $ScriptPath -JobId $JobId -SideFile $SideFile -JobTimeoutSec $TimeoutSec -NotAfterUtc $NotAfterUtc -NotAfterBudgetSec $NotAfterBudgetSec -NotAfterCapUtc $NotAfterCapUtc)
 $jobId = $null
 $nonce = $null
+$notAfterSampledAt = $null
 foreach ($line in $dropLines) {
     if ($line -like 'UMRUN_JOBID=*') { $jobId = $line.Substring('UMRUN_JOBID='.Length) }
     elseif ($line -like 'UMRUN_NONCE=*') { $nonce = $line.Substring('UMRUN_NONCE='.Length) }
-    else { Write-Host $line }
+    else {
+        if ($line -match '^job not-after: \S+\.meta\.json notAfterUtc=\S+ sampledUtc=(\S+) budgetSec=') {
+            $notAfterSampledAt = [DateTimeOffset]::Parse($Matches[1], [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None)
+        }
+        Write-Host $line
+    }
 }
 if (-not $jobId) { throw "UmRunDrop returned no job id" }
 if (-not $nonce) { throw "UmRunDrop returned no claim nonce" }
@@ -214,7 +233,22 @@ $startedMarker = Join-Path $running "$jobId.started.json"
 # timezones and not others (round 10/11 sol+fable minor). Using [DateTimeOffset] throughout removes
 # the ambiguity at its source rather than trying to out-guess it in a test.
 $submittedAt    = [DateTimeOffset]::Now
-$queueDeadline  = $submittedAt.AddSeconds($MaxQueueWaitSec)
+# LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r5 (Dot 180721e3 on r4): with -NotAfterBudgetSec the drop wrote notAfterUtc = min(sampledUtc + budget,
+# cap), and everything after its rename (its own cleanup and return, the lines above) is time the agent can already see the job. Counting the waits
+# from $submittedAt put that time on top of them: sample 05:00, budget 7560, a 300 s stall after visibility -> queue 120 + admission 7200 from 05:05
+# ran to 07:07, past 07:06. So the waits count from $waitAnchor, the drop's sampledUtc ($preDropAt, earlier still, if the drop reported none): the
+# queue wait ends at $waitAnchor + MaxQueueWaitSec, and an admission wait ends at the earlier of its own start + MaxAdmissionWaitSec and
+# $waitAnchor + MaxQueueWaitSec + MaxAdmissionWaitSec ($admissionCeiling). A deadline already passed when the wait starts ends it on the first poll,
+# through its existing outcome (the queue's recheck and RETRACTED, the admission's UNRESOLVED). So whenever the job became visible, both waits end
+# by sampledUtc + queue + admission, which a budget sized from those waits keeps before notAfterUtc; each deadline is checked once per poll.
+# Without -NotAfterBudgetSec nothing changes: the waits count from $submittedAt, as before.
+$waitAnchor = $submittedAt
+$admissionCeiling = $null
+if ($NotAfterBudgetSec -ne 0) {
+    $waitAnchor = $(if ($null -ne $notAfterSampledAt) { $notAfterSampledAt } else { $preDropAt })
+    $admissionCeiling = $waitAnchor.AddSeconds([double]$MaxQueueWaitSec + [double]$MaxAdmissionWaitSec)
+}
+$queueDeadline  = $waitAnchor.AddSeconds($MaxQueueWaitSec)
 $claimedAt      = $null
 $budgetDeadline = $null
 # MLV-AGENT-HEAVY-SLOT-GATE-2: set when this client first sees the agent holding the job in its
@@ -343,7 +377,9 @@ while ($true) {
             $admissionLogKey = $logKey
             $admissionLogAt = $now
         }
-        if ($now -ge $admissionAt.AddSeconds($MaxAdmissionWaitSec)) {
+        $admissionDeadline = $admissionAt.AddSeconds($MaxAdmissionWaitSec)
+        if ($null -ne $admissionCeiling -and $admissionCeiling -lt $admissionDeadline) { $admissionDeadline = $admissionCeiling }
+        if ($now -ge $admissionDeadline) {
             $r = Get-UmRunResultIfPresent -Path $resultFile
             if ($null -ne $r) { return $r }
             $ceilingClaim = Get-UmRunClaimState -Path $startedMarker
@@ -352,7 +388,7 @@ while ($true) {
                 $budgetDeadline = $claimedAt.AddSeconds($TimeoutSec)
                 continue
             }
-            throw "UNRESOLVED: $jobId was held unlaunched in the agent's heavy-slot admission gate ($startedMarker last read as $ceilingClaim, never launched; last gate state=$($gate.State)) for the full -MaxAdmissionWaitSec (${MaxAdmissionWaitSec}s) -- this client is stopping, not failing, and did not withdraw it: the agent still holds $jobId and may launch it and publish $resultFile after this; not retryable on this evidence alone"
+            throw "UNRESOLVED: $jobId was held unlaunched in the agent's heavy-slot admission gate ($startedMarker last read as $ceilingClaim, never launched; last gate state=$($gate.State)) for the full -MaxAdmissionWaitSec (${MaxAdmissionWaitSec}s$(if ($admissionDeadline -eq $admissionCeiling) { ", capped at the drop's sampledUtc + queue + admission, $($admissionCeiling.UtcDateTime.ToString('o'))" })) -- this client is stopping, not failing, and did not withdraw it: the agent still holds $jobId and may launch it and publish $resultFile after this; not retryable on this evidence alone"
         }
     } else {
         # QUEUED phase.
@@ -450,7 +486,7 @@ while ($true) {
                         }
                     }
                 }
-                $queuedElapsedSec = [int]([DateTimeOffset]::Now - $submittedAt).TotalSeconds
+                $queuedElapsedSec = [int]([DateTimeOffset]::Now - $waitAnchor).TotalSeconds
                 # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 12 (sol BLOCKER / fable MINOR, item 1):
                 # this client's own rename proves the job's CONTENT can never execute now (its
                 # bytes are gone from the path any agent would open by name), but it does NOT prove
