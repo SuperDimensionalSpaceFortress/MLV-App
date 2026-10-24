@@ -1462,10 +1462,12 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + lease-batch r2 (2026-10-23)"
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + lease-batch r3 (2026-10-23)"
 $script:QuietLeaseLabel = "quiet-lease mlv"
 # lease-batch r2: heavy-slot.py's renew_stale_s. A lease with no successful renew for longer is demoted (non-exclusive).
 $script:LeaseRenewStaleSec = 120
+# lease-batch r3: a batch job still running this long before its lease's until= is stopped (Get-LeaseBatchJobStop).
+$script:LeaseBatchJobGuardSec = 10
 $script:QuietLease = $null
 $script:QuietLeaseWaiting = $null
 # lease-batch r1: the parked (or in-use) batch lease, and "the admitted batch job launched and ended" for Exit-HeavySlot.
@@ -2539,7 +2541,11 @@ function Confirm-QuietLeaseHeldForLaunch {
 #      under it, the opening request's refusals, renew counts (r2: okMaxGapSec, the longest gap between successful renews),
 #      endReason and releaseRc. r2: every batch job's admission.leaseBatch and its result's admission.leaseRenew carry
 #      okMaxGapSec too, so the VM counts a leg only when the lease was never demoted up to the leg's end.
-# No new kill path and no new renew call site: release is Stop-QuietLease and renewal is the tick.
+#   6. r3 (sol r2 blockers). BOUNDED BY THE LEASE: a batch job still running LeaseBatchJobGuardSec before its lease's until=, or on a demoted or lost
+#      lease, is stopped with its whole process tree (Get-LeaseBatchJobStop, every monitor slice; exit 124, admission.leaseStop, slotContinuity=lost) and
+#      the lease is released before its result is published. ENDED BATCH: a job of a batch whose close job is queued leaves the gate with no lease
+#      (Test-LeaseBatchClosePending), and its pending request is stopped; the VM also cancels such an open by name (cancel\<jobId>.cancel).
+# No new renew call site, and no new release call site: release is Stop-QuietLease and renewal is the tick. The r3 stop reuses Stop-ProcessTree.
 # ---------------------------------------------------------------------------
 
 function Get-LeaseBatchToken {
@@ -2553,6 +2559,14 @@ function Test-LeaseBatchCloseJobId {
     # Pure. The light job that releases a batch's parked lease: "lease-batch-close-<x>-lb<token>".
     param([AllowNull()][AllowEmptyString()][string]$JobId)
     return ($null -ne $JobId -and $JobId -cmatch '^lease-batch-close-[A-Za-z0-9._-]*-lb[0-9a-f]{12}$')
+}
+
+function Test-LeaseBatchClosePending {
+    # lease-batch r3 (sol r2 B1): is the close job of batch -Token queued in inbox\? The VM queues it when the batch has ended, so a job of that batch
+    # still waiting in the gate must leave it with no lease (Wait-QuietLeaseAdmission). Matched by name in this agent's own inbox.
+    param([Parameter(Mandatory = $true)][string]$Token)
+    try { return @([System.IO.Directory]::EnumerateFiles($inbox, "lease-batch-close-*-lb$Token.job.ps1") | Where-Object { Test-LeaseBatchCloseJobId -JobId ([System.IO.Path]::GetFileName($_) -replace '\.job\.ps1$', '') }).Count -gt 0 }
+    catch { return $false }
 }
 
 function Get-QuietLeaseRemainingSec {
@@ -2613,8 +2627,24 @@ function Use-LeaseBatchForJob {
     }
     if ($null -ne $script:GateHour) { $script:GateHour.admitted++ }
     Add-AgentLogLine "quiet-lease: batch-reused token=$token lease=$($l.id) job=$JobId seq=$($b.seq) held=$($a.held) remaining=${rem}s"
-    if (-not $covers) { Add-AgentLogLine "quiet-lease: lease-shorter-than-timeout job=$JobId remaining=${rem}s timeoutSec=$timeoutSec; the job runs past until=$([long]$a.until) without the lease (admission.leaseCoversTimeout=false)" }
+    if (-not $covers) { Add-AgentLogLine "quiet-lease: lease-shorter-than-timeout job=$JobId remaining=${rem}s timeoutSec=$timeoutSec; lease-batch r3: it is stopped at the lease's end, never run past until=$([long]$a.until) (admission.leaseCoversTimeout=false)" }
     return $adm
+}
+
+function Get-LeaseBatchJobStop {
+    # lease-batch r3 (sol r2 B2): a BATCH job runs only while its batch lease is live and exclusive. $null while it may run, else @{ reason; why }:
+    # lease-end (no more than LeaseBatchJobGuardSec left before heavy-slot.py's until=), demoted (more than LeaseRenewStaleSec between successful
+    # renews), lease-lost (no active lease, or its wrapper exited). Invoke-QueuedJob's monitor loop asks every slice and stops the job's whole process
+    # tree. A job that is not a batch job is never stopped here (an unbatched lease keeps quiet-lease r1: leaseCoversTimeout, slotContinuity).
+    param($Admission, $Lease)
+    if ($null -eq $Admission -or $null -eq $Admission.leaseBatch) { return $null }
+    if ($null -eq $Lease -or $null -eq $Lease.active) { return [pscustomobject]@{ reason = "lease-lost"; why = "no active batch lease" } }
+    if ($Lease.proc.HasExited) { return [pscustomobject]@{ reason = "lease-lost"; why = "lease wrapper pid=$($Lease.pid) exited rc=$($Lease.proc.ExitCode)" } }
+    $rem = Get-QuietLeaseRemainingSec -Lease $Lease
+    if ($rem -le $script:LeaseBatchJobGuardSec) { return [pscustomobject]@{ reason = "lease-end"; why = "${rem}s left before until=$([long]$Lease.active.until) (guard $($script:LeaseBatchJobGuardSec)s)" } }
+    $gap = Get-QuietLeaseRenewOkGapSec -Lease $Lease
+    if ($gap -gt $script:LeaseRenewStaleSec) { return [pscustomobject]@{ reason = "demoted"; why = "${gap}s between successful renews > $($script:LeaseRenewStaleSec)s" } }
+    return $null
 }
 
 function Complete-LeaseBatchJob {
@@ -2721,6 +2751,12 @@ function Wait-QuietLeaseAdmission {
             $waited = ($now - $t0).TotalSeconds
             if (Test-Path -LiteralPath (Join-Path $cancel "$JobId.cancel") -PathType Leaf) {
                 return [pscustomobject]@{ gate = $script:GateVersion; mode = "lease"; label = "cancelled-in-gate"; state = "cancelled"; waitedSec = [int]$waited; probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = "cancel file present before launch"; leaseRefusals = @($refusals.ToArray()) }
+            }
+            # lease-batch r3 (sol r2 B1): the batch has ended (its close job is queued), so a job of it leaves the gate with no lease and its pending request
+            # is stopped (finally below): it can never be admitted after the VM let go. The VM also cancels an open it has no result for (the check above).
+            if ($null -ne $batchToken -and (Test-LeaseBatchClosePending -Token $batchToken)) {
+                Add-AgentLogLine "quiet-lease: batch-closed job=$JobId token=$batchToken waited=$([int]$waited)s requests=$requests; the batch's close job is queued, so this job takes no lease"
+                return [pscustomobject]@{ gate = $script:GateVersion; mode = "lease"; label = "cancelled-in-gate"; state = "cancelled"; waitedSec = [int]$waited; probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = "the close job of lease batch $batchToken is queued: the batch has ended, so this job takes no lease"; batchClosed = $true; leaseRefusals = @($refusals.ToArray()) }
             }
             $age = Get-QueueAgeSeconds -Job $Job -Metadata $Metadata
             if ($maxAge -gt 0 -and $age -gt $maxAge) {
@@ -2917,6 +2953,7 @@ function Invoke-QueuedJob {
     $killedProcessIds = @()
     $jobProcess = $null
     $launch = $null
+    $leaseStop = $null
     $trackedDescendants = @{}
     $keepAwakeBeginUtc = $null
     $keepAwakeEndUtc = $null
@@ -3005,6 +3042,9 @@ function Invoke-QueuedJob {
                 $script:Admission | Add-Member -NotePropertyName slotContinuity -NotePropertyValue "lost" -Force
                 Add-AgentLogLine "quiet-lease: lease wrapper pid=$($script:QuietLease.pid) for job=$jobId exited mid-job rc=$($script:QuietLease.proc.ExitCode); the job keeps running without the lease (admission.slotContinuity=lost)"
             }
+            # lease-batch r3 (sol r2 B2): a batch job never runs on an expired, demoted or lost lease: it is stopped, with its whole tree, below.
+            $leaseStop = Get-LeaseBatchJobStop -Admission $script:Admission -Lease $script:QuietLease
+            if ($null -ne $leaseStop) { break }
             Write-AgentHeartbeat -Activity "job=$jobId"
             $remainingMs = [Math]::Max(1, [int][Math]::Min($waitSliceMs, ($deadline - (Get-Date)).TotalMilliseconds))
             [void]$jobProcess.WaitForExit($remainingMs)
@@ -3015,6 +3055,15 @@ function Invoke-QueuedJob {
             $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath)
             "cancelled by mailbox request; killed process tree pids=$($killedProcessIds -join ',')" |
                 Add-Content -Encoding ASCII $errFile
+        }
+        elseif ($null -ne $leaseStop) {
+            $exit = 124
+            $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath)
+            $script:Admission | Add-Member -NotePropertyName slotContinuity -NotePropertyValue "lost" -Force
+            $script:Admission | Add-Member -NotePropertyName leaseStop -NotePropertyValue ([pscustomobject]@{ reason = $leaseStop.reason; why = $leaseStop.why; stoppedUtc = (Get-Date).ToUniversalTime().ToString("o"); guardSec = $script:LeaseBatchJobGuardSec }) -Force
+            "stopped at its batch lease's bound ($($leaseStop.reason): $($leaseStop.why)); killed process tree pids=$($killedProcessIds -join ',')" |
+                Add-Content -Encoding ASCII $errFile
+            Add-AgentLogLine "quiet-lease: batch-job-stopped job=$jobId reason=$($leaseStop.reason) why=[$($leaseStop.why)] killed=$($killedProcessIds -join ',')"
         }
         elseif ($jobProcess.HasExited) {
             $exit = $jobProcess.ExitCode
@@ -3062,6 +3111,8 @@ function Invoke-QueuedJob {
         $ql = $script:QuietLease
         $script:Admission | Add-Member -NotePropertyName leaseRenew -NotePropertyValue ([pscustomobject]@{ intervalSec = $LeaseRenewSec; starts = $ql.renewStarts; ok = $ql.renewsOk; failures = $ql.renewFailures; slow = $ql.renewSlow; maxGapSec = $ql.renewMaxGapSec; okMaxGapSec = (Get-QuietLeaseRenewOkGapSec -Lease $ql); staleSec = $script:LeaseRenewStaleSec }) -Force
     }
+    # lease-batch r3: a job stopped at its batch lease's bound releases that lease before its result is published, so no later leg can run on it.
+    if ($null -ne $leaseStop) { Close-LeaseBatch -Reason "job-stopped-$($leaseStop.reason)" -Why "job=$jobId $($leaseStop.why)" }
 
     $result = [pscustomobject]@{
         jobId             = $jobId

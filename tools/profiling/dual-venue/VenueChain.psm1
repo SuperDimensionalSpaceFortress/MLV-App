@@ -684,6 +684,33 @@ function Get-VenueJobResult {
     catch { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = "result.json does not parse: $($_.Exception.Message)" } }
 }
 
+function Request-VenueJobCancel {
+    <#
+    .SYNOPSIS
+    Ask the venue agent to cancel one job (BACHELOR-LEASE-BATCH-LEGS-1 r3): <AgentShare>\cancel\<JobId>.cancel, the agent's cooperative cancel request (ultra-magnus-agent.ps1
+    header). Created with FileMode.CreateNew, so it never replaces a file, on one bounded worker, then checked by name. The agent reads it at the top of every loop of its
+    admission gate (before any lease request), again after admission and before launch, and every slice of a running job. The cancel folder is the agent's: it is never created here.
+    .OUTPUTS
+    [pscustomobject]@{ state (REQUESTED | UNKNOWN); path; error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [string]$JobId = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    if ($JobId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { return [pscustomobject]@{ state = 'UNKNOWN'; path = $null; error = 'no usable job id' } }
+    $path = $AgentShare.TrimEnd('\') + '\cancel\' + $JobId + '.cancel'
+    $write = @'
+$p = $args[0]
+if (-not (Test-Path -LiteralPath (Split-Path -Parent $p) -PathType Container)) { '<NO_CANCEL_DIR>'; return }
+if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+    try { $fs = [IO.File]::Open($p, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); try { $bytes = [Text.Encoding]::ASCII.GetBytes('cancel'); $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() } } catch [IO.IOException] { }
+}
+if (Test-Path -LiteralPath $p -PathType Leaf) { '<PRESENT>' } else { '<ABSENT>' }
+'@
+    $r = Invoke-VenueBoundedRead -ScriptText $write -Argument $path -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNKNOWN'; path = $path; error = $r.error } }
+    $said = [string](@($r.value) -join '')
+    if ($said -ceq '<PRESENT>') { return [pscustomobject]@{ state = 'REQUESTED'; path = $path; error = $null } }
+    [pscustomobject]@{ state = 'UNKNOWN'; path = $path; error = $(if ($said -ceq '<NO_CANCEL_DIR>') { 'the agent share has no cancel folder' } else { 'the cancel file is not there after the write' }) }
+}
+
 function Read-VenueLeaseBatchReceipt {
     <#
     .SYNOPSIS
@@ -814,4 +841,4 @@ Export-ModuleMember -Function Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueCl
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait

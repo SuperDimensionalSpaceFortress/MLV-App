@@ -17,8 +17,10 @@
 #      c. the leg's agent result is read BY NAME (outbox\<jobId>.result.json). The leg counts only if it ran on THIS batch's lease (admission.leaseBatch
 #         .leaseId) and kept it (slotContinuity). Class: QUIET_PRELOAD_OK (counted) when its own pre-load mean is <= 30 %; otherwise QUIET_PRELOAD_HIGH,
 #         QUIET_PRELOAD_UNKNOWN or LEASE_LOST (uncounted).
-#   4. END. A batch ends when its legs are done (ALL_LEGS_DONE), the next leg would outlive the lease (LEASE_REMAINING_SHORT: the rest go to the next batch),
-#      the lease was lost (LEASE_LOST) or demoted (LEASE_DEMOTED / LEASE_RENEW_UNKNOWN, 6e), the deadline passed (DEADLINE), or a probe could not measure (PROBE_<verdict>: the run stops). The light job
+#   4. END. A batch ends when its legs are done (ALL_LEGS_DONE), the next leg would outlive the lease (LEASE_REMAINING_SHORT: the rest go to the next batch; also
+#      a busy probe with less room left after the leg's budget than one -RecheckSec), the lease was lost (LEASE_LOST), demoted (LEASE_DEMOTED / LEASE_RENEW_UNKNOWN, 6e)
+#      or ended under a leg (LEASE_EXPIRED, 7b), the deadline passed (DEADLINE), or a probe could not measure (PROBE_<verdict>: the run stops). An open still
+#      unanswered is cancelled and reconciled first (7a). The light job
 #      lease-batch-close-<stamp>-lb<token> then releases the lease at once (the agent's idle bound would, later). The agent's own batch receipt is read by
 #      name (logs\lease-batch-<token>.jsonl), and the claim is released.
 #   5. RECEIPTS. <RunDir>\batch-<nn>.json and one line per batch in <RunDir>\batches.jsonl (mlv-app/venue-lease-batch/v1): token, lease id, held, start and
@@ -29,7 +31,8 @@
 #         -LeaseCapSec (2700) after the open was read, nor past the 3 h budget left (c).
 #      b. 30 min cooldown: before each open the run waits until -LeaseCooldownSec (1800) after the end of the last lease it (or any earlier run on this host)
 #         took, WITHOUT the venue claim (BATCH_WAIT reason=COOLDOWN, the batch's preOpenWait).
-#      c. <= 50 % of any 3 h: every lease is appended to <ClaimDir>\<venue>.lease-ledger.jsonl (VenueChain.psm1). An open waits until the 3 h window ending
+#      c. <= 50 % of any 3 h: every lease a lease-batch run takes is appended to <ClaimDir>\<venue>.lease-ledger.jsonl (VenueChain.psm1), which a run reads
+#         ONCE, at its start (a lease another run takes meanwhile reaches this one only as heavy-slot.py's exit 75, d). An open waits until the 3 h window ending
 #         when a full-length lease opened then would end holds at most -LeaseBudgetSec - -LeaseCapSec (Get-VenueLeaseBudgetWait; reason=BUDGET), so a day of
 #         batches is paced to the budget instead of being refused. A wait that would pass the deadline ends the run DEADLINE (exit 3), nothing submitted.
 #      d. exit 75 = wait and retry, NOT a failure: the agent re-asks a refused (75) request every LeaseRetrySec; the batch receipt types its refusals
@@ -40,6 +43,17 @@
 #         <= -RenewGapMaxSec (120): otherwise it is LEASE_DEMOTED (or LEASE_RENEW_UNKNOWN when absent), uncounted, and the batch ends; the rest go to the next.
 #      f. max pending 30 min: the agent's --admit-timeout is LeasePendingMaxSec (<= 1800); a request past it is abandoned and asked again (d).
 #      Foreign holders' leased time is not in the ledger: heavy-slot.py still refuses (75) on it, and (d) waits that out.
+#   7. r3 (sol r2 blockers):
+#      a. NO LEASE AFTER THE RUNNER LETS GO. An open with no result in hand at the END of its batch (um-run gave up, the deadline came while its result was
+#         awaited, the batch threw) may still be in the agent's gate, re-asking for a lease. The runner writes its cancel file (Request-VenueJobCancel; the agent
+#         reads it at the top of every gate loop, before any request), then reads its result BY NAME for up to -CancelReconcileSec, and only then closes the
+#         lease and releases the claim: openCancel CANCELLED (no lease), RAN_BEFORE_CANCEL (its lease is this batch's: the close releases it), ENDED, or
+#         UNRECONCILED (exit 11: the cancel file stays, and the ledger counts a full lease for it). The agent also ends a batch job's gate wait once that batch's
+#         close job is queued (lease-batch r3).
+#      b. NO LEG PAST THE LEASE'S END. A leg runs as a bounded child (Invoke-VenueBoundedProcess) whose bound is the lease's end: still running then, it is
+#         killed with its whole process tree, its agent job is asked to cancel, and it is LEASE_EXPIRED (outcome INVALID, uncounted, never re-run; exit 7).
+#         The agent stops a batch job at the same bound, or on a demoted or lost lease (admission.leaseStop), which types it LEASE_EXPIRED / LEASE_DEMOTED /
+#         LEASE_LOST. -LegBudgetSec only decides whether a leg STARTS; it never lets one run past the lease.
 # It changes nothing on Bachelor: not heavy-slot.py's caps, not its lease file, not the quiet threshold. A batch run needs the lease-batch agent deployed.
 #
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeaseBatch.ps1 -LegSpec a.json,b.json -Backend cpu -RunDir <rd> `
@@ -47,8 +61,9 @@
 #
 # Exit codes (a leg's OUTCOME is never the exit code: read LEASE_BATCH_RESULT and the receipts): 0 every leg ran; 2 usage (or a leg budget no lease can hold);
 # 3 DEADLINE before every leg ran (a cooldown, budget or exit-75 wait that reached it included); 4 GATE_UNREADABLE and 5 HOST_MISMATCH from Wait-VenueQuiet; 6 a probe ended VENUE_QUIET_UNKNOWN; 7 a leg process exited
-# non-zero (LEG_FAILED; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED, UNRESOLVED or not admitted); 10 the agent is not
-# batch-capable. A stopping code (2-6, 9, 10) replaces 0 or 7.
+# non-zero (LEG_FAILED) or was killed at the lease's end (LEASE_EXPIRED; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
+# UNRESOLVED or not admitted); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
+# 7a). A stopping code (2-6, 9, 10) replaces 0 or 7; 11 replaces every other code.
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
 [CmdletBinding()]
 param(
@@ -81,6 +96,8 @@ param(
     [ValidateRange(1, 120)][int]$RenewGapMaxSec = 120,
     [ValidateRange(60, 86400)][int]$ClaimTtlSec = 10800,
     [ValidateRange(1, 3600)][int]$ClaimPollSec = 30,
+    # r3: how long the end of a batch reads a cancelled open's result by name before it types it UNRECONCILED (exit 11)
+    [ValidateRange(1, 3600)][int]$CancelReconcileSec = 300,
     [string]$ClaimDir = '',
     [string]$QuietScript = '',
     [string]$LegScript = '',
@@ -212,7 +229,7 @@ function Write-BatchReceipt([System.Collections.IDictionary]$B) {
     Add-Content -LiteralPath (Join-Path $RunDir 'batches.jsonl') -Value ($rec | ConvertTo-Json -Compress -Depth 8)
     $batches.Add($rec)
 }
-# Every lease a lease-batch run took on this venue in the last budget window plus cooldown (any run on this host; CAPS b and c).
+# Every lease a lease-batch run on this host took on this venue in the last budget window plus cooldown, read once at the run's start (CAPS b and c).
 $leases = [System.Collections.Generic.List[object]]::new()
 foreach ($l in @(Read-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -SinceUtc $t0.AddSeconds(-($LeaseBudgetWindowSec + $LeaseCooldownSec)))) { $leases.Add($l) }
 function Set-Stop([string]$Reason, [int]$Code) { $script:stopReason = $Reason; if ($script:exitCode -eq 0 -or $script:exitCode -eq 7) { $script:exitCode = $Code } }
@@ -236,6 +253,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         legsAttempted = 0; legsRan = 0; legsCounted = 0; retries = 0; probeRetries = 0; legRetries = 0
         endReason = $null; endDetail = $null; legs = [System.Collections.Generic.List[object]]::new(); closeJobId = $null; closeOutcome = $null; agent = $null; endedUtc = $null
         preOpenWait = $null; openLeaseWait = 'NONE'; exit75Refusals = 0; exit75Class = 'NONE'; renewOkMaxGapSec = $null; leaseEndClamp = $null; ledger = $null
+        openExit75Refusals = 0; legExit75Refusals = 0; openCancel = $null
     }
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
     $bw = Get-VenueLeaseBudgetWait -Leases @($leases) -NowUtc ([DateTime]::UtcNow) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec
@@ -269,6 +287,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     }
     $b.claimNonce = $claim.nonce
     L "CLAIM_TAKEN batch=$batchNo nonce=$($claim.nonce) expiresUtc=$($claim.expiresUtc)"
+    $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null
     try {
         # (2) OPEN: the lease first. Nothing is probed or run before the agent reports this batch's lease active.
         $b.openJobId = "lease-batch-open-$stamp-lb$token"
@@ -290,7 +309,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         }
         $adm = $(if ($null -ne $op.result) { $op.result.admission } else { $null })
         $b.openOutcome = $op.outcome
-        $b.exit75Refusals = $(if ($null -ne $adm) { @(@($adm.leaseRefusals) | Where-Object { $null -ne $_ -and [string]$_.rc -eq '75' }).Count } else { 0 })
+        $b.openExit75Refusals = $(if ($null -ne $adm) { @(@($adm.leaseRefusals) | Where-Object { $null -ne $_ -and [string]$_.rc -eq '75' }).Count } else { 0 })
+        $b.exit75Refusals = $b.openExit75Refusals
         if ($b.exit75Refusals -gt 0 -or $b.openLeaseWait -cne 'NONE') { $b.exit75Class = 'WAIT_RETRY' }
         if ($op.outcome -ceq 'UNRESOLVED' -and $b.openLeaseWait -cne 'NONE') {
             $b.endReason = 'DEADLINE'; $b.endDetail = "lease-wait: the open was still held in the agent's admission gate (exit-75 refusals, not a failure) at the deadline"
@@ -337,6 +357,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($q.verdict -cne 'QUIET') {
                     # COOLDOWN_UNMET (a measured busy desktop, a foreign floor included) or GATE_BUSY: retry INSIDE this lease, never a release and a new request.
                     $b.retries++; $b.probeRetries++
+                    # r3 (fable r2): with less room left after the leg's budget than one -RecheckSec, a busy probe ends the batch (the leg goes to the next one)
+                    # instead of re-probing back to back, one probe and one light agent job per spin, until the room runs out.
+                    $roomNow = [int](($leaseEnd - [DateTime]::UtcNow).TotalSeconds) - $LeaseMarginSec
+                    if (($roomNow - $legBudget) -lt $RecheckSec) {
+                        $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "after a busy probe ($($q.verdict)) roomSec=$roomNow - legBudgetSec=$legBudget < recheckSec=${RecheckSec}: leg $($leg.name) goes to the next batch"
+                        break
+                    }
                     L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=$($q.verdict) mean=$(Format-Mean $q.mean) roomSec=$room"
                     if ($q.verdict -ceq 'GATE_BUSY') { Start-Sleep -Seconds ([int][Math]::Max(1, [Math]::Min($ClaimPollSec, $room - $legBudget))) }
                     continue
@@ -349,10 +376,15 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
                 L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })"
                 $tLeg = [DateTime]::UtcNow
-                & $pwshExe @lArgs *> $out
-                $legCode = $LASTEXITCODE
+                # r3 (sol r2 B2): the leg runs only while the lease does. It is a bounded child: still running at the lease's end, it is killed with its whole
+                # process tree (Kill($true), Invoke-VenueBoundedProcess) and typed LEASE_EXPIRED below. The agent stops its job at the same bound (lease-batch r3).
+                $legBoundSec = [int][Math]::Max(1, [Math]::Floor(($leaseEnd - [DateTime]::UtcNow).TotalSeconds))
+                $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec
+                [IO.File]::WriteAllText($out, [string]$lp.stdout + [string]$lp.stderr, [Text.UTF8Encoding]::new($false))
+                $legCode = $lp.exit
                 $legSec = [int]([DateTime]::UtcNow - $tLeg).TotalSeconds
-                if ($legSec -gt $legBudget) { $legBudget = [Math]::Min(2700, $legSec) }
+                # a leg killed at the lease's end says nothing about how long a leg takes
+                if (-not $lp.timedOut -and $legSec -gt $legBudget) { $legBudget = [Math]::Min(2700, $legSec) }
                 $text = $(if (Test-Path -LiteralPath $out) { [IO.File]::ReadAllText($out) } else { '' })
                 $legLines = @($text -split "`r?`n")
                 $o = $legLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
@@ -362,6 +394,17 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
                 $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
                 $legJobId = @(Get-VenueRemoteJobIds -Text $text | Where-Object { $_ -and $_ -cnotmatch '-health$' }) | Select-Object -Last 1
+                if ($lp.timedOut) {
+                    # Still running at the lease's end: killed with its tree. Never counted and never re-run (a leg that outlives a whole lease is not retried lease
+                    # after lease). Its agent job is asked to cancel too, in case the agent's own bound has not stopped it yet. The batch ends: its lease is over.
+                    $cx = $(if ($legJobId) { Request-VenueJobCancel -AgentShare $AgentShare -JobId $legJobId } else { [pscustomobject]@{ state = 'UNKNOWN'; error = 'the leg printed no job id' } })
+                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state }
+                    $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEASE_EXPIRED' $row; $pending.RemoveAt(0)
+                    $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) was still running at the lease's end ($legSec s, bound $legBoundSec s): killed with its process tree; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
+                    L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) (killed with its process tree at the lease's end)"
+                    if ($exitCode -eq 0) { $exitCode = 7 }
+                    break
+                }
                 if ($legCode -ne 0) {
                     # Invoke-VenueLeg exits 0 whenever it wrote a receipt; non-zero means it died without one. Not evidence: LEG_FAILED, the run goes on.
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec }
@@ -380,12 +423,18 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # demoted the lease, so this leg and every later one did not have it exclusively: never counted, and the batch ends.
                 $gap = $(if ($null -ne $ja -and $null -ne $ja.leaseRenew -and $null -ne $ja.leaseRenew.okMaxGapSec) { [double]$ja.leaseRenew.okMaxGapSec } else { $null })
                 if ($null -ne $gap -and ($null -eq $b.renewOkMaxGapSec -or $gap -gt $b.renewOkMaxGapSec)) { $b.renewOkMaxGapSec = $gap }
-                $leaseClass = $(if (-not $onLease) { 'LEASE_LOST' } elseif ($null -eq $gap) { 'LEASE_RENEW_UNKNOWN' } elseif ($gap -gt $RenewGapMaxSec) { 'LEASE_DEMOTED' } else { $null })
-                $leaseWhy = "jobId=$legJobId result=$($jr.state) jobLease=$jobLease slotContinuity=$(if ($ja) { $ja.slotContinuity }) renewOkMaxGapSec=$(if ($null -ne $gap) { $gap } else { 'UNKNOWN' })$(if ($jr.error) { " error=$($jr.error)" })"
+                # r3: the agent's own bound (lease-batch r3) stopped the job at its lease's end, on a demoted lease or a lost one: typed as such, never counted.
+                $agentStop = $(if ($null -ne $ja -and $null -ne $ja.leaseStop) { [string]$ja.leaseStop.reason } else { $null })
+                $leaseClass = $(if ($agentStop) { switch ($agentStop) { 'lease-end' { 'LEASE_EXPIRED' } 'demoted' { 'LEASE_DEMOTED' } default { 'LEASE_LOST' } } }
+                    elseif (-not $onLease) { 'LEASE_LOST' } elseif ($null -eq $gap) { 'LEASE_RENEW_UNKNOWN' } elseif ($gap -gt $RenewGapMaxSec) { 'LEASE_DEMOTED' } else { $null })
+                $leaseWhy = "jobId=$legJobId result=$($jr.state) jobLease=$jobLease slotContinuity=$(if ($ja) { $ja.slotContinuity }) renewOkMaxGapSec=$(if ($null -ne $gap) { $gap } else { 'UNKNOWN' })$(if ($agentStop) { " leaseStop=$agentStop" })$(if ($jr.error) { " error=$($jr.error)" })"
+                # r3 (fable r2): a leg whose job took a fresh lease under this token carries that request's exit-75 refusals; the batch receipt counts them too.
+                $legRef = $(if ($null -ne $ja) { @(@($ja.leaseRefusals) | Where-Object { $null -ne $_ -and [string]$_.rc -eq '75' }).Count } else { 0 })
+                if ($legRef -gt 0) { $b.legExit75Refusals += $legRef; $b.exit75Refusals += $legRef; $b.exit75Class = 'WAIT_RETRY' }
                 if ($outcome -ceq 'VENUE_NOT_QUIESCENT') {
                     # The leg's own <= 20 % re-check at its start failed: it never played. Retry INSIDE the same lease (on a lost or demoted lease, in the next batch).
                     $b.retries++; $b.legRetries++
-                    $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec })
+                    $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef })
                     L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT receipt=$receipt onLease=$onLease $leaseWhy"
                     if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
                     continue
@@ -395,8 +444,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $class = $(if ($leaseClass) { $leaseClass } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { 'QUIET_PRELOAD_OK' } else { 'QUIET_PRELOAD_HIGH' })
                 $counted = ($class -ceq 'QUIET_PRELOAD_OK')
                 $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RAN'; outcome = $outcome; class = $class; counted = $counted; quietVerdict = $q.verdict; quietMean = $q.mean; preLoadMean = $preLoad
-                    receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; legSec = $legSec; legExit = $legCode }
+                    receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; legSec = $legSec; legExit = $legCode; exit75Refusals = $legRef }
                 if ($detail) { $row['outcomeDetail'] = $detail }
+                if ($agentStop) { $row['leaseStop'] = $agentStop }
                 $b.legs.Add([pscustomobject]$row); Add-Result $leg 'RAN' $row; $pending.RemoveAt(0)
                 $b.legsRan++; if ($counted) { $b.legsCounted++ }
                 L "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) legSec=$legSec receipt=$receipt $leaseWhy"
@@ -411,6 +461,28 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         }
     } finally {
         # (4) END: release the lease now (a light close job), read the agent's receipt for it, release the claim, write the batch receipt.
+        # r3 (sol r2 B1): an open with no result in hand (um-run gave up on it, the deadline came while its result was awaited, or this batch threw) may still
+        # be in the agent's admission gate, re-asking for a lease. It is CANCELLED and reconciled BY NAME first, so it can never take a lease once this runner
+        # lets go: the agent reads the cancel file at the top of every gate loop, before any request. A RETRACTED open never reached the agent.
+        if ($b.openJobId -and ($null -eq $op -or ($op.outcome -cne 'RECEIPT' -and $op.outcome -cne 'RECEIPT_BY_NAME' -and $op.outcome -cne 'RETRACTED'))) {
+            $cx = Request-VenueJobCancel -AgentShare $AgentShare -JobId $b.openJobId
+            L "BATCH_OPEN_CANCEL batch=$batchNo job=$($b.openJobId) requested=$($cx.state)$(if ($cx.error) { " error=$($cx.error)" }) (read by name for up to ${CancelReconcileSec}s before the lease is closed and the claim released)"
+            $tc = [DateTime]::UtcNow; $cPoll = [Math]::Min($ClaimPollSec, 5); $cr = $null
+            while ($true) {
+                $cr = Get-VenueJobResult -AgentShare $AgentShare -JobId $b.openJobId
+                if ($cr.state -ceq 'FOUND' -or [DateTime]::UtcNow.AddSeconds($cPoll) -ge $tc.AddSeconds($CancelReconcileSec)) { break }
+                Start-Sleep -Seconds $cPoll
+            }
+            $ca = $(if ($cr.state -ceq 'FOUND') { $cr.result.admission } else { $null })
+            # CANCELLED: it left the gate with no lease. RAN_BEFORE_CANCEL: its lease turned active first, so it is this batch's lease and the close below releases it.
+            # ENDED: it ended some other way, with no lease. UNRECONCILED: no answer in time (exit 11): its cancel file stays, and the ledger counts a full lease.
+            $cState = $(if ($cr.state -cne 'FOUND') { 'UNRECONCILED' } elseif ($null -ne $ca -and [string]$ca.label -ceq 'cancelled-in-gate') { 'CANCELLED' }
+                elseif ($null -ne $ca -and $null -ne $ca.leaseBatch -and $ca.leaseBatch.leaseId) { 'RAN_BEFORE_CANCEL' } else { 'ENDED' })
+            if ($cState -ceq 'RAN_BEFORE_CANCEL' -and -not $b.leaseId) { $b.leaseId = [string]$ca.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc }
+            $b.openCancel = [ordered]@{ requested = $cx.state; state = $cState; resultState = $cr.state; resultLabel = $(if ($null -ne $ca) { [string]$ca.label } else { $null }); waitedSec = [int]([DateTime]::UtcNow - $tc).TotalSeconds; error = $(if ($cx.error) { $cx.error } else { $cr.error }) }
+            L "BATCH_OPEN_RECONCILED batch=$batchNo state=$cState result=$($cr.state) label=$($b.openCancel.resultLabel) requested=$($cx.state) waitedSec=$($b.openCancel.waitedSec)"
+            if ($cState -ceq 'UNRECONCILED') { $stopReason = 'OPEN_CANCEL_UNRECONCILED'; $exitCode = 11 }
+        }
         if ($b.openJobId) {
             $b.closeJobId = "lease-batch-close-$stamp-lb$token"
             $cl = Submit-AgentJob $b.closeJobId "Write-Output 'LEASE_BATCH_CLOSE token=$token'" 60 300
@@ -420,10 +492,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $b.agent = $(if ($ar.state -ceq 'FOUND') { $ar.record } else { [pscustomobject]@{ state = $ar.state; error = $ar.error } })
             }
             # CAPS b and c: the lease this batch held, into the venue's ledger, conservatively wide: from its start to the close's return (a leg that took a
-            # fresh lease under this token is inside that span too). An open still in the agent's gate may yet take one: counted as a full lease from now.
+            # fresh lease under this token is inside that span too). An open whose cancel was never reconciled may yet take one: counted as a full lease from now.
             $row = $null
             if ($b.leaseId) { $row = [ordered]@{ venue = $Venue; token = $token; leaseId = $b.leaseId; startUtc = $leaseStartUtc.ToString('o'); endUtc = [DateTime]::UtcNow.ToString('o'); runDir = $RunDir; basis = 'open-to-close' } }
-            elseif ($b.openLeaseWait -cne 'NONE') { $n0 = [DateTime]::UtcNow; $row = [ordered]@{ venue = $Venue; token = $token; leaseId = $null; startUtc = $n0.ToString('o'); endUtc = $n0.AddSeconds($LeaseCapSec).ToString('o'); runDir = $RunDir; basis = 'open-still-waiting' } }
+            elseif ($null -ne $b.openCancel -and $b.openCancel.state -ceq 'UNRECONCILED') { $n0 = [DateTime]::UtcNow; $row = [ordered]@{ venue = $Venue; token = $token; leaseId = $null; startUtc = $n0.ToString('o'); endUtc = $n0.AddSeconds($LeaseCapSec).ToString('o'); runDir = $RunDir; basis = 'open-unreconciled' } }
             if ($null -ne $row) {
                 $b.ledger = $row
                 try { Add-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -Row ([pscustomobject]$row) } catch { L "LEDGER_WRITE_FAILED batch=$batchNo $($_.Exception.Message)" }
@@ -442,6 +514,7 @@ $summary = [ordered]@{
     exitCode = $exitCode; stopReason = $stopReason; legs = @($results)
     ran = @($results | Where-Object { $_.status -ceq 'RAN' }).Count; counted = @($results | Where-Object { $_.status -ceq 'RAN' -and $_.counted }).Count
     failed = @($results | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($results | Where-Object { $_.status -ceq 'NOT_RUN' }).Count
+    leaseExpired = @($results | Where-Object { $_.status -ceq 'LEASE_EXPIRED' }).Count
     batches = @($batches | ForEach-Object { [ordered]@{ batch = $_.batch; token = $_.token; leaseId = $_.leaseId; endReason = $_.endReason; legsAttempted = $_.legsAttempted; legsRan = $_.legsRan; legsCounted = $_.legsCounted; retries = $_.retries } })
 }
 $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)

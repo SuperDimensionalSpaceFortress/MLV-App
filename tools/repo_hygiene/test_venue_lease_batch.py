@@ -8,6 +8,10 @@ WHAT IS PINNED
   * A lease too short for the next leg ends the batch cleanly (LEASE_REMAINING_SHORT) and the rest go to the next batch; a leg that did not run on the
     batch's lease is LEASE_LOST (uncounted) and ends the batch; an agent with no lease batch stops the run before any probe or leg (exit 10).
   * Typed receipts per batch (batch-<nn>.json, batches.jsonl) and the close job that releases the lease.
+  * r3 (sol r2 blockers): an open still in the agent's gate at the end of a batch is CANCELLED and reconciled by name before the claim is released, so
+    it can never take a lease after the runner exits (or the run says UNRECONCILED, exit 11); a leg still running at the lease's end is killed with its
+    whole process tree and typed LEASE_EXPIRED (uncounted, never re-run), and a leg the agent stopped at its lease's bound is typed by the agent's reason.
+    Also the LEG_FAILED exit-7 path at run time, the busy-probe spin bound, and a leg's own exit-75 refusals in the batch receipt (fable r2).
   * The agent's own pieces (its RED/GREEN cooldown case lives in tools/testing/test-ultra-magnus-agent-quiet-lease.ps1): a leg job id built by
     Invoke-VenueLeg -LeaseBatch carries the token the agent reads, and its health probe stays a light job.
 
@@ -20,9 +24,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -83,6 +90,10 @@ if ($JobId -like 'lease-batch-open-*') {
     if ($mode -ne 'nobatch') { $adm['leaseBatch'] = [ordered]@{ token = $token; leaseId = $lid; seq = 1; reused = $false; untilEpoch = $now.ToUnixTimeSeconds() + $remain; remainingSec = $remain } }
     [pscustomobject]@{ opens = $n + 1; leaseId = $lid; token = $token } | ConvertTo-Json | Set-Content -LiteralPath $stateFile
     $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
+    if ($mode -eq 'gatehold') {
+        # r3: um-run gave up while the agent still holds the open in its gate, and NO result lands: the agent keeps re-asking until it is cancelled.
+        throw "UNRESOLVED: $JobId was held unlaunched in the agent's heavy-slot admission gate (fake, held) for the full -MaxAdmissionWaitSec"
+    }
     if ($mode -eq 'gatewait') {
         # um-run gave up while the agent still held the open in its gate (exit-75 refusals); the agent admits it later and its result lands by name.
         $outbox = Join-Path $AgentShare 'outbox'
@@ -93,6 +104,11 @@ if ($JobId -like 'lease-batch-open-*') {
     return $res
 }
 if ($JobId -like 'lease-batch-close-*') {
+    # r3: FAKE_CLOSE_MODES per close: ok | timeout (um-run's queue ceiling: the close never ran)
+    $cf = Join-Path $AgentShare 'fake-close-count.txt'
+    $c = $(if (Test-Path -LiteralPath $cf) { [int](Get-Content -LiteralPath $cf) } else { 0 })
+    Set-Content -LiteralPath $cf -Value ($c + 1)
+    if ((Pick $env:FAKE_CLOSE_MODES $c 'ok') -eq 'timeout') { throw "UNRESOLVED: $JobId (fake) was not taken by the agent before -MaxQueueWaitSec" }
     $logs = Join-Path $AgentShare 'logs'
     New-Item -ItemType Directory -Force -Path $logs | Out-Null
     if ($st.token -eq $token) {
@@ -118,9 +134,18 @@ $leaf = [IO.Path]::GetFileNameWithoutExtension($LegSpec)
 $held = [bool]($env:FAKE_CLAIM_PATH -and (Test-Path -LiteralPath $env:FAKE_CLAIM_PATH))
 Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} LEG {1} leaseBatch={2} claimHeld={3}" -f [DateTime]::UtcNow.Ticks, $leaf, $LeaseBatch, $held)
 $jobId = "dve-$leaf-$Venue-cpu-2026102300000$k$(if ($LeaseBatch) { "-lb$LeaseBatch" })"
-"DVE_JOB_ID=$jobId-health"
-"DVE_JOB_ID=$jobId"
-$lose = @(([string]$env:FAKE_LEG_LOSE) -split ',' | Where-Object { $_ } | ForEach-Object { [int]$_ })
+[Console]::Out.WriteLine("DVE_JOB_ID=$jobId-health"); [Console]::Out.WriteLine("DVE_JOB_ID=$jobId"); [Console]::Out.Flush()
+# r3: FAKE_LEG_MODES per call: ok | exit3 (died without a receipt) | hang (still running at lease end: it starts a grandchild, records both pids, and sleeps)
+$legMode = Pick $env:FAKE_LEG_MODES $k 'ok'
+if ($legMode -eq 'exit3') { exit 3 }
+if ($legMode -eq 'hang') {
+    $gc = Start-Process -FilePath ([Environment]::ProcessPath) -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 300' -PassThru -NoNewWindow
+    Add-Content -LiteralPath (Join-Path $share 'fake-leg-pids.txt') -Value "$PID $($gc.Id) $jobId"
+    Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} LEGHANG {1} pid={2}" -f [DateTime]::UtcNow.Ticks, $leaf, $PID)
+    Start-Sleep -Seconds 150
+    exit 0
+}
+$lose =@(([string]$env:FAKE_LEG_LOSE) -split ',' | Where-Object { $_ } | ForEach-Object { [int]$_ })
 $lid = $(if ($lose -contains ($k + 1)) { 'lease-somebody-else' } else { $st.leaseId })
 $now = [DateTimeOffset]::UtcNow
 $remain = [int](Pick $env:FAKE_LEG_REMAIN $k '2600')
@@ -130,6 +155,12 @@ $res = [ordered]@{ jobId = $jobId; exitCode = 0; endedUtc = $now.ToString('o'); 
 # the agent's renew record at the leg's end: okMaxGapSec from FAKE_LEG_GAPS (default 3 s; 'none' = no record)
 $gap = Pick $env:FAKE_LEG_GAPS $k '3'
 if ($gap -ne 'none') { $res.admission['leaseRenew'] = [ordered]@{ intervalSec = 60; ok = 5; okMaxGapSec = [double]$gap; staleSec = 120 } }
+# r3: FAKE_LEG_REFUSALS per call: the exit-75 refusals of a fresh lease the leg's own job asked for; FAKE_LEG_STOPS per call: the agent stopped the job at its
+# batch lease's bound (lease-end | demoted | lease-lost; 'none' = it ended on its own)
+$nRef = [int](Pick $env:FAKE_LEG_REFUSALS $k '0')
+if ($nRef -gt 0) { $res.admission['leaseRefusals'] = @(1..$nRef | ForEach-Object { [ordered]@{ reason = 'refused'; rc = 75; why = 'quiet lease cooldown' } }) }
+$stop = Pick $env:FAKE_LEG_STOPS $k 'none'
+if ($stop -ne 'none') { $res.exitCode = 124; $res.admission['slotContinuity'] = 'lost'; $res.admission['leaseStop'] = [ordered]@{ reason = $stop; why = 'fake' } }
 $res | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $outbox "$jobId.result.json")
 $id = [guid]::NewGuid().ToString()
 $rdir = Join-Path $env:FAKE_LEG_ROOT "receipts\CARD-1\$leaf\$Venue"
@@ -142,6 +173,58 @@ if ($pre -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json')
 "DVE_RECEIPT_PATH=$rp"
 exit 0
 """
+
+
+class _FakeAgentGate(threading.Thread):
+    """r3 (sol r2 B1): the agent holding a batch's open in its admission gate, re-asking a refused (exit 75) lease request. It answers a cancel file for
+    the open with the agent's cancelled-in-gate result (Publish-GateUnlaunchedResult). Told the runner has exited, it takes the lease it was asking for
+    if the open was never cancelled: heavy-slot.py admits the pending request once the foreign holder clears."""
+
+    def __init__(self, share: Path, claim_path: Path) -> None:
+        super().__init__(daemon=True)
+        self.share, self.claim_path = share, claim_path
+        self.runner_exited = threading.Event()
+        self.cancel_seen: tuple[str, bool] | None = None   # (open job id, was the runner's claim still held then)
+        self.acquired_after_exit = False
+
+    def run(self) -> None:
+        while not self.runner_exited.is_set():
+            for f in (self.share / "cancel").glob("lease-batch-open-*.cancel"):
+                if self.cancel_seen is None:
+                    job = f.name[: -len(".cancel")]
+                    self.cancel_seen = (job, self.claim_path.exists())
+                    outbox = self.share / "outbox"
+                    outbox.mkdir(exist_ok=True)
+                    res = {"jobId": job, "exitCode": 130, "cancelled": True, "endedUtc": utc_iso(datetime.now(timezone.utc)),
+                           "admission": {"gate": "fake", "mode": "lease", "label": "cancelled-in-gate", "state": "cancelled", "why": "cancel file present before launch",
+                                         "leaseRefusals": [{"reason": "refused", "rc": 75, "why": "quiet lease cooldown"}]}}
+                    tmp = outbox / f"{job}.result.json.tmp"
+                    tmp.write_text(json.dumps(res), encoding="utf-8")
+                    os.replace(tmp, outbox / f"{job}.result.json")
+            time.sleep(0.1)
+        if self.cancel_seen is None:
+            self.acquired_after_exit = True
+
+
+def _pid_alive(pid: int) -> bool:
+    import ctypes
+    k = ctypes.windll.kernel32
+    h = k.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        k.GetExitCodeProcess(h, ctypes.byref(code))
+        return code.value == 259   # STILL_ACTIVE
+    finally:
+        k.CloseHandle(h)
+
+
+def _wait_pid_gone(pid: int, timeout_s: float) -> bool:
+    end = time.monotonic() + timeout_s
+    while _pid_alive(pid) and time.monotonic() < end:
+        time.sleep(0.1)
+    return not _pid_alive(pid)
 
 
 def utc_iso(dt: datetime) -> str:
@@ -176,6 +259,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
         self.share = self.case / "share"
         self.share.mkdir()
+        (self.share / "cancel").mkdir()   # the agent's cooperative cancel folder (the agent creates it on the real share)
         self.claims = self.case / "claims"
         self.claim_path = self.claims / "bachelor.claim.json"
         self.events = self.case / "events.log"
@@ -185,13 +269,13 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         e = dict(os.environ)
         e.update({"FAKE_EVENTS": str(self.events), "FAKE_SHARE": str(self.share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case)})
         e.update(env)
+        # Bachelor's 30 min cooldown is waited out between batches; the offline cases (a stub um-run) relax it unless they test it. A case may override any default.
+        defaults = {"-LegBudgetSec": "60", "-LeaseMarginSec": "0", "-ClaimPollSec": "1", "-RecheckSec": "1",
+                    "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
         args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-LegSpec", ",".join(str(s) for s in (specs or self.specs[:2])),
                 "-RunDir", str(self.run_dir), "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST, "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
-                "-AgentShare", str(self.share), "-LegBudgetSec", "60", "-LeaseMarginSec", "0", "-ClaimPollSec", "1", "-RecheckSec", "1",
-                "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)),
-                # Bachelor's 30 min cooldown is waited out between batches; the offline cases (a stub um-run) relax it unless they test it
-                *(() if "-LeaseCooldownSec" in extra else ("-LeaseCooldownSec", "0")), *extra]
+                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *extra]
         return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
 
     def kinds(self) -> list[str]:
@@ -204,7 +288,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                 rows.append((int(ticks), "OPEN:" + job[-12:] if job.startswith("lease-batch-open-") else "CLOSE:" + job[-12:]))
             elif kind == "QUIET":
                 rows.append((int(ticks), "QUIET:" + rest.split()[0]))
-            else:
+            elif kind == "LEG":
                 leaf, lb, _held = rest.split()
                 rows.append((int(ticks), f"LEG:{leaf}:{lb.split('=', 1)[1]}"))
         return [k for _, k in sorted(rows)]
@@ -444,6 +528,117 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # leases at -120..-75 and -45..0 min: the cooldown ends at +30, and the first lease leaves the window ending at open + 45 only at +60
         self.assertEqual((got["budget"]["reason"], got["budget"]["waitSec"], got["budget"]["usedSec"]), ("BUDGET", 3600, 2700))
         self.assertEqual(got["old"], {"reason": "NONE", "waitSec": 0, "usedSec": 0})
+
+    # ---------------------------------------------------------------- r3: sol r2 B1 (no lease after the runner exits) and B2 (no leg past the lease's end)
+    def test_r3_an_open_held_in_the_gate_through_the_deadline_is_cancelled_and_reconciled_before_the_claim_is_released(self) -> None:
+        # The agent holds the open in its gate (exit-75 refusals) past the deadline, and the close job times out (um-run's queue ceiling: the agent never
+        # took it). The runner must CANCEL the open and read the agent's answer by name before it releases the claim, so the pending request can never
+        # take an unused lease once the runner is gone. This is also the gate-wait-reaches-deadline path (DEADLINE, exit 3, openLeaseWait EXIT_75_WAIT).
+        agent = _FakeAgentGate(self.share, self.claim_path)
+        agent.start()
+        try:
+            r = self.run_batch([self.specs[0]], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=12)),
+                               FAKE_OPEN_MODES="gatehold", FAKE_CLOSE_MODES="timeout")
+        finally:
+            agent.runner_exited.set()
+            agent.join(10)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertFalse(agent.acquired_after_exit, "the open was never cancelled: its pending request takes an unused lease after the runner exited")
+        self.assertIsNotNone(agent.cancel_seen)
+        [b] = self.batches()
+        job, claim_held = agent.cancel_seen
+        self.assertEqual(job, b["openJobId"])
+        self.assertTrue(claim_held, "the open was cancelled only after the runner released its claim")
+        self.assertEqual((b["endReason"], b["openOutcome"], b["openLeaseWait"], b["exit75Class"]), ("DEADLINE", "UNRESOLVED", "EXIT_75_WAIT", "WAIT_RETRY"))
+        self.assertEqual((b["openCancel"]["requested"], b["openCancel"]["state"], b["openCancel"]["resultLabel"]), ("REQUESTED", "CANCELLED", "cancelled-in-gate"))
+        self.assertEqual(b["closeOutcome"], "UNRESOLVED")
+        self.assertEqual((b["leaseId"], b["ledger"]), (None, None), "a cancelled open took no lease, so the ledger has no row for it")
+        self.assertFalse((self.claims / "bachelor.lease-ledger.jsonl").exists())
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertLess(log.index(" BATCH_OPEN_CANCEL batch=1 "), log.index(" BATCH_OPEN_RECONCILED batch=1 state=CANCELLED "))
+        self.assertLess(log.index(" BATCH_OPEN_RECONCILED batch=1 "), log.index(" CLAIM_RELEASED batch=1 "), "the claim was released before the open was reconciled")
+        self.assertNotIn("QUIET:", " ".join(self.kinds()))
+        self.assertFalse(self.claim_path.exists())
+
+    def test_r3_an_open_the_agent_never_answers_is_typed_unreconciled_and_exits_11(self) -> None:
+        # Nothing answers the cancel: the run says so (exit 11, openCancel UNRECONCILED), its cancel file stays for the agent, and the ledger counts a full
+        # lease for it (the open may yet take one before the agent reads the cancel).
+        r = self.run_batch([self.specs[0]], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=12)), "-CancelReconcileSec", "3",
+                           FAKE_OPEN_MODES="gatehold")
+        self.assertEqual(r.returncode, 11, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["openCancel"]["requested"], b["openCancel"]["state"]), ("REQUESTED", "UNRECONCILED"))
+        self.assertTrue((self.share / "cancel" / f"{b['openJobId']}.cancel").exists(), "the cancel request stays for the agent")
+        self.assertEqual(b["ledger"]["basis"], "open-unreconciled")
+        self.assertEqual(batch_result(r.stdout)["stopReason"], "OPEN_CANCEL_UNRECONCILED")
+
+    def test_r3_a_leg_still_running_at_lease_end_is_killed_as_a_whole_tree_and_uncounted(self) -> None:
+        # sol r2 B2 at test scale: the leg is admitted with 63 s of lease left (>= the 60 s budget + 0 s margin; on Bachelor 360 + 120 = 480 s), then hangs
+        # past the lease's end. It is killed by the lease's end with its whole process tree, typed LEASE_EXPIRED (uncounted), its agent job is asked to
+        # cancel, and it is never re-run.
+        self.addCleanup(self._kill_fake_leg_pids)
+        r = self.run_batch([self.specs[0]], FAKE_LEASE_REMAIN="63", FAKE_LEG_MODES="hang")
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        [b] = self.batches()
+        [leg] = b["legs"]
+        self.assertEqual((leg["status"], leg["class"], leg["outcome"], leg["counted"], b["endReason"]), ("LEASE_EXPIRED", "LEASE_EXPIRED", "INVALID", False, "LEASE_EXPIRED"))
+        self.assertLessEqual(leg["legSec"], 66, "the leg ran past the lease's end")
+        self.assertEqual((b["legsAttempted"], b["legsRan"], b["legsCounted"]), (1, 0, 0))
+        leg_pid, gc_pid, job = (self.share / "fake-leg-pids.txt").read_text(encoding="utf-8").split()
+        for pid in (int(leg_pid), int(gc_pid)):
+            self.assertTrue(_wait_pid_gone(pid, 5), f"pid {pid} of the leg's process tree outlived the lease")
+        self.assertEqual((leg["jobId"], leg["cancel"]), (job, "REQUESTED"))
+        self.assertTrue((self.share / "cancel" / f"{job}.cancel").exists(), "the leg's agent job was not asked to cancel")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["counted"], res["notRun"], res["leaseExpired"]), (0, 0, 0, 1))
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("LEG:")]), 1, "a leg killed at the lease's end is never re-run")
+
+    def test_r3_a_leg_the_agent_stopped_at_its_lease_bound_is_typed_and_uncounted(self) -> None:
+        # The agent's own bound (lease-batch r3): a batch job still running at its lease's end, or on a demoted lease, is stopped and says why.
+        r = self.run_batch(self.specs, FAKE_LEG_STOPS="lease-end,demoted,none")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2, b3 = self.batches()
+        self.assertEqual([(b["legs"][0]["class"], b["legs"][0]["counted"], b["endReason"]) for b in (b1, b2)], [("LEASE_EXPIRED", False, "LEASE_EXPIRED"), ("LEASE_DEMOTED", False, "LEASE_DEMOTED")])
+        self.assertEqual((b3["legsCounted"], b3["endReason"]), (1, "ALL_LEGS_DONE"))
+
+    def test_r3_a_leg_process_that_exits_non_zero_is_leg_failed_never_counted_and_the_run_exits_7(self) -> None:
+        # fable r2 hardening: the LEG_FAILED path at run time, not only by the static scans.
+        r = self.run_batch(self.specs[:2], FAKE_LEG_MODES="exit3,ok")
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual([l["status"] for l in b["legs"]], ["LEG_FAILED", "RAN"])
+        self.assertEqual((b["legs"][0]["outcome"], b["legs"][0]["counted"], b["legs"][0]["legExit"]), ("INVALID", False, 3))
+        self.assertEqual((b["legsRan"], b["legsCounted"]), (1, 1))
+        res = batch_result(r.stdout)
+        self.assertEqual((res["failed"], res["ran"], res["counted"]), (1, 1, 1))
+
+    def test_r3_a_busy_probe_with_less_room_than_one_recheck_ends_the_batch_instead_of_spinning(self) -> None:
+        # fable r2 note: once the room left after the leg's budget is under -RecheckSec, a busy probe ends the batch (the leg goes to the next one)
+        # instead of re-probing back to back until the room runs out.
+        r = self.run_batch([self.specs[0]], "-RecheckSec", "30", FAKE_QUIET_MODES="COOLDOWN,QUIET", FAKE_LEASE_REMAIN="70,2700")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        b1, b2 = self.batches()
+        self.assertEqual((b1["endReason"], b1["probeRetries"], b1["legsAttempted"]), ("LEASE_REMAINING_SHORT", 1, 0))
+        self.assertIn("recheckSec=30", b1["endDetail"])
+        self.assertEqual((b2["legsCounted"], b2["endReason"]), (1, "ALL_LEGS_DONE"))
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("QUIET:")]), 2)
+
+    def test_r3_a_legs_own_exit_75_refusals_are_counted_into_the_batch_receipt(self) -> None:
+        # fable r2 hardening: a leg that took a fresh lease under the batch token carries its exit-75 refusals; the batch receipt counts them too.
+        r = self.run_batch([self.specs[0]], FAKE_LEG_REFUSALS="2")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["openExit75Refusals"], b["legExit75Refusals"], b["exit75Refusals"], b["exit75Class"]), (1, 2, 3, "WAIT_RETRY"))
+        self.assertEqual(b["legs"][0]["exit75Refusals"], 2)
+
+    def _kill_fake_leg_pids(self) -> None:
+        p = self.share / "fake-leg-pids.txt"
+        if p.exists():
+            for tok in p.read_text(encoding="utf-8").split()[:2]:
+                try:
+                    os.kill(int(tok), signal.SIGTERM)
+                except (OSError, ValueError):
+                    pass
 
     # ---------------------------------------------------------------- the job-id contract with the agent
     def test_invoke_venue_leg_tags_its_job_with_the_batch_token_the_agent_reads(self) -> None:

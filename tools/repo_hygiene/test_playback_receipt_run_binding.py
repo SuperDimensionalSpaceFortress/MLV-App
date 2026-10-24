@@ -720,9 +720,11 @@ CONSUMER_FAILING_ACTION: dict[str, tuple[tuple[str, int], ...]] = {
         (r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{\s*"
          r"(?P<act>Add-Result\s+\$leg\s+'LEG_FAILED'\s+@\{[^\n]*outcome\s*=\s*'INVALID'[^\n]*\})", 1),),
     # BACHELOR-LEASE-BATCH-LEGS-1: the same rule inside one quiet lease per batch: a leg that exited non-zero is recorded LEG_FAILED / INVALID (never RAN, never
-    # counted) in the batch and the run results, and the run exits 7.
+    # counted) in the batch and the run results, and the run exits 7. r3 (sol r2 B2): the leg is a bounded child (killed with its tree at the lease's end), so its
+    # exit code is the child's own ($lp.exit from Invoke-VenueBoundedProcess on the leg script), not $LASTEXITCODE.
     "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1": (
-        (r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{\s*"
+        (r"\$lp\s*=\s*Invoke-VenueBoundedProcess\s+-FilePath\s+\$pwshExe\s+-ArgumentList\s+\$lArgs\b[^\n]*\n[\s\S]*?\$legCode\s*=\s*\$lp\.exit\b"
+         r"[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{\s*"
          r"(?P<act>\$row\s*=\s*\[ordered\]@\{[^\n]*status\s*=\s*'LEG_FAILED';\s*outcome\s*=\s*'INVALID'[^\n]*\}\s*"
          r"\$b\.legs\.Add\(\[pscustomobject\]\$row\);\s*Add-Result\s+\$leg\s+'LEG_FAILED'\s+\$row)", 1),),
     # UM-REGULAR-BASELINE-1 r3: a chain that did not end on its own with a documented exit that agrees with its CHAIN_RESULT gives its legs the
