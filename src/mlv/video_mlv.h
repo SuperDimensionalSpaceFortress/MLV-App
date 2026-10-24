@@ -276,8 +276,8 @@ uint64_t getMlvLlrawprocSettingsFingerprint(mlvObject_t * video);
 
 /* CPU-DUALISO-AT-PREVIEW-SCALE-1: phase-3 dual-ISO reconstruction at the
  * playback preview scale. The recon worker reconstructs a Bayer shrunk by the
- * Phase 4B kernels (pl_downsample_bayer_to_bayer_{2,4,8}x keep whole 4-row ISO
- * blocks) instead of the full sensor, and the process stage debayers it at that
+ * phase tent at x2/x4 (centred same-ISO-class bins) or the Phase 4B x8 kernel
+ * (whole 4-row ISO blocks) instead of the full sensor, and the process stage debayers it at that
  * size. Playback only: export and full-quality entries never call these.
  * CPU-DUALISO-REDUCED-ISO-NOTCH-1: the CPU reduced recon ends with the reduced
  * ISO-period notch (LLRP_WITH_DIMS_REDUCED_ISO_NOTCH), as the CUDA one does. */
@@ -291,8 +291,8 @@ typedef struct
     int reducedHeight;
     int fullResFixes;       /* focus/bad pixel fixes run at full res first (stripes/pattern noise are inert on dual ISO) */
     const char * reason;    /* "none" when reduced, otherwise why full resolution */
-    int phaseTentShrink;    /* 1: shrink with pl_downsample_bayer_to_bayer_phase_tent (GPU
-                             * plan only); 0: the Phase 4B decimators (CPU plan) */
+    int phaseTentShrink;    /* 1: shrink with pl_downsample_bayer_to_bayer_phase_tent (both
+                             * plans, x2/x4); 0: the Phase 4B decimator (x8) */
 } mlvDualIsoPreviewScaleRecon_t;
 
 /* Process-wide counters of the phase-tent shrink (successful shrinks and their summed
@@ -477,6 +477,7 @@ int getMlvLastProcessed8CacheHitScaleFactor(void);
 int getMlvLastProcessed8PrefetchHit(void);
 int getMlvProcessed8PrefetchEnabledForTesting(const mlvObject_t * video);
 int mlvWaitForProcessed8PrefetchIdleForTesting(mlvObject_t * video, uint32_t timeout_ms);
+void mlvSetProcessed8PrefetchPrepareFailuresForTesting(mlvObject_t * video, int count);
 void mlvSetProcessed8PrefetchPauseBeforeStoreForTesting(mlvObject_t * video, int enabled);
 int mlvWaitForProcessed8PrefetchPausedBeforeStoreForTesting(mlvObject_t * video,
                                                             uint32_t timeout_ms);
@@ -523,6 +524,10 @@ void mlv_phase4bv_reset_env_cache_for_testing(void);
  * Needs memory to return to, sized: sizeof(float) * getMlvHeight(urvid) * getMlvWidth(urvid)
  * Output values will be in range 0-65535 (16 bit), float is only because AMAzE uses it */
 int getMlvRawFrameUint16(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame);
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1: getMlvRawFrameUint16 without the LJ92 prefetch ring -- never served from
+ * it, never stored into it and never schedules read-ahead -- so a throwaway decode (the paused recon warm run) leaves
+ * no frame a later request could hit. Same return contract (0 = ok). */
+int getMlvRawFrameUint16Uncached(mlvObject_t * video, uint64_t frameIndex, uint16_t * unpackedFrame);
 int getMlvRawFrameProcessedUint16Direct(mlvObject_t * video,
                                         uint64_t frameIndex,
                                         uint16_t * outputFrame,

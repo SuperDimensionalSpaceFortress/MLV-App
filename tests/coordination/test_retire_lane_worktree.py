@@ -8,8 +8,10 @@ import base64
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -42,8 +44,28 @@ def _git(cwd, *args):
     subprocess.run([GIT, "-C", str(cwd), *args], check=True, capture_output=True, text=True)
 
 
+# COST (CI-SHARD8-GUARDRAILS-COST-1): the repository below took eight git processes to build and was rebuilt for
+# each of this file's ~125 cases. It is now built once per pytest session by `_build_repo` (body unchanged) and
+# each case gets a private copy of that directory tree; the one absolute path a copy carries, main's `origin` url,
+# is repointed at the copy's own bare remote.
+_REPO_TEMPLATE = {}
+
+
 @pytest.fixture()
-def repo(tmp_path):
+def repo(tmp_path, tmp_path_factory):
+    if "dir" not in _REPO_TEMPLATE:
+        template = tmp_path_factory.mktemp("retire-repo-template")
+        _build_repo(template)
+        _REPO_TEMPLATE["dir"] = template
+    remote = tmp_path / "remote.git"
+    main = tmp_path / "main"
+    shutil.copytree(_REPO_TEMPLATE["dir"] / "remote.git", remote)
+    shutil.copytree(_REPO_TEMPLATE["dir"] / "main", main)
+    _git(main, "remote", "set-url", "origin", str(remote))
+    return tmp_path, main
+
+
+def _build_repo(tmp_path):
     remote = tmp_path / "remote.git"
     main = tmp_path / "main"
     _git(tmp_path, "init", "--bare", "-b", "master", str(remote))
@@ -485,14 +507,15 @@ def _stop(p):
     p.wait(timeout=30)
 
 
-def _gate_real(workdir, *, whatif=True, prelude=""):
-    """Gate with the REAL process snapshot. Returns (disposition, stderr). `prelude` runs after the helper is dot-sourced."""
+def _gate_real(workdir, *, whatif=True, prelude="", extra=""):
+    """Gate with the REAL process snapshot. Returns (disposition, stderr). `prelude` runs after the helper is dot-sourced; `extra` is
+    appended to the Invoke-RetireLaneWorktree arguments."""
     quarantine = Path(workdir).parent / "q"
     script = (
         "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
         f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}{prelude} "
         f"Invoke-RetireLaneWorktree -WorkDir '{workdir}' -MergeTarget 'origin/master' -QuarantineRoot '{quarantine}'"
-        f"{' -WhatIf' if whatif else ''} | ConvertTo-Json -Depth 4"
+        f"{' -WhatIf' if whatif else ''}{extra} | ConvertTo-Json -Depth 4"
     )
     r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
                        check=True, capture_output=True, text=True)
@@ -604,6 +627,900 @@ def test_holder_exit_releases_the_worktree_for_real_retirement(repo):
     assert not wt.exists()
 
 
+# --- CI-FLAKE-RETIRE-HOLDER-EXIT-PERMISSION-DENIED-1: a handle that outlives the holder's gate-visible life ---
+# 2026-10-17 PR #481 windows shard 8/8 (run 39049834615, job 117460346707): the holder had exited and the gate saw no holder, but Windows
+# still held a handle inside the worktree when `git worktree remove` ran: "failed to delete ...\wt-release: Permission denied".
+# git half-fails there (the worktree is deregistered, its files stay), so the same command cannot be re-run; the tool must finish the
+# removal itself, bounded, keyed to the access-denied / sharing-violation condition, and report `retired` only with the directory gone.
+
+def _spawn_file_handle_holder(path, ready, release, tmp, trigger=None, mode="Open", access="Read", share="Read"):
+    """A child that opens `path` (default: read, no delete share) and keeps it open until `release` exists. The path goes in the
+    ENVIRONMENT, not on the command line, so the gate (which reads command lines and cwds) does not see a holder, exactly
+    like a handle that outlives its process's visibility.
+    r7 (rename probe): a handle open BEFORE the gate runs now keeps the worktree as in-use (the rename is refused), so the cases that
+    exercise the removal RETRY need the handle to appear AFTER the rename. With `trigger` the child waits for that file, then opens
+    `path` (the renamed location) and writes `ready`; the caller does not wait for it (see _handle_appears_after_the_rename).
+    r4 (sol r2 hardening on PR #603): the wait for `trigger` is bounded (60 s) and also ends on `release`, so a retirement that returns
+    before the rename never leaves the child polling; callers clean up with _finish_holder, which kills a child that does not exit.
+    r5: mode / access / share are the [IO.File]::Open arguments (share 'ReadWrite, Delete' = a holder that allows deletion; mode
+    'OpenOrCreate', share 'None' = a live operation holding a rename record's owner.lock)."""
+    script = (("$w = [Diagnostics.Stopwatch]::StartNew(); while (-not (Test-Path -LiteralPath $env:HOLD_TRIGGER)) { "
+               "if ((Test-Path -LiteralPath $env:HOLD_RELEASE) -or $w.Elapsed.TotalSeconds -ge 60) { exit 0 }; Start-Sleep -Milliseconds 20 }; "
+               if trigger else "")
+              + "$f = [IO.File]::Open($env:HOLD_FILE, $env:HOLD_MODE, $env:HOLD_ACCESS, $env:HOLD_SHARE); "
+              "[IO.File]::WriteAllText($env:HOLD_READY, 'open'); "
+              "$t = [Diagnostics.Stopwatch]::StartNew(); "
+              "while (-not (Test-Path -LiteralPath $env:HOLD_RELEASE) -and $t.Elapsed.TotalSeconds -lt 90) { Start-Sleep -Milliseconds 50 }; "
+              "$f.Dispose()")
+    env = dict(os.environ, HOLD_FILE=str(path), HOLD_READY=str(ready), HOLD_RELEASE=str(release), HOLD_TRIGGER=str(trigger or ""),
+               HOLD_MODE=mode, HOLD_ACCESS=access, HOLD_SHARE=share)
+    p = subprocess.Popen([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], cwd=str(tmp), env=env,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if trigger:
+        return p
+    try:
+        deadline = datetime.datetime.now() + datetime.timedelta(seconds=60)
+        while not Path(ready).exists():
+            assert p.poll() is None and datetime.datetime.now() < deadline, "holder child did not open the file"
+            time.sleep(0.05)
+    except BaseException:
+        _finish_holder(p, release)
+        raise
+    return p
+
+
+def _finish_holder(p, release):
+    """Let a holder child go and reap it. A child still alive after 60 s is killed, so no case can leak a pwsh process."""
+    try:
+        Path(release).write_text("go")
+        p.wait(timeout=60)
+    finally:
+        if p.poll() is None:
+            p.kill()
+            p.wait(timeout=30)
+
+
+def _handle_appears_after_the_rename(trigger, ready):
+    """Prelude: wraps the rename seam. Right after the rename to <root>.retiring succeeds it creates `trigger` (the holder child opens its
+    file in the renamed directory) and waits for `ready`, so a handle exists by the time the removal runs, as one that outlives its
+    holder (a scanner, an indexer) does. The rename BACK is passed through untouched."""
+    return ("$origMoveRoot = ${function:Move-LaneWorktreeRoot}; "
+            "function Move-LaneWorktreeRoot { param([string]$From, [string]$To) $e = & $origMoveRoot -From $From -To $To; "
+            f"if (-not $e -and $To -like '*.retiring') {{ [IO.File]::WriteAllText('{trigger}', 'go'); $t = [Diagnostics.Stopwatch]::StartNew(); "
+            f"while (-not (Test-Path -LiteralPath '{ready}') -and $t.Elapsed.TotalSeconds -lt 30) {{ Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds 20 }} }}; $e }}; ")
+
+
+# The retry window scans the host again before EVERY attempt (r2), and a long-lived host pwsh caught exiting mid-scan reads as
+# cwd-unknown (relative-script-unresolved) and refuses a removal, by design (reproduced 1 in 4 in isolation). These cases are about the
+# TEST'S OWN holders, so their snapshot is limited to pytest's direct children; the real-holder children are all that matters to them.
+ONLY_PYTEST_CHILDREN = (
+    "$origChildrenOnly = ${function:Get-LaneProcessSnapshot}; "
+    "function Get-LaneProcessSnapshot { $s = & $origChildrenOnly; "
+    "[pscustomobject]@{ Procs = @($s.Procs | Where-Object { $_.ParentProcessId -eq " + str(PYTEST_PID) + " }); SelfPids = $s.SelfPids; CapturedUtc = $s.CapturedUtc } }; "
+)
+
+
+def _release_on_first_wait(release, budget_ms=20000, delay_ms=50):
+    """Prelude: the tool's own first back-off creates `release`, so the child's handle drops (and the child exits) after the
+    first failed removal. No timing guess: a tool that never waits never lets go, and stays red."""
+    return (ONLY_PYTEST_CHILDREN + f"$script:RemoveRetryBudgetMs = {budget_ms}; $script:RemoveRetryDelayMs = {delay_ms}; "
+            "function Start-Sleep { param([int]$Milliseconds = 0, [double]$Seconds = 0) "
+            f"if (-not (Test-Path -LiteralPath '{release}')) {{ [IO.File]::WriteAllText('{release}', 'go') }}; "
+            "Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds ([Math]::Max($Milliseconds, 400)) }; ")
+
+
+def test_a_handle_that_outlives_the_holder_is_waited_out_and_the_worktree_is_really_retired(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-handle")
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=_release_on_first_wait(release) + _handle_appears_after_the_rename(trigger, ready))
+    finally:
+        _finish_holder(p, release)
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert not wt.exists() and not _retiring_of(wt).exists(), "retired must mean the directory is gone"
+    assert d["removeAttempts"] >= 2 and d["removeNotes"], d
+
+
+def _release_on_first_failed_rename_back(release):
+    """Prelude: wraps the rename seam. The first rename BACK that fails (the late handle still open) creates `release`, so the holder lets
+    go while the tool is still inside its rename-back budget. A tool that tries the rename back only once never sees it drop."""
+    return ("$origMoveBack = ${function:Move-LaneWorktreeRoot}; "
+            "function Move-LaneWorktreeRoot { param([string]$From, [string]$To) $e = & $origMoveBack -From $From -To $To; "
+            f"if ($e -and $From -like '*.retiring' -and -not (Test-Path -LiteralPath '{release}')) {{ [IO.File]::WriteAllText('{release}', 'go') }}; $e }}; ")
+
+
+def _assert_back_at_its_own_path(main, wt):
+    """The acceptance end state of a kept worktree after a rename probe: at its own path, registered there, usable, no .retiring."""
+    assert wt.exists() and (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be back at its own path"
+    assert not _retiring_of(wt).exists(), "no .retiring directory may be left behind"
+    paths = _worktree_paths(main)
+    assert _norm(wt) in paths and not any(p.endswith(".retiring") for p in paths), paths
+    st = subprocess.run([GIT, "-C", str(wt), "status", "--porcelain"], capture_output=True, text=True)
+    assert st.returncode == 0 and st.stdout.strip() == "", (st.returncode, st.stdout, st.stderr)
+    assert _pending_records(main) == [], "a settled rename leaves no rename record"
+
+
+def _pending_records(main):
+    root = Path(main) / ".git" / "mlv-retire-pending"
+    return sorted(os.listdir(root)) if root.exists() else []
+
+
+def _strand_with_a_late_handle(wt, tmp, restore_budget_ms):
+    """Rename ok -> a handle opens beneath <wt>.retiring and is still open through the removal budget AND the rename-back budget.
+    Returns (disposition, stderr, holder, release); the holder is still holding."""
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
+    try:
+        d, err = _gate_real(wt, whatif=False, prelude=ONLY_PYTEST_CHILDREN + "$script:RemoveRetryBudgetMs = 1500; $script:RemoveRetryDelayMs = 100; "
+                            f"$script:RestoreRetryBudgetMs = {restore_budget_ms}; $script:RestoreRetryDelayMs = 100; "
+                            + _handle_appears_after_the_rename(trigger, ready))
+    except BaseException:
+        _finish_holder(p, release)
+        raise
+    return d, err, p, release
+
+
+def test_a_late_handle_that_fails_the_removal_is_waited_out_by_the_rename_back(repo):
+    """NEW CATALOGUE ROW (sol r2 blocker on PR #603): successful rename -> persistent late handle beneath .retiring -> failed removal.
+    The handle outlives the whole removal budget, so the removal fails (git half-removes: deregistered, `.git` link gone, files left);
+    it lets go while the rename back is being retried. End state: kept / remove-failed, back at its own path, registered and clean."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-late-restore")
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=ONLY_PYTEST_CHILDREN + "$script:RemoveRetryBudgetMs = 1500; $script:RemoveRetryDelayMs = 100; "
+                          "$script:RestoreRetryBudgetMs = 15000; $script:RestoreRetryDelayMs = 300; "
+                          + _handle_appears_after_the_rename(trigger, ready) + _release_on_first_failed_rename_back(release))
+    finally:
+        _finish_holder(p, release)
+    assert d["action"] == "kept" and d["reason"].startswith("remove-failed: "), d
+    assert "attempt" in d["reason"] and d["removeAttempts"] >= 2, d
+    assert d["renameRestore"]["state"] == "restored" and d["renameRestore"]["attempts"] >= 2, d
+    assert "admin entry restored" in d["renameRestore"]["note"], d   # git had half-removed it; the registration is back too
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_a_handle_that_outlives_the_rename_back_budget_is_restored_first_by_the_next_sweep(repo):
+    """The same row, with a handle that outlives the rename-back budget too: this call cannot put it back, says so loudly, and leaves a
+    rename record; once the handle is gone the NEXT sweep restores <wt>.retiring to <wt> before any gate decision (registration and the
+    files git had deleted included), and only then judges the worktree at its own path."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-stuck")
+    d, err, p, release = _strand_with_a_late_handle(wt, tmp, restore_budget_ms=800)
+    _finish_holder(p, release)
+    assert d["action"] == "kept" and d["reason"].startswith("remove-failed: "), d
+    assert d["renameRestore"]["state"] == "failed" and d["renameRestore"]["attempts"] >= 2, d
+    assert "rename back" in d["renameRestore"]["note"] and "next sweep" in d["renameRestore"]["note"], d
+    assert "LEFT-RETIRING" in err, err
+    assert _retiring_of(wt).exists() and not wt.exists() and len(_pending_records(main)) == 1
+    # -WhatIf renames nothing, not even back: it only reports the stranded tree.
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"), WhatIf=True)
+    assert [r["state"] for r in s["strandedRestore"]] == ["not-run: WhatIf"] and _retiring_of(wt).exists(), s
+    # A real sweep restores it before any candidate is read. r5 (H1): the restore now counts against -BudgetSeconds (see
+    # test_restore_first_counts_against_the_sweep_budget), so the restored tree is kept from the gate by the young guard instead.
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=24, QuarantineRoot=str(tmp / "q"))
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and _norm(rows[0]["original"]) == _norm(wt) and rows[0]["state"] == "restored", s
+    assert "admin entry restored" in rows[0]["note"] and "status clean" in rows[0]["note"], rows   # git had half-removed it
+    assert s["retired"] == [] and s["young"] == 1, s   # judged at its own path in the same sweep (listed there, not as .retiring)
+    _assert_back_at_its_own_path(main, wt)
+    d, _ = _gate_real(wt, whatif=True)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d   # judged at its own path once restored: clean and merged
+
+
+def _strand_registered(main, wt):
+    """A cheap stranded state with git still registering the tree (at <wt>.retiring): a LOCKED worktree makes `git worktree remove` refuse
+    up front (nothing deleted), and a seam makes every rename back fail with a sharing violation."""
+    _git(main, "worktree", "lock", "--reason", "strand-test", str(wt))
+    # ONLY_PYTEST_CHILDREN: this fixture is about the rename back, not the host; an unrelated live pwsh whose cwd cannot be read would otherwise
+    # refuse the removal as cwd-unknown here, in setup, before any case reaches the behaviour it is written for.
+    prelude = (ONLY_PYTEST_CHILDREN + "$script:RestoreRetryBudgetMs = 300; $script:RestoreRetryDelayMs = 50; $origMoveSeam = ${function:Move-LaneWorktreeRoot}; "
+               "function Move-LaneWorktreeRoot { param([string]$From, [string]$To) if ($From -like '*.retiring') { "
+               "return 'The process cannot access the file because it is being used by another process. (seam)' }; & $origMoveSeam -From $From -To $To }; ")
+    d, _ = _gate_real(wt, whatif=False, prelude=prelude)
+    assert d["action"] == "kept" and d["reason"].startswith("remove-failed: "), d
+    assert d["renameRestore"]["state"] == "failed" and d["renameRestore"]["attempts"] >= 2, d
+    assert _retiring_of(wt).exists() and not wt.exists()
+    _git(main, "worktree", "unlock", str(_retiring_of(wt)))
+
+
+def test_the_next_call_for_a_stranded_worktree_restores_it_before_the_gate(repo):
+    """Per candidate: the next Invoke-RetireLaneWorktree for <wt> finds <wt>.retiring and its rename record, restores it first (receipt
+    field strandedRestore), and only then runs the gate on <wt>."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-strand-call")
+    _strand_registered(main, wt)
+    d, _ = _gate_real(wt, whatif=True)
+    assert d["strandedRestore"]["state"] == "not-run: WhatIf" and d["reason"].startswith("stranded-retiring: "), d
+    assert _retiring_of(wt).exists() and not wt.exists(), "-WhatIf renames nothing"
+    d, _ = _gate_real(wt, whatif=False)
+    assert d["strandedRestore"]["state"] == "restored", d
+    # restored first, then the whole gate ran on <wt> itself: rename probe, removal, nothing left under either name
+    assert (d["action"], d["reason"], d["renameProbe"]) == ("retired", "ok", "ok"), d
+    assert not wt.exists() and not _retiring_of(wt).exists()
+    assert not any(p.startswith(_norm(wt)) for p in _worktree_paths(main)) and _pending_records(main) == [], _worktree_paths(main)
+
+
+def test_a_stranded_retiring_whose_original_path_exists_again_is_refused_and_left_alone(repo):
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-strand-taken")
+    _strand_registered(main, wt)
+    wt.mkdir()
+    (wt / "newcomer.txt").write_text("someone else's", encoding="utf-8")
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"))
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "refused" and "exists again" in rows[0]["note"], s
+    assert (wt / "newcomer.txt").read_text(encoding="utf-8") == "someone else's" and sorted(os.listdir(wt)) == ["newcomer.txt"]
+    assert (_retiring_of(wt) / ".git").exists() and (_retiring_of(wt) / "a.txt").exists(), "the .retiring tree must be untouched"
+    assert s["retired"] == [] and s["kept"] == {"stranded-retiring": 1}, s   # the listed .retiring entry is never gated
+
+
+def test_a_retiring_directory_this_tool_did_not_rename_is_never_restored_or_gated(repo):
+    tmp, main = repo
+    wt = tmp / "wt-strand-foreign"
+    _retiring_of(wt).mkdir()
+    (_retiring_of(wt) / "marker.txt").write_text("not ours", encoding="utf-8")
+    d, _ = _gate_real(wt, whatif=False, extra=f" -RepoRoot '{main}'")
+    assert d["action"] == "kept" and d["reason"].startswith("stranded-retiring: ") and "no rename record" in d["reason"], d
+    assert d["strandedRestore"]["state"] == "refused", d
+    assert not wt.exists() and (_retiring_of(wt) / "marker.txt").read_text(encoding="utf-8") == "not ours"
+    d2, _ = _gate_real(_retiring_of(wt), whatif=False)
+    assert d2["action"] == "kept" and d2["reason"].startswith("stranded-retiring: "), d2
+    assert (_retiring_of(wt) / "marker.txt").exists()
+
+
+# --- r5 (fable r4 + sol r4 blocker on PR #603): a rename record belongs to the operation that wrote it until that operation decides ---
+# Two lane exits sweep at once (Invoke-Lane.ps1 runs one per exit, no mutex) and the fair order gives both the same first candidate. A renames
+# X to X.retiring and its removal half-fails on a late handle; while A backs off, B's restore-first read A's record, moved X.retiring back
+# and deleted the record, and A then reported retired/ok because its path was gone, with X present and registered. The record now carries
+# owner.lock, held open (FileShare.None) by the operation from before the rename until its final decision; a restorer must claim it first.
+
+def _two_sweep_prelude(release, holder_pid, b_script):
+    """Prelude for A: at its FIRST removal back-off the late handle is let go (and its process reaped), then sweep B runs to completion as a
+    separate process, exactly inside A's window. No timing guess: B runs while A is provably between two removal attempts."""
+    return (ONLY_PYTEST_CHILDREN + "$script:RemoveRetryBudgetMs = 20000; $script:RemoveRetryDelayMs = 50; $script:BRan = $false; "
+            "function Start-Sleep { param([int]$Milliseconds = 0, [double]$Seconds = 0) if (-not $script:BRan) { $script:BRan = $true; "
+            f"[IO.File]::WriteAllText('{release}', 'go'); Wait-Process -Id {holder_pid} -Timeout 60 -ErrorAction SilentlyContinue; "
+            f"& '{PWSH}' -NoProfile -NonInteractive -File '{b_script}' | Out-Null }}; "
+            "Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds $Milliseconds }; ")
+
+
+def test_an_overlapping_sweep_never_restores_a_live_retirements_record(repo):
+    """Acceptance (both keys' catalogue row): overlapping sweeps with a live pending record. B never restores A's rename or deletes its
+    record (its row says 'owned'), A never reports retired while X is present or registered, and no deregistered orphan or record is left."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-overlap")
+    b_out, b_script = tmp / "b-sweep.json", tmp / "b-sweep.ps1"
+    b_script.write_text(
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}"
+        f"Invoke-SweepMergedLaneWorktrees -RepoRoot '{main}' -Root '{root}' -MergeTarget 'origin/master' -MinIdleHours 0 "
+        f"-QuarantineRoot '{tmp / 'q'}' | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath '{b_out}' -Encoding utf8\n", encoding="utf-8")
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=_two_sweep_prelude(release, p.pid, b_script) + _handle_appears_after_the_rename(trigger, ready))
+    finally:
+        _finish_holder(p, release)
+    b = json.loads(b_out.read_text(encoding="utf-8-sig"))
+    rows = b["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "owned" and _norm(rows[0]["original"]) == _norm(wt), b   # B left A's record alone
+    assert b["retired"] == [], b
+    assert d["removeAttempts"] >= 2, d   # B really ran inside A's removal retry window
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert not wt.exists() and not _retiring_of(wt).exists(), "retired must mean neither path exists"
+    assert not any(p_.startswith(_norm(wt)) for p_ in _worktree_paths(main)), _worktree_paths(main)
+    assert _pending_records(main) == [], "the owner settles its own record"
+
+
+def test_a_tree_moved_back_by_another_operation_during_the_removal_is_never_reported_retired(repo):
+    """(b) The retry loop used to declare retired whenever its .retiring path was gone, whoever moved it. An actor that ignores the owner
+    lock (an older copy of this tool) moves X.retiring back to X in A's back-off: A keeps it (cannot-determine, 'exists again'), re-registers
+    the tree from its own record (git had half-removed it) and leaves it at its own path, registered and clean."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-moved-back")
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
+    prelude = (ONLY_PYTEST_CHILDREN + "$script:RemoveRetryBudgetMs = 20000; $script:RemoveRetryDelayMs = 50; $script:Moved = $false; "
+               "function Start-Sleep { param([int]$Milliseconds = 0, [double]$Seconds = 0) if (-not $script:Moved) { $script:Moved = $true; "
+               f"[IO.File]::WriteAllText('{release}', 'go'); Wait-Process -Id {p.pid} -Timeout 60 -ErrorAction SilentlyContinue; "
+               f"[IO.Directory]::Move('{_retiring_of(wt)}', '{wt}') }}; Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds $Milliseconds }}; "
+               + _handle_appears_after_the_rename(trigger, ready))
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=prelude)
+    finally:
+        _finish_holder(p, release)
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: ") and "exists again" in d["reason"], d
+    assert d["renameRestore"]["state"] == "restored", d
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_a_record_whose_owner_lock_is_held_is_never_restored_and_is_restored_once_released(repo):
+    """The claim itself: a live process holds the record's owner.lock (FileShare.None). The sweep reports the record 'owned' and touches
+    neither path nor the record; once the holder lets go (exit or crash, the OS closes the handle) the next sweep restores it."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-owned")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    assert len(recs) == 1, recs
+    lock = Path(main) / ".git" / "mlv-retire-pending" / recs[0] / "owner.lock"
+    ready, release = tmp / "lock.ready", tmp / "lock.release"
+    p = _spawn_file_handle_holder(lock, ready, release, tmp, mode="OpenOrCreate", access="ReadWrite", share="None")
+    try:
+        s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=24, QuarantineRoot=str(tmp / "q"))
+    finally:
+        _finish_holder(p, release)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "owned" and "live operation" in rows[0]["note"], s
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing may be touched"
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=24, QuarantineRoot=str(tmp / "q"))
+    assert [r["state"] for r in s["strandedRestore"]] == ["restored"], s
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_restore_first_counts_against_the_sweep_budget(repo):
+    """H1 (RETIRE-RESTORE-FIRST-BUDGET-1): restore-first ran outside -BudgetSeconds, so N stranded records with persistent handles cost
+    N x 15 s per lane exit. With the budget spent, a record is not restored: typed row, record and tree kept for the next sweep."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-budget")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=0, QuarantineRoot=str(tmp / "q"), BudgetSeconds=0)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "not-reached: budget" and rows[0]["attempts"] == 0, s
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "a budget stop keeps the record"
+
+
+def test_a_failed_repair_after_a_good_rename_back_is_restored_unrepaired_and_retried(repo):
+    """H2 (RETIRE-RESTORE-REPAIR-FAILED-STATE-1): the rename back works but `git worktree repair` fails. That is not 'restored': the state is
+    restored-unrepaired and the record stays. The next sweep sees no .retiring but recognises its own tree at the original path, repairs it
+    and drops the record, instead of marking it gone and leaving the tree unregistered."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-unrepaired")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}"
+        "function Repair-LaneWorktreePath { param([string]$Main, [string]$Path) 'git worktree repair: seam failure' }; "
+        f"Invoke-SweepMergedLaneWorktrees -RepoRoot '{main}' -Root '{root}' -MergeTarget 'origin/master' -MinIdleHours 24 "
+        f"-QuarantineRoot '{tmp / 'q'}' | ConvertTo-Json -Depth 5")
+    s = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, text=True).stdout)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "restored-unrepaired" and "seam failure" in rows[0]["note"], s
+    assert wt.exists() and not _retiring_of(wt).exists() and _pending_records(main) == recs, "the record stays until the repair succeeds"
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=24, QuarantineRoot=str(tmp / "q"))
+    assert [r["state"] for r in s["strandedRestore"]] == ["restored"], s
+    _assert_back_at_its_own_path(main, wt)
+
+
+def _sweep_script(main, root, tmp, prelude=""):
+    return ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+            f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}{prelude}"
+            f"Invoke-SweepMergedLaneWorktrees -RepoRoot '{main}' -Root '{root}' -MergeTarget 'origin/master' -MinIdleHours 24 "
+            f"-QuarantineRoot '{tmp / 'q'}' | ConvertTo-Json -Depth 5")
+
+
+def test_a_half_removed_tree_whose_first_repair_fails_is_re_checked_out_by_the_retry(repo):
+    """Dot R18 B1 on PR #603 (RETIRE-RESTORE-PENDING-CHECKOUT-PERSIST-1): git half-removed the tree (admin entry, `.git` link and tracked
+    files deleted). The first restore re-creates the admin entry and the link, then its repair fails: restored-unrepaired, record kept. The
+    retry finds both present, so a re-registration flag local to one call said nothing was owed and checkout-index never ran: 'restored'
+    and the record dropped with the tracked files still missing. The debt now lives in the record until the re-checkout has run."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-half-unrepaired")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    ret = _retiring_of(wt)
+    # What a half-failed `git worktree remove` leaves: the admin entry and the `.git` link gone, tracked files deleted.
+    shutil.rmtree(_admin_dir(main, wt))   # named at `worktree add` time; the rename does not change it
+    for f in (".git", "a.txt", ".gitignore"):
+        (ret / f).unlink()
+    seam = "function Repair-LaneWorktreePath { param([string]$Main, [string]$Path) 'git worktree repair: seam failure' }; "
+    s = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", _sweep_script(main, root, tmp, seam)],
+                                  check=True, capture_output=True, text=True).stdout)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "restored-unrepaired" and "seam failure" in rows[0]["note"], s
+    assert "admin entry restored" in rows[0]["note"] and ".git link rewritten" in rows[0]["note"], rows
+    assert wt.exists() and not ret.exists() and _pending_records(main) == recs, "the record stays until the repair succeeds"
+    assert not (wt / "a.txt").exists(), "the fixture must leave the tracked files missing into the retry"
+    rec = json.loads((Path(main) / ".git" / "mlv-retire-pending" / recs[0] / "record.json").read_text(encoding="utf-8-sig"))
+    assert rec.get("checkoutOwed") is True, rec   # the debt outlives the call that incurred it
+    s = _sweep(main, Root=str(root), MergeTarget="origin/master", MinIdleHours=24, QuarantineRoot=str(tmp / "q"))
+    rows = s["strandedRestore"]
+    assert [r["state"] for r in rows] == ["restored"] and "status clean" in rows[0]["note"], s
+    assert (wt / "a.txt").exists() and (wt / ".gitignore").exists(), "every tracked file is back"
+    _assert_back_at_its_own_path(main, wt)
+
+
+def _git_failure_shim(log, flag, sub, cap=None):
+    """Prelude: a `git.exe` FUNCTION (PowerShell resolves a function before the executable, so the script's `& git.exe ...` lands here, no
+    seam in the script). While `flag` exists, a git call carrying the subcommand `sub` (status | checkout-index) appends a line to `log`,
+    exits 128 and prints a fatal line; every other call, and every call once `flag` is deleted, goes to the real git. `cap` shrinks
+    $script:RestoreCheckoutMaxAttempts (the owed-checkout attempt cap) so the capped case needs few sweeps."""
+    return ("$global:realGit = (Get-Command git.exe -CommandType Application | Select-Object -First 1).Source; "
+            + (f"$script:RestoreCheckoutMaxAttempts = {cap}; " if cap else "")
+            + "function git.exe { "
+            f"if ((Test-Path -LiteralPath '{flag}') -and (@($args) -contains '{sub}')) {{ "
+            f"[IO.File]::AppendAllText('{log}', '{sub}' + [Environment]::NewLine); $global:LASTEXITCODE = 128; 'fatal: seam failure'; return }}; "
+            "& $global:realGit @args }; ")
+
+
+def _owed_checkout_fixture(repo, name):
+    """A half-removed, stranded tree (admin entry, `.git` link and tracked files gone) with its rename record. Returns (tmp, main, root, wt, record dir)."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / name)
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    assert len(recs) == 1, recs
+    shutil.rmtree(_admin_dir(main, wt))
+    for f in (".git", "a.txt", ".gitignore"):
+        (_retiring_of(wt) / f).unlink()
+    return tmp, main, root, wt, Path(main) / ".git" / "mlv-retire-pending" / recs[0]
+
+
+def _sweep_with(main, root, tmp, prelude):
+    return json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", _sweep_script(main, root, tmp, prelude)],
+                                     check=True, capture_output=True, text=True).stdout)
+
+
+def _record_of(rec_dir):
+    return json.loads((rec_dir / "record.json").read_text(encoding="utf-8-sig"))
+
+
+@pytest.mark.parametrize("failing,files_back,note", [("status", True, "status after the re-checkout failed"),
+                                                     ("checkout-index", False, "checkout-index after the re-registration failed")])
+def test_a_git_failure_after_the_re_registration_keeps_the_owed_checkout_and_the_retry_settles_it(repo, failing, files_back, note):
+    """Dot R18 advisory 4e08bf9a on PR #632 (RETIRE-RESTORE-CHECKOUT-STATUS-FAILURE-FIXTURES-1, card A). The admin entry and link are
+    re-created and the repair works, then `git checkout-index -a` (or the `git status` after it) fails. The call is restored-unrepaired,
+    the record keeps checkoutOwed and survives, and a retry with git working re-checks the tree out and drops the record. COVERAGE: the
+    branch already behaves this way on c1e0da63; no committed fixture forced it."""
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, f"wt-git-{failing}")
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    s = _sweep_with(main, root, tmp, _git_failure_shim(log, flag, failing))
+    rows = s["strandedRestore"]
+    assert [r["state"] for r in rows] == ["restored-unrepaired"], s
+    assert note in rows[0]["note"], rows
+    assert "seam failure" in rows[0]["note"] and "re-checks it out" in rows[0]["note"], rows
+    assert log.read_text(encoding="utf-8").split() == [failing], "the shim must have forced exactly the one failure"
+    assert rec_dir.is_dir() and _record_of(rec_dir).get("checkoutOwed") is True, "the record and its debt survive the failure"
+    assert (wt / "a.txt").exists() is files_back, "checkout-index ran before the failing status, or never ran"
+    flag.unlink()
+    s = _sweep_with(main, root, tmp, _git_failure_shim(log, flag, failing))
+    rows = s["strandedRestore"]
+    assert [r["state"] for r in rows] == ["restored"] and "status clean" in rows[0]["note"], rows
+    assert (wt / "a.txt").exists() and (wt / ".gitignore").exists(), "every tracked file is back"
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_an_owed_checkout_that_keeps_failing_gives_up_visibly_after_the_cap_and_never_re_runs_git(repo):
+    """RETIRE-RESTORE-OWED-CHECKOUT-ATTEMPT-CAP-1 (card B; fable r1 hardening on PR #632). An owed re-checkout whose git call keeps failing
+    used to stay restored-unrepaired for ever, running both git calls on every later call or sweep. Each failing run now counts in
+    record.json (checkoutAttempts); the run that reaches the cap reports restored-checkout-gave-up, the record stays on disk as a visible
+    terminal state, and later sweeps report the same state WITHOUT running git again, even once git works."""
+    cap = 3
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-cap")
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap)
+    states = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0]["state"] for _ in range(cap)]
+    assert states == ["restored-unrepaired"] * (cap - 1) + ["restored-checkout-gave-up"], states
+    assert _record_of(rec_dir).get("checkoutAttempts") == cap and _record_of(rec_dir).get("checkoutOwed") is True
+    assert len(log.read_text(encoding="utf-8").split()) == cap
+    for working in (False, True):   # still failing, then git works again: terminal either way
+        if working:
+            flag.unlink()
+        s = _sweep_with(main, root, tmp, shim)
+        row = s["strandedRestore"][0]
+        assert row["state"] == "restored-checkout-gave-up" and "checkout-index -a" in row["note"] and str(rec_dir) in row["note"], s
+        assert rec_dir.is_dir(), "a terminal record is kept on disk, never silently dropped"
+    assert len(log.read_text(encoding="utf-8").split()) == cap, "no git call after the cap"
+    assert not (wt / "a.txt").exists(), "the tree is left as it is for the owner; nothing re-ran"
+
+
+RECORD_WRITE_FAILS = ("function Write-RetirePendingRecordFile { param([string]$Dir, [object]$Record) "
+                      "throw 'seam: record.json is held open by a reader' }; ")
+
+
+def _seed_record(rec_dir, **fields):
+    rec = _record_of(rec_dir)
+    rec.update(fields)
+    (rec_dir / "record.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+def test_a_record_write_that_fails_never_yields_a_terminal_claim_that_the_next_call_contradicts(repo):
+    """RETIRE-RESTORE-CHECKOUT-STATUS-FAILURE-FIXTURES-1 r2 (sol blocker on PR #645; catalogue row R-03: never claim terminal suppression while
+    later calls still execute git). checkoutOwed with 4 of 5 attempts recorded, git checkout-index failing, and record.json cannot be
+    rewritten (a reader holds it). The count used to be saved AFTER git ran: the failed save was only a note, the call still returned
+    restored-checkout-gave-up ('git is not run again'), and the next call ran git again from the unchanged count of 4. The count is now saved
+    BEFORE git runs; when that save fails git is not run at all and the state is the non-terminal restored-unrepaired, naming the save failure."""
+    cap = 5
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-save-fails")
+    _seed_record(rec_dir, checkoutOwed=True, checkoutAttempts=cap - 1)
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap) + RECORD_WRITE_FAILS
+    rows = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0] for _ in range(2)]
+    ran = len(log.read_text(encoding="utf-8").split()) if log.exists() else 0
+    assert not any(r["state"] == "restored-checkout-gave-up" for r in rows) or ran == 0, \
+        f"a terminal claim was made while git ran {ran} time(s): {rows}"
+    assert [r["state"] for r in rows] == ["restored-unrepaired"] * 2, rows
+    assert all("attempt count could not be saved" in r["note"] and "git was not run" in r["note"] for r in rows), rows
+    assert ran == 0, "an attempt that cannot be recorded is not made"
+    assert _record_of(rec_dir).get("checkoutAttempts") == cap - 1 and rec_dir.is_dir(), "the record is untouched and kept"
+
+
+def test_a_record_that_never_saves_cannot_run_git_for_ever_nor_lose_the_cap(repo):
+    """Opus hardening RETIRE-RESTORE-ATTEMPT-COUNT-PERSIST-FAIL-1 on PR #645: if the record cannot be written on any run, the count never
+    advanced past 1 and the cap never fired, so git re-ran on every call. Now git does not run while the count cannot be saved (bounded by
+    zero, not by the cap), every call says so, and once the record can be written again the cap counts from where it was and still fires."""
+    cap = 3
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-never-saves")
+    _seed_record(rec_dir, checkoutOwed=True)
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap)
+    states = []
+    for _ in range(cap + 2):
+        row = _sweep_with(main, root, tmp, shim + RECORD_WRITE_FAILS)["strandedRestore"][0]
+        states.append(row["state"])
+        assert "attempt count could not be saved" in row["note"], row
+    assert states == ["restored-unrepaired"] * (cap + 2), states
+    assert not log.exists() and "checkoutAttempts" not in _record_of(rec_dir), "no git call, nothing counted"
+    states = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0]["state"] for _ in range(cap)]   # the record can be written again
+    assert states == ["restored-unrepaired"] * (cap - 1) + ["restored-checkout-gave-up"], states
+    assert len(log.read_text(encoding="utf-8").split()) == cap and _record_of(rec_dir).get("checkoutAttempts") == cap
+
+
+def test_the_owed_checkout_attempt_cap_is_a_named_script_constant_of_five():
+    # Exact: a substring match also accepted 50 or 500.
+    assert re.search(r"(?m)^\$script:RestoreCheckoutMaxAttempts = 5\s*(#.*)?$", HELPER.read_text(encoding="utf-8"))
+
+
+def test_the_helper_requires_powershell_7():
+    """RETIRE-RESTORE-PWSH7-REQUIRES-PIN-1 (card C). Write-RetirePendingRecordFile calls [IO.File]::Move($src, $dst, $true), a .NET Core-only
+    overload; every caller (Invoke-Lane, Invoke-Workstream, Remove-LaneBulkScratch) starts under pwsh 7, so the file says so instead of
+    failing inside a restore under Windows PowerShell 5.1."""
+    text = HELPER.read_text(encoding="utf-8")
+    assert any(l.strip() == "#Requires -Version 7" for l in text.splitlines()), "missing '#Requires -Version 7'"
+    assert text.isascii()
+
+
+@pytest.mark.skipif(not shutil.which("powershell"), reason="requires Windows PowerShell 5.1")
+def test_dot_sourcing_the_helper_under_windows_powershell_5_1_is_refused_up_front():
+    r = subprocess.run([shutil.which("powershell"), "-NoProfile", "-NonInteractive", "-Command", f". '{HELPER}'"], capture_output=True, text=True)
+    assert r.returncode != 0 and "requires" in (r.stderr + r.stdout).lower(), (r.returncode, r.stdout, r.stderr)
+
+
+def _restore_with_snapshot(rec_dir, snapshot):
+    """Restore-LaneWorktreeRename as a sweep calls it: with the record it read BEFORE claiming (here, the JSON text in `snapshot`)."""
+    script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+              f". '{HELPER}'; $old = Get-Content -LiteralPath '{snapshot}' -Raw | ConvertFrom-Json; "
+              f"Restore-LaneWorktreeRename -Record $old -RecordDir '{rec_dir}' | ConvertTo-Json -Depth 5")
+    return json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, text=True).stdout)
+
+
+def _half_removed_with_a_snapshot(tmp, main, wt):
+    """A stranded, half-removed tree (as in the test above), plus a copy of its record.json as a sweep B reads it before any restore ran:
+    no checkoutOwed in it. Returns (record dir, snapshot path)."""
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    assert len(recs) == 1, recs
+    rec_dir = Path(main) / ".git" / "mlv-retire-pending" / recs[0]
+    shutil.rmtree(_admin_dir(main, wt))
+    for f in (".git", "a.txt", ".gitignore"):
+        (_retiring_of(wt) / f).unlink()
+    snapshot = tmp / "b-snapshot.json"
+    snapshot.write_text((rec_dir / "record.json").read_text(encoding="utf-8-sig"), encoding="utf-8")
+    assert "checkoutOwed" not in json.loads(snapshot.read_text(encoding="utf-8")), "B's snapshot predates the debt"
+    return rec_dir, snapshot
+
+
+def test_a_restore_holding_a_stale_snapshot_still_performs_the_checkout_owed_under_its_claim(repo):
+    """NEW CATALOGUE ROW (sol r1 blocker on PR #632): stale record snapshot before a debt update -> reload under the claim and perform the
+    owed checkout. Sweep B reads the record (no checkoutOwed). Restorer A then claims it, persists checkoutOwed, re-creates the admin entry
+    and the link, fails its repair and lets go. B claims with its OLD snapshot: admin and link exist and the repair succeeds, so deciding
+    from the snapshot skipped checkout-index, reported 'restored' and dropped the record with tracked files missing. Ordered by the test
+    itself, no sleeps: snapshot first, A's whole round second, B's restore third."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-stale-snapshot")
+    rec_dir, snapshot = _half_removed_with_a_snapshot(tmp, main, wt)
+    # A's round: a sweep whose repair fails. It persists the debt, re-creates admin entry and link, and releases its claim on exit.
+    seam = "function Repair-LaneWorktreePath { param([string]$Main, [string]$Path) 'git worktree repair: seam failure' }; "
+    s = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", _sweep_script(main, root, tmp, seam)],
+                                  check=True, capture_output=True, text=True).stdout)
+    assert [r["state"] for r in s["strandedRestore"]] == ["restored-unrepaired"], s
+    assert json.loads((rec_dir / "record.json").read_text(encoding="utf-8-sig")).get("checkoutOwed") is True
+    assert _admin_dir(main, wt).exists() and (wt / ".git").exists() and not (wt / "a.txt").exists(), "A left nothing to re-create"
+    # B: claims now, holding the snapshot it read before A's round.
+    r = _restore_with_snapshot(rec_dir, snapshot)
+    assert r["state"] == "restored" and "status clean" in r["note"], r   # checkout-index and status ran before the drop
+    assert (wt / "a.txt").exists() and (wt / ".gitignore").exists(), "the owed checkout ran: every tracked file is back"
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_a_record_unreadable_under_the_claim_fails_closed_and_is_kept(repo):
+    """r2 on PR #632: the record is re-read under the claim. Present but unparseable then is not decided from the caller's snapshot: the
+    restore fails closed, touches neither path, and the record stays."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-garbled")
+    rec_dir, snapshot = _half_removed_with_a_snapshot(tmp, main, wt)
+    (rec_dir / "record.json").write_text("{ not json", encoding="utf-8")
+    r = _restore_with_snapshot(rec_dir, snapshot)
+    assert r["state"] == "failed" and "cannot be read under the claim" in r["note"], r
+    assert _retiring_of(wt).exists() and not wt.exists() and (rec_dir / "record.json").exists(), "nothing touched, the record stays"
+
+
+def test_a_record_settled_by_its_owner_between_the_listing_and_the_read_is_gone_not_failed(repo):
+    """Fable/Grok note on PR #603: the owner settles a record by emptying it (record.json first) while it holds owner.lock, then deletes the
+    directory. A sweep that listed the directory before that and reads record.json after it must not report a 'failed' (unreadable) row:
+    the record is gone, settled by its owner, as the restore's own claim-time check already says."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-settled-midread")
+    _strand_registered(main, wt)
+    assert len(_pending_records(main)) == 1
+    # Get-Content seam: on the first read of a record.json, the owner's settle happens first (everything but owner.lock deleted).
+    seam = ("$script:Settled = $false; function Get-Content { "
+            "$hit = @($args | Where-Object { $_ -is [string] -and $_ -like '*\\record.json' }); "
+            "if ($hit.Count -and -not $script:Settled) { $script:Settled = $true; "
+            "Get-ChildItem -LiteralPath (Split-Path $hit[0] -Parent) -Force | Where-Object { $_.Name -ne 'owner.lock' } | "
+            "Remove-Item -Recurse -Force }; Microsoft.PowerShell.Management\\Get-Content @args }; ")
+    s = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", _sweep_script(main, root, tmp, seam)],
+                                  check=True, capture_output=True, text=True).stdout)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "gone" and "settled by its owner" in rows[0]["note"], s
+    assert _pending_records(main) == [], "the emptied record is dropped, as the claim-time branch drops it"
+
+
+def _sweep_publish_race(main, root, tmp, published, hold_lock, sweep_args=""):
+    """Sweep with a Get-Content seam: the FIRST read of a record.json finds it absent (the owner has created the directory, as
+    New-RetirePendingRecord does, but not yet written record.json), and before the read returns the owner publishes `published` (the record
+    text, or None for the original text) and, with `hold_lock`, keeps owner.lock open (FileShare.None) through the rest of the sweep.
+    Ordered by the seam, no sleeps. Every claim attempt is counted. Returns (sweep summary, claim attempts)."""
+    text = "[IO.File]::ReadAllText($rj)" if published is None else "'" + published.replace("'", "''") + "'"
+    lock = ("$script:OwnerLock = [IO.File]::Open((Join-Path (Split-Path $rj -Parent) 'owner.lock'), 'OpenOrCreate', 'ReadWrite', 'None'); "
+            if hold_lock else "")
+    seam = ("$script:Raced = $false; $script:ClaimCalls = 0; $script:OwnerLock = $null; $origEnter = ${function:Enter-RetirePendingRecord}; "
+            "function Enter-RetirePendingRecord { $script:ClaimCalls++; & $origEnter @args }; "
+            "function Get-Content { $hit = @($args | Where-Object { $_ -is [string] -and $_ -like '*\\record.json' }); "
+            "if ($hit.Count -and -not $script:Raced) { $script:Raced = $true; $rj = $hit[0]; "
+            f"$text = {text}; [IO.File]::Delete($rj); "
+            f"try {{ Microsoft.PowerShell.Management\\Get-Content @args }} finally {{ {lock}[IO.File]::WriteAllText($rj, $text) }} }} "
+            "else { Microsoft.PowerShell.Management\\Get-Content @args } }; ")
+    script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+              f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}{seam}"
+              f"$s = Invoke-SweepMergedLaneWorktrees -RepoRoot '{main}' -Root '{root}' -MergeTarget 'origin/master' -MinIdleHours 24 "
+              f"-QuarantineRoot '{tmp / 'q'}' {sweep_args}; if ($script:OwnerLock) {{ $script:OwnerLock.Dispose() }}; "
+              "[pscustomobject]@{ sweep = $s; claimCalls = $script:ClaimCalls } | ConvertTo-Json -Depth 6")
+    out = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                                    check=True, capture_output=True, text=True).stdout)
+    return out["sweep"], out["claimCalls"]
+
+
+def test_a_record_published_after_the_sweep_read_it_while_its_owner_holds_the_lock_is_owned_not_failed(repo):
+    """NEW CATALOGUE ROW (sol r2 blocker on PR #632): record absent during enumeration, published before sweep classification, owner.lock
+    held -> owned, never failed. The sweep checked record.json's existence AFTER its failed read and called a record present then corrupt,
+    without ever trying the claim. A record missing at the read goes through the claim: held by a live owner it is 'owned' and untouched."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-published-owned")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s, claims = _sweep_publish_race(main, root, tmp, published=None, hold_lock=True)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "owned", s
+    assert claims >= 1, f"the sweep must try the claim before classifying the record (claimCalls={claims})"
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing renamed, the record is kept"
+    assert (Path(main) / ".git" / "mlv-retire-pending" / recs[0] / "record.json").exists()
+
+
+def test_a_record_published_after_the_sweep_read_it_with_the_lock_free_is_restored_from_the_record_read_under_the_claim(repo):
+    """Companion: the same race, but the owner has let go of the lock. The claim is taken and record.json, re-read under it, is a good
+    record: the restore runs as normal from it."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-published-free")
+    _strand_registered(main, wt)
+    s, claims = _sweep_publish_race(main, root, tmp, published=None, hold_lock=False)
+    rows = s["strandedRestore"]
+    assert [r["state"] for r in rows] == ["restored"] and claims >= 1, s
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_a_record_published_garbled_after_the_sweep_read_it_with_the_lock_free_fails_closed_and_is_kept(repo):
+    """Companion: the record published in the race is present but unparseable, and the lock is free. That is decided under the claim, as
+    any record unreadable there is: failed, nothing touched, the record kept."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-published-garbled")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s, claims = _sweep_publish_race(main, root, tmp, published="{ not json", hold_lock=False)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "failed" and "cannot be read under the claim" in rows[0]["note"] and claims >= 1, s
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing touched, the record stays"
+
+
+def test_a_record_published_after_the_sweep_read_it_naming_an_excluded_path_is_never_restored(repo):
+    """Companion: the sweep's -Root / -Exclude filter could only run on a record it had read. A record first read under the claim is
+    filtered there, before any rename: one naming an excluded path gets no row, and neither path nor the record is touched."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-published-excluded")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s, _ = _sweep_publish_race(main, root, tmp, published=None, hold_lock=False, sweep_args=f"-Exclude '{wt}'")
+    assert s["strandedRestore"] == [], s
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing touched, the record stays"
+
+
+# r4 on PR #632 (sol r3 blocker): the record directory exists when the restore checks it, and is gone before its claim opens owner.lock.
+# The Enter-RetirePendingRecord seam runs `claim` (PowerShell; $dir is the record directory) in place of the claim's first step, so the
+# disappearance lands exactly between the existence check and the open. Ordered by the seam, no sleeps.
+OWNER_SETTLES_BEFORE_THE_CLAIM = "[IO.Directory]::Delete($dir, $true); & $origEnter $dir"
+
+
+def _sweep_claim_seam(main, root, tmp, claim):
+    """Sweep in which the enumeration read of every record.json fails (Record = $null, as for a record not yet published) and each claim
+    attempt is counted and runs `claim`. Returns (sweep summary, claim attempts)."""
+    seam = ("$script:ClaimCalls = 0; $origEnter = ${function:Enter-RetirePendingRecord}; "
+            f"function Enter-RetirePendingRecord {{ param([string]$dir) $script:ClaimCalls++; {claim} }}; "
+            "$script:Hid = $false; function Get-Content { $hit = @($args | Where-Object { $_ -is [string] -and $_ -like '*\\record.json' }); "
+            "if ($hit.Count -and -not $script:Hid) { $script:Hid = $true; throw [IO.FileNotFoundException]::new('seam: record.json not yet published') }; "
+            "Microsoft.PowerShell.Management\\Get-Content @args }; ")
+    script = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+              f". '{HELPER}'; {HOST_SNAPSHOT_FILTER}{seam}"
+              f"$s = Invoke-SweepMergedLaneWorktrees -RepoRoot '{main}' -Root '{root}' -MergeTarget 'origin/master' -MinIdleHours 24 "
+              f"-QuarantineRoot '{tmp / 'q'}'; [pscustomobject]@{{ sweep = $s; claimCalls = $script:ClaimCalls }} | ConvertTo-Json -Depth 6")
+    out = json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script],
+                                    check=True, capture_output=True, text=True).stdout)
+    return out["sweep"], out["claimCalls"]
+
+
+def test_a_record_directory_its_owner_removes_between_the_existence_check_and_the_claim_is_gone_not_failed(repo):
+    """NEW CATALOGUE ROW (sol r3 blocker on PR #632): missing record.json during enumeration; the owner deletes the emptied record
+    directory after the restore's Test-Path succeeds but before owner.lock opens -> gone, never failed. Opening owner.lock in a directory
+    that no longer exists throws DirectoryNotFoundException; that, with the directory confirmed absent afterwards, is the owner's
+    settlement, not a failure. Nothing is renamed."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-dir-vanished")
+    _strand_registered(main, wt)
+    assert len(_pending_records(main)) == 1
+    s, claims = _sweep_claim_seam(main, root, tmp, OWNER_SETTLES_BEFORE_THE_CLAIM)
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "gone" and "settled by its owner" in rows[0]["note"], s
+    assert claims == 1 and s["error"] is None, (claims, s)
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == [], "nothing renamed; nothing left to keep"
+
+
+def test_a_claim_refused_for_permission_while_the_record_directory_exists_stays_failed_and_the_record_is_kept(repo):
+    """Companion: only the owner's settlement is 'gone'. A claim that fails for any other reason, here access denied with the record
+    directory still present, stays 'failed' with its error text, and the record and both paths are kept."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-claim-denied")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s, claims = _sweep_claim_seam(main, root, tmp, "throw [UnauthorizedAccessException]::new('seam: access to owner.lock is denied')")
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "failed" and "access to owner.lock is denied" in rows[0]["note"] and claims == 1, s
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing touched, the record stays"
+
+
+def test_a_claim_reporting_directory_not_found_while_the_record_directory_still_exists_stays_failed(repo):
+    """Companion: DirectoryNotFoundException alone is not the settlement. With the record directory still there after the failure the
+    exception is not masked: 'failed' with its error text, the record kept."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / "wt-claim-dnf-present")
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    s, claims = _sweep_claim_seam(main, root, tmp, "throw [IO.DirectoryNotFoundException]::new('seam: a part of the path was not found')")
+    rows = s["strandedRestore"]
+    assert len(rows) == 1 and rows[0]["state"] == "failed" and "a part of the path was not found" in rows[0]["note"] and claims == 1, s
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == recs, "nothing touched, the record stays"
+
+
+def test_the_next_call_for_a_stranded_worktree_whose_record_directory_vanishes_before_the_claim_reports_gone(repo):
+    """The same race on the per-call restore entry (Restore-StrandedRetiring -> Restore-LaneWorktreeRename): its record read fine, then
+    the owner settles it before the claim. strandedRestore is 'gone', the call keeps the worktree with that reason, and nothing is renamed."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-call-dir-vanished")
+    _strand_registered(main, wt)
+    prelude = ("$origEnter = ${function:Enter-RetirePendingRecord}; "
+               f"function Enter-RetirePendingRecord {{ param([string]$dir) {OWNER_SETTLES_BEFORE_THE_CLAIM} }}; ")
+    d, _ = _gate_real(wt, whatif=False, prelude=prelude)
+    assert d["strandedRestore"]["state"] == "gone" and "settled by its owner" in d["strandedRestore"]["note"], d
+    assert d["action"] == "kept" and d["reason"].startswith("stranded-retiring: "), d
+    assert _retiring_of(wt).exists() and not wt.exists() and _pending_records(main) == [], "nothing renamed; nothing left to keep"
+
+
+# r2 (Sol r1 B1/B2): a holder that appears AFTER the first decision must stop the retry too. The retry window is where the worktree is
+# half-removed and a handle still blocks it, so a process that starts in it is exactly the one the gate was written to refuse.
+# Scans are numbered: 1 = the gate, 2 = the last look before removal, 3.. = one fresh scan before each retry attempt that may delete.
+
+def _counted_scans_and_sleeps(release, release_at_sleep):
+    """Prelude: count every process scan in $script:SnapN, and create `release` (the file holder lets go) at the Nth back-off."""
+    return (ONLY_PYTEST_CHILDREN + "$script:SnapN = 0; $script:SleepN = 0; $script:RemoveRetryBudgetMs = 20000; $script:RemoveRetryDelayMs = 50; "
+            "$origSnapCount = ${function:Get-LaneProcessSnapshot}; "
+            "function Get-LaneProcessSnapshot { $script:SnapN++; & $origSnapCount }; "
+            "function Start-Sleep { param([int]$Milliseconds = 0, [double]$Seconds = 0) $script:SleepN++; "
+            f"if ($script:SleepN -ge {release_at_sleep} -and -not (Test-Path -LiteralPath '{release}')) {{ [IO.File]::WriteAllText('{release}', 'go') }}; "
+            "Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds ([Math]::Max($Milliseconds, 400)) }; ")
+
+
+def test_an_unreadable_cwd_process_that_appears_during_the_retry_no_longer_stops_it(repo):
+    """R-03, r7: sharing-violation half-removal, then a process whose cwd cannot be read shows up. It used to be refused as cwd-unknown
+    at every retry scan; now the retry names it as evidence and carries on (a process that really sat in the tree would be the very
+    handle that fails the removal, and the rename already proved none did), so the worktree is retired once the handle drops."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-late-unknown")
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
+    late = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)   # not the holder of anything; its cwd just cannot be read
+    prelude = (_counted_scans_and_sleeps(release, 1) + _handle_appears_after_the_rename(trigger, ready)
+               + "$origCwdLate = ${function:Get-ProcessCurrentDirectory}; "
+               f"function Get-ProcessCurrentDirectory {{ param([int]$ProcessId) if ($script:SnapN -ge 3 -and $ProcessId -eq {late.pid}) {{ return $null }}; & $origCwdLate -ProcessId $ProcessId }}; ")
+    try:
+        d, err = _gate_real(wt, whatif=False, prelude=prelude)
+    finally:
+        _stop(late)
+        _finish_holder(p, release)
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert any(u.startswith(f"{late.pid} ") for u in d["cwdUnknown"]), d   # named at the retry scan that saw it
+    assert f"pid={late.pid}" not in err, err                               # but not a REFUSED line
+    assert d["removeAttempts"] >= 2 and not wt.exists() and not _retiring_of(wt).exists(), d
+
+
+def test_a_cwd_holder_that_appears_after_the_first_leftover_deletion_keeps_the_worktree(repo):
+    """R-04: the first leftover deletion hits the sharing violation, then a process whose cwd is the worktree appears. The retry
+    that follows must look again (it used to look once), and keep the worktree before deleting anything more."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-late-cwd")
+    ready, release, trigger = tmp / "hold.ready", tmp / "hold.release", tmp / "hold.trigger"
+    p = _spawn_file_handle_holder(_retiring_of(wt) / "a.txt", ready, release, tmp, trigger=trigger)
+    # Scan 3 (attempt 2) is clear and its deletion fails on the file handle; the handle drops at the 2nd back-off; scan 4 (attempt 3) sees the cwd holder.
+    # r7: the removal runs on the RENAMED root, so a process already in the tree has its cwd under <wt>.retiring.
+    prelude = (_counted_scans_and_sleeps(release, 2) + _handle_appears_after_the_rename(trigger, ready)
+               + "$origSnapLate = ${function:Get-LaneProcessSnapshot}; "
+               "function Get-LaneProcessSnapshot { $s = & $origSnapLate; if ($script:SnapN -ge 4) { "
+               f"$row = [pscustomobject]@{{ ProcessId = 999990; Name = 'late-holder.exe'; CommandLine = 'late-holder.exe'; SessionId = 1; CurrentDirectory = '{wt}.retiring' }}; "
+               "return [pscustomobject]@{ Procs = @($s.Procs) + @($row); SelfPids = $s.SelfPids; CapturedUtc = $s.CapturedUtc } }; $s }; ")
+    try:
+        d, err = _gate_real(wt, whatif=False, prelude=prelude)
+    finally:
+        _finish_holder(p, release)
+    assert d["action"] == "kept" and d["reason"].startswith("live-process: 999990 late-holder.exe"), d
+    assert "999990 late-holder.exe cwd" in d["holders"], d
+    assert d["removeAttempts"] == 3, d   # stopped at the third attempt, before its deletion
+
+
+def test_the_removal_retry_is_keyed_to_access_denied_and_sharing_violation_only():
+    """Source pin: the loop is entered only for a failure message matching RemoveRetryablePattern, and that pattern names the two
+    Windows conditions (git renders them as "Permission denied" / "Invalid argument"; native tools as "Access is denied" / "being used
+    by another process"). Anything else is the first and only attempt."""
+    src = HELPER.read_text(encoding="utf-8")
+    assert "-notmatch $script:RemoveRetryablePattern" in src
+    pat = src[src.index("$script:RemoveRetryablePattern"):].splitlines()[0]
+    for needle in ("Permission denied", "Access is denied", "being used by another process", "Invalid argument"):
+        assert needle in pat, pat
+
+
 def test_sweep_keeps_a_worktree_held_only_by_a_process_cwd(repo):
     tmp, main = repo
     root = tmp / "lanes"
@@ -649,6 +1566,13 @@ def _wt_created(wt, minutes):
     return f"(Get-Item -LiteralPath '{wt}').CreationTimeUtc.AddMinutes({minutes})"
 
 
+def _assert_deferred_to_rename(d):
+    """r7 (LANE-RETIRE-CWD-UNKNOWN-RENAME-PROBE-1): a process whose cwd cannot be read is evidence (listed in cwdUnknown), no longer a refusal.
+    The gate says would-retire and the rename of the root settles it for real (-WhatIf never renames)."""
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert d["renameProbe"].startswith("not-run: WhatIf"), d
+
+
 def test_healthy_cwd_probe_is_reported_ok_and_backs_the_would_retire(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-probe-ok")
@@ -679,18 +1603,18 @@ def test_probe_unavailable_refusal_holds_on_a_real_removal_too(repo):
     assert wt.exists()
 
 
-def test_a_pid_whose_cwd_read_fails_is_refused_as_cwd_unknown(repo):
+def test_a_pid_whose_cwd_read_fails_is_listed_and_left_to_the_rename_probe(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-cwd-unknown")
     p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)   # does not hold the worktree, but the gate cannot tell
     try:
         d, err = _gate_real(wt, prelude=_cwd_unreadable_for(p.pid))
-        control, _ = _gate_real(wt)                                  # same process, cwd readable: no refusal for it
+        control, _ = _gate_real(wt)                                  # same process, cwd readable: not listed at all
     finally:
         _stop(p)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d   # r7: no longer a refusal (the rename settles it)
     assert d["cwdProbe"] == "ok" and any(u.startswith(f"{p.pid} ") for u in d["cwdUnknown"]), d
-    assert f"pid={p.pid}" in err and "via=cwd-unknown" in err, err
+    assert f"pid={p.pid}" not in err, err                            # and no REFUSED line for it
     assert not any(u.startswith(f"{p.pid} ") for u in control["cwdUnknown"]), control
     assert wt.exists()
 
@@ -714,11 +1638,11 @@ def test_snapshot_pid_that_has_exited_is_not_a_candidate_holder(repo):
     assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
 
 
-def test_snapshot_user_session_process_with_unreadable_cwd_is_cwd_unknown(repo):
+def test_snapshot_user_session_process_with_unreadable_cwd_is_listed_and_left_to_the_rename(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-sess1")
     d = _gate_with_snapshot(wt, _fake_row("$PID"), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
 def test_snapshot_session0_process_with_unreadable_cwd_is_no_longer_exempt_by_session_id(repo):
@@ -727,30 +1651,30 @@ def test_snapshot_session0_process_with_unreadable_cwd_is_no_longer_exempt_by_se
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-sess0")
     d = _gate_with_snapshot(wt, _fake_row("$PID", session=0), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
 # --- r3 (WORKTREE-REMOVED-UNDER-LIVE-CHAIN-1 hub ruling HUB-TICK 20261009T1004Z, sol blockers on 2d261a18) ---
 # A: a null command line is a LIVE process.  B: a session id is not evidence; creation time before the worktree is.
 
 @pytest.mark.parametrize("cmd", ["pwsh.exe -File C:\\\\elsewhere\\\\quiet.ps1", "svchost.exe -k netsvcs"], ids=["absolute-script", "native-command"])
-def test_snapshot_session0_process_with_unreadable_cwd_created_after_the_worktree_is_cwd_unknown(repo, cmd):
+def test_snapshot_session0_process_with_unreadable_cwd_created_after_the_worktree_is_listed_not_exempt(repo, cmd):
     """Sol r2 row 2. REPLACES the r2 expectation (session 0 + unreadable cwd = would-retire): a session id proves nothing."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-sess0")
     row = _fake_row("$PID", cmd=cmd, session=0, name=cmd.split()[0], created=_wt_created(wt, 5))
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert any("cwd-unreadable" in u for u in d["cwdUnknown"]) and d["cwdExempt"] == 0, d
 
 
-def test_snapshot_process_with_null_command_line_and_unreadable_cwd_is_cwd_unknown(repo):
+def test_snapshot_process_with_null_command_line_and_unreadable_cwd_is_listed_and_left_to_the_rename(repo):
     """Sol r2 row 1: CommandLine = $null used to be filtered out of the snapshot before any cwd check."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-nullcmd")
     row = _fake_row("$PID", cmd=None, created=_wt_created(wt, 5))
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert any(" cwd-unreadable created=" in u for u in d["cwdUnknown"]), d
 
 
@@ -781,20 +1705,20 @@ def test_snapshot_exempt_process_whose_command_line_names_the_worktree_is_still_
 
 
 @pytest.mark.parametrize("created", [None, "$null", "'not a date'"], ids=["no-property", "null", "not-a-datetime"])
-def test_snapshot_unreadable_cwd_with_unreadable_creation_date_is_refused(repo, created):
+def test_snapshot_unreadable_cwd_with_unreadable_creation_date_is_listed_not_exempt(repo, created):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-nodate")
     d = _gate_with_snapshot(wt, _fake_row("$PID", created=created), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert any("created=unreadable" in u for u in d["cwdUnknown"]), d
 
 
-def test_snapshot_unreadable_cwd_created_exactly_when_the_worktree_was_is_refused(repo):
+def test_snapshot_unreadable_cwd_created_exactly_when_the_worktree_was_is_listed_not_exempt(repo):
     """Strictly earlier is required: equal is not earlier."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-same-instant")
     d = _gate_with_snapshot(wt, _fake_row("$PID", created=_wt_created(wt, 0)), prelude=CWD_UNREADABLE_FOR_EVERY_PID)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
 def test_creation_time_does_not_exempt_a_relative_script_whose_cwd_is_unknown(repo):
@@ -937,68 +1861,68 @@ def test_service_sid_owned_unreadable_cwd_process_created_after_the_worktree_is_
     assert len(d["cwdExemptOwner"]) == 1 and f"exempt=service-sid:{sid} via=scm:BITS,gpsvc" in d["cwdExemptOwner"][0], d
 
 
-def test_same_user_session0_process_with_no_service_owner_is_still_cwd_unknown(repo):
+def test_same_user_session0_process_with_no_service_owner_is_still_not_exempt(repo):
     """A lane started by a Scheduled Task runs as THIS user in session 0: no SCM row names it, so its owner is unread."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-lane")
     row = _fake_row("$PID", cmd="pwsh.exe -File C:\\\\elsewhere\\\\lane.ps1", session=0, name="pwsh.exe", created=_wt_created(wt, 5))
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("4321", "BITS", "LocalSystem", "Share Process", SVCHOST)))
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [], d
 
 
 @pytest.mark.parametrize("start,stype", [(".\\obabalola", "Own Process"), ("", "Unknown")], ids=["service-as-this-user", "per-user-service-instance"])
-def test_service_running_as_a_user_account_is_still_cwd_unknown(repo, start, stype):
+def test_service_running_as_a_user_account_is_still_not_exempt(repo, start, stype):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-user")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "CDPUserSvc_6d6616", start, stype, SVCHOST))
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [], d
 
 
-def test_owner_unreadable_process_is_still_cwd_unknown(repo):
+def test_owner_unreadable_process_is_still_not_exempt(repo):
     """SearchProtocolHost: session 0, cwd and token unreadable, hosts no service, so the SCM cannot name its owner."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-unread")
     row = _fake_row("$PID", cmd=None, session=0, name="SearchProtocolHost.exe", created=_wt_created(wt, 5))
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows())
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
-def test_service_owner_query_failure_is_still_cwd_unknown(repo):
+def test_service_owner_query_failure_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-fail")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + "function Get-RunningServiceRows { throw 'scm unavailable' };"
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdOwnerProbe"] == "scm-failed" and d["cwdExemptOwner"] == [], d
 
 
-def test_another_user_service_process_is_still_cwd_unknown(repo):
+def test_another_user_service_process_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-other")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "TBSage", "VIRTUAL-TEN\\tbco903149bf4109", "Own Process", SVCHOST))
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
-def test_service_pid_whose_snapshot_image_differs_is_still_cwd_unknown(repo):
+def test_service_pid_whose_snapshot_image_differs_is_still_not_exempt(repo):
     """Pid reuse: the SCM says pid N hosts svchost.exe, the snapshot row at pid N is pwsh.exe. Not the same process."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-reuse")
     row = _fake_row("$PID", session=0, name="pwsh.exe", created=_wt_created(wt, 5))
     d = _gate_with_snapshot(wt, row, prelude=CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST)))
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
-def test_service_pid_with_mixed_accounts_is_still_cwd_unknown(repo):
+def test_service_pid_with_mixed_accounts_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-mixed")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST),
                                                        ("$PID", "Odd", ".\\obabalola", "Share Process", SVCHOST))
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
 
 
 @pytest.mark.parametrize("via", ["cwd", "cmdline"])
@@ -1047,7 +1971,7 @@ NSSM = "C:\\tools\\nssm\\nssm.exe"
 
 
 @pytest.mark.parametrize("key_minutes", [10, 5], ids=["key-written-after-start", "key-written-at-start"])
-def test_service_reconfigured_to_localsystem_after_the_process_started_is_still_cwd_unknown(repo, key_minutes):
+def test_service_reconfigured_to_localsystem_after_the_process_started_is_still_not_exempt(repo, key_minutes):
     """sol r1 blocker 1: a user-owned nssm.exe service reconfigured to LocalSystem and not yet restarted. The process was
     created at worktree+5 min; its service key was written at/after that, so the configured account is not the live one."""
     tmp, main = repo
@@ -1055,37 +1979,38 @@ def test_service_reconfigured_to_localsystem_after_the_process_started_is_still_
     row = _fake_row("$PID", cmd=None, session=0, name="nssm.exe", created=_wt_created(wt, 5))
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "LaneSvc", "LocalSystem", "Own Process", NSSM)) + _key_written(wt, key_minutes)
     d = _gate_with_snapshot(wt, row, prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [] and any("scm-config-newer-than-process:LaneSvc" in u for u in d["cwdUnknown"]), d
 
 
-def test_service_key_time_unreadable_is_still_cwd_unknown(repo):
+def test_service_key_time_unreadable_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-keyunread")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST)) + _key_written(wt, None)
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [] and any("scm-config-time-unreadable:BITS" in u for u in d["cwdUnknown"]), d
 
 
-def test_service_process_creation_time_unreadable_is_still_cwd_unknown(repo):
+def test_service_process_creation_time_unreadable_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-procunread")
     row = _fake_row("$PID", cmd=None, session=0, name="svchost.exe")   # no CreationDate at all
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST)) + _key_written(wt, -60)
     d = _gate_with_snapshot(wt, row, prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [] and any("scm-process-time-unreadable" in u for u in d["cwdUnknown"]), d
 
 
-def test_share_process_with_one_service_key_newer_than_the_process_is_still_cwd_unknown(repo):
+def test_share_process_with_one_service_key_newer_than_the_process_is_still_not_exempt(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-sharenewer")
     prelude = (CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", "Share Process", SVCHOST),
                                                         ("$PID", "gpsvc", "LocalSystem", "Share Process", SVCHOST))
                + _key_written(wt, -60, gpsvc=30))
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and any("scm-config-newer-than-process:gpsvc" in u for u in d["cwdUnknown"]), d
+    _assert_deferred_to_rename(d)
+    assert any("scm-config-newer-than-process:gpsvc" in u for u in d["cwdUnknown"]), d
 
 
 def test_service_key_written_before_the_process_started_is_exempt_and_bound(repo):
@@ -1120,13 +2045,13 @@ def test_live_binding_does_not_rewrite_the_shared_index_row_for_the_next_worktre
 
 
 @pytest.mark.parametrize("stype", ["Unknown", "Interactive Process"], ids=["unknown", "interactive"])
-def test_localsystem_service_of_a_non_own_or_share_type_is_still_cwd_unknown(repo, stype):
+def test_localsystem_service_of_a_non_own_or_share_type_is_still_not_exempt(repo, stype):
     """fable r1 h1: pins the ServiceType guard. StartName, image and the key binding all pass, so only the type refuses."""
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-svc-type")
     prelude = CWD_UNREADABLE_FOR_EVERY_PID + _svc_rows(("$PID", "BITS", "LocalSystem", stype, SVCHOST)) + _key_written(wt, -60)
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [], d
 
 
@@ -1158,7 +2083,7 @@ def test_unparsable_scm_row_at_the_same_pid_drops_that_pid(repo):
     prelude = (CWD_UNREADABLE_FOR_EVERY_PID + "function Get-RunningServiceRows { @(" + GOOD_BITS_ROW + ", " + bad + ") };"
                + _key_written(wt, -60))
     d = _gate_with_snapshot(wt, _svchost_row(wt), prelude=prelude)
-    assert d["action"] == "kept" and d["reason"].startswith("cwd-unknown"), d
+    _assert_deferred_to_rename(d)
     assert d["cwdExemptOwner"] == [] and len(d["cwdOwnerSkipped"]) == 1, d
 
 
@@ -1351,3 +2276,154 @@ def test_encoded_command_switch_table_matches_pwsh_own_parameter_resolution():
     out = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], check=True, capture_output=True, text=True).stdout
     got = [(r["Present"], r["Failed"]) for r in json.loads(out)]
     assert got == [(p, f) for _, p, f in table]
+
+
+# --- LANE-RETIRE-CWD-UNKNOWN-RENAME-PROBE-1 (r1): an unreadable cwd no longer refuses; the rename of the worktree root is the probe ---
+# NTFS refuses a directory rename while ANY handle beneath it is open (a cwd, a file, whatever the share mode: measured), and it does so
+# whatever the ACL of the process that holds it. So a process whose cwd this user cannot read (an IIS app pool, TeamViewer, an elevated
+# shell) is neither a reason to keep nor a way to hide: if it holds the tree the rename fails (kept / in-use), if not the retire goes ahead.
+
+def _worktree_paths(main):
+    out = subprocess.run([GIT, "-C", str(main), "worktree", "list", "--porcelain"], check=True, capture_output=True, text=True).stdout
+    return [_norm(l[len("worktree "):]) for l in out.splitlines() if l.startswith("worktree ")]
+
+
+def _retiring_of(wt):
+    return Path(str(wt) + ".retiring")
+
+
+def test_rename_probe_refuses_an_unseen_cwd_holder_and_leaves_the_worktree_intact(repo):
+    """(a) A real process whose cwd is INSIDE the worktree, with a cwd the gate cannot read and a command line that does not name it:
+    the cwd and cmdline checks have nothing to see, so only the rename can tell. Kept / in-use, worktree untouched at its own path."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-inuse")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("in-use"), d
+    assert d["renameProbe"].startswith("in-use"), d
+    assert (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+    assert not _retiring_of(wt).exists(), "no .retiring directory may be left behind"
+    assert _norm(wt) in _worktree_paths(main), "git must still know the worktree at its own path"
+
+
+def test_unreadable_cwd_with_no_handle_in_the_worktree_no_longer_blocks_retirement(repo):
+    """(b) The 2026-10-21 incident shape: a live process whose cwd cannot be read, nowhere near the worktree. Retired."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-free")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+    finally:
+        _stop(p)
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert d["renameProbe"] == "ok", d
+    assert any(u.startswith(f"{p.pid} ") for u in d["cwdUnknown"]), "the unreadable pid is still named as evidence"
+    assert not wt.exists() and not _retiring_of(wt).exists()
+
+
+def test_readable_cwd_inside_the_worktree_is_still_refused_ahead_of_the_rename_probe(repo):
+    """(c) Unchanged rule: a readable cwd is a named holder (live-process), found before any rename is attempted."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-readable")
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=wt)
+    try:
+        d, _ = _gate_real(wt, whatif=False)
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith(f"live-process: {p.pid} "), d
+    assert d["renameProbe"] == "not-run", d
+    assert wt.exists() and not _retiring_of(wt).exists()
+
+
+def test_a_retire_that_fails_after_a_good_rename_renames_back_and_keeps(repo):
+    """(d) The rename succeeds, then `git worktree remove` is refused (a LOCKED worktree: a non-retryable failure). The directory
+    goes back to its own name, git is repointed at it, and no .retiring directory is left."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-back")
+    _git(main, "worktree", "lock", "--reason", "rename-probe-test", str(wt))
+    d, _ = _gate_real(wt, whatif=False)
+    assert d["action"] == "kept" and d["reason"].startswith("remove-failed"), d
+    assert d["renameProbe"] == "ok", d
+    assert wt.exists() and (wt / ".git").exists() and (wt / "a.txt").exists()
+    assert not _retiring_of(wt).exists(), "no .retiring directory may be left behind"
+    assert _norm(wt) in _worktree_paths(main) and not any(p.endswith(".retiring") for p in _worktree_paths(main)), _worktree_paths(main)
+    st = subprocess.run([GIT, "-C", str(wt), "status", "--porcelain"], capture_output=True, text=True)
+    assert st.returncode == 0, st.stderr   # git can still use the checkout at its original path
+
+
+def test_a_successful_retire_leaves_no_worktree_entry_and_no_retiring_directory(repo):
+    """(e) The git-consistency pin: after a rename-then-remove, `git worktree list` has no entry for the worktree (not the original
+    path, not the .retiring path), its admin dir is gone, and `git worktree prune` has nothing left to prune."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-ok")
+    admin = _admin_dir(main, wt)
+    d, _ = _gate_real(wt, whatif=False)
+    assert (d["action"], d["reason"]) == ("retired", "ok"), d
+    assert d["renameProbe"] == "ok", d
+    assert not wt.exists() and not _retiring_of(wt).exists()
+    assert _norm(wt) not in _worktree_paths(main) and not any(p.endswith(".retiring") for p in _worktree_paths(main)), _worktree_paths(main)
+    assert not Path(admin).exists(), "the worktree admin dir must be gone, not dangling"
+    pr = subprocess.run([GIT, "-C", str(main), "worktree", "prune", "--verbose"], check=True, capture_output=True, text=True)
+    assert (pr.stdout + pr.stderr).strip() == "", pr
+
+
+def test_whatif_does_not_rename_and_says_so(repo):
+    """A would-retire is never backed by a rename: -WhatIf must not move a real lane worktree, even for an instant."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-whatif")
+    d, _ = _gate_real(wt, whatif=True)
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert d["renameProbe"].startswith("not-run: WhatIf"), d
+    assert wt.exists() and not _retiring_of(wt).exists()
+
+
+def test_an_existing_retiring_directory_is_not_overwritten_and_keeps_the_worktree(repo):
+    """A leftover `<root>.retiring` (a crashed earlier run) must not be merged into or clobbered: kept, cannot-determine, untouched."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-rename-leftover")
+    _retiring_of(wt).mkdir()
+    (_retiring_of(wt) / "marker.txt").write_text("leftover", encoding="utf-8")
+    d, _ = _gate_real(wt, whatif=False)
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: ") and ".retiring" in d["reason"], d
+    assert wt.exists() and (wt / ".git").exists()
+    assert (_retiring_of(wt) / "marker.txt").read_text(encoding="utf-8") == "leftover"
+
+
+# r5 (H3, RETIRE-RENAME-PROBE-NESTED-HOLDER-PIN-1, opus r1 / fable r4 / sol r4): the rename probe's claim is "ANY handle beneath the root",
+# not just one at the root. A holder one directory down, whose cwd the gate cannot read or whose file allows deletion, still refuses it.
+
+def test_rename_probe_refuses_a_cwd_holder_in_a_subdirectory_of_the_worktree(repo):
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-nested-cwd")
+    sub = wt / "sub"
+    sub.mkdir()
+    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=sub)
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=_cwd_unreadable_for(p.pid))
+    finally:
+        _stop(p)
+    assert d["action"] == "kept" and d["reason"].startswith("in-use"), d
+    assert d["renameProbe"].startswith("in-use"), d
+    assert sub.is_dir() and (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+    assert not _retiring_of(wt).exists() and _norm(wt) in _worktree_paths(main) and _pending_records(main) == []
+
+
+def test_rename_probe_refuses_a_delete_sharing_file_holder_in_a_subdirectory_of_the_worktree(repo):
+    """The file is ignored debris (sub/__pycache__/held.pyc), so the gate passes it; the handle allows read, write AND delete sharing."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "wt-nested-file")
+    held = wt / "sub" / "__pycache__" / "held.pyc"
+    held.parent.mkdir(parents=True)
+    held.write_bytes(b"x")
+    ready, release = tmp / "nest.ready", tmp / "nest.release"
+    p = _spawn_file_handle_holder(held, ready, release, tmp, share="ReadWrite, Delete")
+    try:
+        d, _ = _gate_real(wt, whatif=False, prelude=ONLY_PYTEST_CHILDREN)
+    finally:
+        _finish_holder(p, release)
+    assert d["action"] == "kept" and d["reason"].startswith("in-use"), d
+    assert held.exists() and (wt / ".git").exists() and (wt / "a.txt").exists(), "the worktree must be intact"
+    assert not _retiring_of(wt).exists() and _norm(wt) in _worktree_paths(main) and _pending_records(main) == []

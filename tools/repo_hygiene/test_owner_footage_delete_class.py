@@ -131,6 +131,14 @@ PATHNAME_DELETE_ALLOWED = {
         "generator side: the source archive about to be recreated under the generator's own -OutDir.",
     ("um-display-mapping-probe-job.ps1", "Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue"):
         "recursive: see RECURSIVE_DELETE_ALLOWED (a GUID temp directory extracted from the probe zip).",
+    # VENUE-REFERENCE-FRAME-JOB-1 r2: the reference-frame job GENERATOR. Each target is a GUID-named entry this very call
+    # created in the machine temp directory; none is built from a clip id, a footage name or any owner path.
+    ("reference-frame-runner-job.ps1", "if (Test-Path -LiteralPath $specTemp) { Remove-Item -LiteralPath $specTemp -Force -ErrorAction SilentlyContinue }"):
+        "generator side: 'refframe-spec-<guid>.tmp' in the machine temp directory, the committed gate-spec blob this call just saved.",
+    ("reference-frame-runner-job.ps1", "if (Test-Path -LiteralPath $emitPath) { Remove-Item -LiteralPath $emitPath -Force -ErrorAction SilentlyContinue }"):
+        "generator side: 'refframe-clip-<guid>.json' in the machine temp directory, the resolver's private --emit-json file this call created.",
+    ("reference-frame-runner-job.ps1", "if (Test-Path -LiteralPath $bundleTemp) { Remove-Item -LiteralPath $bundleTemp -Recurse -Force -ErrorAction SilentlyContinue }"):
+        "recursive: see RECURSIVE_DELETE_ALLOWED (a GUID temp directory holding the committed capture-script blobs).",
     # The Bachelor bench agent itself (tracked from AGENT-HEAVY-SLOT-WAIT-RELEASE-1 r1c). Every target is a file the
     # agent names inside its OWN mailbox root (logs\, running\, slot-holders\) or an environment variable.
     ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue"):
@@ -144,7 +152,10 @@ PATHNAME_DELETE_ALLOWED = {
     ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $Holder.acquiredFile, $Holder.releaseFile, $Holder.recordFile -Force -ErrorAction SilentlyContinue"):
         "slot-holders\\<jobId>.<guid>.acquired.json / .release / .holder.json: the ended holder's own side files.",
     ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue"):
-        "Stop-StaleHeavySlotHolders: a slot-holders\\*.holder.json record (Get-ChildItem -Filter '*.holder.json').",
+        "Stop-StaleHeavySlotHolders / Stop-StaleQuietLeases: a slot-holders\\*.holder.json or *.lease.json record "
+        "(Get-ChildItem -Filter '*.holder.json' / '*.lease.json').",
+    ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $Lease.recordFile -Force -ErrorAction SilentlyContinue"):
+        "Stop-QuietLease: slot-holders\\<jobId>.<guid>.lease.json, the ended quiet lease's own record (BACHELOR-AGENT-QUIET-LEASE-1).",
     ("ultra-magnus-agent.ps1", "Get-ChildItem -LiteralPath $slotHolders -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\\.(acquired\\.json|release|tmp)$' } | Remove-Item -Force -ErrorAction SilentlyContinue"):
         "slot-holders\\ side files only (*.acquired.json, *.release, *.tmp) left by a dead agent's holders.",
     ("ultra-magnus-agent.ps1", "Remove-Item Env:\\MLV_AGENT_ADMISSION, Env:\\MLV_AGENT_ADMISSION_THERMAL, Env:\\MLV_AGENT_ADMISSION_WAIT_SEC, Env:\\HEAVY_SLOT_HELD -ErrorAction SilentlyContinue"):
@@ -176,6 +187,9 @@ RECURSIVE_DELETE_ALLOWED = {
         "under its own per-run root; no owner path flows into it.",
     ("invoke-ultramagnus-cdng-export-evidence.ps1", "Remove-Item -LiteralPath $expandedRoot -Recurse -Force"):
         "'<output root>\\imported\\packet-<stamp>': the unpacked evidence packet this script extracts itself.",
+    ("bachelor/reference-frame-runner-job.ps1", "if (Test-Path -LiteralPath $bundleTemp) { Remove-Item -LiteralPath $bundleTemp -Recurse -Force -ErrorAction SilentlyContinue }"):
+        "'refframe-bundle-<guid>' in the machine temp directory: the generator's own scratch directory, created by New-Item a few lines "
+        "above and holding only the committed capture-script blobs saved by name from the tooling commit; no clip id or owner path flows into it.",
     ("test-gui-smoke-color-artifact-scan.ps1", "Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue"):
         "a GUID-named temp directory holding the test's own synthetic PNGs.",
     ("ultramagnus/um-display-mapping-probe-job.ps1", "Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue"):

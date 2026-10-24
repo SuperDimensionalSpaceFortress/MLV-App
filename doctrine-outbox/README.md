@@ -6,6 +6,28 @@ is the mechanism, ported from agent-bridge's port of the bus's own reference out
 itself: the unattended drain, the capture hook and the heartbeat debt line are card
 DOCTRINE-OUTBOX-ADOPT-MLV-1b and install against this CLI.
 
+**One file for the fleet (OUTBOX-SINGLE-SOURCE-1).** `tools/coordination/doctrine_outbox.py` is not edited
+per project: every project value (ref, items directory, finding paths, state files, Law-4 deny terms) is
+data in `doctrine-outbox.config.json` at the repo root. The bus steward is asked to land the same bytes as
+`tools/factory/doctrine_outbox.py` (handoff card in this directory; adoption is pending; the bus deleted its
+reference copy in `665b4566`). Sharing is by pin, not by copy (bus `tools/factory/README.md`: "A tool here is
+never copied into a project: the project pins it"): a project records a reviewed bus SHA with
+`python factory-pins/pin-runner.py pin doctrine-outbox --commit <bus-sha> --path tools/factory/doctrine_outbox.py
+--reviewer <who> --reason <why>` and runs `python factory-pins/pin-runner.py run doctrine-outbox -- --config
+doctrine-outbox.config.json <command>`. Setting `tool_pin` in the config (card
+OUTBOX-PIN-AWARE-TOOL-AT-REF-1) makes the hook `install-hooks` writes and the debt and drain checks use the pin; without it they read
+`tool_rel`, so a project KEEPS its copy until it sets `tool_pin`. The digest of the candidate is recorded in that
+config's `bus_candidate` and checked by `tests/coordination/test_doctrine_outbox_hooks.py`. Change behaviour by
+changing the config; once the bus has the file, change the tool only there and re-pin. The same file also answers the hook
+commands `check`, `pre-push`, `stop`, `session-start` and `install-hooks`. `stop` judges the commits not
+yet on the remote (`default_range`, or `--ref R` for `R..HEAD`); `pre-push` hands git's stdin on to the
+layers after it (`git lfs pre-push`); `install-hooks` leaves the hook executable and splices the guard right
+after the shebang and any `set -e` lines, so a hook that ends in `exit 0` or `exec <next hook>` still runs it
+(a guard already sitting behind a top-level `exit`/`exec` is moved ahead of it and reported as `repaired`, never
+as present; `HOOK_GUARD_UNREACHABLE` stays as a defensive invariant that cannot fire today). A push that creates a branch judges only the commits not on the remote's default branch. `check`
+takes a whole number of minutes; anything else is a usage error (exit 2). A config that is
+present but invalid is `CONFIG_INVALID` (exit 1, naming the key), distinct from `CONFIG_ABSENT` (exit 2).
+
 **Derive state; this file holds none.** Every value below is a command.
 
 ```
@@ -32,8 +54,8 @@ change that teaches it.
 
 ```markdown
 ---
-target: TRAPS.md          # RECEIPTS.md | TRAPS.md | RULINGS.md | specs/mlv-app/cards.md (other specs are steward-owned)
-kind: trap                # receipt | trap | ruling
+target: TRAPS.md          # RECEIPTS.md | TRAPS.md | RULINGS.md | specs/mlv-app/cards.md | specs/mlv-app/cos-concerns.md (other specs are steward-owned)
+kind: trap                # receipt | trap | ruling | concern (concern goes only with cos-concerns.md)
 source_commit: PENDING    # PENDING = the commit that adds this file; or an explicit sha
 law4: attested            # required, then SCREENED, never trusted
 # ratified_by: <RULINGS anchor>   required for RULINGS.md; sessions do not mint law
@@ -52,6 +74,246 @@ if they carry an email address, an account or org uuid, a lane wire path, `HUB.m
 pattern, a user-home path, this host's name or account name, or anything in an optional deny file. MLV
 adds its own deny terms: `.claude-state`, `subject-ledger`, `fleet-runs`, `HUB_RUN_WAL`, `dual-lane`, and
 the name of the GPU host. A refusal names the class, never the matched value.
+
+## Card routes are checked before they ship (CARD-ROUTE-EXERCISE-2)
+
+CoS work order FWO-DEFECT-PREVENT-1 item 3, in `validate --exercise`. It is fail-closed: it replaces the parked
+CARD-ROUTE-EXERCISE-1 (PR 479), whose launcher support relied on two hand-written walks over one command line (a safety
+matcher and a script discovery) that kept disagreeing about which script would run.
+
+`python tools/coordination/doctrine_outbox.py validate --exercise --bus <bus clone> doctrine-outbox/<file>.md` (the bus
+defaults to `$FACTORY_BUS_CLONE`) clones the bus's committed tip into a scratch directory with
+`git clone --local --no-hardlinks`, drops its `origin`, checks every command the item names there, without a shell, then
+removes that directory by name. The bus is only read. **"Refuse if `--bus` resolves to the live clone" means this (hub
+ruling, r2):** no route runs with its working directory, a `-C`/`--git-dir`/`--work-tree` target, or any argument or
+`--fill` value (also the value of `--opt=VALUE`) that resolves inside the live bus; that route is `ROUTE_UNSAFE`. A
+`--scratch-root` inside the bus is exit 2. "Inside" is decided on identity, not spelling: real path (junctions, symlinks
+and 8.3 names followed), `..` collapsed, case folded, trailing separators dropped. `<scratch>` in a route names the scratch
+clone. A bus clone behind its own `origin` prints `ROUTE_BUS_STALE <behind>` on stderr (the exit is unchanged). A command is:
+- a line of a fenced block whose info string starts `route` (`$ ` or `> ` prompt and `#` lines dropped); or
+- a backticked span of two or more words inside a route section, which opens at a `Route:` or `Adopt:` label
+  line (bullet and bold allowed) and runs to the next blank line, `#` heading or fence. Bullets right under it,
+  such as `- **Pin:**`, are in the section. A one-word span (`debt`, `RULINGS.md`) is a name, not a command.
+
+**Every route gets a safety screen and a static existence check, and neither runs anything.** The screen refuses a route
+that is not offline, credential-free and confined to the clone (the `ROUTE_UNSAFE` list below). The existence check needs
+the program to be a file in one of the absolute entries of `PATH` (walked by hand with `PATHEXT`; a relative, empty or quoted
+entry is dropped) or, when it is spelled as a path, a file inside the clone, never the current directory, and every script the
+route names to be a file inside the clone, symlinks and junctions followed: the script of `python`/`py`, `node` (and its `-r`/`--require`/`--import`/`--loader`
+preloads), a shell (and its `--rcfile`/`--init-file`), `deno run`, `bun run`/`bun <file>` (and `--preload`), `pwsh -File`,
+`awk -f`, `tclsh`, `perl`, `ruby`, `php`, ... A `bun run build` names a package script, not a file, and is not looked up.
+The program is read by what it resolves to as well as by its name, so a link called `helper.exe` that is really `python`
+has its script checked. A miss is `ROUTE_MISSING` with a typed reason first in its detail: `PROGRAM_NOT_FOUND`,
+`PROGRAM_IS_SHIM` (the `git` found is a `.cmd`/`.bat` shim, which cannot start without `cmd /c`), `SCRIPT_NOT_FOUND` or
+`SCRIPT_OUTSIDE_CLONE` (an absolute path, a `..` path or an outward link). This covers the #468 and #469 evidence: a nonexistent runner script, and a
+`doctrine-sync debt` no bus carries.
+
+**Only a route whose program is on the execution allowlist is run, and the allowlist is `git`.** It is decided on the
+program as the route spells it, a bare name (`git`, `git.exe`; never a path, so `tools/git` and `/usr/bin/git` are not on
+it), and on its resolved executable: the first `git` on a `PATH` stripped of every relative entry and every entry inside the
+scratch clone, whose real path is not inside the clone and is itself called `git`. Those entries are walked by hand (the same
+walk finds every other program's existence check) and the current directory is never consulted (on Windows `shutil.which`
+searches it before `PATH`, so it would find a `git.exe` or a `nosuch.exe` planted in the clone). A `git` that resolves only inside the
+clone, or to some other program, is `ROUTE_UNSAFE`; a `.cmd`/`.bat` shim is `ROUTE_MISSING PROGRAM_IS_SHIM`. Every other program is
+**existence-checked but not executed**: it prints `ROUTE_NOT_EXECUTED`, which is a skip and not a failure (so a card's
+`py -3 tools/x.py` still validates), and it is never launched, whatever its arguments. That includes every shell,
+interpreter and wrapper, and the programs a name list would have missed: `pytest` is never run (it executes Python named in
+its arguments, its conftest files, `-p` plugins and `PYTEST_ADDOPTS`), nor are `pyw`, `ipython`, `java`, `go`, `php-cgi`,
+`jq`, a renamed copy or a link of any of them, or a spelling of a path (`POWERS~1.EXE`, `py.exe.`). An unfilled `<name>`
+placeholder on a route that is not run is noted in its detail rather than failing it, and the script check skips an operand
+that holds one. Widening the allowlist is the separate later card CARD-ROUTE-EXERCISE-LAUNCHER-ALLOWLIST-1: exact shapes, a
+pinned executable and the secondary execution inputs (preload flags, environment) have to be closed first. Because nothing
+launches on the strength of the static check's reading of a program's options, the PR 479 bypass class (a check that accepts
+one script while the program runs another) cannot reach a launch. Each known repro has an acceptance test row that mocks the
+process launch and asserts it is not called:
+
+| Repro (none is on the allowlist) | Outcome |
+|---|---|
+| B1: `python <outside script that exists>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `pwsh -f <outside>` (and `-fi`, `-File:`, `/f`) | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `pwsh <outside.ps1> -File <in-clone>` (pwsh 7 runs the first bare argument) | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `pwsh -NoProfile <outside.ps1> -f` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `node -r <in-clone> <outside.js>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `bash --rcfile <in-clone> <outside.sh>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `bash -o x <outside.sh>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+| `python --check-hash-based-pycs default <outside.py>` | `ROUTE_MISSING SCRIPT_OUTSIDE_CLONE`, not launched |
+
+A second row set forces the static check to pass everything and shows each repro is still `ROUTE_NOT_EXECUTED` and still not
+launched.
+
+**A `git` route runs only read-only verbs, each with its own option allowlist (r5, the final round).** Four rounds of
+refusing named git options each leaked one more option class, and the real card routes on the bus run no git at all, so the
+screen is now positive (`ROUTE_GIT_VERBS` in the tool is the whole grammar; anything it does not name is `ROUTE_UNSAFE`
+before launch):
+- Before the verb only `-C <dir>` is accepted, and only into a directory inside the scratch clone that is not, and does not sit
+  under, a bare repository layout (`HEAD`, `objects/` and `refs/`). `-c`, `--config-env`, `-p`/`--paginate`, `--exec-path`
+  and every other global option are refused, and so is an alternate git directory (`--git-dir`, `--work-tree`, `--namespace`,
+  `--super-prefix`, `--bare`) in any form or abbreviation, whether its target is outside the clone (the diagnostic says so)
+  or inside it.
+- The verb is one of the read-only verbs `log`, `show`, `diff`, `grep`, `rev-parse`, `rev-list`, `status`, `ls-files`,
+  `ls-tree`, `cat-file`, `describe`, `blame`, `shortlog`, `merge-base`, `for-each-ref`, `show-ref`, `name-rev`,
+  `count-objects`, `version`, `branch` and `tag` in list form only (no name unless `--list` is given, and for `tag` also `-l`;
+  `branch` has no `-l` letter, which an older git reads as `--create-reflog`; and no `-d`/`-D`/`-m`/`-c`/`-f`/`-a`/`-s`/`-u`),
+  and `config` in a read mode only (its first word `--get`, `--get-all`,
+  `--get-regexp`, `--list` or `-l`). No verb that can write is run: `commit`, `checkout`, `switch`, `restore`, `reset`,
+  `merge`, `cherry-pick`, `revert`, `stash`, `apply`, `am`, `mv`, `rm`, `rebase`, `add`, `notes`, `worktree`, `gc`, `fetch`,
+  `pull`, `push`, `clone`, `submodule`, ... are all `ROUTE_UNSAFE`, as is an alias (`git ship`, or a `!` alias such as
+  `git !echo hi`). (`status` and `diff` may refresh the scratch clone's own index, as git always does.)
+- Each option must be on that verb's list, matched as an exact token. Git reads any unambiguous prefix of a long option; the
+  screen reads none, so an abbreviation (`--onel`, `--unsafe-p`, `--build-f`, `--strat=`) is refused. A long option takes a
+  value only as `--name=value` (`--format=%h`), never as the next token. A short-option cluster is read letter by letter
+  against the verb's letters, and a value-taking letter takes the rest of the cluster or the next token (`-n3`, `-n 3`,
+  `grep -e TODO`), so `merge -qsoctopus`, `grep -nO` and `log -sp` are refused. `--` ends the options; what follows is
+  pathspecs. None of these is on any list: `--output`, `--no-index`, `--pathspec-from-file`, `--contents`, `--file`,
+  `--textconv`, `--ext-diff`, `-O`/`--open-files-in-pager`, `--exec`, `--upload-pack`, `--unsafe-paths`,
+  `--build-fake-ancestor`, `--strategy`/`merge -s` and `--gpg-sign`.
+- Every option value and every positional (a revision, a path or a pathspec) must resolve inside the scratch clone, read
+  relative to the `-C` directory: `..` collapsed, symlinks, junctions and 8.3 names followed, case folded on Windows. An
+  absolute path outside the clone, a `..` that leaves it and an outward link are refused, and so is a positional that starts
+  with `:` (pathspec magic such as `:(top)`, `:/` or `:!`, or an index path).
+
+A `git` route that is run gets the interpreter-injection environment stripped: `PYTHONPATH`, `PYTHONSTARTUP`, `PYTHONHOME`,
+`NODE_OPTIONS`, `NODE_PATH`, `PERL5OPT`, `PERL5LIB`, `RUBYOPT`, `BASH_ENV` and `ENV`, plus credential-shaped variables, every
+`GIT_*` variable (`GIT_EDITOR`, `GIT_SEQUENCE_EDITOR`, `GIT_PAGER`, `GIT_ASKPASS`, `GIT_SSH`, `GIT_SSH_COMMAND`,
+`GIT_EXTERNAL_DIFF`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, ...) and the
+generic helpers `EDITOR`, `VISUAL`, `PAGER` and `SSH_ASKPASS`. Its git config is isolated: `GIT_CONFIG_NOSYSTEM=1`,
+`GIT_ATTR_NOSYSTEM=1`, and
+`GIT_CONFIG_GLOBAL` names an empty file the tool writes beside the clone in its scratch directory (emptied before every run),
+so a driver, alias or helper defined in the system config, `~/.gitconfig` or the XDG config never applies; a test defines a
+textconv driver through `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `~/.gitconfig`, the XDG config (with an XDG attributes file
+selecting it) and `GIT_CONFIG_COUNT`, shows a plain `git show HEAD` runs it each time, and shows the route never does. Its `PATH`
+keeps only the absolute entries whose real path is outside the clone (a `.`, empty, relative or quoted entry, and a junction
+or link into the clone, are dropped), so a `false.exe` or `gpg` planted in the clone is never found. Git is started as
+`git -c core.pager=cat -c core.editor=false -c diff.external= -c core.fsmonitor=false -c commit.gpgsign=false
+-c tag.gpgsign=false -c safe.bareRepository=explicit -c gpg.program=false -c gpg.ssh.program=false
+-c gpg.x509.program=false -c core.attributesFile= -c core.excludesFile=
+-c core.hooksPath=<an empty directory beside the clone in the scratch> ...`, so no pager, editor, external diff, hook,
+signing program or attributes or excludes file of the host is reachable even through a verb that wants one (`--show-signature`
+is not on the option list of `log` or `show`), and a bare repository committed in the clone is never opened as the
+repository.
+
+The scratch clone is made under the same isolation as the routes, before any route is screened (`run_isolated_git`: the same
+git binary, environment and `-c` pairs, with `git clone --local` and the two follow-up calls going through it). Without that,
+`git clone` read the host's own config, and this host's system `gitconfig` defines `[filter "lfs"] process = git-lfs
+filter-process`, so a bus `.gitattributes` of `* filter=lfs` started git-lfs at checkout. A test builds a bus selecting
+a filter (`keyprobe`, and `lfs`) or a `post-checkout` hook that the host config defines (through `GIT_CONFIG_GLOBAL` and
+`GIT_CONFIG_SYSTEM`), shows a plain `git clone` starts the program, and shows `validate --exercise` never does and checks the
+committed bytes out as committed. A route must be exercisable
+offline and only in the scratch clone, so these are `ROUTE_UNSAFE` too, whether or not the program would be run:
+- a shell operator (pipe, redirect, `&&`, `;`) or an environment-assignment prefix;
+- any `gh`, `claude`/`codex` `auth|login|logout`, a network client (`curl`, `ssh`, `npx`, ...), `find -exec`, a URL or
+  `user@host:` argument, and a credential assignment (`GH_TOKEN=`, `ANTHROPIC_*=`, `*_TOKEN=`, `*_KEY=`, `*PASSWORD*=`)
+  or `--token`.
+
+Each route prints one `ROUTE_OK`, `ROUTE_NOT_EXECUTED`, `ROUTE_MISSING`, `ROUTE_FAILED` (non-zero exit, an unfilled `<name>`
+placeholder on a route that is run, or it does not parse), `ROUTE_TIMEOUT` (`--timeout`, default 60 s; the whole process tree
+is killed, via a Job Object on Windows and a process group on POSIX) or `ROUTE_UNSAFE` line, then the item name and the
+command. Anything but the first two exits 1. Only the last 64 KiB of a route's output is kept. Route text is split like a
+POSIX shell (on Windows a backslash path stays whole). Give `<name>` placeholders a value with `--fill name=VALUE`.
+`--timeout` must be a finite number of seconds above zero; `nan`, `inf`, `0` and a negative value are refused before any
+route runs. A credential's value is never printed: it shows as `NAME=<redacted>` in every diagnostic and route line, whatever
+it contains, in the form it was filled and in the form `repr()` writes it. Put a command a card ships but the bus does not
+yet have in prose, not in a route.
+
+## Ruling candidates name what they supersede (ROUTE-RULING-SUPERSEDES-1)
+
+A ruling candidate is an item with a heading or body line that opens with `Ruling candidate` (any case, zero or more
+spaces or hyphens between the words, whole words, optionally after `Proposed`, `Draft` or `New`) once its text is
+rendered (HTML entities decoded, HTML tags dropped with their text kept, any line with a `|` split into cells that each
+open a block) and normalised
+(Unicode NFKD with combining marks dropped, then NFKC, zero-width and other format characters deleted, which joins the
+two words, so the phrase may have no separator at all, no-break spaces and en or em dashes made plain) and its markdown
+is off: list bullets (`-`, `*`, `+`, `1.`), quote marks (`>`), heading
+marks (`#`), bold, italics, backticks, straight and curly quotes and opening brackets, whatever follows (`:`, ` (r2):`,
+` - `, the end of the line). A line that opens with the phrase, then cites a candidate's path and a status word
+(`remains`, `stays`, `is`, `are`, `was`, `were`, `has`, `have`, `had`, `becomes`, `became`:
+``- Ruling candidate `ruling-candidates/x.md` remains PROPOSED``) is a citation, not a marker; a colon, a dash, nothing
+or any other word after the phrase or the path keeps it one (``... `ruling-candidates/x.md` proposes that X`` is a
+marker: an item does not carry its own path, so the verb is what tells a proposal from a citation, and an item's own path
+followed by a status word is still read as a citation). A heading
+line also counts when the phrase follows ` - ` or `:` (`### mlv-app, 2026-10-16 - RULING CANDIDATE (r2): X`). A line
+that only mentions the phrase mid-sentence is not a marker, and neither is a wrapped continuation line: a marker only
+sits where a block opens: the item's first line, a line after a blank one, a line right after an ATX heading, a setext
+underline, a thematic break (`---`, `***`, `___`) or a code-fence line (backtick or tilde, opening or closing), a
+heading, a list item, a table cell, a blockquote opener, a setext line. So prose that wraps onto `ruling-candidates/x.md`
+is left alone. A marker inside a fence still counts (the check fails closed). Not rendered (card
+ROUTE-RULING-MARKUP-FORMS-1 counted each on the bus at origin/master 918e8e40 before deciding: none is used there, and
+rendering them flips no bus block, so each is PINNED by a test and left alone): HTML comments, footnotes, definition
+lists, look-alike letters from other scripts, a bullet glyph that is not markdown, decoration between a heading
+separator and the phrase (`### p - "RULING CANDIDATE": X`), a declaration label written in a form the tool does not read
+(`> touches/supersedes: R15`, `1. touches: R15`, a full-width colon; refused, so it fails closed), a fence-like line
+indented four spaces (it leaves the fence state open, so later wrapped prose is refused, also closed), prose
+after a pipe that opens with the phrase (refused: a cell opens a block), U+2236 (RATIO) written as a colon (it is
+neither a `-`/`:` before the phrase nor a colon after it, so `### p ∶ RULING CANDIDATE X` is not a marker), and a table
+delimiter row (`| --- | --- |`: it makes the last cell of the row above a setext heading, so a `-` or `:` form in that
+cell counts there and nowhere else in the row). It must declare what it overlaps, so the producer finds a contradiction before the reviewer does
+(seed: PR 469 r1). `validate` refuses one without a `touches/supersedes:` declaration (`touches:` and `supersedes:`
+count too, as does `Relationship to existing doctrine:`, the field of the bus candidate template; same list and target
+rules; bold and a bullet allowed, entries add up across labels). Each entry may open with one verb (`extends`,
+`supersedes`, `distinguishes`, `touches`, `narrows`, `adopts`), whose target is still checked. The entries are rule ids (`R15`, `R14.8`) or
+bus-relative paths (`RULINGS.md:1126-1152`, `tools/fleet-sweep.mjs`), comma or semicolon separated on the label line
+or as bullets under it, or the single entry `none: <reason of at least 4 words>`. A label inside a fenced block does
+not count. Typed refusals (exit 1):
+- `RULING_CANDIDATE_NO_SUPERSEDES`: no label, or an empty one;
+- `RULING_CANDIDATE_NONE_NEEDS_REASON`: `none` with fewer than 4 reason words;
+- `RULING_CANDIDATE_NONE_WITH_RULES`: `none` beside another entry;
+- `RULING_CANDIDATE_TARGET_MALFORMED`: an entry that is not a rule id or a bus-relative path (absolute, `..` and
+  backslash paths and bare words are not targets);
+- `RULING_CANDIDATE_TARGET_NOT_ON_BUS`: with a bus clone (`validate --bus PATH`, default `$FACTORY_BUS_CLONE`), an
+  entry the clone does not hold at its committed tip (the one commit `HEAD` resolves to when that item's check starts:
+  every target of one item is read there, but two items in one `validate` call each resolve their own, so they can be
+  judged at different tips): a path that `git ls-tree <tip> -- <path>` does not list, or a
+  rule id that is not a heading or bold bullet of `RULINGS.md` (prose mentions and `R15` against `R150` or `R15.3`
+  do not count). Line ranges and anchors are not checked. The bus is only read.
+
+A bus clone that cannot be read is UNKNOWN `RULING_BUS_UNREADABLE` (exit 2), never a pass; a clone whose tip is known but
+whose object cannot be read (a missing or corrupt tree or `RULINGS.md` blob, or a path the tree lists whose blob or
+subtree is absent: the entry is read with `git cat-file -e`, never fetched) is UNKNOWN `RULING_BUS_OBJECT_UNREADABLE`
+(exit 2), never a missing target and never a pass. "At the bus tip" holds only when a bus clone is configured. With no bus the shape is
+still checked and `validate` prints a NOTE naming the targets it could not check. Non-ruling items are not looked at,
+the drain does not apply this check, and an item already sent is not re-judged. The 450-word cap still holds, so a
+candidate replaces its prose "relationship" block with the list.
+
+`validate --bus` is defined once, for both checks: the ruling-candidate check above reads it and `--exercise` copies it.
+It is accepted without `--exercise`; `--fill` and `--scratch-root` still need `--exercise`. A duplicate
+`validate_p.add_argument("--bus", ...)` makes argparse raise for every subcommand, the push hook included, so a test
+asserts `build_parser()` defines it exactly once.
+
+## Concerns to the CoS (COS-CONCERN-CHANNEL-1)
+
+A project had no way to tell the CoS a concern: only the CoS writes `cos-feedback/`, and a project-owned
+file is the one legal shape (bus Law 2). `target: specs/mlv-app/cos-concerns.md` with `kind: concern` is
+that file. The body is a `### mlv-app-cc-<yyyymmdd>-<n>` heading and exactly seven `- field: value` lines,
+each on one line: `id`, `to` (always `CoS`), `opened_utc`, `expires_utc` (after `opened_utc`, and no more
+than 14 days after it: a longer window is refused as `CONCERN_WINDOW_TOO_LONG`), `kind` (`output-format` |
+`process` | `shared-tool-defect` | `fleet-pattern`), `evidence` (bus SHAs, public PR comment ids, repo paths)
+and `ask` (one sentence). The set is closed, so no field is an approval, a ruling or a permission; free text is
+data. The CoS answers each id once, in its own `cos-feedback/mlv-app/concerns.md`:
+`<id> ADOPTED|DISTINGUISHED|NEEDS-INFO <reason>`. Open = entries with no answer line and not expired, derived
+and never stored.
+
+The drain holds an entry, and the refusal names the reason:
+- `CONCERN_CHANNEL_NOT_RATIFIED` until the fetched bus tip's `cos-feedback/README.md` carries the exact duty
+  line `- The CoS reads `CoS-CONCERN:` PR comments and every `specs/*/cos-concerns.md` each pass.`: a line EQUAL to
+  it (a leading `-` or `*` bullet followed by 1 to 4 spaces or a tab is optional, the line may be indented 0 to 3
+  spaces and carry trailing whitespace, nothing else). A line that only starts like it, adds a clause, forbids or
+  negates it, names only R1, sits at 4 or more spaces or a tab, has 5 or more spaces after the bullet (both are
+  indented code blocks), or sits inside a ``` fence, a `~~~` fence or an HTML comment (one line or many) does not
+  count, so nothing is written to a file nobody reads. Lines end only at `\n`, `\r\n` or `\r`, as in Markdown: a
+  vertical tab, form feed, `\x85`, U+2028 or U+2029 inside the text does not start a new line. The scan does
+  not parse inline code, so a `<!--` inside a code span before the line keeps the gate shut (it fails closed);
+- `CONCERNS_PATH_IS_LINK` when `specs` or `specs/mlv-app` at the tip is a link (120000), a gitlink (160000) or
+  any other entry that is not a directory (a regular file, say, worded "not a directory: mode 100644"), and
+  `CONCERNS_PATH_NOT_REGULAR_FILE` when the tip's `specs/mlv-app/cos-concerns.md` is a link or any entry
+  other than a regular 100644 blob: that concern alone is refused and the rest of the drain goes on. A card gets
+  the same walk over its own path under `CARDS_PATH_IS_LINK` (the same three cases at `specs` or `specs/mlv-app`);
+- `CONCERN_EXPIRED` when `expires_utc` is not after the clock at drain time;
+- `CONCERN_DUPLICATE_ID` when the id heads more than one committed item (all of them are held), or is already
+  in the tip's `specs/mlv-app/cos-concerns.md`; the refusal names the fields that differ from the published
+  entry, or says none does. An id names exactly one concern.
+
+A concern about one PR goes instead as a comment on that PR's thread starting `CoS-CONCERN:`. The CoS reads
+those comments too: the duty line is live at the bus `cos-feedback/README.md:65`.
 
 ## Traps are cards (bus R14.1)
 
@@ -141,6 +403,23 @@ print as ADVISORY lines and never fail. The ledger path is `--ledger`, else env 
 only past disposed findings, and a rewritten prefix restarts the scan from 0. `--baseline` is the one
 explicit act that waives history up to now and says how many findings it waived. Known limit: it checks
 that a disposition is well formed, not that the named item exists.
+
+## A sent item is never edited (OUTBOX-SENT-CARD-NEVER-EDITED-1)
+
+The idempotency key is `sha256(source_commit, target, body)`, so editing the body of an item the drain already sent gives
+it a new key and the next drain publishes it a second time (sent ledger rows 70 and 72; #533's route-exercise card).
+`check-commits` and the pre-push guard therefore refuse a commit that edits such an item: `SENT_ITEM_EDITED <path> key=<old key>`.
+Not counted as an edit: a change that leaves the key as it was (front matter beyond the key's inputs). Allowed: the commit also
+ADDS a new item with a `supersedes:` line naming the old one by file stem, `## ` card id or key as a COMPLETE token (split on
+whitespace, commas and semicolons; markup, a `.md` suffix and the outbox directory are trimmed; compared by equality, never as a
+substring: `example-10` and `example-1-followup` do not name `example-1`). Never refresh a digest inside a
+sent card; add the next superseding card (a tool change moves `bus_candidate.sha256_lf`, and only the newest card must quote it).
+
+The ledger is untracked and lives on the board, so the check reads `--ledger <sent.jsonl>`, else the config's `ledger_rel` here, else
+in the checkout that owns the git dir (a lane's linked worktree has none). With no ledger, as on hosted CI, the check is NOT run: the
+output says `sent-ledger-absent` and `SKIPPED` (`check-commits over <range> -- trailers only; ...`, exit 0), never `check-commits OK`.
+A ledger that exists but yields no readable key cannot say what was sent, so it is the same skip, `sent-ledger-unreadable`.
+Merge commits are not judged.
 
 ## Sent tracking and the drain
 

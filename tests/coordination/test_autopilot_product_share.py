@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -180,15 +181,23 @@ class CacheTests(ProductShareBase):
         self.assertTrue(res['stale'])
         self.assertEqual(res['cache'], 'refreshing')
         self.assertIn('[stale]', res['line'])
-        deadline = time.monotonic() + 60
+        started = time.monotonic()
+        deadline = started + 60
         refreshed = None
+        last_error = None
         while time.monotonic() < deadline:
-            saved = json.loads(self.verdict_path.read_text(encoding='ascii'))
-            if saved['verdict'] == 'GREEN':
-                refreshed = saved
-                break
-            time.sleep(0.5)
-        self.assertIsNotNone(refreshed, 'the detached worker never refreshed the verdict file')
+            # The refresh rewrites the file while this loop reads it; a read that races the swap is retried, not fatal.
+            try:
+                saved = json.loads(self.verdict_path.read_text(encoding='ascii'))
+            except (OSError, ValueError) as e:
+                last_error = repr(e)
+            else:
+                if saved['verdict'] == 'GREEN':
+                    refreshed = saved
+                    break
+            time.sleep(0.2)
+        self.assertIsNotNone(refreshed, 'the detached worker never refreshed the verdict file within %.1fs (last read error: %s)'
+                             % (time.monotonic() - started, last_error))
         after = self.run_step(guard, '-Detach')
         self.assertEqual(after['cache'], 'hit')
         self.assertEqual(after['verdict'], 'GREEN')
@@ -198,6 +207,179 @@ class CacheTests(ProductShareBase):
         res = self.run_step(sleeper, '-Detach', '-WorkerDeadlineSec', '2')
         self.assertEqual(res['verdict'], 'UNKNOWN')
         self.assertIn(res['cache'], ('refreshing', 'none'))
+
+
+class AtomicWriteTests(unittest.TestCase):
+    """Write-FileAtomic must swap the verdict under a path that always exists (CI-FLAKE-PRODUCT-SHARE-DETACH-REFRESH-1).
+
+    The detached worker rewrites the verdict file while the beat (and the detach test) read it. A writer that deletes the
+    destination before moving the temp file onto it shows readers no file at all, which is what lost two merge_group runs.
+    """
+    WRITES = 400
+    DEADLINE_SEC = 90
+    MIN_OVERLAPPED = 50
+
+    def start_target(self):
+        target = Path(tempfile.mkdtemp(prefix='product-share-atomic-')) / 'state' / 'product-share-verdict.json'
+        self.addCleanup(shutil.rmtree, target.parent.parent, True)
+        target.parent.mkdir(parents=True)
+        target.write_text(json.dumps({'verdict': 'RED', 'pad': 'x' * 2000}), encoding='ascii')
+        return target
+
+    def drive_writer(self, target, cmd, handshake=False):
+        """Runs the writer child while polling the target; returns (writer returncode, writer output, poll stats).
+
+        With handshake=True the reader creates PS_SEEN0 once it has read generation 0, and the writer cmd waits for that file.
+        """
+        env = dict(os.environ, PS_SCRIPT=str(SCRIPT), PS_TARGET=str(target), PS_WRITES=str(self.WRITES))
+        seen0 = None
+        if handshake:
+            seen0 = target.parent.parent / 'seen-generation-0.flag'
+            env['PS_SEEN0'] = str(seen0)
+        # Output goes to files, not pipes: a failing writer is chatty and a full pipe would block it while this loop keeps polling.
+        out_path = target.parent.parent / 'writer.out.txt'
+        err_path = target.parent.parent / 'writer.err.txt'
+        with open(out_path, 'w') as out_f, open(err_path, 'w') as err_f:
+            writer = subprocess.Popen(PWSH + ['-Command', cmd], stdout=out_f, stderr=err_f, env=env)
+            try:
+                stats = self.poll_while_running(writer, target, self.DEADLINE_SEC, seen0)
+            finally:
+                # A writer that is still alive here hung or timed out; it must not outlive the test or keep the output files open.
+                if writer.poll() is None:
+                    writer.terminate()
+                    try:
+                        writer.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        writer.kill()
+                writer.wait()
+        out = out_path.read_text(errors='replace')[:2000]
+        err = err_path.read_text(errors='replace')[:2000]
+        return writer.returncode, f'{err}\n{out}', stats
+
+    def assert_overlapped(self, stats):
+        # Reads taken while pwsh starts, or after a stalled writer, prove nothing: the reader must have watched the file change.
+        self.assertGreaterEqual(stats['generations'], 2, f'the reader saw fewer than 2 distinct rewrites: {stats}')
+        self.assertGreater(stats['overlapped'], self.MIN_OVERLAPPED, f'too few reads overlapped active rewrites: {stats}')
+        # Make the margin above the floor visible on success, so a slowly eroding margin shows before it turns into a red run.
+        print(f'overlap check passed: {stats["overlapped"]} bracketed reads of {stats["reads"]} '
+              f'(floor > {self.MIN_OVERLAPPED}, margin {stats["overlapped"] - self.MIN_OVERLAPPED}), '
+              f'{stats["generations"]} generations', file=sys.stderr)
+
+    def test_rewriting_the_verdict_never_shows_a_reader_an_absent_or_partial_file(self):
+        target = self.start_target()
+        cmd = (". $env:PS_SCRIPT; for ($i = 0; $i -lt [int]$env:PS_WRITES; $i++) { "
+               "Write-FileAtomic $env:PS_TARGET ('{\"verdict\":\"GREEN\",\"i\":' + $i + ',\"pad\":\"' + ('y' * 2000) + '\"}') }")
+        returncode, output, stats = self.drive_writer(target, cmd)
+        self.assertFalse(stats['timed_out'], f'the writer did not finish within {self.DEADLINE_SEC}s: {output}')
+        self.assertEqual(returncode, 0, f'the writer must not fail while a reader holds the file: {output}')
+        self.assert_overlapped(stats)
+        self.assertEqual((stats['absent'], stats['partial']), (0, 0), f'{stats}')
+        self.assertEqual(json.loads(target.read_text(encoding='ascii'))['i'], self.WRITES - 1)
+
+    def test_overlap_check_rejects_a_writer_that_publishes_no_new_generation(self):
+        # More than 50 reads accrue while pwsh starts up and idles, yet no rewrite ever overlapped them.
+        target = self.start_target()
+        returncode, output, stats = self.drive_writer(target, 'Start-Sleep -Seconds 3')
+        self.assertEqual(returncode, 0, output)
+        self.assertGreater(stats['reads'], 50, 'the stub must still accrue enough reads to defeat a bare read count')
+        with self.assertRaises(AssertionError):
+            self.assert_overlapped(stats)
+
+    def test_reads_in_the_idle_tail_after_two_generations_do_not_raise_the_overlap_count(self):
+        # The writer publishes generation 0, waits (bounded) until the reader signals it has read generation 0, publishes 1, then
+        # idles for 2 s. A fixed sleep here let a reader descheduled past it miss generation 0 and see generations == 1. Every
+        # read of the idle tail sees generation 1 and no change after it, so none of them was taken during an active rewrite.
+        target = self.start_target()
+        cmd = (". $env:PS_SCRIPT; "
+               "Write-FileAtomic $env:PS_TARGET ('{\"verdict\":\"GREEN\",\"i\":0,\"pad\":\"' + ('y' * 2000) + '\"}'); "
+               "$sw = [Diagnostics.Stopwatch]::StartNew(); "
+               "while (-not (Test-Path -LiteralPath $env:PS_SEEN0)) { "
+               "if ($sw.Elapsed.TotalSeconds -gt 10) { [Console]::Error.WriteLine('the reader never signalled it observed generation 0 within 10 s'); exit 3 }; "
+               "Start-Sleep -Milliseconds 10 }; "
+               "Write-FileAtomic $env:PS_TARGET ('{\"verdict\":\"GREEN\",\"i\":1,\"pad\":\"' + ('y' * 2000) + '\"}'); "
+               "Start-Sleep -Seconds 2")
+        returncode, output, stats = self.drive_writer(target, cmd, handshake=True)
+        self.assertEqual(returncode, 0, output)
+        self.assertEqual(stats['generations'], 2, f'the reader must watch both rewrites: {stats}')
+        self.assertGreater(stats['idle_tail'], 50, f'the idle tail must accrue enough reads to defeat a bare read count: {stats}')
+        self.assertLess(stats['overlapped'], stats['idle_tail'], f'idle-tail reads were counted as overlapping rewrites: {stats}')
+        self.assertLessEqual(stats['overlapped'] + stats['idle_tail'], stats['reads'], f'{stats}')
+
+    def test_bracket_counts_only_reads_between_two_observed_generation_changes(self):
+        count = self.count_bracketed_reads
+        self.assertEqual(count([]), 0)
+        self.assertEqual(count([None] * 30), 0, 'a seed file alone is no generation')
+        self.assertEqual(count([None, None, 0, 0, 0]), 0, 'one generation has no change to bracket a read')
+        # Reads 3 and 4 follow generation 0 and precede generation 1; the seed reads before generation 0 do not count.
+        self.assertEqual(count([None, None, 0, 0, 0, 1]), 2)
+        # The writer publishes generations 0 and 1 and idles: the 500 reads of the idle tail are not bracketed.
+        idle = [None, 0, 0, 1] + [1] * 500
+        self.assertEqual(count(idle), 1)
+        self.assertEqual(count(idle), count(idle[:4]), 'appending idle reads must not change the count')
+        # Reads that failed mid-swap sit between observed generations and do overlap a rewrite.
+        self.assertEqual(count([0, None, None, 1, 1, 1]), 2)
+        self.assertEqual(count([0, 1, 2, 3]), 2, 'the first and the last read have no generation on both sides')
+
+    @staticmethod
+    def count_bracketed_reads(trace):
+        """Counts the reads that fall between two OBSERVED generation changes.
+
+        trace holds one entry per read: the generation number it saw, or None for the seed file and for a read that failed.
+        The writer's generation number only grows. A read counts only when an earlier read had already seen a generation and a
+        later read sees a newer one than this read and every read before it did, so reads taken while pwsh starts up, or
+        after the writer has stopped rewriting, can never raise the count.
+        """
+        newest_later = [None] * len(trace)  # per read: the newest generation any later read saw
+        newest = None
+        for k in range(len(trace) - 1, -1, -1):
+            newest_later[k] = newest
+            if trace[k] is not None:
+                newest = trace[k] if newest is None else max(newest, trace[k])
+        newest_so_far = None  # the newest generation seen up to and including the previous read
+        bracketed = 0
+        for k, generation in enumerate(trace):
+            if newest_so_far is not None and newest_later[k] is not None:
+                if newest_later[k] > (newest_so_far if generation is None else max(newest_so_far, generation)):
+                    bracketed += 1
+            if generation is not None:
+                newest_so_far = generation if newest_so_far is None else max(newest_so_far, generation)
+        return bracketed
+
+    @classmethod
+    def poll_while_running(cls, writer, target, deadline_sec, seen0=None):
+        deadline = time.monotonic() + deadline_sec
+        stats = {'reads': 0, 'absent': 0, 'partial': 0, 'timed_out': False}
+        # The seed file has no 'i'; every rewrite carries its generation number. Each read is recorded in trace and the
+        # overlap count is derived from it afterwards, once the last generation change the reader saw is known.
+        trace = []
+        last_generation = None
+        last_change = None
+        while writer.poll() is None:
+            if time.monotonic() > deadline:
+                stats['timed_out'] = True
+                break
+            stats['reads'] += 1
+            generation = None
+            try:
+                generation = json.loads(target.read_text(encoding='ascii')).get('i')
+            except FileNotFoundError:
+                stats['absent'] += 1
+            except ValueError:
+                stats['partial'] += 1
+            except PermissionError:
+                pass  # a sharing violation while the swap is in flight: the file exists, the read is simply retried
+            trace.append(generation)
+            if seen0 is not None and generation == 0 and not seen0.exists():
+                seen0.touch()  # handshake: tells a waiting writer this reader has observed generation 0
+            if generation is not None and generation != last_generation:
+                last_generation = generation
+                last_change = len(trace) - 1
+            time.sleep(0.0005)
+        stats['generations'] = len(set(trace) - {None})
+        stats['overlapped'] = cls.count_bracketed_reads(trace)
+        # Reads after the last generation change the reader saw: the writer had stopped rewriting, or the reader missed it.
+        stats['idle_tail'] = len(trace) if last_change is None else len(trace) - 1 - last_change
+        return stats
 
 
 class PlanTests(unittest.TestCase):
@@ -276,6 +458,29 @@ class ExitCodeInvariantTests(ProductShareBase):
 
     def test_act_still_runs_when_the_verdict_step_is_broken(self):
         self.assertEqual(self.run_act(self.tmp / 'no-such-guard.ps1', 5), 5)
+
+
+class RequiresPowerShell7Tests(ProductShareBase):
+    """Write-FileAtomic uses File.Move(src, dst, overwrite), which Windows PowerShell 5.1 lacks (PRODUCT-SHARE-REQUIRES-PS7-1).
+
+    Every caller already runs pwsh 7: the worker relaunches itself with (Get-Process -Id $PID).Path and the staged live wiring
+    starts 'pwsh'. So the script refuses to start on 5.1 instead of reading UNKNOWN step-error after 100 failed writes.
+    """
+
+    def test_script_declares_requires_version_7(self):
+        lines = SCRIPT.read_text(encoding='ascii').splitlines()
+        self.assertIn('#Requires -Version 7', [line.strip() for line in lines if line.startswith('#Requires')])
+
+    @unittest.skipUnless(shutil.which('powershell.exe'), 'Windows PowerShell 5.1 is not installed')
+    def test_windows_powershell_5_1_is_refused_instead_of_reporting_a_step_error(self):
+        args = ['powershell.exe', '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', str(SCRIPT),
+                '-GuardPath', str(self.green_guard()), '-RepoRoot', str(self.tmp), '-SourceRef', 'fork/master',
+                '-VerdictPath', str(self.verdict_path), '-ProfilePath', str(PROFILE)]
+        r = subprocess.run(args, text=True, capture_output=True, env=self.env, timeout=120)
+        self.assertNotEqual(r.returncode, 0, f'5.1 must be refused, not run to a verdict: {r.stdout}')
+        self.assertIn('requires', (r.stderr + r.stdout).lower())
+        self.assertNotIn('step-error', r.stdout)
+        self.assertFalse(self.verdict_path.exists(), 'a refused start must not write a verdict')
 
 
 class AsciiOnlyTests(unittest.TestCase):

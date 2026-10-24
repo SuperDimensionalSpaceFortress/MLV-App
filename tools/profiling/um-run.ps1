@@ -59,6 +59,8 @@
 # unknown; launching is handled exactly like admission-wait (claimed, not launched); unknown (present
 # but unreadable) is cannot-tell and is never folded into none. A marker with no phase field (an agent
 # older than GATE-2) reads as launched, so such an agent sees exactly the behaviour it always did.
+#
+# LEASE-REQUEST-CHILD-NOT-AFTER-1: -NotAfterUtc is forwarded to the claim as meta.json notAfterUtc (the agent's deadline for the job).
 
 [CmdletBinding(DefaultParameterSetName = 'Script')]
 param(
@@ -94,6 +96,15 @@ param(
     # sees that hold. Well above the gate's 600 s hot cap, and a bound on its uncapped slots-full and
     # unknown-feed waits.
     [int]$MaxAdmissionWaitSec = 7200,
+    # LEASE-REQUEST-CHILD-NOT-AFTER-1: the agent's absolute deadline for this job (an ISO-8601 instant with a Z or +hh:mm
+    # offset; see UmRunDrop.psm1). The Bachelor agent takes no lease for the job and does not start it after notAfterUtc, up to
+    # its prelaunch window (its last check sits just before the child is created). A lease it requested before notAfterUtc that
+    # turns active inside a light job the agent runs during that wait is not renewed after notAfterUtc (a renew already in flight
+    # is collected or killed), but stays held, unrenewed, until that light job returns (heavy-slot.py marks it stale at 120 s).
+    # Clock skew between this host and the agent, a frozen agent and another agent are out of scope. '' (the default) sends none, and
+    # this script never derives one: callers that read the result by name after this client stops waiting (#633,
+    # VenueChain) still want such a job run.
+    [string]$NotAfterUtc = '',
     # Test-only: invoked with no arguments the instant the queue deadline is judged reached and no
     # claim has been seen yet, immediately BEFORE the recheck that follows it -- lets a test land a
     # claim marker deterministically inside what is otherwise a sub-millisecond window between
@@ -124,7 +135,16 @@ param(
     # (round 12, item 3) to prove the structural catch around the whole loop converts it to
     # UNRESOLVED rather than letting it propagate raw or be misclassified CLASS=UNKNOWN by a
     # caller. Production never passes this.
-    [scriptblock]$TestHookAtLoopTop = $null
+    [scriptblock]$TestHookAtLoopTop = $null,
+    # Test-only: invoked with no arguments TWICE at the QUEUE-DEADLINE claim site -- immediately
+    # BEFORE the recheck sets $claimedAt and again immediately after it, before the `continue`
+    # (UMRUN-SIBLING-1122-WAIT-LOCUS-1 r3). A test stamps its own clock in each call: the first
+    # stamp (claim_lo) is never later than the true claim instant, the second (claim_hi) never
+    # earlier, so the claim is bracketed and a scheduling pause on either side of $claimedAt cannot
+    # make a correct client look early. Deliberately NOT handed $claimedAt itself: a client whose
+    # claim is anchored wrongly must not be able to vouch for its own claim instant. Production never
+    # passes this.
+    [scriptblock]$TestHookAroundQueueDeadlineClaim = $null
 )
 
 $ErrorActionPreference = "Stop"
@@ -156,7 +176,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Command') {
 }
 if (-not (Test-Path $ScriptPath)) { throw "Script not found: $ScriptPath" }
 
-$dropLines = @(Invoke-UmRunDrop -Inbox $inbox -Outbox $outbox -ScriptPath $ScriptPath -JobId $JobId -SideFile $SideFile -JobTimeoutSec $TimeoutSec)
+$dropLines = @(Invoke-UmRunDrop -Inbox $inbox -Outbox $outbox -ScriptPath $ScriptPath -JobId $JobId -SideFile $SideFile -JobTimeoutSec $TimeoutSec -NotAfterUtc $NotAfterUtc)
 $jobId = $null
 $nonce = $null
 foreach ($line in $dropLines) {
@@ -347,8 +367,10 @@ while ($true) {
             if ($TestHookAtQueueDeadline) { & $TestHookAtQueueDeadline }
             $deadlineClaim = Get-UmRunClaimState -Path $startedMarker
             if ($deadlineClaim -eq 'launched') {
+                if ($TestHookAroundQueueDeadlineClaim) { & $TestHookAroundQueueDeadlineClaim }
                 $claimedAt      = [DateTimeOffset]::Now
                 $budgetDeadline = $claimedAt.AddSeconds($TimeoutSec)
+                if ($TestHookAroundQueueDeadlineClaim) { & $TestHookAroundQueueDeadlineClaim }
                 continue
             }
             if ($deadlineClaim -ne 'none') {

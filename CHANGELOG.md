@@ -16,3 +16,148 @@ maintained in this format.
   reporting.
 - A semantic repository-hygiene check that keeps those routes synchronized with
   their source policies.
+
+### Changed
+
+- Play starts faster: the wait from Play to the first shown frame drops from
+  about 0.9 s to about 0.15 s on the CUDA playback route
+  (PLAYBACK-STARTUP-WAIT-PREWARM-1).
+  - The audio device now runs on its own thread. While paused on a clip with
+    audio (audio output and drop-frame mode on), MLV App keeps the output
+    stream open and running on silence, so Play never waits for the device.
+    The audio is then started where the video will be when it becomes
+    audible, so a slow device start delays the sound but never puts it out
+    of sync.
+  - A held stream that sees no Play for 60 s is suspended (an active audio
+    stream can keep the computer awake). Pausing keeps the stream open:
+    the sound stops after what is already queued (about 0.2 s), as before.
+  - A changed default audio device, or a stream error, while paused re-opens
+    the stream on the new device at the next Play.
+  - Quitting no longer waits forever on a hung audio device. It waits up to
+    5 s, logs a warning, and leaves the audio thread behind.
+  - While paused after a clip loads, the CUDA texture playback route is warmed
+    once (shader program, one debayer run on scratch textures). This is
+    skipped when the window is already presenting that route at the same
+    size.
+  - `MLVAPP_PLAYBACK_AUDIO_SYNC_LEGACY` (default off) restores the old
+    synchronous audio start. `MLVAPP_PLAYBACK_ROUTE_PREWARM` (default on)
+    turns the warm off. Both take exactly `1`, `true`, `on` or `yes`, and
+    `0`, `false`, `off` or `no`, in any case. Any other value keeps the
+    default and is logged once.
+- Play at full resolution (scale 1) on the CUDA playback route starts sooner
+  (PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1).
+  - The paused warm now keeps the two textures it warmed, still registered
+    with CUDA, and the first frame of Play uses them. Before, the first frame
+    allocated and registered a new pair, which took about 100-200 ms at full
+    resolution. The kept pair is used only when the size matches and the
+    window is still showing the paused picture; otherwise it is freed and
+    the first frame allocates as before. A clip change, a window/fullscreen
+    change or a lost GL context frees it.
+  - The CUDA recon library is loaded while paused, not on the first frame
+    of Play.
+  - `MLVAPP_PLAYBACK_ROUTE_PREWARM_STAGE` (default on) turns off keeping the
+    textures, and `MLVAPP_PLAYBACK_RECON_BACKEND_PRELOAD` (default on) turns
+    off the early load. Both take the same values as
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM`, which still turns all of it off.
+  - Playback smoke logs a `playback_smoke.first_present_split` line saying
+    where the first frame's time went.
+- The first frame of Play on the CUDA playback route no longer pays for the
+  first GPU recon run (PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1).
+  - While paused, after the route warm, the paused frame is reconstructed
+    once on the GPU the same way Play's first frame is, and then debayered
+    into the kept textures. This sets up the recon (about 164 MB of buffers at
+    full resolution, plus the LUT upload) before Play instead of on its first
+    frame. Nothing is shown and nothing is cached. The GPU memory is now held
+    from that point instead of from Play: about 200 MB at full resolution,
+    about a quarter of that at half and a sixteenth at quarter.
+  - Any other render, decode or recon work goes first. A warm that finds work
+    pending is skipped and tried again 0.5 s later (for up to 30 s). A warm
+    that is already running when Play starts finishes first, so Play waits
+    for it: one recon run, or two when the warm runs the frame again for a
+    dual-ISO match that was not yet settled
+    (PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1, below).
+  - `MLVAPP_PLAYBACK_RECON_WARM_RUN` (default on, same values as
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM`) turns it off.
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM=0` still turns everything off.
+  - Playback logs one `playback_recon_warm` line per warm. The
+    `first_present_split` line adds `warm_run`, `set_clip_at_play` and
+    `set_luts_at_play`, and a new `playback_smoke.render_first_split` line
+    splits the first render into decode, llrawproc and the rest.
+- On the CUDA playback route, Play now wakes the GPU as it starts, so the first
+  frame's debayer does not run at idle GPU clocks
+  (PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1).
+  - When Play starts, and the AMaZE library is already loaded, MLV App runs
+    one small GPU task on a lowest-priority stream while the first frame is
+    decoded. It stops when that frame's debayer finishes, at the first shown
+    frame, or after 400 ms at most. Nothing runs while paused, and it never
+    keeps the GPU clocks up while idle. The CPU route never touches CUDA for
+    it.
+  - `MLVAPP_PLAYBACK_GPU_CLOCK_KICK` (default off, same values as
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM`) turns it on. It shipped default on and
+    was switched to default off before release
+    (PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1), so a Play
+    wakes the GPU only when this is set to `1`.
+  - The paused warm, the route warm and the first four debayers of each Play
+    now read the GPU clock in-process (never through NVML) and time the
+    debayer on the GPU. The `playback_route_prewarm`, `playback_recon_warm`
+    and `first_present_split` lines add `amaze_sm_mhz_before`,
+    `amaze_sm_mhz_after` and `amaze_device_ms` (`NA` with an older AMaZE
+    library); `first_present_split` also adds `clock_kick`,
+    `clock_kick_reason` and `kick_lead_ms`. A new
+    `playback_smoke.amaze_first_frames` line lists the first four debayers,
+    and a `playback_gpu_clock_kick` line reports each Play's GPU task.
+- At full resolution on the CUDA playback route, the first frame of Play no
+  longer runs its debayer a second time
+  (PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-WARM-OUTPUT-REUSE-1).
+  - The paused warm already debayers that frame into the textures Play
+    shows first. MLV App now keeps a GPU copy of the warm's debayer input
+    (about 8 MB at full resolution, 2 MB at half, 0.5 MB at quarter). Play
+    skips its own debayer only when its input is byte-for-byte the same and
+    the frame, size, black level, white balance and filter setting all
+    match. In every other case it debayers as before. Look, LUT and blur
+    changes are applied when the frame is drawn, so they are never stale.
+  - `MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE` (same values as
+    `MLVAPP_PLAYBACK_ROUTE_PREWARM`) switches it. It is off by default
+    since PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 (below).
+  - The `first_present_split` line adds `warm_output_reuse`,
+    `reuse_reason` and `reuse_compare_ms`, and the `playback_recon_warm`
+    line adds `reuse_capture`. On a reused first frame,
+    `amaze_first_frames` prints `f0=reused`.
+- The paused warm now prepares the first frame exactly as Play will
+  (PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1).
+  - A dual-ISO clip whose exposure match was not yet settled had it solved
+    by the warm. Play then started from the settled match, so its recon
+    used a slightly different white level, and the warm's debayer never
+    matched Play's. When the warm's run changes that shared match, the
+    warm now runs the frame once more and keeps that run. The
+    `playback_recon_warm` line adds `warm_runs` (1 or 2); a match that
+    still changes on the second run keeps nothing (`not_converged`).
+  - Play's first frame also checks the recon's per-frame settings (white
+    level, black delta, exposure, noise, method flags, bright rows, frame)
+    against the warm's before it compares any pixels. A difference is
+    `reuse_reason=state_mismatch`. On a state or content miss,
+    `first_present_split` ends with `warm_state`, `play_state` and
+    `state_diff`.
+  - The CUDA recon library now waits for its copy of a kept frame before
+    handing it on. The debayer and the reuse check run on other GPU queues
+    that did not wait for that copy.
+  - `MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR` (default unset: off) names a
+    folder for a diagnostic dump of both debayer inputs on a content miss.
+    It writes `warm.u16`, `play.u16` and `diff.txt` and logs a
+    `playback_warm_output_reuse_miss_dump` line. Venue legs ask for it
+    with `generatorArgs.warmReuseMissDump`.
+  - Reusing the warm's debayer is now off by default;
+    `MLVAPP_PLAYBACK_WARM_OUTPUT_REUSE=1` turns it on. No venue run has
+    shown it hitting yet, and a miss costs a comparison (0.25 to 36 ms
+    measured) before the debayer runs anyway.
+  - With the reuse off, the paused warm no longer keeps its GPU copy of the
+    debayer input either: no allocation, copy or wait, and the
+    `playback_recon_warm` line says `reuse_capture=none`.
+  - Closing a clip right after a paused warm finished could free the clip
+    while the recon thread was still reading its settings for the warm's
+    completion. The warm's completion no longer reads the clip once the
+    warm is no longer counted as running.
+  - Closing a clip while a paused warm was still waiting for the recon
+    thread could let that thread start the warm on the freed clip. Closing
+    a clip now drops a warm that has not started, and waits for one that
+    has.

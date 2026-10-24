@@ -357,6 +357,23 @@ function Write-DispatchReservation {
     return [pscustomobject]$row
 }
 
+function Add-DispatchLogRow {
+    # LEDGER-APPEND-ATOMIC-WORKSTREAM-LOG-1: pwsh 7 Add-Content (FileMode.Append) loses rows when two dispatches
+    # finish together (~14 % across 6 writers). Same machine-wide mutex as Write-DispatchReservation above, so
+    # the dispatch log needs no second lock order; Add-Content is kept, so the bytes are unchanged.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Record)
+    $logMutex = [Threading.Mutex]::new($false, 'Global\MLV-App-DispatchLedger')
+    $logHeld = $false
+    try {
+        try { $logHeld = $logMutex.WaitOne(30000) } catch [Threading.AbandonedMutexException] { $logHeld = $true }
+        if (-not $logHeld) { throw 'dispatch log lock timeout' }
+        Add-Content -LiteralPath $Path -Value ($Record | ConvertTo-Json -Compress) -Encoding UTF8
+    } finally {
+        if ($logHeld) { $logMutex.ReleaseMutex() }
+        $logMutex.Dispose()
+    }
+}
+
 function Test-KillSwitchArmed { return (Test-Path -LiteralPath $KillSwitch) }
 
 function Test-RatioDispatchPermission {
@@ -986,6 +1003,12 @@ contradicting a deployment claim. A control proving your HASH CHECK discriminate
 prove you tested the right MACHINE: a falsifier on the mechanism is not a falsifier on the
 venue. (Measured 2026-09-04: a lane read PresentMon MISSING at C:\mlvtmp\mlv-agent\cache\
 from this VM and reported it as contradicting the card, while the GPU host was unreachable.)
+NEVER LIST \\bachelor\mlv-agent\processed OR \outbox UNBOUNDED (ls, ls -t, dir, find, or
+Get-ChildItem without a bound): they hold thousands of entries, and ``ls -t`` opens every file over
+SMB so Defender scans each one (2026-10-17: one listing ran >10 min at about one host core). Probe
+one job by exact name (outbox\<jobId>.result.json), or run
+tools\profiling\agent-share\Get-AgentShareRecent.ps1 -Directory outbox -First 20 (or -JobId <id>).
+Entries older than 14 days are moved under <share>\archive\<dir>\<yyyy-MM>\ (-IncludeArchive).
 
 ## MEASUREMENT DISCIPLINE THAT ALREADY COST THIS BOARD REAL TIME
 - EVERY PLAYBACK NUMBER CARRIES ITS CONFIGURATION OR IT CARRIES NOTHING. Legs here have run with
@@ -1094,7 +1117,7 @@ $fence
         laneCostUsd     = $reservationRecord.laneCostUsd
         laneCostReported = $reservationRecord.laneCostReported
     }
-    Add-Content -LiteralPath $LogPath -Value ($record | ConvertTo-Json -Compress) -Encoding UTF8
+    Add-DispatchLogRow -Path $LogPath -Record $record
 
     Write-DispatchAttempt -Outcome 'launched' -Cause 'lane-returned' -ExitCode 0 -LaneExitCode $laneExit
     Write-Output "WORKSTREAM: dispatched, laneExit=$laneExit runDir=$runDir"
@@ -1263,6 +1286,13 @@ $fence
                 # tree someone else left dirty carries staged, tracked or untracked changes the
                 # lane did not make and will commit as if it had. Refuse and name the paths; the
                 # owner of that work decides, never this dispatch.
+                # HOST-FSMONITOR-DAEMON-LEAK-1 r2 (sol r1 BLOCKER): the status below is the first git command to read this worktree's index, so it would
+                # start a daemon in a worktree that predates the fix - and the dirty branch exits before the disable further down. Protect FIRST (disable,
+                # then stop a daemon already running there), on the clean and the dirty path alike. Fail-soft: a fixture without the helper just skips.
+                try {
+                    if (-not (Get-Command Protect-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1') }
+                    $null = Protect-LaneWorktreeFsmonitor -WorkDir $existingWt
+                } catch { Write-Output "WORKSTREAM: fsmonitor protect skipped for ${existingWt}: $($_.Exception.Message)" }
                 $dirty = @(& git -C $existingWt status --porcelain 2>$null | Where-Object { $_ })
                 if ($LASTEXITCODE -ne 0) {
                     Write-Output "WORKSTREAM: CANNOT-DETERMINE - status failed in existing worktree $existingWt"
@@ -1286,7 +1316,7 @@ $fence
                 $laneWorkDir = $existingWt
                 Write-Output "WORKSTREAM: CONTINUATION card=$cardId branch=$branch tip=$branchTip reusing-worktree=$laneWorkDir"
             } else {
-                & git -C $RepoRoot -c core.longpaths=true worktree add $laneWorkDir $branch 2>&1 | Out-Null
+                & git -C $RepoRoot -c core.longpaths=true -c core.fsmonitor=false worktree add $laneWorkDir $branch 2>&1 | Out-Null
                 Write-Output "WORKSTREAM: CONTINUATION card=$cardId branch=$branch tip=$branchTip new-worktree=$laneWorkDir"
             }
             $script:IsContinuation = $true
@@ -1305,7 +1335,7 @@ $fence
                 exit 3
             }
             Write-Output "WORKSTREAM: reusing existing branch $branch (no commits beyond baseSha), moved to $baseSha"
-            & git -C $RepoRoot -c core.longpaths=true worktree add $laneWorkDir $branch 2>&1 | Out-Null
+            & git -C $RepoRoot -c core.longpaths=true -c core.fsmonitor=false worktree add $laneWorkDir $branch 2>&1 | Out-Null
         }
     } else {
         if ($ContinueFromSha) {
@@ -1313,13 +1343,19 @@ $fence
             Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'continuation-branch-absent' -ExitCode 6 -Detail "branch=$branch expected=$ContinueFromSha"
             exit 6
         }
-        & git -C $RepoRoot -c core.longpaths=true worktree add -b $branch $laneWorkDir $baseSha 2>&1 | Out-Null
+        & git -C $RepoRoot -c core.longpaths=true -c core.fsmonitor=false worktree add -b $branch $laneWorkDir $baseSha 2>&1 | Out-Null
     }
     if ($LASTEXITCODE -ne 0) {
         Write-Output "WORKSTREAM: CANNOT-DETERMINE - git worktree add failed for $laneWorkDir at $baseSha (branch $branch)"
         Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'worktree-add-failed' -ExitCode 3 -Detail "workDir=$laneWorkDir baseSha=$baseSha branch=$branch"
         exit 3
     }
+    # HOST-FSMONITOR-DAEMON-LEAK-1 (a): a new OR reused lane worktree must not start a `git fsmonitor--daemon` on its first status. Fail-soft: the helper
+    # lives in lane-fsmonitor.ps1 (a fixture that copies this script without it just skips), and nothing here may fail a dispatch.
+    try {
+        if (-not (Get-Command Disable-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1') }
+        $null = Disable-LaneWorktreeFsmonitor -WorkDir $laneWorkDir
+    } catch { Write-Output "WORKSTREAM: fsmonitor disable skipped for ${laneWorkDir}: $($_.Exception.Message)" }
 
     $script:LastWorktreeDisposition = $null
     function Remove-LaneWorktreeIfClean([string]$WorkDirToCheck) {
@@ -1435,7 +1471,7 @@ $fence
         laneCostUsd     = $reservationRecord.laneCostUsd
         laneCostReported = $reservationRecord.laneCostReported
     }
-    Add-Content -LiteralPath $LogPath -Value ($record | ConvertTo-Json -Compress) -Encoding UTF8
+    Add-DispatchLogRow -Path $LogPath -Record $record
 
     Write-DispatchAttempt -Outcome 'launched' -Cause 'lane-returned' -ExitCode 0 -LaneExitCode $laneExit
     Write-Output "WORKSTREAM: dispatched, laneExit=$laneExit runDir=$runDir workDir=$laneWorkDir"

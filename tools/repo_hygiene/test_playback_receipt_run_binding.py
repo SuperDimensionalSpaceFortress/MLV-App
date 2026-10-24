@@ -390,6 +390,7 @@ class CaptureReferenceFrameRunBindingTests(_BindingCase):
             (out / "reference-frame.png").write_bytes(b"\1" * 65536)
             (out / "reference-frame-candidate.json").write_text(json.dumps({"status": "candidate-unreviewed", "sourceFrames": {"verdict": "VALID"}}),
                                                                  encoding="utf-8")
+            (out / "reference-frame-candidate.invalid").write_text("{}", encoding="utf-8")   # last run's invalid marker (runner job, exit 225)
         grab = self.tmp / "grab.template"
         grab.write_bytes(b"\0" * 65536)
         copies = self.log_template(line) + (((grab, str(out / "reference-frame.png")),) if write_grab else ())
@@ -425,6 +426,8 @@ class CaptureReferenceFrameRunBindingTests(_BindingCase):
         self.assertFalse((out / "reference-frame-candidate.json").exists(), "last run's candidate manifest must not survive")
         self.assertEqual(len(list(out.glob("STALE-*reference-frame.png"))), 1)
         self.assertEqual(len(list(out.glob("STALE-*reference-frame-candidate.json"))), 1)
+        self.assertFalse((out / "reference-frame-candidate.invalid").exists(), "last run's invalid marker must not void this run's capture")
+        self.assertEqual(len(list(out.glob("STALE-*reference-frame-candidate.invalid"))), 1)
 
     def test_the_set_aside_and_the_nonce_are_each_mutation_tested(self) -> None:
         text = CAPTURE.read_text(encoding="utf-8")
@@ -695,6 +698,10 @@ CONSUMER_FAILING_ACTION: dict[str, tuple[tuple[str, int], ...]] = {
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": (
         (r"\$smokeRc\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$null\s+-ne\s+\$smokeLaunchException\s+-or\s+\$smokeRc\s+-ne\s+0[^\n]*\)\s*\{"
          r"[\s\S]*?result='SMOKE_RUN_FAILED'[\s\S]*?(?P<act>\bexit\s+18\b)", 1),),
+    # VENUE-REFERENCE-FRAME-JOB-1: a capture that exited non-zero (43 = its receipt check refused, 70 = it produced no exit code) is a failed job
+    # that exits with the capture's own code and writes no candidate.
+    "tools/profiling/bachelor/reference-frame-runner-job.ps1": (
+        (r"\$captureRc\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$captureRc\s+-ne\s+0\)\s*\{[^}]*?(?P<act>\bexit\s+\$captureRc\b)", 1),),
     "tools/profiling/run-shipping-guard-smoke.ps1": (
         (r"\$code\s*=\s*\$LASTEXITCODE[\s\S]*?status\s*=\s*if\s*\(\$code\s+-eq\s+0\)\s*\{\s*\"success\"\s*\}\s*else\s*\{\s*(?P<act>\"failed\")", 1),),
     "tools/profiling/run-local-cuda-playback-dng-smoke.ps1": (
@@ -712,6 +719,15 @@ CONSUMER_FAILING_ACTION: dict[str, tuple[tuple[str, int], ...]] = {
     "tools/profiling/dual-venue/Invoke-VenueChain.ps1": (
         (r"\$legCode\s*=\s*\$LASTEXITCODE[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{\s*"
          r"(?P<act>Add-Result\s+\$leg\s+'LEG_FAILED'\s+@\{[^\n]*outcome\s*=\s*'INVALID'[^\n]*\})", 1),),
+    # UM-REGULAR-BASELINE-1 r3: a chain that did not end on its own with a documented exit that agrees with its CHAIN_RESULT gives its legs the
+    # failure text and an EVIDENCE_INCOMPLETE / INVALID row with no figures, types the run CHAIN_FAILED (27); a dead leg (chain exit 7) types it
+    # LEG_FAILED (25); the typed reason becomes the process exit code.
+    "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1": (
+        (r"\$chainComplete\s*=\s*\(-not\s+\$c\.timedOut\)[\s\S]*?if\s*\(-not\s+\$chainComplete\)\s*\{\s*(?P<act>\$failure\s*=\s*\")", 1),
+        (r"if\s*\(\$failure\s+-and\s+\$legStatus\s+-ceq\s+'RAN'\)\s*\{\s*(?P<act>\$legStatus\s*=\s*'EVIDENCE_INCOMPLETE';\s*\$legOutcome\s*=\s*'INVALID')", 1),
+        (r"if\s*\(-not\s+\$chainComplete\)\s*\{\s*if\s*\(\$null\s+-eq\s+\$typed\)\s*\{\s*\$typed\s*=\s*@\{\s*(?P<act>reason\s*=\s*'CHAIN_FAILED')", 1),
+        (r"\b7\s*\{\s*if\s*\(\$null\s+-eq\s+\$typed\)\s*\{\s*\$typed\s*=\s*@\{\s*(?P<act>reason\s*=\s*'LEG_FAILED')", 1),
+        (r"\$code\s*=\s*\[int\]\$ExitCodes\[\$reason\][\s\S]*?(?P<act>\bexit\s+\$code\b)", 1)),
 }
 
 

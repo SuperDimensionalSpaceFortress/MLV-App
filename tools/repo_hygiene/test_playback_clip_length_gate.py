@@ -34,8 +34,12 @@ from tools.repo_hygiene.synthetic_mlv import (
     FRAMES_30S_AT_23976,
     FRAMES_SHORT_FIXTURE,
     MLV_EXTENSION,
+    block,
+    mlv_bytes_with_random_vidf_payload,
     mlvi_header,
+    write_header_only_mlv,
     write_synthetic_mlv,
+    write_synthetic_mlv_with_blocks,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -132,7 +136,9 @@ class ClipLengthGateTests(_TmpCase):
             "badmagic": (mlvi_header(720, magic=b"NOPE"), "bad_magic"),
             "truncated": (mlvi_header(720)[:40], "header_truncated"),
             "empty": (b"", "header_truncated"),
+            # header validity precedes the block walk: a zero-fps header alone reports bad_fps, not header_vidf_count_mismatch
             "zero_fps": (mlvi_header(720, fps_denom=0), "bad_fps"),
+            "zero_fps_with_blocks": (mlvi_header(720, fps_denom=0) + b"".join(block(b"VIDF") for _ in range(720)), "bad_fps"),
         }
         for name, (payload, reason) in cases.items():
             with self.subTest(name):
@@ -165,6 +171,123 @@ class ClipLengthGateTests(_TmpCase):
         verdict = _gate(first, 24)
         self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_mismatch)")
 
+    # GUI-SMOKE-LENGTH-GATE-VIDF-COUNT-1: the app plays the VIDF blocks it indexes (src/mlv/video_mlv.c, the
+    # `video_frames++` of the block walk, assigned to video->frames and read back by getMlvFrames), not the MLVI
+    # header's videoFrameCount. M16-1243's headers declared 612 frames while 937 VIDF blocks were indexed.
+    def test_the_vidf_block_count_outranks_an_understating_header(self) -> None:
+        # Header says 400 (16.7 s: too short); the file really holds 720 VIDF blocks (30.03 s, what the app plays).
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("understated" + MLV_EXTENSION), 400, FRAMES_30S_AT_23976)
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "OK", verdict)
+        self.assertEqual(verdict["frames"], FRAMES_30S_AT_23976, verdict)
+        self.assertAlmostEqual(verdict["clipSeconds"], 30.03, places=2)
+
+    def test_the_start_frame_cap_follows_the_vidf_count_not_the_header(self) -> None:
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("startcap" + MLV_EXTENSION), 400, FRAMES_30S_AT_23976)
+        # 600 frames in leaves 120 frames = 5.0 s, under the 24 s window; 120 frames in leaves 25.0 s.
+        self.assertEqual(_gate(path, 24, start_frame=600)["verdict"], "CLIP_TOO_SHORT")
+        self.assertEqual(_gate(path, 24, start_frame=120)["verdict"], "OK")
+
+    def test_a_header_that_overstates_is_corrected_down_to_the_vidf_count(self) -> None:
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("overstated" + MLV_EXTENSION), 720, 100)
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_TOO_SHORT", verdict)
+        self.assertEqual(verdict["frames"], 100, verdict)
+
+    def test_a_spanned_set_sums_the_vidf_blocks_of_every_part(self) -> None:
+        guid = 0x1122334455667788
+        first = write_synthetic_mlv_with_blocks(self.tmp / ("vspan" + MLV_EXTENSION), 200, 400,
+                                                file_num=0, file_count=3, guid=guid)
+        write_synthetic_mlv_with_blocks(self.tmp / "vspan.M00", 200, 300, file_num=1, file_count=3, guid=guid)
+        write_synthetic_mlv_with_blocks(self.tmp / "vspan.M01", 212, 237, file_num=2, file_count=3, guid=guid)
+        verdict = _gate(first, 24)
+        self.assertEqual(verdict["frames"], 937, verdict)
+        self.assertAlmostEqual(verdict["clipSeconds"], 39.08, places=2)
+
+    def test_other_blocks_are_skipped_and_only_vidf_is_counted(self) -> None:
+        path = self.tmp / ("mixed" + MLV_EXTENSION)
+        body = b"".join(block(b"VIDF") + block(b"AUDF") + block(b"NULL", 40) for _ in range(30))
+        write_synthetic_mlv_with_blocks(path, 5, 0, extra=body)
+        verdict = _gate(path, 1, start_frame=0)
+        self.assertEqual(verdict["frames"], 30, verdict)
+
+    def test_a_clip_with_blocks_but_no_vidf_is_a_typed_mismatch_not_the_header_count(self) -> None:
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("novidf" + MLV_EXTENSION), 720, 0, extra=block(b"AUDF"))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+
+    # r4 (sol r3 BLOCKER): the count-or-fail-closed rule has no header-only exception. A file cut off right after its
+    # MLVI header holds zero playable VIDF blocks (src/mlv/video_mlv.c rejects zero indexed frames), so the declared
+    # count is never admitted in its place.
+    def test_a_header_only_clip_declaring_720_frames_is_length_unknown_never_ok(self) -> None:
+        path = write_header_only_mlv(self.tmp / ("headeronly" + MLV_EXTENSION), FRAMES_30S_AT_23976)
+        self.assertEqual(path.stat().st_size, 52)
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+
+    def test_an_mlvi_block_that_skips_beyond_eof_is_length_unknown_never_ok(self) -> None:
+        # The MLVI block declares 1 MB in a 52-byte file: the walk skips past EOF having seen no VIDF at all.
+        path = self.tmp / ("oversizedmlvi" + MLV_EXTENSION)
+        path.write_bytes(mlvi_header(FRAMES_30S_AT_23976, block_size=1_000_000))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+        # ... and with 720 real VIDF blocks behind it: an MLVI block that swallows them is still not a clip.
+        path.write_bytes(mlvi_header(FRAMES_30S_AT_23976, block_size=1_000_000) + b"".join(
+            block(b"VIDF") for _ in range(FRAMES_30S_AT_23976)))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+
+    def test_a_trailing_vidf_block_that_runs_past_eof_fails_closed(self) -> None:
+        # 720 whole VIDF blocks, then one whose declared size reaches past the end of the file.
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("overrun" + MLV_EXTENSION), FRAMES_30S_AT_23976,
+                                               FRAMES_30S_AT_23976, extra=block(b"VIDF", size=1_000_000))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=vidf_count_unverified)")
+
+    def test_a_zero_frame_header_with_no_blocks_is_still_zero_frames(self) -> None:
+        verdict = _gate(write_header_only_mlv(self.tmp / ("emptyheader" + MLV_EXTENSION), 0), 24)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=zero_frames)")
+
+    def test_a_block_walk_that_cannot_finish_fails_closed_and_typed(self) -> None:
+        # blockSize 8 is below the 16-byte block header: the app refuses such a file (MLV_ERR_INVALID).
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("badsize" + MLV_EXTENSION), 720, 10,
+                                               extra=block(b"VIDF", size=8))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=vidf_count_unverified)")
+
+    def test_a_header_in_front_of_a_random_body_is_refused_as_a_vidf_mismatch(self) -> None:
+        # The shape test_attr3_owner_clip_stage_stall used before this card: a genuine header, then random bytes.
+        path = self.tmp / ("randombody" + MLV_EXTENSION)
+        path.write_bytes(mlvi_header(FRAMES_30S_AT_23976) + os.urandom(700_000 - 52))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+
+    def test_a_random_payload_clip_of_a_fixed_size_still_counts_its_frames(self) -> None:
+        path = self.tmp / ("randompayload" + MLV_EXTENSION)
+        data = mlv_bytes_with_random_vidf_payload(FRAMES_30S_AT_23976, 700_000)
+        path.write_bytes(data)
+        self.assertEqual(len(data), 700_000)
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "OK", verdict)
+        self.assertEqual(verdict["frames"], FRAMES_30S_AT_23976, verdict)
+
+    def test_the_block_walk_is_bounded(self) -> None:
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("bounded" + MLV_EXTENSION), 720, 50)
+        proc = _pwsh(
+            f". {_q(GATE)}; $script:GuiSmokeVidfWalkMaxBlocks = 10; "
+            f"Get-GuiSmokeClipLength -Path {_q(path)} | ConvertTo-Json -Compress"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertFalse(result["known"], result)
+        self.assertEqual(result["reason"], "vidf_count_unverified", result)
+
     def test_messages_never_name_the_clip_path(self) -> None:
         verdict = _gate(self.clip("distinctive_name_xyz", 16), 24)
         self.assertNotIn("distinctive_name_xyz", json.dumps(verdict["message"]))
@@ -188,6 +311,40 @@ class ClipLengthGateTests(_TmpCase):
         self.assertEqual(_gate(thirty, 19.5)["verdict"], "PLAY_WINDOW_TOO_SHORT")
         self.assertEqual(_gate(thirty, 20)["verdict"], "OK")
         self.assertEqual(_gate(thirty, 24)["verdict"], "OK")
+
+    # ---- PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): HFR (>= 50 fps native) clips need 10 s ------------
+    # "Amend rule so that hfr 60fps clips are allowed to be 10 seconds". The floor is Get-GuiSmokeMinPlaySeconds of the
+    # clip's HEADER fps; every other clip, and an unknown fps, keeps 20 s.
+
+    def test_hfr_pins_from_the_clip_header(self) -> None:
+        hfr_5994 = self.clip("hfr5994", 720, fps_nom=60000, fps_denom=1001)     # 12.01 s
+        self.assertEqual(_gate(hfr_5994, 10)["verdict"], "OK")                      # 59.94 fps 10 s ACCEPTED
+        refused = _gate(hfr_5994, 9.9)                                              # 59.94 fps 9.9 s REFUSED
+        self.assertEqual(refused["verdict"], "PLAY_WINDOW_TOO_SHORT", refused)
+        self.assertEqual(refused["message"], "PLAY_WINDOW_TOO_SHORT (window=9.9 required=10)")
+        # a 59.94 clip under 10 s of footage cannot be played (or looped) to 10 s
+        self.assertEqual(_gate(self.clip("hfr599", 599, fps_nom=60000, fps_denom=1001), 10)["verdict"], "CLIP_TOO_SHORT")
+        thirty = self.clip("thirty", FRAMES_30S_AT_23976)
+        refused = _gate(thirty, 10)                                                 # 23.976 fps 10 s REFUSED
+        self.assertEqual(refused["message"], "PLAY_WINDOW_TOO_SHORT (window=10 required=20)")
+        self.assertEqual(_gate(thirty, 20)["verdict"], "OK")                        # 23.976 fps 20 s ACCEPTED
+        self.assertEqual(_gate(self.clip("fifty", 600, fps_nom=50, fps_denom=1), 10)["verdict"], "OK")   # 50 fps 10 s ACCEPTED
+        # a 12 s 29.97 clip stays under its 20 s floor however short the window
+        self.assertEqual(_gate(self.clip("ntsc", 360, fps_nom=30000, fps_denom=1001), 20)["verdict"], "CLIP_TOO_SHORT")
+        # unknown fps: the length cannot be read, fail closed (never the 10 s floor)
+        self.assertEqual(_gate(self.clip("nofps", 720, fps_nom=60000, fps_denom=0), 10)["verdict"], "CLIP_LENGTH_UNKNOWN")
+
+    def test_the_floor_derivation_table(self) -> None:
+        proc = _pwsh(
+            f". {_q(GATE)}; "
+            "@(59.94, 60, 50, 120, 49.999, 29.97, 23.976, 0, -60, 'NaN', 'Infinity', 'abc', $null, $true) | "
+            "ForEach-Object { Get-GuiSmokeMinPlaySeconds -NativeFps $_ }; "
+            "Get-GuiSmokeMinPlaySeconds; Get-GuiSmokeMinPlayWindowMs -NativeFps 59.94; Get-GuiSmokeMinPlayWindowMs -NativeFps 23.976; "
+            "Get-GuiSmokeMinPresentedFrames -Fps 59.94; Get-GuiSmokeMinPresentedFrames -Fps 23.976")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.split(),
+                         ["10", "10", "10", "10", "20", "20", "20", "20", "20", "20", "20", "20", "20", "20", "20",
+                          "10000", "20000", "600", "480"])
 
     def test_clip_only_is_the_explicit_opt_out_for_callers_that_play_nothing(self) -> None:
         def gate(path: Path, extra: str) -> dict:
@@ -534,6 +691,31 @@ SOURCE_FRAME_CASES = [
     (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=0,
           source_advanced=0, required_source_frames=0), 24, True, False),
 ]
+# PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): an HFR clip (>= 50 fps native) needs 10 s, ceil(10 x native fps)
+# source frames; every other clip keeps 20 s. Both oracle carriers and the loop verdict execute these rows.
+HFR_SOURCE_FRAME_CASES = [
+    # 59.94 fps, a 12 s clip, 10 s window: 600 source frames consumed at native pace -- VALID
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=12.012, presented_frames=600,
+          source_advanced=600, required_source_frames=600, native_fps=59.94, pace_fps=59.94), 10, False, False),
+    # 59.94 fps admitted for 9.9 s (594 frames): under ceil(10 x 59.94) = 600 -- INVALID
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=12.012, presented_frames=594,
+          source_advanced=594, required_source_frames=594, native_fps=59.94, pace_fps=59.94), 10, False, True),
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=12.012, presented_frames=599,
+          source_advanced=599, required_source_frames=599, native_fps=59.94, pace_fps=59.94), 10, False, True),
+    # 23.976 fps, 10 s of footage (240 frames): a non-HFR clip keeps the 20 s floor -- INVALID
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=240,
+          source_advanced=240, required_source_frames=240, native_fps=23.976, pace_fps=23.976), 10, False, True),
+    # 23.976 fps, 20 s -- VALID (the unchanged rule)
+    (dict(wrapped=0, wrap_count=0, total_frames=720, clip_seconds=30.03, presented_frames=480,
+          source_advanced=480, required_source_frames=480, native_fps=23.976, pace_fps=23.976), 20, False, False),
+    # 50 fps, a 12 s clip, 10 s: 500 source frames -- VALID
+    (dict(wrapped=0, wrap_count=0, total_frames=600, clip_seconds=12.0, presented_frames=500,
+          source_advanced=500, required_source_frames=500, native_fps=50.0, pace_fps=50.0), 10, False, False),
+    # an HFR clip LOOPED to reach 10 s (a 5 s clip wrapped twice) -- INVALID_LOOPED, whatever the count says
+    (dict(wrapped=1, wrap_count=2, total_frames=300, clip_seconds=5.005, presented_frames=600,
+          source_advanced=600, required_source_frames=600, native_fps=59.94, pace_fps=59.94), 10, False, True),
+]
+SOURCE_FRAME_CASES.extend(HFR_SOURCE_FRAME_CASES)
 LOOP_VERDICT_CASES.extend(SOURCE_FRAME_CASES)
 
 
@@ -607,6 +789,10 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
             "fps override ignored": ("[int]$fpsOverride -ne 0", "[int]$fpsOverride -eq 0"),
             "pace comparison inverted": ("-gt (0.005 * [double]$nativeFps)", "-le (0.005 * [double]$nativeFps)"),
             "source verdict dropped": ("$failures += @($sourceFramesVerdict.failures)", "$null = @($sourceFramesVerdict.failures)"),
+            # PLAYBACK-CLIP-LENGTH-HFR-10S-1: the floor derivation itself
+            "HFR floor collapsed to 20 s": ("        return $script:GuiSmokeHfrMinPlaySeconds\n", "        return $script:GuiSmokeStandardMinPlaySeconds\n"),
+            "every clip given the 10 s floor": ("$floorSeconds = Get-GuiSmokeMinPlaySeconds -NativeFps $nativeFps", "$floorSeconds = 10.0"),
+            "HFR threshold ignored": ("$fps -ge $script:GuiSmokeHfrNativeFpsThreshold", "$fps -ge 0"),
         }
         for name, (needle, replacement) in mutations.items():
             with self.subTest(name):
@@ -813,6 +999,43 @@ class SourceFramesOracleParityTests(unittest.TestCase):
         self.assertTrue(self._module_invalid(absent))
         self.assertTrue(self._module_invalid(""))
 
+    def _module_failures(self, line: str, module: Path | None = None) -> list[str]:
+        proc = _pwsh(
+            f"Import-Module {_q(module or self.MODULE)} -Force -DisableNameChecking; "
+            f"$v = Get-AttrCudaSourceFramesVerdict -SummaryLine {_q(line)} -ExpectedRunNonce {_q(RUN_NONCE)}; "
+            "[pscustomobject]@{ failures = @($v.failures | ForEach-Object { [string]$_ }) } | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)["failures"]
+
+    def _assert_hfr_wording(self, module: Path | None = None) -> None:
+        """PLAYBACK-CLIP-LENGTH-HFR-10S-1 r3e: the module applies the HFR wording with a -replace on the base message, so a
+        base-message change would make that replace a silent no-op and an HFR failure would name 20 s again. Pin the text."""
+        hfr = _summary_line(**{**GOOD_SOURCE, "wrapped": 0, "wrap_count": 0, "total_frames": 720, "clip_seconds": 12.012,
+                              "presented_frames": 500, "native_fps": 59.94, "pace_fps": 59.94,
+                              "source_advanced": 300, "required_source_frames": 600})
+        hfr_failures = self._module_failures(hfr, module)
+        self.assertTrue(any(f.startswith("INVALID_SOURCE_FRAMES") and "under 10 s of real footage" in f for f in hfr_failures), hfr_failures)
+        self.assertFalse(any("20 s of real footage" in f for f in hfr_failures), hfr_failures)
+
+    def test_an_hfr_source_frames_failure_names_ten_seconds_and_every_other_rate_names_twenty(self) -> None:
+        self._assert_hfr_wording()
+        for native in (23.976, 49.99):
+            with self.subTest(native_fps=native):
+                low = _summary_line(**{**GOOD_SOURCE, "wrapped": 0, "wrap_count": 0, "native_fps": native, "pace_fps": native,
+                                       "source_advanced": 100, "required_source_frames": 1200, "total_frames": 1200})
+                failures = self._module_failures(low)
+                self.assertTrue(any("under 20 s of real footage" in f for f in failures), failures)
+                self.assertFalse(any("10 s of real footage" in f for f in failures), failures)
+        # RED arm: break the -replace pattern in a scratch copy and the pin must fail on it (the real file stays untouched).
+        source = self.MODULE.read_text(encoding="utf-8")
+        needle = "-replace 'under 20 s of real footage', 'under 10 s of real footage'"
+        self.assertEqual(source.count(needle), 1, "the HFR wording replace moved; update this pin")
+        with tempfile.TemporaryDirectory(prefix="hfr-wording-red-") as tmp:
+            broken = Path(tmp) / "AttrCudaArtifacts.psm1"
+            broken.write_text(source.replace(needle, "-replace 'under 21 s of real footage', 'under 10 s of real footage'"), encoding="utf-8")
+            with self.assertRaises(AssertionError):
+                self._assert_hfr_wording(broken)
+
     def _job_oracle_block(self) -> str:
         job = JOB_GENERATOR.read_text(encoding="utf-8")
         start = job.index("$sourceFramesSummaryLine = $null")
@@ -943,15 +1166,19 @@ DV_NONCE = "ab" * 16
 HFR_RUN = dict(session=7, wrapped=0, wrap_count=0, source_advanced=1200, required_source_frames=1199, native_fps="59.940", pace_fps="24.000", fps_override=0)
 PACE_TEXT = "the engine paced at pace_fps="
 FLOOR_TEXT = "ceil(20 s x native_fps"
+# PLAYBACK-CLIP-LENGTH-HFR-10S-1 (owner amendment 2026-10-15): a 59.94 clip's floor is 10 s, ceil(10 x 59.94) = 600 source frames.
+HFR_FLOOR_TEXT = "ceil(10 s x native_fps"
 
 # (name, summary fields, conform line or None, expected invalid, texts every oracle's failures must contain, texts none may contain, paceRule)
 CONFORM_CASES = [
-    ("a: the real ab404cff shape (600/600 on a 59.94 clip, conformed) stays INVALID on the floor alone",
-     dict(HFR_RUN, source_advanced=600, required_source_frames=600), _conform_line(), True, [FLOOR_TEXT], [PACE_TEXT], "conform"),
+    ("a: the real ab404cff shape (600/600 on a 59.94 clip, conformed) is VALID under the HFR 10 s amendment",
+     dict(HFR_RUN, source_advanced=600, required_source_frames=600), _conform_line(), False, [], [PACE_TEXT, FLOOR_TEXT, HFR_FLOOR_TEXT], "conform"),
+    ("a2: 599/599 on a 59.94 clip (9.99 s) is INVALID on the HFR floor alone",
+     dict(HFR_RUN, source_advanced=599, required_source_frames=599), _conform_line(), True, [HFR_FLOOR_TEXT], [PACE_TEXT], "conform"),
     ("b: a conformed run with 1199+ source frames is valid", HFR_RUN, _conform_line(), False, [], [PACE_TEXT, FLOOR_TEXT], "conform"),
     ("b2: exactly the floor (1199 = ceil(20 s x 59.94 - 0.02)) is valid", dict(HFR_RUN, source_advanced=1199), _conform_line(), False, [], [], "conform"),
-    ("b3: the floor is not relaxed: required 1198 is under ceil(20 s x 59.94)", dict(HFR_RUN, source_advanced=1198, required_source_frames=1198),
-     _conform_line(), True, [FLOOR_TEXT], [PACE_TEXT], "conform"),
+    ("b3: the HFR floor is not relaxed by a long advance: required 599 is under ceil(10 s x 59.94)",
+     dict(HFR_RUN, source_advanced=1198, required_source_frames=599), _conform_line(), True, [HFR_FLOOR_TEXT], [PACE_TEXT], "conform"),
     ("c: the same run without a conform line is INVALID native-pace (absence never helps)", HFR_RUN, None, True, [PACE_TEXT], ["conform"], "native"),
     ("d: conform_active=0 -> INVALID", HFR_RUN, _conform_line(conform_active=0), True, [PACE_TEXT, "conform_active=0"], [], "native"),
     ("e: playback_fps disagreeing with pace_fps -> INVALID", HFR_RUN, _conform_line(playback_fps="30.000"), True, [PACE_TEXT, "does not match pace_fps"], [], "native"),
@@ -1036,17 +1263,20 @@ class ConformAwareReceiptOracleTests(unittest.TestCase):
                 self.assertEqual({g["invalid"] for g in got}, {CONFORM_CASES[index][3]}, got)
                 self.assertEqual([g["paceRule"] for g in got], [rule] * 3, got)
 
-    def test_the_real_ab404cff_receipt_keeps_reason_one_and_loses_reason_two(self) -> None:
-        """The receipt PLAYBACK-HFR-CONFORM-DEFAULT-1's Bachelor leg wrote: 600/600, native 59.94, pace 24, conformed."""
+    def test_the_real_ab404cff_receipt_is_valid_under_the_hfr_amendment(self) -> None:
+        """The receipt PLAYBACK-HFR-CONFORM-DEFAULT-1's Bachelor leg wrote: 600/600, native 59.94, pace 24, conformed. Before the owner's
+        2026-10-15 amendment its one remaining reason was the 20 s floor (reason two, the pace, went with the conform proof); 600 source
+        frames ARE 10 s of 59.94 footage, so PLAYBACK-CLIP-LENGTH-HFR-10S-1 clears reason one too -- and one frame less is still INVALID."""
         for results in (self.gate, self.attr, self.dv):
-            got = results[0]
-            self.assertEqual(len(got["failures"]), 1, got)
-            self.assertIn("required_source_frames=600 is under ceil(20 s x native_fps=59.94)", got["failures"][0])
+            self.assertEqual(results[0]["failures"], [], results[0])
+            self.assertFalse(results[0]["invalid"], results[0])
+            self.assertEqual(len(results[1]["failures"]), 1, results[1])
+            self.assertIn("required_source_frames=599 is under ceil(10 s x native_fps=59.94)", results[1]["failures"][0])
 
     def test_an_unproven_conform_line_says_why_the_relaxation_was_not_applied(self) -> None:
         for results in (self.gate, self.attr, self.dv):
-            self.assertIn("conform relaxation not applied", " | ".join(results[5]["failures"]))      # d: inactive
-            self.assertNotIn("conform relaxation", " | ".join(results[4]["failures"]))               # c: no line at all keeps the native text unchanged
+            self.assertIn("conform relaxation not applied", " | ".join(results[6]["failures"]))      # d: inactive
+            self.assertNotIn("conform relaxation", " | ".join(results[5]["failures"]))               # c: no line at all keeps the native text unchanged
 
     def test_the_dual_venue_evidence_block_records_the_conform_fields_and_which_rule_judged_the_pace(self) -> None:
         """Get-DvPlaybackEvidence end to end, from the run log: the conform line's values and paceRule land on the block and a key can re-derive them."""
@@ -1074,9 +1304,13 @@ class ConformAwareReceiptOracleTests(unittest.TestCase):
         self.assertFalse(bare["valid"])
         self.assertEqual((bare["paceRule"], bare["conformLinePresent"]), ("native", False))
         self.assertTrue(any(PACE_TEXT in r for r in bare["invalidReasons"]), bare["invalidReasons"])
-        short = evidence([base[0], base[1], _summary_line(**dict(HFR_RUN, run_nonce=DV_NONCE, source_advanced=600, required_source_frames=600)), _conform_line("7")])
-        self.assertEqual(len(short["invalidReasons"]), 1, short["invalidReasons"])         # the ab404cff shape end to end: reason (1) only
-        self.assertIn(FLOOR_TEXT, short["invalidReasons"][0])
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1: the ab404cff shape (600/600) is 10 s of 59.94 footage, valid end to end; one frame less is the
+        # HFR floor's one reason.
+        hfr10 = evidence([base[0], base[1], _summary_line(**dict(HFR_RUN, run_nonce=DV_NONCE, source_advanced=600, required_source_frames=600)), _conform_line("7")])
+        self.assertTrue(hfr10["valid"], hfr10["invalidReasons"])
+        short = evidence([base[0], base[1], _summary_line(**dict(HFR_RUN, run_nonce=DV_NONCE, source_advanced=599, required_source_frames=599)), _conform_line("7")])
+        self.assertEqual(len(short["invalidReasons"]), 1, short["invalidReasons"])
+        self.assertIn(HFR_FLOOR_TEXT, short["invalidReasons"][0])
 
     def test_mutation_a_conform_blind_pace_rule_or_a_relaxed_floor_is_caught(self) -> None:
         """Each oracle's relaxation switch is mutated; the case table must flag it (a green mutant means the table does not pin that arm)."""
@@ -1129,7 +1363,9 @@ class JobGeneratorContractTests(unittest.TestCase):
 
     def test_the_play_window_floor_is_the_owner_minimum(self) -> None:
         text = JOB_GENERATOR.read_text(encoding="utf-8")
-        self.assertRegex(text, r"\[ValidateRange\(20, 3600\)\]\s*\[int\]\$PlaySeconds")
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1: the generator never opens an owner clip, so it admits the lowest floor (an HFR clip's 10 s);
+        # the runner applies the clip's own floor from its header at the venue.
+        self.assertRegex(text, r"\[ValidateRange\(10, 3600\)\]\s*\[int\]\$PlaySeconds")
 
     def test_a_fixture_id_is_refused_at_generation_with_the_shared_verdict(self) -> None:
         text = JOB_GENERATOR.read_text(encoding="utf-8")
@@ -1707,8 +1943,17 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
 
     def test_the_pure_window_logic_lives_in_the_unit_tested_header(self) -> None:
         header = (ROOT / "platform" / "qt" / "PlaybackFrameRange.h").read_text(encoding="utf-8")
-        self.assertIn("constexpr double kMinPlayWindowSeconds = 20.0;", header)
-        self.assertIn("constexpr int kMinPlayWindowMs = 20000;", header)
+        # PLAYBACK-CLIP-LENGTH-HFR-10S-1: the floor is ONE derivation of the native fps; the single 20 s constant is gone.
+        self.assertIn("constexpr double kStandardMinPlayWindowSeconds = 20.0;", header)
+        self.assertIn("constexpr double kHfrMinPlayWindowSeconds = 10.0;", header)
+        self.assertIn("constexpr double kHfrNativeFpsThreshold = 50.0;", header)
+        self.assertIn("inline double minPlayWindowSeconds( double nativeFps )", header)
+        self.assertNotIn("kMinPlayWindowSeconds", header)
+        self.assertNotIn("kMinPlayWindowMs", header)
+        for source in (self.sources[self.MAIN_WINDOW], self.sources[self.MAIN]):
+            self.assertNotIn("kMinPlayWindow", source)
+            # no second hard-coded 20 s floor on a clip / window / stress-switch quantity
+            self.assertNotRegex(strip_cpp(source)[0], r"(?:Seconds|seconds)\s*(?:[<>]=?)\s*20(?:\.0)?\b|qMax\(\s*20\.0\s*,")
         for name in ("evaluatePlayableWindow", "ProgrammaticPlayLedger", "noteJumpToFirst", "noteRestart",
                      "engineCutRangeForPlay", "smokePlayRequestSeconds", "stressSwitchReachesFloor",
                      "PLAY_DURATION_TOO_SHORT", "SourceFrameAdvanceCounter", "requiredSourceFrames",
@@ -1775,7 +2020,7 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         for site in ("profile-exercise-play-action", "profile-look-assist-settle"):
             with self.subTest(site):
                 self._assert_caught(self._mutated_re(
-                    r'(programmaticPlay\(\s*"' + site + r'"\s*,\s*)playback_frame_range::kMinPlayWindowSeconds',
+                    r'(programmaticPlay\(\s*"' + site + r'"\s*,\s*)playGateMinPlayWindowSeconds\(\)',
                     r'\g<1>0.0'), "requested window")
         self._assert_caught(self._mutated_re(
             r'(programmaticPlay\(\s*"gui-smoke-measured"\s*,\s*)playback_frame_range::smokePlayRequestSeconds\(',
@@ -1882,7 +2127,13 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         self.assertIn("checkPlayableWindow( site, requestedSeconds )", code)
         main = strip_cpp(self.sources[self.MAIN])[1]
         self.assertIn("PLAY_DURATION_TOO_SHORT (--seconds=", main)
-        self.assertRegex(main, r"seconds \+ 1e-9 < playback_frame_range::kMinPlayWindowSeconds")
+        # HFR-10S-1: at parse the clip is not open, so only what NO clip could admit is refused there; the clip's own
+        # floor is applied by runGuiPlaybackSmoke once it is open, before anything plays.
+        self.assertRegex(main, r"seconds \+ 1e-9 < playback_frame_range::kLowestMinPlayWindowSeconds")
+        self.assertIn("if( options.durationMs + 1e-6 < playGateMinPlayWindowSeconds() * 1000.0 )", code)
+        smoke = _function_body(self.sources[self.MAIN_WINDOW], "int MainWindow::runGuiPlaybackSmoke(")
+        self.assertLess(smoke.index("options.durationMs + 1e-6 < playGateMinPlayWindowSeconds()"),
+                        smoke.index('programmaticPlay( "gui-smoke-measured"'))
 
     def test_b2_every_automation_mode_waits_for_the_engines_source_frame_count(self) -> None:
         # ENFORCE-3: the ENFORCE-2 wall-clock floor (playHoldReachedFloor) is retired. Each automation mode waits on
@@ -1898,11 +2149,11 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
         self.assertNotIn("playActionTimeout", code)
         # the lifecycle stress switch: only once the engine counted the source frames, refused below 20 s at launch
         self.assertIn("&& programmaticPlayConsumed()", code)
-        self.assertIn("!playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs )", code)
+        self.assertIn("!playback_frame_range::stressSwitchReachesFloor( options.stressSwitchAtMs, playGateMinPlayWindowSeconds() )", code)
         header = (ROOT / "platform" / "qt" / "MainWindow.h").read_text(encoding="utf-8")
         self.assertRegex(header, r"int stressSwitchAtMs = 20000;")
         main = strip_cpp(self.sources[self.MAIN])[1]
-        self.assertIn("stressSwitchReachesFloor(stressSwitchAtMs)", main)
+        self.assertIn("stressSwitchReachesFloor(stressSwitchAtMs, playback_frame_range::kLowestMinPlayWindowSeconds)", main)
         self.assertRegex(main, r'QStringLiteral\("20000"\)')
         self.assertNotRegex(main, r'QStringLiteral\("1000"\)\);\s*parser\.addOption\(stressSwitchAtMsOpt\)')
         # a measured Play that did not consume the source frames is a typed failure, never a pass
@@ -1946,10 +2197,10 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             "a new programmaticStop site": self._mutated(restart, restart + '\n    programmaticStop( "a-new-early-stop" );'),
             # sol r2 hardening: COMPLETE request expressions
             "settle request divided by 20":
-                self._mutated_re(r'(programmaticPlay\(\s*"profile-look-assist-settle"\s*,\s*playback_frame_range::kMinPlayWindowSeconds)',
+                self._mutated_re(r'(programmaticPlay\(\s*"profile-look-assist-settle"\s*,\s*playGateMinPlayWindowSeconds\(\))',
                                  r"\1 / 20.0"),
             "play-action request minus 19":
-                self._mutated_re(r'(programmaticPlay\(\s*"profile-exercise-play-action"\s*,\s*playback_frame_range::kMinPlayWindowSeconds)',
+                self._mutated_re(r'(programmaticPlay\(\s*"profile-exercise-play-action"\s*,\s*playGateMinPlayWindowSeconds\(\))',
                                  r"\1 - 19"),
             "autoplay request times zero": self._mutated("programmaticPlay( \"autoplay\", autoplaySeconds )",
                                                           "programmaticPlay( \"autoplay\", autoplaySeconds * 0 )"),

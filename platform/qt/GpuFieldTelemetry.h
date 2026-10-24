@@ -53,7 +53,11 @@ struct CudaFault
     int cudaCode = 0;                /* 0 = none noted (validation failure) */
     const char * cudaName = nullptr; /* cudaGetErrorName, or NULL */
     const char * site = nullptr;     /* failing call site text, or NULL */
-    double utcMs = 0.0;              /* set by noteFault (wall clock, Unix epoch ms) */
+    /* Wall clock when the fault was noted, Unix epoch ms: the backend sinks pass
+     * the DLL note's own utc_ms (a note can be drained much later). 0 = unknown:
+     * noteFault then stamps the time it records it. The listener gets the value
+     * written. */
+    double utcMs = 0.0;
     /* r5: "primary" (NULL means primary), "secondary" (another code the same
      * failed call noted, e.g. its cleanup's) or "orphan" (noted by a call
      * nothing captured; stage "recon:uncaptured"). */
@@ -93,6 +97,15 @@ void noteGlIdentity(const QString & renderer, const QString & vendor,
  *  robust context is GPU-DEVICE-LOSS-SELF-HEAL-1's. Used by both GL present
  *  surfaces (GpuDisplayViewport and GpuDisplayWindow). */
 void noteGlContext(QOpenGLContext * context);
+
+/*! GPU-DEVICE-LOSS-SELF-HEAL-1: the recorded GL renderer and driver (sanitized;
+ *  empty until noteGlIdentity ran). Read-only. */
+struct GlIdentity
+{
+    QString renderer;
+    QString driver;
+};
+GlIdentity glIdentity();
 
 /*! Writes the session snapshot (stage lines, unwritten faults, ...). */
 void flush(const char * reason);

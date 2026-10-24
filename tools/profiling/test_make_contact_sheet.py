@@ -248,7 +248,17 @@ def test_header_reports_real_host_gpu_scale_when_supplied():
     identity_line = next(line for line in lines if line.startswith("clip="))
     assert "host=BACHELOR" in identity_line
     assert "gpu=CUDA / NVIDIA GeForce RTX 4090" in identity_line
-    assert "scale=4" in identity_line
+    assert "scale=Quarter res (0.25x)" in identity_line, "SCALE-LABEL-CLARITY-1 r2: the header says the resolution, not the bare factor"
+    assert "scale=4" not in identity_line
+
+
+def test_header_scale_reads_as_a_resolution_label():
+    assert mcs.scale_label("1") == "Full res (1x)"
+    assert mcs.scale_label("2") == "Half res (0.5x)"
+    assert mcs.scale_label("4") == "Quarter res (0.25x)"
+    assert mcs.scale_label("8") == "Custom res (1/8)"
+    assert mcs.scale_label("unknown") == "unknown"
+    assert mcs.scale_label("Half res (0.5x)") == "Half res (0.5x)"
 
 
 def test_header_flags_frames_not_captured_via_the_playback_path():

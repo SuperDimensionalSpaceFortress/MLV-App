@@ -55,6 +55,10 @@ foreach ($p in $ast.ParamBlock.Parameters) { if ($p.DefaultValue -is [System.Man
 $GateSustainedRows = [int]$paramDefaults['GateSustainedRows']
 $GateMaxThrottledRows = [int]$paramDefaults['GateMaxThrottledRows']
 $GateMeanMaxC = [double]$paramDefaults['GateMeanMaxC']
+# Read by Get-HeavySlotLabel, which the wait calls; defined before the first Wait-HeavySlotAdmission case.
+$GateLongJobSec = [int]$paramDefaults['GateLongJobSec']
+$GateLongJobPattern = [string]$paramDefaults['GateLongJobPattern']
+$JobTimeoutSec = [int]$paramDefaults['JobTimeoutSec']
 Assert-True ($GateSustainedRows -eq 60 -and $GateMaxThrottledRows -eq 6 -and $GateMeanMaxC -eq 88) "defaults are heavy-slot.py's first-run rule (60 rows, > 6 throttled, mean >= 88); got $GateSustainedRows/$GateMaxThrottledRows/$GateMeanMaxC"
 
 function New-FeedRows([double[]]$Temps, [bool[]]$Throttled, [double]$Watts = 40) {
@@ -124,7 +128,7 @@ $unit.ownerCheck = [ordered]@{ foreignOwner = $vTaken.state; otherPid = $vPid.st
 
 # r2: sol's exact repro, through the agent's REAL Wait-HeavySlotAdmission / Get-HeavySlotHolderState /
 # Test-HeavySlotHolderHeld / Confirm-HeavySlotHeldForLaunch, with the holder process, status and feed mocked.
-foreach ($name in @('Read-JsonFile', 'Get-HeavySlotHolderState', 'Test-HeavySlotHolderHeld', 'Add-HeavySlotHolderLoss', 'Add-HeavySlotHolderLossToAdmission', 'Wait-HeavySlotAdmission', 'Confirm-HeavySlotHeldForLaunch', 'Invoke-ExemptJobsDuringWait')) {
+foreach ($name in @('Read-JsonFile', 'Get-HeavySlotHolderState', 'Test-HeavySlotHolderHeld', 'Add-HeavySlotHolderLoss', 'Add-HeavySlotHolderLossToAdmission', 'Wait-HeavySlotAdmission', 'Confirm-HeavySlotHeldForLaunch', 'Invoke-ExemptJobsDuringWait', 'Get-HeavySlotLabel', 'Format-HeavySlotHolderNote')) {
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     Assert-True ($null -ne $fn) "agent defines $name"
     . ([scriptblock]::Create($fn.Extent.Text))
@@ -149,7 +153,7 @@ function New-MockHolder([string]$Held) {
     return [pscustomobject]@{ ok = $true; id = 'j1.x'; jobId = 'j1'; label = 'mlv j1'; pid = [int]($Held -split ':')[1]; acquiredFile = $acq; releaseFile = "$acq.release"; recordFile = "$acq.holder.json"
         launch = [pscustomobject]@{ Process = [pscustomobject]@{ HasExited = $false; ExitCode = 0 } } }
 }
-function Start-HeavySlotHolder { param([string]$JobId) $script:Mock.starts++; return $script:Mock.holder }
+function Start-HeavySlotHolder { param([string]$JobId, [string]$Label) $script:Mock.starts++; return $script:Mock.holder }
 function Stop-HeavySlotHolder { param($Holder, [string]$Why) $script:Mock.stops += @($Why); $script:Mock.expire = $true }
 function Exit-HeavySlot { $h = $script:HeavySlotHolder; $script:HeavySlotHolder = $null; if ($null -ne $h) { Stop-HeavySlotHolder -Holder $h -Why 'job done' } }
 function Invoke-HeavySlotStatus {
@@ -238,6 +242,221 @@ try {
     Assert-True (@($script:Mock.log | Where-Object { $_ -match '^heavy-slot-gate: maint-dispatch exempt job=' }).Count -eq 2) "maint-dispatch: two maint-dispatch log lines"
     Assert-True ($null -eq $script:ExemptDuringWaitOf) "maint-dispatch: the during-wait marker is cleared"
     $unit.maintDispatch = [ordered]@{ dispatched = $dispatched; singleObject = ($adm -isnot [array]); label = $adm.label }
+
+    # 5. AGENT-HEAVY-SLOT-2.3-ADAPT-1. heavy-slot.py 2.3.1 turns "short exclusive first" off for every tenant when a
+    #    holder whose label starts with the literal "mlv " (trailing space) runs past 15 min. A gated job that can
+    #    legitimately run longer is therefore labelled "mlv-long <jobId>", which that prefix test does not match.
+    $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-JobMetadata' }, $true)
+    Assert-True ($null -ne $fn) "agent defines Get-JobMetadata"
+    . ([scriptblock]::Create($fn.Extent.Text))
+    Assert-True ($GateLongJobSec -eq 900) "GateLongJobSec defaults to 900 (15 min is the 2.3.1 cap); got $GateLongJobSec"
+    Assert-True ($JobTimeoutSec -eq 1800) "the agent's default job timeout is 1800 s; got $JobTimeoutSec"
+    $labelCases = [ordered]@{}
+    foreach ($c in @(
+            @{ k = 'at900'; id = 'jobA'; t = 900; want = 'mlv jobA' }
+            @{ k = 'at901'; id = 'jobA'; t = 901; want = 'mlv-long jobA' }
+            @{ k = 'at1'; id = 'jobA'; t = 1; want = 'mlv jobA' }
+            @{ k = 'stage'; id = 'playback-attr-3-cuda-stage-1a2b3c'; t = 60; want = 'mlv-long playback-attr-3-cuda-stage-1a2b3c' }
+            @{ k = 'build'; id = 'um-build-7'; t = 60; want = 'mlv-long um-build-7' }
+            @{ k = 'soak'; id = 'soak.run1'; t = 60; want = 'mlv-long soak.run1' }
+            @{ k = 'kindUpper'; id = 'ATTR3-STAGE'; t = 60; want = 'mlv-long ATTR3-STAGE' }
+            @{ k = 'notAToken'; id = 'upstage-1'; t = 60; want = 'mlv upstage-1' }
+            @{ k = 'notAToken2'; id = 'rebuilder-2'; t = 60; want = 'mlv rebuilder-2' }
+            @{ k = 'ordinary'; id = 'playback-smoke-0001'; t = 300; want = 'mlv playback-smoke-0001' })) {
+        $got = Get-HeavySlotLabel -JobId $c.id -TimeoutSec $c.t
+        Assert-True ($got -ceq $c.want) "label $($c.k): job '$($c.id)' timeoutSec $($c.t) -> '$($c.want)', got '$got'"
+        $labelCases[$c.k] = $got
+    }
+    # The effective timeout is the one the agent applies: Get-JobMetadata. No meta.json, or an unusable timeoutSec, is the
+    # 1800 s default -- so an unset timeout is LONG; only an explicit 1..900 stays short.
+    $metaCases = [ordered]@{}
+    foreach ($c in @(
+            @{ k = 'noMeta'; id = 'mNone'; body = $null; want = 'mlv-long mNone' }
+            @{ k = 'metaNoTimeout'; id = 'mNoT'; body = '{"jobId":"mNoT"}'; want = 'mlv-long mNoT' }
+            @{ k = 'zero'; id = 'mZero'; body = '{"jobId":"mZero","timeoutSec":0}'; want = 'mlv-long mZero' }
+            @{ k = 'overRange'; id = 'mBig'; body = '{"jobId":"mBig","timeoutSec":90000}'; want = 'mlv-long mBig' }
+            @{ k = 'garbage'; id = 'mGar'; body = '{"jobId":"mGar","timeoutSec":"soon"}'; want = 'mlv-long mGar' }
+            @{ k = 'explicit600'; id = 'm600'; body = '{"jobId":"m600","timeoutSec":600}'; want = 'mlv m600' }
+            @{ k = 'explicit900'; id = 'm900'; body = '{"jobId":"m900","timeoutSec":900}'; want = 'mlv m900' }
+            @{ k = 'explicit901'; id = 'm901'; body = '{"jobId":"m901","timeoutSec":901}'; want = 'mlv-long m901' })) {
+        if ($null -ne $c.body) { [IO.File]::WriteAllText((Join-Path $inbox "$($c.id).meta.json"), $c.body) }
+        $md = Get-JobMetadata -JobId $c.id
+        $got = Get-HeavySlotLabel -JobId $c.id -TimeoutSec $md.timeoutSec
+        Assert-True ($got -ceq $c.want) "metadata label $($c.k): '$($c.want)' expected, got '$got' (effective timeoutSec $($md.timeoutSec))"
+        $metaCases[$c.k] = "$($md.timeoutSec) -> $got"
+    }
+    # The label the wait matches its own slot on is the new one: a slot shown under the old label is NOT this job's.
+    $longMeta = [pscustomobject]@{ maxQueueAgeSec = 1; timeoutSec = 1800 }
+    Reset-Mock "1:$PID" @("slot 1: mlv-long j1 (pid $PID, since 2026-10-11 18:00:00, held 1 min) [exclusive]", 'slot 2: free') $false
+    $adm = Wait-HeavySlotAdmission -JobId 'j1' -Job ([pscustomobject]@{}) -Metadata $longMeta
+    Assert-True ($adm.label -eq 'clear' -and $adm.heavySlotLabel -ceq 'mlv-long j1') "wait: a long job admits on its own 'mlv-long j1' slot: $($adm.label) / $($adm.heavySlotLabel)"
+    $script:HeavySlotHolder = $null
+    Reset-Mock "1:$PID" @("slot 1: mlv j1 (pid $PID, since 2026-10-11 18:00:00, held 1 min) [exclusive]", 'slot 2: free') $false
+    $adm = Wait-HeavySlotAdmission -JobId 'j1' -Job ([pscustomobject]@{}) -Metadata $longMeta
+    Assert-True ($adm.label -eq 'queue-expired' -and $script:Mock.probes[0] -eq 'holder-lost') "wait: a long job does not take a slot labelled 'mlv j1' as its own: $($adm.label) $($script:Mock.probes -join ',')"
+    $unit.longLabel = [ordered]@{ cases = $labelCases; metadata = $metaCases; waitAdmitsOnLongLabel = 'clear'; waitRejectsShortLabel = $script:Mock.probes[0] }
+
+    # 5a. UM-AGENT-HEAVY-SLOT-OVERRIDE-BOUNDS-VALIDATE-1. The bounds the agent documents for -GateLongJobSec and
+    #     -GateLongJobPattern are enforced at parameter binding: an out-of-bounds override is refused with ONE typed token
+    #     (HEAVY_SLOT_OVERRIDE_OUT_OF_BOUNDS) in the message, and an in-bounds one still binds. The binding is exercised
+    #     through a scriptblock built from those two parameters' own AST text (attributes included), so the agent's main
+    #     loop never runs and no share is touched.
+    $overrideToken = 'HEAVY_SLOT_OVERRIDE_OUT_OF_BOUNDS'
+    $boundParams = @($ast.ParamBlock.Parameters | Where-Object { @('GateLongJobSec', 'GateLongJobPattern') -contains $_.Name.VariablePath.UserPath })
+    Assert-True ($boundParams.Count -eq 2) "agent param block declares GateLongJobSec and GateLongJobPattern (found $($boundParams.Count))"
+    $bindSb = [scriptblock]::Create("param(`n" + (($boundParams | ForEach-Object { $_.Extent.Text }) -join ",`n") + "`n)`n[pscustomobject]@{ sec = `$GateLongJobSec; pattern = `$GateLongJobPattern }")
+    function Test-OverrideBinding([hashtable]$Splat) {
+        try { $r = & $bindSb @Splat; return [pscustomobject]@{ ok = $true; sec = $r.sec; pattern = $r.pattern; message = '' } }
+        catch { return [pscustomobject]@{ ok = $false; sec = $null; pattern = $null; message = [string]$_.Exception.Message } }
+    }
+    $overrideRefused = [ordered]@{}
+    $overrideMisses = @()
+    foreach ($c in @(
+            @{ k = 'sec0'; a = @{ GateLongJobSec = 0 } }
+            @{ k = 'secMinus1'; a = @{ GateLongJobSec = -1 } }
+            @{ k = 'sec901'; a = @{ GateLongJobSec = 901 } }
+            @{ k = 'sec86400'; a = @{ GateLongJobSec = 86400 } }
+            @{ k = 'patBadRegex'; a = @{ GateLongJobPattern = '(' } }
+            @{ k = 'patBadClass'; a = @{ GateLongJobPattern = '[a-' } }
+            @{ k = 'patEmpty'; a = @{ GateLongJobPattern = '' } }
+            @{ k = 'patBlank'; a = @{ GateLongJobPattern = '   ' } }
+            @{ k = 'patMatchAll'; a = @{ GateLongJobPattern = '.*' } }
+            @{ k = 'patMatchAllAnchor'; a = @{ GateLongJobPattern = '^' } }
+            @{ k = 'patMatchAllOptional'; a = @{ GateLongJobPattern = '(stage|build|soak)?' } }
+            @{ k = 'patNoStage'; a = @{ GateLongJobPattern = '(^|[-_.])(build|soak)([-_.]|$)' } }
+            @{ k = 'patNoBuild'; a = @{ GateLongJobPattern = '(^|[-_.])(stage|soak)([-_.]|$)' } }
+            @{ k = 'patNoSoak'; a = @{ GateLongJobPattern = '(^|[-_.])(stage|build)([-_.]|$)' } }
+            @{ k = 'patUnrelated'; a = @{ GateLongJobPattern = 'zzz-only' } })) {
+        $r = Test-OverrideBinding $c.a
+        # Misses are collected and asserted once below, so a RED run names every case that still binds.
+        if ($r.ok) { $overrideMisses += "$($c.k): $(@($c.a.Keys)[0]) = '$(@($c.a.Values)[0])' bound (sec=$($r.sec) pattern=$($r.pattern))" }
+        elseif (-not $r.message.Contains($overrideToken)) { $overrideMisses += "$($c.k): refused without ${overrideToken}: $($r.message)" }
+        else { $overrideRefused[$c.k] = $overrideToken }
+    }
+    Assert-True ($overrideMisses.Count -eq 0) "$($overrideMisses.Count) out-of-bounds override(s) not refused with $overrideToken -- $($overrideMisses -join ' || ')"
+    $overrideBound = [ordered]@{}
+    foreach ($c in @(
+            @{ k = 'sec1'; a = @{ GateLongJobSec = 1 }; sec = 1 }
+            @{ k = 'sec600'; a = @{ GateLongJobSec = 600 }; sec = 600 }
+            @{ k = 'sec900'; a = @{ GateLongJobSec = 900 }; sec = 900 }
+            @{ k = 'patDefault'; a = @{ GateLongJobPattern = $GateLongJobPattern }; pattern = $GateLongJobPattern }
+            @{ k = 'patWidened'; a = @{ GateLongJobPattern = '(^|[-_.])(stage|build|soak|trace)([-_.]|$)' }; pattern = '(^|[-_.])(stage|build|soak|trace)([-_.]|$)' }
+            @{ k = 'patWidenedUnanchored'; a = @{ GateLongJobPattern = 'stage|build|soak|trace' }; pattern = 'stage|build|soak|trace' }
+            @{ k = 'patUpperCase'; a = @{ GateLongJobPattern = '(^|[-_.])(STAGE|BUILD|SOAK)([-_.]|$)' }; pattern = '(^|[-_.])(STAGE|BUILD|SOAK)([-_.]|$)' }
+            @{ k = 'bothInBounds'; a = @{ GateLongJobSec = 900; GateLongJobPattern = $GateLongJobPattern }; sec = 900; pattern = $GateLongJobPattern })) {
+        $r = Test-OverrideBinding $c.a
+        Assert-True $r.ok "override accepted $($c.k): an in-bounds override must bind, got: $($r.message)"
+        if ($c.ContainsKey('sec')) { Assert-True ($r.sec -eq $c.sec) "override accepted $($c.k): sec bound as $($r.sec), wanted $($c.sec)" }
+        if ($c.ContainsKey('pattern')) { Assert-True ($r.pattern -ceq $c.pattern) "override accepted $($c.k): pattern bound as '$($r.pattern)', wanted '$($c.pattern)'" }
+        $overrideBound[$c.k] = 'bound'
+    }
+    # No override: both parameters keep the defaults the label cases above run on (validation does not touch a default).
+    $noOverride = Test-OverrideBinding @{}
+    Assert-True ($noOverride.ok -and $noOverride.sec -eq $GateLongJobSec -and $noOverride.pattern -ceq $GateLongJobPattern) "no override binds the defaults ($GateLongJobSec / '$GateLongJobPattern'), got $($noOverride.sec) / '$($noOverride.pattern)' $($noOverride.message)"
+    $unit.overrideBounds = [ordered]@{ refused = $overrideRefused; bound = $overrideBound; token = $overrideToken }
+
+    # 5b. AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1. The wait resolves the label ONCE, from the metadata the job was queued
+    #     with, and the holder it creates is filed under that same label. Through the REAL Start-HeavySlotHolder (only its
+    #     process, record and path helpers mocked) and the REAL Wait-HeavySlotAdmission, the job's meta.json is rewritten
+    #     after the wait's metadata was read: 600 s then 1200 s with GateLongJobSec 900 must stay 'mlv', and 1200 s
+    #     then 600 s must stay 'mlv-long'. A second read inside the holder start used to file the ticket under the other
+    #     label, which Get-HeavySlotVerdict then reads as holder-lost.
+    $startFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-HeavySlotHolder' }, $true)
+    Assert-True ($null -ne $startFn) "agent defines Start-HeavySlotHolder"
+    $mockStartHolder = ${function:Start-HeavySlotHolder}
+    # The names Start-HeavySlotHolder reads are the agent's own script variables; $HeavySlotScript is also this script's
+    # -HeavySlotScript parameter, so every one is put back after the case.
+    $savedAgentVars = @{}
+    foreach ($n in @('HeavySlotPython', 'HeavySlotScript', 'HeavySlotFeed', 'HeavySlotCount', 'slotHolders', 'logs', 'psExe')) {
+        $savedAgentVars[$n] = Get-Variable -Name $n -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    }
+    . ([scriptblock]::Create($startFn.Extent.Text))
+    $HeavySlotPython = 'python-mock'
+    $HeavySlotScript = Join-Path $mockDir 'heavy-slot-mock.py'
+    [IO.File]::WriteAllText($HeavySlotScript, '# mock')
+    $HeavySlotFeed = Join-Path $mockDir 'feed-mock.csv'
+    $HeavySlotCount = 2
+    $slotHolders = $mockDir
+    $logs = $mockDir
+    $psExe = 'pwsh-mock'
+    $script:AgentProcessStartUtc = 'unit'
+    function Resolve-HeavySlotPython { return $HeavySlotPython }
+    function New-HeavySlotSentinelCommand { param($AcquiredFile, $ReleaseFile) return 'sentinel-mock' }
+    function Get-ProcessIdentity { param($ProcessId) return $null }
+    function Write-JsonFileAtomic { param($Path, $InputObject) $script:Mock.record = $InputObject; return [pscustomobject]@{ ok = $true } }
+    function Start-WindowlessRedirectedProcess {
+        param($FilePath, $ArgumentList, $OutFile, $ErrFile, $Environment)
+        $script:Mock.launchArgs = @($ArgumentList)
+        $script:Mock.expire = $true     # the next loop turn leaves the wait, so the case is one holder start
+        return [pscustomobject]@{ Process = [pscustomobject]@{ Id = 4242; StartTime = (Get-Date); HasExited = $false; ExitCode = 0 } }
+    }
+    $singleRead = [ordered]@{}
+    foreach ($c in @(
+            @{ k = 'shortThenLong'; queuedSec = 600; laterSec = 1200; want = 'mlv jslr' }
+            @{ k = 'longThenShort'; queuedSec = 1200; laterSec = 600; want = 'mlv-long jslr' })) {
+        Assert-True ((($c.queuedSec -le $GateLongJobSec) -ne ($c.laterSec -le $GateLongJobSec))) "single-read $($c.k): the two timeouts straddle GateLongJobSec ($GateLongJobSec)"
+        Reset-Mock "1:$PID" @('slot 1: free', 'slot 2: free') $false
+        [IO.File]::WriteAllText((Join-Path $inbox 'jslr.meta.json'), ('{{"jobId":"jslr","timeoutSec":{0}}}' -f $c.laterSec))
+        $queuedMeta = [pscustomobject]@{ maxQueueAgeSec = 1; timeoutSec = $c.queuedSec }
+        $adm = Wait-HeavySlotAdmission -JobId 'jslr' -Job ([pscustomobject]@{}) -Metadata $queuedMeta
+        Assert-True ($adm.label -eq 'queue-expired') "single-read $($c.k): the wait ended on the expiry, label $($adm.label)"
+        $argv = @($script:Mock.launchArgs)
+        $at = [array]::IndexOf($argv, '--label')
+        Assert-True ($at -ge 0 -and $at + 1 -lt $argv.Count) "single-read $($c.k): the holder was launched with a --label: [$($argv -join ' ')]"
+        $ticketLabel = [string]$argv[$at + 1]
+        Assert-True ($ticketLabel -ceq $c.want) "single-read $($c.k): the ticket is filed under the label resolved from the metadata the wait read ('$($c.want)'), got '$ticketLabel' (meta.json now says $($c.laterSec) s)"
+        Assert-True ([string]$script:Mock.record.label -ceq $c.want) "single-read $($c.k): the holder record carries the same label: '$($script:Mock.record.label)'"
+        Assert-True (@($script:Mock.probes) -notcontains 'holder-lost') "single-read $($c.k): no probe reads the holder as lost: $($script:Mock.probes -join ',')"
+        $singleRead[$c.k] = $ticketLabel
+    }
+    ${function:Start-HeavySlotHolder} = $mockStartHolder
+    Remove-Item Function:\Resolve-HeavySlotPython, Function:\New-HeavySlotSentinelCommand, Function:\Get-ProcessIdentity, Function:\Write-JsonFileAtomic, Function:\Start-WindowlessRedirectedProcess -ErrorAction SilentlyContinue
+    foreach ($n in $savedAgentVars.Keys) { Set-Variable -Name $n -Scope Script -Value $savedAgentVars[$n] }
+    $unit.singleRead = $singleRead
+
+    # 6. The gate-wait heartbeat names the holder it is waiting behind. The prefix stays byte-identical:
+    #    um-run.ps1 reads "gate-wait job=<id> state=<s> waited=<n>s" unanchored at the end, and the fifo e2e needs
+    #    "state=queued " with a space.
+    $ctl = "bad" + [char]9 + "la" + [char]10 + [char]13 + [char]1 + "bel" + ("y" * 100)
+    $hn = Format-HeavySlotHolderNote -Holders @("$ctl (pid 5, since 2026-10-11 18:00:00, held 9 min) [exclusive]")
+    Assert-True ($hn -match '^ holder=([\x21-\x7E]+(?: [\x21-\x7E]+)*) held=9m$') "holder note is printable ASCII with single spaces only: [$hn]"
+    $lab = ($hn -replace '^ holder=', '') -replace ' held=9m$', ''
+    Assert-True ($lab.Length -le 64) "holder label is capped at 64 chars: $($lab.Length)"
+    Assert-True ($lab.StartsWith('bad la bel') -and $lab -notmatch '\s{2}') "control characters and whitespace collapse to one space: [$lab]"
+    Assert-True ((Format-HeavySlotHolderNote -Holders @("suite X (pid 77, since 2026-10-11 18:00:00, held 62 min) [exclusive]")) -ceq ' holder=suite X held=62m') "holder note: plain holder"
+    Assert-True ((Format-HeavySlotHolderNote -Holders @("a (pid 1, since S, held 3 min)", "b (pid 2, since S, held 70 min) [exclusive]", "c (pid 3, since S, held 9 min)")) -ceq ' holder=b held=70m') "holder note: the longest-held holder is named"
+    Assert-True ((Format-HeavySlotHolderNote -Holders @("old (pid 4, since 2026-10-11 18:00:00) [exclusive]")) -ceq ' holder=old held=?m') "holder note: a status line without a held field gives held=?m"
+    Assert-True ((Format-HeavySlotHolderNote -Holders @()) -ceq '') "holder note: no holder, no field"
+    Assert-True ((Format-HeavySlotHolderNote -Holders $null) -ceq '') "holder note: null holders, no field"
+    $label64 = 'x' * 64
+    Assert-True ((Format-HeavySlotHolderNote -Holders @(("x" * 70) + " (pid 6, since S, held 1 min)")) -ceq " holder=$label64 held=1m") "holder note: exactly 64 chars kept"
+    function Write-AgentHeartbeat([string]$Activity) { $script:Mock.hb += @($Activity); $script:Mock.expire = $true }
+    Reset-Mock "1:$PID" @('slot 1: suite X (pid 77, since 2026-10-11 18:00:00, held 62 min) [exclusive]', 'slot 2: free') $false
+    Remove-Item -LiteralPath $script:Mock.holder.acquiredFile -Force
+    $script:Mock.hb = @()
+    $adm = Wait-HeavySlotAdmission -JobId 'j1' -Job ([pscustomobject]@{}) -Metadata ([pscustomobject]@{ maxQueueAgeSec = 1 })
+    Assert-True (@($script:Mock.hb).Count -ge 1) "heartbeat: the wait heartbeats"
+    $busyBeat = [string]$script:Mock.hb[0]
+    Assert-True ($busyBeat -cmatch '^gate-wait job=j1 state=queued waited=\d+s holder=suite X held=62m$') "heartbeat: busy line carries holder= and held=: [$busyBeat]"
+    Assert-True ($busyBeat.StartsWith('gate-wait job=j1 state=queued ')) "heartbeat: the prefix keeps 'state=queued ' with a space"
+    $script:Mock.hb = @()
+    Reset-Mock "1:$PID" @('slot 1: free', 'slot 2: free') $false
+    Remove-Item -LiteralPath $script:Mock.holder.acquiredFile -Force
+    $script:Mock.hb = @()
+    $adm = Wait-HeavySlotAdmission -JobId 'j1' -Job ([pscustomobject]@{}) -Metadata ([pscustomobject]@{ maxQueueAgeSec = 1 })
+    $freeBeat = [string]$script:Mock.hb[0]
+    Assert-True ($freeBeat -cmatch '^gate-wait job=j1 state=queued waited=\d+s$') "heartbeat: a free machine adds no holder field, line byte-identical to today's: [$freeBeat]"
+    # um-run.ps1's own reader (its function, parsed from the tracked file) still reads the new line.
+    $umRunPath = Join-Path $RepoRoot 'tools\profiling\um-run.ps1'
+    $umAst = [System.Management.Automation.Language.Parser]::ParseFile($umRunPath, [ref]$null, [ref]$null)
+    $umFn = $umAst.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-UmRunGateWaitState' }, $true)
+    Assert-True ($null -ne $umFn) "um-run.ps1 defines Get-UmRunGateWaitState"
+    . ([scriptblock]::Create($umFn.Extent.Text))
+    $hbFile = Join-Path $mockDir 'um-run-heartbeat.txt'
+    [IO.File]::WriteAllText($hbFile, "alive 2026-10-19T00:00:00.0000000-05:00 pid=1 host=H generation=9 imagePath=""x"" agentScript=""y"" $busyBeat")
+    $umState = Get-UmRunGateWaitState -HeartbeatPath $hbFile -JobId 'j1'
+    Assert-True ($umState.State -eq 'queued' -and $umState.AgentWaited -match '^\d+s$') "um-run.ps1 still parses the busy line: state=$($umState.State) waited=$($umState.AgentWaited)"
+    $unit.heartbeat = [ordered]@{ busy = ($busyBeat -replace 'waited=\d+s', 'waited=Ns'); free = ($freeBeat -replace 'waited=\d+s', 'waited=Ns'); umRunState = $umState.State; capped = $lab.Length; collapsed = $lab.Substring(0, 10) }
 }
 finally {
     Remove-Item Function:\Invoke-QueuedJob, Function:\Get-JobRecoveryPending -ErrorAction SilentlyContinue
@@ -246,6 +465,13 @@ finally {
     Remove-Item -LiteralPath $mockDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 $results.unit = $unit
+
+# BACHELOR-AGENT-QUIET-LEASE-1: the quiet-lease cases (lease mode, the default) run in their own process against a fake
+# heavy-slot.py, so this script's status-mode mocks never meet them. A failure there fails this run.
+$leaseTest = Join-Path $PSScriptRoot 'test-ultra-magnus-agent-quiet-lease.ps1'
+$leaseOut = & (Get-Process -Id $PID).Path -NoLogo -NoProfile -NonInteractive -File $leaseTest -RepoRoot $RepoRoot -AgentScript $agentScript 2>&1
+Assert-True ($LASTEXITCODE -eq 0) "quiet-lease cases ($leaseTest) pass: $($leaseOut -join ' | ')"
+$results.quietLease = ($leaseOut -join "`n") | ConvertFrom-Json
 
 if ($UnitOnly) {
     [pscustomobject]@{ status = 'PASS'; mode = 'unit-only'; results = $results } | ConvertTo-Json -Depth 8
@@ -288,7 +514,12 @@ function Start-Agent($c) {
     $si = [Diagnostics.ProcessStartInfo]::new((Get-Command pwsh.exe).Source)
     foreach ($a in @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $agentScript, '-Root', $c.root, '-PollSeconds', '1',
             '-MutexName', "Local\MlvHeavySlotFifoTest-$PID-$($c.name)-$($agents.Count)", '-HeavySlotPython', $Python, '-HeavySlotScript', $hs,
-            '-HeavySlotDir', $c.slots, '-HeavySlotFeed', $c.feed, '-GateProbeSec', '2', '-GateIdleSampleSec', '0')) { [void]$si.ArgumentList.Add($a) }
+            '-HeavySlotDir', $c.slots, '-HeavySlotFeed', $c.feed, '-GateProbeSec', '2', '-GateIdleSampleSec', '0',
+            # AGENT-HEAVY-SLOT-2.3-ADAPT-1: an unset timeout is the 1800 s default, which labels a job "mlv-long <id>".
+            # These test jobs are short, so they keep the "mlv <id>" label the cases below match on.
+            '-JobTimeoutSec', '600',
+            # BACHELOR-AGENT-QUIET-LEASE-1: these cases prove the r1c holder path, which is now the -HeavySlotMode status rollback.
+            '-HeavySlotMode', 'status')) { [void]$si.ArgumentList.Add($a) }
     $si.UseShellExecute = $false; $si.CreateNoWindow = $true
     $si.RedirectStandardOutput = $true; $si.RedirectStandardError = $true
     $p = [Diagnostics.Process]::Start($si)

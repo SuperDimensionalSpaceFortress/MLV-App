@@ -3,7 +3,7 @@
 # The settled-grab gates (review-dualiso-fullres-recon.ps1, run-release-gui-smoke.ps1 single screenshot)
 # are BLIND to the LIVE look: the cold (first-uncached) pass, the dark->bright Look Assist shift, temporal
 # grain/chroma residual, and whether the displayed frame actually ADVANCES. This rebuilds the deleted
-# capturer: it launches the GUI-smoke playback (which auto-plays ONCE, never loops: a clip under 20 s is refused), PrintWindow-captures the MLVApp
+# capturer: it launches the GUI-smoke playback (which auto-plays ONCE, never loops: a clip under its play floor, 20 s or 10 s at >= 50 fps, is refused), PrintWindow-captures the MLVApp
 # window every ~1s into a cap-*.png filmstrip, WAITS for the app to end its own Play (it never kills the app on a
 # clock of its own) and reads the app's playback_smoke.summary: a Play that did not consume the source frames of its
 # window, or that the script had to kill, is INVALID (exit 43), never a normal result (PLAYBACK-CLIP-LENGTH-ENFORCE-3
@@ -62,9 +62,13 @@ if ($Seconds -lt $needSeconds) { $Seconds = $needSeconds }
 # the same clip-length gate run-release-gui-smoke.ps1 does. A clip under 20 s, or shorter than the
 # play window, is refused (exit 41 CLIP_TOO_SHORT / 42 CLIP_LENGTH_UNKNOWN); --loop is never passed.
 . (Join-Path $PSScriptRoot 'gui-smoke-length-gate.ps1')
-# ENFORCE-2: this script computes its own window; it is never below the 20 s floor, and an inherited
+# ENFORCE-2: this script computes its own window; it is never below the clip's play floor, and an inherited
 # MLVAPP_AUTOPLAY_* variable (which plays with no tool gate) is refused.
-if ($Seconds -lt 20) { $Seconds = 20 }
+# HFR-10S-1 r2 (sol M-04): the floor is Get-GuiSmokeMinPlaySeconds of the clip's header fps (10 s at >= 50 fps, else 20 s; an
+# unreadable header is 20 s and the gate below then refuses it as CLIP_LENGTH_UNKNOWN), never a literal of this script.
+$clipHeaderLength = Get-GuiSmokeClipLength -Path $clip
+$playFloorSeconds = Get-GuiSmokeClipPlayFloorSeconds -ClipLength $clipHeaderLength
+if ($Seconds -lt $playFloorSeconds) { $Seconds = [int][math]::Ceiling($playFloorSeconds) }
 $parentEnvironmentGate = Test-GuiSmokeParentEnvironment
 if ($parentEnvironmentGate.verdict -ne 'OK') {
     [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-2: $($parentEnvironmentGate.message)")

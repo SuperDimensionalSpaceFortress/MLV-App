@@ -1,6 +1,7 @@
 #include "../common/minitest.h"
 #include "../common/hash_helpers.h"
 #include "../common/test_artifacts.h"
+#include "../common/repo_paths.h"
 #include "../common/frame_compare.h"
 
 #include "mlv_pipeline_fixture.h"
@@ -1786,7 +1787,7 @@ TEST(GpuPreviewProcessing, ViewportRouteContractCheckerAcceptsOnlyTheMainPath)
 TEST(GpuPreviewProcessing, ViewportPresentRoutesNeverBindAStaleShadowsHighlightsBlur)
 {
     QString path = qEnvironmentVariable("MLVAPP_TEST_VIEWPORT_SOURCE"); /* red-first override */
-    if (path.isEmpty()) path = QStringLiteral("platform/qt/GpuDisplayViewport.cpp");
+    if (path.isEmpty()) path = repo_file_path(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
     QFile file(path);
     ASSERT_TRUE(file.open(QIODevice::ReadOnly));
     const std::string source = cpp_body_without_comments_and_strings(file.readAll().toStdString());
@@ -2013,7 +2014,7 @@ TEST(GpuPreviewProcessing, HostRouteAndTelemetryComeFromTheSingleEngineCallSite)
     int helperCalls = 0;
     for (const QString & path : sources)
     {
-        QFile file(path);
+        QFile file(repo_file_path(path));
         ASSERT_TRUE(file.open(QIODevice::ReadOnly));
         const std::string body = cpp_body_without_comments_and_strings(file.readAll().toStdString());
         const bool isHelper = path.endsWith("GpuPreviewHostRoute.h");
@@ -2044,7 +2045,7 @@ TEST(GpuPreviewProcessing, HostRouteAndTelemetryComeFromTheSingleEngineCallSite)
     ASSERT_EQ(1, helperCalls);   /* the one call site: RenderFrameThread::drawFrame */
 
     /* the telemetry keys read the engine's route (strings are blanked above) */
-    QFile raw(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    QFile raw(repo_file_path(QStringLiteral("platform/qt/RenderFrameThread.cpp")));
     ASSERT_TRUE(raw.open(QIODevice::ReadOnly));
     const QString text = QString::fromUtf8(raw.readAll());
     const int directAt = text.indexOf(QStringLiteral("QStringLiteral(\"gpu_preview_processing_cpu_route_direct8\")"));
@@ -3632,6 +3633,34 @@ TEST(GpuPreviewProcessing, EngineAnchoredLookAssistFlavorsMatchEngineWithReceipt
                                                                              : "look_assist_film_v3_shade_real_frame",
                                                film, curve);
     }
+
+    /* LOOK-ASSIST-KODAK-VISION-50D-1: Kodak Vision3 50D = the Cinematic preset + the vibrance delta, and the vision50d-v1
+     * curves (a crisper Y line and a near-neutral R / B mirror). The display shader and both CPU routes match the engine at
+     * the same budgets, Night and Shade. */
+    LookAssistPreset vision50d = classic;
+    lookAssistApplyFlavorDeltas(&vision50d, LookAssistScene::Night, LookAssistFlavor::Vision50d);
+    ASSERT_EQ(cinematic.contrast, vision50d.contrast);
+    ASSERT_EQ(cinematic.pivot, vision50d.pivot);
+    ASSERT_EQ(cinematic.shadows, vision50d.shadows);
+    ASSERT_EQ(cinematic.highlights, vision50d.highlights);
+    ASSERT_EQ(cinematic.vibrance + lookassist::lookAssistVision50dVibranceDelta(), vision50d.vibrance);
+    for (const LookAssistScene scene : { LookAssistScene::Night, LookAssistScene::Shade })
+    {
+        const QString curve = lookassist::lookAssistVision50dGradationCurve(scene);
+        processingObject_t * probe = initProcessingObject();
+        ASSERT_TRUE(probe != nullptr);
+        lookAssistTestApplyGradationCurve(probe, curve);
+        int yMoved = 0;
+        for (int index = 0; index < 65536; ++index)
+        {
+            if (std::abs(static_cast<int>(probe->gcurve_y[index]) - index) > 200) ++yMoved;
+        }
+        freeProcessingObject(probe);
+        ASSERT_TRUE(yMoved > 1000);
+        run_look_assist_flavor_real_frame_case(scene == LookAssistScene::Night ? "look_assist_vision50d_night_real_frame"
+                                                                             : "look_assist_vision50d_shade_real_frame",
+                                               vision50d, curve);
+    }
 }
 
 struct CreativeChainCase
@@ -4211,7 +4240,7 @@ TEST(GpuPreviewProcessing, PlaybackTextureRouteRefusalIsWiredIntoThePolicy)
      * policy state, the scale-one clamp sees the same refusal, the fallback reason
      * carries the typed token, and the viewport's RGB16 display-shader present is
      * skipped for a refused stage. */
-    QFile policyFile(QStringLiteral("platform/qt/MainWindowGpuPreviewPolicy.h"));
+    QFile policyFile(repo_file_path(QStringLiteral("platform/qt/MainWindowGpuPreviewPolicy.h")));
     ASSERT_TRUE(policyFile.open(QIODevice::ReadOnly));
     const QString policy = QString::fromUtf8(policyFile.readAll());
     auto functionBody = [&policy](const QString & signature) -> QString
@@ -4226,7 +4255,7 @@ TEST(GpuPreviewProcessing, PlaybackTextureRouteRefusalIsWiredIntoThePolicy)
     ASSERT_TRUE(functionBody(QStringLiteral("inline bool mainWindowAllowsGpuAmazeTexturePresentation("))
                     .contains(QStringLiteral("state.gpuPreviewProcessingDisplayShaderCompatible")));
 
-    QFile mainWindowFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    QFile mainWindowFile(repo_file_path(QStringLiteral("platform/qt/MainWindow.cpp")));
     ASSERT_TRUE(mainWindowFile.open(QIODevice::ReadOnly));
     const QString mainWindow = QString::fromUtf8(mainWindowFile.readAll());
     ASSERT_TRUE(mainWindow.contains(QStringLiteral(

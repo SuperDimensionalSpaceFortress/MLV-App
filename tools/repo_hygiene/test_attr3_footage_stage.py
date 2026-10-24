@@ -1546,8 +1546,14 @@ class SameJobIdRulingPremiseTests(unittest.TestCase):
     # ownership (above) makes a collision safe by construction anyway.
     # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1: Wait-VenueQuiet.ps1 (the read-only cooldown probe) is the third. Re-examined the same way: every probe
     # submission carries a fresh JobId (venue-quiet-probe-<UTC to the millisecond>), it never resubmits one, and claim-first ownership holds anyway.
+    # UM-REGULAR-BASELINE-STAGE-1: Invoke-VenueStageNightly.ps1 (the nightly BUILD stager; it never touches footage) is the fourth. Re-examined: its JobIds
+    # are deterministic per sha and single-use BY DESIGN (that is its #508 idempotency), so the property kept here is "never resubmits one", not "fresh":
+    # it reads each JobId's outbox result by name before submitting and never submits a spent one, an UMRUN_JOBID_IN_USE refusal is never resubmitted under
+    # the same id (one suffixed stage re-try, then STAGE_FAILED), an UNRESOLVED um-run is never retried, one driver per venue runs at a time (named mutex),
+    # and claim-first ownership makes a collision with any other submitter safe anyway. test_venue_stage_nightly.py pins "no JobId twice in one call".
     KNOWN_PRODUCTION_CALLERS = {GENERATOR, ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeg.ps1",
-                                ROOT / "tools" / "profiling" / "dual-venue" / "Wait-VenueQuiet.ps1"}
+                                ROOT / "tools" / "profiling" / "dual-venue" / "Wait-VenueQuiet.ps1",
+                                ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueStageNightly.ps1"}
 
     def _production_um_run_references(self) -> set[Path]:
         proc = subprocess.run(
