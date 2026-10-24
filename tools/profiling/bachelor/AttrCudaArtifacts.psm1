@@ -3310,7 +3310,8 @@ function Get-AttrCudaSelfHealMetrics {
         else {
             # r10: a fault row without an integer cuda_code was [int]$null = 0, i.e. "no injected fault"
             $code = @($tel.faults.Values)[0]
-            if ($code -is [int] -or $code -is [long]) { $m["$($p)InjectedFaultCode"] = [int]$code }
+            # a JSON integer past Int32 parses as Int64 and [int] on it throws: only a code an Int32 can hold is a fault code
+            if (($code -is [int] -or $code -is [long]) -and [long]$code -ge [int]::MinValue -and [long]$code -le [int]::MaxValue) { $m["$($p)InjectedFaultCode"] = [int]$code }
             elseif ($null -eq $code) { $m["$($p)InjectedFaultCodeCouldNotCheck"] = 'COULD-NOT-CHECK FAULT_CODE_ABSENT gpu-field-telemetry fault.cuda_code' }
             else { $m["$($p)InjectedFaultCodeCouldNotCheck"] = "COULD-NOT-CHECK FAULT_CODE_NOT_NUMERIC gpu-field-telemetry fault.cuda_code='$code'" }
         }
