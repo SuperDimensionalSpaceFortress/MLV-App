@@ -58,7 +58,7 @@ generated_from: 2026-10-23T17:21:52Z
 product+playback open: 34
 
 Window: the 7 UTC days ending 2026-10-23 (the last day is partial).
-Landed = merged rows by newest stamp; queued = rows of any state by `source_ledger_stamp`.
+Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp (approximate: a lower bound on the merge time, not a measurement); queued = rows of any state by `source_ledger_stamp`.
 
 | day (UTC) | landed | queued |
 |---|---|---|

@@ -346,5 +346,74 @@ class InputValidationTests(unittest.TestCase):
         self.assertIn("| 2026-10-22 | 1 | 0 |", render_roadmap.render(data))
 
 
+class DeclaredTokenTests(unittest.TestCase):
+    """A `declared@` token in `evidence` is validated as a whole token; none is silently skipped."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.queue = Path(self.tmp.name) / "card-queue.json"
+        self.out = Path(self.tmp.name) / "roadmap.md"
+
+    def run_main(self, data: dict) -> tuple[int, str]:
+        self.queue.write_text(json.dumps(data), encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            try:
+                code = render_roadmap.main(["--card-queue", str(self.queue), "--out", str(self.out)])
+            except SystemExit as exc:
+                code = exc.code
+        return code, err.getvalue()
+
+    def merged(self, evidence: str) -> dict:
+        data = synthetic(1, 0, 0)
+        data["rows"].append(row("MERGED-DECLARED", "merged", "2026-10-18T05:00:00Z", evidence=evidence))
+        return data
+
+    def test_malformed_declared_token_exits_2_naming_the_row_and_the_field(self) -> None:
+        for bad in ("declared@garbage", "declared@2026-10-3T1:2:3Z", "declared@2026-10-21",
+                    "declared@2026-10-21T05:00:00", "declared@2026-10-21T05:00:00Zjunk", "declared@"):
+            with self.subTest(token=bad):
+                code, err = self.run_main(self.merged("hub touched it; " + bad))
+                self.assertEqual(code, 2, err)
+                for needle in (str(self.queue), "row 1", "MERGED-DECLARED", "evidence", bad):
+                    self.assertIn(needle, err)
+                self.assertFalse(self.out.exists())
+
+    def test_one_malformed_token_among_good_ones_still_exits_2(self) -> None:
+        code, err = self.run_main(self.merged("declared@2026-10-20T05:00:00Z declared@bad declared@2026-10-21T05:00:00Z"))
+        self.assertEqual(code, 2, err)
+        self.assertIn("declared@bad", err)
+
+    def test_well_formed_tokens_with_trailing_punctuation_still_render(self) -> None:
+        code, err = self.run_main(self.merged("(declared@2026-10-20T05:00:00Z), then declared@2026-10-21T05:00:00Z."))
+        self.assertEqual(code, 0, err)
+        self.assertIn("| 2026-10-21 | 1 | 0 |", self.out.read_text(encoding="utf-8"))
+
+    def test_non_zero_padded_stamp_would_win_the_string_max_so_it_is_rejected(self) -> None:
+        # As strings "2026-10-9..." > "2026-10-21...", so max() would land the row on the wrong day.
+        self.assertGreater("2026-10-9T05:00:00Z", "2026-10-21T05:00:00Z")
+        code, err = self.run_main(self.merged("declared@2026-10-21T05:00:00Z declared@2026-10-9T05:00:00Z"))
+        self.assertEqual(code, 2, err)
+        self.assertIn("evidence", err)
+
+    def test_zero_padded_stamps_land_on_the_newest_day_whatever_the_token_order(self) -> None:
+        for evidence in ("declared@2026-10-09T05:00:00Z declared@2026-10-21T05:00:00Z",
+                         "declared@2026-10-21T05:00:00Z declared@2026-10-09T05:00:00Z"):
+            with self.subTest(evidence=evidence):
+                self.assertIn("| 2026-10-21 | 1 | 0 |", render_roadmap.render(self.merged(evidence)))
+
+    def test_same_priority_and_stamp_order_by_card_name_as_strings(self) -> None:
+        data = synthetic(0, 0, 0)
+        data["rows"] += [row("CARD-9", "queued", "2026-10-20T00:00:00Z"), row("CARD-10", "queued", "2026-10-20T00:00:00Z")]
+        self.assertEqual(table_cards(render_roadmap.render(data)), ["CARD-10", "CARD-9"])
+
+    def test_legend_says_merged_utc_is_preferred_and_the_fallback_is_approximate(self) -> None:
+        legend = next(l for l in render_roadmap.render(load_fixture()).splitlines() if l.startswith("Landed = "))
+        self.assertIn("merged_utc", legend)
+        self.assertIn("approximate", legend)
+        self.assertIn("queued = rows of any state by `source_ledger_stamp`", legend)
+
+
 if __name__ == "__main__":
     unittest.main()

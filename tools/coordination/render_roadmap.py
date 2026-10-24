@@ -22,8 +22,10 @@ Usage:
 
 Exit: 0 ok / written, 1 `--check` and the file differs (or is missing), 2 bad input.
 Bad input includes a malformed stamp (`generated_utc`, `source_ledger_stamp`, `pinned_utc`,
-`merged_utc`, a `declared@` stamp in `evidence`) or a malformed `order_chain`; the message
-names the file, the row index and the field.
+`merged_utc`, a `declared@` token in `evidence`) or a malformed `order_chain`; the message
+names the file, the row index and the field. A `declared@` token is malformed unless it is
+exactly `declared@YYYY-MM-DDTHH:MM:SSZ` (trailing `.,;:)]}'"` is ignored): a non-zero-padded
+stamp would otherwise lose or win the string `max()` that picks the landing day.
 """
 
 from __future__ import annotations
@@ -42,6 +44,9 @@ WINDOW_DAYS = 7
 NOTE_MAX = 140
 REQUIRED = ("card", "kind", "priority", "state", "source_ledger_stamp")
 DECLARED_RX = re.compile(r"declared@(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
+# Every declared@ token, however it is spelled; validation compares it to DECLARED_RX.
+DECLARED_TOKEN_RX = re.compile(r"declared@(\S*)")
+TOKEN_TRAILING_PUNCT = ".,;:)]}'\""
 
 HEADER = """\
 # MLV-App product roadmap
@@ -155,7 +160,9 @@ def render(data: dict) -> str:
 
     out += ["", "## Drain", "", "product+playback open: %d" % len(open_rows),
             "", "Window: the %d UTC days ending %s (the last day is partial)." % (WINDOW_DAYS, last.isoformat()),
-            "Landed = merged rows by newest stamp; queued = rows of any state by `source_ledger_stamp`.", "",
+            "Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp "
+            "(approximate: a lower bound on the merge time, not a measurement); "
+            "queued = rows of any state by `source_ledger_stamp`.", "",
             "| day (UTC) | landed | queued |", "|---|---|---|"]
     for d in days:
         out.append("| %s | %d | %d |" % (d.isoformat(), landed[d], queued[d]))
@@ -187,9 +194,12 @@ def _check_row(path: Path, i: int, r: dict) -> None:
     for key in ("evidence", "notes"):
         if r.get(key) is not None and not isinstance(r[key], str):
             _die("%s has a non-string %s" % (where, key))
-    for stamp in DECLARED_RX.findall(r.get("evidence") or ""):
-        if not _valid_stamp(stamp):
-            _die("%s has a malformed declared@ stamp in evidence: %r" % (where, stamp))
+    for token in DECLARED_TOKEN_RX.findall(r.get("evidence") or ""):
+        token = token.rstrip(TOKEN_TRAILING_PUNCT)
+        stamp = DECLARED_RX.fullmatch("declared@" + token)
+        if not stamp or not _valid_stamp(stamp.group(1)):
+            _die("%s has a malformed declared@ stamp in evidence: 'declared@%s' "
+                 "(want declared@YYYY-MM-DDTHH:MM:SSZ)" % (where, token))
     oc = r.get("order_chain")
     if oc is None:
         return
