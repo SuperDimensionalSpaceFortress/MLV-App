@@ -107,6 +107,8 @@
     that is not base64 of UTF-16LE text (or a switch with no value) is a holder the gate cannot read, so it is kept like an
     unreadable cwd (kept / cwd-unknown, Why=encoded-command-undecodable, no creation-time or service-owner exemption).
     NOT adopted from dng: its seat-ancestry exemption and report-leftovers-only reclaim (retire refuses on ANY live holder).
+    LANE-RETIRE-GUARD-UNKNOWN-CWD-AND-ENCODED-1: the run-dir tie (Find-RunDirDriverHolders) reads the decoded text too, so a recorded driver
+    that names its RUN DIR only inside -EncodedCommand is a live driver (via=rundir-pid:<file>+cmdline-encoded).
 
     RENAME PROBE (r7, 2026-10-23, LANE-RETIRE-CWD-UNKNOWN-RENAME-PROBE-1): the cwd-unknown rule retired 0 worktrees in 55 lane
       receipts. Its question - "could a process whose cwd I cannot read be sitting in this tree?" - is one the ACL of that
@@ -147,8 +149,9 @@
       RESIDUAL RISK, accepted: a handle that outlives the rename-back budget leaves <root>.retiring (registered or not) until the next lane
       exit's sweep, whose restore runs under the same budget; a record whose admin copy cannot be taken refuses the rename probe, so that
       worktree is kept as cannot-determine.
-      Get-CwdUnknownRefusal keeps its fail-closed default for its other caller (Remove-LaneBulkScratch.ps1, which has no rename
-      to lean on); this function opts in with -DeferUnreadableCwd.
+      Get-CwdUnknownRefusal keeps its fail-closed default for its other callers (Remove-LaneBulkScratch.ps1 and, since
+      LANE-RETIRE-GUARD-UNKNOWN-CWD-AND-ENCODED-1, Get-WorktreeLiveRefusal: neither has a rename to lean on); this function opts in
+      with -DeferUnreadableCwd.
 
     OWNERSHIP (r9, 2026-10-23, fable r4 + sol r4 blocker on PR #603; catalogue row: overlapping sweeps with a live pending record -> never
       restore another live operation, never report retired while the original path exists): two lane exits sweep at once (Invoke-Lane.ps1
@@ -743,12 +746,16 @@ function Find-RunDirDriverHolders {
     # a run dir whose tie cannot be settled (Test-RunDirNamesPath), or a pid record that exists but cannot be read. Such a record may name ANY
     # pid, so it is read as naming every live non-self pid: it refuses exactly when one of them would hold the worktree through that run dir.
     param([string]$WorktreePath, [object]$Snapshot, [string]$RunsRoot)
+    # LANE-RETIRE-GUARD-UNKNOWN-CWD-AND-ENCODED-1 B2: each command line is read with its -EncodedCommand arguments decoded (Get-EncodedCommandText), so a
+    # driver started as `pwsh -EncodedCommand <base64>` that names its run dir only inside the base64 still ties to it; such a row is via ...+cmdline-encoded.
     $rows = New-Object System.Collections.Generic.List[object]
     if (-not $RunsRoot) { return $rows.ToArray() }
     $wd = $WorktreePath.TrimEnd('\')
     $self = @($Snapshot.SelfPids)
     $byPid = @{}
     foreach ($p in @($Snapshot.Procs)) { $byPid[[int]$p.ProcessId] = $p }
+    $decoded = @{}
+    $text = { param($p) $k = [int]$p.ProcessId; if (-not $decoded.ContainsKey($k)) { $decoded[$k] = [string](Get-EncodedCommandText -Name ([string]$p.Name) -CommandLine ([string]$p.CommandLine)).Text }; $decoded[$k] }
     $seen = @{}
     $fail = $null
     $unreadable = New-Object System.Collections.Generic.List[object]
@@ -757,14 +764,17 @@ function Find-RunDirDriverHolders {
         if ($seen.ContainsKey($rec.Pid) -or $self -contains $rec.Pid -or -not $byPid.ContainsKey($rec.Pid)) { continue }
         $p = $byPid[$rec.Pid]
         $cl = [string]$p.CommandLine
-        $matched = $null
+        $matched = $null; $enc = ''
         try {
             if (Test-PathNamed -Text $cl -Path $wd) { $matched = $wd }
-            elseif ((-not $cl -or (Test-PathNamed -Text $cl -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) { $matched = $rec.RunDir }
+            elseif ((-not $cl -or (Test-PathNamed -Text ($cl + "`n" + (& $text $p)) -Path $rec.RunDir)) -and (Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd)) {
+                $matched = $rec.RunDir
+                if ($cl -and -not (Test-PathNamed -Text $cl -Path $rec.RunDir)) { $enc = '+cmdline-encoded' }
+            }
         } catch { if (-not $fail) { $fail = "$($_.Exception.Message) (live pid $($rec.Pid) recorded by $($rec.File))" }; continue }
         if (-not $matched) { continue }
         $seen[$rec.Pid] = $true
-        $rows.Add([pscustomobject]@{ ProcessId = [int]$rec.Pid; Name = [string]$p.Name; Via = "rundir-pid:$($rec.File)"; MatchedPath = $matched })
+        $rows.Add([pscustomobject]@{ ProcessId = [int]$rec.Pid; Name = [string]$p.Name; Via = "rundir-pid:$($rec.File)$enc"; MatchedPath = $matched })
     }
     if ($rows.Count) { return $rows.ToArray() }   # a definite holder outranks an unknown: both refuse, this one names the pid
     if ($fail) { throw $fail }
@@ -772,9 +782,9 @@ function Find-RunDirDriverHolders {
         $tied = $null   # does the record's run dir name the worktree; asked once, and only when a live pid could be tied through it
         foreach ($p in @($Snapshot.Procs)) {
             if ($self -contains [int]$p.ProcessId) { continue }
-            $cl = [string]$p.CommandLine
+            $cl = [string]$p.CommandLine + "`n" + (& $text $p)
             $hit = Test-PathNamed -Text $cl -Path $wd
-            if (-not $hit -and (-not $cl -or (Test-PathNamed -Text $cl -Path $rec.RunDir))) {
+            if (-not $hit -and (-not $cl.Trim() -or (Test-PathNamed -Text $cl -Path $rec.RunDir))) {
                 if ($null -eq $tied) { $tied = [bool](Test-RunDirNamesPath -RunDir $rec.RunDir -Path $wd) }   # throws when unknown: fails closed too
                 $hit = $tied
             }
@@ -793,6 +803,8 @@ function Get-WorktreeLiveRefusal {
     #         census-failed         the process table could not be read      } fail closed: unknown is never free
     #         rundir-census-failed  the run dirs could not be read, or (r2) a  }
     #                               record or tie file in one could not be read, or its tie hit RunDirTieMaxFiles; detail names the file and error class
+    #         cwd-unknown           a candidate holder's cwd is unreadable (not exempt) or its -EncodedCommand does not decode } Get-CwdUnknownRefusal,
+    #         cwd-probe-unavailable the cwd probe cannot run here                                                              } never deferred here
     # -Snapshot: a Get-LaneProcessSnapshot result (a sweep passes one); taken here when absent. -RunsRoot: the fleet-runs root ('' skips the run-dir check).
     param([Parameter(Mandatory = $true)][string]$WorktreePath, [object]$Snapshot = $null, [string]$RunsRoot = '')
     $wd = ([IO.Path]::GetFullPath(($WorktreePath -replace '/', '\'))).TrimEnd('\')
@@ -814,6 +826,11 @@ function Get-WorktreeLiveRefusal {
     try { $r = @(Find-RunDirDriverHolders -WorktreePath $wd -Snapshot $Snapshot -RunsRoot $RunsRoot) }
     catch { return (& $new 'rundir-census-failed' $null $_.Exception.Message) }
     if ($r.Count) { return (& $new 'live-driver' $r[0] '') }
+    # LANE-RETIRE-GUARD-UNKNOWN-CWD-AND-ENCODED-1 B1: a candidate holder whose cwd or -EncodedCommand cannot be read is never free. These callers
+    # have no rename probe, so nothing is deferred (Get-CwdUnknownRefusal's fail-closed default, with its creation-time and service-owner exemptions).
+    try { $u = Get-CwdUnknownRefusal -Snapshot $Snapshot -WorktreePath $wd }
+    catch { return (& $new 'census-failed' $null $_.Exception.Message) }
+    if ($u.Reason) { return (& $new ([string]$u.Reason -replace ':.*$', '') @($u.Rows)[0] ([string]$u.Reason)) }
     return $null
 }
 
