@@ -2599,3 +2599,158 @@ def test_gate_fails_closed_with_a_typed_reason_when_the_process_census_fails(rep
     d = json.loads(p.stdout)
     assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: process census failed"), d
     assert wt.exists()
+
+
+# --- r2 (PR #654 sol r1 BLOCKER + key3 hardening): a run-dir record that cannot be READ is unknown, never absent ---
+# Sol's repro: a live driver named only by its run dir is live-driver while its pid record reads, and was FREE once the same read threw a
+# sharing IOException (the catch dropped the error and cached an empty index). Every read failure other than "the file is gone" now refuses
+# reason=rundir-census-failed naming the file and the error class. The lock below is a real FileShare.None handle held by the test's own
+# pwsh on a temp file; the seam (Read-RunDirRecordText) fakes the error classes a lock cannot produce. No real driver, no real process table.
+
+def _locked(path):
+    p = str(path).replace("'", "''")
+    return f"$lock = [IO.File]::Open('{p}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None);"
+
+
+def _seam_throws(leaf, exc_expr):
+    return ("function Read-RunDirRecordText { param([string]$Path) "
+            f"if ((Split-Path -Leaf $Path) -eq '{leaf}') {{ throw ({exc_expr}) }}; return [IO.File]::ReadAllText($Path) }};")
+
+
+def _blocker_fixture(tmp_path, *, workdir=None):
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs = tmp_path / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-X-1-r5-20261024T0110Z", 999982, workdir=wt if workdir is None else workdir)
+    return wt, runs, rd, _fake_snapshot(_fake_proc(999982, _driver_cmdline(rd)))
+
+
+def test_live_refusal_rundir_record_readable_is_live_driver(tmp_path):
+    """(a) the readable half of sol's pair."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    r, _ = _live_refusal(wt, snap, runs)
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999982, r
+
+
+def test_live_refusal_rundir_pid_record_held_by_a_sharing_violation_is_census_failed_never_free(tmp_path):
+    """(b) sol's repro with a REAL sharing violation: the pid record is open FileShare.None while the guard reads it."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    rec = rd / "venue-driver.pid"
+    r, err = _live_refusal(wt, snap, runs, prelude=_locked(rec))
+    assert r is not None, "an unreadable pid record of a live run-dir driver was read as FREE"
+    assert r["reason"] == "rundir-census-failed", r
+    assert str(rec).lower() in r["detail"].lower() and "IOException" in r["detail"], r
+    assert "REFUSED worktree-removal reason=rundir-census-failed" in err and "venue-driver.pid" in err, err
+
+
+@pytest.mark.parametrize("exc", ["[UnauthorizedAccessException]::new('Access to the path is denied.')",
+                                 "[IO.IOException]::new('The process cannot access the file because it is being used by another process.')",
+                                 "[InvalidOperationException]::new('anything else')"])
+def test_live_refusal_rundir_pid_record_read_error_of_any_class_is_census_failed(tmp_path, exc):
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    r, _ = _live_refusal(wt, snap, runs, prelude=_seam_throws("venue-driver.pid", exc))
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+    cls = exc.split("]")[0].strip("[").split(".")[-1]
+    assert cls in r["detail"] and "venue-driver.pid" in r["detail"], r
+
+
+def test_live_refusal_rundir_tie_receipt_held_by_a_sharing_violation_is_census_failed_never_free(tmp_path):
+    """The pid record reads, the only file tying the run dir to the worktree (the receipt) cannot be read."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    rec = rd / "opus-001.receipt.json"
+    r, err = _live_refusal(wt, snap, runs, prelude=_locked(rec))
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+    assert "opus-001.receipt.json" in r["detail"] and "IOException" in r["detail"], r
+    assert "reason=rundir-census-failed" in err, err
+
+
+def test_live_refusal_rundir_record_gone_between_listing_and_read_is_absent_not_census_failed(tmp_path):
+    """A file that no longer exists is absent evidence, not a failure: the dead-record case stays FREE."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    r, _ = _live_refusal(wt, snap, runs, prelude=_seam_throws("venue-driver.pid", "[IO.FileNotFoundException]::new('gone')"))
+    assert r is None, r
+
+
+def test_live_refusal_unreadable_record_in_a_run_dir_naming_another_worktree_does_not_refuse_this_one(tmp_path):
+    """The unreadable record is read as naming EVERY live pid: it refuses exactly the worktrees such a pid could hold, not every worktree."""
+    other = tmp_path / "lane-Y-1"
+    wt, runs, rd, snap = _blocker_fixture(tmp_path, workdir=other)
+    r, _ = _live_refusal(wt, snap, runs, prelude=_locked(rd / "venue-driver.pid"))
+    assert r is None, r
+    other.mkdir()
+    r2, _ = _live_refusal(other, snap, runs, prelude=_locked(rd / "venue-driver.pid"))
+    assert r2 is not None and r2["reason"] == "rundir-census-failed", r2
+
+
+def test_live_refusal_rundir_tie_cap_reached_without_a_tie_is_census_failed_never_free(tmp_path):
+    """(c) key3 H3: RunDirTieMaxFiles files read without finding the tie is unknown, not free."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    for i in range(5):
+        (rd / f"leg-{i:02d}.json").write_text('{"leg": %d}' % i, encoding="utf-8")
+    r, err = _live_refusal(wt, snap, runs, prelude="$script:RunDirTieMaxFiles = 3;")
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+    assert "rundir-tie-cap" in r["detail"] and str(rd).lower() in r["detail"].lower(), r
+    assert "reason=rundir-census-failed" in err, err
+
+
+def test_live_refusal_rundir_tie_reads_the_receipt_before_bulk_leg_output(tmp_path):
+    """key3 H3 repro shape: NTFS lists leg-*.out.txt before opus-001.receipt.json; the receipt is read first, so the cap is not reached."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    for i in range(5):
+        (rd / f"leg-{i:02d}.out.txt").write_text(f"leg {i}\n", encoding="utf-8")
+    r, _ = _live_refusal(wt, snap, runs, prelude="$script:RunDirTieMaxFiles = 3;")
+    assert r is not None and r["reason"] == "live-driver", r
+
+
+def _gate_err(wt, snapshot_expr, runs=None, prelude="", whatif=True):
+    extra = (f" -RunsRoot '{runs}'" if runs is not None else "") + (" -WhatIf" if whatif else "")
+    snap = f"-ProcessSnapshot ({snapshot_expr})" if snapshot_expr else ""
+    script = (
+        "$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
+        f". '{HELPER}'; {prelude} "
+        f"Invoke-RetireLaneWorktree -WorkDir '{wt}' -MergeTarget 'origin/master' {snap}{extra} | ConvertTo-Json -Depth 4"
+    )
+    p = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    return json.loads(p.stdout), p.stderr
+
+
+def test_gate_refused_line_carries_reason_live_driver_or_live_process(repo):
+    """(d) key3 H4: the gate's REFUSED line carries reason= like the shared guard's line."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-DRV-2")
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-DRV-2-r5", 999991, workdir=wt)
+    d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999991, _driver_cmdline(rd))), runs)
+    assert d["action"] == "kept", d
+    assert re.search(r"REFUSED worktree-removal reason=live-driver path=.* pid=999991 .*via=rundir-pid:venue-driver\.pid", err), err
+    d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999992, f"git -C {wt} status", "git.exe")), runs)
+    assert d["action"] == "kept", d
+    assert re.search(r"REFUSED worktree-removal reason=live-process path=.* pid=999992 .*via=cmdline", err), err
+
+
+def test_gate_census_failures_write_a_typed_refused_line(repo):
+    """key3 H4: a gate census failure writes a REFUSED line, not only the disposition reason."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-CENSUS-2")
+    d, err = _gate_err(wt, None, prelude="function Get-LaneProcessSnapshot { throw 'WMI provider down' };", whatif=False)
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: process census failed"), d
+    assert re.search(r"REFUSED worktree-removal reason=census-failed path=.* pid=unknown .*WMI provider down", err), err
+    runs = tmp / "fleet-runs-file"
+    runs.write_text("not a directory", encoding="utf-8")
+    d, err = _gate_err(wt, _fake_snapshot(), runs)
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: run-dir census failed"), d
+    assert re.search(r"REFUSED worktree-removal reason=rundir-census-failed path=.* pid=unknown ", err), err
+    assert wt.exists()
+
+
+def test_gate_keeps_a_worktree_whose_live_driver_record_is_locked(repo):
+    """The blocker through Invoke-RetireLaneWorktree: kept as cannot-determine, with a typed REFUSED line."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-DRV-3")
+    runs = tmp / "fleet-runs"
+    rd = _driver_run_dir(runs, "lane-DRV-3-r5", 999993, workdir=wt)
+    d, err = _gate_err(wt, _fake_snapshot(_fake_proc(999993, _driver_cmdline(rd))), runs, prelude=_locked(rd / "venue-driver.pid"))
+    assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: run-dir census failed"), d
+    assert "venue-driver.pid" in d["reason"], d
+    assert "REFUSED worktree-removal reason=rundir-census-failed" in err, err
