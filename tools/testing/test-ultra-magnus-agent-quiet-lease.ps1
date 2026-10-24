@@ -40,6 +40,10 @@ param(
 #               A present sidecar that has passed or cannot be read ends the job like a passed notAfterUtc at every check (pre-gate,
 #               each gate loop, post-active, post-admission, pre-launch); a renewed one keeps it alive across exit-75 retries; an
 #               absent one changes nothing. It only shortens: remainingSec and --admit-timeout come from meta.json alone.
+#   runner liveness r2 - (cases liveness-root-shape, liveness-lapse-latched): a sidecar whose JSON root is not an object (a
+#               one-element array that pwsh 7 would unroll, an array of one, an empty array) fails closed, at the gate and in
+#               Invoke-QueuedJob; a lapse the renew tick sees is latched, so a fresher sidecar written later revives no renew
+#               and no admission.
 # Prints one JSON object with status PASS, or throws.
 
 $ErrorActionPreference = 'Stop'
@@ -437,7 +441,8 @@ try {
         'notafter-prelaunch-confirm', 'notafter-renew-in-light-job', 'notafter-meta-unreadable',
         'queuedjob-cancel-post-admission', 'notafter-renew-crosses-deadline', 'notafter-meta-sticky',
         'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75',
-        'liveness-absent-unchanged', 'liveness-unparseable-expired', 'liveness-pure', 'liveness-reader', 'liveness-ast-guard', 'liveness-queuedjob')
+        'liveness-absent-unchanged', 'liveness-unparseable-expired', 'liveness-pure', 'liveness-reader', 'liveness-ast-guard', 'liveness-queuedjob',
+        'liveness-root-shape', 'liveness-lapse-latched')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -696,7 +701,7 @@ function Exit-HeavySlot {
     # wrapper keeps the object it returned, so a case moves that job's notAfterUtc into the past at a chosen step, which is
     # what the verdict sees when the clock passes the deadline there.
     $qjCases = @('notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker', 'notafter-prelaunch-confirm', 'notafter-meta-unreadable',
-        'queuedjob-cancel-post-admission', 'notafter-meta-sticky', 'liveness-queuedjob')
+        'queuedjob-cancel-post-admission', 'notafter-meta-sticky', 'liveness-queuedjob', 'liveness-root-shape')
     if (@($qjCases | Where-Object { Test-Case $_ }).Count -gt 0) {
         # STAGE-JOB-LEASE-EXEMPT-1 r2: Invoke-QueuedJob classifies the job through Get-GateExemptClass, which reads both patterns.
         foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult', 'Get-GateExemptClass')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
@@ -1278,6 +1283,8 @@ function Exit-HeavySlot {
             @{ n = 'live-meta-open'; m = $mOpen; s = $live; st = 'open'; src = 'meta'; ls = 'live'; r = 3600; o = $z3; u = $sOk }
             @{ n = 'live-meta-none'; m = $mNone; s = $live; st = 'none'; src = 'meta'; ls = 'live'; r = $null; o = $null; u = $sOk }
             @{ n = 'live-offset'; m = $mOpen; s = (New-SidecarRead (New-SidecarJson 'jP' '2026-10-24T04:01:00+02:00')); st = 'open'; src = 'meta'; ls = 'live'; r = 3600; o = $z3; u = $sOk }
+            # liveness r2: the root-shape check reads past JSON whitespace, so a valid object after it is still live.
+            @{ n = 'live-leading-whitespace'; m = $mOpen; s = (New-SidecarRead (" `r`n`t" + (New-SidecarJson 'jP' '2026-10-24T02:01:00Z'))); st = 'open'; src = 'meta'; ls = 'live'; r = 3600; o = $z3; u = $sOk }
             @{ n = 'far-future-never-extends'; m = $mOpen; s = (New-SidecarRead (New-SidecarJson 'jP' '2099-01-01T00:00:00Z')); st = 'open'; src = 'meta'; ls = 'live'; r = 3600; o = $z3; u = '2099-01-01T00:00:00.0000000Z' }
             @{ n = 'lapsed'; m = $mOpen; s = (New-SidecarRead (New-SidecarJson 'jP' '2026-10-24T01:59:59Z')); st = 'passed'; src = 'sidecar'; ls = 'lapsed'; r = 3600; o = $z3; u = '2026-10-24T01:59:59.0000000Z' }
             @{ n = 'lapsed-exactly-now'; m = $mOpen; s = (New-SidecarRead (New-SidecarJson 'jP' '2026-10-24T02:00:00Z')); st = 'passed'; src = 'sidecar'; ls = 'lapsed'; r = 3600; o = $z3; u = '2026-10-24T02:00:00.0000000Z' }
@@ -1290,6 +1297,11 @@ function Exit-HeavySlot {
             'not-json'       = (New-SidecarRead '{not json')
             'empty'          = (New-SidecarRead '')
             'json-array'     = (New-SidecarRead '[1,2]')
+            # liveness r2 (Dot B1 on #663): pwsh 7's ConvertFrom-Json unrolls a one-element root array, so '[{...}]' would read
+            # as the object inside it. The root must be an object; these three are each a valid sidecar wrapped in an array.
+            'singleton-object-array' = (New-SidecarRead ('[' + (New-SidecarJson 'jP' '2026-10-24T02:01:00Z') + ']'))
+            'singleton-array-array'  = (New-SidecarRead ('[[' + (New-SidecarJson 'jP' '2026-10-24T02:01:00Z') + ']]'))
+            'empty-array'    = (New-SidecarRead '[]')
             'json-string'    = (New-SidecarRead '"x"')
             'wrong-schema'   = (New-SidecarRead (New-SidecarJson 'jP' '2026-10-24T02:01:00Z' @{ schema = 'mlv-app/job-notafter-sidecar/v2' }))
             'schema-case'    = (New-SidecarRead (New-SidecarJson 'jP' '2026-10-24T02:01:00Z' @{ schema = 'MLV-APP/job-notafter-sidecar/v1' }))
@@ -1466,6 +1478,96 @@ function Exit-HeavySlot {
             $lq[$c.phase] = $p.stderr
         }
         $results.livenessQueuedJob = $lq
+    }
+
+    # ================================================================ runner liveness r2 (LEASE-BATCH-OPEN-RUNNER-LIVENESS-1 r2)
+    # ------------------------------------------------------------ liveness-root-shape: a sidecar whose root is not an object fails closed
+    # Dot B1 on #663: pwsh 7's ConvertFrom-Json unrolls a one-element root array, so '[{valid sidecar}]' read as that sidecar,
+    # live, and the job was requested, admitted and launched. Each shape wraps a sidecar that is valid for its job.
+    if (Test-Case 'liveness-root-shape') {
+        $rs = [ordered]@{}
+        $shapes = [ordered]@{
+            'singleton-object-array' = { param($id) '[' + (New-SidecarJson $id ([DateTime]::UtcNow.AddSeconds(600).ToString('o'))) + ']' }
+            'singleton-array-array'  = { param($id) '[[' + (New-SidecarJson $id ([DateTime]::UtcNow.AddSeconds(600).ToString('o'))) + ']]' }
+            'empty-array'            = { param($id) '[]' }
+        }
+        $k = 0
+        foreach ($n in $shapes.Keys) {
+            $k++
+            # The gate: no request, typed fail closed.
+            Reset-Case @{ request = 'active' }
+            $script:LeaseNotAfterMinAdmitSec = 1
+            $script:AgeAfter = (Get-Date).AddSeconds(15)
+            $id = "jLs$k"
+            $mL = New-NotAfterMeta 3600
+            Write-SidecarRaw $id (& $shapes[$n] $id)
+            $adm = Wait-QuietLeaseAdmission -JobId $id -Job ([pscustomobject]@{}) -Metadata $mL
+            $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+            Assert-True ($adm.label -eq 'expired-not-after' -and $adm.phase -ceq 'pre-request' -and $adm.notAfterState -ceq 'unparseable' -and $adm.notAfterSource -ceq 'sidecar' -and $adm.livenessState -ceq 'unparseable' -and $reqs.Count -eq 0 -and $null -eq $script:QuietLease) "liveness-root-shape (${n}): fail closed at the gate, no request, no admission: label=$($adm.label) state=$($adm.notAfterState) source=$($adm.notAfterSource) requests=$($reqs.Count) why=$($adm.why)"
+            Assert-True ($adm.why -like '*does not hold a JSON object*') "liveness-root-shape (${n}): why names the root shape: $($adm.why)"
+            $want = "quiet-lease: expired-not-after job=$id phase=pre-request notAfterUtc=$($mL.notAfterUtc) requests=0 releaseRc=none$(Get-LivenessSuffix 'unparseable')"
+            Assert-True (@($script:Log | Where-Object { $_ -ceq $want }).Count -eq 1) "liveness-root-shape (${n}): typed line [$want]: $($script:Log -join ' | ')"
+            if ($null -ne $script:QuietLease) { Exit-HeavySlot }
+            # Invoke-QueuedJob: refused pre-gate, NO child launch.
+            $qid = "jLsq$k"
+            $job = Reset-QueuedJobCase @{ request = 'active' } $qid (New-NotAfterMetaJson 3600)
+            Write-SidecarRaw $qid (& $shapes[$n] $qid)
+            $null = Invoke-QueuedJob -Job $job
+            Assert-NotAfterExit "liveness-root-shape (${n}, queued job)" $qid 'pre-gate' $false ''
+            $p = $script:QJ.published[0]
+            Assert-True ($p.notAfterSource -ceq 'sidecar' -and $p.notAfterState -ceq 'unparseable' -and $p.stderr -ceq 'runner liveness sidecar could not be read (fail closed) before launch (pre-gate); job was not executed') "liveness-root-shape (${n}, queued job): typed: $($p | Select-Object notAfterSource, notAfterState, stderr | ConvertTo-Json -Compress)"
+            $rs[$n] = $adm.why
+        }
+        $results.livenessRootShape = $rs
+    }
+
+    # ------------------------------------------------------------ liveness-lapse-latched: a lapse the renew tick saw is not revived
+    # Dot on #663 (improvement): the waiting lease's renew tick, run from inside a light job, sees the sidecar lapse and stops
+    # renewing ("released at the wait's next loop top"). A fresher sidecar written after that must not resume the renewals, and
+    # the wait's next loop top must still release the lease, typed with the lapsed sidecar, never admit it.
+    if (Test-Case 'liveness-lapse-latched') {
+        Reset-Case @{ request = 'active'; active_after = 2 }
+        $script:LeaseNotAfterMinAdmitSec = 1
+        $script:AgeAfter = (Get-Date).AddSeconds(40)
+        $mL = New-NotAfterMeta 3600
+        $script:AliveAt = [DateTime]::UtcNow.AddSeconds(5)
+        $until = Write-Sidecar 'jLl' $script:AliveAt
+        $script:Latch = @{ ran = 0; activeBefore = $false; renewsBefore = 0; stopSeen = $false; fresh = $null; ticksAfterRevive = 0; renewsAfterRevive = 0 }
+        function Invoke-ExemptJobsDuringWait {
+            param([string]$WaitingJobId, [double]$WaitedSec)
+            $script:Latch.ran++
+            $w = $script:QuietLeaseWaiting
+            if ($null -eq $w -or $script:Latch.ran -gt 1) { return 0 }
+            # The light job's monitor loop: one renew tick per slice. Once the tick has typed the stop, the sidecar is renewed
+            # (seq 2, 600 s ahead), and the loop ticks on for 30 more slices, over three renew intervals (LeaseRenewSec 1).
+            $dl = $script:AliveAt.AddSeconds(15)
+            while ([DateTime]::UtcNow -lt $dl -and $script:Latch.ticksAfterRevive -lt 30) {
+                $before = $w.renewStarts
+                Invoke-QuietLeaseRenewTick
+                $d = $w.renewStarts - $before
+                if ($null -ne $script:Latch.fresh) { $script:Latch.renewsAfterRevive += $d; $script:Latch.ticksAfterRevive++ }
+                elseif ($w.notAfterStopLogged -eq $true) {
+                    $script:Latch.stopSeen = $true
+                    $script:Latch.fresh = Write-Sidecar 'jLl' ([DateTime]::UtcNow.AddSeconds(600)) 2
+                }
+                else { $script:Latch.renewsBefore += $d; if ($null -ne $w.active) { $script:Latch.activeBefore = $true } }
+                Start-Sleep -Milliseconds 100
+            }
+            return 1
+        }
+        try { $adm = Wait-QuietLeaseAdmission -JobId 'jLl' -Job ([pscustomobject]@{}) -Metadata $mL }
+        finally { function Invoke-ExemptJobsDuringWait { param([string]$WaitingJobId, [double]$WaitedSec) $script:Exempt++; return 0 } }
+        $lt2 = $script:Latch
+        $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        Assert-True ($lt2.ran -ge 1 -and $lt2.stopSeen -and $null -ne $lt2.fresh -and $lt2.ticksAfterRevive -ge 30) "liveness-lapse-latched: the race landed: the tick typed the lapse inside the light job, then a fresher sidecar was written and ticked over: $($lt2 | ConvertTo-Json -Compress)"
+        Assert-True ($lt2.renewsAfterRevive -eq 0) "liveness-lapse-latched: no renew started after the lapse, the fresher sidecar notwithstanding: $($lt2 | ConvertTo-Json -Compress)"
+        Assert-True ($adm.label -eq 'expired-not-after' -and $adm.phase -ceq 'post-active' -and $adm.notAfterSource -ceq 'sidecar' -and $adm.notAfterState -ceq 'passed' -and $adm.livenessUntilUtc -ceq $until) "liveness-lapse-latched: the wait releases it, typed with the LAPSED sidecar ($until), never admits it: label=$($adm.label) phase=$($adm.phase) source=$($adm.notAfterSource) until=$($adm.livenessUntilUtc)"
+        Assert-True ($adm.why -like '*latched*' -and $null -ne $adm.leaseRelease -and $adm.leaseRelease.phase -ceq 'post-active' -and [string]$adm.leaseRelease.releaseRc -ceq '0') "liveness-lapse-latched: why says latched, released post-active: why=$($adm.why) release=$($adm.leaseRelease | ConvertTo-Json -Compress)"
+        Assert-True ($reqs.Count -eq 1 -and (Get-Released).Count -eq 1 -and (Wait-Until { -not (Test-PidAlive ([int]$reqs[0].pid)) } 5) -and $null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting) "liveness-lapse-latched: one request, released once, wrapper gone, no lease kept"
+        Assert-True (@($script:Log | Where-Object { $_ -like "quiet-lease: not-after passed job=jLl notAfterUtc=$($mL.notAfterUtc) active=* source=sidecar livenessUntilUtc=$until while waiting;*" }).Count -eq 1) "liveness-lapse-latched: the stop is typed once"
+        $want = "quiet-lease: expired-not-after job=jLl phase=post-active notAfterUtc=$($mL.notAfterUtc) requests=1 releaseRc=0$(Get-LivenessSuffix $until)"
+        Assert-True (@($script:Log | Where-Object { $_ -ceq $want }).Count -eq 1) "liveness-lapse-latched: typed line [$want]: $($script:Log -join ' | ')"
+        $results.livenessLapseLatched = [ordered]@{ activeBefore = $lt2.activeBefore; renewsBefore = $lt2.renewsBefore; ticksAfterRevive = $lt2.ticksAfterRevive; renewsAfterRevive = $lt2.renewsAfterRevive; phase = $adm.phase }
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }

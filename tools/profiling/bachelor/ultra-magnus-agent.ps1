@@ -722,7 +722,7 @@ function Get-JobNotAfterVerdict {
     # liveness r1 (LEASE-BATCH-OPEN-RUNNER-LIVENESS-1): -Sidecar is Read-JobNotAfterSidecar's result for the job, folded in so it
     # can only make the job expire SOONER: the earlier of meta and sidecar, never the later. A meta verdict of passed or
     # unparseable stands as it is. Sidecar absent (or $null): the meta verdict, as before. Live: the meta verdict (its state,
-    # notAfterUtc and remainingSec). aliveUntilUtc passed: passed. Unreadable, not a JSON object, the wrong schema or jobId, or an
+    # notAfterUtc and remainingSec). aliveUntilUtc passed: passed. Unreadable, a JSON root that is not an object, the wrong schema or jobId, or an
     # aliveUntilUtc that is missing or does not parse (read as notAfterUtc is): unparseable, fail closed. remainingSec, and so
     # Get-QuietLeaseAdmitTimeout's --admit-timeout, never comes from the sidecar: a short liveness window must not shrink a
     # request's bound (that would drop it every few seconds and starve it behind a foreign holder). Every verdict also carries
@@ -775,7 +775,13 @@ function Get-JobNotAfterVerdict {
         if ([string]$Sidecar.state -cne "present") { $bad = "could not be read ($(([string]$Sidecar.error) -replace '[^\x20-\x7E]', '?'))" }
         else {
             $o = $null
-            try { $o = [string]$Sidecar.text | ConvertFrom-Json -ErrorAction Stop } catch { $bad = "does not parse as JSON" }
+            # liveness r2 (Dot B1 on #663): the ROOT must be an object, read from the text before it is parsed. pwsh 7's
+            # ConvertFrom-Json unrolls a one-element root array, so '[{...}]' would come back as the object inside it (live);
+            # -NoEnumerate would keep the array but does not exist on Windows PowerShell 5.1, which this agent may run under.
+            # Past JSON whitespace the first character must be '{'; a text that starts so and parses whole is an object on both.
+            $txt = ([string]$Sidecar.text).TrimStart([char[]]@([char]0x20, [char]0x09, [char]0x0D, [char]0x0A))
+            if ($txt.Length -eq 0 -or $txt[0] -ne [char]'{') { $bad = "does not hold a JSON object" }
+            else { try { $o = $txt | ConvertFrom-Json -ErrorAction Stop } catch { $bad = "does not parse as JSON" } }
             if ($null -eq $bad -and $o -isnot [System.Management.Automation.PSCustomObject]) { $bad = "does not hold a JSON object" }
             if ($null -eq $bad) {
                 $w = & $toUtc $o.writtenUtc
@@ -2421,6 +2427,8 @@ function Wait-HeavySlotAdmission {
 #      notAfterUtc alone in charge. The earlier bound wins: a sidecar only shortens, never extends. remainingSec, and so
 #      --admit-timeout, come from meta.json alone, so a short liveness window never shrinks a request's bound. The agent never
 #      writes, moves or deletes a sidecar. A job already running is not stopped by it.
+#      liveness r2: the sidecar's JSON root must be an object (checked on the text, so a one-element array is not unrolled
+#      into one), and a lapse the renew tick sees is latched on the waiting lease: a later sidecar does not revive it.
 # KNOWN LIMIT: a lease cannot drain a holder that outlives heavy-slot.py's 30-min pending cap. Such a request is refused
 # (exit 75) and re-asked every LeaseRetrySec, so the job waits behind that holder until the queue-age ceiling.
 # A job whose timeout is over LeaseMaxMinutes minutes is admitted with admission.leaseCoversTimeout=false and a typed line:
@@ -2713,13 +2721,23 @@ function Invoke-QuietLeaseRenewTick {
     # LEASE-NOT-AFTER-HARDENING-2 (Dot R18 on #648): a renew already in flight as that deadline passes is still collected, or
     # killed at LeaseRenewTimeoutSec, here (Update-QuietLeaseRenew -CollectOnly), not left running until the release.
     # liveness r1: the waiting lease's runner-liveness sidecar is read too; one that has passed or cannot be read stops it the same way.
+    # liveness r2 (Dot on #663): the stop is LATCHED. Its verdict is kept on the lease (notAfterStopVerdict) and not read again, so
+    # a fresher sidecar written after the lapse resumes no renew, and the wait's loop top and post-active check use it in place of
+    # a fresh verdict that is no longer passed or unparseable: the lease is released, never admitted. A meta.json bound that has
+    # passed stays passed, so only a sidecar can differ; a runner whose liveness lapsed has given up (R5-4), and its job is ended.
     foreach ($l in @($script:QuietLease, $script:QuietLeaseWaiting)) {
         if ($null -eq $l) { continue }
         $lv = $null
-        if ([object]::ReferenceEquals($l, $script:QuietLeaseWaiting)) { $lv = Get-JobNotAfterVerdict -Metadata $l -Sidecar (Read-JobNotAfterSidecar -JobId $l.jobId) }
+        if ([object]::ReferenceEquals($l, $script:QuietLeaseWaiting)) {
+            if ($null -ne $l.notAfterStopVerdict) { $lv = $l.notAfterStopVerdict }
+            else { $lv = Get-JobNotAfterVerdict -Metadata $l -Sidecar (Read-JobNotAfterSidecar -JobId $l.jobId) }
+        }
         if ($null -ne $lv -and $lv.state -in @("passed", "unparseable")) {
             if ($l.notAfterStopLogged -ne $true) {
                 $l | Add-Member -NotePropertyName notAfterStopLogged -NotePropertyValue $true -Force
+                $latched = $lv | Select-Object *
+                $latched.why = "$($lv.why); latched by the renew tick at $((Get-Date).ToUniversalTime().ToString('o')), so a later sidecar does not revive it"
+                $l | Add-Member -NotePropertyName notAfterStopVerdict -NotePropertyValue $latched -Force
                 $src = if ($lv.source -eq "sidecar") { " source=sidecar livenessUntilUtc=$(if ($null -ne $lv.livenessUntilUtc) { $lv.livenessUntilUtc } else { 'unparseable' })" } else { "" }
                 Add-AgentLogLine "quiet-lease: not-after passed job=$($l.jobId) notAfterUtc=$($l.notAfterUtc) active=$($null -ne $l.active)$src while waiting; no more renews (one in flight is still collected or killed), released at the wait's next loop top"
             }
@@ -2856,6 +2874,8 @@ function Wait-QuietLeaseAdmission {
             # unreadable ends the wait here, releasing a pending request first. liveness r1: so does a runner-liveness sidecar
             # that has passed or cannot be read, read fresh on every loop.
             $v = Get-JobNotAfterVerdict -Metadata $Metadata -Sidecar (Read-JobNotAfterSidecar -JobId $JobId)
+            # liveness r2: a stop the renew tick latched on this lease stands, whatever a later sidecar says.
+            if ($v.state -notin @("passed", "unparseable") -and $null -ne $lease -and $null -ne $lease.notAfterStopVerdict) { $v = $lease.notAfterStopVerdict }
             if ($v.state -in @("passed", "unparseable")) {
                 # LEASE-NOT-AFTER-HARDENING-1 (key3 hardening 2): the request may have turned active since the last read (inside
                 # a light job run from this wait, say), so it is read once more and the phase says which: pending | post-active.
@@ -2893,6 +2913,7 @@ function Wait-QuietLeaseAdmission {
                     # cancel file and notAfterUtc are read again before the lease is handed to the job; either releases it at once.
                     $cancelNow = Test-Path -LiteralPath (Join-Path $cancel "$JobId.cancel") -PathType Leaf
                     $vNow = Get-JobNotAfterVerdict -Metadata $Metadata -Sidecar (Read-JobNotAfterSidecar -JobId $JobId)
+                    if ($vNow.state -notin @("passed", "unparseable") -and $null -ne $lease.notAfterStopVerdict) { $vNow = $lease.notAfterStopVerdict }
                     if ($cancelNow) {
                         $rel = Stop-QuietLease -Lease $lease -Why "cancel file present when the lease turned active"
                         $lease = $null
