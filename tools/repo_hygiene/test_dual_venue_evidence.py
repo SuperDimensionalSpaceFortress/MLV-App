@@ -8092,5 +8092,657 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         self.assertIn("PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT )", src)
 
 
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1: every busy quiet probe names WHO (owner, project) and WHAT (script, redacted command line, parent chain, start time, GPU) for its top CPU and top
+# GPU pids, collected after the sampling window with at most 3 WQL queries, GetOwner per target and ONE GPU Engine read; the gate prints it as comma-free key=value pairs after the
+# byte-identical top prefix; Summarize-VenueBusyProbes.ps1 groups busy probes by project with the gate's own lifted decision function. The real probe job runs here against canned
+# Get-Counter / Get-Process / Get-CimInstance / Invoke-CimMethod shadows, so identity is proved on exact values, not on whatever the test host is running.
+import base64 as _ident_base64
+import datetime as _ident_dt
+
+IDENT_SCHEMA = "mlv-app/venue-quiet-probe-identity/v1"
+IDENT_T0 = _ident_dt.datetime(2026, 10, 24, 1, 2, 3, tzinfo=_ident_dt.timezone.utc)
+_IDENT_EPOCH = _ident_dt.datetime(1601, 1, 1, tzinfo=_ident_dt.timezone.utc)
+
+# Get-Counter shadow that also accepts -MaxSamples (the identity block's GPU read passes it); a canned set past the end of the list answers with no samples
+GET_COUNTER_PRELUDE_MAXSAMPLES = GET_COUNTER_PRELUDE.replace("param($Counter)", "param($Counter, $MaxSamples)")
+
+GET_CIM_PRELUDE = r"""$script:CimRows = @(ConvertFrom-Json -InputObject @'
+__CIMROWS__
+'@)
+$script:CimOwners = ConvertFrom-Json -InputObject @'
+__CIMOWNERS__
+'@
+$script:CimThrow = __CIMTHROW__
+function Get-CimInstance {
+    [CmdletBinding()] param($ClassName, $Filter)
+    if ($script:CimThrow) { throw 'canned CIM failure' }
+    [IO.File]::AppendAllText('__CIMLOG__', "$ClassName|$Filter`n")
+    $ids = @([regex]::Matches([string]$Filter, 'ProcessId=(\d+)') | ForEach-Object { [int64]$_.Groups[1].Value })
+    foreach ($r in $script:CimRows) {
+        if ($ids -contains [int64]$r.ProcessId) {
+            [pscustomobject]@{ ProcessId = [uint32]$r.ProcessId; ParentProcessId = [uint32]$r.ParentProcessId; Name = [string]$r.Name
+                CreationDate = [datetime]::FromFileTimeUtc([int64]$r.CreationFt).ToLocalTime(); CommandLine = $r.CommandLine; ExecutablePath = $r.ExecutablePath }
+        }
+    }
+}
+function Invoke-CimMethod {
+    [CmdletBinding()] param($InputObject, $MethodName)
+    [IO.File]::AppendAllText('__OWNERLOG__', "$($InputObject.ProcessId)`n")
+    $o = $script:CimOwners.PSObject.Properties["$($InputObject.ProcessId)"]
+    if ($null -eq $o) { return [pscustomobject]@{ ReturnValue = [uint32]2; Domain = $null; User = $null } }
+    [pscustomobject]@{ ReturnValue = [uint32]$o.Value.rv; Domain = $o.Value.domain; User = $o.Value.user }
+}
+"""
+
+
+def _ident_ft(dt: "_ident_dt.datetime") -> int:
+    return int((dt - _IDENT_EPOCH).total_seconds() * 10_000_000)
+
+
+def _ident_cim(pid: int, ppid: int, name: str, start, cmd, exe=None) -> dict:
+    return {"ProcessId": pid, "ParentProcessId": ppid, "Name": name, "CreationFt": _ident_ft(start), "CommandLine": cmd, "ExecutablePath": exe}
+
+
+def _ident_gpu_sample(pid: int, eng: int, value: float) -> dict:
+    return _cs("gpu engine", f"pid_{pid}_luid_0x0_0x1_phys_0_eng_{eng}_engtype_3d", "utilization percentage", value)
+
+
+def _ident_probe_body() -> str:
+    text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+    return re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
+
+
+class IdentityProbeMixin:
+    """Runs the REAL probe body (12 s sleeps -> 0) against canned process, counter and CIM data."""
+
+    def run_identity_probe(self, procs: list, cim: list, owners: dict | None = None, gpu: list | None = None, throw: bool = False, cpus: int = 4,
+                           body: str | None = None, old_counter_shadow: bool = False, after_start_ft: dict | None = None) -> dict:
+        body = (_ident_probe_body() if body is None else body).replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
+        sets = []
+        for _ in range(3):
+            seen: dict = {}
+            parts = []
+            for i, (pid, name, _d, _s) in enumerate(procs):   # PDH names a second instance "name#1", so two processes of one name stay two rows
+                n = seen.get(name, 0); seen[name] = n + 1
+                parts.append(_proc(name if n == 0 else f"{name}#{n}", pid, 400 - 10 * i))
+            sets.append({"s": _flat(*parts, _proc("idle", 0, 100))})
+        if gpu is not None:
+            sets.append({"s": [_ident_gpu_sample(p, e, v) for (p, e, v) in gpu]})
+        before = [{"id": pid, "name": name, "cpu": 10.0, "start": _ident_ft(start)} for (pid, name, _d, start) in procs]
+        after = [{"id": pid, "name": name, "cpu": 10.0 + delta, "start": (after_start_ft or {}).get(pid, _ident_ft(start))} for (pid, name, delta, start) in procs]
+        self.cim_log = self.tmp / "cim.log"
+        self.owner_log = self.tmp / "owner.log"
+        for f in (self.cim_log, self.owner_log):
+            f.write_text("", encoding="utf-8")
+        counter_prelude = (GET_COUNTER_PRELUDE if old_counter_shadow else GET_COUNTER_PRELUDE_MAXSAMPLES).replace("__CANNED__", json.dumps(sets))
+        prelude = (counter_prelude + GET_PROCESS_PRELUDE.replace("__SNAPSHOTS__", json.dumps([before, after]))
+                   + GET_CIM_PRELUDE.replace("__CIMROWS__", json.dumps(cim)).replace("__CIMOWNERS__", json.dumps({str(k): {"rv": v[0], "domain": v[1], "user": v[2]} for k, v in (owners or {}).items()}))
+                   .replace("__CIMTHROW__", "$true" if throw else "$false").replace("__CIMLOG__", str(self.cim_log)).replace("__OWNERLOG__", str(self.owner_log)))
+        job = self.tmp / "identity-probe-job.ps1"
+        job.write_text(prelude + body, encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], capture_output=True, text=True, timeout=240)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
+        self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
+        return json.loads(lines[0][len("VENUE_QUIET="):])
+
+    def cim_queries(self) -> list:
+        return [ln for ln in self.cim_log.read_text(encoding="utf-8").splitlines() if ln]
+
+    def owner_calls(self) -> list:
+        return [int(ln) for ln in self.owner_log.read_text(encoding="utf-8").splitlines() if ln]
+
+    @staticmethod
+    def row(probe: dict, pid: int) -> dict:
+        rows = [r for r in probe["identity"]["processes"] if r["pid"] == pid]
+        assert len(rows) == 1, (pid, probe["identity"]["processes"])
+        return rows[0]
+
+
+CHAIN_OWNERS = {pid: (0, "BACHELOR", "layib") for pid in (16892, 500, 400, 17000, 501, 401, 17001, 502, 402)}
+
+
+@requires_windows_pwsh
+class VenueProbeIdentityTests(IdentityProbeMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-probe-identity-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def chain(self, cmd: str, pcmd: str = "pwsh.exe -NoProfile", gcmd: str = "explorer.exe"):
+        t = IDENT_T0
+        procs = [(16892, "python", 29.1, t), (500, "pwsh", 1.0, t - _ident_dt.timedelta(seconds=60)), (400, "explorer", 0.5, t - _ident_dt.timedelta(hours=1))]
+        cim = [_ident_cim(16892, 500, "python.exe", t, cmd, r"C:\Python\python.exe"),
+               _ident_cim(500, 400, "pwsh.exe", t - _ident_dt.timedelta(seconds=60), pcmd, r"C:\Program Files\PowerShell\7\pwsh.exe"),
+               _ident_cim(400, 0, "explorer.exe", t - _ident_dt.timedelta(hours=1), gcmd, r"C:\Windows\explorer.exe")]
+        return procs, cim
+
+    def test_the_fixture_process_is_named_by_owner_project_script_parent_chain_and_start(self) -> None:
+        procs, cim = self.chain(r"C:\Python\python.exe C:\mlvtmp\lane-X-1\tools\bench.py --api_key=abc123 --token xyz")
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0), (16892, 1, 15.0)])
+        ident = p["identity"]
+        self.assertEqual(ident["schema"], IDENT_SCHEMA)
+        self.assertEqual(p["schema"], "mlv-app/venue-quiet-probe/v2", "the top-level schema stays v2: identity only adds a field")
+        r = self.row(p, 16892)
+        self.assertEqual((r["owner"], r["owner_status"]), ("BACHELOR\\layib", "ok"))
+        self.assertEqual((r["project"], r["project_from"], r["script"]), ("mlv-app", "self", "bench.py"))
+        self.assertEqual(r["start_check"], "match")
+        self.assertTrue(r["started_utc"].startswith("2026-10-24T01:02:03"), r["started_utc"])
+        self.assertEqual((r["cmdline_status"], r["cmdline_redactions"], r["cmdline_truncated_chars"]), ("ok", 2, 0))
+        for secret in ("abc123", "xyz"):
+            self.assertNotIn(secret, r["cmdline"])
+        self.assertEqual(r["cmdline"].count("<redacted>"), 2)
+        self.assertIn("bench.py", r["cmdline"])
+        self.assertEqual((r["parent"]["pid"], r["parent"]["name"], r["parent"]["status"]), (500, "pwsh", "ok"))
+        self.assertEqual((r["grandparent"]["pid"], r["grandparent"]["name"], r["grandparent"]["status"]), (400, "explorer", "ok"))
+        self.assertEqual(r["source"], ["top", "top_processes", "gpu_top"], "this pid is in all three target sets")
+        self.assertEqual((r["gpu_percent"], r["gpu_engtype"], r["gpu_status"]), (40.0, "3d", "ok"))
+        for k in ("probe_user", "elevated", "project_roots", "gpu_basis", "gpu_status", "gpu_top", "cost_ms", "notes"):
+            self.assertIn(k, ident)
+        self.assertEqual(ident["project_roots"], "r1")
+        self.assertEqual(set(ident["cost_ms"]), {"cim", "owner", "gpu", "total"})
+        self.assertTrue(all(isinstance(v, int) and v >= 0 for v in ident["cost_ms"].values()), ident["cost_ms"])
+        self.assertTrue(all(isinstance(k, str) and isinstance(v, str) for k, v in ident["notes"].items()))
+
+    def test_the_cim_bound_is_at_most_three_queries_and_getowner_is_for_target_rows_only(self) -> None:
+        # three tops whose parents and grandparents are NOT targets: query 1 = targets, query 2 = parents, query 3 = grandparents
+        t = IDENT_T0
+        procs = [(16892, "python", 29.0, t), (17000, "python", 28.0, t), (17001, "python", 27.0, t)]
+        cim = [_ident_cim(16892, 500, "python.exe", t, "python a.py"), _ident_cim(17000, 501, "python.exe", t, "python b.py"), _ident_cim(17001, 502, "python.exe", t, "python c.py"),
+               _ident_cim(500, 400, "pwsh.exe", t - _ident_dt.timedelta(seconds=9), "pwsh"), _ident_cim(501, 401, "pwsh.exe", t - _ident_dt.timedelta(seconds=9), "pwsh"),
+               _ident_cim(502, 402, "pwsh.exe", t - _ident_dt.timedelta(seconds=9), "pwsh"),
+               _ident_cim(400, 0, "explorer.exe", t - _ident_dt.timedelta(hours=1), "explorer"), _ident_cim(401, 0, "explorer.exe", t - _ident_dt.timedelta(hours=1), "explorer"),
+               _ident_cim(402, 0, "explorer.exe", t - _ident_dt.timedelta(hours=1), "explorer")]
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS)
+        queries = self.cim_queries()
+        self.assertEqual(len(queries), 3, queries)
+        self.assertTrue(all(q.startswith("Win32_Process|ProcessId=") for q in queries), "a filtered query, never a full-table enumeration")
+        for pid in (16892, 17000, 17001):
+            self.assertIn(f"ProcessId={pid}", queries[0])
+        for pid in (500, 501, 502):
+            self.assertIn(f"ProcessId={pid}", queries[1])
+        for pid in (400, 401, 402):
+            self.assertIn(f"ProcessId={pid}", queries[2])
+        self.assertEqual(sorted(self.owner_calls()), [16892, 17000, 17001], "GetOwner is asked for the TARGET rows only, never for a parent")
+        self.assertEqual({r["pid"] for r in p["identity"]["processes"]}, {16892, 17000, 17001})
+        self.assertEqual(self.row(p, 17001)["grandparent"]["pid"], 402)
+
+    def test_the_project_comes_from_self_then_parent_then_grandparent_and_otherwise_is_unknown(self) -> None:
+        t = IDENT_T0
+        old = _ident_dt.timedelta(seconds=9)
+        procs = [(16892, "python", 29.0, t), (17000, "python", 28.0, t), (17001, "python", 27.0, t)]
+        cim = [_ident_cim(16892, 500, "python.exe", t, r"C:\Python\python.exe C:\Users\x\job.py"), _ident_cim(17000, 501, "python.exe", t, r"C:\Python\python.exe C:\Users\x\job.py"),
+               _ident_cim(17001, 502, "python.exe", t, r"C:\Python\python.exe C:\Users\x\job.py"),
+               _ident_cim(500, 400, "pwsh.exe", t - old, r"pwsh -File C:\Users\layib\agent-bridge\run.ps1"), _ident_cim(501, 401, "pwsh.exe", t - old, "pwsh -NoProfile"),
+               _ident_cim(502, 402, "pwsh.exe", t - old, "pwsh -NoProfile"),
+               _ident_cim(400, 0, "explorer.exe", t - old, "explorer.exe"), _ident_cim(401, 0, "explorer.exe", t - old, "explorer.exe"),
+               _ident_cim(402, 0, "airmypc.exe", t - old, r"C:\Tools\AirMyPC\airmypc.exe")]
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS)
+        self.assertEqual((self.row(p, 16892)["project"], self.row(p, 16892)["project_from"]), ("agent-bridge", "parent"))
+        self.assertEqual((self.row(p, 17000)["project"], self.row(p, 17000)["project_from"]), ("unknown", "none"))
+        self.assertEqual((self.row(p, 17001)["project"], self.row(p, 17001)["project_from"]), ("airmypc", "grandparent"))
+
+    def test_an_unreadable_owner_and_command_line_are_typed_never_guessed(self) -> None:
+        t = IDENT_T0
+        procs = [(16892, "python", 29.0, t)]
+        cim = [_ident_cim(16892, 0, "python.exe", t, None, None)]
+        p = self.run_identity_probe(procs, cim, {})   # no owner answer: GetOwner returns ReturnValue 2 (access denied)
+        r = self.row(p, 16892)
+        self.assertEqual((r["owner"], r["owner_status"]), (None, "access-denied"))
+        self.assertEqual((r["cmdline"], r["cmdline_status"], r["exe"], r["exe_status"], r["script"]), (None, "unreadable", None, "unreadable", None))
+        self.assertEqual((r["project"], r["project_from"]), ("unknown", "none"))
+        self.assertEqual(r["parent"]["status"], "none")
+
+    def test_other_getowner_failures_are_typed_by_return_value(self) -> None:
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py")]
+        p = self.run_identity_probe([(16892, "python", 29.0, t)], cim, {16892: (8, None, None)})
+        self.assertEqual((self.row(p, 16892)["owner"], self.row(p, 16892)["owner_status"]), (None, "error-8"))
+
+    def test_an_exited_pid_a_reused_pid_and_a_reused_parent_are_typed_and_never_borrow_another_identity(self) -> None:
+        t = IDENT_T0
+        later = _ident_dt.timedelta(seconds=30)
+        procs = [(16892, "python", 29.0, t), (17000, "python", 28.0, t), (17001, "python", 27.0, t)]
+        cim = [  # 16892: no CIM row at all (exited); 17000: CIM start differs from the sampled start (pid reused); 17001: its parent started AFTER it
+            _ident_cim(17000, 501, "other.exe", t + _ident_dt.timedelta(hours=1), r"C:\Users\x\other.exe --secret-sauce", r"C:\Users\x\other.exe"),
+            _ident_cim(17001, 502, "python.exe", t, r"C:\Python\python.exe C:\mlvtmp\lane-X-1\run.py"),
+            _ident_cim(502, 402, "pwsh.exe", t + later, r"pwsh -File C:\Users\layib\agent-bridge\run.ps1"),
+            _ident_cim(402, 0, "explorer.exe", t - _ident_dt.timedelta(hours=1), "explorer.exe")]
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS)
+        gone = self.row(p, 16892)
+        self.assertEqual((gone["owner"], gone["owner_status"], gone["cmdline"], gone["cmdline_status"], gone["exe"], gone["exe_status"]), (None, "exited", None, "exited", None, "exited"))
+        self.assertEqual(gone["parent"]["status"], "none")
+        reused = self.row(p, 17000)
+        self.assertEqual(set(reused), {"pid", "name", "start_check"}, "a mismatched start carries pid, name and start_check only")
+        self.assertEqual((reused["name"], reused["start_check"]), ("python", "mismatch"), "the name is the SAMPLED one, never the new process's")
+        self.assertNotIn(17000, self.owner_calls(), "no GetOwner for a pid that is no longer the sampled process")
+        self.assertNotIn("other.exe", json.dumps(p["identity"]))
+        self.assertNotIn("secret-sauce", json.dumps(p["identity"]))
+        child = self.row(p, 17001)
+        self.assertEqual(child["parent"]["status"], "pid-reused")
+        self.assertEqual((child["parent"]["name"], child["parent"]["started_utc"]), (None, None), "a reused parent is never named")
+        self.assertEqual(child["grandparent"]["status"], "none")
+        self.assertEqual((child["project"], child["project_from"]), ("mlv-app", "self"))
+
+    def test_a_reused_parent_does_not_lend_its_project(self) -> None:
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 502, "python.exe", t, r"C:\Python\python.exe C:\Users\x\job.py"),
+               _ident_cim(502, 0, "pwsh.exe", t + _ident_dt.timedelta(seconds=30), r"pwsh -File C:\Users\layib\agent-bridge\run.ps1")]
+        p = self.run_identity_probe([(16892, "python", 29.0, t)], cim, CHAIN_OWNERS)
+        self.assertEqual((self.row(p, 16892)["project"], self.row(p, 16892)["project_from"]), ("unknown", "none"))
+
+    def test_redaction_vectors_and_the_200_character_cap(self) -> None:
+        b64 = _ident_base64.b64encode(b"A" * 36).decode()
+        self.assertEqual(len(b64), 48)
+        card = "lane-CPU-17V9-FPS-GAP-AB-1-r5x-20261024T0110Z"
+        self.assertEqual(len(card), 45)
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcDEF123_-xyzABC789"
+        base = "python.exe "
+        cap_cmd = base + ("ab " * 200)[:500 - len(base)]
+        self.assertEqual(len(cap_cmd), 500)
+        vectors = [
+            ("url userinfo", "curl https://user:pw123@host.example/x", ["pw123", "user:pw"], "https://<redacted>@host.example/x"),
+            ("bearer", "tool --header Bearer abcDEF123456 go", ["abcDEF123456"], "Bearer <redacted>"),
+            ("password=", "app password=hunter2 run", ["hunter2"], "password=<redacted>"),
+            ("--secret quoted", 'app --secret "a b" go', ['"a b"'], "--secret <redacted> go"),
+            ("token prefixes", "x sk-abcdefghijklmnop ghp_abcdefghijklmnop12 AKIAABCDEFGHIJKLMNOP", ["sk-abcdefghijklmnop", "ghp_abcdefghijklmnop12", "AKIAABCDEFGHIJKLMNOP"], "<redacted> <redacted> <redacted>"),
+            ("jwt", f"y {jwt}", [jwt, "eyJhbGci"], "y <redacted>"),
+            ("opaque run", f"z {b64}", [b64], "z <redacted>"),
+        ]
+        t = IDENT_T0
+        procs = []; cim = []
+        for i, (_label, cmd, _gone, _want) in enumerate(vectors):
+            procs.append((1001 + i, "tool", 20.0 - i, t)); cim.append(_ident_cim(1001 + i, 0, "tool.exe", t, cmd))
+        procs.append((1101, "tool", 9.0, t)); cim.append(_ident_cim(1101, 0, "tool.exe", t, rf"python C:\x\tool.py {card}"))
+        procs.append((1102, "tool", 8.0, t)); cim.append(_ident_cim(1102, 0, "tool.exe", t, cap_cmd))
+        p = self.run_identity_probe(procs, cim, {})
+        for i, (label, cmd, gone, want) in enumerate(vectors):
+            r = self.row(p, 1001 + i)
+            for secret in gone:
+                self.assertNotIn(secret, r["cmdline"], label)
+            self.assertIn(want, r["cmdline"], label)
+            self.assertGreaterEqual(r["cmdline_redactions"], 1, label)
+        survivor = self.row(p, 1101)
+        self.assertIn(card, survivor["cmdline"], "a hyphenated card or worktree name must survive")
+        self.assertEqual(survivor["cmdline_redactions"], 0)
+        capped = self.row(p, 1102)
+        self.assertEqual(capped["cmdline"], cap_cmd[:200] + "...[+300]")
+        self.assertEqual(capped["cmdline_truncated_chars"], 300)
+
+    def test_gpu_is_the_per_process_max_over_engines_and_a_gpu_only_pid_becomes_a_target(self) -> None:
+        t = IDENT_T0
+        procs = [(16892, "python", 29.1, t)]
+        cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py"), _ident_cim(7777, 0, "wmiprvse.exe", t - _ident_dt.timedelta(hours=2), r"C:\Windows\system32\wbem\wmiprvse.exe")]
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS | {7777: (0, "NT AUTHORITY", "NETWORK SERVICE")},
+                                    gpu=[(16892, 0, 40.0), (16892, 1, 15.0), (7777, 0, 12.0)])
+        ident = p["identity"]
+        self.assertEqual(ident["gpu_status"], "ok")
+        self.assertEqual(ident["gpu_top"], [16892, 7777])
+        r = self.row(p, 16892)
+        self.assertEqual((r["gpu_percent"], r["gpu_engtype"], r["gpu_status"]), (40.0, "3d", "ok"), "the max over engines (40), not their sum (55)")
+        g = self.row(p, 7777)
+        self.assertEqual(g["source"], ["gpu_top"])
+        self.assertEqual((g["owner"], g["gpu_percent"], g["name"]), ("NT AUTHORITY\\NETWORK SERVICE", 12.0, "wmiprvse"))
+
+    def test_a_pid_with_no_gpu_instance_is_zero_and_an_unreadable_counter_is_typed_null(self) -> None:
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py")]
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS, gpu=[(7777, 0, 12.0)])
+        r = self.row(p, 16892)
+        self.assertEqual((r["gpu_percent"], r["gpu_engtype"], r["gpu_status"]), (0.0, None, "no-gpu-context"))
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS, gpu=[])
+        self.assertTrue(p["identity"]["gpu_status"].startswith("counter-unavailable: "), p["identity"]["gpu_status"])
+        r = self.row(p, 16892)
+        self.assertEqual((r["gpu_percent"], r["gpu_engtype"]), (None, None))
+        self.assertEqual(r["gpu_status"], p["identity"]["gpu_status"])
+        self.assertEqual(p["identity"]["gpu_top"], [])
+
+    def test_a_get_counter_that_rejects_the_gpu_read_is_typed_and_changes_nothing_else(self) -> None:
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py")]
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS, old_counter_shadow=True)
+        self.assertTrue(p["identity"]["gpu_status"].startswith("counter-unavailable: "), p["identity"]["gpu_status"])
+        self.assertEqual(self.row(p, 16892)["owner"], "BACHELOR\\layib", "the CIM half of identity still works")
+
+    def test_the_gpu_read_can_be_switched_off_with_a_typed_reason(self) -> None:
+        body = _ident_probe_body().replace("$IdentityGpu = $true", "$IdentityGpu = $false").replace("$IdentityGpuDisabledWhy = ''", "$IdentityGpuDisabledWhy = 'disabled: dev-host read 9999 ms exceeded 2500 ms'")
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py")]
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], body=body)
+        self.assertEqual(p["identity"]["gpu_status"], "disabled: dev-host read 9999 ms exceeded 2500 ms")
+        self.assertNotIn("gpu_top", p["identity"])
+        self.assertEqual((self.row(p, 16892)["gpu_percent"], self.row(p, 16892)["gpu_status"]), (None, p["identity"]["gpu_status"]))
+
+    def test_an_identity_failure_is_typed_and_every_other_field_is_unchanged(self) -> None:
+        t = IDENT_T0
+        procs = [(16892, "python", 29.1, t), (500, "pwsh", 1.0, t)]
+        cim = [_ident_cim(16892, 500, "python.exe", t, "python a.py"), _ident_cim(500, 0, "pwsh.exe", t, "pwsh")]
+        boom = self.run_identity_probe(procs, cim, CHAIN_OWNERS, throw=True)
+        self.assertEqual(set(boom["identity"]), {"schema", "error"})
+        self.assertEqual(boom["identity"]["schema"], IDENT_SCHEMA)
+        self.assertIn("canned CIM failure", boom["identity"]["error"])
+        # the same probe with the identity code CUT OUT is the reference: samples, top and every v2 field must equal it
+        body = _ident_probe_body()
+        cut = re.sub(r"# IDENTITY \(VENUE-PROBE-PROCESS-ATTRIBUTION-1\).*?(?=Write-Output \('VENUE_QUIET=')", "", body, flags=re.S).replace("    identity = $identity\n", "").replace("    identity = $identity\r\n", "")
+        self.assertNotIn("identity", cut)
+        plain = self.run_identity_probe(procs, cim, CHAIN_OWNERS, body=cut)
+        self.assertNotIn("identity", plain)
+        ok = self.run_identity_probe(procs, cim, CHAIN_OWNERS)
+        for k, v in plain.items():
+            self.assertEqual(boom[k], v, f"{k} changed when identity failed")
+            self.assertEqual(ok[k], v, f"{k} changed when identity ran")
+        self.assertEqual(set(boom) - set(plain), {"identity"})
+
+    def test_past_the_wall_clock_budget_no_further_getowner_is_made_and_the_rest_is_still_filled(self) -> None:
+        body = _ident_probe_body().replace("$IdentityBudgetMs = 25000", "$IdentityBudgetMs = -1")
+        self.assertIn("$IdentityBudgetMs = -1", body)
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "python.exe", t, r"C:\mlvtmp\lane-X-1\bench.py")]
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS, body=body)
+        r = self.row(p, 16892)
+        self.assertEqual((r["owner"], r["owner_status"]), (None, "budget-exceeded"))
+        self.assertEqual(self.owner_calls(), [], "no GetOwner call once the budget is spent")
+        self.assertEqual((r["project"], r["script"], r["cmdline_status"]), ("mlv-app", "bench.py", "ok"), "what needs no call is still filled")
+
+    def test_the_budget_is_a_pinned_literal_well_inside_the_120_second_submission_timeout(self) -> None:
+        m = re.search(r"\$IdentityBudgetMs = (\d+)", _ident_probe_body())
+        self.assertIsNotNone(m)
+        self.assertLessEqual(int(m.group(1)), 30000)
+
+    def test_the_decision_counters_never_include_the_gpu_engine(self) -> None:
+        body = _ident_probe_body()
+        decision = re.search(r"\$groups = \[ordered\]@\{.*?\$allPaths = [^\n]*", body, re.S).group(0)
+        self.assertNotIn("gpu engine", decision.lower())
+        self.assertEqual(body.count("Get-Counter -Counter '\\GPU Engine(*)"), 1, "exactly ONE GPU Engine read in the probe")
+        self.assertEqual(len(re.findall(r"\bGet-Counter -Counter\b", re.sub(r"(?m)^\s*#.*$", "", body))), 2, "the decision read plus the one GPU read, nothing else")
+        self.assertEqual(body.count("Start-Sleep -Seconds 12"), 1, "no new sleep text: the 12 s cadence is the gate's contract")
+        self.assertEqual(len(re.findall(r"Get-CimInstance", body)), 1, "one query helper, called at most three times")
+        self.assertNotIn("Win32_Process |", body, "never a full-table enumeration")
+        self.assertNotRegex(body, r"(?i)\bGet-WmiObject\b|\bGetEnvironmentVariable\b|ReadProcessMemory")
+
+    def test_the_real_probe_job_emits_a_typed_identity_with_a_status_for_every_null(self) -> None:
+        job = self.tmp / "real-probe-job.ps1"
+        job.write_text(_ident_probe_body().replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0"), encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], capture_output=True, text=True, timeout=240)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
+        self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
+        p = json.loads(lines[0][len("VENUE_QUIET="):])
+        self.assertEqual(p["schema"], "mlv-app/venue-quiet-probe/v2")
+        ident = p["identity"]
+        self.assertEqual(ident["schema"], IDENT_SCHEMA)
+        if "error" in ident:   # a host where identity cannot run still emits a typed error, never a malformed line
+            self.assertTrue(isinstance(ident["error"], str) and ident["error"])
+            return
+        self.assertTrue(all(isinstance(v, int) and v >= 0 for v in ident["cost_ms"].values()), ident["cost_ms"])
+        self.assertIsInstance(ident["elevated"], bool)
+        self.assertTrue(ident["probe_user"])
+        top_pids = {t["pid"] for t in p["top"]}
+        self.assertTrue(top_pids <= {r["pid"] for r in ident["processes"]}, "every top pid has an identity row")
+        for r in ident["processes"]:
+            if r["start_check"] == "mismatch":
+                self.assertEqual(set(r), {"pid", "name", "start_check"})
+                continue
+            self.assertTrue(r["name"])
+            self.assertTrue(set(r["source"]) <= {"top", "top_processes", "gpu_top"} and r["source"])
+            if r["owner"] is None:
+                self.assertRegex(r["owner_status"], r"^(access-denied|exited|budget-exceeded|error-\w+)$")
+            else:
+                self.assertEqual(r["owner_status"], "ok")
+            for value, status in (("cmdline", "cmdline_status"), ("exe", "exe_status")):
+                self.assertTrue((r[value] is None) == (r[status] != "ok"), (value, r))
+            self.assertTrue((r["gpu_percent"] is None) == (r["gpu_status"] not in ("ok", "no-gpu-context")), r)
+            self.assertIn(r["project"], ("mlv-app", "agent-bridge", "adobe-ingester", "fleet-doctrine", "adversarialllm", "virtual-ten", "airmypc", "unknown"))
+            self.assertIn(r["parent"]["status"], ("ok", "exited", "pid-reused", "none"))
+            self.assertIn(r["grandparent"]["status"], ("ok", "exited", "pid-reused", "none"))
+            for k in ("cmdline", "exe"):
+                self.assertTrue(r[k] is None or len(r[k]) <= 200 + len("...[+999999]"))
+
+
+IDENT_ROW = {"pid": 16892, "name": "python", "source": ["top", "top_processes"], "started_utc": "2026-10-24T01:02:03.0000000Z", "start_check": "match",
+             "owner": "BACHELOR\\layib", "owner_status": "ok", "cmdline": "python bench.py --token <redacted>", "cmdline_status": "ok", "cmdline_redactions": 1,
+             "cmdline_truncated_chars": 0, "exe": "C:\\Python\\python.exe", "exe_status": "ok", "script": "bench.py", "project": "mlv-app", "project_from": "self",
+             "parent": {"pid": 500, "name": "pwsh", "started_utc": "2026-10-24T01:01:03.0000000Z", "status": "ok"},
+             "grandparent": {"pid": 400, "name": "explorer", "started_utc": "2026-10-23T23:02:03.0000000Z", "status": "ok"},
+             "gpu_percent": 40.0, "gpu_engtype": "3d", "gpu_status": "ok"}
+IDENT_GPU_ROW = dict(IDENT_ROW, pid=7777, name="wmiprvse", source=["gpu_top"], owner="NT AUTHORITY\\NETWORK SERVICE", script=None, project="unknown", project_from="none",
+                     parent={"pid": None, "name": None, "started_utc": None, "status": "none"}, grandparent={"pid": None, "name": None, "started_utc": None, "status": "none"},
+                     gpu_percent=12.0)
+IDENT_DENIED_ROW = dict(IDENT_ROW, pid=4, name="system", owner=None, owner_status="access-denied", cmdline=None, cmdline_status="unreadable", exe=None, exe_status="unreadable",
+                        script=None, project="unknown", project_from="none", gpu_percent=None, gpu_engtype=None, gpu_status="counter-unavailable: x")
+IDENT_MISMATCH_ROW = {"pid": 4242, "name": "pwsh", "start_check": "mismatch"}
+IDENT_BLOCK = {"schema": IDENT_SCHEMA, "probe_user": "BACHELOR\\layib", "elevated": False, "project_roots": "r1", "gpu_basis": "per-process max over GPU engines of summed ...",
+               "gpu_status": "ok", "gpu_top": [16892, 7777], "processes": [IDENT_ROW, IDENT_GPU_ROW, IDENT_DENIED_ROW, IDENT_MISMATCH_ROW],
+               "cost_ms": {"cim": 12, "owner": 300, "gpu": 1200, "total": 1600}, "notes": {"cim_queries": "1 WQL queries for 4 target pid(s) (bound: 3); GetOwner once per target"}}
+IDENT_TOP = [{"name": "python", "pid": 16892, "cpuSeconds": 29.1}, {"name": "pwsh", "pid": 4242, "cpuSeconds": 12.5}, {"name": "system", "pid": 4, "cpuSeconds": 3.5},
+             {"name": "svchost", "pid": 999, "cpuSeconds": 1.5}]
+
+
+@requires_windows_pwsh
+class VenueProbeIdentityGateTextTests(unittest.TestCase):
+    setUp = VenueQuietAttributionTests.setUp
+    gate = VenueQuietAttributionTests.gate
+
+    def probe(self, **extra) -> dict:
+        return dict(V2_PROBE, top=IDENT_TOP, identity=IDENT_BLOCK, **extra)
+
+    def test_top_lines_keep_their_prefix_and_append_comma_free_key_value_pairs(self) -> None:
+        proc = self.gate(self.probe())
+        out = proc.stdout
+        self.assertEqual(proc.returncode, 0, out + proc.stderr)
+        self.assertRegex(out, r"(?m)^COOLDOWN_UNMET mean=50\.0% threshold=20(\.0)?% waitedSec=\d+$", "the verdict is unchanged")
+        self.assertIn("  top python pid=16892 cpuSeconds=29.1 owner=BACHELOR\\layib project=mlv-app script=bench.py parent=pwsh:500|ok gparent=explorer:400|ok started=2026-10-24T01:02:03Z gpu=40.0%\n", out.replace("\r\n", "\n"))
+        self.assertIn("  top pwsh pid=4242 cpuSeconds=12.5 ident=pid-reused\n", out.replace("\r\n", "\n"), "a reused pid is named as such and nothing else")
+        self.assertIn("  top system pid=4 cpuSeconds=3.5 owner=unreadable(access-denied) project=unknown script=n/a parent=pwsh:500|ok gparent=explorer:400|ok started=2026-10-24T01:02:03Z gpu=n/a\n", out.replace("\r\n", "\n"))
+        self.assertRegex(out, r"(?m)^  top svchost pid=999 cpuSeconds=1\.5$", "a top row with no identity row prints exactly what it printed before")
+        for line in out.splitlines():
+            if line.startswith("  top ") and "cpuSeconds=" in line:
+                for token in line.split("cpuSeconds=", 1)[1].split()[1:]:   # everything after the cpuSeconds value
+                    self.assertRegex(token, r"^[a-z]+=\S+$", line)
+                    self.assertNotIn(",", token)
+        self.assertNotIn("bench.py --token", out, "no command line is ever printed")
+
+    def test_the_run_local_driver_transform_still_yields_the_process_name(self) -> None:
+        out = self.gate(self.probe()).stdout.replace("\r\n", "\n")
+        line = next(ln for ln in out.split("\n") if ln.startswith("  top python pid=16892 cpuSeconds=29.1 "))
+        step = re.sub(r"\s+cpuSeconds=", ":", re.sub(r"^\s+top\s+", "", line))
+        entries = re.split(r",\s*", step)
+        self.assertEqual(len(entries), 1, "no appended value contains a comma")
+        self.assertEqual(entries[0].split()[0], "python")
+        self.assertTrue(entries[0].startswith("python pid=16892:29.1 "), entries[0])
+
+    def test_whitespace_and_commas_in_an_owner_are_replaced_by_underscores(self) -> None:
+        row = dict(IDENT_ROW, owner="BACH ELOR\\lay,ib", script="my script.py", name="py thon")
+        proc = self.gate(dict(V2_PROBE, top=IDENT_TOP[:1], identity=dict(IDENT_BLOCK, processes=[row], gpu_top=[])))
+        self.assertIn("owner=BACH_ELOR\\lay_ib project=mlv-app script=my_script.py ", proc.stdout)
+
+    def test_attr_proc_lines_gain_owner_and_project_and_the_rest_are_unchanged(self) -> None:
+        probe = self.probe(top_processes=[{"instance": "python", "pid": 16892, "percent": 6.0}, {"instance": "aws", "pid": 43644, "percent": 4.79},
+                                          {"instance": "pwsh", "pid": 4242, "percent": 1.0}])
+        out = self.gate(probe).stdout
+        self.assertRegex(out, r"(?m)^  attr proc python pid=16892 pct=6\.0% owner=BACHELOR\\layib project=mlv-app$")
+        self.assertRegex(out, r"(?m)^  attr proc aws pid=43644 pct=4\.8%$")
+        self.assertRegex(out, r"(?m)^  attr proc pwsh pid=4242 pct=1\.0% ident=pid-reused$")
+
+    def test_ident_lines_follow_the_attr_lines(self) -> None:
+        out = self.gate(self.probe()).stdout.replace("\r\n", "\n")
+        self.assertIn("  ident probe user=BACHELOR\\layib elevated=false cost cim=12 owner=300 gpu=1200 total=1600\n", out)
+        self.assertIn("  ident gpu wmiprvse pid=7777 gpu=12.0% engtype=3d owner=NT_AUTHORITY\\NETWORK_SERVICE project=unknown\n", out)
+        self.assertNotIn("  ident gpu python", out, "a GPU pid already printed in top is not printed twice")
+        self.assertIn("  ident note cim_queries: 1 WQL queries for 4 target pid(s) (bound: 3); GetOwner once per target\n", out)
+        self.assertLess(out.index("  attr cores"), out.index("  ident probe "))
+        self.assertLess(out.index("COOLDOWN_UNMET"), out.index("  top python"))
+
+    def test_an_identity_error_prints_one_line_and_changes_nothing_else(self) -> None:
+        plain = self.gate(dict(V2_PROBE, top=IDENT_TOP)).stdout.replace("\r\n", "\n")
+        bad = self.gate(dict(V2_PROBE, top=IDENT_TOP, identity={"schema": IDENT_SCHEMA, "error": "canned CIM failure"}))
+        self.assertEqual(bad.returncode, 0, bad.stdout + bad.stderr)
+        out = bad.stdout.replace("\r\n", "\n")
+        self.assertIn("  ident error canned CIM failure\n", out)
+        keep = lambda text: [ln for ln in text.split("\n") if ln.startswith(("  top ", "  attr "))]
+        self.assertEqual(keep(out), keep(plain))
+
+    def test_a_probe_without_a_usable_identity_prints_exactly_what_it_printed_before(self) -> None:
+        plain = self.gate(dict(V2_PROBE, top=IDENT_TOP)).stdout.replace("\r\n", "\n")
+        keep = lambda text: [ln for ln in text.split("\n") if ln.startswith(("  top ", "  attr ", "  ident "))]
+        for odd in ({"schema": "mlv-app/venue-quiet-probe-identity/v9", "processes": [IDENT_ROW]}, "garbage", 7, [IDENT_ROW]):
+            proc = self.gate(dict(V2_PROBE, top=IDENT_TOP, identity=odd))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(keep(proc.stdout.replace("\r\n", "\n")), keep(plain), odd)
+        v1 = self.gate(dict(V1_PROBE, identity=IDENT_BLOCK)).stdout
+        self.assertRegex(v1, r"(?m)^  top pwsh pid=4242 cpuSeconds=12\.5 ident=pid-reused$", "identity is read from any probe that carries it")
+
+    def test_a_malformed_identity_never_changes_the_verdict_or_the_exit_code(self) -> None:
+        for odd in (dict(IDENT_BLOCK, processes=7), dict(IDENT_BLOCK, cost_ms=None, notes=None, gpu_top=7), dict(IDENT_BLOCK, processes=[None, {"pid": None}, 5])):
+            proc = self.gate(dict(V2_PROBE, top=IDENT_TOP, identity=odd))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+        proc = self.gate(dict(V2_PROBE, top=IDENT_TOP, samples=[5.0, None, 5.0], identity=IDENT_BLOCK))
+        self.assertEqual(proc.returncode, 6, "an unmeasured venue stays UNKNOWN, with no identity text")
+        self.assertNotIn("  ident ", proc.stdout)
+
+    def test_a_quiet_probe_is_attributed_too(self) -> None:
+        proc = self.gate(self.probe(samples=[5.0, 5.0, 5.0]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% ")
+        self.assertIn("owner=BACHELOR\\layib project=mlv-app", proc.stdout)
+
+    def test_the_header_states_the_identity_contract(self) -> None:
+        header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
+        for needle in ("PROCESS IDENTITY", "mlv-app/venue-quiet-probe-identity/v1", "top-level schema stays v2", "AFTER the sample window", "at most 3 WQL", "GetOwner per TARGET",
+                       "separate Get-Counter call", "REDACTION", "200-character cap", "NON-ELEVATED DEGRADATION", "WALL-CLOCK BUDGET", "budget-exceeded", "working directory is NOT collected", "Summarize-VenueBusyProbes.ps1"):
+            self.assertIn(needle, header)
+        for kept in ("schema v2", "The v1 `samples` and `top` fields are unchanged", "core_class unknown", "6 VENUE_QUIET_UNKNOWN"):
+            self.assertIn(kept, header)
+
+    def test_the_new_scripts_are_ascii_only(self) -> None:
+        for name in ("Wait-VenueQuiet.ps1", "Summarize-VenueBusyProbes.ps1"):
+            data = (DV / name).read_bytes()
+            self.assertFalse([b for b in data if b > 127], f"{name} must stay ASCII-only")
+
+
+def _ident_summary_probe(samples, top, identity=None) -> dict:
+    probe = dict(V2_PROBE, samples=samples, top=top)
+    if identity is not None:
+        probe["identity"] = identity
+    return probe
+
+
+@requires_windows_pwsh
+class VenueBusyProbeSummaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-busy-summary-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.tree = self.tmp / "tree"
+        self.dv = self.tree / "tools" / "profiling" / "dual-venue"
+        shutil.copytree(DV, self.dv, ignore=shutil.ignore_patterns("__pycache__"))
+        self.share = self.tmp / "share-bachelor"
+        (self.share / "inbox").mkdir(parents=True)
+        table = json.loads((self.dv / "venues.json").read_text(encoding="utf-8"))
+        table["venues"]["bachelor"]["agentShare"] = str(self.share)
+        table["venues"]["bachelor"]["agentRoot"] = str(self.share) + "-root"
+        (self.dv / "venues.json").write_text(json.dumps(table), encoding="utf-8")
+        self.probes = self.tmp / "probes"
+        self.probes.mkdir()
+
+    def write(self, name: str, probe) -> Path:
+        path = self.probes / name
+        path.write_text(probe if isinstance(probe, str) else json.dumps(probe), encoding="utf-8")
+        return path
+
+    def fixtures(self) -> None:
+        busy_a = _ident_summary_probe([50.0, 50.0, 50.0], [{"name": "python", "pid": 16892, "cpuSeconds": 29.1}, {"name": "explorer", "pid": 30, "cpuSeconds": 3.0}],
+                                      dict(IDENT_BLOCK, processes=[dict(IDENT_ROW, gpu_percent=40.0),
+                                                                    dict(IDENT_DENIED_ROW, pid=30, name="explorer", gpu_percent=None, gpu_status="no-gpu-context")], gpu_top=[16892]))
+        busy_b = _ident_summary_probe([60.0, 60.0, 60.0], [{"name": "python", "pid": 16372, "cpuSeconds": 29.0}],
+                                      dict(IDENT_BLOCK, processes=[dict(IDENT_ROW, pid=16372, script="other.py", gpu_percent=55.5)], gpu_top=[16372]))
+        busy_v2 = _ident_summary_probe([70.0, 70.0, 70.0], [{"name": "pwsh", "pid": 4242, "cpuSeconds": 12.5}])
+        quiet = _ident_summary_probe([5.0, 5.0, 5.0], [{"name": "python", "pid": 1, "cpuSeconds": 99.0}], dict(IDENT_BLOCK, processes=[dict(IDENT_ROW, pid=1)]))
+        self.write("venue-quiet-probe-20261024T010000000Z.json", busy_a)
+        self.write("venue-quiet-probe-20261024T010100000Z.json", busy_b)
+        self.write("venue-quiet-probe-20261024T010200000Z.json", busy_v2)
+        self.write("venue-quiet-probe-20261024T010300000Z.json", quiet)
+
+    def summarize(self, *args: str, source: str | None = None) -> subprocess.CompletedProcess:
+        cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"), *args]
+        if source:
+            cmd += ["-DecisionSource", source]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+    def test_busy_probes_are_grouped_by_project_with_exact_text_lines(self) -> None:
+        self.fixtures()
+        proc = self.summarize("-ProbeDir", str(self.probes))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = proc.stdout.replace("\r\n", "\n").strip().split("\n")
+        self.assertEqual(lines[0], "- Busy probes summarized: 3 (quiet skipped 1, unknown skipped 0, unreadable 0)")
+        self.assertEqual(lines[1], "- Busy probes by project (probes in which the project held a top-5 CPU row; cpuSeconds summed over those rows): "
+                                   "mlv-app (2 probes, 58.1 s; e.g. python script=bench.py owner=BACHELOR\\layib; python script=other.py owner=BACHELOR\\layib), "
+                                   "unknown(no-identity) (1 probes, 12.5 s; e.g. pwsh script=n/a owner=n/a), "
+                                   "unknown (1 probes, 3.0 s; e.g. explorer script=n/a owner=unreadable(access-denied))")
+        self.assertEqual(lines[2], "- GPU-heavy across busy probes: python pid=16372 project=mlv-app max gpu=55.5% (1 probes), python pid=16892 project=mlv-app max gpu=40.0% (1 probes)")
+        self.assertEqual(len(lines), 3)
+
+    def test_json_output_is_one_parseable_object_with_the_same_aggregate(self) -> None:
+        self.fixtures()
+        proc = self.summarize("-ProbeDir", str(self.probes), "-Json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        j = json.loads(proc.stdout)
+        self.assertEqual(j["schema"], "mlv-app/venue-busy-probe-summary/v1")
+        self.assertEqual((j["busy_probes"], j["quiet_skipped"], j["unknown_skipped"], j["unreadable"]), (3, 1, 0, 0))
+        self.assertEqual([p["project"] for p in j["projects"]], ["mlv-app", "unknown(no-identity)", "unknown"])
+        self.assertEqual((j["projects"][0]["probes"], j["projects"][0]["cpu_seconds"]), (2, 58.1))
+        self.assertEqual(j["projects"][0]["examples"][0], {"name": "python", "script": "bench.py", "owner": "BACHELOR\\layib"})
+        self.assertEqual([g["pid"] for g in j["gpu_heavy"]], [16372, 16892])
+
+    def test_include_quiet_keeps_the_quiet_probes(self) -> None:
+        self.fixtures()
+        proc = self.summarize("-ProbeDir", str(self.probes), "-IncludeQuiet")
+        self.assertEqual(proc.stdout.splitlines()[0], "- Busy probes summarized: 4 (quiet skipped 0, unknown skipped 0, unreadable 0)")
+
+    def test_the_decision_is_the_gates_own_unrounded_rule(self) -> None:
+        # three 20.04% samples print as 20.0% but are BUSY at the 20 threshold (the gate's UNROUNDED mean decides)
+        self.write("venue-quiet-probe-20261024T010000000Z.json", _ident_summary_probe([20.04, 20.04, 20.04], [{"name": "pwsh", "pid": 4242, "cpuSeconds": 1.0}]))
+        self.write("venue-quiet-probe-20261024T010100000Z.json", _ident_summary_probe([5.0, None, 5.0], [{"name": "pwsh", "pid": 4242, "cpuSeconds": 1.0}]))
+        proc = self.summarize("-ProbeDir", str(self.probes))
+        self.assertEqual(proc.stdout.splitlines()[0], "- Busy probes summarized: 1 (quiet skipped 0, unknown skipped 1, unreadable 0)")
+
+    def test_a_decision_that_cannot_be_lifted_is_exit_three_not_a_second_copy_of_the_rule(self) -> None:
+        self.fixtures()
+        empty = self.tmp / "no-decision.ps1"
+        empty.write_text("# no decision function here\n", encoding="utf-8")
+        proc = self.summarize("-ProbeDir", str(self.probes), source=str(empty))
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("DECISION_LIFT_FAILED", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        text = (DV / "Summarize-VenueBusyProbes.ps1").read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotIn("function Get-VenueQuietDecision", code, "the quiet rule is lifted by AST, never copied")
+        self.assertIn("FunctionDefinitionAst", code)
+
+    def test_a_path_inside_a_venue_share_is_refused_before_anything_is_read(self) -> None:
+        inside = self.share / "venue-quiet-probe-20261024T010000000Z.json"
+        inside.write_text(json.dumps(_ident_summary_probe([50.0, 50.0, 50.0], [])), encoding="utf-8")
+        for args in (["-ProbeJson", str(inside)], ["-ProbeDir", str(self.share)], ["-ProbeDir", str(self.share / "inbox")]):
+            proc = self.summarize(*args)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("PROBE_PATH_IN_VENUE_SHARE", proc.stderr)
+            self.assertEqual(proc.stdout, "")
+
+    def test_a_corrupt_file_is_counted_unreadable_and_other_files_in_the_dir_are_ignored(self) -> None:
+        self.fixtures()
+        self.write("venue-quiet-probe-20261024T010400000Z.json", "{ not json")
+        self.write("other-notes.json", "{ not json either")
+        proc = self.summarize("-ProbeDir", str(self.probes))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines()[0], "- Busy probes summarized: 3 (quiet skipped 1, unknown skipped 0, unreadable 1)")
+
+    def test_no_input_is_a_usage_error_and_the_script_never_references_the_submitter(self) -> None:
+        proc = self.summarize()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        code = (DV / "Summarize-VenueBusyProbes.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("um-run.ps1", code, "read-only: it is not a submitter and must not name the one writer to a venue share")
+        self.assertNotRegex(code, r"(?i)Remove-Item|Set-Content|Add-Content|Out-File|WriteAllText|New-Item|Move-Item|Copy-Item")
+
+
 if __name__ == "__main__":
     unittest.main()

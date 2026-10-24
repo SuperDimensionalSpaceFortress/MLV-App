@@ -30,6 +30,31 @@
 #          set whose process active was valid); neither moves a value. `top` cpuSeconds (after minus before) is keyed on (pid, process start time): a pid whose start time
 #          differs between the two snapshots (reused) or cannot be read is left out of `top` and counted in the new note `top_pid_reuse_dropped`, never a negative or foreign figure.
 #      None of this feeds the QUIET decision: its threshold, v1 fields and the offline -SamplesJson output are byte-identical to before.
+#      PROCESS IDENTITY (VENUE-PROBE-PROCESS-ATTRIBUTION-1): a busy reading names WHO and WHAT, not only `top <name> pid=<n> cpuSeconds=<x>`. The probe line gains ONE more field,
+#        `identity` (sub-schema mlv-app/venue-quiet-probe-identity/v1). The top-level schema stays v2 on purpose: identity only ADDS a field, every v2 reader ignores it, and a
+#        probe or gate that predates it still parses; a probe WITHOUT identity prints exactly what it printed before.
+#        WHEN: collection runs AFTER the sample window and after every v2 figure, never inside the sample loop, with no new sleep. It decides nothing and sits in one try/catch: on
+#          any failure the line carries identity = { schema, error } and samples, top and every v2 field are unchanged.
+#        WHO: the targets are the top[] pids, the top_processes pids that are not null, and the top 3 pids by GPU. COST BOUND: at most 3 WQL Win32_Process queries (the targets, then
+#          their parents, then their grandparents; never a full-table enumeration, never polling) + one GetOwner per TARGET + ONE \GPU Engine(*)\Utilization Percentage read. The
+#          GPU read is a separate Get-Counter call, never added to the decision's counter groups, and runs before the CIM batch because its top pids are CIM targets too.
+#          Per target row: owner, started_utc (checked against the sampled process start; a start that differs by more than 1 s is start_check mismatch = a reused pid, and that
+#          row carries pid, name and start_check ONLY), redacted command line, executable, script, project, parent and grandparent (status ok | exited | pid-reused when the
+#          parent STARTED AFTER its child | none = no parent pid or nothing to compare), GPU percent and engine type.
+#        PROJECT: a pinned table (mlv-app, agent-bridge, adobe-ingester, fleet-doctrine, adversarialllm, virtual-ten, airmypc), first match wins, case-insensitive substring on the
+#          UNREDACTED command line and executable path (held in memory only), the process itself first, then its parent, then its grandparent; only the table's name is emitted.
+#          A user-profile root is not a project (the owner field covers it). The working directory is NOT collected: Win32_Process does not expose it and reading the process
+#          environment block or memory is out of scope. No environment block is ever read.
+#        REDACTION, in order, before anything is written: URL userinfo, bearer values, key-like arguments (key, token, secret, password, auth, credential, signature, session, cookie ...),
+#          known token prefixes and JWTs, opaque 40+ character runs; then a 200-character cap that keeps the first 200 and appends `...[+N]` (cmdline_truncated_chars = N).
+#          Hyphenated or underscored card and worktree names survive.
+#        NON-ELEVATED DEGRADATION: the probe runs as the agent account, not elevated. What it cannot read is a TYPED status, never a guess: owner_status access-denied | exited |
+#          error-<ReturnValue> | budget-exceeded, cmdline_status / exe_status unreadable | exited, gpu_status counter-unavailable: <why> | no-gpu-context | disabled: <why>. A null
+#          always has its reason. WALL-CLOCK BUDGET: past 25 s of identity time no further GetOwner call is made (owner_status budget-exceeded), so identity can never push the
+#          probe job toward its 120 s submission timeout, which would turn a measured busy venue into UNKNOWN.
+#        GATE TEXT: each `top` line keeps its prefix byte for byte and appends comma-free, whitespace-free key=value pairs (owner project script parent gparent started gpu); `attr proc`
+#          lines append owner and project; `ident probe` (user, elevated, cost), `ident gpu` (GPU-heavy pids not already in top), `ident note` and `ident error` follow the attr lines.
+#          No command line is ever printed. Summarize-VenueBusyProbes.ps1 (read-only) groups the busy probes' raw files by project using this script's own decision function.
 #   3. decides: QUIET when the UNROUNDED mean of the 3 samples is <= -ThresholdPercent (the printed mean is rounded to 0.1 for display only). A
 #      failed counter read makes the check UNKNOWN, never quiet.
 #   4. re-probes every -RecheckSec until QUIET or -MaxWaitSec, then prints `QUIET mean=<x>` or `COOLDOWN_UNMET mean=<x>` (a MEASURED busy venue) and the top
@@ -458,6 +483,229 @@ foreach ($c in ($cores | Group-Object core_class)) {
     $vals = @($c.Group | ForEach-Object { $_.percent })
     $classAgg[$c.Name] = [ordered]@{ count = $vals.Count; mean_percent = Get-Mean $vals; max_percent = ($vals | Measure-Object -Maximum).Maximum }
 }
+# IDENTITY (VENUE-PROBE-PROCESS-ATTRIBUTION-1): WHO (owner, project) and WHAT (script, redacted command line, parent chain, start time, GPU) for the processes named above.
+# It runs AFTER the sample window and after every v2 figure (never inside the sample loop, no new sleep), decides nothing, and sits in ONE try/catch: on any failure the line
+# carries identity = { schema, error } and every other field is unchanged. The GPU read comes FIRST here, not last, because its top pids are CIM targets too (one extra WQL
+# query would break the 3-query bound). Bound: at most 3 WQL queries (targets, their parents, their grandparents) + GetOwner per target + ONE GPU Engine read.
+$IdentityGpu = $true
+$IdentityGpuDisabledWhy = ''
+# WALL-CLOCK BUDGET: identity must never push the probe job toward its 120 s submission timeout (a timed-out probe is UNKNOWN, a changed decision). Past this many ms of identity
+# time no further GetOwner call is made: the remaining rows say owner_status budget-exceeded. Command line, parent chain and project do not need a call and are still filled.
+$IdentityBudgetMs = 25000
+$identitySchema = 'mlv-app/venue-quiet-probe-identity/v1'
+# the pinned project table: first match wins, case-insensitive substring on the UNREDACTED command line + executable path (held in memory only; only the name is emitted)
+$identityProjects = @(
+    @('\mlvtmp\', 'mlv-app'), @('\mlv-agent\', 'mlv-app'), @('MLV-App', 'mlv-app'), @('ultra-magnus-agent', 'mlv-app'), @('um-run', 'mlv-app'),
+    @('agent-bridge', 'agent-bridge'), @('Adobe Document Cloud Ingester', 'adobe-ingester'), @('softwarefactory-fleet-doctrine', 'fleet-doctrine'),
+    @('AdversarialLLM', 'adversarialllm'), @('VIRTUAL-TEN', 'virtual-ten'), @('AirMyPC', 'airmypc')
+)
+# REDACTION, in this order, counted: (a) URL userinfo (b) bearer values (c) key-like arguments (d) known token prefixes and JWTs (e) opaque 40+ runs; then a 200-char cap.
+function Protect-IdentText($Text) {
+    if ($null -eq $Text) { return $null }
+    $s = [string]$Text; $n = 0
+    $rules = @(
+        @('(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+@', '$1<redacted>@'),
+        @('(?i)\bbearer\s+\S+', 'Bearer <redacted>'),
+        @('(?i)((?:--?|/)?[a-z0-9_.-]*(?:key|token|secret|password|passwd|pwd|auth|credential|signature|sig|session|cookie)[a-z0-9_.-]*)(\s*[=:]\s*|\s+)("[^"]*"|''[^'']*''|[^\s&]+)', '$1$2<redacted>'),
+        @('(sk-|ghp_|gho_|ghs_|github_pat_|xox[abps]-|AKIA)[A-Za-z0-9_-]{10,}', '<redacted>'),
+        @('eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+', '<redacted>'),
+        @('[A-Za-z0-9+/=]{40,}', '<redacted>')
+    )
+    foreach ($r in $rules) { $n += [regex]::Matches($s, $r[0]).Count; $s = [regex]::Replace($s, $r[0], $r[1]) }
+    $cut = 0
+    if ($s.Length -gt 200) { $cut = $s.Length - 200; $s = $s.Substring(0, 200) + "...[+$cut]" }
+    [pscustomobject]@{ text = $s; redactions = $n; truncated = $cut }
+}
+# the first argument that is a script file (.py .ps1 .psm1 .js .mjs .cmd .bat), by basename; an .exe alone names no script. Never the whole command line.
+function Get-IdentScript($CmdLine) {
+    if ([string]::IsNullOrEmpty([string]$CmdLine)) { return $null }
+    foreach ($m in [regex]::Matches([string]$CmdLine, '"([^"]*)"|(\S+)')) {
+        $tok = $(if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }).Trim([char]39)
+        if ($tok -match '(?i)\.(py|ps1|psm1|js|mjs|cmd|bat)$') {
+            $base = $tok -replace '^.*[\\/]', ''
+            if ($base) { return (Protect-IdentText $base).text }
+        }
+    }
+    $null
+}
+function Get-IdentProject($Row) {
+    if ($null -eq $Row) { return $null }
+    $t = "$($Row.CommandLine) $($Row.ExecutablePath)"
+    foreach ($e in $identityProjects) { if ($t.IndexOf($e[0], [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $e[1] } }
+    $null
+}
+# ONE WQL query for a set of pids (validated integers, so nothing but digits reaches the filter); never a full-table enumeration
+function Get-IdentCim($Ids) {
+    $h = @{}
+    $ids = @($Ids | ForEach-Object { [int64]$_ } | Sort-Object -Unique)
+    if ($ids.Count -eq 0) { return $h }
+    $filter = ($ids | ForEach-Object { "ProcessId=$_" }) -join ' OR '
+    $csw = [Diagnostics.Stopwatch]::StartNew()
+    try { $rows = @(Get-CimInstance -ClassName Win32_Process -Filter $filter -ErrorAction Stop) } finally { $csw.Stop(); $script:IdentCimMs += $csw.ElapsedMilliseconds; $script:IdentCimQueries++ }
+    foreach ($r in $rows) { if ($null -ne $r) { $h["$([int64]$r.ProcessId)"] = $r } }
+    $h
+}
+function Get-IdentOwner($Row) {
+    $osw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        try {
+            $r = Invoke-CimMethod -InputObject $Row -MethodName GetOwner -ErrorAction Stop
+            $rv = [int]$r.ReturnValue
+            if ($rv -eq 0 -and -not [string]::IsNullOrEmpty([string]$r.User)) { return @{ owner = $(if ([string]$r.Domain) { "$($r.Domain)\$($r.User)" } else { [string]$r.User }); status = 'ok' } }
+            if ($rv -eq 2) { return @{ owner = $null; status = 'access-denied' } }
+            return @{ owner = $null; status = "error-$rv" }
+        } catch {
+            $msg = [string]$_.Exception.Message
+            if ($msg -match '(?i)access is denied|access denied|0x80041003') { return @{ owner = $null; status = 'access-denied' } }
+            if ($msg -match '(?i)not found|0x80041002|invalid object') { return @{ owner = $null; status = 'exited' } }
+            return @{ owner = $null; status = 'error-exception' }
+        }
+    } finally { $osw.Stop(); $script:IdentOwnerMs += $osw.ElapsedMilliseconds }
+}
+# parent / grandparent: no CIM row = exited; a parent that STARTED AFTER its child is a reused pid (never named); no parent pid or no dates to compare = none
+function Get-IdentAncestor($Child, $Cim) {
+    $none = @{ info = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }; row = $null }
+    if ($null -eq $Child) { return $none }
+    $ppid = [int64]0
+    try { $ppid = [int64]$Child.ParentProcessId } catch { }
+    if ($ppid -le 0 -or "$ppid" -ceq "$($Child.ProcessId)") { return $none }
+    $pr = $Cim["$ppid"]
+    if ($null -eq $pr) { return @{ info = [ordered]@{ pid = $ppid; name = $null; started_utc = $null; status = 'exited' }; row = $null } }
+    $cd = $Child.CreationDate; $pd = $pr.CreationDate
+    if ($null -eq $cd -or $null -eq $pd) { $none.info.pid = $ppid; return $none }
+    if ($pd.ToUniversalTime() -gt $cd.ToUniversalTime()) { return @{ info = [ordered]@{ pid = $ppid; name = $null; started_utc = $null; status = 'pid-reused' }; row = $null } }
+    $nm = (Protect-IdentText (([string]$pr.Name) -replace '(?i)\.exe$', '')).text
+    if (-not $nm) { $nm = 'unknown' }
+    @{ info = [ordered]@{ pid = $ppid; name = $nm; started_utc = $pd.ToUniversalTime().ToString('o'); status = 'ok' }; row = $pr }
+}
+$identity = $null
+try {
+    $idSw = [Diagnostics.Stopwatch]::StartNew()
+    $script:IdentCimMs = 0L; $script:IdentOwnerMs = 0L; $script:IdentCimQueries = 0
+    $identNotes = [ordered]@{}
+    $curId = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $probeUser = [string]$curId.Name
+    $elevated = [bool]([Security.Principal.WindowsPrincipal]::new($curId)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    # GPU: ONE read, kept out of $groups / $allPaths so the decision read above is untouched
+    $gpuMs = 0L; $gpuStatus = 'ok'; $gpuBest = @{}; $gpuTop = @()
+    if (-not $IdentityGpu) { $gpuStatus = $IdentityGpuDisabledWhy }
+    else {
+        $gsw = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $gs = @((Get-Counter -Counter '\GPU Engine(*)\Utilization Percentage' -MaxSamples 1 -ErrorAction SilentlyContinue).CounterSamples | Where-Object { $null -ne $_ })
+            $engSum = @{}; $engType = @{}; $gpuInstances = 0
+            foreach ($s in $gs) {
+                $lp = ([string]$s.Path).ToLowerInvariant()
+                if ($lp -notmatch '\(pid_(\d+)_luid_(0x[0-9a-f]+)_(0x[0-9a-f]+)_phys_(\d+)_eng_(\d+)_engtype_([^)]*)\)\\utilization percentage$') { continue }
+                $gPid = $Matches[1]; $gEng = "$gPid|$($Matches[2])_$($Matches[3])_$($Matches[4])_$($Matches[5])"; $gType = $Matches[6]
+                $gpuInstances++
+                $gv = Get-GoodValue $s
+                if ($null -eq $gv) { continue }
+                $engSum[$gEng] = [double]$engSum[$gEng] + $gv; $engType[$gEng] = $gType
+            }
+            if ($gpuInstances -eq 0) { $gpuStatus = 'counter-unavailable: no GPU Engine instance' }
+            foreach ($e in $engSum.Keys) {
+                $gPid = $e.Substring(0, $e.IndexOf('|'))
+                if (-not $gpuBest.ContainsKey($gPid) -or $engSum[$e] -gt $gpuBest[$gPid].percent) { $gpuBest[$gPid] = @{ percent = $engSum[$e]; engtype = $engType[$e] } }
+            }
+            $gpuTop = @($gpuBest.Keys | Where-Object { $gpuBest[$_].percent -gt 0 } | Sort-Object @{ Expression = { $gpuBest[$_].percent }; Descending = $true }, @{ Expression = { [int64]$_ } } | Select-Object -First 3 | ForEach-Object { [int64]$_ })
+        } catch { $gpuStatus = 'counter-unavailable: ' + (([string]$_.Exception.Message) -replace '\s+', ' ') }
+        $gsw.Stop(); $gpuMs = $gsw.ElapsedMilliseconds
+    }
+    # targets: top, then top_processes (pid not null), then the top GPU pids; each row records where it came from
+    $targets = [ordered]@{}
+    $nameOf = @{}
+    foreach ($t in $top) { $targets["$($t.pid)"] = @('top'); $nameOf["$($t.pid)"] = [string]$t.name }
+    foreach ($t in $ranked) {
+        if ($null -eq $t.pid) { continue }
+        $k = "$($t.pid)"
+        if ($targets.Contains($k)) { $targets[$k] += 'top_processes' } else { $targets[$k] = @('top_processes') }
+        if (-not $nameOf.ContainsKey($k)) { $nameOf[$k] = ([string]$t.instance) -replace '#\d+$', '' }
+    }
+    foreach ($g in $gpuTop) { $k = "$g"; if ($targets.Contains($k)) { $targets[$k] += 'gpu_top' } else { $targets[$k] = @('gpu_top') } }
+    $cim = Get-IdentCim @($targets.Keys)
+    $parentIds = @($targets.Keys | Where-Object { $cim.ContainsKey($_) } | ForEach-Object { $a = Get-IdentAncestor $cim[$_] $cim; if ($a.info.pid) { $a.info.pid } } | Where-Object { -not $cim.ContainsKey("$_") })
+    $cim2 = Get-IdentCim $parentIds
+    foreach ($k in $cim2.Keys) { $cim[$k] = $cim2[$k] }
+    $gpIds = @($targets.Keys | Where-Object { $cim.ContainsKey($_) } | ForEach-Object {
+        $a = Get-IdentAncestor $cim[$_] $cim
+        if ($a.info.status -ceq 'ok') { $a2 = Get-IdentAncestor $a.row $cim; if ($a2.info.pid) { $a2.info.pid } }
+    } | Where-Object { -not $cim.ContainsKey("$_") })
+    $cim3 = Get-IdentCim $gpIds
+    foreach ($k in $cim3.Keys) { $cim[$k] = $cim3[$k] }
+    $procRows = @(); $ownerBad = 0; $cmdBad = 0
+    foreach ($k in $targets.Keys) {
+        $snap = $after[[int]$k]
+        $row = $cim[$k]
+        $name = $nameOf[$k]
+        if (-not $name -and $null -ne $snap) { $name = [string]$snap[0] }
+        if (-not $name -and $null -ne $row) { $name = ([string]$row.Name) -replace '(?i)\.exe$', '' }
+        if (-not $name) { $name = 'unknown' }
+        $startCheck = 'unverified'; $startedUtc = $null
+        if ($null -ne $row -and $null -ne $row.CreationDate) {
+            $startedUtc = $row.CreationDate.ToUniversalTime().ToString('o')
+            if ($null -ne $snap -and $null -ne $snap[2]) {
+                $startCheck = $(if ([math]::Abs(($row.CreationDate.ToUniversalTime() - [datetime]::FromFileTimeUtc([int64]$snap[2])).TotalSeconds) -gt 1) { 'mismatch' } else { 'match' })
+            }
+        }
+        if ($startCheck -ceq 'mismatch') {
+            # the pid now belongs to a different process than the one sampled: no owner, command line or project, never another process's identity
+            $procRows += [ordered]@{ pid = [int64]$k; name = $name; start_check = 'mismatch' }
+            continue
+        }
+        $gpuPct = $null; $gpuEng = $null; $gpuRowStatus = $gpuStatus
+        if ($gpuStatus -ceq 'ok') {
+            if ($gpuBest.ContainsKey($k)) { $gpuPct = [math]::Round($gpuBest[$k].percent, 2); $gpuEng = [string]$gpuBest[$k].engtype; $gpuRowStatus = 'ok' }
+            else { $gpuPct = 0.0; $gpuRowStatus = 'no-gpu-context' }
+        }
+        if ($null -eq $row) {
+            $procRows += [ordered]@{
+                pid = [int64]$k; name = $name; source = @($targets[$k]); started_utc = $null; start_check = $startCheck
+                owner = $null; owner_status = 'exited'; cmdline = $null; cmdline_status = 'exited'; cmdline_redactions = 0; cmdline_truncated_chars = 0
+                exe = $null; exe_status = 'exited'; script = $null; project = 'unknown'; project_from = 'none'
+                parent = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }; grandparent = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }
+                gpu_percent = $gpuPct; gpu_engtype = $gpuEng; gpu_status = $gpuRowStatus
+            }
+            $ownerBad++; $cmdBad++
+            continue
+        }
+        $own = $(if ($idSw.ElapsedMilliseconds -gt $IdentityBudgetMs) { @{ owner = $null; status = 'budget-exceeded' } } else { Get-IdentOwner $row })
+        if ($null -eq $own.owner) { $ownerBad++ }
+        $cmdText = $null; $cmdRed = 0; $cmdCut = 0; $cmdStatus = 'unreadable'
+        if (-not [string]::IsNullOrEmpty([string]$row.CommandLine)) { $pc = Protect-IdentText $row.CommandLine; $cmdText = $pc.text; $cmdRed = $pc.redactions; $cmdCut = $pc.truncated; $cmdStatus = 'ok' } else { $cmdBad++ }
+        $exeText = $null; $exeStatus = 'unreadable'
+        if (-not [string]::IsNullOrEmpty([string]$row.ExecutablePath)) { $exeText = (Protect-IdentText $row.ExecutablePath).text; $exeStatus = 'ok' }
+        $par = Get-IdentAncestor $row $cim
+        $gpar = $(if ($par.info.status -ceq 'ok') { Get-IdentAncestor $par.row $cim } else { @{ info = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }; row = $null } })
+        $project = 'unknown'; $projectFrom = 'none'
+        $hit = Get-IdentProject $row
+        if ($hit) { $project = $hit; $projectFrom = 'self' }
+        elseif ($par.info.status -ceq 'ok' -and ($hit = Get-IdentProject $par.row)) { $project = $hit; $projectFrom = 'parent' }
+        elseif ($gpar.info.status -ceq 'ok' -and ($hit = Get-IdentProject $gpar.row)) { $project = $hit; $projectFrom = 'grandparent' }
+        $procRows += [ordered]@{
+            pid = [int64]$k; name = $name; source = @($targets[$k]); started_utc = $startedUtc; start_check = $startCheck
+            owner = $own.owner; owner_status = $own.status; cmdline = $cmdText; cmdline_status = $cmdStatus; cmdline_redactions = $cmdRed; cmdline_truncated_chars = $cmdCut
+            exe = $exeText; exe_status = $exeStatus; script = (Get-IdentScript $row.CommandLine); project = $project; project_from = $projectFrom
+            parent = $par.info; grandparent = $gpar.info
+            gpu_percent = $gpuPct; gpu_engtype = $gpuEng; gpu_status = $gpuRowStatus
+        }
+    }
+    $identNotes['cim_queries'] = "$($script:IdentCimQueries) WQL queries for $($targets.Count) target pid(s) (bound: 3); GetOwner once per target"
+    if ($ownerBad -gt 0) { $identNotes['owner_unreadable'] = "$ownerBad of $($targets.Count) target(s) have no owner: see owner_status per row (a non-elevated probe cannot read other users' processes)" }
+    if ($cmdBad -gt 0) { $identNotes['cmdline_unreadable'] = "$cmdBad of $($targets.Count) target(s) have no command line: see cmdline_status per row" }
+    $idSw.Stop()
+    $identity = [ordered]@{
+        schema = $identitySchema; probe_user = $probeUser; elevated = $elevated; project_roots = 'r1'
+        gpu_basis = 'per-process max over GPU engines of summed \GPU Engine(*)\Utilization Percentage (0-100 of that engine)'
+        gpu_status = $gpuStatus
+    }
+    if ($IdentityGpu) { $identity['gpu_top'] = @($gpuTop) }
+    $identity['processes'] = @($procRows)
+    $identity['cost_ms'] = [ordered]@{ cim = [int64]$script:IdentCimMs; owner = [int64]$script:IdentOwnerMs; gpu = [int64]$gpuMs; total = [int64]$idSw.ElapsedMilliseconds }
+    $identity['notes'] = $identNotes
+} catch {
+    $identity = [ordered]@{ schema = $identitySchema; error = (([string]$_.Exception.Message) -replace '\s+', ' ') }
+}
 Write-Output ('VENUE_QUIET=' + ([ordered]@{
     schema = 'mlv-app/venue-quiet-probe/v2'; host = $env:COMPUTERNAME; samples = $samples; top = $top
     cpu_count = $cpuCount
@@ -470,12 +718,66 @@ Write-Output ('VENUE_QUIET=' + ([ordered]@{
     core_topology = $(if ($topo.map.Count -gt 0) { 'logical-processor-information-ex' } else { 'unknown' })
     core_classes = $classAgg; cores = $cores
     notes = $notes
+    identity = $identity
 } | ConvertTo-Json -Compress -Depth 6))
 '@
 
 # v2 attribution, printed AFTER the verdict and top lines so the gate log says what kept the venue busy. Display only: nothing here feeds the decision, and a
 # probe line that is not v2 (or whose v2 fields are malformed) prints nothing / one `attr` note and never changes the verdict or the exit code.
 function Format-Pct($v) { if ($null -eq $v) { 'n/a' } else { '{0:0.0}%' -f [double]$v } }
+
+# IDENTITY text (VENUE-PROBE-PROCESS-ATTRIBUTION-1), display only. A probe with no identity (v1, v2, malformed, a future schema) prints exactly what it printed before. Every value
+# written here has whitespace and commas replaced by '_' (the run-local drivers split top lines on whitespace and commas), and no command line is ever written to a text line.
+$identitySchemaV1 = 'mlv-app/venue-quiet-probe-identity/v1'
+function ConvertTo-IdentToken($v) { $s = [string]$v; if ([string]::IsNullOrEmpty($s)) { return 'n/a' }; $s -replace '[\s,]', '_' }
+# PURE: pid -> identity row for a probe that carries identity schema v1, else $null
+function Get-IdentityRowMap($Probe) {
+    try {
+        if ([string]$Probe.identity.schema -cne $identitySchemaV1) { return $null }
+        $map = @{}
+        foreach ($r in @($Probe.identity.processes)) { if ($null -ne $r -and $null -ne $r.pid) { $map["$($r.pid)"] = $r } }
+        return $map
+    } catch { return $null }
+}
+function Format-IdentOwner($Row) { if (-not [string]::IsNullOrEmpty([string]$Row.owner)) { ConvertTo-IdentToken $Row.owner } else { 'unreadable(' + (ConvertTo-IdentToken $Row.owner_status) + ')' } }
+function Format-IdentWhen($v) {
+    if ($null -eq $v) { return 'n/a' }
+    try {
+        $d = $(if ($v -is [datetime]) { $v.ToUniversalTime() } else { [datetime]::Parse([string]$v, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal) })
+        return $d.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+    } catch { return 'n/a' }
+}
+function Format-IdentAncestor($A) { if ($null -eq $A) { return 'n/a:n/a|none' }; '{0}:{1}|{2}' -f (ConvertTo-IdentToken $A.name), (ConvertTo-IdentToken $A.pid), (ConvertTo-IdentToken $A.status) }
+# the suffix of a `top` line; $Full = $false is the shorter `attr proc` suffix (owner and project only)
+function Get-IdentSuffix($Row, [bool]$Full) {
+    if ($null -eq $Row) { return '' }
+    try {
+        if ([string]$Row.start_check -ceq 'mismatch') { return ' ident=pid-reused' }
+        $s = ' owner={0} project={1}' -f (Format-IdentOwner $Row), (ConvertTo-IdentToken $Row.project)
+        if ($Full) { $s += ' script={0} parent={1} gparent={2} started={3} gpu={4}' -f (ConvertTo-IdentToken $Row.script), (Format-IdentAncestor $Row.parent), (Format-IdentAncestor $Row.grandparent), (Format-IdentWhen $Row.started_utc), (Format-Pct $Row.gpu_percent) }
+        return $s
+    } catch { return '' }
+}
+function Write-IdentityLines($Probe) {
+    try {
+        $id = $Probe.identity
+        if ($null -eq $id -or [string]$id.schema -cne $identitySchemaV1) { return }
+        if ($null -ne $id.error) { Write-Gate ("  ident error {0}" -f ((([string]$id.error) -replace '\s+', ' '))); return }
+        $c = $id.cost_ms
+        Write-Gate ("  ident probe user={0} elevated={1} cost cim={2} owner={3} gpu={4} total={5}" -f (ConvertTo-IdentToken $id.probe_user), $(if ($id.elevated -eq $true) { 'true' } else { 'false' }), (ConvertTo-IdentToken $c.cim), (ConvertTo-IdentToken $c.owner), (ConvertTo-IdentToken $c.gpu), (ConvertTo-IdentToken $c.total))
+        $map = Get-IdentityRowMap $Probe
+        $inTop = @{}; foreach ($t in @($Probe.top)) { if ($null -ne $t.pid) { $inTop["$($t.pid)"] = $true } }
+        foreach ($g in @($id.gpu_top)) {
+            $k = "$g"
+            if ($inTop.ContainsKey($k)) { continue }
+            $row = $(if ($null -ne $map -and $map.ContainsKey($k)) { $map[$k] } else { $null })
+            if ($null -eq $row) { Write-Gate ("  ident gpu n/a pid={0}" -f (ConvertTo-IdentToken $g)); continue }
+            if ([string]$row.start_check -ceq 'mismatch') { Write-Gate ("  ident gpu {0} pid={1} ident=pid-reused" -f (ConvertTo-IdentToken $row.name), (ConvertTo-IdentToken $row.pid)); continue }
+            Write-Gate ("  ident gpu {0} pid={1} gpu={2} engtype={3} owner={4} project={5}" -f (ConvertTo-IdentToken $row.name), (ConvertTo-IdentToken $row.pid), (Format-Pct $row.gpu_percent), (ConvertTo-IdentToken $row.gpu_engtype), (Format-IdentOwner $row), (ConvertTo-IdentToken $row.project))
+        }
+        foreach ($n in @($id.notes.PSObject.Properties)) { Write-Gate ("  ident note {0}: {1}" -f $n.Name, $n.Value) }
+    } catch { Write-Gate ("  ident UNPRINTABLE {0}" -f $_.Exception.Message) }
+}
 function Write-AttributionLines($Probe) {
     if ([string]$Probe.schema -cne 'mlv-app/venue-quiet-probe/v2') { return }
     try {
@@ -483,7 +785,8 @@ function Write-AttributionLines($Probe) {
         Write-Gate ("  attr cpus={0} processor total={1} privileged={2} user={3} dpc={4} interrupt={5}" -f $Probe.cpu_count, (Format-Pct $pr.total_percent), (Format-Pct $pr.privileged_percent), (Format-Pct $pr.user_percent), (Format-Pct $pr.dpc_percent), (Format-Pct $pr.interrupt_percent))
         Write-Gate ("  attr process total={0} idle={1} system={2} attributed={3}" -f (Format-Pct $Probe.process_total_percent), (Format-Pct $Probe.idle_percent), (Format-Pct $Probe.system_percent), (Format-Pct $Probe.attributed_percent))
         Write-Gate ("  attr gap processorTotal={0} processActive={1} attributed={2} unattributedKernel={3} gap={4}" -f (Format-Pct $pr.total_percent), (Format-Pct $Probe.process_active_percent), (Format-Pct $Probe.attributed_percent), (Format-Pct $Probe.unattributed_kernel_percent), $(if ($null -eq $Probe.attribution_gap_points) { 'n/a' } else { '{0:0.0} points' -f [double]$Probe.attribution_gap_points }))
-        foreach ($p in @($Probe.top_processes)) { Write-Gate ("  attr proc {0} pid={1} pct={2}{3}" -f $p.instance, $(if ($null -eq $p.pid) { 'n/a' } else { $p.pid }), (Format-Pct $p.percent), $(if ($p.incomplete -eq $true) { " valid=$($p.validSamples)/$($p.totalSamples) incomplete" } else { '' })) }
+        $idMap = Get-IdentityRowMap $Probe
+        foreach ($p in @($Probe.top_processes)) { Write-Gate ("  attr proc {0} pid={1} pct={2}{3}{4}" -f $p.instance, $(if ($null -eq $p.pid) { 'n/a' } else { $p.pid }), (Format-Pct $p.percent), $(if ($p.incomplete -eq $true) { " valid=$($p.validSamples)/$($p.totalSamples) incomplete" } else { '' }), $(if ($null -ne $idMap -and $null -ne $p.pid -and $idMap.ContainsKey("$($p.pid)")) { Get-IdentSuffix $idMap["$($p.pid)"] $false } else { '' })) }
         $cls = @($Probe.core_classes.PSObject.Properties | ForEach-Object { "{0} n={1} mean={2} max={3}" -f $_.Name, $_.Value.count, (Format-Pct $_.Value.mean_percent), (Format-Pct $_.Value.max_percent) })
         Write-Gate ("  attr cores topology={0} {1}" -f $Probe.core_topology, $(if ($cls.Count) { $cls -join ' | ' } else { 'none' }))
         foreach ($n in @($Probe.notes.PSObject.Properties)) { Write-Gate ("  attr note {0}: {1}" -f $n.Name, $n.Value) }
@@ -560,6 +863,8 @@ if ($last.decision.state -ceq 'UNKNOWN') {
 if ($null -ne $foreignFloor) { Write-Gate "FOREIGN_FLOOR owners=$($foreignFloor.owners -join ',') floorMean=$(Format-Mean $foreignFloor.floorMean) waitedSec=$([int]((Get-Date) - $t0).TotalSeconds) probes=$($foreignFloor.probes)" }
 $verdict = $(if ($last.decision.state -ceq 'QUIET') { 'QUIET' } else { 'COOLDOWN_UNMET' })
 Write-Gate "$verdict mean=$(Format-Mean $last.decision.mean) threshold=$ThresholdPercent% waitedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
-if ($null -ne $last.probe) { foreach ($p in @($last.probe.top)) { Write-Gate ("  top {0} pid={1} cpuSeconds={2}" -f $p.name, $p.pid, $p.cpuSeconds) } }
+$topIdMap = $(if ($null -ne $last.probe) { Get-IdentityRowMap $last.probe } else { $null })
+if ($null -ne $last.probe) { foreach ($p in @($last.probe.top)) { Write-Gate (("  top {0} pid={1} cpuSeconds={2}" -f $p.name, $p.pid, $p.cpuSeconds) + $(if ($null -ne $topIdMap -and $null -ne $p.pid -and $topIdMap.ContainsKey("$($p.pid)")) { Get-IdentSuffix $topIdMap["$($p.pid)"] $true } else { '' })) } }
 if ($null -ne $last.probe) { Write-AttributionLines $last.probe }
+if ($null -ne $last.probe) { Write-IdentityLines $last.probe }
 exit 0
