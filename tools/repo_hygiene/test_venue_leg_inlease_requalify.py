@@ -45,6 +45,8 @@ foreach ($op in @($ops)) {
     foreach ($p in $op.args.PSObject.Properties) {
         $v = $p.Value
         if ($v -is [string] -and $v -ceq 'NaN') { $v = [double]::NaN }
+        if ($v -is [string] -and $v -ceq 'Infinity') { $v = [double]::PositiveInfinity }
+        if ($v -is [string] -and $v -ceq '-Infinity') { $v = [double]::NegativeInfinity }
         $a[$p.Name] = $v
     }
     $out.Add((& $op.fn @a))
@@ -173,6 +175,85 @@ class LookAssistArmTests(unittest.TestCase):
         self.assertEqual((on_missing["proven"], on_missing["violation"]), (False, False))
         (off_forced,) = call(la("off", "0", "0", True, True))
         self.assertIs(off_forced["proven"], False)
+
+
+def call_raw(*ops: tuple[str, dict]) -> subprocess.CompletedProcess:
+    """Like call() but returns the process, for cases where the parameter binder is expected to reject the call."""
+    payload = json.dumps([{"fn": fn, "args": args} for fn, args in ops])
+    env = dict(os.environ, VLC_MODULE=str(MODULE))
+    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", HARNESS], input=payload, capture_output=True,
+                          text=True, timeout=120, env=env)
+
+
+@requires_windows_pwsh
+class CaseExactEnumTests(unittest.TestCase):
+    """Dot 80f0e297 B1: ValidateSet was case-insensitive while the branches use -ceq. Chosen fix: reject (IgnoreCase = $false)."""
+
+    def assertRejected(self, op: tuple[str, dict]) -> None:
+        r = call_raw(op)
+        self.assertNotEqual(r.returncode, 0, f"a case variant must be refused, got stdout:\n{r.stdout}")
+        self.assertIn("ValidateSet", r.stderr + r.stdout)
+
+    def test_11_rule_case_variant_is_rejected_not_requalified(self) -> None:
+        # counterexample 1: STALE-DISCARD-180 skipped the old-rule branch and returned eligible/requalified instead of stale
+        for rule in ("STALE-DISCARD-180", "Stale-Discard-180", "INLEASE-REQUALIFY-1"):
+            self.assertRejected(req(rule, 912, COOL, 15.4, base=OK))
+
+    def test_12_kind_case_variant_is_rejected(self) -> None:
+        for kind in ("REF", "Ref", "Chain"):
+            self.assertRejected(req(INLEASE, 912, COOL, None, kind=kind))
+
+    def test_13_arm_case_variant_is_rejected_not_the_off_branch(self) -> None:
+        # counterexample 2: Arm=ON with log=0, vq=0, ArgNoLookAssist=true, forced=false took the OFF branch -> proven=true / violation=false
+        for arm in ("ON", "On", "OFF", "Off"):
+            self.assertRejected(la(arm, "0", "0", True, False))
+
+    def test_14_canonical_values_still_bind(self) -> None:
+        stale, on_arm = call(req(STALE180, 912, COOL, 15.4), la("on", "0", "0", True, False))
+        self.assertEqual(stale["class"], "QUIET_PRELOAD_STALE")
+        self.assertEqual((on_arm["proven"], on_arm["violation"]), (False, True))
+
+
+@requires_windows_pwsh
+class InvalidMeasurementTests(unittest.TestCase):
+    def test_15_fractional_negative_or_nonfinite_throttled_is_thermal_unknown(self) -> None:
+        cases = [{"throttled": 0.4}, {"throttled": 1.5}, {"throttled": -1}, {"throttled": "NaN"}, {"throttled": "Infinity"},
+                 {"throttled": -0.0001}, {"throttled": 1e12}, {"throttled": 0.4, "thermal": COOL}, {"throttled": "0", "thermal": COOL}]
+        rows = call(*(req(INLEASE, 912, pre=15.4, admission=a) for a in cases))
+        thermal = call(*(("ConvertFrom-VenueAdmissionThermal", {"Admission": a}) for a in cases))
+        for a, r, t in zip(cases, rows, thermal):
+            self.assertEqual(r["class"], "NOT_COUNTED_THERMAL_UNKNOWN", (a, r))
+            self.assertIs(r["eligible"], False, (a, r))
+            self.assertIs(r["thermalKnown"], False, (a, r))
+            self.assertIsNone(r["throttledAtGrant"], (a, r))
+            self.assertIs(t["known"], False, (a, t))
+            self.assertIsNone(t["throttled"], (a, t))
+
+    def test_16_whole_number_throttled_still_known(self) -> None:
+        zero, two, two_float = call(req(INLEASE, 912, pre=15.4, admission={"throttled": 0}), req(INLEASE, 912, pre=15.4, admission={"throttled": 2}),
+                                    req(INLEASE, 912, pre=15.4, admission={"throttled": 2.0}))
+        self.assertEqual(zero["class"], "QUIET_PRELOAD_REQUALIFIED_IN_LEASE")
+        self.assertEqual((two["class"], two["throttledAtGrant"]), ("NOT_COUNTED_THROTTLED_AT_GRANT", 2))
+        self.assertEqual((two_float["class"], two_float["throttledAtGrant"]), ("NOT_COUNTED_THROTTLED_AT_GRANT", 2))
+
+    def test_17_negative_or_infinite_wait_is_never_eligible(self) -> None:
+        waits = (-5, -0.001, "Infinity", "-Infinity")
+        rows = call(*(req(rule, w, COOL, 15.4) for rule in (INLEASE, STALE180) for w in waits))
+        for r in rows:
+            self.assertEqual(r["class"], "NOT_COUNTED_INVALID_MEASUREMENT", r)
+            self.assertIs(r["eligible"], False, r)
+            self.assertIs(r["requalified"], False, r)
+            self.assertEqual(r["notCountedReason"], "NOT_COUNTED_INVALID_MEASUREMENT", r)
+
+    def test_18_negative_or_infinite_preload_is_never_eligible(self) -> None:
+        rows = call(*(req(INLEASE, 912, COOL, p) for p in (-0.5, -100, "Infinity", "-Infinity")))
+        for r in rows:
+            self.assertEqual(r["class"], "NOT_COUNTED_INVALID_MEASUREMENT", r)
+            self.assertIs(r["eligible"], False, r)
+        # a within-180 s leg never consults the pre-load, and a non-OK base class still passes through
+        ok180, cool = call(req(INLEASE, 100, COOL, -1), req(INLEASE, -5, COOL, 15.4, base="COOLDOWN_UNMET"))
+        self.assertEqual(ok180["class"], OK)
+        self.assertEqual(cool["class"], "COOLDOWN_UNMET")
 
 
 class ModulePurityPinTests(unittest.TestCase):

@@ -206,7 +206,8 @@ and every pace and display-matrix leg), so at 95 the job's own gate is effective
 records the load but does not label a contended run. COUNTED is decided lane-side (Wait-VenueQuiet QUIET, PASS, exe match and
 preLoad <= 30 %), so this leg is evidence-only.
 
-From bench round r7 on, the lane analyzers count a leg whose admission wait exceeded 180 s by the pre-registered rule
-`inlease-requalify-1`, implemented in `tools/profiling/dual-venue/VenueLegCounting.psm1`. Under that rule, the leg counts only if
+The pre-registered rule `inlease-requalify-1` for bench round r7 on is available as a pure module,
+`tools/profiling/dual-venue/VenueLegCounting.psm1`; no driver or analyzer imports it yet, and wiring it into the r7 driver and
+analyzers is a separate hub follow-up. Under that rule, a leg whose admission wait exceeded 180 s will count only if
 it was already `QUIET_PRELOAD_OK`, its in-job post-grant pre-load is <= 30 %, and it was throttled 0 at the lease grant. Every other
 stale leg is typed `NOT_COUNTED_<reason>`. Rows from r1-r6 keep the `stale-discard-180` rule.

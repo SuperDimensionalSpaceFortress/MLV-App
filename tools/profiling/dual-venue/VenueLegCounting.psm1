@@ -19,6 +19,11 @@
 #     30.0 % (Invoke-VenueChain.ps1:556, docs/cuda-playback-present-cadence.md:206-207); throttled = 0 at grant (the ruling above).
 #   * the Look Assist arm check is the r6 lane analyze.ps1:100-106 logic, with a missing field never proven.
 #
+# Enum parameters (Rule, Kind, Arm) are CASE-EXACT: ValidateSet(..., IgnoreCase = $false). A case variant is rejected at the parameter
+# binder, so it can never take a branch other than its canonical form's (dot 80f0e297 B1: the -ceq tests below used to disagree with
+# the case-insensitive binder). A value that is not a measurement (negative or infinite wait or pre-load, a throttled count that is not
+# a whole number >= 0) is refused: NOT_COUNTED_INVALID_MEASUREMENT / thermal-unknown, never rounded and never eligible.
+#
 # Pure: no file, network or share access, no process start. Callers pass values they have already read.
 
 Set-StrictMode -Version Latest
@@ -26,6 +31,13 @@ Set-StrictMode -Version Latest
 $script:StaleAdmissionSec = 180.0
 $script:InLeasePreLoadMaxPercent = 30.0
 $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
+
+function Test-VenueLegCountingNonNegativeInteger([object]$Value) {
+    # A numeric type holding a whole number in [0, Int32.MaxValue]. A fraction, a negative, NaN or Infinity is not a count.
+    if (-not (Test-VenueLegCountingFiniteNonNegative $Value)) { return $false }
+    $d = [double]$Value
+    ($d -le [int]::MaxValue) -and ($d -eq [math]::Floor($d))
+}
 
 function Get-VenueLegCountingProperty([object]$Object, [string]$Name) {
     if ($null -eq $Object) { return $null }
@@ -56,11 +68,13 @@ function Get-VenueLegCountingRule {
 
 function ConvertFrom-VenueAdmissionThermal {
     # Throttled rows at grant. A numeric admission.throttled wins; else the thermal string; else unknown.
+    # A present admission.throttled that is not a non-negative whole number is unknown: never rounded, never replaced by the string.
     param([AllowNull()][object]$Admission)
     $t = Get-VenueLegCountingProperty $Admission 'throttled'
-    if (Test-VenueLegCountingFiniteNonNegative $t) {
+    if ($null -ne $t) {
+        if (-not (Test-VenueLegCountingNonNegativeInteger $t)) { return @{ throttled = $null; window = $null; known = $false; source = 'numeric-invalid' } }
         $w = Get-VenueLegCountingProperty $Admission 'rows'
-        return @{ throttled = [int]$t; window = $(if (Test-VenueLegCountingFiniteNonNegative $w) { [int]$w } else { $null }); known = $true; source = 'numeric' }
+        return @{ throttled = [int]$t; window = $(if (Test-VenueLegCountingNonNegativeInteger $w) { [int]$w } else { $null }); known = $true; source = 'numeric' }
     }
     $s = Get-VenueLegCountingProperty $Admission 'thermal'
     if ($s -is [string] -and $s) {
@@ -76,8 +90,8 @@ function ConvertFrom-VenueAdmissionThermal {
 
 function Get-VenueLegRequalification {
     param(
-        [Parameter(Mandatory)][ValidateSet('stale-discard-180', 'inlease-requalify-1')][string]$Rule,
-        [Parameter(Mandatory)][ValidateSet('chain', 'ref')][string]$Kind,
+        [Parameter(Mandatory)][ValidateSet('stale-discard-180', 'inlease-requalify-1', IgnoreCase = $false)][string]$Rule,
+        [Parameter(Mandatory)][ValidateSet('chain', 'ref', IgnoreCase = $false)][string]$Kind,
         [Parameter(Mandatory)][AllowEmptyString()][string]$BaseClass,
         [AllowNull()][Nullable[double]]$AdmissionWaitedSec,
         [AllowNull()][object]$Admission,
@@ -93,6 +107,8 @@ function Get-VenueLegRequalification {
         $class = $BaseClass   # the cooldown gate is not relaxed: any other base class passes through, not eligible
     } elseif ($null -eq $AdmissionWaitedSec -or [double]::IsNaN([double]$AdmissionWaitedSec)) {
         $class = 'QUIET_PRELOAD_UNVERIFIED_ADMISSION'
+    } elseif ([double]::IsInfinity([double]$AdmissionWaitedSec) -or [double]$AdmissionWaitedSec -lt 0) {
+        $class = 'NOT_COUNTED_INVALID_MEASUREMENT'   # a negative or infinite wait is not a measurement; it never reaches the <= 180 s path
     } elseif ([double]$AdmissionWaitedSec -le $script:StaleAdmissionSec) {
         $row.class = 'QUIET_PRELOAD_OK'; $row.eligible = $true
         return $row
@@ -100,6 +116,8 @@ function Get-VenueLegRequalification {
         $class = 'QUIET_PRELOAD_STALE'
     } elseif ($null -eq $InLeasePreLoadMean) {
         $class = $(if ($Kind -ceq 'ref') { 'NOT_COUNTED_STALE_NO_INLEASE_PROBE' } else { 'NOT_COUNTED_INLEASE_PROBE_MISSING' })
+    } elseif (-not [double]::IsNaN([double]$InLeasePreLoadMean) -and ([double]::IsInfinity([double]$InLeasePreLoadMean) -or [double]$InLeasePreLoadMean -lt 0)) {
+        $class = 'NOT_COUNTED_INVALID_MEASUREMENT'   # a negative or infinite pre-load mean is not a measurement (NaN keeps refusing as HIGH)
     } elseif (-not ([double]$InLeasePreLoadMean -le $script:InLeasePreLoadMaxPercent)) {
         $class = 'NOT_COUNTED_INLEASE_PRELOAD_HIGH'   # written as -not (<= 30.0) so NaN refuses
     } elseif (-not $th.known) {
@@ -117,7 +135,7 @@ function Get-VenueLegRequalification {
 function Test-VenueLegLookAssistArm {
     # The r6 lane analyze.ps1:100-106 check. A missing field (empty string, $null flag) is never proven and, alone, never a violation.
     param(
-        [Parameter(Mandatory)][ValidateSet('on', 'off')][string]$Arm,
+        [Parameter(Mandatory)][ValidateSet('on', 'off', IgnoreCase = $false)][string]$Arm,
         [AllowEmptyString()][AllowNull()][string]$LogLookAssist,
         [AllowEmptyString()][AllowNull()][string]$VisualQualityLookAssist,
         [AllowNull()][Nullable[bool]]$ArgNoLookAssist,
