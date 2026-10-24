@@ -187,17 +187,19 @@ class ShardDurationBudgetTests(unittest.TestCase):
 
     def test_the_table_measures_nearly_every_discovered_test(self) -> None:
         # An unmeasured class costs DEFAULT_TEST_SECONDS per test whatever it really takes;
-        # 101 of them hid that shard 2 was at 31 min while the table claimed 10.6.
-        for profile in ("windows",):
-            weights = shard.load_weights(profile)
-            unmeasured = {key: n for key, n in _COUNTS.items() if key not in weights}
-            share = sum(unmeasured.values()) / sum(_COUNTS.values())
-            self.assertLessEqual(
-                share,
-                MAX_UNMEASURED_TEST_SHARE,
-                f"{profile}: {sum(unmeasured.values())} tests in {len(unmeasured)} classes have no "
-                f"measured weight ({share:.0%}); re-run ci_unittest_shard_timings on hosted logs",
-            )
+        # 101 of them hid that shard 2 was at 31 min while the table claimed 10.6. Every
+        # profile is pinned (CoS on #449: ubuntu was left out, 22.3 % unmeasured then).
+        for profile in shard.PROFILES:
+            with self.subTest(profile=profile):
+                weights = shard.load_weights(profile)
+                unmeasured = {key: n for key, n in _COUNTS.items() if key not in weights}
+                share = sum(unmeasured.values()) / sum(_COUNTS.values())
+                self.assertLessEqual(
+                    share,
+                    MAX_UNMEASURED_TEST_SHARE,
+                    f"{profile}: {sum(unmeasured.values())} tests in {len(unmeasured)} classes have no "
+                    f"measured weight ({share:.0%}); re-run ci_unittest_shard_timings on hosted logs",
+                )
 
 
 class JobCapPinTests(unittest.TestCase):
@@ -686,6 +688,103 @@ class TimingsTests(unittest.TestCase):
             timings.class_seconds(log),
             {"tools.repo_hygiene.test_x.AlphaTests": 3.5, "tools.repo_hygiene.test_x.BetaTests": 0.5},
         )
+
+    def test_a_docstring_test_that_logs_a_line_keeps_its_whole_runtime(self) -> None:
+        # CoS on #449: a stamped line between the id line and "<docstring> ... ok" (a logged
+        # warning) cleared the pending test, so its result line was never counted. The test
+        # keeps head -> result, the warning's line included; only a new id line replaces it.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.AlphaTests.test_a)\n"
+            "2026-10-04T00:00:03.0000000Z WARNING: something the test logged\n"
+            "2026-10-04T00:00:06.0000000Z the docstring first line ... ok\n"
+            "2026-10-04T00:00:06.0000000Z test_b (tools.repo_hygiene.test_x.BetaTests.test_b)\n"
+            "2026-10-04T00:00:07.0000000Z WARNING: logged by a test whose id line is replaced\n"
+            "2026-10-04T00:00:08.0000000Z test_c (tools.repo_hygiene.test_x.GammaTests.test_c)\n"
+            "2026-10-04T00:00:09.5000000Z another docstring ... ok\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.AlphaTests": 5.0, "tools.repo_hygiene.test_x.GammaTests": 1.5},
+        )
+
+    def test_an_unexpected_success_docstring_test_clears_pending(self) -> None:
+        # fable r1-p1 on #629: "unexpected success" is a result line too. Left unmatched it
+        # never cleared the pending test, so test_a went uncounted.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a)\n"
+            "2026-10-04T00:00:03.0000000Z x ... unexpected success\n"
+            "2026-10-04T00:00:04.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b)\n"
+            "2026-10-04T00:00:05.0000000Z y ... ok\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 2.0, "tools.repo_hygiene.test_x.B": 1.0},
+        )
+
+    def test_a_one_line_unexpected_success_is_counted_to_its_class(self) -> None:
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:03.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... unexpected success\n"
+            "2026-10-04T00:00:04.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 3.0, "tools.repo_hygiene.test_x.B": 1.0},
+        )
+
+    def test_a_pending_test_that_never_printed_a_result_keeps_its_interval(self) -> None:
+        # fable on #629: a docstring id line, then a plain "... ok" line with no result line
+        # for the first test (crash, interleaved output). The plain line closes the pending
+        # test: head -> plain line is charged to the PENDING class, as for a result line, and
+        # the plain test is not charged (its own time is not separable from the pending one's).
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a)\n"
+            "2026-10-04T00:00:05.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+            "2026-10-04T00:00:06.0000000Z test_c (tools.repo_hygiene.test_x.C.test_c) ... ok\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 4.0, "tools.repo_hygiene.test_x.C": 1.0},
+        )
+
+    def test_a_logged_line_shaped_like_an_id_head_is_not_a_pending_test(self) -> None:
+        # Dot R18 on #634: "Running (1.2)" matches DOC_HEAD's shape. It set pending to "1.2",
+        # so the next plain result was charged to that foreign id and dropped. Only a head
+        # whose id is under KEY_PREFIX, or whose displayed name is the id's last component,
+        # is a test; any other line is an ordinary logged line.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:03.0000000Z Running (1.2)\n"
+            "2026-10-04T00:00:06.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 1.0, "tools.repo_hygiene.test_x.B": 3.0},
+        )
+
+    def test_a_logged_id_shaped_line_does_not_replace_a_pending_docstring_test(self) -> None:
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a)\n"
+            "2026-10-04T00:00:03.0000000Z Running (1.2)\n"
+            "2026-10-04T00:00:06.0000000Z the docstring first line ... ok\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 5.0})
+
+    def test_a_docstring_head_outside_the_key_prefix_is_still_pending(self) -> None:
+        # The displayed name equals the id's last component, so this is a real test whose
+        # class is merely not ours: its result line must still close it (and is dropped).
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z unrelated (somewhere.else.Tests.unrelated)\n"
+            "2026-10-04T00:00:04.0000000Z the docstring first line ... ok\n"
+            "2026-10-04T00:00:05.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.B": 1.0})
 
     def test_average_is_over_the_jobs_that_ran_the_class(self) -> None:
         self.assertEqual(

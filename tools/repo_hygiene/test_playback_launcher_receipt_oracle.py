@@ -416,7 +416,7 @@ class CaptureReferenceFrameLauncherTests(_LauncherCase):
 
     def test_a_non_zero_app_exit_is_a_failure_with_the_typed_reason_never_a_candidate(self) -> None:
         proc, _ = self.run_capture(None, exit_code=14, stderr_text="SOURCE_FRAMES_SHORT")
-        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 47, proc.stdout + proc.stderr)   # REFERENCE-FRAME-EXIT-CODE-DISAMBIGUATE-1: an app exit has its own code; 4 is never-started
         self.assertIn("exe exited 14", proc.stdout)
         self.assertNotIn("CANDIDATE", proc.stdout)
 

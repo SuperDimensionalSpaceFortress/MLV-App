@@ -4,7 +4,8 @@
 #
 #   GREEN: the real script closes stdin, sends BatchMode/ConnectTimeout/ServerAlive options,
 #          passes the exit code through, and at the wall-clock bound kills the whole process
-#          tree and exits 124 with the reason on stderr and in a receipt.
+#          tree and exits 124 with the reason on stderr and in a receipt; and a known_hosts path
+#          with whitespace and '!' reaches ssh quoted, so ssh -G resolves it to ONE file.
 #   RED:   each protection is removed in turn (lines tagged "# MUT:<name>" in um-ssh.ps1) and
 #          the same scenarios must go RED. A tag that no longer matches exactly one line fails
 #          the test, so the mutants cannot silently rot.
@@ -66,7 +67,7 @@ function Stop-TreeById([int]$ProcessId) {
 # Runs one um-ssh.ps1 variant against the fake. The harness keeps ITS OWN stdin pipe open and
 # never closes it, which is the inherited-stdin situation the card is about.
 function Invoke-UnderTest {
-    param([string]$Script, [string]$Mode, [int]$Timeout, [string]$Command, [string]$Tag)
+    param([string]$Script, [string]$Mode, [int]$Timeout, [string]$Command, [string]$Tag, [string]$TempDir = '')
     $argFile = Join-Path $sandbox "$Tag.args"
     $pidFile = Join-Path $sandbox "$Tag.pids"
     $receipt = Join-Path $sandbox "$Tag.receipt.json"
@@ -84,6 +85,7 @@ function Invoke-UnderTest {
     $psi.EnvironmentVariables['MLV_FAKE_SSH_MODE'] = $Mode
     $psi.EnvironmentVariables['MLV_FAKE_ARGFILE'] = $argFile
     $psi.EnvironmentVariables['MLV_FAKE_PIDFILE'] = $pidFile
+    if ($TempDir) { $psi.EnvironmentVariables['TMP'] = $TempDir; $psi.EnvironmentVariables['TEMP'] = $TempDir }
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $p = [System.Diagnostics.Process]::Start($psi)
     $outTask = $p.StandardOutput.ReadToEndAsync()
@@ -159,8 +161,51 @@ function Test-WallClockBound([string]$Script, [string]$Tag) {
     return $f
 }
 
+# UM-SSH-KNOWN-HOSTS-BANG-PATH-1: ssh splits the VALUE of UserKnownHostsFile on whitespace, so a
+# known_hosts path under 'C:\!Layi Wkspc\...' (TEMP inside the repo) must reach ssh quoted. The
+# temp dir below carries a double space (a split collapses it to one) and a '!'. ssh -G only
+# prints the resolved config and contacts no host; without ssh.exe the argv is checked directly.
+function Test-KnownHostsPath([string]$Script, [string]$Tag) {
+    $f = @()
+    $tmp = Join-Path $sandbox 'kh  !dir'
+    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+    try {
+        $r = Invoke-UnderTest -Script $Script -Mode 'args' -Timeout 20 -Command $cmdText -Tag $Tag -TempDir $tmp
+        if ($r.Hung) { return @("known_hosts: the call hung past the harness bound ($($r.Seconds) s)") }
+        $want = Join-Path (Join-Path $tmp 'mlv-app-ultra-magnus-ssh') 'known_hosts'
+        $opt = @($r.Args | Where-Object { $_ -like 'UserKnownHostsFile=*' })
+        if ($opt.Count -ne 1) { return @("known_hosts: expected exactly one UserKnownHostsFile option, got $($opt.Count)") }
+        $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
+        if ($ssh) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $ssh.Source
+            foreach ($a in @('-G', '-o', $opt[0], 'dummyhost')) { [void]$psi.ArgumentList.Add($a) }
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $text = $p.StandardOutput.ReadToEnd()
+            [void]$p.WaitForExit(20000)
+            $line = @($text -split "`r?`n" | Where-Object { $_ -match '^userknownhostsfile ' })
+            # ssh -G joins a multi-file list with ONE space, so equality with the single path rules out a split.
+            if ($line.Count -ne 1 -or $line[0] -ne "userknownhostsfile $want") {
+                $f += "known_hosts: ssh -G resolved '$($line -join ' | ')' instead of the single file '$want' (option was: $($opt[0]))"
+            }
+        }
+        elseif ($opt[0] -ne ('UserKnownHostsFile="' + $want + '"')) {
+            $f += "known_hosts: no ssh.exe to resolve it; the option must carry the path in double quotes, got: $($opt[0])"
+        }
+    }
+    finally {
+        # um-ssh created <tmp>\mlv-app-ultra-magnus-ssh (empty: the fake ssh writes no known_hosts); remove both.
+        $inner = Join-Path $tmp 'mlv-app-ultra-magnus-ssh'
+        foreach ($d in @($inner, $tmp)) { if (Test-Path -LiteralPath $d) { Remove-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue } }
+    }
+    return $f
+}
+
 function Invoke-AllScenarios([string]$Script, [string]$Tag) {
-    return @(Test-StdinClosed $Script "$Tag-stdin") + @(Test-ArgsAndExit $Script "$Tag-args") + @(Test-WallClockBound $Script "$Tag-bound")
+    return @(Test-StdinClosed $Script "$Tag-stdin") + @(Test-ArgsAndExit $Script "$Tag-args") + @(Test-WallClockBound $Script "$Tag-bound") + @(Test-KnownHostsPath $Script "$Tag-kh")
 }
 
 $exitCode = 0
@@ -168,7 +213,7 @@ try {
     Write-Host "== GREEN: $ScriptUnderTest"
     $greenFailures = @(Invoke-AllScenarios $ScriptUnderTest 'green')
     foreach ($m in $greenFailures) { Write-Host "  FAIL $m" }
-    if ($greenFailures.Count -eq 0) { Write-Host '  PASS stdin closed, options sent, exit code passed through, wall-clock bound kills the tree (3/3)' }
+    if ($greenFailures.Count -eq 0) { Write-Host '  PASS stdin closed, options sent, exit code passed through, wall-clock bound kills the tree, known_hosts path with space and ! stays one file (4/4)' }
     else { $exitCode = 1 }
 
     if (-not $SkipMutants) {

@@ -41,7 +41,8 @@
 #      e. renew about every 60 s; a gap over 120 s demotes the lease: the agent renews every LeaseRenewSec (<= 60), measures the longest gap between
 #         SUCCESSFUL renews (okMaxGapSec) and releases a demoted parked lease. A leg counts only when its result's admission.leaseRenew.okMaxGapSec is
 #         <= -RenewGapMaxSec (120): otherwise it is LEASE_DEMOTED (or LEASE_RENEW_UNKNOWN when absent), uncounted, and the batch ends; the rest go to the next.
-#      f. max pending 30 min: the agent's --admit-timeout is LeasePendingMaxSec (<= 1800); a request past it is abandoned and asked again (d).
+#      f. max pending 30 min: the agent's --admit-timeout is LeasePendingMaxSec (<= 1800), or less when the open's notAfterUtc is nearer (7a); a request past it
+#         is abandoned and asked again (d).
 #      Foreign holders' leased time is not in the ledger: heavy-slot.py still refuses (75) on it, and (d) waits that out.
 #   7. r3 (sol r2 blockers):
 #      a. NO LEASE AFTER THE RUNNER LETS GO. An open with no result in hand at the END of its batch (um-run gave up, the deadline came while its result was
@@ -49,7 +50,10 @@
 #         reads it at the top of every gate loop, before any request), then reads its result BY NAME for up to -CancelReconcileSec, and only then closes the
 #         lease and releases the claim: openCancel CANCELLED (no lease), RAN_BEFORE_CANCEL (its lease is this batch's: the close releases it), ENDED, or
 #         UNRECONCILED (exit 11: the cancel file stays, and the ledger counts a full lease for it). The agent also ends a batch job's gate wait once that batch's
-#         close job is queued (lease-batch r3).
+#         close job is queued (lease-batch r3). r4 (sol r3 B1): the open also carries the batch deadline as notAfterUtc (um-run.ps1 -NotAfterUtc; the batch
+#         receipt's openNotAfterUtc), so even an agent that never answers the cancel takes no lease for it past the deadline: it requests none, its request's
+#         --admit-timeout ends by then, and a lease that turns active later is released (LEASE-REQUEST-CHILD-NOT-AFTER-1). The close job carries none.
+#         The bound holds to within the VM-to-Bachelor clock skew; a frozen agent process is not covered.
 #      b. NO LEG PAST THE LEASE'S END. A leg runs as a bounded child (Invoke-VenueBoundedProcess) whose bound is the lease's end: still running then, it is
 #         killed with its whole process tree, its agent job is asked to cancel, and it is LEASE_EXPIRED (outcome INVALID, uncounted, never re-run; exit 7).
 #         The agent stops a batch job at the same bound, or on a demoted or lost lease (admission.leaseStop), which types it LEASE_EXPIRED / LEASE_DEMOTED /
@@ -190,12 +194,15 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
     [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff }
 }
 
-function Submit-AgentJob([string]$JobId, [string]$Body, [int]$TimeoutSec, [int]$WaitSec) {
+function Submit-AgentJob([string]$JobId, [string]$Body, [int]$TimeoutSec, [int]$WaitSec, [string]$NotAfterUtc = '') {
     # One job through um-run.ps1 (the only writer to a venue share). RECEIPT | RETRACTED | UNRESOLVED | ERROR; a thrown RETRACTED / UNRESOLVED is data here.
+    # r4: -NotAfterUtc (the open only) goes to um-run.ps1 -NotAfterUtc, meta.json notAfterUtc: the agent takes no lease for the job past it.
     $f = Join-Path $jobDir "$JobId.job.ps1"
     [IO.File]::WriteAllText($f, $Body + "`r`n", [Text.Encoding]::ASCII)
+    $bound = @{}
+    if ($NotAfterUtc) { $bound.NotAfterUtc = $NotAfterUtc }
     try {
-        $o = @(& $UmRunScript -ScriptPath $f -JobId $JobId -AgentShare $AgentShare -TimeoutSec $TimeoutSec -MaxQueueWaitSec $WaitSec -MaxClaimedWaitSec 300 -MaxAdmissionWaitSec $WaitSec 6>$null)
+        $o = @(& $UmRunScript -ScriptPath $f -JobId $JobId -AgentShare $AgentShare -TimeoutSec $TimeoutSec -MaxQueueWaitSec $WaitSec -MaxClaimedWaitSec 300 -MaxAdmissionWaitSec $WaitSec @bound 6>$null)
         [pscustomobject]@{ outcome = 'RECEIPT'; result = $(if ($o.Count -gt 0) { $o[-1] } else { $null }); message = $null }
     } catch {
         $m = [string]$_.Exception.Message
@@ -253,7 +260,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         legsAttempted = 0; legsRan = 0; legsCounted = 0; retries = 0; probeRetries = 0; legRetries = 0
         endReason = $null; endDetail = $null; legs = [System.Collections.Generic.List[object]]::new(); closeJobId = $null; closeOutcome = $null; agent = $null; endedUtc = $null
         preOpenWait = $null; openLeaseWait = 'NONE'; exit75Refusals = 0; exit75Class = 'NONE'; renewOkMaxGapSec = $null; leaseEndClamp = $null; ledger = $null
-        openExit75Refusals = 0; legExit75Refusals = 0; openCancel = $null
+        openExit75Refusals = 0; legExit75Refusals = 0; openCancel = $null; openNotAfterUtc = $null
     }
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
     $bw = Get-VenueLeaseBudgetWait -Leases @($leases) -NowUtc ([DateTime]::UtcNow) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec
@@ -294,7 +301,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $wait = [int][Math]::Max(60, [Math]::Min($OpenAdmissionWaitSec, ($deadline - [DateTime]::UtcNow).TotalSeconds))
         L "BATCH_OPEN_SUBMIT batch=$batchNo token=$token job=$($b.openJobId) admissionWaitSec=$wait (the agent requests the lease; heavy-slot.py's cooldown is waited out there)"
         $openSubmitUtc = [DateTime]::UtcNow
-        $op = Submit-AgentJob $b.openJobId "Write-Output ('LEASE_BATCH_OPEN token=$token held=' + [string]`$env:HEAVY_SLOT_HELD + ' admission=' + [string]`$env:MLV_AGENT_ADMISSION)" 120 $wait
+        # r4 (sol r3 B1): the open carries the batch deadline as notAfterUtc, so no lease is taken for it after the deadline, whether or not the agent answers
+        # the cancel below. The close job carries none: it must still run after the deadline.
+        $b.openNotAfterUtc = $deadline.ToString('o')
+        $op = Submit-AgentJob $b.openJobId "Write-Output ('LEASE_BATCH_OPEN token=$token held=' + [string]`$env:HEAVY_SLOT_HELD + ' admission=' + [string]`$env:MLV_AGENT_ADMISSION)" 120 $wait $b.openNotAfterUtc
         if ($op.outcome -ceq 'UNRESOLVED' -and $op.message -match 'admission gate') {
             # CAPS d: um-run stopped while the agent still holds the open in its gate, re-asking a refused (exit 75) request. That is a wait, not a failure:
             # the open is never resubmitted (a second open would queue behind it); its result is read by name until the deadline.

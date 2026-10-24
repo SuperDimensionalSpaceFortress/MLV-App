@@ -9,10 +9,11 @@ The card-queue file is board-local (gitignored) and absent from hosted CI, so th
 a required argument. The output is a pure function of that file: no wall clock, the
 7-day window is anchored on its `generated_utc`, so `--check` is stable.
 
-Landing time of a merged row has no dedicated field. It is the newest of
-`source_ledger_stamp`, `pinned_utc` and every `declared@<utc>` in `evidence`, which is
-the last time the hub touched the row. That is a lower bound on the real merge time.
-Intake time is `source_ledger_stamp`.
+Landing time of a merged row is its `merged_utc` when the row carries one. Without it,
+the landing time is the newest of `source_ledger_stamp`, `pinned_utc` and every
+`declared@<utc>` in `evidence`, which is the last time the hub touched the row. Declaration
+and pin stamps are not merge events, so that fallback is an approximation (a lower bound
+on the real merge time), not a measurement. Intake time is `source_ledger_stamp`.
 
 Usage:
     py -3 tools/coordination/render_roadmap.py --card-queue <card-queue.json> --out docs/roadmap.md
@@ -20,6 +21,11 @@ Usage:
     py -3 tools/coordination/render_roadmap.py --card-queue <card-queue.json> --drain-line
 
 Exit: 0 ok / written, 1 `--check` and the file differs (or is missing), 2 bad input.
+Bad input includes a malformed stamp (`generated_utc`, `source_ledger_stamp`, `pinned_utc`,
+`merged_utc`, a `declared@` token in `evidence`) or a malformed `order_chain`; the message
+names the file, the row index and the field. A `declared@` token is malformed unless it is
+exactly `declared@YYYY-MM-DDTHH:MM:SSZ` (trailing `.,;:)]}'"` is ignored): a non-zero-padded
+stamp would otherwise lose or win the string `max()` that picks the landing day.
 """
 
 from __future__ import annotations
@@ -38,6 +44,9 @@ WINDOW_DAYS = 7
 NOTE_MAX = 140
 REQUIRED = ("card", "kind", "priority", "state", "source_ledger_stamp")
 DECLARED_RX = re.compile(r"declared@(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
+# Every declared@ token, however it is spelled; validation compares it to DECLARED_RX.
+DECLARED_TOKEN_RX = re.compile(r"declared@(\S*)")
+TOKEN_TRAILING_PUNCT = ".,;:)]}'\""
 
 HEADER = """\
 # MLV-App product roadmap
@@ -66,6 +75,8 @@ def _day(stamp: str) -> date:
 
 
 def _landed_stamp(r: dict) -> str:
+    if r.get("merged_utc"):
+        return r["merged_utc"]
     stamps = [r["source_ledger_stamp"]]
     if r.get("pinned_utc"):
         stamps.append(r["pinned_utc"])
@@ -149,7 +160,9 @@ def render(data: dict) -> str:
 
     out += ["", "## Drain", "", "product+playback open: %d" % len(open_rows),
             "", "Window: the %d UTC days ending %s (the last day is partial)." % (WINDOW_DAYS, last.isoformat()),
-            "Landed = merged rows by newest stamp; queued = rows of any state by `source_ledger_stamp`.", "",
+            "Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp "
+            "(approximate: a lower bound on the merge time, not a measurement); "
+            "queued = rows of any state by `source_ledger_stamp`.", "",
             "| day (UTC) | landed | queued |", "|---|---|---|"]
     for d in days:
         out.append("| %s | %d | %d |" % (d.isoformat(), landed[d], queued[d]))
@@ -163,6 +176,43 @@ def render(data: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+def _valid_stamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        _day(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _check_row(path: Path, i: int, r: dict) -> None:
+    where = "%s row %d (%s)" % (path, i, r["card"])
+    for key in ("source_ledger_stamp", "pinned_utc", "merged_utc"):
+        if r.get(key) is not None and not _valid_stamp(r[key]):
+            _die("%s has a malformed %s: %r (want YYYY-MM-DD...)" % (where, key, r[key]))
+    for key in ("evidence", "notes"):
+        if r.get(key) is not None and not isinstance(r[key], str):
+            _die("%s has a non-string %s" % (where, key))
+    for token in DECLARED_TOKEN_RX.findall(r.get("evidence") or ""):
+        token = token.rstrip(TOKEN_TRAILING_PUNCT)
+        stamp = DECLARED_RX.fullmatch("declared@" + token)
+        if not stamp or not _valid_stamp(stamp.group(1)):
+            _die("%s has a malformed declared@ stamp in evidence: 'declared@%s' "
+                 "(want declared@YYYY-MM-DDTHH:MM:SSZ)" % (where, token))
+    oc = r.get("order_chain")
+    if oc is None:
+        return
+    if not isinstance(oc, dict):
+        _die("%s has an order_chain that is not an object: %r" % (where, oc))
+    if not isinstance(oc.get("chain"), str):
+        _die("%s has an order_chain without a string chain" % where)
+    if not isinstance(oc.get("index"), int) or isinstance(oc["index"], bool):
+        _die("%s has an order_chain without an integer index" % where)
+    if oc.get("predecessor") is not None and not isinstance(oc["predecessor"], str):
+        _die("%s has an order_chain with a non-string predecessor" % where)
+
+
 def _load(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -172,12 +222,15 @@ def _load(path: Path) -> dict:
         _die("%s is not a %s file" % (path, SCHEMA))
     if not isinstance(data.get("generated_utc"), str):
         _die("%s has no generated_utc" % path)
+    if not _valid_stamp(data["generated_utc"]):
+        _die("%s has a malformed generated_utc: %r (want YYYY-MM-DD...)" % (path, data["generated_utc"]))
     for i, r in enumerate(data["rows"]):
         missing = [k for k in REQUIRED if not isinstance(r, dict) or r.get(k) is None]
         if missing:
             _die("%s row %d lacks %s" % (path, i, ", ".join(missing)))
         if not isinstance(r["priority"], int):
             _die("%s row %d (%s) has a non-integer priority" % (path, i, r["card"]))
+        _check_row(path, i, r)
     return data
 
 

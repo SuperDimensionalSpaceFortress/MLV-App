@@ -59,6 +59,8 @@
 # unknown; launching is handled exactly like admission-wait (claimed, not launched); unknown (present
 # but unreadable) is cannot-tell and is never folded into none. A marker with no phase field (an agent
 # older than GATE-2) reads as launched, so such an agent sees exactly the behaviour it always did.
+#
+# LEASE-REQUEST-CHILD-NOT-AFTER-1: -NotAfterUtc is forwarded to the claim as meta.json notAfterUtc (the agent's deadline for the job).
 
 [CmdletBinding(DefaultParameterSetName = 'Script')]
 param(
@@ -94,6 +96,11 @@ param(
     # sees that hold. Well above the gate's 600 s hot cap, and a bound on its uncapped slots-full and
     # unknown-feed waits.
     [int]$MaxAdmissionWaitSec = 7200,
+    # LEASE-REQUEST-CHILD-NOT-AFTER-1: the agent's absolute deadline for this job (an ISO-8601 instant with a Z or +hh:mm
+    # offset; see UmRunDrop.psm1). Past it the Bachelor agent never leases or runs the job. '' (the default) sends none, and
+    # this script never derives one: callers that read the result by name after this client stops waiting (#633,
+    # VenueChain) still want such a job run.
+    [string]$NotAfterUtc = '',
     # Test-only: invoked with no arguments the instant the queue deadline is judged reached and no
     # claim has been seen yet, immediately BEFORE the recheck that follows it -- lets a test land a
     # claim marker deterministically inside what is otherwise a sub-millisecond window between
@@ -165,7 +172,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Command') {
 }
 if (-not (Test-Path $ScriptPath)) { throw "Script not found: $ScriptPath" }
 
-$dropLines = @(Invoke-UmRunDrop -Inbox $inbox -Outbox $outbox -ScriptPath $ScriptPath -JobId $JobId -SideFile $SideFile -JobTimeoutSec $TimeoutSec)
+$dropLines = @(Invoke-UmRunDrop -Inbox $inbox -Outbox $outbox -ScriptPath $ScriptPath -JobId $JobId -SideFile $SideFile -JobTimeoutSec $TimeoutSec -NotAfterUtc $NotAfterUtc)
 $jobId = $null
 $nonce = $null
 foreach ($line in $dropLines) {

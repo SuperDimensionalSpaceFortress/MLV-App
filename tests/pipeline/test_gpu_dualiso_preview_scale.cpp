@@ -1434,6 +1434,107 @@ TEST(GpuDualIsoPreviewScale, CpuReducedDebayerChannelsShareOneCentre)
     }
 }
 
+// T-C (POSTMERGE-IMPROVEMENTS-449-452-453-460-1, CoS on #452): a height that is not a
+// multiple of 16. The fixture is 2268 rows (16 * 141 + 12). Both plans crop the shrink's
+// source to whole 4*S-row blocks (x2 reads 2264 rows, x4 reads 2256), the shrink never reads
+// a cropped row (poisoning them changes no reduced sample), the reduced edge rows stay in
+// their ISO row class, and the reduced debayer repeats the last reduced row into the rows
+// the crop dropped (x2: 1132 -> 1134, x4: 564 -> 567).
+// Mutations: source height not cropped (the tent refuses the frame), kernel reads past
+// sourceHeight, edge clamp crossing class, padded rows left unwritten or zeroed.
+TEST(GpuDualIsoPreviewScale, AHeightNotAMultipleOf16CropsItsLastRowsAndPadsTheEdge)
+{
+    {
+        GpuReconEnv env(true);
+        MlvPipelineFixture fixture;
+        ASSERT_TRUE(openGpuEligibleFixture(fixture));
+        ASSERT_FALSE(fixture.renderFrame8(0).empty());
+        for (const int scale : { 2, 4 })
+        {
+            mlvDualIsoPreviewScaleRecon_t plan;
+            ASSERT_EQ(1, mlvDualIsoGpuPreviewScaleReconPlan(fixture.video(), scale, 1, &plan));
+            ASSERT_EQ((fixture.height() / (4 * scale)) * (4 * scale), plan.sourceHeight);
+            ASSERT_EQ(plan.sourceHeight / scale, plan.reducedHeight);
+        }
+    }
+
+    GpuReconEnv env(false);
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openGpuEligibleFixture(fixture));
+    ASSERT_FALSE(fixture.renderFrame8(0).empty()); // seeds the ISO pattern from real data
+    mlvObject_t * video = fixture.video();
+    setMlvDontAlwaysUseAmaze(video); // the reduced debayer entry is the bilinear route
+    const int hq = llrpHQDualIso(video) ? 1 : 0;
+    const int fullW = fixture.width();
+    const int fullH = fixture.height();
+    ASSERT_EQ(12, fullH % 16);
+    auto frameOf = [&](auto value) {
+        std::vector<uint16_t> f(static_cast<size_t>(fullW) * fullH);
+        for (int y = 0; y < fullH; ++y)
+            for (int x = 0; x < fullW; ++x) f[static_cast<size_t>(y) * fullW + x] = static_cast<uint16_t>(value(x, y));
+        return f;
+    };
+    auto base = [](int x, int y) { return 1000 + 500 * ((y % 4) * 2 + (x % 2)); };
+    // Under 14 bits, as T-B: the entry may shift a non-HQ input left by 16 - bits_per_pixel.
+    auto ramp = [](int x, int y) { return 1000 + 2 * x + 4 * y; };
+    ASSERT_TRUE(ramp(fullW - 1, fullH - 1) < 16384);
+    for (const int scale : { 2, 4 })
+    {
+        mlvDualIsoPreviewScaleRecon_t plan;
+        ASSERT_EQ(1, mlvDualIsoPreviewScaleReconPlan(video, scale, &plan));
+        const int block = 4 * scale;
+        ASSERT_EQ((fullH / block) * block, plan.sourceHeight);
+        ASSERT_TRUE(plan.sourceHeight < fullH);
+        const int rw = plan.reducedWidth;
+        const int rh = plan.reducedHeight;
+        ASSERT_EQ(plan.sourceHeight / scale, rh);
+        mlvDualIsoPreviewScaleRecon_t noFixes = plan; // as T-A: the fixes stay off the synthetic frames
+        noFixes.fullResFixes = 0;
+        auto shrink = [&](std::vector<uint16_t> raw) {
+            std::vector<uint16_t> out(static_cast<size_t>(rw) * rh, 0u);
+            WorkerState worker;
+            if (mlvDualIsoPreviewScaleReconShrink(video, &noFixes, raw.data(), out.data(), &worker.state, 1,
+                                                  nullptr, nullptr) != 1)
+                out.clear();
+            return out;
+        };
+
+        // The cropped rows are never read.
+        const std::vector<uint16_t> clean = frameOf(ramp);
+        std::vector<uint16_t> poisoned(clean);
+        for (int y = plan.sourceHeight; y < fullH; ++y)
+            std::fill_n(poisoned.data() + static_cast<size_t>(y) * fullW, fullW, static_cast<uint16_t>(65535));
+        const std::vector<uint16_t> reduced = shrink(clean);
+        ASSERT_FALSE(reduced.empty());
+        ASSERT_TRUE(reduced == shrink(poisoned));
+
+        // The edge rows (the last block before the crop) keep their ISO row class and colour.
+        const std::vector<uint16_t> classes = shrink(frameOf(base));
+        ASSERT_FALSE(classes.empty());
+        for (int y = rh - 4; y < rh; ++y)
+            for (int x = 0; x < rw; ++x) ASSERT_EQ(base(x, y), static_cast<int>(classes[static_cast<size_t>(y) * rw + x]));
+
+        // The debayered frame is full_h / S rows; the rows past rh repeat row rh - 1.
+        const int outH = fullH / scale;
+        ASSERT_TRUE(rh < outH);
+        std::vector<uint16_t> work(reduced); // the entry shifts its input in place
+        std::vector<uint16_t> rgb(static_cast<size_t>(rw) * outH * 3u, 0u);
+        int w = 0, h = 0;
+        ASSERT_EQ(1, getMlvRawFrameDebayeredFromReducedReconnedRaw16(video, 1, work.data(), rw, rh, scale, rgb.data(),
+                                                                     hq, &w, &h));
+        ASSERT_EQ(rw, w);
+        ASSERT_EQ(outH, h);
+        const size_t rowWords = static_cast<size_t>(rw) * 3u;
+        const uint16_t * last = rgb.data() + static_cast<size_t>(rh - 1) * rowWords;
+        // The ramp: the last row is not a mid-frame row (nor zeros), so a copy of it is told apart.
+        ASSERT_FALSE(std::equal(last, last + rowWords, rgb.data() + static_cast<size_t>(rh / 2) * rowWords));
+        for (int y = rh; y < outH; ++y)
+            ASSERT_TRUE(std::equal(last, last + rowWords, rgb.data() + static_cast<size_t>(y) * rowWords));
+        std::printf("[non-multiple-of-16] x%d %dx%d -> source %d rows (%d cropped) -> reduced %d -> shown %d\n", scale,
+                    fullW, fullH, plan.sourceHeight, fullH - plan.sourceHeight, rh, outH);
+    }
+}
+
 namespace {
 // RGGB Bayer16 from a per-row brightness profile (G level), R and B at fixed fractions.
 std::vector<uint16_t> bayerFromRowProfile(int w, int h, const std::vector<double> & g)

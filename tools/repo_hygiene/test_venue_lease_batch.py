@@ -71,11 +71,12 @@ switch ($mode) {
 # result whose admission.leaseBatch names lease-<n> (FAKE_OPEN_MODES per open: batch | nobatch | retracted; FAKE_LEASE_REMAIN per open: seconds left), and a
 # close job appends the agent's receipt line to <share>\logs\lease-batch-<token>.jsonl.
 FAKE_UMRUN = r"""
-param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec, [int]$MaxAdmissionWaitSec)
+param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec, [int]$MaxAdmissionWaitSec, [string]$NotAfterUtc = '<unset>')
 $stateFile = Join-Path $AgentShare 'fake-agent-state.json'
 $st = $(if (Test-Path -LiteralPath $stateFile) { Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json } else { [pscustomobject]@{ opens = 0; leaseId = $null; token = $null } })
 $held = [bool]($env:FAKE_CLAIM_PATH -and (Test-Path -LiteralPath $env:FAKE_CLAIM_PATH))
-Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} UMRUN {1} claimHeld={2} body={3}" -f [DateTime]::UtcNow.Ticks, $JobId, $held, ((Get-Content -LiteralPath $ScriptPath -Raw) -replace '\s+', ' ').Trim())
+# r4: -NotAfterUtc as passed ('<unset>' when the runner did not pass it), which the real um-run writes as meta.json notAfterUtc
+Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} UMRUN {1} claimHeld={2} notAfter={3} body={4}" -f [DateTime]::UtcNow.Ticks, $JobId, $held, $NotAfterUtc, ((Get-Content -LiteralPath $ScriptPath -Raw) -replace '\s+', ' ').Trim())
 $now = [DateTimeOffset]::UtcNow
 $token = $JobId.Substring($JobId.Length - 12)
 function Pick([string]$List, [int]$I, [string]$Default) { $v = @(([string]$List) -split ',' | Where-Object { $_ }); if ($v.Count -eq 0) { return $Default }; $v[[Math]::Min($I, $v.Count - 1)] }
@@ -562,8 +563,11 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
 
     def test_r3_an_open_the_agent_never_answers_is_typed_unreconciled_and_exits_11(self) -> None:
         # Nothing answers the cancel: the run says so (exit 11, openCancel UNRECONCILED), its cancel file stays for the agent, and the ledger counts a full
-        # lease for it (the open may yet take one before the agent reads the cancel).
-        r = self.run_batch([self.specs[0]], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=12)), "-CancelReconcileSec", "3",
+        # lease for it. r4 (sol r3 B1): NO LEASE AFTER notAfterUtc. The open carries the batch deadline as notAfterUtc (um-run.ps1 -NotAfterUtc), so an agent
+        # that never answers the cancel still never requests, keeps or hands out a lease for it past the deadline (proven against the agent's real gate by
+        # the quiet-lease harness case batch-open-notafter). The close job carries no bound.
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=12))
+        r = self.run_batch([self.specs[0]], "-DeadlineUtc", deadline, "-CancelReconcileSec", "3",
                            FAKE_OPEN_MODES="gatehold")
         self.assertEqual(r.returncode, 11, r.stdout + r.stderr)
         [b] = self.batches()
@@ -571,6 +575,13 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertTrue((self.share / "cancel" / f"{b['openJobId']}.cancel").exists(), "the cancel request stays for the agent")
         self.assertEqual(b["ledger"]["basis"], "open-unreconciled")
         self.assertEqual(batch_result(r.stdout)["stopReason"], "OPEN_CANCEL_UNRECONCILED")
+        bound = {l.split()[2]: l.split()[4] for l in self.events_raw() if " UMRUN " in l}
+        want = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+        got = bound.get(b["openJobId"], "notAfter=<missing>").split("=", 1)[1]
+        self.assertTrue(got.endswith("Z") and datetime.fromisoformat(got[:26].rstrip("Z") + "+00:00") == want,
+                        f"the open's notAfterUtc is the batch deadline as an ISO-8601 UTC 'o' string: {got!r} != {deadline!r}")
+        self.assertEqual(b["openNotAfterUtc"], got, "the batch receipt records the open's bound")
+        self.assertEqual(bound.get(b["closeJobId"]), "notAfter=<unset>", "the close job carries no notAfterUtc")
 
     def test_r3_a_leg_still_running_at_lease_end_is_killed_as_a_whole_tree_and_uncounted(self) -> None:
         # sol r2 B2 at test scale: the leg is admitted with 63 s of lease left (>= the 60 s budget + 0 s margin; on Bachelor 360 + 120 = 480 s), then hangs

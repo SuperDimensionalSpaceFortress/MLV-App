@@ -624,7 +624,7 @@ class GitCallsAreBoundedTests(unittest.TestCase):
 
 SLEEPER_SCAN_CALL_CAP_SECONDS = 60.0   # the most one discovery subprocess may take, however large the wait budget is
 SLEEPER_SCAN_FLOOR_SECONDS = 0.5       # the least a discovery call is given, so a spent budget never hands subprocess a zero or negative timeout
-SLEEPER_WAIT_TOTAL_SECONDS = 30.0      # total elapsed bound of `_wait_for_sleeper`, discovery calls included (a healthy run returns on its first scan)
+SLEEPER_WAIT_TOTAL_SECONDS = 30.0      # elapsed bound of `_wait_for_sleeper`: total for the CIM / ps routes, between scans only for /proc (a healthy run returns on its first scan)
 HANG_GUARD_SECONDS = 30.0              # the watchdog limit for a test whose regression would spin or block
 
 
@@ -747,9 +747,13 @@ def _wait_for_sleeper(token: str, proc: subprocess.Popen, timeout: float = SLEEP
     Popen returns once exec has begun, not once the new image's argv is published (Linux sets mm->arg_end late in the ELF load, so /proc/<pid>/
     cmdline reads empty in between). This waits for a pid the test just started; it never widens what discovery may name, and the caller still
     asserts the exact set, so an extra pid or a child that never shows up still fails.
-    `timeout` is the TOTAL bound, first scan included: the one deadline starts before the first scan and every discovery call is handed the budget
-    left (at most SLEEPER_SCAN_CALL_CAP_SECONDS, at least SLEEPER_SCAN_FLOOR_SECONDS), so a slow call cannot run past it. Worst case is `timeout`
-    plus the floor plus one `interval`. A call that exhausts its budget counts as a scan that named nothing, and the caller's assertion fails."""
+    `timeout` is the TOTAL bound for the subprocess routes (CIM on Windows, `ps` where there is no /proc), first scan included: the one deadline
+    starts before the first scan and every discovery call is handed the budget left (at most SLEEPER_SCAN_CALL_CAP_SECONDS, at least
+    SLEEPER_SCAN_FLOOR_SECONDS), so a slow call cannot run past it. Worst case there is `timeout` plus the floor plus one `interval`. A call that
+    exhausts its budget counts as a scan that named nothing, and the caller's assertion fails.
+    The Linux /proc route is NOT bounded that way: `_sleepers_from_proc` is a synchronous directory walk that is never handed the budget and cannot
+    be interrupted, so one slow walk can run past the deadline. There `timeout` bounds only the rescans (the deadline is checked before each
+    one), not the time inside a scan."""
     deadline = time.monotonic() + timeout
 
     def scan() -> set[int]:
@@ -922,7 +926,8 @@ class SleeperDiscoveryTests(unittest.TestCase):
         # DV-SLEEPER-RESCAN-DEADLINE-SCOPE-1 (Dot R18 advisory on #624): the deadline used to start AFTER the first scan and could not interrupt a
         # call already running, so "5 s" bounded only the retry window and one 60 s discovery call sat outside it. Fixture: the first discovery call
         # would take 1.5 s, the total budget is 1.0 s. The wait must give up at about the budget (plus the floor of one call), not after
-        # 1.5 s + a fresh 1.0 s window.
+        # 1.5 s + a fresh 1.0 s window. The stand-in honours its timeout like the subprocess routes (CIM, ps) do; the /proc route does not (see
+        # `_wait_for_sleeper`), so this pins the total bound for those routes only.
         discovery, timeouts = self._slow_first_discovery(1.5, set())
         alive = mock.Mock(pid=401, **{"poll.return_value": None})
 
@@ -968,6 +973,43 @@ class SleeperDiscoveryTests(unittest.TestCase):
             found = _call_with_hang_guard(self, lambda: _wait_for_sleeper("60.5", alive, timeout=2.0, interval=0.01), HANG_GUARD_SECONDS)
         self.assertEqual(found, {403})
         self.assertEqual(len(timeouts), 2, "one slow miss, then one hit on the rescan")
+
+    def _wait_over_fixture_proc(self, publish_on_scan: int | None, timeout: float) -> tuple[set[int], Path, list[float | None]]:
+        """Drive `_wait_for_sleeper` end to end over a fixture /proc tree: `_sleepers` is replaced by the real Linux reader (`_sleepers_from_proc`)
+        pointed at a temp dir, so the reader and the wait are exercised together (the reader tests above call it directly; the wait tests
+        replace it). pid 601 is the own child, its cmdline EMPTY until scan number `publish_on_scan` (1-based; None = never) writes
+        `sleep\\0<token>\\0` into it; pid 602 runs another test's token and must never be named. Like the real /proc route the reader ignores the
+        timeout it is handed. Returns (found, root, the timeout each scan was handed)."""
+        token = "60.5"
+        root = self._fixture_proc({
+            "601": {"cmdline": b""},                                   # the own child: exec under way, argv not published yet
+            "602": {"cmdline": b"sleep\x0060.999999999\x00"},          # another test's token
+        })
+        handed: list[float | None] = []
+
+        def fixture_reader(tok: str, timeout: float | None = None) -> set[int]:
+            handed.append(timeout)
+            if publish_on_scan is not None and len(handed) == publish_on_scan:
+                (root / "601" / "cmdline").write_bytes(b"sleep\x00" + tok.encode() + b"\x00")
+            return _sleepers_from_proc(tok, root)
+
+        alive = mock.Mock(pid=601, **{"poll.return_value": None})
+        with mock.patch.object(sys.modules[__name__], "_sleepers", fixture_reader):
+            found = _call_with_hang_guard(self, lambda: _wait_for_sleeper(token, alive, timeout=timeout, interval=0.0), HANG_GUARD_SECONDS)
+        return found, root, handed
+
+    def test_the_wait_rescans_a_fixture_proc_until_the_own_childs_cmdline_is_published(self) -> None:
+        # DV-SLEEPER-RESCAN-BOUND-FOLLOWUPS-1 (Sol on #628, hardening): the reader-to-wait path was only covered in two halves.
+        found, _, handed = self._wait_over_fixture_proc(publish_on_scan=3, timeout=5.0)
+        self.assertEqual(found, {601}, "the pid whose cmdline went from empty to `sleep <token>` is named, and the other token's pid 602 is not")
+        self.assertEqual(len(handed), 3, "two scans read the empty cmdline (nothing named), the third read the published one and the wait stopped")
+
+    def test_the_wait_over_a_fixture_proc_that_never_publishes_returns_nothing_within_its_bound(self) -> None:
+        started = time.monotonic()
+        found, _, handed = self._wait_over_fixture_proc(publish_on_scan=None, timeout=0.3)
+        self.assertEqual(found, set(), "an own child whose argv never shows up is not named, so the caller's exact-set assertion fails")
+        self.assertGreater(len(handed), 1, "it rescanned until the deadline instead of giving up after the first empty read")
+        self.assertLess(time.monotonic() - started, 5.0, "bounded between scans: the deadline is checked before each rescan")
 
     @unittest.skipIf(sys.platform == "win32" or Path("/proc").is_dir(), "the ps path is for platforms without /proc (macOS)")
     def test_discovery_runs_where_there_is_no_proc(self) -> None:
