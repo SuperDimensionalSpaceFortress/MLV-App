@@ -90,6 +90,9 @@ if ($JobId -like 'lease-batch-open-*') {
         leaseRefusals = @([ordered]@{ reason = 'refused'; rc = 75; why = 'quiet lease cooldown' }) }
     if ($mode -ne 'nobatch') { $adm['leaseBatch'] = [ordered]@{ token = $token; leaseId = $lid; seq = 1; reused = $false; untilEpoch = $now.ToUnixTimeSeconds() + $remain; remainingSec = $remain } }
     [pscustomobject]@{ opens = $n + 1; leaseId = $lid; token = $token } | ConvertTo-Json | Set-Content -LiteralPath $stateFile
+    # r5: FAKE_OPEN_SLEEP per open: um-run blocks this long first, as it does while the agent re-asks a refused (exit 75) request for the open
+    $sleep = [int](Pick $env:FAKE_OPEN_SLEEP $n '0')
+    if ($sleep -gt 0) { Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} OPENWAIT {1} sec={2}" -f [DateTime]::UtcNow.Ticks, $JobId, $sleep); Start-Sleep -Seconds $sleep; $now = [DateTimeOffset]::UtcNow }
     $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
     if ($mode -eq 'gatehold') {
         # r3: um-run gave up while the agent still holds the open in its gate, and NO result lands: the agent keeps re-asking until it is cancelled.
@@ -232,6 +235,18 @@ def utc_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def parse_utc(text: str) -> datetime:
+    """An ISO stamp as PowerShell's 'o' writes it (7 fraction digits, Z or an offset), as an aware UTC datetime."""
+    body, frac = text.replace("Z", "+00:00"), ""
+    if "." in body:
+        head, rest = body.split(".", 1)
+        digits = "".join(ch for ch in rest if ch.isdigit())
+        frac, tz = "." + digits[:6], rest[len(digits):]
+        body = head + frac + tz
+    dt = datetime.fromisoformat(body)
+    return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
+
+
 def batch_result(stdout: str) -> dict:
     lines = [l for l in stdout.splitlines() if l.startswith("LEASE_BATCH_RESULT=")]
     if not lines:
@@ -261,12 +276,17 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.share = self.case / "share"
         self.share.mkdir()
         (self.share / "cancel").mkdir()   # the agent's cooperative cancel folder (the agent creates it on the real share)
+        (self.share / "notafter").mkdir()   # r5: the agent's runner-liveness sidecar folder (#663; the agent creates it on the real share)
         self.claims = self.case / "claims"
         self.claim_path = self.claims / "bachelor.claim.json"
         self.events = self.case / "events.log"
         self.run_dir = self.case / "run"
 
     def run_batch(self, specs: list[Path] | None = None, *extra: str, **env: str) -> subprocess.CompletedProcess:
+        args, e = self.batch_cmd(specs, *extra, **env)
+        return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+
+    def batch_cmd(self, specs: list[Path] | None = None, *extra: str, **env: str) -> tuple[list[str], dict]:
         e = dict(os.environ)
         e.update({"FAKE_EVENTS": str(self.events), "FAKE_SHARE": str(self.share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case)})
         e.update(env)
@@ -277,7 +297,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                 "-RunDir", str(self.run_dir), "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST, "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
                 "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *extra]
-        return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+        return args, e
 
     def kinds(self) -> list[str]:
         """The event order: OPEN / CLOSE (um-run), QUIET:<mode>, LEG:<leaf>:<leaseBatch>."""
@@ -333,6 +353,11 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         bodies = [l for l in self.events_raw() if " UMRUN " in l]
         self.assertIn("LEASE_BATCH_OPEN token=", bodies[0])
         self.assertIn("LEASE_BATCH_CLOSE token=", bodies[-1])
+        # r5: the open's runner-liveness sidecar was written while the open was owned and removed once its result was in hand; the claim had a keeper
+        self.assertEqual((b["openLiveness"]["end"], b["openLiveness"]["writeFailures"]), ("REMOVED", 0), b["openLiveness"])
+        self.assertEqual(list((self.share / "notafter").iterdir()), [], "the open's sidecar was left behind")
+        self.assertIsNone(b["claimRenew"]["lost"], b["claimRenew"])
+        self.assertIn(f" BATCH_OPEN_LIVENESS batch=1 job=lease-batch-open-", log)
 
     # ---------------------------------------------------------------- in-lease retry
     def test_a_busy_probe_is_retried_inside_the_same_lease(self) -> None:
@@ -341,10 +366,33 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         k = self.kinds()
         self.assertEqual([x.split(":")[0] for x in k], ["OPEN", "QUIET", "QUIET", "QUIET", "QUIET", "LEG", "CLOSE"], k)
         [b] = self.batches()
-        self.assertEqual((b["probeRetries"], b["retries"], b["legsRan"], b["legsCounted"], b["endReason"]), (3, 3, 1, 1, "ALL_LEGS_DONE"))
+        # r5 (V-01): the FOREIGN probe among this leg's attempts sticks, so the leg ran but is not counted (Invoke-VenueChain's rule).
+        self.assertEqual((b["probeRetries"], b["retries"], b["legsRan"], b["legsCounted"], b["endReason"]), (3, 3, 1, 0, "ALL_LEGS_DONE"))
+        self.assertEqual((b["legs"][0]["class"], b["legs"][0]["foreignFloor"]), ("COOLDOWN_UNMET", True), b["legs"])
         log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
         for reason in ("COOLDOWN_UNMET", "GATE_BUSY"):
             self.assertIn(f"RETRY_IN_LEASE leg=01-fx-a-spec batch=1 reason={reason}", log)
+
+    def test_a_foreign_floor_then_a_quiet_retry_leaves_the_leg_uncounted_and_never_the_next_leg(self) -> None:
+        # r5 (V-01, key3): a FOREIGN_FLOOR on the first in-lease probe, then QUIET on the retry. The leg runs on the lease, but the floor seen in an earlier
+        # attempt of the SAME leg sticks: class COOLDOWN_UNMET, uncounted. The next leg's own QUIET probe is clean, so it counts. RED: the leg counted.
+        r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES="FOREIGN,QUIET,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        k = self.kinds()
+        token = k[0].split(":")[1]
+        self.assertEqual(k, [f"OPEN:{token}", "QUIET:FOREIGN", "QUIET:QUIET", f"LEG:fx-a:{token}", "QUIET:QUIET", f"LEG:fx-b:{token}", f"CLOSE:{token}"])
+        [b] = self.batches()
+        a, nxt = b["legs"]
+        self.assertEqual((a["status"], a["class"], a["counted"], a["quietVerdict"]), ("RAN", "COOLDOWN_UNMET", False, "QUIET"), a)
+        self.assertEqual((b["probeRetries"], b["legsRan"], b["legsCounted"]), (1, 2, 1))
+        self.assertEqual((nxt["class"], nxt["counted"]), ("QUIET_PRELOAD_OK", True), nxt)
+        self.assertEqual((a["foreignFloor"], nxt["foreignFloor"]), (True, False), b["legs"])
+        self.assertTrue(a["foreignFloorLine"].startswith("FOREIGN_FLOOR owners="), a)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["counted"]), (2, 1))
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn("LEG 01-fx-a-spec RAN batch=1 ", log)
+        self.assertIn("class=COOLDOWN_UNMET counted=False", log)
 
     def test_a_leg_whose_own_recheck_failed_is_retried_inside_the_same_lease(self) -> None:
         r = self.run_batch([self.specs[0]], FAKE_LEG_OUTCOMES="VENUE_NOT_QUIESCENT,PASS")
@@ -650,6 +698,131 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                     os.kill(int(tok), signal.SIGTERM)
                 except (OSError, ValueError):
                     pass
+
+    # ---------------------------------------------------------------- r5: the open's runner-liveness sidecar (sol B1 on an early runner exit)
+    def _agent_verdict(self, notafter_dir: Path, job_id: str, not_after_utc: str) -> dict:
+        """The agent's OWN reader and verdict (Read-JobNotAfterSidecar, Get-JobNotAfterVerdict, lifted from ultra-magnus-agent.ps1) on a sidecar folder."""
+        script = (
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{AGENT}', [ref]$null, [ref]$null)\n"
+            "foreach ($n in 'Get-JobNotAfterVerdict', 'Read-JobNotAfterSidecar') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
+            f"$notAfterDir = '{notafter_dir}'\n"
+            f"$v = Get-JobNotAfterVerdict -Metadata ([pscustomobject]@{{ notAfterUtc = '{not_after_utc}' }}) -Sidecar (Read-JobNotAfterSidecar -JobId '{job_id}')\n"
+            "[ordered]@{ state = $v.state; source = $v.source; livenessState = $v.livenessState; livenessSeq = $v.livenessSeq; why = $v.why } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json.loads(out.stdout)
+
+    def test_a_runner_killed_while_its_open_waits_stops_renewing_the_sidecar_and_the_agent_reads_it_lapsed(self) -> None:
+        # r5 (sol B1; #644 + #663 + this): um-run blocks on the open (the agent re-asking a refused request). The runner keeps the open's sidecar 6 s ahead,
+        # rewritten every 1 s, in the agent's format. Killed (process tree, as a lane timeout or a closed console does), it renews no more: the last
+        # aliveUntilUtc passes and the agent's own verdict for the open turns passed (source=sidecar), so its wait ends and its request is released (the
+        # agent side of this is batch-runner-killed-liveness in test-ultra-magnus-agent-quiet-lease.ps1). RED: the runner writes no sidecar.
+        args, e = self.batch_cmd([self.specs[0]], "-LivenessWindowSec", "6", "-LivenessRenewSec", "1", FAKE_OPEN_SLEEP="200")
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        side_dir = self.share / "notafter"
+        try:
+            def read_side() -> dict | None:
+                files = [f for f in side_dir.glob("lease-batch-open-*.json")]
+                if len(files) != 1:
+                    return None
+                try:
+                    return json.loads(files[0].read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    return None
+            end = time.monotonic() + 60
+            s = None
+            while time.monotonic() < end:
+                s = read_side()
+                if s is not None and int(s["seq"]) >= 3:
+                    break
+                time.sleep(0.2)
+            self.assertTrue(s is not None and int(s["seq"]) >= 3, f"the runner keeps the open's sidecar renewed while um-run blocks: {s} {list(side_dir.iterdir())}")
+            job = s["jobId"]
+            self.assertEqual((s["schema"], s["writerPid"]), ("mlv-app/job-notafter-sidecar/v1", p.pid), s)
+            self.assertTrue(job.startswith("lease-batch-open-") and (side_dir / f"{job}.json").exists(), job)
+            far = utc_iso(datetime.now(timezone.utc) + timedelta(hours=1))
+            # while the runner lives, the agent reads its open as live
+            live = self._agent_verdict(side_dir, job, far)
+            self.assertEqual((live["state"], live["livenessState"], live["source"]), ("open", "live", "meta"), live)
+            self.assertIsNone(p.poll(), "the runner is still waiting on its open")
+            subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+            p.wait(timeout=60)
+            killed_at = datetime.now(timezone.utc)
+            time.sleep(1.5)   # a write in flight at the kill lands, or not
+            s1 = read_side()
+            until = parse_utc(s1["aliveUntilUtc"])
+            self.assertLessEqual(until, killed_at + timedelta(seconds=7), f"the last aliveUntilUtc is within the window of the kill: {s1}")
+            while datetime.now(timezone.utc) < until + timedelta(seconds=1):
+                time.sleep(0.2)
+            s2 = read_side()
+            self.assertEqual(s2["seq"], s1["seq"], "nothing renews the sidecar after the runner is killed")
+            dead = self._agent_verdict(side_dir, job, far)
+            self.assertEqual((dead["state"], dead["livenessState"], dead["source"]), ("passed", "lapsed", "sidecar"), dead)
+            self.assertFalse(_pid_alive(p.pid), "the killed runner is gone")
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+            p.stdout.close()
+            p.stderr.close()
+
+    # ---------------------------------------------------------------- r5: the claim is renewed for as long as it is held (dot 242171b3 B1)
+    def test_a_long_foreign_refusal_wait_does_not_let_the_live_claim_expire(self) -> None:
+        # -ClaimTtlSec 60 (its floor), and um-run blocks 80 s on the open while the agent re-asks a refused (exit 75) request: longer than the claim's TTL. At
+        # TTL + 10 s VenueChain.psm1's own Get-VenueClaim (Get-VenueClaimStaleReason) still finds the claim LIVE, with the same nonce and a later expiresUtc,
+        # and no waiting chain could break it. RED (no renewal): the claim reads STALE reason=expired while its owner is alive and holding the venue.
+        args, e = self.batch_cmd([self.specs[0]], "-ClaimTtlSec", "60", FAKE_OPEN_SLEEP="80")
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+        try:
+            end = time.monotonic() + 60
+            while not self.claim_path.exists() and time.monotonic() < end:
+                time.sleep(0.2)
+            c0 = json.loads(self.claim_path.read_text(encoding="utf-8"))
+            claimed = parse_utc(c0["claimedUtc"])
+            while datetime.now(timezone.utc) < claimed + timedelta(seconds=70):
+                time.sleep(0.5)
+            self.assertIsNone(p.poll(), "the run is still in its open's wait at TTL + 10 s")
+            script = f"Import-Module '{MODULE}' -Force -DisableNameChecking\n$c = Get-VenueClaim -Venue bachelor -ClaimDir '{self.claims}'\n[ordered]@{{ state = $c.state; reason = $c.reason; nonce = $c.claim.nonce }} | ConvertTo-Json -Compress\n"
+            out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            seen = json.loads(out.stdout)
+            self.assertEqual((seen["state"], seen["reason"], seen["nonce"]), ("LIVE", None, c0["nonce"]), seen)
+            c1 = json.loads(self.claim_path.read_text(encoding="utf-8"))
+            self.assertGreater(parse_utc(c1["expiresUtc"]), datetime.now(timezone.utc), c1)
+            self.assertEqual({k: v for k, v in c1.items() if k != "expiresUtc"}, {k: v for k, v in c0.items() if k != "expiresUtc"}, "only expiresUtc changes")
+            so, se = p.communicate(timeout=300)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertEqual(p.returncode, 0, so + se)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsCounted"]), ("ALL_LEGS_DONE", 1))
+        self.assertGreaterEqual(b["claimRenew"]["renews"], 4, b["claimRenew"])
+        self.assertEqual((b["claimRenew"]["renewSec"], b["claimRenew"]["ttlSec"], b["claimRenew"]["lost"], b["claimRenew"]["errors"]), (15, 60, None, 0), b["claimRenew"])
+        self.assertFalse(self.claim_path.exists(), "the claim is released at the end")
+
+    def test_the_claim_renewal_never_takes_over_another_owners_claim(self) -> None:
+        # Update-VenueClaim renews only the claim with its nonce: another owner's claim (a new one after a break) is NOT_OURS and left byte for byte.
+        self.claims.mkdir()
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"$c = Request-VenueClaim -Venue bachelor -RunDir 'x' -TtlSec 60 -ClaimDir '{self.claims}'\n"
+            f"$before = [IO.File]::ReadAllText('{self.claim_path}')\n"
+            f"$other = Update-VenueClaim -Venue bachelor -Nonce 'not-the-nonce' -TtlSec 600 -ClaimDir '{self.claims}'\n"
+            f"$same = ([IO.File]::ReadAllText('{self.claim_path}') -ceq $before)\n"
+            f"$mine = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{self.claims}'\n"
+            f"$after = Get-VenueClaim -Venue bachelor -ClaimDir '{self.claims}'\n"
+            f"$rel = Release-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -ClaimDir '{self.claims}'\n"
+            f"$gone = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{self.claims}'\n"
+            "[ordered]@{ other = $other.state; same = $same; mine = $mine.state; live = $after.state; ttlLeft = [int](($after.claim.expiresUtc.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds); rel = $rel; gone = $gone.state } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual((got["other"], got["same"], got["mine"], got["live"], got["rel"], got["gone"]), ("NOT_OURS", True, "RENEWED", "LIVE", "RELEASED", "ABSENT"), got)
+        self.assertGreater(got["ttlLeft"], 500, got)
 
     # ---------------------------------------------------------------- the job-id contract with the agent
     def test_invoke_venue_leg_tags_its_job_with_the_batch_token_the_agent_reads(self) -> None:

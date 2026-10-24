@@ -2921,6 +2921,10 @@ function Confirm-QuietLeaseHeldForLaunch {
 #      lease, is stopped with its whole process tree (Get-LeaseBatchJobStop, every monitor slice; exit 124, admission.leaseStop, slotContinuity=lost) and
 #      the lease is released before its result is published. ENDED BATCH: a job of a batch whose close job is queued leaves the gate with no lease
 #      (Test-LeaseBatchClosePending), and its pending request is stopped; the VM also cancels such an open by name (cancel\<jobId>.cancel).
+#   7. r5 (dot 242171b3 B2). CLOSE BEFORE REUSE: a batch job whose batch's close job is queued is never run on the parked lease, whatever the inbox order:
+#      Use-LeaseBatchForJob checks for the close BEFORE any reuse and releases the lease (close-queued), and Invoke-QueuedJob refuses an admitted batch job the
+#      same way after admission, before the launching marker (cancelled-in-gate, batchClosed). A staging step (STAGE-JOB-LEASE-EXEMPT-1) is not gated, so it
+#      runs between legs like a light job and does not end a parked batch. The VM runner keeps the open's runner-liveness sidecar fresh (#633 r5).
 # No new renew call site, and no new release call site: release is Stop-QuietLease and renewal is the tick. The r3 stop reuses Stop-ProcessTree.
 # ---------------------------------------------------------------------------
 
@@ -2979,6 +2983,9 @@ function Use-LeaseBatchForJob {
     $token = Get-LeaseBatchToken -JobId $JobId
     if ($null -eq $b) { return $null }
     if ($b.token -cne $token) { Close-LeaseBatch -Reason "other-job" -Why "job=$JobId"; return $null }
+    # lease-batch r5 (dot 242171b3 B2): the batch's close job is queued, so the VM has let the batch go. Checked BEFORE any reuse: a leg file that sorts ahead of
+    # the close is never run on the parked lease. The lease is released here; the caller's wait then sees the close and leaves with no lease (batchClosed).
+    if (Test-LeaseBatchClosePending -Token $token) { Close-LeaseBatch -Reason "close-queued" -Why "job=$JobId found its batch's close job queued; not reused"; return $null }
     $l = $b.lease
     $u = Update-QuietLeaseRequest -Lease $l
     if ($u.state -ne "active") { Close-LeaseBatch -Reason "lease-ended" -Why "job=$JobId found it $($u.state): $($u.why)"; return $null }
@@ -3353,7 +3360,8 @@ function Invoke-QueuedJob {
     # under it (lease-batch block item 4); a light job runs under it and says so (underLeaseBatch). lease-batch r5: a staging
     # step is not gated either, so it does not end a parked batch (it runs between legs, never during one).
     $closeJob = Test-LeaseBatchCloseJobId -JobId $jobId
-    $exemptClass = if ($closeJob) { "light" } else { Get-GateExemptClass -JobId $jobId }
+    $exemptClass = Get-GateExemptClass -JobId $jobId
+    if ($closeJob) { $exemptClass = "light" }
     $isLight = $null -ne $exemptClass
     Sync-LeaseBatchForJob -JobId $jobId -Light $isLight -Mode $(if ($isLight) { "lease" } else { Resolve-HeavySlotMode })
     if ($exemptClass -eq "light") {
@@ -3398,12 +3406,20 @@ function Invoke-QueuedJob {
     }
     # The admitted lease is released explicitly (its release recorded in the admission) before Exit-HeavySlot, which stays a
     # bare call: it returns nothing.
-    if (Test-Path -LiteralPath (Join-Path $cancel "$jobId.cancel") -PathType Leaf) {
+    # lease-batch r5 (dot 242171b3 B2): an admitted batch job whose batch's close job is queued is refused the same way, before the launching marker and
+    # the pre-launch renew (the close job itself, and an unbatched job, never are).
+    $cancelWhy = $null
+    $closedToken = $null
+    $batchToken = if (-not $closeJob -and $script:Admission.label -eq "clear") { Get-LeaseBatchToken -JobId $jobId } else { $null }
+    if (Test-Path -LiteralPath (Join-Path $cancel "$jobId.cancel") -PathType Leaf) { $cancelWhy = "cancel file present after admission, before launch" }
+    elseif ($null -ne $batchToken -and (Test-LeaseBatchClosePending -Token $batchToken)) { $closedToken = $batchToken; $cancelWhy = "the close job of lease batch $batchToken is queued after admission, before launch" }
+    if ($null -ne $cancelWhy) {
         $rel = $null
-        if ($null -ne $script:QuietLease) { $rel = Stop-QuietLease -Lease $script:QuietLease -Why "cancel file present after admission, before launch"; Close-LeaseBatchAfterRelease -Release $rel -Why "cancel file present after admission, before launch"; $script:QuietLease = $null }
+        if ($null -ne $script:QuietLease) { $rel = Stop-QuietLease -Lease $script:QuietLease -Why $cancelWhy; Close-LeaseBatchAfterRelease -Release $rel -Why $cancelWhy; $script:QuietLease = $null }
         Exit-HeavySlot
         $script:Admission | Add-Member -NotePropertyName label -NotePropertyValue "cancelled-in-gate" -Force
-        $script:Admission | Add-Member -NotePropertyName why -NotePropertyValue "cancel file present after admission, before launch" -Force
+        $script:Admission | Add-Member -NotePropertyName why -NotePropertyValue $cancelWhy -Force
+        if ($null -ne $closedToken) { $script:Admission | Add-Member -NotePropertyName batchClosed -NotePropertyValue $true -Force }
         $script:Admission | Add-Member -NotePropertyName slot -NotePropertyValue $null -Force
         $script:Admission | Add-Member -NotePropertyName leaseRelease -NotePropertyValue (New-LeaseReleaseRecord -Phase "post-admission" -Release $rel) -Force
         Publish-GateUnlaunchedResult -Job $Job -Metadata $metadata -Admission $script:Admission -QueueAgeSec $queueAgeSec

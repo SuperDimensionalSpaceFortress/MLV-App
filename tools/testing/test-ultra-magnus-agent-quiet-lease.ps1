@@ -6,7 +6,9 @@ param(
     # The interpreter that runs the FAKE heavy-slot.py below (never the real one: it lives only on Bachelor).
     [string]$Python = $(if ($env:MLV_HEAVY_SLOT_PYTHON) { $env:MLV_HEAVY_SLOT_PYTHON } else { '' }),
     # Runs only the named not-after cases (empty = every case, the original ones included), so each can be run alone for its RED.
-    [string[]]$Only = @()
+    [string[]]$Only = @(),
+    # lease-batch r5: the VM runner's module whose liveness writer batch-runner-killed-liveness runs (the RED run points this at a base copy).
+    [string]$VenueModule = ''
 )
 
 # BACHELOR-AGENT-QUIET-LEASE-1 r1: the Bachelor agent's QUIET LEASE (tools/profiling/bachelor/ultra-magnus-agent.ps1,
@@ -37,6 +39,9 @@ param(
 #               it passes, and a lease that turns active after it (or after a cancel file) is released before the job gets it
 #               lease-batch r4 (sol r3 B1 on #633; cases batch-*): a batch's open, which carries the batch deadline as notAfterUtc, holds no
 #               lease past it; and a post-admission refusal of an open ends the batch it opened, with its receipt
+#               lease-batch r5 (cases batch-close-before-reuse, batch-runner-killed-liveness): a queued close job wins over a leg that sorts ahead of
+#               it (no reuse, no launch; dot B2), and a VM runner killed while its open is pending stops renewing the open's sidecar, so the open
+#               expires and its request is released within the liveness window (sol B1; the writer is VenueChain.psm1's, -VenueModule for RED)
 #   not-after hardening - LEASE-NOT-AFTER-HARDENING-1 r1 (cases notafter-queuedjob-*, notafter-prelaunch-*, notafter-renew-in-light-job,
 #               notafter-meta-unreadable): Invoke-QueuedJob's not-after exits RUN (pre-gate, gate label, post-admission, and the
 #               last check before the child is created), each refusing, releasing and retiring; a waiting lease is not renewed
@@ -738,7 +743,8 @@ try {
         'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75',
         'liveness-absent-unchanged', 'liveness-unparseable-expired', 'liveness-pure', 'liveness-reader', 'liveness-ast-guard', 'liveness-queuedjob',
         'liveness-root-shape', 'liveness-lapse-latched',
-        'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin')
+        'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin',
+        'batch-close-before-reuse', 'batch-runner-killed-liveness')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -1059,7 +1065,7 @@ function Exit-HeavySlot {
     # what the verdict sees when the clock passes the deadline there.
     $qjCases = @('notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker', 'notafter-prelaunch-confirm', 'notafter-meta-unreadable',
         'queuedjob-cancel-post-admission', 'notafter-meta-sticky', 'liveness-queuedjob', 'liveness-root-shape',
-        'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch')
+        'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'batch-close-before-reuse')
     if (@($qjCases | Where-Object { Test-Case $_ }).Count -gt 0) {
         # STAGE-JOB-LEASE-EXEMPT-1 r2: Invoke-QueuedJob classifies the job through Get-GateExemptClass, which reads both patterns.
         foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult', 'Get-GateExemptClass')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
@@ -2040,8 +2046,10 @@ function Exit-HeavySlot {
         $qjR = Get-FunctionBody 'Invoke-QueuedJob'
         # lease-batch r5 (the merge of #662): every such line, the queue-expired and pre-launch holder-lost exits included; $When and $pre are the
         # variables two of them read in Invoke-QueuedJob.
-        $refusalLines = @(($qjR -split "`r?`n") | Where-Object { $_ -match '^\s*if \(\$null -ne \$script:QuietLease\) \{ \$rel = Stop-QuietLease -Lease \$script:QuietLease -Why "' } | ForEach-Object { $_.Trim() })
+        $refusalLines = @(($qjR -split "`r?`n") | Where-Object { $_ -match '^\s*if \(\$null -ne \$script:QuietLease\) \{ \$rel = Stop-QuietLease -Lease \$script:QuietLease -Why ' } | ForEach-Object { $_.Trim() })
         Assert-True ($refusalLines.Count -eq 4) "batch-refusal-ends-batch: Invoke-QueuedJob has the post-admission cancel, not-after, queue-expired and pre-launch release lines (found $($refusalLines.Count))"
+        # lease-batch r5: the cancel line's why is a variable now (a cancel file, or the batch's queued close job).
+        $cancelWhy = 'cancel file present after admission, before launch'
         $When = 'after admission, before launch'
         $pre = [pscustomobject]@{ reason = 'holder-lost'; why = 'unit' }
         $refused = [ordered]@{}
@@ -2064,6 +2072,100 @@ function Exit-HeavySlot {
             $refused["refusal$i"] = $rcptR[0].endReason
         }
         $results.batchRefusalEndsBatch = $refused
+    }
+
+    # ------------------------------------------------------------ batch-close-before-reuse: a queued CLOSE wins over a leg file that sorts ahead of it
+    # lease-batch r5 (dot 242171b3 B2): the batch's lease is parked; the VM queues the batch's close job, and a leg of that batch sits in inbox\ AHEAD of it
+    # (dve-... < lease-batch-close-...), so the inbox loop takes the leg first. Invoke-QueuedJob is RUN (disk and launch steps stubbed, as above).
+    # RED (reuse before the close check): the leg is admitted on the parked lease and reaches the child launch.
+    if (Test-Case 'batch-close-before-reuse') {
+        $tokC = 'ffffffffff21'
+        $openC = "lease-batch-open-20261024T1930Z-lb$tokC"
+        $legC = "dve-fx-a-bachelor-cpu-20261024000001-lb$tokC"
+        $closeC = "lease-batch-close-20261024T1930Z-lb$tokC"
+        $job = Reset-QueuedJobCase @{ request = 'active' } $legC (New-NotAfterMetaJson 600)
+        # The open: admitted on a fresh lease, ran, ended; the inbox loop parks the lease (Complete-LeaseBatchJob, then Exit-HeavySlot).
+        $script:Admission = Wait-QuietLeaseAdmission -JobId $openC -Job ([pscustomobject]@{}) -Metadata $meta
+        Assert-True ($script:Admission.label -eq 'clear' -and $null -ne $script:LeaseBatch -and $script:LeaseBatch.token -ceq $tokC) "batch-close-before-reuse: the open is admitted and opens its batch ($($script:Admission.label))"
+        Complete-LeaseBatchJob -JobId $openC -ExitCode 0 -StartedUtc ([DateTime]::UtcNow.ToString('o'))
+        Exit-HeavySlot
+        $script:Admission = $null
+        Assert-True ($null -ne $script:LeaseBatch -and $null -eq $script:QuietLease -and (Test-PidAlive $script:LeaseBatch.lease.pid)) "batch-close-before-reuse: the lease is parked, its wrapper alive"
+        $wpC = $script:LeaseBatch.lease.pid
+        [IO.File]::WriteAllText((Join-Path $inbox "$legC.job.ps1"), '# leg')
+        [IO.File]::WriteAllText((Join-Path $inbox "$closeC.job.ps1"), '# close')
+        $order = @(Get-ChildItem -LiteralPath $inbox -Filter '*.job.ps1' -File | Sort-Object Name | ForEach-Object Name)
+        Assert-True ($order.Count -eq 2 -and $order[0] -ceq "$legC.job.ps1" -and $order[1] -ceq "$closeC.job.ps1") "batch-close-before-reuse: the leg sorts ahead of the queued close: $($order -join ', ')"
+        $null = Invoke-QueuedJob -Job $job
+        $pC = @($script:QJ.published)
+        Assert-True ($script:QJ.launches.Count -eq 0 -and $script:QJ.launchingMarkers.Count -eq 0) "batch-close-before-reuse: NO leg launches (no launching marker, no child): launches=[$($script:QJ.launches -join ' | ')] markers=$($script:QJ.launchingMarkers.Count)"
+        Assert-True ($pC.Count -eq 1 -and $pC[0].jobId -ceq $legC -and $pC[0].admission.label -ceq 'cancelled-in-gate' -and $pC[0].admission.batchClosed -eq $true -and $null -eq $pC[0].startedUtc) "batch-close-before-reuse: the leg's result is cancelled-in-gate, batchClosed, never started: $($pC | ConvertTo-Json -Compress -Depth 4)"
+        $reqsC = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        Assert-True ($reqsC.Count -eq 1 -and (Get-Released).Count -eq 1 -and (Wait-Until { -not (Test-PidAlive $wpC) } 8)) "batch-close-before-reuse: one request (the open's), the parked lease released once, its wrapper gone: requests=$($reqsC.Count) releases=$((Get-Released).Count)"
+        $rcptC = @(Get-Content -LiteralPath (Join-Path $fx "lease-batch-$tokC.jsonl") -ErrorAction SilentlyContinue | ForEach-Object { $_ | ConvertFrom-Json })
+        Assert-True ($null -eq $script:LeaseBatch -and $null -eq $script:QuietLease -and $rcptC.Count -eq 1 -and $rcptC[0].endReason -ceq 'close-queued' -and $rcptC[0].jobsRun -eq 1) "batch-close-before-reuse: the batch ends close-queued with its receipt (the open ran, no leg): $($rcptC | ConvertTo-Json -Compress -Depth 4)"
+        Assert-True (Test-Path -LiteralPath (Join-Path $inbox "$closeC.job.ps1") -PathType Leaf) "batch-close-before-reuse: the close job is left for the inbox loop"
+        $results.batchCloseBeforeReuse = [ordered]@{ order = $order; label = $pC[0].admission.label; batchClosed = $pC[0].admission.batchClosed; endReason = $rcptC[0].endReason; launches = $script:QJ.launches.Count }
+    }
+
+    # ------------------------------------------------------------ batch-runner-killed-liveness: the VM runner dies while its open waits in the gate
+    # lease-batch r5 (sol B1 on an early runner exit; #644 + #663 + this): the open's runner-liveness sidecar is written and renewed by the REAL VM writer
+    # (VenueChain.psm1 Start-VenueJobLiveness) in its own process; the open's request is pending (heavy-slot.py has not admitted it). The writer is killed: it
+    # stops renewing, and the agent's wait ends the open expired-not-after (source=sidecar) and releases the pending request once the last aliveUntilUtc passes,
+    # within the window plus one gate loop, never at the open's far notAfterUtc. RED (a runner without the writer): no sidecar is ever written.
+    if (Test-Case 'batch-runner-killed-liveness') {
+        Reset-Case @{ request = 'pending' }
+        $script:LeaseNotAfterMinAdmitSec = 1
+        $script:AgeAfter = (Get-Date).AddSeconds(60)
+        $tokK = 'ffffffffff31'
+        $openK = "lease-batch-open-20261024T1931Z-lb$tokK"
+        $sideK = Join-Path $notAfterDir "$openK.json"
+        $modK = if ($VenueModule) { $VenueModule } else { Join-Path $RepoRoot 'tools\profiling\dual-venue\VenueChain.psm1' }
+        $winK = 5
+        $psi = [Diagnostics.ProcessStartInfo]::new([Environment]::ProcessPath)
+        foreach ($a in @('-NoProfile', '-NonInteractive', '-Command', "Import-Module '$modK' -DisableNameChecking; `$l = Start-VenueJobLiveness -AgentShare '$fx' -JobId '$openK' -WindowSec $winK -RenewSec 1; Start-Sleep -Seconds 300")) { [void]$psi.ArgumentList.Add($a) }
+        $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardOutput = $true
+        $writer = [Diagnostics.Process]::Start($psi)
+        $writerErr = $writer.StandardError.ReadToEndAsync(); $null = $writer.StandardOutput.ReadToEndAsync()
+        try {
+            function Read-SideK { try { return ([IO.File]::ReadAllText($sideK) | ConvertFrom-Json) } catch { return $null } }
+            $first = Wait-Until { $null -ne (Read-SideK) } 20
+            Assert-True $first "batch-runner-killed-liveness: the runner's writer puts the open's sidecar at notafter\$openK.json (writer alive=$(-not $writer.HasExited) stderr=[$(if ($writer.HasExited) { $writerErr.Result })])"
+            $s0 = Read-SideK
+            Assert-True ($s0.schema -ceq 'mlv-app/job-notafter-sidecar/v1' -and $s0.jobId -ceq $openK -and $s0.writerPid -eq $writer.Id) "batch-runner-killed-liveness: the sidecar is the runner's, in the agent's schema: $($s0 | ConvertTo-Json -Compress)"
+            $mK = New-NotAfterMeta 3600
+            $script:KillK = $null
+            $script:LogHook = {
+                param($Message)
+                if ($null -ne $script:KillK -or $Message -notlike "quiet-lease: request started job=$openK *") { return }
+                # the open is pending in heavy-slot.py while the runner renews its sidecar; then the runner dies
+                $null = Wait-Until { $f = Get-FakeFlag; $s = Read-SideK; $null -ne $f -and $f.state -eq 'pending' -and $null -ne $s -and [int]$s.seq -ge 3 } 15
+                $sk = Read-SideK
+                $fk = Get-FakeFlag
+                Stop-Process -Id $writer.Id -Force
+                $null = $writer.WaitForExit(10000)
+                $script:KillK = [pscustomobject]@{ at = [DateTime]::UtcNow; seq = [int]$sk.seq; waitingLive = ($null -ne $fk -and $fk.state -eq 'pending') }
+            }
+            $admK = Wait-QuietLeaseAdmission -JobId $openK -Job ([pscustomobject]@{}) -Metadata $mK
+            $retK = [DateTime]::UtcNow
+            $script:LogHook = $null
+            $sEnd = Read-SideK
+            # pwsh 7's ConvertFrom-Json reads an ISO stamp as a [DateTime]; a string (Windows PowerShell) is parsed.
+            $lastUntil = if ($sEnd.aliveUntilUtc -is [DateTime]) { if ($sEnd.aliveUntilUtc.Kind -eq [DateTimeKind]::Unspecified) { [DateTime]::SpecifyKind($sEnd.aliveUntilUtc, [DateTimeKind]::Utc) } else { $sEnd.aliveUntilUtc.ToUniversalTime() } } else { [DateTimeOffset]::Parse([string]$sEnd.aliveUntilUtc, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime }
+            Assert-True ($null -ne $script:KillK -and $script:KillK.seq -ge 3 -and $script:KillK.waitingLive -and $writer.HasExited) "batch-runner-killed-liveness: the runner renewed the sidecar (seq $($script:KillK.seq)) while the open was pending, then was killed"
+            Assert-True ([int]$sEnd.seq -le $script:KillK.seq + 1 -and $lastUntil -le $script:KillK.at.AddSeconds($winK + 1)) "batch-runner-killed-liveness: no renewal after the kill: seq $($sEnd.seq) (kill saw $($script:KillK.seq)), last aliveUntilUtc $($sEnd.aliveUntilUtc) <= kill + ${winK}s"
+            Assert-True ($admK.label -eq 'expired-not-after' -and $admK.phase -ceq 'pending' -and $admK.notAfterSource -ceq 'sidecar' -and $admK.livenessState -ceq 'lapsed') "batch-runner-killed-liveness: the open ends expired-not-after from the lapsed sidecar, still pending: label=$($admK.label) phase=$($admK.phase) source=$($admK.notAfterSource) liveness=$($admK.livenessState)"
+            $lagK = ($retK - $lastUntil).TotalSeconds
+            Assert-True ($retK -ge $lastUntil -and $lagK -le 5) "batch-runner-killed-liveness: it ends within the #663 bound: $([Math]::Round($lagK, 2)) s after the last aliveUntilUtc (kill + $([Math]::Round(($retK - $script:KillK.at).TotalSeconds, 2)) s)"
+            $reqsK = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+            Assert-True ($reqsK.Count -eq 1 -and (Get-Released).Count -eq 1 -and [string]$admK.leaseRelease.releaseRc -ceq '0' -and (Wait-Until { -not (Test-PidAlive ([int]$reqsK[0].pid)) } 5) -and $null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting -and $null -eq $script:LeaseBatch -and @(Get-ChildItem -LiteralPath $fx -Filter '*.lease.json' -File).Count -eq 0) "batch-runner-killed-liveness: the pending request released once, its wrapper gone, no lease or batch kept: $($admK.leaseRelease | ConvertTo-Json -Compress)"
+            $results.batchRunnerKilledLiveness = [ordered]@{ windowSec = $winK; seqAtKill = $script:KillK.seq; lastSeq = [int]$sEnd.seq; secAfterLastAliveUntil = [Math]::Round($lagK, 2); secAfterKill = [Math]::Round(($retK - $script:KillK.at).TotalSeconds, 2); label = $admK.label; phase = $admK.phase; source = $admK.notAfterSource }
+        }
+        finally {
+            $script:LogHook = $null
+            if (-not $writer.HasExited) { Stop-Process -Id $writer.Id -Force -ErrorAction SilentlyContinue; $null = $writer.WaitForExit(10000) }
+            Remove-Item -LiteralPath $sideK -Force -ErrorAction SilentlyContinue
+        }
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }

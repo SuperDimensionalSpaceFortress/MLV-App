@@ -392,6 +392,34 @@ function Request-VenueClaim {
         Add-Member -NotePropertyName position -NotePropertyValue $position -PassThru | Add-Member -NotePropertyName staleTickets -NotePropertyValue @($removed) -PassThru
 }
 
+function Update-VenueClaim {
+    <#
+    .SYNOPSIS
+    BACHELOR-LEASE-BATCH-LEGS-1 r5 (dot 242171b3 B1): move the expiry of the venue's claim to now + -TtlSec, if it is still the one with -Nonce. The file is opened
+    exclusively (FileShare.None: a reader sees BUSY, never a half-written claim), re-read, and only its expiresUtc is rewritten in place; every other byte stays, so a
+    breaker that judged the old text finds it CHANGED and never removes a renewed claim. Returns @{ state (RENEWED | NOT_OURS | ABSENT | BUSY); expiresUtc }.
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [ValidateRange(60, 86400)][int]$TtlSec = 10800, [string]$ClaimDir = '')
+    $path = Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return [pscustomobject]@{ state = 'ABSENT'; expiresUtc = $null } }
+        $fs = $null
+        try { $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch { Start-Sleep -Milliseconds (50 * $attempt); continue }
+        try {
+            $sr = [IO.StreamReader]::new($fs, [Text.UTF8Encoding]::new($false), $false, 4096, $true)
+            $text = $sr.ReadToEnd(); $sr.Dispose()
+            $j = $null; try { $j = $text | ConvertFrom-Json -ErrorAction Stop } catch { $j = $null }
+            if ($null -eq $j -or [string]$j.nonce -cne $Nonce -or $text -cnotmatch '"expiresUtc":"[^"]*"') { return [pscustomobject]@{ state = 'NOT_OURS'; expiresUtc = $null } }
+            $expires = [DateTime]::UtcNow.AddSeconds($TtlSec).ToString('o')
+            $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($text -creplace '"expiresUtc":"[^"]*"', ('"expiresUtc":"' + $expires + '"')))
+            $fs.SetLength(0); $fs.Position = 0
+            $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true)
+            return [pscustomobject]@{ state = 'RENEWED'; expiresUtc = $expires }
+        } finally { $fs.Dispose() }
+    }
+    [pscustomobject]@{ state = 'BUSY'; expiresUtc = $null }
+}
+
 function Get-VenueClaimStatus {
     <#
     .SYNOPSIS
@@ -711,6 +739,155 @@ if (Test-Path -LiteralPath $p -PathType Leaf) { '<PRESENT>' } else { '<ABSENT>' 
     [pscustomobject]@{ state = 'UNKNOWN'; path = $path; error = $(if ($said -ceq '<NO_CANCEL_DIR>') { 'the agent share has no cancel folder' } else { 'the cancel file is not there after the write' }) }
 }
 
+# BACHELOR-LEASE-BATCH-LEGS-1 r5. KEEPERS: an in-process worker runspace that runs one step every -EverySec while its owner lives, so a renewal goes on while the
+# owner's own thread is blocked (in um-run.ps1, a by-name wait, a leg). It dies with the owner's process, which is the point: what it renews then lapses.
+$script:VenueKeeperLoop = @'
+param($S, $Body, $A, $Module)
+Import-Module $Module -DisableNameChecking
+$step = [scriptblock]::Create($Body)
+while (-not $S.stop -and -not $S.done) {
+    $until = [DateTime]::UtcNow.AddSeconds($S.everySec)
+    while (-not $S.stop -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+    if ($S.stop) { break }
+    try { $S.last = [string](& $step $A $S); $S.ok++ } catch { $S.errors++; $S.lastError = ($_.Exception.Message -replace '\s+', ' ') }
+    $S.runs++
+}
+'@
+
+function Start-VenueKeeper {
+    # One keeper: runs -StepText (param($A, $S); this module is imported) every -EverySec, the first one -EverySec from now, until Stop-VenueKeeper or until a step
+    # sets $S.done. $S is a synchronized
+    # hashtable: runs, ok, errors, last, lastError, plus whatever the step keeps there.
+    param([Parameter(Mandatory)][string]$StepText, $Argument = $null, [Parameter(Mandatory)][ValidateRange(1, 3600)][int]$EverySec, [hashtable]$State = @{})
+    $s = [hashtable]::Synchronized(@{ stop = $false; done = $false; everySec = $EverySec; runs = 0; ok = 0; errors = 0; last = $null; lastError = $null })
+    foreach ($k in $State.Keys) { $s[$k] = $State[$k] }
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($script:VenueKeeperLoop).AddArgument($s).AddArgument($StepText).AddArgument($Argument).AddArgument((Join-Path $PSScriptRoot 'VenueChain.psm1'))
+    [pscustomobject]@{ ps = $ps; async = $ps.BeginInvoke(); state = $s }
+}
+
+function Stop-VenueKeeper {
+    # Stops a keeper and waits up to -TimeoutSec for its step to finish. A step that does not finish (a share write stuck on a dead host) is ABANDONED as
+    # Invoke-VenueBoundedRead abandons a read: never Dispose()d, counted, so Complete-VenueProcess ends the process. Returns $true when it stopped in time.
+    param($Keeper, [ValidateRange(1, 600)][int]$TimeoutSec = 15)
+    if ($null -eq $Keeper) { return $true }
+    $Keeper.state.stop = $true
+    if ($Keeper.async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSec))) {
+        try { [void]$Keeper.ps.EndInvoke($Keeper.async) } catch { }
+        $Keeper.ps.Dispose()
+        return $true
+    }
+    $script:VenueAbandonedReads++
+    try { [void]$Keeper.ps.BeginStop($null, $null) } catch { }
+    $false
+}
+
+function Start-VenueClaimKeeper {
+    <#
+    .SYNOPSIS
+    r5 (dot 242171b3 B1): renew the venue claim (Update-VenueClaim) every -RenewSec while the owner lives, so a wait longer than -TtlSec (a foreign-refusal wait for the
+    lease, a by-name wait, the legs) never lets Get-VenueClaimStaleReason call a live owner's claim expired. A claim found NOT_OURS or ABSENT is lost: renewing stops.
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [ValidateRange(60, 86400)][int]$TtlSec = 10800, [ValidateRange(1, 3600)][int]$RenewSec = 600, [string]$ClaimDir = '')
+    $step = @'
+param($A, $S)
+$r = Update-VenueClaim -Venue $A.venue -Nonce $A.nonce -TtlSec $A.ttlSec -ClaimDir $A.claimDir
+if ($r.state -ceq 'RENEWED') { $S.renews++; $S.expiresUtc = $r.expiresUtc }
+elseif ($r.state -ceq 'NOT_OURS' -or $r.state -ceq 'ABSENT') { $S.lost = $r.state; $S.done = $true }
+$r.state
+'@
+    Start-VenueKeeper -StepText $step -Argument ([pscustomobject]@{ venue = $Venue; nonce = $Nonce; ttlSec = $TtlSec; claimDir = $ClaimDir }) -EverySec $RenewSec -State @{ renews = 0; expiresUtc = $null; lost = $null; renewSec = $RenewSec; ttlSec = $TtlSec }
+}
+
+# r5 (sol B1, the runner side of LEASE-BATCH-OPEN-RUNNER-LIVENESS-1 #663): the open's runner-liveness sidecar, <AgentShare>\notafter\<jobId>.json, in exactly the shape
+# the agent's Read-JobNotAfterSidecar / Get-JobNotAfterVerdict read (schema mlv-app/job-notafter-sidecar/v1, an object root, UTF-8, under 4096 bytes). Written to a tmp
+# name beside it and moved over it in one replacing rename (the agent reads with FileShare ReadWrite|Delete, so the rename never waits on a read). The notafter folder
+# is the agent's: it is never created here.
+$script:LivenessWriteText = @'
+param($A)
+$dir = Split-Path -Parent $A.path
+if (-not (Test-Path -LiteralPath $dir -PathType Container)) { '<NO_NOTAFTER_DIR>'; return }
+$tmp = $A.path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+try {
+    [IO.File]::WriteAllText($tmp, $A.json, [Text.UTF8Encoding]::new($false))
+    [IO.File]::Move($tmp, $A.path, $true)
+} finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
+'<WRITTEN>'
+'@
+
+function New-VenueJobLivenessWrite {
+    # The argument for one sidecar write: path and JSON text for -JobId alive until -AliveUntilUtc, write number -Seq.
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][string]$JobId, [Parameter(Mandatory)][DateTime]$AliveUntilUtc, [long]$Seq = 1)
+    $json = [ordered]@{ schema = 'mlv-app/job-notafter-sidecar/v1'; jobId = $JobId; aliveUntilUtc = $AliveUntilUtc.ToUniversalTime().ToString('o'); writtenUtc = [DateTime]::UtcNow.ToString('o')
+        seq = $Seq; writerPid = $PID; writerHost = [string]$env:COMPUTERNAME } | ConvertTo-Json -Compress
+    [pscustomobject]@{ path = ($AgentShare.TrimEnd('\') + '\notafter\' + $JobId + '.json'); json = $json }
+}
+
+function Write-VenueJobLiveness {
+    <#
+    .SYNOPSIS
+    One sidecar write on a bounded worker (the owner's thread is never held by a dead share). Returns @{ state (WRITTEN | NO_NOTAFTER_DIR | UNKNOWN); path; aliveUntilUtc; error }.
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [string]$JobId = '', [Parameter(Mandatory)][DateTime]$AliveUntilUtc, [long]$Seq = 1, [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    if ($JobId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { return [pscustomobject]@{ state = 'UNKNOWN'; path = $null; aliveUntilUtc = $null; error = 'no usable job id' } }
+    $w = New-VenueJobLivenessWrite -AgentShare $AgentShare -JobId $JobId -AliveUntilUtc $AliveUntilUtc -Seq $Seq
+    $r = Invoke-VenueBoundedRead -ScriptText $script:LivenessWriteText -Argument $w -TimeoutSec $TimeoutSec
+    $said = [string](@($r.value) -join '')
+    $state = $(if (-not $r.answered) { 'UNKNOWN' } elseif ($said -ceq '<WRITTEN>') { 'WRITTEN' } elseif ($said -ceq '<NO_NOTAFTER_DIR>') { 'NO_NOTAFTER_DIR' } else { 'UNKNOWN' })
+    [pscustomobject]@{ state = $state; path = $w.path; aliveUntilUtc = $AliveUntilUtc.ToUniversalTime().ToString('o'); error = $(if ($state -ceq 'NO_NOTAFTER_DIR') { 'the agent share has no notafter folder' } else { $r.error }) }
+}
+
+function Start-VenueJobLiveness {
+    <#
+    .SYNOPSIS
+    r5: while the caller owns a submitted job, keep its runner-liveness sidecar -WindowSec ahead: one write now (bounded), then a keeper rewrites it every -RenewSec
+    (seq 2, 3, ...). The keeper dies with the caller's process, so a runner killed early stops renewing and the agent ends the job's gate wait, and releases a pending
+    or just-active lease, once aliveUntilUtc passes (#663). Stop it with Stop-VenueJobLiveness.
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][string]$JobId, [ValidateRange(5, 1800)][int]$WindowSec = 120, [ValidateRange(1, 600)][int]$RenewSec = 30)
+    $first = Write-VenueJobLiveness -AgentShare $AgentShare -JobId $JobId -AliveUntilUtc ([DateTime]::UtcNow.AddSeconds($WindowSec)) -Seq 1
+    $step = @'
+param($A, $S)
+$S.seq++
+$until = [DateTime]::UtcNow.AddSeconds($A.windowSec)
+$w = New-VenueJobLivenessWrite -AgentShare $A.share -JobId $A.jobId -AliveUntilUtc $until -Seq $S.seq
+$said = [string](@(& ([scriptblock]::Create($A.writeText)) $w) -join '')
+if ($said -ceq '<WRITTEN>') { $S.writes++; $S.aliveUntilUtc = $until.ToString('o') } else { $S.writeFailures++ }
+$said
+'@
+    $arg = [pscustomobject]@{ share = $AgentShare; jobId = $JobId; windowSec = $WindowSec; writeText = $script:LivenessWriteText }
+    $k = Start-VenueKeeper -StepText $step -Argument $arg -EverySec $RenewSec -State @{ seq = 1; writes = $(if ($first.state -ceq 'WRITTEN') { 1 } else { 0 }); writeFailures = $(if ($first.state -ceq 'WRITTEN') { 0 } else { 1 })
+        aliveUntilUtc = $(if ($first.state -ceq 'WRITTEN') { $first.aliveUntilUtc } else { $null }); windowSec = $WindowSec; renewSec = $RenewSec }
+    $k | Add-Member -NotePropertyName first -NotePropertyValue $first -PassThru | Add-Member -NotePropertyName jobId -NotePropertyValue $JobId -PassThru | Add-Member -NotePropertyName share -NotePropertyValue $AgentShare -PassThru
+}
+
+function Stop-VenueJobLiveness {
+    <#
+    .SYNOPSIS
+    r5: the caller no longer owns the job, so the sidecar stops being renewed. -Remove deletes it (the job's result is in hand: the agent will not read it again);
+    otherwise it is rewritten lapsed (aliveUntilUtc = now), so an agent still holding the job ends it at its next check, and left for the agent to read (it never
+    deletes one). Idempotent. Returns @{ end (REMOVED | ABSENT | LAPSED | UNKNOWN | NONE); writes; writeFailures; lastSeq; lastAliveUntilUtc; stoppedInTime; error }.
+    #>
+    param($Liveness, [switch]$Remove)
+    if ($null -eq $Liveness) { return [pscustomobject]@{ end = 'NONE'; writes = 0; writeFailures = 0; lastSeq = $null; lastAliveUntilUtc = $null; stoppedInTime = $true; error = $null } }
+    if ($null -ne $Liveness.PSObject.Properties['stopped']) { return $Liveness.stopped }
+    $inTime = Stop-VenueKeeper -Keeper $Liveness
+    $s = $Liveness.state
+    $end = 'UNKNOWN'; $err = $null
+    if ($Remove) {
+        $path = $Liveness.share.TrimEnd('\') + '\notafter\' + $Liveness.jobId + '.json'
+        $r = Invoke-VenueBoundedRead -ScriptText 'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { Remove-Item -LiteralPath $args[0] -Force; if (Test-Path -LiteralPath $args[0]) { "<PRESENT>" } else { "<REMOVED>" } } else { "<ABSENT>" }' -Argument $path -TimeoutSec 30
+        $said = [string](@($r.value) -join '')
+        $end = $(if ($said -ceq '<REMOVED>') { 'REMOVED' } elseif ($said -ceq '<ABSENT>') { 'ABSENT' } else { 'UNKNOWN' }); $err = $r.error
+    } else {
+        $w = Write-VenueJobLiveness -AgentShare $Liveness.share -JobId $Liveness.jobId -AliveUntilUtc ([DateTime]::UtcNow) -Seq ([long]$s.seq + 1)
+        $end = $(if ($w.state -ceq 'WRITTEN') { 'LAPSED' } else { 'UNKNOWN' }); $err = $w.error
+    }
+    $out = [pscustomobject]@{ end = $end; writes = $s.writes; writeFailures = $s.writeFailures; lastSeq = $s.seq; lastAliveUntilUtc = $s.aliveUntilUtc; stoppedInTime = $inTime; error = $err }
+    $Liveness | Add-Member -NotePropertyName stopped -NotePropertyValue $out -Force
+    $out
+}
+
 function Read-VenueLeaseBatchReceipt {
     <#
     .SYNOPSIS
@@ -856,4 +1033,5 @@ Export-ModuleMember -Function Get-VenueDriverScriptMissing, Get-VenueMainRoot, G
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait,
+    Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Start-VenueJobLiveness, Stop-VenueJobLiveness
