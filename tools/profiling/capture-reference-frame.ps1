@@ -29,6 +29,21 @@
     NEVER screen-capture the bench: this uses the app's OWN --screenshot-output, because the
     bench is a machine its owner uses interactively and a desktop grab captures their screen,
     not the application. (Rule earned the hard way, 2026-09-03.)
+
+    EXIT CODES (REFERENCE-FRAME-EXIT-CODE-DISAMBIGUATE-1: one code per cause; all below 100, the venue job passes them through as captureExitCode).
+      0   a candidate (the app's receipt proved the footage and a frame was written)
+      3   CANNOT-DETERMINE: -Exe or -Clip is missing
+      4   process-never-started: Start-Process returned no process object. Kept for exactly this cause so receipts written before this card keep their meaning
+      5   no frame written
+      6   degenerate grab (under 51200 bytes)
+      17  HUB_VM_LOCAL_PLAYBACK_REFUSED
+      41  CLIP_TOO_SHORT / PLAY_WINDOW_TOO_SHORT        42  CLIP_LENGTH_UNKNOWN
+      43  INVALID: the receipt oracle refused the run, or a stale receipt could not be set aside
+      44  inherited MLVAPP_AUTOPLAY_* refused
+      45  exit-code-lost: the process ran but its exit code could not be read
+      46  PINNED_FRAME_NOT_PRESENTED: the app exited 11 (exact presented-frame target not met) and wrote no frame
+      47  exe exited N: the app exited non-zero for any other reason (N and its typed reason are in the CAPTURE: FAILED line)
+    The venue job's own codes (70 no exit code, 199 fold, 2xx steps) are never reused here.
 #>
 [CmdletBinding()]
 param(
@@ -181,7 +196,8 @@ if (-not $proc.WaitForExit($captureBudgetMs)) {
 }
 $captureExitCode = if ($captureKilled) { $null } else { $proc.ExitCode }
 if (-not $captureKilled -and $null -eq $captureExitCode) {
-    Write-Output "CAPTURE: FAILED - process-never-started ($Exe)"; exit 4
+    # The process RAN (it was started and waited for) and its exit code was lost: not "never started", so not exit 4.
+    Write-Output "CAPTURE: FAILED - exit-code-lost ($Exe); the process ran but its exit code could not be read"; exit 45
 }
 if (-not $captureKilled -and $captureExitCode -ne 0) {
     $captureStderr = Get-Content -LiteralPath (Join-Path $OutDir 'capture.err.txt') -Raw -ErrorAction SilentlyContinue
@@ -189,10 +205,10 @@ if (-not $captureKilled -and $captureExitCode -ne 0) {
     # not met). It writes no frame, so it is a typed failure of its own -- never a candidate, never the generic `(NONE)`.
     if ($captureExitCode -eq 11 -and ([string]$captureStderr) -match 'presented-frame target was not met; target=(\d+) observed=(\d+)') {
         Write-Output ("CAPTURE: FAILED - PINNED_FRAME_NOT_PRESENTED (target={0} observed={1}); exe exited 11 and wrote no frame" -f $Matches[1], $Matches[2])
-        exit 4
+        exit 46
     }
     Write-Output ("CAPTURE: FAILED - exe exited {0} ({1})" -f $captureExitCode, (Get-GuiSmokeRefusalReason -ExitCode $captureExitCode -Message ([string]$captureStderr)))
-    exit 4
+    exit 47
 }
 # The receipt oracle (gui-smoke-length-gate.ps1): the app's playback_smoke.summary must show that the engine consumed
 # the source frames of the window at native pace (a binary that predates ENFORCE-3 writes no source_advanced and fails).

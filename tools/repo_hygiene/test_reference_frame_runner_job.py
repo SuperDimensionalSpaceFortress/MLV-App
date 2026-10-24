@@ -1053,7 +1053,7 @@ class CaptureScriptPinnedWindowTests(oracle_tests._LauncherCase):
         """Failure shape 2, as far as the tool can see it: the app exits 11 (`exact presented-frame target was not met`) and writes no frame."""
         stderr = "[GUI-SMOKE] ERROR: exact presented-frame target was not met; target=480 observed=418."
         proc, _ = self.run_capture(None, "-Seconds", "30", exit_code=11, stderr_text=stderr)
-        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, PINNED_FRAME_NOT_PRESENTED_EXIT, proc.stdout + proc.stderr)
         self.assertIn("PINNED_FRAME_NOT_PRESENTED", proc.stdout)
         self.assertIn("target=480", proc.stdout)
         self.assertIn("observed=418", proc.stdout)
@@ -1062,9 +1062,90 @@ class CaptureScriptPinnedWindowTests(oracle_tests._LauncherCase):
 
     def test_any_other_app_failure_keeps_its_own_reason(self) -> None:
         proc, _ = self.run_capture(None, "-Seconds", "30", exit_code=7, stderr_text="[GUI-SMOKE] ERROR: Play action did not enter checked state.")
-        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, APP_EXITED_NONZERO_EXIT, proc.stdout + proc.stderr)
         self.assertNotIn("PINNED_FRAME_NOT_PRESENTED", proc.stdout)
         self.assertIn("exe exited 7", proc.stdout)
+
+    def test_the_two_app_failures_exit_with_different_codes_and_neither_is_the_never_started_code(self) -> None:
+        """REFERENCE-FRAME-EXIT-CODE-DISAMBIGUATE-1: executed, not read -- result.json captureExitCode tells these apart."""
+        pinned, _ = self.run_capture(None, "-Seconds", "30", exit_code=11,
+                                     stderr_text="[GUI-SMOKE] ERROR: exact presented-frame target was not met; target=480 observed=418.")
+        other, _ = self.run_capture(None, "-Seconds", "30", exit_code=7, stderr_text="[GUI-SMOKE] ERROR: Play action did not enter checked state.")
+        self.assertEqual(len({pinned.returncode, other.returncode, NEVER_STARTED_EXIT}), 3, (pinned.returncode, other.returncode))
+
+
+# REFERENCE-FRAME-EXIT-CODE-DISAMBIGUATE-1: capture-reference-frame.ps1 used exit 4 for four causes. One code per cause now; 4 stays the true
+# never-started case so receipts written before this card keep their meaning. All below 100 (the venue job's header: "all below 100"), and
+# clear of every code the script, the gui-smoke helpers and the job already use.
+NEVER_STARTED_EXIT = 4
+EXIT_CODE_LOST_EXIT = 45
+PINNED_FRAME_NOT_PRESENTED_EXIT = 46
+APP_EXITED_NONZERO_EXIT = 47
+# 3 CANNOT-DETERMINE, 5 no frame, 6 degenerate grab, 17 hub VM refused, 41 CLIP_TOO_SHORT / PLAY_WINDOW_TOO_SHORT, 42 CLIP_LENGTH_UNKNOWN,
+# 43 INVALID, 44 inherited autoplay; the job's own 70 (no exit code) and 199 (fold of a code outside 1-199).
+RESERVED_CAPTURE_EXITS = frozenset({0, 3, 5, 6, 17, 41, 42, 43, 44, 70, 199})
+
+
+class CaptureScriptFailureCodeTests(unittest.TestCase):
+    """The four causes that shared `exit 4`, read from the script's own text (no pwsh, no app)."""
+
+    CAUSES = {
+        "never-started": ("process-never-started", NEVER_STARTED_EXIT),
+        "exit-code-lost": ("exit-code-lost", EXIT_CODE_LOST_EXIT),
+        "pinned-frame-not-presented": ("PINNED_FRAME_NOT_PRESENTED", PINNED_FRAME_NOT_PRESENTED_EXIT),
+        "app-exited-nonzero": ("exe exited", APP_EXITED_NONZERO_EXIT),
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.text = CAPTURE.read_text(encoding="utf-8")
+        cls.header = cls.text.split("[CmdletBinding()]", 1)[0]
+
+    def exit_after(self, token: str) -> int:
+        """The first `exit N` that follows the failure line carrying `token` (a literal number, never an expression)."""
+        start = self.text.find(f"CAPTURE: FAILED - {token}")
+        self.assertGreaterEqual(start, 0, f"no `CAPTURE: FAILED - {token}` line in the script")
+        match = re.search(r"\bexit (\d+)\b", self.text[start:])
+        self.assertIsNotNone(match, token)
+        return int(match.group(1))
+
+    def test_each_failure_cause_has_a_code_of_its_own(self) -> None:
+        codes = {name: self.exit_after(token) for name, (token, _) in self.CAUSES.items()}
+        self.assertEqual(len(set(codes.values())), len(codes), f"two causes share a code: {codes}")
+
+    def test_the_codes_are_the_documented_ones_and_four_stays_the_never_started_case(self) -> None:
+        for name, (token, expected) in self.CAUSES.items():
+            with self.subTest(name):
+                self.assertEqual(self.exit_after(token), expected)
+
+    def test_no_new_code_collides_with_a_code_the_capture_or_the_job_already_uses(self) -> None:
+        for name, (_, code) in self.CAUSES.items():
+            if name == "never-started":
+                continue
+            with self.subTest(name):
+                self.assertNotIn(code, RESERVED_CAPTURE_EXITS)
+                self.assertTrue(1 <= code < 100, "the venue job's header promises every capture code is below 100")
+        # the reserved set is not stale: each of its script-level members is still a literal exit in the script or its gate helper
+        helper = (CAPTURE.parent / "gui-smoke-length-gate.ps1").read_text(encoding="utf-8")
+        for code in (3, 5, 6, 17, 44):
+            self.assertRegex(self.text, rf"\bexit {code}\b")
+        for code in (41, 42, 43):
+            self.assertRegex(helper, rf"return {code}\b|exitCode = {code}\b")
+
+    def test_the_header_names_every_code_beside_the_existing_ones(self) -> None:
+        for name, (token, code) in self.CAUSES.items():
+            with self.subTest(name):
+                self.assertRegex(self.header, rf"\b{code}\b[^\n]*{re.escape(token)}|{re.escape(token)}[^\n]*\b{code}\b")
+        for code in (3, 5, 6, 17, 41, 42, 43, 44):
+            with self.subTest(existing=code):
+                self.assertRegex(self.header, rf"\b{code}\b")
+
+    def test_the_runner_job_still_passes_every_capture_code_through(self) -> None:
+        """The job does not branch on the value, so it needs no change: the raw code is the job's exit and captureExitCode."""
+        job = GENERATOR.read_text(encoding="utf-8")
+        self.assertIn("$captureExitCode = $captureRc", job)
+        self.assertIn("if ($captureRc -ne 0 -and ($captureRc -lt 1 -or $captureRc -gt 199)) { $captureRc = 199 }", job)
+        self.assertIn("RESULT=REFERENCE_FRAME_CAPTURE_FAILED EXIT=$captureRc CAPTURE_EXIT=$captureExitCode", job)
 
 
 # HUB-VM-NO-LOCAL-PLAYBACK-1: CaptureScriptGateProfileArgumentTests runs the real capture script against a stand-in exe that is never launched.
