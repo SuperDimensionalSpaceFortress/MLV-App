@@ -193,6 +193,7 @@ public:
             const QByteArray line = partial_.left(newline).trimmed();
             partial_.remove(0, newline + 1);
             if (line.startsWith("avx_parity_helper t=")) {
+                seen_ = true;
                 last_line_ = line.left(kMaxLineBytes);
                 last_ms_ = now_ms;
                 saw_stage = true;
@@ -205,28 +206,33 @@ public:
         return saw_stage;
     }
 
+    bool seen() const { return seen_; }
     const QByteArray & last_line() const { return last_line_; }
     qint64 last_ms() const { return last_ms_; }
 
 private:
     static const qsizetype kMaxLineBytes = 1024;
     QByteArray partial_;
+    bool seen_ = false;
     QByteArray last_line_;
-    qint64 last_ms_ = -1;
+    qint64 last_ms_ = 0;
 };
 
-// A child's CPU time and thread count as seen from the parent (-1 where unknown or not Windows).
-// Two CPU samples tell a spinning child (time grows) from a blocked one (time stands still).
+// A child's CPU time and thread count as seen from the parent (known only on Windows, and only when
+// the child could still be opened). Two CPU samples tell a spinning child (time grows) from a
+// blocked one (time stands still).
 struct ChildSample {
-    qint64 cpu_ms = -1;
-    int threads = -1;
+    bool has_cpu = false;
+    qint64 cpu_ms = 0;
+    bool has_threads = false;
+    int threads = 0;
 };
 
 static ChildSample sample_child(qint64 pid)
 {
     ChildSample sample;
 #ifdef Q_OS_WIN
-    if (pid <= 0) {
+    if (pid == 0) {
         return sample;
     }
     const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
@@ -236,6 +242,7 @@ static ChildSample sample_child(qint64 pid)
             const auto as_u64 = [](const FILETIME & time) {
                 return (static_cast<quint64>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
             };
+            sample.has_cpu = true;
             sample.cpu_ms = static_cast<qint64>((as_u64(kernel) + as_u64(user)) / 10000u);
         }
         CloseHandle(process);
@@ -246,6 +253,7 @@ static ChildSample sample_child(qint64 pid)
         entry.dwSize = sizeof(entry);
         for (BOOL more = Process32FirstW(snapshot, &entry); more; more = Process32NextW(snapshot, &entry)) {
             if (entry.th32ProcessID == static_cast<DWORD>(pid)) {
+                sample.has_threads = true;
                 sample.threads = static_cast<int>(entry.cntThreads);
                 break;
             }
@@ -268,12 +276,14 @@ struct ProcessRunResult {
     qint64 output_total_bytes = 0;
     QString error_string;
     // On the run clock: when the last output arrived and when the last helper stage line arrived
-    // (-1 if none), and the stage line itself.
-    qint64 last_output_ms = -1;
-    qint64 last_stage_ms = -1;
+    // (each only if one did), and the stage line itself.
+    bool saw_output = false;
+    qint64 last_output_ms = 0;
+    bool saw_stage = false;
+    qint64 last_stage_ms = 0;
     QByteArray last_stage_line;
     // Recorded at the moment the bound expired, before the kill.
-    qint64 killed_at_ms = -1;
+    qint64 killed_at_ms = 0;
     bool output_channel_open = false;  // the merged stdout+stderr pipe
     ChildSample child_at_kill;
     ChildSample child_at_last_stage;
@@ -317,6 +327,7 @@ static ProcessRunResult run_process_bounded(const QString & program,
             return;
         }
         output.append(chunk);
+        result.saw_output = true;
         result.last_output_ms = timer.elapsed();
         if (stages.append(chunk, result.last_output_ms)) {
             result.child_at_last_stage = sample_child(pid);
@@ -338,6 +349,7 @@ static ProcessRunResult run_process_bounded(const QString & program,
         }
     }
     drain();
+    result.saw_stage = stages.seen();
     result.last_stage_line = stages.last_line();
     result.last_stage_ms = stages.last_ms();
     result.output = output.bytes();
@@ -413,25 +425,22 @@ static QString describe_process_failure(const QString & label,
     if (result.timed_out) {
         // What the parent saw just before the kill: how long the child had been silent, the last stage
         // it named, whether its output pipe was still open, and its CPU time (growing = spin).
-        const auto seconds_since = [&result](qint64 at_ms) {
-            return at_ms < 0 ? QStringLiteral("none")
-                             : QString::number((result.killed_at_ms - at_ms) / 1000.0, 'f', 1);
+        const auto seconds_since = [&result](bool seen, qint64 at_ms) {
+            return seen ? QString::number((result.killed_at_ms - at_ms) / 1000.0, 'f', 1) : QStringLiteral("none");
         };
-        const auto cpu_seconds = [](qint64 cpu_ms) {
-            return cpu_ms < 0 ? QStringLiteral("unknown") : QString::number(cpu_ms / 1000.0, 'f', 1);
-        };
-        const bool have_cpu_delta = result.child_at_kill.cpu_ms >= 0 && result.child_at_last_stage.cpu_ms >= 0;
+        const ChildSample & at_kill = result.child_at_kill;
+        const ChildSample & at_stage = result.child_at_last_stage;
         text += QStringLiteral("\nAVX_PARITY_HELPER_TIMEOUT_SNAPSHOT since_last_output_s=%1 since_last_stage_s=%2"
                                " merged_output_channel=%3 child_threads=%4 child_cpu_s=%5 child_cpu_since_last_stage_s=%6"
                                " last_stage=\"%7\"")
-                    .arg(seconds_since(result.last_output_ms),
-                         seconds_since(result.last_stage_ms),
+                    .arg(seconds_since(result.saw_output, result.last_output_ms),
+                         seconds_since(result.saw_stage, result.last_stage_ms),
                          result.output_channel_open ? QStringLiteral("open") : QStringLiteral("closed"),
-                         result.child_at_kill.threads < 0 ? QStringLiteral("unknown")
-                                                          : QString::number(result.child_at_kill.threads),
-                         cpu_seconds(result.child_at_kill.cpu_ms),
-                         have_cpu_delta ? cpu_seconds(result.child_at_kill.cpu_ms - result.child_at_last_stage.cpu_ms)
-                                        : QStringLiteral("unknown"),
+                         at_kill.has_threads ? QString::number(at_kill.threads) : QStringLiteral("unknown"),
+                         at_kill.has_cpu ? QString::number(at_kill.cpu_ms / 1000.0, 'f', 1) : QStringLiteral("unknown"),
+                         at_kill.has_cpu && at_stage.has_cpu
+                             ? QString::number((at_kill.cpu_ms - at_stage.cpu_ms) / 1000.0, 'f', 1)
+                             : QStringLiteral("unknown"),
                          QString::fromLocal8Bit(result.last_stage_line));
         tail_bytes = kTimeoutOutputTailBytes;
     }
@@ -894,16 +903,18 @@ TEST(AvxParityRunner, TimeoutSnapshotNamesTheLastStageAndHowLongTheChildWasSilen
                                                         8000);
     ASSERT_TRUE(result.timed_out);
     ASSERT_TRUE(result.last_stage_line == QByteArray("avx_parity_helper t=1ms stage=open-clip stand-in"));
-    ASSERT_TRUE(result.last_stage_ms >= 0);
+    ASSERT_TRUE(result.saw_stage);
+    ASSERT_TRUE(result.saw_output);
     ASSERT_TRUE(result.last_output_ms >= result.last_stage_ms);
     // The child printed its stage line, then nothing, and the parent measured the silence.
     ASSERT_TRUE(result.killed_at_ms - result.last_stage_ms >= 1000);
     // The child was alive with its pipe open when it was killed: a hang, not a lost line.
     ASSERT_TRUE(result.output_channel_open);
 #ifdef Q_OS_WIN
+    ASSERT_TRUE(result.child_at_kill.has_threads);
     ASSERT_TRUE(result.child_at_kill.threads > 0);
-    ASSERT_TRUE(result.child_at_kill.cpu_ms >= 0);
-    ASSERT_TRUE(result.child_at_last_stage.cpu_ms >= 0);
+    ASSERT_TRUE(result.child_at_kill.has_cpu);
+    ASSERT_TRUE(result.child_at_last_stage.has_cpu);
 #endif
 
     const QString text = describe_process_failure(QStringLiteral("avx"),
