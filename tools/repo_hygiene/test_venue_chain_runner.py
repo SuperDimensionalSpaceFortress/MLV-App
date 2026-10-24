@@ -1466,7 +1466,8 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         # collected (6>&1 into the submit's records, to measure the drop) instead of discarded (6>$null); either way it is never written out.
         fn = text[text.index("function Submit-VenueJob("):text.index("function Write-NotAfterVerdict(")]
         self.assertIn("6>&1 |", fn)
-        self.assertIn("ForEach-Object { $records.Add($_) }", fn)
+        # (r2: only um-run's 'submitted' and 'job not-after:' records are kept, every output object still is)
+        self.assertIn("$records.Add($_)", fn)
         self.assertNotRegex(fn, r"Write-(Host|Output|Information)\b", "the collected records are never written out")
 
     def test_a_real_leg_killed_at_the_chain_timeout_leaves_its_printed_id_to_reconcile_not_unknown(self) -> None:

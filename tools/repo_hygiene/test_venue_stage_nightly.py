@@ -118,12 +118,26 @@ exit 0
 
 # um-run.ps1 stand-in: the agent is simulated in-process. A JobId whose outbox result exists is refused exactly as UmRunDrop refuses it (UMRUN_JOBID_IN_USE).
 # FAKE_UMRUN_<DLLPAIR|STAGE|SMOKE>: ok (default) | unresolved | retracted | fail | wrongcache (stage only: STAGE_OK, but the cache keeps other bytes) | inuse | inuse-all.
-# The line also records the other two waits, the -NotAfterUtc it was handed (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1; empty = none) and when it was called.
+# The line also records the other two waits, the notAfterUtc the drop would write (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1; empty = none) and when it was
+# called. LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r2: for the drop-relative form it computes that value the way UmRunDrop.psm1 does, min(now + budget,
+# cap), refusing a passed cap (UMRUN_NOT_AFTER_CAP_PASSED, also forced by FAKE_UMRUN_<kind>=cappassed), and records the budget and cap it was handed.
 FAKE_UMRUN = r"""
 [CmdletBinding()] param([string]$ScriptPath, [string[]]$SideFile = @(), [string]$JobId = '', [string]$AgentShare = '', [int]$TimeoutSec = 0,
-    [int]$MaxQueueWaitSec = 0, [int]$MaxClaimedWaitSec = 0, [int]$MaxAdmissionWaitSec = 0, [string]$NotAfterUtc = '')
+    [int]$MaxQueueWaitSec = 0, [int]$MaxClaimedWaitSec = 0, [int]$MaxAdmissionWaitSec = 0, [string]$NotAfterUtc = '', [int]$NotAfterBudgetSec = 0,
+    [string]$NotAfterCapUtc = '')
 $sides = @($SideFile | ForEach-Object { ([string]$_) -split ';' } | Where-Object { $_ })
-Add-Content -LiteralPath $env:FAKE_CALLS -Value "UMRUN job=$JobId share=$AgentShare script=$ScriptPath side=$($sides -join ';') timeout=$TimeoutSec queue=$MaxQueueWaitSec admission=$MaxAdmissionWaitSec claimed=$MaxClaimedWaitSec notAfter=$NotAfterUtc called=$([DateTime]::UtcNow.ToString('o'))"
+$calledAt = [DateTime]::UtcNow
+$na = $NotAfterUtc
+if ($NotAfterBudgetSec -gt 0) {
+    $naDt = $calledAt.AddSeconds($NotAfterBudgetSec)
+    if ($NotAfterCapUtc) {
+        $capDt = [DateTime]::Parse($NotAfterCapUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        if ($capDt -le $calledAt) { throw "UMRUN_NOT_AFTER_CAP_PASSED -NotAfterCapUtc '$NotAfterCapUtc' is not later than now; nothing was placed" }
+        if ($capDt -lt $naDt) { $naDt = $capDt }
+    }
+    $na = $naDt.ToString('o')
+}
+Add-Content -LiteralPath $env:FAKE_CALLS -Value "UMRUN job=$JobId share=$AgentShare script=$ScriptPath side=$($sides -join ';') timeout=$TimeoutSec queue=$MaxQueueWaitSec admission=$MaxAdmissionWaitSec claimed=$MaxClaimedWaitSec notAfter=$na budget=$NotAfterBudgetSec cap=$NotAfterCapUtc called=$($calledAt.ToString('o'))"
 $outbox = Join-Path $AgentShare 'outbox'; $cache = Join-Path $AgentShare 'cache'
 New-Item -ItemType Directory -Force -Path $outbox, $cache | Out-Null
 $res = Join-Path $outbox "$JobId.result.json"
@@ -140,6 +154,7 @@ if ($mode -eq 'inuse-all' -or ($mode -eq 'inuse' -and $JobId -notmatch '-n\d{12}
 $sha = $env:FAKE_SHA
 if ($mode -eq 'unresolved') { throw "UNRESOLVED: $JobId was claimed by the agent, but it stopped proving liveness (fixture) -- this client is stopping, not failing" }
 if ($mode -eq 'retracted') { throw "RETRACTED: $JobId reached its queue wait ceiling (fixture); not a failure, retry with a new -JobId if desired" }
+if ($mode -eq 'cappassed') { throw "UMRUN_NOT_AFTER_CAP_PASSED -NotAfterCapUtc '$NotAfterCapUtc' is not later than now (fixture); nothing was placed" }
 $code = 0
 if ($mode -eq 'fail') { $code = 5; $out = 'RESULT=STAGE_FAILED STEP=fixture EXIT=5' }
 elseif ($kind -eq 'DLLPAIR') {
@@ -421,13 +436,17 @@ class VenueStageNightlyTests(unittest.TestCase):
 
         seen = {}
         for c in self.submissions():
-            m = re.search(r" job=(\S+) .* timeout=(\d+) queue=(\d+) admission=(\d+) claimed=(\d+) notAfter=(\S*) called=(\S+)$", c)
+            m = re.search(r" job=(\S+) .* timeout=(\d+) queue=(\d+) admission=(\d+) claimed=(\d+) notAfter=(\S*) budget=(\d+) cap=(\S*) called=(\S+)$", c)
             self.assertIsNotNone(m, c)
-            seen[m.group(1)] = (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), m.group(6), parse_o(m.group(7)))
+            seen[m.group(1)] = (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), m.group(6), int(m.group(7)), m.group(8), parse_o(m.group(9)))
         stage = seen[f"playback-attr-3-cuda-stage-{S12}"]
-        timeout, queue, admission, claimed, not_after, called = stage
-        self.assertRegex(not_after, o_utc, "the stage submit passes -NotAfterUtc in UTC 'o' form")
+        timeout, queue, admission, claimed, not_after, budget, cap, called = stage
+        # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r2: the bound is handed DROP-RELATIVE (-NotAfterBudgetSec), capped by the deadline (-NotAfterCapUtc)
+        self.assertRegex(cap, o_utc, "the stage submit passes its deadline as -NotAfterCapUtc in UTC 'o' form")
+        self.assertGreaterEqual(budget, timeout + queue + admission + claimed, "the budget is every wait it passes (plus the slack)")
+        self.assertRegex(not_after, o_utc, "the drop writes notAfterUtc in UTC 'o' form")
         na = parse_o(not_after)
+        self.assertEqual(na, parse_o(cap), "the waits outlast the deadline, so the drop writes the deadline: um-run is killed there")
         self.assertGreater(na, called)
         for w in (timeout, queue, admission, claimed):
             self.assertGreaterEqual(na, called + timedelta(seconds=w) - timedelta(seconds=1), f"never earlier than the {w} s wait it passes")
@@ -436,7 +455,8 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertLessEqual(na, t1 + timedelta(seconds=600))
         self.assertLessEqual(abs((na - called).total_seconds() - queue), 1.5, "notAfter is the remaining budget the queue wait is also given")
         for jid in (f"playback-attr-3-cuda-dllpair-{S12}", f"attr3-stage-smoke-runner-{S12}-bbbbbbbbbbbb"):
-            self.assertEqual(seen[jid][4], "", f"{jid} is harvested by name by a later call that cannot re-submit it: no notAfter")
+            self.assertEqual((seen[jid][4], seen[jid][5], seen[jid][6]), ("", 0, ""),
+                             f"{jid} is harvested by name by a later call that cannot re-submit it: no notAfter in either form")
 
     def test_a_scheduling_delay_before_the_bound_never_lets_it_pass_the_deadline(self) -> None:
         # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 (CoS Dot 07bd1383 (b)): the driver samples what is left of its deadline, then computes the bound.
@@ -454,14 +474,17 @@ class VenueStageNightlyTests(unittest.TestCase):
         stage_id = f"playback-attr-3-cuda-stage-{S12}"
         said = [l for l in p.stdout.splitlines() if f" submit stage {stage_id} " in l]
         self.assertEqual(len(said), 1, p.stdout)
-        m = re.search(rf" notAfterUtc=({o_utc}) \(caller-deadline\) deadline=({o_utc})$", said[0])
+        # r2: the driver says the drop-relative form it hands um-run: drop + budget, capped at the deadline
+        m = re.search(rf" notAfter=drop\+(\d+)s cap=({o_utc}) \(caller-deadline\) deadline=({o_utc})$", said[0])
         self.assertIsNotNone(m, said[0])
-        na, deadline = parse_o(m.group(1)), parse_o(m.group(2))
-        self.assertLessEqual(na, deadline, "never later than the driver's own deadline")
-        self.assertEqual(na, deadline, "the deadline itself: um-run is killed there")
+        cap, deadline = parse_o(m.group(2)), parse_o(m.group(3))
+        self.assertEqual(cap, deadline, "the cap is the ORIGINAL deadline")
         handed = [c for c in self.submissions() if f" job={stage_id} " in c]
         self.assertEqual(len(handed), 1)
-        self.assertIn(f" notAfter={m.group(1)} ", handed[0], "um-run is handed exactly that bound")
+        self.assertIn(f" budget={m.group(1)} cap={m.group(2)} ", handed[0], "um-run is handed exactly that budget and cap")
+        na = parse_o(re.search(rf" notAfter=({o_utc}) ", handed[0]).group(1))
+        self.assertLessEqual(na, deadline, "never later than the driver's own deadline")
+        self.assertEqual(na, deadline, "the deadline itself: um-run is killed there")
         # the delay really sat between the sample and um-run: the queue wait is floor(deadline - sample) and um-run was called at least 2.5 s after the
         # sample, so the queue wait outlasts what was left at the call by more than 1.5 s (the old bound, sample + later now, lands past the deadline)
         called = parse_o(re.search(rf" called=({o_utc})$", handed[0]).group(1))
@@ -475,9 +498,20 @@ class VenueStageNightlyTests(unittest.TestCase):
         self.assertIn("-CallerCapSec $remain", fn)
         # the bound is the ORIGINAL absolute deadline (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1), not the sampled remaining counted from a later now
         self.assertIn("-CallerDeadlineUtc $script:Deadline", fn)
+        # r2: handed drop-relative (budget and cap from the helper), the absolute form only when the helper gives no budget
+        self.assertIn("-NotAfterBudgetSec $($notAfter.budgetSec)", fn)
+        self.assertIn("' -NotAfterCapUtc ' + (& $lit $notAfter.capUtc)", fn)
         self.assertIn("-NotAfterUtc", fn)
         self.assertEqual(len(re.findall(r"Invoke-UmRun '(?:dllpair|smoke-runner)' .*-LaterHarvest", text)), 2, "the two harvested submits say so")
         self.assertEqual(len(re.findall(r"Invoke-UmRun 'stage' .*-LaterHarvest", text)), 0)
+
+    def test_a_cap_the_drop_finds_passed_is_a_typed_cap_exit(self) -> None:
+        # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r2: the drop refuses a -NotAfterCapUtc (the deadline) that passed before its claim, before any share
+        # write. The driver maps that to STAGE_CAP_EXCEEDED, never the step's generic failure.
+        p = self.run_driver(env={"FAKE_UMRUN_STAGE": "cappassed"})
+        self.assert_exit(p, "STAGE_CAP_EXCEEDED")
+        self.assertIn("deadline passed before the drop; nothing was submitted", p.stdout + p.stderr)
+        self.assertIn("UMRUN_NOT_AFTER_CAP_PASSED", p.stdout + p.stderr)
 
     # ---------------------------------------------------------------- the owner-footage gate: side files are the build package, never anything else
     def test_side_files_are_only_this_shas_build_package_under_the_build_root(self) -> None:

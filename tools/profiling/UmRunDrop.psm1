@@ -37,6 +37,10 @@
 #     same source path, so a swap in THAT gap was never caught either).
 #   - LEASE-REQUEST-CHILD-NOT-AFTER-1: -NotAfterUtc, when given, is checked before the share is touched and written to the
 #     claim as notAfterUtc ('o' form, Z), the agent's absolute deadline for the job; absent, the claim's bytes are unchanged.
+#   - LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: -NotAfterBudgetSec (with an optional -NotAfterCapUtc) is the same field in a
+#     RELATIVE form: notAfterUtc = min(UtcNow sampled immediately before the claim is written + budget, cap), so a slow setup or
+#     share before the drop can never leave the bound short of the waits that follow it. A cap already passed refuses before the
+#     share is touched; passing both forms is UMRUN_NOT_AFTER_CONFLICT.
 #
 # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 10 (hub scope ruling reversed: sol proved BOTH round-9
 # premises false -- see summary.md). OWNERSHIP OF A JobId IS NOW CLAIMED ATOMICALLY, BY
@@ -606,7 +610,18 @@ function Invoke-UmRunDrop {
         # with an explicit Z or +hh:mm offset, later than now; '' (the default) writes no field, so
         # the claim's bytes are exactly what they were without it.
         [string]$NotAfterUtc = '',
-        [scriptblock]$Copier = { param($Source, $Destination) Copy-Item -LiteralPath $Source -Destination $Destination },
+        # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: the same notAfterUtc, RELATIVE to the drop. When given (1..604800), the
+        # value written is min(<UtcNow sampled immediately before the claim is written> + this many seconds, -NotAfterCapUtc), so
+        # it counts from when the job reaches the share, not from when the caller computed it. The budget counts from the claim,
+        # which is written first: side-files placed after it are inside the budget. 0 (the default) means not given.
+        [int]$NotAfterBudgetSec = 0,
+        # The upper bound for -NotAfterBudgetSec (a caller that kills its client at an absolute instant): the same ISO-8601 rules
+        # as -NotAfterUtc. Already passed -> UMRUN_NOT_AFTER_CAP_PASSED before the share is touched. Needs -NotAfterBudgetSec.
+        [string]$NotAfterCapUtc = '',
+        # Test-only: returns the current UTC instant ([DateTimeOffset] or [DateTime]) for the -NotAfterBudgetSec form, so a test
+        # can place the drop at a chosen instant. Production never passes it (the wall clock). The -NotAfterUtc form ignores it.
+        [scriptblock]$TestUtcNow = $null,
+        [scriptblock]$Copier ={ param($Source, $Destination) Copy-Item -LiteralPath $Source -Destination $Destination },
         [scriptblock]$PostAdmissionHook = { param($Source) },
         [scriptblock]$PreRenameRaceHook = { param($PartPath) },
         # Test-only: invoked with no arguments immediately before the job's own rename into view,
@@ -647,6 +662,33 @@ function Invoke-UmRunDrop {
         # A string, never a DateTime, so ConvertTo-Json writes it exactly as here.
         $notAfterText = $notAfterDto.UtcDateTime.ToString('o')
     }
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: the relative form is validated here too, before the share is touched; its
+    # value is computed at the claim below. A cap that passes between here and the claim is refused there, before any write.
+    if ($NotAfterUtc -and ($NotAfterBudgetSec -ne 0 -or $NotAfterCapUtc)) {
+        throw "UMRUN_NOT_AFTER_CONFLICT -NotAfterUtc and -NotAfterBudgetSec/-NotAfterCapUtc are two forms of the same notAfterUtc; pass one"
+    }
+    if ($NotAfterCapUtc -and $NotAfterBudgetSec -eq 0) {
+        throw "UMRUN_NOT_AFTER_INVALID -NotAfterCapUtc '$NotAfterCapUtc' caps a -NotAfterBudgetSec bound and needs one"
+    }
+    if ($NotAfterBudgetSec -ne 0 -and ($NotAfterBudgetSec -lt 1 -or $NotAfterBudgetSec -gt 604800)) {
+        throw "UMRUN_NOT_AFTER_INVALID -NotAfterBudgetSec $NotAfterBudgetSec is outside 1..604800"
+    }
+    $utcNow = { $(if ($TestUtcNow) { [DateTimeOffset](& $TestUtcNow) } else { [DateTimeOffset]::UtcNow }) }
+    $notAfterCapDto = $null
+    if ($NotAfterCapUtc) {
+        $capDto = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse($NotAfterCapUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$capDto)) {
+            throw "UMRUN_NOT_AFTER_INVALID -NotAfterCapUtc '$NotAfterCapUtc' does not parse as an ISO-8601 date and time"
+        }
+        if ($NotAfterCapUtc -notmatch '(Z|[+-]\d{2}:\d{2})$') {
+            throw "UMRUN_NOT_AFTER_INVALID -NotAfterCapUtc '$NotAfterCapUtc' has no Z or +hh:mm offset (an offset-less time is ambiguous local time)"
+        }
+        $capNow = & $utcNow
+        if ($capDto -le $capNow) {
+            throw "UMRUN_NOT_AFTER_CAP_PASSED -NotAfterCapUtc '$NotAfterCapUtc' is not later than now ($($capNow.UtcDateTime.ToString('o'))); nothing was placed"
+        }
+        $notAfterCapDto = $capDto
+    }
     $id = if ($JobId) { $JobId } else { "job_{0}_{1}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'), ([guid]::NewGuid().ToString('N').Substring(0, 8)) }
     # Fast pre-checks, not the actual protection (the claim's own atomic rename below is): cheap,
     # so still worth failing fast on, but racy on their own (TOCTOU) -- a caller relies on the claim
@@ -677,6 +719,19 @@ function Invoke-UmRunDrop {
     # requested -- omitted otherwise, which both the tracked and deployed agents already treat as
     # "fall back to my own default" (confirmed against the deployed agent; see summary.md).
     $metaTmp = Join-Path $Inbox "$id.$nonce.meta.tmp"
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: the relative form's clock is read HERE, immediately before the claim is
+    # written and made visible, so however long the caller's setup or this function's pre-checks took, the budget counts from
+    # the drop. The cap only ever lowers it; a cap that passed since the check above refuses now, before any share write.
+    $notAfterSampled = $null
+    if ($NotAfterBudgetSec -ne 0) {
+        $notAfterSampled = & $utcNow
+        $relDto = $notAfterSampled.AddSeconds($NotAfterBudgetSec)
+        if ($null -ne $notAfterCapDto -and $notAfterCapDto -lt $relDto) { $relDto = $notAfterCapDto }
+        if ($relDto -le $notAfterSampled) {
+            throw "UMRUN_NOT_AFTER_CAP_PASSED -NotAfterCapUtc '$NotAfterCapUtc' is not later than now ($($notAfterSampled.UtcDateTime.ToString('o'))); nothing was placed"
+        }
+        $notAfterText = $relDto.UtcDateTime.ToString('o')
+    }
     $metaObj = [ordered]@{ jobId = $id; nonce = $nonce }
     if ($JobTimeoutSec -ne 0) { $metaObj['timeoutSec'] = $JobTimeoutSec }
     if ($null -ne $notAfterText) { $metaObj['notAfterUtc'] = $notAfterText }
@@ -704,7 +759,10 @@ function Invoke-UmRunDrop {
     } else {
         Write-Output ("job claimed: {0}.meta.json (no budget requested)" -f $id)
     }
-    if ($null -ne $notAfterText) { Write-Output ("job not-after: {0}.meta.json notAfterUtc={1}" -f $id, $notAfterText) }
+    if ($null -ne $notAfterSampled) {
+        Write-Output ("job not-after: {0}.meta.json notAfterUtc={1} sampledUtc={2} budgetSec={3} capUtc={4}" -f $id, $notAfterText,
+            $notAfterSampled.UtcDateTime.ToString('o'), $NotAfterBudgetSec, $(if ($null -ne $notAfterCapDto) { $notAfterCapDto.UtcDateTime.ToString('o') } else { 'none' }))
+    } elseif ($null -ne $notAfterText) { Write-Output ("job not-after: {0}.meta.json notAfterUtc={1}" -f $id, $notAfterText) }
 
     # From here on, this call OWNS the claim above -- any failure in the side-file loop or the
     # job's own placement must roll that claim back (round 2/4's original guarantee, now covering

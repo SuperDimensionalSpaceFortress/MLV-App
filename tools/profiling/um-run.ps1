@@ -61,6 +61,7 @@
 # older than GATE-2) reads as launched, so such an agent sees exactly the behaviour it always did.
 #
 # LEASE-REQUEST-CHILD-NOT-AFTER-1: -NotAfterUtc is forwarded to the claim as meta.json notAfterUtc (the agent's deadline for the job).
+# LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: -NotAfterBudgetSec / -NotAfterCapUtc are forwarded as its drop-relative form.
 
 [CmdletBinding(DefaultParameterSetName = 'Script')]
 param(
@@ -105,6 +106,12 @@ param(
     # this script never derives one: callers that read the result by name after this client stops waiting (#633,
     # VenueChain) still want such a job run.
     [string]$NotAfterUtc = '',
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: the same notAfterUtc RELATIVE to the drop (see UmRunDrop.psm1): the drop writes
+    # min(its own UtcNow, read immediately before the claim, + -NotAfterBudgetSec, -NotAfterCapUtc). A submitter that sizes the
+    # bound from this client's waits passes them here, so a slow start or share before the drop never leaves the bound short of
+    # the waits that follow it. 0 / '' (the defaults) send none; passing either with -NotAfterUtc is UMRUN_NOT_AFTER_CONFLICT.
+    [int]$NotAfterBudgetSec = 0,
+    [string]$NotAfterCapUtc = '',
     # Test-only: invoked with no arguments the instant the queue deadline is judged reached and no
     # claim has been seen yet, immediately BEFORE the recheck that follows it -- lets a test land a
     # claim marker deterministically inside what is otherwise a sub-millisecond window between
@@ -176,7 +183,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Command') {
 }
 if (-not (Test-Path $ScriptPath)) { throw "Script not found: $ScriptPath" }
 
-$dropLines = @(Invoke-UmRunDrop -Inbox $inbox -Outbox $outbox -ScriptPath $ScriptPath -JobId $JobId -SideFile $SideFile -JobTimeoutSec $TimeoutSec -NotAfterUtc $NotAfterUtc)
+$dropLines = @(Invoke-UmRunDrop -Inbox $inbox -Outbox $outbox -ScriptPath $ScriptPath -JobId $JobId -SideFile $SideFile -JobTimeoutSec $TimeoutSec -NotAfterUtc $NotAfterUtc -NotAfterBudgetSec $NotAfterBudgetSec -NotAfterCapUtc $NotAfterCapUtc)
 $jobId = $null
 $nonce = $null
 foreach ($line in $dropLines) {

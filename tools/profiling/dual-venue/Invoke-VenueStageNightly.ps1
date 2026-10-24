@@ -46,7 +46,8 @@
 # NOT-AFTER (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1). The stage job is submitted with -NotAfterUtc at this call's deadline, so a job still queued or gated when
 # um-run is killed never takes a Bachelor lease later (a later call re-stages it under a suffix). The DLL pair and the smoke runner get none: a later call
 # harvests them by name and cannot re-submit their single-use JobId (the DLL pair runs on Ultra-Magnus, whose agent ignores the field anyway). The bound is
-# the ORIGINAL deadline passed as an instant (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1), so a delay before the bound is computed never moves it later.
+# the ORIGINAL deadline passed as an instant (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1), so a delay before the bound is computed never moves it later; since
+# r2 it is passed drop-relative (-NotAfterBudgetSec, capped by -NotAfterCapUtc = that deadline), so the drop writes min(its own now + the waits, the deadline).
 #
 #   pwsh -NoProfile -File "<repo>\tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1" [-Venue ultra-magnus] [-SourceCommit <40-hex>] [-WhatIf]
 #
@@ -484,10 +485,16 @@ function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]
     $lit = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
     $call = '& ' + (& $lit $UmRun) + ' -ScriptPath ' + (& $lit $JobFile) + ' -JobId ' + (& $lit $JobId) + ' -AgentShare ' + (& $lit $Share) +
         " -TimeoutSec $timeoutSec -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $admissionSec -MaxClaimedWaitSec $remain"
-    if ($notAfter.notAfterUtc) { $call += ' -NotAfterUtc ' + (& $lit $notAfter.notAfterUtc) }
+    # r2 (hub ruling on sol's r1 blocker): the bound is passed DROP-RELATIVE, capped by the ORIGINAL deadline: um-run's drop writes min(its own now +
+    # budgetSec, $script:Deadline), so a slow start or side-file share before the drop never leaves the bound short of the waits, and never past the deadline.
+    if ($null -ne $notAfter.budgetSec) {
+        $call += " -NotAfterBudgetSec $($notAfter.budgetSec)"
+        if ($notAfter.capUtc) { $call += ' -NotAfterCapUtc ' + (& $lit $notAfter.capUtc) }
+    } elseif ($notAfter.notAfterUtc) { $call += ' -NotAfterUtc ' + (& $lit $notAfter.notAfterUtc) }
     if (@($Side).Count -gt 0) { $call += ' -SideFile @(' + ((@($Side) | ForEach-Object { & $lit $_ }) -join ', ') + ')' }
     $text = "try { `$null = $call; [Console]::Out.WriteLine('UMRUN_RETURNED'); exit 0 } catch { [Console]::Out.WriteLine('UMRUN_ERROR ' + (`$_.Exception.Message -replace '\s+', ' ')); exit 1 }"
-    Say "submit $Step $JobId -> $Share notAfterUtc=$(if ($notAfter.notAfterUtc) { $notAfter.notAfterUtc } else { 'none' }) ($($notAfter.source)) deadline=$($script:Deadline.ToString('o'))"
+    $bound = $(if ($null -ne $notAfter.budgetSec) { "drop+$($notAfter.budgetSec)s cap=$(if ($notAfter.capUtc) { $notAfter.capUtc } else { 'none' })" } elseif ($notAfter.notAfterUtc) { $notAfter.notAfterUtc } else { 'none' })
+    Say "submit $Step $JobId -> $Share notAfter=$bound ($($notAfter.source)) deadline=$($script:Deadline.ToString('o'))"
     $c = Invoke-Child "umrun-$Step" '' @() -CommandText $text
     if ($c.timedOut) { Stop-Nightly 'STAGE_UNRESOLVED' "um-run for $JobId was still waiting at the $MaxTotalSec s cap and was killed; the agent may still own $JobId (not retried)" }
     if ($c.exit -eq 0 -and $c.out -match '(?m)^UMRUN_RETURNED\s*$') { return 'OK' }
@@ -497,6 +504,8 @@ function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]
     if ($msg -match '^UNRESOLVED:') { Stop-Nightly 'STAGE_UNRESOLVED' "um-run $Step ($JobId): $msg (not retried in this call)" }
     if ($msg -match '^RETRACTED:') { Stop-Nightly 'AGENT_BUSY' "um-run $Step ($JobId) was never claimed: $msg" }
     if ($msg -match '^No agent heartbeat') { Stop-Nightly 'SHARE_UNREACHABLE' "um-run $Step : $msg" }
+    # r2: the drop refuses a cap (this call's deadline) that passed before its claim, before any share write.
+    if ($msg -match '^UMRUN_NOT_AFTER_CAP_PASSED') { Stop-Nightly 'STAGE_CAP_EXCEEDED' "um-run $Step ($JobId): the $MaxTotalSec s deadline passed before the drop; nothing was submitted ($msg)" }
     $last = $(if ($msg) { $msg } else { Get-LastLine ($c.out + "`n" + $c.err) '\S' })
     Stop-Nightly $FailToken "um-run $Step ($JobId) exit $($c.exit): $(if ($last) { ([string]$last).Trim() })"
 }
