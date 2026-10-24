@@ -97,3 +97,19 @@ table), and either makes the overall verdict `INCOMPLETE` (exit 3; no lane in th
 also exit 3). `Invoke-Lane.ps1` receipts carry `codexModelsFetchedAt` (age of the model list) and, for a
 pinned read-only codex lane, `codexExe.pinState` (`PIN_MODEL_UNPROBED` = the pin never proved the
 resolved model, so the global CLI ran it).
+
+## Provider/model topology block (PR-PROVIDER-MODEL-TOPOLOGY-1, record-only)
+
+Owner ask 2026-10-24 (dot notice on #660): a PR body shows the provider and exact model for each role.
+`python tools/coordination/pr_topology.py render --pr N --head <40-hex> --card <CARD> --runs-root
+<fleet-runs>` builds the `<!-- pr-topology:begin -->` ... `<!-- pr-topology:end -->` block from the run
+dirs (`lane-<CARD>-r<k>-*`, `design-<CARD>-*`, `review-pr<N>-<seat>[-key3]-r<k>-*`): provider by receipt
+`engine`, `resolvedModel` (else `claimed: <requestedModel>`), `effort`, and the SHA each row is bound to
+(a key's `subject_sha`, a producer's `DONE <sha>`; else `unbound`). A row on another head reads
+`stale (other head)`. A footer is only ever `claimed by footer, unverified`.
+
+**It is not a gate.** `check --body-file <f> --head <sha>` prints one line (`PR_TOPOLOGY ok`, `WARN
+missing`, `WARN stale head=.. section=..`, `WARN unreadable ..`) and always exits 0. The hub refreshes the
+block with `render`, then `splice --body-file <body> --block-file <block> --out <new>` (idempotent; a body with
+malformed markers is refused, exit 2, nothing written), then `gh pr edit --body-file`. Wiring `check` into
+merge-enqueue's log and `render`+`splice` into the key watcher is hub tooling under `.claude-state`.
