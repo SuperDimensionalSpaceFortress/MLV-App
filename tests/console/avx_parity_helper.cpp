@@ -80,8 +80,12 @@ public:
     }
 };
 
-// A plain read of a field another thread writes. Diagnostics only: the watchdog takes no clip lock,
-// so a deadlocked clip cannot also stall the report.
+// A read of a field another thread writes, with no synchronization. Diagnostics only: the watchdog
+// takes no clip lock, so a deadlocked clip cannot also stall the report. The volatile cast only stops
+// the compiler from caching or dropping the load; it is still a data race, and a value may be stale.
+// The fields are plain members of mlvObject_t that src/ writes with plain stores, so no reader-side
+// atomic (std::atomic_ref, __atomic_load_n) or helper-published copy can make the read race-free;
+// only the writers can. The probe line says so in its own text.
 template <typename T>
 static T racy_read(const T & field)
 {
@@ -103,11 +107,13 @@ static std::string probe_line()
     // Null until initMlvObjectWithClip returns inside openClipFile.
     mlvObject_t * video = g_probed_fixture->video();
     if (!video) {
-        std::snprintf(line, sizeof(line), "AVX_PARITY_HELPER_STALL probe fixture=open video=null");
+        std::snprintf(line, sizeof(line),
+                      "AVX_PARITY_HELPER_STALL probe read=\"unsynchronized best-effort read\" fixture=open video=null");
         return line;
     }
     std::snprintf(line, sizeof(line),
-                  "AVX_PARITY_HELPER_STALL probe fixture=open video=set processing=%s is_active=%d frames=%u "
+                  "AVX_PARITY_HELPER_STALL probe read=\"unsynchronized best-effort read\" fixture=open video=set "
+                  "processing=%s is_active=%d frames=%u "
                   "cpu_cores=%d cache_thread_count=%d stop_caching=%d cache_lifecycle_users=%d cache_closing=%d "
                   "raw_uint16_prefetch_threads_started=%d processed8_prefetch_thread_started=%d",
                   racy_read(video->processing) ? "set" : "null",
@@ -334,7 +340,8 @@ static void dump_threads(ExeSymbols & symbols, std::vector<std::pair<DWORD, unsi
         CloseHandle(thread);
     }
 
-    std::fprintf(stderr, "AVX_PARITY_HELPER_STALL threads count=%d\n", static_cast<int>(samples.size()));
+    std::fprintf(stderr, "AVX_PARITY_HELPER_STALL threads count=%d stack=\"return-address candidates (stack scan, not unwound)\"\n",
+                 static_cast<int>(samples.size()));
     std::vector<std::pair<DWORD, unsigned long long>> current_cpu;
     for (const ThreadSample & sample : samples) {
         long long delta_ms = -1;
