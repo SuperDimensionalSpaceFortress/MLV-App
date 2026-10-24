@@ -777,6 +777,14 @@ if ($outcome -in @('PASS', 'FAIL') -and $unpacedVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but UNPACED_NOT_HONOURED: $($unpacedVerdict.reason). A paced run is no throughput measurement"
     $outcome = 'INVALID'
 }
+# PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON (a look leg, or generatorArgs.forceLookAssist) but whose run log does
+# not show the app running with it on (gui_smoke.visual_state look_assist_enabled=1; 0 or missing blocks) measured another look: a typed INVALID, never a PASS or FAIL.
+$lookAssistVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $runLogText
+if ($lookAssistVerdict.requested) { $receipt['lookAssist'] = [ordered]@{ requested = $true; reported = $lookAssistVerdict.reported; verdict = $lookAssistVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $lookAssistVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but LOOK_ASSIST_NOT_HONOURED: $($lookAssistVerdict.reason). A leg that did not run the look it names is no measurement under it"
+    $outcome = 'INVALID'
+}
 # A signal needs its proof. A PASS or FAIL whose receipt-oracle verdict is not valid (under 20 s of source frames, a wrap,
 # a foreign run, a fixture, or the verdict simply absent) is INVALID: a FAIL on footage that cannot be shown to be long
 # enough is not a product result either. A product FAIL the job reached AFTER its oracle passed (GPU_RECON_FRAMES_ZERO,
@@ -807,8 +815,9 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     if ($receipt.visual.verdict -ceq 'FROZEN_DISPLAY') {
         $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY: $($receipt.visual.reason). A leg whose display did not change is not counted, whatever its cadence numbers say"
         $outcome = 'INVALID'
-    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE')) {
+    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE', 'CAPTURE_UNBOUND')) {
         # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: a single picture over an unknown source, and a leg with no viewport rectangle, are counted and surfaced like a divergence)
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: an unbound paused-instant capture is surfaced the same way (counted; its difference judges nothing).
         $detail += "; $($receipt.visual.verdict) (counted for speed, surfaced for review): $($receipt.visual.reason)"
     }
 }
