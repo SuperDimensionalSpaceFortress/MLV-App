@@ -162,6 +162,8 @@ def _rows_for_dir(run_dir, name, cls):
                 model = resolved.strip()
             elif isinstance(requested, str) and requested.strip():
                 model = "claimed: %s" % requested.strip()
+            elif data.get("state") == "running":
+                model = "unknown (lane still running; receipt incomplete)"
             else:
                 model = "unknown"
             eff = data.get("effort")

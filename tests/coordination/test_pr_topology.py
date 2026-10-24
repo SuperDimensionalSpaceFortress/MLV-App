@@ -126,6 +126,12 @@ class RenderTests(unittest.TestCase):
         self.assertIn("claimed: luna", row)
         self.assertIn(pt.UNBOUND, row)
 
+    def test_running_receipt_with_no_model_says_why(self):
+        _write(os.path.join(self.root, "review-pr%d-luna-r1-20261024T0500Z" % PR, "luna-001.receipt.json"),
+               json.dumps({"schema": "mlv-app/fleet-lane-receipt/v1", "state": "running", "lane": "luna", "card": CARD}))
+        row = [r for r in rows_of(pt.render(PR, HEAD, CARD, self.root)) if "(luna;" in r][0]
+        self.assertIn("unknown (lane still running; receipt incomplete)", row)
+
     def test_corrupt_receipt_renders_unreadable_not_crash(self):
         _write(os.path.join(self.root, "review-pr%d-astra-r1-20261024T0500Z" % PR, "astra-001.receipt.json"), "{not json")
         _write(os.path.join(self.root, "review-pr%d-luna-r1-20261024T0500Z" % PR, "luna-001.receipt.json"), "[1, 2]")
