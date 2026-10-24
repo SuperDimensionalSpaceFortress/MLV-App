@@ -7202,8 +7202,13 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
                "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if mode in ("frozen-partial", "partial-ok") and k == 5 else viewport), "saved": True, "reason": ""}
               for k in range(6)]
     if paired:
-        frames += [{"kind": "play_unbound", "index": k, "file": f"play-unbound-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
-                    "tail_elapsed_ms": 240 + 500 * k, "capture_ms": 40.0, "viewport": viewport, "saved": True, "reason": ""} for k in range(6)]
+        # r3 order and shape: the six forced play captures across the first half of the tail, then the six unforced ones across the second, each
+        # entry carrying forced_paints_before (see write_stateful_visual_captures for a surface the forced paints change)
+        for k, f in enumerate(frames):
+            f.update({"tail_elapsed_ms": 125 + 250 * k, "forced_paints_before": k})
+        frames += [{"kind": "play_unbound", "index": k, "file": f"play-unbound-{k}.png", "display_frame": 612 + 2 * k, "serial": 906 + k, "play_active": True,
+                    "tail_elapsed_ms": 1625 + 250 * k, "capture_ms": 40.0, "viewport": viewport, "saved": True, "reason": "", "forced_paints_before": 6}
+                   for k in range(6)]
     if bound:
         frames.append({"kind": "stop_unbound", "index": 0, "file": "stop-unbound.png", "display_frame": 612, "serial": 912, "painted_serial": 911,
                        "painted_serial_valid": True, "label_bound": False, "label_bound_basis": "gl_viewport_paint", "play_active": False, "viewport": viewport,
@@ -7228,6 +7233,142 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
     (dest / "visual-capture-request.json").write_text(json.dumps({"schema": "mlv-app/visual-capture-request/v1", "requested": True, "probe": "supported",
                                                                   "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
+
+
+def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal: bool = True) -> dict:
+    """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): a STATEFUL model of the window surface the captures print. A forced capture paints
+    the frame its label names onto the surface, then prints it, so it CHANGES what the next unforced capture sees; an unforced capture prints the
+    surface as it stands. Before every capture the display's own (natural) paint lands the current frame only while it works. natural: healthy
+    (always), stuck (never: only a forced capture changes the surface), partial (until the fourth unforced play capture, then never) or static
+    (always, but every source frame is one picture: a static clip the app records as identical). order is the app's capture order: interleaved (the
+    r2 build b35aa308: unforced k, then forced k, in each slice) or forced-first (r3: the six forced play captures across the first half of the tail,
+    then the six unforced ones across the second, then stop_unbound, stop). ordinal writes each entry's forced_paints_before (an r3 build); without
+    it the entries have the r2 shape. Returns the unforced play pictures the model produced (index -> picture) for the trace assertions."""
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    if order == "interleaved":
+        plays = [op for k in range(6) for op in (("play_unbound", k, 240 + 500 * k, 600 + 2 * k), ("play", k, 250 + 500 * k, 600 + 2 * k))]
+        last = 610
+    else:
+        plays = [("play", k, 125 + 250 * k, 600 + k) for k in range(6)] + [("play_unbound", k, 1625 + 250 * k, 606 + k) for k in range(6)]
+        last = 611
+    ops = plays + [("stop_unbound", 0, 3000, last + 1), ("stop", 0, 3000, last + 1), ("paused_unbound", 0, 3400, last + 1), ("paused", 0, 3400, last + 1)]
+    cut = next(t for kind, k, t, _ in ops if kind == "play_unbound" and k == 3)   # partial: the natural paint stops landing here
+
+    def picture(label: int) -> tuple[int, int]:
+        return (2, 0) if natural == "static" else (label % 7, ((label - 600) // 7) * 30)
+
+    surface = (3, 120)   # what was on screen before the tail: no frame's picture
+    forced_paints = 0
+    calls, frames, unforced = [], [], {}
+    for i, (kind, k, t, label) in enumerate(ops):
+        if natural in ("healthy", "static") or (natural == "partial" and t < cut):
+            surface = picture(label)
+        forced = not kind.endswith("_unbound")
+        if forced:
+            surface = picture(label)
+        file = f"{kind.replace('_', '-')}-{k}.png" if kind.startswith("play") else f"{kind.replace('_', '-')}.png"
+        calls.append(f"New-VisPng '{dest / file}' {surface[0]} {60 + 5 * i} {surface[1]} $false")
+        if kind == "play_unbound":
+            unforced[k] = surface
+        entry = {"kind": kind, "index": k, "file": file, "display_frame": label, "serial": 900 + label - 600, "play_active": kind.startswith("play"),
+                 "tail_elapsed_ms": t, "capture_ms": 40.0, "viewport": VIEWPORT, "saved": True, "reason": ""}
+        if kind in ("stop", "paused"):
+            entry.update({"painted_serial": 900 + label - 600, "painted_serial_valid": True, "label_bound": True, "label_bound_basis": "gl_window_paint"})
+        if kind == "paused":
+            entry.update({"settled": True, "settled_frame": label})
+        if ordinal:
+            entry["forced_paints_before"] = forced_paints
+        frames.append(entry)
+        if forced:
+            forced_paints += 1
+    proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    visual = {"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
+              "tail_begin_utc": "2026-10-13T22:00:00.000Z", "tail_end_utc": "2026-10-13T22:00:03.100Z", "frames": frames, "frames_written": len(frames),
+              "error": "", "source_difference": "identical" if natural == "static" else "differ"}
+    (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
+    (dest / "visual-capture-request.json").write_text(json.dumps({"schema": "mlv-app/visual-capture-request/v1", "requested": True, "probe": "supported",
+                                                                  "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
+    return unforced
+
+
+class VisualCaptureObserverPaintTests(unittest.TestCase):
+    """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2 on b35aa308): pairing each forced capture with an unforced one in the same slice does not
+    isolate the NEXT unforced capture from the forced paint. With the display's own paint stuck, unforced k+1 shows forced k's paint (trace: initial,
+    F0, F1, F2, F3, F4), so six distinct unforced pictures read as a moving display and neither FROZEN_DISPLAY nor the masking note fires. Driven by
+    write_stateful_visual_captures, whose surface each forced capture mutates."""
+
+    def read(self, d: str, order: str, natural: str, ordinal: bool = True) -> tuple[dict, dict]:
+        art = Path(d) / "artifacts"
+        unforced = write_stateful_visual_captures(art / "visual", order, natural, ordinal)
+        proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                  "| ConvertTo-Json -Depth 8 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return unforced, out
+
+    def test_the_visual_model_reproduces_dots_trace_on_the_r2_interleaved_order(self) -> None:
+        # the model itself: on the r2 order with the natural paint stuck, unforced k+1 shows forced k's picture
+        with tempfile.TemporaryDirectory(prefix="vis-trace-") as d:
+            unforced = write_stateful_visual_captures(Path(d) / "visual", "interleaved", "stuck")
+        self.assertEqual([unforced[k] for k in range(6)], [(3, 120)] + [((600 + 2 * k) % 7, (2 * k // 7) * 30) for k in range(5)])
+        self.assertEqual(len(set(unforced.values())), 6, "six distinct unforced pictures over a frozen display")
+
+    def test_the_visual_reader_never_says_ok_over_unforced_captures_a_forced_paint_reached(self) -> None:
+        # the r2 build's interleaved order, with the r2 entry shape (no ordinal) and with an ordinal: either way some unforced play captures follow a
+        # forced paint, so they cannot show a frozen display; the runner judges only an interval no forced paint entered, and fails closed when that
+        # leaves fewer than two -- even over a healthy display, whose pictures it cannot tell from observer paints
+        for natural, ordinal in (("stuck", False), ("stuck", True), ("healthy", True), ("partial", True)):
+            with self.subTest(natural=natural, ordinal=ordinal), tempfile.TemporaryDirectory(prefix="vis-r2-order-") as d:
+                _, out = self.read(d, "interleaved", natural, ordinal)
+                self.assertNotEqual(out["verdict"], "OK", out["reason"])
+                self.assertEqual(out["verdict"], "VISUAL_ASSESSMENT_UNAVAILABLE", out["reason"])
+                self.assertEqual(out["frozenJudgedOn"], "play_unbound")
+                self.assertEqual((out["playFrames"], out["observerPaintedPlayFrames"]), (1 if ordinal else 0, 5 if ordinal else 6))
+                self.assertIn("forced paint", out["reason"])
+
+    def test_the_visual_reader_says_frozen_when_the_natural_paint_is_stuck_on_the_r3_order(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-r3-stuck-") as d:
+            unforced, out = self.read(d, "forced-first", "stuck")
+            self.assertEqual(len(set(unforced.values())), 1, "every unforced capture shows the last forced paint")
+            self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+            self.assertEqual((out["frozenJudgedOn"], out["playFrames"], out["distinctContentHashes"], out["observerPaintedPlayFrames"]), ("play_unbound", 6, 1, 0))
+            self.assertIn("the force-paint would have masked this", out["reason"])
+            self.assertIs(out["stopUnboundObserverClean"], True)
+
+    def test_the_visual_reader_says_ok_over_a_healthy_display_on_the_r3_order(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-r3-healthy-") as d:
+            _, out = self.read(d, "forced-first", "healthy")
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertEqual((out["playFrames"], out["distinctContentHashes"], out["observerPaintedPlayFrames"], out["repeatedPlayFrames"]), (6, 6, 0, 0))
+            self.assertIs(out["stopUnboundObserverClean"], True)
+            self.assertEqual([f["forcedPaintsBefore"] for f in out["frames"] if f["kind"] == "play_unbound"], [6] * 6)
+
+    def test_the_visual_reader_reports_a_partial_freeze_on_the_r3_order(self) -> None:
+        # the display's own paint stops landing at the fourth unforced capture: three unforced pictures repeat their predecessor while the app's label
+        # advanced. Not the whole-tail FROZEN_DISPLAY (three pictures differ), but the receipt counts and says it.
+        with tempfile.TemporaryDirectory(prefix="vis-r3-partial-") as d:
+            _, out = self.read(d, "forced-first", "partial")
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertEqual((out["playFrames"], out["distinctContentHashes"], out["repeatedPlayFrames"]), (6, 3, 3))
+            self.assertIn("3 of the 6 unforced play captures repeat", out["reason"])
+
+    def test_the_visual_reader_waives_a_repeated_source_on_the_r3_order(self) -> None:
+        # a static clip: the display paints, but every source frame is the same picture, and the app records the source frames as identical
+        with tempfile.TemporaryDirectory(prefix="vis-r3-static-") as d:
+            _, out = self.read(d, "forced-first", "static")
+            self.assertEqual((out["verdict"], out["counted"]), ("OK", True), out["reason"])
+            self.assertEqual((out["distinctContentHashes"], out["sourceDifference"], out["repeatedPlayFrames"]), (1, "known-identical", None))
+            self.assertIn("static clip", out["reason"])
+
+    def test_the_visual_gate_fails_closed_when_observer_paints_leave_fewer_than_two_judged_frames(self) -> None:
+        for judged, observer, verdict in ((1, 5, "VISUAL_ASSESSMENT_UNAVAILABLE"), (0, 6, "VISUAL_ASSESSMENT_UNAVAILABLE"), (6, 0, "OK")):
+            with self.subTest(judged=judged, observer=observer):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {judged} -DistinctContentHashes {judged} -AppDistinctDisplayFrames {judged} "
+                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 1.0 -SamePosition $true -ObserverPaintedPlayFrames {observer} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True))
 
 
 class GeneratorWarmUpIsOptInPerClassTests(unittest.TestCase):
@@ -8338,7 +8479,7 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         block = body[body.index("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"):body.index("// Contact-sheet files. Deliberately placed AFTER")]
         self.assertGreater(body.index("if( !options.visualCaptureDir.isEmpty()"), reached, "the capture only follows a measured Play that REACHED its stop")
         close = block.index('finishPlaybackSmokeTelemetry( "visual-capture" );')
-        self.assertLess(close, block.index('grabVisual( QStringLiteral("play_unbound"), k, false );'), "the measured session closes before the first capture")
+        self.assertLess(close, block.index('grabVisual( QStringLiteral("play"), k, false );'), "the measured session closes before the first capture")
         self.assertLess(block.index('grabVisual( QStringLiteral("play"), k, false );'), block.index("ui->actionPlay->setChecked( false );"))
         self.assertLess(block.index("ui->actionPlay->setChecked( false );"), block.index('grabVisual( QStringLiteral("stop"), 0, false );'))
         self.assertLess(block.index('grabVisual( QStringLiteral("stop"), 0, false );'), block.index('seekAndSettleLoadedClip( visualStopFrame, "gui-smoke-visual-capture-paused"'))
@@ -8366,16 +8507,26 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         self.assertNotIn("processEvents(", block[block.index(unbound):block.index('grabVisual( QStringLiteral("stop"), 0, false );')])
         for field in ('"painted_serial"', '"painted_serial_valid"', '"label_bound"', '"label_bound_basis"'):
             self.assertIn(f"QStringLiteral({field})", block)
-        # TIMING-2 r2 (Dot 6d0e710f B2): every forced play capture is paired with an unforced one taken just before it, with no event between, and only
-        # the "_unbound" kinds skip the paint -- the frozen check is judged on them, so the force-paint can no longer mask a frozen display
+        # TIMING-2 r2 (Dot 6d0e710f B2): only the "_unbound" kinds skip the paint -- the frozen check is judged on them, so the force-paint can no longer
+        # mask a frozen display. The paused pair keeps its unforced capture just before the forced one, with no event between.
         play_unbound = 'grabVisual( QStringLiteral("play_unbound"), k, false );'
         play = 'grabVisual( QStringLiteral("play"), k, false );'
         paused_unbound = 'grabVisual( QStringLiteral("paused_unbound"), 0, visualSettled );'
         paused = 'grabVisual( QStringLiteral("paused"), 0, visualSettled );'
-        for unforced, forced in ((play_unbound, play), (paused_unbound, paused)):
-            self.assertLess(block.index(unforced), block.index(forced))
-            self.assertNotIn("processEvents(", block[block.index(unforced):block.index(forced)])
+        self.assertLess(block.index(paused_unbound), block.index(paused))
+        self.assertNotIn("processEvents(", block[block.index(paused_unbound):block.index(paused)])
         self.assertIn('!kind.endsWith( QStringLiteral("_unbound") )', lam)
+        # TIMING-2 r3 (Dot 7dc103f1 B2): a forced paint changes what the NEXT unforced capture sees when the display's own paint is stuck, so r2's
+        # per-slice pairing let unforced k+1 show forced k. Every forced play capture now comes first; the unforced ones follow with no forced capture
+        # between any two of them or between the last of them and stop_unbound; every capture records how many forced paints preceded it.
+        self.assertEqual((block.count(play), block.count(play_unbound)), (1, 1))
+        self.assertLess(block.index(play), block.index(play_unbound))
+        between = block[block.index(play_unbound):block.index(unbound)]
+        self.assertEqual(between.count("grabVisual("), 1, "no forced capture inside the unforced observation interval")
+        self.assertIn("ui->actionPlay->setChecked( false );", between)
+        self.assertIn('frameJson.insert( QStringLiteral("forced_paints_before"), grab.forcedPaintsBefore );', block)
+        self.assertLess(lam.index("grab.forcedPaintsBefore = visualForcedPaints;"), lam.index(helper), "the ordinal is read before this capture's own paint")
+        self.assertIn("if( forcePaint ) ++visualForcedPaints;", lam)
         # where the painted serial came from is named (the pixmap route's binding holds by construction)
         for basis in ('"gl_window_paint"', '"gl_viewport_paint"', '"pixmap_item_by_construction"', '"none"'):
             self.assertIn(f"QStringLiteral({basis})", src)

@@ -764,9 +764,10 @@ TEST(GpuPresentSetupStall, SteadyStateBlurUploadTakesNoGlGetErrorButTheAllocatio
 // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f B2, CoS 6219217683): the --visual-capture-dir forced paint
 // (paintPendingNowIfActive above, or the viewport's repaint()) draws the frame the label names even when the
 // display's own deferred paint never lands, so a forced capture alone can never show a frozen display. Every forced
-// capture kind is therefore paired with an unforced "_unbound" twin taken just before it, with no event handled in
-// between, and only the "_unbound" kinds skip the paint. 32626bd5 force-painted every play capture with no twin.
-TEST(VisualCaptureBinding, EveryForcedCaptureIsPairedWithAnUnforcedCaptureTakenJustBeforeIt)
+// capture kind is therefore paired with an unforced "_unbound" twin, and only the "_unbound" kinds skip the paint.
+// 32626bd5 force-painted every play capture with no twin. The stop and paused twins are taken just before their forced
+// capture, with no event handled in between; the play twins are ordered by the r3 test below.
+TEST(VisualCaptureBinding, EveryForcedStopAndPausedCaptureIsPairedWithAnUnforcedCaptureTakenJustBeforeIt)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const int blockAt = source.indexOf(QStringLiteral("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"));
@@ -778,8 +779,6 @@ TEST(VisualCaptureBinding, EveryForcedCaptureIsPairedWithAnUnforcedCaptureTakenJ
     ASSERT_TRUE(block.contains(QStringLiteral("!kind.endsWith( QStringLiteral(\"_unbound\") )")));
 
     const QString pairs[][2] = {
-        { QStringLiteral("grabVisual( QStringLiteral(\"play_unbound\"), k, false );"),
-          QStringLiteral("grabVisual( QStringLiteral(\"play\"), k, false );") },
         { QStringLiteral("grabVisual( QStringLiteral(\"stop_unbound\"), 0, false );"),
           QStringLiteral("grabVisual( QStringLiteral(\"stop\"), 0, false );") },
         { QStringLiteral("grabVisual( QStringLiteral(\"paused_unbound\"), 0, visualSettled );"),
@@ -795,6 +794,51 @@ TEST(VisualCaptureBinding, EveryForcedCaptureIsPairedWithAnUnforcedCaptureTakenJ
     }
     // No forced kind exists without its twin: three forced grabs, three unforced, nothing else.
     ASSERT_EQ(6, countOccurrences(block, QStringLiteral("grabVisual( QStringLiteral(")));
+}
+
+// PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): r2 took unforced play k and then forced play k in each
+// slice. A forced paint stays on screen when the display's own deferred paint never lands, so unforced k+1 showed
+// forced k (trace initial,F0..F4): six moving pictures over a frozen display. Every forced play capture now comes
+// before the first unforced one, no forced capture falls between two unforced play captures or between the last of
+// them and stop_unbound, and every capture records how many forced paints preceded it (forced_paints_before) so the
+// runner judges only an interval no forced paint entered.
+TEST(VisualCaptureBinding, NoForcedPaintFallsInsideTheUnforcedPlayObservationInterval)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int blockAt = source.indexOf(QStringLiteral("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"));
+    const int blockEnd = source.indexOf(QStringLiteral("// (4) files:"), blockAt);
+    ASSERT_TRUE(blockAt >= 0 && blockEnd > blockAt);
+    const QString block = source.mid(blockAt, blockEnd - blockAt);
+
+    const QString forcedPlay = QStringLiteral("grabVisual( QStringLiteral(\"play\"), k, false );");
+    const QString unforcedPlay = QStringLiteral("grabVisual( QStringLiteral(\"play_unbound\"), k, false );");
+    const QString stopUnforced = QStringLiteral("grabVisual( QStringLiteral(\"stop_unbound\"), 0, false );");
+    ASSERT_EQ(1, countOccurrences(block, forcedPlay));
+    ASSERT_EQ(1, countOccurrences(block, unforcedPlay));
+    const int forcedAt = block.indexOf(forcedPlay);
+    const int unforcedAt = block.indexOf(unforcedPlay);
+    const int stopUnforcedAt = block.indexOf(stopUnforced);
+    ASSERT_TRUE(forcedAt >= 0 && unforcedAt > forcedAt && stopUnforcedAt > unforcedAt);
+    // The two play captures sit in two separate loops: the forced loop closes before the unforced one opens.
+    const QString forcedToUnforced = block.mid(forcedAt, unforcedAt - forcedAt);
+    ASSERT_EQ(1, countOccurrences(forcedToUnforced, QStringLiteral("for( int k = 0; k < visualPlayFrames; ++k )")));
+    // From the unforced play capture to stop_unbound: no other capture, only the pause.
+    const QString interval = block.mid(unforcedAt, stopUnforcedAt - unforcedAt);
+    ASSERT_EQ(1, countOccurrences(interval, QStringLiteral("grabVisual(")));
+    ASSERT_TRUE(interval.contains(QStringLiteral("ui->actionPlay->setChecked( false );")));
+
+    // The ordinal is read before this capture's own paint and advanced only by a forced capture; visual.json carries it.
+    const int lambdaAt = block.indexOf(QStringLiteral("auto grabVisual = [&]"));
+    const int lambdaEnd = block.indexOf(QStringLiteral("visualGrabs.append( grab );"), lambdaAt);
+    ASSERT_TRUE(lambdaAt >= 0 && lambdaEnd > lambdaAt);
+    const QString lambda = block.mid(lambdaAt, lambdaEnd - lambdaAt);
+    const int ordinalAt = lambda.indexOf(QStringLiteral("grab.forcedPaintsBefore = visualForcedPaints;"));
+    const int paintAt = lambda.indexOf(QStringLiteral("paintPresentedFrameForCapture("));
+    const int bumpAt = lambda.indexOf(QStringLiteral("if( forcePaint ) ++visualForcedPaints;"));
+    ASSERT_TRUE(ordinalAt >= 0 && paintAt > ordinalAt && bumpAt > paintAt);
+    ASSERT_EQ(1, countOccurrences(block, QStringLiteral("++visualForcedPaints")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "frameJson.insert( QStringLiteral(\"forced_paints_before\"), grab.forcedPaintsBefore );")));
 }
 
 TEST(VisualCaptureBinding, EveryCaptureNamesWhereItsPaintedSerialCameFrom)

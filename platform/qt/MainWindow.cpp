@@ -10375,6 +10375,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             qulonglong paintedSerial = 0;
             bool paintedSerialValid = false;
             QString labelBoundBasis;
+            int forcedPaintsBefore = 0;
             bool playActive = false;
             bool settled = false;
             double captureMs = 0.0;
@@ -10387,6 +10388,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             ? visualGlContainer
             : ( ui->graphicsView ? ui->graphicsView->viewport() : nullptr );
         QElapsedTimer visualTailClock;
+        int visualForcedPaints = 0;
         auto grabVisual = [&]( const QString &kind, int index, bool settled )
         {
             VisualGrab grab;
@@ -10396,14 +10398,18 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             grab.settled = settled;
             // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: paint the pending frame FIRST, then read the label, then print the
             // window, with no event handled in between, so the pixels are the frame the label names. The "_unbound" kinds
-            // skip the paint: each is the capture a pre-binding build took (whatever was last painted), taken just before
-            // its forced twin, so a display whose own deferred paint never lands is still seen (r2: the force-paint
-            // would otherwise mask a frozen display).
+            // skip the paint: each prints whatever was last painted, so a display whose own deferred paint never lands is
+            // still seen (r2: the force-paint would otherwise mask a frozen display). r3: a forced paint stays on screen
+            // when the display's own paint is stuck, so it is what the NEXT unforced capture would show; every capture
+            // records how many forced paints preceded it (forced_paints_before) for the runner's frozen check.
+            const bool forcePaint = !kind.endsWith( QStringLiteral("_unbound") );
+            grab.forcedPaintsBefore = visualForcedPaints;
             quint64 paintedSerial = 0;
             grab.paintedSerialValid = paintPresentedFrameForCapture( ui->graphicsView, visualViewportWidget, visualUseGlContainer,
                                                                      m_graphicsItemPresentedSerial,
-                                                                     !kind.endsWith( QStringLiteral("_unbound") ), &paintedSerial,
+                                                                     forcePaint, &paintedSerial,
                                                                      &grab.labelBoundBasis );
+            if( forcePaint ) ++visualForcedPaints;
             grab.paintedSerial = static_cast<qulonglong>( paintedSerial );
             grab.displayFrame = m_lastPresentedRequestContextValid
                 ? static_cast<int>( m_lastPresentedRequestContext.frameNumber ) : -1;
@@ -10428,22 +10434,38 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( visualMeasuredSession ).arg( visualTailMs ).arg( visualPlayFrames ).arg( visualTailBeginUtc ) );
         visualTailClock.start();
 
-        // (2) K play frames, evenly spaced across the untimed tail (the centres of K equal slices).
+        // (2) K forced, bound play frames evenly spaced across the FIRST half of the untimed tail (the centres of K equal
+        // slices), then K unforced ones across the SECOND half (what the display itself shows: the frozen check is judged
+        // on these). r3 (Dot 7dc103f1 B2): r2 took unforced k then forced k in each slice, so with the display's own paint
+        // stuck, unforced k+1 showed forced k's paint and a frozen display read as K moving pictures. Now no forced paint
+        // falls between two unforced play captures, or between the last of them and stop_unbound.
+        const int visualHalfMs = visualTailMs / 2;
         for( int k = 0; k < visualPlayFrames; ++k )
         {
-            const qint64 targetMs = static_cast<qint64>( ( 2 * k + 1 ) * visualTailMs / ( 2 * visualPlayFrames ) );
+            const qint64 targetMs = static_cast<qint64>( ( 2 * k + 1 ) * visualHalfMs / ( 2 * visualPlayFrames ) );
             while( visualTailClock.elapsed() < targetMs )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
                 QThread::msleep( 2 );
             }
-            // Unforced first (what the display itself shows: the frozen check is judged on these), then forced and bound.
-            grabVisual( QStringLiteral("play_unbound"), k, false );
             grabVisual( QStringLiteral("play"), k, false );
+        }
+        for( int k = 0; k < visualPlayFrames; ++k )
+        {
+            const qint64 targetMs = visualHalfMs + static_cast<qint64>( ( 2 * k + 1 ) * visualHalfMs / ( 2 * visualPlayFrames ) );
+            while( visualTailClock.elapsed() < targetMs )
+            {
+                qApp->processEvents( QEventLoop::AllEvents );
+                QThread::msleep( 2 );
+            }
+            grabVisual( QStringLiteral("play_unbound"), k, false );
         }
         // The frame on screen the instant Play is paused: captured BEFORE any event is processed, so it
         // is still the frame the playback path presented (the paused re-render has not landed yet). First
-        // unforced (stop_unbound: what a pre-binding build captured), then painted and bound to its label.
+        // unforced (stop_unbound: no forced paint since the unforced play captures, so on a display whose own
+        // paint lands it is what a pre-binding build captured; on one whose paint is stuck it still shows the
+        // last forced play paint, which the frozen check over the unforced play captures reports), then painted
+        // and bound to its label.
         ui->actionPlay->setChecked( false );
         grabVisual( QStringLiteral("stop_unbound"), 0, false );
         grabVisual( QStringLiteral("stop"), 0, false );
@@ -10495,6 +10517,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             frameJson.insert( QStringLiteral("painted_serial_valid"), grab.paintedSerialValid );
             frameJson.insert( QStringLiteral("label_bound"), grab.paintedSerialValid && grab.paintedSerial == grab.serial );
             frameJson.insert( QStringLiteral("label_bound_basis"), grab.labelBoundBasis );
+            frameJson.insert( QStringLiteral("forced_paints_before"), grab.forcedPaintsBefore );
             frameJson.insert( QStringLiteral("play_active"), grab.playActive );
             frameJson.insert( QStringLiteral("capture_ms"), grab.captureMs );
             if( grab.kind == QStringLiteral("paused") )
