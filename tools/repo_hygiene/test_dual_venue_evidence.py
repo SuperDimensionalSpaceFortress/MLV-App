@@ -7595,9 +7595,13 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                           f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff {mad} -SamePosition $true -LabelBound {bound} | ConvertTo-Json -Compress")
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertEqual((out["verdict"], out["counted"]), (verdict, True))
-        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 "
-                                  "-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true -LabelBound $false | ConvertTo-Json -Compress")
-        self.assertEqual(out["verdict"], "FROZEN_DISPLAY", "a frozen display outranks an unbound stop capture")
+        # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: FROZEN_DISPLAY needs source frames known to differ; over an unknown source it is SUSPECTED, which outranks too)
+        for source, frozen in (("known-differ", "FROZEN_DISPLAY"), ("unknown", "FROZEN_DISPLAY_SUSPECTED")):
+            with self.subTest(source=source):
+                proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 "
+                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true -SourceDifference {source} -LabelBound $false | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out["verdict"], frozen, "a frozen display outranks an unbound stop capture")
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;
