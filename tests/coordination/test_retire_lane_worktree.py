@@ -8,6 +8,7 @@ import base64
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -815,7 +816,9 @@ def _strand_registered(main, wt):
     """A cheap stranded state with git still registering the tree (at <wt>.retiring): a LOCKED worktree makes `git worktree remove` refuse
     up front (nothing deleted), and a seam makes every rename back fail with a sharing violation."""
     _git(main, "worktree", "lock", "--reason", "strand-test", str(wt))
-    prelude = ("$script:RestoreRetryBudgetMs = 300; $script:RestoreRetryDelayMs = 50; $origMoveSeam = ${function:Move-LaneWorktreeRoot}; "
+    # ONLY_PYTEST_CHILDREN: this fixture is about the rename back, not the host; an unrelated live pwsh whose cwd cannot be read would otherwise
+    # refuse the removal as cwd-unknown here, in setup, before any case reaches the behaviour it is written for.
+    prelude = (ONLY_PYTEST_CHILDREN + "$script:RestoreRetryBudgetMs = 300; $script:RestoreRetryDelayMs = 50; $origMoveSeam = ${function:Move-LaneWorktreeRoot}; "
                "function Move-LaneWorktreeRoot { param([string]$From, [string]$To) if ($From -like '*.retiring') { "
                "return 'The process cannot access the file because it is being used by another process. (seam)' }; & $origMoveSeam -From $From -To $To }; ")
     d, _ = _gate_real(wt, whatif=False, prelude=prelude)
@@ -1037,6 +1040,167 @@ def test_a_half_removed_tree_whose_first_repair_fails_is_re_checked_out_by_the_r
     assert [r["state"] for r in rows] == ["restored"] and "status clean" in rows[0]["note"], s
     assert (wt / "a.txt").exists() and (wt / ".gitignore").exists(), "every tracked file is back"
     _assert_back_at_its_own_path(main, wt)
+
+
+def _git_failure_shim(log, flag, sub, cap=None):
+    """Prelude: a `git.exe` FUNCTION (PowerShell resolves a function before the executable, so the script's `& git.exe ...` lands here, no
+    seam in the script). While `flag` exists, a git call carrying the subcommand `sub` (status | checkout-index) appends a line to `log`,
+    exits 128 and prints a fatal line; every other call, and every call once `flag` is deleted, goes to the real git. `cap` shrinks
+    $script:RestoreCheckoutMaxAttempts (the owed-checkout attempt cap) so the capped case needs few sweeps."""
+    return ("$global:realGit = (Get-Command git.exe -CommandType Application | Select-Object -First 1).Source; "
+            + (f"$script:RestoreCheckoutMaxAttempts = {cap}; " if cap else "")
+            + "function git.exe { "
+            f"if ((Test-Path -LiteralPath '{flag}') -and (@($args) -contains '{sub}')) {{ "
+            f"[IO.File]::AppendAllText('{log}', '{sub}' + [Environment]::NewLine); $global:LASTEXITCODE = 128; 'fatal: seam failure'; return }}; "
+            "& $global:realGit @args }; ")
+
+
+def _owed_checkout_fixture(repo, name):
+    """A half-removed, stranded tree (admin entry, `.git` link and tracked files gone) with its rename record. Returns (tmp, main, root, wt, record dir)."""
+    tmp, main = repo
+    root = tmp / "lanes"
+    wt = _add_wt(main, root / name)
+    _strand_registered(main, wt)
+    recs = _pending_records(main)
+    assert len(recs) == 1, recs
+    shutil.rmtree(_admin_dir(main, wt))
+    for f in (".git", "a.txt", ".gitignore"):
+        (_retiring_of(wt) / f).unlink()
+    return tmp, main, root, wt, Path(main) / ".git" / "mlv-retire-pending" / recs[0]
+
+
+def _sweep_with(main, root, tmp, prelude):
+    return json.loads(subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", _sweep_script(main, root, tmp, prelude)],
+                                     check=True, capture_output=True, text=True).stdout)
+
+
+def _record_of(rec_dir):
+    return json.loads((rec_dir / "record.json").read_text(encoding="utf-8-sig"))
+
+
+@pytest.mark.parametrize("failing,files_back,note", [("status", True, "status after the re-checkout failed"),
+                                                     ("checkout-index", False, "checkout-index after the re-registration failed")])
+def test_a_git_failure_after_the_re_registration_keeps_the_owed_checkout_and_the_retry_settles_it(repo, failing, files_back, note):
+    """Dot R18 advisory 4e08bf9a on PR #632 (RETIRE-RESTORE-CHECKOUT-STATUS-FAILURE-FIXTURES-1, card A). The admin entry and link are
+    re-created and the repair works, then `git checkout-index -a` (or the `git status` after it) fails. The call is restored-unrepaired,
+    the record keeps checkoutOwed and survives, and a retry with git working re-checks the tree out and drops the record. COVERAGE: the
+    branch already behaves this way on c1e0da63; no committed fixture forced it."""
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, f"wt-git-{failing}")
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    s = _sweep_with(main, root, tmp, _git_failure_shim(log, flag, failing))
+    rows = s["strandedRestore"]
+    assert [r["state"] for r in rows] == ["restored-unrepaired"], s
+    assert note in rows[0]["note"], rows
+    assert "seam failure" in rows[0]["note"] and "re-checks it out" in rows[0]["note"], rows
+    assert log.read_text(encoding="utf-8").split() == [failing], "the shim must have forced exactly the one failure"
+    assert rec_dir.is_dir() and _record_of(rec_dir).get("checkoutOwed") is True, "the record and its debt survive the failure"
+    assert (wt / "a.txt").exists() is files_back, "checkout-index ran before the failing status, or never ran"
+    flag.unlink()
+    s = _sweep_with(main, root, tmp, _git_failure_shim(log, flag, failing))
+    rows = s["strandedRestore"]
+    assert [r["state"] for r in rows] == ["restored"] and "status clean" in rows[0]["note"], rows
+    assert (wt / "a.txt").exists() and (wt / ".gitignore").exists(), "every tracked file is back"
+    _assert_back_at_its_own_path(main, wt)
+
+
+def test_an_owed_checkout_that_keeps_failing_gives_up_visibly_after_the_cap_and_never_re_runs_git(repo):
+    """RETIRE-RESTORE-OWED-CHECKOUT-ATTEMPT-CAP-1 (card B; fable r1 hardening on PR #632). An owed re-checkout whose git call keeps failing
+    used to stay restored-unrepaired for ever, running both git calls on every later call or sweep. Each failing run now counts in
+    record.json (checkoutAttempts); the run that reaches the cap reports restored-checkout-gave-up, the record stays on disk as a visible
+    terminal state, and later sweeps report the same state WITHOUT running git again, even once git works."""
+    cap = 3
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-cap")
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap)
+    states = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0]["state"] for _ in range(cap)]
+    assert states == ["restored-unrepaired"] * (cap - 1) + ["restored-checkout-gave-up"], states
+    assert _record_of(rec_dir).get("checkoutAttempts") == cap and _record_of(rec_dir).get("checkoutOwed") is True
+    assert len(log.read_text(encoding="utf-8").split()) == cap
+    for working in (False, True):   # still failing, then git works again: terminal either way
+        if working:
+            flag.unlink()
+        s = _sweep_with(main, root, tmp, shim)
+        row = s["strandedRestore"][0]
+        assert row["state"] == "restored-checkout-gave-up" and "checkout-index -a" in row["note"] and str(rec_dir) in row["note"], s
+        assert rec_dir.is_dir(), "a terminal record is kept on disk, never silently dropped"
+    assert len(log.read_text(encoding="utf-8").split()) == cap, "no git call after the cap"
+    assert not (wt / "a.txt").exists(), "the tree is left as it is for the owner; nothing re-ran"
+
+
+RECORD_WRITE_FAILS = ("function Write-RetirePendingRecordFile { param([string]$Dir, [object]$Record) "
+                      "throw 'seam: record.json is held open by a reader' }; ")
+
+
+def _seed_record(rec_dir, **fields):
+    rec = _record_of(rec_dir)
+    rec.update(fields)
+    (rec_dir / "record.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+def test_a_record_write_that_fails_never_yields_a_terminal_claim_that_the_next_call_contradicts(repo):
+    """RETIRE-RESTORE-CHECKOUT-STATUS-FAILURE-FIXTURES-1 r2 (sol blocker on PR #645; catalogue row R-03: never claim terminal suppression while
+    later calls still execute git). checkoutOwed with 4 of 5 attempts recorded, git checkout-index failing, and record.json cannot be
+    rewritten (a reader holds it). The count used to be saved AFTER git ran: the failed save was only a note, the call still returned
+    restored-checkout-gave-up ('git is not run again'), and the next call ran git again from the unchanged count of 4. The count is now saved
+    BEFORE git runs; when that save fails git is not run at all and the state is the non-terminal restored-unrepaired, naming the save failure."""
+    cap = 5
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-save-fails")
+    _seed_record(rec_dir, checkoutOwed=True, checkoutAttempts=cap - 1)
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap) + RECORD_WRITE_FAILS
+    rows = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0] for _ in range(2)]
+    ran = len(log.read_text(encoding="utf-8").split()) if log.exists() else 0
+    assert not any(r["state"] == "restored-checkout-gave-up" for r in rows) or ran == 0, \
+        f"a terminal claim was made while git ran {ran} time(s): {rows}"
+    assert [r["state"] for r in rows] == ["restored-unrepaired"] * 2, rows
+    assert all("attempt count could not be saved" in r["note"] and "git was not run" in r["note"] for r in rows), rows
+    assert ran == 0, "an attempt that cannot be recorded is not made"
+    assert _record_of(rec_dir).get("checkoutAttempts") == cap - 1 and rec_dir.is_dir(), "the record is untouched and kept"
+
+
+def test_a_record_that_never_saves_cannot_run_git_for_ever_nor_lose_the_cap(repo):
+    """Opus hardening RETIRE-RESTORE-ATTEMPT-COUNT-PERSIST-FAIL-1 on PR #645: if the record cannot be written on any run, the count never
+    advanced past 1 and the cap never fired, so git re-ran on every call. Now git does not run while the count cannot be saved (bounded by
+    zero, not by the cap), every call says so, and once the record can be written again the cap counts from where it was and still fires."""
+    cap = 3
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-never-saves")
+    _seed_record(rec_dir, checkoutOwed=True)
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap)
+    states = []
+    for _ in range(cap + 2):
+        row = _sweep_with(main, root, tmp, shim + RECORD_WRITE_FAILS)["strandedRestore"][0]
+        states.append(row["state"])
+        assert "attempt count could not be saved" in row["note"], row
+    assert states == ["restored-unrepaired"] * (cap + 2), states
+    assert not log.exists() and "checkoutAttempts" not in _record_of(rec_dir), "no git call, nothing counted"
+    states = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0]["state"] for _ in range(cap)]   # the record can be written again
+    assert states == ["restored-unrepaired"] * (cap - 1) + ["restored-checkout-gave-up"], states
+    assert len(log.read_text(encoding="utf-8").split()) == cap and _record_of(rec_dir).get("checkoutAttempts") == cap
+
+
+def test_the_owed_checkout_attempt_cap_is_a_named_script_constant_of_five():
+    # Exact: a substring match also accepted 50 or 500.
+    assert re.search(r"(?m)^\$script:RestoreCheckoutMaxAttempts = 5\s*(#.*)?$", HELPER.read_text(encoding="utf-8"))
+
+
+def test_the_helper_requires_powershell_7():
+    """RETIRE-RESTORE-PWSH7-REQUIRES-PIN-1 (card C). Write-RetirePendingRecordFile calls [IO.File]::Move($src, $dst, $true), a .NET Core-only
+    overload; every caller (Invoke-Lane, Invoke-Workstream, Remove-LaneBulkScratch) starts under pwsh 7, so the file says so instead of
+    failing inside a restore under Windows PowerShell 5.1."""
+    text = HELPER.read_text(encoding="utf-8")
+    assert any(l.strip() == "#Requires -Version 7" for l in text.splitlines()), "missing '#Requires -Version 7'"
+    assert text.isascii()
+
+
+@pytest.mark.skipif(not shutil.which("powershell"), reason="requires Windows PowerShell 5.1")
+def test_dot_sourcing_the_helper_under_windows_powershell_5_1_is_refused_up_front():
+    r = subprocess.run([shutil.which("powershell"), "-NoProfile", "-NonInteractive", "-Command", f". '{HELPER}'"], capture_output=True, text=True)
+    assert r.returncode != 0 and "requires" in (r.stderr + r.stdout).lower(), (r.returncode, r.stdout, r.stderr)
 
 
 def _restore_with_snapshot(rec_dir, snapshot):
