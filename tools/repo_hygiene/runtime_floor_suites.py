@@ -228,16 +228,21 @@ def _scope_end(lines: list[str], start: int, see_through_comments: bool) -> int:
 def citation_snapshot(manifest: dict, root: Path) -> list[tuple]:
     """Resolve every citation ONCE: [(row id, evidence item, resolved 1-based line or None, problem or None)].
 
-    The report and the verdict are both derived from one snapshot, so a cited file edited while the check runs can
-    never leave them disagreeing."""
+    Each cited file is read once per snapshot, so every citation to it resolves against the same text. The report and
+    the verdict are both derived from one snapshot, so a cited file edited while the check runs can never leave them
+    disagreeing."""
     snapshot = []
+    texts: dict[Path, list[str]] = {}
     for row in manifest["rows"]:
         for item in row.get("evidence", []):
             target = Path(root) / item["file"]
             if not target.is_file():
                 snapshot.append((row["id"], item, None, f"evidence file missing: {item['file']}"))
                 continue
-            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            key = target.resolve()
+            if key not in texts:
+                texts[key] = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = texts[key]
             resolved, problem = resolve_evidence(item, lines)
             snapshot.append((row["id"], item, resolved, (f"{item['file']}: {problem}" if problem else None)))
     return snapshot

@@ -447,6 +447,23 @@ class EvidenceReportTests(unittest.TestCase):
                 self.assertEqual(0 if resolves else 1, code, out)
                 self.assertEqual(1, nreads, out)
 
+    def test_citations_to_one_file_resolve_against_one_read_of_it(self):
+        gone = "# the cited text was edited away\n"
+        data = self.manifest({"line": 8, "contains": "'only-here'"}, {"line": 12, "contains": "$tail"})
+        real, seen = Path.read_text, []
+
+        def read_text(path, *args, **kwargs):
+            if path.name != "mod.psm1":
+                return real(path, *args, **kwargs)
+            seen.append(path)
+            return (CITED_MODULE, gone)[min(len(seen), 2) - 1]
+
+        with mock.patch.object(Path, "read_text", read_text):
+            snapshot = rfs.citation_snapshot(data, self.root)
+        self.assertEqual([8, 12], [resolved for _, _, resolved, _ in snapshot], snapshot)
+        self.assertEqual([None, None], [problem for _, _, _, problem in snapshot], snapshot)
+        self.assertEqual(1, len(seen), seen)
+
     def test_check_evidence_flag_passes_on_the_checked_in_manifest(self):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
