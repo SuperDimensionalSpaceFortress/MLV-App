@@ -882,15 +882,13 @@ function Invoke-UmRunDrop {
         # may claim it the instant it appears, and by now this call's own metadata already
         # governs it (claimed before a single side-file or job byte was copied).
         $jobLocalSha = (Get-FileHash -LiteralPath $ScriptPath -Algorithm SHA256).Hash
+        # r6 (Dot 77250bdf): $tmp is assigned once, here, and is the only path the finally below removes: a leaf under this call's own inbox whose name
+        # carries this call's fresh $nonce (a GUID) and a JobId that passed UMRUN_JOBID_INVALID (no separator), so it names only a file this call created.
+        # A copier failure is cleaned up by that same finally ($jobPlaced is still false), not by a second removal site.
         $tmp = Join-Path $Inbox "$id.$nonce.job.tmp"
         $jobPlaced = $false
         try {
-            try {
-                & $Copier $ScriptPath $tmp
-            } catch {
-                if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
-                throw
-            }
+            & $Copier $ScriptPath $tmp
             # ATTR3-ADMIT-CONTENT-PIN-1 round 2g (fable MAJOR): the job's own temporary copy used to be
             # renamed with NO verification at all -- contradicting this module's own header invariant
             # (above) that a share-side temporary is re-read and verified before its rename, which the
@@ -943,7 +941,9 @@ function Invoke-UmRunDrop {
                         if ($republished -cne $notAfterText) {
                             $metaObj['notAfterUtc'] = $republished
                             $metaJson = $metaObj | ConvertTo-Json -Compress
-                            $repubTmp = Join-Path $Inbox "$id.$nonce.meta.tmp"
+                            # r6 (Dot 77250bdf): the re-publish temp IS the claim's own nonce temp name ($metaTmp above, which that claim's rename
+                            # already moved away), never a new derivation, so the Move and the cleanup below touch only a name this call created.
+                            $repubTmp = $metaTmp
                             try {
                                 Set-Content -LiteralPath $repubTmp -Value $metaJson -Encoding ascii -NoNewline
                                 if ($TestHookAfterNotAfterRepublishTmpWritten) { & $TestHookAfterNotAfterRepublishTmpWritten $repubTmp }

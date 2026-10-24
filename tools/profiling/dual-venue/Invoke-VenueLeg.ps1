@@ -351,7 +351,7 @@ function Submit-VenueJob([string]$ScriptPath, [string]$JobId, [int]$TimeoutSec, 
 function Write-NotAfterVerdict($Submitted) {
     # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: one DVE_NOT_AFTER=<json> line per submit (the drop's own notAfterUtc, the bound's anchor, the measured
     # drop, covered true / false / null = unmeasured). r2: the bound is drop-relative, so covered is true by construction; DVE_NOT_AFTER_DROP_LATE is
-    # now a DEFECT signal (the drop did not count the budget from itself, or read its clock more than the slack before the job was visible): the agent may
+    # now a DEFECT signal (r6, Grok G7: the drop did not count the budget from the clock read it reports, which um-run counts its waits from): the agent may
     # then refuse the job (notAfterExpired) while this client still waits, and that is named here, before the outcome, never left for a reader to guess.
     $v = $Submitted.notAfter
     if ($null -eq $v) { return }

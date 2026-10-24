@@ -124,7 +124,9 @@ def run_cover_cases(cases: list[dict]) -> list[dict]:
     'dropReports': 'relative' (default) | 'anchor' | None}. The drop is placed that many seconds after the anchor (the delayed-drop seam) and
     Test-DvNotAfterCoversDrop judges it. For a drop-relative bound (budgetSec set) the value the drop reports is: 'relative', what UmRunDrop.psm1 writes,
     min(drop + budgetSec, capUtc), with the drop's clock read at the drop; 'anchor', a DEFECTIVE drop that counted the budget from the bound's anchor (r1's
-    absolute value); None, no 'job not-after:' line. Each answer is the judge's result."""
+    absolute value); None, no 'job not-after:' line. r6 (Grok G7): 'sampledAfterSec' (optional, 'relative' only) puts the drop's clock read that many
+    seconds after the anchor instead of at the drop, the value counted from it: an honest drop whose 'submitted' line came later (a stall after
+    visibility). Each answer is the judge's result."""
     script = (
         "$cases = [Console]::In.ReadToEnd() | ConvertFrom-Json\n"
         "$o = { param($t) [DateTime]::Parse([string]$t, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }\n"
@@ -141,9 +143,10 @@ def run_cover_cases(cases: list[dict]) -> list[dict]:
         "    $mode = $(if ($c.PSObject.Properties.Name -contains 'dropReports') { $c.dropReports } else { 'relative' })\n"
         "    $dna = $null\n"
         "    if ($null -ne $b.budgetSec -and $null -ne $mode -and $null -ne $drop) {\n"
-        "      $v0 = $(if ($mode -eq 'anchor') { & $o $b.notAfterUtc } else { $drop.AddSeconds([double]$b.budgetSec) })\n"
+        "      $read = $(if ($c.PSObject.Properties.Name -contains 'sampledAfterSec') { (& $o $b.anchorUtc).AddSeconds([double]$c.sampledAfterSec) } else { $drop })\n"
+        "      $v0 = $(if ($mode -eq 'anchor') { & $o $b.notAfterUtc } else { $read.AddSeconds([double]$b.budgetSec) })\n"
         "      if ($mode -ne 'anchor' -and $b.capUtc -and (& $o $b.capUtc) -lt $v0) { $v0 = & $o $b.capUtc }\n"
-        "      $dna = [pscustomobject]@{ notAfterUtc = $v0; sampledUtc = $drop; budgetSec = $b.budgetSec; capUtc = [string]$b.capUtc }\n"
+        "      $dna = [pscustomobject]@{ notAfterUtc = $v0; sampledUtc = $read; budgetSec = $b.budgetSec; capUtc = [string]$b.capUtc }\n"
         "    }\n"
         "    $v = Test-DvNotAfterCoversDrop -NotAfter $b -DropVisibleUtc $drop -DropNotAfter $dna -JobId 'job-x'\n"
         "    [ordered]@{ jobId = $v.jobId; notAfterUtc = [string]$v.notAfterUtc; form = $v.form; boundNotAfterUtc = [string]$b.notAfterUtc; source = $v.source;\n"
@@ -359,6 +362,28 @@ class DelayedDropTests(unittest.TestCase):
                 self.assertEqual(r["covered"], d <= SLACK_SEC)
                 if not r["covered"]:
                     self.assertIn("DVE_NOT_AFTER_DROP_LATE (defect", r["why"])
+
+    def test_grok_g7_a_stall_after_visibility_longer_than_the_slack_is_no_false_alarm(self) -> None:
+        # r6 (Grok G7 on 4ea77b88): the drop reads its clock (sampledUtc) and makes the job visible; um-run's 'submitted' line comes d s later (the drop's
+        # return, a stalled share). um-run r5 counts its queue and admission waits from sampledUtc, so no wait moved and the value covers them all. At
+        # 4ea77b88 the witness judged from the 'submitted' line and named every d > the slack DVE_NOT_AFTER_DROP_LATE (marginSec = slack - d): a false alarm.
+        cases = [0, 30, 61, 300, 3600]
+        answers = run_cover_cases([{"bound": dict(self.UNCAPPED, NowUtc=self.NOW), "dropAfterSec": d, "sampledAfterSec": 0} for d in cases])
+        for d, r in zip(cases, answers):
+            with self.subTest(dropAfterSec=d):
+                self.assertNotIn("error", r, r)
+                self.assertEqual(parse_o(r["dropSampledUtc"]), parse_o(self.NOW))
+                self.assertAlmostEqual(r["dropDelaySec"], d, places=3)
+                self.assertTrue(r["covered"], r)
+                self.assertAlmostEqual(r["marginSec"], SLACK_SEC, places=3)
+                self.assertGreaterEqual(parse_o(r["notAfterUtc"]), parse_o(r["dropSampledUtc"]) + timedelta(seconds=r["waitSec"]))
+                self.assertNotIn("DVE_NOT_AFTER_DROP_LATE", r["why"])
+        # the witness stays a witness: a value counted from earlier than the read the drop reports is still named, by its distance from that read
+        defect = run_cover_cases([{"bound": dict(self.UNCAPPED, NowUtc=self.NOW), "dropAfterSec": 300, "sampledAfterSec": 300, "dropReports": "anchor"}])[0]
+        self.assertNotIn("error", defect, defect)
+        self.assertFalse(defect["covered"], defect)
+        self.assertAlmostEqual(defect["marginSec"], SLACK_SEC - 300, places=3)
+        self.assertIn("DVE_NOT_AFTER_DROP_LATE (defect: the drop did not count the budget from the clock read it reports", defect["why"])
 
     def test_an_unmeasured_drop_is_never_covered(self) -> None:
         r = self.cover(self.UNCAPPED, None)
@@ -968,15 +993,16 @@ class PostVisibilityTailNotAfterTests(unittest.TestCase):
         self.job = local / "job-x.job.ps1"
         self.job.write_text("Write-Output 'hi'\n", encoding="utf-8")
 
-    def run_tail(self, *, mode: str, stall_sec: float) -> dict:
-        """mode 'um-run': um-run.ps1 end to end (budget form, the waits above); 'drop': Invoke-UmRunDrop alone with the same budget. Returns {threw,
-        endUtc (the instant the call returned or threw), meta, fired (the command the stall fired in, '' if none), stallAtUtc, markerAtUtc,
-        tmpChecksAfterVisible (Test-Path calls naming the job's temporary after the job was visible)}."""
+    def run_tail(self, *, mode: str, stall_sec: float, marker: bool = True) -> dict:
+        """mode 'um-run': um-run.ps1 end to end (budget form, the waits above); 'drop': Invoke-UmRunDrop alone with the same budget. marker=False (r6, G8):
+        no admission-wait marker ever lands. Returns {threw, endUtc (the instant the call returned or threw), meta, fired (the command the stall fired in,
+        '' if none), stallAtUtc, markerAtUtc, tmpChecksAfterVisible (Test-Path calls naming the job's temporary after the job was visible), loops (um-run
+        wait-loop iterations, its TestHookAtLoopTop seam)}."""
         budget = self.QUEUE_SEC + self.ADMIT_SEC + self.TAIL_SLACK_SEC
         script = (
             "$ErrorActionPreference = 'Stop'\n"
             "$c = [Console]::In.ReadToEnd() | ConvertFrom-Json\n"
-            f"$global:TailStall = @{{ sec = [double]$c.stall; job = '{self.inbox / 'job-x.job.ps1'}'; fired = ''; atUtc = ''; markerAtUtc = ''; tmpChecks = 0 }}\n"
+            f"$global:TailStall = @{{ sec = [double]$c.stall; job = '{self.inbox / 'job-x.job.ps1'}'; fired = ''; atUtc = ''; markerAtUtc = ''; tmpChecks = 0; loops = 0 }}\n"
             "function global:Invoke-TailStall([string]$Command, [object[]]$ArgList) {\n"
             "  $s = $global:TailStall\n"
             "  if (-not [IO.File]::Exists($s.job)) { return }\n"
@@ -992,7 +1018,8 @@ class PostVisibilityTailNotAfterTests(unittest.TestCase):
             "  if ($c.mode -eq 'um-run') {\n"
             f"    $p = @{{ ScriptPath = '{self.job}'; AgentShare = '{self.share}'; JobId = 'job-x'; TimeoutSec = 60; PollSeconds = 1; MaxClaimedWaitSec = 60\n"
             "      MaxQueueWaitSec = [int]$c.queue; MaxAdmissionWaitSec = [int]$c.admit; NotAfterBudgetSec = [int]$c.budget\n"
-            "      TestHookAtQueueDeadline = { if (-not [IO.File]::Exists($marker)) { [IO.File]::WriteAllText($marker, '{\"jobId\":\"job-x\",\"phase\":\"admission-wait\",\"childPid\":null}')\n"
+            "      TestHookAtLoopTop = { $global:TailStall.loops = 1 + [int]$global:TailStall.loops } }\n"
+            "    if ($c.marker) { $p.TestHookAtQueueDeadline = { if (-not [IO.File]::Exists($marker)) { [IO.File]::WriteAllText($marker, '{\"jobId\":\"job-x\",\"phase\":\"admission-wait\",\"childPid\":null}')\n"
             "        $global:TailStall.markerAtUtc = [DateTime]::UtcNow.ToString('o') } } }\n"
             f"    $null = & '{UM_RUN}' @p\n"
             "  } else {\n"
@@ -1005,9 +1032,9 @@ class PostVisibilityTailNotAfterTests(unittest.TestCase):
             "$meta = $(if ([IO.File]::Exists($metaPath)) { [IO.File]::ReadAllText($metaPath) } else { '' })\n"
             "$s = $global:TailStall\n"
             "[Console]::Out.WriteLine('TAIL_RESULT=' + (ConvertTo-Json -Compress -InputObject ([ordered]@{ threw = $threw; endUtc = $endUtc; meta = $meta;\n"
-            "  fired = $s.fired; stallAtUtc = $s.atUtc; markerAtUtc = $s.markerAtUtc; tmpChecksAfterVisible = [int]$s.tmpChecks })))\n"
+            "  fired = $s.fired; stallAtUtc = $s.atUtc; markerAtUtc = $s.markerAtUtc; tmpChecksAfterVisible = [int]$s.tmpChecks; loops = [int]$s.loops })))\n"
         )
-        payload = {"mode": mode, "stall": stall_sec, "queue": self.QUEUE_SEC, "admit": self.ADMIT_SEC, "budget": budget}
+        payload = {"mode": mode, "stall": stall_sec, "queue": self.QUEUE_SEC, "admit": self.ADMIT_SEC, "budget": budget, "marker": marker}
         p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], input=json.dumps(payload), capture_output=True, text=True,
                            timeout=180)
         lines = [l for l in p.stdout.splitlines() if l.startswith("TAIL_RESULT=")]
@@ -1039,6 +1066,39 @@ class PostVisibilityTailNotAfterTests(unittest.TestCase):
         self.assertEqual(r["threw"], "", r)
         self.assertEqual(r["tmpChecksAfterVisible"], 0, r)
         self.assertEqual(sorted(p.name for p in self.inbox.iterdir()), ["job-x.job.ps1", "job-x.meta.json"])
+
+    def test_grok_g8_a_stall_after_visibility_past_the_queue_wait_retracts_on_the_first_poll_before_not_after(self) -> None:
+        # r6 (Grok G8, escaped-defect test): the other branch r5 relies on. A stall after visibility longer than MaxQueueWaitSec, and no claim marker ever:
+        # the queue deadline (sampledUtc + queue) has already passed when um-run starts waiting, so its FIRST poll takes the existing RETRACTED path and
+        # returns before notAfterUtc, never polling on past the deadline.
+        self.assertGreater(self.STALL_SEC, self.QUEUE_SEC)
+        r = self.run_tail(mode="um-run", stall_sec=self.STALL_SEC, marker=False)
+        self.assertTrue(r["threw"].startswith("RETRACTED:"), r)
+        self.assertNotEqual(r["fired"], "", "the stall fired after the job became visible")
+        self.assertEqual(r["markerAtUtc"], "", "no claim marker")
+        self.assertEqual(r["loops"], 1, f"um-run retracted on wait-loop iteration {r['loops']}, not its first poll")
+        # the claim is withdrawn with the job, so the visible value is read from the drop's own 'job not-after:' line (um-run echoes it)
+        m = re.search(r"(?m)^job not-after: job-x\.meta\.json notAfterUtc=(\S+) sampledUtc=(\S+) budgetSec=", r["stdout"])
+        self.assertIsNotNone(m, r["stdout"])
+        not_after, sampled = parse_o(m.group(1)), parse_o(m.group(2))
+        end = parse_o(r["endUtc"])
+        self.assertGreater(parse_o(r["stallAtUtc"]) + timedelta(seconds=self.STALL_SEC), sampled + timedelta(seconds=self.QUEUE_SEC),
+                           "the stall ran past the queue deadline before um-run started waiting")
+        self.assertLess(end, not_after, f"um-run returned {(end - not_after).total_seconds():.3f} s after notAfterUtc ({utc_o(not_after)})")
+        self.assertEqual(sorted(p.name for p in self.inbox.iterdir()), [], "the job and its claim were withdrawn")
+
+    def test_r6_each_drop_temp_removal_or_move_takes_only_the_name_this_call_created(self) -> None:
+        # r6 (Dot 77250bdf): the reasons the owner-footage route guard (test_dual_venue_owner_footage_gate.py ROUTE_DELETE_ALLOWED) records for the three
+        # UmRunDrop.psm1 sites hold BY CONSTRUCTION: each target variable is assigned exactly once, from this call's own nonce name in its own inbox.
+        code = "\n".join(l for l in DROP_MODULE.read_text(encoding="utf-8").splitlines() if not l.lstrip().startswith("#"))
+        self.assertIn("if ($JobId -and $JobId -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { throw \"UMRUN_JOBID_INVALID '$JobId'\" }", code)
+        self.assertEqual(code.count("$nonce = [guid]::NewGuid().ToString('N')"), 1)
+        for var, rhs in (("$tmp", 'Join-Path $Inbox "$id.$nonce.job.tmp"'), ("$metaTmp", 'Join-Path $Inbox "$id.$nonce.meta.tmp"'),
+                         ("$repubTmp", "$metaTmp"), ("$metaFinal", 'Join-Path $Inbox "$id.meta.json"')):
+            with self.subTest(var=var):
+                assigns = re.findall(r"(?m)^\s*" + re.escape(var) + r"\s*=\s*(.+?)\s*$", code)
+                self.assertEqual(assigns, [rhs], f"{var} is assigned once, from the created name")
+        self.assertEqual(code.count("Remove-Item -LiteralPath $tmp "), 1, "one removal site for the job temp")
 
 
 def run_um_run_args_cases(cases: list[dict]) -> list[dict]:
@@ -1111,7 +1171,9 @@ throw 'UNRESOLVED: stub agent may still own the job'
 # own setup and share I/O) and then prints the lines real um-run prints once the job file is in place (Write-Host): r2, the drop's 'job not-after:' line, its
 # notAfterUtc counted from the drop's own clock as UmRunDrop.psm1 does (the visible instant + -NotAfterBudgetSec), then 'submitted <id> -> <path>'.
 # DROP_STAMP_AFTER_SEC places that drop (the leg's, not the probe's) that many seconds after the call instead and stamps both records then: a drop later than
-# a test should sleep for. DROP_IGNORES_BUDGET=1 makes the leg's drop DEFECTIVE: it counts the budget from the call, not from the drop.
+# a test should sleep for. DROP_IGNORES_BUDGET=1 makes the leg's drop DEFECTIVE: it counts the budget from the call, not from the clock read it reports
+# (r6: sampledUtc stays the visible instant). r6 (Grok G7): DROP_SAMPLED_AT_CALL=1 is an HONEST drop that read its clock at the call and counted from it,
+# its stamped records coming later (a stall after visibility).
 # Advanced, so it can write the stamped records itself; the record says when the job became visible (visibleUtc, never later than the records' own time).
 DROP_UM_RUN = r"""
 [CmdletBinding()] param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec,
@@ -1121,9 +1183,10 @@ $called = [DateTime]::UtcNow
 if ($env:DROP_DELAY_MS) { Start-Sleep -Milliseconds ([int]$env:DROP_DELAY_MS) }
 $stamped = $env:DROP_STAMP_AFTER_SEC -and $JobId -notlike '*-health'
 $visible = $(if ($stamped) { $called.AddSeconds([double]$env:DROP_STAMP_AFTER_SEC) } else { [DateTime]::UtcNow })
-$from = $(if ($env:DROP_IGNORES_BUDGET -and $JobId -notlike '*-health') { $called } else { $visible })
+$sampled = $(if ($env:DROP_SAMPLED_AT_CALL -and $JobId -notlike '*-health') { $called } else { $visible })
+$from = $(if ($env:DROP_IGNORES_BUDGET -and $JobId -notlike '*-health') { $called } else { $sampled })
 $dropNotAfter = $from.AddSeconds($NotAfterBudgetSec).ToString('o')
-$lines = @("job not-after: $JobId.meta.json notAfterUtc=$dropNotAfter sampledUtc=$($from.ToString('o')) budgetSec=$NotAfterBudgetSec capUtc=none",
+$lines = @("job not-after: $JobId.meta.json notAfterUtc=$dropNotAfter sampledUtc=$($sampled.ToString('o')) budgetSec=$NotAfterBudgetSec capUtc=none",
     "submitted $JobId -> $AgentShare\inbox\$JobId.job.ps1")
 foreach ($line in $lines) {
     if ($stamped) {
@@ -1256,6 +1319,21 @@ class VenueLegNotAfterTests(unittest.TestCase):
         # named BEFORE the leg's outcome, so a reader of a refused job (the agent's notAfterExpired) sees why first
         lines = out.splitlines()
         self.assertLess(lines.index(late[0]), next(i for i, l in enumerate(lines) if l.startswith("DVE_OUTCOME=")))
+
+    def test_grok_g7_a_stall_after_visibility_is_no_false_alarm_end_to_end(self) -> None:
+        # r6 (Grok G7): an honest drop read its clock at the call and counted from it; um-run's lines are stamped 300 s later (a stall after visibility,
+        # longer than the slack). um-run r5 counts its waits from that read, so nothing overran: covered, margin = the slack, nothing named late. At
+        # 4ea77b88 the leg printed DVE_NOT_AFTER_DROP_LATE here (shortBySec 240).
+        self.h.um.write_text(DROP_UM_RUN, encoding="utf-8")
+        recs, before, after, out = self.run_leg(env={"DROP_STAMP_AFTER_SEC": "300", "DROP_SAMPLED_AT_CALL": "1"})
+        self.assertIn("DVE_OUTCOME=UNRESOLVED", out)
+        probe, leg = not_after_lines(out)
+        self.assertTrue(probe["covered"], probe)
+        self.assertGreaterEqual(leg["dropDelaySec"], 300)
+        self.assertEqual(parse_o(leg["dropSampledUtc"]), parse_o(recs[1]["calledUtc"]))
+        self.assertTrue(leg["covered"], leg)
+        self.assertAlmostEqual(leg["marginSec"], SLACK_SEC, places=2)
+        self.assertNotIn("DVE_NOT_AFTER_DROP_LATE", out)
 
     def test_the_submits_still_print_their_id_first_and_go_through_one_helper(self) -> None:
         text = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
