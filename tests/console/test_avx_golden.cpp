@@ -220,6 +220,31 @@ private:
     qint64 last_ms_ = 0;
 };
 
+// Why a sample has, or lacks, the CPU time.
+enum class CpuSampleStatus {
+    not_sampled,
+    ok,
+    pid_zero,
+    open_denied,        // OpenProcess failed with ERROR_ACCESS_DENIED: the host refused the query
+    open_failed_other,  // OpenProcess failed otherwise, e.g. the child is already gone
+    times_failed,       // the child opened, GetProcessTimes failed
+    not_windows,
+};
+
+static const char * cpu_sample_status_name(CpuSampleStatus status)
+{
+    switch (status) {
+    case CpuSampleStatus::not_sampled: return "not_sampled";
+    case CpuSampleStatus::ok: return "ok";
+    case CpuSampleStatus::pid_zero: return "pid_zero";
+    case CpuSampleStatus::open_denied: return "open_denied";
+    case CpuSampleStatus::open_failed_other: return "open_failed_other";
+    case CpuSampleStatus::times_failed: return "times_failed";
+    case CpuSampleStatus::not_windows: return "not_windows";
+    }
+    return "unknown";
+}
+
 // A child's CPU time and thread count as seen from the parent (known only on Windows, and only when
 // the child could still be opened). Two CPU samples tell a spinning child (time grows) from a
 // blocked one (time stands still).
@@ -228,13 +253,22 @@ struct ChildSample {
     qint64 cpu_ms = 0;
     bool has_threads = false;
     int threads = 0;
+    CpuSampleStatus cpu_status = CpuSampleStatus::not_sampled;
+    unsigned long cpu_error = 0;  // GetLastError() of the call that failed
 };
+
+// Tests set this to force what the sampler returns; it is empty in every real run.
+static std::function<ChildSample(qint64)> g_sample_child_override;
 
 static ChildSample sample_child(qint64 pid)
 {
+    if (g_sample_child_override) {
+        return g_sample_child_override(pid);
+    }
     ChildSample sample;
 #ifdef Q_OS_WIN
     if (pid == 0) {
+        sample.cpu_status = CpuSampleStatus::pid_zero;
         return sample;
     }
     const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
@@ -246,8 +280,16 @@ static ChildSample sample_child(qint64 pid)
             };
             sample.has_cpu = true;
             sample.cpu_ms = static_cast<qint64>((as_u64(kernel) + as_u64(user)) / 10000u);
+            sample.cpu_status = CpuSampleStatus::ok;
+        } else {
+            sample.cpu_error = GetLastError();
+            sample.cpu_status = CpuSampleStatus::times_failed;
         }
         CloseHandle(process);
+    } else {
+        sample.cpu_error = GetLastError();
+        sample.cpu_status = sample.cpu_error == ERROR_ACCESS_DENIED ? CpuSampleStatus::open_denied
+                                                                    : CpuSampleStatus::open_failed_other;
     }
     const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snapshot != INVALID_HANDLE_VALUE) {
@@ -264,9 +306,54 @@ static ChildSample sample_child(qint64 pid)
     }
 #else
     Q_UNUSED(pid);
+    sample.cpu_status = CpuSampleStatus::not_windows;
 #endif
     return sample;
 }
+
+// What a CPU-sample assertion makes of a sample. Only a refused query is a limit of the host rather
+// than a fault, so only it is noted instead of failed.
+enum class CpuSampleVerdict { sampled, query_denied, missing };
+
+static CpuSampleVerdict cpu_sample_verdict(const ChildSample & sample)
+{
+    if (sample.has_cpu) {
+        return CpuSampleVerdict::sampled;
+    }
+    return sample.cpu_status == CpuSampleStatus::open_denied ? CpuSampleVerdict::query_denied
+                                                             : CpuSampleVerdict::missing;
+}
+
+static std::string describe_cpu_sample(const ChildSample & sample)
+{
+    return std::string("cpu_status=") + cpu_sample_status_name(sample.cpu_status)
+        + " error=" + std::to_string(sample.cpu_error);
+}
+
+// Prints the CPU_QUERY_DENIED note for a sample whose query the host refused; true when it did.
+static bool note_cpu_query_denied(const char * file, int line, const char * expression, const ChildSample & sample)
+{
+    if (cpu_sample_verdict(sample) != CpuSampleVerdict::query_denied) {
+        return false;
+    }
+    std::cout << "CPU_QUERY_DENIED assertion skipped at " << file << ":" << line << ": " << expression << " "
+              << describe_cpu_sample(sample) << " (the host refused the CPU-times query; the rest of the test still asserts)\n";
+    return true;
+}
+
+// ASSERT_TRUE(sample.has_cpu), except that a refused query is noted and the test goes on. Every
+// other missing sample fails and names its reason.
+static void assert_cpu_sampled(const char * file, int line, const char * expression, const ChildSample & sample)
+{
+    ::minitest::note_assertion();
+    if (cpu_sample_verdict(sample) == CpuSampleVerdict::missing) {
+        ::minitest::fail(file, line, std::string(expression) + ".has_cpu", describe_cpu_sample(sample));
+    }
+    note_cpu_query_denied(file, line, expression, sample);
+}
+
+#define ASSERT_CPU_SAMPLED(SAMPLE) assert_cpu_sampled(__FILE__, __LINE__, #SAMPLE, (SAMPLE))
+#define CPU_QUERY_DENIED(SAMPLE) note_cpu_query_denied(__FILE__, __LINE__, #SAMPLE, (SAMPLE))
 
 // What the parent had seen when a run's bound expired, frozen before the kill. The final drain after
 // the kill may still add late output to the shown tail, but never moves these, so the timeout report
@@ -954,8 +1041,8 @@ TEST(AvxParityRunner, TimeoutSnapshotNamesTheLastStageAndHowLongTheChildWasSilen
 #ifdef Q_OS_WIN
     ASSERT_TRUE(result.child_at_kill.has_threads);
     ASSERT_TRUE(result.child_at_kill.threads > 0);
-    ASSERT_TRUE(result.child_at_kill.has_cpu);
-    ASSERT_TRUE(result.child_at_last_stage.has_cpu);
+    ASSERT_CPU_SAMPLED(result.child_at_kill);
+    ASSERT_CPU_SAMPLED(result.child_at_last_stage);
 #endif
 
     const QString text = describe_process_failure(QStringLiteral("avx"),
@@ -1074,10 +1161,152 @@ TEST(AvxParityRunner, OutputAfterTheKillNeverMovesTheTimeoutSnapshot)
     ASSERT_TRUE(result.last_output_ms > result.killed_at_ms);
     ASSERT_TRUE(result.last_stage_line == QByteArray("avx_parity_helper t=2ms stage=late-after-kill stand-in"));
 #ifdef Q_OS_WIN
-    ASSERT_TRUE(snapshot.child_at_last_stage.has_cpu);
+    ASSERT_CPU_SAMPLED(snapshot.child_at_last_stage);
     // Both CPU samples come from before the kill, so the interval between them is never negative.
-    ASSERT_TRUE(snapshot_number(text, QStringLiteral("child_cpu_since_last_stage_s")) >= 0.0);
+    // With either query refused there is no interval to check.
+    const bool stage_cpu_denied = cpu_sample_verdict(snapshot.child_at_last_stage) == CpuSampleVerdict::query_denied;
+    const bool kill_cpu_denied = CPU_QUERY_DENIED(result.child_at_kill);
+    if (!stage_cpu_denied && !kill_cpu_denied) {
+        ASSERT_TRUE(snapshot_number(text, QStringLiteral("child_cpu_since_last_stage_s")) >= 0.0);
+    }
 #endif
+}
+
+// Win32 error codes the forced samples carry, spelled out so the tests also build off Windows.
+static const unsigned long kErrorAccessDenied = 5;       // ERROR_ACCESS_DENIED
+static const unsigned long kErrorInvalidParameter = 87;  // ERROR_INVALID_PARAMETER: the pid names no process
+
+// Forces what sample_child returns until it goes out of scope.
+class ForcedChildSample {
+public:
+    ForcedChildSample(CpuSampleStatus status, unsigned long error)
+    {
+        g_sample_child_override = [status, error](qint64) {
+            ChildSample sample;
+            sample.cpu_status = status;
+            sample.cpu_error = error;
+            return sample;
+        };
+    }
+    ~ForcedChildSample() { g_sample_child_override = nullptr; }
+};
+
+// What ASSERT_CPU_SAMPLED printed for `sample`, and whether it failed (with its message).
+struct CpuAssertOutcome {
+    bool failed = false;
+    std::string failure;
+    std::string printed;
+};
+
+static CpuAssertOutcome run_cpu_assert(const ChildSample & sample)
+{
+    CpuAssertOutcome outcome;
+    std::ostringstream captured;
+    std::streambuf * const original = std::cout.rdbuf(captured.rdbuf());
+    try {
+        ASSERT_CPU_SAMPLED(sample);
+    } catch (const ::minitest::Failure & failure) {
+        outcome.failed = true;
+        outcome.failure = failure.message;
+    }
+    std::cout.rdbuf(original);
+    outcome.printed = captured.str();
+    std::cout << outcome.printed;
+    return outcome;
+}
+
+TEST(AvxParityRunner, CpuSamplerRecordsWhyACpuSampleIsMissing)
+{
+    const ChildSample no_pid = sample_child(0);
+    ASSERT_FALSE(no_pid.has_cpu);
+#ifdef Q_OS_WIN
+    ASSERT_TRUE(no_pid.cpu_status == CpuSampleStatus::pid_zero);
+    // This process can always query itself, so the success path is unchanged and says so.
+    const ChildSample self = sample_child(static_cast<qint64>(GetCurrentProcessId()));
+    ASSERT_TRUE(self.has_cpu);
+    ASSERT_TRUE(self.cpu_status == CpuSampleStatus::ok);
+    ASSERT_EQ(0ul, self.cpu_error);
+    ASSERT_TRUE(self.has_threads);
+#else
+    ASSERT_TRUE(no_pid.cpu_status == CpuSampleStatus::not_windows);
+#endif
+}
+
+// Only a host that refused the CPU-times query (restricted token, AV/EDR handle filtering, a
+// sandboxed runner) is noted instead of failed; every other missing sample still fails.
+TEST(AvxParityRunner, DeniedCpuQueryIsNotedWhileEveryOtherMissingSampleStillFails)
+{
+    {
+        const ForcedChildSample forced(CpuSampleStatus::open_denied, kErrorAccessDenied);
+        const ChildSample denied = sample_child(4242);
+        ASSERT_TRUE(denied.cpu_status == CpuSampleStatus::open_denied);
+        ASSERT_TRUE(cpu_sample_verdict(denied) == CpuSampleVerdict::query_denied);
+        const CpuAssertOutcome outcome = run_cpu_assert(denied);
+        ASSERT_EQ(std::string(), outcome.failure);
+        ASSERT_FALSE(outcome.failed);
+        ASSERT_TRUE(outcome.printed.find("CPU_QUERY_DENIED ") != std::string::npos);
+        ASSERT_TRUE(outcome.printed.find("cpu_status=open_denied error=5") != std::string::npos);
+    }
+
+    // Negative controls: pid 0, a child that is already gone, a failed times query, a sample never
+    // taken, and a host with no sampler all still fail, and the failure names the reason.
+    const struct {
+        CpuSampleStatus status;
+        unsigned long error;
+    } still_failing[] = {
+        {CpuSampleStatus::pid_zero, 0},
+        {CpuSampleStatus::open_failed_other, kErrorInvalidParameter},
+        {CpuSampleStatus::times_failed, kErrorAccessDenied},
+        {CpuSampleStatus::not_sampled, 0},
+        {CpuSampleStatus::not_windows, 0},
+    };
+    for (const auto & forced_case : still_failing) {
+        const ForcedChildSample forced(forced_case.status, forced_case.error);
+        const ChildSample sample = sample_child(4242);
+        ASSERT_TRUE(cpu_sample_verdict(sample) == CpuSampleVerdict::missing);
+        const CpuAssertOutcome outcome = run_cpu_assert(sample);
+        ASSERT_TRUE(outcome.failed);
+        const std::string reason = std::string("cpu_status=") + cpu_sample_status_name(forced_case.status)
+            + " error=" + std::to_string(forced_case.error);
+        ASSERT_TRUE(outcome.failure.find(reason) != std::string::npos);
+        ASSERT_TRUE(outcome.printed.find("CPU_QUERY_DENIED") == std::string::npos);
+    }
+
+    // A real sample passes silently.
+    ChildSample sampled;
+    sampled.has_cpu = true;
+    sampled.cpu_status = CpuSampleStatus::ok;
+    const CpuAssertOutcome outcome = run_cpu_assert(sampled);
+    ASSERT_FALSE(outcome.failed);
+    ASSERT_EQ(std::string(), outcome.printed);
+}
+
+// The forced sampler reaches the samples a timed-out run takes, so the sites that assert on them
+// see the reason.
+TEST(AvxParityRunner, ForcedDeniedSamplerReachesTheTimeoutSnapshot)
+{
+    const QString shell = stand_in_shell();
+    if (shell.isEmpty()) {
+        SKIP_TEST("no shell found to stand in for a hung helper");
+    }
+
+    const ForcedChildSample forced(CpuSampleStatus::open_denied, kErrorAccessDenied);
+    const ProcessRunResult result = run_process_bounded(shell,
+                                                        sleeper_arguments(20),
+                                                        QDir::tempPath(),
+                                                        QProcessEnvironment::systemEnvironment(),
+                                                        1500);
+    ASSERT_TRUE(result.timed_out);
+    ASSERT_TRUE(result.child_at_kill.cpu_status == CpuSampleStatus::open_denied);
+    ASSERT_EQ(kErrorAccessDenied, result.child_at_kill.cpu_error);
+    const CpuAssertOutcome outcome = run_cpu_assert(result.child_at_kill);
+    ASSERT_FALSE(outcome.failed);
+    ASSERT_TRUE(outcome.printed.find("CPU_QUERY_DENIED ") != std::string::npos);
+    const QString text = describe_process_failure(QStringLiteral("avx"),
+                                                  shell,
+                                                  result,
+                                                  QDir(QDir::tempPath()).filePath(QStringLiteral("no-such-hashes.json")));
+    ASSERT_TRUE(text.contains(QStringLiteral("child_cpu_s=unknown")));
 }
 
 // Hangs on the first run; on the second run writes a valid hash json and exits 0.
