@@ -7160,6 +7160,12 @@ function New-VisPng([string]$Path, [int]$Seed, [int]$Chrome, [int]$Bias, [bool]$
     $g.Dispose(); $b.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose()
 }
 """
+# The file's requires_windows_pwsh idiom, with the reason spelled out for a test that drives Read-DvVisualCaptures over real PNGs: New-VisPng above,
+# the reader's pixel measure and New-DvVisualStrip all use System.Drawing (GDI+), which .NET supports only on Windows. Off Windows the reader
+# measures no frame and cannot compose the strip, so it says NOT_CAPTURED -- the venue's fail-closed answer, not the verdict under test (hosted
+# Tests run 40111006101, ubuntu shard 3/4). Get-DvVisualVerdict takes counts, not pixels, so its tests stay unguarded and run on every OS.
+requires_windows_imaging = unittest.skipIf(PWSH is None or sys.platform != "win32",
+                                           "needs pwsh on Windows: the fixture PNGs, the visual reader's pixel measure and its strip composer use System.Drawing")
 
 
 def write_visual_captures(dest: Path, mode: str = "ok") -> None:
@@ -7235,7 +7241,7 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
                                                                   "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
 
 
-def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal: bool = True) -> dict:
+def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal: bool = True, record_source: bool = True) -> dict:
     """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): a STATEFUL model of the window surface the captures print. A forced capture paints
     the frame its label names onto the surface, then prints it, so it CHANGES what the next unforced capture sees; an unforced capture prints the
     surface as it stands. Before every capture the display's own (natural) paint lands the current frame only while it works. natural: healthy
@@ -7243,7 +7249,8 @@ def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal
     (always, but every source frame is one picture: a static clip the app records as identical). order is the app's capture order: interleaved (the
     r2 build b35aa308: unforced k, then forced k, in each slice) or forced-first (r3: the six forced play captures across the first half of the tail,
     then the six unforced ones across the second, then stop_unbound, stop). ordinal writes each entry's forced_paints_before (an r3 build); without
-    it the entries have the r2 shape. Returns the unforced play pictures the model produced (index -> picture) for the trace assertions."""
+    it the entries have the r2 shape. record_source=False leaves source_difference out of visual.json (nothing records whether the source frames
+    differ). Returns the unforced play pictures the model produced (index -> picture) for the trace assertions."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
@@ -7287,7 +7294,9 @@ def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal
     assert proc.returncode == 0, proc.stdout + proc.stderr
     visual = {"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
               "tail_begin_utc": "2026-10-13T22:00:00.000Z", "tail_end_utc": "2026-10-13T22:00:03.100Z", "frames": frames, "frames_written": len(frames),
-              "error": "", "source_difference": "identical" if natural == "static" else "differ"}
+              "error": ""}
+    if record_source:
+        visual["source_difference"] = "identical" if natural == "static" else "differ"
     (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
     (dest / "visual-capture-request.json").write_text(json.dumps({"schema": "mlv-app/visual-capture-request/v1", "requested": True, "probe": "supported",
                                                                   "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
@@ -7298,11 +7307,12 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
     """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2 on b35aa308): pairing each forced capture with an unforced one in the same slice does not
     isolate the NEXT unforced capture from the forced paint. With the display's own paint stuck, unforced k+1 shows forced k's paint (trace: initial,
     F0, F1, F2, F3, F4), so six distinct unforced pictures read as a moving display and neither FROZEN_DISPLAY nor the masking note fires. Driven by
-    write_stateful_visual_captures, whose surface each forced capture mutates."""
+    write_stateful_visual_captures, whose surface each forced capture mutates. The tests that read real PNGs are requires_windows_imaging (r4); the
+    model's own trace and the count-only verdict gate run on every OS."""
 
-    def read(self, d: str, order: str, natural: str, ordinal: bool = True) -> tuple[dict, dict]:
+    def read(self, d: str, order: str, natural: str, ordinal: bool = True, record_source: bool = True) -> tuple[dict, dict]:
         art = Path(d) / "artifacts"
-        unforced = write_stateful_visual_captures(art / "visual", order, natural, ordinal)
+        unforced = write_stateful_visual_captures(art / "visual", order, natural, ordinal, record_source)
         proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
                                   "| ConvertTo-Json -Depth 8 -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -7315,6 +7325,7 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
         self.assertEqual([unforced[k] for k in range(6)], [(3, 120)] + [((600 + 2 * k) % 7, (2 * k // 7) * 30) for k in range(5)])
         self.assertEqual(len(set(unforced.values())), 6, "six distinct unforced pictures over a frozen display")
 
+    @requires_windows_imaging
     def test_the_visual_reader_never_says_ok_over_unforced_captures_a_forced_paint_reached(self) -> None:
         # the r2 build's interleaved order, with the r2 entry shape (no ordinal) and with an ordinal: either way some unforced play captures follow a
         # forced paint, so they cannot show a frozen display; the runner judges only an interval no forced paint entered, and fails closed when that
@@ -7328,6 +7339,7 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
                 self.assertEqual((out["playFrames"], out["observerPaintedPlayFrames"]), (1 if ordinal else 0, 5 if ordinal else 6))
                 self.assertIn("forced paint", out["reason"])
 
+    @requires_windows_imaging
     def test_the_visual_reader_says_frozen_when_the_natural_paint_is_stuck_on_the_r3_order(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-r3-stuck-") as d:
             unforced, out = self.read(d, "forced-first", "stuck")
@@ -7337,6 +7349,7 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
             self.assertIn("the force-paint would have masked this", out["reason"])
             self.assertIs(out["stopUnboundObserverClean"], True)
 
+    @requires_windows_imaging
     def test_the_visual_reader_says_ok_over_a_healthy_display_on_the_r3_order(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-r3-healthy-") as d:
             _, out = self.read(d, "forced-first", "healthy")
@@ -7345,6 +7358,7 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
             self.assertIs(out["stopUnboundObserverClean"], True)
             self.assertEqual([f["forcedPaintsBefore"] for f in out["frames"] if f["kind"] == "play_unbound"], [6] * 6)
 
+    @requires_windows_imaging
     def test_the_visual_reader_reports_a_partial_freeze_on_the_r3_order(self) -> None:
         # the display's own paint stops landing at the fourth unforced capture: three unforced pictures repeat their predecessor while the app's label
         # advanced. Not the whole-tail FROZEN_DISPLAY (three pictures differ), but the receipt counts and says it.
@@ -7353,7 +7367,21 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
             self.assertEqual(out["verdict"], "OK", out["reason"])
             self.assertEqual((out["playFrames"], out["distinctContentHashes"], out["repeatedPlayFrames"]), (6, 3, 3))
             self.assertIn("3 of the 6 unforced play captures repeat", out["reason"])
+            self.assertIn("the display's own paint stopped landing for part of the tail", out["reason"], "the source frames are known to differ")
 
+    @requires_windows_imaging
+    def test_the_visual_reader_names_no_cause_for_a_repeat_over_unknown_source_content(self) -> None:
+        # r4 (Dot a5acb3c8, hub ACK 6386874544): the same repeats, but nothing records whether the source frames differ, so a repeat may be the
+        # source's own picture: the receipt says what it saw and does not name the display as the cause
+        with tempfile.TemporaryDirectory(prefix="vis-r3-partial-unknown-") as d:
+            _, out = self.read(d, "forced-first", "partial", record_source=False)
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertEqual((out["sourceDifference"], out["distinctContentHashes"], out["repeatedPlayFrames"]), ("unknown", 3, 3))
+            self.assertIn("3 of the 6 unforced play captures repeat the picture before them while the app's label advanced", out["reason"])
+            self.assertIn("a possible partial freeze or repeated source pictures, not a proven cause", out["reason"])
+            self.assertNotIn("the display's own paint stopped landing", out["reason"])
+
+    @requires_windows_imaging
     def test_the_visual_reader_waives_a_repeated_source_on_the_r3_order(self) -> None:
         # a static clip: the display paints, but every source frame is the same picture, and the app records the source frames as identical
         with tempfile.TemporaryDirectory(prefix="vis-r3-static-") as d:

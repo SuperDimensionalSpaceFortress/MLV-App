@@ -1962,7 +1962,8 @@ function Read-DvVisualCaptures {
     count as the first of them (no forced paint between any two). Those that record another count, or none (an r2 build), are not judged
     (observerPaintedPlayFrames) -- fewer than two left is VISUAL_ASSESSMENT_UNAVAILABLE. stopUnboundObserverClean says whether stop_unbound also
     follows them with no forced paint between ($null when unknown); repeatedPlayFrames counts judged unforced captures that repeat the picture before
-    them while the app's label advanced (a display whose paint stopped part-way; $null over source frames the app records as identical).
+    them while the app's label advanced (a display whose paint stopped part-way when the source frames are known to differ, a possible one when
+    nothing records them; $null over source frames the app records as identical).
     Never throws for a missing or broken capture: the block says what is missing (a capture is evidence about the leg, not the leg itself).
     #>
     param([bool]$Requested, [string]$OptOutReason, [string]$ArtifactsDir, [string]$EvidenceDir, [Parameter(Mandatory)][string]$LegId, [string]$Header = '')
@@ -2125,7 +2126,10 @@ function Read-DvVisualCaptures {
             if ($b.contentHash -ceq $a.contentHash -and $null -ne $a.displayFrame -and $null -ne $b.displayFrame -and [int]$b.displayFrame -ne [int]$a.displayFrame) { $b.index }
         }).Count
         if ($block.repeatedPlayFrames -gt 0 -and $block.distinctContentHashes -gt 1) {
-            $repeatNote = "$($block.repeatedPlayFrames) of the $($play.Count) unforced play captures repeat the picture before them while the app's label advanced: the display's own paint stopped landing for part of the tail"
+            # the cause is named only over source frames known to differ; over unknown source content a repeat may be the source's own (Dot a5acb3c8)
+            $repeatNote = "$($block.repeatedPlayFrames) of the $($play.Count) unforced play captures repeat the picture before them while the app's label advanced: " + $(
+                if ($block.sourceDifference -ceq 'known-differ') { "the display's own paint stopped landing for part of the tail" }
+                else { "nothing records whether the source frames differ, so this is a possible partial freeze or repeated source pictures, not a proven cause" })
             if (-not $block.reason) { $block.reason = $repeatNote }
         }
     }
