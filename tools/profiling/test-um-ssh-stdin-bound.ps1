@@ -17,6 +17,11 @@
 # (-ProbeDeadlineSeconds, default 20). -ProbeSshPath swaps the probe executable, -HungProbe swaps in
 # a fake that holds stdout open and never exits, and -KnownHostsOnly runs just that scenario; the
 # wrapper test uses all three to prove a hung probe fails the guard at the deadline, not never.
+#
+# UM-SSH-G-PROBE-CLEANUP-HONESTY-1: the timeout message reports what happened (kill attempted or threw, reap
+# confirmed or unconfirmed; a root that exited with a descendant still holding stdout is a drain timeout, not a
+# kill). -ProbeDeadlineSeconds must be 1..300, else exit 2. -ProbeKill Noop|Throw are test seams for the
+# unconfirmed-reap and kill-exception messages.
 [CmdletBinding()]
 param(
     [string]$ScriptUnderTest = (Join-Path $PSScriptRoot 'um-ssh.ps1'),
@@ -24,10 +29,19 @@ param(
     [string]$ProbeSshPath = '',
     [int]$ProbeDeadlineSeconds = 20,
     [switch]$HungProbe,
-    [switch]$KnownHostsOnly
+    [switch]$KnownHostsOnly,
+    [ValidateSet('Real', 'Noop', 'Throw')][string]$ProbeKill = 'Real'
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+
+# UM-SSH-G-PROBE-CLEANUP-HONESTY-1: the probe deadline must be positive and bounded; 0 or a negative value would
+# fail every probe at once and a huge one would defeat the bound this parameter exists to give. Refused before
+# the sandbox is created, so nothing is left behind.
+if ($ProbeDeadlineSeconds -lt 1 -or $ProbeDeadlineSeconds -gt 300) {
+    [Console]::Error.WriteLine("test-um-ssh-stdin-bound: -ProbeDeadlineSeconds must be between 1 and 300 seconds (got $ProbeDeadlineSeconds)")
+    exit 2
+}
 
 $pwshExe = (Get-Process -Id $PID).Path
 $sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("um-ssh-test-" + [Guid]::NewGuid().ToString('N').Substring(0, 12))
@@ -185,6 +199,29 @@ function Test-WallClockBound([string]$Script, [string]$Tag) {
     return $f
 }
 
+# UM-SSH-G-PROBE-CLEANUP-HONESTY-1: the message says what actually happened to the probe, never more.
+# -ProbeKill Noop / Throw are test seams: the kill does nothing, or raises, so a reap that cannot be
+# confirmed and a kill exception can be exercised without an unkillable process.
+function Invoke-ProbeKill($Proc) {
+    switch ($ProbeKill) {
+        'Noop' { }
+        'Throw' { throw 'simulated kill failure' }
+        default { $Proc.Kill($true) }
+    }
+}
+
+function Stop-HungProbe($Proc, [bool]$RootExited) {
+    if ($RootExited) {
+        # The root is gone but a descendant still holds the stdout pipe: there is nothing left to kill by
+        # pid, so say that instead of claiming a tree kill. (Descendants are not tracked once the root exits.)
+        return "known_hosts: ssh -G exited (code $($Proc.ExitCode)) but its stdout drain did not finish within $ProbeDeadlineSeconds s; a descendant still holds the pipe open; the descendant was not killed and the drain was abandoned"
+    }
+    $kill = 'kill attempted'
+    try { Invoke-ProbeKill $Proc } catch { $kill = "kill attempted but threw: $($_.Exception.Message)" }
+    $reap = if ($Proc.WaitForExit(5000)) { 'reap confirmed' } else { 'reap unconfirmed (still running 5 s after the kill)' }
+    return "known_hosts: ssh -G did not exit within $ProbeDeadlineSeconds s; $kill; $reap"
+}
+
 # UM-SSH-KNOWN-HOSTS-BANG-PATH-1: ssh splits the VALUE of UserKnownHostsFile on whitespace, so a
 # known_hosts path under 'C:\!Layi Wkspc\...' (TEMP inside the repo) must reach ssh quoted. The
 # temp dir below carries a double space (a split collapses it to one) and a '!'. ssh -G only
@@ -219,10 +256,9 @@ function Test-KnownHostsPath([string]$Script, [string]$Tag) {
             # drain share that one deadline (the drain gets whatever time is left, never a second grace).
             $outTask = $p.StandardOutput.ReadToEndAsync()
             $left = { [int][Math]::Max(0, $ProbeDeadlineSeconds * 1000 - $probeClock.ElapsedMilliseconds) }
-            if (-not ($p.WaitForExit((& $left)) -and $outTask.Wait((& $left)))) {
-                try { $p.Kill($true) } catch { }
-                [void]$p.WaitForExit(5000)
-                return @("known_hosts: ssh -G did not exit within $ProbeDeadlineSeconds s; the probe tree was killed")
+            $rootExited = $p.WaitForExit((& $left))
+            if (-not ($rootExited -and $outTask.Wait((& $left)))) {
+                return @(Stop-HungProbe $p $rootExited)
             }
             $text = $outTask.Result
             $line = @($text -split "`r?`n" | Where-Object { $_ -match '^userknownhostsfile ' })
