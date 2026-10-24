@@ -101,15 +101,26 @@ JSON list of records, then `render --pr N --head <40-hex> --records <file>` and
 `splice --body-file <body> --block-file <block> --out <new>` (idempotent; malformed markers are refused,
 exit 2, nothing written), then `gh pr edit --body-file`. An absent field renders `MISSING`; a non-`fixed` row
 states `n/a` explicitly. `check --body-file <f>` prints one line (`DEFECT_LEDGER ok n=<k>`, `WARN missing`,
-`WARN incomplete rows=<ids>`, `WARN unreadable <why>`) and always exits 0. "Incomplete" means a MISSING cell,
-a `fixed` row without distinct RED-old / GREEN-new shas or without a combination test or reason, or an unknown
-disposition.
+`WARN unbound=<n> rows=<ids>`, `WARN incomplete rows=<ids>`, `WARN unreadable <why>`) and always exits 0.
+"Incomplete" means a MISSING cell, a `fixed` row without distinct RED-old / GREEN-new shas or without a
+combination test or reason, or an unknown disposition.
+
+**Binding rule (Dot B1 on #667).** Every record carries `schema`, `pr` and `head_sha` (full 40-hex), and
+`render` compares them with `--pr`, `--head` and `defect-ledger.v1`. A record that differs or lacks one is never
+printed as if it belonged to this PR and head: its Disposition cell starts `UNBOUND: pr 612 != 667` (or
+`head 1a2b3c4d != 95e9ff8f`, `head_sha MISSING`, `schema <x>`) and keeps the record's own disposition after it,
+the row stays visible, and a `Binding check:` line counts bound against UNBOUND rows. A block whose records all
+match reads exactly as before. Still no gate: `check` warns and exits 0.
 
 The hub's daily roadmap line comes from `escapes --merged-log <jsonl> --records-dir <dir> --since-days 7
-[--known-flakes <file>] [--reverts-from-git <repo>]`: `ESCAPES window=7d merged_defects=<a> reverts=<c>
-nonflake_merge_group_failures=<b> repeat_failures=<r>`, then one `ESCAPE ...` line per counted item. A repeat
-is one test id or normalised claim recorded on two or more distinct PRs inside the window; `distinguished`
-rows and known flakes never count. It also always exits 0 and reads only the files it is handed.
+[--known-flakes <file>] [--reverts-from-git <repo>] [--now <utc>]`: `ESCAPES window=7d merged_defects=<a>
+reverts=<c> nonflake_merge_group_failures=<b> repeat_failures=<r> undetermined=<u>`, then one `ESCAPE ...` line
+per counted item. A repeat is one test id or normalised claim recorded on two or more distinct PRs inside the
+window; `distinguished` rows and known flakes (events, and records whose regression test is one) never count.
+A merged defect needs the record's `fixed_utc` after the PR's merge event (a defect fixed before landing is not
+an escape); without a usable `fixed_utc` it is `undetermined`, not an escape. `--now` also drops merge events
+dated after it, so a replay never counts a future merge. It also always exits 0 and reads only the files it is
+handed.
 
 ## Checking the posture
 

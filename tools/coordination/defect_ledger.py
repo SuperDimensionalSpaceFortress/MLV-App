@@ -13,24 +13,33 @@ Four subcommands, stdlib only:
   render  --pr N --head <40-hex> --records <json file>
           Print ONE markdown block between the begin/end markers, titled "Defect dispositions", one
           table row per record. Any field a record lacks renders MISSING; a value is never invented.
+          Each record's `schema`, `pr` and `head_sha` are compared to SCHEMA, --pr and --head. A record that
+          does not match (or lacks one) is never relabelled as bound to this PR and head: its Disposition cell
+          starts `UNBOUND: <reasons>` (for example `pr 612 != 667`, `head 1a2b3c4d != 95e9ff8f`, `head_sha
+          MISSING`, `schema <x>`) and keeps the record's own disposition after it, the row stays visible, and
+          a `Binding check:` line states how many rows are bound and how many are not. All bound: no extra line.
   splice  --body-file <in> --block-file <block> --out <out>
           Replace the existing begin/end block in a PR body, or append one. Idempotent; bytes outside
           the markers are untouched. A body whose markers are malformed is refused (exit 2) and nothing
           is written, so no body text can be duplicated or lost.
   check   --body-file <f>
-          Print exactly one line: DEFECT_LEDGER ok n=<k> | WARN missing | WARN incomplete rows=<ids>
-          | WARN unreadable <why>. ALWAYS exits 0. "incomplete" = a row with MISSING, a `fixed` row with
+          Print exactly one line: DEFECT_LEDGER ok n=<k> | WARN missing | WARN unbound=<n> rows=<ids>
+          [incomplete rows=<ids>] | WARN incomplete rows=<ids> | WARN unreadable <why>. ALWAYS exits 0.
+          "unbound" = a row marked UNBOUND by render. "incomplete" = a row with MISSING, a `fixed` row with
           no distinct RED-on-old / GREEN-on-new evidence, a `fixed` row with no combination test and no
           reason, or a disposition that is not one of the three forms.
   escapes --merged-log <file> [--records-dir <dir>] [--since-days 7] [--known-flakes <file>]
           [--reverts-from-git <repo>] [--now <iso utc>]
           Print `ESCAPES window=7d merged_defects=<a> reverts=<c> nonflake_merge_group_failures=<b>
-          repeat_failures=<r>` then one `ESCAPE ...` line per counted item. ALWAYS exits 0. Inputs are
-          plain files passed as arguments; the tool never reads .claude-state on its own.
+          repeat_failures=<r> undetermined=<u>` then one `ESCAPE ...` line per counted item. ALWAYS exits 0.
+          Inputs are plain files passed as arguments; the tool never reads .claude-state on its own.
 
 Record schema `defect-ledger.v1`: a JSON list of objects (a single object is also accepted). Fields:
 
-  pr (int)  head_sha (40-hex)  recorded_utc (ISO-8601 UTC)       -- binding; recorded_utc drives `escapes`
+  schema (this string)  pr (int)  head_sha (40-hex)  recorded_utc (ISO-8601 UTC)
+                   -- binding; render marks a record whose schema, pr or head_sha is not this PR's UNBOUND.
+                      recorded_utc drives the `escapes` window
+  fixed_utc        optional ISO-8601 UTC time the fix landed; `escapes` needs it to call a defect an escape
   defect_id        short id, unique inside the PR
   source           key seat + run dir, a Dot review uuid, a PR comment id, or a merge_group run id
   claim            one line
@@ -49,10 +58,15 @@ merged-log for `escapes` is JSON-lines, one event per line (blank and `#` lines 
   {"event":"revert","utc":..,"sha":..,"title":..}                 a revert landed
   {"event":"merge_group_failure","utc":..,"run_id":..,"test_id":..,"pr":N}
 known-flakes is one test id per line (`#` comments). `escapes` counts: merged_defects = in-window records
-(not `distinguished`) whose PR has a `merged` event; reverts = log reverts plus, with --reverts-from-git,
-merge commits whose subject or first body line starts `Revert "`; nonflake_merge_group_failures =
-in-window failures whose test_id is not a known flake; repeat_failures = clusters of in-window records and
-non-flake failures that share a test id or a normalised claim across two or more distinct PRs.
+(not `distinguished`) whose PR has a `merged` event and whose `fixed_utc` is AFTER that merge (a defect fixed
+before landing is not an escape); a record whose PR merged but that has no usable `fixed_utc`, or whose merge
+event has no usable utc, is `undetermined` (one `ESCAPE undetermined_defect` line each), never a demonstrated
+escape; a `merged` event whose utc is after --now is ignored (a replay never counts a future merge);
+reverts = log reverts plus, with --reverts-from-git, merge commits whose subject or first body line starts
+`Revert "`; nonflake_merge_group_failures = in-window failures whose test_id is not a known flake;
+repeat_failures = clusters of in-window records and non-flake failures that share a test id or a normalised
+claim across two or more distinct PRs. A record whose regression_test is a known flake, like a flake event,
+does not take part in repeat clustering.
 """
 import argparse
 import datetime
@@ -72,6 +86,7 @@ CARD_RE = re.compile(r"^[A-Z0-9][A-Z0-9-]*$")
 
 MISSING = "MISSING"
 UNREADABLE = "unreadable"
+UNBOUND_PREFIX = "UNBOUND: "
 COLUMNS = ["Defect", "Source", "Claim", "Regression test", "Regression evidence", "Combination tests", "Disposition"]
 
 MAX_FILE_BYTES = 8 * 1024 * 1024
@@ -179,18 +194,45 @@ def _disposition(value):
     return raw
 
 
-def _row_cells(rec):
-    """Seven cells for one record, or None when the record cannot be read."""
+def _binding_problems(rec, pr, head):
+    """Why a record is not bound to this PR and head (schema, pr, head_sha); empty when it is. Never raises."""
+    problems = []
+    if "pr" not in rec or rec.get("pr") is None:
+        problems.append("pr MISSING")
+    elif _as_pr(rec.get("pr")) != pr:
+        problems.append("pr %s != %d" % (_cell(rec.get("pr")), pr) if _as_pr(rec.get("pr")) is not None
+                        else "pr %s invalid" % _cell(rec.get("pr")))
+    if rec.get("head_sha") is None:
+        problems.append("head_sha MISSING")
+    else:
+        got = _norm_sha(rec.get("head_sha"))
+        if got is None:
+            problems.append("head_sha %s not a full 40-hex" % _cell(rec.get("head_sha"))[:12])
+        elif got != head:
+            problems.append("head %s != %s" % (got[:8], head[:8]))
+    if rec.get("schema") is None:
+        problems.append("schema MISSING")
+    elif rec.get("schema") != SCHEMA:
+        problems.append("schema %s" % _cell(rec.get("schema"))[:40])
+    return problems
+
+
+def _row_cells(rec, pr, head):
+    """(seven cells, binding problems) for one record, or None when the record cannot be read."""
     if not isinstance(rec, dict):
         return None
     try:
         evidence = "old: %s / new: %s" % (
             "MISSING" if _sha_text(rec.get("old_red_sha")) == MISSING else "RED on %s" % _sha_text(rec.get("old_red_sha")),
             "MISSING" if _sha_text(rec.get("new_green_sha")) == MISSING else "GREEN on %s" % _sha_text(rec.get("new_green_sha")))
-        return [_text(rec.get("defect_id")), _text(rec.get("source")), _text(rec.get("claim")),
-                _text(rec.get("regression_test")), evidence, _combination(rec), _disposition(rec.get("disposition"))]
+        cells = [_text(rec.get("defect_id")), _text(rec.get("source")), _text(rec.get("claim")),
+                 _text(rec.get("regression_test")), evidence, _combination(rec), _disposition(rec.get("disposition"))]
     except _Unreadable:
         return None
+    problems = _binding_problems(rec, pr, head)
+    if problems:  # never relabel: the row stays, marked, and its own disposition stays visible after the marker
+        cells[6] = "%s%s (recorded: %s)" % (UNBOUND_PREFIX, "; ".join(problems), cells[6])
+    return cells, problems
 
 
 def load_records(path):
@@ -214,11 +256,18 @@ def render(pr, head, records):
            "adversarial combination tests, and a disposition (`fixed`, `distinguished: <reason>` or "
            "`deferred: <CARD>`). A field that is not recorded reads `MISSING`." % (SCHEMA, pr, head), "",
            "| %s |" % " | ".join(COLUMNS), "|%s" % ("---|" * len(COLUMNS))]
-    rows = 0
+    rows, unbound = [], 0
     for rec in records:
-        cells = _row_cells(rec) or [UNREADABLE] * len(COLUMNS)
-        out.append("| %s |" % " | ".join(cells))
-        rows += 1
+        made = _row_cells(rec, pr, head)
+        if made is None or made[1]:
+            unbound += 1
+        rows.append("| %s |" % " | ".join(made[0] if made else [UNREADABLE] * len(COLUMNS)))
+    if unbound:
+        out[-2:-2] = ["Binding check: %d of %d records are bound to this PR and head; %d UNBOUND (kept visible, "
+                      "marked in the Disposition column, and not evidence for this head; a record that cannot be "
+                      "read counts here)."
+                      % (len(rows) - unbound, len(rows), unbound), ""]
+    out += rows
     if not rows:
         out += ["", "No defect records supplied for this head."]
     out += ["", END]
@@ -307,14 +356,22 @@ def check(body_bytes):
         if cells[0] == UNREADABLE:
             return "DEFECT_LEDGER WARN unreadable row %d is an unreadable record" % n
         parsed.append(cells)
-    bad = []
+    bad, unbound, n_unbound = [], [], 0
     for n, cells in enumerate(parsed, 1):
-        if _row_incomplete(cells):
-            label = "row%d" % n if cells[0] == MISSING else cells[0]
-            if label not in bad:
-                bad.append(label)
-    if bad:
-        return "DEFECT_LEDGER WARN incomplete rows=%s" % ",".join(bad)
+        label = "row%d" % n if cells[0] == MISSING else cells[0]
+        if cells[6].startswith(UNBOUND_PREFIX):  # already warned; its other fields are not judged
+            n_unbound += 1
+            if label not in unbound:
+                unbound.append(label)
+        elif _row_incomplete(cells) and label not in bad:
+            bad.append(label)
+    if unbound or bad:
+        parts = []
+        if unbound:
+            parts.append("unbound=%d rows=%s" % (n_unbound,",".join(unbound)))
+        if bad:
+            parts.append("incomplete rows=%s" % ",".join(bad))
+        return "DEFECT_LEDGER WARN %s" % " ".join(parts)
     return "DEFECT_LEDGER ok n=%d" % len(parsed)
 
 
@@ -443,8 +500,20 @@ def escapes(merged_log, records_dir=None, since_days=7, known_flakes=None, now=N
     flakes = _load_flakes(known_flakes, notes)
     records = _load_record_dir(records_dir, notes)
 
-    merged_prs = {_as_pr(e.get("pr")) for e in events if e.get("event") == "merged"} - {None}
-    items, nodes = [], []  # nodes: (pr, label, keys) for repeat clustering
+    merged_at = {}  # pr -> earliest known merge epoch, or None when no merge event for it carries a usable utc
+    for e in events:
+        pr_merged = _as_pr(e.get("pr")) if e.get("event") == "merged" else None
+        if pr_merged is None:
+            continue
+        try:
+            when = parse_utc(e.get("utc"))
+        except (ValueError, TypeError):
+            when = None
+        if when is not None and when > hi:  # a replay (--now) never counts a merge that had not happened yet
+            continue
+        known = merged_at.get(pr_merged)
+        merged_at[pr_merged] = when if known is None else known if when is None else min(known, when)
+    items, undetermined, nodes = [], [], []  # nodes: (pr, label, keys) for repeat clustering
 
     for rec in records:
         ident = rec.get("defect_id") if isinstance(rec.get("defect_id"), str) and rec.get("defect_id") else "?"
@@ -458,15 +527,24 @@ def escapes(merged_log, records_dir=None, since_days=7, known_flakes=None, now=N
             continue
         keys = set()
         test = rec.get("regression_test")
+        flake = isinstance(test, str) and test.strip() in flakes
         if isinstance(test, str) and test.strip() and not test.strip().lower().startswith("n/a"):
             keys.add("t:" + test.strip())
         claim = _claim_key(rec.get("claim")) if isinstance(rec.get("claim"), str) else ""
         if claim:
             keys.add("c:" + claim)
-        nodes.append((pr, ident, keys))
-        if pr in merged_prs:
+        if not flake:  # a known-flake regression test is noise for repeats, as a flake event is
+            nodes.append((pr, ident, keys))
+        if pr in merged_at:
             src = rec.get("source") if isinstance(rec.get("source"), str) and rec.get("source").strip() else MISSING
-            items.append("ESCAPE merged_defect %s pr=%d src=%s" % (ident, pr, _cell(src)))
+            try:
+                fixed = parse_utc(rec.get("fixed_utc"))
+            except (ValueError, TypeError):
+                fixed = None
+            if fixed is None or merged_at[pr] is None:  # no time to decide: never a demonstrated escape
+                undetermined.append("ESCAPE undetermined_defect %s pr=%d src=%s" % (ident, pr, _cell(src)))
+            elif fixed > merged_at[pr]:  # a defect fixed before landing is not an escape
+                items.append("ESCAPE merged_defect %s pr=%d src=%s" % (ident, pr, _cell(src)))
     merged_defects = len(items)
 
     revert_lines, seen_reverts = [], set()
@@ -509,9 +587,10 @@ def escapes(merged_log, records_dir=None, since_days=7, known_flakes=None, now=N
             nodes.append((pr, "run-%s" % e.get("run_id"), {"t:" + test.strip()}))
 
     repeat_lines = _repeat_clusters(nodes)
-    head = "ESCAPES window=%s merged_defects=%d reverts=%d nonflake_merge_group_failures=%d repeat_failures=%d" % (
-        window, merged_defects, len(revert_lines), len(failure_lines), len(repeat_lines))
-    return [head] + items + revert_lines + failure_lines + repeat_lines + notes
+    head = ("ESCAPES window=%s merged_defects=%d reverts=%d nonflake_merge_group_failures=%d repeat_failures=%d "
+            "undetermined=%d" % (window, merged_defects, len(revert_lines), len(failure_lines), len(repeat_lines),
+                                 len(undetermined)))
+    return [head] + items + undetermined + revert_lines + failure_lines + repeat_lines + notes
 
 
 def _repeat_clusters(nodes):
@@ -598,7 +677,8 @@ def main(argv=None):
             lines = escapes(args.merged_log, args.records_dir, args.since_days, args.known_flakes, args.now,
                             args.reverts_from_git)
         except Exception as exc:
-            lines = ["ESCAPES window=? merged_defects=0 reverts=0 nonflake_merge_group_failures=0 repeat_failures=0",
+            lines = ["ESCAPES window=? merged_defects=0 reverts=0 nonflake_merge_group_failures=0 repeat_failures=0 "
+                     "undetermined=0",
                      "ESCAPE unreadable arguments %s" % _first_line(exc)]
         sys.stdout.buffer.write(("\n".join(lines) + "\n").encode("utf-8"))
         return 0
