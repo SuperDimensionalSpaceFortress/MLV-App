@@ -2944,51 +2944,113 @@ def test_b2_gate_keeps_a_worktree_whose_encoded_driver_names_only_its_run_dir(re
 # launch site that starts PowerShell from base64 or detaches a process is listed here with the reason it is safe, so a new one fails
 # this census until someone classifies it, instead of slipping past Get-WorktreeLiveRefusal.
 
-CENSUS_ROOTS = ("tools/coordination", "tools/profiling")
-ENCODED_RX = re.compile(r"-EncodedCommand\b|['\"]-ec['\"]", re.I)
-DETACHED_RX = re.compile(r"Start-Process\b[^\n]*-WindowStyle\s+Hidden|Win32_Process[^\n]*\bCreate\b|\[wmiclass\]", re.I)
+# LAUNCHER-CENSUS-ROOTS-AND-DOCTRINE-SCOPE-1: the census used to walk only tools/coordination and tools/profiling, so tracked launch sites
+# elsewhere (tools/agent-bridge, tools/closeout, ...) were invisible. A git pathspec `*` crosses `/`, so these cover every tracked script.
+CENSUS_PATHSPECS = ("*.ps1", "*.psm1")
+CENSUS_EXCLUDED = ("tools/coordination/Retire-LaneWorktree.ps1",)  # the guard decodes -EncodedCommand; it launches nothing
+# The encoded-switch matcher is grammar-aware and lives in _encoded_sites (below); detached launches match per statement.
+DETACHED_RX = re.compile(r"Start-Process\b.*?-WindowStyle\s+['\"]?Hidden|Win32_Process.*?\bCreate\b|\[wmiclass\]|Invoke-(?:Cim|Wmi)Method\b.*?\bCreate\b", re.I)
+# Per-SITE inventories: {path: [(pin, reason), ...]}. The pin is a stable substring of the launching statement (backtick continuations joined,
+# comments dropped); the list length is the expected site COUNT in that file. A new site in a classified file, or a pinned site that moved or
+# vanished, fails the census just as a new file does.
 ENCODED_LAUNCH_SITES = {
-    "tools/coordination/Invoke-Lane.ps1":
-        "the Claude-engine job host (pwsh -EncodedCommand $hostSource) is not a driver: it waits on its claude.exe child, whose argv "
-        "names <RunDir> through --settings <RunDir>\\<lane>-NNN.settings.json and whose pid is written to <RunDir>\\<lane>-NNN.child.json",
-    "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1":
-        "Invoke-Child -CommandText: a synchronous child, waited for and killed at -MaxTotalSec, never a detached driver",
-    "tools/profiling/bachelor/ultra-magnus-agent.ps1":
-        "the heavy-slot sentinel runs on the venue host, never against a hub lane worktree",
+    "tools/agent-bridge/wake_codex.ps1": [
+        ('"-EncodedCommand",',
+         "the UIA wake helper (-RunInnerWake body): a synchronous child, waited for at $TotalRuntimeTimeoutSeconds and killed on overrun; it drives "
+         "the Codex Desktop window and holds no lane worktree, so it is never a lane driver the retire guard has to find"),
+    ],
+    "tools/coordination/Invoke-Lane.ps1": [
+        ("'-ExecutionPolicy','Bypass','-EncodedCommand',$encoded",
+         "the Claude-engine job host (pwsh -EncodedCommand $hostSource) is not a driver: it waits on its claude.exe child, whose argv "
+         "names <RunDir> through --settings <RunDir>\\<lane>-NNN.settings.json and whose pid is written to <RunDir>\\<lane>-NNN.child.json"),
+    ],
+    "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
+        ("'-NonInteractive', '-EncodedCommand', [Convert]::ToBase64String",
+         "Invoke-Child -CommandText: a synchronous child, waited for and killed at -MaxTotalSec, never a detached driver"),
+    ],
+    "tools/profiling/bachelor/ultra-magnus-agent.ps1": [
+        ('"-EncodedCommand", (New-HeavySlotSentinelCommand',
+         "the heavy-slot sentinel runs on the venue host, never against a hub lane worktree"),
+    ],
 }
+# Sites below that earlier censuses never saw (multi-line Start-Process under a backtick, or a root outside tools/coordination + tools/profiling)
+# are classified from reading the launching statement: none starts a PowerShell driver that holds a lane worktree, and none is OPEN.
 DETACHED_LAUNCH_SITES = {
-    "tools/coordination/autopilot/product-share.ps1":
-        ("'-File', \"`\"$PSCommandPath`\"\"", "the verdict worker re-launches this script with -File; it holds no lane worktree"),
-    "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1":
-        ("Start-Process -FilePath (Join-Path $Cache $PresentMonName)", "venue-side job: PresentMon / python helpers, not PowerShell drivers"),
+    "tools/agent-bridge/wake_codex.ps1": [
+        ('Start-Process -FilePath "powershell.exe" -ArgumentList $argumentList -WindowStyle Hidden -PassThru',
+         "carries the -EncodedCommand site above: the wake helper is waited on with a hard timeout and killed on overrun, not left running"),
+    ],
+    "tools/build-release.ps1": [
+        ("Start-Process -FilePath $destExe -ArgumentList '--batch','--help'",
+         "smoke probe of the freshly built MLV-App exe with redirected output; not PowerShell, no lane worktree"),
+    ],
+    "tools/closeout/start-closeout-dashboard.ps1": [
+        ("Start-Process -FilePath $pythonExe -ArgumentList $argumentString -WorkingDirectory $resolvedRepo",
+         "python closeout dashboard server (-m tools.repo_hygiene.closeout_dashboard --repo-root): not a PowerShell lane driver; its cwd is the "
+         "repo it serves, which the guard's cwd probe reads"),
+    ],
+    "tools/coordination/autopilot/product-share.ps1": [
+        ("Start-Process -FilePath $exe -ArgumentList $argList -WindowStyle Hidden",
+         "the verdict worker re-launches this script with -File; it holds no lane worktree"),
+    ],
+    "tools/profiling/bachelor/playback-attr-3-cuda-assemble.ps1": [
+        ("Start-Process -FilePath $releaseExe -ArgumentList '--batch', '--help'",
+         "venue-side smoke probe of the assembled release exe; not PowerShell, no lane worktree"),
+    ],
+    "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [
+        ("Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList $pmArgs",
+         "venue-side job: PresentMon / python helpers, not PowerShell drivers"),
+        ("-ArgumentList @('--session_name', $SessionName",
+         "venue-side job: PresentMon session teardown helper, not a PowerShell driver"),
+        ("Start-Process -FilePath $candidate.exe -ArgumentList $depsArgs",
+         "venue-side job: dependency probe exe, not a PowerShell driver"),
+        ("Start-Process -FilePath $contactSheetPyExe -ArgumentList $composeArgs",
+         "venue-side job: python contact-sheet composer, not a PowerShell driver"),
+    ],
+    "tools/profiling/install-ultra-magnus-agent.ps1": [
+        ('"-File",$AgentScript) -WindowStyle Hidden',
+         "installs the venue-host agent with -File and its script path on the command line; runs on the venue host, never against a hub lane worktree"),
+    ],
+    "tools/profiling/measure-gpu-vram.ps1": [
+        ('Start-Process -FilePath $probe -ArgumentList @("$($r.w)"',
+         "venue-side VRAM probe exe with redirected output; not PowerShell, no lane worktree"),
+        ('-ArgumentList @("1808","2268","4000")',
+         "venue-side VRAM probe exe with redirected output; not PowerShell, no lane worktree"),
+    ],
+    "tools/profiling/ultra-magnus-agent.ps1": [
+        ('"-File", $jobPathArgument)',
+         "the venue-host agent runs a dropped job with -File <job path> under a wall-clock timeout that kills the root and its descendants; "
+         "it never runs against a hub lane worktree"),
+    ],
 }
 
 
 def _census_sources():
-    out = subprocess.run([GIT, "-C", str(REPO), "ls-files", "--", *[f"{r}/*.ps1" for r in CENSUS_ROOTS], *[f"{r}/*.psm1" for r in CENSUS_ROOTS]],
-                         check=True, capture_output=True, text=True).stdout.split()
+    out = subprocess.run([GIT, "-C", str(REPO), "ls-files", "-z", "--", *CENSUS_PATHSPECS],
+                         check=True, capture_output=True, text=True).stdout.split("\0")
     return {p: (REPO / p).read_text(encoding="utf-8", errors="replace") for p in out
-            if p != "tools/coordination/Retire-LaneWorktree.ps1" and "/test" not in p.lower() and not Path(p).name.lower().startswith("test")}
+            if p and p not in CENSUS_EXCLUDED and "/test" not in p.lower() and not Path(p).name.lower().startswith("test")}
 
 
 def test_launcher_census_every_encoded_command_launch_site_is_classified():
-    found = {p for p, t in _census_sources().items() if ENCODED_RX.search(t)}
-    new = sorted(found - set(ENCODED_LAUNCH_SITES))
-    assert not new, ("new -EncodedCommand launch site(s): " + ", ".join(new) + ". Start a lane driver with -File and its run dir on the "
-                     "command line, or classify the site in ENCODED_LAUNCH_SITES with the reason the retire guard still sees it.")
-    gone = sorted(set(ENCODED_LAUNCH_SITES) - found)
-    assert not gone, f"classified -EncodedCommand site(s) no longer found, drop them from the census: {gone}"
+    src = _census_sources()
+    assert src, "git ls-files returned no PowerShell scripts: the census would pass on nothing"
+    problems = _census_problems(src, ENCODED_LAUNCH_SITES, {}, kinds=("encoded",))
+    assert not problems, ("\n".join(problems) + "\nStart a lane driver with -File and its run dir on the command line, or classify the "
+                          "site in ENCODED_LAUNCH_SITES with the reason the retire guard still sees it (drop an entry whose site is gone).")
 
 
 def test_launcher_census_every_detached_launch_site_is_classified():
     src = _census_sources()
-    found = {p for p, t in src.items() if DETACHED_RX.search(t)}
-    new = sorted(found - set(DETACHED_LAUNCH_SITES))
-    assert not new, ("new detached launch site(s): " + ", ".join(new) + ". Launch PowerShell drivers with -File and the run dir on the "
-                     "command line, then classify the site in DETACHED_LAUNCH_SITES.")
-    for p, (pin, why) in DETACHED_LAUNCH_SITES.items():
-        assert p in found and pin in src[p], f"{p}: pinned launch shape moved ({why}); re-check it against the retire guard"
-        assert not ENCODED_RX.search(src[p]), f"{p} now carries -EncodedCommand; a detached driver must start with -File"
+    assert src, "git ls-files returned no PowerShell scripts: the census would pass on nothing"
+    problems = _census_problems(src, {}, DETACHED_LAUNCH_SITES, kinds=("detached",))
+    assert not problems, ("\n".join(problems) + "\nLaunch PowerShell drivers with -File and the run dir on the command line, then "
+                          "classify the site in DETACHED_LAUNCH_SITES (drop an entry whose site is gone).")
+    for p, entries in DETACHED_LAUNCH_SITES.items():
+        for pin, why in entries:
+            site = next(ln for _, ln in _detached_sites(src[p]) if pin in ln)
+            assert not _encoded_sites(site), f"{p}: a detached launch now carries -EncodedCommand ({why}); a detached driver must start with -File"
+    assert "'-File', \"`\"$PSCommandPath`\"\"" in src["tools/coordination/autopilot/product-share.ps1"], "product-share no longer re-launches itself with -File"
 
 
 def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir():
@@ -3009,20 +3071,96 @@ def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir(
 B64 = "UwB0AGEAcgB0AC0AUwBsAGUAZQBwACAAMQAw"
 
 
+def _strip_comment(line):
+    """Cut a trailing `# ...` comment that sits outside any quote (backtick escapes the next char inside double quotes)."""
+    quote = None
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if quote:
+            if ch == "`" and quote == '"':
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
+            return line[:i]
+        i += 1
+    return line
+
+
+def _logical_lines(text):
+    """[(first physical line number, statement text)]: <# block #> and # comments dropped, backtick continuations joined."""
+    text = re.sub(r"<#.*?#>", lambda m: "\n" * m.group(0).count("\n"), text, flags=re.S)
+    out, pending, start = [], "", 0
+    for n, raw in enumerate(text.splitlines(), 1):
+        line = _strip_comment(raw).rstrip()
+        if not pending:
+            start = n
+        if line.endswith("`"):
+            pending += (line[:-1].strip() if pending else line[:-1].rstrip()) + " "
+            continue
+        out.append((start, (pending + line.lstrip() if pending else line)))
+        pending = ""
+    if pending:
+        out.append((start, pending))
+    return [(n, ln) for n, ln in out if ln.strip()]
+
+
+def _is_encoded_switch(word):
+    """pwsh accepts -EncodedCommand, -ec, and every unambiguous prefix (-e, -en, -enc, ... -encodedcommand)."""
+    word = word.lower()
+    return word == "ec" or "encodedcommand".startswith(word)
+
+
+# A word spelled as a switch: `-w` or `/w`, optionally as one standalone quoted argv element ('-w' or "-w"). Never the inside of a longer string.
+_SWITCH_RX = re.compile(r"""(?:^|(?<=[\s(,@=]))(?P<q>['"]?)[-/](?P<word>[A-Za-z]+)(?P=q)(?=[\s,)]|$)""")
+_PWSH_CTX_RX = re.compile(r"pwsh|powershell|(?<![\w-])[-/](?:NoProfile|NoLogo|NonInteractive|NoExit|ExecutionPolicy|Sta|Mta|ConfigurationName)\b", re.I)
+
+
 def _encoded_sites(text):
-    return [(i, ln) for i, ln in enumerate(text.splitlines(), 1) if ENCODED_RX.search(ln)]
+    """Launch sites that hand PowerShell a base64 program, one (line, statement) per statement. Grammar-aware: an unquoted switch only counts
+    on a statement that names pwsh/powershell or another pwsh-only switch; a quoted argv element -e/-en/-enc needs that context within 4
+    statements, while -ec and spellings of 4+ letters (-encodedc, -EncodedCommand) are distinctive enough to count alone."""
+    stmts = _logical_lines(text)
+    out = []
+    for idx, (n, ln) in enumerate(stmts):
+        for m in _SWITCH_RX.finditer(ln):
+            if not _is_encoded_switch(m.group("word")):
+                continue
+            word = m.group("word").lower()
+            if m.group("q"):
+                near = stmts[max(0, idx - 4):idx + 5]
+                if not (word == "ec" or len(word) >= 4 or any(_PWSH_CTX_RX.search(s) for _, s in near)):
+                    continue
+            elif not _PWSH_CTX_RX.search(ln):
+                continue
+            out.append((n, ln))
+            break
+    return out
 
 
 def _detached_sites(text):
-    return [(i, ln) for i, ln in enumerate(text.splitlines(), 1) if DETACHED_RX.search(ln)]
+    return [(n, ln) for n, ln in _logical_lines(text) if DETACHED_RX.search(ln)]
 
 
-def _census_problems(sources, encoded_inventory, detached_inventory):
+def _census_problems(sources, encoded_inventory, detached_inventory, kinds=("encoded", "detached")):
+    """Per-SITE comparison: inventory[path] is a list of (pin, reason), one entry per expected site, the pin a substring of the launching
+    statement. A site no entry claims is unclassified; an entry no site claims has vanished. Two identical sites need two entries."""
     problems = []
     for kind, finder, inventory in (("encoded", _encoded_sites, encoded_inventory), ("detached", _detached_sites, detached_inventory)):
-        found = {p for p, t in sources.items() if finder(t)}
-        problems += [f"{kind}: unclassified {p}" for p in sorted(found - set(inventory))]
-        problems += [f"{kind}: vanished {p}" for p in sorted(set(inventory) - found)]
+        if kind not in kinds:
+            continue
+        for path in sorted(set(sources) | set(inventory)):
+            left = list(finder(sources[path])) if path in sources else []
+            for pin, _why in inventory.get(path, ()):
+                hit = next((s for s in left if pin in s[1]), None)
+                if hit is None:
+                    problems.append(f"{kind}: {path}: classified site no longer found: {pin!r}")
+                else:
+                    left.remove(hit)
+            problems += [f"{kind}: {path}:{n}: unclassified launch site: {ln.strip()[:140]}" for n, ln in left]
     return problems
 
 
