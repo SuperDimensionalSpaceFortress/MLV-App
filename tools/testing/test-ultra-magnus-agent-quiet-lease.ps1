@@ -44,6 +44,10 @@ param(
 #               one-element array that pwsh 7 would unroll, an array of one, an empty array) fails closed, at the gate and in
 #               Invoke-QueuedJob; a lapse the renew tick sees is latched, so a fresher sidecar written later revives no renew
 #               and no admission.
+#   exit release evidence - QUIET-LEASE-EXIT-RELEASE-EVIDENCE-AND-EVENT-OBSERVE-1 r1 (cases queuedjob-queue-expired-post-admission,
+#               queuedjob-holder-lost-prelaunch, exit-release-pin): the queue-expired exit after admission and the pre-launch
+#               holder-lost refusal release the lease and record that release (leaseRelease) before Exit-HeavySlot, and every
+#               Exit-HeavySlot call site is either preceded by a recorded release or allowlisted with a reason.
 # Prints one JSON object with status PASS, or throws.
 
 $ErrorActionPreference = 'Stop'
@@ -442,7 +446,8 @@ try {
         'queuedjob-cancel-post-admission', 'notafter-renew-crosses-deadline', 'notafter-meta-sticky',
         'liveness-dead-before-request', 'liveness-lapses-while-pending', 'liveness-lapses-at-active', 'liveness-renewed-across-exit75',
         'liveness-absent-unchanged', 'liveness-unparseable-expired', 'liveness-pure', 'liveness-reader', 'liveness-ast-guard', 'liveness-queuedjob',
-        'liveness-root-shape', 'liveness-lapse-latched')
+        'liveness-root-shape', 'liveness-lapse-latched',
+        'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -694,6 +699,52 @@ function Exit-HeavySlot {
         $results.notAfterSourceShape = [ordered]@{ order = 'pre-gate < gate < expired-not-after < post-admission re-check < launching marker < slot re-confirm < last re-check < child' }
     }
 
+    # ------------------------------------------------------------ exit-release-pin: every Exit-HeavySlot call site, from the agent's AST
+    # QUIET-LEASE-EXIT-RELEASE-EVIDENCE-1: a call site is RECORDED when, in its own statement block, an earlier statement assigns
+    # `$<v> = Stop-QuietLease -Lease $script:QuietLease` and the block passes `-Release $<v>` to New-LeaseReleaseRecord. Any other
+    # site must be a row below (enclosing function + its trimmed source line) with a reason. A row that matches no site, or a site
+    # that is recorded, is stale and fails, so the list cannot outlive the code it excuses.
+    if (Test-Case 'exit-release-pin') {
+        $exitAllow = @(
+            [pscustomobject]@{ fn = '(script)'; line = 'Exit-HeavySlot'; why = "the inbox loop's finally: the normal end's release, made after its result is published (no open record to carry it; Stop-QuietLease types it as why=[job done]), and the backstop for a thrown leg; after an exit before launch it finds nothing to end, that exit released and recorded already" }
+            [pscustomobject]@{ fn = '(script)'; line = 'if ($agentMutexHeld) { Exit-HeavySlot }'; why = 'agent-mutex teardown: the agent is leaving (exception or stop request), no job record is open to carry a release' }
+        )
+        $agentLines = $agentText -split "`r?`n"
+        $exitSites = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Exit-HeavySlot' }, $true))
+        $exitTable = [System.Collections.Generic.List[object]]::new()
+        $exitBad = [System.Collections.Generic.List[string]]::new()
+        foreach ($s in $exitSites) {
+            $fnAst = $s.Parent; while ($null -ne $fnAst -and $fnAst -isnot [System.Management.Automation.Language.FunctionDefinitionAst]) { $fnAst = $fnAst.Parent }
+            $fnName = if ($null -ne $fnAst) { $fnAst.Name } else { '(script)' }
+            $stmt = $s; $blk = $s.Parent
+            while ($null -ne $blk -and $blk -isnot [System.Management.Automation.Language.StatementBlockAst] -and $blk -isnot [System.Management.Automation.Language.NamedBlockAst]) { $stmt = $blk; $blk = $blk.Parent }
+            $before = @($blk.Statements | Where-Object { $_.Extent.EndOffset -le $stmt.Extent.StartOffset } | ForEach-Object { $_.Extent.Text })
+            $recorded = $false
+            foreach ($t in $before) {
+                $m = [regex]::Match($t, '\$(\w+) = Stop-QuietLease -Lease \$script:QuietLease\b')
+                if ($m.Success -and [regex]::IsMatch($blk.Extent.Text, "New-LeaseReleaseRecord -Phase [^\r\n]*-Release \`$$($m.Groups[1].Value)\b")) { $recorded = $true }
+            }
+            $lineText = $agentLines[$s.Extent.StartLineNumber - 1].Trim()
+            $rows = @($exitAllow | Where-Object { $_.fn -ceq $fnName -and $_.line -ceq $lineText })
+            $exitTable.Add([pscustomobject]@{ line = $s.Extent.StartLineNumber; fn = $fnName; source = $lineText; recorded = $recorded; allowlisted = ($rows.Count -gt 0) })
+            if (-not $recorded -and $rows.Count -eq 0) { $exitBad.Add("line $($s.Extent.StartLineNumber) in ${fnName}: [$lineText] is neither preceded by a recorded release nor allowlisted") }
+            if ($recorded -and $rows.Count -gt 0) { $exitBad.Add("line $($s.Extent.StartLineNumber) in ${fnName}: [$lineText] records its release, so its allowlist row is stale") }
+        }
+        foreach ($r in $exitAllow) {
+            $hits = @($exitTable | Where-Object { $_.fn -ceq $r.fn -and $_.source -ceq $r.line }).Count
+            if ($hits -ne 1) { $exitBad.Add("allowlist row [$($r.fn)] [$($r.line)] matches $hits call sites, not exactly 1") }
+        }
+        Assert-True ($exitSites.Count -ge 1 -and $exitBad.Count -eq 0) "exit-release-pin: every Exit-HeavySlot call site records its release or is allowlisted with a reason: $($exitBad -join ' ; ')"
+        # Light jobs run from inside a gate-wait never call it: the waiting job's lease is the wait's own local.
+        $ewAst = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-ExemptJobsDuringWait' }, $true)
+        Assert-True ($null -ne $ewAst -and $null -eq $ewAst.Find({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -ceq 'Exit-HeavySlot' }, $true)) "exit-release-pin: Invoke-ExemptJobsDuringWait never calls Exit-HeavySlot (its mention is a comment)"
+        $results.exitReleasePin = [ordered]@{
+            sites = @($exitTable | ForEach-Object { "$($_.line) $($_.fn) recorded=$($_.recorded) allowlisted=$($_.allowlisted)" })
+            recorded = @($exitTable | Where-Object { $_.recorded }).Count; allowlisted = @($exitTable | Where-Object { $_.allowlisted }).Count
+            allow = @($exitAllow | ForEach-Object { "$($_.fn) [$($_.line)]: $($_.why)" })
+        }
+    }
+
     # ================================================================ LEASE-NOT-AFTER-HARDENING-1 r1
     # Invoke-QueuedJob, lifted and RUN against the fake heavy-slot.py. Its disk and launch steps are stubbed: the claim and the
     # launching marker are one-field files under running\, the result and the artifact move are recorded, and the child launch
@@ -701,11 +752,17 @@ function Exit-HeavySlot {
     # wrapper keeps the object it returned, so a case moves that job's notAfterUtc into the past at a chosen step, which is
     # what the verdict sees when the clock passes the deadline there.
     $qjCases = @('notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker', 'notafter-prelaunch-confirm', 'notafter-meta-unreadable',
-        'queuedjob-cancel-post-admission', 'notafter-meta-sticky', 'liveness-queuedjob', 'liveness-root-shape')
+        'queuedjob-cancel-post-admission', 'notafter-meta-sticky', 'liveness-queuedjob', 'liveness-root-shape',
+        'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch')
     if (@($qjCases | Where-Object { Test-Case $_ }).Count -gt 0) {
         # STAGE-JOB-LEASE-EXEMPT-1 r2: Invoke-QueuedJob classifies the job through Get-GateExemptClass, which reads both patterns.
         foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult', 'Get-GateExemptClass')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
         . ([scriptblock]::Create(((Get-FunctionBody 'Get-JobMetadata') -replace '^function Get-JobMetadata', 'function Get-JobMetadataReal')))
+        # QUIET-LEASE-EXIT-RELEASE-EVIDENCE-1: the REAL queue-expired publisher and holder-loss recorder run under counting wrappers,
+        # so a case reads the published result and the kept holder-lost event, not a stub's copy.
+        foreach ($name in @('Invoke-QueueExpiredJob', 'Add-HeavySlotHolderLoss', 'Add-HeavySlotHolderLossToAdmission')) {
+            . ([scriptblock]::Create(((Get-FunctionBody $name) -replace "^function $name", "function ${name}Real")))
+        }
         $inbox = Join-Path $fx 'inbox'; $running = Join-Path $fx 'running'; $outbox = Join-Path $fx 'outbox'; $processed = Join-Path $fx 'processed'
         New-Item -ItemType Directory -Force -Path $inbox, $running, $outbox | Out-Null
         $JobTimeoutSec = 1800; $PollSeconds = 2; $Root = $fx; $psExe = 'unit-pwsh.exe'
@@ -729,9 +786,9 @@ function Exit-HeavySlot {
             $script:QJ.retired.Add("$(Split-Path -Leaf $MarkerPath)|$($m.phase)|$Status")
             Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
         }
-        function Invoke-QueueExpiredJob { param($Job, $Metadata, [int]$QueueAgeSec) $script:QJ.queueExpired++ }
+        function Invoke-QueueExpiredJob { param($Job, $Metadata, [int]$QueueAgeSec, $Admission) $script:QJ.queueExpired++; Invoke-QueueExpiredJobReal @PSBoundParameters }
         function Add-HeavySlotHolderLossToAdmission { param([string]$JobId, $Admission) if ($null -ne $script:QJ.admittedHook) { & $script:QJ.admittedHook } }
-        function Add-HeavySlotHolderLoss { param([string]$JobId, [string]$Phase, [string]$Why, [string]$Held, [string]$Reason) $script:QJ.holderLoss.Add("$Phase|$Reason|$Why") }
+        function Add-HeavySlotHolderLoss { param([string]$JobId, [string]$Phase, [string]$Why, [string]$Held, [string]$Reason, $LeaseRelease) $script:QJ.holderLoss.Add("$Phase|$Reason|$Why"); Add-HeavySlotHolderLossReal @PSBoundParameters }
         function Set-AgentKeepAwake { param([bool]$Enable) return $true }
         function Start-WindowlessRedirectedProcess {
             param([string]$FilePath, [string[]]$ArgumentList, [string]$OutFile, [string]$ErrFile, [string]$WorkingDirectory)
@@ -747,6 +804,7 @@ function Exit-HeavySlot {
             Get-ChildItem -LiteralPath $inbox, $running -File | Remove-Item -Force
             Remove-Item Env:\MLV_AGENT_ADMISSION, Env:\MLV_AGENT_ADMISSION_THERMAL, Env:\MLV_AGENT_ADMISSION_WAIT_SEC, Env:\HEAVY_SLOT_HELD -ErrorAction SilentlyContinue
             $script:LastMeta = $null
+            $script:HolderLossByJob = @{}
             $script:QJ = [pscustomobject]@{
                 claims = [System.Collections.Generic.List[string]]::new(); launchingMarkers = [System.Collections.Generic.List[string]]::new()
                 retired = [System.Collections.Generic.List[string]]::new(); holderLoss = [System.Collections.Generic.List[string]]::new()
@@ -839,6 +897,55 @@ function Exit-HeavySlot {
         $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
         Assert-True ($reqs.Count -eq 1 -and (Wait-Until { -not (Test-PidAlive ([int]$reqs[0].pid)) } 5) -and $null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting -and @(Get-ChildItem -LiteralPath $fx -Filter '*.lease.json' -File).Count -eq 0) "queuedjob-cancel-post-admission: the wrapper is gone, its record removed, no lease kept"
         $results.queuedJobCancelPostAdmission = [ordered]@{ label = $a.label; releasePhase = $lr.phase; releaseRc = $lr.releaseRc }
+    }
+
+    # ------------------------------------------------------------ queuedjob-queue-expired-post-admission: the queue ceiling passes once admitted
+    # QUIET-LEASE-EXIT-RELEASE-EVIDENCE-1 (Dot 456ccdf9 on #652, item a): the queue-expired exit after admission releases the lease,
+    # and records that release, before Exit-HeavySlot, as the cancel and not-after exits do. A bare Exit-HeavySlot (which ends the
+    # lease as "job done" and records nothing) leaves the published result without admission.leaseRelease: this case fails on it.
+    if (Test-Case 'queuedjob-queue-expired-post-admission') {
+        $job = Reset-QueuedJobCase @{ request = 'active' } 'jQe' (New-NotAfterMetaJson 600)
+        $script:QJ.admittedHook = { $script:AgeAfter = (Get-Date).AddSeconds(-1) }
+        $null = Invoke-QueuedJob -Job $job
+        $p = @($script:QJ.published)
+        Assert-True ($p.Count -eq 1 -and $p[0].jobId -ceq 'jQe' -and $p[0].exitCode -eq 125 -and $p[0].queueExpired -eq $true -and $p[0].notAfterExpired -ne $true -and $null -eq $p[0].startedUtc -and $p[0].queueAgeSec -eq 9999) "queuedjob-queue-expired-post-admission: one queue-expired result, never started: $($p | ConvertTo-Json -Compress -Depth 5)"
+        $a = $p[0].admission
+        Assert-True ($null -ne $a -and $a.label -ceq 'queue-expired' -and $a.state -ceq 'expired' -and $null -eq $a.slot -and $a.why -ceq 'queue age 9999s > 600s after admission, before launch') "queuedjob-queue-expired-post-admission: the result carries the admission, read queue-expired after admission: $($a | ConvertTo-Json -Compress -Depth 4)"
+        $lr = $a.leaseRelease
+        Assert-True ($null -ne $lr -and $lr.phase -ceq 'post-admission' -and [string]$lr.releaseRc -ceq '0' -and $null -ne $lr.rc -and $null -ne $lr.killed -and (Get-Released).Count -eq 1) "queuedjob-queue-expired-post-admission: the lease released once, the release recorded in phase post-admission: $($lr | ConvertTo-Json -Compress) releases=$((Get-Released).Count)"
+        $ended = @($script:Log | Where-Object { $_.StartsWith('quiet-lease: ended job=jQe ') })
+        Assert-True ($ended.Count -eq 1 -and $ended[0].EndsWith('why=[queue expired after admission, before launch]')) "queuedjob-queue-expired-post-admission: the lease is ended by the queue-expired exit, not by Exit-HeavySlot: $($ended -join ' | ')"
+        Assert-True ($script:QJ.queueExpired -eq 1 -and $script:QJ.launches.Count -eq 0 -and $script:QJ.launchingMarkers.Count -eq 0 -and $script:QJ.claims.Count -eq 1) "queuedjob-queue-expired-post-admission: typed queue-expired once, claimed once, NO launching marker, NO child launch"
+        Assert-True ($script:QJ.moved.Count -eq 1 -and $script:QJ.moved[0] -ceq "jQe|$processed" -and ($script:QJ.retired -join ';') -ceq 'jQe.started.json|admission-wait|queue-expired') "queuedjob-queue-expired-post-admission: artifacts moved, the claim retired as queue-expired: [$($script:QJ.retired -join ';')]"
+        $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        Assert-True ($reqs.Count -eq 1 -and (Wait-Until { -not (Test-PidAlive ([int]$reqs[0].pid)) } 5) -and $null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting -and @(Get-ChildItem -LiteralPath $fx -Filter '*.lease.json' -File).Count -eq 0) "queuedjob-queue-expired-post-admission: the wrapper is gone, its record removed, no lease kept"
+        $results.queuedJobQueueExpiredPostAdmission = [ordered]@{ label = $a.label; releasePhase = $lr.phase; releaseRc = $lr.releaseRc }
+    }
+
+    # ------------------------------------------------------------ queuedjob-holder-lost-prelaunch: the slot re-confirm fails before launch
+    # QUIET-LEASE-EXIT-RELEASE-EVIDENCE-1 (Dot 456ccdf9 on #652, item a): the launching marker is written, then the re-confirm's renew
+    # hangs past LeaseRenewTimeoutSec, so the lease is not proven: holder-lost, NOT launched, left queued. The lease is released and
+    # that release recorded (phase pre-launch) before Exit-HeavySlot, on the admission and on the kept holder-lost event, which is
+    # what the job's next admission (and so its result) carries. A bare Exit-HeavySlot records nothing: this case fails on it.
+    if (Test-Case 'queuedjob-holder-lost-prelaunch') {
+        $job = Reset-QueuedJobCase @{ request = 'active' } 'jQh' (New-NotAfterMetaJson 600)
+        $script:QJ.markerHook = { Set-Fake @{ request = 'active'; renew_hang = $true } }
+        $null = Invoke-QueuedJob -Job $job
+        Assert-True ($script:QJ.launchingMarkers.Count -eq 1 -and $script:QJ.launches.Count -eq 0 -and $script:QJ.published.Count -eq 0 -and $script:QJ.retired.Count -eq 0 -and $script:QJ.moved.Count -eq 0) "queuedjob-holder-lost-prelaunch: the launching marker written, NO child launch, nothing published, the job left queued"
+        Assert-True ($script:QJ.holderLoss.Count -eq 1 -and $script:QJ.holderLoss[0].StartsWith('pre-launch|holder-lost|')) "queuedjob-holder-lost-prelaunch: one typed pre-launch holder-lost: $($script:QJ.holderLoss -join ' | ')"
+        $ev = @($script:HolderLossByJob['jQh'])
+        $evLr = if ($ev.Count -eq 1) { $ev[0].leaseRelease } else { $null }
+        Assert-True ($null -ne $evLr -and $evLr.phase -ceq 'pre-launch' -and [string]$evLr.releaseRc -ceq '0' -and $null -ne $evLr.rc -and $null -ne $evLr.killed -and (Get-Released).Count -eq 1) "queuedjob-holder-lost-prelaunch: the lease released once, the release recorded on the holder-lost event in phase pre-launch: $($ev | ConvertTo-Json -Compress -Depth 4) releases=$((Get-Released).Count)"
+        $admLr = $script:Admission.leaseRelease
+        Assert-True ($null -ne $admLr -and $admLr.phase -ceq 'pre-launch' -and [string]$admLr.releaseRc -ceq '0') "queuedjob-holder-lost-prelaunch: the admission records the same release: $($admLr | ConvertTo-Json -Compress)"
+        $next = [pscustomobject]@{ label = 'clear' }
+        Add-HeavySlotHolderLossToAdmissionReal -JobId 'jQh' -Admission $next
+        Assert-True (@($next.holderLost).Count -eq 1 -and $next.holderLost[0].leaseRelease.phase -ceq 'pre-launch') "queuedjob-holder-lost-prelaunch: the job's next admission (and so its result) carries the recorded release: $($next | ConvertTo-Json -Compress -Depth 4)"
+        $ended = @($script:Log | Where-Object { $_.StartsWith('quiet-lease: ended job=jQh ') })
+        Assert-True ($ended.Count -eq 1 -and $ended[0] -like '*why=`[pre-launch holder-lost: *') "queuedjob-holder-lost-prelaunch: the lease is ended by the refusal, not by Exit-HeavySlot: $($ended -join ' | ')"
+        $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        Assert-True ($reqs.Count -eq 1 -and (Wait-Until { -not (Test-PidAlive ([int]$reqs[0].pid)) } 5) -and $null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting -and @(Get-ChildItem -LiteralPath $fx -Filter '*.lease.json' -File).Count -eq 0) "queuedjob-holder-lost-prelaunch: the wrapper is gone, its record removed, no lease kept"
+        $results.queuedJobHolderLostPrelaunch = [ordered]@{ releasePhase = $evLr.phase; releaseRc = $evLr.releaseRc; holderLoss = $script:QJ.holderLoss[0] }
     }
 
     # ------------------------------------------------------------ notafter-prelaunch-marker: the deadline passes while the launching marker is written
@@ -937,15 +1044,20 @@ function Exit-HeavySlot {
         $crossReleased = [ordered]@{}
         try {
             foreach ($v in @(
-                    @{ n = 'hang'; fake = @{ request = 'active'; active_after = 2; renew_hang = $true }; timeout = 3; window = 6 },
-                    @{ n = 'slow'; fake = @{ request = 'active'; active_after = 2; renew_sleep = 1.5 }; timeout = 15; window = 6 })) {
+                    @{ n = 'hang'; fake = @{ request = 'active'; active_after = 2; renew_hang = $true }; timeout = 3 },
+                    @{ n = 'slow'; fake = @{ request = 'active'; active_after = 2; renew_sleep = 1.5 }; timeout = 15 })) {
                 Reset-Case $v.fake
                 $LeaseRenewTimeoutSec = $v.timeout
                 $script:LeaseNotAfterMinAdmitSec = 1
                 $script:AgeAfter = (Get-Date).AddSeconds(60)
                 $script:CrossMeta = New-NotAfterMeta 600
-                $script:CrossWindow = $v.window
-                $script:Cross = @{ ran = 0; inFlight = $false; renewPid = 0; startsAtDeadline = -1; ticksAfter = 0; renewCallLeft = $null; renewAlive = $null; startsAfter = $null; renewsOk = $null; renewSlow = $null; renewCalls = $null }
+                # QUIET-LEASE-EXIT-RELEASE-EVIDENCE-AND-EVENT-OBSERVE-1 (Dot 456ccdf9 on #652, item b): the ticks run until the event the
+                # case asserts (the renew in flight is collected or killed: renewCall cleared), then a dwell of 3 renew intervals in which
+                # a renew started past the deadline would be seen. The ceiling is the case's own timeout plus a margin that covers the
+                # dwell, never a fixed window shorter than that timeout (a cold host's slow renew outlasted the old 6 s one).
+                $script:CrossDwellSec = 3 * $LeaseRenewSec
+                $script:CrossCeilingSec = $v.timeout + $script:CrossDwellSec + 5
+                $script:Cross = @{ ran = 0; inFlight = $false; renewPid = 0; startsAtDeadline = -1; ticksAfter = 0; renewCallLeft = $null; renewAlive = $null; startsAfter = $null; renewsOk = $null; renewSlow = $null; renewCalls = $null; eventSec = $null; ceilingSec = $script:CrossCeilingSec }
                 function Invoke-ExemptJobsDuringWait {
                     param([string]$WaitingJobId, [double]$WaitedSec)
                     $c = $script:Cross
@@ -959,12 +1071,19 @@ function Exit-HeavySlot {
                     $c.inFlight = $true
                     $c.renewPid = $w.renewCall.proc.Id
                     $c.startsAtDeadline = $w.renewStarts
+                    $renewStart = $w.renewCall.started
                     # The deadline passes with that renew in flight (the tick reads the lease's copy, the wait the metadata's).
                     $past = [DateTime]::UtcNow.AddSeconds(-1).ToString('o')
                     $w | Add-Member -NotePropertyName notAfterUtc -NotePropertyValue $past -Force
                     $script:CrossMeta | Add-Member -NotePropertyName notAfterUtc -NotePropertyValue $past -Force
-                    $end = (Get-Date).AddSeconds($script:CrossWindow)
-                    while ((Get-Date) -lt $end) { Invoke-QuietLeaseRenewTick; $c.ticksAfter++; Start-Sleep -Milliseconds 100 }
+                    $ceiling = (Get-Date).AddSeconds($script:CrossCeilingSec)
+                    $eventAt = $null
+                    while ((Get-Date) -lt $ceiling) {
+                        Invoke-QuietLeaseRenewTick; $c.ticksAfter++
+                        if ($null -eq $eventAt -and $null -eq $w.renewCall) { $eventAt = Get-Date; $c.eventSec = [Math]::Round(($eventAt - $renewStart).TotalSeconds, 2) }
+                        if ($null -ne $eventAt -and ((Get-Date) - $eventAt).TotalSeconds -ge $script:CrossDwellSec) { break }
+                        Start-Sleep -Milliseconds 100
+                    }
                     # Read before the light job returns: the wait's release would end the call anyway.
                     $c.renewCallLeft = $null -ne $w.renewCall
                     $c.renewAlive = Test-PidAlive $c.renewPid
@@ -997,9 +1116,13 @@ function Exit-HeavySlot {
         if (-not (-not $h.renewCallLeft -and -not $h.renewAlive -and $h.renewSlow -eq 1)) { $crossBad.Add("hang: the hung renew is not killed at LeaseRenewTimeoutSec by the tick: $($h | ConvertTo-Json -Compress)") }
         if (-not (-not $s.renewCallLeft -and $s.renewsOk -eq 1 -and $s.renewSlow -eq 0)) { $crossBad.Add("slow: the late renew is not collected by the tick: $($s | ConvertTo-Json -Compress)") }
         Assert-True ($crossBad.Count -eq 0) "notafter-renew-crosses-deadline: the renew in flight is cleaned up past the deadline, not left to the release: $($crossBad -join ' ; ')"
+        # The bounds, from each case's own timeout: hang ends AT its bound (killed once LeaseRenewTimeoutSec passed, within the
+        # ceiling), slow ends BEFORE its bound (collected, never killed).
+        Assert-True ($null -ne $h.eventSec -and $h.eventSec -ge 3 -and $h.eventSec -le $h.ceilingSec + 1) "notafter-renew-crosses-deadline (hang): the hung renew ends at its 3 s bound, within the ceiling $($h.ceilingSec) s: eventSec=$($h.eventSec)"
+        Assert-True ($null -ne $s.eventSec -and $s.eventSec -lt 15) "notafter-renew-crosses-deadline (slow): the late renew is collected before its 15 s bound: eventSec=$($s.eventSec)"
         Assert-True (@($crossLog['hang'] | Where-Object { $_ -like 'quiet-lease: renew-slow job=jXhang killed after 3s*' }).Count -eq 1) "notafter-renew-crosses-deadline (hang): typed renew-slow once"
         Assert-True (@($crossLog['slow'] | Where-Object { $_ -like 'quiet-lease: not-after passed job=jXslow * active=True while waiting; no more renews*' }).Count -eq 1) "notafter-renew-crosses-deadline (slow): the stop is typed once"
-        $results.notAfterRenewCrossesDeadline = [ordered]@{ hang = [ordered]@{ renewSlow = $h.renewSlow; renewCallLeft = $h.renewCallLeft; renewAlive = $h.renewAlive }; slow = [ordered]@{ renewsOk = $s.renewsOk; renewCallLeft = $s.renewCallLeft } }
+        $results.notAfterRenewCrossesDeadline = [ordered]@{ hang = [ordered]@{ renewSlow = $h.renewSlow; renewCallLeft = $h.renewCallLeft; renewAlive = $h.renewAlive; eventSec = $h.eventSec; ceilingSec = $h.ceilingSec }; slow = [ordered]@{ renewsOk = $s.renewsOk; renewCallLeft = $s.renewCallLeft; eventSec = $s.eventSec; ceilingSec = $s.ceilingSec } }
     }
 
     # ------------------------------------------------------------ notafter-meta-unreadable: a deadline the agent cannot read fails closed

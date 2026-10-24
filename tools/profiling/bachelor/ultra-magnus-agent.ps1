@@ -1168,10 +1168,13 @@ function Test-LaunchOutFile {
 }
 
 function Invoke-QueueExpiredJob {
+    # -Admission: the record of a job that expired once admitted (with its leaseRelease); the result carries it. Without it (expired
+    # before or inside the gate) the result's shape is unchanged.
     param(
         [Parameter(Mandatory = $true)]$Job,
         [Parameter(Mandatory = $true)]$Metadata,
-        [Parameter(Mandatory = $true)][int]$QueueAgeSec
+        [Parameter(Mandatory = $true)][int]$QueueAgeSec,
+        $Admission = $null
     )
 
     $jobId = $Job.BaseName -replace '\.job$', ''
@@ -1194,6 +1197,7 @@ function Invoke-QueueExpiredJob {
         stdout         = ""
         stderr         = "queue expired before launch; job was not executed"
     }
+    if ($null -ne $Admission) { $result | Add-Member -NotePropertyName admission -NotePropertyValue $Admission }
     $resultPath = Publish-JobResult -JobId $jobId -Result $result
     Move-JobArtifacts -JobId $jobId -JobPath $Job.FullName -DestinationDirectory $processed
     Add-AgentLogLine "queue expired job=$jobId age=${QueueAgeSec}s max=$($Metadata.maxQueueAgeSec) result=$resultPath"
@@ -2130,10 +2134,13 @@ function Test-HeavySlotHolderHeld {
 
 function Add-HeavySlotHolderLoss {
     # r2: a typed 'holder-lost' event for this job, logged, and kept for its result (admission.holderLost) across a
-    # pre-launch refusal that leaves the job queued for the next poll.
-    param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Phase, [string]$Why, [string]$Held, [string]$Reason = "holder-lost")
+    # pre-launch refusal that leaves the job queued for the next poll. -LeaseRelease (pre-launch) adds that refusal's
+    # leaseRelease record to the event ($null: nothing was released).
+    param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Phase, [string]$Why, [string]$Held, [string]$Reason = "holder-lost", $LeaseRelease = $null)
     if (-not $script:HolderLossByJob.ContainsKey($JobId)) { $script:HolderLossByJob[$JobId] = [System.Collections.Generic.List[object]]::new() }
-    $script:HolderLossByJob[$JobId].Add([pscustomobject]@{ reason = $Reason; phase = $Phase; utc = (Get-Date).ToUniversalTime().ToString("o"); held = $Held; why = $Why })
+    $ev = [pscustomobject]@{ reason = $Reason; phase = $Phase; utc = (Get-Date).ToUniversalTime().ToString("o"); held = $Held; why = $Why }
+    if ($PSBoundParameters.ContainsKey("LeaseRelease")) { $ev | Add-Member -NotePropertyName leaseRelease -NotePropertyValue $LeaseRelease }
+    $script:HolderLossByJob[$JobId].Add($ev)
     Add-AgentLogLine "heavy-slot-gate: $Reason job=$JobId phase=$Phase held=$Held why=[$Why]; the job is NOT launched on that slot"
 }
 
@@ -2403,7 +2410,8 @@ function Wait-HeavySlotAdmission {
 #      renew ends the job. Immediately before the child is created one renew is run to completion and must return the
 #      flag {state active, pid, slot, label} of this lease, or nothing launches (Confirm-QuietLeaseHeldForLaunch).
 #   4. RELEASE. `lease release --label "quiet-lease mlv"` in Exit-HeavySlot, which every path out of a job reaches (normal
-#      end, a thrown leg, a pre-launch refusal) and the agent's outer finally. A wrapper still running 5 s after the
+#      end, a thrown leg, a pre-launch refusal) and the agent's outer finally. Each exit before launch (cancel, not-after,
+#      queue-expired, holder-lost) releases first and records that release as leaseRelease. A wrapper still running 5 s after the
 #      release is stopped by process identity. A successor agent releases and stops any recorded wrapper still alive
 #      (Stop-StaleQuietLeases), so a killed agent leaves at most a stale, non-exclusive lease until it restarts.
 #   5. REFUSED. Exit 75 (cooldown 30 min, <= 50 % of any 3 h, another lease, or pending past the cap) is typed in
@@ -3134,9 +3142,18 @@ function Invoke-QueuedJob {
         & $notAfterAdmitted "post-admission" $notAfter "after admission, before launch"
         return
     }
+    # QUIET-LEASE-EXIT-RELEASE-EVIDENCE-1: the queue-expired exit once admitted releases the lease (its release recorded) before
+    # Exit-HeavySlot, as the cancel and not-after exits do, and its result carries the admission.
     if ([int]$metadata.maxQueueAgeSec -gt 0 -and $queueAgeSec -gt [int]$metadata.maxQueueAgeSec) {
+        $rel = $null
+        if ($null -ne $script:QuietLease) { $rel = Stop-QuietLease -Lease $script:QuietLease -Why "queue expired after admission, before launch"; $script:QuietLease = $null }
         Exit-HeavySlot
-        Invoke-QueueExpiredJob -Job $Job -Metadata $metadata -QueueAgeSec $queueAgeSec
+        $script:Admission | Add-Member -NotePropertyName label -NotePropertyValue "queue-expired" -Force
+        $script:Admission | Add-Member -NotePropertyName state -NotePropertyValue "expired" -Force
+        $script:Admission | Add-Member -NotePropertyName why -NotePropertyValue "queue age ${queueAgeSec}s > $([int]$metadata.maxQueueAgeSec)s after admission, before launch" -Force
+        $script:Admission | Add-Member -NotePropertyName slot -NotePropertyValue $null -Force
+        $script:Admission | Add-Member -NotePropertyName leaseRelease -NotePropertyValue (New-LeaseReleaseRecord -Phase "post-admission" -Release $rel) -Force
+        Invoke-QueueExpiredJob -Job $Job -Metadata $metadata -QueueAgeSec $queueAgeSec -Admission $script:Admission
         Complete-AdmissionWaitMarker -JobId $jobId -Status "queue-expired"
         return
     }
@@ -3188,8 +3205,14 @@ function Invoke-QueuedJob {
         $pre = Confirm-HeavySlotHeldForLaunch -JobId $jobId
         if (-not $pre.ok) {
             $held = [string]$script:Admission.heavySlotHeld
+            # QUIET-LEASE-EXIT-RELEASE-EVIDENCE-1: released (its release recorded) before Exit-HeavySlot, on the admission and on
+            # the kept holder-lost event, which the job's next admission and so its result carry.
+            $rel = $null
+            if ($null -ne $script:QuietLease) { $rel = Stop-QuietLease -Lease $script:QuietLease -Why "pre-launch $($pre.reason): $($pre.why)"; $script:QuietLease = $null }
             Exit-HeavySlot
-            Add-HeavySlotHolderLoss -JobId $jobId -Phase "pre-launch" -Why $pre.why -Held $held -Reason $pre.reason
+            $leaseRelease = New-LeaseReleaseRecord -Phase "pre-launch" -Release $rel
+            $script:Admission | Add-Member -NotePropertyName leaseRelease -NotePropertyValue $leaseRelease -Force
+            Add-HeavySlotHolderLoss -JobId $jobId -Phase "pre-launch" -Why $pre.why -Held $held -Reason $pre.reason -LeaseRelease $leaseRelease
             Add-AgentLogLine "launch refused job=${jobId} reason=$($pre.reason): NOT launched; left queued in inbox\ for the next poll, no result published"
             Write-AgentHeartbeat -Activity "launch-refused job=$jobId $($pre.reason)"
             return
