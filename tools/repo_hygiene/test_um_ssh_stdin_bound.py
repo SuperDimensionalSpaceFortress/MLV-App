@@ -18,8 +18,32 @@ GUARD = REPO / "tools" / "profiling" / "test-um-ssh-stdin-bound.ps1"
 WRAPPER_KILL_DEADLINE = 15  # seconds the wrapper gives taskkill and then the reap, each, before it says so and moves on
 
 
+TASKLIST_DEADLINE = 10  # seconds the wrapper gives one tasklist liveness probe before it reports the pid as not shown gone
+
+
 def _taskkill_tree(pid, deadline=WRAPPER_KILL_DEADLINE):
     subprocess.run(["taskkill.exe", "/T", "/F", "/PID", str(pid)], capture_output=True, timeout=deadline)
+
+
+def _best_effort_taskkill(pid, taskkill=_taskkill_tree):
+    """Fixture cleanup kill: bounded, and a taskkill that hangs becomes a note instead of a hung or masked test.
+
+    Returns "" when taskkill returned, else a one-line note for the test output.
+    """
+    try:
+        taskkill(pid, WRAPPER_KILL_DEADLINE)
+    except subprocess.TimeoutExpired:
+        return "taskkill of pid %s did not return within %d s (fixture cleanup unconfirmed)" % (pid, WRAPPER_KILL_DEADLINE)
+    return ""
+
+
+def _pid_alive(pid, run=subprocess.run):
+    """True if tasklist lists pid. A tasklist that does not answer in time cannot show the pid gone, so it counts as alive."""
+    try:
+        out = run(["tasklist.exe", "/FI", "PID eq %s" % pid, "/NH"], capture_output=True, text=True, timeout=TASKLIST_DEADLINE).stdout
+    except subprocess.TimeoutExpired:
+        return True
+    return str(pid) in out.split()
 
 
 def _stop_process_tree(proc, deadline=WRAPPER_KILL_DEADLINE, taskkill=_taskkill_tree):
@@ -94,15 +118,16 @@ class UmSshStdinBoundTests(unittest.TestCase):
                 text = out.read()
             probe_pid = pidfile.read_text().strip() if pidfile.is_file() else ""
             still_alive = bool(probe_pid) and self._pid_alive(probe_pid)
-            if probe_pid:
-                subprocess.run(["taskkill.exe", "/T", "/F", "/PID", probe_pid], capture_output=True)
+            cleanup_note = _best_effort_taskkill(probe_pid) if probe_pid else ""
+            if cleanup_note:
+                text += "\n[fixture cleanup] " + cleanup_note
         self.assertFalse(timed_out, "the guard was still blocked on a hung ssh -G probe long after its %d s deadline (%s)" % (deadline, stop_note))
         self.assertTrue(probe_pid, "the hung probe never started:\n" + text)
         self.assertEqual(guard.returncode, 1, text)
         self.assertIn("ssh -G did not exit within %d s" % deadline, text)
         self.assertIn("OVERALL FAIL", text)
         self.assertLess(elapsed, allowance, "the guard took %.1f s for a %d s deadline (allowance %d s)" % (elapsed, deadline, allowance))
-        self.assertFalse(still_alive, "the hung probe (pid %s) was left running after the deadline" % probe_pid)
+        self.assertFalse(still_alive, "the hung probe (pid %s) was left running after the deadline (or tasklist did not answer within %d s)\n%s" % (probe_pid, TASKLIST_DEADLINE, text))
 
     @unittest.skipUnless(sys.platform == "win32", "um-ssh.ps1 is Windows-only")
     def test_guard_without_ssh_exe_on_path_takes_the_argv_fallback(self):
@@ -157,7 +182,9 @@ class UmSshStdinBoundTests(unittest.TestCase):
         if pidfile and Path(pidfile).is_file():
             pids = Path(pidfile).read_text().split()
             for pid in pids:
-                subprocess.run(["taskkill.exe", "/T", "/F", "/PID", pid], capture_output=True)
+                cleanup_note = _best_effort_taskkill(pid)
+                if cleanup_note:
+                    text += "\n[fixture cleanup] " + cleanup_note
             # A surviving fake holds the output file open; wait until each is really gone before the temp dir is removed.
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline and any(self._pid_alive(pid) for pid in pids):
@@ -195,7 +222,9 @@ class UmSshStdinBoundTests(unittest.TestCase):
         self.assertEqual(rc, 1, text)
         self.assertIn("OVERALL FAIL", text)
         self.assertIn("drain did not finish within %d s" % deadline, text)
-        self.assertIn("descendant still holds", text)
+        # A likely cause, not an observed one: descendants are not tracked once the root exits.
+        self.assertIn("a descendant may still hold the pipe open (descendants are not tracked once the root exits)", text)
+        self.assertNotIn("descendant still holds", text)
         self.assertNotIn("the probe tree was killed", text)
         self.assertNotIn("did not exit within", text)  # the root DID exit; that is the process-timeout wording
 
@@ -305,12 +334,93 @@ class UmSshStdinBoundTests(unittest.TestCase):
         finally:
             if sleeper.poll() is None:
                 sleeper.kill()
-            sleeper.wait()
+            sleeper.wait(timeout=WRAPPER_KILL_DEADLINE)
 
     @staticmethod
     def _pid_alive(pid):
-        out = subprocess.run(["tasklist.exe", "/FI", "PID eq %s" % pid, "/NH"], capture_output=True, text=True).stdout
-        return pid in out.split()
+        return _pid_alive(pid)
+
+
+_BOUNDED_SUBPROCESS_FUNCS = {"run", "check_output", "check_call", "call"}
+
+
+def _unbounded_calls(source):
+    """UM-SSH-FIXTURE-CLEANUP-BOUND-1: list '<line>: <call>' for every blocking call in source with no timeout=.
+
+    Blocking calls are subprocess.run / check_output / check_call / call and any .wait( (a Popen reap).
+    A **kwargs splat does not count as a timeout: the pin wants it spelled out where the call is read.
+    """
+    import ast
+
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        func = node.func
+        is_subprocess = (
+            func.attr in _BOUNDED_SUBPROCESS_FUNCS
+            and isinstance(func.value, ast.Name) and func.value.id == "subprocess"
+        )
+        if not (is_subprocess or func.attr == "wait"):
+            continue
+        if not any(kw.arg == "timeout" for kw in node.keywords):
+            found.append("%d: %s" % (node.lineno, ast.unparse(node.func)))
+    return sorted(found, key=lambda entry: int(entry.split(":")[0]))
+
+
+class FixtureCleanupBoundTests(unittest.TestCase):
+    """UM-SSH-FIXTURE-CLEANUP-BOUND-1: the wrapper's own fixture cleanup never blocks, and says so when it gives up."""
+
+    def test_every_blocking_call_in_this_file_carries_a_timeout(self):
+        unbounded = _unbounded_calls(Path(__file__).read_text(encoding="utf-8"))
+        self.assertEqual(unbounded, [], "blocking calls with no timeout= (a hung child would hang the suite): " + ", ".join(unbounded))
+
+    def test_the_pin_flags_each_blocking_shape_and_passes_bounded_ones(self):
+        flagged = _unbounded_calls(
+            "import subprocess\n"
+            "subprocess.run(['x'])\n"
+            "subprocess.check_output(['x'])\n"
+            "subprocess.call(['x'])\n"
+            "subprocess.check_call(['x'])\n"
+            "p.wait()\n"
+            "subprocess.run(['x'], **opts)\n"
+        )
+        self.assertEqual([entry.split(":")[0] for entry in flagged], ["2", "3", "4", "5", "6", "7"], flagged)
+        self.assertEqual(_unbounded_calls(
+            "import subprocess\n"
+            "subprocess.run(['x'], timeout=1)\n"
+            "subprocess.check_output(['x'], timeout=1)\n"
+            "p.wait(timeout=1)\n"
+            "p.poll()\n"
+        ), [])
+
+    def test_a_taskkill_that_times_out_is_named_not_raised(self):
+        def stuck(pid, deadline):
+            raise subprocess.TimeoutExpired("taskkill", deadline)
+        note = _best_effort_taskkill("4242", taskkill=stuck)
+        self.assertIn("taskkill of pid 4242 did not return within %d s" % WRAPPER_KILL_DEADLINE, note)
+        self.assertIn("fixture cleanup unconfirmed", note)
+
+    def test_a_taskkill_that_returns_leaves_no_note(self):
+        calls = []
+        self.assertEqual(_best_effort_taskkill("4242", taskkill=lambda pid, deadline: calls.append((pid, deadline))), "")
+        self.assertEqual(calls, [("4242", WRAPPER_KILL_DEADLINE)])
+
+    def test_a_tasklist_that_times_out_counts_as_still_alive(self):
+        """If tasklist will not answer, the pid cannot be shown gone; report alive rather than hang or claim dead."""
+        seen = {}
+
+        def stuck(cmd, **kwargs):
+            seen.update(kwargs)
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+        self.assertTrue(_pid_alive("4242", run=stuck))
+        self.assertEqual(seen.get("timeout"), TASKLIST_DEADLINE)
+
+    def test_a_tasklist_answer_is_read_as_before(self):
+        def answer(text):
+            return lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=text, stderr="")
+        self.assertTrue(_pid_alive("4242", run=answer("python.exe   4242 Console   1   10,000 K\n")))
+        self.assertFalse(_pid_alive("4242", run=answer("INFO: No tasks are running which match the specified criteria.\n")))
 
 
 if __name__ == "__main__":

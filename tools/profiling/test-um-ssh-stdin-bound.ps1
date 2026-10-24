@@ -213,8 +213,9 @@ function Invoke-ProbeKill($Proc) {
 function Stop-HungProbe($Proc, [bool]$RootExited) {
     if ($RootExited) {
         # The root is gone but a descendant still holds the stdout pipe: there is nothing left to kill by
-        # pid, so say that instead of claiming a tree kill. (Descendants are not tracked once the root exits.)
-        return "known_hosts: ssh -G exited (code $($Proc.ExitCode)) but its stdout drain did not finish within $ProbeDeadlineSeconds s; a descendant still holds the pipe open; the descendant was not killed and the drain was abandoned"
+        # pid, so say that instead of claiming a tree kill. Descendants are not tracked once the root exits, so
+        # a descendant holding the pipe is the likely cause, not an observed one, and the message says "may".
+        return "known_hosts: ssh -G exited (code $($Proc.ExitCode)) but its stdout drain did not finish within $ProbeDeadlineSeconds s; a descendant may still hold the pipe open (descendants are not tracked once the root exits); no descendant was killed and the drain was abandoned"
     }
     $kill = 'kill attempted'
     try { Invoke-ProbeKill $Proc } catch { $kill = "kill attempted but threw: $($_.Exception.Message)" }
