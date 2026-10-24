@@ -3,9 +3,12 @@
 The guard itself is tools/profiling/test-um-ssh-stdin-bound.ps1 (a fake remote, no host contact).
 um-ssh.ps1 is Windows-only (ssh.exe, taskkill), so this wrapper skips elsewhere.
 """
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -32,6 +35,75 @@ class UmSshStdinBoundTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("OVERALL PASS", result.stdout)
+
+    @unittest.skipUnless(sys.platform == "win32", "um-ssh.ps1 is Windows-only")
+    def test_hung_ssh_g_probe_fails_at_the_deadline_and_is_reaped(self):
+        """UM-SSH-G-PROBE-DEADLINE-1: a probe that holds stdout open must fail the guard, not hang it."""
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        deadline = 5  # cmd.exe + a cold pwsh must write the pidfile before it, or the test fails on a loaded host
+        # Measured 6.4-6.8 s at a 3 s deadline on the loaded hub VM (~3.5 s of pwsh start-up and the guard's own
+        # um-ssh scenario); 15 s of headroom is ~4x that and still far below a delayed-failure mutant (30 s).
+        allowance = deadline + 15
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "hung-probe.pid"
+            env = dict(os.environ, MLV_HUNG_PROBE_PIDFILE=str(pidfile))
+            started = time.monotonic()
+            timed_out = False
+            # Output goes to files, not pipes: a surviving probe holds inherited pipe handles open, so
+            # draining them after a timeout would block this test as hard as it blocks the guard.
+            with open(Path(tmp) / "out.txt", "w+", encoding="utf-8", errors="replace") as out:
+                guard = subprocess.Popen(
+                    [pwsh, "-NoProfile", "-NonInteractive", "-File", str(GUARD),
+                     "-KnownHostsOnly", "-HungProbe", "-ProbeDeadlineSeconds", str(deadline)],
+                    stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT, env=env,
+                )
+                try:
+                    guard.wait(timeout=allowance)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    subprocess.run(["taskkill.exe", "/T", "/F", "/PID", str(guard.pid)], capture_output=True)
+                    guard.wait()
+                elapsed = time.monotonic() - started
+                out.seek(0)
+                text = out.read()
+            probe_pid = pidfile.read_text().strip() if pidfile.is_file() else ""
+            still_alive = bool(probe_pid) and self._pid_alive(probe_pid)
+            if probe_pid:
+                subprocess.run(["taskkill.exe", "/T", "/F", "/PID", probe_pid], capture_output=True)
+        self.assertFalse(timed_out, "the guard was still blocked on a hung ssh -G probe long after its %d s deadline" % deadline)
+        self.assertTrue(probe_pid, "the hung probe never started:\n" + text)
+        self.assertEqual(guard.returncode, 1, text)
+        self.assertIn("ssh -G did not exit within %d s" % deadline, text)
+        self.assertIn("OVERALL FAIL", text)
+        self.assertLess(elapsed, allowance, "the guard took %.1f s for a %d s deadline (allowance %d s)" % (elapsed, deadline, allowance))
+        self.assertFalse(still_alive, "the hung probe (pid %s) was left running after the deadline" % probe_pid)
+
+    @unittest.skipUnless(sys.platform == "win32", "um-ssh.ps1 is Windows-only")
+    def test_guard_without_ssh_exe_on_path_takes_the_argv_fallback(self):
+        """UM-SSH-G-PROBE-DEADLINE-1 r2: no ssh.exe on PATH must reach the argv check, not throw under strict mode."""
+        pwsh = shutil.which("pwsh")
+        if not pwsh:
+            self.skipTest("pwsh not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            # The seam is PATH itself: the guard looks ssh.exe up with Get-Command, and the only PATH entry
+            # is an empty directory. pwsh is launched by absolute path, so it needs no PATH to start.
+            env = dict(os.environ, PATH=tmp)
+            result = subprocess.run(
+                [pwsh, "-NoProfile", "-NonInteractive", "-File", str(GUARD), "-KnownHostsOnly"],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120, env=env, cwd=tmp,
+            )
+        text = result.stdout + result.stderr
+        self.assertNotIn("cannot be found on this object", text)
+        self.assertEqual(result.returncode, 0, text)
+        self.assertIn("PASS known_hosts path with space and ! stays one file", text)
+        self.assertIn("OVERALL PASS", text)
+
+    @staticmethod
+    def _pid_alive(pid):
+        out = subprocess.run(["tasklist.exe", "/FI", "PID eq %s" % pid, "/NH"], capture_output=True, text=True).stdout
+        return pid in out.split()
 
 
 if __name__ == "__main__":

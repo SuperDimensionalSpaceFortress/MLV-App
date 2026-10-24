@@ -12,10 +12,19 @@
 #
 # Usage: pwsh -NoProfile -File tools\profiling\test-um-ssh-stdin-bound.ps1 [-SkipMutants]
 #        [-ScriptUnderTest <path>]  (point at any um-ssh.ps1 variant to see it RED or GREEN)
+#
+# UM-SSH-G-PROBE-DEADLINE-1: the real `ssh -G` probe in Test-KnownHostsPath has its own deadline
+# (-ProbeDeadlineSeconds, default 20). -ProbeSshPath swaps the probe executable, -HungProbe swaps in
+# a fake that holds stdout open and never exits, and -KnownHostsOnly runs just that scenario; the
+# wrapper test uses all three to prove a hung probe fails the guard at the deadline, not never.
 [CmdletBinding()]
 param(
     [string]$ScriptUnderTest = (Join-Path $PSScriptRoot 'um-ssh.ps1'),
-    [switch]$SkipMutants
+    [switch]$SkipMutants,
+    [string]$ProbeSshPath = '',
+    [int]$ProbeDeadlineSeconds = 20,
+    [switch]$HungProbe,
+    [switch]$KnownHostsOnly
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -59,6 +68,21 @@ switch ($mode) {
 }
 '@
 Set-Content -Path $fakeCmd -Encoding ascii -Value ('@"{0}" -NoProfile -NonInteractive -File "%~dp0fake-ssh.ps1" %*' -f $pwshExe)
+
+# A hung `ssh -G`: prints a partial line, keeps stdout open and sleeps far past any deadline.
+# Its pid goes to $env:MLV_HUNG_PROBE_PIDFILE (when set) so a caller can prove it was reaped.
+if ($HungProbe) {
+    $hungPs1 = Join-Path $sandbox 'hung-probe.ps1'
+    $hungCmd = Join-Path $sandbox 'hung-probe.cmd'
+    Set-Content -Path $hungPs1 -Encoding ascii -Value @'
+if ($env:MLV_HUNG_PROBE_PIDFILE) { Set-Content -Path $env:MLV_HUNG_PROBE_PIDFILE -Value $PID -Encoding ascii }
+[Console]::Out.Write('userknownhosts')
+[Console]::Out.Flush()
+Start-Sleep -Seconds 600
+'@
+    Set-Content -Path $hungCmd -Encoding ascii -Value ('@"{0}" -NoProfile -NonInteractive -File "%~dp0hung-probe.ps1" %*' -f $pwshExe)
+    $ProbeSshPath = $hungCmd
+}
 
 function Stop-TreeById([int]$ProcessId) {
     & taskkill.exe /T /F /PID $ProcessId *> $null
@@ -175,17 +199,32 @@ function Test-KnownHostsPath([string]$Script, [string]$Tag) {
         $want = Join-Path (Join-Path $tmp 'mlv-app-ultra-magnus-ssh') 'known_hosts'
         $opt = @($r.Args | Where-Object { $_ -like 'UserKnownHostsFile=*' })
         if ($opt.Count -ne 1) { return @("known_hosts: expected exactly one UserKnownHostsFile option, got $($opt.Count)") }
-        $ssh = Get-Command ssh.exe -ErrorAction SilentlyContinue
-        if ($ssh) {
+        $sshExe = $ProbeSshPath
+        if (-not $sshExe) {
+            # No ssh.exe on PATH leaves $null here; strict mode forbids .Source on it, so test first.
+            $found = Get-Command ssh.exe -ErrorAction SilentlyContinue
+            if ($found) { $sshExe = [string]$found.Source }
+        }
+        if ($sshExe) {
             $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = $ssh.Source
+            $psi.FileName = $sshExe
             foreach ($a in @('-G', '-o', $opt[0], 'dummyhost')) { [void]$psi.ArgumentList.Add($a) }
             $psi.UseShellExecute = $false
             $psi.CreateNoWindow = $true
             $psi.RedirectStandardOutput = $true
+            $probeClock = [System.Diagnostics.Stopwatch]::StartNew()
             $p = [System.Diagnostics.Process]::Start($psi)
-            $text = $p.StandardOutput.ReadToEnd()
-            [void]$p.WaitForExit(20000)
+            # Read stdout asynchronously so ONE deadline covers the probe: a blocking ReadToEnd would
+            # wait on a hung probe that holds stdout open and the bound could never fire. The wait and the
+            # drain share that one deadline (the drain gets whatever time is left, never a second grace).
+            $outTask = $p.StandardOutput.ReadToEndAsync()
+            $left = { [int][Math]::Max(0, $ProbeDeadlineSeconds * 1000 - $probeClock.ElapsedMilliseconds) }
+            if (-not ($p.WaitForExit((& $left)) -and $outTask.Wait((& $left)))) {
+                try { $p.Kill($true) } catch { }
+                [void]$p.WaitForExit(5000)
+                return @("known_hosts: ssh -G did not exit within $ProbeDeadlineSeconds s; the probe tree was killed")
+            }
+            $text = $outTask.Result
             $line = @($text -split "`r?`n" | Where-Object { $_ -match '^userknownhostsfile ' })
             # ssh -G joins a multi-file list with ONE space, so equality with the single path rules out a split.
             if ($line.Count -ne 1 -or $line[0] -ne "userknownhostsfile $want") {
@@ -205,6 +244,7 @@ function Test-KnownHostsPath([string]$Script, [string]$Tag) {
 }
 
 function Invoke-AllScenarios([string]$Script, [string]$Tag) {
+    if ($KnownHostsOnly) { return @(Test-KnownHostsPath $Script "$Tag-kh") }
     return @(Test-StdinClosed $Script "$Tag-stdin") + @(Test-ArgsAndExit $Script "$Tag-args") + @(Test-WallClockBound $Script "$Tag-bound") + @(Test-KnownHostsPath $Script "$Tag-kh")
 }
 
@@ -213,10 +253,11 @@ try {
     Write-Host "== GREEN: $ScriptUnderTest"
     $greenFailures = @(Invoke-AllScenarios $ScriptUnderTest 'green')
     foreach ($m in $greenFailures) { Write-Host "  FAIL $m" }
-    if ($greenFailures.Count -eq 0) { Write-Host '  PASS stdin closed, options sent, exit code passed through, wall-clock bound kills the tree, known_hosts path with space and ! stays one file (4/4)' }
+    if ($greenFailures.Count -eq 0 -and $KnownHostsOnly) { Write-Host '  PASS known_hosts path with space and ! stays one file (1/1)' }
+    elseif ($greenFailures.Count -eq 0) { Write-Host '  PASS stdin closed, options sent, exit code passed through, wall-clock bound kills the tree, known_hosts path with space and ! stays one file (4/4)' }
     else { $exitCode = 1 }
 
-    if (-not $SkipMutants) {
+    if (-not $SkipMutants -and -not $KnownHostsOnly) {
         # marker -> scenario that must go RED when the protection is removed
         $mutants = [ordered]@{
             'stdin-close'    = 'Test-StdinClosed'
