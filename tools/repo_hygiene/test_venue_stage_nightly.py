@@ -118,11 +118,12 @@ exit 0
 
 # um-run.ps1 stand-in: the agent is simulated in-process. A JobId whose outbox result exists is refused exactly as UmRunDrop refuses it (UMRUN_JOBID_IN_USE).
 # FAKE_UMRUN_<DLLPAIR|STAGE|SMOKE>: ok (default) | unresolved | retracted | fail | wrongcache (stage only: STAGE_OK, but the cache keeps other bytes) | inuse | inuse-all.
+# The line also records the other two waits, the -NotAfterUtc it was handed (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1; empty = none) and when it was called.
 FAKE_UMRUN = r"""
 [CmdletBinding()] param([string]$ScriptPath, [string[]]$SideFile = @(), [string]$JobId = '', [string]$AgentShare = '', [int]$TimeoutSec = 0,
-    [int]$MaxQueueWaitSec = 0, [int]$MaxClaimedWaitSec = 0, [int]$MaxAdmissionWaitSec = 0)
+    [int]$MaxQueueWaitSec = 0, [int]$MaxClaimedWaitSec = 0, [int]$MaxAdmissionWaitSec = 0, [string]$NotAfterUtc = '')
 $sides = @($SideFile | ForEach-Object { ([string]$_) -split ';' } | Where-Object { $_ })
-Add-Content -LiteralPath $env:FAKE_CALLS -Value "UMRUN job=$JobId share=$AgentShare script=$ScriptPath side=$($sides -join ';') timeout=$TimeoutSec queue=$MaxQueueWaitSec"
+Add-Content -LiteralPath $env:FAKE_CALLS -Value "UMRUN job=$JobId share=$AgentShare script=$ScriptPath side=$($sides -join ';') timeout=$TimeoutSec queue=$MaxQueueWaitSec admission=$MaxAdmissionWaitSec claimed=$MaxClaimedWaitSec notAfter=$NotAfterUtc called=$([DateTime]::UtcNow.ToString('o'))"
 $outbox = Join-Path $AgentShare 'outbox'; $cache = Join-Path $AgentShare 'cache'
 New-Item -ItemType Directory -Force -Path $outbox, $cache | Out-Null
 $res = Join-Path $outbox "$JobId.result.json"
@@ -401,6 +402,50 @@ class VenueStageNightlyTests(unittest.TestCase):
         log = self.calls()
         self.assertLess(log.index(self.calls("COMMITGATE")[0]), log.index(self.calls("ASSEMBLE")[0]))
         self.assert_no_jobid_twice()
+
+    # ---------------------------------------------------------------- LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1: the notAfterUtc each submit hands um-run
+    def test_the_stage_job_not_after_is_the_drivers_deadline_and_the_harvested_jobs_get_none(self) -> None:
+        # The driver kills um-run at its -MaxTotalSec deadline, so the stage job (re-stageable under a suffix by a later call) gets that deadline as its
+        # notAfterUtc: the remaining budget, never earlier than a wait it passes. The DLL pair and the smoke runner are harvested BY NAME by a later call
+        # that cannot re-submit their single-use JobId, so they get the later bound: none (Get-DvJobNotAfter -LaterHarvest).
+        t0 = datetime.now(timezone.utc)
+        p = self.run_driver("-MaxTotalSec", "600")
+        t1 = datetime.now(timezone.utc)
+        self.assert_exit(p, "STAGE_OK")
+        o_utc = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$")
+
+        def parse_o(text: str) -> datetime:
+            m = re.match(r"^(.*T\d{2}:\d{2}:\d{2})\.(\d{7})Z$", text)
+            self.assertIsNotNone(m, text)
+            return datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc) + timedelta(microseconds=int(m.group(2)[:6]))
+
+        seen = {}
+        for c in self.submissions():
+            m = re.search(r" job=(\S+) .* timeout=(\d+) queue=(\d+) admission=(\d+) claimed=(\d+) notAfter=(\S*) called=(\S+)$", c)
+            self.assertIsNotNone(m, c)
+            seen[m.group(1)] = (int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)), m.group(6), parse_o(m.group(7)))
+        stage = seen[f"playback-attr-3-cuda-stage-{S12}"]
+        timeout, queue, admission, claimed, not_after, called = stage
+        self.assertRegex(not_after, o_utc, "the stage submit passes -NotAfterUtc in UTC 'o' form")
+        na = parse_o(not_after)
+        self.assertGreater(na, called)
+        for w in (timeout, queue, admission, claimed):
+            self.assertGreaterEqual(na, called + timedelta(seconds=w) - timedelta(seconds=1), f"never earlier than the {w} s wait it passes")
+        # the deadline: startedUtc + 600, with startedUtc inside [t0, t1]; the submit floors what is left of it to whole seconds
+        self.assertGreaterEqual(na, t0 + timedelta(seconds=600 - 1))
+        self.assertLessEqual(na, t1 + timedelta(seconds=600))
+        self.assertLessEqual(abs((na - called).total_seconds() - queue), 1.5, "notAfter is the remaining budget the queue wait is also given")
+        for jid in (f"playback-attr-3-cuda-dllpair-{S12}", f"attr3-stage-smoke-runner-{S12}-bbbbbbbbbbbb"):
+            self.assertEqual(seen[jid][4], "", f"{jid} is harvested by name by a later call that cannot re-submit it: no notAfter")
+
+    def test_the_driver_bounds_each_submit_through_the_one_helper(self) -> None:
+        text = DRIVER.read_text(encoding="utf-8")
+        fn = text[text.index("function Invoke-UmRun("):text.index("# ------------------------------------------------------------------ 6. DLL pair")]
+        self.assertEqual(fn.count("Get-DvJobNotAfter"), 1)
+        self.assertIn("-CallerCapSec $remain", fn)
+        self.assertIn("-NotAfterUtc", fn)
+        self.assertEqual(len(re.findall(r"Invoke-UmRun '(?:dllpair|smoke-runner)' .*-LaterHarvest", text)), 2, "the two harvested submits say so")
+        self.assertEqual(len(re.findall(r"Invoke-UmRun 'stage' .*-LaterHarvest", text)), 0)
 
     # ---------------------------------------------------------------- the owner-footage gate: side files are the build package, never anything else
     def test_side_files_are_only_this_shas_build_package_under_the_build_root(self) -> None:
