@@ -19,6 +19,8 @@
 #   processed\                   - consumed job scripts and metadata are moved here
 #   orphaned\                    - abandoned job scripts are preserved here
 #   cancel\<jobId>.cancel        - cooperative cancellation request
+#   notafter\<jobId>.json        - runner-liveness sidecar (liveness r1): aliveUntilUtc; a present sidecar that has passed or cannot
+#                                  be read ends the job like a passed notAfterUtc; absent = notAfterUtc alone
 #   slot-holders\                - r1c: each gated job's heavy-slot.py holder (record, acquired, release files);
 #                                  quiet-lease r1: <id>.lease.json, the record of a lease request wrapper
 #   heavy-slot-mode.txt          - optional, "lease" or "status": the gate mode when -HeavySlotMode is not passed
@@ -173,9 +175,12 @@ $running   = Join-Path $Root "running"
 $orphaned  = Join-Path $Root "orphaned"
 $cancel    = Join-Path $Root "cancel"
 $slotHolders = Join-Path $Root "slot-holders"
+# liveness r1: runner-liveness sidecars, read only (Read-JobNotAfterSidecar). The folder's existence is the capability signal: a
+# runner refuses to submit an open whose sidecar it cannot write here.
+$notAfterDir = Join-Path $Root "notafter"
 $heartbeat = Join-Path $Root "heartbeat.txt"
 $heavySlotModeFile = Join-Path $Root "heavy-slot-mode.txt"
-foreach ($d in @($inbox, $outbox, $processed, $logs, $running, $orphaned, $cancel, $slotHolders)) {
+foreach ($d in @($inbox, $outbox, $processed, $logs, $running, $orphaned, $cancel, $slotHolders, $notAfterDir)) {
     New-Item -ItemType Directory -Force -Path $d | Out-Null
 }
 
@@ -714,31 +719,145 @@ function Get-JobNotAfterVerdict {
     # turns an ISO string into one); a string with no offset is read as UTC, the same as an Unspecified [DateTime]. A value that
     # does not parse FAILS CLOSED (callers treat it as passed): a submitter that wrote a bound wanted one.
     # LEASE-NOT-AFTER-HARDENING-1: a meta.json Get-JobMetadata marked metaUnreadable (it may carry a deadline) is unparseable too.
-    param([Parameter(Mandatory = $true)]$Metadata, [DateTime]$NowUtc = [DateTime]::MinValue)
+    # liveness r1 (LEASE-BATCH-OPEN-RUNNER-LIVENESS-1): -Sidecar is Read-JobNotAfterSidecar's result for the job, folded in so it
+    # can only make the job expire SOONER: the earlier of meta and sidecar, never the later. A meta verdict of passed or
+    # unparseable stands as it is. Sidecar absent (or $null): the meta verdict, as before. Live: the meta verdict (its state,
+    # notAfterUtc and remainingSec). aliveUntilUtc passed: passed. Unreadable, not a JSON object, the wrong schema or jobId, or an
+    # aliveUntilUtc that is missing or does not parse (read as notAfterUtc is): unparseable, fail closed. remainingSec, and so
+    # Get-QuietLeaseAdmitTimeout's --admit-timeout, never comes from the sidecar: a short liveness window must not shrink a
+    # request's bound (that would drop it every few seconds and starve it behind a foreign holder). Every verdict also carries
+    # livenessState (absent | live | lapsed | unparseable), livenessUntilUtc, livenessWrittenUtc and livenessSeq (recorded, never
+    # gating) and source (meta | sidecar: which bound decided; the why says so when it is the sidecar).
+    param([Parameter(Mandatory = $true)]$Metadata, [DateTime]$NowUtc = [DateTime]::MinValue, $Sidecar = $null)
     $now = if ($NowUtc -eq [DateTime]::MinValue) { [DateTime]::UtcNow } elseif ($NowUtc.Kind -eq [DateTimeKind]::Local) { $NowUtc.ToUniversalTime() } else { [DateTime]::SpecifyKind($NowUtc, [DateTimeKind]::Utc) }
+    # One reading of a bound, for notAfterUtc and aliveUntilUtc alike: a UTC [DateTime], or $null when it does not parse.
+    $toUtc = {
+        param($raw)
+        if ($raw -is [DateTimeOffset]) { return $raw.UtcDateTime }
+        if ($raw -is [DateTime]) {
+            if ($raw.Kind -eq [DateTimeKind]::Local) { return $raw.ToUniversalTime() }
+            return [DateTime]::SpecifyKind($raw, [DateTimeKind]::Utc)
+        }
+        if ($raw -is [string]) {
+            $dto = [DateTimeOffset]::MinValue
+            if ([DateTimeOffset]::TryParse($raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dto)) { return $dto.UtcDateTime }
+        }
+        return $null
+    }
+    $v = $null
     if ($Metadata.metaUnreadable -eq $true) {
-        return [pscustomobject]@{ state = "unparseable"; notAfterUtc = $null; remainingSec = $null; why = "meta.json $($Metadata.metaReadError); it may carry a notAfterUtc, so fail closed (treated as passed)" }
+        $v = [pscustomobject]@{ state = "unparseable"; notAfterUtc = $null; remainingSec = $null; why = "meta.json $($Metadata.metaReadError); it may carry a notAfterUtc, so fail closed (treated as passed)" }
     }
-    $raw = $Metadata.notAfterUtc
-    if ($null -eq $raw -or ($raw -is [string] -and [string]::IsNullOrWhiteSpace($raw))) {
-        return [pscustomobject]@{ state = "none"; notAfterUtc = $null; remainingSec = $null; why = "no notAfterUtc" }
+    else {
+        $raw = $Metadata.notAfterUtc
+        if ($null -eq $raw -or ($raw -is [string] -and [string]::IsNullOrWhiteSpace($raw))) {
+            $v = [pscustomobject]@{ state = "none"; notAfterUtc = $null; remainingSec = $null; why = "no notAfterUtc" }
+        }
+        else {
+            $at = & $toUtc $raw
+            if ($null -eq $at) {
+                $v = [pscustomobject]@{ state = "unparseable"; notAfterUtc = $null; remainingSec = $null; why = "notAfterUtc '$(([string]$raw) -replace '[^\x20-\x7E]', '?')' does not parse; fail closed (treated as passed)" }
+            }
+            else {
+                $text = $at.ToString("o")
+                $left = ($at - $now).TotalSeconds
+                if ($left -gt 0) { $v = [pscustomobject]@{ state = "open"; notAfterUtc = $text; remainingSec = $left; why = "notAfterUtc $text is $([Math]::Round($left, 1)) s away" } }
+                else { $v = [pscustomobject]@{ state = "passed"; notAfterUtc = $text; remainingSec = $left; why = "notAfterUtc $text passed $([Math]::Round(-$left, 1)) s ago" } }
+            }
+        }
     }
-    $at = $null
-    if ($raw -is [DateTimeOffset]) { $at = $raw.UtcDateTime }
-    elseif ($raw -is [DateTime]) {
-        if ($raw.Kind -eq [DateTimeKind]::Local) { $at = $raw.ToUniversalTime() } else { $at = [DateTime]::SpecifyKind($raw, [DateTimeKind]::Utc) }
+    # liveness r1: the sidecar, when present.
+    $lState = "absent"; $lUntil = $null; $lWritten = $null; $lSeq = $null; $lWhy = $null
+    if ($null -ne $Sidecar -and [string]$Sidecar.state -cne "absent") {
+        $sideJobId = [string]$Sidecar.jobId
+        $bad = $null
+        $until = $null
+        if ([string]$Sidecar.state -cne "present") { $bad = "could not be read ($(([string]$Sidecar.error) -replace '[^\x20-\x7E]', '?'))" }
+        else {
+            $o = $null
+            try { $o = [string]$Sidecar.text | ConvertFrom-Json -ErrorAction Stop } catch { $bad = "does not parse as JSON" }
+            if ($null -eq $bad -and $o -isnot [System.Management.Automation.PSCustomObject]) { $bad = "does not hold a JSON object" }
+            if ($null -eq $bad) {
+                $w = & $toUtc $o.writtenUtc
+                if ($null -ne $w) { $lWritten = $w.ToString("o") }
+                $sq = [long]0
+                if ($null -ne $o.seq -and [long]::TryParse([string]$o.seq, [ref]$sq)) { $lSeq = $sq }
+                if (-not ($o.schema -is [string] -and $o.schema -ceq "mlv-app/job-notafter-sidecar/v1")) { $bad = "schema is not mlv-app/job-notafter-sidecar/v1" }
+                elseif ([string]::IsNullOrEmpty($sideJobId) -or -not ($o.jobId -is [string] -and $o.jobId -ceq $sideJobId)) { $bad = "jobId does not name this job" }
+                else {
+                    $rawUntil = $o.aliveUntilUtc
+                    if (-not ($null -eq $rawUntil -or ($rawUntil -is [string] -and [string]::IsNullOrWhiteSpace($rawUntil)))) { $until = & $toUtc $rawUntil }
+                    if ($null -eq $until) { $bad = "aliveUntilUtc is missing or does not parse" }
+                }
+            }
+        }
+        if ($null -ne $bad) {
+            $lState = "unparseable"
+            $lWhy = "runner liveness sidecar notafter\$($sideJobId -replace '[^\x20-\x7E]', '?').json $bad; fail closed (treated as passed)"
+        }
+        else {
+            $lUntil = $until.ToString("o")
+            $lLeft = ($until - $now).TotalSeconds
+            if ($lLeft -gt 0) { $lState = "live"; $lWhy = "runner liveness sidecar live until $lUntil ($([Math]::Round($lLeft, 1)) s)" }
+            else { $lState = "lapsed"; $lWhy = "runner liveness sidecar aliveUntilUtc $lUntil passed $([Math]::Round(-$lLeft, 1)) s ago" }
+        }
     }
-    elseif ($raw -is [string]) {
-        $dto = [DateTimeOffset]::MinValue
-        if ([DateTimeOffset]::TryParse($raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dto)) { $at = $dto.UtcDateTime }
+    $state = $v.state
+    $why = $v.why
+    $source = "meta"
+    if ($v.state -in @("open", "none")) {
+        if ($lState -eq "lapsed") { $state = "passed"; $source = "sidecar"; $why = "$lWhy; the earlier bound wins (source=sidecar)" }
+        elseif ($lState -eq "unparseable") { $state = "unparseable"; $source = "sidecar"; $why = "$lWhy (source=sidecar)" }
+        elseif ($lState -eq "live") { $why = "$($v.why); $lWhy, so notAfterUtc decides (source=meta)" }
     }
-    if ($null -eq $at) {
-        return [pscustomobject]@{ state = "unparseable"; notAfterUtc = $null; remainingSec = $null; why = "notAfterUtc '$(([string]$raw) -replace '[^\x20-\x7E]', '?')' does not parse; fail closed (treated as passed)" }
+    return [pscustomobject]@{
+        state = $state; notAfterUtc = $v.notAfterUtc; remainingSec = $v.remainingSec; why = $why
+        livenessState = $lState; livenessUntilUtc = $lUntil; livenessWrittenUtc = $lWritten; livenessSeq = $lSeq; source = $source
     }
-    $text = $at.ToString("o")
-    $left = ($at - $now).TotalSeconds
-    if ($left -gt 0) { return [pscustomobject]@{ state = "open"; notAfterUtc = $text; remainingSec = $left; why = "notAfterUtc $text is $([Math]::Round($left, 1)) s away" } }
-    return [pscustomobject]@{ state = "passed"; notAfterUtc = $text; remainingSec = $left; why = "notAfterUtc $text passed $([Math]::Round(-$left, 1)) s ago" }
+}
+
+function Read-JobNotAfterSidecar {
+    # Impure. liveness r1 (LEASE-BATCH-OPEN-RUNNER-LIVENESS-1): the job's runner-liveness sidecar, notafter\<jobId>.json, which its
+    # submitter (the VM runner) renews while it is alive, as @{ state = absent | present | unreadable; text; error; jobId; path }
+    # for Get-JobNotAfterVerdict -Sidecar (which parses it). The file is local to this agent, never read over SMB. This agent only
+    # READS it: it never writes, moves or deletes one (the runner owns the file; Move-JobArtifacts leaves it). No file or no
+    # folder: absent. Opened with FileShare ReadWrite|Delete, so a read never blocks the runner's replacing rename. An IOException
+    # other than not-found (a sharing violation, say) is retried 3 times, 200 ms apart, then unreadable; anything else that stops
+    # the read, bytes that are not UTF-8, and a file over 4096 bytes are unreadable at once.
+    param([Parameter(Mandatory = $true)][string]$JobId)
+    $path = Join-Path $notAfterDir "$JobId.json"
+    $err = $null
+    $reads = 0
+    for ($try = 1; $try -le 4; $try++) {
+        $reads = $try
+        try {
+            $buf = [byte[]]::new(4097)
+            $n = 0
+            $fs = [System.IO.FileStream]::new($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, ([System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete))
+            try {
+                while ($n -lt $buf.Length) {
+                    $k = $fs.Read($buf, $n, $buf.Length - $n)
+                    if ($k -le 0) { break }
+                    $n += $k
+                }
+            }
+            finally { $fs.Dispose() }
+            if ($n -gt 4096) { return [pscustomobject]@{ state = "unreadable"; text = $null; error = "over 4096 bytes"; jobId = $JobId; path = $path } }
+            $text = [System.Text.UTF8Encoding]::new($false, $true).GetString($buf, 0, $n).TrimStart([char]0xFEFF)
+            return [pscustomobject]@{ state = "present"; text = $text; error = $null; jobId = $JobId; path = $path }
+        }
+        catch {
+            $ex = $_.Exception
+            if ($ex -is [System.Management.Automation.MethodInvocationException] -and $null -ne $ex.InnerException) { $ex = $ex.InnerException }
+            if ($ex -is [System.IO.FileNotFoundException] -or $ex -is [System.IO.DirectoryNotFoundException]) {
+                return [pscustomobject]@{ state = "absent"; text = $null; error = $null; jobId = $JobId; path = $path }
+            }
+            $err = "$($ex.GetType().Name): $($ex.Message)" -replace '[^\x20-\x7E]', '?'
+            if ($ex -isnot [System.IO.IOException]) { break }
+            if ($try -lt 4) { Start-Sleep -Milliseconds 200 }
+        }
+    }
+    return [pscustomobject]@{ state = "unreadable"; text = $null; error = "$err (after $reads read(s))"; jobId = $JobId; path = $path }
 }
 
 function Publish-JobResult {
@@ -1088,10 +1207,18 @@ function Publish-NotAfterExpiredResult {
 
     $jobId = $Job.BaseName -replace '\.job$', ''
     $phase = if ($null -ne $Admission -and $Admission.phase) { [string]$Admission.phase } else { "pre-gate" }
-    $what = switch ([string]$Verdict.state) {
-        "passed" { "notAfterUtc $($Verdict.notAfterUtc) passed" }
-        "unparseable" { "notAfterUtc could not be read (fail closed)" }
-        default { "notAfterUtc $($Verdict.notAfterUtc) left too little time for a lease request" }
+    # liveness r1: notAfterSource says which bound ended it (meta.json or the runner-liveness sidecar); exitCode is unchanged.
+    $source = if ($Verdict.source) { [string]$Verdict.source } else { "meta" }
+    $what = if ($source -eq "sidecar") {
+        if ([string]$Verdict.state -eq "passed") { "runner liveness lapsed (sidecar aliveUntilUtc $($Verdict.livenessUntilUtc) passed)" }
+        else { "runner liveness sidecar could not be read (fail closed)" }
+    }
+    else {
+        switch ([string]$Verdict.state) {
+            "passed" { "notAfterUtc $($Verdict.notAfterUtc) passed" }
+            "unparseable" { "notAfterUtc could not be read (fail closed)" }
+            default { "notAfterUtc $($Verdict.notAfterUtc) left too little time for a lease request" }
+        }
     }
     $result = [pscustomobject]@{
         jobId            = $jobId
@@ -1109,6 +1236,9 @@ function Publish-NotAfterExpiredResult {
         notAfterUtc      = $Verdict.notAfterUtc
         notAfterState    = [string]$Verdict.state
         notAfterWhy      = [string]$Verdict.why
+        notAfterSource   = $source
+        livenessState    = $Verdict.livenessState
+        livenessUntilUtc = $Verdict.livenessUntilUtc
         orphaned         = $false
         adopted          = $false
         killedProcessIds = @()
@@ -1118,7 +1248,8 @@ function Publish-NotAfterExpiredResult {
     }
     $resultPath = Publish-JobResult -JobId $jobId -Result $result
     Move-JobArtifacts -JobId $jobId -JobPath $Job.FullName -DestinationDirectory $processed
-    Add-AgentLogLine "not-after expired job=$jobId notAfterUtc=$($Verdict.notAfterUtc) phase=$phase result=$resultPath"
+    $sourceText = if ($source -eq "sidecar") { " source=sidecar livenessUntilUtc=$(if ($null -ne $Verdict.livenessUntilUtc) { $Verdict.livenessUntilUtc } else { 'unparseable' })" } else { "" }
+    Add-AgentLogLine "not-after expired job=$jobId notAfterUtc=$($Verdict.notAfterUtc) phase=$phase result=$resultPath$sourceText"
 }
 
 function Invoke-OrphanResult {
@@ -2281,6 +2412,15 @@ function Wait-HeavySlotAdmission {
 #      renewed past it (a light job run from the wait cannot keep it fresh); and a meta.json that may carry it but cannot be
 #      read fails closed (Get-JobMetadata). Not promised: clock skew between submitter and agent, a frozen agent, another
 #      agent, or the few statements between that last check and Process.Start.
+#   7. RUNNER LIVENESS (liveness r1, LEASE-BATCH-OPEN-RUNNER-LIVENESS-1, 2026-10-24). notafter\<jobId>.json is the job's
+#      runner-liveness sidecar: its submitter keeps aliveUntilUtc a short window ahead while it lives (#633 r5), so an open's
+#      bound dies with its runner. It is read fresh (Read-JobNotAfterSidecar) at every notAfterUtc check: the pre-gate check,
+#      the top of every gate loop (a pending request is released), when the lease turns active (it is released), post-admission
+#      and pre-launch, and by the renew tick for a waiting lease (no more renews). A present sidecar that has passed, or cannot
+#      be read, ends the job exactly as a passed notAfterUtc does (fail closed; source=sidecar is typed); absent leaves
+#      notAfterUtc alone in charge. The earlier bound wins: a sidecar only shortens, never extends. remainingSec, and so
+#      --admit-timeout, come from meta.json alone, so a short liveness window never shrinks a request's bound. The agent never
+#      writes, moves or deletes a sidecar. A job already running is not stopped by it.
 # KNOWN LIMIT: a lease cannot drain a holder that outlives heavy-slot.py's 30-min pending cap. Such a request is refused
 # (exit 75) and re-asked every LeaseRetrySec, so the job waits behind that holder until the queue-age ceiling.
 # A job whose timeout is over LeaseMaxMinutes minutes is admitted with admission.leaseCoversTimeout=false and a typed line:
@@ -2572,12 +2712,16 @@ function Invoke-QuietLeaseRenewTick {
     # admitted lease is the running job's and renews as before.
     # LEASE-NOT-AFTER-HARDENING-2 (Dot R18 on #648): a renew already in flight as that deadline passes is still collected, or
     # killed at LeaseRenewTimeoutSec, here (Update-QuietLeaseRenew -CollectOnly), not left running until the release.
+    # liveness r1: the waiting lease's runner-liveness sidecar is read too; one that has passed or cannot be read stops it the same way.
     foreach ($l in @($script:QuietLease, $script:QuietLeaseWaiting)) {
         if ($null -eq $l) { continue }
-        if ([object]::ReferenceEquals($l, $script:QuietLeaseWaiting) -and (Get-JobNotAfterVerdict -Metadata $l).state -eq "passed") {
+        $lv = $null
+        if ([object]::ReferenceEquals($l, $script:QuietLeaseWaiting)) { $lv = Get-JobNotAfterVerdict -Metadata $l -Sidecar (Read-JobNotAfterSidecar -JobId $l.jobId) }
+        if ($null -ne $lv -and $lv.state -in @("passed", "unparseable")) {
             if ($l.notAfterStopLogged -ne $true) {
                 $l | Add-Member -NotePropertyName notAfterStopLogged -NotePropertyValue $true -Force
-                Add-AgentLogLine "quiet-lease: not-after passed job=$($l.jobId) notAfterUtc=$($l.notAfterUtc) active=$($null -ne $l.active) while waiting; no more renews (one in flight is still collected or killed), released at the wait's next loop top"
+                $src = if ($lv.source -eq "sidecar") { " source=sidecar livenessUntilUtc=$(if ($null -ne $lv.livenessUntilUtc) { $lv.livenessUntilUtc } else { 'unparseable' })" } else { "" }
+                Add-AgentLogLine "quiet-lease: not-after passed job=$($l.jobId) notAfterUtc=$($l.notAfterUtc) active=$($null -ne $l.active)$src while waiting; no more renews (one in flight is still collected or killed), released at the wait's next loop top"
             }
             Update-QuietLeaseRenew -Lease $l -CollectOnly
             continue
@@ -2687,14 +2831,18 @@ function Wait-QuietLeaseAdmission {
     $maxAge = [int]$Metadata.maxQueueAgeSec
     # not-after r1: the unadmitted record for a job past its notAfterUtc (or with one that cannot be read, or too near to
     # request), shaped like queue-expired. Phase: pre-request (no request pending) | pending | post-active. Typed once.
+    # liveness r1: when the runner-liveness sidecar decided (source=sidecar), the line also says so and names its aliveUntilUtc.
     $notAfterExpired = {
         param([string]$Phase, $Verdict, $Release, [string]$Why)
-        Add-AgentLogLine "quiet-lease: expired-not-after job=$JobId phase=$Phase notAfterUtc=$(if ($null -ne $Verdict.notAfterUtc) { $Verdict.notAfterUtc } else { 'unparseable' }) requests=$requests releaseRc=$(if ($null -ne $Release) { $Release.releaseRc } else { 'none' }); NOT run, no lease kept"
+        $bySidecar = $Verdict.source -eq "sidecar"
+        $src = if ($bySidecar) { " source=sidecar livenessUntilUtc=$(if ($null -ne $Verdict.livenessUntilUtc) { $Verdict.livenessUntilUtc } else { 'unparseable' })" } else { "" }
+        Add-AgentLogLine "quiet-lease: expired-not-after job=$JobId phase=$Phase notAfterUtc=$(if ($null -ne $Verdict.notAfterUtc) { $Verdict.notAfterUtc } elseif ($bySidecar) { 'none' } else { 'unparseable' }) requests=$requests releaseRc=$(if ($null -ne $Release) { $Release.releaseRc } else { 'none' })$src; NOT run, no lease kept"
         return [pscustomobject]@{
             gate = $script:GateVersion; mode = "lease"; label = "expired-not-after"; state = "expired"; phase = $Phase
             waitedSec = [int]((Get-Date) - $t0).TotalSeconds; probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = $Why
             notAfterUtc = $Verdict.notAfterUtc; notAfterState = $Verdict.state; leaseRelease = (New-LeaseReleaseRecord -Phase $Phase -Release $Release)
             leaseRequests = $requests; leaseRefusals = @($refusals.ToArray())
+            notAfterSource = $(if ($Verdict.source) { [string]$Verdict.source } else { "meta" }); livenessState = $Verdict.livenessState; livenessUntilUtc = $Verdict.livenessUntilUtc
         }
     }
     try {
@@ -2705,8 +2853,9 @@ function Wait-QuietLeaseAdmission {
                 return [pscustomobject]@{ gate = $script:GateVersion; mode = "lease"; label = "cancelled-in-gate"; state = "cancelled"; waitedSec = [int]$waited; probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = "cancel file present before launch"; leaseRefusals = @($refusals.ToArray()) }
             }
             # not-after r1 (sol r3 on #633): a submitter that has given up must not get a lease taken for it. Passed or
-            # unreadable ends the wait here, releasing a pending request first.
-            $v = Get-JobNotAfterVerdict -Metadata $Metadata
+            # unreadable ends the wait here, releasing a pending request first. liveness r1: so does a runner-liveness sidecar
+            # that has passed or cannot be read, read fresh on every loop.
+            $v = Get-JobNotAfterVerdict -Metadata $Metadata -Sidecar (Read-JobNotAfterSidecar -JobId $JobId)
             if ($v.state -in @("passed", "unparseable")) {
                 # LEASE-NOT-AFTER-HARDENING-1 (key3 hardening 2): the request may have turned active since the last read (inside
                 # a light job run from this wait, say), so it is read once more and the phase says which: pending | post-active.
@@ -2743,7 +2892,7 @@ function Wait-QuietLeaseAdmission {
                     # not-after r1 (sol r3 on #633): a pending request can turn active between two checks of the loop top, so the
                     # cancel file and notAfterUtc are read again before the lease is handed to the job; either releases it at once.
                     $cancelNow = Test-Path -LiteralPath (Join-Path $cancel "$JobId.cancel") -PathType Leaf
-                    $vNow = Get-JobNotAfterVerdict -Metadata $Metadata
+                    $vNow = Get-JobNotAfterVerdict -Metadata $Metadata -Sidecar (Read-JobNotAfterSidecar -JobId $JobId)
                     if ($cancelNow) {
                         $rel = Stop-QuietLease -Lease $lease -Why "cancel file present when the lease turned active"
                         $lease = $null
@@ -2776,6 +2925,7 @@ function Wait-QuietLeaseAdmission {
                         thermal = $heat.why; heat = $heat.state; leaseMinutes = $minutes; leaseUntil = $a.until; leaseCoversTimeout = $covers
                         leaseRequests = $requests; leaseRefusals = @($refusals.ToArray()); leaseOwner = $script:QuietLease.ownerCheck.why
                         notAfterUtc = $vNow.notAfterUtc; admitTimeoutSec = $script:QuietLease.admitTimeoutSec; admitTimeoutSource = $script:QuietLease.admitTimeoutSource
+                        notAfterSource = $vNow.source; livenessState = $vNow.livenessState; livenessUntilUtc = $vNow.livenessUntilUtc; livenessSeq = $vNow.livenessSeq
                         why = "quiet lease active: slot $($a.slot) held=$($a.held) until=$([long]$a.until); heat (recorded, not gated): $($heat.why)"
                     }
                     if ($null -ne $script:GateHour) { $script:GateHour.admitted++; $script:GateHour.waitSecTotal += [int]$waited }
@@ -2873,8 +3023,9 @@ function Invoke-QueuedJob {
         Complete-AdmissionWaitMarker -JobId $jobId -Status "queue-expired"   # a claim re-queued by a restart
         return
     }
-    # not-after r1: a job past its notAfterUtc (or with one that cannot be read) is never gated, leased or run.
-    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata
+    # not-after r1: a job past its notAfterUtc (or with one that cannot be read) is never gated, leased or run. liveness r1: nor is
+    # one whose runner-liveness sidecar has passed or cannot be read (each check below reads it fresh).
+    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata -Sidecar (Read-JobNotAfterSidecar -JobId $jobId)
     if ($notAfter.state -in @("passed", "unparseable")) {
         Publish-NotAfterExpiredResult -Job $Job -Metadata $metadata -QueueAgeSec $queueAgeSec -Verdict $notAfter
         Complete-AdmissionWaitMarker -JobId $jobId -Status "expired-not-after"   # a claim re-queued by a restart
@@ -2914,7 +3065,8 @@ function Invoke-QueuedJob {
         return
     }
     if ($script:Admission.label -eq "expired-not-after") {
-        $gateVerdict = [pscustomobject]@{ state = $script:Admission.notAfterState; notAfterUtc = $script:Admission.notAfterUtc; why = $script:Admission.why }
+        $gateVerdict = [pscustomobject]@{ state = $script:Admission.notAfterState; notAfterUtc = $script:Admission.notAfterUtc; why = $script:Admission.why
+            source = $script:Admission.notAfterSource; livenessState = $script:Admission.livenessState; livenessUntilUtc = $script:Admission.livenessUntilUtc }
         Publish-NotAfterExpiredResult -Job $Job -Metadata $metadata -Admission $script:Admission -QueueAgeSec $queueAgeSec -Verdict $gateVerdict
         Complete-AdmissionWaitMarker -JobId $jobId -Status "expired-not-after"
         return
@@ -2948,12 +3100,15 @@ function Invoke-QueuedJob {
         $script:Admission | Add-Member -NotePropertyName slot -NotePropertyValue $null -Force
         $script:Admission | Add-Member -NotePropertyName notAfterUtc -NotePropertyValue $Verdict.notAfterUtc -Force
         $script:Admission | Add-Member -NotePropertyName notAfterState -NotePropertyValue $Verdict.state -Force
+        $script:Admission | Add-Member -NotePropertyName notAfterSource -NotePropertyValue ([string]$Verdict.source) -Force
+        $script:Admission | Add-Member -NotePropertyName livenessState -NotePropertyValue $Verdict.livenessState -Force
+        $script:Admission | Add-Member -NotePropertyName livenessUntilUtc -NotePropertyValue $Verdict.livenessUntilUtc -Force
         $script:Admission | Add-Member -NotePropertyName leaseRelease -NotePropertyValue (New-LeaseReleaseRecord -Phase $Phase -Release $rel) -Force
         Publish-NotAfterExpiredResult -Job $Job -Metadata $metadata -Admission $script:Admission -QueueAgeSec $queueAgeSec -Verdict $Verdict
         Complete-AdmissionWaitMarker -JobId $jobId -Status "expired-not-after"
     }
     # not-after r1: the notAfterUtc check before the launching marker (status mode's own wait does not poll it).
-    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata
+    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata -Sidecar (Read-JobNotAfterSidecar -JobId $jobId)
     if ($notAfter.state -in @("passed", "unparseable")) {
         & $notAfterAdmitted "post-admission" $notAfter "after admission, before launch"
         return
@@ -3023,7 +3178,7 @@ function Invoke-QueuedJob {
     # block (the launching write retries; the slot re-confirm renews to completion) and immediately before the child is
     # created. Passed: the same exit as post-admission (phase pre-launch); this agent's own launching marker is retired as
     # expired-not-after (nothing launched: the out file was never created).
-    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata
+    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata -Sidecar (Read-JobNotAfterSidecar -JobId $jobId)
     if ($notAfter.state -in @("passed", "unparseable")) {
         & $notAfterAdmitted "pre-launch" $notAfter "at the last check before launch"
         return
