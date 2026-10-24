@@ -2316,8 +2316,14 @@ function Test-DvReceiptValid {
 # um-run.ps1's own -MaxAdmissionWaitSec default. A submitter that does not choose one passes this by name, so the wait it bounds is the wait um-run uses
 # (test_venue_not_after.py reads the default out of um-run.ps1's param block and pins the two equal).
 $script:DvUmRunMaxAdmissionWaitSec = 7200
-# Added to an uncapped bound: um-run's clock starts after its drop to the share and it reads the outbox every -PollSeconds (3 s), so the client can still
-# be waiting a little past submit + the sum of its waits.
+# Added to an uncapped bound: um-run reads the outbox every -PollSeconds (3 s), so the client can still be waiting a little past its waits.
+# LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r2 (hub ruling on sol's r1 blocker): the uncapped bound is no longer counted from this helper's clock. The
+# submitter passes it as um-run.ps1 -NotAfterBudgetSec (budgetSec below), and UmRunDrop.psm1 counts it from its own clock read immediately before the claim
+# is written, so a slow setup or share before the drop is absorbed a priori, whatever its length. r3 (sol r2 blocker): the drop reads its clock AGAIN
+# immediately before the job's rename into view, after every side-file and the job's own copy, and re-publishes the value it re-derives, so slow placement
+# is absorbed too. The slack is then only the room between that last read and um-run's 'submitted' line (a fixed few small share operations: the
+# metadata re-publish and the job's rename, whatever the files' sizes) plus the poll above. It is no longer a tolerance for a late drop, and the measured
+# witness (Test-DvNotAfterCoversDrop, DVE_NOT_AFTER_DROP_LATE) must never fire on the uncapped path.
 $script:DvNotAfterSlackSec = 60
 
 function Get-DvJobNotAfter {
@@ -2332,12 +2338,25 @@ function Get-DvJobNotAfter {
         of a killed leg's job (Get-VenueRemoteJobState) is PRESENCE only, and an expired job publishes a result, so it needs no later bound.
       - a caller that kills its um-run at now + -CallerCapSec (Invoke-VenueStageNightly's remaining -MaxTotalSec): nobody waits past the cap, so the bound
         is the cap when that is lower. Source 'caller-cap'. A wait over the cap is a caller bug (it would be cut short): DVE_NOT_AFTER_WAIT_OVER_CAP.
+      - a caller that kills its um-run at an ABSOLUTE instant passes it as -CallerDeadlineUtc (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1; the stage
+        driver's $script:Deadline). The bound is then that instant when it is lower than now + the uncapped bound, source 'caller-deadline', and
+        -CallerCapSec (the remaining seconds the caller sized its waits from) only feeds the over-cap check. Counting a sampled remaining budget again from
+        a later now would move the bound past the deadline by however long the caller was delayed between the sample and this call; the deadline itself
+        can only be approached, never passed. A deadline that is not later than now is refused: DVE_NOT_AFTER_DEADLINE_PASSED.
       - -LaterHarvest: a LATER call reads the result by name, wants the job RUN, and cannot re-submit its single-use JobId (the stage driver's DLL pair and
         smoke runner). That reader comes at a time this call cannot bound, so the later bound is none: notAfterUtc '' and nothing is passed. Source
         'later-harvest'.
     -MaxAdmissionWaitSec defaults to um-run.ps1's own default; the result echoes the one used so the caller passes the same value by name.
+    WHERE THE BOUND COUNTS FROM (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): anchorUtc, the instant this call ran. um-run starts its waits only once the
+    job file is on the share, after this call. r2 (hub ruling): the bound is therefore passed DROP-RELATIVE wherever it is not an absolute kill instant:
+    budgetSec (boundSec for 'um-run-waits'; the uncapped bound for 'caller-deadline') goes to um-run.ps1 -NotAfterBudgetSec and capUtc (the
+    -CallerDeadlineUtc instant, or '') to -NotAfterCapUtc, and the drop writes min(its own now + budgetSec, capUtc). notAfterUtc stays this call's estimate
+    of that value (the drop at the anchor). 'caller-cap' counts from the caller's own start, so it stays absolute (budgetSec null: pass -NotAfterUtc). For
+    'um-run-waits' dropToleranceSec (the slack) is how much later than the drop's own clock read the job may become visible with every um-run wait still
+    inside the bound; a caller that kills um-run at the bound ('caller-cap', 'caller-deadline') waits no longer than it whenever the job appears: null.
     .OUTPUTS
-    [pscustomobject]@{ notAfterUtc ('o' UTC text ending in Z, or ''); source; boundSec; waitSec; longestWaitSec; maxAdmissionWaitSec; why }
+    [pscustomobject]@{ notAfterUtc ('o' UTC text ending in Z, or ''); source; boundSec; waitSec; longestWaitSec; maxAdmissionWaitSec; anchorUtc ('o');
+    dropToleranceSec (or null); budgetSec (or null); capUtc ('o' or ''); why }
     #>
     param(
         [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
@@ -2345,6 +2364,7 @@ function Get-DvJobNotAfter {
         [ValidateRange(0, 86400)][int]$MaxAdmissionWaitSec = $script:DvUmRunMaxAdmissionWaitSec,
         [Parameter(Mandatory)][ValidateRange(0, 86400)][int]$MaxClaimedWaitSec,
         [ValidateRange(0, 86400)][int]$CallerCapSec = 0,
+        $CallerDeadlineUtc = $null,
         [switch]$LaterHarvest,
         $NowUtc = $null
     )
@@ -2354,15 +2374,124 @@ function Get-DvJobNotAfter {
     if ($CallerCapSec -gt 0 -and $longest -gt $CallerCapSec) {
         throw "DVE_NOT_AFTER_WAIT_OVER_CAP a $longest s um-run wait is longer than the caller's $CallerCapSec s cap: the caller would kill um-run first"
     }
-    $result = { param($text, $source, $bound, $why) [pscustomobject]@{ notAfterUtc = $text; source = $source; boundSec = $bound; waitSec = $waitSec; longestWaitSec = $longest; maxAdmissionWaitSec = $MaxAdmissionWaitSec; why = $why } }
-    if ($LaterHarvest) { return (& $result '' 'later-harvest' $null 'a later call harvests this result by name and cannot re-submit its single-use JobId: no notAfter') }
-    # (-NowUtc is a test seam: a [DateTime] of any Kind; Local is converted, Unspecified is taken as UTC)
-    $now = $(if ($null -eq $NowUtc) { [DateTime]::UtcNow } elseif (([datetime]$NowUtc).Kind -eq [DateTimeKind]::Local) { ([datetime]$NowUtc).ToUniversalTime() } else { [DateTime]::SpecifyKind([datetime]$NowUtc, [DateTimeKind]::Utc) })
+    # (-NowUtc is a test seam, -CallerDeadlineUtc a caller's instant: a [DateTime] of any Kind; Local is converted, Unspecified is taken as UTC)
+    $toUtc = { param($v) $(if (([datetime]$v).Kind -eq [DateTimeKind]::Local) { ([datetime]$v).ToUniversalTime() } else { [DateTime]::SpecifyKind([datetime]$v, [DateTimeKind]::Utc) }) }
+    $now = $(if ($null -eq $NowUtc) { [DateTime]::UtcNow } else { & $toUtc $NowUtc })
+    $result = { param($text, $source, $bound, $tolerance, $budget, $cap, $why) [pscustomobject]@{ notAfterUtc = $text; source = $source; boundSec = $bound; waitSec = $waitSec; longestWaitSec = $longest; maxAdmissionWaitSec = $MaxAdmissionWaitSec; anchorUtc = $now.ToString('o'); dropToleranceSec = $tolerance; budgetSec = $budget; capUtc = $cap; why = $why } }
+    if ($LaterHarvest) { return (& $result '' 'later-harvest' $null $null $null '' 'a later call harvests this result by name and cannot re-submit its single-use JobId: no notAfter') }
     $uncapped = $waitSec + $script:DvNotAfterSlackSec
-    if ($CallerCapSec -gt 0 -and $CallerCapSec -lt $uncapped) {
-        return (& $result $now.AddSeconds($CallerCapSec).ToString('o') 'caller-cap' $CallerCapSec "the caller kills um-run $CallerCapSec s after submit")
+    $capText = ''
+    if ($null -ne $CallerDeadlineUtc) {
+        $deadline = & $toUtc $CallerDeadlineUtc
+        if ($deadline -le $now) { throw "DVE_NOT_AFTER_DEADLINE_PASSED the caller's deadline $($deadline.ToString('o')) is not later than now ($($now.ToString('o'))): nothing can be submitted before it" }
+        $capText = $deadline.ToString('o')
+        if ($deadline -lt $now.AddSeconds($uncapped)) {
+            return (& $result $capText 'caller-deadline' ([Math]::Round(($deadline - $now).TotalSeconds, 3)) $null $uncapped $capText "the caller kills um-run at its deadline $capText; the drop writes min(its own now + $uncapped s, that deadline)")
+        }
+    } elseif ($CallerCapSec -gt 0 -and $CallerCapSec -lt $uncapped) {
+        return (& $result $now.AddSeconds($CallerCapSec).ToString('o') 'caller-cap' $CallerCapSec $null $null '' "the caller kills um-run $CallerCapSec s after submit")
     }
-    & $result $now.AddSeconds($uncapped).ToString('o') 'um-run-waits' $uncapped "um-run waits at most $waitSec s (queue $MaxQueueWaitSec + admission $MaxAdmissionWaitSec + timeout $TimeoutSec + claimed $MaxClaimedWaitSec) + $($script:DvNotAfterSlackSec) s slack"
+    & $result $now.AddSeconds($uncapped).ToString('o') 'um-run-waits' $uncapped $script:DvNotAfterSlackSec $uncapped $capText "um-run waits at most $waitSec s (queue $MaxQueueWaitSec + admission $MaxAdmissionWaitSec + timeout $TimeoutSec + claimed $MaxClaimedWaitSec) from its drop + $($script:DvNotAfterSlackSec) s slack; the drop counts the $uncapped s from its own clock$(if ($capText) { ", capped at $capText" })"
+}
+
+function Get-DvUmRunDropVisibleUtc {
+    <#
+    .SYNOPSIS
+    Pure. When a job became visible on the share, read from um-run.ps1's own output (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): um-run prints
+    UmRunDrop.psm1's 'submitted <id> -> <path>' line (Write-Host, the information stream) only after Invoke-UmRunDrop has returned, i.e. after the job file
+    is in place, and before it starts its own waits. So the first such information record for -JobId is never earlier than the drop, and judging the bound
+    against its time is conservative. A plain output string, another id's line and a missing line are not this job's drop: $null (unmeasured).
+    .OUTPUTS
+    [DateTime] (Kind Utc) or $null
+    #>
+    param([object[]]$Records = @(), [Parameter(Mandatory)][string]$JobId)
+    $pattern = '^submitted ' + [regex]::Escape($JobId) + ' -> '
+    foreach ($r in @($Records)) {
+        if ($r -isnot [System.Management.Automation.InformationRecord]) { continue }
+        if ([string]$r.MessageData -cmatch $pattern) { return $r.TimeGenerated.ToUniversalTime() }
+    }
+    $null
+}
+
+function Get-DvUmRunDropNotAfter {
+    <#
+    .SYNOPSIS
+    Pure. The notAfterUtc the drop actually wrote into the claim, read from um-run.ps1's own output (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r2): for
+    the drop-relative form (-NotAfterBudgetSec) UmRunDrop.psm1 returns 'job not-after: <id>.meta.json notAfterUtc=<o> sampledUtc=<o> budgetSec=<n>
+    capUtc=<o|none>' and um-run echoes it on the information stream, like the 'submitted' line. The first such record for -JobId; sampledUtc, budgetSec
+    and capUtc are $null / '' when the line does not carry them (the absolute form prints notAfterUtc only). Anything else: $null (unreported).
+    .OUTPUTS
+    [pscustomobject]@{ notAfterUtc ([DateTime] Utc); sampledUtc ([DateTime] Utc or $null); budgetSec ([int] or $null); capUtc ('o', '' for none) } or $null
+    #>
+    param([object[]]$Records = @(), [Parameter(Mandatory)][string]$JobId)
+    $pattern = '^job not-after: ' + [regex]::Escape($JobId) + '\.meta\.json notAfterUtc=(\S+)(?: sampledUtc=(\S+) budgetSec=(\d+) capUtc=(\S+))?$'
+    $parse = { param($t) [DateTime]::Parse([string]$t, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
+    foreach ($r in @($Records)) {
+        if ($r -isnot [System.Management.Automation.InformationRecord]) { continue }
+        $m = [regex]::Match([string]$r.MessageData, $pattern)
+        if (-not $m.Success) { continue }
+        return [pscustomobject]@{
+            notAfterUtc = (& $parse $m.Groups[1].Value)
+            sampledUtc = $(if ($m.Groups[2].Success) { & $parse $m.Groups[2].Value } else { $null })
+            budgetSec = $(if ($m.Groups[3].Success) { [int]$m.Groups[3].Value } else { $null })
+            capUtc = $(if ($m.Groups[4].Success -and $m.Groups[4].Value -cne 'none') { (& $parse $m.Groups[4].Value).ToString('o') } else { '' })
+        }
+    }
+    $null
+}
+
+function Test-DvNotAfterCoversDrop {
+    <#
+    .SYNOPSIS
+    Pure. Judges a Get-DvJobNotAfter bound against the instant the job actually became visible (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1). A post-hoc
+    WITNESS: since r2 the bound is set a priori at the drop (-NotAfterBudgetSec), so on the uncapped path covered must be true, and
+    DVE_NOT_AFTER_DROP_LATE there is a DEFECT signal (the drop read its clock more than the slack before its 'submitted' line, or did not count the budget
+    from the drop), never an expected outcome of a slow drop. The value judged is the one the agent got: for the drop-relative form (budgetSec set) the
+    drop's own reported notAfterUtc (-DropNotAfter, from Get-DvUmRunDropNotAfter), else the bound's notAfterUtc. For an uncapped bound ('um-run-waits')
+    covered is exactly notAfterUtc >= drop + every um-run wait (waitSec), the waits um-run counts from its drop; marginSec is notAfterUtc - (drop +
+    waitSec): negative is how much earlier than um-run's last wait the agent stops taking the job, positive is how long past it the agent may still take it
+    (at most the slack). An unmeasured drop, or a drop-relative value the drop did not report, is covered = $null: unknown, never covered. A drop-relative
+    value equal to its cap, and a bound the caller kills um-run at ('caller-cap', 'caller-deadline'), are covered whatever the drop time: nobody waits past
+    them. A later harvest passes no bound: nothing to cover. A bound that is not covered says DVE_NOT_AFTER_DROP_LATE in why.
+    .OUTPUTS
+    [pscustomobject]@{ jobId; notAfterUtc (the value judged, '' if unreported); form ('drop-relative', 'absolute', 'none'); budgetSec; capUtc; source;
+    anchorUtc; waitSec; dropToleranceSec; dropSampledUtc ('o' or ''); dropVisibleUtc ('o' or ''); dropDelaySec; marginSec; covered; why }
+    #>
+    param([Parameter(Mandatory)]$NotAfter, $DropVisibleUtc = $null, $DropNotAfter = $null, [string]$JobId = '')
+    $parse = { param($t) [DateTime]::Parse([string]$t, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
+    $anchor = & $parse $NotAfter.anchorUtc
+    $drop = $(if ($null -eq $DropVisibleUtc) { $null } elseif (([datetime]$DropVisibleUtc).Kind -eq [DateTimeKind]::Local) { ([datetime]$DropVisibleUtc).ToUniversalTime() } else { [DateTime]::SpecifyKind([datetime]$DropVisibleUtc, [DateTimeKind]::Utc) })
+    $delay = $(if ($null -eq $drop) { $null } else { [Math]::Round(($drop - $anchor).TotalSeconds, 3) })
+    $margin = $null
+    $relative = $null -ne $NotAfter.budgetSec
+    $form = $(if ($NotAfter.source -ceq 'later-harvest') { 'none' } elseif ($relative) { 'drop-relative' } else { 'absolute' })
+    $judged = $(if (-not $relative) { if ($NotAfter.notAfterUtc) { & $parse $NotAfter.notAfterUtc } else { $null } }
+        elseif ($null -ne $DropNotAfter) { [DateTime]::SpecifyKind([datetime]$DropNotAfter.notAfterUtc, [DateTimeKind]::Utc) } else { $null })
+    $sampled = $(if ($relative -and $null -ne $DropNotAfter -and $null -ne $DropNotAfter.sampledUtc) { [DateTime]::SpecifyKind([datetime]$DropNotAfter.sampledUtc, [DateTimeKind]::Utc).ToString('o') } else { '' })
+    $capped = $relative -and $null -ne $judged -and [string]$NotAfter.capUtc -and $judged -eq (& $parse $NotAfter.capUtc)
+    if ($NotAfter.source -ceq 'later-harvest') {
+        $covered = $true; $why = 'no notAfterUtc was passed: the agent has nothing to refuse the job on'
+    } elseif ($NotAfter.source -cin @('caller-cap', 'caller-deadline')) {
+        $covered = $true; $why = 'the caller kills um-run at notAfterUtc: nobody waits past it, whenever the job became visible (a late drop shortens the waits, never the bound)'
+    } elseif ($null -eq $judged) {
+        $covered = $null; $why = "the drop reported no notAfterUtc for $JobId (no 'job not-after:' line from um-run): the bound is not proven to cover um-run's waits"
+    } elseif ($capped) {
+        $covered = $true; $why = "the drop capped notAfterUtc at the caller's deadline $($NotAfter.capUtc): the caller kills um-run there, so nobody waits past it"
+    } elseif ($null -eq $drop) {
+        $covered = $null; $why = "the drop is unmeasured (um-run reported no drop line for $JobId): the bound is not proven to cover um-run's waits"
+    } else {
+        $margin = [Math]::Round(($judged - $drop.AddSeconds([double]$NotAfter.waitSec)).TotalSeconds, 3)
+        $covered = $margin -ge 0
+        $why = $(if ($relative -and $covered) { "the drop counted notAfterUtc from its own clock$(if ($sampled) { " ($sampled)" }), the job visible $delay s after the bound's anchor: every um-run wait ends before notAfterUtc" }
+            elseif ($relative) { "DVE_NOT_AFTER_DROP_LATE (defect: the drop's last clock read$(if ($sampled) { " ($sampled)" }) was more than the slack before the job was visible, or the drop did not count from it) the drop reported notAfterUtc $($judged.ToString('o')), $(-$margin) s short of the job's visibility ($delay s after the anchor) + every um-run wait" }
+            elseif ($covered) { "the job was visible $delay s after the bound's anchor, inside its $($NotAfter.dropToleranceSec) s tolerance: every um-run wait ends before notAfterUtc" }
+            else { "DVE_NOT_AFTER_DROP_LATE the job was visible $delay s after the bound's anchor, past its $($NotAfter.dropToleranceSec) s tolerance: the agent stops taking it $(-$margin) s before um-run's last wait ends" })
+    }
+    [pscustomobject]@{
+        jobId = $JobId; notAfterUtc = $(if ($null -eq $judged) { '' } else { $judged.ToString('o') }); form = $form; budgetSec = $NotAfter.budgetSec; capUtc = [string]$NotAfter.capUtc
+        source = $NotAfter.source; anchorUtc = $NotAfter.anchorUtc; waitSec = $NotAfter.waitSec; dropToleranceSec = $NotAfter.dropToleranceSec; dropSampledUtc = $sampled
+        dropVisibleUtc = $(if ($null -eq $drop) { '' } else { $drop.ToString('o') }); dropDelaySec = $delay; marginSec = $margin; covered = $covered; why = $why
+    }
 }
 
 # --- health (P5) ----------------------------------------------------------------------------------
@@ -2671,6 +2800,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

@@ -28,8 +28,9 @@
 #   5. P6: the declared -Venue must agree with Get-AttrCudaMeasurementVenue on the host the probe ran
 #      on, and the host must be the venue table's expectedHost -> VENUE_HOST_MISMATCH;
 #   6. the staged build and smoke-runner closure must be the ones named (never a different build)
-#      -> DEVICE_UNAVAILABLE; submit THROUGH um-run.ps1 (NA-7), with -NotAfterUtc at the end of this call's own wait
-#      (Get-DvJobNotAfter; the probe's submit too). (No registry snapshot is taken any more: master
+#      -> DEVICE_UNAVAILABLE; submit THROUGH um-run.ps1 (NA-7), with -NotAfterBudgetSec, this call's own wait counted
+#      by the drop from the drop (Get-DvJobNotAfter; the probe's submit too), judged against the drop um-run reports and printed
+#      as DVE_NOT_AFTER (DVE_NOT_AFTER_DROP_LATE, a defect signal, if the drop's value did not cover it). (No registry snapshot is taken any more: master
 #      isolates an automation run's settings store; the receipt proves it from the run log.)
 #   7. read summary.json / evidence-manifest.json / artifact-index.json plus the launcher's result.json and the app's
 #      run log, copy metrics VERBATIM, RE-DERIVE the receipt oracle's verdict from the run log (source_advanced /
@@ -305,16 +306,52 @@ function Submit-VenueJob([string]$ScriptPath, [string]$JobId, [int]$TimeoutSec, 
     # RETRACTED, or UNRESOLVED -- a thrown UNRESOLVED/RETRACTED is data here, never an error.
     # LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1: the job's notAfterUtc is the end of this call's own wait (DualVenueRunner.psm1: no later reader needs the job
     # run), and the admission wait it assumes (um-run's default) is passed by name.
-    try {
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: um-run starts its waits only once the job file is on the share, after the bound was computed here. Its
+    # information stream (its host lines; collected here, still never shown) carries the 'submitted <id>' line it prints after the drop, so each submit also
+    # returns the bound judged against that measured drop (notAfter; the caller prints it as DVE_NOT_AFTER). Records are collected as they arrive, so a
+    # um-run that throws (UNRESOLVED / RETRACTED) after its drop still leaves the drop measured.
+    # r2 (hub ruling on sol's r1 blocker): the bound is passed DROP-RELATIVE, -NotAfterBudgetSec (the waits plus the slack, Get-DvJobNotAfter's budgetSec):
+    # UmRunDrop.psm1 counts it from its own clock just before the claim, so however late the drop lands, notAfterUtc >= drop + every um-run wait a priori.
+    # The drop's own value comes back on um-run's 'job not-after:' line and is what the witness judges. Only those two information records are kept (um-run
+    # also logs a line per poll for hours of admission wait).
+    $records = [Collections.Generic.List[object]]::new()
+    $notAfter = $null
+    $submitted = try {
         $notAfter = Get-DvJobNotAfter -TimeoutSec $TimeoutSec -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec
-        $out = @(& $UmRunScript -ScriptPath $ScriptPath -JobId $JobId -AgentShare $agentShare -TimeoutSec $TimeoutSec `
-            -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec -MaxAdmissionWaitSec $notAfter.maxAdmissionWaitSec -NotAfterUtc $notAfter.notAfterUtc 6>$null)
+        & $UmRunScript -ScriptPath $ScriptPath -JobId $JobId -AgentShare $agentShare -TimeoutSec $TimeoutSec `
+            -MaxQueueWaitSec $QueueSec -MaxClaimedWaitSec $ClaimedExtraSec -MaxAdmissionWaitSec $notAfter.maxAdmissionWaitSec -NotAfterBudgetSec $notAfter.budgetSec 6>&1 |
+            ForEach-Object { if ($_ -isnot [System.Management.Automation.InformationRecord] -or [string]$_.MessageData -cmatch '^(submitted |job not-after: )') { $records.Add($_) } }
+        $out = @($records | Where-Object { $_ -isnot [System.Management.Automation.InformationRecord] })
         $r = if ($out.Count -gt 0) { $out[-1] } else { $null }
-        [pscustomobject]@{ umOutcome = 'RECEIPT'; result = $r; message = $null }
+        [pscustomobject]@{ umOutcome = 'RECEIPT'; result = $r; message = $null; notAfter = $null }
     } catch {
         $m = [string]$_.Exception.Message
         $kind = if ($m -match '^RETRACTED:') { 'RETRACTED' } elseif ($m -match '^UNRESOLVED:') { 'UNRESOLVED' } else { 'ERROR' }
-        [pscustomobject]@{ umOutcome = $kind; result = $null; message = $m }
+        [pscustomobject]@{ umOutcome = $kind; result = $null; message = $m; notAfter = $null }
+    }
+    if ($null -ne $notAfter) {
+        # The witness never decides the leg's outcome: a judge that throws is recorded as unknown (covered null) with its error, never as a leg ERROR.
+        $submitted.notAfter = try {
+            $recs = $records.ToArray()
+            Test-DvNotAfterCoversDrop -NotAfter $notAfter -DropVisibleUtc (Get-DvUmRunDropVisibleUtc -Records $recs -JobId $JobId) `
+                -DropNotAfter (Get-DvUmRunDropNotAfter -Records $recs -JobId $JobId) -JobId $JobId
+        } catch {
+            [pscustomobject]@{ jobId = $JobId; covered = $null; why = "DVE_NOT_AFTER_JUDGE_ERROR $([string]$_.Exception.Message)" }
+        }
+    }
+    $submitted
+}
+
+function Write-NotAfterVerdict($Submitted) {
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: one DVE_NOT_AFTER=<json> line per submit (the drop's own notAfterUtc, the bound's anchor, the measured
+    # drop, covered true / false / null = unmeasured). r2: the bound is drop-relative, so covered is true by construction; DVE_NOT_AFTER_DROP_LATE is
+    # now a DEFECT signal (the drop did not count the budget from itself, or read its clock more than the slack before the job was visible): the agent may
+    # then refuse the job (notAfterExpired) while this client still waits, and that is named here, before the outcome, never left for a reader to guess.
+    $v = $Submitted.notAfter
+    if ($null -eq $v) { return }
+    Write-Output ('DVE_NOT_AFTER=' + ($v | ConvertTo-Json -Compress))
+    if ($v.covered -eq $false) {
+        Write-Output "DVE_NOT_AFTER_DROP_LATE job=$($v.jobId) dropDelaySec=$($v.dropDelaySec) toleranceSec=$($v.dropToleranceSec) shortBySec=$(-$v.marginSec) notAfterUtc=$($v.notAfterUtc)"
     }
 }
 
@@ -456,10 +493,11 @@ try {
     $probeJob = Join-Path $workDirResolved "$jobStem-health.job.ps1"
     [IO.File]::WriteAllText($probeJob, (New-DvHealthProbeJobText -AgentRoot $agentRoot), [Text.UTF8Encoding]::new($false))
     # VENUE-LEG-PRINT-DVE-JOB-ID-1: the id this call submits under goes to stdout BEFORE the submit, so a chain that kills this client mid-wait still holds the remote job's identity
-    # (Get-VenueRemoteJobIds in VenueChain.psm1 reads `DVE_JOB_ID=<id>` lines). um-run's own output stays suppressed (6>$null in Submit-VenueJob).
+    # (Get-VenueRemoteJobIds in VenueChain.psm1 reads `DVE_JOB_ID=<id>` lines). um-run's own output stays suppressed (Submit-VenueJob collects its information stream, never shows it).
     $probeJobId = "$jobStem-health"
     Write-Output "DVE_JOB_ID=$probeJobId"
     $probeRun = Submit-VenueJob -ScriptPath $probeJob -JobId $probeJobId -TimeoutSec 120 -QueueSec 120 -ClaimedExtraSec 60
+    Write-NotAfterVerdict $probeRun
     $receipt.evidence.umRunOutcome = $probeRun.umOutcome
     $probe = $null
     if ($probeRun.umOutcome -eq 'RECEIPT' -and $null -ne $probeRun.result) { $probe = ConvertFrom-DvProbeStdout ([string]$probeRun.result.stdout) }
@@ -516,6 +554,7 @@ try {
     $timeoutSec = [int]$generated.recommendedJobTimeoutSec + 120
     Write-Output "DVE_JOB_ID=$jobStem"   # VENUE-LEG-PRINT-DVE-JOB-ID-1: before the submit, same id (see the health probe above)
     $run = Submit-VenueJob -ScriptPath $jobFile -JobId $jobStem -TimeoutSec $timeoutSec -QueueSec ([int]$spec.timeouts.queueWaitSec) -ClaimedExtraSec ([int]$spec.timeouts.extraClaimedWaitSec)
+    Write-NotAfterVerdict $run
     $receipt.evidence.umRunOutcome = $run.umOutcome
 } catch {
     $message = [string]$_.Exception.Message
