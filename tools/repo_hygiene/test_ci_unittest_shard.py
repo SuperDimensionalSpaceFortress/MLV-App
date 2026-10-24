@@ -735,7 +735,7 @@ class TimingsTests(unittest.TestCase):
         )
 
     def test_a_pending_test_that_never_printed_a_result_keeps_its_interval(self) -> None:
-        # Dot R18 on #629: a docstring id line, then a plain "... ok" line with no result line
+        # fable on #629: a docstring id line, then a plain "... ok" line with no result line
         # for the first test (crash, interleaved output). The plain line closes the pending
         # test: head -> plain line is charged to the PENDING class, as for a result line, and
         # the plain test is not charged (its own time is not separable from the pending one's).
@@ -749,6 +749,42 @@ class TimingsTests(unittest.TestCase):
             timings.class_seconds(log),
             {"tools.repo_hygiene.test_x.A": 4.0, "tools.repo_hygiene.test_x.C": 1.0},
         )
+
+    def test_a_logged_line_shaped_like_an_id_head_is_not_a_pending_test(self) -> None:
+        # Dot R18 on #634: "Running (1.2)" matches DOC_HEAD's shape. It set pending to "1.2",
+        # so the next plain result was charged to that foreign id and dropped. Only a head
+        # whose id is under KEY_PREFIX, or whose displayed name is the id's last component,
+        # is a test; any other line is an ordinary logged line.
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a) ... ok\n"
+            "2026-10-04T00:00:03.0000000Z Running (1.2)\n"
+            "2026-10-04T00:00:06.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+        )
+        self.assertEqual(
+            timings.class_seconds(log),
+            {"tools.repo_hygiene.test_x.A": 1.0, "tools.repo_hygiene.test_x.B": 3.0},
+        )
+
+    def test_a_logged_id_shaped_line_does_not_replace_a_pending_docstring_test(self) -> None:
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z test_a (tools.repo_hygiene.test_x.A.test_a)\n"
+            "2026-10-04T00:00:03.0000000Z Running (1.2)\n"
+            "2026-10-04T00:00:06.0000000Z the docstring first line ... ok\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.A": 5.0})
+
+    def test_a_docstring_head_outside_the_key_prefix_is_still_pending(self) -> None:
+        # The displayed name equals the id's last component, so this is a real test whose
+        # class is merely not ours: its result line must still close it (and is dropped).
+        log = (
+            "2026-10-04T00:00:00.0000000Z started\n"
+            "2026-10-04T00:00:01.0000000Z unrelated (somewhere.else.Tests.unrelated)\n"
+            "2026-10-04T00:00:04.0000000Z the docstring first line ... ok\n"
+            "2026-10-04T00:00:05.0000000Z test_b (tools.repo_hygiene.test_x.B.test_b) ... ok\n"
+        )
+        self.assertEqual(timings.class_seconds(log), {"tools.repo_hygiene.test_x.B": 1.0})
 
     def test_average_is_over_the_jobs_that_ran_the_class(self) -> None:
         self.assertEqual(
