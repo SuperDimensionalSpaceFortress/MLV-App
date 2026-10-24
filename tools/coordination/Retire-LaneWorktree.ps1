@@ -476,7 +476,7 @@ function Get-ScriptCorpus {
             if ($FileCache.ContainsKey($full.ToLowerInvariant())) { $text = $FileCache[$full.ToLowerInvariant()] }
             else {
                 $fi = New-Object IO.FileInfo $full
-                $text = if ($fi.Exists -and $fi.Length -le $script:HolderMaxBytes) { [IO.File]::ReadAllText($full) } else { $null }
+                $text = if ($fi.Exists -and $fi.Length -le $script:HolderMaxBytes) { Read-SharedText -Path $full } else { $null }
                 $FileCache[$full.ToLowerInvariant()] = $text
             }
         } catch { continue }
@@ -638,10 +638,22 @@ function Get-PidsFromRecordText([string]$Text) {
 $script:PidBareRx = [regex]::new('^\s*(\d{1,7})\s*$', 'Compiled')
 $script:PidJsonRx = [regex]::new('"(?:pid|childPid|driverPid|runnerPid|ownerPid)"\s*:\s*"?(\d{1,7})\b', 'Compiled')
 
+function Read-SharedText {
+    # r3 (PR #654 key3 r2 B1): read a file another process may hold open for WRITING. [IO.File]::ReadAllText asks for FileShare.Read, so it
+    # fails on every log a live lane or detached driver keeps write-held (dispatch.out.txt, cmd /c ... > out.txt); this open shares
+    # ReadWrite|Delete, so such a file reads. A real exclusive lock (FileShare.None, or a writer that does not share Read) still throws.
+    param([string]$Path)
+    $fs = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+        $sr = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8, $true)
+        try { return $sr.ReadToEnd() } finally { $sr.Dispose() }
+    } finally { $fs.Dispose() }
+}
+
 function Read-RunDirRecordText {
     # The one read of a run-dir file (pid record or tie file). A seam: a test redefines it to throw an error class a real lock cannot produce.
     param([string]$Path)
-    return [IO.File]::ReadAllText($Path)
+    return Read-SharedText -Path $Path
 }
 
 function Get-RunDirReadFailure {

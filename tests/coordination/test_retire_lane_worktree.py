@@ -2754,3 +2754,77 @@ def test_gate_keeps_a_worktree_whose_live_driver_record_is_locked(repo):
     assert d["action"] == "kept" and d["reason"].startswith("cannot-determine: run-dir census failed"), d
     assert "venue-driver.pid" in d["reason"], d
     assert "REFUSED worktree-removal reason=rundir-census-failed" in err, err
+
+
+# --- r3 (PR #654 key3 r2 BLOCKER B1): a file that is only held open for WRITING is read, never refused ---
+# r2 read run-dir files with [IO.File]::ReadAllText, which asks for FileShare.Read and so cannot open a file another process holds open for
+# writing. Every live Invoke-Lane lane (dispatch.out.txt) and every Start-HiddenDetached driver (cmd /c ... > out.txt 2> err.txt) keeps its
+# logs write-held for its whole life, and their command lines name their run dirs, so r2 refused EVERY unrelated free worktree while anything
+# ran. The run-dir read now opens with FileShare.ReadWrite|Delete: a write-held file reads; a real FileShare.None lock still fails closed.
+# The write handle is held by the test's own pwsh on a temp file; the process table is faked (pids 99997x are not real).
+
+def _write_held(path):
+    p = str(path).replace("'", "''")
+    return f"$wh_{re.sub(r'[^A-Za-z0-9]', '_', path.name)} = [IO.File]::Open('{p}', [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::Read);"
+
+
+def _lane_cmdline(rd):
+    return f'"C:\\Users\\x\\.local\\bin\\claude.exe" -p --settings "{rd}\\opus-001.settings.json" --model opus'
+
+
+def _unrelated_live_run_dir(tmp_path, shape):
+    """A live lane or detached driver working on ANOTHER worktree (lane-Y-1), with its log write-held, as on the real board."""
+    other = tmp_path / "lane-Y-1"
+    runs = tmp_path / "fleet-runs"
+    if shape == "detached-driver":
+        rd = _driver_run_dir(runs, "lane-Y-1-r5-20261024T0110Z", 999971, workdir=other)
+        log, cl = rd / "driver.out.txt", _driver_cmdline(rd)
+    else:
+        rd = _driver_run_dir(runs, "lane-Y-1-r1-20261024T1100Z", 999971, workdir=other, pid_file="opus-001.child.json", child_json=True)
+        (rd / "opus-001.settings.json").write_text('{"hooks": {}}', encoding="utf-8")
+        log, cl = rd / "dispatch.out.txt", _lane_cmdline(rd)
+    log.write_text("lane output so far\n", encoding="utf-8")
+    return runs, rd, log, _fake_proc(999971, cl)
+
+
+@pytest.mark.parametrize("shape", ["detached-driver", "invoke-lane"])
+def test_live_refusal_write_held_log_in_an_unrelated_live_run_dir_is_free_for_another_worktree(tmp_path, shape):
+    """(a) B1: an unrelated live run dir whose log is held open for writing leaves a different free worktree FREE."""
+    wt = tmp_path / "lane-X-1"
+    wt.mkdir()
+    runs, rd, log, proc = _unrelated_live_run_dir(tmp_path, shape)
+    r, err = _live_refusal(wt, _fake_snapshot(proc), runs, prelude=_write_held(log))
+    assert r is None, f"a write-held log in an unrelated live run dir refused a free worktree: {r}"
+    assert "REFUSED" not in err, err
+
+
+def test_gate_retires_a_free_worktree_while_an_unrelated_live_run_dir_holds_its_log_open(repo):
+    """(a) B1 through Invoke-RetireLaneWorktree: would-retire, not cannot-determine."""
+    tmp, main = repo
+    wt = _add_wt(main, tmp / "lane-FREE-1")
+    runs, rd, log, proc = _unrelated_live_run_dir(tmp, "detached-driver")
+    d, err = _gate_err(wt, _fake_snapshot(proc), runs, prelude=_write_held(log))
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d
+    assert "REFUSED" not in err, err
+
+
+def test_live_refusal_tied_record_under_a_real_lock_is_census_failed_beside_a_write_held_log(tmp_path):
+    """(b) sol r1's case still holds after the share change: a tied record under FileShare.None is unknown, never FREE."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    log = rd / "driver.out.txt"
+    log.write_text("driver output\n", encoding="utf-8")
+    rec = rd / "opus-001.receipt.json"
+    r, err = _live_refusal(wt, snap, runs, prelude=_write_held(log) + _locked(rec))
+    assert r is not None and r["reason"] == "rundir-census-failed", r
+    assert "opus-001.receipt.json" in r["detail"] and "IOException" in r["detail"] and "driver.out.txt" not in r["detail"], r
+    assert "reason=rundir-census-failed" in err, err
+
+
+@pytest.mark.parametrize("leaf", ["opus-001.receipt.json", "venue-driver.pid"])
+def test_live_refusal_write_held_tied_record_is_still_read_and_refuses_as_live_driver(tmp_path, leaf):
+    """(c) a write-held record that ties the run dir to the worktree is READ: the holder is seen as live-driver, not census-failed."""
+    wt, runs, rd, snap = _blocker_fixture(tmp_path)
+    r, err = _live_refusal(wt, snap, runs, prelude=_write_held(rd / leaf))
+    assert r is not None and r["reason"] == "live-driver" and r["processId"] == 999982, r
+    assert r["matchedPath"].lower() == str(rd).lower(), r
+    assert "reason=live-driver" in err, err
