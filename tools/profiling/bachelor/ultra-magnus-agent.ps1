@@ -5,6 +5,7 @@
 # Protocol (all under <agent root>, which is this script's folder):
 #   inbox\<jobId>.job.ps1        - VM drops a PowerShell script here (atomic rename)
 #   inbox\<jobId>.meta.json      - VM submit metadata written before the job is visible
+#                                  not-after r1: optional notAfterUtc (ISO-8601 UTC string); past it the job is never leased or run
 #   running\<jobId>.started.json - agent-owned durable claim marker: phase=admission-wait (held in the
 #                                  heavy-slot gate, childPid null, NOT launched), then phase=launching
 #                                  (about to create the child, childPid null, NOT launched yet), then
@@ -649,6 +650,36 @@ function Get-QueueAgeSeconds {
     return [Math]::Max(0, [int]((Get-Date).ToUniversalTime() - $submitUtc).TotalSeconds)
 }
 
+function Get-JobNotAfterVerdict {
+    # Pure. not-after r1 (LEASE-REQUEST-CHILD-NOT-AFTER-1): the job's absolute deadline, meta.json notAfterUtc, as
+    # @{ state = none | open | passed | unparseable; notAfterUtc ('o' string or $null); remainingSec (double or $null); why }.
+    # Missing or blank = none: today's behaviour. A [DateTime] is read as Get-QueueAgeSeconds reads submitUtc (ConvertFrom-Json
+    # turns an ISO string into one); a string with no offset is read as UTC, the same as an Unspecified [DateTime]. A value that
+    # does not parse FAILS CLOSED (callers treat it as passed): a submitter that wrote a bound wanted one.
+    param([Parameter(Mandatory = $true)]$Metadata, [DateTime]$NowUtc = [DateTime]::MinValue)
+    $now = if ($NowUtc -eq [DateTime]::MinValue) { [DateTime]::UtcNow } elseif ($NowUtc.Kind -eq [DateTimeKind]::Local) { $NowUtc.ToUniversalTime() } else { [DateTime]::SpecifyKind($NowUtc, [DateTimeKind]::Utc) }
+    $raw = $Metadata.notAfterUtc
+    if ($null -eq $raw -or ($raw -is [string] -and [string]::IsNullOrWhiteSpace($raw))) {
+        return [pscustomobject]@{ state = "none"; notAfterUtc = $null; remainingSec = $null; why = "no notAfterUtc" }
+    }
+    $at = $null
+    if ($raw -is [DateTimeOffset]) { $at = $raw.UtcDateTime }
+    elseif ($raw -is [DateTime]) {
+        if ($raw.Kind -eq [DateTimeKind]::Local) { $at = $raw.ToUniversalTime() } else { $at = [DateTime]::SpecifyKind($raw, [DateTimeKind]::Utc) }
+    }
+    elseif ($raw -is [string]) {
+        $dto = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse($raw, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dto)) { $at = $dto.UtcDateTime }
+    }
+    if ($null -eq $at) {
+        return [pscustomobject]@{ state = "unparseable"; notAfterUtc = $null; remainingSec = $null; why = "notAfterUtc '$(([string]$raw) -replace '[^\x20-\x7E]', '?')' does not parse; fail closed (treated as passed)" }
+    }
+    $text = $at.ToString("o")
+    $left = ($at - $now).TotalSeconds
+    if ($left -gt 0) { return [pscustomobject]@{ state = "open"; notAfterUtc = $text; remainingSec = $left; why = "notAfterUtc $text is $([Math]::Round($left, 1)) s away" } }
+    return [pscustomobject]@{ state = "passed"; notAfterUtc = $text; remainingSec = $left; why = "notAfterUtc $text passed $([Math]::Round(-$left, 1)) s ago" }
+}
+
 function Publish-JobResult {
     param(
         [Parameter(Mandatory = $true)][string]$JobId,
@@ -979,6 +1010,52 @@ function Invoke-QueueExpiredJob {
     $resultPath = Publish-JobResult -JobId $jobId -Result $result
     Move-JobArtifacts -JobId $jobId -JobPath $Job.FullName -DestinationDirectory $processed
     Add-AgentLogLine "queue expired job=$jobId age=${QueueAgeSec}s max=$($Metadata.maxQueueAgeSec) result=$resultPath"
+}
+
+function Publish-NotAfterExpiredResult {
+    # not-after r1: a job whose notAfterUtc passed (or cannot be read, or left too little time for a lease request) before launch.
+    # Invoke-QueueExpiredJob's shape, so every VM consumer that reads queueExpired=true as expired-not-executed reads this one the
+    # same way; notAfterExpired / notAfterUtc / notAfterState say why. No admission = it was refused before the gate (pre-gate).
+    param(
+        [Parameter(Mandatory = $true)]$Job,
+        [Parameter(Mandatory = $true)]$Metadata,
+        $Admission = $null,
+        [int]$QueueAgeSec = 0,
+        [Parameter(Mandatory = $true)]$Verdict
+    )
+
+    $jobId = $Job.BaseName -replace '\.job$', ''
+    $phase = if ($null -ne $Admission -and $Admission.phase) { [string]$Admission.phase } else { "pre-gate" }
+    $what = switch ([string]$Verdict.state) {
+        "passed" { "notAfterUtc $($Verdict.notAfterUtc) passed" }
+        "unparseable" { "notAfterUtc could not be read (fail closed)" }
+        default { "notAfterUtc $($Verdict.notAfterUtc) left too little time for a lease request" }
+    }
+    $result = [pscustomobject]@{
+        jobId            = $jobId
+        exitCode         = 125
+        startedUtc       = $null
+        endedUtc         = (Get-Date).ToUniversalTime().ToString("o")
+        host             = $env:COMPUTERNAME
+        timeoutSec       = [int]$Metadata.timeoutSec
+        timedOut         = $false
+        cancelled        = $false
+        queueExpired     = $true
+        queueAgeSec      = $QueueAgeSec
+        maxQueueAgeSec   = [int]$Metadata.maxQueueAgeSec
+        notAfterExpired  = $true
+        notAfterUtc      = $Verdict.notAfterUtc
+        notAfterState    = [string]$Verdict.state
+        orphaned         = $false
+        adopted          = $false
+        killedProcessIds = @()
+        admission        = $Admission
+        stdout           = ""
+        stderr           = "$what before launch ($phase); job was not executed"
+    }
+    $resultPath = Publish-JobResult -JobId $jobId -Result $result
+    Move-JobArtifacts -JobId $jobId -JobPath $Job.FullName -DestinationDirectory $processed
+    Add-AgentLogLine "not-after expired job=$jobId notAfterUtc=$($Verdict.notAfterUtc) phase=$phase result=$resultPath"
 }
 
 function Invoke-OrphanResult {
@@ -1455,7 +1532,7 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23)"
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + not-after r1 (2026-10-24)"
 $script:QuietLeaseLabel = "quiet-lease mlv"
 $script:QuietLease = $null
 $script:QuietLeaseWaiting = $null
@@ -1463,6 +1540,8 @@ $script:LastHeavySlotModeKey = $null
 $script:GateLoopSleepMs = 1000
 # The abandon line fires this long past LeasePendingMaxSec, so heavy-slot.py's own --admit-timeout refusal comes first.
 $script:LeasePendingGraceSec = 15
+# not-after r1: a lease taken and released at once still starts heavy-slot.py's 30 min cooldown, so no request is made with less left.
+$script:LeaseNotAfterMinAdmitSec = 30
 $script:HeavySlotHolder = $null
 $script:Admission = $null
 $script:ExemptDuringWaitOf = $null
@@ -2121,6 +2200,9 @@ function Wait-HeavySlotAdmission {
 #      (admission-wait marker, gate-wait heartbeat) and asks again after LeaseRetrySec, exactly as a held job waited before.
 #      A request still pending 15 s past LeasePendingMaxSec is abandoned (released, stopped) with a typed line and asked
 #      again the same way. Cancel files and the queue-age ceiling still end the wait.
+#   6. NOT-AFTER (not-after r1, 2026-10-24). meta.json notAfterUtc is the job's absolute deadline. Past it (or unreadable) no
+#      request is made and a pending one is released; --admit-timeout is the seconds left when fewer than LeasePendingMaxSec
+#      (none under LeaseNotAfterMinAdmitSec); a lease that turns active after it, or after a cancel file, is released at once.
 # KNOWN LIMIT: a lease cannot drain a holder that outlives heavy-slot.py's 30-min pending cap. Such a request is refused
 # (exit 75) and re-asked every LeaseRetrySec, so the job waits behind that holder until the queue-age ceiling.
 # A job whose timeout is over LeaseMaxMinutes minutes is admitted with admission.leaseCoversTimeout=false and a typed line:
@@ -2154,6 +2236,30 @@ function Get-QuietLeaseMinutes {
     param([int]$TimeoutSec = 0)
     if ($TimeoutSec -le 0) { return $LeaseMaxMinutes }
     return [int][Math]::Max(1, [Math]::Min($LeaseMaxMinutes, [Math]::Ceiling($TimeoutSec / 60.0) + 1))
+}
+
+function Get-QuietLeaseAdmitTimeout {
+    # Pure. not-after r1: the --admit-timeout a request may ask for under a Get-JobNotAfterVerdict verdict, as @{ ok; sec;
+    # source = pending-max | not-after; why }. LeasePendingMaxSec, or the whole seconds left before notAfterUtc when fewer, so a
+    # request cannot turn active after the job's deadline. ok=$false (make no request) when less than LeaseNotAfterMinAdmitSec
+    # is left, or the verdict is passed or unparseable.
+    param([Parameter(Mandatory = $true)]$Verdict)
+    if ($Verdict.state -eq "none") { return [pscustomobject]@{ ok = $true; sec = $LeasePendingMaxSec; source = "pending-max"; why = "no notAfterUtc" } }
+    if ($Verdict.state -ne "open") { return [pscustomobject]@{ ok = $false; sec = 0; source = "not-after"; why = "notAfterUtc $($Verdict.state)" } }
+    $left = [Math]::Floor([double]$Verdict.remainingSec)
+    if ($left -lt $script:LeaseNotAfterMinAdmitSec) {
+        return [pscustomobject]@{ ok = $false; sec = [int][Math]::Max(0, $left); source = "not-after"; why = "only $left s left before notAfterUtc, under the $($script:LeaseNotAfterMinAdmitSec) s minimum request window" }
+    }
+    if ($left -lt $LeasePendingMaxSec) { return [pscustomobject]@{ ok = $true; sec = [int]$left; source = "not-after"; why = "$left s left before notAfterUtc" } }
+    return [pscustomobject]@{ ok = $true; sec = $LeasePendingMaxSec; source = "pending-max"; why = "notAfterUtc is beyond LeasePendingMaxSec" }
+}
+
+function New-LeaseReleaseRecord {
+    # Pure. not-after r1: a Stop-QuietLease result as the admission's leaseRelease { phase; releaseRc; rc; killed }, or $null when
+    # nothing was released.
+    param([Parameter(Mandatory = $true)][string]$Phase, $Release)
+    if ($null -eq $Release) { return $null }
+    return [pscustomobject]@{ phase = $Phase; releaseRc = $Release.releaseRc; rc = $Release.rc; killed = @($Release.killed) }
 }
 
 function ConvertFrom-QuietLeaseActiveLine {
@@ -2237,13 +2343,19 @@ function Start-QuietLeaseRequest {
     # Starts the long-lived `lease request` wrapper for this job in the background (see the quiet-lease block). Its stdout is
     # read a line at a time without blocking (Update-QuietLeaseRequest); its record goes down before anything else so a
     # successor agent can end it. Returns the lease (ok=$true), or ok=$false with why when it cannot start.
-    param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][int]$Minutes)
+    # not-after r1: AdmitTimeoutSec is Get-QuietLeaseAdmitTimeout's bound (LeasePendingMaxSec when the job has no notAfterUtc).
+    param(
+        [Parameter(Mandatory = $true)][string]$JobId,
+        [Parameter(Mandatory = $true)][int]$Minutes,
+        [int]$AdmitTimeoutSec = $LeasePendingMaxSec,
+        [string]$AdmitTimeoutSource = "pending-max"
+    )
     $py = Resolve-HeavySlotPython
     if (-not $py) { return [pscustomobject]@{ ok = $false; why = "python not found ($HeavySlotPython)" } }
     if (-not (Test-Path -LiteralPath $HeavySlotScript -PathType Leaf)) { return [pscustomobject]@{ ok = $false; why = "heavy-slot.py not found ($HeavySlotScript)" } }
     $id = "$JobId.$([guid]::NewGuid().ToString('N').Substring(0, 12))"
     $argv = @($HeavySlotScript, "lease", "request", "--label", $script:QuietLeaseLabel, "--minutes", "$Minutes",
-        "--admit-timeout", "$LeasePendingMaxSec", "--slots", "$HeavySlotCount")
+        "--admit-timeout", "$AdmitTimeoutSec", "--slots", "$HeavySlotCount")
     $p = $null
     try {
         $si = [System.Diagnostics.ProcessStartInfo]::new()
@@ -2269,13 +2381,14 @@ function Start-QuietLeaseRequest {
     $w = Write-JsonFileAtomic -Path $recordFile -InputObject $rec
     $lease = [pscustomobject]@{
         ok = $true; id = $id; jobId = $JobId; label = $script:QuietLeaseLabel; minutes = $Minutes; proc = $p; pid = $p.Id
+        admitTimeoutSec = $AdmitTimeoutSec; admitTimeoutSource = $AdmitTimeoutSource
         identity = (Get-ProcessIdentity -ProcessId $p.Id); recordFile = $recordFile; requested = (Get-Date)
         outLines = [System.Collections.Generic.List[string]]::new(); outTask = $p.StandardOutput.ReadLineAsync(); outEof = $false
         errTask = $p.StandardError.ReadToEndAsync(); active = $null; activeAt = $null; ownerCheck = $null
         renewCall = $null; lastRenewStart = $null; renewStarts = 0; renewsOk = 0; renewFailures = 0; renewSlow = 0; renewMaxGapSec = 0
         lostLogged = $false; why = $null
     }
-    Add-AgentLogLine "quiet-lease: request started job=$JobId pid=$($p.Id) label='$($script:QuietLeaseLabel)' minutes=$Minutes admitTimeout=${LeasePendingMaxSec}s record=$($w.ok)"
+    Add-AgentLogLine "quiet-lease: request started job=$JobId pid=$($p.Id) label='$($script:QuietLeaseLabel)' minutes=$Minutes admitTimeout=${AdmitTimeoutSec}s admitTimeoutSource=$AdmitTimeoutSource record=$($w.ok)"
     return $lease
 }
 
@@ -2462,8 +2575,9 @@ function Confirm-QuietLeaseHeldForLaunch {
 function Wait-QuietLeaseAdmission {
     # Lease mode's Wait-HeavySlotAdmission: blocks until this job holds an ACTIVE quiet lease and returns the admission
     # record (label clear, $script:QuietLease set until Exit-HeavySlot), or ends unadmitted (cancelled-in-gate |
-    # queue-expired) with no lease left behind. Refused, failed and abandoned requests are typed and asked again after
-    # LeaseRetrySec; the job is never admitted without an active lease. No wait cap (the queue-age ceiling ends it).
+    # queue-expired | expired-not-after) with no lease left behind. Refused, failed and abandoned requests are typed and asked
+    # again after LeaseRetrySec; the job is never admitted without an active lease. No wait cap (the queue-age ceiling and
+    # notAfterUtc end it).
     param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)]$Job, [Parameter(Mandatory = $true)]$Metadata)
     $t0 = Get-Date
     $timeoutSec = [int]$Metadata.timeoutSec
@@ -2478,6 +2592,18 @@ function Wait-QuietLeaseAdmission {
     $state = "lease-request"
     $why = "requesting a quiet lease"
     $maxAge = [int]$Metadata.maxQueueAgeSec
+    # not-after r1: the unadmitted record for a job past its notAfterUtc (or with one that cannot be read, or too near to
+    # request), shaped like queue-expired. Phase: pre-request (no request pending) | pending | post-active. Typed once.
+    $notAfterExpired = {
+        param([string]$Phase, $Verdict, $Release, [string]$Why)
+        Add-AgentLogLine "quiet-lease: expired-not-after job=$JobId phase=$Phase notAfterUtc=$(if ($null -ne $Verdict.notAfterUtc) { $Verdict.notAfterUtc } else { 'unparseable' }) requests=$requests releaseRc=$(if ($null -ne $Release) { $Release.releaseRc } else { 'none' }); NOT run, no lease kept"
+        return [pscustomobject]@{
+            gate = $script:GateVersion; mode = "lease"; label = "expired-not-after"; state = "expired"; phase = $Phase
+            waitedSec = [int]((Get-Date) - $t0).TotalSeconds; probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = $Why
+            notAfterUtc = $Verdict.notAfterUtc; notAfterState = $Verdict.state; leaseRelease = (New-LeaseReleaseRecord -Phase $Phase -Release $Release)
+            leaseRequests = $requests; leaseRefusals = @($refusals.ToArray())
+        }
+    }
     try {
         while ($true) {
             $now = Get-Date
@@ -2485,12 +2611,28 @@ function Wait-QuietLeaseAdmission {
             if (Test-Path -LiteralPath (Join-Path $cancel "$JobId.cancel") -PathType Leaf) {
                 return [pscustomobject]@{ gate = $script:GateVersion; mode = "lease"; label = "cancelled-in-gate"; state = "cancelled"; waitedSec = [int]$waited; probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = "cancel file present before launch"; leaseRefusals = @($refusals.ToArray()) }
             }
+            # not-after r1 (sol r3 on #633): a submitter that has given up must not get a lease taken for it. Passed or
+            # unreadable ends the wait here, releasing a pending request first.
+            $v = Get-JobNotAfterVerdict -Metadata $Metadata
+            if ($v.state -in @("passed", "unparseable")) {
+                $phase = if ($null -ne $lease) { "pending" } else { "pre-request" }
+                $rel = $null
+                if ($null -ne $lease) {
+                    $rel = Stop-QuietLease -Lease $lease -Why "not-after passed while pending"
+                    $lease = $null
+                    $script:QuietLeaseWaiting = $null
+                }
+                return (& $notAfterExpired $phase $v $rel $v.why)
+            }
             $age = Get-QueueAgeSeconds -Job $Job -Metadata $Metadata
             if ($maxAge -gt 0 -and $age -gt $maxAge) {
                 return [pscustomobject]@{ gate = $script:GateVersion; mode = "lease"; label = "queue-expired"; state = "expired"; waitedSec = [int]$waited; probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = "queue age ${age}s > ${maxAge}s while waiting"; queueAgeSec = $age; leaseRefusals = @($refusals.ToArray()) }
             }
             if ($null -eq $lease -and $now -ge $nextRequestAt) {
-                $l = Start-QuietLeaseRequest -JobId $JobId -Minutes $minutes
+                # not-after r1: the request child is bounded by notAfterUtc too, so it cannot turn active after the deadline.
+                $at = Get-QuietLeaseAdmitTimeout -Verdict $v
+                if (-not $at.ok) { return (& $notAfterExpired "pre-request" $v $null $at.why) }
+                $l = Start-QuietLeaseRequest -JobId $JobId -Minutes $minutes -AdmitTimeoutSec $at.sec -AdmitTimeoutSource $at.source
                 if ($l.ok) { $lease = $l; $script:QuietLeaseWaiting = $l; $requests++; $state = "lease-pending"; $why = "lease request pid=$($l.pid) pending" }
                 else {
                     $state = "lease-unavailable"; $why = $l.why; $nextRequestAt = $now.AddSeconds($LeaseRetrySec)
@@ -2500,6 +2642,28 @@ function Wait-QuietLeaseAdmission {
             if ($null -ne $lease) {
                 $u = Update-QuietLeaseRequest -Lease $lease
                 if ($u.state -eq "active") {
+                    # not-after r1 (sol r3 on #633): a pending request can turn active between two checks of the loop top, so the
+                    # cancel file and notAfterUtc are read again before the lease is handed to the job; either releases it at once.
+                    $cancelNow = Test-Path -LiteralPath (Join-Path $cancel "$JobId.cancel") -PathType Leaf
+                    $vNow = Get-JobNotAfterVerdict -Metadata $Metadata
+                    if ($cancelNow) {
+                        $rel = Stop-QuietLease -Lease $lease -Why "cancel file present when the lease turned active"
+                        $lease = $null
+                        $script:QuietLeaseWaiting = $null
+                        Add-AgentLogLine "quiet-lease: cancelled-in-gate job=$JobId phase=post-active releaseRc=$($rel.releaseRc); the lease was released as it turned active, NOT run"
+                        return [pscustomobject]@{
+                            gate = $script:GateVersion; mode = "lease"; label = "cancelled-in-gate"; state = "cancelled"; waitedSec = [int]((Get-Date) - $t0).TotalSeconds
+                            probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = "cancel file present when the lease turned active, before launch"
+                            releasedAfterActive = $true; leaseRelease = (New-LeaseReleaseRecord -Phase "post-active" -Release $rel)
+                            leaseRequests = $requests; leaseRefusals = @($refusals.ToArray())
+                        }
+                    }
+                    if ($vNow.state -in @("passed", "unparseable")) {
+                        $rel = Stop-QuietLease -Lease $lease -Why "not-after passed when the lease turned active"
+                        $lease = $null
+                        $script:QuietLeaseWaiting = $null
+                        return (& $notAfterExpired "post-active" $vNow $rel "$($vNow.why) when the lease turned active")
+                    }
                     $script:QuietLease = $lease
                     $script:QuietLeaseWaiting = $null
                     $a = $lease.active
@@ -2513,6 +2677,7 @@ function Wait-QuietLeaseAdmission {
                         heavySlotLabel = $script:QuietLease.label; holderPid = $script:QuietLease.pid; exclusive = $true; busy = $null
                         thermal = $heat.why; heat = $heat.state; leaseMinutes = $minutes; leaseUntil = $a.until; leaseCoversTimeout = $covers
                         leaseRequests = $requests; leaseRefusals = @($refusals.ToArray()); leaseOwner = $script:QuietLease.ownerCheck.why
+                        notAfterUtc = $vNow.notAfterUtc; admitTimeoutSec = $script:QuietLease.admitTimeoutSec; admitTimeoutSource = $script:QuietLease.admitTimeoutSource
                         why = "quiet lease active: slot $($a.slot) held=$($a.held) until=$([long]$a.until); heat (recorded, not gated): $($heat.why)"
                     }
                     if ($null -ne $script:GateHour) { $script:GateHour.admitted++; $script:GateHour.waitSecTotal += [int]$waited }
@@ -2532,10 +2697,10 @@ function Wait-QuietLeaseAdmission {
                     Add-AgentLogLine "quiet-lease: owner-mismatch job=$JobId why=[$($u.why)]; released, NOT run; asking again in ${LeaseRetrySec}s"
                     $abandon = "owner-mismatch"
                 }
-                elseif (($now - $lease.requested).TotalSeconds -gt ($LeasePendingMaxSec + $script:LeasePendingGraceSec)) {
+                elseif (($now - $lease.requested).TotalSeconds -gt ($lease.admitTimeoutSec + $script:LeasePendingGraceSec)) {
                     $p = [int]($now - $lease.requested).TotalSeconds
-                    $refusals.Add([pscustomobject]@{ reason = "abandoned"; rc = $null; utc = (Get-Date).ToUniversalTime().ToString("o"); why = "pending ${p}s > bound ${LeasePendingMaxSec}s" })
-                    Add-AgentLogLine "quiet-lease: abandoned job=$JobId pending=${p}s bound=${LeasePendingMaxSec}s; released, NOT run; asking again in ${LeaseRetrySec}s"
+                    $refusals.Add([pscustomobject]@{ reason = "abandoned"; rc = $null; utc = (Get-Date).ToUniversalTime().ToString("o"); why = "pending ${p}s > bound $($lease.admitTimeoutSec)s" })
+                    Add-AgentLogLine "quiet-lease: abandoned job=$JobId pending=${p}s bound=$($lease.admitTimeoutSec)s; released, NOT run; asking again in ${LeaseRetrySec}s"
                     $abandon = "abandoned"
                 }
                 else { $state = "lease-pending"; $why = $u.why }
@@ -2610,6 +2775,13 @@ function Invoke-QueuedJob {
         Complete-AdmissionWaitMarker -JobId $jobId -Status "queue-expired"   # a claim re-queued by a restart
         return
     }
+    # not-after r1: a job past its notAfterUtc (or with one that cannot be read) is never gated, leased or run.
+    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata
+    if ($notAfter.state -in @("passed", "unparseable")) {
+        Publish-NotAfterExpiredResult -Job $Job -Metadata $metadata -QueueAgeSec $queueAgeSec -Verdict $notAfter
+        Complete-AdmissionWaitMarker -JobId $jobId -Status "expired-not-after"   # a claim re-queued by a restart
+        return
+    }
 
     # Heavy-slot admission: wait (heartbeating) for a slot and a clear thermal feed; see the gate block.
     # r1g: a LIGHT job class is not held (it takes no slot): the venue's own quiet/load probe and agent maintenance.
@@ -2637,13 +2809,42 @@ function Invoke-QueuedJob {
         Complete-AdmissionWaitMarker -JobId $jobId -Status "cancelled-in-gate"
         return
     }
+    if ($script:Admission.label -eq "expired-not-after") {
+        $gateVerdict = [pscustomobject]@{ state = $script:Admission.notAfterState; notAfterUtc = $script:Admission.notAfterUtc }
+        Publish-NotAfterExpiredResult -Job $Job -Metadata $metadata -Admission $script:Admission -QueueAgeSec $queueAgeSec -Verdict $gateVerdict
+        Complete-AdmissionWaitMarker -JobId $jobId -Status "expired-not-after"
+        return
+    }
+    # The admitted lease is released explicitly (its release recorded in the admission) before Exit-HeavySlot, which stays a
+    # bare call: it returns nothing.
     if (Test-Path -LiteralPath (Join-Path $cancel "$jobId.cancel") -PathType Leaf) {
+        $rel = $null
+        if ($null -ne $script:QuietLease) { $rel = Stop-QuietLease -Lease $script:QuietLease -Why "cancel file present after admission, before launch"; $script:QuietLease = $null }
         Exit-HeavySlot
         $script:Admission | Add-Member -NotePropertyName label -NotePropertyValue "cancelled-in-gate" -Force
         $script:Admission | Add-Member -NotePropertyName why -NotePropertyValue "cancel file present after admission, before launch" -Force
         $script:Admission | Add-Member -NotePropertyName slot -NotePropertyValue $null -Force
+        $script:Admission | Add-Member -NotePropertyName leaseRelease -NotePropertyValue (New-LeaseReleaseRecord -Phase "post-admission" -Release $rel) -Force
         Publish-GateUnlaunchedResult -Job $Job -Metadata $metadata -Admission $script:Admission -QueueAgeSec $queueAgeSec
         Complete-AdmissionWaitMarker -JobId $jobId -Status "cancelled-in-gate"
+        return
+    }
+    # not-after r1: the last notAfterUtc check, before the launching marker (status mode's own wait does not poll it).
+    $notAfter = Get-JobNotAfterVerdict -Metadata $metadata
+    if ($notAfter.state -in @("passed", "unparseable")) {
+        $rel = $null
+        if ($null -ne $script:QuietLease) { $rel = Stop-QuietLease -Lease $script:QuietLease -Why "not-after passed after admission, before launch"; $script:QuietLease = $null }
+        Exit-HeavySlot
+        $script:Admission | Add-Member -NotePropertyName label -NotePropertyValue "expired-not-after" -Force
+        $script:Admission | Add-Member -NotePropertyName state -NotePropertyValue "expired" -Force
+        $script:Admission | Add-Member -NotePropertyName phase -NotePropertyValue "post-admission" -Force
+        $script:Admission | Add-Member -NotePropertyName why -NotePropertyValue "$($notAfter.why) after admission, before launch" -Force
+        $script:Admission | Add-Member -NotePropertyName slot -NotePropertyValue $null -Force
+        $script:Admission | Add-Member -NotePropertyName notAfterUtc -NotePropertyValue $notAfter.notAfterUtc -Force
+        $script:Admission | Add-Member -NotePropertyName notAfterState -NotePropertyValue $notAfter.state -Force
+        $script:Admission | Add-Member -NotePropertyName leaseRelease -NotePropertyValue (New-LeaseReleaseRecord -Phase "post-admission" -Release $rel) -Force
+        Publish-NotAfterExpiredResult -Job $Job -Metadata $metadata -Admission $script:Admission -QueueAgeSec $queueAgeSec -Verdict $notAfter
+        Complete-AdmissionWaitMarker -JobId $jobId -Status "expired-not-after"
         return
     }
     if ([int]$metadata.maxQueueAgeSec -gt 0 -and $queueAgeSec -gt [int]$metadata.maxQueueAgeSec) {

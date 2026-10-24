@@ -4,7 +4,9 @@ param(
     # Overrides the agent under test (the RED run points this at a copy of the base agent).
     [string]$AgentScript = '',
     # The interpreter that runs the FAKE heavy-slot.py below (never the real one: it lives only on Bachelor).
-    [string]$Python = $(if ($env:MLV_HEAVY_SLOT_PYTHON) { $env:MLV_HEAVY_SLOT_PYTHON } else { '' })
+    [string]$Python = $(if ($env:MLV_HEAVY_SLOT_PYTHON) { $env:MLV_HEAVY_SLOT_PYTHON } else { '' }),
+    # Runs only the named not-after cases (empty = every case, the original ones included), so each can be run alone for its RED.
+    [string[]]$Only = @()
 )
 
 # BACHELOR-AGENT-QUIET-LEASE-1 r1: the Bachelor agent's QUIET LEASE (tools/profiling/bachelor/ultra-magnus-agent.ps1,
@@ -22,6 +24,9 @@ param(
 #   stale     - a successor agent ends a wrapper its predecessor left behind
 #   cpu       - the legs' <= 20 % CPU quiescence check is kept, and the job launches only after the lease is active
 #   status    - -HeavySlotMode status / heavy-slot-mode.txt keep the r1c holder path (its own suite stays green)
+#   not-after - LEASE-REQUEST-CHILD-NOT-AFTER-1 r1, meta.json notAfterUtc (cases notafter-*, cancel-active-race; -Only runs one):
+#               past it no request is made, a request's --admit-timeout never outlives it, a pending request is stopped when
+#               it passes, and a lease that turns active after it (or after a cancel file) is released before the job gets it
 # Prints one JSON object with status PASS, or throws.
 
 $ErrorActionPreference = 'Stop'
@@ -50,6 +55,14 @@ $lift = @('Resolve-HeavySlotPython', 'Get-ProcessIdentity', 'Test-EpochMillisClo
     'Receive-HeavySlotCli', 'Stop-HeavySlotCli', 'Complete-HeavySlotCli', 'Start-QuietLeaseRequest', 'Test-QuietLeaseOwnerPid', 'Update-QuietLeaseRequest',
     'Update-QuietLeaseRenew', 'Invoke-QuietLeaseRenewTick', 'Stop-QuietLease', 'Stop-StaleQuietLeases', 'Confirm-QuietLeaseHeldForLaunch', 'Wait-QuietLeaseAdmission')
 foreach ($name in $lift) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
+# not-after r1: lifted when present. A missing one is recorded, not thrown, so the cases above still run against a base agent
+# and each not-after case fails on behaviour (or on "agent defines ..." in notafter-pure).
+$liftNotAfter = @('Get-JobNotAfterVerdict', 'Get-QuietLeaseAdmitTimeout', 'New-LeaseReleaseRecord', 'Publish-NotAfterExpiredResult')
+$liftMissing = [System.Collections.Generic.List[string]]::new()
+foreach ($name in $liftNotAfter) {
+    $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
+    if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
+}
 $paramDefaults = @{}
 foreach ($p in $ast.ParamBlock.Parameters) { if ($p.DefaultValue -is [System.Management.Automation.Language.ConstantExpressionAst]) { $paramDefaults[$p.Name.VariablePath.UserPath] = $p.DefaultValue.Value } }
 
@@ -97,6 +110,18 @@ if a[:2] == ["lease", "request"]:
     me = os.getpid()
     rel = os.path.join(d, "release-%d" % me)
     write_flag({"label": label, "pid": me, "state": "pending", "renewed": time.time()})
+    if mode == "admit_timeout":
+        # heavy-slot.py's pending cap: still pending after --admit-timeout s -> a refusal line and exit 75 (a release ends it first).
+        t_end = time.time() + float(a[a.index("--admit-timeout") + 1])
+        while time.time() < t_end and not os.path.exists(rel):
+            time.sleep(0.1)
+        if not os.path.exists(rel):
+            log(cmd="request-end", released=False, refused=True)
+            o = read_flag()
+            if o and o.get("pid") == me:
+                os.remove(flag)
+            print("[heavy-slot] admission refused for %r: still pending after --admit-timeout %s s" % (label, a[a.index("--admit-timeout") + 1]), file=sys.stderr, flush=True)
+            sys.exit(75)
     if mode == "active":
         time.sleep(float(ctl.get("active_after", 0.3)))
         until = time.time() + 60 * float(a[a.index("--minutes") + 1])
@@ -179,7 +204,10 @@ $script:Log = [System.Collections.Generic.List[string]]::new()
 $script:Beats = [System.Collections.Generic.List[string]]::new()
 $script:Age = 0
 $script:Exempt = 0
-function Add-AgentLogLine([string]$Message) { $script:Log.Add($Message) }
+# A case's hook runs inside the agent's own log call, so it can land an event at a known point of the gate loop.
+$script:LogHook = $null
+$script:LeaseNotAfterMinAdmitSec = 30
+function Add-AgentLogLine([string]$Message) { $script:Log.Add($Message); if ($null -ne $script:LogHook) { & $script:LogHook $Message } }
 function Write-AgentHeartbeat([string]$Activity = '') { $script:Beats.Add($Activity) }
 function Get-QueueAgeSeconds { param($Job, $Metadata) return $script:Age }
 function Invoke-ExemptJobsDuringWait { param([string]$WaitingJobId, [double]$WaitedSec) $script:Exempt++; return 0 }
@@ -197,12 +225,14 @@ function Reset-Case([hashtable]$Control, [int]$GraceSec = 120) {
     Get-ChildItem -LiteralPath $fx -Filter 'release-*' -File | Remove-Item -Force
     $script:Log.Clear(); $script:Beats.Clear(); $script:Age = 0; $script:Exempt = 0
     $script:QuietLease = $null; $script:QuietLeaseWaiting = $null; $script:Admission = $null
+    $script:LogHook = $null; $script:HookFired = $false
 }
 function Test-PidAlive([int]$ProcessId) { return $null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) }
 function Wait-Until([scriptblock]$Cond, [double]$TimeoutSec) { $dl = (Get-Date).AddSeconds($TimeoutSec); while (-not (& $Cond) -and (Get-Date) -lt $dl) { Start-Sleep -Milliseconds 100 }; return [bool](& $Cond) }
 $meta = [pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 600 }
 
 try {
+  if ($Only.Count -eq 0) {   # the original cases run only in a full run
     # ------------------------------------------------------------ label + parse + minutes (pure)
     Assert-True ($script:QuietLeaseLabel -ceq 'quiet-lease mlv') "the lease label is exactly 'quiet-lease mlv': '$($script:QuietLeaseLabel)'"
     Assert-True (-not $script:QuietLeaseLabel.StartsWith('mlv ') -and -not $script:QuietLeaseLabel.StartsWith('mlv-agent ')) "the label never starts 'mlv ' or 'mlv-agent ' (heavy-slot.py LEASE_FORBIDDEN_PREFIXES)"
@@ -372,6 +402,241 @@ try {
     Assert-True ($prio.Contains('[System.Diagnostics.ProcessPriorityClass]::Normal') -and [string]$paramDefaults['AgentPriority'] -ceq 'Normal') "priority: a BelowNormal agent raises itself to Normal by default"
     Assert-True ($code -match 'priority=\$priority') "priority: the agent start line names it (Deploy-AgentSwap's proof reads that line)"
     $results.priority = [ordered]@{ default = $paramDefaults['AgentPriority'] }
+  }
+
+    # ================================================================ not-after r1 (LEASE-REQUEST-CHILD-NOT-AFTER-1)
+    $notAfterCases = @('notafter-before-request', 'notafter-while-pending', 'notafter-active-then-expired', 'cancel-active-race',
+        'notafter-absent-unchanged', 'notafter-pure', 'notafter-source-shape')
+    foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
+    function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
+    # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
+    # (a FAIL on the label assert), never a hang.
+    function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return 0 }
+    function Get-FakeFlag { try { return ([IO.File]::ReadAllText((Join-Path $fx 'quiet-lease.json')) | ConvertFrom-Json) } catch { return $null } }
+    function New-NotAfterMeta([double]$InSec) { return [pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 600; notAfterUtc = [DateTime]::UtcNow.AddSeconds($InSec).ToString('o') } }
+    function Get-RequestArg($Call, [string]$Flag) { $a = @($Call.argv); $i = [Array]::IndexOf($a, $Flag); if ($i -lt 0) { return $null }; return $a[$i + 1] }
+    function Get-Released { return @(Get-Calls | Where-Object { $_.cmd -eq 'release' }) }
+
+    # ------------------------------------------------------------ notafter-before-request: no request once it has passed / is too near
+    if (Test-Case 'notafter-before-request') {
+        Reset-Case @{ request = 'active' }
+        $script:LeaseNotAfterMinAdmitSec = 30
+        $script:AgeAfter = (Get-Date).AddSeconds(20)
+        $mPast = New-NotAfterMeta -60
+        $adm = Wait-QuietLeaseAdmission -JobId 'jNb' -Job ([pscustomobject]@{}) -Metadata $mPast
+        $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        Assert-True ($adm.label -eq 'expired-not-after' -and $adm.phase -eq 'pre-request' -and $adm.notAfterState -eq 'passed' -and $reqs.Count -eq 0) "notafter-before-request: a passed notAfterUtc ends the wait before any request: label=$($adm.label) phase=$($adm.phase) state=$($adm.notAfterState) requests=$($reqs.Count)"
+        Assert-True ($null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting -and $null -eq $adm.leaseRelease -and $adm.leaseRequests -eq 0 -and $adm.notAfterUtc -ceq $mPast.notAfterUtc) "notafter-before-request: no lease, nothing released, the bound recorded: $($adm | ConvertTo-Json -Compress -Depth 4)"
+        Assert-True (@($script:Log | Where-Object { $_ -ceq "quiet-lease: expired-not-after job=jNb phase=pre-request notAfterUtc=$($mPast.notAfterUtc) requests=0 releaseRc=none; NOT run, no lease kept" }).Count -eq 1) "notafter-before-request: typed expired-not-after line"
+        Reset-Case @{ request = 'active' }
+        $script:LeaseNotAfterMinAdmitSec = 30
+        $script:AgeAfter = (Get-Date).AddSeconds(20)
+        $adm2 = Wait-QuietLeaseAdmission -JobId 'jNm' -Job ([pscustomobject]@{}) -Metadata (New-NotAfterMeta 10)
+        $reqs2 = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        Assert-True ($adm2.label -eq 'expired-not-after' -and $adm2.phase -eq 'pre-request' -and $adm2.notAfterState -eq 'open' -and $reqs2.Count -eq 0 -and $adm2.why -match 'under the 30 s minimum request window') "notafter-before-request: 10 s left is under the 30 s minimum: no request: label=$($adm2.label) requests=$($reqs2.Count) why=$($adm2.why)"
+        $results.notAfterBeforeRequest = [ordered]@{ passed = $adm.label; near = $adm2.label; nearWhy = $adm2.why; requests = $reqs.Count + $reqs2.Count }
+    }
+
+    # ------------------------------------------------------------ notafter-while-pending: the request child is bounded by it
+    if (Test-Case 'notafter-while-pending') {
+        Reset-Case @{ request = 'admit_timeout' }
+        $script:LeaseNotAfterMinAdmitSec = 1
+        $savedPendingMax = $LeasePendingMaxSec
+        $LeasePendingMaxSec = 1800
+        $script:AgeAfter = (Get-Date).AddSeconds(25)
+        $mPend = New-NotAfterMeta 4
+        $tP = Get-Date
+        try { $adm = Wait-QuietLeaseAdmission -JobId 'jNp' -Job ([pscustomobject]@{}) -Metadata $mPend }
+        finally { $LeasePendingMaxSec = $savedPendingMax }
+        $elapsed = ((Get-Date) - $tP).TotalSeconds
+        $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        $at = if ($reqs.Count -ge 1) { Get-RequestArg $reqs[0] '--admit-timeout' } else { $null }
+        Assert-True ($reqs.Count -eq 1 -and [int]$at -ge 1 -and [int]$at -le 4) "notafter-while-pending: one request, its --admit-timeout bounded by notAfterUtc (1..4, not 1800): requests=$($reqs.Count) admit-timeout=$at"
+        Assert-True ($adm.label -eq 'expired-not-after' -and $adm.phase -in @('pre-request', 'pending') -and $adm.leaseRequests -eq 1 -and $elapsed -lt 20) "notafter-while-pending: expired-not-after after one request, quickly: label=$($adm.label) phase=$($adm.phase) requests=$($adm.leaseRequests) elapsed=$([Math]::Round($elapsed, 1))s"
+        # The phase depends on whether the fake's own clock (started after python start-up) reached its 75 before notAfterUtc.
+        if ($adm.phase -eq 'pre-request') {
+            $r75 = @($adm.leaseRefusals | Where-Object { $_.reason -eq 'refused' -and $_.rc -eq 75 })
+            Assert-True ($r75.Count -eq 1 -and @($script:Log | Where-Object { $_ -like 'quiet-lease: refused job=jNp rc=75 *' }).Count -eq 1) "notafter-while-pending: the bounded request's exit 75 is typed and kept: $(@($adm.leaseRefusals) | ConvertTo-Json -Compress)"
+        }
+        else {
+            Assert-True ($null -ne $adm.leaseRelease -and $adm.leaseRelease.phase -eq 'pending') "notafter-while-pending: the still-pending request is released when notAfterUtc passes: $($adm.leaseRelease | ConvertTo-Json -Compress)"
+        }
+        Assert-True (Wait-Until { -not (Test-PidAlive ([int]$reqs[0].pid)) } 5) "notafter-while-pending: no request wrapper is left running"
+        Assert-True (@($script:Log | Where-Object { $_ -match "^quiet-lease: request started job=jNp pid=\d+ label='quiet-lease mlv' minutes=31 admitTimeout=${at}s admitTimeoutSource=not-after record=True$" }).Count -eq 1) "notafter-while-pending: the request line names the bound and its source"
+        $results.notAfterWhilePending = [ordered]@{ admitTimeout = [int]$at; phase = $adm.phase; elapsedSec = [Math]::Round($elapsed, 1) }
+    }
+
+    # ------------------------------------------------------------ notafter-active-then-expired: active after the bound -> released
+    if (Test-Case 'notafter-active-then-expired') {
+        Reset-Case @{ request = 'active'; active_after = 3 }
+        $script:LeaseNotAfterMinAdmitSec = 1
+        $script:AgeAfter = (Get-Date).AddSeconds(25)
+        $mAct = New-NotAfterMeta 2
+        $script:NotAfterAt = [DateTimeOffset]::Parse($mAct.notAfterUtc).UtcDateTime
+        # Lands the race: the request is filed under a live bound, then turns active AND notAfterUtc passes before the gate's
+        # next read of the wrapper (the same iteration, right after the request-started line).
+        $script:LogHook = {
+            param($Message)
+            if ($script:HookFired -or $Message -notlike 'quiet-lease: request started job=jNa *') { return }
+            $script:HookFired = $true
+            $null = Wait-Until { $f = Get-FakeFlag; $null -ne $f -and $f.state -eq 'active' -and [DateTime]::UtcNow -gt $script:NotAfterAt } 10
+            Start-Sleep -Milliseconds 500
+        }
+        $adm = Wait-QuietLeaseAdmission -JobId 'jNa' -Job ([pscustomobject]@{}) -Metadata $mAct
+        $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        Assert-True ($script:HookFired -and $reqs.Count -eq 1) "notafter-active-then-expired: one request, the race landed"
+        Assert-True ($adm.label -eq 'expired-not-after' -and $adm.phase -eq 'post-active' -and $adm.notAfterState -eq 'passed') "notafter-active-then-expired: a lease that turns active after notAfterUtc is not handed to the job: label=$($adm.label) phase=$($adm.phase)"
+        Assert-True ((Get-Released).Count -eq 1 -and $null -ne $adm.leaseRelease -and [string]$adm.leaseRelease.releaseRc -ceq '0' -and $adm.leaseRelease.phase -eq 'post-active') "notafter-active-then-expired: released once, the release recorded: $($adm.leaseRelease | ConvertTo-Json -Compress)"
+        Assert-True ((Wait-Until { -not (Test-PidAlive ([int]$reqs[0].pid)) } 5) -and @(Get-ChildItem -LiteralPath $fx -Filter '*.lease.json' -File).Count -eq 0 -and $null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting) "notafter-active-then-expired: wrapper gone, record removed, no lease kept"
+        Assert-True (@($script:Log | Where-Object { $_ -ceq "quiet-lease: expired-not-after job=jNa phase=post-active notAfterUtc=$($mAct.notAfterUtc) requests=1 releaseRc=0; NOT run, no lease kept" }).Count -eq 1) "notafter-active-then-expired: typed line"
+        $results.notAfterActiveThenExpired = [ordered]@{ phase = $adm.phase; releaseRc = $adm.leaseRelease.releaseRc }
+    }
+
+    # ------------------------------------------------------------ cancel-active-race: a cancel file that lands as the lease turns active
+    if (Test-Case 'cancel-active-race') {
+        Reset-Case @{ request = 'active' }
+        $script:AgeAfter = (Get-Date).AddSeconds(25)
+        $script:CancelFile = Join-Path $cancel 'jCa.cancel'
+        $script:LogHook = {
+            param($Message)
+            if ($script:HookFired -or $Message -notlike 'quiet-lease: request started job=jCa *') { return }
+            $script:HookFired = $true
+            $null = Wait-Until { $f = Get-FakeFlag; $null -ne $f -and $f.state -eq 'active' } 10
+            [IO.File]::WriteAllText($script:CancelFile, 'x')
+            Start-Sleep -Milliseconds 500
+        }
+        try { $adm = Wait-QuietLeaseAdmission -JobId 'jCa' -Job ([pscustomobject]@{}) -Metadata $meta }
+        finally { Remove-Item -LiteralPath $script:CancelFile -Force -ErrorAction SilentlyContinue }
+        $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        Assert-True ($script:HookFired -and $adm.label -eq 'cancelled-in-gate' -and $adm.releasedAfterActive -eq $true) "cancel-active-race: a cancel file present when the lease turns active ends the wait: label=$($adm.label) releasedAfterActive=$($adm.releasedAfterActive)"
+        Assert-True ((Get-Released).Count -eq 1 -and $null -ne $adm.leaseRelease -and [string]$adm.leaseRelease.releaseRc -ceq '0') "cancel-active-race: released once, the release recorded: $($adm.leaseRelease | ConvertTo-Json -Compress)"
+        Assert-True ((Wait-Until { -not (Test-PidAlive ([int]$reqs[0].pid)) } 5) -and $null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting) "cancel-active-race: wrapper gone, no lease kept"
+        Assert-True (@($script:Log | Where-Object { $_ -like 'quiet-lease: cancelled-in-gate job=jCa phase=post-active releaseRc=0;*' }).Count -eq 1) "cancel-active-race: typed line"
+        $results.cancelActiveRace = [ordered]@{ label = $adm.label; releaseRc = $adm.leaseRelease.releaseRc }
+    }
+
+    # ------------------------------------------------------------ notafter-absent-unchanged: no notAfterUtc = today's request
+    # The unchanged half (argv) passes on a base agent BY DESIGN; this case's RED is the new typed fields.
+    if (Test-Case 'notafter-absent-unchanged') {
+        Reset-Case @{ request = 'active' }
+        $script:AgeAfter = (Get-Date).AddSeconds(25)
+        $adm = Wait-QuietLeaseAdmission -JobId 'jNn' -Job ([pscustomobject]@{}) -Metadata $meta
+        $req = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+        Assert-True ($adm.label -eq 'clear' -and $req.Count -eq 1 -and ($req[0].argv -join ' ') -ceq 'lease request --label quiet-lease mlv --minutes 31 --admit-timeout 1 --slots 2') "notafter-absent-unchanged: the request argv is today's: [$($req[0].argv -join ' ')]"
+        Assert-True ($null -eq $adm.notAfterUtc -and $adm.admitTimeoutSec -eq 1 -and $adm.admitTimeoutSource -ceq 'pending-max') "notafter-absent-unchanged: the admission types notAfterUtc=null admitTimeoutSec=1 admitTimeoutSource=pending-max: $($adm | Select-Object notAfterUtc, admitTimeoutSec, admitTimeoutSource | ConvertTo-Json -Compress)"
+        $line = @($script:Log | Where-Object { $_ -like 'quiet-lease: request started job=jNn *' })
+        Assert-True ($line.Count -eq 1 -and $line[0] -match "^quiet-lease: request started job=jNn pid=\d+ label='quiet-lease mlv' minutes=31 admitTimeout=1s admitTimeoutSource=pending-max record=True$") "notafter-absent-unchanged: the request line: $($line -join ' | ')"
+        Exit-HeavySlot
+        $results.notAfterAbsentUnchanged = [ordered]@{ argv = ($req[0].argv -join ' '); admitTimeoutSource = $adm.admitTimeoutSource }
+    }
+
+    # ------------------------------------------------------------ notafter-pure: the verdict, the request bound, the result shape
+    if (Test-Case 'notafter-pure') {
+        foreach ($name in $liftNotAfter) { Assert-True ($liftMissing -notcontains $name) "agent defines $name" }
+        $minAst = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:LeaseNotAfterMinAdmitSec' }, $true)
+        Assert-True ($null -ne $minAst -and $minAst.Right.Expression.Value -eq 30) "the agent's minimum request window is 30 s (heavy-slot.py's 30 min cooldown follows any lease, however short)"
+        $now = [DateTime]::new(2026, 10, 24, 2, 0, 0, [DateTimeKind]::Utc)
+        $at3 = [DateTime]::new(2026, 10, 24, 3, 0, 0, [DateTimeKind]::Utc)
+        $z3 = '2026-10-24T03:00:00.0000000Z'
+        $vt = @(
+            @{ n = 'missing'; m = [pscustomobject]@{ timeoutSec = 1 }; s = 'none'; o = $null; r = $null }
+            @{ n = 'null'; m = [pscustomobject]@{ notAfterUtc = $null }; s = 'none'; o = $null; r = $null }
+            @{ n = 'blank'; m = [pscustomobject]@{ notAfterUtc = '  ' }; s = 'none'; o = $null; r = $null }
+            @{ n = 'future-z'; m = [pscustomobject]@{ notAfterUtc = $z3 }; s = 'open'; o = $z3; r = 3600 }
+            @{ n = 'future-offset'; m = [pscustomobject]@{ notAfterUtc = '2026-10-24T05:00:00+02:00' }; s = 'open'; o = $z3; r = 3600 }
+            @{ n = 'past'; m = [pscustomobject]@{ notAfterUtc = '2026-10-24T01:00:00Z' }; s = 'passed'; o = '2026-10-24T01:00:00.0000000Z'; r = -3600 }
+            @{ n = 'exactly-now'; m = [pscustomobject]@{ notAfterUtc = '2026-10-24T02:00:00Z' }; s = 'passed'; o = '2026-10-24T02:00:00.0000000Z'; r = 0 }
+            @{ n = 'datetime-utc'; m = [pscustomobject]@{ notAfterUtc = $at3 }; s = 'open'; o = $z3; r = 3600 }
+            @{ n = 'datetime-local'; m = [pscustomobject]@{ notAfterUtc = $at3.ToLocalTime() }; s = 'open'; o = $z3; r = 3600 }
+            @{ n = 'datetime-unspecified'; m = [pscustomobject]@{ notAfterUtc = [DateTime]::SpecifyKind($at3, [DateTimeKind]::Unspecified) }; s = 'open'; o = $z3; r = 3600 }
+            @{ n = 'datetimeoffset'; m = [pscustomobject]@{ notAfterUtc = [DateTimeOffset]::new(2026, 10, 24, 5, 0, 0, [TimeSpan]::FromHours(2)) }; s = 'open'; o = $z3; r = 3600 }
+            @{ n = 'json-z'; m = ('{"notAfterUtc":"2026-10-24T03:00:00.0000000Z"}' | ConvertFrom-Json); s = 'open'; o = $z3; r = 3600 }
+            @{ n = 'json-offset'; m = ('{"notAfterUtc":"2026-10-24T05:00:00+02:00"}' | ConvertFrom-Json); s = 'open'; o = $z3; r = 3600 }
+            @{ n = 'garbage'; m = [pscustomobject]@{ notAfterUtc = 'not-a-date' }; s = 'unparseable'; o = $null; r = $null }
+            @{ n = 'number'; m = [pscustomobject]@{ notAfterUtc = 12345 }; s = 'unparseable'; o = $null; r = $null }
+        )
+        $verdicts = [ordered]@{}
+        foreach ($c in $vt) {
+            $v = Get-JobNotAfterVerdict -Metadata $c.m -NowUtc $now
+            $remOk = if ($null -eq $c.r) { $null -eq $v.remainingSec } else { $null -ne $v.remainingSec -and [Math]::Abs([double]$v.remainingSec - $c.r) -lt 0.001 }
+            Assert-True ($v.state -ceq $c.s -and $v.notAfterUtc -ceq $c.o -and $remOk -and -not [string]::IsNullOrWhiteSpace($v.why)) "notafter-pure: verdict $($c.n) is $($c.s) $($c.o) $($c.r): $($v | ConvertTo-Json -Compress)"
+            $verdicts[$c.n] = $v.state
+        }
+        $savedPendingMax = $LeasePendingMaxSec
+        $LeasePendingMaxSec = 1800
+        $script:LeaseNotAfterMinAdmitSec = 30
+        try {
+            $aNone = Get-QuietLeaseAdmitTimeout -Verdict ([pscustomobject]@{ state = 'none'; remainingSec = $null })
+            $aFar = Get-QuietLeaseAdmitTimeout -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 7200.0 })
+            $aHuge = Get-QuietLeaseAdmitTimeout -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 2.5e11 })
+            $aEdge = Get-QuietLeaseAdmitTimeout -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 1800.5 })
+            $aNear = Get-QuietLeaseAdmitTimeout -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 600.7 })
+            $aMin = Get-QuietLeaseAdmitTimeout -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 29.9 })
+            $aPassed = Get-QuietLeaseAdmitTimeout -Verdict ([pscustomobject]@{ state = 'passed'; remainingSec = -1.0 })
+            $aBad = Get-QuietLeaseAdmitTimeout -Verdict ([pscustomobject]@{ state = 'unparseable'; remainingSec = $null })
+        }
+        finally { $LeasePendingMaxSec = $savedPendingMax }
+        Assert-True ($aNone.ok -and $aNone.sec -eq 1800 -and $aNone.source -ceq 'pending-max') "notafter-pure: no notAfterUtc asks for LeasePendingMaxSec: $($aNone | ConvertTo-Json -Compress)"
+        Assert-True ($aFar.ok -and $aFar.sec -eq 1800 -and $aFar.source -ceq 'pending-max' -and $aHuge.ok -and $aHuge.sec -eq 1800 -and $aHuge.source -ceq 'pending-max') "notafter-pure: a far notAfterUtc keeps pending-max: $($aFar | ConvertTo-Json -Compress) $($aHuge | ConvertTo-Json -Compress)"
+        Assert-True ($aEdge.ok -and $aEdge.sec -eq 1800 -and $aEdge.source -ceq 'pending-max') "notafter-pure: floor(1800.5) = 1800 is not below pending-max: $($aEdge | ConvertTo-Json -Compress)"
+        Assert-True ($aNear.ok -and $aNear.sec -eq 600 -and $aNear.source -ceq 'not-after') "notafter-pure: a near notAfterUtc bounds the request to its whole seconds: $($aNear | ConvertTo-Json -Compress)"
+        Assert-True (-not $aMin.ok -and $aMin.why -ceq 'only 29 s left before notAfterUtc, under the 30 s minimum request window') "notafter-pure: under the minimum, no request: $($aMin | ConvertTo-Json -Compress)"
+        Assert-True (-not $aPassed.ok -and -not $aBad.ok) "notafter-pure: a passed or unparseable verdict never requests"
+        $r0 = New-LeaseReleaseRecord -Phase 'pending' -Release ([pscustomobject]@{ releaseRc = '0'; rc = 0; killed = @() })
+        Assert-True ($r0.phase -ceq 'pending' -and $r0.releaseRc -ceq '0' -and $r0.rc -eq 0 -and @($r0.killed).Count -eq 0 -and $null -eq (New-LeaseReleaseRecord -Phase 'pending' -Release $null)) "notafter-pure: leaseRelease is {phase, releaseRc, rc, killed}, or null when nothing was released"
+        # Publish-NotAfterExpiredResult, with the publish and move stubbed.
+        $script:Published = $null; $script:Moved = $null
+        function Publish-JobResult { param([string]$JobId, $Result) $script:Published = $Result; return (Join-Path $fx "$JobId.result.json") }
+        function Move-JobArtifacts { param([string]$JobId, [string]$JobPath, [string]$DestinationDirectory) $script:Moved = "$JobId|$DestinationDirectory" }
+        $processed = Join-Path $fx 'processed'
+        $pubJob = [pscustomobject]@{ BaseName = 'jPub.job'; FullName = (Join-Path $fx 'jPub.job.ps1') }
+        $pubMeta = [pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 0 }
+        $vPast = [pscustomobject]@{ state = 'passed'; notAfterUtc = '2026-10-24T01:00:00.0000000Z'; remainingSec = -5.0; why = 'passed' }
+        Publish-NotAfterExpiredResult -Job $pubJob -Metadata $pubMeta -Admission ([pscustomobject]@{ label = 'expired-not-after'; phase = 'pending' }) -QueueAgeSec 7 -Verdict $vPast
+        $p = $script:Published
+        Assert-True ($null -ne $p -and $p.jobId -ceq 'jPub' -and $p.exitCode -eq 125 -and $null -eq $p.startedUtc -and $p.cancelled -eq $false -and $p.timedOut -eq $false -and $p.queueExpired -eq $true -and $p.notAfterExpired -eq $true) "notafter-pure: result exitCode 125, queueExpired + notAfterExpired true, not cancelled, never started: $($p | ConvertTo-Json -Compress -Depth 4)"
+        Assert-True ($p.notAfterUtc -ceq '2026-10-24T01:00:00.0000000Z' -and $p.notAfterState -ceq 'passed' -and @($p.killedProcessIds).Count -eq 0 -and $p.queueAgeSec -eq 7 -and $p.admission.phase -ceq 'pending' -and $p.stdout -ceq '') "notafter-pure: result carries the bound, the state and the admission"
+        Assert-True ($p.stderr -ceq 'notAfterUtc 2026-10-24T01:00:00.0000000Z passed before launch (pending); job was not executed') "notafter-pure: result stderr: $($p.stderr)"
+        Assert-True ($script:Moved -ceq "jPub|$processed" -and @($script:Log | Where-Object { $_ -ceq "not-after expired job=jPub notAfterUtc=2026-10-24T01:00:00.0000000Z phase=pending result=$(Join-Path $fx 'jPub.result.json')" }).Count -eq 1) "notafter-pure: artifacts moved to processed, typed line"
+        $script:Published = $null
+        Publish-NotAfterExpiredResult -Job $pubJob -Metadata $pubMeta -QueueAgeSec 0 -Verdict ([pscustomobject]@{ state = 'unparseable'; notAfterUtc = $null; remainingSec = $null; why = 'garbage' })
+        Assert-True ($null -eq $script:Published.admission -and $script:Published.notAfterState -ceq 'unparseable' -and $script:Published.exitCode -eq 125 -and $script:Published.stderr -like '*(pre-gate); job was not executed') "notafter-pure: before the gate there is no admission; unparseable is typed: $($script:Published.stderr)"
+        $results.notAfterPure = [ordered]@{ verdicts = $verdicts; near = $aNear.sec; min = $aMin.why }
+    }
+
+    # ------------------------------------------------------------ notafter-source-shape: where Invoke-QueuedJob checks it
+    if (Test-Case 'notafter-source-shape') {
+        $qj = Get-FunctionBody 'Invoke-QueuedJob'
+        $probe = '$notAfter = Get-JobNotAfterVerdict -Metadata $metadata'
+        $iPre = $qj.IndexOf($probe)
+        $iGate = $qj.IndexOf('Wait-QuietLeaseAdmission -JobId $jobId')
+        $iLabel = $qj.IndexOf('if ($script:Admission.label -eq "expired-not-after") {')
+        $iRe = if ($iLabel -ge 0) { $qj.IndexOf($probe, $iLabel) } else { -1 }
+        $iMarker = $qj.IndexOf('$marker = New-LaunchingMarker')
+        Assert-True ($iPre -ge 0 -and $iPre -lt $iGate) "notafter-source-shape: Invoke-QueuedJob reads notAfterUtc before the gate ($iPre < $iGate)"
+        Assert-True ($iLabel -gt $iGate) "notafter-source-shape: it handles label expired-not-after after the gate ($iGate < $iLabel)"
+        Assert-True ($iRe -gt $iLabel -and $iRe -lt $iMarker) "notafter-source-shape: the post-admission re-check sits before New-LaunchingMarker ($iLabel < $iRe < $iMarker)"
+        $post = $qj.Substring($iGate, $iMarker - $iGate)
+        Assert-True (([regex]::Matches($post, [regex]::Escape('$rel = Stop-QuietLease -Lease $script:QuietLease'))).Count -eq 2 -and ([regex]::Matches($post, [regex]::Escape('-Phase "post-admission" -Release $rel'))).Count -eq 2) "notafter-source-shape: the post-admission cancel and not-after refusals each release the lease and record it"
+        Assert-True (([regex]::Matches($qj, [regex]::Escape('Complete-AdmissionWaitMarker -JobId $jobId -Status "expired-not-after"'))).Count -eq 3) "notafter-source-shape: all three not-after exits retire the claim as expired-not-after"
+        $exitBody = (Get-FunctionBody 'Exit-HeavySlot') -replace '\s+', ' '
+        $exitWant = @'
+function Exit-HeavySlot {
+    # Ends the admitted job's holder (status mode) or quiet lease (lease mode), so heavy-slot.py releases the job's slot.
+    # Idempotent. Called on every path out of a job: normal end, a thrown leg, a pre-launch refusal, and agent exit.
+    $h = $script:HeavySlotHolder
+    $script:HeavySlotHolder = $null
+    if ($null -ne $h) { Stop-HeavySlotHolder -Holder $h -Why "job done" }
+    $l = $script:QuietLease
+    $script:QuietLease = $null
+    if ($null -ne $l) { $null = Stop-QuietLease -Lease $l -Why "job done" }
+}
+'@ -replace '\s+', ' '
+        Assert-True ($exitBody.Trim() -ceq $exitWant.Trim()) "notafter-source-shape: Exit-HeavySlot is unchanged (it returns nothing, so its bare calls leak no output)"
+        Assert-True (-not (Get-FunctionBody 'Wait-HeavySlotAdmission').Contains('NotAfter')) "notafter-source-shape: status mode's wait loop is unchanged (Invoke-QueuedJob's checks cover it)"
+        $results.notAfterSourceShape = [ordered]@{ order = 'pre-gate < gate < expired-not-after < post-admission re-check < launching marker' }
+    }
+    if ($Only.Count -gt 0) { $results.only = @($Only) }
 }
 finally {
     foreach ($l2 in @($script:QuietLease, $script:QuietLeaseWaiting)) { if ($null -ne $l2) { try { $null = Stop-QuietLease -Lease $l2 -Why 'test cleanup' } catch { } } }

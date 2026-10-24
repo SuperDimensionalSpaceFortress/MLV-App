@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # hub: pwsh colours its error view with ANSI escapes whenever the parent environment advertises a colour
@@ -281,9 +282,12 @@ class _Share(unittest.TestCase):
              module: Path | None = None, repo_root: Path | None = None,
              job_timeout_sec: int | None = None,
              before_job_visible: str | None = None,
-             after_meta_tmp_written: str | None = None) -> subprocess.CompletedProcess:
+             after_meta_tmp_written: str | None = None,
+             not_after_utc: str | None = None) -> subprocess.CompletedProcess:
         sides = ",".join(_q(p) for p in (side if side is not None else [self.side]))
         timeout_arg = "" if job_timeout_sec is None else f" -JobTimeoutSec {job_timeout_sec}"
+        if not_after_utc is not None:
+            timeout_arg += f" -NotAfterUtc {_q(not_after_utc)}"
         script = self.tmp / "drop.ps1"
         repo_root_arg = f" -RepoRoot {_q(repo_root)}" if repo_root is not None else ""
         preamble = (
@@ -331,6 +335,16 @@ RACING_JOB = ("{ param($s, $d) Copy-Item -LiteralPath $s -Destination $d; "
 # rollback proof that actually exercises metadata-then-job-rename-fails.
 JOB_COPY_FAILS = ("{ param($s, $d) if ($d -like '*.job.tmp') { throw 'INJECTED_JOB_COPY_FAILURE' }; "
                    "Copy-Item -LiteralPath $s -Destination $d }")
+
+
+def _future_not_after(hours: float = 2.0) -> datetime:
+    """A whole-second UTC instant `hours` from now, for -NotAfterUtc."""
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).replace(microsecond=0)
+
+
+def _round_trip_utc(instant: datetime) -> str:
+    """.NET's DateTime 'o' form of a whole-second UTC instant, as the module writes notAfterUtc."""
+    return instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
 
 
 class UmRunDropModuleTests(_Share):
@@ -428,6 +442,51 @@ class UmRunDropModuleTests(_Share):
         self.assertIn("THREW UMRUN_JOB_TIMEOUT_INVALID", proc.stdout, proc.stdout + proc.stderr)
         self.assertFalse(self.log.exists(), "no copy may happen before the budget is validated")
         self.assertEqual(self.names(), [])
+
+    # ---- agent-side absolute deadline (LEASE-REQUEST-CHILD-NOT-AFTER-1) -----------------------
+    # inbox\<id>.meta.json notAfterUtc: past it, the Bachelor agent never takes a quiet lease for the
+    # job and never runs it. Optional; absent leaves the metadata exactly as it was.
+
+    def test_not_after_is_written_as_a_round_trip_utc_string(self) -> None:
+        instant = _future_not_after()
+        expected = _round_trip_utc(instant)
+        for given in (instant.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      instant.astimezone(timezone(timedelta(hours=2))).isoformat()):
+            with self.subTest(given=given):
+                for leftover in self.inbox.iterdir():
+                    leftover.unlink()
+                proc = self.drop(OBSERVING, side=[], not_after_utc=given)
+                self.assertIn("UMRUN_JOBID=demo", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(f"job not-after: demo.meta.json notAfterUtc={expected}", proc.stdout, proc.stdout)
+                meta = json.loads((self.inbox / "demo.meta.json").read_text(encoding="ascii"))
+                self.assertEqual(meta["notAfterUtc"], expected, "the same instant, normalised to 'o' form in Z")
+
+    def test_no_not_after_leaves_the_metadata_without_the_key(self) -> None:
+        # Passes on a module without -NotAfterUtc too, by design: it pins that the field's absence
+        # leaves the claim's bytes exactly as they were.
+        proc = self.drop(OBSERVING, side=[], job_timeout_sec=600)
+        self.assertIn("UMRUN_JOBID=demo", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("job not-after:", proc.stdout)
+        raw = (self.inbox / "demo.meta.json").read_text(encoding="ascii")
+        meta = json.loads(raw)
+        self.assertNotIn("notAfterUtc", meta)
+        self.assertEqual(raw, json.dumps({"jobId": "demo", "nonce": meta["nonce"], "timeoutSec": 600}, separators=(",", ":")))
+
+    def test_an_invalid_not_after_is_refused_before_anything_is_placed(self) -> None:
+        offsetless = _future_not_after().strftime("%Y-%m-%dT%H:%M:%S")
+        for bad, reason in (("not-a-date", "does not parse"),
+                            (offsetless, "no Z or +hh:mm offset"),
+                            ("2020-01-01T00:00:00Z", "not later than now")):
+            with self.subTest(not_after=bad):
+                for leftover in self.inbox.iterdir():
+                    leftover.unlink()
+                if self.log.exists():
+                    self.log.unlink()
+                proc = self.drop(OBSERVING, not_after_utc=bad)   # self.side is a real side-file by default
+                self.assertIn(f"THREW UMRUN_NOT_AFTER_INVALID '{bad}'", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(reason, proc.stdout, proc.stdout)
+                self.assertFalse(self.log.exists(), "no copy may happen before notAfterUtc is validated")
+                self.assertEqual(self.names(), [], "a refused notAfterUtc must leave neither metadata nor a job")
 
     def test_a_failed_job_copy_removes_the_metadata_so_a_retry_with_the_same_job_id_succeeds(self) -> None:
         # fable/sol major 1: metadata was placed and never rolled back when the job's OWN copy then
@@ -977,6 +1036,31 @@ class UmRunEndToEndTests(_Share):
         finally:
             proc.kill()
             proc.communicate()
+
+    def test_the_callers_not_after_reaches_the_agents_metadata(self) -> None:
+        # LEASE-REQUEST-CHILD-NOT-AFTER-1: um-run forwards -NotAfterUtc and never derives one itself.
+        instant = _future_not_after()
+        proc = subprocess.Popen(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(UM_RUN),
+             "-ScriptPath", str(self.job), "-AgentShare", str(self.share),
+             "-TimeoutSec", "3600", "-PollSeconds", "1", "-JobId", "demo",
+             "-NotAfterUtc", instant.strftime("%Y-%m-%dT%H:%M:%SZ")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            meta_path = self.inbox / "demo.meta.json"
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and not meta_path.exists() and proc.poll() is None:
+                time.sleep(0.2)
+            exists = meta_path.exists()
+            meta = json.loads(meta_path.read_text(encoding="ascii")) if exists else {}
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            stdout, stderr = proc.communicate()
+        output = _ANSI_ESCAPE.sub("", (stdout or "") + (stderr or ""))[-2000:]
+        self.assertTrue(exists, f"the drop must write the job's notAfterUtc: {output}")
+        self.assertEqual(meta["notAfterUtc"], _round_trip_utc(instant), output)
+        self.assertEqual(meta["timeoutSec"], 3600)
 
     def test_retracted_message_discloses_the_agents_own_stale_enumeration_window(self) -> None:
         # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 12 (sol BLOCKER / fable MINOR, item 1): RETRACTED

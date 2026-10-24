@@ -35,6 +35,8 @@
 #     refuses to proceed if a later read of the source no longer matches the pin admission handed
 #     back (sol, PR #140 r2 MAJOR: admission and placement used to be independent reads of the
 #     same source path, so a swap in THAT gap was never caught either).
+#   - LEASE-REQUEST-CHILD-NOT-AFTER-1: -NotAfterUtc, when given, is checked before the share is touched and written to the
+#     claim as notAfterUtc ('o' form, Z), the agent's absolute deadline for the job; absent, the claim's bytes are unchanged.
 #
 # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 10 (hub scope ruling reversed: sol proved BOTH round-9
 # premises false -- see summary.md). OWNERSHIP OF A JobId IS NOW CLAIMED ATOMICALLY, BY
@@ -594,6 +596,12 @@ function Invoke-UmRunDrop {
         # before this whole feature existed. um-run's -TimeoutSec now reaches the agent as the
         # job's own budget for a caller that does state one.
         [int]$JobTimeoutSec = 0,
+        # LEASE-REQUEST-CHILD-NOT-AFTER-1: the AGENT's absolute deadline for this job, written to
+        # inbox\<id>.meta.json as notAfterUtc. Past it the Bachelor agent never takes a quiet lease
+        # for the job and never runs it (result exitCode 125, notAfterExpired). An ISO-8601 instant
+        # with an explicit Z or +hh:mm offset, later than now; '' (the default) writes no field, so
+        # the claim's bytes are exactly what they were without it.
+        [string]$NotAfterUtc = '',
         [scriptblock]$Copier = { param($Source, $Destination) Copy-Item -LiteralPath $Source -Destination $Destination },
         [scriptblock]$PostAdmissionHook = { param($Source) },
         [scriptblock]$PreRenameRaceHook = { param($PartPath) },
@@ -617,6 +625,23 @@ function Invoke-UmRunDrop {
     # possibly multi-GB side-file transfer.
     if ($JobTimeoutSec -ne 0 -and ($JobTimeoutSec -lt 1 -or $JobTimeoutSec -gt 86400)) {
         throw "UMRUN_JOB_TIMEOUT_INVALID $JobTimeoutSec is outside the agent's accepted 1..86400 range"
+    }
+    # LEASE-REQUEST-CHILD-NOT-AFTER-1: checked here for the same reason. An offset-less time is
+    # ambiguous local time on whichever machine reads it, so it is refused rather than guessed.
+    $notAfterText = $null
+    if ($NotAfterUtc) {
+        $notAfterDto = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse($NotAfterUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$notAfterDto)) {
+            throw "UMRUN_NOT_AFTER_INVALID '$NotAfterUtc' does not parse as an ISO-8601 date and time"
+        }
+        if ($NotAfterUtc -notmatch '(Z|[+-]\d{2}:\d{2})$') {
+            throw "UMRUN_NOT_AFTER_INVALID '$NotAfterUtc' has no Z or +hh:mm offset (an offset-less time is ambiguous local time)"
+        }
+        if ($notAfterDto -le [DateTimeOffset]::UtcNow) {
+            throw "UMRUN_NOT_AFTER_INVALID '$NotAfterUtc' is not later than now ($([DateTime]::UtcNow.ToString('o')))"
+        }
+        # A string, never a DateTime, so ConvertTo-Json writes it exactly as here.
+        $notAfterText = $notAfterDto.UtcDateTime.ToString('o')
     }
     $id = if ($JobId) { $JobId } else { "job_{0}_{1}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'), ([guid]::NewGuid().ToString('N').Substring(0, 8)) }
     # Fast pre-checks, not the actual protection (the claim's own atomic rename below is): cheap,
@@ -650,6 +675,7 @@ function Invoke-UmRunDrop {
     $metaTmp = Join-Path $Inbox "$id.$nonce.meta.tmp"
     $metaObj = [ordered]@{ jobId = $id; nonce = $nonce }
     if ($JobTimeoutSec -ne 0) { $metaObj['timeoutSec'] = $JobTimeoutSec }
+    if ($null -ne $notAfterText) { $metaObj['notAfterUtc'] = $notAfterText }
     $metaJson = $metaObj | ConvertTo-Json -Compress
     try {
         Set-Content -LiteralPath $metaTmp -Value $metaJson -Encoding ascii -NoNewline
@@ -674,6 +700,7 @@ function Invoke-UmRunDrop {
     } else {
         Write-Output ("job claimed: {0}.meta.json (no budget requested)" -f $id)
     }
+    if ($null -ne $notAfterText) { Write-Output ("job not-after: {0}.meta.json notAfterUtc={1}" -f $id, $notAfterText) }
 
     # From here on, this call OWNS the claim above -- any failure in the side-file loop or the
     # job's own placement must roll that claim back (round 2/4's original guarantee, now covering
