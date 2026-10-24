@@ -181,14 +181,18 @@
         i. r14 (RETIRE-RESTORE-OWED-CHECKOUT-ATTEMPT-CAP-1): each failed run of the owed re-checkout adds 1 to checkoutAttempts in record.json
            (under the claim); at RestoreCheckoutMaxAttempts (5) the state is restored-checkout-gave-up and git is not run for that record
            again. Also: checkout-index exiting 1 with no output (every file already there) goes on to status instead of failing.
+        j. r15 (sol blocker on PR #645): the count is saved BEFORE git runs. If it cannot be saved git is not run: restored-unrepaired with a
+           note naming the save failure, never restored-checkout-gave-up, so "git is not run again" is only ever said of a durable count.
       renameRestore.state (and each sweep strandedRestore row / disposition.strandedRestore):
         not-renamed          no rename happened in this call
         retired              the rename was followed by a real retirement; the record is dropped
         restored             back at <root>, registered, record dropped
         restored-unrepaired  back at <root> but git does not list it there, or its owed re-checkout did not run; record kept, the next
                              call or sweep repairs it
-        restored-checkout-gave-up  back at <root>, registered, but the owed re-checkout failed RestoreCheckoutMaxAttempts times; terminal:
-                             record kept as the visible marker, reported by every call and sweep, git never re-run (note says how to finish by hand)
+        restored-checkout-gave-up  back at <root>, but the owed re-checkout failed RestoreCheckoutMaxAttempts times (the count is saved in the
+                             record BEFORE each git run); terminal: record kept as the visible marker, reported by every call and sweep, git
+                             never re-run, and the admin entry / `.git` link / worktree repair are not re-attempted either, so the tree may
+                             still be unregistered (note says how to finish by hand)
         failed               the rename back kept failing (or cannot-determine); <root>.retiring and the record stay for the next try
         refused              <root> exists again and <root>.retiring too; neither is touched, the record stays
         gone                 nothing left to restore (<root>.retiring absent and <root> absent or not this tree); the record is dropped
@@ -956,6 +960,18 @@ function Restore-LaneWorktreeRename {
         if ($needCheckout) {
             # r10: a re-checkout that did not run to the end is not 'restored'. It is restored-unrepaired, the state that already means "back at
             # <root>, the record stays and the next call or sweep finishes it"; the record keeps checkoutOwed, so that call runs this again.
+            # r15 (sol blocker on PR #645; catalogue row R-03: never claim terminal suppression while later calls still execute git): the run is
+            # counted in the record BEFORE git runs, so "attempts" means attempts that were recorded. A count that cannot be saved (a reader holds
+            # record.json) means git is not run this call: the state stays the non-terminal restored-unrepaired and the note names the failure,
+            # so neither a false "git is not run again" nor an endless unrecorded retry is possible. Success never gets past the checks below
+            # (the record is dropped), so it clears the count.
+            $coAttempts++
+            try { $Record | Add-Member -NotePropertyName checkoutAttempts -NotePropertyValue $coAttempts -Force; Write-RetirePendingRecordFile -Dir $RecordDir -Record $Record }
+            catch {
+                $notes += "the attempt count could not be saved ($($_.Exception.Message)); git was not run, because an attempt that cannot be recorded cannot count toward the cap of $($script:RestoreCheckoutMaxAttempts)"
+                $res.state = 'restored-unrepaired'; $res.note = ($notes -join '; ') + '; the rename record stays and the next call or sweep re-checks it out'
+                return $res
+            }
             $co = @(& git.exe -c core.longpaths=true -C $orig checkout-index -a -q 2>&1 | ForEach-Object { "$_" })
             # r14: `-q` hides git's "already exists" message but not its exit status: exit 1 with NO output means every tracked file is already
             # there (a retry after the status below failed, or after a partial earlier run). That is not a failure; status decides. Any real
@@ -971,10 +987,7 @@ function Restore-LaneWorktreeRename {
                 }
             }
             if ($needCheckout) {
-                # r14: count the failed run in the record, under this call's claim; success never gets here (the record is dropped), so it clears the count.
-                $coAttempts++
-                try { $Record | Add-Member -NotePropertyName checkoutAttempts -NotePropertyValue $coAttempts -Force; Write-RetirePendingRecordFile -Dir $RecordDir -Record $Record }
-                catch { $notes += "the attempt count could not be saved: $($_.Exception.Message)" }
+                # r14/r15: the count was saved before git ran, so reaching the cap here is durably recorded and the terminal claim is true.
                 if ($coAttempts -ge $script:RestoreCheckoutMaxAttempts) {
                     $res.state = 'restored-checkout-gave-up'; $res.note = ($notes -join '; ') + '; ' + (Get-RestoreCheckoutGaveUpNote $orig $RecordDir $coAttempts)
                     return $res

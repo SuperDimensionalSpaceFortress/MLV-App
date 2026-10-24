@@ -8,6 +8,7 @@ import base64
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -815,7 +816,9 @@ def _strand_registered(main, wt):
     """A cheap stranded state with git still registering the tree (at <wt>.retiring): a LOCKED worktree makes `git worktree remove` refuse
     up front (nothing deleted), and a seam makes every rename back fail with a sharing violation."""
     _git(main, "worktree", "lock", "--reason", "strand-test", str(wt))
-    prelude = ("$script:RestoreRetryBudgetMs = 300; $script:RestoreRetryDelayMs = 50; $origMoveSeam = ${function:Move-LaneWorktreeRoot}; "
+    # ONLY_PYTEST_CHILDREN: this fixture is about the rename back, not the host; an unrelated live pwsh whose cwd cannot be read would otherwise
+    # refuse the removal as cwd-unknown here, in setup, before any case reaches the behaviour it is written for.
+    prelude = (ONLY_PYTEST_CHILDREN + "$script:RestoreRetryBudgetMs = 300; $script:RestoreRetryDelayMs = 50; $origMoveSeam = ${function:Move-LaneWorktreeRoot}; "
                "function Move-LaneWorktreeRoot { param([string]$From, [string]$To) if ($From -like '*.retiring') { "
                "return 'The process cannot access the file because it is being used by another process. (seam)' }; & $origMoveSeam -From $From -To $To }; ")
     d, _ = _gate_real(wt, whatif=False, prelude=prelude)
@@ -1126,8 +1129,63 @@ def test_an_owed_checkout_that_keeps_failing_gives_up_visibly_after_the_cap_and_
     assert not (wt / "a.txt").exists(), "the tree is left as it is for the owner; nothing re-ran"
 
 
+RECORD_WRITE_FAILS = ("function Write-RetirePendingRecordFile { param([string]$Dir, [object]$Record) "
+                      "throw 'seam: record.json is held open by a reader' }; ")
+
+
+def _seed_record(rec_dir, **fields):
+    rec = _record_of(rec_dir)
+    rec.update(fields)
+    (rec_dir / "record.json").write_text(json.dumps(rec), encoding="utf-8")
+
+
+def test_a_record_write_that_fails_never_yields_a_terminal_claim_that_the_next_call_contradicts(repo):
+    """RETIRE-RESTORE-CHECKOUT-STATUS-FAILURE-FIXTURES-1 r2 (sol blocker on PR #645; catalogue row R-03: never claim terminal suppression while
+    later calls still execute git). checkoutOwed with 4 of 5 attempts recorded, git checkout-index failing, and record.json cannot be
+    rewritten (a reader holds it). The count used to be saved AFTER git ran: the failed save was only a note, the call still returned
+    restored-checkout-gave-up ('git is not run again'), and the next call ran git again from the unchanged count of 4. The count is now saved
+    BEFORE git runs; when that save fails git is not run at all and the state is the non-terminal restored-unrepaired, naming the save failure."""
+    cap = 5
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-save-fails")
+    _seed_record(rec_dir, checkoutOwed=True, checkoutAttempts=cap - 1)
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap) + RECORD_WRITE_FAILS
+    rows = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0] for _ in range(2)]
+    ran = len(log.read_text(encoding="utf-8").split()) if log.exists() else 0
+    assert not any(r["state"] == "restored-checkout-gave-up" for r in rows) or ran == 0, \
+        f"a terminal claim was made while git ran {ran} time(s): {rows}"
+    assert [r["state"] for r in rows] == ["restored-unrepaired"] * 2, rows
+    assert all("attempt count could not be saved" in r["note"] and "git was not run" in r["note"] for r in rows), rows
+    assert ran == 0, "an attempt that cannot be recorded is not made"
+    assert _record_of(rec_dir).get("checkoutAttempts") == cap - 1 and rec_dir.is_dir(), "the record is untouched and kept"
+
+
+def test_a_record_that_never_saves_cannot_run_git_for_ever_nor_lose_the_cap(repo):
+    """Opus hardening RETIRE-RESTORE-ATTEMPT-COUNT-PERSIST-FAIL-1 on PR #645: if the record cannot be written on any run, the count never
+    advanced past 1 and the cap never fired, so git re-ran on every call. Now git does not run while the count cannot be saved (bounded by
+    zero, not by the cap), every call says so, and once the record can be written again the cap counts from where it was and still fires."""
+    cap = 3
+    tmp, main, root, wt, rec_dir = _owed_checkout_fixture(repo, "wt-attempt-never-saves")
+    _seed_record(rec_dir, checkoutOwed=True)
+    log, flag = tmp / "git-fail.log", tmp / "git-fail.flag"
+    flag.write_text("fail", encoding="utf-8")
+    shim = _git_failure_shim(log, flag, "checkout-index", cap=cap)
+    states = []
+    for _ in range(cap + 2):
+        row = _sweep_with(main, root, tmp, shim + RECORD_WRITE_FAILS)["strandedRestore"][0]
+        states.append(row["state"])
+        assert "attempt count could not be saved" in row["note"], row
+    assert states == ["restored-unrepaired"] * (cap + 2), states
+    assert not log.exists() and "checkoutAttempts" not in _record_of(rec_dir), "no git call, nothing counted"
+    states = [_sweep_with(main, root, tmp, shim)["strandedRestore"][0]["state"] for _ in range(cap)]   # the record can be written again
+    assert states == ["restored-unrepaired"] * (cap - 1) + ["restored-checkout-gave-up"], states
+    assert len(log.read_text(encoding="utf-8").split()) == cap and _record_of(rec_dir).get("checkoutAttempts") == cap
+
+
 def test_the_owed_checkout_attempt_cap_is_a_named_script_constant_of_five():
-    assert "$script:RestoreCheckoutMaxAttempts = 5" in HELPER.read_text(encoding="utf-8")
+    # Exact: a substring match also accepted 50 or 500.
+    assert re.search(r"(?m)^\$script:RestoreCheckoutMaxAttempts = 5\s*(#.*)?$", HELPER.read_text(encoding="utf-8"))
 
 
 def test_the_helper_requires_powershell_7():
