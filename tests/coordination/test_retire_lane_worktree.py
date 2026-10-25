@@ -3515,3 +3515,94 @@ def test_launcher_census_r4_b1_a_caller_variable_read_by_a_dot_sourced_script_is
 ])
 def test_launcher_census_r4_a_literal_assigned_in_the_reading_scope_still_resolves(text):
     assert _unresolved_sites(text) == [], f"a same-scope literal was reported unresolved: {text!r}"
+
+
+# --- r5 (Dot advisory 6392164637 items 1-3, Grok CoS ask 6392177927 G1, hub ACK 6392234100): rule V still read a safe literal where
+# pwsh rebinds the name some other way: a scope-qualified write re-homed to the lexical scope, a later literal borrowed by an earlier
+# $script: read, Set-Variable's name taken from -Scope's value, and writes through the variable: drive, PSVariable or a Get-Variable
+# result. Every form below was run in pwsh with a harmless payload and does change what `iex $cmd` runs. Each must report the iex site.
+_R5_BUILT = "('Start-' + 'Process -FilePath pwsh -WindowStyle Hidden')"
+
+
+def _r5(writer):
+    return "$cmd='Write-Output ok'; " + writer + "; iex $cmd\n"
+
+
+def _r5_iex_is_unresolved(text):
+    sites = _unresolved_sites(text)
+    assert [ln for _, ln in sites if ln.startswith("iex $")], f"the executed $cmd was resolved to the safe literal: {text!r} -> {sites}"
+    assert _census_problems({_SYNTH: text}, {}, {}), f"the counterexample passed an empty inventory: {text!r}"
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param("$cmd='Start-'+'Process -FilePath pwsh -WindowStyle Hidden'; function Run-Code { $global:cmd='Write-Output ok'; iex $cmd }; "
+                 "Run-Code\n", id="dot1-global-write-in-a-function"),
+    pytest.param("iex $script:cmd; $script:cmd='Write-Output ok'\n", id="dot2-later-script-literal"),
+    pytest.param("$cmd='Write-Output ok'; Set-Variable -Scope Local cmd ('Start-'+'Process -FilePath pwsh -WindowStyle Hidden'); iex $cmd\n",
+                 id="dot3-set-variable-scope-then-positional-name"),
+])
+def test_launcher_census_r5_dot_qualified_write_ordering_and_set_variable_binding(text):
+    _r5_iex_is_unresolved(text)
+
+
+@pytest.mark.parametrize("writer", [
+    pytest.param("Set-Item -Path variable:cmd -Value " + _R5_BUILT, id="g1a-set-item"),
+    pytest.param("New-Item -Path variable:cmd -Value " + _R5_BUILT + " -Force", id="g1b-new-item"),
+    pytest.param("${variable:cmd} = " + _R5_BUILT, id="g1c-braced-variable-drive"),
+    pytest.param("$ExecutionContext.SessionState.PSVariable.Set('cmd', " + _R5_BUILT + ")", id="g1d-psvariable-set"),
+    pytest.param("(Get-Variable cmd).Value = " + _R5_BUILT, id="g1e-get-variable-value"),
+])
+def test_launcher_census_r5_g1_variable_drive_and_psvariable_writers(writer):
+    _r5_iex_is_unresolved(_r5(writer))
+
+
+# Further forms of the same classes (lane-found, each run in pwsh): spellings of the variable: path, the other item cmdlets, a path or a
+# PSVariable held in a variable, the provider API, aliases, and a removal that lets a function read its caller's value.
+@pytest.mark.parametrize("writer", [
+    pytest.param("Set-Item variable:\\cmd " + _R5_BUILT, id="variable-drive-backslash"),
+    pytest.param("Set-Item -LiteralPath 'Microsoft.PowerShell.Core\\Variable::cmd' -Value " + _R5_BUILT, id="provider-qualified-path"),
+    pytest.param("$variable:cmd = " + _R5_BUILT, id="dollar-variable-drive"),
+    pytest.param("$other = " + _R5_BUILT + "; Clear-Item variable:cmd; Rename-Item variable:other cmd -Force", id="rename-item"),
+    pytest.param("$other = " + _R5_BUILT + "; Copy-Item variable:other variable:cmd -Force", id="copy-item"),
+    pytest.param("Set-Content variable:cmd " + _R5_BUILT, id="set-content"),
+    pytest.param("$p = 'variable:cmd'; Set-Item $p " + _R5_BUILT, id="path-held-in-a-variable"),
+    pytest.param("$pv = $ExecutionContext.SessionState.PSVariable; $pv.Set('cmd', " + _R5_BUILT + ")", id="psvariable-held-in-a-variable"),
+    pytest.param("$v = Get-Variable cmd; $v.Value = " + _R5_BUILT, id="get-variable-result-held-in-a-variable"),
+    pytest.param("(Get-Item variable:cmd).Value = " + _R5_BUILT, id="get-item-variable-value"),
+    pytest.param("$ExecutionContext.SessionState.InvokeProvider.Item.Set('variable:cmd', " + _R5_BUILT + ")", id="invoke-provider"),
+    pytest.param("New-Variable -Force -Scope Local cmd " + _R5_BUILT, id="new-variable-switch-and-scope-first"),
+    pytest.param("Set-Variable -Scope 0 -Option None cmd " + _R5_BUILT, id="set-variable-two-named-first"),
+    pytest.param("set cmd " + _R5_BUILT, id="set-alias"),
+])
+def test_launcher_census_r5_more_writers_that_rebind_the_name(writer):
+    _r5_iex_is_unresolved(_r5(writer))
+
+
+@pytest.mark.parametrize("text", [
+    # a function that removes its own $cmd reads its caller's
+    pytest.param("$cmd = " + _R5_BUILT + "; function F { $cmd='Write-Output ok'; Remove-Variable cmd; iex $cmd }; F\n", id="remove-variable-fallback"),
+    # dot-sourced into a function, the file's top level is that function's scope, not the script scope
+    pytest.param("$cmd='Write-Output ok'; iex $script:cmd\n", id="script-read-after-an-unqualified-literal"),
+    pytest.param("$script:cmd='Write-Output ok'; iex $cmd\n", id="unqualified-read-after-a-script-literal"),
+])
+def test_launcher_census_r5_scope_crossing_reads_are_unresolved(text):
+    _r5_iex_is_unresolved(text)
+
+
+# Controls (pass on every scanner): the two writers rule V already saw stay one site, and a safe literal with no other writer of its name
+# (another name bound by Set-Variable -Scope, or a local:/private: write in the reading scope) stays resolved.
+@pytest.mark.parametrize("writer", ["$cmd = " + _R5_BUILT, "Set-Variable cmd " + _R5_BUILT])
+def test_launcher_census_r5_control_writers_stay_one_site(writer):
+    sites = _unresolved_sites(_r5(writer))
+    assert [ln for _, ln in sites] == ["iex $cmd"], f"a writer rule V already saw is no longer exactly one site: {sites}"
+
+
+@pytest.mark.parametrize("text", [
+    "$cmd='Write-Output ok'; iex $cmd\n",
+    "$cmd='Write-Output ok'; Set-Variable -Scope Local other " + _R5_BUILT + "; iex $cmd\n",
+    "$local:cmd='Write-Output ok'; iex $cmd\n",
+    "function Run-Code { $private:c = 'Write-Output ok'; iex $c }\n",
+    "$script:cmd='Write-Output ok'; iex $script:cmd\n",
+])
+def test_launcher_census_r5_control_a_safe_same_scope_literal_stays_resolved(text):
+    assert _unresolved_sites(text) == [], f"a safe same-scope literal with no other writer was reported unresolved: {text!r}"
