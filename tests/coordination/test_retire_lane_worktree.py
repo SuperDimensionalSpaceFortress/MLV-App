@@ -2967,51 +2967,197 @@ def test_b2_gate_keeps_a_worktree_whose_encoded_driver_names_only_its_run_dir(re
 # launch site that starts PowerShell from base64 or detaches a process is listed here with the reason it is safe, so a new one fails
 # this census until someone classifies it, instead of slipping past Get-WorktreeLiveRefusal.
 
-CENSUS_ROOTS = ("tools/coordination", "tools/profiling")
-ENCODED_RX = re.compile(r"-EncodedCommand\b|['\"]-ec['\"]", re.I)
-DETACHED_RX = re.compile(r"Start-Process\b[^\n]*-WindowStyle\s+Hidden|Win32_Process[^\n]*\bCreate\b|\[wmiclass\]", re.I)
+# LAUNCHER-CENSUS-ROOTS-AND-DOCTRINE-SCOPE-1: the census used to walk only tools/coordination and tools/profiling, so tracked launch sites
+# elsewhere (tools/agent-bridge, tools/closeout, ...) were invisible. A git pathspec `*` crosses `/`, so these cover every tracked script.
+CENSUS_PATHSPECS = ("*.ps1", "*.psm1")
+CENSUS_EXCLUDED = ("tools/coordination/Retire-LaneWorktree.ps1",)  # the guard decodes -EncodedCommand; it launches nothing
+# Sites are read from the PowerShell AST by tests/coordination/Test-LaunchSites.ps1 (rules in its header; seam: _encoded_sites,
+# _detached_sites, _unresolved_sites below). Per-SITE inventories: {path: [(pin, reason), ...]}. The pin is a stable substring of the site
+# text (the launching pipeline, or the statement around a string, with comments and line continuations dropped and whitespace collapsed);
+# the list length is the expected site COUNT in that file. A new site in a classified file, or a pinned site that moved or vanished, fails
+# the census just as a new file does.
 ENCODED_LAUNCH_SITES = {
-    "tools/coordination/Invoke-Lane.ps1":
-        "the Claude-engine job host (pwsh -EncodedCommand $hostSource) is not a driver: it waits on its claude.exe child, whose argv "
-        "names <RunDir> through --settings <RunDir>\\<lane>-NNN.settings.json and whose pid is written to <RunDir>\\<lane>-NNN.child.json",
-    "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1":
-        "Invoke-Child -CommandText: a synchronous child, waited for and killed at -MaxTotalSec, never a detached driver",
-    "tools/profiling/bachelor/ultra-magnus-agent.ps1":
-        "the heavy-slot sentinel runs on the venue host, never against a hub lane worktree",
+    "tools/agent-bridge/wake_codex.ps1": [
+        ('"-EncodedCommand",',
+         "the UIA wake helper (-RunInnerWake body): a synchronous child, waited for at $TotalRuntimeTimeoutSeconds and killed on overrun; it drives "
+         "the Codex Desktop window and holds no lane worktree, so it is never a lane driver the retire guard has to find"),
+    ],
+    "tools/coordination/Invoke-Lane.ps1": [
+        ("'-ExecutionPolicy','Bypass','-EncodedCommand',$encoded",
+         "the Claude-engine job host (pwsh -EncodedCommand $hostSource) is not a driver: it waits on its claude.exe child, whose argv "
+         "names <RunDir> through --settings <RunDir>\\<lane>-NNN.settings.json and whose pid is written to <RunDir>\\<lane>-NNN.child.json"),
+    ],
+    "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
+        ("'-NonInteractive', '-EncodedCommand', [Convert]::ToBase64String",
+         "Invoke-Child -CommandText: a synchronous child, waited for and killed at -MaxTotalSec, never a detached driver"),
+    ],
+    "tools/profiling/bachelor/ultra-magnus-agent.ps1": [
+        ('"-EncodedCommand", (New-HeavySlotSentinelCommand',
+         "the heavy-slot sentinel runs on the venue host, never against a hub lane worktree"),
+    ],
 }
+# Sites below that earlier censuses never saw (multi-line Start-Process under a backtick, or a root outside tools/coordination + tools/profiling)
+# are classified from reading the launching statement: none starts a PowerShell driver that holds a lane worktree, and none is OPEN.
 DETACHED_LAUNCH_SITES = {
-    "tools/coordination/autopilot/product-share.ps1":
-        ("'-File', \"`\"$PSCommandPath`\"\"", "the verdict worker re-launches this script with -File; it holds no lane worktree"),
-    "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1":
-        ("Start-Process -FilePath (Join-Path $Cache $PresentMonName)", "venue-side job: PresentMon / python helpers, not PowerShell drivers"),
+    "tools/agent-bridge/wake_codex.ps1": [
+        ('Start-Process -FilePath "powershell.exe" -ArgumentList $argumentList -WindowStyle Hidden -PassThru',
+         "carries the -EncodedCommand site above: the wake helper is waited on with a hard timeout and killed on overrun, not left running"),
+    ],
+    "tools/build-release.ps1": [
+        ("Start-Process -FilePath $destExe -ArgumentList '--batch','--help'",
+         "smoke probe of the freshly built MLV-App exe with redirected output; not PowerShell, no lane worktree"),
+    ],
+    "tools/closeout/start-closeout-dashboard.ps1": [
+        ("Start-Process -FilePath $pythonExe -ArgumentList $argumentString -WorkingDirectory $resolvedRepo",
+         "python closeout dashboard server (-m tools.repo_hygiene.closeout_dashboard --repo-root): not a PowerShell lane driver; its cwd is the "
+         "repo it serves, which the guard's cwd probe reads"),
+    ],
+    "tools/coordination/autopilot/product-share.ps1": [
+        ("Start-Process -FilePath $exe -ArgumentList $argList -WindowStyle Hidden",
+         "the verdict worker re-launches this script with -File; it holds no lane worktree"),
+    ],
+    "tools/profiling/bachelor/playback-attr-3-cuda-assemble.ps1": [
+        ("Start-Process -FilePath $releaseExe -ArgumentList '--batch', '--help'",
+         "venue-side smoke probe of the assembled release exe; not PowerShell, no lane worktree"),
+    ],
+    "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [
+        ("Start-Process -FilePath (Join-Path $Cache $PresentMonName) -ArgumentList $pmArgs",
+         "venue-side job: PresentMon / python helpers, not PowerShell drivers"),
+        ("-ArgumentList @('--session_name', $SessionName",
+         "venue-side job: PresentMon session teardown helper, not a PowerShell driver"),
+        ("Start-Process -FilePath $candidate.exe -ArgumentList $depsArgs",
+         "venue-side job: dependency probe exe, not a PowerShell driver"),
+        ("Start-Process -FilePath $contactSheetPyExe -ArgumentList $composeArgs",
+         "venue-side job: python contact-sheet composer, not a PowerShell driver"),
+    ],
+    "tools/profiling/install-ultra-magnus-agent.ps1": [
+        ('"-File",$AgentScript) -WindowStyle Hidden',
+         "installs the venue-host agent with -File and its script path on the command line; runs on the venue host, never against a hub lane worktree"),
+    ],
+    "tools/profiling/measure-gpu-vram.ps1": [
+        ('Start-Process -FilePath $probe -ArgumentList @("$($r.w)"',
+         "venue-side VRAM probe exe with redirected output; not PowerShell, no lane worktree"),
+        ('-ArgumentList @("1808","2268","4000")',
+         "venue-side VRAM probe exe with redirected output; not PowerShell, no lane worktree"),
+    ],
+    "tools/profiling/ultra-magnus-agent.ps1": [
+        ('"-File", $jobPathArgument)',
+         "the venue-host agent runs a dropped job with -File <job path> under a wall-clock timeout that kills the root and its descendants; "
+         "it never runs against a hub lane worktree"),
+    ],
+}
+# r3: strings that are EXECUTED ([scriptblock]::Create, .AddScript, iex, pwsh -Command) but built at run time, so no scanner can read the
+# code they will run. Each is classified from reading how the string is built: its literal parts are scanned by rule S (and hold no launch),
+# and the variable parts are paths, numbers or a caller's { } literal. A new one fails the census until it is classified here.
+UNRESOLVED_EXECUTED_SITES = {
+    "tools/coordination/build-guard.ps1": [
+        ('[scriptblock]::Create("[CmdletBinding()] param()`n" + $fragment)',
+         "the -Command build fragment its caller hands build-guard (mingw32-make / qmake lines), run in-process and waited on under the host "
+         "memory guard; a tracked caller passes it as a literal, which rule S scans in the caller's own file"),
+    ],
+    "tools/profiling/bachelor/AttrCudaArtifacts.psm1": [
+        ("[void]$shell.AddScript($loopScript)",
+         "r5 rule V2: $loopScript is the { } literal at :6242 in the same function (Start-AttrCudaDisplayWakeKeepAlive), its only writer, "
+         "which the AST scans as code; it is unresolved because this module's item cmdlets take non-constant paths (Copy-Item / "
+         "Move-Item / Remove-Item -LiteralPath $var), none of them on the variable: drive"),
+    ],
+    "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [
+        ("-ExecutionPolicy Bypass -Command $cmd 1>",
+         "$cmd is the smoke-script call `& <smoke.ps1> -ExePath .. -Input .. -Output ..` built at :2701 (+ :2740 / :4696 argument appends): "
+         "quoted paths and numbers, a synchronous venue-side child that is waited on, never a hub lane driver"),
+        ("-ExecutionPolicy Bypass -Command $preCmd 1>",
+         "inside the self-heal pre-launch block this job writes into its own copy: $preCmd is $cmd with the output path and environment list "
+         "swapped (.Replace), the same synchronous venue-side smoke call"),
+    ],
+    "tools/profiling/bachelor/reference-frame-runner-job.ps1": [
+        ("-Command $captureCommand",
+         "$captureCommand is `& '<bundle capture script>' -Exe .. -Clip .. -OutDir ..` plus an exit-code suffix (:585, :588): quoted paths and "
+         "numbers, a synchronous venue-side capture"),
+    ],
+    "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1": [
+        ("[void]$ps.AddScript($Script.ToString())",
+         "Invoke-Bounded runs its caller's [scriptblock] on a worker runspace; both callers in this file pass a { } literal (a Test-Path / "
+         "Get-FileHash read), which the AST scans as code"),
+    ],
+    "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
+        ("[void]$ps.AddScript($Script.ToString())",
+         "the same Invoke-Bounded pattern: every caller in this file hands it a { } literal share read, which the AST scans as code"),
+    ],
+    "tools/profiling/dual-venue/Summarize-VenueBusyProbes.ps1": [
+        (". ([scriptblock]::Create($fn[0].Extent.Text))",
+         "r4 (from #661): dot-sources the text of the one FunctionDefinitionAst named Get-VenueQuietDecision (-ceq, exactly one) parsed "
+         "from -DecisionSource, which defaults to the tracked Wait-VenueQuiet.ps1 beside it (:42); that pure function (:134-148) is scanned "
+         "in its own file. Dot-sourcing a definition only defines the function, which is then called in-process at :118"),
+    ],
+    "tools/profiling/dual-venue/VenueChain.psm1": [
+        ("[void]$ps.AddScript($ScriptText)",
+         "Invoke-VenueBoundedRead runs a share read on a worker runspace; its callers in this module pass a { } literal's text or a "
+         "single-quoted Test-Path literal, both scanned as code"),
+        ("$step = [scriptblock]::Create($Body)",
+         "r4 (from #633): inside the keeper-loop here-string ($script:VenueKeeperLoop); $Body is Start-VenueKeeper -StepText, and both "
+         "callers in this module (Start-VenueClaimKeeper, Start-VenueJobLiveness) pass a single-quoted here-string $step that rule S scans "
+         "in place; it runs on an in-process worker runspace"),
+        ("& ([scriptblock]::Create($A.writeText)) $w",
+         "r4 (from #633): inside Start-VenueJobLiveness's step here-string; $A.writeText is $script:LivenessWriteText, the single-quoted "
+         "here-string liveness-sidecar write at :822 that rule S scans in place"),
+        ("[void]$ps.AddScript($script:VenueKeeperLoop)",
+         "r5 rule V2: Start-VenueKeeper runs $script:VenueKeeperLoop, the single-quoted here-string assigned once at top level (:744), "
+         "which rule S scans in place (the keeper-step row above is inside it); it is unresolved because this module's New-Item / "
+         "Remove-Item take non-constant paths, none of them on the variable: drive"),
+    ],
+    "tools/profiling/dual-venue/Wait-VenueQuiet.ps1": [
+        ("[void]$pp.AddScript($IdentityWorkerPrelude)",
+         "r4 rule V: $IdentityWorkerPrelude is assigned '' at script scope (:516) and read inside Get-IdentWorker, another scope. Empty in "
+         "production (and guarded by `if ($IdentityWorkerPrelude)`); only test_dual_venue_evidence.py rewrites that literal in its own "
+         "copy, to re-declare command shadows in the in-process identity worker runspace"),
+        ("[void]$ps.AddScript($Script)",
+         "r4 (from #633): Invoke-IdentBounded runs one identity read on its worker runspace; its four callers pass $IdentCimScript, "
+         "$IdentOwnerScript, $IdentScriptCheckScript or $IdentGpuScript, each a { } literal's .ToString() (:640-683) that the AST scans as code"),
+    ],
+    "tools/profiling/ultramagnus/playback-attr-3-cuda-dll-job.ps1": [
+        ("-Command $reconCommand",
+         "$reconCommand is `& <recon script> -Dir <backend> -CudaArchitectures <list>` (:347): a synchronous venue-side build step"),
+        ("-Command $amazeCommand",
+         "$amazeCommand is `& <amaze script> -Dir <backend> -Arch <label>` (:368): a synchronous venue-side build step"),
+    ],
 }
 
 
 def _census_sources():
-    out = subprocess.run([GIT, "-C", str(REPO), "ls-files", "--", *[f"{r}/*.ps1" for r in CENSUS_ROOTS], *[f"{r}/*.psm1" for r in CENSUS_ROOTS]],
-                         check=True, capture_output=True, text=True).stdout.split()
+    out = subprocess.run([GIT, "-C", str(REPO), "ls-files", "-z", "--", *CENSUS_PATHSPECS],
+                         check=True, capture_output=True, text=True).stdout.split("\0")
     return {p: (REPO / p).read_text(encoding="utf-8", errors="replace") for p in out
-            if p != "tools/coordination/Retire-LaneWorktree.ps1" and "/test" not in p.lower() and not Path(p).name.lower().startswith("test")}
+            if p and p not in CENSUS_EXCLUDED and "/test" not in p.lower() and not Path(p).name.lower().startswith("test")}
 
 
 def test_launcher_census_every_encoded_command_launch_site_is_classified():
-    found = {p for p, t in _census_sources().items() if ENCODED_RX.search(t)}
-    new = sorted(found - set(ENCODED_LAUNCH_SITES))
-    assert not new, ("new -EncodedCommand launch site(s): " + ", ".join(new) + ". Start a lane driver with -File and its run dir on the "
-                     "command line, or classify the site in ENCODED_LAUNCH_SITES with the reason the retire guard still sees it.")
-    gone = sorted(set(ENCODED_LAUNCH_SITES) - found)
-    assert not gone, f"classified -EncodedCommand site(s) no longer found, drop them from the census: {gone}"
+    src = _census_sources()
+    assert src, "git ls-files returned no PowerShell scripts: the census would pass on nothing"
+    problems = _census_problems(src, ENCODED_LAUNCH_SITES, {}, kinds=("encoded",))
+    assert not problems, ("\n".join(problems) + "\nStart a lane driver with -File and its run dir on the command line, or classify the "
+                          "site in ENCODED_LAUNCH_SITES with the reason the retire guard still sees it (drop an entry whose site is gone).")
 
 
 def test_launcher_census_every_detached_launch_site_is_classified():
     src = _census_sources()
-    found = {p for p, t in src.items() if DETACHED_RX.search(t)}
-    new = sorted(found - set(DETACHED_LAUNCH_SITES))
-    assert not new, ("new detached launch site(s): " + ", ".join(new) + ". Launch PowerShell drivers with -File and the run dir on the "
-                     "command line, then classify the site in DETACHED_LAUNCH_SITES.")
-    for p, (pin, why) in DETACHED_LAUNCH_SITES.items():
-        assert p in found and pin in src[p], f"{p}: pinned launch shape moved ({why}); re-check it against the retire guard"
-        assert not ENCODED_RX.search(src[p]), f"{p} now carries -EncodedCommand; a detached driver must start with -File"
+    assert src, "git ls-files returned no PowerShell scripts: the census would pass on nothing"
+    problems = _census_problems(src, {}, DETACHED_LAUNCH_SITES, kinds=("detached",))
+    assert not problems, ("\n".join(problems) + "\nLaunch PowerShell drivers with -File and the run dir on the command line, then "
+                          "classify the site in DETACHED_LAUNCH_SITES (drop an entry whose site is gone).")
+    for p, entries in DETACHED_LAUNCH_SITES.items():
+        for pin, why in entries:
+            site = next(ln for _, ln in _detached_sites(src[p]) if pin in ln)
+            assert not _encoded_sites(site), f"{p}: a detached launch now carries -EncodedCommand ({why}); a detached driver must start with -File"
+    assert "'-File', \"`\"$PSCommandPath`\"\"" in src["tools/coordination/autopilot/product-share.ps1"], "product-share no longer re-launches itself with -File"
+
+
+def test_launcher_census_every_executed_string_built_at_run_time_is_classified():
+    """r3: a string run by [scriptblock]::Create / .AddScript / iex / pwsh -Command that the scanner cannot resolve could carry any launch."""
+    src = _census_sources()
+    assert src, "git ls-files returned no PowerShell scripts: the census would pass on nothing"
+    problems = _census_problems(src, {}, {}, kinds=("unresolved",), unresolved_inventory=UNRESOLVED_EXECUTED_SITES)
+    assert not problems, ("\n".join(problems) + "\nBuild the executed string from literals the census can read, or classify the site in "
+                          "UNRESOLVED_EXECUTED_SITES with what the string is built from (drop an entry whose site is gone).")
 
 
 def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir():
@@ -3023,3 +3169,569 @@ def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir(
     assert '$controlPath = "$base.child.json"' in t and "pid=$child.Id" in t, "child pid is no longer recorded in the run dir"
     host = t.split("$hostSource = @'", 1)[1].split("'@", 1)[0]
     assert "-File" not in host and "Start-Process" not in host and "WaitForExit()" in host, "the encoded host must only wait on its child"
+
+
+# --- LANE-RETIRE-LAUNCH-SITE-CENSUS-1 / LAUNCHER-CENSUS-ROOTS-AND-DOCTRINE-SCOPE-1: the census classifies launch SITES, not files.
+# These fixtures run against synthetic source text through the same seam the real census uses (_encoded_sites, _detached_sites,
+# _census_problems), so a site the census cannot see fails here without anyone adding a real launcher script to the repo.
+
+B64 = "UwB0AGEAcgB0AC0AUwBsAGUAZQBwACAAMQAw"
+
+
+# r3 (hub ruling): sites are read from the PowerShell parser's own AST by Test-LaunchSites.ps1 beside this file, not by a Python tokenizer;
+# its header writes down every rule (pwsh's -EncodedCommand prefix rule, Start-Process's own WindowStyle prefixes, executed strings).
+# One pwsh process scans a whole batch of sources; results are cached per source text.
+SITE_SCANNER = Path(__file__).resolve().with_name("Test-LaunchSites.ps1")
+_SITE_CACHE = {}
+
+
+def _scan_sites(texts):
+    """Fill _SITE_CACHE for every text not yet scanned, in one pwsh call. Raises if the scanner fails: a census that cannot scan never passes."""
+    todo = list(dict.fromkeys(t for t in texts if t not in _SITE_CACHE))
+    if not todo:
+        return
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(SITE_SCANNER)], input=json.dumps({str(i): t for i, t in enumerate(todo)}),
+                       capture_output=True, text=True, encoding="utf-8", timeout=900)
+    assert r.returncode == 0, f"launch-site scanner failed (exit {r.returncode}): {r.stderr[-2000:]}"
+    got = json.loads(r.stdout)
+    for i, t in enumerate(todo):
+        _SITE_CACHE[t] = tuple((s["kind"], s["line"], s["text"]) for s in got[str(i)])
+
+
+def _sites(text, kind):
+    _scan_sites([text])
+    return [(n, ln) for k, n, ln in _SITE_CACHE[text] if k == kind]
+
+
+def _encoded_sites(text):
+    """Launch sites that hand PowerShell a base64 program: one (line, site text) per site (Test-LaunchSites.ps1 rules E1/E2/S)."""
+    return _sites(text, "encoded")
+
+
+def _detached_sites(text):
+    """Hidden Start-Process and Win32_Process Create sites: one (line, site text) per site (Test-LaunchSites.ps1 rules D1/D2/S)."""
+    return _sites(text, "detached")
+
+
+def _unresolved_sites(text):
+    """Executed strings built at run time, splats with no literal behind them, and unparsable sources (Test-LaunchSites.ps1 rule X)."""
+    return _sites(text, "unresolved")
+
+
+def _census_problems(sources, encoded_inventory, detached_inventory, kinds=("encoded", "detached", "unresolved"), unresolved_inventory=None):
+    """Per-SITE comparison: inventory[path] is a list of (pin, reason), one entry per expected site, the pin a substring of the site text.
+    A site no entry claims is unclassified; an entry no site claims has vanished. Two identical sites need two entries. An `unresolved`
+    site (a string executed but built at run time) fails like an unclassified launch until UNRESOLVED_EXECUTED_SITES classifies it."""
+    _scan_sites(sources.values())
+    problems = []
+    for kind, finder, inventory in (("encoded", _encoded_sites, encoded_inventory), ("detached", _detached_sites, detached_inventory),
+                                    ("unresolved", _unresolved_sites, unresolved_inventory or {})):
+        if kind not in kinds:
+            continue
+        for path in sorted(set(sources) | set(inventory)):
+            left = list(finder(sources[path])) if path in sources else []
+            for pin, _why in inventory.get(path, ()):
+                hit = next((s for s in left if pin in s[1]), None)
+                if hit is None:
+                    problems.append(f"{kind}: {path}: classified site no longer found: {pin!r}")
+                else:
+                    left.remove(hit)
+            problems += [f"{kind}: {path}:{n}: unclassified launch site: {ln.strip()[:140]}" for n, ln in left]
+    return problems
+
+
+_ENC_LAUNCH_A = "$args1 = @('-NoLogo', '-NoProfile', '-EncodedCommand', $encodedA)"
+_ENC_LAUNCH_B = "$args2 = @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encodedB)"
+_DET_LAUNCH_A = "Start-Process -FilePath $exeA -ArgumentList $listA -WindowStyle Hidden | Out-Null"
+_DET_LAUNCH_B = "Start-Process -FilePath $exeB -ArgumentList $listB -WindowStyle Hidden | Out-Null"
+_SYNTH = "tools/synthetic/Launch.ps1"
+
+
+def test_launcher_census_second_encoded_launch_in_a_classified_file_is_unclassified():
+    inventory = {_SYNTH: [(_ENC_LAUNCH_A, "classified")]}
+    one = {_SYNTH: _ENC_LAUNCH_A + "\n"}
+    assert _census_problems(one, inventory, {}) == [], "the fixture's one classified site must pass"
+    two = {_SYNTH: _ENC_LAUNCH_A + "\n# between\n" + _ENC_LAUNCH_B + "\n"}
+    assert _census_problems(two, inventory, {}), "a second -EncodedCommand launch added to a classified file slipped through the census"
+
+
+def test_launcher_census_identical_second_encoded_launch_line_is_counted():
+    inventory = {_SYNTH: [(_ENC_LAUNCH_A, "classified")]}
+    twice = {_SYNTH: _ENC_LAUNCH_A + "\n" + _ENC_LAUNCH_A + "\n"}
+    assert _census_problems(twice, inventory, {}), "a duplicated classified launch line slipped through the census"
+
+
+def test_launcher_census_second_detached_launch_in_a_classified_file_is_unclassified():
+    inventory = {_SYNTH: [(_DET_LAUNCH_A, "classified")]}
+    assert _census_problems({_SYNTH: _DET_LAUNCH_A + "\n"}, {}, inventory) == []
+    two = {_SYNTH: _DET_LAUNCH_A + "\n" + _DET_LAUNCH_B + "\n"}
+    assert _census_problems(two, {}, inventory), "a second detached launch added to a classified file slipped through the census"
+
+
+def test_launcher_census_detached_launch_split_over_backtick_continuation_lines_is_found():
+    text = "$p = Start-Process -FilePath $exe -ArgumentList $list `\n    -PassThru -WindowStyle Hidden\n"
+    assert len(_detached_sites(text)) == 1, "a hidden Start-Process split across continuation lines is not seen"
+
+
+# --- r2 (Dot advisory 6390752487): the census scanner is statement- and quote-aware.
+# B1: `;` separates statements, so `<pinned launch A>; <launch B>` on ONE line is two sites, not one.
+# B2: `<#` / `#>` only open and close a block comment outside a string, so a quoted '<#' ... '#>' pair cannot hide the code between them.
+
+def test_launcher_census_b1_same_line_semicolon_second_encoded_launch_is_unclassified():
+    inventory = {_SYNTH: [(_ENC_LAUNCH_A, "classified")]}
+    text = _ENC_LAUNCH_A + "; " + _ENC_LAUNCH_B + "\n"
+    assert len(_encoded_sites(text)) == 2, "a `;`-separated second -EncodedCommand launch was folded into the first site"
+    problems = _census_problems({_SYNTH: text}, inventory, {})
+    assert problems and any("unclassified" in p for p in problems), "the pinned first launch consumed the unpinned second one on the same line"
+
+
+def test_launcher_census_b1_same_line_semicolon_second_detached_launch_is_unclassified():
+    inventory = {_SYNTH: [(_DET_LAUNCH_A, "classified")]}
+    text = _DET_LAUNCH_A + "; " + _DET_LAUNCH_B + "\n"
+    assert len(_detached_sites(text)) == 2, "a `;`-separated second detached launch was folded into the first site"
+    problems = _census_problems({_SYNTH: text}, {}, inventory)
+    assert problems and any("unclassified" in p for p in problems), "the pinned first launch consumed the unpinned second one on the same line"
+
+
+def test_launcher_census_b2_quoted_block_comment_markers_cannot_hide_an_encoded_launch():
+    text = "Write-Host '<#'\n" + _ENC_LAUNCH_B + "\nWrite-Host '#>'\n"
+    assert len(_encoded_sites(text)) == 1, "a quoted '<#' ... '#>' pair hid the -EncodedCommand launch between them"
+    assert _census_problems({_SYNTH: text}, {}, {}), "the census passes a file whose only launch sits between quoted comment markers"
+
+
+def test_launcher_census_b2_quoted_block_comment_markers_cannot_hide_a_detached_launch():
+    text = "Write-Host '<#'\n" + _DET_LAUNCH_B + "\nWrite-Host '#>'\n"
+    assert len(_detached_sites(text)) == 1, "a quoted '<#' ... '#>' pair hid the detached launch between them"
+    assert _census_problems({_SYNTH: text}, {}, {}), "the census passes a file whose only launch sits between quoted comment markers"
+
+
+def test_launcher_census_b1_semicolon_inside_a_quoted_string_is_not_a_statement_split():
+    first = "Start-Process -FilePath $exeA -ArgumentList 'x;y' -WindowStyle Hidden"
+    sites = _detached_sites(first + "; " + _DET_LAUNCH_B + "\n")
+    assert len(sites) == 2, "the `;` after the quoted argument was not treated as a statement separator"
+    assert "'x;y'" in sites[0][1] and sites[0][1].endswith("-WindowStyle Hidden"), "a `;` inside a quoted string split its own statement"
+    assert len(_detached_sites(first + "\n")) == 1, "a `;` inside a quoted string produced a false second site"
+
+
+def test_launcher_census_b2_real_comments_and_comment_markers_inside_strings_and_here_strings():
+    block = "<#\n" + _ENC_LAUNCH_A + "\n#>\n# " + _ENC_LAUNCH_B + "\n"
+    assert _encoded_sites(block) == [], "a launch inside a real comment was counted"
+    quoted = '$m = "see <# not a comment"\n' + _DET_LAUNCH_A + "\n"
+    assert len(_detached_sites(quoted)) == 1, "a `<#` inside a double-quoted string swallowed the launch after it"
+    here = "$h = @'\n<# not a comment in a here-string\n'@\n" + _DET_LAUNCH_B + "\n"
+    assert len(_detached_sites(here)) == 1, "a `<#` inside a here-string swallowed the launch after it"
+    trailing = _DET_LAUNCH_A + " # trailing comment; " + _DET_LAUNCH_B + "\n"
+    assert len(_detached_sites(trailing)) == 1, "a launch inside a trailing # comment was counted"
+
+
+@pytest.mark.parametrize("line", [
+    "& pwsh -NoProfile -e " + B64,
+    "& pwsh.exe -NoProfile -enc " + B64,
+    "powershell.exe -NoProfile -ec " + B64,
+    "pwsh -encodedc " + B64,
+    "pwsh /EncodedCommand " + B64,
+    "pwsh /enc " + B64,
+    "pwsh /e " + B64,
+    "$a = @('-NoProfile', '-enc', $encoded)",
+    "$a = @('-NoProfile', '-e', $encoded)",
+    "$a = @('-ec', $encoded)",
+    "$cl = '\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -NoProfile -EncodedCommand ' + $encoded",
+])
+def test_launcher_census_every_pwsh_spelling_of_the_encoded_switch_is_matched(line):
+    assert len(_encoded_sites(line + "\n")) == 1, f"encoded-command spelling not matched: {line}"
+
+
+@pytest.mark.parametrize("line", [
+    "Get-Process -ErrorAction SilentlyContinue",
+    "Get-ChildItem -Path $p -Exclude '*.log'",
+    "if ($a -eq 1) { $b }",
+    "Set-Content -Path $f -Encoding utf8 -Value $v",
+    "Set-Content -Path $f -enc utf8 -Value $v",
+    "# pwsh -NoProfile -e " + B64,
+    "git cat-file -e abcdef1234",
+    "$r = Invoke-Git @('cat-file', '-e', \"$sha^{commit}\")",
+    "$msg = 'usage: tool -e " + B64 + "'",
+    "Write-Host 'the -EncodedCommand switch is documented elsewhere'",
+])
+def test_launcher_census_look_alikes_of_the_encoded_switch_are_not_matched(line):
+    assert _encoded_sites(line + "\n") == [], f"look-alike matched as an encoded-command launch: {line}"
+
+
+def test_launcher_census_roots_cover_tracked_launch_sites_outside_the_old_roots():
+    src = _census_sources()
+    for p in ("tools/agent-bridge/wake_codex.ps1", "tools/closeout/start-closeout-dashboard.ps1"):
+        assert p in src, f"{p} is a tracked launch site outside the census roots"
+    assert "tools/coordination/Retire-LaneWorktree.ps1" not in src
+    assert not [p for p in src if "/test" in p.lower() or Path(p).name.lower().startswith("test")], "test scripts must stay out of the census"
+
+
+# --- r3 (sol r2 D-01, Dot 64dc38fd B1/B2, Grok 6390930513 G1/G2/G3, opus r2 H1/H3): the census reads sites from the PowerShell AST.
+# Each fixture below is a launch that some hand-written tokenizer round hid. Two launches in ONE statement are two sites; a `$()` in a
+# double-quoted string is code; a here-string run through [scriptblock]::Create is code, `;` inside its quotes included; an encoded switch
+# on `& $exe` needs no pwsh word beside it; Start-Process takes -WindowStyle in its colon, prefix, alias and splatted forms.
+
+_ENC_CMD_A = "& $exeA -NoProfile -EncodedCommand $encodedA"
+_ENC_CMD_B = "& $exeB -NoProfile -EncodedCommand $encodedB"
+
+
+def _second_site_is_unclassified(text, kind):
+    """`text` holds two launches of `kind`; with only the A launch pinned, return (sites, census problems)."""
+    pin = next(p for p in ((_ENC_LAUNCH_A, _ENC_CMD_A) if kind == "encoded" else (_DET_LAUNCH_A,)) if p in text)
+    inv = {_SYNTH: [(pin, "classified")]}
+    if kind == "encoded":
+        return _encoded_sites(text), _census_problems({_SYNTH: text}, inv, {})
+    return _detached_sites(text), _census_problems({_SYNTH: text}, {}, inv)
+
+
+@pytest.mark.parametrize("kind", ["encoded", "detached"])
+def test_launcher_census_r3_d01_same_line_if_else_branches_are_two_sites(kind):
+    a, b = (_ENC_LAUNCH_A, _ENC_LAUNCH_B) if kind == "encoded" else (_DET_LAUNCH_A, _DET_LAUNCH_B)
+    sites, problems = _second_site_is_unclassified("if ($x) { " + a + " } else { " + b + " }\n", kind)
+    assert len(sites) == 2, f"two {kind} launches in one if/else statement were folded into one site: {sites}"
+    assert any("unclassified" in p for p in problems), f"the pinned if-branch launch consumed the else-branch launch: {problems}"
+
+
+@pytest.mark.parametrize("kind", ["encoded", "detached"])
+def test_launcher_census_r3_d01_pipeline_chain_and_and_is_two_sites(kind):
+    a, b = (_ENC_CMD_A, _ENC_CMD_B) if kind == "encoded" else (_DET_LAUNCH_A, _DET_LAUNCH_B)
+    sites, problems = _second_site_is_unclassified(a + " && " + b + "\n", kind)
+    assert len(sites) == 2, f"`A && B` folded two {kind} launches into one site: {sites}"
+    assert any("unclassified" in p for p in problems), problems
+
+
+def test_launcher_census_r3_d01_launch_inside_a_pipeline_scriptblock_is_its_own_site():
+    text = _DET_LAUNCH_A + " | ForEach-Object { " + _DET_LAUNCH_B + " }\n"
+    sites, problems = _second_site_is_unclassified(text, "detached")
+    assert len(sites) == 2, f"`A | % {{ B }}` folded two detached launches into one site: {sites}"
+    assert any("unclassified" in p for p in problems), problems
+
+
+def test_launcher_census_r3_b1_subexpression_in_a_double_quoted_string_is_code():
+    text = '$s = "$(' + _DET_LAUNCH_A + "; " + _DET_LAUNCH_B + ')"\n'
+    sites, problems = _second_site_is_unclassified(text, "detached")
+    assert len(sites) == 2, f"two launches inside $( ) in a double-quoted string were read as one opaque string: {sites}"
+    assert any("unclassified" in p for p in problems), problems
+
+
+def test_launcher_census_r3_b2_here_string_run_by_scriptblock_create_keeps_its_quoted_semicolon():
+    text = ("$script = @'\nStart-Process -FilePath $exe -ArgumentList 'x;y' -WindowStyle Hidden\n'@\n"
+            "& ([scriptblock]::Create($script))\n")
+    sites = _detached_sites(text)
+    assert len(sites) == 1 and "'x;y'" in sites[0][1], f"a quoted `;` inside a here-string split the hidden launch it carries: {sites}"
+    assert sites[0][0] == 2, f"the inner launch is reported at its own line in the outer file: {sites}"
+    assert _census_problems({_SYNTH: text}, {}, {}), "an executed here-string's hidden launch passed an empty inventory"
+
+
+@pytest.mark.parametrize("sep", ["; ", "\n"])
+def test_launcher_census_r3_g1_encoded_switch_on_amp_exe_after_get_command_pwsh(sep):
+    text = "$exe = (Get-Command pwsh).Source" + sep + "& $exe -enc $b64\n"
+    assert len(_encoded_sites(text)) == 1, f"`& $exe -enc` with $exe resolved from Get-Command pwsh was not a site (sep={sep!r})"
+    assert _census_problems({_SYNTH: text}, {}, {}), "an unclassified encoded launch on `& $exe` passed the census"
+
+
+def test_launcher_census_r3_g2_unquoted_long_switch_on_amp_exe_counts_alone():
+    text = "& $exe -EncodedCommand $b64\n"
+    assert len(_encoded_sites(text)) == 1, "an unquoted -EncodedCommand on `& $exe` with no pwsh word beside it was not a site"
+    assert _census_problems({_SYNTH: text}, {}, {}), "an unclassified `& $exe -EncodedCommand` passed the census"
+
+
+def test_launcher_census_r3_h3_quote_inside_subexpression_cannot_open_a_block_comment():
+    text = '$m = "$(if ($x) { "it\'s" })"\nWrite-Host \'<#\'\n' + _ENC_LAUNCH_B + "\nWrite-Host '#>'\n"
+    assert len(_encoded_sites(text)) == 1, "a quote inside $( ) desynchronised the scanner and a quoted '<#' hid the launch after it"
+    assert _census_problems({_SYNTH: text}, {}, {}), "the census passes a file whose only launch sits behind a $( ) quote desync"
+
+
+@pytest.mark.parametrize("line", [
+    "Start-Process -FilePath $x -WindowStyle:Hidden",
+    "Start-Process -FilePath $x -WindowStyle:'Hidden'",
+    "Start-Process -FilePath $x -Win Hidden",
+    "Start-Process -FilePath $x -windowst hidden",
+    "saps -FilePath $x -WindowStyle Hidden",
+    "start $x -WindowStyle Hidden",
+    "Microsoft.PowerShell.Management\\Start-Process $x -WindowStyle Hidden",
+    "Start-Process $x -WindowStyle ([System.Diagnostics.ProcessWindowStyle]::Hidden)",
+    "$sp = @{ FilePath = $x; WindowStyle = 'Hidden' }\nStart-Process @sp",
+    "$sp = @{ FilePath = $x }\n$sp.WindowStyle = 'Hidden'\nStart-Process @sp",
+])
+def test_launcher_census_r3_g3_every_form_of_a_hidden_start_process_is_a_site(line):
+    assert len(_detached_sites(line + "\n")) == 1, f"hidden Start-Process form not seen: {line!r}"
+
+
+@pytest.mark.parametrize("text", [
+    "& ([scriptblock]::Create($prefix + $body))\n",
+    "Invoke-Expression $cmd\n",
+    "iex \"$a; $b\"\n",
+    "param($cmd)\n$sb = [scriptblock]::Create($cmd)\n",
+    "$cmd | Invoke-Expression\n",
+    "& pwsh -NoProfile -Command $cmd\n",
+])
+def test_launcher_census_r3_an_executed_string_built_at_run_time_is_unresolved_and_fails_the_census(text):
+    assert _census_problems({_SYNTH: text}, {}, {}), f"an executed string the census cannot resolve passed silently: {text!r}"
+
+
+# Guards (pass on every scanner): the shapes r2's DETACHED_RX regex matched stay one site each, and the look-alikes stay zero.
+@pytest.mark.parametrize("line", [
+    "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cl }",
+    "Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList $cl",
+    "$r = ([wmiclass]'Win32_Process').Create($cl)",
+    "$c = [wmiclass]'Win32_Process'",
+])
+def test_launcher_census_r3_win32_process_create_shapes_stay_one_site_each(line):
+    assert len(_detached_sites(line + "\n")) == 1, f"Win32_Process Create shape not counted exactly once: {line!r}"
+
+
+@pytest.mark.parametrize("text", [
+    "Start-Process -FilePath $x -WindowStyle Normal\n",
+    "Start-Process -FilePath $x -WindowStyle Minimized -PassThru\n",
+    "Start-Process -FilePath $x -wi\n",
+    "Start-Process -FilePath $x -NoNewWindow -Wait\n",
+    "Write-Host 'Start-Process is forbidden here'\n",
+    "& $winget install --id Microsoft.VisualStudio.2022.BuildTools -e --silent\n",
+    "& $dumpbin /EXPORTS $dll\n",
+])
+def test_launcher_census_r3_look_alikes_of_a_launch_are_not_sites(text):
+    assert _detached_sites(text) == [] and _encoded_sites(text) == [], f"look-alike counted as a launch site: {text!r}"
+
+
+# --- r4 (Dot advisory 6391702961 B1, hub ACK 6392004927): a variable resolves to a literal only through assignments in the scope where
+# it is read. r3 kept one file-wide assignment map, so a parameter, a foreach variable or a caller's variable that shares a name with an
+# unrelated literal was read as that literal and its executed string passed as resolved.
+
+def test_launcher_census_r4_b1_dot_parameter_shadowing_an_outer_literal_is_unresolved():
+    text = ("$cmd='Write-Output ok'; function Run-Code { param($cmd) iex $cmd }; "
+            "Run-Code ('Start-' + 'Process -FilePath pwsh -WindowStyle Hidden')\n")
+    sites = _unresolved_sites(text)
+    assert [ln for _, ln in sites] == ["iex $cmd"], f"the parameter $cmd was resolved from the unrelated outer literal: {sites}"
+    assert _census_problems({_SYNTH: text}, {}, {}), "Dot's static counterexample passed an empty inventory"
+
+
+@pytest.mark.parametrize("text", [
+    "$cmd = 'Write-Output ok'\nfunction Run-Code($cmd) { iex $cmd }\n",
+    "$cmd = 'Write-Output ok'\n& { param($cmd) iex $cmd } $built\n",
+    "$cmd = 'Write-Output ok'\nforeach ($cmd in $list) { iex $cmd }\n",
+    "$cmd = 'Write-Output ok'\n$cmd, $rest = $parts\niex $cmd\n",
+    "$cmd = 'Write-Output ok'\nGet-Thing -OutVariable cmd\niex $cmd\n",
+    "$cmd = 'Write-Output ok'\n$sb = [scriptblock]::Create($global:cmd)\n",
+    "$sp = @{ FilePath = 'x' }\nfunction Start-It { param($sp) Start-Process @sp }\n",
+])
+def test_launcher_census_r4_b1_a_name_bound_by_something_other_than_a_literal_is_unresolved(text):
+    assert _unresolved_sites(text), f"a parameter / loop / multi-assignment / -OutVariable binding was read as the outer literal: {text!r}"
+
+
+# Nested scope (stated choice: conservatively unresolved). A { } body or a function reads a variable it never assigns from whatever scope
+# calls it at run time, so the outer literal is not evidence of the value.
+@pytest.mark.parametrize("text", [
+    "$cmd = 'Write-Output ok'\n& { iex $cmd }\n",
+    "$cmd = 'Write-Output ok'\nfunction Run-Code { iex $cmd }\n",
+])
+def test_launcher_census_r4_b1_a_nested_scope_reading_an_outer_literal_is_unresolved(text):
+    assert _unresolved_sites(text), f"a nested scope read an outer literal as its own: {text!r}"
+
+
+# Dot-sourced script reading a caller variable: a value the file does not definitely assign before the read comes from the caller.
+@pytest.mark.parametrize("text", [
+    "iex $cmd\n",
+    "if ($Force) { $cmd = 'Write-Output ok' }\niex $cmd\n",
+    "iex $cmd\n$cmd = 'Write-Output ok'\n",
+])
+def test_launcher_census_r4_b1_a_caller_variable_read_by_a_dot_sourced_script_is_unresolved(text):
+    assert _unresolved_sites(text), f"a variable the file does not assign before reading it was resolved: {text!r}"
+
+
+# Guards (pass on every scanner): a literal assigned in the scope that reads it still resolves, so these stay site-free.
+@pytest.mark.parametrize("text", [
+    "$cmd = 'Write-Output ok'\niex $cmd\n",
+    "function Run-Code { $c = 'Write-Output ok'; iex $c }\n",
+    "$a = 'Write-Output ok'\n$b = $a\niex $b\n",
+    "$script:T = 'Write-Output ok'\nfunction Run-Code { iex $script:T }\n",
+    "$sp = @{ FilePath = 'x' }\nStart-Process @sp\n",
+])
+def test_launcher_census_r4_a_literal_assigned_in_the_reading_scope_still_resolves(text):
+    assert _unresolved_sites(text) == [], f"a same-scope literal was reported unresolved: {text!r}"
+
+
+# --- r5 (Dot advisory 6392164637 items 1-3, Grok CoS ask 6392177927 G1, hub ACK 6392234100): rule V still read a safe literal where
+# pwsh rebinds the name some other way: a scope-qualified write re-homed to the lexical scope, a later literal borrowed by an earlier
+# $script: read, Set-Variable's name taken from -Scope's value, and writes through the variable: drive, PSVariable or a Get-Variable
+# result. Every form below was run in pwsh with a harmless payload and does change what `iex $cmd` runs. Each must report the iex site.
+_R5_BUILT = "('Start-' + 'Process -FilePath pwsh -WindowStyle Hidden')"
+
+
+def _r5(writer):
+    return "$cmd='Write-Output ok'; " + writer + "; iex $cmd\n"
+
+
+def _r5_iex_is_unresolved(text):
+    sites = _unresolved_sites(text)
+    assert [ln for _, ln in sites if ln.startswith("iex $")], f"the executed $cmd was resolved to the safe literal: {text!r} -> {sites}"
+    assert _census_problems({_SYNTH: text}, {}, {}), f"the counterexample passed an empty inventory: {text!r}"
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param("$cmd='Start-'+'Process -FilePath pwsh -WindowStyle Hidden'; function Run-Code { $global:cmd='Write-Output ok'; iex $cmd }; "
+                 "Run-Code\n", id="dot1-global-write-in-a-function"),
+    pytest.param("iex $script:cmd; $script:cmd='Write-Output ok'\n", id="dot2-later-script-literal"),
+    pytest.param("$cmd='Write-Output ok'; Set-Variable -Scope Local cmd ('Start-'+'Process -FilePath pwsh -WindowStyle Hidden'); iex $cmd\n",
+                 id="dot3-set-variable-scope-then-positional-name"),
+])
+def test_launcher_census_r5_dot_qualified_write_ordering_and_set_variable_binding(text):
+    _r5_iex_is_unresolved(text)
+
+
+@pytest.mark.parametrize("writer", [
+    pytest.param("Set-Item -Path variable:cmd -Value " + _R5_BUILT, id="g1a-set-item"),
+    pytest.param("New-Item -Path variable:cmd -Value " + _R5_BUILT + " -Force", id="g1b-new-item"),
+    pytest.param("${variable:cmd} = " + _R5_BUILT, id="g1c-braced-variable-drive"),
+    pytest.param("$ExecutionContext.SessionState.PSVariable.Set('cmd', " + _R5_BUILT + ")", id="g1d-psvariable-set"),
+    pytest.param("(Get-Variable cmd).Value = " + _R5_BUILT, id="g1e-get-variable-value"),
+])
+def test_launcher_census_r5_g1_variable_drive_and_psvariable_writers(writer):
+    _r5_iex_is_unresolved(_r5(writer))
+
+
+# Further forms of the same classes (lane-found, each run in pwsh): spellings of the variable: path, the other item cmdlets, a path or a
+# PSVariable held in a variable, the provider API, aliases, and a removal that lets a function read its caller's value.
+@pytest.mark.parametrize("writer", [
+    pytest.param("Set-Item variable:\\cmd " + _R5_BUILT, id="variable-drive-backslash"),
+    pytest.param("Set-Item -LiteralPath 'Microsoft.PowerShell.Core\\Variable::cmd' -Value " + _R5_BUILT, id="provider-qualified-path"),
+    pytest.param("$variable:cmd = " + _R5_BUILT, id="dollar-variable-drive"),
+    pytest.param("$other = " + _R5_BUILT + "; Clear-Item variable:cmd; Rename-Item variable:other cmd -Force", id="rename-item"),
+    pytest.param("$other = " + _R5_BUILT + "; Copy-Item variable:other variable:cmd -Force", id="copy-item"),
+    pytest.param("Set-Content variable:cmd " + _R5_BUILT, id="set-content"),
+    pytest.param("$p = 'variable:cmd'; Set-Item $p " + _R5_BUILT, id="path-held-in-a-variable"),
+    pytest.param("$pv = $ExecutionContext.SessionState.PSVariable; $pv.Set('cmd', " + _R5_BUILT + ")", id="psvariable-held-in-a-variable"),
+    pytest.param("$v = Get-Variable cmd; $v.Value = " + _R5_BUILT, id="get-variable-result-held-in-a-variable"),
+    pytest.param("(Get-Item variable:cmd).Value = " + _R5_BUILT, id="get-item-variable-value"),
+    pytest.param("$ExecutionContext.SessionState.InvokeProvider.Item.Set('variable:cmd', " + _R5_BUILT + ")", id="invoke-provider"),
+    pytest.param("New-Variable -Force -Scope Local cmd " + _R5_BUILT, id="new-variable-switch-and-scope-first"),
+    pytest.param("Set-Variable -Scope 0 -Option None cmd " + _R5_BUILT, id="set-variable-two-named-first"),
+    pytest.param("set cmd " + _R5_BUILT, id="set-alias"),
+])
+def test_launcher_census_r5_more_writers_that_rebind_the_name(writer):
+    _r5_iex_is_unresolved(_r5(writer))
+
+
+@pytest.mark.parametrize("text", [
+    # a function that removes its own $cmd reads its caller's
+    pytest.param("$cmd = " + _R5_BUILT + "; function F { $cmd='Write-Output ok'; Remove-Variable cmd; iex $cmd }; F\n", id="remove-variable-fallback"),
+    # dot-sourced into a function, the file's top level is that function's scope, not the script scope
+    pytest.param("$cmd='Write-Output ok'; iex $script:cmd\n", id="script-read-after-an-unqualified-literal"),
+    pytest.param("$script:cmd='Write-Output ok'; iex $cmd\n", id="unqualified-read-after-a-script-literal"),
+])
+def test_launcher_census_r5_scope_crossing_reads_are_unresolved(text):
+    _r5_iex_is_unresolved(text)
+
+
+# Code that runs in this scope from text, from another file, or under another name writes names too (lane-found, each run in pwsh).
+@pytest.mark.parametrize("text", [
+    pytest.param("$cmd='Write-Output ok'; . ./lib.ps1; iex $cmd\n", id="dot-sourced-file"),
+    pytest.param("$sb = { $cmd = $env:PAYLOAD }; $cmd='Write-Output ok'; . $sb; iex $cmd\n", id="dot-sourced-variable"),
+    pytest.param("$cmd='Write-Output ok'; iex '$cmd = $env:PAYLOAD'; iex $cmd\n", id="iex-literal-that-assigns"),
+    pytest.param("$script:cmd='Write-Output ok'; & ([scriptblock]::Create('$script:cmd = $env:PAYLOAD')); iex $script:cmd\n",
+                 id="scriptblock-create-literal-that-assigns"),
+    pytest.param("$c = 'Set-Variable'; $cmd='Write-Output ok'; & $c cmd $env:PAYLOAD; iex $cmd\n", id="dynamic-call-of-a-named-cmdlet"),
+    pytest.param("$cmd='Write-Output ok'; & (Get-Command sv) cmd $env:PAYLOAD; iex $cmd\n", id="call-of-get-command"),
+    pytest.param("Set-Alias w Set-Variable; $cmd='Write-Output ok'; w cmd $env:PAYLOAD; iex $cmd\n", id="alias-defined-here"),
+    pytest.param("$cmd='Write-Output ok'; Push-Location variable:; Set-Item cmd $env:PAYLOAD; Pop-Location; iex $cmd\n", id="location-in-variable-drive"),
+])
+def test_launcher_census_r5_code_run_in_this_scope_can_rebind_the_name(text):
+    _r5_iex_is_unresolved(text)
+
+
+# Controls (pass on every scanner): the two writers rule V already saw stay one site, and a safe literal with no other writer of its name
+# (another name bound by Set-Variable -Scope, or a local:/private: write in the reading scope) stays resolved.
+@pytest.mark.parametrize("writer", ["$cmd = " + _R5_BUILT, "Set-Variable cmd " + _R5_BUILT])
+def test_launcher_census_r5_control_writers_stay_one_site(writer):
+    sites = _unresolved_sites(_r5(writer))
+    assert [ln for _, ln in sites] == ["iex $cmd"], f"a writer rule V already saw is no longer exactly one site: {sites}"
+
+
+@pytest.mark.parametrize("text", [
+    "$cmd='Write-Output ok'; iex $cmd\n",
+    "$cmd='Write-Output ok'; Set-Variable -Scope Local other " + _R5_BUILT + "; iex $cmd\n",
+    "$local:cmd='Write-Output ok'; iex $cmd\n",
+    "function Run-Code { $private:c = 'Write-Output ok'; iex $c }\n",
+    "$script:cmd='Write-Output ok'; iex $script:cmd\n",
+    "$cmd='Write-Output ok'; Remove-Item -LiteralPath 'C:\\tmp\\x.txt' -Force; iex $cmd\n",
+    "$cmd='Write-Output ok'; $p = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('x'); iex $cmd\n",
+    "$cmd='Write-Output ok'; iex 'Write-Output hi'; iex $cmd\n",
+    "$cmd='Write-Output ok'; . { $other = 1 }; iex $cmd\n",
+])
+def test_launcher_census_r5_control_a_safe_same_scope_literal_stays_resolved(text):
+    assert _unresolved_sites(text) == [], f"a safe same-scope literal with no other writer was reported unresolved: {text!r}"
+
+
+# --- r7 (Dot advisory 6392963508, Grok CoS ask 6392967676, hub ruling HUB-TICK 20261025T0526Z): rule V is closed by an allowlist
+# (Test-LaunchSites.ps1 header, V3). One fixture per allowlist boundary, not one per known writer. The payload is a benign marker that
+# is not a constant: the only question is whether `$cmd` still resolves to its literal. Parameter coverage is proven by the metadata
+# meta-test in tools/repo_hygiene/test_launch_site_census_binders.py, which runs on the hosted Windows and ubuntu shards.
+_R7_MARKER = "$env:CENSUS_FIXTURE_MARKER"
+
+
+def _r7(binder):
+    return "$cmd = 'Write-Output ok'; " + binder + "; iex $cmd\n"
+
+
+@pytest.mark.parametrize("binder", [
+    pytest.param(_R7_MARKER + " | Tee-Object -Variable cmd", id="i-variable-named-parameter"),
+    pytest.param("$m = 'Value'; (Get-Variable cmd).$m = " + _R7_MARKER, id="ii-dynamic-member-name"),
+    pytest.param("(Get-Variable cmd -ValueOnly:$false).Value = " + _R7_MARKER, id="iii-valueonly-not-true"),
+    pytest.param(". { param($cmd) } " + _R7_MARKER, id="iv-dot-sourced-block-param"),
+])
+def test_launcher_census_r7_a_binder_off_the_allowlist_leaves_the_read_unresolved(binder):
+    _r5_iex_is_unresolved(_r7(binder))
+
+
+# Controls: the writers rule V always saw stay one site, and binders that are on the allowlist (a param of a block run with `&` or of a
+# function that is not dot-sourced, -ValueOnly given as a switch or :$true, a constant member name, a parameter that binds no variable)
+# leave a safe same-scope literal resolved.
+@pytest.mark.parametrize("binder", ["$cmd = " + _R7_MARKER, "Set-Variable cmd " + _R7_MARKER])
+def test_launcher_census_r7_control_writers_stay_one_site(binder):
+    sites = _unresolved_sites(_r7(binder))
+    assert [ln for _, ln in sites] == ["iex $cmd"], f"a writer rule V already saw is no longer exactly one site: {sites}"
+
+
+@pytest.mark.parametrize("binder", [
+    pytest.param("& { param($cmd) } " + _R7_MARKER, id="amp-block-param"),
+    pytest.param("function Use-It { param($cmd) }; Use-It " + _R7_MARKER, id="function-param"),
+    pytest.param("$o = Get-Variable other -ValueOnly; $p = Get-Variable more -ValueOnly:$true", id="valueonly-switch-and-true"),
+    pytest.param("$o = @{ a = 1 }; $o.a = " + _R7_MARKER, id="constant-member-name"),
+    pytest.param(_R7_MARKER + " | Write-Output -InputObject cmd", id="parameter-binding-no-variable"),
+])
+def test_launcher_census_r7_control_an_allowlisted_binder_keeps_the_literal(binder):
+    assert _unresolved_sites(_r7(binder)) == [], f"an allowlisted binder made a safe same-scope literal unresolved: {binder!r}"
+
+
+# --- r8 (Dot advisory 6394696125, hub ruling HUB-TICK 20261025T0706Z): splat sources join the rule V allowlist. A splat `@h` has a
+# known key set only when every use of `h` in the file is on the allowlist (a constant-key hashtable literal assigned in the reading
+# scope before the splat; .Add / indexer / member writes with a constant key). Any other use makes the key set unknown, and an unknown
+# splat taints every name. Same benign marker as r7; each shape was run in pwsh and does rebind `$cmd` (run dir proof\r8-runtime-*.ps1).
+def _r8(mutation, splat=_R7_MARKER + " | Tee-Object @h"):
+    return "$cmd = 'Write-Output ok'; $h = @{}; $key = " + _R7_MARKER + "; " + mutation + "; " + splat + "; iex $cmd\n"
+
+
+@pytest.mark.parametrize("mutation", [
+    pytest.param("$h.Add($key, 'cmd')", id="i-add-with-a-dynamic-key"),
+    pytest.param("$h[$key] = 'cmd'", id="ii-indexer-with-a-dynamic-key"),
+    pytest.param("function Fill($t, $k) { $t.Add($k, 'cmd') }; Fill $h $key", id="iii-passed-to-a-function"),
+    pytest.param("$g = $h; $g.Add($key, 'cmd')", id="aliased-by-assignment"),
+    pytest.param("$h | ForEach-Object { $_.Add($key, 'cmd') }", id="piped-into-a-command"),
+    pytest.param("$h.set_Item($key, 'cmd')", id="set-item-with-a-dynamic-key"),
+    pytest.param("$h.psbase.Add($key, 'cmd')", id="reached-through-a-member"),
+    pytest.param("$r = [ref]$h; $r.Value.Add($key, 'cmd')", id="ref"),
+])
+def test_launcher_census_r8_a_splat_source_off_the_allowlist_leaves_the_read_unresolved(mutation):
+    _r5_iex_is_unresolved(_r8(mutation))
+
+
+# Controls: a constant-key literal with no *Variable* key, and constant-key .Add / indexer / member writes, keep the splat's key set
+# known, so a safe same-scope literal stays resolved.
+@pytest.mark.parametrize("mutation", [
+    pytest.param("$h = @{ FilePath = 'x.txt' }", id="constant-key-literal"),
+    pytest.param("$h.Add('Encoding', 'utf8')", id="add-constant-key"),
+    pytest.param("$h['Encoding'] = 'utf8'", id="indexer-constant-key"),
+    pytest.param("$h.Encoding = 'utf8'", id="member-constant-key"),
+])
+def test_launcher_census_r8_control_an_allowlisted_splat_source_keeps_the_literal(mutation):
+    text = _r8(mutation, splat=_R7_MARKER + " | Out-File -FilePath x.txt @h")
+    assert _unresolved_sites(text) == [], f"an allowlisted splat source made a safe same-scope literal unresolved: {text!r}"
