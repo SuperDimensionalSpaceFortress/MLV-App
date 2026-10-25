@@ -261,6 +261,102 @@ class MeterFixtureTests(unittest.TestCase):
         result = self._measure("demo", self._dir(), gh=gh, expect=2)
         self.assertTrue(any("truncated" in e for e in result["errors"]), result["errors"])
 
+    def test_adoption_reads_repositories_named_at_the_bus_head_even_with_no_pass_in_the_window(self) -> None:
+        gh = self._fake_gh(prs={"acme/widget": [
+            {"number": 5, "body": "Adversary pass: run verdict=CLEAN found=0 fixed=0", "createdAt": _iso(NOW - timedelta(hours=1))}]})
+        result = self._measure("demo", self._dir(), gh=gh, since=_iso(NOW - timedelta(hours=2)))
+        self.assertEqual(result["windows"][0]["passes"], 0)
+        self.assertEqual(result["shiftLeft"], {"prs": 1, "withAdversaryLine": 1})
+
+    def test_exactly_full_listings_are_complete_not_truncated(self) -> None:
+        recent = _iso(NOW - timedelta(hours=1))
+        full = [_status(f"ctx/{i}", "pending", "2026-10-21T11:00:00Z") for i in range(2000)]
+        gh = self._fake_gh(statuses={("acme/widget", H3): full},
+                           prs={"acme/widget": [{"number": n, "body": "x", "createdAt": recent} for n in range(200, 0, -1)]})
+        result = self._measure("demo", self._dir(), gh=gh)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["shiftLeft"], {"prs": 200, "withAdversaryLine": 0})
+
+    # -- passes, heads and the cache
+
+    def _small_bus(self, commits: list[tuple[str, str, str, str]]) -> Path:
+        bus = self._dir()
+        _git(bus, "init", "-q")
+        for rel, text, when, subject in commits:
+            _commit(bus, rel, text, when, subject)
+        return bus
+
+    def _measure_bus(self, bus: Path, project: str, since: str = "2026-10-01T00:00:00Z", cache: dict | None = None,
+                     expect: int = 0, gh: Path | None = None) -> tuple[dict, Path]:
+        out = self._dir()
+        if cache is not None:
+            (out / "status-cache.json").write_text(json.dumps(cache), encoding="utf-8")
+        args = ["-Bus", str(bus), "-Project", project, "-Since", since, "-OutDir", str(out), "-NoFetch"]
+        if gh is None:
+            args.append("-NoStatuses")
+        proc = self._run(*args, gh=gh)
+        self.assertEqual(proc.returncode, expect, proc.stdout + proc.stderr)
+        return json.loads((out / "quality-lift.json").read_text(encoding="utf-8-sig")), out
+
+    def test_the_first_head_is_ordered_by_its_first_pass_and_a_later_block_keeps_it_first(self) -> None:
+        p = "cos-feedback/p/pr-7.md"
+        bus = self._small_bus([
+            (p, _section(7, H1, "None."), _iso(NOW - timedelta(days=3)), "h1 clean"),
+            (p, _section(7, H2, "None."), _iso(NOW - timedelta(days=2)), "h2 clean"),
+            (p, _section(7, H1, "B1 x."), _iso(NOW - timedelta(days=1)), "h1 blocked later"),
+        ])
+        since = self._measure_bus(bus, "p", since=_iso(NOW - timedelta(days=5)))[0]["windows"][0]
+        self.assertEqual((since["passes"], since["blocked"], since["firstRoundBlocked"]), (2, 1, 1))
+
+    def test_a_future_block_does_not_hide_a_clean_pass_inside_the_window(self) -> None:
+        p = "cos-feedback/p/pr-7.md"
+        bus = self._small_bus([
+            (p, _section(7, H1, "None."), _iso(NOW - timedelta(days=1)), "h1 clean"),
+            (p, _section(7, H1, "B1 x."), _iso(NOW + timedelta(days=2)), "h1 blocked in the future"),
+        ])
+        since = self._measure_bus(bus, "p", since=_iso(NOW - timedelta(days=5)))[0]["windows"][0]
+        self.assertEqual((since["passes"], since["blocked"]), (1, 0))
+
+    def test_a_commit_behind_an_older_dated_child_is_still_read(self) -> None:
+        p = "cos-feedback/p/pr-7.md"
+        bus = self._small_bus([
+            (p, _section(7, H1, "B1 x."), _iso(NOW - timedelta(hours=3)), "blocked, in the window"),
+            (p, _section(7, H2, "None."), "2026-09-01T10:00:00+00:00", "child with a skewed old date"),
+        ])
+        since = self._measure_bus(bus, "p", since=_iso(NOW - timedelta(days=1)))[0]["windows"][0]
+        self.assertEqual((since["passes"], since["blocked"]), (1, 1))
+
+    def test_only_the_blockers_heading_line_opens_the_section(self) -> None:
+        text = f"# acme/widget #7 / {H1}\n\nVerdict: see the ## Blockers section below.\n\n## Blockers\n\nB1 a demonstrated defect.\n"
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", text, "2026-10-20T10:00:00+00:00", "inline phrase")])
+        since = self._measure_bus(bus, "p")[0]["windows"][0]
+        self.assertEqual(since["blocked"], 1)
+
+    def test_one_corpus_row_per_repo_and_head_within_a_run(self) -> None:
+        bus = self._small_bus([
+            ("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7"),
+            ("cos-feedback/p/pr-8.md", _section(8, H1, "B1 x."), "2026-10-21T11:00:00+00:00", "pr8 same head"),
+        ])
+        cache = {f"acme/widget@{H1}": {"fetched": "2026-10-21T12:00:00Z", "rows": []}}
+        result, out = self._measure_bus(bus, "p", cache=cache)
+        self.assertEqual(result["corpusNew"], 1)
+        self.assertEqual(len(self._corpus(out)), 1)
+
+    def test_a_malformed_cache_entry_is_unknown_and_a_named_error(self) -> None:
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7")])
+        key = f"acme/widget@{H1}"
+        for entry in (None, {}, {"fetched": "2026-10-21T12:00:00Z", "rows": None}, {"fetched": "2026-10-21T12:00:00Z", "rows": [None]},
+                      {"fetched": "2026-10-21T12:00:00Z", "rows": "true"}, {"fetched": "2026-10-21T12:00:00Z", "rows": [{"context": "k"}]},
+                      {"fetched": None, "rows": []}):
+            result, out = self._measure_bus(bus, "p", cache={key: entry}, expect=2)
+            since = result["windows"][0]
+            self.assertEqual((since["statusUnknown"], since["noPriorKey"]), (1, 0), entry)
+            self.assertTrue(any("malformed" in e for e in result["errors"]), (entry, result["errors"]))
+            self.assertEqual(self._corpus(out), [], entry)
+        # With statuses on, the dropped entry is refetched instead of crashing the run.
+        result, out = self._measure_bus(bus, "p", cache={key: {"fetched": None, "rows": []}}, expect=2, gh=self._fake_gh())
+        self.assertEqual((result["windows"][0]["statusUnknown"], result["windows"][0]["noPriorKey"]), (0, 1))
+
     # -- windows
 
     def test_last_24h_ignores_a_narrower_since_and_future_commits(self) -> None:

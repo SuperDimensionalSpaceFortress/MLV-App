@@ -15,7 +15,8 @@
 # Definitions (lower is better on every rate). A "round" is one head CoS reviewed:
 #   blockedRate        share of CoS-reviewed heads (one pass per repo, PR and head; a head re-reviewed clean-then-blocked counts
 #                      at its first BLOCKING pass) whose first Blockers line starts B<n>
-#   firstRoundBlocked  PRs whose first CoS-reviewed head was blocked (clean-then-blocked on that head counts as blocked)
+#   firstRoundBlocked  PRs whose first CoS-reviewed head (ordered by its first pass in the window) was blocked; clean-then-
+#                      blocked on that head counts as blocked. Each window is cut from the raw passes before heads are folded.
 #   noPriorKey         blocked heads whose statuses are known and none was created before the CoS pass (CoS read it first)
 #   trueMiss           blocked heads where some context reported 'success' BEFORE the CoS pass (the factory approved a defect)
 #   statusUnknown      blocked heads with no status evidence (-NoStatuses with no cache entry, or a failed fetch); they count
@@ -52,9 +53,11 @@ function ConvertTo-QlUtc([object]$s) {
 
 function Get-QlKey($p) { "$($p.repo)@$($p.head)" }
 
+# Every CoS pass (one per commit and file) since $From, unfolded. --since-as-filter, not --since: --since stops the walk at
+# the first older commit, so a commit behind one with a skewed (older) date would be missed.
 function Get-QlPasses([string]$Proj, [string]$From) {
     $out = @()
-    $log = @(git -C $Bus log --since=$From --format="%H|%cI" -- "cos-feedback/$Proj")
+    $log = @(git -C $Bus log --since-as-filter=$From --format="%H|%cI" -- "cos-feedback/$Proj")
     if ($LASTEXITCODE -ne 0) { throw "git log of cos-feedback/$Proj failed (exit $LASTEXITCODE)" }
     foreach ($c in $log) {
         $h, $t = $c.Split('|')
@@ -68,19 +71,51 @@ function Get-QlPasses([string]$Proj, [string]$From) {
             if ($ms.Count -eq 0) { continue }
             $m = $ms[$ms.Count - 1]
             $sec = $txt.Substring($m.Index)
-            $i = $sec.IndexOf('## Blockers')
+            # The heading line, not the phrase: a verdict that mentions "## Blockers" mid-line is not the section.
+            $hm = [regex]::Match($sec, '(?m)^##[ \t]+Blockers')
             $blk = ''
-            if ($i -ge 0) { $blk = ((($sec.Substring($i + 11) -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 1) + '').Trim() }
+            if ($hm.Success) { $blk = ((($sec.Substring($hm.Index + $hm.Length) -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 1) + '').Trim() }
             $out += [pscustomobject]@{
                 utc = (ConvertTo-QlUtc $t); repo = $m.Groups[1].Value; pr = [int]$m.Groups[2].Value
                 head = $m.Groups[3].Value; blocked = ($blk -match '^B\d'); blocker = $(if ($blk.Length -gt 160) { $blk.Substring(0, 160) } else { $blk })
             }
         }
     }
-    @($out | Sort-Object utc | Group-Object { "$($_.repo)|$($_.pr)|$($_.head)" } | ForEach-Object {
+    $out
+}
+
+# One record per repo, PR and head, from passes ALREADY cut to a window: the first blocking pass if any, else the first pass.
+# firstSeen (the head's first pass in the window) orders the heads of a PR; utc (the blocking pass) is the CoS time that
+# statuses are compared against.
+function Group-QlHeads([object[]]$Raw) {
+    @(@($Raw) | Where-Object { $null -ne $_ } | Sort-Object utc | Group-Object { "$($_.repo)|$($_.pr)|$($_.head)" } | ForEach-Object {
         $bl = @($_.Group | Where-Object blocked)
-        if ($bl.Count) { $bl[0] } else { $_.Group[0] }
+        $rep = $(if ($bl.Count) { $bl[0] } else { $_.Group[0] })
+        [pscustomobject]@{ utc = $rep.utc; firstSeen = $_.Group[0].utc; repo = $rep.repo; pr = $rep.pr; head = $rep.head; blocked = $rep.blocked; blocker = $rep.blocker }
     })
+}
+
+# Every repository the project's CoS files at the bus HEAD name, so adoption is read even when no pass is in the window.
+function Get-QlRepos([string]$Proj) {
+    $lines = @(git -C $Bus grep -h -I -E '^# [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+ #[0-9]+ / [0-9a-f]{40}' HEAD -- "cos-feedback/$Proj/pr-*.md" 2>$null)
+    if ($LASTEXITCODE -gt 1) { throw "git grep of cos-feedback/$Proj failed (exit $LASTEXITCODE)" }
+    @($lines | ForEach-Object { if ($_ -match '^# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #') { $Matches[1] } })
+}
+
+# A cache entry is evidence only when it has a parseable fetched time and a rows array whose every row names a context with
+# parseable times. Anything else is dropped (the head reads as unknown) and named as a source error.
+function Test-QlCacheEntry($e) {
+    try {
+        if ($null -eq $e -or $null -eq $e.fetched) { return $false }
+        $null = ConvertTo-QlUtc $e.fetched
+        if ($e.rows -isnot [array]) { return $false }
+        foreach ($r in $e.rows) {
+            if ($null -eq $r -or $r -is [string] -or -not "$($r.context)") { return $false }
+            $null = ConvertTo-QlUtc $r.firstUtc
+            foreach ($v in @($r.successUtc, $r.failureUtc)) { if ($null -ne $v -and "$v" -ne '') { $null = ConvertTo-QlUtc $v } }
+        }
+        $true
+    } catch { $false }
 }
 
 # Every status of one head, all pages, folded per context: the first status of any state, the first 'success', the first
@@ -88,11 +123,11 @@ function Get-QlPasses([string]$Proj, [string]$From) {
 function Get-QlStatusRows([string]$Repo, [string]$Head) {
     $all = @()
     for ($page = 1; ; $page++) {
-        if ($page -gt $StatusPageMax) { throw "more than $($StatusPageMax * 100) statuses; not measured" }
         # Plain -F arguments only: where gh resolves through a .cmd shim, '&', '|' and '>' in an argument are shell syntax.
         $raw = gh api -X GET "repos/$Repo/commits/$Head/statuses" -F per_page=100 -F page=$page 2>$null
         if ($LASTEXITCODE -ne 0) { throw "gh api exit $LASTEXITCODE" }
         $rows = @((($raw | Out-String) | ConvertFrom-Json) | Where-Object { $null -ne $_ })
+        if ($rows.Count -and $page -gt $StatusPageMax) { throw "more than $($StatusPageMax * 100) statuses; not measured" }
         $all += $rows
         if ($rows.Count -lt 100) { break }
     }
@@ -111,9 +146,10 @@ function Get-QlStatusRows([string]$Repo, [string]$Head) {
 function Test-QlBefore([object]$When, [DateTime]$Cos) { ($null -ne $When) -and ("$When" -ne '') -and ((ConvertTo-QlUtc $When) -lt $Cos) }
 
 function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache) {
-    $P = @($P)
+    # An empty window can arrive as $null, and @($null) is one element: drop nulls so it counts zero passes.
+    $P = @($P | Where-Object { $null -ne $_ })
     $blocked = @($P | Where-Object blocked)
-    $firstPerPr = @($P | Group-Object { "$($_.repo)#$($_.pr)" } | ForEach-Object { $_.Group | Sort-Object utc | Select-Object -First 1 })
+    $firstPerPr = @($P | Group-Object { "$($_.repo)#$($_.pr)" } | ForEach-Object { $_.Group | Sort-Object firstSeen | Select-Object -First 1 })
     $noKey = 0; $trueMiss = 0; $unknown = 0; $keyStats = [ordered]@{}
     foreach ($b in $blocked) {
         $k = Get-QlKey $b
@@ -148,23 +184,32 @@ function Measure-QlProject([string]$Proj, [string]$Dir) {
     $now = [DateTime]::UtcNow
     $d1Start = $now.AddHours(-24)
     $errors = @($script:SharedErrors)
-    $fetched = @()
+    $raw = @()
     $from = $(if ($script:SinceUtc -lt $d1Start) { $script:SinceUtc } else { $d1Start })
-    try { $fetched = @(Get-QlPasses $Proj $from.ToString('yyyy-MM-ddTHH:mm:ssZ')) } catch { $errors += "bus ${Proj}: $($_.Exception.Message)" }
-    $fetched = @($fetched | Where-Object { $_.utc -le $now })
-    $passes = @($fetched | Where-Object { $_.utc -ge $script:SinceUtc })
-    $passes24 = @($fetched | Where-Object { $_.utc -ge $d1Start })
+    try { $raw = @(Get-QlPasses $Proj $from.ToString('yyyy-MM-ddTHH:mm:ssZ')) } catch { $errors += "bus ${Proj}: $($_.Exception.Message)" }
+    # Cut to the window FIRST, then fold per head: a blocking pass outside the window must not hide a clean pass inside it.
+    $raw = @($raw | Where-Object { $_.utc -le $now })
+    $passes = @(Group-QlHeads @($raw | Where-Object { $_.utc -ge $script:SinceUtc }))
+    $passes24 = @(Group-QlHeads @($raw | Where-Object { $_.utc -ge $d1Start }))
+    $heads = @(Group-QlHeads $raw)
 
     $cacheFile = Join-Path $Dir 'status-cache.json'
     $cache = @{}
-    if (Test-Path -LiteralPath $cacheFile) { try { (Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $cache[$_.Name] = $_.Value } } catch { $cache = @{} } }
+    if (Test-Path -LiteralPath $cacheFile) {
+        try {
+            (Get-Content -LiteralPath $cacheFile -Raw | ConvertFrom-Json).PSObject.Properties | ForEach-Object {
+                if (Test-QlCacheEntry $_.Value) { $cache[$_.Name] = $_.Value } else { $errors += "status-cache entry $($_.Name) is malformed; dropped (the head reads as unknown until refetched)" }
+            }
+        } catch { $cache = @{}; $errors += "status-cache.json does not parse; ignored" }
+    }
     if (-not $NoStatuses) {
-        foreach ($p in ($fetched | Where-Object blocked)) {
+        foreach ($p in ($heads | Where-Object blocked)) {
             $k = Get-QlKey $p
-            $e = $cache[$k]
-            if ($e -and ((($now - (ConvertTo-QlUtc $e.fetched)).TotalHours -lt 1) -or (($now - $p.utc).TotalHours -gt 6))) { continue }
-            try { $cache[$k] = [pscustomobject]@{ fetched = $now.ToString('o'); rows = @(Get-QlStatusRows $p.repo $p.head) } }
-            catch { $errors += "statuses $($p.repo)@$($p.head.Substring(0,8)): $($_.Exception.Message)" }
+            try {
+                $e = $cache[$k]
+                if ($e -and ((($now - (ConvertTo-QlUtc $e.fetched)).TotalHours -lt 1) -or (($now - $p.utc).TotalHours -gt 6))) { continue }
+                $cache[$k] = [pscustomobject]@{ fetched = $now.ToString('o'); rows = @(Get-QlStatusRows $p.repo $p.head) }
+            } catch { $errors += "statuses $($p.repo)@$($p.head.Substring(0,8)): $($_.Exception.Message)" }
         }
         ($cache | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $cacheFile -Encoding utf8
     }
@@ -173,17 +218,20 @@ function Measure-QlProject([string]$Proj, [string]$Dir) {
     $d1 = Get-QlWindow $passes24 'last-24h' $cache
 
     $adopt = [ordered]@{ prs = $null; withAdversaryLine = $null }
-    $repos = @($fetched | ForEach-Object repo | Sort-Object -Unique)
+    $repos = @($heads | ForEach-Object repo)
+    if (-not $NoStatuses) { try { $repos += @(Get-QlRepos $Proj) } catch { $errors += "repos ${Proj}: $($_.Exception.Message)" } }
+    $repos = @($repos | Sort-Object -Unique)
     if ($repos.Count -and -not $NoStatuses) {
         $n = 0; $w = 0
         foreach ($rp in $repos) {
             try {
                 # No --search: where gh resolves through a .cmd shim, '>' in "created:>=" becomes a redirect.
-                $list = gh pr list --repo $rp --state all --limit $PrListLimit --json number,body,createdAt 2>$null
+                # One past the limit, so exactly $PrListLimit recent PRs still reads as complete.
+                $list = gh pr list --repo $rp --state all --limit ($PrListLimit + 1) --json number,body,createdAt 2>$null
                 if ($LASTEXITCODE -ne 0) { throw "gh pr list exit $LASTEXITCODE" }
                 $listed = @((($list | Out-String) | ConvertFrom-Json) | Where-Object { $null -ne $_ })
-                if ($listed.Count -ge $PrListLimit -and @($listed | Where-Object { (ConvertTo-QlUtc $_.createdAt) -lt $d1Start }).Count -eq 0) {
-                    throw "the newest $PrListLimit PRs are all from the last 24 h; the listing is truncated"
+                if ($listed.Count -gt $PrListLimit -and @($listed | Where-Object { (ConvertTo-QlUtc $_.createdAt) -lt $d1Start }).Count -eq 0) {
+                    throw "more than $PrListLimit PRs were created in the last 24 h; the listing is truncated"
                 }
                 $prs = @($listed | Where-Object { $c = ConvertTo-QlUtc $_.createdAt; $c -ge $d1Start -and $c -le $now })
                 $n += $prs.Count; $w += @($prs | Where-Object { $_.body -match '(?im)^\W*Adversary pass' }).Count
@@ -197,11 +245,12 @@ function Measure-QlProject([string]$Proj, [string]$Dir) {
     $known = @{}
     if (Test-Path -LiteralPath $corpusFile) { Get-Content -LiteralPath $corpusFile | ForEach-Object { try { $known[(Get-QlKey ($_ | ConvertFrom-Json))] = 1 } catch { } } }
     $newCorpus = 0
-    foreach ($b in ($fetched | Where-Object blocked | Sort-Object utc)) {
+    foreach ($b in ($heads | Where-Object blocked | Sort-Object utc)) {
         $k = Get-QlKey $b
         if ($known.ContainsKey($k) -or -not $cache.ContainsKey($k)) { continue }
         $prior = @($cache[$k].rows | Where-Object { $null -ne $_ -and (Test-QlBefore $_.successUtc $b.utc) } | ForEach-Object context)
         ([ordered]@{ addedUtc = $now.ToString('o'); cosUtc = $b.utc.ToString('o'); repo = $b.repo; pr = $b.pr; head = $b.head; blocker = $b.blocker; successBeforeCos = $prior } | ConvertTo-Json -Compress) | Add-Content -LiteralPath $corpusFile -Encoding utf8
+        $known[$k] = 1
         $newCorpus++
     }
 
