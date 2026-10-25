@@ -12,9 +12,11 @@ Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
 not classified are not counted either, even when the card name says PLAYBACK.
 
-generated_from: 2026-10-25T00:46:11Z
+generated_from: 2026-10-25T03:36:29Z
 
 ## Open product and playback cards
+
+**macOS scope (owner ruling 2026-10-25T00:44:41Z).** Deferred: macOS feature, performance and GPU work (MAC-MINI-BUILD-HOST-1, CPU-SIMD-CLANG-X86-ENABLE-1, CPU-NEON-HOT-KERNELS-1, GPU-PORTABLE-BACKEND-RHI-1, GPU-METAL-BACKEND-1) until Windows CUDA and the portable GL/RHI path are solid. Not deferred: macOS compilation stays green (MAC-LINUX-BUILD-RESTORE-1, the compile canary, PR #671).
 
 | P | card | kind | state | queued since | order_chain |
 |---|---|---|---|---|---|
@@ -28,7 +30,7 @@ generated_from: 2026-10-25T00:46:11Z
 | 1 | CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 | product | queued | 2026-10-21 | - |
 | 1 | BACHELOR-CORE-PARTITION-AB-1 | product | queued | 2026-10-23 | - |
 | 1 | PROCESSED8-MS-TELEMETRY-STUCK-1-VENUE-LEG | product | declared | 2026-10-24 | - |
-| 1 | CPU-17V9-FPS-GAP-AB-1 | product | declared | 2026-10-24 | - |
+| 1 | CPU-17V9-FPS-GAP-AB-1 | product | declared | 2026-10-24 | ORDER-20261025T013808Z #2 after LEASE-BATCH-LEASE-END-TZ-1 |
 | 2 | PLAYBACK-GL-PRESENT-BACKLOG-1 | product | declared | 2026-10-09 | ORDER-20261008T151800Z #2 after PLAYBACK-GL-PRESENT-SETUP-STALL-1 |
 | 2 | PLAYBACK-GPU-SCOPES-NO-VETO-1 | product | pr-open | 2026-10-15 | - |
 | 2 | PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 | product | pr-open | 2026-10-15 | - |
@@ -38,7 +40,7 @@ generated_from: 2026-10-25T00:46:11Z
 | 3 | HFR-NATIVE-60FPS-FULLRES-1 | product | pr-open | 2026-10-12 | ORDER-20261014T015628Z #3 after HFR-NATIVE-M16-1457-TIMEBUDGET-1 |
 | 3 | PLAYBACK-HFR-CONFORM-DEFAULT-1 | product | declared | 2026-10-15 | - |
 | 3 | WARM-RUN-CHROMA-SMOOTH-PARITY-1 | product | pr-open | 2026-10-18 | - |
-| 3 | MAC-LINUX-BUILD-RESTORE-1 | product | queued | 2026-10-25 | - |
+| 3 | MAC-LINUX-BUILD-RESTORE-1 | product | pr-open | 2026-10-25 | - |
 | 6 | PREP-WORKER-HL-RECON-REFUSAL-FIXTURE-1 | product | queued | 2026-10-07 | - |
 | 6 | C1-PARITY-TESTS-SKIP-WHEN-UNSET-1 | product | queued | 2026-10-09 | - |
 | 6 | PREP-TIER1-FROZEN-ORACLE-1 | product | queued | 2026-10-09 | - |
@@ -74,6 +76,8 @@ Landed = merged rows by `merged_utc` when the row has one, else by the newest st
 does not drain (queued >= landed)
 
 ## Parked with reason
+
+**macOS scope (owner ruling 2026-10-25T00:44:41Z).** Deferred: macOS feature, performance and GPU work (MAC-MINI-BUILD-HOST-1, CPU-SIMD-CLANG-X86-ENABLE-1, CPU-NEON-HOT-KERNELS-1, GPU-PORTABLE-BACKEND-RHI-1, GPU-METAL-BACKEND-1) until Windows CUDA and the portable GL/RHI path are solid. Not deferred: macOS compilation stays green (MAC-LINUX-BUILD-RESTORE-1, the compile canary, PR #671).
 
 - OUTPUT-BUDGET-M02-OPTIONAL-1 (P1): HUB-TICK 20261022T0853Z: r1 PARTIAL on NA-4 (gate-spec edit names owner footage path); blocked on NA4-CLIP-OR-NONE-AUTHORING-ROUTE-1 (par...
 - CI-WINDOWS-UNITTEST-SHARD-8-1 (P1): HUB-TICK 20261021T0740Z A4: not triggered (merge_group last 15 runs all success, none on ShardDurationBudgetTests; max windows shard ~114...

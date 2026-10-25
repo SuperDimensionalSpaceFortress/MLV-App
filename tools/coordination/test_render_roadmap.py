@@ -116,6 +116,23 @@ class ParkedSectionTests(unittest.TestCase):
         self.assertIn("(no note)", section)
 
 
+class MacosScopeNoteTests(unittest.TestCase):
+    """The owner's macOS ruling (deferred feature/perf/GPU, NOT deferred compilation) survives a re-render."""
+
+    def test_note_sits_beside_the_open_table_and_the_parked_section(self) -> None:
+        text = render_roadmap.render(load_fixture())
+        self.assertEqual(text.count(render_roadmap.MACOS_SCOPE_NOTE), 2)
+        open_part, rest = text.split("## Drain")
+        self.assertIn(render_roadmap.MACOS_SCOPE_NOTE, open_part)
+        self.assertIn(render_roadmap.MACOS_SCOPE_NOTE, rest.split("## Parked with reason")[1])
+
+    def test_note_says_compilation_is_not_deferred(self) -> None:
+        note = render_roadmap.MACOS_SCOPE_NOTE
+        self.assertIn("2026-10-25T00:44:41Z", note)
+        self.assertIn("Not deferred: macOS compilation stays green", note)
+        self.assertIn("MAC-LINUX-BUILD-RESTORE-1", note)
+
+
 class DrainTests(unittest.TestCase):
     def test_open_count_and_per_day_table_on_the_fixture(self) -> None:
         text = render_roadmap.render(load_fixture())

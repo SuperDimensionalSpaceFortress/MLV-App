@@ -64,6 +64,15 @@ hygiene and ci-flake cards are tooling churn and are not counted here. Rows the 
 not classified are not counted either, even when the card name says PLAYBACK.
 """
 
+# Standing owner ruling (chat e7cff0a2, 2026-10-25T00:44:41Z); static text, so a re-render keeps it.
+MACOS_SCOPE_NOTE = (
+    "**macOS scope (owner ruling 2026-10-25T00:44:41Z).** Deferred: macOS feature, performance and "
+    "GPU work (MAC-MINI-BUILD-HOST-1, CPU-SIMD-CLANG-X86-ENABLE-1, CPU-NEON-HOT-KERNELS-1, "
+    "GPU-PORTABLE-BACKEND-RHI-1, GPU-METAL-BACKEND-1) until Windows CUDA and the portable GL/RHI "
+    "path are solid. Not deferred: macOS compilation stays green (MAC-LINUX-BUILD-RESTORE-1, the "
+    "compile canary, PR #671)."
+)
+
 
 def _die(message: str) -> "None":
     print("render_roadmap: " + message, file=sys.stderr)
@@ -149,7 +158,8 @@ def render(data: dict) -> str:
     last = days[-1]
     landed_total, queued_total = sum(landed.values()), sum(queued.values())
 
-    out = [HEADER, "generated_from: %s" % generated, "", "## Open product and playback cards", ""]
+    out = [HEADER, "generated_from: %s" % generated, "", "## Open product and playback cards", "",
+           MACOS_SCOPE_NOTE, ""]
     out.append("| P | card | kind | state | queued since | order_chain |")
     out.append("|---|---|---|---|---|---|")
     for r in open_rows:
@@ -168,7 +178,7 @@ def render(data: dict) -> str:
         out.append("| %s | %d | %d |" % (d.isoformat(), landed[d], queued[d]))
     out.append("| total | %d | %d |" % (landed_total, queued_total))
     out += ["", _drain_line(len(open_rows), landed_total, queued_total), "",
-            "## Parked with reason", ""]
+            "## Parked with reason", "", MACOS_SCOPE_NOTE, ""]
     for r in parked:
         out.append("- %s (P%s): %s" % (r["card"], r["priority"], _note(r)))
     if not parked:
