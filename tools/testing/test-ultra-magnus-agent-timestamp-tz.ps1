@@ -24,7 +24,8 @@ param(
 #   out of range - AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a time at DateTime.MinValue or MaxValue never throws out of the three
 #                 sites above (a throw there ends the agent): queue age is clamped to [0, Int32.MaxValue], a launchingUtc
 #                 within 2 s of MinValue makes find-child unknown, and an adopt deadline that cannot be represented reads as
-#                 passed
+#                 passed. Both edges are pinned from the valid side too: MinValue + 2 s is accepted (found, never unknown), and an
+#                 unrepresentable deadline with an identity MISMATCH kills nothing (the identity check still runs first)
 # r2: the shift only shows when the process is NOT on UTC, so this test never trusts the host's zone. It FORCES the zone of the
 # process: once at UTC-5 (what moves a deadline 5 h LATE on a pwsh 7 JSON read-back) and once at UTC+5:30 (what moves it early
 # and kills a live job), and asserts the effective offset is non-zero and the forced one BEFORE any other assertion; a zero or
@@ -324,6 +325,18 @@ try {
             }
         }
     }
+    # The VALID edge (adversary Dot, r2): MinValue + 2 s is the earliest launchingUtc whose 2 s slack can be taken off (notBefore is
+    # exactly MinValue). It is accepted and processed like any other time: a live process is found, nothing throws, and it is
+    # never "unknown" (the guard above is strict, `-lt MinValue + 2 s`).
+    foreach ($kv in (New-Shapes ([DateTime]::SpecifyKind([DateTime]::MinValue.AddSeconds(2), [DateTimeKind]::Utc))).GetEnumerator()) {
+        foreach ($pref in @('Continue', 'Stop')) {
+            $r = Invoke-UnderPreference $pref { Find-LaunchedJobChild -Marker ([pscustomobject]@{ launchScriptPath = 'C:\jobs\the-job.ps1'; launchImagePath = ''; launchingUtc = $kv.Value }) }
+            $label = if ($r.threw) { 'threw' } else { [string]$r.value.state }
+            $childCases["minvalue+2s-valid-$($kv.Key)-$pref"] = $label
+            if ($r.threw) { $failures.Add("find-child minvalue+2s (valid boundary) $($kv.Key) ($pref): must not throw, threw $($r.threw)") }
+            elseif ($r.value.state -ne 'found') { $failures.Add("find-child minvalue+2s (valid boundary) $($kv.Key) ($pref): expected found (a valid time, never unknown), got $($r.value.state) ($($r.value.why))") }
+        }
+    }
     $results['findChild'] = $childCases
 
     # ---------------------------------------------------------------- adopt
@@ -384,6 +397,13 @@ try {
     foreach ($kv in (New-Shapes ([DateTime]::SpecifyKind([DateTime]::MaxValue.AddSeconds(-1), [DateTimeKind]::Utc))).GetEnumerator()) {
         foreach ($pref in @('Continue', 'Stop')) {
             Invoke-AdoptCase "maxvalue-$($kv.Key)-$pref" $kv.Value 3600 @($true) 'adopted/killed=True' $pref
+        }
+    }
+    # The same unrepresentable deadline, but the identity check says the pid is NOT this job's child (it was reused): the deadline
+    # reads as passed, yet the identity check still runs first (the final look), so nothing is killed.
+    foreach ($kv in (New-Shapes ([DateTime]::SpecifyKind([DateTime]::MaxValue.AddSeconds(-1), [DateTimeKind]::Utc))).GetEnumerator()) {
+        foreach ($pref in @('Continue', 'Stop')) {
+            Invoke-AdoptCase "maxvalue-mismatch-$($kv.Key)-$pref" $kv.Value 3600 @($false) 'adopted/killed=False' $pref
         }
     }
     $results['adopt'] = $script:AdoptSummary
