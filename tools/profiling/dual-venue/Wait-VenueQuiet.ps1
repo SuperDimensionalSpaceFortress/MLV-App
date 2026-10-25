@@ -662,7 +662,7 @@ try {
     elseif ($telGpu.state_reason -ceq 'multi-dgpu-ambiguous') { Set-TelNulls $telGpu $gpuFields 'multi-dgpu-ambiguous' }
     elseif ($telGpu.state -cne 'D0') { Set-TelNulls $telGpu $gpuFields 'skipped-wake-risk' }
     else {
-        # D0: the dGPU is already awake, so ONE nvidia-smi read cannot wake it
+        # D0 was the last recorded PnP power state, so nvidia-smi is read once; a D0->D3 change between the two reads is a known race (see header), not excluded
         $telGpu.skipped_wake_risk = $false
         $s = Invoke-TelBounded $TelSmiScript @() $TelemetryCallMs
         $code = $null
