@@ -37,6 +37,7 @@ H12 = "c" * 40  # recent: dated two days in the future
 
 FAKE_GH = r"""
 $dir = $env:QL_FAKE_GH_DIR
+if (Test-Path -LiteralPath (Join-Path $dir 'fail')) { exit 1 }
 if ($args[0] -eq 'api') {
     $path = @($args | Where-Object { $_ -like 'repos/*' })[0]
     $page = [int](@($args | Where-Object { $_ -like 'page=*' })[0] -replace '^page=', '')
@@ -356,6 +357,64 @@ class MeterFixtureTests(unittest.TestCase):
         # With statuses on, the dropped entry is refetched instead of crashing the run.
         result, out = self._measure_bus(bus, "p", cache={key: {"fetched": None, "rows": []}}, expect=2, gh=self._fake_gh())
         self.assertEqual((result["windows"][0]["statusUnknown"], result["windows"][0]["noPriorKey"]), (0, 1))
+
+    def test_a_cache_fetched_before_the_pass_is_not_evidence_when_the_refetch_fails(self) -> None:
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), _iso(NOW - timedelta(hours=1)), "pr7")])
+        gh = self._fake_gh()
+        (gh / "fail").write_text("", encoding="utf-8")
+        cache = {f"acme/widget@{H1}": {"fetched": _iso(NOW - timedelta(hours=2)), "rows": []}}
+        result, out = self._measure_bus(bus, "p", cache=cache, expect=2, gh=gh)
+        for window in result["windows"]:
+            self.assertEqual((window["statusUnknown"], window["noPriorKey"]), (1, 0), window["window"])
+        self.assertEqual(self._corpus(out), [])
+        result, _ = self._measure_bus(bus, "p", cache=cache)  # -NoStatuses: the same stale entry proves nothing either
+        self.assertEqual((result["windows"][0]["statusUnknown"], result["windows"][0]["noPriorKey"]), (1, 0))
+
+    def test_a_later_blocking_pass_refetches_and_is_judged_on_its_own_time(self) -> None:
+        p = "cos-feedback/p/pr-7.md"
+        bus = self._small_bus([
+            (p, _section(7, H1, "B1 x."), _iso(NOW - timedelta(days=2)), "first block"),
+            (p, _section(7, H1, "B1 still."), _iso(NOW - timedelta(hours=1)), "second block, same head"),
+        ])
+        gh = self._fake_gh({("acme/widget", H1): [_status("review/key-a", "success", _iso(NOW - timedelta(days=1)))]})
+        cache = {f"acme/widget@{H1}": {"fetched": _iso(NOW - timedelta(days=2) + timedelta(minutes=1)), "rows": []}}
+        result, _ = self._measure_bus(bus, "p", since=_iso(NOW - timedelta(days=5)), cache=cache, gh=gh)
+        since, d1 = result["windows"]
+        self.assertEqual((since["noPriorKey"], since["trueMiss"]), (1, 0))  # judged at the first block: success came later
+        self.assertEqual((d1["noPriorKey"], d1["trueMiss"]), (0, 1))  # judged at the second block: success came before
+
+    def test_a_cache_row_whose_context_is_not_text_is_malformed(self) -> None:
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7")])
+        for context in (["a", "b"], 7, True, {"k": 1}, ""):
+            row = {"context": context, "firstUtc": "2026-10-21T09:00:00Z", "state": "success", "successUtc": "2026-10-21T09:00:00Z", "failureUtc": None}
+            result, _ = self._measure_bus(bus, "p", cache={f"acme/widget@{H1}": {"fetched": "2026-10-21T12:00:00Z", "rows": [row]}}, expect=2)
+            self.assertEqual(result["windows"][0]["statusUnknown"], 1, context)
+
+    def test_fleet_mode_finds_a_project_whose_folder_was_deleted_in_the_window(self) -> None:
+        bus = self._small_bus([
+            ("cos-feedback/README.md", "readme\n", "2026-10-20T00:00:00+00:00", "seed"),
+            ("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), _iso(NOW - timedelta(hours=3)), "pr7"),
+            ("cos-feedback/p/pr-7.md", None, _iso(NOW - timedelta(hours=2)), "pr7 deleted"),
+        ])
+        out = self._dir()
+        proc = self._run("-Bus", str(bus), "-Since", _iso(NOW - timedelta(days=1)), "-OutDir", str(out), "-NoStatuses", "-NoFetch")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("| **fleet** | 1 | 1 (100%) |", (out / "fleet.md").read_text(encoding="utf-8-sig"))
+
+    @unittest.skipUnless(os.name == "nt", "the lock is a Windows share-mode lock")
+    def test_a_second_run_on_the_same_folder_waits_then_reports_the_held_lock(self) -> None:
+        out = self._dir()
+        with open(out / ".quality-lift.lock", "a", encoding="utf-8"):
+            proc = self._run("-Bus", str(self.bus), "-Project", "demo", "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out),
+                             "-NoStatuses", "-NoFetch", "-LockWaitSec", "1")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("holds the lock", proc.stdout)
+        self.assertFalse((out / "quality-lift.json").exists())
+
+    def test_a_heading_that_only_starts_with_blockers_is_not_the_section(self) -> None:
+        text = f"# acme/widget #7 / {H1}\n\n## Blockers explained\nContext only.\n\n## Blockers\nB1 real defect.\n"
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", text, "2026-10-20T10:00:00+00:00", "heading prefix")])
+        self.assertEqual(self._measure_bus(bus, "p")[0]["windows"][0]["blocked"], 1)
 
     # -- windows
 

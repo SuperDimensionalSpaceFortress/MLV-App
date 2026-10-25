@@ -29,16 +29,21 @@
 #   -Since      ISO time (an offset or Z); default 7 days ago. Normalised to UTC before use.
 #   -NoStatuses read nothing from GitHub (no statuses, no PR bodies): the status cache already in -OutDir is still used, heads
 #               it lacks count as statusUnknown, and the adoption counts read n/a. -NoFetch skips the bus pull.
+#   -LockWaitSec how long a run waits for another run on the same project folder (default 60); past it, a source error.
+# Status evidence: a cached status list proves what existed before a CoS pass only when it was fetched AFTER that pass
+# (statuses are append-only with their creation time). An entry fetched earlier is refetched, and reads as unknown when it
+# cannot be.
 # Exit 0 = measured; 2 = measured with source errors (named in the report: a bus read, the bus pull, a GitHub read, a
-# truncated listing); 3 = bus unreadable (unset, missing, no cos-feedback/, or not a git repository); 4 = usage error (no
-# -OutDir, an unparseable -Since).
+# truncated listing, a malformed cache entry, a held lock); 3 = bus unreadable (unset, missing, no cos-feedback/, or not a
+# git repository); 4 = usage error (no -OutDir, an unparseable -Since).
 param(
     [string]$Bus = $env:FACTORY_BUS_CLONE,
     [string]$Project = "",
     [string]$Since = ([DateTime]::UtcNow.AddDays(-7).ToString('yyyy-MM-ddTHH:mm:ssZ')),
     [string]$OutDir = "",
     [switch]$NoStatuses,
-    [switch]$NoFetch
+    [switch]$NoFetch,
+    [ValidateRange(0, 600)][int]$LockWaitSec = 60
 )
 $ErrorActionPreference = 'Stop'
 $StatusPageMax = 20      # 100 statuses per page; a head with more than 2,000 is a named source error, never a silent cut
@@ -72,7 +77,7 @@ function Get-QlPasses([string]$Proj, [string]$From) {
             $m = $ms[$ms.Count - 1]
             $sec = $txt.Substring($m.Index)
             # The heading line, not the phrase: a verdict that mentions "## Blockers" mid-line is not the section.
-            $hm = [regex]::Match($sec, '(?m)^##[ \t]+Blockers')
+            $hm = [regex]::Match($sec, '(?m)^##[ \t]+Blockers[ \t]*$')
             $blk = ''
             if ($hm.Success) { $blk = ((($sec.Substring($hm.Index + $hm.Length) -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 1) + '').Trim() }
             $out += [pscustomobject]@{
@@ -110,7 +115,7 @@ function Test-QlCacheEntry($e) {
         $null = ConvertTo-QlUtc $e.fetched
         if ($e.rows -isnot [array]) { return $false }
         foreach ($r in $e.rows) {
-            if ($null -eq $r -or $r -is [string] -or -not "$($r.context)") { return $false }
+            if ($null -eq $r -or $r -is [string] -or $r.context -isnot [string] -or -not $r.context) { return $false }
             $null = ConvertTo-QlUtc $r.firstUtc
             foreach ($v in @($r.successUtc, $r.failureUtc)) { if ($null -ne $v -and "$v" -ne '') { $null = ConvertTo-QlUtc $v } }
         }
@@ -145,6 +150,12 @@ function Get-QlStatusRows([string]$Repo, [string]$Head) {
 
 function Test-QlBefore([object]$When, [DateTime]$Cos) { ($null -ne $When) -and ("$When" -ne '') -and ((ConvertTo-QlUtc $When) -lt $Cos) }
 
+# The cache entry that proves the statuses of one pass, or $null: it must have been fetched at or after the pass.
+function Get-QlEvidence([hashtable]$Cache, $p) {
+    $e = $Cache[(Get-QlKey $p)]
+    if ($e -and (ConvertTo-QlUtc $e.fetched) -ge $p.utc) { $e } else { $null }
+}
+
 function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache) {
     # An empty window can arrive as $null, and @($null) is one element: drop nulls so it counts zero passes.
     $P = @($P | Where-Object { $null -ne $_ })
@@ -152,9 +163,9 @@ function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache) {
     $firstPerPr = @($P | Group-Object { "$($_.repo)#$($_.pr)" } | ForEach-Object { $_.Group | Sort-Object firstSeen | Select-Object -First 1 })
     $noKey = 0; $trueMiss = 0; $unknown = 0; $keyStats = [ordered]@{}
     foreach ($b in $blocked) {
-        $k = Get-QlKey $b
-        if (-not $Cache.ContainsKey($k)) { $unknown++; continue }
-        $rows = @($Cache[$k].rows | Where-Object { $null -ne $_ })
+        $e = Get-QlEvidence $Cache $b
+        if (-not $e) { $unknown++; continue }
+        $rows = @($e.rows | Where-Object { $null -ne $_ })
         $before = @($rows | Where-Object { Test-QlBefore $_.firstUtc $b.utc })
         if ($before.Count -eq 0) { $noKey++ }
         if (@($rows | Where-Object { Test-QlBefore $_.successUtc $b.utc }).Count) { $trueMiss++ }
@@ -179,8 +190,25 @@ function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache) {
 
 function Format-QlFirst($w) { "$($w.noPriorKey) of $($w.blocked)$(if ($w.statusUnknown) { " ($($w.statusUnknown) unknown)" })" }
 
+# One run per project folder at a time: the corpus check-then-append and the cache rewrite are not safe to interleave. A run
+# that cannot take the lock within -LockWaitSec writes nothing and reports a source error.
 function Measure-QlProject([string]$Proj, [string]$Dir) {
     New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+    $lockPath = Join-Path $Dir '.quality-lift.lock'
+    $lock = $null
+    $deadline = [DateTime]::UtcNow.AddSeconds($LockWaitSec)
+    while ($true) {
+        try { $lock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None'); break }
+        catch { if ([DateTime]::UtcNow -ge $deadline) { break }; Start-Sleep -Milliseconds 250 }
+    }
+    if (-not $lock) {
+        $empty = Get-QlWindow @() 'since' @{}
+        return [pscustomobject]@{ project = $Proj; headline = "QUALITY-LIFT $Proj NOT MEASURED: another run holds the lock $lockPath"; all = $empty; d1 = $empty; adopt = [ordered]@{ prs = $null; withAdversaryLine = $null }; errors = 1 }
+    }
+    try { Measure-QlProjectLocked $Proj $Dir } finally { $lock.Dispose() }
+}
+
+function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
     $now = [DateTime]::UtcNow
     $d1Start = $now.AddHours(-24)
     $errors = @($script:SharedErrors)
@@ -203,11 +231,14 @@ function Measure-QlProject([string]$Proj, [string]$Dir) {
         } catch { $cache = @{}; $errors += "status-cache.json does not parse; ignored" }
     }
     if (-not $NoStatuses) {
-        foreach ($p in ($heads | Where-Object blocked)) {
-            $k = Get-QlKey $p
+        # Refetch a head unless its entry was fetched after its LATEST blocking pass: each window may compare against a
+        # different blocking pass of the same head, and only an entry fetched after a pass proves that pass's statuses.
+        $latest = @{}
+        foreach ($p in ($raw | Where-Object blocked)) { $k = Get-QlKey $p; if (-not $latest.ContainsKey($k) -or $p.utc -gt $latest[$k].utc) { $latest[$k] = $p } }
+        foreach ($k in @($latest.Keys)) {
+            $p = $latest[$k]
             try {
-                $e = $cache[$k]
-                if ($e -and ((($now - (ConvertTo-QlUtc $e.fetched)).TotalHours -lt 1) -or (($now - $p.utc).TotalHours -gt 6))) { continue }
+                if (Get-QlEvidence $cache $p) { continue }
                 $cache[$k] = [pscustomobject]@{ fetched = $now.ToString('o'); rows = @(Get-QlStatusRows $p.repo $p.head) }
             } catch { $errors += "statuses $($p.repo)@$($p.head.Substring(0,8)): $($_.Exception.Message)" }
         }
@@ -247,8 +278,9 @@ function Measure-QlProject([string]$Proj, [string]$Dir) {
     $newCorpus = 0
     foreach ($b in ($heads | Where-Object blocked | Sort-Object utc)) {
         $k = Get-QlKey $b
-        if ($known.ContainsKey($k) -or -not $cache.ContainsKey($k)) { continue }
-        $prior = @($cache[$k].rows | Where-Object { $null -ne $_ -and (Test-QlBefore $_.successUtc $b.utc) } | ForEach-Object context)
+        $e = Get-QlEvidence $cache $b
+        if ($known.ContainsKey($k) -or -not $e) { continue }
+        $prior = @($e.rows | Where-Object { $null -ne $_ -and (Test-QlBefore $_.successUtc $b.utc) } | ForEach-Object context)
         ([ordered]@{ addedUtc = $now.ToString('o'); cosUtc = $b.utc.ToString('o'); repo = $b.repo; pr = $b.pr; head = $b.head; blocker = $b.blocker; successBeforeCos = $prior } | ConvertTo-Json -Compress) | Add-Content -LiteralPath $corpusFile -Encoding utf8
         $known[$k] = 1
         $newCorpus++
@@ -290,7 +322,14 @@ if ($Project) {
     $r.headline
     if ($r.errors) { exit 2 } else { exit 0 }
 }
-$projects = @(Get-ChildItem -LiteralPath (Join-Path $Bus 'cos-feedback') -Directory | Where-Object { $_.Name -notmatch '^[_.]' } | ForEach-Object Name)
+# Projects: every folder under cos-feedback/ now, plus every folder a commit in the window touched (a project whose files
+# were since deleted still had CoS passes in the window).
+$fromUtc = $(if ($SinceUtc -lt [DateTime]::UtcNow.AddHours(-24)) { $SinceUtc } else { [DateTime]::UtcNow.AddHours(-24) })
+$touched = @(git -C $Bus log --since-as-filter=$($fromUtc.ToString('yyyy-MM-ddTHH:mm:ssZ')) --name-only --format= -- cos-feedback/)
+if ($LASTEXITCODE -ne 0) { $SharedErrors += "git log of cos-feedback/ failed (exit $LASTEXITCODE); projects listed from the checkout only" }
+$projects = @(@(Get-ChildItem -LiteralPath (Join-Path $Bus 'cos-feedback') -Directory | ForEach-Object Name) +
+    @($touched | ForEach-Object { if ($_ -match '^cos-feedback/([^/]+)/') { $Matches[1] } }) |
+    Where-Object { $_ -and $_ -notmatch '^[_.]' } | Sort-Object -Unique)
 $results = @(foreach ($p in $projects) { Measure-QlProject $p (Join-Path $OutDir $p) })
 $pct = { param($x) if ($null -eq $x) { 'n/a' } else { "$([math]::Round(100 * [double]$x))%" } }
 $fl = @()

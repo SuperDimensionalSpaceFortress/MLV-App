@@ -24,7 +24,8 @@ nothing from GitHub: blocked heads with no cached statuses then count as "unknow
 means measured, 2 measured with source errors (named in the report), 3 bus unreadable, and 4 a usage error.
 
 Then run it hourly from your project's own scheduler, with the same arguments and no `-Since` (the default is the last 7
-days). Each run appends one row to `<OutDir>\history.jsonl`, so the 24 h targets can be read as a trend:
+days). Runs on one project folder take turns through a lock file there; a run that waits past `-LockWaitSec` (default
+60) writes nothing and exits 2. Each run appends one row to `<OutDir>\history.jsonl`, so the 24 h targets can be read as a trend:
 
 - first-round CoS blocked rate below 20 % over 24 h;
 - CoS read first: 0;
