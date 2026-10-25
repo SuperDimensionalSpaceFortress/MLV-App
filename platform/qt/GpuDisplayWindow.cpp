@@ -1861,6 +1861,17 @@ void GpuDisplayWindow::dumpWarmOutputReuseMiss(const uint16_t *deviceBayer16,
                              + QStringLiteral(" dir=\"") + dir + QStringLiteral("\"");
 }
 
+void GpuDisplayWindow::swapOutsidePaintEventAndRecord(GpuDisplayWindow *win, QOpenGLContext *glContext)
+{
+    glContext->swapBuffers(win);
+    // Real swap path 2 of 3: this manual swap runs outside Qt's own paint-event cycle, so
+    // QOpenGLWindow's frameSwapped() signal (path 1, connected in the constructor) does
+    // NOT fire for it -- record it explicitly so swap telemetry covers every real swap.
+    // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2: the screenshot grab and the visual-capture
+    // forced paint both swap HERE, once per frame they paint, never inline.
+    if ( swapTelemetryEnabled() ) win->noteRealSwap();
+}
+
 bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,
                                                         QString *reason,
                                                         quint64 *presentedSerial,
@@ -1933,16 +1944,46 @@ bool GpuDisplayWindow::grabPresentedFramebufferIfActive(QImage *outImage,
     // The capture-triggered paintGL() call above genuinely drew and read back a frame --
     // swap now so the window's own swapchain reflects exactly what was just captured,
     // making this a real present rather than a side-channel readback.
-    glContext->swapBuffers(win);
-    // Real swap path 2 of 3: this manual swap runs outside Qt's own paint-event cycle, so
-    // QOpenGLWindow's frameSwapped() signal (path 1, connected in the constructor) does
-    // NOT fire for it -- record it explicitly so swap telemetry covers every real swap.
-    if ( swapTelemetryEnabled() ) win->noteRealSwap();
+    swapOutsidePaintEventAndRecord(win, glContext);
     if ( madeCurrent ) win->doneCurrent();
 
     if ( outImage ) *outImage = win->m_captureReadbackImage;
     if ( reason ) reason->clear();
     return true;
+}
+
+bool GpuDisplayWindow::presentedSerialIfActive(quint64 *presentedSerial)
+{
+    if ( presentedSerial ) *presentedSerial = 0;
+    QMutexLocker lock(&g_activeMutex);
+    GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+    if ( !win ) return false;
+    if ( presentedSerial ) *presentedSerial = win->m_presentedSerial;
+    return win->m_presentedSerialValid;
+}
+
+bool GpuDisplayWindow::paintPendingNowIfActive(quint64 *presentedSerial)
+{
+    {
+        QMutexLocker lock(&g_activeMutex);
+        GpuDisplayWindow *win = g_activeWindow.load(std::memory_order_acquire);
+        // A frame is pending when a submit's serial has not yet been promoted by paintGL().
+        const bool pending = win
+            && ( win->m_pendingPresentationSerialValid != win->m_presentedSerialValid
+              || win->m_pendingPresentationSerial != win->m_presentedSerial );
+        QOpenGLContext *glContext = win ? win->context() : nullptr;
+        if ( pending && glContext && QThread::currentThread() == win->thread()
+          && win->isExposed() && win->isValid() )
+        {
+            const bool needsCurrent = QOpenGLContext::currentContext() != glContext;
+            const bool madeCurrent = needsCurrent ? (win->makeCurrent(), true) : false;
+            win->paintGL();
+            // One swap for the one frame just painted, through the grab's own site (path 2).
+            swapOutsidePaintEventAndRecord(win, glContext);
+            if ( madeCurrent ) win->doneCurrent();
+        }
+    }
+    return presentedSerialIfActive(presentedSerial);
 }
 
 void GpuDisplayWindow::initializeGL()
