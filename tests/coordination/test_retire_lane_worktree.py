@@ -3781,3 +3781,48 @@ def test_launcher_census_r9_a_default_parameter_binder_leaves_a_scriptblock_crea
 def test_launcher_census_r9_control_a_non_binder_default_keeps_the_literal(write):
     text = _r9(write, use=_R7_MARKER + " | Out-File -FilePath x.txt")
     assert _unresolved_sites(text) == [], f"a default that binds no variable made a safe same-scope literal unresolved: {text!r}"
+
+
+# --- r9 round 2 (sol r1 BLOCKER and Fable r1 items 1-2 on #678, CoS dot B1, hub ACK 6398138185): a compound write (`+=`) to a
+# $PSDefaultParameterValues entry builds a name its right side does not hold, and an assignment of the table whose value another name takes
+# (`$x = ($PSDefaultParameterValues = @{})`) aliases it. Each shape was run in pwsh and does rebind `$cmd` (r2 run dir
+# proof\runtime-witness-r2.txt). Catalogue row S-06 is the first case.
+@pytest.mark.parametrize("write,use", [
+    pytest.param("$PSDefaultParameterValues = @{'Tee-Object:Variable' = 'cm'}; $PSDefaultParameterValues['Tee-Object:Variable'] += 'd'",
+                 _R7_MARKER + " | Tee-Object", id="s06-index-plus-equals"),
+    pytest.param("$PSDefaultParameterValues = @{'Tee-Object:Variable' = 'cm'}; $PSDefaultParameterValues.'Tee-Object:Variable' += 'd'",
+                 _R7_MARKER + " | Tee-Object", id="s06-member-plus-equals"),
+    pytest.param("$PSDefaultParameterValues['*:OutVariable'] = 'c'; $PSDefaultParameterValues['*:OutVariable'] += 'md'",
+                 _R7_MARKER + " | Write-Output", id="index-write-then-plus-equals"),
+    pytest.param("$x = ($PSDefaultParameterValues = @{}); $x['Tee-Object:Variable'] = 'cmd'", _R7_MARKER + " | Tee-Object",
+                 id="chained-assignment-alias"),
+    pytest.param("$x = ($PSDefaultParameterValues = @{}); $x['*:OutVariable'] = 'cmd'", _R7_MARKER + " | Write-Output",
+                 id="chained-assignment-alias-outvariable"),
+    pytest.param("$x = $PSDefaultParameterValues = @{}; $x['Tee-Object:Variable'] = 'cmd'", _R7_MARKER + " | Tee-Object",
+                 id="chained-assignment-alias-no-parens"),
+])
+def test_launcher_census_r9_round2_a_compound_or_aliasing_default_write_leaves_the_read_unresolved(write, use):
+    _r5_iex_is_unresolved(_r9(write, use))
+
+
+# Policy (hub ACK 6398138185): the census does not model the value a compound operator leaves, so any operator other than `=` on an entry
+# taints every name, whatever its right side. `??= 'other'` does not rebind `$cmd` at run time (witness c-null-coalesce-other); it is
+# reported unresolved on purpose.
+@pytest.mark.parametrize("write", [
+    pytest.param("$PSDefaultParameterValues = @{}; $PSDefaultParameterValues['Tee-Object:Variable'] ??= 'other'", id="index-null-coalescing"),
+    pytest.param("$PSDefaultParameterValues = @{}; $PSDefaultParameterValues.'Tee-Object:Variable' ??= 'other'", id="member-null-coalescing"),
+])
+def test_launcher_census_r9_round2_any_compound_entry_write_taints_every_name(write):
+    _r5_iex_is_unresolved(_r9(write))
+
+
+# Controls: a plain `=` entry write whose literal names another variable binds only that name, and a table assignment in a statement block
+# (its value taken by no one) is still read as a literal, so a safe same-scope literal stays resolved.
+@pytest.mark.parametrize("write", [
+    pytest.param("$PSDefaultParameterValues = @{}; $PSDefaultParameterValues['Tee-Object:Variable'] = 'other'", id="index-plain-other-name"),
+    pytest.param("$PSDefaultParameterValues = @{}; $PSDefaultParameterValues.'Tee-Object:Variable' = 'other'", id="member-plain-other-name"),
+    pytest.param("if ($true) { $PSDefaultParameterValues = @{'Tee-Object:Variable' = 'other'} }", id="statement-block-assignment"),
+])
+def test_launcher_census_r9_round2_control_a_plain_entry_write_keeps_the_literal(write):
+    text = _r9(write)
+    assert _unresolved_sites(text) == [], f"a plain default naming another variable made a safe same-scope literal unresolved: {text!r}"

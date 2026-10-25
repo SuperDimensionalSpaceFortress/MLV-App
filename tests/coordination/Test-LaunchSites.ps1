@@ -97,7 +97,9 @@ Rules, written down because the census depends on them:
                 a call of Remove, ContainsKey, Contains, get_Item, Clear, ContainsValue, Clone or GetEnumerator; a read of .Count / .Keys /
                 .Values. A key that is not constant, a right side that is not a hashtable literal, any other use (aliased to another
                 name, passed to or piped into a command, [ref], cast), and a constant string naming PSDefaultParameterValues (Set-Variable,
-                the variable: drive) taint every name.
+                the variable: drive) taint every name. (r9 round 2, #678) So do an entry write with any operator other than `=` (`+=`,
+                `??=`, ...: the value it leaves is not read), and a table assignment whose value is taken (`$x = ($PSDefaultParameterValues
+                = @{})` aliases the table): only one that is a statement of its own block is read.
 #>
 [CmdletBinding()]
 param()
@@ -604,11 +606,11 @@ function Get-ParenOuter($V) {
     return $u
 }
 
-# The right side of the assignment whose left side is $Left (looked through casts and attributes).
-function Get-AssignRight($Left) {
+# The assignment whose left side is $Left (looked through casts and attributes).
+function Get-Assignment($Left) {
     $p = $Left
     while ($p.Parent -is [AttributedExpressionAst]) { $p = $p.Parent }
-    return $p.Parent.Right
+    return $p.Parent
 }
 
 # r9 (rule V3): a $PSDefaultParameterValues entry `<command>:<parameter>` = $Value binds a variable when its parameter part is a binder
@@ -618,6 +620,13 @@ function Add-DefaultKeyTaint($Ctx, $Key, $Value) {
     if ($null -eq $k) { if (-not ((Get-Inner $Key) -is [ConstantExpressionAst])) { $Ctx.TaintAll = $true }; return }
     $param = if ($k.Contains(':')) { $k.Substring($k.IndexOf(':') + 1).Trim() } else { '' }
     if ($param -match '[*?\[]' -or (Test-BinderParameter $param) -or (Test-BinderParameter $k.Trim())) { Add-Taint $Ctx $Value }
+}
+
+# r9 round 2 (sol r1 BLOCKER on #678, CoS dot B1): `[<key>] += v` builds a name its right side does not hold; any operator other than `=`
+# taints every name, and the value it leaves is not modelled.
+function Add-DefaultEntryWrite($Ctx, $Left, $Key) {
+    $a = Get-Assignment $Left
+    if ($a.Operator -eq [TokenKind]::Equals) { Add-DefaultKeyTaint $Ctx $Key $a.Right } else { $Ctx.TaintAll = $true }
 }
 
 $DefaultsReadMethods = [HashSet[string]]::new([string[]]@('remove', 'containskey', 'contains', 'get_item', 'clear', 'containsvalue', 'clone', 'getenumerator'))
@@ -632,7 +641,9 @@ function Add-DefaultParameterTaints($Ctx) {
             $a = $v.Parent
             while ($a -is [AttributedExpressionAst]) { $a = $a.Parent }
             $h = Get-Inner $a.Right
-            if (($a.Operator -eq [TokenKind]::Equals -or $a.Operator -eq [TokenKind]::PlusEquals) -and $h -is [HashtableAst]) {
+            # r9 round 2 (Fable r1 item 2): `$x = ($PSDefaultParameterValues = @{})` hands the table to $x; only a statement of its own block is read
+            $own = $a.Parent -is [NamedBlockAst] -or $a.Parent -is [StatementBlockAst]
+            if ($own -and ($a.Operator -eq [TokenKind]::Equals -or $a.Operator -eq [TokenKind]::PlusEquals) -and $h -is [HashtableAst]) {
                 foreach ($kv in $h.KeyValuePairs) { Add-DefaultKeyTaint $Ctx $kv.Item1 $kv.Item2 }
             }
             else { $Ctx.TaintAll = $true }
@@ -648,12 +659,12 @@ function Add-DefaultParameterTaints($Ctx) {
         }
         if ($p -is [MemberExpressionAst] -and -not ($p -is [InvokeMemberExpressionAst]) -and [object]::ReferenceEquals($p.Expression, $u) -and -not $p.Static -and
             $p.Member -is [StringConstantExpressionAst]) {
-            if (Test-AssignTarget $p) { Add-DefaultKeyTaint $Ctx $p.Member (Get-AssignRight $p) }
+            if (Test-AssignTarget $p) { Add-DefaultEntryWrite $Ctx $p $p.Member }
             elseif (-not $SplatReadMembers.Contains($p.Member.Value.ToLowerInvariant())) { $Ctx.TaintAll = $true }
             continue
         }
         if ($p -is [IndexExpressionAst] -and [object]::ReferenceEquals($p.Target, $u)) {
-            if (Test-AssignTarget $p) { Add-DefaultKeyTaint $Ctx $p.Index (Get-AssignRight $p) }
+            if (Test-AssignTarget $p) { Add-DefaultEntryWrite $Ctx $p $p.Index }
             continue
         }
         $Ctx.TaintAll = $true
