@@ -33,6 +33,9 @@
 #      defaults: at run start ONE exempt light job (venue-quiet-probe-caps-<stamp>, no lease) prints C:\Users\layib\.claude\ops\heavy-slot.lease.json and the run takes
 #      cooldown = cooldown_minutes*60, budget = max_fraction_per_3h*10800 and lease cap = min(2700, max_minutes*60) from it (capsSource=live in the receipts and the CAPS
 #      line of batch.log). Unreadable or invalid (heavy-slot.py's own rules) -> 1800 / 5400 / 2700 (capsSource=fallback). A caller can only tighten them (LEASE_CAP_RELAXED):
+#      r2 (CoS/Dot on affa0d1a): the budget is always fraction * the FIXED 10800 s, whatever -LeaseBudgetWindowSec is (a longer window only counts more earlier leases
+#      against it, a shorter one only shrinks it); a cooldown is kept exactly (2880 min = 172800 s), and one no int of seconds can hold is the fallback; the probe job id is
+#      venue-quiet-probe-caps-<stamp>-<12 hex GUID> (New-VenueCapsProbeId), so two runs started in the same second never share an id.
 #      a. 45 min max lease: the agent asks for LeaseMaxMinutes (<= 45) and a leg is started only while the lease has room for it, and that room never runs past
 #         -LeaseCapSec (2700) after the open was read, nor past the 3 h budget left (c).
 #      b. 30 min cooldown: before each open the run waits until -LeaseCooldownSec (1800) after the end of the last lease it (or any earlier run on this host)
@@ -283,7 +286,7 @@ function Write-BatchReceipt([System.Collections.IDictionary]$B) {
 # BACHELOR-DEDICATED-CAPS-RUNNER-1: the caps are Bachelor's heavy-slot.lease.json (the owner moves them), so they are READ, not mirrored: one light exempt job
 # (GateExemptJobPattern ^venue-quiet-probe-: no lease, no slot, no venue claim) prints the file; anything unreadable or invalid is the old constants (the tightest ever
 # set), typed capsSource=fallback.
-$capsProbeId = 'venue-quiet-probe-caps-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ')
+$capsProbeId = New-VenueCapsProbeId
 $capsProbe = Submit-AgentJob $capsProbeId ("`$p = 'C:\Users\layib\.claude\ops\heavy-slot.lease.json'`r`nif (Test-Path -LiteralPath `$p -PathType Leaf) { [IO.File]::ReadAllText(`$p) } else { 'HEAVY_SLOT_LEASE_JSON_MISSING' }") 60 180
 $capsText = ''; $capsWhy = $null
 if ($capsProbe.outcome -cne 'RECEIPT' -or $null -eq $capsProbe.result) { $capsWhy = "probe-$($capsProbe.outcome)" }

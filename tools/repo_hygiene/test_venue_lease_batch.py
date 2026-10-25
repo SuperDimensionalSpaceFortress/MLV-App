@@ -635,7 +635,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         probes = self.caps_events_raw()
         self.assertEqual(len(probes), 1, probes)
-        self.assertRegex(probes[0].split(" ", 3)[2], r"^venue-quiet-probe-caps-\d{8}T\d{6}Z$")
+        self.assertRegex(probes[0].split(" ", 3)[2], r"^venue-quiet-probe-caps-\d{8}T\d{6}Z-[0-9a-f]{8,}$")
         self.assertIn("heavy-slot.lease.json", probes[0], "the probe prints Bachelor's lease config")
         self.assertIn(r"C:\Users\layib\.claude\ops\heavy-slot.lease.json", probes[0])
         self.assertIn("notAfter=<unset>", probes[0])
@@ -745,6 +745,74 @@ $o | ConvertTo-Json -Compress
         self.assertIn("LEASE_CAP_RELAXED", got["fb-cooldown-looser"])
         self.assertIn("LEASE_CAP_RELAXED", got["fb-budget-looser"])
         self.assertEqual(got["fb-tighter"], "True 2400 3000 2700")
+
+    def test_r2_b1_a_non_default_window_never_loosens_the_budget_of_the_fixed_3_hour_basis(self) -> None:
+        # CoS/Dot B1 on affa0d1a: budget = max_fraction_per_3h * 10800 whatever -LeaseBudgetWindowSec says (it used to be fraction * the CALLER's window, so 21600 doubled
+        # it). A longer window can only count MORE of the earlier leases against the same budget; a shorter one may only shrink the budget, never raise it.
+        caps = json.dumps({**self.LIVE_CAPS, "cooldown_minutes": 0, "max_fraction_per_3h": 0.5})
+        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+$now = [DateTime]::UtcNow
+$o = [ordered]@{{}}
+foreach ($w in 10800, 21600, 86400, 3600, 600) {{
+    $c = Get-VenueLeaseCaps -Text '{caps}' -WindowSec $w
+    # 5400 s of leases that ended just now (the exact CoS example): a 45 min lease needs 5400 - 2700 or less already used in its window
+    $leases = @([pscustomobject]@{{ startUtc = $now.AddSeconds(-5400).ToString('o'); endUtc = $now.ToString('o') }})
+    $b = Get-VenueLeaseBudgetWait -Leases $leases -NowUtc $now -CapSec $c.capSec -CooldownSec $c.cooldownSec -WindowSec $w -BudgetSec $c.budgetSec
+    $o["w$w"] = [ordered]@{{ source = $c.source; budgetSec = $c.budgetSec; reason = $b.reason; waitSec = $b.waitSec }}
+}}
+$o | ConvertTo-Json -Compress -Depth 4
+"""
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["w10800"]["budgetSec"], 5400)
+        for w in (21600, 86400):
+            with self.subTest(window=w):
+                self.assertEqual(got[f"w{w}"]["budgetSec"], 5400, "a longer window must not raise the budget")
+                self.assertEqual(got[f"w{w}"]["reason"], "BUDGET", "5400 s taken, fraction 0.5: the next lease WAITS")
+                self.assertGreater(got[f"w{w}"]["waitSec"], 0)
+        for w in (3600, 600):
+            with self.subTest(window=w):
+                self.assertLessEqual(got[f"w{w}"]["budgetSec"], 5400, "a shorter window may only tighten")
+                self.assertEqual(got[f"w{w}"]["budgetSec"], w // 2, "the fraction of the shorter window")
+        self.assertEqual(got["w10800"]["reason"], "BUDGET")
+
+    def test_r2_b1b_a_configured_cooldown_is_never_silently_shortened(self) -> None:
+        # CoS/Dot B1b on affa0d1a: cooldown_minutes 2880 (2 days) was clipped to 86400 s. The exact value is kept up to what an int of seconds holds; beyond that the
+        # config is unrepresentable and is the FALLBACK with a typed reason (never a shorter cooldown than the one configured).
+        def caps(minutes: float) -> str:
+            return json.dumps({**self.LIVE_CAPS, "cooldown_minutes": minutes})
+        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+$o = [ordered]@{{}}
+$i = 0
+foreach ($t in '{caps(1440)}', '{caps(2880)}', '{caps(10080)}', '{caps(0.5)}', '{caps(1e9)}') {{
+    $c = Get-VenueLeaseCaps -Text $t
+    $o["c$i"] = "$($c.source) $($c.cooldownSec) $($c.reason)".Trim(); $i++
+}}
+$o | ConvertTo-Json -Compress
+"""
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["c0"], "live 86400")
+        self.assertEqual(got["c1"], "live 172800", "2880 min is 172800 s, not the old 86400 clip")
+        self.assertEqual(got["c2"], "live 604800")
+        self.assertEqual(got["c3"], "live 30")
+        self.assertTrue(got["c4"].startswith("fallback 1800 cooldown_minutes-unrepresentable"), got["c4"])
+
+    def test_r2_i1_two_caps_probe_ids_built_in_the_same_second_differ_and_keep_the_agents_shapes(self) -> None:
+        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+$ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
+[ordered]@{{ ids = $ids; distinct = @($ids | Select-Object -Unique).Count }} | ConvertTo-Json -Compress
+"""
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["distinct"], 40, "40 ids built back to back (the same second) must all differ")
+        for i in got["ids"]:
+            self.assertRegex(i, r"^venue-quiet-probe-caps-\d{8}T\d{6}Z-[0-9a-f]{8,}$")
+            self.assertRegex(i, r"^(venue-quiet-probe|agent-swap)-", "the agent's GateExemptJobPattern")
+            self.assertRegex(i, r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "UmRunDrop's job id rule")
 
     def test_an_explicit_tighter_cooldown_and_budget_win_over_the_live_caps_in_a_run(self) -> None:
         r = self.run_batch([self.specs[0]], "-LeaseCooldownSec", "900", "-LeaseBudgetSec", "6000", FAKE_CAPS_MODE="live", FAKE_CAPS_JSON=json.dumps(self.LIVE_CAPS))

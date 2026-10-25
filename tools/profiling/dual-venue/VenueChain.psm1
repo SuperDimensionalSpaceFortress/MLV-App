@@ -1060,11 +1060,17 @@ function Get-VenueLeaseCaps {
     BACHELOR-DEDICATED-CAPS-RUNNER-1: Bachelor's heavy-slot.py lease caps, read from the text of its heavy-slot.lease.json (printed by the runner's exempt probe job) with
     the rules heavy-slot.py applies: enabled is true; max_minutes, pending_max_minutes, cooldown_minutes, max_fraction_per_3h and renew_stale_s are numbers >= 0;
     max_minutes > 0. Anything else (empty, missing file, not JSON, invalid) is the FALLBACK: the old mirrored constants, which are the tightest the owner ever set, so
-    an unreadable file never loosens a cap. cooldown = cooldown_minutes*60, budget = max_fraction_per_3h*WindowSec (at most the window), cap = min(MaxCapSec, max_minutes*60).
+    an unreadable file never loosens a cap. cooldown = cooldown_minutes*60, budget = max_fraction_per_3h*10800 (at most 10800), cap = min(MaxCapSec, max_minutes*60).
+    r2 (CoS/Dot B1 on affa0d1a): the budget basis is ALWAYS the fixed 3 h window heavy-slot.py uses (10800 s), never the caller's -WindowSec, so a caller can never loosen
+    it: a longer -WindowSec leaves the budget alone (Get-VenueLeaseBudgetWait then counts more of the earlier leases against it, which only tightens), and a shorter one
+    can only shrink it (fraction * that window, never above the 3 h figure).
+    r2 (B1b): a cooldown is never silently shortened. cooldown_minutes*60 is kept exactly (2880 min = 172800 s); only a value no int of seconds can hold is
+    unrepresentable, and that is the FALLBACK (reason cooldown_minutes-unrepresentable), the old constants, logged as capsFallbackReason.
     .OUTPUTS
     [pscustomobject]@{ source (live | fallback); reason ($null when live); cooldownSec; budgetSec; capSec }
     #>
-    param([AllowEmptyString()][AllowNull()][string]$Text = '', [int]$WindowSec = 10800, [int]$FallbackCooldownSec = 1800, [int]$FallbackBudgetSec = 5400, [int]$MaxCapSec = 2700)
+    param([AllowEmptyString()][AllowNull()][string]$Text = '', [int]$WindowSec = 10800, [int]$FallbackCooldownSec = 1800, [int]$FallbackBudgetSec = 5400, [int]$MaxCapSec = 2700,
+        [int]$BudgetBasisSec = 10800)
     $fallback = { param([string]$Why) [pscustomobject]@{ source = 'fallback'; reason = $Why; cooldownSec = $FallbackCooldownSec; budgetSec = $FallbackBudgetSec; capSec = $MaxCapSec } }
     if ([string]::IsNullOrWhiteSpace($Text)) { return (& $fallback 'probe-printed-nothing') }
     $j = try { $Text | ConvertFrom-Json -ErrorAction Stop } catch { $null }
@@ -1078,10 +1084,25 @@ function Get-VenueLeaseCaps {
         $v[$k] = [double]$x
     }
     if ($v['max_minutes'] -le 0) { return (& $fallback 'max_minutes-is-not-above-0') }
+    $cooldownSec = [Math]::Ceiling($v['cooldown_minutes'] * 60)
+    if ($cooldownSec -gt [int]::MaxValue) { return (& $fallback 'cooldown_minutes-unrepresentable') }
+    $f = $v['max_fraction_per_3h']
+    $fixedBudget = [Math]::Min($BudgetBasisSec, $f * $BudgetBasisSec)
+    $windowBudget = [Math]::Min($WindowSec, $f * $WindowSec)
     [pscustomobject]@{ source = 'live'; reason = $null
-        cooldownSec = [int][Math]::Min(86400, [Math]::Ceiling($v['cooldown_minutes'] * 60))
-        budgetSec = [int][Math]::Floor([Math]::Min($WindowSec, $v['max_fraction_per_3h'] * $WindowSec))
+        cooldownSec = [int]$cooldownSec
+        budgetSec = [int][Math]::Floor([Math]::Min($fixedBudget, $windowBudget))
         capSec = [int][Math]::Floor([Math]::Min($MaxCapSec, $v['max_minutes'] * 60)) }
+}
+
+function New-VenueCapsProbeId {
+    <#
+    .SYNOPSIS
+    The job id of the run's one caps probe: venue-quiet-probe-caps-<UTC stamp>-<12 hex of a fresh GUID>. The stamp alone is one-second resolution, so two runs that start in
+    the same second would submit the same id (UmRunDrop refuses a job id already in use, and the run would read the fallback caps). Still matches the agent's
+    GateExemptJobPattern ^(venue-quiet-probe|agent-swap)- and UmRunDrop's job id rule ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$.
+    #>
+    'venue-quiet-probe-caps-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
 }
 
 function Resolve-VenueLeaseCaps {
@@ -1142,7 +1163,7 @@ function Get-VenueDriverScriptMissing {
     return ''
 }
 
-Export-ModuleMember -Function Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
+Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
