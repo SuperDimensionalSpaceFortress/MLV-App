@@ -8775,7 +8775,7 @@ class IdentityProbeMixin:
 
     def run_identity_probe(self, procs: list, cim: list, owners: dict | None = None, gpu: list | None = None, throw: bool = False, cpus: int = 4,
                            body: str | None = None, old_counter_shadow: bool = False, after_start_ft: dict | None = None,
-                           delays: dict | None = None, call_ms: int | None = None) -> dict:
+                           delays: dict | None = None, call_ms: int | None = None, tel: dict | None = None, env: dict | None = None) -> dict:
         delays = delays or {}
         body = (_ident_probe_body() if body is None else body).replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
         if call_ms is not None:
@@ -8809,9 +8809,10 @@ class IdentityProbeMixin:
             worker_counter = worker_counter.replace("param($Counter, $MaxSamples)", "param($Counter)")
         worker_b64 = _ident_base64.b64encode((cim_prelude + worker_counter).encode("utf-8")).decode("ascii")
         body = body.replace("$IdentityWorkerPrelude = ''", f"$IdentityWorkerPrelude = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{worker_b64}'))")
+        body = _tel_hermetic(body, self.tmp, tel)   # VENUE-PROBE-HEAT-GPU-TELEMETRY-1: the heat feed, dGPU and agent log are canned too, never the test host's
         job = self.tmp / "identity-probe-job.ps1"
         job.write_text(prelude + body, encoding="utf-8")
-        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240)
+        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240, env=env)
         lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
         self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
         self.last_line = lines[0][len("VENUE_QUIET="):]   # the line exactly as the gate retains it (Wait-VenueQuiet.ps1 RAW RETENTION)
@@ -9890,7 +9891,9 @@ class VenueProbeScriptCheckR6Tests(IdentityProbeMixin, unittest.TestCase):
         self.assertEqual(re.findall(r"\$IdentScriptCheckScript\b", rest), ["$IdentScriptCheckScript"], "the worker body is used once")
         self.assertRegex(rest, r"Invoke-IdentBounded \$IdentScriptCheckScript @\([^)]*\) \$IdentityCallMs", "and only through the bounded call, under the call deadline")
         self.assertRegex(body, r"(?m)^\$IdentityScriptCheckDelayMs = 0$", "the seam is 0 in production")
-        self.assertEqual(sorted(set(re.findall(r"\$env:(\w+)", code))), ["COMPUTERNAME"], "no environment variable can reach the probe, so none can set the seam")
+        # VENUE-PROBE-HEAT-GPU-TELEMETRY-1: HEAVY_SLOT_FEED is the agent's own feed override, read on the ONE line that picks the heat feed path; it reaches no seam
+        self.assertEqual(sorted(set(re.findall(r"\$env:(\w+)", code))), ["COMPUTERNAME", "HEAVY_SLOT_FEED"], "no other environment variable can reach the probe, so none can set the seam")
+        self.assertEqual([ln.strip() for ln in code.splitlines() if "$env:HEAVY_SLOT_FEED" in ln], [TEL_FEED_LINE])
 
     def test_script_check_is_printed_on_the_top_attr_and_ident_lines_of_a_row_that_carries_it(self) -> None:
         block = dict(IDENT_BLOCK, processes=[dict(IDENT_ROW, script_check="ok"), dict(IDENT_GPU_ROW, script_check="rejected"), dict(IDENT_DENIED_ROW, script_check=None), IDENT_MISMATCH_ROW])
@@ -10041,6 +10044,412 @@ ConvertTo-Json -InputObject @($out) -Compress"""
         self.assertEqual((r["script"], r["script_check"], r["cmdline"]), (None, "timeout", r"C:\Python\python.exe args=1 script=<none>"), r)
         self.assertIn("script_check_unresolved", p["identity"]["notes"])
         self.assertEqual((r["owner"], r["owner_status"]), ("BACHELOR\\layib", "ok"), "the next call still gets a fresh worker")
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-HEAT-GPU-TELEMETRY-1: BACHELOR-HEAT-WHILE-QUIET-DIAG-1 r1 found two long quiet-lease waits that fit the heat gate while the probe saw nothing: it had no heat, power,
+# throttle or GPU field and no time since the last lease. Every probe line now carries heat{} (the agent's own feed reading), gpu{} (the dGPU power state read FIRST, by a method
+# that does not wake it; utilisation / temperature / power only when it is already D0) and seconds_since_last_lease (+ last_lease{}). RECORD-ONLY: the verdict never reads them.
+# The real probe job runs against a canned feed file, canned Get-PnpDevice / Get-PnpDeviceProperty / nvidia-smi shadows in the telemetry worker, and a canned agent.log.
+TEL_SCHEMA = "mlv-app/venue-quiet-probe-telemetry/v1"
+TEL_FEED_LINE = r"$HeatFeedPath = $(if ($env:HEAVY_SLOT_FEED) { $env:HEAVY_SLOT_FEED } else { 'C:\temp\hwinfo-log-adapter.csv' })"
+TEL_HEAT_FIELDS = ("sample_age_s", "hottest_core_c", "max15_c", "mean_c", "throttled", "window_rows", "package_w")
+TEL_GPU_FIELDS = ("utilization_percent", "temp_c", "power_w", "pstate")
+TEL_VM_ADAPTER = r"PCI\VEN_15AD&DEV_0405&SUBSYS_040515AD&REV_00\3&18D45AA6&0&78"
+TEL_DGPU = r"PCI\VEN_10DE&DEV_25A2&SUBSYS_0B2A1028&REV_A1\4&1E3A2B4C&0&0008"
+TEL_DGPU_B = r"PCI\VEN_10DE&DEV_2684&SUBSYS_0B2A1028&REV_A1\4&2F4B3C5D&0&0010"
+TEL_WORKER_PRELUDE = r"""$script:TelFake = ConvertFrom-Json -InputObject @'
+__TELFAKE__
+'@
+function Get-PnpDevice {
+    [CmdletBinding()] param($Class, [switch]$PresentOnly)
+    [IO.File]::AppendAllText('__TELLOG__', "enum|$Class|$([bool]$PresentOnly)`n")
+    if ($script:TelFake.pnpDelayMs) { [Threading.Thread]::Sleep([int]$script:TelFake.pnpDelayMs) }
+    if ($script:TelFake.enumThrow) { throw [string]$script:TelFake.enumThrow }
+    @($script:TelFake.devices | ForEach-Object { [pscustomobject]@{ InstanceId = [string]$_; Class = 'Display' } })
+}
+function Get-PnpDeviceProperty {
+    [CmdletBinding()] param($InstanceId, $KeyName)
+    [IO.File]::AppendAllText('__TELLOG__', "prop|$InstanceId|$KeyName`n")
+    if ($script:TelFake.propThrow) { throw [string]$script:TelFake.propThrow }
+    $d = $script:TelFake.data
+    if ($script:TelFake.dataById -and $script:TelFake.dataById.PSObject.Properties[[string]$InstanceId]) { $d = $script:TelFake.dataById.PSObject.Properties[[string]$InstanceId].Value }
+    [pscustomobject]@{ KeyName = $KeyName; Type = 'Binary'; Data = [byte[]]@($d | ForEach-Object { [byte]$_ }) }
+}
+function nvidia-smi {
+    [IO.File]::AppendAllText('__TELLOG__', 'smi|' + (($args | ForEach-Object { [string]$_ }) -join ' ') + "`n")
+    if ($script:TelFake.smiDelayMs) { [Threading.Thread]::Sleep([int]$script:TelFake.smiDelayMs) }
+    if ($script:TelFake.smiThrow) { throw [string]$script:TelFake.smiThrow }
+    $global:LASTEXITCODE = [int]$script:TelFake.smiRc
+    @($script:TelFake.smiOut)
+}
+"""
+
+
+def _tel_power_data(dstate_code: int) -> list:
+    # CM_POWER_DATA (56 bytes): PD_Size, then PD_MostRecentPowerState (DEVICE_POWER_STATE: 0 unspecified, 1 D0 ... 4 D3), then the capabilities
+    return [56, 0, 0, 0, dstate_code, 0, 0, 0, 9, 0, 0, 0] + [0] * 44
+
+
+def _tel_hermetic(body: str, tmp: Path, tel: dict | None) -> str:
+    """Point the probe body's telemetry at canned inputs under tmp (no-op on a body without the telemetry block). Default: no feed, no NVIDIA adapter, no agent.log."""
+    tel = dict(tel or {})
+    fake = {"devices": [TEL_VM_ADAPTER], "data": _tel_power_data(1), "smiRc": 0, "smiOut": [], "pnpDelayMs": 0, "smiDelayMs": 0, "dataById": None,
+            "enumThrow": None, "propThrow": None, "smiThrow": None}
+    fake.update(tel.get("fake", {}))
+    log = tmp / "tel-calls.log"
+    log.write_text("", encoding="utf-8")
+    if not tel.get("env_feed"):
+        body = body.replace(TEL_FEED_LINE, "$HeatFeedPath = '%s'" % str(tel.get("feed", tmp / "no-such-feed.csv")).replace("'", "''"))
+    body = body.replace("$LeaseLogPath = ''", "$LeaseLogPath = '%s'" % str(tel.get("log", tmp / "no-such-agent.log")).replace("'", "''"))
+    if "call_ms" in tel:
+        body = body.replace("$TelemetryCallMs = 4000", f"$TelemetryCallMs = {tel['call_ms']}")
+    if "read_delay_ms" in tel:
+        body = body.replace("$TelemetryReadDelayMs = 0", f"$TelemetryReadDelayMs = {tel['read_delay_ms']}")
+    prelude = TEL_WORKER_PRELUDE.replace("__TELFAKE__", json.dumps(fake)).replace("__TELLOG__", str(log))
+    b64 = _ident_base64.b64encode(prelude.encode("utf-8")).decode("ascii")
+    return body.replace("$TelemetryWorkerPrelude = ''", f"$TelemetryWorkerPrelude = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{b64}'))")
+
+
+def _tel_feed_rows(temps: list, watts: list, throttled: list) -> list:
+    # the HWiNFO adapter CSV the agent reads: a header, then rows whose column 0 starts with a digit; 3 = PackageC (the hottest core), 4 = package W, 5 / 6 = throttling
+    rows = ["Date,Time,Tick,PackageC,PackageW,CoreThrottling,RingThrottling"]
+    for i, (c, w, thr) in enumerate(zip(temps, watts, throttled)):
+        rows.append(f"10/24/2026,08:{i // 30:02d}:{(2 * i) % 60:02d},{i},{c:.1f},{w:.1f},{'Yes' if thr else 'No'},No")
+    return rows
+
+
+def _tel_expected_heat(temps: list, watts: list, throttled: list) -> dict:
+    # heavy-slot.py's feed_metrics() as the agent reimplements it (ConvertFrom-HeavySlotFeedRows): last 150 rows, window = last 60, max / watts over the last 15
+    t, w, th = temps[-150:], watts[-150:], throttled[-150:]
+    return {"window_rows": len(t[-60:]), "throttled": sum(1 for x in th[-60:] if x), "mean_c": round(sum(t[-60:]) / len(t[-60:]), 2),
+            "max15_c": max(t[-15:]), "package_w": round(sum(w[-15:]) / len(w[-15:]), 1), "hottest_core_c": t[-1]}
+
+
+def _tel_cut(body: str) -> str:
+    """The probe body with the telemetry block and its output keys CUT OUT: the reference every other field must equal."""
+    cut = re.sub(r"# HEAT / GPU / LEASE TELEMETRY \(VENUE-PROBE-HEAT-GPU-TELEMETRY-1\).*?(?=# IDENTITY \(VENUE-PROBE-PROCESS-ATTRIBUTION-1\))", "", body, flags=re.S)
+    return re.sub(r"(?m)^    telemetry_schema = .*\r?\n", "", cut)
+
+
+@requires_windows_pwsh
+class VenueProbeHeatGpuTelemetryTests(IdentityProbeMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-probe-telemetry-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        t = IDENT_T0
+        self.procs = [(16892, "python", 29.1, t)]
+        self.cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py")]
+
+    def probe(self, **tel) -> dict:
+        env = tel.pop("env", None)
+        return self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, tel=tel, env=env)
+
+    def feed(self, lines: list, age_s: float = 0.0) -> Path:
+        import os
+        import time
+        f = self.tmp / "hwinfo-log-adapter.csv"
+        f.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8")
+        ts = time.time() - age_s
+        os.utime(f, (ts, ts))
+        return f
+
+    def agent_log(self, lines: list) -> Path:
+        f = self.tmp / "agent.log"
+        f.write_text("".join(ln + "\r\n" for ln in lines), encoding="ascii")
+        return f
+
+    def calls(self) -> list:
+        return [ln for ln in (self.tmp / "tel-calls.log").read_text(encoding="utf-8").splitlines() if ln]
+
+    def assert_typed(self, block: dict, fields: tuple) -> None:
+        # every field is present (never omitted); a null always has a typed reason, and a reason is never left behind for a value
+        for k in fields:
+            self.assertIn(k, block)
+            if block[k] is None:
+                self.assertTrue(isinstance(block["reasons"].get(k), str) and block["reasons"][k], (k, block))
+            else:
+                self.assertNotIn(k, block["reasons"], (k, block))
+
+    def test_every_probe_carries_heat_gpu_and_lease_and_every_unknown_is_a_typed_null(self) -> None:
+        p = self.probe()
+        self.assertEqual(p["schema"], "mlv-app/venue-quiet-probe/v2", "the top-level schema stays v2: telemetry only adds fields")
+        self.assertEqual(p["telemetry_schema"], TEL_SCHEMA)
+        heat = p["heat"]
+        self.assertEqual(heat["source"], "unavailable")
+        self.assert_typed(heat, TEL_HEAT_FIELDS)
+        self.assertTrue(all(heat[k] is None for k in TEL_HEAT_FIELDS), heat)
+        self.assertEqual({heat["reasons"][k] for k in TEL_HEAT_FIELDS}, {"feed-missing"})
+        self.assertNotEqual(heat.get("throttled"), 0, "0 is never an unknown")
+        gpu = p["gpu"]
+        self.assertEqual((gpu["state"], gpu["skipped_wake_risk"], gpu["device"], gpu["method"]), ("absent", False, None, "DEVPKEY_Device_PowerData"))
+        self.assert_typed(gpu, TEL_GPU_FIELDS)
+        self.assertEqual({gpu["reasons"][k] for k in TEL_GPU_FIELDS}, {"no-dgpu"})
+        self.assertIsNone(p["seconds_since_last_lease"])
+        self.assertEqual(p["last_lease"]["reason"], "log-missing")
+        self.assertTrue(p["last_lease"]["source"].endswith("no-such-agent.log"), p["last_lease"])
+        self.assertEqual([c for c in self.calls() if c.startswith("smi|")], [], "no dGPU: nvidia-smi is never run")
+
+    def test_heat_is_the_agents_own_feed_reading_over_the_agents_window(self) -> None:
+        n = 80
+        temps = [60.0 + (i % 7) for i in range(n - 1)] + [97.0]
+        watts = [10.0 + (i % 5) for i in range(n)]
+        thr = [i % 9 == 0 for i in range(n)]
+        p = self.probe(feed=self.feed(_tel_feed_rows(temps, watts, thr)))
+        heat = p["heat"]
+        self.assertEqual(heat["source"], str(self.tmp / "hwinfo-log-adapter.csv"))
+        self.assertEqual(heat["reasons"], {}, heat)
+        want = _tel_expected_heat(temps, watts, thr)
+        for k, v in want.items():
+            self.assertAlmostEqual(heat[k], v, places=2, msg=k)
+        self.assertEqual(heat["hottest_core_c"], 97.0, "the newest row's PackageC: the hottest single core")
+        self.assertTrue(0 <= heat["sample_age_s"] < 60, heat)
+        self.assertEqual((heat["window_rule_rows"], heat["stale_after_s"]), (60, 120))
+
+    def test_the_heat_reading_matches_the_agent_function_on_the_same_rows(self) -> None:
+        # parity pin: the agent's ConvertFrom-HeavySlotFeedRows (lifted verbatim from ultra-magnus-agent.ps1) over the same rows gives the same throttled / mean / max15 / W
+        n = 170
+        temps = [55.0 + (i * 37 % 41) for i in range(n)]
+        watts = [8.0 + (i * 13 % 29) for i in range(n)]
+        thr = [(i * 7) % 5 == 0 for i in range(n)]
+        lines = _tel_feed_rows(temps, watts, thr)
+        p = self.probe(feed=self.feed(lines))
+        agent = (ROOT / "tools" / "profiling" / "bachelor" / "ultra-magnus-agent.ps1").read_text(encoding="utf-8")
+        fn = re.search(r"function ConvertFrom-HeavySlotFeedRows \{.*?\r?\n\}\r?\n", agent, re.S).group(0)
+        self.assertRegex(agent, r"\[int\]\$GateSustainedRows = 60\b")
+        self.assertRegex(agent, r"\[int\]\$GateFeedStaleSec = 120\b")
+        script = self.tmp / "agent-parse.ps1"
+        lines_file = self.tmp / "agent-lines.txt"
+        lines_file.write_text("\n".join(lines), encoding="utf-8")
+        script.write_text("$GateSustainedRows = 60\n" + fn + f"\n$m = ConvertFrom-HeavySlotFeedRows -Lines @(Get-Content -LiteralPath '{lines_file}')\n$m | ConvertTo-Json -Compress\n", encoding="utf-8")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        m = json.loads(out.stdout)
+        heat = p["heat"]
+        self.assertEqual((heat["throttled"], heat["window_rows"]), (m["throttled"], m["window"]))
+        self.assertAlmostEqual(heat["mean_c"], m["meanC"], places=2)
+        self.assertAlmostEqual(heat["max15_c"], m["max15C"], places=2)
+        self.assertAlmostEqual(heat["package_w"], m["watts30"], places=1)
+
+    def test_heavy_slot_feed_overrides_the_feed_path_as_it_does_for_the_agent(self) -> None:
+        import os
+        f = self.feed(_tel_feed_rows([70.0] * 20, [12.0] * 20, [False] * 20))
+        p = self.probe(env_feed=True, env=dict(os.environ, HEAVY_SLOT_FEED=str(f)))
+        self.assertEqual(p["heat"]["source"], str(f))
+        self.assertEqual(p["heat"]["mean_c"], 70.0)
+
+    def test_a_stale_short_or_unparseable_feed_is_a_typed_null_never_a_zero(self) -> None:
+        rows = _tel_feed_rows([90.0] * 30, [40.0] * 30, [True] * 30)
+        p = self.probe(feed=self.feed(rows, age_s=600))
+        heat = p["heat"]
+        self.assertEqual(heat["source"], str(self.tmp / "hwinfo-log-adapter.csv"), "a stale feed was found: its path is the source")
+        self.assertTrue(590 <= heat["sample_age_s"] <= 700, heat)
+        self.assert_typed(heat, TEL_HEAT_FIELDS)
+        self.assertEqual({heat["reasons"][k] for k in TEL_HEAT_FIELDS if k != "sample_age_s"}, {"feed-stale"})
+        p = self.probe(feed=self.feed(_tel_feed_rows([90.0] * 10, [40.0] * 10, [False] * 10)))
+        self.assertEqual({p["heat"]["reasons"][k] for k in TEL_HEAT_FIELDS if k != "sample_age_s"}, {"feed-too-few-rows"})
+        self.assertIsNone(p["heat"]["throttled"], "fewer than 15 rows is unknown, never 0 throttled")
+        bad = rows[:-1] + ["10/24/2026,08:59:58,99,n/a,40.0,No,No"]
+        p = self.probe(feed=self.feed(bad))
+        self.assertEqual({p["heat"]["reasons"][k] for k in TEL_HEAT_FIELDS if k != "sample_age_s"}, {"feed-unparseable"})
+
+    def test_a_hung_feed_read_is_a_typed_timeout_and_the_probe_still_answers(self) -> None:
+        f = self.feed(_tel_feed_rows([70.0] * 20, [12.0] * 20, [False] * 20))
+        p = self.probe(feed=f, call_ms=1000, read_delay_ms=4000)
+        self.assertEqual(p["heat"]["source"], "unavailable")
+        self.assertEqual({p["heat"]["reasons"][k] for k in TEL_HEAT_FIELDS}, {"timeout"})
+        self.assertEqual(len(p["samples"]), 3)
+
+    def test_a_d3_dgpu_is_never_woken(self) -> None:
+        p = self.probe(fake={"devices": [TEL_VM_ADAPTER, TEL_DGPU], "data": _tel_power_data(4), "smiOut": ["37, 61, 22.53, P2"]})
+        gpu = p["gpu"]
+        self.assertEqual((gpu["state"], gpu["skipped_wake_risk"], gpu["device"], gpu["power_state_raw"]), ("D3", True, TEL_DGPU, 4))
+        self.assert_typed(gpu, TEL_GPU_FIELDS)
+        self.assertEqual({gpu["reasons"][k] for k in TEL_GPU_FIELDS}, {"skipped-wake-risk"})
+        calls = self.calls()
+        self.assertEqual([c for c in calls if c.startswith("smi|")], [], "D3: nothing but the power state is read")
+        self.assertEqual(calls, ["enum|Display|True", f"prop|{TEL_DGPU}|DEVPKEY_Device_PowerData"])
+
+    def test_an_unknown_power_state_is_never_woken_either(self) -> None:
+        for fake, why in (({"devices": [TEL_DGPU], "propThrow": "canned PnP failure"}, "pnp-read-failed"),
+                          ({"devices": [TEL_DGPU], "data": _tel_power_data(0)}, "unspecified-power-state"),
+                          ({"enumThrow": "canned enumeration failure"}, "pnp-read-failed")):
+            p = self.probe(fake=fake)
+            gpu = p["gpu"]
+            self.assertEqual((gpu["state"], gpu["skipped_wake_risk"]), ("unknown", True), fake)
+            self.assertEqual(gpu["state_reason"], why, gpu)
+            self.assertEqual({gpu["reasons"][k] for k in TEL_GPU_FIELDS}, {"skipped-wake-risk"})
+            self.assertEqual([c for c in self.calls() if c.startswith("smi|")], [], fake)
+
+    def test_a_hung_power_state_read_is_unknown_and_never_woken(self) -> None:
+        p = self.probe(fake={"devices": [TEL_DGPU], "data": _tel_power_data(1), "pnpDelayMs": 4000, "smiOut": ["37, 61, 22.53, P2"]}, call_ms=1000)
+        gpu = p["gpu"]
+        self.assertEqual((gpu["state"], gpu["skipped_wake_risk"], gpu["state_reason"]), ("unknown", True, "timeout"))
+        self.assertEqual([c for c in self.calls() if c.startswith("smi|")], [])
+        self.assertEqual(len(p["samples"]), 3)
+
+    def test_an_awake_d0_dgpu_is_read_after_its_power_state(self) -> None:
+        p = self.probe(fake={"devices": [TEL_DGPU], "data": _tel_power_data(1), "smiOut": ["37, 61, 22.53, P2"]})
+        gpu = p["gpu"]
+        self.assertEqual((gpu["state"], gpu["skipped_wake_risk"], gpu["device"]), ("D0", False, TEL_DGPU))
+        self.assertEqual((gpu["utilization_percent"], gpu["temp_c"], gpu["power_w"], gpu["pstate"]), (37.0, 61.0, 22.53, "P2"))
+        self.assertEqual(gpu["reasons"], {})
+        calls = self.calls()
+        self.assertEqual(len(calls), 3, calls)
+        self.assertTrue(calls[0].startswith("enum|") and calls[1].startswith("prop|"), "the power state is read FIRST")
+        self.assertEqual(calls[2], "smi|--query-gpu=utilization.gpu,temperature.gpu,power.draw,pstate --format=csv,noheader,nounits")
+
+    # VENUE-PROBE-HEAT-GPU-TELEMETRY-1 r2 (CoS B1): nvidia-smi has no device selector here, so it reads EVERY NVIDIA adapter while only one adapter's power state was checked.
+    # With more than one NVIDIA display adapter the reading cannot be bound to the checked one: fail toward null, and never query an adapter whose power state was not read.
+    def assert_ambiguous_dgpu(self, gpu: dict, why: str) -> None:
+        self.assert_typed(gpu, TEL_GPU_FIELDS)
+        self.assertTrue(all(gpu[k] is None for k in TEL_GPU_FIELDS), gpu)
+        self.assertEqual({gpu["reasons"][k] for k in TEL_GPU_FIELDS}, {why}, gpu)
+
+    def test_two_nvidia_adapters_both_d0_record_no_gpu_numbers_and_never_run_nvidia_smi(self) -> None:
+        # nvidia-smi lists adapter B first: r1 recorded B's numbers as the checked adapter A's
+        p = self.probe(fake={"devices": [TEL_VM_ADAPTER, TEL_DGPU, TEL_DGPU_B], "data": _tel_power_data(1), "smiOut": ["99, 93, 140.0, P0", "37, 61, 22.53, P2"]})
+        self.assert_ambiguous_dgpu(p["gpu"], "multi-dgpu-ambiguous")
+        self.assertEqual([c for c in self.calls() if c.startswith("smi|")], [], "an ambiguous dGPU set is never queried")
+
+    def test_two_nvidia_adapters_one_in_d3_never_query_the_unchecked_adapter(self) -> None:
+        p = self.probe(fake={"devices": [TEL_DGPU, TEL_DGPU_B], "data": _tel_power_data(1), "dataById": {TEL_DGPU: _tel_power_data(1), TEL_DGPU_B: _tel_power_data(4)},
+                             "smiOut": ["37, 61, 22.53, P2", "0, 40, 5.0, P8"]})
+        self.assert_ambiguous_dgpu(p["gpu"], "multi-dgpu-ambiguous")
+        self.assertEqual([c for c in self.calls() if c.startswith("smi|")], [], "adapter B may be asleep: nvidia-smi would wake it")
+
+    def test_one_nvidia_adapter_but_two_nvidia_smi_rows_is_ambiguous_never_the_first_row(self) -> None:
+        p = self.probe(fake={"devices": [TEL_DGPU], "data": _tel_power_data(1), "smiOut": ["99, 93, 140.0, P0", "", "37, 61, 22.53, P2"]})
+        gpu = p["gpu"]
+        self.assertEqual((gpu["state"], gpu["skipped_wake_risk"], gpu["device"]), ("D0", False, TEL_DGPU))
+        self.assert_ambiguous_dgpu(gpu, "nvidia-smi-ambiguous")
+
+    def test_one_nvidia_adapter_with_a_vm_display_adapter_still_records_its_one_row(self) -> None:
+        p = self.probe(fake={"devices": [TEL_VM_ADAPTER, TEL_DGPU], "data": _tel_power_data(1), "smiOut": ["", "37, 61, 22.53, P2", ""]})
+        gpu = p["gpu"]
+        self.assertEqual((gpu["utilization_percent"], gpu["temp_c"], gpu["power_w"], gpu["pstate"]), (37.0, 61.0, 22.53, "P2"))
+        self.assertEqual(gpu["reasons"], {})
+
+    def test_a_d0_read_that_fails_is_typed(self) -> None:
+        p = self.probe(fake={"devices": [TEL_DGPU], "data": _tel_power_data(1), "smiThrow": "The term 'nvidia-smi' is not recognized as a name of a cmdlet"})
+        self.assertEqual({p["gpu"]["reasons"][k] for k in TEL_GPU_FIELDS}, {"nvidia-smi-missing"})
+        p = self.probe(fake={"devices": [TEL_DGPU], "data": _tel_power_data(1), "smiRc": 9, "smiOut": ["NVIDIA-SMI has failed"]})
+        self.assertEqual({p["gpu"]["reasons"][k] for k in TEL_GPU_FIELDS}, {"nvidia-smi-failed"})
+        p = self.probe(fake={"devices": [TEL_DGPU], "data": _tel_power_data(1), "smiOut": ["[N/A], 61, [Not Supported], P8"]})
+        gpu = p["gpu"]
+        self.assertEqual((gpu["utilization_percent"], gpu["temp_c"], gpu["power_w"], gpu["pstate"]), (None, 61.0, None, "P8"))
+        self.assertEqual((gpu["reasons"]["utilization_percent"], gpu["reasons"]["power_w"]), ("not-supported", "not-supported"))
+        self.assert_typed(gpu, TEL_GPU_FIELDS)
+
+    def test_seconds_since_last_lease_is_the_newest_lease_event_in_the_agent_log(self) -> None:
+        now = _ident_dt.datetime.now(_ident_dt.timezone.utc)
+        cdt = _ident_dt.timezone(_ident_dt.timedelta(hours=-5))
+        ts = lambda ago: (now - _ident_dt.timedelta(seconds=ago)).astimezone(cdt).isoformat()
+        log = self.agent_log([
+            f"{ts(4000)} quiet-lease: active job=dve-a slot=1 held=1:4242 until=1761300000 minutes=3 waited=541s requests=1 refusals=0 owner=[ok] heat=[clear]",
+            f"{ts(3000)} quiet-lease: ended job=dve-a pid=4242 active=True rc=0 releaseRc=0 killed= renews=2/2 renewFailures=0 renewSlow=0 renewMaxGapSec=61 why=[job done]",
+            f"{ts(900)} quiet-lease: ended job=dve-b pid=4243 active=False rc=75 releaseRc=0 killed= renews=0/0 renewFailures=0 renewSlow=0 renewMaxGapSec=0 why=[refused]",
+            f"{ts(800)} heavy-slot gate: something else entirely",
+        ])
+        p = self.probe(log=log)
+        self.assertEqual(p["last_lease"]["event"], "ended", "a request that never held a lease (active=False) is not a lease")
+        self.assertIsNone(p["last_lease"]["reason"])
+        self.assertEqual(p["last_lease"]["source"], str(log))
+        self.assertTrue(2990 <= p["seconds_since_last_lease"] <= 3200, p["seconds_since_last_lease"])
+        log = self.agent_log([f"{ts(500)} quiet-lease: batch-parked token=abcdef012345 lease=x jobs=1 remaining=1500s idleBound=300s"])
+        p = self.probe(log=log)
+        self.assertEqual(p["last_lease"]["event"], "batch-parked")
+        self.assertTrue(490 <= p["seconds_since_last_lease"] <= 700, p)
+
+    def test_a_log_with_no_lease_record_is_a_typed_null(self) -> None:
+        p = self.probe(log=self.agent_log(["2026-10-25T08:00:00.0000000-05:00 agent started pid=1"]))
+        self.assertIsNone(p["seconds_since_last_lease"])
+        self.assertEqual((p["last_lease"]["reason"], p["last_lease"]["event"]), ("no-lease-record", None))
+
+    def test_telemetry_is_record_only_and_moves_no_other_field(self) -> None:
+        hot = _tel_feed_rows([99.0] * 70, [60.0] * 70, [True] * 70)
+        busy_gpu = {"devices": [TEL_DGPU], "data": _tel_power_data(1), "smiOut": ["99, 93, 140.0, P0"]}
+        with_tel = self.probe(feed=self.feed(hot), fake=busy_gpu)
+        self.assertEqual((with_tel["heat"]["throttled"], with_tel["gpu"]["state"]), (60, "D0"))
+        plain = self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, body=_tel_cut(_ident_probe_body()))
+        for k in ("heat", "gpu", "seconds_since_last_lease", "last_lease", "telemetry_schema"):
+            self.assertNotIn(k, plain)
+        for k, v in plain.items():
+            if k == "identity":
+                continue
+            self.assertEqual(with_tel[k], v, f"{k} changed when telemetry ran")
+        self.assertEqual(set(with_tel) - set(plain), {"heat", "gpu", "seconds_since_last_lease", "last_lease", "telemetry_schema"})
+
+    def test_the_telemetry_calls_are_bounded_inside_the_submission_timeout(self) -> None:
+        body = _ident_probe_body()
+        call = int(re.search(r"\$TelemetryCallMs = (\d+)", body).group(1))
+        ident = int(re.search(r"\$IdentityCallMs = (\d+)", body).group(1))
+        budget = int(re.search(r"\$IdentityBudgetMs = (\d+)", body).group(1))
+        self.assertEqual(len(re.findall(r"Invoke-TelBounded \$Tel\w+Script", body)), 4, "four bounded calls: feed, agent log, power state, nvidia-smi")
+        self.assertEqual(body.count("Invoke-TelBounded $TelSmiScript"), 1, "ONE nvidia-smi call site")
+        worst_s = (ident * 5 + budget + ident + call * 4) / 1000.0 + 24
+        self.assertLess(worst_s, 110, worst_s)
+        code = re.sub(r"(?m)^\s*#.*$", "", body)
+        self.assertEqual(len(re.findall(r"\bGet-Counter -Counter\b", code)), 2, "telemetry adds no counter read")
+        self.assertEqual(len(re.findall(r"Get-CimInstance", body)), 1, "telemetry adds no WQL query")
+        self.assertIn("if ($script:IdentAbandoned -gt 0 -or $script:TelAbandoned -gt 0)", body, "an abandoned telemetry worker ends the job like an abandoned identity worker")
+
+    def test_the_real_probe_job_emits_typed_telemetry_on_this_host(self) -> None:
+        job = self.tmp / "real-probe-job.ps1"
+        job.write_text(_ident_probe_body().replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0").replace("$LeaseLogPath = ''", "$LeaseLogPath = '%s'" % (self.tmp / "none.log")), encoding="utf-8")
+        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
+        self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
+        p = json.loads(lines[0][len("VENUE_QUIET="):])
+        self.assertEqual(p["telemetry_schema"], TEL_SCHEMA)
+        self.assert_typed(p["heat"], TEL_HEAT_FIELDS)
+        self.assert_typed(p["gpu"], TEL_GPU_FIELDS)
+        self.assertIn(p["gpu"]["state"], ("D0", "D1", "D2", "D3", "unknown", "absent"))
+        self.assertIs(p["gpu"]["skipped_wake_risk"], p["gpu"]["state"] not in ("D0", "absent"))
+        self.assertTrue(p["seconds_since_last_lease"] is not None or p["last_lease"]["reason"])
+
+
+TEL_BLOCK_HOT = {"source": "C:\\temp\\hwinfo-log-adapter.csv", "sample_age_s": 1.5, "hottest_core_c": 100.0, "max15_c": 100.0, "mean_c": 95.24, "throttled": 60,
+                 "window_rows": 60, "package_w": 44.0, "window_rule_rows": 60, "stale_after_s": 120, "reasons": {}, "why": None}
+TEL_GPU_D3 = {"method": "DEVPKEY_Device_PowerData", "vendor_filter": "VEN_10DE", "device": TEL_DGPU, "state": "D3", "power_state_raw": 4, "state_reason": None,
+              "skipped_wake_risk": True, "utilization_percent": None, "temp_c": None, "power_w": None, "pstate": None,
+              "reasons": {k: "skipped-wake-risk" for k in TEL_GPU_FIELDS}, "why": None}
+TEL_LEASE = {"source": "C:\\mlv-agent\\logs\\agent.log", "event": "ended", "utc": "2026-10-24T08:10:25.0000000Z", "reason": None, "why": None}
+
+
+@requires_windows_pwsh
+class VenueProbeTelemetryGateTextTests(unittest.TestCase):
+    setUp = VenueQuietAttributionTests.setUp
+    gate = VenueQuietAttributionTests.gate
+
+    def tel(self, probe: dict) -> dict:
+        return dict(probe, telemetry_schema=TEL_SCHEMA, heat=TEL_BLOCK_HOT, gpu=TEL_GPU_D3, seconds_since_last_lease=1834.2, last_lease=TEL_LEASE)
+
+    def test_a_hot_throttled_probe_with_a_quiet_cpu_keeps_its_verdict(self) -> None:
+        quiet = dict(V2_PROBE, samples=[5.0, 5.0, 5.0])
+        before = self.gate(quiet)
+        after = self.gate(self.tel(quiet))
+        self.assertEqual((before.returncode, after.returncode), (0, 0), after.stdout + after.stderr)
+        verdict = lambda out: re.sub(r"waitedSec=\d+", "waitedSec=N", re.search(r"(?m)^(QUIET|COOLDOWN_UNMET) .*$", out).group(0))
+        self.assertEqual(verdict(after.stdout), verdict(before.stdout))
+        self.assertRegex(after.stdout, r"(?m)^QUIET mean=5\.0% threshold=20(\.0)?% waitedSec=\d+$", "heat is record-only: a hot venue with a quiet CPU is still QUIET")
+        busy = self.gate(self.tel(V2_PROBE))
+        self.assertRegex(busy.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+
+    def test_the_telemetry_is_printed_after_the_verdict_as_comma_free_pairs(self) -> None:
+        out = self.gate(self.tel(V2_PROBE)).stdout
+        self.assertRegex(out, r"(?m)^  tele heat source=C:\\temp\\hwinfo-log-adapter\.csv age=1\.5s hottest=100\.0C max15=100\.0C mean=95\.2C throttled=60/60 W=44\.0$")
+        self.assertRegex(out, r"(?m)^  tele gpu state=D3 skipped_wake_risk=true util=n/a temp=n/a W=n/a pstate=n/a$")
+        self.assertRegex(out, r"(?m)^  tele lease since=1834s event=ended$")
+        self.assertLess(out.index("COOLDOWN_UNMET"), out.index("  tele heat"))
+
+    def test_a_probe_without_telemetry_prints_no_tele_line(self) -> None:
+        self.assertNotIn("  tele ", self.gate(V2_PROBE).stdout)
+
+    def test_malformed_telemetry_never_changes_the_verdict_or_the_exit_code(self) -> None:
+        proc = self.gate(dict(V2_PROBE, telemetry_schema=TEL_SCHEMA, heat="hot", gpu=7, last_lease=None))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
 
 
 if __name__ == "__main__":
