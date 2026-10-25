@@ -268,6 +268,25 @@ def parse_utc(text: str) -> datetime:
     return (dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
 
 
+def read_claim_json(path: Path, timeout_s: float = 10.0, sleep_s: float = 0.1) -> dict:
+    """A claim file read that waits out the runner's own write (CI-FLAKE-LEASE-BATCH-CLAIM-READ-RACE-1, merge_group 40211588250).
+
+    The runner takes the claim with CreateNew/FileShare.None and renews it in place under FileShare.None (VenueChain.psm1 Request-/Update-VenueClaim), so on Windows a
+    reader that lands in that window gets PermissionError, on a half-written file JSONDecodeError, before the take FileNotFoundError. Retries those three for
+    timeout_s, then raises the last one with the path.
+    """
+    end = time.monotonic() + timeout_s
+    while True:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (PermissionError, json.JSONDecodeError, FileNotFoundError) as e:
+            if time.monotonic() >= end:
+                if isinstance(e, json.JSONDecodeError):
+                    raise json.JSONDecodeError(f"{path}: {e.msg}", e.doc, e.pos) from e
+                raise type(e)(e.errno, f"{e.strerror} (still failing after {timeout_s}s): {path}") from e
+            time.sleep(sleep_s)
+
+
 def batch_result(stdout: str) -> dict:
     lines = [l for l in stdout.splitlines() if l.startswith("LEASE_BATCH_RESULT=")]
     if not lines:
@@ -789,6 +808,57 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             p.stdout.close()
             p.stderr.close()
 
+    # ---------------------------------------------------------------- CI-FLAKE-LEASE-BATCH-CLAIM-READ-RACE-1 (merge_group 40211588250)
+    def _hold_exclusive(self, path: Path, hold_s: float) -> threading.Thread:
+        """Hold `path` open with share mode 0 (what Request-/Update-VenueClaim's FileShare.None does) for hold_s seconds on a background thread."""
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = k32.CreateFileW(str(path), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
+        self.assertNotEqual(handle, wintypes.HANDLE(-1).value, "could not take the exclusive handle")
+
+        def hold() -> None:
+            time.sleep(hold_s)
+            k32.CloseHandle(handle)
+
+        t = threading.Thread(target=hold, daemon=True)
+        t.start()
+        return t
+
+    def test_the_claim_reader_waits_out_a_writer_that_holds_the_file(self) -> None:
+        # The race the merge_group flake hit: a reader that lands while the runner holds the claim (FileShare.None on the take or a renewal) got PermissionError;
+        # one that lands on a half-written or not yet created file gets JSONDecodeError or FileNotFoundError. The direct read raises on each; read_claim_json waits.
+        self.claims.mkdir()
+        body = {"schema": "mlv-app/venue-claim/v1", "venue": "bachelor", "nonce": "n" * 32}
+        full = json.dumps(body)
+        self.claim_path.write_text(full, encoding="utf-8")
+
+        t = self._hold_exclusive(self.claim_path, 1.0)
+        with self.assertRaises(PermissionError):
+            self.claim_path.read_text(encoding="utf-8")
+        self.assertEqual(read_claim_json(self.claim_path), body, "returns the full JSON once the writer releases")
+        t.join(5)
+
+        self.claim_path.write_text('{"schema": "mlv-app/ven', encoding="utf-8")   # a half-written claim
+        with self.assertRaises(json.JSONDecodeError):
+            json.loads(self.claim_path.read_text(encoding="utf-8"))
+        threading.Timer(1.0, lambda: self.claim_path.write_text(full, encoding="utf-8")).start()
+        self.assertEqual(read_claim_json(self.claim_path), body)
+
+        self.claim_path.unlink()   # not created yet
+        with self.assertRaises(FileNotFoundError):
+            self.claim_path.read_text(encoding="utf-8")
+        threading.Timer(1.0, lambda: self.claim_path.write_text(full, encoding="utf-8")).start()
+        self.assertEqual(read_claim_json(self.claim_path), body)
+
+        self.claim_path.write_text("not json at all", encoding="utf-8")   # a claim that never becomes valid: bounded, then the last error with the path
+        with self.assertRaises(json.JSONDecodeError) as cm:
+            read_claim_json(self.claim_path, timeout_s=0.5, sleep_s=0.1)
+        self.assertIn(str(self.claim_path), str(cm.exception))
+
     # ---------------------------------------------------------------- r5: the claim is renewed for as long as it is held (dot 242171b3 B1)
     def test_a_long_foreign_refusal_wait_does_not_let_the_live_claim_expire(self) -> None:
         # -ClaimTtlSec 60 (its floor), and um-run blocks 80 s on the open while the agent re-asks a refused (exit 75) request: longer than the claim's TTL. At
@@ -800,7 +870,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             end = time.monotonic() + 60
             while not self.claim_path.exists() and time.monotonic() < end:
                 time.sleep(0.2)
-            c0 = json.loads(self.claim_path.read_text(encoding="utf-8"))
+            c0 = read_claim_json(self.claim_path)
             claimed = parse_utc(c0["claimedUtc"])
             while datetime.now(timezone.utc) < claimed + timedelta(seconds=70):
                 time.sleep(0.5)
@@ -810,7 +880,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
             seen = json.loads(out.stdout)
             self.assertEqual((seen["state"], seen["reason"], seen["nonce"]), ("LIVE", None, c0["nonce"]), seen)
-            c1 = json.loads(self.claim_path.read_text(encoding="utf-8"))
+            c1 = read_claim_json(self.claim_path)
             self.assertGreater(parse_utc(c1["expiresUtc"]), datetime.now(timezone.utc), c1)
             self.assertEqual({k: v for k, v in c1.items() if k != "expiresUtc"}, {k: v for k, v in c0.items() if k != "expiresUtc"}, "only expiresUtc changes")
             so, se = p.communicate(timeout=300)
