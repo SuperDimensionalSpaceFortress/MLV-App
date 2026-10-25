@@ -62,7 +62,7 @@ jobs:
             ${{ env.QTDIR }}/qmake -r ${{ env.SOURCE_DIR }}/qt/MLVApp.pro MLVAPP_SKIP_LEGACY_PAYLOAD_EXTRACTION=1
             make -j8
             ls -al
-            PYTHONPATH="${{ github.workspace }}" python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root "${{ github.workspace }}" --payload-id ffmpeg-macos-x86_64 --archive-reference ffmpegOSX.zip --output-dir "MLV App.app/Contents/MacOS" --verify-installed
+            PYTHONPATH="${{ github.workspace }}" python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root "${{ github.workspace }}" --payload-id ffmpeg-macos-arm64 --archive-reference ffmpegOSXarm.zip --output-dir "MLV App.app/Contents/MacOS" --verify-installed
             PYTHONPATH="${{ github.workspace }}" python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root "${{ github.workspace }}" --payload-id raw2mlv-macos-arm64 --archive-reference raw2mlvMacOsArm.zip --output-dir "MLV App.app/Contents/MacOS" --verify-installed
             ${{ env.QTDIR }}/macdeployqt MLV\ App.app -dmg
 

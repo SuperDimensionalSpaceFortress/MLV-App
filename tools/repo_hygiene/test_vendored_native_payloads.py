@@ -245,22 +245,33 @@ class VendoredNativePayloadTests(unittest.TestCase):
         )
         self.assertEqual(schema["properties"]["authority"]["const"]["automatic_launch_gate"], "CLOSED")
 
-    def test_manifest_keeps_unknown_raw2mlv_provenance_and_arm64_ffmpeg_debt_explicit(self) -> None:
+    def test_manifest_keeps_unknown_raw2mlv_provenance_and_pins_arm64_ffmpeg_consumer(self) -> None:
         raw_records = [record for record in self.manifest["payloads"] if record["id"].startswith("raw2mlv-")]
         self.assertEqual(len(raw_records), 5)
         self.assertTrue(all(record["provenance"]["status"] == "unknown" for record in raw_records))
         self.assertTrue(all(record["provenance"]["license"] == "unknown" for record in raw_records))
-        mac_ffmpeg = next(record for record in self.manifest["payloads"] if record["id"] == "ffmpeg-macos-x86_64")
-        arm_consumer = next(row for row in mac_ffmpeg["consumers"] if row["target"] == "macos-arm64")
-        self.assertEqual(arm_consumer["status"], "active-release-workflow-architecture-mismatch")
-        self.assertEqual(mac_ffmpeg["selected_members"][0]["binary"]["machine"], "x86_64")
+        intel_ffmpeg = next(record for record in self.manifest["payloads"] if record["id"] == "ffmpeg-macos-x86_64")
+        self.assertEqual(intel_ffmpeg["selected_members"][0]["binary"]["machine"], "x86_64")
+        self.assertNotIn("macos-arm64", {row["target"] for row in intel_ffmpeg["consumers"]})
+        arm_ffmpeg = next(record for record in self.manifest["payloads"] if record["id"] == "ffmpeg-macos-arm64")
+        self.assertEqual(arm_ffmpeg["path"], "platform/qt/FFmpeg/ffmpegOSXarm.zip")
+        self.assertEqual(arm_ffmpeg["selected_members"][0]["binary"], {"format": "macho", "machine": "arm64"})
+        arm_consumer = next(row for row in arm_ffmpeg["consumers"] if row["target"] == "macos-arm64")
+        self.assertEqual(arm_consumer["status"], "active-release-workflow")
+        self.assertEqual(arm_consumer["path"], ".github/workflows/macOS-Arm64.yml")
+        self.assertEqual(arm_consumer["reference_marker"], "ffmpegOSXarm.zip")
+        self.assertIn("--payload-id ffmpeg-macos-arm64", arm_consumer["operation_marker"])
 
-    def test_arm64_release_target_rejects_committed_x86_64_ffmpeg_before_packaging(self) -> None:
-        with self.assertRaisesRegex(
-            PayloadIntegrityError,
-            "release target macos-arm64 rejects payload ffmpeg-macos-x86_64",
-        ):
-            validate(ROOT, required_target="macos-arm64")
+    def test_arm64_release_target_admits_arm64_ffmpeg_and_rejects_x86_64_ffmpeg(self) -> None:
+        arm = validate(ROOT, required_target="macos-arm64")
+        admitted_arm = arm["target_compatibility"]
+        self.assertEqual(admitted_arm["status"], "pass")
+        self.assertEqual(admitted_arm["target"], "macos-arm64")
+        self.assertEqual(
+            {row["payload_id"] for row in admitted_arm["members"]},
+            {"ffmpeg-macos-arm64", "raw2mlv-macos-arm64"},
+        )
+        self.assertEqual({row["machine"] for row in admitted_arm["members"]}, {"arm64"})
 
         intel = validate(ROOT, required_target="macos-x86_64")
         admitted = intel["target_compatibility"]
@@ -271,8 +282,23 @@ class VendoredNativePayloadTests(unittest.TestCase):
             {"ffmpeg-macos-x86_64", "raw2mlv-macos-x86_64"},
         )
 
+        # Re-declaring the x86_64 archive as an arm64 release consumer must still be rejected.
+        regressed = copy.deepcopy(self.manifest)
+        regressed_intel = next(
+            record for record in regressed["payloads"] if record["id"] == "ffmpeg-macos-x86_64"
+        )
+        regressed_intel["consumers"].append(
+            {
+                "target": "macos-arm64",
+                "path": ".github/workflows/macOS-Arm64.yml",
+                "status": "active-release-workflow",
+            }
+        )
+        with self.assertRaisesRegex(PayloadIntegrityError, "extraction/consumer payload mismatch"):
+            _validate_release_target_compatibility(ROOT, regressed, "macos-arm64")
+
         relabeled = copy.deepcopy(
-            next(record for record in self.manifest["payloads"] if record["id"] == "ffmpeg-macos-x86_64")
+            next(record for record in self.manifest["payloads"] if record["id"] == "ffmpeg-macos-arm64")
         )
         arm_consumer = next(
             consumer for consumer in relabeled["consumers"] if consumer["target"] == "macos-arm64"
@@ -288,7 +314,7 @@ class VendoredNativePayloadTests(unittest.TestCase):
 
         omitted = copy.deepcopy(self.manifest)
         omitted_ffmpeg = next(
-            record for record in omitted["payloads"] if record["id"] == "ffmpeg-macos-x86_64"
+            record for record in omitted["payloads"] if record["id"] == "ffmpeg-macos-arm64"
         )
         omitted_ffmpeg["consumers"] = [
             consumer for consumer in omitted_ffmpeg["consumers"] if consumer["target"] != "macos-arm64"

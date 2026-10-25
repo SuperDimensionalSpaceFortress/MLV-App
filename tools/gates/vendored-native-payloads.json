@@ -182,18 +182,6 @@
           }
         },
         {
-          "target": "macos-arm64",
-          "path": ".github/workflows/macOS-Arm64.yml",
-          "status": "active-release-workflow-architecture-mismatch",
-          "reference_marker": "ffmpegOSX.zip",
-          "operation_marker": "PYTHONPATH=\"${{ github.workspace }}\" python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root \"${{ github.workspace }}\" --payload-id ffmpeg-macos-x86_64 --archive-reference ffmpegOSX.zip --output-dir \"MLV App.app/Contents/MacOS\" --verify-installed",
-          "integrity_gate": {
-            "path": ".github/workflows/macOS-Arm64.yml",
-            "marker": "python -m tools.repo_hygiene.vendored_native_payloads --repo-root . --require-target-compatible macos-arm64",
-            "must_precede": "PYTHONPATH=\"${{ github.workspace }}\" python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root \"${{ github.workspace }}\" --payload-id ffmpeg-macos-x86_64 --archive-reference ffmpegOSX.zip --output-dir \"MLV App.app/Contents/MacOS\" --verify-installed"
-          }
-        },
-        {
           "target": "macos-local",
           "path": "platform/qt/MLVApp.pro",
           "status": "active-local-install-rule-unvalidated",
@@ -248,6 +236,18 @@
         }
       ],
       "consumers": [
+        {
+          "target": "macos-arm64",
+          "path": ".github/workflows/macOS-Arm64.yml",
+          "status": "active-release-workflow",
+          "reference_marker": "ffmpegOSXarm.zip",
+          "operation_marker": "PYTHONPATH=\"${{ github.workspace }}\" python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root \"${{ github.workspace }}\" --payload-id ffmpeg-macos-arm64 --archive-reference ffmpegOSXarm.zip --output-dir \"MLV App.app/Contents/MacOS\" --verify-installed",
+          "integrity_gate": {
+            "path": ".github/workflows/macOS-Arm64.yml",
+            "marker": "python -m tools.repo_hygiene.vendored_native_payloads --repo-root . --require-target-compatible macos-arm64",
+            "must_precede": "PYTHONPATH=\"${{ github.workspace }}\" python -m tools.repo_hygiene.extract_vendored_native_payload --repo-root \"${{ github.workspace }}\" --payload-id ffmpeg-macos-arm64 --archive-reference ffmpegOSXarm.zip --output-dir \"MLV App.app/Contents/MacOS\" --verify-installed"
+          }
+        },
         {
           "target": "macos-local",
           "path": "platform/qt/MLVApp.pro",
