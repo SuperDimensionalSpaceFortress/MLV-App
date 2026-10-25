@@ -12,7 +12,7 @@ Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
 not classified are not counted either, even when the card name says PLAYBACK.
 
-generated_from: 2026-10-25T00:13:20Z
+generated_from: 2026-10-25T00:46:11Z
 
 ## Open product and playback cards
 
@@ -38,8 +38,7 @@ generated_from: 2026-10-25T00:13:20Z
 | 3 | HFR-NATIVE-60FPS-FULLRES-1 | product | pr-open | 2026-10-12 | ORDER-20261014T015628Z #3 after HFR-NATIVE-M16-1457-TIMEBUDGET-1 |
 | 3 | PLAYBACK-HFR-CONFORM-DEFAULT-1 | product | declared | 2026-10-15 | - |
 | 3 | WARM-RUN-CHROMA-SMOOTH-PARITY-1 | product | pr-open | 2026-10-18 | - |
-| 4 | MAC-LINUX-BUILD-RESTORE-1 | product | queued | 2026-10-25 | - |
-| 5 | CPU-SIMD-CLANG-X86-ENABLE-1 | product | queued | 2026-10-25 | - |
+| 3 | MAC-LINUX-BUILD-RESTORE-1 | product | queued | 2026-10-25 | - |
 | 6 | PREP-WORKER-HL-RECON-REFUSAL-FIXTURE-1 | product | queued | 2026-10-07 | - |
 | 6 | C1-PARITY-TESTS-SKIP-WHEN-UNSET-1 | product | queued | 2026-10-09 | - |
 | 6 | PREP-TIER1-FROZEN-ORACLE-1 | product | queued | 2026-10-09 | - |
@@ -56,7 +55,7 @@ generated_from: 2026-10-25T00:13:20Z
 
 ## Drain
 
-product+playback open: 35
+product+playback open: 34
 
 Window: the 7 UTC days ending 2026-10-25 (the last day is partial).
 Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp (approximate: a lower bound on the merge time, not a measurement); queued = rows of any state by `source_ledger_stamp`.
@@ -109,7 +108,8 @@ does not drain (queued >= landed)
 - M16-CAST-PROBES-SALVAGE-1 (P4): D13(d) HUB-TICK 20261013T0714Z: measure-only salvage, colour goal closed 2026-10-08; P6 backlog when idle
 - GPU-FIELD-TELEMETRY-COLLECTION-AND-BATCH-1 (P4): waits for #409 to merge (hardening on its code); unpark the tick #409 MERGED is observed
 - PR493-CLIP-OPEN-ABORT-HARDENING-1 (P4): waits for #493 (CPU-SCOPE-PLAYSTOP-LIFETIME-HARDENING-1) to merge: its cited lines exist only on #493 head 421c4aad; re-queue at P3 the t...
-- MAC-MINI-BUILD-HOST-1 (P4): owner chat e7cff0a2: needs the Mac mini ssh host alias + an authorized key for this machine (refused 2026-10-24 for ultra-magnus, 10.0.0....
-- CPU-NEON-HOT-KERNELS-1 (P5): owner chat e7cff0a2: waits for MAC-MINI-BUILD-HOST-1 (needs an Apple Silicon venue to measure)
-- GPU-PORTABLE-BACKEND-RHI-1 (P5): owner chat e7cff0a2: OWNER sequencing -- after the CUDA speedup work is complete; unpark then
-- GPU-METAL-BACKEND-1 (P6): owner chat e7cff0a2: after GPU-PORTABLE-BACKEND-RHI-1 is measured on the Mac mini
+- MAC-MINI-BUILD-HOST-1 (P4): OWNER RULING 2026-10-25T00:44:41Z - deferred until Windows CUDA + portable GL/RHI solid; ssh mac-mini already works (Qt not installed)
+- CPU-NEON-HOT-KERNELS-1 (P5): OWNER RULING 2026-10-25T00:44:41Z - deferred; when unparked, port upstream ilia3101 cb5c8eb8b (Apple Silicon NEON, 2026-10-13) instead of...
+- CPU-SIMD-CLANG-X86-ENABLE-1 (P5): OWNER RULING 2026-10-25T00:44:41Z - Mac perf work deferred until Windows CUDA + portable GL/RHI solid
+- GPU-PORTABLE-BACKEND-RHI-1 (P5): OWNER - after the CUDA speedup work is complete (CUDA speedup itself owner-deferred 2026-10-21); validating it needs macOS/Metal too
+- GPU-METAL-BACKEND-1 (P6): after GPU-PORTABLE-BACKEND-RHI-1 is measured on the Mac mini
