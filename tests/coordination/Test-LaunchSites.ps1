@@ -80,6 +80,15 @@ Rules, written down because the census depends on them:
                 *Variable* parameter is positional (Import-LocalizedData); -Name or the first positional of the *-Variable cmdlets.
                 Get-Variable's -ValueOnly counts only as the bare switch or `:$true` with no splat. tools/repo_hygiene/
                 test_launch_site_census_binders.py walks the live Get-Command parameter metadata and fails on any binder missed here.
+                (r8, Dot 6394696125; hub ruling HUB-TICK 20261025T0706Z) Splat sources are on the allowlist too. A splat `@h` has a known
+                key set only when a hashtable literal assigned in the splat's own scope reaches it (rule V, with every assignment to h a
+                hashtable literal) and every use of h in the file is one of: the splat; `$h = @{ <constant keys> }`; `$h.Add(<constant>,
+                ...)` or another keyed Hashtable method (set_Item, get_Item, Remove, ContainsKey, Contains) with a constant key, or Clear /
+                ContainsValue / Clone / GetEnumerator; `$h[<constant>]`, read or written; `$h.<constant> = ...`; a read of .Count / .Keys
+                / .Values. Anything else that names h (a non-constant key or member name, h passed to or piped into a command, assigned
+                to another name, cast or [ref], reached through another member such as .psbase, or qualified) makes the key set unknown,
+                and an unknown splat on any command could bind every *Variable* parameter, so it taints every name. An array splat
+                (positional binding) never has a known key set here: its value is not a hashtable literal, so it taints every name.
 #>
 [CmdletBinding()]
 param()
@@ -545,7 +554,77 @@ function New-Ctx($Root) {
         DynamicCall = $false; CmdletName = $false
         # r7 (V3): splatted variables, every param name, and the keyed writes a splat could carry (checked after the walk)
         Splats = [List[object]]::new(); ParamNames = [HashSet[string]]::new(); KeyedValues = [List[object]]::new(); DynamicKey = $false
+        # r8 (V3): every variable reference by name, for the splat-source allowlist (built on first use by Test-SplatSourceUses)
+        VarUses = $null
     }
+}
+
+# r8 (rule V3, Dot 6394696125): $true when every use of the splatted name $Key in the file is on the splat-source allowlist: the splat
+# itself; `$h = @{...}` (Read-Writes already requires every assignment to be a hashtable literal, and a non-constant key there sets
+# DynamicKey); a call of an allowlisted method whose key argument is a constant (`$h.Add('k', v)`); an index with a constant key
+# (`$h['k']`, read or write); a write to a constant member (`$h.k = v`); or a read of .Count / .Keys / .Values. Anything else (a
+# non-constant key, `$h` passed to or piped into a command, assigned to another name, cast, reached through another member such as
+# .psbase, or qualified) could add a key this source cannot see, so the splat's key set is unknown.
+$SplatKeyedMethods = [HashSet[string]]::new([string[]]@('add', 'set_item', 'get_item', 'remove', 'containskey', 'contains'))
+$SplatPlainMethods = [HashSet[string]]::new([string[]]@('clear', 'containsvalue', 'clone', 'getenumerator'))
+$SplatReadMembers = [HashSet[string]]::new([string[]]@('count', 'keys', 'values'))
+
+function Test-ConstKey($K) {
+    $x = Get-Inner $K
+    return ($null -ne $x -and ($x -is [ConstantExpressionAst] -or $null -ne (Get-ConstString $x)))
+}
+
+function Test-AssignTarget($U) {
+    $p = $U
+    while ($p.Parent -is [AttributedExpressionAst]) { $p = $p.Parent }
+    return ($p.Parent -is [AssignmentStatementAst] -and [object]::ReferenceEquals($p.Parent.Left, $p))
+}
+
+function Test-SplatSourceUses([string]$Key, $Ctx) {
+    if ($null -eq $Ctx.VarUses) {
+        # built only for a file with a splat: indexing every variable node of every scanned file costs the census seconds
+        $Ctx.VarUses = @{}
+        foreach ($n in $Ctx.Root.FindAll({ $args[0] -is [VariableExpressionAst] }, $true)) {
+            $nk = Get-VarKey $n
+            if ($null -eq $Ctx.VarUses[$nk]) { $Ctx.VarUses[$nk] = [List[object]]::new() }
+            $Ctx.VarUses[$nk].Add($n)
+        }
+    }
+    foreach ($v in @($Ctx.VarUses[$Key])) {
+        if ($null -eq $v) { continue }
+        if ($v.Splatted) { continue }
+        if ($v.VariablePath.UserPath.Contains(':')) { return $false }
+        if (Test-AssignTarget $v) {
+            $a = $v.Parent
+            while ($a -is [AttributedExpressionAst]) { $a = $a.Parent }
+            if ($a.Operator -eq [TokenKind]::Equals -and (Get-Inner $a.Right) -is [HashtableAst]) { continue }
+            return $false
+        }
+        # look through ( ) around the name
+        $u = $v
+        while ($true) {
+            $p = $u.Parent
+            if ($p -is [ParenExpressionAst]) { $u = $p; continue }
+            if ($p -is [CommandExpressionAst] -and $p.Parent -is [PipelineAst] -and $p.Parent.PipelineElements.Count -eq 1 -and $p.Parent.Parent -is [ParenExpressionAst]) { $u = $p; continue }
+            if ($p -is [PipelineAst] -and $p.PipelineElements.Count -eq 1 -and $p.Parent -is [ParenExpressionAst]) { $u = $p; continue }
+            break
+        }
+        $p = $u.Parent
+        if ($p -is [InvokeMemberExpressionAst] -and [object]::ReferenceEquals($p.Expression, $u) -and -not $p.Static -and $p.Member -is [StringConstantExpressionAst]) {
+            $mn = $p.Member.Value.ToLowerInvariant()
+            if ($SplatPlainMethods.Contains($mn)) { continue }
+            if ($SplatKeyedMethods.Contains($mn) -and $null -ne $p.Arguments -and $p.Arguments.Count -ge 1 -and (Test-ConstKey $p.Arguments[0])) { continue }
+            return $false
+        }
+        if ($p -is [MemberExpressionAst] -and -not ($p -is [InvokeMemberExpressionAst]) -and [object]::ReferenceEquals($p.Expression, $u) -and -not $p.Static -and
+            $p.Member -is [StringConstantExpressionAst]) {
+            if ((Test-AssignTarget $p) -or $SplatReadMembers.Contains($p.Member.Value.ToLowerInvariant())) { continue }
+            return $false
+        }
+        if ($p -is [IndexExpressionAst] -and [object]::ReferenceEquals($p.Target, $u) -and (Test-ConstKey $p.Index)) { continue }
+        return $false
+    }
+    return $true
 }
 
 # Every write to a variable in $Root's AST, recorded in $Ctx (rule V / V2). $Lists, when given, also collects the nodes the site rules read.
@@ -649,14 +728,22 @@ function Read-Writes($Ctx, $Root, $Lists, [int]$Depth) {
     }
     # r7 (V3): a splat binds its keys like named parameters. Only a name whose every value in this file is a hashtable literal is read;
     # then every binder key in the file (a hashtable can be aliased or filled by a function) taints what it names, and a key that is not
-    # constant taints every name.
+    # constant taints every name. r8: the literal must reach the splat in its own scope and every use of the name must be allowlisted.
     if ($Ctx.Splats.Count -gt 0) {
+        $usesOk = @{}
         foreach ($s in $Ctx.Splats) {
+            if ($Ctx.TaintAll) { break }
             $sk = Get-VarKey $s
             $rs = @($Ctx.Assign[$sk] | Where-Object { $null -ne $_ })
             $other = @($rs | Where-Object { $null -eq $_.Right -or -not ((Get-Inner $_.Right) -is [HashtableAst]) }).Count -gt 0
             if ($rs.Count -eq 0 -or $other -or $AutoVars.Contains($sk) -or $Ctx.ParamNames.Contains($sk) -or $Ctx.Tainted.Contains($sk) -or
                 $s.VariablePath.UserPath.Contains(':')) { $Ctx.TaintAll = $true }
+            # r8 (V3): the splat's key set is known only when a literal reaches it in its own scope and every use of the name is allowlisted
+            elseif ($null -eq (Get-LiteralRights $s $Ctx)) { $Ctx.TaintAll = $true }
+            else {
+                if ($null -eq $usesOk[$sk]) { $usesOk[$sk] = Test-SplatSourceUses $sk $Ctx }
+                if (-not $usesOk[$sk]) { $Ctx.TaintAll = $true }
+            }
         }
         if ($Ctx.DynamicKey) { $Ctx.TaintAll = $true }
         foreach ($v in $Ctx.KeyedValues) { Add-Taint $Ctx $v }
