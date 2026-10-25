@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -1007,6 +1008,80 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"found": "L1", "absent": "ABSENT", "bad": "UNKNOWN", "rec": "closed", "none": "ABSENT", "nofile": "ABSENT"})
+
+
+# 2026-10-25 LEASE-BATCH-LEASE-END-TZ-1: the agent's result reaches the runner through ConvertFrom-Json, which on PowerShell 7 turns "endedUtc": "...Z" into a
+# [DateTime] of Kind Utc. Get-LeaseEndUtc used to run it through [string] + DateTimeOffset.Parse, which drops the Kind and assumes the HOST's local offset, so on a
+# Central host every lease end landed 5 h early (roomSec=-15301) and no leg ever started. CI hosts are UTC (offset 0), where the old code passes, so the behavioural
+# cases below only go red on a non-UTC host; the source case is the one that guards on UTC.
+@requires_windows_pwsh
+class LeaseEndUtcTimezoneTests(unittest.TestCase):
+    ENDED = datetime(2026, 10, 25, 1, 19, 14, 720994, tzinfo=timezone.utc)   # the r7 open result's endedUtc
+    LEFT = 2699                                                              # a 45 min lease less the open job's run (the r7 figure)
+    WANT = LEFT - (ENDED.timestamp() % 1)                                    # until - ended, to the sub-second
+
+    @classmethod
+    def lease_end_deltas(cls) -> dict:
+        """Seconds from now to the lease end Get-LeaseEndUtc returns, per input shape. The function is the runner's own text (AST), not a copy."""
+        until = int(cls.ENDED.timestamp()) + cls.LEFT
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)\n"
+            "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-LeaseEndUtc' }, $true)\n"
+            ". ([scriptblock]::Create($fn.Extent.Text))\n"
+            f"$until = {until}\n"
+            "function Delta($ended) {\n"
+            "  $r = Get-LeaseEndUtc ([pscustomobject]@{ endedUtc = $ended; admission = [pscustomobject]@{ leaseBatch = [pscustomobject]@{ untilEpoch = $until } } })\n"
+            "  if ($null -eq $r) { $null } else { [Math]::Round(($r - [DateTime]::UtcNow).TotalSeconds, 1) }\n"
+            "}\n"
+            # the way the runner receives it: the agent's result JSON through ConvertFrom-Json
+            "$fromJson = ('{\"endedUtc\": \"2026-10-25T01:19:14.7209943Z\", \"admission\": {}}' | ConvertFrom-Json).endedUtc\n"
+            "$utc = [DateTime]::SpecifyKind([DateTime]'2026-10-25T01:19:14.7209943', [DateTimeKind]::Utc)\n"
+            "[ordered]@{\n"
+            "  jsonKind = [string]$fromJson.Kind; json = Delta $fromJson\n"
+            "  utcKind = Delta $utc\n"
+            "  unspecifiedKind = Delta ([DateTime]::SpecifyKind($utc, [DateTimeKind]::Unspecified))\n"
+            "  localKind = Delta $utc.ToLocalTime()\n"
+            "  offset = Delta ([DateTimeOffset]::new($utc).ToOffset([TimeSpan]::FromHours(-5)))\n"
+            "  stringZ = Delta '2026-10-25T01:19:14.7209943Z'\n"
+            "  stringOffset = Delta '2026-10-25T03:19:14.7209943+02:00'\n"
+            "  stringNoZone = Delta '2026-10-25T01:19:14.7209943'\n"
+            "  garbage = Delta 'not a time'\n"
+            "  missing = Delta $null\n"
+            "} | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        assert out.returncode == 0, out.stdout + out.stderr
+        return json.loads(out.stdout)
+
+    def test_a_json_utc_timestamp_is_the_same_instant_on_any_host_zone(self) -> None:
+        got = self.lease_end_deltas()
+        self.assertEqual(got["jsonKind"], "Utc", "ConvertFrom-Json hands the runner a Kind=Utc DateTime for a 'Z' string")
+        # the host's UTC offset must not enter (the bug read -15301 on a Central host); 3 s covers the fractional second and a slow host, no real offset is that small
+        self.assertAlmostEqual(got["json"], self.WANT, delta=3, msg=f"roomSec on this host (UTC offset {datetime.now().astimezone().utcoffset()}): {got}")
+
+    def test_every_input_shape_resolves_to_the_same_utc_instant(self) -> None:
+        got = self.lease_end_deltas()
+        for shape in ("utcKind", "unspecifiedKind", "localKind", "offset", "stringZ", "stringOffset", "stringNoZone"):
+            with self.subTest(shape=shape):
+                self.assertAlmostEqual(got[shape], self.WANT, delta=3, msg=f"{shape}: {got}")
+
+    def test_an_unreadable_or_missing_endedutc_is_no_lease_end(self) -> None:
+        got = self.lease_end_deltas()
+        self.assertIsNone(got["garbage"])
+        self.assertIsNone(got["missing"])
+
+    # ---- host-independent guard (the one a UTC CI host can fail)
+    def test_the_runner_never_parses_a_json_timestamp_through_string_and_the_host_offset(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertIsNone(re.search(r"(?<!Try)Parse\(\[string\]", text), "[string] drops the DateTime Kind and a bare Parse then assumes the host's local offset")
+        fn = text[text.index("function Get-LeaseEndUtc"):]
+        fn = fn[:fn.index("\n}\n") + 3]
+        self.assertIn("-is [DateTime]", fn)
+        self.assertIn(".ToUniversalTime()", fn)
+        self.assertIn("AssumeUniversal", fn)
+        self.assertIn("AdjustToUniversal", fn)
+        self.assertNotIn("::Parse(", fn, "a zone-less string must go through TryParse with AssumeUniversal, never a bare Parse")
 
 
 if __name__ == "__main__":

@@ -241,7 +241,19 @@ function Get-LeaseEndUtc($Result) {
     try {
         $lb = $Result.admission.leaseBatch
         if ($null -eq $lb -or $null -eq $lb.untilEpoch -or -not $Result.endedUtc) { return $null }
-        $ended = [DateTimeOffset]::Parse([string]$Result.endedUtc, [Globalization.CultureInfo]::InvariantCulture).ToUnixTimeMilliseconds() / 1000.0
+        # PowerShell 7 ConvertFrom-Json hands a "...Z" string back as a DateTime of Kind Utc; [string] drops the Kind and Parse then assumes THIS host's offset
+        # (a Central host put every lease end 5 h early). A DateTime converts by its Kind (Unspecified is read as UTC, like the string with no zone); a string
+        # is read as UTC unless it names an offset.
+        $er = $Result.endedUtc
+        $edt = $null
+        if ($er -is [DateTime]) { $edt = $(if ($er.Kind -eq [DateTimeKind]::Unspecified) { [DateTime]::SpecifyKind($er, [DateTimeKind]::Utc) } else { $er.ToUniversalTime() }) }
+        elseif ($er -is [DateTimeOffset]) { $edt = $er.UtcDateTime }
+        else {
+            $o = [DateTimeOffset]::MinValue
+            if ([DateTimeOffset]::TryParse([string]$er, [Globalization.CultureInfo]::InvariantCulture, ([Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal), [ref]$o)) { $edt = $o.UtcDateTime }
+        }
+        if ($null -eq $edt) { return $null }
+        $ended = [DateTimeOffset]::new($edt).ToUnixTimeMilliseconds() / 1000.0
         [DateTime]::UtcNow.AddSeconds([double]$lb.untilEpoch - $ended)
     } catch { $null }
 }
