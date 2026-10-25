@@ -336,6 +336,98 @@ GpuPreviewProcessingConfig buildLookAssistOnConfig(MlvPipelineFixture & fixture,
     return config;
 }
 
+/* The optional stages one stage-matrix case may turn on: the config's stage flags,
+ * plus the settings the base subset does not reset (camera matrix, gamut, WB,
+ * exposure, the dual-ISO switch the HL-recon cases flip). A case's mask must equal
+ * the stages it is named for, so no setting from another case rides along. */
+enum CaseStage : uint32_t
+{
+    kStageCreative       = 1u << 0,
+    kStageToning         = 1u << 1,
+    kStageSaturation     = 1u << 2,
+    kStageVibrance       = 1u << 3,
+    kStageInLoopContrast = 1u << 4,
+    kStageHueVs          = 1u << 5,
+    kStageAgx            = 1u << 6,
+    kStageVignette       = 1u << 7,
+    kStageShadowsHighlights = 1u << 8,
+    kStageLut            = 1u << 9,
+    kStageHighlightRecon = 1u << 10,
+    kStageGradient       = 1u << 11,
+    kStageChroma         = 1u << 12,
+    kStageSharpen        = 1u << 13,
+    kStageMedian         = 1u << 14,
+    kStageNoCameraMatrix = 1u << 15,
+    kStageNoGamutCompression = 1u << 16,   /* camera matrix on, compression off (exr_mode) */
+    kStageGamut          = 1u << 17,       /* not Rec709 */
+    kStageWb             = 1u << 18,       /* kelvin or tint off the receipt's */
+    kStageExposure       = 1u << 19,       /* exposure off the receipt's */
+    kStageDualIsoOff     = 1u << 20        /* the receipt's dual ISO switched off */
+};
+
+const char * const kCaseStageNames[] = {
+    "creative", "toning", "saturation", "vibrance", "in_loop_contrast", "hue_vs", "agx",
+    "vignette", "shadows_highlights", "lut", "highlight_recon", "gradient", "chroma",
+    "sharpen", "median", "no_camera_matrix", "no_gamut_compression", "gamut", "wb",
+    "exposure", "dual_iso_off"
+};
+
+std::string caseStageText(uint32_t mask)
+{
+    std::string text;
+    for (size_t bit = 0; bit < sizeof(kCaseStageNames) / sizeof(kCaseStageNames[0]); ++bit)
+        if (mask & (1u << bit))
+            text += (text.empty() ? "" : "|") + std::string(kCaseStageNames[bit]);
+    return text.empty() ? "none" : text;
+}
+
+/* The receipt's settings on a freshly opened fixture, before any case touches it. */
+struct ReceiptBaseline
+{
+    double kelvin = 0.0;
+    double tint = 0.0;
+    double exposure = 0.0;
+    bool dualIso = false;
+};
+
+ReceiptBaseline captureBaseline(const processingObject_t * p)
+{
+    ReceiptBaseline baseline;
+    baseline.kelvin = p->kelvin;
+    baseline.tint = p->wb_tint;
+    baseline.exposure = p->exposure_stops;
+    baseline.dualIso = p->dual_iso != nullptr && *p->dual_iso != 0;
+    return baseline;
+}
+
+uint32_t caseStageMask(const GpuPreviewProcessingConfig & c, const processingObject_t * p,
+                       const ReceiptBaseline & baseline)
+{
+    uint32_t mask = 0;
+    if (c.applyCreativeCurves) mask |= kStageCreative;
+    if (c.applyToning) mask |= kStageToning;
+    if (c.applySaturation) mask |= kStageSaturation;
+    if (c.applyVibrance) mask |= kStageVibrance;
+    if (c.applyInLoopContrast) mask |= kStageInLoopContrast;
+    if (c.applyHueVs) mask |= kStageHueVs;
+    if (c.applyAgx) mask |= kStageAgx;
+    if (c.applyVignette) mask |= kStageVignette;
+    if (c.applyShadowsHighlights) mask |= kStageShadowsHighlights;
+    if (c.applyLut) mask |= kStageLut;
+    if (c.applyHighlightReconstruction) mask |= kStageHighlightRecon;
+    if (c.applyGradient) mask |= kStageGradient;
+    if (c.applyChroma) mask |= kStageChroma;
+    if (c.applySharpen) mask |= kStageSharpen;
+    if (c.applyMedian) mask |= kStageMedian;
+    if (!c.useCameraMatrix) mask |= kStageNoCameraMatrix;
+    if (c.useCameraMatrix && !c.applyGamutCompression) mask |= kStageNoGamutCompression;
+    if (p->colour_gamut != GAMUT_Rec709) mask |= kStageGamut;
+    if (p->kelvin != baseline.kelvin || p->wb_tint != baseline.tint) mask |= kStageWb;
+    if (p->exposure_stops != baseline.exposure) mask |= kStageExposure;
+    if (baseline.dualIso && !c.highlightReconDualIso) mask |= kStageDualIsoOff;
+    return mask;
+}
+
 } // namespace
 
 TEST(PrepPointwiseFast, LookAssistOnAndOffAreAdmittedAndByteIdenticalAtFullSize)
@@ -388,48 +480,52 @@ TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
     {
         const char * label;
         const char * refusal;
+        uint32_t stages;   /* caseStageMask the case must produce, and nothing else */
         std::function<void(processingObject_t *)> setup;
         int blurMode;   /* 0 none, 1 full-res, 2 quarter-res, 3 frame state not ready, 4 short blur */
     };
+    constexpr uint32_t kSh = kStageCreative | kStageShadowsHighlights;
+    constexpr uint32_t kM16 = kStageCreative | kStageInLoopContrast | kStageShadowsHighlights | kStageVibrance
+                            | kStageWb | kStageExposure;
     const Case cases[] = {
-        { "plain", "", [](processingObject_t *) {}, 0 },
-        { "creative_standard", "", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); }, 0 },
-        { "toning", "", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetToning(p, 255, 192, 0, 40); }, 0 },
-        { "saturation", "", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetSaturation(p, 1.5); }, 0 },
-        { "vibrance_up", "", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetVibrance(p, 1.5); }, 0 },
-        { "vibrance_down", "", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetVibrance(p, 0.6); }, 0 },
-        { "in_loop_contrast", "", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetSimpleContrast(p, 1.0); }, 0 },
-        { "gamut_rec2020", "", [](processingObject_t * p) { processingSetGamut(p, GAMUT_Rec2020); }, 0 },
-        { "exr_mode", "", [](processingObject_t * p) { p->exr_mode = 1; }, 0 },
-        { "no_camera_matrix", "", [](processingObject_t * p) { p->use_cam_matrix = 0; }, 0 },
-        { "wb_3000k", "", [](processingObject_t * p) { processingSetWhiteBalance(p, 3000.0, 0.0); }, 0 },
-        { "hl_recon", "", [](processingObject_t * p) { p->highlight_reconstruction = 1; if (p->dual_iso) *p->dual_iso = 0; }, 0 },
-        { "hl_recon_dual_iso", "", [](processingObject_t * p) { p->highlight_reconstruction = 1; if (p->dual_iso) *p->dual_iso = 1; p->highest_green_diso = 30000; }, 0 },
-        { "sh_full", "", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 1 },
-        { "sh_quarter", "", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 2 },
-        { "sh_no_frame_state", "", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 3 },
-        { "sh_short_blur", "", [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 4 },
-        { "night_preset", "", [](processingObject_t * p) {
+        { "plain", "", 0, [](processingObject_t *) {}, 0 },
+        { "creative_standard", "", kStageCreative, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); }, 0 },
+        { "toning", "", kStageCreative | kStageToning, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetToning(p, 255, 192, 0, 40); }, 0 },
+        { "saturation", "", kStageCreative | kStageSaturation, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetSaturation(p, 1.5); }, 0 },
+        { "vibrance_up", "", kStageCreative | kStageVibrance, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetVibrance(p, 1.5); }, 0 },
+        { "vibrance_down", "", kStageCreative | kStageVibrance, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetVibrance(p, 0.6); }, 0 },
+        { "in_loop_contrast", "", kStageCreative | kStageInLoopContrast, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetSimpleContrast(p, 1.0); }, 0 },
+        { "gamut_rec2020", "", kStageGamut, [](processingObject_t * p) { processingSetGamut(p, GAMUT_Rec2020); }, 0 },
+        { "exr_mode", "", kStageNoGamutCompression, [](processingObject_t * p) { p->exr_mode = 1; }, 0 },
+        { "no_camera_matrix", "", kStageNoCameraMatrix, [](processingObject_t * p) { p->use_cam_matrix = 0; }, 0 },
+        { "wb_3000k", "", kStageWb, [](processingObject_t * p) { processingSetWhiteBalance(p, 3000.0, 0.0); }, 0 },
+        { "hl_recon", "", kStageHighlightRecon | kStageDualIsoOff, [](processingObject_t * p) { p->highlight_reconstruction = 1; if (p->dual_iso) *p->dual_iso = 0; }, 0 },
+        { "hl_recon_dual_iso", "", kStageHighlightRecon, [](processingObject_t * p) { p->highlight_reconstruction = 1; if (p->dual_iso) *p->dual_iso = 1; p->highest_green_diso = 30000; }, 0 },
+        { "sh_full", "", kSh, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 1 },
+        { "sh_quarter", "", kSh, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 2 },
+        { "sh_no_frame_state", "", kSh, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 3 },
+        { "sh_short_blur", "", kSh, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 4 },
+        { "night_preset", "", kSh | kStageInLoopContrast | kStageVibrance, [](processingObject_t * p) {
               processingAllowCreativeAdjustments(p); processingSetSimpleContrast(p, 0.14); processingSetPivot(p, 0.46);
               processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); processingSetVibrance(p, 1.03); }, 1 },
-        { "m16_la_on", "", applyM16LookAssistPreset, 1 },
-        { "m16_la_on_hl_recon_dual_iso", "", [](processingObject_t * p) {
+        { "m16_la_on", "", kM16, applyM16LookAssistPreset, 1 },
+        { "m16_la_on_hl_recon_dual_iso", "", kM16 | kStageHighlightRecon, [](processingObject_t * p) {
               applyM16LookAssistPreset(p); p->highlight_reconstruction = 1; if (p->dual_iso) *p->dual_iso = 1; p->highest_green_diso = 30000; }, 1 },
-        { "chroma_r2", "", [](processingObject_t * p) { processingEnableChromaSeparation(p); processingSetChromaBlurRadius(p, 2); }, 0 },
-        { "sharpen", "", [](processingObject_t * p) { processingSetSharpening(p, 0.5); }, 0 },
-        { "median_w3", "", [](processingObject_t * p) { p->denoiserWindow = 3; p->denoiserStrength = 80; }, 0 },
+        { "chroma_r2", "", kStageChroma, [](processingObject_t * p) { processingEnableChromaSeparation(p); processingSetChromaBlurRadius(p, 2); }, 0 },
+        { "sharpen", "", kStageSharpen, [](processingObject_t * p) { processingSetSharpening(p, 0.5); }, 0 },
+        { "median_w3", "", kStageMedian, [](processingObject_t * p) { p->denoiserWindow = 3; p->denoiserStrength = 80; }, 0 },
         /* Refused: the stages the fast path does not carry. */
-        { "vignette", "vignette", [uw, uh](processingObject_t * p) { processingSetVignetteMask(p, uw, uh, 0.5f, 0.2f, 1.0f, 1.4f); processingSetVignetteStrength(p, 60); }, 0 },
-        { "gradient", "gradient", [uw, uh](processingObject_t * p) {
+        { "vignette", "vignette", kStageVignette, [uw, uh](processingObject_t * p) { processingSetVignetteMask(p, uw, uh, 0.5f, 0.2f, 1.0f, 1.4f); processingSetVignetteStrength(p, 60); }, 0 },
+        { "gradient", "gradient", kStageGradient, [uw, uh](processingObject_t * p) {
               processingSetGradientEnable(p, 1);
               processingSetGradientMask(p, uw, uh, 0.0f, 0.0f, static_cast<float>(uw), static_cast<float>(uh));
               processingSetGradientExposure(p, 1.0); }, 0 },
-        { "agx", "agx", [](processingObject_t * p) { processingEnableAgX(p); }, 0 },
-        { "hue_vs", "hue_vs", [](processingObject_t * p) {
+        { "agx", "agx", kStageAgx, [](processingObject_t * p) { processingEnableAgX(p); }, 0 },
+        { "hue_vs", "hue_vs", kStageCreative | kStageHueVs, [](processingObject_t * p) {
               processingAllowCreativeAdjustments(p);
               for (int i = 0; i < 36000; ++i) p->hue_vs_hue[i] = 0.5f;
               p->hue_vs_hue_used = 1; }, 0 },
-        { "lut3d", "lut", [](processingObject_t * p) {
+        { "lut3d", "lut", kStageLut, [](processingObject_t * p) {
               lut_t * lut = p->lut;
               ASSERT_TRUE(lut != nullptr);
               if (lut->cube) { free(lut->cube); lut->cube = nullptr; }
@@ -447,9 +543,15 @@ TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
     };
 
     int checked = 0;
+    const ReceiptBaseline baseline = captureBaseline(fixture.processing());
+    std::string stageMismatches;
     for (const Case & c : cases)
     {
         GpuPreviewProcessingConfig config = buildConfig(fixture, c.setup);
+        const uint32_t stages = caseStageMask(config, fixture.processing(), baseline);
+        if (stages != c.stages)
+            stageMismatches += std::string(" ") + c.label + ": expected=" + caseStageText(c.stages)
+                             + " got=" + caseStageText(stages) + ";";
         if (c.blurMode != 0) ASSERT_TRUE(config.applyShadowsHighlights);
         if (c.blurMode == 1)
         {
@@ -477,6 +579,8 @@ TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
         ++checked;
     }
     ASSERT_EQ(static_cast<int>(sizeof(cases) / sizeof(cases[0])), checked);
+    if (!stageMismatches.empty())
+        ::minitest::fail(__FILE__, __LINE__, "each case enables only its own stages", stageMismatches);
 }
 
 TEST(PrepPointwiseFast, KillSwitchRestoresTheReferenceLoop)
