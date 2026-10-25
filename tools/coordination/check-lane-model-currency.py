@@ -37,13 +37,18 @@ Exit code: 0 overall CURRENT, 1 at least one STALE-MODEL or BAD-EFFORT, 2 the ru
 unreadable, 3 overall INCOMPLETE or NO-DATA (evidence missing, not a violation). One JSON object with
 --json, else a short table.
 
---posture swaps the receipt check for a text guard (MODEL-POSTURE-R19-ADOPT-1, bus R19.1 clause 3):
-Astra is an occasional diversity seat, never a default or a gate. It refuses an
-agents/orchestration-tiering.md table row that names Astra without saying optional / never a default /
-never a gate / `astra: diversity` or that names Astra ahead of the Sol tier, and a tools/coordination/
-Invoke-Lane.ps1 astra comment that does not say the same (or still calls astra the tie-breaker).
-Exit 0 clean, 1 a violation, 2 a file unreadable. The `role` string value in $LANES is not judged: a
-guardrail test pins it, so only its comment carries the posture.
+--posture swaps the receipt check for a BOUNDED TEXT LINT (MODEL-POSTURE-R19-ADOPT-1, bus R19.1
+clause 3): Astra is an occasional diversity seat, never a default or a gate. It is NOT proof that Astra
+cannot become required. It checks exactly three things: (1) every agents/orchestration-tiering.md table
+row that mentions Astra contains the marker substrings optional / never a default / never a gate /
+`astra: diversity` somewhere in the row and names the Sol tier ahead of Astra in its model cell; (2) the
+first contiguous `# astra --` comment block in tools/coordination/Invoke-Lane.ps1 contains the same
+markers; (3) that block does not contain the word tie-breaker. KNOWN LIMIT: it does not read the
+meaning of the text, so a row or comment that keeps every marker but states a contradictory duty
+(e.g. "Astra is required for every design pass"), or a duty stated outside the checked row or comment
+block, still passes; the tests pin both as known limits. Exit 0 clean, 1 a violation, 2 a file
+unreadable. The `role` string value in $LANES is not judged: a guardrail test pins it, and it is a
+legacy receipt label, not routing authority.
 
 Usage: python check-lane-model-currency.py [--runs-dir DIR] [--since-hours N] [--newest FAMILY=ID]... [--json]
        python check-lane-model-currency.py --posture [--repo-root DIR]
@@ -66,6 +71,8 @@ RECEIPT_GLOB = "*/*-001.receipt.json"
 TIERING_REL = "agents/orchestration-tiering.md"
 INVOKE_LANE_REL = "tools/coordination/Invoke-Lane.ps1"
 ASTRA_ROW_MARKERS = ("optional", "never a default", "never a gate", "astra: diversity")
+POSTURE_LINT_SCOPE = ("bounded text lint (marker substrings, their order, one comment block); "
+                      "not proof that Astra cannot become required")
 ASTRA_COMMENT_MARKERS = ("optional diversity seat", "never a default", "never a gate", "astra: diversity")
 
 
@@ -259,7 +266,10 @@ def render(result):
 
 
 def posture_violations(tiering_text, invoke_lane_text):
-    """Astra-posture problems in the two texts (bus R19.1 clause 3); [] when clean."""
+    """Bounded text lint of the two texts (bus R19.1 clause 3); [] when clean.
+
+    Checks marker substrings, their order (Sol before Astra) and one comment block, nothing more. It is
+    not proof that Astra cannot become required: a contradictory duty that keeps every marker passes."""
     problems = []
     for line in tiering_text.splitlines():
         if not line.lstrip().startswith("|") or "astra" not in line.lower():
@@ -322,7 +332,7 @@ def main(argv=None):
         if error:
             print(json.dumps({"ok": False, "error": error}))
             return 2
-        print(json.dumps({"ok": not problems, "problems": problems}, indent=2))
+        print(json.dumps({"ok": not problems, "problems": problems, "scope": POSTURE_LINT_SCOPE}, indent=2))
         return 1 if problems else 0
 
     runs_dir = args.runs_dir or default_runs_dir()

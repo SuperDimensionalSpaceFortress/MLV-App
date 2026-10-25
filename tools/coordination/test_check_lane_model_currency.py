@@ -372,6 +372,42 @@ class AstraPostureTests(unittest.TestCase):
         prose = "astra joined Luna and Sol at high.\n" + NEW_TIERING_ROW
         self.assertEqual(check.posture_violations(prose, NEW_LANES_COMMENT), [])
 
+    # KNOWN LIMITS (dot 718b5ce8 I1 on PR 675): the guard is a bounded text lint over marker substrings,
+    # their order and one comment block. These two tests pin what it does NOT catch; if a later change
+    # makes it catch them, flip the assertion rather than delete the test.
+    def test_known_limit_a_row_keeping_every_marker_but_adding_a_required_duty_still_passes(self):
+        contradictory = NEW_TIERING_ROW.replace(
+            "| anything routine |",
+            "| anything routine; Astra is required for every design pass and must sign off before merge |")
+        self.assertIn("required", contradictory)
+        self.assertIn("never a gate", contradictory)
+        self.assertEqual(check.posture_violations(contradictory, NEW_LANES_COMMENT), [])
+
+    def test_known_limit_a_duty_outside_the_checked_comment_block_still_passes(self):
+        elsewhere = NEW_LANES_COMMENT + (
+            "# Every packet must wait for the astra seat; astra is the required design arbiter.\n"
+            "#   astra  -- required design arbiter (a second, unchecked comment block).\n")
+        self.assertEqual(check.posture_violations(NEW_TIERING_ROW, elsewhere), [])
+
+    def test_known_limit_a_contradictory_duty_in_a_row_that_does_not_name_astra_is_not_seen(self):
+        other_row = "| design arbiter | the second Codex seat is required on every packet | high | x | y |"
+        self.assertEqual(check.posture_violations(NEW_TIERING_ROW + "\n" + other_row, NEW_LANES_COMMENT), [])
+
+    def test_the_lint_describes_itself_as_bounded_not_proof(self):
+        self.assertIn("BOUNDED TEXT LINT", check.__doc__)
+        self.assertIn("KNOWN LIMIT", check.__doc__)
+        self.assertIn("not proof", check.posture_violations.__doc__)
+        done = subprocess.run([sys.executable, str(SCRIPT), "--posture", "--repo-root", str(REPO_ROOT)],
+                              capture_output=True, text=True, timeout=30)
+        self.assertIn("bounded text lint", json.loads(done.stdout)["scope"])
+
+    def test_the_astra_role_label_is_marked_legacy_where_it_is_defined_and_emitted(self):
+        text = (REPO_ROOT / check.INVOKE_LANE_REL).read_text(encoding="utf-8-sig")
+        self.assertIn("role = 'tie-breaker-design-arbiter'", text)  # label unchanged; guardrail test pins it
+        self.assertEqual(text.count("LEGACY"), 2, "one note at the $LANES row, one at the receipt emit site")
+        self.assertEqual(text.count("NOT current routing authority"), 1)
+        self.assertEqual(text.count("must not take it as"), 1)
+
     def test_the_committed_files_satisfy_the_posture(self):
         problems, error = check.check_posture(str(REPO_ROOT))
         self.assertIsNone(error)
