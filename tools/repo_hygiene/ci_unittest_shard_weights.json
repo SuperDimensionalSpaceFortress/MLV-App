@@ -1171,7 +1171,7 @@
    "tools.repo_hygiene.test_venue_chain_runner.VenueChainSupplementaryTests": 166.1,
    "tools.repo_hygiene.test_venue_claim_fifo.VenueClaimFifoTests": 113.1,
    "tools.repo_hygiene.test_venue_lease_batch.LeaseEndUtcTimezoneTests": 3.0,
-   "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchLegPlanTests": 22.0,
+   "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchLegPlanTests": 40.0,
    "tools.repo_hygiene.test_venue_lease_batch.VenueLeaseBatchRunnerTests": 245.0,
    "tools.repo_hygiene.test_venue_leg_inlease_requalify.AdmissionThermalTests": 1.0,
    "tools.repo_hygiene.test_venue_leg_inlease_requalify.CaseExactEnumTests": 4.0,
