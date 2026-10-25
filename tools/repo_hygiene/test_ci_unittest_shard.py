@@ -95,6 +95,29 @@ class AssignTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             shard.load_weights("solaris")
 
+    def test_a_malformed_weight_table_is_refused(self) -> None:
+        # Adversary A1 sibling (r1, 980a921c): a boolean or non-finite weight is not seconds.
+        bad = (
+            {"schema": 1, "seconds": {"windows": {"a.A": True}}},
+            {"schema": 1, "seconds": {"windows": {"a.A": "3"}}},
+            {"schema": 1, "seconds": {"windows": {"a.A": None}}},
+            {"schema": 1, "seconds": {"windows": {"a.A": -1.0}}},
+            {"schema": 1, "seconds": {"windows": ["a.A"]}},
+            {"schema": 1, "seconds": ["windows"]},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "weights.json"
+            for table in bad:
+                with self.subTest(table=table):
+                    path.write_text(json.dumps(table), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        shard.load_weights("windows", path)
+            path.write_text('{"schema": 1, "seconds": {"windows": {"a.A": Infinity}}}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                shard.load_weights("windows", path)
+            path.write_text(json.dumps({"schema": 1, "seconds": {"windows": {"a.A": 2, "b.B": 0.5}}}), encoding="utf-8")
+            self.assertEqual(shard.load_weights("windows", path), {"a.A": 2.0, "b.B": 0.5})
+
 
 class CoverageTests(unittest.TestCase):
     def test_shards_are_an_exact_cover_of_discover(self) -> None:
@@ -371,6 +394,16 @@ class HeavySetTests(unittest.TestCase):
             {"schema": 1, "profiles": {"windows": {"parts": 2, "classes": []}}},
             {"schema": 2, "profiles": {}},
             {"schema": 1, "profiles": {"solaris": {"parts": 1, "classes": ["a.A"]}}},
+            # Adversary A1 (r1, 980a921c): a wrong shape must not be coerced into a valid one.
+            {"schema": 1, "profiles": {"windows": {"parts": 1, "classes": {"a.A": False}}}},
+            {"schema": 1, "profiles": {"windows": {"parts": 1, "classes": "a.A"}}},
+            {"schema": 1, "profiles": {"windows": {"parts": 1, "classes": [None]}}},
+            {"schema": 1, "profiles": {"windows": {"parts": 1, "classes": [""]}}},
+            {"schema": True, "profiles": {"windows": {"parts": 1, "classes": ["a.A"]}}},
+            {"schema": 1, "profiles": ["windows"]},
+            {"schema": 1, "profiles": {"windows": ["a.A"]}},
+            {"schema": 1, "profiles": {"windows": {"parts": True, "classes": ["a.A"]}}},
+            [],
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "heavy.json"

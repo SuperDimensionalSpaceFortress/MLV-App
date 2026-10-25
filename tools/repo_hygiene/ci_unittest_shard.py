@@ -66,27 +66,45 @@ HEAVY_SET_PATH = Path(__file__).with_name("ci_unittest_heavy_set.json")
 def load_weights(profile: str, path: Path = WEIGHTS_PATH) -> dict[str, float]:
     """Measured seconds per ``module.Class`` for one runner OS."""
     table = json.loads(path.read_text(encoding="utf-8"))["seconds"]
+    if not isinstance(table, dict):
+        raise ValueError(f"{path.name}: seconds must be an object")
     if profile not in table:
         raise ValueError(f"no weight table for profile {profile!r}; have {sorted(table)}")
-    return {name: float(seconds) for name, seconds in table[profile].items()}
+    rows = table[profile]
+    if not isinstance(rows, dict):
+        raise ValueError(f"{path.name}: {profile} must be an object of class -> seconds")
+    for name, seconds in rows.items():
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
+            raise ValueError(f"{path.name}: {profile} {name} is {seconds!r}, not a finite number of seconds")
+    return {name: float(seconds) for name, seconds in rows.items()}
 
 
 def load_heavy_set(profile: str, path: Path = HEAVY_SET_PATH) -> tuple[list[str], int]:
     """The profile's heavy classes, sorted, and how many parts the heavy job runs; ``([], 0)`` if none."""
     table = json.loads(path.read_text(encoding="utf-8"))
-    if table.get("schema") != 1:
-        raise ValueError(f"{path.name}: unknown schema {table.get('schema')!r}")
+    schema = table.get("schema") if isinstance(table, dict) else None
+    if type(schema) is not int or schema != 1:
+        raise ValueError(f"{path.name}: unknown schema {schema!r}")
     profiles = table.get("profiles", {})
+    if not isinstance(profiles, dict):
+        raise ValueError(f"{path.name}: profiles must be an object")
     unknown = sorted(set(profiles) - set(PROFILES))
     if unknown:
         raise ValueError(f"{path.name}: unknown profile(s) {unknown}")
     if profile not in profiles:
         return [], 0
     entry = profiles[profile]
-    classes = list(entry.get("classes", []))
+    if not isinstance(entry, dict):
+        raise ValueError(f"{path.name}: {profile} must be an object")
+    classes = entry.get("classes")
     parts = entry.get("parts")
-    if not classes or len(set(classes)) != len(classes):
-        raise ValueError(f"{path.name}: {profile} classes must be non-empty and unique")
+    if (
+        not isinstance(classes, list)
+        or not classes
+        or not all(isinstance(key, str) and key for key in classes)
+        or len(set(classes)) != len(classes)
+    ):
+        raise ValueError(f"{path.name}: {profile} classes must be a non-empty list of unique class names")
     if not isinstance(parts, int) or isinstance(parts, bool) or not 1 <= parts <= len(classes):
         raise ValueError(f"{path.name}: {profile} parts must be an integer from 1 to {len(classes)}")
     return sorted(classes), parts
