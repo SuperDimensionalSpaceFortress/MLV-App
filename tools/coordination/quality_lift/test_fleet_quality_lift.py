@@ -295,14 +295,20 @@ class MeterFixtureTests(unittest.TestCase):
                                              _review("someone", "APPROVED", "2026-10-21T09:00:00Z", H8)],
             ("acme/widget", 22, "reviews"): [_review("keybot", "APPROVED", "2026-10-21T11:00:00Z", H9)],  # after CoS
         })
-        result = self._measure("flip", self._dir(), gh=gh, declared={"nativeReviews": True, "reviewAuthors": ["keybot"]})
+        out = self._dir()
+        declared = {"nativeReviews": True, "reviewAuthors": ["keybot"]}
+        result = self._measure("flip", out, gh=gh, declared=declared)
         since = result["windows"][0]
         self.assertEqual(since["trueMiss"], 1)
         self.assertEqual(since["noPriorKey"], 2)
+        # The entry for a head blocked on one PR still lists it, so the next run (here without GitHub) can use it.
+        self.assertEqual(json.loads((out / "status-cache.json").read_text(encoding="utf-8-sig"))[f"acme/widget@{H7}"]["prs"], [20])
+        again = self._measure("flip", out, declared=declared)
+        self.assertEqual((again["windows"][0]["trueMiss"], again["windows"][0]["statusUnknown"], again["errors"]), (1, 0, []))
         self.assertEqual(since["statusBeforeCos"]["noPriorStatus"], 3)
         self.assertIn("native", since["reviewSource"])
-        self.assertTrue(since["contextsBeforeCos"]["pull-request-review/keybot"]["review"])
-        self.assertFalse(since["contextsBeforeCos"]["pull-request-review/someone"]["review"])
+        self.assertTrue(since["nativeBeforeCos"]["pull-request-review/keybot"]["review"])
+        self.assertFalse(since["nativeBeforeCos"]["pull-request-review/someone"]["review"])
         calls = (gh / "calls.log").read_text(encoding="utf-8")
         self.assertIn("api repos/acme/widget/pulls/20/reviews page=1", calls)
         self.assertIn("api repos/acme/widget/pulls/20/comments page=1", calls)
@@ -315,9 +321,9 @@ class MeterFixtureTests(unittest.TestCase):
         })
         since = self._measure("flip", self._dir(), gh=gh, declared={"nativeReviews": True})["windows"][0]
         self.assertEqual((since["noPriorKey"], since["trueMiss"]), (0, 0))
-        self.assertEqual(since["contextsBeforeCos"]["pull-request-review-comment/keybot"],
+        self.assertEqual(since["nativeBeforeCos"]["pull-request-review-comment/keybot"],
                          {"review": True, "successBeforeCos": 0, "failureBeforeCos": 0})
-        self.assertEqual(since["contextsBeforeCos"]["pull-request-review/keybot"]["failureBeforeCos"], 1)
+        self.assertEqual(since["nativeBeforeCos"]["pull-request-review/keybot"]["failureBeforeCos"], 1)
 
     def test_a_project_with_no_declared_review_source_is_unknown_not_zero(self) -> None:
         out = self._dir()
@@ -351,6 +357,118 @@ class MeterFixtureTests(unittest.TestCase):
                              "-ReviewSources", str(self._sources(projects)))
             self.assertEqual(proc.returncode, 4, (projects, proc.stdout + proc.stderr))
         self.assertFalse((out / "quality-lift.json").exists())
+
+    # -- adversary pass r2 on f6b187b0
+
+    def test_cached_native_evidence_must_cover_every_pr_the_head_was_blocked_on(self) -> None:  # A1
+        bus = self._small_bus([
+            ("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7"),
+            ("cos-feedback/p/pr-8.md", _section(8, H1, "B1 x."), "2026-10-21T10:01:00+00:00", "pr8 same head"),
+        ])
+        # Fetched after both passes, but by a run that had only seen PR 7.
+        cache = {f"acme/widget@{H1}": {"fetched": "2026-10-21T10:02:00Z", "native": True, "prs": [7], "rows": []}}
+        gh = self._fake_gh(pulls={("acme/widget", 8, "reviews"): [_review("keybot", "APPROVED", "2026-10-21T09:00:00Z", H1)]})
+        result, _ = self._measure_bus(bus, "p", cache=cache, gh=gh, declared={"nativeReviews": True})
+        # The approval is of the exact commit, so it precedes both blocking passes on H1.
+        self.assertEqual((result["windows"][0]["noPriorKey"], result["windows"][0]["trueMiss"]), (0, 2))
+        # Under -NoStatuses the same partial entry proves nothing.
+        result, _ = self._measure_bus(bus, "p", cache=cache, declared={"nativeReviews": True})
+        self.assertEqual(result["windows"][0]["statusUnknown"], 1)
+
+    def test_a_project_name_is_literal_and_skipped_folders_are_named(self) -> None:  # A2
+        bus = self._small_bus([
+            ("cos-feedback/README.md", "readme\n", "2026-10-20T00:00:00+00:00", "seed"),
+            ("cos-feedback/demo[1]/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "bracketed"),
+            ("cos-feedback/demo1/pr-8.md", _section(8, H2, "B1 x."), "2026-10-21T11:00:00+00:00", "a name the pattern would match"),
+            ("cos-feedback/_demo/pr-9.md", _section(9, H3, "B1 x."), "2026-10-21T12:00:00+00:00", "underscore folder"),
+        ])
+        since = self._measure_bus(bus, "demo[1]")[0]["windows"][0]
+        self.assertEqual((since["passes"], since["blocked"]), (1, 1))
+        self.assertEqual(self._measure_bus(bus, "demo1")[0]["windows"][0]["passes"], 1)
+        out = self._dir()
+        proc = self._run("-Bus", str(bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoStatuses", "-NoFetch")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        fleet = (out / "fleet.md").read_text(encoding="utf-8-sig")
+        self.assertIn("| demo[1] | 1 |", fleet)
+        self.assertIn("Not measured (bus folders starting with _ or .): _demo", fleet)
+
+    def test_equal_timestamps_keep_commit_and_listing_order(self) -> None:  # A3
+        p = "cos-feedback/p/pr-7.md"
+        bus = self._small_bus([
+            (p, _section(7, H2, "B1 x."), "2026-10-21T10:00:00+00:00", "older: blocks H2"),
+            (p, _section(7, H1, "None."), "2026-10-21T10:00:00+00:00", "child, same second: H1 clean"),
+        ])
+        gh = self._fake_gh({("acme/widget", H2): [_status("review/key-a", "success", "2026-10-21T09:00:00Z"),
+                                                  _status("review/key-a", "pending", "2026-10-21T09:00:00Z")]})  # newest first
+        since, out = self._measure_bus(bus, "p", gh=gh)
+        self.assertEqual(since["windows"][0]["firstRoundBlocked"], 1)
+        cache = json.loads((out / "status-cache.json").read_text(encoding="utf-8-sig"))
+        rows = cache[f"acme/widget@{H2}"]["rows"]
+        rows = rows if isinstance(rows, list) else [rows]
+        self.assertEqual(rows[0]["state"], "success")
+
+    def test_an_invalid_wildcard_in_review_sources_is_a_usage_error(self) -> None:  # A4
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7")])
+        cache = {f"acme/widget@{H1}": {"fetched": "2026-10-21T12:00:00Z", "rows": [
+            {"context": "review/sol", "firstUtc": "2026-10-21T09:00:00Z", "state": "success", "successUtc": "2026-10-21T09:00:00Z", "failureUtc": None}]}}
+        out = self._dir()
+        (out / "status-cache.json").write_text(json.dumps(cache), encoding="utf-8")
+        proc = self._run("-Bus", str(bus), "-Project", "p", "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoStatuses", "-NoFetch",
+                         "-ReviewSources", str(self._sources({"p": {"statusContexts": ["review/[z-a]"]}})))
+        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+
+    def test_a_status_named_like_a_native_review_is_kept_apart(self) -> None:  # A5
+        gh = self._fake_gh({("acme/widget", H7): [_status("pull-request-review/keybot", "pending", "2026-10-21T08:00:00Z")]},
+                           pulls={("acme/widget", 20, "reviews"): [_review("keybot", "APPROVED", "2026-10-21T09:00:00Z", H7)]})
+        since = self._measure("flip", self._dir(), gh=gh, declared={"nativeReviews": True, "reviewAuthors": ["keybot"]})["windows"][0]
+        self.assertEqual(since["contextsBeforeCos"]["pull-request-review/keybot"], {"review": False, "successBeforeCos": 0, "failureBeforeCos": 0})
+        self.assertEqual(since["nativeBeforeCos"]["pull-request-review/keybot"], {"review": True, "successBeforeCos": 1, "failureBeforeCos": 0})
+        self.assertEqual(since["trueMiss"], 1)
+
+    def test_a_project_named_like_a_fleet_report_is_a_named_error(self) -> None:  # A6
+        bus = self._small_bus([
+            ("cos-feedback/fleet.json/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "collides with fleet.json"),
+            ("cos-feedback/ok/pr-8.md", _section(8, H2, "B1 x."), "2026-10-21T11:00:00+00:00", "ordinary"),
+        ])
+        out = self._dir()
+        proc = self._run("-Bus", str(bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoStatuses", "-NoFetch")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertEqual([r["project"] for r in json.loads((out / "fleet.json").read_text(encoding="utf-8-sig"))], ["ok"])
+        self.assertIn("fleet.json", (out / "fleet.md").read_text(encoding="utf-8-sig").split("Errors:")[1])
+
+    def test_a_torn_jsonl_tail_is_not_appended_to(self) -> None:  # A7
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7")])
+        out = self._dir()
+        (out / "corpus.jsonl").write_text("{", encoding="utf-8")
+        (out / "history.jsonl").write_text("{", encoding="utf-8")
+        (out / "status-cache.json").write_text(json.dumps({f"acme/widget@{H1}": {"fetched": "2026-10-21T12:00:00Z", "rows": []}}), encoding="utf-8")
+        proc = self._run("-Bus", str(bus), "-Project", "p", "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoStatuses", "-NoFetch",
+                         "-ReviewSources", str(self._sources({"p": REVIEW_STATUS})))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        for name in ("corpus.jsonl", "history.jsonl"):
+            lines = (out / name).read_text(encoding="utf-8-sig").splitlines()
+            self.assertEqual(lines[0], "{", name)
+            self.assertEqual(len(lines), 2, name)
+            json.loads(lines[1])
+        result = json.loads((out / "quality-lift.json").read_text(encoding="utf-8-sig"))
+        self.assertTrue(any("corpus.jsonl" in e for e in result["errors"]), result["errors"])
+
+    def test_the_lock_wait_is_timed_by_a_monotonic_clock(self) -> None:  # A8: a wall-clock step cannot be faked here
+        text = METER.read_text(encoding="ascii")
+        self.assertNotIn("UtcNow.AddSeconds($LockWaitSec)", text)
+        self.assertIn("Diagnostics.Stopwatch", text)
+
+    def test_a_review_comment_row_that_claims_a_success_is_malformed(self) -> None:  # A9
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7")])
+        row = {"context": "pull-request-review-comment/keybot", "source": "review-comment", "login": "keybot",
+               "firstUtc": "2026-10-21T09:00:00Z", "state": "COMMENTED", "successUtc": "2026-10-21T09:00:00Z", "failureUtc": None}
+        cache = {f"acme/widget@{H1}": {"fetched": "2026-10-21T12:00:00Z", "native": True, "prs": [7], "rows": [row]}}
+        result, _ = self._measure_bus(bus, "p", cache=cache, expect=2, declared={"nativeReviews": True})
+        self.assertEqual((result["windows"][0]["statusUnknown"], result["windows"][0]["trueMiss"]), (1, 0))
+
+    def test_the_reported_since_keeps_its_fraction(self) -> None:  # A10
+        result = self._measure("demo", self._dir(), since="2026-10-21T10:00:00.500Z")
+        self.assertEqual(result["since"], "2026-10-21T10:00:00.5000000Z")
 
     def test_the_tracked_review_sources_file_parses_and_declares_review_evidence(self) -> None:
         tracked = json.loads((HERE / "review-sources.json").read_text(encoding="utf-8"))
