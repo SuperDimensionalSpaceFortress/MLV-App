@@ -18,7 +18,9 @@ pwsh -NoProfile -File tools/coordination/quality_lift/Measure-FleetQualityLift.p
 ```
 
 `-Bus` defaults to `$env:FACTORY_BUS_CLONE`. Leave out `-Project` to measure every project with cos-feedback on the bus
-(it writes `<OutDir>\fleet.md`). `-NoStatuses` reads nothing from GitHub, and `-NoFetch` skips the bus pull. Exit 0
+(it writes `<OutDir>\fleet.md`). The meter writes only under `-OutDir`, except one `git pull --ff-only` of the bus
+before it measures; `-NoFetch` skips that pull, and a pull that fails is a named source error. `-NoStatuses` reads
+nothing from GitHub: blocked heads with no cached statuses then count as "unknown", never as "CoS read first". Exit 0
 means measured, 2 measured with source errors (named in the report), 3 bus unreadable, and 4 a usage error.
 
 Then run it hourly from your project's own scheduler, with the same arguments and no `-Since` (the default is the last 7
@@ -41,10 +43,11 @@ Before `gh pr create`, and before any push to an open PR:
    still open in the PR body.
 3. If the pass cannot run (no capacity, timeout), proceed and say `verdict=ERROR` in the PR body.
 
-The PR body (or the comment on the push) carries one line, which the meter counts:
+The PR body carries one line, which the meter counts:
 
 ```
 Adversary pass: <where the result is> verdict=<CLEAN|FINDINGS|ERROR> found=<n> fixed=<m>
 ```
 
-The meter matches any body line that starts `Adversary pass` (case-insensitive, after optional bullet or bold marks).
+On a push to an open PR, update that line in the PR body: the meter reads PR bodies only, never comments. It matches
+any body line that starts `Adversary pass` (case-insensitive, after optional bullet or bold marks).
