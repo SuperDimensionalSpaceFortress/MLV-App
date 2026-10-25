@@ -156,6 +156,14 @@ public:
                                                  QString *reason = nullptr,
                                                  quint64 *presentedSerial = nullptr,
                                                  bool *presentedSerialValid = nullptr);
+    /* PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 (--visual-capture-dir only): the presentationSerial paintGL() last
+     * promoted (m_presentedSerial) -- a cheap read, no paint and no readback. Returns its validity; false when
+     * no window is active. */
+    static bool presentedSerialIfActive(quint64 *presentedSerial);
+    /* Same, after first painting a pending frame synchronously (paintGL() + swap, the grab idiom without its
+     * readback) when one is waiting on Qt's deferred update(); a frame already painted is not painted again.
+     * GUI-thread only. */
+    static bool paintPendingNowIfActive(quint64 *presentedSerial);
     /* Logical size of the active preview window (empty if none). Used by the display
      * scene-geometry calc so the playback preview resolution tracks the QOpenGLWindow
      * surface, not the hidden QGraphicsView. GUI-thread only. */
@@ -252,6 +260,9 @@ private:
     // a ring scan) answer the session-summary questions (count/fps/max gap).
     static const int kSwapTelemetryRingCapacity = 2048;
     void noteRealSwap(void);
+    /* The ONE manual swap site (real swap path 2 of 3): swaps a frame painted outside Qt's paint-event cycle
+     * (grabPresentedFramebufferIfActive, paintPendingNowIfActive) and records it. Context already current. */
+    static void swapOutsidePaintEventAndRecord(GpuDisplayWindow *win, QOpenGLContext *glContext);
     /* Fate telemetry (CUDA-PLAYBACK-PRESENT-CADENCE-1): called at the START of
      * setPresentedImage()/setPresentedGpuPlaybackReconAmazePostWbTexture(), before either
      * mutates any pending state, with the NEW submission's presentationSerial. If the

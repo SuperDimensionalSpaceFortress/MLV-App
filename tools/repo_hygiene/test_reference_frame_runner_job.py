@@ -567,7 +567,8 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertFalse((self.artifacts() / "capture" / "reference-frame-candidate.json").exists())
 
     # --- F-01 footage-path-disclosure: a SUCCESSFUL capture publishes nothing that names the owner's part path ---------------------------------
-    def run_stand_in_capture(self, name: str, edit: tuple[str, str] | None = None) -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
+    def run_stand_in_capture(self, name: str, edit: tuple[str, str] | None = None,
+                             more_edits: tuple[tuple[str, str], ...] = ()) -> tuple[subprocess.CompletedProcess, Path, Path, str, Path, str]:
         """The emitted job run end to end against a stand-in app; returns (ran, outbox, part, part sha256, the app's argv file, the path marker)."""
         marker = "OWNERREALPATHMARKERq7z3"
         owner_dir = self.tmp / f"{marker}-dir"
@@ -593,9 +594,9 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertEqual(count, 1)
         self.assertEqual(job.count("-Exe '$exePath'"), 1, "the capture's -Exe anchor moved: this fixture is stale")
         job = job.replace("-Exe '$exePath'", f"-Exe '{fake}'")
-        if edit is not None:
-            self.assertEqual(job.count(edit[0]), 1, f"injection anchor {edit[0]!r} is not unique: this fixture is stale")
-            job = job.replace(edit[0], edit[1])
+        for anchor, injected in (() if edit is None else (edit,)) + tuple(more_edits):
+            self.assertEqual(job.count(anchor), 1, f"injection anchor {anchor!r} is not unique: this fixture is stale")
+            job = job.replace(anchor, injected)
         gen_out.write_text(job, encoding="utf-8")
         ran = _run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(gen_out)])
         return ran, self.artifacts(), part, part_sha, args_file, marker
@@ -697,6 +698,175 @@ class EmittedJobOnAFixtureAgentRootTests(_GeneratorCase):
         self.assertIs(candidate["invalid"], True)
         self.assertIn("OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE", candidate["invalid_reasons"])
         self.assertIs(result["candidateInvalidated"], True)
+        self.assertIs(result["candidateInvalidMarker"], True, "the marker is written whenever a manifest is invalidated, not only when the stamp fails")
+
+    # --- VENUE-REFERENCE-FRAME-CANDIDATE-INVALID-MARKER-1: the in-place stamp is best effort, so a durable marker backs it -------------------------
+    VIEW_CHANGED = ("Assert-AttrCudaOwnerFootageViewsIntact -Views @($ownerViews); $viewsIntactAfterCapture = $true",
+                    "throw 'INJECTED_VIEW_CHANGED'; $viewsIntactAfterCapture = $true")
+    # (a) the manifest on disk does not parse when the job comes to stamp it
+    UNPARSEABLE_MANIFEST = ("$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'",
+                            "$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'; "
+                            "[IO.File]::WriteAllText($candidatePath, '{\"status\": \"candidate-unreviewed\", \"truncated')")
+    # (b) the manifest parses, but publishing the stamped copy fails
+    STAMP_PUBLISH_FAILS = ("[void](Publish-AttrCudaText -Path $candidatePath -Value ($candidateDoc | ConvertTo-Json -Depth 64))",
+                           "throw 'INJECTED_CANDIDATE_PUBLISH_FAILURE'")
+    # (c) the marker cannot be written either
+    MARKER_PUBLISH_FAILS = ("[void](Publish-AttrCudaText -Path $candidateMarkerPath ",
+                            "throw 'INJECTED_MARKER_PUBLISH_FAILURE'; [void](Publish-AttrCudaText -Path $candidateMarkerPath ")
+
+    @staticmethod
+    def _frame_provenance():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("frame_provenance_under_test", ROOT / "tools" / "profiling" / "frame_provenance.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def assert_failed_stamp_left_a_marker_and_no_candidate(self, ran: subprocess.CompletedProcess, pub: Path) -> dict:
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=footageViewIntact EXIT=225", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 225, 0))
+        self.assertIsNone(result["candidateSha256"])
+        self.assertIs(result["candidateInvalidated"], False, "the stamp did not land: result.json must not say it did")
+        marker = pub / "capture" / "reference-frame-candidate.invalid"
+        self.assertTrue(marker.is_file(), "no durable invalid marker: the manifest still reads as a candidate")
+        document = json.loads(marker.read_text(encoding="utf-8-sig"))
+        self.assertIs(document["invalid"], True)
+        self.assertIn("OWNER_FOOTAGE_VIEW_CHANGED_DURING_CAPTURE", document["invalid_reasons"])
+        self.assertIs(result["candidateInvalidMarker"], True)
+        # the reader in tree honours it: marker present = not a candidate, whatever the manifest says
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {}, "frame_provenance still indexes the capture as a candidate")
+        return result
+
+    def test_a_manifest_that_does_not_parse_leaves_a_marker_even_so(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("unparseable", edit=self.VIEW_CHANGED, more_edits=(self.UNPARSEABLE_MANIFEST,))
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout)
+        self.assert_failed_stamp_left_a_marker_and_no_candidate(ran, pub)
+        with self.assertRaises(ValueError):
+            json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+
+    def test_a_stamp_that_cannot_be_published_leaves_a_marker_anyway(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("stampfails", edit=self.VIEW_CHANGED, more_edits=(self.STAMP_PUBLISH_FAILS,))
+        self.assertIn("CANDIDATE_NOT_INVALIDATED", ran.stdout)
+        self.assert_failed_stamp_left_a_marker_and_no_candidate(ran, pub)
+        # the manifest kept its old, unstamped text: this is exactly the case the marker exists for
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(manifest["status"], "candidate-unreviewed")
+
+    def test_when_neither_the_stamp_nor_the_marker_can_be_written_the_manifest_is_moved_out_of_the_candidate_name(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("nomarker", edit=self.VIEW_CHANGED,
+                                                         more_edits=(self.STAMP_PUBLISH_FAILS, self.MARKER_PUBLISH_FAILS))
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertIn("CANDIDATE_MARKER_NOT_WRITTEN", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 225, 0))
+        self.assertIsNone(result["candidateSha256"])
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, True))
+        self.assertFalse((pub / "capture" / "reference-frame-candidate.json").exists(), "the manifest still carries the candidate name")
+        self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {})
+
+    # REFERENCE-FRAME-QUARANTINE-NUMBERED-TARGET-1: defense-in-depth, not the ordinary same-jobId rerun (that recreates the outbox fresh, so the
+    # fixture plants the earlier quarantine by hand). The numbering is Set-GuiSmokeReceiptInvalid's (<stem>.INVALID<ext>, then
+    # <stem>.INVALID.<n><ext>); nothing is overwritten and the move does not throw.
+    @staticmethod
+    def occupied_quarantine_target(*names: str) -> tuple[str, str]:
+        writes = "; ".join(f"[IO.File]::WriteAllText((Join-Path $captureOut '{name}'), 'earlier-run-{name}')" for name in names)
+        anchor = "$candidatePath = Join-Path $captureOut 'reference-frame-candidate.json'"
+        return (anchor, f"{anchor}; {writes}")
+
+    def assert_quarantined_to(self, ran: subprocess.CompletedProcess, pub: Path, target: str, kept: tuple[str, ...]) -> None:
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertNotIn("CANDIDATE_NOT_QUARANTINED", ran.stdout, "the quarantine rename threw on an occupied target")
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, True))
+        capture = pub / "capture"
+        self.assertFalse((capture / "reference-frame-candidate.json").exists(), "the manifest still carries the candidate name")
+        self.assertIn("candidate-unreviewed", (capture / target).read_text(encoding="utf-8-sig"), "the manifest is not at the numbered target")
+        for name in kept:
+            self.assertEqual((capture / name).read_text(encoding="utf-8-sig"), f"earlier-run-{name}", f"{name} was overwritten")
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {})
+
+    def test_an_occupied_quarantine_target_is_numbered_not_overwritten_and_the_manifest_still_leaves_the_candidate_name(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("quarantineoccupied", edit=self.VIEW_CHANGED, more_edits=(
+            self.STAMP_PUBLISH_FAILS, self.MARKER_PUBLISH_FAILS, self.occupied_quarantine_target("reference-frame-candidate.INVALID.json")))
+        self.assert_quarantined_to(ran, pub, "reference-frame-candidate.INVALID.1.json", ("reference-frame-candidate.INVALID.json",))
+
+    def test_a_second_occupied_quarantine_target_numbers_past_the_first(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("quarantineoccupied2", edit=self.VIEW_CHANGED, more_edits=(
+            self.STAMP_PUBLISH_FAILS, self.MARKER_PUBLISH_FAILS,
+            self.occupied_quarantine_target("reference-frame-candidate.INVALID.json", "reference-frame-candidate.INVALID.1.json")))
+        self.assert_quarantined_to(ran, pub, "reference-frame-candidate.INVALID.2.json",
+                                   ("reference-frame-candidate.INVALID.json", "reference-frame-candidate.INVALID.1.json"))
+
+    # REFERENCE-FRAME-QUARANTINE-FOLLOWUPS-1: the quarantine is best effort too. When the move itself throws, the job still exits 225 and says so:
+    # CANDIDATE_NOT_QUARANTINED is printed, result.json carries candidateQuarantined=false, and the manifest is left exactly as the capture wrote it.
+    def test_a_quarantine_rename_that_throws_is_reported_and_leaves_the_candidate_unchanged(self) -> None:
+        before = self.tmp / "candidate-before-quarantine.json"
+        move = "Move-Item -LiteralPath $candidatePath -Destination $quarantineTarget -ErrorAction Stop"
+        failing_move = (move, f"[IO.File]::Copy($candidatePath, '{str(before).replace(chr(39), chr(39) * 2)}'); throw 'INJECTED_QUARANTINE_RENAME_FAILURE'")
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("quarantinemovefails", edit=self.VIEW_CHANGED, more_edits=(
+            self.STAMP_PUBLISH_FAILS, self.MARKER_PUBLISH_FAILS, failing_move))
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertIn("RESULT=REFERENCE_FRAME_FAILED STEP=footageViewIntact EXIT=225", ran.stdout)
+        self.assertIn("CANDIDATE_NOT_QUARANTINED", ran.stdout, "the swallowed rename failure left no diagnostic")
+        self.assertIn("INJECTED_QUARANTINE_RENAME_FAILURE", ran.stdout, "the diagnostic does not carry the rename's error")
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["status"], result["exitCode"], result["captureExitCode"]), ("capture-failed", 225, 0))
+        self.assertIsNone(result["candidateSha256"])
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (False, False, False))
+        capture = pub / "capture"
+        self.assertTrue(before.is_file(), "the injected failure did not run: this fixture is stale")
+        self.assertEqual((capture / "reference-frame-candidate.json").read_bytes(), before.read_bytes(), "the candidate manifest changed")
+        self.assertEqual(sorted(p.name for p in capture.glob("*INVALID*")), [], "a quarantine target or marker was written")
+
+    def test_a_marker_that_cannot_be_written_but_a_stamp_that_lands_is_still_not_a_candidate_to_the_reader(self) -> None:
+        """REFERENCE-FRAME-CONSUMER-HONORS-INVALID-STAMP-1: marker publish fails, stamp succeeds -> no marker and no quarantine (the job only does
+        either when the stamp failed too), so the stamp alone must keep frame_provenance from indexing the voided capture."""
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("markerfails", edit=self.VIEW_CHANGED, more_edits=(self.MARKER_PUBLISH_FAILS,))
+        self.assertEqual(ran.returncode, 225, ran.stdout + ran.stderr)
+        self.assertIn("CANDIDATE_MARKER_NOT_WRITTEN", ran.stdout)
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (True, False, None))
+        self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
+        manifest = json.loads((pub / "capture" / "reference-frame-candidate.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((manifest["status"], manifest["invalid"]), ("invalid", True))
+        # No `skipped` argument first, so a reader that predates the stamp check fails here on the assertion, not on a TypeError for the new parameter.
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub)), {}, "frame_provenance still indexes the stamped-invalid capture")
+        skipped: list[dict] = []
+        self.assertEqual(self._frame_provenance().index_capture_records(str(pub), skipped), {}, "frame_provenance still indexes the stamped-invalid capture")
+        self.assertEqual([s["reason"] for s in skipped], ["manifest-stamped-invalid"])
+
+    def test_a_capture_that_passed_writes_no_invalid_marker_and_reports_none(self) -> None:
+        ran, pub, _, _, _, _ = self.run_stand_in_capture("nomarkerok")
+        self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+        self.assertFalse((pub / "capture" / "reference-frame-candidate.invalid").exists())
+        result = json.loads((pub / "result.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual((result["candidateInvalidated"], result["candidateInvalidMarker"], result["candidateQuarantined"]), (None, None, None))
+        self.assertEqual(len(self._frame_provenance().index_capture_records(str(pub))), 1)
+
+    def test_the_comment_states_the_marker_rule_and_no_longer_claims_the_manifest_alone_decides(self) -> None:
+        text = GENERATOR.read_text(encoding="utf-8")
+        self.assertNotIn("so the manifest alone never\n# reads as a candidate", text)
+        self.assertIn("reference-frame-candidate.invalid", text)
+        self.assertIn("marker present = not a candidate", text)
+
+    # REFERENCE-FRAME-JOB-HEADER-CLAIM-QUALIFY-1: the same claim, in the header comment (unwrapped) and in the doc, is qualified the way the body is.
+    UNCONDITIONAL_CLAIM = re.compile(r"manifest\s+alone\s+never\s+reads\s+as\s+a\s+candidate", re.IGNORECASE)
+
+    def test_no_comment_claims_the_stamped_manifest_alone_never_reads_as_a_candidate_wrapped_or_not(self) -> None:
+        text = GENERATOR.read_text(encoding="utf-8")
+        self.assertIsNone(self.UNCONDITIONAL_CLAIM.search(re.sub(r"\s*\n#\s*", " ", text)), "an unconditional 'the manifest alone never reads as a candidate' survives")
+        self.assertIsNone(self.UNCONDITIONAL_CLAIM.search(text))
+        header = text.split("# NOT COVERED HERE", 1)[0]
+        self.assertIn("best effort", header, "the header does not say the in-place stamp is best effort")
+        self.assertIn("reference-frame-candidate.invalid", header, "the header does not name the marker that backs the stamp")
+        doc = (ROOT / "docs" / "playback-clip-length-rule.md").read_text(encoding="utf-8")
+        row = next(line for line in doc.splitlines() if "bachelor/reference-frame-runner-job.ps1" in line and "VENUE-REFERENCE-FRAME-JOB-1" in line)
+        self.assertIsNone(self.UNCONDITIONAL_CLAIM.search(row))
+        self.assertIn("best effort", row, "the doc row presents the in-place stamp as unconditional")
+        self.assertIn("moved out of the candidate name", row, "the doc row omits the last-resort quarantine")
 
 
 @requires_pwsh
@@ -883,7 +1053,7 @@ class CaptureScriptPinnedWindowTests(oracle_tests._LauncherCase):
         """Failure shape 2, as far as the tool can see it: the app exits 11 (`exact presented-frame target was not met`) and writes no frame."""
         stderr = "[GUI-SMOKE] ERROR: exact presented-frame target was not met; target=480 observed=418."
         proc, _ = self.run_capture(None, "-Seconds", "30", exit_code=11, stderr_text=stderr)
-        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, PINNED_FRAME_NOT_PRESENTED_EXIT, proc.stdout + proc.stderr)
         self.assertIn("PINNED_FRAME_NOT_PRESENTED", proc.stdout)
         self.assertIn("target=480", proc.stdout)
         self.assertIn("observed=418", proc.stdout)
@@ -892,9 +1062,90 @@ class CaptureScriptPinnedWindowTests(oracle_tests._LauncherCase):
 
     def test_any_other_app_failure_keeps_its_own_reason(self) -> None:
         proc, _ = self.run_capture(None, "-Seconds", "30", exit_code=7, stderr_text="[GUI-SMOKE] ERROR: Play action did not enter checked state.")
-        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, APP_EXITED_NONZERO_EXIT, proc.stdout + proc.stderr)
         self.assertNotIn("PINNED_FRAME_NOT_PRESENTED", proc.stdout)
         self.assertIn("exe exited 7", proc.stdout)
+
+    def test_the_two_app_failures_exit_with_different_codes_and_neither_is_the_never_started_code(self) -> None:
+        """REFERENCE-FRAME-EXIT-CODE-DISAMBIGUATE-1: executed, not read -- result.json captureExitCode tells these apart."""
+        pinned, _ = self.run_capture(None, "-Seconds", "30", exit_code=11,
+                                     stderr_text="[GUI-SMOKE] ERROR: exact presented-frame target was not met; target=480 observed=418.")
+        other, _ = self.run_capture(None, "-Seconds", "30", exit_code=7, stderr_text="[GUI-SMOKE] ERROR: Play action did not enter checked state.")
+        self.assertEqual(len({pinned.returncode, other.returncode, NEVER_STARTED_EXIT}), 3, (pinned.returncode, other.returncode))
+
+
+# REFERENCE-FRAME-EXIT-CODE-DISAMBIGUATE-1: capture-reference-frame.ps1 used exit 4 for four causes. One code per cause now; 4 stays the true
+# never-started case so receipts written before this card keep their meaning. All below 100 (the venue job's header: "all below 100"), and
+# clear of every code the script, the gui-smoke helpers and the job already use.
+NEVER_STARTED_EXIT = 4
+EXIT_CODE_LOST_EXIT = 45
+PINNED_FRAME_NOT_PRESENTED_EXIT = 46
+APP_EXITED_NONZERO_EXIT = 47
+# 3 CANNOT-DETERMINE, 5 no frame, 6 degenerate grab, 17 hub VM refused, 41 CLIP_TOO_SHORT / PLAY_WINDOW_TOO_SHORT, 42 CLIP_LENGTH_UNKNOWN,
+# 43 INVALID, 44 inherited autoplay; the job's own 70 (no exit code) and 199 (fold of a code outside 1-199).
+RESERVED_CAPTURE_EXITS = frozenset({0, 3, 5, 6, 17, 41, 42, 43, 44, 70, 199})
+
+
+class CaptureScriptFailureCodeTests(unittest.TestCase):
+    """The four causes that shared `exit 4`, read from the script's own text (no pwsh, no app)."""
+
+    CAUSES = {
+        "never-started": ("process-never-started", NEVER_STARTED_EXIT),
+        "exit-code-lost": ("exit-code-lost", EXIT_CODE_LOST_EXIT),
+        "pinned-frame-not-presented": ("PINNED_FRAME_NOT_PRESENTED", PINNED_FRAME_NOT_PRESENTED_EXIT),
+        "app-exited-nonzero": ("exe exited", APP_EXITED_NONZERO_EXIT),
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.text = CAPTURE.read_text(encoding="utf-8")
+        cls.header = cls.text.split("[CmdletBinding()]", 1)[0]
+
+    def exit_after(self, token: str) -> int:
+        """The first `exit N` that follows the failure line carrying `token` (a literal number, never an expression)."""
+        start = self.text.find(f"CAPTURE: FAILED - {token}")
+        self.assertGreaterEqual(start, 0, f"no `CAPTURE: FAILED - {token}` line in the script")
+        match = re.search(r"\bexit (\d+)\b", self.text[start:])
+        self.assertIsNotNone(match, token)
+        return int(match.group(1))
+
+    def test_each_failure_cause_has_a_code_of_its_own(self) -> None:
+        codes = {name: self.exit_after(token) for name, (token, _) in self.CAUSES.items()}
+        self.assertEqual(len(set(codes.values())), len(codes), f"two causes share a code: {codes}")
+
+    def test_the_codes_are_the_documented_ones_and_four_stays_the_never_started_case(self) -> None:
+        for name, (token, expected) in self.CAUSES.items():
+            with self.subTest(name):
+                self.assertEqual(self.exit_after(token), expected)
+
+    def test_no_new_code_collides_with_a_code_the_capture_or_the_job_already_uses(self) -> None:
+        for name, (_, code) in self.CAUSES.items():
+            if name == "never-started":
+                continue
+            with self.subTest(name):
+                self.assertNotIn(code, RESERVED_CAPTURE_EXITS)
+                self.assertTrue(1 <= code < 100, "the venue job's header promises every capture code is below 100")
+        # the reserved set is not stale: each of its script-level members is still a literal exit in the script or its gate helper
+        helper = (CAPTURE.parent / "gui-smoke-length-gate.ps1").read_text(encoding="utf-8")
+        for code in (3, 5, 6, 17, 44):
+            self.assertRegex(self.text, rf"\bexit {code}\b")
+        for code in (41, 42, 43):
+            self.assertRegex(helper, rf"return {code}\b|exitCode = {code}\b")
+
+    def test_the_header_names_every_code_beside_the_existing_ones(self) -> None:
+        for name, (token, code) in self.CAUSES.items():
+            with self.subTest(name):
+                self.assertRegex(self.header, rf"\b{code}\b[^\n]*{re.escape(token)}|{re.escape(token)}[^\n]*\b{code}\b")
+        for code in (3, 5, 6, 17, 41, 42, 43, 44):
+            with self.subTest(existing=code):
+                self.assertRegex(self.header, rf"\b{code}\b")
+
+    def test_the_runner_job_still_passes_every_capture_code_through(self) -> None:
+        """The job does not branch on the value, so it needs no change: the raw code is the job's exit and captureExitCode."""
+        job = GENERATOR.read_text(encoding="utf-8")
+        self.assertIn("$captureExitCode = $captureRc", job)
+        self.assertIn("if ($captureRc -ne 0 -and ($captureRc -lt 1 -or $captureRc -gt 199)) { $captureRc = 199 }", job)
+        self.assertIn("RESULT=REFERENCE_FRAME_CAPTURE_FAILED EXIT=$captureRc CAPTURE_EXIT=$captureExitCode", job)
 
 
 # HUB-VM-NO-LOCAL-PLAYBACK-1: CaptureScriptGateProfileArgumentTests runs the real capture script against a stand-in exe that is never launched.

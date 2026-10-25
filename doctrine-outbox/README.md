@@ -404,6 +404,23 @@ only past disposed findings, and a rewritten prefix restarts the scan from 0. `-
 explicit act that waives history up to now and says how many findings it waived. Known limit: it checks
 that a disposition is well formed, not that the named item exists.
 
+## A sent item is never edited (OUTBOX-SENT-CARD-NEVER-EDITED-1)
+
+The idempotency key is `sha256(source_commit, target, body)`, so editing the body of an item the drain already sent gives
+it a new key and the next drain publishes it a second time (sent ledger rows 70 and 72; #533's route-exercise card).
+`check-commits` and the pre-push guard therefore refuse a commit that edits such an item: `SENT_ITEM_EDITED <path> key=<old key>`.
+Not counted as an edit: a change that leaves the key as it was (front matter beyond the key's inputs). Allowed: the commit also
+ADDS a new item with a `supersedes:` line naming the old one by file stem, `## ` card id or key as a COMPLETE token (split on
+whitespace, commas and semicolons; markup, a `.md` suffix and the outbox directory are trimmed; compared by equality, never as a
+substring: `example-10` and `example-1-followup` do not name `example-1`). Never refresh a digest inside a
+sent card; add the next superseding card (a tool change moves `bus_candidate.sha256_lf`, and only the newest card must quote it).
+
+The ledger is untracked and lives on the board, so the check reads `--ledger <sent.jsonl>`, else the config's `ledger_rel` here, else
+in the checkout that owns the git dir (a lane's linked worktree has none). With no ledger, as on hosted CI, the check is NOT run: the
+output says `sent-ledger-absent` and `SKIPPED` (`check-commits over <range> -- trailers only; ...`, exit 0), never `check-commits OK`.
+A ledger that exists but yields no readable key cannot say what was sent, so it is the same skip, `sent-ledger-unreadable`.
+Merge commits are not judged.
+
 ## Sent tracking and the drain
 
 An item stays in this directory. It counts as sent if its `<!-- outbox:<key> mlv-app:<sha12> -->` marker

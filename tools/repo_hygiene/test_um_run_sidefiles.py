@@ -11,6 +11,7 @@ The placement code is exercised two ways:
 
 from __future__ import annotations
 
+import ast
 import re
 import hashlib
 import json
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # hub: pwsh colours its error view with ANSI escapes whenever the parent environment advertises a colour
@@ -42,6 +44,81 @@ requires_git = unittest.skipIf(GIT is None, "git is not on PATH")
 
 def _q(path: Path | str) -> str:
     return "'" + str(path).replace("'", "''") + "'"
+
+
+CLAIM_WAIT_PASS = "PASS"
+CLAIM_WAIT_FAIL = "FAIL"
+CLAIM_WAIT_INCONCLUSIVE = "INCONCLUSIVE"
+
+
+def judge_claim_wait(claim_lo: float, claim_hi: float, verdict_time: float, timeout_sec: float,
+                     slack: float = 0.5) -> str:
+    """Judge the claimed wait from three epoch-second stamps, with no process involved.
+
+    UMRUN-SIBLING-1122-CLAIM-WINDOW-ORACLE-1: pure so the verdict table is covered deterministically
+    (UmRunClaimWaitOracleTests) instead of by whatever the scheduler does to a live client.
+
+    FAIL: the verdict came before even the earliest possible claim (claim_lo) plus the budget: a
+    correct client cannot do that. PASS: the verdict is also a full budget after the LATEST possible
+    claim (claim_hi), so the wait was served whatever happened inside the claim window. Between the
+    two the stamps cannot say where the time went: a client that stalled ~8 s inside the window
+    (before or after assigning claimedAt) and a healthy one look alike, so the outcome is
+    INCONCLUSIVE, never a FAIL and never a PASS. The window is microseconds on a healthy host, so
+    this almost never triggers; it only stops a stalled run from vouching for a wrong anchor."""
+    if verdict_time - claim_lo < timeout_sec - slack:
+        return CLAIM_WAIT_FAIL
+    if verdict_time - claim_hi < timeout_sec - slack:
+        return CLAIM_WAIT_INCONCLUSIVE
+    return CLAIM_WAIT_PASS
+
+
+def skip_if_claim_wait_inconclusive(test: unittest.TestCase, claim_lo: float, claim_hi: float,
+                                    verdict_time: float, timeout_sec: float, timing_facts: str) -> None:
+    """The live wait test's last step, extracted so a committed test can drive it without a UM client
+    (UMRUN-CLAIM-WINDOW-ORACLE-BOUNDARY-PINS-1): an INCONCLUSIVE verdict skips, anything else returns."""
+    if judge_claim_wait(claim_lo, claim_hi, verdict_time, timeout_sec) == CLAIM_WAIT_INCONCLUSIVE:
+        test.skipTest(
+            "INCONCLUSIVE: the claim window (claim_lo -> claim_hi) was wide enough that a stall "
+            "inside it cannot be told from an hour-back client; every other check passed "
+            f"[{timing_facts}]")
+
+
+_SEAM_CALL_ARGS = ["self", "claim_lo", "claim_hi", "verdict_time", "timeout_sec", "timing_facts"]
+_SEAM_CALL_METHOD = "test_a_clock_skewed_claim_marker_observed_at_the_queue_deadline_does_not_shrink_the_clients_patience"
+
+
+def seam_call_position_problem(source: str, class_name: str, method_name: str | None = None) -> str | None:
+    """UMRUN-SEAM-CALL-POSITION-PIN-1: None when `class_name` in `source` calls
+    skip_if_claim_wait_inconclusive exactly once, as the FINAL top-level statement of a method body
+    and with the live test's own arguments; otherwise a sentence saying what is wrong. The seam only
+    skips after every other check has run, so a call placed earlier would skip past the UNRESOLVED /
+    started-marker asserts below it. Takes source text so a test can feed it a mutated copy. When
+    `method_name` is given, the call must also sit in the method of that name.
+
+    Final-statement placement is a positional contract only: it does not prove the call is reached at
+    run time (an early return, a raised skip or an exception above it still bypasses it). The
+    earlier checks in the live test must pass before execution reaches the call."""
+    classes = [node for node in ast.walk(ast.parse(source))
+               if isinstance(node, ast.ClassDef) and node.name == class_name]
+    if len(classes) != 1:
+        return f"expected exactly one class {class_name}, found {len(classes)}"
+    calls = [(member, node) for member in classes[0].body for node in ast.walk(member)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+             and node.func.id == "skip_if_claim_wait_inconclusive"]
+    if len(calls) != 1:
+        return f"expected exactly one seam call in {class_name}, found {len(calls)}"
+    method, call = calls[0]
+    if not isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return "the seam call is not inside a method body"
+    if method_name is not None and method.name != method_name:
+        return f"the seam call is in {method.name}, not in the expected method {method_name}"
+    if [ast.unparse(arg) for arg in call.args] != _SEAM_CALL_ARGS or call.keywords:
+        return f"{method.name} calls the seam with unexpected arguments: {ast.unparse(call)}"
+    final = method.body[-1]
+    if not (isinstance(final, ast.Expr) and final.value is call):
+        return (f"{method.name}: the seam call (line {call.lineno}) is not the final top-level "
+                f"statement of the method body (that is line {final.lineno})")
+    return None
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -136,9 +213,17 @@ class _Share(unittest.TestCase):
             "    while (-not (Test-Path -LiteralPath $tickHold) -and [DateTime]::UtcNow -lt $tickUntil) { Start-Sleep -Milliseconds 20 }\n"
             "  }\n"
             "  $tickLine = '{0} {1}' -f $tickN, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n"
+            "  $tickWritten = $false; $tickError = ''\n"
             "  for ($tickTry = 0; $tickTry -lt 40; $tickTry++) {\n"
-            "    try { Add-Content -LiteralPath $tickLog -Value $tickLine -Encoding ascii -ErrorAction Stop; break }\n"
-            "    catch { Start-Sleep -Milliseconds 25 }\n"
+            "    try { Add-Content -LiteralPath $tickLog -Value $tickLine -Encoding ascii -ErrorAction Stop; $tickWritten = $true; break }\n"
+            "    catch { $tickError = $_.Exception.Message; Start-Sleep -Milliseconds 25 }\n"
+            "  }\n"
+            # um-run's loop catch rewraps a hook throw as UNRESOLVED naming only the exception type,
+            # so the path and the last error also go to stderr, where the waiting test reports them.
+            "  if (-not $tickWritten) {\n"
+            "    $tickFail = \"TICK_LOG_WRITE_EXHAUSTED: 40 tries to append poll $tickN to $tickLog all failed; last error: $tickError\"\n"
+            "    [Console]::Error.WriteLine($tickFail)\n"
+            "    throw $tickFail\n"
             "  }\n"
             f"  if ($tickN -eq {action_poll}) {{ {action_body} }}\n"
             "}\n"
@@ -178,7 +263,10 @@ class _Share(unittest.TestCase):
         while time.monotonic() < deadline:
             if len(self.ticks()) >= count:
                 return
-            self.assertIsNone(proc.poll(), f"um-run exited before it started poll {count}")
+            if proc.poll() is not None:
+                stdout, stderr = proc.communicate()
+                output = _ANSI_ESCAPE.sub("", (stdout or "") + (stderr or "")).strip()
+                self.fail(f"um-run exited before it started poll {count}: {output[-2000:]}")
             time.sleep(0.05)
         self.fail(f"um-run never started poll {count} within {within}s (saw {len(self.ticks())})")
 
@@ -194,9 +282,12 @@ class _Share(unittest.TestCase):
              module: Path | None = None, repo_root: Path | None = None,
              job_timeout_sec: int | None = None,
              before_job_visible: str | None = None,
-             after_meta_tmp_written: str | None = None) -> subprocess.CompletedProcess:
+             after_meta_tmp_written: str | None = None,
+             not_after_utc: str | None = None) -> subprocess.CompletedProcess:
         sides = ",".join(_q(p) for p in (side if side is not None else [self.side]))
         timeout_arg = "" if job_timeout_sec is None else f" -JobTimeoutSec {job_timeout_sec}"
+        if not_after_utc is not None:
+            timeout_arg += f" -NotAfterUtc {_q(not_after_utc)}"
         script = self.tmp / "drop.ps1"
         repo_root_arg = f" -RepoRoot {_q(repo_root)}" if repo_root is not None else ""
         preamble = (
@@ -244,6 +335,16 @@ RACING_JOB = ("{ param($s, $d) Copy-Item -LiteralPath $s -Destination $d; "
 # rollback proof that actually exercises metadata-then-job-rename-fails.
 JOB_COPY_FAILS = ("{ param($s, $d) if ($d -like '*.job.tmp') { throw 'INJECTED_JOB_COPY_FAILURE' }; "
                    "Copy-Item -LiteralPath $s -Destination $d }")
+
+
+def _future_not_after(hours: float = 2.0) -> datetime:
+    """A whole-second UTC instant `hours` from now, for -NotAfterUtc."""
+    return (datetime.now(timezone.utc) + timedelta(hours=hours)).replace(microsecond=0)
+
+
+def _round_trip_utc(instant: datetime) -> str:
+    """.NET's DateTime 'o' form of a whole-second UTC instant, as the module writes notAfterUtc."""
+    return instant.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
 
 
 class UmRunDropModuleTests(_Share):
@@ -341,6 +442,51 @@ class UmRunDropModuleTests(_Share):
         self.assertIn("THREW UMRUN_JOB_TIMEOUT_INVALID", proc.stdout, proc.stdout + proc.stderr)
         self.assertFalse(self.log.exists(), "no copy may happen before the budget is validated")
         self.assertEqual(self.names(), [])
+
+    # ---- agent-side absolute deadline (LEASE-REQUEST-CHILD-NOT-AFTER-1) -----------------------
+    # inbox\<id>.meta.json notAfterUtc: past it, the Bachelor agent never takes a quiet lease for the
+    # job and never runs it. Optional; absent leaves the metadata exactly as it was.
+
+    def test_not_after_is_written_as_a_round_trip_utc_string(self) -> None:
+        instant = _future_not_after()
+        expected = _round_trip_utc(instant)
+        for given in (instant.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      instant.astimezone(timezone(timedelta(hours=2))).isoformat()):
+            with self.subTest(given=given):
+                for leftover in self.inbox.iterdir():
+                    leftover.unlink()
+                proc = self.drop(OBSERVING, side=[], not_after_utc=given)
+                self.assertIn("UMRUN_JOBID=demo", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(f"job not-after: demo.meta.json notAfterUtc={expected}", proc.stdout, proc.stdout)
+                meta = json.loads((self.inbox / "demo.meta.json").read_text(encoding="ascii"))
+                self.assertEqual(meta["notAfterUtc"], expected, "the same instant, normalised to 'o' form in Z")
+
+    def test_no_not_after_leaves_the_metadata_without_the_key(self) -> None:
+        # Passes on a module without -NotAfterUtc too, by design: it pins that the field's absence
+        # leaves the claim's bytes exactly as they were.
+        proc = self.drop(OBSERVING, side=[], job_timeout_sec=600)
+        self.assertIn("UMRUN_JOBID=demo", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("job not-after:", proc.stdout)
+        raw = (self.inbox / "demo.meta.json").read_text(encoding="ascii")
+        meta = json.loads(raw)
+        self.assertNotIn("notAfterUtc", meta)
+        self.assertEqual(raw, json.dumps({"jobId": "demo", "nonce": meta["nonce"], "timeoutSec": 600}, separators=(",", ":")))
+
+    def test_an_invalid_not_after_is_refused_before_anything_is_placed(self) -> None:
+        offsetless = _future_not_after().strftime("%Y-%m-%dT%H:%M:%S")
+        for bad, reason in (("not-a-date", "does not parse"),
+                            (offsetless, "no Z or +hh:mm offset"),
+                            ("2020-01-01T00:00:00Z", "not later than now")):
+            with self.subTest(not_after=bad):
+                for leftover in self.inbox.iterdir():
+                    leftover.unlink()
+                if self.log.exists():
+                    self.log.unlink()
+                proc = self.drop(OBSERVING, not_after_utc=bad)   # self.side is a real side-file by default
+                self.assertIn(f"THREW UMRUN_NOT_AFTER_INVALID '{bad}'", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(reason, proc.stdout, proc.stdout)
+                self.assertFalse(self.log.exists(), "no copy may happen before notAfterUtc is validated")
+                self.assertEqual(self.names(), [], "a refused notAfterUtc must leave neither metadata nor a job")
 
     def test_a_failed_job_copy_removes_the_metadata_so_a_retry_with_the_same_job_id_succeeds(self) -> None:
         # fable/sol major 1: metadata was placed and never rolled back when the job's OWN copy then
@@ -846,6 +992,27 @@ class UmRunEndToEndTests(_Share):
         self.assertIn("UMRUN_TIMEOUT_SEC_INVALID", proc.stdout + proc.stderr)
         self.assertEqual(self.names(), [], "a rejected -TimeoutSec must submit nothing at all")
 
+    def test_a_tick_log_that_cannot_be_written_fails_naming_the_path_and_the_last_error(self) -> None:
+        # CoS on #460: the tick hook's write retry (40 tries, catch -> sleep) used to end silently
+        # when every try failed, so a test waiting on polls saw no poll and no reason. A directory
+        # at the tick log's path makes every Add-Content fail; the client must stop at its first
+        # poll and the waiting test must fail with the path and the last error.
+        ticks_path = self.tmp / "client-ticks.log"
+        ticks_path.mkdir()
+        proc = self.start_ticked("-TimeoutSec", "1", "-MaxQueueWaitSec", "1")
+        try:
+            with self.assertRaises(AssertionError) as caught:
+                self.wait_for_polls(proc, 1)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate()
+        message = str(caught.exception)
+        self.assertIn(f"TICK_LOG_WRITE_EXHAUSTED: 40 tries to append poll 1 to {ticks_path} all failed",
+                      message, message)
+        self.assertIn("last error:", message, message)
+        self.assertIn("THREW UNRESOLVED:", message, message)
+
     def test_the_callers_timeout_reaches_the_agent_as_the_jobs_own_budget(self) -> None:
         # The bug this closes: -TimeoutSec bounded only the client poll, so the agent ran every job
         # on its 1800 s default and killed a placement the caller had given an hour.
@@ -869,6 +1036,31 @@ class UmRunEndToEndTests(_Share):
         finally:
             proc.kill()
             proc.communicate()
+
+    def test_the_callers_not_after_reaches_the_agents_metadata(self) -> None:
+        # LEASE-REQUEST-CHILD-NOT-AFTER-1: um-run forwards -NotAfterUtc and never derives one itself.
+        instant = _future_not_after()
+        proc = subprocess.Popen(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(UM_RUN),
+             "-ScriptPath", str(self.job), "-AgentShare", str(self.share),
+             "-TimeoutSec", "3600", "-PollSeconds", "1", "-JobId", "demo",
+             "-NotAfterUtc", instant.strftime("%Y-%m-%dT%H:%M:%SZ")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            meta_path = self.inbox / "demo.meta.json"
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and not meta_path.exists() and proc.poll() is None:
+                time.sleep(0.2)
+            exists = meta_path.exists()
+            meta = json.loads(meta_path.read_text(encoding="ascii")) if exists else {}
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            stdout, stderr = proc.communicate()
+        output = _ANSI_ESCAPE.sub("", (stdout or "") + (stderr or ""))[-2000:]
+        self.assertTrue(exists, f"the drop must write the job's notAfterUtc: {output}")
+        self.assertEqual(meta["notAfterUtc"], _round_trip_utc(instant), output)
+        self.assertEqual(meta["timeoutSec"], 3600)
 
     def test_retracted_message_discloses_the_agents_own_stale_enumeration_window(self) -> None:
         # ATTR3-FOOTAGE-STAGE-SUBMIT-RETRY-1 round 12 (sol BLOCKER / fable MINOR, item 1): RETRACTED
@@ -1368,8 +1560,9 @@ class UmRunEndToEndTests(_Share):
         # stamp to claim_lo: no waiting by the client, only scheduling), in_wait the time inside it
         # measured from claim_lo (so it can only over-state the wait, toward the client),
         # claim_gap the claim_lo -> claim_hi spread (scheduling between the two samples, recorded,
-        # not judged), sched_gap the claim_lo -> poll-2 gap (a scheduling delay between the claim
-        # and the first poll, which a correct client may have and which is recorded, not judged),
+        # not judged), lo_to_first_poll the claim_lo -> poll-2 gap (the first poll after the claim; it
+        # includes the claim window itself and so the time before the claim, a scheduling delay
+        # a correct client may have, recorded and not judged on its own),
         # tail the time from the last poll to the verdict, max_tick_gap the longest pause between
         # two polls (a stall inside the wait shows as a gap far above the 1 s poll interval). A
         # stall in pre_wait pushes decided_after over the bound for a client that decided at once;
@@ -1386,11 +1579,11 @@ class UmRunEndToEndTests(_Share):
         if claim_lo is not None:
             wait_ticks = [at for number, at in all_ticks if number >= 2]
             gaps = [later - earlier for earlier, later in zip(wait_ticks, wait_ticks[1:])]
-            sched_gap = f"{tick2_at - claim_lo:.3f}s" if tick2_at is not None else "none"
+            lo_to_first_poll = f"{tick2_at - claim_lo:.3f}s" if tick2_at is not None else "none"
             locus_facts = (
                 f" claim_lo={claim_lo:.3f} claim_hi={claim_hi:.3f} claim_gap={claim_hi - claim_lo:.3f}s"
                 f" pre_wait={claim_lo - marker_placed_at:.3f}s"
-                f" in_wait={verdict_time - claim_lo:.3f}s sched_gap={sched_gap}"
+                f" in_wait={verdict_time - claim_lo:.3f}s lo_to_first_poll={lo_to_first_poll}"
                 f" tail={verdict_time - (wait_ticks[-1] if wait_ticks else claim_lo):.3f}s"
                 f" polls_in_wait={len(wait_ticks)} max_tick_gap={max(gaps, default=0.0):.3f}s")
         timing_facts = (
@@ -1415,10 +1608,19 @@ class UmRunEndToEndTests(_Share):
         # BEFORE the client sets $claimedAt, never from poll 2 and never from the later claim_hi
         # sample: a correct client throws once Now >= claimedAt + timeout_sec, and claimedAt >=
         # claim_lo, so verdict - claim_lo can only be LONGER than the wait the client really did;
-        # a scheduling delay between the claim and either poll 2 (sched_gap) or the hook's later
+        # a scheduling delay between the claim and either poll 2 (lo_to_first_poll) or the hook's later
         # sample (claim_gap) cannot fail a correct client (r2 sol r1 BLOCKER; r3 sol r2 BLOCKER).
         # A stall that precedes claim_lo is still caught. Same 0.5 s slack as above (stamp
         # truncation and system-clock adjustment only); the bound is not looser than the one above.
+        #
+        # UMRUN-SIBLING-1122-CLAIM-WINDOW-ORACLE-1: that bound cannot see a stall INSIDE the claim
+        # window (claim_lo to the assignment), where an hour-back client pausing ~8 s still decides
+        # >= timeout_sec - 0.5 after claim_lo. So a pass that rests on time inside the window is not
+        # reported as a pass: judge_claim_wait() returns INCONCLUSIVE when the verdict is not also a
+        # full budget after claim_hi, and the test skips at the very end (after every other check
+        # below has run) rather than vouching for a client it could not tell from a broken one.
+        # The FAIL branch above is unchanged and no wall-clock ceiling is added; claim_gap stays a
+        # diagnostic. The verdict table is covered by UmRunClaimWaitOracleTests.
         self.assertIsNotNone(claim_lo, f"no claim bracket, so the wait locus is unknown [{timing_facts}]")
         self.assertGreaterEqual(
             verdict_time - claim_lo, timeout_sec - 0.5,
@@ -1437,6 +1639,7 @@ class UmRunEndToEndTests(_Share):
         self.assertIn("UNRESOLVED:", combined, combined)
         self.assertIn("stopped proving liveness", combined, combined)
         self.assertIn("its own started marker is gone too", combined, combined)
+        skip_if_claim_wait_inconclusive(self, claim_lo, claim_hi, verdict_time, timeout_sec, timing_facts)
 
     # ---- round 11 (sol BLOCKER, item 2): RETRACT at the queue deadline instead of leaving the job
     # ---- in the inbox for the agent to claim after this client has already given up ------------
@@ -2129,6 +2332,229 @@ class UmRunDeadlineTypeTests(unittest.TestCase):
                 f"a wait-loop deadline root assignment constructs {type_name}, not DateTimeOffset "
                 f"-- reintroducing the Kind-ambiguity a prior round had to remove: {result}",
             )
+
+
+class UmRunClaimWaitOracleTests(unittest.TestCase):
+    """UMRUN-SIBLING-1122-CLAIM-WINDOW-ORACLE-1 (Dot e3cb59d2 on #531 50a17a9c, hub ACK 6294165342).
+
+    The client sets `$claimedAt` at an instant the test cannot see, only bracket: claim_lo is stamped
+    just before it, claim_hi just after. An hour-back client that stalls ~8 s inside that window
+    reaches its poll-2 verdict ~8 s after claim_lo, so `verdict - claim_lo` alone cannot tell it from a
+    healthy client. These cases drive the verdict table with synthetic stamps (T = 8 s budget), so
+    the claim does not depend on what a live scheduler happens to do, and none of them adds a
+    wall-clock ceiling: a stamp pattern that cannot separate the two is INCONCLUSIVE, never FAIL."""
+
+    T = 8
+
+    def judge(self, claim_lo: float, claim_hi: float, verdict_time: float) -> str:
+        return judge_claim_wait(claim_lo, claim_hi, verdict_time, self.T)
+
+    def test_a_healthy_client_with_a_tight_claim_bracket_passes(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.005, 8.2), CLAIM_WAIT_PASS)
+
+    def test_an_hour_back_client_that_decides_at_once_fails(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.005, 1.1), CLAIM_WAIT_FAIL)
+
+    def test_an_hour_back_client_stalled_inside_the_claim_window_is_not_reported_as_a_pass(self) -> None:
+        # Dot's masking case: claim_lo stamped, the client stalls 8 s, assigns an hour-back claimedAt,
+        # claim_hi is stamped ~8 s after claim_lo, poll 2 decides ~1 s later. verdict - claim_lo
+        # = 9.0 s clears the bound, yet no wait happened inside the claimed wait.
+        self.assertEqual(self.judge(0.0, 8.0, 9.0), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_a_healthy_client_stalled_after_assigning_claimed_at_is_inconclusive_not_failed(self) -> None:
+        # The same stamps an hour-back client produces: claimedAt assigned at once, then an 8 s stall
+        # before claim_hi. It decides at claimedAt + T, ~8.1 s after claim_lo. Stamps alone cannot
+        # separate it from the case above, so neither may be judged either way.
+        self.assertEqual(self.judge(0.0, 8.0, 8.1), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_a_healthy_client_stalled_before_assigning_claimed_at_passes(self) -> None:
+        # Stall inside the window, THEN a correct assignment: the budget is spent after claim_hi.
+        self.assertEqual(self.judge(0.0, 8.0, 16.1), CLAIM_WAIT_PASS)
+
+    def test_the_conclusive_bound_uses_the_same_half_second_slack_as_the_other_bounds(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.4, 8.0), CLAIM_WAIT_PASS)
+        self.assertEqual(self.judge(0.0, 0.6, 8.0), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_a_verdict_inside_the_budget_fails_whatever_the_bracket_width(self) -> None:
+        self.assertEqual(self.judge(0.0, 8.0, 7.0), CLAIM_WAIT_FAIL)
+        self.assertEqual(self.judge(0.0, 0.005, 7.0), CLAIM_WAIT_FAIL)
+
+    # UMRUN-CLAIM-WINDOW-ORACLE-BOUNDARY-PINS-1 (Dot 89837a67 on #555 6a8c3b35, items 1+2): the cases
+    # above sit NEAR the two T-minus-slack boundaries; these sit EXACTLY on them and one step either
+    # side, to pin the two strict `<` comparisons in judge_claim_wait(). T = 8 and slack = 0.5, so
+    # both boundaries are 7.5. Every stamp below (0.0, 0.5, 7.5, 8.0, 7.5 -/+ 1/64) is a dyadic
+    # rational, exact in binary floating point, so each "exactly on the boundary" subtraction really
+    # is equal to 7.5 rather than off by a rounding error.
+    _STEP = 1 / 64
+
+    def test_a_verdict_exactly_t_minus_slack_after_claim_lo_is_not_failed(self) -> None:
+        # verdict - claim_lo == 7.5 == T - slack: strict `<` is False, so not FAIL. claim_hi == claim_lo
+        # keeps the second comparison at 7.5 < 7.5, also False, so the outcome is PASS.
+        self.assertEqual(self.judge(0.0, 0.0, 7.5), CLAIM_WAIT_PASS)
+
+    def test_a_verdict_one_step_short_of_t_minus_slack_after_claim_lo_fails(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.0, 7.5 - self._STEP), CLAIM_WAIT_FAIL)
+
+    def test_a_verdict_exactly_t_minus_slack_after_claim_hi_is_conclusive_not_inconclusive(self) -> None:
+        # verdict - claim_hi == 7.5 == T - slack: strict `<` is False, so not INCONCLUSIVE. The first
+        # comparison is 8.0 - 0.0 = 8.0 >= 7.5, so it does not fail either: PASS.
+        self.assertEqual(self.judge(0.0, 0.5, 8.0), CLAIM_WAIT_PASS)
+
+    def test_a_verdict_one_step_short_of_t_minus_slack_after_claim_hi_is_inconclusive(self) -> None:
+        self.assertEqual(self.judge(0.0, 0.5 + self._STEP, 8.0), CLAIM_WAIT_INCONCLUSIVE)
+
+    def test_both_boundaries_hold_when_they_coincide_at_a_shared_stamp_offset(self) -> None:
+        # claim_lo == claim_hi == 1.0 and verdict 8.5: both differences are exactly 7.5.
+        self.assertEqual(self.judge(1.0, 1.0, 8.5), CLAIM_WAIT_PASS)
+
+    def test_the_slack_is_subtracted_from_the_budget_not_ignored(self) -> None:
+        # With no slack the first bound would be 8.0 and a verdict at 7.5 would FAIL; the half
+        # second is what makes it a PASS. Passing slack=0.0 explicitly shows the contrast.
+        self.assertEqual(judge_claim_wait(0.0, 0.0, 7.5, self.T), CLAIM_WAIT_PASS)
+        self.assertEqual(judge_claim_wait(0.0, 0.0, 7.5, self.T, slack=0.0), CLAIM_WAIT_FAIL)
+
+
+class UmRunClaimWaitSkipWiringTests(unittest.TestCase):
+    """UMRUN-CLAIM-WINDOW-ORACLE-BOUNDARY-PINS-1 (Dot 89837a67 on #555, item 2): an INCONCLUSIVE
+    claim-window verdict must reach skipTest in the live wait test, which had only been exercised in
+    review. skip_if_claim_wait_inconclusive() is the seam the live test now calls as its last step."""
+
+    T = 8
+    FACTS = "decided_after=9.000s timeout_sec=8"
+
+    @staticmethod
+    def _run(claim_lo: float, claim_hi: float, verdict_time: float) -> unittest.TestResult:
+        class _Probe(unittest.TestCase):
+            def runTest(self) -> None:
+                skip_if_claim_wait_inconclusive(
+                    self, claim_lo, claim_hi, verdict_time, UmRunClaimWaitSkipWiringTests.T,
+                    UmRunClaimWaitSkipWiringTests.FACTS)
+
+        result = unittest.TestResult()
+        _Probe().run(result)
+        return result
+
+    def test_an_inconclusive_stamp_pattern_is_recorded_as_a_skip_with_the_inconclusive_reason(self) -> None:
+        # Dot's masking case: judge_claim_wait() rules (0.0, 8.0, 9.0) INCONCLUSIVE.
+        self.assertEqual(judge_claim_wait(0.0, 8.0, 9.0, self.T), CLAIM_WAIT_INCONCLUSIVE)
+        result = self._run(0.0, 8.0, 9.0)
+        self.assertEqual(len(result.skipped), 1, result.skipped)
+        self.assertEqual((result.errors, result.failures), ([], []))
+        reason = result.skipped[0][1]
+        self.assertTrue(reason.startswith("INCONCLUSIVE:"), reason)
+        self.assertTrue(reason.endswith(f"[{self.FACTS}]"), reason)
+
+    def test_a_pass_stamp_pattern_does_not_skip(self) -> None:
+        self.assertEqual(judge_claim_wait(0.0, 0.005, 8.2, self.T), CLAIM_WAIT_PASS)
+        result = self._run(0.0, 0.005, 8.2)
+        self.assertEqual((result.skipped, result.errors, result.failures), ([], [], []))
+        self.assertEqual(result.testsRun, 1)
+
+    def test_a_fail_stamp_pattern_does_not_skip(self) -> None:
+        # The FAIL branch is asserted by the live test's own assertGreaterEqual before this step; the
+        # seam must not turn it into a skip either.
+        self.assertEqual(judge_claim_wait(0.0, 0.005, 1.1, self.T), CLAIM_WAIT_FAIL)
+        result = self._run(0.0, 0.005, 1.1)
+        self.assertEqual((result.skipped, result.errors, result.failures), ([], [], []))
+
+    def test_the_live_wait_test_ends_by_calling_the_seam(self) -> None:
+        import inspect
+        source = inspect.getsource(UmRunEndToEndTests)
+        calls = source.count(
+            "skip_if_claim_wait_inconclusive(self, claim_lo, claim_hi, verdict_time, timeout_sec, timing_facts)")
+        self.assertEqual(calls, 1, "the live wait test no longer routes its INCONCLUSIVE verdict through the seam")
+
+    # UMRUN-SEAM-CALL-POSITION-PIN-1 (opus r1 on #592): the count above is blind to WHERE the call
+    # sits; these pin it as the live wait test's final top-level statement.
+    _SEAM_CALL = "skip_if_claim_wait_inconclusive(self, claim_lo, claim_hi, verdict_time, timeout_sec, timing_facts)"
+    _SYNTH = (
+        "class Live:\n"
+        "    def test_it(self):\n"
+        "{body}"
+        "\n"
+    )
+
+    @classmethod
+    def _synth(cls, *body: str) -> str:
+        return cls._SYNTH.format(body="".join(f"        {line}\n" for line in body))
+
+    @classmethod
+    def _real_source(cls) -> str:
+        return Path(__file__).read_text(encoding="utf-8")
+
+    @classmethod
+    def _real_source_with_call_moved_above(cls, marker: str) -> str:
+        """The file's own source with the live wait test's seam call moved to just above the first
+        line in that test containing `marker`."""
+        source = cls._real_source()
+        lines = source.splitlines()
+        live = next(node for node in ast.walk(ast.parse(source))
+                    if isinstance(node, ast.ClassDef) and node.name == "UmRunEndToEndTests")
+        method = next(m for m in live.body if isinstance(m, ast.FunctionDef) and m.end_lineno is not None
+                      and lines[m.end_lineno - 1].strip() == cls._SEAM_CALL)
+        call_idx = method.end_lineno - 1
+        target_idx = next(i for i in range(method.lineno - 1, call_idx) if marker in lines[i])
+        lines.insert(target_idx, lines.pop(call_idx))
+        return "\n".join(lines) + "\n"
+
+    def test_the_live_wait_tests_final_statement_is_the_seam_call(self) -> None:
+        self.assertIsNone(seam_call_position_problem(
+            self._real_source(), "UmRunEndToEndTests", method_name=_SEAM_CALL_METHOD))
+
+    # UMRUN-SIBLING-1122-SLACK-COMMENT-SAME-CLOCK-1 (Dot c91c2dda on #597, H1): bind the method name.
+    def test_the_seam_call_moved_into_a_differently_named_method_is_rejected_when_the_name_is_bound(self) -> None:
+        source = self._synth(self._SEAM_CALL).replace("def test_it(", "def test_other(")
+        problem = seam_call_position_problem(source, "Live", method_name="test_it")
+        self.assertIsNotNone(problem)
+        self.assertIn("test_other", problem)
+        self.assertIn("test_it", problem)
+
+    def test_the_seam_call_in_the_renamed_real_live_wait_test_is_rejected_when_the_name_is_bound(self) -> None:
+        mutated = self._real_source().replace(f"def {_SEAM_CALL_METHOD}(", "def test_renamed_live_wait(", 1)
+        self.assertNotEqual(mutated, self._real_source())
+        problem = seam_call_position_problem(mutated, "UmRunEndToEndTests", method_name=_SEAM_CALL_METHOD)
+        self.assertIsNotNone(problem)
+        self.assertIn("test_renamed_live_wait", problem)
+        self.assertIn(_SEAM_CALL_METHOD, problem)
+
+    def test_a_seam_call_in_the_bound_method_name_is_accepted(self) -> None:
+        self.assertIsNone(seam_call_position_problem(self._synth(self._SEAM_CALL), "Live", method_name="test_it"))
+
+    def test_the_seam_call_moved_above_the_unresolved_assert_is_rejected_though_the_count_still_passes(self) -> None:
+        for marker in ('self.assertIn("UNRESOLVED:"', 'self.assertIn("its own started marker is gone too"'):
+            with self.subTest(marker=marker):
+                mutated = self._real_source_with_call_moved_above(marker)
+                class_node = next(node for node in ast.parse(mutated).body
+                                  if isinstance(node, ast.ClassDef) and node.name == "UmRunEndToEndTests")
+                # The mutation is one the old count-only pin cannot see ...
+                self.assertEqual(ast.get_source_segment(mutated, class_node).count(self._SEAM_CALL), 1)
+                # ... and the position pin rejects it.
+                problem = seam_call_position_problem(mutated, "UmRunEndToEndTests")
+                self.assertIsNotNone(problem)
+                self.assertIn("not the final top-level statement", problem)
+
+    def test_a_seam_call_followed_by_any_further_statement_is_rejected(self) -> None:
+        source = self._synth(self._SEAM_CALL, "self.assertTrue(True)")
+        self.assertIn("not the final", seam_call_position_problem(source, "Live") or "")
+
+    def test_a_seam_call_nested_in_a_branch_or_assigned_is_not_the_final_statement(self) -> None:
+        for body in (("if claim_lo:", "    " + self._SEAM_CALL),
+                     (f"outcome = {self._SEAM_CALL}",),
+                     (f"return {self._SEAM_CALL}",)):
+            with self.subTest(body=body):
+                self.assertIsNotNone(seam_call_position_problem(self._synth(*body), "Live"))
+
+    def test_a_missing_or_duplicated_seam_call_is_rejected(self) -> None:
+        self.assertIn("found 0", seam_call_position_problem(self._synth("pass"), "Live") or "")
+        self.assertIn("found 2", seam_call_position_problem(
+            self._synth(self._SEAM_CALL, self._SEAM_CALL), "Live") or "")
+
+    def test_a_seam_call_with_different_arguments_is_rejected(self) -> None:
+        source = self._synth("skip_if_claim_wait_inconclusive(self, claim_hi, claim_lo, verdict_time, timeout_sec, timing_facts)")
+        self.assertIn("unexpected arguments", seam_call_position_problem(source, "Live") or "")
+
+    def test_a_final_seam_call_is_accepted(self) -> None:
+        self.assertIsNone(seam_call_position_problem(self._synth("self.assertTrue(True)", self._SEAM_CALL), "Live"))
 
 
 def _git(args: list[str], cwd: Path) -> None:

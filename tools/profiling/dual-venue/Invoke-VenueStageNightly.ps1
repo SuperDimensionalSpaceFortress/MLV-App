@@ -43,6 +43,11 @@
 # BOUNDED. Every child (generators, um-run, the assembler) runs as a process bounded by what is left of -MaxTotalSec and is killed, with its tree, past it. um-run gets
 # the same remaining budget as its queue / admission / claimed waits, so it normally ends itself first; an um-run killed at the cap is STAGE_UNRESOLVED (the agent may
 # still own the job), never retried in the same call.
+# NOT-AFTER (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1). The stage job is submitted with -NotAfterUtc at this call's deadline, so a job still queued or gated when
+# um-run is killed never takes a Bachelor lease later (a later call re-stages it under a suffix). The DLL pair and the smoke runner get none: a later call
+# harvests them by name and cannot re-submit their single-use JobId (the DLL pair runs on Ultra-Magnus, whose agent ignores the field anyway). The bound is
+# the ORIGINAL deadline passed as an instant (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1), so a delay before the bound is computed never moves it later; since
+# r2 it is passed drop-relative (-NotAfterBudgetSec, capped by -NotAfterCapUtc = that deadline), so the drop writes min(its own now + the waits, the deadline).
 #
 #   pwsh -NoProfile -File "<repo>\tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1" [-Venue ultra-magnus] [-SourceCommit <40-hex>] [-WhatIf]
 #
@@ -51,7 +56,8 @@
 #   2  USAGE (bad venue table, a receipt file outside .claude-state, a non-canonical receipt for the real venue share, a build root inside the checkout)
 #   3  capacity: DISK_FLOOR_REFUSED | HOST_COMMIT_REFUSED | BUILD_GUARD_REFUSED (the refusal text is printed verbatim)
 #   40 AGENT_BUSY (a live claim or queued ticket, another driver holds the venue lock, or um-run RETRACTED a job the agent never claimed)
-#   41 SHARE_UNREACHABLE (the share did not answer by name inside -ProbeTimeoutSec, or the agent has no heartbeat)
+#   41 SHARE_UNREACHABLE (the share did not answer by name inside -ProbeTimeoutSec, the agent has no heartbeat, or the share stalled through placement:
+#      UMRUN_NOT_AFTER_PLACEMENT_STALL, the job never visible)
 #   42 SOURCE_COMMIT_UNRESOLVED   43 GATE_UNAVAILABLE   44 DLLPAIR_FAILED   45 ASSEMBLE_FAILED   46 STAGE_FAILED   47 STAGE_VERIFY_MISMATCH
 #   48 SMOKE_RUNNER_STAGE_FAILED  49 STAGE_UNRESOLVED (um-run stopped while the agent may still own the job; not retried)  50 STAGE_CAP_EXCEEDED (-MaxTotalSec ran out)
 #   51 RECEIPT_IO_FAILED (the receipt could not be read for the night check, the reservation could not be persisted -- staging did not start -- or the closing
@@ -66,7 +72,8 @@
 # Roles come from venues.json and are never set here. Scheduling is NOT here: UM-REGULAR-BASELINE-SCHEDULE-1 makes one call per night (fetch fork, this driver, then
 # Invoke-VenueBaseline.ps1 on exit 0).
 # -UmRunScript / -DllJobScript / -AssembleScript / -StageJobScript / -SmokeRunnerJobScript / -GitExe / -AgentShare (replaces every share this driver touches) / -ClaimDir /
-# -VenueTablePath / -RepoRoot / -GateDir / -NowUtc are seams for the offline tests (tools/repo_hygiene/test_venue_stage_nightly.py); production passes none.
+# -VenueTablePath / -RepoRoot / -GateDir / -NowUtc / -TestNotAfterSampleDelayMs are seams for the offline tests (tools/repo_hygiene/test_venue_stage_nightly.py);
+# production passes none.
 [CmdletBinding()]
 param(
     [ValidateSet('bachelor', 'ultra-magnus')][string]$Venue = 'ultra-magnus',
@@ -88,7 +95,10 @@ param(
     [string]$VenueTablePath = '',
     [string]$RepoRoot = '',
     [string]$GateDir = '',
-    [string]$NowUtc = ''
+    [string]$NowUtc = '',
+    # Test-only (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): sleeps this long between each submission's remaining-budget sample and its not-after bound,
+    # a scheduling delay test_venue_stage_nightly.py injects to prove the bound never passes the deadline. Production passes none.
+    [ValidateRange(0, 60000)][int]$TestNotAfterSampleDelayMs = 0
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -454,21 +464,45 @@ function Assert-StagePackageSideFile([string[]]$Side, [string]$JobId, [string]$F
     }
 }
 
-function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]$JobId, [string]$Share, [int]$JobTimeoutSec, [string]$FailToken) {
+function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]$JobId, [string]$Share, [int]$JobTimeoutSec, [string]$FailToken, [switch]$LaterHarvest) {
     # Returns 'OK' (um-run returned; the caller reads the outbox result BY NAME) or 'IN_USE' (the outbox already holds this JobId). Every other end is a typed exit:
     # UNRESOLVED (or killed at the cap) -> STAGE_UNRESOLVED, never retried here; RETRACTED (never claimed) -> AGENT_BUSY; no heartbeat -> SHARE_UNREACHABLE.
+    # LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1: the job's -NotAfterUtc is this call's deadline (um-run is killed at it: the helper's -CallerDeadlineUtc), except
+    # for -LaterHarvest: a job a LATER call harvests by name and cannot re-submit (single-use JobId, no suffix) gets none.
     Assert-VenueFree "before the $Step submission"
     Assert-StagePackageSideFile -Side $Side -JobId $JobId -FailToken $FailToken
+    # LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1: the waits are sized from a SAMPLE of what is left ($remain), but the bound is the ORIGINAL deadline
+    # (-CallerDeadlineUtc $script:Deadline), never $remain counted again from the helper's later now: a delay between the sample and the call can then only
+    # shorten what um-run is given, never move the bound past the deadline. ($remain still proves the waits fit: -CallerCapSec.) Invoke-Child kills um-run
+    # at the cap from its own sample just before the child starts, so the kill can land up to the child's start-up time after the deadline; a job the
+    # agent refuses in that sub-second window was going to be cut off anyway.
     $remain = Get-RemainingSec
     if ($remain -lt 30) { Stop-Nightly 'STAGE_CAP_EXCEEDED' "only $remain s of the $MaxTotalSec s cap left before the $Step submission; nothing was submitted" }
+    $timeoutSec = [Math]::Min($JobTimeoutSec, $remain); $admissionSec = [Math]::Min(7200, $remain)
+    if ($TestNotAfterSampleDelayMs -gt 0) { Start-Sleep -Milliseconds $TestNotAfterSampleDelayMs }
+    # r3 (STAGE-NOTAFTER-THROW-TYPED-EXIT-1): a deadline that passes between the sample and the bound is the cap running out, so it is the typed cap exit,
+    # never an untyped throw out of the driver.
+    try {
+        $notAfter = Get-DvJobNotAfter -TimeoutSec $timeoutSec -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $admissionSec -MaxClaimedWaitSec $remain -CallerCapSec $remain -CallerDeadlineUtc $script:Deadline -LaterHarvest:$LaterHarvest
+    } catch {
+        if ([string]$_.Exception.Message -match '^DVE_NOT_AFTER_DEADLINE_PASSED') { Stop-Nightly 'STAGE_CAP_EXCEEDED' "the $MaxTotalSec s deadline passed before the $Step submission's bound was computed; nothing was submitted ($($_.Exception.Message))" }
+        throw
+    }
     # um-run.ps1 reports every non-receipt end by THROWING; pwsh's own error view wraps and decorates that text, so the child catches it and prints the message
     # on ONE line (UMRUN_ERROR <message>). The returned result object is discarded: the outbox result.json is read by name afterwards.
     $lit = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
     $call = '& ' + (& $lit $UmRun) + ' -ScriptPath ' + (& $lit $JobFile) + ' -JobId ' + (& $lit $JobId) + ' -AgentShare ' + (& $lit $Share) +
-        " -TimeoutSec $([Math]::Min($JobTimeoutSec, $remain)) -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $([Math]::Min(7200, $remain)) -MaxClaimedWaitSec $remain"
+        " -TimeoutSec $timeoutSec -MaxQueueWaitSec $remain -MaxAdmissionWaitSec $admissionSec -MaxClaimedWaitSec $remain"
+    # r2 (hub ruling on sol's r1 blocker): the bound is passed DROP-RELATIVE, capped by the ORIGINAL deadline: um-run's drop writes min(its own now +
+    # budgetSec, $script:Deadline), so a slow start or side-file share before the drop never leaves the bound short of the waits, and never past the deadline.
+    if ($null -ne $notAfter.budgetSec) {
+        $call += " -NotAfterBudgetSec $($notAfter.budgetSec)"
+        if ($notAfter.capUtc) { $call += ' -NotAfterCapUtc ' + (& $lit $notAfter.capUtc) }
+    } elseif ($notAfter.notAfterUtc) { $call += ' -NotAfterUtc ' + (& $lit $notAfter.notAfterUtc) }
     if (@($Side).Count -gt 0) { $call += ' -SideFile @(' + ((@($Side) | ForEach-Object { & $lit $_ }) -join ', ') + ')' }
     $text = "try { `$null = $call; [Console]::Out.WriteLine('UMRUN_RETURNED'); exit 0 } catch { [Console]::Out.WriteLine('UMRUN_ERROR ' + (`$_.Exception.Message -replace '\s+', ' ')); exit 1 }"
-    Say "submit $Step $JobId -> $Share"
+    $bound = $(if ($null -ne $notAfter.budgetSec) { "drop+$($notAfter.budgetSec)s cap=$(if ($notAfter.capUtc) { $notAfter.capUtc } else { 'none' })" } elseif ($notAfter.notAfterUtc) { $notAfter.notAfterUtc } else { 'none' })
+    Say "submit $Step $JobId -> $Share notAfter=$bound ($($notAfter.source)) deadline=$($script:Deadline.ToString('o'))"
     $c = Invoke-Child "umrun-$Step" '' @() -CommandText $text
     if ($c.timedOut) { Stop-Nightly 'STAGE_UNRESOLVED' "um-run for $JobId was still waiting at the $MaxTotalSec s cap and was killed; the agent may still own $JobId (not retried)" }
     if ($c.exit -eq 0 -and $c.out -match '(?m)^UMRUN_RETURNED\s*$') { return 'OK' }
@@ -478,6 +512,12 @@ function Invoke-UmRun([string]$Step, [string]$JobFile, [string[]]$Side, [string]
     if ($msg -match '^UNRESOLVED:') { Stop-Nightly 'STAGE_UNRESOLVED' "um-run $Step ($JobId): $msg (not retried in this call)" }
     if ($msg -match '^RETRACTED:') { Stop-Nightly 'AGENT_BUSY' "um-run $Step ($JobId) was never claimed: $msg" }
     if ($msg -match '^No agent heartbeat') { Stop-Nightly 'SHARE_UNREACHABLE' "um-run $Step : $msg" }
+    # r2: the drop refuses a cap (this call's deadline) that passed before its claim, before any share write; r3/r4: or during placement, before the job's
+    # rename. r5 (Grok G5): the text says what holds in every case: the job was never made visible.
+    if ($msg -match '^UMRUN_NOT_AFTER_CAP_PASSED') { Stop-Nightly 'STAGE_CAP_EXCEEDED' "um-run $Step ($JobId): the $MaxTotalSec s deadline passed before the job was made visible; nothing was submitted ($msg)" }
+    # r5 (Grok G5): r4's placement-stall refusal means the share stalled through every re-derivation and the drop rolled its claim back, the job never visible.
+    # That is the share not answering in time with nothing submitted, so SHARE_UNREACHABLE, never the step's generic failure.
+    if ($msg -match '^UMRUN_NOT_AFTER_PLACEMENT_STALL') { Stop-Nightly 'SHARE_UNREACHABLE' "um-run $Step ($JobId): the share stalled while the job was being placed; the job was never made visible, nothing was submitted ($msg)" }
     $last = $(if ($msg) { $msg } else { Get-LastLine ($c.out + "`n" + $c.err) '\S' })
     Stop-Nightly $FailToken "um-run $Step ($JobId) exit $($c.exit): $(if ($last) { ([string]$last).Trim() })"
 }
@@ -505,7 +545,7 @@ if ($buildInCache) {
         if ($gen.timedOut) { Stop-Nightly 'STAGE_CAP_EXCEEDED' 'the DLL-pair generator outlived the cap' }
         $dllJob = Join-Path $dllOut "$dllId.job.ps1"; $dllZip = Join-Path $dllOut "$dllId-source.zip"
         if ($gen.exit -ne 0 -or -not (Test-Path -LiteralPath $dllJob -PathType Leaf) -or -not (Test-Path -LiteralPath $dllZip -PathType Leaf)) { Stop-Nightly 'DLLPAIR_FAILED' "the DLL-pair generator exit $($gen.exit) did not emit $dllId.job.ps1 + -source.zip (see $($script:WorkDir)\dllpair-gen.log)" }
-        $u = Invoke-UmRun 'dllpair' $dllJob @($dllZip) $dllId $dllShare 3600 'DLLPAIR_FAILED'
+        $u = Invoke-UmRun 'dllpair' $dllJob @($dllZip) $dllId $dllShare 3600 'DLLPAIR_FAILED' -LaterHarvest
         if ($u -ceq 'IN_USE') { Stop-Nightly 'DLLPAIR_FAILED' "$dllId became in use between the by-name check and the submission; not re-submitted" }
         $pair = Read-Share "$dllOutbox\$dllId.result.json" $DllReuseByName @($reuseModule, $dllOutbox, $dllId, $commit)
         if (-not $pair.Reusable) { Stop-Nightly 'DLLPAIR_FAILED' "the DLL-pair job ended but its result is not a clean pair for $commit ($($pair.Reason))" }
@@ -612,7 +652,7 @@ if ($runnerPresent) {
         }
         $script:Row.steps.smokeRunner = 'in-cache'
     } else {
-        $u = Invoke-UmRun 'smoke-runner' $runnerJob @() $runnerId $share 1800 'SMOKE_RUNNER_STAGE_FAILED'
+        $u = Invoke-UmRun 'smoke-runner' $runnerJob @() $runnerId $share 1800 'SMOKE_RUNNER_STAGE_FAILED' -LaterHarvest
         if ($u -ceq 'IN_USE') { Stop-Nightly 'SMOKE_RUNNER_STAGE_FAILED' "$runnerId became in use between the by-name check and the submission; not re-submitted" }
         $sr = Read-Share $runnerResult $StageReuseByName @($reuseModule, $runnerResult, $runnerId, $commit, 'SmokeRunner')
         if (-not $sr.Staged) { Stop-Nightly 'SMOKE_RUNNER_STAGE_FAILED' "the smoke-runner job $runnerId ended without RESULT=SMOKE_RUNNER_STAGE_OK ($($sr.Reason))" }

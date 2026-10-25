@@ -164,8 +164,18 @@ ROUTE_DELETE_ALLOWED = {
         "publishes a share-side `.sidepart` this call wrote and hash-verified into the inbox, no -Force (a dual-venue leg submits no side file).",
     ("UmRunDrop.psm1", "if (Test-Path -LiteralPath $part) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }"):
         "removes the same share-side `.sidepart` copy this call made when its publish failed.",
-    ("UmRunDrop.psm1", "if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }"):
-        "removes this call's own job-script temp file in the inbox (two sites share the line).",
+    ("UmRunDrop.psm1", "if (-not $jobPlaced -and (Test-Path -LiteralPath $tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }"):
+        "LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r6 (Dot 77250bdf): the job temp after a failed placement (or a failed copy), the only removal "
+        "site for it. $tmp is assigned once, Join-Path $Inbox \"$id.$nonce.job.tmp\": a leaf in this drop's own inbox named with this call's fresh "
+        "GUID nonce and a JobId that passed UMRUN_JOBID_INVALID (no separator), so only a file this call created can carry it; after a successful "
+        "rename ($jobPlaced) nothing is touched.",
+    ("UmRunDrop.psm1", "[IO.File]::Move($repubTmp, $metaFinal, $true)"):
+        "r6 (Dot 77250bdf): the not-after re-publish. Source $repubTmp = $metaTmp, this call's own claim temp name (Join-Path $Inbox "
+        "\"$id.$nonce.meta.tmp\"), written and read back one step earlier; destination $metaFinal = Join-Path $Inbox \"$id.meta.json\", this call's "
+        "own claim, replaced only after the nonce read back from it is this call's. Both are leaves of the drop's own inbox; neither can be footage.",
+    ("UmRunDrop.psm1", "if (Test-Path -LiteralPath $repubTmp) { Remove-Item -LiteralPath $repubTmp -Force -ErrorAction SilentlyContinue }"):
+        "r6 (Dot 77250bdf): removes the same re-publish temp ($repubTmp = $metaTmp, this call's own nonce-named claim temp in its own inbox) when "
+        "the re-publish above failed before its Move.",
     ("UmRunDrop.psm1", "Move-Item -LiteralPath $tmp -Destination $final -ErrorAction Stop"):
         "publishes the job script into the inbox, no -Force: a job is never replaced.",
     ("UmRunDrop.psm1", "Remove-Item -LiteralPath $metaFinal -Force -ErrorAction Stop"):
@@ -187,6 +197,20 @@ ROUTE_DELETE_ALLOWED = {
         "(<claim dir>\\<venue>.tickets) filtered by the ticket-name pattern or the ticket object New-VenueTicket returned, and the delete runs only after the open "
         "handle re-read the file's own JSON (its nonce, or the exact stale bytes judged); a footage name cannot equal either. test_venue_chain_runner and "
         "test_venue_claim_fifo pin release, stale-break, ticket end and ticket sweep.",
+    ("VenueChain.psm1", "[IO.File]::Move($tmp, $A.path, $true)"):
+        "BACHELOR-LEASE-BATCH-LEGS-1 r5: the runner-liveness sidecar writer ($script:LivenessWriteText) publishes the tmp file it wrote one line earlier "
+        "($A.path + '.' + <guid> + '.tmp') over the job's own sidecar <AgentShare>\\notafter\\<jobId>.json in one replacing rename. $A.path is built only by "
+        "New-VenueJobLivenessWrite from the agent share, the fixed folder notafter and the job id the batch runner minted for its own lease open "
+        "(lease-batch-open-<stamp>-lb<token>); the destination is that one sidecar, never a clip, and the notafter folder is never created here.",
+    ("VenueChain.psm1", "} catch { '<WRITE_FAILED> ' + ($_.Exception.Message -replace '\\s+', ' ') } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }"):
+        "BACHELOR-LEASE-BATCH-LEGS-1 r5b: the same sidecar writer's finally clause removes only $tmp, the `<jobId>.json.<guid>.tmp` copy this call made beside the "
+        "job's own sidecar, and only while it is still there (a successful move has already consumed it). Fixed-name leaf, no wildcard, no -Recurse; the guid "
+        "suffix means a footage name cannot equal it.",
+    ("VenueChain.psm1", '$r = Invoke-VenueBoundedRead -ScriptText \'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { Remove-Item -LiteralPath $args[0] -Force; if (Test-Path -LiteralPath $args[0]) { "<PRESENT>" } else { "<REMOVED>" } } else { "<ABSENT>" }\' -Argument $path -TimeoutSec 30'):
+        "BACHELOR-LEASE-BATCH-LEGS-1 r5: Stop-VenueJobLiveness -Remove deletes the one file <AgentShare>\\notafter\\<jobId>.json, the runner-liveness sidecar this "
+        "run kept for its own lease open (jobId = lease-batch-open-<stamp>-lb<token>, minted by Invoke-VenueLeaseBatch), after the open's result is in hand or its "
+        "lease receipt was found. The path is the Start-VenueJobLiveness share plus the fixed folder and the .json suffix, only when it is a leaf, no wildcard, no "
+        "-Recurse; the sidecar is the runner's own liveness note, never a clip.",
 }
 
 TRAILING_COMMENT = re.compile(r"\s+#\s.*$")
@@ -400,6 +424,32 @@ class RouteDeleteSurfaceTests(unittest.TestCase):
                     target.write_bytes(original + b"\n" + payload.encode("utf-8") + b"\n")
                     caught = route_hits(route_sources(profiling)) - set(ROUTE_DELETE_ALLOWED)
                     self.assertIn(("Invoke-VenueLeg.ps1", payload), caught, payload)
+                finally:
+                    target.write_bytes(original)
+
+    def test_mutation_an_unrelated_delete_in_the_drop_is_caught_beside_its_allowed_sites(self) -> None:
+        # r6 (Dot 77250bdf): the three UmRunDrop.psm1 entries are exact lines, never a pattern -- a delete or move of any other target, or of the same
+        # temp spelled differently, still fails the guard. Mutates a copy, never the real file.
+        with tempfile.TemporaryDirectory() as tmp:
+            profiling = Path(tmp) / "profiling"
+            shutil.copytree(PROFILING / "dual-venue", profiling / "dual-venue")
+            for name in ROUTE_PS_SOURCES + ROUTE_PY_SOURCES:
+                shutil.copyfile(PROFILING / name, profiling / name)
+            self.assertEqual(sorted(route_hits(route_sources(profiling)) - set(ROUTE_DELETE_ALLOWED)), [], "the unmutated copy must pass")
+            for payload in (
+                "Remove-Item -LiteralPath $ScriptPath -Force",
+                "Remove-Item -LiteralPath $clip -Force -ErrorAction SilentlyContinue",
+                "Remove-Item -LiteralPath $repubTmp -Force",
+                "if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }",
+                "[IO.File]::Move($tmp, $metaFinal, $true)",
+                "[IO.File]::Move($repubTmp, $final, $true)",
+            ):
+                target = profiling / "UmRunDrop.psm1"
+                original = target.read_bytes()
+                try:
+                    target.write_bytes(original + b"\n" + payload.encode("utf-8") + b"\n")
+                    caught = route_hits(route_sources(profiling)) - set(ROUTE_DELETE_ALLOWED)
+                    self.assertIn(("UmRunDrop.psm1", payload), caught, payload)
                 finally:
                     target.write_bytes(original)
 

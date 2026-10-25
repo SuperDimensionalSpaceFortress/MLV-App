@@ -218,5 +218,77 @@ class RegistrationPathTests(unittest.TestCase):
         self.assertTrue(lines[0].startswith("hook-error:"), lines[0])
 
 
+WMI_GUARD_SCRIPT = "wmi-create-hidden-guard.py"
+WMI_EXPECTED_COMMAND = (
+    '"C:/Users/obabalola/AppData/Local/Python/bin/python.exe" '
+    '"${CLAUDE_PROJECT_DIR}/tools/hooks/wmi-create-hidden-guard.py"'
+)
+WMI_ALLOW_PAYLOAD = {"tool_name": "Bash", "tool_input": {"command": "git status --porcelain"}}
+# The inline shape seen on the owner's desktop (WMI-CREATE-HIDDEN-GUARD-1); the hook only READS it.
+WMI_DENY_PAYLOAD = {
+    "tool_name": "Bash",
+    "tool_input": {
+        "command": "pwsh -NoProfile -Command \"Invoke-CimMethod -ClassName Win32_Process "
+        "-MethodName Create -Arguments @{CommandLine='cmd.exe'}\""
+    },
+}
+
+
+class WmiGuardRegistrationTests(unittest.TestCase):
+    """WMI-CREATE-HIDDEN-GUARD-HOOK-1 r2: the SECOND PreToolUse entry, executed verbatim.
+
+    A wrong script path makes CPython exit 2 ("can't open file"), which denies EVERY matched
+    tool call, so a mistyped registration wedges the session rather than failing open.
+    """
+
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.commands = [
+            hook["command"]
+            for block in registered_pretooluse_entries()
+            if isinstance(block, dict) and block.get("matcher") == EXPECTED_MATCHER
+            for hook in block.get("hooks", [])
+            if isinstance(hook, dict)
+            and hook.get("type") == "command"
+            and WMI_GUARD_SCRIPT in str(hook.get("command", ""))
+        ]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mlv-reg-wmi-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _execute(self, command, payload):
+        command = command.replace("${CLAUDE_PROJECT_DIR}", REPO_ROOT).replace("$CLAUDE_PROJECT_DIR", REPO_ROOT)
+        env = dict(os.environ)
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        env["PYTHONIOENCODING"] = "utf-8"
+        return subprocess.run(
+            command, shell=True, input=json.dumps(payload), capture_output=True, text=True,
+            encoding="utf-8", cwd=self.tmp, env=env,
+        )
+
+    def _registered(self):
+        self.assertEqual(self.commands, [WMI_EXPECTED_COMMAND], "expected exactly one exact wmi guard registration")
+        return self.commands[0]
+
+    def test_registered_command_allows_a_benign_payload(self):
+        completed = self._execute(self._registered(), WMI_ALLOW_PAYLOAD)
+        self.assertEqual(completed.returncode, 0, "stdout=%r stderr=%r" % (completed.stdout, completed.stderr))
+        self.assertEqual(completed.stderr.strip(), "")
+
+    def test_registered_command_denies_an_unhidden_launch(self):
+        completed = self._execute(self._registered(), WMI_DENY_PAYLOAD)
+        self.assertEqual(completed.returncode, 2, "stdout=%r stderr=%r" % (completed.stdout, completed.stderr))
+        self.assertIn("WMI-CREATE-HIDDEN-GUARD", completed.stderr)
+
+    def test_a_mistyped_registration_fails_the_allow_proof(self):
+        """The falsifier: the same ALLOW payload against a missing script must NOT exit 0."""
+        mutated = self._registered().replace(WMI_GUARD_SCRIPT, "wmi-create-hidden-guard-MISSING.py")
+        completed = self._execute(mutated, WMI_ALLOW_PAYLOAD)
+        self.assertNotEqual(completed.returncode, 0, "a missing script must not look like an ALLOW")
+
+
 if __name__ == "__main__":
     unittest.main()

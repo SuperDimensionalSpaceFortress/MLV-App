@@ -3046,3 +3046,38 @@ def test_a_card_the_validator_rejects_is_named_with_its_reason(tmp_path):
     assert re.search(rf"card is \d+ bytes; the limit is {max_bytes}", refusals[0])
     assert "applies names 'every board that retires worktrees', which is not a fleet member" in refusals[0]
     assert refusals[1] == "doctrine-outbox/Bad Name.md: OUTBOX_ITEM_INVALID: ITEM_BAD_FILENAME: Bad Name.md"
+
+
+# ---------- drain: the sent-ledger read is typed and fail-closed (OUTBOX-SENT-GUARD-LEDGER-READ-HARDENING-1 r2) ----------
+
+@pytest.mark.parametrize("content, code", [
+    (b"\xff\n", "sent-ledger-unreadable"),                                    # not UTF-8: used to be a traceback
+    (b'{"key": "0123456789abcdef"}\n{bad\n', "sent-ledger-partial"),          # a corrupt row was silently dropped
+    (b'{"key": ""}\n', "sent-ledger-partial"),                                # an empty key was accepted as a key
+])
+def test_drain_on_an_unreadable_or_corrupt_ledger_is_a_typed_unknown_and_publishes_nothing(tmp_path, capsys, content, code):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    ledger.write_bytes(content)
+    before = git(bare, "rev-parse", "master")
+
+    rc = ob.main(["--repo", str(src), "drain", "--bus", str(clone), "--ref", "HEAD", "--ledger", str(ledger), "--push"])
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert f"[doctrine-outbox] UNKNOWN {code}" in err and "Traceback" not in err, err
+    assert git(bare, "rev-parse", "master") == before
+    assert ledger.read_bytes() == content
+
+
+def test_drain_kernel_filing_shares_the_strict_ledger_read(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    ledger.write_bytes(b"\xff\n")
+    with pytest.raises(ob.Unknown) as excinfo:
+        ob.drain_kernel_filing(src, clone, "HEAD", ledger, [], push=False)
+    assert excinfo.value.code == "sent-ledger-unreadable"

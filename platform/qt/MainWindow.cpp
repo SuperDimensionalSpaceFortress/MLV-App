@@ -1843,6 +1843,54 @@ static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
 #endif
 }
 
+/* PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: binds a --visual-capture-dir capture's label to its pixels. A CPU frame is
+ * presented with a deferred paint (the pixmap item's / GL viewport's update()) while finishPresentedFrame() stamps its
+ * label at once, and PrintWindow reads the LAST PAINTED surface -- so a capture taken in between showed frame N-1
+ * labelled N. With paint set, the pending frame is painted synchronously first: the GL window's paintGL()+swap, else
+ * the viewport widget's repaint() (the --screenshot path's idiom). Returns whether the serial of the frame now painted
+ * is known, in *paintedSerialOut: the GL window's / GL viewport's own record of what its paintGL() drew, or, on the
+ * QGraphicsPixmapItem route, the item's serial once repaint() has drawn it (unknown without the forced paint). Only
+ * ever called by --visual-capture-dir, after the measured interval has closed.
+ * PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2: *basisOut names where the painted serial came from, so a reader can tell a
+ * paint-path record from one that holds by construction: "gl_window_paint" / "gl_viewport_paint" (the paintGL() that
+ * drew the frame recorded it), "pixmap_item_by_construction" (the pixmap route: the serial the item was handed with its
+ * pixmap, the same request serial the label is stamped from, so painted == label holds by construction and proves only
+ * that repaint() ran), or "none" (no painted serial is known). */
+static bool paintPresentedFrameForCapture( QGraphicsView *view,
+                                           QWidget *viewportWidget,
+                                           bool glWindowRoute,
+                                           quint64 pixmapItemSerial,
+                                           bool paint,
+                                           quint64 *paintedSerialOut,
+                                           QString *basisOut )
+{
+    quint64 serial = 0;
+    bool valid = false;
+    QString basis = QStringLiteral("none");
+    if( glWindowRoute )
+    {
+        valid = paint ? GpuDisplayWindow::paintPendingNowIfActive( &serial )
+                      : GpuDisplayWindow::presentedSerialIfActive( &serial );
+        if( valid ) basis = QStringLiteral("gl_window_paint");
+    }
+    else if( GpuDisplayViewport::isInstalledOn( view ) )
+    {
+        if( paint && viewportWidget ) viewportWidget->repaint();
+        valid = GpuDisplayViewport::paintedSerialFor( view, &serial );
+        if( valid ) basis = QStringLiteral("gl_viewport_paint");
+    }
+    else if( paint && viewportWidget && viewportWidget->isVisible() && viewportWidget->updatesEnabled() )
+    {
+        viewportWidget->repaint();
+        serial = pixmapItemSerial;
+        valid = serial != 0;
+        if( valid ) basis = QStringLiteral("pixmap_item_by_construction");
+    }
+    if( paintedSerialOut ) *paintedSerialOut = valid ? serial : 0;
+    if( basisOut ) *basisOut = basis;
+    return valid;
+}
+
 /* spaceTag argument options: ffmpeg color space tag number compliant */
 #define SPACETAG_REC709   1   /* rec709 color space */
 #define SPACETAG_UNKNOWN  2   /* No color space tag set */
@@ -6277,6 +6325,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
             pic.setDevicePixelRatio( devicePixelRatioF() );
         }
         m_pGraphicsItem->setPixmap( pic );
+        m_graphicsItemPresentedSerial = task.requestSerial;
         if( !displayPreviewCachingAllowed
          && m_pRenderThread
          && !releasePresentedFrameEarly )
@@ -10323,6 +10372,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             qint64 tailElapsedMs = 0;
             int displayFrame = -1;
             qulonglong serial = 0;
+            qulonglong paintedSerial = 0;
+            bool paintedSerialValid = false;
+            QString labelBoundBasis;
+            int forcedPaintsBefore = 0;
             bool playActive = false;
             bool settled = false;
             double captureMs = 0.0;
@@ -10335,17 +10388,33 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             ? visualGlContainer
             : ( ui->graphicsView ? ui->graphicsView->viewport() : nullptr );
         QElapsedTimer visualTailClock;
+        int visualForcedPaints = 0;
         auto grabVisual = [&]( const QString &kind, int index, bool settled )
         {
             VisualGrab grab;
             grab.kind = kind;
             grab.index = index;
             grab.tailElapsedMs = visualTailClock.elapsed();
+            grab.settled = settled;
+            // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: paint the pending frame FIRST, then read the label, then print the
+            // window, with no event handled in between, so the pixels are the frame the label names. The "_unbound" kinds
+            // skip the paint: each prints whatever was last painted, so a display whose own deferred paint never lands is
+            // still seen (r2: the force-paint would otherwise mask a frozen display). r3: a forced paint stays on screen
+            // when the display's own paint is stuck, so it is what the NEXT unforced capture would show; every capture
+            // records how many forced paints preceded it (forced_paints_before) for the runner's frozen check.
+            const bool forcePaint = !kind.endsWith( QStringLiteral("_unbound") );
+            grab.forcedPaintsBefore = visualForcedPaints;
+            quint64 paintedSerial = 0;
+            grab.paintedSerialValid = paintPresentedFrameForCapture( ui->graphicsView, visualViewportWidget, visualUseGlContainer,
+                                                                     m_graphicsItemPresentedSerial,
+                                                                     forcePaint, &paintedSerial,
+                                                                     &grab.labelBoundBasis );
+            if( forcePaint ) ++visualForcedPaints;
+            grab.paintedSerial = static_cast<qulonglong>( paintedSerial );
             grab.displayFrame = m_lastPresentedRequestContextValid
                 ? static_cast<int>( m_lastPresentedRequestContext.frameNumber ) : -1;
             grab.serial = static_cast<qulonglong>( m_lastPresentedRequestSerial );
             grab.playActive = ui->actionPlay->isChecked();
-            grab.settled = settled;
             QElapsedTimer captureClock;
             captureClock.start();
             grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
@@ -10365,10 +10434,15 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 .arg( visualMeasuredSession ).arg( visualTailMs ).arg( visualPlayFrames ).arg( visualTailBeginUtc ) );
         visualTailClock.start();
 
-        // (2) K play frames, evenly spaced across the untimed tail (the centres of K equal slices).
+        // (2) K forced, bound play frames evenly spaced across the FIRST half of the untimed tail (the centres of K equal
+        // slices), then K unforced ones across the SECOND half (what the display itself shows: the frozen check is judged
+        // on these). r3 (Dot 7dc103f1 B2): r2 took unforced k then forced k in each slice, so with the display's own paint
+        // stuck, unforced k+1 showed forced k's paint and a frozen display read as K moving pictures. Now no forced paint
+        // falls between two unforced play captures, or between the last of them and stop_unbound.
+        const int visualHalfMs = visualTailMs / 2;
         for( int k = 0; k < visualPlayFrames; ++k )
         {
-            const qint64 targetMs = static_cast<qint64>( ( 2 * k + 1 ) * visualTailMs / ( 2 * visualPlayFrames ) );
+            const qint64 targetMs = static_cast<qint64>( ( 2 * k + 1 ) * visualHalfMs / ( 2 * visualPlayFrames ) );
             while( visualTailClock.elapsed() < targetMs )
             {
                 qApp->processEvents( QEventLoop::AllEvents );
@@ -10376,9 +10450,24 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             }
             grabVisual( QStringLiteral("play"), k, false );
         }
+        for( int k = 0; k < visualPlayFrames; ++k )
+        {
+            const qint64 targetMs = visualHalfMs + static_cast<qint64>( ( 2 * k + 1 ) * visualHalfMs / ( 2 * visualPlayFrames ) );
+            while( visualTailClock.elapsed() < targetMs )
+            {
+                qApp->processEvents( QEventLoop::AllEvents );
+                QThread::msleep( 2 );
+            }
+            grabVisual( QStringLiteral("play_unbound"), k, false );
+        }
         // The frame on screen the instant Play is paused: captured BEFORE any event is processed, so it
-        // is still the frame the playback path presented (the paused re-render has not landed yet).
+        // is still the frame the playback path presented (the paused re-render has not landed yet). First
+        // unforced (stop_unbound: no forced paint since the unforced play captures, so on a display whose own
+        // paint lands it is what a pre-binding build captured; on one whose paint is stuck it still shows the
+        // last forced play paint, which the frozen check over the unforced play captures reports), then painted
+        // and bound to its label.
         ui->actionPlay->setChecked( false );
+        grabVisual( QStringLiteral("stop_unbound"), 0, false );
         grabVisual( QStringLiteral("stop"), 0, false );
         const QString visualTailEndUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
         const int visualStopFrame = visualGrabs.last().displayFrame;
@@ -10398,6 +10487,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             qApp->processEvents( QEventLoop::AllEvents );
             QThread::msleep( 10 );
         }
+        grabVisual( QStringLiteral("paused_unbound"), 0, visualSettled );
         grabVisual( QStringLiteral("paused"), 0, visualSettled );
 
         // (4) files: Play is stopped, so no encode or write below can touch a played frame.
@@ -10411,9 +10501,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         const QDir visualDir( options.visualCaptureDir );
         for( const VisualGrab &grab : visualGrabs )
         {
-            const QString fileName = grab.kind == QStringLiteral("play")
-                ? QStringLiteral("play-%1.png").arg( grab.index )
-                : grab.kind + QStringLiteral(".png");
+            const QString fileStem = QString( grab.kind ).replace( QLatin1Char('_'), QLatin1Char('-') );
+            const QString fileName = grab.kind.startsWith( QStringLiteral("play") )
+                ? QStringLiteral("%1-%2.png").arg( fileStem ).arg( grab.index )
+                : fileStem + QStringLiteral(".png");
             QJsonObject frameJson;
             frameJson.insert( QStringLiteral("kind"), grab.kind );
             frameJson.insert( QStringLiteral("index"), grab.index );
@@ -10422,6 +10513,11 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             frameJson.insert( QStringLiteral("tail_elapsed_ms"), static_cast<double>( grab.tailElapsedMs ) );
             frameJson.insert( QStringLiteral("display_frame"), grab.displayFrame );
             frameJson.insert( QStringLiteral("serial"), static_cast<double>( grab.serial ) );
+            frameJson.insert( QStringLiteral("painted_serial"), static_cast<double>( grab.paintedSerial ) );
+            frameJson.insert( QStringLiteral("painted_serial_valid"), grab.paintedSerialValid );
+            frameJson.insert( QStringLiteral("label_bound"), grab.paintedSerialValid && grab.paintedSerial == grab.serial );
+            frameJson.insert( QStringLiteral("label_bound_basis"), grab.labelBoundBasis );
+            frameJson.insert( QStringLiteral("forced_paints_before"), grab.forcedPaintsBefore );
             frameJson.insert( QStringLiteral("play_active"), grab.playActive );
             frameJson.insert( QStringLiteral("capture_ms"), grab.captureMs );
             if( grab.kind == QStringLiteral("paused") )
@@ -15351,6 +15447,7 @@ void MainWindow::deleteSession()
     invalidateDisplayPreviewCache();
     GpuDisplayViewport::clearPresentedImage( ui->graphicsView, m_pGraphicsItem );
     m_pGraphicsItem->setPixmap( QPixmap( ":/IMG/IMG/TransDummy.png" ) );
+    m_graphicsItemPresentedSerial = 0;
     m_pScene->setSceneRect( 0, 0, 10, 10 );
 
     //Fake no audio track
@@ -19131,6 +19228,7 @@ void MainWindow::clearPresentationForClipOpen( const char *reason )
         if( m_pGraphicsItem )
         {
             m_pGraphicsItem->setPixmap( QPixmap( ":/IMG/IMG/TransDummy.png" ) );
+            m_graphicsItemPresentedSerial = 0;
             m_pGraphicsItem->setVisible( true );
         }
         if( m_pScene )
@@ -22070,12 +22168,8 @@ void MainWindow::updatePlaybackQualityIndicator( void )
         const bool sameRequest =
             m_lastPresentedRequestContextValid
          && m_lastPresentedRequestContext.playbackScaleFactor == requestedScale;
-        if( activeScaleValid && sameRequest && activeScale != requestedScale )
-        {
-            return tr( "%1->%2" ).arg( PlaybackScaleLabel::shortLabel( requestedScale ),
-                                       PlaybackScaleLabel::shortLabel( activeScale ) );
-        }
-        return PlaybackScaleLabel::shortLabel( requestedScale );
+        return PlaybackScaleLabel::indicatorText(
+            requestedScale, ( activeScaleValid && sameRequest ) ? activeScale : requestedScale );
     };
 
     QString text;
@@ -22399,11 +22493,15 @@ int MainWindow::effectivePlaybackScaleFactorForRequest( void ) const
         m_gpuReducedReconSessionScale = 1;
         if( requestedScale != 2 && requestedScale != 4 )
         {
+            /* SCALE-LABEL-TELEMETRY-REASON-CONSISTENCY-1: log reasons use ONE form, the
+             * C seam's (video_mlv.c plan->reason: "preview scale 1 (full resolution)",
+             * "x8 stays on the full-resolution texture route"). A log line is not UI
+             * text, so the factor form stays here, not resolutionLabel(). */
             m_gpuReducedReconSessionReason =
                 requestedScale == 1
-                    ? PlaybackScaleLabel::resolutionLabel( 1 ) + QStringLiteral(" preview")
-                    : QStringLiteral("%1 stays on the full-resolution texture route")
-                          .arg( PlaybackScaleLabel::resolutionLabel( requestedScale ) );
+                    ? QStringLiteral("preview scale 1 (full resolution)")
+                    : QStringLiteral("x%1 stays on the full-resolution texture route")
+                          .arg( requestedScale );
         }
         else if( playbackGpuNoReadbackOutputValidationEnabled() )
         {
@@ -24914,6 +25012,8 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeQueueWaitSumMs = 0.0;
     m_playbackSmokeLlrawprocSumMs = 0.0;
     m_playbackSmokeProcessed8SumMs = 0.0;
+    m_playbackSmokeProcessed8MeasuredFrames = 0;
+    m_playbackSmokeProcessed16MeasuredFrames = 0;
     m_playbackSmokeProcessed8CacheStoreSumMs = 0.0;
     m_playbackSmokeRawUint16SumMs = 0.0;
     m_playbackSmokeRawUint16DecompressSumMs = 0.0;
@@ -25332,6 +25432,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         telemetryDoubleValue( timing, "llrawproc_ms" );
     const double processed8Ms =
         telemetryDoubleValue( timing, "processed8_total_ms" );
+    // PROCESSED8-MS-TELEMETRY-STUCK-1: false when the render thread did not run the
+    // stage this frame (an absent key is "not measured"); its timings are then not a cost.
+    const bool processed8Measured =
+        telemetryBoolValue( timing, "processed8_stage_measured" );
+    const bool processed16Measured =
+        telemetryBoolValue( timing, "processed16_stage_measured" );
     const double rawUint16Ms =
         telemetryDoubleValue( timing, "raw_uint16_ms" );
     const double rawUint16DecompressMs =
@@ -25917,16 +26023,24 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     m_playbackSmokePresentRenderSlotReleaseSumMs += presentRenderSlotReleaseMs;
     m_playbackSmokePresentPacingSumMs += presentPacingMs;
     m_playbackSmokeLlrawprocSumMs += llrawprocMs;
-    m_playbackSmokeProcessed8SumMs += processed8Ms;
-    m_playbackSmokeProcessed8CacheStoreSumMs += processed8CacheStoreMs;
-    m_playbackSmokeProcessed16SetupSumMs += processed16SetupMs;
-    m_playbackSmokeProcessed16CoreMathSumMs += processed16CoreMathMs;
-    m_playbackSmokeProcessed16LocalToneSumMs += processed16LocalToneMs;
-    m_playbackSmokeProcessed16ThreadingOverheadSumMs += processed16ThreadingOverheadMs;
-    m_playbackSmokeProcessed8SetupSumMs += processed8SetupMs;
-    m_playbackSmokeProcessed8CoreMathSumMs += processed8CoreMathMs;
-    m_playbackSmokeProcessed8LocalToneSumMs += processed8LocalToneMs;
-    m_playbackSmokeProcessed8ThreadingOverheadSumMs += processed8ThreadingOverheadMs;
+    if( processed8Measured )
+    {
+        ++m_playbackSmokeProcessed8MeasuredFrames;
+        m_playbackSmokeProcessed8SumMs += processed8Ms;
+        m_playbackSmokeProcessed8CacheStoreSumMs += processed8CacheStoreMs;
+        m_playbackSmokeProcessed8SetupSumMs += processed8SetupMs;
+        m_playbackSmokeProcessed8CoreMathSumMs += processed8CoreMathMs;
+        m_playbackSmokeProcessed8LocalToneSumMs += processed8LocalToneMs;
+        m_playbackSmokeProcessed8ThreadingOverheadSumMs += processed8ThreadingOverheadMs;
+    }
+    if( processed16Measured )
+    {
+        ++m_playbackSmokeProcessed16MeasuredFrames;
+        m_playbackSmokeProcessed16SetupSumMs += processed16SetupMs;
+        m_playbackSmokeProcessed16CoreMathSumMs += processed16CoreMathMs;
+        m_playbackSmokeProcessed16LocalToneSumMs += processed16LocalToneMs;
+        m_playbackSmokeProcessed16ThreadingOverheadSumMs += processed16ThreadingOverheadMs;
+    }
     m_playbackSmokeRawUint16SumMs += rawUint16Ms;
     m_playbackSmokeRawUint16DecompressSumMs += rawUint16DecompressMs;
     m_playbackSmokeRawUint16UnpackSumMs += rawUint16UnpackMs;
@@ -26411,8 +26525,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
 
     if( m_playbackSmokeFrameLogEnabled )
     {
+        const auto measuredMsText = []( bool measured, double ms ) -> QString
+        {
+            return measured ? QString::number( ms, 'f', 3 ) : QStringLiteral("na");
+        };
         qInfo().noquote()
-            << QStringLiteral(
+            << ( QStringLiteral(
                    "playback_smoke.frame session=%1 index=%2 elapsed_ms=%3 "
                    "interval_ms=%4 display_frame=%5 position=%6 serial=%7 "
                    "scale_request=%8 scale_active=%9 worker_threads=%10 "
@@ -26459,7 +26577,7 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                    .arg( renderWorkMs, 0, 'f', 3 )
                    .arg( queueWaitMs, 0, 'f', 3 )
                    .arg( llrawprocMs, 0, 'f', 3 )
-                   .arg( processed8Ms, 0, 'f', 3 )
+                   .arg( measuredMsText( processed8Measured, processed8Ms ) )
                    .arg( drawTotalMs, 0, 'f', 3 )
                    .arg( bool01( m_frameStillDrawing ) )
                    .arg( bool01( m_playbackFrameAdvancePending ) )
@@ -26469,14 +26587,14 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                    .arg( presentOverlaysScopesMs, 0, 'f', 3 )
                    .arg( presentRenderSlotReleaseMs, 0, 'f', 3 )
                    .arg( presentPacingMs, 0, 'f', 3 )
-                   .arg( processed16SetupMs, 0, 'f', 3 )
-                   .arg( processed16CoreMathMs, 0, 'f', 3 )
-                   .arg( processed16LocalToneMs, 0, 'f', 3 )
-                   .arg( processed16ThreadingOverheadMs, 0, 'f', 3 )
-                   .arg( processed8SetupMs, 0, 'f', 3 )
-                   .arg( processed8CoreMathMs, 0, 'f', 3 )
-                   .arg( processed8LocalToneMs, 0, 'f', 3 )
-                   .arg( processed8ThreadingOverheadMs, 0, 'f', 3 )
+                   .arg( measuredMsText( processed16Measured, processed16SetupMs ) )
+                   .arg( measuredMsText( processed16Measured, processed16CoreMathMs ) )
+                   .arg( measuredMsText( processed16Measured, processed16LocalToneMs ) )
+                   .arg( measuredMsText( processed16Measured, processed16ThreadingOverheadMs ) )
+                   .arg( measuredMsText( processed8Measured, processed8SetupMs ) )
+                   .arg( measuredMsText( processed8Measured, processed8CoreMathMs ) )
+                   .arg( measuredMsText( processed8Measured, processed8LocalToneMs ) )
+                   .arg( measuredMsText( processed8Measured, processed8ThreadingOverheadMs ) )
                    .arg( bool01( telemetryBoolValue(
                        timing, "gpu_playback_recon_async_h2d_env_enabled" ) ) )
                    .arg( bool01( telemetryBoolValue(
@@ -26521,7 +26639,10 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                        0, 'f', 3 )
                    .arg( telemetryDoubleValue(
                        timing, "playback_prep_region_unattributed_ms" ),
-                       0, 'f', 3 );
+                       0, 'f', 3 )
+               + QStringLiteral( " processed8_measured=%1 processed16_measured=%2" ) )
+                   .arg( bool01( processed8Measured ) )
+                   .arg( bool01( processed16Measured ) );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.request_state session=%1 index=%2 serial=%3 "
@@ -28209,11 +28330,22 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
             ? m_playbackSmokeLlrawprocSumMs
               / static_cast<double>( m_playbackSmokePresentedFrames )
             : 0.0;
-    const double avgProcessed8Ms =
-        m_playbackSmokePresentedFrames > 0
-            ? m_playbackSmokeProcessed8SumMs
-              / static_cast<double>( m_playbackSmokePresentedFrames )
-            : 0.0;
+    // PROCESSED8-MS-TELEMETRY-STUCK-1: processed8/processed16 averages cover only the
+    // frames whose render ran that stage, and print "na" when none did.
+    const auto avgMeasuredMsText = []( double sum, int measuredFrames ) -> QString
+    {
+        return measuredFrames > 0
+            ? QString::number( sum / static_cast<double>( measuredFrames ), 'f', 3 )
+            : QStringLiteral("na");
+    };
+    const auto avgProcessed8MsText = [&]( double sum ) -> QString
+    {
+        return avgMeasuredMsText( sum, m_playbackSmokeProcessed8MeasuredFrames );
+    };
+    const auto avgProcessed16MsText = [&]( double sum ) -> QString
+    {
+        return avgMeasuredMsText( sum, m_playbackSmokeProcessed16MeasuredFrames );
+    };
     const double avgDrawTotalMs =
         m_playbackSmokePresentedFrames > 0
             ? m_playbackSmokeDrawTotalSumMs
@@ -28334,7 +28466,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( avgRenderWorkMs, 0, 'f', 3 )
                .arg( avgQueueWaitMs, 0, 'f', 3 )
                .arg( avgLlrawprocMs, 0, 'f', 3 )
-               .arg( avgProcessed8Ms, 0, 'f', 3 )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8SumMs ) )
                .arg( avgDrawTotalMs, 0, 'f', 3 )
                .arg( m_playbackSmokeDrawTotalMaxMs, 0, 'f', 3 )
                .arg( m_playbackSmokeStartWorkerThreads )
@@ -28774,8 +28906,11 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         insertNullableDouble(
             &averageFrame,
             QStringLiteral("stage_process_ms"),
-            avgSmokeMs( m_playbackSmokeProcessed8SumMs ),
-            hasFrames );
+            m_playbackSmokeProcessed8MeasuredFrames > 0
+                ? m_playbackSmokeProcessed8SumMs
+                  / static_cast<double>( m_playbackSmokeProcessed8MeasuredFrames )
+                : 0.0,
+            m_playbackSmokeProcessed8MeasuredFrames > 0 );
         insertNullableDouble(
             &averageFrame,
             QStringLiteral("stage_queue_wait_ms"),
@@ -29093,16 +29228,16 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( avgSmokeMs( m_playbackSmokeProcessingCoreCreativeCurveSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeProcessingCoreCreativeGradationSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokeProcessingCoreCreativeAgxInverseSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16SetupSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16CoreMathSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16LocalToneSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16ThreadingOverheadSumMs ), 0, 'f', 3 )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16SetupSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16CoreMathSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16LocalToneSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16ThreadingOverheadSumMs ) )
                .arg( avgSmokeMs( m_playbackSmokeProcessed16CacheStoreSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8SetupSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8CoreMathSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8LocalToneSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8ThreadingOverheadSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8CacheStoreSumMs ), 0, 'f', 3 );
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8SetupSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8CoreMathSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8LocalToneSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8ThreadingOverheadSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8CacheStoreSumMs ) );
 
     qInfo().noquote()
         << QStringLiteral(
@@ -29126,24 +29261,27 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                .arg( avgSmokeMs( m_playbackSmokePresentOverlaysScopesSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokePresentRenderSlotReleaseSumMs ), 0, 'f', 3 )
                .arg( avgSmokeMs( m_playbackSmokePresentPacingSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16SetupSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16CoreMathSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16LocalToneSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed16ThreadingOverheadSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8SetupSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8CoreMathSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8LocalToneSumMs ), 0, 'f', 3 )
-               .arg( avgSmokeMs( m_playbackSmokeProcessed8ThreadingOverheadSumMs ), 0, 'f', 3 );
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16SetupSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16CoreMathSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16LocalToneSumMs ) )
+               .arg( avgProcessed16MsText( m_playbackSmokeProcessed16ThreadingOverheadSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8SetupSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8CoreMathSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8LocalToneSumMs ) )
+               .arg( avgProcessed8MsText( m_playbackSmokeProcessed8ThreadingOverheadSumMs ) );
 
     qInfo().noquote()
         << QStringLiteral(
                "playback_smoke.processed8_cache_summary session=%1 "
                "processed8_cache_hits=%2 processed8_prefetch_hits=%3 "
-               "processed8_direct_path_frames=%4" )
+               "processed8_direct_path_frames=%4 "
+               "processed8_measured_frames=%5 processed16_measured_frames=%6" )
                .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                .arg( m_playbackSmokeProcessed8CacheHits )
                .arg( m_playbackSmokeProcessed8PrefetchHits )
-               .arg( m_playbackSmokeProcessed8DirectPathFrames );
+               .arg( m_playbackSmokeProcessed8DirectPathFrames )
+               .arg( m_playbackSmokeProcessed8MeasuredFrames )
+               .arg( m_playbackSmokeProcessed16MeasuredFrames );
 
     /* CPU-DUALISO-AT-PREVIEW-SCALE-1: which recon scale the phase-3 worker ran
      * for the presented frames (avg_llrawproc_* in cpu_summary is the recon at

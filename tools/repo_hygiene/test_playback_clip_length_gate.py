@@ -34,8 +34,12 @@ from tools.repo_hygiene.synthetic_mlv import (
     FRAMES_30S_AT_23976,
     FRAMES_SHORT_FIXTURE,
     MLV_EXTENSION,
+    block,
+    mlv_bytes_with_random_vidf_payload,
     mlvi_header,
+    write_header_only_mlv,
     write_synthetic_mlv,
+    write_synthetic_mlv_with_blocks,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -132,7 +136,9 @@ class ClipLengthGateTests(_TmpCase):
             "badmagic": (mlvi_header(720, magic=b"NOPE"), "bad_magic"),
             "truncated": (mlvi_header(720)[:40], "header_truncated"),
             "empty": (b"", "header_truncated"),
+            # header validity precedes the block walk: a zero-fps header alone reports bad_fps, not header_vidf_count_mismatch
             "zero_fps": (mlvi_header(720, fps_denom=0), "bad_fps"),
+            "zero_fps_with_blocks": (mlvi_header(720, fps_denom=0) + b"".join(block(b"VIDF") for _ in range(720)), "bad_fps"),
         }
         for name, (payload, reason) in cases.items():
             with self.subTest(name):
@@ -164,6 +170,123 @@ class ClipLengthGateTests(_TmpCase):
         write_synthetic_mlv(self.tmp / "mix.M00", 400, file_num=1, file_count=2, guid=2)
         verdict = _gate(first, 24)
         self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_mismatch)")
+
+    # GUI-SMOKE-LENGTH-GATE-VIDF-COUNT-1: the app plays the VIDF blocks it indexes (src/mlv/video_mlv.c, the
+    # `video_frames++` of the block walk, assigned to video->frames and read back by getMlvFrames), not the MLVI
+    # header's videoFrameCount. M16-1243's headers declared 612 frames while 937 VIDF blocks were indexed.
+    def test_the_vidf_block_count_outranks_an_understating_header(self) -> None:
+        # Header says 400 (16.7 s: too short); the file really holds 720 VIDF blocks (30.03 s, what the app plays).
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("understated" + MLV_EXTENSION), 400, FRAMES_30S_AT_23976)
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "OK", verdict)
+        self.assertEqual(verdict["frames"], FRAMES_30S_AT_23976, verdict)
+        self.assertAlmostEqual(verdict["clipSeconds"], 30.03, places=2)
+
+    def test_the_start_frame_cap_follows_the_vidf_count_not_the_header(self) -> None:
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("startcap" + MLV_EXTENSION), 400, FRAMES_30S_AT_23976)
+        # 600 frames in leaves 120 frames = 5.0 s, under the 24 s window; 120 frames in leaves 25.0 s.
+        self.assertEqual(_gate(path, 24, start_frame=600)["verdict"], "CLIP_TOO_SHORT")
+        self.assertEqual(_gate(path, 24, start_frame=120)["verdict"], "OK")
+
+    def test_a_header_that_overstates_is_corrected_down_to_the_vidf_count(self) -> None:
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("overstated" + MLV_EXTENSION), 720, 100)
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_TOO_SHORT", verdict)
+        self.assertEqual(verdict["frames"], 100, verdict)
+
+    def test_a_spanned_set_sums_the_vidf_blocks_of_every_part(self) -> None:
+        guid = 0x1122334455667788
+        first = write_synthetic_mlv_with_blocks(self.tmp / ("vspan" + MLV_EXTENSION), 200, 400,
+                                                file_num=0, file_count=3, guid=guid)
+        write_synthetic_mlv_with_blocks(self.tmp / "vspan.M00", 200, 300, file_num=1, file_count=3, guid=guid)
+        write_synthetic_mlv_with_blocks(self.tmp / "vspan.M01", 212, 237, file_num=2, file_count=3, guid=guid)
+        verdict = _gate(first, 24)
+        self.assertEqual(verdict["frames"], 937, verdict)
+        self.assertAlmostEqual(verdict["clipSeconds"], 39.08, places=2)
+
+    def test_other_blocks_are_skipped_and_only_vidf_is_counted(self) -> None:
+        path = self.tmp / ("mixed" + MLV_EXTENSION)
+        body = b"".join(block(b"VIDF") + block(b"AUDF") + block(b"NULL", 40) for _ in range(30))
+        write_synthetic_mlv_with_blocks(path, 5, 0, extra=body)
+        verdict = _gate(path, 1, start_frame=0)
+        self.assertEqual(verdict["frames"], 30, verdict)
+
+    def test_a_clip_with_blocks_but_no_vidf_is_a_typed_mismatch_not_the_header_count(self) -> None:
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("novidf" + MLV_EXTENSION), 720, 0, extra=block(b"AUDF"))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+
+    # r4 (sol r3 BLOCKER): the count-or-fail-closed rule has no header-only exception. A file cut off right after its
+    # MLVI header holds zero playable VIDF blocks (src/mlv/video_mlv.c rejects zero indexed frames), so the declared
+    # count is never admitted in its place.
+    def test_a_header_only_clip_declaring_720_frames_is_length_unknown_never_ok(self) -> None:
+        path = write_header_only_mlv(self.tmp / ("headeronly" + MLV_EXTENSION), FRAMES_30S_AT_23976)
+        self.assertEqual(path.stat().st_size, 52)
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+
+    def test_an_mlvi_block_that_skips_beyond_eof_is_length_unknown_never_ok(self) -> None:
+        # The MLVI block declares 1 MB in a 52-byte file: the walk skips past EOF having seen no VIDF at all.
+        path = self.tmp / ("oversizedmlvi" + MLV_EXTENSION)
+        path.write_bytes(mlvi_header(FRAMES_30S_AT_23976, block_size=1_000_000))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+        # ... and with 720 real VIDF blocks behind it: an MLVI block that swallows them is still not a clip.
+        path.write_bytes(mlvi_header(FRAMES_30S_AT_23976, block_size=1_000_000) + b"".join(
+            block(b"VIDF") for _ in range(FRAMES_30S_AT_23976)))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+
+    def test_a_trailing_vidf_block_that_runs_past_eof_fails_closed(self) -> None:
+        # 720 whole VIDF blocks, then one whose declared size reaches past the end of the file.
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("overrun" + MLV_EXTENSION), FRAMES_30S_AT_23976,
+                                               FRAMES_30S_AT_23976, extra=block(b"VIDF", size=1_000_000))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=vidf_count_unverified)")
+
+    def test_a_zero_frame_header_with_no_blocks_is_still_zero_frames(self) -> None:
+        verdict = _gate(write_header_only_mlv(self.tmp / ("emptyheader" + MLV_EXTENSION), 0), 24)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=zero_frames)")
+
+    def test_a_block_walk_that_cannot_finish_fails_closed_and_typed(self) -> None:
+        # blockSize 8 is below the 16-byte block header: the app refuses such a file (MLV_ERR_INVALID).
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("badsize" + MLV_EXTENSION), 720, 10,
+                                               extra=block(b"VIDF", size=8))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=vidf_count_unverified)")
+
+    def test_a_header_in_front_of_a_random_body_is_refused_as_a_vidf_mismatch(self) -> None:
+        # The shape test_attr3_owner_clip_stage_stall used before this card: a genuine header, then random bytes.
+        path = self.tmp / ("randombody" + MLV_EXTENSION)
+        path.write_bytes(mlvi_header(FRAMES_30S_AT_23976) + os.urandom(700_000 - 52))
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=header_vidf_count_mismatch)")
+
+    def test_a_random_payload_clip_of_a_fixed_size_still_counts_its_frames(self) -> None:
+        path = self.tmp / ("randompayload" + MLV_EXTENSION)
+        data = mlv_bytes_with_random_vidf_payload(FRAMES_30S_AT_23976, 700_000)
+        path.write_bytes(data)
+        self.assertEqual(len(data), 700_000)
+        verdict = _gate(path, 24)
+        self.assertEqual(verdict["verdict"], "OK", verdict)
+        self.assertEqual(verdict["frames"], FRAMES_30S_AT_23976, verdict)
+
+    def test_the_block_walk_is_bounded(self) -> None:
+        path = write_synthetic_mlv_with_blocks(self.tmp / ("bounded" + MLV_EXTENSION), 720, 50)
+        proc = _pwsh(
+            f". {_q(GATE)}; $script:GuiSmokeVidfWalkMaxBlocks = 10; "
+            f"Get-GuiSmokeClipLength -Path {_q(path)} | ConvertTo-Json -Compress"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertFalse(result["known"], result)
+        self.assertEqual(result["reason"], "vidf_count_unverified", result)
 
     def test_messages_never_name_the_clip_path(self) -> None:
         verdict = _gate(self.clip("distinctive_name_xyz", 16), 24)

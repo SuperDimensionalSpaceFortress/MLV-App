@@ -65,6 +65,10 @@ public:
     static bool hasPresentedImage(const QGraphicsView *view);
     static bool hasPresentedGpuReconTexture(const QGraphicsView *view);
     static bool isTexturePresentationActive(const QGraphicsView *view);
+    /* PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: the presentationSerial of the frame the last paintGL() actually drew
+     * (a cheap read, no readback). False when no viewport is installed, the last paint drew no frame, or the
+     * route did not supply a serial. */
+    static bool paintedSerialFor(const QGraphicsView *view, quint64 *serial);
     static SamplingMode samplingModeFor(const QGraphicsView *view);
     static QString rendererDescriptionFor(const QGraphicsView *view);
     static bool readPresentedBayer16Texture(QGraphicsView *view,
@@ -222,6 +226,8 @@ private:
     // through the identical display shader and LUT upload/bind path.
     GpuPreviewProcessingLutTextureSet m_lutSet;
     GpuPresentSetupTiming m_lastPresentSetupTiming;
+    quint64 m_paintedSerial;
+    bool m_paintedSerialValid;
 };
 
 #endif // GPUDISPLAYVIEWPORT_H

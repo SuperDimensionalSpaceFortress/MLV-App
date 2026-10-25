@@ -357,6 +357,23 @@ function Write-DispatchReservation {
     return [pscustomobject]$row
 }
 
+function Add-DispatchLogRow {
+    # LEDGER-APPEND-ATOMIC-WORKSTREAM-LOG-1: pwsh 7 Add-Content (FileMode.Append) loses rows when two dispatches
+    # finish together (~14 % across 6 writers). Same machine-wide mutex as Write-DispatchReservation above, so
+    # the dispatch log needs no second lock order; Add-Content is kept, so the bytes are unchanged.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Record)
+    $logMutex = [Threading.Mutex]::new($false, 'Global\MLV-App-DispatchLedger')
+    $logHeld = $false
+    try {
+        try { $logHeld = $logMutex.WaitOne(30000) } catch [Threading.AbandonedMutexException] { $logHeld = $true }
+        if (-not $logHeld) { throw 'dispatch log lock timeout' }
+        Add-Content -LiteralPath $Path -Value ($Record | ConvertTo-Json -Compress) -Encoding UTF8
+    } finally {
+        if ($logHeld) { $logMutex.ReleaseMutex() }
+        $logMutex.Dispose()
+    }
+}
+
 function Test-KillSwitchArmed { return (Test-Path -LiteralPath $KillSwitch) }
 
 function Test-RatioDispatchPermission {
@@ -1100,7 +1117,7 @@ $fence
         laneCostUsd     = $reservationRecord.laneCostUsd
         laneCostReported = $reservationRecord.laneCostReported
     }
-    Add-Content -LiteralPath $LogPath -Value ($record | ConvertTo-Json -Compress) -Encoding UTF8
+    Add-DispatchLogRow -Path $LogPath -Record $record
 
     Write-DispatchAttempt -Outcome 'launched' -Cause 'lane-returned' -ExitCode 0 -LaneExitCode $laneExit
     Write-Output "WORKSTREAM: dispatched, laneExit=$laneExit runDir=$runDir"
@@ -1454,7 +1471,7 @@ $fence
         laneCostUsd     = $reservationRecord.laneCostUsd
         laneCostReported = $reservationRecord.laneCostReported
     }
-    Add-Content -LiteralPath $LogPath -Value ($record | ConvertTo-Json -Compress) -Encoding UTF8
+    Add-DispatchLogRow -Path $LogPath -Record $record
 
     Write-DispatchAttempt -Outcome 'launched' -Cause 'lane-returned' -ExitCode 0 -LaneExitCode $laneExit
     Write-Output "WORKSTREAM: dispatched, laneExit=$laneExit runDir=$runDir workDir=$laneWorkDir"

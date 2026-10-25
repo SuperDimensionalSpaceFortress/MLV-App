@@ -94,7 +94,11 @@ OWNER_CLIP = "M16-1243"   # a consented clip ID (an id is not footage); the runn
 DISPLAY_MATRIX_LEGS = tuple(f"legs/m16-1243-display-{mode}-s{scale}.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed"))
 # PLAYBACK-BACHELOR-PRESENT-JITTER-1 added three capture-free PACE legs: speed legs that force Look Assist (cinematic) through generatorArgs and take no
 # contact sheet, so no GUI-thread framebuffer grab lands inside the timed Play.
-PACE_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4.json", "legs/m16-1243-pace-cinematic-fullscreen-s2.json", "legs/m16-1243-pace-cinematic-windowed-s4.json")
+PACE_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4.json", "legs/m16-1243-pace-cinematic-fullscreen-s2.json", "legs/m16-1243-pace-cinematic-windowed-s4.json",
+             # LOOK-LEG-PACE-TWIN-COVERAGE-1: the three display-matrix cells that had no pace twin (fullscreen s1, windowed s1, windowed s2).
+             "legs/m16-1243-pace-cinematic-fullscreen-s1.json", "legs/m16-1243-pace-cinematic-windowed-s1.json", "legs/m16-1243-pace-cinematic-windowed-s2.json")
+# LOOK-LEG-PACE-TWIN-COVERAGE-1: the capture-free pace twins of the four cpu-reduced look legs (playbackProcessing receipt, cpu only).
+CPU_REDUCED_PACE_LEGS = tuple(f"legs/m16-1243-pace-cinematic-cpu-reduced-{mode}-s{scale}.json" for scale in (2, 4) for mode in ("fullscreen", "windowed"))
 # ... and the lookahead A/B arm: the owner-shape pace leg at MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES=3 (the other arm is the pace leg itself, unset).
 LOOKAHEAD_LEGS = ("legs/m16-1243-pace-cinematic-fullscreen-s4-la3.json",)
 # ... and (r2) the stall-stage diagnostic: the owner-shape pace leg at telemetryArm HEAVY, which keeps the per-frame playback_smoke.frame log
@@ -119,6 +123,10 @@ IDENTITY_LEGS = {f"legs/m16-1243-display-{cell}-identity.json": f"legs/m16-1243-
 MISSDUMP_LEGS = {"legs/m16-1243-display-windowed-s1-missdump.json": "legs/m16-1243-display-windowed-s1.json"}
 # PLAYBACK-VISUAL-INSPECTION-1: the window-capture proof leg, a SPEED leg (windowed, scale 2) that names no visualCapture: absent means on.
 VISUAL_LEGS = ("legs/m16-1243-speed-windowed-s2.json",)
+# PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: the display matrix cells are LOOK legs, which never capture; these speed twins of the proof leg
+# (only displayMode and scaleFactor differ) carry the window capture to every {fullscreen, windowed} x {s1, s2, s4} cell.
+VISUAL_TWIN_LEGS = tuple(f"legs/m16-1243-speed-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)
+                         if (mode, scale) != ("windowed", 2))
 # PLAYBACK-SCOPES-OPTION-1: the windowed scale-1 no-look scope matrix, per backend: N (no scope), T (histogram at the app's default throttle) and
 # F (histogram at scopeIntervalMs 0, upstream's every frame), plus one optional waveform F arm on cuda. Each scope arm differs from its backend's N
 # leg only in its legId and the scope fields of generatorArgs. r4 (PSO-01): every scope arm pins scopesDuringPlayback throttled, the mode the
@@ -143,8 +151,8 @@ SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16
                 "legs/m16-1243-look-scale2-film.json", "legs/m16-1243-look-scale2-vision50d.json",
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *IDENTITY_LEGS,
-                *MISSDUMP_LEGS)
+                *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS,
+                *IDENTITY_LEGS, *MISSDUMP_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
 # LOOK-ASSIST-FILM-FLAVOR-2 r2: the AgX-off twins of the scale-2 Cinematic and Film legs carry a committed look receipt (look-receipts/agx-off.marxml).
@@ -1228,12 +1236,14 @@ class RunnerHarness:
                         nonce: str | None = NONCE, sheet: bool = False, line: dict | None = None, observed_nonce: str | None | bool = True,
                         manifest_nonce: str | None | bool = True, log: bool = True, result: bool = True, isolated: str | None = "run_scoped",
                         declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False,
-                        exact_summary: dict | None = None, extra_log_lines: list[str] | None = None) -> None:
+                        exact_summary: dict | None = None, extra_log_lines: list[str] | None = None,
+                        look_assist_state: str | None = "look_assist_enabled=1") -> None:
         """Write the job's artifacts the way master's generator does, INCLUDING the run's own records the receipt is re-derived
         from: the launcher's result.json (evidence.runNonce = the nonce it generated, the sha256 of the log snapshot) and
         logs/smoke-run.log (the app's playback_smoke.summary line carrying source_advanced / required_source_frames / native_fps /
         pace_fps / fps_override / wrapped / wrap_count and the run_nonce it echoed). `line` overrides summary-line fields;
-        `nonce` is the launcher's (expected) nonce, `observed_nonce` what the app echoed (True = the same one, None = none)."""
+        `nonce` is the launcher's (expected) nonce, `observed_nonce` what the app echoed (True = the same one, None = none).
+        `look_assist_state` is the app's gui_smoke.visual_state fields (Look Assist on by default, as the app ships; None = no visual_state line)."""
         self.artifacts.mkdir(parents=True, exist_ok=True)
         for stale in ("logs/smoke-run.log", "result.json", "contact-sheet/sheet.png", "contact-sheet/compose-status.txt"):
             (self.artifacts / stale).unlink(missing_ok=True)   # a case that omits a record must not inherit the previous case's
@@ -1247,6 +1257,8 @@ class RunnerHarness:
         log_lines = []
         if isolated is not None:
             log_lines.append(f"interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store={isolated}")
+        if look_assist_state is not None:
+            log_lines.append(f"interaction_trace event=gui_smoke.visual_state {look_assist_state}".rstrip())
         # a DECOY earlier session with another nonce: the measured session (the marker) is the one that counts
         log_lines += list(extra_log_lines or [])
         log_lines += ["playback_smoke.summary session=1 reason=warmup source_advanced=1 required_source_frames=1 native_fps=23.976 pace_fps=23.976 fps_override=0 wrapped=0 wrap_count=0 run_nonce=" + "0" * 32,
@@ -4923,10 +4935,8 @@ def run_pwsh_json(script: str, **env: str):
         return proc, None
 
 
-@requires_windows_pwsh
-class ScaleLabelMirrorTests(unittest.TestCase):
-    """SCALE-LABEL-CLARITY-1 r2: Get-DvScaleLabel (PowerShell) and scale_label (make-contact-sheet.py) mirror PlaybackScaleLabel::resolutionLabel; the C++ header is the one
-    mapping, so a reworded label there fails here instead of drifting silently into receipts and sheet headers."""
+class _ScaleLabelHeaderMixin:
+    """Reads the one mapping (PlaybackScaleLabel::resolutionLabel) out of the C++ header for both mirror test classes below."""
 
     HEADER = ROOT / "platform" / "qt" / "PlaybackScaleLabel.h"
 
@@ -4939,6 +4949,12 @@ class ScaleLabelMirrorTests(unittest.TestCase):
         labels[0] = custom.group(1)   # the template for any other factor, %1 = N
         return labels
 
+
+@requires_windows_pwsh
+class ScaleLabelMirrorTests(_ScaleLabelHeaderMixin, unittest.TestCase):
+    """SCALE-LABEL-CLARITY-1 r2: Get-DvScaleLabel (PowerShell) mirrors PlaybackScaleLabel::resolutionLabel; the C++ header is the one mapping, so a reworded label there
+    fails here instead of drifting silently into receipts. The contact-sheet mirror is ungated, in ContactSheetScaleLabelMirrorTests."""
+
     def test_the_powershell_mirror_equals_the_cpp_header(self) -> None:
         want = self.header_labels()
         proc, out = run_pwsh_json("(@(1, 2, 4, 8, 3) | ForEach-Object { [pscustomobject]@{ n = $_; label = (Get-DvScaleLabel -Factor $_) } }) | ConvertTo-Json -Compress")
@@ -4948,6 +4964,11 @@ class ScaleLabelMirrorTests(unittest.TestCase):
             self.assertEqual(got[n], want[n])
         for n in (3, 8):
             self.assertEqual(got[n], want[0].replace("%1", str(n)))
+
+
+class ContactSheetScaleLabelMirrorTests(_ScaleLabelHeaderMixin, unittest.TestCase):
+    """SCALE-LABEL-CLARITY-FOLLOWUP-1 (b): scale_label (make-contact-sheet.py) mirrors PlaybackScaleLabel::resolutionLabel. Needs no pwsh (pure Python, header text only), so it is
+    NOT behind requires_windows_pwsh and the Ubuntu hygiene shards pin it too."""
 
     def test_the_contact_sheet_mirror_equals_the_cpp_header(self) -> None:
         want = self.header_labels()
@@ -5011,6 +5032,55 @@ class UnpacedEvidenceTests(unittest.TestCase):
         self.assertIn('if ($unpacedVerdict.blocks) { $invalid.Add("UNPACED_NOT_HONOURED:', module)
         roles = json.loads((DV / "venues.json").read_text(encoding="utf-8"))["roles"]
         self.assertEqual(roles["CUDA-HEADROOM-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+
+
+@requires_windows_pwsh
+class LookAssistEvidenceTests(unittest.TestCase):
+    """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON counts only when the app's own LAST
+    gui_smoke.visual_state line says look_assist_enabled=1."""
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvLookAssistEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stderr)
+        return out
+
+    @staticmethod
+    def log(*state: str) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", *(f"[INFO] interaction_trace event=gui_smoke.visual_state {s}" for s in state),
+                          "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+
+    def test_a_forced_or_look_leg_is_honoured_only_with_look_assist_enabled_1(self) -> None:
+        for spec in ({"generatorArgs": {"forceLookAssist": True}}, {"legType": "look", "look": {"contactSheetFrames": 2}}):
+            with self.subTest(spec=spec):
+                v = self.verdict(spec, self.log("look_assist_enabled=1 look_assist_diagnostics_valid=1 look_assist_flavor=classic"))
+                self.assertEqual((v["requested"], v["verdict"], v["blocks"], v["reported"]), (True, "HONOURED", False, "1"))
+
+    def test_off_missing_field_or_missing_line_blocks(self) -> None:
+        spec = {"generatorArgs": {"forceLookAssist": True}}
+        for log, needle in ((self.log("look_assist_enabled=0 look_assist_flavor=none"), "look_assist_enabled=0"),
+                            (self.log("look_assist_diagnostics_valid=1"), "carries no look_assist_enabled"),
+                            (self.log(), "no gui_smoke.visual_state line"), ("", "no gui_smoke.visual_state line")):
+            with self.subTest(needle=needle):
+                v = self.verdict(spec, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True))
+                self.assertIn(needle, v["reason"])
+
+    def test_the_last_visual_state_line_is_the_one_that_counts(self) -> None:
+        spec = {"generatorArgs": {"forceLookAssist": True}}
+        self.assertTrue(self.verdict(spec, self.log("look_assist_enabled=1", "look_assist_enabled=0"))["blocks"])
+        self.assertFalse(self.verdict(spec, self.log("look_assist_enabled=0", "look_assist_enabled=1"))["blocks"])
+
+    def test_a_leg_that_does_not_ask_never_blocks(self) -> None:
+        for spec in ({}, {"generatorArgs": {"forceLookAssist": False}}, {"generatorArgs": {"disableLookAssist": True}}):
+            v = self.verdict(spec, self.log("look_assist_enabled=0"))
+            self.assertEqual((v["requested"], v["verdict"], v["blocks"]), (False, "NOT_REQUESTED", False), spec)
+
+    def test_the_runner_gates_on_it(self) -> None:
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$lookAssistVerdict = Get-DvLookAssistEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("if ($outcome -in @('PASS', 'FAIL') -and $lookAssistVerdict.blocks) {", runner)
+        self.assertIn("LOOK_ASSIST_NOT_HONOURED", runner)
 
 
 @requires_windows_pwsh
@@ -5974,6 +6044,169 @@ class VenueQuietValidSampleTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------------
+# BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1: on Bachelor the busy floor is FOREIGN (explorer, TextInputHost, Bloody7, other projects' guardians and sessions; MLV-owned CPU was
+# about 1 point in the BACHELOR-UNGATED-PRIVILEGED-LOAD-2 sample), so a leg waited the whole -MaxWaitSec (1800 s) for a floor that never dropped and then ran as COOLDOWN_UNMET anyway.
+# Now N (-ForeignFloorProbes, default 3, 0 = off) consecutive MEASURED busy probes whose top owners are not MLV's, with no downward trend (newest mean not below the first of the N by
+# more than -ForeignFloorTrendMarginPoints, default 2.0), print `FOREIGN_FLOOR ...` and then the SAME `COOLDOWN_UNMET mean=` line and exit 0. It is never QUIET.
+# The probe is a stub um-run.ps1 that answers call k with line k (the last repeats) of UMSTUB_SEQ, so the live loop is driven by synthetic probes; nothing is submitted.
+STUB_UM_RUN_SEQUENCE = r"""param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec)
+# test stub for tools\profiling\um-run.ps1: the n-th call (counted in UMSTUB_STATE) answers with line n of the UMSTUB_SEQ file verbatim, the last line repeating
+$lines = @(Get-Content -LiteralPath $env:UMSTUB_SEQ | Where-Object { $_ })
+$n = $(if (Test-Path -LiteralPath $env:UMSTUB_STATE) { [int](Get-Content -LiteralPath $env:UMSTUB_STATE) } else { 0 })
+Set-Content -LiteralPath $env:UMSTUB_STATE -Value ($n + 1)
+[pscustomobject]@{ exitCode = 0; stdout = 'VENUE_QUIET=' + $lines[[Math]::Min($n, $lines.Count - 1)] }
+"""
+FOREIGN_OWNERS = [("explorer", 17204, 3.66), ("textinputhost", 23596, 1.91), ("bloody7", 21612, 1.48), ("claude#4", 9120, 1.1), ("pwsh#3", 67876, 0.86)]
+
+
+def foreign_probe(mean, owners=FOREIGN_OWNERS, **extra) -> dict:
+    top = [{"instance": n, "pid": p, "percent": pc} for (n, p, pc) in owners]
+    return dict(V2_PROBE, samples=[mean, mean, mean], top_processes=top, **extra)
+
+
+@requires_windows_pwsh
+class VenueQuietForeignFloorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-quiet-foreign-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.tree = self.tmp / "tree"
+        self.dv = self.tree / "tools" / "profiling" / "dual-venue"
+        shutil.copytree(DV, self.dv, ignore=shutil.ignore_patterns("__pycache__"))
+        share = self.tmp / "share-bachelor"
+        (share / "inbox").mkdir(parents=True)
+        (share / "running").mkdir()
+        table = json.loads((self.dv / "venues.json").read_text(encoding="utf-8"))
+        table["venues"]["bachelor"]["agentShare"] = str(share)
+        table["venues"]["bachelor"]["agentRoot"] = str(share) + "-root"
+        (self.dv / "venues.json").write_text(json.dumps(table), encoding="utf-8")
+        (self.tree / "tools" / "profiling" / "um-run.ps1").write_text(STUB_UM_RUN_SEQUENCE, encoding="utf-8")
+        self.work = self.tmp / "work"
+
+    def gate(self, probes: list, max_wait: int = 8, *extra: str) -> subprocess.CompletedProcess:
+        import os
+        seq = self.tmp / "seq.jsonl"
+        seq.write_text("\n".join(json.dumps(p) for p in probes) + "\n", encoding="utf-8")
+        state = self.tmp / "state.txt"
+        state.unlink(missing_ok=True)
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                               "-WorkDir", str(self.work), "-MaxWaitSec", str(max_wait), "-RecheckSec", "1", *extra],
+                              capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_SEQ=str(seq), UMSTUB_STATE=str(state)))
+
+    @staticmethod
+    def probe_lines(proc: subprocess.CompletedProcess) -> int:
+        return len(re.findall(r"(?m)^PROBE venue-quiet-probe-", proc.stdout))
+
+    def assert_waited_the_whole_cooldown(self, proc: subprocess.CompletedProcess, min_probes: int = 5) -> None:
+        text = proc.stdout + proc.stderr
+        self.assertEqual(proc.returncode, 0, text)
+        self.assertNotIn("FOREIGN_FLOOR", proc.stdout, text)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=")
+        self.assertGreaterEqual(self.probe_lines(proc), min_probes, text)
+
+    def test_three_flat_busy_probes_with_foreign_owners_exit_early_as_foreign_floor_then_cooldown_unmet(self) -> None:
+        proc = self.gate([foreign_probe(35.0)], 20)
+        out = proc.stdout
+        self.assertEqual(proc.returncode, 0, out + proc.stderr)
+        m = re.search(r"(?m)^FOREIGN_FLOOR owners=(\S+) floorMean=(\d+\.\d)% waitedSec=(\d+) probes=(\d+)$", out)
+        self.assertIsNotNone(m, out)
+        self.assertEqual(m.group(1), "explorer:17204,textinputhost:23596,bloody7:21612", "the top 3 owners, name:pid, in rank order; pwsh (the probe's own shell) is never an owner")
+        self.assertEqual(m.group(2), "35.0")
+        self.assertEqual(m.group(4), "3")
+        self.assertLessEqual(int(m.group(3)), 8, "the wait ends after probe 3, far below -MaxWaitSec 20")
+        self.assertEqual(self.probe_lines(proc), 3, out)
+        self.assertRegex(out, r"(?m)^COOLDOWN_UNMET mean=35\.0% threshold=20(\.0)?% waitedSec=\d+$", "the SAME verdict line callers parse today")
+        self.assertLess(out.index("FOREIGN_FLOOR"), out.index("COOLDOWN_UNMET mean="), "the typed line comes first, the verdict line stays the last word")
+        self.assertNotRegex(out, r"(?m)^QUIET ", "an early exit is never QUIET")
+        self.assertRegex(out, r"(?m)^  attr proc explorer pid=17204 ", "the attribution of the last probe still follows the verdict")
+
+    def test_a_falling_floor_keeps_waiting_as_today(self) -> None:
+        self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(m) for m in (99, 92, 85, 78, 71, 64, 57, 50, 43, 36)]))
+
+    def test_an_mlv_owned_top_owner_keeps_waiting_as_today(self) -> None:
+        owners = [("explorer", 17204, 3.66), ("mlvapp#1", 4040, 3.0), ("textinputhost", 23596, 1.91), ("bloody7", 21612, 1.48)]
+        self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(35.0, owners)]))
+
+    def test_the_agent_and_um_run_count_as_mlv_owned_too(self) -> None:
+        for name in ("mlv-agent", "ultra-magnus-agent", "um-run"):
+            with self.subTest(name=name):
+                owners = [(name, 4040, 3.0), ("explorer", 17204, 2.0), ("textinputhost", 23596, 1.9), ("bloody7", 21612, 1.4)]
+                self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(35.0, owners)], 6), 4)
+
+    def test_an_mlv_row_below_the_top_three_foreign_owners_does_not_block(self) -> None:
+        owners = [("explorer", 17204, 3.66), ("textinputhost", 23596, 1.91), ("bloody7", 21612, 1.48), ("mlvapp", 4040, 0.2)]
+        proc = self.gate([foreign_probe(35.0, owners)], 20)
+        self.assertIn("FOREIGN_FLOOR owners=explorer:17204,textinputhost:23596,bloody7:21612 ", proc.stdout)
+
+    def test_a_quiet_probe_is_quiet_and_never_a_foreign_floor(self) -> None:
+        proc = self.gate([foreign_probe(5.0)])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% ")
+        self.assertNotIn("FOREIGN_FLOOR", proc.stdout)
+        self.assertNotIn("COOLDOWN_UNMET", proc.stdout)
+        proc = self.gate([foreign_probe(35.0), foreign_probe(35.0), foreign_probe(5.0)])
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% ")
+        self.assertNotIn("FOREIGN_FLOOR", proc.stdout, "two busy probes are below the default three")
+
+    def test_foreign_floor_probes_zero_is_the_old_behaviour(self) -> None:
+        self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(35.0)], 8, "-ForeignFloorProbes", "0"))
+
+    def test_a_larger_probe_count_waits_for_that_many(self) -> None:
+        proc = self.gate([foreign_probe(35.0)], 20, "-ForeignFloorProbes", "5")
+        self.assertRegex(proc.stdout, r"(?m)^FOREIGN_FLOOR owners=\S+ floorMean=35\.0% waitedSec=\d+ probes=5$")
+        self.assertEqual(self.probe_lines(proc), 5, proc.stdout)
+
+    def test_an_unreadable_probe_is_still_exit_six_and_never_a_foreign_floor(self) -> None:
+        unreadable = dict(foreign_probe(35.0), samples=[35.0, None, 35.0])
+        proc = self.gate([unreadable])
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=")
+        self.assertNotIn("FOREIGN_FLOOR", proc.stdout)
+        # busy, busy, then unreadable for the rest: the FINAL decision is UNKNOWN, so exit 6 and no early exit
+        proc = self.gate([foreign_probe(35.0), foreign_probe(35.0), unreadable], 6)
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertNotIn("FOREIGN_FLOOR", proc.stdout)
+
+    def test_an_unreadable_probe_resets_the_consecutive_count(self) -> None:
+        unreadable = dict(foreign_probe(35.0), samples=[35.0, None, 35.0])
+        proc = self.gate([foreign_probe(35.0), foreign_probe(35.0), unreadable, foreign_probe(35.0)], 20)
+        self.assertRegex(proc.stdout, r"FOREIGN_FLOOR .* probes=3")
+        self.assertEqual(self.probe_lines(proc), 6, "busy x2, unknown, then busy x3 consecutive: fires on probe 6, not probe 3")
+
+    def test_a_v1_probe_that_names_no_owner_keeps_waiting(self) -> None:
+        self.assert_waited_the_whole_cooldown(self.gate([dict(V1_PROBE, samples=[35.0, 35.0, 35.0])]))
+        self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(35.0, [])]))
+        self.assert_waited_the_whole_cooldown(self.gate([foreign_probe(35.0, [("pwsh", 1, 2.0), ("powershell#2", 2, 1.0)])]))
+
+    def test_the_trend_margin_is_exact(self) -> None:
+        # 50 -> 48.0: a drop of exactly 2.0 is NOT more than the margin, so probe 3 fires
+        proc = self.gate([foreign_probe(50.0), foreign_probe(49.0), foreign_probe(48.0)], 20)
+        self.assertEqual(self.probe_lines(proc), 3, proc.stdout)
+        self.assertIn("FOREIGN_FLOOR ", proc.stdout)
+        # 50 -> 47.9: a drop of 2.1 is a downward trend; the window slides and fires on probe 4 (48.5, 47.9, 47.9)
+        proc = self.gate([foreign_probe(50.0), foreign_probe(48.5), foreign_probe(47.9)], 20)
+        self.assertEqual(self.probe_lines(proc), 4, proc.stdout)
+        self.assertIn("FOREIGN_FLOOR ", proc.stdout)
+        # a rising floor is not falling
+        proc = self.gate([foreign_probe(30.0), foreign_probe(40.0), foreign_probe(50.0)], 20)
+        self.assertEqual(self.probe_lines(proc), 3, proc.stdout)
+
+    def test_a_wider_margin_parameter_is_honoured(self) -> None:
+        proc = self.gate([foreign_probe(50.0), foreign_probe(48.5), foreign_probe(47.9)], 20, "-ForeignFloorTrendMarginPoints", "5")
+        self.assertEqual(self.probe_lines(proc), 3, proc.stdout)
+
+    def test_the_header_documents_the_foreign_floor_line_the_parameters_and_the_unchanged_exit_codes(self) -> None:
+        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        header = text.split("[CmdletBinding", 1)[0]
+        for needle in ("FOREIGN_FLOOR owners=<name:pid", "floorMean=", "-ForeignFloorProbes", "-ForeignFloorTrendMarginPoints", "never QUIET", "COOLDOWN_UNMET"):
+            self.assertIn(needle, header)
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertEqual(len(re.findall(r"\bexit 6\b", code)), 1, "exit 6 stays reserved for the UNKNOWN verdict")
+        self.assertEqual(len(re.findall(r"\bexit 0\b", code)), 2, "offline decision + the one verdict exit: the early exit adds no exit of its own")
+        self.assertNotRegex(code, r"(?m)^\s*Write-Gate \"QUIET", "no QUIET line outside the verdict")
+
+
+# ---------------------------------------------------------------------------------------------------
 class LegSpecSchemaTests(unittest.TestCase):
     def setUp(self) -> None:
         try:
@@ -6011,7 +6244,25 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertEqual(pace[key], cell[key], f"{rel}: {key}")
             self.assertEqual(pace.get("acceptedEffectiveScale"), cell.get("acceptedEffectiveScale"), f"{rel}: declares its cell's CUDA texture-route clamp")
         self.assertEqual(sorted(json.loads((DV / rel).read_text(encoding="utf-8"))["legId"] for rel in PACE_LEGS),
-                         sorted(["m16-1243-pace-cinematic-fullscreen-s4", "m16-1243-pace-cinematic-fullscreen-s2", "m16-1243-pace-cinematic-windowed-s4"]))
+                         sorted(["m16-1243-pace-cinematic-fullscreen-s4", "m16-1243-pace-cinematic-fullscreen-s2", "m16-1243-pace-cinematic-windowed-s4",
+                                 "m16-1243-pace-cinematic-fullscreen-s1", "m16-1243-pace-cinematic-windowed-s1", "m16-1243-pace-cinematic-windowed-s2"]))
+
+    def test_each_cpu_reduced_pace_leg_is_its_cpu_reduced_cell_without_the_contact_sheet(self) -> None:
+        """LOOK-LEG-PACE-TWIN-COVERAGE-1: a cpu-reduced pace twin runs its cpu-reduced look leg (same display mode, scale, playbackProcessing receipt,
+        cpu only, same criteria) as a SPEED leg with Look Assist forced at the cell's flavor, so it takes no contact sheet inside the timed Play."""
+        self.assertEqual(len(CPU_REDUCED_PACE_LEGS), len(CPU_REDUCED_LEGS))
+        for rel in CPU_REDUCED_PACE_LEGS:
+            pace = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.jsonschema.validate(pace, self.schema)
+            cell = json.loads((DV / "legs" / f"m16-1243-cpu-reduced-{pace['displayMode']}-s{pace['scaleFactor']}.json").read_text(encoding="utf-8"))
+            self.assertEqual(pace["legType"], "speed", rel)
+            self.assertNotIn("look", pace, rel)
+            self.assertEqual(pace["legId"], "m16-1243-pace-cinematic-cpu-reduced-" + rel.rsplit("cpu-reduced-", 1)[1][:-len(".json")], rel)
+            self.assertEqual(pace["backends"], ["cpu"], rel)
+            self.assertEqual(pace["generatorArgs"]["playbackProcessing"], "receipt", rel)
+            self.assertEqual(pace["generatorArgs"], dict(cell["generatorArgs"], forceLookAssist=True, lookFlavor=cell["look"]["lookFlavor"]), rel)
+            for key in ("clipId", "playSeconds", "backends", "scaleFactor", "displayMode", "timeouts", "criteria"):
+                self.assertEqual(pace[key], cell[key], f"{rel}: {key}")
 
     def test_the_lookahead_leg_is_the_owner_shape_pace_leg_at_depth_3(self) -> None:
         """PLAYBACK-BACHELOR-PRESENT-JITTER-1: the lookahead A/B's depth-3 arm differs from the owner-shape pace leg only in its legId and
@@ -6208,7 +6459,7 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
+                self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
             elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
@@ -6402,6 +6653,95 @@ class LegSpecSchemaTests(unittest.TestCase):
         bad = dict(spec, backends=["cuda", "vulkan"])
         with self.assertRaises(self.jsonschema.ValidationError):
             self.jsonschema.validate(bad, self.schema)
+
+
+# LOOK-LEG-PACE-TWIN-COVERAGE-1: a look leg takes contact-sheet frame grabs DURING the timed Play, so it cannot support an absolute fps / drop / jitter / pace
+# claim; the claim needs the look leg's capture-free pace twin (a speed leg that forces Look Assist at the same clip, display, scale, flavor and condition).
+# A look leg with no twin must be listed here with the reason it has none; the reason is one line. The census that produced the list (KEY-PROMPT-LOOK-LEG-
+# FPS-CAPTURE-FREE-ARM-1 r1, re-run on fork/master 4cf92c33) found 23 untwinned look legs; this card twinned the 9 that merged playback PRs cite for absolute
+# figures (the display matrix cells fullscreen s1, windowed s1 and windowed s2 -- which also cover the s1 identity and miss-dump diagnostics -- and the four
+# cpu-reduced cells) and lists the other 14.
+NO_PACE_TWIN_BY_DESIGN = {
+    **{f"m16-1243-display-{mode}-s{scale}-vsync1": "swapInterval 1 A/B arm; no merged PR cites an absolute figure from it, so a swapInterval 1 pace twin waits for the first PR that does"
+       for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)},
+    "m16-1243-look": "Classic flavor-parity contact-sheet leg (also a supplementary row of the nightly baseline); pace claims use the Cinematic display-matrix twins",
+    "m16-1243-look-scale2": "Classic flavor-parity contact-sheet leg at scale 2; pace claims use the Cinematic display-matrix twins",
+    "m16-1243-look-film": "Film flavor-parity contact-sheet leg; no merged PR cites an absolute figure from it",
+    "m16-1243-look-scale2-film": "Film flavor-parity contact-sheet leg at scale 2; no merged PR cites an absolute figure from it",
+    "m16-1243-look-scale2-vision50d": "Vision50d flavor-parity contact-sheet leg at scale 2; no merged PR cites an absolute figure from it",
+    **{f"m16-1243-look-scale2-{flavor}-agxoff": "carries a look receipt (agx-off.marxml) that a speed leg cannot carry, so no speed leg can be the same condition"
+       for flavor in ("cinematic", "film", "vision50d")},
+}
+
+
+def find_capture_free_pace_twin(look_spec: dict, specs: dict) -> str | None:
+    """The legId of a pace twin of `look_spec` among `specs` ({legId: spec}), else None. A twin is a SPEED leg that forces Look Assist at the look leg's
+    flavor, is paced, and matches its clip, display mode (absent = fullscreen), scale and condition, over a backend set that covers the look leg's. Condition =
+    generatorArgs minus the keys that do not change what is timed: the quiescence gate and telemetry arm, the speed side's forceLookAssist / lookFlavor and the
+    look side's diagnostics (firstPresentCapture, presentTrace, warmReuseMissDump). A look leg that carries a look receipt has no twin: a speed leg cannot."""
+    neutral = {"cpuQuiescenceThresholdPercent", "telemetryArm"}
+    look_diag = {"firstPresentCapture", "presentTrace", "warmReuseMissDump"}
+    speed_only = {"forceLookAssist", "lookFlavor"}
+    look = look_spec.get("look", {})
+    if "receipt" in look:
+        return None
+    want = {k: v for k, v in look_spec.get("generatorArgs", {}).items() if k not in neutral | look_diag}
+    for leg_id, spec in sorted(specs.items()):
+        args = spec.get("generatorArgs", {})
+        if spec.get("legType") != "speed" or args.get("forceLookAssist") is not True or args.get("unpaced"):
+            continue
+        if args.get("lookFlavor") != look.get("lookFlavor"):
+            continue
+        if any(spec.get(k) != look_spec.get(k) for k in ("clipId", "scaleFactor")) or spec.get("displayMode", "fullscreen") != look_spec.get("displayMode", "fullscreen"):
+            continue
+        if not set(look_spec["backends"]) <= set(spec["backends"]):
+            continue
+        if {k: v for k, v in args.items() if k not in neutral | speed_only} == want:
+            return leg_id
+    return None
+
+
+class LookLegPaceTwinCoverageTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.specs = {}
+        for path in sorted((DV / "legs").glob("*.json")):
+            spec = json.loads(path.read_text(encoding="utf-8"))
+            self.specs[spec["legId"]] = spec
+        self.looks = {k: v for k, v in self.specs.items() if v["legType"] == "look"}
+
+    def test_every_look_leg_has_a_capture_free_pace_twin_or_a_by_design_entry(self) -> None:
+        missing = sorted(k for k, v in self.looks.items() if find_capture_free_pace_twin(v, self.specs) is None and k not in NO_PACE_TWIN_BY_DESIGN)
+        self.assertEqual(missing, [], "look legs with no capture-free pace twin and no NO_PACE_TWIN_BY_DESIGN entry: add the twin (a speed leg with generatorArgs.forceLookAssist "
+                                     "true and the same clip, display, scale, flavor and condition) or list the leg with a one-line reason")
+
+    def test_the_by_design_list_names_only_untwinned_look_legs_and_gives_a_reason(self) -> None:
+        for leg_id, reason in NO_PACE_TWIN_BY_DESIGN.items():
+            self.assertIn(leg_id, self.looks, f"{leg_id}: not a look leg under legs/ (stale entry)")
+            self.assertIsNone(find_capture_free_pace_twin(self.looks[leg_id], self.specs), f"{leg_id}: has a pace twin now, so drop it from the by-design list")
+            self.assertTrue(reason.strip() and "\n" not in reason and len(reason) >= 20, f"{leg_id}: the reason must be one real line")
+
+    def test_the_twin_rule_accepts_a_matching_speed_leg_and_rejects_each_mismatch(self) -> None:
+        look = {"legId": "x-look", "legType": "look", "clipId": "C", "scaleFactor": 2, "displayMode": "windowed", "backends": ["cuda", "cpu"],
+                "generatorArgs": {"telemetryArm": "LIGHT", "cpuQuiescenceThresholdPercent": 95, "presentTrace": True}, "look": {"lookFlavor": "cinematic"}}
+        twin = {"legId": "x-pace", "legType": "speed", "clipId": "C", "scaleFactor": 2, "displayMode": "windowed", "backends": ["cuda", "cpu"],
+                "generatorArgs": {"telemetryArm": "HEAVY", "forceLookAssist": True, "lookFlavor": "cinematic"}}
+        self.assertEqual(find_capture_free_pace_twin(look, {"x-pace": twin}), "x-pace")
+        for name, change in (("another clip", {"clipId": "D"}), ("another scale", {"scaleFactor": 4}), ("another display", {"displayMode": "fullscreen"}),
+                             ("a look leg, not a speed leg", {"legType": "look"}), ("backends that do not cover the look leg", {"backends": ["cpu"]}),
+                             ("look assist not forced", {"generatorArgs": {"lookFlavor": "cinematic"}}),
+                             ("another flavor", {"generatorArgs": {"forceLookAssist": True, "lookFlavor": "film"}}),
+                             ("unpaced", {"generatorArgs": {"forceLookAssist": True, "lookFlavor": "cinematic", "unpaced": True}}),
+                             ("another swap interval", {"generatorArgs": {"forceLookAssist": True, "lookFlavor": "cinematic", "swapInterval": 1}}),
+                             ("another playback processing", {"generatorArgs": {"forceLookAssist": True, "lookFlavor": "cinematic", "playbackProcessing": "receipt"}})):
+            self.assertIsNone(find_capture_free_pace_twin(look, {"x-pace": dict(twin, **change)}), name)
+        receipt = dict(look, look={"lookFlavor": "cinematic", "receipt": "look-receipts/agx-off.marxml"})
+        self.assertIsNone(find_capture_free_pace_twin(receipt, {"x-pace": twin}), "a look receipt cannot be carried by a speed leg")
+        self.assertIsNone(find_capture_free_pace_twin(look, {}), "no speed legs at all")
+
+    def test_the_display_matrix_cells_and_the_cpu_reduced_cells_are_all_twinned(self) -> None:
+        for leg_id in (*(rel[len("legs/"):-len(".json")] for rel in (*DISPLAY_MATRIX_LEGS, *CPU_REDUCED_LEGS, *PTRACE_LEGS, *IDENTITY_LEGS, *MISSDUMP_LEGS)),
+                       "m16-1243-look-cinematic", "m16-1243-look-scale2-cinematic"):
+            self.assertIsNotNone(find_capture_free_pace_twin(self.looks[leg_id], self.specs), leg_id)
 
 
 @requires_windows_pwsh
@@ -6820,6 +7160,12 @@ function New-VisPng([string]$Path, [int]$Seed, [int]$Chrome, [int]$Bias, [bool]$
     $g.Dispose(); $b.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png); $b.Dispose()
 }
 """
+# The file's requires_windows_pwsh idiom, with the reason spelled out for a test that drives Read-DvVisualCaptures over real PNGs: New-VisPng above,
+# the reader's pixel measure and New-DvVisualStrip all use System.Drawing (GDI+), which .NET supports only on Windows. Off Windows the reader
+# measures no frame and cannot compose the strip, so it says NOT_CAPTURED -- the venue's fail-closed answer, not the verdict under test (hosted
+# Tests run 40111006101, ubuntu shard 3/4). Get-DvVisualVerdict takes counts, not pixels, so its tests stay unguarded and run on every OS.
+requires_windows_imaging = unittest.skipIf(PWSH is None or sys.platform != "win32",
+                                           "needs pwsh on Windows: the fixture PNGs, the visual reader's pixel measure and its strip composer use System.Drawing")
 
 
 def write_visual_captures(dest: Path, mode: str = "ok") -> None:
@@ -6829,28 +7175,67 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     frozen-unknown (it records nothing), frozen-identical (it records "identical": a static clip), noviewport (a ticking-chrome frozen picture whose
     visual.json carries no viewport rectangle), frozen-partial (frozen + "differ", but play frame 5 alone carries no viewport rectangle),
     frozen-upper-differ / frozen-upper-identical (the same record in the wrong case: "DIFFER" / "IDENTICAL"), partial-ok (six distinct pictures, but play
-    frame 5 alone carries no viewport rectangle: a plain OK with a not-judged note)."""
+    frame 5 alone carries no viewport rectangle: a plain OK with a not-judged note). PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 adds two modes whose stop
+    entry carries the app's binding fields: lagged (the stop capture shows an older picture than its label names: painted_serial != serial,
+    label_bound false) and bound (the unforced stop-unbound.png shows the older picture; the forced, bound stop.png matches paused.png).
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 modes (a build that pairs each forced play capture with an unforced play-unbound-<k>.png, and binds the
+    paused capture too): bound also carries the paused capture's binding (label_bound true) and every bound entry its label_bound_basis;
+    bound-paused-unbound (paused label_bound false) and bound-paused-missing (paused without binding fields); paired-ok (unforced and forced play
+    frames both move); masked (the unforced play frames show ONE picture over a known-differ source while the forced ones move: the frozen display
+    the force-paint used to hide). r5 (Grok G1/G3 on #456): the paired modes model the r3 order -- the unforced captures are taken half a tail
+    after the forced ones, so on a healthy display (paired-ok) unforced k shows a LATER frame than forced k, never the same picture; masked shows
+    the last forced paint (play 5's picture) on every unforced capture; partial-freeze (over a known-differ source) shows three moving unforced
+    pictures and then repeats the third, the display's own paint stopping part-way through the unforced half."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     calls = []
     frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport")
+    paired = mode in ("paired-ok", "masked", "partial-freeze")
+    bound = mode in ("bound", "bound-paused-unbound", "bound-paused-missing")
     viewport = None if mode == "noviewport" else VIEWPORT
     source_difference = {"frozen": "differ", "frozen-partial": "differ", "frozen-identical": "identical",
-                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL"}.get(mode)
+                         "frozen-upper-differ": "DIFFER", "frozen-upper-identical": "IDENTICAL", "masked": "differ", "partial-freeze": "differ"}.get(mode)
     for k in range(6):
         seed = 1 if frozen else k
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
-    calls.append(f"New-VisPng '{dest / 'stop.png'}' 5 120 0 ${'true' if mode == 'blank' else 'false'}")
+        if paired:
+            # (seed, bias): bias 30 marks a frame of the unforced half (later than every forced capture's frame); masked repeats forced play 5's paint
+            unforced_seed, unforced_bias = {"masked": (5, 0), "partial-freeze": (min(k, 2), 30)}.get(mode, (k, 30))
+            calls.append(f"New-VisPng '{dest / f'play-unbound-{k}.png'}' {unforced_seed} {60 + k * 10} {unforced_bias} $false")
+    if bound:
+        calls.append(f"New-VisPng '{dest / 'stop-unbound.png'}' 5 120 40 $false")
+    calls.append(f"New-VisPng '{dest / 'stop.png'}' 5 120 {40 if mode == 'lagged' else 0} ${'true' if mode == 'blank' else 'false'}")
     calls.append(f"New-VisPng '{dest / 'paused.png'}' 5 120 {40 if mode == 'diverge' else 0} ${'true' if mode == 'blank' else 'false'}")
     proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
     assert proc.returncode == 0, proc.stdout + proc.stderr
     frames = [{"kind": "play", "index": k, "file": f"play-{k}.png", "display_frame": 600 + 2 * k, "serial": 900 + k, "play_active": True,
                "tail_elapsed_ms": 250 + 500 * k, "capture_ms": 40.0, "viewport": (None if mode in ("frozen-partial", "partial-ok") and k == 5 else viewport), "saved": True, "reason": ""}
               for k in range(6)]
-    frames.append({"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""})
-    frames.append({"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
-                   "viewport": viewport, "saved": True, "reason": ""})
+    if paired:
+        # r3 order and shape: the six forced play captures across the first half of the tail, then the six unforced ones across the second, each
+        # entry carrying forced_paints_before (see write_stateful_visual_captures for a surface the forced paints change)
+        for k, f in enumerate(frames):
+            f.update({"tail_elapsed_ms": 125 + 250 * k, "forced_paints_before": k})
+        frames += [{"kind": "play_unbound", "index": k, "file": f"play-unbound-{k}.png", "display_frame": 612 + 2 * k, "serial": 906 + k, "play_active": True,
+                    "tail_elapsed_ms": 1625 + 250 * k, "capture_ms": 40.0, "viewport": viewport, "saved": True, "reason": "", "forced_paints_before": 6}
+                   for k in range(6)]
+    if bound:
+        frames.append({"kind": "stop_unbound", "index": 0, "file": "stop-unbound.png", "display_frame": 612, "serial": 912, "painted_serial": 911,
+                       "painted_serial_valid": True, "label_bound": False, "label_bound_basis": "gl_viewport_paint", "play_active": False, "viewport": viewport,
+                       "saved": True, "reason": ""})
+    stop = {"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""}
+    if mode == "lagged" or bound:
+        stop.update({"serial": 912, "painted_serial": 911 if mode == "lagged" else 912, "painted_serial_valid": True, "label_bound": bound})
+    if bound:
+        stop["label_bound_basis"] = "pixmap_item_by_construction"
+    frames.append(stop)
+    paused = {"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
+              "viewport": viewport, "saved": True, "reason": ""}
+    if mode in ("bound", "bound-paused-unbound"):
+        paused.update({"serial": 913, "painted_serial": 913 if mode == "bound" else 912, "painted_serial_valid": True, "label_bound": mode == "bound",
+                       "label_bound_basis": "pixmap_item_by_construction"})
+    frames.append(paused)
     visual = {"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
               "tail_begin_utc": "2026-10-13T22:00:00.000Z", "tail_end_utc": "2026-10-13T22:00:03.100Z",
               "frames": frames, "frames_written": 8, "error": ""}
@@ -6859,6 +7244,222 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
     (dest / "visual-capture-request.json").write_text(json.dumps({"schema": "mlv-app/visual-capture-request/v1", "requested": True, "probe": "supported",
                                                                   "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
+
+
+def stateful_visual_model(order: str, natural: str, ordinal: bool = True, record_source: bool = True,
+                          observer: tuple[int, ...] = (), no_viewport: tuple[int, ...] = ()) -> tuple[list[tuple[str, int, int, int]], dict, dict]:
+    """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): a STATEFUL model of the window surface the captures print. A forced capture paints
+    the frame its label names onto the surface, then prints it, so it CHANGES what the next unforced capture sees; an unforced capture prints the
+    surface as it stands. Before every capture the display's own (natural) paint lands the current frame only while it works. natural: healthy
+    (always), stuck (never: only a forced capture changes the surface), partial (until the fourth unforced play capture, then never) or static
+    (always, but every source frame is one picture: a static clip the app records as identical). order is the app's capture order: interleaved (the
+    r2 build b35aa308: unforced k, then forced k, in each slice) or forced-first (r3: the six forced play captures across the first half of the tail,
+    then the six unforced ones across the second, then stop_unbound, stop). ordinal writes each entry's forced_paints_before (an r3 build); without
+    it the entries have the r2 shape. record_source=False leaves source_difference out of visual.json (nothing records whether the source frames
+    differ). r5: observer lists unforced play indexes whose entry records one forced paint more than the model counted (the reader must leave them
+    unjudged); no_viewport lists unforced play indexes whose entry carries no viewport rectangle.
+    Pure (r5, Dot f589cdbf): no file and no pwsh. Returns (pictures, visual, unforced): one (file, seed, chrome, bias) per capture for New-VisPng,
+    the visual.json body, and the unforced play pictures the model produced (index -> picture) for the trace assertions."""
+    if order == "interleaved":
+        plays = [op for k in range(6) for op in (("play_unbound", k, 240 + 500 * k, 600 + 2 * k), ("play", k, 250 + 500 * k, 600 + 2 * k))]
+        last = 610
+    else:
+        plays = [("play", k, 125 + 250 * k, 600 + k) for k in range(6)] + [("play_unbound", k, 1625 + 250 * k, 606 + k) for k in range(6)]
+        last = 611
+    ops = plays + [("stop_unbound", 0, 3000, last + 1), ("stop", 0, 3000, last + 1), ("paused_unbound", 0, 3400, last + 1), ("paused", 0, 3400, last + 1)]
+    cut = next(t for kind, k, t, _ in ops if kind == "play_unbound" and k == 3)   # partial: the natural paint stops landing here
+
+    def picture(label: int) -> tuple[int, int]:
+        return (2, 0) if natural == "static" else (label % 7, ((label - 600) // 7) * 30)
+
+    surface = (3, 120)   # what was on screen before the tail: no frame's picture
+    forced_paints = 0
+    pictures, frames, unforced = [], [], {}
+    for i, (kind, k, t, label) in enumerate(ops):
+        if natural in ("healthy", "static") or (natural == "partial" and t < cut):
+            surface = picture(label)
+        forced = not kind.endswith("_unbound")
+        if forced:
+            surface = picture(label)
+        file = f"{kind.replace('_', '-')}-{k}.png" if kind.startswith("play") else f"{kind.replace('_', '-')}.png"
+        pictures.append((file, surface[0], 60 + 5 * i, surface[1]))
+        if kind == "play_unbound":
+            unforced[k] = surface
+        entry = {"kind": kind, "index": k, "file": file, "display_frame": label, "serial": 900 + label - 600, "play_active": kind.startswith("play"),
+                 "tail_elapsed_ms": t, "capture_ms": 40.0, "viewport": None if kind == "play_unbound" and k in no_viewport else VIEWPORT,
+                 "saved": True, "reason": ""}
+        if kind in ("stop", "paused"):
+            entry.update({"painted_serial": 900 + label - 600, "painted_serial_valid": True, "label_bound": True, "label_bound_basis": "gl_window_paint"})
+        if kind == "paused":
+            entry.update({"settled": True, "settled_frame": label})
+        if ordinal:
+            entry["forced_paints_before"] = forced_paints + (1 if kind == "play_unbound" and k in observer else 0)
+        frames.append(entry)
+        if forced:
+            forced_paints += 1
+    visual = {"schema": "mlv-app/visual-capture/v1", "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
+              "tail_begin_utc": "2026-10-13T22:00:00.000Z", "tail_end_utc": "2026-10-13T22:00:03.100Z", "frames": frames, "frames_written": len(frames),
+              "error": ""}
+    if record_source:
+        visual["source_difference"] = "identical" if natural == "static" else "differ"
+    return pictures, visual, unforced
+
+
+def write_stateful_visual_captures(dest: Path, order: str, natural: str, ordinal: bool = True, record_source: bool = True,
+                                   observer: tuple[int, ...] = (), no_viewport: tuple[int, ...] = ()) -> dict:
+    """stateful_visual_model's captures written as the job publishes them: one PNG per capture (New-VisPng, through pwsh), visual.json and the job's
+    visual-capture-request.json. Returns the model's unforced play pictures (index -> picture)."""
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    pictures, visual, unforced = stateful_visual_model(order, natural, ordinal, record_source, observer, no_viewport)
+    calls = [f"New-VisPng '{dest / file}' {seed} {chrome} {bias} $false" for file, seed, chrome, bias in pictures]
+    proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
+    (dest / "visual-capture-request.json").write_text(json.dumps({"schema": "mlv-app/visual-capture-request/v1", "requested": True, "probe": "supported",
+                                                                  "reason": None, "forwarded": True, "presentMonWindowEndUtc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
+    return unforced
+
+
+class VisualCaptureObserverPaintTests(unittest.TestCase):
+    """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2 on b35aa308): pairing each forced capture with an unforced one in the same slice does not
+    isolate the NEXT unforced capture from the forced paint. With the display's own paint stuck, unforced k+1 shows forced k's paint (trace: initial,
+    F0, F1, F2, F3, F4), so six distinct unforced pictures read as a moving display and neither FROZEN_DISPLAY nor the masking note fires. Driven by
+    write_stateful_visual_captures, whose surface each forced capture mutates. The tests that read real PNGs are requires_windows_imaging (r4); the
+    model's own trace (pure Python since r5: stateful_visual_model writes no file) and the count-only verdict gate run on every OS."""
+
+    def read(self, d: str, order: str, natural: str, ordinal: bool = True, record_source: bool = True,
+             observer: tuple[int, ...] = (), no_viewport: tuple[int, ...] = ()) -> tuple[dict, dict]:
+        art = Path(d) / "artifacts"
+        unforced = write_stateful_visual_captures(art / "visual", order, natural, ordinal, record_source, observer, no_viewport)
+        proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                  "| ConvertTo-Json -Depth 8 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return unforced, out
+
+    def test_the_visual_model_reproduces_dots_trace_on_the_r2_interleaved_order(self) -> None:
+        # the model itself: on the r2 order with the natural paint stuck, unforced k+1 shows forced k's picture (no file, no pwsh: r5, Dot f589cdbf)
+        _, _, unforced = stateful_visual_model("interleaved", "stuck")
+        self.assertEqual([unforced[k] for k in range(6)], [(3, 120)] + [((600 + 2 * k) % 7, (2 * k // 7) * 30) for k in range(5)])
+        self.assertEqual(len(set(unforced.values())), 6, "six distinct unforced pictures over a frozen display")
+
+    def test_the_visual_model_traces_the_r3_order(self) -> None:
+        # r3 order: stuck shows forced play 5's paint on every unforced capture; partial moves three times, then repeats the third
+        pictures = {natural: stateful_visual_model("forced-first", natural)[2] for natural in ("stuck", "partial", "healthy")}
+        self.assertEqual(set(pictures["stuck"].values()), {(605 % 7, 0)})
+        self.assertEqual([pictures["partial"][k] for k in range(6)], [(4, 0), (5, 30), (6, 30), (6, 30), (6, 30), (6, 30)])
+        self.assertEqual(len(set(pictures["healthy"].values())), 6)
+        _, visual, _ = stateful_visual_model("forced-first", "partial", observer=(5,), no_viewport=(0,))
+        unforced = {f["index"]: f for f in visual["frames"] if f["kind"] == "play_unbound"}
+        self.assertEqual([unforced[k]["forced_paints_before"] for k in range(6)], [6, 6, 6, 6, 6, 7])
+        self.assertEqual([unforced[k]["viewport"] is None for k in range(6)], [True] + [False] * 5)
+
+    @requires_windows_imaging
+    def test_the_visual_reader_never_says_ok_over_unforced_captures_a_forced_paint_reached(self) -> None:
+        # the r2 build's interleaved order, with the r2 entry shape (no ordinal) and with an ordinal: either way some unforced play captures follow a
+        # forced paint, so they cannot show a frozen display; the runner judges only an interval no forced paint entered, and fails closed when that
+        # leaves fewer than two -- even over a healthy display, whose pictures it cannot tell from observer paints
+        for natural, ordinal in (("stuck", False), ("stuck", True), ("healthy", True), ("partial", True)):
+            with self.subTest(natural=natural, ordinal=ordinal), tempfile.TemporaryDirectory(prefix="vis-r2-order-") as d:
+                _, out = self.read(d, "interleaved", natural, ordinal)
+                self.assertNotEqual(out["verdict"], "OK", out["reason"])
+                self.assertEqual(out["verdict"], "VISUAL_ASSESSMENT_UNAVAILABLE", out["reason"])
+                self.assertEqual(out["frozenJudgedOn"], "play_unbound")
+                self.assertEqual((out["playFrames"], out["observerPaintedPlayFrames"]), (1 if ordinal else 0, 5 if ordinal else 6))
+                self.assertIn("forced paint", out["reason"])
+
+    @requires_windows_imaging
+    def test_the_visual_reader_says_frozen_when_the_natural_paint_is_stuck_on_the_r3_order(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-r3-stuck-") as d:
+            unforced, out = self.read(d, "forced-first", "stuck")
+            self.assertEqual(len(set(unforced.values())), 1, "every unforced capture shows the last forced paint")
+            self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+            self.assertEqual((out["frozenJudgedOn"], out["playFrames"], out["distinctContentHashes"], out["observerPaintedPlayFrames"]), ("play_unbound", 6, 1, 0))
+            self.assertIn("the force-paint would have masked this", out["reason"])
+            self.assertIs(out["stopUnboundObserverClean"], True)
+
+    @requires_windows_imaging
+    def test_the_visual_reader_says_ok_over_a_healthy_display_on_the_r3_order(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="vis-r3-healthy-") as d:
+            _, out = self.read(d, "forced-first", "healthy")
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertEqual((out["playFrames"], out["distinctContentHashes"], out["observerPaintedPlayFrames"], out["repeatedPlayFrames"]), (6, 6, 0, 0))
+            self.assertIs(out["stopUnboundObserverClean"], True)
+            self.assertEqual([f["forcedPaintsBefore"] for f in out["frames"] if f["kind"] == "play_unbound"], [6] * 6)
+
+    @requires_windows_imaging
+    def test_the_visual_reader_reports_a_partial_freeze_on_the_r3_order(self) -> None:
+        # the display's own paint stops landing at the fourth unforced capture: three unforced pictures repeat their predecessor while the app's label
+        # advanced. Not the whole-tail FROZEN_DISPLAY (three pictures differ); r5 (hub ruling, ACK 6388020454): over source frames known to differ it
+        # is PARTIAL_FREEZE -- never OK -- counted and surfaced
+        with tempfile.TemporaryDirectory(prefix="vis-r3-partial-") as d:
+            _, out = self.read(d, "forced-first", "partial")
+            self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+            self.assertEqual((out["playFrames"], out["distinctContentHashes"], out["repeatedPlayFrames"]), (6, 3, 3))
+            self.assertIn("3 of the 6 judged play frames repeat the picture before them", out["reason"])
+            self.assertIn("the display's own paint stopped landing for part of the tail", out["reason"], "the source frames are known to differ")
+            self.assertEqual(out["reason"].count("repeat the picture before them"), 1, "the verdict reason is not followed by the same repeat note")
+            self.assertIn("3 of the 6 unforced play captures repeat", out["repeatedPlayFramesNote"])
+
+    @requires_windows_imaging
+    def test_the_visual_reader_names_no_cause_for_a_repeat_over_unknown_source_content(self) -> None:
+        # r4 (Dot a5acb3c8, hub ACK 6386874544): the same repeats, but nothing records whether the source frames differ, so a repeat may be the
+        # source's own picture: the receipt says what it saw and does not name the display as the cause (r5: still a note on an OK block)
+        with tempfile.TemporaryDirectory(prefix="vis-r3-partial-unknown-") as d:
+            _, out = self.read(d, "forced-first", "partial", record_source=False)
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertEqual((out["sourceDifference"], out["distinctContentHashes"], out["repeatedPlayFrames"]), ("unknown", 3, 3))
+            self.assertIn("3 of the 6 unforced play captures repeat the picture before them while the app's label advanced", out["reason"])
+            self.assertIn("a possible partial freeze or repeated source pictures, not a proven cause", out["reason"])
+            self.assertNotIn("the display's own paint stopped landing", out["reason"])
+            self.assertEqual(out["repeatedPlayFramesNote"], out["reason"])
+
+    @requires_windows_imaging
+    def test_the_repeat_note_is_reported_whatever_reason_was_set_first(self) -> None:
+        # r5 (Grok G4 6386577997, G3 6386571526): the repeat note used to be set only when no earlier note held `reason`, so an observer-painted or
+        # viewport-unavailable note hid it and a half-tail freeze read as a plain OK note. repeatedPlayFramesNote carries it on its own; `reason`
+        # keeps its first-wins rule. (observer / no_viewport: unforced play indexes; see stateful_visual_model)
+        rows = [  # observer, no_viewport, the note that wins `reason`, judged, repeats, verdict over a known-differ source
+            ((5,), (), "1 unforced play frame(s) followed a forced paint the others did not and were not judged", 5, 2, "PARTIAL_FREEZE"),
+            ((), (0,), "1 saved play frame(s) have no usable viewport rectangle and were not judged", 5, 3, "PARTIAL_FREEZE"),
+            ((4, 5), (), "2 unforced play frame(s) followed a forced paint the others did not and were not judged", 4, 1, "OK"),   # one repeat alone: OK
+        ]
+        for observer, no_viewport, first_note, judged, repeats, known_verdict in rows:
+            for record_source in (False, True):
+                with self.subTest(observer=observer, no_viewport=no_viewport, record_source=record_source), \
+                        tempfile.TemporaryDirectory(prefix="vis-r5-repeat-note-") as d:
+                    _, out = self.read(d, "forced-first", "partial", record_source=record_source, observer=observer, no_viewport=no_viewport)
+                    self.assertEqual((out["playFrames"], out["repeatedPlayFrames"]), (judged, repeats))
+                    note = out["repeatedPlayFramesNote"]
+                    self.assertIsNotNone(note, out["reason"])
+                    self.assertTrue(note.startswith(f"{repeats} of the {judged} unforced play captures repeat the picture before them"), note)
+                    self.assertIn(first_note, out["reason"])
+                    if record_source:
+                        self.assertEqual((out["verdict"], out["counted"]), (known_verdict, True), out["reason"])
+                        self.assertIn("the display's own paint stopped landing for part of the tail", note)
+                    else:
+                        self.assertEqual(out["verdict"], "OK", out["reason"])
+                        self.assertTrue(out["reason"].startswith(first_note), "reason keeps its first-wins rule")
+                        self.assertNotIn(note, out["reason"], "the earlier note still holds reason; the repeat note is in its own field")
+                        self.assertIn("not a proven cause", note)
+
+    @requires_windows_imaging
+    def test_the_visual_reader_waives_a_repeated_source_on_the_r3_order(self) -> None:
+        # a static clip: the display paints, but every source frame is the same picture, and the app records the source frames as identical
+        with tempfile.TemporaryDirectory(prefix="vis-r3-static-") as d:
+            _, out = self.read(d, "forced-first", "static")
+            self.assertEqual((out["verdict"], out["counted"]), ("OK", True), out["reason"])
+            self.assertEqual((out["distinctContentHashes"], out["sourceDifference"], out["repeatedPlayFrames"]), (1, "known-identical", None))
+            self.assertIn("static clip", out["reason"])
+
+    def test_the_visual_gate_fails_closed_when_observer_paints_leave_fewer_than_two_judged_frames(self) -> None:
+        for judged, observer, verdict in ((1, 5, "VISUAL_ASSESSMENT_UNAVAILABLE"), (0, 6, "VISUAL_ASSESSMENT_UNAVAILABLE"), (6, 0, "OK")):
+            with self.subTest(judged=judged, observer=observer):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {judged} -DistinctContentHashes {judged} -AppDistinctDisplayFrames {judged} "
+                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 1.0 -SamePosition $true -ObserverPaintedPlayFrames {observer} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True))
 
 
 class GeneratorWarmUpIsOptInPerClassTests(unittest.TestCase):
@@ -7052,6 +7653,23 @@ class VisualCaptureVenueHelperTests(unittest.TestCase):
         self.assertEqual(out["B"], "& 'smoke.ps1' -AdditionalArgs @('--contact-sheet-dir', 'C:\\w\\cs', '--windowed', '--visual-capture-dir', 'C:\\w''x\\visual')")
         self.assertTrue(out["C"].startswith("ATTRCUDA_VISUAL_CAPTURE_ARGS_NOT_LAST"), out["C"])
 
+    def test_the_visual_publish_carries_the_unbound_stop_capture(self) -> None:
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: the first venue leg of a binding build wrote stop-unbound.png, and this publish filter
+        # dropped it, so the runner could not compute stopUnboundVsPausedMeanAbsDiff. Every capture the app names is published; nothing else.
+        with tempfile.TemporaryDirectory(prefix="vis-pub-") as d:
+            src = Path(d, "src")
+            src.mkdir()
+            Path(d, "pub").mkdir()
+            # (TIMING-2 r2: the unforced play captures, play-unbound-<k>.png, the frozen check is judged on, and paused-unbound.png are published too)
+            for name in ("play-0.png", "play-unbound-0.png", "stop-unbound.png", "stop.png", "paused-unbound.png", "paused.png", "visual.json", "stray.png",
+                         "stop-unbound.png.tmp", "play-unbound.png"):
+                Path(src, name).write_bytes(b"x")
+            proc = self.run_module(f"$pub = Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}'; "
+                                   "(Get-ChildItem -LiteralPath $pub -File | ForEach-Object Name | Sort-Object) -join ','")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines()[-1],
+                             "paused-unbound.png,paused.png,play-0.png,play-unbound-0.png,stop-unbound.png,stop.png,visual-capture-request.json,visual.json")
+
     def test_the_visual_tail_is_cut_off_the_presentmon_window_and_never_extends_it(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-pm-") as d:
             Path(d, "visual.json").write_text(json.dumps({"tail_begin_utc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
@@ -7148,11 +7766,13 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                   "-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true | ConvertTo-Json -Compress")
         self.assertEqual((proc.returncode, out["verdict"]), (0, "FROZEN_DISPLAY_SUSPECTED"), "ViewportUnavailablePlayFrames defaults to 0")
 
-    def visual_verdict(self, src, play, unavailable, distinct):
-        """One Get-DvVisualVerdict call over `play` judged (viewport) play frames; src None omits -SourceDifference (the default)."""
+    def visual_verdict(self, src, play, unavailable, distinct, repeats=None, extra=""):
+        """One Get-DvVisualVerdict call over `play` judged (viewport) play frames; src None omits -SourceDifference (the default); repeats None omits
+        -RepeatedPlayFrames (the default, 0)."""
         src_arg = f"-SourceDifference {src} " if src else ""
+        repeats_arg = f"-RepeatedPlayFrames {repeats} " if repeats is not None else ""
         proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames 6 "
-                                  f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true {src_arg}-ViewportUnavailablePlayFrames {unavailable} | ConvertTo-Json -Compress")
+                                  f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true {src_arg}{repeats_arg}{extra}-ViewportUnavailablePlayFrames {unavailable} | ConvertTo-Json -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return out
 
@@ -7166,11 +7786,16 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         self.assertIsNone(self.visual_verdict("known-differ", 6, 0, 6)["reason"])
 
     # Prevention (CoS #474): when a pure verdict function gains a verdict, add rows that pair it with EVERY verdict that sets counted = false, and say which wins.
-    # (source difference, judged play frames, play frames without a viewport, distinct, winner); each pair must show BOTH of its verdicts winning somewhere.
+    # (source difference, judged play frames, play frames without a viewport, distinct[, repeated play frames], winner); each pair must show BOTH of its
+    # verdicts winning somewhere.
     NEW_VISUAL_VERDICT_PAIRINGS = {
         ("FROZEN_DISPLAY_SUSPECTED", "FROZEN_DISPLAY"): [("unknown", 6, 0, 1, "FROZEN_DISPLAY_SUSPECTED"), ("known-differ", 6, 0, 1, "FROZEN_DISPLAY")],
         ("VISUAL_ASSESSMENT_UNAVAILABLE", "FROZEN_DISPLAY"): [("known-differ", 5, 1, 1, "FROZEN_DISPLAY"), ("known-differ", 1, 5, 1, "VISUAL_ASSESSMENT_UNAVAILABLE"),
                                                               ("known-differ", 0, 6, 0, "VISUAL_ASSESSMENT_UNAVAILABLE")],
+        # r5: one picture while the label advances is the whole-tail freeze (every judged frame after the first repeats); more than one picture with two or
+        # more repeats is the partial one
+        ("PARTIAL_FREEZE", "FROZEN_DISPLAY"): [("known-differ", 6, 0, 1, 5, "FROZEN_DISPLAY"), ("known-differ", 6, 0, 3, 3, "PARTIAL_FREEZE"),
+                                               ("known-differ", 5, 1, 2, 2, "PARTIAL_FREEZE")],
     }
 
     def test_every_new_visual_verdict_is_paired_with_every_excluding_verdict(self) -> None:
@@ -7178,16 +7803,38 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         body = text[text.index("function Get-DvVisualVerdict {"):text.index("function New-DvVisualStrip {")]
         excluding = set(re.findall(r"verdict = '([A-Z_]+)'; counted = \$false", body))
         self.assertTrue(excluding, "the verdict function names no counted = $false verdict (the pairing check lost its subject)")
-        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE"):
+        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE", "PARTIAL_FREEZE"):
             for ex in sorted(excluding):
                 with self.subTest(new=new, excluding=ex):
                     rows = self.NEW_VISUAL_VERDICT_PAIRINGS.get((new, ex))
                     self.assertTrue(rows, f"add rows pairing {new} with the excluding verdict {ex} to NEW_VISUAL_VERDICT_PAIRINGS")
                     self.assertEqual({r[-1] for r in rows}, {new, ex}, "both verdicts of the pair must win somewhere")
-                    for src, play, unavailable, distinct, winner in rows:
-                        out = self.visual_verdict(src, play, unavailable, distinct)
-                        self.assertEqual(out["verdict"], winner, f"{src} play={play} unavailable={unavailable} distinct={distinct}: {out['reason']}")
+                    for *args, winner in rows:
+                        out = self.visual_verdict(*args)
+                        self.assertEqual(out["verdict"], winner, f"{args}: {out['reason']}")
         self.assertEqual({k[1] for k in self.NEW_VISUAL_VERDICT_PAIRINGS}, excluding, "a pairing names a verdict that no longer excludes")
+
+    def test_the_visual_gate_says_partial_freeze_for_repeats_over_source_frames_known_to_differ(self) -> None:
+        """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5 (hub ruling, ACK 6388020454 on #456): two or more repeated play frames while the label advanced, over
+        source frames KNOWN to differ, are PARTIAL_FREEZE (counted, never OK). One repeat stays OK; over an unknown or identical source the repeats stay a
+        note (the r4 wording) and the verdict does not change."""
+        rows = [  # source difference, distinct, repeats -> verdict
+            ("known-differ", 4, 2, "PARTIAL_FREEZE"), ("known-differ", 3, 3, "PARTIAL_FREEZE"), ("known-differ", 2, 4, "PARTIAL_FREEZE"),
+            ("known-differ", 5, 1, "OK"), ("known-differ", 6, 0, "OK"), ("known-differ", 6, None, "OK"),
+            ("unknown", 3, 3, "OK"), (None, 3, 3, "OK"), ("known-identical", 3, 3, "OK"),
+            ("known-differ", 1, 5, "FROZEN_DISPLAY"), ("unknown", 1, 5, "FROZEN_DISPLAY_SUSPECTED"),
+        ]
+        for src, distinct, repeats, verdict in rows:
+            with self.subTest(source=src, distinct=distinct, repeats=repeats):
+                out = self.visual_verdict(src, 6, 0, distinct, repeats)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, verdict != "FROZEN_DISPLAY"), out["reason"])
+                if verdict == "PARTIAL_FREEZE":
+                    self.assertIn(f"{repeats} of the 6 judged play frames repeat the picture before them", out["reason"])
+        # a partial freeze is judged on the play frames, so it outranks the paused-capture verdicts, as the frozen ones do
+        for extra in ("-LabelBound $false -PausedLabelBound $true ", "-Threshold 1 "):
+            with self.subTest(extra=extra):
+                self.assertEqual(self.visual_verdict("known-differ", 6, 0, 3, 3, extra)["verdict"], "PARTIAL_FREEZE")
+                self.assertIn(self.visual_verdict("known-differ", 6, 0, 3, 1, extra)["verdict"], ("CAPTURE_UNBOUND", "VISUAL_DIVERGENCE"))
 
     def test_the_default_divergence_threshold_is_six_not_twelve(self) -> None:
         # The gate table above passes -Threshold explicitly, so it cannot see the module default. These rows pass none: a same-position
@@ -7232,6 +7879,121 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                     self.assertGreater(out["playVsPausedMeanAbsDiffPerChannel"][0], out["playVsPausedMeanAbsDiffPerChannel"][1], "the red shift shows in R")
                 else:
                     self.assertLess(mad, 1.0)
+                # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: a pre-fix visual.json (no binding fields) reads exactly as before
+                self.assertIsNone(out["labelBound"])
+                self.assertIsNone(out["stopUnboundVsPausedMeanAbsDiff"])
+                self.assertIsNone(out["stopUnboundVsStopMeanAbsDiff"])
+
+    def read_visual_mode(self, mode: str, d: str) -> tuple[Path, dict]:
+        art = Path(d) / "artifacts"
+        write_visual_captures(art / "visual", mode)
+        ev = Path(d) / "evidence"
+        proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return ev, out
+
+    def test_the_visual_reader_says_capture_unbound_when_the_stop_was_not_painted_for_its_label(self) -> None:
+        # G1 (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1): the stop capture shows an older picture than its label names, and the app says so
+        # (painted_serial != serial, label_bound false). The stop-vs-paused difference then compares two moments: never a divergence verdict.
+        with tempfile.TemporaryDirectory(prefix="vis-lagged-") as d:
+            _, out = self.read_visual_mode("lagged", d)
+        self.assertEqual((out["verdict"], out["counted"]), ("CAPTURE_UNBOUND", True), out["reason"])
+        self.assertIs(out["labelBound"], False)
+        self.assertGreater(out["playVsPausedMeanAbsDiff"], 12.0, "the difference is still reported")
+        self.assertIn("label", out["reason"])
+
+    def test_the_visual_reader_keeps_the_unbound_stop_beside_the_bound_one(self) -> None:
+        # G2: the app keeps the unforced (master-equivalent) stop capture as stop-unbound.png, then the forced, bound stop.png.
+        with tempfile.TemporaryDirectory(prefix="vis-bound-") as d:
+            ev, out = self.read_visual_mode("bound", d)
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertIs(out["labelBound"], True)
+            self.assertLess(out["playVsPausedMeanAbsDiff"], 1.0)
+            self.assertGreater(out["stopUnboundVsPausedMeanAbsDiff"], 12.0)
+            self.assertGreater(out["stopUnboundVsStopMeanAbsDiff"], 12.0)
+            files = {f["file"]: f for f in out["frames"]}
+            self.assertIn("unit-leg-stop-unbound.png", files)
+            local = ev / "visual" / "unit-leg-stop-unbound.png"
+            self.assertEqual(files["unit-leg-stop-unbound.png"]["sha256"], hashlib.sha256(local.read_bytes()).hexdigest())
+            self.assertEqual((files["unit-leg-stop.png"]["paintedSerial"], files["unit-leg-stop.png"]["serial"]), (912, 912))
+            self.assertTrue(Path(out["stripPath"]).is_file())
+            self.assertIs(out["pausedLabelBound"], True)
+
+    def test_the_visual_gate_says_capture_unbound_before_divergence(self) -> None:
+        rows = [  # labelBound (stop), pausedLabelBound, mad -> verdict
+            ("$false", "$true", "30.0", "CAPTURE_UNBOUND"), ("$false", "$true", "2.0", "CAPTURE_UNBOUND"),
+            ("$true", "$true", "30.0", "VISUAL_DIVERGENCE"), ("$true", "$true", "2.0", "OK"),
+            ("$null", "$null", "30.0", "VISUAL_DIVERGENCE"), ("$null", "$null", "2.0", "OK"),
+            # r2 (bound paused capture): the divergence compares two captures, so BOTH must be bound; a binding build missing one side fails closed
+            ("$true", "$false", "30.0", "CAPTURE_UNBOUND"), ("$true", "$false", "2.0", "CAPTURE_UNBOUND"),
+            ("$true", "$null", "30.0", "CAPTURE_UNBOUND"), ("$true", "$null", "2.0", "CAPTURE_UNBOUND"),
+            ("$null", "$true", "30.0", "CAPTURE_UNBOUND"), ("$false", "$false", "2.0", "CAPTURE_UNBOUND"),
+        ]
+        for bound, paused_bound, mad, verdict in rows:
+            with self.subTest(bound=bound, paused=paused_bound, mad=mad):
+                proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 6 -AppDistinctDisplayFrames 6 "
+                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff {mad} -SamePosition $true -LabelBound {bound} -PausedLabelBound {paused_bound} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True))
+        # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: FROZEN_DISPLAY needs source frames known to differ; over an unknown source it is SUSPECTED, which outranks too)
+        for source, frozen in (("known-differ", "FROZEN_DISPLAY"), ("unknown", "FROZEN_DISPLAY_SUSPECTED")):
+            with self.subTest(source=source):
+                proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 "
+                                          f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true -SourceDifference {source} -LabelBound $false | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out["verdict"], frozen, "a frozen display outranks an unbound stop capture")
+
+    def test_the_visual_reader_requires_the_paused_capture_bound_before_a_divergence_verdict(self) -> None:
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f improvement; DualVenueRunner.psm1 Read-DvVisualCaptures): the stop-vs-paused difference is only
+        # a verdict when BOTH of its captures are bound to their labels. r1 required it of the stop capture alone.
+        for mode, paused_bound in (("bound-paused-unbound", False), ("bound-paused-missing", None)):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
+                _, out = self.read_visual_mode(mode, d)
+                self.assertEqual((out["verdict"], out["counted"]), ("CAPTURE_UNBOUND", True), out["reason"])
+                self.assertIs(out["labelBound"], True)
+                self.assertIs(out["pausedLabelBound"], paused_bound)
+                self.assertIn("paused re-render capture", out["reason"])
+        with tempfile.TemporaryDirectory(prefix="vis-bound-both-") as d:
+            _, out = self.read_visual_mode("bound", d)
+            self.assertEqual(out["verdict"], "OK", out["reason"])
+            self.assertEqual((out["labelBound"], out["pausedLabelBound"]), (True, True))
+            # label_bound_basis (Dot improvement: the pixmap route's binding holds by construction) is carried, never dropped
+            self.assertEqual((out["labelBoundBasis"], out["pausedLabelBoundBasis"]), ("pixmap_item_by_construction", "pixmap_item_by_construction"))
+            files = {f["file"]: f for f in out["frames"]}
+            self.assertEqual(files["unit-leg-stop-unbound.png"]["labelBoundBasis"], "gl_viewport_paint")
+
+    def test_the_visual_reader_judges_a_frozen_display_on_the_unforced_play_captures(self) -> None:
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f B2, CoS 6219217683): the forced play captures paint the frame the label names first, so a display
+        # whose own deferred paint never lands still showed six moving pictures. The app now pairs each with an unforced capture; the gate judges those.
+        with tempfile.TemporaryDirectory(prefix="vis-masked-") as d:
+            ev, out = self.read_visual_mode("masked", d)
+            self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+            self.assertEqual(out["frozenJudgedOn"], "play_unbound")
+            self.assertEqual((out["playFrames"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"]), (6, 1, 6))
+            self.assertEqual(out["repeatedPlayFrames"], 5, "the whole-tail FROZEN_DISPLAY outranks the repeats it implies")
+            self.assertIn("the force-paint would have masked this", out["reason"])
+            names = sorted(f["file"] for f in out["frames"])
+            self.assertEqual(names, sorted([f"unit-leg-play-{k}.png" for k in range(6)] + [f"unit-leg-play-unbound-{k}.png" for k in range(6)]
+                                           + ["unit-leg-stop.png", "unit-leg-paused.png"]))
+            for f in out["frames"]:
+                self.assertEqual(f["sha256"], hashlib.sha256((ev / "visual" / f["file"]).read_bytes()).hexdigest())
+        with tempfile.TemporaryDirectory(prefix="vis-paired-") as d:
+            # r5 (Grok G1/G3): the r3 order takes unforced k half a tail after forced k, so a healthy display shows them DIFFERENT pictures; the r2
+            # index pairing (playForcedUnforcedDifferFrames) read that as six disagreements and is no longer reported
+            ev, out = self.read_visual_mode("paired-ok", d)
+            self.assertEqual((out["verdict"], out["reason"]), ("OK", None))
+            self.assertEqual((out["frozenJudgedOn"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"], out["repeatedPlayFrames"]),
+                             ("play_unbound", 6, 6, 0))
+            frames = {(f["kind"], f["index"]): f for f in out["frames"]}
+            self.assertTrue(all(frames[("play", k)]["contentHash"] != frames[("play_unbound", k)]["contentHash"] for k in range(6)),
+                            "the fixture models the r3 order: no unforced capture is a same-instant twin of a forced one")
+            self.assertNotIn("playForcedUnforcedDifferFrames", out)
+            self.assertTrue(Path(out["stripPath"]).is_file())
+        with tempfile.TemporaryDirectory(prefix="vis-old-") as d:
+            _, out = self.read_visual_mode("ok", d)
+            self.assertEqual((out["frozenJudgedOn"], out["forcedPlayDistinctContentHashes"]), ("play", None),
+                             "a build without unforced play captures is judged on its play captures, as before")
+            self.assertNotIn("playForcedUnforcedDifferFrames", out)
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;
@@ -7288,6 +8050,66 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 at = [out["reason"].find(text) for text in texts]
                 self.assertTrue(all(i >= 0 for i in at), out["reason"])
                 self.assertEqual(at, sorted(at), out["reason"])
+
+    def test_a_not_captured_leg_whose_strip_also_fails_keeps_both_reasons(self) -> None:
+        """PLAYBACK-VISUAL-STRIP-REASON-NOT-CAPTURED-1 (the named follow-up of #503): no play frame was saved AND the strip cannot be composed. The NOT_CAPTURED
+        leg used to keep only the strip failure, dropping `only N play frame(s) were captured`. Both survive, capture-count first. The strip is made to fail by a
+        directory sitting where its PNG goes; the control leg (strip fine) keeps the capture-count reason alone."""
+        capture_count = "only 0 play frame(s) were captured"
+        strip_failure = "the strip could not be composed"
+        for mode, texts in (("strip-fails", [capture_count, strip_failure]), ("strip-composes", [capture_count])):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-nc-{mode}-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", "ok")
+                visual_json = art / "visual" / "visual.json"
+                visual = json.loads(visual_json.read_text(encoding="utf-8"))
+                for frame in visual["frames"]:
+                    if frame["kind"] == "play":
+                        frame["saved"] = False
+                visual_json.write_text(json.dumps(visual), encoding="utf-8")
+                ev = Path(d) / "evidence"
+                if mode == "strip-fails":
+                    (ev / "visual" / "unit-leg-strip.png").mkdir(parents=True)
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"], out["savedPlayFrames"]), ("NOT_CAPTURED", True, 0), out["reason"])
+                if mode == "strip-fails":
+                    self.assertIsNone(out["stripPath"])
+                    at = [out["reason"].find(text) for text in texts]
+                    self.assertTrue(all(i >= 0 for i in at), out["reason"])
+                    self.assertEqual(at, sorted(at), out["reason"])
+                else:
+                    self.assertTrue(Path(out["stripPath"]).is_file())
+                    self.assertEqual(out["reason"], capture_count)
+
+    def test_a_not_captured_leg_with_a_prior_step_reason_keeps_all_three_reasons_in_order(self) -> None:
+        """DV-VISUAL-STRIP-PRIOR-REASON-FIXTURE-1 (Dot advisory 3a8b205c on #600): the NOT_CAPTURED reason is the join of THREE parts, `<verdict reason>; <the step
+        reason standing when the strip failed>; <strip failure>`, and the test above only runs with an empty middle part, so dropping or reordering `$reasonBeforeStrip`
+        stayed green. Here a malformed visual-capture-request.json sets the step reason BEFORE the strip fails (no play frame saved, strip PNG path blocked by a
+        directory): all three survive, in that order, each exactly once."""
+        capture_count = "only 0 play frame(s) were captured"
+        prior_step = "the job's visual-capture request record is not valid JSON"
+        strip_failure = "the strip could not be composed"
+        with tempfile.TemporaryDirectory(prefix="vis-nc-prior-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "ok")
+            (art / "visual" / "visual-capture-request.json").write_text("{ this is not json", encoding="utf-8")
+            visual_json = art / "visual" / "visual.json"
+            visual = json.loads(visual_json.read_text(encoding="utf-8"))
+            for frame in visual["frames"]:
+                if frame["kind"] == "play":
+                    frame["saved"] = False
+            visual_json.write_text(json.dumps(visual), encoding="utf-8")
+            ev = Path(d) / "evidence"
+            (ev / "visual" / "unit-leg-strip.png").mkdir(parents=True)
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{ev}' -LegId 'unit-leg' -Header 'unit' | ConvertTo-Json -Depth 8 -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["counted"], out["savedPlayFrames"]), ("NOT_CAPTURED", True, 0), out["reason"])
+        self.assertIsNone(out["stripPath"])
+        self.assertEqual([out["reason"].count(text) for text in (capture_count, prior_step, strip_failure)], [1, 1, 1], out["reason"])
+        at = [out["reason"].find(text) for text in (capture_count, prior_step, strip_failure)]
+        self.assertEqual(at, sorted(at), out["reason"])
+        self.assertEqual(out["reason"].split("; ")[1], prior_step, "the prior step reason sits between the verdict reason and the strip failure")
 
     def test_a_strip_that_composes_leaves_the_reason_as_it_was(self) -> None:
         """CoS #474 N5 (no change when the strip is fine): no strip text is added, and the partial-ok note stays the whole reason."""
@@ -7350,6 +8172,18 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["outcome"], "INVALID")
         self.assertIn("FROZEN_DISPLAY", receipt["outcomeDetail"])
         self.assertFalse(receipt["visual"]["counted"])
+
+    def test_a_partial_freeze_leg_is_counted_and_surfaced_never_read_as_ok(self) -> None:
+        """PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5 (hub ruling, ACK 6388020454): the measured run's PARTIAL_FREEZE is surfaced in the outcome detail like the
+        other counted non-OK verdicts, and a self-heal pre-launch with one makes the leg INVALID (that gate needs OK)."""
+        _, receipt, _ = self.run_visual("partial-freeze")
+        self.assertEqual((receipt["visual"]["verdict"], receipt["visual"]["counted"], receipt["visual"]["repeatedPlayFrames"]), ("PARTIAL_FREEZE", True, 3))
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("PARTIAL_FREEZE (counted for speed, surfaced for review)", receipt["outcomeDetail"])
+        _, receipt, _ = self.run_self_heal_visual("ok", {"pre-1": "partial-freeze"})
+        self.assertEqual(receipt["selfHealVisual"]["pre-1"]["verdict"], "PARTIAL_FREEZE")
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("PARTIAL_FREEZE on self-heal pre-launch pre-1", receipt["outcomeDetail"])
 
     def run_self_heal_visual(self, measured: str, launches: dict, declared: int | None = None, **spec_fields):
         """launches: pre-<n> -> a write_visual_captures mode, or None for a pre-launch that published its self-heal\\pre-<n> but no visual\\.
@@ -7431,6 +8265,41 @@ class VisualCaptureRunnerTests(RunnerHarness, unittest.TestCase):
         self.assertIn("VISUAL_DIVERGENCE", receipt["outcomeDetail"])
         self.assertEqual(receipt["visual"]["verdict"], "VISUAL_DIVERGENCE")
 
+    def test_an_unbound_visual_capture_is_counted_for_speed_and_surfaced(self) -> None:
+        _, receipt, _ = self.run_visual("lagged")
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("CAPTURE_UNBOUND", receipt["outcomeDetail"])
+        self.assertEqual((receipt["visual"]["verdict"], receipt["visual"]["labelBound"]), ("CAPTURE_UNBOUND", False))
+
+    def test_a_frozen_display_the_force_paint_would_have_masked_is_not_counted(self) -> None:
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (Dot 6d0e710f B2): judged on the unforced play captures, end to end through the runner
+        _, receipt, _ = self.run_visual("masked")
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("FROZEN_DISPLAY", receipt["outcomeDetail"])
+        self.assertIn("would have masked", receipt["outcomeDetail"])
+        self.assertEqual((receipt["visual"]["frozenJudgedOn"], receipt["visual"]["counted"]), ("play_unbound", False))
+
+    def test_a_look_assist_on_leg_that_ran_without_it_is_invalid(self) -> None:
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b): a speed leg whose spec forces Look Assist on fails closed unless the app's own visual_state says
+        # look_assist_enabled=1; 0 or a missing record is a typed INVALID. A leg that does not ask is unchanged.
+        spec = self.speed_spec(generatorArgs={"forceLookAssist": True})
+        for state, outcome in (("look_assist_enabled=1", "PASS"), ("look_assist_enabled=0", "INVALID"), ("", "INVALID"), (None, "INVALID")):
+            with self.subTest(state=state):
+                self.write_artifacts(look_assist_state=state)
+                write_visual_captures(self.artifacts / "visual", "ok")
+                _, receipt, _ = self.run_leg("ultra-magnus", spec, extra=["-Backend", "cpu"])
+                self.assertEqual(receipt["outcome"], outcome, receipt["outcomeDetail"])
+                self.assertEqual(receipt["lookAssist"]["requested"], True)
+                if outcome == "INVALID":
+                    self.assertIn("LOOK_ASSIST_NOT_HONOURED", receipt["outcomeDetail"])
+                else:
+                    self.assertEqual((receipt["lookAssist"]["reported"], receipt["lookAssist"]["verdict"]), ("1", "HONOURED"))
+        self.write_artifacts(look_assist_state="look_assist_enabled=0")
+        write_visual_captures(self.artifacts / "visual", "ok")
+        _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), extra=["-Backend", "cpu"])
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertNotIn("lookAssist", receipt, "a leg that does not ask for Look Assist records nothing about it")
+
     def test_a_single_picture_over_an_unknown_or_identical_source_is_counted_and_surfaced(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: only a source KNOWN to differ voids the leg. Unknown is surfaced in the detail (counted); identical is OK;
         an unavailable viewport is surfaced too and never judges the whole window."""
@@ -7497,6 +8366,20 @@ UNREADABLE_L3_COUNTERS = {
 }
 
 
+# GPU-SELFHEAL-TEST-GATE-NITS-1 (CoS #437): the L3 fault row's cuda_code as a field log could carry it unreadable. Only a JSON integer inside Int32 is a fault code;
+# on 4e258a92 the Int64 2147483648 reached `[int]$code`, which THROWS, so the metrics never existed instead of naming FAULT_CODE_NOT_NUMERIC.
+UNREADABLE_L3_FAULT_CODES = {
+    "fault-code-string-l3": "cudaErrorLaunchTimeout",
+    "fault-code-numeric-string-l3": "702",
+    "fault-code-high-l3": 2147483648,
+    "fault-code-low-l3": -2147483649,
+    "fault-code-float-l3": 702.5,
+}
+
+# The same extremes one step inside the range: a fault code, so L3's eq 0 reports the value it read, not a COULD-NOT-CHECK.
+IN_RANGE_L3_FAULT_CODES = {"fault-code-int32-max-l3": 2147483647, "fault-code-int32-min-l3": -2147483648, "fault-code-negative-l3": -1}
+
+
 def write_self_heal_evidence(root: Path, case: str = "good") -> None:
     """<artifacts>\\self-heal as the r5 job published it on Bachelor (d3ed879b), reduced to the lines the metrics read: L1 and L2 inject 702 (L2's
     second loss sets the flag), L3 starts on the CPU, the measured run L4 clears the flag. `case` breaks exactly one fact."""
@@ -7521,6 +8404,11 @@ def write_self_heal_evidence(root: Path, case: str = "good") -> None:
         refused = 397 if case == "refused-recon-l3" and n == 3 else 0
         if case == "slow-l1" and n == 1:
             fps = 10.6
+        fps_field = f"presented_fps={fps} "
+        if n == 3 and case == "fps-word-l3":
+            fps_field = "presented_fps=n/a "
+        if n == 3 and case == "fps-absent-l3":
+            fps_field = ""
         counters = (f"gpu_preview_frames={preview} gpu_recon_readback_frames=0 gpu_texture_readback_frames=0 "
                     f"gpu_texture_no_readback_frames={cuda}")
         if n == 3 and case in UNREADABLE_L3_COUNTERS:
@@ -7529,7 +8417,7 @@ def write_self_heal_evidence(root: Path, case: str = "good") -> None:
             refused = ""
         (d / "result.json.run.log").write_text("\n".join([
             "[2026-10-15T08:27:10.400Z] [INFO] [0xd900] playback_smoke.measured_session id=1",
-            f"[2026-10-15T08:27:36.324Z] [INFO] [0xd900] playback_smoke.summary session=1 reason=visual-capture presented_frames=586 presented_fps={fps} last_presented_frame=597",
+            f"[2026-10-15T08:27:36.324Z] [INFO] [0xd900] playback_smoke.summary session=1 reason=visual-capture presented_frames=586 {fps_field}last_presented_frame=597",
             f"[2026-10-15T08:27:36.326Z] [INFO] [0xd900] playback_smoke.gpu_summary session=1 cpu_frames={cpu} {counters}",
             f"[2026-10-15T08:27:36.336Z] [INFO] [0xd900] playback_smoke.debayered16_recon_reuse_summary session=1 scope=presented_frames refused_acquisition_failed=0 "
             f"refused_gpu_playback_recon={refused} reduced_consumed_frames={cpu}", ""]), encoding="utf-8")
@@ -7540,6 +8428,10 @@ def write_self_heal_evidence(root: Path, case: str = "good") -> None:
             rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "device_loss", "outcome": "cuda_suppressed_session"})
         if case == "fault-code-absent-l3" and n == 3:
             rows.append({"schema": "gpu-field-telemetry.v1", "kind": "fault", "dll": "inject", "stage": "recon:run", "rc": -1,
+                         "site": "MLVAPP_GPU_FAULT_INJECT", "fault_utc_ms": 1792052833762.0, "device_loss": True, "role": "primary"})
+        if n == 3 and case in {**UNREADABLE_L3_FAULT_CODES, **IN_RANGE_L3_FAULT_CODES}:
+            rows.append({"schema": "gpu-field-telemetry.v1", "kind": "fault", "dll": "inject", "stage": "recon:run", "rc": -1,
+                         "cuda_code": {**UNREADABLE_L3_FAULT_CODES, **IN_RANGE_L3_FAULT_CODES}[case],
                          "site": "MLVAPP_GPU_FAULT_INJECT", "fault_utc_ms": 1792052833762.0, "device_loss": True, "role": "primary"})
         if n == 2:
             rows.append({"schema": "gpu-field-telemetry.v1", "kind": "recovery", "what": "safe_start_flag", "outcome": "set"})
@@ -7587,13 +8479,17 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
         "counters-string-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames"], "COUNTER_NOT_NUMERIC"),
         "counters-word-l3": (["selfHealL3CudaFrames", "selfHealL3GpuPreviewFrames"], "COUNTER_NOT_NUMERIC"),
         "fault-code-absent-l3": (["selfHealL3InjectedFaultCode"], "FAULT_CODE_ABSENT"),
+        **{case: (["selfHealL3InjectedFaultCode"], "FAULT_CODE_NOT_NUMERIC") for case in UNREADABLE_L3_FAULT_CODES},
+        # an unreadable launch presented_fps leaves the ratio null; it reuses the counter reader, so its tokens are the counter tokens
+        "fps-word-l3": (["selfHealL3FpsRatio"], "COUNTER_NOT_NUMERIC"),
+        "fps-absent-l3": (["selfHealL3FpsRatio"], "COUNTER_ABSENT"),
     }
 
-    def evaluate(self, cases) -> dict:
+    def evaluate(self, cases, measured_fps: str = "23.201") -> dict:
         with tempfile.TemporaryDirectory(prefix="sh-gate-") as d:
             measured = Path(d) / "measured.log"
             measured.write_text("playback_smoke.measured_session id=1\nplayback_smoke.summary session=1 reason=visual-capture presented_frames=599 "
-                                "presented_fps=23.201\n", encoding="utf-8")
+                                f"presented_fps={measured_fps}\n", encoding="utf-8")
             for case in cases:
                 if case != "l4-counters-only":
                     write_self_heal_evidence(Path(d) / case / "self-heal", "good" if case == "good" else case)
@@ -7656,6 +8552,31 @@ class SelfHealLegGatesTheL1ToL4FactsTests(unittest.TestCase):
                 for metric in expected:
                     self.assertIsNone(got["metrics"][metric], f"{case}: {metric} is never a default")
 
+    def test_an_in_range_fault_code_is_read_as_the_value_never_could_not_check(self) -> None:
+        """GPU-SELFHEAL-TEST-GATE-NITS-1: the range check refuses only what an Int32 cannot hold. Int32.MaxValue, Int32.MinValue and -1 are fault codes
+        -- L3's eq 0 fails on the value it read ('actual N'), with no COULD-NOT-CHECK reason and a non-null metric."""
+        out = self.evaluate(list(IN_RANGE_L3_FAULT_CODES))
+        for case, code in IN_RANGE_L3_FAULT_CODES.items():
+            with self.subTest(case):
+                got = out[case]
+                self.assertEqual(got["failures"], [f"selfHealL3InjectedFaultCode eq 0 failed (actual {code})"])
+                self.assertEqual(got["metrics"]["selfHealL3InjectedFaultCode"], code)
+                self.assertIsNone(got["metrics"]["selfHealL3InjectedFaultCodeCouldNotCheck"])
+
+    def test_an_unusable_measured_fps_is_could_not_check_for_every_launch_ratio(self) -> None:
+        """GPU-SELFHEAL-TEST-GATE-NITS-1: the measured run's presented_fps is the denominator of L1-L3's ratio. A zero or non-decimal one leaves all three
+        ratios null with MEASURED_FPS_UNUSABLE (never a divide-by-zero or a default), while the launches' own PresentedFps stay readable."""
+        for measured_fps, detail in (("0", "summary.presented_fps=0"), ("n/a", "COUNTER_NOT_NUMERIC summary.presented_fps='n/a'")):
+            with self.subTest(measured_fps=measured_fps):
+                got = self.evaluate(["good"], measured_fps=measured_fps)["good"]
+                self.assertFalse(got["pass"])
+                self.assertEqual(sorted({f.split(" ")[0].rstrip(":") for f in got["failures"]}), [f"selfHealL{n}FpsRatio" for n in (1, 2, 3)], got["failures"])
+                for failure in got["failures"]:
+                    self.assertIn(f": COULD-NOT-CHECK MEASURED_FPS_UNUSABLE {detail}", failure)
+                for n in (1, 2, 3):
+                    self.assertIsNone(got["metrics"][f"selfHealL{n}FpsRatio"])
+                    self.assertIsNotNone(got["metrics"][f"selfHealL{n}PresentedFps"])
+
 
 class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
     """The schema's opt-out shape, the proof leg, and the app side of the capture (a source census: the app is built and run on a venue, never here)."""
@@ -7677,6 +8598,18 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
             with self.subTest(bad=sorted(set(bad) - set(leg))), self.assertRaises(jsonschema.ValidationError):
                 jsonschema.validate(bad, schema)
 
+    def test_the_visual_speed_twins_differ_from_the_proof_leg_only_in_display_mode_and_scale(self) -> None:
+        proof = json.loads((DV / "legs" / "m16-1243-speed-windowed-s2.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(VISUAL_TWIN_LEGS), 5)
+        for rel in VISUAL_TWIN_LEGS:
+            with self.subTest(rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                mode, scale = re.fullmatch(r"legs/m16-1243-speed-(fullscreen|windowed)-s(\d)\.json", rel).groups()
+                self.assertEqual((twin["legId"], twin["displayMode"], twin["scaleFactor"], twin["legType"]), (Path(rel).stem, mode, int(scale), "speed"))
+                self.assertNotIn("visualCapture", twin, "absent means on")
+                keep = ("legId", "card", "displayMode", "scaleFactor")
+                self.assertEqual({k: v for k, v in twin.items() if k not in keep}, {k: v for k, v in proof.items() if k not in keep})
+
     def test_the_app_visual_capture_runs_after_the_measured_session_closes_and_captures_the_window(self) -> None:
         main_cpp = (ROOT / "platform" / "qt" / "main.cpp").read_text(encoding="utf-8")
         self.assertIn('QStringLiteral("visual-capture-dir")', main_cpp)
@@ -7695,6 +8628,1419 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         for forbidden in ("programmaticPlay(", "setChecked( true", "->trigger(", "return "):
             self.assertNotIn(forbidden, block, f"the capture block never starts a Play and never ends the smoke: {forbidden}")
         self.assertIn("PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT )", src)
+        # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 (G3): every capture binds its label to its pixels. Inside grabVisual the pending frame is painted
+        # FIRST, then the label is read, then the window is printed, with no event processed in between (a paint deferred past the label let a
+        # capture show frame N-1 labelled N). The helper lives outside the block, beside the PrintWindow capture.
+        helper = "paintPresentedFrameForCapture("
+        self.assertTrue("static bool paintPresentedFrameForCapture(" in src, "the binding helper is defined in MainWindow.cpp")
+        self.assertLess(abs(src.index("static bool paintPresentedFrameForCapture(") - src.index("static QImage captureTopLevelWindowByPrintWindow(")), 6000,
+                        "the binding helper sits next to the PrintWindow capture")
+        lam = block[block.index("auto grabVisual = [&]"):block.index("// (1) the measured interval ends HERE")]
+        self.assertLess(lam.index(helper), lam.index("m_lastPresentedRequestContext.frameNumber"), "paint first, then read the label")
+        self.assertLess(lam.index("m_lastPresentedRequestContext.frameNumber"), lam.index("captureTopLevelWindowByPrintWindow("))
+        self.assertNotIn("processEvents(", lam[lam.index(helper):lam.index("captureTopLevelWindowByPrintWindow(")],
+                         "nothing may present a newer frame between the paint and the capture")
+        # the stop grab keeps the unforced (master-equivalent) capture first, then the forced, bound one
+        unbound = 'grabVisual( QStringLiteral("stop_unbound"), 0, false );'
+        self.assertLess(block.index("ui->actionPlay->setChecked( false );"), block.index(unbound))
+        self.assertLess(block.index(unbound), block.index('grabVisual( QStringLiteral("stop"), 0, false );'))
+        self.assertNotIn("processEvents(", block[block.index(unbound):block.index('grabVisual( QStringLiteral("stop"), 0, false );')])
+        for field in ('"painted_serial"', '"painted_serial_valid"', '"label_bound"', '"label_bound_basis"'):
+            self.assertIn(f"QStringLiteral({field})", block)
+        # TIMING-2 r2 (Dot 6d0e710f B2): only the "_unbound" kinds skip the paint -- the frozen check is judged on them, so the force-paint can no longer
+        # mask a frozen display. The paused pair keeps its unforced capture just before the forced one, with no event between.
+        play_unbound = 'grabVisual( QStringLiteral("play_unbound"), k, false );'
+        play = 'grabVisual( QStringLiteral("play"), k, false );'
+        paused_unbound = 'grabVisual( QStringLiteral("paused_unbound"), 0, visualSettled );'
+        paused = 'grabVisual( QStringLiteral("paused"), 0, visualSettled );'
+        self.assertLess(block.index(paused_unbound), block.index(paused))
+        self.assertNotIn("processEvents(", block[block.index(paused_unbound):block.index(paused)])
+        self.assertIn('!kind.endsWith( QStringLiteral("_unbound") )', lam)
+        # TIMING-2 r3 (Dot 7dc103f1 B2): a forced paint changes what the NEXT unforced capture sees when the display's own paint is stuck, so r2's
+        # per-slice pairing let unforced k+1 show forced k. Every forced play capture now comes first; the unforced ones follow with no forced capture
+        # between any two of them or between the last of them and stop_unbound; every capture records how many forced paints preceded it.
+        self.assertEqual((block.count(play), block.count(play_unbound)), (1, 1))
+        self.assertLess(block.index(play), block.index(play_unbound))
+        between = block[block.index(play_unbound):block.index(unbound)]
+        self.assertEqual(between.count("grabVisual("), 1, "no forced capture inside the unforced observation interval")
+        self.assertIn("ui->actionPlay->setChecked( false );", between)
+        self.assertIn('frameJson.insert( QStringLiteral("forced_paints_before"), grab.forcedPaintsBefore );', block)
+        self.assertLess(lam.index("grab.forcedPaintsBefore = visualForcedPaints;"), lam.index(helper), "the ordinal is read before this capture's own paint")
+        self.assertIn("if( forcePaint ) ++visualForcedPaints;", lam)
+        # where the painted serial came from is named (the pixmap route's binding holds by construction)
+        for basis in ('"gl_window_paint"', '"gl_viewport_paint"', '"pixmap_item_by_construction"', '"none"'):
+            self.assertIn(f"QStringLiteral({basis})", src)
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1: every busy quiet probe names WHO (owner, project) and WHAT (script, redacted command line, parent chain, start time, GPU) for its top CPU and top
+# GPU pids, collected after the sampling window with at most 3 WQL queries, GetOwner per target and ONE GPU Engine read; the gate prints it as comma-free key=value pairs after the
+# byte-identical top prefix; Summarize-VenueBusyProbes.ps1 groups busy probes by project with the gate's own lifted decision function. The real probe job runs here against canned
+# Get-Counter / Get-Process / Get-CimInstance / Invoke-CimMethod shadows, so identity is proved on exact values, not on whatever the test host is running.
+import base64 as _ident_base64
+import datetime as _ident_dt
+
+IDENT_SCHEMA = "mlv-app/venue-quiet-probe-identity/v1"
+IDENT_T0 = _ident_dt.datetime(2026, 10, 24, 1, 2, 3, tzinfo=_ident_dt.timezone.utc)
+R6_SCRIPT_CHECKS = ("ok", "notfound", "reparse", "nonfixed", "relative", "rejected", "timeout", "error")   # the closed script_check enum (r6)
+_IDENT_EPOCH = _ident_dt.datetime(1601, 1, 1, tzinfo=_ident_dt.timezone.utc)
+
+# Get-Counter shadow that also accepts -MaxSamples (the identity block's GPU read passes it); a canned set past the end of the list answers with no samples
+GET_COUNTER_PRELUDE_MAXSAMPLES = GET_COUNTER_PRELUDE.replace("param($Counter)", "param($Counter, $MaxSamples)")
+
+GET_CIM_PRELUDE = r"""$script:CimRows = @(ConvertFrom-Json -InputObject @'
+__CIMROWS__
+'@)
+$script:CimOwners = ConvertFrom-Json -InputObject @'
+__CIMOWNERS__
+'@
+$script:CimThrow = __CIMTHROW__
+$script:CimDelayMs = __CIMDELAY__
+$script:OwnerDelayMs = __OWNERDELAY__
+function Get-CimInstance {
+    [CmdletBinding()] param($ClassName, $Filter)
+    if ($script:CimDelayMs) { [Threading.Thread]::Sleep($script:CimDelayMs) }
+    if ($script:CimThrow) { throw 'canned CIM failure' }
+    [IO.File]::AppendAllText('__CIMLOG__', "$ClassName|$Filter`n")
+    $ids = @([regex]::Matches([string]$Filter, 'ProcessId=(\d+)') | ForEach-Object { [int64]$_.Groups[1].Value })
+    foreach ($r in $script:CimRows) {
+        if ($ids -contains [int64]$r.ProcessId) {
+            [pscustomobject]@{ ProcessId = [uint32]$r.ProcessId; ParentProcessId = [uint32]$r.ParentProcessId; Name = [string]$r.Name
+                CreationDate = [datetime]::FromFileTimeUtc([int64]$r.CreationFt).ToLocalTime(); CommandLine = $r.CommandLine; ExecutablePath = $r.ExecutablePath }
+        }
+    }
+}
+function Invoke-CimMethod {
+    [CmdletBinding()] param($InputObject, $MethodName)
+    if ($script:OwnerDelayMs) { [Threading.Thread]::Sleep($script:OwnerDelayMs) }
+    [IO.File]::AppendAllText('__OWNERLOG__', "$($InputObject.ProcessId)`n")
+    $o = $script:CimOwners.PSObject.Properties["$($InputObject.ProcessId)"]
+    if ($null -eq $o) { return [pscustomobject]@{ ReturnValue = [uint32]2; Domain = $null; User = $null } }
+    [pscustomobject]@{ ReturnValue = [uint32]$o.Value.rv; Domain = $o.Value.domain; User = $o.Value.user }
+}
+"""
+
+
+# The identity workers (VENUE-PROBE-PROCESS-ATTRIBUTION-1 r2) are SEPARATE runspaces, so a test's command shadows are re-declared there through $IdentityWorkerPrelude. The GPU read is
+# the only Get-Counter call a worker makes; __GPUDELAY__ is an uninterruptible sleep that stands in for a hung PDH read.
+WORKER_COUNTER_PRELUDE = r"""$script:GpuSet = @(ConvertFrom-Json -InputObject @'
+__GPUSET__
+'@)
+$script:GpuDelayMs = __GPUDELAY__
+function Get-Counter {
+    [CmdletBinding()] param($Counter, $MaxSamples)
+    if ($script:GpuDelayMs) { [Threading.Thread]::Sleep($script:GpuDelayMs) }
+    [pscustomobject]@{ CounterSamples = @($script:GpuSet | ForEach-Object { [pscustomobject]@{ Path = $_.Path; CookedValue = [double]$_.CookedValue; Status = [uint32]$_.Status } }) }
+}
+"""
+
+
+def _ident_ft(dt: "_ident_dt.datetime") -> int:
+    return int((dt - _IDENT_EPOCH).total_seconds() * 10_000_000)
+
+
+def _ident_cim(pid: int, ppid: int, name: str, start, cmd, exe=None) -> dict:
+    return {"ProcessId": pid, "ParentProcessId": ppid, "Name": name, "CreationFt": _ident_ft(start), "CommandLine": cmd, "ExecutablePath": exe}
+
+
+def _ident_gpu_sample(pid: int, eng: int, value: float) -> dict:
+    return _cs("gpu engine", f"pid_{pid}_luid_0x0_0x1_phys_0_eng_{eng}_engtype_3d", "utilization percentage", value)
+
+
+def _ident_probe_body() -> str:
+    text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+    return re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
+
+
+def _ident_run_reaped(cmd: list, timeout: float, env: dict | None = None) -> subprocess.CompletedProcess:
+    """subprocess.run, except that a child still alive at the timeout (or on any error) is killed WITH its process tree (r5: an r4 probe child outlived its test).
+    r6: the final drain is bounded too, so a grandchild that still holds the pipes cannot hold the test."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except BaseException:
+        if proc.poll() is None:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=60)
+        try:
+            proc.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=60)
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+class IdentityProbeMixin:
+    """Runs the REAL probe body (12 s sleeps -> 0) against canned process, counter and CIM data."""
+
+    def run_identity_probe(self, procs: list, cim: list, owners: dict | None = None, gpu: list | None = None, throw: bool = False, cpus: int = 4,
+                           body: str | None = None, old_counter_shadow: bool = False, after_start_ft: dict | None = None,
+                           delays: dict | None = None, call_ms: int | None = None) -> dict:
+        delays = delays or {}
+        body = (_ident_probe_body() if body is None else body).replace("[Environment]::ProcessorCount", str(cpus)).replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0")
+        if call_ms is not None:
+            body = body.replace("$IdentityCallMs = 5000", f"$IdentityCallMs = {call_ms}")
+        sets = []
+        for _ in range(3):
+            seen: dict = {}
+            parts = []
+            for i, (pid, name, _d, _s) in enumerate(procs):   # PDH names a second instance "name#1", so two processes of one name stay two rows
+                n = seen.get(name, 0); seen[name] = n + 1
+                parts.append(_proc(name if n == 0 else f"{name}#{n}", pid, 400 - 10 * i))
+            sets.append({"s": _flat(*parts, _proc("idle", 0, 100))})
+        if gpu is not None:
+            sets.append({"s": [_ident_gpu_sample(p, e, v) for (p, e, v) in gpu]})
+        before = [{"id": pid, "name": name, "cpu": 10.0, "start": _ident_ft(start)} for (pid, name, _d, start) in procs]
+        after = [{"id": pid, "name": name, "cpu": 10.0 + delta, "start": (after_start_ft or {}).get(pid, _ident_ft(start))} for (pid, name, delta, start) in procs]
+        self.cim_log = self.tmp / "cim.log"
+        self.owner_log = self.tmp / "owner.log"
+        for f in (self.cim_log, self.owner_log):
+            f.write_text("", encoding="utf-8")
+        counter_prelude = (GET_COUNTER_PRELUDE if old_counter_shadow else GET_COUNTER_PRELUDE_MAXSAMPLES).replace("__CANNED__", json.dumps(sets))
+        if delays.get("gpu"):   # the decision reads are calls 1-3; the 4th is the GPU read
+            counter_prelude = counter_prelude.replace("$set = $script:Canned[$script:CallNo]; $script:CallNo++",
+                                                      "if ($script:CallNo -eq 3) { [Threading.Thread]::Sleep(%d) }; $set = $script:Canned[$script:CallNo]; $script:CallNo++" % delays["gpu"])
+        cim_prelude = (GET_CIM_PRELUDE.replace("__CIMROWS__", json.dumps(cim)).replace("__CIMOWNERS__", json.dumps({str(k): {"rv": v[0], "domain": v[1], "user": v[2]} for k, v in (owners or {}).items()}))
+                       .replace("__CIMTHROW__", "$true" if throw else "$false").replace("__CIMLOG__", str(self.cim_log)).replace("__OWNERLOG__", str(self.owner_log))
+                       .replace("__CIMDELAY__", str(delays.get("cim", 0))).replace("__OWNERDELAY__", str(delays.get("owner", 0))))
+        prelude = counter_prelude + GET_PROCESS_PRELUDE.replace("__SNAPSHOTS__", json.dumps([before, after])) + cim_prelude
+        worker_counter = WORKER_COUNTER_PRELUDE.replace("__GPUSET__", json.dumps(sets[3]["s"] if gpu is not None else [])).replace("__GPUDELAY__", str(delays.get("gpu", 0)))
+        if old_counter_shadow:
+            worker_counter = worker_counter.replace("param($Counter, $MaxSamples)", "param($Counter)")
+        worker_b64 = _ident_base64.b64encode((cim_prelude + worker_counter).encode("utf-8")).decode("ascii")
+        body = body.replace("$IdentityWorkerPrelude = ''", f"$IdentityWorkerPrelude = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{worker_b64}'))")
+        job = self.tmp / "identity-probe-job.ps1"
+        job.write_text(prelude + body, encoding="utf-8")
+        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
+        self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
+        self.last_line = lines[0][len("VENUE_QUIET="):]   # the line exactly as the gate retains it (Wait-VenueQuiet.ps1 RAW RETENTION)
+        return json.loads(self.last_line)
+
+    def cim_queries(self) -> list:
+        return [ln for ln in self.cim_log.read_text(encoding="utf-8").splitlines() if ln]
+
+    def owner_calls(self) -> list:
+        return [int(ln) for ln in self.owner_log.read_text(encoding="utf-8").splitlines() if ln]
+
+    @staticmethod
+    def row(probe: dict, pid: int) -> dict:
+        rows = [r for r in probe["identity"]["processes"] if r["pid"] == pid]
+        assert len(rows) == 1, (pid, probe["identity"]["processes"])
+        return rows[0]
+
+
+CHAIN_OWNERS = {pid: (0, "BACHELOR", "layib") for pid in (16892, 500, 400, 17000, 501, 401, 17001, 502, 402)}
+
+
+@requires_windows_pwsh
+class VenueProbeIdentityTests(IdentityProbeMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-probe-identity-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+
+    def chain(self, cmd: str, pcmd: str = "pwsh.exe -NoProfile", gcmd: str = "explorer.exe"):
+        t = IDENT_T0
+        procs = [(16892, "python", 29.1, t), (500, "pwsh", 1.0, t - _ident_dt.timedelta(seconds=60)), (400, "explorer", 0.5, t - _ident_dt.timedelta(hours=1))]
+        cim = [_ident_cim(16892, 500, "python.exe", t, cmd, r"C:\Python\python.exe"),
+               _ident_cim(500, 400, "pwsh.exe", t - _ident_dt.timedelta(seconds=60), pcmd, r"C:\Program Files\PowerShell\7\pwsh.exe"),
+               _ident_cim(400, 0, "explorer.exe", t - _ident_dt.timedelta(hours=1), gcmd, r"C:\Windows\explorer.exe")]
+        return procs, cim
+
+    def test_the_fixture_process_is_named_by_owner_project_script_parent_chain_and_start(self) -> None:
+        procs, cim = self.chain(r"C:\Python\python.exe C:\mlvtmp\lane-X-1\tools\bench.py --api_key=abc123 --token xyz")
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0), (16892, 1, 15.0)])
+        ident = p["identity"]
+        self.assertEqual(ident["schema"], IDENT_SCHEMA)
+        self.assertEqual(p["schema"], "mlv-app/venue-quiet-probe/v2", "the top-level schema stays v2: identity only adds a field")
+        r = self.row(p, 16892)
+        self.assertEqual((r["owner"], r["owner_status"]), ("BACHELOR\\layib", "ok"))
+        # r5 allowlist: the script path is named only when it EXISTS on the probed host, and C:\mlvtmp\lane-X-1\tools\bench.py does not exist here; no argument text is kept
+        self.assertEqual((r["project"], r["project_from"], r["script"]), ("mlv-app", "self", None))
+        self.assertEqual(r["start_check"], "match")
+        self.assertTrue(r["started_utc"].startswith("2026-10-24T01:02:03"), r["started_utc"])
+        self.assertEqual((r["cmdline_status"], r["cmdline_redactions"], r["cmdline_truncated_chars"], r["args_redacted"], r["cmdline_args"]), ("ok", 4, 0, "all", 4))
+        self.assertEqual(r["cmdline"], r"C:\Python\python.exe args=4 script=<none>")
+        for secret in ("abc123", "xyz", "bench.py"):
+            self.assertNotIn(secret, self.last_line)
+        self.assertEqual((r["parent"]["pid"], r["parent"]["name"], r["parent"]["status"]), (500, "pwsh", "ok"))
+        self.assertEqual((r["grandparent"]["pid"], r["grandparent"]["name"], r["grandparent"]["status"]), (400, "explorer", "ok"))
+        self.assertEqual(r["source"], ["top", "top_processes", "gpu_top"], "this pid is in all three target sets")
+        self.assertEqual((r["gpu_percent"], r["gpu_engtype"], r["gpu_status"]), (40.0, "3d", "ok"))
+        for k in ("probe_user", "elevated", "project_roots", "gpu_basis", "gpu_status", "gpu_top", "cost_ms", "notes"):
+            self.assertIn(k, ident)
+        self.assertEqual(ident["project_roots"], "r1")
+        self.assertEqual(set(ident["cost_ms"]), {"cim", "owner", "gpu", "total"})
+        self.assertTrue(all(isinstance(v, int) and v >= 0 for v in ident["cost_ms"].values()), ident["cost_ms"])
+        self.assertTrue(all(isinstance(k, str) and isinstance(v, str) for k, v in ident["notes"].items()))
+
+    def test_the_cim_bound_is_at_most_three_queries_and_getowner_is_for_target_rows_only(self) -> None:
+        # three tops whose parents and grandparents are NOT targets: query 1 = targets, query 2 = parents, query 3 = grandparents
+        t = IDENT_T0
+        procs = [(16892, "python", 29.0, t), (17000, "python", 28.0, t), (17001, "python", 27.0, t)]
+        cim = [_ident_cim(16892, 500, "python.exe", t, "python a.py"), _ident_cim(17000, 501, "python.exe", t, "python b.py"), _ident_cim(17001, 502, "python.exe", t, "python c.py"),
+               _ident_cim(500, 400, "pwsh.exe", t - _ident_dt.timedelta(seconds=9), "pwsh"), _ident_cim(501, 401, "pwsh.exe", t - _ident_dt.timedelta(seconds=9), "pwsh"),
+               _ident_cim(502, 402, "pwsh.exe", t - _ident_dt.timedelta(seconds=9), "pwsh"),
+               _ident_cim(400, 0, "explorer.exe", t - _ident_dt.timedelta(hours=1), "explorer"), _ident_cim(401, 0, "explorer.exe", t - _ident_dt.timedelta(hours=1), "explorer"),
+               _ident_cim(402, 0, "explorer.exe", t - _ident_dt.timedelta(hours=1), "explorer")]
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS)
+        queries = self.cim_queries()
+        self.assertEqual(len(queries), 3, queries)
+        self.assertTrue(all(q.startswith("Win32_Process|ProcessId=") for q in queries), "a filtered query, never a full-table enumeration")
+        for pid in (16892, 17000, 17001):
+            self.assertIn(f"ProcessId={pid}", queries[0])
+        for pid in (500, 501, 502):
+            self.assertIn(f"ProcessId={pid}", queries[1])
+        for pid in (400, 401, 402):
+            self.assertIn(f"ProcessId={pid}", queries[2])
+        self.assertEqual(sorted(self.owner_calls()), [16892, 17000, 17001], "GetOwner is asked for the TARGET rows only, never for a parent")
+        self.assertEqual({r["pid"] for r in p["identity"]["processes"]}, {16892, 17000, 17001})
+        self.assertEqual(self.row(p, 17001)["grandparent"]["pid"], 402)
+
+    def test_the_project_comes_from_self_then_parent_then_grandparent_and_otherwise_is_unknown(self) -> None:
+        t = IDENT_T0
+        old = _ident_dt.timedelta(seconds=9)
+        procs = [(16892, "python", 29.0, t), (17000, "python", 28.0, t), (17001, "python", 27.0, t)]
+        cim = [_ident_cim(16892, 500, "python.exe", t, r"C:\Python\python.exe C:\Users\x\job.py"), _ident_cim(17000, 501, "python.exe", t, r"C:\Python\python.exe C:\Users\x\job.py"),
+               _ident_cim(17001, 502, "python.exe", t, r"C:\Python\python.exe C:\Users\x\job.py"),
+               _ident_cim(500, 400, "pwsh.exe", t - old, r"pwsh -File C:\Users\layib\agent-bridge\run.ps1"), _ident_cim(501, 401, "pwsh.exe", t - old, "pwsh -NoProfile"),
+               _ident_cim(502, 402, "pwsh.exe", t - old, "pwsh -NoProfile"),
+               _ident_cim(400, 0, "explorer.exe", t - old, "explorer.exe"), _ident_cim(401, 0, "explorer.exe", t - old, "explorer.exe"),
+               _ident_cim(402, 0, "airmypc.exe", t - old, r"C:\Tools\AirMyPC\airmypc.exe")]
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS)
+        self.assertEqual((self.row(p, 16892)["project"], self.row(p, 16892)["project_from"]), ("agent-bridge", "parent"))
+        self.assertEqual((self.row(p, 17000)["project"], self.row(p, 17000)["project_from"]), ("unknown", "none"))
+        self.assertEqual((self.row(p, 17001)["project"], self.row(p, 17001)["project_from"]), ("airmypc", "grandparent"))
+
+    def test_an_unreadable_owner_and_command_line_are_typed_never_guessed(self) -> None:
+        t = IDENT_T0
+        procs = [(16892, "python", 29.0, t)]
+        cim = [_ident_cim(16892, 0, "python.exe", t, None, None)]
+        p = self.run_identity_probe(procs, cim, {})   # no owner answer: GetOwner returns ReturnValue 2 (access denied)
+        r = self.row(p, 16892)
+        self.assertEqual((r["owner"], r["owner_status"]), (None, "access-denied"))
+        self.assertEqual((r["cmdline"], r["cmdline_status"], r["exe"], r["exe_status"], r["script"]), (None, "unreadable", None, "unreadable", None))
+        self.assertEqual((r["project"], r["project_from"]), ("unknown", "none"))
+        self.assertEqual(r["parent"]["status"], "none")
+
+    def test_other_getowner_failures_are_typed_by_return_value(self) -> None:
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py")]
+        p = self.run_identity_probe([(16892, "python", 29.0, t)], cim, {16892: (8, None, None)})
+        self.assertEqual((self.row(p, 16892)["owner"], self.row(p, 16892)["owner_status"]), (None, "error-8"))
+
+    def test_an_exited_pid_a_reused_pid_and_a_reused_parent_are_typed_and_never_borrow_another_identity(self) -> None:
+        t = IDENT_T0
+        later = _ident_dt.timedelta(seconds=30)
+        procs = [(16892, "python", 29.0, t), (17000, "python", 28.0, t), (17001, "python", 27.0, t)]
+        cim = [  # 16892: no CIM row at all (exited); 17000: CIM start differs from the sampled start (pid reused); 17001: its parent started AFTER it
+            _ident_cim(17000, 501, "other.exe", t + _ident_dt.timedelta(hours=1), r"C:\Users\x\other.exe --secret-sauce", r"C:\Users\x\other.exe"),
+            _ident_cim(17001, 502, "python.exe", t, r"C:\Python\python.exe C:\mlvtmp\lane-X-1\run.py"),
+            _ident_cim(502, 402, "pwsh.exe", t + later, r"pwsh -File C:\Users\layib\agent-bridge\run.ps1"),
+            _ident_cim(402, 0, "explorer.exe", t - _ident_dt.timedelta(hours=1), "explorer.exe")]
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS)
+        gone = self.row(p, 16892)
+        self.assertEqual((gone["owner"], gone["owner_status"], gone["cmdline"], gone["cmdline_status"], gone["exe"], gone["exe_status"]), (None, "exited", None, "exited", None, "exited"))
+        self.assertEqual(gone["parent"]["status"], "none")
+        reused = self.row(p, 17000)
+        self.assertEqual(set(reused), {"pid", "name", "start_check"}, "a mismatched start carries pid, name and start_check only")
+        self.assertEqual((reused["name"], reused["start_check"]), ("python", "mismatch"), "the name is the SAMPLED one, never the new process's")
+        self.assertNotIn(17000, self.owner_calls(), "no GetOwner for a pid that is no longer the sampled process")
+        self.assertNotIn("other.exe", json.dumps(p["identity"]))
+        self.assertNotIn("secret-sauce", json.dumps(p["identity"]))
+        child = self.row(p, 17001)
+        self.assertEqual(child["parent"]["status"], "pid-reused")
+        self.assertEqual((child["parent"]["name"], child["parent"]["started_utc"]), (None, None), "a reused parent is never named")
+        self.assertEqual(child["grandparent"]["status"], "none")
+        self.assertEqual((child["project"], child["project_from"]), ("mlv-app", "self"))
+
+    def test_a_reused_parent_does_not_lend_its_project(self) -> None:
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 502, "python.exe", t, r"C:\Python\python.exe C:\Users\x\job.py"),
+               _ident_cim(502, 0, "pwsh.exe", t + _ident_dt.timedelta(seconds=30), r"pwsh -File C:\Users\layib\agent-bridge\run.ps1")]
+        p = self.run_identity_probe([(16892, "python", 29.0, t)], cim, CHAIN_OWNERS)
+        self.assertEqual((self.row(p, 16892)["project"], self.row(p, 16892)["project_from"]), ("unknown", "none"))
+
+    def test_redaction_vectors_and_the_200_character_cap(self) -> None:
+        b64 = _ident_base64.b64encode(b"A" * 36).decode()
+        self.assertEqual(len(b64), 48)
+        card = "lane-CPU-17V9-FPS-GAP-AB-1-r5x-20261024T0110Z"
+        self.assertEqual(len(card), 45)
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcDEF123_-xyzABC789"
+        base = "python.exe "
+        cap_cmd = base + ("ab " * 200)[:500 - len(base)]
+        self.assertEqual(len(cap_cmd), 500)
+        vectors = [
+            ("url userinfo", "curl https://user:pw123@host.example/x", ["pw123", "user:pw"], "https://<redacted>@host.example/x"),
+            ("bearer", "tool --header Bearer abcDEF123456 go", ["abcDEF123456"], "Bearer <redacted>"),
+            ("password=", "app password=hunter2 run", ["hunter2"], "password=<redacted>"),
+            ("--secret quoted", 'app --secret "a b" go', ['"a b"'], "--secret <redacted> go"),
+            ("token prefixes", "x sk-abcdefghijklmnop ghp_abcdefghijklmnop12 AKIAABCDEFGHIJKLMNOP", ["sk-abcdefghijklmnop", "ghp_abcdefghijklmnop12", "AKIAABCDEFGHIJKLMNOP"], "<redacted> <redacted> <redacted>"),
+            ("jwt", f"y {jwt}", [jwt, "eyJhbGci"], "y <redacted>"),
+            ("opaque run", f"z {b64}", [b64], "z <redacted>"),
+        ]
+        t = IDENT_T0
+        procs = []; cim = []
+        for i, (_label, cmd, _gone, _want) in enumerate(vectors):
+            procs.append((1001 + i, "tool", 20.0 - i, t)); cim.append(_ident_cim(1001 + i, 0, "tool.exe", t, cmd))
+        procs.append((1101, "tool", 9.0, t)); cim.append(_ident_cim(1101, 0, "tool.exe", t, rf"python C:\x\tool.py {card}"))
+        long_exe = "C:\\" + "\\".join(["d" * 20] * 10) + "\\python.exe"   # r5: only the exe path can be long enough to reach the cap
+        procs.append((1102, "tool", 8.0, t)); cim.append(_ident_cim(1102, 0, "python.exe", t, cap_cmd, long_exe))
+        p = self.run_identity_probe(procs, cim, {})
+        for i, (label, cmd, gone, _want) in enumerate(vectors):   # r5: no line keeps argument text, so the r1 `want` (the text around a redacted value) is retired
+            r = self.row(p, 1001 + i)
+            for secret in gone:
+                self.assertNotIn(secret, r["cmdline"], label)
+            self.assertEqual(r["args_redacted"], "all", label)
+            self.assertRegex(r["cmdline"], r"^tool\.exe args=\d+ script=<none>$", label)
+        no_text = self.row(p, 1101)
+        self.assertEqual(no_text["cmdline"], "tool.exe args=2 script=<none>", "r5: even a clean card name is argument text and is not persisted")
+        capped = self.row(p, 1102)
+        full = f"{long_exe} args={len(cap_cmd[len(base):].split())} script=<none>"
+        self.assertGreater(len(full), 200)
+        self.assertEqual(capped["cmdline"], full[:200] + f"...[+{len(full) - 200}]")
+        self.assertEqual(capped["cmdline_truncated_chars"], len(full) - 200)
+
+    def test_gpu_is_the_per_process_max_over_engines_and_a_gpu_only_pid_becomes_a_target(self) -> None:
+        t = IDENT_T0
+        procs = [(16892, "python", 29.1, t)]
+        cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py"), _ident_cim(7777, 0, "wmiprvse.exe", t - _ident_dt.timedelta(hours=2), r"C:\Windows\system32\wbem\wmiprvse.exe")]
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS | {7777: (0, "NT AUTHORITY", "NETWORK SERVICE")},
+                                    gpu=[(16892, 0, 40.0), (16892, 1, 15.0), (7777, 0, 12.0)])
+        ident = p["identity"]
+        self.assertEqual(ident["gpu_status"], "ok")
+        self.assertEqual(ident["gpu_top"], [16892, 7777])
+        r = self.row(p, 16892)
+        self.assertEqual((r["gpu_percent"], r["gpu_engtype"], r["gpu_status"]), (40.0, "3d", "ok"), "the max over engines (40), not their sum (55)")
+        g = self.row(p, 7777)
+        self.assertEqual(g["source"], ["gpu_top"])
+        self.assertEqual((g["owner"], g["gpu_percent"], g["name"]), ("NT AUTHORITY\\NETWORK SERVICE", 12.0, "wmiprvse"))
+
+    def test_a_pid_with_no_gpu_instance_is_zero_and_an_unreadable_counter_is_typed_null(self) -> None:
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py")]
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS, gpu=[(7777, 0, 12.0)])
+        r = self.row(p, 16892)
+        self.assertEqual((r["gpu_percent"], r["gpu_engtype"], r["gpu_status"]), (0.0, None, "no-gpu-context"))
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS, gpu=[])
+        self.assertTrue(p["identity"]["gpu_status"].startswith("counter-unavailable: "), p["identity"]["gpu_status"])
+        r = self.row(p, 16892)
+        self.assertEqual((r["gpu_percent"], r["gpu_engtype"]), (None, None))
+        self.assertEqual(r["gpu_status"], p["identity"]["gpu_status"])
+        self.assertEqual(p["identity"]["gpu_top"], [])
+
+    def test_a_get_counter_that_rejects_the_gpu_read_is_typed_and_changes_nothing_else(self) -> None:
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py")]
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS, old_counter_shadow=True)
+        self.assertTrue(p["identity"]["gpu_status"].startswith("counter-unavailable: "), p["identity"]["gpu_status"])
+        self.assertEqual(self.row(p, 16892)["owner"], "BACHELOR\\layib", "the CIM half of identity still works")
+
+    def test_the_gpu_read_can_be_switched_off_with_a_typed_reason(self) -> None:
+        body = _ident_probe_body().replace("$IdentityGpu = $true", "$IdentityGpu = $false").replace("$IdentityGpuDisabledWhy = ''", "$IdentityGpuDisabledWhy = 'disabled: dev-host read 9999 ms exceeded 2500 ms'")
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "python.exe", t, "python a.py")]
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], body=body)
+        self.assertEqual(p["identity"]["gpu_status"], "disabled: dev-host read 9999 ms exceeded 2500 ms")
+        self.assertNotIn("gpu_top", p["identity"])
+        self.assertEqual((self.row(p, 16892)["gpu_percent"], self.row(p, 16892)["gpu_status"]), (None, p["identity"]["gpu_status"]))
+
+    def test_an_identity_failure_is_typed_and_every_other_field_is_unchanged(self) -> None:
+        t = IDENT_T0
+        procs = [(16892, "python", 29.1, t), (500, "pwsh", 1.0, t)]
+        cim = [_ident_cim(16892, 500, "python.exe", t, "python a.py"), _ident_cim(500, 0, "pwsh.exe", t, "pwsh")]
+        boom = self.run_identity_probe(procs, cim, CHAIN_OWNERS, throw=True)
+        self.assertEqual(set(boom["identity"]), {"schema", "error"})
+        self.assertEqual(boom["identity"]["schema"], IDENT_SCHEMA)
+        self.assertIn("canned CIM failure", boom["identity"]["error"])
+        # the same probe with the identity code CUT OUT is the reference: samples, top and every v2 field must equal it
+        body = _ident_probe_body()
+        cut = re.sub(r"# IDENTITY \(VENUE-PROBE-PROCESS-ATTRIBUTION-1\).*?(?=Write-Output \('VENUE_QUIET=')", "", body, flags=re.S).replace("    identity = $identity\n", "").replace("    identity = $identity\r\n", "")
+        self.assertNotIn("identity", cut)
+        plain = self.run_identity_probe(procs, cim, CHAIN_OWNERS, body=cut)
+        self.assertNotIn("identity", plain)
+        ok = self.run_identity_probe(procs, cim, CHAIN_OWNERS)
+        for k, v in plain.items():
+            self.assertEqual(boom[k], v, f"{k} changed when identity failed")
+            self.assertEqual(ok[k], v, f"{k} changed when identity ran")
+        self.assertEqual(set(boom) - set(plain), {"identity"})
+
+    def test_past_the_wall_clock_budget_no_further_getowner_is_made_and_the_rest_is_still_filled(self) -> None:
+        body = _ident_probe_body().replace("$IdentityBudgetMs = 25000", "$IdentityBudgetMs = -1")
+        self.assertIn("$IdentityBudgetMs = -1", body)
+        t = IDENT_T0
+        cim = [_ident_cim(16892, 0, "python.exe", t, r"C:\mlvtmp\lane-X-1\bench.py")]
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS, body=body)
+        r = self.row(p, 16892)
+        self.assertEqual((r["owner"], r["owner_status"]), (None, "budget-exceeded"))
+        self.assertEqual(self.owner_calls(), [], "no GetOwner call once the budget is spent")
+        self.assertEqual((r["project"], r["cmdline"], r["cmdline_status"]), ("mlv-app", "python.exe args=0 script=<none>", "ok"), "what needs no call is still filled")
+
+    def test_the_budget_is_a_pinned_literal_well_inside_the_120_second_submission_timeout(self) -> None:
+        m = re.search(r"\$IdentityBudgetMs = (\d+)", _ident_probe_body())
+        self.assertIsNotNone(m)
+        self.assertLessEqual(int(m.group(1)), 30000)
+
+    def test_the_decision_counters_never_include_the_gpu_engine(self) -> None:
+        body = _ident_probe_body()
+        decision = re.search(r"\$groups = \[ordered\]@\{.*?\$allPaths = [^\n]*", body, re.S).group(0)
+        self.assertNotIn("gpu engine", decision.lower())
+        self.assertEqual(body.count("Get-Counter -Counter '\\GPU Engine(*)"), 1, "exactly ONE GPU Engine read in the probe")
+        self.assertEqual(len(re.findall(r"\bGet-Counter -Counter\b", re.sub(r"(?m)^\s*#.*$", "", body))), 2, "the decision read plus the one GPU read, nothing else")
+        self.assertEqual(body.count("Start-Sleep -Seconds 12"), 1, "no new sleep text: the 12 s cadence is the gate's contract")
+        self.assertEqual(len(re.findall(r"Get-CimInstance", body)), 1, "one query helper, called at most three times")
+        self.assertNotIn("Win32_Process |", body, "never a full-table enumeration")
+        self.assertNotRegex(body, r"(?i)\bGet-WmiObject\b|\bGetEnvironmentVariable\b|ReadProcessMemory")
+
+    def test_the_real_probe_job_emits_a_typed_identity_with_a_status_for_every_null(self) -> None:
+        job = self.tmp / "real-probe-job.ps1"
+        job.write_text(_ident_probe_body().replace("Start-Sleep -Seconds 12", "Start-Sleep -Seconds 0"), encoding="utf-8")
+        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=240)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("VENUE_QUIET=")]
+        self.assertEqual(len(lines), 1, proc.stdout + proc.stderr)
+        p = json.loads(lines[0][len("VENUE_QUIET="):])
+        self.assertEqual(p["schema"], "mlv-app/venue-quiet-probe/v2")
+        ident = p["identity"]
+        self.assertEqual(ident["schema"], IDENT_SCHEMA)
+        if "error" in ident:   # a host where identity cannot run still emits a typed error, never a malformed line
+            self.assertTrue(isinstance(ident["error"], str) and ident["error"])
+            return
+        self.assertTrue(all(isinstance(v, int) and v >= 0 for v in ident["cost_ms"].values()), ident["cost_ms"])
+        self.assertIsInstance(ident["elevated"], bool)
+        self.assertTrue(ident["probe_user"])
+        top_pids = {t["pid"] for t in p["top"]}
+        self.assertTrue(top_pids <= {r["pid"] for r in ident["processes"]}, "every top pid has an identity row")
+        for r in ident["processes"]:
+            if r["start_check"] == "mismatch":
+                self.assertEqual(set(r), {"pid", "name", "start_check"})
+                continue
+            self.assertTrue(r["name"])
+            self.assertTrue(set(r["source"]) <= {"top", "top_processes", "gpu_top"} and r["source"])
+            if r["owner"] is None:
+                self.assertRegex(r["owner_status"], r"^(access-denied|exited|budget-exceeded|error-\w+)$")
+            else:
+                self.assertEqual(r["owner_status"], "ok")
+            for value, status in (("cmdline", "cmdline_status"), ("exe", "exe_status")):
+                self.assertTrue((r[value] is None) == (r[status] != "ok"), (value, r))
+            # r6: this host's real processes go through the real worker-side script check
+            self.assertIn(r["script_check"], R6_SCRIPT_CHECKS if r["cmdline_status"] == "ok" else (None,), r)
+            self.assertEqual(r["script"] is not None, r["script_check"] == "ok", r)
+            self.assertTrue((r["gpu_percent"] is None) == (r["gpu_status"] not in ("ok", "no-gpu-context")), r)
+            self.assertIn(r["project"], ("mlv-app", "agent-bridge", "adobe-ingester", "fleet-doctrine", "adversarialllm", "virtual-ten", "airmypc", "unknown"))
+            self.assertIn(r["parent"]["status"], ("ok", "exited", "pid-reused", "none"))
+            self.assertIn(r["grandparent"]["status"], ("ok", "exited", "pid-reused", "none"))
+            for k in ("cmdline", "exe"):
+                self.assertTrue(r[k] is None or len(r[k]) <= 200 + len("...[+999999]"))
+
+
+IDENT_ROW = {"pid": 16892, "name": "python", "source": ["top", "top_processes"], "started_utc": "2026-10-24T01:02:03.0000000Z", "start_check": "match",
+             "owner": "BACHELOR\\layib", "owner_status": "ok", "cmdline": "python bench.py --token <redacted>", "cmdline_status": "ok", "cmdline_redactions": 1,
+             "cmdline_truncated_chars": 0, "exe": "C:\\Python\\python.exe", "exe_status": "ok", "script": "bench.py", "project": "mlv-app", "project_from": "self",
+             "parent": {"pid": 500, "name": "pwsh", "started_utc": "2026-10-24T01:01:03.0000000Z", "status": "ok"},
+             "grandparent": {"pid": 400, "name": "explorer", "started_utc": "2026-10-23T23:02:03.0000000Z", "status": "ok"},
+             "gpu_percent": 40.0, "gpu_engtype": "3d", "gpu_status": "ok"}
+IDENT_GPU_ROW = dict(IDENT_ROW, pid=7777, name="wmiprvse", source=["gpu_top"], owner="NT AUTHORITY\\NETWORK SERVICE", script=None, project="unknown", project_from="none",
+                     parent={"pid": None, "name": None, "started_utc": None, "status": "none"}, grandparent={"pid": None, "name": None, "started_utc": None, "status": "none"},
+                     gpu_percent=12.0)
+IDENT_DENIED_ROW = dict(IDENT_ROW, pid=4, name="system", owner=None, owner_status="access-denied", cmdline=None, cmdline_status="unreadable", exe=None, exe_status="unreadable",
+                        script=None, project="unknown", project_from="none", gpu_percent=None, gpu_engtype=None, gpu_status="counter-unavailable: x")
+IDENT_MISMATCH_ROW = {"pid": 4242, "name": "pwsh", "start_check": "mismatch"}
+IDENT_BLOCK = {"schema": IDENT_SCHEMA, "probe_user": "BACHELOR\\layib", "elevated": False, "project_roots": "r1", "gpu_basis": "per-process max over GPU engines of summed ...",
+               "gpu_status": "ok", "gpu_top": [16892, 7777], "processes": [IDENT_ROW, IDENT_GPU_ROW, IDENT_DENIED_ROW, IDENT_MISMATCH_ROW],
+               "cost_ms": {"cim": 12, "owner": 300, "gpu": 1200, "total": 1600}, "notes": {"cim_queries": "1 WQL queries for 4 target pid(s) (bound: 3); GetOwner once per target"}}
+IDENT_TOP = [{"name": "python", "pid": 16892, "cpuSeconds": 29.1}, {"name": "pwsh", "pid": 4242, "cpuSeconds": 12.5}, {"name": "system", "pid": 4, "cpuSeconds": 3.5},
+             {"name": "svchost", "pid": 999, "cpuSeconds": 1.5}]
+
+
+@requires_windows_pwsh
+class VenueProbeIdentityGateTextTests(unittest.TestCase):
+    setUp = VenueQuietAttributionTests.setUp
+    gate = VenueQuietAttributionTests.gate
+
+    def probe(self, **extra) -> dict:
+        return dict(V2_PROBE, top=IDENT_TOP, identity=IDENT_BLOCK, **extra)
+
+    def test_top_lines_keep_their_prefix_and_append_comma_free_key_value_pairs(self) -> None:
+        proc = self.gate(self.probe())
+        out = proc.stdout
+        self.assertEqual(proc.returncode, 0, out + proc.stderr)
+        self.assertRegex(out, r"(?m)^COOLDOWN_UNMET mean=50\.0% threshold=20(\.0)?% waitedSec=\d+$", "the verdict is unchanged")
+        self.assertIn("  top python pid=16892 cpuSeconds=29.1 owner=BACHELOR\\layib project=mlv-app script=bench.py parent=pwsh:500|ok gparent=explorer:400|ok started=2026-10-24T01:02:03Z gpu=40.0%\n", out.replace("\r\n", "\n"))
+        self.assertIn("  top pwsh pid=4242 cpuSeconds=12.5 ident=pid-reused\n", out.replace("\r\n", "\n"), "a reused pid is named as such and nothing else")
+        self.assertIn("  top system pid=4 cpuSeconds=3.5 owner=unreadable(access-denied) project=unknown script=n/a parent=pwsh:500|ok gparent=explorer:400|ok started=2026-10-24T01:02:03Z gpu=n/a\n", out.replace("\r\n", "\n"))
+        self.assertRegex(out, r"(?m)^  top svchost pid=999 cpuSeconds=1\.5$", "a top row with no identity row prints exactly what it printed before")
+        for line in out.splitlines():
+            if line.startswith("  top ") and "cpuSeconds=" in line:
+                for token in line.split("cpuSeconds=", 1)[1].split()[1:]:   # everything after the cpuSeconds value
+                    self.assertRegex(token, r"^[a-z]+=\S+$", line)
+                    self.assertNotIn(",", token)
+        self.assertNotIn("bench.py --token", out, "no command line is ever printed")
+
+    def test_the_run_local_driver_transform_still_yields_the_process_name(self) -> None:
+        out = self.gate(self.probe()).stdout.replace("\r\n", "\n")
+        line = next(ln for ln in out.split("\n") if ln.startswith("  top python pid=16892 cpuSeconds=29.1 "))
+        step = re.sub(r"\s+cpuSeconds=", ":", re.sub(r"^\s+top\s+", "", line))
+        entries = re.split(r",\s*", step)
+        self.assertEqual(len(entries), 1, "no appended value contains a comma")
+        self.assertEqual(entries[0].split()[0], "python")
+        self.assertTrue(entries[0].startswith("python pid=16892:29.1 "), entries[0])
+
+    def test_whitespace_and_commas_in_an_owner_are_replaced_by_underscores(self) -> None:
+        row = dict(IDENT_ROW, owner="BACH ELOR\\lay,ib", script="my script.py", name="py thon")
+        proc = self.gate(dict(V2_PROBE, top=IDENT_TOP[:1], identity=dict(IDENT_BLOCK, processes=[row], gpu_top=[])))
+        self.assertIn("owner=BACH_ELOR\\lay_ib project=mlv-app script=my_script.py ", proc.stdout)
+
+    def test_attr_proc_lines_gain_owner_and_project_and_the_rest_are_unchanged(self) -> None:
+        probe = self.probe(top_processes=[{"instance": "python", "pid": 16892, "percent": 6.0}, {"instance": "aws", "pid": 43644, "percent": 4.79},
+                                          {"instance": "pwsh", "pid": 4242, "percent": 1.0}])
+        out = self.gate(probe).stdout
+        self.assertRegex(out, r"(?m)^  attr proc python pid=16892 pct=6\.0% owner=BACHELOR\\layib project=mlv-app$")
+        self.assertRegex(out, r"(?m)^  attr proc aws pid=43644 pct=4\.8%$")
+        self.assertRegex(out, r"(?m)^  attr proc pwsh pid=4242 pct=1\.0% ident=pid-reused$")
+
+    def test_ident_lines_follow_the_attr_lines(self) -> None:
+        out = self.gate(self.probe()).stdout.replace("\r\n", "\n")
+        self.assertIn("  ident probe user=BACHELOR\\layib elevated=false cost cim=12 owner=300 gpu=1200 total=1600\n", out)
+        self.assertIn("  ident gpu wmiprvse pid=7777 gpu=12.0% engtype=3d owner=NT_AUTHORITY\\NETWORK_SERVICE project=unknown\n", out)
+        self.assertNotIn("  ident gpu python", out, "a GPU pid already printed in top is not printed twice")
+        self.assertIn("  ident note cim_queries: 1 WQL queries for 4 target pid(s) (bound: 3); GetOwner once per target\n", out)
+        self.assertLess(out.index("  attr cores"), out.index("  ident probe "))
+        self.assertLess(out.index("COOLDOWN_UNMET"), out.index("  top python"))
+
+    def test_an_identity_error_prints_one_line_and_changes_nothing_else(self) -> None:
+        plain = self.gate(dict(V2_PROBE, top=IDENT_TOP)).stdout.replace("\r\n", "\n")
+        bad = self.gate(dict(V2_PROBE, top=IDENT_TOP, identity={"schema": IDENT_SCHEMA, "error": "canned CIM failure"}))
+        self.assertEqual(bad.returncode, 0, bad.stdout + bad.stderr)
+        out = bad.stdout.replace("\r\n", "\n")
+        self.assertIn("  ident error canned CIM failure\n", out)
+        keep = lambda text: [ln for ln in text.split("\n") if ln.startswith(("  top ", "  attr "))]
+        self.assertEqual(keep(out), keep(plain))
+
+    def test_a_probe_without_a_usable_identity_prints_exactly_what_it_printed_before(self) -> None:
+        plain = self.gate(dict(V2_PROBE, top=IDENT_TOP)).stdout.replace("\r\n", "\n")
+        keep = lambda text: [ln for ln in text.split("\n") if ln.startswith(("  top ", "  attr ", "  ident "))]
+        for odd in ({"schema": "mlv-app/venue-quiet-probe-identity/v9", "processes": [IDENT_ROW]}, "garbage", 7, [IDENT_ROW]):
+            proc = self.gate(dict(V2_PROBE, top=IDENT_TOP, identity=odd))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(keep(proc.stdout.replace("\r\n", "\n")), keep(plain), odd)
+        v1 = self.gate(dict(V1_PROBE, identity=IDENT_BLOCK)).stdout
+        self.assertRegex(v1, r"(?m)^  top pwsh pid=4242 cpuSeconds=12\.5 ident=pid-reused$", "identity is read from any probe that carries it")
+
+    def test_a_malformed_identity_never_changes_the_verdict_or_the_exit_code(self) -> None:
+        for odd in (dict(IDENT_BLOCK, processes=7), dict(IDENT_BLOCK, cost_ms=None, notes=None, gpu_top=7), dict(IDENT_BLOCK, processes=[None, {"pid": None}, 5])):
+            proc = self.gate(dict(V2_PROBE, top=IDENT_TOP, identity=odd))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+        proc = self.gate(dict(V2_PROBE, top=IDENT_TOP, samples=[5.0, None, 5.0], identity=IDENT_BLOCK))
+        self.assertEqual(proc.returncode, 6, "an unmeasured venue stays UNKNOWN, with no identity text")
+        self.assertNotIn("  ident ", proc.stdout)
+
+    def test_a_quiet_probe_is_attributed_too(self) -> None:
+        proc = self.gate(self.probe(samples=[5.0, 5.0, 5.0]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=5\.0% ")
+        self.assertIn("owner=BACHELOR\\layib project=mlv-app", proc.stdout)
+
+    def test_the_header_states_the_identity_contract(self) -> None:
+        header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
+        for needle in ("PROCESS IDENTITY", "mlv-app/venue-quiet-probe-identity/v1", "top-level schema stays v2", "AFTER the sample window", "at most 3 WQL", "GetOwner per TARGET",
+                       "separate Get-Counter call", "REDACTION", "200-character cap", "NON-ELEVATED DEGRADATION", "WALL-CLOCK BUDGET", "budget-exceeded", "working directory is NOT collected", "Summarize-VenueBusyProbes.ps1"):
+            self.assertIn(needle, header)
+        for kept in ("schema v2", "The v1 `samples` and `top` fields are unchanged", "core_class unknown", "6 VENUE_QUIET_UNKNOWN"):
+            self.assertIn(kept, header)
+
+    def test_the_new_scripts_are_ascii_only(self) -> None:
+        for name in ("Wait-VenueQuiet.ps1", "Summarize-VenueBusyProbes.ps1"):
+            data = (DV / name).read_bytes()
+            self.assertFalse([b for b in data if b > 127], f"{name} must stay ASCII-only")
+
+
+def _ident_summary_probe(samples, top, identity=None) -> dict:
+    probe = dict(V2_PROBE, samples=samples, top=top)
+    if identity is not None:
+        probe["identity"] = identity
+    return probe
+
+
+@requires_windows_pwsh
+class VenueBusyProbeSummaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-busy-summary-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        self.tree = self.tmp / "tree"
+        self.dv = self.tree / "tools" / "profiling" / "dual-venue"
+        shutil.copytree(DV, self.dv, ignore=shutil.ignore_patterns("__pycache__"))
+        self.share = self.tmp / "share-bachelor"
+        (self.share / "inbox").mkdir(parents=True)
+        table = json.loads((self.dv / "venues.json").read_text(encoding="utf-8"))
+        table["venues"]["bachelor"]["agentShare"] = str(self.share)
+        table["venues"]["bachelor"]["agentRoot"] = str(self.share) + "-root"
+        (self.dv / "venues.json").write_text(json.dumps(table), encoding="utf-8")
+        self.probes = self.tmp / "probes"
+        self.probes.mkdir()
+
+    def write(self, name: str, probe) -> Path:
+        path = self.probes / name
+        path.write_text(probe if isinstance(probe, str) else json.dumps(probe), encoding="utf-8")
+        return path
+
+    def fixtures(self) -> None:
+        busy_a = _ident_summary_probe([50.0, 50.0, 50.0], [{"name": "python", "pid": 16892, "cpuSeconds": 29.1}, {"name": "explorer", "pid": 30, "cpuSeconds": 3.0}],
+                                      dict(IDENT_BLOCK, processes=[dict(IDENT_ROW, gpu_percent=40.0),
+                                                                    dict(IDENT_DENIED_ROW, pid=30, name="explorer", gpu_percent=None, gpu_status="no-gpu-context")], gpu_top=[16892]))
+        busy_b = _ident_summary_probe([60.0, 60.0, 60.0], [{"name": "python", "pid": 16372, "cpuSeconds": 29.0}],
+                                      dict(IDENT_BLOCK, processes=[dict(IDENT_ROW, pid=16372, script="other.py", gpu_percent=55.5)], gpu_top=[16372]))
+        busy_v2 = _ident_summary_probe([70.0, 70.0, 70.0], [{"name": "pwsh", "pid": 4242, "cpuSeconds": 12.5}])
+        quiet = _ident_summary_probe([5.0, 5.0, 5.0], [{"name": "python", "pid": 1, "cpuSeconds": 99.0}], dict(IDENT_BLOCK, processes=[dict(IDENT_ROW, pid=1)]))
+        self.write("venue-quiet-probe-20261024T010000000Z.json", busy_a)
+        self.write("venue-quiet-probe-20261024T010100000Z.json", busy_b)
+        self.write("venue-quiet-probe-20261024T010200000Z.json", busy_v2)
+        self.write("venue-quiet-probe-20261024T010300000Z.json", quiet)
+
+    def summarize(self, *args: str, source: str | None = None) -> subprocess.CompletedProcess:
+        cmd = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"), *args]
+        if source:
+            cmd += ["-DecisionSource", source]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+
+    def test_busy_probes_are_grouped_by_project_with_exact_text_lines(self) -> None:
+        self.fixtures()
+        proc = self.summarize("-ProbeDir", str(self.probes))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = proc.stdout.replace("\r\n", "\n").strip().split("\n")
+        self.assertEqual(lines[0], "- Busy probes summarized: 3 (quiet skipped 1, unknown skipped 0, unreadable 0)")
+        self.assertEqual(lines[1], "- Busy probes by project (probes in which the project held a top-5 CPU row; cpuSeconds summed over those rows): "
+                                   "mlv-app (2 probes, 58.1 s; e.g. python script=bench.py owner=BACHELOR\\layib; python script=other.py owner=BACHELOR\\layib), "
+                                   "unknown(no-identity) (1 probes, 12.5 s; e.g. pwsh script=n/a owner=n/a), "
+                                   "unknown (1 probes, 3.0 s; e.g. explorer script=n/a owner=unreadable(access-denied))")
+        self.assertEqual(lines[2], "- GPU-heavy across busy probes: python pid=16372 project=mlv-app max gpu=55.5% (1 probes), python pid=16892 project=mlv-app max gpu=40.0% (1 probes)")
+        self.assertEqual(len(lines), 3)
+
+    def test_json_output_is_one_parseable_object_with_the_same_aggregate(self) -> None:
+        self.fixtures()
+        proc = self.summarize("-ProbeDir", str(self.probes), "-Json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        j = json.loads(proc.stdout)
+        self.assertEqual(j["schema"], "mlv-app/venue-busy-probe-summary/v1")
+        self.assertEqual((j["busy_probes"], j["quiet_skipped"], j["unknown_skipped"], j["unreadable"]), (3, 1, 0, 0))
+        self.assertEqual([p["project"] for p in j["projects"]], ["mlv-app", "unknown(no-identity)", "unknown"])
+        self.assertEqual((j["projects"][0]["probes"], j["projects"][0]["cpu_seconds"]), (2, 58.1))
+        self.assertEqual(j["projects"][0]["examples"][0], {"name": "python", "script": "bench.py", "owner": "BACHELOR\\layib"})
+        self.assertEqual([g["pid"] for g in j["gpu_heavy"]], [16372, 16892])
+
+    def test_include_quiet_keeps_the_quiet_probes(self) -> None:
+        self.fixtures()
+        proc = self.summarize("-ProbeDir", str(self.probes), "-IncludeQuiet")
+        self.assertEqual(proc.stdout.splitlines()[0], "- Busy probes summarized: 4 (quiet skipped 0, unknown skipped 0, unreadable 0)")
+
+    def test_the_decision_is_the_gates_own_unrounded_rule(self) -> None:
+        # three 20.04% samples print as 20.0% but are BUSY at the 20 threshold (the gate's UNROUNDED mean decides)
+        self.write("venue-quiet-probe-20261024T010000000Z.json", _ident_summary_probe([20.04, 20.04, 20.04], [{"name": "pwsh", "pid": 4242, "cpuSeconds": 1.0}]))
+        self.write("venue-quiet-probe-20261024T010100000Z.json", _ident_summary_probe([5.0, None, 5.0], [{"name": "pwsh", "pid": 4242, "cpuSeconds": 1.0}]))
+        proc = self.summarize("-ProbeDir", str(self.probes))
+        self.assertEqual(proc.stdout.splitlines()[0], "- Busy probes summarized: 1 (quiet skipped 0, unknown skipped 1, unreadable 0)")
+
+    def test_a_decision_that_cannot_be_lifted_is_exit_three_not_a_second_copy_of_the_rule(self) -> None:
+        self.fixtures()
+        empty = self.tmp / "no-decision.ps1"
+        empty.write_text("# no decision function here\n", encoding="utf-8")
+        proc = self.summarize("-ProbeDir", str(self.probes), source=str(empty))
+        self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+        self.assertIn("DECISION_LIFT_FAILED", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        text = (DV / "Summarize-VenueBusyProbes.ps1").read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertNotIn("function Get-VenueQuietDecision", code, "the quiet rule is lifted by AST, never copied")
+        self.assertIn("FunctionDefinitionAst", code)
+
+    def test_a_path_inside_a_venue_share_is_refused_before_anything_is_read(self) -> None:
+        inside = self.share / "venue-quiet-probe-20261024T010000000Z.json"
+        inside.write_text(json.dumps(_ident_summary_probe([50.0, 50.0, 50.0], [])), encoding="utf-8")
+        for args in (["-ProbeJson", str(inside)], ["-ProbeDir", str(self.share)], ["-ProbeDir", str(self.share / "inbox")]):
+            proc = self.summarize(*args)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("PROBE_PATH_IN_VENUE_SHARE", proc.stderr)
+            self.assertEqual(proc.stdout, "")
+
+    def test_a_corrupt_file_is_counted_unreadable_and_other_files_in_the_dir_are_ignored(self) -> None:
+        self.fixtures()
+        self.write("venue-quiet-probe-20261024T010400000Z.json", "{ not json")
+        self.write("other-notes.json", "{ not json either")
+        proc = self.summarize("-ProbeDir", str(self.probes))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.splitlines()[0], "- Busy probes summarized: 3 (quiet skipped 1, unknown skipped 0, unreadable 1)")
+
+    def test_a_comma_joined_probe_json_list_reaches_the_script_as_separate_files(self) -> None:
+        # under `pwsh -File` a comma list reaches a [string[]] parameter as ONE string (CI: test_pwsh_string_array_file_params.py); the script must split it itself
+        self.fixtures()
+        a = self.probes / "venue-quiet-probe-20261024T010000000Z.json"
+        b = self.probes / "venue-quiet-probe-20261024T010100000Z.json"
+        proc = self.summarize("-ProbeJson", f"{a},{b}", "-Json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        j = json.loads(proc.stdout)
+        self.assertEqual((j["busy_probes"], j["unreadable"]), (2, 0), j)
+        self.assertEqual((j["projects"][0]["project"], j["projects"][0]["probes"], j["projects"][0]["cpu_seconds"]), ("mlv-app", 2, 58.1))
+
+    def test_a_path_that_holds_a_comma_is_one_file_not_two(self) -> None:
+        self.fixtures()
+        odd = self.probes / "venue-quiet-probe-20261024T010900000Z,odd.json"
+        odd.write_text((self.probes / "venue-quiet-probe-20261024T010000000Z.json").read_text(encoding="utf-8"), encoding="utf-8")
+        proc = self.summarize("-ProbeJson", str(odd), "-Json")
+        j = json.loads(proc.stdout)
+        self.assertEqual((j["busy_probes"], j["unreadable"]), (1, 0), j)
+
+    def test_overlapping_probe_json_and_probe_dir_inputs_are_counted_once(self) -> None:
+        self.fixtures()
+        a = self.probes / "venue-quiet-probe-20261024T010000000Z.json"
+        only_dir = json.loads(self.summarize("-ProbeDir", str(self.probes), "-Json").stdout)
+        both = json.loads(self.summarize("-ProbeJson", f"{a},{str(a).upper()}", "-ProbeDir", str(self.probes), "-Json").stdout)
+        self.assertEqual(both, only_dir, "the same file by two spellings and by the directory is ONE probe")
+        self.assertEqual(both["busy_probes"], 3)
+        self.assertEqual(both["projects"][0]["cpu_seconds"], 58.1, "seconds are not doubled")
+        self.assertEqual(both["unreadable"], 0)
+
+    def test_the_same_basename_in_two_directories_is_two_probes_and_not_one(self) -> None:
+        self.fixtures()
+        name = "venue-quiet-probe-20261024T010000000Z.json"
+        d1 = self.tmp / "run-1"; d2 = self.tmp / "run-2"
+        for d in (d1, d2):
+            d.mkdir()
+            shutil.copyfile(self.probes / name, d / name)
+        j = json.loads(self.summarize("-ProbeJson", f"{d1 / name},{d2 / name}", "-Json").stdout)
+        self.assertEqual(j["busy_probes"], 2)
+        mlv = next(p for p in j["projects"] if p["project"] == "mlv-app")
+        self.assertEqual((mlv["probes"], mlv["cpu_seconds"]), (2, 58.2), "two probes held the project, not one")
+        gpu = next(g for g in j["gpu_heavy"] if g["pid"] == 16892)
+        self.assertEqual(gpu["probes"], 2)
+
+    def test_no_input_is_a_usage_error_and_the_script_never_references_the_submitter(self) -> None:
+        proc = self.summarize()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        code = (DV / "Summarize-VenueBusyProbes.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("um-run.ps1", code, "read-only: it is not a submitter and must not name the one writer to a venue share")
+        self.assertNotRegex(code, r"(?i)Remove-Item|Set-Content|Add-Content|Out-File|WriteAllText|New-Item|Move-Item|Copy-Item")
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r2: Dot B1 -- the redacted command line is retained, emitted and persisted as raw JSON, so no credential may reach it. r4 retired the r2/r3
+# per-shape rule tests (they pinned the text kept AROUND a redacted value, which fail-closed redaction no longer keeps); their vectors live on in the r4 table below.
+SYNTH_SECRET = "demoValue42"
+SYNTH_BASIC = "QWxhZGRpbjpvcGVu"   # the RFC 7617 example credential (Aladdin:open): public and synthetic
+
+
+@requires_windows_pwsh
+class VenueProbeIdentityRedactionR2Tests(IdentityProbeMixin, unittest.TestCase):
+    setUp = VenueQuietAttributionTests.setUp
+    gate = VenueQuietAttributionTests.gate
+    def test_the_persisted_raw_json_holds_no_secret_for_the_json_and_the_basic_shapes(self) -> None:
+        t = IDENT_T0
+        cmd = ('python C:\\mlvtmp\\lane-X-1\\tools\\bench.py {"password":"demoValue42","api_key" : "demoValue42"} '
+               '--hdr "Authorization: Basic QWxhZGRpbjpvcGVu" --q password%3DdemoValue42')
+        cim = [_ident_cim(16892, 0, "python.exe", t, cmd, r"C:\Python\python.exe")]
+        p = self.run_identity_probe([(16892, "python", 29.1, t)], cim, CHAIN_OWNERS)
+        for secret in (SYNTH_SECRET, SYNTH_BASIC):
+            self.assertNotIn(secret, self.last_line, "the probe line the gate retains verbatim")
+        self.assertGreaterEqual(self.row(p, 16892)["cmdline_redactions"], 3)
+        self.assertRegex(self.row(p, 16892)["cmdline"], r"^C:\\Python\\python\.exe args=\d+ script=<none>$")
+        # and through the gate: the raw file Wait-VenueQuiet.ps1 writes next to the job file
+        proc = self.gate(dict(p, host="BACHELOR"))
+        raws = [f for f in self.work.glob("venue-quiet-probe-*.json")]
+        self.assertEqual(len(raws), 1, raws)
+        raw = raws[0].read_text(encoding="utf-8")
+        for secret in (SYNTH_SECRET, SYNTH_BASIC):
+            self.assertNotIn(secret, raw)
+        self.assertNotIn(SYNTH_SECRET, proc.stdout)
+
+
+# r2 improvement: every synchronous call in the identity block has a deadline of its OWN (a hung CIM / owner / GPU read must not hold the probe toward its 120 s submission
+# timeout). The forced-slow call is an UNINTERRUPTIBLE .NET sleep in the shadow (what a hung native call looks like), not an already-expired budget.
+@requires_windows_pwsh
+class VenueProbeIdentityCallDeadlineTests(IdentityProbeMixin, unittest.TestCase):
+    DELAY_MS = 20000
+    CALL_MS = 1500
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(prefix="venue-probe-deadline-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        t = IDENT_T0
+        self.procs = [(16892, "python", 29.1, t), (500, "pwsh", 1.0, t)]
+        self.cim = [_ident_cim(16892, 500, "python.exe", t, r"C:\mlvtmp\lane-X-1\bench.py"), _ident_cim(500, 0, "pwsh.exe", t, "pwsh")]
+
+    def reference(self) -> dict:
+        """The same probe with identity cut out: samples, top and every v2 field must equal it whatever happened to identity."""
+        body = re.sub(r"# IDENTITY \(VENUE-PROBE-PROCESS-ATTRIBUTION-1\).*?(?=Write-Output \('VENUE_QUIET=')", "", _ident_probe_body(), flags=re.S).replace("    identity = $identity\r\n", "").replace("    identity = $identity\n", "")
+        return self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, body=body)
+
+    def slow(self, which: str) -> tuple:
+        import time
+        started = time.monotonic()
+        p = self.run_identity_probe(self.procs, self.cim, CHAIN_OWNERS, gpu=[(16892, 0, 40.0)], delays={which: self.DELAY_MS}, call_ms=self.CALL_MS)
+        return p, time.monotonic() - started
+
+    def assert_measurement_unchanged(self, p: dict, elapsed: float) -> None:
+        ref = self.reference()
+        for k, v in ref.items():
+            self.assertEqual(p[k], v, f"{k} changed because an identity call was slow")
+        self.assertLess(elapsed, self.DELAY_MS / 1000.0 - 2, f"the probe waited for the slow call instead of bounding it ({elapsed:.1f} s)")
+
+    def test_a_slow_gpu_read_times_out_into_a_status_and_the_rest_of_identity_is_still_filled(self) -> None:
+        p, elapsed = self.slow("gpu")
+        self.assertTrue(p["identity"]["gpu_status"].startswith("timeout: "), p["identity"])
+        r = self.row(p, 16892)
+        self.assertEqual((r["gpu_percent"], r["gpu_status"]), (None, p["identity"]["gpu_status"]))
+        self.assertEqual((r["owner"], r["project"], r["cmdline_status"]), ("BACHELOR\\layib", "mlv-app", "ok"), "the CIM half still works")
+        self.assert_measurement_unchanged(p, elapsed)
+
+    def test_a_slow_getowner_times_out_into_owner_status_timeout_and_the_row_keeps_everything_else(self) -> None:
+        p, elapsed = self.slow("owner")
+        r = self.row(p, 16892)
+        self.assertEqual((r["owner"], r["owner_status"]), (None, "timeout"))
+        self.assertEqual((r["project"], r["cmdline_status"], r["gpu_percent"]), ("mlv-app", "ok", 40.0))
+        self.assert_measurement_unchanged(p, elapsed)
+
+    def test_a_slow_win32_process_query_degrades_identity_to_a_typed_error_and_nothing_else_moves(self) -> None:
+        p, elapsed = self.slow("cim")
+        self.assertEqual(set(p["identity"]), {"schema", "error"}, p["identity"])
+        self.assertIn("timed out", p["identity"]["error"])
+        self.assert_measurement_unchanged(p, elapsed)
+
+    def test_the_call_deadline_is_a_pinned_literal_inside_the_identity_budget_arithmetic(self) -> None:
+        body = _ident_probe_body()
+        m = re.search(r"\$IdentityCallMs = (\d+)", body)
+        self.assertIsNotNone(m)
+        # GPU + 3 WQL queries + the r6 script-slot check + budget-gated GetOwner calls (the last may start just under the budget): the identity worst case, plus the 24 s
+        # sample window, stays inside 120 s
+        self.assertEqual(body.count("Invoke-IdentBounded $IdentScriptCheckScript"), 1, "r6: ONE bounded script-slot call per probe, not one per row")
+        worst_s = (int(m.group(1)) * 5 + int(re.search(r"\$IdentityBudgetMs = (\d+)", body).group(1)) + int(m.group(1))) / 1000.0 + 24
+        self.assertLess(worst_s, 110, worst_s)
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r4: FAIL-CLOSED command-line redaction. Per-shape rules (r1-r3) kept leaking new shapes (dot 93a864e0's escaped-quote JSON value, Grok G3 a quoted
+# key then whitespace, G4 compound names, G5 a quote that opens mid-value). r5 retired the r4 denylist too (no line keeps argument text at all); these vectors live on in the r5
+# table below, which checks every persisted copy. Synthetic values only.
+R4_MARKER = "Value42"   # every vector's secret holds it (demoValue42, or a split form such as demo"Value42 / demo&Value42 / demo Value42)
+R4_VECTORS = [
+    # r4: the shapes that leaked on 7bca751c
+    ("dot-93a864e0 three-backslash", r'tool {\"password\":\"prefix\\\" demoValue42 tail\"}'),
+    ("dot-93a864e0 one-backslash", r'tool {\"password\":\"prefix\" demoValue42 tail\"}'),
+    ("G3 fully quoted argv", '"tool.exe" "--password" "demoValue42"'),
+    ("G3 quoted json key then whitespace", 'tool {"password" "demoValue42"}'),
+    ("G3 quoted key then whitespace", 'tool "password"  demoValue42 --verbose'),
+    ("G4 --db-pass", "tool --db-pass demoValue42"),
+    ("G4 --passphrase", "tool --passphrase demoValue42"),
+    ("G5 quote opens mid-value", 'tool --password=demo"Value42 tail" --verbose'),
+    # r1
+    ("r1 key and token", r"python C:\mlvtmp\lane-X-1\tools\bench.py --api_key=demoValue42 --token demoValue42"),
+    ("r1 url userinfo", "curl https://user:demoValue42@host.example/x"),
+    ("r1 bearer", "tool --header Bearer demoValue42 go"),
+    ("r1 password=", "app password=demoValue42 run"),
+    ("r1 --secret quoted", 'app --secret "a demoValue42" go'),
+    ("r1 token prefixes", "x sk-demoValue42abcdef ghp_demoValue42abcdef AKIAdemoValue42ABCDEF"),
+    ("r1 jwt", "y eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJkZW1vIn0.demoValue42sig"),
+    ("r1 opaque run", "z demoValue42" + "A" * 40),
+    # r2 (Dot B1): JSON keys, Authorization headers, a dashed password, URL-encoded keys
+    ("r2 json dq", 'python x.py {"password":"demoValue42"}'),
+    ("r2 json dq space", 'python x.py {"password": "demoValue42"}'),
+    ("r2 json api_key spaced", 'python x.py {"api_key" : "demoValue42"}'),
+    ("r2 json sq", "python x.py {'token':'demoValue42'}"),
+    ("r2 json sq spaced", "python x.py {'token' : 'demoValue42'}"),
+    ("r2 json client_secret", 'python x.py {"client_secret":"demoValue42","n":1}'),
+    ("r2 json escaped", r'python x.py {\"password\":\"demoValue42\"}'),
+    ("r2 json unquoted value", 'python x.py {"password":demoValue42}'),
+    ("r2 json value with spaces", 'python x.py {"password":"demo Value42 two"}'),
+    ("r2 authorization basic dq", 'curl -H "Authorization: Basic demoValue42" https://h.example/x'),
+    ("r2 authorization basic sq", "curl -H 'Authorization: Basic demoValue42' https://h.example/x"),
+    ("r2 authorization basic bare", "curl -H Authorization: Basic demoValue42 https://h.example/x"),
+    ("r2 authorization bearer nospace", 'curl -H "authorization:Bearer demoValue42" https://h.example/x'),
+    ("r2 authorization json", 'curl -d {"Authorization":"Bearer demoValue42"} https://h.example/x'),
+    ("r2 dashed password", "tool --password=demoValue42 --verbose"),
+    ("r2 urlenc password", "curl https://h.example/x?user=a&password%3DdemoValue42&z=1"),
+    ("r2 urlenc password only", "curl https://h.example/x?password%3DdemoValue42"),
+    ("r2 urlenc api_key", "curl https://h.example/x?api_key%3ademoValue42&z=1"),
+    ("r2 urlenc json", "curl https://h.example/x?%22password%22%3A%22demoValue42%22"),
+    ("r2 persisted json and basic", 'python C:\\mlvtmp\\lane-X-1\\tools\\bench.py {"password":"demoValue42","api_key" : "demoValue42"} '
+                                    '--hdr "Authorization: Basic QWxhZGRpbjpvcGVu" --q password%3DdemoValue42'),
+    # r3 (Dot B1 quoted values, Grok G1 short keys and -p, G2 '&')
+    ("r3 b1 escaped quoted value", r'tool {\"password\":\"prefix demoValue42\"}'),
+    ("r3 b1 escaped two words", r'tool {\"password\":\"two demoValue42 words\",\"n\":1}'),
+    ("r3 b1 embedded escaped quote", r'tool {"password":"abc\"demoValue42 tail","n":1}'),
+    ("r3 b1 dq value", 'app --password "two demoValue42 words" --verbose'),
+    ("r3 b1 sq doubled quote", "app --token 'it''s demoValue42 here' --verbose"),
+    ("r3 b1 unterminated", 'app --password "demoValue42 unterminated'),
+    ("r3 g1 --pass", "app --pass demoValue42 --verbose"),
+    ("r3 g1 json pass", 'app {"pass":"demoValue42"}'),
+    ("r3 g1 --pw=", "app --pw=demoValue42 --verbose"),
+    ("r3 g1 --pwd", "app --pwd demoValue42 --verbose"),
+    ("r3 g1 -pass=", "app -pass=demoValue42"),
+    ("r3 g1 mysql -p attached", "mysql -u root -pdemoValue42"),
+    ("r3 g1 mysql -p separated", "mysql -u root -p demoValue42 mydb"),
+    ("r3 g1 mysql -p attached then db", "mysql -u root -pdemoValue42 mydb"),
+    ("r3 g1 mysql -p quoted", 'mysql -u root -p"demo Value42" mydb'),
+    ("r3 g2 ampersand in a password", "tool --password=demo&Value42 --verbose"),
+    ("r3 g2 ampersand in a token", "tool --token demoValue42&tail --verbose"),
+    ("r3 g2 ampersand in a secret", "tool secret=demo&Value42&more x"),
+    ("r3 g2 url query", "curl https://h.example/x?user=a&password=demoValue42&z=1 --verbose"),
+    ("r3 -password=", "tool -password=demoValue42 --verbose"),
+]
+# the rest of a secret that spans words: the marker alone would miss a partial leak (7bca751c persisted G5 as `--password=<redacted> tail"`)
+R4_EXTRA_GONE = {"dot-93a864e0 three-backslash": ("prefix", "tail"), "dot-93a864e0 one-backslash": ("prefix", "tail"), "G5 quote opens mid-value": ("tail",),
+                 "r3 b1 escaped quoted value": ("prefix",), "r3 b1 escaped two words": ("two", "words"), "r3 b1 embedded escaped quote": ("abc", "tail"),
+                 "r3 b1 dq value": ("two", "words"), "r3 b1 sq doubled quote": ("here",), "r3 b1 unterminated": ("unterminated",), "r3 g2 ampersand in a token": ("tail",),
+                 "r3 g2 ampersand in a secret": ("more",)}
+R4_TOKENS = ["pass", "pwd", "pw", "secret", "token", "key", "auth", "credential", "bearer", "cookie", "session"]
+
+
+def _r4_strings(v) -> list:
+    if isinstance(v, dict):
+        return [s for x in v.values() for s in _r4_strings(x)]
+    if isinstance(v, list):
+        return [s for x in v for s in _r4_strings(x)]
+    return [v] if isinstance(v, str) else []
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r5: NO ARGUMENT TEXT IS PERSISTED (allowlist). The r4 token denylist still leaked: dot 9b25f619 B1 promoted `"Bearer demoValue42.py"` to the
+# script slot, B2 classed `--signature demoValue42` and `?sig=demoValue42` clean and kept their text, Grok G6 `-u user:demoValue42`. cmdline is now `<exe> args=<n> script=<path|<none>>`
+# on EVERY line; script comes only from the first argument and only when it is an existing, drive-rooted, allowlisted path. Every vector goes through the REAL probe body, the REAL
+# gate (probe line, raw probe JSON, gate text, every file the gate wrote) and the REAL Summarize-VenueBusyProbes.ps1 (text and -Json), and no persisted byte may hold the secret.
+R5_SECRET = "demoValue42"
+R5_VECTORS = [
+    ("dot-9b25f619 B1 bearer value promoted to the script slot", 'tool --header "Bearer demoValue42.py"'),
+    ("dot-9b25f619 B2 --signature", "tool --signature demoValue42"),
+    ("dot-9b25f619 B2 url ?sig=", "curl https://h.example/x?sig=demoValue42"),
+    ("grok G6 curl -u", "curl -u user:demoValue42"),
+    ("grok G6 --user", "curl --user user:demoValue42 https://h.example/x"),
+] + R4_VECTORS   # R4_VECTORS carries every r1-r4 vector
+
+
+@requires_windows_pwsh
+class VenueProbeIdentityNoArgumentTextR5Tests(IdentityProbeMixin, unittest.TestCase):
+    CHUNK = 5
+
+    def setUp(self) -> None:
+        VenueQuietAttributionTests.setUp(self)
+        # r7: fixture paths use the temp dir's LONG spelling. A GitHub Windows runner's TEMP is C:\Users\RUNNER~1\..., and an 8.3 '~' name is now rejected as text (and
+        # GetFullPath, which expands it, would never equal the slot text either), so a fixture spelled through it could never be named.
+        self.tmp = self.tmp.resolve()   # Summarize reads the top-5 CPU rows, so every vector of a chunk reaches its output too
+
+    def gate(self, probe: dict) -> subprocess.CompletedProcess:
+        import os
+        return _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                                  "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1"], timeout=180, env=dict(os.environ, UMSTUB_LINE=json.dumps(probe)))
+
+    def summarize(self, *args: str) -> str:
+        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"), *args], timeout=180)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout + proc.stderr
+
+    def persist(self, cmds: list, exe: str | None = None, name: str = "tool.exe") -> tuple:
+        """cmds -> (rows as persisted in the gate's raw probe JSON, [(where, every persisted text)]). Each gate run gets a fresh work dir."""
+        t = IDENT_T0
+        self.work = self.tmp / f"work-{len(list(self.tmp.glob('work-*')))}"
+        procs = [(2001 + i, "tool", 30.0 - i, t) for i in range(len(cmds))]
+        cim = [_ident_cim(2001 + i, 0, name, t, c, exe) for i, c in enumerate(cmds)]
+        p = self.run_identity_probe(procs, cim, {})
+        # the canned counters give no decision samples (UNKNOWN prints no identity text at all), so the gate is handed a MEASURED busy reading: then its top / attr / ident
+        # lines and the summary really carry every row, and the raw JSON it retains is this probe's identity verbatim
+        proc = self.gate(dict(p, host="BACHELOR", samples=[50.0, 50.0, 50.0]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^  top tool pid=2001 cpuSeconds=\S+ owner=", "the gate printed the identity suffix")
+        raws = sorted(self.work.glob("venue-quiet-probe-*.json"))
+        self.assertEqual(len(raws), 1, (raws, proc.stdout + proc.stderr))
+        by_pid = {r["pid"]: r for r in json.loads(raws[0].read_text(encoding="utf-8"))["identity"]["processes"]}
+        texts = [("probe line", self.last_line), ("gate text", proc.stdout + proc.stderr)]
+        # every DATA file the gate wrote (the .ps1 job file is the probe's own source code, not a persisted copy of identity)
+        texts += [(f"work file {f.name}", f.read_bytes().decode("utf-8", "replace")) for f in sorted(self.work.rglob("*")) if f.is_file() and f.suffix.lower() != ".ps1"]
+        summary_json = self.summarize("-ProbeDir", str(self.work), "-IncludeQuiet", "-Json")
+        self.assertEqual(json.loads(summary_json)["busy_probes"], 1, "the probe reached the summary, so its rows were read")
+        texts += [("summary text", self.summarize("-ProbeDir", str(self.work), "-IncludeQuiet")), ("summary json", summary_json)]
+        return [by_pid.get(2001 + i) for i in range(len(cmds))], texts
+
+    def real_file(self, *parts: str) -> Path:
+        path = self.tmp.joinpath(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# fixture\n", encoding="utf-8")
+        return path
+
+    def test_no_persisted_byte_holds_any_vectors_secret(self) -> None:
+        self.assertEqual(len({c for _l, c in R5_VECTORS}), len(R5_VECTORS))
+        for at in range(0, len(R5_VECTORS), self.CHUNK):
+            chunk = R5_VECTORS[at:at + self.CHUNK]
+            rows, texts = self.persist([c for _l, c in chunk])
+            for (label, cmd), r in zip(chunk, rows):
+                with self.subTest(vector=label):
+                    self.assertIsNotNone(r, label)
+                    leaked = [s for s in _r4_strings(r) if any(g in s for g in (R5_SECRET, R4_MARKER) + R4_EXTRA_GONE.get(label, ()))]
+                    self.assertEqual(leaked, [], f"{label}: {cmd!r} persisted {leaked!r}")
+                    self.assertEqual((r["cmdline"], r["script"], r["args_redacted"], r["cmdline_status"]), (f"tool.exe args={r['cmdline_args']} script=<none>", None, "all", "ok"), r)
+                    self.assertIsInstance(r["cmdline_token_hits"], int)
+            for where, text in texts:
+                with self.subTest(chunk=at, where=where):
+                    self.assertNotIn(R5_SECRET, text)
+                    self.assertNotIn(R4_MARKER, text)
+
+    def test_a_clean_line_keeps_its_script_and_count_but_none_of_its_argument_text(self) -> None:
+        probe = self.real_file("x", "probe.ps1")
+        self.assertRegex(str(probe), r"^[A-Za-z]:\\[^\s=@?#:]+$", "the fixture path itself must satisfy the allowlist")
+        pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe"
+        rows, texts = self.persist([f"pwsh -File {probe} -Verbose"], exe=pwsh, name="pwsh.exe")
+        r = rows[0]
+        self.assertEqual((r["cmdline"], r["script"], r["cmdline_args"], r["cmdline_redactions"], r["args_redacted"]), (f"{pwsh} args=3 script={probe}", str(probe), 3, 2, "all"))
+        for where, text in texts:
+            with self.subTest(where=where):
+                self.assertNotIn("-Verbose", text)
+                self.assertNotIn("-File", text)
+
+    def test_a_script_path_with_whitespace_is_none_even_when_the_file_exists(self) -> None:
+        spaced = self.real_file("a b", "x.py")
+        rows, _texts = self.persist([r'"tool.exe" "C:\a b\x.py"', f'"tool.exe" "{spaced}"'])
+        for r in rows:
+            self.assertEqual((r["cmdline"], r["script"]), ("tool.exe args=1 script=<none>", None), r)
+
+    def test_only_the_first_argument_can_be_the_script_and_only_an_existing_allowlisted_path(self) -> None:
+        good = self.real_file("lane", "run.py")
+        cmds = [
+            f"python {good} --frames 120",            # 0: named
+            f"python --verbose {good}",               # 1: a later argument is never taken
+            f"pwsh -NoProfile -File {good}",          # 2: only a FIRST-slot -File is skipped
+            f"python {good}.missing.py",              # 3: does not exist
+            f"python {self.real_file('k=v', 'a.py')}",   # 4: '=' in the path
+        ]
+        rows, _texts = self.persist(cmds, name="python.exe")
+        self.assertEqual(rows[0]["script"], str(good))
+        self.assertEqual(rows[0]["cmdline"], f"python.exe args=3 script={good}")
+        for i in (1, 2, 3, 4):
+            with self.subTest(cmd=cmds[i]):
+                self.assertEqual(rows[i]["script"], None)
+                self.assertTrue(rows[i]["cmdline"].endswith(" script=<none>"), rows[i])
+        rows, _texts = self.persist([f"python {self.real_file('m@x', 'a.py')}", f"python {self.real_file('q#x', 'a.py')}", f"python {self.real_file('lane', 'notes.txt')}"], name="python.exe")
+        self.assertEqual([r["script"] for r in rows], [None, None, None], "'@', '#' and a non-script extension never fill the slot")
+
+    def test_the_token_scan_is_a_diagnostic_integer_that_gates_nothing(self) -> None:
+        body = _ident_probe_body()
+        fn = re.search(r"function Protect-IdentCmdLine\(.*?\r?\n\}\r?\n", body, re.S).group(0)
+        self.assertNotRegex(fn, r"\bif\s*\([^)]*(Measure-IdentTokenHits|token_hits)", "the scan never decides what is written")
+        self.assertNotIn(".rest", fn, "the raw argument text after argv[0] never reaches the persisted line")
+        self.assertIn("Measure-IdentTokenHits", fn)
+        m = re.search(r"\$identSecretTokens = @\(([^)]*)\)", body)
+        self.assertEqual(re.findall(r"'([^']*)'", m.group(1)), R4_TOKENS)
+
+    def test_every_r4_path_that_appended_argument_text_is_gone(self) -> None:
+        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        for gone in ("Test-IdentTainted", "Find-IdentScriptArg", "Test-IdentPathShaped", "Get-IdentScript ", "Get-IdentScript(", "': ' + $sp.rest", "<redacted>", "fail-closed",
+                     "Protect-IdentText", "$keyLikePlain", "$keyLikeUrl", "$pFlag"):
+            self.assertNotIn(gone, text)
+        for needle in ("REDACTION IS AN ALLOWLIST (r5)", "NO ARGUMENT TEXT IS EVER PERSISTED", "cmdline_token_hits", "FIRST argument after the executable"):
+            self.assertIn(needle, text)
+
+
+# r3 Dot B2: Summarize-VenueBusyProbes.ps1 judges every input as TEXT before any Test-Path, Get-Item or read; a UNC or provider-qualified path is refused with a typed exit 2.
+UNC_PROBE = r"\\192.0.2.1\mlv-agent\processed\venue-quiet-probe-20261024T010000000Z.json"   # TEST-NET-1: nothing answers there, so a touch would hang or throw
+
+
+@requires_windows_pwsh
+class VenueBusyProbeSummaryPathRefusalR3Tests(unittest.TestCase):
+    setUp = VenueBusyProbeSummaryTests.setUp
+    summarize = VenueBusyProbeSummaryTests.summarize
+    write = VenueBusyProbeSummaryTests.write
+    fixtures = VenueBusyProbeSummaryTests.fixtures
+
+    def assert_refused(self, *args: str, code: str = "PROBE_PATH_UNC") -> None:
+        import time
+        started = time.monotonic()
+        proc = self.summarize(*args)
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn(code, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertLess(elapsed, 20, f"the refusal took {elapsed:.1f} s: a remote path was touched before it")
+
+    def test_b2_a_unc_probe_json_is_refused_typed_and_never_touched(self) -> None:
+        for spelling in (UNC_PROBE, UNC_PROBE.replace("\\", "/"), "FileSystem::" + UNC_PROBE, "Microsoft.PowerShell.Core\\FileSystem::" + UNC_PROBE, "\\\\?\\UNC\\192.0.2.1\\mlv-agent\\x.json"):
+            with self.subTest(spelling=spelling):
+                self.assert_refused("-ProbeJson", spelling)
+
+    def test_b2_a_unc_part_of_a_comma_joined_list_refuses_the_whole_call_before_the_local_part_is_read(self) -> None:
+        self.fixtures()
+        local = self.probes / "venue-quiet-probe-20261024T010000000Z.json"
+        self.assert_refused("-ProbeJson", f"{local},{UNC_PROBE}")
+        self.assert_refused("-ProbeJson", f"{UNC_PROBE},{local}")
+
+    def test_b2_a_unc_probe_dir_is_refused_typed_and_never_listed(self) -> None:
+        self.assert_refused("-ProbeDir", r"\\192.0.2.1\mlv-agent\processed")
+
+    def test_b2_a_comma_joined_venue_share_path_is_still_refused_typed(self) -> None:
+        inside = self.share / "venue-quiet-probe-20261024T010000000Z.json"
+        self.assert_refused("-ProbeJson", f"{inside},{self.probes / 'x.json'}", code="PROBE_PATH_IN_VENUE_SHARE")
+
+    def test_b2_the_script_orders_the_text_refusals_before_every_filesystem_call_on_an_input(self) -> None:
+        text = (DV / "Summarize-VenueBusyProbes.ps1").read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        fs_any = re.search(r"Test-Path|Get-Item|Get-ChildItem|Resolve-Path|ReadAllText|Get-Content", code)
+        fs_probe = re.search(r"Test-Path|Get-Item|Get-ChildItem|Resolve-Path|ReadAllText\(\$f\)|Get-Content", code)
+        unc, share = code.index("PROBE_PATH_UNC"), code.index("PROBE_PATH_IN_VENUE_SHARE")
+        self.assertLess(unc, fs_any.start(), "the UNC refusal comes before the first filesystem call of any kind")
+        self.assertLess(share, fs_probe.start(), "the venue-share refusal comes before the first filesystem call on an input")
+        self.assertLess(share, code.index("$ProbeJson = @($ProbeJson | ForEach-Object"), "the -ProbeJson split (which asks Test-Path about each entry) comes after both refusals")
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r6 (dot advisory 581ad0fa): r5 checked the script slot with DriveInfo.DriveType and File.Exists on the MAIN path, outside the bounded identity
+# worker, so a drive-rooted path through a local link to a dead share (C: is Fixed) could hold the probe past the identity budget. Every filesystem call for the slot now runs in
+# ONE bounded worker call, walks the components without following a reparse point, and each row says why in script_check.
+@requires_windows_pwsh
+class VenueProbeScriptCheckR6Tests(IdentityProbeMixin, unittest.TestCase):
+    setUp = VenueProbeIdentityNoArgumentTextR5Tests.setUp
+    gate = VenueProbeIdentityNoArgumentTextR5Tests.gate
+    real_file = VenueProbeIdentityNoArgumentTextR5Tests.real_file
+    SLOW_MS = 20000
+    CALL_MS = 1500
+    SEAM = "$IdentityScriptCheckDelayMs = 0"
+
+    def junction(self, name: str, target: Path) -> Path:
+        import os
+        link = self.tmp / name
+        proc = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.addCleanup(os.rmdir, link)   # removes the junction itself, never its target; runs before the temp dir's own cleanup
+        return link
+
+    def test_a_slow_metadata_call_is_bounded_into_script_check_timeout_and_the_verdict_and_counters_are_intact(self) -> None:
+        import time
+        self.assertIn(self.SEAM, _ident_probe_body(), "the slow-metadata seam is a literal of the probe body, 0 in production")
+        script = self.real_file("lane", "slow.py")
+        t = IDENT_T0
+        procs = [(16892, "python", 29.1, t), (500, "pwsh", 1.0, t)]
+        cim = [_ident_cim(16892, 500, "python.exe", t, f"python {script} --frames 9", r"C:\Python\python.exe"), _ident_cim(500, 0, "pwsh.exe", t, "pwsh")]
+        # control: the same probe without the delay names the script, and its time is the baseline the bounded run is held to
+        started = time.monotonic()
+        fast = self.run_identity_probe(procs, cim, CHAIN_OWNERS, call_ms=self.CALL_MS)
+        baseline = time.monotonic() - started
+        self.assertEqual((self.row(fast, 16892)["script"], self.row(fast, 16892)["script_check"]), (str(script), "ok"))
+        started = time.monotonic()
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS, body=_ident_probe_body().replace(self.SEAM, f"$IdentityScriptCheckDelayMs = {self.SLOW_MS}"), call_ms=self.CALL_MS)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, self.SLOW_MS / 1000.0 - 2, f"the probe waited for the slow metadata call ({elapsed:.1f} s)")
+        self.assertLess(elapsed - baseline, self.CALL_MS / 1000.0 + 4, f"budget + margin: {elapsed:.1f} s against a {baseline:.1f} s baseline")
+        r = self.row(p, 16892)
+        self.assertEqual((r["script"], r["script_check"], r["cmdline"], r["cmdline_status"]), (None, "timeout", r"C:\Python\python.exe args=3 script=<none>", "ok"))
+        self.assertEqual((r["owner"], r["owner_status"]), ("BACHELOR\\layib", "ok"), "a later call gets a fresh worker")
+        self.assertEqual(self.row(p, 500)["script_check"], "rejected")
+        self.assertIn("script_check_unresolved", p["identity"]["notes"])
+        self.assertIn("calls_abandoned", p["identity"]["notes"])
+        # the measured fields equal the same probe with identity cut out
+        cut = re.sub(r"# IDENTITY \(VENUE-PROBE-PROCESS-ATTRIBUTION-1\).*?(?=Write-Output \('VENUE_QUIET=')", "", _ident_probe_body(), flags=re.S).replace("    identity = $identity\r\n", "").replace("    identity = $identity\n", "")
+        ref = self.run_identity_probe(procs, cim, CHAIN_OWNERS, body=cut)
+        for k, v in ref.items():
+            self.assertEqual(p[k], v, f"{k} changed because the script check was slow")
+        # and through the gate: the verdict, the top line and the retained raw JSON all carry it
+        proc = self.gate(dict(p, host="BACHELOR", samples=[50.0, 50.0, 50.0]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% threshold=20(\.0)?% waitedSec=\d+$")
+        self.assertRegex(proc.stdout, r"(?m)^  top python pid=16892 cpuSeconds=\S+ owner=BACHELOR\\layib project=\S+ script=n/a script_check=timeout parent=")
+        self.assertRegex(proc.stdout, r"(?m)^  ident note script_check_unresolved: ")
+        raw = json.loads(next(self.work.glob("venue-quiet-probe-*.json")).read_text(encoding="utf-8"))
+        self.assertEqual(self.row(raw, 16892)["script_check"], "timeout")
+        self.assertNotIn("--frames", proc.stdout + json.dumps(raw))
+
+    def test_a_junction_is_reparse_never_followed_and_every_other_reason_is_typed(self) -> None:
+        real = self.real_file("real", "probe.py").parent
+        missing_target = self.tmp / "nowhere"
+        j_missing = self.junction("j-missing", missing_target)
+        j_real = self.junction("j-real", real)
+        cases = [
+            (3001, f"python {j_missing}\\probe.py", None, "reparse"),     # a junction to a missing target (the dead-share stand-in)
+            (3002, f"python {j_real}\\probe.py", None, "reparse"),        # a junction to a real file: r5 followed it and named the script
+            (3003, f"python {real}\\probe.py", str(real / "probe.py"), "ok"),
+            (3004, f"python {real}\\missing.py", None, "notfound"),
+            (3005, f"python {real}\\probe.py\\x.py", None, "notfound"),   # a file where a directory must be
+            (3006, "python bench.py --x", None, "relative"),
+            (3007, r"python \\192.0.2.1\share\a.py", None, "nonfixed"),   # UNC: text only, never touched
+            (3008, "python --verbose a.py", None, "rejected"),
+        ]
+        t = IDENT_T0
+        procs = [(pid, "python", 30.0 - i, t) for i, (pid, _c, _s, _k) in enumerate(cases)]
+        cim = [_ident_cim(pid, 0, "python.exe", t, cmd, r"C:\Python\python.exe") for (pid, cmd, _s, _k) in cases]
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS)
+        for pid, cmd, script, check in cases:
+            with self.subTest(cmd=cmd):
+                r = self.row(p, pid)
+                self.assertEqual(r["script"], script, r)   # first, on its own: r5 followed j-real and named the file behind it
+                self.assertEqual(r.get("script_check"), check, r)
+                self.assertTrue(r["cmdline"].endswith(f" script={script or '<none>'}"), r)
+                self.assertIn(r["script_check"], R6_SCRIPT_CHECKS)
+        self.assertFalse(missing_target.exists(), "the walk never created or followed the junction's target")
+        self.assertNotIn("script_check_unresolved", p["identity"]["notes"])
+
+    def test_no_filesystem_call_for_the_script_slot_runs_outside_the_worker_body(self) -> None:
+        body = _ident_probe_body()
+        code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+        m = re.search(r"\$IdentScriptCheckScript = \{.*?\n\}\.ToString\(\)", code, re.S)
+        self.assertIsNotNone(m, "the script-slot filesystem calls live in ONE worker body")
+        worker = m.group(0)
+        rest = code.replace(worker, "")
+        fs = r"DriveInfo|File\]::Exists|Directory\]::Exists|GetAttributes|FileInfo|DirectoryInfo|GetFileAttributes|\bTest-Path\b|\bGet-Item\b|\bResolve-Path\b"
+        self.assertEqual(re.findall(fs, rest), [], "nothing on the main path touches the filesystem for the script slot")
+        for needle in ("DriveInfo", "GetAttributes", "ReparsePoint"):
+            self.assertIn(needle, worker)
+        self.assertEqual(re.findall(r"\$IdentScriptCheckScript\b", rest), ["$IdentScriptCheckScript"], "the worker body is used once")
+        self.assertRegex(rest, r"Invoke-IdentBounded \$IdentScriptCheckScript @\([^)]*\) \$IdentityCallMs", "and only through the bounded call, under the call deadline")
+        self.assertRegex(body, r"(?m)^\$IdentityScriptCheckDelayMs = 0$", "the seam is 0 in production")
+        self.assertEqual(sorted(set(re.findall(r"\$env:(\w+)", code))), ["COMPUTERNAME"], "no environment variable can reach the probe, so none can set the seam")
+
+    def test_script_check_is_printed_on_the_top_attr_and_ident_lines_of_a_row_that_carries_it(self) -> None:
+        block = dict(IDENT_BLOCK, processes=[dict(IDENT_ROW, script_check="ok"), dict(IDENT_GPU_ROW, script_check="rejected"), dict(IDENT_DENIED_ROW, script_check=None), IDENT_MISMATCH_ROW])
+        proc = self.gate(dict(V2_PROBE, top=IDENT_TOP, identity=block, top_processes=[{"instance": "python", "pid": 16892, "percent": 6.0}]))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        out = proc.stdout.replace("\r\n", "\n")
+        self.assertIn("  top python pid=16892 cpuSeconds=29.1 owner=BACHELOR\\layib project=mlv-app script=bench.py script_check=ok parent=pwsh:500|ok gparent=explorer:400|ok started=2026-10-24T01:02:03Z gpu=40.0%\n", out)
+        self.assertIn("  top system pid=4 cpuSeconds=3.5 owner=unreadable(access-denied) project=unknown script=n/a script_check=n/a parent=", out)
+        self.assertIn("  top pwsh pid=4242 cpuSeconds=12.5 ident=pid-reused\n", out)
+        self.assertIn("  attr proc python pid=16892 pct=6.0% owner=BACHELOR\\layib project=mlv-app script_check=ok\n", out)
+        self.assertIn("  ident gpu wmiprvse pid=7777 gpu=12.0% engtype=3d owner=NT_AUTHORITY\\NETWORK_SERVICE project=unknown script_check=rejected\n", out)
+        for line in out.split("\n"):
+            if line.startswith("  top ") and "cpuSeconds=" in line:
+                for token in line.split("cpuSeconds=", 1)[1].split()[1:]:
+                    self.assertRegex(token, r"^[a-z_]+=\S+$", line)
+                    self.assertNotIn(",", token)
+
+
+# ---------------------------------------------------------------------------------------------------
+# VENUE-PROBE-PROCESS-ATTRIBUTION-1 r7 (Grok G7, comment 6388632165; dot 7d1194c7): r5/r6 admitted '.' and '..' segments in the script slot, validated GetFullPath (the NORMALIZED
+# path) and persisted the ORIGINAL slot text, so C:\tok-demoValue42\..\tools\run.py validated C:\tools\run.py and wrote the ghost segment into script, cmdline, the raw JSON and the
+# gate text. Ghost spellings are now rejected as text, and what is persisted is the worker's validated full path, only when it equals the slot text case-insensitively.
+@requires_windows_pwsh
+class VenueProbeScriptGhostSegmentR7Tests(IdentityProbeMixin, unittest.TestCase):
+    setUp = VenueProbeIdentityNoArgumentTextR5Tests.setUp
+    gate = VenueProbeIdentityNoArgumentTextR5Tests.gate
+    summarize = VenueProbeIdentityNoArgumentTextR5Tests.summarize
+    persist = VenueProbeIdentityNoArgumentTextR5Tests.persist
+    real_file = VenueProbeIdentityNoArgumentTextR5Tests.real_file
+    CHUNK = 5   # Summarize reads the top-5 CPU rows
+    CALL_MS = 1500
+    LATE_MS = 250
+    SEAM = "$IdentityScriptCheckDelayMs = 0"
+
+    def vectors(self) -> list:
+        target = str(self.real_file("lane", "run.py"))                # an existing file a ghost segment walks back to
+        named = str(self.real_file("lane", f"{R5_SECRET}.py"))        # an existing file whose NAME holds the secret: r6 named it through any spelling
+        self.assertRegex(target, r"^[A-Za-z]:\\[^~/]+$", "the fixtures are long, backslash-only paths")
+        head, leaf = named.rsplit("\\", 1)
+        return [
+            # the brief's five
+            ("ghost .. over a real file", f"{target[:2]}\\tok-{R5_SECRET}\\..\\{target[3:]}"),
+            (". segment over a real file", f"{named[:2]}\\.\\{named[3:]}"),
+            ("forward slashes", f"C:/x/{R5_SECRET}.py"),
+            ("doubled backslash", f"C:\\a\\\\{R5_SECRET}.py"),
+            ("\\\\?\\ prefix", f"\\\\?\\C:\\{R5_SECRET}.py"),
+            # the same spellings of an EXISTING file (r6 validated and persisted these), plus the rule-2-only spelling and an 8.3 name
+            ("forward slashes, existing", named.replace("\\", "/")),
+            ("doubled backslash, existing", f"{head}\\\\{leaf}"),
+            ("\\\\?\\ prefix, existing", "\\\\?\\" + named),
+            ("\\\\.\\ prefix, existing", "\\\\.\\" + named),
+            ("trailing-dot segment, existing (passes every shape rule; GetFullPath drops the dot)", f"{head}.\\{leaf}"),
+            ("8.3 short name", f"C:\\PROGRA~1\\{R5_SECRET}.py"),
+        ]
+
+    def test_no_ghost_spelling_persists_its_text_and_each_is_rejected(self) -> None:
+        vecs = self.vectors()
+        for at in range(0, len(vecs), self.CHUNK):
+            chunk = vecs[at:at + self.CHUNK]
+            rows, texts = self.persist([f"python {v}" for _l, v in chunk], name="python.exe")
+            for (label, v), r in zip(chunk, rows):
+                with self.subTest(vector=label, slot=v):
+                    self.assertIsNotNone(r, label)
+                    leaked = [s for s in _r4_strings(r) if R5_SECRET in s or "tok-" in s]
+                    self.assertEqual(leaked, [], f"{label}: {v!r} persisted {leaked!r}")
+                    self.assertEqual((r["script"], r["script_check"], r["cmdline"]), (None, "rejected", "python.exe args=1 script=<none>"), r)
+            for where, text in texts:
+                with self.subTest(chunk=at, where=where):
+                    self.assertNotIn(R5_SECRET, text)
+                    self.assertNotIn("tok-", text)
+
+    def test_a_clean_real_path_is_still_named_ok_as_the_workers_validated_text(self) -> None:
+        good = str(self.real_file("lane", "run.py"))
+        lower = good[0].lower() + good[1:]
+        rows, _texts = self.persist([f"python {good} --frames 9", f"python {lower}"], name="python.exe")
+        self.assertEqual((rows[0]["script"], rows[0]["script_check"], rows[0]["cmdline"]), (good, "ok", f"python.exe args=3 script={good}"))
+        # drive-letter case is the one difference allowed; the two spellings are one candidate, so either validated spelling may be the one persisted
+        self.assertEqual(rows[1]["script_check"], "ok", rows[1])
+        self.assertIn(rows[1]["script"], (good, lower), rows[1])
+
+    def test_the_shape_rules_reject_every_ghost_spelling_as_text(self) -> None:
+        body = _ident_probe_body()
+        code = "\n".join([re.search(p, body, re.M).group(0) for p in (r"^\$identScriptShape = .*$", r"^\$identScriptRelShape = .*$", r"^\$identScriptGhostShape = .*$")]
+                         + [re.search(r"^function Get-IdentScriptSlot\(.*?\r?\n\}", body, re.S | re.M).group(0)])
+        cases = [
+            (r"C:\a\.\x.py", None, "rejected"), (r"C:\a\..\x.py", None, "rejected"), (r"C:\.\x.py", None, "rejected"), (r"C:\..\x.py", None, "rejected"),
+            ("C:/x/y.py", None, "rejected"), (r"C:\a/x.py", None, "rejected"), (r"C:\a\\x.py", None, "rejected"), (r"C:\\x.py", None, "rejected"),
+            (r"\\?\C:\x.py", None, "rejected"), (r"\\.\C:\x.py", None, "rejected"), (r"\\.\x.py", None, "rejected"), (r"C:\x.py\\", None, "rejected"), (r"C:\x\x.py/", None, "rejected"),
+            (r"C:\PROGRA~1\x.py", None, "rejected"), (r"C:\a\RUN~12.py", None, "rejected"), (r".\x.py", None, "rejected"), ("//h/s/a.py", None, "rejected"),
+            # still candidates for the worker, or typed exactly as r6 typed them
+            (r"C:\a\x.py", r"C:\a\x.py", None), (r"C:\a.b\x.py", r"C:\a.b\x.py", None), (r"C:\..a\x.py", r"C:\..a\x.py", None), (r"C:\a~b\x.py", r"C:\a~b\x.py", None),
+            (r"\\192.0.2.1\share\a.py", None, "nonfixed"), ("bench.py", None, "relative"), (r"lane\run.py", None, "relative"),
+        ]
+        harness = code + "\n" + r"""$cases = ConvertFrom-Json -InputObject $env:R7_SLOTS
+$out = foreach ($c in $cases) { $s = Get-IdentScriptSlot @('python.exe', [string]$c) 'python.exe'; [pscustomobject]@{ path = $s.path; check = $s.check } }
+ConvertTo-Json -InputObject @($out) -Compress"""
+        import os
+        job = self.tmp / "slot-shapes.ps1"
+        job.write_text(harness, encoding="utf-8")
+        proc = _ident_run_reaped([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(job)], timeout=120, env=dict(os.environ, R7_SLOTS=json.dumps([c for c, _p, _k in cases])))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        got = json.loads(proc.stdout)
+        self.assertEqual(len(got), len(cases), proc.stdout)
+        for (slot, path, check), g in zip(cases, got):
+            with self.subTest(slot=slot):
+                self.assertEqual((g["path"], g["check"]), (path, check))
+
+    def test_no_persisted_field_is_built_from_the_pre_validation_slot_text(self) -> None:
+        body = _ident_probe_body()
+        fn = re.search(r"function Protect-IdentCmdLine\(.*?\r?\n\}\r?\n", body, re.S).group(0)
+        code = "\n".join(ln for ln in fn.splitlines() if not ln.lstrip().startswith("#"))
+        # the slot text is only ever a lookup key or the comparand of the equality check
+        self.assertIn("$rc.slot.path", code, "Protect-IdentCmdLine reads the slot")
+        for m in re.finditer(r"\$rc\.slot\.path\b", code):
+            ctx = code[max(0, m.start() - 20):m.end() + 1]
+            self.assertRegex(ctx, r"ContainsKey\(\$rc\.slot\.path\)|\$ScriptChecks\[\$rc\.slot\.path\]|-ieq \$rc\.slot\.path", ctx)
+        self.assertEqual(sorted(set(re.findall(r"\$script = ([^;}\n]+)", code))), ["$null", "[string]$v.full "], "script is null or the worker's validated full path")
+        self.assertRegex(code, r"text = \$lim\.text; script = \$\(if \(\$script\)", "both persisted fields come from that $script")
+        self.assertNotIn(".slot.path", body.replace(fn, "").replace("(Read-IdentCmdLine $cim[$_].CommandLine $cim[$_].ExecutablePath $cim[$_].Name).slot.path", ""),
+                         "outside Protect-IdentCmdLine the slot text only feeds the worker's candidate list")
+        worker = re.search(r"\$IdentScriptCheckScript = \{.*?\n\}\.ToString\(\)", body, re.S).group(0)
+        self.assertIn("$full = [IO.Path]::GetFullPath([string]$p)", worker)
+        self.assertIn("$full -ine [string]$p", worker, "the worker rejects a path GetFullPath rewrites")
+        self.assertIn("full = $(if ($r -ceq 'ok') { $full } else { $null })", worker, "and hands back the full path only for ok")
+
+    def test_the_worker_table_is_copied_once_under_its_lock_and_never_read_again(self) -> None:
+        body = _ident_probe_body()
+        fn = re.search(r"function Test-IdentScriptPaths\(.*?\r?\n\}\r?\n", body, re.S).group(0)
+        code = "\n".join(ln for ln in fn.splitlines() if not ln.lstrip().startswith("#"))
+        after = code[code.index("$w = Invoke-IdentBounded $IdentScriptCheckScript"):]
+        self.assertIn("[Threading.Monitor]::Enter($out.SyncRoot)", after)
+        self.assertIn("finally { [Threading.Monitor]::Exit($out.SyncRoot) }", after)
+        reads = [ln for ln in after.split("\n")[1:] if "$out" in ln]
+        self.assertEqual(len(reads), 2, reads)   # Enter, then the one copy and its Exit
+        self.assertEqual(sum(ln.count("$out[") for ln in reads), 1, "ONE indexed read of the worker's table, inside the locked copy")
+        self.assertRegex(reads[1], r"^\s*try \{ foreach \(\$k in @\(\$out\.Keys\)\) \{ \$got\[\$k\] = \$out\[\$k\] \} \}")
+
+    def test_an_answer_just_after_the_deadline_is_ignored_and_reads_timeout(self) -> None:
+        self.assertIn(self.SEAM, _ident_probe_body())
+        script = str(self.real_file("lane", "late.py"))
+        t = IDENT_T0
+        procs = [(16892, "python", 29.1, t), (500, "pwsh", 1.0, t)]
+        cim = [_ident_cim(16892, 500, "python.exe", t, f"python {script}", r"C:\Python\python.exe"), _ident_cim(500, 0, "pwsh.exe", t, "pwsh")]
+        # the injected worker answers ok for the path LATE_MS after the call deadline
+        p = self.run_identity_probe(procs, cim, CHAIN_OWNERS, body=_ident_probe_body().replace(self.SEAM, f"$IdentityScriptCheckDelayMs = {self.CALL_MS + self.LATE_MS}"),
+                                    call_ms=self.CALL_MS)
+        r = self.row(p, 16892)
+        self.assertEqual((r["script"], r["script_check"], r["cmdline"]), (None, "timeout", r"C:\Python\python.exe args=1 script=<none>"), r)
+        self.assertIn("script_check_unresolved", p["identity"]["notes"])
+        self.assertEqual((r["owner"], r["owner_status"]), ("BACHELOR\\layib", "ok"), "the next call still gets a fresh worker")
 
 
 if __name__ == "__main__":

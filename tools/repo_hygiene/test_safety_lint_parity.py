@@ -11,6 +11,7 @@ so a PR that touches neither lint pays nothing for it.
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import io
 import json
@@ -50,16 +51,35 @@ ALWAYS_ALLOW_HOOK ="def decide(payload, project_dir):\n    return 0, ''\n\n\ndef
 ALWAYS_THROW_HOOK = "def decide(payload, project_dir):\n    raise RuntimeError('synthetic rule crash')\n\n\ndef main():\n    return 0\n"
 
 # Pinned floors. A shrinking corpus is a red test; raise these when rows are added, never lower them.
-MIN_STATIC_ROWS = 410      # the JSON corpus: 205 kept static rows + the 180-row #455 sweep when this card landed (385), + the 25 r5 CoS #465 B5/B6 rows (410)
-MIN_HOOK_ROWS = 247        # hook share of the JSON corpus: 67 static #455 rows + the 180-row sweep (247 when this card landed)
-MIN_PLAYBACK_ROWS = 163    # playback share: the #465 RULE4 rows master refuses + the authored spaced-clip rows (138 when this card landed), + 25 r5 B5/B6 rows (163)
+MIN_STATIC_ROWS = 652      # the JSON corpus: 205 kept static rows + the 180-row #455 sweep when this card landed (385), + the 25 r5 CoS #465 B5/B6 rows (410), + the 107 SAFETY-LINT-DEFEATER-CORPUS-1 hook defeater rows (517), + the 135 PLAYBACK-LINT-DEFEATER-CORPUS-1 playback defeater rows (652)
+MIN_HOOK_ROWS = 354        # hook share of the JSON corpus: 67 static #455 rows + the 180-row sweep (247 when this card landed), + 107 defeater rows (354)
+MIN_PLAYBACK_ROWS = 298    # playback share: the #465 RULE4 rows master refuses + the authored spaced-clip rows (138 when this card landed), + 25 r5 B5/B6 rows (163), + 135 playback defeater rows (298)
 MIN_DERIVED_HOOK_ROWS = 200  # DENY rows of test_mlv_never_authorized.CASES (203 when this card landed)
+# SAFETY-LINT-DEFEATER-CORPUS-1: rows per hook defeater family (corpus group id prefix), measured against fork/master 530d70e9. The
+# playback-lint families are deferred to PLAYBACK-LINT-DEFEATER-CORPUS-1.
+EXACT_HOOK_DEFEATER_FAMILY_ROWS = {
+    "defeater-glued-switch": 23,
+    "defeater-delimiter": 26,
+    "defeater-quoting": 14,
+    "defeater-argument-position": 24,
+    "defeater-extensionless": 20,
+}
+# PLAYBACK-LINT-DEFEATER-CORPUS-1: rows per playback-lint defeater family (corpus group id prefix), measured against fork/master f2d6d69d.
+# The prefixes share "defeater-" with the hook families above; the "defeater-pb-" ones never match a hook prefix (or the reverse).
+EXACT_PLAYBACK_DEFEATER_FAMILY_ROWS = {
+    "defeater-pb-glued-switch": 22,
+    "defeater-pb-delimiter": 24,
+    "defeater-pb-quoting": 23,
+    "defeater-pb-argument-position": 24,
+    "defeater-pb-extensionless": 22,
+    "defeater-pb-shell-indirection": 20,
+}
 
 # r4 EXACT pins (sol r1 HARDENING: the floor of 200 let three existing DENY rows vanish with the count pin still green, and the
 # derived playback rows had no pin at all). The derived rows are the whole of the head's own deny suites, so any change in their
 # number is a corpus change that a reviewer should see: adding a deny row to either suite means raising the matching number here in
 # the same commit; DELETING one fails this test. The floors above stay as the coarse lower bound.
-EXACT_DERIVED_HOOK_ROWS = 203      # DENY rows of test_mlv_never_authorized.CASES
+EXACT_DERIVED_HOOK_ROWS = 212      # DENY rows of test_mlv_never_authorized.CASES
 EXACT_DERIVED_PLAYBACK_ROWS = 6776  # must-refuse sentences of test_hub_vm_no_local_playback.py, deduplicated by (name, text): 211 + 5,807 non-fuzz RULE4_* rows
 # + 758 of NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (RULE4_SPLIT_REFUSE 700, RULE4_SPLIT_SLASH_GUARDS 16, RULE4_SPLIT_SPAN_GUARDS 42)
 # r18 (hub ruling #3, amends #2): rows of #465's two seeded FUZZ tuples, left out of the derived corpus above, head AND baseline, by the
@@ -77,6 +97,30 @@ EXACT_FUZZ_GENERATOR_PINS = {
 def _write(path: Path, text: str) -> Path:
     path.write_text(text, encoding="utf-8")
     return path
+
+
+def _skip_or_fail_in_hosted_ci(case: unittest.TestCase, message: str):
+    """A missing prerequisite (pwsh, a baseline ref) skips the test locally but FAILS it in hosted CI (GITHUB_ACTIONS=true, as
+    HeadVersusBaselineGateTests reads it): a hosted runner has both, so a missing one is a broken runner, not a reason to run nothing."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        case.fail(f"{message} -- hosted CI must not skip this test (the runner has pwsh and the hygiene jobs check out with fetch-depth: 0)")
+    case.skipTest(message)
+
+
+def requires_pwsh(test):
+    @functools.wraps(test)
+    def wrapper(self, *args, **kwargs):
+        if not PWSH:
+            _skip_or_fail_in_hosted_ci(self, "pwsh is required to run the playback probe")
+        return test(self, *args, **kwargs)
+    return wrapper
+
+
+def _baseline_sha_or_skip(case: unittest.TestCase) -> str:
+    sha = _baseline_sha()
+    if sha is None:
+        _skip_or_fail_in_hosted_ci(case, "no baseline ref resolves (fork/master, origin/master, master)")
+    return sha
 
 
 class ParityRunnerCase(unittest.TestCase):
@@ -234,6 +278,20 @@ class AllowListTests(ParityRunnerCase):
         self.assertEqual(slp.load_allow(slp.DEFAULT_ALLOW), {}, "an entry belongs here only with a reason and a PR number, added in review")
 
 
+def hook_defeater_rows_not_denied(rows: list[dict]) -> list[str]:
+    """One "<row id>: <verdict>" per row of `rows` (corpus hook rows) the checked-out hook lint does not DENY, through the parity runner's
+    own decide() pass (in process, zero pwsh). Base == HEAD, so the verdicts are the hook's own; a row that cannot be run reads as its error."""
+    tmp = Path(tempfile.mkdtemp(prefix="parity-hook-defeater-"))
+    try:
+        corpus = _write(tmp / "corpus.json", json.dumps({"schema": slp.CORPUS_SCHEMA, "rows": [{k: v for k, v in r.items() if k != "source"} for r in rows]}))
+        report = slp.run("HEAD", ("hook",), corpus, _write(tmp / "allow.json", "[]"), derived=False, main_pass=False)
+    finally:
+        shutil.rmtree(tmp, True)
+    seen = {r["id"] for r in report["results"]}
+    missing = [f"{r['id']}: not run" for r in rows if r["id"] not in seen]
+    return missing + [f"{r['id']}: {r.get('head', 'error ' + r.get('error', '?'))}" for r in report["results"] if r.get("head") != slp.DENY]
+
+
 class CorpusPinTests(unittest.TestCase):
     def test_the_tracked_corpus_cannot_silently_shrink(self):
         rows = slp.load_corpus(slp.DEFAULT_CORPUS)
@@ -261,6 +319,61 @@ class CorpusPinTests(unittest.TestCase):
         sweep = [r for r in slp.load_corpus(slp.DEFAULT_CORPUS) if r["id"].startswith("b455-sweep-")]
         self.assertEqual(len(sweep), 180)  # 4 verbs x 9 tails x 5 wrappers, all distinct
 
+    def test_each_hook_defeater_family_keeps_its_exact_row_count(self):
+        # SAFETY-LINT-DEFEATER-CORPUS-1: one group per hook rule family, every row one fork/master DENIED when it was kept. A family that
+        # loses a row is a red test; raise its number in the commit that ADDS a master-denied row.
+        rows = slp.load_corpus(slp.DEFAULT_CORPUS)
+        for family, count in sorted(EXACT_HOOK_DEFEATER_FAMILY_ROWS.items()):
+            with self.subTest(family=family):
+                group = [r for r in rows if r["id"].startswith(family + "-")]
+                self.assertEqual(len(group), count)
+                self.assertTrue(all(r["lint"] == "hook" for r in group), family)
+                self.assertTrue(all("mlv-safety-lint-exemption-defeater-corpus-r1" in r["why"] for r in group), family)
+
+    def test_each_playback_defeater_family_keeps_its_exact_row_count(self):
+        # PLAYBACK-LINT-DEFEATER-CORPUS-1: one group per playback-lint family, every row one fork/master DENIED when it was kept. A family
+        # that loses a row is a red test; raise its number in the commit that ADDS a master-denied row.
+        rows = slp.load_corpus(slp.DEFAULT_CORPUS)
+        for family, count in sorted(EXACT_PLAYBACK_DEFEATER_FAMILY_ROWS.items()):
+            with self.subTest(family=family):
+                group = [r for r in rows if r["id"].startswith(family + "-")]
+                self.assertEqual(len(group), count)
+                self.assertTrue(all(r["lint"] == "playback" for r in group), family)
+                self.assertTrue(all("mlv-safety-lint-exemption-defeater-corpus-r1" in r["why"] for r in group), family)
+                self.assertTrue(all("PLAYBACK-LINT-DEFEATER-CORPUS-1" in r["why"] for r in group), family)
+
+    def _hook_defeater_rows(self) -> list[dict]:
+        rows = [r for r in slp.load_corpus(slp.DEFAULT_CORPUS) if any(r["id"].startswith(f + "-") for f in EXACT_HOOK_DEFEATER_FAMILY_ROWS)]
+        self.assertEqual(len(rows), sum(EXACT_HOOK_DEFEATER_FAMILY_ROWS.values()))
+        return rows
+
+    def test_the_hook_lint_denies_every_hook_defeater_row(self):
+        # Dot's #596 advisory c6cde1fb: the count, hook type and provenance pins above do not prove a row exercises a refusal. Every row of the
+        # five hook defeater families goes through the parity runner's decide() pass and must be DENIED; a row that is not is named with its verdict.
+        self.assertEqual(hook_defeater_rows_not_denied(self._hook_defeater_rows()), [], "the hook lint must DENY every hook defeater row")
+
+    def test_a_hook_defeater_row_rewritten_to_a_harmless_sentence_is_named_with_its_verdict(self):
+        rows = [dict(r) for r in self._hook_defeater_rows()]
+        victim = rows[7]
+        victim["command"] = "Get-Date"
+        self.assertEqual(hook_defeater_rows_not_denied(rows), [f"{victim['id']}: {slp.ALLOW}"])
+
+    @requires_pwsh
+    def test_the_baseline_playback_lint_denies_every_playback_defeater_row(self):
+        # Dot's #596 advisory c6cde1fb (hub ACK 6358238095): a count, a lint type and a `why` do not prove a row is refused. Every row of
+        # the playback defeater groups is judged by the BASELINE's lint (the merge-base with fork/master, as Cos465ProbeRowsTests does),
+        # and a row it allows is named. A row the baseline allows can only read `same` or `tightened`, so it could never catch a loosening.
+        sha = _baseline_sha_or_skip(self)
+        rows = [{k: v for k, v in r.items() if k != "source"} for r in slp.load_corpus(slp.DEFAULT_CORPUS)
+                if any(r["id"].startswith(f + "-") for f in EXACT_PLAYBACK_DEFEATER_FAMILY_ROWS)]
+        self.assertEqual(len(rows), sum(EXACT_PLAYBACK_DEFEATER_FAMILY_ROWS.values()))
+        tmp = Path(tempfile.mkdtemp(prefix="parity-defeater-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        corpus = _write(tmp / "corpus.json", json.dumps({"schema": slp.CORPUS_SCHEMA, "rows": rows}))
+        report = slp.run(sha, ("playback",), corpus, _write(tmp / "allow.json", "[]"), derived=False)
+        self.assertEqual(report["rows"], len(rows))
+        self.assertEqual([r["id"] for r in report["results"] if r.get("master") != slp.DENY], [], "the baseline lint must DENY every row")
+
     def test_the_derived_hook_rows_cannot_silently_shrink(self):
         self.assertGreaterEqual(len(slp.derived_hook_cases(REPO_ROOT)), MIN_DERIVED_HOOK_ROWS)
 
@@ -280,11 +393,9 @@ class Cos465ProbeRowsTests(ParityRunnerCase):
                 self.assertIn("6230178238" if "-b5-" in row_id else "6230713095", by_id[row_id]["why"])
         self.assertEqual(len(COS_465_PROBE_IDS), 25)
 
-    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    @requires_pwsh
     def test_master_refuses_every_probe_row(self):
-        sha = _baseline_sha()
-        if sha is None:
-            self.skipTest("no baseline ref resolves (fork/master, origin/master, master)")
+        sha = _baseline_sha_or_skip(self)
         rows = [{k: v for k, v in r.items() if k != "source"} for r in slp.load_corpus(slp.DEFAULT_CORPUS) if r["id"] in COS_465_PROBE_IDS]
         self.assertEqual(len(rows), len(COS_465_PROBE_IDS))
         report = slp.run(sha, ("playback",), self.corpus(*rows), self.allow, derived=False)
@@ -455,7 +566,7 @@ class PlaybackProbeErrorTests(ParityRunnerCase):
         with mock.patch.object(slp, "git", fake_git):
             return self.cli("--lint", "playback", "--corpus", str(self.corpus(self.playback_row())), "--allow", str(self.allow))
 
-    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    @requires_pwsh
     def test_PARITY_ERROR_01_an_unreadable_or_broken_playback_baseline_exits_2_never_allow(self):
         for label, source in BROKEN_BASELINES.items():
             with self.subTest(baseline=label):
@@ -465,7 +576,7 @@ class PlaybackProbeErrorTests(ParityRunnerCase):
                 self.assertIn("error=1", out)
                 self.assertNotIn("tightened=1", out, "a row that cannot be run must not read as an ALLOW verdict")
 
-    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    @requires_pwsh
     def test_PARITY_ERROR_01_a_missing_baseline_file_is_an_error_row_not_an_allow(self):
         pb = slp.derived_playback_rows(REPO_ROOT)[1]
         rows = [dict(self.playback_row(), source="corpus")]
@@ -475,7 +586,7 @@ class PlaybackProbeErrorTests(ParityRunnerCase):
         self.assertNotIn("master", results[0])
         self.assertEqual(slp.classify(results[0], {}), "error")
 
-    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    @requires_pwsh
     def test_PARITY_ERROR_01_a_broken_head_lint_is_an_error_row_too(self):
         pb = slp.derived_playback_rows(REPO_ROOT)[1]
         broken = _write(self.tmp / "broken-head.ps1", BROKEN_BASELINES["nonterminating-write-error"])
@@ -617,7 +728,7 @@ class BaselineDerivedRowsTests(ParityRunnerCase):
         _, tests = self.scratch_head()
         with self.redirect_head_hook_tests(tests):
             swapped = slp.derived_hook_cases(REPO_ROOT, "HEAD")
-        self.assertEqual(len(swapped), EXACT_DERIVED_HOOK_ROWS + 1, "the swapped-out row comes back from the baseline: head's 203 + 1 base-only")
+        self.assertEqual(len(swapped), EXACT_DERIVED_HOOK_ROWS + 1, "the swapped-out row comes back from the baseline: head's 212 + 1 base-only")
         self.assertEqual([c.source for c in swapped if c.id == LOOSENED_ROW_ID], ["derived-base"])
 
     def test_B1_a_baseline_test_module_that_cannot_be_loaded_is_exit_2_never_a_skip(self):
@@ -636,7 +747,7 @@ class BaselineDerivedRowsTests(ParityRunnerCase):
                 self.assertEqual(rc, slp.EXIT_UNDECIDED, out.getvalue())
                 self.assertIn("CANNOT-DECIDE", out.getvalue())
 
-    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    @requires_pwsh
     def test_B1_playback_a_sentence_the_head_dropped_from_its_suite_and_now_allows_is_still_loosened(self):
         # the victim: one must-refuse sentence that appears exactly once, so dropping it from the head's suite removes the only row
         rows, pb = slp.derived_playback_rows(REPO_ROOT)
@@ -800,7 +911,7 @@ class BaselineCorpusUnionTests(ParityRunnerCase):
         self.assertEqual(len(edited_ids), len(phantom) + 1, "exactly the one edited row on top of the control's set")
         self.assertIn(f"loosened={len(phantom) + 1} (", out.getvalue())
 
-    @unittest.skipUnless(PWSH, "pwsh is required to run the playback probe")
+    @requires_pwsh
     def test_B2_the_8_b465_b6_rows_replaced_by_a_copy_of_b5_01_under_their_ids_are_still_loosened(self):
         rows = {r["id"]: r for r in slp.load_corpus(slp.DEFAULT_CORPUS)}
         b6 = [f"b465-b6-{n:02d}" for n in range(1, 9)]
@@ -1280,9 +1391,7 @@ class MainPathPassTests(ParityRunnerCase):
         self.assertEqual(denied, sorted(MAIN_PATH_MASTER_DENIES), "the rows labelled as master-denied are the ones the break tests expect to loosen")
 
     def test_the_baseline_refuses_every_row_the_table_says_it_refuses(self):
-        sha = _baseline_sha()
-        if sha is None:
-            self.skipTest("no baseline ref resolves (fork/master, origin/master, master)")
+        sha = _baseline_sha_or_skip(self)
         report = slp.run(sha, ("hook",), self.corpus(DENIED), self.allow, derived=False)
         verdicts = {r["id"].split(":")[1]: r["master"] for r in report["results"] if r["id"].startswith("main-path:")}
         self.assertEqual({k for k, v in verdicts.items() if v == slp.DENY} & set(MAIN_PATH_MASTER_DENIES), set(MAIN_PATH_MASTER_DENIES), verdicts)
@@ -1366,6 +1475,56 @@ class HeadVersusBaselineGateTests(unittest.TestCase):
         loosened =[f"{r['id']}: {r['display']}" for r in report["results"] if r["class"] == "LOOSENED" and not r["allowed"]]
         self.assertEqual(loosened, [], "master DENIES, head ALLOWS; fix the lint, or list the row in safety_lint_parity_allow.json with a reason and a PR")
         self.assertEqual([r["id"] for r in report["results"] if r["class"] == "error"], [], "a row that cannot be run is never a pass")
+
+
+class HostedCiFailNotSkipTests(unittest.TestCase):
+    """SAFETY-LINT-PARITY-HOSTED-FAIL-NOT-SKIP-1 (Dot's #596 advisory b8430cc0): a missing pwsh or baseline ref skips a parity test locally
+    but FAILS it where GITHUB_ACTIONS=true, the variable HeadVersusBaselineGateTests already reads. Each case runs a throwaway TestCase that
+    uses the very helpers the real tests use, with the environment, PWSH and the baseline lookup faked."""
+
+    def outcome(self, *, hosted, pwsh, baseline) -> dict:
+        class Probe(unittest.TestCase):
+            @requires_pwsh
+            def test_pwsh(self):
+                pass
+
+            def test_baseline(self):
+                _baseline_sha_or_skip(self)
+
+        env = {"GITHUB_ACTIONS": "true" if hosted else "false"} if hosted is not None else {}
+        with mock.patch.dict(os.environ, env), mock.patch.dict(globals(), {"PWSH": pwsh, "_baseline_sha": lambda: baseline}):
+            if hosted is None:
+                os.environ.pop("GITHUB_ACTIONS", None)
+            result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(Probe))
+        label = lambda pairs: sorted(t.id().rsplit(".", 1)[1] for t, _ in pairs)
+        return {"failed": label(result.failures), "errors": label(result.errors), "skipped": label(result.skipped), "ran": result.testsRun}
+
+    def test_hosted_ci_fails_a_missing_pwsh_and_a_missing_baseline(self):
+        got = self.outcome(hosted=True, pwsh=None, baseline=None)
+        self.assertEqual(got, {"failed": ["test_baseline", "test_pwsh"], "errors": [], "skipped": [], "ran": 2})
+
+    def test_a_local_run_without_the_hosted_variable_still_skips_both(self):
+        for hosted in (None, False):
+            with self.subTest(hosted=hosted):
+                got = self.outcome(hosted=hosted, pwsh=None, baseline=None)
+                self.assertEqual(got, {"failed": [], "errors": [], "skipped": ["test_baseline", "test_pwsh"], "ran": 2})
+
+    def test_hosted_ci_with_pwsh_and_a_baseline_runs_both_tests(self):
+        self.assertEqual(self.outcome(hosted=True, pwsh="pwsh", baseline="0" * 40), {"failed": [], "errors": [], "skipped": [], "ran": 2})
+
+    def test_hosted_ci_fails_only_the_half_that_is_missing(self):
+        self.assertEqual(self.outcome(hosted=True, pwsh=None, baseline="0" * 40)["failed"], ["test_pwsh"])
+        self.assertEqual(self.outcome(hosted=True, pwsh="pwsh", baseline=None)["failed"], ["test_baseline"])
+
+    def test_the_failure_message_says_what_is_missing_and_why_it_may_not_skip(self):
+        class Probe(unittest.TestCase):
+            def test_baseline(self):
+                _baseline_sha_or_skip(self)
+
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), mock.patch.dict(globals(), {"_baseline_sha": lambda: None}):
+            result = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(Probe))
+        self.assertIn("no baseline ref resolves", result.failures[0][1])
+        self.assertIn("hosted CI", result.failures[0][1])
 
 
 if __name__ == "__main__":

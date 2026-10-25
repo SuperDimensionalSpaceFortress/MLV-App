@@ -22,7 +22,8 @@
 #      venue was NOT MEASURED: the leg is NOT run (`LEG <name> NOT_RUN VENUE_QUIET_UNKNOWN reason=...`) and the chain stops (-OnUnknown Stop, the default)
 #      or goes on to the next leg (-OnUnknown Continue). A measured COOLDOWN_UNMET still runs the leg, as before, but the LEG line carries verdict=,
 #      quietMean= and the leg's preLoadMean= and class= (QUIET_PRELOAD_OK when QUIET and preLoad <= 30 %: docs/cuda-playback-present-cadence.md:206 COUNTED
-#      = QUIET plus preLoad <= 30; PASS and the exe match stay lane-side). The quiet gate itself is unchanged: threshold and waits pass straight through.
+#      = QUIET plus preLoad <= 30; PASS and the exe match stay lane-side). A FOREIGN_FLOOR line in EITHER the pre-claim or the under-claim probe keeps class=COOLDOWN_UNMET whatever the
+#      under-claim verdict reads (the LEG line and the result carry preClaimForeignFloor= / underClaimForeignFloor=). The quiet gate itself is unchanged: threshold and waits pass straight through.
 #   4. QUIET WINDOWS. -QuietRateTable prints the per-UTC-hour QUIET rate of the venue's PROBE lines in -GateLogPath (default every
 #      <main checkout>\.claude-state\fleet-runs\*\gate.log) and exits. -PreferQuietWindows: when the current hour's observed rate is under -PreferRatePercent
 #      (30) on at least -MinWindowProbes probes and a later hour within -WindowHorizonHours is at or above it, the chain waits (unclaimed) for that hour.
@@ -55,7 +56,9 @@
 #
 # Exit codes (a leg's OUTCOME is never the exit code: read CHAIN_RESULT and the receipts): 0 every leg ran (Invoke-VenueLeg exited 0 for each); 2 usage (including a Wait-VenueQuiet usage
 # error); 3 DEADLINE (-DeadlineUtc passed before every leg ran: queue busy, a live claim, or a window; the rest are NOT_RUN DEADLINE); 4 GATE_UNREADABLE
-# and 5 HOST_MISMATCH from Wait-VenueQuiet (the chain stops); 6 at least one leg was NOT_RUN VENUE_QUIET_UNKNOWN; 7 (r2) at least one leg process exited
+# and 5 HOST_MISMATCH from Wait-VenueQuiet (the chain stops); 6 at least one leg was NOT_RUN VENUE_QUIET_UNKNOWN, or NOT_RUN VENUE_DRIVER_SCRIPT_MISSING
+# (LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: the probe or leg script is gone, its worktree removed under the chain; one typed
+# `VENUE_DRIVER_SCRIPT_MISSING path=<script>` line and the chain stops whatever -OnUnknown says); 7 (r2) at least one leg process exited
 # non-zero, so it is LEG_FAILED / outcome INVALID in CHAIN_RESULT whatever DVE_OUTCOME it printed (a higher-priority code above is kept); 8 (r1, VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1)
 # the chain stopped on a deterministic venue fault: -UnhealthyStreakStop consecutive RAN legs were VENUE_UNHEALTHY with the same DVE_DETAIL key (r1 of
 # VENUE-CHAIN-STREAK-DETAIL-NORMALISE-1: the leading reason token, else the text with every number replaced by #, so 'freeDiskGiB 42.4 < 50' and '41.9 < 50' are one fault),
@@ -218,8 +221,10 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, [str
     $ProbeAdmissionWaitSec = $(if ($AdmissionWaitSec -gt 0) { $AdmissionWaitSec } else { $ProbeAdmissionWaitSec })   # a LOCAL shadow: the script's own value is untouched
     $out = Join-Path $RunDir "quiet-$Name-$Phase.out.txt"
     # VENUE-CHAIN-PROBE-SCRIPT-MISSING-NAMED-1: the probe script vanished after the start-up check (a worktree removed under a live chain): name it, do not launch.
-    if (-not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) {
-        return [pscustomobject]@{ verdict = 'VENUE_QUIET_UNKNOWN'; code = 'none'; mean = $null; reason = 'PROBE_SCRIPT_MISSING'; waitedSec = $null; out = $out }
+    # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: typed VENUE_DRIVER_SCRIPT_MISSING (reason path=<script>), never VENUE_QUIET_UNKNOWN: the chain stops on it.
+    $missing = Get-VenueDriverScriptMissing -Path @($QuietScript)
+    if ($missing) {
+        return [pscustomobject]@{ verdict = 'VENUE_DRIVER_SCRIPT_MISSING'; code = 'none'; mean = $null; reason = "path=$QuietScript"; waitedSec = $null; out = $out }
     }
     $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript, '-Venue', $pv, '-WorkDir', (Join-Path $RunDir 'quiet'), '-GateLog', (Join-Path $RunDir 'gate.log'),
         '-ThresholdPercent', [string]$ThresholdPercent, '-MaxWaitSec', [string]$MaxWaitSec, '-RecheckSec', [string]$RecheckSec, '-MaxAdmissionWaitSec', [string]$ProbeAdmissionWaitSec)
@@ -228,6 +233,7 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, [str
     $lines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
     $v = $lines | Where-Object { $_ -match '^(QUIET|COOLDOWN_UNMET) mean=' } | Select-Object -Last 1
     $u = $lines | Where-Object { $_ -like 'VENUE_QUIET_UNKNOWN *' } | Select-Object -Last 1
+    $ff = $lines | Where-Object { $_ -match '^FOREIGN_FLOOR ' } | Select-Object -Last 1   # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1 r3: the early-exit marker survives into the leg class
     $mean = $null; $reason = $null
     $verdict = switch ($code) {
         0 { if ($v) { ($v -split ' ')[0] } else { $reason = 'exit0-without-verdict'; 'VENUE_QUIET_UNKNOWN' } }
@@ -236,14 +242,24 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, [str
         4 { 'GATE_UNREADABLE' }
         5 { 'HOST_MISMATCH' }
         6 { $reason = $(if ($u -and $u -match '\breason=(\S+)') { $Matches[1] } else { 'exit6' }); 'VENUE_QUIET_UNKNOWN' }
-        default { $reason = $(if ($code -eq 64 -and -not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) { 'PROBE_SCRIPT_MISSING' } else { "undocumented-exit-$code" }); 'VENUE_QUIET_UNKNOWN' }
+        default { if ($code -eq 64 -and (Get-VenueDriverScriptMissing -Path @($QuietScript))) { $reason = "path=$QuietScript"; 'VENUE_DRIVER_SCRIPT_MISSING' } else { $reason = "undocumented-exit-$code"; 'VENUE_QUIET_UNKNOWN' } }
     }
     if ($v -and $v -match '\bmean=([0-9.]+)%') { $mean = [double]$Matches[1] }
     $waited = $(if (($v, $u | Where-Object { $_ }) -join ' ' -match '\bwaitedSec=(\d+)') { [int]$Matches[1] } else { $null })
-    [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; waitedSec = $waited; out = $out }
+    [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; waitedSec = $waited; out = $out; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff }
 }
 
 function Format-Mean($m) { if ($null -eq $m) { 'UNKNOWN' } else { '{0:0.0}' -f $m } }
+
+function Stop-DriverScriptMissing([object]$Leg, [string]$PathReason, [string]$Phase) {
+    # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: a script the chain launches is gone (its worktree was removed under it). One typed line, the leg
+    # NOT_RUN, and the chain STOPS whatever -OnUnknown says (exit 6, like any leg that was not measured): re-probing cannot bring the script back.
+    Add-Result $Leg 'NOT_RUN' @{ verdict = 'VENUE_DRIVER_SCRIPT_MISSING'; reason = $PathReason; phase = $Phase }
+    L "VENUE_DRIVER_SCRIPT_MISSING $PathReason leg=$($Leg.name) phase=$Phase (the chain stops whatever -OnUnknown says)"
+    L "LEG $($Leg.name) NOT_RUN VENUE_DRIVER_SCRIPT_MISSING $PathReason phase=$Phase"
+    $script:stopReason = 'VENUE_DRIVER_SCRIPT_MISSING'
+    $script:exitCode = 6
+}
 
 function Get-LegPreLoadMean([string]$ReceiptPath) {
     # The leg's own pre-load mean, read from the run's summary.json (cpuQuiescence.timeMeanPercent) -- never from the receipt file. Invoke-VenueLeg writes the
@@ -420,6 +436,7 @@ foreach ($leg in $plan) {
     if ($null -ne $stopReason) { Add-Result $leg 'NOT_RUN' @{ verdict = $stopReason; reason = 'chain-stopped' }; L "LEG $($leg.name) NOT_RUN $stopReason reason=chain-stopped"; continue }
     $ran = $false
     $ticket = $null; $ticketKeeps = 0
+    $legPreFF = $false; $legPreFFLine = ''; $legReFF = $false; $legReFFLine = ''   # r4: a FOREIGN_FLOOR on ANY probe of this leg sticks across GATE_BUSY retries of the same leg, never into the next
     $legWaitStart = [DateTime]::UtcNow   # the supplementary 'held' clock: how long this leg has waited in any gate
     while (-not $ran) {
         if ([DateTime]::UtcNow -ge $deadline) { $stopReason = 'DEADLINE'; $exitCode = 3; Add-Result $leg 'NOT_RUN' @{ verdict = 'DEADLINE'; reason = 'deadline-before-leg' }; L "LEG $($leg.name) NOT_RUN DEADLINE reason=deadline-before-leg"; break }
@@ -439,9 +456,11 @@ foreach ($leg in $plan) {
         # (b) the quiet wait, WITHOUT the claim
         if ($ticket) { [void](Update-VenueTicket -Ticket $ticket -Phase 'probing' -StaleAfterSec $ticketProbeStaleSec) }   # a ticket kept across a GATE_BUSY: held for this ONE probe
         $pre = Invoke-QuietProbe $leg.name 'pre-claim' $QuietMaxWaitSec
+        if ($pre.foreignFloor) { $legPreFF = $true; $legPreFFLine = $pre.foreignFloorLine }
         L "QUIET leg=$($leg.name) phase=pre-claim exit=$($pre.code) verdict=$($pre.verdict) mean=$(Format-Mean $pre.mean) waitedSec=$($pre.waitedSec)$(if ($pre.reason) { " reason=$($pre.reason)" }) (no claim held)"
         if ($pre.verdict -ceq 'USAGE') { $stopReason = 'USAGE'; $exitCode = 2; Add-Result $leg 'NOT_RUN' @{ verdict = 'USAGE'; reason = 'wait-venuequiet-usage' }; L "LEG $($leg.name) NOT_RUN USAGE reason=wait-venuequiet-usage"; break }
         if ($pre.verdict -in @('GATE_UNREADABLE', 'HOST_MISMATCH')) { $stopReason = $pre.verdict; $exitCode = $(if ($pre.verdict -ceq 'GATE_UNREADABLE') { 4 } else { 5 }); Add-Result $leg 'NOT_RUN' @{ verdict = $pre.verdict; reason = 'phase=pre-claim' }; L "LEG $($leg.name) NOT_RUN $($pre.verdict) phase=pre-claim"; break }
+        if ($pre.verdict -ceq 'VENUE_DRIVER_SCRIPT_MISSING') { Stop-DriverScriptMissing $leg $pre.reason 'pre-claim'; break }
         if ($pre.verdict -ceq 'VENUE_QUIET_UNKNOWN') {
             # (a1) the probe blocked the wait loop (heavy-slot admission can hold it up to -ProbeAdmissionWaitSec) and ended not measured: the leg has been held, so make the held
             # offer NOW, before -OnUnknown Stop sets stopReason (a stopped chain skips every offer as CHAIN_STOPPED). The Bachelor verdict, exit code and stop below are unchanged.
@@ -481,6 +500,7 @@ foreach ($leg in $plan) {
             # (d) ONE re-probe under the claim: the measurement nearest the leg is the one its line carries
             if ($ticket) { [void](Update-VenueTicket -Ticket $ticket -Phase 'probing' -StaleAfterSec $ticketProbeStaleSec) }
             $re = Invoke-QuietProbe $leg.name 'under-claim' 0
+            if ($re.foreignFloor) { $legReFF = $true; $legReFFLine = $re.foreignFloorLine }
             L "QUIET leg=$($leg.name) phase=under-claim exit=$($re.code) verdict=$($re.verdict) mean=$(Format-Mean $re.mean)$(if ($re.reason) { " reason=$($re.reason)" })"
             if ($re.verdict -ceq 'GATE_BUSY') {
                 L "CLAIM_RELEASED leg=$($leg.name) result=$(Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir) reason=gate-busy-under-claim (back to waiting)"; $released = $true
@@ -494,6 +514,9 @@ foreach ($leg in $plan) {
             Close-LegTicket $leg.name 'TICKET_ENDED' 'leg-starting'
             if ($re.verdict -ceq 'USAGE') { $stopReason = 'USAGE'; $exitCode = 2; Add-Result $leg 'NOT_RUN' @{ verdict = 'USAGE'; reason = 'phase=under-claim' }; L "LEG $($leg.name) NOT_RUN USAGE phase=under-claim"; break }
             if ($re.verdict -in @('GATE_UNREADABLE', 'HOST_MISMATCH')) { $stopReason = $re.verdict; $exitCode = $(if ($re.verdict -ceq 'GATE_UNREADABLE') { 4 } else { 5 }); Add-Result $leg 'NOT_RUN' @{ verdict = $re.verdict; reason = 'phase=under-claim' }; L "LEG $($leg.name) NOT_RUN $($re.verdict) phase=under-claim"; break }
+            if ($re.verdict -ceq 'VENUE_DRIVER_SCRIPT_MISSING') { Stop-DriverScriptMissing $leg $re.reason 'under-claim'; break }
+            $legMissing = Get-VenueDriverScriptMissing -Path @($LegScript)
+            if ($legMissing) { Stop-DriverScriptMissing $leg ($legMissing -replace '^VENUE_DRIVER_SCRIPT_MISSING ', '') 'leg-launch'; break }
             if ($re.verdict -ceq 'VENUE_QUIET_UNKNOWN') {
                 # (d1) the under-claim probe blocked in heavy-slot admission and ended not measured: same held offer as (a1), made AFTER Bachelor's claim is released (ultra-magnus is
                 # offered while Bachelor is free, never while this chain holds it) and BEFORE -OnUnknown Stop sets stopReason. The leg never ran, so no after-leg offer follows.
@@ -529,11 +552,14 @@ foreach ($leg in $plan) {
                 if ($exitCode -eq 0) { $exitCode = 7 }
             } else {
                 $preLoad = Get-LegPreLoadMean $receipt
-                $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET') { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { 'QUIET_PRELOAD_OK' } else { 'QUIET_PRELOAD_HIGH' })
-                $ranExtra = @{ verdict = $re.verdict; quietMean = $re.mean; preClaimVerdict = $pre.verdict; preClaimMean = $pre.mean; preLoadMean = $preLoad; class = $class; outcome = $outcome; legExit = $legCode; receipt = $receipt }
+                # a FOREIGN_FLOOR early exit in ANY probe of the leg (either phase, any attempt, GATE_BUSY retries included) leaves it contended: a later QUIET reading never promotes it to a counted class
+                $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET' -or $legPreFF -or $legReFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { 'QUIET_PRELOAD_OK' } else { 'QUIET_PRELOAD_HIGH' })
+                $ranExtra = @{ verdict = $re.verdict; quietMean = $re.mean; preClaimVerdict = $pre.verdict; preClaimMean = $pre.mean; preLoadMean = $preLoad; class = $class; preClaimForeignFloor = $legPreFF; underClaimForeignFloor = $legReFF; outcome = $outcome; legExit = $legCode; receipt = $receipt }
+                if ($legPreFF) { $ranExtra['preClaimForeignFloorLine'] = $legPreFFLine }
+                if ($legReFF) { $ranExtra['underClaimForeignFloorLine'] = $legReFFLine }
                 if ($detail) { $ranExtra['outcomeDetail'] = $detail }
                 Add-Result $leg 'RAN' $ranExtra
-                L "LEG $($leg.name) RAN exit=$legCode outcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) preLoadMean=$(Format-Mean $preLoad) class=$class receipt=$receipt$(if ($detail) { " detail=$detail" })"
+                L "LEG $($leg.name) RAN exit=$legCode outcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) preLoadMean=$(Format-Mean $preLoad) class=$class receipt=$receipt$(if ($legPreFF) { ' preClaimForeignFloor=1' })$(if ($legReFF) { ' underClaimForeignFloor=1' })$(if ($detail) { " detail=$detail" })"
                 # VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1: only a RAN leg counts or resets (LEG_FAILED / NOT_RUN never reach here). VENUE_UNHEALTHY with a detail extends the
                 # streak when the detail KEY is the same (Get-UnhealthyDetailKey), otherwise starts it at 1; anything else (a different outcome, or no detail to compare) resets it.
                 # -UnhealthyStreakStop 0 switches off the count only: the owner-only first occurrence stops the chain whatever N is.

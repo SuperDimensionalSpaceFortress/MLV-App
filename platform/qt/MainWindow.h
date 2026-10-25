@@ -1266,6 +1266,10 @@ private:
     double m_playbackSmokePresentPacingSumMs = 0.0;
     double m_playbackSmokeLlrawprocSumMs = 0.0;
     double m_playbackSmokeProcessed8SumMs = 0.0;
+    // PROCESSED8-MS-TELEMETRY-STUCK-1: presented frames whose render ran the
+    // processed8 / processed16 stage; the divisors of the processed8/16 averages.
+    int m_playbackSmokeProcessed8MeasuredFrames = 0;
+    int m_playbackSmokeProcessed16MeasuredFrames = 0;
     double m_playbackSmokeProcessed8CacheStoreSumMs = 0.0;
     double m_playbackSmokeRawUint16SumMs = 0.0;
     double m_playbackSmokeRawUint16DecompressSumMs = 0.0;
@@ -1560,6 +1564,8 @@ private:
     bool m_headlessPlaybackProfileActive = false;
     uint64_t m_nextRenderRequestSerial = 1;
     uint64_t m_lastPresentedRequestSerial = 0;
+    // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: the requestSerial whose pixmap m_pGraphicsItem holds (0: none / a placeholder).
+    uint64_t m_graphicsItemPresentedSerial = 0;
     GpuPreviewProcessingBackendRequest m_gpuPreviewProcessingBackendRequest =
         GpuPreviewProcessingBackendRequest::Auto;
     GpuBilinearDebayerBackendRequest m_gpuBilinearDebayerBackendRequest =

@@ -28,6 +28,7 @@ import random
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -3516,6 +3517,323 @@ class PromptLintTests(unittest.TestCase):
 
 
 @requires_pwsh
+class CompileStepAndReadMentionTests(unittest.TestCase):
+    """LOCAL-PLAYBACK-LINT-COMPILE-WORD-FP-1 (C1) and LOCAL-PLAYBACK-LINT-PARAM-MENTION-FP-1 (C2): two false positives of the prompt lint.
+
+    C1 -- the WARM-RUN-CHROMA-SMOOTH-PARITY-1 design prompt (design-WARM-RUN-CHROMA-SMOOTH-PARITY-1-20261019T1015Z/opus-001.last.txt:192) said
+    "..., assemble locally (-j2), stage to Bachelor, stage the smoke runner, then run" and the chains on the next line. `locally` there is the
+    adverb of a COMPILE step; the lint read it as run-playback-locally and the producer was refused three times. A `locally` marker whose
+    own comma piece is a compile step (a listed compile verb, no launch verb in its clause) is not a launch -- but ONLY when no other clause
+    of the sentence launches anything except a venue chain / leg (DriveObjects) or a bare launch verb at the end of its line.
+
+    C2 -- review-pr522-keys-r1-20261019T1835Z/key-prompt-sol.md:9 asked a key seat to "Confirm from the runner (<launcher> -PlaybackProcessing
+    ValidateSet), the wrapper splat ...". Rule 4 read a tracked launcher named with a parameter as a direct launch, and both r1 key seats were
+    refused before reserve. A launcher + parameter mention INSIDE a parenthetical that a read-only verb (ReadOnlyVerbs) introduces, in a
+    sentence with no launch verb, is not a launch. The call operator, an explicit relative path, `pwsh -File` and any word but a listed one
+    between the parenthesis and the launcher keep it a launch.
+
+    r3 (sol r2 CHANGES_REQUESTED on 31e0d567): C1 exempted on the launch verb ALONE, so a line break between the verb and its app / smoke
+    object hid the launch; C2 took a read-only word as enough to exempt an invocation that passes a value and says it calls the launcher on
+    this host. A bare verb now drives only when the NEXT line opens with a DriveObjects word (no launch verb, no rule trigger), and a mention
+    must name the parameter's declaration (MentionParamWords) in a sentence with no InvokeWords word and no locally / host / here marker.
+    The r1 negative c1-real-line (the verb with no next line) now refuses: its object is missing, and the safety floor wins.
+
+    Every row names its card; the negatives (must pass) and the safety-floor positives (must still be refused) are ONE table each."""
+
+    LAUNCHER = SMOKE_SCRIPT
+    PARAM = LAUNCHER + " -PlaybackProcessing "
+    C2_REAL = (f"Confirm from the runner ({PARAM}ValidateSet), the wrapper splat (compare-output-budget.ps1) and the app "
+               "(MainWindow::selectedPlaybackProcessingLabel) that \"subset\" is the mode the wb_locked profile intended (no receipt), "
+               "and that no other profile changes meaning.")
+    C1_REAL_LINE = "Ultra-Magnus (DLL_PAIR_OK SOURCE=<head>), assemble locally (-j2), stage to Bachelor, stage the smoke runner, then run"
+    C1_REAL_PARAGRAPH = ("No .cu changed, but a DLL pair is bound to the head sha: run the pair on\n" + C1_REAL_LINE
+                         + "\nthe chains with a detached driver copied from venue-wrd1b.ps1 (read-only queue gate waiting for an EMPTY queue).")
+
+    # (label, text): the lint must return NO finding.
+    MUST_PASS = (
+        ("c1-real-paragraph", C1_REAL_PARAGRAPH),
+        ("c1-next-line-venue-chains", "Build MLVApp locally, stage the smoke runner to Bachelor, then run\nthe venue chains on Bachelor."),
+        ("c1-one-sentence", "Assemble locally (-j2), stage to Bachelor, stage the smoke runner, then run the chains."),
+        ("c1-build-venue-chains", "Build locally (-j2), stage the smoke runner to Bachelor, then run the venue chains."),
+        ("c1-compile-legs", "Compile locally, stage the smoke runner to Bachelor, then run the legs."),
+        ("c1-rebuild-app-object", "Rebuild the app locally, stage the smoke runner to Bachelor, then run the chain runner."),
+        ("c2-real-sentence", C2_REAL),
+        ("c2-bare-parenthetical", f"Confirm from the runner ({PARAM}ValidateSet)."),
+        ("c2-check-parenthetical", f"Check the options of the runner ({PARAM}ValidateSet) before editing."),
+        ("c2-see-in-parenthetical", f"Verify against the runner (see {PARAM}ValidateSet) that the value is accepted."),
+        ("c2-tracked-path-parenthetical", f"Inspect the runner (tools/profiling/{PARAM}ValidateSet)."),
+        # r4: a verbless coordinated object after the drive passes when it is itself a drive object, or names its own venue route.
+        ("c1-chains-and-legs", "Assemble locally, then run the chains and the legs."),
+        ("c1-chains-and-smoke-runner-on-bachelor", "Assemble locally, then run the chains and the smoke runner on Bachelor."),
+    )
+    # (label, text): the safety floor -- every one is refused today and must stay refused.
+    MUST_REFUSE = (
+        ("floor-run-playback-locally", "Run playback locally."),
+        ("floor-run-smoke-runner-locally", "Run the smoke runner locally."),
+        ("c1-compile-then-run-playback", "Assemble locally and run playback."),
+        ("c1-build-then-run-playback", "Build locally, then run playback."),
+        ("c1-build-app-then-play-clip", "Build MLVApp locally, then play the clip."),
+        ("c1-stage-then-run-it", "Assemble locally, stage to Bachelor, stage the smoke runner, then run it."),
+        ("c1-then-run-smoke-runner", "Assemble locally, then run the smoke runner."),
+        ("c1-launch-before-compile", "Run playback, then assemble locally."),
+        ("c1-compile-and-run-in-one-clause", "Build and run playback locally."),
+        ("c1-second-locally", "Build locally, stage the smoke runner, then run the chains locally."),
+        ("c1-chains-on-this-host", "Assemble locally, stage the smoke runner, then run the chains on this host."),
+        ("c1-app-launch-after-compile", f"Assemble locally (-j2), then launch {APP} {SMOKE_MODE} take01.dat."),
+        ("c1-drive-chain-and-play", "Assemble locally, stage the smoke runner to Bachelor, then run the chains and play the clip."),
+        ("c2-run-launcher", f"Run {PARAM}cuda."),
+        ("c2-run-in-parentheses", f"Run ({PARAM}cuda)."),
+        ("c2-confirm-then-run", f"Confirm the value, then run {PARAM}cuda."),
+        ("c2-inspect-then-run-it", f"Inspect {PARAM}ValidateSet, then run it."),
+        ("c2-pwsh-file", f"pwsh -NoProfile -File {PARAM}cuda"),
+        ("c2-read-clause-no-parenthesis", f"Confirm from the runner: {PARAM}cuda."),
+        ("c2-read-clause-bare-mention", f"Read {PARAM}ValidateSet to see which values it accepts."),
+        ("c2-paren-with-a-launch-verb-after", f"Confirm from the runner ({PARAM}ValidateSet) and run it."),
+        ("c2-second-launcher-outside-parenthesis", f"Confirm from the runner ({PARAM}ValidateSet); {PARAM}cuda."),
+        ("c2-no-read-verb", f"Then ({PARAM}cuda)."),
+        ("c2-call-operator", f"Confirm from the runner (& {PARAM}cuda)."),
+        ("c2-explicit-relative-path", f"Confirm from the runner (.\\{PARAM}cuda)."),
+        ("c2-unlisted-word-before-launcher", f"Confirm from the runner (using {PARAM}cuda)."),
+        ("c2-pwsh-file-in-parentheses", f"Confirm from the runner (pwsh -File {PARAM}ValidateSet)."),
+        ("c2-launch-verb-in-the-sentence", f"Confirm the runner by executing ({PARAM}ValidateSet)."),
+        ("c2-app-in-parentheses", f"Confirm from the runner ({APP} {SMOKE_MODE} take01.dat)."),
+        # r3 (sol r2 CHANGES_REQUESTED on 31e0d567, findings[0].repro and findings[1].repro, verbatim): merge-base refuses all three.
+        ("c1-sol-r2-launch-object-on-the-next-line", "Build MLVApp locally, then run\nit with the smoke mode."),
+        ("c2-sol-r2-verify-by-calling-on-this-host", f"Verify playback on this host by calling ({PARAM}cuda)."),
+        ("c2-sol-r2-check-by-calling-on-this-host", f"Check playback on this host by calling ({PARAM}cuda)."),
+        # r3: the shapes around the two sol rows. The r1 negative c1-real-line moved here (its launch verb has no object at all).
+        ("c1-real-line-object-missing", C1_REAL_LINE),
+        ("c1-bare-verb-then-period", "Build MLVApp locally, then run.\nthe chains."),
+        ("c1-next-line-smoke-runner", "Build MLVApp locally, then run\nthe smoke runner."),
+        ("c1-next-line-chains-on-this-host", "Build MLVApp locally, then run\nthe chains on this host."),
+        ("c1-next-line-chains-then-play", "Build MLVApp locally, then run\nthe chains and play the clip."),
+        ("c1-next-line-after-a-blank-line", "Build MLVApp locally, then run\n\nthe chains."),
+        ("c1-next-line-is-a-heading", "Build MLVApp locally, then run\n## the chains"),
+        ("c1-bare-verb-mid-sentence", "Build MLVApp locally, then run, then stage the chains."),
+        ("c2-value-not-a-declaration", f"Verify from the runner ({PARAM}cuda)."),
+        ("c2-declaration-then-value", f"Verify from the runner ({PARAM}ValidateSet cuda)."),
+        ("c2-declaration-on-this-host", f"Verify from the runner ({PARAM}ValidateSet) on this host."),
+        ("c2-declaration-locally", f"Verify locally from the runner ({PARAM}ValidateSet)."),
+        ("c2-declaration-by-calling", f"Verify by calling the runner ({PARAM}ValidateSet)."),
+        ("c2-backticked-invocation", f"Verify playback by calling (`{PARAM}cuda`)."),
+        # r4 (sol r3 CHANGES_REQUESTED on 3799f0de, findings[0].repro, verbatim): a verbless coordinated clause after the drive carries a
+        # launch object with a local destination. Merge-base c4b1fb49 refuses both (run-playback-locally).
+        ("c1-sol-r3-chains-and-smoke-runner-here", "Assemble locally, then run the chains and the smoke runner here."),
+        ("c1-sol-r3-chains-and-playback-here", "Assemble locally, then run the chains and playback here."),
+        # r4: the shapes around the sol rows. A verbless coordinated object inherits the drive's verb and needs its own venue route.
+        ("c1-chains-and-smoke-runner-no-route", "Assemble locally, then run the chains and the smoke runner."),
+        ("c1-chains-then-smoke-runner-on-this-host", "Assemble locally, then run the chains, then the smoke runner on this host."),
+        ("c1-chains-or-the-arms", "Assemble locally, then run the chains or the arms."),
+        ("c1-chains-and-smoke-runner-locally", "Assemble locally, then run the chains and the smoke runner locally."),
+        ("c1-chains-and-legs-here", "Assemble locally, then run the chains and the legs here with the smoke runner."),
+        ("c1-next-line-chains-on-my-machine", "Build MLVApp locally, then run\nthe chains on my machine with the smoke runner."),
+    )
+    # (label, text): r4 (sol r3 findings[1], LOCAL-PLAYBACK-LINT-C1-MUTATION-FIXTURES-1). Each guard of the C1 exemption has a row that only
+    # that guard refuses, so removing the guard turns the row red (test_each_guard_mutation_turns_its_fixture_red). The first two are sol's
+    # findings[1].repro verbatim; the lint refuses all of them. Sol's second row is also refused by the r4 drive-remainder guard (`clip`),
+    # so the lookahead's own row drives a pronoun object no other guard reads.
+    MUTATION_REFUSE = (
+        ("mut-own-clause-launch-verb", "Build MLVApp to play locally."),
+        ("sol-r3-drive-tail-second-verb", "Assemble locally, stage the smoke runner to Bachelor, then run the chains to play the clip."),
+        ("mut-drive-tail-second-verb", "Assemble locally, stage the smoke runner to Bachelor, then run the chains to play it."),
+        ("mut-coordinated-object", "Assemble locally, then run the chains and the smoke runner."),
+        ("mut-drive-remainder-object", "Assemble locally, then run the chains with the smoke runner."),
+        ("mut-sentence-host-reference", "Assemble locally, stage the smoke runner here, then run the chains."),
+    )
+    # (guard label, exact text of the guard in the lint, its mutation, the MUTATION_REFUSE label the mutation must turn red). Each source
+    # string must occur exactly once in the lint, so a renamed or removed guard fails this table too.
+    GUARD_MUTATIONS = (
+        ("own-clause HasVerb guard", "if ($Clause.HasVerb -or $Clause.Contrast -or $Index -lt $Clause.Start) { return $false }",
+         "if ($Clause.Contrast -or $Index -lt $Clause.Start) { return $false }", "mut-own-clause-launch-verb"),
+        ("driveTail second-launch-verb lookahead", "(?:${driveObject})${e}(?!.*${b}(?:${verbs})${e})\"\n    $driveBare",
+         "(?:${driveObject})${e}\"\n    $driveBare", "mut-drive-tail-second-verb"),
+        ("coordinated verbless object", "if ($launched -and -not (Test-DriveObjectClause", "if ($false -and -not (Test-DriveObjectClause",
+         "mut-coordinated-object"),
+        ("drive remainder launch object", "if ($rest -match $LaunchObject) { return $false }", "if ($false) { return $false }",
+         "mut-drive-remainder-object"),
+        ("sentence host reference", "if ($hm.Index -ne $Index) { return $false }", "if ($false) { return $false }", "mut-sentence-host-reference"),
+    )
+
+    # LOCAL-PLAYBACK-LINT-EXEMPT-SENTENCE-PRONOUN-FOLLOWUP-1 (Dot R18 advisory 58a56d93 on #619). An exemption covers its OWN sentence (C1 also
+    # reads the next line of a bare launch verb) and nothing after it. What a LATER sentence or line says is judged by the lint on its own.
+    # (label, exempted text, joiner, follow-up): the joiner is a space (one block, one line) or a line break (adjacent lines).
+    C1_EXEMPT = "Assemble locally, stage the smoke runner to Bachelor, then run the chains."
+    C1_COMPILE = "Build it locally with qmake."
+    C2_EXEMPT = f"Confirm from the runner ({PARAM}ValidateSet)."
+    SPACE, BREAK = " ", "\n"
+    # (label, text): C1's bare launch verb ends the line and a PRONOUN object opens the next line. The drive object must be a DriveObjects
+    # word, so every pronoun is refused (it, that, this, this build, the build, the app, them), with and without a clip, bare and on a clip.
+    NEXT_LINE_PRONOUNS = ("it", "that", "this", "this build", "the build", "the app", "them")
+    # (label, exempted text, joiner, follow-up): the follow-up names its own playback / launcher, so the lint refuses IT; the exemption of the
+    # first sentence must not hide it, whether it sits in the same line or on the next one.
+    FOLLOW_UP_REFUSE = (
+        ("c1-then-playback-here", C1_EXEMPT, SPACE, "Then run playback here."),
+        ("c1-line-playback-here", C1_EXEMPT, BREAK, "Then run playback here."),
+        ("c1-then-smoke-runner-here", C1_EXEMPT, SPACE, "Then run the smoke runner here."),
+        ("c1-line-smoke-runner-locally", C1_EXEMPT, BREAK, "Then run the smoke runner locally."),
+        ("c1-compile-then-playback-here", C1_COMPILE, SPACE, "Then run playback here."),
+        ("c1-compile-line-playback-here", C1_COMPILE, BREAK, "Then run playback here."),
+        ("c2-then-playback-here", C2_EXEMPT, SPACE, "Then run playback here."),
+        ("c2-line-playback-here", C2_EXEMPT, BREAK, "Then run playback here."),
+        ("c2-then-launcher-cuda", C2_EXEMPT, SPACE, f"Then run {PARAM}cuda."),
+        ("c2-line-launcher-cuda", C2_EXEMPT, BREAK, f"Then run {PARAM}cuda."),
+    )
+    # (label, exempted text, joiner, follow-up): the follow-up is not a launch, so the pair stays ALLOWED.
+    FOLLOW_UP_PASS = (
+        ("d-compile-then-commit", C1_COMPILE, SPACE, "Then commit it."),
+        ("d-compile-line-commit", C1_COMPILE, BREAK, "Then commit it."),
+        ("d-c1-then-commit", C1_EXEMPT, SPACE, "Then commit it."),
+        ("d-c1-line-commit", C1_EXEMPT, BREAK, "Then commit it."),
+        ("d-c2-then-commit", C2_EXEMPT, SPACE, "Then commit it."),
+        ("d-c2-line-commit", C2_EXEMPT, BREAK, "Then commit it."),
+    )
+    # (label, exempted text, joiner, follow-up): KNOWN GAP, not caused by C1 or C2. The follow-up is a pronoun launch with no playback word, so
+    # the lint (sentence-local, no antecedent resolution) allows it ALONE as well ("Then run it on M16-1243." is allowed with no exemption in play,
+    # see test_pronoun_only_follow_ups_are_a_gap_of_the_whole_lint_not_of_the_exemptions). Dot's examples are the first rows. If the lint ever
+    # learns to refuse a pronoun launch, these rows turn red and move to FOLLOW_UP_REFUSE in the same change.
+    FOLLOW_UP_PRONOUN_GAP = (
+        ("gap-compile-then-run-it-on-a-clip", C1_COMPILE, SPACE, "Then run it on M16-1243."),
+        ("gap-compile-line-run-it-on-a-clip", C1_COMPILE, BREAK, "Then run it on M16-1243."),
+        ("gap-c2-then-run-it-with-cuda", C2_EXEMPT, SPACE, "Then run it with cuda."),
+        ("gap-c2-line-run-it-with-cuda", C2_EXEMPT, BREAK, "Then run it with cuda."),
+        ("gap-c1-then-run-it-here", C1_EXEMPT, SPACE, "Then run it here."),
+        ("gap-c1-line-run-it-locally", C1_EXEMPT, BREAK, "Then run it locally."),
+    )
+
+    @classmethod
+    def _next_line_pronoun_rows(cls) -> list[tuple[str, str]]:
+        rows = []
+        for pron in cls.NEXT_LINE_PRONOUNS:
+            rows.append((f"c1-next-line-pronoun-{pron.replace(' ', '-')}-on-a-clip", f"Build MLVApp locally, then run\n{pron} on M16-1243."))
+            rows.append((f"c1-next-line-pronoun-{pron.replace(' ', '-')}-bare", f"Build MLVApp locally, then run\n{pron}."))
+        return rows
+
+    @classmethod
+    def _pairs(cls, table) -> list[tuple[str, str, str, str]]:
+        """(label, pair text, exempted text, follow-up): the pair is the two texts joined as the table says."""
+        return [(label, first + joiner + follow, first, follow) for label, first, joiner, follow in table]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="hubvm-compile-mention-"))
+        cls.lists = _lint_word_lists(LINT_PS1, cls.tmp)
+        cls.member_rows = cls._member_rows(cls.lists)
+        cls.pair_tables = {name: cls._pairs(getattr(cls, name)) for name in ("FOLLOW_UP_REFUSE", "FOLLOW_UP_PASS", "FOLLOW_UP_PRONOUN_GAP")}
+        texts = ([t for _, t in cls.MUST_PASS] + [t for _, t in cls.MUST_REFUSE] + [t for _, t in cls.MUTATION_REFUSE]
+                 + [t for _, _, t in cls.member_rows] + [t for _, t in cls._next_line_pronoun_rows()]
+                 + [x for rows in cls.pair_tables.values() for _, pair, first, follow in rows for x in (pair, first, follow)])
+        counts = _batch_counts(LINT_PS1, texts, cls.tmp, "compile-mention")
+        cls.verdicts = dict(zip(texts, counts))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def _member_rows(cls, lists: dict[str, list[str]]) -> list[tuple[str, bool, str]]:
+        """(label, must_pass, text): one allow row and one defeater row per member of each list the two exemptions read."""
+        rows: list[tuple[str, bool, str]] = []
+        for verb in lists.get("CompileVerbs", []):
+            v = verb.capitalize()
+            rows.append((f"CompileVerbs:{verb}:allow", True, f"{v} locally, stage the smoke runner to Bachelor, then run the chains."))
+            rows.append((f"CompileVerbs:{verb}:defeater", False, f"{v} locally, then run playback."))
+        for verb in lists.get("ReadOnlyVerbs", []):
+            v = verb.capitalize()
+            rows.append((f"ReadOnlyVerbs:{verb}:allow", True, f"{v} from the runner ({cls.PARAM}ValidateSet)."))
+            rows.append((f"ReadOnlyVerbs:{verb}:defeater", False, f"{v} from the runner: {cls.PARAM}cuda."))
+        for obj in lists.get("DriveObjects", []):
+            rows.append((f"DriveObjects:{obj}:allow", True, f"Assemble locally, stage the smoke runner to Bachelor, then run the {obj}."))
+            rows.append((f"DriveObjects:{obj}:defeater", False, f"Assemble locally, stage the smoke runner to Bachelor, then run the {obj} and play the clip."))
+            # r3: the same object on the NEXT line of a bare verb
+            rows.append((f"DriveObjects:{obj}:next-line-allow", True, f"Assemble locally, stage the smoke runner to Bachelor, then run\nthe {obj} on Bachelor."))
+            rows.append((f"DriveObjects:{obj}:next-line-defeater", False, f"Assemble locally, stage the smoke runner to Bachelor, then run\nthe {obj} here."))
+        for word in lists.get("MentionParenWords", []):
+            rows.append((f"MentionParenWords:{word}:allow", True, f"Confirm from the runner ({word} {cls.PARAM}ValidateSet)."))
+            rows.append((f"MentionParenWords:{word}:defeater", False, f"Confirm from the runner ({word} & {cls.PARAM}cuda)."))
+        for word in lists.get("MentionParamWords", []):
+            rows.append((f"MentionParamWords:{word}:allow", True, f"Confirm from the runner ({cls.PARAM}{word})."))
+            rows.append((f"MentionParamWords:{word}:defeater", False, f"Confirm from the runner ({cls.PARAM}{word} cuda)."))
+        for word in lists.get("InvokeWords", []):
+            rows.append((f"InvokeWords:{word}:defeater", False, f"Confirm the runner by {word} ({cls.PARAM}ValidateSet)."))
+        return rows
+
+    def test_every_negative_fixture_passes(self):
+        wrong = [label for label, text in self.MUST_PASS if self.verdicts[text] != 0]
+        self.assertEqual([], wrong, "false positives the lint still refuses")
+
+    def test_every_safety_floor_positive_is_still_refused(self):
+        wrong = [label for label, text in self.MUST_REFUSE if self.verdicts[text] == 0]
+        self.assertEqual([], wrong, "real launch shapes the lint no longer refuses")
+
+    def test_the_lint_exposes_the_lists_the_two_exemptions_read(self):
+        for key in ("CompileVerbs", "ReadOnlyVerbs", "DriveObjects", "MentionParenWords", "MentionParamWords", "InvokeWords"):
+            self.assertTrue(self.lists.get(key), f"list {key} is missing or empty")
+        body = _lint_reading_body()
+        for key in ("CompileVerbs", "ReadOnlyVerbs", "DriveObjects", "MentionParenWords", "MentionParamWords", "InvokeWords"):
+            self.assertIn(f"$lists.{key}", body, f"the lint does not read list {key}")
+
+    def test_no_listed_verb_of_the_new_lists_is_a_launch_verb(self):
+        launch = {w.lower() for w in self.lists["LaunchVerbs"]}
+        for key in ("CompileVerbs", "ReadOnlyVerbs"):
+            clash = [w for w in self.lists.get(key, []) if w.lower() in launch]
+            self.assertEqual([], clash, f"{key} holds a launch verb: such a word would exempt a launch")
+
+    def test_every_member_of_the_new_lists_has_an_allow_row_and_a_defeater_row(self):
+        self.assertTrue(self.member_rows, "the new lists are not exposed, so no member row exists")
+        wrong = [label for label, must_pass, text in self.member_rows if (self.verdicts[text] == 0) != must_pass]
+        self.assertEqual([], wrong)
+
+    def test_each_guard_mutation_turns_its_fixture_red(self):
+        """r4 (LOCAL-PLAYBACK-LINT-C1-MUTATION-FIXTURES-1): every MUTATION_REFUSE row is refused, and removing ONE guard of the C1
+        exemption (a copy of the lint with that guard's text replaced) admits the row named for it. A guard whose text is gone fails here."""
+        wrong = [label for label, text in self.MUTATION_REFUSE if self.verdicts[text] == 0]
+        self.assertEqual([], wrong, "a mutation fixture is not refused by the unmodified lint")
+        source = LINT_PS1.read_text(encoding="utf-8")
+        rows = dict(self.MUTATION_REFUSE)
+        survivors = []
+        for n, (guard, old, new, label) in enumerate(self.GUARD_MUTATIONS):
+            self.assertEqual(1, source.count(old), f"guard '{guard}' does not occur exactly once in the lint")
+            mutant = self.tmp / f"mutant-{n}.ps1"
+            mutant.write_text(source.replace(old, new), encoding="utf-8")
+            if _batch_counts(mutant, [rows[label]], self.tmp, f"mutant-{n}") != [0]:
+                survivors.append(guard)
+        self.assertEqual([], survivors, "removing these guards admits nothing, so no fixture pins them")
+
+    def test_a_pronoun_on_the_next_line_of_a_bare_launch_verb_is_refused(self):
+        """LOCAL-PLAYBACK-LINT-EXEMPT-SENTENCE-PRONOUN-FOLLOWUP-1: C1 reads the next line of a bare launch verb, and only a DriveObjects word may open it."""
+        rows = self._next_line_pronoun_rows()
+        self.assertEqual(2 * len(self.NEXT_LINE_PRONOUNS), len(rows))
+        wrong = [label for label, text in rows if self.verdicts[text] == 0]
+        self.assertEqual([], wrong, "a pronoun object carried the launch through the compile-step exemption")
+
+    def test_a_follow_up_with_its_own_marker_is_refused_after_an_exempted_sentence(self):
+        """The exemption of the first sentence hides nothing in the second: the pair is refused, and the follow-up alone is refused too."""
+        rows = self.pair_tables["FOLLOW_UP_REFUSE"]
+        self.assertTrue(rows)
+        wrong = [label for label, pair, first, follow in rows
+                 if self.verdicts[first] != 0 or self.verdicts[follow] == 0 or self.verdicts[pair] != self.verdicts[follow]]
+        self.assertEqual([], wrong, "an exempted sentence swallowed (or changed) the verdict of the sentence after it")
+
+    def test_a_follow_up_that_is_not_a_launch_stays_allowed_after_an_exempted_sentence(self):
+        rows = self.pair_tables["FOLLOW_UP_PASS"]
+        self.assertTrue(rows)
+        wrong = [label for label, pair, first, follow in rows if self.verdicts[pair] != 0 or self.verdicts[follow] != 0]
+        self.assertEqual([], wrong, "the exemption leaked a refusal onto a follow-up that launches nothing")
+
+    def test_pronoun_only_follow_ups_are_a_gap_of_the_whole_lint_not_of_the_exemptions(self):
+        """Dot's R18 examples ("Build it locally. Then run it on M16-1243.") are ALLOWED -- and so is the follow-up ALONE, with no exemption in
+        play: the lint is sentence-local and refuses a launch only when its own sentence holds a playback word, so a bare pronoun object
+        ("run it", "run it here", "run it on a clip") is invisible to every rule. That is a different card (it needs an antecedent policy:
+        "run it" after a build is a launch, "run it" after a test list is not); this table pins that C1 and C2 neither cause nor widen it.
+        A lint that starts refusing a pronoun launch turns these rows red: move them to FOLLOW_UP_REFUSE in that change."""
+        rows = self.pair_tables["FOLLOW_UP_PRONOUN_GAP"]
+        self.assertTrue(rows)
+        wrong = [label for label, pair, first, follow in rows
+                 if self.verdicts[first] != 0 or self.verdicts[follow] != 0 or self.verdicts[pair] != 0]
+        self.assertEqual([], wrong, "a pronoun follow-up is now refused (the gap is closed: move the row to FOLLOW_UP_REFUSE) or the exemption broke")
+
+
+@requires_pwsh
 class ListMemberDefeaterTests(unittest.TestCase):
     """r5 (CoS prevention note on PR #448 r4, ruling candidate mlv-safety-lint-exemption-defeater-corpus-r1 WITH the CoS amendment).
 
@@ -4075,7 +4393,10 @@ class LintDifferentialPinTests(unittest.TestCase):
     # multi-line probes (_json_counts: candidate, previous head, master) + 2 probes of test_a_lint_text_is_evaluated_once_per_corpus
     # + 1 probe of test_a_slow_probe_fails_typed_with_its_name_and_elapsed_time = 25. Before the change the same case started
     # 3 tests x (1 word-list probe + 2 lints x 6 shards) + 3 multi-line probes = 42.
-    MAX_PWSH_SPAWNS = 25
+    # CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 adds 3 single-shard probes (a 3-row corpus is one shard): the WITNESS_ROWS corpus (shared by the
+    # changed-corpus and reordered-corpus tests, whichever runs first starts it), the changed corpus and the reordered corpus; the
+    # cached-failure test starts none (its collector is stubbed) = 28.
+    MAX_PWSH_SPAWNS = 28
 
     @classmethod
     def setUpClass(cls):
@@ -4115,6 +4436,70 @@ class LintDifferentialPinTests(unittest.TestCase):
         self.assertEqual(2, len(_PWSH_SPAWNS) - start, "a different lint text is evaluated by its own probe")
         self.assertEqual(len(rows), len(different))
         self.assertGreater(first[0], 0, "`Run playback locally.` is refused: the cached verdicts are real counts")
+
+    # CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 (Dot's record of #501, cos-feedback/mlv-app/pr-501.md line 25): committed witnesses that the
+    # _corpus_counts key carries the corpus digest and that a cached failure is reused. The rows are not test_a_lint_text_is_evaluated_once_
+    # per_corpus's, so neither test depends on which of them runs first; W1 and W2 share this base corpus, and each measures only the spawn
+    # delta of its own call (the base call starts 1 probe or, when the other already ran, none).
+    WITNESS_ROWS = ["Run playback locally now.", "Run playback on Bachelor now.", "Build the console tests."]
+
+    def test_a_changed_corpus_under_unchanged_lint_bytes_is_its_own_evaluation(self):
+        """CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 (W1, Dot's #501 record): one row swapped, the lint bytes unchanged -> exactly one new
+        probe, and the swapped row carries its own verdict, never the earlier corpus's."""
+        base, = _corpus_counts([LINT_PS1], self.WITNESS_ROWS, self.tmp, "w1-base")
+        self.assertGreater(base[0], 0, "`Run playback locally now.` is refused")
+        self.assertEqual(0, base[1], "`Run playback on Bachelor now.` passes")
+        changed_rows = [self.WITNESS_ROWS[1], self.WITNESS_ROWS[1], self.WITNESS_ROWS[2]]  # row 0: the refused row swapped for a passing one
+        start = len(_PWSH_SPAWNS)
+        changed, = _corpus_counts([LINT_PS1], changed_rows, self.tmp, "w1-changed")
+        self.assertEqual(1, len(_PWSH_SPAWNS) - start, "a corpus that differs in one row is a different key: one new probe")
+        self.assertEqual([base[1], base[1], base[2]], changed, "each row of the changed corpus carries its own verdict")
+        self.assertNotEqual(base[0], changed[0], "row 0 must not borrow the earlier corpus's verdict")
+
+    def test_a_reordered_corpus_under_unchanged_lint_bytes_follows_the_new_order(self):
+        """CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 (W2, Dot's #501 record): the same rows in another order are a different key (one new
+        probe) and the verdicts follow the new order -- no positional verdict is borrowed."""
+        base, = _corpus_counts([LINT_PS1], self.WITNESS_ROWS, self.tmp, "w2-base")
+        self.assertNotEqual(base[0], base[1], "the witness needs rows whose verdicts differ")
+        order = [2, 0, 1]
+        start = len(_PWSH_SPAWNS)
+        reordered, = _corpus_counts([LINT_PS1], [self.WITNESS_ROWS[i] for i in order], self.tmp, "w2-reordered")
+        self.assertEqual(1, len(_PWSH_SPAWNS) - start, "the same rows in another order are a different key: one new probe")
+        self.assertEqual([base[i] for i in order], reordered, "the verdicts are the earlier ones permuted the same way as the rows")
+        self.assertNotEqual(base, reordered)
+
+    def test_a_cached_failure_is_reused_without_respawning(self):
+        """CI-LINTDIFF-PIN-DETERMINISM-WITNESS-1 (W3, Dot's #501 record): once a (lint, corpus) evaluation failed, the next call for the
+        same key raises the same message and starts nothing. The failure is produced by a collector that raises (no real probe, 0 pwsh)."""
+        rows = ["Cached-failure witness row one.", "Cached-failure witness row two."]
+        known = set(_COUNT_CACHE)
+        starts: list = []
+        collects: list = []
+
+        def start_nothing(lint, texts, work, tag, shards):
+            starts.append(tag)
+
+        def collect_fails(shards, deadline=None):
+            collects.append(shards)
+            raise AssertionError("witness probe failed: boom")
+
+        spawns = len(_PWSH_SPAWNS)
+        try:
+            with mock.patch.object(sys.modules[__name__], "_start_shards", start_nothing), \
+                    mock.patch.object(sys.modules[__name__], "_collect_shards", collect_fails):
+                with self.assertRaises(AssertionError) as first:
+                    _corpus_counts([LINT_PS1], rows, self.tmp, "w3")
+                self.assertEqual(1, len(starts), "the first call evaluates")
+                with self.assertRaises(AssertionError) as second:
+                    _corpus_counts([LINT_PS1], rows, self.tmp, "w3-again")
+        finally:
+            for key in set(_COUNT_CACHE) - known:
+                del _COUNT_CACHE[key]
+        self.assertEqual("witness probe failed: boom", str(first.exception))
+        self.assertEqual(str(first.exception), str(second.exception), "the cached failure is re-raised with the same message")
+        self.assertEqual(1, len(starts), "the second call must not start an evaluation")
+        self.assertEqual(1, len(collects), "the second call must not collect (re-evaluate) either")
+        self.assertEqual(spawns, len(_PWSH_SPAWNS), "a cached failure starts no pwsh")
 
     def test_a_slow_probe_fails_typed_with_its_name_and_elapsed_time(self):
         """CI-LINTDIFF-PIN-HOSTED-COST-1 bound: a probe that outlives the budget raises an AssertionError naming it, not TimeoutExpired."""
@@ -4581,8 +4966,8 @@ class LintCacheProbeBoundTests(unittest.TestCase):
     def test_the_cache_probe_runs_through_the_counted_helper_and_the_shared_bound(self):
         done = subprocess.CompletedProcess([], 0, stdout='[{"op":"state"}]', stderr="")
         before = len(_PWSH_SPAWNS)
-        with mock.patch.dict(globals(), {"LINT_PROBE_BOUND_SEC": 7}):
-            rows, run = self._probe_with(done, "bound")
+        with mock.patch.object(sys.modules[__name__], "LINT_PROBE_BOUND_SEC", 7):
+            rows, run =self._probe_with(done, "bound")
         self.assertEqual([{"op": "state"}], rows)
         self.assertEqual(["bound-probe.ps1"], _PWSH_SPAWNS[before:], "the probe must be counted in _PWSH_SPAWNS")
         timeout = run.call_args.kwargs["timeout"]
@@ -4612,8 +4997,8 @@ class LintCacheProbeBoundTests(unittest.TestCase):
         self.assertIn("END", message, "the tail of stderr, not its head, is what explains a failure")
 
     def test_a_probe_killed_at_the_bound_fails_typed_with_elapsed_and_bound(self):
-        with mock.patch.dict(globals(), {"LINT_PROBE_BOUND_SEC": 7}):
-            message = self._failure_of(subprocess.TimeoutExpired(["pwsh"], 7, output=None, stderr=b"half a line"), "fresh8")
+        with mock.patch.object(sys.modules[__name__], "LINT_PROBE_BOUND_SEC", 7):
+            message =self._failure_of(subprocess.TimeoutExpired(["pwsh"], 7, output=None, stderr=b"half a line"), "fresh8")
         for needle in ("fresh8", "timed out", "7 s", "half a line"):
             self.assertIn(needle, message)
 
@@ -4641,7 +5026,7 @@ class LintCacheProbeBoundTests(unittest.TestCase):
 
         Throwaway._class_cleanups = []
         self.addCleanup(lambda: [shutil.rmtree(d, ignore_errors=True) for d in made])
-        with mock.patch.dict(globals(), {"_cache_probe": mock.Mock(side_effect=AssertionError("probe boom"))}), \
+        with mock.patch.object(sys.modules[__name__], "_cache_probe", mock.Mock(side_effect=AssertionError("probe boom"))), \
                 mock.patch.object(tempfile, "mkdtemp", spy):
             try:
                 with self.assertRaises(AssertionError):

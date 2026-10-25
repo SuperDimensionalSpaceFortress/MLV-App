@@ -306,13 +306,53 @@ function ConvertTo-DvWindowsArg {
 # hook takes it cannot have started anything (a test sets a sleep here to prove the escape window is closed).
 $script:DvStartGate = $null
 
+# Test seams, empty in production (DV-GIT-NATIVE-START-TYPED-FAILURE-1). DvNativeFault maps a native call's name (AssignProcessToJobObject,
+# ResumeThread, GetExitCodeProcess) to the result to read INSTEAD of the real one; the real call still runs, so the child exists and the
+# cleanup is real. DvNewPipeStream builds one parent-side pipe stream from a raw handle; a test swaps in one that throws.
+$script:DvNativeFault = @{}
+$script:DvNewPipeStream = { param([IntPtr]$h) [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($h, $true)) }
+# DV-GIT-NATIVE-START-UNASSIGNED-CHILD-CLEANUP-1, also empty in production. DvNativeSkipCall names the native calls (AssignProcessToJobObject,
+# CreatePipe, CreateProcessW) whose REAL call is not made when DvNativeFault also names them: the fault then happens BEFORE the call, so a child
+# stays genuinely outside the job (the fault alone lets the real assignment run first). DvNativeFaultHits records the names a fault was read
+# for. DvCleanupGate, $null in production, is called with (child pid, child process handle, job) as the failure cleanup of Start-DvGitInJob
+# begins: it sees the child's state at that moment.
+$script:DvNativeSkipCall = @{}
+$script:DvNativeFaultHits = [Collections.Generic.List[string]]::new()
+$script:DvCleanupGate = $null
+
+function Test-DvNativeSkipped {
+    param([Parameter(Mandatory)][string]$Name)
+    $script:DvNativeFault.ContainsKey($Name) -and $script:DvNativeSkipCall.ContainsKey($Name)
+}
+
+function Resolve-DvNativeResult {
+    param([Parameter(Mandatory)][string]$Name, $Real)
+    if ($script:DvNativeFault.ContainsKey($Name)) { $script:DvNativeFaultHits.Add($Name); return $script:DvNativeFault[$Name] }
+    $Real
+}
+
 function Start-DvGitInJob {
     # CI-FLAKE-DV-GIT-PIPE-STRAGGLER-KILL-1: start $Psi's program SUSPENDED, put it in $Job, then resume it, so that nothing git starts can
     # ever be outside the job. Process.Start then AssignProcessToJobObject left a window (measured: 20 ms was enough on an idle host, and
     # `sh -c 'x & exit 0'` was already in the grandchild's hands): a child started inside it escaped TerminateJobObject, its parent exited, and
     # Kill($true) had no parent chain to follow, so the straggler kill was not confirmed on a loaded hosted runner.
-    # Returns @{ Process; Out; Err } (Out: stdout stream; Err: stderr reader), or $null on ANY failure with nothing left open: the caller then
-    # takes the Process.Start path, which also produces the typed DV_GIT_START_FAILED message. 64-bit only (the buffers below are x64 layouts).
+    # Returns @{ Failure = $null; Process; Handle; Out; Err } (Handle: the process handle, the caller's to close; Out: stdout stream; Err: stderr
+    # reader), or
+    #   * $null when NO child exists yet (CreatePipe / SetHandleInformation / CreateProcessW failed, or not 64-bit) with nothing left open: the
+    #     caller then takes the Process.Start path, which also produces the typed DV_GIT_START_FAILED message; or
+    #   * @{ Failure = <token>; Detail } once a child HAS been created: DV_GIT_START_FAILED (a step before the job assignment threw),
+    #     DV_GIT_JOB_ASSIGN_FAILED (AssignProcessToJobObject returned false), DV_GIT_RESUME_FAILED (ResumeThread returned -1 or left the thread
+    #     suspended), DV_GIT_STREAM_FAILED (a throw building the pipe streams after the resume). The child is then already terminated (with its job)
+    #     and every handle and stream closed, and the caller must NOT start another git: it refuses, exit -1. Each token is its own status and is
+    #     never DV_GIT_TIMEOUT. 64-bit only (the buffers below are x64 layouts).
+    # LIMIT (F, DV-GIT-NATIVE-START-TYPED-FAILURE-1): CreateProcessW is called with bInheritHandles = TRUE and NO PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    # so the child inherits every inheritable handle of this process, not only its three pipe ends. The pipe ends are created inheritable (the
+    # SECURITY_ATTRIBUTES below) and the parent's ends are made non-inheritable straight after, so today the window is the few calls between
+    # CreatePipe and CreateProcessW in ONE thread. Nothing here is thread-safe (the script-scope seams, the counters and the cached $Native are
+    # per module), and no caller runs two Invoke-DvGit calls at once. Before a parallel caller exists this MUST get an explicit handle list
+    # (InitializeProcThreadAttributeList + UpdateProcThreadAttribute with the three child ends, EXTENDED_STARTUPINFO_PRESENT, STARTUPINFOEXW),
+    # or a process-wide lock around create-pipe .. CreateProcessW. Not done here: it needs three more P/Invokes, a STARTUPINFOEXW layout and a
+    # test that enumerates the child's handles, and a half-built list is worse than the documented limit.
     param([Parameter(Mandatory)]$Native, [Parameter(Mandatory)][IntPtr]$Job, [Parameter(Mandatory)]$Psi)
     if ([IntPtr]::Size -ne 8) { return $null }
     $m = [Runtime.InteropServices.Marshal]
@@ -320,6 +360,10 @@ function Start-DvGitInJob {
     $mem = [Collections.Generic.List[IntPtr]]::new()
     $suspendedThread = [IntPtr]::Zero
     $suspendedProcess = [IntPtr]::Zero
+    $childPid = 0
+    $created = $false
+    $step = 'DV_GIT_START_FAILED'   # the token a throw is reported under once the child exists
+    $proc = $null; $outStream = $null; $errStream = $null
     try {
         $alloc = { param([int]$n) $p = $m::AllocHGlobal($n); $m::Copy([byte[]]::new($n), 0, $p, $n); $mem.Add($p); $p }
         $sa = & $alloc 24
@@ -327,11 +371,11 @@ function Start-DvGitInJob {
         $pipe = {
             param([bool]$ParentReads)
             [IntPtr]$r = [IntPtr]::Zero; [IntPtr]$w = [IntPtr]::Zero
-            if (-not $Native::CreatePipe([ref]$r, [ref]$w, $sa, [uint32]0)) { throw 'CreatePipe failed' }
+            if (-not (Resolve-DvNativeResult 'CreatePipe' $(if (Test-DvNativeSkipped 'CreatePipe') { $false } else { $Native::CreatePipe([ref]$r, [ref]$w, $sa, [uint32]0) }))) { throw 'CreatePipe failed' }
             $handles.Add($r); $handles.Add($w)
             # HANDLE_FLAG_INHERIT off on the parent's end: git inherits its own end only.
             $parent = $(if ($ParentReads) { $r } else { $w })
-            if (-not $Native::SetHandleInformation($parent, [uint32]1, [uint32]0)) { throw 'SetHandleInformation failed' }
+            if (-not (Resolve-DvNativeResult 'SetHandleInformation' $Native::SetHandleInformation($parent, [uint32]1, [uint32]0))) { throw 'SetHandleInformation failed' }
             @($r, $w)
         }
         $in = & $pipe $false; $out = & $pipe $true; $err = & $pipe $true
@@ -345,29 +389,45 @@ function Start-DvGitInJob {
         $cmdPtr = $m::StringToHGlobalUni($cmd); $mem.Add($cmdPtr)
         $envPtr = $m::StringToHGlobalUni($envText); $mem.Add($envPtr)
         # CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW, the parent's current directory, handles inherited (as Process.Start does).
-        if (-not $Native::CreateProcessW([IntPtr]::Zero, $cmdPtr, [IntPtr]::Zero, [IntPtr]::Zero, $true, [uint32](0x4 -bor 0x400 -bor 0x08000000), $envPtr, [IntPtr]::Zero, $si, $pi)) { throw 'CreateProcessW failed' }
+        if (-not (Resolve-DvNativeResult 'CreateProcessW' $(if (Test-DvNativeSkipped 'CreateProcessW') { $false } else { $Native::CreateProcessW([IntPtr]::Zero, $cmdPtr, [IntPtr]::Zero, [IntPtr]::Zero, $true, [uint32](0x4 -bor 0x400 -bor 0x08000000), $envPtr, [IntPtr]::Zero, $si, $pi) }))) { throw 'CreateProcessW failed' }
         $suspendedProcess = $m::ReadIntPtr($pi, 0); $suspendedThread = $m::ReadIntPtr($pi, 8); $childPid = $m::ReadInt32($pi, 16)
-        try {
-            $proc = [System.Diagnostics.Process]::GetProcessById($childPid)
-            if ($null -ne $script:DvStartGate) { & $script:DvStartGate }
-            [void]$Native::AssignProcessToJobObject($Job, $suspendedProcess)   # a false return leaves Kill($true) only, as before
-        } catch {
-            # Never leave a suspended child behind, and never let the Process.Start fallback run a second git beside it.
-            try { [System.Diagnostics.Process]::GetProcessById($childPid).Kill() } catch { $null = $_ }
-            throw
-        }
-        [void]$Native::ResumeThread($suspendedThread)
+        $created = $true
+        $proc = [System.Diagnostics.Process]::GetProcessById($childPid)
+        if ($null -ne $script:DvStartGate) { & $script:DvStartGate }
+        $step = 'DV_GIT_JOB_ASSIGN_FAILED'
+        if (-not (Resolve-DvNativeResult 'AssignProcessToJobObject' $(if (Test-DvNativeSkipped 'AssignProcessToJobObject') { $false } else { $Native::AssignProcessToJobObject($Job, $suspendedProcess) }))) { throw 'AssignProcessToJobObject returned false' }
+        $step = 'DV_GIT_RESUME_FAILED'
+        # ResumeThread returns the previous suspend count: 1 for the thread CREATE_SUSPENDED made (now running), -1 (0xFFFFFFFF) on failure,
+        # and more than 1 when the thread stays suspended.
+        $resumed = [uint32](Resolve-DvNativeResult 'ResumeThread' ($Native::ResumeThread($suspendedThread)))
+        if ($resumed -eq [uint32]::MaxValue -or $resumed -gt 1) { throw "ResumeThread returned $resumed" }
+        $step = 'DV_GIT_STREAM_FAILED'   # from here on the child is RUNNING: any throw terminates it and is typed, never a null
         # The child's ends and the stdin writer close here: the child holds its own copies, and a closed stdin reads EOF at once.
         foreach ($h in @($in[0], $in[1], $out[1], $err[1])) { [void]$Native::CloseHandle($h); [void]$handles.Remove($h) }
-        $outStream = [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($out[0], $true))
+        $outStream = & $script:DvNewPipeStream $out[0]
         [void]$handles.Remove($out[0])
-        $errStream = [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($err[0], $true))
+        $errStream = & $script:DvNewPipeStream $err[0]
         [void]$handles.Remove($err[0])
+        $reader = [System.IO.StreamReader]::new($errStream, [Text.UTF8Encoding]::new($false), $true)
         # The process handle stays open for the caller (Handle): Process.ExitCode does not read for a process opened by id, GetExitCodeProcess does.
         $handle = $suspendedProcess; $suspendedProcess = [IntPtr]::Zero
-        [pscustomobject]@{ Process = $proc; Handle = $handle; Out = $outStream; Err = [System.IO.StreamReader]::new($errStream, [Text.UTF8Encoding]::new($false), $true) }
+        [pscustomobject]@{ Failure = $null; Process = $proc; Handle = $handle; Out = $outStream; Err = $reader }
     } catch {
-        $null
+        if ($created) {
+            # One cleanup for every failure after the child exists (before: some paths killed the suspended child, the stream path left a running
+            # one unwatched): terminate it and everything in its job, close the streams and the Process, and report a typed failure. Never a null,
+            # which would make the caller start another git beside this one.
+            $detail = $_.Exception.Message
+            if ($null -ne $script:DvCleanupGate) { try { & $script:DvCleanupGate $childPid $suspendedProcess $Job } catch { $null = $_ } }
+            try { if ($null -ne $proc) { $proc.Kill($true) } else { [System.Diagnostics.Process]::GetProcessById($childPid).Kill($true) } } catch { $null = $_ }
+            [void]$Native::TerminateJobObject($Job, [uint32]1)
+            try { if ($null -ne $proc) { [void]$proc.WaitForExit(5000) } } catch { $null = $_ }
+            foreach ($s in @($errStream, $outStream)) { if ($null -ne $s) { try { $s.Dispose() } catch { $null = $_ } } }
+            if ($null -ne $proc) { try { $proc.Dispose() } catch { $null = $_ } }
+            [pscustomobject]@{ Failure = $step; Detail = $detail }
+        } else {
+            $null
+        }
     } finally {
         foreach ($h in $handles) { [void]$Native::CloseHandle($h) }
         if ($suspendedThread -ne [IntPtr]::Zero) { [void]$Native::CloseHandle($suspendedThread) }
@@ -379,10 +439,12 @@ function Start-DvGitInJob {
 function Get-DvExitCode {
     # The exit code of an exited git: Process.ExitCode, except for a process Start-DvGitInJob started (its Process was opened by id, whose
     # ExitCode does not read), where it is GetExitCodeProcess on the handle the call kept. A signed int, as Process.ExitCode is.
+    # $null when GetExitCodeProcess fails (DV-GIT-NATIVE-START-TYPED-FAILURE-1 I3: the code starts at 0, so ignoring the return read a failure
+    # as git exiting 0); the callers refuse typed (DV_GIT_EXITCODE_FAILED), never admit.
     param([Parameter(Mandatory)]$Proc, $Started, $Native)
     if ($null -eq $Started) { return $Proc.ExitCode }
     [uint32]$code = 0
-    [void]$Native::GetExitCodeProcess($Started.Handle, [ref]$code)
+    if (-not (Resolve-DvNativeResult 'GetExitCodeProcess' ($Native::GetExitCodeProcess($Started.Handle, [ref]$code)))) { return $null }
     [BitConverter]::ToInt32([BitConverter]::GetBytes($code), 0)
 }
 
@@ -430,6 +492,11 @@ function Invoke-DvGit {
         # CI-FLAKE-DV-GIT-PIPE-STRAGGLER-KILL-1: on Windows git is started suspended and resumed only once it is in the job (Start-DvGitInJob),
         # so everything it starts is in the job. Process.Start and then Assign (the fallback below) left a window in which a child escaped it.
         $started = $(if ($job -ne [IntPtr]::Zero) { Start-DvGitInJob -Native $native -Job $job -Psi $psi })
+        if ($null -ne $started -and $null -ne $started.Failure) {
+            # DV-GIT-NATIVE-START-TYPED-FAILURE-1: a child was created and has been terminated and cleaned up. Refuse typed; starting another git
+            # here (the Process.Start path below) is exactly what a null used to cause.
+            return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "$($started.Failure) git was created but could not be started cleanly ($($started.Detail)): git $($GitArgs -join ' ')" }
+        }
         if ($null -ne $started) {
             $proc = $started.Process
             $pipes = $started
@@ -470,13 +537,16 @@ function Invoke-DvGit {
         if (-not $drained) {
             $gitExit = Get-DvExitCode -Proc $proc -Started $pipes -Native $native
             Stop-DvGitCall -Proc $proc -Job $job -Tag $tag
+            if ($null -eq $gitExit) { return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_EXITCODE_FAILED GetExitCodeProcess failed for an exited git (and a process it started held its output open): git $($GitArgs -join ' ')" } }
             # r3 (CoS N4): the kill is confirmed by the evidence that matters, the pipes closing. Closed within 5 s = every holder of the pipe
             # closed its copy of it (KILL-NOT-CONFIRMED-ROW-1: a holder that ended on its own in that window counts, as does one that was killed).
             $confirmed = $false
             try { $confirmed = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($outTask, $errTask), 5000) } catch { $null = $_ }
             return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = (Get-DvStragglerMessage -GitExit $gitExit -Seconds ($drain / 1000) -KillConfirmed $confirmed -GitArgs $GitArgs) }
         }
-        [pscustomobject]@{ exitCode = (Get-DvExitCode -Proc $proc -Started $pipes -Native $native); bytes = $ms.ToArray(); stderr = $errTask.Result }
+        $gitExit = Get-DvExitCode -Proc $proc -Started $pipes -Native $native
+        if ($null -eq $gitExit) { return [pscustomobject]@{ exitCode = -1; bytes = [byte[]]@(); stderr = "DV_GIT_EXITCODE_FAILED GetExitCodeProcess failed for an exited git: git $($GitArgs -join ' ')" } }
+        [pscustomobject]@{ exitCode = $gitExit; bytes = $ms.ToArray(); stderr = $errTask.Result }
     } finally {
         # Only when both reads are done: closing a pipe handle under a blocked read can block, and an unconfirmed straggler still holds it.
         if ($null -ne $pipes -and $null -ne $outTask -and $null -ne $errTask -and $outTask.IsCompleted -and $errTask.IsCompleted) {
@@ -1211,6 +1281,39 @@ function Get-DvUnpacedEvidence {
     [ordered]@{ requested = $requested; active = $active; dropFrame = $dropFrame; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+function Get-DvLookAssistEvidence {
+    <#
+    .SYNOPSIS
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b): did a leg whose spec says Look Assist ON (a LOOK leg, or generatorArgs.forceLookAssist = true) actually
+    run with it on? Read from the app's own LAST `gui_smoke.visual_state` line in the run log (look_assist_enabled), never from the spec or the job's
+    summary. FAIL CLOSED: `blocks` is true when the leg asked for it and the line is absent, carries no look_assist_enabled, or says anything but 1.
+    A leg that does not ask for it never blocks.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $requested = ($null -ne (Get-DvProp $Spec 'look')) -or ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'forceLookAssist') -eq $true)
+    $reported = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    if ($requested) {
+        $found = $null
+        if (-not [string]::IsNullOrEmpty($LogText)) {
+            foreach ($line in ($LogText -split "`r?`n")) { if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') { $found = $line } }
+        }
+        $verdict = 'NOT_HONOURED'
+        if ($null -eq $found) { $reason = 'the run log has no gui_smoke.visual_state line, so nothing shows the app ran with Look Assist on' }
+        else {
+            $m = [regex]::Match($found, '(^|\s)look_assist_enabled=(?<v>\S+)')
+            if (-not $m.Success) { $reason = 'the app''s gui_smoke.visual_state line carries no look_assist_enabled' }
+            else {
+                $reported = $m.Groups['v'].Value
+                if ($reported -cne '1') { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
+                else { $verdict = 'HONOURED' }
+            }
+        }
+    }
+    [ordered]@{ requested = $requested; reported = $reported; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
 # --- leg sets and the display matrix (DUAL-VENUE-DISPLAY-MATRIX-1) -------------------------------------------------------
 # A LEG SET is a tracked list of committed leg specs that one run executes together. The set does not define legs: every cell is still an ordinary committed leg spec (so every receipt
 # is bound to a committed spec by its sha256, exactly as for a single leg), and the set only says which specs make up the matrix, and in what order a run walks them.
@@ -1750,12 +1853,27 @@ function Get-DvVisualVerdict {
     VISUAL_ASSESSMENT_UNAVAILABLE: play frames lack a usable viewport rectangle AND fewer than two judged ones remain, so nothing is judged (counted, surfaced; never the whole window).
     VISUAL_DIVERGENCE: the playback-path frame is further than the threshold from its paused full-quality re-render; counted for speed and
     surfaced. CAPTURE_BLANK: every play frame's viewport is flat (a blank capture judges nothing). NOT_CAPTURED / NOT_REQUESTED: no captures.
+    CAPTURE_UNBOUND (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1): the app says the paused-instant capture's pixels are not the frame its label names
+    (-LabelBound $false), so its difference from the paused re-render compares two moments; counted, judged before VISUAL_DIVERGENCE. A
+    -LabelBound of $null (a build that predates the binding) changes nothing.
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2: the divergence compares TWO captures, so both must be bound. -PausedLabelBound is the paused capture's
+    label_bound. When either side carries a binding (a binding build), anything but $true on BOTH -- $false, or a side that is missing -- is
+    CAPTURE_UNBOUND (fail closed); only when neither carries one (a pre-binding build) does the gate judge as before.
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): -ObserverPaintedPlayFrames are the unforced play frames NOT judged because a forced
+    capture's paint may be what they show (a forced paint stays on screen when the display's own paint is stuck); when they leave fewer than two
+    judged, it is VISUAL_ASSESSMENT_UNAVAILABLE (fail closed: such pictures cannot tell a moving display from a frozen one).
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5 (hub ruling, ACK 6388020454): PARTIAL_FREEZE -- two or more judged play frames repeat the picture
+    before them while the app's label advanced (-RepeatedPlayFrames) AND the source frames are known to differ: the display's own paint stopped
+    landing for part of the tail. Counted and surfaced, never OK; the whole-tail FROZEN_DISPLAY outranks it. Over an unknown source a repeat may be
+    the source's own picture, so it stays a note on an OK block (the reader's repeatedPlayFramesNote); one repeat alone is OK.
     #>
     param([bool]$Requested, [bool]$Captured, [int]$PlayFrames, [int]$DistinctContentHashes, [int]$AppDistinctDisplayFrames, [int]$FlatPlayFrames,
           $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold,
-          [ValidateSet('known-differ', 'known-identical', 'unknown')][string]$SourceDifference = 'unknown', [int]$ViewportUnavailablePlayFrames = 0)
+          [ValidateSet('known-differ', 'known-identical', 'unknown')][string]$SourceDifference = 'unknown', [int]$ViewportUnavailablePlayFrames = 0, $LabelBound = $null,
+          $PausedLabelBound = $null, [int]$ObserverPaintedPlayFrames = 0, [int]$RepeatedPlayFrames = 0)
     if (-not $Requested) { return [pscustomobject]@{ verdict = 'NOT_REQUESTED'; counted = $true; reason = 'the leg spec opts out of window captures' } }
     if ($ViewportUnavailablePlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ViewportUnavailablePlayFrames play frame(s) have no usable viewport rectangle (visual.json), leaving $PlayFrames judged, so the picture cannot be told from the window's timecode and chrome: no visual assessment" } }
+    if ($ObserverPaintedPlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ObserverPaintedPlayFrames unforced play frame(s) were taken after a forced paint their predecessor did not see, or do not record how many forced paints preceded them (forced_paints_before), leaving $PlayFrames judged: a forced paint stays on screen when the display's own paint is stuck, so those pictures cannot tell a moving display from a frozen one: no visual assessment" } }
     if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $PlayFrames play frame(s) were captured" } }
     if ($FlatPlayFrames -ge $PlayFrames) { return [pscustomobject]@{ verdict = 'CAPTURE_BLANK'; counted = $true; reason = 'every play frame''s viewport is flat: the capture shows no picture, so it judges nothing' } }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
@@ -1763,6 +1881,14 @@ function Get-DvVisualVerdict {
     }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'unknown') {
         return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY_SUSPECTED'; counted = $true; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them, but nothing records whether the source frames differ (a static clip shows one picture legitimately): suspected, not excluded" }
+    }
+    if ($RepeatedPlayFrames -ge 2 -and $SourceDifference -ceq 'known-differ') {
+        return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "$RepeatedPlayFrames of the $PlayFrames judged play frames repeat the picture before them while the app's label advanced and the source frames are known to differ: the display's own paint stopped landing for part of the tail" }
+    }
+    if (($null -ne $LabelBound -or $null -ne $PausedLabelBound) -and -not ($LabelBound -eq $true -and $PausedLabelBound -eq $true)) {
+        $unbound = @(if ($LabelBound -ne $true) { "the paused-instant capture (label_bound $(if ($null -eq $LabelBound) { 'missing' } else { 'false' }))" }
+                     if ($PausedLabelBound -ne $true) { "the paused re-render capture (label_bound $(if ($null -eq $PausedLabelBound) { 'missing' } else { 'false' }))" }) -join ' and '
+        return [pscustomobject]@{ verdict = 'CAPTURE_UNBOUND'; counted = $true; reason = "$unbound is not bound to its label (the frame painted when it was taken is not shown to be the frame the label names), so the paused-instant vs paused re-render difference ($PlayVsPausedMeanAbsDiff) compares two moments and judges nothing" }
     }
     if ($SamePosition -and $null -ne $PlayVsPausedMeanAbsDiff -and [double]$PlayVsPausedMeanAbsDiff -gt $Threshold) {
         return [pscustomobject]@{ verdict = 'VISUAL_DIVERGENCE'; counted = $true; reason = "the playback-path frame is $PlayVsPausedMeanAbsDiff (per-channel mean absolute difference, 0..255) from its paused full-quality re-render; the threshold is $Threshold" }
@@ -1827,6 +1953,26 @@ function Read-DvVisualCaptures {
     The receipt's `visual` block for one leg. Copies the published captures (<artifacts>\visual) into <evidence>\visual under the leg's names
     (<legId>-play-<k>.png, <legId>-stop.png, <legId>-paused.png; the app's visual.json and the job's request record beside them), hashes every
     file, derives the content hashes and the play-vs-paused difference from the copies, composes <legId>-strip.png, and applies the gate.
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: a build that binds its captures also keeps the unforced paused-instant capture (<legId>-stop-unbound.png,
+    what a pre-binding build captured) and stamps the stop capture's label_bound; labelBound is $null for a build that predates it.
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2: such a build also takes unforced play captures (<legId>-play-unbound-<k>.png; r3: all of them after
+    the forced ones, see below). When the app published any, the frozen check is judged on the UNFORCED play captures (frozenJudgedOn
+    'play_unbound'): the force-paint shows the frame the label names even when the display's own paint never lands, so judging the forced
+    ones would mask a frozen display. The forced set is reported beside it (forcedPlayDistinctContentHashes) and a forced set that moved over an
+    unforced one that did not is said in the reason. (r5: no index pairing of forced k with unforced k is reported: under the r3 order they are
+    half a tail apart, so on a healthy display every such pair disagrees.) The paused capture gets its unforced twin too
+    (<legId>-paused-unbound.png; pausedUnboundVsPausedMeanAbsDiff). pausedLabelBound and labelBoundBasis /
+    pausedLabelBoundBasis carry the paused capture's binding and where each painted serial came from (label_bound_basis:
+    pixmap_item_by_construction holds by construction and proves only that the forced repaint ran).
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): a forced paint stays on screen when the display's own paint is stuck, so it is what
+    the NEXT unforced capture shows (r2's per-slice pairing let unforced k+1 show forced k: six moving pictures over a frozen display). Every
+    capture records forced_paints_before (forcedPaintsBefore); the frozen check is judged only on the unforced play captures that record the SAME
+    count as the first of them (no forced paint between any two). Those that record another count, or none (an r2 build), are not judged
+    (observerPaintedPlayFrames) -- fewer than two left is VISUAL_ASSESSMENT_UNAVAILABLE. stopUnboundObserverClean says whether stop_unbound also
+    follows them with no forced paint between ($null when unknown); repeatedPlayFrames counts judged unforced captures that repeat the picture before
+    them while the app's label advanced (a display whose paint stopped part-way when the source frames are known to differ, a possible one when
+    nothing records them; $null over source frames the app records as identical). r5: repeatedPlayFramesNote carries the repeat note whatever
+    reason was set first (reason keeps its first-wins rule), and two or more repeats over known-differ source frames are PARTIAL_FREEZE.
     Never throws for a missing or broken capture: the block says what is missing (a capture is evidence about the leg, not the leg itself).
     #>
     param([bool]$Requested, [string]$OptOutReason, [string]$ArtifactsDir, [string]$EvidenceDir, [Parameter(Mandatory)][string]$LegId, [string]$Header = '')
@@ -1837,20 +1983,32 @@ function Read-DvVisualCaptures {
         sourceDifference = 'unknown'; viewportUnavailablePlayFrames = 0
         stopFrame = $null; pausedSettled = $null; pausedFrame = $null; samePosition = $false
         playVsPausedMeanAbsDiff = $null; playVsPausedMeanAbsDiffPerChannel = $null; divergenceThreshold = $script:VisualDivergenceThreshold
+        labelBound = $null; stopUnboundVsPausedMeanAbsDiff = $null; stopUnboundVsStopMeanAbsDiff = $null
+        pausedLabelBound = $null; labelBoundBasis = $null; pausedLabelBoundBasis = $null; pausedUnboundVsPausedMeanAbsDiff = $null
+        frozenJudgedOn = 'play'; forcedPlayDistinctContentHashes = $null
+        observerPaintedPlayFrames = $null; stopUnboundObserverClean = $null; repeatedPlayFrames = $null; repeatedPlayFramesNote = $null
         tailBeginUtc = $null; tailEndUtc = $null; presentMonWindowEndUtc = $null
         stripPath = $null; stripSha256 = $null; stripCopyPath = $null
         verdict = $null; counted = $true; reason = $null; appError = $null
     }
     $notJudgedNote = $null   # set once the frames are read; kept after a verdict reason rather than replaced by it
-    $stripNote = $null       # set when the strip cannot be composed; kept the same way, after the not-judged note
+    $maskNote = $null        # set when the forced play captures moved over unforced ones that did not; kept the same way
+    $observerNote = $null    # set when some unforced play captures followed a forced paint and were not judged; kept the same way
+    $repeatNote = $null      # set when judged unforced captures repeat their predecessor's picture while the label advanced; kept the same way
+    $stripNote = $null      # set when the strip cannot be composed; kept the same way, after the not-judged note
+    $reasonBeforeStrip = $null   # the step reason standing when the strip failed (a NOT_CAPTURED leg keeps it between the capture count and the strip failure)
     $finish = {
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
-            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames)
+            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
+            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFrames)
         # a gate reason replaces a step's reason, except that a NOT_CAPTURED leg keeps the step that says WHY nothing was captured
-        # (the verdict reason comes first, then the note that some saved play frames were not judged, then the strip failure)
-        $notes = (@($notJudgedNote, $stripNote) | Where-Object { $_ }) -join '; '
-        if ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
+        # (the verdict reason comes first, then the notes that some saved play frames were not judged, then the masking and repeat notes, then the strip failure;
+        # a PARTIAL_FREEZE reason already says what the repeat note says, so the note stays in repeatedPlayFramesNote only)
+        $notes = (@($notJudgedNote, $observerNote, $maskNote, $(if ($v.verdict -cne 'PARTIAL_FREEZE') { $repeatNote }), $stripNote) | Where-Object { $_ }) -join '; '
+        # a NOT_CAPTURED leg whose strip also failed keeps both: the capture count, any step reason from before the strip, then the strip failure
+        if ($v.verdict -ceq 'NOT_CAPTURED' -and $stripNote) { $block.reason = (@($v.reason, $reasonBeforeStrip, $stripNote) | Where-Object { $_ }) -join '; ' }
+        elseif ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -1886,11 +2044,14 @@ function Read-DvVisualCaptures {
     foreach ($f in @($appFrames)) {
         if ($null -eq $f) { continue }
         $kind = [string](Get-DvProp $f 'kind'); $index = [int](Get-DvProp $f 'index'); $file = [string](Get-DvProp $f 'file')
-        if ($kind -cnotin @('play', 'stop', 'paused') -or $file -cnotmatch '^(play-\d+|stop|paused)\.png$') { continue }
-        $legName = $(if ($kind -ceq 'play') { "$LegId-play-$index.png" } else { "$LegId-$kind.png" })
+        if ($kind -cnotin @('play', 'play_unbound', 'stop_unbound', 'stop', 'paused_unbound', 'paused') -or $file -cnotmatch '^(play-\d+|play-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$') { continue }
+        $isPlayKind = $kind -cin @('play', 'play_unbound')
+        $legName = $(if ($isPlayKind) { "$LegId-$($kind.Replace('_', '-'))-$index.png" } else { "$LegId-$($kind.Replace('_', '-')).png" })
         $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null; viewportAvailable = $true
                              displayFrame = Get-DvProp $f 'display_frame'; playActive = Get-DvProp $f 'play_active'; tailElapsedMs = Get-DvProp $f 'tail_elapsed_ms'
-                             captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason' }
+                             captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason'
+                             serial = Get-DvProp $f 'serial'; paintedSerial = Get-DvProp $f 'painted_serial'; paintedSerialValid = Get-DvProp $f 'painted_serial_valid'
+                             labelBound = Get-DvProp $f 'label_bound'; labelBoundBasis = Get-DvProp $f 'label_bound_basis'; forcedPaintsBefore = Get-DvProp $f 'forced_paints_before' }
         $src = Join-Path $share $file
         if ($entry.saved -and (Test-Path -LiteralPath $src -PathType Leaf)) {
             $local = Join-Path $dir $legName
@@ -1901,22 +2062,60 @@ function Read-DvVisualCaptures {
                 if ($null -eq $hashPx) { $entry.viewportAvailable = $false }   # no usable viewport rectangle: the whole window is never hashed in its place
                 else {
                     $entry.contentHash = $hashPx.contentHash; $entry.viewportMean = $hashPx.mean; $entry.viewportStd = $hashPx.std
-                    if ($kind -cne 'play') { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1] -RequireViewport).rgb }
+                    if (-not $isPlayKind) { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1] -RequireViewport).rgb }
                 }
             } catch { $entry.appReason = "the runner could not read the image: $($_.Exception.GetType().Name)" }
         }
-        if ($kind -ceq 'paused') { $block.pausedSettled = Get-DvProp $f 'settled'; $block.pausedFrame = Get-DvProp $f 'settled_frame' }
-        if ($kind -ceq 'stop') { $block.stopFrame = Get-DvProp $f 'display_frame' }
+        if ($kind -ceq 'paused') {
+            $block.pausedSettled = Get-DvProp $f 'settled'; $block.pausedFrame = Get-DvProp $f 'settled_frame'
+            if ($null -ne $entry.labelBound) { $block.pausedLabelBound = [bool]$entry.labelBound }
+            $block.pausedLabelBoundBasis = $entry.labelBoundBasis
+        }
+        if ($kind -ceq 'stop') {
+            $block.stopFrame = Get-DvProp $f 'display_frame'
+            if ($null -ne $entry.labelBound) { $block.labelBound = [bool]$entry.labelBound }
+            $block.labelBoundBasis = $entry.labelBoundBasis
+        }
         $frames.Add([pscustomobject]$entry)
     }
     $block.frames = $frames.ToArray()
+    # r2: the frozen check is judged on the UNFORCED play captures whenever the app published any (a binding build); a build without them is judged
+    # on its play captures as before. The choice follows what the app NAMED, never what could be read: an unreadable unforced set is not swapped
+    # for the forced one (that swap is exactly the masking).
+    $judgeKind = $(if (@($frames | Where-Object { $_.kind -ceq 'play_unbound' }).Count -gt 0) { 'play_unbound' } else { 'play' })
+    $block.frozenJudgedOn = $judgeKind
+    # r3 (Dot 7dc103f1 B2): of the unforced play captures, only those no forced paint reached are judged -- the ones recording the same
+    # forced_paints_before as the first of them. One recording another count, or none (an r2 build), may show a forced paint, not the display's own.
+    $isOrdinal = { param($v) ($v -is [int] -or $v -is [long]) -and $v -ge 0 }
+    $pool = @($frames | Where-Object { $_.kind -ceq $judgeKind })
+    $baseOrdinal = $null
+    if ($judgeKind -ceq 'play_unbound') {
+        $first = @($pool | Sort-Object index) | Select-Object -First 1
+        if ($null -ne $first -and (& $isOrdinal $first.forcedPaintsBefore)) { $baseOrdinal = [long]$first.forcedPaintsBefore }
+        $clean = @($pool | Where-Object { $null -ne $baseOrdinal -and (& $isOrdinal $_.forcedPaintsBefore) -and [long]$_.forcedPaintsBefore -eq $baseOrdinal })
+        $block.observerPaintedPlayFrames = $pool.Count - $clean.Count
+        $pool = $clean
+        $stopUnbound = @($frames | Where-Object { $_.kind -ceq 'stop_unbound' }) | Select-Object -First 1
+        if ($null -ne $stopUnbound -and $null -ne $baseOrdinal -and (& $isOrdinal $stopUnbound.forcedPaintsBefore)) {
+            $block.stopUnboundObserverClean = ([long]$stopUnbound.forcedPaintsBefore -eq $baseOrdinal)
+        }
+    }
     # `playFrames` counts the JUDGED play frames (those with a usable viewport); `savedPlayFrames` the play PNGs the app saved and the runner copied;
     # `captured` is true when any was saved, so a leg whose every viewport is missing still says six pictures were captured and none judged.
-    $play = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.contentHash })
+    $play = @($pool | Where-Object { $_.contentHash })
     $block.playFrames = $play.Count
-    $block.savedPlayFrames = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.sha256 }).Count
+    $block.savedPlayFrames = @($frames | Where-Object { $_.kind -ceq $judgeKind -and $_.sha256 }).Count
     $block.captured = ($block.savedPlayFrames -gt 0)
-    $block.viewportUnavailablePlayFrames = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.sha256 -and -not $_.viewportAvailable }).Count
+    $block.viewportUnavailablePlayFrames = @($pool | Where-Object { $_.sha256 -and -not $_.viewportAvailable }).Count
+    if ([int]$block.observerPaintedPlayFrames -gt 0 -and $play.Count -ge 2) {
+        $observerNote = "$($block.observerPaintedPlayFrames) unforced play frame(s) followed a forced paint the others did not and were not judged; the other $($play.Count) were"
+        if (-not $block.reason) { $block.reason = $observerNote }
+    }
+    if ($judgeKind -ceq 'play_unbound') {
+        # the forced twins, reported beside the judged set: if forced and unforced disagree, the receipt says so rather than hiding it
+        $forced = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.contentHash })
+        $block.forcedPlayDistinctContentHashes = @($forced | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
+    }
     if ($block.viewportUnavailablePlayFrames -gt 0 -and $play.Count -ge 2) {
         $notJudgedNote = "$($block.viewportUnavailablePlayFrames) saved play frame(s) have no usable viewport rectangle and were not judged; the other $($play.Count) were"
         if (-not $block.reason) { $block.reason = $notJudgedNote }
@@ -1924,25 +2123,59 @@ function Read-DvVisualCaptures {
     $block.distinctContentHashes = @($play | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
     $block.appDistinctDisplayFrames = @($play | ForEach-Object { $_.displayFrame } | Where-Object { $null -ne $_ -and [int]$_ -ge 0 } | Sort-Object -Unique).Count
     $block.flatPlayFrames = @($play | Where-Object { $null -ne $_.viewportStd -and [double]$_.viewportStd -lt $script:VisualFlatViewportStd }).Count
+    if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1) {
+        $maskNote = "the forced play captures show $($block.forcedPlayDistinctContentHashes) distinct pictures where the unforced ones show one: the force-paint would have masked this"
+        if (-not $block.reason) { $block.reason = $maskNote }
+    }
+    if ($judgeKind -ceq 'play_unbound' -and $block.sourceDifference -cne 'known-identical') {
+        # a display whose own paint stopped part-way: a judged unforced picture equal to the one before it while the app's label advanced
+        $ordered = @($play | Sort-Object index)
+        $block.repeatedPlayFrames = @(for ($i = 1; $i -lt $ordered.Count; $i++) {
+            $a = $ordered[$i - 1]; $b = $ordered[$i]
+            if ($b.contentHash -ceq $a.contentHash -and $null -ne $a.displayFrame -and $null -ne $b.displayFrame -and [int]$b.displayFrame -ne [int]$a.displayFrame) { $b.index }
+        }).Count
+        if ($block.repeatedPlayFrames -gt 0 -and $block.distinctContentHashes -gt 1) {
+            # the cause is named only over source frames known to differ; over unknown source content a repeat may be the source's own (Dot a5acb3c8)
+            $repeatNote = "$($block.repeatedPlayFrames) of the $($play.Count) unforced play captures repeat the picture before them while the app's label advanced: " + $(
+                if ($block.sourceDifference -ceq 'known-differ') { "the display's own paint stopped landing for part of the tail" }
+                else { "nothing records whether the source frames differ, so this is a possible partial freeze or repeated source pictures, not a proven cause" })
+            $block.repeatedPlayFramesNote = $repeatNote   # its own field: an earlier note in reason never hides it (r5, Grok G4)
+            if (-not $block.reason) { $block.reason = $repeatNote }
+        }
+    }
     $block.samePosition = ($null -ne $block.stopFrame -and $null -ne $block.pausedFrame -and [int]$block.stopFrame -ge 0 -and [int]$block.stopFrame -eq [int]$block.pausedFrame -and $block.pausedSettled -eq $true)
     if ($pixels.ContainsKey('stop') -and $pixels.ContainsKey('paused')) {
         $mad = Get-DvVisualMeanAbsDiff -A $pixels['stop'] -B $pixels['paused']
         $block.playVsPausedMeanAbsDiffPerChannel = $mad
         $block.playVsPausedMeanAbsDiff = ($mad | Measure-Object -Maximum).Maximum
     }
-    $tiles = @($frames | Sort-Object @{ Expression = { @{ play = 0; stop = 1; paused = 2 }[$_.kind] } }, index | ForEach-Object {
-        $label = $(if ($_.kind -ceq 'play') { "play $($_.index)  f=$($_.displayFrame)" } elseif ($_.kind -ceq 'stop') { "paused instant  f=$($_.displayFrame)" } else { "paused full quality  f=$($block.pausedFrame)" })
+    if ($pixels.ContainsKey('stop_unbound') -and $pixels.ContainsKey('paused')) {
+        $block.stopUnboundVsPausedMeanAbsDiff = (Get-DvVisualMeanAbsDiff -A $pixels['stop_unbound'] -B $pixels['paused'] | Measure-Object -Maximum).Maximum
+    }
+    if ($pixels.ContainsKey('stop_unbound') -and $pixels.ContainsKey('stop')) {
+        $block.stopUnboundVsStopMeanAbsDiff = (Get-DvVisualMeanAbsDiff -A $pixels['stop_unbound'] -B $pixels['stop'] | Measure-Object -Maximum).Maximum
+    }
+    if ($pixels.ContainsKey('paused_unbound') -and $pixels.ContainsKey('paused')) {
+        $block.pausedUnboundVsPausedMeanAbsDiff = (Get-DvVisualMeanAbsDiff -A $pixels['paused_unbound'] -B $pixels['paused'] | Measure-Object -Maximum).Maximum
+    }
+    $tiles = @($frames | Sort-Object @{ Expression = { @{ play_unbound = 0; play = 1; stop_unbound = 2; stop = 3; paused_unbound = 4; paused = 5 }[$_.kind] } }, index | ForEach-Object {
+        $label = $(if ($_.kind -ceq 'play') { "play $($_.index)  f=$($_.displayFrame)" } elseif ($_.kind -ceq 'play_unbound') { "play $($_.index), unforced  f=$($_.displayFrame)" }
+                   elseif ($_.kind -ceq 'stop_unbound') { "paused instant, unforced  f=$($_.displayFrame)" }
+                   elseif ($_.kind -ceq 'paused_unbound') { "paused full quality, unforced  f=$($block.pausedFrame)" }
+                   elseif ($_.kind -ceq 'stop') { "paused instant  f=$($_.displayFrame)$(if ($null -ne $_.labelBound) { "  bound=$([bool]$_.labelBound)" })" } else { "paused full quality  f=$($block.pausedFrame)" })
         [pscustomobject]@{ path = $(if ($_.sha256) { Join-Path $dir $_.file } else { $null }); viewport = $_.viewport; label = $label } })
     if ($tiles.Count -gt 0) {
         $v = Get-DvVisualVerdict -Requested $true -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
-            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames)
-        $head = "$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)"
+            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
+            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFrames)
+        $head ="$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)"
         try {
             $block.stripPath = New-DvVisualStrip -Tiles $tiles -OutPath (Join-Path $dir "$LegId-strip.png") -Header $head.Trim()
             $block.stripSha256 = Get-DvSha256OfFile $block.stripPath
         } catch {
             $stripNote = "the strip could not be composed: $($_.Exception.GetType().Name)"
+            $reasonBeforeStrip = $block.reason
             $block.reason = $(if ($block.reason) { "$($block.reason); $stripNote" } else { $stripNote })   # a plain OK keeps the not-judged note beside it
         }
     }
@@ -2236,6 +2469,219 @@ function Test-DvReceiptValid {
     # reported as VERIFIED, so nothing that checks `status -eq 'VERIFIED'` can ever take a stub-run receipt for evidence.
     $status = $(if ($invalid.Count -gt 0) { 'INVALID' } elseif ($incomplete.Count -gt 0) { 'INCOMPLETE' } elseif ($mode -ceq 'offline-test') { 'VERIFIED_OFFLINE_TEST' } elseif ($venueAnchorAbsent) { 'ADVISORY' } else { 'VERIFIED' })
     [pscustomobject]@{ valid = ($status -in @('VERIFIED', 'VERIFIED_OFFLINE_TEST')); status = $status; reasons = $reasons; unbound = $unbound; evidenceDir = $ev.dir; legType = $(if ($null -ne $spec) { [string](Get-DvProp $spec 'legType') } else { $null }) }
+}
+
+# --- the job's notAfterUtc (LEASE-NOT-AFTER-SINGLE-LEG-SUBMITTERS-1) --------------------------------
+# um-run.ps1's own -MaxAdmissionWaitSec default. A submitter that does not choose one passes this by name, so the wait it bounds is the wait um-run uses
+# (test_venue_not_after.py reads the default out of um-run.ps1's param block and pins the two equal).
+$script:DvUmRunMaxAdmissionWaitSec = 7200
+# Added to an uncapped bound: um-run reads the outbox every -PollSeconds (3 s), so the client can still be waiting a little past its waits.
+# LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r2 (hub ruling on sol's r1 blocker): the uncapped bound is no longer counted from this helper's clock. The
+# submitter passes it as um-run.ps1 -NotAfterBudgetSec (budgetSec below), and UmRunDrop.psm1 counts it from its own clock read immediately before the claim
+# is written, so a slow setup or share before the drop is absorbed a priori, whatever its length. r3 (sol r2 blocker): the drop reads its clock AGAIN
+# immediately before the job's rename into view, after every side-file and the job's own copy, and re-publishes the value it re-derives, so slow placement
+# is absorbed too. The slack is then only the room between that last read and um-run's 'submitted' line (a fixed few small share operations: the
+# metadata re-publish and the job's rename, whatever the files' sizes) plus the poll above. It is no longer a tolerance for a late drop.
+# r5 (Dot 180721e3 on r4): um-run.ps1 now ends its queue and admission waits at absolute deadlines counted from the drop's sampledUtc, so time after the job
+# is visible (the drop's return, um-run's own lines) no longer comes out of the slack either: what the slack still covers is the drop's measured placement
+# bound (UmRunDrop.psm1 UmRunNotAfterPlacementStallSec) and um-run's poll.
+# r6 (Grok G7): so the measured witness (Test-DvNotAfterCoversDrop) judges a drop-relative value from that same sampledUtc, the instant um-run counts its
+# waits from, whenever the drop reports one; its DVE_NOT_AFTER_DROP_LATE then fires on the uncapped path only for a drop that did not count the budget from
+# the clock read it reports (a defect), never for a stall after visibility, however long.
+$script:DvNotAfterSlackSec = 60
+
+function Get-DvJobNotAfter {
+    <#
+    .SYNOPSIS
+    Pure. The notAfterUtc a venue submitter passes um-run.ps1 -NotAfterUtc: the instant after which no caller reads the job's result any more. Past it the
+    Bachelor agent never leases or launches the job (LEASE-REQUEST-CHILD-NOT-AFTER-1); a launched job is never stopped by it, and the Ultra-Magnus agent
+    ignores the field. The bound is never earlier than a wait the caller passes (a job must not be refused while its submitter still waits) and never later
+    than the last read:
+      - no kill bound of its own (-CallerCapSec 0; Invoke-VenueLeg): um-run waits at most Queue + Admission + Timeout + Claimed after submit (QUEUED, then
+        held in the gate, then CLAIMED to its outer ceiling), so the bound is that sum plus the slack. Source 'um-run-waits'. VenueChain's later by-name read
+        of a killed leg's job (Get-VenueRemoteJobState) is PRESENCE only, and an expired job publishes a result, so it needs no later bound.
+      - a caller that kills its um-run at now + -CallerCapSec (Invoke-VenueStageNightly's remaining -MaxTotalSec): nobody waits past the cap, so the bound
+        is the cap when that is lower. Source 'caller-cap'. A wait over the cap is a caller bug (it would be cut short): DVE_NOT_AFTER_WAIT_OVER_CAP.
+      - a caller that kills its um-run at an ABSOLUTE instant passes it as -CallerDeadlineUtc (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1; the stage
+        driver's $script:Deadline). The bound is then that instant when it is lower than now + the uncapped bound, source 'caller-deadline', and
+        -CallerCapSec (the remaining seconds the caller sized its waits from) only feeds the over-cap check. Counting a sampled remaining budget again from
+        a later now would move the bound past the deadline by however long the caller was delayed between the sample and this call; the deadline itself
+        can only be approached, never passed. A deadline that is not later than now is refused: DVE_NOT_AFTER_DEADLINE_PASSED.
+      - -LaterHarvest: a LATER call reads the result by name, wants the job RUN, and cannot re-submit its single-use JobId (the stage driver's DLL pair and
+        smoke runner). That reader comes at a time this call cannot bound, so the later bound is none: notAfterUtc '' and nothing is passed. Source
+        'later-harvest'.
+    -MaxAdmissionWaitSec defaults to um-run.ps1's own default; the result echoes the one used so the caller passes the same value by name.
+    WHERE THE BOUND COUNTS FROM (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): anchorUtc, the instant this call ran. um-run starts its waits only once the
+    job file is on the share, after this call. r2 (hub ruling): the bound is therefore passed DROP-RELATIVE wherever it is not an absolute kill instant:
+    budgetSec (boundSec for 'um-run-waits'; the uncapped bound for 'caller-deadline') goes to um-run.ps1 -NotAfterBudgetSec and capUtc (the
+    -CallerDeadlineUtc instant, or '') to -NotAfterCapUtc, and the drop writes min(its own now + budgetSec, capUtc). notAfterUtc stays this call's estimate
+    of that value (the drop at the anchor). 'caller-cap' counts from the caller's own start, so it stays absolute (budgetSec null: pass -NotAfterUtc). For
+    'um-run-waits' dropToleranceSec (the slack) is how much later than the drop's own clock read the job may become visible with every um-run wait still
+    inside the bound; a caller that kills um-run at the bound ('caller-cap', 'caller-deadline') waits no longer than it whenever the job appears: null.
+    .OUTPUTS
+    [pscustomobject]@{ notAfterUtc ('o' UTC text ending in Z, or ''); source; boundSec; waitSec; longestWaitSec; maxAdmissionWaitSec; anchorUtc ('o');
+    dropToleranceSec (or null); budgetSec (or null); capUtc ('o' or ''); why }
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
+        [Parameter(Mandatory)][ValidateRange(0, 86400)][int]$MaxQueueWaitSec,
+        [ValidateRange(0, 86400)][int]$MaxAdmissionWaitSec = $script:DvUmRunMaxAdmissionWaitSec,
+        [Parameter(Mandatory)][ValidateRange(0, 86400)][int]$MaxClaimedWaitSec,
+        [ValidateRange(0, 86400)][int]$CallerCapSec = 0,
+        $CallerDeadlineUtc = $null,
+        [switch]$LaterHarvest,
+        $NowUtc = $null
+    )
+    $waits = @($TimeoutSec, $MaxQueueWaitSec, $MaxAdmissionWaitSec, $MaxClaimedWaitSec)
+    $waitSec = ($waits | Measure-Object -Sum).Sum
+    $longest = ($waits | Measure-Object -Maximum).Maximum
+    if ($CallerCapSec -gt 0 -and $longest -gt $CallerCapSec) {
+        throw "DVE_NOT_AFTER_WAIT_OVER_CAP a $longest s um-run wait is longer than the caller's $CallerCapSec s cap: the caller would kill um-run first"
+    }
+    # (-NowUtc is a test seam, -CallerDeadlineUtc a caller's instant: a [DateTime] of any Kind; Local is converted, Unspecified is taken as UTC)
+    $toUtc = { param($v) $(if (([datetime]$v).Kind -eq [DateTimeKind]::Local) { ([datetime]$v).ToUniversalTime() } else { [DateTime]::SpecifyKind([datetime]$v, [DateTimeKind]::Utc) }) }
+    $now = $(if ($null -eq $NowUtc) { [DateTime]::UtcNow } else { & $toUtc $NowUtc })
+    $result = { param($text, $source, $bound, $tolerance, $budget, $cap, $why) [pscustomobject]@{ notAfterUtc = $text; source = $source; boundSec = $bound; waitSec = $waitSec; longestWaitSec = $longest; maxAdmissionWaitSec = $MaxAdmissionWaitSec; anchorUtc = $now.ToString('o'); dropToleranceSec = $tolerance; budgetSec = $budget; capUtc = $cap; why = $why } }
+    if ($LaterHarvest) { return (& $result '' 'later-harvest' $null $null $null '' 'a later call harvests this result by name and cannot re-submit its single-use JobId: no notAfter') }
+    $uncapped = $waitSec + $script:DvNotAfterSlackSec
+    $capText = ''
+    if ($null -ne $CallerDeadlineUtc) {
+        $deadline = & $toUtc $CallerDeadlineUtc
+        if ($deadline -le $now) { throw "DVE_NOT_AFTER_DEADLINE_PASSED the caller's deadline $($deadline.ToString('o')) is not later than now ($($now.ToString('o'))): nothing can be submitted before it" }
+        $capText = $deadline.ToString('o')
+        if ($deadline -lt $now.AddSeconds($uncapped)) {
+            return (& $result $capText 'caller-deadline' ([Math]::Round(($deadline - $now).TotalSeconds, 3)) $null $uncapped $capText "the caller kills um-run at its deadline $capText; the drop writes min(its own now + $uncapped s, that deadline)")
+        }
+    } elseif ($CallerCapSec -gt 0 -and $CallerCapSec -lt $uncapped) {
+        return (& $result $now.AddSeconds($CallerCapSec).ToString('o') 'caller-cap' $CallerCapSec $null $null '' "the caller kills um-run $CallerCapSec s after submit")
+    }
+    & $result $now.AddSeconds($uncapped).ToString('o') 'um-run-waits' $uncapped $script:DvNotAfterSlackSec $uncapped $capText "um-run waits at most $waitSec s (queue $MaxQueueWaitSec + admission $MaxAdmissionWaitSec + timeout $TimeoutSec + claimed $MaxClaimedWaitSec) from its drop + $($script:DvNotAfterSlackSec) s slack; the drop counts the $uncapped s from its own clock$(if ($capText) { ", capped at $capText" })"
+}
+
+function Get-DvUmRunNotAfterArgs {
+    <#
+    .SYNOPSIS
+    Pure. The um-run.ps1 arguments that carry a Get-DvJobNotAfter result (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r4, Grok G1, card
+    NOT-AFTER-BUDGET-NULL-FAIL-CLOSED-1): a budgetSec >= 1 -> NotAfterBudgetSec (plus NotAfterCapUtc when capUtc is set); else a notAfterUtc -> NotAfterUtc;
+    else source 'later-harvest' -> none, by design. Anything else would bind -NotAfterBudgetSec to [int] 0, which um-run reads as 'not given', and drop the
+    bound silently: DVE_NOT_AFTER_BUDGET_MISSING, before anything is submitted.
+    .OUTPUTS
+    [hashtable] to splat onto um-run.ps1
+    #>
+    param([Parameter(Mandatory)]$NotAfter)
+    if ($null -ne $NotAfter.budgetSec) {
+        if ([int]$NotAfter.budgetSec -lt 1) { throw "DVE_NOT_AFTER_BUDGET_MISSING budgetSec $($NotAfter.budgetSec) would reach um-run as 'not given' and drop the bound (source '$($NotAfter.source)')" }
+        $a = @{ NotAfterBudgetSec = [int]$NotAfter.budgetSec }
+        if ($NotAfter.capUtc) { $a.NotAfterCapUtc = [string]$NotAfter.capUtc }
+        return $a
+    }
+    if ($NotAfter.notAfterUtc) { return @{ NotAfterUtc = [string]$NotAfter.notAfterUtc } }
+    if ($NotAfter.source -eq 'later-harvest') { return @{} }
+    throw "DVE_NOT_AFTER_BUDGET_MISSING the bound (source '$($NotAfter.source)') has neither budgetSec nor notAfterUtc; um-run would get no notAfterUtc"
+}
+
+function Get-DvUmRunDropVisibleUtc {
+    <#
+    .SYNOPSIS
+    Pure. When a job became visible on the share, read from um-run.ps1's own output (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1): um-run prints
+    UmRunDrop.psm1's 'submitted <id> -> <path>' line (Write-Host, the information stream) only after Invoke-UmRunDrop has returned, i.e. after the job file
+    is in place, and before it starts its own waits. So the first such information record for -JobId is never earlier than the drop, and judging the bound
+    against its time is conservative. A plain output string, another id's line and a missing line are not this job's drop: $null (unmeasured).
+    .OUTPUTS
+    [DateTime] (Kind Utc) or $null
+    #>
+    param([object[]]$Records = @(), [Parameter(Mandatory)][string]$JobId)
+    $pattern = '^submitted ' + [regex]::Escape($JobId) + ' -> '
+    foreach ($r in @($Records)) {
+        if ($r -isnot [System.Management.Automation.InformationRecord]) { continue }
+        if ([string]$r.MessageData -cmatch $pattern) { return $r.TimeGenerated.ToUniversalTime() }
+    }
+    $null
+}
+
+function Get-DvUmRunDropNotAfter {
+    <#
+    .SYNOPSIS
+    Pure. The notAfterUtc the drop actually wrote into the claim, read from um-run.ps1's own output (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r2): for
+    the drop-relative form (-NotAfterBudgetSec) UmRunDrop.psm1 returns 'job not-after: <id>.meta.json notAfterUtc=<o> sampledUtc=<o> budgetSec=<n>
+    capUtc=<o|none>' and um-run echoes it on the information stream, like the 'submitted' line. The first such record for -JobId; sampledUtc, budgetSec
+    and capUtc are $null / '' when the line does not carry them (the absolute form prints notAfterUtc only). Anything else: $null (unreported).
+    .OUTPUTS
+    [pscustomobject]@{ notAfterUtc ([DateTime] Utc); sampledUtc ([DateTime] Utc or $null); budgetSec ([int] or $null); capUtc ('o', '' for none) } or $null
+    #>
+    param([object[]]$Records = @(), [Parameter(Mandatory)][string]$JobId)
+    $pattern = '^job not-after: ' + [regex]::Escape($JobId) + '\.meta\.json notAfterUtc=(\S+)(?: sampledUtc=(\S+) budgetSec=(\d+) capUtc=(\S+))?$'
+    $parse = { param($t) [DateTime]::Parse([string]$t, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
+    foreach ($r in @($Records)) {
+        if ($r -isnot [System.Management.Automation.InformationRecord]) { continue }
+        $m = [regex]::Match([string]$r.MessageData, $pattern)
+        if (-not $m.Success) { continue }
+        return [pscustomobject]@{
+            notAfterUtc = (& $parse $m.Groups[1].Value)
+            sampledUtc = $(if ($m.Groups[2].Success) { & $parse $m.Groups[2].Value } else { $null })
+            budgetSec = $(if ($m.Groups[3].Success) { [int]$m.Groups[3].Value } else { $null })
+            capUtc = $(if ($m.Groups[4].Success -and $m.Groups[4].Value -cne 'none') { (& $parse $m.Groups[4].Value).ToString('o') } else { '' })
+        }
+    }
+    $null
+}
+
+function Test-DvNotAfterCoversDrop {
+    <#
+    .SYNOPSIS
+    Pure. Judges a Get-DvJobNotAfter bound against the instant the job actually became visible (LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1). A post-hoc
+    WITNESS: since r2 the bound is set a priori at the drop (-NotAfterBudgetSec), so on the uncapped path covered must be true, and
+    DVE_NOT_AFTER_DROP_LATE there is a DEFECT signal (the drop did not count the budget from the clock read it reports), never an expected outcome of a slow
+    drop or of a stall after visibility. The value judged is the one the agent got: for the drop-relative form (budgetSec set) the drop's own reported
+    notAfterUtc (-DropNotAfter, from Get-DvUmRunDropNotAfter), else the bound's notAfterUtc. The waits are judged from the instant um-run counts them from:
+    r6 (Grok G7), for a drop-relative value that carries sampledUtc, that sampledUtc (um-run.ps1 r5 anchors its queue and admission deadlines there), else
+    the drop (um-run's 'submitted' line, never earlier than visibility: conservative). For an uncapped bound ('um-run-waits') covered is exactly notAfterUtc
+    >= that instant + every um-run wait (waitSec); marginSec is notAfterUtc - (that instant + waitSec): negative is how much earlier than um-run's last wait
+    the agent stops taking the job, positive is how long past it the agent may still take it (at most the slack). dropDelaySec is still the drop's delay after
+    the anchor. An unmeasured drop, or a drop-relative value the drop did not report, is covered = $null: unknown, never covered. A drop-relative
+    value equal to its cap, and a bound the caller kills um-run at ('caller-cap', 'caller-deadline'), are covered whatever the drop time: nobody waits past
+    them. A later harvest passes no bound: nothing to cover. A bound that is not covered says DVE_NOT_AFTER_DROP_LATE in why.
+    .OUTPUTS
+    [pscustomobject]@{ jobId; notAfterUtc (the value judged, '' if unreported); form ('drop-relative', 'absolute', 'none'); budgetSec; capUtc; source;
+    anchorUtc; waitSec; dropToleranceSec; dropSampledUtc ('o' or ''); dropVisibleUtc ('o' or ''); dropDelaySec; marginSec; covered; why }
+    #>
+    param([Parameter(Mandatory)]$NotAfter, $DropVisibleUtc = $null, $DropNotAfter = $null, [string]$JobId = '')
+    $parse = { param($t) [DateTime]::Parse([string]$t, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime() }
+    $anchor = & $parse $NotAfter.anchorUtc
+    $drop = $(if ($null -eq $DropVisibleUtc) { $null } elseif (([datetime]$DropVisibleUtc).Kind -eq [DateTimeKind]::Local) { ([datetime]$DropVisibleUtc).ToUniversalTime() } else { [DateTime]::SpecifyKind([datetime]$DropVisibleUtc, [DateTimeKind]::Utc) })
+    $delay = $(if ($null -eq $drop) { $null } else { [Math]::Round(($drop - $anchor).TotalSeconds, 3) })
+    $margin = $null
+    $relative = $null -ne $NotAfter.budgetSec
+    $form = $(if ($NotAfter.source -ceq 'later-harvest') { 'none' } elseif ($relative) { 'drop-relative' } else { 'absolute' })
+    $judged = $(if (-not $relative) { if ($NotAfter.notAfterUtc) { & $parse $NotAfter.notAfterUtc } else { $null } }
+        elseif ($null -ne $DropNotAfter) { [DateTime]::SpecifyKind([datetime]$DropNotAfter.notAfterUtc, [DateTimeKind]::Utc) } else { $null })
+    $sampled = $(if ($relative -and $null -ne $DropNotAfter -and $null -ne $DropNotAfter.sampledUtc) { [DateTime]::SpecifyKind([datetime]$DropNotAfter.sampledUtc, [DateTimeKind]::Utc).ToString('o') } else { '' })
+    $capped = $relative -and $null -ne $judged -and [string]$NotAfter.capUtc -and $judged -eq (& $parse $NotAfter.capUtc)
+    if ($NotAfter.source -ceq 'later-harvest') {
+        $covered = $true; $why = 'no notAfterUtc was passed: the agent has nothing to refuse the job on'
+    } elseif ($NotAfter.source -cin @('caller-cap', 'caller-deadline')) {
+        $covered = $true; $why = 'the caller kills um-run at notAfterUtc: nobody waits past it, whenever the job became visible (a late drop shortens the waits, never the bound)'
+    } elseif ($null -eq $judged) {
+        $covered = $null; $why = "the drop reported no notAfterUtc for $JobId (no 'job not-after:' line from um-run): the bound is not proven to cover um-run's waits"
+    } elseif ($capped) {
+        $covered = $true; $why = "the drop capped notAfterUtc at the caller's deadline $($NotAfter.capUtc): the caller kills um-run there, so nobody waits past it"
+    } elseif ($null -eq $drop) {
+        $covered = $null; $why = "the drop is unmeasured (um-run reported no drop line for $JobId): the bound is not proven to cover um-run's waits"
+    } else {
+        # r6 (Grok G7): um-run counts a drop-relative value's waits from the drop's sampledUtc, so a stall after visibility moves no wait
+        $waitsFrom = $(if ($sampled) { & $parse $sampled } else { $drop })
+        $margin = [Math]::Round(($judged - $waitsFrom.AddSeconds([double]$NotAfter.waitSec)).TotalSeconds, 3)
+        $covered = $margin -ge 0
+        $why = $(if ($relative -and $covered) { "the drop counted notAfterUtc from its own clock$(if ($sampled) { " ($sampled), which um-run counts its waits from" }), the job visible $delay s after the bound's anchor: every um-run wait ends before notAfterUtc" }
+            elseif ($relative) { "DVE_NOT_AFTER_DROP_LATE (defect: the drop did not count the budget from $(if ($sampled) { "the clock read it reports ($sampled)" } else { "its own clock" })) the drop reported notAfterUtc $($judged.ToString('o')), $(-$margin) s short of $(if ($sampled) { 'that read' } else { "the job's visibility ($delay s after the anchor)" }) + every um-run wait" }
+            elseif ($covered) { "the job was visible $delay s after the bound's anchor, inside its $($NotAfter.dropToleranceSec) s tolerance: every um-run wait ends before notAfterUtc" }
+            else { "DVE_NOT_AFTER_DROP_LATE the job was visible $delay s after the bound's anchor, past its $($NotAfter.dropToleranceSec) s tolerance: the agent stops taking it $(-$margin) s before um-run's last wait ends" })
+    }
+    [pscustomobject]@{
+        jobId = $JobId; notAfterUtc = $(if ($null -eq $judged) { '' } else { $judged.ToString('o') }); form = $form; budgetSec = $NotAfter.budgetSec; capUtc = [string]$NotAfter.capUtc
+        source = $NotAfter.source; anchorUtc = $NotAfter.anchorUtc; waitSec = $NotAfter.waitSec; dropToleranceSec = $NotAfter.dropToleranceSec; dropSampledUtc = $sampled
+        dropVisibleUtc = $(if ($null -eq $drop) { '' } else { $drop.ToString('o') }); dropDelaySec = $delay; marginSec = $margin; covered = $covered; why = $why
+    }
 }
 
 # --- health (P5) ----------------------------------------------------------------------------------
@@ -2544,6 +2990,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

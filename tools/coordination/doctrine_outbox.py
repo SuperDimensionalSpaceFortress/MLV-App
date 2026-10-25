@@ -87,7 +87,7 @@ BEHAVIOURS
    opens, once the body is rendered (HTML entities and tags, table cells) and normalised (Unicode, invisible characters)
    and its bullet, quote, bold and heading marks are off; or a heading with `- RULING CANDIDATE` / `RULING CANDIDATE:` in
    it; a wrapped continuation line, a mid-sentence mention and a citation (the phrase, a `ruling-candidates/` path and
-   a status word such as `remains`) are not markers) unless it
+   a status word such as `remains`, with no colon after it and not the item's own path) are not markers) unless it
    carries a `touches/supersedes:` declaration (`touches:`, `supersedes:` and the bus template's `Relationship to
    existing doctrine:` count too): rule ids (`R15`) or bus-relative paths (`RULINGS.md:1126-1152`) on that line, comma or semicolon
    separated, or as bullets under it, or the single entry `none: <reason of >= 4 words>`. Typed refusals:
@@ -140,6 +140,7 @@ config that is present but wrong is the refusal CONFIG_INVALID (exit 1, naming t
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import html
 import json
@@ -506,6 +507,47 @@ _autoconfigure()
 
 # ---------- git plumbing ----------
 
+# The bus clone is only read here, never written: a partial (promisor) clone must answer from what it holds and not fetch
+# a missing object from its remote mid-lookup. git reads this from 2.44; an older git ignores it.
+NO_LAZY_FETCH_ENV = {"GIT_NO_LAZY_FETCH": "1"}
+NO_LAZY_FETCH_MIN_GIT = (2, 44, 0)
+_GIT_VERSION_RE = re.compile(r"^git version (\d+)\.(\d+)(?:\.(\d+))?")
+
+
+@functools.lru_cache(maxsize=1)
+def git_version_text() -> str:
+    """`git --version`, probed once per process (the seam the tests replace). A git that cannot be run raises OSError."""
+    return subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=30).stdout
+
+
+def parse_git_version(text: str) -> tuple[int, int, int] | None:
+    """(major, minor, patch) from `git version 2.40.0.windows.1`, or None when the text is not a git version line."""
+    found = _GIT_VERSION_RE.match(text.strip())
+    return None if found is None else (int(found.group(1)), int(found.group(2)), int(found.group(3) or 0))
+
+
+def require_no_lazy_fetch_honoured(bus: pathlib.Path) -> None:
+    """Raise Unknown GIT_TOO_OLD_FOR_NO_LAZY_FETCH when the guard above would silently do nothing: this git is older than
+    NO_LAZY_FETCH_MIN_GIT, or its version cannot be read (unknown is never a pass), AND `bus` is a partial (promisor) clone,
+    the only kind that can lazy-fetch. A bus holding every object has nothing to fetch, so it is read as before on any git.
+    A git that honours the variable returns at once, with no further git call. Called before the first bus read."""
+    try:
+        text = git_version_text()
+    except (OSError, subprocess.SubprocessError):
+        text = ""
+    version = parse_git_version(text)
+    if version is not None and version >= NO_LAZY_FETCH_MIN_GIT:
+        return
+    rc, out, _err = git_try(bus, "config", "--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$",
+                          extra_env=NO_LAZY_FETCH_ENV)
+    if rc != 0 or not out:   # rc 1: no promisor setting. Any other rc is an unreadable bus, which the tip lookup reports as such
+        return
+    required = ".".join(str(n) for n in NO_LAZY_FETCH_MIN_GIT[:2])
+    found = f"git {'.'.join(str(n) for n in version)}" if version else f"an unparseable `git --version` ({text.strip()[:80]!r})"
+    raise Unknown("GIT_TOO_OLD_FOR_NO_LAZY_FETCH",
+                  f"{found} is not known to honour GIT_NO_LAZY_FETCH (git {required} or newer does), and {bus} is a partial clone, so a "
+                  f"bus read could lazy-fetch from its promisor remote; use git {required}+ or a full clone of the bus")
+
 def _run_git(repo: pathlib.Path, args: list[str], input_text: str | None = None,
              extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
@@ -544,20 +586,21 @@ def git_paths(repo: pathlib.Path, *args: str) -> list[str]:
     return [p for p in proc.stdout.split("\0") if p]
 
 
-def cat_file_blob(repo: pathlib.Path, ref: str, path: str) -> bytes:
+def cat_file_blob(repo: pathlib.Path, ref: str, path: str, extra_env: dict[str, str] | None = None) -> bytes:
     """The raw bytes of `path` at `ref`, or b"" if it does not exist there (a target
     missing at the tip counts as empty). A failed read is NOT absence: `git cat-file` exits 128 both
     for a missing path and for a bad ref, a non-blob or an unreadable object, so when it fails the
     path is looked up with `git ls-tree`, which exits 0 with no output only when `ref` is readable
     and carries no such path. Anything else raises Refusal TIP_BLOB_READ_FAILED, so a read failure
-    is never mistaken for an empty file."""
+    is never mistaken for an empty file. `extra_env` (opt-in, NO_LAZY_FETCH_ENV for a read-only bus) reaches both git calls;
+    None leaves the environment untouched."""
     proc = subprocess.run(
         ["git", "-C", str(repo), "cat-file", "blob", f"{ref}:{path}"],
-        capture_output=True, timeout=120,
+        capture_output=True, timeout=120, **({"env": {**os.environ, **extra_env}} if extra_env else {}),
     )
     if proc.returncode == 0:
         return proc.stdout
-    listing = _run_git(repo, ["ls-tree", "-z", "--name-only", ref, "--", path])
+    listing = _run_git(repo, ["ls-tree", "-z", "--name-only", ref, "--", path], extra_env=extra_env)
     if listing.returncode == 0 and not listing.stdout:
         return b""
     why = proc.stderr.decode("utf-8", errors="replace").strip() or listing.stderr.strip() or "the path is listed but did not read as a blob"
@@ -877,21 +920,61 @@ def resolve_deny_file(repo: pathlib.Path, deny_file: pathlib.Path | None) -> pat
     return deny_file.resolve() if deny_file is not None else (repo / DENY_FILE_REL)
 
 
-def read_ledger_keys(ledger: pathlib.Path) -> set[str]:
-    if not ledger.is_file():
-        return set()
+SENT_LEDGER_ABSENT = "sent-ledger-absent"
+SENT_LEDGER_UNREADABLE = "sent-ledger-unreadable"
+SENT_LEDGER_PARTIAL = "sent-ledger-partial"
+SENT_KEY_RE = re.compile(r"[0-9a-f]{16}")   # idempotency_key(): sha256 hexdigest, first 16 characters
+
+
+def ledger_present(ledger: pathlib.Path) -> bool:
+    """True when the ledger path exists, False only when it is not there (FileNotFoundError). `Path.exists()` would
+    read any other failure to stat it (an ACL-protected folder: PermissionError) as ABSENT, and an absent ledger skips
+    the guard and lets the drain republish, so every other OSError is Unknown(SENT_LEDGER_UNREADABLE)."""
+    try:
+        ledger.stat()
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        raise Unknown(SENT_LEDGER_UNREADABLE, f"{ledger}: {e}") from e
+    return True
+
+
+def read_sent_ledger(ledger: pathlib.Path) -> tuple[set[str], int]:
+    """(usable keys, non-blank rows) of an existing sent ledger: THE read every ledger consumer shares (the drain,
+    the kernel-filing drain, debt, and the check-commits guard). A ledger that is there is judged whole or not at all:
+    a path that cannot be opened or decoded raises Unknown(SENT_LEDGER_UNREADABLE), and any row that is not a JSON
+    object whose `key` matches SENT_KEY_RE (the shape `idempotency_key` writes) raises Unknown(SENT_LEDGER_PARTIAL,
+    "<path>: N of M ..."): a key set missing a row is how an already-sent item is published again."""
+    try:
+        text = ledger.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise Unknown(SENT_LEDGER_UNREADABLE, f"{ledger}: {e}") from e
     keys: set[str] = set()
-    for line in ledger.read_text(encoding="utf-8").splitlines():
+    rows = bad = 0
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
+        rows += 1
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
+            bad += 1
             continue
-        if isinstance(row, dict) and isinstance(row.get("key"), str):
-            keys.add(row["key"])
-    return keys
+        key = row.get("key") if isinstance(row, dict) else None
+        if isinstance(key, str) and SENT_KEY_RE.fullmatch(key):
+            keys.add(key)
+        else:
+            bad += 1
+    if bad:
+        raise Unknown(SENT_LEDGER_PARTIAL, f"{ledger}: {bad} of {rows} row(s) are unparseable or carry no well-formed key")
+    return keys, rows
+
+
+def read_ledger_keys(ledger: pathlib.Path) -> set[str]:
+    """The sent keys the drain, the kernel-filing drain and debt judge by. An ABSENT ledger is the empty set (a first
+    run, or a lost ledger the bus tip then answers for); one that is there goes through `read_sent_ledger`."""
+    return read_sent_ledger(ledger)[0] if ledger_present(ledger) else set()
 
 
 def append_ledger_rows(ledger: pathlib.Path, rows: list[dict]) -> None:
@@ -2122,9 +2205,103 @@ def check_commit(repo: pathlib.Path, sha: str, added_items: set[str],
     return problems
 
 
-def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str, str]]) -> dict[str, list[str]]:
+SUPERSEDES_LINE_RE = re.compile(r"^\s*(?:[-*]\s+)?(?:\*\*)?supersedes:(?:\*\*)?(.*)$", re.IGNORECASE)
+SUPERSEDES_SPLIT_RE = re.compile(r"[\s,;]+")
+SUPERSEDES_TOKEN_EDGE = "()[]{}<>`'\"*.:"
+
+
+def superseded_names(text: str) -> set[str]:
+    """The COMPLETE tokens a card names on its `supersedes:` lines: each whitespace/comma/semicolon-separated word with
+    markup and punctuation trimmed, also without a `.md` suffix and without the outbox directory. Compared by equality
+    only: `example-10` and `example-1-followup` name different items from `example-1`."""
+    names: set[str] = set()
+    for line in text.splitlines():
+        found = SUPERSEDES_LINE_RE.match(line)
+        if found is None:
+            continue
+        for token in (*SUPERSEDES_SPLIT_RE.split(found.group(1)), found.group(1)):
+            token = token.strip(SUPERSEDES_TOKEN_EDGE + " \t")
+            if not token:
+                continue
+            names.add(token)
+            bare = token.removesuffix(".md")
+            names.add(bare)
+            names.add(bare.removeprefix(OUTBOX_DIR + "/"))
+    return names
+
+
+def find_sent_ledger(repo: pathlib.Path, ledger: pathlib.Path | None) -> pathlib.Path | None:
+    """The sent ledger to judge against, or None. An explicit path is used as given. Otherwise the repo's own
+    `ledger_rel`, then the same path in the checkout that owns the git dir: the ledger is untracked, so a linked
+    worktree (where lanes work) never holds it. A candidate that cannot be looked at is Unknown(SENT_LEDGER_UNREADABLE)
+    (see ledger_present), never None."""
+    if ledger is not None:
+        return ledger if ledger_present(ledger) else None
+    own = repo / LEDGER_REL
+    if ledger_present(own):
+        return own
+    rc, common, _err = git_try(repo, "rev-parse", "--git-common-dir")
+    if rc == 0 and common:
+        main_git = (repo / common).resolve()
+        if main_git.name == ".git" and ledger_present(main_git.parent / LEDGER_REL):
+            return main_git.parent / LEDGER_REL
+    return None
+
+
+def _item_paths(paths: Iterable[str]) -> list[str]:
+    return [p for p in paths if p.startswith(OUTBOX_DIR + "/") and not (SENT_PREFIX and p.startswith(SENT_PREFIX))
+            and not p.startswith(KERNEL_DIR + "/") and ITEM_NAME_RE.match(p.rsplit("/", 1)[-1])]
+
+
+def _item_key(repo: pathlib.Path, rev: str, path: str) -> tuple[dict, str] | None:
+    """(item, idempotency key) for `path` as it stands at `rev`; None when it is not a valid item (the other checks name that)."""
+    rc, text, _err = git_try(repo, "show", f"{rev}:{path}")
+    if rc != 0:
+        return None
+    try:
+        item = parse_item(text + "\n")
+    except Refusal:
+        return None
+    src = item["meta"]["source_commit"]
+    if src == "PENDING":
+        src = added_in(repo, rev, path) or "PENDING"
+    return item, idempotency_key(src, item["meta"]["target"], item["body"])
+
+
+def check_sent_item_edits(repo: pathlib.Path, sha: str, sent_keys: set[str]) -> list[str]:
+    """`SENT_ITEM_EDITED <path> key=<old key>` for each outbox item this commit edits whose pre-edit key the sent
+    ledger records and whose key the edit changes: the drain would publish it again. The one allowed edit is the one
+    a NEW item added in the same commit names, as a complete token on a `supersedes:` line, by the old item's file
+    stem, card id or key (superseded_names)."""
+    modified = _item_paths(git_paths(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--diff-filter=M", sha))
+    problems: list[str] = []
+    superseded: set[str] | None = None
+    for path in modified:
+        old, new = _item_key(repo, f"{sha}^", path), _item_key(repo, sha, path)
+        if old is None or new is None or old[1] not in sent_keys or old[1] == new[1]:
+            continue
+        if superseded is None:
+            superseded = set().union(*(superseded_names(git(repo, "show", f"{sha}:{p}")) for p in
+                                       _item_paths(git_paths(repo, "diff-tree", "--no-commit-id", "--name-only", "-r", "--diff-filter=A", sha))))
+        stem = path.rsplit("/", 1)[-1].removesuffix(".md")
+        heading = item_heading(old[0])
+        names = {stem, old[1], *([heading[3:].strip()] if heading.startswith("## ") else [])}
+        if not names & superseded:
+            problems.append(f"SENT_ITEM_EDITED {path} key={old[1]} (already sent: editing it republishes it; "
+                            f"add a new item whose `supersedes:` line names it, in this commit)")
+    return problems
+
+
+def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str, str]],
+                  ledger: pathlib.Path | None = None, skips: list[str] | None = None) -> dict[str, list[str]]:
     """{sha: problems} for every non-merge commit in `rev_range` that fails. Raises Unknown
-    when the range cannot be resolved -- an unresolvable range is not a passing one."""
+    when the range cannot be resolved -- an unresolvable range is not a passing one.
+    The sent-item-edit check needs the sent ledger (see find_sent_ledger). With none, it is NOT run and
+    `sent-ledger-absent: <path>` is appended to `skips` for the caller to print: unchecked is not checked. A ledger
+    with no row at all cannot say what was sent, so it is the same skip, `sent-ledger-unreadable: <path>`.
+    A ledger that exists but cannot be opened or decoded raises Unknown(`sent-ledger-unreadable`), and one with any row
+    that is not a JSON object carrying a well-formed `key` raises Unknown(`sent-ledger-partial`, "<path>: N of M ..."):
+    the guard would otherwise run on a partial key set without saying so. Both fail closed (exit 2; pre-push refuses)."""
     require_configured()
     for end in [e for e in re.split(r"\.{2,3}", rev_range) if e]:
         rc, _out, _err = git_try(repo, "rev-parse", "--verify", "--quiet", f"{end}^{{commit}}")
@@ -2132,9 +2309,18 @@ def check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str
             raise Unknown("RANGE_UNRESOLVED", rev_range)
     shas = git(repo, "rev-list", "--no-merges", "--reverse", rev_range).split()
     added = range_added_items(repo, rev_range)
+    found = find_sent_ledger(repo, ledger)
+    sent_keys: set[str] | None = None
+    if found is not None:
+        sent_keys, _rows = read_sent_ledger(found)
+    if skips is not None and not sent_keys:
+        skips.append(f"{SENT_LEDGER_UNREADABLE}: {found}" if found is not None else
+                     f"{SENT_LEDGER_ABSENT}: {ledger if ledger is not None else repo / LEDGER_REL}")
     failures: dict[str, list[str]] = {}
     for sha in shas:
         problems = check_commit(repo, sha, added, deny_terms)
+        if sent_keys:
+            problems += check_sent_item_edits(repo, sha, sent_keys)
         if problems:
             failures[sha] = problems
     return failures
@@ -2316,12 +2502,7 @@ def _remote_default_base(repo: pathlib.Path, remote: str, local_sha: str) -> str
     judged when they landed); the remote's HEAD, master and main count only when that config guards them."""
     if not remote:
         return None
-    # r8 (Iverson advisory on b5310592, ACK 6227530991): a base is taken only from a branch the hook guards
-    # (`pre_push_refs`), by its WHOLE name after refs/heads/. r1-r7 also tried the remote's HEAD and
-    # `{remote}/master` / `{remote}/main` whatever the config guarded, and read the name after the last
-    # slash (refs/heads/release/1.0 became `1.0`), so the walk could start from a ref the hook never judged:
-    #     candidates.extend(f"{remote}/{ref.rsplit('/', 1)[-1]}" for ref in PRE_PUSH_REFS)
-    #     candidates.extend((f"{remote}/master", f"{remote}/main"))
+    # Invariant: a base comes only from a branch in pre_push_refs, by its whole name after refs/heads/.
     guarded = [ref[len("refs/heads/"):] for ref in PRE_PUSH_REFS if ref.startswith("refs/heads/")]
     candidates: list[str] = []
     rc, out, _err = git_try(repo, "symbolic-ref", "--quiet", "--short", f"refs/remotes/{remote}/HEAD")
@@ -2346,6 +2527,7 @@ def cmd_pre_push(repo: pathlib.Path, deny_terms: list[tuple[str, str]], remote: 
     This reads stdin to the end; the shell snippet install_pre_push writes spools it first and
     rebinds the hook's stdin afterwards, so the layers after the guard see the same bytes."""
     problems: list[str] = []
+    skips: list[str] = []
     for line in sys.stdin.read().splitlines():
         parts = line.split()
         if len(parts) != 4:
@@ -2359,7 +2541,7 @@ def cmd_pre_push(repo: pathlib.Path, deny_terms: list[tuple[str, str]], remote: 
             base = _remote_default_base(repo, remote, local_sha)
             rng = f"{base}..{local_sha}" if base else local_sha
         try:
-            failures = check_commits(repo, rng, deny_terms)
+            failures = check_commits(repo, rng, deny_terms, skips=skips)
         except Unknown as e:
             problems.append(f"cannot check {rng}: {e}")
             continue
@@ -2371,6 +2553,8 @@ def cmd_pre_push(repo: pathlib.Path, deny_terms: list[tuple[str, str]], remote: 
             print("  " + p, file=sys.stderr)
         print(f"  see {OUTBOX_DIR}/README.md", file=sys.stderr)
         return 1
+    if skips:
+        print(f"[doctrine-outbox] push judged on trailers only; the sent-item-edit check was SKIPPED ({skips[0]})", file=sys.stderr)
     return 0
 
 
@@ -3749,9 +3933,32 @@ RULING_CANDIDATE_COLON_RE = re.compile(r"(?<![\w/-])ruling[ \t-]*candidate[ \t]*
 # `Ruling candidate `ruling-candidates/x.md` remains PROPOSED`: the phrase, a space, a candidate's path (no colon), a space
 # and a STATUS word (remains, stays, is, was, ...). That is a statement about a candidate, not a marker (bus
 # cos-feedback/_bus/pr-69.md:17); a colon, a dash, a parenthesis, nothing, or any other word after the phrase or the path
-# keeps it a marker. An item does not carry its own path, so a verb of its own (`... proposes that X`) cannot be told from a
-# citation by the path and is refused by the verb.
-RULING_CANDIDATE_CITES_RE = re.compile(r"[ \t]+ruling-candidates/[^\s:]*[ \t]+(?i:remains?|stays?|stayed|is|are|was|were|has|have|had|becomes?|became)\b")
+# keeps it a marker, and so does a colon after the status word (`is: every lane must X` states a rule). A verb of its own
+# (`... proposes that X`) is refused by the verb. An item's own path (its outbox file's slug, `own_candidate_slug`) is no
+# citation: an item that cites itself proposes itself.
+RULING_CANDIDATE_CITES_RE = re.compile(r"[ \t]+ruling-candidates/(?P<path>[^\s:]*)[ \t]+(?i:remains?|stays?|stayed|is|are|was|were|has|have|had|becomes?|became)\b(?![ \t]*:)")
+RULING_CANDIDATE_REVISION_RE = re.compile(r"-r\d+$")
+
+
+def own_candidate_slug(item_name: str) -> str | None:
+    """The slug an outbox file `YYYYMMDD-<slug>.md` files its ruling candidate under (`ruling-candidates/<slug>[-rN].md`),
+    or None when the name is not an item name."""
+    return item_name[9:-3].lower() if ITEM_NAME_RE.match(item_name) else None
+
+
+def cites_another_candidate(text: str, pos: int, own: str | None = None) -> bool:
+    """True when `text` at `pos` is a citation: a `ruling-candidates/` path (no colon), a status word, and no colon after
+    the status word (`is: every lane must X` states a rule). The path must not be the item's own (`own`, from
+    `own_candidate_slug`): an item that cites itself proposes itself."""
+    found = RULING_CANDIDATE_CITES_RE.match(text, pos)
+    if not found:
+        return False
+    if own:
+        path = found.group("path").lower()
+        stem = path.split(".md", 1)[0] if ".md" in path else path.rstrip("`\"')]>*_,.;")
+        if stem == own or RULING_CANDIDATE_REVISION_RE.sub("", stem) == own:
+            return False
+    return True
 HTML_TAG_RE = re.compile(r"</?[A-Za-z][^<>]*>")
 # Markup that may sit in front of a marker, in any order: spaces, `>`, `#`s, a list bullet, emphasis, quotes, brackets.
 MARKER_FRONT_RE = re.compile(r"[ \t]+|(?P<quote>>)|(?P<atx>#{1,6})(?=[ \t]|$)|(?P<bullet>(?:[-+*]|\d+[.)])(?=[ \t]|$))"
@@ -3812,7 +4019,7 @@ def render_marker_lines(body: str) -> list[tuple[str, bool]]:
     return rendered
 
 
-def is_ruling_candidate(item: dict) -> bool:
+def is_ruling_candidate(item: dict, own: str | None = None) -> bool:
     """A ruling candidate is an item with a marker line. A line can be one only where a block OPENS: the item's first
     line, a line after a blank one, a line after a heading (ATX or setext underline), a thematic break or a fence
     line (opening or closing), a heading, a list item, a table cell, a line that starts a deeper blockquote, a setext
@@ -3823,7 +4030,7 @@ def is_ruling_candidate(item: dict) -> bool:
     (`marker_line`), the marker is `Ruling candidate` as whole words, any case, a space or dash between them, with
     an optional `Proposed`, `Draft` or `New` before it, whatever follows (`:`, ` (r2):`, ` - `, the end of the line),
     except a citation: the phrase, a `ruling-candidates/` path with no colon, and a status word (remains, stays, is,
-    was, ...: `Ruling candidate `ruling-candidates/x.md` remains PROPOSED`; any other word, `... proposes that X`, is a marker). A heading-class line (ATX, setext, the item's first line) also counts when the phrase follows a `-` or `:`
+    was, ...: `Ruling candidate `ruling-candidates/x.md` remains PROPOSED`; any other word, `... proposes that X`, a colon after the status word, or the item's own path (`own`), is a marker). A heading-class line (ATX, setext, the item's first line) also counts when the phrase follows a `-` or `:`
     (`### proj, 2026-10-16 - RULING CANDIDATE (r2): X`) or is followed by a colon. A line that only mentions the
     phrase, or a heading that mentions someone else's candidate (`... for ruling candidate <id>`, no colon), is
     not a marker. A `kind: ruling` item is a ratified ruling (`ratified_by` is required for it), not a candidate."""
@@ -3848,7 +4055,7 @@ def is_ruling_candidate(item: dict) -> bool:
                  or depth > prev_depth)
         if text and opens:
             lead = RULING_CANDIDATE_LEAD_RE.match(text)
-            if lead and not RULING_CANDIDATE_CITES_RE.match(text, lead.end()):
+            if lead and not cites_another_candidate(text, lead.end(), own):
                 return True
             if (heading or setext or first) and (RULING_CANDIDATE_AFTER_SEP_RE.search(text) or RULING_CANDIDATE_COLON_RE.search(text)):
                 return True
@@ -3918,8 +4125,10 @@ def _ruling_target(entry: str) -> tuple[str, str] | None:
 def _bus_tip(bus: pathlib.Path) -> str:
     """The bus clone's committed tip, resolved ONCE per item (`screen_ruling_candidate` calls it once): every target of that
     item is then read at this commit, so a writer that advances the clone mid-check cannot mix two snapshots into one
-    verdict. Two items in one `validate` call each resolve their own."""
-    rc, out, _err = git_try(bus, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    verdict. Two items in one `validate` call each resolve their own. The first bus read, so it is where a git that
+    cannot honour GIT_NO_LAZY_FETCH is refused (require_no_lazy_fetch_honoured)."""
+    require_no_lazy_fetch_honoured(bus)
+    rc, out, _err = git_try(bus, "rev-parse", "--verify", "-q", "HEAD^{commit}", extra_env=NO_LAZY_FETCH_ENV)
     if rc != 0 or not out:
         raise Unknown("RULING_BUS_UNREADABLE", f"{bus} is not a git clone with a committed tip; the touches/supersedes targets cannot be checked")
     return out
@@ -3928,7 +4137,7 @@ def _bus_tip(bus: pathlib.Path) -> str:
 def _bus_ruling_ids(bus: pathlib.Path, tip: str) -> str:
     """RULINGS.md at `tip` (empty when the tip has none: no rule id is then on the bus). A read failure is UNKNOWN."""
     try:
-        return cat_file_blob(bus, tip, RULINGS_FILE).decode("utf-8", errors="replace")
+        return cat_file_blob(bus, tip, RULINGS_FILE, extra_env=NO_LAZY_FETCH_ENV).decode("utf-8", errors="replace")
     except Refusal as e:
         if e.code != "TIP_BLOB_READ_FAILED":
             raise
@@ -3942,7 +4151,7 @@ def _bus_has_path(bus: pathlib.Path, tip: str, path: str) -> bool:
     parent tree's entry, so the blob or subtree it names is read as well (`cat-file -e`, with no lazy fetch: the bus is
     never written); an entry that lists but does not read is UNKNOWN too. A gitlink names a commit of another
     repository, which this object store need not hold, so it is not read."""
-    proc = _run_git(bus, ["ls-tree", "-z", tip, "--", path])
+    proc = _run_git(bus, ["ls-tree", "-z", tip, "--", path], extra_env=NO_LAZY_FETCH_ENV)
     if proc.returncode != 0:
         raise Unknown("RULING_BUS_OBJECT_UNREADABLE", f"{tip[:12]}:{path}: {proc.stderr.strip()[:300]}")
     for entry in proc.stdout.split("\0"):
@@ -3954,7 +4163,7 @@ def _bus_has_path(bus: pathlib.Path, tip: str, path: str) -> bool:
             raise Unknown("RULING_BUS_OBJECT_UNREADABLE", f"{tip[:12]}:{path}: unexpected ls-tree entry {entry[:120]!r}")
         _mode, kind, oid = fields
         if kind != "commit":
-            read = _run_git(bus, ["cat-file", "-e", oid], extra_env={"GIT_NO_LAZY_FETCH": "1"})
+            read = _run_git(bus, ["cat-file", "-e", oid], extra_env=NO_LAZY_FETCH_ENV)
             if read.returncode != 0:
                 raise Unknown("RULING_BUS_OBJECT_UNREADABLE",
                               f"{tip[:12]}:{path}: listed as {kind} {oid[:12]}, but the object does not read: {read.stderr.strip()[:300] or 'missing'}")
@@ -3972,13 +4181,13 @@ def _bus_has_rule(rulings: str, rule_id: str) -> bool:
     return False
 
 
-def screen_ruling_candidate(item: dict, bus: pathlib.Path | None = None) -> list[str]:
+def screen_ruling_candidate(item: dict, bus: pathlib.Path | None = None, own: str | None = None) -> list[str]:
     """Refuse a ruling candidate whose `touches/supersedes:` declaration is missing or empty, mixes `none` with rule
     ids, gives `none` without a reason of NONE_REASON_MIN_WORDS words (the floor a `Doctrine-Export: none` carries),
     names an entry that is not a rule id or a bus-relative path, or, when `bus` is given, names one the bus clone
     does not hold at its tip. Returns the targets it could not check because no bus was given (empty otherwise).
     A bus that cannot be read is UNKNOWN, never a pass. A non-candidate is not looked at."""
-    if not is_ruling_candidate(item):
+    if not is_ruling_candidate(item, own):
         return []
     entries = touches_supersedes_entries(item["body"])
     if not entries:
@@ -4042,7 +4251,7 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
             item = parse_item(text)
             screen_law4(item["body"], deny_terms)
             screen_rendered_card(item)
-            unchecked = screen_ruling_candidate(item, bus)
+            unchecked = screen_ruling_candidate(item, bus, own_candidate_slug(p.name))
             if unchecked:
                 print(f"[doctrine-outbox] NOTE {p}: touches/supersedes targets NOT checked against the bus (pass --bus <bus clone> "
                       f"or set ${RULING_BUS_ENV}): {'; '.join(unchecked[:6])}", file=sys.stderr)
@@ -4063,10 +4272,15 @@ def cmd_validate(paths: list[pathlib.Path], deny_terms: list[tuple[str, str]],
     return 0 if ok else 1
 
 
-def cmd_check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str, str]]) -> int:
-    failures = check_commits(repo, rev_range, deny_terms)
+def cmd_check_commits(repo: pathlib.Path, rev_range: str, deny_terms: list[tuple[str, str]],
+                      ledger: pathlib.Path | None = None) -> int:
+    skips: list[str] = []
+    failures = check_commits(repo, rev_range, deny_terms, ledger, skips)
     if not failures:
-        print(f"[doctrine-outbox] check-commits OK over {rev_range}")
+        if skips:  # not "OK": the sent-item-edit check did not run (exit stays 0 so hosted CI, with no ledger, passes)
+            print(f"[doctrine-outbox] check-commits over {rev_range} -- trailers only; the sent-item-edit check was SKIPPED ({skips[0]})")
+        else:
+            print(f"[doctrine-outbox] check-commits OK over {rev_range}")
         return 0
     for sha, problems in failures.items():
         for p in problems:
@@ -4144,6 +4358,9 @@ def build_parser() -> argparse.ArgumentParser:
         commits_p.add_argument("legacy", nargs="*", help="optional REPO then A..B, as the older check-range was called")
         commits_p.add_argument("--range", dest="rev_range", default=DEFAULT_RANGE)
         commits_p.add_argument("--deny-file", type=pathlib.Path, default=None)
+        commits_p.add_argument("--ledger", type=pathlib.Path, default=None,
+                               help="the SENT ledger (sent.jsonl) the sent-item-edit check reads (default: the config's, here or "
+                                    f"in the main checkout); with none the check is a typed skip, {SENT_LEDGER_ABSENT}")
 
     check_p = sub.add_parser("check", help="exit 1 when an unsent item is older than MAX_AGE_MIN (default "
                                            f"{HOOK_CHECK_WINDOW_MIN}); args: [REPO [MAX_AGE_MIN]]")
@@ -4241,7 +4458,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd in ("check-commits", "check-range"):
             deny_terms = gather_deny_terms(resolve_deny_file(repo, args.deny_file))
             rev_range = legacy[1] if len(legacy) > 1 else args.rev_range
-            return cmd_check_commits(repo, rev_range, deny_terms)
+            return cmd_check_commits(repo, rev_range, deny_terms, args.ledger)
         if args.cmd == "check":
             # was: max_age = int(legacy[1]) if len(legacy) > 1 else HOOK_CHECK_WINDOW_MIN  (a bad value was a traceback)
             max_age = HOOK_CHECK_WINDOW_MIN

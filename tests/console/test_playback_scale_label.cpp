@@ -67,6 +67,40 @@ TEST(PlaybackScaleLabel, ShortLabelIsTheCompactToolbarForm)
     ASSERT_QSTR_EQ(QStringLiteral("1/8 res"), PlaybackScaleLabel::shortLabel(8));
 }
 
+TEST(PlaybackScaleLabel, IndicatorTextIsTheShortLabelUnlessActiveDiffersFromRequested)
+{
+    // SCALE-LABEL-INDICATOR-PIN-1: the toolbar indicator never falls back to the bare "x%1" factor form.
+    ASSERT_QSTR_EQ(QStringLiteral("Full res"), PlaybackScaleLabel::indicatorText(1, 1));
+    ASSERT_QSTR_EQ(QStringLiteral("Half res"), PlaybackScaleLabel::indicatorText(2, 2));
+    ASSERT_QSTR_EQ(QStringLiteral("Quarter res"), PlaybackScaleLabel::indicatorText(4, 4));
+    ASSERT_QSTR_EQ(QStringLiteral("1/8 res"), PlaybackScaleLabel::indicatorText(8, 8));
+    ASSERT_QSTR_EQ(QStringLiteral("Full res->Half res"), PlaybackScaleLabel::indicatorText(1, 2));
+    ASSERT_QSTR_EQ(QStringLiteral("Half res->Quarter res"), PlaybackScaleLabel::indicatorText(2, 4));
+    ASSERT_QSTR_EQ(QStringLiteral("Quarter res->1/8 res"), PlaybackScaleLabel::indicatorText(4, 8));
+}
+
+TEST(PlaybackScaleLabel, MainWindowIndicatorUsesTheHelperNotAnInlineFormat)
+{
+    // MainWindow.cpp is not linked into console_tests, so read it as text: the call site must go through indicatorText.
+    const QString src = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(src.contains(QStringLiteral("PlaybackScaleLabel::indicatorText(")));
+    ASSERT_FALSE(src.contains(QStringLiteral("tr( \"x%1\" )")));
+}
+
+TEST(PlaybackScaleLabel, SessionReasonLogUsesTheCSeamsWordingNotTheUiLabel)
+{
+    // SCALE-LABEL-TELEMETRY-REASON-CONSISTENCY-1: MainWindow's session_reason / playback_scale_gpu_texture_route_session reason must read exactly
+    // what the C seam (mlvDualIsoGpuPreviewScaleReconPlan) writes for the same condition. Neither file is linked into console_tests, so read both as text.
+    const QString seam = readRepoFile(QStringLiteral("src/mlv/video_mlv.c"));
+    const QString window = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_TRUE(seam.contains(QStringLiteral("plan->reason = \"x8 stays on the full-resolution texture route\";")));
+    ASSERT_TRUE(seam.contains(QStringLiteral("plan->reason = \"preview scale 1 (full resolution)\";")));
+    ASSERT_TRUE(window.contains(QStringLiteral("QStringLiteral(\"x%1 stays on the full-resolution texture route\")")));
+    ASSERT_TRUE(window.contains(QStringLiteral("QStringLiteral(\"preview scale 1 (full resolution)\")")));
+    ASSERT_FALSE(window.contains(QStringLiteral("resolutionLabel( requestedScale ) );")));
+    ASSERT_FALSE(window.contains(QStringLiteral(" preview\")")));
+}
+
 TEST(PlaybackScaleLabel, UnexpectedFactorsStillProduceReadableText)
 {
     ASSERT_QSTR_EQ(QStringLiteral("Custom res (1/3)"), PlaybackScaleLabel::resolutionLabel(3));

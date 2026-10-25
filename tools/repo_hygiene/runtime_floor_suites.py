@@ -175,10 +175,19 @@ def resolve_evidence(item: dict, lines: list[str]) -> tuple[int | None, str | No
 
     The scope ends at the first non-blank line indented no deeper than the ``within`` line, so it ends EARLY at a
     comment at the same indent, a column-zero line (a here-string body), or an opening brace on the line after the
-    ``within`` line. An early end can only turn a citation red (``matches 0 lines``): ``contains`` must still be
-    unique inside the shorter scope, so it never resolves to a different line.
+    ``within`` line. An early end never lets ``contains`` resolve to a line other than the one it names in the
+    shorter scope, and it can only turn a citation red (``matches 0 lines``), with one qualification:
+
+    * An early end at a COMMENT is seen through. The comment line itself says nothing about where the block ends,
+      so a second match past it (up to the next non-comment line indented no deeper) makes the citation red
+      (``matches 2 lines ... past an early scope end``) rather than letting it resolve to the first match.
+    * An early end at a column-zero code line or a brace is NOT seen through: a here-string body cannot be told
+      from the next top-level declaration, so a second match beyond it is invisible and the citation resolves to
+      the first one. Cite a ``contains`` that is unique in the whole block, or a ``within`` anchor that closes
+      before such a line.
     """
     scope = range(len(lines))
+    wide = scope
     where = "the file"
     anchor = item.get("within")
     if anchor:
@@ -186,40 +195,77 @@ def resolve_evidence(item: dict, lines: list[str]) -> tuple[int | None, str | No
         if len(opens) != 1:
             return None, f"'within' anchor {anchor!r} matches {len(opens)} lines (need exactly 1)"
         start = opens[0]
-        end = start + 1
-        while end < len(lines) and (not lines[end].strip() or _indent(lines[end]) > _indent(lines[start])):
-            end += 1
-        scope = range(start, end)
+        scope = range(start, _scope_end(lines, start, see_through_comments=False))
+        wide = range(start, _scope_end(lines, start, see_through_comments=True))
         where = f"the block under {anchor!r}"
     hits = [i for i in scope if item["contains"] in lines[i]]
-    if len(hits) != 1:
-        return None, f"{item['contains']!r} matches {len(hits)} lines of {where} (need exactly 1)"
-    return hits[0] + 1, None
+    if len(hits) == 1:
+        beyond = [i for i in wide if i not in scope and item["contains"] in lines[i]]
+        if beyond:
+            return None, (f"{item['contains']!r} matches {len(hits) + len(beyond)} lines of {where}, "
+                          f"{len(beyond)} of them past an early scope end at line {scope.stop + 1} (need exactly 1)")
+        return hits[0] + 1, None
+    return None, f"{item['contains']!r} matches {len(hits)} lines of {where} (need exactly 1)"
 
 
-def _walk_evidence(manifest: dict, root: Path):
-    """Yield (row id, evidence item, resolved 1-based line or None, problem or None) for every citation."""
+def _is_comment(text: str) -> bool:
+    return text.lstrip().startswith(("#", "//"))
+
+
+def _scope_end(lines: list[str], start: int, see_through_comments: bool) -> int:
+    """Index one past the ``within`` block that opens at ``start``: the first non-blank line indented no deeper than
+    it. With ``see_through_comments`` a comment line never ends the block (it only marks where a narrow scope ends
+    early); the first code line indented no deeper still does."""
+    end = start + 1
+    while end < len(lines):
+        text = lines[end]
+        if text.strip() and _indent(text) <= _indent(lines[start]) and not (see_through_comments and _is_comment(text)):
+            break
+        end += 1
+    return end
+
+
+def citation_snapshot(manifest: dict, root: Path) -> list[tuple]:
+    """Resolve every citation ONCE: [(row id, evidence item, resolved 1-based line or None, problem or None)].
+
+    Each cited file is read once per snapshot, so every citation to it resolves against the same text. The report and
+    the verdict are both derived from one snapshot, so a cited file edited while the check runs can never leave them
+    disagreeing."""
+    snapshot = []
+    texts: dict[Path, list[str]] = {}
     for row in manifest["rows"]:
         for item in row.get("evidence", []):
             target = Path(root) / item["file"]
             if not target.is_file():
-                yield row["id"], item, None, f"evidence file missing: {item['file']}"
+                snapshot.append((row["id"], item, None, f"evidence file missing: {item['file']}"))
                 continue
-            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            key = target.resolve()
+            if key not in texts:
+                texts[key] = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = texts[key]
             resolved, problem = resolve_evidence(item, lines)
-            yield row["id"], item, resolved, (f"{item['file']}: {problem}" if problem else None)
+            snapshot.append((row["id"], item, resolved, (f"{item['file']}: {problem}" if problem else None)))
+    return snapshot
+
+
+def snapshot_problems(snapshot: list[tuple]) -> list[str]:
+    return [f"{row_id}: {problem}" for row_id, _, _, problem in snapshot if problem]
 
 
 def check_evidence(manifest: dict, root: Path) -> list[str]:
     """Each declared floor must cite, by a unique text anchor, a real file that contains the quoted text."""
-    return [f"{row_id}: {problem}" for row_id, _, _, problem in _walk_evidence(manifest, root) if problem]
+    return snapshot_problems(citation_snapshot(manifest, root))
 
 
 def evidence_report(manifest: dict, root: Path) -> list[str]:
     """One line per citation: the resolved line beside its ``line`` hint. Drift is advice, never a failure; only an
     UNRESOLVED citation (the problems ``check_evidence`` returns) is one."""
+    return snapshot_report(citation_snapshot(manifest, root))
+
+
+def snapshot_report(snapshot: list[tuple]) -> list[str]:
     report = []
-    for row_id, item, resolved, problem in _walk_evidence(manifest, root):
+    for row_id, item, resolved, problem in snapshot:
         if problem:
             report.append(f"{row_id}: UNRESOLVED {problem}")
             continue
@@ -514,11 +560,12 @@ def main(argv: list[str] | None = None, detect=detect_runtime) -> int:
     try:
         manifest = load_manifest(Path(args.manifest) if args.manifest else worktree / DEFAULT_MANIFEST)
         if args.check_evidence:
-            report = evidence_report(manifest, worktree)
+            snapshot = citation_snapshot(manifest, worktree)
+            report = snapshot_report(snapshot)
             result["evidence"] = report
             if not args.json:
                 print("\n".join(report))
-            bad = sum("UNRESOLVED" in line for line in report)
+            bad = len(snapshot_problems(snapshot))
             if bad:
                 return emit(1, "FAIL", f"{bad} of {len(report)} citation(s) unresolved")
             return emit(0, "PASS", f"{len(report)} citation(s) resolved")

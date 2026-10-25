@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import inspect
+import os
 import re
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 
 import pytest
@@ -1099,3 +1101,327 @@ def test_r2_pinned_u2236_and_table_delimiter_forms(tmp_path, capsys, label, body
         assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (label, err)
     else:
         assert rc == 0 and err == "", (label, err)
+
+
+# ---------- ROUTE-RULING-NO-LAZY-FETCH-ALL-BUS-READS-1: no bus read on the route-ruling path may lazy-fetch ----------
+# The bus is never written. A partial (promisor) clone fetches a missing object from its promisor remote on any read,
+# which would write into the bus and could stall on the network, so every git read the lookup makes sets
+# GIT_NO_LAZY_FETCH=1 (the final `cat-file -e` probe had it; the tip probe, the RULINGS.md read and the `ls-tree` did not).
+# The bus here is a scratch clone configured as a promisor clone of a scratch origin that still holds every object, so a
+# read that lazy-fetches succeeds and leaves the dropped object back in the bus: that is how a fetch shows.
+
+GIT_TIMEOUT = 60
+
+
+def _promisor_bus(tmp_path: Path) -> Path:
+    """make_bus, then made a promisor clone of a full scratch origin (so a missing object is fetchable)."""
+    bus = make_bus(tmp_path)
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "clone", "-q", "--bare", "--no-local", str(bus), str(origin)], check=True, capture_output=True, text=True, timeout=GIT_TIMEOUT)
+    git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+    git(bus, "config", "core.repositoryformatversion", "1")
+    git(bus, "config", "extensions.partialclone", "origin")
+    git(bus, "remote", "add", "origin", origin.as_uri())
+    git(bus, "config", "remote.origin.promisor", "true")
+    git(bus, "config", "remote.origin.partialclonefilter", "blob:none")
+    return bus
+
+
+def _git_version() -> tuple[int, ...]:
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=GIT_TIMEOUT).stdout
+    return tuple(int(n) for n in re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", out).groups(default="0"))
+
+
+# git reads GIT_NO_LAZY_FETCH from 2.44 (older builds ignore it and fetch anyway), so the behavioural checks below can only
+# be met on such a git; the call-level check (every bus git call carries the variable) holds on any version.
+needs_no_lazy_fetch_git = pytest.mark.skipif(_git_version() < (2, 44), reason="this git predates GIT_NO_LAZY_FETCH (2.44)")
+
+
+def _held(bus: Path, oid: str) -> bool:
+    """Whether the bus object store holds `oid` locally right now. `--batch-all-objects` lists local objects only and never
+    lazy-fetches, on any git version."""
+    out = subprocess.run(["git", "-C", str(bus), "cat-file", "--batch-all-objects", "--batch-check"], capture_output=True, text=True,
+                         env={**os.environ, "GIT_NO_LAZY_FETCH": "1"}, timeout=GIT_TIMEOUT).stdout
+    return any(line.split(" ", 1)[0] == oid for line in out.splitlines())
+
+
+def _dropped_oid(bus: Path, rev: str) -> str:
+    oid = git(bus, "rev-parse", rev)
+    _drop_object(bus, rev)
+    assert not _held(bus, oid), "the object must be gone from the bus before the lookup"
+    return oid
+
+
+def _check_without_fetch(tmp_path: Path, bus: Path, declaration: str, oid: str, code: str) -> None:
+    """The lookup ends UNKNOWN `code`, and the dropped object was not fetched back into the bus."""
+    caught = None
+    try:
+        call_validate([write_item(tmp_path, candidate(declaration))], bus)
+    except ob.Unknown as e:
+        caught = e
+    assert not _held(bus, oid), f"a bus read lazy-fetched {oid[:12]} from the promisor remote (GIT_NO_LAZY_FETCH was not set)"
+    assert caught is not None and caught.code == code, f"expected UNKNOWN {code}, got {caught!r}"
+
+
+@needs_no_lazy_fetch_git
+def test_nlf_a_missing_rulings_md_blob_is_unknown_and_not_fetched(tmp_path):
+    bus = _promisor_bus(tmp_path)
+    oid = _dropped_oid(bus, "HEAD:RULINGS.md")
+    _check_without_fetch(tmp_path, bus, "touches/supersedes: R15\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
+
+
+@needs_no_lazy_fetch_git
+def test_nlf_a_missing_tree_on_the_way_to_a_path_is_unknown_and_not_fetched(tmp_path):
+    bus = _promisor_bus(tmp_path)
+    oid = _dropped_oid(bus, "HEAD:specs")
+    _check_without_fetch(tmp_path, bus, "touches/supersedes: specs/mlv-app/cards.md\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
+
+
+@needs_no_lazy_fetch_git
+def test_nlf_a_missing_root_tree_is_unknown_and_not_fetched(tmp_path):
+    bus = _promisor_bus(tmp_path)
+    oid = _dropped_oid(bus, "HEAD^{tree}")
+    _check_without_fetch(tmp_path, bus, "touches/supersedes: tools/fleet-sweep.mjs\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
+
+
+@needs_no_lazy_fetch_git
+def test_nlf_a_missing_blob_behind_a_listing_is_unknown_and_not_fetched(tmp_path):
+    bus = _promisor_bus(tmp_path)
+    oid = _dropped_oid(bus, "HEAD:tools/fleet-sweep.mjs")
+    _check_without_fetch(tmp_path, bus, "touches/supersedes: tools/fleet-sweep.mjs\n", oid, "RULING_BUS_OBJECT_UNREADABLE")
+
+
+@needs_no_lazy_fetch_git
+def test_nlf_a_missing_tip_commit_is_unknown_and_not_fetched(tmp_path):
+    bus = _promisor_bus(tmp_path)
+    oid = _dropped_oid(bus, "HEAD")
+    _check_without_fetch(tmp_path, bus, "touches/supersedes: R15\n", oid, "RULING_BUS_UNREADABLE")
+
+
+def test_nlf_every_bus_git_call_on_the_route_ruling_path_sets_no_lazy_fetch(tmp_path, monkeypatch):
+    monkeypatch.setattr(ob, "git_version_text", lambda: "git version 2.44.0")   # a call-level check: it must run on any real git
+    bus = _promisor_bus(tmp_path)
+    seen: list[tuple[list[str], str | None]] = []
+    real = subprocess.run
+
+    def spy(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[:1] == ["git"] and str(bus) in cmd:
+            seen.append((cmd, (kwargs.get("env") or {}).get("GIT_NO_LAZY_FETCH")))
+        return real(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(ob.subprocess, "run", spy)
+    call_validate([write_item(tmp_path, candidate("touches/supersedes: R15, tools/fleet-sweep.mjs, specs/mlv-app, tools/nope.mjs\n"))], bus)
+    assert len(seen) >= 4, f"the spy saw too few bus git calls to prove anything: {seen}"
+    unguarded = [" ".join(cmd[3:]) for cmd, flag in seen if flag != "1"]
+    assert not unguarded, "bus git calls without GIT_NO_LAZY_FETCH=1: " + "; ".join(unguarded)
+
+
+def test_nlf_a_promisor_bus_that_holds_every_object_answers_as_a_full_clone_does(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(ob, "git_version_text", lambda: "git version 2.44.0")   # the answer, not the old-git refusal, is under test
+    bus = _promisor_bus(tmp_path)
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R15, R14.8, tools/fleet-sweep.mjs, specs/mlv-app, specs/mlv-app/cards.md\n"), bus, capsys)
+    assert rc == 0 and err == "", err
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R99, tools/nope.mjs\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err and "'R99'" in err and "'tools/nope.mjs'" in err, err
+
+
+# ---------- ROUTE-RULING-NLF-OLD-GIT-REFUSE-1: a git that ignores GIT_NO_LAZY_FETCH must not be trusted to honour it ----------
+# Before 2.44 git ignores the variable, so on a partial (promisor) bus the guard silently does nothing and a read can still
+# lazy-fetch. The lookup then ends UNKNOWN GIT_TOO_OLD_FOR_NO_LAZY_FETCH, naming the found and the required version, before
+# any bus object is read. A bus that holds every object (no promisor remote) has nothing to lazy-fetch and is read as before.
+# The version is injected through `ob.git_version_text`; no test needs a real old git.
+
+OLD_GIT_CODE = "GIT_TOO_OLD_FOR_NO_LAZY_FETCH"
+RESOLVABLE = "touches/supersedes: R15, tools/fleet-sweep.mjs\n"
+
+
+def _pretend_git(monkeypatch, text: str) -> None:
+    monkeypatch.setattr(ob, "git_version_text", lambda: text, raising=False)
+
+
+def _refused_for_old_git(tmp_path: Path, bus: Path) -> ob.Unknown:
+    with pytest.raises(ob.Unknown) as caught:
+        call_validate([write_item(tmp_path, candidate(RESOLVABLE))], bus)
+    return caught.value
+
+
+@pytest.mark.parametrize("reported, found", [("git version 2.40.0.windows.1", "2.40.0"), ("git version 2.43.5", "2.43.5"), ("git version 1.9.1", "1.9.1")])
+def test_nlf_old_git_on_a_promisor_bus_is_refused_with_the_versions_named(tmp_path, monkeypatch, reported, found):
+    bus = _promisor_bus(tmp_path)
+    _pretend_git(monkeypatch, reported)
+    error = _refused_for_old_git(tmp_path, bus)
+    assert error.code == OLD_GIT_CODE, error
+    assert found in error.detail and "2.44" in error.detail, error.detail
+
+
+def test_nlf_old_git_is_refused_before_any_bus_object_is_read(tmp_path, monkeypatch):
+    bus = _promisor_bus(tmp_path)
+    _pretend_git(monkeypatch, "git version 2.40.0.windows.1")
+    reads: list[list[str]] = []
+    real = subprocess.run
+    monkeypatch.setattr(ob.subprocess, "run", lambda cmd, *a, **k: (reads.append(cmd), real(cmd, *a, **k))[1])
+    error = _refused_for_old_git(tmp_path, bus)
+    assert error.code == OLD_GIT_CODE, error
+    object_reads = [c for c in reads if isinstance(c, list) and any(v in c for v in ("rev-parse", "cat-file", "ls-tree"))]
+    assert not object_reads, f"a bus object was read on a git that cannot guard it: {object_reads}"
+
+
+@pytest.mark.parametrize("reported", ["", "git", "git version", "git version unknown", "garbage 2.44.0 rest", "git version 2"])
+def test_nlf_an_unparseable_git_version_is_refused_the_same_way(tmp_path, monkeypatch, reported):
+    bus = _promisor_bus(tmp_path)
+    _pretend_git(monkeypatch, reported)
+    error = _refused_for_old_git(tmp_path, bus)
+    assert error.code == OLD_GIT_CODE and "unparseable" in error.detail and "2.44" in error.detail, error
+
+
+def test_nlf_a_git_that_cannot_be_run_for_its_version_is_refused_the_same_way(tmp_path, monkeypatch):
+    bus = _promisor_bus(tmp_path)
+
+    def broken() -> str:
+        raise OSError("no git on PATH")
+
+    monkeypatch.setattr(ob, "git_version_text", broken, raising=False)
+    error = _refused_for_old_git(tmp_path, bus)
+    assert error.code == OLD_GIT_CODE and "unparseable" in error.detail, error
+
+
+@pytest.mark.parametrize("reported", ["git version 2.44.0", "git version 2.44.0.windows.1", "git version 2.51.2", "git version 3.0.0"])
+def test_nlf_a_git_that_honours_the_variable_behaves_exactly_as_before(tmp_path, capsys, monkeypatch, reported):
+    bus = _promisor_bus(tmp_path)
+    _pretend_git(monkeypatch, reported)
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R15, R14.8, tools/fleet-sweep.mjs, specs/mlv-app\n"), bus, capsys)
+    assert rc == 0 and err == "", err
+    rc, err = validate(tmp_path, candidate("touches/supersedes: R99\n"), bus, capsys)
+    assert rc == 1 and "RULING_CANDIDATE_TARGET_NOT_ON_BUS" in err, err
+
+
+def test_nlf_old_git_on_a_bus_with_no_promisor_remote_is_read_as_before(tmp_path, capsys, monkeypatch):
+    bus = make_bus(tmp_path)   # a full local repository: every object is held, so nothing can be lazy-fetched
+    _pretend_git(monkeypatch, "git version 2.40.0.windows.1")
+    rc, err = validate(tmp_path, candidate(RESOLVABLE), bus, capsys)
+    assert rc == 0 and err == "", err
+
+
+def test_nlf_the_version_is_probed_once_per_process(tmp_path, monkeypatch):
+    bus = _promisor_bus(tmp_path)
+    ob.git_version_text.cache_clear()   # the probe is cached per process; this test reads the real one
+    seen: list[list[str]] = []
+    real = subprocess.run
+    monkeypatch.setattr(ob.subprocess, "run", lambda cmd, *a, **k: (seen.append(cmd), real(cmd, *a, **k))[1])
+    for _ in range(3):
+        try:
+            call_validate([write_item(tmp_path, candidate(RESOLVABLE))], bus)
+        except ob.Unknown:
+            pass   # a real git older than 2.44 refuses; the count is the same
+    assert sum(1 for c in seen if c == ["git", "--version"]) == 1, seen
+
+
+def test_nlf_the_running_git_version_is_recorded_in_the_log(record_property):
+    """Never skips. Hosted CI's git version is then in its log whichever side of 2.44 it falls (the behavioural checks above
+    skip on an old git, so without this a green run would not say which half of the suite ran)."""
+    text = ob.git_version_text()
+    version = ob.parse_git_version(text)
+    honours = version is not None and version >= ob.NO_LAZY_FETCH_MIN_GIT
+    line = f"[nlf] running git: {text.strip()!r} parsed={version} honours_GIT_NO_LAZY_FETCH(>=2.44)={honours}"
+    print(line)
+    record_property("running_git", text.strip())
+    record_property("honours_no_lazy_fetch", honours)
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY")   # hosted runners set it; a missing or unwritable file is not a failure
+    if step_summary:
+        try:
+            with open(step_summary, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+        except OSError:
+            pass
+    # Warn on BOTH branches: a passing run drops print() and an un-exported record_property, but prints its warnings summary.
+    warnings.warn(line + ("" if honours else " -- the nlf behavioural tests are SKIPPED on this git"), stacklevel=1)
+    assert version is not None, f"the running git reports an unparseable version: {text!r}"
+
+
+# The hosted step is a plain `python -m pytest ... -q`: default capture, no JUnit export. A passing test's print() is dropped
+# there, and record_property reaches nobody without a JUnit file, so the record has to travel as a warning (the warnings
+# summary prints under -q) and, on a hosted runner, as a line in the file GITHUB_STEP_SUMMARY names. The repo sets no
+# filterwarnings anywhere (no pytest.ini / pyproject.toml / setup.cfg / tox.ini; tests/coordination/conftest.py only installs
+# the fast-git shim), so a plain UserWarning is neither hidden nor turned into a failure.
+_PIN_GIT_PLUGIN = '''\
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _pin_running_git(request):
+    request.module.ob.git_version_text = lambda: "git version 2.44.0"
+'''
+
+
+def _run_recording_test_like_hosted_ci(tmp_path: Path, step_summary: Path | None) -> subprocess.CompletedProcess:
+    (tmp_path / "nlf_pin_git_plugin.py").write_text(_PIN_GIT_PLUGIN, encoding="utf-8")
+    env = {k: v for k, v in os.environ.items() if k not in ("GITHUB_STEP_SUMMARY", "PYTEST_ADDOPTS", "PYTHONPATH")}
+    env["PYTHONPATH"] = str(tmp_path)
+    if step_summary is not None:
+        env["GITHUB_STEP_SUMMARY"] = str(step_summary)
+    test_id = f"{Path(__file__).resolve()}::test_nlf_the_running_git_version_is_recorded_in_the_log"
+    return subprocess.run([sys.executable, "-m", "pytest", test_id, "-q", "-p", "no:cacheprovider", "-p", "nlf_pin_git_plugin"],
+                          cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=300)
+
+
+def test_nlf_a_modern_git_passing_run_still_retains_the_version_line(tmp_path):
+    done = _run_recording_test_like_hosted_ci(tmp_path, None)
+    out = done.stdout + done.stderr
+    assert done.returncode == 0 and "1 passed" in out, out
+    assert "git version 2.44.0" in out and "honours_GIT_NO_LAZY_FETCH(>=2.44)=True" in out, out
+    assert "=True -- the nlf behavioural tests are SKIPPED" not in out, out   # a modern git skips nothing; the line must not claim it did
+
+
+def test_nlf_the_version_line_is_appended_to_the_hosted_step_summary(tmp_path):
+    step_summary = tmp_path / "step-summary.md"
+    step_summary.write_text("earlier step\n", encoding="utf-8")
+    done = _run_recording_test_like_hosted_ci(tmp_path, step_summary)
+    assert done.returncode == 0, done.stdout + done.stderr
+    written = step_summary.read_text(encoding="utf-8")
+    assert written.startswith("earlier step\n") and "git version 2.44.0" in written and "honours_GIT_NO_LAZY_FETCH(>=2.44)=True" in written, written
+
+
+def test_nlf_an_unwritable_step_summary_never_fails_the_recording_test(tmp_path):
+    done = _run_recording_test_like_hosted_ci(tmp_path, tmp_path / "no-such-dir" / "step-summary.md")
+    out = done.stdout + done.stderr
+    assert done.returncode == 0 and "1 passed" in out and "honours_GIT_NO_LAZY_FETCH(>=2.44)=True" in out, out
+
+
+# ---------- ROUTE-RULING-CITATION-STATUS-WORD-COLON-1 + ROUTE-RULING-CITATION-SELF-PATH-STATUS-1: what a citation is NOT ----------
+# A citation is a statement ABOUT another candidate. (a) A status word that opens a colon (`... is: every lane must X`) states a
+# rule, so it is a marker. (b) An item cannot cite itself: its own candidate path (its outbox file `YYYYMMDD-<slug>.md` files as
+# `ruling-candidates/<slug>[-rN].md`) followed by a status word is the item proposing itself, so it is a marker too. A DIFFERENT
+# candidate's path with a status word and no colon stays a citation.
+
+COLON_STATUS_LINES = [
+    "- Ruling candidate `ruling-candidates/x.md` is: every lane must X",
+    "Ruling candidate ruling-candidates/x.md remains: the hook is deny-only",
+    "- Ruling candidate `ruling-candidates/x.md` **is**: every lane must X",
+]
+SELF_PATH_STATUS_LINES = [
+    "- Ruling candidate `ruling-candidates/foo.md` is every lane's rule",
+    "Ruling candidate ruling-candidates/foo-r1.md remains PROPOSED",
+]
+
+
+def _validate_named(tmp_path: Path, text: str, name: str, capsys) -> tuple[int, str]:
+    rc = call_validate([write_item(tmp_path, text, name=name)], tmp_path / "no-such-clone")
+    return rc, capsys.readouterr().err
+
+
+@pytest.mark.parametrize("line", COLON_STATUS_LINES)
+def test_a_status_word_followed_by_a_colon_is_a_ruling_not_a_citation(tmp_path, capsys, line):
+    rc, err = _validate_named(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), "20261022-foo.md", capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (line, err)
+
+
+@pytest.mark.parametrize("line", SELF_PATH_STATUS_LINES)
+def test_an_items_own_candidate_path_followed_by_a_status_word_is_a_marker(tmp_path, capsys, line):
+    rc, err = _validate_named(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), "20261022-foo.md", capsys)
+    assert rc == 1 and "RULING_CANDIDATE_NO_SUPERSEDES" in err, (line, err)
+
+
+def test_a_different_candidates_path_followed_by_a_status_word_is_still_a_citation(tmp_path, capsys):
+    for line in ("- Ruling candidate `ruling-candidates/bar.md` is still open", "Ruling candidate ruling-candidates/foo-bar-r1.md remains PROPOSED"):
+        rc, err = _validate_named(tmp_path, _receipt(f"{NEUTRAL_HEADING}\n\n{line}\n"), "20261022-foo.md", capsys)
+        assert rc == 0 and err == "", (line, err)

@@ -60,6 +60,7 @@ if ($env:FAKE_QUIET_LOG) { Add-Content -LiteralPath $env:FAKE_QUIET_LOG -Value (
 switch ($mode) {
     'QUIET' { 'PROBE venue-quiet-probe-x bachelor samples=5.0/5.0/5.0 mean=5.0% state=QUIET'; "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0 }
     'COOLDOWN' { "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=544"; exit 0 }
+    'FOREIGN' { 'FOREIGN_FLOOR owners=explorer:17204,textinputhost:23596,bloody7:21612 floorMean=32.0% waitedSec=180 probes=3'; "COOLDOWN_UNMET mean=32.0% threshold=$ThresholdPercent% waitedSec=180"; exit 0 }
     'UNKNOWN' { "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=1 reason=probe-failed note=fake"; exit 6 }
     'NOVERDICT' { 'GATE quiet-probe bachelor queued=0 running=0'; exit 0 }
     'BUSY' { 'GATE_BUSY quiet-probe waitedSec=1'; exit 3 }
@@ -391,6 +392,74 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual(got, [("COOLDOWN_UNMET", 29.6, "COOLDOWN_UNMET"), ("QUIET", 20.2, "QUIET_PRELOAD_OK"), ("QUIET", 43.9, "QUIET_PRELOAD_HIGH")])
         ran = [l for l in self.chain_log(rd) if " RAN " in l]
         self.assertIn("verdict=COOLDOWN_UNMET quietMean=32.0 preLoadMean=29.6 class=COOLDOWN_UNMET", ran[0])
+
+    # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1: Wait-VenueQuiet's FOREIGN_FLOOR early exit prints a typed line and then the same COOLDOWN_UNMET line; the chain must
+    # still classify the leg COOLDOWN_UNMET (contended, never counted), never QUIET_PRELOAD_* and never VENUE_QUIET_UNKNOWN.
+    def test_a_foreign_floor_early_exit_is_still_a_cooldown_unmet_leg(self) -> None:
+        rd = self.case / "lane-FF"
+        env = self.env(FAKE_QUIET_MODES="FOREIGN,FOREIGN,FOREIGN,FOREIGN,FOREIGN,FOREIGN", FAKE_LEG_PRELOADS="5.0,5.0,5.0")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["verdict"], l["quietMean"], l["class"]) for l in res["legs"]]
+        self.assertEqual(got, [("COOLDOWN_UNMET", 32.0, "COOLDOWN_UNMET")] * 3, "a low preLoad must not promote an early-exit leg to a counted class")
+        ran = [l for l in self.chain_log(rd) if " RAN " in l]
+        self.assertIn("verdict=COOLDOWN_UNMET quietMean=32.0 preLoadMean=5.0 class=COOLDOWN_UNMET", ran[0])
+        self.assertNotIn("VENUE_QUIET_UNKNOWN", r.stdout)
+
+    # r3 (Sol r2 blocker): a PRE-claim FOREIGN_FLOOR keeps the leg contended even when the later under-claim probe reads QUIET. Probe order per leg is pre-claim then under-claim.
+    def test_a_pre_claim_foreign_floor_keeps_the_leg_contended_when_the_under_claim_probe_is_quiet(self) -> None:
+        rd = self.case / "lane-FFQ"
+        env = self.env(FAKE_QUIET_MODES="FOREIGN,QUIET,FOREIGN,QUIET,FOREIGN,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["verdict"], bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]]
+        self.assertEqual(got, [("QUIET", True, "COOLDOWN_UNMET")] * 3, "a pre-claim FOREIGN_FLOOR must not be promoted to a counted class by a later QUIET probe")
+        ran = [l for l in self.chain_log(rd) if " RAN " in l]
+        self.assertIn("verdict=QUIET quietMean=5.0 preLoadMean=5.0 class=COOLDOWN_UNMET", ran[0])
+        self.assertIn("preClaimForeignFloor=1", ran[0])
+
+    # r4 (Sol r3 blocker): the FOREIGN_FLOOR marker is sticky across a GATE_BUSY retry of the SAME leg. Probe order: attempt 1 pre-claim FOREIGN, under-claim BUSY (claim
+    # released, leg retried); attempt 2 pre-claim QUIET, under-claim QUIET with a low preLoad. The leg stays contended; the next leg starts clean.
+    def test_a_foreign_floor_survives_a_gate_busy_retry_of_the_same_leg_and_does_not_leak_to_the_next_leg(self) -> None:
+        rd = self.case / "lane-FFB"
+        env = self.env(FAKE_QUIET_MODES="FOREIGN,BUSY,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0")
+        r = self.run_chain(rd, self.specs[:2], env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["verdict"], bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]]
+        self.assertEqual(got, [("QUIET", True, "COOLDOWN_UNMET"), ("QUIET", False, "QUIET_PRELOAD_OK")], "a FOREIGN_FLOOR seen on an attempt that ended GATE_BUSY must keep that leg (and only that leg) contended")
+        ran = [l for l in self.chain_log(rd) if " RAN " in l]
+        self.assertIn("class=COOLDOWN_UNMET", ran[0])
+        self.assertIn("preClaimForeignFloor=1", ran[0])
+        self.assertIn("class=QUIET_PRELOAD_OK", ran[1])
+        self.assertNotIn("ForeignFloor=1", ran[1])
+
+    def test_a_gate_busy_retry_that_never_saw_a_foreign_floor_is_still_a_counted_leg(self) -> None:
+        rd = self.case / "lane-QBQ"
+        env = self.env(FAKE_QUIET_MODES="QUIET,BUSY,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0")
+        r = self.run_chain(rd, self.specs[:1], env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([(bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]], [(False, "QUIET_PRELOAD_OK")])
+
+    def test_a_quiet_pre_claim_and_quiet_under_claim_probe_is_still_a_counted_leg(self) -> None:
+        rd = self.case / "lane-QQ"
+        env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([(bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]], [(False, "QUIET_PRELOAD_OK")] * 3)
+        self.assertNotIn("ForeignFloor=1", "\n".join(self.chain_log(rd)))
+
+    def test_a_plain_pre_claim_cooldown_timeout_without_a_foreign_floor_line_keeps_todays_class(self) -> None:
+        rd = self.case / "lane-CQ"
+        env = self.env(FAKE_QUIET_MODES="COOLDOWN,QUIET,COOLDOWN,QUIET,COOLDOWN,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        self.assertEqual([(bool(l.get("preClaimForeignFloor")), l["class"]) for l in res["legs"]], [(False, "QUIET_PRELOAD_OK")] * 3, "no FOREIGN_FLOOR line: no behaviour change")
 
     # ---------------------------------------------------------------- r2: a leg that exits non-zero is never a successful leg
     def test_a_leg_that_exits_nonzero_is_leg_failed_invalid_never_ran(self) -> None:
@@ -790,21 +859,40 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, "the mutant must reproduce the defect: three identical unhealthy legs and no stop")
         self.assertEqual(self.started(), 3)
 
-    def test_probe_script_vanishing_under_a_live_chain_is_named_not_undocumented_exit_64(self) -> None:
-        quiet = self.case / "vanishing-quiet.ps1"
-        shutil.copy2(self.fake_quiet, quiet)
-        rd = self.case / "lane-GONE"
-        # leg 1 runs, and deletes the probe script as it exits (the worktree was removed under the chain); leg 2's probe cannot launch
-        r = self.run_chain(rd, self.specs, quiet=quiet, env=self.env(FAKE_LEG_DELETE_PATH=str(quiet)))
-        self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
-        res = chain_result(r.stdout)
-        self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "NOT_RUN", "NOT_RUN"])
-        self.assertEqual((res["legs"][1]["verdict"], res["legs"][1]["reason"]), ("VENUE_QUIET_UNKNOWN", "PROBE_SCRIPT_MISSING"))
-        self.assertEqual(res["stopReason"], "VENUE_QUIET_UNKNOWN")
-        log = self.chain_log(rd)
-        self.assertTrue(any(re.search(r"LEG 02-fx-b-spec NOT_RUN VENUE_QUIET_UNKNOWN reason=PROBE_SCRIPT_MISSING phase=pre-claim", l) for l in log), log)
-        self.assertFalse([l for l in log if "undocumented-exit" in l], log)
-        self.assertEqual(self.started(), 1, "no leg and no retry after the probe script vanished")
+    def test_probe_script_vanishing_under_a_live_chain_is_typed_and_stops_in_both_unknown_modes(self) -> None:
+        # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: 2026-10-24 06:05-06:40Z a detached driver whose worktree was removed under it logged
+        # VENUE_QUIET_UNKNOWN every 5 min for 40 min. A missing driver script is not "the venue was not measured": it is typed
+        # VENUE_DRIVER_SCRIPT_MISSING with the path, and the chain STOPS whatever -OnUnknown says.
+        for mode in ("Stop", "Continue"):
+            with self.subTest(onUnknown=mode):
+                quiet = self.case / f"vanishing-quiet-{mode}.ps1"
+                shutil.copy2(self.fake_quiet, quiet)
+                rd = self.case / f"lane-GONE-{mode}"
+                before = self.started()
+                # leg 1 runs, and deletes the probe script as it exits (the worktree was removed under the chain); leg 2's probe cannot launch
+                r = self.run_chain(rd, self.specs, "-OnUnknown", mode, quiet=quiet, env=self.env(FAKE_LEG_DELETE_PATH=str(quiet)))
+                self.assertEqual(r.returncode, 6, r.stdout + r.stderr)
+                res = chain_result(r.stdout)
+                self.assertEqual([l["status"] for l in res["legs"]], ["RAN", "NOT_RUN", "NOT_RUN"])
+                self.assertEqual((res["legs"][1]["verdict"], res["legs"][1]["reason"]), ("VENUE_DRIVER_SCRIPT_MISSING", f"path={quiet}"))
+                self.assertEqual(res["stopReason"], "VENUE_DRIVER_SCRIPT_MISSING")
+                log = self.chain_log(rd)
+                self.assertTrue(any(f"VENUE_DRIVER_SCRIPT_MISSING path={quiet}" in l for l in log), log)
+                self.assertTrue(any(re.search(r"LEG 02-fx-b-spec NOT_RUN VENUE_DRIVER_SCRIPT_MISSING ", l) for l in log), log)
+                self.assertFalse([l for l in log if "VENUE_QUIET_UNKNOWN" in l or "undocumented-exit" in l], log)
+                self.assertEqual(self.started() - before, 1, "no leg and no retry after the probe script vanished")
+
+    def test_module_names_a_missing_driver_script_and_passes_present_ones(self) -> None:
+        present = self.case / "present.ps1"
+        present.write_text("# x\n", encoding="utf-8")
+        gone = self.case / "gone" / "Wait-VenueQuiet.ps1"
+        cmd = (f"Import-Module '{MODULE}' -Force -DisableNameChecking; "
+               f"$a = Get-VenueDriverScriptMissing -Path @('{present}'); $b = Get-VenueDriverScriptMissing -Path @('{present}', '{gone}'); "
+               "\"A=[$a]\"; \"B=[$b]\"")
+        r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("A=[]", r.stdout)
+        self.assertIn(f"B=[VENUE_DRIVER_SCRIPT_MISSING path={gone}]", r.stdout)
 
     # ---------------------------------------------------------------- the contract stays in the file
     def test_runner_has_no_process_or_lane_scan_and_documents_its_exit_codes(self) -> None:
@@ -1393,7 +1481,13 @@ class VenueChainSupplementaryTests(unittest.TestCase):
             self.assertIsNotNone(printed, f"the statement before the submit must print the job id on stdout: {code[k]}")
             self.assertEqual(printed.group(1), submitted.group(1).strip('"'), "the printed id is the submitted one")
         self.assertEqual(len([l for l in code if "DVE_JOB_ID=" in l]), 2, "one print per submit")
-        self.assertIn("6>$null", text)   # um-run's own output stays suppressed: only the id line is added
+        # um-run's own output stays suppressed: only the id line is added. Since LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 the information stream is
+        # collected (6>&1 into the submit's records, to measure the drop) instead of discarded (6>$null); either way it is never written out.
+        fn = text[text.index("function Submit-VenueJob("):text.index("function Write-NotAfterVerdict(")]
+        self.assertIn("6>&1 |", fn)
+        # (r2: only um-run's 'submitted' and 'job not-after:' records are kept, every output object still is)
+        self.assertIn("$records.Add($_)", fn)
+        self.assertNotRegex(fn, r"Write-(Host|Output|Information)\b", "the collected records are never written out")
 
     def test_a_real_leg_killed_at_the_chain_timeout_leaves_its_printed_id_to_reconcile_not_unknown(self) -> None:
         # The real Invoke-VenueLeg.ps1 (offline test mode, stub generator, a stub um-run that submits and then never returns) is the ultra-magnus leg; the fake leg stays Bachelor's.

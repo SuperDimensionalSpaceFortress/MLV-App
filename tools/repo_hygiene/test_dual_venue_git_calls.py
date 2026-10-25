@@ -13,7 +13,10 @@ Pinned here:
   * (r2, CoS I1) a child that outlives git holding its output is killed and is a typed ``DV_GIT_PIPE_STRAGGLER`` failure (exit -1, no
     partial bytes), never git's own exit code;
   * (r3, CoS N3) a git that cannot be started is a typed ``DV_GIT_START_FAILED`` refusal and leaks no job object;
-  * (r3, CoS N4) the straggler message says "(killed)" only when the kill is confirmed, "(kill not confirmed)" otherwise.
+  * (r3, CoS N4) the straggler message says "(killed)" only when the kill is confirmed, "(kill not confirmed)" otherwise;
+  * (DV-GIT-NATIVE-START-TYPED-FAILURE-1) a failed AssignProcessToJobObject, a failed ResumeThread, a throw building the pipe streams after the
+    resume and a failed GetExitCodeProcess are each their own typed refusal (exit -1, no bytes; never a timeout, never a success, never a null
+    that lets a second git start), and the child that was started is terminated.
 The tests run wherever pwsh does (Windows and the ubuntu shards; CoS N2).
 """
 
@@ -28,10 +31,12 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
@@ -47,6 +52,13 @@ LEG_COUNT = 16
 
 def _import(extra: str) -> str:
     return f"Import-Module '{MODULE}' -Force\n{extra}"
+
+
+def _is_git_spawn_trace(line: str) -> bool:
+    """One GIT_TRACE line that marks one git run. A built-in (`rev-parse`) logs `trace: built-in:`; a shell alias (`alias.x=!cmd`) is not a
+    built-in and logs `trace: exec: git-<alias>` instead, so counting only the first form read 0 for every alias run (DV-GIT-NATIVE-START-
+    UNASSIGNED-CHILD-CLEANUP-1 U3: the "at most one git" checks of the alias tests were vacuous)."""
+    return "trace: built-in:" in line or "trace: exec: git-" in line
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -365,6 +377,232 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         self.assertIsNotNone(match, out)
         self.assertEqual(match.group(1), match.group(2), "every job object opened must be closed (a Start that throws must not leak one)")
 
+    # DV-GIT-NATIVE-START-TYPED-FAILURE-1 (CoS Dot on #511, all nonblocking hardening): every native call of the suspended start is checked and a
+    # failure after the child exists is a TYPED refusal (exit -1, no bytes), never a null that lets the caller start a second git beside the
+    # first, and never a success. The module's seams: $script:DvNativeFault (a native call's name -> the result to read instead of the real
+    # one; the real call still runs, so the child exists and the cleanup has something to prove) and $script:DvNewPipeStream (builds one
+    # parent-side pipe stream; a test swaps in one that throws).
+    def run_native_fault(self, setup: str, git_args: str = "'rev-parse', '--is-inside-work-tree'", env_extra: dict[str, str] | None = None,
+                         trace: bool = False, after: str = "") -> tuple[str, list[str]]:
+        repo = self.make_repo()
+        env = dict(env_extra or {})
+        trace_file = None
+        if trace:
+            trace_dir = Path(tempfile.mkdtemp(prefix="dve-trace-"))
+            self.addCleanup(shutil.rmtree, trace_dir, True)
+            trace_file = trace_dir / "git-trace.txt"
+            env["GIT_TRACE"] = str(trace_file)
+        out = self.in_module(
+            f"{setup}\n"
+            f"try {{ $r = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @({git_args}); Write-Output ('EXIT ' + $r.exitCode); Write-Output ('BYTES ' + $r.bytes.Length); Write-Output ('ERR ' + $r.stderr) }}\n"
+            "catch { Write-Output ('THREW ' + $_.Exception.Message) }\n"
+            f"{after}\n"
+            "Write-Output ('JOBS opened=' + $script:DvJobsOpened + ' closed=' + $script:DvJobsClosed)\n", env)
+        spawns = []
+        if trace_file is not None and trace_file.exists():
+            spawns = [line for line in trace_file.read_text(encoding="utf-8", errors="replace").splitlines() if _is_git_spawn_trace(line)]
+        return out, spawns
+
+    def assert_typed_refusal(self, out: str, token: str) -> None:
+        self.assertNotIn("THREW", out, "a failed native call must be a typed refusal, not an exception")
+        self.assertIn("EXIT -1", out)
+        self.assertIn("BYTES 0", out)
+        self.assertIn(f"ERR {token}", out)
+        self.assertNotIn("DV_GIT_TIMEOUT", out, "a start failure is its own status, never read as a later timeout")
+        match = re.search(r"JOBS opened=(\d+) closed=(\d+)", out)
+        self.assertIsNotNone(match, out)
+        self.assertEqual(match.group(1), match.group(2), "the failure path must still close its job object")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_failed_job_assignment_is_a_typed_refusal_and_no_second_git_starts(self) -> None:
+        # I1: AssignProcessToJobObject's return was dropped, so a child outside the job ran on and a timeout could not reach its children.
+        out, spawns = self.run_native_fault("$script:DvNativeFault = @{ AssignProcessToJobObject = $false }", trace=True)
+        self.assert_typed_refusal(out, "DV_GIT_JOB_ASSIGN_FAILED")
+        self.assertEqual(spawns, [], "the suspended child must never run, and the Process.Start fallback must not start a second git")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_failed_resume_is_a_typed_refusal_and_no_second_git_starts(self) -> None:
+        # I1: ResumeThread's return was dropped; 0xFFFFFFFF means the thread was never resumed and the call then waited out the whole bound.
+        started = time.monotonic()
+        out, spawns = self.run_native_fault("$script:DvNativeFault = @{ ResumeThread = [uint32]::MaxValue }", env_extra={"DV_GIT_TIMEOUT_SECONDS": "20"}, trace=True)
+        self.assert_typed_refusal(out, "DV_GIT_RESUME_FAILED")
+        self.assertLess(time.monotonic() - started, 15, "a failed resume is refused at once, not after the git bound")
+        self.assertLessEqual(len(spawns), 1, "the Process.Start fallback must not start a second git beside the first")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_stream_construction_throw_after_resume_is_typed_and_cleans_up_the_started_child(self) -> None:
+        # I2: a throw building the pipe streams AFTER the child was resumed returned null, and the caller then started another git beside the
+        # running first one (leaked, unwatched, still in the job). Now the started child is killed with its children and the call is exit -1.
+        for label, fail_on in (("first", 1), ("second", 2)):
+            with self.subTest(stream=label):
+                token = _own_sleep_token("63")
+                self.addCleanup(_kill_sleepers, token)
+                started = time.monotonic()
+                out, spawns = self.run_native_fault(
+                    "$script:StreamCalls = 0\n"
+                    "$script:DvNewPipeStream = { param($h) $script:StreamCalls++\n"
+                    f"  if ($script:StreamCalls -eq {fail_on}) {{ throw 'injected stream failure' }}\n"
+                    "  [System.IO.Pipes.AnonymousPipeClientStream]::new([System.IO.Pipes.PipeDirection]::In, [Microsoft.Win32.SafeHandles.SafePipeHandle]::new($h, $true)) }",
+                    f"'-c', 'alias.dvs=!sleep {token}', 'dvs'", {"DV_GIT_TIMEOUT_SECONDS": "3"}, trace=True)
+                self.assert_typed_refusal(out, "DV_GIT_STREAM_FAILED")
+                self.assertIn("injected stream failure", out)
+                self.assertLess(time.monotonic() - started, 25, "the refusal must not wait out the git bound or the 63 s child")
+                self.assertLessEqual(len(spawns), 1, "the Process.Start fallback must not start a second git beside the first")
+                deadline = time.monotonic() + 10
+                survivors = _sleepers(token)
+                while survivors and time.monotonic() < deadline:
+                    time.sleep(0.5)
+                    survivors = _sleepers(token)
+                self.assertEqual(survivors, set(), "the child that was resumed must be terminated with its children, not left running")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_failed_exit_code_read_is_a_typed_refusal_not_a_success(self) -> None:
+        # I3: GetExitCodeProcess's return was dropped while the code started at 0, so a failed read looked like git exiting 0.
+        out, _ = self.run_native_fault("$script:DvNativeFault = @{ GetExitCodeProcess = $false }")
+        self.assert_typed_refusal(out, "DV_GIT_EXITCODE_FAILED")
+
+    # DV-GIT-NATIVE-START-UNASSIGNED-CHILD-CLEANUP-1 (Dot R18 advisory on #607). The seams added for it, all empty in production:
+    # $script:DvNativeSkipCall (a native call's name -> the real call is NOT made, only the DvNativeFault result is read; the child is then
+    # genuinely outside the job), $script:DvNativeFaultHits (the names a fault was read for: proof the fault fired) and $script:DvCleanupGate
+    # (called with the child's pid, process handle and the job as the failure cleanup starts: the child's state at that moment).
+    # DV-ISPROCESSINJOB-SUCCESS-ASSERT-1 (Dot R18 advisory 5b7ca117 on #614): the probe used to discard IsProcessInJob's BOOL return and seed
+    # `$r = $true`, so a failed call (a bad handle) left `$r` to whatever the marshaller wrote back and the test read a membership answer the
+    # API never gave. Now the declaration sets SetLastError, the BOOL return is kept as `ok`, `$r` is an int seeded -1 (neither 0 nor 1, so an
+    # unanswered call matches no expectation) and `inJob` is only a bool when the call succeeded and answered 0 or 1.
+    CHILD_PROBE_PS = (
+        "Add-Type -Namespace DvT -Name K -MemberDefinition '[System.Runtime.InteropServices.DllImport(\"kernel32.dll\", SetLastError=true)] "
+        "public static extern bool IsProcessInJob(System.IntPtr p, System.IntPtr j, out int r);'\n"
+        "$script:Seen = @{}\n"
+        "$script:DvCleanupGate = { param($ChildPid, $Process, $Job)\n"
+        "  [int]$r = -1; $ok = [DvT.K]::IsProcessInJob($Process, $Job, [ref]$r); $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()\n"
+        "  $answer = if ($ok -and ($r -eq 0 -or $r -eq 1)) { [bool]$r } else { 'Unanswered' }\n"
+        "  $script:Seen = @{ pid = $ChildPid; ok = [bool]$ok; win32 = $err; inJob = $answer; alive = (-not [Diagnostics.Process]::GetProcessById($ChildPid).HasExited) } }\n")
+    CHILD_REPORT_PS = (
+        "Write-Output ('HITS ' + (@($script:DvNativeFaultHits) -join ','))\n"
+        "Write-Output ('SEEN pid=' + $script:Seen.pid + ' ok=' + $script:Seen.ok + ' win32=' + $script:Seen.win32 + ' injob=' + $script:Seen.inJob + ' alive=' + $script:Seen.alive)\n"
+        "$gone = $false\n"
+        "try { $gone = [Diagnostics.Process]::GetProcessById([int]$script:Seen.pid).HasExited } catch { $gone = $true }\n"
+        "Write-Output ('GONE ' + $gone)\n")
+
+    def read_child_probe(self, out: str) -> tuple[str, str]:
+        """(in-job, alive) as the cleanup gate saw them, after proving IsProcessInJob itself answered: a failed call is reported with its Win32 error."""
+        seen = re.search(r"SEEN pid=(\d{2,}) ok=(\w+) win32=(\d+) injob=(\w+) alive=(\w+)", out)
+        self.assertIsNotNone(seen, f"the cleanup gate never saw a created child: {out}")
+        self.assertEqual(seen.group(2), "True", f"IsProcessInJob failed (GetLastError={seen.group(3)}), so its membership answer was never given: {out}")
+        self.assertIn(seen.group(4), ("True", "False"), f"IsProcessInJob returned no 0/1 membership answer: {out}")
+        return seen.group(4), seen.group(5)
+
+    def assert_child_was_unassigned_alive_then_gone(self, out: str) -> None:
+        in_job, alive = self.read_child_probe(out)
+        self.assertEqual(in_job, "False", "the child must be OUTSIDE the job when the cleanup starts: that is the case under test")
+        self.assertEqual(alive, "True", "the suspended child must be alive when the cleanup starts")
+        self.assertIn("GONE True", out, "the unassigned child must be terminated by the failure cleanup (a job close does not reach it)")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_the_in_job_probe_reads_true_for_a_child_that_is_assigned_to_the_job(self) -> None:
+        # Positive control for the probe above: only the unassigned (False) answer was ever exercised, so a probe that always said False passed.
+        # Here the AssignProcessToJobObject fault is read but the REAL call still runs (no DvNativeSkipCall), so the suspended child IS in the job
+        # when the cleanup gate asks, through the same helper, and must read True.
+        out, spawns = self.run_native_fault(
+            self.CHILD_PROBE_PS + "$script:DvNativeFault = @{ AssignProcessToJobObject = $false }\n", trace=True, after=self.CHILD_REPORT_PS)
+        self.assert_typed_refusal(out, "DV_GIT_JOB_ASSIGN_FAILED")
+        self.assertIn("HITS AssignProcessToJobObject", out)
+        in_job, alive = self.read_child_probe(out)
+        self.assertEqual(in_job, "True", "a child assigned to the job must read in-job = true, or the probe cannot say yes")
+        self.assertEqual(alive, "True", "the suspended child must be alive when the cleanup starts")
+        self.assertIn("GONE True", out, "the assigned child is still terminated by the failure cleanup")
+        self.assertEqual(spawns, [], "the suspended child must never run, and the Process.Start fallback must not start a second git")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_child_never_assigned_to_the_job_is_terminated_by_the_failure_cleanup(self) -> None:
+        # U1: the AssignProcessToJobObject fault used to let the REAL call run first, so the child was in the job when the cleanup ran and a
+        # job-based kill could have hidden a cleanup that does not reach it. Here the real call is skipped: the child is genuinely unassigned.
+        out, spawns = self.run_native_fault(
+            self.CHILD_PROBE_PS + "$script:DvNativeFault = @{ AssignProcessToJobObject = $false }\n$script:DvNativeSkipCall = @{ AssignProcessToJobObject = $true }\n",
+            trace=True, after=self.CHILD_REPORT_PS)
+        self.assert_typed_refusal(out, "DV_GIT_JOB_ASSIGN_FAILED")
+        self.assertIn("HITS AssignProcessToJobObject", out)
+        self.assert_child_was_unassigned_alive_then_gone(out)
+        self.assertEqual(spawns, [], "the suspended child must never run, and the Process.Start fallback must not start a second git")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_throw_between_creation_and_assignment_terminates_the_unassigned_child(self) -> None:
+        # U2: DvStartGate runs between CreateProcessW and the assignment. A throw there is the earliest failure with a child alive.
+        out, spawns = self.run_native_fault(
+            self.CHILD_PROBE_PS + "$script:DvStartGate = { throw 'injected gate failure' }\n", trace=True, after=self.CHILD_REPORT_PS)
+        self.assert_typed_refusal(out, "DV_GIT_START_FAILED")
+        self.assertIn("injected gate failure", out)
+        self.assert_child_was_unassigned_alive_then_gone(out)
+        self.assertEqual(spawns, [], "the suspended child must never run, and the Process.Start fallback must not start a second git")
+
+    def handle_delta(self, setup: str, calls: int = 25) -> str:
+        """Run Invoke-DvGit `calls` times after a warm-up and print how many handles this pwsh gained (a leak of even one handle per call shows)."""
+        repo = self.make_repo()
+        return self.in_module(
+            f"{setup}\n"
+            "function Get-DvTestHandles { [GC]::Collect(); [GC]::WaitForPendingFinalizers(); [GC]::Collect(); (Get-Process -Id $PID).HandleCount }\n"
+            f"$call = {{ $script:Last = Invoke-DvGit -RepoRoot '{repo}' -GitArgs @('rev-parse', '--is-inside-work-tree') }}\n"
+            "1..3 | ForEach-Object { & $call }\n"
+            "$before = Get-DvTestHandles\n"
+            f"1..{calls} | ForEach-Object {{ & $call }}\n"
+            "$after = Get-DvTestHandles\n"
+            "Write-Output ('DELTA ' + ($after - $before))\n"
+            "Write-Output ('LAST ' + $script:Last.exitCode + ' ' + $script:Last.stderr)\n"
+            "Write-Output ('HITS ' + (@($script:DvNativeFaultHits | Select-Object -Unique) -join ','))\n"
+            "Write-Output ('JOBS opened=' + $script:DvJobsOpened + ' closed=' + $script:DvJobsClosed)\n")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_every_early_return_before_the_job_assignment_releases_its_handles(self) -> None:
+        # U2: each step that can fail before the assignment (the second and third rows have created some pipes; the gate row has created the
+        # suspended child) must leave no handle behind, call after call. The first three fall back to Process.Start (no child existed), which
+        # is git's own result; the gate row is the typed refusal. A leak shows as at least one handle per call, so the bound is half that.
+        calls = 25
+        cases = (
+            ("CreatePipe", "$script:DvNativeFault = @{ CreatePipe = $false }; $script:DvNativeSkipCall = @{ CreatePipe = $true }", "LAST 0 ", "CreatePipe"),
+            ("SetHandleInformation", "$script:DvNativeFault = @{ SetHandleInformation = $false }", "LAST 0 ", "SetHandleInformation"),
+            ("CreateProcessW", "$script:DvNativeFault = @{ CreateProcessW = $false }; $script:DvNativeSkipCall = @{ CreateProcessW = $true }", "LAST 0 ", "CreateProcessW"),
+            ("gate", "$script:DvStartGate = { throw 'injected gate failure' }", "LAST -1 DV_GIT_START_FAILED", ""),
+        )
+        for label, setup, last, hit in cases:
+            with self.subTest(step=label):
+                out = self.handle_delta(setup, calls)
+                self.assertIn(last, out, out)
+                if hit:
+                    self.assertIn(f"HITS {hit}", out, "the fault must have fired, or the case proves nothing")
+                delta = re.search(r"DELTA (-?\d+)", out)
+                self.assertIsNotNone(delta, out)
+                self.assertLess(int(delta.group(1)), calls // 2, f"{label}: handles leaked across {calls} calls: {out}")
+                jobs = re.search(r"JOBS opened=(\d+) closed=(\d+)", out)
+                self.assertIsNotNone(jobs, out)
+                self.assertEqual(jobs.group(1), jobs.group(2), "every job object opened must be closed")
+
+    # U3: the alias tests above counted only `trace: built-in:` lines, which an alias never writes (see _is_git_spawn_trace), so their "at most
+    # one git" bounds held for any number of gits. These two pin the count through a shell alias: exactly one run on the success path (the
+    # control that the counter sees an alias at all) and none when the suspended child is refused before it can run.
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_shell_alias_through_the_native_start_is_traced_as_exactly_one_git(self) -> None:
+        out, spawns = self.run_native_fault("$script:DvNativeFault = @{}", "'-c', 'alias.dvhi=!echo hi', 'dvhi'", trace=True)
+        self.assertIn("EXIT 0", out)
+        self.assertEqual(len(spawns), 1, f"one alias call is one git run in the trace: {spawns}")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_a_refused_start_through_a_shell_alias_never_runs_the_alias(self) -> None:
+        for label, setup in (("assign", "$script:DvNativeFault = @{ AssignProcessToJobObject = $false }"),
+                             ("gate", "$script:DvStartGate = { throw 'injected gate failure' }")):
+            with self.subTest(step=label):
+                out, spawns = self.run_native_fault(setup, "'-c', 'alias.dvhi=!echo hi', 'dvhi'", trace=True)
+                self.assertIn("EXIT -1", out)
+                self.assertIn("BYTES 0", out)
+                self.assertEqual(spawns, [], "the suspended child was refused before it could run, and no second git was started")
+
+    @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
+    def test_the_native_fault_seam_is_inert_when_no_fault_is_injected(self) -> None:
+        # The happy path is byte-for-byte what it was: no seam entry, the real results are read.
+        out, _ = self.run_native_fault("$script:DvNativeFault = @{}")
+        self.assertIn("EXIT 0", out)
+        self.assertIn("BYTES 5", out)   # 'true' plus the newline
+        self.assertNotIn("ERR DV_GIT", out)
+
     def test_the_straggler_message_claims_a_kill_only_when_it_is_confirmed(self) -> None:
         # CoS N4: macOS reaches only the direct child, so the message must not say "(killed)" unless the kill was confirmed. The refusal is the
         # same typed exit -1 either way; only the wording differs.
@@ -382,6 +620,34 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         self.assertNotIn("kill not confirmed", confirmed)
         self.assertIn("(kill not confirmed)", unconfirmed)
         self.assertNotIn("(killed)", unconfirmed)
+
+
+SLEEPER_SCAN_CALL_CAP_SECONDS = 60.0   # the most one discovery subprocess may take, however large the wait budget is
+SLEEPER_SCAN_FLOOR_SECONDS = 0.5       # the least a discovery call is given, so a spent budget never hands subprocess a zero or negative timeout
+SLEEPER_WAIT_TOTAL_SECONDS = 30.0      # elapsed bound of `_wait_for_sleeper`: total for the CIM / ps routes, between scans only for /proc (a healthy run returns on its first scan)
+HANG_GUARD_SECONDS = 30.0              # the watchdog limit for a test whose regression would spin or block
+
+
+def _call_with_hang_guard(test: unittest.TestCase, fn, limit: float):
+    """Run `fn()` on a daemon thread and fail `test` if it has not returned within `limit` seconds, so a regression that hangs (a loop that stops
+    honouring its deadline, a call that never times out) fails this test instead of stalling the shard until the job timeout. Returns fn's value;
+    an exception it raised is re-raised here. A hung body is abandoned (daemon), not killed."""
+    box: dict[str, object] = {}
+
+    def body() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:   # re-raised on the calling thread, assertion failures included
+            box["error"] = exc
+
+    worker = threading.Thread(target=body, daemon=True)
+    worker.start()
+    worker.join(limit)
+    if worker.is_alive():
+        test.fail(f"the guarded body did not return within {limit} s (hung): a deadline or timeout stopped bounding it")
+    if "error" in box:
+        raise box["error"]   # type: ignore[misc]
+    return box.get("value")
 
 
 def _own_sleep_token(seconds: str = "60") -> str:
@@ -402,23 +668,29 @@ def _sleeper_pids_from_ps(ps_output: str, token: str = "60") -> set[int]:
     return found
 
 
-def _sleepers(token: str) -> set[int]:
+def _sleepers(token: str, timeout: float = SLEEPER_SCAN_CALL_CAP_SECONDS) -> set[int]:
     """Pids of the processes running exactly `sleep <token>` (the straggler of the aliases above; token from _own_sleep_token). There is no
     before/after set: the token is the identity. HARDENING-2 (4): Windows asks CIM, Linux reads /proc, anything else with no /proc (macOS)
-    asks ps."""
+    asks ps. `timeout` bounds the CIM / ps subprocess (subprocess.TimeoutExpired past it); /proc is a directory read and has none."""
     found: set[int] = set()
     if sys.platform == "win32":
         pattern = re.compile(r'sleep(\.exe)?"?\s+' + re.escape(token) + r'\s*$', re.IGNORECASE)   # a sleep started by path reads `sleep.EXE`
         query = "Get-CimInstance Win32_Process -Filter \"Name='sleep.exe'\" | ForEach-Object { '' + $_.ProcessId + [char]9 + $_.CommandLine }"
-        out = subprocess.run([PWSH, *PWSH_ARGS, "-Command", query], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL).stdout
+        out = subprocess.run([PWSH, *PWSH_ARGS, "-Command", query], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL).stdout
         for line in out.splitlines():
             pid, _, cmd = line.partition("\t")
             if pid.strip().isdigit() and pattern.search(cmd.strip()):
                 found.add(int(pid))
         return found
     if not Path("/proc").is_dir():
-        return _sleeper_pids_from_ps(subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL).stdout, token)
-    for entry in Path("/proc").iterdir():
+        return _sleeper_pids_from_ps(subprocess.run(["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL).stdout, token)
+    return _sleepers_from_proc(token)
+
+
+def _sleepers_from_proc(token: str, proc_root: Path = Path("/proc")) -> set[int]:
+    """The Linux scan of `_sleepers`, with the /proc root injectable so a fixture tree can stand in for it."""
+    found: set[int] = set()
+    for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
         try:
@@ -427,6 +699,74 @@ def _sleepers(token: str) -> set[int]:
             continue
         if len(argv) >= 2 and os.path.basename(argv[0]) in (b"sleep", b"sleep.exe") and argv[1] == token.encode():
             found.add(int(entry.name))
+    return found
+
+
+def _describe_pid(pid: int, proc_root: Path = Path("/proc")) -> str:
+    """What /proc says about one pid right now: whether it exists, its raw cmdline bytes, and its State and PPid lines. Built only for a failure
+    message; every read is guarded because the pid may vanish between two of them."""
+    base = proc_root / str(pid)
+    if not base.is_dir():
+        return f"pid {pid}: {base} absent"
+    try:
+        cmdline: object = (base / "cmdline").read_bytes()
+    except OSError as exc:
+        cmdline = f"unreadable ({exc!r})"
+    try:
+        status = [line for line in (base / "status").read_text(errors="replace").splitlines() if line.startswith(("State:", "PPid:"))]
+    except OSError as exc:
+        status = [f"status unreadable ({exc!r})"]
+    return f"pid {pid}: cmdline={cmdline!r} status={status}"
+
+
+def _parent_chain(pid: int, proc_root: Path = Path("/proc"), limit: int = 8) -> list[int]:
+    """`pid` then its parents (PPid) up to `limit` hops or pid 1; for a failure message."""
+    chain = [pid]
+    while len(chain) <= limit and chain[-1] > 1:
+        try:
+            line = next(ln for ln in (proc_root / str(chain[-1]) / "status").read_text(errors="replace").splitlines() if ln.startswith("PPid:"))
+            chain.append(int(line.split()[1]))
+        except (OSError, StopIteration, ValueError, IndexError):
+            break
+    return chain
+
+
+def _sleeper_diagnostic(token: str, proc: subprocess.Popen, found: set[int], proc_root: Path = Path("/proc")) -> str:
+    """The failure message's evidence (called only on a mismatch, so the passing path is unchanged): what discovery returned for `token`, and
+    for the test's own child and every pid discovery did return, what /proc held at that moment."""
+    lines = [f"token={token} found={sorted(found)} own.pid={proc.pid} own.poll()={proc.poll()!r}"]
+    if not proc_root.is_dir():
+        return lines[0] + f" ({proc_root} is not a directory on this platform; no per-pid detail)"
+    for pid in sorted({proc.pid, *found}):
+        lines.append(f"  {_describe_pid(pid, proc_root)} parents={_parent_chain(pid, proc_root)}")
+    return "\n".join(lines)
+
+
+def _wait_for_sleeper(token: str, proc: subprocess.Popen, timeout: float = SLEEPER_WAIT_TOTAL_SECONDS, interval: float = 0.02) -> set[int]:
+    """Scan for `sleep <token>`, and while the test's own child `proc` is alive but not yet named, scan again until it is or `timeout` passes.
+    Popen returns once exec has begun, not once the new image's argv is published (Linux sets mm->arg_end late in the ELF load, so /proc/<pid>/
+    cmdline reads empty in between). This waits for a pid the test just started; it never widens what discovery may name, and the caller still
+    asserts the exact set, so an extra pid or a child that never shows up still fails.
+    `timeout` is the TOTAL bound for the subprocess routes (CIM on Windows, `ps` where there is no /proc), first scan included: the one deadline
+    starts before the first scan and every discovery call is handed the budget left (at most SLEEPER_SCAN_CALL_CAP_SECONDS, at least
+    SLEEPER_SCAN_FLOOR_SECONDS), so a slow call cannot run past it. Worst case there is `timeout` plus the floor plus one `interval`. A call that
+    exhausts its budget counts as a scan that named nothing, and the caller's assertion fails.
+    The Linux /proc route is NOT bounded that way: `_sleepers_from_proc` is a synchronous directory walk that is never handed the budget and cannot
+    be interrupted, so one slow walk can run past the deadline. There `timeout` bounds only the rescans (the deadline is checked before each
+    one), not the time inside a scan."""
+    deadline = time.monotonic() + timeout
+
+    def scan() -> set[int]:
+        budget = max(SLEEPER_SCAN_FLOOR_SECONDS, min(deadline - time.monotonic(), SLEEPER_SCAN_CALL_CAP_SECONDS))
+        try:
+            return _sleepers(token, timeout=budget)
+        except subprocess.TimeoutExpired:
+            return set()
+
+    found = scan()
+    while proc.pid not in found and proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(interval)
+        found = scan()
     return found
 
 
@@ -449,6 +789,13 @@ class SleeperDiscoveryTests(unittest.TestCase):
         self.assertEqual(_sleeper_pids_from_ps(listing), {101})
         self.assertEqual(_sleeper_pids_from_ps(listing, "61"), {102})
 
+    def _assert_discovers_only(self, token: str, proc: subprocess.Popen, message: str) -> None:
+        """Wait (bounded) for `proc` to be discoverable, then require discovery to name exactly it. A mismatch carries what /proc held."""
+        found = _wait_for_sleeper(token, proc)
+        if found != {proc.pid}:
+            message = f"{message}\n{_sleeper_diagnostic(token, proc, found)}"
+        self.assertEqual(found, {proc.pid}, message)
+
     @unittest.skipIf(shutil.which("sleep") is None, "needs a sleep binary on PATH")
     def test_two_overlapping_sleeper_tests_each_count_and_terminate_only_their_own_child(self) -> None:
         # r2 (sol BLOCKER on #504): one process, no second pytest. Three same-duration sleepers are alive at once: this test's own, a plain
@@ -462,13 +809,207 @@ class SleeperDiscoveryTests(unittest.TestCase):
         for proc in (own, other_test, other_lane):
             self.addCleanup(proc.wait)
             self.addCleanup(proc.kill)
-        self.assertEqual(_sleepers(own_token), {own.pid}, "discovery must name this test's child only")
-        self.assertEqual(_sleepers(other_token), {other_test.pid})
+        self._assert_discovers_only(own_token, own, "discovery must name this test's child only")
+        self._assert_discovers_only(other_token, other_test, "discovery must name the other test's child only")
         _kill_sleepers(own_token)
         own.wait(timeout=15)
         self.assertIsNone(other_test.poll(), "the cleanup of one test killed another overlapping test's sleeper")
         self.assertIsNone(other_lane.poll(), "the cleanup killed a same-duration sleeper that no test of this file started")
         self.assertEqual(_sleepers(other_token), {other_test.pid})
+
+    @unittest.skipIf(shutil.which("sleep") is None, "needs a sleep binary on PATH")
+    def test_a_child_whose_argv_is_not_yet_visible_to_discovery_is_waited_for(self) -> None:
+        # DV-SLEEPER-OVERLAP-EXTRA-PID-DIAG-1: merge_group run 39943319734 saw the first scan miss the test's OWN child. Reproduced
+        # deterministically: the first scan for every token reads as if the child's argv were not published yet (the real test, run inside
+        # this one, must wait for its own pid rather than fail).
+        module = sys.modules[__name__]
+        real, blind_once = module._sleepers, set()
+
+        def blind_on_first_scan(token: str, **kwargs: float) -> set[int]:
+            if token not in blind_once:
+                blind_once.add(token)
+                return set()
+            return real(token, **kwargs)
+
+        inner = SleeperDiscoveryTests("test_two_overlapping_sleeper_tests_each_count_and_terminate_only_their_own_child")
+        result = unittest.TestResult()
+        with mock.patch.object(module, "_sleepers", blind_on_first_scan):
+            inner.run(result)
+        self.assertTrue(result.wasSuccessful(), f"failures={result.failures} errors={result.errors}")
+        self.assertEqual(len(blind_once), 2, "the first scan of both the own and the other test's token was blinded")
+
+    def _fixture_proc(self, entries: dict[str, dict[str, bytes]]) -> Path:
+        root = Path(tempfile.mkdtemp(prefix="dv-fake-proc-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for name, files in entries.items():
+            (root / name).mkdir()
+            for fname, data in files.items():
+                (root / name / fname).write_bytes(data)
+        return root
+
+    def test_the_proc_scan_names_only_the_token_and_skips_an_empty_or_unreadable_cmdline(self) -> None:
+        root = self._fixture_proc({
+            "101": {"cmdline": b"/usr/bin/sleep\x0060.123456789\x00"},
+            "102": {"cmdline": b""},                                   # exec under way: argv not published yet
+            "103": {"cmdline": b"sleep\x0060.999999999\x00"},          # another test's token
+            "104": {},                                                 # no cmdline file at all (the pid vanished)
+            "self": {"cmdline": b"sleep\x0060.123456789\x00"},         # not a pid
+        })
+        self.assertEqual(_sleepers_from_proc("60.123456789", root), {101})
+
+    def test_the_failure_message_carries_what_proc_held_for_the_own_child_and_each_found_pid(self) -> None:
+        root = self._fixture_proc({
+            "201": {"cmdline": b"", "status": b"Name:\tsleep\nState:\tR (running)\nPPid:\t200\n"},
+            "200": {"cmdline": b"python3\x00-m\x00pytest\x00", "status": b"State:\tS (sleeping)\nPPid:\t1\n"},
+            "202": {"cmdline": b"sleep\x0060.5\x00", "status": b"State:\tS (sleeping)\nPPid:\t200\n"},
+        })
+        own = mock.Mock(pid=201, **{"poll.return_value": None})
+        text = _sleeper_diagnostic("60.5", own, {202}, root)
+        self.assertIn("found=[202]", text)
+        self.assertIn("own.pid=201 own.poll()=None", text)
+        self.assertIn("pid 201: cmdline=b''", text)
+        self.assertIn("State:\\tR (running)", text)
+        self.assertIn("PPid:\\t200", text)
+        self.assertIn("parents=[201, 200, 1]", text)
+        self.assertIn("pid 202: cmdline=b'sleep\\x0060.5\\x00'", text)
+        self.assertIn("pid 999: " + str(root / "999") + " absent", _sleeper_diagnostic("60.5", mock.Mock(pid=999, **{"poll.return_value": 0}), set(), root))
+
+    def test_the_wait_for_the_own_child_is_bounded_and_never_accepts_a_different_pid(self) -> None:
+        # DV-SLEEPER-RESCAN-DEADLINE-SCOPE-1: this is the test a regression would hang (a rescan loop that stops honouring its deadline spins
+        # forever), so its body runs under a watchdog that fails it instead of letting it stall the shard.
+        _call_with_hang_guard(self, self._check_the_wait_is_bounded, HANG_GUARD_SECONDS)
+
+    def _check_the_wait_is_bounded(self) -> None:
+        alive = mock.Mock(pid=301, **{"poll.return_value": None})
+        with mock.patch.object(sys.modules[__name__], "_sleepers", side_effect=[set(), set(), {301}]) as scan:
+            self.assertEqual(_wait_for_sleeper("60.5", alive, timeout=5.0, interval=0.0), {301})
+            self.assertEqual(scan.call_count, 3, "it stops scanning as soon as the own child is named")
+        started = time.monotonic()
+        with mock.patch.object(sys.modules[__name__], "_sleepers", return_value={999}):
+            self.assertEqual(_wait_for_sleeper("60.5", alive, timeout=0.2, interval=0.01), {999}, "a foreign pid is returned as it is, never waited for as if it were the own child")
+        self.assertLess(time.monotonic() - started, 5.0, "the wait is bounded by its timeout")
+        exited = mock.Mock(pid=302, **{"poll.return_value": 1})
+        with mock.patch.object(sys.modules[__name__], "_sleepers", return_value=set()) as scan:
+            self.assertEqual(_wait_for_sleeper("60.5", exited, timeout=5.0), set())
+            self.assertEqual(scan.call_count, 1, "an own child that has already exited is not waited for")
+
+    def test_the_hang_guard_fails_a_body_that_never_returns_instead_of_hanging(self) -> None:
+        release = threading.Event()
+        self.addCleanup(release.set)   # lets the abandoned daemon thread end once the assertion below has seen the failure
+        started = time.monotonic()
+        with self.assertRaises(self.failureException) as raised:
+            _call_with_hang_guard(self, lambda: release.wait(60), 0.3)
+        self.assertLess(time.monotonic() - started, 10.0, "the guard returns at its limit, not when the body does")
+        self.assertIn("did not return within 0.3 s", str(raised.exception))
+        self.assertEqual(_call_with_hang_guard(self, lambda: 7, 5.0), 7)
+        with self.assertRaises(KeyError):
+            _call_with_hang_guard(self, lambda: {}["missing"], 5.0)
+
+    def _slow_first_discovery(self, first_call_seconds: float, found_after_first: set[int]):
+        """A stand-in for `_sleepers` whose first call takes `first_call_seconds` of wall time and which, like the real subprocess, honours the
+        timeout it is given (it raises TimeoutExpired once that passes). Records every timeout it was handed."""
+        timeouts: list[float | None] = []
+
+        def discovery(token: str, timeout: float | None = None) -> set[int]:
+            timeouts.append(timeout)
+            first = len(timeouts) == 1
+            limit = first_call_seconds if first else 0.0
+            allowed = timeout if timeout is not None else 60.0
+            time.sleep(min(limit, allowed))
+            if limit > allowed:
+                raise subprocess.TimeoutExpired("discovery", allowed)
+            return set() if first else set(found_after_first)
+
+        return discovery, timeouts
+
+    def test_a_slow_first_discovery_cannot_stretch_the_wait_past_its_total_bound(self) -> None:
+        # DV-SLEEPER-RESCAN-DEADLINE-SCOPE-1 (Dot R18 advisory on #624): the deadline used to start AFTER the first scan and could not interrupt a
+        # call already running, so "5 s" bounded only the retry window and one 60 s discovery call sat outside it. Fixture: the first discovery call
+        # would take 1.5 s, the total budget is 1.0 s. The wait must give up at about the budget (plus the floor of one call), not after
+        # 1.5 s + a fresh 1.0 s window. The stand-in honours its timeout like the subprocess routes (CIM, ps) do; the /proc route does not (see
+        # `_wait_for_sleeper`), so this pins the total bound for those routes only.
+        discovery, timeouts = self._slow_first_discovery(1.5, set())
+        alive = mock.Mock(pid=401, **{"poll.return_value": None})
+
+        def run() -> set[int]:
+            with mock.patch.object(sys.modules[__name__], "_sleepers", discovery):
+                return _wait_for_sleeper("60.5", alive, timeout=1.0, interval=0.01)
+
+        started = time.monotonic()
+        found = _call_with_hang_guard(self, run, HANG_GUARD_SECONDS)
+        elapsed = time.monotonic() - started
+        self.assertEqual(found, set(), "a discovery that never answered inside the budget names nothing; the caller's assertion then fails with a diagnostic")
+        self.assertLess(elapsed, 1.0 + SLEEPER_SCAN_FLOOR_SECONDS + 0.5, f"total elapsed {elapsed:.2f} s exceeds budget + one floor-sized call + slack")
+        self.assertTrue(timeouts and timeouts[0] is not None and 0 < timeouts[0] <= 1.0, f"the first call must be handed the remaining budget, got {timeouts}")
+        for given in timeouts:
+            self.assertTrue(given is not None and SLEEPER_SCAN_FLOOR_SECONDS <= given <= SLEEPER_SCAN_CALL_CAP_SECONDS, f"every call is handed a timeout between the floor and the per-call cap: {timeouts}")
+
+    def test_each_discovery_call_gets_the_remaining_budget_capped_per_call_and_floored(self) -> None:
+        alive = mock.Mock(pid=402, **{"poll.return_value": None})
+        seen: list[float] = []
+
+        def discovery(token: str, timeout: float | None = None) -> set[int]:
+            seen.append(timeout)
+            return set()
+
+        with mock.patch.object(sys.modules[__name__], "_sleepers", discovery):
+            started = time.monotonic()
+            _wait_for_sleeper("60.5", alive, timeout=1.0, interval=0.05)
+            self.assertLess(time.monotonic() - started, 5.0)
+        self.assertGreater(len(seen), 1, "an unnamed own child is rescanned until the budget is spent")
+        self.assertLessEqual(seen[0], 1.0,"the first call is bounded by the whole budget, not by the 60 s per-call cap")
+        self.assertEqual(seen[-1], SLEEPER_SCAN_FLOOR_SECONDS, "past the deadline a call is floored, never zero or negative")
+        self.assertTrue(all(0 < t <= SLEEPER_SCAN_CALL_CAP_SECONDS for t in seen), seen)
+        big: list[float] = []
+        with mock.patch.object(sys.modules[__name__], "_sleepers", lambda token, timeout=None: (big.append(timeout), {402})[1]):
+            self.assertEqual(_wait_for_sleeper("60.5", alive, timeout=500.0), {402})
+        self.assertEqual(big, [SLEEPER_SCAN_CALL_CAP_SECONDS], "a budget larger than the per-call cap is clamped to the cap")
+
+    def test_a_slow_but_healthy_first_discovery_inside_the_budget_still_names_the_child(self) -> None:
+        # The flakiness guard for the bound: a host whose first discovery is slow (0.4 s here against a 2 s budget) must still pass.
+        discovery, timeouts = self._slow_first_discovery(0.4, {403})
+        alive = mock.Mock(pid=403, **{"poll.return_value": None})
+        with mock.patch.object(sys.modules[__name__], "_sleepers", discovery):
+            found = _call_with_hang_guard(self, lambda: _wait_for_sleeper("60.5", alive, timeout=2.0, interval=0.01), HANG_GUARD_SECONDS)
+        self.assertEqual(found, {403})
+        self.assertEqual(len(timeouts), 2, "one slow miss, then one hit on the rescan")
+
+    def _wait_over_fixture_proc(self, publish_on_scan: int | None, timeout: float) -> tuple[set[int], Path, list[float | None]]:
+        """Drive `_wait_for_sleeper` end to end over a fixture /proc tree: `_sleepers` is replaced by the real Linux reader (`_sleepers_from_proc`)
+        pointed at a temp dir, so the reader and the wait are exercised together (the reader tests above call it directly; the wait tests
+        replace it). pid 601 is the own child, its cmdline EMPTY until scan number `publish_on_scan` (1-based; None = never) writes
+        `sleep\\0<token>\\0` into it; pid 602 runs another test's token and must never be named. Like the real /proc route the reader ignores the
+        timeout it is handed. Returns (found, root, the timeout each scan was handed)."""
+        token = "60.5"
+        root = self._fixture_proc({
+            "601": {"cmdline": b""},                                   # the own child: exec under way, argv not published yet
+            "602": {"cmdline": b"sleep\x0060.999999999\x00"},          # another test's token
+        })
+        handed: list[float | None] = []
+
+        def fixture_reader(tok: str, timeout: float | None = None) -> set[int]:
+            handed.append(timeout)
+            if publish_on_scan is not None and len(handed) == publish_on_scan:
+                (root / "601" / "cmdline").write_bytes(b"sleep\x00" + tok.encode() + b"\x00")
+            return _sleepers_from_proc(tok, root)
+
+        alive = mock.Mock(pid=601, **{"poll.return_value": None})
+        with mock.patch.object(sys.modules[__name__], "_sleepers", fixture_reader):
+            found = _call_with_hang_guard(self, lambda: _wait_for_sleeper(token, alive, timeout=timeout, interval=0.0), HANG_GUARD_SECONDS)
+        return found, root, handed
+
+    def test_the_wait_rescans_a_fixture_proc_until_the_own_childs_cmdline_is_published(self) -> None:
+        # DV-SLEEPER-RESCAN-BOUND-FOLLOWUPS-1 (Sol on #628, hardening): the reader-to-wait path was only covered in two halves.
+        found, _, handed = self._wait_over_fixture_proc(publish_on_scan=3, timeout=5.0)
+        self.assertEqual(found, {601}, "the pid whose cmdline went from empty to `sleep <token>` is named, and the other token's pid 602 is not")
+        self.assertEqual(len(handed), 3, "two scans read the empty cmdline (nothing named), the third read the published one and the wait stopped")
+
+    def test_the_wait_over_a_fixture_proc_that_never_publishes_returns_nothing_within_its_bound(self) -> None:
+        started = time.monotonic()
+        found, _, handed = self._wait_over_fixture_proc(publish_on_scan=None, timeout=0.3)
+        self.assertEqual(found, set(), "an own child whose argv never shows up is not named, so the caller's exact-set assertion fails")
+        self.assertGreater(len(handed), 1, "it rescanned until the deadline instead of giving up after the first empty read")
+        self.assertLess(time.monotonic() - started, 5.0, "bounded between scans: the deadline is checked before each rescan")
 
     @unittest.skipIf(sys.platform == "win32" or Path("/proc").is_dir(), "the ps path is for platforms without /proc (macOS)")
     def test_discovery_runs_where_there_is_no_proc(self) -> None:

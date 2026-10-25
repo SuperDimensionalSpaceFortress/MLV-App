@@ -60,8 +60,10 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
 
     def test_heavy_job_is_held_through_heavy_slot_py_run_exclusive(self) -> None:
         # AGENT-HEAVY-SLOT-2.3-ADAPT-1: the label is "mlv <jobId>" or "mlv-long <jobId>" (Get-HeavySlotLabel).
-        self.assertIn("$label = Get-HeavySlotLabel -JobId $JobId -TimeoutSec ([int](Get-JobMetadata -JobId $JobId).timeoutSec)", self.code)
-        self.assertRegex(self.code, r'\$HeavySlotScript,\s*"run",\s*"--exclusive",\s*"--label",\s*\$label,\s*"--slots"')
+        # AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1: the wait resolves it once and hands it to the holder start.
+        self.assertIn("$label = Get-HeavySlotLabel -JobId $JobId -TimeoutSec ([int]$Metadata.timeoutSec)", self.code)
+        self.assertIn("$h = Start-HeavySlotHolder -JobId $JobId -Label $label", self.code)
+        self.assertRegex(self.code, r'\$HeavySlotScript,\s*"run",\s*"--exclusive",\s*"--label",\s*\$Label,\s*"--slots"')
         # A holder must take its own slot, never pass through as nested under a stale HEAVY_SLOT_HELD.
         self.assertIn("HEAVY_SLOT_HELD = $null", self.code)
         # The job runs inside the holder's slot and inherits it (heavy-slot.py NESTING contract).
@@ -123,6 +125,27 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertIn("wait-release r1c", m.group(1))
         self.assertIn("maint-dispatch r1", m.group(1))
 
+    def test_staging_jobs_skip_the_lease_but_never_run_during_a_wait(self) -> None:
+        # STAGE-JOB-LEASE-EXEMPT-1: a build-artifact staging step (copy + hash into cache\, measures nothing) waited 6889 s
+        # for a quiet lease on 2026-10-24. Its exact generator id grammars are exempt; anything else stays gated.
+        self.assertIn("[string]$GateStageJobPattern = '^(playback-attr-3-cuda-stage-[0-9a-f]{12}(-[A-Za-z0-9-]{1,32})?"
+                      "|attr3-stage-smoke-runner-[0-9a-f]{12}-[0-9a-f]{12}|attr3-stage-fixture-(tiny|large)_dual_iso-[0-9a-f]{12})\\z'",
+                      self.text)
+        classify = self.code[self.code.index("function Get-GateExemptClass"):]
+        classify = classify[:classify.index("\n}\n")]
+        self.assertIn("$JobId -match $GateExemptJobPattern", classify)
+        self.assertIn("$JobId -cmatch $GateStageJobPattern", classify)
+        queued = self.code[self.code.index("function Invoke-QueuedJob"):]
+        queued = queued[:queued.index("\n}\n")]
+        self.assertIn("$exemptClass = Get-GateExemptClass -JobId $jobId", queued)
+        # Serial with the agent's own measured leg: the during-wait dispatcher runs light jobs only, never a staging job.
+        helper = self.code[self.code.index("function Invoke-ExemptJobsDuringWait"):]
+        helper = helper[:helper.index("\n}\n")]
+        self.assertNotIn("GateStageJobPattern", helper)
+        self.assertNotIn("Get-GateExemptClass", helper)
+        self.assertEqual(len(re.findall(r"-c?match \$GateStageJobPattern", self.code)), 1,
+                         "the stage pattern is matched in one place (Get-GateExemptClass), case-sensitively")
+
     def test_exempt_jobs_run_during_a_gate_wait(self) -> None:
         # GATE-MAINT-DISPATCH-DURING-WAIT-1: a job waiting on the gate has no cap, and the inbox loop is blocked
         # inside it, so the light jobs behind it (probes, dve health, agent-swap) are run from inside the wait.
@@ -153,7 +176,8 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         # "mlv " (trailing space) as short-exclusive and writes a stop file when one runs past 15 min. A gated job over
         # 900 s, or a stage / build / soak job, is "mlv-long <id>", which that prefix does not match.
         self.assertEqual(self.code.count('"mlv $JobId"'), 1, "the short label is spelled once, inside Get-HeavySlotLabel")
-        for fn in ("function Start-HeavySlotHolder", "function Wait-HeavySlotAdmission"):
+        # AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1: only the wait resolves it; the holder start takes it as -Label (pinned below).
+        for fn in ("function Wait-HeavySlotAdmission",):
             body = self.code[self.code.index(fn):]
             body = body[:body.index("\n}\n")]
             self.assertIn("Get-HeavySlotLabel", body, fn)
@@ -163,10 +187,19 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertIn('"mlv $JobId"', label)
         self.assertRegex(self.text, r"\[int\]\$GateLongJobSec = 900\b")
         self.assertRegex(self.text, r"\[string\]\$GateLongJobPattern = '[^']*stage\|build\|soak[^']*'")
-        # The second label source is the metadata the agent applies (default 1800 s), never a restated number.
+        # The label's timeout is the metadata the agent applies (default 1800 s), never a restated number; it is read
+        # once per job, in the wait, and the holder start takes the resolved label instead of reading metadata again.
+        wait = self.code[self.code.index("function Wait-HeavySlotAdmission"):]
+        wait = wait[:wait.index("\n}\n")]
+        self.assertEqual(wait.count("Get-HeavySlotLabel"), 1, "the wait resolves the label once")
+        self.assertIn("[int]$Metadata.timeoutSec", wait)
         start = self.code[self.code.index("function Start-HeavySlotHolder"):]
         start = start[:start.index("\n}\n")]
-        self.assertIn("Get-JobMetadata -JobId $JobId", start)
+        self.assertNotIn("Get-JobMetadata", start, "the holder start must not read the metadata a second time")
+        self.assertNotIn("Get-HeavySlotLabel", start, "the holder start must not resolve a label of its own")
+        self.assertRegex(start, r"\[Parameter\(Mandatory = \$true\)\]\[string\]\$Label")
+        self.assertEqual(self.code.count("Start-HeavySlotHolder -JobId"), 1, "one holder-start call site, and it passes the label")
+        self.assertEqual(self.code.count("Get-HeavySlotLabel -JobId"), 1, "one label resolution per job admission path")
 
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -192,6 +225,12 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
         self.assertEqual(unit["maintDispatch"]["dispatched"], ["agent-swap-U1", "venue-quiet-probe-U2"])
         self.assertTrue(unit["maintDispatch"]["singleObject"])
         self.assertEqual(unit["maintDispatch"]["label"], "queue-expired")
+        # STAGE-JOB-LEASE-EXEMPT-1: staging jobs reach the launch with zero heavy-slot.py calls; measured ids still lease.
+        stage = out["results"]["stageExempt"]
+        self.assertEqual(stage["status"], "PASS")
+        self.assertEqual(stage["results"]["stageUngated"]["attrStage"]["calls"], 0)
+        self.assertGreaterEqual(stage["results"]["stageGated"]["stageElsewhere"]["requests"], 1)
+        self.assertEqual(stage["results"]["stageNotDuringWait"]["ranDuringWait"], ["agent-swap-20261024T0519Z"])
         # AGENT-HEAVY-SLOT-2.3-ADAPT-1: long jobs are "mlv-long <id>"; the busy heartbeat names the holder.
         cases = unit["longLabel"]["cases"]
         self.assertEqual(cases["at900"], "mlv jobA")
@@ -202,6 +241,10 @@ class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
         self.assertEqual(unit["longLabel"]["metadata"]["explicit900"], "900 -> mlv m900")
         self.assertEqual(unit["longLabel"]["waitAdmitsOnLongLabel"], "clear")
         self.assertEqual(unit["longLabel"]["waitRejectsShortLabel"], "holder-lost")
+        # AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1: meta.json rewritten after the wait read it (600 -> 1200 s and 1200 -> 600 s
+        # with GateLongJobSec 900) does not change the label the ticket is filed under.
+        self.assertEqual(unit["singleRead"]["shortThenLong"], "mlv jslr")
+        self.assertEqual(unit["singleRead"]["longThenShort"], "mlv-long jslr")
         self.assertEqual(unit["heartbeat"]["busy"], "gate-wait job=j1 state=queued waited=Ns holder=suite X held=62m")
         self.assertEqual(unit["heartbeat"]["free"], "gate-wait job=j1 state=queued waited=Ns")
         self.assertEqual(unit["heartbeat"]["umRunState"], "queued")
