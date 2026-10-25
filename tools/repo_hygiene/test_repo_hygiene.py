@@ -2025,10 +2025,10 @@ class RepoHygieneTests(unittest.TestCase):
 
         expected_remote_inventory = Counter(
             {
-                ("actions/checkout", "v5"): 13,
+                ("actions/checkout", "v5"): 14,
                 ("actions/setup-python", "v6"): 13,
                 ("actions/upload-artifact", "v7"): 13,
-                ("ConorMacBride/install-package", "v1"): 2,
+                ("ConorMacBride/install-package", "v1"): 3,
             }
         )
         observed_remote_inventory: Counter[tuple[str, str]] = Counter()

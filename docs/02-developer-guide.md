@@ -597,7 +597,7 @@ under `platform/qt/FFmpeg/` and `platform/qt/raw2mlv/`:
 | Windows 64 | `ffmpegWin64.zip` | `raw2mlvWin64.zip` |
 | Windows 32 | `ffmpegWin32.zip` | `raw2mlvWin32.zip` |
 | macOS Intel | `ffmpegOSX.zip` | `raw2mlvOSX.zip` |
-| macOS Apple Silicon | `ffmpegOSX.zip` | `raw2mlvMacOsArm.zip` |
+| macOS Apple Silicon | `ffmpegOSXarm.zip` | `raw2mlvMacOsArm.zip` |
 | Linux | `ffmpegLinux.tar.xz` | `raw2mlvLinux.tar.xz` |
 
 Unpack rules:
