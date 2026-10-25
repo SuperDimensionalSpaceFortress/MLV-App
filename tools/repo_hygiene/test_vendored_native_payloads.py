@@ -1763,7 +1763,7 @@ class VendoredNativePayloadTests(unittest.TestCase):
                     break
             return tuple(commands)
 
-        def assert_fail_closed_policy(text: str) -> None:
+        def assert_fail_closed_policy(text: str, brew_line: str) -> None:
             self.assertNotRegex(text, r"(?im)^\s*continue-on-error\s*:")
             steps = named_step_blocks(text)
             names = [name for name, _ in steps]
@@ -1775,18 +1775,20 @@ class VendoredNativePayloadTests(unittest.TestCase):
             blocks = dict(steps)
             install_block = blocks[expected_order[0]]
             verify_block = blocks[expected_order[1]]
-            self.assertIn("brew: llvm qt5 openssl", install_block)
+            self.assertIn(brew_line, install_block)
             self.assertNotRegex(install_block, permissive_shell)
             self.assertNotRegex(verify_block, permissive_shell)
             self.assertEqual(normalized_run_lines(verify_block), expected_verify_lines)
 
-        for relative in (
-            ".github/workflows/macOS-Intel.yml",
-            ".github/workflows/macOS-Arm64.yml",
-        ):
+        # Intel stays on Qt 5 (qt@5); the Arm64 release workflow moved to Qt 6 (brew `qt`).
+        expected_brew_lines = {
+            ".github/workflows/macOS-Intel.yml": "brew: llvm qt5 openssl",
+            ".github/workflows/macOS-Arm64.yml": "brew: llvm qt openssl",
+        }
+        for relative, brew_line in expected_brew_lines.items():
             with self.subTest(workflow=relative):
                 text = (ROOT / relative).read_text(encoding="utf-8")
-                assert_fail_closed_policy(text)
+                assert_fail_closed_policy(text, brew_line)
 
                 falsifiers = (
                     (
@@ -1821,7 +1823,7 @@ class VendoredNativePayloadTests(unittest.TestCase):
                 for label, falsified in falsifiers:
                     with self.subTest(workflow=relative, falsifier=label):
                         with self.assertRaises(AssertionError):
-                            assert_fail_closed_policy(falsified)
+                            assert_fail_closed_policy(falsified, brew_line)
 
 
 if __name__ == "__main__":
