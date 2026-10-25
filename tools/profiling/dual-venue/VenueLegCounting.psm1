@@ -1,4 +1,6 @@
-# VenueLegCounting.psm1 -- VENUE-LEG-INLEASE-REQUALIFY-1. The pure leg-counting rules every bench analyzer imports.
+# VenueLegCounting.psm1 -- VENUE-LEG-INLEASE-REQUALIFY-1. The pure leg-counting rules for bench analyzers.
+# No tracked driver or analyzer imports it (test_venue_leg_inlease_requalify.py test_24 re-derives that from tools/ and holds this line to it);
+# its first importer is the untracked CPU-17V9-FPS-GAP-AB-1 r7 run-dir analyze.ps1 (CPU-17V9-R7-PREP-1).
 #
 # Pre-registered rule 'inlease-requalify-1' (HUB RULING, .claude-state/kernel/subject-ledger.md, tool stamp 2026-10-24T15:40:56Z, action (1)):
 # a leg whose admission wait exceeded 180 s counts only if it already met every existing condition (class QUIET_PRELOAD_OK) AND its in-job,
@@ -23,6 +25,10 @@
 # binder, so it can never take a branch other than its canonical form's (dot 80f0e297 B1: the -ceq tests below used to disagree with
 # the case-insensitive binder). A value that is not a measurement (negative or infinite wait or pre-load, a throttled count that is not
 # a whole number >= 0) is refused: NOT_COUNTED_INVALID_MEASUREMENT / thermal-unknown, never rounded and never eligible.
+# VENUE-LEG-COUNTING-HARDENING-1: the wait and the pre-load are numeric-typed or $null, as throttled already was. A string or bool is not a
+# measurement and is NOT_COUNTED_INVALID_MEASUREMENT under both rules (a [Nullable[double]] binder turned '' and '   ' into 0, so an empty
+# wait counted and an empty pre-load requalified). A NaN pre-load is NOT_COUNTED_INVALID_MEASUREMENT (it was refused as PRELOAD_HIGH);
+# a NaN wait stays a missing wait (QUIET_PRELOAD_UNVERIFIED_ADMISSION). No finite numeric input changes class.
 #
 # Pure: no file, network or share access, no process start. Callers pass values they have already read.
 
@@ -47,10 +53,16 @@ function Get-VenueLegCountingProperty([object]$Object, [string]$Name) {
     $p.Value
 }
 
+function Test-VenueLegCountingNumericType([object]$Value) {
+    # A numeric type only: a string (empty, blank or numeric-looking) or a bool is not a measurement.
+    # Supported (a measurement): byte, int16, int32, int64, single, double, decimal. Every other type is refused, never coerced: sbyte,
+    # uint16, uint32, uint64, System.Numerics.BigInteger, bool, string, char, arrays. Pinned by test_27 with exact .NET types.
+    ($null -ne $Value) -and ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single] -or $Value -is [int16] -or $Value -is [byte])
+}
+
 function Test-VenueLegCountingFiniteNonNegative([object]$Value) {
     # A numeric type only (a string or bool is not a measurement), finite and >= 0.
-    if ($null -eq $Value) { return $false }
-    if (-not ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single] -or $Value -is [int16] -or $Value -is [byte])) { return $false }
+    if (-not (Test-VenueLegCountingNumericType $Value)) { return $false }
     $d = [double]$Value
     (-not [double]::IsNaN($d)) -and (-not [double]::IsInfinity($d)) -and $d -ge 0
 }
@@ -93,10 +105,15 @@ function Get-VenueLegRequalification {
         [Parameter(Mandatory)][ValidateSet('stale-discard-180', 'inlease-requalify-1', IgnoreCase = $false)][string]$Rule,
         [Parameter(Mandatory)][ValidateSet('chain', 'ref', IgnoreCase = $false)][string]$Kind,
         [Parameter(Mandatory)][AllowEmptyString()][string]$BaseClass,
-        [AllowNull()][Nullable[double]]$AdmissionWaitedSec,
+        [AllowNull()][object]$AdmissionWaitedSec,
         [AllowNull()][object]$Admission,
-        [AllowNull()][Nullable[double]]$InLeasePreLoadMean
+        [AllowNull()][object]$InLeasePreLoadMean
     )
+    # Numeric-typed or $null only (HARDENING-1): a string or bool never reaches a comparison, so '' cannot become 0.
+    $waitIsNumber = Test-VenueLegCountingNumericType $AdmissionWaitedSec
+    $wait = $(if ($waitIsNumber) { [double]$AdmissionWaitedSec } else { $null })
+    $preIsNumber = Test-VenueLegCountingNumericType $InLeasePreLoadMean
+    $pre = $(if ($preIsNumber) { [double]$InLeasePreLoadMean } else { $null })
     $th = ConvertFrom-VenueAdmissionThermal -Admission $Admission
     $row = [pscustomobject]@{
         rule = $Rule; class = $BaseClass; eligible = $false; notCountedReason = $null; requalified = $false
@@ -105,21 +122,23 @@ function Get-VenueLegRequalification {
     $class = $null
     if ($BaseClass -cne 'QUIET_PRELOAD_OK') {
         $class = $BaseClass   # the cooldown gate is not relaxed: any other base class passes through, not eligible
-    } elseif ($null -eq $AdmissionWaitedSec -or [double]::IsNaN([double]$AdmissionWaitedSec)) {
+    } elseif ($null -ne $AdmissionWaitedSec -and -not $waitIsNumber) {
+        $class = 'NOT_COUNTED_INVALID_MEASUREMENT'   # a string or bool wait is not a measurement, under both rules
+    } elseif ($null -eq $wait -or [double]::IsNaN($wait)) {
         $class = 'QUIET_PRELOAD_UNVERIFIED_ADMISSION'
-    } elseif ([double]::IsInfinity([double]$AdmissionWaitedSec) -or [double]$AdmissionWaitedSec -lt 0) {
-        $class = 'NOT_COUNTED_INVALID_MEASUREMENT'   # a negative or infinite wait is not a measurement; it never reaches the <= 180 s path
-    } elseif ([double]$AdmissionWaitedSec -le $script:StaleAdmissionSec) {
+    } elseif ([double]::IsInfinity($wait) -or $wait -lt 0) {
+        $class = 'NOT_COUNTED_INVALID_MEASUREMENT'   # a negative or infinite wait is not a measurement, under both rules; it never reaches the <= 180 s path
+    } elseif ($wait -le $script:StaleAdmissionSec) {
         $row.class = 'QUIET_PRELOAD_OK'; $row.eligible = $true
         return $row
     } elseif ($Rule -ceq 'stale-discard-180') {
         $class = 'QUIET_PRELOAD_STALE'
     } elseif ($null -eq $InLeasePreLoadMean) {
         $class = $(if ($Kind -ceq 'ref') { 'NOT_COUNTED_STALE_NO_INLEASE_PROBE' } else { 'NOT_COUNTED_INLEASE_PROBE_MISSING' })
-    } elseif (-not [double]::IsNaN([double]$InLeasePreLoadMean) -and ([double]::IsInfinity([double]$InLeasePreLoadMean) -or [double]$InLeasePreLoadMean -lt 0)) {
-        $class = 'NOT_COUNTED_INVALID_MEASUREMENT'   # a negative or infinite pre-load mean is not a measurement (NaN keeps refusing as HIGH)
-    } elseif (-not ([double]$InLeasePreLoadMean -le $script:InLeasePreLoadMaxPercent)) {
-        $class = 'NOT_COUNTED_INLEASE_PRELOAD_HIGH'   # written as -not (<= 30.0) so NaN refuses
+    } elseif (-not $preIsNumber -or [double]::IsNaN($pre) -or [double]::IsInfinity($pre) -or $pre -lt 0) {
+        $class = 'NOT_COUNTED_INVALID_MEASUREMENT'   # a string, bool, NaN, infinite or negative pre-load mean is not a measurement (G2: NaN was typed HIGH)
+    } elseif (-not ($pre -le $script:InLeasePreLoadMaxPercent)) {
+        $class = 'NOT_COUNTED_INLEASE_PRELOAD_HIGH'
     } elseif (-not $th.known) {
         $class = 'NOT_COUNTED_THERMAL_UNKNOWN'
     } elseif ($th.throttled -gt 0) {
