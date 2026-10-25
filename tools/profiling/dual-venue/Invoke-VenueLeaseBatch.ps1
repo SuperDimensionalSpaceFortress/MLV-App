@@ -75,27 +75,45 @@
 #         next batch, which takes the claim again.
 #      c. AN UNRESOLVED LEG IS WITHDRAWN (hub 13:21Z B2 clause). A leg whose job has no agent result by name (um-run said UNRESOLVED, or the read failed) gets
 #         its cancel file at once (row withdraw, LEG_WITHDRAWN), so the agent never launches it later on a parked lease.
+#   9. MULTI-BUILD LEG PLAN (LEASE-BATCH-MULTI-BUILD-1). The scalar form runs one build and one backend per call, so an A/B driver paid a lease (and its 30 min
+#      cooldown) per build. -LegPlan <json> instead names an ordered list of legs, each with its own build: {"schema": "mlv-app/venue-lease-leg-plan/v1", "legs":
+#      [{legSpec, backend, sourceCommit, buildManifestSha256, arm}, ...]} (a bare array of items is read too). legSpec is a path (as given, then beside the plan
+#      file, then legs\<name>); backend is cuda or cpu; arm is a free label (A, B, base, cand...). It is a parameter set of its own: -LegSpec / -LegSet / -Repeats /
+#      -Backend / -SourceCommit / -BuildManifestSha256 cannot be passed with it, and the scalar call is unchanged (same receipts, rows and exit codes).
+#      a. EVERY item is validated BEFORE any claim or lease: the hex patterns of the scalar form, backend, arm, the leg spec found, and its build STAGED on the
+#         venue with exactly that manifest (Get-VenueStagedBuildManifest, the file Invoke-VenueLeg hashes). One bad item refuses the whole plan on stderr,
+#         BATCH_USAGE LEG_PLAN_REFUSED reason=<BAD_ITEM_SHAPE | BAD_SOURCE_COMMIT | BAD_MANIFEST_SHA256 | BAD_BACKEND | BAD_ARM | LEG_SPEC_MISSING | BUILD_NOT_STAGED |
+#         BUILD_MANIFEST_MISMATCH | SHARE_UNREACHABLE> item=<n> (or LEG_PLAN_UNREADABLE), exit 2: nothing is submitted, so no lease ever fails halfway on a build.
+#      b. The legs run in plan order (-PlanOrder AsGiven), or with the arms INTERLEAVED, A B A B (-PlanOrder Interleave, Get-VenueInterleavedLegPlan), so lease
+#         position and venue heat fall on every arm alike. Per-leg budget, re-check, claim loss and deadline handling are the scalar form's, leg by leg.
+#      c. Each leg process gets its own -SourceCommit / -BuildManifestSha256 / -Backend; each batch leg row and run result carries name, arm, backend, sourceCommit
+#         and buildManifestSha256; the LEG ... RUN line names them; <RunDir>\leg-plan.json keeps the validated plan in run order and each build's staged state.
 # It changes nothing on Bachelor: not heavy-slot.py's caps, not its lease file, not the quiet threshold. A batch run needs the lease-batch agent deployed.
 #
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeaseBatch.ps1 -LegSpec a.json,b.json -Backend cpu -RunDir <rd> `
 #       -SourceCommit <40-hex> -BuildManifestSha256 <64-hex> [-DeadlineUtc <iso>]
+#   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeaseBatch.ps1 -LegPlan ab-plan.json -PlanOrder Interleave -RunDir <rd> [-DeadlineUtc <iso>]
 #
-# Exit codes (a leg's OUTCOME is never the exit code: read LEASE_BATCH_RESULT and the receipts): 0 every leg ran; 2 usage (or a leg budget no lease can hold);
+# Exit codes (a leg's OUTCOME is never the exit code: read LEASE_BATCH_RESULT and the receipts): 0 every leg ran; 2 usage (or a leg budget no lease can hold,
+# or a refused -LegPlan: LEG_PLAN_REFUSED);
 # 3 DEADLINE before every leg ran (a cooldown, budget or exit-75 wait that reached it included); 4 GATE_UNREADABLE and 5 HOST_MISMATCH from Wait-VenueQuiet; 6 a probe ended VENUE_QUIET_UNKNOWN; 7 a leg process exited
 # non-zero (LEG_FAILED) or was killed at the lease's end (LEASE_EXPIRED; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
 # UNRESOLVED or not admitted, or never submitted because its sidecar could not be written: LIVENESS_UNAVAILABLE); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
 # 7a). A stopping code (2-6, 9, 10) replaces 0 or 7; 11 replaces every other code.
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Scalar')]
 param(
     [ValidateSet('bachelor')][string]$Venue = 'bachelor',
-    [string[]]$LegSpec = @(),
-    [string]$LegSet = '',
-    [ValidateRange(1, 20)][int]$Repeats = 1,
-    [ValidateSet('cuda', 'cpu')][string]$Backend,
+    [Parameter(ParameterSetName = 'Scalar')][string[]]$LegSpec = @(),
+    [Parameter(ParameterSetName = 'Scalar')][string]$LegSet = '',
+    [Parameter(ParameterSetName = 'Scalar')][ValidateRange(1, 20)][int]$Repeats = 1,
+    [Parameter(ParameterSetName = 'Scalar')][ValidateSet('cuda', 'cpu')][string]$Backend,
     [Parameter(Mandatory = $true)][string]$RunDir,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
+    [Parameter(ParameterSetName = 'Scalar', Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+    [Parameter(ParameterSetName = 'Scalar', Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
+    # LEASE-BATCH-MULTI-BUILD-1 (item 9): an ordered leg plan, each leg with its own build, backend and arm, run in ONE batched lease series
+    [Parameter(ParameterSetName = 'Plan', Mandatory = $true)][string]$LegPlan,
+    [Parameter(ParameterSetName = 'Plan')][ValidateSet('AsGiven', 'Interleave')][string]$PlanOrder = 'AsGiven',
     [string]$Purpose = '',
     [string]$SheetCopyDir = '',
     # passed through to Wait-VenueQuiet.ps1 (never relaxed here)
@@ -153,7 +171,8 @@ if ($LeaseBudgetSec -lt $LeaseCapSec) { Stop-Usage "-LeaseBudgetSec $LeaseBudget
 if ($ClaimRenewSec -eq 0) { $ClaimRenewSec = [int][Math]::Max(1, [Math]::Min(600, [Math]::Floor($ClaimTtlSec / 4))) }
 if (2 * $ClaimRenewSec -gt $ClaimTtlSec) { Stop-Usage "-ClaimRenewSec $ClaimRenewSec is over half of -ClaimTtlSec ${ClaimTtlSec}: one late renewal would let the claim expire" }
 if (2 * $LivenessRenewSec -gt $LivenessWindowSec) { Stop-Usage "-LivenessRenewSec $LivenessRenewSec is over half of -LivenessWindowSec ${LivenessWindowSec}: one late write would lapse a live runner" }
-if (($LegSpec.Count -gt 0) -eq [bool]$LegSet) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
+$legPlanMode = ($PSCmdlet.ParameterSetName -ceq 'Plan')
+if (-not $legPlanMode -and (($LegSpec.Count -gt 0) -eq [bool]$LegSet)) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
 if (-not $AgentShare) { $AgentShare = try { [string](([IO.File]::ReadAllText((Join-Path $here 'venues.json')) | ConvertFrom-Json).venues.$Venue.agentShare) } catch { '' } }
 if (-not $AgentShare) { Stop-Usage "venues.json names no agentShare for $Venue" }
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
@@ -172,22 +191,98 @@ function L([string]$Message) {
     Write-Output $line
 }
 
+function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
+    # LEASE-BATCH-MULTI-BUILD-1 (item 9a): a -LegPlan item that cannot run refuses the WHOLE plan before any claim, open or lease. Nothing was submitted.
+    $line = "LEG_PLAN_REFUSED reason=$Reason$(if ($Item -gt 0) { " item=$Item" }) $Detail"
+    Add-Content -LiteralPath $batchLog -Value "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $line"
+    [Console]::Error.WriteLine("BATCH_USAGE $line")
+    Complete-VenueProcess -ExitCode 2
+    exit 2
+}
+
+function Resolve-LegSpecPath([string]$Ref, [string]$BesideDir) {
+    # a leg spec as given, then beside the plan file (-LegPlan only), then legs\<name>; $null when none is a file
+    foreach ($c in @($Ref, $(if ($BesideDir -and -not [IO.Path]::IsPathRooted($Ref)) { Join-Path $BesideDir $Ref }), (Join-Path $here "legs\$Ref"))) {
+        if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return (Resolve-Path -LiteralPath $c).Path }
+    }
+    $null
+}
+
+function Get-LegSpecId([string]$Path) {
+    $legId = try { [string](([IO.File]::ReadAllText($Path) | ConvertFrom-Json).legId) } catch { '' }
+    if ($legId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$') { $legId = [IO.Path]::GetFileNameWithoutExtension($Path) }
+    $legId
+}
+
 # The planned legs: name, spec path, backend ('' = whatever the spec lists). Same naming as Invoke-VenueChain.
 $plan = [System.Collections.Generic.List[object]]::new()
-if ($LegSet) {
+$planRecord = $null
+if ($legPlanMode) {
+    # LEASE-BATCH-MULTI-BUILD-1 (item 9): read the plan, validate EVERY item (shape first, then each build staged with that manifest), then order it.
+    $planPath = $(if (Test-Path -LiteralPath $LegPlan -PathType Leaf) { (Resolve-Path -LiteralPath $LegPlan).Path } else { $null })
+    if (-not $planPath) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "no plan file at '$LegPlan'" }
+    $doc = try { [IO.File]::ReadAllText($planPath) | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
+    $rawItems = $(if ($doc -is [array]) { $doc } elseif ($null -ne $doc -and $doc.PSObject.Properties['legs']) {
+            if ($doc.PSObject.Properties['schema'] -and [string]$doc.schema -cne 'mlv-app/venue-lease-leg-plan/v1') { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "schema '$($doc.schema)' is not mlv-app/venue-lease-leg-plan/v1" }
+            $doc.legs
+        } else { $null })
+    $rawItems = @($rawItems | Where-Object { $null -ne $_ })
+    if ($rawItems.Count -eq 0) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' names no legs (an array of items, or an object with a legs array)" }
+    $planDir = Split-Path -Parent $planPath
+    $items = [System.Collections.Generic.List[object]]::new()
+    for ($i = 0; $i -lt $rawItems.Count; $i++) {
+        $it = $rawItems[$i]; $n = $i + 1
+        if ($it -isnot [System.Management.Automation.PSCustomObject]) { Stop-PlanRefused 'BAD_ITEM_SHAPE' $n 'an item is an object {legSpec, backend, sourceCommit, buildManifestSha256, arm}' }
+        $sc = [string]$it.sourceCommit; $ms = [string]$it.buildManifestSha256; $be = [string]$it.backend; $arm = [string]$it.arm; $ref = [string]$it.legSpec
+        # the scalar form's own patterns (ValidatePattern, case-insensitive) and backend set
+        if ($sc -notmatch '^[0-9a-f]{40}$') { Stop-PlanRefused 'BAD_SOURCE_COMMIT' $n "sourceCommit '$sc' is not 40 hex" }
+        if ($ms -notmatch '^[0-9a-f]{64}$') { Stop-PlanRefused 'BAD_MANIFEST_SHA256' $n "buildManifestSha256 '$ms' is not 64 hex" }
+        if ($be -notin @('cuda', 'cpu')) { Stop-PlanRefused 'BAD_BACKEND' $n "backend '$be' is not cuda or cpu" }
+        if ($arm -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$') { Stop-PlanRefused 'BAD_ARM' $n "arm '$arm' is not a label of 1-32 of [A-Za-z0-9._-]" }
+        $path = $(if ($ref) { Resolve-LegSpecPath $ref $planDir } else { $null })
+        if (-not $path) { Stop-PlanRefused 'LEG_SPEC_MISSING' $n "no leg spec at '$ref'" }
+        $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
+    }
+    # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
+    $builds = [ordered]@{}
+    foreach ($it in $items) {
+        if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -TimeoutSec 30 }
+        $st = $builds[$it.sourceCommit]
+        $short = $it.sourceCommit.Substring(0, 12)
+        if ($st.state -ceq 'UNREACHABLE') { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
+        if ($st.state -cne 'STAGED') { Stop-PlanRefused 'BUILD_NOT_STAGED' $it.item "no staged build manifest for $short at $($st.path); the runner stages and builds nothing" }
+        if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
+    }
+    $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
+    foreach ($it in $ordered) {
+        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
+                arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item })
+    }
+    $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
+        legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
+        builds = @($builds.Keys | ForEach-Object { [ordered]@{ sourceCommit = $_; state = $builds[$_].state; sha256 = $builds[$_].sha256; path = $builds[$_].path } }) }
+    [IO.File]::WriteAllText((Join-Path $RunDir 'leg-plan.json'), ($planRecord | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false))
+} elseif ($LegSet) {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
     $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
     foreach ($e in $sp.plan) { $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend }) }
 } else {
     foreach ($ref in $LegSpec) {
-        $path = $(if (Test-Path -LiteralPath $ref -PathType Leaf) { $ref } elseif (Test-Path -LiteralPath (Join-Path $here "legs\$ref") -PathType Leaf) { Join-Path $here "legs\$ref" } else { Stop-Usage "no leg spec at '$ref'" })
-        $path = (Resolve-Path -LiteralPath $path).Path
-        $legId = try { [string](([IO.File]::ReadAllText($path) | ConvertFrom-Json).legId) } catch { '' }
-        if ($legId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$') { $legId = [IO.Path]::GetFileNameWithoutExtension($path) }
+        $path = Resolve-LegSpecPath $ref ''
+        if (-not $path) { Stop-Usage "no leg spec at '$ref'" }
+        $legId = Get-LegSpecId $path
         for ($r = 1; $r -le $Repeats; $r++) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })
         }
     }
+}
+# The scalar form's one build rides on every leg, so each leg is launched with its own build in either form.
+if (-not $legPlanMode) { foreach ($p in $plan) { $p | Add-Member -NotePropertyName sourceCommit -NotePropertyValue $SourceCommit; $p | Add-Member -NotePropertyName buildManifestSha256 -NotePropertyValue $BuildManifestSha256 } }
+
+function Add-PlanIdentity([object]$Row, [object]$Leg) {
+    # LEASE-BATCH-MULTI-BUILD-1 (item 9c): a -LegPlan leg's batch row names its own leg, arm, backend and build. A scalar run's rows are left as they were.
+    if (-not $legPlanMode) { return }
+    foreach ($k in 'name', 'arm', 'backend', 'sourceCommit', 'buildManifestSha256') { $Row | Add-Member -NotePropertyName $k -NotePropertyValue $Leg.$k -Force }
 }
 
 function Format-Mean($m) { if ($null -eq $m) { 'UNKNOWN' } else { '{0:0.0}' -f $m } }
@@ -282,11 +377,12 @@ foreach ($l in @(Read-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -SinceU
 function Set-Stop([string]$Reason, [int]$Code) { $script:stopReason = $Reason; if ($script:exitCode -eq 0 -or $script:exitCode -eq 7) { $script:exitCode = $Code } }
 function Add-Result([object]$Leg, [string]$Status, [hashtable]$Extra) {
     $r = [ordered]@{ name = $Leg.name; spec = $Leg.spec; backend = $Leg.backend; status = $Status }
+    if ($legPlanMode) { $r.arm = $Leg.arm; $r.sourceCommit = $Leg.sourceCommit; $r.buildManifestSha256 = $Leg.buildManifestSha256 }
     foreach ($k in $Extra.Keys) { $r[$k] = $Extra[$k] }
     $results.Add([pscustomobject]$r)
 }
 
-L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript"
+L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
 
 while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     if ([DateTime]::UtcNow -ge $deadline) { Set-Stop 'DEADLINE' 3; break }
@@ -448,10 +544,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($cl) { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "before leg $($leg.name): $($cl.detail)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=leg $($cl.detail)"; break }
                 $b.legsAttempted++
                 $out = Join-Path $RunDir "leg-$($leg.name)-b$('{0:00}' -f $batchNo)-a$attempt.out.txt"
-                $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $SourceCommit, '-BuildManifestSha256', $BuildManifestSha256, '-LeaseBatch', $token)
+                $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $leg.sourceCommit, '-BuildManifestSha256', $leg.buildManifestSha256, '-LeaseBatch', $token)
                 if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
                 if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
-                L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })"
+                L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })$(if ($legPlanMode) { " arm=$($leg.arm) sourceCommit=$($leg.sourceCommit) buildManifestSha256=$($leg.buildManifestSha256)" })"
                 $tLeg = [DateTime]::UtcNow
                 # r3 (sol r2 B2): the leg runs only while the lease does. It is a bounded child: still running at the lease's end, it is killed with its whole
                 # process tree (Kill($true), Invoke-VenueBoundedProcess) and typed LEASE_EXPIRED below. The agent stops its job at the same bound (lease-batch r3).
@@ -477,6 +573,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $cx = $(if ($legJobId) { Request-VenueJobCancel -AgentShare $AgentShare -JobId $legJobId } else { [pscustomobject]@{ state = 'UNKNOWN'; error = 'the leg printed no job id' } })
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state }
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEASE_EXPIRED' $row; $pending.RemoveAt(0)
+                    Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) was still running at the lease's end ($legSec s, bound $legBoundSec s): killed with its process tree; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
                     L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) (killed with its process tree at the lease's end)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
@@ -486,6 +583,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     # Invoke-VenueLeg exits 0 whenever it wrote a receipt; non-zero means it died without one. Not evidence: LEG_FAILED, the run goes on.
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec }
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEG_FAILED' $row; $pending.RemoveAt(0)
+                    Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "LEG $($leg.name) LEG_FAILED batch=$batchNo exit=$legCode outcome=INVALID printedOutcome=$outcome (the leg exited non-zero: no usable receipt)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     continue
@@ -520,6 +618,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     # The leg's own <= 20 % re-check at its start failed: it never played. Retry INSIDE the same lease (on a lost or demoted lease, in the next batch).
                     $b.retries++; $b.legRetries++
                     $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef; withdraw = $withdraw })
+                    Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT receipt=$receipt onLease=$onLease $leaseWhy"
                     if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
                     continue
@@ -537,6 +636,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($agentStop) { $row['leaseStop'] = $agentStop }
                 if ($withdraw) { $row['withdraw'] = $withdraw }
                 $b.legs.Add([pscustomobject]$row); Add-Result $leg 'RAN' $row; $pending.RemoveAt(0)
+                Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                 $b.legsRan++; if ($counted) { $b.legsCounted++ }
                 L "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
                 if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
@@ -618,6 +718,7 @@ $summary = [ordered]@{
     leaseExpired = @($results | Where-Object { $_.status -ceq 'LEASE_EXPIRED' }).Count
     batches = @($batches | ForEach-Object { [ordered]@{ batch = $_.batch; token = $_.token; leaseId = $_.leaseId; endReason = $_.endReason; legsAttempted = $_.legsAttempted; legsRan = $_.legsRan; legsCounted = $_.legsCounted; retries = $_.retries } })
 }
+if ($legPlanMode) { $summary.legPlan = [ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
 $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
 Add-Content -LiteralPath $batchLog -Value $resultLine
 Write-Output $resultLine

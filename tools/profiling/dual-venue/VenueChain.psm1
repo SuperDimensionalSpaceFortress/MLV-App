@@ -926,6 +926,28 @@ function Read-VenueLeaseBatchReceipt {
     [pscustomobject]@{ state = 'ABSENT'; record = $null; error = "no line for lease $LeaseId among $($lines.Count)" }
 }
 
+function Get-VenueInterleavedLegPlan {
+    <#
+    .SYNOPSIS
+    LEASE-BATCH-MULTI-BUILD-1: a lease-batch leg plan with its arms INTERLEAVED (A B A B ...) instead of run in blocks, so lease position and venue heat fall on
+    every arm alike. Arms are taken in order of first appearance, one leg each per round, each arm's legs keeping their own order; an arm with more legs than the
+    others runs its remainder at the end (A A A B -> A B A A). Every item is returned once; nothing is added or dropped.
+    .OUTPUTS
+    The -Items objects, reordered.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items)
+    $queues = [ordered]@{}
+    foreach ($it in $Items) {
+        $arm = [string]$it.arm
+        if (-not $queues.Contains($arm)) { $queues[$arm] = [System.Collections.Generic.Queue[object]]::new() }
+        $queues[$arm].Enqueue($it)
+    }
+    $left = $Items.Count
+    while ($left -gt 0) {
+        foreach ($q in $queues.Values) { if ($q.Count -gt 0) { $q.Dequeue(); $left-- } }
+    }
+}
+
 function Get-VenueLegPreLoadMean {
     <#
     .SYNOPSIS
@@ -1050,5 +1072,5 @@ Export-ModuleMember -Function Get-VenueDriverScriptMissing, Get-VenueMainRoot, G
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait,
     Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Start-VenueJobLiveness, Stop-VenueJobLiveness

@@ -1010,6 +1010,165 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual(json.loads(out.stdout), {"found": "L1", "absent": "ABSENT", "bad": "UNKNOWN", "rec": "closed", "none": "ABSENT", "nofile": "ABSENT"})
 
 
+# LEASE-BATCH-MULTI-BUILD-1: a wrapper around fake-leg.ps1 that records the build, backend and spec each leg was called with, then runs the fake leg unchanged.
+FAKE_LEG_ARGS = r"""
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '')
+Add-Content -LiteralPath $env:FAKE_LEG_ARGS -Value (([ordered]@{ leaf = [IO.Path]::GetFileNameWithoutExtension($LegSpec); sourceCommit = $SourceCommit; buildManifestSha256 = $BuildManifestSha256; backend = $Backend; leaseBatch = $LeaseBatch }) | ConvertTo-Json -Compress)
+& (Join-Path $PSScriptRoot 'fake-leg.ps1') @PSBoundParameters
+exit $LASTEXITCODE
+"""
+
+
+@requires_windows_pwsh
+class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
+    """LEASE-BATCH-MULTI-BUILD-1: one batched lease carries legs of more than one build and backend (-LegPlan), validated before the lease is requested, and
+    an interleaving order (A B A B) across arms. Same fakes and seams as the runner tests above; nothing reaches a venue."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        (cls.tmp / "fake-leg-args.ps1").write_text(FAKE_LEG_ARGS, encoding="utf-8")
+        cls.commit_a, cls.commit_b = "1" * 40, "2" * 40
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.leg_args = self.case / "leg-args.jsonl"
+        # two builds staged in the venue's cache, by the path Invoke-VenueLeg hashes
+        self.manifests = {c: self.stage(c, f"build {c[:1]}") for c in (self.commit_a, self.commit_b)}
+
+    def stage(self, commit: str, body: str) -> str:
+        cache = self.share / "cache"
+        cache.mkdir(exist_ok=True)
+        p = cache / f"playback-attr-3-cuda-{commit[:12]}-build.json"
+        p.write_text(json.dumps({"sourceCommit": commit, "body": body}), encoding="utf-8")
+        import hashlib
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    def item(self, spec: Path, arm: str, commit: str, backend: str = "cpu", manifest: str | None = None) -> dict:
+        return {"legSpec": str(spec), "backend": backend, "sourceCommit": commit, "buildManifestSha256": manifest or self.manifests[commit], "arm": arm}
+
+    def write_plan(self, items: list[dict]) -> Path:
+        p = self.case / "plan.json"
+        p.write_text(json.dumps({"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": items}), encoding="utf-8")
+        return p
+
+    def plan_cmd(self, plan: Path, *extra: str, **env: str) -> tuple[list[str], dict]:
+        e = dict(os.environ)
+        e.update({"FAKE_EVENTS": str(self.events), "FAKE_SHARE": str(self.share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case),
+                  "FAKE_LEG_ARGS": str(self.leg_args)})
+        e.update(env)
+        defaults = {"-LegBudgetSec": "60", "-LeaseMarginSec": "0", "-ClaimPollSec": "1", "-RecheckSec": "1",
+                    "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
+        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-LegPlan", str(plan),
+                "-RunDir", str(self.run_dir), "-ClaimDir", str(self.claims),
+                "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg-args.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
+                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *extra]
+        return args, e
+
+    def run_plan(self, plan: Path, *extra: str, **env: str) -> subprocess.CompletedProcess:
+        args, e = self.plan_cmd(plan, *extra, **env)
+        return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+
+    def leg_calls(self) -> list[dict]:
+        return [json.loads(l) for l in self.leg_args.read_text(encoding="utf-8").splitlines() if l.strip()] if self.leg_args.exists() else []
+
+    def ab_block_plan(self) -> Path:
+        # block order on purpose (A A B B): -PlanOrder Interleave must run it A B A B
+        a, b = self.commit_a, self.commit_b
+        return self.write_plan([self.item(self.specs[0], "A", a, "cpu"), self.item(self.specs[1], "A", a, "cpu"),
+                                self.item(self.specs[0], "B", b, "cuda"), self.item(self.specs[1], "B", b, "cuda")])
+
+    def test_two_builds_interleaved_in_one_lease_each_row_carrying_its_own_build(self) -> None:
+        # RED on 3723b76d: the runner has no -LegPlan (one build per call, so an A/B pair takes a lease per build).
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        k = self.kinds()
+        opens = [x for x in k if x.startswith("OPEN:")]
+        self.assertEqual(len(opens), 1, f"ONE lease request for both builds: {k}")
+        token = opens[0].split(":")[1]
+        self.assertEqual(k, [f"OPEN:{token}", "QUIET:QUIET", f"LEG:fx-a:{token}", "QUIET:QUIET", f"LEG:fx-a:{token}",
+                             "QUIET:QUIET", f"LEG:fx-b:{token}", "QUIET:QUIET", f"LEG:fx-b:{token}", f"CLOSE:{token}"])
+        a, b = self.commit_a, self.commit_b
+        want = [("fx-a", "A", a, "cpu"), ("fx-a", "B", b, "cuda"), ("fx-b", "A", a, "cpu"), ("fx-b", "B", b, "cuda")]
+        # each leg process was handed its own build and backend
+        calls = self.leg_calls()
+        self.assertEqual([(c["leaf"], c["sourceCommit"], c["buildManifestSha256"], c["backend"], c["leaseBatch"]) for c in calls],
+                         [(leaf, c, self.manifests[c], be, token) for leaf, _arm, c, be in want])
+        # each batch row and each run result records its own build, backend and arm, in A B A B order
+        [bt] = self.batches()
+        self.assertEqual((bt["endReason"], bt["legsRan"], bt["legsCounted"], bt["leaseId"]), ("ALL_LEGS_DONE", 4, 4, "lease-1"))
+        self.assertEqual([(l["arm"], l["sourceCommit"], l["buildManifestSha256"], l["backend"]) for l in bt["legs"]],
+                         [(arm, c, self.manifests[c], be) for _leaf, arm, c, be in want])
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["counted"], res["legPlan"]["order"]), (4, 4, "Interleave"))
+        self.assertEqual([(l["name"], l["arm"], l["sourceCommit"], l["buildManifestSha256"], l["backend"]) for l in res["legs"]],
+                         [(f"{i + 1:02d}-{leaf}-{be}-{arm}", arm, c, self.manifests[c], be) for i, (leaf, arm, c, be) in enumerate(want)])
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn(f"LEG 02-fx-a-cuda-B RUN batch=1 ", log)
+        self.assertIn(f" arm=B sourceCommit={b} buildManifestSha256={self.manifests[b]}", log)
+        # the validated, ordered plan is kept beside the receipts
+        kept = json.loads((self.run_dir / "leg-plan.json").read_text(encoding="utf-8"))
+        self.assertEqual([x["arm"] for x in kept["legs"]], ["A", "B", "A", "B"])
+        self.assertEqual(sorted((s["sourceCommit"], s["state"]) for s in kept["builds"]), [(a, "STAGED"), (b, "STAGED")])
+
+    def test_the_plan_runs_as_given_without_the_interleave_option(self) -> None:
+        r = self.run_plan(self.ab_block_plan())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [bt] = self.batches()
+        self.assertEqual([l["arm"] for l in bt["legs"]], ["A", "A", "B", "B"])
+        self.assertEqual(batch_result(r.stdout)["legPlan"]["order"], "AsGiven")
+
+    def test_a_build_that_is_not_staged_is_refused_before_the_lease_is_requested(self) -> None:
+        unstaged = "3" * 40
+        plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[0], "B", unstaged, manifest="c" * 64)])
+        r = self.run_plan(plan, "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=BUILD_NOT_STAGED item=2 ", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted (no open, no probe, no leg) when one build is not staged")
+        self.assertFalse((self.run_dir / "batches.jsonl").exists())
+        self.assertFalse(self.claim_path.exists())
+
+    def test_every_item_is_validated_before_the_lease(self) -> None:
+        a = self.commit_a
+        bad = {
+            "BUILD_MANIFEST_MISMATCH": self.item(self.specs[0], "B", a, manifest="d" * 64),
+            "BAD_BACKEND": self.item(self.specs[0], "B", a, backend="metal"),
+            "BAD_SOURCE_COMMIT": self.item(self.specs[0], "B", "xyz", manifest=self.manifests[a]),
+            "BAD_MANIFEST_SHA256": self.item(self.specs[0], "B", a, manifest="e" * 63),
+            "BAD_ARM": self.item(self.specs[0], "", a),
+            "LEG_SPEC_MISSING": self.item(self.case / "no-such-spec.json", "B", a),
+        }
+        for reason, item in bad.items():
+            with self.subTest(reason=reason):
+                r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", a), item]))
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(f"LEG_PLAN_REFUSED reason={reason} item=2 ", r.stderr)
+                self.assertEqual(self.kinds(), [])
+
+    def test_the_plan_and_the_scalar_form_are_mutually_exclusive(self) -> None:
+        args, e = self.plan_cmd(self.ab_block_plan(), "-SourceCommit", SHA)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.kinds(), [])
+
+    def test_the_interleave_helper(self) -> None:
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            "function P([string]$arms) { @($arms.ToCharArray() | ForEach-Object -Begin { $i = 0 } -Process { $i++; [pscustomobject]@{ arm = [string]$_; n = $i } }) }\n"
+            "function S($items) { (@(Get-VenueInterleavedLegPlan -Items $items) | ForEach-Object { \"$($_.arm)$($_.n)\" }) -join ' ' }\n"
+            "[ordered]@{ block = S (P 'AABB'); uneven = S (P 'AAAB'); three = S (P 'AABBCC'); one = S (P 'AAA'); mixed = S (P 'ABBA') } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"block": "A1 B3 A2 B4", "uneven": "A1 B4 A2 A3", "three": "A1 B3 C5 A2 B4 C6", "one": "A1 A2 A3", "mixed": "A1 B2 A4 B3"})
+
+
+# the runner cases are inherited only for their fixtures: they run once, in their own class (unittest collects callable test_* attributes only)
+for _name in [n for n in vars(VenueLeaseBatchRunnerTests) if n.startswith("test_")]:
+    setattr(VenueLeaseBatchLegPlanTests, _name, None)
+del _name
+
+
 # 2026-10-25 LEASE-BATCH-LEASE-END-TZ-1: the agent's result reaches the runner through ConvertFrom-Json, which on PowerShell 7 turns "endedUtc": "...Z" into a
 # [DateTime] of Kind Utc. Get-LeaseEndUtc used to run it through [string] + DateTimeOffset.Parse, which drops the Kind and assumes the HOST's local offset, so on a
 # Central host every lease end landed 5 h early (roomSec=-15301) and no leg ever started. CI hosts are UTC (offset 0), where the old code passes, so the behavioural
