@@ -40,6 +40,10 @@ class BachelorAgentTimestampTzPins(unittest.TestCase):
         # The shape that moved a time by the host offset: Parse([string]$x) where $x came back from ConvertFrom-Json.
         offenders = re.findall(r"\[(?:DateTimeOffset|DateTime|datetime)\]::(?:Parse|ParseExact)\(\s*\[string\]", self.code)
         self.assertEqual(offenders, [], "a JSON timestamp is read by ConvertTo-UtcDateTime, never cast to [string] and parsed")
+        # The same loss spelled with an interpolated string: [datetime]"$x" and Parse("$($x)"). The behaviour test below is the
+        # backstop for any other spelling (it swaps four of them into the helper and requires the site cases to fail).
+        spelled = re.findall(r"\[(?:datetime|DateTime)\]\s*\"|\[(?:DateTimeOffset|DateTime|datetime)\]::(?:Parse|ParseExact)\(\s*\"", self.code)
+        self.assertEqual(spelled, [], "no timestamp is read through an interpolated string either")
 
     def test_the_restart_and_adopt_path_uses_the_helper(self) -> None:
         body = self.code[self.code.index("function Invoke-AdoptStartedJob"):]
@@ -71,23 +75,47 @@ class BachelorAgentTimestampTzPins(unittest.TestCase):
         self.assertNotIn("[string]$", helper, "the helper never casts a value through [string]")
 
 
-@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+POWERSHELL_51 = shutil.which("powershell.exe")
+FORCED_OFFSETS = {"utc-5": -300, "utc+5:30": 330}
+SPELLING_MUTANTS = ("dto-parse-string-cast", "datetime-parse-string-cast", "datetime-cast-interpolated", "dto-parse-interpolated")
+
+
 @unittest.skipUnless(os.name == "nt", "runs the Windows agent's PowerShell functions")
 class BachelorAgentTimestampTzBehaviour(unittest.TestCase):
-    def test_every_shape_reads_as_utc_at_every_site(self) -> None:
-        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(TZ_TEST)],
-                              capture_output=True, text=True, timeout=300)
+    def _run_matrix(self, exe: str) -> None:
+        # The .ps1 forces the zone of its own child processes (UTC-5 and UTC+5:30) and fails if the effective offset is zero,
+        # so this holds on a UTC runner too.
+        proc = subprocess.run([exe, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(TZ_TEST)],
+                              capture_output=True, text=True, timeout=600)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         out = json.loads(proc.stdout)
         self.assertEqual(out["status"], "PASS")
-        self.assertEqual(out["helper"]["kinds"], "ok")
-        # The restart-and-adopt path: past its deadline a job is killed at once, whatever shape its startedUtc came back in.
-        for shape in ("json-readback", "z-string", "plus0-string", "no-offset"):
-            self.assertEqual(out["adopt"][f"expired-{shape}"], "adopted/killed=True", shape)
-            self.assertEqual(out["adopt"][f"inside-{shape}"], "adopted/killed=False", shape)
-        self.assertEqual(out["adopt"]["missing"], "threw/killed=False")
-        self.assertEqual(out["findChild"]["bad-"], "unknown")
-        self.assertEqual(out["queueAge"]["missing"], 400)
+        self.assertEqual(sorted(out["offsets"]), sorted(FORCED_OFFSETS))
+        for name, minutes in FORCED_OFFSETS.items():
+            one = out["offsets"][name]
+            self.assertEqual(one["forcedOffsetMinutes"], minutes)
+            self.assertEqual(one["effectiveOffsetMinutes"], minutes, "the forced zone is the one in effect, not the host's")
+            self.assertEqual(one["helper"]["kinds"], "ok")
+            # The restart-and-adopt path: past its deadline a job is killed at once, whatever shape its startedUtc came back in.
+            for shape in ("json-readback", "z-string", "plus0-string", "no-offset"):
+                self.assertEqual(one["adopt"][f"expired-{shape}"], "adopted/killed=True", f"{name} {shape}")
+                self.assertEqual(one["adopt"][f"inside-{shape}"], "adopted/killed=False", f"{name} {shape}")
+            self.assertEqual(one["adopt"]["missing"], "threw/killed=False")
+            self.assertEqual(one["findChild"]["bad-"], "unknown")
+            # The fixture creates the job 400 s old and the case reads its age a moment later, so the age is 400 plus the
+            # time the run took in between (a slow runner or an edition start-up adds seconds); the .ps1 itself allows 15 s.
+            self.assertAlmostEqual(one["queueAge"]["missing"], 400, delta=15)
+        # Each wrong spelling swapped into the agent's helper is failed by the site cases at both offsets.
+        for key in (f"{spelling}@{name}" for spelling in SPELLING_MUTANTS for name in FORCED_OFFSETS):
+            self.assertEqual(out["spellingMutants"][key], "caught", key)
+
+    @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+    def test_every_shape_reads_as_utc_at_every_site_pwsh7(self) -> None:
+        self._run_matrix(PWSH)
+
+    @unittest.skipIf(POWERSHELL_51 is None, "powershell.exe is not on PATH")
+    def test_every_shape_reads_as_utc_at_every_site_windows_powershell_51(self) -> None:
+        self._run_matrix(POWERSHELL_51)
 
 
 if __name__ == "__main__":
