@@ -35,6 +35,9 @@ jobs:
       run: |
         test -x "${{ env.QTDIR }}/qmake"
         "${{ env.QTDIR }}/qmake" -v
+        "${{ env.QTDIR }}/qmake" -query QT_VERSION
+        QT_VERSION="$("${{ env.QTDIR }}/qmake" -query QT_VERSION)"
+        case "$QT_VERSION" in 6.*) ;; *) echo "::error::Qt major version must be 6, got $QT_VERSION"; exit 1 ;; esac
         LLVM_CXX="$(brew --prefix llvm)/bin/clang++"
         test -x "$LLVM_CXX"
         "$LLVM_CXX" --version

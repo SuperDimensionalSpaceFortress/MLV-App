@@ -48,7 +48,6 @@
       "No payload has a hash-bound provenance promotion receipt plus a registered provider-verified repository-owner redistribution approval claim.",
       "No independently verified upstream checksum or reproducible build recipe is recorded for every executable payload.",
       "Only the Linux FFmpeg archive contains a redistributable license text; the other consumed archives lack complete bundled notices.",
-      "The macOS Arm64 release consumes the x86_64-only ffmpegOSX.zip payload.",
       "The exact raw2mlv source commits, versions, licenses, and build recipes are not locally recoverable.",
       "The local qmake Linux and macOS install rules retain legacy extraction until a portable pinned-Python discovery contract can fail closed without breaking supported local builds."
     ]

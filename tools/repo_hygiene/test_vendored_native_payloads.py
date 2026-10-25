@@ -262,6 +262,57 @@ class VendoredNativePayloadTests(unittest.TestCase):
         self.assertEqual(arm_consumer["reference_marker"], "ffmpegOSXarm.zip")
         self.assertIn("--payload-id ffmpeg-macos-arm64", arm_consumer["operation_marker"])
 
+    @staticmethod
+    def _stale_arm64_consumer_blockers(manifest: dict) -> list[str]:
+        # A blocker naming the x86_64 archive as the macOS Arm64 release consumer is only
+        # true while the arm64 consumer row points at an x86_64 payload.
+        arm_consumer_machines = {
+            member["binary"]["machine"]
+            for record in manifest["payloads"]
+            for consumer in record["consumers"]
+            if consumer["target"] == "macos-arm64" and record["id"].startswith("ffmpeg-")
+            for member in record["selected_members"]
+        }
+        if arm_consumer_machines != {"arm64"}:
+            return []
+        return [
+            blocker
+            for blocker in manifest["redistribution_readiness"]["blockers"]
+            if re.search(r"(?i)arm64.*(?:x86_64|ffmpegOSX\.zip)|(?:x86_64|ffmpegOSX\.zip).*arm64", blocker)
+        ]
+
+    def test_redistribution_blockers_do_not_name_x86_64_ffmpeg_as_arm64_release_consumer(self) -> None:
+        # r6 G1: r5 moved the Arm64 release to ffmpeg-macos-arm64, so the old blocker
+        # "The macOS Arm64 release consumes the x86_64-only ffmpegOSX.zip payload." is false.
+        self.assertEqual(self._stale_arm64_consumer_blockers(self.manifest), [])
+        reintroduced = copy.deepcopy(self.manifest)
+        reintroduced["redistribution_readiness"]["blockers"].append(
+            "The macOS Arm64 release consumes the x86_64-only ffmpegOSX.zip payload."
+        )
+        self.assertEqual(
+            self._stale_arm64_consumer_blockers(reintroduced),
+            ["The macOS Arm64 release consumes the x86_64-only ffmpegOSX.zip payload."],
+        )
+
+    def test_real_manifest_swapback_of_arm64_consumer_to_x86_64_is_rejected_for_architecture(self) -> None:
+        # VENDORED-ARM64-SWAPBACK-NEGATIVE-1: workflow AND manifest both moved back to the
+        # x86_64 archive with status active-release-workflow. The payload-id sets then agree,
+        # so the only thing left to reject it is the architecture policy (the workflow side
+        # of the swap is modelled by _workflow_payload_ids returning the swapped set).
+        swapped = copy.deepcopy(self.manifest)
+        arm = next(record for record in swapped["payloads"] if record["id"] == "ffmpeg-macos-arm64")
+        intel = next(record for record in swapped["payloads"] if record["id"] == "ffmpeg-macos-x86_64")
+        moved = next(row for row in arm["consumers"] if row["target"] == "macos-arm64")
+        arm["consumers"] = [row for row in arm["consumers"] if row is not moved]
+        moved["status"] = "active-release-workflow"
+        intel["consumers"].append(moved)
+        with mock.patch(
+            "tools.repo_hygiene.vendored_native_payloads._workflow_payload_ids",
+            return_value={"ffmpeg-macos-x86_64", "raw2mlv-macos-arm64"},
+        ):
+            with self.assertRaisesRegex(PayloadIntegrityError, "required architecture arm64.*'x86_64'"):
+                _validate_release_target_compatibility(self.root, swapped, "macos-arm64")
+
     def test_arm64_release_target_admits_arm64_ffmpeg_and_rejects_x86_64_ffmpeg(self) -> None:
         arm = validate(ROOT, required_target="macos-arm64")
         admitted_arm = arm["target_compatibility"]
@@ -1748,6 +1799,15 @@ class VendoredNativePayloadTests(unittest.TestCase):
             "Verify vendored native payload integrity",
             "Build",
         )
+        qt_major_guard = (
+            'case "$QT_VERSION" in 6.*) ;; '
+            '*) echo "::error::Qt major version must be 6, got $QT_VERSION"; exit 1 ;; esac'
+        )
+        qt_major_probe_lines = (
+            '"${{ env.QTDIR }}/qmake" -query QT_VERSION',
+            'QT_VERSION="$("${{ env.QTDIR }}/qmake" -query QT_VERSION)"',
+            qt_major_guard,
+        )
         expected_verify_lines = (
             'test -x "${{ env.QTDIR }}/qmake"',
             '"${{ env.QTDIR }}/qmake" -v',
@@ -1755,6 +1815,14 @@ class VendoredNativePayloadTests(unittest.TestCase):
             'test -x "$LLVM_CXX"',
             '"$LLVM_CXX" --version',
         )
+        # Intel stays on Qt 5 and has no major guard; the Arm64 release (Qt 6) carries the
+        # same guard as the compile-only canary (r6, hub ACK 6393835298 item 2).
+        expected_verify_lines_by_workflow = {
+            '.github/workflows/macOS-Intel.yml': expected_verify_lines,
+            '.github/workflows/macOS-Arm64.yml': expected_verify_lines[:2]
+            + qt_major_probe_lines
+            + expected_verify_lines[2:],
+        }
         permissive_shell = re.compile(
             r"(?im)(?:\|\|\s*(?:true|:)(?:\s|$)|(?:;|&&)\s*true(?:\s|$)|"
             r"^\s*set\s+\+(?:e|o\s+errexit)\b)"
@@ -1789,7 +1857,7 @@ class VendoredNativePayloadTests(unittest.TestCase):
                     break
             return tuple(commands)
 
-        def assert_fail_closed_policy(text: str, brew_line: str) -> None:
+        def assert_fail_closed_policy(text: str, brew_line: str, verify_lines: tuple[str, ...]) -> None:
             self.assertNotRegex(text, r"(?im)^\s*continue-on-error\s*:")
             steps = named_step_blocks(text)
             names = [name for name, _ in steps]
@@ -1804,7 +1872,7 @@ class VendoredNativePayloadTests(unittest.TestCase):
             self.assertIn(brew_line, install_block)
             self.assertNotRegex(install_block, permissive_shell)
             self.assertNotRegex(verify_block, permissive_shell)
-            self.assertEqual(normalized_run_lines(verify_block), expected_verify_lines)
+            self.assertEqual(normalized_run_lines(verify_block), verify_lines)
 
         # Intel stays on Qt 5 (qt@5); the Arm64 release workflow moved to Qt 6 (brew `qt`).
         expected_brew_lines = {
@@ -1814,7 +1882,8 @@ class VendoredNativePayloadTests(unittest.TestCase):
         for relative, brew_line in expected_brew_lines.items():
             with self.subTest(workflow=relative):
                 text = (ROOT / relative).read_text(encoding="utf-8")
-                assert_fail_closed_policy(text, brew_line)
+                verify_lines = expected_verify_lines_by_workflow[relative]
+                assert_fail_closed_policy(text, brew_line, verify_lines)
 
                 falsifiers = (
                     (
@@ -1846,10 +1915,18 @@ class VendoredNativePayloadTests(unittest.TestCase):
                         ),
                     ),
                 )
+                if relative.endswith('macOS-Arm64.yml'):
+                    falsifiers += (
+                        ('qt major guard removed', text.replace(qt_major_guard, 'true', 1)),
+                        ('qt major guard accepts any version', text.replace('in 6.*)', 'in *)', 1)),
+                        ('qt major guard accepts qt 5', text.replace('in 6.*)', 'in 5.*|6.*)', 1)),
+                        ('qt major guard cannot fail', text.replace('exit 1 ;;', 'exit 0 ;;', 1)),
+                    )
                 for label, falsified in falsifiers:
                     with self.subTest(workflow=relative, falsifier=label):
+                        self.assertNotEqual(falsified, text)
                         with self.assertRaises(AssertionError):
-                            assert_fail_closed_policy(falsified, brew_line)
+                            assert_fail_closed_policy(falsified, brew_line, verify_lines)
 
         # The compile-only canary has no payload steps, so it gets its own policy: fail
         # closed (no continue-on-error, no masked failures anywhere in its run bodies) and
@@ -1861,10 +1938,6 @@ class VendoredNativePayloadTests(unittest.TestCase):
             "Verify macOS build toolchain",
             "Create build directory",
             "Compile",
-        )
-        qt_major_guard = (
-            'case "$QT_VERSION" in 6.*) ;; '
-            '*) echo "::error::Qt major version must be 6, got $QT_VERSION"; exit 1 ;; esac'
         )
         canary_verify_lines = (
             'test -x "${{ env.QTDIR }}/qmake"',
