@@ -222,17 +222,20 @@ if ($legPlanMode) {
     $planPath = $(if (Test-Path -LiteralPath $LegPlan -PathType Leaf) { (Resolve-Path -LiteralPath $LegPlan).Path } else { $null })
     if (-not $planPath) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "no plan file at '$LegPlan'" }
     $doc = try { [IO.File]::ReadAllText($planPath) | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
-    $rawItems = $(if ($doc -is [array]) { $doc } elseif ($null -ne $doc -and $doc.PSObject.Properties['legs']) {
-            if ($doc.PSObject.Properties['schema'] -and [string]$doc.schema -cne 'mlv-app/venue-lease-leg-plan/v1') { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "schema '$($doc.schema)' is not mlv-app/venue-lease-leg-plan/v1" }
-            $doc.legs
-        } else { $null })
-    $rawItems = @($rawItems | Where-Object { $null -ne $_ })
-    if ($rawItems.Count -eq 0) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' names no legs (an array of items, or an object with a legs array)" }
+    # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
+    $rawItems = $null
+    if ($doc -is [array]) { $rawItems = $doc }
+    elseif ($doc -is [System.Management.Automation.PSCustomObject] -and $doc.PSObject.Properties['legs']) {
+        if ($doc.PSObject.Properties['schema'] -and [string]$doc.schema -cne 'mlv-app/venue-lease-leg-plan/v1') { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "schema '$($doc.schema)' is not mlv-app/venue-lease-leg-plan/v1" }
+        if ($doc.legs -isnot [array]) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'legs' in '$planPath' is not an array (a single leg is a one-item array)" }
+        $rawItems = $doc.legs
+    }
+    if ($null -eq $rawItems -or $rawItems.Count -eq 0) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' names no legs (an array of items, or an object with a legs array)" }
     $planDir = Split-Path -Parent $planPath
     $items = [System.Collections.Generic.List[object]]::new()
     for ($i = 0; $i -lt $rawItems.Count; $i++) {
         $it = $rawItems[$i]; $n = $i + 1
-        if ($it -isnot [System.Management.Automation.PSCustomObject]) { Stop-PlanRefused 'BAD_ITEM_SHAPE' $n 'an item is an object {legSpec, backend, sourceCommit, buildManifestSha256, arm}' }
+        if ($it -isnot [System.Management.Automation.PSCustomObject]) { Stop-PlanRefused 'BAD_ITEM_SHAPE' $n "an item is an object {legSpec, backend, sourceCommit, buildManifestSha256, arm}, not $(if ($null -eq $it) { 'null' } else { $it.GetType().Name }); the whole plan is refused" }
         $sc = [string]$it.sourceCommit; $ms = [string]$it.buildManifestSha256; $be = [string]$it.backend; $arm = [string]$it.arm; $ref = [string]$it.legSpec
         # the scalar form's own patterns (ValidatePattern, case-insensitive) and backend set
         if ($sc -notmatch '^[0-9a-f]{40}$') { Stop-PlanRefused 'BAD_SOURCE_COMMIT' $n "sourceCommit '$sc' is not 40 hex" }
