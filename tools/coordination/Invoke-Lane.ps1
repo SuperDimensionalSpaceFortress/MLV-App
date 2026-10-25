@@ -208,13 +208,18 @@ if (Test-HubHost) {
 #   sol    -- review key A (found 51 blockers fable missed vs 1 the other way, 191 paired reviews)
 #             and co-planner with opus.
 #   luna   -- breadth recon.
-#   astra  -- tie-breaker / design arbiter on contested designs; never xhigh.
+#   astra  -- optional diversity seat (MODEL-POSTURE-2026-10-22, bus R19.1): never a default, never a
+#             gate, never the only Codex seat a procedure waits for; a round using it records
+#             `astra: diversity`. Design-pass and arbiter duties go to the sol tier. Never xhigh.
 $LANES = @{
     opus   = @{ engine = 'claude'; model = 'opus';   effort = 'high'; role = 'orchestrator-design-planner-review-key-b' }
     sonnet = @{ engine = 'claude'; model = 'sonnet'; effort = 'high'; role = 'default-implementer' }
     fable  = @{ engine = 'claude'; model = 'fable';  effort = 'high'; role = 'planning-guidance-fallback-key-b' }
     sol    = @{ engine = 'codex';  tier = 'sol';     effort = 'high'; role = 'review-key-a-co-planner' }
     luna   = @{ engine = 'codex';  tier = 'luna';    effort = 'high'; role = 'breadth-recon' }
+    # LEGACY LABEL: the astra role string below is kept verbatim for receipt compatibility (a
+    # guardrail test pins it). It is a machine-readable label, NOT current routing authority; the
+    # posture is the comment block above (optional diversity seat; design/arbiter duties -> sol).
     astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'tie-breaker-design-arbiter' }
 }
 
@@ -2395,6 +2400,9 @@ $receipt = [ordered]@{
                    elseif ($processEnded) { 'ended-incomplete' }
                    else { 'incomplete' }
     lane         = $Lane
+    # `role` copies the $LANES label. For astra that label (`tie-breaker-design-arbiter`) is a
+    # LEGACY machine-readable value kept for receipt compatibility; a reader must not take it as
+    # current routing authority (astra is an optional diversity seat -- see the $LANES comments).
     role         = $cfg.role
     engine       = $cfg.engine
     # LANE-MODEL-CURRENCY-1: requestedModel is the table's alias/tier (the lane's
