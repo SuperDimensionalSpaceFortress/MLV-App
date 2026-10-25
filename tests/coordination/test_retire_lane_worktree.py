@@ -3677,3 +3677,38 @@ def test_launcher_census_r7_control_writers_stay_one_site(binder):
 ])
 def test_launcher_census_r7_control_an_allowlisted_binder_keeps_the_literal(binder):
     assert _unresolved_sites(_r7(binder)) == [], f"an allowlisted binder made a safe same-scope literal unresolved: {binder!r}"
+
+
+# --- r8 (Dot advisory 6394696125, hub ruling HUB-TICK 20261025T0706Z): splat sources join the rule V allowlist. A splat `@h` has a
+# known key set only when every use of `h` in the file is on the allowlist (a constant-key hashtable literal assigned in the reading
+# scope before the splat; .Add / indexer / member writes with a constant key). Any other use makes the key set unknown, and an unknown
+# splat taints every name. Same benign marker as r7; each shape was run in pwsh and does rebind `$cmd` (run dir proof\r8-runtime-*.ps1).
+def _r8(mutation, splat=_R7_MARKER + " | Tee-Object @h"):
+    return "$cmd = 'Write-Output ok'; $h = @{}; $key = " + _R7_MARKER + "; " + mutation + "; " + splat + "; iex $cmd\n"
+
+
+@pytest.mark.parametrize("mutation", [
+    pytest.param("$h.Add($key, 'cmd')", id="i-add-with-a-dynamic-key"),
+    pytest.param("$h[$key] = 'cmd'", id="ii-indexer-with-a-dynamic-key"),
+    pytest.param("function Fill($t, $k) { $t.Add($k, 'cmd') }; Fill $h $key", id="iii-passed-to-a-function"),
+    pytest.param("$g = $h; $g.Add($key, 'cmd')", id="aliased-by-assignment"),
+    pytest.param("$h | ForEach-Object { $_.Add($key, 'cmd') }", id="piped-into-a-command"),
+    pytest.param("$h.set_Item($key, 'cmd')", id="set-item-with-a-dynamic-key"),
+    pytest.param("$h.psbase.Add($key, 'cmd')", id="reached-through-a-member"),
+    pytest.param("$r = [ref]$h; $r.Value.Add($key, 'cmd')", id="ref"),
+])
+def test_launcher_census_r8_a_splat_source_off_the_allowlist_leaves_the_read_unresolved(mutation):
+    _r5_iex_is_unresolved(_r8(mutation))
+
+
+# Controls: a constant-key literal with no *Variable* key, and constant-key .Add / indexer / member writes, keep the splat's key set
+# known, so a safe same-scope literal stays resolved.
+@pytest.mark.parametrize("mutation", [
+    pytest.param("$h = @{ FilePath = 'x.txt' }", id="constant-key-literal"),
+    pytest.param("$h.Add('Encoding', 'utf8')", id="add-constant-key"),
+    pytest.param("$h['Encoding'] = 'utf8'", id="indexer-constant-key"),
+    pytest.param("$h.Encoding = 'utf8'", id="member-constant-key"),
+])
+def test_launcher_census_r8_control_an_allowlisted_splat_source_keeps_the_literal(mutation):
+    text = _r8(mutation, splat=_R7_MARKER + " | Out-File -FilePath x.txt @h")
+    assert _unresolved_sites(text) == [], f"an allowlisted splat source made a safe same-scope literal unresolved: {text!r}"
