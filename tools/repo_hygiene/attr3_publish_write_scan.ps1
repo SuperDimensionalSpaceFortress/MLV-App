@@ -34,11 +34,36 @@
 # template scan sees such a helper by NAME only (it is a known command), so a raw write into $Pub
 # inside its body used to pass. With -SpliceSource <files> the scan enumerates every
 # Get-AttrCudaEmbeddedFunctionSource call site in those files (every literal -Name; a name list that
-# is not literal, or a name no -ModulePath module defines, is a 'splice' finding, never a silent
-# skip), reads each body with the extractor's own regex, and runs R1 R2 R3 R4 R5 R6 over it exactly as
-# over a template, minus the "$Work assigned once at top level" half of R5 (a function body is not a
-# job). Findings are reported separately as splicedViolations with the function, its module line and
-# the offending token; the template verdict in `violations` is unchanged. The helpers that ARE the
+# is not literal is a 'splice' finding, never a silent skip), reads each body with the extractor's own
+# regex, and runs R1 R2 R3 R4 R5 R6 over it exactly as over a template, minus the "$Work assigned once
+# at top level" half of R5 (a function body is not a job). Findings are reported separately as
+# splicedViolations with the function, its module line and the offending token; the template verdict in
+# `violations` is unchanged.
+#
+# MODULE BINDING (ATTR3-SCAN-COVERAGE-LIMITS-1 L2). A call is resolved against the module the extractor
+# will read for THAT call, not against every -ModulePath module:
+#   - no -ModulePath on the call: the -ModulePath module that defines the extractor itself (the
+#     extractor's default module); when no -ModulePath module defines it, every -ModulePath module is a
+#     candidate;
+#   - a literal -ModulePath ('X.psm1' or Join-Path <anything> 'X.psm1'): the one -ModulePath module with
+#     that file name; none, or more than one, is a 'splice' finding;
+#   - any other -ModulePath expression (a variable): every -ModulePath module is a candidate, so the name
+#     must be defined by exactly one of them;
+#   - a call that splats, or passes a second positional argument (which binds -ModulePath), or repeats
+#     -ModulePath: a 'splice' finding, because its module is unknown.
+# A name the bound module does not define, a name two candidates define, or a module the scan was not
+# given is a 'splice' finding (fail closed): the scan never reads a same-named helper from a module the
+# extractor will not read. A variable -ModulePath is bound only by uniqueness; the text of the temp file
+# a job passes there is not read.
+#
+# PROPERTY SETS IN BODIES (ATTR3-SCAN-COVERAGE-LIMITS-1 L1). `$receiver.Member = ...` is an R5 finding
+# (token = the target text), and in a spliced body each one carries an `origin` for the receiver:
+# 'literal' / 'constructed:<Type>' when EVERY assignment to the receiver variable builds a fresh object
+# (a hashtable, [ordered] or [pscustomobject] literal; New-Object <Type>; [Type]::new), otherwise 'other'
+# (a command or member result, a compound assignment), 'unbound' (a parameter, loop variable or captured
+# variable), 'nested' (`$a.b.c = ...`), 'scoped' or 'complex'. The origin is data for the caller; this
+# script still decides nothing. Index assignments keep the template rule: any target that is not a plain
+# unscoped non-root variable is a finding. The helpers that ARE the
 # runtime boundary (Publish-AttrCuda*, New-AttrCudaDirectory, Remove-AttrCuda*) legitimately hold the
 # raw writes and deletes a template may not, so the policy that decides which findings are accepted
 # lives in the caller (tools/repo_hygiene/test_attr3_spliced_body_scan.py: its inert-member lists and
@@ -75,7 +100,8 @@
 #
 # Output: JSON { templates: [...], violations: [ { source, line, rule, text, reason } ],
 #                spliced: [ { module, name, line, bodyLength, bodySha256, callers } ],
-#                splicedViolations: [ { source, module, function, line, rule, token, text, reason } ] }.
+#                splicedViolations: [ { source, module, function, line, rule, token, origin, text, reason } ] }.
+# `origin` is the receiver origin of an R5 property set (see PROPERTY SETS IN BODIES), '' for every other finding.
 # spliced / splicedViolations are empty unless -SpliceSource is given.
 
 [CmdletBinding()]
@@ -141,11 +167,11 @@ $violations = [System.Collections.Generic.List[object]]::new()
 $scanned = [System.Collections.Generic.List[string]]::new()
 $script:bodyMode = $false
 
-function Add-Violation([string]$Source, $Ast, [string]$Rule, [string]$Reason) {
+function Add-Violation([string]$Source, $Ast, [string]$Rule, [string]$Reason, [string]$Origin = '') {
     $text = ($Ast.Extent.Text -replace '\s+', ' ')
     if ($text.Length -gt 160) { $text = $text.Substring(0, 160) }
     $record = [ordered]@{ source = $Source; line = $Ast.Extent.StartLineNumber; rule = $Rule; text = $text; reason = $Reason }
-    if ($script:bodyMode) { $record['token'] = Get-ViolationToken $Ast }
+    if ($script:bodyMode) { $record['token'] = Get-ViolationToken $Ast; $record['origin'] = $Origin }
     $violations.Add($record)
 }
 
@@ -243,6 +269,57 @@ function Get-AssignmentsTo($Root, [string]$Name) {
         if ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
         ($left -is [System.Management.Automation.Language.VariableExpressionAst]) -and ((Get-VariableName $left).name -ieq $Name)
     }, $true))
+}
+
+function Get-AssignedObjectOrigin($Assignment) {
+    # What one assignment to a local variable binds it to: 'literal' (a hashtable / [ordered] /
+    # [pscustomobject] literal, an in-memory object nothing else holds), 'constructed:<Type>' (New-Object or
+    # [Type]::new), else 'other' (a command result, a parameter default, a compound assignment, ...).
+    if ($Assignment.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) { return 'other' }
+    $node = $Assignment.Right
+    while ($true) {
+        if ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1) { $node = $node.PipelineElements[0]; continue }
+        if ($node -is [System.Management.Automation.Language.CommandExpressionAst]) { $node = $node.Expression; continue }
+        break
+    }
+    if ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) { $node = $node.Child }
+    if ($node -is [System.Management.Automation.Language.HashtableAst]) { return 'literal' }
+    if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Static -and
+        $node.Member.Extent.Text -ceq 'new' -and $node.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
+        return 'constructed:' + $node.Expression.TypeName.FullName
+    }
+    if ($node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ieq 'New-Object') {
+        $typeArgs = Get-NamedArguments $node @('TypeName')
+        $typeElement = $null
+        if ($typeArgs.Count -eq 1 -and $null -ne $typeArgs[0]) { $typeElement = $typeArgs[0] }
+        elseif ($typeArgs.Count -eq 0 -and $node.CommandElements.Count -gt 1 -and $node.CommandElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $typeElement = $node.CommandElements[1] }
+        if ($null -ne $typeElement -and $typeElement -is [System.Management.Automation.Language.StringConstantExpressionAst]) { return 'constructed:' + [string]$typeElement.Value }
+    }
+    return 'other'
+}
+
+function Get-ReceiverOrigin($Target, $Root) {
+    # Where the object on the left of `$receiver.Member = ...` comes from, so the CALLER can tell a property set
+    # on an in-memory object this body just built from one on a foreign object (`$f = Get-Item $Pub; $f.Attributes = ...`).
+    # The scan reports the origin; it does not decide that one is acceptable.
+    #   literal | constructed:<Type>   every assignment to the variable builds a fresh object (';'-joined if mixed)
+    #   other                          some assignment binds a command / member / parameter-derived value
+    #   unbound                        no assignment in the body: a parameter, loop variable or captured variable
+    #   nested | scoped | complex      `$a.b.c = ...`, `$script:a.b = ...`, a receiver that is not a plain variable
+    $node = $Target
+    $depth = 0
+    while ($node -is [System.Management.Automation.Language.MemberExpressionAst]) {
+        if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) { return 'complex' }
+        $depth++
+        $node = $node.Expression
+    }
+    if ($node -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return 'complex' }
+    $v = Get-VariableName $node
+    if ($v.scope -ne '') { return 'scoped' }
+    if ($depth -gt 1) { return 'nested' }
+    $assignments = @(Get-AssignmentsTo $Root $v.name)
+    if ($assignments.Count -eq 0) { return 'unbound' }
+    return (@($assignments | ForEach-Object { Get-AssignedObjectOrigin $_ } | Sort-Object -Unique) -join ';')
 }
 
 function Test-Provable($Ast, $Root, $Visiting) {
@@ -441,7 +518,8 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
             continue
         }
         if ($left -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
-            Add-Violation $Source $a 'R5' "assignment to $($left.GetType().Name) is not allowed"
+            $origin = if ($left -is [System.Management.Automation.Language.MemberExpressionAst]) { Get-ReceiverOrigin $left $root } else { '' }
+            Add-Violation $Source $a 'R5' "assignment to $($left.GetType().Name) is not allowed" $origin
             continue
         }
         $v = Get-VariableName $left
@@ -505,7 +583,46 @@ function Get-RepoRelativePath([string]$Path) {
 }
 
 function Add-SpliceFinding([string]$Source, [int]$Line, [string]$Function, [string]$Text, [string]$Reason) {
-    $splicedViolations.Add([ordered]@{ source = $Source; module = ''; function = $Function; line = $Line; rule = 'splice'; token = 'splice'; text = $Text; reason = $Reason })
+    $splicedViolations.Add([ordered]@{ source = $Source; module = ''; function = $Function; line = $Line; rule = 'splice'; token = 'splice'; origin = ''; text = $Text; reason = $Reason })
+}
+
+function Get-SpliceModuleBinding($Call) {
+    # Which module the extractor will read for this call: kind 'default' (no -ModulePath: the extractor's own
+    # module), 'leaf' (a literal / Join-Path -ModulePath: bound by file name), 'dynamic' (any other expression)
+    # or 'unsupported' (a call shape whose -ModulePath cannot be read, so the binding is unknown).
+    foreach ($element in $Call.CommandElements) {
+        if ($element -is [System.Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) {
+            return [pscustomobject]@{ kind = 'unsupported'; leaf = ''; reason = 'the call splats arguments, which can hide a -ModulePath' }
+        }
+    }
+    # -Name is position 0 and -ModulePath position 1, so a second positional argument binds -ModulePath.
+    $expectedPositional = if ((Get-NamedArguments $Call @('Name')).Count -eq 0) { 1 } else { 0 }
+    if ((Get-PositionalCount $Call) -gt $expectedPositional) {
+        return [pscustomobject]@{ kind = 'unsupported'; leaf = ''; reason = 'the call passes a positional argument after -Name, which binds -ModulePath by position' }
+    }
+    $modulePaths = Get-NamedArguments $Call @('ModulePath')
+    if ($modulePaths.Count -eq 0) { return [pscustomobject]@{ kind = 'default'; leaf = ''; reason = '' } }
+    if ($modulePaths.Count -gt 1 -or $null -eq $modulePaths[0]) {
+        return [pscustomobject]@{ kind = 'unsupported'; leaf = ''; reason = '-ModulePath is repeated or has no value' }
+    }
+    $argument = $modulePaths[0]
+    $plain = @($argument.FindAll({
+        param($n) ($n -is [System.Management.Automation.Language.SubExpressionAst]) -or ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -or
+                  ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -or
+                  (($n -is [System.Management.Automation.Language.VariableExpressionAst]) -and (Get-VariableName $n).name -cne 'PSScriptRoot') -or
+                  (($n -is [System.Management.Automation.Language.CommandAst]) -and $n.GetCommandName() -cne 'Join-Path')
+    }, $true)).Count -eq 0
+    $strings = @($argument.FindAll({
+        param($n) ($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -and
+                  -not (($n.Parent -is [System.Management.Automation.Language.CommandAst]) -and $n.Parent.CommandElements[0] -eq $n)
+    }, $true))
+    if ($argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $strings = @($argument) }
+    if ($plain -and $strings.Count -gt 0) {
+        $value = [string]$strings[$strings.Count - 1].Value
+        $leaf = $value.Substring($value.LastIndexOfAny([char[]]@('\', '/')) + 1)
+        if ($leaf -match '\.ps(m)?1$') { return [pscustomobject]@{ kind = 'leaf'; leaf = $leaf; reason = '' } }
+    }
+    return [pscustomobject]@{ kind = 'dynamic'; leaf = ''; reason = '' }
 }
 
 function Get-SpliceCallSites([string]$Path) {
@@ -546,7 +663,7 @@ function Get-SpliceCallSites([string]$Path) {
             Add-SpliceFinding $source $call.Extent.StartLineNumber '' $text 'the -Name list is not a literal list of function names, so the spliced bodies cannot be enumerated'
             continue
         }
-        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names }
+        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; bind = (Get-SpliceModuleBinding $call) }
     }
 }
 
@@ -554,26 +671,51 @@ if ($SpliceSource.Count -gt 0) {
     $moduleTexts = [ordered]@{}
     foreach ($modulePath in $ModulePath) { $moduleTexts[(Get-RepoRelativePath $modulePath)] = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $modulePath).Path) }
     $entries = [ordered]@{}
+    # The module the extractor reads when a call names no -ModulePath is the module that defines the extractor
+    # ($script:AttrCudaModulePath). When no -ModulePath module defines it (a fixture), every module is a candidate.
+    $extractorModules = @($moduleTexts.Keys | Where-Object { $moduleTexts[$_] -match '(?m)^function\s+Get-AttrCudaEmbeddedFunctionSource\s*\{' })
     foreach ($spliceSource in $SpliceSource) {
         foreach ($site in @(Get-SpliceCallSites $spliceSource)) {
+            # Bind the call to the module(s) the extractor will really read, so a same-named helper in another
+            # module is never scanned in its place. A call whose binding cannot be proven is a finding.
+            $candidates = @($moduleTexts.Keys)
+            $bindingFailure = ''
+            switch ($site.bind.kind) {
+                'unsupported' { $bindingFailure = $site.bind.reason }
+                'default' {
+                    if ($extractorModules.Count -eq 1) { $candidates = @($extractorModules) }
+                    elseif ($extractorModules.Count -gt 1) { $bindingFailure = 'more than one -ModulePath module defines the extractor, so the default module is ambiguous' }
+                }
+                'leaf' {
+                    $candidates = @($moduleTexts.Keys | Where-Object { $_.Substring($_.LastIndexOf('/') + 1) -ieq $site.bind.leaf })
+                    if ($candidates.Count -ne 1) { $bindingFailure = "-ModulePath names '$($site.bind.leaf)', which is not exactly one scanner -ModulePath module ($($candidates.Count) match)" }
+                }
+            }
+            if ($bindingFailure) {
+                Add-SpliceFinding $site.source $site.line '' $site.text "the extractor module this call reads cannot be bound: $bindingFailure"
+                continue
+            }
             foreach ($functionName in $site.names) {
                 # The extractor's own pattern (Get-AttrCudaEmbeddedFunctionSource in AttrCudaArtifacts.psm1).
                 $pattern = '(?ms)^function\s+' + [regex]::Escape($functionName) + '\s*\{.*?^\}'
-                $found = 0
-                foreach ($module in $moduleTexts.Keys) {
-                    $match = [regex]::Match($moduleTexts[$module], $pattern)
-                    if (-not $match.Success) { continue }
-                    $found++
-                    $key = "$module::$functionName"
-                    if (-not $entries.Contains($key)) {
-                        $line = 1 + ([regex]::Matches($moduleTexts[$module].Substring(0, $match.Index), "`n")).Count
-                        $entries[$key] = [ordered]@{ module = $module; name = $functionName; line = $line; body = $match.Value; callers = [System.Collections.Generic.List[string]]::new() }
-                    }
-                    if (-not $entries[$key].callers.Contains($site.source)) { $entries[$key].callers.Add($site.source) }
+                $definers = @($candidates | Where-Object { [regex]::IsMatch($moduleTexts[$_], $pattern) })
+                if ($definers.Count -eq 0) {
+                    $where = if ($site.bind.kind -eq 'leaf' -or ($site.bind.kind -eq 'default' -and $extractorModules.Count -eq 1)) { "the module this call reads ($($candidates[0]))" } else { 'no -ModulePath module' }
+                    Add-SpliceFinding $site.source $site.line $functionName $site.text "$where defines an extractable function named '$functionName'"
+                    continue
                 }
-                if ($found -eq 0) {
-                    Add-SpliceFinding $site.source $site.line $functionName $site.text "no -ModulePath module defines an extractable function named '$functionName'"
+                if ($definers.Count -gt 1) {
+                    Add-SpliceFinding $site.source $site.line $functionName $site.text "'$functionName' is defined by more than one candidate module ($($definers -join ', ')) and the call does not bind it to one"
+                    continue
                 }
+                $module = $definers[0]
+                $match = [regex]::Match($moduleTexts[$module], $pattern)
+                $key = "$module::$functionName"
+                if (-not $entries.Contains($key)) {
+                    $line = 1 + ([regex]::Matches($moduleTexts[$module].Substring(0, $match.Index), "`n")).Count
+                    $entries[$key] = [ordered]@{ module = $module; name = $functionName; line = $line; body = $match.Value; callers = [System.Collections.Generic.List[string]]::new() }
+                }
+                if (-not $entries[$key].callers.Contains($site.source)) { $entries[$key].callers.Add($site.source) }
             }
         }
     }
@@ -587,7 +729,8 @@ if ($SpliceSource.Count -gt 0) {
         foreach ($finding in @($violations.GetRange($before, $violations.Count - $before))) {
             $token = if ($finding.Contains('token')) { $finding.token } else { [string]$finding.rule }
             $absolute = if ($finding.line -ge 1) { $entry.line + $finding.line - 1 } else { $entry.line }
-            $splicedViolations.Add([ordered]@{ source = $finding.source; module = $entry.module; function = $entry.name; line = $absolute; rule = $finding.rule; token = $token; text = $finding.text; reason = $finding.reason })
+            $origin = if ($finding.Contains('origin')) { [string]$finding.origin } else { '' }
+            $splicedViolations.Add([ordered]@{ source = $finding.source; module = $entry.module; function = $entry.name; line = $absolute; rule = $finding.rule; token = $token; origin = $origin; text = $finding.text; reason = $finding.reason })
         }
         $violations.RemoveRange($before, $violations.Count - $before)
     }

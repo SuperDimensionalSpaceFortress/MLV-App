@@ -119,11 +119,27 @@ Environment::GetFolderPath IO.DriveInfo::new IO.File::OpenRead IO.File::ReadAllB
 # New-Object is NOT here: it can build a StreamWriter, so each type it builds needs its own row.
 INERT_COMMANDS = frozenset("Get-Command Get-Counter Get-Item Group-Object Write-Warning".split())
 
-# An R5 finding on `$local.property = ...` sets a property of a helper's own local object (a result
-# record, a ProcessStartInfo). It cannot be a publish destination; the template-side member-assignment
-# rule exists to stop `(Get-Item $Pub).Attributes = ...` shapes, which keep their token (the full
-# member text of a non-local receiver) and stay findings.
+# An R5 finding on `$local.property = ...` is inert only when the scan proves the receiver is an object
+# this same body just BUILT: every assignment to the variable is a hashtable / [ordered] / [pscustomobject]
+# literal ("literal") or a New-Object / [Type]::new of a type on INERT_LOCAL_TYPES ("constructed:<Type>").
+# A receiver that came from a command, a member or a parameter ("other", "unbound", "nested", ...) can be a
+# foreign object, and `$f = Get-Item $Pub; $f.Attributes = ...` is a file write: that stays a finding and
+# needs a reviewed ALLOWLIST row. The scan reports the receiver's origin; this file decides.
 LOCAL_PROPERTY_SET = re.compile(r"^\$(?!Work\b|Pub\b|Cache\b|AgentRoot\b|Root\b)[A-Za-z_]\w*(\.\w+)+$")
+# Types a body builds only to fill in and hand to an effectful call that is itself a finding (Process.Start,
+# SetFileInformationByHandle, EnumDisplay*): setting their fields touches no file, process or registry.
+INERT_LOCAL_TYPES = frozenset("""
+System.Diagnostics.ProcessStartInfo Diagnostics.ProcessStartInfo AttrCudaDisplayDevice AttrCudaDevMode
+AttrCudaWin32.FileIdNative+FileBasicInfo AttrCudaWin32.FileIdNative+FileDispositionInfo
+""".split())
+
+
+def local_property_set_is_inert(finding: dict) -> bool:
+    if finding["rule"] != "R5" or not LOCAL_PROPERTY_SET.match(finding["token"]):
+        return False
+    origins = [o for o in finding.get("origin", "").split(";") if o]
+    return bool(origins) and all(
+        o == "literal" or (o.startswith("constructed:") and o[len("constructed:"):] in INERT_LOCAL_TYPES) for o in origins)
 
 # (function, rule, offending token) -> (how many times the body holds it, one-line reason). REVIEWED
 # rows only: every row names a helper whose job is to be the runtime boundary, or a read-only / inert
@@ -298,6 +314,19 @@ _allow("Get-AttrCudaGuiSmokeDisplaySelection",
        "fallback dot-source of the sibling gui-smoke-display-identity.ps1, taken only when ConvertFrom-GuiSmokeDisplayLog is NOT defined; the emitted job embeds that function, so the branch is dead there",
        ("R3", ". (dot-source)", 1))
 
+# ---- property sets whose receiver the scan could not prove is a fresh local object (ATTR3-SCAN-COVERAGE-LIMITS-1 L1) ----
+_allow("Get-AttrCudaPresentMonWindowResult",
+       "mutates a shallow PSObject.Copy() of the caller's parsed result and its nested process record; in-memory data only, nothing is written back to a file",
+       ("R5", "$clone.process", 1), ("R5", "$clone.process.endedAtUtc", 1))
+_allow("Invoke-AttrCudaBoundedProbe",
+       "attaches the throwaway runspace to the [powershell]::Create() shell this body made; the runspace and its commands stay findings on their own",
+       ("R5", "$probeShell.Runspace", 1))
+_allow("Start-AttrCudaDisplayWakeKeepAlive",
+       "writes counters and messages into the synchronized in-memory $NudgeState table the body builds and shares with its keep-alive runspace, and attaches the runspace to its shell",
+       ("R5", "$NudgeState.count", 3), ("R5", "$NudgeState.failureCount", 4), ("R5", "$NudgeState.lastDesktopName", 1),
+       ("R5", "$NudgeState.lastError", 4), ("R5", "$NudgeState.lastFailureUtc", 4), ("R5", "$NudgeState.sessionLockReason", 2),
+       ("R5", "$NudgeState.successCount", 1), ("R5", "$shell.Runspace", 1))
+
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 
 
@@ -371,7 +400,7 @@ def in_scope(findings: list[dict]) -> list[dict]:
             continue
         if f["rule"] == "R1" and f["token"] in INERT_COMMANDS:
             continue
-        if f["rule"] == "R5" and LOCAL_PROPERTY_SET.match(f["token"]):
+        if local_property_set_is_inert(f):
             continue
         kept.append(f)
     return kept
@@ -413,6 +442,12 @@ class SplicedBodyScanHeaderTests(unittest.TestCase):
                        "reference-frame-runner-job.ps1", "Attr3Footage", "child executables",
                        "trusted as reviewed"):
             self.assertIn(needle, limits, f"the scan header's EXPLICIT LIMITS block lost: {needle}")
+        # ATTR3-SCAN-COVERAGE-LIMITS-1: the header states the module binding and the property-set origin exactly.
+        for needle in ("MODULE BINDING", "the module the extractor will read for THAT call", "fail closed",
+                       "PROPERTY SETS IN BODIES", "'constructed:<Type>'", "this script still decides nothing"):
+            self.assertIn(needle, flat, f"the scan header no longer states: {needle}")
+        self.assertNotIn("security boundary", flat.replace("NOT a security boundary", "").replace("not a security boundary", ""),
+                         "the scan is a regression tripwire; its header must not claim it is a security boundary")
         # The parser calls the header names are the ones the scan really makes.
         self.assertGreaterEqual(text.count("[System.Management.Automation.Language.Parser]::ParseInput("), 1)
         self.assertGreaterEqual(text.count("[System.Management.Automation.Language.Parser]::ParseFile("), 1)
@@ -664,6 +699,186 @@ class SplicedBodyScanFixtureTests(unittest.TestCase):
 
     def test_a_lowercase_module_qualified_extractor_call_with_a_positional_list_is_scanned(self) -> None:
         self.assert_the_variant_call_is_scanned("attrcudaartifacts\\GET-ATTRCUDAEMBEDDEDFUNCTIONSOURCE @('Publish-AttrCudaFixtureHelper')")
+
+
+@requires_pwsh
+@unittest.skipUnless(os.name == "nt", "the ATTR-3 host jobs and their helpers are Windows-only")
+class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
+    """ATTR3-SCAN-COVERAGE-LIMITS-1: the two limits Dot recorded on #655, pinned with concrete inputs.
+
+    L1: a `$local.Property = ...` finding inside a spliced helper body was dropped by SHAPE alone, so a helper
+    that sets a property on a foreign object (`$f = Get-Item $Pub; $f.Attributes = ...`) passed the policy.
+    L2: a splice call site was resolved against EVERY -ModulePath module instead of the module its own
+    extractor call reads, so a same-named helper in another module could be scanned in its place.
+    This is a regression tripwire, not a security boundary (see the scan's header).
+
+    Three scans cover every case (one generator holds many call sites, one helper name per case), so the class
+    costs three pwsh starts, not one per test: the Windows shard budget has no slack for more.
+    """
+
+    RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
+    CLEAN = "    Get-Date"
+    TEMPLATE = "$Work = Join-Path 'C:\\mlvtmp' $JobId\n__EMBEDDED_FUNCTIONS__\n"
+
+    L1_BODIES = [
+        ("L1Foreign", "    param([string]$Target)\n    $item = Get-Item -LiteralPath $Target\n    $item.Attributes = 'Hidden'"),
+        ("L1Param", "    param($Target)\n    $Target.IsReadOnly = $true"),
+        ("L1Mixed", "    param([string]$Target)\n    $r = [ordered]@{}\n    $r = Get-Item -LiteralPath $Target\n    $r.Attributes = 'Hidden'"),
+        # New-Object itself is judged on its own (R1, per type); a property set on a FileInfo writes the file's attributes.
+        ("L1FileInfo", "    param([string]$Target)\n    $fi = New-Object System.IO.FileInfo $Target\n    $fi.IsReadOnly = $true"),
+        ("L1Nested", "    $r = [ordered]@{ inner = $null }\n    $r.inner.Attributes = 'Hidden'"),
+        ("L1Root", "    $Pub.Attributes = 'Hidden'"),
+        ("L1Fresh", "    $r = [ordered]@{}\n    $r.a = 1\n    $o = [pscustomobject]@{ a = 1 }\n    $o.a = 2\n"
+                    "    $psi = New-Object System.Diagnostics.ProcessStartInfo\n    $psi.FileName = 'x'"),
+        ("L1IndexRoot", "    $Pub['k'] = 1"),
+        ("L1IndexLocal", "    $h = @{}\n    $h['k'] = 1\n    $list = New-Object 'System.Collections.Generic.List[object]'"),
+    ]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-coverage-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.tmp = _long_path(Path(cls._tmp.name))
+        names = ", ".join(repr(n) for n, _ in cls.L1_BODIES)
+        cls.l1 = cls._scan("l1", [("Body.psm1", cls.L1_BODIES)], ["Body.psm1"],
+                           [f"Get-AttrCudaEmbeddedFunctionSource -Name @({names})"])
+        # No -ModulePath module defines the extractor here, so every module is a candidate for a call that names none.
+        cls.l2 = cls._scan("l2", [
+            ("Clean.psm1", [(n, cls.CLEAN) for n in ("LitClean", "LitDirty", "OffList", "Ambig", "AmbigDyn", "Spl")]),
+            ("Dirty.psm1", [(n, cls.RAW_WRITE) for n in ("LitClean", "LitDirty", "Ambig", "AmbigDyn")]),
+            ("Only.psm1", [("OnlyHere", cls.CLEAN)]),
+        ], ["Clean.psm1", "Dirty.psm1", "Only.psm1"], [
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1') -Name @('LitClean')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('LitDirty') -ModulePath (Join-Path $PSScriptRoot 'Dirty.psm1')",
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'Off.psm1') -Name @('OffList')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('OffOnly')",
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'Off.psm1') -Name @('OffOnly')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('Ambig')",
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath $somePath -Name @('AmbigDyn')",
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath $somePath -Name @('OnlyHere')",
+            "Get-AttrCudaEmbeddedFunctionSource @('Spl') (Join-Path $PSScriptRoot 'Dirty.psm1')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('Spl') @extra",
+        ])
+        # The extractor's own module is on the list, so a call that names no -ModulePath reads exactly that module.
+        cls.l2_default = cls._scan("l2-default", [
+            ("Extractor.psm1", [("Get-AttrCudaEmbeddedFunctionSource", "    param($Name)"), ("DefHelper", cls.CLEAN)]),
+            ("Dirty.psm1", [("DefHelper", cls.RAW_WRITE), ("DirtyOnly", cls.RAW_WRITE)]),
+        ], ["Extractor.psm1", "Dirty.psm1"], [
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('DefHelper')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('DirtyOnly')",
+        ])
+
+    @classmethod
+    def _scan(cls, label: str, modules: list, on_list: list, calls: list) -> dict:
+        directory = cls.tmp / label
+        directory.mkdir()
+        for file_name, functions in modules:
+            (directory / file_name).write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in functions), encoding="utf-8")
+        generator = directory / "fixture-gen.ps1"
+        generator.write_text("".join(f"$e = {call}\n" for call in calls) + "$template = @'\n" + cls.TEMPLATE + "'@\n", encoding="utf-8")
+        return run_scan(generators=[generator], modules=[directory / m for m in on_list], splice_sources=[generator])
+
+    @staticmethod
+    def of(result: dict, function: str) -> list[dict]:
+        return [f for f in result["splicedViolations"] if f["function"] == function]
+
+    @staticmethod
+    def call_findings(result: dict, needle: str) -> list[dict]:
+        """Findings about a call as a whole (no function name), picked by the call text they carry."""
+        return [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and needle in f["text"]]
+
+    @staticmethod
+    def modules_of(result: dict, name: str) -> list[str]:
+        return sorted(s["module"].rsplit("/", 1)[-1] for s in result["spliced"] if s["name"] == name)
+
+    @staticmethod
+    def unlisted(findings: list[dict]) -> list[tuple[str, str]]:
+        """What the real policy (in_scope + the reviewed allowlist) leaves of body findings, as (rule, token)."""
+        return [(f["rule"], f["token"]) for f in apply_allowlist(in_scope([x for x in findings if x["rule"] != "splice"]))[0]]
+
+    # ---- L1: property and index assignments in a spliced body ----
+
+    def test_l1_a_property_set_on_an_object_a_command_returned_stays_a_finding(self) -> None:
+        found = self.of(self.l1, "L1Foreign")
+        self.assertEqual(self.unlisted(found), [("R5", "$item.Attributes")], describe(found))
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["other"])
+
+    def test_l1_a_property_set_on_a_parameter_stays_a_finding(self) -> None:
+        self.assertEqual(self.unlisted(self.of(self.l1, "L1Param")), [("R5", "$Target.IsReadOnly")])
+
+    def test_l1_a_variable_that_is_sometimes_a_foreign_object_stays_a_finding(self) -> None:
+        found = self.of(self.l1, "L1Mixed")
+        self.assertEqual(self.unlisted(found), [("R5", "$r.Attributes")], describe(found))
+
+    def test_l1_a_property_set_on_a_constructed_file_object_stays_a_finding(self) -> None:
+        found = self.of(self.l1, "L1FileInfo")
+        self.assertIn(("R5", "$fi.IsReadOnly"), self.unlisted(found), describe(found))
+
+    def test_l1_a_nested_property_chain_stays_a_finding(self) -> None:
+        self.assertEqual(self.unlisted(self.of(self.l1, "L1Nested")), [("R5", "$r.inner.Attributes")])
+
+    def test_l1_a_property_set_on_a_root_variable_stays_a_finding(self) -> None:
+        self.assertEqual(self.unlisted(self.of(self.l1, "L1Root")), [("R5", "$Pub.Attributes")])
+
+    def test_l1_property_sets_on_freshly_built_in_memory_objects_are_not_findings(self) -> None:
+        found = self.of(self.l1, "L1Fresh")
+        r5 = [f for f in found if f["rule"] == "R5"]
+        self.assertEqual(sorted(f["origin"] for f in r5),
+                         ["constructed:System.Diagnostics.ProcessStartInfo", "literal", "literal"], describe(r5))
+        self.assertEqual([k for k in self.unlisted(found) if k[0] == "R5"], [])
+
+    def test_l1_index_assignments_to_a_root_variable_are_findings_and_to_a_local_are_not(self) -> None:
+        # Pinned, not new behaviour: the index half of R5 already worked; this keeps it from regressing.
+        self.assertEqual([(f["rule"], f["token"]) for f in self.of(self.l1, "L1IndexRoot")], [("R5", "$Pub['k']")])
+        self.assertEqual([f for f in self.of(self.l1, "L1IndexLocal") if f["rule"] == "R5"], [])
+
+    def test_l1_every_reviewed_property_set_row_names_a_plain_local_receiver(self) -> None:
+        for (function, rule, token) in ALLOWLIST:
+            if rule == "R5":
+                self.assertRegex(token, LOCAL_PROPERTY_SET, f"{function}: an R5 row must name a plain local receiver")
+
+    # ---- L2: a splice call site is bound to the module its extractor call reads ----
+
+    def test_l2_a_literal_module_path_binds_the_call_to_that_module_not_to_a_same_named_helper_elsewhere(self) -> None:
+        self.assertEqual(self.modules_of(self.l2, "LitClean"), ["Clean.psm1"])
+        self.assertEqual(self.of(self.l2, "LitClean"), [], describe(self.of(self.l2, "LitClean")))
+
+    def test_l2_a_literal_module_path_to_the_dirty_module_reports_its_body_only(self) -> None:
+        self.assertEqual(self.modules_of(self.l2, "LitDirty"), ["Dirty.psm1"])
+        self.assertEqual([(f["rule"], f["token"]) for f in self.of(self.l2, "LitDirty")], [("R2", "New-Item")])
+
+    def test_l2_a_module_path_off_the_scanners_module_list_is_a_finding_even_if_another_module_defines_the_name(self) -> None:
+        # OffList is defined (clean) in Clean.psm1, which IS on the list; the call reads Off.psm1, which is not.
+        self.assertEqual(len(self.call_findings(self.l2, "'OffList'")), 1, describe(self.l2["splicedViolations"]))
+        self.assertEqual(self.modules_of(self.l2, "OffList"), [], "the scan must not read Clean.psm1's body in place of Off.psm1's")
+
+    def test_l2_a_helper_defined_only_off_the_module_list_is_a_finding_not_a_silent_pass(self) -> None:
+        self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2, "OffOnly")], [("splice", "OffOnly")])
+        self.assertEqual(len(self.call_findings(self.l2, "Off.psm1') -Name @('OffOnly')")), 1)
+        self.assertEqual(self.modules_of(self.l2, "OffOnly"), [])
+
+    def test_l2_a_name_two_candidate_modules_define_and_the_call_does_not_bind_is_ambiguous(self) -> None:
+        for name in ("Ambig", "AmbigDyn"):
+            self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2, name)], [("splice", name)], describe(self.of(self.l2, name)))
+            self.assertEqual(self.modules_of(self.l2, name), [])
+
+    def test_l2_a_dynamic_module_path_resolves_a_name_only_one_module_defines(self) -> None:
+        self.assertEqual(self.modules_of(self.l2, "OnlyHere"), ["Only.psm1"])
+        self.assertEqual(self.of(self.l2, "OnlyHere"), [])
+
+    def test_l2_a_positional_module_path_or_a_splat_is_a_finding_because_the_binding_is_unknown(self) -> None:
+        self.assertEqual(len(self.call_findings(self.l2, "@('Spl') (Join-Path")), 1, describe(self.l2["splicedViolations"]))
+        self.assertEqual(len(self.call_findings(self.l2, "-Name @('Spl') @extra")), 1)
+        self.assertEqual(self.modules_of(self.l2, "Spl"), [])
+
+    def test_l2_without_a_module_path_the_call_reads_the_extractors_own_module(self) -> None:
+        self.assertEqual(self.modules_of(self.l2_default, "DefHelper"), ["Extractor.psm1"])
+        self.assertEqual(self.of(self.l2_default, "DefHelper"), [], describe(self.of(self.l2_default, "DefHelper")))
+
+    def test_l2_without_a_module_path_a_name_the_extractors_module_lacks_is_a_finding(self) -> None:
+        # At run time the extractor throws for a name its own module does not define; the scan must not find it elsewhere.
+        self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2_default, "DirtyOnly")], [("splice", "DirtyOnly")])
+        self.assertEqual(self.modules_of(self.l2_default, "DirtyOnly"), [])
 
 
 class SpliceInventoryCallShapeTests(unittest.TestCase):
