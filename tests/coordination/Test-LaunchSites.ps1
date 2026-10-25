@@ -89,6 +89,15 @@ Rules, written down because the census depends on them:
                 to another name, cast or [ref], reached through another member such as .psbase, or qualified) makes the key set unknown,
                 and an unknown splat on any command could bind every *Variable* parameter, so it taints every name. An array splat
                 (positional binding) never has a known key set here: its value is not a hashtable literal, so it taints every name.
+                (r9, CoS/Dot 6397324853 on #669; LAUNCH-SITE-CENSUS-PSDEFAULTPARAMETERVALUES-BINDER-1) $PSDefaultParameterValues gives a
+                default to every later command that has the parameter, so it is read with or without a splat in the file. Its key is
+                `<command>:<parameter>`; when the parameter part is a binder parameter (above), or holds a wildcard (pwsh binds one that
+                matches a single parameter, `*:OutVa*`), the value names a variable that is tainted. Every use of the name (any qualifier)
+                must be one of: `= / += @{ ... }`; `[<key>] = v`; `.<key> = v`; `.Add(<key>, v)` / `.set_Item(<key>, v)`; an index read;
+                a call of Remove, ContainsKey, Contains, get_Item, Clear, ContainsValue, Clone or GetEnumerator; a read of .Count / .Keys /
+                .Values. A key that is not constant, a right side that is not a hashtable literal, any other use (aliased to another
+                name, passed to or piped into a command, [ref], cast), and a constant string naming PSDefaultParameterValues (Set-Variable,
+                the variable: drive) taint every name.
 #>
 [CmdletBinding()]
 param()
@@ -556,6 +565,8 @@ function New-Ctx($Root) {
         Splats = [List[object]]::new(); ParamNames = [HashSet[string]]::new(); KeyedValues = [List[object]]::new(); DynamicKey = $false
         # r8 (V3): every variable reference by name, for the splat-source allowlist (built on first use by Test-SplatSourceUses)
         VarUses = $null
+        # r9 (V3): every use of $PSDefaultParameterValues, checked after the walk with or without a splat
+        Defaults = [List[object]]::new()
     }
 }
 
@@ -580,6 +591,75 @@ function Test-AssignTarget($U) {
     return ($p.Parent -is [AssignmentStatementAst] -and [object]::ReferenceEquals($p.Parent.Left, $p))
 }
 
+# The outermost node that is only ( ) around $V: what a member, index or call on the name is applied to.
+function Get-ParenOuter($V) {
+    $u = $V
+    while ($true) {
+        $p = $u.Parent
+        if ($p -is [ParenExpressionAst]) { $u = $p; continue }
+        if ($p -is [CommandExpressionAst] -and $p.Parent -is [PipelineAst] -and $p.Parent.PipelineElements.Count -eq 1 -and $p.Parent.Parent -is [ParenExpressionAst]) { $u = $p; continue }
+        if ($p -is [PipelineAst] -and $p.PipelineElements.Count -eq 1 -and $p.Parent -is [ParenExpressionAst]) { $u = $p; continue }
+        break
+    }
+    return $u
+}
+
+# The right side of the assignment whose left side is $Left (looked through casts and attributes).
+function Get-AssignRight($Left) {
+    $p = $Left
+    while ($p.Parent -is [AttributedExpressionAst]) { $p = $p.Parent }
+    return $p.Parent.Right
+}
+
+# r9 (rule V3): a $PSDefaultParameterValues entry `<command>:<parameter>` = $Value binds a variable when its parameter part is a binder
+# parameter or holds a wildcard (pwsh binds a wildcard that matches one parameter); a key that is not constant could be any binder.
+function Add-DefaultKeyTaint($Ctx, $Key, $Value) {
+    $k = Get-ConstString $Key
+    if ($null -eq $k) { if (-not ((Get-Inner $Key) -is [ConstantExpressionAst])) { $Ctx.TaintAll = $true }; return }
+    $param = if ($k.Contains(':')) { $k.Substring($k.IndexOf(':') + 1).Trim() } else { '' }
+    if ($param -match '[*?\[]' -or (Test-BinderParameter $param) -or (Test-BinderParameter $k.Trim())) { Add-Taint $Ctx $Value }
+}
+
+$DefaultsReadMethods = [HashSet[string]]::new([string[]]@('remove', 'containskey', 'contains', 'get_item', 'clear', 'containsvalue', 'clone', 'getenumerator'))
+
+# r9 (rule V3, CoS/Dot 6397324853): every use of $PSDefaultParameterValues must be on the allowlist in the header; its binder entries taint
+# their value names, and any use off the allowlist taints every name. Runs with or without a splat in the file.
+function Add-DefaultParameterTaints($Ctx) {
+    foreach ($v in $Ctx.Defaults) {
+        if ($Ctx.TaintAll) { return }
+        if ($v.Splatted) { $Ctx.TaintAll = $true; continue }
+        if (Test-AssignTarget $v) {
+            $a = $v.Parent
+            while ($a -is [AttributedExpressionAst]) { $a = $a.Parent }
+            $h = Get-Inner $a.Right
+            if (($a.Operator -eq [TokenKind]::Equals -or $a.Operator -eq [TokenKind]::PlusEquals) -and $h -is [HashtableAst]) {
+                foreach ($kv in $h.KeyValuePairs) { Add-DefaultKeyTaint $Ctx $kv.Item1 $kv.Item2 }
+            }
+            else { $Ctx.TaintAll = $true }
+            continue
+        }
+        $u = Get-ParenOuter $v
+        $p = $u.Parent
+        if ($p -is [InvokeMemberExpressionAst] -and [object]::ReferenceEquals($p.Expression, $u) -and -not $p.Static -and $p.Member -is [StringConstantExpressionAst]) {
+            $mn = $p.Member.Value.ToLowerInvariant()
+            if ($DefaultsReadMethods.Contains($mn)) { continue }
+            if (($mn -eq 'add' -or $mn -eq 'set_item') -and $null -ne $p.Arguments -and $p.Arguments.Count -eq 2) { Add-DefaultKeyTaint $Ctx $p.Arguments[0] $p.Arguments[1]; continue }
+            $Ctx.TaintAll = $true; continue
+        }
+        if ($p -is [MemberExpressionAst] -and -not ($p -is [InvokeMemberExpressionAst]) -and [object]::ReferenceEquals($p.Expression, $u) -and -not $p.Static -and
+            $p.Member -is [StringConstantExpressionAst]) {
+            if (Test-AssignTarget $p) { Add-DefaultKeyTaint $Ctx $p.Member (Get-AssignRight $p) }
+            elseif (-not $SplatReadMembers.Contains($p.Member.Value.ToLowerInvariant())) { $Ctx.TaintAll = $true }
+            continue
+        }
+        if ($p -is [IndexExpressionAst] -and [object]::ReferenceEquals($p.Target, $u)) {
+            if (Test-AssignTarget $p) { Add-DefaultKeyTaint $Ctx $p.Index (Get-AssignRight $p) }
+            continue
+        }
+        $Ctx.TaintAll = $true
+    }
+}
+
 function Test-SplatSourceUses([string]$Key, $Ctx) {
     if ($null -eq $Ctx.VarUses) {
         # built only for a file with a splat: indexing every variable node of every scanned file costs the census seconds
@@ -601,14 +681,7 @@ function Test-SplatSourceUses([string]$Key, $Ctx) {
             return $false
         }
         # look through ( ) around the name
-        $u = $v
-        while ($true) {
-            $p = $u.Parent
-            if ($p -is [ParenExpressionAst]) { $u = $p; continue }
-            if ($p -is [CommandExpressionAst] -and $p.Parent -is [PipelineAst] -and $p.Parent.PipelineElements.Count -eq 1 -and $p.Parent.Parent -is [ParenExpressionAst]) { $u = $p; continue }
-            if ($p -is [PipelineAst] -and $p.PipelineElements.Count -eq 1 -and $p.Parent -is [ParenExpressionAst]) { $u = $p; continue }
-            break
-        }
+        $u = Get-ParenOuter $v
         $p = $u.Parent
         if ($p -is [InvokeMemberExpressionAst] -and [object]::ReferenceEquals($p.Expression, $u) -and -not $p.Static -and $p.Member -is [StringConstantExpressionAst]) {
             $mn = $p.Member.Value.ToLowerInvariant()
@@ -659,6 +732,9 @@ function Read-Writes($Ctx, $Root, $Lists, [int]$Depth) {
                 elseif (-not ($key -is [ConstantExpressionAst])) { $Ctx.DynamicKey = $true }
             }
         }
+        # r9 (V3): $PSDefaultParameterValues (any qualifier) is read after the walk; a constant string naming it binds it by name
+        if ($a -is [VariableExpressionAst] -and $a.VariablePath.UserPath -like '*psdefaultparametervalues' -and (Get-VarKey $a) -eq 'psdefaultparametervalues') { $Ctx.Defaults.Add($a) }
+        if ($a -is [StringConstantExpressionAst] -and $a.Value -like '*psdefaultparametervalues*') { $Ctx.TaintAll = $true }
         if ($a -is [StringConstantExpressionAst]) {
             [void](Add-VarDriveTaint $Ctx $a.Value)
             $sv = $a.Value.ToLowerInvariant()
@@ -719,6 +795,8 @@ function Read-Writes($Ctx, $Root, $Lists, [int]$Depth) {
     if ($Ctx.ValueWrite -and $Ctx.VarObject) { $Ctx.TaintAll = $true }
     # $c = 'Set-Variable'; & $c cmd ... / & (Get-Command sv) cmd ...: a dynamic call in a file that names a variable or item cmdlet
     if ($Ctx.DynamicCall -and $Ctx.CmdletName) { $Ctx.TaintAll = $true }
+    # r9 (V3): a $PSDefaultParameterValues binder entry binds with no splat in the file, so it is read here, before the splat check
+    Add-DefaultParameterTaints $Ctx
     # iex and a script block made from text run that text in this scope (or a dot-sourced one): its writes are this file's writes. Repeat
     # until the taints settle, since a new taint can stop a string from resolving.
     for ($round = 0; $round -lt 4 -and $executed.Count -gt 0; $round++) {

@@ -3735,3 +3735,49 @@ def test_launcher_census_r8_a_splat_source_off_the_allowlist_leaves_the_read_unr
 def test_launcher_census_r8_control_an_allowlisted_splat_source_keeps_the_literal(mutation):
     text = _r8(mutation, splat=_R7_MARKER + " | Out-File -FilePath x.txt @h")
     assert _unresolved_sites(text) == [], f"an allowlisted splat source made a safe same-scope literal unresolved: {text!r}"
+
+
+# --- r9 (CoS/Dot 6397324853 on #669, hub ACK 6397373319; LAUNCH-SITE-CENSUS-PSDEFAULTPARAMETERVALUES-BINDER-1): a default written to
+# $PSDefaultParameterValues binds every later command that has the parameter, with no splat in the file. Before r9 its *Variable* keys
+# were read only in a file with a splat. Shapes 1 and 2 were run in pwsh and do rebind `$cmd` (run dir proof\runtime-witness.txt); there
+# exact names, aliases (`*:ov`) and a parameter wildcard that matches one parameter (`*:OutVa*`) bind, a parameter prefix does not.
+def _r9(write, use=_R7_MARKER + " | Tee-Object"):
+    return "$cmd = 'Write-Output ok'; $key = " + _R7_MARKER + "; " + write + "; " + use + "; iex $cmd\n"
+
+
+@pytest.mark.parametrize("write,use", [
+    pytest.param("$PSDefaultParameterValues = @{'Tee-Object:Variable' = 'cmd'}", _R7_MARKER + " | Tee-Object", id="1-literal-hashtable"),
+    pytest.param("$PSDefaultParameterValues['*:OutVariable'] = 'cmd'", _R7_MARKER + " | Write-Output", id="2-indexer-wildcard-command"),
+    pytest.param("$PSDefaultParameterValues.Add('Tee-Object:Variable', 'cmd')", _R7_MARKER + " | Tee-Object", id="3-add"),
+    pytest.param("$PSDefaultParameterValues[$key] = 'cmd'", _R7_MARKER + " | Write-Output", id="4-non-constant-key"),
+    pytest.param("$PSDefaultParameterValues.set_Item('*:ov', 'cmd')", _R7_MARKER + " | Write-Output", id="set-item-alias"),
+    pytest.param("$PSDefaultParameterValues.'*:OutVa*' = 'cmd'", _R7_MARKER + " | Write-Output", id="member-parameter-wildcard"),
+    pytest.param("$PSDefaultParameterValues += @{'*:OutVariable' = 'cmd'}", _R7_MARKER + " | Write-Output", id="plus-equals-literal"),
+    pytest.param("$global:PSDefaultParameterValues['Tee-Object:Variable'] = 'cmd'", _R7_MARKER + " | Tee-Object", id="global-qualified"),
+    pytest.param("$PSDefaultParameterValues.Add($key, 'cmd')", _R7_MARKER + " | Write-Output", id="add-non-constant-key"),
+    pytest.param("$d = $PSDefaultParameterValues; $d['*:OutVariable'] = 'cmd'", _R7_MARKER + " | Write-Output", id="aliased-by-assignment"),
+    pytest.param("Set-Variable PSDefaultParameterValues @{'*:OutVariable' = 'cmd'}", _R7_MARKER + " | Write-Output", id="set-variable-by-name"),
+])
+def test_launcher_census_r9_a_default_parameter_binder_leaves_the_read_unresolved(write, use):
+    _r5_iex_is_unresolved(_r9(write, use))
+
+
+def test_launcher_census_r9_a_default_parameter_binder_leaves_a_scriptblock_create_unresolved():
+    # -OutVariable binds an ArrayList, which iex's [string] -Command refuses at run time; [scriptblock]::Create takes it as its text
+    text = ("$cmd = 'Write-Output ok'; $PSDefaultParameterValues['*:OutVariable'] = 'cmd'; " + _R7_MARKER + " | Write-Output; "
+            "& ([scriptblock]::Create($cmd))\n")
+    assert [ln for _, ln in _unresolved_sites(text) if "Create($cmd)" in ln], f"the created $cmd was resolved to the safe literal: {text!r}"
+
+
+# Controls: a default whose key names no *Variable* parameter, and reads and removals of $PSDefaultParameterValues, bind nothing, so a
+# safe same-scope literal stays resolved with no splat in the file.
+@pytest.mark.parametrize("write", [
+    pytest.param("$PSDefaultParameterValues['*:Encoding'] = 'utf8'", id="indexer-encoding"),
+    pytest.param("$PSDefaultParameterValues = @{'Out-File:Encoding' = 'utf8'; 'Disabled' = $false}", id="literal-no-binder-key"),
+    pytest.param("$PSDefaultParameterValues.Add('*:Encoding', 'utf8')", id="add-encoding"),
+    pytest.param("$global:PSDefaultParameterValues['*:Encoding'] = 'utf8'", id="global-encoding"),
+    pytest.param("$PSDefaultParameterValues.Remove('*:Encoding'); $n = $PSDefaultParameterValues.Count", id="remove-and-count"),
+])
+def test_launcher_census_r9_control_a_non_binder_default_keeps_the_literal(write):
+    text = _r9(write, use=_R7_MARKER + " | Out-File -FilePath x.txt")
+    assert _unresolved_sites(text) == [], f"a default that binds no variable made a safe same-scope literal unresolved: {text!r}"
