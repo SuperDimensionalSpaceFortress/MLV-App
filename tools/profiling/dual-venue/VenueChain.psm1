@@ -877,21 +877,25 @@ function Test-VenueJobLivenessReadback {
     # r2: agentScriptSha256 is the hash of the checkout's agent script the parser was lifted from, so a later drift between the checkout and the deployed agent shows in the receipt.
     $sha = $null
     $no = { param($why) [pscustomobject]@{ live = $false; state = 'UNKNOWN'; livenessState = 'UNKNOWN'; livenessUntilUtc = $null; why = $why; error = $why; agentScriptSha256 = $sha } }
-    if (-not $AgentScript) { $AgentScript = Join-Path $PSScriptRoot '..\bachelor\ultra-magnus-agent.ps1' }
-    if (-not (Test-Path -LiteralPath $AgentScript -PathType Leaf)) { return & $no "the agent script is not at $AgentScript" }
-    $sha = (Get-FileHash -LiteralPath $AgentScript -Algorithm SHA256).Hash.ToLowerInvariant()
-    $ast = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$null, [ref]$null)
-    $fns = @(foreach ($n in 'Get-JobNotAfterVerdict', 'Read-JobNotAfterSidecar') {
-        $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true)
-        if ($null -ne $f) { $f.Extent.Text }
-    })
-    if ($fns.Count -ne 2) { return & $no 'the agent script does not define both Get-JobNotAfterVerdict and Read-JobNotAfterSidecar' }
-    $arg = [pscustomobject]@{ functions = $fns; dir = ($AgentShare.TrimEnd('\') + '\notafter'); jobId = $JobId; notAfterUtc = $NotAfterUtc }
-    $r = Invoke-VenueBoundedRead -ScriptText $script:LivenessReadbackText -Argument $arg -TimeoutSec $TimeoutSec
-    if (-not $r.answered) { return & $no "read-back: $($r.error)" }
-    $v = try { [string](@($r.value) -join '') | ConvertFrom-Json -ErrorAction Stop } catch { $null }
-    if ($null -eq $v -or $null -eq $v.livenessState) { return & $no "read-back gave no verdict: $([string](@($r.value) -join ''))" }
-    [pscustomobject]@{ live = ([string]$v.livenessState -ceq 'live' -and [string]$v.state -cin @('open', 'none')); state = [string]$v.state; livenessState = [string]$v.livenessState; livenessUntilUtc = $v.livenessUntilUtc; why = [string]$v.why; error = $null; agentScriptSha256 = $sha }
+    # r3 (Dot B1 on 46768a21): a hash or read that throws after Test-Path succeeded (the script locked or vanished) is a not-live answer like any other. It never
+    # reaches the runner as an exception, which the runner's cleanup would read as a sent open.
+    try {
+        if (-not $AgentScript) { $AgentScript = Join-Path $PSScriptRoot '..\bachelor\ultra-magnus-agent.ps1' }
+        if (-not (Test-Path -LiteralPath $AgentScript -PathType Leaf)) { return & $no "the agent script is not at $AgentScript" }
+        $sha = (Get-FileHash -LiteralPath $AgentScript -Algorithm SHA256).Hash.ToLowerInvariant()
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$null, [ref]$null)
+        $fns = @(foreach ($n in 'Get-JobNotAfterVerdict', 'Read-JobNotAfterSidecar') {
+            $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true)
+            if ($null -ne $f) { $f.Extent.Text }
+        })
+        if ($fns.Count -ne 2) { return & $no 'the agent script does not define both Get-JobNotAfterVerdict and Read-JobNotAfterSidecar' }
+        $arg = [pscustomobject]@{ functions = $fns; dir = ($AgentShare.TrimEnd('\') + '\notafter'); jobId = $JobId; notAfterUtc = $NotAfterUtc }
+        $r = Invoke-VenueBoundedRead -ScriptText $script:LivenessReadbackText -Argument $arg -TimeoutSec $TimeoutSec
+        if (-not $r.answered) { return & $no "read-back: $($r.error)" }
+        $v = try { [string](@($r.value) -join '') | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+        if ($null -eq $v -or $null -eq $v.livenessState) { return & $no "read-back gave no verdict: $([string](@($r.value) -join ''))" }
+        [pscustomobject]@{ live = ([string]$v.livenessState -ceq 'live' -and [string]$v.state -cin @('open', 'none')); state = [string]$v.state; livenessState = [string]$v.livenessState; livenessUntilUtc = $v.livenessUntilUtc; why = [string]$v.why; error = $null; agentScriptSha256 = $sha }
+    } catch { return & $no "read-back threw: $($_.Exception.Message -replace '\s+', ' ')" }
 }
 
 function Start-VenueJobLiveness {

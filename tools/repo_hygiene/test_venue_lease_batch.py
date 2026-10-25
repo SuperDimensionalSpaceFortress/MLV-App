@@ -912,7 +912,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
 
     # ---------------------------------------------------------------- r6: the first sidecar write is read back with the agent's own parser (Grok G2 on #633)
     def _mirror_with_bad_sidecar(self, json_patch: str = "", writer_patch: tuple[str, str] | None = None,
-                                 module_patches: tuple[tuple[str, str], ...] = (), agent_patches: tuple[tuple[str, str], ...] = ()) -> None:
+                                 module_patches: tuple[tuple[str, str], ...] = (), agent_patches: tuple[tuple[str, str], ...] = (),
+                                 runner_patches: tuple[tuple[str, str], ...] = ()) -> None:
         """A copy of tools/profiling/{dual-venue,bachelor/ultra-magnus-agent.ps1} in which the runner's sidecar writer still says WRITTEN but writes bytes the agent
         would not read as live. json_patch is PowerShell run on $json before it is written; writer_patch replaces a statement of the write itself. The runner under test
         is the copy's own Invoke-VenueLeaseBatch.ps1 (self.runner), reading the agent's functions from the copy's bachelor folder."""
@@ -940,6 +941,12 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             text = text.replace(writer_patch[0], writer_patch[1])
         mod.write_text(text, encoding="utf-8")
         self.runner = tree / "dual-venue" / RUNNER.name
+        if runner_patches:
+            run_text = self.runner.read_text(encoding="utf-8")
+            for old, new in runner_patches:
+                self.assertEqual(run_text.count(old), 1, "the runner line moved: update this fixture")
+                run_text = run_text.replace(old, new)
+            self.runner.write_text(run_text, encoding="utf-8")
 
     def _assert_readback_refused(self, r: subprocess.CompletedProcess, want_state: str, end_reason: str = "LIVENESS_UNAVAILABLE", code: int = 9,
                                  detail: str = "agent's own parser does not read it as live") -> dict:
@@ -1085,6 +1092,47 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         sha = b["openLivenessReadback"]["agentScriptSha256"]
         self.assertRegex(sha, r"^[0-9a-f]{64}$")
         self.assertEqual(sha, hashlib.sha256(AGENT.read_bytes()).hexdigest(), "the mirror's agent script is the checkout's, byte for byte")
+
+    # ---------------------------------------------------------------- r3: a read-back that THROWS before the open is submitted is not a sent open (Dot B1 on 46768a21)
+    def test_r3_a_readback_that_throws_before_the_open_is_submitted_cancels_nothing_closes_nothing_and_charges_nothing(self) -> None:
+        # VenueChain.psm1 Test-VenueJobLivenessReadback: Test-Path on the agent script succeeds, then the hash (Get-FileHash) or the parse (ParseFile) throws because
+        # the file is locked or vanished. RED on 46768a21: the exception left $op null, the finally block read a null $op as "maybe sent", requested a cancel, submitted
+        # a close and wrote a full-LeaseCapSec open-unreconciled ledger row for an open that was never submitted, and the exception then escaped past the summary.
+        # (Parser::ParseFile itself does not throw on a missing file: it returns an error AST, which the helper already treats as "functions not defined".) Case 1: the
+        # path Get-FileHash reads is swapped for one that does not exist, so the .NET call really throws. Case 2: a simulated throw where the helper reads the script.
+        # The batch ends typed, with its summary.
+        hash_old = "(Get-FileHash -LiteralPath $AgentScript -Algorithm SHA256)"
+        read_old = "    $ast = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$null, [ref]$null)"
+        for label, old, new in (
+            ("the hash throws", hash_old, "(Get-FileHash -LiteralPath ($AgentScript + '.vanished') -Algorithm SHA256)"),
+            ("the read throws", read_old, "    throw 'vanished: simulated read failure, the agent script is locked'\n" + read_old),
+        ):
+            with self.subTest(label):
+                self.setUp()   # a fresh share, claim dir and run dir per case
+                self._mirror_with_bad_sidecar(module_patches=((old, new),))
+                r = self.run_batch(self.specs[:2], "-CancelReconcileSec", "3")
+                b = self._assert_readback_refused(r, "UNKNOWN")
+                self.assertIn("vanished", b["openLivenessReadback"]["why"], b["openLivenessReadback"])
+                self.assertEqual(list((self.share / "cancel").iterdir()), [], "a cancel was requested for an open that was never submitted")
+                self.assertFalse((self.claims / "bachelor.lease-ledger.jsonl").exists(), "the ledger was charged for an open that was never submitted")
+                self.assertIn("LEASE_BATCH_RESULT=", r.stdout, "the original exception escaped past the batch summary")
+                log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+                self.assertNotIn(" BATCH_OPEN_CANCEL ", log)
+                self.assertNotIn(" BATCH_OPEN_RECONCILED ", log)
+
+    def test_r3_a_submit_that_throws_is_an_uncertain_open_and_keeps_the_conservative_cancel_close_and_ledger_row(self) -> None:
+        # Control for the case above: here the open IS (maybe) submitted. Submit-AgentJob throws for the open job before it reports anything, so $op stays null; the
+        # submitted flag, not $op, tells the finally block the open may be in the agent's gate: cancel requested, close submitted, open-unreconciled row charged.
+        anchor = '    $f = Join-Path $jobDir "$JobId.job.ps1"'
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, "    if ($JobId -like 'lease-batch-open-*') { throw 'simulated submit failure' }\n" + anchor),))
+        r = self.run_batch([self.specs[0]], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=30)), "-CancelReconcileSec", "3")
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["openCancel"]["requested"], b["openCancel"]["state"]), ("REQUESTED", "UNRECONCILED"), b)
+        self.assertTrue((self.share / "cancel" / f"{b['openJobId']}.cancel").exists(), "the cancel request stays for the agent")
+        self.assertTrue(b["closeJobId"], "the close was not submitted")
+        self.assertEqual(b["ledger"]["basis"], "open-unreconciled", b["ledger"])
+        self.assertTrue((self.claims / "bachelor.lease-ledger.jsonl").exists())
 
     # ---------------------------------------------------------------- r5b: no probe or leg without the claim (Grok G1, 6389240991)
     def test_r5b_a_claim_taken_over_mid_batch_ends_the_batch_claim_lost_and_keeps_the_legs_already_run(self) -> None:
