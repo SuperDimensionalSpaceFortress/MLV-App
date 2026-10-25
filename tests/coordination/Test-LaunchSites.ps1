@@ -64,6 +64,22 @@ Rules, written down because the census depends on them:
                 taint every name; the text an iex / [scriptblock]::Create / .InvokeScript / .NewScriptBlock runs is parsed and each name
                 it writes is tainted, and a text not resolved to literals taints every name. Bound: one file at a time, so a function
                 in another file that writes through its caller's SessionState is caught only in its own file.
+            V3. (r7, Dot a3d55115, Grok G1; hub ruling HUB-TICK 20261025T0526Z) Rule V is closed by an allowlist. A read of `$x` resolves
+                only when every construct in the file that binds or could bind x is one of: (a) `$x = <constant>` in the reading scope
+                before the read (rule V); (b) a `foreach ($x in ...)` header (it never resolves the read, it only does not taint); (c) a
+                param of a function, of a class method, of the file, or of a { } literal run with `&` (none of these is dot-sourced;
+                `. F` and `. $sb` already taint every name). Anything else that names x taints x: a param of any other { } literal (`.`,
+                ForEach-Object, a block kept in a variable), the target of ++ / --, an assignment through any number of casts and
+                attributes. Anything that could name a variable dynamically taints every name: a member access or call whose member
+                name is not a constant string (`.$m`, `.($m)`), a non-constant variable-name argument, a splat whose value is not a
+                hashtable literal of this file (a parameter, $PSBoundParameters, @args, a call result), and, in a file with a splat, a
+                hashtable key or a member / index write whose key is not constant, or a method call given a binder name. Binder
+                parameters: any parameter whose name holds `variable`, an alias or a prefix (2+ letters) of a *Variable* parameter
+                of a cmdlet that ships with pwsh ($VarParamNames / $VarParamAliases), and the common -*Variable parameters; the same
+                words as hashtable keys or member names in a file with a splat; every positional argument of a cmdlet whose
+                *Variable* parameter is positional (Import-LocalizedData); -Name or the first positional of the *-Variable cmdlets.
+                Get-Variable's -ValueOnly counts only as the bare switch or `:$true` with no splat. tools/repo_hygiene/
+                test_launch_site_census_binders.py walks the live Get-Command parameter metadata and fails on any binder missed here.
 #>
 [CmdletBinding()]
 param()
@@ -127,11 +143,27 @@ function Get-VarQualifier($V) { if ($V.VariablePath.UserPath -match $QualRx) { r
 $AutoVars = [HashSet[string]]::new([string[]]@('args', 'input', '_', 'psitem', 'this', 'matches', 'foreach', 'switch', 'sender', 'event', 'eventargs',
         'eventsubscriber', 'myinvocation', 'psboundparameters', 'pscmdlet', 'error', 'lastexitcode'))
 $BindParamRx = [regex]::new('^(?i)(ov|ev|wv|iv|pv|outv\w*|errorv\w*|warningv\w*|informationv\w*|pipelinev\w*)$')
+# r7 (rule V3): the *Variable* parameters (and their aliases) of the cmdlets that ship with pwsh, listed by hand so the census reads the same
+# on every platform. A parameter word that holds `variable`, is one of these aliases, or is a prefix (2+ letters) of one of these names
+# binds a variable by name. test_launch_site_census_binders.py walks the live metadata and fails on any binder these words miss.
+$VarParamNames = @('variable', 'bindingvariable', 'sessionvariable', 'statuscodevariable', 'responseheadersvariable', 'variablestoexport',
+    'variabledefinitions', 'environmentvariables', 'outvariable', 'errorvariable', 'warningvariable', 'informationvariable', 'pipelinevariable')
+$VarParamAliases = [HashSet[string]]::new([string[]]@('ov', 'ev', 'wv', 'iv', 'pv', 'rhv', 'sv', 'v'))
+$PositionalVarBinders = [HashSet[string]]::new([string[]]@('import-localizeddata'))
+
+function Test-BinderParameter([string]$Word) {
+    $w = $Word.ToLowerInvariant()
+    if ($BindParamRx.IsMatch($w) -or $w.Contains('variable') -or $VarParamAliases.Contains($w)) { return $true }
+    if ($w.Length -lt 2) { return $false }
+    foreach ($n in $VarParamNames) { if ($n.StartsWith($w, [StringComparison]::Ordinal)) { return $true } }
+    return $false
+}
 
 # r5 (rule V2): cmdlets that bind a variable by name, item cmdlets that write through a provider path, and location cmdlets. Aliases are
 # listed by hand so the census reads the same on every platform; parameters come from each cmdlet's own metadata at run time.
 $VarCmds = @{ 'set-variable' = 'Set-Variable'; 'set' = 'Set-Variable'; 'sv' = 'Set-Variable'; 'new-variable' = 'New-Variable'; 'nv' = 'New-Variable'
     'remove-variable' = 'Remove-Variable'; 'rv' = 'Remove-Variable'; 'clear-variable' = 'Clear-Variable'; 'clv' = 'Clear-Variable'
+    'get-variable' = 'Get-Variable'; 'gv' = 'Get-Variable'
 }
 $ItemCmds = @{ 'set-item' = 'Set-Item'; 'si' = 'Set-Item'; 'new-item' = 'New-Item'; 'ni' = 'New-Item'; 'set-content' = 'Set-Content'; 'sc' = 'Set-Content'
     'add-content' = 'Add-Content'; 'ac' = 'Add-Content'; 'clear-content' = 'Clear-Content'; 'clc' = 'Clear-Content'; 'clear-item' = 'Clear-Item'
@@ -237,6 +269,20 @@ function Get-ScopeParameters($S) {
     return , $names
 }
 
+# r7 (rule V3): $true for a param that binds in a scope of its own: a function's, a class method's, the file's, or a { } literal's that is
+# run with `&`. A { } literal can be dot-sourced (`.`, ForEach-Object, a block kept in a variable), and then its params are the caller's.
+function Test-OwnScopeParameter($P) {
+    $owner = $P.Parent
+    if ($owner -is [FunctionDefinitionAst] -or $owner -is [FunctionMemberAst]) { return $true }
+    if (-not ($owner -is [ParamBlockAst])) { return $false }
+    $sb = $owner.Parent
+    if ($null -eq $sb.Parent -or $sb.Parent -is [FunctionDefinitionAst] -or $sb.Parent -is [FunctionMemberAst]) { return $true }
+    $e = $sb.Parent
+    $cmd = $e.Parent
+    return ($e -is [ScriptBlockExpressionAst] -and $cmd -is [CommandAst] -and $cmd.InvocationOperator -eq [TokenKind]::Ampersand -and
+        [object]::ReferenceEquals($cmd.CommandElements[0], $e))
+}
+
 function Add-Assign($Ctx, $V, $Op, $Right, $Scope, [bool]$Direct, [int]$End, [bool]$Script = $false) {
     $k = Get-VarKey $V
     if ($null -eq $Ctx.Assign[$k]) { $Ctx.Assign[$k] = [List[object]]::new() }
@@ -270,10 +316,13 @@ function Add-CommandBindings($Ctx, $Cmd) {
     $leaf = if ($name) { ($name -split '\\')[-1].ToLowerInvariant() } else { '' }
     for ($i = 1; $i -lt $els.Count; $i++) {
         $el = $els[$i]
-        if ($el -is [CommandParameterAst] -and $BindParamRx.IsMatch($el.ParameterName)) {
+        if ($el -is [CommandParameterAst] -and (Test-BinderParameter $el.ParameterName)) {
+            # r7 (V3): a binder with no value binds nothing, except the common ones r4 already read that way
             $v = Get-ParameterValue $els $i
-            if ($null -eq $v) { $Ctx.TaintAll = $true } else { Add-Taint $Ctx $v }
+            if ($null -ne $v) { Add-Taint $Ctx $v } elseif ($BindParamRx.IsMatch($el.ParameterName)) { $Ctx.TaintAll = $true }
         }
+        if ($el -is [VariableExpressionAst] -and $el.Splatted) { $Ctx.Splats.Add($el) }
+        elseif ($PositionalVarBinders.Contains($leaf) -and -not ($el -is [CommandParameterAst])) { Add-Taint $Ctx $el }
         $s = Get-ConstString $el
         if ($null -ne $s -and $LocationCmdRx.IsMatch($leaf) -and $VarDriveRx.IsMatch($s)) { $Ctx.TaintAll = $true }
     }
@@ -288,8 +337,17 @@ function Add-CommandBindings($Ctx, $Cmd) {
     if ($leaf -eq 'get-command' -or $leaf -eq 'gcm') { $Ctx.CmdletName = $true }
     if ($VarObjectCmdRx.IsMatch($leaf)) { $Ctx.VarObject = $true }
     if ($leaf -eq 'get-variable' -or $leaf -eq 'gv') {
-        $valueOnly = @($els | Where-Object { $_ -is [CommandParameterAst] -and 'valueonly'.StartsWith($_.ParameterName.ToLowerInvariant(), [StringComparison]::Ordinal) -and $_.ParameterName.Length -ge 2 }).Count -gt 0
-        if (-not $valueOnly) { $Ctx.VarObject = $true }
+        # r7 (V3): -ValueOnly is on only as the bare switch or -ValueOnly:$true, with no splat that could turn it off
+        $valueOnly = $false; $splat = $false
+        foreach ($el in $els) {
+            if ($el -is [VariableExpressionAst] -and $el.Splatted) { $splat = $true }
+            if (-not ($el -is [CommandParameterAst])) { continue }
+            $p = Resolve-CmdletParameter $ParamTables['Get-Variable'] $el.ParameterName
+            if ($null -eq $p -or $p.Name -ne 'ValueOnly') { continue }
+            $arg = $el.Argument
+            $valueOnly = $null -eq $arg -or ($arg -is [VariableExpressionAst] -and $arg.VariablePath.UserPath -ieq 'true')
+        }
+        if (-not $valueOnly -or $splat) { $Ctx.VarObject = $true }
     }
     if ($VarCmds.ContainsKey($leaf)) {
         # Set-Variable -Scope Local cmd <value>: the name is -Name, else the first positional once the named parameters have their values
@@ -485,6 +543,8 @@ function New-Ctx($Root) {
     return @{
         Assign = @{}; Member = @{}; Root = $Root; Tainted = [HashSet[string]]::new(); TaintAll = $false; VarObject = $false; ValueWrite = $false
         DynamicCall = $false; CmdletName = $false
+        # r7 (V3): splatted variables, every param name, and the keyed writes a splat could carry (checked after the walk)
+        Splats = [List[object]]::new(); ParamNames = [HashSet[string]]::new(); KeyedValues = [List[object]]::new(); DynamicKey = $false
     }
 }
 
@@ -506,6 +566,19 @@ function Read-Writes($Ctx, $Root, $Lists, [int]$Depth) {
                 $isSb = $mn -ne 'create' -or ($a.Static -and $a.Expression -is [TypeExpressionAst] -and $SbTypeRx.IsMatch($a.Expression.TypeName.FullName))
                 if ($isSb) { $executed.Add($(if ($null -ne $a.Arguments -and $a.Arguments.Count -gt 0) { $a.Arguments[0] } else { $null })) }
             }
+            # r7 (V3): $h.Add('OutVariable', ...) can put a binder into a hashtable a splat then carries
+            if ($a -is [InvokeMemberExpressionAst] -and $null -ne $a.Arguments) {
+                foreach ($g in $a.Arguments) { $gs = Get-ConstString $g; if ($null -ne $gs -and (Test-BinderParameter $gs)) { $Ctx.DynamicKey = $true } }
+            }
+        }
+        # r7 (V3): a member name that is not a constant can name anything (.Value, .set_Value, .PSVariable, ...)
+        elseif ($a -is [MemberExpressionAst]) { $Ctx.TaintAll = $true }
+        if ($a -is [HashtableAst]) {
+            foreach ($kv in $a.KeyValuePairs) {
+                $key = Get-Inner $kv.Item1
+                if ($key -is [StringConstantExpressionAst]) { if (Test-BinderParameter $key.Value) { $Ctx.KeyedValues.Add($kv.Item2) } }
+                elseif (-not ($key -is [ConstantExpressionAst])) { $Ctx.DynamicKey = $true }
+            }
         }
         if ($a -is [StringConstantExpressionAst]) {
             [void](Add-VarDriveTaint $Ctx $a.Value)
@@ -523,25 +596,43 @@ function Read-Writes($Ctx, $Root, $Lists, [int]$Depth) {
         elseif (($a -is [StringConstantExpressionAst] -and $a.StringConstantType -ne [StringConstantType]::BareWord) -or $a -is [ExpandableStringExpressionAst]) { if ($null -ne $Lists) { $Lists.Strings.Add($a) } }
         elseif ($a -is [ForEachStatementAst]) { Add-Write $Ctx $a.Variable $null $null (Get-Scope $a) $false 0 }
         elseif ($a -is [ConvertExpressionAst] -and $a.Type.TypeName.Name -ieq 'ref' -and (Get-Inner $a.Child) -is [VariableExpressionAst]) { [void]$Ctx.Tainted.Add((Get-VarKey (Get-Inner $a.Child))) }
+        elseif ($a -is [ParameterAst]) {
+            # r7 (V3): a param binds in the caller's scope when its { } literal is dot-sourced
+            $pk = Get-VarKey $a.Name
+            [void]$Ctx.ParamNames.Add($pk)
+            if (-not (Test-OwnScopeParameter $a)) { [void]$Ctx.Tainted.Add($pk) }
+        }
+        elseif ($a -is [UnaryExpressionAst] -and $a.TokenKind -in @([TokenKind]::PlusPlus, [TokenKind]::MinusMinus, [TokenKind]::PostfixPlusPlus, [TokenKind]::PostfixMinusMinus)) {
+            $v = Get-Inner $a.Child
+            if ($v -is [VariableExpressionAst]) { Add-Write $Ctx $v $a.TokenKind $null (Get-Scope $a) $false 0 }
+        }
         elseif ($a -is [AssignmentStatementAst]) {
+            # r7 (V3): casts and attributes on the left are peeled whatever their number; a left side of any other shape taints every name
             $left = $a.Left
-            if ($left -is [ConvertExpressionAst]) { $left = $left.Child }
+            while ($left -is [AttributedExpressionAst]) { $left = $left.Child }
             if ($left -is [VariableExpressionAst]) {
                 Add-Write $Ctx $left $a.Operator $a.Right (Get-Scope $a) ($a.Parent -is [NamedBlockAst]) $a.Extent.EndOffset
             }
             elseif ($left -is [ArrayLiteralAst]) {
                 # `$a, $b = ...` splits a value at run time: each name is bound, none to a literal
-                foreach ($el in $left.Elements) { $v = Get-Inner $el; if ($v -is [VariableExpressionAst]) { Add-Write $Ctx $v $null $null (Get-Scope $a) $false 0 } }
+                foreach ($el in $left.Elements) {
+                    $v = Get-Inner $el
+                    while ($v -is [AttributedExpressionAst]) { $v = $v.Child }
+                    if ($v -is [VariableExpressionAst]) { Add-Write $Ctx $v $null $null (Get-Scope $a) $false 0 }
+                }
             }
             elseif ($left -is [MemberExpressionAst] -or $left -is [IndexExpressionAst]) {
                 $target = if ($left -is [MemberExpressionAst]) { Get-Inner $left.Expression } else { Get-Inner $left.Target }
                 $member = if ($left -is [MemberExpressionAst]) { $left.Member } else { Get-Inner $left.Index }
+                if ($member -is [StringConstantExpressionAst]) { if (Test-BinderParameter $member.Value) { $Ctx.KeyedValues.Add($a.Right) } }
+                elseif (-not ($member -is [ConstantExpressionAst])) { $Ctx.DynamicKey = $true }
                 if ($target -is [VariableExpressionAst] -and $member -is [StringConstantExpressionAst]) {
                     $k = Get-VarKey $target
                     if ($null -eq $Ctx.Member[$k]) { $Ctx.Member[$k] = [List[object]]::new() }
                     $Ctx.Member[$k].Add(@{ Key = $member.Value; Right = $a.Right })
                 }
             }
+            else { $Ctx.TaintAll = $true }
         }
     }
 
@@ -555,6 +646,20 @@ function Read-Writes($Ctx, $Root, $Lists, [int]$Depth) {
         $before = "$($Ctx.TaintAll) $($Ctx.Tainted.Count)"
         foreach ($x in $executed) { Add-ExecutedWrites $Ctx $x 0 $Depth }
         if ("$($Ctx.TaintAll) $($Ctx.Tainted.Count)" -eq $before) { break }
+    }
+    # r7 (V3): a splat binds its keys like named parameters. Only a name whose every value in this file is a hashtable literal is read;
+    # then every binder key in the file (a hashtable can be aliased or filled by a function) taints what it names, and a key that is not
+    # constant taints every name.
+    if ($Ctx.Splats.Count -gt 0) {
+        foreach ($s in $Ctx.Splats) {
+            $sk = Get-VarKey $s
+            $rs = @($Ctx.Assign[$sk] | Where-Object { $null -ne $_ })
+            $other = @($rs | Where-Object { $null -eq $_.Right -or -not ((Get-Inner $_.Right) -is [HashtableAst]) }).Count -gt 0
+            if ($rs.Count -eq 0 -or $other -or $AutoVars.Contains($sk) -or $Ctx.ParamNames.Contains($sk) -or $Ctx.Tainted.Contains($sk) -or
+                $s.VariablePath.UserPath.Contains(':')) { $Ctx.TaintAll = $true }
+        }
+        if ($Ctx.DynamicKey) { $Ctx.TaintAll = $true }
+        foreach ($v in $Ctx.KeyedValues) { Add-Taint $Ctx $v }
     }
 }
 
@@ -582,6 +687,8 @@ function Add-ExecutedWrites($Ctx, $Arg, [int]$Hops, [int]$Depth) {
         $sub = [Parser]::ParseInput($s, [ref]$t, [ref]$e)
         $c = New-Ctx $sub
         Read-Writes $c $sub $null ($Depth + 1)
+        # r7 (V3): the executed text runs in this scope, so its own top-level params bind here too
+        foreach ($k in (Get-ScopeParameters $sub)) { [void]$Ctx.Tainted.Add($k) }
         if ($c.TaintAll) { $Ctx.TaintAll = $true }
         foreach ($k in $c.Tainted) { [void]$Ctx.Tainted.Add($k) }
         foreach ($k in $c.Assign.Keys) { [void]$Ctx.Tainted.Add($k) }
