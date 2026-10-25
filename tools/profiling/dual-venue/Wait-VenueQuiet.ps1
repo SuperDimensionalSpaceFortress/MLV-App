@@ -66,6 +66,12 @@
 #          gpu); `attr proc` lines append owner, project and script_check; `ident probe` (user, elevated, cost), `ident gpu` (GPU-heavy pids not already in top, with script_check),
 #          `ident note` and `ident error` follow the attr lines. script_check is printed only for a row that carries it (an older probe's row prints what it printed before).
 #          No command line is ever printed. Summarize-VenueBusyProbes.ps1 (read-only) groups the busy probes' raw files by project using this script's own decision function.
+#      HEAT / GPU / LEASE TELEMETRY (VENUE-PROBE-HEAT-GPU-TELEMETRY-1): RECORD-ONLY fields on every probe line (telemetry_schema mlv-app/venue-quiet-probe-telemetry/v1; the
+#        top-level schema stays v2), read after the sample window, each block failure-isolated and every read bounded: heat{} = the agent's own heavy-slot feed reading (source,
+#        sample_age_s, hottest_core_c, max15_c, mean_c and throttled over the agent's 60-row window, package_w); gpu{} = the dGPU power state read FIRST from
+#        DEVPKEY_Device_PowerData, which does not wake it, and nvidia-smi only when it is already D0 (else skipped_wake_risk = true and nothing else is read);
+#        seconds_since_last_lease + last_lease{} = the newest quiet-lease event in the agent's logs\agent.log. Every null has a typed reason; none of it reaches the
+#        decision. The gate prints three `tele` lines after the ident lines. The contract is documented above $telemetrySchema in the job.
 #   3. decides: QUIET when the UNROUNDED mean of the 3 samples is <= -ThresholdPercent (the printed mean is rounded to 0.1 for display only). A
 #      failed counter read makes the check UNKNOWN, never quiet.
 #   4. re-probes every -RecheckSec until QUIET or -MaxWaitSec, then prints `QUIET mean=<x>` or `COOLDOWN_UNMET mean=<x>` (a MEASURED busy venue) and the top
@@ -494,6 +500,217 @@ foreach ($c in ($cores | Group-Object core_class)) {
     $vals = @($c.Group | ForEach-Object { $_.percent })
     $classAgg[$c.Name] = [ordered]@{ count = $vals.Count; mean_percent = Get-Mean $vals; max_percent = ($vals | Measure-Object -Maximum).Maximum }
 }
+# HEAT / GPU / LEASE TELEMETRY (VENUE-PROBE-HEAT-GPU-TELEMETRY-1): RECORD-ONLY. It runs after the sample window and every v2 figure, and nothing reads it but the line.
+# BACHELOR-HEAT-WHILE-QUIET-DIAG-1 r1: two long quiet-lease waits fit the heat gate while this probe saw nothing. Three blocks, each in its own try/catch, every read in a worker
+# runspace with a deadline of its own ($TelemetryCallMs, abandoned past it):
+#   heat{}  the agent's OWN reading of the heavy-slot feed (ultra-magnus-agent.ps1 Read-HeavySlotFeedMetrics + ConvertFrom-HeavySlotFeedRows, copied rather than re-derived: this
+#           job is text run on the venue and cannot import the agent): HEAVY_SLOT_FEED, else C:\temp\hwinfo-log-adapter.csv; the last 150 rows; column 3 PackageC (the HOTTEST
+#           core), 4 package W, 5 / 6 throttling "Yes". The last 60 rows (GateSustainedRows): throttled and mean_c; the last 15: max15_c and package_w (the agent's watts30);
+#           hottest_core_c is the newest row. Older than 120 s (GateFeedStaleSec), fewer than 15 rows, or a row that does not parse: every value null, typed.
+#   gpu{}   the dGPU (display-class PCI\VEN_10DE) POWER STATE FIRST, from DEVPKEY_Device_PowerData (CM_POWER_DATA; bytes 4-7 = PD_MostRecentPowerState, 1 = D0 .. 4 = D3). That
+#           property is the PnP manager's record of the device's last power state: reading it sends the device no I/O and does not wake it (project memory
+#           bachelor-dgpu-nvidia-smi-wake-trap-20261011: nvidia-smi / NVML WAKE a D3 dGPU and read a bogus state). ONLY in D0 (already awake) is nvidia-smi run, once; in D1-D3 or
+#           unknown nothing else is read and skipped_wake_risk is true. No NVIDIA display adapter: state absent.
+#   seconds_since_last_lease + last_lease{}: the newest quiet-lease event in the agent's own log, <job working directory>\logs\agent.log (the agent starts every job in its root),
+#           tail only: `quiet-lease: active`, `ended ... active=True`, `batch-opened|batch-reused|batch-parked|batch-ended`, `stale lease`. A request that never held a lease
+#           (ended active=False) is not a lease.
+# A null always has a typed reason in its block's `reasons` (field -> code); 0 is never an unknown. COST: 4 bounded calls (feed, log, power state; nvidia-smi only in D0), at most
+# 4 x $TelemetryCallMs = 16 s, so 24 s sampling + 16 s + the process-attribution worst case below (55 s) = 95 s, inside the 120 s submission timeout. An abandoned worker
+# ends the job after its line is written, as an abandoned attribution worker does.
+# $TelemetryWorkerPrelude and $TelemetryReadDelayMs are TEST SEAMS (empty / 0 in production; only a test rewrites the literal in its own copy of the job).
+$telemetrySchema = 'mlv-app/venue-quiet-probe-telemetry/v1'
+$HeatFeedPath = $(if ($env:HEAVY_SLOT_FEED) { $env:HEAVY_SLOT_FEED } else { 'C:\temp\hwinfo-log-adapter.csv' })
+$HeatWindowRows = 60
+$HeatStaleSec = 120
+$LeaseLogPath = ''
+$TelemetryCallMs = 4000
+$TelemetryWorkerPrelude = ''
+$TelemetryReadDelayMs = 0
+# the tail of one local file: $args[0] path, $args[1] max bytes, $args[2] the test seam delay. { ok, v = { exists, ageSec, text, partial }, msg }; never throws.
+$TelTailScript = {
+    try {
+        if ([int]$args[2] -gt 0) { [Threading.Thread]::Sleep([int]$args[2]) }
+        $fs = $null
+        try { $fs = [IO.File]::Open([string]$args[0], [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete) }
+        catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { return [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ exists = $false; ageSec = $null; text = $null; partial = $false }; msg = $null } }
+        try {
+            $age = ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc([string]$args[0])).TotalSeconds
+            $start = [Math]::Max([long]0, $fs.Length - [long]$args[1])
+            [void]$fs.Seek($start, [IO.SeekOrigin]::Begin)
+            $text = [IO.StreamReader]::new($fs, [Text.Encoding]::UTF8).ReadToEnd()
+        } finally { $fs.Dispose() }
+        [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ exists = $true; ageSec = $age; text = $text; partial = ($start -gt 0) }; msg = $null }
+    } catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
+}.ToString()
+# the dGPU power state, never anything that touches the device: { ok, v = { id, data }, msg }
+$TelGpuStateScript = {
+    $id = $null
+    try {
+        $all = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction Stop)
+        $d = @($all | Where-Object { [string]$_.InstanceId -like 'PCI\VEN_10DE*' } | Sort-Object InstanceId)
+        if ($d.Count -eq 0) { return [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ id = $null; data = $null }; msg = $null } }
+        $id = [string]$d[0].InstanceId
+        $p = Get-PnpDeviceProperty -InstanceId $id -KeyName 'DEVPKEY_Device_PowerData' -ErrorAction Stop
+        [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ id = $id; data = [byte[]]@($p.Data) }; msg = $null }
+    } catch { [pscustomobject]@{ ok = $false; v = [pscustomobject]@{ id = $id; data = $null }; msg = [string]$_.Exception.Message } }
+}.ToString()
+# ONLY called for a dGPU already in D0: one nvidia-smi query. { ok, v = { rc, lines }, msg }
+$TelSmiScript = {
+    try {
+        $out = @(& 'nvidia-smi' '--query-gpu=utilization.gpu,temperature.gpu,power.draw,pstate' '--format=csv,noheader,nounits' 2>&1 | ForEach-Object { [string]$_ })
+        [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ rc = $(if ($null -eq $LASTEXITCODE) { 0 } else { [int]$LASTEXITCODE }); lines = $out }; msg = $null }
+    } catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
+}.ToString()
+$script:TelRs = $null
+$script:TelAbandoned = 0
+# one call with a deadline of its own: { timeout, ok, v, msg }. A call past the deadline is ABANDONED (its worker dies with the process; the next call gets a fresh one).
+function Invoke-TelBounded([string]$Script, [object[]]$ArgList, [int]$TimeoutMs) {
+    $ps = [powershell]::Create()
+    try {
+        if ($null -eq $script:TelRs) {
+            $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+            if ($TelemetryWorkerPrelude) { $pp = [powershell]::Create(); try { $pp.Runspace = $rs; [void]$pp.AddScript($TelemetryWorkerPrelude); [void]$pp.Invoke() } finally { $pp.Dispose() } }
+            $script:TelRs = $rs
+        }
+        $ps.Runspace = $script:TelRs
+        [void]$ps.AddScript($Script)
+        foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }
+        $ar = $ps.BeginInvoke()
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            $script:TelRs = $null; $script:TelAbandoned++
+            try { [void]$ps.BeginStop($null, $null) } catch { }
+            $ps = $null
+            return [pscustomobject]@{ timeout = $true; ok = $false; v = $null; msg = "timed out after $TimeoutMs ms" }
+        }
+        $o = @($ps.EndInvoke($ar)) | Select-Object -Last 1
+        if ($null -eq $o) { return [pscustomobject]@{ timeout = $false; ok = $false; v = $null; msg = 'the worker returned nothing' } }
+        [pscustomobject]@{ timeout = $false; ok = [bool]$o.ok; v = $o.v; msg = [string]$o.msg }
+    } catch {
+        [pscustomobject]@{ timeout = $false; ok = $false; v = $null; msg = [string]$_.Exception.Message }
+    } finally { if ($null -ne $ps) { $ps.Dispose() } }
+}
+# every still-null field of a block gets the code (a field that has a value never does)
+function Set-TelNulls($Block, [string[]]$Fields, [string]$Code) { foreach ($f in $Fields) { if ($null -eq $Block[$f] -and -not $Block.reasons.Contains($f)) { $Block.reasons[$f] = $Code } } }
+# PURE, the agent's ConvertFrom-HeavySlotFeedRows: @{ m; why }. m = $null when a data row does not parse (feed-unparseable) or fewer than 15 data rows remain (feed-too-few-rows).
+function ConvertFrom-TelFeedRows([string[]]$Lines) {
+    $inv = [Globalization.CultureInfo]::InvariantCulture; $num = [Globalization.NumberStyles]::Float
+    $recs = [Collections.Generic.List[object]]::new()
+    foreach ($r in @($Lines | Select-Object -Last 150)) {
+        if ([string]::IsNullOrEmpty($r)) { continue }
+        $c = $r.Split(',')
+        if ($c.Count -lt 7 -or $c[0].Length -lt 1 -or -not [char]::IsDigit($c[0], 0)) { continue }
+        $t = 0.0; $w = 0.0
+        if (-not [double]::TryParse($c[3], $num, $inv, [ref]$t)) { return @{ m = $null; why = 'feed-unparseable' } }
+        if (-not [double]::TryParse($c[4], $num, $inv, [ref]$w)) { return @{ m = $null; why = 'feed-unparseable' } }
+        $recs.Add([pscustomobject]@{ c = $t; w = $w; thr = ($c[5].Trim() -eq 'Yes' -or $c[6].Trim() -eq 'Yes') })
+    }
+    if ($recs.Count -lt 15) { return @{ m = $null; why = 'feed-too-few-rows' } }
+    $win = @($recs | Select-Object -Last $HeatWindowRows); $last15 = @($recs | Select-Object -Last 15)
+    @{ why = $null; m = [pscustomobject]@{ window = $win.Count; throttled = @($win | Where-Object { $_.thr }).Count; meanC = ($win | Measure-Object -Property c -Average).Average
+        max15C = ($last15 | Measure-Object -Property c -Maximum).Maximum; watts30 = [Math]::Round(($last15 | Measure-Object -Property w -Average).Average, 1); lastC = $recs[$recs.Count - 1].c } }
+}
+$heatFields = @('sample_age_s', 'hottest_core_c', 'max15_c', 'mean_c', 'throttled', 'window_rows', 'package_w')
+$telHeat = [ordered]@{ source = 'unavailable'; sample_age_s = $null; hottest_core_c = $null; max15_c = $null; mean_c = $null; throttled = $null; window_rows = $null; package_w = $null
+    window_rule_rows = $HeatWindowRows; stale_after_s = $HeatStaleSec; reasons = [ordered]@{}; why = $null }
+try {
+    $w = Invoke-TelBounded $TelTailScript @($HeatFeedPath, (80 * 150 + 400), $TelemetryReadDelayMs) $TelemetryCallMs
+    $code = $null
+    if ($w.timeout) { $code = 'timeout'; $telHeat.why = "feed read exceeded $TelemetryCallMs ms ($HeatFeedPath)" }
+    elseif (-not $w.ok) { $code = 'feed-read-failed'; $telHeat.why = ([string]$w.msg -replace '\s+', ' ') }
+    elseif (-not $w.v.exists) { $code = 'feed-missing'; $telHeat.why = "no feed at $HeatFeedPath" }
+    else {
+        $telHeat.source = $HeatFeedPath; $telHeat.sample_age_s = [math]::Round([double]$w.v.ageSec, 1)
+        if ([double]$w.v.ageSec -gt $HeatStaleSec) { $code = 'feed-stale'; $telHeat.why = "feed older than $HeatStaleSec s" }
+        else {
+            $lines = @(([string]$w.v.text) -split "`r?`n")
+            if ($w.v.partial) { $lines = @($lines | Select-Object -Skip 1) }   # the first line read mid-row is partial
+            $r = ConvertFrom-TelFeedRows $lines
+            if ($null -eq $r.m) { $code = $r.why }
+            else {
+                $telHeat.hottest_core_c = [double]$r.m.lastC; $telHeat.max15_c = [double]$r.m.max15C; $telHeat.mean_c = [math]::Round([double]$r.m.meanC, 2)
+                $telHeat.throttled = [int]$r.m.throttled; $telHeat.window_rows = [int]$r.m.window; $telHeat.package_w = [double]$r.m.watts30
+            }
+        }
+    }
+    if ($code) { Set-TelNulls $telHeat $heatFields $code }
+} catch { $telHeat.why = ([string]$_.Exception.Message -replace '\s+', ' '); Set-TelNulls $telHeat $heatFields 'telemetry-error' }
+$gpuFields = @('utilization_percent', 'temp_c', 'power_w', 'pstate')
+$telGpu = [ordered]@{ method = 'DEVPKEY_Device_PowerData'; vendor_filter = 'VEN_10DE'; device = $null; state = 'unknown'; power_state_raw = $null; state_reason = $null
+    skipped_wake_risk = $true; utilization_percent = $null; temp_c = $null; power_w = $null; pstate = $null; reasons = [ordered]@{}; why = $null }
+try {
+    $w = Invoke-TelBounded $TelGpuStateScript @() $TelemetryCallMs
+    if ($w.timeout) { $telGpu.state_reason = 'timeout'; $telGpu.why = "power state read exceeded $TelemetryCallMs ms" }
+    elseif (-not $w.ok) {
+        $telGpu.device = $(if ($null -ne $w.v) { $w.v.id } else { $null }); $telGpu.why = ([string]$w.msg -replace '\s+', ' ')
+        if ($null -eq $telGpu.device -and [string]$w.msg -match '(?i)no matching') { $telGpu.state = 'absent' } else { $telGpu.state_reason = 'pnp-read-failed' }
+    }
+    elseif ($null -eq $w.v.id) { $telGpu.state = 'absent' }
+    else {
+        $telGpu.device = [string]$w.v.id
+        $data = [byte[]]@($w.v.data)
+        $raw = $(if ($data.Count -ge 8) { [BitConverter]::ToInt32($data, 4) } else { $null })
+        $telGpu.power_state_raw = $raw
+        if ($null -ne $raw -and $raw -ge 1 -and $raw -le 4) { $telGpu.state = "D$($raw - 1)" } else { $telGpu.state_reason = 'unspecified-power-state' }
+    }
+    if ($telGpu.state -ceq 'absent') { $telGpu.skipped_wake_risk = $false; $telGpu.reasons['device'] = 'no-dgpu'; Set-TelNulls $telGpu $gpuFields 'no-dgpu' }
+    elseif ($telGpu.state -cne 'D0') { Set-TelNulls $telGpu $gpuFields 'skipped-wake-risk' }
+    else {
+        # D0: the dGPU is already awake, so ONE nvidia-smi read cannot wake it
+        $telGpu.skipped_wake_risk = $false
+        $s = Invoke-TelBounded $TelSmiScript @() $TelemetryCallMs
+        $code = $null
+        if ($s.timeout) { $code = 'timeout' }
+        elseif (-not $s.ok) { $code = $(if ([string]$s.msg -match '(?i)not recognized|not found') { 'nvidia-smi-missing' } else { 'nvidia-smi-failed' }); $telGpu.why = ([string]$s.msg -replace '\s+', ' ') }
+        elseif ([int]$s.v.rc -ne 0) { $code = 'nvidia-smi-failed'; $telGpu.why = "nvidia-smi exit $($s.v.rc)" }
+        else {
+            $first = @($s.v.lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -First 1
+            $parts = @(([string]$first).Split(',') | ForEach-Object { $_.Trim() })
+            if ($parts.Count -lt 4) { $code = 'nvidia-smi-unparseable' }
+            else {
+                $inv = [Globalization.CultureInfo]::InvariantCulture
+                for ($i = 0; $i -lt 3; $i++) {
+                    $f = $gpuFields[$i]; $v = 0.0
+                    if ([double]::TryParse($parts[$i], [Globalization.NumberStyles]::Float, $inv, [ref]$v)) { $telGpu[$f] = $v }
+                    else { $telGpu.reasons[$f] = $(if ($parts[$i] -match '^\[.*\]$') { 'not-supported' } else { 'nvidia-smi-unparseable' }) }
+                }
+                if ($parts[3] -cmatch '^P\d{1,2}$') { $telGpu.pstate = $parts[3] } else { $telGpu.reasons['pstate'] = 'not-supported' }
+            }
+        }
+        if ($code) { Set-TelNulls $telGpu $gpuFields $code }
+    }
+} catch { $telGpu.why = ([string]$_.Exception.Message -replace '\s+', ' '); Set-TelNulls $telGpu $gpuFields 'telemetry-error' }
+$secondsSinceLease = $null
+$leaseLog = $(if ($LeaseLogPath) { $LeaseLogPath } else { Join-Path ([Environment]::CurrentDirectory) 'logs\agent.log' })
+$telLease = [ordered]@{ source = $leaseLog; event = $null; utc = $null; reason = $null; why = $null }
+try {
+    $w = Invoke-TelBounded $TelTailScript @($leaseLog, 262144, $TelemetryReadDelayMs) $TelemetryCallMs
+    if ($w.timeout) { $telLease.reason = 'timeout' }
+    elseif (-not $w.ok) { $telLease.reason = 'log-read-failed'; $telLease.why = ([string]$w.msg -replace '\s+', ' ') }
+    elseif (-not $w.v.exists) { $telLease.reason = 'log-missing' }
+    else {
+        $lines = @(([string]$w.v.text) -split "`r?`n")
+        if ($w.v.partial) { $lines = @($lines | Select-Object -Skip 1) }
+        $hit = $null
+        for ($i = $lines.Count - 1; $i -ge 0 -and $null -eq $hit; $i--) {
+            if ($lines[$i] -notmatch '^(\d{4}-\d\d-\d\dT\S+) quiet-lease: (active|ended|batch-opened|batch-reused|batch-parked|batch-ended|stale lease) (.*)$') { continue }
+            $ts = $Matches[1]; $ev = $Matches[2]; $rest = $Matches[3]
+            if ($ev -ceq 'ended' -and $rest -notmatch '(^| )active=True( |$)') { continue }
+            $hit = @{ ts = $ts; event = $ev }
+        }
+        if ($null -eq $hit) { $telLease.reason = 'no-lease-record'; $telLease.why = "no quiet-lease event in the last $($lines.Count) line(s)" }
+        else {
+            $telLease.event = $hit.event
+            $dto = [DateTimeOffset]::MinValue
+            if (-not [DateTimeOffset]::TryParse($hit.ts, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$dto)) { $telLease.reason = 'unparseable-timestamp' }
+            else {
+                $telLease.utc = $dto.UtcDateTime.ToString('o')
+                $age = ([DateTime]::UtcNow - $dto.UtcDateTime).TotalSeconds
+                if ($age -lt -5) { $telLease.reason = 'future-timestamp' } else { $secondsSinceLease = [math]::Round([math]::Max(0.0, $age), 1) }
+            }
+        }
+    }
+} catch { $telLease.reason = 'telemetry-error'; $telLease.why = ([string]$_.Exception.Message -replace '\s+', ' ') }
+if ($null -ne $script:TelRs) { try { $script:TelRs.Dispose() } catch { }; $script:TelRs = $null }
 # IDENTITY (VENUE-PROBE-PROCESS-ATTRIBUTION-1): WHO (owner, project) and WHAT (script, a command line with no argument text, parent chain, start time, GPU) for the processes named above.
 # It runs AFTER the sample window and after every v2 figure (never inside the sample loop, no new sleep), decides nothing, and sits in ONE try/catch: on any failure the line
 # carries identity = { schema, error } and every other field is unchanged. The GPU read comes FIRST here, not last, because its top pids are CIM targets too (one extra WQL
@@ -936,10 +1153,11 @@ Write-Output ('VENUE_QUIET=' + ([ordered]@{
     core_topology = $(if ($topo.map.Count -gt 0) { 'logical-processor-information-ex' } else { 'unknown' })
     core_classes = $classAgg; cores = $cores
     notes = $notes
+    telemetry_schema = $telemetrySchema; heat = $telHeat; gpu = $telGpu; seconds_since_last_lease = $secondsSinceLease; last_lease = $telLease
     identity = $identity
 } | ConvertTo-Json -Compress -Depth 6))
 # an abandoned worker may still be inside a native call, and a runspace thread is a foreground thread: end the process now that the line is written
-if ($script:IdentAbandoned -gt 0) { [Console]::Out.Flush(); [Environment]::Exit(0) }
+if ($script:IdentAbandoned -gt 0 -or $script:TelAbandoned -gt 0) { [Console]::Out.Flush(); [Environment]::Exit(0) }
 '@
 
 # v2 attribution, printed AFTER the verdict and top lines so the gate log says what kept the venue busy. Display only: nothing here feeds the decision, and a
@@ -1000,6 +1218,27 @@ function Write-IdentityLines($Probe) {
         }
         foreach ($n in @($id.notes.PSObject.Properties)) { Write-Gate ("  ident note {0}: {1}" -f $n.Name, $n.Value) }
     } catch { Write-Gate ("  ident UNPRINTABLE {0}" -f $_.Exception.Message) }
+}
+# TELEMETRY text (VENUE-PROBE-HEAT-GPU-TELEMETRY-1), display only: three `tele` lines after the ident lines for a probe that carries telemetry schema v1, nothing otherwise.
+$telemetrySchemaV1 = 'mlv-app/venue-quiet-probe-telemetry/v1'
+function Format-TelNum($v, [string]$Unit, [string]$Fmt = '{0:0.0}') { if ($null -eq $v -or -not ($v -is [ValueType])) { 'n/a' } else { ($Fmt -f [double]$v) + $Unit } }
+function Get-TelReasonSuffix($Block) {
+    $codes = @(@($Block.reasons.PSObject.Properties) | ForEach-Object { ConvertTo-IdentToken $_.Value } | Sort-Object -Unique)
+    if ($codes.Count) { ' reason=' + ($codes -join '+') } else { '' }
+}
+function Write-TelemetryLines($Probe) {
+    try {
+        if ([string]$Probe.telemetry_schema -cne $telemetrySchemaV1) { return }
+        $h = $Probe.heat
+        Write-Gate (("  tele heat source={0} age={1} hottest={2} max15={3} mean={4} throttled={5}/{6} W={7}" -f (ConvertTo-IdentToken $h.source), (Format-TelNum $h.sample_age_s 's'),
+            (Format-TelNum $h.hottest_core_c 'C'), (Format-TelNum $h.max15_c 'C'), (Format-TelNum $h.mean_c 'C'), (ConvertTo-IdentToken $h.throttled), (ConvertTo-IdentToken $h.window_rows),
+            (Format-TelNum $h.package_w '')) + (Get-TelReasonSuffix $h))
+        $g = $Probe.gpu
+        Write-Gate (("  tele gpu state={0} skipped_wake_risk={1} util={2} temp={3} W={4} pstate={5}" -f (ConvertTo-IdentToken $g.state), $(if ($g.skipped_wake_risk -eq $true) { 'true' } elseif ($g.skipped_wake_risk -eq $false) { 'false' } else { 'n/a' }),
+            (Format-TelNum $g.utilization_percent '%'), (Format-TelNum $g.temp_c 'C'), (Format-TelNum $g.power_w ''), (ConvertTo-IdentToken $g.pstate)) + $(if ($g.state_reason) { ' state_reason=' + (ConvertTo-IdentToken $g.state_reason) } else { '' }))
+        $l = $Probe.last_lease
+        Write-Gate (("  tele lease since={0} event={1}" -f (Format-TelNum $Probe.seconds_since_last_lease 's' '{0:0}'), (ConvertTo-IdentToken $l.event)) + $(if ($l.reason) { ' reason=' + (ConvertTo-IdentToken $l.reason) } else { '' }))
+    } catch { Write-Gate ("  tele UNPRINTABLE {0}" -f $_.Exception.Message) }
 }
 function Write-AttributionLines($Probe) {
     if ([string]$Probe.schema -cne 'mlv-app/venue-quiet-probe/v2') { return }
@@ -1090,4 +1329,5 @@ $topIdMap = $(if ($null -ne $last.probe) { Get-IdentityRowMap $last.probe } else
 if ($null -ne $last.probe) { foreach ($p in @($last.probe.top)) { Write-Gate (("  top {0} pid={1} cpuSeconds={2}" -f $p.name, $p.pid, $p.cpuSeconds) + $(if ($null -ne $topIdMap -and $null -ne $p.pid -and $topIdMap.ContainsKey("$($p.pid)")) { Get-IdentSuffix $topIdMap["$($p.pid)"] $true } else { '' })) } }
 if ($null -ne $last.probe) { Write-AttributionLines $last.probe }
 if ($null -ne $last.probe) { Write-IdentityLines $last.probe }
+if ($null -ne $last.probe) { Write-TelemetryLines $last.probe }
 exit 0
