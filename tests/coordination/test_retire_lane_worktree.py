@@ -3104,6 +3104,12 @@ UNRESOLVED_EXECUTED_SITES = {
          "r5 rule V2: Start-VenueKeeper runs $script:VenueKeeperLoop, the single-quoted here-string assigned once at top level (:744), "
          "which rule S scans in place (the keeper-step row above is inside it); it is unresolved because this module's New-Item / "
          "Remove-Item take non-constant paths, none of them on the variable: drive"),
+        (". ([scriptblock]::Create($t))",
+         "r4 (from #673): inside the single-quoted here-string $script:LivenessReadbackText (:860-866) that rule S scans in place; $t iterates "
+         "$A.functions, which Test-VenueJobLivenessReadback (:887-891) fills with the Extent.Text of exactly the FunctionDefinitionAsts named "
+         "Get-JobNotAfterVerdict and Read-JobNotAfterSidecar (it refuses unless both are found; the name match is -eq, case-insensitive, like "
+         "PowerShell's own function lookup) parsed from the tracked tools/profiling/bachelor/ultra-magnus-agent.ps1 (:722 and :832), which the "
+         "census scans in its own file. Dot-sourcing a definition only defines the function, which is then called on the same bounded worker runspace"),
     ],
     "tools/profiling/dual-venue/Wait-VenueQuiet.ps1": [
         ("[void]$pp.AddScript($IdentityWorkerPrelude)",
