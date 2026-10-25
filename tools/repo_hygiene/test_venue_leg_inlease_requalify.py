@@ -17,13 +17,16 @@ Runs wherever pwsh is on PATH (the hosted Windows and ubuntu runners both have i
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "tools" / "profiling" / "dual-venue" / "VenueLegCounting.psm1"
@@ -44,6 +47,25 @@ HARNESS = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module -Name $env:VLC_MODULE -Force -DisableNameChecking
 function ConvertTo-HarnessValue([object]$v) {
+    if ($v -is [string] -and $v -cmatch '^typed:(\w+):(\d+)$') {
+        # 'typed:<type>:<digits>' builds that exact .NET numeric type (JSON only has double and int64)
+        $n = $Matches[2]
+        switch ($Matches[1]) {
+            'byte' { return , [byte]$n }
+            'sbyte' { return , [sbyte]$n }
+            'int16' { return , [int16]$n }
+            'uint16' { return , [uint16]$n }
+            'int32' { return , [int]$n }
+            'uint32' { return , [uint32]$n }
+            'int64' { return , [long]$n }
+            'uint64' { return , [uint64]$n }
+            'single' { return , [single]$n }
+            'double' { return , [double]$n }
+            'decimal' { return , [decimal]$n }
+            'bigint' { return , [System.Numerics.BigInteger]::Parse($n) }
+            default { throw "unknown typed value $v" }
+        }
+    }
     if ($v -is [string] -and $v -ceq 'NaN') { return [double]::NaN }
     if ($v -is [string] -and $v -ceq 'Infinity') { return [double]::PositiveInfinity }
     if ($v -is [string] -and $v -ceq '-Infinity') { return [double]::NegativeInfinity }
@@ -322,6 +344,27 @@ class NonFiniteInputFixtureTests(unittest.TestCase):
         self.assertEqual([r["class"] for r in got], [OK, OK, "QUIET_PRELOAD_REQUALIFIED_IN_LEASE", "NOT_COUNTED_INLEASE_PRELOAD_HIGH",
                                                      "QUIET_PRELOAD_STALE", "NOT_COUNTED_THROTTLED_AT_GRANT"])
 
+    def test_27_typed_numeric_inputs_follow_the_documented_type_list(self) -> None:
+        # Dot 258ad5e5 nit: the module documents its supported numeric types (VenueLegCounting.psm1, Test-VenueLegCountingNumericType). Each
+        # supported .NET type is a measurement; every other numeric type is not, and is refused rather than coerced. JSON has only double and
+        # int64, so the harness builds the exact type from 'typed:<type>:<digits>'.
+        supported = ("byte", "int16", "int32", "int64", "single", "double", "decimal")
+        refused = ("sbyte", "uint16", "uint32", "uint64", "bigint")
+        for rule in (INLEASE, STALE180):
+            for t, r in zip(supported, call(*(req(rule, f"typed:{t}:100", COOL, 15.4) for t in supported))):
+                self.assertEqual((r["class"], r["eligible"]), (OK, True), (rule, t, r))
+            for t, r in zip(refused, call(*(req(rule, f"typed:{t}:100", COOL, 15.4) for t in refused))):
+                self.assertInvalid(r, (rule, "wait", t))
+        # the pre-load (a stale leg under inlease-requalify-1) and the throttled count use the same type list
+        for t, r in zip(supported, call(*(req(INLEASE, 912, COOL, f"typed:{t}:15") for t in supported))):
+            self.assertEqual(r["class"], "QUIET_PRELOAD_REQUALIFIED_IN_LEASE", (t, r))
+        for t, r in zip(refused, call(*(req(INLEASE, 912, COOL, f"typed:{t}:15") for t in refused))):
+            self.assertInvalid(r, ("preload", t))
+        for t, r in zip(supported, call(*(req(INLEASE, 912, pre=15.4, admission={"throttled": f"typed:{t}:0"}) for t in supported))):
+            self.assertEqual((r["class"], r["throttledAtGrant"]), ("QUIET_PRELOAD_REQUALIFIED_IN_LEASE", 0), (t, r))
+        for t, r in zip(refused, call(*(req(INLEASE, 912, pre=15.4, admission={"throttled": f"typed:{t}:0"}) for t in refused))):
+            self.assertEqual((r["class"], r["eligible"], r["throttledAtGrant"]), ("NOT_COUNTED_THERMAL_UNKNOWN", False, None), (t, r))
+
 
 def _tracked_importers() -> list[str]:
     """Tracked tools/ scripts that import VenueLegCounting.psm1 (the module and this test excluded)."""
@@ -358,13 +401,46 @@ class ImporterAndDocPinTests(unittest.TestCase):
 
 
 class SkipGatePinTests(unittest.TestCase):
-    def test_26_pins_are_gated_on_pwsh_only(self) -> None:
-        # G1: a platform gate here left the ubuntu shards with no pins; the module is pure PowerShell
-        src = Path(__file__).read_text(encoding="utf-8")
-        gates = re.findall(r"skipIf\((.*)\)", src)
-        self.assertTrue(gates)
-        for gate in gates:
-            self.assertNotIn("platform", gate)
+    def _run_gated(self, *, pwsh, hosted, on_class):
+        """Run a throwaway TestCase gated by requires_pwsh with PWSH and GITHUB_ACTIONS forced; returns (result, bodies that ran)."""
+        ran = []
+        if on_class:
+            @requires_pwsh
+            class Probe(unittest.TestCase):
+                def test_x(self):
+                    ran.append(1)
+        else:
+            class Probe(unittest.TestCase):
+                @requires_pwsh
+                def test_x(self):
+                    ran.append(1)
+        result = unittest.TestResult()
+        with mock.patch.object(sys.modules[__name__], "PWSH", pwsh), mock.patch.dict(os.environ):
+            if hosted is None:
+                os.environ.pop("GITHUB_ACTIONS", None)
+            else:
+                os.environ["GITHUB_ACTIONS"] = hosted
+            unittest.defaultTestLoader.loadTestsFromTestCase(Probe).run(result)
+        return result, ran
+
+    def test_26_pins_are_gated_on_pwsh_only_and_fail_closed_in_hosted_ci(self) -> None:
+        # G1 (platform): a platform gate left the ubuntu shards with no pins; the module is pure PowerShell, so the gate reads pwsh alone.
+        # Grok G1 (fail closed): a hosted shard without pwsh must FAIL, not skip all the pins and go green. Same pattern as
+        # test_safety_lint_parity.py _skip_or_fail_in_hosted_ci: GITHUB_ACTIONS=true -> fail, anywhere else -> skip. Pinned for the class
+        # decorator (how every pin class uses it) and the method decorator.
+        self.assertNotIn("platform", inspect.getsource(requires_pwsh))
+        self.assertNotIn("skipIf", inspect.getsource(requires_pwsh))
+        for on_class in (True, False):
+            where = "class" if on_class else "method"
+            res, ran = self._run_gated(pwsh=None, hosted="true", on_class=on_class)
+            self.assertEqual((len(res.failures), len(res.skipped), len(res.errors), ran), (1, 0, 0, []), f"hosted CI, no pwsh, {where}")
+            self.assertIn("hosted CI must not skip", res.failures[0][1])
+            for hosted in (None, "", "false", "TRUE"):
+                res, ran = self._run_gated(pwsh=None, hosted=hosted, on_class=on_class)
+                self.assertEqual((len(res.failures), len(res.skipped), len(res.errors), ran), (0, 1, 0, []), f"local {hosted!r}, no pwsh, {where}")
+            for hosted in (None, "true"):
+                res, ran = self._run_gated(pwsh="pwsh", hosted=hosted, on_class=on_class)
+                self.assertEqual((res.wasSuccessful(), len(res.skipped), ran), (True, 0, [1]), f"pwsh present {hosted!r}, {where}")
 
 
 class ModulePurityPinTests(unittest.TestCase):
