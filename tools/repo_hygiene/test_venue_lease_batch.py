@@ -1370,6 +1370,63 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertIn(f"LEG_PLAN_REFUSED reason={reason} item=2 ", r.stderr)
                 self.assertEqual(self.kinds(), [])
 
+    def write_raw_plan(self, doc: object) -> Path:
+        p = self.case / "plan.json"
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        return p
+
+    def assert_whole_plan_refused(self, plan: Path, want: str) -> None:
+        # subtests share one fixture directory: clear what an earlier subtest's run left, so a run that wrongly proceeds cannot fail the next case instead of itself
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        r = self.run_plan(plan)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"LEG_PLAN_REFUSED reason={want}", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_a_null_or_non_object_entry_refuses_the_whole_plan_at_its_original_position(self) -> None:
+        # Dot B1 (e2160c2d): the null was dropped BEFORE the shape check, so [A, null, B] ran as a two-item plan (B became item 2) and finished ALL_LEGS_DONE.
+        a, b = self.commit_a, self.commit_b
+        ok_a, ok_b = self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", b, "cuda")
+        cases = {
+            "null in the middle": ([ok_a, None, ok_b], 2),
+            "null first": ([None, ok_a, ok_b], 1),
+            "null last": ([ok_a, ok_b, None], 3),
+            "string in the middle": ([ok_a, "leg-b", ok_b], 2),
+            "number in the middle": ([ok_a, 7, ok_b], 2),
+            "array in the middle": ([ok_a, [ok_b], ok_b], 2),
+            "only a null": ([None], 1),
+        }
+        for label, (legs, n) in cases.items():
+            for container in ("object", "bare-array"):
+                with self.subTest(case=label, container=container):
+                    doc = {"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": legs} if container == "object" else legs
+                    self.assert_whole_plan_refused(self.write_raw_plan(doc), f"BAD_ITEM_SHAPE item={n} ")
+
+    def test_a_legs_value_that_is_not_an_array_is_refused_not_wrapped_into_a_one_item_plan(self) -> None:
+        one = self.item(self.specs[0], "A", self.commit_a)
+        schema = "mlv-app/venue-lease-leg-plan/v1"
+        cases = {
+            "a single item object as legs": {"schema": schema, "legs": one},
+            "legs is a string": {"schema": schema, "legs": "leg-a"},
+            "legs is a number": {"schema": schema, "legs": 3},
+            "legs is null": {"schema": schema, "legs": None},
+            "legs is an empty array": {"schema": schema, "legs": []},
+            "a bare item object with no legs container": one,
+            "the document is a string": "plan",
+            "the document is a number": 5,
+            "the document is null": None,
+            "the document is an empty array": [],
+            "the legs container is named something else": {"schema": schema, "items": [one]},
+        }
+        for label, doc in cases.items():
+            with self.subTest(case=label):
+                self.assert_whole_plan_refused(self.write_raw_plan(doc), "LEG_PLAN_UNREADABLE")
+
     def test_the_plan_and_the_scalar_form_are_mutually_exclusive(self) -> None:
         args, e = self.plan_cmd(self.ab_block_plan(), "-SourceCommit", SHA)
         r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
