@@ -2948,11 +2948,11 @@ def test_b2_gate_keeps_a_worktree_whose_encoded_driver_names_only_its_run_dir(re
 # elsewhere (tools/agent-bridge, tools/closeout, ...) were invisible. A git pathspec `*` crosses `/`, so these cover every tracked script.
 CENSUS_PATHSPECS = ("*.ps1", "*.psm1")
 CENSUS_EXCLUDED = ("tools/coordination/Retire-LaneWorktree.ps1",)  # the guard decodes -EncodedCommand; it launches nothing
-# The encoded-switch matcher is grammar-aware and lives in _encoded_sites (below); detached launches match per statement.
-DETACHED_RX = re.compile(r"Start-Process\b.*?-WindowStyle\s+['\"]?Hidden|Win32_Process.*?\bCreate\b|\[wmiclass\]|Invoke-(?:Cim|Wmi)Method\b.*?\bCreate\b", re.I)
-# Per-SITE inventories: {path: [(pin, reason), ...]}. The pin is a stable substring of the launching statement (backtick continuations joined,
-# comments dropped, `;`-separated statements split); the list length is the expected site COUNT in that file. A new site in a classified file, or a pinned site that moved or
-# vanished, fails the census just as a new file does.
+# Sites are read from the PowerShell AST by tests/coordination/Test-LaunchSites.ps1 (rules in its header; seam: _encoded_sites,
+# _detached_sites, _unresolved_sites below). Per-SITE inventories: {path: [(pin, reason), ...]}. The pin is a stable substring of the site
+# text (the launching pipeline, or the statement around a string, with comments and line continuations dropped and whitespace collapsed);
+# the list length is the expected site COUNT in that file. A new site in a classified file, or a pinned site that moved or vanished, fails
+# the census just as a new file does.
 ENCODED_LAUNCH_SITES = {
     "tools/agent-bridge/wake_codex.ps1": [
         ('"-EncodedCommand",',
@@ -3023,6 +3023,49 @@ DETACHED_LAUNCH_SITES = {
          "it never runs against a hub lane worktree"),
     ],
 }
+# r3: strings that are EXECUTED ([scriptblock]::Create, .AddScript, iex, pwsh -Command) but built at run time, so no scanner can read the
+# code they will run. Each is classified from reading how the string is built: its literal parts are scanned by rule S (and hold no launch),
+# and the variable parts are paths, numbers or a caller's { } literal. A new one fails the census until it is classified here.
+UNRESOLVED_EXECUTED_SITES = {
+    "tools/coordination/build-guard.ps1": [
+        ('[scriptblock]::Create("[CmdletBinding()] param()`n" + $fragment)',
+         "the -Command build fragment its caller hands build-guard (mingw32-make / qmake lines), run in-process and waited on under the host "
+         "memory guard; a tracked caller passes it as a literal, which rule S scans in the caller's own file"),
+    ],
+    "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [
+        ("-ExecutionPolicy Bypass -Command $cmd 1>",
+         "$cmd is the smoke-script call `& <smoke.ps1> -ExePath .. -Input .. -Output ..` built at :2701 (+ :2740 / :4696 argument appends): "
+         "quoted paths and numbers, a synchronous venue-side child that is waited on, never a hub lane driver"),
+        ("-ExecutionPolicy Bypass -Command $preCmd 1>",
+         "inside the self-heal pre-launch block this job writes into its own copy: $preCmd is $cmd with the output path and environment list "
+         "swapped (.Replace), the same synchronous venue-side smoke call"),
+    ],
+    "tools/profiling/bachelor/reference-frame-runner-job.ps1": [
+        ("-Command $captureCommand",
+         "$captureCommand is `& '<bundle capture script>' -Exe .. -Clip .. -OutDir ..` plus an exit-code suffix (:585, :588): quoted paths and "
+         "numbers, a synchronous venue-side capture"),
+    ],
+    "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1": [
+        ("[void]$ps.AddScript($Script.ToString())",
+         "Invoke-Bounded runs its caller's [scriptblock] on a worker runspace; both callers in this file pass a { } literal (a Test-Path / "
+         "Get-FileHash read), which the AST scans as code"),
+    ],
+    "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
+        ("[void]$ps.AddScript($Script.ToString())",
+         "the same Invoke-Bounded pattern: every caller in this file hands it a { } literal share read, which the AST scans as code"),
+    ],
+    "tools/profiling/dual-venue/VenueChain.psm1": [
+        ("[void]$ps.AddScript($ScriptText)",
+         "Invoke-VenueBoundedRead runs a share read on a worker runspace; its callers in this module pass a { } literal's text or a "
+         "single-quoted Test-Path literal, both scanned as code"),
+    ],
+    "tools/profiling/ultramagnus/playback-attr-3-cuda-dll-job.ps1": [
+        ("-Command $reconCommand",
+         "$reconCommand is `& <recon script> -Dir <backend> -CudaArchitectures <list>` (:347): a synchronous venue-side build step"),
+        ("-Command $amazeCommand",
+         "$amazeCommand is `& <amaze script> -Dir <backend> -Arch <label>` (:368): a synchronous venue-side build step"),
+    ],
+}
 
 
 def _census_sources():
@@ -3053,6 +3096,15 @@ def test_launcher_census_every_detached_launch_site_is_classified():
     assert "'-File', \"`\"$PSCommandPath`\"\"" in src["tools/coordination/autopilot/product-share.ps1"], "product-share no longer re-launches itself with -File"
 
 
+def test_launcher_census_every_executed_string_built_at_run_time_is_classified():
+    """r3: a string run by [scriptblock]::Create / .AddScript / iex / pwsh -Command that the scanner cannot resolve could carry any launch."""
+    src = _census_sources()
+    assert src, "git ls-files returned no PowerShell scripts: the census would pass on nothing"
+    problems = _census_problems(src, {}, {}, kinds=("unresolved",), unresolved_inventory=UNRESOLVED_EXECUTED_SITES)
+    assert not problems, ("\n".join(problems) + "\nBuild the executed string from literals the census can read, or classify the site in "
+                          "UNRESOLVED_EXECUTED_SITES with what the string is built from (drop an entry whose site is gone).")
+
+
 def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir():
     """The one Invoke-Lane -EncodedCommand site is safe only while its child names the run dir and is recorded in it."""
     t = (REPO / "tools/coordination/Invoke-Lane.ps1").read_text(encoding="utf-8")
@@ -3071,141 +3123,54 @@ def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir(
 B64 = "UwB0AGEAcgB0AC0AUwBsAGUAZQBwACAAMQAw"
 
 
-_HERE_OPEN_RX = re.compile(r"@(['\"])[ \t]*\r?\n")
-_CONTINUATION_RX = re.compile(r"`[ \t]*\r?\n[ \t]*")
+# r3 (hub ruling): sites are read from the PowerShell parser's own AST by Test-LaunchSites.ps1 beside this file, not by a Python tokenizer;
+# its header writes down every rule (pwsh's -EncodedCommand prefix rule, Start-Process's own WindowStyle prefixes, executed strings).
+# One pwsh process scans a whole batch of sources; results are cached per source text.
+SITE_SCANNER = Path(__file__).resolve().with_name("Test-LaunchSites.ps1")
+_SITE_CACHE = {}
 
 
-def _statements(text):
-    """[(first physical line, statement text)] from ONE quote-aware pass over PowerShell source. Tracks '...' and "..." literals (a backtick
-    escapes inside double quotes), @'...'@ / @"..."@ here-strings, `#` line comments and `<# #>` block comments (recognised only outside
-    strings), backtick line continuations, and `;` statement separators (only outside strings and comments). A newline ends a candidate even
-    inside a multi-line string, and a here-string body is emitted line by line and split on `;` with no quote tracking, so an inner script is
-    over-reported rather than hidden. Strings stay verbatim in the statement text; comments are dropped."""
-    out, buf, start = [], [], None
-    line, i, n, quote = 1, 0, len(text), None
-
-    def put(ch):
-        nonlocal start
-        if start is None and not ch.isspace():
-            start = line
-        buf.append(ch)
-
-    def flush():
-        nonlocal buf, start
-        stmt = "".join(buf).strip()
-        if stmt:
-            out.append((start, stmt))
-        buf, start = [], None
-
-    while i < n:
-        ch = text[i]
-        if ch == "\r":
-            i += 1
-        elif ch == "\n":
-            line += 1
-            i += 1
-            flush()
-        elif quote:
-            put(ch)
-            if ch == "`" and quote == '"' and i + 1 < n and text[i + 1] not in "\r\n":
-                put(text[i + 1])
-                i += 1
-            elif ch == quote:
-                quote = None
-            i += 1
-        elif text.startswith("<#", i):
-            end = text.find("#>", i + 2)
-            end = n if end < 0 else end + 2
-            line += text.count("\n", i, end)
-            put(" ")
-            i = end
-        elif ch == "#" and (not buf or buf[-1].isspace() or buf[-1] in ";({"):
-            while i < n and text[i] != "\n":
-                i += 1
-        elif ch == "`":
-            m = _CONTINUATION_RX.match(text, i)
-            if m:
-                while buf and buf[-1].isspace():
-                    buf.pop()
-                put(" ")
-                line += 1
-                i = m.end()
-            else:
-                put(ch)
-                if i + 1 < n:
-                    put(text[i + 1])
-                i += 2
-        elif (m := _HERE_OPEN_RX.match(text, i)):
-            put("@" + m.group(1))
-            flush()
-            line += 1
-            close = re.compile(r"^" + m.group(1) + "@", re.M).search(text, m.end())
-            body_end = close.start() if close else n
-            for raw in text[m.end():body_end].split("\n"):
-                if raw.strip() and not raw.lstrip().startswith("#"):
-                    out.extend((line, seg.strip()) for seg in raw.rstrip("\r").split(";") if seg.strip())
-                line += 1
-            line -= 1
-            i = body_end
-            if close:
-                put(m.group(1) + "@")
-                i += 2
-        elif ch in "'\"":
-            quote = ch
-            put(ch)
-            i += 1
-        elif ch == ";":
-            flush()
-            i += 1
-        else:
-            put(ch)
-            i += 1
-    flush()
-    return out
+def _scan_sites(texts):
+    """Fill _SITE_CACHE for every text not yet scanned, in one pwsh call. Raises if the scanner fails: a census that cannot scan never passes."""
+    todo = list(dict.fromkeys(t for t in texts if t not in _SITE_CACHE))
+    if not todo:
+        return
+    r = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(SITE_SCANNER)], input=json.dumps({str(i): t for i, t in enumerate(todo)}),
+                       capture_output=True, text=True, encoding="utf-8", timeout=900)
+    assert r.returncode == 0, f"launch-site scanner failed (exit {r.returncode}): {r.stderr[-2000:]}"
+    got = json.loads(r.stdout)
+    for i, t in enumerate(todo):
+        _SITE_CACHE[t] = tuple((s["kind"], s["line"], s["text"]) for s in got[str(i)])
 
 
-def _is_encoded_switch(word):
-    """pwsh accepts -EncodedCommand, -ec, and every unambiguous prefix (-e, -en, -enc, ... -encodedcommand)."""
-    word = word.lower()
-    return word == "ec" or "encodedcommand".startswith(word)
-
-
-# A word spelled as a switch: `-w` or `/w`, optionally as one standalone quoted argv element ('-w' or "-w"). Never the inside of a longer string.
-_SWITCH_RX = re.compile(r"""(?:^|(?<=[\s(,@=]))(?P<q>['"]?)[-/](?P<word>[A-Za-z]+)(?P=q)(?=[\s,)]|$)""")
-_PWSH_CTX_RX = re.compile(r"pwsh|powershell|(?<![\w-])[-/](?:NoProfile|NoLogo|NonInteractive|NoExit|ExecutionPolicy|Sta|Mta|ConfigurationName)\b", re.I)
+def _sites(text, kind):
+    _scan_sites([text])
+    return [(n, ln) for k, n, ln in _SITE_CACHE[text] if k == kind]
 
 
 def _encoded_sites(text):
-    """Launch sites that hand PowerShell a base64 program, one (line, statement) per statement. Grammar-aware: an unquoted switch only counts
-    on a statement that names pwsh/powershell or another pwsh-only switch; a quoted argv element -e/-en/-enc needs that context within 4
-    statements, while -ec and spellings of 4+ letters (-encodedc, -EncodedCommand) are distinctive enough to count alone."""
-    stmts = _statements(text)
-    out = []
-    for idx, (n, ln) in enumerate(stmts):
-        for m in _SWITCH_RX.finditer(ln):
-            if not _is_encoded_switch(m.group("word")):
-                continue
-            word = m.group("word").lower()
-            if m.group("q"):
-                near = stmts[max(0, idx - 4):idx + 5]
-                if not (word == "ec" or len(word) >= 4 or any(_PWSH_CTX_RX.search(s) for _, s in near)):
-                    continue
-            elif not _PWSH_CTX_RX.search(ln):
-                continue
-            out.append((n, ln))
-            break
-    return out
+    """Launch sites that hand PowerShell a base64 program: one (line, site text) per site (Test-LaunchSites.ps1 rules E1/E2/S)."""
+    return _sites(text, "encoded")
 
 
 def _detached_sites(text):
-    return [(n, ln) for n, ln in _statements(text) if DETACHED_RX.search(ln)]
+    """Hidden Start-Process and Win32_Process Create sites: one (line, site text) per site (Test-LaunchSites.ps1 rules D1/D2/S)."""
+    return _sites(text, "detached")
 
 
-def _census_problems(sources, encoded_inventory, detached_inventory, kinds=("encoded", "detached")):
-    """Per-SITE comparison: inventory[path] is a list of (pin, reason), one entry per expected site, the pin a substring of the launching
-    statement. A site no entry claims is unclassified; an entry no site claims has vanished. Two identical sites need two entries."""
+def _unresolved_sites(text):
+    """Executed strings built at run time, splats with no literal behind them, and unparsable sources (Test-LaunchSites.ps1 rule X)."""
+    return _sites(text, "unresolved")
+
+
+def _census_problems(sources, encoded_inventory, detached_inventory, kinds=("encoded", "detached", "unresolved"), unresolved_inventory=None):
+    """Per-SITE comparison: inventory[path] is a list of (pin, reason), one entry per expected site, the pin a substring of the site text.
+    A site no entry claims is unclassified; an entry no site claims has vanished. Two identical sites need two entries. An `unresolved`
+    site (a string executed but built at run time) fails like an unclassified launch until UNRESOLVED_EXECUTED_SITES classifies it."""
+    _scan_sites(sources.values())
     problems = []
-    for kind, finder, inventory in (("encoded", _encoded_sites, encoded_inventory), ("detached", _detached_sites, detached_inventory)):
+    for kind, finder, inventory in (("encoded", _encoded_sites, encoded_inventory), ("detached", _detached_sites, detached_inventory),
+                                    ("unresolved", _unresolved_sites, unresolved_inventory or {})):
         if kind not in kinds:
             continue
         for path in sorted(set(sources) | set(inventory)):
@@ -3449,7 +3414,7 @@ def test_launcher_census_r3_an_executed_string_built_at_run_time_is_unresolved_a
     assert _census_problems({_SYNTH: text}, {}, {}), f"an executed string the census cannot resolve passed silently: {text!r}"
 
 
-# Guards (pass on every scanner): the shapes DETACHED_RX matched stay one site each, and the look-alikes stay zero.
+# Guards (pass on every scanner): the shapes r2's DETACHED_RX regex matched stay one site each, and the look-alikes stay zero.
 @pytest.mark.parametrize("line", [
     "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cl }",
     "Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList $cl",
