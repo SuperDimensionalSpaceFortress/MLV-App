@@ -262,6 +262,10 @@ void checkConfig(const std::string & label, const GpuPreviewProcessingConfig & c
     {
         const std::string tag = label + ".omp" + std::to_string(threads);
         const std::string threadText = std::to_string(threads);
+        /* test_runtime::force_single_threaded_pipeline sets MLVAPP_FORCE_SINGLETHREAD
+         * for the whole binary; the fast path's team comes from
+         * mlvappEffectivePlaybackWorkerThreadCount, so MLVAPP_FORCE_THREADS picks it. */
+        EnvScope single("MLVAPP_FORCE_SINGLETHREAD", nullptr);
         EnvScope forced("MLVAPP_FORCE_THREADS", threadText.c_str());
         EnvScope tier1(gpuPreviewProcessingTier1SwitchName(), nullptr);
         OmpThreads scope(threads);
@@ -350,9 +354,18 @@ TEST(PrepPointwiseFast, LookAssistOnAndOffAreAdmittedAndByteIdenticalAtFullSize)
     laOnIndexMask.shadowsHighlightsCurveIndexMask = !laOn.shadowsHighlightsCurveIndexMask;
     checkConfig("m16_la_on.sh_index_mask_flipped", laOnIndexMask, frame, kFullWidth, kFullHeight, "");
 
-    /* Look Assist off: the Standard profile's creative curves and the same WB. */
-    const GpuPreviewProcessingConfig laOff = buildConfig(fixture, [](processingObject_t * p) {
+    /* Look Assist off, on a fresh fixture (the preset's contrast and vibrance stay
+     * on a processing object): the Standard profile's creative curves, every
+     * slider at its neutral position, the same WB. */
+    MlvPipelineFixture offFixture;
+    openFixture(offFixture);
+    const GpuPreviewProcessingConfig laOff = buildConfig(offFixture, [](processingObject_t * p) {
         processingAllowCreativeAdjustments(p);
+        processingSetExposureStops(p, 0 / 100.0 + 1.2);
+        processingSetSimpleContrast(p, 0.0);
+        processingSetShadows(p, 0.0);
+        processingSetHighlights(p, 0.0);
+        processingSetVibrance(p, 1.0);
         processingSetWhiteBalance(p, 6485.0, -12 / 10.0);
     });
     ASSERT_TRUE(!laOff.applyShadowsHighlights && !laOff.applyInLoopContrast && !laOff.applyVibrance);
@@ -502,9 +515,13 @@ TEST(PrepPointwiseFast, OptInBenchmarkOnAPrepStyleThread)
     const GpuPreviewProcessingConfig laOn = buildLookAssistOnConfig(fixture, blur, kFullWidth, kFullHeight);
     const char * kill = gpuPreviewProcessingPointwiseFastKillSwitchName();
     EnvScope killUnset(kill, nullptr);
+    /* Production thread counts: no test-harness override, so the fast team is
+     * the playback worker count (min(idealThreadCount, 16)). */
+    EnvScope single("MLVAPP_FORCE_SINGLETHREAD", nullptr);
+    EnvScope forced("MLVAPP_FORCE_THREADS", nullptr);
 
     constexpr int kReps = 7;
-    std::vector<double> refMs, fastMs;
+    std::vector<double> refMs, fastMs, refMs1, fastMs1;
     int workerMaxThreads = 0, refTeam = 0, fastTeam = 0;
     bool identical = true;
     /* A plain std::thread, as MainWindow::playbackPrepThreadLoop is: its OpenMP
@@ -538,6 +555,23 @@ TEST(PrepPointwiseFast, OptInBenchmarkOnAPrepStyleThread)
             }
             if (refOut != fastOut) identical = false;
         }
+        /* Scaling: both loops on one thread (3 reps each, interleaved). */
+        omp_set_num_threads(1);
+        qputenv("MLVAPP_FORCE_THREADS", QByteArray("1"));
+        for (int rep = 0; rep < 3; ++rep)
+        {
+            GpuPreviewProcessingCpuSpans spans;
+            qputenv(kill, QByteArray("1"));
+            gpuPreviewProcessingApplyCpuReferenceTimed(laOn, frame.data(), refOut.data(),
+                                                       kFullWidth, kFullHeight, &spans);
+            qunsetenv(kill);
+            refMs1.push_back(spans.pointwiseMs);
+            gpuPreviewProcessingApplyCpuReferenceTimed(laOn, frame.data(), fastOut.data(),
+                                                       kFullWidth, kFullHeight, &spans);
+            fastMs1.push_back(spans.pointwiseMs);
+            if (refOut != fastOut || spans.pointwiseOmpThreads != 1) identical = false;
+        }
+        qunsetenv("MLVAPP_FORCE_THREADS");
     });
     worker.join();
     auto median = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
@@ -550,5 +584,10 @@ TEST(PrepPointwiseFast, OptInBenchmarkOnAPrepStyleThread)
                 refMed, fastMed, fastMed > 0.0 ? refMed / fastMed : 0.0, identical ? 1 : 0);
     for (int rep = 0; rep < kReps; ++rep)
         std::printf("[PREP-FAST-BENCH] rep=%d reference_ms=%.3f fast_ms=%.3f\n", rep, refMs[rep], fastMs[rep]);
+    std::printf("[PREP-FAST-BENCH] one_thread reference_median_ms=%.3f fast_median_ms=%.3f "
+                "reference_ns_per_px=%.2f fast_ns_per_px=%.2f\n",
+                median(refMs1), median(fastMs1),
+                median(refMs1) * 1.0e6 / (static_cast<double>(kFullWidth) * kFullHeight),
+                median(fastMs1) * 1.0e6 / (static_cast<double>(kFullWidth) * kFullHeight));
     ASSERT_TRUE(identical);
 }
