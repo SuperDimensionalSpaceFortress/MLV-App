@@ -1,5 +1,6 @@
 """RED/GREEN proof for the two stuck-work doctrine-card checks in this folder."""
 
+import subprocess
 import sys
 from pathlib import Path
 
@@ -61,6 +62,37 @@ def test_lost_update_beat_writer_that_raises_is_a_harness_error_not_green(tmp_pa
     out = capsys.readouterr().out
     assert "GREEN" not in out
     assert "beat_save raised" in out
+
+
+# A beat writer that never returns. The check gives a writer 30 s, raises HarnessError and promises
+# exit 2; a non-daemon worker thread kept the interpreter alive at shutdown, so the CLI hung instead.
+_WRITER_NEVER_RETURNS = '''
+import json
+import threading
+from pathlib import Path
+
+
+def arm(path, entry_id, after_write=None):
+    rows = json.loads(Path(path).read_text(encoding="utf-8"))
+    rows.append({"id": entry_id, "status": "armed"})
+    Path(path).write_text(json.dumps(rows), encoding="utf-8")
+    return 0
+
+
+def beat_save(path, snapshot, changed):
+    threading.Event().wait()
+'''
+
+
+def test_lost_update_writer_that_never_returns_exits_2_instead_of_hanging(tmp_path):
+    module = tmp_path / "writers_beat_hangs.py"
+    module.write_text(_WRITER_NEVER_RETURNS, encoding="utf-8")
+    cmd = [sys.executable, str(HERE / "action_list_lost_update_check.py"), "--impl-module", str(module), "--trials", "1"]
+    # The writer budget is 30 s; 60 s leaves room for start-up and still fails fast on a hang.
+    done = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    assert done.returncode == 2
+    assert "a writer did not finish within 30 s" in done.stdout
+    assert "GREEN" not in done.stdout
 
 
 def test_lost_update_arming_command_that_raises_is_a_harness_error_not_green(tmp_path, capsys):
