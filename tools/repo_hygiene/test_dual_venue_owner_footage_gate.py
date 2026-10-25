@@ -197,6 +197,20 @@ ROUTE_DELETE_ALLOWED = {
         "(<claim dir>\\<venue>.tickets) filtered by the ticket-name pattern or the ticket object New-VenueTicket returned, and the delete runs only after the open "
         "handle re-read the file's own JSON (its nonce, or the exact stale bytes judged); a footage name cannot equal either. test_venue_chain_runner and "
         "test_venue_claim_fifo pin release, stale-break, ticket end and ticket sweep.",
+    ("VenueChain.psm1", "[IO.File]::Move($tmp, $A.path, $true)"):
+        "BACHELOR-LEASE-BATCH-LEGS-1 r5: the runner-liveness sidecar writer ($script:LivenessWriteText) publishes the tmp file it wrote one line earlier "
+        "($A.path + '.' + <guid> + '.tmp') over the job's own sidecar <AgentShare>\\notafter\\<jobId>.json in one replacing rename. $A.path is built only by "
+        "New-VenueJobLivenessWrite from the agent share, the fixed folder notafter and the job id the batch runner minted for its own lease open "
+        "(lease-batch-open-<stamp>-lb<token>); the destination is that one sidecar, never a clip, and the notafter folder is never created here.",
+    ("VenueChain.psm1", "} catch { '<WRITE_FAILED> ' + ($_.Exception.Message -replace '\\s+', ' ') } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }"):
+        "BACHELOR-LEASE-BATCH-LEGS-1 r5b: the same sidecar writer's finally clause removes only $tmp, the `<jobId>.json.<guid>.tmp` copy this call made beside the "
+        "job's own sidecar, and only while it is still there (a successful move has already consumed it). Fixed-name leaf, no wildcard, no -Recurse; the guid "
+        "suffix means a footage name cannot equal it.",
+    ("VenueChain.psm1", '$r = Invoke-VenueBoundedRead -ScriptText \'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { Remove-Item -LiteralPath $args[0] -Force; if (Test-Path -LiteralPath $args[0]) { "<PRESENT>" } else { "<REMOVED>" } } else { "<ABSENT>" }\' -Argument $path -TimeoutSec 30'):
+        "BACHELOR-LEASE-BATCH-LEGS-1 r5: Stop-VenueJobLiveness -Remove deletes the one file <AgentShare>\\notafter\\<jobId>.json, the runner-liveness sidecar this "
+        "run kept for its own lease open (jobId = lease-batch-open-<stamp>-lb<token>, minted by Invoke-VenueLeaseBatch), after the open's result is in hand or its "
+        "lease receipt was found. The path is the Start-VenueJobLiveness share plus the fixed folder and the .json suffix, only when it is a leaf, no wildcard, no "
+        "-Recurse; the sidecar is the runner's own liveness note, never a clip.",
 }
 
 TRAILING_COMMENT = re.compile(r"\s+#\s.*$")
