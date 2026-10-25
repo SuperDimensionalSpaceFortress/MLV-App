@@ -22,8 +22,9 @@ param(
 #   adopt       - Invoke-AdoptStartedJob (the restart-and-adopt path): the deadline is startedUtc + timeoutSec in UTC. A job past
 #                 it is killed at once; a job inside it is not; a missing startedUtc still throws (fail closed)
 #   out of range - AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a time at DateTime.MinValue or MaxValue never throws out of the three
-#                 sites above (a throw there ends the agent): queue age is clamped to [0, Int32.MaxValue], find-child is
-#                 unknown, and an adopt deadline that cannot be represented reads as passed
+#                 sites above (a throw there ends the agent): queue age is clamped to [0, Int32.MaxValue], a launchingUtc
+#                 within 2 s of MinValue makes find-child unknown, and an adopt deadline that cannot be represented reads as
+#                 passed
 # r2: the shift only shows when the process is NOT on UTC, so this test never trusts the host's zone. It FORCES the zone of the
 # process: once at UTC-5 (what moves a deadline 5 h LATE on a pwsh 7 JSON read-back) and once at UTC+5:30 (what moves it early
 # and kills a live job), and asserts the effective offset is non-zero and the forced one BEFORE any other assertion; a zero or
