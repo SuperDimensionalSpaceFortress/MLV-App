@@ -80,6 +80,11 @@ class RoadmapQueueParityTests(unittest.TestCase):
         for heading in ("## Open product and playback cards", "## Drain", "## Parked with reason"):
             self.assertIn(heading, text)
 
+    def test_roadmap_states_macos_compilation_is_not_deferred(self) -> None:
+        """sol r1 blocker on #670: the rendered roadmap must say compilation is NOT deferred."""
+        text = ROADMAP_PATH.read_text(encoding="utf-8")
+        self.assertIn("Not deferred: macOS compilation stays green", text)
+
     def test_every_table_row_is_a_product_or_playback_card(self) -> None:
         section = ROADMAP_PATH.read_text(encoding="utf-8").split("## Drain")[0]
         table_lines = [l for l in section.splitlines() if re.match(r"^\|\s*\d+\s*\|", l)]
