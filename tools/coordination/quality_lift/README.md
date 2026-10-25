@@ -1,11 +1,12 @@
 # Quality lift: measure the CoS-first-reader gap, then shift the adversary left
 
 Two portable, project-neutral files. Neither names a project, host or board path, and neither grants any runtime
-authority: the Chief-of-Staff (CoS) stays advisory (bus RULINGS.md R18.1), and the adversary pass is not a review key.
+authority. The per-project values (which evidence is a project's review) live only in `review-sources.json`: the Chief-of-Staff (CoS) stays advisory (bus RULINGS.md R18.1), and the adversary pass is not a review key.
 
 | file | what it is |
 |---|---|
-| `Measure-FleetQualityLift.ps1` | Read-only meter. From the bus history of `cos-feedback/<project>/pr-*.md` (plus GitHub commit statuses and PR bodies) it reports, per project and fleet-wide: CoS passes, blocked rate, first-round blocked PRs, heads CoS read first (no factory status yet), true misses (a factory status said `success` before CoS blocked), CoS rounds per PR, and how many new PRs carry an `Adversary pass` line. The header lists the definitions and exit codes. |
+| `Measure-FleetQualityLift.ps1` | Read-only meter. From the bus history of `cos-feedback/<project>/pr-*.md` (plus GitHub commit statuses, native PR reviews where declared, and PR bodies) it reports, per project and fleet-wide: CoS passes, blocked rate, first-round blocked PRs, heads CoS read first (no declared review evidence before CoS), true misses (a declared approval before CoS blocked), the raw status proxy (`statusBeforeCos`), CoS rounds per PR, and how many new PRs carry an `Adversary pass` line. The header lists the definitions and exit codes. |
+| `review-sources.json` | Which evidence each project's factory review leaves (`-ReviewSources`). "CoS read first" and true misses are claimed only from it; a project it does not name reads `unknown`. |
 | `adversary-pass-prompt.md` | Template for ONE read-only contract-attack pass on an exact local head: list the invariants, build accepted inputs that break each, cite file:line, sweep the class. Only blocker/major findings that the diff introduced are actionable; minor and pre-existing ones are advisories. |
 | `test_fleet_quality_lift.py` | Fixture proof for the meter (`py -3 -m unittest tools/coordination/quality_lift/test_fleet_quality_lift.py`). |
 
@@ -23,12 +24,32 @@ before it measures; `-NoFetch` skips that pull, and a pull that fails is a named
 nothing from GitHub: blocked heads with no cached statuses then count as "unknown", never as "CoS read first". Exit 0
 means measured, 2 measured with source errors (named in the report), 3 bus unreadable, and 4 a usage error.
 
+## Declare your review evidence
+
+A commit status that says `success` is not a review: CI says it too. So the meter claims "CoS read first" and true misses
+only from evidence your project declares in `review-sources.json` (or the file you pass as `-ReviewSources`):
+
+```json
+{"schema": "fleet/quality-lift/review-sources/v1",
+ "projects": {"<project>": {"statusContexts": ["review/*"], "nativeReviews": true, "reviewAuthors": ["<login>"]}}}
+```
+
+- `statusContexts`: PowerShell wildcards naming your factory's review status contexts. Any state of a matching context
+  before CoS is prior review; its `success` is an approval.
+- `nativeReviews`: also read GitHub PR reviews on that head (`commit_id`) and review comments written on it
+  (`original_commit_id`), optionally only by `reviewAuthors`. Only an `APPROVED` review is an approval; any other review
+  and every review comment is prior review evidence, never an approval.
+
+Declare at least one. A project the file does not name reports `unknown` for CoS read first and true misses, and the
+fleet totals leave it out. Its raw status counts stay in `statusBeforeCos` (no status of any context before CoS; some
+context said `success` before CoS), a proxy that proves neither a review nor its absence.
+
 Then run it hourly from your project's own scheduler, with the same arguments and no `-Since` (the default is the last 7
 days). Runs on one project folder take turns through a lock file there; a run that waits past `-LockWaitSec` (default
 60) writes nothing and exits 2. Each run appends one row to `<OutDir>\history.jsonl`, so the 24 h targets can be read as a trend:
 
 - first-round CoS blocked rate below 20 % over 24 h;
-- CoS read first: 0;
+- CoS read first: 0 (from declared review evidence only);
 - CoS rounds per PR at or below 1.3;
 - an `Adversary pass` line on 100 % of new PRs.
 

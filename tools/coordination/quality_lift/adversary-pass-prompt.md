@@ -14,8 +14,8 @@ READ-ONLY: do not edit, create or delete any file, do not commit, push, or run a
 read-only commands (git show, git diff, git grep, rg, reading files, a one-liner that only evaluates an expression). Never launch the
 product, a build or a long-running job. Your final message is the deliverable.
 
-WHY: the Chief-of-Staff reviewer keeps finding blockers the factory's own keys approved, and in most of them it is the first reader of
-the head. Its method is the one below: it reads the source first, takes every promise the change makes literally, and builds an
+WHY: the Chief-of-Staff reviewer keeps finding blockers the factory's own review missed, and where a project's review evidence is
+declared it is often the first reader of the head. Its method is the one below: it reads the source first, takes every promise the change makes literally, and builds an
 ACCEPTED input that breaks it. Producer tests confirm the intent; your job is to attack the contract. Assume there is at least one
 defect until you have tried every row and failed.
 

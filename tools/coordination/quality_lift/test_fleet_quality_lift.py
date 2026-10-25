@@ -2,7 +2,9 @@
 
 A throwaway git repo shaped like the fleet doctrine bus (cos-feedback/<project>/pr-*.md, one CoS pass per commit)
 is measured with -NoFetch. With -NoStatuses no network is read and the status cache in -OutDir is seeded by hand;
-without it, a fake `gh` (a gh.ps1 first on PATH) answers the status pages and the PR listing from files.
+without it, a fake `gh` (a gh.ps1 first on PATH) answers the status pages, native PR reviews and review comments,
+and the PR listing from files. Unless a test says otherwise, the measured project declares `review/*` status
+contexts as its review evidence (-ReviewSources).
 """
 
 from __future__ import annotations
@@ -34,6 +36,9 @@ H9 = "9" * 40  # flip: the success before CoS is on the second status page
 H10 = "a" * 40  # recent: blocked 3 h ago
 H11 = "b" * 40  # recent: blocked 1 h ago
 H12 = "c" * 40  # recent: dated two days in the future
+OTHER = "e" * 40  # a head no pass names
+
+REVIEW_STATUS = {"statusContexts": ["review/*"]}
 
 FAKE_GH = r"""
 $dir = $env:QL_FAKE_GH_DIR
@@ -42,7 +47,11 @@ if ($args[0] -eq 'api') {
     $path = @($args | Where-Object { $_ -like 'repos/*' })[0]
     $page = [int](@($args | Where-Object { $_ -like 'page=*' })[0] -replace '^page=', '')
     $parts = $path.Split('/')
-    $file = Join-Path $dir ('status-{0}_{1}_{2}.json' -f $parts[1], $parts[2], $parts[4])
+    if ($parts[3] -eq 'pulls') {
+        $file = Join-Path $dir ('pull-{0}_{1}_{2}_{3}.json' -f $parts[1], $parts[2], $parts[4], $parts[5])
+    } else {
+        $file = Join-Path $dir ('status-{0}_{1}_{2}.json' -f $parts[1], $parts[2], $parts[4])
+    }
     Add-Content -LiteralPath (Join-Path $dir 'calls.log') -Value "api $path page=$page"
     if (-not (Test-Path -LiteralPath $file)) { '[]'; exit 0 }
     $all = @(Get-Content -LiteralPath $file -Raw | ConvertFrom-Json)
@@ -72,6 +81,14 @@ def _section(pr: int, head: str, blockers: str, repo: str = "acme/widget") -> st
 
 def _status(context: str, state: str, created: str) -> dict:
     return {"context": context, "state": state, "created_at": created}
+
+
+def _review(login: str, state: str, submitted: str, commit: str) -> dict:
+    return {"user": {"login": login}, "state": state, "submitted_at": submitted, "commit_id": commit}
+
+
+def _review_comment(login: str, created: str, original_commit: str, commit: str = OTHER) -> dict:
+    return {"user": {"login": login}, "created_at": created, "original_commit_id": original_commit, "commit_id": commit}
 
 
 def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
@@ -135,15 +152,25 @@ class MeterFixtureTests(unittest.TestCase):
         path.mkdir(exist_ok=True)
         return path
 
-    def _fake_gh(self, statuses: dict[tuple[str, str], list[dict]] | None = None, prs: dict[str, list[dict]] | None = None) -> Path:
+    def _fake_gh(self, statuses: dict[tuple[str, str], list[dict]] | None = None, prs: dict[str, list[dict]] | None = None,
+                 pulls: dict[tuple[str, int, str], list[dict]] | None = None) -> Path:
+        """pulls: (repo, pr, 'reviews' | 'comments') -> the native rows GitHub would return."""
         fake = self._dir()
         (fake / "gh.ps1").write_text(FAKE_GH, encoding="utf-8")
         for (repo, head), rows in (statuses or {}).items():
             owner, name = repo.split("/")
             (fake / f"status-{owner}_{name}_{head}.json").write_text(json.dumps(rows), encoding="utf-8")
+        for (repo, pr, kind), rows in (pulls or {}).items():
+            owner, name = repo.split("/")
+            (fake / f"pull-{owner}_{name}_{pr}_{kind}.json").write_text(json.dumps(rows), encoding="utf-8")
         for repo, rows in (prs or {}).items():
             (fake / f"prs-{repo.replace('/', '_')}.json").write_text(json.dumps(rows), encoding="utf-8")
         return fake
+
+    def _sources(self, projects: dict[str, dict]) -> Path:
+        path = self._dir() / "review-sources.json"
+        path.write_text(json.dumps({"schema": "fleet/quality-lift/review-sources/v1", "projects": projects}), encoding="utf-8")
+        return path
 
     def _run(self, *args: str, env: dict[str, str] | None = None, gh: Path | None = None) -> subprocess.CompletedProcess:
         env = dict(os.environ if env is None else env)
@@ -155,10 +182,13 @@ class MeterFixtureTests(unittest.TestCase):
             capture_output=True, text=True, env=env, timeout=300)
 
     def _measure(self, project: str, out: Path, cache: dict | None = None, gh: Path | None = None,
-                 since: str = "2026-10-01T00:00:00Z", expect: int = 0) -> dict:
+                 since: str = "2026-10-01T00:00:00Z", expect: int = 0, declared: dict | None = REVIEW_STATUS) -> dict:
+        """declared: the project's review evidence in -ReviewSources; None declares nothing for it."""
         if cache is not None:
             (out / "status-cache.json").write_text(json.dumps(cache), encoding="utf-8")
-        args = ["-Bus", str(self.bus), "-Project", project, "-Since", since, "-OutDir", str(out), "-NoFetch"]
+        sources = self._sources({} if declared is None else {project: declared})
+        args = ["-Bus", str(self.bus), "-Project", project, "-Since", since, "-OutDir", str(out), "-NoFetch",
+                "-ReviewSources", str(sources)]
         if gh is None:
             args.append("-NoStatuses")
         proc = self._run(*args, gh=gh)
@@ -216,7 +246,7 @@ class MeterFixtureTests(unittest.TestCase):
         self.assertEqual(since["trueMiss"], 1)
         self.assertEqual(since["noPriorKey"], 1)
         self.assertEqual(since["statusUnknown"], 0)
-        self.assertEqual(since["keysBeforeCos"], {"review/key-a": {"successBeforeCos": 1, "failureBeforeCos": 0}})
+        self.assertEqual(since["contextsBeforeCos"], {"review/key-a": {"review": True, "successBeforeCos": 1, "failureBeforeCos": 0}})
         rows = self._corpus(out)
         self.assertEqual(rows[0]["cosUtc"], "2026-10-20T17:00:00.0000000Z")
         self.assertEqual(rows[0]["successBeforeCos"], ["review/key-a"])
@@ -235,8 +265,98 @@ class MeterFixtureTests(unittest.TestCase):
         self.assertEqual(since["trueMiss"], 2)  # H8 and H9 (page 2); H7's success came after CoS
         self.assertEqual(since["noPriorKey"], 0)
         self.assertEqual(since["statusUnknown"], 0)
-        self.assertEqual(since["keysBeforeCos"]["review/key-a"], {"successBeforeCos": 2, "failureBeforeCos": 0})
+        self.assertEqual(since["contextsBeforeCos"]["review/key-a"], {"review": True, "successBeforeCos": 2, "failureBeforeCos": 0})
         self.assertIn(f"api repos/acme/widget/commits/{H9}/statuses page=2", (gh / "calls.log").read_text(encoding="utf-8"))
+
+    # -- review evidence: only what the project declares counts as a factory review (CoS r1 B1 on 01639c98)
+
+    def test_an_unrelated_ci_success_before_cos_is_not_a_factory_key(self) -> None:
+        gh = self._fake_gh({
+            ("acme/widget", H7): [_status("ci/lint", "success", "2026-10-21T09:00:00Z")],
+            ("acme/widget", H8): [_status("ci/lint", "success", "2026-10-21T09:00:00Z"), _status("review/key-a", "success", "2026-10-21T09:30:00Z")],
+        })
+        out = self._dir()
+        since = self._measure("flip", out, gh=gh)["windows"][0]
+        self.assertEqual(since["blocked"], 3)
+        self.assertEqual(since["trueMiss"], 1)  # H8's review/key-a only; ci/lint is not a factory key
+        self.assertEqual(since["noPriorKey"], 2)  # H7 (ci/lint only) and H9 (nothing)
+        self.assertEqual(since["statusBeforeCos"], {"noPriorStatus": 1, "successBeforeCos": 2})  # the raw proxy
+        self.assertEqual(since["contextsBeforeCos"]["ci/lint"], {"review": False, "successBeforeCos": 2, "failureBeforeCos": 0})
+        self.assertEqual(since["contextsBeforeCos"]["review/key-a"]["review"], True)
+        rows = {r["head"]: r for r in self._corpus(out)}
+        self.assertEqual((rows[H7]["successBeforeCos"], rows[H7]["reviewApprovedBeforeCos"]), (["ci/lint"], []))
+        self.assertEqual(rows[H8]["reviewApprovedBeforeCos"], ["review/key-a"])
+
+    def test_a_native_approved_review_before_cos_is_prior_factory_review(self) -> None:
+        gh = self._fake_gh(pulls={
+            ("acme/widget", 20, "reviews"): [_review("keybot", "APPROVED", "2026-10-21T09:00:00Z", H7)],
+            # An approval of another commit, and one by an author the project does not name, prove nothing about H8.
+            ("acme/widget", 21, "reviews"): [_review("keybot", "APPROVED", "2026-10-21T09:00:00Z", OTHER),
+                                             _review("someone", "APPROVED", "2026-10-21T09:00:00Z", H8)],
+            ("acme/widget", 22, "reviews"): [_review("keybot", "APPROVED", "2026-10-21T11:00:00Z", H9)],  # after CoS
+        })
+        result = self._measure("flip", self._dir(), gh=gh, declared={"nativeReviews": True, "reviewAuthors": ["keybot"]})
+        since = result["windows"][0]
+        self.assertEqual(since["trueMiss"], 1)
+        self.assertEqual(since["noPriorKey"], 2)
+        self.assertEqual(since["statusBeforeCos"]["noPriorStatus"], 3)
+        self.assertIn("native", since["reviewSource"])
+        self.assertTrue(since["contextsBeforeCos"]["pull-request-review/keybot"]["review"])
+        self.assertFalse(since["contextsBeforeCos"]["pull-request-review/someone"]["review"])
+        calls = (gh / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("api repos/acme/widget/pulls/20/reviews page=1", calls)
+        self.assertIn("api repos/acme/widget/pulls/20/comments page=1", calls)
+
+    def test_a_review_comment_before_cos_is_review_evidence_not_an_approval(self) -> None:
+        gh = self._fake_gh(pulls={
+            ("acme/widget", 20, "comments"): [_review_comment("keybot", "2026-10-21T09:00:00Z", H7)],
+            ("acme/widget", 21, "reviews"): [_review("keybot", "COMMENTED", "2026-10-21T09:00:00Z", H8)],
+            ("acme/widget", 22, "reviews"): [_review("keybot", "CHANGES_REQUESTED", "2026-10-21T09:00:00Z", H9)],
+        })
+        since = self._measure("flip", self._dir(), gh=gh, declared={"nativeReviews": True})["windows"][0]
+        self.assertEqual((since["noPriorKey"], since["trueMiss"]), (0, 0))
+        self.assertEqual(since["contextsBeforeCos"]["pull-request-review-comment/keybot"],
+                         {"review": True, "successBeforeCos": 0, "failureBeforeCos": 0})
+        self.assertEqual(since["contextsBeforeCos"]["pull-request-review/keybot"]["failureBeforeCos"], 1)
+
+    def test_a_project_with_no_declared_review_source_is_unknown_not_zero(self) -> None:
+        out = self._dir()
+        result = self._measure("flip", out, gh=self._fake_gh(), declared=None)
+        for window in result["windows"]:
+            self.assertEqual((window["noPriorKey"], window["trueMiss"]), ("unknown", "unknown"), window["window"])
+            self.assertEqual(window["reviewSource"], "undeclared")
+        self.assertEqual(result["windows"][0]["statusBeforeCos"], {"noPriorStatus": 3, "successBeforeCos": 0})
+        md = (out / "quality-lift.md").read_text(encoding="utf-8-sig")
+        self.assertIn("CoS read first 24h unknown", md)
+        self.assertNotIn("0 of 3", md.split("|")[0])
+        self.assertTrue(all(r["reviewApprovedBeforeCos"] == "unknown" for r in self._corpus(out)))
+        history = [json.loads(x) for x in (out / "history.jsonl").read_text(encoding="utf-8-sig").splitlines() if x.strip()]
+        self.assertEqual((history[-1]["noPriorKey24h"], history[-1]["trueMiss24h"]), ("unknown", "unknown"))
+        # Fleet mode: an undeclared project never adds to the fleet's CoS-first count.
+        fleet_out = self._dir()
+        proc = self._run("-Bus", str(self.bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(fleet_out), "-NoStatuses",
+                         "-NoFetch", "-ReviewSources", str(self._sources({})))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        fleet = (fleet_out / "fleet.md").read_text(encoding="utf-8-sig")
+        self.assertIn("| **fleet** | 12 | 9 (75%) | | 0 of 5 projects | unknown | unknown | 0 of 9 (9 unknown) |", fleet)
+
+    def test_a_missing_or_malformed_review_sources_file_is_a_usage_error(self) -> None:
+        out = self._dir()
+        proc = self._run("-Bus", str(self.bus), "-Project", "demo", "-OutDir", str(out), "-NoStatuses", "-NoFetch",
+                         "-ReviewSources", str(self.root / "no-such-sources.json"))
+        self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+        for projects in ({"demo": {"statusContexts": "review/*"}}, {"demo": {}}, {"demo": {"nativeReviews": "yes"}},
+                         {"demo": {"statusContexts": [""]}}, {"demo": {"nativeReviews": True, "reviewAuthors": [7]}}):
+            proc = self._run("-Bus", str(self.bus), "-Project", "demo", "-OutDir", str(out), "-NoStatuses", "-NoFetch",
+                             "-ReviewSources", str(self._sources(projects)))
+            self.assertEqual(proc.returncode, 4, (projects, proc.stdout + proc.stderr))
+        self.assertFalse((out / "quality-lift.json").exists())
+
+    def test_the_tracked_review_sources_file_parses_and_declares_review_evidence(self) -> None:
+        tracked = json.loads((HERE / "review-sources.json").read_text(encoding="utf-8"))
+        self.assertEqual(tracked["schema"], "fleet/quality-lift/review-sources/v1")
+        for name, decl in tracked["projects"].items():
+            self.assertTrue(decl.get("statusContexts") or decl.get("nativeReviews") is True, name)
 
     def test_status_evidence_is_kept_per_repository_not_per_sha(self) -> None:
         gh = self._fake_gh({("acme/widget", H6): [_status("review/key-a", "success", "2026-10-21T14:00:00Z")]})
@@ -288,11 +408,13 @@ class MeterFixtureTests(unittest.TestCase):
         return bus
 
     def _measure_bus(self, bus: Path, project: str, since: str = "2026-10-01T00:00:00Z", cache: dict | None = None,
-                     expect: int = 0, gh: Path | None = None) -> tuple[dict, Path]:
+                     expect: int = 0, gh: Path | None = None, declared: dict | None = REVIEW_STATUS) -> tuple[dict, Path]:
         out = self._dir()
         if cache is not None:
             (out / "status-cache.json").write_text(json.dumps(cache), encoding="utf-8")
-        args = ["-Bus", str(bus), "-Project", project, "-Since", since, "-OutDir", str(out), "-NoFetch"]
+        sources = self._sources({} if declared is None else {project: declared})
+        args = ["-Bus", str(bus), "-Project", project, "-Since", since, "-OutDir", str(out), "-NoFetch",
+                "-ReviewSources", str(sources)]
         if gh is None:
             args.append("-NoStatuses")
         proc = self._run(*args, gh=gh)
@@ -429,14 +551,50 @@ class MeterFixtureTests(unittest.TestCase):
 
     def test_fleet_mode_writes_every_project_and_the_fleet_row(self) -> None:
         out = self._dir()
-        proc = self._run("-Bus", str(self.bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoStatuses", "-NoFetch")
+        projects = ("demo", "other", "twin", "flip", "recent")
+        sources = self._sources({p: REVIEW_STATUS for p in projects})
+        proc = self._run("-Bus", str(self.bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoStatuses", "-NoFetch",
+                         "-ReviewSources", str(sources))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        for project in ("demo", "other", "twin", "flip", "recent"):
+        for project in projects:
             self.assertTrue((out / project / "quality-lift.json").is_file(), project)
         other = json.loads((out / "other" / "quality-lift.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(other["windows"][0]["passes"], 1)  # the later commit that deletes pr-1.md is not an error
         fleet = (out / "fleet.md").read_text(encoding="utf-8-sig")
-        self.assertIn("| **fleet** | 12 | 9 (75%) | | 0 of 9 (9 unknown) | 0 |", fleet)
+        self.assertIn("| **fleet** | 12 | 9 (75%) | | 5 of 5 projects | 0 of 9 (9 unknown) | 0 | 0 of 9 (9 unknown) |", fleet)
+
+    def test_fleet_markdown_names_a_project_that_errored_with_no_passes(self) -> None:
+        bus = self._dir()
+        _git(bus, "init", "-q")
+        _commit(bus, "cos-feedback/x/pr-1.md", _section(1, H1, "B1 x."), "2026-10-20T00:00:00+00:00", "x")
+        blob = _git(bus, "rev-parse", "HEAD:cos-feedback/x/pr-1.md")
+        loose = bus / ".git" / "objects" / blob[:2] / blob[2:]
+        os.chmod(loose, stat.S_IWRITE | stat.S_IREAD)
+        loose.unlink()
+        out = self._dir()
+        proc = self._run("-Bus", str(bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoStatuses", "-NoFetch")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertRegex((out / "fleet.md").read_text(encoding="utf-8-sig"), r"(?m)^\| x \| 0 \|.*\| 1 \|$")
+
+    # -- paths git would quote (CI DG-GIT-PATHLIST on 01639c98)
+
+    def test_a_project_folder_git_would_quote_is_still_measured(self) -> None:
+        project = "café"
+        p = f"cos-feedback/{project}/pr-7.md"
+        bus = self._small_bus([
+            ("cos-feedback/README.md", "readme\n", "2026-10-20T00:00:00+00:00", "seed (keeps cos-feedback/)"),
+            (p, _section(7, H1, "B1 x."), _iso(NOW - timedelta(hours=3)), "pr7"),
+            (f"cos-feedback/{project}/pr-8.md", _section(8, H2, "None."), _iso(NOW - timedelta(hours=2)), "pr8"),
+        ])
+        since = self._measure_bus(bus, project, since=_iso(NOW - timedelta(days=1)))[0]["windows"][0]
+        self.assertEqual((since["passes"], since["blocked"]), (2, 1))
+        # Fleet mode finds the folder from the log alone once it is deleted from the checkout.
+        _commit(bus, p, None, _iso(NOW - timedelta(hours=1)), "pr7 deleted")
+        _commit(bus, f"cos-feedback/{project}/pr-8.md", None, _iso(NOW - timedelta(minutes=30)), "pr8 deleted")
+        out = self._dir()
+        proc = self._run("-Bus", str(bus), "-Since", _iso(NOW - timedelta(days=1)), "-OutDir", str(out), "-NoStatuses", "-NoFetch")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"| {project} | 2 | 1 (50%) |", (out / "fleet.md").read_text(encoding="utf-8-sig"))
 
     def test_an_empty_bus_still_writes_the_fleet_report(self) -> None:
         bus = self._dir()
