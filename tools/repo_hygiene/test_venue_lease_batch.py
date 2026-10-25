@@ -312,6 +312,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.events = self.case / "events.log"
         self.caps_events = self.case / "caps-events.log"
         self.run_dir = self.case / "run"
+        self.runner = RUNNER
 
     def run_batch(self, specs: list[Path] | None = None, *extra: str, **env: str) -> subprocess.CompletedProcess:
         args, e = self.batch_cmd(specs, *extra, **env)
@@ -329,7 +330,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
                     "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
         for k in omit:
             defaults.pop(k)
-        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-LegSpec", ",".join(str(s) for s in (specs or self.specs[:2])),
+        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.runner), "-LegSpec", ",".join(str(s) for s in (specs or self.specs[:2])),
                 "-RunDir", str(self.run_dir), "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST, "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
                 "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *extra]
@@ -1060,6 +1061,230 @@ $o | ConvertTo-Json -Compress
                 p.wait(timeout=60)
             p.stdout.close()
             p.stderr.close()
+
+    # ---------------------------------------------------------------- r6: the first sidecar write is read back with the agent's own parser (Grok G2 on #633)
+    def _mirror_with_bad_sidecar(self, json_patch: str = "", writer_patch: tuple[str, str] | None = None,
+                                 module_patches: tuple[tuple[str, str], ...] = (), agent_patches: tuple[tuple[str, str], ...] = (),
+                                 runner_patches: tuple[tuple[str, str], ...] = ()) -> None:
+        """A copy of tools/profiling/{dual-venue,bachelor/ultra-magnus-agent.ps1} in which the runner's sidecar writer still says WRITTEN but writes bytes the agent
+        would not read as live. json_patch is PowerShell run on $json before it is written; writer_patch replaces a statement of the write itself. The runner under test
+        is the copy's own Invoke-VenueLeaseBatch.ps1 (self.runner), reading the agent's functions from the copy's bachelor folder."""
+        tree = self.case / "tree" / "tools" / "profiling"
+        shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
+        (tree / "bachelor").mkdir()
+        shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
+        if agent_patches:
+            agent_copy = tree / "bachelor" / AGENT.name
+            agent_text = agent_copy.read_text(encoding="utf-8")
+            for old, new in agent_patches:
+                self.assertEqual(agent_text.count(old), 1, "the agent line moved: update this fixture")
+                agent_text = agent_text.replace(old, new)
+            agent_copy.write_text(agent_text, encoding="utf-8")
+        mod = tree / "dual-venue" / "VenueChain.psm1"
+        text = mod.read_text(encoding="utf-8")
+        for old, new in module_patches:
+            self.assertEqual(text.count(old), 1, "the module line moved: update this fixture")
+            text = text.replace(old, new)
+        anchor = "[pscustomobject]@{ path = ($AgentShare.TrimEnd('\\') + '\\notafter\\' + $JobId + '.json'); json = $json }"
+        self.assertEqual(text.count(anchor), 1, "the sidecar write argument moved: update this fixture")
+        text = text.replace(anchor, (json_patch + "\n    " if json_patch else "") + anchor)
+        if writer_patch:
+            self.assertEqual(text.count(writer_patch[0]), 1, "the sidecar write moved: update this fixture")
+            text = text.replace(writer_patch[0], writer_patch[1])
+        mod.write_text(text, encoding="utf-8")
+        self.runner = tree / "dual-venue" / RUNNER.name
+        if runner_patches:
+            run_text = self.runner.read_text(encoding="utf-8")
+            for old, new in runner_patches:
+                self.assertEqual(run_text.count(old), 1, "the runner line moved: update this fixture")
+                run_text = run_text.replace(old, new)
+            self.runner.write_text(run_text, encoding="utf-8")
+
+    def _assert_readback_refused(self, r: subprocess.CompletedProcess, want_state: str, end_reason: str = "LIVENESS_UNAVAILABLE", code: int = 9,
+                                 detail: str = "agent's own parser does not read it as live") -> dict:
+        """The first write said WRITTEN, the agent's parser disagrees: the open is never submitted and the batch ends exactly as a failed write ends it
+        (or, r2, DEADLINE exit 3 when the deadline crossed under a live sidecar). Nothing reaches Submit-AgentJob: the fake um-run's call log and the inbox stay empty."""
+        self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["openOutcome"], b["leaseId"], b["openCancel"], b["closeJobId"], b["ledger"]), (end_reason, "NOT_SUBMITTED", None, None, None, None), b)
+        self.assertEqual(self.kinds(), [], "no open, close, probe or leg once the read-back was not live")
+        self.assertFalse([l for l in (self.events_raw() if self.events.exists() else []) if " UMRUN " in l], "the fake um-run was called")
+        self.assertEqual(list((self.share / "inbox").glob("*.job.ps1")) if (self.share / "inbox").exists() else [], [], "a job reached the inbox")
+        self.assertIn("first liveness write WRITTEN", b["endDetail"])
+        self.assertIn(detail, b["endDetail"])
+        rb = b["openLivenessReadback"]
+        self.assertEqual((rb["live"], rb["livenessState"]), (False, want_state), rb)
+        self.assertTrue(rb["why"], rb)
+        self.assertIn(rb["why"], b["endDetail"])
+        self.assertEqual(list((self.share / "notafter").glob("lease-batch-open-*")), [], "the refused sidecar was left behind")
+        self.assertEqual(b["legsAttempted"], 0)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["stopReason"], res["ran"], res["counted"], res["notRun"]), (end_reason, 0, 0, 2))
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn(f" BATCH_OPEN_LIVENESS batch=1 job={b['openJobId']} first=WRITTEN ", log)
+        self.assertIn(f" BATCH_OPEN_LIVENESS_READBACK batch=1 job={b['openJobId']} live=False livenessState={want_state} ", log)
+        return b
+
+    # (what the bytes are, PowerShell that makes them, the agent's livenessState for them; the agent lines are ultra-magnus-agent.ps1 Get-JobNotAfterVerdict / Read-JobNotAfterSidecar)
+    BAD_SIDECARS = (
+        ("no aliveUntilUtc (:803)", "$json = $json -replace '\"aliveUntilUtc\":\"[^\"]*\",', ''", "unparseable"),
+        ("aliveUntilUtc that is no time (:803)", "$json = $json -replace '\"aliveUntilUtc\":\"[^\"]*\"', '\"aliveUntilUtc\":\"not a time\"'", "unparseable"),
+        ("aliveUntilUtc already passed (:815)", "$json = $json -replace '\"aliveUntilUtc\":\"[^\"]*\"', '\"aliveUntilUtc\":\"2001-01-01T00:00:00.0000000Z\"'", "lapsed"),
+        ("another job's id (:799)", "$json = $json -replace '\"jobId\":\"[^\"]*\"', '\"jobId\":\"lease-batch-open-someone-else\"'", "unparseable"),
+        ("another schema (:798)", "$json = $json -replace 'mlv-app/job-notafter-sidecar/v1', 'mlv-app/job-notafter-sidecar/v0'", "unparseable"),
+        ("cut-off JSON (:791)", "$json = $json.Substring(0, 40)", "unparseable"),
+        ("an array root (:790)", "$json = '[' + $json + ']'", "unparseable"),
+        ("over 4096 bytes (:858)", "$json = $json + (' ' * 5000)", "unparseable"),
+    )
+
+    def test_r6_a_written_sidecar_the_agent_would_not_read_as_live_submits_no_open(self) -> None:
+        # Grok G2 on #633: the first write reports WRITTEN but the agent would parse the bytes as absent / unparseable / lapsed. RED on 13d65263: the open is
+        # submitted (the batch runs on to its legs, exit 0), then refused or lapsed on the agent.
+        for label, patch, want in self.BAD_SIDECARS:
+            with self.subTest(label):
+                self.setUp()   # a fresh share, claim dir and run dir per case
+                self._mirror_with_bad_sidecar(json_patch=patch)
+                self._assert_readback_refused(self.run_batch(self.specs[:2]), want)
+
+    def test_r6_a_sidecar_that_vanishes_after_a_written_write_submits_no_open(self) -> None:
+        # The write returned WRITTEN and the file is gone when read back: the agent reads no sidecar (absent), so the open would have no liveness bound at all.
+        self._mirror_with_bad_sidecar(writer_patch=("[IO.File]::Move($tmp, $A.path, $true)", "[IO.File]::Move($tmp, $A.path, $true); Remove-Item -LiteralPath $A.path -Force"))
+        self._assert_readback_refused(self.run_batch(self.specs[:2]), "absent")
+
+    def test_r6_the_mirror_with_an_unchanged_writer_still_submits_the_open(self) -> None:
+        # Control: the copied tree is faithful, so the refusals above come from the bytes, not from the copy. A live sidecar is read back live and the batch runs.
+        self._mirror_with_bad_sidecar()
+        r = self.run_batch(self.specs[:2])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["openOutcome"], b["legsCounted"]), ("ALL_LEGS_DONE", "RECEIPT", 2), b)
+        self.assertEqual((b["openLivenessReadback"]["live"], b["openLivenessReadback"]["livenessState"]), (True, "live"), b["openLivenessReadback"])
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1)
+
+    def test_r6_the_readback_judges_with_the_agents_functions_and_fails_closed_without_them(self) -> None:
+        # Test-VenueJobLivenessReadback lifts Get-JobNotAfterVerdict and Read-JobNotAfterSidecar from the agent script. An agent script that lacks them, or is
+        # missing, gives a not-live answer rather than a guess.
+        empty = self.case / "no-fns.ps1"
+        empty.write_text("function Something-Else { 1 }\n", encoding="utf-8")
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            "[ordered]@{\n"
+            f"  noFns = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1' -AgentScript '{empty}'\n"
+            f"  noFile = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1' -AgentScript '{self.case / 'missing.ps1'}'\n"
+            f"  noSidecar = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1'\n"
+            "} | ConvertTo-Json -Compress -Depth 4\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual((got["noFns"]["live"], got["noFile"]["live"], got["noSidecar"]["live"]), (False, False, False), got)
+        self.assertIn("does not define both", got["noFns"]["error"])
+        self.assertEqual((got["noSidecar"]["livenessState"], got["noSidecar"]["error"]), ("absent", None), got["noSidecar"])
+
+    # ---------------------------------------------------------------- r2: the three regression cases hub ACK 6394063078 promised, the deadline typing, the agent-script sha
+    def test_r2_a_stalled_readback_worker_is_not_live_and_submits_no_open(self) -> None:
+        # (a) VenueChain.psm1 Invoke-VenueBoundedRead: the worker reading the sidecar back never answers (the lifted agent reader sleeps 120 s; the read-back's bound is
+        # patched down to 2 s so the case stays fast). The bound expires -> not live (UNKNOWN) -> no Submit-AgentJob, exit 9 LIVENESS_UNAVAILABLE, keeper stopped, sidecar removed.
+        # RED on 13d65263 (no read-back: the open is submitted, exit 0).
+        self._mirror_with_bad_sidecar(
+            module_patches=(("[string]$AgentScript = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)", "[string]$AgentScript = '', [ValidateRange(1, 600)][int]$TimeoutSec = 2)"),),
+            agent_patches=(('$path = Join-Path $notAfterDir "$JobId.json"', '$path = Join-Path $notAfterDir "$JobId.json"; Start-Sleep -Seconds 120'),))
+        started = time.monotonic()
+        r = self.run_batch(self.specs[:2])
+        elapsed = time.monotonic() - started
+        b = self._assert_readback_refused(r, "UNKNOWN")
+        self.assertEqual(b["openLivenessReadback"]["state"], "UNKNOWN")
+        self.assertIn("no answer in 2 s", b["openLivenessReadback"]["why"])
+        self.assertLess(elapsed, 100, "the abandoned worker held the runner (it sleeps 120 s)")
+
+    def test_r2_the_readback_helper_gives_up_on_a_stalled_worker_within_its_timeout(self) -> None:
+        # The helper on its own: an agent script whose reader never returns, -TimeoutSec 1 -> not live, UNKNOWN, 'no answer', in about a second (not the reader's 120 s).
+        stall = self.case / "stalled-agent.ps1"
+        stall.write_text("function Get-JobNotAfterVerdict { param($Metadata, $Sidecar) 1 }\nfunction Read-JobNotAfterSidecar { param($JobId) Start-Sleep -Seconds 120 }\n", encoding="utf-8")
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"$t = [Diagnostics.Stopwatch]::StartNew(); $r = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1' -AgentScript '{stall}' -TimeoutSec 1; $t.Stop()\n"
+            "[ordered]@{ live = $r.live; state = $r.state; livenessState = $r.livenessState; error = $r.error; ms = $t.ElapsedMilliseconds } | ConvertTo-Json -Compress\n"
+            "Complete-VenueProcess -ExitCode 0\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=100)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual((got["live"], got["state"], got["livenessState"]), (False, "UNKNOWN", "UNKNOWN"), got)
+        self.assertIn("no answer in 1 s", got["error"])
+        self.assertLess(got["ms"], 20000, got)
+
+    def test_r2_a_sidecar_holding_invalid_utf8_is_not_live_and_submits_no_open(self) -> None:
+        # (b) ultra-magnus-agent.ps1 Read-JobNotAfterSidecar :859 reads with a strict UTF-8 decoder, so bytes that are not UTF-8 are 'unreadable' and the verdict
+        # fails closed (:782). The writer still says WRITTEN; the file then holds 0xFF 0xFE bytes. -> not live, refuse, no open. RED on 13d65263 (the open is submitted).
+        bad = "[IO.File]::Move($tmp, $A.path, $true); [IO.File]::WriteAllBytes($A.path, [byte[]](0x7B, 0x22, 0xFF, 0xFE, 0x22, 0x7D))"
+        self._mirror_with_bad_sidecar(writer_patch=("[IO.File]::Move($tmp, $A.path, $true)", bad))
+        b = self._assert_readback_refused(self.run_batch(self.specs[:2]), "unparseable")
+        self.assertIn("could not be read", b["openLivenessReadback"]["why"])
+
+    def test_r2_a_deadline_crossed_under_a_live_sidecar_ends_deadline_and_submits_no_open(self) -> None:
+        # (c) The runner's own deadline check (Invoke-VenueLeaseBatch.ps1 :349) passed, then the deadline crossed before the read-back: the agent's verdict is
+        # state=passed with livenessState=live (ultra-magnus-agent.ps1 :818-825). Simulated by handing the read-back a notAfterUtc 5 s in the past, the sidecar live.
+        # r1 typed this LIVENESS_UNAVAILABLE exit 9 with "(read-back live)"; r2 types it DEADLINE exit 3 (the runner's deadline code) and the open is still never submitted.
+        anchor = "    $ast = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$null, [ref]$null)"
+        self._mirror_with_bad_sidecar(module_patches=((anchor, "    $NotAfterUtc = [DateTime]::UtcNow.AddSeconds(-5).ToString('o')\n" + anchor),))
+        b = self._assert_readback_refused(self.run_batch(self.specs[:2]), "live", end_reason="DEADLINE", code=3, detail="the batch deadline passed first")
+        rb = b["openLivenessReadback"]
+        self.assertEqual((rb["state"], rb["livenessState"], rb["live"]), ("passed", "live", False), rb)
+        self.assertNotIn("does not read it as live", b["endDetail"])
+
+    def test_r2_the_readback_record_carries_the_agent_scripts_sha256(self) -> None:
+        # Opus H3: the read-back judges with the checkout's agent script; its sha256 in openLivenessReadback makes a later drift from the deployed agent visible.
+        import hashlib
+        self._mirror_with_bad_sidecar()
+        r = self.run_batch(self.specs[:2])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        sha = b["openLivenessReadback"]["agentScriptSha256"]
+        self.assertRegex(sha, r"^[0-9a-f]{64}$")
+        self.assertEqual(sha, hashlib.sha256(AGENT.read_bytes()).hexdigest(), "the mirror's agent script is the checkout's, byte for byte")
+
+    # ---------------------------------------------------------------- r3: a read-back that THROWS before the open is submitted is not a sent open (Dot B1 on 46768a21)
+    def test_r3_a_readback_that_throws_before_the_open_is_submitted_cancels_nothing_closes_nothing_and_charges_nothing(self) -> None:
+        # VenueChain.psm1 Test-VenueJobLivenessReadback: Test-Path on the agent script succeeds, then the hash (Get-FileHash) or the parse (ParseFile) throws because
+        # the file is locked or vanished. RED on 46768a21: the exception left $op null, the finally block read a null $op as "maybe sent", requested a cancel, submitted
+        # a close and wrote a full-LeaseCapSec open-unreconciled ledger row for an open that was never submitted, and the exception then escaped past the summary.
+        # (Parser::ParseFile itself does not throw on a missing file: it returns an error AST, which the helper already treats as "functions not defined".) Case 1: the
+        # path Get-FileHash reads is swapped for one that does not exist, so the .NET call really throws. Case 2: a simulated throw where the helper reads the script.
+        # The batch ends typed, with its summary.
+        hash_old = "(Get-FileHash -LiteralPath $AgentScript -Algorithm SHA256)"
+        read_old = "    $ast = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$null, [ref]$null)"
+        for label, old, new in (
+            ("the hash throws", hash_old, "(Get-FileHash -LiteralPath ($AgentScript + '.vanished') -Algorithm SHA256)"),
+            ("the read throws", read_old, "    throw 'vanished: simulated read failure, the agent script is locked'\n" + read_old),
+        ):
+            with self.subTest(label):
+                self.setUp()   # a fresh share, claim dir and run dir per case
+                self._mirror_with_bad_sidecar(module_patches=((old, new),))
+                r = self.run_batch(self.specs[:2], "-CancelReconcileSec", "3")
+                b = self._assert_readback_refused(r, "UNKNOWN")
+                self.assertIn("vanished", b["openLivenessReadback"]["why"], b["openLivenessReadback"])
+                self.assertEqual(list((self.share / "cancel").iterdir()), [], "a cancel was requested for an open that was never submitted")
+                self.assertFalse((self.claims / "bachelor.lease-ledger.jsonl").exists(), "the ledger was charged for an open that was never submitted")
+                self.assertIn("LEASE_BATCH_RESULT=", r.stdout, "the original exception escaped past the batch summary")
+                log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+                self.assertNotIn(" BATCH_OPEN_CANCEL ", log)
+                self.assertNotIn(" BATCH_OPEN_RECONCILED ", log)
+
+    def test_r3_a_submit_that_throws_is_an_uncertain_open_and_keeps_the_conservative_cancel_close_and_ledger_row(self) -> None:
+        # Control for the case above: here the open IS (maybe) submitted. Submit-AgentJob throws for the open job before it reports anything, so $op stays null; the
+        # submitted flag, not $op, tells the finally block the open may be in the agent's gate: cancel requested, close submitted, open-unreconciled row charged.
+        anchor = '    $f = Join-Path $jobDir "$JobId.job.ps1"'
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, "    if ($JobId -like 'lease-batch-open-*') { throw 'simulated submit failure' }\n" + anchor),))
+        r = self.run_batch([self.specs[0]], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=30)), "-CancelReconcileSec", "3")
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["openCancel"]["requested"], b["openCancel"]["state"]), ("REQUESTED", "UNRECONCILED"), b)
+        self.assertTrue((self.share / "cancel" / f"{b['openJobId']}.cancel").exists(), "the cancel request stays for the agent")
+        self.assertTrue(b["closeJobId"], "the close was not submitted")
+        self.assertEqual(b["ledger"]["basis"], "open-unreconciled", b["ledger"])
+        self.assertTrue((self.claims / "bachelor.lease-ledger.jsonl").exists())
 
     # ---------------------------------------------------------------- r5b: no probe or leg without the claim (Grok G1, 6389240991)
     def test_r5b_a_claim_taken_over_mid_batch_ends_the_batch_claim_lost_and_keeps_the_legs_already_run(self) -> None:

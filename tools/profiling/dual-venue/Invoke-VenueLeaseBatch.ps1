@@ -322,7 +322,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         legsAttempted = 0; legsRan = 0; legsCounted = 0; retries = 0; probeRetries = 0; legRetries = 0
         endReason = $null; endDetail = $null; legs = [System.Collections.Generic.List[object]]::new(); closeJobId = $null; closeOutcome = $null; agent = $null; endedUtc = $null
         preOpenWait = $null; openLeaseWait = 'NONE'; exit75Refusals = 0; exit75Class = 'NONE'; renewOkMaxGapSec = $null; leaseEndClamp = $null; ledger = $null
-        openExit75Refusals = 0; legExit75Refusals = 0; openCancel = $null; openNotAfterUtc = $null; openLiveness = $null; claimRenew = $null
+        openExit75Refusals = 0; legExit75Refusals = 0; openCancel = $null; openNotAfterUtc = $null; openLiveness = $null; openLivenessReadback = $null; claimRenew = $null
     }
     foreach ($ck in $capsReceipt.Keys) { $b[$ck] = $capsReceipt[$ck] }
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
@@ -360,7 +360,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     # outlast -ClaimTtlSec), so Get-VenueClaimStaleReason never finds a live owner's claim expired. The keeper dies with this process.
     $claimKeeper = Start-VenueClaimKeeper -Venue $Venue -Nonce $claim.nonce -TtlSec $ClaimTtlSec -RenewSec $ClaimRenewSec -ClaimDir $ClaimDir
     L "CLAIM_TAKEN batch=$batchNo nonce=$($claim.nonce) expiresUtc=$($claim.expiresUtc) renewSec=$ClaimRenewSec ttlSec=$ClaimTtlSec"
-    $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null; $openLive = $null; $cr = $null
+    # r3 (Dot B1): $openSubmitted is true from the moment Submit-AgentJob is called for the open. The finally block's cancel, close and ledger charge follow
+    # that flag, never "$op is null": a null $op before the call (a throw while the sidecar was checked) means nothing was sent.
+    $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null; $openLive = $null; $cr = $null; $openSubmitted = $false
     try {
         # (2) OPEN: the lease first. Nothing is probed or run before the agent reports this batch's lease active.
         $b.openJobId = "lease-batch-open-$stamp-lb$token"
@@ -374,12 +376,23 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # -LivenessWindowSec ahead. Killed, this run stops renewing it, and the agent ends the open's gate wait and releases its lease within that window.
         $openLive = Start-VenueJobLiveness -AgentShare $AgentShare -JobId $b.openJobId -WindowSec $LivenessWindowSec -RenewSec $LivenessRenewSec
         L "BATCH_OPEN_LIVENESS batch=$batchNo job=$($b.openJobId) first=$($openLive.first.state) aliveUntilUtc=$($openLive.first.aliveUntilUtc) windowSec=$LivenessWindowSec renewSec=$LivenessRenewSec$(if ($openLive.first.error) { " error=$($openLive.first.error)" })"
-        if ($openLive.first.state -cne 'WRITTEN') {
+        # r6 (Grok G2 on #633): WRITTEN only says the write returned. The file is read back with the agent's own reader and verdict; one the agent would not read as live is no sidecar.
+        $rb = $null; $crossed = $false
+        if ($openLive.first.state -ceq 'WRITTEN') {
+            $rb = Test-VenueJobLivenessReadback -AgentShare $AgentShare -JobId $b.openJobId -NotAfterUtc $b.openNotAfterUtc
+            $b.openLivenessReadback = $rb
+            L "BATCH_OPEN_LIVENESS_READBACK batch=$batchNo job=$($b.openJobId) live=$($rb.live) livenessState=$($rb.livenessState) why=$($rb.why)"
+            # r2 (opus H1): a LIVE sidecar under a job whose own notAfterUtc (the batch deadline) has passed reads state=passed. The sidecar is fine; the deadline crossed between
+            # the check above and this read-back, so the batch ends DEADLINE (exit 3) like every other deadline stop, not as a liveness failure.
+            $crossed = [string]$rb.livenessState -ceq 'live' -and [string]$rb.state -ceq 'passed'
+        }
+        if ($openLive.first.state -cne 'WRITTEN' -or -not $rb.live) {
             # r5b (dot ef5805a4 residual B1): no sidecar, no open. Submitted without one, an open this run dies under stays admissible until the far batch
             # deadline, not -LivenessWindowSec. The keeper is stopped and the open is never submitted: the batch ends LIVENESS_UNAVAILABLE (exit 9, below).
             $b.openLiveness = Stop-VenueJobLiveness $openLive -Remove
-            $op = [pscustomobject]@{ outcome = 'NOT_SUBMITTED'; result = $null; message = "first liveness write $($openLive.first.state)$(if ($openLive.first.error) { ": $($openLive.first.error)" })" }
+            $op = [pscustomobject]@{ outcome = 'NOT_SUBMITTED'; result = $null; message = "first liveness write $($openLive.first.state)$(if ($openLive.first.error) { ": $($openLive.first.error)" })$(if ($crossed) { ", but the batch deadline passed first (the sidecar is live; read-back: $($rb.why))" } elseif ($null -ne $rb -and -not $rb.live) { ", but the agent's own parser does not read it as live (read-back $($rb.livenessState)): $($rb.why)" })" }
         } else {
+            $openSubmitted = $true
             $op = Submit-AgentJob $b.openJobId "Write-Output ('LEASE_BATCH_OPEN token=$token held=' + [string]`$env:HEAVY_SLOT_HELD + ' admission=' + [string]`$env:MLV_AGENT_ADMISSION)" 120 $wait $b.openNotAfterUtc
         }
         if ($op.outcome -ceq 'UNRESOLVED' -and $op.message -match 'admission gate') {
@@ -402,7 +415,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $b.openExit75Refusals = $(if ($null -ne $adm) { @(@($adm.leaseRefusals) | Where-Object { $null -ne $_ -and [string]$_.rc -eq '75' }).Count } else { 0 })
         $b.exit75Refusals = $b.openExit75Refusals
         if ($b.exit75Refusals -gt 0 -or $b.openLeaseWait -cne 'NONE') { $b.exit75Class = 'WAIT_RETRY' }
-        if ($op.outcome -ceq 'NOT_SUBMITTED') {
+        if ($op.outcome -ceq 'NOT_SUBMITTED' -and $crossed) {
+            $b.endReason = 'DEADLINE'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
+            Set-Stop 'DEADLINE' 3
+        } elseif ($op.outcome -ceq 'NOT_SUBMITTED') {
             $b.endReason = 'LIVENESS_UNAVAILABLE'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
             Set-Stop 'LIVENESS_UNAVAILABLE' 9
         } elseif ($op.outcome -ceq 'UNRESOLVED' -and $b.openLeaseWait -cne 'NONE') {
@@ -576,8 +592,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # r3 (sol r2 B1): an open with no result in hand (um-run gave up on it, the deadline came while its result was awaited, or this batch threw) may still
         # be in the agent's admission gate, re-asking for a lease. It is CANCELLED and reconciled BY NAME first, so it can never take a lease once this runner
         # lets go: the agent reads the cancel file at the top of every gate loop, before any request. A RETRACTED open never reached the agent.
-        # r5b: an open never submitted (NOT_SUBMITTED) has nothing to cancel and no lease to close.
-        $openSent = ($b.openJobId -and ($null -eq $op -or $op.outcome -cne 'NOT_SUBMITTED'))
+        # r5b: an open never submitted (NOT_SUBMITTED) has nothing to cancel and no lease to close. r3: "never submitted" is the $openSubmitted flag, so a throw before
+        # the call (op still null) is also never sent, while a throw or timeout inside the call (flag set, op null or not) stays a maybe-sent open.
+        $openSent = ($b.openJobId -and $openSubmitted)
         if ($openSent -and ($null -eq $op -or ($op.outcome -cne 'RECEIPT' -and $op.outcome -cne 'RECEIPT_BY_NAME' -and $op.outcome -cne 'RETRACTED'))) {
             $cx = Request-VenueJobCancel -AgentShare $AgentShare -JobId $b.openJobId
             L "BATCH_OPEN_CANCEL batch=$batchNo job=$($b.openJobId) requested=$($cx.state)$(if ($cx.error) { " error=$($cx.error)" }) (read by name for up to ${CancelReconcileSec}s before the lease is closed and the claim released)"
