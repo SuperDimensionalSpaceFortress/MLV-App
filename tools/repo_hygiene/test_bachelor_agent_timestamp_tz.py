@@ -60,6 +60,8 @@ class BachelorAgentTimestampTzPins(unittest.TestCase):
         child = child[:child.index("\n}\n")]
         self.assertIn("$launchingAt = ConvertTo-UtcDateTime $Marker.launchingUtc", child)
         self.assertIn('if ($null -eq $launchingAt) { return @{ state = "unknown"', child)
+        # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: the 2 s slack is taken off only after the MinValue guard.
+        self.assertLess(child.index("[DateTime]::MinValue.AddSeconds(2)"), child.index("$launchingAt.AddSeconds(-2)"))
 
     def test_helper_reads_by_kind_and_parses_a_bare_string_as_utc(self) -> None:
         helper = self.code[self.code.index("function ConvertTo-UtcDateTime"):]
@@ -102,6 +104,15 @@ class BachelorAgentTimestampTzBehaviour(unittest.TestCase):
                 self.assertEqual(one["adopt"][f"inside-{shape}"], "adopted/killed=False", f"{name} {shape}")
             self.assertEqual(one["adopt"]["missing"], "threw/killed=False")
             self.assertEqual(one["findChild"]["bad-"], "unknown")
+            # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a time at DateTime.MinValue or MaxValue never throws out of these sites (a
+            # throw there unwinds the agent's whole try and ends it), under the agent's 'Continue' preference and under 'Stop'.
+            for shape in ("json-readback", "z-string", "plus0-string", "no-offset"):
+                for pref in ("Continue", "Stop"):
+                    for edge in ("minvalue+0s", "minvalue+1s"):
+                        self.assertEqual(one["findChild"][f"{edge}-{shape}-{pref}"], "unknown", f"{name} {edge} {shape} {pref}")
+                    for edge in ("minvalue", "maxvalue"):
+                        self.assertAlmostEqual(one["queueAge"][f"{edge}-{shape}-{pref}"], 400, delta=15, msg=f"{name} {edge} {shape} {pref}")
+                    self.assertEqual(one["adopt"][f"maxvalue-{shape}-{pref}"], "adopted/killed=True", f"{name} {shape} {pref}")
             # The fixture creates the job 400 s old and the case reads its age a moment later, so the age is 400 plus the
             # time the run took in between (a slow runner or an edition start-up adds seconds); the .ps1 itself allows 15 s.
             self.assertAlmostEqual(one["queueAge"]["missing"], 400, delta=15)

@@ -803,10 +803,16 @@ function Get-QueueAgeSeconds {
     )
 
     $submitUtc = ConvertTo-UtcDateTime $Metadata.submitUtc
+    $nowUtc = (Get-Date).ToUniversalTime()
+    # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a submitUtc whose age does not fit an [int] (DateTime.MinValue, MaxValue) reads as an
+    # unreadable one; the [int] cast below would otherwise throw out of the poll loop and end the agent.
+    if ($null -ne $submitUtc -and [Math]::Abs(($nowUtc - $submitUtc).TotalSeconds) -gt [int]::MaxValue) {
+        $submitUtc = $null
+    }
     if ($null -eq $submitUtc) {
         $submitUtc = $Job.CreationTimeUtc
     }
-    return [Math]::Max(0, [int]((Get-Date).ToUniversalTime() - $submitUtc).TotalSeconds)
+    return [Math]::Max(0, [int]($nowUtc - $submitUtc).TotalSeconds)
 }
 
 function Get-JobNotAfterVerdict {
@@ -1231,6 +1237,9 @@ function Find-LaunchedJobChild {
     # ConvertFrom-Json has already turned the ISO string into a DateTime; ConvertTo-UtcDateTime reads it by its Kind, never through [string].
     $launchingAt = ConvertTo-UtcDateTime $Marker.launchingUtc
     if ($null -eq $launchingAt) { return @{ state = "unknown"; why = "launching marker has no readable launchingUtc" } }
+    # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: within 2 s of DateTime.MinValue the slack below cannot be taken off, and that throw
+    # would unwind the agent's whole try (it exits, and the next start reads the same marker).
+    if ($launchingAt -lt [DateTime]::MinValue.AddSeconds(2)) { return @{ state = "unknown"; why = "launching marker launchingUtc $($launchingAt.ToString('o')) is out of range" } }
     $notBefore = $launchingAt.AddSeconds(-2)
     try { $all = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
     catch { return @{ state = "unknown"; why = "process table unreadable: $($_.Exception.Message)" } }
@@ -1419,7 +1428,11 @@ function Invoke-AdoptStartedJob {
             $adoptedTimeoutSec = [int]$StageExemptMaxSec
             $adoptedClamped = $true
         }
-        $deadline = $startedUtc.AddSeconds($adoptedTimeoutSec)
+        # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a deadline that cannot be represented (startedUtc near DateTime.MaxValue) reads
+        # as passed, so the child is killed at once; an uncaught AddSeconds here would end the agent instead.
+        $deadline = [DateTime]::MinValue
+        try { $deadline = $startedUtc.AddSeconds($adoptedTimeoutSec) }
+        catch { Add-AgentLogLine "adopted marker job=$jobId startedUtc $($startedUtc.ToString('o')) + ${adoptedTimeoutSec}s is out of range; the deadline reads as passed" }
         $waitSliceMs = [Math]::Max(250, [Math]::Min(5000, $PollSeconds * 1000))
         while ((Get-Date).ToUniversalTime() -lt $deadline) {
             $currentMatch = Test-ProcessIdentityMatch -ProcessId ([int]$Marker.childPid) -ExpectedStartUtc ([string]$Marker.childStartUtc) -ExpectedStartEpochMs $Marker.childStartEpochMs -ExpectedImagePath $Marker.childImagePath
