@@ -74,19 +74,97 @@ param(
     # fixture stem, sha12). attr3-footage-stage-* stays gated: it moves owner footage (GBs, 1800 s default). Read only by
     # Get-GateExemptClass for the job about to run; Invoke-ExemptJobsDuringWait never runs a staging job from inside another
     # job's gate-wait, so a staging job never runs while this agent's own lease is pending or held.
-    # An override is refused at binding unless it compiles (1 s match timeout) and matches none of the measured probe ids
-    # below: widening it to a measured leg would run that leg without a quiet machine. Narrowing it is safe (more jobs gated).
+    # An override is refused at binding unless it compiles (1 s match timeout) and stays INSIDE the staging grammar above
+    # (STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r1, Dot 04eedafd on #649: the old guard named seven measured ids, so a pattern for any other
+    # measured shape was accepted and that leg ran with no quiet machine). Stated positively, in three layers: (1) every top-level
+    # alternative opens with ^ and one of the three staging stems, a group at an alternative's start is checked the same way and may
+    # not be optional; (2) it matches none of the measured probe ids below; (3) it matches no near-miss (mutation) of a staging id
+    # that the default grammar itself rejects, which catches a stem followed by a loose tail such as .*. $stageGrammar below is a copy
+    # of the default (test-ultra-magnus-agent-stage-exempt.ps1 pins them equal). Narrowing it is safe (more jobs gated).
+    # r2 (STAGE-JOB-LEASE-EXEMPT-HARDENING-1, sol BLOCKER on b8faccf1): THIS CHECK IS A SAMPLED GUARD, NOT AN EXACT SUBSET TEST. Regex
+    # containment is not decidable cheaply, so it refuses what it can see (structure, measured ids, near-misses, unlisted fixture stems) and an
+    # override that matches only ids outside those samples still loads. The bound that holds for ANY override is in Get-GateExemptClass: an id
+    # is "stage" only if the immutable default grammar ($script:StageGrammarDefault) AND the effective pattern both match, so an override can
+    # only narrow, never widen.
     [ValidateScript({
             $gatedProbeIds = @('job-1', 'x-stage-1', 'playback-attr-3-cuda-0123456789ab-M16-1243-20261024T051948Z',
                 'playback-attr-3-cuda-0123456789ab-stage-20261024T051948Z', 'playback-attr-3-cuda-build-0123456789ab',
-                'attr3-footage-stage-M16-1243-0123456789ab-n1', 'reference-frame-0123456789ab-M16-1243-0123456789ab')
+                'attr3-footage-stage-M16-1243-0123456789ab-n1', 'reference-frame-0123456789ab-M16-1243-0123456789ab',
+                'playback-attr-3-cuda-dllpair-0123456789ab', 'lease-batch-open-20261025T051948Z-lb0123', 'lease-batch-close-20261025T051948Z-lb0123')
+            $stems = @('playback-attr-3-cuda-stage-', 'attr3-stage-smoke-runner-', 'attr3-stage-fixture-')
+            $stageGrammar = '^(playback-attr-3-cuda-stage-[0-9a-f]{12}(-[A-Za-z0-9-]{1,32})?|attr3-stage-smoke-runner-[0-9a-f]{12}-[0-9a-f]{12}|attr3-stage-fixture-(tiny|large)_dual_iso-[0-9a-f]{12})\z'
+            $checkArms = $null
+            $checkArms = {
+                param([string]$Text, [bool]$Top)
+                $arms = [System.Collections.Generic.List[string]]::new()
+                $depth = 0; $inClass = $false; $start = 0
+                for ($i = 0; $i -lt $Text.Length; $i++) {
+                    $c = $Text[$i]
+                    if ($c -eq '\') { $i++; continue }
+                    if ($inClass) { if ($c -eq ']') { $inClass = $false }; continue }
+                    if ($c -eq '[') { $inClass = $true }
+                    elseif ($c -eq '(') { $depth++ }
+                    elseif ($c -eq ')') { $depth--; if ($depth -lt 0) { return 'its parentheses do not balance' } }
+                    elseif ($c -eq '|' -and $depth -eq 0) { $arms.Add($Text.Substring($start, $i - $start)); $start = $i + 1 }
+                }
+                $arms.Add($Text.Substring($start))
+                foreach ($arm in $arms) {
+                    $a = $arm
+                    if ($Top) {
+                        if (-not $a.StartsWith('^', [StringComparison]::Ordinal)) { return "an alternative does not start with ^ ('$arm')" }
+                        $a = $a.Substring(1)
+                    }
+                    if ($a.StartsWith('(', [StringComparison]::Ordinal)) {
+                        if ($a.StartsWith('(?', [StringComparison]::Ordinal) -and -not $a.StartsWith('(?:', [StringComparison]::Ordinal)) { return "a lookaround or option group opens an alternative ('$arm')" }
+                        $open = $(if ($a.StartsWith('(?:', [StringComparison]::Ordinal)) { 3 } else { 1 })
+                        $d = 0; $cls = $false; $close = -1
+                        for ($j = 0; $j -lt $a.Length; $j++) {
+                            $c = $a[$j]
+                            if ($c -eq '\') { $j++; continue }
+                            if ($cls) { if ($c -eq ']') { $cls = $false }; continue }
+                            if ($c -eq '[') { $cls = $true }
+                            elseif ($c -eq '(') { $d++ }
+                            elseif ($c -eq ')') { $d--; if ($d -eq 0) { $close = $j; break } }
+                        }
+                        if ($close -lt 0) { return 'its parentheses do not balance' }
+                        if ($a.Substring($close + 1) -match '^(\?|\*|\{0)') { return "a group of staging stems is made optional ('$arm')" }
+                        $inner = & $checkArms $a.Substring($open, $close - $open) $false
+                        if ($inner) { return $inner }
+                        continue
+                    }
+                    $stemOk = $false
+                    foreach ($stem in $stems) { if ($a.StartsWith($stem, [StringComparison]::Ordinal)) { $stemOk = $true; break } }
+                    if (-not $stemOk) { return "an alternative does not open with a staging stem ($($stems -join ', ')): '$arm'" }
+                }
+                return $null
+            }
             $why = $null
             if ([string]::IsNullOrWhiteSpace($_)) { $why = 'it is empty or blank (an empty pattern matches every id)' }
             else {
                 try {
                     $re = [regex]::new($_, [System.Text.RegularExpressions.RegexOptions]::None, [TimeSpan]::FromSeconds(1))
-                    $hit = @($gatedProbeIds | Where-Object { $re.IsMatch($_) })
-                    if ($hit.Count -gt 0) { $why = "it matches measured job id(s) $($hit -join ', ')" }
+                    $why = & $checkArms ([string]$_) $true
+                    if (-not $why) {
+                        $hit = @($gatedProbeIds | Where-Object { $re.IsMatch($_) })
+                        if ($hit.Count -gt 0) { $why = "it matches measured job id(s) $($hit -join ', ')" }
+                    }
+                    if (-not $why) {
+                        $exemplars = @('playback-attr-3-cuda-stage-0123456789ab', 'playback-attr-3-cuda-stage-0123456789ab-n1',
+                            'attr3-stage-smoke-runner-0123456789ab-0123456789ab', 'attr3-stage-fixture-tiny_dual_iso-0123456789ab')
+                        $near = foreach ($e in $exemplars) {
+                            'x-' + $e; $e + '-x'; $e + '_x'; $e + '.x'; $e + "`n"; $e.ToUpperInvariant(); $e + '-' + ('a' * 33); $e + '-n_1'; $e + '-0123456789ab'
+                            $e -replace '0123456789ab', '0123456789a'; $e -replace '0123456789ab', '0123456789abc'; $e -replace '0123456789ab', '0123456789ag'
+                            $e -replace 'stage-', 'build-'; $e -replace 'stage-', 'dllpair-'; $e -replace 'tiny_dual_iso', 'M16-1243'; $e -replace 'tiny_dual_iso', 'huge_dual_iso'
+                            $e -replace 'attr3-stage-', 'attr3-footage-stage-'; $e -replace 'cuda-stage-', 'cuda-'
+                            $e -replace '0123456789ab', '0123456789AB'
+                        }
+                        # r2 (sol/opus/fable/Dot on b8faccf1): a fixture stem the default does not list. Stems outside (tiny|large) are the likeliest widening.
+                        $near = @($near) + @(foreach ($stem in @('medium', 'med', 'unlisted', 'small', 'huge', 'xl', 'tiny2', 'large2', 'Tiny', 'x', 'M16-1243', '')) {
+                            "attr3-stage-fixture-${stem}_dual_iso-0123456789ab"; "attr3-stage-fixture-${stem}-0123456789ab"
+                        })
+                        $loose = @($near | Select-Object -Unique | Where-Object { $_ -cnotmatch $stageGrammar -and $re.IsMatch($_) })
+                        if ($loose.Count -gt 0) { $why = "it matches id(s) the staging grammar cannot produce, e.g. $((@($loose | Select-Object -First 3)) -join ', ')" }
+                    }
                 }
                 catch { $why = "it does not compile or match within 1 s ($($_.Exception.Message))" }
             }
@@ -94,6 +172,16 @@ param(
             $true
         })]
     [string]$GateStageJobPattern = '^(playback-attr-3-cuda-stage-[0-9a-f]{12}(-[A-Za-z0-9-]{1,32})?|attr3-stage-smoke-runner-[0-9a-f]{12}-[0-9a-f]{12}|attr3-stage-fixture-(tiny|large)_dual_iso-[0-9a-f]{12})\z',
+    # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r1 (Dot 04eedafd on #649): the longest a lease-exempt (stage-class) job may run. It holds no
+    # slot and no lease, so past this it is no longer "measures nothing, light": it heats the host inside someone else's quiet lease.
+    # Only a stage-class job is clamped (Invoke-QueuedJob); a light or gated job keeps its own timeout. The clamp applies whatever the
+    # job's metadata timeoutSec (up to 86400) or the agent default (JobTimeoutSec 1800) ask for; a job killed at it carries
+    # STAGE_EXEMPT_CEILING_EXCEEDED in its stderr and admission.stageCeiling. Default 300 s: the staging step
+    # playback-attr-3-cuda-stage-8ea38dff267b (a copy-and-hash into cache\) ran ~4.5 s on 2026-10-24 (the incident that made staging
+    # lease-exempt), so 300 s is ~66x the measured step; the generators' submit paths ask 1800 s (smoke-runner) and 3600 s (stage) as
+    # headroom for a queued run, not as expected run time. The 900 s upper bound is heavy-slot.py's 15 min "mlv" label cap, as GateLongJobSec's.
+    [ValidateRange(1, 900)]
+    [int]$StageExemptMaxSec = 300,
     # AGENT-HEAVY-SLOT-2.3-ADAPT-1: a gated job whose effective timeout is over GateLongJobSec, or whose id names a stage,
     # build or soak, is labelled "mlv-long <id>" (see Get-HeavySlotLabel). 900 s is heavy-slot.py 2.3.1's 15 min cap.
     # Override bounds (AGENT-HEAVY-SLOT-LABEL-SINGLE-READ-1): GateLongJobSec must stay at or below 900. A larger value files
@@ -1321,7 +1409,17 @@ function Invoke-AdoptStartedJob {
     try {
         $startedUtc = ConvertTo-UtcDateTime $Marker.startedUtc
         if ($null -eq $startedUtc) { throw "adopted marker for job $jobId has no readable startedUtc, so no deadline can be computed" }
-        $deadline = $startedUtc.AddSeconds([int]$Marker.timeoutSec)
+        # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r3 (transition edge): a stage marker written by an agent that predates the ceiling has exemptClass stage
+        # and NO stageCeiling, so its timeoutSec is unclamped. Clamp it to StageExemptMaxSec here and type the kill as the live path does.
+        $adoptedCeiling = if ($null -ne $Marker.admission) { $Marker.admission.stageCeiling } else { $null }
+        $adoptedTimeoutSec = [int]$Marker.timeoutSec
+        $adoptedRequestedSec = if ($null -ne $adoptedCeiling) { $adoptedCeiling.requestedSec } else { $adoptedTimeoutSec }
+        $adoptedClamped = ($null -ne $adoptedCeiling -and $adoptedCeiling.clamped -eq $true)
+        if ($null -eq $adoptedCeiling -and $null -ne $Marker.admission -and [string]$Marker.admission.exemptClass -ceq "stage" -and $adoptedTimeoutSec -gt $StageExemptMaxSec) {
+            $adoptedTimeoutSec = [int]$StageExemptMaxSec
+            $adoptedClamped = $true
+        }
+        $deadline = $startedUtc.AddSeconds($adoptedTimeoutSec)
         $waitSliceMs = [Math]::Max(250, [Math]::Min(5000, $PollSeconds * 1000))
         while ((Get-Date).ToUniversalTime() -lt $deadline) {
             $currentMatch = Test-ProcessIdentityMatch -ProcessId ([int]$Marker.childPid) -ExpectedStartUtc ([string]$Marker.childStartUtc) -ExpectedStartEpochMs $Marker.childStartEpochMs -ExpectedImagePath $Marker.childImagePath
@@ -1335,8 +1433,15 @@ function Invoke-AdoptStartedJob {
         if ($finalMatch.matches) {
             $timedOut = $true
             $killedProcessIds = @(Stop-ProcessTree -RootProcessId ([int]$Marker.childPid) -RootStartUtc ([string]$Marker.childStartUtc) -RootStartEpochMs $Marker.childStartEpochMs -RootImagePath $Marker.childImagePath)
-            "adopted child timed out after $($Marker.timeoutSec)s; killed process tree pids=$($killedProcessIds -join ',')" |
+            "adopted child timed out after ${adoptedTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')" |
                 Add-Content -Encoding ASCII $Marker.errFile
+            # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: an adopted stage child killed at a bound that was the exempt ceiling's (the marker's timeoutSec when
+            # it was clamped, or the r3 clamp above) is typed as the live path types it. A non-stage or unclamped marker gets no reason.
+            if ($adoptedClamped) {
+                "STAGE_EXEMPT_CEILING_EXCEEDED: adopted staging step ran past its ${adoptedTimeoutSec}s exempt ceiling (asked for ${adoptedRequestedSec}s); a lease-exempt job may not heat the host for longer" |
+                    Add-Content -Encoding ASCII $Marker.errFile
+                Add-AgentLogLine "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$jobId ceiling=${adoptedTimeoutSec}s adopted killed pids=$($killedProcessIds -join ',')"
+            }
         }
     }
     finally {
@@ -1350,7 +1455,7 @@ function Invoke-AdoptStartedJob {
         startedUtc        = $Marker.startedUtc
         endedUtc          = (Get-Date).ToUniversalTime().ToString("o")
         host              = $env:COMPUTERNAME
-        timeoutSec        = $Marker.timeoutSec
+        timeoutSec        = $adoptedTimeoutSec
         timedOut          = $timedOut
         cancelled         = $false
         queueExpired      = $false
@@ -1743,7 +1848,10 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + not-after r1 (2026-10-24) + stage-exempt r1 (2026-10-24) + lease-batch r5 (2026-10-24)"
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + not-after r1 (2026-10-24) + stage-exempt r1 (2026-10-24) + lease-batch r5 (2026-10-24) + stage-exempt r2 (2026-10-25) + stage-exempt r3 (2026-10-25)"
+# STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: the immutable default staging grammar (a copy of the GateStageJobPattern default and of the load-time
+# guard's $stageGrammar; test-ultra-magnus-agent-stage-exempt.ps1 pins all three equal). Get-GateExemptClass ANDs it with the effective pattern.
+$script:StageGrammarDefault = '^(playback-attr-3-cuda-stage-[0-9a-f]{12}(-[A-Za-z0-9-]{1,32})?|attr3-stage-smoke-runner-[0-9a-f]{12}-[0-9a-f]{12}|attr3-stage-fixture-(tiny|large)_dual_iso-[0-9a-f]{12})\z'
 $script:QuietLeaseLabel = "quiet-lease mlv"
 # lease-batch r2: heavy-slot.py's renew_stale_s. A lease with no successful renew for longer is demoted (non-exclusive).
 $script:LeaseRenewStaleSec = 120
@@ -2274,7 +2382,11 @@ function Get-GateExemptClass {
     # from inside another job's gate-wait (Invoke-ExemptJobsDuringWait reads GateExemptJobPattern alone).
     param([Parameter(Mandatory = $true)][string]$JobId)
     if ($JobId -match $GateExemptJobPattern) { return "light" }
-    if ($JobId -cmatch $GateStageJobPattern) { return "stage" }
+    # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: stage = the immutable default grammar AND the effective pattern, so an override can only
+    # NARROW. The load-time check on -GateStageJobPattern is a sampled guard; this AND is the bound that holds for any override.
+    # r3: fail CLOSED. An empty or missing default grammar matches every id (-cmatch '' is true), which would leave the override alone deciding.
+    if ([string]::IsNullOrEmpty($script:StageGrammarDefault)) { return $null }
+    if (($JobId -cmatch $script:StageGrammarDefault) -and ($JobId -cmatch $GateStageJobPattern)) { return "stage" }
     return $null
 }
 
@@ -3374,8 +3486,15 @@ function Invoke-QueuedJob {
         Add-AgentLogLine "heavy-slot-gate: exempt job=$jobId (light class, no slot)$(if ($null -ne $script:LeaseBatch) { " under lease batch $($script:LeaseBatch.token)" })"
     }
     elseif ($exemptClass -eq "stage") {
-        $script:Admission = [pscustomobject]@{ gate = $script:GateVersion; label = "exempt-light"; state = "exempt"; exemptClass = "stage"; waitedSec = 0; probes = 0; requeues = 0; slot = $null; thermal = $null; why = "job id matches GateStageJobPattern ($GateStageJobPattern): staging step, measures nothing, not gated, holds no slot or lease" }
+        # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r1: a staging step holds no slot and no lease, so its run time is bounded here (StageExemptMaxSec),
+        # whatever the job's metadata or the agent default ask for; only this branch clamps, so a light or gated job keeps its own timeout.
+        $stageCeiling = [pscustomobject]@{ ceilingSec = $StageExemptMaxSec; requestedSec = $effectiveTimeoutSec; clamped = ($effectiveTimeoutSec -gt $StageExemptMaxSec) }
+        $script:Admission = [pscustomobject]@{ gate = $script:GateVersion; label = "exempt-light"; state = "exempt"; exemptClass = "stage"; stageCeiling = $stageCeiling; waitedSec = 0; probes = 0; requeues = 0; slot = $null; thermal = $null; why = "job id matches GateStageJobPattern ($GateStageJobPattern): staging step, measures nothing, not gated, holds no slot or lease" }
         Add-AgentLogLine "heavy-slot-gate: exempt job=$jobId (staging step, no slot, no lease)"
+        if ($stageCeiling.clamped) {
+            $effectiveTimeoutSec = $StageExemptMaxSec
+            Add-AgentLogLine "heavy-slot-gate: STAGE_EXEMPT_CEILING_APPLIED job=$jobId requested=$($stageCeiling.requestedSec)s ceiling=${StageExemptMaxSec}s"
+        }
     }
     else {
         # GATE-2: claim the job (phase=admission-wait, no child) BEFORE the gate holds it.
@@ -3627,6 +3746,11 @@ function Invoke-QueuedJob {
             $killedProcessIds = @(Stop-ProcessTree -RootProcessId $jobProcess.Id -RootStartUtc $marker.childStartUtc -RootStartEpochMs $marker.childStartEpochMs -RootImagePath $marker.childImagePath)
             "timed out after ${effectiveTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')" |
                 Add-Content -Encoding ASCII $errFile
+            if ($null -ne $script:Admission.stageCeiling -and $script:Admission.stageCeiling.clamped) {
+                "STAGE_EXEMPT_CEILING_EXCEEDED: staging step ran past its ${effectiveTimeoutSec}s exempt ceiling (asked for $($script:Admission.stageCeiling.requestedSec)s); a lease-exempt job may not heat the host for longer" |
+                    Add-Content -Encoding ASCII $errFile
+                Add-AgentLogLine "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$jobId ceiling=${effectiveTimeoutSec}s killed pids=$($killedProcessIds -join ',')"
+            }
         }
     }
     catch {

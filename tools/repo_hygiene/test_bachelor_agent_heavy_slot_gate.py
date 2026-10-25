@@ -146,6 +146,46 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertEqual(len(re.findall(r"-c?match \$GateStageJobPattern", self.code)), 1,
                          "the stage pattern is matched in one place (Get-GateExemptClass), case-sensitively")
 
+    def test_stage_exempt_hardening_bounds_override_and_run_time(self) -> None:
+        # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r1 (Dot 04eedafd on #649): the override is stated positively (staging stems only) and a
+        # stage-class job has its own short ceiling. Behaviour is driven by tools/testing/test-ultra-magnus-agent-stage-exempt.ps1.
+        self.assertIn("stage-exempt r2 (2026-10-25)", self.text)
+        self.assertIn("[ValidateRange(1, 900)]\n    [int]$StageExemptMaxSec = 300,".replace("\n", "\r\n" if "\r\n" in self.text else "\n"), self.text)
+        # The validator's copy of the grammar is the parameter default (the .ps1 test pins the same).
+        default = re.search(r"\[string\]\$GateStageJobPattern = '([^']+)'", self.text).group(1)
+        self.assertIn("$stageGrammar = '" + default + "'", self.text)
+        for stem in ("playback-attr-3-cuda-stage-", "attr3-stage-smoke-runner-", "attr3-stage-fixture-"):
+            self.assertIn("'" + stem + "'", self.text)
+        # Only the stage branch clamps; the kill path types the reason; light and gated paths never read the ceiling.
+        queued = self.code[self.code.index("function Invoke-QueuedJob"):]
+        queued = queued[:queued.index("\n}\n")]
+        stage_branch = queued[queued.index('elseif ($exemptClass -eq "stage")'):]
+        stage_branch = stage_branch[:stage_branch.index("    else {")]
+        self.assertIn("$effectiveTimeoutSec = $StageExemptMaxSec", stage_branch)
+        self.assertEqual(queued.count("$effectiveTimeoutSec = $StageExemptMaxSec"), 1)
+        self.assertIn("STAGE_EXEMPT_CEILING_APPLIED", stage_branch)
+        self.assertIn("STAGE_EXEMPT_CEILING_EXCEEDED: ", queued)
+        # The parameter declaration, the stage branch and (r3) the adopt-path clamp of a pre-ceiling marker are the only places the ceiling appears.
+        adopt_fn = self.code[self.code.index("function Invoke-AdoptStartedJob"):]
+        adopt_fn = adopt_fn[:adopt_fn.index("\n}\n")]
+        self.assertEqual(self.code.count("$StageExemptMaxSec"), 1 + stage_branch.count("$StageExemptMaxSec") + adopt_fn.count("$StageExemptMaxSec"),
+                         "the ceiling is read only by the stage branch and the adopt clamp")
+        self.assertEqual(adopt_fn.count("$StageExemptMaxSec"), 2)
+        # r2: classify = the immutable default grammar AND the effective pattern (an override only narrows), and an adopted stage child
+        # killed at the ceiling is typed too. Behaviour is driven by the .ps1 test (classify-and-override, stage-ceiling-kill, stage-ceiling-adopt).
+        self.assertIn("stage-exempt r3 (2026-10-25)", self.text)
+        self.assertIn("$script:StageGrammarDefault = '" + default + "'", self.text)
+        classify = self.code[self.code.index("function Get-GateExemptClass"):]
+        classify = classify[:classify.index("\n}\n")]
+        self.assertIn("($JobId -cmatch $script:StageGrammarDefault) -and ($JobId -cmatch $GateStageJobPattern)", classify)
+        adopt = self.code[self.code.index("function Invoke-AdoptStartedJob"):]
+        adopt = adopt[:adopt.index("\n}\n")]
+        self.assertIn("STAGE_EXEMPT_CEILING_EXCEEDED: adopted staging step", adopt)
+        # r3: the classifier fails closed on an empty default grammar, and an un-ceilinged stage marker is clamped at the adopt read.
+        # Behaviour is driven by the .ps1 test (classify-and-override, stage-ceiling-adopt legacy-over-ceiling).
+        self.assertIn("if ([string]::IsNullOrEmpty($script:StageGrammarDefault)) { return $null }", classify)
+        self.assertIn('[string]$Marker.admission.exemptClass -ceq "stage" -and $adoptedTimeoutSec -gt $StageExemptMaxSec', adopt)
+
     def test_exempt_jobs_run_during_a_gate_wait(self) -> None:
         # GATE-MAINT-DISPATCH-DURING-WAIT-1: a job waiting on the gate has no cap, and the inbox loop is blocked
         # inside it, so the light jobs behind it (probes, dve health, agent-swap) are run from inside the wait.
