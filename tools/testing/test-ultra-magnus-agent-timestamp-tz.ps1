@@ -279,6 +279,35 @@ try {
         if ($r.threw) { $failures.Add("queue-age a2 missing submitUtc, 1950 file ($pref): must not throw, threw $($r.threw)") }
         elseif ($r.value -ne $maxInt) { $failures.Add("queue-age a2 missing submitUtc, 1950 file ($pref): expected $maxInt, got '$($r.value)'") }
     }
+    # Adversary r2 A1: the clamp makes a saturated age EQUAL a limit of Int32.MaxValue, so the expiry test must treat an age at the
+    # clamp as "at least this old". A 1950 submitUtc (older than an [int] can hold) against the largest limit is expired.
+    # The four expiry checks are inline in the agent; each one's literal condition is lifted from the source and evaluated.
+    $agentSource = [IO.File]::ReadAllText($agentScript)
+    $siteForms = [ordered]@{
+        'gate-wait' = @{ pattern = '\$maxAge -gt 0 -and \(\$age -gt \$maxAge -or \$age -ge \[int\]::MaxValue\)'; count = 2 }
+        'queued'    = @{ pattern = '\[int\]\$metadata\.maxQueueAgeSec -gt 0 -and \(\$queueAgeSec -gt \[int\]\$metadata\.maxQueueAgeSec -or \$queueAgeSec -ge \[int\]::MaxValue\)'; count = 2 }
+    }
+    $oldAge = Get-QueueAgeSeconds -Job $job -Metadata ([pscustomobject]@{ submitUtc = [DateTime]::new(1950, 1, 1, 0, 0, 0, [DateTimeKind]::Utc) })
+    $expiryCases = [ordered]@{
+        'saturated-vs-intmax' = @{ age = $oldAge; max = $maxInt; want = $true }
+        'over-limit'          = @{ age = 4000; max = 3600; want = $true }
+        'at-limit'            = @{ age = 3600; max = 3600; want = $false }
+        'under-limit'         = @{ age = 90; max = 3600; want = $false }
+        'no-limit'            = @{ age = $maxInt; max = 0; want = $false }
+        'intmax-limit-young'  = @{ age = 90; max = $maxInt; want = $false }
+    }
+    foreach ($site in $siteForms.GetEnumerator()) {
+        $found = [regex]::Matches($agentSource, $site.Value.pattern)
+        if ($found.Count -ne $site.Value.count) { $failures.Add("queue-age expiry $($site.Key): expected $($site.Value.count) checks that treat an age at Int32.MaxValue as expired, found $($found.Count)"); continue }
+        $cond = [scriptblock]::Create($found[0].Value)
+        foreach ($kv in $expiryCases.GetEnumerator()) {
+            $maxAge = $kv.Value.max; $age = $kv.Value.age; $queueAgeSec = $kv.Value.age; $metadata = [pscustomobject]@{ maxQueueAgeSec = $kv.Value.max }
+            $got = [bool](& $cond)
+            $ageCases["expired-$($site.Key)-$($kv.Key)"] = $got
+            if ($got -ne $kv.Value.want) { $failures.Add("queue-age expiry $($site.Key) $($kv.Key): age $($kv.Value.age) vs limit $($kv.Value.max) expected $($kv.Value.want), got $got") }
+        }
+    }
+    if ($agentSource -match '\$age -gt \$maxAge\)' -or $agentSource -match '\$queueAgeSec -gt \[int\]\$metadata\.maxQueueAgeSec\)') { $failures.Add('queue-age expiry: a check still compares with a bare -gt, which never expires an age clamped to Int32.MaxValue') }
     $results['queueAge'] = $ageCases
 
     # ---------------------------------------------------------------- find-child

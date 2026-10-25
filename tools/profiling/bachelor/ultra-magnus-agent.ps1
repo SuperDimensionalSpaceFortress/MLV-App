@@ -808,7 +808,8 @@ function Get-QueueAgeSeconds {
     }
     # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: clamped to [0, Int32.MaxValue] BEFORE the [int] cast, which would otherwise throw out of
     # the poll loop and end the agent for an age past ~68 years (a submitUtc or file time at DateTime.MinValue or MaxValue). Every
-    # age the cast could hold gives the same answer as before.
+    # age the cast could hold gives the same answer as before. An age AT Int32.MaxValue therefore means "at least this old": the
+    # four expiry checks (`$age -gt $max -or $age -ge [int]::MaxValue`) expire it even against a limit of Int32.MaxValue.
     $ageSec = ((Get-Date).ToUniversalTime() - $submitUtc).TotalSeconds
     return [int][Math]::Min([double][int]::MaxValue, [Math]::Max(0.0, $ageSec))
 }
@@ -2456,7 +2457,7 @@ function Wait-HeavySlotAdmission {
                 return [pscustomobject]@{ gate = $script:GateVersion; label = "cancelled-in-gate"; state = "cancelled"; waitedSec = [int]$waited; probes = $probes; requeues = $requeues; slot = $null; thermal = $null; why = "cancel file present before launch" }
             }
             $age = Get-QueueAgeSeconds -Job $Job -Metadata $Metadata
-            if ($maxAge -gt 0 -and $age -gt $maxAge) {
+            if ($maxAge -gt 0 -and ($age -gt $maxAge -or $age -ge [int]::MaxValue)) {
                 return [pscustomobject]@{ gate = $script:GateVersion; label = "queue-expired"; state = "expired"; waitedSec = [int]$waited; probes = $probes; requeues = $requeues; slot = $null; thermal = $null; why = "queue age ${age}s > ${maxAge}s while waiting"; queueAgeSec = $age }
             }
             if ($null -eq $holder -and $now -ge $nextHolderAt) {
@@ -3311,7 +3312,7 @@ function Wait-QuietLeaseAdmission {
                 return (& $notAfterExpired $phase $v $rel $v.why)
             }
             $age = Get-QueueAgeSeconds -Job $Job -Metadata $Metadata
-            if ($maxAge -gt 0 -and $age -gt $maxAge) {
+            if ($maxAge -gt 0 -and ($age -gt $maxAge -or $age -ge [int]::MaxValue)) {
                 return [pscustomobject]@{ gate = $script:GateVersion; mode = "lease"; label = "queue-expired"; state = "expired"; waitedSec = [int]$waited; probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = "queue age ${age}s > ${maxAge}s while waiting"; queueAgeSec = $age; leaseRefusals = @($refusals.ToArray()) }
             }
             if ($null -eq $lease -and $now -ge $nextRequestAt) {
@@ -3461,7 +3462,7 @@ function Invoke-QueuedJob {
     $metadata = Get-JobMetadata -JobId $jobId
     $effectiveTimeoutSec = [int]$metadata.timeoutSec
     $queueAgeSec = Get-QueueAgeSeconds -Job $Job -Metadata $metadata
-    if ([int]$metadata.maxQueueAgeSec -gt 0 -and $queueAgeSec -gt [int]$metadata.maxQueueAgeSec) {
+    if ([int]$metadata.maxQueueAgeSec -gt 0 -and ($queueAgeSec -gt [int]$metadata.maxQueueAgeSec -or $queueAgeSec -ge [int]::MaxValue)) {
         Invoke-QueueExpiredJob -Job $Job -Metadata $metadata -QueueAgeSec $queueAgeSec
         Complete-AdmissionWaitMarker -JobId $jobId -Status "queue-expired"   # a claim re-queued by a restart
         return
@@ -3585,7 +3586,7 @@ function Invoke-QueuedJob {
     }
     # QUIET-LEASE-EXIT-RELEASE-EVIDENCE-1: the queue-expired exit once admitted releases the lease (its release recorded) before
     # Exit-HeavySlot, as the cancel and not-after exits do, and its result carries the admission.
-    if ([int]$metadata.maxQueueAgeSec -gt 0 -and $queueAgeSec -gt [int]$metadata.maxQueueAgeSec) {
+    if ([int]$metadata.maxQueueAgeSec -gt 0 -and ($queueAgeSec -gt [int]$metadata.maxQueueAgeSec -or $queueAgeSec -ge [int]::MaxValue)) {
         $rel = $null
         if ($null -ne $script:QuietLease) { $rel = Stop-QuietLease -Lease $script:QuietLease -Why "queue expired after admission, before launch"; Close-LeaseBatchAfterRelease -Release $rel -Why "queue expired after admission, before launch"; $script:QuietLease = $null }
         Exit-HeavySlot
