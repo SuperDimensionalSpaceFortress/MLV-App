@@ -3054,10 +3054,32 @@ UNRESOLVED_EXECUTED_SITES = {
         ("[void]$ps.AddScript($Script.ToString())",
          "the same Invoke-Bounded pattern: every caller in this file hands it a { } literal share read, which the AST scans as code"),
     ],
+    "tools/profiling/dual-venue/Summarize-VenueBusyProbes.ps1": [
+        (". ([scriptblock]::Create($fn[0].Extent.Text))",
+         "r4 (from #661): dot-sources the text of the one FunctionDefinitionAst named Get-VenueQuietDecision (-ceq, exactly one) parsed "
+         "from -DecisionSource, which defaults to the tracked Wait-VenueQuiet.ps1 beside it (:42); that pure function (:134-148) is scanned "
+         "in its own file. Dot-sourcing a definition only defines the function, which is then called in-process at :118"),
+    ],
     "tools/profiling/dual-venue/VenueChain.psm1": [
         ("[void]$ps.AddScript($ScriptText)",
          "Invoke-VenueBoundedRead runs a share read on a worker runspace; its callers in this module pass a { } literal's text or a "
          "single-quoted Test-Path literal, both scanned as code"),
+        ("$step = [scriptblock]::Create($Body)",
+         "r4 (from #633): inside the keeper-loop here-string ($script:VenueKeeperLoop); $Body is Start-VenueKeeper -StepText, and both "
+         "callers in this module (Start-VenueClaimKeeper, Start-VenueJobLiveness) pass a single-quoted here-string $step that rule S scans "
+         "in place; it runs on an in-process worker runspace"),
+        ("& ([scriptblock]::Create($A.writeText)) $w",
+         "r4 (from #633): inside Start-VenueJobLiveness's step here-string; $A.writeText is $script:LivenessWriteText, the single-quoted "
+         "here-string liveness-sidecar write at :822 that rule S scans in place"),
+    ],
+    "tools/profiling/dual-venue/Wait-VenueQuiet.ps1": [
+        ("[void]$pp.AddScript($IdentityWorkerPrelude)",
+         "r4 rule V: $IdentityWorkerPrelude is assigned '' at script scope (:516) and read inside Get-IdentWorker, another scope. Empty in "
+         "production (and guarded by `if ($IdentityWorkerPrelude)`); only test_dual_venue_evidence.py rewrites that literal in its own "
+         "copy, to re-declare command shadows in the in-process identity worker runspace"),
+        ("[void]$ps.AddScript($Script)",
+         "r4 (from #633): Invoke-IdentBounded runs one identity read on its worker runspace; its four callers pass $IdentCimScript, "
+         "$IdentOwnerScript, $IdentScriptCheckScript or $IdentGpuScript, each a { } literal's .ToString() (:640-683) that the AST scans as code"),
     ],
     "tools/profiling/ultramagnus/playback-attr-3-cuda-dll-job.ps1": [
         ("-Command $reconCommand",

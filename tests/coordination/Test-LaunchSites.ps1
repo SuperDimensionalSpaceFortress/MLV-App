@@ -37,8 +37,14 @@ Rules, written down because the census depends on them:
             string that is never run is accepted; hiding one that is run is not.
  unresolved X.  The argument of [scriptblock]::Create, .InvokeScript / .NewScriptBlock / .AddScript, Invoke-Expression / iex (or its
                 pipeline input, when it has no argument), or -Command / -c of a pwsh command, when it is neither a string or { } literal
-                nor a variable whose every assignment in the same source is one (it is built at run time). A source pwsh cannot parse
-                is one `unresolved` site.
+                nor a variable that resolves to one (it is built at run time). A source pwsh cannot parse is one `unresolved` site.
+            V.  (r4, Dot B1) A variable resolves only through the assignments in the scope that reads it (its nearest script block: the
+                file, a function body, a { } literal) or in a script block inside that scope; every one must be a plain `=` to a literal,
+                and one must be a top-level statement of that scope before the read. `$script:x` is read against the file's top scope.
+                A scope's parameters, automatic variables ($args, $input, $_, ...), foreach variables, `$a, $b =`, [ref], -OutVariable /
+                -PipelineVariable style bindings, Set-Variable / New-Variable names, and $global: / $using: reads never resolve. So a
+                nested scope that reads an outer literal it does not assign itself is `unresolved` (conservative, by choice), and so is
+                a dot-sourced script reading its caller's variable. A splat is D1 `none` only under the same rule.
 #>
 [CmdletBinding()]
 param()
@@ -96,6 +102,93 @@ function Get-Inner($Ast) {
 
 function Get-VarKey($V) { return ($V.VariablePath.UserPath -replace '^(?i)(script|global|local|private|using):', '').ToLowerInvariant() }
 
+# r4 (Dot B1): names pwsh binds itself, and the parameters that bind a variable by name. Neither is ever a literal assignment here.
+$AutoVars = [HashSet[string]]::new([string[]]@('args', 'input', '_', 'psitem', 'this', 'matches', 'foreach', 'switch', 'sender', 'event', 'eventargs',
+        'eventsubscriber', 'myinvocation', 'psboundparameters', 'pscmdlet', 'error', 'lastexitcode'))
+$BindParamRx = [regex]::new('^(?i)(ov|ev|wv|iv|pv|outv\w*|errorv\w*|warningv\w*|informationv\w*|pipelinev\w*)$')
+$SetVarRx = [regex]::new('^(?i)(set-variable|new-variable|sv|nv)$')
+
+# The scope an AST node runs in: its nearest enclosing script block (a file, a function body, a { } literal).
+function Get-Scope($Ast) {
+    $p = $Ast.Parent
+    while ($null -ne $p -and -not ($p -is [ScriptBlockAst])) { $p = $p.Parent }
+    return $p
+}
+
+function Test-Within($Inner, $Outer) {
+    for ($p = $Inner; $null -ne $p; $p = $p.Parent) { if ([object]::ReferenceEquals($p, $Outer)) { return $true } }
+    return $false
+}
+
+# The parameter names a scope binds: its param( ) block, and `function F($a)` / class-method parameters.
+function Get-ScopeParameters($S) {
+    $names = [HashSet[string]]::new()
+    $lists = @()
+    if ($null -ne $S.ParamBlock) { $lists += , $S.ParamBlock.Parameters }
+    if (($S.Parent -is [FunctionDefinitionAst] -or $S.Parent -is [FunctionMemberAst]) -and $null -ne $S.Parent.Parameters) { $lists += , $S.Parent.Parameters }
+    foreach ($l in $lists) { foreach ($p in $l) { [void]$names.Add((Get-VarKey $p.Name)) } }
+    return , $names
+}
+
+function Add-Assign($Ctx, $V, $Op, $Right, $Scope, [bool]$Direct, [int]$End) {
+    $k = Get-VarKey $V
+    if ($null -eq $Ctx.Assign[$k]) { $Ctx.Assign[$k] = [List[object]]::new() }
+    $Ctx.Assign[$k].Add(@{ Op = $Op; Right = $Right; Scope = $Scope; Direct = $Direct; End = $End })
+}
+
+# A variable named by a constant string (-OutVariable cmd, Set-Variable -Name cmd) is bound at run time; a name that is not a constant
+# could be any variable, so then nothing in this source resolves.
+function Add-Taint($Ctx, $V) {
+    $x = Get-Inner $V
+    if ($x -is [ArrayLiteralAst]) { foreach ($e in $x.Elements) { Add-Taint $Ctx $e }; return }
+    if ($x -is [StringConstantExpressionAst]) { [void]$Ctx.Tainted.Add(($x.Value -replace '^\+', '' -replace '^(?i)(script|global|local|private):', '').ToLowerInvariant()); return }
+    $Ctx.TaintAll = $true
+}
+
+function Add-CommandBindings($Ctx, $Cmd) {
+    $els = $Cmd.CommandElements
+    $name = $Cmd.GetCommandName()
+    $setVar = $name -and $SetVarRx.IsMatch(($name -split '\\')[-1])
+    $named = $false
+    for ($i = 1; $i -lt $els.Count; $i++) {
+        $el = $els[$i]
+        if (-not ($el -is [CommandParameterAst])) { continue }
+        $isName = $setVar -and 'name'.StartsWith($el.ParameterName.ToLowerInvariant(), [StringComparison]::Ordinal)
+        if ($isName) { $named = $true }
+        if ($isName -or $BindParamRx.IsMatch($el.ParameterName)) {
+            $v = Get-ParameterValue $els $i
+            if ($null -eq $v) { $Ctx.TaintAll = $true } else { Add-Taint $Ctx $v }
+        }
+    }
+    if ($setVar -and -not $named) {
+        $first = @($els | Select-Object -Skip 1 | Where-Object { -not ($_ -is [CommandParameterAst]) } | Select-Object -First 1)
+        if ($first.Count -eq 1) { Add-Taint $Ctx $first[0] } else { $Ctx.TaintAll = $true }
+    }
+}
+
+# The right-hand sides that can give $V its value where it is read, or $null when this source alone does not decide it. A read resolves
+# only through assignments in its own scope (or a script block inside it, which `.` or ForEach-Object can run in that scope), every one a
+# plain `=`, one of them a top-level statement of that scope before the read; `$script:x` is read against the file's own top scope.
+# A parameter, an automatic variable, a foreach / multi-assignment / [ref] / -OutVariable binding, or $global: / $using: never resolves.
+function Get-LiteralRights($V, $Ctx) {
+    $path = $V.VariablePath.UserPath
+    if ($path.Contains(':') -and $path -notmatch '^(?i)(script|local|private):') { return $null }
+    $key = Get-VarKey $V
+    if ($Ctx.TaintAll -or $AutoVars.Contains($key) -or $Ctx.Tainted.Contains($key)) { return $null }
+    $isScript = $path -match '^(?i)script:'
+    $scope = if ($isScript) { $Ctx.Root } else { Get-Scope $V }
+    if ($null -eq $scope -or (Get-ScopeParameters $scope).Contains($key)) { return $null }
+    $rights = [List[object]]::new(); $definite = $false
+    foreach ($r in @($Ctx.Assign[$key])) {
+        if ($null -eq $r -or -not (Test-Within $r.Scope $scope)) { continue }
+        if ($r.Op -ne [TokenKind]::Equals) { return $null }
+        if ($r.Direct -and [object]::ReferenceEquals($r.Scope, $scope) -and ($isScript -or $r.End -le $V.Extent.StartOffset)) { $definite = $true }
+        $rights.Add($r.Right)
+    }
+    if (-not $definite) { return $null }
+    return , $rights.ToArray()
+}
+
 function Get-Statement($Ast) {
     # The outermost statement around $Ast that is not itself inside an expression: an @( ) or $( ) body is looked through, a branch body
     # of if / foreach / try is not, so each branch of a one-line if/else keeps its own text.
@@ -149,11 +242,9 @@ function Test-ResolvedString($Ast, $Ctx, [int]$Depth = 0) {
     if ($x -is [StringConstantExpressionAst] -or $x -is [ScriptBlockExpressionAst]) { return $true }   # a { } literal is AST code already
     if ($x -is [ExpandableStringExpressionAst]) { return ($x.NestedExpressions.Count -eq 0) }
     if ($x -is [VariableExpressionAst] -and $Depth -lt 4) {
-        $list = $Ctx.Assign[(Get-VarKey $x)]
-        if ($null -eq $list) { return $false }
-        foreach ($r in $list) {
-            if ($r.Op -ne [TokenKind]::Equals -or -not (Test-ResolvedString $r.Right $Ctx ($Depth + 1))) { return $false }
-        }
+        $rights = Get-LiteralRights $x $Ctx
+        if ($null -eq $rights) { return $false }
+        foreach ($r in $rights) { if (-not (Test-ResolvedString $r $Ctx ($Depth + 1))) { return $false } }
         return $true
     }
     return $false
@@ -166,26 +257,27 @@ function Test-HiddenValue($V) {
     return $true
 }
 
-# 'hidden' | 'none' | 'unresolved' for a variable splatted into Start-Process.
-function Get-SplatWindowStyle([string]$Key, $Ctx) {
-    $literal = $false; $other = $false
-    foreach ($r in @($Ctx.Assign[$Key])) {
+# 'hidden' | 'none' | 'unresolved' for a variable $V splatted into Start-Process. A Hidden set anywhere in this source counts, whatever
+# its scope (over-reporting is accepted); 'none' needs every assignment that reaches the splat (Get-LiteralRights) to be a hashtable literal.
+function Get-SplatWindowStyle($V, $Ctx) {
+    $key = Get-VarKey $V
+    foreach ($r in @($Ctx.Assign[$key])) {
         if ($null -eq $r) { continue }
         $x = Get-Inner $r.Right
-        if ($x -is [HashtableAst] -and $r.Op -eq [TokenKind]::Equals) {
-            $literal = $true
+        if ($x -is [HashtableAst]) {
             foreach ($kv in $x.KeyValuePairs) {
                 $k = Get-Inner $kv.Item1
                 if ($k -is [StringConstantExpressionAst] -and (Resolve-StartProcessParameter $k.Value) -eq 'WindowStyle' -and (Test-HiddenValue $kv.Item2)) { return 'hidden' }
             }
         }
-        else { $other = $true }
     }
-    foreach ($m in @($Ctx.Member[$Key])) {
+    foreach ($m in @($Ctx.Member[$key])) {
         if ($null -eq $m) { continue }
         if ((Resolve-StartProcessParameter $m.Key) -eq 'WindowStyle' -and (Test-HiddenValue $m.Right)) { return 'hidden' }
     }
-    if (-not $literal -or $other) { return 'unresolved' }
+    $rights = Get-LiteralRights $V $Ctx
+    if ($null -eq $rights) { return 'unresolved' }
+    foreach ($r in $rights) { if (-not ((Get-Inner $r) -is [HashtableAst])) { return 'unresolved' } }
     return 'none'
 }
 
@@ -201,7 +293,7 @@ function Get-CommandTarget($Cmd, $Ctx) {
         if ($first.Extent.Text -match '(?i)pwsh|powershell') { return 'pwsh' }
         $inner = Get-Inner $first
         if ($inner -is [VariableExpressionAst]) {
-            foreach ($r in @($Ctx.Assign[(Get-VarKey $inner)])) { if ($null -ne $r -and $r.Right.Extent.Text -match '(?i)pwsh|powershell') { return 'pwsh' } }
+            foreach ($r in @($Ctx.Assign[(Get-VarKey $inner)])) { if ($null -ne $r -and $null -ne $r.Right -and $r.Right.Extent.Text -match '(?i)pwsh|powershell') { return 'pwsh' } }
         }
         return '?'
     }
@@ -243,6 +335,7 @@ function Get-Sites([string]$Text, [int]$LineBase, [int]$OffBase, [int]$Depth, [b
     $ctx = @{
         Text = $Text; LineBase = $LineBase; OffBase = $OffBase; Out = $Out
         Skip = [List[object]]::new(); CtxLines = [HashSet[int]]::new(); Assign = @{}; Member = @{}
+        Root = $root; Tainted = [HashSet[string]]::new(); TaintAll = $false
     }
     if ($TopLevel -and $errors.Count -gt 0) {
         $e0 = $errors[0]
@@ -256,17 +349,21 @@ function Get-Sites([string]$Text, [int]$LineBase, [int]$OffBase, [int]$Depth, [b
     $all = $root.FindAll({ $true }, $true)
     $commands = [List[object]]::new(); $members = [List[object]]::new(); $types = [List[object]]::new(); $strings = [List[object]]::new()
     foreach ($a in $all) {
-        if ($a -is [CommandAst]) { $commands.Add($a) }
+        if ($a -is [CommandAst]) { $commands.Add($a); Add-CommandBindings $ctx $a }
         elseif ($a -is [InvokeMemberExpressionAst]) { $members.Add($a) }
         elseif ($a -is [TypeConstraintAst] -or $a -is [TypeExpressionAst]) { $types.Add($a) }
         elseif (($a -is [StringConstantExpressionAst] -and $a.StringConstantType -ne [StringConstantType]::BareWord) -or $a -is [ExpandableStringExpressionAst]) { $strings.Add($a) }
+        elseif ($a -is [ForEachStatementAst]) { Add-Assign $ctx $a.Variable $null $null (Get-Scope $a) $false 0 }
+        elseif ($a -is [ConvertExpressionAst] -and $a.Type.TypeName.Name -ieq 'ref' -and (Get-Inner $a.Child) -is [VariableExpressionAst]) { [void]$ctx.Tainted.Add((Get-VarKey (Get-Inner $a.Child))) }
         elseif ($a -is [AssignmentStatementAst]) {
             $left = $a.Left
             if ($left -is [ConvertExpressionAst]) { $left = $left.Child }
             if ($left -is [VariableExpressionAst]) {
-                $k = Get-VarKey $left
-                if ($null -eq $ctx.Assign[$k]) { $ctx.Assign[$k] = [List[object]]::new() }
-                $ctx.Assign[$k].Add(@{ Op = $a.Operator; Right = $a.Right })
+                Add-Assign $ctx $left $a.Operator $a.Right (Get-Scope $a) ($a.Parent -is [NamedBlockAst]) $a.Extent.EndOffset
+            }
+            elseif ($left -is [ArrayLiteralAst]) {
+                # `$a, $b = ...` splits a value at run time: each name is bound, none to a literal
+                foreach ($el in $left.Elements) { $v = Get-Inner $el; if ($v -is [VariableExpressionAst]) { Add-Assign $ctx $v $null $null (Get-Scope $a) $false 0 } }
             }
             elseif ($left -is [MemberExpressionAst] -or $left -is [IndexExpressionAst]) {
                 $target = if ($left -is [MemberExpressionAst]) { Get-Inner $left.Expression } else { Get-Inner $left.Target }
@@ -320,7 +417,7 @@ function Get-Sites([string]$Text, [int]$LineBase, [int]$OffBase, [int]$Depth, [b
                 $el = $els[$i]
                 if ($el -is [CommandParameterAst] -and (Resolve-StartProcessParameter $el.ParameterName) -eq 'WindowStyle' -and (Test-HiddenValue (Get-ParameterValue $els $i))) { $hit = $true }
                 elseif ($el -is [VariableExpressionAst] -and $el.Splatted) {
-                    $style = Get-SplatWindowStyle (Get-VarKey $el) $ctx
+                    $style = Get-SplatWindowStyle $el $ctx
                     if ($style -eq 'hidden') { $hit = $true } elseif ($style -eq 'unresolved') { $unresolved = $true }
                 }
             }
@@ -345,7 +442,7 @@ function Get-Sites([string]$Text, [int]$LineBase, [int]$OffBase, [int]$Depth, [b
             if (-not $w32 -and $inner -is [VariableExpressionAst]) {
                 foreach ($r in @($ctx.Assign[(Get-VarKey $inner)])) {
                     # a [wmiclass] assignment is a site of its own already
-                    if ($null -ne $r -and $r.Right.Extent.Text -match '(?i)win32_process' -and $r.Right.Extent.Text -notmatch '(?i)wmiclass') { $w32 = $true }
+                    if ($null -ne $r -and $null -ne $r.Right -and $r.Right.Extent.Text -match '(?i)win32_process' -and $r.Right.Extent.Text -notmatch '(?i)wmiclass') { $w32 = $true }
                 }
             }
             if ($w32) { $createTargets.Add($m.Expression.Extent); $st = Get-Statement $m; Add-Site $ctx 'detached' $st }
