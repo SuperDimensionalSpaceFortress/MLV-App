@@ -300,7 +300,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         legsAttempted = 0; legsRan = 0; legsCounted = 0; retries = 0; probeRetries = 0; legRetries = 0
         endReason = $null; endDetail = $null; legs = [System.Collections.Generic.List[object]]::new(); closeJobId = $null; closeOutcome = $null; agent = $null; endedUtc = $null
         preOpenWait = $null; openLeaseWait = 'NONE'; exit75Refusals = 0; exit75Class = 'NONE'; renewOkMaxGapSec = $null; leaseEndClamp = $null; ledger = $null
-        openExit75Refusals = 0; legExit75Refusals = 0; openCancel = $null; openNotAfterUtc = $null; openLiveness = $null; claimRenew = $null
+        openExit75Refusals = 0; legExit75Refusals = 0; openCancel = $null; openNotAfterUtc = $null; openLiveness = $null; openLivenessReadback = $null; claimRenew = $null
     }
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
     $bw = Get-VenueLeaseBudgetWait -Leases @($leases) -NowUtc ([DateTime]::UtcNow) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec
@@ -351,11 +351,18 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # -LivenessWindowSec ahead. Killed, this run stops renewing it, and the agent ends the open's gate wait and releases its lease within that window.
         $openLive = Start-VenueJobLiveness -AgentShare $AgentShare -JobId $b.openJobId -WindowSec $LivenessWindowSec -RenewSec $LivenessRenewSec
         L "BATCH_OPEN_LIVENESS batch=$batchNo job=$($b.openJobId) first=$($openLive.first.state) aliveUntilUtc=$($openLive.first.aliveUntilUtc) windowSec=$LivenessWindowSec renewSec=$LivenessRenewSec$(if ($openLive.first.error) { " error=$($openLive.first.error)" })"
-        if ($openLive.first.state -cne 'WRITTEN') {
+        # r6 (Grok G2 on #633): WRITTEN only says the write returned. The file is read back with the agent's own reader and verdict; one the agent would not read as live is no sidecar.
+        $rb = $null
+        if ($openLive.first.state -ceq 'WRITTEN') {
+            $rb = Test-VenueJobLivenessReadback -AgentShare $AgentShare -JobId $b.openJobId -NotAfterUtc $b.openNotAfterUtc
+            $b.openLivenessReadback = $rb
+            L "BATCH_OPEN_LIVENESS_READBACK batch=$batchNo job=$($b.openJobId) live=$($rb.live) livenessState=$($rb.livenessState) why=$($rb.why)"
+        }
+        if ($openLive.first.state -cne 'WRITTEN' -or -not $rb.live) {
             # r5b (dot ef5805a4 residual B1): no sidecar, no open. Submitted without one, an open this run dies under stays admissible until the far batch
             # deadline, not -LivenessWindowSec. The keeper is stopped and the open is never submitted: the batch ends LIVENESS_UNAVAILABLE (exit 9, below).
             $b.openLiveness = Stop-VenueJobLiveness $openLive -Remove
-            $op = [pscustomobject]@{ outcome = 'NOT_SUBMITTED'; result = $null; message = "first liveness write $($openLive.first.state)$(if ($openLive.first.error) { ": $($openLive.first.error)" })" }
+            $op = [pscustomobject]@{ outcome = 'NOT_SUBMITTED'; result = $null; message = "first liveness write $($openLive.first.state)$(if ($openLive.first.error) { ": $($openLive.first.error)" })$(if ($null -ne $rb -and -not $rb.live) { ", but the agent's own parser does not read it as live (read-back $($rb.livenessState)): $($rb.why)" })" }
         } else {
             $op = Submit-AgentJob $b.openJobId "Write-Output ('LEASE_BATCH_OPEN token=$token held=' + [string]`$env:HEAVY_SLOT_HELD + ' admission=' + [string]`$env:MLV_AGENT_ADMISSION)" 120 $wait $b.openNotAfterUtc
         }
