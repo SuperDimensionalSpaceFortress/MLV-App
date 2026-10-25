@@ -4319,6 +4319,17 @@ static double cpuReferenceSpanMs(const QElapsedTimer & clock, qint64 startNs)
     return static_cast<double>(clock.nsecsElapsed() - startNs) / 1000000.0;
 }
 
+const char * gpuPreviewProcessingPointwiseFastKillSwitchName(void)
+{
+    return "MLVAPP_DISABLE_PREP_POINTWISE_FAST";
+}
+
+const char * gpuPreviewProcessingPointwiseFastRefusal(const GpuPreviewProcessingConfig & config)
+{
+    Q_UNUSED(config);
+    return "not_implemented";
+}
+
 void gpuPreviewProcessingApplyCpuReferenceTimed(const GpuPreviewProcessingConfig & configIn,
                                                 const uint16_t * inputRgb16,
                                                 uint16_t * outputRgb16,
@@ -4332,6 +4343,7 @@ void gpuPreviewProcessingApplyCpuReferenceTimed(const GpuPreviewProcessingConfig
     {
         *spans = GpuPreviewProcessingCpuSpans();
         spans->stageMask = gpuPreviewProcessingCpuStageMask(configIn);
+        spans->pointwiseFastRefusal = gpuPreviewProcessingPointwiseFastRefusal(configIn);
     }
     GpuPreviewProcessingConfig expandedConfig;
     const GpuPreviewProcessingConfig & config =

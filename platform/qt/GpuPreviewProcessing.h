@@ -320,7 +320,25 @@ struct GpuPreviewProcessingCpuSpans
     uint32_t stageMask = 0;
     /* true when >>8 ran inside the pointwise loop (no spatial post-pass). */
     bool fused8 = false;
+    /* CPU-LOOKASSIST-PLAYBACK-COST-1: the pointwise pass ran the fast path; the
+     * OpenMP team size it ran with (read inside the region, 0 when no pass ran);
+     * why the fast path was refused (static string, "" when it ran). */
+    bool pointwiseFast = false;
+    int pointwiseOmpThreads = 0;
+    const char * pointwiseFastRefusal = "";
 };
+/* CPU-LOOKASSIST-PLAYBACK-COST-1: the prep route's pointwise pass
+ * (gpuPreviewProcessingApplyCpuReferenceTimed / ...To8) has a fast path that is
+ * byte-identical to the reference loop: the config's tables resolved once per
+ * frame into raw pointers and per-channel composite tables, and an explicit
+ * team of mlvappEffectivePlaybackWorkerThreadCount() threads.
+ * gpuPreviewProcessingApplyCpuReference (the parity oracle) never takes it.
+ * MLVAPP_DISABLE_PREP_POINTWISE_FAST ("1", "true", "yes", "on") restores the
+ * reference loop. */
+const char * gpuPreviewProcessingPointwiseFastKillSwitchName(void);
+/* "" when the fast path covers every pointwise stage the config enables, else a
+ * stable token naming the first reason it does not. Reads the kill switch. */
+const char * gpuPreviewProcessingPointwiseFastRefusal(const GpuPreviewProcessingConfig & config);
 uint32_t gpuPreviewProcessingCpuStageMask(const GpuPreviewProcessingConfig & config);
 /* Chroma, sharpen or median: the stages that read neighbouring pixels after
  * the pointwise pass. */
