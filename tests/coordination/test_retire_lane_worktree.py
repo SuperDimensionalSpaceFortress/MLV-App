@@ -1603,17 +1603,38 @@ def test_probe_unavailable_refusal_holds_on_a_real_removal_too(repo):
     assert wt.exists()
 
 
+def _spawn_proven_alive(tmp, name, cwd, attempts=3):
+    """A sleeping holder that has PROVEN it is running: it writes a ready file as its first act and the caller waits for it. A bare
+    Popen only proves CreateProcess returned; a pwsh that dies at startup under host load (no stderr, DEVNULL) leaves a pid the sweep
+    rightly never lists, which reads as a gate miss (CI-FLAKE-RETIRE-CWD-UNKNOWN-PID-1, merge_group 40157682070). Only the holder's
+    STARTUP is retried, before any product code runs; the sleep outlives any gate call so it cannot expire mid-scan."""
+    for attempt in range(attempts):
+        ready = Path(tmp) / f"{name}-{attempt}.ready"
+        p = _spawn(["-Command", f"[IO.File]::WriteAllText('{ready}', 'up'); Start-Sleep -Seconds 600"], cwd=cwd)
+        deadline = time.monotonic() + 60
+        while p.poll() is None and not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if p.poll() is None and ready.exists():
+            return p
+        _stop(p)
+    raise AssertionError(f"fixture holder {name} did not reach its ready file in {attempts} attempts")
+
+
 def test_a_pid_whose_cwd_read_fails_is_listed_and_left_to_the_rename_probe(repo):
     tmp, main = repo
     wt = _add_wt(main, tmp / "wt-cwd-unknown")
-    p = _spawn(["-Command", "Start-Sleep -Seconds 120"], cwd=tmp)   # does not hold the worktree, but the gate cannot tell
+    p = _spawn_proven_alive(tmp, "cwd-unknown-holder", cwd=tmp)      # does not hold the worktree, but the gate cannot tell
+    # ONLY_PYTEST_CHILDREN: this case is about its own holder; an unrelated host pwsh/cmd with an unreadable cwd and a relative script
+    # (relative-script-unresolved, never exempt) would otherwise turn the would-retire into a cwd-unknown refusal (reproduced 2 in ~100).
     try:
-        d, err = _gate_real(wt, prelude=_cwd_unreadable_for(p.pid))
-        control, _ = _gate_real(wt)                                  # same process, cwd readable: not listed at all
+        d, err = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN + _cwd_unreadable_for(p.pid))
+        control, _ = _gate_real(wt, prelude=ONLY_PYTEST_CHILDREN)    # same process, cwd readable: not listed at all
+        # The holder was alive for both scans (it is killed only below), so a missing pid is the gate's, never a vanished fixture.
+        assert p.poll() is None, f"fixture holder {p.pid} exited before the scans finished"
     finally:
         _stop(p)
-    assert (d["action"], d["reason"]) == ("would-retire", "ok"), d   # r7: no longer a refusal (the rename settles it)
-    assert d["cwdProbe"] == "ok" and any(u.startswith(f"{p.pid} ") for u in d["cwdUnknown"]), d
+    assert (d["action"], d["reason"]) == ("would-retire", "ok"), json.dumps(d)   # r7: no longer a refusal (the rename settles it)
+    assert d["cwdProbe"] == "ok" and any(u.startswith(f"{p.pid} ") for u in d["cwdUnknown"]), json.dumps(d)
     assert f"pid={p.pid}" not in err, err                            # and no REFUSED line for it
     assert not any(u.startswith(f"{p.pid} ") for u in control["cwdUnknown"]), control
     assert wt.exists()
