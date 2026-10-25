@@ -1469,6 +1469,12 @@ private:
         QString downscaleBranchLast;
         QMap<QString, quint64> refusalCounts;
         QMap<QString, quint64> downscaleBranchCounts;
+        // CPU-LOOKASSIST-PLAYBACK-COST-1: the pointwise fast path (empty refusal = it ran).
+        quint64 pointwiseFastFrames = 0;
+        double pointwiseOmpThreadsSum = 0.0;
+        int pointwiseOmpThreadsLast = 0;
+        QString pointwiseFastRefusalLast;
+        QMap<QString, quint64> pointwiseFastRefusalCounts;
     };
     PlaybackSmokePrepSpanTotals m_playbackSmokePrepSpans;
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;

@@ -4292,6 +4292,11 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
         spanTelemetry.insert( QStringLiteral("playback_prep_median_ms"), cpuRoute.spans.medianMs );
         spanTelemetry.insert( QStringLiteral("playback_prep_rgb16to8_ms"), cpuRoute.spans.rgb16to8Ms );
         spanTelemetry.insert( QStringLiteral("playback_prep_fused8"), cpuRoute.spans.fused8 );
+        // CPU-LOOKASSIST-PLAYBACK-COST-1: which pointwise loop ran, on what team, and why not the fast one.
+        spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_fast"), cpuRoute.spans.pointwiseFast );
+        spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_omp_threads"), cpuRoute.spans.pointwiseOmpThreads );
+        spanTelemetry.insert( QStringLiteral("playback_prep_pointwise_fast_refusal"),
+                              QString::fromLatin1( cpuRoute.spans.pointwiseFastRefusal ) );
         spanTelemetry.insert( QStringLiteral("playback_prep_stage_mask"),
                               static_cast<qint64>( gpuPreviewProcessingCpuStageMask( gpuPreviewProcessingConfig ) ) );
         spanTelemetry.insert( QStringLiteral("playback_prep_reduced_factor"), cpuRoute.reducedFactor );
@@ -26329,6 +26334,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         {
             ++spans.cpuRouteFrames;
             if( telemetryBoolValue( timing, "playback_prep_fused8" ) ) ++spans.fused8Frames;
+            if( telemetryBoolValue( timing, "playback_prep_pointwise_fast" ) ) ++spans.pointwiseFastFrames;
+            spans.pointwiseOmpThreadsSum += telemetryIntValue( timing, "playback_prep_pointwise_omp_threads" );
+            spans.pointwiseOmpThreadsLast = telemetryIntValue( timing, "playback_prep_pointwise_omp_threads" );
+            spans.pointwiseFastRefusalLast =
+                telemetryStringValue( timing, "playback_prep_pointwise_fast_refusal" );
+            ++spans.pointwiseFastRefusalCounts[spans.pointwiseFastRefusalLast];
             spans.stageMaskLast = static_cast<qint64>(
                 telemetryDoubleValue( timing, "playback_prep_stage_mask" ) );
             spans.reducedFactorLast = telemetryIntValue( timing, "playback_prep_reduced_factor" );
@@ -29373,6 +29384,12 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                                                 .arg( it.value() );
             return parts.isEmpty() ? QStringLiteral("none") : parts.join( QLatin1Char(',') );
         };
+        // CPU-LOOKASSIST-PLAYBACK-COST-1: an empty refusal means the fast path ran ("none").
+        QMap<QString, quint64> pointwiseFastRefusalCounts;
+        for( auto it = spans.pointwiseFastRefusalCounts.constBegin();
+             it != spans.pointwiseFastRefusalCounts.constEnd(); ++it )
+            pointwiseFastRefusalCounts[it.key().isEmpty() ? QStringLiteral("none") : it.key()] += it.value();
+        const double cpuRouteFrames = static_cast<double>( spans.cpuRouteFrames );
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.prep_summary session=%1 frames=%2 cpu_route_frames=%3 "
@@ -29385,7 +29402,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "span_coverage=%16 fused8_frames=%17 reduced_frames=%18 "
                    "playback_prep_reduced_factor=%19 playback_prep_reduced_refusal_reason=%20 "
                    "refusal_counts=%21 playback_prep_downscale_branch=%22 downscale_branch_counts=%23 "
-                   "playback_prep_stage_mask=%24" )
+                   "playback_prep_stage_mask=%24 playback_prep_pointwise_fast_frames=%25 "
+                   "playback_prep_pointwise_fast=%26 playback_prep_pointwise_omp_threads=%27 "
+                   "playback_prep_pointwise_omp_threads_last=%28 playback_prep_pointwise_fast_refusal=%29 "
+                   "pointwise_fast_refusal_counts=%30" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokePresentedFrames )
                    .arg( spans.cpuRouteFrames )
@@ -29409,7 +29429,15 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( joinCounts( spans.refusalCounts ) )
                    .arg( spans.downscaleBranchLast.isEmpty() ? QStringLiteral("unset") : spans.downscaleBranchLast )
                    .arg( joinCounts( spans.downscaleBranchCounts ) )
-                   .arg( spans.stageMaskLast );
+                   .arg( spans.stageMaskLast )
+                   .arg( spans.pointwiseFastFrames )
+                   .arg( cpuRouteFrames > 0.0 ? spans.pointwiseFastFrames / cpuRouteFrames : 0.0, 0, 'f', 3 )
+                   .arg( cpuRouteFrames > 0.0 ? spans.pointwiseOmpThreadsSum / cpuRouteFrames : 0.0, 0, 'f', 3 )
+                   .arg( spans.pointwiseOmpThreadsLast )
+                   .arg( spans.cpuRouteFrames == 0 ? QStringLiteral("unset")
+                         : ( spans.pointwiseFastRefusalLast.isEmpty() ? QStringLiteral("none")
+                                                                      : spans.pointwiseFastRefusalLast ) )
+                   .arg( joinCounts( pointwiseFastRefusalCounts ) );
     }
 
     /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayered-16 frames whose render
