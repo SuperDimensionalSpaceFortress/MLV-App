@@ -269,8 +269,22 @@ def parse_utc(text: str) -> datetime:
 
 
 def read_claim_json(path: Path, timeout_s: float = 10.0, sleep_s: float = 0.1) -> dict:
-    """RED stub (CI-FLAKE-LEASE-BATCH-CLAIM-READ-RACE-1): the direct read the claim reads used before the bounded retry."""
-    return json.loads(path.read_text(encoding="utf-8"))
+    """A claim file read that waits out the runner's own write (CI-FLAKE-LEASE-BATCH-CLAIM-READ-RACE-1, merge_group 40211588250).
+
+    The runner takes the claim with CreateNew/FileShare.None and renews it in place under FileShare.None (VenueChain.psm1 Request-/Update-VenueClaim), so on Windows a
+    reader that lands in that window gets PermissionError, on a half-written file JSONDecodeError, before the take FileNotFoundError. Retries those three for
+    timeout_s, then raises the last one with the path.
+    """
+    end = time.monotonic() + timeout_s
+    while True:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (PermissionError, json.JSONDecodeError, FileNotFoundError) as e:
+            if time.monotonic() >= end:
+                if isinstance(e, json.JSONDecodeError):
+                    raise json.JSONDecodeError(f"{path}: {e.msg}", e.doc, e.pos) from e
+                raise type(e)(e.errno, f"{e.strerror} (still failing after {timeout_s}s): {path}") from e
+            time.sleep(sleep_s)
 
 
 def batch_result(stdout: str) -> dict:
@@ -856,7 +870,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             end = time.monotonic() + 60
             while not self.claim_path.exists() and time.monotonic() < end:
                 time.sleep(0.2)
-            c0 = json.loads(self.claim_path.read_text(encoding="utf-8"))
+            c0 = read_claim_json(self.claim_path)
             claimed = parse_utc(c0["claimedUtc"])
             while datetime.now(timezone.utc) < claimed + timedelta(seconds=70):
                 time.sleep(0.5)
@@ -866,7 +880,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
             seen = json.loads(out.stdout)
             self.assertEqual((seen["state"], seen["reason"], seen["nonce"]), ("LIVE", None, c0["nonce"]), seen)
-            c1 = json.loads(self.claim_path.read_text(encoding="utf-8"))
+            c1 = read_claim_json(self.claim_path)
             self.assertGreater(parse_utc(c1["expiresUtc"]), datetime.now(timezone.utc), c1)
             self.assertEqual({k: v for k, v in c1.items() if k != "expiresUtc"}, {k: v for k, v in c0.items() if k != "expiresUtc"}, "only expiresUtc changes")
             so, se = p.communicate(timeout=300)
