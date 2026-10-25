@@ -803,16 +803,14 @@ function Get-QueueAgeSeconds {
     )
 
     $submitUtc = ConvertTo-UtcDateTime $Metadata.submitUtc
-    $nowUtc = (Get-Date).ToUniversalTime()
-    # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a submitUtc whose age does not fit an [int] (DateTime.MinValue, MaxValue) reads as an
-    # unreadable one; the [int] cast below would otherwise throw out of the poll loop and end the agent.
-    if ($null -ne $submitUtc -and [Math]::Abs(($nowUtc - $submitUtc).TotalSeconds) -gt [int]::MaxValue) {
-        $submitUtc = $null
-    }
     if ($null -eq $submitUtc) {
         $submitUtc = $Job.CreationTimeUtc
     }
-    return [Math]::Max(0, [int]($nowUtc - $submitUtc).TotalSeconds)
+    # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: clamped to [0, Int32.MaxValue] BEFORE the [int] cast, which would otherwise throw out of
+    # the poll loop and end the agent for an age past ~68 years (a submitUtc or file time at DateTime.MinValue or MaxValue). Every
+    # age the cast could hold gives the same answer as before.
+    $ageSec = ((Get-Date).ToUniversalTime() - $submitUtc).TotalSeconds
+    return [int][Math]::Min([double][int]::MaxValue, [Math]::Max(0.0, $ageSec))
 }
 
 function Get-JobNotAfterVerdict {

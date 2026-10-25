@@ -22,7 +22,7 @@ param(
 #   adopt       - Invoke-AdoptStartedJob (the restart-and-adopt path): the deadline is startedUtc + timeoutSec in UTC. A job past
 #                 it is killed at once; a job inside it is not; a missing startedUtc still throws (fail closed)
 #   out of range - AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a time at DateTime.MinValue or MaxValue never throws out of the three
-#                 sites above (a throw there ends the agent): queue age falls back to the file's creation time, find-child is
+#                 sites above (a throw there ends the agent): queue age is clamped to [0, Int32.MaxValue], find-child is
 #                 unknown, and an adopt deadline that cannot be represented reads as passed
 # r2: the shift only shows when the process is NOT on UTC, so this test never trusts the host's zone. It FORCES the zone of the
 # process: once at UTC-5 (what moves a deadline 5 h LATE on a pwsh 7 JSON read-back) and once at UTC+5:30 (what moves it early
@@ -247,18 +247,35 @@ try {
     $ageBad = Get-QueueAgeSeconds -Job $job -Metadata ([pscustomobject]@{ submitUtc = 'not a time' })
     $ageCases['unparseable'] = $ageBad
     if ([Math]::Abs($ageBad - 400) -gt 15) { $failures.Add("queue-age unparseable: expected the file creation time (about 400 s), got $ageBad") }
-    # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a submitUtc whose age does not fit an [int] (DateTime.MinValue or MaxValue) reads as
-    # an unreadable one, the file's creation time. Before, the [int] cast threw out of the poll loop and ended the agent.
-    $edges = [ordered]@{ 'minvalue' = [DateTime]::MinValue; 'maxvalue' = [DateTime]::MaxValue.AddSeconds(-1) }
+    # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: an age that does not fit an [int] is clamped to [0, Int32.MaxValue] (a submitUtc at
+    # DateTime.MinValue is as old as an age can be; one at MaxValue is in the future, 0). Before, the [int] cast threw out of the
+    # poll loop and ended the agent. Every age the cast could hold keeps its old answer: r1 adversary A1 (2147483647.x s old,
+    # -2147483648.x s old, the latter beside a 1950 file time) and A2 (no submitUtc, a 1950 file time; base gap, same class).
+    $oldJob = [pscustomobject]@{ CreationTimeUtc = [DateTime]::new(1950, 1, 1, 0, 0, 0, [DateTimeKind]::Utc) }
+    $maxInt = [int]::MaxValue
+    $edges = [ordered]@{
+        'minvalue'    = @{ at = [DateTime]::MinValue; job = $job; want = $maxInt; shapes = $null }
+        'maxvalue'    = @{ at = [DateTime]::MaxValue.AddSeconds(-1); job = $job; want = 0; shapes = $null }
+        'a1-posmax'   = @{ at = [DateTime]::UtcNow.AddSeconds(-2147483647.2); job = $job; want = $maxInt; shapes = @('json-readback', 'z-string') }
+        'a1-negmin'   = @{ at = [DateTime]::UtcNow.AddSeconds(2147483648.2); job = $job; want = 0; shapes = @('json-readback', 'z-string') }
+        'a1-old-file' = @{ at = [DateTime]::UtcNow.AddSeconds(2147483648.2); job = $oldJob; want = 0; shapes = @('json-readback', 'z-string') }
+    }
     foreach ($edge in $edges.GetEnumerator()) {
-        foreach ($kv in (New-Shapes ([DateTime]::SpecifyKind($edge.Value, [DateTimeKind]::Utc))).GetEnumerator()) {
+        foreach ($kv in (New-Shapes ([DateTime]::SpecifyKind($edge.Value.at, [DateTimeKind]::Utc))).GetEnumerator()) {
+            if ($null -ne $edge.Value.shapes -and $kv.Key -notin $edge.Value.shapes) { continue }
             foreach ($pref in @('Continue', 'Stop')) {
-                $r = Invoke-UnderPreference $pref { Get-QueueAgeSeconds -Job $job -Metadata ([pscustomobject]@{ submitUtc = $kv.Value }) }
+                $r = Invoke-UnderPreference $pref { Get-QueueAgeSeconds -Job $edge.Value.job -Metadata ([pscustomobject]@{ submitUtc = $kv.Value }) }
                 $ageCases["$($edge.Key)-$($kv.Key)-$pref"] = if ($r.threw) { 'threw' } else { $r.value }
                 if ($r.threw) { $failures.Add("queue-age $($edge.Key) $($kv.Key) ($pref): must not throw, threw $($r.threw)") }
-                elseif ($null -eq $r.value -or [Math]::Abs($r.value - 400) -gt 15) { $failures.Add("queue-age $($edge.Key) $($kv.Key) ($pref): expected the file creation time (about 400 s), got '$($r.value)'") }
+                elseif ($r.value -ne $edge.Value.want) { $failures.Add("queue-age $($edge.Key) $($kv.Key) ($pref): expected $($edge.Value.want), got '$($r.value)'") }
             }
         }
+    }
+    foreach ($pref in @('Continue', 'Stop')) {
+        $r = Invoke-UnderPreference $pref { Get-QueueAgeSeconds -Job $oldJob -Metadata ([pscustomobject]@{ submitUtc = $null }) }
+        $ageCases["a2-missing-old-file-$pref"] = if ($r.threw) { 'threw' } else { $r.value }
+        if ($r.threw) { $failures.Add("queue-age a2 missing submitUtc, 1950 file ($pref): must not throw, threw $($r.threw)") }
+        elseif ($r.value -ne $maxInt) { $failures.Add("queue-age a2 missing submitUtc, 1950 file ($pref): expected $maxInt, got '$($r.value)'") }
     }
     $results['queueAge'] = $ageCases
 

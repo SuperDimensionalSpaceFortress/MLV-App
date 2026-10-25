@@ -110,9 +110,17 @@ class BachelorAgentTimestampTzBehaviour(unittest.TestCase):
                 for pref in ("Continue", "Stop"):
                     for edge in ("minvalue+0s", "minvalue+1s"):
                         self.assertEqual(one["findChild"][f"{edge}-{shape}-{pref}"], "unknown", f"{name} {edge} {shape} {pref}")
-                    for edge in ("minvalue", "maxvalue"):
-                        self.assertAlmostEqual(one["queueAge"][f"{edge}-{shape}-{pref}"], 400, delta=15, msg=f"{name} {edge} {shape} {pref}")
+                    # An age past an [int] is clamped: as old as it can be, or 0 for a future submitUtc.
+                    self.assertEqual(one["queueAge"][f"minvalue-{shape}-{pref}"], 2147483647, f"{name} {shape} {pref}")
+                    self.assertEqual(one["queueAge"][f"maxvalue-{shape}-{pref}"], 0, f"{name} {shape} {pref}")
                     self.assertEqual(one["adopt"][f"maxvalue-{shape}-{pref}"], "adopted/killed=True", f"{name} {shape} {pref}")
+            # r1 adversary A1/A2: an age the cast could hold keeps its old answer, and an old file time never throws.
+            for pref in ("Continue", "Stop"):
+                for shape in ("json-readback", "z-string"):
+                    self.assertEqual(one["queueAge"][f"a1-posmax-{shape}-{pref}"], 2147483647, f"{name} {shape} {pref}")
+                    self.assertEqual(one["queueAge"][f"a1-negmin-{shape}-{pref}"], 0, f"{name} {shape} {pref}")
+                    self.assertEqual(one["queueAge"][f"a1-old-file-{shape}-{pref}"], 0, f"{name} {shape} {pref}")
+                self.assertEqual(one["queueAge"][f"a2-missing-old-file-{pref}"], 2147483647, f"{name} {pref}")
             # The fixture creates the job 400 s old and the case reads its age a moment later, so the age is 400 plus the
             # time the run took in between (a slow runner or an edition start-up adds seconds); the .ps1 itself allows 15 s.
             self.assertAlmostEqual(one["queueAge"]["missing"], 400, delta=15)
