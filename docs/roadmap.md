@@ -12,7 +12,7 @@ Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
 not classified are not counted either, even when the card name says PLAYBACK.
 
-generated_from: 2026-10-25T04:21:22Z
+generated_from: 2026-10-25T05:46:25Z
 
 ## Open product and playback cards
 
@@ -30,10 +30,9 @@ generated_from: 2026-10-25T04:21:22Z
 | 1 | CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 | product | queued | 2026-10-21 | - |
 | 1 | BACHELOR-CORE-PARTITION-AB-1 | product | queued | 2026-10-23 | - |
 | 1 | PROCESSED8-MS-TELEMETRY-STUCK-1-VENUE-LEG | product | declared | 2026-10-24 | - |
-| 1 | CPU-17V9-FPS-GAP-AB-1 | product | declared | 2026-10-24 | ORDER-20261025T013808Z #2 after LEASE-BATCH-LEASE-END-TZ-1 |
+| 1 | CPU-17V9-FPS-GAP-AB-1 | product | running | 2026-10-24 | ORDER-20261025T013808Z #2 after LEASE-BATCH-LEASE-END-TZ-1 |
 | 2 | PLAYBACK-GL-PRESENT-BACKLOG-1 | product | declared | 2026-10-09 | ORDER-20261008T151800Z #2 after PLAYBACK-GL-PRESENT-SETUP-STALL-1 |
 | 2 | PLAYBACK-GPU-SCOPES-NO-VETO-1 | product | pr-open | 2026-10-15 | - |
-| 2 | PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 | product | pr-open | 2026-10-15 | - |
 | 2 | LOOK-FULLSCREEN-PARITY-1 | product | pr-open | 2026-10-16 | - |
 | 2 | PLAYBACK-SOURCE-FRAME-IDENTITY-1 | product | pr-open | 2026-10-17 | - |
 | 3 | PLAYBACK-CLIP-LENGTH-ENFORCE-2 | product | declared | 2026-10-01 | - |
@@ -57,7 +56,7 @@ generated_from: 2026-10-25T04:21:22Z
 
 ## Drain
 
-product+playback open: 34
+product+playback open: 33
 
 Window: the 7 UTC days ending 2026-10-25 (the last day is partial).
 Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp (approximate: a lower bound on the merge time, not a measurement); queued = rows of any state by `source_ledger_stamp`.
