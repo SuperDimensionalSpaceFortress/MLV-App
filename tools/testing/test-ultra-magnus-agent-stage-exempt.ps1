@@ -52,6 +52,15 @@ foreach ($name in $lift) { $fn = Find-Function $name; Assert-True ($null -ne $fn
 # The function under change: lifted when present, so a base agent runs every behavioural case and fails each on behaviour.
 $classifyFn = Find-Function 'Get-GateExemptClass'
 if ($null -ne $classifyFn) { . ([scriptblock]::Create($classifyFn.Extent.Text)) }
+# BACHELOR-LEASE-BATCH-LEGS-1 r5: Invoke-QueuedJob and the lease wait call the lease-batch block (no batch is open here); lifted when present.
+foreach ($name in @('Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId', 'Test-LeaseBatchClosePending', 'Get-QuietLeaseRemainingSec', 'Get-QuietLeaseRenewOkGapSec',
+        'Get-LeaseBatchAdmission', 'Open-LeaseBatch', 'Use-LeaseBatchForJob', 'Get-LeaseBatchJobStop', 'Complete-LeaseBatchJob', 'Write-LeaseBatchReceipt', 'Close-LeaseBatch',
+        'Close-LeaseBatchAfterRelease', 'Sync-LeaseBatchForJob')) {
+    $fn = Find-Function $name
+    if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) }
+}
+$script:LeaseBatch = $null
+$script:LeaseBatchKeep = $false
 $paramDefaults = @{}
 foreach ($p in $ast.ParamBlock.Parameters) { if ($p.DefaultValue -is [System.Management.Automation.Language.ConstantExpressionAst]) { $paramDefaults[$p.Name.VariablePath.UserPath] = $p.DefaultValue.Value } }
 $GateExemptJobPattern = [string]$paramDefaults['GateExemptJobPattern']

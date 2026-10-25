@@ -30,6 +30,42 @@
 #          set whose process active was valid); neither moves a value. `top` cpuSeconds (after minus before) is keyed on (pid, process start time): a pid whose start time
 #          differs between the two snapshots (reused) or cannot be read is left out of `top` and counted in the new note `top_pid_reuse_dropped`, never a negative or foreign figure.
 #      None of this feeds the QUIET decision: its threshold, v1 fields and the offline -SamplesJson output are byte-identical to before.
+#      PROCESS IDENTITY (VENUE-PROBE-PROCESS-ATTRIBUTION-1): a busy reading names WHO and WHAT, not only `top <name> pid=<n> cpuSeconds=<x>`. The probe line gains ONE more field,
+#        `identity` (sub-schema mlv-app/venue-quiet-probe-identity/v1). The top-level schema stays v2 on purpose: identity only ADDS a field, every v2 reader ignores it, and a
+#        probe or gate that predates it still parses; a probe WITHOUT identity prints exactly what it printed before.
+#        WHEN: collection runs AFTER the sample window and after every v2 figure, never inside the sample loop, with no new sleep. It decides nothing and sits in one try/catch: on
+#          any failure the line carries identity = { schema, error } and samples, top and every v2 field are unchanged.
+#        WHO: the targets are the top[] pids, the top_processes pids that are not null, and the top 3 pids by GPU. COST BOUND: at most 3 WQL Win32_Process queries (the targets, then
+#          their parents, then their grandparents; never a full-table enumeration, never polling) + one GetOwner per TARGET + ONE \GPU Engine(*)\Utilization Percentage read. The
+#          GPU read is a separate Get-Counter call, never added to the decision's counter groups, and runs before the CIM batch because its top pids are CIM targets too.
+#          Per target row: owner, started_utc (checked against the sampled process start; a start that differs by more than 1 s is start_check mismatch = a reused pid, and that
+#          row carries pid, name and start_check ONLY), command line with no argument text, executable, script, project, parent and grandparent (status ok | exited | pid-reused when the
+#          parent STARTED AFTER its child | none = no parent pid or nothing to compare), GPU percent and engine type.
+#        PROJECT: a pinned table (mlv-app, agent-bridge, adobe-ingester, fleet-doctrine, adversarialllm, virtual-ten, airmypc), first match wins, case-insensitive substring on the
+#          UNREDACTED command line and executable path (held in memory only), the process itself first, then its parent, then its grandparent; only the table's name is emitted.
+#          A user-profile root is not a project (the owner field covers it). The working directory is NOT collected: Win32_Process does not expose it and reading the process
+#          environment block or memory is out of scope. No environment block is ever read.
+#        REDACTION IS AN ALLOWLIST (r5): NO ARGUMENT TEXT IS EVER PERSISTED. cmdline is `<exe> args=<count> script=<path|<none>>` and nothing else, on every line: the exe path
+#          (ExecutablePath, else the OS image name), the argument count, and a script path taken ONLY from the first argument after the executable, ONLY when it is a drive-rooted
+#          .ps1/.psm1/.py/.js/.mjs/.cmd/.bat path with no whitespace, '=', '@', '?', '#' or ':' past the drive letter that EXISTS on a fixed local drive of the probed host. The row's
+#          `script` is that same path or null. SCRIPT CHECK (r6): every filesystem call for that slot (drive type, ONE attribute read per path component from the drive root,
+#          existence) runs in the bounded identity worker under the call deadline, never on the main path, so a slow or dead volume behind a local-looking path cannot hold the
+#          probe; a component that is a reparse point (junction, symlink, mount point) is never followed. Each row's `script_check` says why: ok | notfound | reparse | nonfixed
+#          | relative | rejected | timeout | error (null when the row has no readable command line; cmdline_status says why); only ok fills script. NO GHOST SEGMENTS (r7): a
+#          slot holding a '.' or '..' segment, a '/', a doubled '\', a trailing separator, a \\?\ or \\.\ prefix or an 8.3 '~<digit>' name is rejected as text, and `script` is
+#          the worker-validated full path, persisted only when it equals the slot text case-insensitively (else rejected). The old token scan is only the diagnostic integer cmdline_token_hits and gates nothing. Then a 200-character cap keeps the first 200
+#          and appends `...[+N]` (cmdline_truncated_chars = N). The contract is documented at Protect-IdentCmdLine.
+#        NON-ELEVATED DEGRADATION: the probe runs as the agent account, not elevated. What it cannot read is a TYPED status, never a guess: owner_status access-denied | exited |
+#          error-<ReturnValue> | budget-exceeded, cmdline_status / exe_status unreadable | exited, gpu_status counter-unavailable: <why> | no-gpu-context | disabled: <why>. A null
+#          always has its reason. WALL-CLOCK BUDGET: past 25 s of identity time no further GetOwner call is made (owner_status budget-exceeded), so identity can never push the
+#          probe job toward its 120 s submission timeout, which would turn a measured busy venue into UNKNOWN. CALL DEADLINE: the budget gates only later GetOwner calls, so every
+#          synchronous call (the GPU read, each Win32_Process query, the one script-slot check, each GetOwner) ALSO runs in a worker runspace with a 5 s deadline of its own and is
+#          abandoned past it: gpu_status `timeout: ...`, script_check `timeout`, owner_status `timeout`, or (a query) identity = { schema, error }; the measured samples and the
+#          quiet decision are never touched.
+#        GATE TEXT: each `top` line keeps its prefix byte for byte and appends comma-free, whitespace-free key=value pairs (owner project script script_check parent gparent started
+#          gpu); `attr proc` lines append owner, project and script_check; `ident probe` (user, elevated, cost), `ident gpu` (GPU-heavy pids not already in top, with script_check),
+#          `ident note` and `ident error` follow the attr lines. script_check is printed only for a row that carries it (an older probe's row prints what it printed before).
+#          No command line is ever printed. Summarize-VenueBusyProbes.ps1 (read-only) groups the busy probes' raw files by project using this script's own decision function.
 #   3. decides: QUIET when the UNROUNDED mean of the 3 samples is <= -ThresholdPercent (the printed mean is rounded to 0.1 for display only). A
 #      failed counter read makes the check UNKNOWN, never quiet.
 #   4. re-probes every -RecheckSec until QUIET or -MaxWaitSec, then prints `QUIET mean=<x>` or `COOLDOWN_UNMET mean=<x>` (a MEASURED busy venue) and the top
@@ -458,6 +494,436 @@ foreach ($c in ($cores | Group-Object core_class)) {
     $vals = @($c.Group | ForEach-Object { $_.percent })
     $classAgg[$c.Name] = [ordered]@{ count = $vals.Count; mean_percent = Get-Mean $vals; max_percent = ($vals | Measure-Object -Maximum).Maximum }
 }
+# IDENTITY (VENUE-PROBE-PROCESS-ATTRIBUTION-1): WHO (owner, project) and WHAT (script, a command line with no argument text, parent chain, start time, GPU) for the processes named above.
+# It runs AFTER the sample window and after every v2 figure (never inside the sample loop, no new sleep), decides nothing, and sits in ONE try/catch: on any failure the line
+# carries identity = { schema, error } and every other field is unchanged. The GPU read comes FIRST here, not last, because its top pids are CIM targets too (one extra WQL
+# query would break the 3-query bound). Bound: at most 3 WQL queries (targets, their parents, their grandparents) + GetOwner per target + ONE GPU Engine read.
+$IdentityGpu = $true
+$IdentityGpuDisabledWhy = ''
+# WALL-CLOCK BUDGET: identity must never push the probe job toward its 120 s submission timeout (a timed-out probe is UNKNOWN, a changed decision). Past this many ms of identity
+# time no further GetOwner call is made: the remaining rows say owner_status budget-exceeded. Command line, parent chain and project do not need a call and are still filled.
+$IdentityBudgetMs = 25000
+# CALL DEADLINE: the budget above gates only LATER GetOwner calls, so each synchronous call (the GPU Engine read, every Win32_Process query, every GetOwner) also has a deadline of its own.
+# Each runs in a WORKER RUNSPACE and is abandoned after this many ms: a GPU read becomes gpu_status `timeout: ...`, a GetOwner becomes owner_status `timeout`, the script-slot check
+# leaves every unanswered path script_check `timeout`, a Win32_Process query becomes identity = { schema, error } (the same typed degradation as any other identity failure). The
+# measured samples, top and every v2 figure are read BEFORE any of this and never change.
+# Worst case: GPU + 3 queries + the script check + the budget-gated GetOwner calls + one more = 5 x 5 s + 25 s + 5 s = 55 s on top of the 24 s sample window, inside the 120 s
+# submission timeout. A worker thread stuck in a native call is a FOREGROUND thread, so the job ends with [Environment]::Exit after its line is written when any call was abandoned.
+# $IdentityWorkerPrelude is PowerShell run once in each new worker (empty in production): the workers are separate runspaces, so it is the seam a test uses to re-declare its shadows there.
+# $IdentityScriptCheckDelayMs is a TEST SEAM (0 in production; only a test rewrites this literal in its own copy of the job): the worker sleeps that long before each path's
+# metadata reads, standing in for a slow or dead volume. Nothing on the host (no environment variable, no file) can set it.
+$IdentityCallMs = 5000
+$IdentityWorkerPrelude = ''
+$IdentityScriptCheckDelayMs = 0
+$identitySchema = 'mlv-app/venue-quiet-probe-identity/v1'
+# the pinned project table: first match wins, case-insensitive substring on the UNREDACTED command line + executable path (held in memory only; only the name is emitted)
+$identityProjects = @(
+    @('\mlvtmp\', 'mlv-app'), @('\mlv-agent\', 'mlv-app'), @('MLV-App', 'mlv-app'), @('ultra-magnus-agent', 'mlv-app'), @('um-run', 'mlv-app'),
+    @('agent-bridge', 'agent-bridge'), @('Adobe Document Cloud Ingester', 'adobe-ingester'), @('softwarefactory-fleet-doctrine', 'fleet-doctrine'),
+    @('AdversarialLLM', 'adversarialllm'), @('VIRTUAL-TEN', 'virtual-ten'), @('AirMyPC', 'airmypc')
+)
+# REDACTION IS AN ALLOWLIST (r5): NO ARGUMENT TEXT IS PERSISTED. The r4 token denylist still leaked (`--signature x`, `?sig=x`, `-u user:x`, and a quoted value promoted to the
+# script slot), so no argument text is kept on ANY line, whatever the line holds:
+#   1. cmdline = `<exe> args=<n> script=<path|<none>>` and nothing else. exe is ExecutablePath, else the process image Name (both come from the OS, never from the argument text),
+#      else <unknown-exe>; n counts the arguments after argv[0] (Windows argv rules, Split-IdentArgv).
+#   2. script comes ONLY from the FIRST argument after the executable, never a later one (for pwsh / powershell whose first argument is a literal -File, the argument after it: the
+#      one host switch whose next argument is a script by definition). It is filled only when that argument is a drive-rooted path (so it starts with neither '-' nor '/'; a
+#      relative path cannot be checked, the working directory is not collected) holding no whitespace, '=', '@', '?', '#', quote or ':' past the drive letter, ending in
+#      .ps1 .psm1 .py .js .mjs .cmd .bat, on a FIXED local drive, reached through NO reparse point, and naming a file that EXISTS on this host. The text test runs here; every
+#      filesystem call runs in the bounded worker (Test-IdentScriptPaths; nothing is written). Otherwise <none>, and script_check says why.
+#      r7: the text test also rejects a '.' or '..' segment, any '/', a doubled '\' after the drive root, a trailing separator, a \\?\ or \\.\ prefix and an 8.3 '~<digit>'
+#      name, and what is persisted is the WORKER's validated full path, only when it equals the slot text case-insensitively: the slot text itself is never persisted.
+#   3. the row's `script` field is that same path or null; then the 200-character cap. The token scan survives ONLY as the diagnostic integer cmdline_token_hits and gates
+#      nothing. Project attribution reads the unredacted line in memory only (Get-IdentProject) and emits a table name, never text.
+$identSecretTokens = @('pass', 'pwd', 'pw', 'secret', 'token', 'key', 'auth', 'credential', 'bearer', 'cookie', 'session')
+$identSecretShapes = '(?i)[a-z][a-z0-9+.-]*://[^/@\s]+@|(?:sk-|ghp_|gho_|ghs_|github_pat_|xox[abps]-|AKIA)[A-Za-z0-9_-]{10,}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.|[A-Za-z0-9+/=]{40,}|(?-i:(?<![\w-])-p)'
+# diagnostic only: how many of the tokens and shapes the RAW line holds (case-insensitive substring scan). It decides nothing about what is written.
+function Measure-IdentTokenHits($Text) {
+    $s = [string]$Text; $n = 0
+    foreach ($t in $identSecretTokens) { if ($s.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $n++ } }
+    $n + [regex]::Matches($s, $identSecretShapes).Count
+}
+# the 200-character cap for a path or a name (no rule rewrites it): { text, truncated }
+function Limit-IdentText($Text) {
+    if ($null -eq $Text) { return [pscustomobject]@{ text = $null; truncated = 0 } }
+    $s = [string]$Text; $cut = 0
+    if ($s.Length -gt 200) { $cut = $s.Length - 200; $s = $s.Substring(0, 200) + "...[+$cut]" }
+    [pscustomobject]@{ text = $s; truncated = $cut }
+}
+# Windows argv rules (CommandLineToArgvW): argv[0] runs to the next quote when quoted, else to whitespace; later arguments honour 2n / 2n+1 backslashes before a quote and "" inside
+# quotes. Returns { argv, rest } where rest is the raw text after argv[0] (held in memory; never persisted).
+function Split-IdentArgv([string]$s) {
+    $argv = New-Object System.Collections.Generic.List[string]
+    $q = [char]34; $bsl = [char]92; $i = 0; $n = $s.Length
+    while ($i -lt $n -and [char]::IsWhiteSpace($s[$i])) { $i++ }
+    $sb = New-Object Text.StringBuilder
+    if ($i -lt $n -and $s[$i] -eq $q) { $i++; while ($i -lt $n -and $s[$i] -ne $q) { [void]$sb.Append($s[$i]); $i++ }; if ($i -lt $n) { $i++ } }
+    else { while ($i -lt $n -and -not [char]::IsWhiteSpace($s[$i])) { [void]$sb.Append($s[$i]); $i++ } }
+    $argv.Add($sb.ToString())
+    $rest = $s.Substring($i).Trim()
+    while ($true) {
+        while ($i -lt $n -and [char]::IsWhiteSpace($s[$i])) { $i++ }
+        if ($i -ge $n) { break }
+        $sb = New-Object Text.StringBuilder; $inQ = $false
+        while ($i -lt $n) {
+            $c = $s[$i]
+            if (-not $inQ -and [char]::IsWhiteSpace($c)) { break }
+            if ($c -eq $bsl) {
+                $nb = 0; while ($i -lt $n -and $s[$i] -eq $bsl) { $nb++; $i++ }
+                if ($i -lt $n -and $s[$i] -eq $q) { [void]$sb.Append($bsl, [int][math]::Floor($nb / 2)); if ($nb % 2 -eq 1) { [void]$sb.Append($q); $i++ } }
+                else { [void]$sb.Append($bsl, $nb) }
+                continue
+            }
+            if ($c -eq $q) {
+                if ($inQ -and $i + 1 -lt $n -and $s[$i + 1] -eq $q) { [void]$sb.Append($q); $i += 2; continue }
+                $inQ = -not $inQ; $i++; continue
+            }
+            [void]$sb.Append($c); $i++
+        }
+        $argv.Add($sb.ToString())
+    }
+    [pscustomobject]@{ argv = $argv.ToArray(); rest = $rest }
+}
+# rule 2 above, as text: drive-rooted, no whitespace = @ ? # quote or ':' past the drive letter, one of the seven script extensions
+$identScriptShape = '(?i)^[a-z]:[\\/][^\s=@?#:"''*<>|]+\.(?:ps1|psm1|py|js|mjs|cmd|bat)$'
+# the same, NOT drive-rooted (no drive letter, so no ':' at all): a relative path (the working directory is not collected) or, with a leading '\\' or '//', a UNC path
+$identScriptRelShape = '(?i)^[^\s=@?#:"''*<>|-][^\s=@?#:"''*<>|]*\.(?:ps1|psm1|py|js|mjs|cmd|bat)$'
+# r7: spellings that name a file other than the text (GetFullPath would rewrite them), each rejected before any worker call: a \\?\ or \\.\ prefix, any '/', a '.' or '..'
+# segment, a doubled '\' after the drive root, a trailing separator, an 8.3 short name ('~' then a digit)
+$identScriptGhostShape = '^[\\/]{2}[?.][\\/]|/|(?:^|\\)\.{1,2}(?:\\|$)|^[A-Za-z]:.*\\\\|[\\/]$|~[0-9]'
+# rule 2 as TEXT ONLY (no filesystem call here): ONLY the first argument after the executable (or, for pwsh / powershell, the one after a first-slot -File), never a later one.
+# Returns { path, check }: path is the candidate the bounded worker must check (check $null), else path is $null and check is final: rejected (no slot argument, or its text fails
+# the allowlist or matches a ghost shape), relative, or nonfixed (a UNC path is never a fixed local drive, so it is never touched).
+function Get-IdentScriptSlot($Argv, [string]$ExeLeaf) {
+    $j = 1
+    if ($ExeLeaf -match '(?i)^(pwsh|powershell)(\.exe)?$' -and $Argv.Count -gt 2 -and [string]$Argv[1] -ieq '-File') { $j = 2 }
+    if ($Argv.Count -le $j) { return @{ path = $null; check = 'rejected' } }
+    $p = [string]$Argv[$j]
+    if ($p -match $identScriptGhostShape) { return @{ path = $null; check = 'rejected' } }
+    if ($p -match $identScriptShape) { return @{ path = $p; check = $null } }
+    if ($p -match $identScriptRelShape) { return @{ path = $null; check = $(if ($p -match '^[\\/]{2}') { 'nonfixed' } else { 'relative' }) } }
+    @{ path = $null; check = 'rejected' }
+}
+# argv, exe and the rule-2 slot of one command line, as text
+function Read-IdentCmdLine($CmdLine, $ExePath, $ImageName) {
+    $argv = @((Split-IdentArgv ([string]$CmdLine)).argv)
+    $exe = $(if (-not [string]::IsNullOrEmpty([string]$ExePath)) { [string]$ExePath } elseif (-not [string]::IsNullOrEmpty([string]$ImageName)) { [string]$ImageName } else { '<unknown-exe>' })
+    $leaf = $(if ($exe -cne '<unknown-exe>') { $exe } else { [string]$argv[0] }) -replace '^.*[\\/]', ''
+    [pscustomobject]@{ argv = $argv; exe = $exe; slot = (Get-IdentScriptSlot $argv $leaf) }
+}
+# the persisted command line (contract above): { text, script, script_check, redactions, truncated, args, token_hits }. No argument text reaches `text` except the rule-2 script
+# path, and only when the worker's check of it ($ScriptChecks: path -> { check, full }, from Test-IdentScriptPaths) is ok; a candidate the worker never answered is error.
+# r7: the slot text is only a lookup key and a comparand here. What is persisted is the worker's validated full path, and only when it equals the slot text case-insensitively.
+function Protect-IdentCmdLine($CmdLine, $ExePath, $ImageName, $ScriptChecks) {
+    $raw = [string]$CmdLine
+    $rc = Read-IdentCmdLine $raw $ExePath $ImageName
+    $check = $rc.slot.check; $script = $null
+    if ($null -eq $check) {
+        $v = $(if ($null -ne $ScriptChecks -and $ScriptChecks.ContainsKey($rc.slot.path)) { $ScriptChecks[$rc.slot.path] } else { $null })
+        $check = $(if ($null -ne $v) { [string]$v.check } else { 'error' })
+        if ($check -ceq 'ok') { if ([string]$v.full -ieq $rc.slot.path) { $script = [string]$v.full } else { $check = 'rejected' } }
+    }
+    $nArgs = $rc.argv.Count - 1
+    $lim = Limit-IdentText ("$($rc.exe) args=$nArgs script=" + $(if ($script) { $script } else { '<none>' }))
+    [pscustomobject]@{
+        text = $lim.text; script = $(if ($script) { (Limit-IdentText $script).text } else { $null }); script_check = $check; redactions = $nArgs - $(if ($script) { 1 } else { 0 })
+        truncated = $lim.truncated; args = $nArgs; token_hits = (Measure-IdentTokenHits $raw)
+    }
+}
+function Get-IdentProject($Row) {
+    if ($null -eq $Row) { return $null }
+    $t = "$($Row.CommandLine) $($Row.ExecutablePath)"
+    foreach ($e in $identityProjects) { if ($t.IndexOf($e[0], [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $e[1] } }
+    $null
+}
+# The three bounded calls, as the text each worker runs ($args[0] is the call's one argument). Each returns { ok, v, msg } and never throws.
+$IdentGpuScript = {
+    try { [pscustomobject]@{ ok = $true; v = @((Get-Counter -Counter '\GPU Engine(*)\Utilization Percentage' -MaxSamples 1 -ErrorAction SilentlyContinue).CounterSamples | Where-Object { $null -ne $_ }); msg = $null } }
+    catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
+}.ToString()
+$IdentCimScript = {
+    try { [pscustomobject]@{ ok = $true; v = @(Get-CimInstance -ClassName Win32_Process -Filter $args[0] -ErrorAction Stop); msg = $null } }
+    catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
+}.ToString()
+$IdentOwnerScript = {
+    try { $o = Invoke-CimMethod -InputObject $args[0] -MethodName GetOwner -ErrorAction Stop; [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ ReturnValue = [int]$o.ReturnValue; Domain = [string]$o.Domain; User = [string]$o.User }; msg = $null } }
+    catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
+}.ToString()
+# The script-slot check: the ONLY place a script candidate touches the filesystem. $args[0] = the candidate paths, $args[1] = a synchronized table it fills
+# path -> { check, full } AS IT GOES (so a deadline keeps what was already answered), $args[2] = the test seam delay. Per path: the full path must equal the candidate
+# case-insensitively (r7: GetFullPath expands 8.3 names, so it runs here; else rejected), the drive must be Fixed (else nonfixed); then each component from the drive root to
+# the file has its attributes read ONCE (a GetAttributes call does not follow the component it names): a ReparsePoint stops the walk unfollowed (reparse), a missing
+# component, a non-directory before the end or a directory at the end is notfound, anything else that throws is error. full is the validated path, set only for ok.
+$IdentScriptCheckScript = {
+    $paths = @($args[0]); $out = $args[1]; $delayMs = [int]$args[2]
+    try {
+        foreach ($p in $paths) {
+            $r = 'error'; $full = $null
+            try {
+                if ($delayMs -gt 0) { [Threading.Thread]::Sleep($delayMs) }
+                $full = [IO.Path]::GetFullPath([string]$p)
+                if ($full -notmatch '^[A-Za-z]:\\' -or $full -ine [string]$p) { $r = 'rejected' }
+                elseif (([IO.DriveInfo]::new($full.Substring(0, 1))).DriveType -ne [IO.DriveType]::Fixed) { $r = 'nonfixed' }
+                else {
+                    $parts = @($full.Substring(3).Split([char[]]@('\'), [StringSplitOptions]::RemoveEmptyEntries))
+                    $r = $(if ($parts.Count -gt 0) { 'ok' } else { 'notfound' })
+                    $cur = $full.Substring(0, 2)
+                    for ($i = 0; $i -lt $parts.Count; $i++) {
+                        $cur = $cur + '\' + $parts[$i]
+                        try { $a = [IO.File]::GetAttributes($cur) } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { $r = 'notfound'; break }
+                        if ($a -band [IO.FileAttributes]::ReparsePoint) { $r = 'reparse'; break }
+                        if ([bool]($a -band [IO.FileAttributes]::Directory) -ne ($i -lt $parts.Count - 1)) { $r = 'notfound'; break }
+                    }
+                }
+            } catch { $r = 'error' }
+            $out[[string]$p] = @{ check = $r; full = $(if ($r -ceq 'ok') { $full } else { $null }) }
+        }
+        [pscustomobject]@{ ok = $true; v = $null; msg = $null }
+    } catch { [pscustomobject]@{ ok = $false; v = $null; msg = [string]$_.Exception.Message } }
+}.ToString()
+$script:IdentRs = $null
+$script:IdentAbandoned = 0
+function Get-IdentWorker {
+    if ($null -eq $script:IdentRs) {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.Open()
+        if ($IdentityWorkerPrelude) { $pp = [powershell]::Create(); try { $pp.Runspace = $rs; [void]$pp.AddScript($IdentityWorkerPrelude); [void]$pp.Invoke() } finally { $pp.Dispose() } }
+        $script:IdentRs = $rs
+    }
+    $script:IdentRs
+}
+# one call with a deadline of its own: { timeout, ok, v, msg }. A call past the deadline is ABANDONED (its worker is left to die with the process and the next call gets a fresh one).
+function Invoke-IdentBounded([string]$Script, [object[]]$ArgList, [int]$TimeoutMs) {
+    $ps = [powershell]::Create()
+    try {
+        $ps.Runspace = Get-IdentWorker
+        [void]$ps.AddScript($Script)
+        foreach ($a in $ArgList) { [void]$ps.AddArgument($a) }
+        $ar = $ps.BeginInvoke()
+        if (-not $ar.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+            $script:IdentRs = $null; $script:IdentAbandoned++
+            try { [void]$ps.BeginStop($null, $null) } catch { }
+            $ps = $null
+            return [pscustomobject]@{ timeout = $true; ok = $false; v = $null; msg = "timed out after $TimeoutMs ms" }
+        }
+        $o = @($ps.EndInvoke($ar)) | Select-Object -Last 1
+        if ($null -eq $o) { return [pscustomobject]@{ timeout = $false; ok = $false; v = $null; msg = 'the worker returned nothing' } }
+        [pscustomobject]@{ timeout = $false; ok = [bool]$o.ok; v = $o.v; msg = [string]$o.msg }
+    } catch {
+        [pscustomobject]@{ timeout = $false; ok = $false; v = $null; msg = [string]$_.Exception.Message }
+    } finally { if ($null -ne $ps) { $ps.Dispose() } }
+}
+function Close-IdentWorker { if ($null -ne $script:IdentRs) { try { $script:IdentRs.Dispose() } catch { }; $script:IdentRs = $null } }
+# ONE WQL query for a set of pids (validated integers, so nothing but digits reaches the filter); never a full-table enumeration
+function Get-IdentCim($Ids) {
+    $h = @{}
+    $ids = @($Ids | ForEach-Object { [int64]$_ } | Sort-Object -Unique)
+    if ($ids.Count -eq 0) { return $h }
+    $filter = ($ids | ForEach-Object { "ProcessId=$_" }) -join ' OR '
+    $csw = [Diagnostics.Stopwatch]::StartNew()
+    try { $w = Invoke-IdentBounded $IdentCimScript @($filter) $IdentityCallMs } finally { $csw.Stop(); $script:IdentCimMs += $csw.ElapsedMilliseconds; $script:IdentCimQueries++ }
+    if ($w.timeout) { throw "Win32_Process query timed out after $IdentityCallMs ms" }
+    if (-not $w.ok) { throw [string]$w.msg }
+    foreach ($r in @($w.v)) { if ($null -ne $r) { $h["$([int64]$r.ProcessId)"] = $r } }
+    $h
+}
+function Get-IdentOwner($Row) {
+    $osw = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $w = Invoke-IdentBounded $IdentOwnerScript @($Row) $IdentityCallMs
+        if ($w.timeout) { return @{ owner = $null; status = 'timeout' } }
+        if (-not $w.ok) {
+            $msg = [string]$w.msg
+            if ($msg -match '(?i)access is denied|access denied|0x80041003') { return @{ owner = $null; status = 'access-denied' } }
+            if ($msg -match '(?i)not found|0x80041002|invalid object') { return @{ owner = $null; status = 'exited' } }
+            return @{ owner = $null; status = 'error-exception' }
+        }
+        $r = $w.v
+        $rv = [int]$r.ReturnValue
+        if ($rv -eq 0 -and -not [string]::IsNullOrEmpty([string]$r.User)) { return @{ owner = $(if ([string]$r.Domain) { "$($r.Domain)\$($r.User)" } else { [string]$r.User }); status = 'ok' } }
+        if ($rv -eq 2) { return @{ owner = $null; status = 'access-denied' } }
+        return @{ owner = $null; status = "error-$rv" }
+    } finally { $osw.Stop(); $script:IdentOwnerMs += $osw.ElapsedMilliseconds }
+}
+# ONE bounded worker call for every script candidate: path -> { check, full }. As the call returns or times out, the worker's table is copied ONCE under its lock (the lock its
+# writes take), and only that copy is read: an answer the abandoned worker writes after the copy is never seen. A path missing from the copy is timeout after a deadline, else
+# error (the worker failed before reaching it).
+function Test-IdentScriptPaths($Paths) {
+    $res = @{}
+    $ps = @($Paths | Where-Object { $_ } | ForEach-Object { [string]$_ } | Sort-Object -Unique)
+    if ($ps.Count -eq 0) { return $res }
+    $out = [hashtable]::Synchronized(@{})
+    $w = Invoke-IdentBounded $IdentScriptCheckScript @($ps, $out, $IdentityScriptCheckDelayMs) $IdentityCallMs
+    $got = @{}
+    [Threading.Monitor]::Enter($out.SyncRoot)
+    try { foreach ($k in @($out.Keys)) { $got[$k] = $out[$k] } } finally { [Threading.Monitor]::Exit($out.SyncRoot) }
+    foreach ($p in $ps) {
+        $v = $got[$p]
+        $res[$p] = $(if ($null -ne $v) { @{ check = [string]$v.check; full = $(if ($null -ne $v.full) { [string]$v.full } else { $null }) } } else { @{ check = $(if ($w.timeout) { 'timeout' } else { 'error' }); full = $null } })
+    }
+    $res
+}
+# parent / grandparent: no CIM row = exited; a parent that STARTED AFTER its child is a reused pid (never named); no parent pid or no dates to compare = none
+function Get-IdentAncestor($Child, $Cim) {
+    $none = @{ info = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }; row = $null }
+    if ($null -eq $Child) { return $none }
+    $ppid = [int64]0
+    try { $ppid = [int64]$Child.ParentProcessId } catch { }
+    if ($ppid -le 0 -or "$ppid" -ceq "$($Child.ProcessId)") { return $none }
+    $pr = $Cim["$ppid"]
+    if ($null -eq $pr) { return @{ info = [ordered]@{ pid = $ppid; name = $null; started_utc = $null; status = 'exited' }; row = $null } }
+    $cd = $Child.CreationDate; $pd = $pr.CreationDate
+    if ($null -eq $cd -or $null -eq $pd) { $none.info.pid = $ppid; return $none }
+    if ($pd.ToUniversalTime() -gt $cd.ToUniversalTime()) { return @{ info = [ordered]@{ pid = $ppid; name = $null; started_utc = $null; status = 'pid-reused' }; row = $null } }
+    $nm = (Limit-IdentText (([string]$pr.Name) -replace '(?i)\.exe$', '')).text
+    if (-not $nm) { $nm = 'unknown' }
+    @{ info = [ordered]@{ pid = $ppid; name = $nm; started_utc = $pd.ToUniversalTime().ToString('o'); status = 'ok' }; row = $pr }
+}
+$identity = $null
+try {
+    $idSw = [Diagnostics.Stopwatch]::StartNew()
+    $script:IdentCimMs = 0L; $script:IdentOwnerMs = 0L; $script:IdentCimQueries = 0
+    $identNotes = [ordered]@{}
+    $curId = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $probeUser = [string]$curId.Name
+    $elevated = [bool]([Security.Principal.WindowsPrincipal]::new($curId)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    # GPU: ONE read, kept out of $groups / $allPaths so the decision read above is untouched
+    $gpuMs = 0L; $gpuStatus = 'ok'; $gpuBest = @{}; $gpuTop = @()
+    if (-not $IdentityGpu) { $gpuStatus = $IdentityGpuDisabledWhy }
+    else {
+        $gsw = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $gw = Invoke-IdentBounded $IdentGpuScript @() $IdentityCallMs
+            if ($gw.timeout) { $gpuStatus = "timeout: GPU Engine read exceeded $IdentityCallMs ms" }
+            elseif (-not $gw.ok) { throw [string]$gw.msg }
+            else {
+                $gs = @($gw.v | Where-Object { $null -ne $_ })
+                $engSum = @{}; $engType = @{}; $gpuInstances = 0
+                foreach ($s in $gs) {
+                    $lp = ([string]$s.Path).ToLowerInvariant()
+                    if ($lp -notmatch '\(pid_(\d+)_luid_(0x[0-9a-f]+)_(0x[0-9a-f]+)_phys_(\d+)_eng_(\d+)_engtype_([^)]*)\)\\utilization percentage$') { continue }
+                    $gPid = $Matches[1]; $gEng = "$gPid|$($Matches[2])_$($Matches[3])_$($Matches[4])_$($Matches[5])"; $gType = $Matches[6]
+                    $gpuInstances++
+                    $gv = Get-GoodValue $s
+                    if ($null -eq $gv) { continue }
+                    $engSum[$gEng] = [double]$engSum[$gEng] + $gv; $engType[$gEng] = $gType
+                }
+                if ($gpuInstances -eq 0) { $gpuStatus = 'counter-unavailable: no GPU Engine instance' }
+                foreach ($e in $engSum.Keys) {
+                    $gPid = $e.Substring(0, $e.IndexOf('|'))
+                    if (-not $gpuBest.ContainsKey($gPid) -or $engSum[$e] -gt $gpuBest[$gPid].percent) { $gpuBest[$gPid] = @{ percent = $engSum[$e]; engtype = $engType[$e] } }
+                }
+                $gpuTop = @($gpuBest.Keys | Where-Object { $gpuBest[$_].percent -gt 0 } | Sort-Object @{ Expression = { $gpuBest[$_].percent }; Descending = $true }, @{ Expression = { [int64]$_ } } | Select-Object -First 3 | ForEach-Object { [int64]$_ })
+            }
+        } catch { $gpuStatus = 'counter-unavailable: ' + (([string]$_.Exception.Message) -replace '\s+', ' ') }
+        $gsw.Stop(); $gpuMs = $gsw.ElapsedMilliseconds
+    }
+    # targets: top, then top_processes (pid not null), then the top GPU pids; each row records where it came from
+    $targets = [ordered]@{}
+    $nameOf = @{}
+    foreach ($t in $top) { $targets["$($t.pid)"] = @('top'); $nameOf["$($t.pid)"] = [string]$t.name }
+    foreach ($t in $ranked) {
+        if ($null -eq $t.pid) { continue }
+        $k = "$($t.pid)"
+        if ($targets.Contains($k)) { $targets[$k] += 'top_processes' } else { $targets[$k] = @('top_processes') }
+        if (-not $nameOf.ContainsKey($k)) { $nameOf[$k] = ([string]$t.instance) -replace '#\d+$', '' }
+    }
+    foreach ($g in $gpuTop) { $k = "$g"; if ($targets.Contains($k)) { $targets[$k] += 'gpu_top' } else { $targets[$k] = @('gpu_top') } }
+    $cim = Get-IdentCim @($targets.Keys)
+    $parentIds = @($targets.Keys | Where-Object { $cim.ContainsKey($_) } | ForEach-Object { $a = Get-IdentAncestor $cim[$_] $cim; if ($a.info.pid) { $a.info.pid } } | Where-Object { -not $cim.ContainsKey("$_") })
+    $cim2 = Get-IdentCim $parentIds
+    foreach ($k in $cim2.Keys) { $cim[$k] = $cim2[$k] }
+    $gpIds = @($targets.Keys | Where-Object { $cim.ContainsKey($_) } | ForEach-Object {
+        $a = Get-IdentAncestor $cim[$_] $cim
+        if ($a.info.status -ceq 'ok') { $a2 = Get-IdentAncestor $a.row $cim; if ($a2.info.pid) { $a2.info.pid } }
+    } | Where-Object { -not $cim.ContainsKey("$_") })
+    $cim3 = Get-IdentCim $gpIds
+    foreach ($k in $cim3.Keys) { $cim[$k] = $cim3[$k] }
+    # the script slot of every target, checked in ONE bounded worker call before the rows are built: nothing below touches the filesystem for it
+    $scriptCands = @($targets.Keys | Where-Object { $cim.ContainsKey($_) -and -not [string]::IsNullOrEmpty([string]$cim[$_].CommandLine) } |
+        ForEach-Object { (Read-IdentCmdLine $cim[$_].CommandLine $cim[$_].ExecutablePath $cim[$_].Name).slot.path } | Where-Object { $_ })
+    $scriptChecks = Test-IdentScriptPaths $scriptCands
+    $procRows = @(); $ownerBad = 0; $cmdBad = 0; $scriptUnresolved = 0
+    foreach ($k in $targets.Keys) {
+        $snap = $after[[int]$k]
+        $row = $cim[$k]
+        $name = $nameOf[$k]
+        if (-not $name -and $null -ne $snap) { $name = [string]$snap[0] }
+        if (-not $name -and $null -ne $row) { $name = ([string]$row.Name) -replace '(?i)\.exe$', '' }
+        if (-not $name) { $name = 'unknown' }
+        $startCheck = 'unverified'; $startedUtc = $null
+        if ($null -ne $row -and $null -ne $row.CreationDate) {
+            $startedUtc = $row.CreationDate.ToUniversalTime().ToString('o')
+            if ($null -ne $snap -and $null -ne $snap[2]) {
+                $startCheck = $(if ([math]::Abs(($row.CreationDate.ToUniversalTime() - [datetime]::FromFileTimeUtc([int64]$snap[2])).TotalSeconds) -gt 1) { 'mismatch' } else { 'match' })
+            }
+        }
+        if ($startCheck -ceq 'mismatch') {
+            # the pid now belongs to a different process than the one sampled: no owner, command line or project, never another process's identity
+            $procRows += [ordered]@{ pid = [int64]$k; name = $name; start_check = 'mismatch' }
+            continue
+        }
+        $gpuPct = $null; $gpuEng = $null; $gpuRowStatus = $gpuStatus
+        if ($gpuStatus -ceq 'ok') {
+            if ($gpuBest.ContainsKey($k)) { $gpuPct = [math]::Round($gpuBest[$k].percent, 2); $gpuEng = [string]$gpuBest[$k].engtype; $gpuRowStatus = 'ok' }
+            else { $gpuPct = 0.0; $gpuRowStatus = 'no-gpu-context' }
+        }
+        if ($null -eq $row) {
+            $procRows += [ordered]@{
+                pid = [int64]$k; name = $name; source = @($targets[$k]); started_utc = $null; start_check = $startCheck
+                owner = $null; owner_status = 'exited'; cmdline = $null; cmdline_status = 'exited'; cmdline_redactions = 0; cmdline_truncated_chars = 0
+                cmdline_args = $null; args_redacted = $null; cmdline_token_hits = $null
+                exe = $null; exe_status = 'exited'; script = $null; script_check = $null; project = 'unknown'; project_from = 'none'
+                parent = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }; grandparent = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }
+                gpu_percent = $gpuPct; gpu_engtype = $gpuEng; gpu_status = $gpuRowStatus
+            }
+            $ownerBad++; $cmdBad++
+            continue
+        }
+        $own = $(if ($idSw.ElapsedMilliseconds -gt $IdentityBudgetMs) { @{ owner = $null; status = 'budget-exceeded' } } else { Get-IdentOwner $row })
+        if ($null -eq $own.owner) { $ownerBad++ }
+        $cmdText = $null; $cmdRed = 0; $cmdCut = 0; $cmdStatus = 'unreadable'; $cmdArgs = $null; $cmdArgsRed = $null; $cmdScript = $null; $cmdCheck = $null; $cmdHits = $null
+        if (-not [string]::IsNullOrEmpty([string]$row.CommandLine)) {
+            $pc = Protect-IdentCmdLine $row.CommandLine $row.ExecutablePath $row.Name $scriptChecks
+            $cmdText = $pc.text; $cmdRed = $pc.redactions; $cmdCut = $pc.truncated; $cmdArgs = $pc.args; $cmdArgsRed = 'all'; $cmdScript = $pc.script; $cmdCheck = $pc.script_check; $cmdHits = $pc.token_hits; $cmdStatus = 'ok'
+            if ($cmdCheck -ceq 'timeout' -or $cmdCheck -ceq 'error') { $scriptUnresolved++ }
+        } else { $cmdBad++ }
+        $exeText = $null; $exeStatus = 'unreadable'
+        if (-not [string]::IsNullOrEmpty([string]$row.ExecutablePath)) { $exeText = (Limit-IdentText $row.ExecutablePath).text; $exeStatus = 'ok' }
+        $par = Get-IdentAncestor $row $cim
+        $gpar = $(if ($par.info.status -ceq 'ok') { Get-IdentAncestor $par.row $cim } else { @{ info = [ordered]@{ pid = $null; name = $null; started_utc = $null; status = 'none' }; row = $null } })
+        $project = 'unknown'; $projectFrom = 'none'
+        $hit = Get-IdentProject $row
+        if ($hit) { $project = $hit; $projectFrom = 'self' }
+        elseif ($par.info.status -ceq 'ok' -and ($hit = Get-IdentProject $par.row)) { $project = $hit; $projectFrom = 'parent' }
+        elseif ($gpar.info.status -ceq 'ok' -and ($hit = Get-IdentProject $gpar.row)) { $project = $hit; $projectFrom = 'grandparent' }
+        $procRows += [ordered]@{
+            pid = [int64]$k; name = $name; source = @($targets[$k]); started_utc = $startedUtc; start_check = $startCheck
+            owner = $own.owner; owner_status = $own.status; cmdline = $cmdText; cmdline_status = $cmdStatus; cmdline_redactions = $cmdRed; cmdline_truncated_chars = $cmdCut
+            cmdline_args = $cmdArgs; args_redacted = $cmdArgsRed; cmdline_token_hits = $cmdHits
+            exe = $exeText; exe_status = $exeStatus; script = $cmdScript; script_check = $cmdCheck; project = $project; project_from = $projectFrom
+            parent = $par.info; grandparent = $gpar.info
+            gpu_percent = $gpuPct; gpu_engtype = $gpuEng; gpu_status = $gpuRowStatus
+        }
+    }
+    $identNotes['cim_queries'] = "$($script:IdentCimQueries) WQL queries for $($targets.Count) target pid(s) (bound: 3); GetOwner once per target"
+    if ($ownerBad -gt 0) { $identNotes['owner_unreadable'] = "$ownerBad of $($targets.Count) target(s) have no owner: see owner_status per row (a non-elevated probe cannot read other users' processes)" }
+    if ($cmdBad -gt 0) { $identNotes['cmdline_unreadable'] = "$cmdBad of $($targets.Count) target(s) have no command line: see cmdline_status per row" }
+    if ($scriptUnresolved -gt 0) { $identNotes['script_check_unresolved'] = "$scriptUnresolved of $($targets.Count) target(s) have script_check timeout or error: their script slot was not confirmed within $IdentityCallMs ms, so script is null" }
+    if ($script:IdentAbandoned -gt 0) { $identNotes['calls_abandoned'] = "$($script:IdentAbandoned) identity call(s) passed their $IdentityCallMs ms deadline and were abandoned: see the *_status fields" }
+    $idSw.Stop()
+    $identity = [ordered]@{
+        schema = $identitySchema; probe_user = $probeUser; elevated = $elevated; project_roots = 'r1'
+        gpu_basis = 'per-process max over GPU engines of summed \GPU Engine(*)\Utilization Percentage (0-100 of that engine)'
+        gpu_status = $gpuStatus
+    }
+    if ($IdentityGpu) { $identity['gpu_top'] = @($gpuTop) }
+    $identity['processes'] = @($procRows)
+    $identity['cost_ms'] = [ordered]@{ cim = [int64]$script:IdentCimMs; owner = [int64]$script:IdentOwnerMs; gpu = [int64]$gpuMs; total = [int64]$idSw.ElapsedMilliseconds }
+    $identity['notes'] = $identNotes
+} catch {
+    $identity = [ordered]@{ schema = $identitySchema; error = (([string]$_.Exception.Message) -replace '\s+', ' ') }
+} finally { Close-IdentWorker }
 Write-Output ('VENUE_QUIET=' + ([ordered]@{
     schema = 'mlv-app/venue-quiet-probe/v2'; host = $env:COMPUTERNAME; samples = $samples; top = $top
     cpu_count = $cpuCount
@@ -470,12 +936,71 @@ Write-Output ('VENUE_QUIET=' + ([ordered]@{
     core_topology = $(if ($topo.map.Count -gt 0) { 'logical-processor-information-ex' } else { 'unknown' })
     core_classes = $classAgg; cores = $cores
     notes = $notes
+    identity = $identity
 } | ConvertTo-Json -Compress -Depth 6))
+# an abandoned worker may still be inside a native call, and a runspace thread is a foreground thread: end the process now that the line is written
+if ($script:IdentAbandoned -gt 0) { [Console]::Out.Flush(); [Environment]::Exit(0) }
 '@
 
 # v2 attribution, printed AFTER the verdict and top lines so the gate log says what kept the venue busy. Display only: nothing here feeds the decision, and a
 # probe line that is not v2 (or whose v2 fields are malformed) prints nothing / one `attr` note and never changes the verdict or the exit code.
 function Format-Pct($v) { if ($null -eq $v) { 'n/a' } else { '{0:0.0}%' -f [double]$v } }
+
+# IDENTITY text (VENUE-PROBE-PROCESS-ATTRIBUTION-1), display only. A probe with no identity (v1, v2, malformed, a future schema) prints exactly what it printed before. Every value
+# written here has whitespace and commas replaced by '_' (the run-local drivers split top lines on whitespace and commas), and no command line is ever written to a text line.
+$identitySchemaV1 = 'mlv-app/venue-quiet-probe-identity/v1'
+function ConvertTo-IdentToken($v) { $s = [string]$v; if ([string]::IsNullOrEmpty($s)) { return 'n/a' }; $s -replace '[\s,]', '_' }
+# PURE: pid -> identity row for a probe that carries identity schema v1, else $null
+function Get-IdentityRowMap($Probe) {
+    try {
+        if ([string]$Probe.identity.schema -cne $identitySchemaV1) { return $null }
+        $map = @{}
+        foreach ($r in @($Probe.identity.processes)) { if ($null -ne $r -and $null -ne $r.pid) { $map["$($r.pid)"] = $r } }
+        return $map
+    } catch { return $null }
+}
+function Format-IdentOwner($Row) { if (-not [string]::IsNullOrEmpty([string]$Row.owner)) { ConvertTo-IdentToken $Row.owner } else { 'unreadable(' + (ConvertTo-IdentToken $Row.owner_status) + ')' } }
+function Format-IdentWhen($v) {
+    if ($null -eq $v) { return 'n/a' }
+    try {
+        $d = $(if ($v -is [datetime]) { $v.ToUniversalTime() } else { [datetime]::Parse([string]$v, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal) })
+        return $d.ToString('yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture)
+    } catch { return 'n/a' }
+}
+function Format-IdentAncestor($A) { if ($null -eq $A) { return 'n/a:n/a|none' }; '{0}:{1}|{2}' -f (ConvertTo-IdentToken $A.name), (ConvertTo-IdentToken $A.pid), (ConvertTo-IdentToken $A.status) }
+# r6: ` script_check=<value>` for a row that carries the field; a row from an older probe has none and prints exactly what it printed before
+function Format-IdentScriptCheck($Row) { if ($null -ne $Row.PSObject.Properties['script_check']) { ' script_check=' + (ConvertTo-IdentToken $Row.script_check) } else { '' } }
+# the suffix of a `top` line; $Full = $false is the shorter `attr proc` suffix (owner, project and script_check only)
+function Get-IdentSuffix($Row, [bool]$Full) {
+    if ($null -eq $Row) { return '' }
+    try {
+        if ([string]$Row.start_check -ceq 'mismatch') { return ' ident=pid-reused' }
+        $s = ' owner={0} project={1}' -f (Format-IdentOwner $Row), (ConvertTo-IdentToken $Row.project)
+        if ($Full) { $s += (' script={0}' -f (ConvertTo-IdentToken $Row.script)) + (Format-IdentScriptCheck $Row) + (' parent={0} gparent={1} started={2} gpu={3}' -f (Format-IdentAncestor $Row.parent), (Format-IdentAncestor $Row.grandparent), (Format-IdentWhen $Row.started_utc), (Format-Pct $Row.gpu_percent)) }
+        else { $s += Format-IdentScriptCheck $Row }
+        return $s
+    } catch { return '' }
+}
+function Write-IdentityLines($Probe) {
+    try {
+        $id = $Probe.identity
+        if ($null -eq $id -or [string]$id.schema -cne $identitySchemaV1) { return }
+        if ($null -ne $id.error) { Write-Gate ("  ident error {0}" -f ((([string]$id.error) -replace '\s+', ' '))); return }
+        $c = $id.cost_ms
+        Write-Gate ("  ident probe user={0} elevated={1} cost cim={2} owner={3} gpu={4} total={5}" -f (ConvertTo-IdentToken $id.probe_user), $(if ($id.elevated -eq $true) { 'true' } else { 'false' }), (ConvertTo-IdentToken $c.cim), (ConvertTo-IdentToken $c.owner), (ConvertTo-IdentToken $c.gpu), (ConvertTo-IdentToken $c.total))
+        $map = Get-IdentityRowMap $Probe
+        $inTop = @{}; foreach ($t in @($Probe.top)) { if ($null -ne $t.pid) { $inTop["$($t.pid)"] = $true } }
+        foreach ($g in @($id.gpu_top)) {
+            $k = "$g"
+            if ($inTop.ContainsKey($k)) { continue }
+            $row = $(if ($null -ne $map -and $map.ContainsKey($k)) { $map[$k] } else { $null })
+            if ($null -eq $row) { Write-Gate ("  ident gpu n/a pid={0}" -f (ConvertTo-IdentToken $g)); continue }
+            if ([string]$row.start_check -ceq 'mismatch') { Write-Gate ("  ident gpu {0} pid={1} ident=pid-reused" -f (ConvertTo-IdentToken $row.name), (ConvertTo-IdentToken $row.pid)); continue }
+            Write-Gate (("  ident gpu {0} pid={1} gpu={2} engtype={3} owner={4} project={5}" -f (ConvertTo-IdentToken $row.name), (ConvertTo-IdentToken $row.pid), (Format-Pct $row.gpu_percent), (ConvertTo-IdentToken $row.gpu_engtype), (Format-IdentOwner $row), (ConvertTo-IdentToken $row.project)) + (Format-IdentScriptCheck $row))
+        }
+        foreach ($n in @($id.notes.PSObject.Properties)) { Write-Gate ("  ident note {0}: {1}" -f $n.Name, $n.Value) }
+    } catch { Write-Gate ("  ident UNPRINTABLE {0}" -f $_.Exception.Message) }
+}
 function Write-AttributionLines($Probe) {
     if ([string]$Probe.schema -cne 'mlv-app/venue-quiet-probe/v2') { return }
     try {
@@ -483,7 +1008,8 @@ function Write-AttributionLines($Probe) {
         Write-Gate ("  attr cpus={0} processor total={1} privileged={2} user={3} dpc={4} interrupt={5}" -f $Probe.cpu_count, (Format-Pct $pr.total_percent), (Format-Pct $pr.privileged_percent), (Format-Pct $pr.user_percent), (Format-Pct $pr.dpc_percent), (Format-Pct $pr.interrupt_percent))
         Write-Gate ("  attr process total={0} idle={1} system={2} attributed={3}" -f (Format-Pct $Probe.process_total_percent), (Format-Pct $Probe.idle_percent), (Format-Pct $Probe.system_percent), (Format-Pct $Probe.attributed_percent))
         Write-Gate ("  attr gap processorTotal={0} processActive={1} attributed={2} unattributedKernel={3} gap={4}" -f (Format-Pct $pr.total_percent), (Format-Pct $Probe.process_active_percent), (Format-Pct $Probe.attributed_percent), (Format-Pct $Probe.unattributed_kernel_percent), $(if ($null -eq $Probe.attribution_gap_points) { 'n/a' } else { '{0:0.0} points' -f [double]$Probe.attribution_gap_points }))
-        foreach ($p in @($Probe.top_processes)) { Write-Gate ("  attr proc {0} pid={1} pct={2}{3}" -f $p.instance, $(if ($null -eq $p.pid) { 'n/a' } else { $p.pid }), (Format-Pct $p.percent), $(if ($p.incomplete -eq $true) { " valid=$($p.validSamples)/$($p.totalSamples) incomplete" } else { '' })) }
+        $idMap = Get-IdentityRowMap $Probe
+        foreach ($p in @($Probe.top_processes)) { Write-Gate ("  attr proc {0} pid={1} pct={2}{3}{4}" -f $p.instance, $(if ($null -eq $p.pid) { 'n/a' } else { $p.pid }), (Format-Pct $p.percent), $(if ($p.incomplete -eq $true) { " valid=$($p.validSamples)/$($p.totalSamples) incomplete" } else { '' }), $(if ($null -ne $idMap -and $null -ne $p.pid -and $idMap.ContainsKey("$($p.pid)")) { Get-IdentSuffix $idMap["$($p.pid)"] $false } else { '' })) }
         $cls = @($Probe.core_classes.PSObject.Properties | ForEach-Object { "{0} n={1} mean={2} max={3}" -f $_.Name, $_.Value.count, (Format-Pct $_.Value.mean_percent), (Format-Pct $_.Value.max_percent) })
         Write-Gate ("  attr cores topology={0} {1}" -f $Probe.core_topology, $(if ($cls.Count) { $cls -join ' | ' } else { 'none' }))
         foreach ($n in @($Probe.notes.PSObject.Properties)) { Write-Gate ("  attr note {0}: {1}" -f $n.Name, $n.Value) }
@@ -560,6 +1086,8 @@ if ($last.decision.state -ceq 'UNKNOWN') {
 if ($null -ne $foreignFloor) { Write-Gate "FOREIGN_FLOOR owners=$($foreignFloor.owners -join ',') floorMean=$(Format-Mean $foreignFloor.floorMean) waitedSec=$([int]((Get-Date) - $t0).TotalSeconds) probes=$($foreignFloor.probes)" }
 $verdict = $(if ($last.decision.state -ceq 'QUIET') { 'QUIET' } else { 'COOLDOWN_UNMET' })
 Write-Gate "$verdict mean=$(Format-Mean $last.decision.mean) threshold=$ThresholdPercent% waitedSec=$([int]((Get-Date) - $t0).TotalSeconds)"
-if ($null -ne $last.probe) { foreach ($p in @($last.probe.top)) { Write-Gate ("  top {0} pid={1} cpuSeconds={2}" -f $p.name, $p.pid, $p.cpuSeconds) } }
+$topIdMap = $(if ($null -ne $last.probe) { Get-IdentityRowMap $last.probe } else { $null })
+if ($null -ne $last.probe) { foreach ($p in @($last.probe.top)) { Write-Gate (("  top {0} pid={1} cpuSeconds={2}" -f $p.name, $p.pid, $p.cpuSeconds) + $(if ($null -ne $topIdMap -and $null -ne $p.pid -and $topIdMap.ContainsKey("$($p.pid)")) { Get-IdentSuffix $topIdMap["$($p.pid)"] $true } else { '' })) } }
 if ($null -ne $last.probe) { Write-AttributionLines $last.probe }
+if ($null -ne $last.probe) { Write-IdentityLines $last.probe }
 exit 0
