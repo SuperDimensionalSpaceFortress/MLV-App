@@ -12,7 +12,7 @@ Only rows with `kind` of `product` or `playback` are shown. Hub-tooling, factory
 hygiene and ci-flake cards are tooling churn and are not counted here. Rows the board has
 not classified are not counted either, even when the card name says PLAYBACK.
 
-generated_from: 2026-10-23T17:21:52Z
+generated_from: 2026-10-25T00:11:28Z
 
 ## Open product and playback cards
 
@@ -23,12 +23,12 @@ generated_from: 2026-10-23T17:21:52Z
 | 1 | CPU-SCOPE-PLAYSTOP-LIFETIME-HARDENING-1 | product | pr-open | 2026-10-15 | - |
 | 1 | PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1 | product | queued | 2026-10-15 | - |
 | 1 | HFR-NATIVE-D4-HEAD-VISUAL-CELLS-1 | product | queued | 2026-10-16 | - |
-| 1 | POSTMERGE-IMPROVEMENTS-449-452-453-460-1 | product | queued | 2026-10-16 | - |
 | 1 | PR493-CONTROL-ARM-QUIET-AB-1 | product | queued | 2026-10-21 | ORDER-20261021T111948Z #3 after BACHELOR-FS-CUDA-QUIET-LEGS-1 |
 | 1 | CPU-LOOKASSIST-PLAYBACK-COST-1 | product | queued | 2026-10-21 | - |
 | 1 | CPU-DUALISO-PREVIEW-SCALE-VERIFY-1 | product | queued | 2026-10-21 | - |
-| 1 | PROCESSED8-MS-TELEMETRY-STUCK-1-VENUE-LEG | product | declared | 2026-10-21 | - |
-| 1 | CPU-17V9-FPS-GAP-AB-1 | product | running | 2026-10-22 | - |
+| 1 | BACHELOR-CORE-PARTITION-AB-1 | product | queued | 2026-10-23 | - |
+| 1 | PROCESSED8-MS-TELEMETRY-STUCK-1-VENUE-LEG | product | declared | 2026-10-24 | - |
+| 1 | CPU-17V9-FPS-GAP-AB-1 | product | declared | 2026-10-24 | - |
 | 2 | PLAYBACK-GL-PRESENT-BACKLOG-1 | product | declared | 2026-10-09 | ORDER-20261008T151800Z #2 after PLAYBACK-GL-PRESENT-SETUP-STALL-1 |
 | 2 | PLAYBACK-GPU-SCOPES-NO-VETO-1 | product | pr-open | 2026-10-15 | - |
 | 2 | PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1 | product | pr-open | 2026-10-15 | - |
@@ -38,7 +38,8 @@ generated_from: 2026-10-23T17:21:52Z
 | 3 | HFR-NATIVE-60FPS-FULLRES-1 | product | pr-open | 2026-10-12 | ORDER-20261014T015628Z #3 after HFR-NATIVE-M16-1457-TIMEBUDGET-1 |
 | 3 | PLAYBACK-HFR-CONFORM-DEFAULT-1 | product | declared | 2026-10-15 | - |
 | 3 | WARM-RUN-CHROMA-SMOOTH-PARITY-1 | product | pr-open | 2026-10-18 | - |
-| 3 | BACHELOR-CORE-PARTITION-AB-1 | product | queued | 2026-10-23 | - |
+| 4 | MAC-LINUX-BUILD-RESTORE-1 | product | queued | 2026-10-25 | - |
+| 5 | CPU-SIMD-CLANG-X86-ENABLE-1 | product | queued | 2026-10-25 | - |
 | 6 | PREP-WORKER-HL-RECON-REFUSAL-FIXTURE-1 | product | queued | 2026-10-07 | - |
 | 6 | C1-PARITY-TESTS-SKIP-WHEN-UNSET-1 | product | queued | 2026-10-09 | - |
 | 6 | PREP-TIER1-FROZEN-ORACLE-1 | product | queued | 2026-10-09 | - |
@@ -55,21 +56,21 @@ generated_from: 2026-10-23T17:21:52Z
 
 ## Drain
 
-product+playback open: 34
+product+playback open: 35
 
-Window: the 7 UTC days ending 2026-10-23 (the last day is partial).
+Window: the 7 UTC days ending 2026-10-25 (the last day is partial).
 Landed = merged rows by `merged_utc` when the row has one, else by the newest stamp (approximate: a lower bound on the merge time, not a measurement); queued = rows of any state by `source_ledger_stamp`.
 
 | day (UTC) | landed | queued |
 |---|---|---|
-| 2026-10-17 | 3 | 7 |
-| 2026-10-18 | 4 | 4 |
 | 2026-10-19 | 1 | 12 |
 | 2026-10-20 | 2 | 3 |
-| 2026-10-21 | 3 | 15 |
-| 2026-10-22 | 4 | 4 |
+| 2026-10-21 | 3 | 14 |
+| 2026-10-22 | 4 | 3 |
 | 2026-10-23 | 4 | 3 |
-| total | 21 | 48 |
+| 2026-10-24 | 0 | 2 |
+| 2026-10-25 | 0 | 6 |
+| total | 14 | 43 |
 
 does not drain (queued >= landed)
 
@@ -108,3 +109,7 @@ does not drain (queued >= landed)
 - M16-CAST-PROBES-SALVAGE-1 (P4): D13(d) HUB-TICK 20261013T0714Z: measure-only salvage, colour goal closed 2026-10-08; P6 backlog when idle
 - GPU-FIELD-TELEMETRY-COLLECTION-AND-BATCH-1 (P4): waits for #409 to merge (hardening on its code); unpark the tick #409 MERGED is observed
 - PR493-CLIP-OPEN-ABORT-HARDENING-1 (P4): waits for #493 (CPU-SCOPE-PLAYSTOP-LIFETIME-HARDENING-1) to merge: its cited lines exist only on #493 head 421c4aad; re-queue at P3 the t...
+- MAC-MINI-BUILD-HOST-1 (P4): owner chat e7cff0a2: needs the Mac mini ssh host alias + an authorized key for this machine (refused 2026-10-24 for ultra-magnus, 10.0.0....
+- CPU-NEON-HOT-KERNELS-1 (P5): owner chat e7cff0a2: waits for MAC-MINI-BUILD-HOST-1 (needs an Apple Silicon venue to measure)
+- GPU-PORTABLE-BACKEND-RHI-1 (P5): owner chat e7cff0a2: OWNER sequencing -- after the CUDA speedup work is complete; unpark then
+- GPU-METAL-BACKEND-1 (P6): owner chat e7cff0a2: after GPU-PORTABLE-BACKEND-RHI-1 is measured on the Mac mini
