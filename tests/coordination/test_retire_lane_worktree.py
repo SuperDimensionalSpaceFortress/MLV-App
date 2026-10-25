@@ -3086,7 +3086,7 @@ UNRESOLVED_EXECUTED_SITES = {
     "tools/profiling/dual-venue/Summarize-VenueBusyProbes.ps1": [
         (". ([scriptblock]::Create($fn[0].Extent.Text))",
          "r4 (from #661): dot-sources the text of the one FunctionDefinitionAst named Get-VenueQuietDecision (-ceq, exactly one) parsed "
-         "from -DecisionSource, which defaults to the tracked Wait-VenueQuiet.ps1 beside it (:42); that pure function (:134-148) is scanned "
+         "from -DecisionSource, which defaults to the tracked Wait-VenueQuiet.ps1 beside it (:42); that pure function (:140-154) is scanned "
          "in its own file. Dot-sourcing a definition only defines the function, which is then called in-process at :118"),
     ],
     "tools/profiling/dual-venue/VenueChain.psm1": [
@@ -3113,12 +3113,19 @@ UNRESOLVED_EXECUTED_SITES = {
     ],
     "tools/profiling/dual-venue/Wait-VenueQuiet.ps1": [
         ("[void]$pp.AddScript($IdentityWorkerPrelude)",
-         "r4 rule V: $IdentityWorkerPrelude is assigned '' at script scope (:516) and read inside Get-IdentWorker, another scope. Empty in "
+         "r4 rule V: $IdentityWorkerPrelude is assigned '' at script scope (:733) and read inside Get-IdentWorker, another scope. Empty in "
          "production (and guarded by `if ($IdentityWorkerPrelude)`); only test_dual_venue_evidence.py rewrites that literal in its own "
          "copy, to re-declare command shadows in the in-process identity worker runspace"),
         ("[void]$ps.AddScript($Script)",
          "r4 (from #633): Invoke-IdentBounded runs one identity read on its worker runspace; its four callers pass $IdentCimScript, "
-         "$IdentOwnerScript, $IdentScriptCheckScript or $IdentGpuScript, each a { } literal's .ToString() (:640-683) that the AST scans as code"),
+         "$IdentOwnerScript, $IdentScriptCheckScript or $IdentGpuScript, each a { } literal's .ToString() (:857-900) that the AST scans as code"),
+        ("[void]$pp.AddScript($TelemetryWorkerPrelude)",
+         "VENUE-PROBE-HEAT-GPU-TELEMETRY-1: $TelemetryWorkerPrelude is assigned '' at script scope (:527) and read inside Invoke-TelBounded, "
+         "another scope. Empty in production (and guarded by `if ($TelemetryWorkerPrelude)`); only test_dual_venue_evidence.py rewrites that "
+         "literal in its own copy, to declare Get-PnpDevice / Get-PnpDeviceProperty / nvidia-smi shadows in the telemetry worker runspace"),
+        ("[void]$ps.AddScript($Script)",
+         "VENUE-PROBE-HEAT-GPU-TELEMETRY-1: Invoke-TelBounded runs one telemetry read on its worker runspace; its four callers pass "
+         "$TelTailScript (twice), $TelGpuStateScript or $TelSmiScript, each a { } literal's .ToString() (:530-563) that the AST scans as code"),
     ],
     "tools/profiling/ultramagnus/playback-attr-3-cuda-dll-job.ps1": [
         ("-Command $reconCommand",

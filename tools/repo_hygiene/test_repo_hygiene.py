@@ -1462,6 +1462,9 @@ class RepoHygieneTests(unittest.TestCase):
             "tests\\docs",
         ):
             self.assertIn(path, tokens)
+        # STUCK-QUEUE-HANG-AND-CI-REVERT-1 r4: the stuck-queue suite stays collected in this step
+        # (hosted CI); the r2 assertNotIn that pinned its removal is reversed.
+        # No local-only exemption exists for it in test_ci_collects_every_test.py.
 
     def test_product_oracles_are_split_into_parts_behind_the_required_name(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")

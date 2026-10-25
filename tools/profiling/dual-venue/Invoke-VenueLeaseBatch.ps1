@@ -29,7 +29,13 @@
 #   5. RECEIPTS. <RunDir>\batch-<nn>.json and one line per batch in <RunDir>\batches.jsonl (mlv-app/venue-lease-batch/v1): token, lease id, held, start and
 #      end, the open's wait and refusals, legs attempted / ran / counted, retries (probe and leg re-check), the end reason, the per-leg rows and the agent's
 #      receipt. <RunDir>\batch.log has one line per event, UTC stamp first; the last stdout line is LEASE_BATCH_RESULT=<json>.
-#   6. CAPS (r2; Bachelor's heavy-slot.py, read from heavy-slot.lease.json, CAPS-ADDENDUM 2026-10-23; each one binding):
+#   6. CAPS (r2; Bachelor's heavy-slot.py, read from heavy-slot.lease.json, CAPS-ADDENDUM 2026-10-23; each one binding). The figures below (45 / 30 / 50 %) are the
+#      defaults: at run start ONE exempt light job (venue-quiet-probe-caps-<stamp>, no lease) prints C:\Users\layib\.claude\ops\heavy-slot.lease.json and the run takes
+#      cooldown = cooldown_minutes*60, budget = max_fraction_per_3h*10800 and lease cap = min(2700, max_minutes*60) from it (capsSource=live in the receipts and the CAPS
+#      line of batch.log). Unreadable or invalid (heavy-slot.py's own rules) -> 1800 / 5400 / 2700 (capsSource=fallback). A caller can only tighten them (LEASE_CAP_RELAXED):
+#      r2 (CoS/Dot on affa0d1a): the budget is always fraction * the FIXED 10800 s, whatever -LeaseBudgetWindowSec is (a longer window only counts more earlier leases
+#      against it, a shorter one only shrinks it); a cooldown is kept exactly (2880 min = 172800 s), and one no int of seconds can hold is the fallback; the probe job id is
+#      venue-quiet-probe-caps-<stamp>-<12 hex GUID> (New-VenueCapsProbeId), so two runs started in the same second never share an id.
 #      a. 45 min max lease: the agent asks for LeaseMaxMinutes (<= 45) and a leg is started only while the lease has room for it, and that room never runs past
 #         -LeaseCapSec (2700) after the open was read, nor past the 3 h budget left (c).
 #      b. 30 min cooldown: before each open the run waits until -LeaseCooldownSec (1800) after the end of the last lease it (or any earlier run on this host)
@@ -126,11 +132,12 @@ param(
     [ValidateRange(0, 3600)][int]$CooldownSec = 0,
     [ValidateRange(60, 86400)][int]$OpenAdmissionWaitSec = 7200,
     [string]$DeadlineUtc = '',
-    # Bachelor's heavy-slot.py caps (CAPS-ADDENDUM 2026-10-23), binding (see CAPS above). Each can only be TIGHTENED: the ranges stop a longer lease, a bigger budget or a
-    # longer renew gap, and a shorter cooldown or window is refused unless -UmRunScript is an offline stub (LEASE_CAP_RELAXED).
+    # Bachelor's heavy-slot.py caps, binding (see CAPS above), read LIVE at run start (the 1800 / 5400 / 2700 defaults are only the fallback). Each can only be
+    # TIGHTENED: the ranges stop a longer lease, a bigger budget or a longer renew gap, and a cooldown shorter than the live one, a budget above it or a shorter window
+    # is refused unless -UmRunScript is an offline stub (LEASE_CAP_RELAXED).
     [ValidateRange(60, 2700)][int]$LeaseCapSec = 2700,
-    [ValidateRange(0, 7200)][int]$LeaseCooldownSec = 1800,
-    [ValidateRange(60, 5400)][int]$LeaseBudgetSec = 5400,
+    [ValidateRange(0, 86400)][int]$LeaseCooldownSec = 1800,
+    [ValidateRange(60, 10800)][int]$LeaseBudgetSec = 5400,
     [ValidateRange(60, 86400)][int]$LeaseBudgetWindowSec = 10800,
     [ValidateRange(1, 120)][int]$RenewGapMaxSec = 120,
     [ValidateRange(60, 86400)][int]$ClaimTtlSec = 10800,
@@ -164,10 +171,10 @@ foreach ($s in $QuietScript, $LegScript, $UmRunScript) { if (-not (Test-Path -Li
 # The caps hold against the real um-run.ps1 (by path or by content): only an offline stub may shorten the cooldown or the budget window.
 $realUmRun = [IO.Path]::GetFullPath((Join-Path $here '..\um-run.ps1'))
 $umRunIsReal = ([IO.Path]::GetFullPath($UmRunScript) -ieq $realUmRun) -or ((Test-Path -LiteralPath $realUmRun -PathType Leaf) -and (Get-FileHash -LiteralPath $UmRunScript).Hash -ceq (Get-FileHash -LiteralPath $realUmRun).Hash)
-if ($umRunIsReal -and ($LeaseCooldownSec -lt 1800 -or $LeaseBudgetWindowSec -lt 10800)) {
-    Stop-Usage "LEASE_CAP_RELAXED -LeaseCooldownSec $LeaseCooldownSec / -LeaseBudgetWindowSec $LeaseBudgetWindowSec are looser than Bachelor's caps (1800 s cooldown, 10800 s window)"
+if ($umRunIsReal -and $LeaseBudgetWindowSec -lt 10800) {
+    Stop-Usage "LEASE_CAP_RELAXED -LeaseBudgetWindowSec $LeaseBudgetWindowSec is looser than Bachelor's 10800 s window"
 }
-if ($LeaseBudgetSec -lt $LeaseCapSec) { Stop-Usage "-LeaseBudgetSec $LeaseBudgetSec is under -LeaseCapSec ${LeaseCapSec}: no lease could ever open" }
+$cooldownExplicit = $PSBoundParameters.ContainsKey('LeaseCooldownSec'); $budgetExplicit = $PSBoundParameters.ContainsKey('LeaseBudgetSec')
 if ($ClaimRenewSec -eq 0) { $ClaimRenewSec = [int][Math]::Max(1, [Math]::Min(600, [Math]::Floor($ClaimTtlSec / 4))) }
 if (2 * $ClaimRenewSec -gt $ClaimTtlSec) { Stop-Usage "-ClaimRenewSec $ClaimRenewSec is over half of -ClaimTtlSec ${ClaimTtlSec}: one late renewal would let the claim expire" }
 if (2 * $LivenessRenewSec -gt $LivenessWindowSec) { Stop-Usage "-LivenessRenewSec $LivenessRenewSec is over half of -LivenessWindowSec ${LivenessWindowSec}: one late write would lapse a live runner" }
@@ -374,6 +381,24 @@ function Write-BatchReceipt([System.Collections.IDictionary]$B) {
     Add-Content -LiteralPath (Join-Path $RunDir 'batches.jsonl') -Value ($rec | ConvertTo-Json -Compress -Depth 8)
     $batches.Add($rec)
 }
+# BACHELOR-DEDICATED-CAPS-RUNNER-1: the caps are Bachelor's heavy-slot.lease.json (the owner moves them), so they are READ, not mirrored: one light exempt job
+# (GateExemptJobPattern ^venue-quiet-probe-: no lease, no slot, no venue claim) prints the file; anything unreadable or invalid is the old constants (the tightest ever
+# set), typed capsSource=fallback.
+$capsProbeId = New-VenueCapsProbeId
+$capsProbe = Submit-AgentJob $capsProbeId ("`$p = 'C:\Users\layib\.claude\ops\heavy-slot.lease.json'`r`nif (Test-Path -LiteralPath `$p -PathType Leaf) { [IO.File]::ReadAllText(`$p) } else { 'HEAVY_SLOT_LEASE_JSON_MISSING' }") 60 180
+$capsText = ''; $capsWhy = $null
+if ($capsProbe.outcome -cne 'RECEIPT' -or $null -eq $capsProbe.result) { $capsWhy = "probe-$($capsProbe.outcome)" }
+elseif ($capsProbe.result.exitCode -ne 0) { $capsWhy = "probe-exit-$($capsProbe.result.exitCode)" }
+else { $capsText = (@($capsProbe.result.stdout) -join "`n").Trim() }
+$caps = Get-VenueLeaseCaps -Text $capsText -WindowSec $LeaseBudgetWindowSec
+if ($capsWhy) { $caps = [pscustomobject]@{ source = 'fallback'; reason = $capsWhy; cooldownSec = 1800; budgetSec = 5400; capSec = 2700 } }
+$eff = Resolve-VenueLeaseCaps -Caps $caps -CooldownSec $LeaseCooldownSec -CooldownExplicit $cooldownExplicit -BudgetSec $LeaseBudgetSec -BudgetExplicit $budgetExplicit -CapSec $LeaseCapSec -AllowRelax (-not $umRunIsReal)
+if (-not $eff.ok) { Stop-Usage $eff.error }
+if ($eff.capSec -lt 60) { Stop-Usage "the lease cap is $($eff.capSec) s (caps source=$($caps.source)): no leg fits in a lease" }
+if ($eff.budgetSec -lt $eff.capSec) { Stop-Usage "the lease budget $($eff.budgetSec) s is under the lease cap $($eff.capSec) s: no lease could ever open (caps source=$($caps.source))" }
+$LeaseCooldownSec = $eff.cooldownSec; $LeaseBudgetSec = $eff.budgetSec; $LeaseCapSec = $eff.capSec
+$capsReceipt = [ordered]@{ capsSource = $caps.source; capsCooldownSec = $LeaseCooldownSec; capsBudgetSec = $LeaseBudgetSec; capsCapSec = $LeaseCapSec; capsFallbackReason = $caps.reason; capsProbeJobId = $capsProbeId }
+L "CAPS source=$($caps.source) cooldownSec=$LeaseCooldownSec budgetSec=$LeaseBudgetSec capSec=$LeaseCapSec windowSec=$LeaseBudgetWindowSec probeJob=$capsProbeId$(if ($caps.reason) { " fallbackReason=$($caps.reason)" }) (Bachelor's heavy-slot.lease.json$(if ($caps.source -ceq 'fallback') { ' unread: the old constants apply' }))"
 # Every lease a lease-batch run on this host took on this venue in the last budget window plus cooldown, read once at the run's start (CAPS b and c).
 $leases = [System.Collections.Generic.List[object]]::new()
 foreach ($l in @(Read-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -SinceUtc $t0.AddSeconds(-($LeaseBudgetWindowSec + $LeaseCooldownSec)))) { $leases.Add($l) }
@@ -401,6 +426,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         preOpenWait = $null; openLeaseWait = 'NONE'; exit75Refusals = 0; exit75Class = 'NONE'; renewOkMaxGapSec = $null; leaseEndClamp = $null; ledger = $null
         openExit75Refusals = 0; legExit75Refusals = 0; openCancel = $null; openNotAfterUtc = $null; openLiveness = $null; openLivenessReadback = $null; claimRenew = $null
     }
+    foreach ($ck in $capsReceipt.Keys) { $b[$ck] = $capsReceipt[$ck] }
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
     $bw = Get-VenueLeaseBudgetWait -Leases @($leases) -NowUtc ([DateTime]::UtcNow) -CapSec $LeaseCapSec -CooldownSec $LeaseCooldownSec -WindowSec $LeaseBudgetWindowSec -BudgetSec $LeaseBudgetSec
     $b.preOpenWait = [ordered]@{ reason = $bw.reason; waitSec = $bw.waitSec; usedSec = $bw.usedSec; budgetRoomSec = $bw.budgetRoomSec; openUtc = $bw.openUtc.ToString('o'); lastLeaseEndUtc = $(if ($bw.lastEndUtc) { $bw.lastEndUtc.ToString('o') }) }
@@ -732,7 +758,7 @@ foreach ($leg in $pending) { Add-Result $leg 'NOT_RUN' @{ verdict = $(if ($stopR
 
 $summary = [ordered]@{
     schema = 'mlv-app/venue-lease-batch-result/v1'; venue = $Venue; runDir = $RunDir; startedUtc = $t0.ToString('o'); finishedUtc = [DateTime]::UtcNow.ToString('o')
-    exitCode = $exitCode; stopReason = $stopReason; legs = @($results)
+    exitCode = $exitCode; stopReason = $stopReason; capsSource = $capsReceipt.capsSource; legs = @($results)
     ran = @($results | Where-Object { $_.status -ceq 'RAN' }).Count; counted = @($results | Where-Object { $_.status -ceq 'RAN' -and $_.counted }).Count
     failed = @($results | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($results | Where-Object { $_.status -ceq 'NOT_RUN' }).Count
     leaseExpired = @($results | Where-Object { $_.status -ceq 'LEASE_EXPIRED' }).Count
