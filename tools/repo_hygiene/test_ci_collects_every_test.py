@@ -103,11 +103,10 @@ LOCAL_ONLY_OR_UNCOLLECTED: dict[str, str] = {
         "UNCOLLECTED at acc811f8, follow-up CI-COLLECT-PROFILING-NUMPY-PILLOW: factory-bridge.yml "
         "passes it to --ignore; it imports numpy and Pillow, pinned in no hash-locked requirements file"
     ),
-    "tools/coordination/stuck_queue_checks/test_stuck_queue_checks.py": (
-        "Run locally only. Its tests.yml line (added by #454) was reverted under CoS ruling "
-        "https://github.com/SuperDimensionalSpaceFortress/MLV-App/pull/454#issuecomment-6216179462 "
-        "(not retro-approved); re-adding it needs a Layi-Approval id (separate card)"
-    ),
+    # STUCK-QUEUE-HANG-AND-CI-REVERT-1 r4: test_stuck_queue_checks.py is collected by the
+    # Windows guardrails step of tests.yml again (the 2026-10-25 owner ruling moved .github
+    # changes to factory adjudication), so it needs no exemption here and must not get one.
+    # A hosted collector is required for it by the guard below like for any other test file.
 }
 
 _PYTEST_OPTIONS_WITH_VALUE = frozenset(
