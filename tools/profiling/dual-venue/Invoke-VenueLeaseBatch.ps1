@@ -352,17 +352,20 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $openLive = Start-VenueJobLiveness -AgentShare $AgentShare -JobId $b.openJobId -WindowSec $LivenessWindowSec -RenewSec $LivenessRenewSec
         L "BATCH_OPEN_LIVENESS batch=$batchNo job=$($b.openJobId) first=$($openLive.first.state) aliveUntilUtc=$($openLive.first.aliveUntilUtc) windowSec=$LivenessWindowSec renewSec=$LivenessRenewSec$(if ($openLive.first.error) { " error=$($openLive.first.error)" })"
         # r6 (Grok G2 on #633): WRITTEN only says the write returned. The file is read back with the agent's own reader and verdict; one the agent would not read as live is no sidecar.
-        $rb = $null
+        $rb = $null; $crossed = $false
         if ($openLive.first.state -ceq 'WRITTEN') {
             $rb = Test-VenueJobLivenessReadback -AgentShare $AgentShare -JobId $b.openJobId -NotAfterUtc $b.openNotAfterUtc
             $b.openLivenessReadback = $rb
             L "BATCH_OPEN_LIVENESS_READBACK batch=$batchNo job=$($b.openJobId) live=$($rb.live) livenessState=$($rb.livenessState) why=$($rb.why)"
+            # r2 (opus H1): a LIVE sidecar under a job whose own notAfterUtc (the batch deadline) has passed reads state=passed. The sidecar is fine; the deadline crossed between
+            # the check above and this read-back, so the batch ends DEADLINE (exit 3) like every other deadline stop, not as a liveness failure.
+            $crossed = [string]$rb.livenessState -ceq 'live' -and [string]$rb.state -ceq 'passed'
         }
         if ($openLive.first.state -cne 'WRITTEN' -or -not $rb.live) {
             # r5b (dot ef5805a4 residual B1): no sidecar, no open. Submitted without one, an open this run dies under stays admissible until the far batch
             # deadline, not -LivenessWindowSec. The keeper is stopped and the open is never submitted: the batch ends LIVENESS_UNAVAILABLE (exit 9, below).
             $b.openLiveness = Stop-VenueJobLiveness $openLive -Remove
-            $op = [pscustomobject]@{ outcome = 'NOT_SUBMITTED'; result = $null; message = "first liveness write $($openLive.first.state)$(if ($openLive.first.error) { ": $($openLive.first.error)" })$(if ($null -ne $rb -and -not $rb.live) { ", but the agent's own parser does not read it as live (read-back $($rb.livenessState)): $($rb.why)" })" }
+            $op = [pscustomobject]@{ outcome = 'NOT_SUBMITTED'; result = $null; message = "first liveness write $($openLive.first.state)$(if ($openLive.first.error) { ": $($openLive.first.error)" })$(if ($crossed) { ", but the batch deadline passed first (the sidecar is live; read-back: $($rb.why))" } elseif ($null -ne $rb -and -not $rb.live) { ", but the agent's own parser does not read it as live (read-back $($rb.livenessState)): $($rb.why)" })" }
         } else {
             $op = Submit-AgentJob $b.openJobId "Write-Output ('LEASE_BATCH_OPEN token=$token held=' + [string]`$env:HEAVY_SLOT_HELD + ' admission=' + [string]`$env:MLV_AGENT_ADMISSION)" 120 $wait $b.openNotAfterUtc
         }
@@ -386,7 +389,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $b.openExit75Refusals = $(if ($null -ne $adm) { @(@($adm.leaseRefusals) | Where-Object { $null -ne $_ -and [string]$_.rc -eq '75' }).Count } else { 0 })
         $b.exit75Refusals = $b.openExit75Refusals
         if ($b.exit75Refusals -gt 0 -or $b.openLeaseWait -cne 'NONE') { $b.exit75Class = 'WAIT_RETRY' }
-        if ($op.outcome -ceq 'NOT_SUBMITTED') {
+        if ($op.outcome -ceq 'NOT_SUBMITTED' -and $crossed) {
+            $b.endReason = 'DEADLINE'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
+            Set-Stop 'DEADLINE' 3
+        } elseif ($op.outcome -ceq 'NOT_SUBMITTED') {
             $b.endReason = 'LIVENESS_UNAVAILABLE'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
             Set-Stop 'LIVENESS_UNAVAILABLE' 9
         } elseif ($op.outcome -ceq 'UNRESOLVED' -and $b.openLeaseWait -cne 'NONE') {

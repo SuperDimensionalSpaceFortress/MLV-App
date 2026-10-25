@@ -868,14 +868,18 @@ $v = Get-JobNotAfterVerdict -Metadata ([pscustomobject]@{ notAfterUtc = $A.notAf
 function Test-VenueJobLivenessReadback {
     <#
     .SYNOPSIS
-    Read the job's sidecar back from the agent share on a bounded worker and judge it with the agent's own functions. Returns @{ live; state; livenessState; livenessUntilUtc; why; error }.
+    Read the job's sidecar back from the agent share on a bounded worker and judge it with the agent's own functions. Returns @{ live; state; livenessState; livenessUntilUtc; why; error; agentScriptSha256 }.
     live is true only when the agent's verdict calls the sidecar live and the job still open (or unbounded); anything else, including a worker that does not answer or an
-    agent script whose functions cannot be lifted, is not live (fail closed).
+    agent script whose functions cannot be lifted, is not live (fail closed). A live sidecar with state 'passed' means the job's own notAfterUtc has passed (the deadline
+    crossed): the caller types that DEADLINE, not a liveness failure.
     #>
     param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][string]$JobId, [string]$NotAfterUtc = '', [string]$AgentScript = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
-    $no = { param($why) [pscustomobject]@{ live = $false; state = 'UNKNOWN'; livenessState = 'UNKNOWN'; livenessUntilUtc = $null; why = $why; error = $why } }
+    # r2: agentScriptSha256 is the hash of the checkout's agent script the parser was lifted from, so a later drift between the checkout and the deployed agent shows in the receipt.
+    $sha = $null
+    $no = { param($why) [pscustomobject]@{ live = $false; state = 'UNKNOWN'; livenessState = 'UNKNOWN'; livenessUntilUtc = $null; why = $why; error = $why; agentScriptSha256 = $sha } }
     if (-not $AgentScript) { $AgentScript = Join-Path $PSScriptRoot '..\bachelor\ultra-magnus-agent.ps1' }
     if (-not (Test-Path -LiteralPath $AgentScript -PathType Leaf)) { return & $no "the agent script is not at $AgentScript" }
+    $sha = (Get-FileHash -LiteralPath $AgentScript -Algorithm SHA256).Hash.ToLowerInvariant()
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$null, [ref]$null)
     $fns = @(foreach ($n in 'Get-JobNotAfterVerdict', 'Read-JobNotAfterSidecar') {
         $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true)
@@ -887,7 +891,7 @@ function Test-VenueJobLivenessReadback {
     if (-not $r.answered) { return & $no "read-back: $($r.error)" }
     $v = try { [string](@($r.value) -join '') | ConvertFrom-Json -ErrorAction Stop } catch { $null }
     if ($null -eq $v -or $null -eq $v.livenessState) { return & $no "read-back gave no verdict: $([string](@($r.value) -join ''))" }
-    [pscustomobject]@{ live = ([string]$v.livenessState -ceq 'live' -and [string]$v.state -cin @('open', 'none')); state = [string]$v.state; livenessState = [string]$v.livenessState; livenessUntilUtc = $v.livenessUntilUtc; why = [string]$v.why; error = $null }
+    [pscustomobject]@{ live = ([string]$v.livenessState -ceq 'live' -and [string]$v.state -cin @('open', 'none')); state = [string]$v.state; livenessState = [string]$v.livenessState; livenessUntilUtc = $v.livenessUntilUtc; why = [string]$v.why; error = $null; agentScriptSha256 = $sha }
 }
 
 function Start-VenueJobLiveness {

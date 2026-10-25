@@ -911,7 +911,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
             p.stderr.close()
 
     # ---------------------------------------------------------------- r6: the first sidecar write is read back with the agent's own parser (Grok G2 on #633)
-    def _mirror_with_bad_sidecar(self, json_patch: str = "", writer_patch: tuple[str, str] | None = None) -> None:
+    def _mirror_with_bad_sidecar(self, json_patch: str = "", writer_patch: tuple[str, str] | None = None,
+                                 module_patches: tuple[tuple[str, str], ...] = (), agent_patches: tuple[tuple[str, str], ...] = ()) -> None:
         """A copy of tools/profiling/{dual-venue,bachelor/ultra-magnus-agent.ps1} in which the runner's sidecar writer still says WRITTEN but writes bytes the agent
         would not read as live. json_patch is PowerShell run on $json before it is written; writer_patch replaces a statement of the write itself. The runner under test
         is the copy's own Invoke-VenueLeaseBatch.ps1 (self.runner), reading the agent's functions from the copy's bachelor folder."""
@@ -919,8 +920,18 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
         shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
+        if agent_patches:
+            agent_copy = tree / "bachelor" / AGENT.name
+            agent_text = agent_copy.read_text(encoding="utf-8")
+            for old, new in agent_patches:
+                self.assertEqual(agent_text.count(old), 1, "the agent line moved: update this fixture")
+                agent_text = agent_text.replace(old, new)
+            agent_copy.write_text(agent_text, encoding="utf-8")
         mod = tree / "dual-venue" / "VenueChain.psm1"
         text = mod.read_text(encoding="utf-8")
+        for old, new in module_patches:
+            self.assertEqual(text.count(old), 1, "the module line moved: update this fixture")
+            text = text.replace(old, new)
         anchor = "[pscustomobject]@{ path = ($AgentShare.TrimEnd('\\') + '\\notafter\\' + $JobId + '.json'); json = $json }"
         self.assertEqual(text.count(anchor), 1, "the sidecar write argument moved: update this fixture")
         text = text.replace(anchor, (json_patch + "\n    " if json_patch else "") + anchor)
@@ -930,15 +941,18 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         mod.write_text(text, encoding="utf-8")
         self.runner = tree / "dual-venue" / RUNNER.name
 
-    def _assert_readback_refused(self, r: subprocess.CompletedProcess, want_state: str) -> dict:
-        """The first write said WRITTEN, the agent's parser disagrees: the open is never submitted and the batch ends exactly as a failed write ends it."""
-        self.assertEqual(r.returncode, 9, r.stdout + r.stderr)
+    def _assert_readback_refused(self, r: subprocess.CompletedProcess, want_state: str, end_reason: str = "LIVENESS_UNAVAILABLE", code: int = 9,
+                                 detail: str = "agent's own parser does not read it as live") -> dict:
+        """The first write said WRITTEN, the agent's parser disagrees: the open is never submitted and the batch ends exactly as a failed write ends it
+        (or, r2, DEADLINE exit 3 when the deadline crossed under a live sidecar). Nothing reaches Submit-AgentJob: the fake um-run's call log and the inbox stay empty."""
+        self.assertEqual(r.returncode, code, r.stdout + r.stderr)
         [b] = self.batches()
-        self.assertEqual((b["endReason"], b["openOutcome"], b["leaseId"], b["openCancel"], b["closeJobId"], b["ledger"]), ("LIVENESS_UNAVAILABLE", "NOT_SUBMITTED", None, None, None, None), b)
+        self.assertEqual((b["endReason"], b["openOutcome"], b["leaseId"], b["openCancel"], b["closeJobId"], b["ledger"]), (end_reason, "NOT_SUBMITTED", None, None, None, None), b)
         self.assertEqual(self.kinds(), [], "no open, close, probe or leg once the read-back was not live")
+        self.assertFalse([l for l in (self.events_raw() if self.events.exists() else []) if " UMRUN " in l], "the fake um-run was called")
         self.assertEqual(list((self.share / "inbox").glob("*.job.ps1")) if (self.share / "inbox").exists() else [], [], "a job reached the inbox")
         self.assertIn("first liveness write WRITTEN", b["endDetail"])
-        self.assertIn("agent's own parser does not read it as live", b["endDetail"])
+        self.assertIn(detail, b["endDetail"])
         rb = b["openLivenessReadback"]
         self.assertEqual((rb["live"], rb["livenessState"]), (False, want_state), rb)
         self.assertTrue(rb["why"], rb)
@@ -946,7 +960,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual(list((self.share / "notafter").glob("lease-batch-open-*")), [], "the refused sidecar was left behind")
         self.assertEqual(b["legsAttempted"], 0)
         res = batch_result(r.stdout)
-        self.assertEqual((res["stopReason"], res["ran"], res["counted"], res["notRun"]), ("LIVENESS_UNAVAILABLE", 0, 0, 2))
+        self.assertEqual((res["stopReason"], res["ran"], res["counted"], res["notRun"]), (end_reason, 0, 0, 2))
         self.assertFalse(self.claim_path.exists(), "the claim was left behind")
         log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
         self.assertIn(f" BATCH_OPEN_LIVENESS batch=1 job={b['openJobId']} first=WRITTEN ", log)
@@ -1008,6 +1022,69 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual((got["noFns"]["live"], got["noFile"]["live"], got["noSidecar"]["live"]), (False, False, False), got)
         self.assertIn("does not define both", got["noFns"]["error"])
         self.assertEqual((got["noSidecar"]["livenessState"], got["noSidecar"]["error"]), ("absent", None), got["noSidecar"])
+
+    # ---------------------------------------------------------------- r2: the three regression cases hub ACK 6394063078 promised, the deadline typing, the agent-script sha
+    def test_r2_a_stalled_readback_worker_is_not_live_and_submits_no_open(self) -> None:
+        # (a) VenueChain.psm1 Invoke-VenueBoundedRead: the worker reading the sidecar back never answers (the lifted agent reader sleeps 120 s; the read-back's bound is
+        # patched down to 2 s so the case stays fast). The bound expires -> not live (UNKNOWN) -> no Submit-AgentJob, exit 9 LIVENESS_UNAVAILABLE, keeper stopped, sidecar removed.
+        # RED on 13d65263 (no read-back: the open is submitted, exit 0).
+        self._mirror_with_bad_sidecar(
+            module_patches=(("[string]$AgentScript = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)", "[string]$AgentScript = '', [ValidateRange(1, 600)][int]$TimeoutSec = 2)"),),
+            agent_patches=(('$path = Join-Path $notAfterDir "$JobId.json"', '$path = Join-Path $notAfterDir "$JobId.json"; Start-Sleep -Seconds 120'),))
+        started = time.monotonic()
+        r = self.run_batch(self.specs[:2])
+        elapsed = time.monotonic() - started
+        b = self._assert_readback_refused(r, "UNKNOWN")
+        self.assertEqual(b["openLivenessReadback"]["state"], "UNKNOWN")
+        self.assertIn("no answer in 2 s", b["openLivenessReadback"]["why"])
+        self.assertLess(elapsed, 100, "the abandoned worker held the runner (it sleeps 120 s)")
+
+    def test_r2_the_readback_helper_gives_up_on_a_stalled_worker_within_its_timeout(self) -> None:
+        # The helper on its own: an agent script whose reader never returns, -TimeoutSec 1 -> not live, UNKNOWN, 'no answer', in about a second (not the reader's 120 s).
+        stall = self.case / "stalled-agent.ps1"
+        stall.write_text("function Get-JobNotAfterVerdict { param($Metadata, $Sidecar) 1 }\nfunction Read-JobNotAfterSidecar { param($JobId) Start-Sleep -Seconds 120 }\n", encoding="utf-8")
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"$t = [Diagnostics.Stopwatch]::StartNew(); $r = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1' -AgentScript '{stall}' -TimeoutSec 1; $t.Stop()\n"
+            "[ordered]@{ live = $r.live; state = $r.state; livenessState = $r.livenessState; error = $r.error; ms = $t.ElapsedMilliseconds } | ConvertTo-Json -Compress\n"
+            "Complete-VenueProcess -ExitCode 0\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=100)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual((got["live"], got["state"], got["livenessState"]), (False, "UNKNOWN", "UNKNOWN"), got)
+        self.assertIn("no answer in 1 s", got["error"])
+        self.assertLess(got["ms"], 20000, got)
+
+    def test_r2_a_sidecar_holding_invalid_utf8_is_not_live_and_submits_no_open(self) -> None:
+        # (b) ultra-magnus-agent.ps1 Read-JobNotAfterSidecar :859 reads with a strict UTF-8 decoder, so bytes that are not UTF-8 are 'unreadable' and the verdict
+        # fails closed (:782). The writer still says WRITTEN; the file then holds 0xFF 0xFE bytes. -> not live, refuse, no open. RED on 13d65263 (the open is submitted).
+        bad = "[IO.File]::Move($tmp, $A.path, $true); [IO.File]::WriteAllBytes($A.path, [byte[]](0x7B, 0x22, 0xFF, 0xFE, 0x22, 0x7D))"
+        self._mirror_with_bad_sidecar(writer_patch=("[IO.File]::Move($tmp, $A.path, $true)", bad))
+        b = self._assert_readback_refused(self.run_batch(self.specs[:2]), "unparseable")
+        self.assertIn("could not be read", b["openLivenessReadback"]["why"])
+
+    def test_r2_a_deadline_crossed_under_a_live_sidecar_ends_deadline_and_submits_no_open(self) -> None:
+        # (c) The runner's own deadline check (Invoke-VenueLeaseBatch.ps1 :349) passed, then the deadline crossed before the read-back: the agent's verdict is
+        # state=passed with livenessState=live (ultra-magnus-agent.ps1 :818-825). Simulated by handing the read-back a notAfterUtc 5 s in the past, the sidecar live.
+        # r1 typed this LIVENESS_UNAVAILABLE exit 9 with "(read-back live)"; r2 types it DEADLINE exit 3 (the runner's deadline code) and the open is still never submitted.
+        anchor = "    $ast = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$null, [ref]$null)"
+        self._mirror_with_bad_sidecar(module_patches=((anchor, "    $NotAfterUtc = [DateTime]::UtcNow.AddSeconds(-5).ToString('o')\n" + anchor),))
+        b = self._assert_readback_refused(self.run_batch(self.specs[:2]), "live", end_reason="DEADLINE", code=3, detail="the batch deadline passed first")
+        rb = b["openLivenessReadback"]
+        self.assertEqual((rb["state"], rb["livenessState"], rb["live"]), ("passed", "live", False), rb)
+        self.assertNotIn("does not read it as live", b["endDetail"])
+
+    def test_r2_the_readback_record_carries_the_agent_scripts_sha256(self) -> None:
+        # Opus H3: the read-back judges with the checkout's agent script; its sha256 in openLivenessReadback makes a later drift from the deployed agent visible.
+        import hashlib
+        self._mirror_with_bad_sidecar()
+        r = self.run_batch(self.specs[:2])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        sha = b["openLivenessReadback"]["agentScriptSha256"]
+        self.assertRegex(sha, r"^[0-9a-f]{64}$")
+        self.assertEqual(sha, hashlib.sha256(AGENT.read_bytes()).hexdigest(), "the mirror's agent script is the checkout's, byte for byte")
 
     # ---------------------------------------------------------------- r5b: no probe or leg without the claim (Grok G1, 6389240991)
     def test_r5b_a_claim_taken_over_mid_batch_ends_the_batch_claim_lost_and_keeps_the_legs_already_run(self) -> None:
