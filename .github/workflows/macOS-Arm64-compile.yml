@@ -1,9 +1,17 @@
 name: macOS Arm64 Compile Canary
 
 # Compile-only canary (MAC-LINUX-BUILD-RESTORE-1; OWNER RULING 2026-10-25T00:44:41Z).
-# qmake + make only: no bundle is produced, so no vendored payload is verified,
-# extracted or shipped here. The release path stays in macOS-Arm64.yml, unchanged.
+# qmake + make only: no packaged release or vendored payload is produced (qmake
+# still builds an .app bundle in the build tree), so no vendored payload is
+# verified, extracted or shipped here. The release path stays in macOS-Arm64.yml.
+# Qt: this canary and macOS-Arm64.yml both moved from Qt 5 (qt@5) to Qt 6 (brew
+# `qt`); the toolchain step fails unless `qmake -query QT_VERSION` starts with 6.
 # Not a required context.
+#
+# The narrow trigger below (workflow_dispatch, plus pull_request only when this
+# file changes) is intentional (owner ruling): fold the canary into tests.yml after
+# a week green. Widening the path filter (platform/qt/**, src/**, *.pro) is a
+# separate follow-up card, not part of this change.
 
 on:
   workflow_dispatch:
@@ -43,6 +51,8 @@ jobs:
         test -x "${{ env.QTDIR }}/qmake"
         "${{ env.QTDIR }}/qmake" -v
         "${{ env.QTDIR }}/qmake" -query QT_VERSION
+        QT_VERSION="$("${{ env.QTDIR }}/qmake" -query QT_VERSION)"
+        case "$QT_VERSION" in 6.*) ;; *) echo "::error::Qt major version must be 6, got $QT_VERSION"; exit 1 ;; esac
         LLVM_CXX="$(brew --prefix llvm)/bin/clang++"
         test -x "$LLVM_CXX"
         "$LLVM_CXX" --version

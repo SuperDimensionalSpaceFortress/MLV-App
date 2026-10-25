@@ -1825,6 +1825,74 @@ class VendoredNativePayloadTests(unittest.TestCase):
                         with self.assertRaises(AssertionError):
                             assert_fail_closed_policy(falsified, brew_line)
 
+        # The compile-only canary has no payload steps, so it gets its own policy: fail
+        # closed (no continue-on-error, no masked failures anywhere in its run bodies) and
+        # the toolchain step must FAIL unless `qmake -query QT_VERSION` starts with `6.`
+        # (brew `qt` floats, so the major version is asserted, not assumed).
+        canary_relative = ".github/workflows/macOS-Arm64-compile.yml"
+        canary_order = (
+            "Install llvm & Qt & OpenSSL",
+            "Verify macOS build toolchain",
+            "Create build directory",
+            "Compile",
+        )
+        qt_major_guard = (
+            'case "$QT_VERSION" in 6.*) ;; '
+            '*) echo "::error::Qt major version must be 6, got $QT_VERSION"; exit 1 ;; esac'
+        )
+        canary_verify_lines = (
+            'test -x "${{ env.QTDIR }}/qmake"',
+            '"${{ env.QTDIR }}/qmake" -v',
+            '"${{ env.QTDIR }}/qmake" -query QT_VERSION',
+            'QT_VERSION="$("${{ env.QTDIR }}/qmake" -query QT_VERSION)"',
+            qt_major_guard,
+            'LLVM_CXX="$(brew --prefix llvm)/bin/clang++"',
+            'test -x "$LLVM_CXX"',
+            '"$LLVM_CXX" --version',
+        )
+
+        def assert_canary_policy(text: str) -> None:
+            self.assertNotRegex(text, r"(?im)^\s*continue-on-error\s*:")
+            self.assertNotRegex(text, permissive_shell)
+            steps = named_step_blocks(text)
+            self.assertEqual([name for name, _ in steps], list(canary_order))
+            blocks = dict(steps)
+            self.assertIn("brew: llvm qt openssl", blocks[canary_order[0]])
+            self.assertEqual(normalized_run_lines(blocks[canary_order[1]]), canary_verify_lines)
+
+        with self.subTest(workflow=canary_relative):
+            canary_text = (ROOT / canary_relative).read_text(encoding="utf-8")
+            assert_canary_policy(canary_text)
+
+            canary_falsifiers = (
+                (
+                    "compile continue-on-error",
+                    canary_text.replace(
+                        "    - name: Compile\n",
+                        "    - name: Compile\n      continue-on-error: true\n",
+                        1,
+                    ),
+                ),
+                ("make masks failure", canary_text.replace("make -j8", "make -j8 || true", 1)),
+                (
+                    "errexit disabled",
+                    canary_text.replace(
+                        '        test -x "${{ env.QTDIR }}/qmake"',
+                        '        set +e\n        test -x "${{ env.QTDIR }}/qmake"',
+                        1,
+                    ),
+                ),
+                ("qt major guard removed", canary_text.replace(qt_major_guard, "true", 1)),
+                ("qt major guard accepts any version", canary_text.replace("in 6.*)", "in *)", 1)),
+                ("qt major guard accepts qt 5", canary_text.replace("in 6.*)", "in 5.*|6.*)", 1)),
+                ("qt major guard cannot fail", canary_text.replace("exit 1 ;;", "exit 0 ;;", 1)),
+            )
+            for label, falsified in canary_falsifiers:
+                with self.subTest(workflow=canary_relative, falsifier=label):
+                    self.assertNotEqual(falsified, canary_text)
+                    with self.assertRaises(AssertionError):
+                        assert_canary_policy(falsified)
+
 
 if __name__ == "__main__":
     unittest.main()
