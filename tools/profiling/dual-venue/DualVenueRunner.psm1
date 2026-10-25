@@ -1281,6 +1281,39 @@ function Get-DvUnpacedEvidence {
     [ordered]@{ requested = $requested; active = $active; dropFrame = $dropFrame; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+function Get-DvLookAssistEvidence {
+    <#
+    .SYNOPSIS
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b): did a leg whose spec says Look Assist ON (a LOOK leg, or generatorArgs.forceLookAssist = true) actually
+    run with it on? Read from the app's own LAST `gui_smoke.visual_state` line in the run log (look_assist_enabled), never from the spec or the job's
+    summary. FAIL CLOSED: `blocks` is true when the leg asked for it and the line is absent, carries no look_assist_enabled, or says anything but 1.
+    A leg that does not ask for it never blocks.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $requested = ($null -ne (Get-DvProp $Spec 'look')) -or ((Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'forceLookAssist') -eq $true)
+    $reported = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    if ($requested) {
+        $found = $null
+        if (-not [string]::IsNullOrEmpty($LogText)) {
+            foreach ($line in ($LogText -split "`r?`n")) { if ($line -match '(^|\s)event=gui_smoke\.visual_state(\s|$)') { $found = $line } }
+        }
+        $verdict = 'NOT_HONOURED'
+        if ($null -eq $found) { $reason = 'the run log has no gui_smoke.visual_state line, so nothing shows the app ran with Look Assist on' }
+        else {
+            $m = [regex]::Match($found, '(^|\s)look_assist_enabled=(?<v>\S+)')
+            if (-not $m.Success) { $reason = 'the app''s gui_smoke.visual_state line carries no look_assist_enabled' }
+            else {
+                $reported = $m.Groups['v'].Value
+                if ($reported -cne '1') { $reason = "the app's gui_smoke.visual_state line says look_assist_enabled=$reported (the leg asks for Look Assist on)" }
+                else { $verdict = 'HONOURED' }
+            }
+        }
+    }
+    [ordered]@{ requested = $requested; reported = $reported; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
 # --- leg sets and the display matrix (DUAL-VENUE-DISPLAY-MATRIX-1) -------------------------------------------------------
 # A LEG SET is a tracked list of committed leg specs that one run executes together. The set does not define legs: every cell is still an ordinary committed leg spec (so every receipt
 # is bound to a committed spec by its sha256, exactly as for a single leg), and the set only says which specs make up the matrix, and in what order a run walks them.
@@ -1820,12 +1853,27 @@ function Get-DvVisualVerdict {
     VISUAL_ASSESSMENT_UNAVAILABLE: play frames lack a usable viewport rectangle AND fewer than two judged ones remain, so nothing is judged (counted, surfaced; never the whole window).
     VISUAL_DIVERGENCE: the playback-path frame is further than the threshold from its paused full-quality re-render; counted for speed and
     surfaced. CAPTURE_BLANK: every play frame's viewport is flat (a blank capture judges nothing). NOT_CAPTURED / NOT_REQUESTED: no captures.
+    CAPTURE_UNBOUND (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1): the app says the paused-instant capture's pixels are not the frame its label names
+    (-LabelBound $false), so its difference from the paused re-render compares two moments; counted, judged before VISUAL_DIVERGENCE. A
+    -LabelBound of $null (a build that predates the binding) changes nothing.
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2: the divergence compares TWO captures, so both must be bound. -PausedLabelBound is the paused capture's
+    label_bound. When either side carries a binding (a binding build), anything but $true on BOTH -- $false, or a side that is missing -- is
+    CAPTURE_UNBOUND (fail closed); only when neither carries one (a pre-binding build) does the gate judge as before.
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): -ObserverPaintedPlayFrames are the unforced play frames NOT judged because a forced
+    capture's paint may be what they show (a forced paint stays on screen when the display's own paint is stuck); when they leave fewer than two
+    judged, it is VISUAL_ASSESSMENT_UNAVAILABLE (fail closed: such pictures cannot tell a moving display from a frozen one).
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5 (hub ruling, ACK 6388020454): PARTIAL_FREEZE -- two or more judged play frames repeat the picture
+    before them while the app's label advanced (-RepeatedPlayFrames) AND the source frames are known to differ: the display's own paint stopped
+    landing for part of the tail. Counted and surfaced, never OK; the whole-tail FROZEN_DISPLAY outranks it. Over an unknown source a repeat may be
+    the source's own picture, so it stays a note on an OK block (the reader's repeatedPlayFramesNote); one repeat alone is OK.
     #>
     param([bool]$Requested, [bool]$Captured, [int]$PlayFrames, [int]$DistinctContentHashes, [int]$AppDistinctDisplayFrames, [int]$FlatPlayFrames,
           $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold,
-          [ValidateSet('known-differ', 'known-identical', 'unknown')][string]$SourceDifference = 'unknown', [int]$ViewportUnavailablePlayFrames = 0)
+          [ValidateSet('known-differ', 'known-identical', 'unknown')][string]$SourceDifference = 'unknown', [int]$ViewportUnavailablePlayFrames = 0, $LabelBound = $null,
+          $PausedLabelBound = $null, [int]$ObserverPaintedPlayFrames = 0, [int]$RepeatedPlayFrames = 0)
     if (-not $Requested) { return [pscustomobject]@{ verdict = 'NOT_REQUESTED'; counted = $true; reason = 'the leg spec opts out of window captures' } }
     if ($ViewportUnavailablePlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ViewportUnavailablePlayFrames play frame(s) have no usable viewport rectangle (visual.json), leaving $PlayFrames judged, so the picture cannot be told from the window's timecode and chrome: no visual assessment" } }
+    if ($ObserverPaintedPlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ObserverPaintedPlayFrames unforced play frame(s) were taken after a forced paint their predecessor did not see, or do not record how many forced paints preceded them (forced_paints_before), leaving $PlayFrames judged: a forced paint stays on screen when the display's own paint is stuck, so those pictures cannot tell a moving display from a frozen one: no visual assessment" } }
     if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $PlayFrames play frame(s) were captured" } }
     if ($FlatPlayFrames -ge $PlayFrames) { return [pscustomobject]@{ verdict = 'CAPTURE_BLANK'; counted = $true; reason = 'every play frame''s viewport is flat: the capture shows no picture, so it judges nothing' } }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
@@ -1833,6 +1881,14 @@ function Get-DvVisualVerdict {
     }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'unknown') {
         return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY_SUSPECTED'; counted = $true; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them, but nothing records whether the source frames differ (a static clip shows one picture legitimately): suspected, not excluded" }
+    }
+    if ($RepeatedPlayFrames -ge 2 -and $SourceDifference -ceq 'known-differ') {
+        return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "$RepeatedPlayFrames of the $PlayFrames judged play frames repeat the picture before them while the app's label advanced and the source frames are known to differ: the display's own paint stopped landing for part of the tail" }
+    }
+    if (($null -ne $LabelBound -or $null -ne $PausedLabelBound) -and -not ($LabelBound -eq $true -and $PausedLabelBound -eq $true)) {
+        $unbound = @(if ($LabelBound -ne $true) { "the paused-instant capture (label_bound $(if ($null -eq $LabelBound) { 'missing' } else { 'false' }))" }
+                     if ($PausedLabelBound -ne $true) { "the paused re-render capture (label_bound $(if ($null -eq $PausedLabelBound) { 'missing' } else { 'false' }))" }) -join ' and '
+        return [pscustomobject]@{ verdict = 'CAPTURE_UNBOUND'; counted = $true; reason = "$unbound is not bound to its label (the frame painted when it was taken is not shown to be the frame the label names), so the paused-instant vs paused re-render difference ($PlayVsPausedMeanAbsDiff) compares two moments and judges nothing" }
     }
     if ($SamePosition -and $null -ne $PlayVsPausedMeanAbsDiff -and [double]$PlayVsPausedMeanAbsDiff -gt $Threshold) {
         return [pscustomobject]@{ verdict = 'VISUAL_DIVERGENCE'; counted = $true; reason = "the playback-path frame is $PlayVsPausedMeanAbsDiff (per-channel mean absolute difference, 0..255) from its paused full-quality re-render; the threshold is $Threshold" }
@@ -1897,6 +1953,26 @@ function Read-DvVisualCaptures {
     The receipt's `visual` block for one leg. Copies the published captures (<artifacts>\visual) into <evidence>\visual under the leg's names
     (<legId>-play-<k>.png, <legId>-stop.png, <legId>-paused.png; the app's visual.json and the job's request record beside them), hashes every
     file, derives the content hashes and the play-vs-paused difference from the copies, composes <legId>-strip.png, and applies the gate.
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: a build that binds its captures also keeps the unforced paused-instant capture (<legId>-stop-unbound.png,
+    what a pre-binding build captured) and stamps the stop capture's label_bound; labelBound is $null for a build that predates it.
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2: such a build also takes unforced play captures (<legId>-play-unbound-<k>.png; r3: all of them after
+    the forced ones, see below). When the app published any, the frozen check is judged on the UNFORCED play captures (frozenJudgedOn
+    'play_unbound'): the force-paint shows the frame the label names even when the display's own paint never lands, so judging the forced
+    ones would mask a frozen display. The forced set is reported beside it (forcedPlayDistinctContentHashes) and a forced set that moved over an
+    unforced one that did not is said in the reason. (r5: no index pairing of forced k with unforced k is reported: under the r3 order they are
+    half a tail apart, so on a healthy display every such pair disagrees.) The paused capture gets its unforced twin too
+    (<legId>-paused-unbound.png; pausedUnboundVsPausedMeanAbsDiff). pausedLabelBound and labelBoundBasis /
+    pausedLabelBoundBasis carry the paused capture's binding and where each painted serial came from (label_bound_basis:
+    pixmap_item_by_construction holds by construction and proves only that the forced repaint ran).
+    PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): a forced paint stays on screen when the display's own paint is stuck, so it is what
+    the NEXT unforced capture shows (r2's per-slice pairing let unforced k+1 show forced k: six moving pictures over a frozen display). Every
+    capture records forced_paints_before (forcedPaintsBefore); the frozen check is judged only on the unforced play captures that record the SAME
+    count as the first of them (no forced paint between any two). Those that record another count, or none (an r2 build), are not judged
+    (observerPaintedPlayFrames) -- fewer than two left is VISUAL_ASSESSMENT_UNAVAILABLE. stopUnboundObserverClean says whether stop_unbound also
+    follows them with no forced paint between ($null when unknown); repeatedPlayFrames counts judged unforced captures that repeat the picture before
+    them while the app's label advanced (a display whose paint stopped part-way when the source frames are known to differ, a possible one when
+    nothing records them; $null over source frames the app records as identical). r5: repeatedPlayFramesNote carries the repeat note whatever
+    reason was set first (reason keeps its first-wins rule), and two or more repeats over known-differ source frames are PARTIAL_FREEZE.
     Never throws for a missing or broken capture: the block says what is missing (a capture is evidence about the leg, not the leg itself).
     #>
     param([bool]$Requested, [string]$OptOutReason, [string]$ArtifactsDir, [string]$EvidenceDir, [Parameter(Mandatory)][string]$LegId, [string]$Header = '')
@@ -1907,20 +1983,29 @@ function Read-DvVisualCaptures {
         sourceDifference = 'unknown'; viewportUnavailablePlayFrames = 0
         stopFrame = $null; pausedSettled = $null; pausedFrame = $null; samePosition = $false
         playVsPausedMeanAbsDiff = $null; playVsPausedMeanAbsDiffPerChannel = $null; divergenceThreshold = $script:VisualDivergenceThreshold
+        labelBound = $null; stopUnboundVsPausedMeanAbsDiff = $null; stopUnboundVsStopMeanAbsDiff = $null
+        pausedLabelBound = $null; labelBoundBasis = $null; pausedLabelBoundBasis = $null; pausedUnboundVsPausedMeanAbsDiff = $null
+        frozenJudgedOn = 'play'; forcedPlayDistinctContentHashes = $null
+        observerPaintedPlayFrames = $null; stopUnboundObserverClean = $null; repeatedPlayFrames = $null; repeatedPlayFramesNote = $null
         tailBeginUtc = $null; tailEndUtc = $null; presentMonWindowEndUtc = $null
         stripPath = $null; stripSha256 = $null; stripCopyPath = $null
         verdict = $null; counted = $true; reason = $null; appError = $null
     }
     $notJudgedNote = $null   # set once the frames are read; kept after a verdict reason rather than replaced by it
-    $stripNote = $null       # set when the strip cannot be composed; kept the same way, after the not-judged note
+    $maskNote = $null        # set when the forced play captures moved over unforced ones that did not; kept the same way
+    $observerNote = $null    # set when some unforced play captures followed a forced paint and were not judged; kept the same way
+    $repeatNote = $null      # set when judged unforced captures repeat their predecessor's picture while the label advanced; kept the same way
+    $stripNote = $null      # set when the strip cannot be composed; kept the same way, after the not-judged note
     $reasonBeforeStrip = $null   # the step reason standing when the strip failed (a NOT_CAPTURED leg keeps it between the capture count and the strip failure)
     $finish = {
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
-            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames)
+            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
+            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFrames)
         # a gate reason replaces a step's reason, except that a NOT_CAPTURED leg keeps the step that says WHY nothing was captured
-        # (the verdict reason comes first, then the note that some saved play frames were not judged, then the strip failure)
-        $notes = (@($notJudgedNote, $stripNote) | Where-Object { $_ }) -join '; '
+        # (the verdict reason comes first, then the notes that some saved play frames were not judged, then the masking and repeat notes, then the strip failure;
+        # a PARTIAL_FREEZE reason already says what the repeat note says, so the note stays in repeatedPlayFramesNote only)
+        $notes = (@($notJudgedNote, $observerNote, $maskNote, $(if ($v.verdict -cne 'PARTIAL_FREEZE') { $repeatNote }), $stripNote) | Where-Object { $_ }) -join '; '
         # a NOT_CAPTURED leg whose strip also failed keeps both: the capture count, any step reason from before the strip, then the strip failure
         if ($v.verdict -ceq 'NOT_CAPTURED' -and $stripNote) { $block.reason = (@($v.reason, $reasonBeforeStrip, $stripNote) | Where-Object { $_ }) -join '; ' }
         elseif ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
@@ -1959,11 +2044,14 @@ function Read-DvVisualCaptures {
     foreach ($f in @($appFrames)) {
         if ($null -eq $f) { continue }
         $kind = [string](Get-DvProp $f 'kind'); $index = [int](Get-DvProp $f 'index'); $file = [string](Get-DvProp $f 'file')
-        if ($kind -cnotin @('play', 'stop', 'paused') -or $file -cnotmatch '^(play-\d+|stop|paused)\.png$') { continue }
-        $legName = $(if ($kind -ceq 'play') { "$LegId-play-$index.png" } else { "$LegId-$kind.png" })
+        if ($kind -cnotin @('play', 'play_unbound', 'stop_unbound', 'stop', 'paused_unbound', 'paused') -or $file -cnotmatch '^(play-\d+|play-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$') { continue }
+        $isPlayKind = $kind -cin @('play', 'play_unbound')
+        $legName = $(if ($isPlayKind) { "$LegId-$($kind.Replace('_', '-'))-$index.png" } else { "$LegId-$($kind.Replace('_', '-')).png" })
         $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null; viewportAvailable = $true
                              displayFrame = Get-DvProp $f 'display_frame'; playActive = Get-DvProp $f 'play_active'; tailElapsedMs = Get-DvProp $f 'tail_elapsed_ms'
-                             captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason' }
+                             captureMs = Get-DvProp $f 'capture_ms'; viewport = Get-DvProp $f 'viewport'; saved = [bool](Get-DvProp $f 'saved'); appReason = Get-DvProp $f 'reason'
+                             serial = Get-DvProp $f 'serial'; paintedSerial = Get-DvProp $f 'painted_serial'; paintedSerialValid = Get-DvProp $f 'painted_serial_valid'
+                             labelBound = Get-DvProp $f 'label_bound'; labelBoundBasis = Get-DvProp $f 'label_bound_basis'; forcedPaintsBefore = Get-DvProp $f 'forced_paints_before' }
         $src = Join-Path $share $file
         if ($entry.saved -and (Test-Path -LiteralPath $src -PathType Leaf)) {
             $local = Join-Path $dir $legName
@@ -1974,22 +2062,60 @@ function Read-DvVisualCaptures {
                 if ($null -eq $hashPx) { $entry.viewportAvailable = $false }   # no usable viewport rectangle: the whole window is never hashed in its place
                 else {
                     $entry.contentHash = $hashPx.contentHash; $entry.viewportMean = $hashPx.mean; $entry.viewportStd = $hashPx.std
-                    if ($kind -cne 'play') { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1] -RequireViewport).rgb }
+                    if (-not $isPlayKind) { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1] -RequireViewport).rgb }
                 }
             } catch { $entry.appReason = "the runner could not read the image: $($_.Exception.GetType().Name)" }
         }
-        if ($kind -ceq 'paused') { $block.pausedSettled = Get-DvProp $f 'settled'; $block.pausedFrame = Get-DvProp $f 'settled_frame' }
-        if ($kind -ceq 'stop') { $block.stopFrame = Get-DvProp $f 'display_frame' }
+        if ($kind -ceq 'paused') {
+            $block.pausedSettled = Get-DvProp $f 'settled'; $block.pausedFrame = Get-DvProp $f 'settled_frame'
+            if ($null -ne $entry.labelBound) { $block.pausedLabelBound = [bool]$entry.labelBound }
+            $block.pausedLabelBoundBasis = $entry.labelBoundBasis
+        }
+        if ($kind -ceq 'stop') {
+            $block.stopFrame = Get-DvProp $f 'display_frame'
+            if ($null -ne $entry.labelBound) { $block.labelBound = [bool]$entry.labelBound }
+            $block.labelBoundBasis = $entry.labelBoundBasis
+        }
         $frames.Add([pscustomobject]$entry)
     }
     $block.frames = $frames.ToArray()
+    # r2: the frozen check is judged on the UNFORCED play captures whenever the app published any (a binding build); a build without them is judged
+    # on its play captures as before. The choice follows what the app NAMED, never what could be read: an unreadable unforced set is not swapped
+    # for the forced one (that swap is exactly the masking).
+    $judgeKind = $(if (@($frames | Where-Object { $_.kind -ceq 'play_unbound' }).Count -gt 0) { 'play_unbound' } else { 'play' })
+    $block.frozenJudgedOn = $judgeKind
+    # r3 (Dot 7dc103f1 B2): of the unforced play captures, only those no forced paint reached are judged -- the ones recording the same
+    # forced_paints_before as the first of them. One recording another count, or none (an r2 build), may show a forced paint, not the display's own.
+    $isOrdinal = { param($v) ($v -is [int] -or $v -is [long]) -and $v -ge 0 }
+    $pool = @($frames | Where-Object { $_.kind -ceq $judgeKind })
+    $baseOrdinal = $null
+    if ($judgeKind -ceq 'play_unbound') {
+        $first = @($pool | Sort-Object index) | Select-Object -First 1
+        if ($null -ne $first -and (& $isOrdinal $first.forcedPaintsBefore)) { $baseOrdinal = [long]$first.forcedPaintsBefore }
+        $clean = @($pool | Where-Object { $null -ne $baseOrdinal -and (& $isOrdinal $_.forcedPaintsBefore) -and [long]$_.forcedPaintsBefore -eq $baseOrdinal })
+        $block.observerPaintedPlayFrames = $pool.Count - $clean.Count
+        $pool = $clean
+        $stopUnbound = @($frames | Where-Object { $_.kind -ceq 'stop_unbound' }) | Select-Object -First 1
+        if ($null -ne $stopUnbound -and $null -ne $baseOrdinal -and (& $isOrdinal $stopUnbound.forcedPaintsBefore)) {
+            $block.stopUnboundObserverClean = ([long]$stopUnbound.forcedPaintsBefore -eq $baseOrdinal)
+        }
+    }
     # `playFrames` counts the JUDGED play frames (those with a usable viewport); `savedPlayFrames` the play PNGs the app saved and the runner copied;
     # `captured` is true when any was saved, so a leg whose every viewport is missing still says six pictures were captured and none judged.
-    $play = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.contentHash })
+    $play = @($pool | Where-Object { $_.contentHash })
     $block.playFrames = $play.Count
-    $block.savedPlayFrames = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.sha256 }).Count
+    $block.savedPlayFrames = @($frames | Where-Object { $_.kind -ceq $judgeKind -and $_.sha256 }).Count
     $block.captured = ($block.savedPlayFrames -gt 0)
-    $block.viewportUnavailablePlayFrames = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.sha256 -and -not $_.viewportAvailable }).Count
+    $block.viewportUnavailablePlayFrames = @($pool | Where-Object { $_.sha256 -and -not $_.viewportAvailable }).Count
+    if ([int]$block.observerPaintedPlayFrames -gt 0 -and $play.Count -ge 2) {
+        $observerNote = "$($block.observerPaintedPlayFrames) unforced play frame(s) followed a forced paint the others did not and were not judged; the other $($play.Count) were"
+        if (-not $block.reason) { $block.reason = $observerNote }
+    }
+    if ($judgeKind -ceq 'play_unbound') {
+        # the forced twins, reported beside the judged set: if forced and unforced disagree, the receipt says so rather than hiding it
+        $forced = @($frames | Where-Object { $_.kind -ceq 'play' -and $_.contentHash })
+        $block.forcedPlayDistinctContentHashes = @($forced | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
+    }
     if ($block.viewportUnavailablePlayFrames -gt 0 -and $play.Count -ge 2) {
         $notJudgedNote = "$($block.viewportUnavailablePlayFrames) saved play frame(s) have no usable viewport rectangle and were not judged; the other $($play.Count) were"
         if (-not $block.reason) { $block.reason = $notJudgedNote }
@@ -1997,20 +2123,53 @@ function Read-DvVisualCaptures {
     $block.distinctContentHashes = @($play | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
     $block.appDistinctDisplayFrames = @($play | ForEach-Object { $_.displayFrame } | Where-Object { $null -ne $_ -and [int]$_ -ge 0 } | Sort-Object -Unique).Count
     $block.flatPlayFrames = @($play | Where-Object { $null -ne $_.viewportStd -and [double]$_.viewportStd -lt $script:VisualFlatViewportStd }).Count
+    if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1) {
+        $maskNote = "the forced play captures show $($block.forcedPlayDistinctContentHashes) distinct pictures where the unforced ones show one: the force-paint would have masked this"
+        if (-not $block.reason) { $block.reason = $maskNote }
+    }
+    if ($judgeKind -ceq 'play_unbound' -and $block.sourceDifference -cne 'known-identical') {
+        # a display whose own paint stopped part-way: a judged unforced picture equal to the one before it while the app's label advanced
+        $ordered = @($play | Sort-Object index)
+        $block.repeatedPlayFrames = @(for ($i = 1; $i -lt $ordered.Count; $i++) {
+            $a = $ordered[$i - 1]; $b = $ordered[$i]
+            if ($b.contentHash -ceq $a.contentHash -and $null -ne $a.displayFrame -and $null -ne $b.displayFrame -and [int]$b.displayFrame -ne [int]$a.displayFrame) { $b.index }
+        }).Count
+        if ($block.repeatedPlayFrames -gt 0 -and $block.distinctContentHashes -gt 1) {
+            # the cause is named only over source frames known to differ; over unknown source content a repeat may be the source's own (Dot a5acb3c8)
+            $repeatNote = "$($block.repeatedPlayFrames) of the $($play.Count) unforced play captures repeat the picture before them while the app's label advanced: " + $(
+                if ($block.sourceDifference -ceq 'known-differ') { "the display's own paint stopped landing for part of the tail" }
+                else { "nothing records whether the source frames differ, so this is a possible partial freeze or repeated source pictures, not a proven cause" })
+            $block.repeatedPlayFramesNote = $repeatNote   # its own field: an earlier note in reason never hides it (r5, Grok G4)
+            if (-not $block.reason) { $block.reason = $repeatNote }
+        }
+    }
     $block.samePosition = ($null -ne $block.stopFrame -and $null -ne $block.pausedFrame -and [int]$block.stopFrame -ge 0 -and [int]$block.stopFrame -eq [int]$block.pausedFrame -and $block.pausedSettled -eq $true)
     if ($pixels.ContainsKey('stop') -and $pixels.ContainsKey('paused')) {
         $mad = Get-DvVisualMeanAbsDiff -A $pixels['stop'] -B $pixels['paused']
         $block.playVsPausedMeanAbsDiffPerChannel = $mad
         $block.playVsPausedMeanAbsDiff = ($mad | Measure-Object -Maximum).Maximum
     }
-    $tiles = @($frames | Sort-Object @{ Expression = { @{ play = 0; stop = 1; paused = 2 }[$_.kind] } }, index | ForEach-Object {
-        $label = $(if ($_.kind -ceq 'play') { "play $($_.index)  f=$($_.displayFrame)" } elseif ($_.kind -ceq 'stop') { "paused instant  f=$($_.displayFrame)" } else { "paused full quality  f=$($block.pausedFrame)" })
+    if ($pixels.ContainsKey('stop_unbound') -and $pixels.ContainsKey('paused')) {
+        $block.stopUnboundVsPausedMeanAbsDiff = (Get-DvVisualMeanAbsDiff -A $pixels['stop_unbound'] -B $pixels['paused'] | Measure-Object -Maximum).Maximum
+    }
+    if ($pixels.ContainsKey('stop_unbound') -and $pixels.ContainsKey('stop')) {
+        $block.stopUnboundVsStopMeanAbsDiff = (Get-DvVisualMeanAbsDiff -A $pixels['stop_unbound'] -B $pixels['stop'] | Measure-Object -Maximum).Maximum
+    }
+    if ($pixels.ContainsKey('paused_unbound') -and $pixels.ContainsKey('paused')) {
+        $block.pausedUnboundVsPausedMeanAbsDiff = (Get-DvVisualMeanAbsDiff -A $pixels['paused_unbound'] -B $pixels['paused'] | Measure-Object -Maximum).Maximum
+    }
+    $tiles = @($frames | Sort-Object @{ Expression = { @{ play_unbound = 0; play = 1; stop_unbound = 2; stop = 3; paused_unbound = 4; paused = 5 }[$_.kind] } }, index | ForEach-Object {
+        $label = $(if ($_.kind -ceq 'play') { "play $($_.index)  f=$($_.displayFrame)" } elseif ($_.kind -ceq 'play_unbound') { "play $($_.index), unforced  f=$($_.displayFrame)" }
+                   elseif ($_.kind -ceq 'stop_unbound') { "paused instant, unforced  f=$($_.displayFrame)" }
+                   elseif ($_.kind -ceq 'paused_unbound') { "paused full quality, unforced  f=$($block.pausedFrame)" }
+                   elseif ($_.kind -ceq 'stop') { "paused instant  f=$($_.displayFrame)$(if ($null -ne $_.labelBound) { "  bound=$([bool]$_.labelBound)" })" } else { "paused full quality  f=$($block.pausedFrame)" })
         [pscustomobject]@{ path = $(if ($_.sha256) { Join-Path $dir $_.file } else { $null }); viewport = $_.viewport; label = $label } })
     if ($tiles.Count -gt 0) {
         $v = Get-DvVisualVerdict -Requested $true -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
             -AppDistinctDisplayFrames ([int]$block.appDistinctDisplayFrames) -FlatPlayFrames ([int]$block.flatPlayFrames) -PlayVsPausedMeanAbsDiff $block.playVsPausedMeanAbsDiff -SamePosition ([bool]$block.samePosition) `
-            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames)
-        $head = "$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)"
+            -SourceDifference ([string]$block.sourceDifference) -ViewportUnavailablePlayFrames ([int]$block.viewportUnavailablePlayFrames) -LabelBound $block.labelBound `
+            -PausedLabelBound $block.pausedLabelBound -ObserverPaintedPlayFrames ([int]$block.observerPaintedPlayFrames) -RepeatedPlayFrames ([int]$block.repeatedPlayFrames)
+        $head ="$Header  visual=$($v.verdict)  distinct=$($block.distinctContentHashes)/$($block.playFrames)  play-vs-paused=$($block.playVsPausedMeanAbsDiff)"
         try {
             $block.stripPath = New-DvVisualStrip -Tiles $tiles -OutPath (Join-Path $dir "$LegId-strip.png") -Header $head.Trim()
             $block.stripSha256 = Get-DvSha256OfFile $block.stripPath
@@ -2831,6 +2990,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
