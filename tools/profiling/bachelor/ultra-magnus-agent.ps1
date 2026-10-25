@@ -1410,7 +1410,17 @@ function Invoke-AdoptStartedJob {
     $killedProcessIds = @()
     try {
         $startedUtc = ([DateTimeOffset]::Parse([string]$Marker.startedUtc)).UtcDateTime
-        $deadline = $startedUtc.AddSeconds([int]$Marker.timeoutSec)
+        # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r3 (transition edge): a stage marker written by an agent that predates the ceiling has exemptClass stage
+        # and NO stageCeiling, so its timeoutSec is unclamped. Clamp it to StageExemptMaxSec here and type the kill as the live path does.
+        $adoptedCeiling = if ($null -ne $Marker.admission) { $Marker.admission.stageCeiling } else { $null }
+        $adoptedTimeoutSec = [int]$Marker.timeoutSec
+        $adoptedRequestedSec = if ($null -ne $adoptedCeiling) { $adoptedCeiling.requestedSec } else { $adoptedTimeoutSec }
+        $adoptedClamped = ($null -ne $adoptedCeiling -and $adoptedCeiling.clamped -eq $true)
+        if ($null -eq $adoptedCeiling -and $null -ne $Marker.admission -and [string]$Marker.admission.exemptClass -ceq "stage" -and $adoptedTimeoutSec -gt $StageExemptMaxSec) {
+            $adoptedTimeoutSec = [int]$StageExemptMaxSec
+            $adoptedClamped = $true
+        }
+        $deadline = $startedUtc.AddSeconds($adoptedTimeoutSec)
         $waitSliceMs = [Math]::Max(250, [Math]::Min(5000, $PollSeconds * 1000))
         while ((Get-Date).ToUniversalTime() -lt $deadline) {
             $currentMatch = Test-ProcessIdentityMatch -ProcessId ([int]$Marker.childPid) -ExpectedStartUtc ([string]$Marker.childStartUtc) -ExpectedStartEpochMs $Marker.childStartEpochMs -ExpectedImagePath $Marker.childImagePath
@@ -1424,15 +1434,14 @@ function Invoke-AdoptStartedJob {
         if ($finalMatch.matches) {
             $timedOut = $true
             $killedProcessIds = @(Stop-ProcessTree -RootProcessId ([int]$Marker.childPid) -RootStartUtc ([string]$Marker.childStartUtc) -RootStartEpochMs $Marker.childStartEpochMs -RootImagePath $Marker.childImagePath)
-            "adopted child timed out after $($Marker.timeoutSec)s; killed process tree pids=$($killedProcessIds -join ',')" |
+            "adopted child timed out after ${adoptedTimeoutSec}s; killed process tree pids=$($killedProcessIds -join ',')" |
                 Add-Content -Encoding ASCII $Marker.errFile
-            # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: an adopted stage child killed at a bound that was the exempt ceiling's (marker timeoutSec is the clamped
-            # value) is typed as the live path types it. A non-stage, unclamped or pre-ceiling marker has no stageCeiling and gets no reason.
-            $adoptedCeiling = if ($null -ne $Marker.admission) { $Marker.admission.stageCeiling } else { $null }
-            if ($null -ne $adoptedCeiling -and $adoptedCeiling.clamped -eq $true) {
-                "STAGE_EXEMPT_CEILING_EXCEEDED: adopted staging step ran past its $($Marker.timeoutSec)s exempt ceiling (asked for $($adoptedCeiling.requestedSec)s); a lease-exempt job may not heat the host for longer" |
+            # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: an adopted stage child killed at a bound that was the exempt ceiling's (the marker's timeoutSec when
+            # it was clamped, or the r3 clamp above) is typed as the live path types it. A non-stage or unclamped marker gets no reason.
+            if ($adoptedClamped) {
+                "STAGE_EXEMPT_CEILING_EXCEEDED: adopted staging step ran past its ${adoptedTimeoutSec}s exempt ceiling (asked for ${adoptedRequestedSec}s); a lease-exempt job may not heat the host for longer" |
                     Add-Content -Encoding ASCII $Marker.errFile
-                Add-AgentLogLine "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$jobId ceiling=$($Marker.timeoutSec)s adopted killed pids=$($killedProcessIds -join ',')"
+                Add-AgentLogLine "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$jobId ceiling=${adoptedTimeoutSec}s adopted killed pids=$($killedProcessIds -join ',')"
             }
         }
     }
@@ -1447,7 +1456,7 @@ function Invoke-AdoptStartedJob {
         startedUtc        = $Marker.startedUtc
         endedUtc          = (Get-Date).ToUniversalTime().ToString("o")
         host              = $env:COMPUTERNAME
-        timeoutSec        = $Marker.timeoutSec
+        timeoutSec        = $adoptedTimeoutSec
         timedOut          = $timedOut
         cancelled         = $false
         queueExpired      = $false
@@ -2376,6 +2385,8 @@ function Get-GateExemptClass {
     if ($JobId -match $GateExemptJobPattern) { return "light" }
     # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: stage = the immutable default grammar AND the effective pattern, so an override can only
     # NARROW. The load-time check on -GateStageJobPattern is a sampled guard; this AND is the bound that holds for any override.
+    # r3: fail CLOSED. An empty or missing default grammar matches every id (-cmatch '' is true), which would leave the override alone deciding.
+    if ([string]::IsNullOrEmpty($script:StageGrammarDefault)) { return $null }
     if (($JobId -cmatch $script:StageGrammarDefault) -and ($JobId -cmatch $GateStageJobPattern)) { return "stage" }
     return $null
 }

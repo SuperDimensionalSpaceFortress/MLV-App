@@ -165,9 +165,12 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertEqual(queued.count("$effectiveTimeoutSec = $StageExemptMaxSec"), 1)
         self.assertIn("STAGE_EXEMPT_CEILING_APPLIED", stage_branch)
         self.assertIn("STAGE_EXEMPT_CEILING_EXCEEDED: ", queued)
-        # The parameter declaration plus the stage branch are the only places the ceiling appears.
-        self.assertEqual(self.code.count("$StageExemptMaxSec"), 1 + stage_branch.count("$StageExemptMaxSec"),
-                         "the ceiling is read only by the stage branch")
+        # The parameter declaration, the stage branch and (r3) the adopt-path clamp of a pre-ceiling marker are the only places the ceiling appears.
+        adopt_fn = self.code[self.code.index("function Invoke-AdoptStartedJob"):]
+        adopt_fn = adopt_fn[:adopt_fn.index("\n}\n")]
+        self.assertEqual(self.code.count("$StageExemptMaxSec"), 1 + stage_branch.count("$StageExemptMaxSec") + adopt_fn.count("$StageExemptMaxSec"),
+                         "the ceiling is read only by the stage branch and the adopt clamp")
+        self.assertEqual(adopt_fn.count("$StageExemptMaxSec"), 2)
         # r2: classify = the immutable default grammar AND the effective pattern (an override only narrows), and an adopted stage child
         # killed at the ceiling is typed too. Behaviour is driven by the .ps1 test (classify-and-override, stage-ceiling-kill, stage-ceiling-adopt).
         self.assertIn("stage-exempt r3 (2026-10-25)", self.text)
@@ -178,6 +181,10 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         adopt = self.code[self.code.index("function Invoke-AdoptStartedJob"):]
         adopt = adopt[:adopt.index("\n}\n")]
         self.assertIn("STAGE_EXEMPT_CEILING_EXCEEDED: adopted staging step", adopt)
+        # r3: the classifier fails closed on an empty default grammar, and an un-ceilinged stage marker is clamped at the adopt read.
+        # Behaviour is driven by the .ps1 test (classify-and-override, stage-ceiling-adopt legacy-over-ceiling).
+        self.assertIn("if ([string]::IsNullOrEmpty($script:StageGrammarDefault)) { return $null }", classify)
+        self.assertIn('[string]$Marker.admission.exemptClass -ceq "stage" -and $adoptedTimeoutSec -gt $StageExemptMaxSec', adopt)
 
     def test_exempt_jobs_run_during_a_gate_wait(self) -> None:
         # GATE-MAINT-DISPATCH-DURING-WAIT-1: a job waiting on the gate has no cap, and the inbox loop is blocked

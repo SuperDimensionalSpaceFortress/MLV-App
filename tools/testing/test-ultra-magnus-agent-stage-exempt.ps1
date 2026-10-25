@@ -493,6 +493,18 @@ try {
                 Assert-True ($null -eq $c) "classify-and-override: with override '$ov' in force, $outside is NOT stage (gated): '$c'"
                 $per[$ov] = $c
             }
+            # r3 (opus r2 hardening): fail CLOSED. An empty or missing default grammar matches everything (-cmatch '' is true), so the override alone
+            # would decide; the classifier must gate every id instead, not fall through to the override.
+            $savedGrammar = $script:StageGrammarDefault
+            try {
+                $GateStageJobPattern = '.*'
+                foreach ($emptyGrammar in @('', $null)) {
+                    $script:StageGrammarDefault = $emptyGrammar
+                    $c = Get-GateExemptClass -JobId $stageIds.fixtureTiny
+                    Assert-True ($null -eq $c) "classify-and-override: with the default grammar '$emptyGrammar' (empty/null) and '.*' in force, the classifier fails closed (gated), not stage: '$c'"
+                }
+            }
+            finally { $script:StageGrammarDefault = $savedGrammar }
             # An override still NARROWS: an id the default admits but the override does not match is gated; one both admit stays stage.
             $GateStageJobPattern = '^attr3-stage-fixture-tiny_dual_iso-[0-9a-f]{12}\z'
             $c = Get-GateExemptClass -JobId $stageIds.fixtureLarge
@@ -572,39 +584,68 @@ try {
     # Invoke-AdoptStartedJob (agent restart) kills an adopted child at the marker's timeoutSec. For a stage job the marker's admission
     # carries stageCeiling, and that bound is the ceiling's when clamped: the kill must be typed as the live path types it.
     if (Test-Case 'stage-ceiling-adopt') {
+        # r3 (sol/dot/opus/fable r2 + hub ACK 2026-10-25T12:47Z): the case used to kill the child in its own finally BEFORE asserting, and
+        # Invoke-AdoptStartedJob sets exit 124 from its own deadline, so a Stop-ProcessTree that killed nothing still passed. Each variant now
+        # waits (bounded, NOT killing) for the adopted child to exit and requires the agent's own killedProcessIds to name its pid, both BEFORE
+        # the fixture cleanup below runs.
+        $savedCeiling = $StageExemptMaxSec
         $per = [ordered]@{}
-        foreach ($variant in @('stage-clamped', 'stage-unclamped', 'gated')) {
-            Reset-Case
-            $id = $stageIds.attrStage
-            $outF = Join-Path $fx "adopt-$variant.out.txt"; $errF = Join-Path $fx "adopt-$variant.err.txt"
-            $sleepJob = New-SleepJob $id 40
-            $launch = Start-WindowlessRedirectedProcess -FilePath $psExe -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $sleepJob.FullName) -OutFile $outF -ErrFile $errF -WorkingDirectory $fx
-            try {
-                $ident = Get-ProcessIdentity -ProcessId $launch.Process.Id
-                $admission = switch ($variant) {
-                    'stage-clamped' { [pscustomobject]@{ label = 'exempt-light'; state = 'exempt'; exemptClass = 'stage'; stageCeiling = [pscustomobject]@{ ceilingSec = 1; requestedSec = 3600; clamped = $true }; why = 'unit' } }
-                    'stage-unclamped' { [pscustomobject]@{ label = 'exempt-light'; state = 'exempt'; exemptClass = 'stage'; stageCeiling = [pscustomobject]@{ ceilingSec = 300; requestedSec = 1; clamped = $false }; why = 'unit' } }
-                    default { [pscustomobject]@{ label = 'clear'; state = 'clear'; why = 'unit' } }
+        # name, marker timeoutSec, seconds the marker says the child already ran, StageExemptMaxSec for the variant, stageCeiling in the admission
+        # (the legacy variants model a marker written by a pre-ceiling agent: exemptClass stage, NO stageCeiling), and whether a ceiling reason is expected.
+        $variants = @(
+            @{ name = 'stage-clamped';   timeoutSec = 1;    ranSec = 0;    ceilingSec = 300; admission = 'clamped';   typed = $true }
+            @{ name = 'stage-unclamped'; timeoutSec = 1;    ranSec = 0;    ceilingSec = 300; admission = 'unclamped'; typed = $false }
+            @{ name = 'gated';           timeoutSec = 1;    ranSec = 0;    ceilingSec = 300; admission = 'gated';     typed = $false }
+            # transition edge (fable key3 r2): the old marker's timeoutSec (3600) exceeds the ceiling (1); it ran 3599 s, so the old bound ends in ~1 s
+            # on an unfixed agent (no typed reason, RED) while the clamp ends it at once with the typed reason.
+            @{ name = 'legacy-over-ceiling';   timeoutSec = 3600; ranSec = 3599; ceilingSec = 1;   admission = 'legacy'; typed = $true }
+            @{ name = 'legacy-within-ceiling'; timeoutSec = 1;    ranSec = 0;    ceilingSec = 300; admission = 'legacy'; typed = $false }
+        )
+        try {
+            foreach ($v in $variants) {
+                $variant = $v.name
+                Reset-Case
+                $StageExemptMaxSec = $v.ceilingSec
+                $id = $stageIds.attrStage
+                $outF = Join-Path $fx "adopt-$variant.out.txt"; $errF = Join-Path $fx "adopt-$variant.err.txt"
+                $sleepJob = New-SleepJob $id 40
+                $launch = Start-WindowlessRedirectedProcess -FilePath $psExe -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $sleepJob.FullName) -OutFile $outF -ErrFile $errF -WorkingDirectory $fx
+                $childPid = $launch.Process.Id
+                $childGone = $false
+                try {
+                    $ident = Get-ProcessIdentity -ProcessId $childPid
+                    $admission = switch ($v.admission) {
+                        'clamped' { [pscustomobject]@{ label = 'exempt-light'; state = 'exempt'; exemptClass = 'stage'; stageCeiling = [pscustomobject]@{ ceilingSec = 1; requestedSec = 3600; clamped = $true }; why = 'unit' } }
+                        'unclamped' { [pscustomobject]@{ label = 'exempt-light'; state = 'exempt'; exemptClass = 'stage'; stageCeiling = [pscustomobject]@{ ceilingSec = 300; requestedSec = 1; clamped = $false }; why = 'unit' } }
+                        'legacy' { [pscustomobject]@{ label = 'exempt-light'; state = 'exempt'; exemptClass = 'stage'; why = 'unit' } }
+                        default { [pscustomobject]@{ label = 'clear'; state = 'clear'; why = 'unit' } }
+                    }
+                    $marker = [pscustomobject]@{ jobId = $id; childPid = $childPid; childStartUtc = $ident.startUtc; childStartEpochMs = $ident.startEpochMs; childImagePath = $ident.imagePath
+                        startedUtc = (Get-Date).ToUniversalTime().AddSeconds(-1 * $v.ranSec).ToString('o'); timeoutSec = $v.timeoutSec; outFile = $outF; errFile = $errF; sourceInboxPath = ''; admission = $admission }
+                    $sw = [Diagnostics.Stopwatch]::StartNew()
+                    Invoke-AdoptStartedJob -Marker $marker -MarkerPath (Join-Path $fx "adopt-$variant.started.json") -Match ([pscustomobject]@{})
+                    $sw.Stop()
+                    # Wait only (no kill) for the child to be gone: it is the AGENT's kill that must have ended it.
+                    $childGone = $launch.Process.WaitForExit(5000)
                 }
-                $marker = [pscustomobject]@{ jobId = $id; childPid = $launch.Process.Id; childStartUtc = $ident.startUtc; childStartEpochMs = $ident.startEpochMs; childImagePath = $ident.imagePath
-                    startedUtc = (Get-Date).ToUniversalTime().ToString('o'); timeoutSec = 1; outFile = $outF; errFile = $errF; sourceInboxPath = ''; admission = $admission }
-                $sw = [Diagnostics.Stopwatch]::StartNew()
-                Invoke-AdoptStartedJob -Marker $marker -MarkerPath (Join-Path $fx "adopt-$variant.started.json") -Match ([pscustomobject]@{})
-                $sw.Stop()
+                finally { try { if (-not $launch.Process.HasExited) { $launch.Process.Kill($true) } } catch { }; Complete-WindowlessRedirectedProcess -Launch $launch; $launch.Process.Dispose() }
+                $r = $script:JobResults[$id]
+                Assert-True ($null -ne $r -and $r.adopted -eq $true -and $r.exitCode -eq 124 -and $r.timedOut -eq $true) "stage-ceiling-adopt ($variant): the adopted child past its bound is killed, 124: $($r | ConvertTo-Json -Compress -Depth 3)"
+                Assert-True $childGone "stage-ceiling-adopt ($variant): the adopted child pid $childPid exited (by the agent's kill, before the fixture cleanup) within 5 s of the adopt call"
+                Assert-True (@($r.killedProcessIds) -contains $childPid) "stage-ceiling-adopt ($variant): the agent's killedProcessIds names the adopted child ${childPid}: [$(@($r.killedProcessIds) -join ',')]"
+                Assert-True ($sw.Elapsed.TotalSeconds -lt 30) "stage-ceiling-adopt ($variant): killed at the bound, not run to its 40 s end: $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
+                $typed = ($r.stderr -match 'STAGE_EXEMPT_CEILING_EXCEEDED: ')
+                if ($v.typed) {
+                    Assert-True $typed "stage-ceiling-adopt ($variant): an adopted stage child killed at the ceiling carries the typed reason: $($r.stderr)"
+                    Assert-True (@($script:Log | Where-Object { $_ -like "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$id *" }).Count -eq 1) "stage-ceiling-adopt ($variant): typed log line"
+                }
+                else { Assert-True (-not $typed) "stage-ceiling-adopt ($variant): no ceiling reason when the bound was not the ceiling's: $($r.stderr)" }
+                if ($variant -eq 'stage-clamped') { Assert-True ($r.admission.stageCeiling.clamped -eq $true) "stage-ceiling-adopt ($variant): the recovered admission keeps stageCeiling" }
+                if ($variant -eq 'legacy-over-ceiling') { Assert-True ($r.timeoutSec -eq 1) "stage-ceiling-adopt ($variant): the result reports the clamped bound, not the old marker's 3600 s: $($r.timeoutSec)" }
+                $per[$variant] = [ordered]@{ exit = $r.exitCode; typed = $typed; killedPids = @($r.killedProcessIds); childGone = $childGone }
             }
-            finally { try { if (-not $launch.Process.HasExited) { $launch.Process.Kill($true) } } catch { }; Complete-WindowlessRedirectedProcess -Launch $launch; $launch.Process.Dispose() }
-            $r = $script:JobResults[$id]
-            Assert-True ($null -ne $r -and $r.adopted -eq $true -and $r.exitCode -eq 124 -and $r.timedOut -eq $true) "stage-ceiling-adopt ($variant): the adopted child past its 1 s bound is killed, 124: $($r | ConvertTo-Json -Compress -Depth 3)"
-            Assert-True ($sw.Elapsed.TotalSeconds -lt 30) "stage-ceiling-adopt ($variant): killed at the bound, not run to its 40 s end: $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
-            $typed = ($r.stderr -match 'STAGE_EXEMPT_CEILING_EXCEEDED: ')
-            if ($variant -eq 'stage-clamped') {
-                Assert-True $typed "stage-ceiling-adopt ($variant): an adopted stage child killed at the ceiling carries the typed reason: $($r.stderr)"
-                Assert-True (@($script:Log | Where-Object { $_ -like "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$id *" }).Count -eq 1) "stage-ceiling-adopt ($variant): typed log line"
-                Assert-True ($r.admission.stageCeiling.clamped -eq $true) "stage-ceiling-adopt ($variant): the recovered admission keeps stageCeiling"
-            }
-            else { Assert-True (-not $typed) "stage-ceiling-adopt ($variant): no ceiling reason when the bound was not the ceiling's: $($r.stderr)" }
-            $per[$variant] = [ordered]@{ exit = $r.exitCode; typed = $typed }
         }
+        finally { $StageExemptMaxSec = $savedCeiling }
         $results.stageCeilingAdopt = $per
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
