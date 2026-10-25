@@ -8,9 +8,10 @@
 //      synthetic frame: 16-bit (ApplyCpuReferenceTimed, and To8's 16-bit route,
 //      the tier-1-off default) and fused 8-bit, at OpenMP 1 and 4. The team size
 //      the pass reports is read inside its region.
-//  F3  every parity-fixture stage config: admitted ones match; refused ones name
-//      the stage, fall back to the reference loop and still match; the kill
-//      switch does the same.
+//  F3  every parity-fixture stage config, each on a fresh processing object and
+//      asserted to enable exactly the stages it is named for: admitted ones match;
+//      refused ones name the stage, fall back to the reference loop and still
+//      match; the kill switch does the same.
 //  F4  opt-in (MLVAPP_PREP_POINTWISE_FAST_BENCH=1, never in CI): reference vs
 //      fast on a std::thread, as the prep thread runs it. Printed, never asserted.
 // No assertion here reads a duration.
@@ -68,6 +69,15 @@ void openFixture(MlvPipelineFixture & fixture)
     QString error_message;
     ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
     ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_hq.marxml"), &error_message));
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+}
+
+/* A new processing object on the open clip, with the receipt applied again (which
+ * also resets the clip's dual-ISO mode). */
+void freshProcessing(MlvPipelineFixture & fixture)
+{
+    QString error_message;
+    ASSERT_TRUE(fixture.resetProcessing(&error_message));
     ASSERT_TRUE(fixture.applyReceipt(&error_message));
 }
 
@@ -467,8 +477,6 @@ TEST(PrepPointwiseFast, LookAssistOnAndOffAreAdmittedAndByteIdenticalAtFullSize)
 
 TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
 {
-    MlvPipelineFixture fixture;
-    openFixture(fixture);
     const int w = kMatrixWidth;
     const int h = kMatrixHeight;
     const std::vector<uint16_t> frame = makeSyntheticFrame(w, h, 0xC0FFEEu);
@@ -540,13 +548,30 @@ TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
                   for (int c = 0; c < 3; ++c)
                       lut->cube[e * 3 + c] = static_cast<float>((e * 3 + c) % dim) / (dim - 1);
               p->lut_on = 1; }, 0 },
+        /* Intentional combinations, named as such (the single-stage cases above
+         * once reached these only through settings left on a shared object). */
+        { "combo_toning_saturation_vibrance_contrast", "",
+          kStageCreative | kStageToning | kStageSaturation | kStageVibrance | kStageInLoopContrast,
+          [](processingObject_t * p) {
+              processingAllowCreativeAdjustments(p); processingSetToning(p, 255, 192, 0, 40);
+              processingSetSaturation(p, 1.5); processingSetVibrance(p, 0.6); processingSetSimpleContrast(p, 1.0); }, 0 },
+        { "combo_no_camera_matrix_wb_3000k", "", kStageNoCameraMatrix | kStageWb, [](processingObject_t * p) {
+              p->use_cam_matrix = 0; processingSetWhiteBalance(p, 3000.0, 0.0); }, 0 },
+        { "combo_m16_la_on_no_camera_matrix", "", kM16 | kStageNoCameraMatrix, [](processingObject_t * p) {
+              applyM16LookAssistPreset(p); p->use_cam_matrix = 0; }, 1 },
     };
 
     int checked = 0;
-    const ReceiptBaseline baseline = captureBaseline(fixture.processing());
+    /* One open clip; a fresh processing object per case, so nothing one case sets
+     * reaches the next (reopening the clip per case costs ~2 s each in its first
+     * dual-ISO render). */
+    MlvPipelineFixture fixture;
+    openFixture(fixture);
     std::string stageMismatches;
     for (const Case & c : cases)
     {
+        freshProcessing(fixture);
+        const ReceiptBaseline baseline = captureBaseline(fixture.processing());
         GpuPreviewProcessingConfig config = buildConfig(fixture, c.setup);
         const uint32_t stages = caseStageMask(config, fixture.processing(), baseline);
         if (stages != c.stages)
