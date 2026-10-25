@@ -1010,6 +1010,58 @@ function Get-VenueLeaseBudgetWait {
     [pscustomobject]@{ reason = $reason; waitSec = [int][Math]::Ceiling(($t - $now).TotalSeconds); openUtc = $t; usedSec = $u; budgetRoomSec = [int][Math]::Min($CapSec, $BudgetSec - $u); lastEndUtc = $lastEnd }
 }
 
+function Get-VenueLeaseCaps {
+    <#
+    .SYNOPSIS
+    BACHELOR-DEDICATED-CAPS-RUNNER-1: Bachelor's heavy-slot.py lease caps, read from the text of its heavy-slot.lease.json (printed by the runner's exempt probe job) with
+    the rules heavy-slot.py applies: enabled is true; max_minutes, pending_max_minutes, cooldown_minutes, max_fraction_per_3h and renew_stale_s are numbers >= 0;
+    max_minutes > 0. Anything else (empty, missing file, not JSON, invalid) is the FALLBACK: the old mirrored constants, which are the tightest the owner ever set, so
+    an unreadable file never loosens a cap. cooldown = cooldown_minutes*60, budget = max_fraction_per_3h*WindowSec (at most the window), cap = min(MaxCapSec, max_minutes*60).
+    .OUTPUTS
+    [pscustomobject]@{ source (live | fallback); reason ($null when live); cooldownSec; budgetSec; capSec }
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Text = '', [int]$WindowSec = 10800, [int]$FallbackCooldownSec = 1800, [int]$FallbackBudgetSec = 5400, [int]$MaxCapSec = 2700)
+    $fallback = { param([string]$Why) [pscustomobject]@{ source = 'fallback'; reason = $Why; cooldownSec = $FallbackCooldownSec; budgetSec = $FallbackBudgetSec; capSec = $MaxCapSec } }
+    if ([string]::IsNullOrWhiteSpace($Text)) { return (& $fallback 'probe-printed-nothing') }
+    $j = try { $Text | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+    if ($null -eq $j -or $j -isnot [pscustomobject]) { return (& $fallback 'not-a-json-object') }
+    if ($j.enabled -isnot [bool] -or -not $j.enabled) { return (& $fallback 'enabled-is-not-true') }
+    $v = @{}
+    foreach ($k in 'max_minutes', 'pending_max_minutes', 'cooldown_minutes', 'max_fraction_per_3h', 'renew_stale_s') {
+        $x = $j.$k
+        $num = ($x -is [int] -or $x -is [long] -or $x -is [double] -or $x -is [decimal])
+        if (-not $num -or $x -lt 0) { return (& $fallback "$k-is-not-a-number-at-least-0") }
+        $v[$k] = [double]$x
+    }
+    if ($v['max_minutes'] -le 0) { return (& $fallback 'max_minutes-is-not-above-0') }
+    [pscustomobject]@{ source = 'live'; reason = $null
+        cooldownSec = [int][Math]::Min(86400, [Math]::Ceiling($v['cooldown_minutes'] * 60))
+        budgetSec = [int][Math]::Floor([Math]::Min($WindowSec, $v['max_fraction_per_3h'] * $WindowSec))
+        capSec = [int][Math]::Floor([Math]::Min($MaxCapSec, $v['max_minutes'] * 60)) }
+}
+
+function Resolve-VenueLeaseCaps {
+    <#
+    .SYNOPSIS
+    The caps a run uses: the live ones (Get-VenueLeaseCaps), unless the caller passed one explicitly. A caller may only TIGHTEN: a cooldown shorter than the live one, or a
+    budget above it, is LEASE_CAP_RELAXED, except with -AllowRelax (an offline stub um-run, the old shortening rule). The lease cap is the smaller of -CapSec and the live one.
+    .OUTPUTS
+    [pscustomobject]@{ ok; error; cooldownSec; budgetSec; capSec }
+    #>
+    param([Parameter(Mandatory)]$Caps, [int]$CooldownSec, [bool]$CooldownExplicit = $false, [int]$BudgetSec, [bool]$BudgetExplicit = $false, [int]$CapSec = 2700, [bool]$AllowRelax = $false)
+    $bad = { param([string]$Msg) [pscustomobject]@{ ok = $false; error = "LEASE_CAP_RELAXED $Msg"; cooldownSec = $null; budgetSec = $null; capSec = $null } }
+    $cd = $Caps.cooldownSec; $bud = $Caps.budgetSec
+    if ($CooldownExplicit) {
+        if ($CooldownSec -lt $Caps.cooldownSec -and -not $AllowRelax) { return (& $bad "-LeaseCooldownSec $CooldownSec is shorter than Bachelor's cooldown ($($Caps.cooldownSec) s, source=$($Caps.source))") }
+        $cd = $CooldownSec
+    }
+    if ($BudgetExplicit) {
+        if ($BudgetSec -gt $Caps.budgetSec -and -not $AllowRelax) { return (& $bad "-LeaseBudgetSec $BudgetSec is above Bachelor's budget ($($Caps.budgetSec) s per window, source=$($Caps.source))") }
+        $bud = $BudgetSec
+    }
+    [pscustomobject]@{ ok = $true; error = $null; cooldownSec = [int]$cd; budgetSec = [int]$bud; capSec = [int][Math]::Min($CapSec, $Caps.capSec) }
+}
+
 function Invoke-VenueBoundedProcess {
     <#
     .SYNOPSIS
@@ -1050,5 +1102,5 @@ Export-ModuleMember -Function Get-VenueDriverScriptMissing, Get-VenueMainRoot, G
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Start-VenueJobLiveness, Stop-VenueJobLiveness
