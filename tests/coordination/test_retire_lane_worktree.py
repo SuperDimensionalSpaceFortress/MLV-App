@@ -1607,7 +1607,9 @@ def _spawn_proven_alive(tmp, name, cwd, attempts=3):
     """A sleeping holder that has PROVEN it is running: it writes a ready file as its first act and the caller waits for it. A bare
     Popen only proves CreateProcess returned; a pwsh that dies at startup under host load (no stderr, DEVNULL) leaves a pid the sweep
     rightly never lists, which reads as a gate miss (CI-FLAKE-RETIRE-CWD-UNKNOWN-PID-1, merge_group 40157682070). Only the holder's
-    STARTUP is retried, before any product code runs; the sleep outlives any gate call so it cannot expire mid-scan."""
+    STARTUP is retried, before any product code runs. The 600 s sleep outlives any scan shorter than 600 s, but _gate_real passes no
+    subprocess timeout, so that is a bound on the fixture and not a guarantee; a longer scan is caught by the caller's post-scan
+    p.poll() assertion, which fails loudly as a fixture error and can never turn into a false pass."""
     for attempt in range(attempts):
         ready = Path(tmp) / f"{name}-{attempt}.ready"
         p = _spawn(["-Command", f"[IO.File]::WriteAllText('{ready}', 'up'); Start-Sleep -Seconds 600"], cwd=cwd)
