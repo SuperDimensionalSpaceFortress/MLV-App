@@ -208,7 +208,9 @@ if (Test-HubHost) {
 #   sol    -- review key A (found 51 blockers fable missed vs 1 the other way, 191 paired reviews)
 #             and co-planner with opus.
 #   luna   -- breadth recon.
-#   astra  -- tie-breaker / design arbiter on contested designs; never xhigh.
+#   astra  -- optional diversity seat (MODEL-POSTURE-2026-10-22, bus R19.1): never a default, never a
+#             gate, never the only Codex seat a procedure waits for; a round using it records
+#             `astra: diversity`. Design-pass and arbiter duties go to the sol tier. Never xhigh.
 $LANES = @{
     opus   = @{ engine = 'claude'; model = 'opus';   effort = 'high'; role = 'orchestrator-design-planner-review-key-b' }
     sonnet = @{ engine = 'claude'; model = 'sonnet'; effort = 'high'; role = 'default-implementer' }

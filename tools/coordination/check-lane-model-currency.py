@@ -37,7 +37,16 @@ Exit code: 0 overall CURRENT, 1 at least one STALE-MODEL or BAD-EFFORT, 2 the ru
 unreadable, 3 overall INCOMPLETE or NO-DATA (evidence missing, not a violation). One JSON object with
 --json, else a short table.
 
+--posture swaps the receipt check for a text guard (MODEL-POSTURE-R19-ADOPT-1, bus R19.1 clause 3):
+Astra is an occasional diversity seat, never a default or a gate. It refuses an
+agents/orchestration-tiering.md table row that names Astra without saying optional / never a default /
+never a gate / `astra: diversity` or that names Astra ahead of the Sol tier, and a tools/coordination/
+Invoke-Lane.ps1 astra comment that does not say the same (or still calls astra the tie-breaker).
+Exit 0 clean, 1 a violation, 2 a file unreadable. The `role` string value in $LANES is not judged: a
+guardrail test pins it, so only its comment carries the posture.
+
 Usage: python check-lane-model-currency.py [--runs-dir DIR] [--since-hours N] [--newest FAMILY=ID]... [--json]
+       python check-lane-model-currency.py --posture [--repo-root DIR]
 """
 import argparse
 import datetime
@@ -54,6 +63,10 @@ REQUIRED_EFFORT = "high"
 CONSECUTIVE_STALE_RUNS = 2
 DEFAULT_SINCE_HOURS = 72.0
 RECEIPT_GLOB = "*/*-001.receipt.json"
+TIERING_REL = "agents/orchestration-tiering.md"
+INVOKE_LANE_REL = "tools/coordination/Invoke-Lane.ps1"
+ASTRA_ROW_MARKERS = ("optional", "never a default", "never a gate", "astra: diversity")
+ASTRA_COMMENT_MARKERS = ("optional diversity seat", "never a default", "never a gate", "astra: diversity")
 
 
 def parse_model_id(model_id):
@@ -245,13 +258,72 @@ def render(result):
     return "\n".join(lines)
 
 
+def posture_violations(tiering_text, invoke_lane_text):
+    """Astra-posture problems in the two texts (bus R19.1 clause 3); [] when clean."""
+    problems = []
+    for line in tiering_text.splitlines():
+        if not line.lstrip().startswith("|") or "astra" not in line.lower():
+            continue
+        lowered = line.lower()
+        cells = line.strip().strip("|").split("|")
+        label = cells[0].strip()
+        missing = [m for m in ASTRA_ROW_MARKERS if m not in lowered]
+        if missing:
+            problems.append("%s row %r names Astra without %s" % (TIERING_REL, label, ", ".join(missing)))
+        model_cell = cells[1].lower() if len(cells) > 1 else lowered
+        if "sol" not in model_cell or model_cell.find("astra") < model_cell.find("sol"):
+            problems.append("%s row %r must name the Sol tier ahead of Astra in its model cell" % (TIERING_REL, label))
+    block, grabbing = [], False
+    for line in invoke_lane_text.splitlines():
+        if re.match(r"^#\s+astra\s+--", line):
+            grabbing = True
+        elif grabbing and not re.match(r"^#\s{6,}\S", line):
+            break
+        if grabbing:
+            block.append(line)
+    joined = re.sub(r"\s+", " ", re.sub(r"(^|\s)#", " ", "\n".join(block))).strip().lower()
+    if not joined:
+        problems.append("%s has no `# astra --` comment block to carry the posture" % INVOKE_LANE_REL)
+    else:
+        missing = [m for m in ASTRA_COMMENT_MARKERS if m not in joined]
+        if missing:
+            problems.append("%s astra comment lacks %s" % (INVOKE_LANE_REL, ", ".join(missing)))
+        if "tie-breaker" in joined:
+            problems.append("%s astra comment still calls astra the tie-breaker" % INVOKE_LANE_REL)
+    return problems
+
+
+def check_posture(repo_root):
+    """-> (problems, error). error is 'posture-file-unreadable:<path>' when a file cannot be read."""
+    texts = []
+    for rel in (TIERING_REL, INVOKE_LANE_REL):
+        path = os.path.join(repo_root, *rel.split("/"))
+        try:
+            with open(path, "r", encoding="utf-8-sig") as handle:
+                texts.append(handle.read())
+        except OSError:
+            return [], "posture-file-unreadable:%s" % path
+    return posture_violations(texts[0], texts[1]), None
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--runs-dir", default=None)
     parser.add_argument("--since-hours", type=float, default=DEFAULT_SINCE_HOURS)
     parser.add_argument("--newest", action="append", default=[])
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--posture", action="store_true")
+    parser.add_argument("--repo-root", default=None)
     args = parser.parse_args(argv)
+
+    if args.posture:
+        repo_root = args.repo_root or os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        problems, error = check_posture(repo_root)
+        if error:
+            print(json.dumps({"ok": False, "error": error}))
+            return 2
+        print(json.dumps({"ok": not problems, "problems": problems}, indent=2))
+        return 1 if problems else 0
 
     runs_dir = args.runs_dir or default_runs_dir()
     if not os.path.isdir(runs_dir):
