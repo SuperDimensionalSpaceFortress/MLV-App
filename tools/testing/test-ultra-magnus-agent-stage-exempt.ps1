@@ -59,7 +59,9 @@ $lift = @('Resolve-HeavySlotPython', 'Get-ProcessIdentity', 'Test-EpochMillisClo
     'Complete-HeavySlotCli', 'Start-QuietLeaseRequest', 'Test-QuietLeaseOwnerPid', 'Update-QuietLeaseRequest', 'Stop-QuietLease', 'Wait-QuietLeaseAdmission',
     'Get-JobNotAfterVerdict', 'Get-QuietLeaseAdmitTimeout', 'New-LeaseReleaseRecord', 'Invoke-ExemptJobsDuringWait', 'Invoke-QueuedJob', 'Read-JobNotAfterSidecar',
     # hardening r2: the real child launch, the process-tree kill and the adopt path, so the ceiling kill is driven against a real child
-    'Start-WindowlessRedirectedProcess', 'Complete-WindowlessRedirectedProcess', 'Set-LaunchedMarkerFields', 'Stop-VerifiedProcessIdentities', 'Invoke-AdoptStartedJob', 'Get-RecoveredAdmission')
+    'Start-WindowlessRedirectedProcess', 'Complete-WindowlessRedirectedProcess', 'Set-LaunchedMarkerFields', 'Stop-VerifiedProcessIdentities', 'Invoke-AdoptStartedJob', 'Get-RecoveredAdmission',
+    # r4 (master merge of AGENT-TIMESTAMP-PARSE-TZ-1): Invoke-AdoptStartedJob now reads the marker's startedUtc through this helper
+    'ConvertTo-UtcDateTime')
 foreach ($name in $lift) { $fn = Find-Function $name; Assert-True ($null -ne $fn) "agent defines $name"; . ([scriptblock]::Create($fn.Extent.Text)) }
 # The function under change: lifted when present, so a base agent runs every behavioural case and fails each on behaviour.
 $classifyFn = Find-Function 'Get-GateExemptClass'

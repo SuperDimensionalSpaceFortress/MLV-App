@@ -777,30 +777,32 @@ function Get-JobMetadata {
     return $meta
 }
 
+function ConvertTo-UtcDateTime {
+    # AGENT-TIMESTAMP-PARSE-TZ-1: a timestamp read back from JSON (a marker, meta.json, a sidecar) as a UTC [DateTime], or $null
+    # when it does not parse. pwsh 7's ConvertFrom-Json turns an ISO "...Z" string into a [DateTime] of Kind Utc, and `[string]` on
+    # that drops the Kind, so a Parse of the result assumes THIS host's offset (5 h off on a Central-time host). Windows PowerShell
+    # 5.1 returns the string itself. So: a [DateTime] is read by its Kind (Unspecified = UTC, as the writers always write UTC),
+    # a [DateTimeOffset] is its UtcDateTime, and a string is parsed as UTC unless it names an offset. Never casts through [string].
+    param($Value)
+    if ($Value -is [DateTimeOffset]) { return $Value.UtcDateTime }
+    if ($Value -is [DateTime]) {
+        if ($Value.Kind -eq [DateTimeKind]::Local) { return $Value.ToUniversalTime() }
+        return [DateTime]::SpecifyKind($Value, [DateTimeKind]::Utc)
+    }
+    if ($Value -is [string] -and -not [string]::IsNullOrWhiteSpace($Value)) {
+        $dto = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse($Value, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$dto)) { return $dto.UtcDateTime }
+    }
+    return $null
+}
+
 function Get-QueueAgeSeconds {
     param(
         [Parameter(Mandatory = $true)]$Job,
         [Parameter(Mandatory = $true)]$Metadata
     )
 
-    $submitUtc = $null
-    if ($Metadata.submitUtc -is [DateTime]) {
-        $submitDateTime = [DateTime]$Metadata.submitUtc
-        if ($submitDateTime.Kind -eq [DateTimeKind]::Local) {
-            $submitUtc = $submitDateTime.ToUniversalTime()
-        }
-        else {
-            $submitUtc = [DateTime]::SpecifyKind($submitDateTime, [DateTimeKind]::Utc)
-        }
-    }
-    elseif (-not [string]::IsNullOrWhiteSpace($Metadata.submitUtc)) {
-        try {
-            $submitUtc = ([DateTimeOffset]::Parse([string]$Metadata.submitUtc)).UtcDateTime
-        }
-        catch {
-            $submitUtc = $null
-        }
-    }
+    $submitUtc = ConvertTo-UtcDateTime $Metadata.submitUtc
     if ($null -eq $submitUtc) {
         $submitUtc = $Job.CreationTimeUtc
     }
@@ -1226,14 +1228,10 @@ function Find-LaunchedJobChild {
     param([Parameter(Mandatory = $true)]$Marker)
     $script = [string]$Marker.launchScriptPath
     if ([string]::IsNullOrWhiteSpace($script)) { return @{ state = "unknown"; why = "launching marker names no job script" } }
-    # ConvertFrom-Json has already turned the ISO string into a DateTime; [string] on that drops its zone, so a
-    # DateTime is used as-is (made UTC) and only a string is parsed.
-    $notBefore = $null
-    try {
-        $at = $Marker.launchingUtc
-        $notBefore = $(if ($at -is [DateTime]) { $at.ToUniversalTime() } else { ([DateTimeOffset]::Parse([string]$at)).UtcDateTime }).AddSeconds(-2)
-    }
-    catch { return @{ state = "unknown"; why = "launching marker has no readable launchingUtc" } }
+    # ConvertFrom-Json has already turned the ISO string into a DateTime; ConvertTo-UtcDateTime reads it by its Kind, never through [string].
+    $launchingAt = ConvertTo-UtcDateTime $Marker.launchingUtc
+    if ($null -eq $launchingAt) { return @{ state = "unknown"; why = "launching marker has no readable launchingUtc" } }
+    $notBefore = $launchingAt.AddSeconds(-2)
     try { $all = @(Get-CimInstance Win32_Process -ErrorAction Stop) }
     catch { return @{ state = "unknown"; why = "process table unreadable: $($_.Exception.Message)" } }
     $hits = @($all | Where-Object {
@@ -1409,7 +1407,8 @@ function Invoke-AdoptStartedJob {
     $timedOut = $false
     $killedProcessIds = @()
     try {
-        $startedUtc = ([DateTimeOffset]::Parse([string]$Marker.startedUtc)).UtcDateTime
+        $startedUtc = ConvertTo-UtcDateTime $Marker.startedUtc
+        if ($null -eq $startedUtc) { throw "adopted marker for job $jobId has no readable startedUtc, so no deadline can be computed" }
         # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r3 (transition edge): a stage marker written by an agent that predates the ceiling has exemptClass stage
         # and NO stageCeiling, so its timeoutSec is unclamped. Clamp it to StageExemptMaxSec here and type the kill as the live path does.
         $adoptedCeiling = if ($null -ne $Marker.admission) { $Marker.admission.stageCeiling } else { $null }
