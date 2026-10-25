@@ -15,6 +15,11 @@ the landing time is the newest of `source_ledger_stamp`, `pinned_utc` and every
 and pin stamps are not merge events, so that fallback is an approximation (a lower bound
 on the real merge time), not a measurement. Intake time is `source_ledger_stamp`.
 
+Scope rulings (for example a deferral) are data, not code: an optional top-level `scope_notes`
+list of `{"title": ..., "text": ...}` in card-queue.json is rendered as `**title.** text` under
+the open table and under "Parked with reason". This file holds no PR number or card id; a queue
+without `scope_notes` renders no note. The hub owns the block and removes a note when it lapses.
+
 Usage:
     py -3 tools/coordination/render_roadmap.py --card-queue <card-queue.json> --out docs/roadmap.md
     py -3 tools/coordination/render_roadmap.py --card-queue <card-queue.json> --out docs/roadmap.md --check
@@ -64,15 +69,6 @@ hygiene and ci-flake cards are tooling churn and are not counted here. Rows the 
 not classified are not counted either, even when the card name says PLAYBACK.
 """
 
-# Standing owner ruling (chat e7cff0a2, 2026-10-25T00:44:41Z); static text, so a re-render keeps it.
-MACOS_SCOPE_NOTE = (
-    "**macOS scope (owner ruling 2026-10-25T00:44:41Z).** Deferred: macOS feature, performance and "
-    "GPU work (MAC-MINI-BUILD-HOST-1, CPU-SIMD-CLANG-X86-ENABLE-1, CPU-NEON-HOT-KERNELS-1, "
-    "GPU-PORTABLE-BACKEND-RHI-1, GPU-METAL-BACKEND-1) until Windows CUDA and the portable GL/RHI "
-    "path are solid. Not deferred: macOS compilation stays green (MAC-LINUX-BUILD-RESTORE-1, the "
-    "compile canary, PR #671)."
-)
-
 
 def _die(message: str) -> "None":
     print("render_roadmap: " + message, file=sys.stderr)
@@ -103,6 +99,14 @@ def _chain(r: dict) -> str:
         return "-"
     pred = oc.get("predecessor")
     return "%s #%s %s" % (oc["chain"], oc["index"], "after " + pred if pred else "first")
+
+
+def _scope_notes(data: dict) -> list:
+    """Scope-note paragraphs (each followed by a blank line) from the queue's optional scope_notes block."""
+    out = []
+    for n in data.get("scope_notes") or []:
+        out += ["**%s.** %s" % (n["title"], n["text"]), ""]
+    return out
 
 
 def _note(r: dict) -> str:
@@ -158,8 +162,8 @@ def render(data: dict) -> str:
     last = days[-1]
     landed_total, queued_total = sum(landed.values()), sum(queued.values())
 
-    out = [HEADER, "generated_from: %s" % generated, "", "## Open product and playback cards", "",
-           MACOS_SCOPE_NOTE, ""]
+    scope = _scope_notes(data)
+    out = [HEADER, "generated_from: %s" % generated, "", "## Open product and playback cards", "", *scope]
     out.append("| P | card | kind | state | queued since | order_chain |")
     out.append("|---|---|---|---|---|---|")
     for r in open_rows:
@@ -178,7 +182,7 @@ def render(data: dict) -> str:
         out.append("| %s | %d | %d |" % (d.isoformat(), landed[d], queued[d]))
     out.append("| total | %d | %d |" % (landed_total, queued_total))
     out += ["", _drain_line(len(open_rows), landed_total, queued_total), "",
-            "## Parked with reason", "", MACOS_SCOPE_NOTE, ""]
+            "## Parked with reason", "", *scope]
     for r in parked:
         out.append("- %s (P%s): %s" % (r["card"], r["priority"], _note(r)))
     if not parked:
@@ -223,6 +227,16 @@ def _check_row(path: Path, i: int, r: dict) -> None:
         _die("%s has an order_chain with a non-string predecessor" % where)
 
 
+def _check_scope_notes(path: Path, notes: object) -> None:
+    if notes is None:
+        return
+    if not isinstance(notes, list):
+        _die("%s has a scope_notes that is not a list: %r" % (path, notes))
+    for i, n in enumerate(notes):
+        if not isinstance(n, dict) or not all(isinstance(n.get(k), str) and n[k].strip() for k in ("title", "text")):
+            _die("%s scope_notes entry %d needs a non-empty string title and text: %r" % (path, i, n))
+
+
 def _load(path: Path) -> dict:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -234,6 +248,7 @@ def _load(path: Path) -> dict:
         _die("%s has no generated_utc" % path)
     if not _valid_stamp(data["generated_utc"]):
         _die("%s has a malformed generated_utc: %r (want YYYY-MM-DD...)" % (path, data["generated_utc"]))
+    _check_scope_notes(path, data.get("scope_notes"))
     for i, r in enumerate(data["rows"]):
         missing = [k for k in REQUIRED if not isinstance(r, dict) or r.get(k) is None]
         if missing:

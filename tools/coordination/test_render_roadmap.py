@@ -116,21 +116,69 @@ class ParkedSectionTests(unittest.TestCase):
         self.assertIn("(no note)", section)
 
 
-class MacosScopeNoteTests(unittest.TestCase):
-    """The owner's macOS ruling (deferred feature/perf/GPU, NOT deferred compilation) survives a re-render."""
+SCOPE_NOTE = {
+    "title": "macOS scope (owner ruling 2026-10-25T00:44:41Z)",
+    "text": "Deferred: macOS feature, performance and GPU work (DEFERRED-ONE, DEFERRED-TWO) until the "
+            "portable path is solid. Not deferred: macOS compilation stays green (KEPT-ONE, PR #9001).",
+}
+SCOPE_NOTE_LINE = "**%s.** %s" % (SCOPE_NOTE["title"], SCOPE_NOTE["text"])
+
+
+class ScopeNoteTests(unittest.TestCase):
+    """A scope note (for example the owner's macOS ruling) renders only from card-queue data, never from code."""
+
+    def with_notes(self, *notes: dict) -> dict:
+        data = load_fixture()
+        data["scope_notes"] = list(notes)
+        return data
+
+    def test_a_queue_without_scope_notes_renders_no_note(self) -> None:
+        text = render_roadmap.render(load_fixture())
+        self.assertNotIn("scope", text.lower().replace("scoped", ""))
+        self.assertNotIn("Not deferred", text)
+        self.assertNotRegex(text, r"PR #\d+")
+
+    def test_a_note_never_names_a_pr_number_or_card_that_is_not_in_the_queue_data(self) -> None:
+        text = render_roadmap.render(self.with_notes({"title": "Other ruling", "text": "Plain text only."}))
+        self.assertNotRegex(text, r"PR #\d+")
+        for card in ("MAC-LINUX-BUILD-RESTORE-1", "MAC-MINI-BUILD-HOST-1", "GPU-METAL-BACKEND-1"):
+            self.assertNotIn(card, text)
+
+    def test_the_renderer_source_holds_no_pr_number_or_ruling_card_literal(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotRegex(source, r"PR #\d+")
+        for literal in ("MAC-LINUX-BUILD-RESTORE-1", "CPU-NEON-HOT-KERNELS-1", "2026-10-25T00:44:41Z"):
+            self.assertNotIn(literal, source)
 
     def test_note_sits_beside_the_open_table_and_the_parked_section(self) -> None:
-        text = render_roadmap.render(load_fixture())
-        self.assertEqual(text.count(render_roadmap.MACOS_SCOPE_NOTE), 2)
+        text = render_roadmap.render(self.with_notes(SCOPE_NOTE))
+        self.assertEqual(text.count(SCOPE_NOTE_LINE), 2)
         open_part, rest = text.split("## Drain")
-        self.assertIn(render_roadmap.MACOS_SCOPE_NOTE, open_part)
-        self.assertIn(render_roadmap.MACOS_SCOPE_NOTE, rest.split("## Parked with reason")[1])
+        self.assertIn(SCOPE_NOTE_LINE, open_part)
+        self.assertLess(open_part.index(SCOPE_NOTE_LINE), open_part.index("| P | card |"))
+        self.assertIn(SCOPE_NOTE_LINE, rest.split("## Parked with reason")[1])
 
-    def test_note_says_compilation_is_not_deferred(self) -> None:
-        note = render_roadmap.MACOS_SCOPE_NOTE
-        self.assertIn("2026-10-25T00:44:41Z", note)
-        self.assertIn("Not deferred: macOS compilation stays green", note)
-        self.assertIn("MAC-LINUX-BUILD-RESTORE-1", note)
+    def test_note_text_is_data_so_the_not_deferred_clause_survives_verbatim(self) -> None:
+        text = render_roadmap.render(self.with_notes(SCOPE_NOTE))
+        self.assertIn("Not deferred: macOS compilation stays green (KEPT-ONE, PR #9001).", text)
+
+    def test_several_notes_render_in_queue_order(self) -> None:
+        second = {"title": "Second", "text": "Later note."}
+        text = render_roadmap.render(self.with_notes(SCOPE_NOTE, second))
+        part = text.split("## Drain")[0]
+        self.assertLess(part.index(SCOPE_NOTE_LINE), part.index("**Second.** Later note."))
+
+    def test_empty_scope_notes_list_renders_no_note(self) -> None:
+        self.assertEqual(render_roadmap.render(self.with_notes()), render_roadmap.render(load_fixture()))
+
+    def test_a_note_is_rendered_by_the_cli_from_the_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue, out = Path(tmp) / "card-queue.json", Path(tmp) / "roadmap.md"
+            queue.write_text(json.dumps(self.with_notes(SCOPE_NOTE)), encoding="utf-8")
+            done = subprocess.run([sys.executable, str(SCRIPT), "--card-queue", str(queue), "--out", str(out)],
+                                  capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(out.read_text(encoding="utf-8").count(SCOPE_NOTE_LINE), 2)
 
 
 class DrainTests(unittest.TestCase):
@@ -298,6 +346,19 @@ class InputValidationTests(unittest.TestCase):
         for needle in (str(self.queue), *needles):
             self.assertIn(needle, err)
         self.assertFalse(self.out.exists())
+
+    def test_scope_notes_that_is_not_a_list_exits_2(self) -> None:
+        data = synthetic(1, 0, 0)
+        data["scope_notes"] = "a string"
+        self.assert_rejected(data, "scope_notes")
+
+    def test_scope_note_without_string_title_and_text_exits_2_naming_the_entry(self) -> None:
+        for bad in ({"text": "no title"}, {"title": "no text"}, {"title": 1, "text": "x"},
+                    {"title": "t", "text": 2}, {"title": "", "text": "x"}, "bare string"):
+            with self.subTest(note=bad):
+                data = synthetic(1, 0, 0)
+                data["scope_notes"] = [bad]
+                self.assert_rejected(data, "scope_notes", "entry 0")
 
     def test_malformed_generated_utc_exits_2(self) -> None:
         data = synthetic(1, 0, 0)
