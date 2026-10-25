@@ -8374,6 +8374,11 @@ UNREADABLE_L3_FAULT_CODES = {
     "fault-code-high-l3": 2147483648,
     "fault-code-low-l3": -2147483649,
     "fault-code-float-l3": 702.5,
+    # ATTR-CUDA-FAULT-CODE-RANGE-FIXTURES-1 (Dot 30637950 on #659, ACK 6224003932): a present-but-empty value is not "no fault" (0), and a JSON
+    # boolean is neither [int] nor [long], so neither may be cast into a fault code.
+    "fault-code-empty-l3": "",
+    "fault-code-whitespace-l3": " ",
+    "fault-code-boolean-l3": True,
 }
 
 # The same extremes one step inside the range: a fault code, so L3's eq 0 reports the value it read, not a COULD-NOT-CHECK.
