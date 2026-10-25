@@ -510,7 +510,10 @@ foreach ($c in ($cores | Group-Object core_class)) {
 #   gpu{}   the dGPU (display-class PCI\VEN_10DE) POWER STATE FIRST, from DEVPKEY_Device_PowerData (CM_POWER_DATA; bytes 4-7 = PD_MostRecentPowerState, 1 = D0 .. 4 = D3). That
 #           property is the PnP manager's record of the device's last power state: reading it sends the device no I/O and does not wake it (project memory
 #           bachelor-dgpu-nvidia-smi-wake-trap-20261011: nvidia-smi / NVML WAKE a D3 dGPU and read a bogus state). ONLY in D0 (already awake) is nvidia-smi run, once; in D1-D3 or
-#           unknown nothing else is read and skipped_wake_risk is true. No NVIDIA display adapter: state absent.
+#           unknown nothing else is read and skipped_wake_risk is true. No NVIDIA display adapter: state absent. MORE THAN ONE (r2, CoS B1): nvidia-smi has no device selector here and
+#           would read every adapter, including ones whose power state was never checked, so nothing more is read: every field null, reason multi-dgpu-ambiguous. With exactly one,
+#           nvidia-smi output of other than one non-blank row is null, reason nvidia-smi-ambiguous. One PnP power-state read precedes one nvidia-smi read; a D0->D3 change between
+#           them is a known race, not excluded, and actual wake behaviour is not measured here.
 #   seconds_since_last_lease + last_lease{}: the newest quiet-lease event in the agent's own log, <job working directory>\logs\agent.log (the agent starts every job in its root),
 #           tail only: `quiet-lease: active`, `ended ... active=True`, `batch-opened|batch-reused|batch-parked|batch-ended`, `stale lease`. A request that never held a lease
 #           (ended active=False) is not a lease.
@@ -548,10 +551,12 @@ $TelGpuStateScript = {
     try {
         $all = @(Get-PnpDevice -Class Display -PresentOnly -ErrorAction Stop)
         $d = @($all | Where-Object { [string]$_.InstanceId -like 'PCI\VEN_10DE*' } | Sort-Object InstanceId)
-        if ($d.Count -eq 0) { return [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ id = $null; data = $null }; msg = $null } }
+        if ($d.Count -eq 0) { return [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ id = $null; data = $null; count = 0 }; msg = $null } }
+        # more than one NVIDIA adapter: nvidia-smi (no device selector) would read all of them, so no one adapter's power state can vouch for the reading. Read nothing more.
+        if ($d.Count -gt 1) { return [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ id = $null; data = $null; count = $d.Count }; msg = $null } }
         $id = [string]$d[0].InstanceId
         $p = Get-PnpDeviceProperty -InstanceId $id -KeyName 'DEVPKEY_Device_PowerData' -ErrorAction Stop
-        [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ id = $id; data = [byte[]]@($p.Data) }; msg = $null }
+        [pscustomobject]@{ ok = $true; v = [pscustomobject]@{ id = $id; data = [byte[]]@($p.Data); count = 1 }; msg = $null }
     } catch { [pscustomobject]@{ ok = $false; v = [pscustomobject]@{ id = $id; data = $null }; msg = [string]$_.Exception.Message } }
 }.ToString()
 # ONLY called for a dGPU already in D0: one nvidia-smi query. { ok, v = { rc, lines }, msg }
@@ -644,6 +649,7 @@ try {
         $telGpu.device = $(if ($null -ne $w.v) { $w.v.id } else { $null }); $telGpu.why = ([string]$w.msg -replace '\s+', ' ')
         if ($null -eq $telGpu.device -and [string]$w.msg -match '(?i)no matching') { $telGpu.state = 'absent' } else { $telGpu.state_reason = 'pnp-read-failed' }
     }
+    elseif ($null -eq $w.v.id -and [int]$w.v.count -gt 1) { $telGpu.state_reason = 'multi-dgpu-ambiguous'; $telGpu.why = "$($w.v.count) NVIDIA display adapters; nvidia-smi cannot be bound to one" }
     elseif ($null -eq $w.v.id) { $telGpu.state = 'absent' }
     else {
         $telGpu.device = [string]$w.v.id
@@ -653,6 +659,7 @@ try {
         if ($null -ne $raw -and $raw -ge 1 -and $raw -le 4) { $telGpu.state = "D$($raw - 1)" } else { $telGpu.state_reason = 'unspecified-power-state' }
     }
     if ($telGpu.state -ceq 'absent') { $telGpu.skipped_wake_risk = $false; $telGpu.reasons['device'] = 'no-dgpu'; Set-TelNulls $telGpu $gpuFields 'no-dgpu' }
+    elseif ($telGpu.state_reason -ceq 'multi-dgpu-ambiguous') { Set-TelNulls $telGpu $gpuFields 'multi-dgpu-ambiguous' }
     elseif ($telGpu.state -cne 'D0') { Set-TelNulls $telGpu $gpuFields 'skipped-wake-risk' }
     else {
         # D0: the dGPU is already awake, so ONE nvidia-smi read cannot wake it
@@ -663,9 +670,10 @@ try {
         elseif (-not $s.ok) { $code = $(if ([string]$s.msg -match '(?i)not recognized|not found') { 'nvidia-smi-missing' } else { 'nvidia-smi-failed' }); $telGpu.why = ([string]$s.msg -replace '\s+', ' ') }
         elseif ([int]$s.v.rc -ne 0) { $code = 'nvidia-smi-failed'; $telGpu.why = "nvidia-smi exit $($s.v.rc)" }
         else {
-            $first = @($s.v.lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) | Select-Object -First 1
-            $parts = @(([string]$first).Split(',') | ForEach-Object { $_.Trim() })
-            if ($parts.Count -lt 4) { $code = 'nvidia-smi-unparseable' }
+            $rows = @($s.v.lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $parts = @(([string]($rows | Select-Object -First 1)).Split(',') | ForEach-Object { $_.Trim() })
+            if ($rows.Count -ne 1) { $code = 'nvidia-smi-ambiguous'; $telGpu.why = "nvidia-smi returned $($rows.Count) rows for the one checked adapter" }
+            elseif ($parts.Count -lt 4) { $code = 'nvidia-smi-unparseable' }
             else {
                 $inv = [Globalization.CultureInfo]::InvariantCulture
                 for ($i = 0; $i -lt 3; $i++) {

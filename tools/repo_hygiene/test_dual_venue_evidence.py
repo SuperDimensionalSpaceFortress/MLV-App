@@ -10057,6 +10057,7 @@ TEL_HEAT_FIELDS = ("sample_age_s", "hottest_core_c", "max15_c", "mean_c", "throt
 TEL_GPU_FIELDS = ("utilization_percent", "temp_c", "power_w", "pstate")
 TEL_VM_ADAPTER = r"PCI\VEN_15AD&DEV_0405&SUBSYS_040515AD&REV_00\3&18D45AA6&0&78"
 TEL_DGPU = r"PCI\VEN_10DE&DEV_25A2&SUBSYS_0B2A1028&REV_A1\4&1E3A2B4C&0&0008"
+TEL_DGPU_B = r"PCI\VEN_10DE&DEV_2684&SUBSYS_0B2A1028&REV_A1\4&2F4B3C5D&0&0010"
 TEL_WORKER_PRELUDE = r"""$script:TelFake = ConvertFrom-Json -InputObject @'
 __TELFAKE__
 '@
@@ -10071,7 +10072,9 @@ function Get-PnpDeviceProperty {
     [CmdletBinding()] param($InstanceId, $KeyName)
     [IO.File]::AppendAllText('__TELLOG__', "prop|$InstanceId|$KeyName`n")
     if ($script:TelFake.propThrow) { throw [string]$script:TelFake.propThrow }
-    [pscustomobject]@{ KeyName = $KeyName; Type = 'Binary'; Data = [byte[]]@($script:TelFake.data | ForEach-Object { [byte]$_ }) }
+    $d = $script:TelFake.data
+    if ($script:TelFake.dataById -and $script:TelFake.dataById.PSObject.Properties[[string]$InstanceId]) { $d = $script:TelFake.dataById.PSObject.Properties[[string]$InstanceId].Value }
+    [pscustomobject]@{ KeyName = $KeyName; Type = 'Binary'; Data = [byte[]]@($d | ForEach-Object { [byte]$_ }) }
 }
 function nvidia-smi {
     [IO.File]::AppendAllText('__TELLOG__', 'smi|' + (($args | ForEach-Object { [string]$_ }) -join ' ') + "`n")
@@ -10091,7 +10094,7 @@ def _tel_power_data(dstate_code: int) -> list:
 def _tel_hermetic(body: str, tmp: Path, tel: dict | None) -> str:
     """Point the probe body's telemetry at canned inputs under tmp (no-op on a body without the telemetry block). Default: no feed, no NVIDIA adapter, no agent.log."""
     tel = dict(tel or {})
-    fake = {"devices": [TEL_VM_ADAPTER], "data": _tel_power_data(1), "smiRc": 0, "smiOut": [], "pnpDelayMs": 0, "smiDelayMs": 0,
+    fake = {"devices": [TEL_VM_ADAPTER], "data": _tel_power_data(1), "smiRc": 0, "smiOut": [], "pnpDelayMs": 0, "smiDelayMs": 0, "dataById": None,
             "enumThrow": None, "propThrow": None, "smiThrow": None}
     fake.update(tel.get("fake", {}))
     log = tmp / "tel-calls.log"
@@ -10295,6 +10298,37 @@ class VenueProbeHeatGpuTelemetryTests(IdentityProbeMixin, unittest.TestCase):
         self.assertEqual(len(calls), 3, calls)
         self.assertTrue(calls[0].startswith("enum|") and calls[1].startswith("prop|"), "the power state is read FIRST")
         self.assertEqual(calls[2], "smi|--query-gpu=utilization.gpu,temperature.gpu,power.draw,pstate --format=csv,noheader,nounits")
+
+    # VENUE-PROBE-HEAT-GPU-TELEMETRY-1 r2 (CoS B1): nvidia-smi has no device selector here, so it reads EVERY NVIDIA adapter while only one adapter's power state was checked.
+    # With more than one NVIDIA display adapter the reading cannot be bound to the checked one: fail toward null, and never query an adapter whose power state was not read.
+    def assert_ambiguous_dgpu(self, gpu: dict, why: str) -> None:
+        self.assert_typed(gpu, TEL_GPU_FIELDS)
+        self.assertTrue(all(gpu[k] is None for k in TEL_GPU_FIELDS), gpu)
+        self.assertEqual({gpu["reasons"][k] for k in TEL_GPU_FIELDS}, {why}, gpu)
+
+    def test_two_nvidia_adapters_both_d0_record_no_gpu_numbers_and_never_run_nvidia_smi(self) -> None:
+        # nvidia-smi lists adapter B first: r1 recorded B's numbers as the checked adapter A's
+        p = self.probe(fake={"devices": [TEL_VM_ADAPTER, TEL_DGPU, TEL_DGPU_B], "data": _tel_power_data(1), "smiOut": ["99, 93, 140.0, P0", "37, 61, 22.53, P2"]})
+        self.assert_ambiguous_dgpu(p["gpu"], "multi-dgpu-ambiguous")
+        self.assertEqual([c for c in self.calls() if c.startswith("smi|")], [], "an ambiguous dGPU set is never queried")
+
+    def test_two_nvidia_adapters_one_in_d3_never_query_the_unchecked_adapter(self) -> None:
+        p = self.probe(fake={"devices": [TEL_DGPU, TEL_DGPU_B], "data": _tel_power_data(1), "dataById": {TEL_DGPU: _tel_power_data(1), TEL_DGPU_B: _tel_power_data(4)},
+                             "smiOut": ["37, 61, 22.53, P2", "0, 40, 5.0, P8"]})
+        self.assert_ambiguous_dgpu(p["gpu"], "multi-dgpu-ambiguous")
+        self.assertEqual([c for c in self.calls() if c.startswith("smi|")], [], "adapter B may be asleep: nvidia-smi would wake it")
+
+    def test_one_nvidia_adapter_but_two_nvidia_smi_rows_is_ambiguous_never_the_first_row(self) -> None:
+        p = self.probe(fake={"devices": [TEL_DGPU], "data": _tel_power_data(1), "smiOut": ["99, 93, 140.0, P0", "", "37, 61, 22.53, P2"]})
+        gpu = p["gpu"]
+        self.assertEqual((gpu["state"], gpu["skipped_wake_risk"], gpu["device"]), ("D0", False, TEL_DGPU))
+        self.assert_ambiguous_dgpu(gpu, "nvidia-smi-ambiguous")
+
+    def test_one_nvidia_adapter_with_a_vm_display_adapter_still_records_its_one_row(self) -> None:
+        p = self.probe(fake={"devices": [TEL_VM_ADAPTER, TEL_DGPU], "data": _tel_power_data(1), "smiOut": ["", "37, 61, 22.53, P2", ""]})
+        gpu = p["gpu"]
+        self.assertEqual((gpu["utilization_percent"], gpu["temp_c"], gpu["power_w"], gpu["pstate"]), (37.0, 61.0, 22.53, "P2"))
+        self.assertEqual(gpu["reasons"], {})
 
     def test_a_d0_read_that_fails_is_typed(self) -> None:
         p = self.probe(fake={"devices": [TEL_DGPU], "data": _tel_power_data(1), "smiThrow": "The term 'nvidia-smi' is not recognized as a name of a cmdlet"})
