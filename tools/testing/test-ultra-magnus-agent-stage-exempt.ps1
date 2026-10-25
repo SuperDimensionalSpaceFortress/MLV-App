@@ -27,12 +27,18 @@ param(
 #                     the default pattern cannot produce (a prefix no probe list names, a near-miss of a staging id) is refused
 #   stage-ceiling   - (hardening r1) a stage-class job's effective timeout is bounded by -StageExemptMaxSec (default 300 s, ~66x the
 #                     measured ~4.5 s step), with a typed STAGE_EXEMPT_CEILING_* reason; light and gated timeouts are unchanged
+#   classify-and-override - (hardening r2, sol/opus/fable/Dot on b8faccf1) classify = the immutable default grammar AND the effective pattern, so an
+#                     override that is somehow in force can only NARROW: an id the default grammar rejects is gated whatever the override says
+#   stage-ceiling-kill - (hardening r2) the kill path driven by a REAL child: a stage job whose child outlives -StageExemptMaxSec is killed (exit 124)
+#                     with the typed STAGE_EXEMPT_CEILING_EXCEEDED line and admission.stageCeiling.clamped; the controls (own shorter timeout, a child
+#                     that finishes in time) carry no ceiling reason
+#   stage-ceiling-adopt - (hardening r2) an ADOPTED stage job past its bound gets the same typed reason; a non-stage or unclamped adopted job does not
 # Prints one JSON object with status PASS, or throws.
 
 $ErrorActionPreference = 'Stop'
 $agentScript = if ($AgentScript) { $AgentScript } else { Join-Path $RepoRoot 'tools\profiling\bachelor\ultra-magnus-agent.ps1' }
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw "FAIL: $Message" } }
-$caseNames = @('classify', 'stage-ungated', 'stage-gated', 'light-ungated', 'stage-cancel', 'stage-notafter', 'stage-not-during-wait', 'override-bounds', 'stage-ceiling')
+$caseNames = @('classify', 'stage-ungated', 'stage-gated', 'light-ungated', 'stage-cancel', 'stage-notafter', 'stage-not-during-wait', 'override-bounds', 'stage-ceiling', 'classify-and-override', 'stage-ceiling-kill', 'stage-ceiling-adopt')
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 foreach ($n in $Only) { if ($caseNames -notcontains $n) { throw "unknown case '$n' (known: $($caseNames -join ', '))" } }
 function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
@@ -51,7 +57,9 @@ $lift = @('Resolve-HeavySlotPython', 'Get-ProcessIdentity', 'Test-EpochMillisClo
     'Stop-ProcessTree', 'Move-FileChecked', 'Write-JsonFileAtomic', 'Read-JsonFile', 'Get-SustainedHeatVerdict', 'Stop-HeavySlotHolder', 'Exit-HeavySlot',
     'Resolve-HeavySlotMode', 'Get-QuietLeaseMinutes', 'ConvertFrom-QuietLeaseActiveLine', 'Start-HeavySlotCli', 'Receive-HeavySlotCli', 'Stop-HeavySlotCli',
     'Complete-HeavySlotCli', 'Start-QuietLeaseRequest', 'Test-QuietLeaseOwnerPid', 'Update-QuietLeaseRequest', 'Stop-QuietLease', 'Wait-QuietLeaseAdmission',
-    'Get-JobNotAfterVerdict', 'Get-QuietLeaseAdmitTimeout', 'New-LeaseReleaseRecord', 'Invoke-ExemptJobsDuringWait', 'Invoke-QueuedJob', 'Read-JobNotAfterSidecar')
+    'Get-JobNotAfterVerdict', 'Get-QuietLeaseAdmitTimeout', 'New-LeaseReleaseRecord', 'Invoke-ExemptJobsDuringWait', 'Invoke-QueuedJob', 'Read-JobNotAfterSidecar',
+    # hardening r2: the real child launch, the process-tree kill and the adopt path, so the ceiling kill is driven against a real child
+    'Start-WindowlessRedirectedProcess', 'Complete-WindowlessRedirectedProcess', 'Set-LaunchedMarkerFields', 'Stop-VerifiedProcessIdentities', 'Invoke-AdoptStartedJob', 'Get-RecoveredAdmission')
 foreach ($name in $lift) { $fn = Find-Function $name; Assert-True ($null -ne $fn) "agent defines $name"; . ([scriptblock]::Create($fn.Extent.Text)) }
 # The function under change: lifted when present, so a base agent runs every behavioural case and fails each on behaviour.
 $classifyFn = Find-Function 'Get-GateExemptClass'
@@ -71,9 +79,16 @@ $GateExemptJobPattern = [string]$paramDefaults['GateExemptJobPattern']
 $GateStageJobPattern = $paramDefaults['GateStageJobPattern']
 $StageExemptMaxSec = $paramDefaults['StageExemptMaxSec']
 $agentText = [IO.File]::ReadAllText($agentScript)
+# hardening r2: the immutable default grammar Get-GateExemptClass ANDs with the effective pattern (a base agent has none: its classifier ignores this).
+$grammarAst = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:StageGrammarDefault' }, $true)
+$script:StageGrammarDefault = if ($null -ne $grammarAst) { [string]$grammarAst.Right.Expression.Value } else { [string]$GateStageJobPattern }
+$psExe = (Get-Process -Id $PID).Path
+$Root = ''
+$PollSeconds = 1
 
 $results = [ordered]@{}
 $fx = Join-Path ([IO.Path]::GetTempPath()) ("um-agent-stage-exempt-{0}-{1}" -f $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
+$Root = $fx
 New-Item -ItemType Directory -Force -Path $fx, (Join-Path $fx 'cancel'), (Join-Path $fx 'inbox'), (Join-Path $fx 'processed'), (Join-Path $fx 'running') | Out-Null
 
 # ---------------------------------------------------------------- the fake heavy-slot.py: every call recorded, every request refused
@@ -157,11 +172,21 @@ function Add-HeavySlotHolderLossToAdmission { param([string]$JobId, $Admission) 
 function Invoke-QueueExpiredJob { param($Job, $Metadata, [int]$QueueAgeSec) $script:Published.Add("queue-expired|$($Job.BaseName -replace '\.job$', '')") }
 function Publish-GateUnlaunchedResult { param($Job, $Metadata, $Admission, [int]$QueueAgeSec) $script:Published.Add("$($Admission.label)|$($Job.BaseName -replace '\.job$', '')") }
 function Publish-NotAfterExpiredResult { param($Job, $Metadata, $Admission, [int]$QueueAgeSec, $Verdict) $script:Published.Add("expired-not-after|$($Job.BaseName -replace '\.job$', '')") }
+# hardening r2: the launch-and-monitor tail of Invoke-QueuedJob, driven for real by the kill cases (a real child, the agent's own Stop-ProcessTree).
+$script:RealLaunch = $false
+$script:JobResults = @{}
+function Set-AgentKeepAwake { param([bool]$Enable) return $true }
+function Write-StartedMarkerVerified { param($Path, $Marker) return $true }
+function Invoke-QuietLeaseRenewTick { }
+function Publish-JobResult { param([string]$JobId, $Result) $script:JobResults[$JobId] = $Result; return "unit:$JobId" }
+function Move-JobArtifacts { param([string]$JobId, [string]$JobPath, [string]$DestinationDirectory) }
+function Complete-StartedMarker { param([string]$MarkerPath, [string]$Status, [string]$ResultPath) }
 function New-LaunchingMarker {
     param([string]$JobId, $Job, $Metadata, [string]$OutFile, [string]$ErrFile, [string]$StartedUtc, [int]$TimeoutSec)
     # What WOULD launch, with the admission it would launch under; the job file leaves inbox\ as a run job's does.
     $a = $script:Admission
     $script:Launches.Add([pscustomobject]@{ jobId = $JobId; label = $a.label; why = $a.why; waitingFor = $a.waitingFor; leasePending = ($null -ne $script:QuietLeaseWaiting); leaseHeld = ($null -ne $script:QuietLease); timeoutSec = $TimeoutSec; stageCeiling = $a.stageCeiling })
+    if ($script:RealLaunch) { return [pscustomobject]@{ jobId = $JobId; heartbeatGeneration = 0 } }   # the kill cases launch the child for real
     if (Test-Path -LiteralPath $Job.FullName -PathType Leaf) { Move-Item -LiteralPath $Job.FullName -Destination $processed }
     return $null
 }
@@ -170,10 +195,11 @@ function Get-Calls { $p = Join-Path $fx 'calls.jsonl'; if (-not (Test-Path -Lite
 function Reset-Case {
     Remove-Item -LiteralPath (Join-Path $fx 'calls.jsonl') -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $inbox, $processed, $cancel -File | Remove-Item -Force
-    $script:Log.Clear(); $script:Claims.Clear(); $script:Launches.Clear(); $script:Published.Clear(); $script:Meta = @{}
+    $script:JobResults = @{}; $script:RealLaunch = $false; $script:Log.Clear(); $script:Claims.Clear(); $script:Launches.Clear(); $script:Published.Clear(); $script:Meta = @{}
     $script:QuietLease = $null; $script:QuietLeaseWaiting = $null; $script:Admission = $null; $script:ExemptDuringWaitOf = $null
     $script:ExpireJob = $null; $script:ExpireWhen = { $false }; $script:AgeAfter = (Get-Date).AddSeconds(60)
 }
+function New-SleepJob([string]$JobId, [int]$Sec) { $p = Join-Path $inbox "$JobId.job.ps1"; [IO.File]::WriteAllText($p, "Start-Sleep -Seconds $Sec"); return (Get-Item -LiteralPath $p) }
 function New-InboxJob([string]$JobId) { $p = Join-Path $inbox "$JobId.job.ps1"; [IO.File]::WriteAllText($p, '# mock: never executed'); return (Get-Item -LiteralPath $p) }
 function Get-Requests { return @(Get-Calls | Where-Object { ($_.argv | Select-Object -First 2) -join ' ' -eq 'lease request' }) }
 
@@ -366,6 +392,13 @@ try {
             '^playback-attr-3-cuda-stage-[0-9a-f]{12}\z|^.*-leg-[0-9]+\z'                         # top-level alternation, second arm not a stem
             '^(playback-attr-3-cuda-stage-)?.*\z'                                                 # the stem made optional
             '^playback-attr-3-cuda-stage-[0-9a-f]{12}(-[A-Za-z0-9_-]{1,32})?\z'                  # allows an underscore the generator never emits
+            # hardening r2 (sol BLOCKER on b8faccf1, opus/fable/Dot): a fixture stem the default grammar does not list, with a tail that
+            # looks like the real one. attr3-stage-fixture-medium_dual_iso-0123456789ab is not a staging id, so these admit ids the default rejects.
+            '^attr3-stage-fixture-medium_dual_iso-[0-9a-f]{12}\z'
+            '^attr3-stage-fixture-unlisted_dual_iso-[0-9a-f]{12}\z'
+            '^attr3-stage-fixture-(tiny|large|med)_dual_iso-[0-9a-f]{12}\z'
+            '^attr3-stage-fixture-(tiny|large)_dual_iso-[0-9a-fA-F]{12}\z'                       # hex wider than the generator's lower case
+            '^(attr3-stage-fixture-(tiny|large)_dual_iso-[0-9a-f]{12}|attr3-stage-fixture-small_dual_iso-[0-9a-f]{12})\z'   # one good arm, one unlisted stem
         )
         $mustAccept = @(
             $GateStageJobPattern                                                                  # the default
@@ -416,7 +449,7 @@ try {
             Assert-True (@($script:Log | Where-Object { $_ -ceq "heavy-slot-gate: STAGE_EXEMPT_CEILING_APPLIED job=$id requested=3600s ceiling=${StageExemptMaxSec}s" }).Count -eq 1) "stage-ceiling: typed STAGE_EXEMPT_CEILING_APPLIED line for $id"
             $per[$k] = $l[0].timeoutSec
         }
-        # The agent's own 1800 s default (no usable metadata) is bounded too.
+        # A 1800 s ask (the agent's JobTimeoutSec default value, given here as the job's own metadata timeoutSec) is bounded too.
         $id = $stageIds.attrStage
         $l = @(& $runStage $id 1800)
         Assert-True ($l.Count -eq 1 -and $l[0].timeoutSec -eq $StageExemptMaxSec) "stage-ceiling: an 1800 s ask is bounded at ${StageExemptMaxSec} s: $($l | ConvertTo-Json -Compress)"
@@ -433,13 +466,146 @@ try {
         $reqs = @(Get-Requests)
         Assert-True ($reqs.Count -ge 1 -and ((@($reqs[0].argv) -join ' ') -match '--minutes 31 ')) "stage-ceiling: a gated job asked for 1800 s still requests a 31 min lease: $((@($reqs | ForEach-Object { $_.argv -join ' ' })) -join ' | ')"
         Assert-True (@($script:Log | Where-Object { $_ -like '*STAGE_EXEMPT_CEILING*' }).Count -eq 0) "stage-ceiling: a gated job logs no stage ceiling line"
-        # The kill path (a real child past its bound) cannot be driven with stubs; pin that it types the reason when the bound was the ceiling's.
+        # The kill path itself is driven by a real child in stage-ceiling-kill and stage-ceiling-adopt; here only the typed text is pinned.
         Assert-True ($agentText -match 'STAGE_EXEMPT_CEILING_EXCEEDED: ') "stage-ceiling: the timed-out branch writes the typed STAGE_EXEMPT_CEILING_EXCEEDED reason"
         Assert-True ($declaredCeiling -is [int] -and $declaredCeiling -eq 300) "stage-ceiling: the agent declares -StageExemptMaxSec with default 300 (got '$declaredCeiling')"
         $p = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'StageExemptMaxSec' }
         $vr = @($p.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateRange' })
         Assert-True ($vr.Count -eq 1 -and $vr[0].PositionalArguments[0].Value -eq 1 -and $vr[0].PositionalArguments[1].Value -le 900) "stage-ceiling: -StageExemptMaxSec has a validated range, 1..900 at most"
         $results.stageCeiling = [ordered]@{ ceilingSec = $StageExemptMaxSec; boundedAt = $per }
+    }
+
+    # ------------------------------------------------------------ classify-and-override: an override can only NARROW the default grammar
+    # Hardening r2: sol reproduced an override ('^attr3-stage-fixture-medium_dual_iso-[0-9a-f]{12}\z') the load-time guard accepted and
+    # that made attr3-stage-fixture-medium_dual_iso-0123456789ab classify "stage" though the default grammar does not match it, because
+    # Get-GateExemptClass used the override alone. The load-time guard is a sampled check; this is the real bound: stage = default AND override.
+    if (Test-Case 'classify-and-override') {
+        Assert-True ($null -ne $classifyFn) "agent defines Get-GateExemptClass"
+        $savedPattern = $GateStageJobPattern
+        $outside = 'attr3-stage-fixture-medium_dual_iso-0123456789ab'
+        Assert-True ($null -ne $grammarAst -and $script:StageGrammarDefault -ceq $GateStageJobPattern) "classify-and-override: the agent declares `$script:StageGrammarDefault, equal to the GateStageJobPattern default"
+        Assert-True ($outside -cnotmatch $script:StageGrammarDefault) "classify-and-override: $outside is outside the default grammar"
+        $per = [ordered]@{}
+        try {
+            foreach ($ov in @('^attr3-stage-fixture-medium_dual_iso-[0-9a-f]{12}\z', '^attr3-stage-fixture-(tiny|large|med)_dual_iso-[0-9a-f]{12}\z', '^attr3-stage-fixture-.*\z', '.*')) {
+                $GateStageJobPattern = $ov     # in force WITHOUT passing the load-time guard: the classifier must hold on its own
+                $c = Get-GateExemptClass -JobId $outside
+                Assert-True ($null -eq $c) "classify-and-override: with override '$ov' in force, $outside is NOT stage (gated): '$c'"
+                $per[$ov] = $c
+            }
+            # An override still NARROWS: an id the default admits but the override does not match is gated; one both admit stays stage.
+            $GateStageJobPattern = '^attr3-stage-fixture-tiny_dual_iso-[0-9a-f]{12}\z'
+            $c = Get-GateExemptClass -JobId $stageIds.fixtureLarge
+            Assert-True ($null -eq $c) "classify-and-override: an override narrowed to tiny gates the large fixture (an override narrows): '$c'"
+            $c = Get-GateExemptClass -JobId $stageIds.fixtureTiny
+            Assert-True ($c -ceq 'stage') "classify-and-override: an override narrowed to tiny keeps the tiny fixture stage: '$c'"
+            # Behaviour, not just the classifier: the out-of-grammar id under a wide override requests a quiet lease like any gated job.
+            $GateStageJobPattern = '^attr3-stage-fixture-.*\z'
+            Reset-Case
+            $script:ExpireJob = $outside
+            $script:ExpireWhen = { @($script:Log | Where-Object { $_ -like 'quiet-lease: refused job=*' }).Count -ge 1 }
+            $null = Invoke-QueuedJob -Job (New-InboxJob $outside)
+            $reqs = @(Get-Requests)
+            Assert-True ($reqs.Count -ge 1 -and $script:Claims -contains $outside -and $script:Launches.Count -eq 0) "classify-and-override: $outside under a wide override is claimed and requests a quiet lease, never launched unleased: claims=[$($script:Claims -join ',')] requests=$($reqs.Count) launches=$($script:Launches.Count)"
+        }
+        finally { $GateStageJobPattern = $savedPattern }
+        # No regression with the default in force: every default stage id still classes stage, a light id stays light, a measured id stays gated.
+        foreach ($k in $stageIds.Keys) { $c = Get-GateExemptClass -JobId $stageIds[$k]; Assert-True ($c -ceq 'stage') "classify-and-override: default in force, $($stageIds[$k]) is stage: '$c'" }
+        Assert-True ((Get-GateExemptClass -JobId $lightIds.quietProbe) -ceq 'light') "classify-and-override: a light id is still light"
+        Assert-True ($null -eq (Get-GateExemptClass -JobId $gatedIds.measuredLeg)) "classify-and-override: a measured id is still gated"
+        $results.classifyAndOverride = [ordered]@{ outside = $outside; classUnderOverride = $per }
+    }
+
+    # ------------------------------------------------------------ stage-ceiling-kill: the kill path, driven by a REAL child
+    # Invoke-QueuedJob's own launch, monitor loop and Stop-ProcessTree run for real (only the disk, result and keep-awake steps are
+    # stubbed). The child is a pwsh that sleeps 40 s; the ceiling is 1 s, so the agent must kill it long before it ends (the monitor loop pays ~1 s per CIM process query,
+    # so the kill lands a few seconds after the bound, never near 40 s).
+    if (Test-Case 'stage-ceiling-kill') {
+        $savedCeiling = $StageExemptMaxSec
+        $per = [ordered]@{}
+        try {
+            $id = $stageIds.attrStage
+            # (1) the ceiling is the bound: a 3600 s ask, ceiling 1 s, a child that outlives it.
+            $StageExemptMaxSec = 1
+            Reset-Case
+            $script:RealLaunch = $true
+            $script:Meta[$id] = [pscustomobject]@{ jobId = $id; timeoutSec = 3600; maxQueueAgeSec = 600 }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $null = Invoke-QueuedJob -Job (New-SleepJob $id 40)
+            $sw.Stop()
+            $r = $script:JobResults[$id]
+            Assert-True ($null -ne $r) "stage-ceiling-kill: the job published a result"
+            Assert-True ($sw.Elapsed.TotalSeconds -lt 30) "stage-ceiling-kill: the 40 s child was cut off at the 1 s ceiling, well before its end: $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
+            Assert-True ($r.exitCode -eq 124 -and $r.timedOut -eq $true) "stage-ceiling-kill: exit 124, timedOut: exit=$($r.exitCode) timedOut=$($r.timedOut)"
+            Assert-True ($r.timeoutSec -eq 1) "stage-ceiling-kill: the effective timeout in the result is the ceiling: $($r.timeoutSec)"
+            Assert-True ($r.stderr -match 'STAGE_EXEMPT_CEILING_EXCEEDED: ') "stage-ceiling-kill: the result's stderr carries the typed ceiling reason: $($r.stderr)"
+            Assert-True ($r.admission.stageCeiling.clamped -eq $true -and $r.admission.stageCeiling.ceilingSec -eq 1 -and $r.admission.stageCeiling.requestedSec -eq 3600) "stage-ceiling-kill: admission.stageCeiling records the clamp: $($r.admission.stageCeiling | ConvertTo-Json -Compress)"
+            Assert-True (@($r.killedProcessIds).Count -ge 1) "stage-ceiling-kill: the agent killed the child tree: pids=$(@($r.killedProcessIds) -join (","))"
+            Assert-True (@($script:Log | Where-Object { $_ -like "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$id *" }).Count -eq 1) "stage-ceiling-kill: typed log line"
+            Assert-True ($null -eq (Get-Process -Id ([int]$r.childPid) -ErrorAction SilentlyContinue)) "stage-ceiling-kill: the child pid $($r.childPid) is gone"
+            Assert-True (@(Get-Calls).Count -eq 0) "stage-ceiling-kill: and no lease was requested"
+            $per.ceiling = [ordered]@{ seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); exit = $r.exitCode }
+            # (2) control: the job's OWN shorter timeout (1 s) under the default ceiling kills it with exit 124 but is NOT a ceiling kill.
+            $StageExemptMaxSec = 300
+            Reset-Case
+            $script:RealLaunch = $true
+            $script:Meta[$id] = [pscustomobject]@{ jobId = $id; timeoutSec = 1; maxQueueAgeSec = 600 }
+            $null = Invoke-QueuedJob -Job (New-SleepJob $id 40)
+            $r = $script:JobResults[$id]
+            Assert-True ($r.exitCode -eq 124 -and $r.timedOut -eq $true -and $r.admission.stageCeiling.clamped -eq $false) "stage-ceiling-kill: the job's own 1 s timeout still ends it (124) unclamped: exit=$($r.exitCode) clamped=$($r.admission.stageCeiling.clamped)"
+            Assert-True (([string]$r.stderr) -notmatch 'STAGE_EXEMPT_CEILING' -and @($script:Log | Where-Object { $_ -like '*STAGE_EXEMPT_CEILING*' }).Count -eq 0) "stage-ceiling-kill: and it carries NO ceiling reason: $($r.stderr)"
+            $per.ownTimeout = $r.exitCode
+            # (3) control: a child that finishes inside the ceiling exits 0 and says nothing about one (a 3600 s ask is clamped to 300 s, never reached).
+            Reset-Case
+            $script:RealLaunch = $true
+            $script:Meta[$id] = [pscustomobject]@{ jobId = $id; timeoutSec = 3600; maxQueueAgeSec = 600 }
+            $null = Invoke-QueuedJob -Job (New-SleepJob $id 0)
+            $r = $script:JobResults[$id]
+            Assert-True ($r.exitCode -eq 0 -and $r.timedOut -eq $false -and $r.admission.stageCeiling.clamped -eq $true -and ([string]$r.stderr) -notmatch 'STAGE_EXEMPT_CEILING_EXCEEDED') "stage-ceiling-kill: a quick stage child ends 0, not timed out, no EXCEEDED reason: exit=$($r.exitCode) timedOut=$($r.timedOut) clamped=$($r.admission.stageCeiling.clamped) stderr=[$($r.stderr)]"
+            $per.quick = $r.exitCode
+        }
+        finally { $StageExemptMaxSec = $savedCeiling; $script:RealLaunch = $false }
+        $results.stageCeilingKill = $per
+    }
+
+    # ------------------------------------------------------------ stage-ceiling-adopt: a restarted agent adopts a live stage child
+    # Invoke-AdoptStartedJob (agent restart) kills an adopted child at the marker's timeoutSec. For a stage job the marker's admission
+    # carries stageCeiling, and that bound is the ceiling's when clamped: the kill must be typed as the live path types it.
+    if (Test-Case 'stage-ceiling-adopt') {
+        $per = [ordered]@{}
+        foreach ($variant in @('stage-clamped', 'stage-unclamped', 'gated')) {
+            Reset-Case
+            $id = $stageIds.attrStage
+            $outF = Join-Path $fx "adopt-$variant.out.txt"; $errF = Join-Path $fx "adopt-$variant.err.txt"
+            $sleepJob = New-SleepJob $id 40
+            $launch = Start-WindowlessRedirectedProcess -FilePath $psExe -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-File', $sleepJob.FullName) -OutFile $outF -ErrFile $errF -WorkingDirectory $fx
+            try {
+                $ident = Get-ProcessIdentity -ProcessId $launch.Process.Id
+                $admission = switch ($variant) {
+                    'stage-clamped' { [pscustomobject]@{ label = 'exempt-light'; state = 'exempt'; exemptClass = 'stage'; stageCeiling = [pscustomobject]@{ ceilingSec = 1; requestedSec = 3600; clamped = $true }; why = 'unit' } }
+                    'stage-unclamped' { [pscustomobject]@{ label = 'exempt-light'; state = 'exempt'; exemptClass = 'stage'; stageCeiling = [pscustomobject]@{ ceilingSec = 300; requestedSec = 1; clamped = $false }; why = 'unit' } }
+                    default { [pscustomobject]@{ label = 'clear'; state = 'clear'; why = 'unit' } }
+                }
+                $marker = [pscustomobject]@{ jobId = $id; childPid = $launch.Process.Id; childStartUtc = $ident.startUtc; childStartEpochMs = $ident.startEpochMs; childImagePath = $ident.imagePath
+                    startedUtc = (Get-Date).ToUniversalTime().ToString('o'); timeoutSec = 1; outFile = $outF; errFile = $errF; sourceInboxPath = ''; admission = $admission }
+                $sw = [Diagnostics.Stopwatch]::StartNew()
+                Invoke-AdoptStartedJob -Marker $marker -MarkerPath (Join-Path $fx "adopt-$variant.started.json") -Match ([pscustomobject]@{})
+                $sw.Stop()
+            }
+            finally { try { if (-not $launch.Process.HasExited) { $launch.Process.Kill($true) } } catch { }; Complete-WindowlessRedirectedProcess -Launch $launch; $launch.Process.Dispose() }
+            $r = $script:JobResults[$id]
+            Assert-True ($null -ne $r -and $r.adopted -eq $true -and $r.exitCode -eq 124 -and $r.timedOut -eq $true) "stage-ceiling-adopt ($variant): the adopted child past its 1 s bound is killed, 124: $($r | ConvertTo-Json -Compress -Depth 3)"
+            Assert-True ($sw.Elapsed.TotalSeconds -lt 30) "stage-ceiling-adopt ($variant): killed at the bound, not run to its 40 s end: $([math]::Round($sw.Elapsed.TotalSeconds, 1)) s"
+            $typed = ($r.stderr -match 'STAGE_EXEMPT_CEILING_EXCEEDED: ')
+            if ($variant -eq 'stage-clamped') {
+                Assert-True $typed "stage-ceiling-adopt ($variant): an adopted stage child killed at the ceiling carries the typed reason: $($r.stderr)"
+                Assert-True (@($script:Log | Where-Object { $_ -like "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$id *" }).Count -eq 1) "stage-ceiling-adopt ($variant): typed log line"
+                Assert-True ($r.admission.stageCeiling.clamped -eq $true) "stage-ceiling-adopt ($variant): the recovered admission keeps stageCeiling"
+            }
+            else { Assert-True (-not $typed) "stage-ceiling-adopt ($variant): no ceiling reason when the bound was not the ceiling's: $($r.stderr)" }
+            $per[$variant] = [ordered]@{ exit = $r.exitCode; typed = $typed }
+        }
+        $results.stageCeilingAdopt = $per
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }

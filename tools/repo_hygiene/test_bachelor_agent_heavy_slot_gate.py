@@ -168,6 +168,16 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         # The parameter declaration plus the stage branch are the only places the ceiling appears.
         self.assertEqual(self.code.count("$StageExemptMaxSec"), 1 + stage_branch.count("$StageExemptMaxSec"),
                          "the ceiling is read only by the stage branch")
+        # r2: classify = the immutable default grammar AND the effective pattern (an override only narrows), and an adopted stage child
+        # killed at the ceiling is typed too. Behaviour is driven by the .ps1 test (classify-and-override, stage-ceiling-kill, stage-ceiling-adopt).
+        self.assertIn("stage-exempt r3 (2026-10-25)", self.text)
+        self.assertIn("$script:StageGrammarDefault = '" + default + "'", self.text)
+        classify = self.code[self.code.index("function Get-GateExemptClass"):]
+        classify = classify[:classify.index("\n}\n")]
+        self.assertIn("($JobId -cmatch $script:StageGrammarDefault) -and ($JobId -cmatch $GateStageJobPattern)", classify)
+        adopt = self.code[self.code.index("function Invoke-AdoptStartedJob"):]
+        adopt = adopt[:adopt.index("\n}\n")]
+        self.assertIn("STAGE_EXEMPT_CEILING_EXCEEDED: adopted staging step", adopt)
 
     def test_exempt_jobs_run_during_a_gate_wait(self) -> None:
         # GATE-MAINT-DISPATCH-DURING-WAIT-1: a job waiting on the gate has no cap, and the inbox loop is blocked

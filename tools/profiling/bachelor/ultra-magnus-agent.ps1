@@ -81,6 +81,11 @@ param(
     # not be optional; (2) it matches none of the measured probe ids below; (3) it matches no near-miss (mutation) of a staging id
     # that the default grammar itself rejects, which catches a stem followed by a loose tail such as .*. $stageGrammar below is a copy
     # of the default (test-ultra-magnus-agent-stage-exempt.ps1 pins them equal). Narrowing it is safe (more jobs gated).
+    # r2 (STAGE-JOB-LEASE-EXEMPT-HARDENING-1, sol BLOCKER on b8faccf1): THIS CHECK IS A SAMPLED GUARD, NOT AN EXACT SUBSET TEST. Regex
+    # containment is not decidable cheaply, so it refuses what it can see (structure, measured ids, near-misses, unlisted fixture stems) and an
+    # override that matches only ids outside those samples still loads. The bound that holds for ANY override is in Get-GateExemptClass: an id
+    # is "stage" only if the immutable default grammar ($script:StageGrammarDefault) AND the effective pattern both match, so an override can
+    # only narrow, never widen.
     [ValidateScript({
             $gatedProbeIds = @('job-1', 'x-stage-1', 'playback-attr-3-cuda-0123456789ab-M16-1243-20261024T051948Z',
                 'playback-attr-3-cuda-0123456789ab-stage-20261024T051948Z', 'playback-attr-3-cuda-build-0123456789ab',
@@ -151,7 +156,12 @@ param(
                             $e -replace '0123456789ab', '0123456789a'; $e -replace '0123456789ab', '0123456789abc'; $e -replace '0123456789ab', '0123456789ag'
                             $e -replace 'stage-', 'build-'; $e -replace 'stage-', 'dllpair-'; $e -replace 'tiny_dual_iso', 'M16-1243'; $e -replace 'tiny_dual_iso', 'huge_dual_iso'
                             $e -replace 'attr3-stage-', 'attr3-footage-stage-'; $e -replace 'cuda-stage-', 'cuda-'
+                            $e -replace '0123456789ab', '0123456789AB'
                         }
+                        # r2 (sol/opus/fable/Dot on b8faccf1): a fixture stem the default does not list. Stems outside (tiny|large) are the likeliest widening.
+                        $near = @($near) + @(foreach ($stem in @('medium', 'med', 'unlisted', 'small', 'huge', 'xl', 'tiny2', 'large2', 'Tiny', 'x', 'M16-1243', '')) {
+                            "attr3-stage-fixture-${stem}_dual_iso-0123456789ab"; "attr3-stage-fixture-${stem}-0123456789ab"
+                        })
                         $loose = @($near | Select-Object -Unique | Where-Object { $_ -cnotmatch $stageGrammar -and $re.IsMatch($_) })
                         if ($loose.Count -gt 0) { $why = "it matches id(s) the staging grammar cannot produce, e.g. $((@($loose | Select-Object -First 3)) -join ', ')" }
                     }
@@ -1416,6 +1426,14 @@ function Invoke-AdoptStartedJob {
             $killedProcessIds = @(Stop-ProcessTree -RootProcessId ([int]$Marker.childPid) -RootStartUtc ([string]$Marker.childStartUtc) -RootStartEpochMs $Marker.childStartEpochMs -RootImagePath $Marker.childImagePath)
             "adopted child timed out after $($Marker.timeoutSec)s; killed process tree pids=$($killedProcessIds -join ',')" |
                 Add-Content -Encoding ASCII $Marker.errFile
+            # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: an adopted stage child killed at a bound that was the exempt ceiling's (marker timeoutSec is the clamped
+            # value) is typed as the live path types it. A non-stage, unclamped or pre-ceiling marker has no stageCeiling and gets no reason.
+            $adoptedCeiling = if ($null -ne $Marker.admission) { $Marker.admission.stageCeiling } else { $null }
+            if ($null -ne $adoptedCeiling -and $adoptedCeiling.clamped -eq $true) {
+                "STAGE_EXEMPT_CEILING_EXCEEDED: adopted staging step ran past its $($Marker.timeoutSec)s exempt ceiling (asked for $($adoptedCeiling.requestedSec)s); a lease-exempt job may not heat the host for longer" |
+                    Add-Content -Encoding ASCII $Marker.errFile
+                Add-AgentLogLine "heavy-slot-gate: STAGE_EXEMPT_CEILING_EXCEEDED job=$jobId ceiling=$($Marker.timeoutSec)s adopted killed pids=$($killedProcessIds -join ',')"
+            }
         }
     }
     finally {
@@ -1822,7 +1840,10 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + not-after r1 (2026-10-24) + stage-exempt r1 (2026-10-24) + lease-batch r5 (2026-10-24) + stage-exempt r2 (2026-10-25)"
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + not-after r1 (2026-10-24) + stage-exempt r1 (2026-10-24) + lease-batch r5 (2026-10-24) + stage-exempt r2 (2026-10-25) + stage-exempt r3 (2026-10-25)"
+# STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: the immutable default staging grammar (a copy of the GateStageJobPattern default and of the load-time
+# guard's $stageGrammar; test-ultra-magnus-agent-stage-exempt.ps1 pins all three equal). Get-GateExemptClass ANDs it with the effective pattern.
+$script:StageGrammarDefault = '^(playback-attr-3-cuda-stage-[0-9a-f]{12}(-[A-Za-z0-9-]{1,32})?|attr3-stage-smoke-runner-[0-9a-f]{12}-[0-9a-f]{12}|attr3-stage-fixture-(tiny|large)_dual_iso-[0-9a-f]{12})\z'
 $script:QuietLeaseLabel = "quiet-lease mlv"
 # lease-batch r2: heavy-slot.py's renew_stale_s. A lease with no successful renew for longer is demoted (non-exclusive).
 $script:LeaseRenewStaleSec = 120
@@ -2353,7 +2374,9 @@ function Get-GateExemptClass {
     # from inside another job's gate-wait (Invoke-ExemptJobsDuringWait reads GateExemptJobPattern alone).
     param([Parameter(Mandatory = $true)][string]$JobId)
     if ($JobId -match $GateExemptJobPattern) { return "light" }
-    if ($JobId -cmatch $GateStageJobPattern) { return "stage" }
+    # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: stage = the immutable default grammar AND the effective pattern, so an override can only
+    # NARROW. The load-time check on -GateStageJobPattern is a sampled guard; this AND is the bound that holds for any override.
+    if (($JobId -cmatch $script:StageGrammarDefault) -and ($JobId -cmatch $GateStageJobPattern)) { return "stage" }
     return $null
 }
 
