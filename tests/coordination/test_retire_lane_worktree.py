@@ -3436,3 +3436,60 @@ def test_launcher_census_r3_win32_process_create_shapes_stay_one_site_each(line)
 ])
 def test_launcher_census_r3_look_alikes_of_a_launch_are_not_sites(text):
     assert _detached_sites(text) == [] and _encoded_sites(text) == [], f"look-alike counted as a launch site: {text!r}"
+
+
+# --- r4 (Dot advisory 6391702961 B1, hub ACK 6392004927): a variable resolves to a literal only through assignments in the scope where
+# it is read. r3 kept one file-wide assignment map, so a parameter, a foreach variable or a caller's variable that shares a name with an
+# unrelated literal was read as that literal and its executed string passed as resolved.
+
+def test_launcher_census_r4_b1_dot_parameter_shadowing_an_outer_literal_is_unresolved():
+    text = ("$cmd='Write-Output ok'; function Run-Code { param($cmd) iex $cmd }; "
+            "Run-Code ('Start-' + 'Process -FilePath pwsh -WindowStyle Hidden')\n")
+    sites = _unresolved_sites(text)
+    assert [ln for _, ln in sites] == ["iex $cmd"], f"the parameter $cmd was resolved from the unrelated outer literal: {sites}"
+    assert _census_problems({_SYNTH: text}, {}, {}), "Dot's static counterexample passed an empty inventory"
+
+
+@pytest.mark.parametrize("text", [
+    "$cmd = 'Write-Output ok'\nfunction Run-Code($cmd) { iex $cmd }\n",
+    "$cmd = 'Write-Output ok'\n& { param($cmd) iex $cmd } $built\n",
+    "$cmd = 'Write-Output ok'\nforeach ($cmd in $list) { iex $cmd }\n",
+    "$cmd = 'Write-Output ok'\n$cmd, $rest = $parts\niex $cmd\n",
+    "$cmd = 'Write-Output ok'\nGet-Thing -OutVariable cmd\niex $cmd\n",
+    "$cmd = 'Write-Output ok'\n$sb = [scriptblock]::Create($global:cmd)\n",
+    "$sp = @{ FilePath = 'x' }\nfunction Start-It { param($sp) Start-Process @sp }\n",
+])
+def test_launcher_census_r4_b1_a_name_bound_by_something_other_than_a_literal_is_unresolved(text):
+    assert _unresolved_sites(text), f"a parameter / loop / multi-assignment / -OutVariable binding was read as the outer literal: {text!r}"
+
+
+# Nested scope (stated choice: conservatively unresolved). A { } body or a function reads a variable it never assigns from whatever scope
+# calls it at run time, so the outer literal is not evidence of the value.
+@pytest.mark.parametrize("text", [
+    "$cmd = 'Write-Output ok'\n& { iex $cmd }\n",
+    "$cmd = 'Write-Output ok'\nfunction Run-Code { iex $cmd }\n",
+])
+def test_launcher_census_r4_b1_a_nested_scope_reading_an_outer_literal_is_unresolved(text):
+    assert _unresolved_sites(text), f"a nested scope read an outer literal as its own: {text!r}"
+
+
+# Dot-sourced script reading a caller variable: a value the file does not definitely assign before the read comes from the caller.
+@pytest.mark.parametrize("text", [
+    "iex $cmd\n",
+    "if ($Force) { $cmd = 'Write-Output ok' }\niex $cmd\n",
+    "iex $cmd\n$cmd = 'Write-Output ok'\n",
+])
+def test_launcher_census_r4_b1_a_caller_variable_read_by_a_dot_sourced_script_is_unresolved(text):
+    assert _unresolved_sites(text), f"a variable the file does not assign before reading it was resolved: {text!r}"
+
+
+# Guards (pass on every scanner): a literal assigned in the scope that reads it still resolves, so these stay site-free.
+@pytest.mark.parametrize("text", [
+    "$cmd = 'Write-Output ok'\niex $cmd\n",
+    "function Run-Code { $c = 'Write-Output ok'; iex $c }\n",
+    "$a = 'Write-Output ok'\n$b = $a\niex $b\n",
+    "$script:T = 'Write-Output ok'\nfunction Run-Code { iex $script:T }\n",
+    "$sp = @{ FilePath = 'x' }\nStart-Process @sp\n",
+])
+def test_launcher_census_r4_a_literal_assigned_in_the_reading_scope_still_resolves(text):
+    assert _unresolved_sites(text) == [], f"a same-scope literal was reported unresolved: {text!r}"
