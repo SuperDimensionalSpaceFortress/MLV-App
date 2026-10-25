@@ -23,12 +23,16 @@ param(
 #   stage-cancel   - a staging job with a cancel file is published cancelled-in-gate and never launched
 #   stage-notafter - a staging job past its notAfterUtc is published expired and never launched
 #   stage-not-during-wait - while a measured job waits on its lease, the light job behind it runs and the staging job does not
+#   override-bounds - (hardening r1, Dot 04eedafd on #649) an override must stay inside the staging grammar: one that matches an id
+#                     the default pattern cannot produce (a prefix no probe list names, a near-miss of a staging id) is refused
+#   stage-ceiling   - (hardening r1) a stage-class job's effective timeout is bounded by -StageExemptMaxSec (default 300 s, ~66x the
+#                     measured ~4.5 s step), with a typed STAGE_EXEMPT_CEILING_* reason; light and gated timeouts are unchanged
 # Prints one JSON object with status PASS, or throws.
 
 $ErrorActionPreference = 'Stop'
 $agentScript = if ($AgentScript) { $AgentScript } else { Join-Path $RepoRoot 'tools\profiling\bachelor\ultra-magnus-agent.ps1' }
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw "FAIL: $Message" } }
-$caseNames = @('classify', 'stage-ungated', 'stage-gated', 'light-ungated', 'stage-cancel', 'stage-notafter', 'stage-not-during-wait')
+$caseNames = @('classify', 'stage-ungated', 'stage-gated', 'light-ungated', 'stage-cancel', 'stage-notafter', 'stage-not-during-wait', 'override-bounds', 'stage-ceiling')
 $Only = @($Only | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 foreach ($n in $Only) { if ($caseNames -notcontains $n) { throw "unknown case '$n' (known: $($caseNames -join ', '))" } }
 function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
@@ -65,6 +69,8 @@ $paramDefaults = @{}
 foreach ($p in $ast.ParamBlock.Parameters) { if ($p.DefaultValue -is [System.Management.Automation.Language.ConstantExpressionAst]) { $paramDefaults[$p.Name.VariablePath.UserPath] = $p.DefaultValue.Value } }
 $GateExemptJobPattern = [string]$paramDefaults['GateExemptJobPattern']
 $GateStageJobPattern = $paramDefaults['GateStageJobPattern']
+$StageExemptMaxSec = $paramDefaults['StageExemptMaxSec']
+$agentText = [IO.File]::ReadAllText($agentScript)
 
 $results = [ordered]@{}
 $fx = Join-Path ([IO.Path]::GetTempPath()) ("um-agent-stage-exempt-{0}-{1}" -f $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -155,7 +161,7 @@ function New-LaunchingMarker {
     param([string]$JobId, $Job, $Metadata, [string]$OutFile, [string]$ErrFile, [string]$StartedUtc, [int]$TimeoutSec)
     # What WOULD launch, with the admission it would launch under; the job file leaves inbox\ as a run job's does.
     $a = $script:Admission
-    $script:Launches.Add([pscustomobject]@{ jobId = $JobId; label = $a.label; why = $a.why; waitingFor = $a.waitingFor; leasePending = ($null -ne $script:QuietLeaseWaiting); leaseHeld = ($null -ne $script:QuietLease) })
+    $script:Launches.Add([pscustomobject]@{ jobId = $JobId; label = $a.label; why = $a.why; waitingFor = $a.waitingFor; leasePending = ($null -ne $script:QuietLeaseWaiting); leaseHeld = ($null -ne $script:QuietLease); timeoutSec = $TimeoutSec; stageCeiling = $a.stageCeiling })
     if (Test-Path -LiteralPath $Job.FullName -PathType Leaf) { Move-Item -LiteralPath $Job.FullName -Destination $processed }
     return $null
 }
@@ -337,6 +343,103 @@ try {
         Assert-True (@($l | Where-Object { $_.jobId -ceq $stageIds.attrStage }).Count -eq 0 -and (Test-Path -LiteralPath $stageJob.FullName -PathType Leaf)) "stage-not-during-wait: the staging job is NOT run during the measured job's lease wait and stays in inbox\"
         Assert-True (@($script:Log | Where-Object { $_ -like "heavy-slot-gate: maint-dispatch exempt job=$($stageIds.attrStage) *" }).Count -eq 0) "stage-not-during-wait: no maint-dispatch line for the staging job"
         $results.stageNotDuringWait = [ordered]@{ refusals = $scans; ranDuringWait = @($l | ForEach-Object { $_.jobId }); stageLeftQueued = $true }
+    }
+    # ------------------------------------------------------------ override-bounds: an override stays inside the staging grammar
+    # Hardening r1 (Dot 04eedafd on #649): the override used to be refused only when it matched one of seven measured probe ids, so a
+    # pattern for any OTHER measured shape (dllpair, a new leg generator, a reference frame with another stem) was accepted and that
+    # leg would run with no quiet machine. The bound is now positive: every alternative must open with a staging stem, and the
+    # pattern must reject near-misses of the staging ids. Narrowing to a subset of the grammar stays allowed (more jobs gated).
+    if (Test-Case 'override-bounds') {
+        $p = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'GateStageJobPattern' }
+        $vs = @($p.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateScript' })
+        Assert-True ($vs.Count -eq 1) "override-bounds: GateStageJobPattern is validated at binding"
+        $validator = [scriptblock]::Create($vs[0].PositionalArguments[0].ScriptBlock.EndBlock.Extent.Text)
+        Assert-True ($vs[0].PositionalArguments[0].ScriptBlock.EndBlock.Extent.Text.Contains("`$stageGrammar = '$GateStageJobPattern'")) "override-bounds: the validator's copy of the grammar equals the parameter default"
+        $mustRefuse = @(
+            '^playback-attr-3-cuda-dllpair-[0-9a-f]{12}\z'                                        # a real generator id the probe list never named
+            '^cpu-look-leg-[0-9a-f]{12}-[A-Za-z0-9-]+\z'                                          # a new leg generator's ids
+            '^reference-frame-[0-9a-f]{12}-[a-z0-9-]+-[0-9a-f]{12}\z'                             # a reference frame with another stem
+            '^lease-batch-open-[0-9T]+-lb[0-9a-f]+\z'
+            '^playback-attr-3-cuda-stage-[0-9a-f]{12}-.*\z'                                       # widening inside the stem: admits near-misses
+            '^attr3-stage-fixture-.*\z'                                                           # any fixture stem, not the two tracked clips
+            '^(playback-attr-3-cuda-stage-[0-9a-f]{12}|lease-batch-open-.*)\z'                    # one good alternative, one not
+            '^playback-attr-3-cuda-stage-[0-9a-f]{12}\z|^.*-leg-[0-9]+\z'                         # top-level alternation, second arm not a stem
+            '^(playback-attr-3-cuda-stage-)?.*\z'                                                 # the stem made optional
+            '^playback-attr-3-cuda-stage-[0-9a-f]{12}(-[A-Za-z0-9_-]{1,32})?\z'                  # allows an underscore the generator never emits
+        )
+        $mustAccept = @(
+            $GateStageJobPattern                                                                  # the default
+            '^playback-attr-3-cuda-stage-8ea38dff267b\z'                                          # narrowed to one sha
+            '^attr3-stage-fixture-tiny_dual_iso-[0-9a-f]{12}\z'                                   # narrowed to one fixture
+            '^(attr3-stage-smoke-runner-[0-9a-f]{12}-[0-9a-f]{12}|attr3-stage-fixture-large_dual_iso-[0-9a-f]{12})\z'
+            '^attr3-stage-smoke-runner-[0-9a-f]{12}-[0-9a-f]{12}\z|^attr3-stage-fixture-tiny_dual_iso-[0-9a-f]{12}\z'
+        )
+        $refusedNow = [ordered]@{}; $acceptedNow = [ordered]@{}
+        foreach ($bad in $mustRefuse) {
+            $msg = $null
+            try { $null = ForEach-Object -Process $validator -InputObject $bad } catch { $msg = $_.Exception.Message }
+            Assert-True ($null -ne $msg -and $msg -match '^HEAVY_SLOT_OVERRIDE_OUT_OF_BOUNDS: -GateStageJobPattern ') "override-bounds: '$bad' is refused with the typed token (it admits ids the default grammar cannot produce): '$msg'"
+            $refusedNow[$bad] = $msg
+        }
+        foreach ($good in $mustAccept) {
+            $msg = $null; $ok = $null
+            try { $ok = ForEach-Object -Process $validator -InputObject $good } catch { $msg = $_.Exception.Message }
+            Assert-True ($ok -eq $true -and $null -eq $msg) "override-bounds: '$good' stays accepted (inside the grammar): '$msg'"
+            $acceptedNow[$good] = $true
+        }
+        $results.overrideBounds = [ordered]@{ refused = @($refusedNow.Keys); accepted = @($acceptedNow.Keys) }
+    }
+
+    # ------------------------------------------------------------ stage-ceiling: a staging job's timeout is bounded, the others' are not
+    # Evidence for the default: playback-attr-3-cuda-stage-8ea38dff267b, a copy-and-hash step, ran ~4.5 s on 2026-10-24; 300 s is
+    # ~66x that, well under the 900 s heavy-slot long-label bound. The submit paths ask 1800 s (smoke-runner) and 3600 s (stage).
+    if (Test-Case 'stage-ceiling') {
+        # The behavioural checks run first (against 300 when the agent declares no ceiling, so a base agent fails each on behaviour);
+        # the declaration checks close the case.
+        $declaredCeiling = $StageExemptMaxSec
+        if ($declaredCeiling -isnot [int]) { $StageExemptMaxSec = 300 }
+        $per = [ordered]@{}
+        $runStage = {
+            param([string]$Id, $Timeout)
+            Reset-Case
+            if ($null -ne $Timeout) { $script:Meta[$Id] = [pscustomobject]@{ jobId = $Id; timeoutSec = $Timeout; maxQueueAgeSec = 600 } }
+            $script:ExpireJob = $Id
+            $script:ExpireWhen = { @($script:Log | Where-Object { $_ -like 'quiet-lease: refused job=*' }).Count -ge 1 }
+            $null = Invoke-QueuedJob -Job (New-InboxJob $Id)
+            return @($script:Launches)
+        }
+        foreach ($k in $stageIds.Keys) {
+            $id = $stageIds[$k]
+            $l = @(& $runStage $id 3600)
+            Assert-True ($l.Count -eq 1 -and $l[0].timeoutSec -eq $StageExemptMaxSec) "stage-ceiling: $id asked for 3600 s is bounded at ${StageExemptMaxSec} s: $($l | ConvertTo-Json -Compress)"
+            Assert-True ($l[0].stageCeiling.ceilingSec -eq $StageExemptMaxSec -and $l[0].stageCeiling.requestedSec -eq 3600 -and $l[0].stageCeiling.clamped -eq $true) "stage-ceiling: $id carries the typed ceiling record in its admission: $($l[0].stageCeiling | ConvertTo-Json -Compress)"
+            Assert-True (@($script:Log | Where-Object { $_ -ceq "heavy-slot-gate: STAGE_EXEMPT_CEILING_APPLIED job=$id requested=3600s ceiling=${StageExemptMaxSec}s" }).Count -eq 1) "stage-ceiling: typed STAGE_EXEMPT_CEILING_APPLIED line for $id"
+            $per[$k] = $l[0].timeoutSec
+        }
+        # The agent's own 1800 s default (no usable metadata) is bounded too.
+        $id = $stageIds.attrStage
+        $l = @(& $runStage $id 1800)
+        Assert-True ($l.Count -eq 1 -and $l[0].timeoutSec -eq $StageExemptMaxSec) "stage-ceiling: an 1800 s ask is bounded at ${StageExemptMaxSec} s: $($l | ConvertTo-Json -Compress)"
+        # No regression: a normal ask (inside the ceiling, and exactly at it) is untouched, and says nothing about a ceiling.
+        foreach ($ask in @(60, 120, $StageExemptMaxSec)) {
+            $l = @(& $runStage $id $ask)
+            Assert-True ($l.Count -eq 1 -and $l[0].label -ceq 'exempt-light' -and $l[0].timeoutSec -eq $ask) "stage-ceiling: a ${ask} s staging ask is unchanged and still exempt-light: $($l | ConvertTo-Json -Compress)"
+            Assert-True ($l[0].stageCeiling.clamped -eq $false -and @($script:Log | Where-Object { $_ -like '*STAGE_EXEMPT_CEILING*' }).Count -eq 0) "stage-ceiling: a ${ask} s ask is not clamped and logs no ceiling line"
+        }
+        # The light class keeps its timeout; a gated job keeps its timeout (its quiet lease is sized from it: 1800 s -> 31 min, not the 6 min a 300 s clamp would give).
+        $l = @(& $runStage $lightIds.quietProbe 3600)
+        Assert-True ($l.Count -eq 1 -and $l[0].timeoutSec -eq 3600 -and $null -eq $l[0].stageCeiling) "stage-ceiling: a light job asked for 3600 s keeps 3600 s and has no ceiling record: $($l | ConvertTo-Json -Compress)"
+        $null = & $runStage $gatedIds.measuredLeg 1800
+        $reqs = @(Get-Requests)
+        Assert-True ($reqs.Count -ge 1 -and ((@($reqs[0].argv) -join ' ') -match '--minutes 31 ')) "stage-ceiling: a gated job asked for 1800 s still requests a 31 min lease: $((@($reqs | ForEach-Object { $_.argv -join ' ' })) -join ' | ')"
+        Assert-True (@($script:Log | Where-Object { $_ -like '*STAGE_EXEMPT_CEILING*' }).Count -eq 0) "stage-ceiling: a gated job logs no stage ceiling line"
+        # The kill path (a real child past its bound) cannot be driven with stubs; pin that it types the reason when the bound was the ceiling's.
+        Assert-True ($agentText -match 'STAGE_EXEMPT_CEILING_EXCEEDED: ') "stage-ceiling: the timed-out branch writes the typed STAGE_EXEMPT_CEILING_EXCEEDED reason"
+        Assert-True ($declaredCeiling -is [int] -and $declaredCeiling -eq 300) "stage-ceiling: the agent declares -StageExemptMaxSec with default 300 (got '$declaredCeiling')"
+        $p = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'StageExemptMaxSec' }
+        $vr = @($p.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateRange' })
+        Assert-True ($vr.Count -eq 1 -and $vr[0].PositionalArguments[0].Value -eq 1 -and $vr[0].PositionalArguments[1].Value -le 900) "stage-ceiling: -StageExemptMaxSec has a validated range, 1..900 at most"
+        $results.stageCeiling = [ordered]@{ ceilingSec = $StageExemptMaxSec; boundedAt = $per }
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
 }

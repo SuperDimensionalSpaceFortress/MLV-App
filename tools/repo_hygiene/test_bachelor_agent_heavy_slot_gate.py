@@ -146,6 +146,29 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         self.assertEqual(len(re.findall(r"-c?match \$GateStageJobPattern", self.code)), 1,
                          "the stage pattern is matched in one place (Get-GateExemptClass), case-sensitively")
 
+    def test_stage_exempt_hardening_bounds_override_and_run_time(self) -> None:
+        # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r1 (Dot 04eedafd on #649): the override is stated positively (staging stems only) and a
+        # stage-class job has its own short ceiling. Behaviour is driven by tools/testing/test-ultra-magnus-agent-stage-exempt.ps1.
+        self.assertIn("stage-exempt r2 (2026-10-25)", self.text)
+        self.assertIn("[ValidateRange(1, 900)]\n    [int]$StageExemptMaxSec = 300,".replace("\n", "\r\n" if "\r\n" in self.text else "\n"), self.text)
+        # The validator's copy of the grammar is the parameter default (the .ps1 test pins the same).
+        default = re.search(r"\[string\]\$GateStageJobPattern = '([^']+)'", self.text).group(1)
+        self.assertIn("$stageGrammar = '" + default + "'", self.text)
+        for stem in ("playback-attr-3-cuda-stage-", "attr3-stage-smoke-runner-", "attr3-stage-fixture-"):
+            self.assertIn("'" + stem + "'", self.text)
+        # Only the stage branch clamps; the kill path types the reason; light and gated paths never read the ceiling.
+        queued = self.code[self.code.index("function Invoke-QueuedJob"):]
+        queued = queued[:queued.index("\n}\n")]
+        stage_branch = queued[queued.index('elseif ($exemptClass -eq "stage")'):]
+        stage_branch = stage_branch[:stage_branch.index("    else {")]
+        self.assertIn("$effectiveTimeoutSec = $StageExemptMaxSec", stage_branch)
+        self.assertEqual(queued.count("$effectiveTimeoutSec = $StageExemptMaxSec"), 1)
+        self.assertIn("STAGE_EXEMPT_CEILING_APPLIED", stage_branch)
+        self.assertIn("STAGE_EXEMPT_CEILING_EXCEEDED: ", queued)
+        # The parameter declaration plus the stage branch are the only places the ceiling appears.
+        self.assertEqual(self.code.count("$StageExemptMaxSec"), 1 + stage_branch.count("$StageExemptMaxSec"),
+                         "the ceiling is read only by the stage branch")
+
     def test_exempt_jobs_run_during_a_gate_wait(self) -> None:
         # GATE-MAINT-DISPATCH-DURING-WAIT-1: a job waiting on the gate has no cap, and the inbox loop is blocked
         # inside it, so the light jobs behind it (probes, dve health, agent-swap) are run from inside the wait.
