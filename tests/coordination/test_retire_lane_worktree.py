@@ -3636,3 +3636,44 @@ def test_launcher_census_r5_control_writers_stay_one_site(writer):
 ])
 def test_launcher_census_r5_control_a_safe_same_scope_literal_stays_resolved(text):
     assert _unresolved_sites(text) == [], f"a safe same-scope literal with no other writer was reported unresolved: {text!r}"
+
+
+# --- r7 (Dot advisory 6392963508, Grok CoS ask 6392967676, hub ruling HUB-TICK 20261025T0526Z): rule V is closed by an allowlist
+# (Test-LaunchSites.ps1 header, V3). One fixture per allowlist boundary, not one per known writer. The payload is a benign marker that
+# is not a constant: the only question is whether `$cmd` still resolves to its literal. Parameter coverage is proven by the metadata
+# meta-test in tools/repo_hygiene/test_launch_site_census_binders.py, which runs on the hosted Windows and ubuntu shards.
+_R7_MARKER = "$env:CENSUS_FIXTURE_MARKER"
+
+
+def _r7(binder):
+    return "$cmd = 'Write-Output ok'; " + binder + "; iex $cmd\n"
+
+
+@pytest.mark.parametrize("binder", [
+    pytest.param(_R7_MARKER + " | Tee-Object -Variable cmd", id="i-variable-named-parameter"),
+    pytest.param("$m = 'Value'; (Get-Variable cmd).$m = " + _R7_MARKER, id="ii-dynamic-member-name"),
+    pytest.param("(Get-Variable cmd -ValueOnly:$false).Value = " + _R7_MARKER, id="iii-valueonly-not-true"),
+    pytest.param(". { param($cmd) } " + _R7_MARKER, id="iv-dot-sourced-block-param"),
+])
+def test_launcher_census_r7_a_binder_off_the_allowlist_leaves_the_read_unresolved(binder):
+    _r5_iex_is_unresolved(_r7(binder))
+
+
+# Controls: the writers rule V always saw stay one site, and binders that are on the allowlist (a param of a block run with `&` or of a
+# function that is not dot-sourced, -ValueOnly given as a switch or :$true, a constant member name, a parameter that binds no variable)
+# leave a safe same-scope literal resolved.
+@pytest.mark.parametrize("binder", ["$cmd = " + _R7_MARKER, "Set-Variable cmd " + _R7_MARKER])
+def test_launcher_census_r7_control_writers_stay_one_site(binder):
+    sites = _unresolved_sites(_r7(binder))
+    assert [ln for _, ln in sites] == ["iex $cmd"], f"a writer rule V already saw is no longer exactly one site: {sites}"
+
+
+@pytest.mark.parametrize("binder", [
+    pytest.param("& { param($cmd) } " + _R7_MARKER, id="amp-block-param"),
+    pytest.param("function Use-It { param($cmd) }; Use-It " + _R7_MARKER, id="function-param"),
+    pytest.param("$o = Get-Variable other -ValueOnly; $p = Get-Variable more -ValueOnly:$true", id="valueonly-switch-and-true"),
+    pytest.param("$o = @{ a = 1 }; $o.a = " + _R7_MARKER, id="constant-member-name"),
+    pytest.param(_R7_MARKER + " | Write-Output -InputObject cmd", id="parameter-binding-no-variable"),
+])
+def test_launcher_census_r7_control_an_allowlisted_binder_keeps_the_literal(binder):
+    assert _unresolved_sites(_r7(binder)) == [], f"an allowlisted binder made a safe same-scope literal unresolved: {binder!r}"
