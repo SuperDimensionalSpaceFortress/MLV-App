@@ -3343,3 +3343,131 @@ def test_launcher_census_roots_cover_tracked_launch_sites_outside_the_old_roots(
         assert p in src, f"{p} is a tracked launch site outside the census roots"
     assert "tools/coordination/Retire-LaneWorktree.ps1" not in src
     assert not [p for p in src if "/test" in p.lower() or Path(p).name.lower().startswith("test")], "test scripts must stay out of the census"
+
+
+# --- r3 (sol r2 D-01, Dot 64dc38fd B1/B2, Grok 6390930513 G1/G2/G3, opus r2 H1/H3): the census reads sites from the PowerShell AST.
+# Each fixture below is a launch that some hand-written tokenizer round hid. Two launches in ONE statement are two sites; a `$()` in a
+# double-quoted string is code; a here-string run through [scriptblock]::Create is code, `;` inside its quotes included; an encoded switch
+# on `& $exe` needs no pwsh word beside it; Start-Process takes -WindowStyle in its colon, prefix, alias and splatted forms.
+
+_ENC_CMD_A = "& $exeA -NoProfile -EncodedCommand $encodedA"
+_ENC_CMD_B = "& $exeB -NoProfile -EncodedCommand $encodedB"
+
+
+def _second_site_is_unclassified(text, kind):
+    """`text` holds two launches of `kind`; with only the A launch pinned, return (sites, census problems)."""
+    pin = next(p for p in ((_ENC_LAUNCH_A, _ENC_CMD_A) if kind == "encoded" else (_DET_LAUNCH_A,)) if p in text)
+    inv = {_SYNTH: [(pin, "classified")]}
+    if kind == "encoded":
+        return _encoded_sites(text), _census_problems({_SYNTH: text}, inv, {})
+    return _detached_sites(text), _census_problems({_SYNTH: text}, {}, inv)
+
+
+@pytest.mark.parametrize("kind", ["encoded", "detached"])
+def test_launcher_census_r3_d01_same_line_if_else_branches_are_two_sites(kind):
+    a, b = (_ENC_LAUNCH_A, _ENC_LAUNCH_B) if kind == "encoded" else (_DET_LAUNCH_A, _DET_LAUNCH_B)
+    sites, problems = _second_site_is_unclassified("if ($x) { " + a + " } else { " + b + " }\n", kind)
+    assert len(sites) == 2, f"two {kind} launches in one if/else statement were folded into one site: {sites}"
+    assert any("unclassified" in p for p in problems), f"the pinned if-branch launch consumed the else-branch launch: {problems}"
+
+
+@pytest.mark.parametrize("kind", ["encoded", "detached"])
+def test_launcher_census_r3_d01_pipeline_chain_and_and_is_two_sites(kind):
+    a, b = (_ENC_CMD_A, _ENC_CMD_B) if kind == "encoded" else (_DET_LAUNCH_A, _DET_LAUNCH_B)
+    sites, problems = _second_site_is_unclassified(a + " && " + b + "\n", kind)
+    assert len(sites) == 2, f"`A && B` folded two {kind} launches into one site: {sites}"
+    assert any("unclassified" in p for p in problems), problems
+
+
+def test_launcher_census_r3_d01_launch_inside_a_pipeline_scriptblock_is_its_own_site():
+    text = _DET_LAUNCH_A + " | ForEach-Object { " + _DET_LAUNCH_B + " }\n"
+    sites, problems = _second_site_is_unclassified(text, "detached")
+    assert len(sites) == 2, f"`A | % {{ B }}` folded two detached launches into one site: {sites}"
+    assert any("unclassified" in p for p in problems), problems
+
+
+def test_launcher_census_r3_b1_subexpression_in_a_double_quoted_string_is_code():
+    text = '$s = "$(' + _DET_LAUNCH_A + "; " + _DET_LAUNCH_B + ')"\n'
+    sites, problems = _second_site_is_unclassified(text, "detached")
+    assert len(sites) == 2, f"two launches inside $( ) in a double-quoted string were read as one opaque string: {sites}"
+    assert any("unclassified" in p for p in problems), problems
+
+
+def test_launcher_census_r3_b2_here_string_run_by_scriptblock_create_keeps_its_quoted_semicolon():
+    text = ("$script = @'\nStart-Process -FilePath $exe -ArgumentList 'x;y' -WindowStyle Hidden\n'@\n"
+            "& ([scriptblock]::Create($script))\n")
+    sites = _detached_sites(text)
+    assert len(sites) == 1 and "'x;y'" in sites[0][1], f"a quoted `;` inside a here-string split the hidden launch it carries: {sites}"
+    assert sites[0][0] == 2, f"the inner launch is reported at its own line in the outer file: {sites}"
+    assert _census_problems({_SYNTH: text}, {}, {}), "an executed here-string's hidden launch passed an empty inventory"
+
+
+@pytest.mark.parametrize("sep", ["; ", "\n"])
+def test_launcher_census_r3_g1_encoded_switch_on_amp_exe_after_get_command_pwsh(sep):
+    text = "$exe = (Get-Command pwsh).Source" + sep + "& $exe -enc $b64\n"
+    assert len(_encoded_sites(text)) == 1, f"`& $exe -enc` with $exe resolved from Get-Command pwsh was not a site (sep={sep!r})"
+    assert _census_problems({_SYNTH: text}, {}, {}), "an unclassified encoded launch on `& $exe` passed the census"
+
+
+def test_launcher_census_r3_g2_unquoted_long_switch_on_amp_exe_counts_alone():
+    text = "& $exe -EncodedCommand $b64\n"
+    assert len(_encoded_sites(text)) == 1, "an unquoted -EncodedCommand on `& $exe` with no pwsh word beside it was not a site"
+    assert _census_problems({_SYNTH: text}, {}, {}), "an unclassified `& $exe -EncodedCommand` passed the census"
+
+
+def test_launcher_census_r3_h3_quote_inside_subexpression_cannot_open_a_block_comment():
+    text = '$m = "$(if ($x) { "it\'s" })"\nWrite-Host \'<#\'\n' + _ENC_LAUNCH_B + "\nWrite-Host '#>'\n"
+    assert len(_encoded_sites(text)) == 1, "a quote inside $( ) desynchronised the scanner and a quoted '<#' hid the launch after it"
+    assert _census_problems({_SYNTH: text}, {}, {}), "the census passes a file whose only launch sits behind a $( ) quote desync"
+
+
+@pytest.mark.parametrize("line", [
+    "Start-Process -FilePath $x -WindowStyle:Hidden",
+    "Start-Process -FilePath $x -WindowStyle:'Hidden'",
+    "Start-Process -FilePath $x -Win Hidden",
+    "Start-Process -FilePath $x -windowst hidden",
+    "saps -FilePath $x -WindowStyle Hidden",
+    "start $x -WindowStyle Hidden",
+    "Microsoft.PowerShell.Management\\Start-Process $x -WindowStyle Hidden",
+    "Start-Process $x -WindowStyle ([System.Diagnostics.ProcessWindowStyle]::Hidden)",
+    "$sp = @{ FilePath = $x; WindowStyle = 'Hidden' }\nStart-Process @sp",
+    "$sp = @{ FilePath = $x }\n$sp.WindowStyle = 'Hidden'\nStart-Process @sp",
+])
+def test_launcher_census_r3_g3_every_form_of_a_hidden_start_process_is_a_site(line):
+    assert len(_detached_sites(line + "\n")) == 1, f"hidden Start-Process form not seen: {line!r}"
+
+
+@pytest.mark.parametrize("text", [
+    "& ([scriptblock]::Create($prefix + $body))\n",
+    "Invoke-Expression $cmd\n",
+    "iex \"$a; $b\"\n",
+    "param($cmd)\n$sb = [scriptblock]::Create($cmd)\n",
+    "$cmd | Invoke-Expression\n",
+    "& pwsh -NoProfile -Command $cmd\n",
+])
+def test_launcher_census_r3_an_executed_string_built_at_run_time_is_unresolved_and_fails_the_census(text):
+    assert _census_problems({_SYNTH: text}, {}, {}), f"an executed string the census cannot resolve passed silently: {text!r}"
+
+
+# Guards (pass on every scanner): the shapes DETACHED_RX matched stay one site each, and the look-alikes stay zero.
+@pytest.mark.parametrize("line", [
+    "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cl }",
+    "Invoke-WmiMethod -Class Win32_Process -Name Create -ArgumentList $cl",
+    "$r = ([wmiclass]'Win32_Process').Create($cl)",
+    "$c = [wmiclass]'Win32_Process'",
+])
+def test_launcher_census_r3_win32_process_create_shapes_stay_one_site_each(line):
+    assert len(_detached_sites(line + "\n")) == 1, f"Win32_Process Create shape not counted exactly once: {line!r}"
+
+
+@pytest.mark.parametrize("text", [
+    "Start-Process -FilePath $x -WindowStyle Normal\n",
+    "Start-Process -FilePath $x -WindowStyle Minimized -PassThru\n",
+    "Start-Process -FilePath $x -wi\n",
+    "Start-Process -FilePath $x -NoNewWindow -Wait\n",
+    "Write-Host 'Start-Process is forbidden here'\n",
+    "& $winget install --id Microsoft.VisualStudio.2022.BuildTools -e --silent\n",
+    "& $dumpbin /EXPORTS $dll\n",
+])
+def test_launcher_census_r3_look_alikes_of_a_launch_are_not_sites(text):
+    assert _detached_sites(text) == [] and _encoded_sites(text) == [], f"look-alike counted as a launch site: {text!r}"
