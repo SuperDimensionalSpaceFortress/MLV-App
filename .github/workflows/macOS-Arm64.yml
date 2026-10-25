@@ -12,7 +12,7 @@ concurrency:
 
 env:
   SOURCE_DIR:   ${{ github.workspace }}/platform
-  QTDIR:        /opt/homebrew/opt/qt@5/bin
+  QTDIR:        /opt/homebrew/opt/qt/bin
   ARTIFACT:     ${{ github.workspace }}/platform/build/MLV\ App.dmg
 
 jobs:
@@ -29,7 +29,7 @@ jobs:
     - name: Install llvm & Qt & OpenSSL
       uses: ConorMacBride/install-package@3e7ad059e07782ee54fa35f827df52aae0626f30 # v1.1.0
       with:
-        brew: llvm qt5 openssl
+        brew: llvm qt openssl
 
     - name: Verify macOS build toolchain
       run: |
