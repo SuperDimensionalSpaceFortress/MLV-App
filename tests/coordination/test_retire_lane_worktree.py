@@ -3032,6 +3032,12 @@ UNRESOLVED_EXECUTED_SITES = {
          "the -Command build fragment its caller hands build-guard (mingw32-make / qmake lines), run in-process and waited on under the host "
          "memory guard; a tracked caller passes it as a literal, which rule S scans in the caller's own file"),
     ],
+    "tools/profiling/bachelor/AttrCudaArtifacts.psm1": [
+        ("[void]$shell.AddScript($loopScript)",
+         "r5 rule V2: $loopScript is the { } literal at :6242 in the same function (Start-AttrCudaDisplayWakeKeepAlive), its only writer, "
+         "which the AST scans as code; it is unresolved because this module's item cmdlets take non-constant paths (Copy-Item / "
+         "Move-Item / Remove-Item -LiteralPath $var), none of them on the variable: drive"),
+    ],
     "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [
         ("-ExecutionPolicy Bypass -Command $cmd 1>",
          "$cmd is the smoke-script call `& <smoke.ps1> -ExePath .. -Input .. -Output ..` built at :2701 (+ :2740 / :4696 argument appends): "
@@ -3071,6 +3077,10 @@ UNRESOLVED_EXECUTED_SITES = {
         ("& ([scriptblock]::Create($A.writeText)) $w",
          "r4 (from #633): inside Start-VenueJobLiveness's step here-string; $A.writeText is $script:LivenessWriteText, the single-quoted "
          "here-string liveness-sidecar write at :822 that rule S scans in place"),
+        ("[void]$ps.AddScript($script:VenueKeeperLoop)",
+         "r5 rule V2: Start-VenueKeeper runs $script:VenueKeeperLoop, the single-quoted here-string assigned once at top level (:744), "
+         "which rule S scans in place (the keeper-step row above is inside it); it is unresolved because this module's New-Item / "
+         "Remove-Item take non-constant paths, none of them on the variable: drive"),
     ],
     "tools/profiling/dual-venue/Wait-VenueQuiet.ps1": [
         ("[void]$pp.AddScript($IdentityWorkerPrelude)",
@@ -3589,6 +3599,22 @@ def test_launcher_census_r5_scope_crossing_reads_are_unresolved(text):
     _r5_iex_is_unresolved(text)
 
 
+# Code that runs in this scope from text, from another file, or under another name writes names too (lane-found, each run in pwsh).
+@pytest.mark.parametrize("text", [
+    pytest.param("$cmd='Write-Output ok'; . ./lib.ps1; iex $cmd\n", id="dot-sourced-file"),
+    pytest.param("$sb = { $cmd = $env:PAYLOAD }; $cmd='Write-Output ok'; . $sb; iex $cmd\n", id="dot-sourced-variable"),
+    pytest.param("$cmd='Write-Output ok'; iex '$cmd = $env:PAYLOAD'; iex $cmd\n", id="iex-literal-that-assigns"),
+    pytest.param("$script:cmd='Write-Output ok'; & ([scriptblock]::Create('$script:cmd = $env:PAYLOAD')); iex $script:cmd\n",
+                 id="scriptblock-create-literal-that-assigns"),
+    pytest.param("$c = 'Set-Variable'; $cmd='Write-Output ok'; & $c cmd $env:PAYLOAD; iex $cmd\n", id="dynamic-call-of-a-named-cmdlet"),
+    pytest.param("$cmd='Write-Output ok'; & (Get-Command sv) cmd $env:PAYLOAD; iex $cmd\n", id="call-of-get-command"),
+    pytest.param("Set-Alias w Set-Variable; $cmd='Write-Output ok'; w cmd $env:PAYLOAD; iex $cmd\n", id="alias-defined-here"),
+    pytest.param("$cmd='Write-Output ok'; Push-Location variable:; Set-Item cmd $env:PAYLOAD; Pop-Location; iex $cmd\n", id="location-in-variable-drive"),
+])
+def test_launcher_census_r5_code_run_in_this_scope_can_rebind_the_name(text):
+    _r5_iex_is_unresolved(text)
+
+
 # Controls (pass on every scanner): the two writers rule V already saw stay one site, and a safe literal with no other writer of its name
 # (another name bound by Set-Variable -Scope, or a local:/private: write in the reading scope) stays resolved.
 @pytest.mark.parametrize("writer", ["$cmd = " + _R5_BUILT, "Set-Variable cmd " + _R5_BUILT])
@@ -3603,6 +3629,10 @@ def test_launcher_census_r5_control_writers_stay_one_site(writer):
     "$local:cmd='Write-Output ok'; iex $cmd\n",
     "function Run-Code { $private:c = 'Write-Output ok'; iex $c }\n",
     "$script:cmd='Write-Output ok'; iex $script:cmd\n",
+    "$cmd='Write-Output ok'; Remove-Item -LiteralPath 'C:\\tmp\\x.txt' -Force; iex $cmd\n",
+    "$cmd='Write-Output ok'; $p = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath('x'); iex $cmd\n",
+    "$cmd='Write-Output ok'; iex 'Write-Output hi'; iex $cmd\n",
+    "$cmd='Write-Output ok'; . { $other = 1 }; iex $cmd\n",
 ])
 def test_launcher_census_r5_control_a_safe_same_scope_literal_stays_resolved(text):
     assert _unresolved_sites(text) == [], f"a safe same-scope literal with no other writer was reported unresolved: {text!r}"

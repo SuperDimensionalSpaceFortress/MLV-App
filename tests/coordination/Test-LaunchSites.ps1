@@ -45,6 +45,25 @@ Rules, written down because the census depends on them:
                 -PipelineVariable style bindings, Set-Variable / New-Variable names, and $global: / $using: reads never resolve. So a
                 nested scope that reads an outer literal it does not assign itself is `unresolved` (conservative, by choice), and so is
                 a dot-sourced script reading its caller's variable. A splat is D1 `none` only under the same rule.
+            V2. (r5, Dot 6392164637, Grok G1) A write lands in the scope its qualifier names; it is never stripped and re-homed. local: and
+                private: are the lexical scope. script: is the script scope: it reaches every read of the name, and resolves only a
+                `$script:x` read, as a top-level `$script:x =` before it (a dot-sourced file's top level can be a function's scope, so a
+                plain `$x =` there never resolves `$script:x`, nor `$script:x =` a plain `$x`). global: and variable: writes cannot be
+                placed, so the name is tainted (never resolves). Ordering holds for every read: a literal after it never resolves it.
+                Set-Variable / New-Variable / Remove-Variable / Clear-Variable (set, sv, nv, rv, clv) bind like pwsh: -Name, else the first
+                positional left once named parameters (-Scope Local, -Option None, switches) take their values; a non-constant name, a
+                splat or an unknown parameter taints every name. A constant string anywhere that names the variable: drive (variable:x,
+                variable:\x, Variable::x) taints x; with no name or a wildcard it taints every name. An item cmdlet (Set-Item, New-Item,
+                Set-Content, Add-Content, Clear-Content, Clear-Item, Remove-Item, Rename-Item, Copy-Item, Move-Item and aliases) whose
+                path, destination or new name is not a constant taints every name, as does a location cmdlet given variable: or a path
+                that is not a constant. Any use of .PSVariable, .InvokeProvider, .SessionStateProxy or .SetVariable, or of .SessionState
+                other than .SessionState.Path, taints every name; so does a `.Value` write or set_Value call in a file that also calls
+                Get-Variable without -ValueOnly or a Get-Item / Get-ChildItem command (a PSVariable object's .Value is the variable).
+                Code run in this scope writes names too: `.` of anything but a { } literal, Set-Alias / New-Alias, and `& $x` / `. $x` on
+                a target that is not a static name in a file that names a variable or item cmdlet as a string (or calls Get-Command)
+                taint every name; the text an iex / [scriptblock]::Create / .InvokeScript / .NewScriptBlock runs is parsed and each name
+                it writes is tainted, and a text not resolved to literals taints every name. Bound: one file at a time, so a function
+                in another file that writes through its caller's SessionState is caught only in its own file.
 #>
 [CmdletBinding()]
 param()
@@ -100,13 +119,101 @@ function Get-Inner($Ast) {
     return $x
 }
 
-function Get-VarKey($V) { return ($V.VariablePath.UserPath -replace '^(?i)(script|global|local|private|using):', '').ToLowerInvariant() }
+$QualRx = '^(?i)(script|global|local|private|using|variable):'
+function Get-VarKey($V) { return ($V.VariablePath.UserPath -replace $QualRx, '').ToLowerInvariant() }
+function Get-VarQualifier($V) { if ($V.VariablePath.UserPath -match $QualRx) { return $Matches[1].ToLowerInvariant() }; return '' }
 
 # r4 (Dot B1): names pwsh binds itself, and the parameters that bind a variable by name. Neither is ever a literal assignment here.
 $AutoVars = [HashSet[string]]::new([string[]]@('args', 'input', '_', 'psitem', 'this', 'matches', 'foreach', 'switch', 'sender', 'event', 'eventargs',
         'eventsubscriber', 'myinvocation', 'psboundparameters', 'pscmdlet', 'error', 'lastexitcode'))
 $BindParamRx = [regex]::new('^(?i)(ov|ev|wv|iv|pv|outv\w*|errorv\w*|warningv\w*|informationv\w*|pipelinev\w*)$')
-$SetVarRx = [regex]::new('^(?i)(set-variable|new-variable|sv|nv)$')
+
+# r5 (rule V2): cmdlets that bind a variable by name, item cmdlets that write through a provider path, and location cmdlets. Aliases are
+# listed by hand so the census reads the same on every platform; parameters come from each cmdlet's own metadata at run time.
+$VarCmds = @{ 'set-variable' = 'Set-Variable'; 'set' = 'Set-Variable'; 'sv' = 'Set-Variable'; 'new-variable' = 'New-Variable'; 'nv' = 'New-Variable'
+    'remove-variable' = 'Remove-Variable'; 'rv' = 'Remove-Variable'; 'clear-variable' = 'Clear-Variable'; 'clv' = 'Clear-Variable'
+}
+$ItemCmds = @{ 'set-item' = 'Set-Item'; 'si' = 'Set-Item'; 'new-item' = 'New-Item'; 'ni' = 'New-Item'; 'set-content' = 'Set-Content'; 'sc' = 'Set-Content'
+    'add-content' = 'Add-Content'; 'ac' = 'Add-Content'; 'clear-content' = 'Clear-Content'; 'clc' = 'Clear-Content'; 'clear-item' = 'Clear-Item'
+    'cli' = 'Clear-Item'; 'remove-item' = 'Remove-Item'; 'ri' = 'Remove-Item'; 'rm' = 'Remove-Item'; 'rmdir' = 'Remove-Item'; 'del' = 'Remove-Item'
+    'erase' = 'Remove-Item'; 'rd' = 'Remove-Item'; 'rename-item' = 'Rename-Item'; 'rni' = 'Rename-Item'; 'ren' = 'Rename-Item'; 'copy-item' = 'Copy-Item'
+    'cpi' = 'Copy-Item'; 'cp' = 'Copy-Item'; 'copy' = 'Copy-Item'; 'move-item' = 'Move-Item'; 'mi' = 'Move-Item'; 'mv' = 'Move-Item'; 'move' = 'Move-Item'
+}
+$LocationCmdRx = [regex]::new('^(?i)(set-location|sl|cd|chdir|push-location|pushd)$')
+$ItemPathParams = [HashSet[string]]::new([string[]]@('Path', 'LiteralPath', 'Destination', 'NewName', 'Name'), [StringComparer]::OrdinalIgnoreCase)
+$VarDriveRx = [regex]::new('^(?i)(?:(?:Microsoft\.PowerShell\.Core\\)?Variable::|Variable:)[\\/]*(?<n>.*)$')
+$VarObjectCmdRx = [regex]::new('^(?i)(get-item|gi|get-childitem|gci|dir|ls)$')
+$StateMembers = [HashSet[string]]::new([string[]]@('psvariable', 'invokeprovider', 'sessionstateproxy', 'setvariable'))
+
+# One entry per parameter name and alias of a cmdlet: @(lower name, @{ Name; Switch; Pos }); Pos is its lowest position in any set.
+$ParamTables = @{}
+foreach ($c in @($VarCmds.Values + $ItemCmds.Values | Select-Object -Unique)) {
+    $t = [List[object]]::new()
+    foreach ($p in (Get-Command -Name $c -CommandType Cmdlet).Parameters.Values) {
+        $ps = @($p.ParameterSets.Values | ForEach-Object { $_.Position } | Where-Object { $_ -ge 0 })
+        $e = @{ Name = $p.Name; Switch = $p.SwitchParameter; Pos = if ($ps.Count) { ($ps | Measure-Object -Minimum).Minimum } else { -1 } }
+        $t.Add(@($p.Name.ToLowerInvariant(), $e))
+        foreach ($a in $p.Aliases) { $t.Add(@($a.ToLowerInvariant(), $e)) }
+    }
+    $ParamTables[$c] = $t
+}
+
+function Resolve-CmdletParameter($Table, [string]$Word) {
+    $w = $Word.ToLowerInvariant()
+    foreach ($k in $Table) { if ($k[0] -eq $w) { return $k[1] } }
+    $hits = @($Table | Where-Object { $_[0].StartsWith($w, [StringComparison]::Ordinal) } | ForEach-Object { $_[1] })
+    $names = @($hits | ForEach-Object { $_.Name } | Select-Object -Unique)
+    if ($names.Count -eq 1) { return $hits[0] }
+    return $null
+}
+
+# Binds a command's elements as pwsh does for a cmdlet: -P value / -P:value, a switch takes no value, then the positional elements fill
+# the unbound parameters in position order. Returns @{ Bound = @{ <param> = [List] values }; Ok = $false } when a parameter is unknown or
+# ambiguous, a splat is present, or a positional has no parameter to bind to (the binding is then not decided by this source).
+function Get-CmdletBinding($Els, $Table) {
+    $bound = @{}; $ok = $true; $positional = [List[object]]::new()
+    for ($i = 1; $i -lt $Els.Count; $i++) {
+        $el = $Els[$i]
+        if ($el -is [CommandParameterAst]) {
+            $p = Resolve-CmdletParameter $Table $el.ParameterName
+            if ($null -eq $p) { $ok = $false; continue }
+            if ($p.Switch) { continue }
+            $v = $el.Argument
+            if ($null -eq $v -and $i + 1 -lt $Els.Count -and -not ($Els[$i + 1] -is [CommandParameterAst])) { $i++; $v = $Els[$i] }
+            if ($null -eq $bound[$p.Name]) { $bound[$p.Name] = [List[object]]::new() }
+            if ($null -ne $v) { $bound[$p.Name].Add($v) }
+            continue
+        }
+        if ($el -is [VariableExpressionAst] -and $el.Splatted) { $ok = $false; continue }
+        $positional.Add($el)
+    }
+    $slots = @($Table | ForEach-Object { $_[1] } | Where-Object { $_.Pos -ge 0 } | Sort-Object { $_.Pos }, { $_.Name } -Unique)
+    $k = 0
+    foreach ($s in $slots) {
+        if ($k -ge $positional.Count) { break }
+        if ($bound.ContainsKey($s.Name)) { continue }
+        $bound[$s.Name] = [List[object]]::new(); $bound[$s.Name].Add($positional[$k]); $k++
+    }
+    if ($k -lt $positional.Count) { $ok = $false }
+    return @{ Bound = $bound; Ok = $ok }
+}
+
+# The value of a constant string argument (quoted, bare word, or an expandable string with nothing expanded), else $null.
+function Get-ConstString($V) {
+    $x = Get-Inner $V
+    if ($x -is [StringConstantExpressionAst]) { return $x.Value }
+    if ($x -is [ExpandableStringExpressionAst] -and $x.NestedExpressions.Count -eq 0) { return $x.Value }
+    return $null
+}
+
+# A constant path that names the variable: drive taints that name; with no name, or a wildcard, it taints every name.
+function Add-VarDriveTaint($Ctx, [string]$S) {
+    $m = $VarDriveRx.Match($S)
+    if (-not $m.Success) { return $false }
+    $n = $m.Groups['n'].Value
+    if ($n -eq '' -or $n -match '[*?\[`]') { $Ctx.TaintAll = $true } else { [void]$Ctx.Tainted.Add(($n -replace $QualRx, '').ToLowerInvariant()) }
+    return $true
+}
 
 # The scope an AST node runs in: its nearest enclosing script block (a file, a function body, a { } literal).
 function Get-Scope($Ast) {
@@ -130,10 +237,19 @@ function Get-ScopeParameters($S) {
     return , $names
 }
 
-function Add-Assign($Ctx, $V, $Op, $Right, $Scope, [bool]$Direct, [int]$End) {
+function Add-Assign($Ctx, $V, $Op, $Right, $Scope, [bool]$Direct, [int]$End, [bool]$Script = $false) {
     $k = Get-VarKey $V
     if ($null -eq $Ctx.Assign[$k]) { $Ctx.Assign[$k] = [List[object]]::new() }
-    $Ctx.Assign[$k].Add(@{ Op = $Op; Right = $Right; Scope = $Scope; Direct = $Direct; End = $End })
+    $Ctx.Assign[$k].Add(@{ Op = $Op; Right = $Right; Scope = $Scope; Direct = $Direct; End = $End; Script = $Script })
+}
+
+# r5 (rule V2): a write lands in the scope its qualifier names. global: / variable: / using: cannot be placed by this source, so the name
+# is tainted; script: is kept as a script-scope write; local: / private: / no qualifier are the lexical scope. Another drive ($env:x) is
+# its own name.
+function Add-Write($Ctx, $V, $Op, $Right, $Scope, [bool]$Direct, [int]$End) {
+    $q = Get-VarQualifier $V
+    if ($q -eq 'global' -or $q -eq 'variable' -or $q -eq 'using') { [void]$Ctx.Tainted.Add((Get-VarKey $V)); return }
+    Add-Assign $Ctx $V $Op $Right $Scope $Direct $End ($q -eq 'script')
 }
 
 # A variable named by a constant string (-OutVariable cmd, Set-Variable -Name cmd) is bound at run time; a name that is not a constant
@@ -141,28 +257,62 @@ function Add-Assign($Ctx, $V, $Op, $Right, $Scope, [bool]$Direct, [int]$End) {
 function Add-Taint($Ctx, $V) {
     $x = Get-Inner $V
     if ($x -is [ArrayLiteralAst]) { foreach ($e in $x.Elements) { Add-Taint $Ctx $e }; return }
-    if ($x -is [StringConstantExpressionAst]) { [void]$Ctx.Tainted.Add(($x.Value -replace '^\+', '' -replace '^(?i)(script|global|local|private):', '').ToLowerInvariant()); return }
+    if ($x -is [StringConstantExpressionAst]) {
+        if ($x.Value -match '[*?\[`]') { $Ctx.TaintAll = $true; return }
+        [void]$Ctx.Tainted.Add(($x.Value -replace '^\+', '' -replace $QualRx, '').ToLowerInvariant()); return
+    }
     $Ctx.TaintAll = $true
 }
 
 function Add-CommandBindings($Ctx, $Cmd) {
     $els = $Cmd.CommandElements
     $name = $Cmd.GetCommandName()
-    $setVar = $name -and $SetVarRx.IsMatch(($name -split '\\')[-1])
-    $named = $false
+    $leaf = if ($name) { ($name -split '\\')[-1].ToLowerInvariant() } else { '' }
     for ($i = 1; $i -lt $els.Count; $i++) {
         $el = $els[$i]
-        if (-not ($el -is [CommandParameterAst])) { continue }
-        $isName = $setVar -and 'name'.StartsWith($el.ParameterName.ToLowerInvariant(), [StringComparison]::Ordinal)
-        if ($isName) { $named = $true }
-        if ($isName -or $BindParamRx.IsMatch($el.ParameterName)) {
+        if ($el -is [CommandParameterAst] -and $BindParamRx.IsMatch($el.ParameterName)) {
             $v = Get-ParameterValue $els $i
             if ($null -eq $v) { $Ctx.TaintAll = $true } else { Add-Taint $Ctx $v }
         }
+        $s = Get-ConstString $el
+        if ($null -ne $s -and $LocationCmdRx.IsMatch($leaf) -and $VarDriveRx.IsMatch($s)) { $Ctx.TaintAll = $true }
     }
-    if ($setVar -and -not $named) {
-        $first = @($els | Select-Object -Skip 1 | Where-Object { -not ($_ -is [CommandParameterAst]) } | Select-Object -First 1)
-        if ($first.Count -eq 1) { Add-Taint $Ctx $first[0] } else { $Ctx.TaintAll = $true }
+    if ($LocationCmdRx.IsMatch($leaf)) {
+        foreach ($el in @($els | Select-Object -Skip 1 | Where-Object { -not ($_ -is [CommandParameterAst]) })) { if ($null -eq (Get-ConstString $el)) { $Ctx.TaintAll = $true } }
+    }
+    # Code that runs in this scope from text or from another file can write any name: `. <anything but a { } literal>`, iex, an alias
+    # defined here, or `& $x` / `. $x` on a target that is not a static name (checked after the walk against the cmdlet names in this file)
+    if ($Cmd.InvocationOperator -eq [TokenKind]::Dot -and -not ((Get-Inner $els[0]) -is [ScriptBlockExpressionAst])) { $Ctx.TaintAll = $true }
+    if ($leaf -match '^(?i)(set-alias|new-alias|sal|nal)$') { $Ctx.TaintAll = $true }
+    if (-not $name -and -not ((Get-Inner $els[0]) -is [ScriptBlockExpressionAst])) { $Ctx.DynamicCall = $true }
+    if ($leaf -eq 'get-command' -or $leaf -eq 'gcm') { $Ctx.CmdletName = $true }
+    if ($VarObjectCmdRx.IsMatch($leaf)) { $Ctx.VarObject = $true }
+    if ($leaf -eq 'get-variable' -or $leaf -eq 'gv') {
+        $valueOnly = @($els | Where-Object { $_ -is [CommandParameterAst] -and 'valueonly'.StartsWith($_.ParameterName.ToLowerInvariant(), [StringComparison]::Ordinal) -and $_.ParameterName.Length -ge 2 }).Count -gt 0
+        if (-not $valueOnly) { $Ctx.VarObject = $true }
+    }
+    if ($VarCmds.ContainsKey($leaf)) {
+        # Set-Variable -Scope Local cmd <value>: the name is -Name, else the first positional once the named parameters have their values
+        $b = Get-CmdletBinding $els $ParamTables[$VarCmds[$leaf]]
+        $names = $b.Bound['Name']
+        if (-not $b.Ok -or $null -eq $names -or $names.Count -eq 0) { $Ctx.TaintAll = $true } else { foreach ($n in $names) { Add-Taint $Ctx $n } }
+    }
+    elseif ($ItemCmds.ContainsKey($leaf)) {
+        $b = Get-CmdletBinding $els $ParamTables[$ItemCmds[$leaf]]
+        $paths = [List[object]]::new()
+        if ($b.Ok) { foreach ($k in $b.Bound.Keys) { if ($ItemPathParams.Contains($k)) { foreach ($v in $b.Bound[$k]) { $paths.Add($v) } } } }
+        else { foreach ($el in @($els | Select-Object -Skip 1 | Where-Object { -not ($_ -is [CommandParameterAst]) })) { $paths.Add($el) } }
+        $consts = [List[string]]::new(); $drive = $false
+        foreach ($v in $paths) {
+            $x = Get-Inner $v
+            $vals = if ($x -is [ArrayLiteralAst]) { @($x.Elements) } else { @($v) }
+            foreach ($e in $vals) {
+                $s = Get-ConstString $e
+                if ($null -eq $s) { $Ctx.TaintAll = $true } else { $consts.Add($s); if ($VarDriveRx.IsMatch($s)) { $drive = $true } }
+            }
+        }
+        # Rename-Item variable:a cmd / Copy-Item variable:a cmd: a bare destination or new name beside a variable: path is a variable too
+        if ($drive) { foreach ($s in $consts) { if (-not (Add-VarDriveTaint $Ctx $s)) { [void]$Ctx.Tainted.Add(($s -replace '^[\\/]+', '').ToLowerInvariant()) } } }
     }
 }
 
@@ -170,6 +320,8 @@ function Add-CommandBindings($Ctx, $Cmd) {
 # only through assignments in its own scope (or a script block inside it, which `.` or ForEach-Object can run in that scope), every one a
 # plain `=`, one of them a top-level statement of that scope before the read; `$script:x` is read against the file's own top scope.
 # A parameter, an automatic variable, a foreach / multi-assignment / [ref] / -OutVariable binding, or $global: / $using: never resolves.
+# r5 (rule V2): a script: write reaches every read; it is the definite write only for a `$script:x` read, and a plain write only for a
+# plain read. The definite write always ends before the read, for a `$script:x` read too.
 function Get-LiteralRights($V, $Ctx) {
     $path = $V.VariablePath.UserPath
     if ($path.Contains(':') -and $path -notmatch '^(?i)(script|local|private):') { return $null }
@@ -180,9 +332,9 @@ function Get-LiteralRights($V, $Ctx) {
     if ($null -eq $scope -or (Get-ScopeParameters $scope).Contains($key)) { return $null }
     $rights = [List[object]]::new(); $definite = $false
     foreach ($r in @($Ctx.Assign[$key])) {
-        if ($null -eq $r -or -not (Test-Within $r.Scope $scope)) { continue }
+        if ($null -eq $r -or -not ($r.Script -or (Test-Within $r.Scope $scope))) { continue }
         if ($r.Op -ne [TokenKind]::Equals) { return $null }
-        if ($r.Direct -and [object]::ReferenceEquals($r.Scope, $scope) -and ($isScript -or $r.End -le $V.Extent.StartOffset)) { $definite = $true }
+        if ($r.Script -eq $isScript -and $r.Direct -and [object]::ReferenceEquals($r.Scope, $scope) -and $r.End -le $V.Extent.StartOffset) { $definite = $true }
         $rights.Add($r.Right)
     }
     if (-not $definite) { return $null }
@@ -329,14 +481,127 @@ function Get-StringBody($S) {
     return @{ Text = $t.Substring(1, [Math]::Max(0, $t.Length - 2)); Line = $ext.StartLineNumber; Off = $ext.StartOffset + 1 }
 }
 
+function New-Ctx($Root) {
+    return @{
+        Assign = @{}; Member = @{}; Root = $Root; Tainted = [HashSet[string]]::new(); TaintAll = $false; VarObject = $false; ValueWrite = $false
+        DynamicCall = $false; CmdletName = $false
+    }
+}
+
+# Every write to a variable in $Root's AST, recorded in $Ctx (rule V / V2). $Lists, when given, also collects the nodes the site rules read.
+function Read-Writes($Ctx, $Root, $Lists, [int]$Depth) {
+    $executed = [List[object]]::new()
+    foreach ($a in $Root.FindAll({ $true }, $true)) {
+        if ($a -is [MemberExpressionAst] -and $a.Member -is [StringConstantExpressionAst]) {
+            # r5 (rule V2): the session-state APIs that write any variable by name, and a PSVariable's .Value (checked after the walk)
+            $mn = $a.Member.Value.ToLowerInvariant()
+            if ($StateMembers.Contains($mn)) { $Ctx.TaintAll = $true }
+            elseif ($mn -eq 'sessionstate') {
+                $up = $a.Parent
+                if (-not ($up -is [MemberExpressionAst] -and [object]::ReferenceEquals($up.Expression, $a) -and $up.Member -is [StringConstantExpressionAst] -and $up.Member.Value -ieq 'path')) { $Ctx.TaintAll = $true }
+            }
+            elseif ($mn -eq 'set_value' -and $a -is [InvokeMemberExpressionAst]) { $Ctx.ValueWrite = $true }
+            elseif ($mn -eq 'value' -and $a.Parent -is [AssignmentStatementAst] -and [object]::ReferenceEquals($a.Parent.Left, $a)) { $Ctx.ValueWrite = $true }
+            if ($a -is [InvokeMemberExpressionAst] -and $mn -in @('create', 'invokescript', 'newscriptblock')) {
+                $isSb = $mn -ne 'create' -or ($a.Static -and $a.Expression -is [TypeExpressionAst] -and $SbTypeRx.IsMatch($a.Expression.TypeName.FullName))
+                if ($isSb) { $executed.Add($(if ($null -ne $a.Arguments -and $a.Arguments.Count -gt 0) { $a.Arguments[0] } else { $null })) }
+            }
+        }
+        if ($a -is [StringConstantExpressionAst]) {
+            [void](Add-VarDriveTaint $Ctx $a.Value)
+            $sv = $a.Value.ToLowerInvariant()
+            if ($a.StringConstantType -ne [StringConstantType]::BareWord -and ($VarCmds.ContainsKey($sv) -or $ItemCmds.ContainsKey($sv))) { $Ctx.CmdletName = $true }
+        }
+        if ($a -is [CommandAst]) {
+            if ($null -ne $Lists) { $Lists.Commands.Add($a) }
+            Add-CommandBindings $Ctx $a
+            $n = $a.GetCommandName()
+            if ($n -and (($n -split '\\')[-1] -match '^(?i)(invoke-expression|iex)$')) { $executed.Add((Get-IexArgument $a)) }
+        }
+        elseif ($a -is [InvokeMemberExpressionAst]) { if ($null -ne $Lists) { $Lists.Members.Add($a) } }
+        elseif ($a -is [TypeConstraintAst] -or $a -is [TypeExpressionAst]) { if ($null -ne $Lists) { $Lists.Types.Add($a) } }
+        elseif (($a -is [StringConstantExpressionAst] -and $a.StringConstantType -ne [StringConstantType]::BareWord) -or $a -is [ExpandableStringExpressionAst]) { if ($null -ne $Lists) { $Lists.Strings.Add($a) } }
+        elseif ($a -is [ForEachStatementAst]) { Add-Write $Ctx $a.Variable $null $null (Get-Scope $a) $false 0 }
+        elseif ($a -is [ConvertExpressionAst] -and $a.Type.TypeName.Name -ieq 'ref' -and (Get-Inner $a.Child) -is [VariableExpressionAst]) { [void]$Ctx.Tainted.Add((Get-VarKey (Get-Inner $a.Child))) }
+        elseif ($a -is [AssignmentStatementAst]) {
+            $left = $a.Left
+            if ($left -is [ConvertExpressionAst]) { $left = $left.Child }
+            if ($left -is [VariableExpressionAst]) {
+                Add-Write $Ctx $left $a.Operator $a.Right (Get-Scope $a) ($a.Parent -is [NamedBlockAst]) $a.Extent.EndOffset
+            }
+            elseif ($left -is [ArrayLiteralAst]) {
+                # `$a, $b = ...` splits a value at run time: each name is bound, none to a literal
+                foreach ($el in $left.Elements) { $v = Get-Inner $el; if ($v -is [VariableExpressionAst]) { Add-Write $Ctx $v $null $null (Get-Scope $a) $false 0 } }
+            }
+            elseif ($left -is [MemberExpressionAst] -or $left -is [IndexExpressionAst]) {
+                $target = if ($left -is [MemberExpressionAst]) { Get-Inner $left.Expression } else { Get-Inner $left.Target }
+                $member = if ($left -is [MemberExpressionAst]) { $left.Member } else { Get-Inner $left.Index }
+                if ($target -is [VariableExpressionAst] -and $member -is [StringConstantExpressionAst]) {
+                    $k = Get-VarKey $target
+                    if ($null -eq $Ctx.Member[$k]) { $Ctx.Member[$k] = [List[object]]::new() }
+                    $Ctx.Member[$k].Add(@{ Key = $member.Value; Right = $a.Right })
+                }
+            }
+        }
+    }
+
+    # (Get-Variable cmd).Value = ... / $v = Get-Item variable:cmd; $v.Value = ...: a PSVariable object's .Value is the variable itself
+    if ($Ctx.ValueWrite -and $Ctx.VarObject) { $Ctx.TaintAll = $true }
+    # $c = 'Set-Variable'; & $c cmd ... / & (Get-Command sv) cmd ...: a dynamic call in a file that names a variable or item cmdlet
+    if ($Ctx.DynamicCall -and $Ctx.CmdletName) { $Ctx.TaintAll = $true }
+    # iex and a script block made from text run that text in this scope (or a dot-sourced one): its writes are this file's writes. Repeat
+    # until the taints settle, since a new taint can stop a string from resolving.
+    for ($round = 0; $round -lt 4 -and $executed.Count -gt 0; $round++) {
+        $before = "$($Ctx.TaintAll) $($Ctx.Tainted.Count)"
+        foreach ($x in $executed) { Add-ExecutedWrites $Ctx $x 0 $Depth }
+        if ("$($Ctx.TaintAll) $($Ctx.Tainted.Count)" -eq $before) { break }
+    }
+}
+
+# The argument of an iex / Invoke-Expression command ($null when it takes pipeline input).
+function Get-IexArgument($Cmd) {
+    $els = $Cmd.CommandElements
+    for ($i = 1; $i -lt $els.Count; $i++) {
+        if ($els[$i] -is [CommandParameterAst]) {
+            if ('command'.StartsWith($els[$i].ParameterName.ToLowerInvariant(), [StringComparison]::Ordinal)) { return Get-ParameterValue $els $i }
+        }
+        else { return $els[$i] }
+    }
+    return $null
+}
+
+# r5 (rule V2): the names an executed string writes. A string literal (or a variable resolving only to literals) is parsed and its writes
+# taint those names here; anything else (built at run time, or pipeline input) taints every name. A { } literal is AST code already.
+function Add-ExecutedWrites($Ctx, $Arg, [int]$Hops, [int]$Depth) {
+    $x = Get-Inner $Arg
+    if ($x -is [ScriptBlockExpressionAst]) { return }
+    $s = if ($null -ne $x) { Get-ConstString $x } else { $null }
+    if ($null -ne $s) {
+        if ($Depth -ge $MaxDepth) { $Ctx.TaintAll = $true; return }
+        $t = $null; $e = $null
+        $sub = [Parser]::ParseInput($s, [ref]$t, [ref]$e)
+        $c = New-Ctx $sub
+        Read-Writes $c $sub $null ($Depth + 1)
+        if ($c.TaintAll) { $Ctx.TaintAll = $true }
+        foreach ($k in $c.Tainted) { [void]$Ctx.Tainted.Add($k) }
+        foreach ($k in $c.Assign.Keys) { [void]$Ctx.Tainted.Add($k) }
+        return
+    }
+    if ($x -is [VariableExpressionAst] -and $Hops -lt 4) {
+        $rights = Get-LiteralRights $x $Ctx
+        if ($null -eq $rights) { $Ctx.TaintAll = $true; return }
+        foreach ($r in $rights) { Add-ExecutedWrites $Ctx $r ($Hops + 1) $Depth }
+        return
+    }
+    $Ctx.TaintAll = $true
+}
+
 function Get-Sites([string]$Text, [int]$LineBase, [int]$OffBase, [int]$Depth, [bool]$TopLevel, $Out) {
     $tokens = $null; $errors = $null
     $root = [Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
-    $ctx = @{
-        Text = $Text; LineBase = $LineBase; OffBase = $OffBase; Out = $Out
-        Skip = [List[object]]::new(); CtxLines = [HashSet[int]]::new(); Assign = @{}; Member = @{}
-        Root = $root; Tainted = [HashSet[string]]::new(); TaintAll = $false
-    }
+    $ctx = New-Ctx $root
+    $ctx.Text = $Text; $ctx.LineBase = $LineBase; $ctx.OffBase = $OffBase; $ctx.Out = $Out
+    $ctx.Skip = [List[object]]::new(); $ctx.CtxLines = [HashSet[int]]::new()
     if ($TopLevel -and $errors.Count -gt 0) {
         $e0 = $errors[0]
         $Out.Add([pscustomobject]@{ kind = 'unresolved'; line = $LineBase + $e0.Extent.StartLineNumber - 1; ord = $OffBase + $e0.Extent.StartOffset; text = "parse error: $($e0.Message)" })
@@ -346,36 +611,8 @@ function Get-Sites([string]$Text, [int]$LineBase, [int]$OffBase, [int]$Depth, [b
         elseif ($CtxRx.IsMatch($t.Text)) { for ($l = $t.Extent.StartLineNumber; $l -le $t.Extent.EndLineNumber; $l++) { [void]$ctx.CtxLines.Add($l) } }
     }
 
-    $all = $root.FindAll({ $true }, $true)
     $commands = [List[object]]::new(); $members = [List[object]]::new(); $types = [List[object]]::new(); $strings = [List[object]]::new()
-    foreach ($a in $all) {
-        if ($a -is [CommandAst]) { $commands.Add($a); Add-CommandBindings $ctx $a }
-        elseif ($a -is [InvokeMemberExpressionAst]) { $members.Add($a) }
-        elseif ($a -is [TypeConstraintAst] -or $a -is [TypeExpressionAst]) { $types.Add($a) }
-        elseif (($a -is [StringConstantExpressionAst] -and $a.StringConstantType -ne [StringConstantType]::BareWord) -or $a -is [ExpandableStringExpressionAst]) { $strings.Add($a) }
-        elseif ($a -is [ForEachStatementAst]) { Add-Assign $ctx $a.Variable $null $null (Get-Scope $a) $false 0 }
-        elseif ($a -is [ConvertExpressionAst] -and $a.Type.TypeName.Name -ieq 'ref' -and (Get-Inner $a.Child) -is [VariableExpressionAst]) { [void]$ctx.Tainted.Add((Get-VarKey (Get-Inner $a.Child))) }
-        elseif ($a -is [AssignmentStatementAst]) {
-            $left = $a.Left
-            if ($left -is [ConvertExpressionAst]) { $left = $left.Child }
-            if ($left -is [VariableExpressionAst]) {
-                Add-Assign $ctx $left $a.Operator $a.Right (Get-Scope $a) ($a.Parent -is [NamedBlockAst]) $a.Extent.EndOffset
-            }
-            elseif ($left -is [ArrayLiteralAst]) {
-                # `$a, $b = ...` splits a value at run time: each name is bound, none to a literal
-                foreach ($el in $left.Elements) { $v = Get-Inner $el; if ($v -is [VariableExpressionAst]) { Add-Assign $ctx $v $null $null (Get-Scope $a) $false 0 } }
-            }
-            elseif ($left -is [MemberExpressionAst] -or $left -is [IndexExpressionAst]) {
-                $target = if ($left -is [MemberExpressionAst]) { Get-Inner $left.Expression } else { Get-Inner $left.Target }
-                $member = if ($left -is [MemberExpressionAst]) { $left.Member } else { Get-Inner $left.Index }
-                if ($target -is [VariableExpressionAst] -and $member -is [StringConstantExpressionAst]) {
-                    $k = Get-VarKey $target
-                    if ($null -eq $ctx.Member[$k]) { $ctx.Member[$k] = [List[object]]::new() }
-                    $ctx.Member[$k].Add(@{ Key = $member.Value; Right = $a.Right })
-                }
-            }
-        }
-    }
+    Read-Writes $ctx $root @{ Commands = $commands; Members = $members; Types = $types; Strings = $strings } $Depth
 
     $consumed = [HashSet[object]]::new()
     foreach ($cmd in $commands) {
