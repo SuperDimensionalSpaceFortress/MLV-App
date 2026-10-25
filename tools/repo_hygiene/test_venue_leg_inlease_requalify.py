@@ -17,6 +17,7 @@ Runs wherever pwsh is on PATH (the hosted Windows and ubuntu runners both have i
 
 from __future__ import annotations
 
+import functools
 import inspect
 import json
 import os
@@ -32,8 +33,39 @@ ROOT = Path(__file__).resolve().parents[2]
 MODULE = ROOT / "tools" / "profiling" / "dual-venue" / "VenueLegCounting.psm1"
 DOC = ROOT / "docs" / "cuda-playback-present-cadence.md"
 PWSH = shutil.which("pwsh")
-# G1: gated on pwsh alone. The module is pure PowerShell, so the platform does not matter, and a win32 gate left the ubuntu shards with no pins.
-requires_pwsh = unittest.skipIf(PWSH is None, "needs pwsh")
+
+
+def _skip_or_fail_in_hosted_ci(case: unittest.TestCase, message: str):
+    """Same pattern as test_safety_lint_parity.py: a missing pwsh skips the pin locally but FAILS it in hosted CI (GITHUB_ACTIONS=true).
+    A hosted runner has pwsh, so a missing one is a broken runner, and skipping every pin would let the shard go green with none run."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        case.fail(f"{message} -- hosted CI must not skip this test (the hosted runners have pwsh)")
+    case.skipTest(message)
+
+
+def requires_pwsh(target):
+    """G1: gated on pwsh alone, and fail-closed in hosted CI. The module is pure PowerShell, so the platform does not matter, and a win32
+    gate left the ubuntu shards with no pins. Works on a TestCase class (the gate runs in setUp) and on a test method. PWSH is read at
+    call time, so test_26 can force it."""
+    def gate(case: unittest.TestCase) -> None:
+        if not PWSH:
+            _skip_or_fail_in_hosted_ci(case, "pwsh is required to run the leg-counting pins")
+
+    if isinstance(target, type):
+        set_up = target.setUp
+
+        @functools.wraps(set_up)
+        def gated_set_up(self, *args, **kwargs):
+            gate(self)
+            return set_up(self, *args, **kwargs)
+        target.setUp = gated_set_up
+        return target
+
+    @functools.wraps(target)
+    def wrapper(self, *args, **kwargs):
+        gate(self)
+        return target(self, *args, **kwargs)
+    return wrapper
 
 INLEASE = "inlease-requalify-1"
 STALE180 = "stale-discard-180"
@@ -428,8 +460,8 @@ class SkipGatePinTests(unittest.TestCase):
         # Grok G1 (fail closed): a hosted shard without pwsh must FAIL, not skip all the pins and go green. Same pattern as
         # test_safety_lint_parity.py _skip_or_fail_in_hosted_ci: GITHUB_ACTIONS=true -> fail, anywhere else -> skip. Pinned for the class
         # decorator (how every pin class uses it) and the method decorator.
-        self.assertNotIn("platform", inspect.getsource(requires_pwsh))
-        self.assertNotIn("skipIf", inspect.getsource(requires_pwsh))
+        gate_src = inspect.getsource(requires_pwsh) + inspect.getsource(_skip_or_fail_in_hosted_ci)
+        self.assertIsNone(re.search(r"sys\.platform|platform\.system|os\.name|skipIf", gate_src), "the gate reads pwsh and GITHUB_ACTIONS only")
         for on_class in (True, False):
             where = "class" if on_class else "method"
             res, ran = self._run_gated(pwsh=None, hosted="true", on_class=on_class)

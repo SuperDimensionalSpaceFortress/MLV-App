@@ -55,6 +55,8 @@ function Get-VenueLegCountingProperty([object]$Object, [string]$Name) {
 
 function Test-VenueLegCountingNumericType([object]$Value) {
     # A numeric type only: a string (empty, blank or numeric-looking) or a bool is not a measurement.
+    # Supported (a measurement): byte, int16, int32, int64, single, double, decimal. Every other type is refused, never coerced: sbyte,
+    # uint16, uint32, uint64, System.Numerics.BigInteger, bool, string, char, arrays. Pinned by test_27 with exact .NET types.
     ($null -ne $Value) -and ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single] -or $Value -is [int16] -or $Value -is [byte])
 }
 
