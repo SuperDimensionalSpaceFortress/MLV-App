@@ -1873,6 +1873,8 @@ $script:QuietLease = $null
 $script:QuietLeaseWaiting = $null
 # AGENT-LEASE-PENDING-HEAT-TRACE-1: how often a quiet-lease wait logs its waiting line (a test shortens it). Logging only.
 $script:QuietLeaseWaitLogSec = 60
+# adversary r1 A2: a slot snapshot's status probe (up to 30 s) is skipped when a deadline or the lease end is within this many seconds.
+$script:LeaseSnapshotSkipBelowSec = 70
 # lease-batch r1: the parked (or in-use) batch lease, and "the admitted batch job launched and ended" for Exit-HeavySlot.
 $script:LeaseBatch = $null
 $script:LeaseBatchKeep = $false
@@ -1982,7 +1984,7 @@ function Read-HeavySlotFeedMetrics {
         if (-not $fi.Exists) { return @{ metrics = $null; why = "feed missing ($HeavySlotFeed)"; ageSec = $null } }
         $age = ([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalSeconds
         $ageSec = $age
-        if ($age -gt $GateFeedStaleSec) { return @{ metrics = $null; why = "feed stale ($([int]$age) s > $GateFeedStaleSec s)"; ageSec = $ageSec } }
+        if ($age -gt $GateFeedStaleSec) { return @{ metrics = $null; why = "feed stale ($([long]$age) s > $GateFeedStaleSec s)"; ageSec = $ageSec } }
         $fs = [System.IO.File]::Open($HeavySlotFeed, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
         $start = [Math]::Max([long]0, $fs.Length - (80 * 150 + 400))
         try {
@@ -2008,7 +2010,9 @@ function Get-LeaseWaitHeatField {
     # heat=unknown(<reason>), never an omitted field. Logging only: it never throws and no decision reads what it returns.
     try {
         $feed = Read-HeavySlotFeedMetrics
-        $age = if ($null -ne $feed.ageSec) { "$([int]$feed.ageSec)s" } else { "unknown" }
+        # adversary r1 A3: a feed whose timestamp is far in the future (or an absurd age) must not turn a readable heat into unknown.
+        $age = "unknown"
+        if ($null -ne $feed.ageSec) { $a = [double]$feed.ageSec; if (-not [double]::IsNaN($a) -and [Math]::Abs($a) -le 31536000) { $age = "$([long][Math]::Round($a))s" } }
         $h = Get-SustainedHeatVerdict -Metrics $feed.metrics -UnknownWhy ([string]$feed.why)
         if ($h.state -eq "feed-unknown") { return "heat=unknown($($h.why)) feedAge=$age" }
         return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "heat={0} throttled={1}/{2} meanC={3:F1} feedAge={4}", $h.state, $feed.metrics.throttled, $feed.metrics.window, $feed.metrics.meanC, $age)
@@ -2018,13 +2022,38 @@ function Get-LeaseWaitHeatField {
     }
 }
 
+function Get-LeaseSnapshotHeadroomSec {
+    # adversary r1 A2: the least time left before a deadline the status probe could push the wait past -- the job's notAfterUtc, its runner-liveness
+    # bound, the queue-age ceiling, and (once granted) the lease's own until=. +Infinity when none applies. Add-LeaseSlotSnapshot skips its probe
+    # (slots=skipped) when this is within the longest the probe may take, so the logging can never change an admission outcome.
+    param($Verdict, $Lease = $null, [double]$QueueLeftSec = [double]::PositiveInfinity)
+    $left = $QueueLeftSec
+    try {
+        if ($null -ne $Verdict -and $Verdict.state -eq "open" -and $null -ne $Verdict.remainingSec) { $left = [Math]::Min($left, [double]$Verdict.remainingSec) }
+        if ($null -ne $Verdict -and $Verdict.livenessState -eq "live" -and $null -ne $Verdict.livenessUntilUtc) {
+            $lu = [DateTimeOffset]::Parse([string]$Verdict.livenessUntilUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal)
+            $left = [Math]::Min($left, ($lu.UtcDateTime - [DateTime]::UtcNow).TotalSeconds)
+        }
+        if ($null -ne $Lease -and $null -ne $Lease.active) { $left = [Math]::Min($left, [double]$Lease.active.until - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0) }
+    }
+    catch { return 0.0 }   # a bound that cannot be read is treated as no headroom: the probe is skipped
+    return $left
+}
+
 function Add-LeaseSlotSnapshot {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1: ONE `heavy-slot.py status` probe, logged as who holds each slot (owner, pid, age) and how many runs
     # are queued; Phase is request | grant. The probe is Invoke-HeavySlotStatus, so it is bounded by that helper's own 30 s timeout (which
     # heartbeats while it waits); a timeout logs slots=unknown(timeout 30 s) and the caller goes on. Logging only: nothing here throws,
     # gates or changes a return value, and a failed log line is dropped.
-    param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Phase, [double]$WaitedSec = 0)
+    param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Phase, [double]$WaitedSec = 0, [double]$HeadroomSec = [double]::PositiveInfinity)
     try {
+        # adversary r1 A2: the probe may take up to 30 s (and the loop does nothing meanwhile), so it is not made when a job deadline, the queue ceiling or the
+        # lease's own end is within twice that: a log line must not turn an admission into expired-not-after / queue-expired or hand over a spent lease.
+        $skipBelow = if ($script:LeaseSnapshotSkipBelowSec -gt 0) { [double]$script:LeaseSnapshotSkipBelowSec } else { 70.0 }
+        if ($HeadroomSec -le $skipBelow) {
+            Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=skipped($([long][Math]::Floor($HeadroomSec)) s before a deadline or the lease end, within the ${skipBelow} s a status probe may take)"
+            return
+        }
         $s = Invoke-HeavySlotStatus -HeartbeatActivity "gate-wait job=$JobId state=slots-snapshot waited=$([int]$WaitedSec)s"
         if (-not $s.ok) {
             $e = ([string]$s.error) -replace '\s+', ' '
@@ -2041,13 +2070,14 @@ function Add-LeaseSlotSnapshot {
             $n = $Matches[1]
             $who = $Matches[2]
             if ($who -eq "free") { $parts.Add("slot ${n}: free"); continue }
-            if ($who -match '^(.*?) \(pid (\d+)(?:, since ([^)]*))?\)') {
+            # adversary r1 A1: heavy-slot.py may add fields after the timestamp (", held 5 min"); only the timestamp token is the age's start.
+            if ($who -match '^(.*?) \(pid (\d+)(?:, since (\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?))?[,)]') {
                 $owner = $Matches[1]
                 $ownerPid = $Matches[2]
                 $since = $Matches[3]
                 $age = "unknown"
                 $dt = [DateTime]::MinValue
-                if ($since -and [DateTime]::TryParse($since, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$dt) -and $dt -le $now) { $age = "$([int]($now - $dt).TotalSeconds)s" }
+                if ($since -and [DateTime]::TryParse($since, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$dt) -and $dt -le $now) { $age = "$([long][Math]::Floor(($now - $dt).TotalSeconds))s" }
                 $parts.Add("slot ${n}: $owner pid=$ownerPid age=$age")
             }
             else { $parts.Add("slot ${n}: $who") }
@@ -3397,7 +3427,7 @@ function Wait-QuietLeaseAdmission {
             # AGENT-LEASE-PENDING-HEAT-TRACE-1: ONE slot snapshot per job when its first request is made (a re-ask after a refusal adds none).
             if (-not $snapshotRequestDone -and $requests -ge 1) {
                 $snapshotRequestDone = $true
-                Add-LeaseSlotSnapshot -JobId $JobId -Phase "request" -WaitedSec ((Get-Date) - $t0).TotalSeconds
+                Add-LeaseSlotSnapshot -JobId $JobId -Phase "request" -WaitedSec ((Get-Date) - $t0).TotalSeconds -HeadroomSec (Get-LeaseSnapshotHeadroomSec -Verdict $v -QueueLeftSec $(if ($maxAge -gt 0) { [double]$maxAge - [double]$age } else { [double]::PositiveInfinity }))
             }
             if ($null -ne $lease) {
                 $u = Update-QuietLeaseRequest -Lease $lease
@@ -3445,7 +3475,7 @@ function Wait-QuietLeaseAdmission {
                     if ($null -ne $batchToken) { $adm | Add-Member -NotePropertyName leaseBatch -NotePropertyValue (Open-LeaseBatch -Token $batchToken -Lease $script:QuietLease -JobId $JobId -Refusals $refusals.ToArray() -Requests $requests) }
                     if ($null -ne $script:GateHour) { $script:GateHour.admitted++; $script:GateHour.waitSecTotal += [int]$waited }
                     Add-AgentLogLine "quiet-lease: active job=$JobId slot=$($a.slot) held=$($a.held) until=$([long]$a.until) minutes=$minutes waited=$($adm.waitedSec)s requests=$requests refusals=$($refusals.Count) owner=[$($adm.leaseOwner)] heat=[$($heat.why)]"
-                    Add-LeaseSlotSnapshot -JobId $JobId -Phase "grant" -WaitedSec $waited
+                    Add-LeaseSlotSnapshot -JobId $JobId -Phase "grant" -WaitedSec $waited -HeadroomSec (Get-LeaseSnapshotHeadroomSec -Verdict $vNow -Lease $script:QuietLease)
                     if (-not $covers) { Add-AgentLogLine "quiet-lease: lease-shorter-than-timeout job=$JobId minutes=$minutes timeoutSec=$timeoutSec; legs past until=$([long]$a.until) run without the lease (admission.leaseCoversTimeout=false)" }
                     return $adm
                 }

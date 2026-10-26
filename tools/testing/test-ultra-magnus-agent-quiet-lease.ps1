@@ -113,7 +113,7 @@ foreach ($name in $liftNotAfter) {
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
 # lease-batch r4 (the merge of not-after r1): the same, so batch-refusal-ends-batch fails on behaviour against an agent without it.
-foreach ($name in @('Close-LeaseBatchAfterRelease', 'Get-LeaseWaitHeatField', 'Add-LeaseSlotSnapshot')) {   # the last two: AGENT-LEASE-PENDING-HEAT-TRACE-1
+foreach ($name in @('Close-LeaseBatchAfterRelease', 'Get-LeaseWaitHeatField', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec')) {   # the last three: AGENT-LEASE-PENDING-HEAT-TRACE-1
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -2250,6 +2250,53 @@ function Exit-HeavySlot {
             Assert-True ($r7.adm.label -eq 'clear' -and @(Get-Calls | Where-Object { $_.cmd -eq 'request' }).Count -eq 2) "heat-trace: the refused request was asked again and then admitted: $($r7.adm.label)"
             Assert-True (@($r7.snaps | Where-Object { $_ -match ' phase=request ' }).Count -eq 1 -and @($r7.snaps | Where-Object { $_ -match ' phase=grant ' }).Count -eq 1 -and $script:StatusCalls -eq 2) "heat-trace: one request snapshot and one grant snapshot across a refuse-then-active job: $($r7.snaps -join ' || ') calls=$($script:StatusCalls)"
             Exit-HeavySlot
+            # (e) adversary r1 A1: heavy-slot.py may add fields after the timestamp (", held 5 min"): the age is still read.
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @("slot 1: suite X (pid 77, since $since, held 5 min) [exclusive]", 'slot 2: free') }
+            $r8 = Invoke-HeatTraceCase 'jHt8' @{ request = 'active'; active_after = 1.5 }
+            Assert-True (@($r8.snaps | Where-Object { $_ -notmatch 'slot 1: suite X pid=77 age=(29[5-9]|3[0-2]\d)s' }).Count -eq 0 -and $r8.snaps.Count -eq 2) "heat-trace A1: a status line with a field after 'since <ts>' still yields the age: $($r8.snaps -join ' || ')"
+            Exit-HeavySlot
+            $script:StatusStub = $slotsOk
+
+            # (f) adversary r1 A2: a probe (up to 30 s) is never made when a deadline, the queue ceiling or the lease end is within 70 s -- it
+            # would turn an admission into expired-not-after / queue-expired. The skip is logged, the admission is unchanged.
+            $r9 = $null
+            Reset-Case @{ request = 'active'; active_after = 1.0 }
+            $script:AgeAfter = (Get-Date).AddSeconds(60); $script:StatusCalls = 0
+            $adm9 = Wait-QuietLeaseAdmission -JobId 'jHt9' -Job ([pscustomobject]@{}) -Metadata (New-NotAfterMeta 50)
+            $script:Admission = $adm9
+            $sk9 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHt9 *' })
+            Assert-True ($adm9.label -eq 'clear' -and $script:StatusCalls -eq 0 -and $sk9.Count -eq 2 -and @($sk9 | Where-Object { $_ -notmatch ' slots=skipped\(' }).Count -eq 0) "heat-trace A2: 50 s before notAfterUtc, no probe is made (calls=$($script:StatusCalls)) and the admission stays clear: $($adm9.label) $($sk9 -join ' || ')"
+            Exit-HeavySlot
+            Reset-Case @{ request = 'active'; active_after = 1.0 }
+            $script:AgeAfter = (Get-Date).AddSeconds(60); $script:StatusCalls = 0
+            $adm10 = Wait-QuietLeaseAdmission -JobId 'jHt10' -Job ([pscustomobject]@{}) -Metadata ([pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 60 })
+            $script:Admission = $adm10
+            $sk10 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHt10 phase=request *' })
+            Assert-True ($adm10.label -eq 'clear' -and $sk10.Count -eq 1 -and $sk10[0] -match ' slots=skipped\(') "heat-trace A2: a queue ceiling within 70 s skips the request probe: $($adm10.label) $($sk10 -join ' || ')"
+            Exit-HeavySlot
+            $script:LeaseSnapshotSkipBelowSec = 7200       # the 31 min lease (1860 s) is then within the skip window at grant
+            Reset-Case @{ request = 'active'; active_after = 1.0 }
+            $script:AgeAfter = (Get-Date).AddSeconds(60); $script:StatusCalls = 0
+            $adm11 = Wait-QuietLeaseAdmission -JobId 'jHt11' -Job ([pscustomobject]@{}) -Metadata $meta
+            $script:Admission = $adm11
+            $script:LeaseSnapshotSkipBelowSec = 70
+            $sk11 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHt11 phase=grant *' })
+            Assert-True ($adm11.label -eq 'clear' -and $script:StatusCalls -eq 0 -and $sk11.Count -eq 1 -and $sk11[0] -match ' slots=skipped\(') "heat-trace A2: a lease end within the skip window skips the grant probe: calls=$($script:StatusCalls) $($sk11 -join ' || ')"
+            Exit-HeavySlot
+            $pureHead = Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'none'; remainingSec = $null; livenessState = 'absent'; livenessUntilUtc = $null })
+            Assert-True ([double]::IsPositiveInfinity($pureHead) -and (Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 12.5 })) -eq 12.5 -and (Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'none'; livenessState = 'live'; livenessUntilUtc = [DateTime]::UtcNow.AddSeconds(8).ToString('o') })) -lt 9 -and (Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'none'; livenessState = 'live'; livenessUntilUtc = 'not a date' })) -eq 0) "heat-trace A2: headroom is the least of the open notAfter, the live sidecar bound and the lease; an unreadable bound is no headroom"
+
+            # (g) adversary r1 A3: a feed stamped far in the future (age negative, huge) keeps its readable heat; and a status age that overflows Int32 is per-slot, not a whole-snapshot failure.
+            $script:FeedStub = @{ metrics = $hotMetrics; why = $null; ageSec = -2309511600.0 }
+            $r12 = Invoke-HeatTraceCase 'jHt12' @{ request = 'active'; active_after = 1.5 }
+            Assert-True ($r12.waits.Count -ge 1 -and @($r12.waits | Where-Object { $_ -notmatch ' heat=hot throttled=6/60 meanC=88\.2 feedAge=unknown( |$)' }).Count -eq 0) "heat-trace A3: a far-future feed stamp keeps the readable heat and reports feedAge=unknown: $($r12.waits -join ' || ')"
+            Exit-HeavySlot
+            $script:FeedStub = @{ metrics = $hotMetrics; why = $null; ageSec = 12 }
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: suite X (pid 77, since 0001-01-02 00:00:00) [exclusive]', 'slot 2: free') }
+            $r13 = Invoke-HeatTraceCase 'jHt13' @{ request = 'active'; active_after = 1.5 }
+            Assert-True ($r13.snaps.Count -eq 2 -and @($r13.snaps | Where-Object { $_ -notmatch 'slot 1: suite X pid=77 age=\d{10,}s; slot 2: free' }).Count -eq 0) "heat-trace A3: a status age beyond Int32 is logged, not a whole-snapshot failure: $($r13.snaps -join ' || ')"
+            Exit-HeavySlot
+            $script:StatusStub = $slotsOk
             $results.leasePendingHeatTrace = [ordered]@{ waitLines = $r.waits.Count; sample = $r.waits[0]; requestSnapshot = $sReq[0]; grantSnapshot = $sGrant[0]; staleSample = $r2.waits[0]; timeoutSample = $r5.snaps[0] }
         }
         finally {
