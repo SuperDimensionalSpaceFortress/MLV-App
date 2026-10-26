@@ -893,12 +893,18 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "${alias:global:Split-Path} = 'Redirect'",
         "New-Item -Path alias: -Name Join-Path -Value Redirect",
         'Set-Item -Path "function:$routeName" -Value { 1 }',
+        # Adversary pass 2: a leading separator after the drive, and a rename or move whose NEW name is the evaluated command.
+        "${function:\\Join-Path} = { 'C:\\fixture\\Dirty.psm1' }",
+        "Rename-Item -LiteralPath function:Redirect -NewName Join-Path",
+        "Rename-Item -LiteralPath alias:RedirectAlias -NewName:Split-Path",
+        "Move-Item function:Redirect New-Object",
     )
     # Not shadows: the alias is for a command the scan does not evaluate, and a read of an unrelated function.
     ALIAS_CONTROLS = (
         "Set-Alias -Name:Get-Item -Value:Get-Date",
         "New-Alias -Name:'Get-Thing' -Value Get-Date",
         "Get-Item -Path function:Get-Date",
+        "Rename-Item -LiteralPath function:Redirect -NewName Other-Name",
     )
     ALIAS_PREAMBLE = ("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
                       + "".join(f"{line}\n" for line in ALIAS_SHADOWS + ALIAS_COMPUTED + PROVIDER_ROUTES + ALIAS_CONTROLS))

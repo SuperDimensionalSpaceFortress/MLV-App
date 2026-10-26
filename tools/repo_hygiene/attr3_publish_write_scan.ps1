@@ -300,6 +300,8 @@ function Get-AliasNameArguments($Command) {
     return , $arguments
 }
 
+$script:providerRoutePattern = '^\s*(?:[A-Za-z0-9_.]+\\)?(?:alias|function)::?'
+
 function Get-ShadowKind($Node, [string[]]$Names) {
     # '' when $Node shadows nothing, otherwise the kind Get-ShadowingDefinitions reports.
     $aliasCommands = @('set-alias', 'new-alias', 'sal', 'nal')
@@ -312,7 +314,19 @@ function Get-ShadowKind($Node, [string[]]$Names) {
         if ($null -eq $commandName) { return '' }
         # A module-qualified name (Microsoft.PowerShell.Utility\Set-Alias) is the same command.
         $commandName = $commandName.Substring($commandName.LastIndexOf('\') + 1)
-        if ($aliasCommands -notcontains $commandName.ToLowerInvariant()) { return '' }
+        if ($aliasCommands -notcontains $commandName.ToLowerInvariant()) {
+            # `Rename-Item -LiteralPath function:Redirect -NewName Join-Path`, `Move-Item function:Redirect New-Object`: the
+            # alias: / function: path is the SOURCE and a constant elsewhere in the same command is the new name.
+            $routed = $false; $named = $false
+            foreach ($element in @($Node.CommandElements | Select-Object -Skip 1)) {
+                $operand = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
+                if ($operand -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -and $operand -isnot [System.Management.Automation.Language.ExpandableStringExpressionAst]) { continue }
+                if (([string]$operand.Value) -match $script:providerRoutePattern) { $routed = $true }
+                elseif ($operand -is [System.Management.Automation.Language.StringConstantExpressionAst] -and (Test-ShadowedName ([string]$operand.Value) $Names)) { $named = $true }
+            }
+            if ($routed -and $named) { return 'provider-path' }
+            return ''
+        }
         # Any constant element naming a shadowed command counts, whichever parameter it follows (the conservative reading).
         foreach ($element in @($Node.CommandElements | Select-Object -Skip 1)) {
             if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst] -and (Test-ShadowedName ([string]$element.Value) $Names)) { return 'definition' }
@@ -329,7 +343,7 @@ function Get-ShadowKind($Node, [string[]]$Names) {
     }
     # `Set-Item alias:Join-Path ...`, `New-Item -Path function: -Name Join-Path`, `${function:Join-Path} = ...`: the
     # alias: and function: drives (or the Alias:: / Function:: providers) define commands without naming Set-Alias.
-    $routePattern = '^\s*(?:[A-Za-z0-9_.]+\\)?(?:alias|function)::?'
+    $routePattern = $script:providerRoutePattern
     if ($Node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $Node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
         $value = [string]$Node.Value
         if ($value -notmatch $routePattern) { return '' }
@@ -340,7 +354,8 @@ function Get-ShadowKind($Node, [string[]]$Names) {
     }
     if ($Node -is [System.Management.Automation.Language.VariableExpressionAst]) {
         $user = $Node.VariablePath.UserPath
-        if ($user -match '^(?i:alias|function):(.*)$' -and (Test-ShadowedName $Matches[1] $Names)) { return 'provider-path' }
+        # ${function:\Join-Path} and ${function:/Join-Path} name the same command as ${function:Join-Path}.
+        if ($user -match '^(?i:alias|function):(.*)$' -and (Test-ShadowedName $Matches[1].TrimStart('\', '/') $Names)) { return 'provider-path' }
     }
     return ''
 }
