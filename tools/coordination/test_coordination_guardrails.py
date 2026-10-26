@@ -2291,6 +2291,77 @@ def test_save_dirty_worktree_evidence_round_trips_is_idempotent_and_read_only(tm
     assert again.stdout.startswith("DIRTY_TREE_SAVED") and len(list(dest.glob("dirty-worktree-*.patch"))) == 1, "the same diff must keep one name"
 
 
+def _dirty_save_repo(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    make_repo(wt)
+    (wt / "src").mkdir()
+    (wt / "src" / "a.txt").write_text("one\n")
+    git(wt, "add", "src/a.txt")
+    git(wt, "commit", "-qm", "base")
+    (wt / "src" / "a.txt").write_text("two\n")
+    dest = tmp_path / "run"
+    dest.mkdir()
+    return wt, dest
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_names_non_ascii_untracked_files_and_ignores_diff_config(tmp_path):
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "config", "diff.noprefix", "true")  # a user/global setting must not change the patch's path prefix (git apply defaults to -p1)
+    git(wt, "config", "diff.mnemonicPrefix", "true")
+    (wt / "é.txt").write_text("x\n")
+    (wt / "猫.txt").write_text("y\n")
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVED card=C1") and "verified=reverse-apply-ok" in out.stdout, out.stdout + out.stderr
+    patch = next(dest.glob("dirty-worktree-*.patch"))
+    status = patch.with_suffix(".status.txt").read_text(encoding="utf-8")
+    assert "é.txt" in status and "猫.txt" in status and '"' not in status and "?.txt" not in status, status
+    text = patch.read_text(encoding="utf-8")
+    assert "--- a/src/a.txt" in text and "+++ b/src/a.txt" in text, text
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(wt), str(clone))
+    git(clone, "apply", str(patch))  # the advertised reapply command (plain git apply) must land on src/a.txt
+    assert (clone / "src" / "a.txt").read_text() == "two\n"
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_never_reuses_a_name_for_a_different_patch(tmp_path):
+    wt, dest = _dirty_save_repo(tmp_path)
+    first = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert first.stdout.startswith("DIRTY_TREE_SAVED"), first.stdout + first.stderr
+    saved = next(dest.glob("dirty-worktree-*.patch"))
+    saved.write_bytes(saved.read_bytes() + b"\n")  # stands in for a different diff that shares the 8-hex name prefix
+    second = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert second.stdout.startswith("DIRTY_TREE_SAVED") and "verified=reverse-apply-ok" in second.stdout, second.stdout + second.stderr
+    patches = sorted(dest.glob("dirty-worktree-*.patch"))
+    assert len(patches) == 2, patches
+    assert saved.read_bytes().endswith(b"\n\n") and any(p != saved and "two" in p.read_text(encoding="utf-8") for p in patches)
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_reports_a_failed_status_instead_of_empty_evidence(tmp_path):
+    wt, dest = _dirty_save_repo(tmp_path)
+    (wt / "orphan.txt").write_text("z\n")
+    git(wt, "config", "status.renames", "bogus")  # makes git status (not git diff) exit non-zero with no stdout
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=git-status-exit-"), out.stdout + out.stderr
+    assert not list(dest.glob("*.status.txt"))
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_resolves_a_relative_destination_against_the_caller(tmp_path):
+    wt, _ = _dirty_save_repo(tmp_path)
+    board = tmp_path / "board"
+    (board / "run").mkdir(parents=True)
+    (wt / "run").mkdir()  # git -C <wt> would resolve a relative --output here
+    out = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command",
+                          f". '{DIRTY_SAVE_LIB}'; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '.\\run' -CardName C1 -RoundName r1"],
+                         text=True, capture_output=True, cwd=board)
+    assert out.stdout.startswith("DIRTY_TREE_SAVED"), out.stdout + out.stderr
+    assert len(list((board / "run").glob("dirty-worktree-*.patch"))) == 1 and not list((wt / "run").iterdir())
+
+
 @dirty_save_only
 def test_save_dirty_worktree_evidence_fails_soft_and_refuses_a_non_root_directory(tmp_path):
     wt = tmp_path / "wt"
