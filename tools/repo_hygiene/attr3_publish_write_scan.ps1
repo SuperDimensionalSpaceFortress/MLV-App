@@ -79,6 +79,15 @@
 #      .SessionState, .SessionStateProxy, .PSVariable, [psvariable]): for $PSScriptRoot (an extractor input) the call is
 #      unproven; for an R5 receiver the origin gains 'unproven-binding' (never inert) and a separate finding names the route.
 #   3. An extractor call that abbreviates a parameter or splats.
+#   4. (r10, sol r9; key attack catalogue row S-06: "a literal source-defined variable-cmdlet alias -> follow its binding or report
+#      unproven-binding".) Before any rule reads a command by name, the aliases the scanned file defines -- Set-Alias / New-Alias /
+#      sal / nal, the alias: drive (New-Item, Set-Item, ${alias:x} = ...), a rename, copy or move on alias: or function: -- and, for a
+#      splice source, the ones the -ModulePath modules' top-level code defines, are resolved, chains followed (Get-AliasContext), and
+#      routes 2 and 1 and the shadow rule run on every name a command resolves to, so `Set-Alias Rebind Set-Variable; Rebind
+#      PSScriptRoot ...` is judged as Set-Variable. An alias whose NAME is not a literal makes every command also read as its target.
+#      An alias the scan cannot resolve (a target that is not a literal or that no command answers to, a splatted alias command,
+#      Import-Alias, an alias: drive use or path it does not model, a rename fed a source it cannot read in a file that uses the alias:
+#      drive, a function: drive body that is not a script block) makes every variable binding in the file unproven.
 #
 # PROPERTY SETS IN BODIES (ATTR3-SCAN-COVERAGE-LIMITS-1 L1). `$receiver.Member = ...` is an R5 finding
 # (token = the target text), and in a spliced body each one carries an `origin` for the receiver:
@@ -489,9 +498,10 @@ function Get-ShadowKind($Node, [string[]]$Names) {
     if ($Node -is [System.Management.Automation.Language.CommandAst]) {
         $commandName = $Node.GetCommandName()
         if ($null -eq $commandName) { return '' }
-        # A module-qualified name (Microsoft.PowerShell.Utility\Set-Alias) is the same command.
-        $commandName = $commandName.Substring($commandName.LastIndexOf('\') + 1)
-        if ($aliasCommands -notcontains $commandName.ToLowerInvariant()) {
+        # A module-qualified name (Microsoft.PowerShell.Utility\Set-Alias) is the same command, and so is an alias the source defines
+        # for one (r10: `Set-Alias MakeAlias Set-Alias; MakeAlias Join-Path Redirect`): every name the command resolves to is read.
+        $resolvedNames = @(Get-ResolvedCommandNames $Node)
+        if (@($resolvedNames | Where-Object { $aliasCommands -contains $_ }).Count -eq 0) {
             # `Rename-Item -LiteralPath function:Redirect -NewName Join-Path`, `Move-Item function:Redirect New-Object`: the
             # alias: / function: path is the SOURCE and a constant elsewhere in the same command is the new name. An operand
             # written as ('Join-Path'), $('Join-Path') or 'Join-' + 'Path' is read as the constant it is; on a rename, move or
@@ -524,10 +534,10 @@ function Get-ShadowKind($Node, [string[]]$Names) {
                 }
             }
             if ($routed -and $named) { return 'provider-path' }
-            if ($renameCommands -contains $commandName.ToLowerInvariant() -and ($fixedButUnread -or ($unreadable -and ($routed -or $named)))) { return 'computed-rename' }
+            if (@($resolvedNames | Where-Object { $renameCommands -contains $_ }).Count -gt 0 -and ($fixedButUnread -or ($unreadable -and ($routed -or $named)))) { return 'computed-rename' }
             # An item command writes the alias: / function: drive directly (`Set-Item ([string]@('function:Join','-Path')) -Value {...}`),
             # so a path built only from literals that the scan cannot read fails closed here too, as it does on a rename.
-            if ($script:itemCommands -contains $commandName.ToLowerInvariant() -and $fixedButUnread) { return 'computed-rename' }
+            if (@($resolvedNames | Where-Object { $script:itemCommands -contains $_ }).Count -gt 0 -and $fixedButUnread) { return 'computed-rename' }
             return ''
         }
         # Any constant element naming a shadowed command counts, whichever parameter it follows (the conservative reading).
@@ -832,6 +842,300 @@ function Get-OtherBindings($Root, [string]$Name, [switch]$SkipVariableParameters
     return $tags.ToArray()
 }
 
+# ---- r10: source-defined aliases (sol r9 blocker; key attack catalogue row S-06) ----
+# A literal alias the scanned source defines itself (`Set-Alias Rebind Set-Variable`) makes `Rebind` run Set-Variable, and every rule
+# below that reads a command by its NAME (the variable cmdlets, the variable parameters, the item and rename commands, the alias commands
+# Get-ShadowKind reads) would see `Rebind`. So every command name is first resolved through the aliases the source defines -- Set-Alias /
+# New-Alias / sal / nal, the alias: drive (New-Item, Set-Item, ${alias:x} = ...), a rename, copy or move on alias: or function: -- chains
+# followed to their end, and each rule runs on every name the command resolves to. An alias the scan cannot resolve makes every variable
+# binding in the file unproven (Get-VariableRouteBinding), which is how the call, receiver and defaults rules fail closed.
+$script:aliasDefiningCommands = @('set-alias', 'new-alias', 'sal', 'nal')
+$script:aliasRoutePattern = '^\s*(?:[A-Za-z0-9_.]+\\)?alias::?'
+$script:functionRoutePattern = '^\s*(?:[A-Za-z0-9_.]+\\)?function::?'
+$script:aliasContexts = [System.Collections.Generic.Dictionary[object, object]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
+$script:importedAliases = @{ map = @{}; wildcard = [System.Collections.Generic.List[string]]::new(); problem = '' }
+$script:sessionCommands = @{}
+
+function Get-BareCommandName([string]$Name) {
+    # 'Microsoft.PowerShell.Utility\Set-Variable' and 'global:Rebind' name the commands 'set-variable' and 'rebind'.
+    return (($Name.Substring($Name.LastIndexOf('\') + 1)) -replace '^(?i:global|script|local|private):', '').Trim().ToLowerInvariant()
+}
+
+function Get-SessionCommand([string]$Name) {
+    # The command this scan's own session answers to $Name (module auto-loading off), or $null.
+    $key = $Name.ToLowerInvariant()
+    if (-not $script:sessionCommands.ContainsKey($key)) {
+        $PSModuleAutoLoadingPreference = 'None'
+        $script:sessionCommands[$key] = Get-Command -Name ([WildcardPattern]::Escape($Name)) -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+    return $script:sessionCommands[$key]
+}
+
+function Resolve-CommandNames([string]$Name, $Map, $Wildcard) {
+    # Every name $Name may run as: itself, each target the source's aliases give it (chains followed), the session's own alias
+    # resolution of each, and every target of an alias whose name the scan cannot read (any command may be that alias).
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    $queue = [System.Collections.Generic.Queue[string]]::new()
+    $queue.Enqueue((Get-BareCommandName $Name))
+    foreach ($target in @($Wildcard)) { $queue.Enqueue((Get-BareCommandName $target)) }
+    while ($queue.Count -gt 0) {
+        $next = $queue.Dequeue()
+        if ([string]::IsNullOrEmpty($next) -or -not $seen.Add($next)) { continue }
+        if ($Map.ContainsKey($next)) { foreach ($target in @($Map[$next])) { $queue.Enqueue((Get-BareCommandName $target)) } }
+        $session = Get-SessionCommand $next
+        if ($null -ne $session -and [string]$session.CommandType -eq 'Alias' -and $session.ResolvedCommandName) { $queue.Enqueue((Get-BareCommandName $session.ResolvedCommandName)) }
+    }
+    return @($seen)
+}
+
+function Get-BoundOperands($Command, [string]$Cmdlet) {
+    # How PowerShell binds $Command's elements to $Cmdlet's parameters: @{ named = @{ <parameter> = <ast> }; problem = '' }. A parameter is
+    # read by its exact name, an alias or a unique prefix, a switch takes no value, and the positional values go to the positional
+    # parameters (in Position order) of the parameter set that holds every named one. problem is set when the command splats, names no
+    # unique parameter, repeats one, or passes more positional values than the set takes.
+    $result = @{ named = @{}; problem = '' }
+    $info = Get-SessionCommand $Cmdlet
+    if ($null -eq $info -or $null -eq $info.Parameters) { $result.problem = "the scan cannot read the parameters of $Cmdlet"; return $result }
+    $parameters = @($info.Parameters.Values)
+    $positional = [System.Collections.Generic.List[object]]::new()
+    $elements = $Command.CommandElements
+    for ($i = 1; $i -lt $elements.Count; $i++) {
+        $element = $elements[$i]
+        if ($element -is [System.Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) { $result.problem = 'it splats its arguments'; return $result }
+        if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { $positional.Add($element); continue }
+        $spelling = $element.ParameterName
+        $match = @($parameters | Where-Object { $_.Name -ieq $spelling -or @($_.Aliases) -icontains $spelling })
+        if ($match.Count -eq 0) {
+            $match = @($parameters | Where-Object { $_.Name.StartsWith($spelling, [StringComparison]::OrdinalIgnoreCase) -or
+                                                    @($_.Aliases | Where-Object { $_.StartsWith($spelling, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0 })
+        }
+        if ($match.Count -ne 1) { $result.problem = "-$spelling does not name exactly one parameter of $Cmdlet"; return $result }
+        $parameter = $match[0]
+        $value = $element.Argument
+        if ($parameter.SwitchParameter) { continue }
+        if ($null -eq $value) {
+            if ($i + 1 -ge $elements.Count -or $elements[$i + 1] -is [System.Management.Automation.Language.CommandParameterAst]) { $result.problem = "-$spelling has no value"; return $result }
+            $i++
+            $value = $elements[$i]
+        }
+        if ($result.named.ContainsKey($parameter.Name)) { $result.problem = "-$($parameter.Name) is repeated"; return $result }
+        $result.named[$parameter.Name] = $value
+    }
+    $chosen = $null
+    foreach ($set in @($info.ParameterSets)) {
+        $setNames = @($set.Parameters | ForEach-Object { $_.Name })
+        if (@($result.named.Keys | Where-Object { $setNames -notcontains $_ }).Count -gt 0) { continue }
+        if ($null -eq $chosen -or $set.IsDefault) { $chosen = $set }
+    }
+    if ($null -eq $chosen) { $result.problem = "no parameter set of $Cmdlet holds every parameter it names"; return $result }
+    $slots = @($chosen.Parameters | Where-Object { $_.Position -ge 0 -and -not $result.named.ContainsKey($_.Name) } | Sort-Object Position)
+    if ($positional.Count -gt $slots.Count) { $result.problem = "it passes more positional values than $Cmdlet takes"; return $result }
+    for ($k = 0; $k -lt $positional.Count; $k++) { $result.named[$slots[$k].Name] = $positional[$k] }
+    return $result
+}
+
+function Get-SingleConstant($Ast) {
+    # The one string an operand binds to a [string] parameter, or $null when it is not exactly one constant.
+    if ($null -eq $Ast) { return $null }
+    $operands = @(Expand-Operands $Ast)
+    if ($operands.Count -ne 1) { return $null }
+    return (Get-ConstantString $operands[0])
+}
+
+function Test-RouteOperand($Ast, [string]$Pattern, [string]$Fragment) {
+    # True when an operand names, or could name, a path on the drive $Pattern matches: its constant does, a string inside it does
+    # ("alias:$name"), or it is built only from literals the scan cannot reduce whose fragments, put together, spell $Fragment.
+    if ($null -eq $Ast -or (Test-DataLiteralOperand $Ast)) { return $false }
+    foreach ($operand in @(Expand-Operands $Ast)) {
+        $constant = Get-ConstantString $operand
+        if ($null -ne $constant) { if ($constant -match $Pattern) { return $true }; continue }
+        foreach ($s in @($operand.FindAll({ param($x) $x -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $x -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true))) {
+            if (([string]$s.Value) -match $Pattern) { return $true }
+        }
+        $fragments = -join @($operand.FindAll({ param($x) $x -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value })
+        if ((Test-BuiltFromLiteralsOnly $operand) -and $fragments -match "(?i)$Fragment") { return $true }
+    }
+    return $false
+}
+
+function Get-RouteLeafName([string]$Value, [string]$Pattern) {
+    # The item a constant drive path names ('alias:./Rebind' -> 'Rebind'), $null when it is not on that drive.
+    if ($Value -notmatch $Pattern) { return $null }
+    return (Get-ProviderLeaf ($Value -replace $Pattern, ''))
+}
+
+function Get-AliasDefinitions($Top, $InitialMap, $InitialWildcard, [switch]$TopLevelOnly) {
+    # One pass over $Top: @{ map; wildcard; problem } with the definitions it finds added to $InitialMap / $InitialWildcard (copied).
+    # -TopLevelOnly skips function bodies (a module's aliases that run when the module is imported).
+    $map = @{}
+    foreach ($key in @($InitialMap.Keys)) { $map[$key] = [System.Collections.Generic.List[string]]::new([string[]]@($InitialMap[$key])) }
+    $wildcard = [System.Collections.Generic.List[string]]::new([string[]]@($InitialWildcard | Where-Object { $_ }))
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $nodes = @($Top.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] -or $x -is [System.Management.Automation.Language.AssignmentStatementAst] -or
+                                        $x -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $x -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true))
+    if ($TopLevelOnly) {
+        $nodes = @($nodes | Where-Object {
+            $inside = $false
+            for ($p = $_.Parent; $null -ne $p; $p = $p.Parent) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { $inside = $true; break } }
+            -not $inside
+        })
+    }
+    $addAlias = {
+        param([string]$AliasName, [string]$Target)
+        if ([string]::IsNullOrEmpty($AliasName) -or $AliasName -match '[*?\[\]]') { $wildcard.Add($Target); return }
+        $key = Get-BareCommandName $AliasName
+        if (-not $map.ContainsKey($key)) { $map[$key] = [System.Collections.Generic.List[string]]::new() }
+        if (-not $map[$key].Contains($Target)) { $map[$key].Add($Target) }
+    }
+    $hasAliasRoute = $false
+    $renamesWithoutSource = [System.Collections.Generic.List[string]]::new()
+    foreach ($n in $nodes) {
+        if ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+            # An alias: path anywhere but an operand of a command (`$p = 'alias:Rebind'`) reaches a command the scan does not see.
+            if (([string]$n.Value) -notmatch $script:aliasRoutePattern) { continue }
+            $hasAliasRoute = $true
+            # Its owner is the nearest command whose operand holds it; an assignment or a block reached first means it has none.
+            $owner = $n.Parent
+            while ($null -ne $owner -and $owner -isnot [System.Management.Automation.Language.CommandAst] -and $owner -isnot [System.Management.Automation.Language.AssignmentStatementAst] -and
+                   $owner -isnot [System.Management.Automation.Language.StatementBlockAst] -and $owner -isnot [System.Management.Automation.Language.NamedBlockAst] -and
+                   -not ($owner -is [System.Management.Automation.Language.PipelineAst] -and $owner.PipelineElements.Count -gt 1)) { $owner = $owner.Parent }
+            if ($owner -isnot [System.Management.Automation.Language.CommandAst]) { $problems.Add("the alias: drive path '$($n.Value)' outside a command the scan models") }
+            continue
+        }
+        if ($n -is [System.Management.Automation.Language.AssignmentStatementAst]) {
+            $left = Get-AssignmentTarget $n.Left
+            if ($left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+            $user = $left.VariablePath.UserPath
+            if ($user -match '^(?i:alias):(.*)$') {
+                $hasAliasRoute = $true
+                $leaf = Get-ProviderLeaf $Matches[1]
+                $target = if ($n.Operator -eq [System.Management.Automation.Language.TokenKind]::Equals) { Get-SingleConstant $n.Right } else { $null }
+                if ($null -eq $target) { $problems.Add("``$($left.Extent.Text) = ...`` with a target that is not a string constant") }
+                else { & $addAlias $leaf $target }
+            }
+            elseif ($user -match '^(?i:function):(.*)$') {
+                $leaf = Get-ProviderLeaf $Matches[1]
+                $value = Get-UnwrappedOperand $n.Right
+                if ($value -is [System.Management.Automation.Language.VariableExpressionAst] -and $value.VariablePath.UserPath -match '^(?i:function):(.*)$') { & $addAlias $leaf (Get-ProviderLeaf $Matches[1]) }
+                elseif ($value -isnot [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $problems.Add("``$($left.Extent.Text) = ...`` with a body that is not a script block in the source") }
+            }
+            continue
+        }
+        $commandName = $n.GetCommandName()
+        if ([string]::IsNullOrEmpty($commandName)) { continue }
+        $names = Resolve-CommandNames $commandName $map $wildcard
+        if (@($names | Where-Object { @('import-alias', 'ipal') -contains $_ }).Count -gt 0) { $problems.Add('Import-Alias defines aliases from a file the scan does not read'); continue }
+        if (@($names | Where-Object { $script:aliasDefiningCommands -contains $_ }).Count -gt 0) {
+            $bound = Get-BoundOperands $n 'Set-Alias'
+            if ($bound.problem) { $problems.Add("an alias command the scan cannot read ($($bound.problem))"); continue }
+            $target = Get-SingleConstant $bound.named['Value']
+            if ($null -eq $target) { $problems.Add('an alias command whose target is not a string constant'); continue }
+            & $addAlias (Get-SingleConstant $bound.named['Name']) $target
+            continue
+        }
+        $operands = @($n.CommandElements | Select-Object -Skip 1 | ForEach-Object { if ($_ -is [System.Management.Automation.Language.CommandParameterAst]) { $_.Argument } else { $_ } } | Where-Object { $null -ne $_ })
+        $aliasOperand = @($operands | Where-Object { Test-RouteOperand $_ $script:aliasRoutePattern 'alias' }).Count -gt 0
+        $functionOperand = @($operands | Where-Object { Test-RouteOperand $_ $script:functionRoutePattern 'function' }).Count -gt 0
+        if ($aliasOperand) { $hasAliasRoute = $true }
+        $isItem = @($names | Where-Object { @('new-item', 'ni', 'set-item', 'si') -contains $_ }).Count -gt 0
+        $renameKind = @($names | Where-Object { @('rename-item', 'rni', 'ren') -contains $_ }).Count -gt 0
+        $copyKind = @($names | Where-Object { @('copy-item', 'cpi', 'copy', 'cp', 'move-item', 'mi', 'move', 'mv') -contains $_ }).Count -gt 0
+        if ($renameKind -or $copyKind) {
+            $cmdlet = if ($renameKind) { 'Rename-Item' } elseif (@($names | Where-Object { @('move-item', 'mi', 'move', 'mv') -contains $_ }).Count -gt 0) { 'Move-Item' } else { 'Copy-Item' }
+            $bound = Get-BoundOperands $n $cmdlet
+            $source = if ($bound.named.ContainsKey('Path')) { $bound.named['Path'] } else { $bound.named['LiteralPath'] }
+            $destination = if ($renameKind) { $bound.named['NewName'] } else { $bound.named['Destination'] }
+            $sourceText = Get-SingleConstant $source
+            # A source the scan cannot read (pipeline input, a variable) may be an alias; it is judged once the whole file is read.
+            if ($null -eq $sourceText) { $renamesWithoutSource.Add($n.Extent.Text); if (-not ($aliasOperand -or $functionOperand)) { continue } }
+            if (-not ($aliasOperand -or $functionOperand)) { continue }
+            if ($bound.problem) { $problems.Add("a rename or copy on the alias: / function: drive the scan cannot read ($($bound.problem))"); continue }
+            $pattern = if ($null -ne $sourceText -and $sourceText -match $script:functionRoutePattern) { $script:functionRoutePattern } else { $script:aliasRoutePattern }
+            $sourceLeaf = if ($null -ne $sourceText) { Get-RouteLeafName $sourceText $pattern } else { $null }
+            if ($null -eq $sourceLeaf -or $sourceLeaf -eq '' -or $sourceLeaf -match '[*?\[\]$(\\/]') {
+                if ($aliasOperand) { $problems.Add("a rename or copy on the alias: drive whose source the scan cannot read as one alias") }
+                continue
+            }
+            $destinationText = Get-SingleConstant $destination
+            $newName = if ($null -eq $destinationText) { $null } elseif ($destinationText -match $script:providerRoutePattern) { Get-ProviderLeaf ($destinationText -replace $script:providerRoutePattern, '') } else { Get-ProviderLeaf $destinationText }
+            & $addAlias $newName $sourceLeaf
+            continue
+        }
+        if ($isItem -and ($aliasOperand -or $functionOperand)) {
+            $cmdlet = if (@($names | Where-Object { @('new-item', 'ni') -contains $_ }).Count -gt 0) { 'New-Item' } else { 'Set-Item' }
+            $bound = Get-BoundOperands $n $cmdlet
+            if ($bound.problem) { $problems.Add("$cmdlet on the alias: / function: drive the scan cannot read ($($bound.problem))"); continue }
+            $path = if ($bound.named.ContainsKey('Path')) { $bound.named['Path'] } else { $bound.named['LiteralPath'] }
+            $pathText = Get-SingleConstant $path
+            $leaf = $null
+            if ($null -ne $pathText) {
+                $onAlias = $pathText -match $script:aliasRoutePattern
+                $leaf = Get-RouteLeafName $pathText $(if ($onAlias) { $script:aliasRoutePattern } else { $script:functionRoutePattern })
+                if ($bound.named.ContainsKey('Name')) { $leaf = if ($leaf -eq '') { Get-SingleConstant $bound.named['Name'] } else { $null } }
+            }
+            else { $onAlias = $aliasOperand }
+            if ($onAlias) {
+                $target = Get-SingleConstant $bound.named['Value']
+                if ($null -eq $target) { $problems.Add("$cmdlet on the alias: drive with a target that is not a string constant"); continue }
+                & $addAlias $leaf $target
+            }
+            else {
+                $value = Get-UnwrappedOperand $bound.named['Value']
+                if ($null -eq $value -or $value -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { continue }
+                if ($value -is [System.Management.Automation.Language.VariableExpressionAst] -and $value.VariablePath.UserPath -match '^(?i:function):(.*)$' -and $null -ne $leaf) { & $addAlias $leaf (Get-ProviderLeaf $Matches[1]) }
+                else { $problems.Add("$cmdlet on the function: drive with a body that is not a script block in the source") }
+            }
+            continue
+        }
+        # Reading or removing an alias binds nothing; any other command handed an alias: path is a use the scan does not model.
+        if ($aliasOperand -and @($names | Where-Object { @('get-item', 'gi', 'get-childitem', 'gci', 'ls', 'dir', 'test-path', 'get-content', 'gc', 'remove-item', 'ri', 'rm', 'del', 'erase') -contains $_ }).Count -eq 0) {
+            $problems.Add("$commandName on the alias: drive, a use the scan does not model")
+        }
+    }
+    if ($hasAliasRoute -and $renamesWithoutSource.Count -gt 0) { $problems.Add("a rename, copy or move whose source the scan cannot read, in a file that uses the alias: drive ($($renamesWithoutSource[0]))") }
+    return @{ map = $map; wildcard = $wildcard; problem = $(if ($problems.Count -gt 0) { $problems[0] } else { '' }) }
+}
+
+function Get-AliasContext($Root, [switch]$Imported) {
+    # The aliases the tree that holds $Root defines (Get-AliasDefinitions, repeated until an alias of an alias command adds nothing),
+    # cached per tree. -Imported (a splice source) starts from the aliases the -ModulePath modules' top-level code defines. A target
+    # no command answers to -- not a session command, a function the tree or a -ModulePath module defines, or another alias -- is a
+    # problem: the scan cannot say what the alias runs.
+    $top = $Root
+    while ($null -ne $top.Parent) { $top = $top.Parent }
+    if ($script:aliasContexts.ContainsKey($top)) { return $script:aliasContexts[$top] }
+    $map = if ($Imported) { $script:importedAliases.map } else { @{} }
+    $wildcard = @(if ($Imported) { $script:importedAliases.wildcard })
+    $context = $null
+    for ($pass = 0; $pass -lt 8; $pass++) {
+        $context = Get-AliasDefinitions $top $map $wildcard
+        $size = @($context.map.Values | ForEach-Object { $_.Count } | Measure-Object -Sum).Sum + $context.wildcard.Count
+        $before = @($map.Values | ForEach-Object { @($_).Count } | Measure-Object -Sum).Sum + @($wildcard).Count
+        if ($size -eq $before) { break }
+        $map = $context.map; $wildcard = $context.wildcard
+        if ($pass -eq 7) { $context.problem = 'aliases of alias commands the scan stopped following after eight passes' }
+    }
+    if (-not $context.problem -and $Imported -and $script:importedAliases.problem) { $context.problem = "a -ModulePath module's $($script:importedAliases.problem)" }
+    if (-not $context.problem) {
+        $defined = @($top.FindAll({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { Get-BareCommandName $_.Name }) +
+                   @($moduleFunctions | ForEach-Object { Get-BareCommandName $_ })
+        foreach ($target in @(@($context.map.Values | ForEach-Object { $_ }) + @($context.wildcard))) {
+            $answered = @(Resolve-CommandNames $target $context.map @() | Where-Object { $defined -contains $_ -or ($null -ne (Get-SessionCommand $_) -and [string](Get-SessionCommand $_).CommandType -ne 'Alias') })
+            if ($answered.Count -eq 0) { $context.problem = "an alias whose target '$target' is not a command the scan can resolve"; break }
+        }
+    }
+    $script:aliasContexts[$top] = $context
+    return $context
+}
+
+function Get-ResolvedCommandNames($Command) {
+    # Every name a CommandAst may run as (Resolve-CommandNames through its tree's aliases); empty when it has no literal name.
+    $name = $Command.GetCommandName()
+    if ([string]::IsNullOrEmpty($name)) { return @() }
+    $context = Get-AliasContext $Command
+    return @(Resolve-CommandNames $name $context.map $context.wildcard)
+}
+
 # ---- r9: the unproven-binding class rule (opus r8 B1/B2, sol r8 L2) ----
 # Eight rounds each closed one construct that changes WHICH module or object a name binds to at run time, and the next key found
 # another of the same class. The rule is the class, not the instance: a route this scan cannot evaluate statically makes the
@@ -890,11 +1194,13 @@ function Get-VariableRouteBinding($Root, [string]$Name) {
                             # also -Value, so it is not read as one -- unless the command's own parameter set says it is (r9, below).
                             @{ Full = 'Variable'; Alias = ''; Min = 3 }, @{ Full = 'SessionVariable'; Alias = ''; Min = 8 },
                             @{ Full = 'ResponseHeadersVariable'; Alias = ''; Min = 16 }, @{ Full = 'StatusCodeVariable'; Alias = ''; Min = 11 })
+    # r10 (sol r9, catalogue S-06): an alias the source defines and the scan cannot resolve may run any command, so it may bind $Name.
+    $aliasContext = Get-AliasContext $Root
+    if ($aliasContext.problem) { return "an alias the scan cannot resolve ($($aliasContext.problem)), which may run a command that binds $Name" }
     foreach ($command in @($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true))) {
         $elements = $command.CommandElements
-        $commandName = $command.GetCommandName()
-        $ownSpellings = @()
-        if (-not [string]::IsNullOrEmpty($commandName)) { $ownSpellings = @(Get-VariableParameterSpellings ($commandName.Substring($commandName.LastIndexOf('\') + 1))) }
+        # r10: a command is read as every name it resolves to through the source's own aliases (`Set-Alias T Tee-Object; T -Va x`).
+        $ownSpellings = @(foreach ($resolvedName in @(Get-ResolvedCommandNames $command)) { Get-VariableParameterSpellings $resolvedName })
         for ($i = 1; $i -lt $elements.Count; $i++) {
             $element = $elements[$i]
             if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
@@ -918,17 +1224,14 @@ function Get-VariableRouteBinding($Root, [string]$Name) {
     foreach ($n in @($Root.FindAll({ param($x) $true }, $true))) {
         if ($n -is [System.Management.Automation.Language.CommandAst]) {
             # A route built from constants ('vari' + 'able:PSScriptRoot') has no string node of its own; a plain string is read below.
-            $itemCommandName = $n.GetCommandName()
-            $isItemCommand = $false
-            if ($null -ne $itemCommandName) {
-                $itemCommandName = $itemCommandName.Substring($itemCommandName.LastIndexOf('\') + 1).ToLowerInvariant()
-                $isItemCommand = $script:itemCommands -contains $itemCommandName
-            }
+            $resolvedNames = @(Get-ResolvedCommandNames $n)
+            $isItemCommand = @($resolvedNames | Where-Object { $script:itemCommands -contains $_ }).Count -gt 0
+            $renameName = @($resolvedNames | Where-Object { @('rename-item', 'rni', 'ren', 'move-item', 'mi', 'move', 'mv', 'copy-item', 'cpi', 'copy', 'cp') -contains $_ }) | Select-Object -First 1
             # r9 adversary A1: a rename, move or copy on the variable: drive makes its NEW name a variable (`Rename-Item variable:x
             # PSScriptRoot`), so the tail of the route is not the only name it binds. An operand naming the variable next to a route or
             # a source the scan cannot read (an operand, or pipeline input), a route next to an operand the scan cannot read, or an
             # operand built only from literals the scan cannot reduce, binds it (the same reading Get-ShadowKind gives function:).
-            if (@('rename-item', 'rni', 'ren', 'move-item', 'mi', 'move', 'mv', 'copy-item', 'cpi', 'copy', 'cp') -contains $itemCommandName) {
+            if ($null -ne $renameName) {
                 $routed = $false; $named = $false; $unreadable = $false; $fixedButUnread = $false
                 if ($n.Parent -is [System.Management.Automation.Language.PipelineAst] -and $n.Parent.PipelineElements.IndexOf($n) -gt 0) { $unreadable = $true }
                 foreach ($element in @($n.CommandElements | Select-Object -Skip 1)) {
@@ -951,7 +1254,7 @@ function Get-VariableRouteBinding($Root, [string]$Name) {
                     }
                 }
                 if ($fixedButUnread -or ($routed -and ($named -or $unreadable)) -or ($named -and $unreadable)) {
-                    return "$itemCommandName on the variable: drive (a new name that is, or could be, $Name)"
+                    return "$renameName on the variable: drive (a new name that is, or could be, $Name)"
                 }
             }
             foreach ($element in @($n.CommandElements | Select-Object -Skip 1)) {
@@ -974,10 +1277,8 @@ function Get-VariableRouteBinding($Root, [string]$Name) {
                     }
                 }
             }
-            $commandName = $n.GetCommandName()
+            $commandName = @($resolvedNames | Where-Object { $script:variableCommands -contains $_ }) | Select-Object -First 1
             if ($null -eq $commandName) { continue }
-            $commandName = $commandName.Substring($commandName.LastIndexOf('\') + 1).ToLowerInvariant()
-            if ($script:variableCommands -notcontains $commandName) { continue }
             # r9: Get-Variable hands back the variable object itself (`(Get-Variable r).Value = ...`), and -Include selects by wildcard;
             # a variable command with no name argument at all reaches every variable.
             $nameArguments = [System.Collections.Generic.List[object]]::new()
@@ -1358,11 +1659,18 @@ function Get-SpliceModuleBinding($Call, [string]$SourceDir, [string]$RootRebindi
     # r9 rule 1 (sol r8): a $PSDefaultParameterValues entry binds -ModulePath, -Name or Join-Path's arguments that the call does not
     # name ('Get-AttrCudaEmbeddedFunctionSource:ModulePath', '*:ModulePath', 'Join-Path:AdditionalChildPath'), so with any reference to
     # it in the file no call there binds the way its text reads.
-    if ($DefaultsReference) {
-        # One route (a computed Set-Variable name, the session-state API) can reach both variables; the reason names each one it reaches.
-        $alsoRoot = if ($RootRebinding) { "; `$PSScriptRoot may be rebound too (via $RootRebinding)" } else { '' }
-        return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "the file that holds the call refers to `$PSDefaultParameterValues ($DefaultsReference), whose defaults can bind -ModulePath, -Name or Join-Path's arguments at run time$alsoRoot" }
-    }
+    # r10: the call's own shape is read first and its reason kept, so a defaults reference adds to it ('relative', 'module-qualified')
+    # instead of hiding it.
+    $shapeBinding = Get-SpliceCallShapeBinding $Call $SourceDir $RootRebinding
+    if (-not $DefaultsReference) { return $shapeBinding }
+    # One route (a computed Set-Variable name, the session-state API) can reach both variables; the reason names each one it reaches.
+    $alsoRoot = if ($RootRebinding -and $shapeBinding.reason -notmatch 'PSScriptRoot is rebound') { "; `$PSScriptRoot may be rebound too (via $RootRebinding)" } else { '' }
+    $shape = if ($shapeBinding.kind -eq 'unsupported') { "$($shapeBinding.reason); and " } else { '' }
+    return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "${shape}the file that holds the call refers to `$PSDefaultParameterValues ($DefaultsReference), whose defaults can bind -ModulePath, -Name or Join-Path's arguments at run time$alsoRoot" }
+}
+
+function Get-SpliceCallShapeBinding($Call, [string]$SourceDir, [string]$RootRebinding = '') {
+    # Get-SpliceModuleBinding without the $PSDefaultParameterValues rule: what the call's own text binds.
     # r9 rule 3: PowerShell binds an abbreviated parameter by prefix against the extractor's parameter set as it is at run time, which
     # this scan does not prove (a module-qualified or replaced extractor, or one more parameter, changes what -Mod or -Na selects).
     # Only the exact name or a declared alias of a parameter the extractor has is read; anything else is an unproven binding.
@@ -1467,6 +1775,8 @@ function Get-SpliceCallSites([string]$Path) {
     foreach ($err in @($errors)) {
         Add-SpliceFinding $source $err.Extent.StartLineNumber '' $err.Message 'splice source does not parse; its splice call sites cannot be enumerated'
     }
+    # r10: the source's aliases, and the ones the -ModulePath modules' top-level code defines, before any rule reads a command name.
+    $null = Get-AliasContext $ast -Imported
     # The binding below evaluates Join-Path, and the call itself is Get-AttrCudaEmbeddedFunctionSource: a source that
     # defines its own version of either (or of Split-Path / New-Object) makes the scan's evaluation say nothing about it.
     foreach ($shadow in @(Get-ShadowingDefinitions $ast @('Join-Path', 'Split-Path', 'New-Object', 'Get-AttrCudaEmbeddedFunctionSource'))) {
@@ -1533,6 +1843,14 @@ if ($SpliceSource.Count -gt 0) {
         # $PSDefaultParameterValues in one rebinds an extractor call as one in the generator does.
         $moduleTokens = $null; $moduleErrors = $null
         $moduleAst = [System.Management.Automation.Language.Parser]::ParseInput($moduleTexts[$key], [ref]$moduleTokens, [ref]$moduleErrors)
+        # r10: the aliases its top-level code defines are the generator's aliases too (Get-AliasContext -Imported).
+        $moduleAliases = Get-AliasDefinitions $moduleAst @{} @() -TopLevelOnly
+        foreach ($aliasKey in @($moduleAliases.map.Keys)) {
+            if (-not $script:importedAliases.map.ContainsKey($aliasKey)) { $script:importedAliases.map[$aliasKey] = [System.Collections.Generic.List[string]]::new() }
+            foreach ($target in @($moduleAliases.map[$aliasKey])) { $script:importedAliases.map[$aliasKey].Add($target) }
+        }
+        foreach ($target in @($moduleAliases.wildcard)) { $script:importedAliases.wildcard.Add($target) }
+        if ($moduleAliases.problem -and -not $script:importedAliases.problem) { $script:importedAliases.problem = "$($moduleAliases.problem) ($key)" }
         $moduleDefaults = Get-DefaultParameterValuesReference $moduleAst
         if ($null -ne $moduleDefaults) {
             Add-SpliceFinding $key $moduleDefaults.Ast.Extent.StartLineNumber '' $key "the module refers to `$PSDefaultParameterValues ($($moduleDefaults.Reason)), whose defaults can bind any extractor call's -ModulePath or -Name at run time" 'unproven-binding'
@@ -1564,9 +1882,11 @@ if ($SpliceSource.Count -gt 0) {
             # <Module>\Get-AttrCudaEmbeddedFunctionSource runs THAT module's extractor. Only the real extractor module
             # (AttrCudaArtifacts) or the one module this call was bound to is the extractor this scan reads; any other
             # qualifier may run an extractor, and read a module, the scan never saw.
-            if (-not $bindingFailure -and $site.qualifier -and $site.qualifier -ine 'AttrCudaArtifacts' -and
+            # r10: read even when the binding already failed, so the reason names the qualifier too.
+            if ($site.qualifier -and $site.qualifier -ine 'AttrCudaArtifacts' -and
                 -not ($candidates.Count -eq 1 -and [IO.Path]::GetFileNameWithoutExtension($candidates[0]) -ieq $site.qualifier)) {
-                $bindingFailure = "the call is module-qualified by '$($site.qualifier)', which is not the module this scan binds"
+                $qualified = "the call is module-qualified by '$($site.qualifier)', which is not the module this scan binds"
+                $bindingFailure = if ($bindingFailure) { "$qualified; $bindingFailure" } else { $qualified }
             }
             if ($bindingFailure) {
                 Add-SpliceFinding $site.source $site.line '' $site.text "the extractor module this call reads cannot be bound: $bindingFailure" 'unproven-binding'

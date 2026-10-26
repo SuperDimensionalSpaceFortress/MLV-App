@@ -1155,7 +1155,16 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         # Runtime would read Dirty.psm1 (the alias redirects Join-Path); the scan evaluates Join-Path by its stock behaviour
         # and reads Clean.psm1. The shadow finding is what stops that divergence from passing.
         self.assertIn("Set-Alias -Name:Join-Path -Value:Redirect", self.alias_texts(), describe(self.alias["splicedViolations"]))
-        self.assertEqual(self.modules_of(self.alias, "DotF"), ["Clean.psm1"])
+        # r10 (sol r9, catalogue S-06): this generator also holds aliases the scan cannot resolve (`Set-Alias @aliasSplat`, a rename of
+        # the undefined alias:RedirectAlias), which may run Set-Variable, so the call is now an unproven binding as well: no module is
+        # scanned, where before r10 the clean one was. Tightened, not widened: the shadow finding above still holds.
+        self.assert_unproven_by_an_alias("'DotF'")
+        self.assertEqual(self.modules_of(self.alias, "DotF"), [])
+
+    def assert_unproven_by_an_alias(self, needle: str) -> None:
+        found = self.call_findings(self.alias, needle)
+        self.assertEqual([f["token"] for f in found], ["unproven-binding"], describe(self.alias["splicedViolations"]))
+        self.assertIn("an alias the scan cannot resolve", found[0]["reason"])
 
     def test_b1_an_alias_whose_name_is_not_a_string_constant_is_a_finding_of_its_own_kind(self) -> None:
         by_text = {f["text"]: f for f in self.alias_findings()}
@@ -1176,7 +1185,9 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
     def test_r4_a1_a_parenthesized_rename_operand_still_ends_in_a_shadow_finding_while_the_call_resolves_to_the_clean_module(self) -> None:
         # Adversary r3 A1 / Dot B2, end to end: runtime Join-Path returns Dirty.psm1 after the rename; the scan binds Clean.psm1.
         self.assertIn("Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path')", self.alias_texts(), describe(self.alias["splicedViolations"]))
-        self.assertEqual(self.modules_of(self.alias, "RenF"), ["Clean.psm1"])
+        # r10: unproven too, for the same unresolvable aliases as DotF (tightened: no module is scanned, the shadow finding still holds).
+        self.assert_unproven_by_an_alias("'RenF'")
+        self.assertEqual(self.modules_of(self.alias, "RenF"), [])
 
     def test_r4_a1_a_rename_or_move_with_an_operand_the_scan_cannot_reduce_to_a_constant_fails_closed(self) -> None:
         by_text = {f["text"]: f for f in self.alias_findings()}
@@ -1641,6 +1652,171 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
         for template in self.foreach_templates:
             found = [v for v in self.result["violations"] if v["source"] == str(template) and v["rule"] == "R2"]
             self.assertTrue([v for v in found if "destination is not provably under" in v["reason"]], json.dumps(self.result["violations"], indent=2))
+
+
+@requires_pwsh
+@unittest.skipUnless(os.name == "nt", "the ATTR-3 host jobs and their helpers are Windows-only")
+class SplicedBodyScanSourceAliasTests(unittest.TestCase):
+    """r10 (sol r9 blocker; catalogue row S-06): an alias the scanned source defines itself (Set-Alias, New-Alias, the alias: drive,
+    a rename or copy on alias: / function:) is resolved, chains followed, before the binding model runs, so an alias of Set-Variable,
+    Get-Variable, Tee-Object, ... is judged exactly like the cmdlet. An alias the scan cannot resolve (a name or target that is not a
+    literal, a target no command answers to, Import-Alias, an alias: drive write it does not model) makes every binding it could reach
+    an unproven binding.
+
+    One scan covers every case, as in SplicedBodyScanUnprovenBindingTests: each generator case is its own file, each body its own function.
+    """
+
+    RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
+    PSR_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"
+    DEF_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}'"
+    # name -> (preamble, call): the alias is followed to its cmdlet, and the cmdlet's binding is a rebinding / defaults finding.
+    CALLS = {
+        # sol r9, verbatim repros 1-3.
+        "SolRebind": ("Set-Alias Rebind Set-Variable; Rebind -Name PSScriptRoot -Value 'C:\\dirty'", PSR_CALL),
+        "SolReadVar": ("Set-Alias ReadVar Get-Variable; (ReadVar PSScriptRoot).Value='C:\\dirty'", PSR_CALL),
+        "SolReadVarDefaults": ("Set-Alias ReadVar Get-Variable; (ReadVar -Name ('PSDef'+'aultParameter'+'Values')).Value"
+                               "['Get-AttrCudaEmbeddedFunctionSource:ModulePath']='C:\\dirty.psm1'", DEF_CALL),
+        # The class: every alias-defining command, the alias: drive, a chain, a qualified target and every variable cmdlet.
+        "AliasNewAlias": ("New-Alias Rebind Set-Variable\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasSalToSv": ("sal -Name Rebind -Value sv\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasNalNewVariable": ("nal Rebind New-Variable\nRebind PSScriptRoot 'C:\\dirty' -Force", PSR_CALL),
+        "AliasQualifiedTarget": ("Set-Alias Rebind Microsoft.PowerShell.Utility\\Set-Variable\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasChain": ("Set-Alias First Set-Variable\nSet-Alias -Value First -Name Second\nSecond PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasOfSetAlias": ("Set-Alias MakeAlias Set-Alias\nMakeAlias Rebind Set-Variable\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasClearVariable": ("Set-Alias Wipe Clear-Variable\nWipe PSScriptRoot", PSR_CALL),
+        "AliasRemoveVariable": ("Set-Alias Drop Remove-Variable\nDrop -Name PSScriptRoot", PSR_CALL),
+        "AliasTeeVa": ("Set-Alias T Tee-Object\n'C:\\dirty' | T -Va PSScriptRoot | Out-Null", PSR_CALL),
+        "AliasRenameItemVarDrive": ("Set-Alias Ren2 Rename-Item\nRen2 variable:sourceRoute PSScriptRoot", PSR_CALL),
+        "AliasDriveNewItem": ("New-Item -Path alias:Rebind -Value Set-Variable | Out-Null\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveNewItemName": ("New-Item -Path alias: -Name Rebind -Value Set-Variable | Out-Null\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveSetItem": ("Set-Item alias:Rebind Set-Variable\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveReduced": ("Set-Item -Path ('ali' + 'as:Rebind') -Value Set-Variable\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveBraced": ("${{alias:Rebind}} = 'Set-Variable'\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveRename": ("Rename-Item alias:sv Rebind\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveCopy": ("Copy-Item alias:gv alias:ReadVar\n(ReadVar PSScriptRoot).Value = 'C:\\dirty'", PSR_CALL),
+        "AliasDefaultsSetVar": ("Set-Alias Rebind Set-Variable\nRebind PSDefaultParameterValues @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        # A computed alias NAME with a literal target: any command could be that alias, so each one is also read as the target.
+        "AliasComputedName": ("Set-Alias $aliasName Set-Variable\nGet-Thing PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        # A -ModulePath module's top-level code runs in the generator's session: its alias is the generator's alias.
+        "AliasFromModule": ("RebindFromModule PSScriptRoot 'C:\\dirty'", PSR_CALL),
+    }
+    # Fail closed: an alias the scan cannot resolve makes every binding it could reach unproven.
+    UNRESOLVABLE = {
+        "UnresComputedTarget": ("Set-Alias Rebind $aliasTarget\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "UnresUnknownTarget": ("Set-Alias Rebind Not-ACommandAnywhere\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "UnresSplat": ("Set-Alias @aliasArgs", PSR_CALL),
+        "UnresImportAlias": ("Import-Alias -Path 'C:\\fixture\\aliases.csv'", PSR_CALL),
+        "UnresPipeRename": ("Get-Item alias:sv | Rename-Item -NewName Rebind", PSR_CALL),
+        "UnresDriveContent": ("Set-Content -Path alias:Rebind -Value Set-Variable", PSR_CALL),
+        "UnresFunctionText": ("Set-Item function:Rebind -Value 'Set-Variable -Name PSScriptRoot -Value C:\\dirty -Scope Script'\nRebind", PSR_CALL),
+        "UnresDefaults": ("Set-Alias ReadVar $aliasTarget", DEF_CALL),
+    }
+    # Not unproven: an alias of a command that binds no variable, an alias binding another variable, a read of the alias: drive.
+    CALL_CONTROLS = {
+        "CtlAliasUnrelated": ("Set-Alias Stamp Get-Date\nStamp | Out-Null", PSR_CALL, "Clean.psm1"),
+        "CtlAliasOtherVariable": ("Set-Alias Rebind Set-Variable\nRebind -Name other -Value 1", PSR_CALL, "Clean.psm1"),
+        "CtlAliasDriveRead": ("$known = Test-Path alias:sv", PSR_CALL, "Clean.psm1"),
+        "CtlAliasOfFunction": ("function Helper {{ Get-Date }}\nSet-Alias H Helper\nH | Out-Null", PSR_CALL, "Clean.psm1"),
+        "CtlAliasDefault": ("Set-Alias Stamp Get-Date", DEF_CALL, "Extractor.psm1"),
+    }
+    # sol r9 repro 4, verbatim, and its siblings: a receiver the alias rebinds is not a fresh literal.
+    BODIES = {
+        "SolBodyRebind": "    param([string]$Target)\n    $r=@{}; Set-Alias Rebind Set-Variable; Rebind r (Get-Item $Target); $r.Attributes=1",
+        "BodyDriveAlias": "    param([string]$Target)\n    $r = @{}\n    New-Item -Path alias:Rebind -Value Set-Variable | Out-Null\n    Rebind r (Get-Item $Target)\n    $r.Attributes = 1",
+        "BodyGetVarAlias": "    param([string]$Target)\n    $r = @{}\n    Set-Alias ReadVar Get-Variable\n    (ReadVar r).Value = Get-Item $Target\n    $r.Attributes = 1",
+        "BodyUnresolvable": "    $r = @{}\n    Set-Alias Rebind $aliasTarget\n    $r.Attributes = 1",
+    }
+    BODY_CONTROLS = {
+        "BodyCtlAlias": "    $r = @{}\n    Set-Alias Stamp Get-Date\n    $r.a = 1",
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-alias-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        d = _long_path(Path(cls._tmp.name))
+        dirty = d / "Dirty.psm1"
+        names = list(cls.CALLS) + list(cls.UNRESOLVABLE) + list(cls.CALL_CONTROLS)
+        clean = "".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names)
+        (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n" + clean, encoding="utf-8")
+        (d / "Clean.psm1").write_text(clean, encoding="utf-8")
+        dirty.write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
+        # Top-level code of a module the generator imports: the alias it defines is visible to the generator.
+        (d / "Aliases.psm1").write_text("Set-Alias -Name RebindFromModule -Value Set-Variable -Scope Global\nfunction AliasesHelper {\n    Get-Date\n}\n", encoding="utf-8")
+        sources = []
+        cases = {**cls.CALLS, **cls.UNRESOLVABLE}
+        cases.update({n: (pre, call) for n, (pre, call, _) in cls.CALL_CONTROLS.items()})
+        for name, (pre, call) in cases.items():
+            generator = d / f"gen-{name}.ps1"
+            preamble = pre.format(dirty=dirty, dir=d)
+            generator.write_text(preamble + "\n$e = " + call.format(name=name) + "\n", encoding="utf-8")
+            sources.append(generator)
+        bodies = {**cls.BODIES, **cls.BODY_CONTROLS}
+        (d / "Body.psm1").write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in bodies.items()), encoding="utf-8")
+        body_gen = d / "gen-body.ps1"
+        body_gen.write_text("$e = Get-AttrCudaEmbeddedFunctionSource -Name @(" + ", ".join(f"'{n}'" for n in bodies)
+                            + ") -ModulePath (Join-Path $PSScriptRoot 'Body.psm1')\n", encoding="utf-8")
+        sources.append(body_gen)
+        # A template destination an alias of Set-Variable rebinds is not provable; an alias of Set-Alias still installs a shadow.
+        cls.template = d / "template-alias-dest.ps1"
+        cls.template.write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$d = Join-Path $Work 'ok'\nSet-Alias Rebind Set-Variable\n"
+                                "Rebind d 'C:\\outside'\nNew-Item -ItemType Directory -Path $d -Force | Out-Null\n", encoding="utf-8")
+        cls.shadow_gen = d / "gen-shadow.ps1"
+        cls.shadow_gen.write_text("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
+                                  "Set-Alias MakeAlias Set-Alias\nMakeAlias Join-Path Redirect\n", encoding="utf-8")
+        sources.append(cls.shadow_gen)
+        modules = [d / "Extractor.psm1", d / "Clean.psm1", dirty, d / "Body.psm1", d / "Aliases.psm1"]
+        cls.result = run_scan(templates=[cls.template], modules=modules, splice_sources=sources)
+
+    def call_findings(self, name: str) -> list[dict]:
+        return [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and f"'{name}'" in f["text"]]
+
+    def bound(self, name: str) -> list[str]:
+        return sorted(s["module"].rsplit("/", 1)[-1] for s in self.result["spliced"] if s["name"] == name)
+
+    def test_r10_a_literal_source_defined_alias_of_a_variable_cmdlet_is_followed_to_the_cmdlets_binding(self) -> None:
+        for name in self.CALLS:
+            with self.subTest(name=name):
+                found = self.call_findings(name)
+                self.assertEqual([f["token"] for f in found], ["unproven-binding"], f"{name}\n" + describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [], f"{name}: a module was scanned in place of the one runtime reads")
+
+    def test_r10_an_alias_the_scan_cannot_resolve_makes_every_binding_it_could_reach_unproven(self) -> None:
+        for name in self.UNRESOLVABLE:
+            with self.subTest(name=name):
+                found = self.call_findings(name)
+                self.assertEqual([f["token"] for f in found], ["unproven-binding"], f"{name}\n" + describe(self.result["splicedViolations"]))
+                self.assertIn("alias", found[0]["reason"], name)
+                self.assertEqual(self.bound(name), [], f"{name}: a module was scanned for an unproven binding")
+
+    def test_r10_an_alias_that_reaches_no_variable_binding_leaves_the_call_bound(self) -> None:
+        for name, (_, _, module) in self.CALL_CONTROLS.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.call_findings(name), [], describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [module])
+
+    def test_r10_a_receiver_an_alias_rebinds_is_an_unproven_binding_and_stays_a_finding(self) -> None:
+        for name in self.BODIES:
+            with self.subTest(name=name):
+                found = [f for f in self.result["splicedViolations"] if f["function"] == name]
+                self.assertTrue([f for f in found if f["rule"] == "unproven-binding" and f["token"] == "unproven-binding"], describe(found))
+                setters = [f for f in found if f["rule"] == "R5" and f["token"] == "$r.Attributes"]
+                self.assertEqual(len(setters), 1, describe(found))
+                self.assertIn("unproven-binding", setters[0]["origin"].split(";"), describe(setters))
+                self.assertIn(("R5", "$r.Attributes"), SplicedBodyScanCoverageLimitTests.unlisted(found), f"{name}: the policy dropped the setter")
+
+    def test_r10_a_receiver_an_unrelated_alias_does_not_reach_stays_a_fresh_literal(self) -> None:
+        found = [f for f in self.result["splicedViolations"] if f["function"] == "BodyCtlAlias"]
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+        self.assertEqual([f for f in found if f["rule"] == "unproven-binding"], [], describe(found))
+
+    def test_r10_a_template_destination_an_alias_rebinds_is_not_provable(self) -> None:
+        found = [v for v in self.result["violations"] if v["source"] == str(self.template) and v["rule"] == "R2"]
+        self.assertTrue([v for v in found if "destination is not provably under" in v["reason"]], json.dumps(self.result["violations"], indent=2))
+
+    def test_r10_an_alias_of_set_alias_that_installs_an_evaluated_command_is_a_shadow_finding(self) -> None:
+        shadows = [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and "shadow" in f["reason"] and "MakeAlias Join-Path" in f["text"]]
+        self.assertEqual(len(shadows), 1, describe(self.result["splicedViolations"]))
 
 
 class SpliceInventoryCallShapeTests(unittest.TestCase):
