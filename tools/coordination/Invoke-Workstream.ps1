@@ -1301,6 +1301,12 @@ $fence
                 }
                 if ($dirty.Count -gt 0) {
                     $names = ($dirty | Select-Object -First 10) -join '; '
+                    # LANE-HUBCHAT-DETACHED-DISPATCH-1: a lane that died mid-edit leaves its work here. Save it into the run dir before refusing (read-only, fail-soft; the refusal and exit 6 are unchanged).
+                    try {
+                        if (-not (Get-Command Save-DirtyWorktreeEvidence -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lane-dirty-save.ps1') }
+                        if (-not (Test-Path -LiteralPath $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+                        Write-Output ("WORKSTREAM: " + (Save-DirtyWorktreeEvidence -Wt $existingWt -Dest $runDir -CardName $cardId -RoundName $stamp))
+                    } catch { Write-Output "WORKSTREAM: DIRTY_TREE_SAVE_FAILED card=$cardId reason=$($_.Exception.Message -replace '\s+', ' ')" }
                     Write-Output "WORKSTREAM: REFUSED continuation-worktree-dirty card=$cardId workDir=$existingWt entries=$($dirty.Count) $names"
                     Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'continuation-worktree-dirty' -ExitCode 6 -Detail "workDir=$existingWt entries=$($dirty.Count)"
                     exit 6

@@ -2221,6 +2221,95 @@ def test_continuation_refuses_a_dirty_existing_worktree(tmp_path):
         cleanup_lane_worktree(tmp_path, "TEST-EDIT-CONT-6")
 
 
+# ---------------------------------------------------------------- LANE-HUBCHAT-DETACHED-DISPATCH-1
+# A lane that dies mid-edit (2026-10-26 09:09Z, the hub chat's tool tree ended with the Desktop app) leaves tracked changes in its worktree; a dispatcher that then
+# refuses the dirty tree must first save that work into the refused run dir. lane-dirty-save.ps1 is the helper, Invoke-Workstream.ps1 calls it before exit 6.
+DIRTY_SAVE_LIB = ROOT / "tools" / "coordination" / "lane-dirty-save.ps1"
+
+
+def test_continuation_dirty_refusal_saves_the_tracked_diff_first_and_still_exits_6(tmp_path):
+    dual, head = editing_board(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "product/TEST-EDIT-CONT-8"], cwd=tmp_path, check=True)
+    (tmp_path / "stage1.txt").write_text("stage one\n")
+    subprocess.run(["git", "add", "stage1.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "stage one"], cwd=tmp_path, check=True)
+    tip = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "checkout", "-q", "--detach", head], cwd=tmp_path, check=True)
+    wt = tmp_path / "wt-cont-8"
+    subprocess.run(["git", "worktree", "add", str(wt), "product/TEST-EDIT-CONT-8"], cwd=tmp_path, check=True, capture_output=True)
+    (wt / "stage1.txt").write_text("stage one\nHALF-FINISHED EDIT FROM A DEAD LANE\n")
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-8")], "TEST-EDIT-CONT-8", extra=("-ContinueFromSha", tip))
+        assert result.returncode == 6 and "REFUSED continuation-worktree-dirty" in result.stdout, result.stdout + result.stderr
+        saved = re.search(r"DIRTY_TREE_SAVED card=TEST-EDIT-CONT-8 .*?verified=(\S+) patch=(.+?\.patch) status=(.+?\.status\.txt) reapply=", result.stdout)
+        assert saved, result.stdout
+        assert saved.group(1) == "reverse-apply-ok", result.stdout
+        patch = Path(saved.group(2))
+        assert patch.is_file() and "HALF-FINISHED EDIT FROM A DEAD LANE" in patch.read_text(encoding="utf-8"), patch
+        assert "stage1.txt" in Path(saved.group(3)).read_text(encoding="ascii")
+        assert result.stdout.index("DIRTY_TREE_SAVED") < result.stdout.index("REFUSED continuation-worktree-dirty"), "the save must precede the refusal"
+        assert "HALF-FINISHED EDIT FROM A DEAD LANE" in (wt / "stage1.txt").read_text(), "the save must not restore or touch the worktree"
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=tmp_path, check=False, capture_output=True)
+
+
+DIRTY_SAVE_PWSH = shutil.which("pwsh")
+dirty_save_only = pytest.mark.skipif(DIRTY_SAVE_PWSH is None, reason="the PowerShell helper needs pwsh")
+
+
+def dirty_save_pwsh(body):
+    return subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", f". '{DIRTY_SAVE_LIB}'; {body}"], text=True, capture_output=True)
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_round_trips_is_idempotent_and_read_only(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    make_repo(wt)
+    (wt / "a.txt").write_text("one\n")
+    (wt / "blob.bin").write_bytes(bytes(range(256)))
+    git(wt, "add", "a.txt", "blob.bin")
+    git(wt, "commit", "-qm", "base")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(wt), str(clone))
+    (wt / "a.txt").write_text("one\ntwo\n")
+    (wt / "blob.bin").write_bytes(bytes(reversed(range(256))))
+    (wt / "untracked.txt").write_text("not in the patch\n")
+    before = git(wt, "status", "--porcelain")
+    dest = tmp_path / "run"
+    dest.mkdir()
+    first = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert first.returncode == 0 and first.stdout.startswith("DIRTY_TREE_SAVED card=C1 round=r1 files=3 "), first.stdout + first.stderr
+    assert "verified=reverse-apply-ok" in first.stdout
+    patches = sorted(dest.glob("dirty-worktree-*.patch"))
+    assert len(patches) == 1 and not list(dest.glob("*.tmp"))
+    assert "untracked.txt" in patches[0].with_suffix(".status.txt").read_text(encoding="ascii") and "not in the patch" not in patches[0].read_text(encoding="utf-8", errors="replace")
+    git(clone, "apply", str(patches[0]))  # byte-exact round trip, binary file included
+    assert (clone / "blob.bin").read_bytes() == bytes(reversed(range(256))) and (clone / "a.txt").read_text() == "one\ntwo\n"
+    assert git(wt, "status", "--porcelain") == before, "the save must not touch the worktree"
+    again = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert again.stdout.startswith("DIRTY_TREE_SAVED") and len(list(dest.glob("dirty-worktree-*.patch"))) == 1, "the same diff must keep one name"
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_soft_and_refuses_a_non_root_directory(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    make_repo(wt)
+    (wt / "sub").mkdir()
+    dest = tmp_path / "run"
+    dest.mkdir()
+    gone = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{tmp_path / 'missing'}' -CardName C1")
+    assert gone.returncode == 0 and gone.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=no-run-dir", gone.stdout + gone.stderr
+    sub = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt / 'sub'}' -Dest '{dest}' -CardName C1")
+    assert sub.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=not-a-worktree-root", sub.stdout + sub.stderr
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    nogit = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{plain}' -Dest '{dest}' -CardName C1")
+    assert nogit.returncode == 0 and nogit.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1"), nogit.stdout + nogit.stderr
+    assert not list(dest.iterdir()), "a failed save must leave nothing behind"
+
+
 def test_continuation_reuses_a_clean_existing_worktree(tmp_path):
     """The arm none of the round-1 tests exercised: the branch IS checked out somewhere. Stage 1's
     tree carries its build outputs, and making stage 2 rebuild from scratch is most of why the wide
@@ -3551,7 +3640,7 @@ def ratio_full_dispatch_board(tmp_path, guard_payload, use_real_guard=False):
     tool_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(RATIO_WORKSTREAM, tool_dir / "Invoke-Workstream.ps1")
     shutil.copy2(RATIO_GUARD if use_real_guard else guard, tool_dir / "Test-ProductRatioGuard.ps1")
-    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "repo-slug.ps1", "Retire-LaneWorktree.ps1", "lane-fsmonitor.ps1",
+    for dependency in ("landing-probe.ps1", "compose-lane-prompt-core.ps1", "repo-slug.ps1", "Retire-LaneWorktree.ps1", "lane-fsmonitor.ps1", "lane-dirty-save.ps1",
                        "Get-DoctrineBrief.ps1", "get_doctrine_brief.py"):
         shutil.copy2(RATIO_WORKSTREAM.parent / dependency, tool_dir / dependency)
     # get_doctrine_brief.py honours a fixture only inside the fixtures/ beside itself, so the
