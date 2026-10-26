@@ -80,7 +80,12 @@
 # bound module), Split-Path and New-Object by their stock behaviour. A template or body that defines a function
 # or Set-Alias / New-Alias with one of those names (or an allowlisted cmdlet's name) is an R1 finding, and a
 # splice source that does so (or shadows the extractor itself) is a 'splice' finding, because the scan's own
-# evaluation then says nothing about what the script runs. Not covered, and left OPEN: a freshness proof that
+# evaluation then says nothing about what the script runs. The alias's name is read from every spelling of -Name
+# (positional, separated, colon form `-Name:Join-Path`, any unique prefix); a name that is not a string constant
+# is a finding of its own kind, and so is a path or variable on the alias: / function: drives that names, or
+# could name, such a command (`Set-Item alias:Join-Path`, `${function:Join-Path} = ...`). Left OPEN: a drive
+# path built at run time (`'al' + 'ias:'`), Import-Alias, and a relative path after `Set-Location alias:`.
+# Not covered, and left OPEN: a freshness proof that
 # crosses a dynamic-scope or deferred-execution route this scan does not model (adversary A2-A5 inputs beyond the
 # scoped, trap, deferred-block and shadowed-constructor shapes above).
 # The origin is data for the caller; this
@@ -230,22 +235,113 @@ function Get-ShadowingDefinitions($Root, [string[]]$Names) {
     # whatever its scope prefix) a meaning of the scanned script's own. The scan evaluates Join-Path, Split-Path and
     # New-Object by their stock behaviour (a provable destination, a bound module, a fresh object); a script that
     # redefines one of them makes that evaluation say nothing about what the script runs.
-    $aliasCommands = @('set-alias', 'new-alias', 'sal', 'nal')
-    @($Root.FindAll({
-        param($n)
-        if ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
-            return @($Names | Where-Object { $_ -ieq ($n.Name -replace '^[A-Za-z]+:', '') }).Count -gt 0
+    # Each result is { Ast; Kind }: 'definition' (a function, or an alias whose name argument is a string constant naming
+    # one of $Names), 'computed-alias' (an alias command whose name argument the scan cannot read as a string constant,
+    # so it could name any command) or 'provider-path' (an alias: / function: drive path or variable that could define
+    # one). Get-ShadowReason words each kind for the caller.
+    $found = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    foreach ($n in @($Root.FindAll({ param($x) $true }, $true))) {
+        $kind = Get-ShadowKind $n $Names
+        if (-not $kind) { continue }
+        $ast = $n
+        if ($kind -eq 'provider-path') {
+            # Report the statement that uses the path, not the bare string inside it.
+            while ($null -ne $ast.Parent -and $ast -isnot [System.Management.Automation.Language.CommandAst] -and $ast -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { $ast = $ast.Parent }
+            if ($ast -isnot [System.Management.Automation.Language.CommandAst] -and $ast -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { $ast = $n }
         }
-        if ($n -is [System.Management.Automation.Language.CommandAst]) {
-            $commandName = $n.GetCommandName()
-            if ($null -eq $commandName -or $aliasCommands -notcontains $commandName.ToLowerInvariant()) { return $false }
-            foreach ($element in @($n.CommandElements | Select-Object -Skip 1)) {
-                if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
-                    @($Names | Where-Object { $_ -ieq ([string]$element.Value -replace '^[A-Za-z]+:', '') }).Count -gt 0) { return $true }
+        $key = "$kind|$($ast.Extent.StartOffset)|$($ast.Extent.EndOffset)"
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $found.Add([pscustomobject]@{ Ast = $ast; Kind = $kind })
+    }
+    return $found.ToArray()
+}
+
+function Get-ShadowReason([string]$Kind, [string]$Consequence) {
+    switch ($Kind) {
+        'computed-alias' { return "an alias command whose name is not a string constant could shadow a command this scan evaluates$Consequence" }
+        'provider-path' { return "an alias: or function: path could define a command (a shadow) named like one this scan evaluates$Consequence" }
+        default { return "a function or alias named like a command this scan evaluates shadows it$Consequence" }
+    }
+}
+
+function Test-ShadowedName([string]$Value, [string[]]$Names) {
+    # A name with its scope prefix (global:Join-Path) removed, compared case-insensitively.
+    @($Names | Where-Object { $_ -ieq ($Value -replace '^[A-Za-z]+:', '') }).Count -gt 0
+}
+
+function Get-AliasNameArguments($Command) {
+    # What Set-Alias / New-Alias binds to -Name: every -Name argument (any unique prefix, separated or colon form), or,
+    # when none, the first positional element -- skipping the value each preceding parameter consumes. A splat is returned
+    # as itself (it can carry a name the scan cannot read).
+    $switches = @('PassThru', 'Force', 'Confirm', 'WhatIf', 'Verbose', 'Debug')
+    $arguments = [System.Collections.Generic.List[object]]::new()
+    $elements = $Command.CommandElements
+    foreach ($element in @($elements | Select-Object -Skip 1)) {
+        if ($element -is [System.Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) { $arguments.Add($element) }
+    }
+    $named = Get-NamedArguments $Command @('Name') 'Set-Alias'
+    foreach ($argument in $named) { if ($null -ne $argument) { $arguments.Add($argument) } }
+    if ($named.Count -eq 0) {
+        for ($i = 1; $i -lt $elements.Count; $i++) {
+            $element = $elements[$i]
+            if ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
+                $isSwitch = @($switches | Where-Object { $_.StartsWith($element.ParameterName, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+                if ($null -eq $element.Argument -and -not $isSwitch -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $i++ }
+                continue
             }
+            if ($element -is [System.Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) { continue }
+            $arguments.Add($element)
+            break
         }
-        return $false
-    }, $true))
+    }
+    return , $arguments
+}
+
+function Get-ShadowKind($Node, [string[]]$Names) {
+    # '' when $Node shadows nothing, otherwise the kind Get-ShadowingDefinitions reports.
+    $aliasCommands = @('set-alias', 'new-alias', 'sal', 'nal')
+    if ($Node -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+        if (Test-ShadowedName $Node.Name $Names) { return 'definition' }
+        return ''
+    }
+    if ($Node -is [System.Management.Automation.Language.CommandAst]) {
+        $commandName = $Node.GetCommandName()
+        if ($null -eq $commandName) { return '' }
+        # A module-qualified name (Microsoft.PowerShell.Utility\Set-Alias) is the same command.
+        $commandName = $commandName.Substring($commandName.LastIndexOf('\') + 1)
+        if ($aliasCommands -notcontains $commandName.ToLowerInvariant()) { return '' }
+        # Any constant element naming a shadowed command counts, whichever parameter it follows (the conservative reading).
+        foreach ($element in @($Node.CommandElements | Select-Object -Skip 1)) {
+            if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst] -and (Test-ShadowedName ([string]$element.Value) $Names)) { return 'definition' }
+        }
+        $computed = $false
+        foreach ($argument in (Get-AliasNameArguments $Node)) {
+            if ($argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                if (Test-ShadowedName ([string]$argument.Value) $Names) { return 'definition' }
+            }
+            else { $computed = $true }
+        }
+        if ($computed) { return 'computed-alias' }
+        return ''
+    }
+    # `Set-Item alias:Join-Path ...`, `New-Item -Path function: -Name Join-Path`, `${function:Join-Path} = ...`: the
+    # alias: and function: drives (or the Alias:: / Function:: providers) define commands without naming Set-Alias.
+    $routePattern = '^\s*(?:[A-Za-z0-9_.]+\\)?(?:alias|function)::?'
+    if ($Node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $Node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+        $value = [string]$Node.Value
+        if ($value -notmatch $routePattern) { return '' }
+        $rest = ($value -replace $routePattern, '').Trim().TrimStart('\', '/')
+        # Nothing after the drive, a wildcard or a computed part: the name comes from somewhere else, so it is unproven.
+        if ($rest -eq '' -or $rest -match '[*?\[\]$(]' -or (Test-ShadowedName $rest $Names)) { return 'provider-path' }
+        return ''
+    }
+    if ($Node -is [System.Management.Automation.Language.VariableExpressionAst]) {
+        $user = $Node.VariablePath.UserPath
+        if ($user -match '^(?i:alias|function):(.*)$' -and (Test-ShadowedName $Matches[1] $Names)) { return 'provider-path' }
+    }
+    return ''
 }
 
 function Get-ModuleFunctionNames([string]$Path) {
@@ -518,7 +614,7 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
         Add-Violation $Source $root 'R8' '#requires is not allowed in a job template'
     }
     foreach ($shadow in @(Get-ShadowingDefinitions $root @($allowedCmdlets + 'New-Object'))) {
-        Add-Violation $Source $shadow 'R1' 'a function or alias named like a command this scan evaluates shadows it, so the scan cannot trust its own evaluation of that command'
+        Add-Violation $Source $shadow.Ast 'R1' (Get-ShadowReason $shadow.Kind ', so the scan cannot trust its own evaluation of that command')
     }
     $templateFunctions = @($root.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
     $known = @($allowedCmdlets + $templateFunctions + $ModuleFunctions)
@@ -800,9 +896,9 @@ function Get-SpliceCallSites([string]$Path) {
     # The binding below evaluates Join-Path, and the call itself is Get-AttrCudaEmbeddedFunctionSource: a source that
     # defines its own version of either (or of Split-Path / New-Object) makes the scan's evaluation say nothing about it.
     foreach ($shadow in @(Get-ShadowingDefinitions $ast @('Join-Path', 'Split-Path', 'New-Object', 'Get-AttrCudaEmbeddedFunctionSource'))) {
-        $shadowText = ($shadow.Extent.Text -replace '\s+', ' ')
+        $shadowText = ($shadow.Ast.Extent.Text -replace '\s+', ' ')
         if ($shadowText.Length -gt 160) { $shadowText = $shadowText.Substring(0, 160) }
-        Add-SpliceFinding $source $shadow.Extent.StartLineNumber '' $shadowText 'a function or alias in the splice source shadows a command this scan evaluates, so the module binding it computed cannot be trusted'
+        Add-SpliceFinding $source $shadow.Ast.Extent.StartLineNumber '' $shadowText (Get-ShadowReason $shadow.Kind ', so the module binding it computed cannot be trusted')
     }
     # Command names are case-insensitive and a module-qualified name (<Module>\Get-AttrCudaEmbeddedFunctionSource)
     # resolves to the same command: compare the part after the last backslash, ignoring case.

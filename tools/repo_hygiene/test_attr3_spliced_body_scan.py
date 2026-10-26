@@ -846,6 +846,56 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
                                "function global:Split-Path { param($Path) 'C:\\fixture' }\n"
                                "Set-Alias -Name Get-Item -Value Get-Date\n"
                                "New-Alias New-Object Get-Date\n"))
+        # r3 (Dot B1): the colon form `-Name:Join-Path` keeps the name in the parameter's own Argument, so a scan that read
+        # only the command's string elements never saw it. One scan covers every spelling, computed name and provider route.
+        cls.alias = cls._scan("alias", [
+            ("Clean.psm1", [("DotF", cls.CLEAN)]),
+            ("Dirty.psm1", [("DotF", cls.RAW_WRITE)]),
+        ], ["Clean.psm1", "Dirty.psm1"], [
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'DotF' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')",
+        ], generator_preamble=cls.ALIAS_PREAMBLE, template_extra=cls.ALIAS_TEMPLATE)
+
+    # Every line is its own finding, found again by its exact text. Redirect is the Dot counterexample's replacement command.
+    ALIAS_SHADOWS = (
+        "Set-Alias -Name:Join-Path -Value:Redirect",
+        "New-Alias -Name:Join-Path -Value:Redirect",
+        "Set-Alias -N:Join-Path -Value:Redirect",
+        "Set-Alias -Na:Split-Path -Value:Redirect",
+        "Set-Alias -Name:'Join-Path' -Value Redirect",
+        'Set-Alias -Name:"Split-Path" -Value:Redirect',
+        "New-Alias -Name:New-Object -Value:Redirect",
+        "Set-Alias -Name:global:Join-Path -Value:Redirect",
+        "sal -Name:JOIN-PATH Redirect",
+        "Microsoft.PowerShell.Utility\\New-Alias -Value:Redirect -Name:Split-Path",
+    )
+    # A name the scan cannot read as a string constant could be any command, so each of these is a finding of its own kind.
+    ALIAS_COMPUTED = (
+        "Set-Alias -Name:$aliasName -Value:Redirect",
+        "Set-Alias -Name ($aliasPrefix + '-Path') Redirect",
+        'New-Alias "$aliasPrefix-Path" Redirect',
+        "Set-Alias -Value:Redirect $aliasName",
+        "Set-Alias @aliasSplat",
+    )
+    # Other routes to a command called Join-Path / Split-Path / New-Object: the alias: and function: drives.
+    PROVIDER_ROUTES = (
+        "Set-Item -Path alias:Join-Path -Value Redirect",
+        "New-Item -Path function:\\Split-Path -Value { 'C:\\fixture' }",
+        "Set-Item -LiteralPath:Alias::New-Object Redirect",
+        "${function:Join-Path} = { 'C:\\fixture\\Dirty.psm1' }",
+        "${alias:global:Split-Path} = 'Redirect'",
+        "New-Item -Path alias: -Name Join-Path -Value Redirect",
+        'Set-Item -Path "function:$routeName" -Value { 1 }',
+    )
+    # Not shadows: the alias is for a command the scan does not evaluate, and a read of an unrelated function.
+    ALIAS_CONTROLS = (
+        "Set-Alias -Name:Get-Item -Value:Get-Date",
+        "New-Alias -Name:'Get-Thing' -Value Get-Date",
+        "Get-Item -Path function:Get-Date",
+    )
+    ALIAS_PREAMBLE = ("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
+                      + "".join(f"{line}\n" for line in ALIAS_SHADOWS + ALIAS_COMPUTED + PROVIDER_ROUTES + ALIAS_CONTROLS))
+    # The template is held to the same rule; only the colon-form lines (the ones the old scan missed) go in it.
+    ALIAS_TEMPLATE = "Set-Alias -Name:Join-Path -Value:Redirect\nNew-Alias -N:'New-Object' -Value:Redirect\nSet-Alias -Name:$templateName -Value:Redirect\nSet-Alias -Name:Get-Item -Value:Get-Date\n"
 
     @classmethod
     def _scan(cls, label: str, modules: list, on_list: list, calls: list, *, extra_files=(), template_extra: str = "", raw_modules=None,
@@ -965,6 +1015,45 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         for needle in ("Join-Path", "Split-Path", "New-Object"):
             self.assertIn(needle, texts, f"no shadow finding names {needle}\n" + describe(self.shadow["splicedViolations"]))
         self.assertNotIn("Get-Item", texts, "Get-Item is not a command the scan evaluates")
+
+    def alias_findings(self) -> list[dict]:
+        return [f for f in self.alias["splicedViolations"] if f["rule"] == "splice" and "shadow" in f["reason"]]
+
+    def alias_texts(self) -> list[str]:
+        return [f["text"] for f in self.alias_findings()]
+
+    def test_b1_a_colon_form_prefixed_quoted_scoped_or_reordered_alias_of_an_evaluated_command_is_a_finding(self) -> None:
+        texts = self.alias_texts()
+        for line in self.ALIAS_SHADOWS:
+            self.assertIn(line, texts, f"no shadow finding for `{line}`\n" + describe(self.alias["splicedViolations"]))
+
+    def test_b1_the_dot_counterexample_end_to_end_is_a_finding_while_the_call_still_resolves_to_the_clean_module(self) -> None:
+        # Runtime would read Dirty.psm1 (the alias redirects Join-Path); the scan evaluates Join-Path by its stock behaviour
+        # and reads Clean.psm1. The shadow finding is what stops that divergence from passing.
+        self.assertIn("Set-Alias -Name:Join-Path -Value:Redirect", self.alias_texts(), describe(self.alias["splicedViolations"]))
+        self.assertEqual(self.modules_of(self.alias, "DotF"), ["Clean.psm1"])
+
+    def test_b1_an_alias_whose_name_is_not_a_string_constant_is_a_finding_of_its_own_kind(self) -> None:
+        by_text = {f["text"]: f for f in self.alias_findings()}
+        for line in self.ALIAS_COMPUTED:
+            self.assertIn(line, by_text, f"no finding for the computed alias name in `{line}`\n" + describe(self.alias["splicedViolations"]))
+            self.assertIn("not a string constant", by_text[line]["reason"], line)
+
+    def test_b1_a_function_or_alias_drive_route_to_an_evaluated_command_is_a_finding(self) -> None:
+        texts = self.alias_texts()
+        for line in self.PROVIDER_ROUTES:
+            self.assertIn(line, texts, f"no shadow finding for `{line}`\n" + describe(self.alias["splicedViolations"]))
+
+    def test_b1_an_alias_of_a_command_the_scan_does_not_evaluate_and_a_read_of_an_unrelated_function_are_not_findings(self) -> None:
+        texts = " | ".join(self.alias_texts())
+        for line in self.ALIAS_CONTROLS:
+            self.assertNotIn(line, texts, f"`{line}` is not a shadow\n" + describe(self.alias["splicedViolations"]))
+
+    def test_b1_the_template_is_held_to_the_same_rule(self) -> None:
+        shadows = {v["text"]: v for v in self.alias["violations"] if "shadow" in v["reason"]}
+        for line in ("Set-Alias -Name:Join-Path -Value:Redirect", "New-Alias -N:'New-Object' -Value:Redirect", "Set-Alias -Name:$templateName -Value:Redirect"):
+            self.assertIn(line, shadows, f"template line `{line}` was not flagged\n" + json.dumps(self.alias["violations"], indent=2))
+        self.assertNotIn("Set-Alias -Name:Get-Item -Value:Get-Date", shadows)
 
     def test_l1_template_parameters_named_by_alias_or_abbreviation_are_still_judged(self) -> None:
         # Advisory A8, same class as A3: -RSO / -RSE are aliases of Start-Process -RedirectStandardOutput / -Error, -N: abbreviates -Name.
