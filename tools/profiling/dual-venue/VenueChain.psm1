@@ -612,8 +612,11 @@ function Get-VenueStagedBuildManifest {
             {
                 param($p)
                 if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return '' }
-                (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
-                $m = try { [IO.File]::ReadAllText($p) | ConvertFrom-Json } catch { $null }
+                # ONE read: the digest and the facts below come from the same bytes (a file replaced between two reads would pair one version's hash with another's content)
+                $bytes = [IO.File]::ReadAllBytes($p)
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try { ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+                $m = try { [Text.UTF8Encoding]::new($false).GetString($bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { $null }
                 if ($null -eq $m) { 'UNPARSEABLE'; return }
                 $c = $m.PSObject.Properties['sourceCommit']; 'C:' + $(if ($null -eq $c) { '' } else { [string]$c.Value })
                 $d = $m.PSObject.Properties['dllPairManifestSha256']; 'D:' + $(if ($null -eq $d) { '' } else { ([string]$d.Value).ToLowerInvariant() })

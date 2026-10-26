@@ -1945,6 +1945,36 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         manifest = hashlib.sha256(p.read_bytes()).hexdigest()
         self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_MANIFEST_MISMATCH item=2 ")
 
+    def test_r5_adv2_a2_a_leg_is_marked_in_flight_at_the_launch_not_before_its_run_line_is_logged(self) -> None:
+        # adversary r5 pass 2 A2: the marker was set before the "LEG .. RUN" log line, so a throw while that line was appended recorded a leg whose child never started as
+        # LEG_FAILED. It is set on the line before the child is launched, after everything that can throw without having started it.
+        text = RUNNER.read_text(encoding="utf-8")
+        run_line, launch = text.index('L "LEG $($leg.name) RUN batch='), text.index("$lp = Invoke-VenueBoundedProcess -FilePath $pwshExe")
+        marks = [i for i in range(len(text)) if text.startswith("$inFlightLeg = $leg", i)]
+        self.assertEqual(len(marks), 1, marks)
+        self.assertTrue(run_line < marks[0] < launch, (run_line, marks, launch))
+        self.assertEqual(text[marks[0]:launch].count("\n"), 1, "nothing between the marker and the launch but the launch's own line")
+
+    def test_r5_adv2_a3_the_staged_manifest_digest_and_facts_come_from_one_read(self) -> None:
+        # adversary r5 pass 2 A3: Get-FileHash and a second read of the same file could pair one version's digest with another's content.
+        text = MODULE.read_text(encoding="utf-8")
+        body = text[text.index("function Get-VenueStagedBuildManifest"):text.index("$script:VenueAbandonedReads = 0")]
+        self.assertEqual(body.count("ReadAllBytes"), 1, body)
+        self.assertNotIn("Get-FileHash", body)
+        self.assertNotIn("ReadAllText", body)
+
+    def test_r5_adv2_a3_a_staged_manifest_with_a_byte_order_mark_is_still_read(self) -> None:
+        c = "5" * 40
+        p = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
+        p.write_bytes(b"\xef\xbb\xbf" + json.dumps({"sourceCommit": c, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False}).encode("utf-8"))
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sha = $r.sha256; problem = $r.contentProblem }\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        import hashlib
+        self.assertEqual(json.loads(out.stdout), {"state": "STAGED", "sha": hashlib.sha256(p.read_bytes()).hexdigest(), "problem": ""})
+
     def test_r5_h2_the_interleave_helper_keeps_an_array_valued_item_whole(self) -> None:
         # key3 H2 (sol): the bare Dequeue() output was enumerated, so one array-valued item came back as its elements.
         script = (

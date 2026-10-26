@@ -632,7 +632,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # QUIET under the lease: the leg, on the same lease (r5b, Grok G1: while the claim is still this run's).
                 $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc
                 if ($cl) { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "before leg $($leg.name): $($cl.detail)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=leg $($cl.detail)"; break }
-                $b.legsAttempted++; $inFlightLeg = $leg
+                $b.legsAttempted++
                 $out = Join-Path $RunDir "leg-$($leg.name)-b$('{0:00}' -f $batchNo)-a$attempt.out.txt"
                 $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $leg.sourceCommit, '-BuildManifestSha256', $leg.buildManifestSha256, '-LeaseBatch', $token)
                 if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
@@ -642,6 +642,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # r3 (sol r2 B2): the leg runs only while the lease does. It is a bounded child: still running at the lease's end, it is killed with its whole
                 # process tree (Kill($true), Invoke-VenueBoundedProcess) and typed LEASE_EXPIRED below. The agent stops its job at the same bound (lease-batch r3).
                 $legBoundSec = [int][Math]::Max(1, [Math]::Floor(($leaseEnd - [DateTime]::UtcNow).TotalSeconds))
+                $inFlightLeg = $leg   # adversary r5 pass 2 A2: marked at the launch itself, so a throw while the RUN line was logged leaves a leg that never started NOT_RUN
                 $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec
                 [IO.File]::WriteAllText($out, [string]$lp.stdout + [string]$lp.stderr, [Text.UTF8Encoding]::new($false))
                 $legCode = $lp.exit
