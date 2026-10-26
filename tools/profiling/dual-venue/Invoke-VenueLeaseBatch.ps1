@@ -109,7 +109,7 @@
 # non-zero (LEG_FAILED) or was killed at the lease's end (LEASE_EXPIRED; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
 # UNRESOLVED or not admitted, or never submitted because its sidecar could not be written: LIVENESS_UNAVAILABLE); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
 # 7a); 12 an unexpected throw inside a batch after its claim was taken (BATCH_ERROR: the claim keeper is stopped, the claim released and the batch receipt written
-# first; the legs not run are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
+# first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
 [CmdletBinding(DefaultParameterSetName = 'Scalar')]
 param(
@@ -297,6 +297,8 @@ if ($legPlanMode) {
             if ($st.state -ceq 'UNREACHABLE') { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
             if ($st.state -cne 'STAGED') { Stop-PlanRefused 'BUILD_NOT_STAGED' $it.item "no staged build manifest for $short at $($st.path); the runner stages and builds nothing" }
             if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
+            # r5 (adversary A2): and the manifest must be one the leg job's validator accepts (its commit, dll pair digest and symbol presence), not only the one named by hash
+            if ($st.contentProblem) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short at $($st.path) is not one the leg job accepts: $($st.contentProblem)" }
         }
         $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
         foreach ($it in $ordered) {
@@ -501,7 +503,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     $claimKeeper = Start-VenueClaimKeeper -Venue $Venue -Nonce $claim.nonce -TtlSec $ClaimTtlSec -RenewSec $ClaimRenewSec -ClaimDir $ClaimDir
     # r3 (Dot B1): $openSubmitted is true from the moment Submit-AgentJob is called for the open. The finally block's cancel, close and ledger charge follow
     # that flag, never "$op is null": a null $op before the call (a throw while the sidecar was checked) means nothing was sent.
-    $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null; $openLive = $null; $cr = $null; $openSubmitted = $false
+    $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null; $openLive = $null; $cr = $null; $openSubmitted = $false; $inFlightLeg = $null
     # r5 (key3 F1): the try opens IMMEDIATELY after the keeper starts, so every throw from here on ends with the keeper stopped, the claim released and the batch
     # receipt written (the finally), and as a typed exit 12 (the catch). A throw outside it left the keeper runspace renewing the claim of a process that had died.
     try {
@@ -593,7 +595,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # (3) the legs, under the lease
             $attempt = 0
             while ($pending.Count -gt 0) {
-                $leg = $pending[0]
+                $leg = $pending[0]; $inFlightLeg = $null
                 if ([DateTime]::UtcNow -ge $deadline) { $b.endReason = 'DEADLINE'; Set-Stop 'DEADLINE' 3; break }
                 # r5b (Grok G1): no probe and no leg without the venue claim. Lost (NOT_OURS / ABSENT) or past its last good expiry, the batch ends CLAIM_LOST
                 # (uncounted); the legs already run stay as measured and the rest go to the next batch, which takes the claim again.
@@ -630,7 +632,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # QUIET under the lease: the leg, on the same lease (r5b, Grok G1: while the claim is still this run's).
                 $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc
                 if ($cl) { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "before leg $($leg.name): $($cl.detail)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=leg $($cl.detail)"; break }
-                $b.legsAttempted++
+                $b.legsAttempted++; $inFlightLeg = $leg
                 $out = Join-Path $RunDir "leg-$($leg.name)-b$('{0:00}' -f $batchNo)-a$attempt.out.txt"
                 $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $leg.sourceCommit, '-BuildManifestSha256', $leg.buildManifestSha256, '-LeaseBatch', $token)
                 if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
@@ -740,6 +742,15 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # r5 (key3 F1): an unexpected throw anywhere in the batch is a typed stop, not an unhandled exit 1 that skips the summary. The finally below runs first; 12 replaces every code.
         $b.endReason = 'BATCH_ERROR'; $b.endDetail = ($_.Exception.Message -replace '\s+', ' ')
         $script:stopReason = 'BATCH_ERROR'; $script:exitCode = 12
+        # adversary r5 A1: a leg whose child had started but whose result was not recorded yet RAN (or may have): LEG_FAILED / reason BATCH_ERROR, outcome unknown,
+        # uncounted, never NOT_RUN. Only the legs never started stay pending for the NOT_RUN loop below.
+        try {
+            if ($null -ne $inFlightLeg -and $pending.Contains($inFlightLeg)) {
+                $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; reason = 'BATCH_ERROR'; detail = $b.endDetail; counted = $false }
+                $b.legs.Add([pscustomobject]$row); Add-Result $inFlightLeg 'LEG_FAILED' $row; $null = $pending.Remove($inFlightLeg)
+                Add-PlanIdentity $b.legs[$b.legs.Count - 1] $inFlightLeg
+            }
+        } catch { }
         try { L "BATCH_ERROR batch=$batchNo $($b.endDetail)" } catch { }   # a batch.log another process holds must not turn the typed stop back into an unhandled throw
     } finally {
         # (4) END: release the lease now (a light close job), read the agent's receipt for it, release the claim, write the batch receipt.

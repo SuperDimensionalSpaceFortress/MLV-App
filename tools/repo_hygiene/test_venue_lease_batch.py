@@ -46,6 +46,7 @@ requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32",
 
 SHA = "a" * 40
 MANIFEST = "b" * 64
+ABSENT = object()   # a staged build manifest field left out (stage(): dllPairManifestSha256=ABSENT)
 
 # Wait-VenueQuiet stand-in: mode per call from FAKE_QUIET_MODES (comma list, the last repeats), counted in the run dir; each call is logged with UTC ticks.
 FAKE_QUIET = r"""
@@ -1553,11 +1554,14 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # two builds staged in the venue's cache, by the path Invoke-VenueLeg hashes
         self.manifests = {c: self.stage(c, f"build {c[:1]}") for c in (self.commit_a, self.commit_b)}
 
-    def stage(self, commit: str, body: str) -> str:
+    def stage(self, commit: str, body: str, **override: object) -> str:
+        # the three fields Assert-AttrCudaBuildManifest (the leg job's own validator) requires: the build's commit, its dll pair digest and a boolean symbol presence
         cache = self.share / "cache"
         cache.mkdir(exist_ok=True)
         p = cache / f"playback-attr-3-cuda-{commit[:12]}-build.json"
-        p.write_text(json.dumps({"sourceCommit": commit, "body": body}), encoding="utf-8")
+        doc = {"sourceCommit": commit, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, "body": body}
+        doc.update(override)
+        p.write_text(json.dumps({k: v for k, v in doc.items() if v is not ABSENT}), encoding="utf-8")
         import hashlib
         return hashlib.sha256(p.read_bytes()).hexdigest()
 
@@ -1897,6 +1901,49 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn(" BATCH_ERROR batch=1 ", log)
         [b] = self.batches()
         self.assertEqual(b["endReason"], "BATCH_ERROR")
+
+    def test_r5_adv_a1_a_throw_after_a_leg_ran_does_not_record_that_leg_as_not_run(self) -> None:
+        # adversary r5 A1: the new batch catch left the leg whose child had completed (its output file could not be written) in pending, and the summary then said
+        # NOT_RUN for a leg that ran. The leg is recorded LEG_FAILED / reason BATCH_ERROR (its result is unknown); only the legs never started are NOT_RUN.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "leg-01-fx-a-cpu-A-b01-a1.out.txt").mkdir()
+        a = self.commit_a
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "A", a)]))
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        self.assertEqual(len(self.leg_calls()), 1, "the first leg's child ran")
+        res = batch_result(r.stdout)
+        self.assertEqual([(l["name"], l["status"]) for l in res["legs"]], [("01-fx-a-cpu-A", "LEG_FAILED"), ("02-fx-b-cpu-A", "NOT_RUN")], res["legs"])
+        self.assertEqual((res["ran"], res["failed"], res["notRun"], res["stopReason"]), (0, 1, 1, "BATCH_ERROR"))
+        self.assertEqual(res["legs"][0]["reason"], "BATCH_ERROR")
+        [b] = self.batches()
+        self.assertEqual([(l["name"], l["status"]) for l in b["legs"]], [("01-fx-a-cpu-A", "LEG_FAILED")])
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_r5_adv_a2_a_staged_build_the_leg_job_would_reject_is_refused_before_the_claim_and_the_lease(self) -> None:
+        # adversary r5 A2: preflight read the staged manifest's sha256 only. The leg job's validator (Assert-AttrCudaBuildManifest) also needs the manifest to declare
+        # the same sourceCommit, a well-formed dllPairManifestSha256 and a boolean pendingSymbolPresence, so a hash-matching manifest that fails any of them opened a lease first.
+        a, c = self.commit_a, "3" * 40
+        cases = {
+            "declares another commit": {"sourceCommit": "4" * 40},
+            "no sourceCommit": {"sourceCommit": ABSENT},
+            "no dllPairManifestSha256": {"dllPairManifestSha256": ABSENT},
+            "dllPairManifestSha256 malformed": {"dllPairManifestSha256": "xyz"},
+            "no pendingSymbolPresence": {"pendingSymbolPresence": ABSENT},
+            "pendingSymbolPresence is a string": {"pendingSymbolPresence": "false"},
+        }
+        for label, override in cases.items():
+            with self.subTest(case=label):
+                manifest = self.stage(c, "bad build", **override)
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_MANIFEST_MISMATCH item=2 ")
+
+    def test_r5_adv_a2_a_staged_build_that_is_not_json_is_refused(self) -> None:
+        c = "3" * 40
+        cache = self.share / "cache"
+        p = cache / f"playback-attr-3-cuda-{c[:12]}-build.json"
+        p.write_text("this is not json", encoding="utf-8")
+        import hashlib
+        manifest = hashlib.sha256(p.read_bytes()).hexdigest()
+        self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_MANIFEST_MISMATCH item=2 ")
 
     def test_r5_h2_the_interleave_helper_keeps_an_array_valued_item_whole(self) -> None:
         # key3 H2 (sol): the bare Dequeue() output was enumerated, so one array-valued item came back as its elements.

@@ -599,18 +599,45 @@ function Get-VenueStagedBuildManifest {
     .SYNOPSIS
     The sha256 of the build manifest already staged on a venue (<AgentShare>\cache\playback-attr-3-cuda-<sha12>-build.json, the file Invoke-VenueLeg hashes), read
     on a worker thread and given up after -TimeoutSec (a UNC path of a host that is down can block a Test-Path for minutes). Never stages anything.
+    r5 (adversary A2): the same read also reports what the leg job's own validator (Assert-AttrCudaBuildManifest) needs INSIDE the file: it parses, it declares
+    -SourceCommit, its dllPairManifestSha256 is 64 hex and its pendingSymbolPresence is a boolean. contentProblem says which fails ('' = none; $null = not checked,
+    which is what an offline -ProbeScript that returns only a hash gets).
     .OUTPUTS
-    [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error }
+    [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
     param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][int]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null)
     $path = $AgentShare.TrimEnd('\') + '\cache\playback-attr-3-cuda-' + $SourceCommit.Substring(0, 12) + '-build.json'
     # -ProbeScript is the offline test seam for a read that never answers; production passes none.
-    $read = $(if ($null -ne $ProbeScript) { $ProbeScript } else { { param($p) if (Test-Path -LiteralPath $p -PathType Leaf) { (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' } } })
+    $read = $(if ($null -ne $ProbeScript) { $ProbeScript } else {
+            {
+                param($p)
+                if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return '' }
+                (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant()
+                $m = try { [IO.File]::ReadAllText($p) | ConvertFrom-Json } catch { $null }
+                if ($null -eq $m) { 'UNPARSEABLE'; return }
+                $c = $m.PSObject.Properties['sourceCommit']; 'C:' + $(if ($null -eq $c) { '' } else { [string]$c.Value })
+                $d = $m.PSObject.Properties['dllPairManifestSha256']; 'D:' + $(if ($null -eq $d) { '' } else { ([string]$d.Value).ToLowerInvariant() })
+                $s = $m.PSObject.Properties['pendingSymbolPresence']; 'S:' + $(if ($null -ne $s -and $s.Value -is [bool]) { 'bool' } else { 'bad' })
+            } })
     $r = Invoke-VenueBoundedRead -ScriptText $read.ToString() -Argument $path -TimeoutSec $TimeoutSec
-    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error } }
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
     $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })
-    if ($sha -cmatch '^[0-9a-f]{64}$') { return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null } }
-    [pscustomobject]@{ state = 'NOT_STAGED'; sha256 = $null; path = $path; error = $null }
+    if ($sha -cmatch '^[0-9a-f]{64}$') {
+        $problem = $null
+        if ($r.value.Count -gt 1) {
+            $facts = @($r.value | Select-Object -Skip 1 | ForEach-Object { [string]$_ })
+            $commit = @($facts | Where-Object { $_.StartsWith('C:') }) | Select-Object -First 1
+            $dll = @($facts | Where-Object { $_.StartsWith('D:') }) | Select-Object -First 1
+            $sym = @($facts | Where-Object { $_.StartsWith('S:') }) | Select-Object -First 1
+            $problem = $(if ($facts -contains 'UNPARSEABLE') { 'ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE the staged manifest is not JSON' }
+                elseif ($commit.Substring(2) -ne $SourceCommit) { "ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH the staged manifest declares '$($commit.Substring(2))', expected '$SourceCommit'" }
+                elseif ($dll.Substring(2) -notmatch '^[0-9a-f]{64}$') { "ATTRCUDA_BUILD_MANIFEST_DLLPAIR_UNBOUND the staged manifest carries no well-formed dllPairManifestSha256 (got '$($dll.Substring(2))')" }
+                elseif ($sym -ne 'S:bool') { 'ATTRCUDA_BUILD_MANIFEST_SYMBOL_PRESENCE_INVALID the staged manifest pendingSymbolPresence is not a boolean' }
+                else { '' })
+        }
+        return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null; contentProblem = $problem }
+    }
+    [pscustomobject]@{ state = 'NOT_STAGED'; sha256 = $null; path = $path; error = $null; contentProblem = $null }
 }
 
 $script:VenueAbandonedReads = 0
