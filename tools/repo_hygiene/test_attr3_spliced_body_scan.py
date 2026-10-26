@@ -1475,12 +1475,18 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
         "AbbrevMod": ("", "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -Mod (Join-Path $PSScriptRoot 'Clean.psm1')"),
         "AbbrevNa": ("", "Get-AttrCudaEmbeddedFunctionSource -Na '{name}'"),
         "SplatBound": ("", "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' @PSBoundParameters"),
+        # r9 adversary A1: a rename, move or copy on the variable: drive makes its NEW name a variable.
+        "AdvRenameVar": ("New-Variable -Name sourceRoute -Value '{dir}\\sub'\nRename-Item variable:sourceRoute PSScriptRoot -Force", PSR_CALL),
+        "AdvRenamePipe": ("Get-Item variable:sourceRoute | Rename-Item -NewName PSScriptRoot", PSR_CALL),
+        "AdvMoveComputed": ("Move-Item variable:sourceRoute $newName", PSR_CALL),
     }
     # Not unproven: an unrelated variable parameter, the default module, an exact common-parameter alias.
     CALL_CONTROLS = {
         "CtlPlain": ("$other = @{{ a = 1 }}\n'x' | Tee-Object -Variable keep | Out-Null", PSR_CALL, "Clean.psm1"),
         "CtlDefault": ("", DEF_CALL, "Extractor.psm1"),
         "CtlAlias": ("", "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -vb -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')", "Clean.psm1"),
+        # A file copy that names no variable and touches no variable: route.
+        "CtlCopyFile": ("Copy-Item 'C:\\fixture\\a.txt' 'C:\\fixture\\b.txt'", PSR_CALL, "Clean.psm1"),
     }
     # opus r8 B1 and rule 2 on an R5 receiver: a binder the origin model did not follow left the receiver 'literal'.
     BODIES = {
@@ -1495,9 +1501,20 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
         "B1Computed": "    param([string]$Target, [string]$n)\n    $r = @{}\n    Set-Variable -Name $n -Value (Get-Item $Target)\n    $r.Attributes = 1",
         "B1RemoveVar": "    $r = @{}\n    Remove-Variable -Name r\n    $r.Attributes = 1",
         "B1TeeVa": "    param([string]$Target)\n    $r = @{}\n    Get-Item $Target | Tee-Object -Va r | Out-Null\n    $r.Attributes = 1",
+        "B1RenameVar": "    $r = @{}\n    Rename-Item variable:other r\n    $r.Attributes = 1",
     }
     BODY_CONTROLS = {
         "B1CtlOther": "    $r = @{}\n    Set-Variable -Name other -Value 1\n    $r.a = 1",
+    }
+    # r9 adversary A2: an attribute on the assignment target (an ArgumentTransformationAttribute declared in the body) replaces the value.
+    ATTRIBUTED_BODIES = {
+        "A2Borrow": ("    class Borrow : System.Management.Automation.ArgumentTransformationAttribute {\n"
+                     "        [object] Transform([System.Management.Automation.EngineIntrinsics]$e, [object]$d) {\n"
+                     "            return (Get-Item -LiteralPath 'C:\\outside\\target.txt')\n"
+                     "        }\n"
+                     "    }\n"
+                     "    [Borrow()]$r = @{}\n"
+                     "    $r.Attributes = 1"),
     }
 
     @classmethod
@@ -1521,7 +1538,7 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
             preamble = pre.format(dirty=dirty, dir=d)
             generator.write_text((preamble + "\n" if preamble else "") + "$e = " + call.format(name=name) + "\n", encoding="utf-8")
             sources.append(generator)
-        bodies = {**cls.BODIES, **cls.BODY_CONTROLS}
+        bodies = {**cls.BODIES, **cls.BODY_CONTROLS, **cls.ATTRIBUTED_BODIES}
         (d / "Body.psm1").write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in bodies.items()), encoding="utf-8")
         body_gen = d / "gen-body.ps1"
         body_gen.write_text("$e = Get-AttrCudaEmbeddedFunctionSource -Name @(" + ", ".join(f"'{n}'" for n in bodies)
@@ -1534,8 +1551,14 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
         cls.template = d / "template-defaults.ps1"
         cls.template.write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$PSDefaultParameterValues['New-Item:Name'] = '..\\..\\escape'\n"
                                 "New-Item -ItemType Directory -Path $Work -Force | Out-Null\n", encoding="utf-8")
+        # r9 adversary A3 (advisory): a foreach variable replaces the value an assignment proved, for $Work as for a destination.
+        cls.foreach_templates = [d / "template-foreach-work.ps1", d / "template-foreach-dest.ps1"]
+        cls.foreach_templates[0].write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n"
+                                            "foreach ($Work in @('C:\\outside')) { New-Item -ItemType Directory -Path $Work -Force }\n", encoding="utf-8")
+        cls.foreach_templates[1].write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$dest = Join-Path $Work 'ok'\n"
+                                            "foreach ($dest in @('C:\\outside')) { New-Item -ItemType Directory -Path $dest -Force }\n", encoding="utf-8")
         modules = [d / "Extractor.psm1", d / "Clean.psm1", dirty, d / "Body.psm1", d / "Imported.psm1"]
-        cls.result = run_scan(templates=[cls.template], modules=modules, splice_sources=sources)
+        cls.result = run_scan(templates=[cls.template, *cls.foreach_templates], modules=modules, splice_sources=sources)
 
     def call_findings(self, name: str) -> list[dict]:
         return [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and f"'{name}'" in f["text"]]
@@ -1576,6 +1599,19 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
         self.assertEqual(len(module), 1, describe(self.result["splicedViolations"]))
         template = [v for v in self.result["violations"] if v["source"] == str(self.template) and v["rule"] == "unproven-binding"]
         self.assertEqual(len(template), 1, json.dumps(self.result["violations"], indent=2))
+
+    def test_r9_a2_an_attribute_on_the_assignment_target_makes_the_receiver_not_a_literal(self) -> None:
+        for name in self.ATTRIBUTED_BODIES:
+            found = [f for f in self.result["splicedViolations"] if f["function"] == name]
+            setters = [f for f in found if f["rule"] == "R5" and f["token"] == "$r.Attributes"]
+            self.assertEqual(len(setters), 1, describe(found))
+            self.assertIn("other", setters[0]["origin"].split(";"), describe(setters))
+            self.assertIn(("R5", "$r.Attributes"), SplicedBodyScanCoverageLimitTests.unlisted(found), f"{name}: the policy dropped the setter")
+
+    def test_r9_a3_a_foreach_variable_that_replaces_work_or_a_destination_is_not_provable(self) -> None:
+        for template in self.foreach_templates:
+            found = [v for v in self.result["violations"] if v["source"] == str(template) and v["rule"] == "R2"]
+            self.assertTrue([v for v in found if "destination is not provably under" in v["reason"]], json.dumps(self.result["violations"], indent=2))
 
 
 class SpliceInventoryCallShapeTests(unittest.TestCase):

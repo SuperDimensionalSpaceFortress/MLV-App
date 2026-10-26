@@ -672,6 +672,12 @@ function Get-AssignedObjectOrigin($Assignment) {
     foreach ($type in (Get-AssignmentConversionTypes $Assignment.Left)) {
         if ($literalTypes -notcontains $type) { return 'other' }
     }
+    # r9 adversary A2: an attribute on the target ([Borrow()]$r = @{}) is attached to the variable, and an
+    # ArgumentTransformationAttribute replaces the value assigned (a class in the body can return Get-Item's FileInfo), so a target that
+    # carries any attribute other than a conversion is not provably the literal on the right.
+    for ($left = $Assignment.Left; $left -is [System.Management.Automation.Language.AttributedExpressionAst]; $left = $left.Child) {
+        if ($left -isnot [System.Management.Automation.Language.ConvertExpressionAst]) { return 'other' }
+    }
     $node = $Assignment.Right
     while ($true) {
         if ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1) { $node = $node.PipelineElements[0]; continue }
@@ -915,6 +921,36 @@ function Get-VariableRouteBinding($Root, [string]$Name) {
                 $itemCommandName = $itemCommandName.Substring($itemCommandName.LastIndexOf('\') + 1).ToLowerInvariant()
                 $isItemCommand = $script:itemCommands -contains $itemCommandName
             }
+            # r9 adversary A1: a rename, move or copy on the variable: drive makes its NEW name a variable (`Rename-Item variable:x
+            # PSScriptRoot`), so the tail of the route is not the only name it binds. An operand naming the variable next to a route or
+            # a source the scan cannot read (an operand, or pipeline input), a route next to an operand the scan cannot read, or an
+            # operand built only from literals the scan cannot reduce, binds it (the same reading Get-ShadowKind gives function:).
+            if (@('rename-item', 'rni', 'ren', 'move-item', 'mi', 'move', 'mv', 'copy-item', 'cpi', 'copy', 'cp') -contains $itemCommandName) {
+                $routed = $false; $named = $false; $unreadable = $false; $fixedButUnread = $false
+                if ($n.Parent -is [System.Management.Automation.Language.PipelineAst] -and $n.Parent.PipelineElements.IndexOf($n) -gt 0) { $unreadable = $true }
+                foreach ($element in @($n.CommandElements | Select-Object -Skip 1)) {
+                    $operandRoot = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
+                    if ($null -eq $operandRoot) { continue }
+                    foreach ($operand in @(Expand-Operands $operandRoot)) {
+                        $constant = Get-ConstantString $operand
+                        if ($null -eq $constant) {
+                            if (Test-DataLiteralOperand $operand) { continue }
+                            $unreadable = $true
+                            # Fixed by the source text but unreadable here: it fails closed when its literal fragments, put together, can
+                            # spell the drive or the variable's name ('vari' + 'able:x', ('PSScript', 'Root') -join '').
+                            $fragments = -join @($operand.FindAll({ param($x) $x -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value })
+                            if ((Test-BuiltFromLiteralsOnly $operand) -and ($fragments -match '(?i)variable' -or $fragments.IndexOf($Name, [StringComparison]::OrdinalIgnoreCase) -ge 0)) { $fixedButUnread = $true }
+                            continue
+                        }
+                        if ($constant -match $script:variableRoute) { $routed = $true }
+                        # A function: / alias: path names a command, never a variable.
+                        elseif ($constant -notmatch $script:providerRoutePattern -and (Test-NameMatchesPattern $Name ($constant -replace '^[A-Za-z]+:', ''))) { $named = $true }
+                    }
+                }
+                if ($fixedButUnread -or ($routed -and ($named -or $unreadable)) -or ($named -and $unreadable)) {
+                    return "$itemCommandName on the variable: drive (a new name that is, or could be, $Name)"
+                }
+            }
             foreach ($element in @($n.CommandElements | Select-Object -Skip 1)) {
                 $operandRoot = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
                 if ($null -eq $operandRoot) { continue }
@@ -1025,6 +1061,10 @@ function Test-Provable($Ast, $Root, $Visiting) {
         $v = Get-VariableName $Ast
         if ($v.scope -ne '') { return $false }
         if ($v.name -eq 'null') { return $true }
+        # r9 adversary A3 (advisory, same class): a foreach variable, a multi-target assignment, [ref], a variable parameter or a variable
+        # route replaces the value an assignment proved (`foreach ($dest in @('C:\outside'))`), for $Work as for any destination. A
+        # parameter of a nested function binds only inside it and is not counted here.
+        if (@(Get-OtherBindings $Root $v.name | Where-Object { $_ -ne 'unbound' }).Count -gt 0 -or (Get-VariableRouteBinding $Root $v.name)) { return $false }
         if ($v.name -ceq 'Work') { return $true }   # R5 separately proves $Work's single canonical assignment
         if (-not $Visiting.Add($v.name.ToLowerInvariant())) { return $false }
         try {
