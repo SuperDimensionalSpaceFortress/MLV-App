@@ -2011,7 +2011,8 @@ function Test-LeaseLocalFixedPath {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1 r4 (Dot B4; adversary r4-6abf870f A3). Whether a path the lease wait's LOGGING touches synchronously is on a
     # local fixed disk: fully qualified, a drive letter, DriveType Fixed, and no reparse point (junction, symlink, mount) on the way to it, each
     # component checked from the root down without following one. A component that does not exist ends the walk (an access then fails fast).
-    # -LeafLinkOk allows the last component itself to be a link (python.exe may be an app-execution alias). Never throws: an error is $false.
+    # -LeafLinkOk allows the last component itself to be an app-execution alias (python.exe may be one); a leaf symlink is followed one hop and its target
+    # checked without -LeafLinkOk. Never throws: an error is $false.
     param([AllowNull()][AllowEmptyString()][string]$Path, [switch]$LeafLinkOk)
     try {
         if (-not [System.IO.Path]::IsPathFullyQualified([string]$Path)) { return $false }
@@ -2023,7 +2024,12 @@ function Test-LeaseLocalFixedPath {
             $cur = [System.IO.Path]::Combine($cur, $segs[$i])
             try { $attr = [System.IO.File]::GetAttributes($cur) }
             catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { return $true }
-            if (($attr -band [System.IO.FileAttributes]::ReparsePoint) -and -not ($LeafLinkOk -and $i -eq $segs.Count - 1)) { return $false }
+            if (-not ($attr -band [System.IO.FileAttributes]::ReparsePoint)) { continue }
+            if (-not $LeafLinkOk -or $i -ne $segs.Count - 1) { return $false }
+            # adversary r4-52d0e792 A1: a leaf symlink is followed ONE hop (its reparse data is read locally) and its target must pass without links;
+            # an app-execution alias has no link target and stays allowed.
+            $tgt = [System.IO.File]::ResolveLinkTarget($cur, $false)
+            if ($null -ne $tgt) { return (Test-LeaseLocalFixedPath -Path $tgt.FullName) }
         }
         return $true
     }
@@ -2061,7 +2067,16 @@ function Get-LeaseSnapshotHeadroomSec {
     param($Verdict, $Lease = $null, [double]$QueueLeftSec = [double]::PositiveInfinity)
     $left = $QueueLeftSec
     try {
-        if ($null -ne $Verdict -and $Verdict.state -eq "open" -and $null -ne $Verdict.remainingSec) { $left = [Math]::Min($left, [double]$Verdict.remainingSec) }
+        # adversary r4-52d0e792 A3: remainingSec was sampled with the verdict; the absolute notAfterUtc is re-read against the clock NOW, so steps
+        # since the verdict (the request's start, the grant's feed read and log lines) are counted. The lesser of the two is used.
+        if ($null -ne $Verdict -and $Verdict.state -eq "open" -and $null -ne $Verdict.remainingSec) {
+            $left = [Math]::Min($left, [double]$Verdict.remainingSec)
+            if ($null -ne $Verdict.notAfterUtc) {
+                $na = ConvertTo-UtcDateTime $Verdict.notAfterUtc
+                if ($null -eq $na) { return 0.0 }
+                $left = [Math]::Min($left, ($na - [DateTime]::UtcNow).TotalSeconds)
+            }
+        }
         if ($null -ne $Verdict -and $Verdict.livenessState -eq "live" -and $null -ne $Verdict.livenessUntilUtc) {
             $lu = ConvertTo-UtcDateTime $Verdict.livenessUntilUtc   # never a [string] cast then Parse (AGENT-TIMESTAMP-PARSE-TZ-1's pin)
             if ($null -eq $lu) { return 0.0 }
@@ -2126,7 +2141,9 @@ function Add-LeaseSlotSnapshot {
         }
         # adversary r4-6abf870f A3: Start-HeavySlotCli checks python and heavy-slot.py synchronously, before the probe's bound exists, so a probe
         # whose script or configured interpreter is not on a local fixed disk (Test-LeaseLocalFixedPath) is not started.
-        if (-not (Test-LeaseLocalFixedPath -Path $HeavySlotScript -LeafLinkOk) -or -not (Test-LeaseLocalFixedPath -Path $HeavySlotPython -LeafLinkOk)) {
+        # adversary r4-52d0e792 A1: heavy-slot.py takes no leaf link at all, and the configured python must exist (Resolve-HeavySlotPython would otherwise
+        # search PATH, whose entries are not checked).
+        if (-not (Test-LeaseLocalFixedPath -Path $HeavySlotScript) -or -not (Test-LeaseLocalFixedPath -Path $HeavySlotPython -LeafLinkOk) -or -not (Test-Path -LiteralPath $HeavySlotPython -PathType Leaf)) {
             Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=skipped(heavy-slot.py or its python is not on a local fixed disk)"
             return
         }
@@ -3587,7 +3604,7 @@ function Wait-QuietLeaseAdmission {
             # r3 (Dot B1): the probe is only started here; this loop polls it below and never waits on it, so the re-ask schedule is the base one.
             if (-not $snapshotRequestDone -and $requests -ge 1) {
                 $snapshotRequestDone = $true
-                Add-LeaseSlotSnapshot -JobId $JobId -Phase "request" -WaitedSec ((Get-Date) - $t0).TotalSeconds -HeadroomSec (Get-LeaseSnapshotHeadroomSec -Verdict $v -QueueLeftSec $(if ($maxAge -gt 0) { [double]$maxAge - [double]$age } else { [double]::PositiveInfinity }))
+                Add-LeaseSlotSnapshot -JobId $JobId -Phase "request" -WaitedSec ((Get-Date) - $t0).TotalSeconds -HeadroomSec (Get-LeaseSnapshotHeadroomSec -Verdict $v -QueueLeftSec $(if ($maxAge -gt 0) { [double]$maxAge - [double](Get-QueueAgeSeconds -Job $Job -Metadata $Metadata) } else { [double]::PositiveInfinity }))   # r4 (adversary A3): the age NOW, after the request started
             }
             if ($null -ne $lease) {
                 $u = Update-QuietLeaseRequest -Lease $lease

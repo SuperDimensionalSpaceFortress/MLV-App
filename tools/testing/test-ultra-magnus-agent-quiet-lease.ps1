@@ -2600,6 +2600,31 @@ function Exit-HeavySlot {
             finally { $script:LeaseSlotSnapshots = $savedSnaps }
             Assert-True ($wNone -eq 5000 -and $wNear -ge 1 -and $wNear -le 500 -and $wPast -eq 1) "heat-trace A2(r4): the wait is capped at the earliest bound: none=$wNone near(29.5 s)=$wNear past=$wPast"
             Assert-True ($agentText.Contains('Start-Sleep -Milliseconds (Get-LeaseSlotSnapshotWaitMs -MaxMs $script:GateLoopSleepMs)') -and $agentText.Contains('$remainingMs = Get-LeaseSlotSnapshotWaitMs -MaxMs $remainingMs')) "heat-trace A2(r4): the wait loop's sleep and the job monitor loop's slice are both capped by it"
+            # adversary r4-52d0e792 A1: a heavy-slot.py that is a leaf symlink (here to a missing UNC target) and a configured python that does not
+            # exist (Resolve-HeavySlotPython would search PATH) start no probe either. The symlink half needs the right to create one; without it,
+            # that half is recorded as not run.
+            $cliReal = ${function:Start-HeavySlotCli}
+            $script:CliCalls = 0
+            function Start-HeavySlotCli { param([string[]]$Arguments) $script:CliCalls++; return [pscustomobject]@{ ok = $false; why = 'stub: not started' } }
+            $lnk = Join-Path $fx 'heavy-slot-link.py'
+            $symlinkRan = $false
+            try {
+                try { New-Item -ItemType SymbolicLink -Path $lnk -Target '\\heat-trace-unc.invalid\share\heavy-slot.py' -ErrorAction Stop | Out-Null; $symlinkRan = $true } catch { }
+                if ($symlinkRan) { $HeavySlotScript = $lnk; Add-LeaseSlotSnapshot -JobId 'jHtS3' -Phase 'grant'; $HeavySlotScript = $savedScript }
+                $HeavySlotPython = Join-Path $fx 'no-such-python.exe'
+                Add-LeaseSlotSnapshot -JobId 'jHtS4' -Phase 'request'
+            }
+            finally {
+                $HeavySlotScript = $savedScript; $HeavySlotPython = $savedPy; Set-Item -LiteralPath Function:\Start-HeavySlotCli -Value $cliReal
+                if (Test-Path -LiteralPath $lnk) { [IO.File]::Delete($lnk) }   # the link only
+            }
+            $sS2 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtS3 *' -or $_ -like 'quiet-lease: slots-snapshot job=jHtS4 *' })
+            Assert-True ($script:CliCalls -eq 0 -and $sS2.Count -eq $(if ($symlinkRan) { 2 } else { 1 }) -and @($sS2 | Where-Object { $_ -notmatch ' slots=skipped\(heavy-slot\.py or its python is not on a local fixed disk\)$' }).Count -eq 0) "heat-trace A1(r4b): a symlinked heavy-slot.py (ran=$symlinkRan) and a missing configured python start no probe: cli=$($script:CliCalls) $($sS2 -join ' || ')"
+            # adversary r4-52d0e792 A3: the headroom reads the absolute notAfterUtc against the clock now, not only the remainingSec sampled with the verdict.
+            $hStale = Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 75; notAfterUtc = [DateTime]::UtcNow.AddSeconds(25).ToString('o') })
+            $hBad = Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 75; notAfterUtc = 'not a date' })
+            Assert-True ($hStale -le 26 -and $hStale -gt 20 -and $hBad -eq 0) "heat-trace A3(r4b): a verdict sampled 50 s ago (remainingSec 75, notAfterUtc now+25 s) is ~25 s of headroom, an unreadable one none: stale=$hStale bad=$hBad"
+            Assert-True ($agentText.Contains('[double]$maxAge - [double](Get-QueueAgeSeconds -Job $Job -Metadata $Metadata) } else { [double]::PositiveInfinity }))   # r4 (adversary A3)')) "heat-trace A3(r4b): the request snapshot's queue headroom is the age read after the request started"
             # adversary r4-6abf870f A4 (advisory, fixed in scope): a held field past Int32 is read, one past Int64 is unknown; neither throws.
             $hBig = $null; $hHuge = $null; $hErr = $null
             try { $hBig = ConvertFrom-HeavySlotHolderText -Text 'suite (pid 77, held 2147483648 min)'; $hHuge = ConvertFrom-HeavySlotHolderText -Text 'suite (pid 77, held 99999999999999999999 min)' } catch { $hErr = $_.Exception.Message }
