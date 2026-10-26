@@ -3,6 +3,7 @@
 The guard itself is tools/profiling/test-um-ssh-stdin-bound.ps1 (a fake remote, no host contact).
 um-ssh.ps1 is Windows-only (ssh.exe, taskkill), so this wrapper skips elsewhere.
 """
+import math
 import os
 import shutil
 import stat
@@ -80,16 +81,25 @@ def _rmtree_clearing_readonly(path):
         shutil.rmtree(path, onerror=clear)
 
 
+def _check_remove_deadline(deadline):
+    """Sol B1: a nan or infinite deadline never expires and a negative one is meaningless, so refuse them by name."""
+    if not (math.isfinite(deadline) and deadline >= 0):
+        raise ValueError("deadline must be a finite number of seconds >= 0, got %r" % (deadline,))
+
+
 def _remove_tree_bounded(path, deadline=FIXTURE_TMP_REMOVE_DEADLINE):
     """UM-SSH-FIXTURE-DIAG-PRESERVE-1: remove path, retrying for up to deadline s (a dying child may still hold a file).
 
-    Returns "" when the dir is gone, else a one-line note naming the last error.
+    Returns "" when the dir is gone, else a one-line note naming the last error. The deadline bounds the retries:
+    one rmtree call cannot be interrupted, and a dir confirmed gone has nothing to report, so a removal that
+    succeeds after the deadline is still "" (sol B1).
     """
+    _check_remove_deadline(deadline)
     end = time.monotonic() + deadline
     while True:
         try:
             _rmtree_clearing_readonly(path)
-            last = OSError("shutil.rmtree returned but the directory is still present")
+            last = None
         except OSError as exc:
             last = exc
         # Adversary A1: rmtree returning is not proof (its error callback can retry only the first lstat and then
@@ -99,8 +109,10 @@ def _remove_tree_bounded(path, deadline=FIXTURE_TMP_REMOVE_DEADLINE):
             os.stat(path)
         except FileNotFoundError:
             return ""
-        except OSError:
-            pass
+        except OSError as exc:
+            last = exc  # Sol B3: the stat error is the newest word; never claim "still present" when stat failed.
+        else:
+            last = last or OSError("shutil.rmtree returned but the directory is still present")
         if time.monotonic() >= end:
             return "temp dir %s was not removed within %d s: %s: %s" % (path, deadline, type(last).__name__, last)
         time.sleep(0.25)
@@ -116,6 +128,7 @@ class _FixtureTmp:
     """
 
     def __init__(self, deadline=FIXTURE_TMP_REMOVE_DEADLINE, remove=_remove_tree_bounded):
+        _check_remove_deadline(deadline)
         self._deadline = deadline
         self._remove = remove
         self.path = None
@@ -125,7 +138,11 @@ class _FixtureTmp:
         return self.path
 
     def __exit__(self, exc_type, exc, tb):
-        note = self._remove(self.path, self._deadline)
+        # Sol B2: a remover that raises must not replace the failure in flight; its exception becomes the note.
+        try:
+            note = self._remove(self.path, self._deadline)
+        except Exception as removal_error:
+            note = "temp dir %s removal raised %s: %s" % (self.path, type(removal_error).__name__, removal_error)
         if not note:
             return False
         line = "[fixture cleanup] " + note
@@ -597,6 +614,92 @@ class FixtureCleanupBoundTests(unittest.TestCase):
             shutil.rmtree(path, ignore_errors=True)
         self.assertIn("was not removed", note)
         self.assertIn("PermissionError", note)
+
+    # ---- sol r1 B1-B3 ---------------------------------------------------------------------------------
+
+    def test_a_deadline_that_is_not_a_finite_non_negative_number_is_refused_up_front(self):
+        """Sol B1: nan and inf never expire, so a locked dir would retry forever. Refuse them, in the helper and the fixture."""
+        for bad in (float("nan"), float("inf"), float("-inf"), -1):
+            with self.subTest(deadline=bad):
+                with self.assertRaises(ValueError) as helper:
+                    _remove_tree_bounded("no-such-dir", deadline=bad)
+                self.assertIn("deadline", str(helper.exception))
+                with self.assertRaises(ValueError) as fixture:
+                    _FixtureTmp(deadline=bad)
+                self.assertIn("deadline", str(fixture.exception))
+
+    def test_a_removal_that_succeeds_after_the_deadline_is_still_a_success(self):
+        """Sol B1: the deadline bounds RETRIES. One rmtree call cannot be interrupted, and a dir that is confirmed
+        gone has nothing left to report, so a slow success is a success (failing it would turn a clean teardown into noise)."""
+        from unittest import mock
+
+        now = [0.0]
+
+        def slow_rmtree(target, **kwargs):
+            now[0] = 20.0
+
+        def gone(target, *args, **kwargs):
+            raise FileNotFoundError(2, "gone", target)
+
+        with mock.patch.object(time, "monotonic", lambda: now[0]), mock.patch.object(shutil, "rmtree", slow_rmtree), \
+                mock.patch.object(os, "stat", gone):
+            self.assertEqual(_remove_tree_bounded("slow-dir", deadline=10), "")
+
+    def test_a_remover_that_raises_is_annotated_onto_the_failure_in_flight(self):
+        """Sol B2: a raising remover must not replace the guard output; its exception becomes the cleanup note."""
+        def raising_remove(path, deadline):
+            raise PermissionError("REMOVE-RAISED")
+
+        with self.assertRaises(AssertionError) as caught:
+            with _FixtureTmp(remove=raising_remove) as tmp:
+                raise AssertionError("GUARD-OUTPUT-MARKER")
+        message = str(caught.exception)
+        self.assertIn("GUARD-OUTPUT-MARKER", message)
+        self.assertIn("[fixture cleanup]", message)
+        self.assertIn("REMOVE-RAISED", message)
+        self.assertNotIsInstance(caught.exception, PermissionError)
+        shutil.rmtree(tmp)
+
+    def test_a_remover_that_raises_after_a_passing_body_fails_with_the_cleanup_error(self):
+        def raising_remove(path, deadline):
+            raise PermissionError("REMOVE-RAISED")
+
+        with self.assertRaises(AssertionError) as caught:
+            with _FixtureTmp(remove=raising_remove) as tmp:
+                pass
+        self.assertIn("[fixture cleanup]", str(caught.exception))
+        self.assertIn("REMOVE-RAISED", str(caught.exception))
+        shutil.rmtree(tmp)
+
+    def test_a_remover_that_raises_is_chained_with_a_non_assertion_failure(self):
+        def raising_remove(path, deadline):
+            raise PermissionError("REMOVE-RAISED")
+
+        with self.assertRaises(AssertionError) as caught:
+            with _FixtureTmp(remove=raising_remove) as tmp:
+                raise subprocess.TimeoutExpired("guard", 5)
+        self.assertIn("REMOVE-RAISED", str(caught.exception))
+        self.assertIn("TimeoutExpired", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, subprocess.TimeoutExpired)
+        shutil.rmtree(tmp)
+
+    def test_a_stat_error_after_rmtree_returns_is_the_reported_last_error(self):
+        """Sol B3: when the final stat is what failed, the note names that error and never claims the dir is present."""
+        from unittest import mock
+
+        path = tempfile.mkdtemp(prefix="um-ssh-fixture-")
+
+        def denied(target, *args, **kwargs):
+            raise PermissionError(13, "STAT-ACCESS-DENIED", target)
+
+        try:
+            with mock.patch.object(shutil, "rmtree", lambda target, **kwargs: None), mock.patch.object(os, "stat", denied):
+                note = _remove_tree_bounded(path, deadline=0)
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+        self.assertIn("was not removed", note)
+        self.assertIn("STAT-ACCESS-DENIED", note)
+        self.assertNotIn("still present", note)
 
     @unittest.skipUnless(sys.platform == "win32", "an open file blocks directory removal on Windows only")
     def test_an_open_handle_at_teardown_keeps_the_guard_diagnostic(self):
