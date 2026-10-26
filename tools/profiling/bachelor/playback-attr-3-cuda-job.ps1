@@ -4197,8 +4197,9 @@ function Edit-DualVenueTemplate([string]$Text, [string]$Old, [string]$New) {
 # the same definitions from this file by AST and feeds them fixtures.
 
 # '0x' + 1..5 hex digits, non-zero -> [int64]. Throws CORE_PARTITION_MASK_FORMAT / CORE_PARTITION_MASK_ZERO.
+# `\z`, not `$`: .NET `$` also matches before a final LF, and "0x00FFF`n" would then reach ToInt64's untyped FormatException (sol r2 A6).
 function ConvertFrom-CorePartitionMask([string]$Mask, [string]$Label) {
-    if ($Mask -notmatch '^0x[0-9A-Fa-f]{1,5}$') { throw "CORE_PARTITION_MASK_FORMAT -$Label '$Mask' is not 0x followed by 1 to 5 hex digits" }
+    if ($Mask -notmatch '^0x[0-9A-Fa-f]{1,5}\z') { throw "CORE_PARTITION_MASK_FORMAT -$Label '$Mask' is not 0x followed by 1 to 5 hex digits" }
     $v = [Convert]::ToInt64($Mask.Substring(2), 16)
     if ($v -eq 0) { throw "CORE_PARTITION_MASK_ZERO -$Label is zero" }
     $v

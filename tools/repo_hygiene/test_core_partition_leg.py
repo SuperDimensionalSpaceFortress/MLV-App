@@ -75,6 +75,14 @@ REFUSALS = {
     "CORE_PARTITION_NEEDS_HELPER_MASK": ["-CorePartitionTelemetry"],
     "CORE_PARTITION_HELPER_OVERLAP": ["-CorePartitionTelemetry", "-CorePartitionHelperMask", "0x01F00", "-BenchAffinityMask", "0x00FFF"],
 }
+# sol r2 (A6): a mask ending in LF slipped past the `$`-anchored format check (.NET `$` matches before a final LF) and reached the untyped converter
+# throw; each of the three mask fields must get the typed CORE_PARTITION_MASK_FORMAT refusal for a trailing LF, a trailing CRLF and a doubled LF.
+EOL_SUFFIXES = {"lf": "\n", "crlf": "\r\n", "lflf": "\n\n"}
+EOL_FIELDS = {
+    "BenchAffinityMask": lambda v: [*HELPER, "-BenchAffinityMask", "0x00FFF" + v],
+    "PartitionLoadMask": lambda v: [*HELPER, "-BenchAffinityMask", "0x00FFF", "-PartitionLoadMask", "0xFF000" + v, "-PartitionLoadThreads", "8"],
+    "CorePartitionHelperMask": lambda v: ["-CorePartitionTelemetry", "-CorePartitionHelperMask", "0xFF000" + v],
+}
 SCALAR_NAMES = ["corePartitionTelemetry", "corePartitionTopologyOk", "appAffinityObserved", "benchAffinityRequested", "benchAffinityApplied", "partitionLoadMask",
                 "partitionLoadThreads", "partitionLoadApplied", "partitionLoadGBps", "pkgWattsMean", "pkgWattsMax", "pkgTempCMean", "pkgTempCMax", "pkgThrottledRows",
                 "pkgTempCAtStart", "pcoreMHzMean", "ecoreMHzMean", "pcoreParkedSampleFraction", "playbackWorkerThreads", "corePartitionNullReasons"]
@@ -220,6 +228,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         if cls.base_available:
             requests += [("base-default", cls.base_generator, []), ("base-shape", cls.base_generator, SHAPE)]
         requests += [(f"refuse-{n}", GENERATOR, extra) for n, extra in enumerate(REFUSALS.values())]
+        requests += [(f"eol-{field}-{eol}", GENERATOR, build(suffix)) for field, build in EOL_FIELDS.items() for eol, suffix in EOL_SUFFIXES.items()]
         commands = []
         cls.out = {}
         for key, script, extra in requests:
@@ -253,6 +262,17 @@ class CorePartitionGeneratorTests(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0, "the generator accepted a bad core-partition combination")
                 self.assertIn(code.strip() + " ", proc.stdout + proc.stderr)
                 self.assertFalse(self.out[f"refuse-{n}"].exists(), "a refused generation wrote a job")
+
+    def test_a_trailing_line_ending_on_any_mask_is_the_typed_format_refusal_not_a_converter_throw(self) -> None:
+        for field in EOL_FIELDS:
+            for eol in EOL_SUFFIXES:
+                with self.subTest(field=field, eol=eol):
+                    proc = self.proc[f"eol-{field}-{eol}"]
+                    text = proc.stdout + proc.stderr
+                    self.assertNotEqual(proc.returncode, 0, "the generator accepted a mask with a trailing line ending")
+                    self.assertIn("CORE_PARTITION_MASK_FORMAT ", text)
+                    self.assertIn(f"-{field} ", text)
+                    self.assertFalse(self.out[f"eol-{field}-{eol}"].exists(), "a refused generation wrote a job")
 
     def test_the_regions_exist_only_with_telemetry_and_strip_back_to_the_plain_job(self) -> None:
         for key in ("default", "shape"):
@@ -373,6 +393,7 @@ foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Lan
 FIXTURES = r"""
 $r = [ordered]@{}
 $r.mask = @((ConvertFrom-CorePartitionMask '0x00FFF' 'X'), (ConvertFrom-CorePartitionMask '0xfffff' 'X'), (Format-CorePartitionMask 4095), (Format-CorePartitionMask 1048575))
+$r.eol = @(foreach ($m in @("0x00FFF`n", "0x00FFF`r`n", "0x00FFF`n`n", "0x0`n")) { try { [void](ConvertFrom-CorePartitionMask $m 'X'); 'accepted' } catch { ([string]$_.Exception.Message -split '\s+')[0] } })
 $map = @{}; for ($i = 0; $i -lt 20; $i++) { $map["0,$i"] = $(if ($i -lt 12) { 1 } else { 0 }) }
 $ok = Test-CorePartitionMaskClass $map 4095 @(1044480, 1044480)
 $badBench = Test-CorePartitionMaskClass $map 8191 @(1044480)
@@ -472,6 +493,9 @@ class CorePartitionPureHelperTests(unittest.TestCase):
     def test_masks(self) -> None:
         self.assertEqual(self.r["mask"], [4095, 1048575, "0x00FFF", "0xFFFFF"])
 
+    def test_the_mask_converter_refuses_a_trailing_line_ending_typed(self) -> None:
+        self.assertEqual(self.r["eol"], ["CORE_PARTITION_MASK_FORMAT"] * 4)
+
     def test_topology_class_check(self) -> None:
         t = self.r["topo"]
         self.assertEqual(t[:3], [True, 4095, 1044480])
@@ -562,6 +586,40 @@ class CorePartitionRunnerMappingTests(RunnerHarness, unittest.TestCase):
         self.assertEqual((fields.get("BenchAffinityMask"), fields.get("PartitionLoadMask"), fields.get("PartitionLoadThreads"),
                           fields.get("CorePartitionTelemetry"), fields.get("CorePartitionHelperMask")), ("0x00FFF", "0xFF000", "8", "True", "0xFF000"))
 
+    def run_validating_leg(self, args: dict, leg: str) -> dict:
+        """The full runner path (Invoke-VenueLeg -> generator -> leg receipt) with the REAL mask validator: the stub generator lifts
+        Assert-CorePartitionArgs from the shipped generator by AST and runs it on the arguments the runner mapped."""
+        lift = ("$ast = [System.Management.Automation.Language.Parser]::ParseFile('" + str(GENERATOR) + "', [ref]$null, [ref]$null)\n"
+                "foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -like '*CorePartition*' }, $false)) "
+                "{ . ([scriptblock]::Create($f.Extent.Text)) }\n"
+                "[void](Assert-CorePartitionArgs $BenchAffinityMask $PartitionLoadMask ([int]$PartitionLoadThreads) ([bool]$CorePartitionTelemetry) $CorePartitionHelperMask)\n")
+        anchor = "if ($cfg.genRefusal) { throw $cfg.genRefusal }\n"
+        self.assertEqual(CP_STUB_GENERATOR.count(anchor), 1, "the stub generator's refusal line moved")
+        self.gen.write_text(CP_STUB_GENERATOR.replace(anchor, anchor + lift), encoding="utf-8")
+        proc, receipt, submitted = self.run_leg("bachelor", self.spec_with(args, leg))
+        self.assertIsNotNone(receipt, proc.stdout[-2000:] + proc.stderr[-2000:])
+        self.assertEqual(submitted, [], "a refused generation submits nothing")
+        return receipt
+
+    def test_a_malformed_mask_is_a_typed_leg_refusal_not_a_runner_error(self) -> None:
+        # dot B3 (bus 9bdd4c4): CORE_PARTITION_* was missing from the runner's typed-refusal whitelist, so a correctly typed converter refusal was
+        # recorded as UNRESOLVED / RUNNER_ERROR; sol r2 (A6): a trailing LF used to skip the typed refusal for an untyped converter throw.
+        base = {"corePartitionTelemetry": True, "corePartitionHelperMask": "0xFF000", "benchAffinityMask": "0x00FFF", "partitionLoadMask": "0xFF000", "partitionLoadThreads": 8}
+        for key in ("benchAffinityMask", "partitionLoadMask", "corePartitionHelperMask"):
+            for eol, suffix in (("lf", "\n"), ("crlf", "\r\n"), ("none", "")):
+                with self.subTest(field=key, eol=eol):
+                    args = dict(base)
+                    args[key] = "FFF" if eol == "none" else base[key] + suffix   # only the mask under test is malformed, so the format check is the first refusal
+                    receipt = self.run_validating_leg(args, f"cp-{key}-{eol}")
+                    self.assertEqual(receipt["refusal"], "GENERATOR_REFUSED_CORE_PARTITION_MASK_FORMAT", receipt["outcomeDetail"])
+                    self.assertNotIn("RUNNER_ERROR", receipt["outcomeDetail"])
+                    self.assertNotIn(receipt["outcome"], ("PASS", "FAIL"))
+
+    def test_a_typed_non_format_core_partition_refusal_is_a_leg_refusal_too(self) -> None:
+        args = {"corePartitionTelemetry": True, "corePartitionHelperMask": "0xFF000", "benchAffinityMask": "0x00FFF", "partitionLoadMask": "0x00F00", "partitionLoadThreads": 8}
+        receipt = self.run_validating_leg(args, "cp-overlap")
+        self.assertEqual(receipt["refusal"], "GENERATOR_REFUSED_CORE_PARTITION_MASK_OVERLAP", receipt["outcomeDetail"])
+
     def test_absent_args_map_nothing(self) -> None:
         for args, leg in ((None, "cp-none"), ({"corePartitionTelemetry": False}, "cp-off")):
             with self.subTest(leg=leg):
@@ -621,6 +679,17 @@ class CorePartitionSpecTests(unittest.TestCase):
             broken["generatorArgs"].update(bad)
             with self.subTest(bad=bad), self.assertRaises(jsonschema.ValidationError):
                 jsonschema.validate(broken, self.schema)
+
+    def test_the_schema_refuses_a_mask_with_a_trailing_line_ending(self) -> None:
+        # sol r2 (A6): jsonschema searches with Python's re, where `$` also matches before a final LF, so "0x00FFF\n" validated.
+        import jsonschema
+        spec = self.load("b2")
+        for key in ("benchAffinityMask", "partitionLoadMask", "corePartitionHelperMask"):
+            for eol in ("\n", "\r\n", "\n\n"):
+                broken = json.loads(json.dumps(spec))
+                broken["generatorArgs"][key] = spec["generatorArgs"][key] + eol
+                with self.subTest(field=key, eol=eol), self.assertRaises(jsonschema.ValidationError):
+                    jsonschema.validate(broken, self.schema)
 
 
 if __name__ == "__main__":

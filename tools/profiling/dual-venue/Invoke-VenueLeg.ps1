@@ -495,7 +495,8 @@ try {
         # receipt, recorded as its TOKEN only (a message may echo a value). Anything untyped is a runner error.
         $first = ([string]$_.Exception.Message -split '\s+')[0]
         # ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING (CPU-LEG-SMOKE-CEILING-1): an input too large for a bounded leg at the measured read rate is a typed refusal, not a runner error.
-        if ($first -match '^((PLAYBACK_ATTR3|DUAL_VENUE)_[A-Z0-9_]+|ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING)$') { Stop-Refused "GENERATOR_REFUSED_$first" }
+        # BACHELOR-CORE-PARTITION-AB-1: the generator's CORE_PARTITION_* mask / combination refusals are typed too (dot B3).
+        if ($first -match '^((PLAYBACK_ATTR3|DUAL_VENUE|CORE_PARTITION)_[A-Z0-9_]+|ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING)$') { Stop-Refused "GENERATOR_REFUSED_$first" }
         throw
     }
     $generated = $genOut[-1]
