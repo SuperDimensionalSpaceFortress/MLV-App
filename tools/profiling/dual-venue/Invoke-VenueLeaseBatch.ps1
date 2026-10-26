@@ -246,18 +246,73 @@ $script:RunDirOutputLeafPatterns = @(
 )
 $script:RunDirOutputDirs = @('batch-jobs', 'quiet')   # the agent job files; Wait-VenueQuiet -WorkDir
 
+function Get-PhysicalPath([string]$Path) {
+    # r10 (adversary r9 A1): the path the file system opens for $Path, every junction, symlink, subst and 8.3 spelling resolved (GetFinalPathNameByHandle), so two spellings
+    # of one file compare equal. THE one resolver of every comparison below. Throws when the path cannot be opened (the caller refuses: an unknown location is not a safe one).
+    if (-not ('VenueLeaseBatchFinalPath' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class VenueLeaseBatchFinalPath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder buffer, uint length, uint flags);
+    public static string Resolve(string path) {
+        // access 0 (attributes only), share all, OPEN_EXISTING, BACKUP_SEMANTICS (a directory opens too); no OPEN_REPARSE_POINT, so a link is followed to its target
+        using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (h.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            uint size = 1024;
+            while (true) {
+                StringBuilder sb = new StringBuilder((int)size);
+                uint n = GetFinalPathNameByHandleW(h, sb, size, 0);
+                if (n == 0) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                if (n < size) {
+                    string s = sb.ToString();
+                    if (s.StartsWith(@"\\?\UNC\", StringComparison.Ordinal)) { return @"\\" + s.Substring(8); }
+                    if (s.StartsWith(@"\\?\", StringComparison.Ordinal)) { return s.Substring(4); }
+                    return s;
+                }
+                size = n + 1;
+            }
+        }
+    }
+}
+'@
+    }
+    [VenueLeaseBatchFinalPath]::Resolve([IO.Path]::GetFullPath($Path))
+}
+
 function Get-RunDirOutputRefusal([string]$Path) {
-    # '' when $Path is not a file this run writes; else the sentence for the refusal. Resolved paths on both sides, so a spelling of -RunDir (\.\, ..\, a trailing \) does not slip past.
-    $full = [IO.Path]::GetFullPath($Path)
-    $root = [IO.Path]::GetFullPath($RunDir).TrimEnd('\')
+    # '' when $Path is not a file this run writes; else the sentence for the refusal. r10 (adversary r9 A1): PHYSICAL paths on both sides (Get-PhysicalPath), so neither a spelling of -RunDir
+    # (\.\, ..\, a trailing \) nor a junction or symlink that reaches it (the input, an ancestor of it, or -RunDir itself) slips past. Every caller goes through here.
+    try {
+        $full = Get-PhysicalPath $Path
+        $root = (Get-PhysicalPath $RunDir).TrimEnd('\')
+        # a runner-owned name inside -RunDir that is itself a link: what the runner writes under that name lands at the link's target, so the target is the output
+        $linked = @()
+        foreach ($c in @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
+            $owned = ($c.Name -iin $script:RunDirOutputDirs)
+            foreach ($p in $script:RunDirOutputLeafPatterns) { if ($c.Name -imatch $p) { $owned = $true } }
+            if ($owned) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = (Get-PhysicalPath $c.FullName) } }
+        }
+    } catch { return "'$Path' cannot be resolved to a physical path ($($_.Exception.Message -replace '\s+', ' ')); an input whose location is unknown is refused" }
+    $shown = $(if ($full -ieq [IO.Path]::GetFullPath($Path)) { "'$full'" } else { "'$Path' (physical path '$full')" })
+    foreach ($l in $linked) {
+        if (-not $l.isDir -and $full -ieq $l.physical) { return "$shown is a file this run writes into -RunDir ($($l.name), a link to it)" }
+        if ($l.isDir -and ($full + '\').StartsWith($l.physical.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $($l.name)\, a link to a directory this run writes into under -RunDir" }
+    }
     $parent = [IO.Path]::GetDirectoryName($full).TrimEnd('\')
     if ($parent -ieq $root) {
         $leaf = [IO.Path]::GetFileName($full)
-        foreach ($p in $script:RunDirOutputLeafPatterns) { if ($leaf -imatch $p) { return "'$full' is a file this run writes into -RunDir ($leaf)" } }
+        foreach ($p in $script:RunDirOutputLeafPatterns) { if ($leaf -imatch $p) { return "$shown is a file this run writes into -RunDir ($leaf)" } }
         return ''
     }
     foreach ($d in $script:RunDirOutputDirs) {
-        if (($parent + '\').StartsWith($root + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase)) { return "'$full' is inside $d\, a directory this run writes into under -RunDir" }
+        if (($parent + '\').StartsWith($root + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $d\, a directory this run writes into under -RunDir" }
     }
     ''
 }

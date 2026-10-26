@@ -2338,6 +2338,144 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertNotIn("LEG_SPEC_IS_RUN_OUTPUT", r.stderr)
         self.assertNotEqual(r.returncode, 2, r.stdout + r.stderr)
 
+    # r10 (adversary r9 A1): the r9 guard compared LEXICAL parents, so an input reached through a junction that targets -RunDir (or an ancestor of it) passed preflight and was
+    # overwritten after the claim. One case per call site of the one helper (the plan file, a plan item's spec, a scalar spec), the aliases that matter (the input, an ancestor
+    # of it, -RunDir itself, a runner-owned directory that is a link) and the fail-closed case. Each asserts the physical file is byte-unchanged and nothing was submitted.
+    def _junction(self, link: Path, target: Path) -> None:
+        target.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def _assert_alias_refused(self, r: subprocess.CompletedProcess, physical: Path, before: str, marker: str) -> None:
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(marker, r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+        self.assertEqual(physical.read_text(encoding="utf-8"), before, "the physical file is byte-unchanged")
+
+    def _fresh_run_dir(self) -> None:
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        self.run_dir.mkdir(parents=True)
+
+    def test_r10_a_leg_spec_reached_through_a_junction_to_the_run_dir_is_refused_before_the_claim(self) -> None:
+        for leaf in ("leg-plan.json", "gate.log", "batch.log", "batch-jobs/x.json"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                alias = self.case / "alias"
+                if alias.exists():
+                    os.rmdir(alias)
+                self._junction(alias, self.run_dir)
+                spec = self.run_dir / leaf
+                spec.parent.mkdir(parents=True, exist_ok=True)
+                spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = spec.read_text(encoding="utf-8")
+                r = self.run_plan(self.write_plan([self.item(alias / leaf, "A", self.commit_a)]))
+                self._assert_alias_refused(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                os.rmdir(alias)
+
+    def test_r10_a_leg_spec_reached_through_a_junction_to_an_ancestor_of_the_run_dir_is_refused(self) -> None:
+        self._fresh_run_dir()
+        alias = self.tmp / f"up-{self.case.name}"
+        self._junction(alias, self.case)
+        try:
+            spec = self.run_dir / "leg-plan.json"
+            spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+            before = spec.read_text(encoding="utf-8")
+            r = self.run_plan(self.write_plan([self.item(alias / "run" / "leg-plan.json", "A", self.commit_a)]))
+            self._assert_alias_refused(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+        finally:
+            os.rmdir(alias)
+
+    def test_r10_a_plan_file_reached_through_a_junction_to_the_run_dir_is_refused_before_the_claim(self) -> None:
+        for leaf in ("leg-plan.json", "batch.log", "batch-jobs/plan.json"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                alias = self.case / "alias"
+                if alias.exists():
+                    os.rmdir(alias)
+                self._junction(alias, self.run_dir)
+                plan = self.run_dir / leaf
+                plan.parent.mkdir(parents=True, exist_ok=True)
+                plan.write_text(json.dumps({"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": [self.item(self.specs[0], "A", self.commit_a)]}), encoding="utf-8")
+                before = plan.read_text(encoding="utf-8")
+                r = self.run_plan(alias / leaf)
+                self._assert_alias_refused(r, plan, before, "LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT")
+                os.rmdir(alias)
+
+    def test_r10_a_scalar_leg_spec_reached_through_a_junction_to_the_run_dir_is_refused_before_the_claim(self) -> None:
+        for leaf in ("gate.log", "leg-plan.json", "quiet/x.json"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                alias = self.case / "alias"
+                if alias.exists():
+                    os.rmdir(alias)
+                self._junction(alias, self.run_dir)
+                spec = self.run_dir / leaf
+                spec.parent.mkdir(parents=True, exist_ok=True)
+                spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = spec.read_text(encoding="utf-8")
+                r = self.run_batch([alias / leaf])
+                self._assert_alias_refused(r, spec, before, "BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT")
+                os.rmdir(alias)
+
+    def test_r10_a_run_dir_given_as_a_junction_alias_still_refuses_the_physical_output(self) -> None:
+        # the other direction: -RunDir is the alias, the input is spelled with the physical path
+        real = self.case / "real-run"
+        real.mkdir()
+        spec = real / "gate.log"
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        before = spec.read_text(encoding="utf-8")
+        alias = self.case / "run-alias"
+        self._junction(alias, real)
+        try:
+            self.run_dir = alias
+            r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+            self._assert_alias_refused(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+        finally:
+            os.rmdir(alias)
+
+    def test_r10_a_spec_inside_a_runner_owned_directory_that_is_a_link_is_refused(self) -> None:
+        # <RunDir>\quiet is a junction elsewhere: Wait-VenueQuiet -WorkDir writes into the target, so a spec there is a runner output
+        self._fresh_run_dir()
+        elsewhere = self.case / "elsewhere"
+        self._junction(self.run_dir / "quiet", elsewhere)
+        spec = elsewhere / "venue-quiet-probe-x.json"
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        before = spec.read_text(encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self._assert_alias_refused(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+
+    def test_r10_an_input_whose_physical_path_cannot_be_resolved_is_refused_before_the_claim(self) -> None:
+        # fail closed: the resolver is made to fail (as it does for a path the file system will not open); the plan file, a plan item's spec and a scalar spec each refuse
+        anchor = "[VenueLeaseBatchFinalPath]::Resolve([IO.Path]::GetFullPath($Path))"
+        runner = self._patched_runner(anchor, "throw 'injected: the path will not open'")
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a)])
+        spec_text = self.specs[0].read_text(encoding="utf-8")
+        args, e = self.plan_cmd(plan)
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self._assert_alias_refused(r, self.specs[0], spec_text, "LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT")
+        self.assertIn("cannot be resolved to a physical path", r.stderr)
+        args, e = self.batch_cmd([self.specs[0]])
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self._assert_alias_refused(r, self.specs[0], spec_text, "BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertIn("cannot be resolved to a physical path", r.stderr)
+
+    def test_r10_a_junction_that_does_not_reach_the_run_dir_is_not_refused(self) -> None:
+        # the guard resolves paths, it does not distrust links: a spec kept behind a junction elsewhere still runs
+        self._fresh_run_dir()
+        kept = self.case / "kept-specs"
+        self._junction(self.case / "spec-alias", kept)
+        shutil.copy2(self.specs[0], kept / "fx-a.json")
+        r = self.run_plan(self.write_plan([self.item(self.case / "spec-alias" / "fx-a.json", "A", self.commit_a)]))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_r5_adv_a1_a_throw_after_a_leg_ran_does_not_record_that_leg_as_not_run(self) -> None:
         # adversary r5 A1: the new batch catch left the leg whose child had completed (its output file could not be written) in pending, and the summary then said
         # NOT_RUN for a leg that ran. The leg is recorded LEG_FAILED / reason BATCH_ERROR (its result is unknown); only the legs never started are NOT_RUN.
