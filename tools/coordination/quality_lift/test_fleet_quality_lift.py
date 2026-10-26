@@ -169,7 +169,10 @@ $res = foreach ($c in @(Get-Content -LiteralPath $Cases -Raw | ConvertFrom-Json)
     $null = Invoke-Case ([pscustomobject]@{ kind = $c.kind; text = 'x' })
     $best = [double]::MaxValue; $r = $null
     for ($k = 0; $k -lt 3; $k++) {
-        $sw = [Diagnostics.Stopwatch]::StartNew(); $r = Invoke-Case $c; $sw.Stop()
+        # A match timeout (or any throw) is this case's result, not the end of the run.
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        try { $r = Invoke-Case $c } catch { $r = "ERROR $($_.Exception.GetBaseException().GetType().Name)" }
+        $sw.Stop()
         $best = [Math]::Min($best, $sw.Elapsed.TotalMilliseconds)
     }
     [pscustomobject]@{ name = $c.name; ms = $best; result = "$r" }
@@ -1317,6 +1320,27 @@ class MeterFixtureTests(unittest.TestCase):
         # The rate is over the passes the meter could classify: an unknown pass is never counted as clean.
         self.assertEqual(since["blockedRate"], round(n_blocked / (len(bodies) - n_unknown), 3))
 
+    def test_adversary_r4_meaning_cases(self) -> None:  # adversary r4 on e5d54282: A1-A4
+        bodies = [
+            # A1: under a no-blocker opener, only a B<n> the section says was addressed is a disposition note.
+            ("## Blockers\nNone newly demonstrated.\nB1: tools/lease.ps1:9 deletes another owner's lock.\n", "blocked"),
+            ("## Blockers\nNone newly demonstrated. Prior B1 is source-addressed.\nB2: a.ps1:9 drops the lock.\n", "blocked"),
+            ("## Blockers\nNone newly demonstrated.\nB1: a.ps1:3 is now fixed by the claim check.\n", "clean"),
+            # A2: a negation before the B<n> words, wherever it stands in the sentence.
+            ("## Blockers\nNone.\nThere is no current B1.\n", "clean"),
+            ("## Blockers\nNone.\nIt is not true that B1 remains open.\n", "clean"),
+            # A3: a later fail-safe phrase does not hide an earlier failure.
+            ("## Blockers\nNone.\nThe exact-head job1 fails the gate that is intended to fail closed.\n", "blocked"),
+            # A4: 'No' opens explicit no-blocker text only when it says what there is none of.
+            ("## Blockers\nNo assessment has been made.\n", "unknown"),
+            ("## Blockers\nNothing was reviewed.\n", "unknown"),
+            ("## Blockers\nNo new demonstrated defect in this delta.\n", "clean"),
+            ("## Blockers\nNo current failing check demonstrated.\n", "clean"),
+        ]
+        _, got = self._classes(bodies)
+        want = {f"{i + 1:040x}": c for i, (_, c) in enumerate(bodies)}
+        self.assertEqual(got, want, [(b, got[h], c) for (b, c), h in zip(bodies, want) if got[h] != c])
+
     def test_an_unknown_pass_folds_apart_and_never_as_clean(self) -> None:  # B5
         p, q = "cos-feedback/p/pr-7.md", "cos-feedback/p/pr-8.md"
         bus = self._small_bus([
@@ -1396,6 +1420,15 @@ class MeterFixtureTests(unittest.TestCase):
             ("identity heading long repo", "identity", "# " + "a" * 100000 + "/" + "b" * 100000 + " #1 / x\n", ""),
             ("adversary line long marks", "rx:adversary", "!" * 200000, "False"),
             ("repo line long spaces", "rx:repoLine", "repo:" + " " * 100000 + "a/b" + " " * 100000 + "x", "False"),
+            # adversary r4 on e5d54282: A5 (a scan that copied the rest of the heading per note), A6 (\W* ran across lines).
+            ("Blockers heading with 64000 notes", "class", f"# a/b #1 / {H1}\n\n## Blockers{'()' * 64000}\nNone.\n", "clean"),
+            ("adversary line after 64000 newlines", "rx:adversary", "\n" * 64000 + "x", "False"),
+            ("adversary line after a bullet", "rx:adversary", "body\n- **Adversary pass:** x", "True"),
+            # A7 (minor): a PR number that fits an Int32 names the pass, one past it names none.
+            ("PR number 1000000000", "identity", f"# a/b #1000000000 / {H1}\n", H1),
+            ("PR number 2147483647", "identity", f"# a/b #2147483647 / {H1}\n", H1),
+            ("PR number 2147483648", "identity", f"# a/b #2147483648 / {H1}\n", ""),
+            ("front matter PR 2147483648", "identity", f"schema: cos-feedback.v1\nrepo: a/b\npr: 2147483648\nhead: {H1}\n\n", ""),
         ]
         work = self._dir()
         helper = work / "time-parsers.ps1"
