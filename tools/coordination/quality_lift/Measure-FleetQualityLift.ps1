@@ -94,9 +94,11 @@ function Get-QlKey($p) { "$($p.repo)@$($p.head)" }
 #   blocker   the section's first content line starts B<n>, after optional quote, heading (###+), bullet (- * +), number
 #             (1. 1)) and emphasis (one to three * or _) marks. A line under the next level-1 or -2 heading is outside it.
 #   A head may be written in either case; it is kept in lowercase, as git and GitHub print it.
-$QlHeading = '(?m)^# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d+) / ([0-9a-fA-F]{40})(?![0-9A-Za-z])'   # exactly 40: 41 hex is no head
+# Up to three leading spaces (still a markdown heading); exactly 40 hex (41 is no head); a PR number that fits an Int32.
+$QlHeading = '(?m)^[ ]{0,3}# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d{1,9}) / ([0-9a-fA-F]{40})(?![0-9A-Za-z])'
 $QlCorpusEvidence = 'r3'   # corpus row format: bump when a meter change can alter a row already written
-$QlBlockedLine = '^(?:>[ \t]*)?(?:#{3,6}[ \t]+)?(?:[-*+][ \t]+|\d+[.)][ \t]+)?(?:\*{1,3}|_{1,3})?B\d'
+# Markers in any order and nesting (> - ### **B1): each is a quote, a heading, a bullet or number, or emphasis.
+$QlBlockedLine = '^(?:[ \t]*(?:>|#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t]|\*{1,3}|_{1,3}))*[ \t]*B\d'
 
 # The pass a CoS file names: @{ repo; pr; head; section }, or $null when it names none.
 function Get-QlIdentity([string]$Txt) {
@@ -108,7 +110,7 @@ function Get-QlIdentity([string]$Txt) {
     $fm = [regex]::Match($Txt, '\A(?:\uFEFF)?schema:[ \t]*cos-feedback\.v1[ \t]*\r?\n(?:[^\r\n]*\S[^\r\n]*\r?\n)*')
     if (-not $fm.Success) { return $null }
     $repo = [regex]::Match($fm.Value, '(?m)^repo:[ \t]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)[ \t]*\r?$')
-    $pr = [regex]::Match($fm.Value, '(?m)^pr:[ \t]*(\d+)[ \t]*\r?$')
+    $pr = [regex]::Match($fm.Value, '(?m)^pr:[ \t]*(\d{1,9})[ \t]*\r?$')
     $head = [regex]::Match($fm.Value, '(?m)^head:[ \t]*([0-9a-fA-F]{40})[ \t]*\r?$')
     if (-not ($repo.Success -and $pr.Success -and $head.Success)) { return $null }
     @{ repo = $repo.Groups[1].Value; pr = [int]$pr.Groups[1].Value; head = $head.Groups[1].Value.ToLowerInvariant(); section = $Txt.Substring($fm.Length) }
@@ -117,7 +119,7 @@ function Get-QlIdentity([string]$Txt) {
 # The first content line of the Blockers section ('' when there is none, or the section is empty).
 function Get-QlBlockerLine([string]$Sec) {
     # Up to three leading spaces, and closing #s on a heading, are markdown too.
-    $h = [regex]::Match($Sec, '(?m)^[ ]{0,3}#{2,3}[ \t]+(?:\*\*|__)?Blockers[ \t]*:?(?:\*\*|__)?[ \t]*:?[ \t]*(?:\([^)\r\n]*\)|\[[^\]\r\n]*\])?[ \t]*(?:#+[ \t]*)?\r?$')
+    $h = [regex]::Match($Sec, '(?m)^[ ]{0,3}#{2,3}[ \t]+(?:\*\*|__)?Blockers[ \t]*:?[ \t]*(?:\([^)\r\n]*\)|\[[^\]\r\n]*\])?[ \t]*:?(?:\*\*|__)?[ \t]*:?[ \t]*(?:\([^)\r\n]*\)|\[[^\]\r\n]*\])?[ \t]*(?:#+[ \t]*)?\r?$')
     $l = [regex]::Match($Sec, '(?m)^[ ]{0,3}(?:[-*+][ \t]+)?(?:\*\*|__)?Blockers(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*([^\r\n]*)')
     if (-not $h.Success -and -not $l.Success) { return '' }
     if ($l.Success -and (-not $h.Success -or $l.Index -lt $h.Index)) {
@@ -177,12 +179,15 @@ function Group-QlHeads([object[]]$Raw) {
 # --null prints each path verbatim before a NUL, so the pr-*.md filter runs on the literal project folder.
 function Get-QlRepos([string]$Proj) {
     # Either identity form names the repository: the heading, or the front matter's repo: line.
-    $lines = @(git -C $Bus grep --null -I -E -e '^# [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+ #[0-9]+ / [0-9a-fA-F]{40}' -e '^repo:[[:blank:]]*[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+[[:blank:]]*$' HEAD -- ":(literal)cos-feedback/$Proj/" 2>$null)
-    if ($LASTEXITCODE -gt 1) { throw "git grep of cos-feedback/$Proj failed (exit $LASTEXITCODE)" }
+    $all = @(git -C $Bus grep --null -I -E -e '^[ ]{0,3}# [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+ #[0-9]+ / [0-9a-fA-F]{40}' -e '^repo:[[:blank:]]*[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+[[:blank:]]*$' HEAD -- ":(literal)cos-feedback/$Proj/" 2>&1)
+    # git grep exits 1 both for "no match" and for a blob it could not read, so any stderr line is a failure too.
+    $stderr = @($all | Where-Object { $_ -is [Management.Automation.ErrorRecord] })
+    if ($LASTEXITCODE -gt 1 -or $stderr.Count) { throw "git grep of cos-feedback/$Proj failed (exit $LASTEXITCODE): $("$($stderr | Select-Object -First 1)".Trim())" }
+    $lines = @($all | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] })
     $like = "HEAD:cos-feedback/$([WildcardPattern]::Escape($Proj))/pr-*.md"
     @($lines | ForEach-Object {
         $path, $text = $_.Split([char]0, 2)
-        if ($path -like $like -and $text -match '^(?:# |repo:[ \t]*)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?: #|[ \t]*\r?$)') { $Matches[1] }
+        if ($path -like $like -and $text -match '^(?:[ ]{0,3}# |repo:[ \t]*)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?: #|[ \t]*\r?$)') { $Matches[1] }
     })
 }
 
@@ -494,10 +499,11 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
 
     $adopt = [ordered]@{ prs = $null; withAdversaryLine = $null }
     $repos = @($heads | ForEach-Object repo)
-    if (-not $NoStatuses) { try { $repos += @(Get-QlRepos $Proj) } catch { $errors += "repos ${Proj}: $($_.Exception.Message)" } }
+    $reposFailed = $false   # a repository the discovery missed has PRs no one counted: the adoption count is then unknown
+    if (-not $NoStatuses) { try { $repos += @(Get-QlRepos $Proj) } catch { $errors += "repos ${Proj}: $($_.Exception.Message)"; $reposFailed = $true } }
     $repos = @($repos | Sort-Object -Unique)
     if ($repos.Count -and -not $NoStatuses) {
-        $n = 0; $w = 0; $listFailed = $false
+        $n = 0; $w = 0; $listFailed = $reposFailed
         foreach ($rp in $repos) {
             try {
                 # No --search: where gh resolves through a .cmd shim, '>' in "created:>=" becomes a redirect.

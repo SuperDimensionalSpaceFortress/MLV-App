@@ -1140,6 +1140,45 @@ class MeterFixtureTests(unittest.TestCase):
             proc = self._run("-Bus", str(self.bus), "-Project", "demo", "-Since", since, "-OutDir", str(self._dir()), "-NoStatuses", "-NoFetch")
             self.assertEqual(proc.returncode, 4, (since, proc.stdout + proc.stderr))
 
+    # -- adversary pass r3 rerun 2 on 7f618957 (fixed without a further rerun: the README caps reruns at 2)
+
+    def test_nested_markers_and_a_note_inside_bold_are_read(self) -> None:  # A1, A2
+        bodies = ["## **Blockers [2026-10-21]**\nB1 x.\n", "## __Blockers (r3):__\nB1 x.\n", "## Blockers\n> - ### **B1** x.\n",
+                  "## Blockers\n1. - **B1** x.\n"]
+        commits, heads = [], []
+        for i, body in enumerate(bodies):
+            head = f"{i + 1:040x}"
+            heads.append(head)
+            commits.append((f"cos-feedback/p/pr-{i + 1}.md", f"# acme/widget #{i + 1} / {head}\n\n{body}", f"2026-10-21T10:0{i}:00+00:00", f"v{i}"))
+        _, got = self._blocked_heads(self._small_bus(commits), "p", heads)
+        self.assertEqual(sorted(got), sorted(heads), [(b, h in got) for b, h in zip(bodies, heads)])
+
+    def test_an_indented_identity_heading_counts_and_a_huge_pr_number_names_no_pass(self) -> None:  # A3, A6
+        bus = self._small_bus([
+            ("cos-feedback/p/pr-7.md", f"# acme/widget #7 / {H1}\n\n## Blockers\nB1 x.\n\n  # acme/widget #7 / {H2}\n\n## Blockers\nNone.\n",
+             "2026-10-21T10:00:00+00:00", "indented last heading"),
+            ("cos-feedback/p/pr-8.md", f"# acme/widget #99999999999 / {H3}\n\n## Blockers\nB1 x.\n", "2026-10-21T10:01:00+00:00", "PR number past Int32"),
+            ("cos-feedback/p/pr-9.md", f"# acme/widget #9 / {H4}\n\n## Blockers\nB1 x.\n", "2026-10-21T10:02:00+00:00", "ordinary"),
+        ])
+        result, got = self._blocked_heads(bus, "p", [H1, H2, H3, H4])
+        self.assertEqual(sorted(got), [H4])  # H2 (the last heading) is clean; H1 is not this file's pass
+        since = result["windows"][0]
+        self.assertEqual((since["measured"], since["passes"], since["unparsed"]), (True, 2, 1))
+
+    def test_a_failed_repository_discovery_leaves_adoption_unknown(self) -> None:  # A5
+        bus = self._small_bus([
+            ("cos-feedback/p/pr-7.md", _section(7, H1, "None.", "acme/other"), "2026-10-01T00:00:00+00:00", "old, names acme/other"),
+            ("cos-feedback/p/pr-8.md", _section(8, H2, "None."), _iso(NOW - timedelta(hours=1)), "recent, names acme/widget"),
+        ])
+        # git grep exits 1 (the 'no match' code) on a blob it cannot read: the meter must still see the failure.
+        blob = _git(bus, "rev-parse", "HEAD:cos-feedback/p/pr-7.md")
+        loose = bus / ".git" / "objects" / blob[:2] / blob[2:]
+        os.chmod(loose, stat.S_IWRITE | stat.S_IREAD)
+        loose.unlink()
+        gh = self._fake_gh(prs={"acme/widget": [{"number": 5, "body": "Adversary pass: x", "createdAt": _iso(NOW - timedelta(hours=1))}]})
+        result, _ = self._measure_bus(bus, "p", since=_iso(NOW - timedelta(hours=2)), gh=gh, expect=2)
+        self.assertEqual(result["shiftLeft"], {"prs": None, "withAdversaryLine": None})
+
     def test_the_meter_is_ascii_and_names_no_board_path(self) -> None:
         raw = METER.read_bytes()
         self.assertTrue(all(b < 128 for b in raw), "Measure-FleetQualityLift.ps1 must be ASCII-only")
