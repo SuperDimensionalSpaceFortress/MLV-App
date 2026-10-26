@@ -392,6 +392,13 @@ WRITE_ALLOWED = {
         "owner path and no view entry.",
     ("playback-attr-3-cuda-job.ps1", "$pmRows | Export-Csv -LiteralPath (Join-Path $legOut 'presentmon-series.csv') -NoTypeInformation"):
         "the PresentMon series CSV, a fixed-name file in the same per-leg output directory; not an owner path.",
+    # BACHELOR-CORE-PARTITION-AB-1: the core-partition telemetry helper's own two output files, inside the encoded helper body.
+    ("playback-attr-3-cuda-job.ps1", "[IO.File]::WriteAllText($ready, 'ready')"):
+        "core-partition helper (a bounded pwsh the job spawns): writes its ready marker, the fixed-name 'core-partition.ready' in the job's "
+        "own $Work directory (MLV_CP_READY); it never opens footage and names no owner path or view entry.",
+    ("playback-attr-3-cuda-job.ps1", "[IO.File]::WriteAllText($outPath, ($rec | ConvertTo-Json -Depth 8 -Compress))"):
+        "core-partition helper: writes its one record, the fixed-name 'core-partition-helper.json' in the job's own $Work directory "
+        "(MLV_CP_OUT); the content is its own counter / affinity observations, never footage bytes.",
     # ---- Attr3FootageStageJob.psm1 -------------------------------------------------------------
     ("Attr3FootageStageJob.psm1", "$localDstStream = [IO.File]::Open($localPartialPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)"):
         "the target-volume partial, created by THIS attempt with CreateNew under a per-attempt name carrying the "

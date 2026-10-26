@@ -4511,6 +4511,8 @@ $instances = [Collections.Generic.List[object]]::new()
 $loadOn = $false; $loadStartTicks = 0
 try {
     $self = [Diagnostics.Process]::GetCurrentProcess()
+    # Dot improvement: the measured app starts after this helper does (the job spawns the helper first), so a same-path process already running is never bound.
+    $helperBornUtc = $self.StartTime.ToUniversalTime()
     $topo = Get-CorePartitionTopology
     $tm = [ordered]@{}; foreach ($k in @($topo.map.Keys | Sort-Object)) { $tm[$k] = $topo.map[$k] }
     $rec.topology = $tm; $rec.topologyReason = $topo.reason
@@ -4558,7 +4560,8 @@ public static class MlvCorePartitionLoad {
         if ($null -eq $cur) {
             foreach ($p in @(Get-Process -Name $appName -ErrorAction SilentlyContinue)) {
                 $pp = $null; try { $pp = [string]$p.Path } catch { }
-                if ($pp -and $pp -ieq $exe) {
+                $pst = $null; try { $pst = $p.StartTime.ToUniversalTime() } catch { }
+                if ($pp -and $pp -ieq $exe -and $pst -and $pst -ge $helperBornUtc) {
                     $cur = $p
                     $curRec = [ordered]@{ pid = $p.Id; firstSeenUtcTicks = [DateTime]::UtcNow.Ticks; lastSeenUtcTicks = [DateTime]::UtcNow.Ticks; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null }
                     try { $curRec.affinityFirst = [int64]$p.ProcessorAffinity; $curRec.affinityLast = $curRec.affinityFirst; $curRec.priorityFirst = [string]$p.PriorityClass; $curRec.priorityLast = $curRec.priorityFirst } catch { $errs.Add("app-read: $($_.Exception.Message)") }
@@ -5208,8 +5211,9 @@ $corePartitionStopFile = Join-Path $Work 'core-partition.stop'
 $corePartitionReadyFile = Join-Path $Work 'core-partition.ready'
 $corePartitionHelperOut = Join-Path $Work 'core-partition-helper.json'
 $corePartitionFeedPath = $(if ($env:HEAVY_SLOT_FEED) { $env:HEAVY_SLOT_FEED } else { 'C:\temp\hwinfo-log-adapter.csv' })
-$corePartitionFeedStart = Read-CorePartitionFeedMark $corePartitionFeedPath
-$corePartitionHelperLaunch = [ordered]@{ pid = $null; affinityRequested = (Format-CorePartitionMask $CorePartitionHelperAffinity); affinityObserved = $null; priorityObserved = $null; ready = $false; readyWaitMs = $null }
+$corePartitionFeedPreHelper = Read-CorePartitionFeedMark $corePartitionFeedPath
+$corePartitionPreHelperUtc = (Get-Date).ToUniversalTime()
+$corePartitionHelperLaunch =[ordered]@{ pid = $null; affinityRequested = (Format-CorePartitionMask $CorePartitionHelperAffinity); affinityObserved = $null; priorityObserved = $null; ready = $false; readyWaitMs = $null }
 try {
     $corePartitionJob.affinityBefore = Format-CorePartitionMask ([int64]$corePartitionJobProc.ProcessorAffinity)
     $cpPsi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $CorePartitionHelperEncoded")
@@ -5248,6 +5252,10 @@ if ($CorePartitionBenchMask -ne 0) {
         $corePartitionErrors.Add("job-affinity-set: $([string]$_.Exception.Message)")
     }
 }
+# Dot B1: the measured window opens HERE, after the helper's ready wait and the job's own affinity set, right before the smoke launch below
+# (the pre-helper mark above is recorded separately and never windows the feed).
+$corePartitionFeedStart = Read-CorePartitionFeedMark $corePartitionFeedPath
+$corePartitionMeasuredLaunchUtc = (Get-Date).ToUniversalTime()
 Write-JobTrace "step core-partition start helperPid=$($corePartitionHelperLaunch.pid) helperAffinity=$($corePartitionHelperLaunch.affinityObserved) ready=$($corePartitionHelperLaunch.ready) readyWaitMs=$($corePartitionHelperLaunch.readyWaitMs) jobAffinity=$($corePartitionJob.affinityApplied)"
 '@ + "`n" + $cpClose + "`n" + @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
@@ -5298,9 +5306,10 @@ try {
             helper = $corePartitionHelperRecord
             feed = [ordered]@{
                 path = $corePartitionFeedPath
+                preHelperMark = [ordered]@{ exists = $corePartitionFeedPreHelper.exists; length = $corePartitionFeedPreHelper.length; ageSec = $corePartitionFeedPreHelper.ageSec; utc = $corePartitionPreHelperUtc.ToString('o') }
                 startMark = [ordered]@{ exists = $corePartitionFeedStart.exists; length = $corePartitionFeedStart.length; ageSec = $corePartitionFeedStart.ageSec }
                 endMark = [ordered]@{ exists = $corePartitionFeedEnd.exists; length = $corePartitionFeedEnd.length; ageSec = $corePartitionFeedEnd.ageSec; windowStartsMidRow = $corePartitionFeedEnd.windowStartsMidRow }
-                windowUtc = [ordered]@{ start = $smokeLaunchedAtUtc.ToString('o'); end = $corePartitionSmokeEndedAtUtc.ToString('o') }
+                windowUtc = [ordered]@{ start = $corePartitionMeasuredLaunchUtc.ToString('o'); end = $corePartitionSmokeEndedAtUtc.ToString('o') }
                 summary = $corePartitionFeedSummary
             }
             perCoreTemperature = 'not in the feed (column 3 is the package / hottest core); adding columns is the Bachelor session''s work'

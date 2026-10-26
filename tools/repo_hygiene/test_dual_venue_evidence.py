@@ -145,13 +145,16 @@ SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json
 HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip in ("m16-1243", "m16-1457") for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  *(f"legs/m16-1243-headroom-stage-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  "legs/m16-1457-headroom-stage-fullscreen-s1.json")
+# BACHELOR-CORE-PARTITION-AB-1: the core-partition legs (A whole machine, B1 P-cores, B2 P-cores + E-core load): the headroom unpaced windowed s1 shape
+# (a Cinematic Look-Assist pace leg at swap interval 0, so they carry the same presentTearingExpectedReason) plus the core-partition generatorArgs.
+PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload"))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", "legs/m16-1243-look-scale2-vision50d.json",
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS,
+                *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *PARTITION_LEGS,
                 *IDENTITY_LEGS, *MISSDUMP_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
@@ -6415,12 +6418,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in HEADROOM_LEGS:
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in HEADROOM_LEGS:
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -6468,6 +6471,10 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "CUDA-HEADROOM-1":   # the unpaced throughput and stage legs, named by clip, kind and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-(1243|1457)-headroom-(unpaced|stage)-(fullscreen|windowed)-s[124]$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+            elif spec["card"] == "BACHELOR-CORE-PARTITION-AB-1":   # the core-partition A/B legs (cinematic pace legs), named by arm
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload)-unpaced-windowed-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)

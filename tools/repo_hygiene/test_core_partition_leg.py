@@ -90,6 +90,82 @@ def strip_regions(text: str) -> str:
                        "    $smokeLaunchException = $_\n}\nWrite-JobTrace \"step smoke-launch done rc=$smokeRc\"", 1)
 
 
+# r2 (Dot B1): the job's pre-launch region run for real, with a fake HWiNFO feed and a stand-in helper that is only ready after a delay. The helper
+# first writes low-power "startup" rows to the feed, then signals ready (recording the feed length at that instant); the driver then appends the
+# "smoke" rows and reads the window the way the job's finally block does. Arm A: no bench mask, so no affinity is set on the test process.
+FAKE_HELPER = r"""
+$f = $env:HEAVY_SLOT_FEED
+Start-Sleep -Milliseconds 400
+[IO.File]::AppendAllText($f, "26.10.2026,01:00:00,x,30.0,10.0,No,No`n26.10.2026,01:00:01,x,30.0,10.0,No,No`n")
+Start-Sleep -Milliseconds 1200
+[IO.File]::WriteAllText($env:MLV_CP_READY, [string](New-Object IO.FileInfo $f).Length)
+Start-Sleep -Seconds 60
+"""
+READINESS_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$job = [IO.File]::ReadAllText($env:CP_JOB)
+$s = $job.IndexOf($env:CP_OPEN)
+$e = $job.IndexOf($env:CP_CLOSE, $s)
+$region = $job.Substring($s, $e - $s)
+$fake = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($env:CP_FAKE_HELPER))
+$region = [regex]::Replace($region, "(?m)^\`$CorePartitionHelperEncoded = '[^']*'", { "`$CorePartitionHelperEncoded = '$fake'" })
+$region = [regex]::Replace($region, '(?m)^\$CorePartitionHelperAffinity = \[int64\]\d+', '$CorePartitionHelperAffinity = [int64]1')
+function Write-JobTrace([string]$Message) { }
+$Work = $env:CP_WORK
+$exePath = 'C:\no\such\MLVApp.exe'
+$SmokeProcessTimeoutMs = 60000
+. ([scriptblock]::Create($region))
+try {
+    $ready = $null
+    for ($i = 0; $i -lt 40 -and -not $ready; $i++) { $ready = (Get-Content -LiteralPath $corePartitionReadyFile -Raw -ErrorAction SilentlyContinue); if (-not $ready) { Start-Sleep -Milliseconds 100 } }
+    [IO.File]::AppendAllText($corePartitionFeedPath, "26.10.2026,01:00:02,x,70.0,45.0,No,No`n26.10.2026,01:00:03,x,80.0,55.0,No,No`n26.10.2026,01:00:04,x,75.0,50.0,No,No`n")
+    $end = Read-CorePartitionFeedSince $corePartitionFeedPath ([int64]$corePartitionFeedStart.length)
+    $sum = Get-CorePartitionFeedSummary $corePartitionFeedStart $end 120
+    [ordered]@{
+        helperReady = $corePartitionHelperLaunch.ready; readyLength = [int64]([string]$ready).Trim(); startLength = $corePartitionFeedStart.length
+        rows = $sum.rows; wattsMean = $sum.pkgWattsMean; tempAtStart = $sum.pkgTempCAtStart
+        launchUtcAfterReady = ($null -ne $corePartitionMeasuredLaunchUtc -and $corePartitionMeasuredLaunchUtc -gt $corePartitionPreHelperUtc.AddMilliseconds(1000))
+    } | ConvertTo-Json -Compress
+} finally {
+    if ($null -ne $corePartitionHelper -and -not $corePartitionHelper.HasExited) { $corePartitionHelper.Kill() }
+}
+"""
+
+
+# r2 (Dot improvement): the decoded helper run for real against a stand-in "app" (a copy of PING.EXE named mlvfake.exe; never MLVApp). One instance
+# of that exe already runs when the helper starts, a second starts after it is ready: only the second may be bound as the measured app.
+IDENTITY_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$dir = $env:CP_DIR
+$exe = Join-Path $dir 'mlvfake.exe'
+Copy-Item -LiteralPath 'C:\Windows\System32\PING.EXE' -Destination $exe
+$pre = Start-Process -FilePath $exe -ArgumentList @('-n', '40', '127.0.0.1') -PassThru -WindowStyle Hidden
+try {
+    Start-Sleep -Milliseconds 1500
+    $psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $($env:CP_ENCODED)")
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.Environment['MLV_CP_EXE'] = $exe
+    $psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
+    $psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
+    $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
+    $psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
+    $psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(90).Ticks)
+    $h = [Diagnostics.Process]::Start($psi)
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path (Join-Path $dir 'ready')) -and -not $h.HasExited -and $sw.ElapsedMilliseconds -lt 30000) { Start-Sleep -Milliseconds 100 }
+    $post = Start-Process -FilePath $exe -ArgumentList @('-n', '6', '127.0.0.1') -PassThru -WindowStyle Hidden
+    [void]$post.WaitForExit(20000)
+    Start-Sleep -Seconds 1
+    Set-Content -LiteralPath (Join-Path $dir 'stop') -Value 'stop'
+    if (-not $h.WaitForExit(20000)) { $h.Kill() }
+    $r = Get-Content -LiteralPath (Join-Path $dir 'helper.json') -Raw | ConvertFrom-Json
+    [ordered]@{ prePid = $pre.Id; postPid = $post.Id; seen = $r.app.pid; instances = @($r.instances | ForEach-Object { $_.pid }) } | ConvertTo-Json -Compress
+} finally {
+    if (-not $pre.HasExited) { $pre.Kill() }
+}
+"""
+
+
 @requires_windows_pwsh
 class CorePartitionGeneratorTests(unittest.TestCase):
     """Runs the generator for real against a sparse clone with header-only ~30 s fixtures (the device test_dual_venue_evidence uses)."""
@@ -179,6 +255,42 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         block = "    cpuFrames = $gpuSummary.cpuFrames\n    " + OPEN + "\n" + "".join(f"    {n} = $corePartitionScalars['{n}']\n" for n in SCALAR_NAMES) + "    " + CLOSE + "\n"
         self.assertIn(block, text)
         self.assertIn("Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary", text)
+
+    def test_the_feed_window_opens_after_the_helper_is_ready_not_before_it_starts(self) -> None:
+        """Dot B1: a helper that takes seconds to become ready must not leak its startup rows (here 10 W) into the measured window (50 W)."""
+        job = self.out["a"]
+        self.job("a")
+        feed = self.tmp / "ready-delay-feed.csv"
+        feed.write_text("26.10.2026,00:59:59,x,20.0,5.0,No,No\n", encoding="utf-8")
+        work = self.tmp / "ready-delay-work"
+        work.mkdir()
+        driver = self.tmp / "ready-delay-driver.ps1"
+        driver.write_text(READINESS_DRIVER, encoding="ascii")
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_JOB": str(job), "CP_OPEN": OPEN, "CP_CLOSE": CLOSE, "CP_FAKE_HELPER": FAKE_HELPER,
+                                                           "CP_WORK": str(work), "HEAVY_SLOT_FEED": str(feed)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(got["helperReady"], got)
+        self.assertGreaterEqual(got["startLength"], got["readyLength"], "the feed window opened before the helper was ready")
+        self.assertEqual(got["rows"], 3, got)
+        self.assertEqual(got["wattsMean"], 50.0, "the window mean includes the helper's startup rows")
+        self.assertEqual(got["tempAtStart"], 30.0, "the start temperature is the newest row before the measured launch")
+        self.assertTrue(got["launchUtcAfterReady"], "the measured-launch timestamp must be taken after the ready wait")
+
+    def test_the_helper_binds_only_an_app_started_after_it_not_a_same_path_process_already_running(self) -> None:
+        """Dot improvement: affinity and load evidence must come from the measured app, not from any process at the same exe path."""
+        m = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a"))
+        self.assertIsNotNone(m)
+        work = self.tmp / "identity-work"
+        work.mkdir()
+        driver = self.tmp / "identity-driver.ps1"
+        driver.write_text(IDENTITY_DRIVER, encoding="ascii")
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertNotEqual(got["prePid"], got["postPid"])
+        self.assertEqual(got["seen"], got["postPid"], f"the helper bound a process that was running before it started: {got}")
+        self.assertEqual(got["instances"], [got["postPid"]], got)
 
     def test_the_jobs_and_the_encoded_helper_parse(self) -> None:
         files = [self.out[k] for k in ("a", "b1", "b2", "cuda-b2") if self.job(k)]
