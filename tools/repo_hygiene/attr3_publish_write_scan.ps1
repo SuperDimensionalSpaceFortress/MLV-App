@@ -72,6 +72,17 @@
 # across a function boundary), 'automatic' (the engine binds the name: $_, $PSItem, $args, ...), and for
 # a different receiver shape 'nested' (`$a.b.c = ...`), 'scoped' or 'complex'. Casts other than
 # [ordered] / [pscustomobject] / [hashtable] around a literal build an instance of that type: 'other'.
+# An assignment through another scope (`$script:r = ...`) is not a binding of this body's `$r`: 'other'.
+# A setter inside a `trap` body, or inside a script block that is not an argument of a command, is not "after
+# the assignment, in line": 'undominated'.
+#
+# SHADOWED COMMANDS (third adversary pass, A5/A6/A7). The scan evaluates Join-Path (a provable destination, a
+# bound module), Split-Path and New-Object by their stock behaviour. A template or body that defines a function
+# or Set-Alias / New-Alias with one of those names (or an allowlisted cmdlet's name) is an R1 finding, and a
+# splice source that does so (or shadows the extractor itself) is a 'splice' finding, because the scan's own
+# evaluation then says nothing about what the script runs. Not covered, and left OPEN: a freshness proof that
+# crosses a dynamic-scope or deferred-execution route this scan does not model (adversary A2-A5 inputs beyond the
+# scoped, trap, deferred-block and shadowed-constructor shapes above).
 # The origin is data for the caller; this
 # script still decides nothing. Index assignments keep the template rule: any target that is not a plain
 # unscoped non-root variable is a finding. The helpers that ARE the
@@ -209,8 +220,32 @@ function Get-ViolationToken($Ast) {
         return $Ast.Extent.Text
     }
     if ($Ast -is [System.Management.Automation.Language.AssignmentStatementAst]) { return $Ast.Left.Extent.Text }
+    if ($Ast -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return 'function ' + $Ast.Name }
     if ($Ast -is [System.Management.Automation.Language.FileRedirectionAst]) { return 'redirection' }
     return $Ast.GetType().Name
+}
+
+function Get-ShadowingDefinitions($Root, [string[]]$Names) {
+    # Every function definition, and every Set-Alias / New-Alias, that gives one of $Names (case-insensitively, and
+    # whatever its scope prefix) a meaning of the scanned script's own. The scan evaluates Join-Path, Split-Path and
+    # New-Object by their stock behaviour (a provable destination, a bound module, a fresh object); a script that
+    # redefines one of them makes that evaluation say nothing about what the script runs.
+    $aliasCommands = @('set-alias', 'new-alias', 'sal', 'nal')
+    @($Root.FindAll({
+        param($n)
+        if ($n -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+            return @($Names | Where-Object { $_ -ieq ($n.Name -replace '^[A-Za-z]+:', '') }).Count -gt 0
+        }
+        if ($n -is [System.Management.Automation.Language.CommandAst]) {
+            $commandName = $n.GetCommandName()
+            if ($null -eq $commandName -or $aliasCommands -notcontains $commandName.ToLowerInvariant()) { return $false }
+            foreach ($element in @($n.CommandElements | Select-Object -Skip 1)) {
+                if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                    @($Names | Where-Object { $_ -ieq ([string]$element.Value -replace '^[A-Za-z]+:', '') }).Count -gt 0) { return $true }
+            }
+        }
+        return $false
+    }, $true))
 }
 
 function Get-ModuleFunctionNames([string]$Path) {
@@ -351,8 +386,16 @@ function Get-ReceiverOrigin($Target, $Root) {
     if (@('_', 'PSItem', 'input', 'args', 'this', 'matches', 'Error', 'foreach', 'switch', 'PSBoundParameters', 'MyInvocation',
           'PSCmdlet', 'ExecutionContext', 'Host', 'PWD', 'PID', 'null', 'true', 'false', 'PSScriptRoot', 'PSCommandPath',
           'Event', 'EventArgs', 'Sender', 'SourceArgs', 'SourceEventArgs', 'StackTrace', 'LASTEXITCODE') -contains $v.name) { return 'automatic' }
-    $assignments = @(Get-AssignmentsTo $Root $v.name)
+    # Only an UNSCOPED assignment (or `local:`) binds this body's variable; `$script:r = ...` / `$global:r = ...` binds
+    # another scope's, so the receiver may still be a caller's: it counts as a binding of unknown origin.
+    $allAssignments = @(Get-AssignmentsTo $Root $v.name)
+    $assignments = @($allAssignments | Where-Object {
+        $left = $_.Left
+        if ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
+        @('', 'local') -contains (Get-VariableName $left).scope.ToLowerInvariant()
+    })
     $origins = @($assignments | ForEach-Object { Get-AssignedObjectOrigin $_ }) + @(Get-OtherBindings $Root $v.name)
+    if ($allAssignments.Count -gt $assignments.Count) { $origins += 'other' }
     if ($origins.Count -eq 0) { return 'unbound' }
     # A receiver is fresh only if an assignment of a fresh object comes first, in a block that encloses the property
     # set and not across a function boundary; a later, conditional or nested-function assignment says nothing about the
@@ -369,6 +412,11 @@ function Test-DominatesSetter($Assignment, $Setter) {
     for ($cursor = $Setter.Parent; $null -ne $cursor; $cursor = $cursor.Parent) {
         if ([object]::ReferenceEquals($cursor, $block)) { return $true }
         if ($cursor -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false }
+        # A trap body runs when an error fires, possibly before the assignment; a script block that is not an argument
+        # of a command is deferred until a caller invokes it. Neither is "after the assignment, in line".
+        if ($cursor -is [System.Management.Automation.Language.TrapStatementAst]) { return $false }
+        if ($cursor -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and
+            $cursor.Parent -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
     }
     return $false
 }
@@ -468,6 +516,9 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
     }
     if ($null -ne $root.ScriptRequirements) {
         Add-Violation $Source $root 'R8' '#requires is not allowed in a job template'
+    }
+    foreach ($shadow in @(Get-ShadowingDefinitions $root @($allowedCmdlets + 'New-Object'))) {
+        Add-Violation $Source $shadow 'R1' 'a function or alias named like a command this scan evaluates shadows it, so the scan cannot trust its own evaluation of that command'
     }
     $templateFunctions = @($root.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object { $_.Name })
     $known = @($allowedCmdlets + $templateFunctions + $ModuleFunctions)
@@ -690,7 +741,8 @@ function Get-SpliceModuleBinding($Call, [string]$SourceDir) {
     }
     # -Name is position 0 and -ModulePath position 1, so a second positional argument binds -ModulePath.
     $expectedPositional = if ((Get-NamedArguments $Call @('Name')).Count -eq 0) { 1 } else { 0 }
-    if ((Get-PositionalCount $Call @('Verbose', 'Debug')) -gt $expectedPositional) {
+    # The aliases -vb and -db are switches too; read as value parameters they would swallow the positional path.
+    if ((Get-PositionalCount $Call @('Verbose', 'Debug', 'vb', 'db')) -gt $expectedPositional) {
         return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = 'the call passes a positional argument after -Name, which binds -ModulePath by position' }
     }
     $modulePaths = Get-NamedArguments $Call @('ModulePath')
@@ -744,6 +796,13 @@ function Get-SpliceCallSites([string]$Path) {
     $sourceDir = Split-Path -Parent (Resolve-Path -LiteralPath $Path).Path
     foreach ($err in @($errors)) {
         Add-SpliceFinding $source $err.Extent.StartLineNumber '' $err.Message 'splice source does not parse; its splice call sites cannot be enumerated'
+    }
+    # The binding below evaluates Join-Path, and the call itself is Get-AttrCudaEmbeddedFunctionSource: a source that
+    # defines its own version of either (or of Split-Path / New-Object) makes the scan's evaluation say nothing about it.
+    foreach ($shadow in @(Get-ShadowingDefinitions $ast @('Join-Path', 'Split-Path', 'New-Object', 'Get-AttrCudaEmbeddedFunctionSource'))) {
+        $shadowText = ($shadow.Extent.Text -replace '\s+', ' ')
+        if ($shadowText.Length -gt 160) { $shadowText = $shadowText.Substring(0, 160) }
+        Add-SpliceFinding $source $shadow.Extent.StartLineNumber '' $shadowText 'a function or alias in the splice source shadows a command this scan evaluates, so the module binding it computed cannot be trusted'
     }
     # Command names are case-insensitive and a module-qualified name (<Module>\Get-AttrCudaEmbeddedFunctionSource)
     # resolves to the same command: compare the part after the last backslash, ignoring case.

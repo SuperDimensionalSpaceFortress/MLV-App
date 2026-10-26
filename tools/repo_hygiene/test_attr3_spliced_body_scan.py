@@ -756,8 +756,18 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         ("L1LateAssign", "    $r.Attributes = 'Hidden'\n    $r = @{}"),
         ("L1ConditionalAssign", "    param($Cond)\n    if ($Cond) { $r = @{} }\n    $r.Attributes = 'Hidden'"),
         ("L1SetterInNestedFunction", "    $r = @{}\n    function G { $r.Attributes = 'Hidden' }"),
-        # Still fresh: the assignment comes first in an enclosing block, and the setter sits in a deeper block or script block.
-        ("L1FreshNested", "    $r = [ordered]@{}\n    if ($true) { $r.a = 1 }\n    $sb = { $r.b = 2 }"),
+        # Still fresh: the assignment comes first in an enclosing block, and the setter sits in a deeper block.
+        ("L1FreshNested", "    $r = [ordered]@{}\n    if ($true) { $r.a = 1 }"),
+        # Round 2 (third adversary pass, A2-A5): only an UNSCOPED assignment makes a receiver fresh; a trap or a deferred
+        # script block runs when the caller says, not where it is written; a local function named like a command the
+        # scan reasons about (New-Object) changes what that command does.
+        ("L1ScopedAssign", "    $script:r = @{}\n    $r.Attributes = 2"),
+        ("L1TrapSetter", "    throw 'boom'\n    $r = @{}\n    trap { $r.Attributes = 2; continue }"),
+        ("L1DeferredBlock", "    $r = @{}\n    { $r.Attributes = 2 }"),
+        ("L1ShadowNew", "    param([string]$Target)\n    function New-Object { param($TypeName) Get-Item -LiteralPath $Target }\n"
+                        "    $r = New-Object System.Diagnostics.ProcessStartInfo\n    $r.Attributes = 2"),
+        # Still fresh: a script block handed to a command runs in line.
+        ("L1InlineBlock", "    $r = [ordered]@{}\n    1 | ForEach-Object { $r.a = $_ }"),
     ]
 
     # Adversary A8 (same class as A3): template shapes that name a parameter by alias or abbreviation.
@@ -765,6 +775,8 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c echo x' -RSO 'C:\\outside\\stdout.txt'\n"
         "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c echo x' -RSE 'C:\\outside\\stderr.txt'\n"
         "New-Item -ItemType Directory -Path $Work -N:'..\\escape' -Force\n"
+        # Third adversary pass A7: a template function named like a command the proof evaluates changes the proof.
+        "function Join-Path { param($Path, $ChildPath) 'C:\\outside' }\n"
     )
 
     @classmethod
@@ -821,9 +833,23 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
             "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath $NULL",
             "Get-AttrCudaEmbeddedFunctionSource -Name @('CaseRoot') -ModulePath (join-path $psscriptroot 'Dirty.psm1')",
         ], raw_modules={"Notes.psm1": "<#\nfunction Get-AttrCudaEmbeddedFunctionSource {\n}\n#>\n"})
+        # Third adversary pass A1 / A6: a positional path after a common-parameter ALIAS (-vb, -db) binds -ModulePath, and a
+        # generator that defines its own Join-Path / Split-Path / alias changes what the scan's own evaluation means.
+        cls.shadow = cls._scan("shadow", [
+            ("Clean.psm1", [("PosVb", cls.CLEAN), ("PosDb", cls.CLEAN), ("ShadowF", cls.CLEAN)]),
+            ("Dirty.psm1", [("ShadowF", cls.RAW_WRITE)]),
+        ], ["Clean.psm1", "Dirty.psm1"], [
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'PosVb' -vb (Join-Path $PSScriptRoot 'Dirty.psm1')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'PosDb' -db (Join-Path $PSScriptRoot 'Dirty.psm1')",
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1') -Name 'ShadowF'",
+        ], generator_preamble=("function Join-Path { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
+                               "function global:Split-Path { param($Path) 'C:\\fixture' }\n"
+                               "Set-Alias -Name Get-Item -Value Get-Date\n"
+                               "New-Alias New-Object Get-Date\n"))
 
     @classmethod
-    def _scan(cls, label: str, modules: list, on_list: list, calls: list, *, extra_files=(), template_extra: str = "", raw_modules=None) -> dict:
+    def _scan(cls, label: str, modules: list, on_list: list, calls: list, *, extra_files=(), template_extra: str = "", raw_modules=None,
+              generator_preamble: str = "") -> dict:
         directory = cls.tmp / label
         directory.mkdir()
         for file_name, text in (raw_modules or {}).items():
@@ -835,7 +861,7 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
             target.write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in functions), encoding="utf-8")
         generator = directory / "fixture-gen.ps1"
         template = cls.TEMPLATE.replace("__EMBEDDED_FUNCTIONS__", template_extra + "__EMBEDDED_FUNCTIONS__")
-        generator.write_text("".join(f"$e = {call}\n" for call in calls) + "$template = @'\n" + template + "'@\n", encoding="utf-8")
+        generator.write_text(generator_preamble + "".join(f"$e = {call}\n" for call in calls) + "$template = @'\n" + template + "'@\n", encoding="utf-8")
         return run_scan(generators=[generator], modules=[directory / m for m in on_list], splice_sources=[generator])
 
     @staticmethod
@@ -908,8 +934,37 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
 
     def test_l1_an_assignment_that_comes_first_in_an_enclosing_block_still_makes_a_receiver_fresh(self) -> None:
         found = self.of(self.l1, "L1FreshNested")
-        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal", "literal"], describe(found))
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
         self.assertEqual([k for k in self.unlisted(found) if k[0] == "R5"], [])
+
+    def test_l1_a_scoped_assignment_a_trap_a_deferred_block_or_a_shadowed_constructor_does_not_make_a_receiver_fresh(self) -> None:
+        for name in ("L1ScopedAssign", "L1TrapSetter", "L1DeferredBlock"):
+            found = self.of(self.l1, name)
+            self.assertIn(("R5", "$r.Attributes"), self.unlisted(found), f"{name} was judged fresh\n" + describe(found))
+        found = self.of(self.l1, "L1ShadowNew")
+        self.assertTrue([f for f in found if "shadow" in f["reason"]], "a local New-Object was trusted\n" + describe(found))
+        self.assertIn(("R1", "function New-Object"), self.unlisted(found), describe(found))
+
+    def test_l1_a_script_block_handed_to_a_command_still_runs_in_line_so_a_fresh_receiver_stays_fresh(self) -> None:
+        found = self.of(self.l1, "L1InlineBlock")
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+        self.assertEqual([k for k in self.unlisted(found) if k[0] == "R5"], [])
+
+    def test_l1_a_template_function_named_like_join_path_is_a_finding(self) -> None:
+        shadows = [v for v in self.l1["violations"] if "shadow" in v["reason"] and "Join-Path" in v["text"]]
+        self.assertEqual(len(shadows), 1, json.dumps(self.l1["violations"], indent=2))
+
+    def test_l2_a_positional_module_path_after_a_common_parameter_alias_is_a_finding(self) -> None:
+        for name, flag in (("PosVb", "-vb"), ("PosDb", "-db")):
+            self.assertEqual(len(self.call_findings(self.shadow, f"'{name}' {flag}")), 1, describe(self.shadow["splicedViolations"]))
+            self.assertEqual(self.modules_of(self.shadow, name), [], f"{flag}: the clean default module was scanned in place of the path")
+
+    def test_l2_a_splice_source_that_defines_join_path_split_path_or_an_alias_of_a_command_the_scan_evaluates_is_a_finding(self) -> None:
+        shadows = [f for f in self.shadow["splicedViolations"] if f["rule"] == "splice" and "shadow" in f["reason"]]
+        texts = " | ".join(f["text"] for f in shadows)
+        for needle in ("Join-Path", "Split-Path", "New-Object"):
+            self.assertIn(needle, texts, f"no shadow finding names {needle}\n" + describe(self.shadow["splicedViolations"]))
+        self.assertNotIn("Get-Item", texts, "Get-Item is not a command the scan evaluates")
 
     def test_l1_template_parameters_named_by_alias_or_abbreviation_are_still_judged(self) -> None:
         # Advisory A8, same class as A3: -RSO / -RSE are aliases of Start-Process -RedirectStandardOutput / -Error, -N: abbreviates -Name.
