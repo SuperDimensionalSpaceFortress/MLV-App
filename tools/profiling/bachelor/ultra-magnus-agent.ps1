@@ -2061,6 +2061,22 @@ function Get-LeaseSlotAgeText {
     catch { return "unknown" }
 }
 
+function ConvertFrom-HeavySlotHolderText {
+    # adversary r3 A2. Pure. Splits the holder text of a `heavy-slot.py status` slot line -- "<label> (pid P[, since S][, held M min][, <other>]) [mode]" -- into
+    # label, owner pid (string), since text and held minutes (null when absent); $null when the text does not end that way. The metadata group is the LAST
+    # "(pid N...)" before the optional [mode] tag, so an owner label may itself contain "(pid N)" (job id 'suite (pid 12)' -> label 'mlv suite (pid 12)').
+    param([string]$Text)
+    if ($Text -notmatch '(?s)^(.*) \(pid (\d+)((?:, [^,)]*)*)\)(?: \[[^\]]*\])?\s*$') { return $null }
+    $label = $Matches[1]
+    $ownerPid = $Matches[2]
+    $rest = $Matches[3]
+    $since = $null
+    $held = $null
+    if ($rest -match ', since ([^,)]*)') { $since = $Matches[1] }
+    if ($rest -match ', held (\d+) min') { $held = [int]$Matches[1] }
+    return [pscustomobject]@{ label = $label; ownerPid = $ownerPid; since = $since; heldMin = $held }
+}
+
 function Add-LeaseSlotSnapshot {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1: ONE `heavy-slot.py status` probe, logged as who holds each slot (owner, pid, age) and how many runs
     # are queued; Phase is request | grant. The probe is Invoke-HeavySlotStatus, so it is bounded by that helper's own 30 s timeout (which
@@ -2092,12 +2108,9 @@ function Add-LeaseSlotSnapshot {
             $who = $Matches[2]
             if ($who -eq "free") { $parts.Add("slot ${n}: free"); continue }
             # adversary r1 A1: heavy-slot.py may add fields after the timestamp (", held 5 min"); only the timestamp token is the age's start.
-            if ($who -match '^(.*?) \(pid (\d+)(?:, since (\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?))?[,)]') {
-                $owner = $Matches[1]
-                $ownerPid = $Matches[2]
-                $since = $Matches[3]
-                $parts.Add("slot ${n}: $owner pid=$ownerPid age=$(Get-LeaseSlotAgeText -Since $since)")
-            }
+            # adversary r3 A2: the metadata group is read from the RIGHT (ConvertFrom-HeavySlotHolderText), so a label may contain "(pid N)".
+            $h = ConvertFrom-HeavySlotHolderText -Text $who
+            if ($null -ne $h) { $parts.Add("slot ${n}: $($h.label) pid=$($h.ownerPid) age=$(Get-LeaseSlotAgeText -Since $h.since)") }
             else { $parts.Add("slot ${n}: $who") }
         }
         if ($parts.Count -lt 1) { Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown(status output unrecognised)"; return }
@@ -2141,7 +2154,9 @@ function Get-HeavySlotOccupancy {
         $n = [int]$Matches[1]
         $who = $Matches[2]
         if ($OwnSlot -gt 0 -and $n -eq $OwnSlot -and $who -ne "free") {
-            if ($Label -and $OwnPid -gt 0 -and $who -match '^(.*?) \(pid (\d+)[,)]' -and $Matches[1] -eq $Label -and [int]$Matches[2] -eq $OwnPid) { $ownSeen = $true; continue }
+            # adversary r3 A2: the label is everything before the LAST "(pid N...)" group, so a label that contains "(pid N)" still matches itself.
+            $oh = if ($Label -and $OwnPid -gt 0) { ConvertFrom-HeavySlotHolderText -Text $who } else { $null }
+            if ($null -ne $oh -and $oh.label -eq $Label -and [int]$oh.ownerPid -eq $OwnPid) { $ownSeen = $true; continue }
             $ownWho = $who
             $o.ownLost = $true
         }
@@ -2289,9 +2304,11 @@ function Format-HeavySlotHolderNote {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         $label = $line
         $min = -1
-        if ($line -match '(?s)^(.*?) \(pid \d+(?:, since [^,)]*)?(?:, held (\d+) min)?\)') {
-            $label = $Matches[1]
-            if ($Matches[2]) { $min = [int]$Matches[2] }
+        # adversary r3 A2: read from the RIGHT, so a label containing "(pid N)" is kept whole and the held minutes come from the last group.
+        $hp = ConvertFrom-HeavySlotHolderText -Text $line
+        if ($null -ne $hp) {
+            $label = $hp.label
+            if ($null -ne $hp.heldMin) { $min = [int]$hp.heldMin }
         }
         if ($null -eq $best -or $min -gt $bestMin) { $best = $label; $bestMin = $min }
     }
@@ -3396,6 +3413,7 @@ function Wait-QuietLeaseAdmission {
     try {
         while ($true) {
             $now = Get-Date
+            $snapCostSec = 0.0
             $waited = ($now - $t0).TotalSeconds
             if (Test-Path -LiteralPath (Join-Path $cancel "$JobId.cancel") -PathType Leaf) {
                 return [pscustomobject]@{ gate = $script:GateVersion; mode = "lease"; label = "cancelled-in-gate"; state = "cancelled"; waitedSec = [int]$waited; probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = "cancel file present before launch"; leaseRefusals = @($refusals.ToArray()) }
@@ -3445,7 +3463,9 @@ function Wait-QuietLeaseAdmission {
             # AGENT-LEASE-PENDING-HEAT-TRACE-1: ONE slot snapshot per job when its first request is made (a re-ask after a refusal adds none).
             if (-not $snapshotRequestDone -and $requests -ge 1) {
                 $snapshotRequestDone = $true
+                $snapT = Get-Date
                 Add-LeaseSlotSnapshot -JobId $JobId -Phase "request" -WaitedSec ((Get-Date) - $t0).TotalSeconds -HeadroomSec (Get-LeaseSnapshotHeadroomSec -Verdict $v -QueueLeftSec $(if ($maxAge -gt 0) { [double]$maxAge - [double]$age } else { [double]::PositiveInfinity }))
+                $snapCostSec = [Math]::Max(0.0, ((Get-Date) - $snapT).TotalSeconds)   # adversary r3 A1: what the probe took, so the re-ask below is timed as if it had not run
             }
             if ($null -ne $lease) {
                 $u = Update-QuietLeaseRequest -Lease $lease
@@ -3517,6 +3537,15 @@ function Wait-QuietLeaseAdmission {
                 }
                 else { $state = "lease-pending"; $why = $u.why }
                 if ($null -ne $abandon) {
+                    # adversary r3 A1: the re-ask is LeaseRetrySec after the refusal, not after the request-time slot probe that may have run in this
+                    # iteration (logging must not move an admission time). A child that exited is timed from its ExitTime; any other kind from now less the
+                    # probe's cost. Both are clamped to the request time. Without a probe this iteration, it is exactly Get-Date, as before.
+                    $retryFrom = Get-Date
+                    if ($snapCostSec -gt 0) {
+                        $retryFrom = $retryFrom.AddSeconds(-$snapCostSec)
+                        if ($u.state -eq "exited") { try { $ex = [DateTime]$lease.proc.ExitTime; if ($ex -le (Get-Date)) { $retryFrom = $ex } } catch { } }
+                        if ($retryFrom -lt $lease.requested) { $retryFrom = $lease.requested }
+                    }
                     $null = Stop-QuietLease -Lease $lease -Why "lease $abandon"
                     $lease = $null
                     $script:QuietLeaseWaiting = $null
@@ -3524,7 +3553,7 @@ function Wait-QuietLeaseAdmission {
                     if ($null -ne $script:GateHour) { $script:GateHour.requeued++ }
                     $state = "lease-$abandon"
                     $why = $refusals[$refusals.Count - 1].why
-                    $nextRequestAt = (Get-Date).AddSeconds($LeaseRetrySec)
+                    $nextRequestAt = $retryFrom.AddSeconds($LeaseRetrySec)
                 }
             }
             # maint-dispatch r1 holds in lease mode too: light jobs are not held behind this wait.

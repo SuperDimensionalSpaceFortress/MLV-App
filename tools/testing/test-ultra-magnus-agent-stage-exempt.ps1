@@ -68,7 +68,7 @@ $classifyFn = Find-Function 'Get-GateExemptClass'
 if ($null -ne $classifyFn) { . ([scriptblock]::Create($classifyFn.Extent.Text)) }
 # AGENT-LEASE-PENDING-HEAT-TRACE-1: the lease wait's logging callees (waiting-line heat fields, grant slot snapshot); lifted when present. Invoke-HeavySlotStatus is
 # not lifted: the snapshot catches the missing probe and logs slots=unknown(...), which is all these cases need from it.
-foreach ($name in @('Get-LeaseWaitHeatField', 'Get-LeaseSlotAgeText', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec')) { $fn = Find-Function $name; if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) } }
+foreach ($name in @('Get-LeaseWaitHeatField', 'Get-LeaseSlotAgeText', 'ConvertFrom-HeavySlotHolderText', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec')) { $fn = Find-Function $name; if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) } }
 # BACHELOR-LEASE-BATCH-LEGS-1 r5: Invoke-QueuedJob and the lease wait call the lease-batch block (no batch is open here); lifted when present.
 foreach ($name in @('Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId', 'Test-LeaseBatchClosePending', 'Get-QuietLeaseRemainingSec', 'Get-QuietLeaseRenewOkGapSec',
         'Get-LeaseBatchAdmission', 'Open-LeaseBatch', 'Use-LeaseBatchForJob', 'Get-LeaseBatchJobStop', 'Complete-LeaseBatchJob', 'Write-LeaseBatchReceipt', 'Close-LeaseBatch',

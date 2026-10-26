@@ -113,7 +113,7 @@ foreach ($name in $liftNotAfter) {
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
 # lease-batch r4 (the merge of not-after r1): the same, so batch-refusal-ends-batch fails on behaviour against an agent without it.
-foreach ($name in @('Close-LeaseBatchAfterRelease', 'ConvertTo-UtcDateTime', 'Get-LeaseWaitHeatField', 'Get-LeaseSlotAgeText', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec')) {   # the last five: AGENT-LEASE-PENDING-HEAT-TRACE-1 (ConvertTo-UtcDateTime: the headroom helper reads the sidecar bound with it)
+foreach ($name in @('Close-LeaseBatchAfterRelease', 'ConvertTo-UtcDateTime', 'Get-LeaseWaitHeatField', 'Get-LeaseSlotAgeText', 'ConvertFrom-HeavySlotHolderText', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec')) {   # the last five: AGENT-LEASE-PENDING-HEAT-TRACE-1 (ConvertTo-UtcDateTime: the headroom helper reads the sidecar bound with it)
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -2178,7 +2178,8 @@ function Exit-HeavySlot {
         $script:FeedReads = 0; $script:StatusCalls = 0; $script:FeedStub = $null; $script:StatusStub = $null; $script:StatusThrows = $false; $script:FeedThrows = $false
         $hotMetrics = [pscustomobject]@{ rows = 150; window = 60; throttled = 6; meanC = 88.2; max15C = 97; watts30 = 41.5 }
         function Read-HeavySlotFeedMetrics { $script:FeedReads++; if ($script:FeedThrows -and $null -eq $script:QuietLease) { throw 'feed boom' }; return $script:FeedStub }   # throws only while waiting: the real reader never throws, and the grant's own read is not under test
-        function Invoke-HeavySlotStatus { param([string]$HeartbeatActivity = ''); $script:StatusCalls++; if ($script:StatusThrows) { throw 'status boom' }; return $script:StatusStub }
+        $script:StatusDelaySec = 0
+        function Invoke-HeavySlotStatus { param([string]$HeartbeatActivity = ''); $script:StatusCalls++; if ($script:StatusDelaySec -gt 0) { Start-Sleep -Milliseconds ([int]($script:StatusDelaySec * 1000)) }; if ($script:StatusThrows) { throw 'status boom' }; return $script:StatusStub }
         $since = (Get-Date).AddSeconds(-300).ToString('yyyy-MM-dd HH:mm:ss')
         $slotsOk = @{ ok = $true; error = $null; lines = @("slot 1: suite X (pid 77, since $since) [exclusive]", 'slot 2: free', 'thermal: max 99 C, throttled 6/15, 40 W over ~30 s', "queue 1: mlv j9 (pid 78, since $since)") }
         function Invoke-HeatTraceCase([string]$JobId, [hashtable]$Control) {
@@ -2317,6 +2318,40 @@ function Exit-HeavySlot {
             $plain = Get-LeaseSlotAgeText -Since '2026-10-25 10:00:00' -NowUtc ([DateTime]::new(2026, 10, 25, 16, 5, 0, [DateTimeKind]::Utc)) -Zone $cst
             $future = Get-LeaseSlotAgeText -Since '2026-10-25 12:00:00' -NowUtc ([DateTime]::new(2026, 10, 25, 16, 5, 0, [DateTimeKind]::Utc)) -Zone $cst
             Assert-True ($spring -ceq '600s' -and $fall -ceq 'unknown' -and $gap -ceq 'unknown' -and $plain -ceq '3900s' -and $future -ceq 'unknown' -and (Get-LeaseSlotAgeText -Since 'x') -ceq 'unknown') "heat-trace A2(r2): spring-forward 01:55 CST -> 03:05 CDT is 600 s (not 4200), the ambiguous/non-existent hours are unknown, a plain age is exact: spring=$spring fall=$fall gap=$gap plain=$plain future=$future"
+            # (j) adversary r3 A2: an owner label may contain '(pid N)' (job id 'suite (pid 12)' -> label 'mlv suite (pid 12)'): the metadata group is the LAST one before [mode].
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @("slot 1: mlv suite (pid 12) (pid 77, since $since, held 5 min) [exclusive]", 'slot 2: free') }
+            $r15 = Invoke-HeatTraceCase 'jHt15' @{ request = 'active'; active_after = 1.5 }
+            Assert-True ($r15.snaps.Count -eq 2 -and @($r15.snaps | Where-Object { $_ -notmatch 'slot 1: mlv suite \(pid 12\) pid=77 age=(29\d|3\d\d)s; slot 2: free' }).Count -eq 0) "heat-trace A2(r3): a label containing '(pid 12)' is named whole with the real owner pid 77 and its age: $($r15.snaps -join ' || ')"
+            Exit-HeavySlot
+            $script:StatusStub = $slotsOk
+
+            # (k) adversary r3 A1: the request-time probe must not consume admission time. A refusal that lands while a slow probe runs is asked again
+            # LeaseRetrySec after the refusal (as without the probe), not after the probe: otherwise the job crosses its queue ceiling and is queue-expired.
+            # Scaled: retry 5 s, ceiling 9 s, probe 5 s; the fake refuses the first request at once. Without the probe the second request is made at ~5 s.
+            $savedRetry = $LeaseRetrySec; $LeaseRetrySec = 5
+            $script:LeaseSnapshotSkipBelowSec = 1
+            $script:HtT0 = Get-Date
+            function Get-QueueAgeSeconds { param($Job, $Metadata) return [int]((Get-Date) - $script:HtT0).TotalSeconds }
+            try {
+                $metaQ = [pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 9 }
+                $out = @{}
+                foreach ($delay in @(0, 5)) {
+                    $script:StatusDelaySec = $delay
+                    Reset-Case @{ request = 'refuse_then_active'; refuse_count = 1 }
+                    $script:AgeAfter = (Get-Date).AddSeconds(120); $script:StatusCalls = 0; $script:HtT0 = Get-Date
+                    $admK = Wait-QuietLeaseAdmission -JobId "jHtK$delay" -Job ([pscustomobject]@{}) -Metadata $metaQ
+                    $script:Admission = $admK
+                    $out[$delay] = [pscustomobject]@{ label = $admK.label; requests = $admK.leaseRequests; calls = $script:StatusCalls }
+                    if ($null -ne $script:QuietLease) { Exit-HeavySlot }
+                }
+                Assert-True ($out[0].label -eq 'clear' -and $out[0].requests -eq 2) "heat-trace A1(r3) baseline: with an instant probe the refused job is asked again and admitted: $($out[0] | ConvertTo-Json -Compress)"
+                Assert-True ($out[5].calls -ge 1) "heat-trace A1(r3): the slow probe really ran (calls=$($out[5].calls))"
+                Assert-True ($out[5].label -eq $out[0].label -and $out[5].requests -eq $out[0].requests) "heat-trace A1(r3): a 5 s probe changes neither the admission outcome nor the number of requests: instant=$($out[0] | ConvertTo-Json -Compress) slow=$($out[5] | ConvertTo-Json -Compress)"
+            }
+            finally {
+                $LeaseRetrySec = $savedRetry; $script:LeaseSnapshotSkipBelowSec = 70; $script:StatusDelaySec = 0
+                function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return [int]$script:HtAge }
+            }
             $results.leasePendingHeatTrace = [ordered]@{ waitLines = $r.waits.Count; sample = $r.waits[0]; requestSnapshot = $sReq[0]; grantSnapshot = $sGrant[0]; staleSample = $r2.waits[0]; timeoutSample = $r5.snaps[0] }
         }
         finally {
