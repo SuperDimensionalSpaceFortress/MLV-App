@@ -42,15 +42,20 @@
 #
 # MODULE BINDING (ATTR3-SCAN-COVERAGE-LIMITS-1 L2). A call is resolved against the module the extractor
 # will read for THAT call, not against every -ModulePath module:
-#   - no -ModulePath on the call: the -ModulePath module that defines the extractor itself (the
-#     extractor's default module); when no -ModulePath module defines it, every -ModulePath module is a
-#     candidate;
-#   - a literal -ModulePath ('X.psm1' or Join-Path <anything> 'X.psm1'): the one -ModulePath module with
-#     that file name; none, or more than one, is a 'splice' finding;
-#   - any other -ModulePath expression (a variable): every -ModulePath module is a candidate, so the name
-#     must be defined by exactly one of them;
+#   - no -ModulePath on the call, or an empty / blank / $null one (the extractor falls back to its default):
+#     the -ModulePath module that defines the extractor itself; when no -ModulePath module defines it,
+#     every -ModulePath module is a candidate;
+#   - a rooted string literal, or exactly `Join-Path $PSScriptRoot '<child>'` (resolved against the
+#     directory of the file that holds the call): the -ModulePath module with that FULL path, never one
+#     with the same file name elsewhere; no such module is a 'splice' finding;
+#   - any other -ModulePath expression (a variable, an index, a sub-expression, however path-like its
+#     text): every -ModulePath module is a candidate, so the name must be defined by exactly one of them;
 #   - a call that splats, or passes a second positional argument (which binds -ModulePath), or repeats
-#     -ModulePath: a 'splice' finding, because its module is unknown.
+#     -ModulePath, or gives a relative literal path: a 'splice' finding, because its module is unknown.
+# The extractor's parameters are matched the way PowerShell binds them, by any prefix (-M, -N), and a
+# -Name that is anything but string constants in @( ) / , / parentheses (a + expression, a variable) is a
+# 'splice' finding. Template parameters of New-Item, Expand-Archive, Export-Csv and Start-Process are
+# likewise matched by prefix and by the cmdlet's own aliases (-RSO, -RSE, -LP).
 # A name the bound module does not define, a name two candidates define, or a module the scan was not
 # given is a 'splice' finding (fail closed): the scan never reads a same-named helper from a module the
 # extractor will not read. A variable -ModulePath is bound only by uniqueness; the text of the temp file
@@ -59,9 +64,11 @@
 # PROPERTY SETS IN BODIES (ATTR3-SCAN-COVERAGE-LIMITS-1 L1). `$receiver.Member = ...` is an R5 finding
 # (token = the target text), and in a spliced body each one carries an `origin` for the receiver:
 # 'literal' / 'constructed:<Type>' when EVERY assignment to the receiver variable builds a fresh object
-# (a hashtable, [ordered] or [pscustomobject] literal; New-Object <Type>; [Type]::new), otherwise 'other'
-# (a command or member result, a compound assignment), 'unbound' (a parameter, loop variable or captured
-# variable), 'nested' (`$a.b.c = ...`), 'scoped' or 'complex'. The origin is data for the caller; this
+# (a hashtable, [ordered] or [pscustomobject] literal; New-Object <Type>; [Type]::new) and nothing else
+# binds the variable. Otherwise it lists, ';'-joined: 'other' (a command or member result, a compound
+# assignment, a foreach variable, a multi-target assignment, [ref]$v, -OutVariable / -ErrorVariable /
+# ... or their aliases and prefixes), 'unbound' (a parameter, or no binding at all), and for a different
+# receiver shape 'nested' (`$a.b.c = ...`), 'scoped' or 'complex'. The origin is data for the caller; this
 # script still decides nothing. Index assignments keep the template rule: any target that is not a plain
 # unscoped non-root variable is a finding. The helpers that ARE the
 # runtime boundary (Publish-AttrCuda*, New-AttrCudaDirectory, Remove-AttrCuda*) legitimately hold the
@@ -216,14 +223,23 @@ function Get-VariableName($VariableAst) {
     return [pscustomobject]@{ scope = ''; name = $user }
 }
 
-function Get-NamedArguments($Command, [string[]]$Names) {
+function Get-NamedArguments($Command, [string[]]$Names, [string]$Cmdlet = '') {
+    # PowerShell binds a parameter by any unique PREFIX of its name or of one of its aliases (-M for -ModulePath,
+    # -RSO for Start-Process -RedirectStandardOutput), so a one-character prefix and the cmdlet's own aliases
+    # count. -Cmdlet names the cmdlet whose aliases to add; a script function has none to look up.
     $found = [System.Collections.Generic.List[object]]::new()
     $elements = $Command.CommandElements
+    $cmdletInfo = if ($Cmdlet) { Get-Command -Name $Cmdlet -CommandType Cmdlet, Function -ErrorAction SilentlyContinue | Select-Object -First 1 } else { $null }
+    $spellings = @{}
+    foreach ($name in $Names) {
+        $spellings[$name] = @($name)
+        if ($null -ne $cmdletInfo -and $cmdletInfo.Parameters.ContainsKey($name)) { $spellings[$name] = @($name) + @($cmdletInfo.Parameters[$name].Aliases) }
+    }
     for ($i = 1; $i -lt $elements.Count; $i++) {
         $element = $elements[$i]
         if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
         foreach ($name in $Names) {
-            if ($element.ParameterName.Length -ge 2 -and $name.StartsWith($element.ParameterName, [StringComparison]::OrdinalIgnoreCase)) {
+            if (@($spellings[$name] | Where-Object { $_.StartsWith($element.ParameterName, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0 -and $element.ParameterName.Length -ge 1) {
                 if ($null -ne $element.Argument) { $found.Add($element.Argument) }
                 elseif ($i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $found.Add($elements[$i + 1]) }
                 else { $found.Add($null) }
@@ -233,11 +249,13 @@ function Get-NamedArguments($Command, [string[]]$Names) {
     return , $found
 }
 
-function Get-PositionalCount($Command) {
+function Get-PositionalCount($Command, [string[]]$SwitchNames = @()) {
     # Elements that are neither a parameter nor the value consumed by the preceding parameter. Switch
     # parameters (-Force, -NoTypeInformation) consume nothing, so a value following one is counted
     # as positional -- conservative for the mutators, which never need a positional argument.
-    $switchNames = @('Force', 'NoTypeInformation', 'PassThru', 'Wait', 'NoNewWindow', 'Recurse', 'Confirm', 'WhatIf', 'Append', 'NoClobber')
+    # -SwitchNames replaces the mutators' list with the switches of another command (the extractor's own are
+    # Verbose and Debug), because a short prefix such as -N would otherwise be read as -NoNewWindow.
+    $switchNames = if ($SwitchNames.Count -gt 0) { $SwitchNames } else { @('Force', 'NoTypeInformation', 'PassThru', 'Wait', 'NoNewWindow', 'Recurse', 'Confirm', 'WhatIf', 'Append', 'NoClobber') }
     $elements = $Command.CommandElements
     $count = 0
     for ($i = 1; $i -lt $elements.Count; $i++) {
@@ -318,8 +336,49 @@ function Get-ReceiverOrigin($Target, $Root) {
     if ($v.scope -ne '') { return 'scoped' }
     if ($depth -gt 1) { return 'nested' }
     $assignments = @(Get-AssignmentsTo $Root $v.name)
-    if ($assignments.Count -eq 0) { return 'unbound' }
-    return (@($assignments | ForEach-Object { Get-AssignedObjectOrigin $_ } | Sort-Object -Unique) -join ';')
+    $origins = @($assignments | ForEach-Object { Get-AssignedObjectOrigin $_ }) + @(Get-OtherBindings $Root $v.name)
+    if ($origins.Count -eq 0) { return 'unbound' }
+    return (@($origins | Sort-Object -Unique) -join ';')
+}
+
+function Get-OtherBindings($Root, [string]$Name) {
+    # Every way a variable gets a value besides `$v = <expr>`: a parameter ('unbound'), and a foreach variable, a
+    # multi-target assignment, [ref], and -OutVariable / -ErrorVariable / ... (including their aliases and
+    # prefixes), which all bind a value of unknown origin ('other'). A -XxxVariable whose argument is not a
+    # literal name could name any variable, so it counts against every receiver.
+    $tags = [System.Collections.Generic.List[string]]::new()
+    $variableParameters = @('OutVariable', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'PipelineVariable', 'ov', 'ev', 'wv', 'iv', 'pv')
+    foreach ($node in $Root.FindAll({ param($n) $true }, $true)) {
+        if ($node -is [System.Management.Automation.Language.ParameterAst]) {
+            if ($node.Name.VariablePath.UserPath -ieq $Name) { $tags.Add('unbound') }
+        } elseif ($node -is [System.Management.Automation.Language.ForEachStatementAst]) {
+            if ($node.Variable.VariablePath.UserPath -ieq $Name) { $tags.Add('other') }
+        } elseif ($node -is [System.Management.Automation.Language.AssignmentStatementAst]) {
+            $left = $node.Left
+            if ($left -is [System.Management.Automation.Language.ArrayLiteralAst] -or $left -is [System.Management.Automation.Language.ParenExpressionAst]) {
+                $bound = @($left.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -ieq $Name }, $true))
+                if ($bound.Count -gt 0) { $tags.Add('other') }
+            }
+        } elseif ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) {
+            if ($node.Type.TypeName.FullName -ieq 'ref' -and $node.Child -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                $node.Child.VariablePath.UserPath -ieq $Name) { $tags.Add('other') }
+        } elseif ($node -is [System.Management.Automation.Language.CommandAst]) {
+            $elements = $node.CommandElements
+            for ($i = 1; $i -lt $elements.Count; $i++) {
+                $element = $elements[$i]
+                if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+                if (@($variableParameters | Where-Object { $_.StartsWith($element.ParameterName, [StringComparison]::OrdinalIgnoreCase) }).Count -eq 0) { continue }
+                $value = $element.Argument
+                if ($null -eq $value -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $value = $elements[$i + 1] }
+                if ($value -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                    if (([string]$value.Value).TrimStart('+') -ieq $Name) { $tags.Add('other') }
+                } else {
+                    $tags.Add('other')
+                }
+            }
+        }
+    }
+    return $tags.ToArray()
 }
 
 function Test-Provable($Ast, $Root, $Visiting) {
@@ -428,12 +487,12 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
             }
         }
         if ($key -eq 'new-item') {
-            if ((Get-NamedArguments $command @('Name')).Count -gt 0) {
+            if ((Get-NamedArguments $command @('Name') $name).Count -gt 0) {
                 Add-Violation $Source $command 'R2' 'New-Item -Name is not allowed (it can traverse out of -Path)'
             }
             # Only a plain directory or file; a SymbolicLink/Junction/HardLink under $Work would let a
             # later provable write land outside it.
-            $types = Get-NamedArguments $command @('ItemType')
+            $types = Get-NamedArguments $command @('ItemType') $name
             $typeOk = $types.Count -eq 1 -and $null -ne $types[0] -and
                 ($types[0] -is [System.Management.Automation.Language.StringConstantExpressionAst]) -and
                 (@('Directory', 'File') -ccontains [string]$types[0].Value)
@@ -451,7 +510,7 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
             }
         }
         if ($mutatorParams.ContainsKey($key)) {
-            $destinations = Get-NamedArguments $command $mutatorParams[$key]
+            $destinations = Get-NamedArguments $command $mutatorParams[$key] $name
             if ($key -ne 'start-process') {
                 if ((Get-PositionalCount $command) -gt 0) {
                     Add-Violation $Source $command 'R2' "$name has a positional argument; its destination must be named"
@@ -586,43 +645,62 @@ function Add-SpliceFinding([string]$Source, [int]$Line, [string]$Function, [stri
     $splicedViolations.Add([ordered]@{ source = $Source; module = ''; function = $Function; line = $Line; rule = 'splice'; token = 'splice'; origin = ''; text = $Text; reason = $Reason })
 }
 
-function Get-SpliceModuleBinding($Call) {
-    # Which module the extractor will read for this call: kind 'default' (no -ModulePath: the extractor's own
-    # module), 'leaf' (a literal / Join-Path -ModulePath: bound by file name), 'dynamic' (any other expression)
-    # or 'unsupported' (a call shape whose -ModulePath cannot be read, so the binding is unknown).
+function Get-SpliceModuleBinding($Call, [string]$SourceDir) {
+    # Which module the extractor will read for this call: kind 'default' (no -ModulePath, or an empty / blank /
+    # $null one: the extractor's own module), 'path' (a rooted literal or Join-Path $PSScriptRoot '<child>': bound
+    # by FULL path), 'dynamic' (any other expression) or 'unsupported' (a call shape whose -ModulePath cannot be
+    # read, so the binding is unknown).
     foreach ($element in $Call.CommandElements) {
         if ($element -is [System.Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) {
-            return [pscustomobject]@{ kind = 'unsupported'; leaf = ''; reason = 'the call splats arguments, which can hide a -ModulePath' }
+            return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = 'the call splats arguments, which can hide a -ModulePath' }
         }
     }
     # -Name is position 0 and -ModulePath position 1, so a second positional argument binds -ModulePath.
     $expectedPositional = if ((Get-NamedArguments $Call @('Name')).Count -eq 0) { 1 } else { 0 }
-    if ((Get-PositionalCount $Call) -gt $expectedPositional) {
-        return [pscustomobject]@{ kind = 'unsupported'; leaf = ''; reason = 'the call passes a positional argument after -Name, which binds -ModulePath by position' }
+    if ((Get-PositionalCount $Call @('Verbose', 'Debug')) -gt $expectedPositional) {
+        return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = 'the call passes a positional argument after -Name, which binds -ModulePath by position' }
     }
     $modulePaths = Get-NamedArguments $Call @('ModulePath')
-    if ($modulePaths.Count -eq 0) { return [pscustomobject]@{ kind = 'default'; leaf = ''; reason = '' } }
+    if ($modulePaths.Count -eq 0) { return [pscustomobject]@{ kind = 'default'; path = ''; reason = '' } }
     if ($modulePaths.Count -gt 1 -or $null -eq $modulePaths[0]) {
-        return [pscustomobject]@{ kind = 'unsupported'; leaf = ''; reason = '-ModulePath is repeated or has no value' }
+        return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = '-ModulePath is repeated or has no value' }
     }
-    $argument = $modulePaths[0]
-    $plain = @($argument.FindAll({
-        param($n) ($n -is [System.Management.Automation.Language.SubExpressionAst]) -or ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -or
-                  ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -or
-                  (($n -is [System.Management.Automation.Language.VariableExpressionAst]) -and (Get-VariableName $n).name -cne 'PSScriptRoot') -or
-                  (($n -is [System.Management.Automation.Language.CommandAst]) -and $n.GetCommandName() -cne 'Join-Path')
-    }, $true)).Count -eq 0
-    $strings = @($argument.FindAll({
-        param($n) ($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -and
-                  -not (($n.Parent -is [System.Management.Automation.Language.CommandAst]) -and $n.Parent.CommandElements[0] -eq $n)
-    }, $true))
-    if ($argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $strings = @($argument) }
-    if ($plain -and $strings.Count -gt 0) {
-        $value = [string]$strings[$strings.Count - 1].Value
-        $leaf = $value.Substring($value.LastIndexOfAny([char[]]@('\', '/')) + 1)
-        if ($leaf -match '\.ps(m)?1$') { return [pscustomobject]@{ kind = 'leaf'; leaf = $leaf; reason = '' } }
+    # Only two exact shapes are read as a path: a rooted string literal, and `Join-Path $PSScriptRoot '<child>'`
+    # (resolved against the directory of the file that holds the call). Anything else, however path-like its
+    # contents, is a computed value. An empty, blank or $null value makes the extractor use its default module.
+    $node = $modulePaths[0]
+    while ($true) {
+        if ($node -is [System.Management.Automation.Language.ParenExpressionAst]) { $node = $node.Pipeline; continue }
+        if ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1) { $node = $node.PipelineElements[0]; continue }
+        if ($node -is [System.Management.Automation.Language.CommandExpressionAst]) { $node = $node.Expression; continue }
+        break
     }
-    return [pscustomobject]@{ kind = 'dynamic'; leaf = ''; reason = '' }
+    $dynamic = [pscustomobject]@{ kind = 'dynamic'; path = ''; reason = '' }
+    if ($node -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $node.Splatted -and $node.VariablePath.UserPath -ceq 'null') {
+        return [pscustomobject]@{ kind = 'default'; path = ''; reason = '' }
+    }
+    $child = $null
+    if ($node -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+        if ([string]::IsNullOrWhiteSpace([string]$node.Value)) { return [pscustomobject]@{ kind = 'default'; path = ''; reason = '' } }
+        if (-not [IO.Path]::IsPathRooted([string]$node.Value)) {
+            return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = '-ModulePath is a relative literal path, which depends on the working directory' }
+        }
+        try { return [pscustomobject]@{ kind = 'path'; path = [IO.Path]::GetFullPath([string]$node.Value); reason = '' } }
+        catch { return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = '-ModulePath is not a valid path' } }
+    }
+    if ($node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Join-Path' -and $node.InvocationOperator -eq 'Unknown') {
+        $parts = @($node.CommandElements | Select-Object -Skip 1)
+        if ($parts.Count -eq 2 -and @($parts | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] }).Count -eq 0 -and
+            $parts[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and $parts[0].VariablePath.UserPath -ceq 'PSScriptRoot' -and
+            $parts[1] -is [System.Management.Automation.Language.StringConstantExpressionAst] -and -not [string]::IsNullOrWhiteSpace([string]$parts[1].Value)) {
+            $child = [string]$parts[1].Value
+        }
+    }
+    if ($null -ne $child -and $SourceDir) {
+        try { return [pscustomobject]@{ kind = 'path'; path = [IO.Path]::GetFullPath((Join-Path $SourceDir $child)); reason = '' } }
+        catch { return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = '-ModulePath is not a valid path' } }
+    }
+    return $dynamic
 }
 
 function Get-SpliceCallSites([string]$Path) {
@@ -630,6 +708,7 @@ function Get-SpliceCallSites([string]$Path) {
     $tokens = $null; $errors = $null
     $ast = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $Path).Path, [ref]$tokens, [ref]$errors)
     $source = Get-RepoRelativePath $Path
+    $sourceDir = Split-Path -Parent (Resolve-Path -LiteralPath $Path).Path
     foreach ($err in @($errors)) {
         Add-SpliceFinding $source $err.Extent.StartLineNumber '' $err.Message 'splice source does not parse; its splice call sites cannot be enumerated'
     }
@@ -649,10 +728,13 @@ function Get-SpliceCallSites([string]$Path) {
         $argument = $null
         if ($named.Count -eq 1) { $argument = $named[0] }
         elseif ($named.Count -eq 0 -and $call.CommandElements.Count -gt 1 -and $call.CommandElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $argument = $call.CommandElements[1] }
+        # A literal list is built only from string constants, @( ) / , and parentheses; any other node (a variable, a
+        # + or -f expression, an index, a sub-expression, a command) computes the names, so they cannot be enumerated.
         $dynamic = $null -eq $argument -or @($argument.FindAll({
-            param($n) ($n -is [System.Management.Automation.Language.VariableExpressionAst]) -or ($n -is [System.Management.Automation.Language.SubExpressionAst]) -or
-                      ($n -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -or ($n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) -or
-                      ($n -is [System.Management.Automation.Language.CommandAst])
+            param($n) -not (($n -is [System.Management.Automation.Language.StringConstantExpressionAst]) -or ($n -is [System.Management.Automation.Language.ArrayLiteralAst]) -or
+                      ($n -is [System.Management.Automation.Language.ArrayExpressionAst]) -or ($n -is [System.Management.Automation.Language.StatementBlockAst]) -or
+                      ($n -is [System.Management.Automation.Language.PipelineAst]) -or ($n -is [System.Management.Automation.Language.CommandExpressionAst]) -or
+                      ($n -is [System.Management.Automation.Language.ParenExpressionAst]))
         }, $true)).Count -gt 0
         $names = @()
         if (-not $dynamic) {
@@ -663,13 +745,19 @@ function Get-SpliceCallSites([string]$Path) {
             Add-SpliceFinding $source $call.Extent.StartLineNumber '' $text 'the -Name list is not a literal list of function names, so the spliced bodies cannot be enumerated'
             continue
         }
-        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; bind = (Get-SpliceModuleBinding $call) }
+        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; bind = (Get-SpliceModuleBinding $call $sourceDir) }
     }
 }
 
 if ($SpliceSource.Count -gt 0) {
     $moduleTexts = [ordered]@{}
-    foreach ($modulePath in $ModulePath) { $moduleTexts[(Get-RepoRelativePath $modulePath)] = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $modulePath).Path) }
+    $moduleFullPaths = @{}
+    foreach ($modulePath in $ModulePath) {
+        $key = Get-RepoRelativePath $modulePath
+        $full = (Resolve-Path -LiteralPath $modulePath).Path
+        $moduleTexts[$key] = [IO.File]::ReadAllText($full)
+        $moduleFullPaths[$key] = [IO.Path]::GetFullPath($full)
+    }
     $entries = [ordered]@{}
     # The module the extractor reads when a call names no -ModulePath is the module that defines the extractor
     # ($script:AttrCudaModulePath). When no -ModulePath module defines it (a fixture), every module is a candidate.
@@ -686,9 +774,10 @@ if ($SpliceSource.Count -gt 0) {
                     if ($extractorModules.Count -eq 1) { $candidates = @($extractorModules) }
                     elseif ($extractorModules.Count -gt 1) { $bindingFailure = 'more than one -ModulePath module defines the extractor, so the default module is ambiguous' }
                 }
-                'leaf' {
-                    $candidates = @($moduleTexts.Keys | Where-Object { $_.Substring($_.LastIndexOf('/') + 1) -ieq $site.bind.leaf })
-                    if ($candidates.Count -ne 1) { $bindingFailure = "-ModulePath names '$($site.bind.leaf)', which is not exactly one scanner -ModulePath module ($($candidates.Count) match)" }
+                'path' {
+                    # By FULL path: a same-named file in another directory is a different module.
+                    $candidates = @($moduleTexts.Keys | Where-Object { $moduleFullPaths[$_] -ieq $site.bind.path })
+                    if ($candidates.Count -ne 1) { $bindingFailure = "-ModulePath names '$($site.bind.path)', which is not a scanner -ModulePath module" }
                 }
             }
             if ($bindingFailure) {
@@ -700,7 +789,7 @@ if ($SpliceSource.Count -gt 0) {
                 $pattern = '(?ms)^function\s+' + [regex]::Escape($functionName) + '\s*\{.*?^\}'
                 $definers = @($candidates | Where-Object { [regex]::IsMatch($moduleTexts[$_], $pattern) })
                 if ($definers.Count -eq 0) {
-                    $where = if ($site.bind.kind -eq 'leaf' -or ($site.bind.kind -eq 'default' -and $extractorModules.Count -eq 1)) { "the module this call reads ($($candidates[0]))" } else { 'no -ModulePath module' }
+                    $where = if ($site.bind.kind -eq 'path' -or ($site.bind.kind -eq 'default' -and $extractorModules.Count -eq 1)) { "the module this call reads ($($candidates[0]))" } else { 'no -ModulePath module' }
                     Add-SpliceFinding $site.source $site.line $functionName $site.text "$where defines an extractable function named '$functionName'"
                     continue
                 }

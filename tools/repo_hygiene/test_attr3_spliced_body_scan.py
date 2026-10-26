@@ -126,11 +126,11 @@ INERT_COMMANDS = frozenset("Get-Command Get-Counter Get-Item Group-Object Write-
 # foreign object, and `$f = Get-Item $Pub; $f.Attributes = ...` is a file write: that stays a finding and
 # needs a reviewed ALLOWLIST row. The scan reports the receiver's origin; this file decides.
 LOCAL_PROPERTY_SET = re.compile(r"^\$(?!Work\b|Pub\b|Cache\b|AgentRoot\b|Root\b)[A-Za-z_]\w*(\.\w+)+$")
-# Types a body builds only to fill in and hand to an effectful call that is itself a finding (Process.Start,
-# SetFileInformationByHandle, EnumDisplay*): setting their fields touches no file, process or registry.
+# Types a body builds only to fill in and hand to an effectful call that is itself a finding (Process.Start):
+# setting their fields touches no file, process or registry. A variable that is ALSO bound some other way
+# (foreach, [ref], -OutVariable, a parameter, a multi-target assignment) is no longer provably this object.
 INERT_LOCAL_TYPES = frozenset("""
-System.Diagnostics.ProcessStartInfo Diagnostics.ProcessStartInfo AttrCudaDisplayDevice AttrCudaDevMode
-AttrCudaWin32.FileIdNative+FileBasicInfo AttrCudaWin32.FileIdNative+FileDispositionInfo
+System.Diagnostics.ProcessStartInfo Diagnostics.ProcessStartInfo
 """.split())
 
 
@@ -318,6 +318,12 @@ _allow("Get-AttrCudaGuiSmokeDisplaySelection",
 _allow("Get-AttrCudaPresentMonWindowResult",
        "mutates a shallow PSObject.Copy() of the caller's parsed result and its nested process record; in-memory data only, nothing is written back to a file",
        ("R5", "$clone.process", 1), ("R5", "$clone.process.endedAtUtc", 1))
+_allow("Get-AttrCudaWindowsDisplayInventory",
+       "sets the size field of an AttrCudaDisplayDevice / AttrCudaDevMode struct this body built with New-Object, which EnumDisplay* then fills through [ref]; in-memory only",
+       ("R5", "$adapter.cb", 1), ("R5", "$monitor.cb", 1), ("R5", "$mode.dmSize", 1))
+_allow("Remove-AttrCudaFileByProof",
+       "sets fields of the FileDispositionInfo / FileBasicInfo structs this body built with ::new() and hands to SetFileInformationByHandle through [ref]; the call is the finding",
+       ("R5", "$disposition.DeleteFile", 1), ("R5", "$basic.FileAttributes", 1))
 _allow("Invoke-AttrCudaBoundedProbe",
        "attaches the throwaway runspace to the [powershell]::Create() shell this body made; the runspace and its commands stay findings on their own",
        ("R5", "$probeShell.Runspace", 1))
@@ -732,7 +738,20 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
                     "    $psi = New-Object System.Diagnostics.ProcessStartInfo\n    $psi.FileName = 'x'"),
         ("L1IndexRoot", "    $Pub['k'] = 1"),
         ("L1IndexLocal", "    $h = @{}\n    $h['k'] = 1\n    $list = New-Object 'System.Collections.Generic.List[object]'"),
+        # Adversary A1: a variable is also bound by foreach, -OutVariable, a multi-target assignment, [ref] and a parameter.
+        ("L1Foreach", "    param([string]$Target)\n    $r = @{}\n    foreach ($r in (Get-Item -LiteralPath $Target)) { $r.Attributes = 'Hidden' }"),
+        ("L1OutVariable", "    param([string]$Target)\n    $r = @{}\n    Get-Item -LiteralPath $Target -ov r | Out-Null\n    $r.Attributes = 'Hidden'"),
+        ("L1MultiTarget", "    param([string]$Target)\n    $r = @{}\n    $x, $r = Get-Item -LiteralPath $Target\n    $r.Attributes = 'Hidden'"),
+        ("L1Ref", "    $r = @{}\n    $null = [int]::TryParse('1', [ref]$r)\n    $r.Attributes = 'Hidden'"),
+        ("L1ParamAlso", "    param($r)\n    $r = @{}\n    $r.Attributes = 'Hidden'"),
     ]
+
+    # Adversary A8 (same class as A3): template shapes that name a parameter by alias or abbreviation.
+    TEMPLATE_ALIASES = (
+        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c echo x' -RSO 'C:\\outside\\stdout.txt'\n"
+        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c echo x' -RSE 'C:\\outside\\stderr.txt'\n"
+        "New-Item -ItemType Directory -Path $Work -N:'..\\escape' -Force\n"
+    )
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -741,11 +760,15 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         cls.tmp = _long_path(Path(cls._tmp.name))
         names = ", ".join(repr(n) for n, _ in cls.L1_BODIES)
         cls.l1 = cls._scan("l1", [("Body.psm1", cls.L1_BODIES)], ["Body.psm1"],
-                           [f"Get-AttrCudaEmbeddedFunctionSource -Name @({names})"])
+                           [f"Get-AttrCudaEmbeddedFunctionSource -Name @({names})"], template_extra=cls.TEMPLATE_ALIASES)
+        outside = cls.tmp / "outside"
+        outside.mkdir()
+        (outside / "Clean.psm1").write_text(f"function Collide {{\n{cls.RAW_WRITE}\n}}\n", encoding="utf-8")
+        l2_dir = cls.tmp / "l2"
         # No -ModulePath module defines the extractor here, so every module is a candidate for a call that names none.
         cls.l2 = cls._scan("l2", [
-            ("Clean.psm1", [(n, cls.CLEAN) for n in ("LitClean", "LitDirty", "OffList", "Ambig", "AmbigDyn", "Spl")]),
-            ("Dirty.psm1", [(n, cls.RAW_WRITE) for n in ("LitClean", "LitDirty", "Ambig", "AmbigDyn")]),
+            ("Clean.psm1", [(n, cls.CLEAN) for n in ("LitClean", "LitDirty", "OffList", "Ambig", "AmbigDyn", "Spl", "Collide", "CollideSub", "IdxAmbig", "Nm")]),
+            ("Dirty.psm1", [(n, cls.RAW_WRITE) for n in ("LitClean", "LitDirty", "Ambig", "AmbigDyn", "IdxAmbig", "NmNm")]),
             ("Only.psm1", [("OnlyHere", cls.CLEAN)]),
         ], ["Clean.psm1", "Dirty.psm1", "Only.psm1"], [
             "Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1') -Name @('LitClean')",
@@ -758,24 +781,42 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
             "Get-AttrCudaEmbeddedFunctionSource -ModulePath $somePath -Name @('OnlyHere')",
             "Get-AttrCudaEmbeddedFunctionSource @('Spl') (Join-Path $PSScriptRoot 'Dirty.psm1')",
             "Get-AttrCudaEmbeddedFunctionSource -Name @('Spl') @extra",
-        ])
+            # A2: a same-named file OUTSIDE the scanned set must not be matched by its base name.
+            f"Get-AttrCudaEmbeddedFunctionSource -Name @('Collide') -ModulePath '{outside / 'Clean.psm1'}'",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('CollideSub') -ModulePath (Join-Path $PSScriptRoot 'sub\\Clean.psm1')",
+            # A4: an expression that evaluates to a module path is not a literal one.
+            f"Get-AttrCudaEmbeddedFunctionSource -Name @('IdxAmbig') -ModulePath (@('{l2_dir / 'Dirty.psm1'}', '{l2_dir / 'Clean.psm1'}')[0])",
+            # A7: a -Name that is an expression is not a literal name list.
+            "Get-AttrCudaEmbeddedFunctionSource -Name ('Nm' + 'Nm')",
+        ], extra_files=[("sub/Clean.psm1", [("CollideSub", cls.RAW_WRITE)])])
         # The extractor's own module is on the list, so a call that names no -ModulePath reads exactly that module.
         cls.l2_default = cls._scan("l2-default", [
-            ("Extractor.psm1", [("Get-AttrCudaEmbeddedFunctionSource", "    param($Name)"), ("DefHelper", cls.CLEAN)]),
-            ("Dirty.psm1", [("DefHelper", cls.RAW_WRITE), ("DirtyOnly", cls.RAW_WRITE)]),
+            ("Extractor.psm1", [("Get-AttrCudaEmbeddedFunctionSource", "    param($Name)"), ("DefHelper", cls.CLEAN), ("AbbrevM", cls.CLEAN), ("NameAbbrev", cls.CLEAN)]),
+            ("Dirty.psm1", [("DefHelper", cls.RAW_WRITE), ("DirtyOnly", cls.RAW_WRITE), ("AbbrevM", cls.RAW_WRITE), ("EmptyOnly", cls.RAW_WRITE)]),
         ], ["Extractor.psm1", "Dirty.psm1"], [
             "Get-AttrCudaEmbeddedFunctionSource -Name @('DefHelper')",
             "Get-AttrCudaEmbeddedFunctionSource -Name @('DirtyOnly')",
+            # A3: PowerShell binds -M to -ModulePath and -N to -Name (unique prefixes).
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('AbbrevM') -M (Join-Path $PSScriptRoot 'Dirty.psm1')",
+            "Get-AttrCudaEmbeddedFunctionSource -N @('NameAbbrev')",
+            # A5: an empty, blank or null -ModulePath makes the extractor fall back to its own module.
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath ''",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath ' '",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath $null",
         ])
 
     @classmethod
-    def _scan(cls, label: str, modules: list, on_list: list, calls: list) -> dict:
+    def _scan(cls, label: str, modules: list, on_list: list, calls: list, *, extra_files=(), template_extra: str = "") -> dict:
         directory = cls.tmp / label
         directory.mkdir()
-        for file_name, functions in modules:
-            (directory / file_name).write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in functions), encoding="utf-8")
+        # extra_files are written but NOT given to the scan (-ModulePath): the files the job would read and the scan does not.
+        for file_name, functions in list(modules) + list(extra_files):
+            target = directory / file_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in functions), encoding="utf-8")
         generator = directory / "fixture-gen.ps1"
-        generator.write_text("".join(f"$e = {call}\n" for call in calls) + "$template = @'\n" + cls.TEMPLATE + "'@\n", encoding="utf-8")
+        template = cls.TEMPLATE.replace("__EMBEDDED_FUNCTIONS__", template_extra + "__EMBEDDED_FUNCTIONS__")
+        generator.write_text("".join(f"$e = {call}\n" for call in calls) + "$template = @'\n" + template + "'@\n", encoding="utf-8")
         return run_scan(generators=[generator], modules=[directory / m for m in on_list], splice_sources=[generator])
 
     @staticmethod
@@ -832,6 +873,17 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         self.assertEqual([(f["rule"], f["token"]) for f in self.of(self.l1, "L1IndexRoot")], [("R5", "$Pub['k']")])
         self.assertEqual([f for f in self.of(self.l1, "L1IndexLocal") if f["rule"] == "R5"], [])
 
+    def test_l1_a_variable_bound_by_foreach_out_variable_a_multi_target_assignment_ref_or_a_parameter_is_not_fresh(self) -> None:
+        for name in ("L1Foreach", "L1OutVariable", "L1MultiTarget", "L1Ref", "L1ParamAlso"):
+            found = self.of(self.l1, name)
+            self.assertIn(("R5", "$r.Attributes"), self.unlisted(found), f"{name}\n" + describe(found))
+
+    def test_l1_template_parameters_named_by_alias_or_abbreviation_are_still_judged(self) -> None:
+        # Advisory A8, same class as A3: -RSO / -RSE are aliases of Start-Process -RedirectStandardOutput / -Error, -N: abbreviates -Name.
+        texts = " | ".join(v["text"] for v in self.l1["violations"])
+        for needle in ("-RSO", "-RSE", "-N:"):
+            self.assertIn(needle, texts, f"the template line using {needle} was not flagged\n" + json.dumps(self.l1["violations"], indent=2))
+
     def test_l1_every_reviewed_property_set_row_names_a_plain_local_receiver(self) -> None:
         for (function, rule, token) in ALLOWLIST:
             if rule == "R5":
@@ -870,6 +922,32 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         self.assertEqual(len(self.call_findings(self.l2, "@('Spl') (Join-Path")), 1, describe(self.l2["splicedViolations"]))
         self.assertEqual(len(self.call_findings(self.l2, "-Name @('Spl') @extra")), 1)
         self.assertEqual(self.modules_of(self.l2, "Spl"), [])
+
+    def test_l2_a_same_named_module_file_outside_the_scanned_set_is_not_matched_by_its_base_name(self) -> None:
+        self.assertEqual(self.modules_of(self.l2, "Collide"), [], "outside\\Clean.psm1 was matched to the listed l2\\Clean.psm1")
+        self.assertEqual(len(self.call_findings(self.l2, "'Collide'")), 1, describe(self.l2["splicedViolations"]))
+        self.assertEqual(self.modules_of(self.l2, "CollideSub"), [])
+        self.assertEqual(len(self.call_findings(self.l2, "'CollideSub'")), 1)
+
+    def test_l2_a_module_path_expression_that_merely_contains_a_path_is_not_a_literal_path(self) -> None:
+        self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2, "IdxAmbig")], [("splice", "IdxAmbig")], describe(self.of(self.l2, "IdxAmbig")))
+        self.assertEqual(self.modules_of(self.l2, "IdxAmbig"), [])
+
+    def test_l2_a_name_list_that_is_an_expression_is_a_finding_not_a_scan_of_different_names(self) -> None:
+        self.assertEqual(len(self.call_findings(self.l2, "('Nm' + 'Nm')")), 1, describe(self.l2["splicedViolations"]))
+        self.assertEqual(self.modules_of(self.l2, "Nm"), [])
+        self.assertEqual(self.modules_of(self.l2, "NmNm"), [])
+
+    def test_l2_an_abbreviated_parameter_name_binds_like_the_full_one(self) -> None:
+        # PowerShell binds -M to -ModulePath and -N to -Name.
+        self.assertEqual(self.modules_of(self.l2_default, "AbbrevM"), ["Dirty.psm1"], json.dumps(self.l2_default["spliced"], indent=2))
+        self.assertEqual([(f["rule"], f["token"]) for f in self.of(self.l2_default, "AbbrevM")], [("R2", "New-Item")])
+        self.assertEqual(self.modules_of(self.l2_default, "NameAbbrev"), ["Extractor.psm1"])
+
+    def test_l2_an_empty_blank_or_null_module_path_is_the_default_module(self) -> None:
+        found = self.of(self.l2_default, "EmptyOnly")
+        self.assertEqual([(f["rule"], f["function"]) for f in found], [("splice", "EmptyOnly")] * 3, describe(found))
+        self.assertEqual(self.modules_of(self.l2_default, "EmptyOnly"), [])
 
     def test_l2_without_a_module_path_the_call_reads_the_extractors_own_module(self) -> None:
         self.assertEqual(self.modules_of(self.l2_default, "DefHelper"), ["Extractor.psm1"])
