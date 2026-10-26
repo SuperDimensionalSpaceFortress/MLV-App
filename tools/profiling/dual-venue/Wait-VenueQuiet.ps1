@@ -85,8 +85,8 @@
 #        <instance> is the probe's `<group>,<core>` with the comma written as `_` (gate text is comma-free, as for every other line the run-local drivers split).
 #        would_block is what the check says about that probe; with the switch OFF it changes nothing, so the log measures how often enforcing would have fired before anyone turns it on.
 #        UNKNOWN IS NULL, NEVER FALSE, AND NEVER A BLOCK: would_block=null with reason no-probe (the probe itself was unavailable), no-cores (no cores[] rows), core-class-unknown (a row whose class is not P / E / uniform, so it
-#        might be a fast core), invalid-core-row (a null entry in cores[]), incomplete-samples (a fast or unknown-class row flagged incomplete, with validSamples < totalSamples, or with a
-#        non-numeric count), cores-omitted (the probe omitted a core for having no
+#        might be a fast core), invalid-core-row (an entry in cores[] that is not a JSON object: null, a scalar, a nested array), incomplete-samples (a fast or unknown-class row flagged incomplete, with
+#        validSamples != totalSamples, or with a count that is not a whole number >= 1), cores-omitted (the probe omitted a core for having no
 #        valid sample: notes.cores_omitted) or invalid-core-percent (a non-numeric, array or out-of-range
 #        value). The figure compared is the unrounded valid-sample mean (`percent_exact`, which the probe job now emits beside the 2-dp `percent`; an older probe falls back to
 #        `percent`), as the mean rule decides on the unrounded mean. A core-level BUSY never replaces UNKNOWN, a measured-busy mean or any exit code. Turning the switch ON for a
@@ -1311,21 +1311,28 @@ function Get-VenuePerCoreVerdict($Probe, [double]$Threshold, [bool]$Enabled) {
         if ($null -eq $Probe) { $r.reason = 'no-probe'; return [pscustomobject]$r }
         if ($null -eq $Probe.cores) { $r.reason = 'no-cores'; return [pscustomobject]$r }
         $all = @($Probe.cores)
-        $rows = @($all | Where-Object { $null -ne $_ })
-        if ($rows.Count -eq 0) { $r.reason = 'no-cores'; return [pscustomobject]$r }
+        if ($all.Count -eq 0) { $r.reason = 'no-cores'; return [pscustomobject]$r }
         $fast = @(); $reasons = @()
-        # a null entry in cores[] is a row that could not be read, and it might have been a fast core: unknown, never silently dropped
-        if ($rows.Count -ne $all.Count) { $reasons += 'invalid-core-row' }
-        foreach ($row in $rows) {
-            $cls = [string]$row.core_class
+        # a whole count as an exact [long] (never a double: 2^53 and 2^53+1 are the same double), else $null
+        $wholeCount = { param($v)
+            if ($v -is [int] -or $v -is [long]) { return [long]$v }
+            if ($v -is [double] -and [double]::IsFinite($v) -and [Math]::Floor($v) -eq $v -and [Math]::Abs($v) -lt 9007199254740992.0) { return [long]$v }
+            return $null
+        }
+        foreach ($row in $all) {
+            # a row that is not a JSON object (null, a scalar, an array nested in cores[]) could not be read, and it might have been a fast core: unknown, never dropped or enumerated
+            if ($row -isnot [pscustomobject]) { $reasons += 'invalid-core-row'; continue }
+            # a class that is not a plain string (an array would stringify to its first element) is no class
+            $cls = $row.core_class; if ($cls -isnot [string]) { $cls = '' }
             $isFast = ($cls -ceq 'P' -or $cls -ceq 'uniform')
             $isUnknown = -not ($isFast -or $cls -ceq 'E')
             if (-not ($isFast -or $isUnknown)) { continue }
             if ($isUnknown) { $reasons += 'core-class-unknown' }
-            # sample counts: when the row carries either count, both must be numbers and valid >= total; a malformed count is not evidence of completeness
+            # sample counts: when the row carries either count, both must be whole numbers with valid == total >= 1; anything else (a string, a fraction, zero, a negative, valid > total) is not evidence of completeness
             $short = $false
             if ($null -ne $row.PSObject.Properties['validSamples'] -or $null -ne $row.PSObject.Properties['totalSamples']) {
-                if (-not (Test-PerCoreNumber $row.validSamples) -or -not (Test-PerCoreNumber $row.totalSamples) -or [double]$row.validSamples -lt [double]$row.totalSamples) { $short = $true }
+                $vs = & $wholeCount $row.validSamples; $ts = & $wholeCount $row.totalSamples
+                if ($null -eq $vs -or $null -eq $ts -or $ts -lt 1 -or $vs -ne $ts) { $short = $true }
             }
             if ($row.incomplete -eq $true -or $short) { $reasons += 'incomplete-samples' }
             # percent_exact when the row carries the property (even a null or bad one: no fallback to the rounded figure), else the older probe's 2-dp percent; plain assignment keeps a one-element array an array
@@ -1350,9 +1357,12 @@ function Format-PerCorePct($v) { if ($null -eq $v) { 'n/a' } else { ([double]$v)
 # Logging only: a failing -GateLog sink (a lock, a full disk) loses this line from the log and nothing else. The line is written to stdout first by Write-Gate, and the catch does
 # NOT write through the same failing sink again, so the verdict and every exit code stay what they were with the check off.
 function Write-PerCoreLines($Pc, [bool]$Blocked) {
+    # each line has its own guard: a sink that fails on the observation line must not also swallow the blocked-core line
     try {
         $wb = $(if ($null -eq $Pc.would_block) { 'null' } elseif ($Pc.would_block) { 'true' } else { 'false' })
         Write-Gate (("  percore enabled={0} threshold={1} busiest_fast_core={2} busiest_fast_pct={3} would_block={4}" -f $Pc.enabled.ToString().ToLowerInvariant(), (Format-PerCorePct $Pc.threshold), (ConvertTo-IdentToken $Pc.busiest_fast_core), (Format-PerCorePct $Pc.busiest_fast_percent), $wb) + $(if ($Pc.reason) { ' reason=' + (ConvertTo-IdentToken $Pc.reason) } else { '' }))
+    } catch { try { [Console]::Error.WriteLine("percore line not logged: $($_.Exception.Message)") } catch { } }
+    try {
         if ($Blocked) { Write-Gate ("  percore blocked core={0} percent={1} threshold={2}" -f (ConvertTo-IdentToken $Pc.busiest_fast_core), (Format-PerCorePct $Pc.busiest_fast_percent), (Format-PerCorePct $Pc.threshold)) }
     } catch { try { [Console]::Error.WriteLine("percore line not logged: $($_.Exception.Message)") } catch { } }
 }

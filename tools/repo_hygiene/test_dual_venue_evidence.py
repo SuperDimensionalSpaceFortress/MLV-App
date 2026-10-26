@@ -5977,6 +5977,46 @@ $obj = $arr[[Math]::Min($n, $arr.Count - 1)]
                                        "-ProbeJson", str(raw), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
                 self.assertIn("Busy probes summarized: 0 (quiet skipped 1", summ.stdout, summ.stdout + summ.stderr)
 
+    # ---- adversary pass r4 (A1 A2 A5): row SHAPE and sample COUNTS are validated exactly, not coerced; the same helper serves the gate and the summary ----
+    def test_a_row_of_the_wrong_shape_or_an_impossible_count_is_unknown_in_the_gate_and_the_summary(self) -> None:
+        hot = {"instance": "0,2", "core_class": "P", "efficiency_class": 1, "percent": 82.0, "validSamples": 3, "totalSamples": 3, "incomplete": False}
+        cases = {
+            "a row nested in an array": ([[dict(hot, validSamples="3", totalSamples="3")]], "invalid-core-row"),
+            "a nested array beside a cool row": ([[dict(hot)], dict(hot, instance="0,0", percent=30.0)], "invalid-core-row"),
+            "a scalar row": ([82], "invalid-core-row"),
+            "a lone null row": ([None], "invalid-core-row"),
+            "an array core_class": ([dict(hot, core_class=["P"])], "core-class-unknown"),
+            "counts beyond double precision": ([dict(hot, validSamples=9007199254740992, totalSamples=9007199254740993)], "incomplete-samples"),
+            "zero of zero samples": ([dict(hot, validSamples=0, totalSamples=0)], "incomplete-samples"),
+            "negative counts": ([dict(hot, validSamples=-1, totalSamples=-1)], "incomplete-samples"),
+            "fractional counts": ([dict(hot, validSamples=3.5, totalSamples=3)], "incomplete-samples"),
+            "more valid than total": ([dict(hot, validSamples=4, totalSamples=3)], "incomplete-samples"),
+        }
+        for name, (cores, reason) in cases.items():
+            with self.subTest(name):
+                probe = self.probe(cores)
+                proc = self.gate(probe, "-PerCoreEnforce")
+                self.assertRegex(proc.stdout, r"(?m)^QUIET ", proc.stdout + proc.stderr)
+                self.assertIn(f"would_block=null reason={reason}", proc.stdout)
+                self.assertNotIn("percore blocked", proc.stdout)
+                raw = self.tmp / f"venue-quiet-probe-r4-{abs(hash(name))}.json"
+                raw.write_text(json.dumps(probe), encoding="utf-8")
+                summ = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"),
+                                       "-ProbeJson", str(raw), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
+                self.assertIn("Busy probes summarized: 0 (quiet skipped 1", summ.stdout, summ.stdout + summ.stderr)
+
+    # ---- adversary pass r4 (A4): a sink that fails on the observation line must not also swallow the blocked-core line ----
+    def test_a_sink_failure_on_the_observation_line_still_prints_the_blocked_core_line(self) -> None:
+        script = (DV / "Wait-VenueQuiet.ps1").as_posix()
+        cmd = (f"$t=$null;$e=$null;$ast=[System.Management.Automation.Language.Parser]::ParseFile('{script}',[ref]$t,[ref]$e);"
+               "foreach($n in 'Format-PerCorePct','ConvertTo-IdentToken','Write-PerCoreLines'){ $f=$ast.Find({param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -ceq $n},$true); . ([scriptblock]::Create($f.Extent.Text)) }; "
+               "function Write-Gate([string]$Line) { Write-Output $Line; if ($Line -like '  percore enabled=*') { throw 'sink locked' } }; "
+               "$pc=[pscustomobject]@{enabled=$true;threshold=60.0;busiest_fast_core='0,2';busiest_fast_percent=82.0;would_block=$true;reason=$null}; "
+               "try { Write-PerCoreLines $pc $true; 'NO_ESCAPE' } catch { 'ESCAPED ' + $_.Exception.Message }")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
+        self.assertIn("NO_ESCAPE", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("  percore blocked core=0_2 percent=82.0% threshold=60.0%", proc.stdout)
+
 
 # ---------------------------------------------------------------------------------------------------
 # VENUE-QUIET-ATTRIBUTION-1 r2 (hub ruling): every per-process and per-core figure is the mean over the samples whose counter status is VALID for that instance (never
