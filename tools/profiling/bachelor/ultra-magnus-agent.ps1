@@ -4044,12 +4044,17 @@ function Invoke-QueuedJob {
         $keepAwakeBeginOk = Set-AgentKeepAwake -Enable $true
         Add-AgentLogLine "keep-awake begin job=$jobId ok=$keepAwakeBeginOk"
 
-        # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3 (Dot B2): the lease's coverage of the job timeout, re-read from its until= as the child is created
-        # (adversary r3-a96d3fe5 A3: after the keep-awake step and its log line, so only the launch call itself follows).
-        Set-LeaseCoverageAtLaunch -JobId $jobId -Admission $script:Admission -Lease $script:QuietLease -TimeoutSec ([int]$metadata.timeoutSec)
-        $launch = Start-WindowlessRedirectedProcess -FilePath $psExe `
-            -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $Job.FullName) `
-            -OutFile $outFile -ErrFile $errFile -WorkingDirectory $Root
+        try {
+            $launch = Start-WindowlessRedirectedProcess -FilePath $psExe `
+                -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $Job.FullName) `
+                -OutFile $outFile -ErrFile $errFile -WorkingDirectory $Root
+        }
+        finally {
+            # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3 (Dot B2): the lease's coverage of the job timeout, re-read from its until= as the child is created.
+            # r5 (adversary r5b-cb19d346 A3): read as the launch call RETURNS (or throws), so the launch helper's own out/err file opens (slow on a
+            # share root) are counted: what it records is at most what was left when the child was created. It never throws; nothing gates on it.
+            Set-LeaseCoverageAtLaunch -JobId $jobId -Admission $script:Admission -Lease $script:QuietLease -TimeoutSec ([int]$metadata.timeoutSec)
+        }
         $jobProcess = $launch.Process
         # phase=launched is published ONCE, in the same write as the child identity. THREE OUTCOMES:
         #   done        - verified: clients start their claimed clock; a restart adopts or orphans by child identity.

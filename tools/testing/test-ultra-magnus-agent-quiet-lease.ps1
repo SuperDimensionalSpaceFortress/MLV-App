@@ -1160,6 +1160,7 @@ function Exit-HeavySlot {
         function Start-WindowlessRedirectedProcess {
             param([string]$FilePath, [string[]]$ArgumentList, [string]$OutFile, [string]$ErrFile, [string]$WorkingDirectory)
             $script:QJ.launches.Add("$FilePath $($ArgumentList -join ' ')")
+            if ($script:QJLaunchDelaySec -gt 0) { Start-Sleep -Milliseconds ([int](1000 * [double]$script:QJLaunchDelaySec)) }   # r5: the helper's out/err opens, slow on a share root
             throw 'unit: the child launch was reached'
         }
         function Publish-JobResult { param([string]$JobId, $Result) $script:QJ.published.Add($Result); return (Join-Path $outbox "$JobId.result.json") }
@@ -1321,9 +1322,13 @@ function Exit-HeavySlot {
     # line and the seconds left. The control run (nothing spent) keeps it covered and records what was left.
     if (Test-Case 'queuedjob-lease-coverage-at-launch') {
         $cov = [ordered]@{}
-        foreach ($k in @('control', 'short')) {
+        # r5 (adversary r5b-cb19d346 A3): 'slow' leaves 1803 s at the marker and the launch call itself takes 5 s (its out/err file opens on a share
+        # root): the child is created with ~1798 s left, so it is NOT covered; a reading taken before the launch call says covered.
+        foreach ($k in @('control', 'short', 'slow')) {
             $job = Reset-QueuedJobCase @{ request = 'active' } "jQc$k" (New-NotAfterMetaJson 600)
+            $script:QJLaunchDelaySec = 0
             if ($k -ceq 'short') { $script:QJ.markerHook = { $script:QuietLease.active.until = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 + 1790 } }
+            if ($k -ceq 'slow') { $script:QJ.markerHook = { $script:QuietLease.active.until = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 + 1803 }; $script:QJLaunchDelaySec = 5 }
             try { $null = Invoke-QueuedJob -Job $job }
             finally {
                 $a = $script:Admission
@@ -1336,7 +1341,9 @@ function Exit-HeavySlot {
         Assert-True ($cov.short.covers -eq $false -and $null -ne $cov.short.remaining -and $cov.short.remaining -ge 1780 -and $cov.short.remaining -le 1790) "queuedjob-lease-coverage-at-launch: 1790 s left at launch for an 1800 s timeout is NOT reported covered: $($cov.short | ConvertTo-Json -Compress)"
         Assert-True ($cov.control.covers -eq $true -and $null -ne $cov.control.remaining -and $cov.control.remaining -ge 1800 -and $cov.control.lines.Count -eq 0) "queuedjob-lease-coverage-at-launch: control: covered at launch, the seconds left recorded: $($cov.control | ConvertTo-Json -Compress)"
         Assert-True ($cov.short.lines.Count -eq 1 -and $cov.short.lines[0] -match ' phase=launch remaining=17[89]\ds timeoutSec=1800;') "queuedjob-lease-coverage-at-launch: one typed lease-shorter-than-timeout line at launch: $($cov.short.lines -join ' | ')"
-        $results.queuedJobLeaseCoverageAtLaunch = [ordered]@{ control = $cov.control.remaining; short = $cov.short.remaining; shortCovers = $cov.short.covers }
+        $script:QJLaunchDelaySec = 0
+        Assert-True ($cov.slow.launches -eq 1 -and $cov.slow.covers -eq $false -and $null -ne $cov.slow.remaining -and $cov.slow.remaining -lt 1800 -and $cov.slow.lines.Count -eq 1) "queuedjob-lease-coverage-at-launch A3(r5): a 5 s launch call with 1803 s left for an 1800 s timeout is NOT reported covered (read as the call returns): $($cov.slow | ConvertTo-Json -Compress)"
+        $results.queuedJobLeaseCoverageAtLaunch = [ordered]@{ control = $cov.control.remaining; short = $cov.short.remaining; shortCovers = $cov.short.covers; slow = $cov.slow.remaining; slowCovers = $cov.slow.covers }
     }
 
     # ------------------------------------------------------------ notafter-prelaunch-marker: the deadline passes while the launching marker is written
@@ -2591,7 +2598,9 @@ function Exit-HeavySlot {
             $script:FeedStallSec = 0
             Assert-True ($outN.local.label -ceq 'clear' -and $outN.local.waits.Count -ge 1 -and @($outN.local.waits | Where-Object { $_ -notmatch ' heat=unknown\(feed missing \(stub\)\) feedAge=unknown$' }).Count -eq 0) "heat-trace B4 baseline: a local feed is read on the waiting line and the job is admitted: label=$($outN.local.label) $($outN.local.waits -join ' || ')"
             Assert-True ($outN.unc.label -ceq 'clear') "heat-trace B4: a stalled UNC feed read never holds the wait past its 6 s queue ceiling: label=$($outN.unc.label) why=$($outN.unc.why)"
-            Assert-True ($outN.unc.waitedSec -le $outN.local.waitedSec + 2) "heat-trace B4: the activation is processed on the baseline schedule: unc=$($outN.unc.waitedSec)s local=$($outN.local.waitedSec)s"
+            # r5: +4 s, not +2: at 100% host CPU the python start-up alone moved either run by 2-3 s (local 2-5 s, unc 2-4 s, both agents); a read of
+            # the stalled feed adds its 8 s, so the bound still tells the two apart (and the label above already fails a queue-expired run).
+            Assert-True ($outN.unc.waitedSec -le $outN.local.waitedSec + 4) "heat-trace B4: the activation is processed on the baseline schedule: unc=$($outN.unc.waitedSec)s local=$($outN.local.waitedSec)s"
             Assert-True ($outN.unc.waits.Count -ge 1 -and @($outN.unc.waits | Where-Object { $_ -notmatch ' heat=skipped reason=non-local-feed$' }).Count -eq 0) "heat-trace B4: the heat field stays on every waiting line, as heat=skipped reason=non-local-feed: $($outN.unc.waits -join ' || ')"
             Assert-True ($outN.unc.reads -eq 1) "heat-trace B4: a UNC feed is never read while waiting (the one read is the grant's own): reads=$($outN.unc.reads)"
             # The path rule, called directly: only a fully-qualified drive-letter path on a fixed disk with no reparse point on the way is read.
