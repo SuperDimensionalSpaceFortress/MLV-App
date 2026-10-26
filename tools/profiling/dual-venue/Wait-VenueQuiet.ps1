@@ -84,7 +84,8 @@
 #        <instance> is the probe's `<group>,<core>` with the comma written as `_` (gate text is comma-free, as for every other line the run-local drivers split).
 #        would_block is what the check says about that probe; with the switch OFF it changes nothing, so the log measures how often enforcing would have fired before anyone turns it on.
 #        UNKNOWN IS NULL, NEVER FALSE, AND NEVER A BLOCK: would_block=null with reason no-cores (no cores[] rows), core-class-unknown (a row whose class is not P / E / uniform, so it
-#        might be a fast core), incomplete-samples (a fast or unknown-class row flagged incomplete, or with validSamples < totalSamples), cores-omitted (the probe omitted a core for having no
+#        might be a fast core), invalid-core-row (a null entry in cores[]), incomplete-samples (a fast or unknown-class row flagged incomplete, with validSamples < totalSamples, or with a
+#        non-numeric count), cores-omitted (the probe omitted a core for having no
 #        valid sample: notes.cores_omitted) or invalid-core-percent (a non-numeric, array or out-of-range
 #        value). The figure compared is the unrounded valid-sample mean (`percent_exact`, which the probe job now emits beside the 2-dp `percent`; an older probe falls back to
 #        `percent`), as the mean rule decides on the unrounded mean. A core-level BUSY never replaces UNKNOWN, a measured-busy mean or any exit code. Turning the switch ON for a
@@ -1306,20 +1307,27 @@ function Test-PerCoreNumber($v) { $v -is [double] -or $v -is [int] -or $v -is [l
 function Get-VenuePerCoreVerdict($Probe, [double]$Threshold, [bool]$Enabled) {
     $r = [ordered]@{ enabled = $Enabled; threshold = $Threshold; busiest_fast_core = $null; busiest_fast_percent = $null; would_block = $null; reason = $null }
     try {
-        $rows = @(@($Probe.cores) | Where-Object { $null -ne $_ })
+        if ($null -eq $Probe.cores) { $r.reason = 'no-cores'; return [pscustomobject]$r }
+        $all = @($Probe.cores)
+        $rows = @($all | Where-Object { $null -ne $_ })
         if ($rows.Count -eq 0) { $r.reason = 'no-cores'; return [pscustomobject]$r }
         $fast = @(); $reasons = @()
+        # a null entry in cores[] is a row that could not be read, and it might have been a fast core: unknown, never silently dropped
+        if ($rows.Count -ne $all.Count) { $reasons += 'invalid-core-row' }
         foreach ($row in $rows) {
             $cls = [string]$row.core_class
             $isFast = ($cls -ceq 'P' -or $cls -ceq 'uniform')
             $isUnknown = -not ($isFast -or $cls -ceq 'E')
             if (-not ($isFast -or $isUnknown)) { continue }
             if ($isUnknown) { $reasons += 'core-class-unknown' }
+            # sample counts: when the row carries either count, both must be numbers and valid >= total; a malformed count is not evidence of completeness
             $short = $false
-            if ((Test-PerCoreNumber $row.validSamples) -and (Test-PerCoreNumber $row.totalSamples) -and [double]$row.validSamples -lt [double]$row.totalSamples) { $short = $true }
+            if ($null -ne $row.PSObject.Properties['validSamples'] -or $null -ne $row.PSObject.Properties['totalSamples']) {
+                if (-not (Test-PerCoreNumber $row.validSamples) -or -not (Test-PerCoreNumber $row.totalSamples) -or [double]$row.validSamples -lt [double]$row.totalSamples) { $short = $true }
+            }
             if ($row.incomplete -eq $true -or $short) { $reasons += 'incomplete-samples' }
-            # percent_exact when the row carries it (even a bad one: no fallback to the rounded figure), else the older probe's 2-dp percent; plain assignment keeps a one-element array an array
-            if ($null -ne $row.PSObject.Properties['percent_exact'] -and $null -ne $row.percent_exact) { $v = $row.percent_exact } else { $v = $row.percent }
+            # percent_exact when the row carries the property (even a null or bad one: no fallback to the rounded figure), else the older probe's 2-dp percent; plain assignment keeps a one-element array an array
+            if ($null -ne $row.PSObject.Properties['percent_exact']) { $v = $row.percent_exact } else { $v = $row.percent }
             if (-not (Test-PerCoreNumber $v) -or -not [double]::IsFinite([double]$v) -or [double]$v -lt 0.0 -or [double]$v -gt 100.0) { $reasons += 'invalid-core-percent'; continue }
             if ($isFast) { $fast += [pscustomobject]@{ instance = [string]$row.instance; percent = [double]$v } }
         }

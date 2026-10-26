@@ -5925,6 +5925,29 @@ $obj = $arr[[Math]::Min($n, $arr.Count - 1)]
         raised = subprocess.run([*summarize[:-1], str(cool), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
         self.assertIn("Busy probes summarized: 0 (quiet skipped 1", raised.stdout)
 
+    # ---- adversary pass r2 (A1 A2 A3): a malformed core row is UNKNOWN (null), never a definite true or false, in the gate and in the summary ----
+    def test_a_malformed_core_row_is_unknown_in_the_gate_and_never_busy_in_the_summary(self) -> None:
+        hot = {"instance": "0,2", "core_class": "P", "efficiency_class": 1, "percent": 82.0, "validSamples": 3, "totalSamples": 3, "incomplete": False}
+        cases = {
+            "null percent_exact": ([dict(hot, percent_exact=None)], "invalid-core-percent"),
+            "null row beside a hot row": ([None, dict(hot)], "invalid-core-row"),
+            "null row beside a cool row": ([None, dict(hot, instance="0,0", percent=30.0)], "invalid-core-row"),
+            "string totalSamples": ([dict(hot, totalSamples="3")], "incomplete-samples"),
+            "null validSamples": ([dict(hot, validSamples=None)], "incomplete-samples"),
+        }
+        for name, (cores, reason) in cases.items():
+            with self.subTest(name):
+                probe = self.probe(cores)
+                proc = self.gate(probe, "-PerCoreEnforce")
+                self.assertRegex(proc.stdout, r"(?m)^QUIET ", proc.stdout + proc.stderr)
+                self.assertIn(f"would_block=null reason={reason}", proc.stdout)
+                self.assertNotIn("percore blocked", proc.stdout)
+                raw = self.tmp / f"venue-quiet-probe-{abs(hash(name))}.json"
+                raw.write_text(json.dumps(probe), encoding="utf-8")
+                summ = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"),
+                                       "-ProbeJson", str(raw), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
+                self.assertIn("Busy probes summarized: 0 (quiet skipped 1", summ.stdout, summ.stdout + summ.stderr)
+
 
 # ---------------------------------------------------------------------------------------------------
 # VENUE-QUIET-ATTRIBUTION-1 r2 (hub ruling): every per-process and per-core figure is the mean over the samples whose counter status is VALID for that instance (never
