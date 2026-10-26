@@ -1363,6 +1363,19 @@ function Get-VenuePerCoreVerdict($Probe, [double]$Threshold, [bool]$Enabled) {
 }
 # invariant-culture percent text ('82.0%', never '82,0%': gate text is comma-free)
 function Format-PerCorePct($v) { if ($null -eq $v) { 'n/a' } else { ([double]$v).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + '%' } }
+# One probe sample as log text, TOTAL: a number prints '{0:0.0}', null prints 'null', anything else a typed token (never a cast, so a malformed sample the decision already called UNKNOWN
+# cannot stop the PROBE line, the percore lines or the VENUE_QUIET_UNKNOWN exit from being written).
+function Format-VenueSample($v) {
+    try {
+        if ($null -eq $v) { return 'null' }
+        if (Test-PerCoreNumber $v) { return ('{0:0.0}' -f [double]$v) }
+        if ($v -is [string]) { return 'bad:string' }
+        if ($v -is [bool]) { return 'bad:bool' }
+        if ($v -is [array]) { return 'bad:array' }
+        if ($v -is [pscustomobject]) { return 'bad:object' }
+    } catch { }
+    'bad:other'
+}
 # Logging only: a failing -GateLog sink (a lock, a full disk) loses this line from the log and nothing else. The line is written to stdout first by Write-Gate, and the catch does
 # NOT write through the same failing sink again, so the verdict and every exit code stay what they were with the check off.
 function Write-PerCoreLines($Pc, [bool]$Blocked) {
@@ -1415,7 +1428,7 @@ while ($true) {
         $pcNote = " note=percore core=$(ConvertTo-IdentToken $pc.busiest_fast_core) percent=$(Format-PerCorePct $pc.busiest_fast_percent)"
     }
     $last = [pscustomobject]@{ decision = $d; probe = $probe; why = $why; whyKind = $(if ($whyKind) { $whyKind } else { 'invalid-samples' }); percore = $pc }
-    $sampleText = $(if ($samples.Count) { ($samples | ForEach-Object { if ($null -eq $_) { 'null' } else { '{0:0.0}' -f [double]$_ } }) -join '/' } else { 'none' })
+    $sampleText = $(if ($samples.Count) { (@($samples | ForEach-Object { Format-VenueSample $_ })) -join '/' } else { 'none' })
     Write-Gate "PROBE $jobId $Venue samples=$sampleText mean=$(Format-Mean $d.mean) state=$($d.state)$(if ($why) { " note=$why" })$pcNote $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
     if ($rawPath) { Write-Gate "  raw $rawPath" } elseif ($rawErr) { Write-Gate "  raw UNWRITABLE $rawErr" }
     if ($null -ne $pc) { Write-PerCoreLines $pc $pcBlocked }

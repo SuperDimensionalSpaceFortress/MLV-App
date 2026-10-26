@@ -6051,6 +6051,26 @@ $obj = $arr[[Math]::Min($n, $arr.Count - 1)]
                 self.assertIn("would_block=false", self.gate(cool, "-PerCoreEnforce").stdout)
                 self.assertIn("Busy probes summarized: 1 (quiet skipped 0", self._summary_for(hot, "ok-" + name.replace(" ", "-")).stdout)
 
+    # ---- r6 (sol r5 B4 / Dot B4): a malformed ACCEPTED sample must not stop the probe being logged first: the PROBE line, the percore lines and the typed UNKNOWN exit 6 all still happen ----
+    def test_a_malformed_sample_still_logs_the_probe_and_percore_lines_and_ends_unknown(self) -> None:
+        cases = {
+            "string sample": ([10, "hot", 10], "10.0/bad:string/10.0"),
+            "object sample": ([10, {"x": 1}, 10], "10.0/bad:object/10.0"),
+            "nested array sample": ([10, [1, 2], 10], "10.0/bad:array/10.0"),
+            "boolean sample": ([10, True, 10], "10.0/bad:bool/10.0"),
+        }
+        for name, (samples, shown) in cases.items():
+            for flags in ((), ("-PerCoreEnforce",)):
+                with self.subTest(name, enforce=bool(flags)):
+                    proc = self.gate(self.probe(_pc_cores(self.HOT), samples=samples), *flags)
+                    out = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, 6, out)
+                    self.assertRegex(proc.stdout, r"(?m)^PROBE venue-quiet-probe-\S+ bachelor samples=" + re.escape(shown) + r" mean=UNKNOWN state=UNKNOWN", out)
+                    self.assertIn(f"  percore enabled={'true' if flags else 'false'} threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true", proc.stdout, out)
+                    self.assertRegex(proc.stdout, r"(?m)^VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=", out)
+                    self.assertNotIn("Cannot convert", out)
+                    self.assertNotIn("percore blocked", proc.stdout, "an UNKNOWN mean is never turned into a measured BUSY by the per-core check")
+
     # ---- adversary pass r4 (A4): a sink that fails on the observation line must not also swallow the blocked-core line ----
     def test_a_sink_failure_on_the_observation_line_still_prints_the_blocked_core_line(self) -> None:
         script = (DV / "Wait-VenueQuiet.ps1").as_posix()
