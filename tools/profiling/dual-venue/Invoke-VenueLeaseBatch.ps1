@@ -207,10 +207,13 @@ function L([string]$Message) {
 # r6 (Dot r5 B5): the log is best effort wherever a mandatory step (keeper stop, claim release, receipt, summary, exit code) follows it. A batch.log another process holds
 # exclusively must not skip them: the failure is swallowed, counted (logWriteFailures in the receipt and the summary), said once on stderr, and the line still reaches stdout.
 $script:logWriteFailures = 0
+function Register-LogFailure([string]$Why) {
+    $script:logWriteFailures++
+    if ($script:logWriteFailures -eq 1) { try { [Console]::Error.WriteLine("BATCH_LOG_FAILED the batch log cannot be written ($($Why -replace '\s+', ' ')); later failures are counted in the batch receipt as logWriteFailures") } catch { } }
+}
 function LogBest([string]$Message) {
     try { L $Message } catch {
-        $script:logWriteFailures++
-        if ($script:logWriteFailures -eq 1) { try { [Console]::Error.WriteLine("BATCH_LOG_FAILED the batch log cannot be written ($($_.Exception.Message -replace '\s+', ' ')); later failures are counted in the batch receipt as logWriteFailures") } catch { } }
+        Register-LogFailure $_.Exception.Message
         try { Write-Output "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message" } catch { }
     }
 }
@@ -840,7 +843,7 @@ $summary = [ordered]@{
 }
 if ($legPlanMode) { $summary.legPlan = [ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
 $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch { }   # r6 (Dot r5 B5): the result line on stdout and the typed exit code never depend on batch.log
+try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch { Register-LogFailure $_.Exception.Message }   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
 Write-Output $resultLine
 Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned at its timeout would otherwise keep this process alive until it ends
 exit $exitCode

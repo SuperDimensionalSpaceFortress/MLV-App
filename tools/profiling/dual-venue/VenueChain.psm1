@@ -616,7 +616,8 @@ function Get-VenueStagedBuildManifest {
                 $bytes = [IO.File]::ReadAllBytes($p)
                 $sha = [Security.Cryptography.SHA256]::Create()
                 try { ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
-                $m = try { [Text.UTF8Encoding]::new($false).GetString($bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { $null }
+                # r6 (adversary A1): decoded exactly as Assert-AttrCudaBuildManifest's own file read does (UTF-8 default, ONE BOM consumed, UTF-16/32 by BOM), from the bytes already hashed
+                $m = try { [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true).ReadToEnd() | ConvertFrom-Json } catch { $null }
                 if ($null -eq $m) { 'UNPARSEABLE'; return }
                 $c = $m.PSObject.Properties['sourceCommit']; 'C:' + $(if ($null -eq $c) { '' } else { [string]$c.Value })
                 $d = $m.PSObject.Properties['dllPairManifestSha256']; 'D:' + $(if ($null -eq $d) { '' } else { ([string]$d.Value).ToLowerInvariant() })

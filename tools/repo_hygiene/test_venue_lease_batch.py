@@ -1966,15 +1966,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
         # the owner is gone (a pid no process has): the next claim request breaks it as dead-pid, the way the STEAL fake leaves a foreign claim
         self.claim_path.write_text(re.sub(r'"ownerPid":\s*\d+', '"ownerPid":99999999', self.claim_path.read_text(encoding="utf-8")), encoding="utf-8")
-        tree = self.case / "tree" / "tools" / "profiling"
-        shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
-        (tree / "bachelor").mkdir()
-        shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
-        runner = tree / "dual-venue" / RUNNER.name
-        text = runner.read_text(encoding="utf-8")
         anchor = "function L([string]$Message) {\n"
-        self.assertEqual(text.count(anchor), 1, "the log function moved: update this fixture")
-        runner.write_text(text.replace(anchor, anchor + "    if ($Message -like 'CLAIM_STALE_BROKEN*') { throw 'simulated log failure' }\n"), encoding="utf-8")
+        runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'CLAIM_STALE_BROKEN*') { throw 'simulated log failure' }\n")
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
         args[args.index("-File") + 1] = str(runner)
         r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
@@ -1983,6 +1976,30 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         res = batch_result(r.stdout)
         self.assertEqual((res["ran"], res["notRun"]), (4, 0))
         self.assertIn("BATCH_LOG_FAILED", r.stderr)
+
+    def _patched_runner(self, old: str, new: str) -> Path:
+        """A copy of the dual-venue tree whose runner has `old` (found exactly once) replaced by `new`; returns the copy's runner."""
+        tree = self.case / "tree" / "tools" / "profiling"
+        shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
+        (tree / "bachelor").mkdir()
+        shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
+        runner = tree / "dual-venue" / RUNNER.name
+        text = runner.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, "the runner line moved: update this fixture")
+        runner.write_text(text.replace(old, new), encoding="utf-8")
+        return runner
+
+    def test_r6_adv_a3_a_result_line_that_cannot_be_appended_to_the_log_is_still_said_on_stderr(self) -> None:
+        # adversary r6 A3: the final LEASE_BATCH_RESULT append failed inside an empty catch, so no BATCH_LOG_FAILED diagnostic was ever emitted for it. The run still ends
+        # 0 with the result on stdout; the failure is injected into a copy of the runner (the real cause is a batch.log another process holds at that instant).
+        anchor = "try { Add-Content -LiteralPath $batchLog -Value $resultLine }"
+        runner = self._patched_runner(anchor, "try { throw 'simulated result-line append failure'; Add-Content -LiteralPath $batchLog -Value $resultLine }")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(batch_result(r.stdout)["ran"], 4)
+        self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (simulated result-line append failure)", r.stderr)
 
     def test_r5_adv_a1_a_throw_after_a_leg_ran_does_not_record_that_leg_as_not_run(self) -> None:
         # adversary r5 A1: the new batch catch left the leg whose child had completed (its output file could not be written) in pending, and the summary then said
@@ -2056,6 +2073,35 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         import hashlib
         self.assertEqual(json.loads(out.stdout), {"state": "STAGED", "sha": hashlib.sha256(p.read_bytes()).hexdigest(), "problem": ""})
+
+    def test_r6_adv_a1_preflight_decodes_the_staged_manifest_exactly_as_the_leg_jobs_validator_does(self) -> None:
+        # adversary r6 A1: preflight stripped every leading U+FEFF from a UTF-8 decode and never honoured a UTF-16 BOM, while Assert-AttrCudaBuildManifest reads with
+        # [IO.File]::ReadAllText (one BOM, UTF-16/32 by BOM). A doubled BOM was accepted here and rejected by the leg job after the lease opened; a UTF-16 manifest the
+        # job accepts was refused here. The oracle below is that very read; preflight must agree with it on every input.
+        c = "6" * 40
+        body = json.dumps({"sourceCommit": c, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False})
+        cases = {
+            "no BOM": (body.encode("utf-8"), ""),
+            "one UTF-8 BOM": (b"\xef\xbb\xbf" + body.encode("utf-8"), ""),
+            "two UTF-8 BOMs": (b"\xef\xbb\xbf\xef\xbb\xbf" + body.encode("utf-8"), "ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE"),
+            "UTF-16LE with a BOM": (b"\xff\xfe" + body.encode("utf-16-le"), ""),
+            "UTF-16BE with a BOM": (b"\xfe\xff" + body.encode("utf-16-be"), ""),
+        }
+        p = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
+        for label, (data, expected) in cases.items():
+            with self.subTest(case=label):
+                p.write_bytes(data)
+                script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                          f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30\n"
+                          f"$oracle = try {{ $null -ne ([IO.File]::ReadAllText('{p}') | ConvertFrom-Json) }} catch {{ $false }}\n"
+                          "ConvertTo-Json -Compress -InputObject @{ state = $r.state; problem = [string]$r.contentProblem; validatorParses = $oracle }\n")
+                out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                got = json.loads(out.stdout)
+                self.assertEqual(got["state"], "STAGED")
+                self.assertEqual(got["validatorParses"], expected == "", "the oracle (the validator's own read) disagrees with the fixture's expectation")
+                self.assertTrue(got["problem"].startswith(expected), got)
+                self.assertEqual(got["problem"] == "", got["validatorParses"], "preflight and the validator disagree")
 
     def test_r5_h2_the_interleave_helper_keeps_an_array_valued_item_whole(self) -> None:
         # key3 H2 (sol): the bare Dequeue() output was enumerated, so one array-valued item came back as its elements.
