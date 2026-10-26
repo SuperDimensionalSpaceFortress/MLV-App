@@ -47,7 +47,7 @@ if ($args[0] -eq 'api') {
     $path = @($args | Where-Object { $_ -like 'repos/*' })[0]
     $page = [int](@($args | Where-Object { $_ -like 'page=*' })[0] -replace '^page=', '')
     $parts = $path.Split('/')
-    if ($parts[3] -eq 'pulls') {
+    if ($parts[3] -in 'pulls', 'issues') {
         $file = Join-Path $dir ('pull-{0}_{1}_{2}_{3}.json' -f $parts[1], $parts[2], $parts[4], $parts[5])
     } else {
         $file = Join-Path $dir ('status-{0}_{1}_{2}.json' -f $parts[1], $parts[2], $parts[4])
@@ -83,8 +83,43 @@ def _status(context: str, state: str, created: str) -> dict:
     return {"context": context, "state": state, "created_at": created}
 
 
-def _review(login: str, state: str, submitted: str, commit: str) -> dict:
-    return {"user": {"login": login}, "state": state, "submitted_at": submitted, "commit_id": commit}
+def _review(login: str, state: str, submitted: str, commit: str, rid: int = 0) -> dict:
+    row = {"user": {"login": login}, "state": state, "submitted_at": submitted, "commit_id": commit}
+    if rid:
+        row["id"] = rid
+    return row
+
+
+def _dismissed(rid: int, prior: str, created: str) -> dict:
+    """A review_dismissed issue event: GitHub keeps the dismissed review's earlier state only here."""
+    return {"event": "review_dismissed", "created_at": created,
+            "dismissed_review": {"state": prior, "review_id": rid, "dismissal_message": "stale"}}
+
+
+def _front(pr: int, head: str, body: str, repo: str = "acme/widget") -> str:
+    """A cos-feedback.v1 record that names its pass only in the front matter (no '# owner/repo #n / head' heading)."""
+    return (f"schema: cos-feedback.v1\nproject: p\nrepo: {repo}\npr: {pr}\nhead: {head}\nreviewed_utc: 2026-10-21T09:00:00Z\n"
+            f"verdict: ADVISORY\n\nADVISORY — {repo} #{pr} / {head}\n\n{body}")
+
+
+SAMPLES = HERE / "fixtures" / "cos-samples"
+# Real CoS records copied verbatim from the bus (<project>--pr-<n>--<doctrine commit>.md): the pass each names, and whether
+# the CoS blocked it. The first five were read as clean (or not read at all) by the meter at 58806c8e.
+SAMPLE_PASSES = {
+    "mlv-app--pr-608--b2283ba4d6f6.md": ("SuperDimensionalSpaceFortress/MLV-App", 608, "073fc4f1a84439a8edf75cf6081defd81f08aee3", True),
+    "mlv-app--pr-612--84e86b2e8171.md": ("SuperDimensionalSpaceFortress/MLV-App", 612, "a297f0e5cd0fec6260632162c0e8b203666c1e9d", True),
+    "adobe-ingester--pr-4--c38e3dfd5a56.md": ("layibabalola/adobe-document-cloud-ingester", 4, "23270dcc9113118048e722b64ad617e50b79445d", True),
+    "mlv-app--pr-493--8c755c572106.md": ("SuperDimensionalSpaceFortress/MLV-App", 493, "79db95afcef4959a45daa83aabe54b2c8de9fb6c", True),
+    "mlv-app--pr-480--3a2c8a01e2f9.md": ("SuperDimensionalSpaceFortress/MLV-App", 480, "e5dd4b473b0afbb58acddc22d72c03e1ec26e0f8", True),
+    "mlv-app--pr-578--4587c6e6dcea.md": ("SuperDimensionalSpaceFortress/MLV-App", 578, "a8858093c127a30b446a26343f7e2c30dad7781c", False),
+    "mlv-app--pr-537--c4893fcf509a.md": ("SuperDimensionalSpaceFortress/MLV-App", 537, "7538f47b58a53ce35022516656a6c13800980587", False),
+    "mlv-app--pr-533--5c3efd9c33ae.md": ("SuperDimensionalSpaceFortress/MLV-App", 533, "20a58d87b5ab7de25a1543281adc3aa78566dc30", False),
+}
+
+
+def _sample_text(name: str) -> str:
+    # A Windows checkout may add CR; the bus blobs are LF.
+    return (SAMPLES / name).read_text(encoding="utf-8").replace("\r\n", "\n")
 
 
 def _review_comment(login: str, created: str, original_commit: str, commit: str = OTHER) -> dict:
@@ -366,7 +401,7 @@ class MeterFixtureTests(unittest.TestCase):
             ("cos-feedback/p/pr-8.md", _section(8, H1, "B1 x."), "2026-10-21T10:01:00+00:00", "pr8 same head"),
         ])
         # Fetched after both passes, but by a run that had only seen PR 7.
-        cache = {f"acme/widget@{H1}": {"fetched": "2026-10-21T10:02:00Z", "native": True, "prs": [7], "rows": []}}
+        cache = {f"acme/widget@{H1}": {"fetched": "2026-10-21T10:02:00Z", "native": True, "dismissals": True, "prs": [7], "rows": []}}
         gh = self._fake_gh(pulls={("acme/widget", 8, "reviews"): [_review("keybot", "APPROVED", "2026-10-21T09:00:00Z", H1)]})
         result, _ = self._measure_bus(bus, "p", cache=cache, gh=gh, declared={"nativeReviews": True})
         # The approval is of the exact commit, so it precedes both blocking passes on H1.
@@ -772,6 +807,176 @@ class MeterFixtureTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
         proc = self._run("-Bus", str(self.bus), "-OutDir", str(self._dir()), "-Since", "not-a-time", "-NoStatuses", "-NoFetch")
         self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+
+    # -- r3 on 58806c8e: CoS markdown variants (key3 B3, catalogue D-03) and dismissed native reviews (sol r2)
+
+    def _blocked_heads(self, bus: Path, project: str, heads: list[str], repo: str = "acme/widget") -> tuple[dict, list[str]]:
+        """Measures with known (empty) evidence for every head, so the corpus lists exactly the heads read as blocked."""
+        cache = {f"{repo}@{h}": {"fetched": "2026-10-25T00:00:00Z", "rows": []} for h in heads}
+        result, out = self._measure_bus(bus, project, cache=cache)
+        return result, [r["head"] for r in self._corpus(out)]
+
+    def test_markdown_blocker_forms_in_the_blockers_section_are_blocked(self) -> None:
+        blocked = ["- B1 x.", "* B1 x.", "+ B2 x.", "**B1** x.", "__B1__ x.", "*B1* x.", "1. B1 x.", "2) B1 x.",
+                   "- **B1 / P1:** `a.ps1:3` x.", "> B1 x.", "### B1 x.", "  - B1 indented."]
+        clean = ["None.", "- None demonstrated.", "**None demonstrated.**", "1. None.",
+                 "No new demonstrated blocker. Prior B1 is source-fixed.", "- Prior B1 is source-fixed.", "Blocked by nothing; B1 closed."]
+        commits, heads = [], []
+        for i, text in enumerate(blocked + clean):
+            head = f"{i + 1:040x}"
+            heads.append(head)
+            commits.append((f"cos-feedback/p/pr-{i + 1}.md", _section(i + 1, head, text), f"2026-10-21T10:{i:02d}:00+00:00", f"form {i}"))
+        result, got = self._blocked_heads(self._small_bus(commits), "p", heads)
+        self.assertEqual(sorted(got), sorted(heads[:len(blocked)]),
+                         [(t, h in got) for t, h in zip(blocked + clean, heads)])
+        since = result["windows"][0]
+        self.assertEqual((since["passes"], since["blocked"], since["firstRoundBlocked"]), (len(heads), len(blocked), len(blocked)))
+
+    def test_a_b_line_after_the_blockers_section_ends_is_not_a_blocker(self) -> None:
+        texts = [
+            f"# acme/widget #1 / {H1}\n\n## Blockers\n\n## Improvements\n- B1 an improvement numbered like a blocker.\n",
+            f"# acme/widget #2 / {H2}\n\n## Blockers\n\n# Appendix\nB1 x.\n",
+            f"# acme/widget #3 / {H3}\n\n## Blockers\nNone.\n\n## Improvements\n- B1 x.\n",
+            f"# acme/widget #4 / {H4}\n\nBlockers: None demonstrated.\nImprovements:\n- B1 x.\n",
+        ]
+        commits = [(f"cos-feedback/p/pr-{i + 1}.md", t, f"2026-10-21T10:0{i}:00+00:00", f"t{i}") for i, t in enumerate(texts)]
+        result, got = self._blocked_heads(self._small_bus(commits), "p", [H1, H2, H3, H4])
+        self.assertEqual(got, [])
+        self.assertEqual((result["windows"][0]["passes"], result["windows"][0]["blocked"]), (4, 0))
+
+    def test_blockers_heading_and_label_variants_open_the_section(self) -> None:
+        bodies = [
+            ("## Blockers (2026-10-19T15:36:51Z)\n- B1 x.\n", True),
+            ("## Blockers:\nB1 x.\n", True),
+            ("### Blockers\n\n- B1 x.\n", True),
+            ("## **Blockers**\n- B1 x.\n", True),
+            ("Blockers: B1 (medium confidence) x.\n\nImprovements: none.\n", True),
+            ("**Blockers:** B1 x.\n", True),
+            ("Blockers:\n- B1 x.\n", True),
+            ("## Blockers (none)\nNone demonstrated.\n", False),
+            ("Blockers: None demonstrated in this pass.\n", False),
+        ]
+        commits, heads, want = [], [], []
+        for i, (body, is_blocked) in enumerate(bodies):
+            head = f"{i + 1:040x}"
+            heads.append(head)
+            if is_blocked:
+                want.append(head)
+            commits.append((f"cos-feedback/p/pr-{i + 1}.md", f"# acme/widget #{i + 1} / {head}\n\nVerdict.\n\n{body}",
+                            f"2026-10-21T10:{i:02d}:00+00:00", f"v{i}"))
+        _, got = self._blocked_heads(self._small_bus(commits), "p", heads)
+        self.assertEqual(sorted(got), sorted(want), [(b, h in got) for (b, _), h in zip(bodies, heads)])
+
+    def test_front_matter_names_the_pass_when_there_is_no_heading(self) -> None:
+        bus = self._small_bus([
+            ("cos-feedback/p/pr-7.md", _front(7, H1, "## Blockers\n- B1 x.\n"), "2026-10-21T10:00:00+00:00", "front matter, blocked"),
+            ("cos-feedback/p/pr-8.md", _front(8, H2, "## Blockers\nNone demonstrated.\n"), "2026-10-21T10:01:00+00:00", "front matter, clean"),
+            # A heading wins over the front matter: it is what a multi-section file appends per head.
+            ("cos-feedback/p/pr-9.md", _front(9, H3, f"# acme/widget #9 / {H4}\n\n## Blockers\nB1 x.\n"), "2026-10-21T10:02:00+00:00", "both"),
+            # Front matter that does not name a full head names no pass.
+            ("cos-feedback/p/pr-10.md", "schema: cos-feedback.v1\nrepo: acme/widget\npr: 10\nhead: abc123 (merged)\n\n## Blockers\n- B1 x.\n",
+             "2026-10-21T10:03:00+00:00", "bad head"),
+            ("cos-feedback/p/pr-11.md", "# Agent-share listing: ADVISORY\n\n## Blockers\n- B1 x.\n", "2026-10-21T10:04:00+00:00", "no identity"),
+        ])
+        result, got = self._blocked_heads(bus, "p", [H1, H2, H3, H4])
+        self.assertEqual(sorted(got), sorted([H1, H4]))
+        since = result["windows"][0]
+        self.assertEqual((since["passes"], since["blocked"], since["unparsed"]), (3, 2, 2))
+        self.assertEqual(result["windows"][1]["unparsed"], 0)  # the 24 h window holds none of them
+
+    def test_an_unparsed_cos_file_is_counted_and_named_not_silently_skipped(self) -> None:
+        bus = self._small_bus([("cos-feedback/p/pr-11.md", "# Agent-share listing: ADVISORY\n\n## Blockers\n- B1 x.\n",
+                                _iso(NOW - timedelta(hours=1)), "no identity")])
+        result, out = self._measure_bus(bus, "p", since=_iso(NOW - timedelta(days=1)))
+        self.assertEqual([w["unparsed"] for w in result["windows"]], [1, 1])
+        md = (out / "quality-lift.md").read_text(encoding="utf-8-sig")
+        self.assertIn("not measured: 1", md)
+        fleet_out = self._dir()
+        proc = self._run("-Bus", str(bus), "-Since", _iso(NOW - timedelta(days=1)), "-OutDir", str(fleet_out), "-NoStatuses", "-NoFetch")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("CoS files that name no pass (not measured): p 1", (fleet_out / "fleet.md").read_text(encoding="utf-8-sig"))
+
+    def test_real_cos_records_are_read_as_the_cos_wrote_them(self) -> None:
+        commits, by_project = [], {}
+        for i, (name, (repo, pr, head, _)) in enumerate(sorted(SAMPLE_PASSES.items())):
+            project = name.split("--")[0]
+            by_project.setdefault(project, []).append((repo, head))
+            commits.append((f"cos-feedback/{project}/pr-{pr}.md", _sample_text(name), f"2026-10-21T1{i}:00:00+00:00", name))
+        bus = self._small_bus(commits)
+        for project, passes in by_project.items():
+            cache = {f"{repo}@{head}": {"fetched": "2026-10-25T00:00:00Z", "rows": []} for repo, head in passes}
+            result, out = self._measure_bus(bus, project, cache=cache)
+            want = sorted(h for n, (_, _, h, b) in SAMPLE_PASSES.items() if b and n.startswith(project + "--"))
+            self.assertEqual(sorted(r["head"] for r in self._corpus(out)), want, project)
+            self.assertEqual((result["windows"][0]["passes"], result["windows"][0]["unparsed"]), (len(passes), 0), project)
+
+    @unittest.skipUnless(os.environ.get("FACTORY_BUS_CLONE"), "binds the samples to the bus; set FACTORY_BUS_CLONE to a bus clone")
+    def test_the_real_records_match_the_bus_at_their_doctrine_commit(self) -> None:
+        bus = Path(os.environ["FACTORY_BUS_CLONE"])
+        self.assertEqual(sorted(p.name for p in SAMPLES.glob("*.md")), sorted(SAMPLE_PASSES))
+        for name, (_, pr, _, _) in SAMPLE_PASSES.items():
+            project, _, commit = name[:-3].split("--")
+            blob = subprocess.run(["git", "-C", str(bus), "show", f"{commit}:cos-feedback/{project}/pr-{pr}.md"],
+                                  capture_output=True, check=True).stdout.decode("utf-8")
+            self.assertEqual(_sample_text(name), blob, name)
+
+    def test_adoption_reads_a_repository_named_only_in_front_matter(self) -> None:
+        bus = self._small_bus([("cos-feedback/p/pr-5.md", _front(5, H1, "## Blockers\nNone.\n"), "2026-10-01T00:00:00+00:00", "old")])
+        gh = self._fake_gh(prs={"acme/widget": [
+            {"number": 6, "body": "Adversary pass: run verdict=CLEAN found=0 fixed=0", "createdAt": _iso(NOW - timedelta(hours=1))}]})
+        result, _ = self._measure_bus(bus, "p", since=_iso(NOW - timedelta(hours=2)), gh=gh)
+        self.assertEqual(result["shiftLeft"], {"prs": 1, "withAdversaryLine": 1})
+
+    NATIVE_KEYBOT = {"nativeReviews": True, "reviewAuthors": ["keybot"]}
+
+    def test_a_dismissed_approval_before_cos_is_still_a_prior_approval(self) -> None:
+        # GitHub returns a dismissed review as DISMISSED with its original submitted_at; its earlier state is on the event.
+        gh = self._fake_gh(pulls={
+            ("acme/widget", 20, "reviews"): [_review("keybot", "DISMISSED", "2026-10-21T09:00:00Z", H7, rid=101)],
+            ("acme/widget", 20, "events"): [_dismissed(101, "approved", "2026-10-21T11:00:00Z")],  # dismissed after CoS
+            ("acme/widget", 21, "reviews"): [_review("keybot", "DISMISSED", "2026-10-21T09:00:00Z", H8, rid=102)],
+            ("acme/widget", 21, "events"): [_dismissed(102, "changes_requested", "2026-10-21T11:00:00Z")],
+            ("acme/widget", 22, "reviews"): [_review("keybot", "APPROVED", "2026-10-21T09:00:00Z", H9, rid=103)],
+        })
+        out = self._dir()
+        since = self._measure("flip", out, gh=gh, declared=self.NATIVE_KEYBOT)["windows"][0]
+        self.assertEqual((since["trueMiss"], since["noPriorKey"], since["statusUnknown"]), (2, 0, 0))
+        self.assertEqual(since["nativeBeforeCos"]["pull-request-review/keybot"], {"review": True, "successBeforeCos": 2, "failureBeforeCos": 1})
+        rows = {r["head"]: r for r in self._corpus(out)}
+        self.assertEqual((rows[H7]["nativeApprovedBeforeCos"], rows[H8]["nativeApprovedBeforeCos"]), (["pull-request-review/keybot"], []))
+        calls = (gh / "calls.log").read_text(encoding="utf-8")
+        self.assertIn("api repos/acme/widget/issues/20/events page=1", calls)
+        self.assertNotIn("issues/22/events", calls)  # no dismissed review there, so no history is read
+        # The next run reads the same evidence from the cache.
+        again = self._measure("flip", out, declared=self.NATIVE_KEYBOT)["windows"][0]
+        self.assertEqual((again["trueMiss"], again["statusUnknown"]), (2, 0))
+
+    def test_a_dismissed_review_whose_history_cannot_be_read_is_unknown_not_zero(self) -> None:
+        gh = self._fake_gh(pulls={
+            ("acme/widget", 20, "reviews"): [_review("keybot", "DISMISSED", "2026-10-21T09:00:00Z", H7, rid=101)],
+            ("acme/widget", 21, "reviews"): [_review("keybot", "DISMISSED", "2026-10-21T09:00:00Z", H8, rid=102)],
+            ("acme/widget", 21, "events"): [_dismissed(999, "approved", "2026-10-21T11:00:00Z")],  # another review's event
+        })
+        out = self._dir()
+        since = self._measure("flip", out, gh=gh, declared=self.NATIVE_KEYBOT)["windows"][0]
+        self.assertEqual((since["statusUnknown"], since["trueMiss"], since["noPriorKey"]), (2, 0, 1))  # H9 has no review
+        self.assertEqual([r["head"] for r in self._corpus(out)], [H9], "an unknown head must not be frozen into the corpus")
+        # A known approval on the same head decides it, whatever the dismissed review was.
+        gh = self._fake_gh(pulls={("acme/widget", 20, "reviews"): [
+            _review("keybot", "DISMISSED", "2026-10-21T08:00:00Z", H7, rid=101), _review("keybot", "APPROVED", "2026-10-21T09:00:00Z", H7, rid=104)]})
+        since = self._measure("flip", self._dir(), gh=gh, declared=self.NATIVE_KEYBOT)["windows"][0]
+        self.assertEqual((since["statusUnknown"], since["trueMiss"]), (0, 1))
+
+    def test_a_native_cache_entry_without_dismissal_history_is_not_evidence(self) -> None:
+        # Written by a meter that read a dismissed review as no approval: refetched with GitHub, unknown without it.
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7")])
+        cache = {f"acme/widget@{H1}": {"fetched": "2026-10-21T12:00:00Z", "native": True, "prs": [7], "rows": []}}
+        result, _ = self._measure_bus(bus, "p", cache=cache, declared=self.NATIVE_KEYBOT)
+        self.assertEqual(result["windows"][0]["statusUnknown"], 1)
+        gh = self._fake_gh(pulls={("acme/widget", 7, "reviews"): [_review("keybot", "DISMISSED", "2026-10-21T09:00:00Z", H1, rid=5)],
+                                  ("acme/widget", 7, "events"): [_dismissed(5, "approved", "2026-10-21T11:00:00Z")]})
+        result, _ = self._measure_bus(bus, "p", cache=cache, gh=gh, declared=self.NATIVE_KEYBOT)
+        self.assertEqual((result["windows"][0]["statusUnknown"], result["windows"][0]["trueMiss"]), (0, 1))
 
     def test_the_meter_is_ascii_and_names_no_board_path(self) -> None:
         raw = METER.read_bytes()

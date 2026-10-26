@@ -9,6 +9,7 @@ authority. The per-project values (which evidence is a project's review) live on
 | `review-sources.json` | Which evidence each project's factory review leaves (`-ReviewSources`). "CoS read first" and true misses are claimed only from it; a project it does not name reads `unknown`. |
 | `adversary-pass-prompt.md` | Template for ONE read-only contract-attack pass on an exact local head: list the invariants, build accepted inputs that break each, cite file:line, sweep the class. Only blocker/major findings that the diff introduced are actionable; minor and pre-existing ones are advisories. |
 | `test_fleet_quality_lift.py` | Fixture proof for the meter (`py -3 -m unittest tools/coordination/quality_lift/test_fleet_quality_lift.py`). |
+| `fixtures/cos-samples/` | Real CoS records copied verbatim from the bus, named `<project>--pr-<n>--<bus commit>.md`. With `FACTORY_BUS_CLONE` set, a test checks each one against the bus at that commit. |
 
 ## Run the meter
 
@@ -24,6 +25,17 @@ before it measures; `-NoFetch` skips that pull, and a pull that fails is a named
 nothing from GitHub: blocked heads with no cached statuses then count as "unknown", never as "CoS read first". Exit 0
 means measured, 2 measured with source errors (named in the report), 3 bus unreadable, and 4 a usage error.
 
+## What the meter reads from a CoS file
+
+- **The pass:** the last `# <owner>/<repo> #<n> / <40-hex head>` heading, or else the `cos-feedback.v1` front matter
+  (`repo:`, `pr:` and `head:` in the leading `schema: cos-feedback.v1` block). A file with neither is counted as
+  "names no pass" in the report, never silently dropped.
+- **Blocked:** the first content line of the Blockers section starts `B<n>`. The section is a `## Blockers` or
+  `### Blockers` heading (bold, a trailing colon or a note in brackets allowed) or a `Blockers:` label line. The line may
+  carry quote, list (`- * +`, `1.`, `1)`), `###` heading or bold/italic marks before `B<n>`. A line under the next level-1
+  or level-2 heading is outside the section, so `## Blockers` followed by `## Improvements` and `- B1 ...` is clean.
+  `None demonstrated.`, `- None.` and `Prior B1 is fixed.` are clean.
+
 ## Declare your review evidence
 
 A commit status that says `success` is not a review: CI says it too. So the meter claims "CoS read first" and true misses
@@ -38,7 +50,10 @@ only from evidence your project declares in `review-sources.json` (or the file y
   before CoS is prior review; its `success` is an approval.
 - `nativeReviews`: also read GitHub PR reviews on that head (`commit_id`) and review comments written on it
   (`original_commit_id`), optionally only by `reviewAuthors`. Only an `APPROVED` review is an approval; any other review
-  and every review comment is prior review evidence, never an approval.
+  and every review comment is prior review evidence, never an approval. GitHub returns a dismissed review as `DISMISSED`
+  with its original `submitted_at`, so the meter reads the PR's `review_dismissed` issue events for the state it was
+  submitted with: a dismissed approval is still an approval at its submission time. When that event cannot be found, the
+  head reads `unknown`, never "no approval".
 
 Declare at least one. A project the file does not name reports `unknown` for CoS read first and true misses, and the
 fleet totals leave it out. Its raw status counts stay in `statusBeforeCos` (no status of any context before CoS; some

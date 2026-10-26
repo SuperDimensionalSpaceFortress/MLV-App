@@ -14,7 +14,7 @@ Owner-requested, 2026-10-25. Proposed only: it grants no runtime authority, and 
 - touches R18.3 (RULINGS.md:2914, the merge floor; unchanged, the pass is not a key)
 - extends R18.4 (RULINGS.md:2915-2919, quality compensation and the attack catalogue)
 
-**Measured problem** (bus cos-feedback, 2026-10-18..25): across 4 projects, 202 CoS passes found a demonstrated defect in 53 (26 %). CoS-first is claimed only from declared review evidence. mlv-app declares its review/* factory keys: 35 of 140 blocked, 18 of 91 PRs blocked first round, CoS first on 30 of 35 (no prior review/* status), 5 true misses (a review/* key said success before CoS blocked), 1.54 rounds per PR. The other 3 declare nothing yet: unknown. Detail: same-date receipt.
+**Measured problem** (bus cos-feedback, 2026-10-18..25): across 6 projects, 69 of 342 CoS passes (20 %) found a demonstrated defect. CoS-first is claimed only from declared review evidence. mlv-app declares its review/* factory keys: 43 of 248 blocked, 25 of 179 PRs blocked first round, CoS first on 33 of 43 (no prior review/* status), 10 true misses (a review/* key said success before CoS blocked), 1.39 rounds per PR. The other 5 declare nothing yet: unknown. Detail: same-date receipt.
 
 **Proposed law**
 1. Before a producer opens a PR or pushes to an open one, ONE read-only adversary pass runs on the exact local head, preferably by a different provider family than the author. The same family is allowed when that provider is dark: a preference is not a gate.

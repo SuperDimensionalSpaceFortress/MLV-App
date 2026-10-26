@@ -7,10 +7,12 @@
 # READ-ONLY on GitHub. On the bus it only reads, except the one `git pull --ff-only` before measuring, which -NoFetch skips.
 # It reads:
 #   - the bus history of cos-feedback/<project>/pr-*.md (one CoS pass per commit and file; the section header
-#     "# <owner>/<repo> #<n> / <40-hex head>" names the repo, PR and head; a first "## Blockers" line B<n> = blocked)
+#     "# <owner>/<repo> #<n> / <40-hex head>", else the cos-feedback.v1 front matter, names the repo, PR and head; the
+#     Blockers section's first line starting B<n>, in plain, bulleted, numbered or bold form, = blocked; see Get-QlIdentity)
 #   - GitHub commit statuses on each blocked head (every page, every context, reported per context)
 #   - for a project that declares native reviews: the PR's reviews (on that head's commit_id) and review comments
-#     (written on that head: original_commit_id), every page, folded per author
+#     (written on that head: original_commit_id), every page, folded per author; for a DISMISSED review, the PR's
+#     review_dismissed issue events, which keep the state it was submitted with
 #   - PR bodies created in the last 24 h, for an "Adversary pass" line (shift-left adoption; bodies only, never comments)
 # It writes ONLY under -OutDir:
 #   single project (-Project x): <OutDir>\quality-lift.md|.json, history.jsonl, corpus.jsonl, status-cache.json
@@ -18,10 +20,12 @@
 # Review evidence is DECLARED, never inferred. A status context is not a review because it said 'success': CI says that too.
 # -ReviewSources names, per project, which evidence is the factory's review: status contexts (wildcards, e.g. review/*)
 # and/or native PR reviews (optionally only by named authors). A native review counts as an approval only when its state is
-# APPROVED; every other review state and every review comment is review evidence, never an approval.
+# APPROVED, or it was APPROVED when submitted and later dismissed; every other review state and every review comment is
+# review evidence, never an approval. A dismissed review whose earlier state cannot be read makes the head unknown.
 # Definitions (lower is better on every rate). A "round" is one head CoS reviewed:
 #   blockedRate        share of CoS-reviewed heads (one pass per repo, PR and head; a head re-reviewed clean-then-blocked counts
 #                      at its first BLOCKING pass) whose first Blockers line starts B<n>
+#   unparsed           CoS files in the window that name no pass (neither identity form); counted and reported, not measured
 #   firstRoundBlocked  PRs whose first CoS-reviewed head (ordered by its first pass in the window) was blocked; clean-then-
 #                      blocked on that head counts as blocked. Each window is cut from the raw passes before heads are folded.
 #   noPriorKey         blocked heads whose evidence is known and that carry no DECLARED review evidence from before the CoS
@@ -30,8 +34,9 @@
 #                      review) from before the CoS pass (the factory approved a defect). 'unknown' when nothing is declared.
 #   statusBeforeCos    the raw status proxy, every context alike: noPriorStatus (no status of any context before CoS) and
 #                      successBeforeCos (some context said 'success' before CoS). It proves neither a review nor its absence.
-#   statusUnknown      blocked heads with no evidence (-NoStatuses with no cache entry, or a failed fetch); they count in
-#                      neither noPriorKey nor trueMiss nor the proxy
+#   statusUnknown      blocked heads with no evidence (-NoStatuses with no cache entry, or a failed fetch), or with a prior
+#                      dismissed review of unreadable state and no known prior approval; they count in neither noPriorKey nor trueMiss
+#                      nor the proxy
 #   contextsBeforeCos  per status context, and nativeBeforeCos per native reviewer, what existed before CoS on blocked heads,
 #                      each marked review=true when it is declared review evidence (kept apart: a status may use any text)
 #   roundsPerPr        distinct heads CoS reviewed per PR
@@ -81,6 +86,46 @@ function ConvertTo-QlUtc([object]$s) {
 
 function Get-QlKey($p) { "$($p.repo)@$($p.head)" }
 
+# CoS text forms, all as the CoS writes them on the bus (measured 2026-10-26; tests carry real records):
+#   identity  the last "# <owner>/<repo> #<n> / <40-hex head>" heading, else the cos-feedback.v1 front matter (the
+#             leading "schema: cos-feedback.v1" block, up to its first blank line) naming repo:, pr: and head:
+#   section   a "## Blockers" or "### Blockers" heading (bold, a trailing colon or a parenthesised note allowed), or a
+#             "Blockers:" label line (bold or bulleted allowed) whose text may follow on the same line
+#   blocker   the section's first content line starts B<n>, after optional quote, heading (###+), bullet (- * +), number
+#             (1. 1)) and emphasis (** __ * _) marks. A line under the next level-1 or -2 heading is outside the section.
+$QlHeading = '(?m)^# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d+) / ([0-9a-f]{40})'
+$QlBlockedLine = '^(?:>[ \t]*)?(?:#{3,6}[ \t]+)?(?:[-*+][ \t]+|\d+[.)][ \t]+)?(?:\*\*|__|\*|_)?B\d'
+
+# The pass a CoS file names: @{ repo; pr; head; section }, or $null when it names none.
+function Get-QlIdentity([string]$Txt) {
+    $ms = [regex]::Matches($Txt, $QlHeading)
+    if ($ms.Count) {
+        $m = $ms[$ms.Count - 1]
+        return @{ repo = $m.Groups[1].Value; pr = [int]$m.Groups[2].Value; head = $m.Groups[3].Value; section = $Txt.Substring($m.Index) }
+    }
+    $fm = [regex]::Match($Txt, '\A(?:\uFEFF)?schema:[ \t]*cos-feedback\.v1[ \t]*\r?\n(?:[^\r\n]*\S[^\r\n]*\r?\n)*')
+    if (-not $fm.Success) { return $null }
+    $repo = [regex]::Match($fm.Value, '(?m)^repo:[ \t]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)[ \t]*\r?$')
+    $pr = [regex]::Match($fm.Value, '(?m)^pr:[ \t]*(\d+)[ \t]*\r?$')
+    $head = [regex]::Match($fm.Value, '(?m)^head:[ \t]*([0-9a-f]{40})[ \t]*\r?$')
+    if (-not ($repo.Success -and $pr.Success -and $head.Success)) { return $null }
+    @{ repo = $repo.Groups[1].Value; pr = [int]$pr.Groups[1].Value; head = $head.Groups[1].Value; section = $Txt.Substring($fm.Length) }
+}
+
+# The first content line of the Blockers section ('' when there is none, or the section is empty).
+function Get-QlBlockerLine([string]$Sec) {
+    $h = [regex]::Match($Sec, '(?m)^#{2,3}[ \t]+(?:\*\*|__)?Blockers(?:\*\*|__)?[ \t]*:?[ \t]*(?:\([^)\r\n]*\))?[ \t]*\r?$')
+    $l = [regex]::Match($Sec, '(?m)^(?:[-*+][ \t]+)?(?:\*\*|__)?Blockers(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*([^\r\n]*)')
+    if (-not $h.Success -and -not $l.Success) { return '' }
+    if ($l.Success -and (-not $h.Success -or $l.Index -lt $h.Index)) {
+        if ($l.Groups[1].Value.Trim()) { return $l.Groups[1].Value.Trim() }
+        $rest = $Sec.Substring($l.Index + $l.Length)
+    } else { $rest = $Sec.Substring($h.Index + $h.Length) }
+    $first = (($rest -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 1) + ''
+    if ($first -match '^[ \t]*#{1,2}([ \t]|$)') { return '' }   # the next section: this one is empty
+    $first.Trim()
+}
+
 # Every CoS pass (one per commit and file) since $From, unfolded. --since-as-filter, not --since: --since stops the walk at
 # the first older commit, so a commit behind one with a skewed (older) date would be missed. The project name is literal
 # everywhere (a git :(literal) pathspec, an escaped wildcard), so 'demo[1]' is not a pattern that matches 'demo1'. seq is the
@@ -100,17 +145,14 @@ function Get-QlPasses([string]$Proj, [string]$From) {
         foreach ($f in ($names | Where-Object { $_ -like $like })) {
             $txt = (git -C $Bus show "${h}:$f" 2>$null) -join "`n"
             if ($LASTEXITCODE -ne 0) { throw "git show $($h.Substring(0,12)):$f failed (exit $LASTEXITCODE)" }
-            $ms = [regex]::Matches($txt, '(?m)^# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d+) / ([0-9a-f]{40})')
-            if ($ms.Count -eq 0) { continue }
-            $m = $ms[$ms.Count - 1]
-            $sec = $txt.Substring($m.Index)
+            $id = Get-QlIdentity $txt
+            # A file that names no pass is counted (parsed = false) and reported, never silently dropped.
+            if (-not $id) { $out += [pscustomobject]@{ utc = (ConvertTo-QlUtc $t); seq = $seq; parsed = $false; file = $f }; continue }
             # The heading line, not the phrase: a verdict that mentions "## Blockers" mid-line is not the section.
-            $hm = [regex]::Match($sec, '(?m)^##[ \t]+Blockers[ \t]*$')
-            $blk = ''
-            if ($hm.Success) { $blk = ((($sec.Substring($hm.Index + $hm.Length) -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 1) + '').Trim() }
+            $blk = Get-QlBlockerLine $id.section
             $out += [pscustomobject]@{
-                utc = (ConvertTo-QlUtc $t); seq = $seq; repo = $m.Groups[1].Value; pr = [int]$m.Groups[2].Value
-                head = $m.Groups[3].Value; blocked = ($blk -match '^B\d'); blocker = $(if ($blk.Length -gt 160) { $blk.Substring(0, 160) } else { $blk })
+                utc = (ConvertTo-QlUtc $t); seq = $seq; parsed = $true; repo = $id.repo; pr = $id.pr
+                head = $id.head; blocked = ($blk -match $QlBlockedLine); blocker = $(if ($blk.Length -gt 160) { $blk.Substring(0, 160) } else { $blk })
             }
         }
     }
@@ -131,12 +173,13 @@ function Group-QlHeads([object[]]$Raw) {
 # Every repository the project's CoS files at the bus HEAD name, so adoption is read even when no pass is in the window.
 # --null prints each path verbatim before a NUL, so the pr-*.md filter runs on the literal project folder.
 function Get-QlRepos([string]$Proj) {
-    $lines = @(git -C $Bus grep --null -I -E '^# [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+ #[0-9]+ / [0-9a-f]{40}' HEAD -- ":(literal)cos-feedback/$Proj/" 2>$null)
+    # Either identity form names the repository: the heading, or the front matter's repo: line.
+    $lines = @(git -C $Bus grep --null -I -E -e '^# [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+ #[0-9]+ / [0-9a-f]{40}' -e '^repo:[[:blank:]]*[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+[[:blank:]]*$' HEAD -- ":(literal)cos-feedback/$Proj/" 2>$null)
     if ($LASTEXITCODE -gt 1) { throw "git grep of cos-feedback/$Proj failed (exit $LASTEXITCODE)" }
     $like = "HEAD:cos-feedback/$([WildcardPattern]::Escape($Proj))/pr-*.md"
     @($lines | ForEach-Object {
         $path, $text = $_.Split([char]0, 2)
-        if ($path -like $like -and $text -match '^# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #') { $Matches[1] }
+        if ($path -like $like -and $text -match '^(?:# |repo:[ \t]*)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?: #|[ \t]*\r?$)') { $Matches[1] }
     })
 }
 
@@ -189,6 +232,7 @@ function Test-QlCacheEntry($e) {
             if ($null -ne $r.source -and $r.source -notin 'status', 'review', 'review-comment') { return $false }
             if ($r.source -in 'review', 'review-comment' -and ($r.login -isnot [string] -or -not $r.login)) { return $false }
             if ($r.source -eq 'review-comment' -and $null -ne $r.successUtc -and "$($r.successUtc)" -ne '') { return $false }
+            if ($null -ne $r.unknownUtc -and "$($r.unknownUtc)" -ne '') { if ($r.source -ne 'review') { return $false }; $null = ConvertTo-QlUtc $r.unknownUtc }
             $null = ConvertTo-QlUtc $r.firstUtc
             foreach ($v in @($r.successUtc, $r.failureUtc)) { if ($null -ne $v -and "$v" -ne '') { $null = ConvertTo-QlUtc $v } }
         }
@@ -218,11 +262,13 @@ function Group-QlRows([object[]]$Rows, [string]$Context, [string]$Source, [strin
     $g = @($Rows | Sort-Object when, ord)
     $okRows = @($g | Where-Object { $_.state -in $Ok })
     $badRows = @($g | Where-Object { $_.state -in $Bad })
+    $unknownRows = @($g | Where-Object { $_.unknown -eq $true })
     $row = [ordered]@{
         context = $Context; source = $Source; firstUtc = $g[0].when.ToString('o'); state = $g[-1].state
         successUtc = $(if ($okRows.Count) { $okRows[0].when.ToString('o') } else { $null })
         failureUtc = $(if ($badRows.Count) { $badRows[0].when.ToString('o') } else { $null })
     }
+    if ($unknownRows.Count) { $row.unknownUtc = $unknownRows[0].when.ToString('o') }   # a dismissed review of unknown state
     if ($Login) { $row.login = $Login }
     [pscustomobject]$row
 }
@@ -240,13 +286,24 @@ function Get-QlStatusRows([string]$Repo, [string]$Head) {
 # context pull-request-review/<login> (APPROVED = success, CHANGES_REQUESTED = failure; a review still pending has no
 # submitted_at and is skipped) and pull-request-review-comment/<login> (never a success). A review counts for the commit
 # it was submitted on, a review comment for the commit it was written on. Both listings are oldest first.
+# A dismissed review: GitHub returns it as DISMISSED with its original submitted_at, and keeps the state it had only on
+# the PR's review_dismissed issue event (dismissed_review.state: approved, changes_requested or commented). That state is
+# the review's state at submission; a review whose event cannot be found is marked unknown (Test-QlPriorUnknown).
 function Get-QlNativeRows([string]$Repo, [int[]]$Prs, [string]$Head) {
     $seen = @(); $ord = 0
     foreach ($n in @($Prs | Sort-Object -Unique)) {
+        $dismissals = $null   # read once per PR, and only when a dismissed review is on this head
         foreach ($r in @(Get-QlGhPages "repos/$Repo/pulls/$n/reviews")) {
             $ord++
             if ("$($r.commit_id)" -ne $Head -or $null -eq $r.submitted_at -or "$($r.submitted_at)" -eq '') { continue }
-            $seen += [pscustomobject]@{ source = 'review'; login = "$($r.user.login)"; when = (ConvertTo-QlUtc $r.submitted_at); ord = $ord; state = "$($r.state)" }
+            $state = "$($r.state)"; $unknown = $false
+            if ($state -eq 'DISMISSED') {
+                if ($null -eq $dismissals) { $dismissals = @(Get-QlGhPages "repos/$Repo/issues/$n/events" | Where-Object { "$($_.event)" -eq 'review_dismissed' }) }
+                $ev = @($dismissals | Where-Object { "$($r.id)" -ne '' -and "$($_.dismissed_review.review_id)" -eq "$($r.id)" })
+                $prior = $(if ($ev.Count) { "$($ev[0].dismissed_review.state)".ToUpperInvariant() } else { '' })
+                if ($prior -cin 'APPROVED', 'CHANGES_REQUESTED', 'COMMENTED') { $state = $prior } else { $unknown = $true }
+            }
+            $seen += [pscustomobject]@{ source = 'review'; login = "$($r.user.login)"; when = (ConvertTo-QlUtc $r.submitted_at); ord = $ord; state = $state; unknown = $unknown }
         }
         foreach ($c in @(Get-QlGhPages "repos/$Repo/pulls/$n/comments")) {
             $ord++
@@ -276,13 +333,21 @@ function Test-QlReviewRow($r, $Decl) {
 function Test-QlApprovedBefore($r, [DateTime]$Cos) { $r.source -ne 'review-comment' -and (Test-QlBefore $r.successUtc $Cos) }
 
 # The cache entry that proves the evidence of one pass, or $null: it must have been fetched at or after the pass, and, when
-# the project declares native reviews, hold the reviews of that pass's PR.
+# the project declares native reviews, hold the reviews of that pass's PR, read with their dismissal history (an entry
+# without dismissals = true was written by a meter that read a dismissed approval as no approval).
 function Get-QlEvidence([hashtable]$Cache, $p, [bool]$NeedNative) {
     $e = $Cache[(Get-QlKey $p)]
-    if ($e -and (ConvertTo-QlUtc $e.fetched) -ge $p.utc -and (-not $NeedNative -or ($e.native -eq $true -and $p.pr -in @($e.prs)))) { $e } else { $null }
+    if ($e -and (ConvertTo-QlUtc $e.fetched) -ge $p.utc -and (-not $NeedNative -or ($e.native -eq $true -and $e.dismissals -eq $true -and $p.pr -in @($e.prs)))) { $e } else { $null }
 }
 
-function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache, $Decl) {
+# Is the head's approval before the pass unknown? Yes when a declared review row from before the pass holds a dismissed
+# review whose earlier state could not be read, and no known approval precedes the pass.
+function Test-QlPriorUnknown([object[]]$Rows, [DateTime]$Cos, $Decl) {
+    $review = @($Rows | Where-Object { $null -ne $_ -and (Test-QlBefore $_.firstUtc $Cos) -and (Test-QlReviewRow $_ $Decl) })
+    (@($review | Where-Object { Test-QlBefore $_.unknownUtc $Cos }).Count -gt 0) -and (@($review | Where-Object { Test-QlApprovedBefore $_ $Cos }).Count -eq 0)
+}
+
+function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache, $Decl, [int]$Unparsed = 0) {
     # An empty window can arrive as $null, and @($null) is one element: drop nulls so it counts zero passes.
     $P = @($P | Where-Object { $null -ne $_ })
     $blocked = @($P | Where-Object blocked)
@@ -293,6 +358,7 @@ function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache, $Decl) {
         $e = Get-QlEvidence $Cache $b ([bool]($Decl -and $Decl.nativeReviews))
         if (-not $e) { $unknown++; continue }
         $rows = @($e.rows | Where-Object { $null -ne $_ })
+        if (Test-QlPriorUnknown $rows $b.utc $Decl) { $unknown++; continue }
         $before = @($rows | Where-Object { Test-QlBefore $_.firstUtc $b.utc })
         $review = @($before | Where-Object { Test-QlReviewRow $_ $Decl })
         if ($review.Count -eq 0) { $noKey++ }
@@ -309,7 +375,7 @@ function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache, $Decl) {
     }
     $rounds = @($P | Group-Object { "$($_.repo)#$($_.pr)" } | ForEach-Object { $_.Count })
     [ordered]@{
-        window = $Name; passes = $P.Count; blocked = $blocked.Count
+        window = $Name; passes = $P.Count; unparsed = $Unparsed; blocked = $blocked.Count
         blockedRate = $(if ($P.Count) { [math]::Round($blocked.Count / $P.Count, 3) } else { $null })
         prs = $firstPerPr.Count; firstRoundBlocked = @($firstPerPr | Where-Object blocked).Count
         firstRoundBlockedRate = $(if ($firstPerPr.Count) { [math]::Round(@($firstPerPr | Where-Object blocked).Count / $firstPerPr.Count, 3) } else { $null })
@@ -366,6 +432,8 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
     try { $raw = @(Get-QlPasses $Proj $from.ToString('yyyy-MM-ddTHH:mm:ssZ')) } catch { $errors += "bus ${Proj}: $($_.Exception.Message)" }
     # Cut to the window FIRST, then fold per head: a blocking pass outside the window must not hide a clean pass inside it.
     $raw = @($raw | Where-Object { $_.utc -le $now })
+    $unparsed = @($raw | Where-Object { -not $_.parsed })
+    $raw = @($raw | Where-Object { $_.parsed })
     $passes = @(Group-QlHeads @($raw | Where-Object { $_.utc -ge $script:SinceUtc }))
     $passes24 = @(Group-QlHeads @($raw | Where-Object { $_.utc -ge $d1Start }))
     $heads = @(Group-QlHeads $raw)
@@ -397,14 +465,14 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
                 $rows = @(Get-QlStatusRows $p.repo $p.head)
                 if ($needNative) { $rows += @(Get-QlNativeRows $p.repo $prsOf[$k] $p.head) }
                 $prsRead = @(if ($needNative) { $prsOf[$k] })   # an array even for one PR: a cached native entry must list them
-                $cache[$k] = [pscustomobject]@{ fetched = $now.ToString('o'); native = $needNative; prs = $prsRead; rows = $rows }
+                $cache[$k] = [pscustomobject]@{ fetched = $now.ToString('o'); native = $needNative; dismissals = $needNative; prs = $prsRead; rows = $rows }
             } catch { $errors += "statuses or reviews $($p.repo)@$($p.head.Substring(0,8)): $($_.Exception.Message)" }
         }
         ($cache | ConvertTo-Json -Depth 6) | Set-Content -LiteralPath $cacheFile -Encoding utf8
     }
 
-    $all = Get-QlWindow $passes 'since' $cache $decl
-    $d1 = Get-QlWindow $passes24 'last-24h' $cache $decl
+    $all = Get-QlWindow $passes 'since' $cache $decl @($unparsed | Where-Object { $_.utc -ge $script:SinceUtc }).Count
+    $d1 = Get-QlWindow $passes24 'last-24h' $cache $decl @($unparsed | Where-Object { $_.utc -ge $d1Start }).Count
 
     $adopt = [ordered]@{ prs = $null; withAdversaryLine = $null }
     $repos = @($heads | ForEach-Object repo)
@@ -441,7 +509,7 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
     foreach ($b in ($heads | Where-Object blocked | Sort-Object utc)) {
         $k = Get-QlKey $b
         $e = Get-QlEvidence $cache $b $needNative
-        if ($known.ContainsKey($k) -or -not $e) { continue }
+        if ($known.ContainsKey($k) -or -not $e -or (Test-QlPriorUnknown @($e.rows) $b.utc $decl)) { continue }
         $okRows = @($e.rows | Where-Object { $null -ne $_ -and (Test-QlApprovedBefore $_ $b.utc) })
         $prior = @($okRows | Where-Object { Test-QlStatusRow $_ } | ForEach-Object context)
         if ($decl) {
@@ -466,6 +534,8 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
     foreach ($w in @($all, $d1)) { $md += "| $($w.window) | $($w.passes) | $($w.blocked) ($(& $pct $w.blockedRate)) | $($w.firstRoundBlocked)/$($w.prs) | $(Format-QlFirst $w) | $($w.trueMiss) | $(Format-QlProxy $w) | $($w.roundsPerPr) (max $($w.roundsPerPrMax)) |" }
     $md += ''
     $md += "CoS read first and true misses count only declared review evidence ($($all.reviewSource)); 'unknown' when none is declared."
+    $md += ''
+    $md += "CoS files that name no pass (no '# owner/repo #n / head' heading and no cos-feedback.v1 front matter), not measured: $($all.unparsed) since, $($d1.unparsed) in 24 h."
     $md += ''
     $md += "Contexts that existed before CoS on blocked heads (review = declared review evidence):"
     foreach ($k in $all.contextsBeforeCos.Keys) { $v = $all.contextsBeforeCos[$k]; $md += "- status $k$(if ($v.review) { ' [review]' }) : success $($v.successBeforeCos), failure $($v.failureBeforeCos)" }
@@ -524,6 +594,8 @@ $fleetFirst = $(if ($nd) { Format-QlOf $dn ([pscustomobject]@{ blocked = $db; st
 $fleetMiss = $(if ($nd) { $dm } else { 'unknown' })
 $fl += "| **fleet** | $tp | $tb ($(if ($tp) { [math]::Round(100 * $tb / $tp) } else { 'n/a' })%) | | $nd of $np projects | $fleetFirst | $fleetMiss | $(Format-QlOf $sn ([pscustomobject]@{ blocked = $tb; statusUnknown = $tu })) | | | |"
 if ($skipped) { $fl += ''; $fl += "Not measured (bus folders starting with _ or .): $($skipped -join ', ')" }
+$unnamed = @($results | Where-Object { $_.all.unparsed } | ForEach-Object { "$($_.project) $($_.all.unparsed)" })
+if ($unnamed) { $fl += ''; $fl += "CoS files that name no pass (not measured): $($unnamed -join ', ')" }
 $listErrors = @($FleetErrors) + @(if (-not $results.Count) { $SharedErrors })
 if ($listErrors) { $fl += ''; $fl += 'Errors:'; $listErrors | ForEach-Object { $fl += "- $_" } }
 $fl | Set-Content -LiteralPath (Join-Path $OutDir 'fleet.md') -Encoding utf8
