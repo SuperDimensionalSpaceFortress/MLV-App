@@ -2264,6 +2264,80 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertFalse(self.claim_path.exists(), "no claim was written")
         self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is untouched")
 
+    # r9 (Sol r8 / Dot B7 / producer OPEN A1; card LEASE-BATCH-RUNDIR-OUTPUT-COLLISION-GUARD-1): the r7 guard named five of the runner's outputs and missed quiet-*.out.txt and
+    # gate.log, so a valid spec there passed preflight and was overwritten after the lease opened. One case per output name the runner writes under -RunDir, plus the two
+    # directories it owns (batch-jobs\, quiet\). A new output that is not in the runner's one list is a failing case here, not a quiet hole.
+    RUN_OUTPUT_PATHS = (
+        "quiet-01-fx-a-cpu-A-leg.out.txt", "quiet-caps.out.txt", "leg-01-fx-a-cpu-A-b01-a1.out.txt", "gate.log", "batch-01.json", "batches.jsonl", "batch.log",
+        "leg-plan.json", "batch-jobs/lease-batch-open-x.job.ps1", "quiet/venue-quiet-probe-x.json",
+    )
+
+    def _valid_leg_spec_text(self) -> str:
+        return json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-a", "backends": ["cpu"], "scaleFactor": 1})
+
+    def test_r9_a_leg_spec_at_any_runner_output_path_is_refused_before_the_claim(self) -> None:
+        for leaf in self.RUN_OUTPUT_PATHS:
+            with self.subTest(output=leaf):
+                for p in (self.events, self.leg_args, self.claim_path):
+                    p.unlink(missing_ok=True)
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                spec = self.run_dir / leaf
+                spec.parent.mkdir(parents=True, exist_ok=True)
+                spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = spec.read_text(encoding="utf-8")
+                r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertEqual(self.leg_calls(), [])
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+                self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is untouched")
+
+    def test_r9_a_plan_file_at_a_runner_output_path_is_refused_before_the_claim(self) -> None:
+        # the plan is an input too: leg-plan.json is written over it once the claim is held, and batch.log / gate.log are appended to
+        for leaf in ("leg-plan.json", "batch.log", "gate.log", "quiet-01-fx-a-cpu-A-leg.out.txt", "batch-jobs/plan.json"):
+            with self.subTest(output=leaf):
+                for p in (self.events, self.leg_args, self.claim_path):
+                    p.unlink(missing_ok=True)
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                plan = self.run_dir / leaf
+                plan.parent.mkdir(parents=True, exist_ok=True)
+                plan.write_text(json.dumps({"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": [self.item(self.specs[0], "A", self.commit_a)]}), encoding="utf-8")
+                before = plan.read_text(encoding="utf-8")
+                r = self.run_plan(plan)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+                self.assertEqual(plan.read_text(encoding="utf-8"), before, "the accepted input is untouched")
+
+    def test_r9_a_scalar_leg_spec_at_a_runner_output_path_is_refused_before_the_claim(self) -> None:
+        for leaf in ("gate.log", "quiet-01-fx-a-cpu-A-leg.out.txt", "leg-plan.json", "batch-03.json"):
+            with self.subTest(output=leaf):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                spec = self.run_dir / leaf
+                spec.parent.mkdir(parents=True, exist_ok=True)
+                spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = spec.read_text(encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+                self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is untouched")
+
+    def test_r9_a_spec_in_the_run_dir_under_another_name_is_not_refused(self) -> None:
+        # the guard names the runner's outputs, not the directory: a spec kept beside them under any other name still runs
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        self.run_dir.mkdir(parents=True)
+        spec = self.run_dir / "gate.log.spec.json"
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self.assertNotIn("LEG_SPEC_IS_RUN_OUTPUT", r.stderr)
+        self.assertNotEqual(r.returncode, 2, r.stdout + r.stderr)
+
     def test_r5_adv_a1_a_throw_after_a_leg_ran_does_not_record_that_leg_as_not_run(self) -> None:
         # adversary r5 A1: the new batch catch left the leg whose child had completed (its output file could not be written) in pending, and the summary then said
         # NOT_RUN for a leg that ran. The leg is recorded LEG_FAILED / reason BATCH_ERROR (its result is unknown); only the legs never started are NOT_RUN.

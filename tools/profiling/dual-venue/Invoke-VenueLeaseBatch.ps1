@@ -223,10 +223,43 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
     # LEASE-BATCH-MULTI-BUILD-1 (item 9a): a -LegPlan item that cannot run refuses the WHOLE plan before any claim, open or lease. Nothing was submitted.
     $line = "LEG_PLAN_REFUSED reason=$Reason$(if ($Item -gt 0) { " item=$Item" }) $Detail"
     # The log line is best effort (sol r3 A5): a batch.log another process holds must not turn the typed refusal into an unhandled exit 1 with no BATCH_USAGE line.
-    try { Add-Content -LiteralPath $batchLog -Value "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $line" } catch { }
+    # r9: not for a refusal of an input that IS a runner output (it may be batch.log itself): the refusal must leave that file as it found it; stderr carries the line.
+    if ($Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT')) {
+        try { Add-Content -LiteralPath $batchLog -Value "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $line" } catch { }
+    }
     [Console]::Error.WriteLine("BATCH_USAGE $line")
     try { Complete-VenueProcess -ExitCode 2 } catch { }
     exit 2
+}
+
+# r9 (Sol r8 / Dot B7 / card LEASE-BATCH-RUNDIR-OUTPUT-COLLISION-GUARD-1): every file this runner writes under -RunDir, in ONE place. An input (a plan, a leg spec) that resolves to one
+# of them would be overwritten or appended to after the lease opened, so preflight refuses it before any claim. A new output is added HERE and nowhere else: the files named
+# directly in RunDir (leaf patterns, matched whole and case-insensitively) and the subdirectories the runner owns (anything under them).
+$script:RunDirOutputLeafPatterns = @(
+    '^quiet-.+\.out\.txt\z'     # Invoke-QuietProbe: each probe's output
+    '^leg-.+\.out\.txt\z'       # the leg's output (leg-<name>-b<nn>-a<n>.out.txt)
+    '^gate\.log\z'              # Wait-VenueQuiet -GateLog
+    '^batch-\d+\.json\z'        # the per-batch receipt
+    '^batches\.jsonl\z'         # one line per batch
+    '^batch\.log\z'             # one line per event
+    '^leg-plan\.json\z'         # the validated -LegPlan run record
+)
+$script:RunDirOutputDirs = @('batch-jobs', 'quiet')   # the agent job files; Wait-VenueQuiet -WorkDir
+
+function Get-RunDirOutputRefusal([string]$Path) {
+    # '' when $Path is not a file this run writes; else the sentence for the refusal. Resolved paths on both sides, so a spelling of -RunDir (\.\, ..\, a trailing \) does not slip past.
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetFullPath($RunDir).TrimEnd('\')
+    $parent = [IO.Path]::GetDirectoryName($full).TrimEnd('\')
+    if ($parent -ieq $root) {
+        $leaf = [IO.Path]::GetFileName($full)
+        foreach ($p in $script:RunDirOutputLeafPatterns) { if ($leaf -imatch $p) { return "'$full' is a file this run writes into -RunDir ($leaf)" } }
+        return ''
+    }
+    foreach ($d in $script:RunDirOutputDirs) {
+        if (($parent + '\').StartsWith($root + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase)) { return "'$full' is inside $d\, a directory this run writes into under -RunDir" }
+    }
+    ''
 }
 
 function Resolve-LegSpecPath([string]$Ref, [string]$BesideDir) {
@@ -276,6 +309,8 @@ if ($legPlanMode) {
         Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force   # the leg process's own spec predicates, run in preflight (Get-LegSpecRefusal)
         $planPath = $(if (Test-Path -LiteralPath $LegPlan -PathType Leaf) { (Resolve-Path -LiteralPath $LegPlan).Path } else { $null })
         if (-not $planPath) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "no plan file at '$LegPlan'" }
+        $outputRefusal = Get-RunDirOutputRefusal $planPath   # r9: the plan is an input too (leg-plan.json is written over it once the claim is held)
+        if ($outputRefusal) { Stop-PlanRefused 'LEG_PLAN_IS_RUN_OUTPUT' 0 "the plan file $outputRefusal" }
         $doc = try { [IO.File]::ReadAllText($planPath) | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
         # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
         $rawItems = $null
@@ -299,8 +334,9 @@ if ($legPlanMode) {
             if ($arm -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}\z') { Stop-PlanRefused 'BAD_ARM' $n "arm '$arm' is not a label of 1-32 of [A-Za-z0-9._-]" }
             $path = $(if ($ref) { Resolve-LegSpecPath $ref $planDir } else { $null })
             if (-not $path) { Stop-PlanRefused 'LEG_SPEC_MISSING' $n "no leg spec at '$ref'" }
-            # adversary r7 pass 2 A1: a spec that IS one of the files this run writes into -RunDir (leg-plan.json, batch.log, a batch receipt, a leg output) would be overwritten after the lease opened.
-            if ((([IO.Path]::GetFullPath((Split-Path -Parent $path))).TrimEnd('\') -ieq ([IO.Path]::GetFullPath($RunDir)).TrimEnd('\')) -and ((Split-Path -Leaf $path) -match '^(leg-plan\.json|batch\.log|batches\.jsonl|batch-\d+\.json|leg-.*\.out\.txt)\z')) { Stop-PlanRefused 'LEG_SPEC_IS_RUN_OUTPUT' $n "the leg spec '$path' is a file this run writes into -RunDir" }
+            # adversary r7 pass 2 A1, r9: a spec that IS one of the files this run writes under -RunDir (the one list above) would be overwritten after the lease opened.
+            $outputRefusal = Get-RunDirOutputRefusal $path
+            if ($outputRefusal) { Stop-PlanRefused 'LEG_SPEC_IS_RUN_OUTPUT' $n "the leg spec $outputRefusal" }
             $specRefusal = Get-LegSpecRefusal $path $be
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
@@ -337,6 +373,8 @@ if ($legPlanMode) {
     foreach ($ref in $LegSpec) {
         $path = Resolve-LegSpecPath $ref ''
         if (-not $path) { Stop-Usage "no leg spec at '$ref'" }
+        $outputRefusal = Get-RunDirOutputRefusal $path   # r9: the same guard as a -LegPlan item's spec
+        if ($outputRefusal) { Stop-Usage "LEG_SPEC_IS_RUN_OUTPUT the leg spec $outputRefusal" }
         $legId = Get-LegSpecId $path
         for ($r = 1; $r -le $Repeats; $r++) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })
