@@ -4192,7 +4192,7 @@ function Edit-DualVenueTemplate([string]$Text, [string]$Old, [string]$New) {
 }
 
 # --- BACHELOR-CORE-PARTITION-AB-1: core-partition helpers ----------------------------------------
-# The functions below are PURE except Get-CorePartitionTopology and the two feed readers. The emitted
+# The functions below are PURE except Get-CorePartitionTopology, Get-CorePartitionFeedHandleInfo and the two feed readers. The emitted
 # job and its helper carry their source verbatim (Get-CorePartitionFunctionSource), so a test lifts
 # the same definitions from this file by AST and feeds them fixtures.
 
@@ -4297,8 +4297,11 @@ function Test-CorePartitionMaskClass($Map, [int64]$BenchMask, [int64[]]$LowMasks
 function Get-CorePartitionEffectiveMHz($FrequencyMHz, $PerformancePercent) {
     if ($null -eq $FrequencyMHz -or $null -eq $PerformancePercent) { return $null }
     $f = [double]$FrequencyMHz; $pp = [double]$PerformancePercent
-    if ($f -le 0 -or $pp -lt 0 -or [double]::IsNaN($f) -or [double]::IsNaN($pp)) { return $null }
-    $f * $pp / 100.0
+    if ($f -le 0 -or $pp -lt 0 -or [double]::IsNaN($f) -or [double]::IsNaN($pp) -or [double]::IsInfinity($f) -or [double]::IsInfinity($pp)) { return $null }
+    # sol r4 CP-03 (class): finite counter values can multiply past the double range; that is no clock reading.
+    $v = $f * $pp / 100.0
+    if ([double]::IsInfinity($v)) { return $null }
+    $v
 }
 
 # PURE. HWiNFO adapter feed rows (the agent's ConvertFrom-HeavySlotFeedRows column rule: a data row starts with a digit and has 7+
@@ -4339,7 +4342,9 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec) {
     elseif (-not $Start.exists -or -not $End.exists) { $code = 'feed-missing' }
     elseif ([int64]$End.length -lt [int64]$Start.length) { $code = 'feed-rotated' }
     # Adversary r2 A3/A4: a replaced file (new creation time, or different bytes just before the start offset) or a window larger than the read cap is no evidence.
-    elseif ($Start.created -and $End.created -and [int64]$Start.created -ne [int64]$End.created) { $code = 'feed-replaced' }
+    # sol r4 CP-04: the creation time and file id are each mark's opened handle's; one mark without them, or a mismatch, is a different file.
+    elseif (($Start.created -or $End.created) -and [int64]$Start.created -ne [int64]$End.created) { $code = 'feed-replaced' }
+    elseif (($Start.fileId -or $End.fileId) -and [string]$Start.fileId -ne [string]$End.fileId) { $code = 'feed-replaced' }
     elseif ($End.replaced) { $code = 'feed-replaced' }
     elseif ($End.truncated) { $code = 'feed-window-truncated' }
     elseif ($null -eq $End.ageSec -or [double]$End.ageSec -gt $StaleSec) { $code = 'feed-stale' }
@@ -4350,12 +4355,18 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec) {
         if ($null -eq $parsed.rows) { $code = $parsed.why }
         else {
             $rows = @($parsed.rows)
-            $s.rows = $rows.Count
-            $s.pkgWattsMean = [math]::Round(($rows | Measure-Object -Property w -Average).Average, 2)
-            $s.pkgWattsMax = [double]($rows | Measure-Object -Property w -Maximum).Maximum
-            $s.pkgTempCMean = [math]::Round(($rows | Measure-Object -Property c -Average).Average, 2)
-            $s.pkgTempCMax = [double]($rows | Measure-Object -Property c -Maximum).Maximum
-            $s.pkgThrottledRows = @($rows | Where-Object { $_.thr }).Count
+            $wm = [double]($rows | Measure-Object -Property w -Average).Average
+            $tm = [double]($rows | Measure-Object -Property c -Average).Average
+            # sol r4 CP-03: every row is finite, but two 1e308 rows still sum to Infinity; a non-finite mean is no measured value.
+            if ([double]::IsNaN($wm) -or [double]::IsInfinity($wm) -or [double]::IsNaN($tm) -or [double]::IsInfinity($tm)) { $code = 'feed-aggregate-non-finite' }
+            else {
+                $s.rows = $rows.Count
+                $s.pkgWattsMean = [math]::Round($wm, 2)
+                $s.pkgWattsMax = [double]($rows | Measure-Object -Property w -Maximum).Maximum
+                $s.pkgTempCMean = [math]::Round($tm, 2)
+                $s.pkgTempCMax = [double]($rows | Measure-Object -Property c -Maximum).Maximum
+                $s.pkgThrottledRows = @($rows | Where-Object { $_.thr }).Count
+            }
         }
     }
     if ($null -ne $code) { foreach ($f in $windowFields) { $s.reasons[$f] = $code } }
@@ -4393,11 +4404,17 @@ function Get-CorePartitionCounterSummary($Samples, [int64]$PMask, [int64]$EMask)
             }
         }
     }
+    # sol r4 CP-03 (class): finite readings that sum past the double range give no mean (null, named in nonFinite).
+    $nonFinite = [Collections.Generic.List[string]]::new()
+    $pMean = $null; $eMean = $null
+    if ($pm.Count -gt 0) { $v = [double]($pm | Measure-Object -Average).Average; if ([double]::IsInfinity($v) -or [double]::IsNaN($v)) { $nonFinite.Add('pcoreMHzMean') } else { $pMean = [math]::Round($v, 1) } }
+    if ($em.Count -gt 0) { $v = [double]($em | Measure-Object -Average).Average; if ([double]::IsInfinity($v) -or [double]::IsNaN($v)) { $nonFinite.Add('ecoreMHzMean') } else { $eMean = [math]::Round($v, 1) } }
     [pscustomobject]@{
         appSamples = $n
-        pcoreMHzMean = $(if ($pm.Count -gt 0) { [math]::Round(($pm | Measure-Object -Average).Average, 1) } else { $null })
-        ecoreMHzMean = $(if ($em.Count -gt 0) { [math]::Round(($em | Measure-Object -Average).Average, 1) } else { $null })
+        pcoreMHzMean = $pMean
+        ecoreMHzMean = $eMean
         pcoreParkedSampleFraction = $(if ($pn -gt 0) { [math]::Round($pk / [double]$pn, 4) } else { $null })
+        nonFinite = $nonFinite.ToArray()
     }
 }
 
@@ -4430,36 +4447,62 @@ function Get-CorePartitionReadyFeed($Feed, [bool]$NotReady) {
     $s
 }
 
+# PURE. sol r4 CP-02: the helper's app evidence belongs to the measured app only, the process the smoke runner launched ($MeasuredPid, its
+# result.json process.id). That pid must name exactly one recorded same-path instance (pid + start time), the helper must have bound it, and no
+# other same-path instance may have been alive at any time while it was. @{ why } is $null when the evidence is the measured app's, else a typed reason.
+function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid) {
+    if ($MeasuredPid -le 0) { return @{ why = 'measured-pid-unknown' } }
+    $all = @($Helper.instances | Where-Object { $null -ne $_ })
+    $m = @($all | Where-Object { [int64]$_.pid -eq $MeasuredPid })
+    if ($m.Count -eq 0) { return @{ why = 'measured-app-not-observed' } }
+    if ($m.Count -gt 1) { return @{ why = 'measured-pid-ambiguous' } }
+    $a = $m[0]
+    foreach ($o in $all) {
+        if ([object]::ReferenceEquals($o, $a)) { continue }
+        if ([int64]$o.firstSeenUtcTicks -le [int64]$a.lastSeenUtcTicks -and [int64]$a.firstSeenUtcTicks -le [int64]$o.lastSeenUtcTicks) { return @{ why = 'same-path-instance-overlap' } }
+    }
+    if ($null -eq $Helper.app -or [int64]$Helper.app.pid -ne $MeasuredPid) { return @{ why = 'helper-app-not-measured-pid' } }
+    @{ why = $null }
+}
+
 # PURE. The summary scalars from the helper's record (or $null when it wrote none), the feed summary and the requested masks.
 # $HelperNotReady (sol r3 CP-01) is the not-ready guard; it is a flag, so no change to the reason text can re-open the criteria.
-function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$LoadMask, [int]$LoadThreads, $Workers, [string]$HelperWhy, [bool]$HelperNotReady) {
+# $MeasuredPid (sol r4 CP-02): the app evidence is used only when Test-CorePartitionMeasuredApp binds it to that pid.
+# $PublishWhy (sol r4 CP-05): set when core-partition.json was not published; every acceptance flag is then false with that reason.
+function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$LoadMask, [int]$LoadThreads, $Workers, [string]$HelperWhy, [bool]$HelperNotReady, [int64]$MeasuredPid, [string]$PublishWhy) {
     $why = [ordered]@{}
     $h = $Helper
+    $appWhy = if ($null -ne $h) { (Test-CorePartitionMeasuredApp $h $MeasuredPid).why } else { $null }
     $topoOk = $false; $pMask = [int64]0; $eMask = [int64]0
     if ($null -eq $h) { $why['corePartitionTopologyOk'] = $(if ($HelperWhy) { $HelperWhy } else { 'helper-record-missing' }) }
     elseif ($null -eq $h.topologyCheck) { $why['corePartitionTopologyOk'] = 'topology-check-missing' }
     else { $topoOk = [bool]$h.topologyCheck.ok; if (-not $topoOk) { $why['corePartitionTopologyOk'] = [string]$h.topologyCheck.reason }; if ($null -ne $h.topologyCheck.pMask) { $pMask = [int64]$h.topologyCheck.pMask }; if ($null -ne $h.topologyCheck.eMask) { $eMask = [int64]$h.topologyCheck.eMask } }
-    $app = if ($null -ne $h) { $h.app } else { $null }
+    $app = if ($null -ne $h -and -not $appWhy) { $h.app } else { $null }
     $first = $null; $last = $null
     if ($null -ne $app -and $null -ne $app.affinityFirst) { $first = [int64]$app.affinityFirst }
     if ($null -ne $app -and $null -ne $app.affinityLast) { $last = [int64]$app.affinityLast }
     $observed = $null
-    if ($null -eq $first) { $why['appAffinityObserved'] = $(if ($null -eq $app) { 'app-not-seen' } else { 'app-affinity-unread' }) }
+    if ($null -eq $first) { $why['appAffinityObserved'] = $(if ($appWhy) { $appWhy } elseif ($null -eq $app) { 'app-not-seen' } else { 'app-affinity-unread' }) }
     elseif ($null -eq $last -or $last -eq $first) { $observed = Format-CorePartitionMask $first }
     else { $observed = (Format-CorePartitionMask $first) + '/' + (Format-CorePartitionMask $last) }
     $notReady = $HelperNotReady
     if ($notReady) { $topoOk = $false; $why['corePartitionTopologyOk'] = $(if ($HelperWhy) { $HelperWhy } else { 'helper-not-ready-at-launch' }) }
     $benchApplied = (-not $notReady -and $BenchMask -ne 0 -and $null -ne $first -and $null -ne $last -and $first -eq $BenchMask -and $last -eq $BenchMask)
-    $load = if ($null -ne $h) { $h.load } else { $null }
+    # The load totals and the app-sample tags are the bound instance's (the helper's), so they are evidence only when the app evidence is.
+    $load = if ($null -ne $h -and -not $appWhy) { $h.load } else { $null }
     $loadSec = if ($null -ne $load -and $null -ne $load.seconds) { [double]$load.seconds } else { 0.0 }
     $loadBytes = if ($null -ne $load -and $null -ne $load.bytes) { [double]$load.bytes } else { 0.0 }
     $helperAff = if ($null -ne $h -and $null -ne $h.helperAffinityObserved) { [int64]$h.helperAffinityObserved } else { $null }
-    $loadApplied = (-not $notReady -and $LoadMask -ne 0 -and $LoadThreads -gt 0 -and $helperAff -eq $LoadMask -and $loadSec -ge 1 -and $loadBytes -gt 0)
+    $loadApplied = (-not $notReady -and -not $appWhy -and $LoadMask -ne 0 -and $LoadThreads -gt 0 -and $helperAff -eq $LoadMask -and $loadSec -ge 1 -and $loadBytes -gt 0)
     $gbps = $null
-    if ($LoadMask -ne 0) { if ($loadSec -gt 0) { $gbps = [math]::Round($loadBytes / $loadSec / 1e9, 3) } else { $why['partitionLoadGBps'] = 'load-never-ran' } }
-    $cs = if ($null -ne $h -and $null -ne $h.samples -and $topoOk) { Get-CorePartitionCounterSummary $h.samples $pMask $eMask } else { $null }
-    if ($null -eq $cs) { foreach ($f in @('pcoreMHzMean', 'ecoreMHzMean', 'pcoreParkedSampleFraction')) { $why[$f] = $(if (-not $topoOk) { 'topology-not-ok' } else { 'samples-missing' }) } }
-    else { foreach ($f in @('pcoreMHzMean', 'ecoreMHzMean', 'pcoreParkedSampleFraction')) { if ($null -eq $cs.$f) { $why[$f] = 'no-app-samples' } } }
+    if ($LoadMask -ne 0) { if ($appWhy) { $why['partitionLoadGBps'] = $appWhy } elseif ($loadSec -gt 0) { $gbps = [math]::Round($loadBytes / $loadSec / 1e9, 3) } else { $why['partitionLoadGBps'] = 'load-never-ran' } }
+    $cs = if ($null -ne $h -and $null -ne $h.samples -and $topoOk -and -not $appWhy) { Get-CorePartitionCounterSummary $h.samples $pMask $eMask } else { $null }
+    if ($null -eq $cs) { foreach ($f in @('pcoreMHzMean', 'ecoreMHzMean', 'pcoreParkedSampleFraction')) { $why[$f] = $(if (-not $topoOk) { 'topology-not-ok' } elseif ($appWhy) { $appWhy } else { 'samples-missing' }) } }
+    else { foreach ($f in @('pcoreMHzMean', 'ecoreMHzMean', 'pcoreParkedSampleFraction')) { if ($null -eq $cs.$f) { $why[$f] = $(if (@($cs.nonFinite) -contains $f) { 'counter-aggregate-non-finite' } else { 'no-app-samples' }) } } }
+    if ($PublishWhy) {
+        $topoOk = $false; $benchApplied = $false; $loadApplied = $false
+        foreach ($f in @('corePartitionTopologyOk', 'benchAffinityApplied', 'partitionLoadApplied')) { $why[$f] = Join-CorePartitionWhy ([string]$why[$f]) $PublishWhy }
+    }
     $pkg = Get-CorePartitionReadyFeed $Feed $notReady
     foreach ($k in $pkg.reasons.Keys) { $why[$k] = $pkg.reasons[$k] }
     if ($null -eq $Workers.value) { $why['playbackWorkerThreads'] = $Workers.why }
@@ -4487,13 +4530,29 @@ function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$Loa
     }
 }
 
+# I/O: an OPENED feed handle's creation time, last-write time and file id (volume serial + file index), from GetFileInformationByHandle.
+# sol r4 CP-04: the feed readers take no metadata by path, so a file swapped in between a path lookup and the open can never lend the
+# old file's identity to the new file's rows; the file described is always the file read.
+function Get-CorePartitionFeedHandleInfo([IO.FileStream]$Stream) {
+    if (-not ('MlvCorePartition.FileId' -as [type])) {
+        Add-Type -Namespace MlvCorePartition -Name FileId -MemberDefinition '[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle h, [System.Runtime.InteropServices.Out] byte[] info);'
+    }
+    # BY_HANDLE_FILE_INFORMATION, 52 bytes: creation FILETIME at 4, last write at 20, volume serial at 28, file index high/low at 44/48.
+    $b = New-Object byte[] 52
+    if (-not [MlvCorePartition.FileId]::GetFileInformationByHandle($Stream.SafeFileHandle, $b)) { throw "GetFileInformationByHandle failed (win32 $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
+    @{
+        created = [DateTime]::FromFileTimeUtc([BitConverter]::ToInt64($b, 4)).Ticks
+        lastWriteUtc = [DateTime]::FromFileTimeUtc([BitConverter]::ToInt64($b, 20))
+        fileId = '{0:X8}-{1:X8}{2:X8}' -f [BitConverter]::ToUInt32($b, 28), [BitConverter]::ToUInt32($b, 44), [BitConverter]::ToUInt32($b, 48)
+    }
+}
+
 # I/O, bounded: the feed's length, age and up to 4 KiB of text before its end (the start mark), read-only and FileShare.ReadWrite.
 function Read-CorePartitionFeedMark([string]$Path) {
     try {
-        $fi = [IO.FileInfo]::new($Path)
-        if (-not $fi.Exists) { return @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false } }
         $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
         try {
+            $id = Get-CorePartitionFeedHandleInfo $fs
             $len = $fs.Length
             $from = [Math]::Max([int64]0, $len - 4096)
             [void]$fs.Seek($from, [IO.SeekOrigin]::Begin)
@@ -4502,18 +4561,18 @@ function Read-CorePartitionFeedMark([string]$Path) {
             $text = [Text.Encoding]::UTF8.GetString($buf, 0, $got)
             if ($from -gt 0) { $nl = $text.IndexOf("`n"); $text = if ($nl -ge 0) { $text.Substring($nl + 1) } else { '' } }
         } finally { $fs.Dispose() }
-        @{ exists = $true; length = $len; ageSec = ([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalSeconds; before = $text; window = ''; windowStartsMidRow = $false; created = $fi.CreationTimeUtc.Ticks }
-    } catch { @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false; error = [string]$_.Exception.Message } }
+        @{ exists = $true; length = $len; ageSec = ([DateTime]::UtcNow - $id.lastWriteUtc).TotalSeconds; before = $text; window = ''; windowStartsMidRow = $false; created = $id.created; fileId = $id.fileId }
+    } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false } }
+    catch { @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false; error = [string]$_.Exception.Message } }
 }
 
 # I/O, bounded (2 MiB): the text appended since the start mark's offset, plus whether that offset fell inside a row. $ExpectedBefore is the start mark's
 # text: when the bytes just before the offset differ from its tail the file was replaced (replaced); a window over the cap is flagged (truncated).
 function Read-CorePartitionFeedSince([string]$Path, [int64]$Offset, [string]$ExpectedBefore = '') {
     try {
-        $fi = [IO.FileInfo]::new($Path)
-        if (-not $fi.Exists) { return @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false } }
         $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
         try {
+            $id = Get-CorePartitionFeedHandleInfo $fs
             $len = $fs.Length
             $text = ''; $mid = $false; $replaced = $false; $truncated = $false
             if ($len -ge $Offset) {
@@ -4535,8 +4594,9 @@ function Read-CorePartitionFeedSince([string]$Path, [int64]$Offset, [string]$Exp
                 else { $text = [Text.Encoding]::UTF8.GetString($buf, 0, $got) }
             }
         } finally { $fs.Dispose() }
-        @{ exists = $true; length = $len; ageSec = ([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalSeconds; before = ''; window = $text; windowStartsMidRow = $mid; replaced = $replaced; truncated = $truncated; created = $fi.CreationTimeUtc.Ticks }
-    } catch { @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false; error = [string]$_.Exception.Message } }
+        @{ exists = $true; length = $len; ageSec = ([DateTime]::UtcNow - $id.lastWriteUtc).TotalSeconds; before = ''; window = $text; windowStartsMidRow = $mid; replaced = $replaced; truncated = $truncated; created = $id.created; fileId = $id.fileId }
+    } catch [IO.FileNotFoundException], [IO.DirectoryNotFoundException] { @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false } }
+    catch { @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false; error = [string]$_.Exception.Message } }
 }
 
 # The source text of generator functions, for splicing into the emitted job / helper (one definition, here).
@@ -4598,36 +4658,39 @@ public static class MlvCorePartitionLoad {
     $prev = $cat.ReadCategory()
     Write-CorePartitionNewFile $ready 'ready'
     $appName = [IO.Path]::GetFileNameWithoutExtension($exe)
-    $cur = $null; $curRec = $null
+    # sol r4 CP-02: EVERY same-path process started after the launch instant is tracked (key pid,start) for as long as it lives, so a second
+    # instance alive beside the measured app is on the record; the load runs for the one that owns it ($own), the first found while none does.
+    $live = @{}; $seen = @{}; $own = $null
     $nextSample = [DateTime]::UtcNow.AddSeconds(1)
     $t0 = [DateTime]::UtcNow
     while ($true) {
         if (Test-Path -LiteralPath $stop) { $rec.endedBy = 'stop-file'; break }
         if ([DateTime]::UtcNow.Ticks -ge $deadline) { $rec.endedBy = 'deadline'; break }
-        if ($null -ne $cur) {
-            $gone = $true; try { $cur.Refresh(); $gone = $cur.HasExited } catch { $gone = $true }
+        foreach ($k in @($live.Keys)) {
+            $q = $live[$k]
+            $gone = $true; try { $q.p.Refresh(); $gone = $q.p.HasExited } catch { }
             if (-not $gone) {
-                try { $curRec.affinityLast = [int64]$cur.ProcessorAffinity; $curRec.priorityLast = [string]$cur.PriorityClass } catch { }
-                $curRec.lastSeenUtcTicks = [DateTime]::UtcNow.Ticks
+                try { $q.r.affinityLast = [int64]$q.p.ProcessorAffinity; $q.r.priorityLast = [string]$q.p.PriorityClass } catch { }
+                $q.r.lastSeenUtcTicks = [DateTime]::UtcNow.Ticks
             } else {
-                if ($loadOn) { [MlvCorePartitionLoad]::End(); $curRec.loadSec += ([DateTime]::UtcNow.Ticks - $loadStartTicks) / 1e7; $curRec.loadBytes += [MlvCorePartitionLoad]::Bytes - $loadStartBytes; $loadOn = $false }
-                $cur = $null; $curRec = $null
+                if ($k -eq $own) { if ($loadOn) { [MlvCorePartitionLoad]::End(); $q.r.loadSec += ([DateTime]::UtcNow.Ticks - $loadStartTicks) / 1e7; $q.r.loadBytes += [MlvCorePartitionLoad]::Bytes - $loadStartBytes; $loadOn = $false }; $own = $null }
+                $live.Remove($k)
             }
         }
         if ($null -eq $launchUtc -and $launchFile -and (Test-Path -LiteralPath $launchFile)) {
             try { $launchUtc = [DateTime]::new([int64]([IO.File]::ReadAllText($launchFile).Trim()), [DateTimeKind]::Utc) } catch { }
         }
-        if ($null -eq $cur -and $null -ne $launchUtc) {
-            foreach ($p in @(Get-Process -Name $appName -ErrorAction SilentlyContinue)) {
+        if ($null -ne $launchUtc) {
+            foreach ($p in @(Get-Process -Name $appName -ea 0)) {
                 $pp = $null; try { $pp = [string]$p.Path } catch { }
                 $pst = $null; try { $pst = $p.StartTime.ToUniversalTime() } catch { }
-                if ($pp -and $pp -ieq $exe -and $pst -and $pst -ge $launchUtc) {
-                    $cur = $p
-                    $curRec = [ordered]@{ pid = $p.Id; firstSeenUtcTicks = [DateTime]::UtcNow.Ticks; lastSeenUtcTicks = [DateTime]::UtcNow.Ticks; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0 }
-                    try { $curRec.affinityFirst = [int64]$p.ProcessorAffinity; $curRec.affinityLast = $curRec.affinityFirst; $curRec.priorityFirst = [string]$p.PriorityClass; $curRec.priorityLast = $curRec.priorityFirst } catch { $errs.Add("app-read: $($_.Exception.Message)") }
-                    $instances.Add($curRec)
-                    if ($threads -gt 0) { $loadStartBytes = [MlvCorePartitionLoad]::Bytes; [MlvCorePartitionLoad]::Begin($threads, 32); $loadOn = $true; $loadStartTicks = [DateTime]::UtcNow.Ticks; $rec.load.sessions++ }
-                    break
+                $k = "$($p.Id),$($pst.Ticks)"
+                if ($pp -and $pp -ieq $exe -and $pst -and $pst -ge $launchUtc -and -not $seen.ContainsKey($k)) {
+                    $seen[$k] = 1
+                    $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = [DateTime]::UtcNow.Ticks; lastSeenUtcTicks = [DateTime]::UtcNow.Ticks; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0 }
+                    try { $r.affinityFirst = [int64]$p.ProcessorAffinity; $r.affinityLast = $r.affinityFirst; $r.priorityFirst = [string]$p.PriorityClass; $r.priorityLast = $r.priorityFirst } catch { $errs.Add("app-read: $($_.Exception.Message)") }
+                    $instances.Add($r); $live[$k] = @{ p = $p; r = $r }
+                    if ($null -eq $own) { $own = $k; if ($threads -gt 0) { $loadStartBytes = [MlvCorePartitionLoad]::Bytes; [MlvCorePartitionLoad]::Begin($threads, 32); $loadOn = $true; $loadStartTicks = [DateTime]::UtcNow.Ticks; $rec.load.sessions++ } }
                 }
             }
         }
@@ -4644,7 +4707,7 @@ public static class MlvCorePartitionLoad {
                     }
                     $vals[$cn] = $arr
                 }
-                $samples.Add([ordered]@{ tMs = [int](([DateTime]::UtcNow - $t0).TotalMilliseconds); app = ($null -ne $cur); appPid = $(if ($null -ne $curRec) { $curRec.pid } else { $null }); inst = $names; time = $vals['% Processor Time']; freq = $vals['Processor Frequency']; perf = $vals['% Processor Performance']; park = $vals['Parking Status'] })
+                $samples.Add([ordered]@{ tMs = [int](([DateTime]::UtcNow - $t0).TotalMilliseconds); app = $false; appPid = $(if ($null -ne $own) { $live[$own].r.pid }); inst = $names; time = $vals['% Processor Time']; freq = $vals['Processor Frequency']; perf = $vals['% Processor Performance']; park = $vals['Parking Status'] })
                 $prev = $now
             } catch { if ($errs.Count -lt 20) { $errs.Add("sample: $($_.Exception.Message)") } }
         }
@@ -4652,15 +4715,17 @@ public static class MlvCorePartitionLoad {
     }
 } catch { $errs.Add("helper: $($_.Exception.Message)") }
 finally {
-    try { if ($loadOn) { [MlvCorePartitionLoad]::End(); $curRec.loadSec += ([DateTime]::UtcNow.Ticks - $loadStartTicks) / 1e7; $curRec.loadBytes += [MlvCorePartitionLoad]::Bytes - $loadStartBytes } } catch { $errs.Add("load-end: $($_.Exception.Message)") }
+    try { if ($loadOn) { [MlvCorePartitionLoad]::End(); $o = $live[$own].r; $o.loadSec += ([DateTime]::UtcNow.Ticks - $loadStartTicks) / 1e7; $o.loadBytes += [MlvCorePartitionLoad]::Bytes - $loadStartBytes } } catch { $errs.Add("load-end: $($_.Exception.Message)") }
     try { $self = [Diagnostics.Process]::GetCurrentProcess(); $self.Refresh(); $rec.helperAffinityObserved = [int64]$self.ProcessorAffinity; $rec.helperPriorityObserved = [string]$self.PriorityClass } catch { }
     $rec.instances = $instances.ToArray()
-    $longest = $null; foreach ($r in $instances) { if ($null -eq $longest -or ($r.lastSeenUtcTicks - $r.firstSeenUtcTicks) -gt ($longest.lastSeenUtcTicks - $longest.firstSeenUtcTicks)) { $longest = $r } }
-    $rec.app = $longest
-    # sol r4 A2: a shorter same-path instance after the launch (the smoke runner's --help probe) is not the measured app: only the measured
-    # instance's samples count as app samples, and the load totals are its own.
-    foreach ($smp in $samples) { $smp.app = ($null -ne $longest -and $smp.appPid -eq $longest.pid) }
-    if ($null -ne $longest) { $rec.load.seconds = $longest.loadSec; $rec.load.bytes = $longest.loadBytes }
+    # sol r4 CP-02 (was the longest instance): the app is the instance whose pid the job hands over after the smoke run (the runner's launched
+    # process); none, or two with that pid, binds nothing. Only its samples are app samples and the load totals are its own (sol r4 A2).
+    $mp = [int64]0; try { $mp = [int64]([IO.File]::ReadAllText([string]$env:MLV_CP_MEASURED).Trim()) } catch { }
+    $m = @($instances | Where-Object { $_.pid -eq $mp })
+    $app = $(if ($m.Count -eq 1) { $m[0] })
+    $rec.measuredPid = $mp; $rec.app = $app
+    foreach ($smp in $samples) { $smp.app = ($null -ne $app -and $smp.appPid -eq $app.pid) }
+    if ($null -ne $app) { $rec.load.seconds = $app.loadSec; $rec.load.bytes = $app.loadBytes }
     $rec.samples = $samples.ToArray(); $rec.errors = $errs.ToArray(); $rec.endedUtc = [DateTime]::UtcNow.ToString('o')
     if (-not $rec.endedBy) { $rec.endedBy = 'error' }
     Write-CorePartitionNewFile $outPath ($rec | ConvertTo-Json -Depth 8 -Compress)
@@ -5243,7 +5308,7 @@ if ($CorePartitionTelemetry) {
     $cpHelperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cpHelperSource))
     if ($cpHelperEncoded.Length -gt 30000) { throw "CORE_PARTITION_HELPER_TOO_LONG the encoded helper is $($cpHelperEncoded.Length) chars (limit 30000, one command line)" }
     $cpHelperAffinity = if ($corePartitionArgs.load -ne 0) { $corePartitionArgs.load } else { $corePartitionArgs.helper }
-    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Split-CorePartitionFeedLines', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Join-CorePartitionWhy', 'Get-CorePartitionReadyFeed', 'Get-CorePartitionScalars', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince') "`n"
+    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Split-CorePartitionFeedLines', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Join-CorePartitionWhy', 'Get-CorePartitionReadyFeed', 'Test-CorePartitionMeasuredApp', 'Get-CorePartitionScalars', 'Get-CorePartitionFeedHandleInfo', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince') "`n"
     $cpLaunchOld = @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
@@ -5274,6 +5339,7 @@ $corePartitionJob = [ordered]@{ affinityBefore = $null; affinityRequested = $(if
 $corePartitionStopFile = Join-Path $Work 'core-partition.stop'
 $corePartitionReadyFile = Join-Path $Work 'core-partition.ready'
 $corePartitionLaunchFile = Join-Path $Work 'core-partition.launch'
+$corePartitionMeasuredFile = Join-Path $Work 'core-partition.measured'
 $corePartitionHelperOut = Join-Path $Work 'core-partition-helper.json'
 $corePartitionFeedPath = $(if ($env:HEAVY_SLOT_FEED) { $env:HEAVY_SLOT_FEED } else { 'C:\temp\hwinfo-log-adapter.csv' })
 $corePartitionFeedPreHelper = Read-CorePartitionFeedMark $corePartitionFeedPath
@@ -5288,6 +5354,7 @@ try {
     $cpPsi.Environment['MLV_CP_STOP'] = $corePartitionStopFile
     $cpPsi.Environment['MLV_CP_READY'] = $corePartitionReadyFile
     $cpPsi.Environment['MLV_CP_LAUNCH'] = $corePartitionLaunchFile
+    $cpPsi.Environment['MLV_CP_MEASURED'] = $corePartitionMeasuredFile
     $cpPsi.Environment['MLV_CP_OUT'] = $corePartitionHelperOut
     $cpPsi.Environment['MLV_CP_BENCH'] = [string]$CorePartitionBenchMask
     $cpPsi.Environment['MLV_CP_LOAD'] = [string]$CorePartitionLoadMask
@@ -5350,7 +5417,15 @@ try {
     }
     $corePartitionSmokeEndedAtUtc = (Get-Date).ToUniversalTime()
     $corePartitionFeedEnd = Read-CorePartitionFeedSince $corePartitionFeedPath ([int64]$corePartitionFeedStart.length) ([string]$corePartitionFeedStart.before)
+    # sol r4 CP-02: the measured app is the process the smoke runner launched (its result.json process.id); 0 when unknown, which binds nothing.
+    $corePartitionMeasuredPid = [int64]0
+    try {
+        $cpRunnerProcess = ([IO.File]::ReadAllText($resultPath) | ConvertFrom-Json).process
+        if ($null -ne $cpRunnerProcess -and $null -ne $cpRunnerProcess.id) { $corePartitionMeasuredPid = [int64]$cpRunnerProcess.id }
+    } catch { $corePartitionErrors.Add("measured-pid: $([string]$_.Exception.Message)") }
     if ($null -ne $corePartitionHelper) {
+        # The pid goes to the helper BEFORE the stop file, so the helper binds its record to it as it ends.
+        try { [void](Publish-AttrCudaText -Path $corePartitionMeasuredFile -Value ([string]$corePartitionMeasuredPid)) } catch { $corePartitionErrors.Add("measured-pid-file: $([string]$_.Exception.Message)") }
         try { [void](Publish-AttrCudaText -Path $corePartitionStopFile -Value 'stop') } catch { $corePartitionErrors.Add("helper-stop-file: $([string]$_.Exception.Message)") }
         try {
             if (-not $corePartitionHelper.WaitForExit(20000)) {
@@ -5365,6 +5440,8 @@ try {
         try { $corePartitionHelperRecord = [IO.File]::ReadAllText($corePartitionHelperOut) | ConvertFrom-Json } catch { $corePartitionHelperWhy = Join-CorePartitionWhy $corePartitionHelperWhy 'helper-record-unparseable' }
     } elseif (-not $corePartitionHelperWhy) { $corePartitionHelperWhy = 'helper-record-missing' }
     $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120) $corePartitionHelperNotReady
+    # sol r4 CP-05: set until core-partition.json is saved, so any failure on the way leaves every acceptance flag false with this reason.
+    $corePartitionPublishWhy = 'core-partition-json-unpublished'
     try {
         [void](New-AttrCudaDirectory -Path $Pub)
         Save-Json ([ordered]@{
@@ -5374,6 +5451,8 @@ try {
             helperLaunch = $corePartitionHelperLaunch
             helperWhy = $corePartitionHelperWhy
             helperNotReady = $corePartitionHelperNotReady
+            measuredPid = $corePartitionMeasuredPid
+            measuredApp = (Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid).why
             helper = $corePartitionHelperRecord
             feed = [ordered]@{
                 path = $corePartitionFeedPath
@@ -5386,8 +5465,9 @@ try {
             perCoreTemperature = 'not in the feed (column 3 is the package / hottest core); adding columns is the Bachelor session''s work'
             errors = $corePartitionErrors.ToArray()
         }) (Join-Path $Pub 'core-partition.json')
+        $corePartitionPublishWhy = $null
     } catch { $corePartitionErrors.Add("publish: $([string]$_.Exception.Message)") }
-    Write-JobTrace "step core-partition done helperWhy=$corePartitionHelperWhy jobAffinityRestored=$($corePartitionJob.affinityRestored) errors=$($corePartitionErrors.Count)"
+    Write-JobTrace "step core-partition done helperWhy=$corePartitionHelperWhy publishWhy=$corePartitionPublishWhy jobAffinityRestored=$($corePartitionJob.affinityRestored) errors=$($corePartitionErrors.Count)"
 '@ + "`n" + $cpClose + "`n" + @'
 }
 Write-JobTrace "step smoke-launch done rc=$smokeRc"
@@ -5395,7 +5475,7 @@ Write-JobTrace "step smoke-launch done rc=$smokeRc"
     $text = Edit-DualVenueTemplate $text $cpLaunchOld ($cpPre + "`n" + $cpPost)
     $cpMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
     $text = Edit-DualVenueTemplate $text $cpMetricsAnchor ($cpOpen + "`n" + @'
-$corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady
+$corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy
 '@ + "`n" + $cpClose + "`n" + $cpMetricsAnchor)
     $cpMetricsAt = $text.IndexOf($cpMetricsAnchor, [StringComparison]::Ordinal)
     $cpKeysAnchor = '    cpuFrames = $gpuSummary.cpuFrames' + $cpEol

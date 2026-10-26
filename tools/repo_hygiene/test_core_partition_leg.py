@@ -159,6 +159,7 @@ try {
     $psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
     $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
     $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
+    $psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
     $psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
     $psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(90).Ticks)
     $h = [Diagnostics.Process]::Start($psi)
@@ -171,6 +172,7 @@ try {
     $post = Start-Process -FilePath $exe -ArgumentList @('-n', '6', '127.0.0.1') -PassThru -WindowStyle Hidden
     [void]$post.WaitForExit(20000)
     Start-Sleep -Seconds 1
+    [IO.File]::WriteAllText((Join-Path $dir 'measured'), [string]$post.Id)
     Set-Content -LiteralPath (Join-Path $dir 'stop') -Value 'stop'
     if (-not $h.WaitForExit(20000)) { $h.Kill() }
     $r = Get-Content -LiteralPath (Join-Path $dir 'helper.json') -Raw | ConvertFrom-Json
@@ -197,6 +199,7 @@ $psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
 $psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
 $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
 $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
+$psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
 $psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '1'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '1'
 $psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(120).Ticks)
 $h = [Diagnostics.Process]::Start($psi)
@@ -211,6 +214,7 @@ try {
     $measured = Start-Process -FilePath $exe -ArgumentList @('-n', '9', '127.0.0.1') -PassThru -WindowStyle Hidden
     [void]$measured.WaitForExit(30000)
     Start-Sleep -Seconds 1
+    [IO.File]::WriteAllText((Join-Path $dir 'measured'), [string]$measured.Id)
     Set-Content -LiteralPath (Join-Path $dir 'stop') -Value 'stop'
     if (-not $h.WaitForExit(30000)) { $h.Kill() }
     $r = Get-Content -LiteralPath (Join-Path $dir 'helper.json') -Raw | ConvertFrom-Json
@@ -219,6 +223,52 @@ try {
         loadSec = $r.load.seconds; loadBytes = $r.load.bytes; sessions = $r.load.sessions; appSamples = @($r.samples | Where-Object { $_.app }).Count; errors = @($r.errors) } | ConvertTo-Json -Compress
 } finally {
     if (-not $h.HasExited) { $h.Kill() }
+}
+"""
+
+
+# sol r4 CP-02: an unrelated same-path process starts right after the measured-launch instant and lives throughout; the measured app starts later.
+# The r4 helper bound the first one and never looked again. The decoded helper is run for real (stand-in exe, never MLVApp), handed the measured
+# pid the way the job hands it over (before the stop file), and its record goes through the generator's own Get-CorePartitionScalars (lifted).
+SAME_PATH_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$dir = $env:CP_DIR
+$exe = Join-Path $dir 'mlvfake.exe'
+Copy-Item -LiteralPath 'C:\Windows\System32\PING.EXE' -Destination $exe
+$psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $($env:CP_ENCODED)")
+$psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+$psi.Environment['MLV_CP_EXE'] = $exe
+$psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
+$psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
+$psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
+$psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
+$psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
+$psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '1'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '1'
+$psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(120).Ticks)
+$h = [Diagnostics.Process]::Start($psi)
+$other = $null
+try {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path (Join-Path $dir 'ready')) -and -not $h.HasExited -and $sw.ElapsedMilliseconds -lt 60000) { Start-Sleep -Milliseconds 100 }
+    [IO.File]::WriteAllText((Join-Path $dir 'launch'), [string][DateTime]::UtcNow.Ticks)
+    Start-Sleep -Milliseconds 50
+    $other = Start-Process -FilePath $exe -ArgumentList @('-n', '30', '127.0.0.1') -PassThru -WindowStyle Hidden
+    Start-Sleep -Milliseconds 1500
+    $measured = Start-Process -FilePath $exe -ArgumentList @('-n', '5', '127.0.0.1') -PassThru -WindowStyle Hidden
+    [void]$measured.WaitForExit(30000)
+    Start-Sleep -Seconds 1
+    [IO.File]::WriteAllText((Join-Path $dir 'measured'), [string]$measured.Id)
+    Set-Content -LiteralPath (Join-Path $dir 'stop') -Value 'stop'
+    if (-not $h.WaitForExit(30000)) { $h.Kill() }
+    $r = Get-Content -LiteralPath (Join-Path $dir 'helper.json') -Raw | ConvertFrom-Json
+    $bench = [int64]@($r.instances)[0].affinityFirst
+    $mp = @{}; if ((Get-Command Get-CorePartitionScalars).Parameters.ContainsKey('MeasuredPid')) { $mp.MeasuredPid = [int64]$measured.Id }
+    $s = Get-CorePartitionScalars $r ([ordered]@{ reasons = [ordered]@{} }) $bench 0 0 @{ value = 1; why = $null } $null $false @mp
+    [ordered]@{ otherPid = $other.Id; measuredPid = $measured.Id; app = $r.app.pid; instances = @($r.instances | ForEach-Object { $_.pid }); recordedMeasuredPid = $r.measuredPid
+        appSamples = @($r.samples | Where-Object { $_.app -and $_.appPid -ne $measured.Id }).Count; bench = $s.benchAffinityApplied; observed = $s.appAffinityObserved; why = [string]$s.corePartitionNullReasons } | ConvertTo-Json -Compress
+} finally {
+    if (-not $h.HasExited) { $h.Kill() }
+    if ($null -ne $other -and -not $other.HasExited) { $other.Kill() }
 }
 """
 
@@ -400,6 +450,38 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertLessEqual(got["loadSec"], life + 1.5, f"the probe's load seconds were counted as the measured app's: {got}")
         self.assertLessEqual(got["appSamples"], life + 1.5, f"the probe's samples were counted as app samples: {got}")
 
+    def test_an_unrelated_same_path_process_started_after_the_launch_never_supplies_the_measured_apps_evidence(self) -> None:
+        """sol r4 CP-02 (= adversary A1): the helper binds the pid the job hands over, records the other instance beside it, and the scalars refuse."""
+        m = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a"))
+        self.assertIsNotNone(m)
+        work = self.tmp / "same-path-work"
+        work.mkdir()
+        driver = self.tmp / "same-path-driver.ps1"
+        driver.write_text(LIFT + SAME_PATH_DRIVER, encoding="ascii")
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1), "CP_GEN": str(GENERATOR)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["app"], got["measuredPid"], f"the helper bound another same-path instance as the measured app: {got}")
+        self.assertEqual(got["recordedMeasuredPid"], got["measuredPid"], got)
+        self.assertEqual(sorted(got["instances"]), sorted([got["otherPid"], got["measuredPid"]]), f"the concurrent instance is not on the record: {got}")
+        self.assertEqual(got["appSamples"], 0, f"a sample of another instance was tagged as the app's: {got}")
+        self.assertFalse(got["bench"], f"a concurrent same-path instance's affinity was accepted: {got}")
+        self.assertIsNone(got["observed"], got)
+        self.assertIn("appAffinityObserved=same-path-instance-overlap", got["why"])
+
+    def test_the_job_hands_the_measured_pid_to_the_helper_before_the_stop_file(self) -> None:
+        """sol r4 CP-02 / CP-05 wiring: the runner's pid reaches the helper first, and the scalar line carries the pid and the publish reason."""
+        for key in ("a", "b1", "b2", "cuda-b2"):
+            with self.subTest(job=key):
+                text = lf(self.job(key))
+                self.assertIn("$cpPsi.Environment['MLV_CP_MEASURED'] = $corePartitionMeasuredFile\n", text)
+                self.assertIn("([IO.File]::ReadAllText($resultPath) | ConvertFrom-Json).process", text)
+                measured = text.index("Publish-AttrCudaText -Path $corePartitionMeasuredFile")
+                self.assertLess(measured, text.index("Publish-AttrCudaText -Path $corePartitionStopFile"), "the measured pid must reach the helper before it stops")
+                self.assertIn("$corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy\n", text)
+                for fn in ("function Test-CorePartitionMeasuredApp", "function Get-CorePartitionFeedHandleInfo"):
+                    self.assertIn(fn, text)
+
     def test_the_helpers_output_files_are_created_never_truncated(self) -> None:
         """Adversary A5: a planted hard link at the helper's ready / record name must be refused, not truncated through."""
         m = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a"))
@@ -453,6 +535,10 @@ foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Lan
 
 FIXTURES = r"""
 $r = [ordered]@{}
+# sol r4 CP-02: the measured app's pid (Get-CorePartitionScalars -MeasuredPid). A pre-r5 generator has no such parameter; the splat is then empty so
+# a RED run reaches the assertions and reports the defect instead of a binding error.
+$hasMp = (Get-Command Get-CorePartitionScalars).Parameters.ContainsKey('MeasuredPid')
+$mp = @{}; if ($hasMp) { $mp.MeasuredPid = [int64]5000 }
 $r.mask = @((ConvertFrom-CorePartitionMask '0x00FFF' 'X'), (ConvertFrom-CorePartitionMask '0xfffff' 'X'), (Format-CorePartitionMask 4095), (Format-CorePartitionMask 1048575))
 $r.eol = @(foreach ($m in @("0x00FFF`n", "0x00FFF`r`n", "0x00FFF`n`n", "0x0`n")) { try { [void](ConvertFrom-CorePartitionMask $m 'X'); 'accepted' } catch { ([string]$_.Exception.Message -split '\s+')[0] } })
 $map = @{}; for ($i = 0; $i -lt 20; $i++) { $map["0,$i"] = $(if ($i -lt 12) { 1 } else { 0 }) }
@@ -489,19 +575,20 @@ $cs = Get-CorePartitionCounterSummary $samples 1 4096
 $r.counters = @($cs.appSamples, $cs.pcoreMHzMean, $cs.ecoreMHzMean, $cs.pcoreParkedSampleFraction)
 $r.workers = @((Get-CorePartitionWorkerThreads "playback_smoke.start session=1 worker_threads=16 x=1`nplayback_smoke.start session=3 scale_request=1 worker_threads=12 start_serial=2`n").value,
     (Get-CorePartitionWorkerThreads "nothing here").why, (Get-CorePartitionWorkerThreads '').why)
-$helper = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":10.0,"bytes":20000000000},"samples":[{"app":true,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}]}' | ConvertFrom-Json
+$one = '"instances":[{"pid":5000,"firstSeenUtcTicks":100,"lastSeenUtcTicks":200}]'
+$helper = ('{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":10.0,"bytes":20000000000},"samples":[{"app":true,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],' + $one + '}') | ConvertFrom-Json
 $w = @{ value = 16; why = $null }
-$b2 = Get-CorePartitionScalars $helper $feed 4095 1044480 8 $w $null
+$b2 = Get-CorePartitionScalars $helper $feed 4095 1044480 8 $w $null @mp
 $r.b2 = @($b2.corePartitionTopologyOk, $b2.appAffinityObserved, $b2.benchAffinityRequested, $b2.benchAffinityApplied, $b2.partitionLoadMask, $b2.partitionLoadApplied, $b2.partitionLoadGBps,
     $b2.pcoreMHzMean, $b2.ecoreMHzMean, $b2.pcoreParkedSampleFraction, $b2.playbackWorkerThreads, $b2.pkgWattsMean, $b2.corePartitionNullReasons, @($b2.Keys).Count)
-$helperA = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"affinityFirst":1048575,"affinityLast":1048575},"load":{"seconds":0.0,"bytes":0},"samples":[]}' | ConvertFrom-Json
-$a = Get-CorePartitionScalars $helperA $feed 0 0 0 $w $null
+$helperA = ('{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"affinityFirst":1048575,"affinityLast":1048575},"load":{"seconds":0.0,"bytes":0},"samples":[],' + $one + '}') | ConvertFrom-Json
+$a = Get-CorePartitionScalars $helperA $feed 0 0 0 $w $null @mp
 $r.a = @($a.appAffinityObserved, $a.benchAffinityApplied, $a.benchAffinityRequested, $a.partitionLoadApplied, $a.partitionLoadGBps, $a.pcoreMHzMean, $a.corePartitionNullReasons)
-$helperMoved = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"affinityFirst":4095,"affinityLast":1048575},"load":{"seconds":0.5,"bytes":10},"samples":[]}' | ConvertFrom-Json
-$m = Get-CorePartitionScalars $helperMoved $feed 4095 1044480 8 $w $null
+$helperMoved = ('{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"affinityFirst":4095,"affinityLast":1048575},"load":{"seconds":0.5,"bytes":10},"samples":[],' + $one + '}') | ConvertFrom-Json
+$m = Get-CorePartitionScalars $helperMoved $feed 4095 1044480 8 $w $null @mp
 $r.moved = @($m.appAffinityObserved, $m.benchAffinityApplied, $m.partitionLoadApplied)
-$wrongHelper = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1048575,"app":{"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":10,"bytes":10},"samples":[]}' | ConvertFrom-Json
-$r.wrongHelper = (Get-CorePartitionScalars $wrongHelper $feed 4095 1044480 8 $w $null).partitionLoadApplied
+$wrongHelper = ('{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1048575,"app":{"pid":5000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":10,"bytes":10},"samples":[],' + $one + '}') | ConvertFrom-Json
+$r.wrongHelper = (Get-CorePartitionScalars $wrongHelper $feed 4095 1044480 8 $w $null @mp).partitionLoadApplied
 $none = Get-CorePartitionScalars $null $mf 4095 0 0 @{ value = $null; why = 'run-log-missing' } 'helper-not-started'
 $r.none = @($none.corePartitionTopologyOk, $none.appAffinityObserved, $none.benchAffinityApplied, $none.corePartitionNullReasons)
 $badTopo = '{"topologyCheck":{"ok":false,"reason":"topology-uniform (1 efficiency class(es))","pMask":null,"eMask":null},"app":{"affinityFirst":4095,"affinityLast":4095},"samples":[]}' | ConvertFrom-Json
@@ -530,12 +617,12 @@ for ($i = 0; $i -lt 32768; $i++) { [void]$sb.Append($cool + ',' + ('x' * (62 - $
 $ec = Read-CorePartitionFeedSince $fb ([int64]$mb.length) ([string]$mb.before)
 $r.integrityTruncated = @($ec.truncated, (Get-CorePartitionFeedSummary $mb $ec 120).reasons['rows'], (Get-CorePartitionFeedSummary $mb $ec 120).pkgWattsMax)
 # adversary r2 A1: a helper that was not ready at the measured launch fails the topology, bench and load flags closed
-$helperGood = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[]}' | ConvertFrom-Json
-$nr = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w 'helper-not-ready-at-launch' $true
-$okc = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w $null
+$helperGood = ('{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[],' + $one + '}') | ConvertFrom-Json
+$nr = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w 'helper-not-ready-at-launch' $true @mp
+$okc = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w $null $false @mp
 $r.notReady = @($nr.corePartitionTopologyOk, $nr.benchAffinityApplied, $nr.partitionLoadApplied, $nr.corePartitionNullReasons, $okc.corePartitionTopologyOk, $okc.benchAffinityApplied, $okc.partitionLoadApplied)
 # sol r3 CP-01: the guard is the dedicated flag, so a reason text that no longer says "not ready" cannot re-open the criteria
-$nrText = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w 'helper-killed-after-stop-timeout' $true
+$nrText = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w 'helper-killed-after-stop-timeout' $true @mp
 $r.notReadyFlag = @($nrText.corePartitionTopologyOk, $nrText.benchAffinityApplied, $nrText.partitionLoadApplied)
 # opus H2 (CORE-PARTITION-FEED-NOT-READY-REASON-1): with a not-ready helper every package-feed field is null and names the not-ready reason
 $r.notReadyFeed = @($nr.pkgWattsMean, $nr.pkgWattsMax, $nr.pkgTempCMean, $nr.pkgTempCMax, $nr.pkgThrottledRows, $nr.pkgTempCAtStart, $okc.pkgWattsMean, $okc.pkgTempCAtStart)
@@ -550,6 +637,66 @@ $r.nonFinite = @(foreach ($row in @("26.10.2026,01:00:02,x,NaN,45,No,No`n", "26.
     $nf = $end.Clone(); $nf.window = $row; $nf.windowStartsMidRow = $false; (Get-CorePartitionFeedSummary $start $nf 120).reasons['pkgWattsMean'] })
 $nfs = $start.Clone(); $nfs.before = "26.10.2026,01:00:00,x,NaN,20.5,No,No`n"
 $r.nonFiniteStart = (Get-CorePartitionFeedSummary $nfs $whole 120).reasons['pkgTempCAtStart']
+# sol r4 CP-02 (literal): launch mark 2026-10-26T12:00:00Z; unrelated same-path pid 4242 starts at +50 ms with affinity 4095 and lives throughout;
+# the measured pid 5000 starts later. One record as the r4 helper wrote it (4242 bound), one as an r5 helper binds it (5000, 4242 still alive).
+$L = 639286128000000000
+$i4242 = '{"pid":4242,"startUtcTicks":' + ($L + 500000) + ',"firstSeenUtcTicks":' + ($L + 600000) + ',"lastSeenUtcTicks":' + ($L + 200000000) + ',"affinityFirst":4095,"affinityLast":4095,"loadSec":19.0,"loadBytes":40000000000}'
+$i5000 = '{"pid":5000,"startUtcTicks":' + ($L + 30000000) + ',"firstSeenUtcTicks":' + ($L + 31000000) + ',"lastSeenUtcTicks":' + ($L + 190000000) + ',"affinityFirst":4095,"affinityLast":4095,"loadSec":15.0,"loadBytes":30000000000}'
+$i4100 = '{"pid":4100,"startUtcTicks":' + ($L + 1000000) + ',"firstSeenUtcTicks":' + ($L + 2000000) + ',"lastSeenUtcTicks":' + ($L + 20000000) + ',"affinityFirst":4095,"affinityLast":4095,"loadSec":1.8,"loadBytes":3000000000}'
+$i5000early = '{"pid":5000,"startUtcTicks":' + ($L + 1000000) + ',"firstSeenUtcTicks":' + ($L + 2000000) + ',"lastSeenUtcTicks":' + ($L + 20000000) + ',"affinityFirst":4095,"affinityLast":4095,"loadSec":1.8,"loadBytes":3000000000}'
+$hb = '"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"samples":[{"app":true,"appPid":5000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}]'
+function New-CpRecord([string]$App, [string]$Load, [string[]]$Inst) { ('{' + $hb + ',"app":' + $App + ',"load":' + $Load + ',"instances":[' + ($Inst -join ',') + ']}') | ConvertFrom-Json }
+$cases = [ordered]@{
+    'r4-bound-4242' = @((New-CpRecord $i4242 '{"seconds":19.0,"bytes":40000000000}' @($i4242, $i5000)), 5000)
+    'bound-5000-beside-4242' = @((New-CpRecord $i5000 '{"seconds":15.0,"bytes":30000000000}' @($i4242, $i5000)), 5000)
+    'pid-unknown' = @((New-CpRecord $i5000 '{"seconds":15.0,"bytes":30000000000}' @($i4100, $i5000)), 0)
+    'pid-not-observed' = @((New-CpRecord $i5000 '{"seconds":15.0,"bytes":30000000000}' @($i4100, $i5000)), 6000)
+    'pid-reused' = @((New-CpRecord $i5000 '{"seconds":15.0,"bytes":30000000000}' @($i5000early, $i5000)), 5000)
+    'helper-bound-another' = @((New-CpRecord $i4100 '{"seconds":1.8,"bytes":3000000000}' @($i4100, $i5000)), 5000)
+    'probe-then-app-control' = @((New-CpRecord $i5000 '{"seconds":15.0,"bytes":30000000000}' @($i4100, $i5000)), 5000)
+}
+$r.measured = [ordered]@{}
+foreach ($k in $cases.Keys) {
+    $mpk = @{}; if ($hasMp) { $mpk.MeasuredPid = [int64]$cases[$k][1] }
+    $sc = Get-CorePartitionScalars $cases[$k][0] $feed 4095 1044480 8 $w $null $false @mpk
+    $r.measured[$k] = @($sc.corePartitionTopologyOk, $sc.benchAffinityApplied, $sc.partitionLoadApplied, $sc.appAffinityObserved, $sc.partitionLoadGBps, $sc.pcoreMHzMean, [string]$sc.corePartitionNullReasons)
+}
+# sol r4 CP-03 (literal): fresh unchanged marks, two complete rows of finite 1e308 values; a watts-only overflow too
+$s308 = $start.Clone(); $s308.before = "26.10.2026,01:00:00,x,30,10,No,No`n"
+$w308 = $end.Clone(); $w308.window = "26.10.2026,01:00:01,x,1e308,1e308,No,No`n26.10.2026,01:00:02,x,1e308,1e308,No,No`n"; $w308.windowStartsMidRow = $false
+$f308 = Get-CorePartitionFeedSummary $s308 $w308 120
+$r.aggregate = @($f308.rows, $f308.pkgWattsMean, $f308.pkgWattsMax, $f308.pkgTempCMean, $f308.pkgTempCMax, $f308.pkgThrottledRows, [string]$f308.reasons['pkgWattsMean'], [string]$f308.reasons['pkgTempCMean'], [string]$f308.reasons['rows'], $f308.pkgTempCAtStart)
+$r.aggregateJsonInfinity = ([string]($f308 | ConvertTo-Json -Compress -Depth 4)).Contains('Infinity')
+$ww = $w308.Clone(); $ww.window = "26.10.2026,01:00:01,x,70,1e308,No,No`n26.10.2026,01:00:02,x,70,1e308,No,No`n"
+$fw = Get-CorePartitionFeedSummary $s308 $ww 120
+$r.aggregateWatts = @($fw.pkgWattsMean, $fw.pkgTempCMean, [string]$fw.reasons['pkgWattsMean'], [string]$fw.reasons['pkgTempCMax'])
+$sc308 = Get-CorePartitionScalars $helper $f308 4095 1044480 8 $w $null $false @mp
+$r.aggregateScalars = @($sc308.pkgWattsMean, $sc308.pkgTempCMean, [string]$sc308.corePartitionNullReasons)
+# sol r4 CP-03 (class): a clock reading past the double range, and finite readings whose mean overflows
+$r.mhzOverflow = @((Get-CorePartitionEffectiveMHz 1.7e308 100), (Get-CorePartitionEffectiveMHz ([double]::PositiveInfinity) 100), (Get-CorePartitionEffectiveMHz 2500 ([double]::PositiveInfinity)))
+$bigS = @{ app = $true; inst = @(0..62 | ForEach-Object { "0,$_" }); freq = @(0..62 | ForEach-Object { 1.7e308 }); perf = @(0..62 | ForEach-Object { 1 }); park = @(0..62 | ForEach-Object { 0 }) }
+$csBig = Get-CorePartitionCounterSummary @($bigS, $bigS) ([int64]::MaxValue) 0
+$r.counterOverflow = @($csBig.appSamples, $csBig.pcoreMHzMean, ([string]($csBig | ConvertTo-Json -Compress)).Contains('Infinity'))
+# sol r4 CP-04: each mark carries its opened handle's file id; a mismatch, or one mark without it (or without a creation time), is a replaced file
+$idS = $start.Clone(); $idS.fileId = '0000ABCD-0000000000000001'
+$idE = $end.Clone(); $idE.fileId = '0000ABCD-0000000000000002'
+$idSame = $end.Clone(); $idSame.fileId = '0000ABCD-0000000000000001'
+$crE = $end.Clone(); $crE.created = [int64]639286056000000000
+$r.fileId = @([string](Get-CorePartitionFeedSummary $idS $idE 120).reasons['rows'], [string](Get-CorePartitionFeedSummary $start $idSame 120).reasons['rows'],
+    (Get-CorePartitionFeedSummary $idS $idSame 120).rows, [string](Get-CorePartitionFeedSummary $start $crE 120).reasons['rows'])
+# sol r4 CP-04 (executed): the feed deleted and re-created under its name with the identical prefix plus a replayed 99 W row. NTFS name tunneling
+# hands the new file the old creation time, so only the file id tells the two apart.
+$ft = Join-Path $env:CP_TMP 'feed-swap.csv'
+[IO.File]::WriteAllText($ft, "26.10.2026,01:00:00,x,30,10,No,No`n")
+$mt = Read-CorePartitionFeedMark $ft
+Remove-Item -LiteralPath $ft
+[IO.File]::WriteAllText($ft, "26.10.2026,01:00:00,x,30,10,No,No`n25.10.2026,01:00:01,x,90,99,Yes,No`n")
+$et = Read-CorePartitionFeedSince $ft ([int64]$mt.length) ([string]$mt.before)
+$st = Get-CorePartitionFeedSummary $mt $et 120
+$r.swap = @(([int64]$mt.created -eq [int64]$et.created), $et.exists, $st.rows, $st.pkgWattsMean, [string]$st.reasons['rows'])
+$nope = Join-Path $env:CP_TMP 'no-such-feed.csv'
+$rm = Read-CorePartitionFeedMark $nope; $rs = Read-CorePartitionFeedSince $nope 0 ''
+$r.readerMissing = @($rm.exists, $rs.exists, $rm.ContainsKey('error'), $rs.ContainsKey('error'))
 $r | ConvertTo-Json -Depth 6 -Compress
 """
 
@@ -569,7 +716,13 @@ if (-not $scalarLine) { throw 'no scalar line in the generator' }
 function Write-JobTrace([string]$Message) { }
 function Publish-AttrCudaText { param([string]$Path, [string]$Value) }
 function New-AttrCudaDirectory { param([string]$Path) }
-function Save-Json { param($Object, $Path) $global:cpSaved = $Object }
+# sol r4 CP-05: the publisher double throws as the job's would for an injected IOException, or for a directory sitting at core-partition.json.
+function Save-Json {
+    param($Object, $Path)
+    if ($global:cpPublish -eq 'throw') { throw [IO.IOException]::new('injected publisher IOException') }
+    if (Test-Path -LiteralPath $Path -PathType Container) { throw [IO.IOException]::new("'$Path' is a directory") }
+    $global:cpSaved = $Object
+}
 function New-HelperDouble([string]$Mode) {
     $d = [pscustomobject]@{ Id = 4242; Mode = $Mode; Killed = $false }
     $d | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param([int]$Ms) if ($this.Mode -eq 'throw') { throw 'wait failed' }; if ($this.Mode -eq 'timeout' -and -not $this.Killed) { return $false }; return $true }
@@ -580,7 +733,7 @@ $CorePartitionBenchMask = [int64]4095
 $CorePartitionLoadMask = [int64]1044480
 $CorePartitionLoadThreads = 8
 $CorePartitionHelperMask = [int64]1044480
-$record = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[{"app":true,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}]}'
+$record = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[{"app":true,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"firstSeenUtcTicks":100,"lastSeenUtcTicks":200}]}'
 $cases = @(
     @{ name = 'stop-timeout'; mode = 'timeout'; record = 'valid'; ready = $false },
     @{ name = 'normal-exit'; mode = 'exit'; record = 'valid'; ready = $false },
@@ -588,7 +741,11 @@ $cases = @(
     @{ name = 'record-unparseable'; mode = 'exit'; record = 'garbage'; ready = $false },
     @{ name = 'record-missing'; mode = 'exit'; record = 'none'; ready = $false },
     @{ name = 'stop-timeout-record-unparseable'; mode = 'timeout'; record = 'garbage'; ready = $false },
-    @{ name = 'ready-stop-timeout-control'; mode = 'timeout'; record = 'valid'; ready = $true })
+    @{ name = 'ready-stop-timeout-control'; mode = 'timeout'; record = 'valid'; ready = $true },
+    @{ name = 'ready-normal-exit-control'; mode = 'exit'; record = 'valid'; ready = $true },
+    @{ name = 'publish-io-exception'; mode = 'exit'; record = 'valid'; ready = $true; publish = 'throw' },
+    @{ name = 'publish-directory'; mode = 'exit'; record = 'valid'; ready = $true; publish = 'directory' },
+    @{ name = 'measured-pid-missing'; mode = 'exit'; record = 'valid'; ready = $true; result = 'none' })
 $out = [ordered]@{}
 foreach ($c in $cases) {
     $dir = Join-Path $env:CP_TMP $c.name
@@ -597,6 +754,12 @@ foreach ($c in $cases) {
     $corePartitionHelperOut = Join-Path $dir 'core-partition-helper.json'
     if ($c.record -eq 'valid') { [IO.File]::WriteAllText($corePartitionHelperOut, $record) } elseif ($c.record -eq 'garbage') { [IO.File]::WriteAllText($corePartitionHelperOut, '{"topologyCheck":') }
     $corePartitionStopFile = Join-Path $dir 'core-partition.stop'
+    $corePartitionMeasuredFile = Join-Path $dir 'core-partition.measured'
+    # sol r4 CP-02: the smoke runner's result.json names the process it launched (the record's bound pid)
+    $resultPath = Join-Path $dir 'result.json'
+    if ($c.result -ne 'none') { [IO.File]::WriteAllText($resultPath, '{"process":{"id":5000}}') }
+    $global:cpPublish = $c.publish
+    if ($c.publish -eq 'directory') { [void](New-Item -ItemType Directory -Path (Join-Path $dir 'core-partition.json')) }
     $corePartitionFeedPath = Join-Path $dir 'feed.csv'
     [IO.File]::WriteAllText($corePartitionFeedPath, "26.10.2026,01:00:00,x,30,10,No,No`n")
     $corePartitionFeedPreHelper = Read-CorePartitionFeedMark $corePartitionFeedPath
@@ -621,6 +784,7 @@ foreach ($c in $cases) {
         helperWhy = $corePartitionHelperWhy; notReady = [bool]$corePartitionHelperNotReady; killed = $corePartitionHelper.Killed
         pkg = @($s.pkgWattsMean, $s.pkgWattsMax, $s.pkgTempCMean, $s.pkgTempCMax, $s.pkgThrottledRows, $s.pkgTempCAtStart)
         published = $(if ($null -ne $global:cpSaved) { $ps = $global:cpSaved.feed.summary; @($ps.rows, $ps.pkgWattsMean, $ps.pkgWattsMax, $ps.pkgTempCMean, $ps.pkgTempCMax, $ps.pkgThrottledRows, $ps.pkgTempCAtStart, [string]$ps.reasons['pkgWattsMean']) } else { @('not-published') })
+        errors = @($corePartitionErrors)
     }
 }
 $out | ConvertTo-Json -Depth 6 -Compress
@@ -639,6 +803,19 @@ class CorePartitionPureHelperTests(unittest.TestCase):
 
     def setUp(self) -> None:
         self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+
+    def cleanup_cases(self) -> dict:
+        """CLEANUP_DRIVER's per-case results, run once per class (the job's own cleanup block and scalar line against process and I/O doubles)."""
+        cls = type(self)
+        if getattr(cls, "_cleanup", None) is None:
+            driver = Path(cls._tmp.name) / "cleanup-driver.ps1"
+            driver.write_text(LIFT + CLEANUP_DRIVER, encoding="ascii")
+            work = Path(cls._tmp.name) / "cleanup"
+            work.mkdir(exist_ok=True)
+            proc = run_pwsh(["-File", str(driver)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": str(work)})
+            self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+            cls._cleanup = json.loads(proc.stdout.strip().splitlines()[-1])
+        return cls._cleanup
 
     def test_masks(self) -> None:
         self.assertEqual(self.r["mask"], [4095, 1048575, "0x00FFF", "0xFFFFF"])
@@ -709,13 +886,7 @@ class CorePartitionPureHelperTests(unittest.TestCase):
     def test_launch_readiness_rejection_survives_every_cleanup_outcome(self) -> None:
         """sol r3 CP-01: the job's exact cleanup block (lifted from the generator) run against a helper process double that was not ready at the
         measured launch, then the job's exact scalar line. A late helper that publishes a valid B2 record must never regain the criteria."""
-        driver = Path(self._tmp.name) / "cleanup-driver.ps1"
-        driver.write_text(LIFT + CLEANUP_DRIVER, encoding="ascii")
-        work = Path(self._tmp.name) / "cleanup"
-        work.mkdir(exist_ok=True)
-        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": str(work)})
-        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
-        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        got = self.cleanup_cases()
         first = {
             "stop-timeout": "helper-not-ready-at-launch+helper-killed-after-stop-timeout",
             "normal-exit": "helper-not-ready-at-launch",
@@ -757,6 +928,87 @@ class CorePartitionPureHelperTests(unittest.TestCase):
             self.assertIn(code, none[3])
         self.assertFalse(self.r["badTopo"][0])
         self.assertIn("corePartitionTopologyOk=topology-uniform", self.r["badTopo"][1])
+
+    def test_the_evidence_is_the_measured_pids_and_a_concurrent_same_path_instance_refuses_it(self) -> None:
+        """sol r4 CP-02 (= adversary A1), from its literal: binding, the bound instance's affinity, load totals, samples and scalar acceptance."""
+        refused = {
+            "r4-bound-4242": "same-path-instance-overlap",
+            "bound-5000-beside-4242": "same-path-instance-overlap",
+            "pid-unknown": "measured-pid-unknown",
+            "pid-not-observed": "measured-app-not-observed",
+            "pid-reused": "measured-pid-ambiguous",
+            "helper-bound-another": "helper-app-not-measured-pid",
+        }
+        for case, code in refused.items():
+            with self.subTest(case=case):
+                topo, bench, load, observed, gbps, pcore, why = self.r["measured"][case]
+                self.assertEqual([bench, load, observed, gbps, pcore], [False, False, None, None, None], f"evidence not bound to the measured pid was accepted: {why}")
+                self.assertTrue(topo, "the host topology is not the app's evidence and stays as checked")
+                for field in ("appAffinityObserved", "partitionLoadGBps", "pcoreMHzMean", "ecoreMHzMean", "pcoreParkedSampleFraction"):
+                    self.assertIn(f"{field}={code}", why)
+        control = self.r["measured"]["probe-then-app-control"]
+        self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"a probe that ended before the measured app started is no overlap: {control}")
+
+    def test_finite_feed_rows_whose_mean_overflows_are_a_typed_refusal(self) -> None:
+        """sol r4 CP-03 (= adversary A2), its literal rows: both package means, and the success-summary scalars."""
+        self.assertEqual(self.r["aggregate"][:6], [None] * 6, f"an overflowing mean published window values: {self.r['aggregate']}")
+        self.assertEqual(self.r["aggregate"][6:9], ["feed-aggregate-non-finite"] * 3)
+        self.assertEqual(self.r["aggregate"][9], 30.0, "the start temperature (one finite row before the launch) is unaffected")
+        self.assertFalse(self.r["aggregateJsonInfinity"], "core-partition.json would carry the string Infinity")
+        self.assertEqual(self.r["aggregateWatts"], [None, None, "feed-aggregate-non-finite", "feed-aggregate-non-finite"], "a watts-only overflow refuses the whole window")
+        self.assertEqual(self.r["aggregateScalars"][:2], [None, None])
+        for f in ("pkgWattsMean", "pkgTempCMean"):
+            self.assertIn(f"{f}=feed-aggregate-non-finite", self.r["aggregateScalars"][2])
+
+    def test_counter_readings_never_aggregate_to_a_non_finite_mean(self) -> None:
+        """sol r4 CP-03 (class): the clock math and the P/E means."""
+        self.assertEqual(self.r["mhzOverflow"], [None, None, None])
+        self.assertEqual(self.r["counterOverflow"], [2, None, False])
+
+    def test_a_feed_mark_without_the_same_handle_identity_is_a_replaced_file(self) -> None:
+        """sol r4 CP-04 (= adversary A3): file id mismatch, one-sided file id and one-sided creation time are each feed-replaced."""
+        self.assertEqual(self.r["fileId"], ["feed-replaced", "feed-replaced", 3, "feed-replaced"])
+
+    def test_a_feed_deleted_and_recreated_under_its_name_supplies_no_window_even_when_its_creation_time_tunnels(self) -> None:
+        """sol r4 CP-04, executed through both real readers: the replayed 99 W row is never evidence."""
+        tunneled, exists, rows, watts, reason = self.r["swap"]
+        self.assertTrue(exists)
+        self.assertEqual([rows, watts, reason], [None, None, "feed-replaced"], f"a re-created feed supplied window evidence (creation time tunneled: {tunneled})")
+        self.assertEqual(self.r["readerMissing"], [False, False, False, False], "a missing feed is exists=false without an error, from both readers")
+
+    def test_the_feed_readers_take_their_metadata_from_the_opened_handle(self) -> None:
+        """sol r4 CP-04: no metadata by path in either reader (the swap between a path lookup and the open is not reachable in a test)."""
+        src = lf(GENERATOR.read_text(encoding="utf-8"))
+        for name in ("Read-CorePartitionFeedMark", "Read-CorePartitionFeedSince"):
+            with self.subTest(reader=name):
+                m = re.search(r"(?ms)^function " + re.escape(name) + r"\(.*?^\}$", src)
+                self.assertIsNotNone(m)
+                body = m.group(0)
+                for banned in ("FileInfo", "Get-Item", "Test-Path", "GetCreationTime", "GetLastWriteTime", ".Exists", "LastWriteTimeUtc", "CreationTimeUtc"):
+                    self.assertNotIn(banned, body, f"{name} reads metadata by path ({banned})")
+                self.assertLess(body.index("[IO.File]::Open("), body.index("Get-CorePartitionFeedHandleInfo $fs"), "the identity is the opened stream's")
+                self.assertIn("created = $id.created; fileId = $id.fileId", body)
+
+    def test_a_core_partition_json_publish_failure_clears_every_acceptance_flag(self) -> None:
+        """sol r4 CP-05 (= adversary A4): an injected publisher IOException, and a directory at Pub/core-partition.json, through the scalar line."""
+        got = self.cleanup_cases()
+        control = got["ready-normal-exit-control"]
+        self.assertEqual([control["topo"], control["bench"], control["load"]], [True, True, True], f"a published ready run is accepted: {control}")
+        for case in ("publish-io-exception", "publish-directory"):
+            with self.subTest(case=case):
+                c = got[case]
+                self.assertEqual(c["published"], "not-published", c)
+                self.assertEqual([c["topo"], c["bench"], c["load"]], [False, False, False], f"an unpublished core-partition.json left a flag true: {c}")
+                for flag in ("corePartitionTopologyOk", "benchAffinityApplied", "partitionLoadApplied"):
+                    self.assertIn(f"{flag}=core-partition-json-unpublished", c["why"])
+                self.assertTrue(any(e.startswith("publish: ") for e in c["errors"]), c)
+
+    def test_an_unknown_measured_pid_through_the_job_cleanup_binds_nothing(self) -> None:
+        """sol r4 CP-02 through the job's cleanup block: no runner result.json, so no measured pid, so no app evidence is accepted."""
+        c = self.cleanup_cases()["measured-pid-missing"]
+        self.assertEqual([c["bench"], c["load"]], [False, False], c)
+        self.assertIn("appAffinityObserved=measured-pid-unknown", c["why"])
+        self.assertTrue(any(e.startswith("measured-pid: ") for e in c["errors"]), c)
 
 
 # --- the runner's mapping (offline test mode, stub generator) -------------------------------------------------------------------------------
