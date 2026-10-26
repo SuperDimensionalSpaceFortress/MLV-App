@@ -111,6 +111,7 @@ $fake = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($env:CP_FAKE
 $region = [regex]::Replace($region, "(?m)^\`$CorePartitionHelperEncoded = '[^']*'", { "`$CorePartitionHelperEncoded = '$fake'" })
 $region = [regex]::Replace($region, '(?m)^\$CorePartitionHelperAffinity = \[int64\]\d+', '$CorePartitionHelperAffinity = [int64]1')
 function Write-JobTrace([string]$Message) { }
+function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText($Path, $Value) }
 $Work = $env:CP_WORK
 $exePath = 'C:\no\such\MLVApp.exe'
 $SmokeProcessTimeoutMs = 60000
@@ -124,6 +125,7 @@ try {
     [ordered]@{
         helperReady = $corePartitionHelperLaunch.ready; readyLength = [int64]([string]$ready).Trim(); startLength = $corePartitionFeedStart.length
         rows = $sum.rows; wattsMean = $sum.pkgWattsMean; tempAtStart = $sum.pkgTempCAtStart
+        launchFileCarriesTheMeasuredLaunch = ([IO.File]::ReadAllText($corePartitionLaunchFile) -eq [string]$corePartitionMeasuredLaunchUtc.Ticks)
         launchUtcAfterReady = ($null -ne $corePartitionMeasuredLaunchUtc -and $corePartitionMeasuredLaunchUtc -gt $corePartitionPreHelperUtc.AddMilliseconds(1000))
     } | ConvertTo-Json -Compress
 } finally {
@@ -148,21 +150,45 @@ try {
     $psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
     $psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
     $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
+    $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
     $psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
     $psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(90).Ticks)
     $h = [Diagnostics.Process]::Start($psi)
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while (-not (Test-Path (Join-Path $dir 'ready')) -and -not $h.HasExited -and $sw.ElapsedMilliseconds -lt 30000) { Start-Sleep -Milliseconds 100 }
+    $mid = Start-Process -FilePath $exe -ArgumentList @('-n', '40', '127.0.0.1') -PassThru -WindowStyle Hidden
+    Start-Sleep -Milliseconds 1500
+    [IO.File]::WriteAllText((Join-Path $dir 'launch'), [string][DateTime]::UtcNow.Ticks)
+    Start-Sleep -Milliseconds 700
     $post = Start-Process -FilePath $exe -ArgumentList @('-n', '6', '127.0.0.1') -PassThru -WindowStyle Hidden
     [void]$post.WaitForExit(20000)
     Start-Sleep -Seconds 1
     Set-Content -LiteralPath (Join-Path $dir 'stop') -Value 'stop'
     if (-not $h.WaitForExit(20000)) { $h.Kill() }
     $r = Get-Content -LiteralPath (Join-Path $dir 'helper.json') -Raw | ConvertFrom-Json
-    [ordered]@{ prePid = $pre.Id; postPid = $post.Id; seen = $r.app.pid; instances = @($r.instances | ForEach-Object { $_.pid }) } | ConvertTo-Json -Compress
+    [ordered]@{ prePid = $pre.Id; midPid = $mid.Id; postPid = $post.Id; seen = $r.app.pid; instances = @($r.instances | ForEach-Object { $_.pid }) } | ConvertTo-Json -Compress
 } finally {
     if (-not $pre.HasExited) { $pre.Kill() }
+    if ($null -ne $mid -and -not $mid.HasExited) { $mid.Kill() }
 }
+"""
+
+
+NEWFILE_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$src = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:CP_ENCODED))
+$m = [regex]::Match($src, '(?ms)^function Write-CorePartitionNewFile.*?^\}$')
+if (-not $m.Success) { throw 'Write-CorePartitionNewFile is not in the helper' }
+. ([scriptblock]::Create($m.Value))
+$owner = Join-Path $env:CP_DIR 'owner.bin'
+[IO.File]::WriteAllText($owner, 'original-bytes')
+$ready = Join-Path $env:CP_DIR 'core-partition.ready'
+New-Item -ItemType HardLink -Path $ready -Target $owner | Out-Null
+$threw = $false
+try { Write-CorePartitionNewFile $ready 'ready' } catch { $threw = $true }
+$fresh = Join-Path $env:CP_DIR 'fresh.txt'
+Write-CorePartitionNewFile $fresh 'ok'
+[ordered]@{ threw = $threw; original = [IO.File]::ReadAllText($owner); fresh = [IO.File]::ReadAllText($fresh) } | ConvertTo-Json -Compress
 """
 
 
@@ -276,6 +302,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(got["wattsMean"], 50.0, "the window mean includes the helper's startup rows")
         self.assertEqual(got["tempAtStart"], 30.0, "the start temperature is the newest row before the measured launch")
         self.assertTrue(got["launchUtcAfterReady"], "the measured-launch timestamp must be taken after the ready wait")
+        self.assertTrue(got["launchFileCarriesTheMeasuredLaunch"], "the helper is handed the measured-launch instant it binds the app by")
 
     def test_the_helper_binds_only_an_app_started_after_it_not_a_same_path_process_already_running(self) -> None:
         """Dot improvement: affinity and load evidence must come from the measured app, not from any process at the same exe path."""
@@ -288,9 +315,26 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1)})
         self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
         got = json.loads(proc.stdout.strip().splitlines()[-1])
-        self.assertNotEqual(got["prePid"], got["postPid"])
-        self.assertEqual(got["seen"], got["postPid"], f"the helper bound a process that was running before it started: {got}")
+        self.assertEqual(len({got["prePid"], got["midPid"], got["postPid"]}), 3)
+        self.assertEqual(got["seen"], got["postPid"], f"the helper bound a same-path process that started before the measured launch: {got}")
         self.assertEqual(got["instances"], [got["postPid"]], got)
+
+    def test_the_helpers_output_files_are_created_never_truncated(self) -> None:
+        """Adversary A5: a planted hard link at the helper's ready / record name must be refused, not truncated through."""
+        m = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a"))
+        self.assertIsNotNone(m)
+        src = base64.b64decode(m.group(1)).decode("utf-16-le")
+        self.assertNotIn("WriteAllText(", src, "the helper still truncating-writes a file by name")
+        work = self.tmp / "newfile-work"
+        work.mkdir()
+        driver = self.tmp / "newfile-driver.ps1"
+        driver.write_text(NEWFILE_DRIVER, encoding="ascii")
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(got["threw"], "CreateNew must refuse a name that already exists (a hard link to something else)")
+        self.assertEqual(got["original"], "original-bytes", "the file behind the planted link was changed")
+        self.assertEqual(got["fresh"], "ok")
 
     def test_the_jobs_and_the_encoded_helper_parse(self) -> None:
         files = [self.out[k] for k in ("a", "b1", "b2", "cuda-b2") if self.job(k)]
@@ -380,6 +424,34 @@ $none = Get-CorePartitionScalars $null $mf 4095 0 0 @{ value = $null; why = 'run
 $r.none = @($none.corePartitionTopologyOk, $none.appAffinityObserved, $none.benchAffinityApplied, $none.corePartitionNullReasons)
 $badTopo = '{"topologyCheck":{"ok":false,"reason":"topology-uniform (1 efficiency class(es))","pMask":null,"eMask":null},"app":{"affinityFirst":4095,"affinityLast":4095},"samples":[]}' | ConvertFrom-Json
 $r.badTopo = @((Get-CorePartitionScalars $badTopo $feed 4095 0 0 $w $null).corePartitionTopologyOk, (Get-CorePartitionScalars $badTopo $feed 4095 0 0 $w $null).corePartitionNullReasons)
+# adversary r2 A3 / A4: a replaced or over-cap feed is no evidence (real files, the I/O readers)
+$fa = Join-Path $env:CP_TMP 'feed-a.csv'
+[IO.File]::WriteAllText($fa, "26.10.2026,01:00:00,x,30,10,No,No`n")
+$ma = Read-CorePartitionFeedMark $fa
+[IO.File]::AppendAllText($fa, "26.10.2026,01:00:01,x,90,99,Yes,No`n")
+$ea = Read-CorePartitionFeedSince $fa ([int64]$ma.length) ([string]$ma.before)
+$sa = Get-CorePartitionFeedSummary $ma $ea 120
+$r.integrityAppend = @($ea.replaced, $ea.truncated, $sa.rows, $sa.pkgWattsMean, $sa.reasons.Count)
+$mc = $ma.Clone(); $mc.created = [int64]$ma.created - 10000000
+$r.integrityCreated = (Get-CorePartitionFeedSummary $mc $ea 120).reasons['rows']
+[IO.File]::WriteAllText($fa, "26.10.2026,00:00:09,x,55,55,No,No`n26.10.2026,01:00:01,x,90,99,Yes,No`n")
+$eb = Read-CorePartitionFeedSince $fa ([int64]$ma.length) ([string]$ma.before)
+$r.integrityReplaced = @($eb.replaced, (Get-CorePartitionFeedSummary $ma $eb 120).reasons['rows'])
+$fb = Join-Path $env:CP_TMP 'feed-b.csv'
+[IO.File]::WriteAllText($fb, '')
+$mb = Read-CorePartitionFeedMark $fb
+$cool = '26.10.2026,00:00:00,x,30,10,No,No'
+$sb = [Text.StringBuilder]::new()
+for ($i = 0; $i -lt 32768; $i++) { [void]$sb.Append($cool + ',' + ('x' * (62 - $cool.Length)) + "`n") }
+[void]$sb.Append("26.10.2026,00:00:01,x,90,99,Yes,No`n")
+[IO.File]::AppendAllText($fb, $sb.ToString())
+$ec = Read-CorePartitionFeedSince $fb ([int64]$mb.length) ([string]$mb.before)
+$r.integrityTruncated = @($ec.truncated, (Get-CorePartitionFeedSummary $mb $ec 120).reasons['rows'], (Get-CorePartitionFeedSummary $mb $ec 120).pkgWattsMax)
+# adversary r2 A1: a helper that was not ready at the measured launch fails the topology, bench and load flags closed
+$helperGood = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[]}' | ConvertFrom-Json
+$nr = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w 'helper-not-ready-at-launch'
+$okc = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w $null
+$r.notReady = @($nr.corePartitionTopologyOk, $nr.benchAffinityApplied, $nr.partitionLoadApplied, $nr.corePartitionNullReasons, $okc.corePartitionTopologyOk, $okc.benchAffinityApplied, $okc.partitionLoadApplied)
 $r | ConvertTo-Json -Depth 6 -Compress
 """
 
@@ -388,7 +460,9 @@ $r | ConvertTo-Json -Depth 6 -Compress
 class CorePartitionPureHelperTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        proc = run_pwsh(["-Command", LIFT + FIXTURES], env_extra={"CP_GEN": str(GENERATOR)})
+        cls._tmp = tempfile.TemporaryDirectory(prefix="core-partition-feed-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        proc = run_pwsh(["-Command", LIFT + FIXTURES], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name})
         cls.raw = proc
         cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
 
@@ -424,6 +498,22 @@ class CorePartitionPureHelperTests(unittest.TestCase):
 
     def test_worker_threads(self) -> None:
         self.assertEqual(self.r["workers"], [12, "worker-threads-line-missing", "run-log-missing"])
+
+    def test_a_replaced_or_over_cap_feed_is_no_evidence_and_an_append_still_is(self) -> None:
+        # a plain append (the normal case) is unchanged: the one appended row, no reason
+        self.assertEqual(self.r["integrityAppend"], [False, False, 1, 99.0, 0])
+        self.assertEqual(self.r["integrityCreated"], "feed-replaced", "a feed whose creation time changed is a different file")
+        self.assertEqual(self.r["integrityReplaced"], [True, "feed-replaced"], "different bytes just before the start offset: the file was replaced")
+        truncated, reason, wmax = self.r["integrityTruncated"]
+        self.assertTrue(truncated)
+        self.assertEqual(reason, "feed-window-truncated", "a window over the 2 MiB cap must not report the last row's absence as a 10 W maximum")
+        self.assertIsNone(wmax)
+
+    def test_a_helper_not_ready_at_launch_fails_topology_bench_and_load_closed(self) -> None:
+        not_ready, control = self.r["notReady"][:4], self.r["notReady"][4:]
+        self.assertEqual(not_ready[:3], [False, False, False])
+        self.assertIn("corePartitionTopologyOk=helper-not-ready-at-launch", not_ready[3])
+        self.assertEqual(control, [True, True, True], "the same record with a ready helper is accepted")
 
     def test_summary_scalars(self) -> None:
         b2 = self.r["b2"]

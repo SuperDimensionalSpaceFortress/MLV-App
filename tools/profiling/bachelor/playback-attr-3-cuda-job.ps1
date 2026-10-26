@@ -4329,6 +4329,10 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec) {
     if ($null -eq $Start -or $null -eq $End) { $code = 'feed-mark-missing' }
     elseif (-not $Start.exists -or -not $End.exists) { $code = 'feed-missing' }
     elseif ([int64]$End.length -lt [int64]$Start.length) { $code = 'feed-rotated' }
+    # Adversary r2 A3/A4: a replaced file (new creation time, or different bytes just before the start offset) or a window larger than the read cap is no evidence.
+    elseif ($Start.created -and $End.created -and [int64]$Start.created -ne [int64]$End.created) { $code = 'feed-replaced' }
+    elseif ($End.replaced) { $code = 'feed-replaced' }
+    elseif ($End.truncated) { $code = 'feed-window-truncated' }
     elseif ($null -eq $End.ageSec -or [double]$End.ageSec -gt $StaleSec) { $code = 'feed-stale' }
     if ($null -eq $code) {
         $lines = @(([string]$End.window) -split "`r?`n")
@@ -4412,12 +4416,14 @@ function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$Loa
     if ($null -eq $first) { $why['appAffinityObserved'] = $(if ($null -eq $app) { 'app-not-seen' } else { 'app-affinity-unread' }) }
     elseif ($null -eq $last -or $last -eq $first) { $observed = Format-CorePartitionMask $first }
     else { $observed = (Format-CorePartitionMask $first) + '/' + (Format-CorePartitionMask $last) }
-    $benchApplied = ($BenchMask -ne 0 -and $null -ne $first -and $null -ne $last -and $first -eq $BenchMask -and $last -eq $BenchMask)
+    $notReady = ($HelperWhy -eq 'helper-not-ready-at-launch')
+    if ($notReady) { $topoOk = $false; $why['corePartitionTopologyOk'] = $HelperWhy }
+    $benchApplied = (-not $notReady -and $BenchMask -ne 0 -and $null -ne $first -and $null -ne $last -and $first -eq $BenchMask -and $last -eq $BenchMask)
     $load = if ($null -ne $h) { $h.load } else { $null }
     $loadSec = if ($null -ne $load -and $null -ne $load.seconds) { [double]$load.seconds } else { 0.0 }
     $loadBytes = if ($null -ne $load -and $null -ne $load.bytes) { [double]$load.bytes } else { 0.0 }
     $helperAff = if ($null -ne $h -and $null -ne $h.helperAffinityObserved) { [int64]$h.helperAffinityObserved } else { $null }
-    $loadApplied = ($LoadMask -ne 0 -and $LoadThreads -gt 0 -and $helperAff -eq $LoadMask -and $loadSec -ge 1 -and $loadBytes -gt 0)
+    $loadApplied = (-not $notReady -and $LoadMask -ne 0 -and $LoadThreads -gt 0 -and $helperAff -eq $LoadMask -and $loadSec -ge 1 -and $loadBytes -gt 0)
     $gbps = $null
     if ($LoadMask -ne 0) { if ($loadSec -gt 0) { $gbps = [math]::Round($loadBytes / $loadSec / 1e9, 3) } else { $why['partitionLoadGBps'] = 'load-never-ran' } }
     $cs = if ($null -ne $h -and $null -ne $h.samples -and $topoOk) { Get-CorePartitionCounterSummary $h.samples $pMask $eMask } else { $null }
@@ -4464,30 +4470,40 @@ function Read-CorePartitionFeedMark([string]$Path) {
             $text = [Text.Encoding]::UTF8.GetString($buf, 0, $got)
             if ($from -gt 0) { $nl = $text.IndexOf("`n"); $text = if ($nl -ge 0) { $text.Substring($nl + 1) } else { '' } }
         } finally { $fs.Dispose() }
-        @{ exists = $true; length = $len; ageSec = ([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalSeconds; before = $text; window = ''; windowStartsMidRow = $false }
+        @{ exists = $true; length = $len; ageSec = ([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalSeconds; before = $text; window = ''; windowStartsMidRow = $false; created = $fi.CreationTimeUtc.Ticks }
     } catch { @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false; error = [string]$_.Exception.Message } }
 }
 
-# I/O, bounded (2 MiB): the text appended since the start mark's offset, plus whether that offset fell inside a row.
-function Read-CorePartitionFeedSince([string]$Path, [int64]$Offset) {
+# I/O, bounded (2 MiB): the text appended since the start mark's offset, plus whether that offset fell inside a row. $ExpectedBefore is the start mark's
+# text: when the bytes just before the offset differ from its tail the file was replaced (replaced); a window over the cap is flagged (truncated).
+function Read-CorePartitionFeedSince([string]$Path, [int64]$Offset, [string]$ExpectedBefore = '') {
     try {
         $fi = [IO.FileInfo]::new($Path)
         if (-not $fi.Exists) { return @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false } }
         $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
         try {
             $len = $fs.Length
-            $text = ''; $mid = $false
+            $text = ''; $mid = $false; $replaced = $false; $truncated = $false
             if ($len -ge $Offset) {
-                $from = [Math]::Max([int64]0, $Offset - 1)
+                $exp = [Text.Encoding]::UTF8.GetBytes($ExpectedBefore)
+                $k = [int][Math]::Min([int64][Math]::Min($exp.Length, 256), $Offset)
+                $kk = [int][Math]::Min([int64][Math]::Max($k, 1), $Offset)
+                $from = [Math]::Max([int64]0, $Offset - $kk)
                 $count = [int][Math]::Min([int64]2097152, $len - $from)
+                $truncated = (($len - $from) -gt 2097152)
                 [void]$fs.Seek($from, [IO.SeekOrigin]::Begin)
                 $buf = New-Object byte[] $count
                 $got = $fs.Read($buf, 0, $count)
-                if ($Offset -gt 0 -and $got -gt 0) { $mid = ($buf[0] -ne 10); $text = [Text.Encoding]::UTF8.GetString($buf, 1, $got - 1) }
+                if ($Offset -gt 0 -and $got -ge $kk) {
+                    $mid = ($buf[$kk - 1] -ne 10)
+                    for ($i = 0; $i -lt $k; $i++) { if ($buf[$i] -ne $exp[$exp.Length - $k + $i]) { $replaced = $true; break } }
+                    $text = [Text.Encoding]::UTF8.GetString($buf, $kk, $got - $kk)
+                }
+                elseif ($Offset -gt 0) { $text = '' }
                 else { $text = [Text.Encoding]::UTF8.GetString($buf, 0, $got) }
             }
         } finally { $fs.Dispose() }
-        @{ exists = $true; length = $len; ageSec = ([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalSeconds; before = ''; window = $text; windowStartsMidRow = $mid }
+        @{ exists = $true; length = $len; ageSec = ([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalSeconds; before = ''; window = $text; windowStartsMidRow = $mid; replaced = $replaced; truncated = $truncated; created = $fi.CreationTimeUtc.Ticks }
     } catch { @{ exists = $false; length = 0; ageSec = $null; before = ''; window = ''; windowStartsMidRow = $false; error = [string]$_.Exception.Message } }
 }
 
@@ -4500,6 +4516,14 @@ function Get-CorePartitionFunctionSource([string[]]$Name, [string]$Eol) {
 # It never touches another process but reading the MLVApp whose Path is the job's exe; it writes only its ready and record files.
 $corePartitionHelperBody = @'
 $ErrorActionPreference = 'Stop'
+# Adversary r2 A5: the helper's two output files are created with CreateNew, so a name that already exists (a planted hard link) is refused, never truncated.
+function Write-CorePartitionNewFile([string]$Path, [string]$Text) {
+    $nf = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $nb = [Text.Encoding]::UTF8.GetBytes($Text)
+        $nf.Write($nb, 0, $nb.Length)
+    } finally { $nf.Dispose() }
+}
 $exe = [string]$env:MLV_CP_EXE; $stop = [string]$env:MLV_CP_STOP; $outPath = [string]$env:MLV_CP_OUT; $ready = [string]$env:MLV_CP_READY
 $bench = [int64]$env:MLV_CP_BENCH; $loadMask = [int64]$env:MLV_CP_LOAD; $helperMask = [int64]$env:MLV_CP_HELPER; $threads = [int]$env:MLV_CP_THREADS
 $deadline = [int64]$env:MLV_CP_DEADLINE_TICKS
@@ -4511,8 +4535,9 @@ $instances = [Collections.Generic.List[object]]::new()
 $loadOn = $false; $loadStartTicks = 0
 try {
     $self = [Diagnostics.Process]::GetCurrentProcess()
-    # Dot improvement: the measured app starts after this helper does (the job spawns the helper first), so a same-path process already running is never bound.
-    $helperBornUtc = $self.StartTime.ToUniversalTime()
+    # Dot improvement + adversary r2 A2: the measured app starts after the job's measured-launch instant, which the job hands over in MLV_CP_LAUNCH once the
+    # helper is ready; a same-path process that started earlier (or while no launch instant is known yet) is never bound.
+    $launchFile = [string]$env:MLV_CP_LAUNCH; $launchUtc = $null
     $topo = Get-CorePartitionTopology
     $tm = [ordered]@{}; foreach ($k in @($topo.map.Keys | Sort-Object)) { $tm[$k] = $topo.map[$k] }
     $rec.topology = $tm; $rec.topologyReason = $topo.reason
@@ -4539,7 +4564,7 @@ public static class MlvCorePartitionLoad {
     }
     $cat = [Diagnostics.PerformanceCounterCategory]::new('Processor Information')
     $prev = $cat.ReadCategory()
-    [IO.File]::WriteAllText($ready, 'ready')
+    Write-CorePartitionNewFile $ready 'ready'
     $appName = [IO.Path]::GetFileNameWithoutExtension($exe)
     $cur = $null; $curRec = $null
     $nextSample = [DateTime]::UtcNow.AddSeconds(1)
@@ -4557,11 +4582,14 @@ public static class MlvCorePartitionLoad {
                 if ($loadOn) { [MlvCorePartitionLoad]::End(); $rec.load.seconds += ([DateTime]::UtcNow.Ticks - $loadStartTicks) / 1e7; $loadOn = $false }
             }
         }
-        if ($null -eq $cur) {
+        if ($null -eq $launchUtc -and $launchFile -and (Test-Path -LiteralPath $launchFile)) {
+            try { $launchUtc = [DateTime]::new([int64]([IO.File]::ReadAllText($launchFile).Trim()), [DateTimeKind]::Utc) } catch { }
+        }
+        if ($null -eq $cur -and $null -ne $launchUtc) {
             foreach ($p in @(Get-Process -Name $appName -ErrorAction SilentlyContinue)) {
                 $pp = $null; try { $pp = [string]$p.Path } catch { }
                 $pst = $null; try { $pst = $p.StartTime.ToUniversalTime() } catch { }
-                if ($pp -and $pp -ieq $exe -and $pst -and $pst -ge $helperBornUtc) {
+                if ($pp -and $pp -ieq $exe -and $pst -and $pst -ge $launchUtc) {
                     $cur = $p
                     $curRec = [ordered]@{ pid = $p.Id; firstSeenUtcTicks = [DateTime]::UtcNow.Ticks; lastSeenUtcTicks = [DateTime]::UtcNow.Ticks; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null }
                     try { $curRec.affinityFirst = [int64]$p.ProcessorAffinity; $curRec.affinityLast = $curRec.affinityFirst; $curRec.priorityFirst = [string]$p.PriorityClass; $curRec.priorityLast = $curRec.priorityFirst } catch { $errs.Add("app-read: $($_.Exception.Message)") }
@@ -4600,7 +4628,7 @@ finally {
     $rec.app = $longest
     $rec.samples = $samples.ToArray(); $rec.errors = $errs.ToArray(); $rec.endedUtc = [DateTime]::UtcNow.ToString('o')
     if (-not $rec.endedBy) { $rec.endedBy = 'error' }
-    [IO.File]::WriteAllText($outPath, ($rec | ConvertTo-Json -Depth 8 -Compress))
+    Write-CorePartitionNewFile $outPath ($rec | ConvertTo-Json -Depth 8 -Compress)
 }
 '@
 # Generation-time refusals (typed CORE_PARTITION_*); with every argument unset this returns zeros and nothing else changes.
@@ -5209,6 +5237,7 @@ $corePartitionJobProc = [Diagnostics.Process]::GetCurrentProcess()
 $corePartitionJob = [ordered]@{ affinityBefore = $null; affinityRequested = $(if ($CorePartitionBenchMask -ne 0) { Format-CorePartitionMask $CorePartitionBenchMask } else { $null }); affinityApplied = $null; affinityRestored = $null }
 $corePartitionStopFile = Join-Path $Work 'core-partition.stop'
 $corePartitionReadyFile = Join-Path $Work 'core-partition.ready'
+$corePartitionLaunchFile = Join-Path $Work 'core-partition.launch'
 $corePartitionHelperOut = Join-Path $Work 'core-partition-helper.json'
 $corePartitionFeedPath = $(if ($env:HEAVY_SLOT_FEED) { $env:HEAVY_SLOT_FEED } else { 'C:\temp\hwinfo-log-adapter.csv' })
 $corePartitionFeedPreHelper = Read-CorePartitionFeedMark $corePartitionFeedPath
@@ -5222,6 +5251,7 @@ try {
     $cpPsi.Environment['MLV_CP_EXE'] = $exePath
     $cpPsi.Environment['MLV_CP_STOP'] = $corePartitionStopFile
     $cpPsi.Environment['MLV_CP_READY'] = $corePartitionReadyFile
+    $cpPsi.Environment['MLV_CP_LAUNCH'] = $corePartitionLaunchFile
     $cpPsi.Environment['MLV_CP_OUT'] = $corePartitionHelperOut
     $cpPsi.Environment['MLV_CP_BENCH'] = [string]$CorePartitionBenchMask
     $cpPsi.Environment['MLV_CP_LOAD'] = [string]$CorePartitionLoadMask
@@ -5243,6 +5273,8 @@ try {
 } catch {
     $corePartitionErrors.Add("helper-start: $([string]$_.Exception.Message)")
 }
+# Adversary r2 A1: a helper that is not ready when the measured launch happens fails every telemetry criterion closed (its record cannot cover the window).
+if ($null -ne $corePartitionHelper -and -not $corePartitionHelperLaunch.ready) { $corePartitionHelperWhy = 'helper-not-ready-at-launch' }
 if ($CorePartitionBenchMask -ne 0) {
     try {
         $corePartitionJobProc.ProcessorAffinity = [IntPtr]$CorePartitionBenchMask
@@ -5256,6 +5288,7 @@ if ($CorePartitionBenchMask -ne 0) {
 # (the pre-helper mark above is recorded separately and never windows the feed).
 $corePartitionFeedStart = Read-CorePartitionFeedMark $corePartitionFeedPath
 $corePartitionMeasuredLaunchUtc = (Get-Date).ToUniversalTime()
+try { [void](Publish-AttrCudaText -Path $corePartitionLaunchFile -Value ([string]$corePartitionMeasuredLaunchUtc.Ticks)) } catch { $corePartitionErrors.Add("launch-file: $([string]$_.Exception.Message)") }
 Write-JobTrace "step core-partition start helperPid=$($corePartitionHelperLaunch.pid) helperAffinity=$($corePartitionHelperLaunch.affinityObserved) ready=$($corePartitionHelperLaunch.ready) readyWaitMs=$($corePartitionHelperLaunch.readyWaitMs) jobAffinity=$($corePartitionJob.affinityApplied)"
 '@ + "`n" + $cpClose + "`n" + @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
@@ -5279,7 +5312,7 @@ try {
         $corePartitionErrors.Add("job-affinity-restore: $([string]$_.Exception.Message)")
     }
     $corePartitionSmokeEndedAtUtc = (Get-Date).ToUniversalTime()
-    $corePartitionFeedEnd = Read-CorePartitionFeedSince $corePartitionFeedPath ([int64]$corePartitionFeedStart.length)
+    $corePartitionFeedEnd = Read-CorePartitionFeedSince $corePartitionFeedPath ([int64]$corePartitionFeedStart.length) ([string]$corePartitionFeedStart.before)
     if ($null -ne $corePartitionHelper) {
         try { [void](Publish-AttrCudaText -Path $corePartitionStopFile -Value 'stop') } catch { $corePartitionErrors.Add("helper-stop-file: $([string]$_.Exception.Message)") }
         try {
