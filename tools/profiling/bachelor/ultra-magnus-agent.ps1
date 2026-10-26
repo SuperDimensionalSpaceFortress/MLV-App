@@ -1875,6 +1875,9 @@ $script:QuietLeaseWaiting = $null
 $script:QuietLeaseWaitLogSec = 60
 # adversary r1 A2: a slot snapshot's status probe (up to 30 s) is skipped when a deadline or the lease end is within this many seconds.
 $script:LeaseSnapshotSkipBelowSec = 70
+# r3 (Dot B1/B2): the snapshot probes in flight (Add-LeaseSlotSnapshot starts one, Update-LeaseSlotSnapshots polls them) and their bound.
+$script:LeaseSlotSnapshots = [System.Collections.Generic.List[object]]::new()
+$script:LeaseSnapshotProbeSec = 30
 # lease-batch r1: the parked (or in-use) batch lease, and "the admitted batch job launched and ended" for Exit-HeavySlot.
 $script:LeaseBatch = $null
 $script:LeaseBatchKeep = $false
@@ -2079,19 +2082,64 @@ function ConvertFrom-HeavySlotHolderText {
 
 function Add-LeaseSlotSnapshot {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1: ONE `heavy-slot.py status` probe, logged as who holds each slot (owner, pid, age) and how many runs
-    # are queued; Phase is request | grant. The probe is Invoke-HeavySlotStatus, so it is bounded by that helper's own 30 s timeout (which
-    # heartbeats while it waits); a timeout logs slots=unknown(timeout 30 s) and the caller goes on. Logging only: nothing here throws,
-    # gates or changes a return value, and a failed log line is dropped.
+    # are queued; Phase is request | grant. r3 (Dot B1/B2, adversary r4 A1/A2): the probe is STARTED here and never waited on, so it holds neither
+    # the wait loop nor the lease: Update-LeaseSlotSnapshots, called from the wait loop, the job monitor loop and the inbox loop, logs it once it
+    # exits, or kills it at LeaseSnapshotProbeSec (slots=unknown(timeout N s)). Logging only: nothing here throws, gates or changes a return value,
+    # and a failed log line is dropped.
     param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Phase, [double]$WaitedSec = 0, [double]$HeadroomSec = [double]::PositiveInfinity)
     try {
-        # adversary r1 A2: the probe may take up to 30 s (and the loop does nothing meanwhile), so it is not made when a job deadline, the queue ceiling or the
-        # lease's own end is within twice that: a log line must not turn an admission into expired-not-after / queue-expired or hand over a spent lease.
+        # adversary r1 A2: a probe whose answer could only land after a job deadline, the queue ceiling or the lease's own end is not started.
         $skipBelow = if ($script:LeaseSnapshotSkipBelowSec -gt 0) { [double]$script:LeaseSnapshotSkipBelowSec } else { 70.0 }
         if ($HeadroomSec -le $skipBelow) {
             Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=skipped($([long][Math]::Floor($HeadroomSec)) s before a deadline or the lease end, within the ${skipBelow} s a status probe may take)"
             return
         }
-        $s = Invoke-HeavySlotStatus -HeartbeatActivity "gate-wait job=$JobId state=slots-snapshot waited=$([int]$WaitedSec)s"
+        $call = Start-HeavySlotCli -Arguments @("status", "--slots", "$HeavySlotCount")
+        if (-not $call.ok) {
+            Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown($(([string]$call.why) -replace '\s+', ' '))"
+            return
+        }
+        $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = $JobId; phase = $Phase; call = $call; clock = [System.Diagnostics.Stopwatch]::StartNew() })
+    }
+    catch {
+        try { Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown(snapshot failed: $(([string]$_.Exception.Message) -replace '\s+', ' '))" } catch { }
+    }
+}
+
+function Update-LeaseSlotSnapshots {
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: never waits. Logs each snapshot probe that has exited (and whose output has been read to its end),
+    # kills one that has run LeaseSnapshotProbeSec (a monotonic clock, not the wall clock) as slots=unknown(timeout N s), and with -Abandon kills
+    # every one still running as slots=unknown(<Abandon>). Logging only: it never throws.
+    param([string]$Abandon = "")
+    if ($null -eq $script:LeaseSlotSnapshots -or $script:LeaseSlotSnapshots.Count -lt 1) { return }
+    $bound = if ($script:LeaseSnapshotProbeSec -gt 0) { [double]$script:LeaseSnapshotProbeSec } else { 30.0 }
+    foreach ($s in @($script:LeaseSlotSnapshots.ToArray())) {
+        try {
+            $st = $null
+            if ($s.call.proc.HasExited -and $s.call.out.IsCompleted -and $s.call.err.IsCompleted) {
+                $r = Receive-HeavySlotCli -Call $s.call
+                $lines = @(([string]$r.stdout) -split "`r?`n" | Where-Object { $_ -ne "" })
+                $st = if ($r.rc -eq 0) { @{ ok = $true; lines = $lines; error = $null } } else { @{ ok = $false; lines = $lines; error = "status exit $($r.rc): $($r.stderr)" } }
+            }
+            elseif ($s.clock.Elapsed.TotalSeconds -ge $bound) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = "timeout $([long]$bound) s" } }
+            elseif ($Abandon) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = $Abandon } }
+            if ($null -eq $st) { continue }
+            [void]$script:LeaseSlotSnapshots.Remove($s)
+            Write-LeaseSlotSnapshotLine -JobId $s.jobId -Phase $s.phase -Status $st
+        }
+        catch {
+            [void]$script:LeaseSlotSnapshots.Remove($s)
+            try { Stop-HeavySlotCli -Call $s.call } catch { }
+            try { Add-AgentLogLine "quiet-lease: slots-snapshot job=$($s.jobId) phase=$($s.phase) slots=unknown(snapshot failed: $(([string]$_.Exception.Message) -replace '\s+', ' '))" } catch { }
+        }
+    }
+}
+
+function Write-LeaseSlotSnapshotLine {
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1: one finished status probe (@{ ok; lines; error }) as its slots-snapshot line. Logging only: it never throws.
+    param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Phase, [Parameter(Mandatory = $true)]$Status)
+    try {
+        $s = $Status
         if (-not $s.ok) {
             $e = ([string]$s.error) -replace '\s+', ' '
             $what = if ($e -match '^status timed out after (\d+) s$') { "timeout $($Matches[1]) s" } else { $e }
@@ -3208,6 +3256,20 @@ function Get-QuietLeaseRemainingSec {
     return [int][Math]::Floor($Lease.active.until - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0)
 }
 
+function Set-LeaseCoverageAtLaunch {
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3 (Dot B2, adversary r4 A2): admission.leaseCoversTimeout is re-read from the lease's own until= immediately
+    # before the child is created, so it is true AT LAUNCH and not only at the grant: whatever the steps since the grant took is counted. It only
+    # lowers it (true -> false, with the typed line); leaseRemainingAtLaunchSec records what was left. Not a lease admission, no active lease, or
+    # no job timeout: nothing changes. Recorded, not gated: no decision reads it.
+    param([Parameter(Mandatory = $true)][string]$JobId, $Admission, $Lease, [int]$TimeoutSec = 0)
+    if ($null -eq $Admission -or $Admission.mode -ne "lease" -or $null -eq $Lease -or $null -eq $Lease.active) { return }
+    $rem = Get-QuietLeaseRemainingSec -Lease $Lease
+    $Admission | Add-Member -NotePropertyName leaseRemainingAtLaunchSec -NotePropertyValue $rem -Force
+    if ($TimeoutSec -le 0 -or $Admission.leaseCoversTimeout -ne $true -or $rem -ge $TimeoutSec) { return }
+    $Admission | Add-Member -NotePropertyName leaseCoversTimeout -NotePropertyValue $false -Force
+    Add-AgentLogLine "quiet-lease: lease-shorter-than-timeout job=$JobId phase=launch remaining=${rem}s timeoutSec=$TimeoutSec; the job's time past until=$([long]$Lease.active.until) is not covered by the lease (admission.leaseCoversTimeout=false)"
+}
+
 function Get-LeaseBatchAdmission {
     # The admission's leaseBatch block for the batch's current job.
     param([Parameter(Mandatory = $true)]$Batch, [bool]$Reused)
@@ -3413,7 +3475,6 @@ function Wait-QuietLeaseAdmission {
     try {
         while ($true) {
             $now = Get-Date
-            $snapCostSec = 0.0
             $waited = ($now - $t0).TotalSeconds
             if (Test-Path -LiteralPath (Join-Path $cancel "$JobId.cancel") -PathType Leaf) {
                 return [pscustomobject]@{ gate = $script:GateVersion; mode = "lease"; label = "cancelled-in-gate"; state = "cancelled"; waitedSec = [int]$waited; probes = 0; requeues = $requeues; slot = $null; thermal = $null; why = "cancel file present before launch"; leaseRefusals = @($refusals.ToArray()) }
@@ -3461,11 +3522,10 @@ function Wait-QuietLeaseAdmission {
                 }
             }
             # AGENT-LEASE-PENDING-HEAT-TRACE-1: ONE slot snapshot per job when its first request is made (a re-ask after a refusal adds none).
+            # r3 (Dot B1): the probe is only started here; this loop polls it below and never waits on it, so the re-ask schedule is the base one.
             if (-not $snapshotRequestDone -and $requests -ge 1) {
                 $snapshotRequestDone = $true
-                $snapT = Get-Date
                 Add-LeaseSlotSnapshot -JobId $JobId -Phase "request" -WaitedSec ((Get-Date) - $t0).TotalSeconds -HeadroomSec (Get-LeaseSnapshotHeadroomSec -Verdict $v -QueueLeftSec $(if ($maxAge -gt 0) { [double]$maxAge - [double]$age } else { [double]::PositiveInfinity }))
-                $snapCostSec = [Math]::Max(0.0, ((Get-Date) - $snapT).TotalSeconds)   # adversary r3 A1: what the probe took, so the re-ask below is timed as if it had not run
             }
             if ($null -ne $lease) {
                 $u = Update-QuietLeaseRequest -Lease $lease
@@ -3537,15 +3597,6 @@ function Wait-QuietLeaseAdmission {
                 }
                 else { $state = "lease-pending"; $why = $u.why }
                 if ($null -ne $abandon) {
-                    # adversary r3 A1: the re-ask is LeaseRetrySec after the refusal, not after the request-time slot probe that may have run in this
-                    # iteration (logging must not move an admission time). A child that exited is timed from its ExitTime; any other kind from now less the
-                    # probe's cost. Both are clamped to the request time. Without a probe this iteration, it is exactly Get-Date, as before.
-                    $retryFrom = Get-Date
-                    if ($snapCostSec -gt 0) {
-                        $retryFrom = $retryFrom.AddSeconds(-$snapCostSec)
-                        if ($u.state -eq "exited") { try { $ex = [DateTime]$lease.proc.ExitTime; if ($ex -le (Get-Date)) { $retryFrom = $ex } } catch { } }
-                        if ($retryFrom -lt $lease.requested) { $retryFrom = $lease.requested }
-                    }
                     $null = Stop-QuietLease -Lease $lease -Why "lease $abandon"
                     $lease = $null
                     $script:QuietLeaseWaiting = $null
@@ -3553,7 +3604,7 @@ function Wait-QuietLeaseAdmission {
                     if ($null -ne $script:GateHour) { $script:GateHour.requeued++ }
                     $state = "lease-$abandon"
                     $why = $refusals[$refusals.Count - 1].why
-                    $nextRequestAt = $retryFrom.AddSeconds($LeaseRetrySec)
+                    $nextRequestAt = (Get-Date).AddSeconds($LeaseRetrySec)
                 }
             }
             # maint-dispatch r1 holds in lease mode too: light jobs are not held behind this wait.
@@ -3565,6 +3616,7 @@ function Wait-QuietLeaseAdmission {
                 Add-AgentLogLine "quiet-lease: waiting job=$JobId state=$state why=[$why] waited=$([int]$waited)s requests=$requests requeues=$requeues leasePid=$(if ($null -ne $lease) { $lease.pid } else { 'none' }) $(Get-LeaseWaitHeatField)"
                 $lastLog = Get-Date
             }
+            Update-LeaseSlotSnapshots   # r3: logs a snapshot probe that has exited; never waits
             Write-AgentHeartbeat -Activity "gate-wait job=$JobId state=$state waited=$([int]((Get-Date) - $t0).TotalSeconds)s"
             Start-Sleep -Milliseconds $script:GateLoopSleepMs
         }
@@ -3819,6 +3871,8 @@ function Invoke-QueuedJob {
         & $notAfterAdmitted "pre-launch" $notAfter "at the last check before launch"
         return
     }
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3 (Dot B2): the lease's coverage of the job timeout, re-read from its until= as the child is created.
+    Set-LeaseCoverageAtLaunch -JobId $jobId -Admission $script:Admission -Lease $script:QuietLease -TimeoutSec ([int]$metadata.timeoutSec)
     $launchedPersisted = $false
     try {
         $keepAwakeBeginUtc = (Get-Date).ToUniversalTime().ToString("o")
@@ -3864,6 +3918,7 @@ function Invoke-QueuedJob {
             }
             # quiet-lease r1: renew on cadence (never blocks this loop), and say so in the result if the lease ended mid-job.
             Invoke-QuietLeaseRenewTick
+            Update-LeaseSlotSnapshots   # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: the grant's snapshot probe is logged from here (never waits)
             if (-not $holderLossLogged -and $null -ne $script:QuietLease -and $script:QuietLease.proc.HasExited) {
                 $holderLossLogged = $true
                 $script:Admission | Add-Member -NotePropertyName slotContinuity -NotePropertyValue "lost" -Force
@@ -4000,8 +4055,10 @@ try {
         Invoke-QuarantineReconcile
         # lease-batch r1: renew a parked batch lease, and release it when idle, short or gone.
         Update-LeaseBatchHold
+        # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: a snapshot probe still running when its job ended is logged, or killed at its bound, from here.
+        Update-LeaseSlotSnapshots
 
-        $jobs = Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name
+        $jobs =Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name
         if (@($jobs).Count -eq 0) { Invoke-GateIdleSample }
         foreach ($job in $jobs) {
             # r2d (sol r2c BLOCKER): a job with ANY unresolved marker artifact is never admitted or launched here.
@@ -4035,6 +4092,7 @@ finally {
     # quiet-lease r1: an agent leaving by exception or stop request releases its lease (a hard kill skips this; the lease
     # then goes stale at 120 s for want of a renew, and the next agent's Stop-StaleQuietLeases ends the wrapper).
     if ($agentMutexHeld) { Exit-HeavySlot }
+    if ($agentMutexHeld) { Update-LeaseSlotSnapshots -Abandon "the agent is stopping" }
     if ($agentMutexHeld) { Close-LeaseBatch -Reason "agent-exit" -Why "the agent is stopping" }
     if ($agentMutexHeld) { $agentMutex.ReleaseMutex() }
     $agentMutex.Dispose()

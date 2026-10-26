@@ -95,7 +95,13 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
         # r2 (sol r1 BLOCKER): r1c excluded the slot NUMBER without checking its owner, so a holder that exited
         # during the status probe let another suite's slot be excluded and a heavy job was admitted beside it.
         self.assertIn("-OwnSlot $hs.slot -OwnPid $hs.ownerPid -Label $label", self.code)
-        self.assertIn("$Matches[1] -eq $Label -and [int]$Matches[2] -eq $OwnPid) { $ownSeen = $true; continue }", self.code)
+        # AGENT-LEASE-PENDING-HEAT-TRACE-1 (adversary r3 A2): the holder text is split by ConvertFrom-HeavySlotHolderText (read from the
+        # right, so a label containing "(pid N)" still matches itself); the own slot is still excluded only when BOTH its label and its
+        # owner pid are this holder's, and only when the holder's label and pid are known.
+        self.assertIn("$oh = if ($Label -and $OwnPid -gt 0) { ConvertFrom-HeavySlotHolderText -Text $who } else { $null }", self.code)
+        self.assertIn("if ($null -ne $oh -and $oh.label -eq $Label -and [int]$oh.ownerPid -eq $OwnPid) { $ownSeen = $true; continue }", self.code)
+        self.assertIn("$o.ownLost = $true", self.code)
+        self.assertIn("if ($Text -notmatch '(?s)^(.*) \\(pid (\\d+)((?:, [^,)]*)*)\\)(?: \\[[^\\]]*\\])?\\s*$') { return $null }", self.code)
         self.assertIn('elseif ($occ.ownLost) { $v.state = "holder-lost"', self.code)
         # The holder must still hold the slot AFTER the probe: checked after Invoke-HeavySlotStatus, before any admit.
         acquired = self.code[self.code.index("$status = Invoke-HeavySlotStatus -HeartbeatActivity \"gate-wait job=$JobId state=acquired"):]
