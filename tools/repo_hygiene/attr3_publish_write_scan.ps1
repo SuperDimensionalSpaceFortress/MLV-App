@@ -67,8 +67,12 @@
 # (a hashtable, [ordered] or [pscustomobject] literal; New-Object <Type>; [Type]::new) and nothing else
 # binds the variable. Otherwise it lists, ';'-joined: 'other' (a command or member result, a compound
 # assignment, a foreach variable, a multi-target assignment, [ref]$v, -OutVariable / -ErrorVariable /
-# ... or their aliases and prefixes), 'unbound' (a parameter, or no binding at all), and for a different
-# receiver shape 'nested' (`$a.b.c = ...`), 'scoped' or 'complex'. The origin is data for the caller; this
+# ... or their aliases and prefixes), 'unbound' (a parameter, or no binding at all), 'undominated' (a
+# fresh assignment exists but does not come first in a block that encloses the property set, or lies
+# across a function boundary), 'automatic' (the engine binds the name: $_, $PSItem, $args, ...), and for
+# a different receiver shape 'nested' (`$a.b.c = ...`), 'scoped' or 'complex'. Casts other than
+# [ordered] / [pscustomobject] / [hashtable] around a literal build an instance of that type: 'other'.
+# The origin is data for the caller; this
 # script still decides nothing. Index assignments keep the template rule: any target that is not a plain
 # unscoped non-root variable is a finding. The helpers that ARE the
 # runtime boundary (Publish-AttrCuda*, New-AttrCudaDirectory, Remove-AttrCuda*) legitimately hold the
@@ -294,13 +298,21 @@ function Get-AssignedObjectOrigin($Assignment) {
     # [pscustomobject] literal, an in-memory object nothing else holds), 'constructed:<Type>' (New-Object or
     # [Type]::new), else 'other' (a command result, a parameter default, a compound assignment, ...).
     if ($Assignment.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) { return 'other' }
+    # Only these casts keep a hashtable literal an in-memory PowerShell object; any other target type (`[EventLog]@{...}`)
+    # builds an instance of that type, on the left (`[T]$v = @{...}`) as well as on the right.
+    $literalTypes = @('ordered', 'pscustomobject', 'hashtable')
+    if ($Assignment.Left -is [System.Management.Automation.Language.ConvertExpressionAst] -and
+        $literalTypes -notcontains $Assignment.Left.Type.TypeName.FullName) { return 'other' }
     $node = $Assignment.Right
     while ($true) {
         if ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1) { $node = $node.PipelineElements[0]; continue }
         if ($node -is [System.Management.Automation.Language.CommandExpressionAst]) { $node = $node.Expression; continue }
         break
     }
-    if ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) { $node = $node.Child }
+    if ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) {
+        if ($literalTypes -notcontains $node.Type.TypeName.FullName) { return 'other' }
+        $node = $node.Child
+    }
     if ($node -is [System.Management.Automation.Language.HashtableAst]) { return 'literal' }
     if ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and $node.Static -and
         $node.Member.Extent.Text -ceq 'new' -and $node.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) {
@@ -335,10 +347,30 @@ function Get-ReceiverOrigin($Target, $Root) {
     $v = Get-VariableName $node
     if ($v.scope -ne '') { return 'scoped' }
     if ($depth -gt 1) { return 'nested' }
+    # Variables the engine itself binds (the pipeline's $_ / $PSItem, $args, $input, ...) are never a fresh object.
+    if (@('_', 'PSItem', 'input', 'args', 'this', 'matches', 'Error', 'foreach', 'switch', 'PSBoundParameters', 'MyInvocation',
+          'PSCmdlet', 'ExecutionContext', 'Host', 'PWD', 'PID', 'null', 'true', 'false', 'PSScriptRoot', 'PSCommandPath',
+          'Event', 'EventArgs', 'Sender', 'SourceArgs', 'SourceEventArgs', 'StackTrace', 'LASTEXITCODE') -contains $v.name) { return 'automatic' }
     $assignments = @(Get-AssignmentsTo $Root $v.name)
     $origins = @($assignments | ForEach-Object { Get-AssignedObjectOrigin $_ }) + @(Get-OtherBindings $Root $v.name)
     if ($origins.Count -eq 0) { return 'unbound' }
+    # A receiver is fresh only if an assignment of a fresh object comes first, in a block that encloses the property
+    # set and not across a function boundary; a later, conditional or nested-function assignment says nothing about the
+    # object the property set reaches (it may be a caller's, found by dynamic scope).
+    $freshAssignments = @($assignments | Where-Object { (Get-AssignedObjectOrigin $_) -ne 'other' })
+    if ($freshAssignments.Count -gt 0 -and @($freshAssignments | Where-Object { Test-DominatesSetter $_ $Target }).Count -eq 0) { $origins += 'undominated' }
     return (@($origins | Sort-Object -Unique) -join ';')
+}
+
+function Test-DominatesSetter($Assignment, $Setter) {
+    $block = $Assignment.Parent
+    if ($block -isnot [System.Management.Automation.Language.StatementBlockAst] -and $block -isnot [System.Management.Automation.Language.NamedBlockAst]) { return $false }
+    if ($Assignment.Extent.EndOffset -gt $Setter.Extent.StartOffset) { return $false }
+    for ($cursor = $Setter.Parent; $null -ne $cursor; $cursor = $cursor.Parent) {
+        if ([object]::ReferenceEquals($cursor, $block)) { return $true }
+        if ($cursor -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false }
+    }
+    return $false
 }
 
 function Get-OtherBindings($Root, [string]$Name) {
@@ -352,16 +384,16 @@ function Get-OtherBindings($Root, [string]$Name) {
         if ($node -is [System.Management.Automation.Language.ParameterAst]) {
             if ($node.Name.VariablePath.UserPath -ieq $Name) { $tags.Add('unbound') }
         } elseif ($node -is [System.Management.Automation.Language.ForEachStatementAst]) {
-            if ($node.Variable.VariablePath.UserPath -ieq $Name) { $tags.Add('other') }
+            if ((Get-VariableName $node.Variable).name -ieq $Name) { $tags.Add('other') }
         } elseif ($node -is [System.Management.Automation.Language.AssignmentStatementAst]) {
             $left = $node.Left
             if ($left -is [System.Management.Automation.Language.ArrayLiteralAst] -or $left -is [System.Management.Automation.Language.ParenExpressionAst]) {
-                $bound = @($left.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and $n.VariablePath.UserPath -ieq $Name }, $true))
+                $bound = @($left.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and (Get-VariableName $n).name -ieq $Name }, $true))
                 if ($bound.Count -gt 0) { $tags.Add('other') }
             }
         } elseif ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) {
             if ($node.Type.TypeName.FullName -ieq 'ref' -and $node.Child -is [System.Management.Automation.Language.VariableExpressionAst] -and
-                $node.Child.VariablePath.UserPath -ieq $Name) { $tags.Add('other') }
+                (Get-VariableName $node.Child).name -ieq $Name) { $tags.Add('other') }
         } elseif ($node -is [System.Management.Automation.Language.CommandAst]) {
             $elements = $node.CommandElements
             for ($i = 1; $i -lt $elements.Count; $i++) {
@@ -371,7 +403,8 @@ function Get-OtherBindings($Root, [string]$Name) {
                 $value = $element.Argument
                 if ($null -eq $value -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $value = $elements[$i + 1] }
                 if ($value -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
-                    if (([string]$value.Value).TrimStart('+') -ieq $Name) { $tags.Add('other') }
+                    # -PipelineVariable local:r / -OutVariable +r name the variable without its scope or its append marker.
+                    if ((([string]$value.Value).TrimStart('+') -replace '^[A-Za-z]+:', '') -ieq $Name) { $tags.Add('other') }
                 } else {
                     $tags.Add('other')
                 }
@@ -676,7 +709,7 @@ function Get-SpliceModuleBinding($Call, [string]$SourceDir) {
         break
     }
     $dynamic = [pscustomobject]@{ kind = 'dynamic'; path = ''; reason = '' }
-    if ($node -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $node.Splatted -and $node.VariablePath.UserPath -ceq 'null') {
+    if ($node -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $node.Splatted -and $node.VariablePath.UserPath -ieq 'null') {
         return [pscustomobject]@{ kind = 'default'; path = ''; reason = '' }
     }
     $child = $null
@@ -688,10 +721,10 @@ function Get-SpliceModuleBinding($Call, [string]$SourceDir) {
         try { return [pscustomobject]@{ kind = 'path'; path = [IO.Path]::GetFullPath([string]$node.Value); reason = '' } }
         catch { return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = '-ModulePath is not a valid path' } }
     }
-    if ($node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ceq 'Join-Path' -and $node.InvocationOperator -eq 'Unknown') {
+    if ($node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ieq 'Join-Path' -and $node.InvocationOperator -eq 'Unknown') {
         $parts = @($node.CommandElements | Select-Object -Skip 1)
         if ($parts.Count -eq 2 -and @($parts | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] }).Count -eq 0 -and
-            $parts[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and $parts[0].VariablePath.UserPath -ceq 'PSScriptRoot' -and
+            $parts[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and $parts[0].VariablePath.UserPath -ieq 'PSScriptRoot' -and
             $parts[1] -is [System.Management.Automation.Language.StringConstantExpressionAst] -and -not [string]::IsNullOrWhiteSpace([string]$parts[1].Value)) {
             $child = [string]$parts[1].Value
         }
@@ -761,7 +794,8 @@ if ($SpliceSource.Count -gt 0) {
     $entries = [ordered]@{}
     # The module the extractor reads when a call names no -ModulePath is the module that defines the extractor
     # ($script:AttrCudaModulePath). When no -ModulePath module defines it (a fixture), every module is a candidate.
-    $extractorModules = @($moduleTexts.Keys | Where-Object { $moduleTexts[$_] -match '(?m)^function\s+Get-AttrCudaEmbeddedFunctionSource\s*\{' })
+    # Found by parsing, not by text, so a comment or a here-string that merely contains the definition does not count.
+    $extractorModules = @($moduleTexts.Keys | Where-Object { @(Get-ModuleFunctionNames $moduleFullPaths[$_]) -contains 'Get-AttrCudaEmbeddedFunctionSource' })
     foreach ($spliceSource in $SpliceSource) {
         foreach ($site in @(Get-SpliceCallSites $spliceSource)) {
             # Bind the call to the module(s) the extractor will really read, so a same-named helper in another

@@ -744,6 +744,20 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         ("L1MultiTarget", "    param([string]$Target)\n    $r = @{}\n    $x, $r = Get-Item -LiteralPath $Target\n    $r.Attributes = 'Hidden'"),
         ("L1Ref", "    $r = @{}\n    $null = [int]::TryParse('1', [ref]$r)\n    $r.Attributes = 'Hidden'"),
         ("L1ParamAlso", "    param($r)\n    $r = @{}\n    $r.Attributes = 'Hidden'"),
+        # Adversary round 2. A1: automatic pipeline variables; A2: scope-qualified binders; A3: a type conversion is not a
+        # literal; A4: an assignment must come first, in an enclosing block, outside any nested function.
+        ("L1AutoUnderscore", "    param($Target)\n    $_ = @{}\n    Get-Item -LiteralPath $Target | ForEach-Object { $_.Attributes = 'Hidden' }"),
+        ("L1AutoPSItem", "    param($Target)\n    $PSItem = @{}\n    Get-Item -LiteralPath $Target | ForEach-Object { $PSItem.Attributes = 'Hidden' }"),
+        ("L1ScopedForeach", "    param($Target)\n    $r = @{}\n    foreach ($local:r in (Get-Item -LiteralPath $Target)) { $r.Attributes = 'Hidden' }"),
+        ("L1ScopedPipeVar", "    param($Target)\n    $r = @{}\n    Get-Item -LiteralPath $Target -PipelineVariable local:r | ForEach-Object { $r.Attributes = 'Hidden' }"),
+        ("L1CastRhs", "    $r = [System.Diagnostics.EventLog]@{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        ("L1CastLhs", "    [System.Diagnostics.EventLog]$r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        ("L1NestedAssign", "    function G { $r = @{} }\n    $r.Attributes = 'Hidden'"),
+        ("L1LateAssign", "    $r.Attributes = 'Hidden'\n    $r = @{}"),
+        ("L1ConditionalAssign", "    param($Cond)\n    if ($Cond) { $r = @{} }\n    $r.Attributes = 'Hidden'"),
+        ("L1SetterInNestedFunction", "    $r = @{}\n    function G { $r.Attributes = 'Hidden' }"),
+        # Still fresh: the assignment comes first in an enclosing block, and the setter sits in a deeper block or script block.
+        ("L1FreshNested", "    $r = [ordered]@{}\n    if ($true) { $r.a = 1 }\n    $sb = { $r.b = 2 }"),
     ]
 
     # Adversary A8 (same class as A3): template shapes that name a parameter by alias or abbreviation.
@@ -791,9 +805,9 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         ], extra_files=[("sub/Clean.psm1", [("CollideSub", cls.RAW_WRITE)])])
         # The extractor's own module is on the list, so a call that names no -ModulePath reads exactly that module.
         cls.l2_default = cls._scan("l2-default", [
-            ("Extractor.psm1", [("Get-AttrCudaEmbeddedFunctionSource", "    param($Name)"), ("DefHelper", cls.CLEAN), ("AbbrevM", cls.CLEAN), ("NameAbbrev", cls.CLEAN)]),
-            ("Dirty.psm1", [("DefHelper", cls.RAW_WRITE), ("DirtyOnly", cls.RAW_WRITE), ("AbbrevM", cls.RAW_WRITE), ("EmptyOnly", cls.RAW_WRITE)]),
-        ], ["Extractor.psm1", "Dirty.psm1"], [
+            ("Extractor.psm1", [("Get-AttrCudaEmbeddedFunctionSource", "    param($Name)"), ("DefHelper", cls.CLEAN), ("AbbrevM", cls.CLEAN), ("NameAbbrev", cls.CLEAN), ("CaseRoot", cls.CLEAN)]),
+            ("Dirty.psm1", [("DefHelper", cls.RAW_WRITE), ("DirtyOnly", cls.RAW_WRITE), ("AbbrevM", cls.RAW_WRITE), ("EmptyOnly", cls.RAW_WRITE), ("CaseRoot", cls.RAW_WRITE)]),
+        ], ["Extractor.psm1", "Dirty.psm1", "Notes.psm1"], [
             "Get-AttrCudaEmbeddedFunctionSource -Name @('DefHelper')",
             "Get-AttrCudaEmbeddedFunctionSource -Name @('DirtyOnly')",
             # A3: PowerShell binds -M to -ModulePath and -N to -Name (unique prefixes).
@@ -803,12 +817,17 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
             "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath ''",
             "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath ' '",
             "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath $null",
-        ])
+            # Round 2 A5: PowerShell variable and command names are case-insensitive.
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath $NULL",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('CaseRoot') -ModulePath (join-path $psscriptroot 'Dirty.psm1')",
+        ], raw_modules={"Notes.psm1": "<#\nfunction Get-AttrCudaEmbeddedFunctionSource {\n}\n#>\n"})
 
     @classmethod
-    def _scan(cls, label: str, modules: list, on_list: list, calls: list, *, extra_files=(), template_extra: str = "") -> dict:
+    def _scan(cls, label: str, modules: list, on_list: list, calls: list, *, extra_files=(), template_extra: str = "", raw_modules=None) -> dict:
         directory = cls.tmp / label
         directory.mkdir()
+        for file_name, text in (raw_modules or {}).items():
+            (directory / file_name).write_text(text, encoding="utf-8")
         # extra_files are written but NOT given to the scan (-ModulePath): the files the job would read and the scan does not.
         for file_name, functions in list(modules) + list(extra_files):
             target = directory / file_name
@@ -878,6 +897,20 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
             found = self.of(self.l1, name)
             self.assertIn(("R5", "$r.Attributes"), self.unlisted(found), f"{name}\n" + describe(found))
 
+    def test_l1_automatic_variables_scope_qualified_binders_conversions_and_unordered_assignments_are_not_fresh(self) -> None:
+        for name in ("L1AutoUnderscore", "L1AutoPSItem", "L1ScopedForeach", "L1ScopedPipeVar", "L1NestedAssign", "L1LateAssign",
+                     "L1ConditionalAssign", "L1SetterInNestedFunction"):
+            found = self.of(self.l1, name)
+            self.assertTrue([k for k in self.unlisted(found) if k[0] == "R5"], f"{name} was judged fresh\n" + describe(found))
+        for name in ("L1CastRhs", "L1CastLhs"):
+            found = self.of(self.l1, name)
+            self.assertIn(("R5", "$r.MaximumKilobytes"), self.unlisted(found), f"{name}\n" + describe(found))
+
+    def test_l1_an_assignment_that_comes_first_in_an_enclosing_block_still_makes_a_receiver_fresh(self) -> None:
+        found = self.of(self.l1, "L1FreshNested")
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal", "literal"], describe(found))
+        self.assertEqual([k for k in self.unlisted(found) if k[0] == "R5"], [])
+
     def test_l1_template_parameters_named_by_alias_or_abbreviation_are_still_judged(self) -> None:
         # Advisory A8, same class as A3: -RSO / -RSE are aliases of Start-Process -RedirectStandardOutput / -Error, -N: abbreviates -Name.
         texts = " | ".join(v["text"] for v in self.l1["violations"])
@@ -946,8 +979,16 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
 
     def test_l2_an_empty_blank_or_null_module_path_is_the_default_module(self) -> None:
         found = self.of(self.l2_default, "EmptyOnly")
-        self.assertEqual([(f["rule"], f["function"]) for f in found], [("splice", "EmptyOnly")] * 3, describe(found))
+        self.assertEqual([(f["rule"], f["function"]) for f in found], [("splice", "EmptyOnly")] * 4, describe(found))  # '', ' ', $null, $NULL
         self.assertEqual(self.modules_of(self.l2_default, "EmptyOnly"), [])
+
+    def test_l2_variable_and_command_names_in_a_module_path_are_case_insensitive(self) -> None:
+        self.assertEqual(self.modules_of(self.l2_default, "CaseRoot"), ["Dirty.psm1"], json.dumps(self.l2_default["spliced"], indent=2))
+
+    def test_l2_a_comment_that_mentions_the_extractor_does_not_make_a_second_default_module(self) -> None:
+        # Notes.psm1 holds the extractor's definition inside a block comment only; DefHelper still resolves to Extractor.psm1.
+        self.assertEqual(self.modules_of(self.l2_default, "DefHelper"), ["Extractor.psm1"])
+        self.assertEqual([f for f in self.l2_default["splicedViolations"] if f["rule"] == "splice" and "default module is ambiguous" in f["reason"]], [])
 
     def test_l2_without_a_module_path_the_call_reads_the_extractors_own_module(self) -> None:
         self.assertEqual(self.modules_of(self.l2_default, "DefHelper"), ["Extractor.psm1"])
