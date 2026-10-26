@@ -1892,18 +1892,24 @@ namespace MlvApp.Agent {
         private readonly object _gate = new object();
         private readonly System.Diagnostics.Process _proc;
         private readonly System.Diagnostics.Stopwatch _clock;
+        private readonly System.Threading.Tasks.Task _out;
+        private readonly System.Threading.Tasks.Task _err;
         private System.Threading.Timer _timer;
         private bool _disarmed;
         private long _killedAtMs = -1;
-        public LeaseProbeWatchdog(System.Diagnostics.Process proc, System.Diagnostics.Stopwatch clock, long dueMs) {
+        public LeaseProbeWatchdog(System.Diagnostics.Process proc, System.Diagnostics.Stopwatch clock, long dueMs, System.Threading.Tasks.Task stdout, System.Threading.Tasks.Task stderr) {
             _proc = proc;
             _clock = clock;
+            _out = stdout;
+            _err = stderr;
             _timer = new System.Threading.Timer(Fire, null, dueMs < 0 ? 0 : dueMs, System.Threading.Timeout.Infinite);
         }
         private void Fire(object state) {
             lock (_gate) {
                 try {
-                    if (_disarmed || _proc.HasExited) { return; }
+                    // adversary r5-2ca9f68f A1: the probe is done only when its root has exited AND its output pipes are closed; a root that exited
+                    // leaving a child holding them is not, and Kill(true) on an exited root still ends that child.
+                    if (_disarmed || (_proc.HasExited && _out.IsCompleted && _err.IsCompleted)) { return; }
                     long age = _clock.ElapsedMilliseconds;
                     _proc.Kill(true);
                     _killedAtMs = age;
@@ -2211,7 +2217,7 @@ function Add-LeaseSlotSnapshot {
         $bound = if ($script:LeaseSnapshotProbeSec -gt 0) { [double]$script:LeaseSnapshotProbeSec } else { 30.0 }
         $dog = $null
         $dogType = 'MlvApp.Agent.LeaseProbeWatchdog' -as [type]
-        if ($null -ne $dogType) { try { $dog = $dogType::new($call.proc, $clock, [long][Math]::Ceiling($bound * 1000.0 - $clock.Elapsed.TotalMilliseconds)) } catch { $dog = $null } }
+        if ($null -ne $dogType) { try { $dog = $dogType::new($call.proc, $clock, [long][Math]::Ceiling($bound * 1000.0 - $clock.Elapsed.TotalMilliseconds), $call.out, $call.err) } catch { $dog = $null } }
         $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = $JobId; phase = $Phase; call = $call; clock = $clock; dog = $dog })
     }
     catch {
@@ -2236,10 +2242,12 @@ function Update-LeaseSlotSnapshots {
             $st = $null
             $el = $s.clock.Elapsed.TotalSeconds
             $dog = $s.dog
-            $exited = $s.call.proc.HasExited   # read BEFORE the watchdog's record: a kill it made before this read is then always seen below
+            # read BEFORE the watchdog's record: a kill it made before this read is then always seen below. Done = the root exited AND its pipes
+            # closed (adversary r5-2ca9f68f A1: a root that exited leaving a child holding them is still running).
+            $done = $s.call.proc.HasExited -and $s.call.out.IsCompleted -and $s.call.err.IsCompleted
             $killedMs = if ($null -ne $dog) { [long]$dog.KilledAtMs } else { [long]-1 }
             if ($killedMs -ge 0) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = [string]::Format($inv, "timeout {0} s; killed at {1:F1} s", [long]$bound, $killedMs / 1000.0) } }
-            elseif ($el -ge $bound) { $how = if ($exited) { "seen" } else { "killed" }; Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = [string]::Format($inv, "timeout {0} s; {1} at {2:F1} s", [long]$bound, $how, $el) } }
+            elseif ($el -ge $bound) { $how = if ($done) { "seen" } else { "killed" }; Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = [string]::Format($inv, "timeout {0} s; {1} at {2:F1} s", [long]$bound, $how, $el) } }
             elseif ($s.call.proc.HasExited -and $s.call.out.IsCompleted -and $s.call.err.IsCompleted) {
                 $r = Receive-HeavySlotCli -Call $s.call
                 $lines = @(([string]$r.stdout) -split "`r?`n" | Where-Object { $_ -ne "" })
@@ -3031,9 +3039,11 @@ function Receive-HeavySlotCli {
 
 function Stop-HeavySlotCli {
     # Kills a call that did not return in time (its whole tree) and disposes it.
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r5 (adversary r5-2ca9f68f A1): the tree is killed even when its root has exited, so a child the root left
+    # running (holding the call's output pipes) does not outlive it; Kill(true) on an exited root still ends its children.
     param($Call)
     if ($null -eq $Call -or -not $Call.ok) { return }
-    try { if (-not $Call.proc.HasExited) { $Call.proc.Kill($true) } } catch { }
+    try { $Call.proc.Kill($true) } catch { }
     try { [void]$Call.proc.WaitForExit(2000) } catch { }
     try { $Call.proc.Dispose() } catch { }
 }
