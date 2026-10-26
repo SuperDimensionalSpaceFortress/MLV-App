@@ -6,6 +6,7 @@ Chief-of-Staff (CoS) stays advisory (bus RULINGS.md R18.1), and the adversary pa
 | file | what it is |
 |---|---|
 | `adversary-pass-prompt.md` | Template for ONE read-only contract-attack pass on an exact local head: list the invariants, build accepted inputs that break each, cite file:line, sweep the class. Only blocker/major findings that the diff introduced are actionable; minor and pre-existing ones are advisories. |
+| `Render-AdversaryPrompt.ps1` | Fills the template for one exact head in a single pass. A value that lands inside a command the reviewer runs (the worktree path, the `base...head` range) is rendered as a PowerShell single-quoted literal by the script, so `$name`, quotes, backticks and `;` in a path reach git unchanged. It refuses a blank or control-character path, a head that is not 40 lowercase hex, and a base that starts with `-`. |
 
 No meter ships here. Classifying free-form CoS prose as blocked or clean did not converge over five review rounds, so
 each project counts its own lift from its own review evidence (below) until the CoS writes a machine-readable verdict
@@ -15,7 +16,7 @@ line. A shared meter is proposed again only once that line exists.
 
 Before `gh pr create`, and before any push to an open PR:
 
-1. Commit. Fill the template for the exact local head (`git rev-parse HEAD`) and the diff base, and hand it to ONE
+1. Commit. Fill the template with `Render-AdversaryPrompt.ps1` for the exact local head (`git rev-parse HEAD`) and the diff base, and hand it to ONE
    read-only reviewer. A different provider family from the author is preferred. The same family is allowed when that
    provider is dark, because the provider choice is a preference and not a gate.
 2. For each actionable finding: write a test that is RED on the head, fix it, and fix every sibling site the report
