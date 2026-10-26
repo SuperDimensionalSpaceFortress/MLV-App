@@ -5725,7 +5725,7 @@ class VenueQuietAttributionTests(unittest.TestCase):
     QUIET_SAMPLES = [10.0, 10.0, 10.0]
 
     def probe(self, cores: list, samples: list | None = None) -> dict:
-        return dict(json.loads(json.dumps(V2_PROBE)), samples=samples or self.QUIET_SAMPLES, cores=cores)
+        return dict(json.loads(json.dumps(V2_PROBE)), samples=self.QUIET_SAMPLES if samples is None else samples, cores=cores)
 
     def percore_lines(self, proc: subprocess.CompletedProcess) -> list:
         return [ln for ln in proc.stdout.splitlines() if ln.startswith("  percore ")]
@@ -5815,6 +5815,35 @@ class VenueQuietAttributionTests(unittest.TestCase):
         on = self.gate(V1_PROBE, "-PerCoreEnforce")
         self.assertRegex(on.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
         self.assertIn("would_block=null reason=no-cores", on.stdout)
+
+    def test_the_probe_fixture_keeps_an_explicit_empty_sample_list(self) -> None:
+        self.assertEqual(self.probe([], samples=[])["samples"], [], "an explicit empty list is not 'use the default'")
+        self.assertEqual(self.probe([])["samples"], self.QUIET_SAMPLES)
+
+    def test_a_core_bearing_v1_probe_logs_the_observation_with_enforcement_off(self) -> None:
+        # sol r3 V-02: the observation was gated on schema v2, so a v1 probe that carries cores[] logged nothing while the header promises one line per cores[] probe
+        v1 = {"schema": "mlv-app/venue-quiet-probe/v1", "host": "BACHELOR", "samples": [10, 10, 10], "cores": _pc_cores(self.HOT)}
+        proc = self.gate(v1)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% ", "off: logged only, the verdict is the mean's")
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=false threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true"])
+
+    def test_an_unavailable_probe_logs_one_typed_null_observation_when_enforcing(self) -> None:
+        # sol r3 V-02: a failed probe left probe = $null, so no observation at all; it must be one null line with a typed reason, and the verdict stays UNKNOWN (exit 6)
+        import os
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                               "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1", "-PerCoreEnforce"],
+                              capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_LINE="{ not json"))
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=true threshold=60.0% busiest_fast_core=n/a busiest_fast_pct=n/a would_block=null reason=no-probe"])
+        self.assertIn("VENUE_QUIET_UNKNOWN", proc.stdout)
+        off = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                              "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1"],
+                             capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_LINE="{ not json"))
+        self.assertEqual(off.returncode, 6, off.stdout + off.stderr)
+        self.assertEqual(self.percore_lines(off), [], "off and no cores[] to report: nothing to log")
 
     def test_the_mean_rule_still_wins_when_the_mean_is_busy(self) -> None:
         proc = self.gate(self.probe(_pc_cores(self.COOL), samples=[50.0, 50.0, 50.0]), "-PerCoreEnforce")

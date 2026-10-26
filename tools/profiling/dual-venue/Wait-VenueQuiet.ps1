@@ -79,11 +79,12 @@
 #          -PerCoreThresholdPercent <n>   default 60: above the 47 % busiest core of the cool wait and below the 66 % of the first hot one. A core is hot at busiest >= threshold.
 #          -PerCoreEnforce                the check blocks: a mean-QUIET probe whose busiest fast core is at or over the threshold is BUSY (the PROBE line ends `note=percore core=<instance>
 #                                         percent=<p>%`, the final verdict is COOLDOWN_UNMET and a `  percore blocked core=<instance> percent=<p>% threshold=<t>%` line names the core).
-#        EVERY probe that carries cores[] (and every probe at all once -PerCoreEnforce is on, an UNKNOWN one included) prints ONE line right after its `  raw` line, whatever the switch says:
+#        EVERY probe that carries cores[] (whatever its schema), every v2 probe, and every probe at all once -PerCoreEnforce is on (an UNKNOWN one included, and an unavailable one:
+#        reason no-probe) prints ONE line right after its `  raw` line, whatever the switch says:
 #          `  percore enabled=<bool> threshold=<t>% busiest_fast_core=<instance|n/a> busiest_fast_pct=<p>%|n/a would_block=<true|false|null>[ reason=<code>]`
 #        <instance> is the probe's `<group>,<core>` with the comma written as `_` (gate text is comma-free, as for every other line the run-local drivers split).
 #        would_block is what the check says about that probe; with the switch OFF it changes nothing, so the log measures how often enforcing would have fired before anyone turns it on.
-#        UNKNOWN IS NULL, NEVER FALSE, AND NEVER A BLOCK: would_block=null with reason no-cores (no cores[] rows), core-class-unknown (a row whose class is not P / E / uniform, so it
+#        UNKNOWN IS NULL, NEVER FALSE, AND NEVER A BLOCK: would_block=null with reason no-probe (the probe itself was unavailable), no-cores (no cores[] rows), core-class-unknown (a row whose class is not P / E / uniform, so it
 #        might be a fast core), invalid-core-row (a null entry in cores[]), incomplete-samples (a fast or unknown-class row flagged incomplete, with validSamples < totalSamples, or with a
 #        non-numeric count), cores-omitted (the probe omitted a core for having no
 #        valid sample: notes.cores_omitted) or invalid-core-percent (a non-numeric, array or out-of-range
@@ -1307,6 +1308,7 @@ function Test-PerCoreNumber($v) { $v -is [double] -or $v -is [int] -or $v -is [l
 function Get-VenuePerCoreVerdict($Probe, [double]$Threshold, [bool]$Enabled) {
     $r = [ordered]@{ enabled = $Enabled; threshold = $Threshold; busiest_fast_core = $null; busiest_fast_percent = $null; would_block = $null; reason = $null }
     try {
+        if ($null -eq $Probe) { $r.reason = 'no-probe'; return [pscustomobject]$r }
         if ($null -eq $Probe.cores) { $r.reason = 'no-cores'; return [pscustomobject]$r }
         $all = @($Probe.cores)
         $rows = @($all | Where-Object { $null -ne $_ })
@@ -1386,7 +1388,8 @@ while ($true) {
     # BUSIEST FAST CORE: always evaluated for a v2 probe (or any probe once enforcing) so the line can be logged; it changes the decision only under -PerCoreEnforce, only for a
     # mean-QUIET probe, and only on a measured would_block = $true (null is unknown and never blocks).
     $pc = $null; $pcBlocked = $false; $pcNote = ''
-    if ($null -ne $probe -and ($PerCoreEnforce -or [string]$probe.schema -ceq 'mlv-app/venue-quiet-probe/v2')) { $pc = Get-VenuePerCoreVerdict $probe $PerCoreThresholdPercent ([bool]$PerCoreEnforce) }
+    # Eligible = the probe carries cores[] (whatever its schema) or is v2, or enforcement is on (an unavailable probe then gets one typed-null line). The schema version is not the gate.
+    if ($PerCoreEnforce -or ($null -ne $probe -and ($null -ne $probe.cores -or [string]$probe.schema -ceq 'mlv-app/venue-quiet-probe/v2'))) { $pc = Get-VenuePerCoreVerdict $probe $PerCoreThresholdPercent ([bool]$PerCoreEnforce) }
     if ($PerCoreEnforce -and $d.state -ceq 'QUIET' -and $null -ne $pc -and $pc.would_block -eq $true) {
         $d = [pscustomobject]@{ state = 'BUSY'; mean = $d.mean }
         $pcBlocked = $true
