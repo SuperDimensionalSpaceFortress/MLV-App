@@ -768,6 +768,14 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
                         "    $r = New-Object System.Diagnostics.ProcessStartInfo\n    $r.Attributes = 2"),
         # Still fresh: a script block handed to a command runs in line.
         ("L1InlineBlock", "    $r = [ordered]@{}\n    1 | ForEach-Object { $r.a = $_ }"),
+        # r4 (adversary r3 A3 = Dot B4): a typed parameter named WITH a scope qualifier binds the same variable, so the
+        # hashtable assigned after it is converted to the parameter's type (an EventLog) and the setter writes the log.
+        ("L1TypedLocal", "    param([System.Diagnostics.EventLog]$local:r)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        ("L1TypedScript", "    param([System.Diagnostics.EventLog]$script:r)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        ("L1TypedPrivate", "    param([System.Diagnostics.EventLog]$private:r)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        ("L1TypedGlobal", "    param([System.Diagnostics.EventLog]$global:r)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        # Control: a scoped parameter with ANOTHER name does not touch $r, which stays a fresh literal.
+        ("L1TypedOther", "    param([System.Diagnostics.EventLog]$local:other)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
     ]
 
     # Adversary A8 (same class as A3): template shapes that name a parameter by alias or abbreviation.
@@ -849,8 +857,8 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         # r3 (Dot B1): the colon form `-Name:Join-Path` keeps the name in the parameter's own Argument, so a scan that read
         # only the command's string elements never saw it. One scan covers every spelling, computed name and provider route.
         cls.alias = cls._scan("alias", [
-            ("Clean.psm1", [(n, cls.CLEAN) for n in ("DotF", "QualF", "DriveF", "RootF")]),
-            ("Dirty.psm1", [(n, cls.RAW_WRITE) for n in ("DotF", "QualF", "DriveF", "RootF")]),
+            ("Clean.psm1", [(n, cls.CLEAN) for n in ("DotF", "QualF", "DriveF", "RootF", "RenF")]),
+            ("Dirty.psm1", [(n, cls.RAW_WRITE) for n in ("DotF", "QualF", "DriveF", "RootF", "RenF")]),
         ], ["Clean.psm1", "Dirty.psm1"], [
             "Get-AttrCudaEmbeddedFunctionSource -Name 'DotF' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')",
             # Third-pass adversary A2 / A3: a module-qualified extractor runs another module's extractor, and a drive-relative
@@ -858,6 +866,8 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
             "Dirty\\Get-AttrCudaEmbeddedFunctionSource -Name 'QualF'",
             "Get-AttrCudaEmbeddedFunctionSource -Name 'DriveF' -ModulePath 'C:Clean.psm1'",
             "Get-AttrCudaEmbeddedFunctionSource -Name 'RootF' -ModulePath '\\Clean.psm1'",
+            # r4 (A1): the rename in the preamble (`-NewName ('Join-Path')`) makes runtime read Dirty.psm1 here.
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'RenF' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')",
         ], generator_preamble=cls.ALIAS_PREAMBLE, template_extra=cls.ALIAS_TEMPLATE)
 
     # Every line is its own finding, found again by its exact text. Redirect is the Dot counterexample's replacement command.
@@ -898,6 +908,21 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Rename-Item -LiteralPath function:Redirect -NewName Join-Path",
         "Rename-Item -LiteralPath alias:RedirectAlias -NewName:Split-Path",
         "Move-Item function:Redirect New-Object",
+        # r4 (adversary r3 A1 = Dot B2): a constant wrapped in parentheses, a sub-expression, a cast or a concatenation is still
+        # a constant, and a source or new name written that way is the same rename.
+        "Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path')",
+        "Rename-Item -LiteralPath ('function:Redirect') -NewName Split-Path",
+        "Rename-Item -LiteralPath function:Redirect -NewName:$('Split-Path')",
+        "Move-Item function:Redirect (('New-' + 'Object'))",
+        "Rename-Item -LiteralPath function:Redirect -NewName ([string]'Join-Path')",
+        "Copy-Item -LiteralPath function:Redirect -Destination ('function:Join-Path')",
+    )
+    # r4: a rename or move that touches the function: / alias: drive, or names an evaluated command, with an operand the scan cannot
+    # reduce to a constant, could be installing a shadow: it fails closed, in a kind of its own.
+    RENAME_COMPUTED = (
+        "Rename-Item -LiteralPath function:Redirect -NewName ($renameBase + '-Path')",
+        "Move-Item function:Redirect $moveTarget",
+        "Rename-Item -LiteralPath $renameSource -NewName 'Join-Path'",
     )
     # Not shadows: the alias is for a command the scan does not evaluate, and a read of an unrelated function.
     ALIAS_CONTROLS = (
@@ -905,13 +930,16 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "New-Alias -Name:'Get-Thing' -Value Get-Date",
         "Get-Item -Path function:Get-Date",
         "Rename-Item -LiteralPath function:Redirect -NewName Other-Name",
+        "Rename-Item -LiteralPath function:Redirect -NewName ('Other-Name')",
+        "Move-Item -LiteralPath $someFile -Destination $someFolder -Force",
     )
     ALIAS_PREAMBLE = ("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
-                      + "".join(f"{line}\n" for line in ALIAS_SHADOWS + ALIAS_COMPUTED + PROVIDER_ROUTES + ALIAS_CONTROLS))
+                      + "".join(f"{line}\n" for line in ALIAS_SHADOWS + ALIAS_COMPUTED + PROVIDER_ROUTES + RENAME_COMPUTED + ALIAS_CONTROLS))
     # The template is held to the same rule; only the colon-form lines (the ones the old scan missed) go in it.
     # Advisory A4 (same class): a mutator's positional source path after -vb must not be read as that switch's value.
     ALIAS_TEMPLATE = ("Set-Alias -Name:Join-Path -Value:Redirect\nNew-Alias -N:'New-Object' -Value:Redirect\nSet-Alias -Name:$templateName -Value:Redirect\n"
-                      "Set-Alias -Name:Get-Item -Value:Get-Date\nExpand-Archive -DestinationPath $Work -vb 'C:\\archive.zip'\n")
+                      "Set-Alias -Name:Get-Item -Value:Get-Date\nExpand-Archive -DestinationPath $Work -vb 'C:\\archive.zip'\n"
+                      "Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path')\nMove-Item function:Redirect $moveTarget\n")
 
     @classmethod
     def _scan(cls, label: str, modules: list, on_list: list, calls: list, *, extra_files=(), template_extra: str = "", raw_modules=None,
@@ -998,6 +1026,15 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
             found = self.of(self.l1, name)
             self.assertIn(("R5", "$r.MaximumKilobytes"), self.unlisted(found), f"{name}\n" + describe(found))
 
+    def test_r4_a3_a_typed_parameter_named_with_a_scope_qualifier_is_the_same_variable_so_the_receiver_is_not_fresh(self) -> None:
+        # Adversary r3 A3 / Dot B4: `param([EventLog]$local:r)` binds $r; the hashtable assigned later is converted to an EventLog.
+        for name in ("L1TypedLocal", "L1TypedScript", "L1TypedPrivate", "L1TypedGlobal"):
+            found = self.of(self.l1, name)
+            self.assertIn(("R5", "$r.MaximumKilobytes"), self.unlisted(found), f"{name} was judged a literal\n" + describe(found))
+            self.assertIn("unbound", [o for f in found if f["rule"] == "R5" for o in f["origin"].split(";")], f"{name}\n" + describe(found))
+        found = self.of(self.l1, "L1TypedOther")
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+
     def test_l1_an_assignment_that_comes_first_in_an_enclosing_block_still_makes_a_receiver_fresh(self) -> None:
         found = self.of(self.l1, "L1FreshNested")
         self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
@@ -1064,6 +1101,22 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         texts = " | ".join(self.alias_texts())
         for line in self.ALIAS_CONTROLS:
             self.assertNotIn(line, texts, f"`{line}` is not a shadow\n" + describe(self.alias["splicedViolations"]))
+
+    def test_r4_a1_a_parenthesized_rename_operand_still_ends_in_a_shadow_finding_while_the_call_resolves_to_the_clean_module(self) -> None:
+        # Adversary r3 A1 / Dot B2, end to end: runtime Join-Path returns Dirty.psm1 after the rename; the scan binds Clean.psm1.
+        self.assertIn("Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path')", self.alias_texts(), describe(self.alias["splicedViolations"]))
+        self.assertEqual(self.modules_of(self.alias, "RenF"), ["Clean.psm1"])
+
+    def test_r4_a1_a_rename_or_move_with_an_operand_the_scan_cannot_reduce_to_a_constant_fails_closed(self) -> None:
+        by_text = {f["text"]: f for f in self.alias_findings()}
+        for line in self.RENAME_COMPUTED:
+            self.assertIn(line, by_text, f"no finding for the computed rename operand in `{line}`\n" + describe(self.alias["splicedViolations"]))
+            self.assertIn("not a string constant", by_text[line]["reason"], line)
+
+    def test_r4_a1_the_template_is_held_to_the_same_rename_rule(self) -> None:
+        shadows = {v["text"] for v in self.alias["violations"] if "shadow" in v["reason"] or "not a string constant" in v["reason"]}
+        for line in ("Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path')", "Move-Item function:Redirect $moveTarget"):
+            self.assertIn(line, shadows, f"template line `{line}` was not flagged\n" + json.dumps(self.alias["violations"], indent=2))
 
     def test_b1_the_template_is_held_to_the_same_rule(self) -> None:
         shadows = {v["text"]: v for v in self.alias["violations"] if "shadow" in v["reason"]}
@@ -1172,6 +1225,69 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         # At run time the extractor throws for a name its own module does not define; the scan must not find it elsewhere.
         self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2_default, "DirtyOnly")], [("splice", "DirtyOnly")])
         self.assertEqual(self.modules_of(self.l2_default, "DirtyOnly"), [])
+
+
+class SplicedBodyScanPsScriptRootTests(unittest.TestCase):
+    """r4 (adversary r3 A2 = Dot B3): `Join-Path $PSScriptRoot '<child>'` is read as the generator's own directory, which holds only
+    while `$PSScriptRoot` is the automatic value. A generator that rebinds it (any assignment, scope qualifier, parameter, loop
+    variable, [ref], -OutVariable, Set-Variable / New-Variable, the variable: drive) makes runtime read another directory's module.
+
+    One scan covers every variant: each lives in its own generator file with its own function name, and the scan takes them all as
+    splice sources.
+    """
+
+    CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n"
+    REBINDS = {
+        "PsrAssign": "$PSScriptRoot = 'C:\\dirty'\n",
+        "PsrScoped": "$script:PSScriptRoot = 'C:\\dirty'\n",
+        "PsrGlobal": "$global:PSScriptRoot = 'C:\\dirty'\n",
+        "PsrTyped": "[string]$PSScriptRoot = 'C:\\dirty'\n",
+        "PsrCompound": "$PSScriptRoot += 'x'\n",
+        "PsrMulti": "$a, $PSScriptRoot = 'C:\\x', 'C:\\dirty'\n",
+        "PsrForeach": "foreach ($PSScriptRoot in @('C:\\dirty')) { }\n",
+        "PsrRef": "$null = [int]::TryParse('1', [ref]$PSScriptRoot)\n",
+        "PsrOutVar": "Get-Date -OutVariable PSScriptRoot | Out-Null\n",
+        "PsrSetVariable": "Set-Variable -Name PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrNewVariable": "New-Variable PSScriptRoot 'C:\\dirty' -Force\n",
+        "PsrSv": "sv PSScriptRoot 'C:\\dirty' -Scope Script\n",
+        "PsrDrive": "Set-Item -Path variable:PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrBraced": "${variable:PSScriptRoot} = 'C:\\dirty'\n",
+        "PsrParam": "function Rebind { param($PSScriptRoot) }\n",
+        "PsrComputed": "Set-Variable -Name $someName -Value 'C:\\dirty'\n",
+    }
+    CONTROLS = {
+        # No rebinding: the call still binds to Clean.psm1 by full path.
+        "PsrPlain": "$other = 'C:\\x'\nSet-Variable -Name Unrelated -Value 1\nGet-Date -OutVariable unrelated | Out-Null\n",
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-psroot-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.dir = _long_path(Path(cls._tmp.name))
+        names = list(cls.REBINDS) + list(cls.CONTROLS)
+        (cls.dir / "Clean.psm1").write_text("".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names), encoding="utf-8")
+        sources = []
+        for name, line in {**cls.REBINDS, **cls.CONTROLS}.items():
+            generator = cls.dir / f"gen-{name}.ps1"
+            generator.write_text(line + "$e = " + cls.CALL.format(name=name), encoding="utf-8")
+            sources.append(generator)
+        cls.result = run_scan(modules=[cls.dir / "Clean.psm1"], splice_sources=sources)
+
+    def findings_for(self, name: str) -> list[dict]:
+        return [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and f"'{name}'" in f["text"]]
+
+    def test_r4_a2_a_rebound_psscriptroot_makes_the_module_binding_a_finding_not_a_scan_of_the_generators_directory(self) -> None:
+        for name in self.REBINDS:
+            found = self.findings_for(name)
+            self.assertEqual(len(found), 1, f"{name}\n" + describe(self.result["splicedViolations"]))
+            self.assertIn("PSScriptRoot", found[0]["reason"], name)
+            self.assertEqual([s for s in self.result["spliced"] if s["name"] == name], [], f"{name}: Clean.psm1 was scanned in place of the module runtime reads")
+
+    def test_r4_a2_an_unrebound_psscriptroot_still_binds_to_the_generators_directory(self) -> None:
+        for name in self.CONTROLS:
+            self.assertEqual(self.findings_for(name), [], describe(self.result["splicedViolations"]))
+            self.assertEqual([s["module"].rsplit("/", 1)[-1] for s in self.result["spliced"] if s["name"] == name], ["Clean.psm1"])
 
 
 class SpliceInventoryCallShapeTests(unittest.TestCase):

@@ -83,8 +83,18 @@
 # evaluation then says nothing about what the script runs. The alias's name is read from every spelling of -Name
 # (positional, separated, colon form `-Name:Join-Path`, any unique prefix); a name that is not a string constant
 # is a finding of its own kind, and so is a path or variable on the alias: / function: drives that names, or
-# could name, such a command (`Set-Item alias:Join-Path`, `${function:Join-Path} = ...`). Left OPEN: a drive
+# could name, such a command (`Set-Item alias:Join-Path`, `${function:Join-Path} = ...`). A rename, move or copy
+# operand written as ('Join-Path'), $('Join-Path'), [string]'Join-Path' or 'Join-' + 'Path' is read as the constant
+# it is; on those commands an operand the scan cannot reduce to a constant, next to a function: / alias: route or an
+# evaluated name, is a finding of its own kind ('computed-rename'). Left OPEN: a drive
 # path built at run time (`'al' + 'ias:'`), Import-Alias, and a relative path after `Set-Location alias:`.
+#
+# $PSScriptRoot (r4, adversary r3 A2). `Join-Path $PSScriptRoot '<child>'` is read as the directory of the file that
+# holds the call only while the file never rebinds $PSScriptRoot: an assignment (any scope qualifier, typed or compound),
+# a multi-target assignment, a foreach variable, [ref], a parameter, -OutVariable and its relatives, Set-Variable /
+# New-Variable / Remove-Variable / Clear-Variable (a name the scan cannot read counts), or the variable: drive makes the
+# binding a 'splice' finding naming that reason. Parameter and variable names are compared without their scope
+# qualifier (`param([T]$local:r)` binds $r).
 # Not covered, and left OPEN: a freshness proof that
 # crosses a dynamic-scope or deferred-execution route this scan does not model (adversary A2-A5 inputs beyond the
 # scoped, trap, deferred-block and shadowed-constructor shapes above).
@@ -262,6 +272,7 @@ function Get-ShadowReason([string]$Kind, [string]$Consequence) {
     switch ($Kind) {
         'computed-alias' { return "an alias command whose name is not a string constant could shadow a command this scan evaluates$Consequence" }
         'provider-path' { return "an alias: or function: path could define a command (a shadow) named like one this scan evaluates$Consequence" }
+        'computed-rename' { return "a rename, move or copy with an operand that is not a string constant could install a command (a shadow) named like one this scan evaluates$Consequence" }
         default { return "a function or alias named like a command this scan evaluates shadows it$Consequence" }
     }
 }
@@ -271,7 +282,7 @@ function Test-ShadowedName([string]$Value, [string[]]$Names) {
     @($Names | Where-Object { $_ -ieq ($Value -replace '^[A-Za-z]+:', '') }).Count -gt 0
 }
 
-function Get-AliasNameArguments($Command) {
+function Get-AliasNameArguments($Command, [string]$Cmdlet = 'Set-Alias') {
     # What Set-Alias / New-Alias binds to -Name: every -Name argument (any unique prefix, separated or colon form), or,
     # when none, the first positional element -- skipping the value each preceding parameter consumes. A splat is returned
     # as itself (it can carry a name the scan cannot read).
@@ -282,7 +293,7 @@ function Get-AliasNameArguments($Command) {
     foreach ($element in @($elements | Select-Object -Skip 1)) {
         if ($element -is [System.Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) { $arguments.Add($element) }
     }
-    $named = Get-NamedArguments $Command @('Name') 'Set-Alias'
+    $named = Get-NamedArguments $Command @('Name') $Cmdlet
     foreach ($argument in $named) { if ($null -ne $argument) { $arguments.Add($argument) } }
     if ($named.Count -eq 0) {
         for ($i = 1; $i -lt $elements.Count; $i++) {
@@ -302,6 +313,41 @@ function Get-AliasNameArguments($Command) {
 
 $script:providerRoutePattern = '^\s*(?:[A-Za-z0-9_.]+\\)?(?:alias|function)::?'
 
+function Get-ConstantString($Ast) {
+    # The string a command operand always evaluates to, or $null when the scan cannot prove one. Parentheses, a one-expression
+    # sub-expression, a [string] cast, a quoted string with nothing to expand and a '+' of such parts are all the same constant.
+    while ($true) {
+        if ($Ast -is [System.Management.Automation.Language.ParenExpressionAst]) { $Ast = $Ast.Pipeline; continue }
+        if ($Ast -is [System.Management.Automation.Language.SubExpressionAst]) {
+            if ($Ast.SubExpression.Statements.Count -ne 1) { return $null }
+            $Ast = $Ast.SubExpression.Statements[0]; continue
+        }
+        if ($Ast -is [System.Management.Automation.Language.PipelineAst]) {
+            if ($Ast.PipelineElements.Count -ne 1) { return $null }
+            $Ast = $Ast.PipelineElements[0]; continue
+        }
+        if ($Ast -is [System.Management.Automation.Language.CommandExpressionAst]) {
+            if ($Ast.Redirections.Count -gt 0) { return $null }
+            $Ast = $Ast.Expression; continue
+        }
+        if ($Ast -is [System.Management.Automation.Language.ConvertExpressionAst] -and $Ast.Type.TypeName.FullName -ieq 'string') { $Ast = $Ast.Child; continue }
+        break
+    }
+    if ($Ast -is [System.Management.Automation.Language.StringConstantExpressionAst]) { return [string]$Ast.Value }
+    if ($Ast -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+        if ($Ast.NestedExpressions.Count -eq 0) { return [string]$Ast.Value }
+        return $null
+    }
+    if ($Ast -is [System.Management.Automation.Language.BinaryExpressionAst] -and $Ast.Operator -eq [System.Management.Automation.Language.TokenKind]::Plus) {
+        $left = Get-ConstantString $Ast.Left
+        if ($null -eq $left) { return $null }
+        $right = Get-ConstantString $Ast.Right
+        if ($null -eq $right) { return $null }
+        return $left + $right
+    }
+    return $null
+}
+
 function Get-ShadowKind($Node, [string[]]$Names) {
     # '' when $Node shadows nothing, otherwise the kind Get-ShadowingDefinitions reports.
     $aliasCommands = @('set-alias', 'new-alias', 'sal', 'nal')
@@ -316,15 +362,21 @@ function Get-ShadowKind($Node, [string[]]$Names) {
         $commandName = $commandName.Substring($commandName.LastIndexOf('\') + 1)
         if ($aliasCommands -notcontains $commandName.ToLowerInvariant()) {
             # `Rename-Item -LiteralPath function:Redirect -NewName Join-Path`, `Move-Item function:Redirect New-Object`: the
-            # alias: / function: path is the SOURCE and a constant elsewhere in the same command is the new name.
-            $routed = $false; $named = $false
+            # alias: / function: path is the SOURCE and a constant elsewhere in the same command is the new name. An operand
+            # written as ('Join-Path'), $('Join-Path') or 'Join-' + 'Path' is read as the constant it is; on a rename, move or
+            # copy, an operand the scan cannot read as a constant, next to a route or an evaluated name, fails closed.
+            $renameCommands = @('rename-item', 'rni', 'ren', 'move-item', 'mi', 'move', 'mv', 'copy-item', 'cpi', 'copy', 'cp')
+            $routed = $false; $named = $false; $unreadable = $false
             foreach ($element in @($Node.CommandElements | Select-Object -Skip 1)) {
                 $operand = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
-                if ($operand -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -and $operand -isnot [System.Management.Automation.Language.ExpandableStringExpressionAst]) { continue }
-                if (([string]$operand.Value) -match $script:providerRoutePattern) { $routed = $true }
-                elseif ($operand -is [System.Management.Automation.Language.StringConstantExpressionAst] -and (Test-ShadowedName ([string]$operand.Value) $Names)) { $named = $true }
+                if ($null -eq $operand) { continue }
+                $constant = Get-ConstantString $operand
+                if ($null -eq $constant) { $unreadable = $true; continue }
+                if ($constant -match $script:providerRoutePattern) { $routed = $true }
+                elseif (Test-ShadowedName $constant $Names) { $named = $true }
             }
             if ($routed -and $named) { return 'provider-path' }
+            if ($unreadable -and ($routed -or $named) -and $renameCommands -contains $commandName.ToLowerInvariant()) { return 'computed-rename' }
             return ''
         }
         # Any constant element naming a shadowed command counts, whichever parameter it follows (the conservative reading).
@@ -533,7 +585,7 @@ function Test-DominatesSetter($Assignment, $Setter) {
     return $false
 }
 
-function Get-OtherBindings($Root, [string]$Name) {
+function Get-OtherBindings($Root, [string]$Name, [switch]$SkipVariableParameters) {
     # Every way a variable gets a value besides `$v = <expr>`: a parameter ('unbound'), and a foreach variable, a
     # multi-target assignment, [ref], and -OutVariable / -ErrorVariable / ... (including their aliases and
     # prefixes), which all bind a value of unknown origin ('other'). A -XxxVariable whose argument is not a
@@ -542,7 +594,8 @@ function Get-OtherBindings($Root, [string]$Name) {
     $variableParameters = @('OutVariable', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'PipelineVariable', 'ov', 'ev', 'wv', 'iv', 'pv')
     foreach ($node in $Root.FindAll({ param($n) $true }, $true)) {
         if ($node -is [System.Management.Automation.Language.ParameterAst]) {
-            if ($node.Name.VariablePath.UserPath -ieq $Name) { $tags.Add('unbound') }
+            # `param([T]$local:r)` binds the same variable as `$r`: compare the name without its scope qualifier.
+            if ((Get-VariableName $node.Name).name -ieq $Name) { $tags.Add('unbound') }
         } elseif ($node -is [System.Management.Automation.Language.ForEachStatementAst]) {
             if ((Get-VariableName $node.Variable).name -ieq $Name) { $tags.Add('other') }
         } elseif ($node -is [System.Management.Automation.Language.AssignmentStatementAst]) {
@@ -554,7 +607,7 @@ function Get-OtherBindings($Root, [string]$Name) {
         } elseif ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) {
             if ($node.Type.TypeName.FullName -ieq 'ref' -and $node.Child -is [System.Management.Automation.Language.VariableExpressionAst] -and
                 (Get-VariableName $node.Child).name -ieq $Name) { $tags.Add('other') }
-        } elseif ($node -is [System.Management.Automation.Language.CommandAst]) {
+        } elseif ($node -is [System.Management.Automation.Language.CommandAst] -and -not $SkipVariableParameters) {
             $elements = $node.CommandElements
             for ($i = 1; $i -lt $elements.Count; $i++) {
                 $element = $elements[$i]
@@ -841,7 +894,68 @@ function Add-SpliceFinding([string]$Source, [int]$Line, [string]$Function, [stri
     $splicedViolations.Add([ordered]@{ source = $Source; module = ''; function = $Function; line = $Line; rule = 'splice'; token = 'splice'; origin = ''; text = $Text; reason = $Reason })
 }
 
-function Get-SpliceModuleBinding($Call, [string]$SourceDir) {
+function Get-PsScriptRootRebinding($Root) {
+    # '' when $PSScriptRoot is provably the automatic value in this file, otherwise a short description of the first thing that
+    # could rebind it. Any scope qualifier counts (`$script:PSScriptRoot = ...`), and so does every way a variable gets a value:
+    # an assignment (plain, typed, compound), a multi-target assignment, a foreach variable, [ref], -OutVariable and its
+    # relatives, a parameter, Set-Variable / New-Variable / Remove-Variable / Clear-Variable (a computed name could be it), and
+    # the variable: drive. `Join-Path $PSScriptRoot '<child>'` is the generator's directory only while none of these appears.
+    if (@(Get-AssignmentsTo $Root 'PSScriptRoot').Count -gt 0) { return 'an assignment' }
+    if (@(Get-OtherBindings $Root 'PSScriptRoot' -SkipVariableParameters).Count -gt 0) { return 'a parameter, loop variable, multi-target assignment or [ref]' }
+    # -OutVariable / -ErrorVariable / -WarningVariable / -InformationVariable / -PipelineVariable by name, alias or unique prefix
+    # (-OutV, -ErrorV, -ev). A one-letter prefix of a native tool's switch (`git cat-file -e`) is not one of them, so the
+    # shortest prefix read is the shortest unique among the common parameters; -p is read only when it names PSScriptRoot.
+    $variableParameters = @(@{ Full = 'ErrorVariable'; Alias = 'ev'; Min = 6 }, @{ Full = 'WarningVariable'; Alias = 'wv'; Min = 8 }, @{ Full = 'InformationVariable'; Alias = 'iv'; Min = 12 },
+                            @{ Full = 'OutVariable'; Alias = 'ov'; Min = 4 }, @{ Full = 'PipelineVariable'; Alias = 'pv'; Min = 1 })
+    foreach ($command in @($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+        $elements = $command.CommandElements
+        for ($i = 1; $i -lt $elements.Count; $i++) {
+            $element = $elements[$i]
+            if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+            $spelling = $element.ParameterName
+            $binds = @($variableParameters | Where-Object {
+                $spelling -ieq $_.Alias -or ($spelling.Length -ge $_.Min -and $_.Full.StartsWith($spelling, [StringComparison]::OrdinalIgnoreCase))
+            }).Count -gt 0
+            if (-not $binds) { continue }
+            $value = $element.Argument
+            if ($null -eq $value -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $value = $elements[$i + 1] }
+            $constant = if ($null -ne $value) { Get-ConstantString $value } else { $null }
+            if ($null -ne $constant) {
+                if (($constant.TrimStart('+') -replace '^[A-Za-z]+:', '') -ieq 'PSScriptRoot') { return "-$spelling PSScriptRoot" }
+            } elseif ($spelling.Length -gt 1) {
+                return "-$spelling with a variable name the scan cannot read as a string constant"
+            }
+        }
+    }
+    $variableCommands = @('set-variable', 'sv', 'new-variable', 'nv', 'remove-variable', 'rv', 'clear-variable', 'clv')
+    $variableRoute = '^\s*(?:[A-Za-z0-9_.]+\\)?variable::?\s*[\\/]?(.*)$'
+    foreach ($n in @($Root.FindAll({ param($x) $true }, $true))) {
+        if ($n -is [System.Management.Automation.Language.CommandAst]) {
+            $commandName = $n.GetCommandName()
+            if ($null -eq $commandName) { continue }
+            $commandName = $commandName.Substring($commandName.LastIndexOf('\') + 1).ToLowerInvariant()
+            if ($variableCommands -notcontains $commandName) { continue }
+            foreach ($argument in (Get-AliasNameArguments $n 'Set-Variable')) {
+                $constant = Get-ConstantString $argument
+                if ($null -eq $constant) { return "$commandName with a variable name the scan cannot read as a string constant" }
+                $bare = $constant -replace '^[A-Za-z]+:', ''
+                if ('PSScriptRoot' -like $bare) { return "$commandName naming PSScriptRoot" }
+            }
+        }
+        elseif ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+            if (([string]$n.Value) -match $variableRoute) {
+                $rest = $Matches[1].Trim()
+                if ($rest -eq '' -or $rest -match '[$(]' -or 'PSScriptRoot' -like $rest) { return 'the variable: drive' }
+            }
+        }
+        elseif ($n -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            if ($n.VariablePath.UserPath -match '^(?i:variable):(.*)$' -and ('PSScriptRoot' -like $Matches[1].TrimStart('\', '/'))) { return 'the variable: drive' }
+        }
+    }
+    return ''
+}
+
+function Get-SpliceModuleBinding($Call, [string]$SourceDir, [string]$RootRebinding = '') {
     # Which module the extractor will read for this call: kind 'default' (no -ModulePath, or an empty / blank /
     # $null one: the extractor's own module), 'path' (a rooted literal or Join-Path $PSScriptRoot '<child>': bound
     # by FULL path), 'dynamic' (any other expression) or 'unsupported' (a call shape whose -ModulePath cannot be
@@ -895,6 +1009,10 @@ function Get-SpliceModuleBinding($Call, [string]$SourceDir) {
             $child = [string]$parts[1].Value
         }
     }
+    if ($null -ne $child -and $RootRebinding) {
+        $rebound = '$PSScriptRoot is rebound in the file that holds the call (via ' + $RootRebinding + '), so Join-Path $PSScriptRoot ''' + $child + ''' is not the generator''s own directory'
+        return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = $rebound }
+    }
     if ($null -ne $child -and $SourceDir) {
         try { return [pscustomobject]@{ kind = 'path'; path = [IO.Path]::GetFullPath((Join-Path $SourceDir $child)); reason = '' } }
         catch { return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = '-ModulePath is not a valid path' } }
@@ -918,6 +1036,7 @@ function Get-SpliceCallSites([string]$Path) {
         if ($shadowText.Length -gt 160) { $shadowText = $shadowText.Substring(0, 160) }
         Add-SpliceFinding $source $shadow.Ast.Extent.StartLineNumber '' $shadowText (Get-ShadowReason $shadow.Kind ', so the module binding it computed cannot be trusted')
     }
+    $rootRebinding = Get-PsScriptRootRebinding $ast
     # Command names are case-insensitive and a module-qualified name (<Module>\Get-AttrCudaEmbeddedFunctionSource)
     # resolves to the same command: compare the part after the last backslash, ignoring case.
     $extractorCalls = $ast.FindAll({
@@ -953,7 +1072,7 @@ function Get-SpliceCallSites([string]$Path) {
         }
         $callName = $call.GetCommandName()
         $qualifier = if ($callName.Contains('\')) { $callName.Substring(0, $callName.LastIndexOf('\')) } else { '' }
-        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; qualifier = $qualifier; bind = (Get-SpliceModuleBinding $call $sourceDir) }
+        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; qualifier = $qualifier; bind = (Get-SpliceModuleBinding $call $sourceDir $rootRebinding) }
     }
 }
 
