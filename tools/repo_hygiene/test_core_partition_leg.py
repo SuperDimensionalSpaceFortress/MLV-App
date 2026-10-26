@@ -182,6 +182,47 @@ try {
 """
 
 
+# sol r4 A2: the smoke runner starts a short same-exe probe (--help) after the measured-launch instant and before the measured app. The decoded helper,
+# with its load on, runs against a stand-in probe (~5 s) and then the stand-in measured app (~8 s): only the measured instance's samples are app samples
+# and the load totals are its own.
+PROBE_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$dir = $env:CP_DIR
+$exe = Join-Path $dir 'mlvfake.exe'
+Copy-Item -LiteralPath 'C:\Windows\System32\PING.EXE' -Destination $exe
+$psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $($env:CP_ENCODED)")
+$psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+$psi.Environment['MLV_CP_EXE'] = $exe
+$psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
+$psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
+$psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
+$psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
+$psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '1'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '1'
+$psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(120).Ticks)
+$h = [Diagnostics.Process]::Start($psi)
+try {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    while (-not (Test-Path (Join-Path $dir 'ready')) -and -not $h.HasExited -and $sw.ElapsedMilliseconds -lt 60000) { Start-Sleep -Milliseconds 100 }
+    [IO.File]::WriteAllText((Join-Path $dir 'launch'), [string][DateTime]::UtcNow.Ticks)
+    Start-Sleep -Milliseconds 300
+    $probe = Start-Process -FilePath $exe -ArgumentList @('-n', '6', '127.0.0.1') -PassThru -WindowStyle Hidden
+    [void]$probe.WaitForExit(30000)
+    Start-Sleep -Milliseconds 800
+    $measured = Start-Process -FilePath $exe -ArgumentList @('-n', '9', '127.0.0.1') -PassThru -WindowStyle Hidden
+    [void]$measured.WaitForExit(30000)
+    Start-Sleep -Seconds 1
+    Set-Content -LiteralPath (Join-Path $dir 'stop') -Value 'stop'
+    if (-not $h.WaitForExit(30000)) { $h.Kill() }
+    $r = Get-Content -LiteralPath (Join-Path $dir 'helper.json') -Raw | ConvertFrom-Json
+    $life = @{}; foreach ($i in @($r.instances)) { $life[[string]$i.pid] = ([int64]$i.lastSeenUtcTicks - [int64]$i.firstSeenUtcTicks) / 1e7 }
+    [ordered]@{ probePid = $probe.Id; measuredPid = $measured.Id; app = $r.app.pid; instances = @($r.instances | ForEach-Object { $_.pid }); measuredLifeSec = $life[[string]$measured.Id]
+        loadSec = $r.load.seconds; loadBytes = $r.load.bytes; sessions = $r.load.sessions; appSamples = @($r.samples | Where-Object { $_.app }).Count; errors = @($r.errors) } | ConvertTo-Json -Compress
+} finally {
+    if (-not $h.HasExited) { $h.Kill() }
+}
+"""
+
+
 NEWFILE_DRIVER = r"""
 $ErrorActionPreference = 'Stop'
 $src = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:CP_ENCODED))
@@ -339,6 +380,26 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(got["seen"], got["postPid"], f"the helper bound a same-path process that started before the measured launch: {got}")
         self.assertEqual(got["instances"], [got["postPid"]], got)
 
+    def test_a_short_same_exe_probe_after_the_launch_is_not_the_measured_apps_evidence(self) -> None:
+        """sol r4 A2: the probe is bound first (it starts after the launch instant), but its samples and load seconds must not be the app's."""
+        m = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a"))
+        self.assertIsNotNone(m)
+        work = self.tmp / "probe-work"
+        work.mkdir()
+        driver = self.tmp / "probe-driver.ps1"
+        driver.write_text(PROBE_DRIVER, encoding="ascii")
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["instances"], [got["probePid"], got["measuredPid"]], f"the driver did not reproduce the probe-then-app shape: {got}")
+        self.assertEqual(got["app"], got["measuredPid"], got)
+        self.assertEqual(got["sessions"], 2, got)
+        life = got["measuredLifeSec"]
+        self.assertGreater(got["loadSec"], 0, got)
+        self.assertGreater(got["loadBytes"], 0, got)
+        self.assertLessEqual(got["loadSec"], life + 1.5, f"the probe's load seconds were counted as the measured app's: {got}")
+        self.assertLessEqual(got["appSamples"], life + 1.5, f"the probe's samples were counted as app samples: {got}")
+
     def test_the_helpers_output_files_are_created_never_truncated(self) -> None:
         """Adversary A5: a planted hard link at the helper's ready / record name must be refused, not truncated through."""
         m = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a"))
@@ -478,6 +539,17 @@ $nrText = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w 'helper-k
 $r.notReadyFlag = @($nrText.corePartitionTopologyOk, $nrText.benchAffinityApplied, $nrText.partitionLoadApplied)
 # opus H2 (CORE-PARTITION-FEED-NOT-READY-REASON-1): with a not-ready helper every package-feed field is null and names the not-ready reason
 $r.notReadyFeed = @($nr.pkgWattsMean, $nr.pkgWattsMax, $nr.pkgTempCMean, $nr.pkgTempCMax, $nr.pkgThrottledRows, $nr.pkgTempCAtStart, $okc.pkgWattsMean, $okc.pkgTempCAtStart)
+# sol r4 A3: a row the writer has not finished (no newline yet) is not a row, at the window's end or at the start mark
+$part = $end.Clone(); $part.window = "26.10.2026,01:00:02,x,70,45,No,Y"; $part.windowStartsMidRow = $false
+$partTwo = $end.Clone(); $partTwo.window = "26.10.2026,01:00:01,x,60,40,No,No`n26.10.2026,01:00:02,x,70,45,No,Y"; $partTwo.windowStartsMidRow = $false
+$startPart = $start.Clone(); $startPart.before = "26.10.2026,01:00:00,x,61.0,20.5,No,No`n26.10.2026,01:00:01,x,6,20,No,N"
+$r.partialRow = @((Get-CorePartitionFeedSummary $start $part 120).reasons['rows'], (Get-CorePartitionFeedSummary $start $partTwo 120).rows, (Get-CorePartitionFeedSummary $start $partTwo 120).pkgWattsMax,
+    (Get-CorePartitionFeedSummary $startPart $whole 120).pkgTempCAtStart)
+# sol r4 A4: NaN, Infinity and an overflowing exponent are not measured values
+$r.nonFinite = @(foreach ($row in @("26.10.2026,01:00:02,x,NaN,45,No,No`n", "26.10.2026,01:00:02,x,70,1e309,No,No`n", "26.10.2026,01:00:02,x,Infinity,45,No,No`n", "26.10.2026,01:00:02,x,70,-Infinity,No,No`n")) {
+    $nf = $end.Clone(); $nf.window = $row; $nf.windowStartsMidRow = $false; (Get-CorePartitionFeedSummary $start $nf 120).reasons['pkgWattsMean'] })
+$nfs = $start.Clone(); $nfs.before = "26.10.2026,01:00:00,x,NaN,20.5,No,No`n"
+$r.nonFiniteStart = (Get-CorePartitionFeedSummary $nfs $whole 120).reasons['pkgTempCAtStart']
 $r | ConvertTo-Json -Depth 6 -Compress
 """
 
@@ -497,7 +569,7 @@ if (-not $scalarLine) { throw 'no scalar line in the generator' }
 function Write-JobTrace([string]$Message) { }
 function Publish-AttrCudaText { param([string]$Path, [string]$Value) }
 function New-AttrCudaDirectory { param([string]$Path) }
-function Save-Json { param($Object, $Path) }
+function Save-Json { param($Object, $Path) $global:cpSaved = $Object }
 function New-HelperDouble([string]$Mode) {
     $d = [pscustomobject]@{ Id = 4242; Mode = $Mode; Killed = $false }
     $d | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param([int]$Ms) if ($this.Mode -eq 'throw') { throw 'wait failed' }; if ($this.Mode -eq 'timeout' -and -not $this.Killed) { return $false }; return $true }
@@ -535,6 +607,7 @@ foreach ($c in $cases) {
     $corePartitionErrors = [Collections.Generic.List[string]]::new()
     $corePartitionJob = [ordered]@{ affinityBefore = $null; affinityRequested = '0x00FFF'; affinityApplied = '0x00FFF'; affinityRestored = $null }
     $corePartitionHelperNotReady = $null
+    $global:cpSaved = $null
     foreach ($l in $preLines) { if (-not $l.StartsWith('if ')) { . ([scriptblock]::Create($l)) } }
     $corePartitionHelper = New-HelperDouble $c.mode
     $corePartitionHelperLaunch = [ordered]@{ pid = 4242; ready = $c.ready; readyWaitMs = 30000 }
@@ -547,6 +620,7 @@ foreach ($c in $cases) {
         topo = $s.corePartitionTopologyOk; bench = $s.benchAffinityApplied; load = $s.partitionLoadApplied; why = [string]$s.corePartitionNullReasons
         helperWhy = $corePartitionHelperWhy; notReady = [bool]$corePartitionHelperNotReady; killed = $corePartitionHelper.Killed
         pkg = @($s.pkgWattsMean, $s.pkgWattsMax, $s.pkgTempCMean, $s.pkgTempCMax, $s.pkgThrottledRows, $s.pkgTempCAtStart)
+        published = $(if ($null -ne $global:cpSaved) { $ps = $global:cpSaved.feed.summary; @($ps.rows, $ps.pkgWattsMean, $ps.pkgWattsMax, $ps.pkgTempCMean, $ps.pkgTempCMax, $ps.pkgThrottledRows, $ps.pkgTempCAtStart, [string]$ps.reasons['pkgWattsMean']) } else { @('not-published') })
     }
 }
 $out | ConvertTo-Json -Depth 6 -Compress
@@ -623,6 +697,15 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         for f in ("pkgWattsMean", "pkgWattsMax", "pkgTempCMean", "pkgTempCMax", "pkgThrottledRows", "pkgTempCAtStart"):
             self.assertIn(f"{f}=helper-not-ready-at-launch", self.r["notReady"][3])
 
+    def test_an_unfinished_last_feed_row_is_not_a_row(self) -> None:
+        """sol r4 A3: the end read can land between a row's text and its newline; that row (here its throttle flag cut to 'Y') is not evidence."""
+        self.assertEqual(self.r["partialRow"], ["feed-no-rows-in-window", 1, 40.0, 61.0])
+
+    def test_a_non_finite_feed_value_is_unparseable(self) -> None:
+        """sol r4 A4: double.TryParse accepts NaN, Infinity and 1e309; the summary must not publish them as package values."""
+        self.assertEqual(self.r["nonFinite"], ["feed-unparseable"] * 4)
+        self.assertEqual(self.r["nonFiniteStart"], "feed-unparseable")
+
     def test_launch_readiness_rejection_survives_every_cleanup_outcome(self) -> None:
         """sol r3 CP-01: the job's exact cleanup block (lifted from the generator) run against a helper process double that was not ready at the
         measured launch, then the job's exact scalar line. A late helper that publishes a valid B2 record must never regain the criteria."""
@@ -650,12 +733,15 @@ class CorePartitionPureHelperTests(unittest.TestCase):
                 self.assertIn("corePartitionTopologyOk=helper-not-ready-at-launch", c["why"])
                 self.assertEqual(c["pkg"], [None] * 6, f"a not-ready helper published package-feed values: {c}")
                 self.assertIn("pkgWattsMean=helper-not-ready-at-launch", c["why"])
+                # sol r4 A1: core-partition.json's feed summary is held to the same rule as the success-summary scalars
+                self.assertEqual(c["published"], [None] * 7 + ["helper-not-ready-at-launch"], f"core-partition.json published feed values: {c}")
         self.assertTrue(got["stop-timeout"]["killed"], "the stop-timeout double was killed (the branch under test ran)")
         control = got["ready-stop-timeout-control"]
         self.assertEqual([control["topo"], control["bench"], control["load"]], [True, True, True], f"the same late kill with a ready helper is accepted: {control}")
         self.assertEqual(control["helperWhy"], "helper-killed-after-stop-timeout")
         self.assertFalse(control["notReady"])
         self.assertEqual(control["pkg"][:4], [50.0, 55.0, 75.0, 80.0], "a ready helper's window still carries the feed")
+        self.assertEqual(control["published"][:3], [2, 50.0, 55.0], "a ready helper's core-partition.json still carries the feed")
 
     def test_summary_scalars(self) -> None:
         b2 = self.r["b2"]
