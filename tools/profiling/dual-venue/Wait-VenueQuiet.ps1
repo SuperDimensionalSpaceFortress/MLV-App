@@ -86,7 +86,7 @@
 #        would_block is what the check says about that probe; with the switch OFF it changes nothing, so the log measures how often enforcing would have fired before anyone turns it on.
 #        UNKNOWN IS NULL, NEVER FALSE, AND NEVER A BLOCK: would_block=null with reason no-probe (the probe itself was unavailable), no-cores (no cores[] rows), core-class-unknown (a row whose class is not P / E / uniform, so it
 #        might be a fast core), invalid-core-row (an entry in cores[] that is not a JSON object: null, a scalar, a nested array), incomplete-samples (a fast or unknown-class row flagged incomplete, with
-#        validSamples != totalSamples, or with a count that is not a whole number >= 1 or an incomplete flag that is not a boolean), invalid-notes (notes is not an object), cores-omitted (the probe omitted a core for having no
+#        validSamples != totalSamples, or with a count that is not a whole number >= 1 or an incomplete flag that is not a boolean), invalid-notes (a notes property that is present but not an object, an explicit null included; an absent property is an older probe and is unchanged), cores-omitted (the probe omitted a core for having no
 #        valid sample: notes.cores_omitted) or invalid-core-percent (a non-numeric, array or out-of-range
 #        value). The figure compared is the unrounded valid-sample mean (`percent_exact`, which the probe job now emits beside the 2-dp `percent`; an older probe falls back to
 #        `percent`), as the mean rule decides on the unrounded mean. A core-level BUSY never replaces UNKNOWN, a measured-busy mean or any exit code. Turning the switch ON for a
@@ -1347,10 +1347,12 @@ function Get-VenuePerCoreVerdict($Probe, [double]$Threshold, [bool]$Enabled) {
             $top = $fast | Sort-Object -Property @{ Expression = { $_.percent }; Descending = $true } | Select-Object -First 1
             $r.busiest_fast_core = $top.instance; $r.busiest_fast_percent = $top.percent
         }
-        # notes is an object; any other non-null shape (an array, a string) cannot say that nothing was omitted, so it is unknown rather than silently clean
-        if ($null -ne $Probe.notes) {
-            if ($Probe.notes -isnot [pscustomobject]) { $reasons += 'invalid-notes' }
-            elseif ($null -ne $Probe.notes.PSObject.Properties['cores_omitted']) { $reasons += 'cores-omitted' }
+        # notes is an object; any other shape (an array, a string, an explicit null) cannot say that nothing was omitted, so it is unknown rather than silently clean. Only an ABSENT
+        # property (an older probe that never carried notes) is skipped: "present with a null value" is told apart from "absent" by the property itself, not by its value.
+        $notesProp = $Probe.PSObject.Properties['notes']
+        if ($null -ne $notesProp) {
+            if ($notesProp.Value -isnot [pscustomobject]) { $reasons += 'invalid-notes' }
+            elseif ($null -ne $notesProp.Value.PSObject.Properties['cores_omitted']) { $reasons += 'cores-omitted' }
         }
         $reasons = @($reasons | Select-Object -Unique)
         if ($reasons.Count -gt 0) { $r.reason = $reasons -join '+' }

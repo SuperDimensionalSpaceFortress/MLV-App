@@ -6012,6 +6012,45 @@ $obj = $arr[[Math]::Min($n, $arr.Count - 1)]
                                        "-ProbeJson", str(raw), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
                 self.assertIn("Busy probes summarized: 0 (quiet skipped 1", summ.stdout, summ.stdout + summ.stderr)
 
+    # ---- r5 (sol r4 V-03 / Dot B3): a PRESENT notes property whose value is null is invalid-notes, never a definite verdict; an ABSENT property and an empty object are unchanged ----
+    def _summary_for(self, probe: dict, tag: str) -> subprocess.CompletedProcess:
+        raw = self.tmp / f"venue-quiet-probe-r5-{tag}.json"
+        raw.write_text(json.dumps(probe), encoding="utf-8")
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"),
+                               "-ProbeJson", str(raw), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
+
+    def test_an_explicit_null_notes_is_invalid_notes_in_the_gate_and_the_summary(self) -> None:
+        for name, cores in {"hot 82": _pc_cores(self.HOT), "cool 30": _pc_cores(self.COOL)}.items():
+            with self.subTest(name):
+                probe = dict(self.probe(cores), notes=None)
+                self.assertIn('"notes": null', json.dumps(probe))
+                proc = self.gate(probe, "-PerCoreEnforce")
+                self.assertRegex(proc.stdout, r"(?m)^QUIET ", proc.stdout + proc.stderr)
+                self.assertIn("would_block=null reason=invalid-notes", proc.stdout)
+                self.assertNotIn("percore blocked", proc.stdout)
+                off = self.gate(probe)
+                self.assertIn("would_block=null reason=invalid-notes", off.stdout, "the observation line reports the same typed unknown when enforcement is off")
+                self.assertRegex(off.stdout, r"(?m)^QUIET ")
+                summ = self._summary_for(probe, name.replace(" ", "-"))
+                self.assertIn("Busy probes summarized: 0 (quiet skipped 1", summ.stdout, summ.stdout + summ.stderr)
+
+    def test_an_absent_notes_property_and_an_empty_notes_object_keep_the_definite_verdict(self) -> None:
+        for name, extra in {"absent": None, "empty object": {}}.items():
+            with self.subTest(name):
+                hot = self.probe(_pc_cores(self.HOT))
+                cool = self.probe(_pc_cores(self.COOL))
+                for p in (hot, cool):
+                    p.pop("notes", None)
+                    if extra is not None:
+                        p["notes"] = extra
+                self.assertEqual("notes" in hot, extra is not None)
+                blocked = self.gate(hot, "-PerCoreEnforce")
+                self.assertIn("would_block=true", blocked.stdout, blocked.stdout + blocked.stderr)
+                self.assertNotIn("reason=invalid-notes", blocked.stdout)
+                self.assertIn("percore blocked", blocked.stdout)
+                self.assertIn("would_block=false", self.gate(cool, "-PerCoreEnforce").stdout)
+                self.assertIn("Busy probes summarized: 1 (quiet skipped 0", self._summary_for(hot, "ok-" + name.replace(" ", "-")).stdout)
+
     # ---- adversary pass r4 (A4): a sink that fails on the observation line must not also swallow the blocked-core line ----
     def test_a_sink_failure_on_the_observation_line_still_prints_the_blocked_core_line(self) -> None:
         script = (DV / "Wait-VenueQuiet.ps1").as_posix()
