@@ -113,7 +113,7 @@ foreach ($name in $liftNotAfter) {
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
 # lease-batch r4 (the merge of not-after r1): the same, so batch-refusal-ends-batch fails on behaviour against an agent without it.
-foreach ($name in @('Close-LeaseBatchAfterRelease', 'Get-LeaseWaitHeatField', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec')) {   # the last three: AGENT-LEASE-PENDING-HEAT-TRACE-1
+foreach ($name in @('Close-LeaseBatchAfterRelease', 'ConvertTo-UtcDateTime', 'Get-LeaseWaitHeatField', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec')) {   # the last four: AGENT-LEASE-PENDING-HEAT-TRACE-1 (ConvertTo-UtcDateTime: the headroom helper reads the sidecar bound with it)
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }

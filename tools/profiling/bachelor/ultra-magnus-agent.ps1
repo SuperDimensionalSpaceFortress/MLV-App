@@ -2031,8 +2031,9 @@ function Get-LeaseSnapshotHeadroomSec {
     try {
         if ($null -ne $Verdict -and $Verdict.state -eq "open" -and $null -ne $Verdict.remainingSec) { $left = [Math]::Min($left, [double]$Verdict.remainingSec) }
         if ($null -ne $Verdict -and $Verdict.livenessState -eq "live" -and $null -ne $Verdict.livenessUntilUtc) {
-            $lu = [DateTimeOffset]::Parse([string]$Verdict.livenessUntilUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal)
-            $left = [Math]::Min($left, ($lu.UtcDateTime - [DateTime]::UtcNow).TotalSeconds)
+            $lu = ConvertTo-UtcDateTime $Verdict.livenessUntilUtc   # never a [string] cast then Parse (AGENT-TIMESTAMP-PARSE-TZ-1's pin)
+            if ($null -eq $lu) { return 0.0 }
+            $left = [Math]::Min($left, ($lu - [DateTime]::UtcNow).TotalSeconds)
         }
         if ($null -ne $Lease -and $null -ne $Lease.active) { $left = [Math]::Min($left, [double]$Lease.active.until - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0) }
     }
