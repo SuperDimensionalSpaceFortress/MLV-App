@@ -766,7 +766,7 @@ try {
         'liveness-root-shape', 'liveness-lapse-latched',
         'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin',
         'batch-close-before-reuse', 'batch-runner-killed-liveness', 'lease-pending-heat-trace',
-        'lease-heat-trace-async-retry', 'lease-heat-trace-grant-coverage', 'queuedjob-lease-coverage-at-launch')
+        'lease-heat-trace-async-retry', 'lease-heat-trace-grant-coverage', 'queuedjob-lease-coverage-at-launch', 'lease-heat-trace-nonlocal-feed')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -2466,15 +2466,17 @@ function Exit-HeavySlot {
             Assert-True ($admA.label -ceq 'clear') "heat-trace B1: admitted before the 12 s queue ceiling, not expired by the probe: label=$($admA.label) why=$($admA.why)"
             Assert-True ($snapA.Count -eq 1 -and $snapA[0] -match 'slot 1: suite X pid=77 age=\d+s; slot 2: free') "heat-trace B1: the request snapshot is still logged, from the loop's poll: $($snapA -join ' || ')"
             if ($null -ne $script:QuietLease) { Exit-HeavySlot }
-            # adversary r3-a96d3fe5 A1: the probe's bound is checked FIRST (an answer that came only after it is a timeout, not a success), and a
+            # adversary r3-a96d3fe5 A1: the probe's bound is checked FIRST (a probe first OBSERVED after it is classified a timeout, not a success), and a
             # caller about to sleep past the bound (HorizonSec, the inbox loop's poll) has a still-running probe stopped now. Bound 1 s here.
+            # r4 (Dot): this is LATE-OBSERVATION classification. The fake answers at once; what is delayed past the bound is the poll that observes the
+            # exited probe, not the probe's completion. A probe that really completes late is the timeout cases above (StatusDelaySec 4, bound 1 s).
             $script:LeaseSnapshotProbeSec = 1; $script:StatusDelaySec = 0; Sync-FakeStatus
             $cLate = Start-HeavySlotCli -Arguments @('status', '--slots', '2')
             $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = 'jHtL'; phase = 'grant'; call = $cLate; clock = [System.Diagnostics.Stopwatch]::StartNew() })
-            $null = $cLate.proc.WaitForExit(10000); Start-Sleep -Milliseconds 1100   # it has answered (rc 0, slot lines), but only after its 1 s bound
+            $null = $cLate.proc.WaitForExit(10000); Start-Sleep -Milliseconds 1100   # it has exited (rc 0, slot lines); the first poll to observe it comes after its 1 s bound
             Update-LeaseSlotSnapshots
             $lateL = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtL *' })
-            Assert-True ($lateL.Count -eq 1 -and $lateL[0] -match ' slots=unknown\(timeout 1 s\)$') "heat-trace A1(r3): a probe that answered only after its bound is logged as a timeout, never a success: $($lateL -join ' || ')"
+            Assert-True ($lateL.Count -eq 1 -and $lateL[0] -match ' slots=unknown\(timeout 1 s\)$') "heat-trace A1(r3): a probe first observed only after its bound (late observation) is classified a timeout, never a success: $($lateL -join ' || ')"
             $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 8; Sync-FakeStatus
             Add-LeaseSlotSnapshot -JobId 'jHtH' -Phase 'grant'
             Start-Sleep -Milliseconds 300
@@ -2518,6 +2520,64 @@ function Exit-HeavySlot {
             $script:StatusDelaySec = 0
             if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test case end' }
             Remove-Item -LiteralPath Function:\Invoke-HeavySlotStatus -ErrorAction SilentlyContinue
+        }
+    }
+    # ------------------------------------------------------------ lease-heat-trace-nonlocal-feed (AGENT-LEASE-PENDING-HEAT-TRACE-1 r4, Dot B4 / r3 adversary A2)
+    # The waiting line's heat read must never hold the wait loop. Read-HeavySlotFeedMetrics is a synchronous stat/open/read with no timeout, and the
+    # first pending iteration reads (lastLog starts at MinValue). Scaled from Dot's shape (a UNC feed stalled 30 s, ceiling 20 s, active at 5 s): the
+    # stubbed read stalls 8 s while waiting, the ceiling is 6 s, the request turns active at 2 s. A loop that reads a UNC feed is queue-expired at ~8 s;
+    # one that skips it (heat=skipped reason=non-local-feed) is admitted on the baseline schedule (a local feed, whose read does not stall).
+    if (Test-Case 'lease-heat-trace-nonlocal-feed') {
+        $savedFeed = $HeavySlotFeed
+        $script:LeaseSnapshotSkipBelowSec = 70   # the 6 s ceiling is inside it: neither snapshot probe runs, so only the heat read is under test
+        $script:HtT0 = Get-Date
+        function Get-QueueAgeSeconds { param($Job, $Metadata) return [int]((Get-Date) - $script:HtT0).TotalSeconds }
+        $script:FeedReads = 0; $script:FeedStallSec = 0
+        function Read-HeavySlotFeedMetrics { $script:FeedReads++; if ($null -eq $script:QuietLease -and $script:FeedStallSec -gt 0) { Start-Sleep -Seconds $script:FeedStallSec }; return @{ metrics = $null; why = 'feed missing (stub)'; ageSec = $null } }   # stalls only while waiting: the grant's own read is not under test
+        $jn = Join-Path $fx 'heat-jn'
+        try {
+            $metaN = [pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 6 }
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: free', 'slot 2: free') }; $script:StatusDelaySec = 0
+            $outN = [ordered]@{}
+            foreach ($k in @('local', 'unc')) {
+                $HeavySlotFeed = if ($k -eq 'local') { Join-Path $fx 'feed-local.csv' } else { '\\heat-trace-unc.invalid\share\hwinfo-log-adapter.csv' }
+                $script:FeedStallSec = if ($k -eq 'local') { 0 } else { 8 }
+                Reset-Case @{ request = 'active'; active_after = 2 }
+                $script:AgeAfter = (Get-Date).AddSeconds(120); $script:FeedReads = 0; $script:HtT0 = Get-Date
+                $admN = Invoke-HtWait "jHtN$k" $metaN
+                $script:Admission = $admN
+                $outN[$k] = [pscustomobject]@{ label = $admN.label; waitedSec = $admN.waitedSec; why = $admN.why; reads = $script:FeedReads; waits = @($script:Log | Where-Object { $_ -like "quiet-lease: waiting job=jHtN$k *" }) }
+                if ($null -ne $script:QuietLease) { Exit-HeavySlot }
+            }
+            $script:FeedStallSec = 0
+            Assert-True ($outN.local.label -ceq 'clear' -and $outN.local.waits.Count -ge 1 -and @($outN.local.waits | Where-Object { $_ -notmatch ' heat=unknown\(feed missing \(stub\)\) feedAge=unknown$' }).Count -eq 0) "heat-trace B4 baseline: a local feed is read on the waiting line and the job is admitted: label=$($outN.local.label) $($outN.local.waits -join ' || ')"
+            Assert-True ($outN.unc.label -ceq 'clear') "heat-trace B4: a stalled UNC feed read never holds the wait past its 6 s queue ceiling: label=$($outN.unc.label) why=$($outN.unc.why)"
+            Assert-True ($outN.unc.waitedSec -le $outN.local.waitedSec + 2) "heat-trace B4: the activation is processed on the baseline schedule: unc=$($outN.unc.waitedSec)s local=$($outN.local.waitedSec)s"
+            Assert-True ($outN.unc.waits.Count -ge 1 -and @($outN.unc.waits | Where-Object { $_ -notmatch ' heat=skipped reason=non-local-feed$' }).Count -eq 0) "heat-trace B4: the heat field stays on every waiting line, as heat=skipped reason=non-local-feed: $($outN.unc.waits -join ' || ')"
+            Assert-True ($outN.unc.reads -eq 1) "heat-trace B4: a UNC feed is never read while waiting (the one read is the grant's own): reads=$($outN.unc.reads)"
+            # The path rule, called directly: only a fully-qualified drive-letter path on a fixed disk with no reparse point on the way is read.
+            $jReal = Join-Path $fx 'heat-jn-target'
+            New-Item -ItemType Directory -Force -Path $jReal | Out-Null
+            New-Item -ItemType Junction -Path $jn -Target $jReal | Out-Null
+            $script:FeedReads = 0
+            $pathCases = [ordered]@{ unc = '\\srv\share\f.csv'; slashUnc = '//srv/share/f.csv'; device = '\\?\C:\temp\f.csv'; dotDevice = '\\.\C:\temp\f.csv'; relative = 'feed.csv'; driveRelative = 'C:feed.csv'; empty = ''; junction = (Join-Path $jn 'f.csv') }
+            foreach ($pc in $pathCases.Keys) {
+                $HeavySlotFeed = $pathCases[$pc]
+                $f = Get-LeaseWaitHeatField
+                Assert-True ($f -ceq 'heat=skipped reason=non-local-feed') "heat-trace B4: a $pc feed path is skipped, not read: '$($pathCases[$pc])' -> $f"
+            }
+            Assert-True ($script:FeedReads -eq 0) "heat-trace B4: none of the non-local paths was read: reads=$($script:FeedReads)"
+            $HeavySlotFeed = Join-Path $fx 'feed-local.csv'
+            $fLocal = Get-LeaseWaitHeatField
+            Assert-True ($script:FeedReads -eq 1 -and $fLocal -match '^heat=unknown\(feed missing \(stub\)\)') "heat-trace B4: a local fixed-disk path is read: reads=$($script:FeedReads) $fLocal"
+            $results.leaseHeatTraceNonlocalFeed = [ordered]@{ local = $outN.local.waitedSec; unc = $outN.unc.waitedSec; uncLabel = $outN.unc.label; uncSample = $outN.unc.waits[0] }
+        }
+        finally {
+            $HeavySlotFeed = $savedFeed; $script:FeedStallSec = 0
+            if (Test-Path -LiteralPath $jn) { [IO.Directory]::Delete($jn) }   # the junction only, never its target's contents
+            function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return [int]$script:HtAge }
+            function Read-HeavySlotFeedMetrics { return @{ metrics = $null; why = 'feed missing (unit)' } }
+            if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test case end' }
         }
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }

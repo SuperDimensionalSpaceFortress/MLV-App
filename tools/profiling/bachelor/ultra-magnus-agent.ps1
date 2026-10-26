@@ -2011,7 +2011,23 @@ function Get-LeaseWaitHeatField {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1: the heat fields of a quiet-lease waiting line, from ONE feed read, in the gate's own terms
     # (Get-SustainedHeatVerdict: throttled rows of the window, the window's mean C) plus the feed's age. An unreadable feed is
     # heat=unknown(<reason>), never an omitted field. Logging only: it never throws and no decision reads what it returns.
+    # r4 (Dot B4, r3 adversary A2): the read is a synchronous stat/open/read with no timeout on the wait loop, so it is made only for a feed on a
+    # local fixed disk: a fully-qualified drive-letter path, DriveType Fixed, and no reparse point (junction, symlink, mount) on the way to it,
+    # each checked from the root down without following one. Any other path (UNC, device, relative, a mapped drive, a link that may lead to a
+    # share) is heat=skipped reason=non-local-feed, so a stalled share never holds the loop past a queue ceiling or a deadline. The grant-time
+    # and status-mode reads are unchanged.
     try {
+        $p = [string]$HeavySlotFeed
+        if (-not [System.IO.Path]::IsPathFullyQualified($p)) { return "heat=skipped reason=non-local-feed" }
+        $full = [System.IO.Path]::GetFullPath($p)
+        if ($full -notmatch '^[A-Za-z]:\\' -or [System.IO.DriveInfo]::new($full.Substring(0, 1)).DriveType -ne [System.IO.DriveType]::Fixed) { return "heat=skipped reason=non-local-feed" }
+        $cur = $full.Substring(0, 3)
+        foreach ($seg in @($full.Substring(3).Split([char]'\') | Where-Object { $_ })) {
+            $cur = [System.IO.Path]::Combine($cur, $seg)
+            try { $attr = [System.IO.File]::GetAttributes($cur) }
+            catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { break }   # nothing further exists: the read finds it missing
+            if ($attr -band [System.IO.FileAttributes]::ReparsePoint) { return "heat=skipped reason=non-local-feed" }
+        }
         $feed = Read-HeavySlotFeedMetrics
         # adversary r1 A3: a feed whose timestamp is far in the future (or an absurd age) must not turn a readable heat into unknown.
         $age = "unknown"
