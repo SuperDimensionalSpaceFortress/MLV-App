@@ -197,8 +197,8 @@ jobs:
           python -m pip check
 
       - name: Prove the unittest shards cover every discovered test
-        # Fails unless shards 1-7 hold exactly the test ids `unittest discover` collects,
-        # each once.
+        # Fails unless shards 1-7 and the unittest heavy job's parts (ci_unittest_heavy_set.json)
+        # together hold exactly the test ids `unittest discover` collects, each once.
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
         run: python -m tools.repo_hygiene.ci_unittest_shard --profile windows --of 7 --verify-partition
 
@@ -324,6 +324,51 @@ jobs:
             tests\coordination\test_retire_lane_worktree.py `
             -q
 
+  repo-hygiene-python-windows-unittest-heavy:
+    # The 7-way windows unittest partition was expected at 1439 of its 1440 s budget (48 % of
+    # 50 min), so any PR that added tests failed the merge group (run 40233119003, 1445 s). The
+    # heaviest measured classes, listed in tools/repo_hygiene/ci_unittest_heavy_set.json, leave
+    # the partition and run here instead, split into that file's `parts` by the same weighted
+    # assignment. The shard job's partition proof step checks the 7 shards plus these parts are
+    # an exact cover of `unittest discover`. The aggregate `Repo Hygiene Python (windows-latest)`
+    # below requires this job, so a failed, cancelled or skipped part still fails the check.
+    name: Repo Hygiene Python windows unittest heavy ${{ matrix.part }}/2
+    runs-on: windows-latest
+    # The shard job's cap and budget: each part is expected at about 16-17 min including setup.
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
+
+    steps:
+      - name: Record the job start for the shard budget clock
+        # ci_unittest_shard reads CI_SHARD_JOB_START_EPOCH so checkout and pip count toward
+        # the 75 % warning; without it the clock starts at main().
+        shell: pwsh
+        run: '"CI_SHARD_JOB_START_EPOCH=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install repo hygiene test dependencies
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/pip.txt
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/repo-hygiene.txt
+          python -m pip check
+
+      - name: Run repo hygiene heavy unittest part ${{ matrix.part }}/2
+        shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
+        run: python -m tools.repo_hygiene.ci_unittest_shard --profile windows --heavy-part ${{ matrix.part }}
+
   repo-hygiene-python-windows:
     # Keeps the required status-check name `Repo Hygiene Python (windows-latest)` that
     # branch protection pins. It succeeds only when every Windows shard job succeeded: a
@@ -331,7 +376,7 @@ jobs:
     # (not `!cancelled()`) keeps it running when the whole run is cancelled, so a cancel
     # leaves the required check failed rather than condition-skipped, which GitHub accepts.
     name: Repo Hygiene Python (windows-latest)
-    needs: [repo-hygiene-python-windows-shard, repo-hygiene-python-windows-containment, repo-hygiene-python-windows-coordination-heavy]
+    needs: [repo-hygiene-python-windows-shard, repo-hygiene-python-windows-containment, repo-hygiene-python-windows-coordination-heavy, repo-hygiene-python-windows-unittest-heavy]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -356,6 +401,13 @@ jobs:
         run: |
           echo "windows coordination heavy result: $HEAVY_RESULT"
           test "$HEAVY_RESULT" = "success"
+
+      - name: Require the heavy unittest job to have passed
+        env:
+          UNITTEST_HEAVY_RESULT: ${{ needs.repo-hygiene-python-windows-unittest-heavy.result }}
+        run: |
+          echo "windows unittest heavy result: $UNITTEST_HEAVY_RESULT"
+          test "$UNITTEST_HEAVY_RESULT" = "success"
 
   windows-product-oracles-part:
     name: Windows Product Oracles part ${{ matrix.part }}/3

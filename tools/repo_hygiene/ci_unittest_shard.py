@@ -13,9 +13,14 @@ balanced whole. The split is stable, and a test class the table does not know is
 weighted by its test count, so a new test file is picked up automatically instead of
 being silently omitted.
 
-Coverage is proven, not assumed: ``--verify-partition`` fails unless every shard's test
-ids, taken together, are exactly the ids plain ``unittest discover`` collects, each
-once, and no module failed to import.
+A profile may name a heavy set in ``ci_unittest_heavy_set.json``: those classes leave the
+N-way partition and run in their own job instead, split into the set's ``parts`` by the same
+assignment (``--heavy-part``). The partition and the heavy job read the one file, so what
+one excludes the other runs.
+
+Coverage is proven, not assumed: ``--verify-partition`` fails unless every shard's and
+every heavy part's test ids, taken together, are exactly the ids plain ``unittest discover``
+collects, each once, no heavy class is missing from discover, and no module failed to import.
 """
 
 from __future__ import annotations
@@ -55,14 +60,54 @@ ORIGIN_JOB_START = "job_start"
 ORIGIN_MAIN = "main"
 ORIGIN_MAIN_INVALID = "main_invalid_job_start"
 WEIGHTS_PATH = Path(__file__).with_name("ci_unittest_shard_weights.json")
+HEAVY_SET_PATH = Path(__file__).with_name("ci_unittest_heavy_set.json")
 
 
 def load_weights(profile: str, path: Path = WEIGHTS_PATH) -> dict[str, float]:
     """Measured seconds per ``module.Class`` for one runner OS."""
     table = json.loads(path.read_text(encoding="utf-8"))["seconds"]
+    if not isinstance(table, dict):
+        raise ValueError(f"{path.name}: seconds must be an object")
     if profile not in table:
         raise ValueError(f"no weight table for profile {profile!r}; have {sorted(table)}")
-    return {name: float(seconds) for name, seconds in table[profile].items()}
+    rows = table[profile]
+    if not isinstance(rows, dict):
+        raise ValueError(f"{path.name}: {profile} must be an object of class -> seconds")
+    for name, seconds in rows.items():
+        if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
+            raise ValueError(f"{path.name}: {profile} {name} is {seconds!r}, not a finite number of seconds")
+    return {name: float(seconds) for name, seconds in rows.items()}
+
+
+def load_heavy_set(profile: str, path: Path = HEAVY_SET_PATH) -> tuple[list[str], int]:
+    """The profile's heavy classes, sorted, and how many parts the heavy job runs; ``([], 0)`` if none."""
+    table = json.loads(path.read_text(encoding="utf-8"))
+    schema = table.get("schema") if isinstance(table, dict) else None
+    if type(schema) is not int or schema != 1:
+        raise ValueError(f"{path.name}: unknown schema {schema!r}")
+    profiles = table.get("profiles", {})
+    if not isinstance(profiles, dict):
+        raise ValueError(f"{path.name}: profiles must be an object")
+    unknown = sorted(set(profiles) - set(PROFILES))
+    if unknown:
+        raise ValueError(f"{path.name}: unknown profile(s) {unknown}")
+    if profile not in profiles:
+        return [], 0
+    entry = profiles[profile]
+    if not isinstance(entry, dict):
+        raise ValueError(f"{path.name}: {profile} must be an object")
+    classes = entry.get("classes")
+    parts = entry.get("parts")
+    if (
+        not isinstance(classes, list)
+        or not classes
+        or not all(isinstance(key, str) and key for key in classes)
+        or len(set(classes)) != len(classes)
+    ):
+        raise ValueError(f"{path.name}: {profile} classes must be a non-empty list of unique class names")
+    if not isinstance(parts, int) or isinstance(parts, bool) or not 1 <= parts <= len(classes):
+        raise ValueError(f"{path.name}: {profile} parts must be an integer from 1 to {len(classes)}")
+    return sorted(classes), parts
 
 
 def _flatten(suite: unittest.TestSuite) -> Iterator[unittest.TestCase]:
@@ -119,34 +164,62 @@ def shard_tests(units: dict[str, list[unittest.TestCase]], bucket: list[str]) ->
     return [test for key in sorted(bucket) for test in units[key]]
 
 
-def plan(profile: str, shards: int) -> tuple[list[unittest.TestCase], dict[str, list[unittest.TestCase]], list[list[str]]]:
+def plan_buckets(
+    counts: dict[str, int], profile: str, shards: int, heavy_path: Path = HEAVY_SET_PATH
+) -> tuple[list[list[str]], list[list[str]]]:
+    """The ``shards``-way partition of every class outside the heavy set, and the heavy parts.
+
+    A heavy class that ``counts`` does not hold is in neither; ``stale_heavy`` names it.
+    """
+    weights = load_weights(profile)
+    classes, parts = load_heavy_set(profile, heavy_path)
+    heavy = set(classes)
+    partition = assign({key: n for key, n in counts.items() if key not in heavy}, shards, weights)
+    present = {key: counts[key] for key in classes if key in counts}
+    return partition, assign(present, parts, weights) if parts else []
+
+
+def stale_heavy(counts: dict[str, int], profile: str, heavy_path: Path = HEAVY_SET_PATH) -> list[str]:
+    """Heavy classes that discover did not collect: renamed or deleted, so nothing would run them."""
+    return [key for key in load_heavy_set(profile, heavy_path)[0] if key not in counts]
+
+
+def plan(
+    profile: str, shards: int, heavy_path: Path = HEAVY_SET_PATH
+) -> tuple[list[unittest.TestCase], dict[str, list[unittest.TestCase]], list[list[str]], list[list[str]]]:
     tests = collect_tests()
     units = group_units(tests)
-    buckets = assign({key: len(items) for key, items in units.items()}, shards, load_weights(profile))
-    return tests, units, buckets
+    buckets, heavy = plan_buckets({key: len(items) for key, items in units.items()}, profile, shards, heavy_path)
+    return tests, units, buckets, heavy
 
 
-def verify_partition(profile: str, shards: int) -> int:
-    tests, units, buckets = plan(profile, shards)
+def verify_partition(profile: str, shards: int, heavy_path: Path = HEAVY_SET_PATH) -> int:
+    tests, units, buckets, heavy = plan(profile, shards, heavy_path)
     weights = load_weights(profile)
     problems: list[str] = []
     for failed in import_failures(tests):
         problems.append(f"a test module failed to import: {failed}")
+    for key in stale_heavy({key: len(items) for key, items in units.items()}, profile, heavy_path):
+        problems.append(f"a heavy-set class is not collected by discover: {key}")
     expected = sorted(test.id() for test in tests)
     covered: list[str] = []
-    for index, bucket in enumerate(buckets, start=1):
-        members = shard_tests(units, bucket)
-        covered.extend(test.id() for test in members)
-        estimate = sum(unit_weight(key, len(units[key]), weights) for key in bucket)
-        print(f"shard {index}/{shards}: {len(bucket)} classes, {len(members)} tests, ~{estimate:.0f} s estimated")
-        if not members:
-            problems.append(f"shard {index} holds no tests")
-    print(f"discover: {len({unit_key(t) for t in tests})} classes, {len(expected)} tests; shards total {len(covered)}")
+    for label, group in (("shard", buckets), ("heavy part", heavy)):
+        for index, bucket in enumerate(group, start=1):
+            members = shard_tests(units, bucket)
+            covered.extend(test.id() for test in members)
+            estimate = sum(unit_weight(key, len(units[key]), weights) for key in bucket)
+            print(f"{label} {index}/{len(group)}: {len(bucket)} classes, {len(members)} tests, ~{estimate:.0f} s estimated")
+            if not members:
+                problems.append(f"{label} {index} holds no tests")
+    print(
+        f"discover: {len({unit_key(t) for t in tests})} classes, {len(expected)} tests; "
+        f"shards and heavy parts total {len(covered)}"
+    )
     if sorted(covered) != expected:
         missing = sorted(set(expected) - set(covered))
         extra = sorted(set(covered) - set(expected))
         problems.append(
-            f"shards are not an exact cover of discover: {len(missing)} missing, "
+            f"shards and heavy parts are not an exact cover of discover: {len(missing)} missing, "
             f"{len(extra)} extra, {len(covered) - len(set(covered))} repeated"
         )
     for problem in problems:
@@ -489,30 +562,46 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--profile", choices=PROFILES, required=True, help="runner OS weight table")
-    parser.add_argument("--of", type=int, required=True, help="total number of shards")
+    parser.add_argument("--of", type=int, help="total number of shards (not with --heavy-part)")
     parser.add_argument("--shard", type=int, help="1-based shard to run")
+    parser.add_argument("--heavy-part", type=int, help="1-based part of the profile's heavy set to run")
     parser.add_argument("--verify-partition", action="store_true")
     parser.add_argument("--list", action="store_true", help="print the shard's classes and exit")
     parser.add_argument("--list-tests", action="store_true", help="print the shard's test ids and exit")
     args = parser.parse_args(argv)
     started = time.monotonic()
+    if args.heavy_part is not None:
+        if args.of is not None or args.shard is not None or args.verify_partition:
+            parser.error("--heavy-part takes no --of, --shard or --verify-partition")
+        parts = load_heavy_set(args.profile)[1]
+        if not 1 <= args.heavy_part <= parts:
+            parser.error(f"--heavy-part must be between 1 and {parts}, the {args.profile} heavy set's parts")
+    elif args.of is None:
+        parser.error("--of is required unless --heavy-part is given")
     repo_root = Path(args.repo_root).resolve()
     sys.path.insert(0, str(repo_root))
     os.chdir(repo_root)
 
     if args.verify_partition:
         return verify_partition(args.profile, args.of)
-    if args.shard is None or not 1 <= args.shard <= args.of:
+    if args.heavy_part is None and (args.shard is None or not 1 <= args.shard <= args.of):
         parser.error("--shard must be between 1 and --of")
-    tests, units, buckets = plan(args.profile, args.of)
+    tests, units, buckets, heavy = plan(args.profile, args.of or 1)
     failures = import_failures(tests)
     if failures:
         print("ERROR: a test module failed to import: " + ", ".join(failures), file=sys.stderr)
         return 1
-    bucket = buckets[args.shard - 1]
+    if args.heavy_part is not None:
+        stale = stale_heavy({key: len(items) for key, items in units.items()}, args.profile)
+        if stale:
+            print("ERROR: a heavy-set class is not collected by discover: " + ", ".join(stale), file=sys.stderr)
+            return 1
+        label, index, of, bucket = "heavy part", args.heavy_part, len(heavy), heavy[args.heavy_part - 1]
+    else:
+        label, index, of, bucket = "shard", args.shard, args.of, buckets[args.shard - 1]
     members = shard_tests(units, bucket)
     if not members:
-        print(f"ERROR: shard {args.shard}/{args.of} holds no tests", file=sys.stderr)
+        print(f"ERROR: {label} {index}/{of} holds no tests", file=sys.stderr)
         return 1
     if args.list:
         print("\n".join(bucket))
@@ -520,8 +609,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.list_tests:
         print("\n".join(test.id() for test in members))
         return 0
-    print(f"shard {args.shard}/{args.of}: {len(bucket)} classes, {len(members)} tests", flush=True)
-    return run_shard(members, args.profile, args.shard, args.of, started=started)
+    print(f"{label} {index}/{of}: {len(bucket)} classes, {len(members)} tests", flush=True)
+    return run_shard(members, args.profile, index, of, started=started)
 
 
 if __name__ == "__main__":
