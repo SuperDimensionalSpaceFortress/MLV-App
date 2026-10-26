@@ -1878,6 +1878,57 @@ $script:LeaseSnapshotSkipBelowSec = 70
 # r3 (Dot B1/B2): the snapshot probes in flight (Add-LeaseSlotSnapshot starts one, Update-LeaseSlotSnapshots polls them) and their bound.
 $script:LeaseSlotSnapshots = [System.Collections.Generic.List[object]]::new()
 $script:LeaseSnapshotProbeSec = 30
+
+function Initialize-LeaseProbeWatchdog {
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r5 (sol r4 S1, adversary r4-e98a2780 A1): a snapshot probe's bound must hold whether or not the agent polls
+    # (the pre-launch renew, Confirm-HeavySlotHeldForLaunch and a lease release block without polling). Add-LeaseSlotSnapshot arms one of these on
+    # each probe it starts: a thread-pool timer that kills the probe's tree at its bound and records the probe's age at the kill. Nothing ever
+    # waits on it. Compiled once at agent start (never on the wait loop); $false when it cannot be, and the poll's own bound check then stands alone.
+    if ($null -ne ('MlvApp.Agent.LeaseProbeWatchdog' -as [type])) { return $true }
+    try {
+        Add-Type -TypeDefinition @"
+namespace MlvApp.Agent {
+    public sealed class LeaseProbeWatchdog {
+        private readonly object _gate = new object();
+        private readonly System.Diagnostics.Process _proc;
+        private readonly System.Diagnostics.Stopwatch _clock;
+        private System.Threading.Timer _timer;
+        private bool _disarmed;
+        private long _killedAtMs = -1;
+        public LeaseProbeWatchdog(System.Diagnostics.Process proc, System.Diagnostics.Stopwatch clock, long dueMs) {
+            _proc = proc;
+            _clock = clock;
+            _timer = new System.Threading.Timer(Fire, null, dueMs < 0 ? 0 : dueMs, System.Threading.Timeout.Infinite);
+        }
+        private void Fire(object state) {
+            lock (_gate) {
+                try {
+                    if (_disarmed || _proc.HasExited) { return; }
+                    long age = _clock.ElapsedMilliseconds;
+                    _proc.Kill(true);
+                    _killedAtMs = age;
+                }
+                catch { }
+            }
+        }
+        // Read under the lock Fire holds for its whole kill, so a probe seen exited is never read as not-yet-killed mid-kill.
+        public long KilledAtMs { get { lock (_gate) { return _killedAtMs; } } }
+        public void Disarm() {
+            lock (_gate) { _disarmed = true; }
+            System.Threading.Timer t = System.Threading.Interlocked.Exchange(ref _timer, null);
+            if (t != null) { t.Dispose(); }
+        }
+    }
+}
+"@ -ErrorAction Stop
+        return $true
+    }
+    catch {
+        Add-AgentLogLine "quiet-lease: snapshot probe watchdog unavailable (the poll's bound check stands alone): $(([string]$_.Exception.Message) -replace '\s+', ' ')"
+        return $false
+    }
+}
+$null = Initialize-LeaseProbeWatchdog
 # lease-batch r1: the parked (or in-use) batch lease, and "the admitted batch job launched and ended" for Exit-HeavySlot.
 $script:LeaseBatch = $null
 $script:LeaseBatchKeep = $false
@@ -2129,7 +2180,8 @@ function Add-LeaseSlotSnapshot {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1: ONE `heavy-slot.py status` probe, logged as who holds each slot (owner, pid, age) and how many runs
     # are queued; Phase is request | grant. r3 (Dot B1/B2, adversary r4 A1/A2): the probe is STARTED here and never waited on, so it holds neither
     # the wait loop nor the lease: Update-LeaseSlotSnapshots, called from the wait loop, the job monitor loop and the inbox loop, logs it once it
-    # exits, or kills it at LeaseSnapshotProbeSec (slots=unknown(timeout N s)). Logging only: nothing here throws, gates or changes a return value,
+    # exits; the probe's own watchdog (r5) kills it at LeaseSnapshotProbeSec (slots=unknown(timeout N s; killed at <age> s)) even while nothing
+    # polls. Logging only: nothing here throws, gates or changes a return value,
     # and a failed log line is dropped.
     param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Phase, [double]$WaitedSec = 0, [double]$HeadroomSec = [double]::PositiveInfinity)
     try {
@@ -2147,12 +2199,20 @@ function Add-LeaseSlotSnapshot {
             Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=skipped(heavy-slot.py or its python is not on a local fixed disk)"
             return
         }
-        $call = Start-HeavySlotCli -Arguments @("status", "--slots", "$HeavySlotCount")
+        # r5 (sol r4 S2): the paths just checked are the ones started (-Python/-Script), never re-resolved: a checked python gone by now is
+        # slots=unknown(python not found at its checked path ...), never a PATH search. r5 (sol r4 S1): the clock starts with the probe, and
+        # the probe's own watchdog (Initialize-LeaseProbeWatchdog) kills it at its bound whether or not the agent polls.
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        $call = Start-HeavySlotCli -Arguments @("status", "--slots", "$HeavySlotCount") -Python $HeavySlotPython -Script $HeavySlotScript
         if (-not $call.ok) {
             Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown($(([string]$call.why) -replace '\s+', ' '))"
             return
         }
-        $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = $JobId; phase = $Phase; call = $call; clock = [System.Diagnostics.Stopwatch]::StartNew() })
+        $bound = if ($script:LeaseSnapshotProbeSec -gt 0) { [double]$script:LeaseSnapshotProbeSec } else { 30.0 }
+        $dog = $null
+        $dogType = 'MlvApp.Agent.LeaseProbeWatchdog' -as [type]
+        if ($null -ne $dogType) { try { $dog = $dogType::new($call.proc, $clock, [long][Math]::Ceiling($bound * 1000.0 - $clock.Elapsed.TotalMilliseconds)) } catch { $dog = $null } }
+        $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = $JobId; phase = $Phase; call = $call; clock = $clock; dog = $dog })
     }
     catch {
         try { Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown(snapshot failed: $(([string]$_.Exception.Message) -replace '\s+', ' '))" } catch { }
@@ -2165,14 +2225,21 @@ function Update-LeaseSlotSnapshots {
     # every one still running as slots=unknown(<Abandon>). Logging only: it never throws.
     # adversary r3-a96d3fe5 A1: the bound is checked FIRST, so a probe that answered only after it is a timeout, never a success; and a caller about
     # to sleep HorizonSec (the inbox loop) has a probe whose bound falls inside that sleep killed now, so none outlives its bound by a poll interval.
+    # r5 (sol r4 S1): a probe its watchdog killed is logged with the age it was killed at; one the poll finds past its bound, with the age it was
+    # killed (still running) or seen (already exited) at -- the real age, never only the bound.
     param([string]$Abandon = "", [double]$HorizonSec = 0)
     if ($null -eq $script:LeaseSlotSnapshots -or $script:LeaseSlotSnapshots.Count -lt 1) { return }
     $bound = if ($script:LeaseSnapshotProbeSec -gt 0) { [double]$script:LeaseSnapshotProbeSec } else { 30.0 }
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
     foreach ($s in @($script:LeaseSlotSnapshots.ToArray())) {
         try {
             $st = $null
             $el = $s.clock.Elapsed.TotalSeconds
-            if ($el -ge $bound) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = "timeout $([long]$bound) s" } }
+            $dog = $s.dog
+            $exited = $s.call.proc.HasExited   # read BEFORE the watchdog's record: a kill it made before this read is then always seen below
+            $killedMs = if ($null -ne $dog) { [long]$dog.KilledAtMs } else { [long]-1 }
+            if ($killedMs -ge 0) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = [string]::Format($inv, "timeout {0} s; killed at {1:F1} s", [long]$bound, $killedMs / 1000.0) } }
+            elseif ($el -ge $bound) { $how = if ($exited) { "seen" } else { "killed" }; Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = [string]::Format($inv, "timeout {0} s; {1} at {2:F1} s", [long]$bound, $how, $el) } }
             elseif ($s.call.proc.HasExited -and $s.call.out.IsCompleted -and $s.call.err.IsCompleted) {
                 $r = Receive-HeavySlotCli -Call $s.call
                 $lines = @(([string]$r.stdout) -split "`r?`n" | Where-Object { $_ -ne "" })
@@ -2181,11 +2248,13 @@ function Update-LeaseSlotSnapshots {
             elseif ($HorizonSec -gt 0 -and $el + $HorizonSec -ge $bound) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = "stopped at $([long]$el) s: the agent's next poll is past the $([long]$bound) s bound" } }
             elseif ($Abandon) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = $Abandon } }
             if ($null -eq $st) { continue }
+            if ($null -ne $dog) { $dog.Disarm() }
             [void]$script:LeaseSlotSnapshots.Remove($s)
             Write-LeaseSlotSnapshotLine -JobId $s.jobId -Phase $s.phase -Status $st
         }
         catch {
             [void]$script:LeaseSlotSnapshots.Remove($s)
+            try { if ($null -ne $s.dog) { $s.dog.Disarm() } } catch { }
             try { Stop-HeavySlotCli -Call $s.call } catch { }
             try { Add-AgentLogLine "quiet-lease: slots-snapshot job=$($s.jobId) phase=$($s.phase) slots=unknown(snapshot failed: $(([string]$_.Exception.Message) -replace '\s+', ' '))" } catch { }
         }
@@ -2915,14 +2984,23 @@ function Start-HeavySlotCli {
     # One short heavy-slot.py call (lease renew / release), started windowless with this agent's HEAVY_SLOT_DIR and
     # HEAVY_SLOT_FEED and WITHOUT HEAVY_SLOT_HELD (a lease call is never nested). Nothing waits here: Complete-HeavySlotCli
     # waits with a bound, Receive-HeavySlotCli collects a call that has exited. Returns @{ ok; proc; out; err; started; why }.
-    param([Parameter(Mandatory = $true)][string[]]$Arguments)
-    $py = Resolve-HeavySlotPython
-    if (-not $py) { return [pscustomobject]@{ ok = $false; why = "python not found ($HeavySlotPython)" } }
-    if (-not (Test-Path -LiteralPath $HeavySlotScript -PathType Leaf)) { return [pscustomobject]@{ ok = $false; why = "heavy-slot.py not found ($HeavySlotScript)" } }
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r5 (sol r4 S2): -Python/-Script are paths the caller has already checked (the slot snapshot's local-disk
+    # rule). They are started as given and never re-resolved: a checked python that is gone now is ok=$false, never a PATH search.
+    param([Parameter(Mandatory = $true)][string[]]$Arguments, [string]$Python = "", [string]$Script = "")
+    if ($Python) {
+        $py = $Python
+        if (-not (Test-Path -LiteralPath $py -PathType Leaf)) { return [pscustomobject]@{ ok = $false; why = "python not found at its checked path ($py); no PATH search" } }
+    }
+    else {
+        $py = Resolve-HeavySlotPython
+        if (-not $py) { return [pscustomobject]@{ ok = $false; why = "python not found ($HeavySlotPython)" } }
+    }
+    $scr = if ($Script) { $Script } else { $HeavySlotScript }
+    if (-not (Test-Path -LiteralPath $scr -PathType Leaf)) { return [pscustomobject]@{ ok = $false; why = "heavy-slot.py not found ($scr)" } }
     try {
         $si = [System.Diagnostics.ProcessStartInfo]::new()
         $si.FileName = $py
-        foreach ($a in @($HeavySlotScript) + @($Arguments)) { [void]$si.ArgumentList.Add([string]$a) }
+        foreach ($a in @($scr) + @($Arguments)) { [void]$si.ArgumentList.Add([string]$a) }
         $si.UseShellExecute = $false
         $si.CreateNoWindow = $true
         $si.RedirectStandardOutput = $true
@@ -4139,7 +4217,7 @@ try {
         # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: a snapshot probe still running when its job ended is logged, or killed at its bound, from here.
         Update-LeaseSlotSnapshots
 
-        $jobs =Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name
+        $jobs = Get-ChildItem $inbox -Filter *.job.ps1 -File -ErrorAction SilentlyContinue | Sort-Object Name
         if (@($jobs).Count -eq 0) { Invoke-GateIdleSample }
         foreach ($job in $jobs) {
             # r2d (sol r2c BLOCKER): a job with ANY unresolved marker artifact is never admitted or launched here.
