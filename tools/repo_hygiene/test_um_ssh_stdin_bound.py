@@ -35,7 +35,7 @@ def _best_effort_taskkill(pid, taskkill=_taskkill_tree):
     try:
         taskkill(pid, WRAPPER_KILL_DEADLINE)
     except subprocess.TimeoutExpired:
-        return "taskkill of pid %s did not return within %d s (fixture cleanup unconfirmed)" % (pid, WRAPPER_KILL_DEADLINE)
+        return "taskkill of pid %s did not return within %r s (fixture cleanup unconfirmed)" % (pid, WRAPPER_KILL_DEADLINE)
     return ""
 
 
@@ -58,11 +58,11 @@ def _stop_process_tree(proc, deadline=WRAPPER_KILL_DEADLINE, taskkill=_taskkill_
     try:
         taskkill(proc.pid, deadline)
     except subprocess.TimeoutExpired:
-        notes.append("taskkill did not return within %d s" % deadline)
+        notes.append("taskkill did not return within %r s" % deadline)
     try:
         proc.wait(timeout=deadline)
     except subprocess.TimeoutExpired:
-        notes.append("pid %d still running %d s after the kill (reap unconfirmed, wrapper deadline hit)" % (proc.pid, deadline))
+        notes.append("pid %d still running %r s after the kill (reap unconfirmed, wrapper deadline hit)" % (proc.pid, deadline))
     return "; ".join(notes) if notes else "killed and reaped"
 
 
@@ -82,7 +82,13 @@ def _rmtree_clearing_readonly(path):
 
 
 def _check_remove_deadline(deadline):
-    """Sol B1: a nan or infinite deadline never expires and a negative one is meaningless, so refuse them by name."""
+    """Sol B1: a nan or infinite deadline never expires and a negative one is meaningless, so refuse them by name.
+
+    H2: only int and float are accepted (a bool is an int by inheritance but never a duration); a Decimal used to pass
+    here and then raise TypeError at monotonic() + deadline, so the type is refused up front instead.
+    """
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        raise TypeError("deadline must be an int or float number of seconds, got %s %r" % (type(deadline).__name__, deadline))
     if not (math.isfinite(deadline) and deadline >= 0):
         raise ValueError("deadline must be a finite number of seconds >= 0, got %r" % (deadline,))
 
@@ -113,17 +119,21 @@ def _remove_tree_bounded(path, deadline=FIXTURE_TMP_REMOVE_DEADLINE):
             last = exc  # Sol B3: the stat error is the newest word; never claim "still present" when stat failed.
         else:
             last = last or OSError("shutil.rmtree returned but the directory is still present")
+        remaining = end - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(0.25, remaining))
+        # Sol r2: the sleep can cross expiry, and no removal attempt may start once the budget is spent.
         if time.monotonic() >= end:
-            return "temp dir %s was not removed within %d s: %s: %s" % (path, deadline, type(last).__name__, last)
-        time.sleep(0.25)
+            # %r, not %d: a fractional deadline must be reported as configured (sol r2 B1).
+            return "temp dir %s was not removed within %r s: %s: %s" % (path, deadline, type(last).__name__, last)
 
 
 class _FixtureTmp:
     """Replacement for tempfile.TemporaryDirectory in this file's fixtures.
 
     TemporaryDirectory.__exit__ raises PermissionError when a Windows file is still open, and that REPLACES the
-    failure in flight (the guard output, the stop/cleanup notes, the real assertion). Here the removal is bounded,
-    and a removal that fails is APPENDED to the failure in flight; with no failure in flight it is raised itself,
+    failure in flight (the guard output, the stop/cleanup notes, the real assertion). Here the removal retries are
+    bounded (no wall-clock cap: one rmtree call cannot be interrupted), and a removal that fails is APPENDED to the failure in flight; with no failure in flight it is raised itself,
     so a leaked handle is never swallowed. Assertions that read the guard output belong INSIDE the with block.
     """
 
@@ -148,6 +158,11 @@ class _FixtureTmp:
         line = "[fixture cleanup] " + note
         if exc is None:
             raise AssertionError(line)
+        # H1: Ctrl-C and sys.exit are not test failures; they pass through unchanged, the note rides along.
+        if not isinstance(exc, Exception):
+            if hasattr(exc, "add_note"):
+                exc.add_note(line)
+            return False
         # Only AssertionError renders its args[0] as str(); other types (TimeoutExpired, OSError) would drop the note.
         if isinstance(exc, AssertionError) and exc.args and isinstance(exc.args[0], str):
             exc.args = (exc.args[0] + "\n" + line,) + exc.args[1:]
@@ -520,7 +535,7 @@ class FixtureCleanupBoundTests(unittest.TestCase):
 
     @staticmethod
     def _failing_remove(path, deadline):
-        return "temp dir %s was not removed within %d s: PermissionError: simulated open handle" % (path, deadline)
+        return "temp dir %s was not removed within %r s: PermissionError: simulated open handle" % (path, deadline)
 
     def test_a_cleanup_failure_is_appended_to_the_failure_in_flight(self):
         with self.assertRaises(AssertionError) as caught:
@@ -732,6 +747,116 @@ class FixtureCleanupBoundTests(unittest.TestCase):
             timer.start()
         timer.join(timeout=15)
         self.assertFalse(Path(tmp).exists())
+
+    # ---- sol r2 B1 + r3 fold-ins ---------------------------------------------------------------------
+
+    @staticmethod
+    def _fake_clock_persistent_lock(deadline):
+        """Run _remove_tree_bounded against a lock that never lets go, on a fake clock where sleep advances time.
+
+        Returns (note, start times of each removal attempt).
+        """
+        from unittest import mock
+
+        now = [0.0]
+        starts = []
+
+        def locked(target, **kwargs):
+            starts.append(now[0])
+            raise PermissionError(13, "LOCKED", target)
+
+        def present(target, *args, **kwargs):
+            return object()
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with mock.patch.object(time, "monotonic", lambda: now[0]), mock.patch.object(time, "sleep", sleep), \
+                mock.patch.object(shutil, "rmtree", locked), mock.patch.object(os, "stat", present):
+            return _remove_tree_bounded("locked-dir", deadline=deadline), starts
+
+    def test_a_fractional_deadline_is_reported_as_configured_not_truncated(self):
+        """Sol r2 B1: 0.1 and 0.9 printed 'within 0 s' and 1.5 printed 'within 1 s'; the budget must round-trip."""
+        for deadline, shown in ((0.1, "0.1"), (0.9, "0.9"), (1.5, "1.5"), (10, "10"), (0, "0")):
+            with self.subTest(deadline=deadline):
+                note, _starts = self._fake_clock_persistent_lock(deadline)
+                self.assertIn("within %s s:" % shown, note)
+
+    def test_a_kill_and_reap_note_reports_a_fractional_deadline_as_configured(self):
+        """Class sweep of sol r2 B1: the wrapper kill notes also rendered their deadline with %d."""
+        def stuck(pid, deadline):
+            raise subprocess.TimeoutExpired("taskkill", deadline)
+
+        class Proc:
+            pid = 4242
+
+            @staticmethod
+            def wait(timeout):
+                raise subprocess.TimeoutExpired("proc", timeout)
+
+        note = _stop_process_tree(Proc, deadline=0.5, taskkill=stuck)
+        self.assertIn("taskkill did not return within 0.5 s", note)
+        self.assertIn("pid 4242 still running 0.5 s after the kill", note)
+
+    def test_no_removal_attempt_starts_after_the_deadline_has_expired(self):
+        """Sol r2 blocker 1: the sleep after a failed attempt used to cross expiry and a further removal still ran."""
+        note, starts = self._fake_clock_persistent_lock(0.1)
+        self.assertEqual(starts, [0.0])
+        self.assertIn("was not removed within 0.1 s", note)
+
+    def test_a_removal_that_fails_late_does_not_start_another_after_expiry(self):
+        from unittest import mock
+
+        now = [0.0]
+        starts = []
+
+        def late_failure(target, **kwargs):
+            starts.append(now[0])
+            if len(starts) > 3:
+                raise RuntimeError("retried again after expiry: starts %s" % starts)  # also stops a regressed loop from spinning
+            now[0] = 9.9
+            raise PermissionError(13, "LOCKED", target)
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with mock.patch.object(time, "monotonic", lambda: now[0]), mock.patch.object(time, "sleep", sleep), \
+                mock.patch.object(shutil, "rmtree", late_failure), mock.patch.object(os, "stat", lambda target, *a, **k: object()):
+            note = _remove_tree_bounded("locked-dir", deadline=10)
+        self.assertEqual(starts, [0.0])
+        self.assertIn("was not removed within 10 s", note)
+
+    def test_an_interruption_in_flight_passes_through_a_failed_cleanup_unchanged(self):
+        """H1 FIXTURE-TMP-BASEEXC-PASSTHROUGH-1: Ctrl-C and sys.exit must stay themselves; the cleanup note rides along."""
+        for raised, kind in ((KeyboardInterrupt(), KeyboardInterrupt), (SystemExit(7), SystemExit)):
+            with self.subTest(raised=type(raised).__name__):
+                with self.assertRaises(kind) as caught:
+                    with _FixtureTmp(remove=self._failing_remove) as tmp:
+                        raise raised
+                self.assertIs(caught.exception, raised)
+                if kind is SystemExit:
+                    self.assertEqual(caught.exception.code, 7)
+                if hasattr(raised, "add_note"):
+                    self.assertTrue(any("[fixture cleanup]" in note for note in raised.__notes__), getattr(raised, "__notes__", None))
+                shutil.rmtree(tmp)
+
+    def test_an_interruption_with_a_clean_cleanup_is_untouched(self):
+        with self.assertRaises(KeyboardInterrupt):
+            with _FixtureTmp():
+                raise KeyboardInterrupt()
+
+    def test_a_deadline_that_is_not_an_int_or_float_is_refused_up_front_by_type(self):
+        """H2 FIXTURE-TMP-DEADLINE-TYPE: a Decimal passed the validator and then died at monotonic() + deadline."""
+        import decimal
+
+        for bad, type_name in ((decimal.Decimal("0.1"), "Decimal"), (True, "bool"), ("5", "str"), (None, "NoneType")):
+            with self.subTest(deadline=bad):
+                with self.assertRaises((TypeError, ValueError)) as helper:
+                    _remove_tree_bounded("no-such-dir", deadline=bad)
+                self.assertIn(type_name, str(helper.exception))
+                with self.assertRaises((TypeError, ValueError)) as fixture:
+                    _FixtureTmp(deadline=bad)
+                self.assertIn(type_name, str(fixture.exception))
 
 
 if __name__ == "__main__":
