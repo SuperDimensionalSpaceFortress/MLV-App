@@ -2600,6 +2600,14 @@ function Exit-HeavySlot {
             finally { $script:LeaseSlotSnapshots = $savedSnaps }
             Assert-True ($wNone -eq 5000 -and $wNear -ge 1 -and $wNear -le 500 -and $wPast -eq 1) "heat-trace A2(r4): the wait is capped at the earliest bound: none=$wNone near(29.5 s)=$wNear past=$wPast"
             Assert-True ($agentText.Contains('Start-Sleep -Milliseconds (Get-LeaseSlotSnapshotWaitMs -MaxMs $script:GateLoopSleepMs)') -and $agentText.Contains('$remainingMs = Get-LeaseSlotSnapshotWaitMs -MaxMs $remainingMs')) "heat-trace A2(r4): the wait loop's sleep and the job monitor loop's slice are both capped by it"
+            # adversary r4-6abf870f A4 (advisory, fixed in scope): a held field past Int32 is read, one past Int64 is unknown; neither throws.
+            $hBig = $null; $hHuge = $null; $hErr = $null
+            try { $hBig = ConvertFrom-HeavySlotHolderText -Text 'suite (pid 77, held 2147483648 min)'; $hHuge = ConvertFrom-HeavySlotHolderText -Text 'suite (pid 77, held 99999999999999999999 min)' } catch { $hErr = $_.Exception.Message }
+            Assert-True ($null -eq $hErr -and $hBig.heldMin -eq 2147483648 -and $hBig.ownerPid -ceq '77' -and $null -ne $hHuge -and $null -eq $hHuge.heldMin) "heat-trace A4(r4): an Int32-overflowing held field never throws: err=$hErr big=$($hBig.heldMin) huge=$($hHuge.heldMin)"
+            # adversary r4-6abf870f A5 (advisory, fixed in scope): with no job timeout, Set-LeaseCoverageAtLaunch changes nothing.
+            $adZ = [pscustomobject]@{ mode = 'lease'; leaseCoversTimeout = $true }
+            Set-LeaseCoverageAtLaunch -JobId 'jHtZ' -Admission $adZ -Lease ([pscustomobject]@{ active = [pscustomobject]@{ until = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 100 } }) -TimeoutSec 0
+            Assert-True ($null -eq $adZ.PSObject.Properties['leaseRemainingAtLaunchSec'] -and $adZ.leaseCoversTimeout -eq $true) "heat-trace A5(r4): TimeoutSec 0 adds no field and keeps leaseCoversTimeout: $($adZ | ConvertTo-Json -Compress)"
             $results.leaseHeatTraceNonlocalFeed = [ordered]@{ local = $outN.local.waitedSec; unc = $outN.unc.waitedSec; uncLabel = $outN.unc.label; uncSample = $outN.unc.waits[0]; scriptSkip = $sS[0]; waitNearMs = $wNear }
         }
         finally {

@@ -2105,7 +2105,8 @@ function ConvertFrom-HeavySlotHolderText {
     $since = $null
     $held = $null
     if ($rest -match ', since ([^,)]*)') { $since = $Matches[1] }
-    if ($rest -match ', held (\d+) min') { $held = [int]$Matches[1] }
+    # adversary r4-6abf870f A4: a held field past Int32 (or past Int64: unknown) never throws into Get-HeavySlotOccupancy.
+    if ($rest -match ', held (\d+) min') { $hv = [long]0; if ([long]::TryParse($Matches[1], [ref]$hv)) { $held = $hv } }
     return [pscustomobject]@{ label = $label; ownerPid = $ownerPid; since = $since; heldMin = $held }
 }
 
@@ -2413,7 +2414,7 @@ function Format-HeavySlotHolderNote {
         $hp = ConvertFrom-HeavySlotHolderText -Text $line
         if ($null -ne $hp) {
             $label = $hp.label
-            if ($null -ne $hp.heldMin) { $min = [int]$hp.heldMin }
+            if ($null -ne $hp.heldMin) { $min = [long]$hp.heldMin }
         }
         if ($null -eq $best -or $min -gt $bestMin) { $best = $label; $bestMin = $min }
     }
@@ -3321,9 +3322,10 @@ function Set-LeaseCoverageAtLaunch {
     param([Parameter(Mandatory = $true)][string]$JobId, $Admission, $Lease, [int]$TimeoutSec = 0)
     try {   # it runs just before the child is created: it never throws, so it can never stop a launch
         if ($null -eq $Admission -or $Admission.mode -ne "lease" -or $null -eq $Lease -or $null -eq $Lease.active) { return }
+        if ($TimeoutSec -le 0) { return }   # adversary r4-6abf870f A5: no job timeout changes nothing, not even the recorded remainder
         $rem = Get-QuietLeaseRemainingSec -Lease $Lease
         $Admission | Add-Member -NotePropertyName leaseRemainingAtLaunchSec -NotePropertyValue $rem -Force
-        if ($TimeoutSec -le 0 -or $Admission.leaseCoversTimeout -ne $true -or $rem -ge $TimeoutSec) { return }
+        if ($Admission.leaseCoversTimeout -ne $true -or $rem -ge $TimeoutSec) { return }
         $Admission | Add-Member -NotePropertyName leaseCoversTimeout -NotePropertyValue $false -Force
         Add-AgentLogLine "quiet-lease: lease-shorter-than-timeout job=$JobId phase=launch remaining=${rem}s timeoutSec=$TimeoutSec; the job's time past until=$([long]$Lease.active.until) is not covered by the lease (admission.leaseCoversTimeout=false)"
     }
