@@ -496,7 +496,7 @@ function Get-ShadowKind($Node, [string[]]$Names) {
         return ''
     }
     if ($Node -is [System.Management.Automation.Language.CommandAst]) {
-        $commandName = $Node.GetCommandName()
+        $commandName = Get-LiteralCommandName $Node
         if ($null -eq $commandName) { return '' }
         # A module-qualified name (Microsoft.PowerShell.Utility\Set-Alias) is the same command, and so is an alias the source defines
         # for one (r10: `Set-Alias MakeAlias Set-Alias; MakeAlias Join-Path Redirect`): every name the command resolves to is read.
@@ -1021,7 +1021,7 @@ function Get-AliasDefinitions($Top, $InitialMap, $InitialWildcard, [switch]$TopL
             }
             continue
         }
-        $commandName = $n.GetCommandName()
+        $commandName = Get-LiteralCommandName $n
         if ([string]::IsNullOrEmpty($commandName)) { continue }
         $names = Resolve-CommandNames $commandName $map $wildcard
         if (@($names | Where-Object { @('import-alias', 'ipal') -contains $_ }).Count -gt 0) { $problems.Add('Import-Alias defines aliases from a file the scan does not read'); continue }
@@ -1128,9 +1128,18 @@ function Get-AliasContext($Root, [switch]$Imported) {
     return $context
 }
 
+function Get-LiteralCommandName($Command) {
+    # The name a CommandAst invokes when the source text fixes it: GetCommandName(), or (r10 adversary A2) the constant after `&` or
+    # `.` (`& ('Rebind')`, `& 'Set-Variable'`), which GetCommandName() does not read. $null when the name is computed at run time.
+    $name = $Command.GetCommandName()
+    if (-not [string]::IsNullOrEmpty($name)) { return $name }
+    if ($Command.InvocationOperator -eq 'Unknown' -or $Command.CommandElements.Count -eq 0) { return $null }
+    return (Get-ConstantString $Command.CommandElements[0])
+}
+
 function Get-ResolvedCommandNames($Command) {
     # Every name a CommandAst may run as (Resolve-CommandNames through its tree's aliases); empty when it has no literal name.
-    $name = $Command.GetCommandName()
+    $name = Get-LiteralCommandName $Command
     if ([string]::IsNullOrEmpty($name)) { return @() }
     $context = Get-AliasContext $Command
     return @(Resolve-CommandNames $name $context.map $context.wildcard)
@@ -1307,7 +1316,8 @@ function Get-VariableRouteBinding($Root, [string]$Name) {
             if ((Get-ProviderLeaf $n.VariablePath.UserPath) -ieq 'ExecutionContext') { return 'the session-state API ($ExecutionContext)' }
         }
         elseif ($n -is [System.Management.Automation.Language.MemberExpressionAst]) {
-            $memberName = $n.Member.Extent.Text.Trim('''', '"')
+            # r10 adversary A3: a quoted member name is read by its parsed value ("GetVariab`leValue" is GetVariableValue).
+            $memberName = if ($n.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { [string]$n.Member.Value } else { $n.Member.Extent.Text.Trim('''', '"') }
             # r9 adversary A3: $PSCmdlet.GetVariableValue(<name>) hands back a variable's value (the defaults dictionary itself) by a name.
             if (@('SessionState', 'SessionStateProxy', 'PSVariable', 'GetVariableValue') -icontains $memberName) { return "the session-state API (.$memberName)" }
         }
@@ -1568,7 +1578,7 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
             $origin = if ($left -is [System.Management.Automation.Language.MemberExpressionAst]) { Get-ReceiverOrigin $left $root } else { '' }
             Add-Violation $Source $a 'R5' "assignment to $($left.GetType().Name) is not allowed" $origin
             if ($left -is [System.Management.Automation.Language.MemberExpressionAst] -and $script:receiverRouteReason) {
-                Add-Violation $Source $a 'unproven-binding' "the receiver may be bound by $($script:receiverRouteReason), a route this scan cannot follow, so the object this property set reaches is unproven" $origin 'unproven-binding'
+                Add-Violation $Source $a 'unproven-binding' "the receiver may be bound by $($script:receiverRouteReason), a route this scan cannot follow, so the object this property set reaches is unproven" '' 'unproven-binding'
             }
             continue
         }
@@ -1792,9 +1802,11 @@ function Get-SpliceCallSites([string]$Path) {
     $extractorCalls = $ast.FindAll({
         param($n)
         if ($n -isnot [System.Management.Automation.Language.CommandAst]) { return $false }
-        $commandName = $n.GetCommandName()
+        # r10 (adversary A2 sibling, A4): `& ('Get-AttrCudaEmbeddedFunctionSource')` and an alias the source defines for it are calls too.
+        $commandName = Get-LiteralCommandName $n
         if ($null -eq $commandName) { return $false }
-        return $commandName.Substring($commandName.LastIndexOf('\') + 1) -ieq 'Get-AttrCudaEmbeddedFunctionSource'
+        if ($commandName.Substring($commandName.LastIndexOf('\') + 1) -ieq 'Get-AttrCudaEmbeddedFunctionSource') { return $true }
+        return (@(Get-ResolvedCommandNames $n) -contains 'get-attrcudaembeddedfunctionsource')
     }, $true)
     foreach ($call in $extractorCalls) {
         $text = ($call.Extent.Text -replace '\s+', ' ')
@@ -1825,15 +1837,21 @@ function Get-SpliceCallSites([string]$Path) {
             Add-SpliceFinding $source $call.Extent.StartLineNumber '' $text 'the -Name list is not a literal list of function names, so the spliced bodies cannot be enumerated'
             continue
         }
-        $callName = $call.GetCommandName()
+        $callName = Get-LiteralCommandName $call
         $qualifier = if ($callName.Contains('\')) { $callName.Substring(0, $callName.LastIndexOf('\')) } else { '' }
-        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; qualifier = $qualifier; bind = (Get-SpliceModuleBinding $call $sourceDir $rootRebinding $defaultsReference) }
+        $bind = Get-SpliceModuleBinding $call $sourceDir $rootRebinding $defaultsReference
+        if ($callName.Substring($callName.LastIndexOf('\') + 1) -ine 'Get-AttrCudaEmbeddedFunctionSource') {
+            # Reached through an alias the source defines: which extractor (and so which module) it runs is not what the text names.
+            $bind = [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "the extractor is called through the alias '$callName' the source defines, so the extractor it runs is unproven" }
+        }
+        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; qualifier = $qualifier; bind = $bind }
     }
 }
 
 if ($SpliceSource.Count -gt 0) {
     $moduleTexts = [ordered]@{}
     $moduleFullPaths = @{}
+    $moduleAsts = [ordered]@{}
     foreach ($modulePath in $ModulePath) {
         $key = Get-RepoRelativePath $modulePath
         $full = (Resolve-Path -LiteralPath $modulePath).Path
@@ -1844,17 +1862,25 @@ if ($SpliceSource.Count -gt 0) {
         $moduleTokens = $null; $moduleErrors = $null
         $moduleAst = [System.Management.Automation.Language.Parser]::ParseInput($moduleTexts[$key], [ref]$moduleTokens, [ref]$moduleErrors)
         # r10: the aliases its top-level code defines are the generator's aliases too (Get-AliasContext -Imported).
-        $moduleAliases = Get-AliasDefinitions $moduleAst @{} @() -TopLevelOnly
-        foreach ($aliasKey in @($moduleAliases.map.Keys)) {
-            if (-not $script:importedAliases.map.ContainsKey($aliasKey)) { $script:importedAliases.map[$aliasKey] = [System.Collections.Generic.List[string]]::new() }
-            foreach ($target in @($moduleAliases.map[$aliasKey])) { $script:importedAliases.map[$aliasKey].Add($target) }
-        }
-        foreach ($target in @($moduleAliases.wildcard)) { $script:importedAliases.wildcard.Add($target) }
-        if ($moduleAliases.problem -and -not $script:importedAliases.problem) { $script:importedAliases.problem = "$($moduleAliases.problem) ($key)" }
+        $moduleAsts[$key] = $moduleAst
         $moduleDefaults = Get-DefaultParameterValuesReference $moduleAst
         if ($null -ne $moduleDefaults) {
             Add-SpliceFinding $key $moduleDefaults.Ast.Extent.StartLineNumber '' $key "the module refers to `$PSDefaultParameterValues ($($moduleDefaults.Reason)), whose defaults can bind any extractor call's -ModulePath or -Name at run time" 'unproven-binding'
         }
+    }
+    # r10: the aliases the modules' top-level code defines, read together until nothing is added (adversary A1: an alias of Set-Alias
+    # one module defines can define the alias another module uses), so a chain across modules is followed like one inside a file.
+    for ($pass = 0; $pass -lt 8; $pass++) {
+        $before = @($script:importedAliases.map.Values | ForEach-Object { @($_).Count } | Measure-Object -Sum).Sum + $script:importedAliases.wildcard.Count
+        foreach ($moduleKey in @($moduleAsts.Keys)) {
+            $moduleAliases = Get-AliasDefinitions $moduleAsts[$moduleKey] $script:importedAliases.map @($script:importedAliases.wildcard) -TopLevelOnly
+            $script:importedAliases.map = $moduleAliases.map
+            $script:importedAliases.wildcard = $moduleAliases.wildcard
+            if ($moduleAliases.problem -and -not $script:importedAliases.problem) { $script:importedAliases.problem = "$($moduleAliases.problem) ($moduleKey)" }
+        }
+        $after = @($script:importedAliases.map.Values | ForEach-Object { @($_).Count } | Measure-Object -Sum).Sum + $script:importedAliases.wildcard.Count
+        if ($after -eq $before) { break }
+        if ($pass -eq 7 -and -not $script:importedAliases.problem) { $script:importedAliases.problem = 'aliases of alias commands the scan stopped following after eight passes' }
     }
     $entries = [ordered]@{}
     # The module the extractor reads when a call names no -ModulePath is the module that defines the extractor

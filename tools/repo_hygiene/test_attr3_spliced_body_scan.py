@@ -1699,6 +1699,15 @@ class SplicedBodyScanSourceAliasTests(unittest.TestCase):
         "AliasComputedName": ("Set-Alias $aliasName Set-Variable\nGet-Thing PSScriptRoot 'C:\\dirty'", PSR_CALL),
         # A -ModulePath module's top-level code runs in the generator's session: its alias is the generator's alias.
         "AliasFromModule": ("RebindFromModule PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        # r10 adversary pass 1. A1: an alias of Set-Alias one module defines defines the alias another module's top-level code uses.
+        "AdvCrossModuleChain": ("RebindChained PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        # A2: a constant after `&` names the command as surely as a bare word.
+        "AdvAmpParen": ("Set-Alias Rebind Set-Variable; & ('Rebind') PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        # A3: a quoted, backtick-escaped member name is the member it parses to.
+        "AdvQuotedMember": ("[CmdletBinding()]param()\n$PSCmdlet.\"GetVariab`leValue\"(('PSDef'+'aultPara'+'meterValues'))['*:ModulePath']='C:\\dirty\\Clean.psm1'", DEF_CALL),
+        # A4 (advisory, base defect, same class): an alias the source defines for the extractor itself is an extractor call.
+        "AdvExtractorAlias": ("Set-Alias Extract AttrCudaArtifacts\\Get-AttrCudaEmbeddedFunctionSource",
+                              "Extract -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"),
     }
     # Fail closed: an alias the scan cannot resolve makes every binding it could reach unproven.
     UNRESOLVABLE = {
@@ -1743,6 +1752,8 @@ class SplicedBodyScanSourceAliasTests(unittest.TestCase):
         dirty.write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
         # Top-level code of a module the generator imports: the alias it defines is visible to the generator.
         (d / "Aliases.psm1").write_text("Set-Alias -Name RebindFromModule -Value Set-Variable -Scope Global\nfunction AliasesHelper {\n    Get-Date\n}\n", encoding="utf-8")
+        (d / "AliasesA.psm1").write_text("Set-Alias MakeAlias Set-Alias -Scope Global\n", encoding="utf-8")
+        (d / "AliasesB.psm1").write_text("MakeAlias RebindChained Set-Variable -Scope Global\n", encoding="utf-8")
         sources = []
         cases = {**cls.CALLS, **cls.UNRESOLVABLE}
         cases.update({n: (pre, call) for n, (pre, call, _) in cls.CALL_CONTROLS.items()})
@@ -1765,7 +1776,7 @@ class SplicedBodyScanSourceAliasTests(unittest.TestCase):
         cls.shadow_gen.write_text("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
                                   "Set-Alias MakeAlias Set-Alias\nMakeAlias Join-Path Redirect\n", encoding="utf-8")
         sources.append(cls.shadow_gen)
-        modules = [d / "Extractor.psm1", d / "Clean.psm1", dirty, d / "Body.psm1", d / "Aliases.psm1"]
+        modules = [d / "Extractor.psm1", d / "Clean.psm1", dirty, d / "Body.psm1", d / "Aliases.psm1", d / "AliasesB.psm1", d / "AliasesA.psm1"]
         cls.result = run_scan(templates=[cls.template], modules=modules, splice_sources=sources)
 
     def call_findings(self, name: str) -> list[dict]:
@@ -1804,6 +1815,14 @@ class SplicedBodyScanSourceAliasTests(unittest.TestCase):
                 self.assertEqual(len(setters), 1, describe(found))
                 self.assertIn("unproven-binding", setters[0]["origin"].split(";"), describe(setters))
                 self.assertIn(("R5", "$r.Attributes"), SplicedBodyScanCoverageLimitTests.unlisted(found), f"{name}: the policy dropped the setter")
+
+    def test_r10_a5_the_separate_unproven_binding_record_carries_no_origin(self) -> None:
+        # r10 adversary A5 (advisory): the header says origin is '' for every finding but an R5 property set.
+        for name in self.BODIES:
+            with self.subTest(name=name):
+                records = [f for f in self.result["splicedViolations"] if f["function"] == name and f["rule"] == "unproven-binding"]
+                self.assertTrue(records, describe(records))
+                self.assertEqual({f["origin"] for f in records}, {""}, describe(records))
 
     def test_r10_a_receiver_an_unrelated_alias_does_not_reach_stays_a_fresh_literal(self) -> None:
         found = [f for f in self.result["splicedViolations"] if f["function"] == "BodyCtlAlias"]
