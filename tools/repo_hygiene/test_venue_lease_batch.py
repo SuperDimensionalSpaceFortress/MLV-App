@@ -1956,12 +1956,14 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.run_dir.mkdir(parents=True, exist_ok=True)
         log = self.run_dir / "batch.log"
         log.write_text("", encoding="utf-8")
-        hold = self._hold_exclusive(log, 90)
-        r = self.run_plan(self.case / "missing-plan.json")
-        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("BATCH_USAGE LEG_PLAN_REFUSED reason=LEG_PLAN_UNREADABLE", r.stderr)
-        self.assertEqual(self.kinds(), [])
-        del hold
+        hold = ExclusiveHold(log)
+        try:
+            r = self.run_plan(self.case / "missing-plan.json")
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("BATCH_USAGE LEG_PLAN_REFUSED reason=LEG_PLAN_UNREADABLE", r.stderr)
+            self.assertEqual(self.kinds(), [])
+        finally:
+            hold.release()
 
     def test_r4_a1_a_spec_the_leg_process_would_throw_on_is_refused_before_the_claim_and_the_lease(self) -> None:
         # sol r3 second pass A1: Invoke-VenueLeg also throws on a malformed visualCapture / opt-out pair, a playSeconds outside [int], a scaleFactor that is not a
