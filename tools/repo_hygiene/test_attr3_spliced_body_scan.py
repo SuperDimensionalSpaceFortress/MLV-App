@@ -968,6 +968,12 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Move-Item function:Redirect ([string]('a','b'))",
         # Elements that no scope-qualified-name reading flags on its own ('function:Join', '-Path'): only the whole cast operand is a finding.
         "Copy-Item -LiteralPath function:Redirect -Destination ([string]@('function:Join','-Path'))",
+        # r7 (adversary r6 A1): the same cast over a comma list on an item command (Set-Item, New-Item) that writes the drive directly.
+        "Set-Item -LiteralPath ([string]@('function:Join','-Path')) -Value { 'C:\\fixture\\Dirty.psm1' }",
+        "New-Item -Path ([string]('alias:Split','-Path')) -Value Redirect",
+        # r7 (adversary r6 A4): $true / $false are 'True' / 'False' after a string and are an error before one, never ''.
+        "Rename-Item -LiteralPath function:Redirect -NewName ($true + 'Join-Path')",
+        "Rename-Item -LiteralPath function:Redirect -NewName (1 + 2)",
     )
     # Not shadows: the alias is for a command the scan does not evaluate, and a read of an unrelated function.
     ALIAS_CONTROLS = (
@@ -980,6 +986,11 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Move-Item -LiteralPath 'C:\\a.txt', 'C:\\b.txt' -Destination 'C:\\dir' -Force:$true",
         # r6 (Dot B9): a plain comma list (no cast) is still split into its elements and is not over-refused.
         "Copy-Item function:Redirect 'a','b'",
+        # r7 (adversary r6 A4): $false / $true read as 'False' / 'True', so these name 'Join-PathFalse' / 'Join-PathTrue', not Join-Path.
+        "Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path' + $false)",
+        "Copy-Item function:Redirect ('function:Join-Pat' + $true + 'h')",
+        # r7: a literal hashtable value on an item command is not a name.
+        "Set-Item -Path variable:harmless -Value @{ a = 1 }",
     )
     ALIAS_PREAMBLE = ("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
                       + "".join(f"{line}\n" for line in ALIAS_SHADOWS + ALIAS_COMPUTED + PROVIDER_ROUTES + RENAME_COMPUTED + ALIAS_CONTROLS))
@@ -1323,10 +1334,24 @@ class SplicedBodyScanPsScriptRootTests(unittest.TestCase):
         "PsrDriveInnerParent": "Set-Item -LiteralPath variable:x/../PSScriptRoot -Value 'C:\\dirty'\n",
         "PsrBracedParent": "${variable:../PSScriptRoot} = 'C:\\dirty'\n",
         "PsrDataStatementCommand":"data PSScriptRoot -SupportedCommand Get-Item { Get-Item -LiteralPath 'C:\\dirty' }\n",
+        # r7 (Dot B10 = r6 adversary A2): an assignment target wrapped in more than one type conversion, or in a validation attribute, is
+        # still an assignment to the variable; every wrapper is stripped, not just the outermost.
+        "PsrDoubleTyped": "[object][string]$PSScriptRoot = 'C:\\dirty'\n",
+        "PsrDoubleTypedScoped": "[object][string]$script:PSScriptRoot = 'C:\\dirty'\n",
+        "PsrDoubleTypedGlobal": "[object][string]$global:PSScriptRoot = 'C:\\dirty'\n",
+        "PsrTripleTyped": "[object][psobject][string]$PSScriptRoot = 'C:\\dirty'\n",
+        "PsrAttributed": "[ValidateNotNull()][string]$PSScriptRoot = 'C:\\dirty'\n",
+        "PsrAttributedTwice": "[ValidateNotNull()][ValidateNotNullOrEmpty()][object][string]$script:PSScriptRoot = 'C:\\dirty'\n",
+        "PsrDoubleTypedCompound": "[object][string]$PSScriptRoot += 'x'\n",
+        # r7 (adversary r6 A1): a cast over a comma list is one string at run time (joined by $OFS); on an item command it is never split.
+        "PsrDriveCastList": "Set-Item -LiteralPath ([string]@('variable:PSScript','Root')) -Value 'C:\\dirty'\n",
+        "PsrDriveCastListNew": "New-Item -Path ([string]('variable:PSScript','Root')) -Value 'C:\\dirty' -Force\n",
     }
     CONTROLS = {
         # No rebinding: the call still binds to Clean.psm1 by full path.
         "PsrPlain": "$other = 'C:\\x'\nSet-Variable -Name Unrelated -Value 1\nGet-Date -OutVariable unrelated | Out-Null\n",
+        # r7: a wrapped target that is some OTHER variable, and a cast list on an item command that names no variable, are not rebindings.
+        "PsrWrappedOther": "[object][string]$other = 'C:\\x'\n[ValidateNotNull()][string]$script:unrelated = 'y'\nSet-Item -Path variable:harmless -Value 5\n",
     }
 
     @classmethod

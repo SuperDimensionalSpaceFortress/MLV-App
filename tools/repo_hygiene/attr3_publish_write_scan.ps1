@@ -88,7 +88,10 @@
 # it is; on those commands an operand the scan cannot reduce to a constant, next to a function: / alias: route or an
 # evaluated name, is a finding of its own kind ('computed-rename'); so is an operand built only from literals that
 # the scan cannot reduce (`('Join', 'Path') -join '-'`), whatever sits beside it, because the source text fixes its
-# value; a cast over an array-valued operand (`[string]@('fun', 'ction:Join-Path')`) is never split and fails closed (OFS-dependent).
+# value; a cast over an array-valued operand (`[string]@('fun', 'ction:Join-Path')`) is never split and fails closed (OFS-dependent),
+# on an item command (Set-Item, New-Item, ...) as on a rename. r7: a constant reads $true / $false as 'True' / 'False' after a string,
+# and a '+' whose left is not a string (`1 + 2`, `$true + 'x'`) has no string value; an assignment target is stripped of EVERY
+# type conversion and attribute (`[object][string]$x = ...`, `[ValidateNotNull()][string]$x = ...`) by Get-AssignmentTarget.
 # An operand holding a variable or a command is a run-time-built value and stays a declared limit. Left OPEN: a drive
 # path built at run time (`'al' + 'ias:'`), Import-Alias, and a relative path after `Set-Location alias:`.
 #
@@ -282,7 +285,7 @@ function Get-ShadowReason([string]$Kind, [string]$Consequence) {
     switch ($Kind) {
         'computed-alias' { return "an alias command whose name is not a string constant could shadow a command this scan evaluates$Consequence" }
         'provider-path' { return "an alias: or function: path could define a command (a shadow) named like one this scan evaluates$Consequence" }
-        'computed-rename' { return "a rename, move or copy with an operand that is not a string constant could install a command (a shadow) named like one this scan evaluates$Consequence" }
+        'computed-rename' { return "a rename, move, copy or item command with an operand that is not a string constant could install a command (a shadow) named like one this scan evaluates$Consequence" }
         default { return "a function or alias named like a command this scan evaluates shadows it$Consequence" }
     }
 }
@@ -392,25 +395,42 @@ function Expand-Operands($Ast) {
     return @($Ast)
 }
 
+function Get-ConstantTyped($Ast) {
+    # A constant operand as @{ value = <its string>; kind = string | number | bool | null }, or $null when the scan cannot prove one.
+    # The kind matters for '+': a string on the left concatenates the string form of the right ($true is 'True', $false 'False',
+    # $null ''), but a number or a boolean on the left is ARITHMETIC (`1 + 2` is 3, not '12') or an error (`$true + 'x'`), and no
+    # string comes out of either, so a '+' whose left is not a string has no constant value.
+    $castToString = $false
+    $Ast = Get-UnwrappedOperand $Ast ([ref]$castToString)
+    $typed = $null
+    if ($Ast -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $typed = @{ value = [string]$Ast.Value; kind = 'string' } }
+    elseif ($Ast -is [System.Management.Automation.Language.ConstantExpressionAst]) { $typed = @{ value = [string]$Ast.Value; kind = 'number' } }
+    elseif ($Ast -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $Ast.Splatted) {
+        switch ($Ast.VariablePath.UserPath.ToLowerInvariant()) {
+            'true' { $typed = @{ value = 'True'; kind = 'bool' } }
+            'false' { $typed = @{ value = 'False'; kind = 'bool' } }
+            'null' { $typed = @{ value = ''; kind = 'null' } }
+        }
+    }
+    elseif ($Ast -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+        if ($Ast.NestedExpressions.Count -eq 0) { $typed = @{ value = [string]$Ast.Value; kind = 'string' } }
+    }
+    elseif ($Ast -is [System.Management.Automation.Language.BinaryExpressionAst] -and $Ast.Operator -eq [System.Management.Automation.Language.TokenKind]::Plus) {
+        $left = Get-ConstantTyped $Ast.Left
+        $right = Get-ConstantTyped $Ast.Right
+        if ($null -ne $left -and $null -ne $right -and $left.kind -eq 'string') { $typed = @{ value = $left.value + $right.value; kind = 'string' } }
+    }
+    if ($null -ne $typed -and $castToString) { $typed.kind = 'string' }
+    return $typed
+}
+
 function Get-ConstantString($Ast) {
     # The string a command operand always evaluates to, or $null when the scan cannot prove one. Parentheses, a one-expression
     # sub-expression, @( ) of one element, a [string] cast, a quoted string with nothing to expand, a number, $true / $false /
-    # $null and a '+' of such parts are all constants.
-    $Ast = Get-UnwrappedOperand $Ast
-    if ($Ast -is [System.Management.Automation.Language.ConstantExpressionAst]) { return [string]$Ast.Value }
-    if ($Ast -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $Ast.Splatted -and @('true', 'false', 'null') -contains $Ast.VariablePath.UserPath.ToLowerInvariant()) { return '' }
-    if ($Ast -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
-        if ($Ast.NestedExpressions.Count -eq 0) { return [string]$Ast.Value }
-        return $null
-    }
-    if ($Ast -is [System.Management.Automation.Language.BinaryExpressionAst] -and $Ast.Operator -eq [System.Management.Automation.Language.TokenKind]::Plus) {
-        $left = Get-ConstantString $Ast.Left
-        if ($null -eq $left) { return $null }
-        $right = Get-ConstantString $Ast.Right
-        if ($null -eq $right) { return $null }
-        return $left + $right
-    }
-    return $null
+    # $null (as 'True' / 'False' / '') and a '+' of such parts that starts with a string are all constants (Get-ConstantTyped).
+    $typed = Get-ConstantTyped $Ast
+    if ($null -eq $typed) { return $null }
+    return $typed.value
 }
 
 function Test-BuiltFromLiteralsOnly($Ast) {
@@ -423,6 +443,17 @@ function Test-BuiltFromLiteralsOnly($Ast) {
         return $false
     }
     return $true
+}
+
+$script:itemCommands = @('set-item', 'si', 'new-item', 'ni', 'clear-item', 'cli', 'remove-item', 'ri', 'rm', 'del', 'erase', 'rd', 'rmdir',
+                         'set-itemproperty', 'sp', 'new-itemproperty', 'clear-itemproperty', 'clp', 'remove-itemproperty', 'rp')
+
+function Test-DataLiteralOperand($Ast) {
+    # A literal hashtable (not cast to a string) is a value handed to a command, never a name or a path it resolves. A cast over a
+    # comma list is NOT one: it is a string, the very operand the r6 rule refuses to split.
+    $cast = $false
+    $inner = Get-UnwrappedOperand $Ast ([ref]$cast)
+    return ($inner -is [System.Management.Automation.Language.HashtableAst] -and -not $cast)
 }
 
 function Get-ShadowKind($Node, [string[]]$Names) {
@@ -451,7 +482,7 @@ function Get-ShadowKind($Node, [string[]]$Names) {
                     $constant = Get-ConstantString $operand
                     if ($null -eq $constant) {
                         $unreadable = $true
-                        if (Test-BuiltFromLiteralsOnly $operand) { $fixedButUnread = $true }
+                        if ((Test-BuiltFromLiteralsOnly $operand) -and -not (Test-DataLiteralOperand $operand)) { $fixedButUnread = $true }
                         continue
                     }
                     if ($constant -match $script:providerRoutePattern) {
@@ -468,6 +499,9 @@ function Get-ShadowKind($Node, [string[]]$Names) {
             }
             if ($routed -and $named) { return 'provider-path' }
             if ($renameCommands -contains $commandName.ToLowerInvariant() -and ($fixedButUnread -or ($unreadable -and ($routed -or $named)))) { return 'computed-rename' }
+            # An item command writes the alias: / function: drive directly (`Set-Item ([string]@('function:Join','-Path')) -Value {...}`),
+            # so a path built only from literals that the scan cannot read fails closed here too, as it does on a rename.
+            if ($script:itemCommands -contains $commandName.ToLowerInvariant() -and $fixedButUnread) { return 'computed-rename' }
             return ''
         }
         # Any constant element naming a shadowed command counts, whichever parameter it follows (the conservative reading).
@@ -573,12 +607,30 @@ function Test-SafeChild($Ast) {
     return $true
 }
 
+function Get-AssignmentTarget($Left) {
+    # What an assignment writes to, with EVERY type conversion and attribute stripped: `[object][string]$x = ...` and
+    # `[ValidateNotNull()][string]$x = ...` nest one wrapper per bracket, and each one is an AttributedExpressionAst (a
+    # ConvertExpressionAst is the kind that carries a type). Stripping only the outermost leaves the next wrapper in place, and the
+    # target then looks like something that is not a variable.
+    while ($Left -is [System.Management.Automation.Language.AttributedExpressionAst]) { $Left = $Left.Child }
+    return $Left
+}
+
+function Get-AssignmentConversionTypes($Left) {
+    # The type names of every conversion wrapped around an assignment target, outermost first ([ValidateNotNull()] is not one).
+    $types = [System.Collections.Generic.List[string]]::new()
+    while ($Left -is [System.Management.Automation.Language.AttributedExpressionAst]) {
+        if ($Left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $types.Add($Left.Type.TypeName.FullName) }
+        $Left = $Left.Child
+    }
+    return $types.ToArray()
+}
+
 function Get-AssignmentsTo($Root, [string]$Name) {
     @($Root.FindAll({
         param($n)
         if ($n -isnot [System.Management.Automation.Language.AssignmentStatementAst]) { return $false }
-        $left = $n.Left
-        if ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
+        $left = Get-AssignmentTarget $n.Left
         ($left -is [System.Management.Automation.Language.VariableExpressionAst]) -and ((Get-VariableName $left).name -ieq $Name)
     }, $true))
 }
@@ -591,8 +643,9 @@ function Get-AssignedObjectOrigin($Assignment) {
     # Only these casts keep a hashtable literal an in-memory PowerShell object; any other target type (`[EventLog]@{...}`)
     # builds an instance of that type, on the left (`[T]$v = @{...}`) as well as on the right.
     $literalTypes = @('ordered', 'pscustomobject', 'hashtable')
-    if ($Assignment.Left -is [System.Management.Automation.Language.ConvertExpressionAst] -and
-        $literalTypes -notcontains $Assignment.Left.Type.TypeName.FullName) { return 'other' }
+    foreach ($type in (Get-AssignmentConversionTypes $Assignment.Left)) {
+        if ($literalTypes -notcontains $type) { return 'other' }
+    }
     $node = $Assignment.Right
     while ($true) {
         if ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1) { $node = $node.PipelineElements[0]; continue }
@@ -645,8 +698,7 @@ function Get-ReceiverOrigin($Target, $Root) {
     # another scope's, so the receiver may still be a caller's: it counts as a binding of unknown origin.
     $allAssignments = @(Get-AssignmentsTo $Root $v.name)
     $assignments = @($allAssignments | Where-Object {
-        $left = $_.Left
-        if ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
+        $left = Get-AssignmentTarget $_.Left
         @('', 'local') -contains (Get-VariableName $left).scope.ToLowerInvariant()
     })
     $origins = @($assignments | ForEach-Object { Get-AssignedObjectOrigin $_ }) + @(Get-OtherBindings $Root $v.name)
@@ -706,7 +758,7 @@ function Get-OtherBindings($Root, [string]$Name, [switch]$SkipVariableParameters
             # `data r -SupportedCommand Get-Item { ... }` assigns the section's result to $r: a binding of unknown origin.
             if (Test-DataStatementBinds $node $Name) { $tags.Add('other') }
         } elseif ($node -is [System.Management.Automation.Language.AssignmentStatementAst]) {
-            $left = $node.Left
+            $left = Get-AssignmentTarget $node.Left
             if ($left -is [System.Management.Automation.Language.ArrayLiteralAst] -or $left -is [System.Management.Automation.Language.ParenExpressionAst]) {
                 $bound = @($left.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] -and (Get-VariableName $n).name -ieq $Name }, $true))
                 if ($bound.Count -gt 0) { $tags.Add('other') }
@@ -928,8 +980,7 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
         }
     }
     foreach ($a in $root.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
-        $left = $a.Left
-        if ($left -is [System.Management.Automation.Language.ConvertExpressionAst]) { $left = $left.Child }
+        $left = Get-AssignmentTarget $a.Left
         if ($left -is [System.Management.Automation.Language.IndexExpressionAst]) {
             if ($left.Target -isnot [System.Management.Automation.Language.VariableExpressionAst] -or (Get-VariableName $left.Target).scope -ne '' -or
                 $rootVariables -contains (Get-VariableName $left.Target).name) {
@@ -1045,6 +1096,12 @@ function Get-PsScriptRootRebinding($Root) {
     foreach ($n in @($Root.FindAll({ param($x) $true }, $true))) {
         if ($n -is [System.Management.Automation.Language.CommandAst]) {
             # A route built from constants ('vari' + 'able:PSScriptRoot') has no string node of its own; a plain string is read below.
+            $itemCommandName = $n.GetCommandName()
+            $isItemCommand = $false
+            if ($null -ne $itemCommandName) {
+                $itemCommandName = $itemCommandName.Substring($itemCommandName.LastIndexOf('\') + 1).ToLowerInvariant()
+                $isItemCommand = $script:itemCommands -contains $itemCommandName
+            }
             foreach ($element in @($n.CommandElements | Select-Object -Skip 1)) {
                 $operandRoot = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
                 if ($null -eq $operandRoot) { continue }
@@ -1055,6 +1112,13 @@ function Get-PsScriptRootRebinding($Root) {
                     if ($null -ne $constant -and $constant -match $variableRoute) {
                         $reducedRest = Get-ProviderLeaf $Matches[1]
                         if (Test-VariableTailReachesRoot $reducedRest) { return 'the variable: drive' }
+                    }
+                    # An item command's path built only from literals the scan cannot reduce (a cast over a comma list, a -join) is
+                    # decided by the source text but unreadable here: it could name variable:PSScriptRoot, so it fails closed.
+                    # Only when its literal fragments, put together, can spell the drive name ('vari', 'able:' in any order of joining).
+                    if ($isItemCommand -and $null -eq $constant -and (Test-BuiltFromLiteralsOnly $operand) -and -not (Test-DataLiteralOperand $operand) -and
+                        (-join @($operand.FindAll({ param($x) $x -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value })) -match '(?i)variable') {
+                        return 'the variable: drive (an item command path the scan cannot read as a string constant)'
                     }
                 }
             }
