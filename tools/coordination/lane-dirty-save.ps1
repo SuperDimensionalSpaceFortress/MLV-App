@@ -27,20 +27,34 @@ function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem,
     return $null
 }
 
-# True only when the saved patch names the same files with the same added/deleted line counts as git reports for the tree it was cut from (DiffMode = 'HEAD' or '--cached').
-# A file-boundary or hunk-boundary cut is still a well-formed patch that reverse-applies, so only this comparison (git diff --numstat vs git apply --numstat) sees the loss.
-function Test-DirtyPatchComplete([string]$Wt, [string]$Patch, [string[]]$DiffMode) {
-    $expected = @(& git -C $Wt -c core.quotepath=false diff @DiffMode --numstat --no-renames --no-ext-diff --no-textconv 2>$null)
-    if ($LASTEXITCODE -ne 0) { return $false }
-    if (-not (Test-Path -LiteralPath $Patch) -or (Get-Item -LiteralPath $Patch).Length -eq 0) { return ($expected.Count -eq 0) }
-    $actual = @(& git -C $Wt -c core.quotepath=false apply --numstat $Patch 2>$null)
-    if ($LASTEXITCODE -ne 0) { return $false }
-    return ((@($expected | Sort-Object) -join "`n") -ceq (@($actual | Sort-Object) -join "`n"))
+# True only when the saved file is byte-identical to what git writes to a pipe for the same diff (GitDiffArgs = the arguments after `git -C <Wt>`, without --output).
+# A cut at a file boundary, a hunk boundary or just before `\ No newline at end of file` is still a well-formed patch that keeps every line count and reverse-applies, and a
+# full volume can make git write less than it was given without a non-zero exit; only a byte-exact comparison against git's own stream sees every such loss.
+function Test-DirtyPatchComplete([string]$Wt, [string]$Patch, [string[]]$GitDiffArgs) {
+    if (-not (Test-Path -LiteralPath $Patch)) { return $false }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = @(Get-Command git -CommandType Application)[0].Source
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    foreach ($a in (@('-C', $Wt) + $GitDiffArgs)) { [void]$psi.ArgumentList.Add($a) }
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $null = $p.StandardError.ReadToEndAsync()  # drained so a chatty git cannot block on a full stderr pipe
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $live = ([BitConverter]::ToString($sha.ComputeHash($p.StandardOutput.BaseStream)) -replace '-', '').ToLowerInvariant()
+        $p.WaitForExit()
+        if ($p.ExitCode -ne 0) { return $false }
+    } finally { $p.Dispose() }
+    return ($live -ceq (Get-FileHash -LiteralPath $Patch -Algorithm SHA256).Hash.ToLowerInvariant())
 }
 
 function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardName = '', [string]$RoundName = '') {
     $tmp = $null; $stagedTmp = $null; $statTmp = $null
     $CardName = $CardName -replace '\s+', ' '; $RoundName = $RoundName -replace '\s+', ' '  # the result is one line
+    # -C $Wt names the repository, so a GIT_DIR / GIT_INDEX_FILE / GIT_DIFF_OPTS inherited from the caller is cleared for the call and put back afterwards.
+    # These variables change which repository git reads or the shape of the diff it writes; GIT_DIFF_OPTS=--unified=0, for one, beats the explicit -U3.
+    $gitEnv = 'GIT_DIFF_OPTS', 'GIT_EXTERNAL_DIFF', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX'
+    $savedEnv = @{}
+    foreach ($v in $gitEnv) { if (Test-Path -LiteralPath "Env:$v") { $savedEnv[$v] = (Get-Item -LiteralPath "Env:$v").Value; Remove-Item -LiteralPath "Env:$v" } }  # removed, not emptied: git reads an empty GIT_DIR as a path
     try {
         if (-not (Test-Path -LiteralPath $Dest -PathType Container)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=no-run-dir" }
         $Dest = (Resolve-Path -LiteralPath $Dest).ProviderPath  # git -C $Wt would resolve a relative --output against the worktree, not the caller
@@ -49,12 +63,12 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $tmp = Join-Path $Dest ('dirty-worktree-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
         # The diff shape is pinned on every diff the saver runs, so no user, global or repo config can change what `git apply` (default -p1) has to read back:
         # a/ b/ prefixes (diff.noprefix / diff.mnemonicPrefix), no external driver or textconv (diff.external), -U3 (diff.context=0 and diff.interHunkContext would
-# emit a patch plain git apply rejects), no color (color.ui=always), short submodule lines (diff.submodule=log) and no rename detection (diff.renames), so the
-        # numstat comparison below sees the same file list on both sides.
-        $shape = @('--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--submodule=short', '-U3', '--src-prefix=a/', '--dst-prefix=b/')
+        # emit a patch plain git apply rejects), no color (color.ui=always), short submodule lines (diff.submodule=log), submodules never ignored
+        # (diff.ignoreSubmodules=all would hide a gitlink change) and no rename detection (diff.renames).
+        $shape = @('--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--submodule=short', '--ignore-submodules=none', '-U3', '--src-prefix=a/', '--dst-prefix=b/')
         & git -C $Wt diff HEAD @shape "--output=$tmp" 2>$null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-exit-$LASTEXITCODE" }
-        if (-not (Test-DirtyPatchComplete -Wt $Wt -Patch $tmp -DiffMode @('HEAD'))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=patch-incomplete" }
+        if (-not (Test-DirtyPatchComplete -Wt $Wt -Patch $tmp -GitDiffArgs (@('diff', 'HEAD') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=patch-incomplete" }
         $full = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
         # The name is the first 8 hex of the hash, lengthened until it is free or already holds these exact bytes (two different diffs may share a prefix).
         $bytes = (Get-Item -LiteralPath $tmp).Length
@@ -78,7 +92,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $stat = $statPlaced.Path
         # Staged content the working tree no longer has (staged, then edited back) is invisible to diff HEAD; keep it in its own file when it exists.
         # Whether anything is staged is asked of git (exit 1 = yes), never inferred from the size of a file a failed write may have emptied.
-        & git -C $Wt diff --cached --quiet --no-ext-diff 2>$null
+        & git -C $Wt diff --cached --quiet --no-ext-diff --ignore-submodules=none 2>$null
         $stagedState = $LASTEXITCODE
         if ($stagedState -notin 0, 1) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-staged-check-exit-$stagedState patch=$patch" }
         $stagedOut = 'none'
@@ -87,9 +101,9 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             & git -C $Wt diff --cached @shape "--output=$stagedTmp" 2>$null
             $stagedExit = $LASTEXITCODE
             if ($stagedExit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-staged-diff-exit-$stagedExit patch=$patch" }
-            # A full volume can cut the file short without git saying so: the staged diff must be non-empty and must list every file, with every line count, git reports for the index.
+            # A full volume can cut the file short without git saying so: the staged diff must be non-empty and byte-identical to git's own stream for the index.
             if (-not (Test-Path -LiteralPath $stagedTmp) -or (Get-Item -LiteralPath $stagedTmp).Length -eq 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete patch=$patch" }
-            if (-not (Test-DirtyPatchComplete -Wt $Wt -Patch $stagedTmp -DiffMode @('--cached'))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete patch=$patch" }
+            if (-not (Test-DirtyPatchComplete -Wt $Wt -Patch $stagedTmp -GitDiffArgs (@('diff', '--cached') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete patch=$patch" }
             $stagedFull = (Get-FileHash -LiteralPath $stagedTmp -Algorithm SHA256).Hash.ToLowerInvariant()
             $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull
             if (-not $stagedPlaced) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=name-collision patch=$patch" }
@@ -101,5 +115,8 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=git -C `"$Wt`" apply `"$patch`""
     }
     catch { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($_.Exception.Message -replace '\s+', ' ')" }
-    finally { foreach ($t in $tmp, $stagedTmp, $statTmp) { if ($t -and (Test-Path -LiteralPath $t)) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } } }
+    finally {
+        foreach ($t in $tmp, $stagedTmp, $statTmp) { if ($t -and (Test-Path -LiteralPath $t)) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } }
+        foreach ($v in $savedEnv.Keys) { Set-Item -LiteralPath "Env:$v" -Value $savedEnv[$v] }
+    }
 }

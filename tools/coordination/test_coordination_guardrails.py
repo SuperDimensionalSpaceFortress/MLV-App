@@ -2472,15 +2472,19 @@ def test_save_dirty_worktree_evidence_never_overwrites_a_status_snapshot_for_the
     assert third.stdout.startswith("DIRTY_TREE_SAVED") and len(list(dest.glob("dirty-worktree-*.status*.txt"))) == 2, "an identical status snapshot is reused, not duplicated"
 
 
-def _truncate_staged_at_second_file_shim(second_marker):
+def _cut_diff_output_shim(marker):
     # A PowerShell function named git outranks git.exe for the helper's `& git` calls: it runs the real git, then cuts the output file of `diff --cached` / `diff HEAD`
-    # right before the SECOND file header (so the first file's patch stays whole) and keeps git's exit code 0.
+    # right before the first line that starts with `marker` (the patch before it stays whole and well-formed) and keeps git's exit code 0.
     return (f"$script:RealGit = '{shutil.which('git')}'; "
             "function git { & $script:RealGit @args; $code = $LASTEXITCODE; "
             "$o = @($args | Where-Object { $_ -like '--output=*' })[0]; "
             "if ($o -and $args -contains 'diff') { $p = $o.Substring(9); $t = [System.IO.File]::ReadAllText($p); "
-            f"$i = $t.IndexOf(\"`ndiff --git a/{second_marker}\"); if ($i -gt 0) {{ [System.IO.File]::WriteAllText($p, $t.Substring(0, $i + 1)) }} }}; "
+            f"$i = $t.IndexOf(\"`n{marker}\"); if ($i -gt 0) {{ [System.IO.File]::WriteAllText($p, $t.Substring(0, $i + 1)) }} }}; "
             "$global:LASTEXITCODE = $code }")
+
+
+def _truncate_staged_at_second_file_shim(second_marker):
+    return _cut_diff_output_shim(f"diff --git a/{second_marker}")
 
 
 @dirty_save_only
@@ -2497,6 +2501,64 @@ def test_save_dirty_worktree_evidence_fails_typed_when_a_staged_diff_loses_a_who
     out = dirty_save_pwsh(f"{_truncate_staged_at_second_file_shim('src/b.txt')}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
     assert out.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=staged-diff-incomplete"), out.stdout + out.stderr
     assert not list(dest.glob("dirty-worktree-staged-*")) and not list(dest.glob("*.tmp"))
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_typed_when_a_staged_diff_loses_its_no_newline_marker(tmp_path):
+    # r3 round-3 adversary A1: a cut right before `\ No newline at end of file` keeps every line count, so only a byte-exact comparison against git's own output sees it.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    (wt / "src" / "a.txt").write_bytes(b"two")
+    git(wt, "add", "src/a.txt")
+    (wt / "src" / "a.txt").write_text("one\n")
+    out = dirty_save_pwsh(f"{_cut_diff_output_shim(chr(92) + ' No newline at end of file')}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=staged-diff-incomplete"), out.stdout + out.stderr
+    assert not list(dest.glob("dirty-worktree-staged-*")) and not list(dest.glob("*.tmp"))
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_ignores_git_environment_that_changes_the_diff_or_the_repo(tmp_path):
+    # r3 round-3 adversary A2: GIT_DIFF_OPTS=--unified=0 beats -U3 and made the saved patch unusable for plain git apply; a stray GIT_DIR / GIT_INDEX_FILE would aim the saver at another repo.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    (wt / "src" / "a.txt").write_text("alpha\nbeta\ngamma\n")
+    git(wt, "add", "src/a.txt")
+    git(wt, "commit", "-qm", "three lines")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(wt), str(clone))
+    (wt / "src" / "a.txt").write_text("alpha\nBETA\ngamma\n")
+    git(wt, "add", "src/a.txt")
+    other = tmp_path / "other"
+    other.mkdir()
+    make_repo(other)
+    env = {**os.environ, "GIT_DIFF_OPTS": "--unified=0", "GIT_DIR": str(other / ".git"), "GIT_WORK_TREE": str(other), "GIT_INDEX_FILE": str(tmp_path / "stray-index")}
+    out = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command",
+                          f". '{DIRTY_SAVE_LIB}'; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1"],
+                         text=True, capture_output=True, env=env)
+    assert out.stdout.startswith("DIRTY_TREE_SAVED") and "verified=reverse-apply-ok" in out.stdout, out.stdout + out.stderr
+    for saved in (next(dest.glob("dirty-worktree-*.patch")), next(dest.glob("dirty-worktree-staged-*.diff"))):
+        assert " alpha\n" in saved.read_text(encoding="utf-8"), saved.name
+        fresh = tmp_path / ("clone-" + saved.suffix.lstrip("."))
+        git(tmp_path, "clone", "-q", str(clone), str(fresh))
+        git(fresh, "apply", str(saved))
+        assert (fresh / "src" / "a.txt").read_text() == "alpha\nBETA\ngamma\n", saved.name
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_keeps_a_staged_gitlink_despite_ignore_submodules_config(tmp_path):
+    # r3 round-3 adversary A3: diff.ignoreSubmodules=all hid the gitlink from the quiet query and from both diffs, so SAVED reported staged=none.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    head = git(wt, "rev-parse", "HEAD")
+    git(wt, "update-index", "--add", "--cacheinfo", f"160000,{head},vendor/sub")
+    git(wt, "commit", "-qm", "gitlink")
+    (wt / "vendor" / "sub").mkdir(parents=True)  # an uninitialised submodule directory
+    git(wt, "update-index", "--cacheinfo", f"160000,{'1' * 40},vendor/sub")
+    git(wt, "config", "diff.ignoreSubmodules", "all")
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVED") and " staged=none " not in out.stdout, out.stdout + out.stderr
+    staged = next(dest.glob("dirty-worktree-staged-*.diff")).read_text(encoding="utf-8")
+    assert "Subproject commit " + "1" * 40 in staged, staged
 
 
 @dirty_save_only
