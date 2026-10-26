@@ -5523,6 +5523,22 @@ V2_PROBE = {"schema": "mlv-app/venue-quiet-probe/v2", "host": "BACHELOR", "sampl
             "notes": {}}
 
 
+# ---------------------------------------------------------------------------------------------------
+# VENUE-QUIET-PER-CORE-VERDICT-1: the machine-wide mean (-ThresholdPercent 20) can call a venue QUIET while one fast core runs flat out (one saturated core on 20 logical CPUs
+# is ~5 % of the total; BACHELOR-HEAT-WHILE-QUIET-DIAG-1 r1 measured busiest cores of 66 % and 82-92 % under a < 20 % mean, at 100 C). The gate adds a busiest-FAST-core check
+# beside the mean: LOGGED FIRST (one `  percore` line, always) and OFF by default (-PerCoreEnforce turns the BUSY verdict on). Off, every verdict, exit code and existing line is unchanged.
+def _pc_cores(*rows) -> list:
+    """rows: (instance, core_class, percent[, extra dict])"""
+    out = []
+    for r in rows:
+        row = {"instance": r[0], "core_class": r[1], "efficiency_class": {"P": 1, "E": 0, "uniform": 0}.get(r[1]), "percent": r[2],
+               "validSamples": 3, "totalSamples": 3, "incomplete": False}
+        if len(r) > 3:
+            row.update(r[3])
+        out.append(row)
+    return out
+
+
 @requires_windows_pwsh
 class VenueQuietAttributionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -5542,10 +5558,10 @@ class VenueQuietAttributionTests(unittest.TestCase):
         (self.tree / "tools" / "profiling" / "um-run.ps1").write_text(STUB_UM_RUN_FOR_QUIET_LINE, encoding="utf-8")
         self.work = self.tmp / "work"
 
-    def gate(self, probe: dict) -> subprocess.CompletedProcess:
+    def gate(self, probe: dict, *extra: str) -> subprocess.CompletedProcess:
         import os
         return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
-                               "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1"],
+                               "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1", *extra],
                               capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_LINE=json.dumps(probe)))
 
     def test_a_v2_line_is_attributed_after_the_verdict_and_the_verdict_is_unchanged(self) -> None:
@@ -5705,6 +5721,126 @@ class VenueQuietAttributionTests(unittest.TestCase):
         if p["core_topology"] == "unknown":
             self.assertIn("core_class", p["notes"])
         self.assertTrue(all(isinstance(k, str) and isinstance(v, str) and v for k, v in p["notes"].items()))
+
+    QUIET_SAMPLES = [10.0, 10.0, 10.0]
+
+    def probe(self, cores: list, samples: list | None = None) -> dict:
+        return dict(json.loads(json.dumps(V2_PROBE)), samples=samples or self.QUIET_SAMPLES, cores=cores)
+
+    def percore_lines(self, proc: subprocess.CompletedProcess) -> list:
+        return [ln for ln in proc.stdout.splitlines() if ln.startswith("  percore ")]
+
+    HOT = ("0,2", "P", 82.0)
+    COOL = ("0,0", "P", 30.0)
+    EHOT = ("0,8", "E", 95.0)
+
+    def test_off_by_default_a_quiet_mean_stays_quiet_and_the_line_records_what_the_check_would_have_said(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.COOL, self.HOT, self.EHOT)))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% threshold=20(\.0)?% waitedSec=\d+$", "off: the verdict is the mean's, unchanged")
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=false threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true"])
+
+    def test_on_a_hot_fast_core_under_a_quiet_mean_is_busy_and_names_the_core(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.COOL, self.HOT)), "-PerCoreEnforce")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=10\.0% threshold=20(\.0)?% waitedSec=\d+$")
+        self.assertNotRegex(proc.stdout, r"(?m)^QUIET ")
+        self.assertRegex(proc.stdout, r"(?m)^PROBE \S+ bachelor samples=10\.0/10\.0/10\.0 mean=10\.0% state=BUSY note=percore core=0_2 ")
+        lines = self.percore_lines(proc)
+        self.assertEqual(lines[0], "  percore enabled=true threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true")
+        self.assertIn("  percore blocked core=0_2 percent=82.0% threshold=60.0%", lines)
+
+    def test_on_a_cool_fast_core_leaves_the_quiet_verdict_alone(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.COOL, ("0,2", "P", 47.0), self.EHOT)), "-PerCoreEnforce")
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% ")
+        self.assertEqual(self.percore_lines(proc), ["  percore enabled=true threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=47.0% would_block=false"])
+
+    def test_the_threshold_is_inclusive_and_a_parameter(self) -> None:
+        at = self.gate(self.probe(_pc_cores(("0,2", "P", 60.0))))
+        self.assertIn("would_block=true", at.stdout, "busiest >= threshold")
+        raised = self.gate(self.probe(_pc_cores(self.HOT)), "-PerCoreThresholdPercent", "90", "-PerCoreEnforce")
+        self.assertRegex(raised.stdout, r"(?m)^QUIET ")
+        self.assertIn("threshold=90.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=false", raised.stdout)
+
+    def test_an_efficiency_core_never_counts_and_a_uniform_class_is_fast(self) -> None:
+        e_only_hot = self.gate(self.probe(_pc_cores(self.COOL, self.EHOT)), "-PerCoreEnforce")
+        self.assertRegex(e_only_hot.stdout, r"(?m)^QUIET ", "a busy E-core is not the fast-core check's business")
+        self.assertIn("busiest_fast_core=0_0 busiest_fast_pct=30.0% would_block=false", e_only_hot.stdout)
+        uniform = self.gate(self.probe(_pc_cores(("0,0", "uniform", 20.0), ("0,1", "uniform", 71.0))))
+        self.assertIn("busiest_fast_core=0_1 busiest_fast_pct=71.0% would_block=true", uniform.stdout)
+
+    def test_the_unrounded_per_core_mean_decides_not_the_two_decimal_display(self) -> None:
+        # the probe rounds `percent` to 2 dp; percent_exact is the unrounded valid-sample mean. 59.9996 prints as 60.0 but is below 60.
+        core = _pc_cores(("0,2", "P", 60.0, {"percent_exact": 59.9996}))
+        proc = self.gate(self.probe(core), "-PerCoreEnforce")
+        self.assertRegex(proc.stdout, r"(?m)^QUIET ", "three 20.04 % samples are BUSY at 20 for the mean rule; the same unrounded rule applies per core")
+        self.assertIn("would_block=false", proc.stdout)
+        over = self.gate(self.probe(_pc_cores(("0,2", "P", 60.0, {"percent_exact": 60.0004}))))
+        self.assertIn("would_block=true", over.stdout)
+
+    def test_an_unknown_class_core_makes_the_answer_null_with_a_reason_and_never_blocks(self) -> None:
+        for flags in ((), ("-PerCoreEnforce",)):
+            proc = self.gate(self.probe(_pc_cores(self.HOT, ("0,5", "unknown", 20.0))), *flags)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% ", f"unknown never blocks (flags={flags})")
+            line = self.percore_lines(proc)[0]
+            self.assertIn("would_block=null reason=core-class-unknown", line)
+            self.assertNotIn("would_block=false", line, "never a silent false")
+
+    def test_no_cores_is_null_with_a_reason(self) -> None:
+        for drop_field in (False, True):
+            probe = self.probe([])
+            if drop_field:
+                del probe["cores"]
+            proc = self.gate(probe)
+            self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% ")
+            self.assertEqual(self.percore_lines(proc), ["  percore enabled=false threshold=60.0% busiest_fast_core=n/a busiest_fast_pct=n/a would_block=null reason=no-cores"])
+
+    def test_an_incomplete_fast_core_is_null_with_a_reason_but_an_incomplete_efficiency_core_is_not(self) -> None:
+        partial = {"validSamples": 2, "incomplete": True}
+        bad = self.gate(self.probe(_pc_cores(("0,2", "P", 82.0, partial), self.COOL)), "-PerCoreEnforce")
+        self.assertRegex(bad.stdout, r"(?m)^QUIET ", "unknown is not a block")
+        self.assertIn("would_block=null reason=incomplete-samples", bad.stdout)
+        fine = self.gate(self.probe(_pc_cores(self.COOL, ("0,8", "E", 90.0, partial))))
+        self.assertIn("would_block=false", fine.stdout)
+
+    def test_a_non_numeric_core_percent_is_null_not_zero(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(("0,2", "P", "hot"), self.COOL)))
+        self.assertIn("would_block=null reason=invalid-core-percent", proc.stdout)
+
+    def test_a_v1_probe_prints_no_percore_line_off_and_a_null_line_on(self) -> None:
+        off = self.gate(V1_PROBE)
+        self.assertEqual(self.percore_lines(off), [], "a probe without v2 prints exactly what it printed before")
+        on = self.gate(V1_PROBE, "-PerCoreEnforce")
+        self.assertRegex(on.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+        self.assertIn("would_block=null reason=no-cores", on.stdout)
+
+    def test_the_mean_rule_still_wins_when_the_mean_is_busy(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.COOL), samples=[50.0, 50.0, 50.0]), "-PerCoreEnforce")
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+        self.assertIn("would_block=false", proc.stdout)
+        self.assertNotIn("percore blocked", proc.stdout, "blocked is only for a mean-QUIET venue the per-core check overrode")
+
+    def test_an_unmeasured_venue_prints_no_percore_line_and_exits_six(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.HOT), samples=[5.0, None, 5.0]), "-PerCoreEnforce")
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertEqual(self.percore_lines(proc), [])
+
+    def test_the_offline_decision_output_is_unchanged(self) -> None:
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-SamplesJson", "[12.5, 18.0, 21.0]"],
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.stdout.strip(), "DECISION QUIET mean=17.2%", proc.stdout + proc.stderr)
+
+    def test_the_header_documents_the_default_threshold_and_the_evidence(self) -> None:
+        header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
+        for token in ("VENUE-QUIET-PER-CORE-VERDICT-1", "-PerCoreEnforce", "-PerCoreThresholdPercent", "default 60", "OFF by default", "would_block"):
+            self.assertIn(token, header)
+
+    def test_the_real_probe_job_emits_the_unrounded_core_mean_beside_the_rounded_one(self) -> None:
+        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        body = re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
+        self.assertIn("percent_exact", body)
 
 
 # ---------------------------------------------------------------------------------------------------
