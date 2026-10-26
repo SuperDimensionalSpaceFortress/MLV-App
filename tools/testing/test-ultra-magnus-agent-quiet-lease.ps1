@@ -2465,11 +2465,27 @@ function Exit-HeavySlot {
             Assert-True ($reqsA.Count -eq 2 -and $gapA -ge 0 -and $gapA -le ($LeaseRetrySec + 3)) "heat-trace B1: the refused request is asked again on the base schedule (within LeaseRetrySec + 3 s), not after the 6 s probe: requests=$($reqsA.Count) gap=$([Math]::Round($gapA, 2)) s"
             Assert-True ($admA.label -ceq 'clear') "heat-trace B1: admitted before the 12 s queue ceiling, not expired by the probe: label=$($admA.label) why=$($admA.why)"
             Assert-True ($snapA.Count -eq 1 -and $snapA[0] -match 'slot 1: suite X pid=77 age=\d+s; slot 2: free') "heat-trace B1: the request snapshot is still logged, from the loop's poll: $($snapA -join ' || ')"
-            $results.leaseHeatTraceAsyncRetry = [ordered]@{ label = $admA.label; requests = $reqsA.Count; retryGapSec = [Math]::Round($gapA, 2); waitedSec = $admA.waitedSec; requestSnapshot = $snapA[0] }
             if ($null -ne $script:QuietLease) { Exit-HeavySlot }
+            # adversary r3-a96d3fe5 A1: the probe's bound is checked FIRST (an answer that came only after it is a timeout, not a success), and a
+            # caller about to sleep past the bound (HorizonSec, the inbox loop's poll) has a still-running probe stopped now. Bound 1 s here.
+            $script:LeaseSnapshotProbeSec = 1; $script:StatusDelaySec = 0; Sync-FakeStatus
+            $cLate = Start-HeavySlotCli -Arguments @('status', '--slots', '2')
+            $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = 'jHtL'; phase = 'grant'; call = $cLate; clock = [System.Diagnostics.Stopwatch]::StartNew() })
+            $null = $cLate.proc.WaitForExit(10000); Start-Sleep -Milliseconds 1100   # it has answered (rc 0, slot lines), but only after its 1 s bound
+            Update-LeaseSlotSnapshots
+            $lateL = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtL *' })
+            Assert-True ($lateL.Count -eq 1 -and $lateL[0] -match ' slots=unknown\(timeout 1 s\)$') "heat-trace A1(r3): a probe that answered only after its bound is logged as a timeout, never a success: $($lateL -join ' || ')"
+            $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 8; Sync-FakeStatus
+            Add-LeaseSlotSnapshot -JobId 'jHtH' -Phase 'grant'
+            Start-Sleep -Milliseconds 300
+            $pidH = $script:LeaseSlotSnapshots[$script:LeaseSlotSnapshots.Count - 1].call.proc.Id
+            Update-LeaseSlotSnapshots -HorizonSec 60
+            $horL = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtH *' })
+            Assert-True ($script:LeaseSlotSnapshots.Count -eq 0 -and $horL.Count -eq 1 -and $horL[0] -match " slots=unknown\(stopped at \d+ s: the agent's next poll is past the 30 s bound\)$" -and (Wait-Until { -not (Test-PidAlive $pidH) } 5)) "heat-trace A1(r3): a running probe whose bound falls inside the next 60 s sleep is stopped now, not left running: $($horL -join ' || ')"
+            $results.leaseHeatTraceAsyncRetry = [ordered]@{ label = $admA.label; requests = $reqsA.Count; retryGapSec = [Math]::Round($gapA, 2); waitedSec = $admA.waitedSec; requestSnapshot = $snapA[0]; lateProbe = $lateL[0]; horizon = $horL[0] }
         }
         finally {
-            $LeaseRetrySec = $savedRetry; $script:LeaseSnapshotSkipBelowSec = 70; $script:StatusDelaySec = 0
+            $LeaseRetrySec = $savedRetry; $script:LeaseSnapshotSkipBelowSec = 70; $script:StatusDelaySec = 0; $script:LeaseSnapshotProbeSec = 30
             if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test case end' }
             function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return [int]$script:HtAge }
             Remove-Item -LiteralPath Function:\Invoke-HeavySlotStatus -ErrorAction SilentlyContinue

@@ -2110,18 +2110,22 @@ function Update-LeaseSlotSnapshots {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: never waits. Logs each snapshot probe that has exited (and whose output has been read to its end),
     # kills one that has run LeaseSnapshotProbeSec (a monotonic clock, not the wall clock) as slots=unknown(timeout N s), and with -Abandon kills
     # every one still running as slots=unknown(<Abandon>). Logging only: it never throws.
-    param([string]$Abandon = "")
+    # adversary r3-a96d3fe5 A1: the bound is checked FIRST, so a probe that answered only after it is a timeout, never a success; and a caller about
+    # to sleep HorizonSec (the inbox loop) has a probe whose bound falls inside that sleep killed now, so none outlives its bound by a poll interval.
+    param([string]$Abandon = "", [double]$HorizonSec = 0)
     if ($null -eq $script:LeaseSlotSnapshots -or $script:LeaseSlotSnapshots.Count -lt 1) { return }
     $bound = if ($script:LeaseSnapshotProbeSec -gt 0) { [double]$script:LeaseSnapshotProbeSec } else { 30.0 }
     foreach ($s in @($script:LeaseSlotSnapshots.ToArray())) {
         try {
             $st = $null
-            if ($s.call.proc.HasExited -and $s.call.out.IsCompleted -and $s.call.err.IsCompleted) {
+            $el = $s.clock.Elapsed.TotalSeconds
+            if ($el -ge $bound) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = "timeout $([long]$bound) s" } }
+            elseif ($s.call.proc.HasExited -and $s.call.out.IsCompleted -and $s.call.err.IsCompleted) {
                 $r = Receive-HeavySlotCli -Call $s.call
                 $lines = @(([string]$r.stdout) -split "`r?`n" | Where-Object { $_ -ne "" })
                 $st = if ($r.rc -eq 0) { @{ ok = $true; lines = $lines; error = $null } } else { @{ ok = $false; lines = $lines; error = "status exit $($r.rc): $($r.stderr)" } }
             }
-            elseif ($s.clock.Elapsed.TotalSeconds -ge $bound) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = "timeout $([long]$bound) s" } }
+            elseif ($HorizonSec -gt 0 -and $el + $HorizonSec -ge $bound) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = "stopped at $([long]$el) s: the agent's next poll is past the $([long]$bound) s bound" } }
             elseif ($Abandon) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = $Abandon } }
             if ($null -eq $st) { continue }
             [void]$script:LeaseSlotSnapshots.Remove($s)
@@ -3262,12 +3266,15 @@ function Set-LeaseCoverageAtLaunch {
     # lowers it (true -> false, with the typed line); leaseRemainingAtLaunchSec records what was left. Not a lease admission, no active lease, or
     # no job timeout: nothing changes. Recorded, not gated: no decision reads it.
     param([Parameter(Mandatory = $true)][string]$JobId, $Admission, $Lease, [int]$TimeoutSec = 0)
-    if ($null -eq $Admission -or $Admission.mode -ne "lease" -or $null -eq $Lease -or $null -eq $Lease.active) { return }
-    $rem = Get-QuietLeaseRemainingSec -Lease $Lease
-    $Admission | Add-Member -NotePropertyName leaseRemainingAtLaunchSec -NotePropertyValue $rem -Force
-    if ($TimeoutSec -le 0 -or $Admission.leaseCoversTimeout -ne $true -or $rem -ge $TimeoutSec) { return }
-    $Admission | Add-Member -NotePropertyName leaseCoversTimeout -NotePropertyValue $false -Force
-    Add-AgentLogLine "quiet-lease: lease-shorter-than-timeout job=$JobId phase=launch remaining=${rem}s timeoutSec=$TimeoutSec; the job's time past until=$([long]$Lease.active.until) is not covered by the lease (admission.leaseCoversTimeout=false)"
+    try {   # it runs just before the child is created: it never throws, so it can never stop a launch
+        if ($null -eq $Admission -or $Admission.mode -ne "lease" -or $null -eq $Lease -or $null -eq $Lease.active) { return }
+        $rem = Get-QuietLeaseRemainingSec -Lease $Lease
+        $Admission | Add-Member -NotePropertyName leaseRemainingAtLaunchSec -NotePropertyValue $rem -Force
+        if ($TimeoutSec -le 0 -or $Admission.leaseCoversTimeout -ne $true -or $rem -ge $TimeoutSec) { return }
+        $Admission | Add-Member -NotePropertyName leaseCoversTimeout -NotePropertyValue $false -Force
+        Add-AgentLogLine "quiet-lease: lease-shorter-than-timeout job=$JobId phase=launch remaining=${rem}s timeoutSec=$TimeoutSec; the job's time past until=$([long]$Lease.active.until) is not covered by the lease (admission.leaseCoversTimeout=false)"
+    }
+    catch { }
 }
 
 function Get-LeaseBatchAdmission {
@@ -3871,14 +3878,15 @@ function Invoke-QueuedJob {
         & $notAfterAdmitted "pre-launch" $notAfter "at the last check before launch"
         return
     }
-    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3 (Dot B2): the lease's coverage of the job timeout, re-read from its until= as the child is created.
-    Set-LeaseCoverageAtLaunch -JobId $jobId -Admission $script:Admission -Lease $script:QuietLease -TimeoutSec ([int]$metadata.timeoutSec)
     $launchedPersisted = $false
     try {
         $keepAwakeBeginUtc = (Get-Date).ToUniversalTime().ToString("o")
         $keepAwakeBeginOk = Set-AgentKeepAwake -Enable $true
         Add-AgentLogLine "keep-awake begin job=$jobId ok=$keepAwakeBeginOk"
 
+        # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3 (Dot B2): the lease's coverage of the job timeout, re-read from its until= as the child is created
+        # (adversary r3-a96d3fe5 A3: after the keep-awake step and its log line, so only the launch call itself follows).
+        Set-LeaseCoverageAtLaunch -JobId $jobId -Admission $script:Admission -Lease $script:QuietLease -TimeoutSec ([int]$metadata.timeoutSec)
         $launch = Start-WindowlessRedirectedProcess -FilePath $psExe `
             -ArgumentList @("-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", $Job.FullName) `
             -OutFile $outFile -ErrFile $errFile -WorkingDirectory $Root
@@ -4085,6 +4093,7 @@ try {
         if ($RunOnce) {
             break
         }
+        Update-LeaseSlotSnapshots -HorizonSec $PollSeconds   # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: no snapshot probe outlives its bound during this sleep
         Start-Sleep -Seconds $PollSeconds
     }
 }
