@@ -89,15 +89,18 @@ def _remove_tree_bounded(path, deadline=FIXTURE_TMP_REMOVE_DEADLINE):
     while True:
         try:
             _rmtree_clearing_readonly(path)
-            return ""
+            last = OSError("shutil.rmtree returned but the directory is still present")
         except OSError as exc:
-            try:
-                os.stat(path)
-            except FileNotFoundError:
-                return ""  # gone; os.path.exists is not used because it reads any stat error (PermissionError) as gone
-            except OSError:
-                pass
             last = exc
+        # Adversary A1: rmtree returning is not proof (its error callback can retry only the first lstat and then
+        # return without traversing), so the verdict is always a fresh stat. os.path.exists is not used because it
+        # reads any stat error (PermissionError) as gone; only FileNotFoundError means gone.
+        try:
+            os.stat(path)
+        except FileNotFoundError:
+            return ""
+        except OSError:
+            pass
         if time.monotonic() >= end:
             return "temp dir %s was not removed within %d s: %s: %s" % (path, deadline, type(last).__name__, last)
         time.sleep(0.25)
@@ -554,6 +557,21 @@ class FixtureCleanupBoundTests(unittest.TestCase):
             target.write_text("x")
             os.chmod(target, stat.S_IREAD)
         self.assertFalse(Path(tmp).exists())
+
+    def test_an_rmtree_that_returns_with_the_dir_still_there_is_not_success(self):
+        """Adversary A1: a rmtree that returns without removing (error callback retried only the first lstat)."""
+        from unittest import mock
+
+        path = tempfile.mkdtemp(prefix="um-ssh-fixture-")
+        try:
+            with mock.patch.object(shutil, "rmtree", lambda target, **kwargs: None):
+                note = _remove_tree_bounded(path, deadline=0)
+            still_there = Path(path).is_dir()
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+        self.assertTrue(still_there)
+        self.assertIn("was not removed", note)
+        self.assertIn("still present", note)
 
     def test_a_dir_that_cannot_be_stat_ed_is_not_reported_as_gone(self):
         """Adversary A2: os.path.exists turns a PermissionError into False; only FileNotFoundError means gone."""
