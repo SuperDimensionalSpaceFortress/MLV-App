@@ -113,7 +113,7 @@ foreach ($name in $liftNotAfter) {
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
 # lease-batch r4 (the merge of not-after r1): the same, so batch-refusal-ends-batch fails on behaviour against an agent without it.
-foreach ($name in @('Close-LeaseBatchAfterRelease')) {
+foreach ($name in @('Close-LeaseBatchAfterRelease', 'Get-LeaseWaitHeatField', 'Add-LeaseSlotSnapshot')) {   # the last two: AGENT-LEASE-PENDING-HEAT-TRACE-1
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -744,7 +744,7 @@ try {
         'liveness-absent-unchanged', 'liveness-unparseable-expired', 'liveness-pure', 'liveness-reader', 'liveness-ast-guard', 'liveness-queuedjob',
         'liveness-root-shape', 'liveness-lapse-latched',
         'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin',
-        'batch-close-before-reuse', 'batch-runner-killed-liveness')
+        'batch-close-before-reuse', 'batch-runner-killed-liveness', 'lease-pending-heat-trace')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -2165,6 +2165,97 @@ function Exit-HeavySlot {
             $script:LogHook = $null
             if (-not $writer.HasExited) { Stop-Process -Id $writer.Id -Force -ErrorAction SilentlyContinue; $null = $writer.WaitForExit(10000) }
             Remove-Item -LiteralPath $sideK -Force -ErrorAction SilentlyContinue
+        }
+    }
+    # ------------------------------------------------------------ lease-pending-heat-trace (AGENT-LEASE-PENDING-HEAT-TRACE-1 r1)
+    # Logging only. Three long quiet-lease waits on Bachelor (541 s, 672 s, 832 s) could not be attributed afterwards: the waiting
+    # line carried neither the heat reading nor who held the heavy slots. Every waiting line now carries the gate's heat fields
+    # (throttled/window, window mean C, feed age, or heat=unknown(<reason>)), and ONE bounded slot snapshot is logged at request
+    # and one at grant. Nothing it logs may throw, delay the grant past the status probe's own bound, or change a return value.
+    if (Test-Case 'lease-pending-heat-trace') {
+        $GateSustainedRows = [int]$paramDefaults['GateSustainedRows']; $GateMaxThrottledRows = [int]$paramDefaults['GateMaxThrottledRows']; $GateMeanMaxC = [double]$paramDefaults['GateMeanMaxC']
+        $script:QuietLeaseWaitLogSec = 1      # the agent logs a waiting line every 60 s; 1 s here so a short wait carries several
+        $script:FeedReads = 0; $script:StatusCalls = 0; $script:FeedStub = $null; $script:StatusStub = $null; $script:StatusThrows = $false; $script:FeedThrows = $false
+        $hotMetrics = [pscustomobject]@{ rows = 150; window = 60; throttled = 6; meanC = 88.2; max15C = 97; watts30 = 41.5 }
+        function Read-HeavySlotFeedMetrics { $script:FeedReads++; if ($script:FeedThrows -and $null -eq $script:QuietLease) { throw 'feed boom' }; return $script:FeedStub }   # throws only while waiting: the real reader never throws, and the grant's own read is not under test
+        function Invoke-HeavySlotStatus { param([string]$HeartbeatActivity = ''); $script:StatusCalls++; if ($script:StatusThrows) { throw 'status boom' }; return $script:StatusStub }
+        $since = (Get-Date).AddSeconds(-300).ToString('yyyy-MM-dd HH:mm:ss')
+        $slotsOk = @{ ok = $true; error = $null; lines = @("slot 1: suite X (pid 77, since $since) [exclusive]", 'slot 2: free', 'thermal: max 99 C, throttled 6/15, 40 W over ~30 s', "queue 1: mlv j9 (pid 78, since $since)") }
+        function Invoke-HeatTraceCase([string]$JobId, [hashtable]$Control) {
+            Reset-Case $Control
+            $script:AgeAfter = (Get-Date).AddSeconds(60)
+            $script:FeedReads = 0; $script:StatusCalls = 0
+            $adm = Wait-QuietLeaseAdmission -JobId $JobId -Job ([pscustomobject]@{}) -Metadata $meta
+            $script:Admission = $adm
+            return [pscustomobject]@{
+                adm = $adm; waits = @($script:Log | Where-Object { $_ -like "quiet-lease: waiting job=$JobId *" })
+                snaps = @($script:Log | Where-Object { $_ -like "quiet-lease: slots-snapshot job=$JobId *" })
+                active = @($script:Log | Where-Object { $_ -like "quiet-lease: active job=$JobId *" })
+            }
+        }
+        try {
+            # (a) a feed AT the pass line (throttled 6/60, mean 88.2 C): every waiting line carries the numbers the gate uses.
+            $script:FeedStub = @{ metrics = $hotMetrics; why = $null; ageSec = 12 }
+            $script:StatusStub = $slotsOk
+            $r = Invoke-HeatTraceCase 'jHt' @{ request = 'active'; active_after = 3.5 }
+            Assert-True ($r.adm.label -eq 'clear' -and $r.adm.mode -eq 'lease' -and $null -ne $script:QuietLease -and $r.active.Count -eq 1) "heat-trace: the job is still admitted clear in lease mode: $($r.adm.label)"
+            Assert-True ($r.waits.Count -ge 1) "heat-trace: the wait logged a waiting line: $($r.waits.Count)"
+            $bad = @($r.waits | Where-Object { $_ -notmatch ' heat=hot throttled=6/60 meanC=88\.2 feedAge=12s( |$)' })
+            Assert-True ($bad.Count -eq 0) "heat-trace: EVERY waiting line carries heat=<state> throttled=<n>/<window> meanC=<C> feedAge=<s>; without it: $($bad -join ' || ')"
+            Assert-True ($r.waits.Count -ge 2) "heat-trace: a 3.5 s wait at a 1 s cadence logs at least two waiting lines: $($r.waits.Count)"
+            Assert-True ($r.waits[0] -match '^quiet-lease: waiting job=jHt state=lease-pending why=\[.*\] waited=\d+s requests=1 requeues=0 leasePid=\d+') "heat-trace: the existing waiting-line fields are unchanged: $($r.waits[0])"
+            Assert-True ($script:FeedReads -eq $r.waits.Count + 1) "heat-trace: ONE feed read per waiting line, plus the grant's own (no extra read): reads=$($script:FeedReads) lines=$($r.waits.Count)"
+            Exit-HeavySlot
+            # the snapshots: exactly one at request, one at grant, each naming the holder slot, its owner and its age.
+            Assert-True ($script:StatusCalls -eq 2) "heat-trace: exactly two status probes (request, grant): $($script:StatusCalls)"
+            $sReq = @($r.snaps | Where-Object { $_ -match ' phase=request ' }); $sGrant = @($r.snaps | Where-Object { $_ -match ' phase=grant ' })
+            Assert-True ($r.snaps.Count -eq 2 -and $sReq.Count -eq 1 -and $sGrant.Count -eq 1) "heat-trace: exactly one slots-snapshot line at request and one at grant: $($r.snaps -join ' || ')"
+            foreach ($s in @($sReq[0], $sGrant[0])) {
+                Assert-True ($s -match 'slot 1: suite X pid=77 age=(29[5-9]|3[0-2]\d)s' -and $s -match 'slot 2: free') "heat-trace: the snapshot names each slot, the holder, its pid and its age (~300 s): $s"
+            }
+            $iReq = $script:Log.IndexOf($sReq[0]); $iAct = $script:Log.IndexOf($r.active[0]); $iGrant = $script:Log.IndexOf($sGrant[0])
+            Assert-True ($iReq -ge 0 -and $iReq -lt $iAct -and $iAct -lt $iGrant) "heat-trace: the request snapshot precedes the grant line and the grant snapshot follows it"
+
+            # (b) feed unknown: stale, then a read that THROWS -- an explicit heat=unknown(<reason>), never a silent omission, never a throw.
+            $script:FeedStub = @{ metrics = $null; why = 'feed stale (400 s > 120 s)'; ageSec = 400 }
+            $r2 = Invoke-HeatTraceCase 'jHu' @{ request = 'active'; active_after = 2.5 }
+            Assert-True ($r2.adm.label -eq 'clear' -and $r2.waits.Count -ge 1) "heat-trace: a stale feed still admits and logs: $($r2.adm.label)"
+            Assert-True (@($r2.waits | Where-Object { $_ -notmatch ' heat=unknown\(feed stale \(400 s > 120 s\)\) feedAge=400s( |$)' }).Count -eq 0) "heat-trace: a stale feed is heat=unknown(<reason>) feedAge=<s> on every waiting line: $($r2.waits -join ' || ')"
+            Exit-HeavySlot
+            $script:FeedStub = @{ metrics = $null; why = 'feed missing (x)' }
+            $r3 = Invoke-HeatTraceCase 'jHm' @{ request = 'active'; active_after = 2.5 }
+            Assert-True (@($r3.waits | Where-Object { $_ -notmatch ' heat=unknown\(feed missing \(x\)\) feedAge=unknown( |$)' }).Count -eq 0 -and $r3.waits.Count -ge 1) "heat-trace: a missing feed is heat=unknown(<reason>) feedAge=unknown: $($r3.waits -join ' || ')"
+            Exit-HeavySlot
+            $script:FeedThrows = $true
+            $r4 = Invoke-HeatTraceCase 'jHx' @{ request = 'active'; active_after = 2.5 }
+            $script:FeedThrows = $false
+            Assert-True ($r4.adm.label -eq 'clear' -and $r4.waits.Count -ge 1 -and @($r4.waits | Where-Object { $_ -notmatch ' heat=unknown\(.*feed boom.*\)( |$)' }).Count -eq 0) "heat-trace: a feed read that throws is logged as heat=unknown(...) and the wait goes on: $($r4.adm.label) $($r4.waits -join ' || ')"
+            Exit-HeavySlot
+
+            # (c) the status probe times out / fails / throws: slots=unknown(...) on both snapshots, the job is still admitted and the lease is the same.
+            $script:FeedStub = @{ metrics = $hotMetrics; why = $null; ageSec = 12 }
+            $script:StatusStub = @{ ok = $false; error = 'status timed out after 30 s'; lines = @() }
+            $r5 = Invoke-HeatTraceCase 'jHt5' @{ request = 'active'; active_after = 1.5 }
+            Assert-True ($r5.adm.label -eq 'clear' -and $r5.snaps.Count -eq 2 -and @($r5.snaps | Where-Object { $_ -notmatch ' slots=unknown\(timeout 30 s\)$' }).Count -eq 0) "heat-trace: a timed-out probe is slots=unknown(timeout 30 s) at request and at grant, and the job is admitted: $($r5.adm.label) $($r5.snaps -join ' || ')"
+            Exit-HeavySlot
+            $script:StatusThrows = $true
+            $r6 = Invoke-HeatTraceCase 'jHt6' @{ request = 'active'; active_after = 1.5 }
+            $script:StatusThrows = $false
+            Assert-True ($r6.adm.label -eq 'clear' -and $r6.snaps.Count -eq 2 -and @($r6.snaps | Where-Object { $_ -notmatch ' slots=unknown\(.*status boom.*\)$' }).Count -eq 0) "heat-trace: a probe that throws is slots=unknown(...) and never stops the grant: $($r6.adm.label) $($r6.snaps -join ' || ')"
+            Exit-HeavySlot
+
+            # (d) a refused request that is asked again still snapshots ONCE at request (one per job, not one per ask).
+            $script:StatusStub = $slotsOk
+            $r7 = Invoke-HeatTraceCase 'jHt7' @{ request = 'refuse_then_active'; refuse_count = 1 }
+            Assert-True ($r7.adm.label -eq 'clear' -and @(Get-Calls | Where-Object { $_.cmd -eq 'request' }).Count -eq 2) "heat-trace: the refused request was asked again and then admitted: $($r7.adm.label)"
+            Assert-True (@($r7.snaps | Where-Object { $_ -match ' phase=request ' }).Count -eq 1 -and @($r7.snaps | Where-Object { $_ -match ' phase=grant ' }).Count -eq 1 -and $script:StatusCalls -eq 2) "heat-trace: one request snapshot and one grant snapshot across a refuse-then-active job: $($r7.snaps -join ' || ') calls=$($script:StatusCalls)"
+            Exit-HeavySlot
+            $results.leasePendingHeatTrace = [ordered]@{ waitLines = $r.waits.Count; sample = $r.waits[0]; requestSnapshot = $sReq[0]; grantSnapshot = $sGrant[0]; staleSample = $r2.waits[0]; timeoutSample = $r5.snaps[0] }
+        }
+        finally {
+            $script:FeedThrows = $false; $script:StatusThrows = $false
+            Remove-Item -LiteralPath Function:\Invoke-HeavySlotStatus -ErrorAction SilentlyContinue
+            function Read-HeavySlotFeedMetrics { return @{ metrics = $null; why = 'feed missing (unit)' } }
         }
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }

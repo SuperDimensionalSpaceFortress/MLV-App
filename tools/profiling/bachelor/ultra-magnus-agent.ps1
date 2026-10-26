@@ -1860,7 +1860,7 @@ function Resolve-StartedMarkers {
 # that finds launching adopts a live child found by command line, re-queues only on proof nothing launched (no
 # live child and no out file), and otherwise orphans (Resolve-LaunchingMarker).
 # ---------------------------------------------------------------------------
-$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + not-after r1 (2026-10-24) + stage-exempt r1 (2026-10-24) + lease-batch r5 (2026-10-24) + stage-exempt r2 (2026-10-25) + stage-exempt r3 (2026-10-25)"
+$script:GateVersion = "heavy-slot-gate-1 r1k + heavy-slot-gate-2 r2e + wait-release r1c fifo-holder sustained-heat + r2 holder-owner-check (2026-10-12) + maint-dispatch r1 (2026-10-14) + long-label r1 (2026-10-20) + quiet-lease r1 (2026-10-23) + not-after r1 (2026-10-24) + stage-exempt r1 (2026-10-24) + lease-batch r5 (2026-10-24) + stage-exempt r2 (2026-10-25) + stage-exempt r3 (2026-10-25) + lease-heat-trace r1 (2026-10-26)"
 # STAGE-JOB-LEASE-EXEMPT-HARDENING-1 r2: the immutable default staging grammar (a copy of the GateStageJobPattern default and of the load-time
 # guard's $stageGrammar; test-ultra-magnus-agent-stage-exempt.ps1 pins all three equal). Get-GateExemptClass ANDs it with the effective pattern.
 $script:StageGrammarDefault = '^(playback-attr-3-cuda-stage-[0-9a-f]{12}(-[A-Za-z0-9-]{1,32})?|attr3-stage-smoke-runner-[0-9a-f]{12}-[0-9a-f]{12}|attr3-stage-fixture-(tiny|large)_dual_iso-[0-9a-f]{12})\z'
@@ -1871,6 +1871,8 @@ $script:LeaseRenewStaleSec = 120
 $script:LeaseBatchJobGuardSec = 10
 $script:QuietLease = $null
 $script:QuietLeaseWaiting = $null
+# AGENT-LEASE-PENDING-HEAT-TRACE-1: how often a quiet-lease wait logs its waiting line (a test shortens it). Logging only.
+$script:QuietLeaseWaitLogSec = 60
 # lease-batch r1: the parked (or in-use) batch lease, and "the admitted batch job launched and ended" for Exit-HeavySlot.
 $script:LeaseBatch = $null
 $script:LeaseBatchKeep = $false
@@ -1972,11 +1974,15 @@ function ConvertFrom-HeavySlotFeedRows {
 function Read-HeavySlotFeedMetrics {
     # Returns @{ metrics; why }. metrics=$null is FEED UNKNOWN: missing, older than GateFeedStaleSec, unreadable,
     # or fewer than 15 data rows (heavy-slot.py's own staleness and row rules).
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1: ageSec (the feed file's age, $null when it does not exist or could not be stat'ed) is carried for the
+    # waiting-line trace only; no decision reads it.
+    $ageSec = $null
     try {
         $fi = [System.IO.FileInfo]::new($HeavySlotFeed)
-        if (-not $fi.Exists) { return @{ metrics = $null; why = "feed missing ($HeavySlotFeed)" } }
+        if (-not $fi.Exists) { return @{ metrics = $null; why = "feed missing ($HeavySlotFeed)"; ageSec = $null } }
         $age = ([DateTime]::UtcNow - $fi.LastWriteTimeUtc).TotalSeconds
-        if ($age -gt $GateFeedStaleSec) { return @{ metrics = $null; why = "feed stale ($([int]$age) s > $GateFeedStaleSec s)" } }
+        $ageSec = $age
+        if ($age -gt $GateFeedStaleSec) { return @{ metrics = $null; why = "feed stale ($([int]$age) s > $GateFeedStaleSec s)"; ageSec = $ageSec } }
         $fs = [System.IO.File]::Open($HeavySlotFeed, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete)
         $start = [Math]::Max([long]0, $fs.Length - (80 * 150 + 400))
         try {
@@ -1988,11 +1994,69 @@ function Read-HeavySlotFeedMetrics {
         $lines = @($text -split "`r?`n")
         if ($start -gt 0) { $lines = @($lines | Select-Object -Skip 1) }   # the first line read mid-row is partial
         $m = ConvertFrom-HeavySlotFeedRows -Lines $lines
-        if ($null -eq $m) { return @{ metrics = $null; why = "feed unreadable or fewer than 15 rows" } }
-        return @{ metrics = $m; why = $null }
+        if ($null -eq $m) { return @{ metrics = $null; why = "feed unreadable or fewer than 15 rows"; ageSec = $ageSec } }
+        return @{ metrics = $m; why = $null; ageSec = $ageSec }
     }
     catch {
-        return @{ metrics = $null; why = "feed read failed: $($_.Exception.Message)" }
+        return @{ metrics = $null; why = "feed read failed: $($_.Exception.Message)"; ageSec = $ageSec }
+    }
+}
+
+function Get-LeaseWaitHeatField {
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1: the heat fields of a quiet-lease waiting line, from ONE feed read, in the gate's own terms
+    # (Get-SustainedHeatVerdict: throttled rows of the window, the window's mean C) plus the feed's age. An unreadable feed is
+    # heat=unknown(<reason>), never an omitted field. Logging only: it never throws and no decision reads what it returns.
+    try {
+        $feed = Read-HeavySlotFeedMetrics
+        $age = if ($null -ne $feed.ageSec) { "$([int]$feed.ageSec)s" } else { "unknown" }
+        $h = Get-SustainedHeatVerdict -Metrics $feed.metrics -UnknownWhy ([string]$feed.why)
+        if ($h.state -eq "feed-unknown") { return "heat=unknown($($h.why)) feedAge=$age" }
+        return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, "heat={0} throttled={1}/{2} meanC={3:F1} feedAge={4}", $h.state, $feed.metrics.throttled, $feed.metrics.window, $feed.metrics.meanC, $age)
+    }
+    catch {
+        return "heat=unknown(heat read failed: $(([string]$_.Exception.Message) -replace '\s+', ' '))"
+    }
+}
+
+function Add-LeaseSlotSnapshot {
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1: ONE `heavy-slot.py status` probe, logged as who holds each slot (owner, pid, age) and how many runs
+    # are queued; Phase is request | grant. The probe is Invoke-HeavySlotStatus, so it is bounded by that helper's own 30 s timeout (which
+    # heartbeats while it waits); a timeout logs slots=unknown(timeout 30 s) and the caller goes on. Logging only: nothing here throws,
+    # gates or changes a return value, and a failed log line is dropped.
+    param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Phase, [double]$WaitedSec = 0)
+    try {
+        $s = Invoke-HeavySlotStatus -HeartbeatActivity "gate-wait job=$JobId state=slots-snapshot waited=$([int]$WaitedSec)s"
+        if (-not $s.ok) {
+            $e = ([string]$s.error) -replace '\s+', ' '
+            $what = if ($e -match '^status timed out after (\d+) s$') { "timeout $($Matches[1]) s" } else { $e }
+            Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown($what)"
+            return
+        }
+        $now = Get-Date
+        $parts = [System.Collections.Generic.List[string]]::new()
+        $queued = 0
+        foreach ($l in @($s.lines)) {
+            if ($l -match '^queue \d+: ') { $queued++; continue }
+            if ($l -notmatch '^slot (\d+): (.*)$') { continue }
+            $n = $Matches[1]
+            $who = $Matches[2]
+            if ($who -eq "free") { $parts.Add("slot ${n}: free"); continue }
+            if ($who -match '^(.*?) \(pid (\d+)(?:, since ([^)]*))?\)') {
+                $owner = $Matches[1]
+                $ownerPid = $Matches[2]
+                $since = $Matches[3]
+                $age = "unknown"
+                $dt = [DateTime]::MinValue
+                if ($since -and [DateTime]::TryParse($since, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$dt) -and $dt -le $now) { $age = "$([int]($now - $dt).TotalSeconds)s" }
+                $parts.Add("slot ${n}: $owner pid=$ownerPid age=$age")
+            }
+            else { $parts.Add("slot ${n}: $who") }
+        }
+        if ($parts.Count -lt 1) { Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown(status output unrecognised)"; return }
+        Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=[$($parts -join '; ')] queued=$queued"
+    }
+    catch {
+        try { Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown(snapshot failed: $(([string]$_.Exception.Message) -replace '\s+', ' '))" } catch { }
     }
 }
 
@@ -3260,6 +3324,8 @@ function Wait-QuietLeaseAdmission {
     $nextRequestAt = $t0
     $nextExemptScanAt = $t0
     $lastLog = [DateTime]::MinValue
+    $waitLogSec = if ($script:QuietLeaseWaitLogSec -gt 0) { [int]$script:QuietLeaseWaitLogSec } else { 60 }
+    $snapshotRequestDone = $false
     $state = "lease-request"
     $why = "requesting a quiet lease"
     $maxAge = [int]$Metadata.maxQueueAgeSec
@@ -3328,6 +3394,11 @@ function Wait-QuietLeaseAdmission {
                     Add-AgentLogLine "quiet-lease: unavailable job=$JobId why=[$why]; the job is NOT run unleased; asking again in ${LeaseRetrySec}s"
                 }
             }
+            # AGENT-LEASE-PENDING-HEAT-TRACE-1: ONE slot snapshot per job when its first request is made (a re-ask after a refusal adds none).
+            if (-not $snapshotRequestDone -and $requests -ge 1) {
+                $snapshotRequestDone = $true
+                Add-LeaseSlotSnapshot -JobId $JobId -Phase "request" -WaitedSec ((Get-Date) - $t0).TotalSeconds
+            }
             if ($null -ne $lease) {
                 $u = Update-QuietLeaseRequest -Lease $lease
                 if ($u.state -eq "active") {
@@ -3374,6 +3445,7 @@ function Wait-QuietLeaseAdmission {
                     if ($null -ne $batchToken) { $adm | Add-Member -NotePropertyName leaseBatch -NotePropertyValue (Open-LeaseBatch -Token $batchToken -Lease $script:QuietLease -JobId $JobId -Refusals $refusals.ToArray() -Requests $requests) }
                     if ($null -ne $script:GateHour) { $script:GateHour.admitted++; $script:GateHour.waitSecTotal += [int]$waited }
                     Add-AgentLogLine "quiet-lease: active job=$JobId slot=$($a.slot) held=$($a.held) until=$([long]$a.until) minutes=$minutes waited=$($adm.waitedSec)s requests=$requests refusals=$($refusals.Count) owner=[$($adm.leaseOwner)] heat=[$($heat.why)]"
+                    Add-LeaseSlotSnapshot -JobId $JobId -Phase "grant" -WaitedSec $waited
                     if (-not $covers) { Add-AgentLogLine "quiet-lease: lease-shorter-than-timeout job=$JobId minutes=$minutes timeoutSec=$timeoutSec; legs past until=$([long]$a.until) run without the lease (admission.leaseCoversTimeout=false)" }
                     return $adm
                 }
@@ -3412,8 +3484,8 @@ function Wait-QuietLeaseAdmission {
                 $null = Invoke-ExemptJobsDuringWait -WaitingJobId $JobId -WaitedSec ((Get-Date) - $t0).TotalSeconds
                 $nextExemptScanAt = (Get-Date).AddSeconds($GateProbeSec)
             }
-            if (((Get-Date) - $lastLog).TotalSeconds -ge 60) {
-                Add-AgentLogLine "quiet-lease: waiting job=$JobId state=$state why=[$why] waited=$([int]$waited)s requests=$requests requeues=$requeues leasePid=$(if ($null -ne $lease) { $lease.pid } else { 'none' })"
+            if (((Get-Date) - $lastLog).TotalSeconds -ge $waitLogSec) {
+                Add-AgentLogLine "quiet-lease: waiting job=$JobId state=$state why=[$why] waited=$([int]$waited)s requests=$requests requeues=$requeues leasePid=$(if ($null -ne $lease) { $lease.pid } else { 'none' }) $(Get-LeaseWaitHeatField)"
                 $lastLog = Get-Date
             }
             Write-AgentHeartbeat -Activity "gate-wait job=$JobId state=$state waited=$([int]((Get-Date) - $t0).TotalSeconds)s"
