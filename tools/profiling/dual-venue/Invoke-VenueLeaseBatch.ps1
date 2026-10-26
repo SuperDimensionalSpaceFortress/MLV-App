@@ -200,7 +200,7 @@ if (-not $Purpose) { $Purpose = "Invoke-VenueLeaseBatch $(Split-Path -Leaf $RunD
 
 function L([string]$Message) {
     $line = "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message"
-    Add-Content -LiteralPath $batchLog -Value $line
+    try { Add-Content -LiteralPath $batchLog -Value $line } catch { Register-LogFailure $_.Exception.Message; throw }   # r7 (adversary A1): every append failure is counted and said, whichever call site wrote the line
     Write-Output $line
 }
 
@@ -212,8 +212,9 @@ function Register-LogFailure([string]$Why) {
     if ($script:logWriteFailures -eq 1) { try { [Console]::Error.WriteLine("BATCH_LOG_FAILED the batch log cannot be written ($($Why -replace '\s+', ' ')); later failures are counted in the batch receipt as logWriteFailures") } catch { } }
 }
 function LogBest([string]$Message) {
+    $failuresBefore = $script:logWriteFailures
     try { L $Message } catch {
-        Register-LogFailure $_.Exception.Message
+        if ($script:logWriteFailures -eq $failuresBefore) { Register-LogFailure $_.Exception.Message }   # L counts a failed append itself
         try { Write-Output "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message" } catch { }
     }
 }
@@ -657,8 +658,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # r3 (sol r2 B2): the leg runs only while the lease does. It is a bounded child: still running at the lease's end, it is killed with its whole
                 # process tree (Kill($true), Invoke-VenueBoundedProcess) and typed LEASE_EXPIRED below. The agent stops its job at the same bound (lease-batch r3).
                 $legBoundSec = [int][Math]::Max(1, [Math]::Floor(($leaseEnd - [DateTime]::UtcNow).TotalSeconds))
+                # adversary r7 A2: Process.Start failing (a command line past 32767 characters, a missing exe) throws a Win32Exception before any child exists: the leg stays NOT_RUN.
                 $inFlightLeg = $leg   # adversary r5 pass 2 A2: marked at the launch itself, so a throw while the RUN line was logged leaves a leg that never started NOT_RUN
-                $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec
+                try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {
+                    if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
+                    throw
+                }
                 [IO.File]::WriteAllText($out, [string]$lp.stdout + [string]$lp.stderr, [Text.UTF8Encoding]::new($false))
                 $legCode = $lp.exit
                 $legSec = [int]([DateTime]::UtcNow - $tLeg).TotalSeconds
