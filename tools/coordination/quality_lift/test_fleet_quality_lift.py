@@ -1341,6 +1341,47 @@ class MeterFixtureTests(unittest.TestCase):
         want = {f"{i + 1:040x}": c for i, (_, c) in enumerate(bodies)}
         self.assertEqual(got, want, [(b, got[h], c) for (b, c), h in zip(bodies, want) if got[h] != c])
 
+    def test_adversary_r4_rerun_meaning_cases(self) -> None:  # adversary r4 rerun on 8694a086: A1-A4
+        bodies = [
+            # A1: "No"/"None" open clean text only when they say there is no blocker, defect or failure.
+            ("## Blockers\nNo assessment of the reported blocker has been made.\n", "unknown"),
+            ("## Blockers\nNone of the blockers have been reviewed.\n", "unknown"),
+            ("## Blockers\nNo new independently established code blocker or SHARED BLOCKER.\n", "clean"),
+            ("## Blockers\nNo newly demonstrated behavior/security/CI blocker.\n", "clean"),
+            # A2: a closure counts for the B<n> it is stated of, not for every B<n> near a closure word.
+            ("## Blockers\nNone newly demonstrated.\nB1: tools/fixed.ps1:9 deletes another owner's lock.\n", "blocked"),
+            ("## Blockers\nPrior B1: tools/fixed.ps1:9 deletes another owner's lock.\n", "unknown"),
+            ("## Blockers\nNone newly demonstrated.\nB1: B2 is fixed, but the lock deletion race occurs on every run.\n", "blocked"),
+            ("## Blockers\nNone newly demonstrated. Prior B1/B2/I1 are source-addressed.\nB2: b.ps1:9 adds a regression.\n", "clean"),
+            # A3: each clause is read on its own; a negation in one does not cover the next.
+            ("## Blockers\nNone newly demonstrated.\nNo new defects were found, but B1 remains open.\n", "blocked"),
+            ("## Blockers\nNone newly demonstrated.\nThere is no regression in the reader, but B1 remains open in the writer.\n", "blocked"),
+            ("## Blockers\nNone newly demonstrated.\nCI job1 did not fail, but job2 fails on the exact head.\n", "blocked"),
+            # A4: emphasis inside the line is read through.
+            ("## Blockers\nNone newly demonstrated.\nPrior **B1** persists at a.ps1:9.\n", "blocked"),
+            ("## Blockers\n**B1** closed: the lock is checked.\n", "clean"),
+            ("## Blockers\n__B1__ fixed: the lock is checked.\n", "clean"),
+            ("## Blockers\n- **B1 / P1:** a.ps1:3 races.\n", "blocked"),
+        ]
+        _, got = self._classes(bodies)
+        want = {f"{i + 1:040x}": c for i, (_, c) in enumerate(bodies)}
+        self.assertEqual(got, want, [(b, got[h], c) for (b, c), h in zip(bodies, want) if got[h] != c])
+
+    def test_the_first_round_fraction_is_over_classified_prs(self) -> None:  # adversary r4 rerun A5
+        bus = self._small_bus([
+            ("cos-feedback/p/pr-1.md", _section(1, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "blocked"),
+            ("cos-feedback/p/pr-2.md", _section(2, H2, "G1 OPEN."), "2026-10-21T10:01:00+00:00", "unknown"),
+        ])
+        result, out = self._measure_bus(bus, "p", cache={f"acme/widget@{H1}": {"fetched": "2026-10-25T00:00:00Z", "rows": []}})
+        since = result["windows"][0]
+        self.assertEqual((since["prs"], since["firstRoundBlocked"], since["firstRoundUnknown"], since["firstRoundBlockedRate"]), (2, 1, 1, 1.0))
+        self.assertIn("| since | 2 | 1 (100%) | 1 | 1/1 (1 unclassified) |", (out / "quality-lift.md").read_text(encoding="utf-8-sig"))
+        fleet_out = self._dir()
+        proc = self._run("-Bus", str(bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(fleet_out), "-NoStatuses", "-NoFetch",
+                         "-ReviewSources", str(self._sources({"p": REVIEW_STATUS})))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("| p | 2 | 1 (100%) | 1 | 1/1 (1 unclassified) |", (fleet_out / "fleet.md").read_text(encoding="utf-8-sig"))
+
     def test_an_unknown_pass_folds_apart_and_never_as_clean(self) -> None:  # B5
         p, q = "cos-feedback/p/pr-7.md", "cos-feedback/p/pr-8.md"
         bus = self._small_bus([
@@ -1429,6 +1470,15 @@ class MeterFixtureTests(unittest.TestCase):
             ("PR number 2147483647", "identity", f"# a/b #2147483647 / {H1}\n", H1),
             ("PR number 2147483648", "identity", f"# a/b #2147483648 / {H1}\n", ""),
             ("front matter PR 2147483648", "identity", f"schema: cos-feedback.v1\nrepo: a/b\npr: 2147483648\nhead: {H1}\n\n", ""),
+            # The rerun fixes' own inputs: inner emphasis, clause breaks and many matches after one negation stay linear.
+            ("underscore run inside a word", "class", sec("None. a" + "_" * 100000 + "b"), "clean"),
+            ("star run inside a line", "class", sec("None. a" + "*" * 100000 + "b"), "clean"),
+            ("spaces before no contrast word", "class", sec("None. x" + " " * 100000 + "y"), "clean"),
+            ("many failures after a hedge", "class", sec("None. CI would " + "fails " * 20000), "clean"),
+            ("many current B1s after a negation", "class", sec("None. It is not true that " + "B1 remains " * 20000), "clean"),
+            # adversary r4 rerun A6 (minor): a non-ASCII digit names no pass (it used to throw and unmeasure the project).
+            ("PR number in Arabic-Indic digits", "identity", f"# a/b #١ / {H1}\n", ""),
+            ("front matter PR in Arabic-Indic digits", "identity", f"schema: cos-feedback.v1\nrepo: a/b\npr: ١\nhead: {H1}\n\n", ""),
         ]
         work = self._dir()
         helper = work / "time-parsers.ps1"

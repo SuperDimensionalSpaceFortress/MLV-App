@@ -10,8 +10,8 @@ law4: attested
 
 | project | CoS passes | blocked | unclassified | first-round blocked PRs | CoS first | true misses | rounds per PR |
 |---|---|---|---|---|---|---|---|
-| mlv-app | 263 | 58 (24%) | 16 | 28/184 | 45/58 | 11 | 1.43 |
-| adversarialllm | 46 | 18 (40%) | 1 | 10/24 | unknown | unknown | 1.92 |
+| mlv-app | 263 | 58 (24%) | 16 | 28/173 | 45/58 | 11 | 1.43 |
+| adversarialllm | 46 | 18 (40%) | 1 | 10/23 | unknown | unknown | 1.92 |
 | agent-bridge | 30 | 5 (17%) | 0 | 4/25 | unknown | unknown | 1.2 |
 | adobe-ingester | 17 | 10 (59%) | 0 | 4/4 | unknown | unknown | 4.25 |
 | fleet (6 projects) | 359 | 92/342 (27%) | 17 | | 45/58 | 11 | |

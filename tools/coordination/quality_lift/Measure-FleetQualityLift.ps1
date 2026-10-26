@@ -109,28 +109,40 @@ $QlRxTimeout = [TimeSpan]::FromSeconds(2)
 function New-QlRx([string]$Pattern, [Text.RegularExpressions.RegexOptions]$Options = 'None') { [regex]::new($Pattern, $Options, $QlRxTimeout) }
 # The words a CoS uses to say a blocker is closed, in either order with B<n>.
 $QlClosedWords = '(?:closed|fixed|source-fixed|resolved|source-resolved|addressed|source-addressed|remedied|source-remedied|withdrawn|superseded)'
+# A B<n> stated closed: B1 closed, B1/B2/I1 are source-addressed, B1 is now fixed. Digits are ASCII ([0-9]): \d also matches
+# other scripts' digits, which a later [long] conversion rejects.
+$QlClosedRef = "B[0-9]+(?:/[A-Z][0-9]+)*,?[ \t]+(?:(?i:is|was|are|were|now|been|has|have|also|remains|remain|stays|stay)[ \t]+){0,3}(?i:$QlClosedWords)\b"
+# The words "No" may carry before what there is none of (No new independently established code blocker).
+$QlNoWord = '(?i:new|newly|current|currently|independent|independently|demonstrated|established|introduced|additional|remaining|code|source|product|functional|runtime|behavior|security|ci|correctness|governance|shared|static|wrong-count|delta|other|or|and)\b'
 $QlRx = @{
-    heading       = New-QlRx '^[ ]{0,3}# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d{1,10}) / ([0-9a-fA-F]{40})(?![0-9A-Za-z])' 'Multiline'
+    heading       = New-QlRx '^[ ]{0,3}# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #([0-9]{1,10}) / ([0-9a-fA-F]{40})(?![0-9A-Za-z])' 'Multiline'
     # Header lines run to the first blank one: leading blanks, one non-blank, then the rest of the line (three disjoint runs).
     frontMatter   = New-QlRx '\A(?:\uFEFF)?schema:[ \t]*cos-feedback\.v1[ \t]*\r?\n(?:[^\S\r\n]*\S[^\r\n]*\r?\n)*'
     fmRepo        = New-QlRx '^repo:[ \t]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)[ \t]*\r?$' 'Multiline'
-    fmPr          = New-QlRx '^pr:[ \t]*(\d{1,10})[ \t]*\r?$' 'Multiline'
+    fmPr          = New-QlRx '^pr:[ \t]*([0-9]{1,10})[ \t]*\r?$' 'Multiline'
     fmHead        = New-QlRx '^head:[ \t]*([0-9a-fA-F]{40})[ \t]*\r?$' 'Multiline'
     # One line at a time. The heading's text is checked by Test-QlBlockersHeading, not by a pattern.
     hashLine      = New-QlRx '^[ ]{0,3}(#{2,3})[ \t]+(.*)$'
     anyHeading    = New-QlRx '^[ \t]*(#{1,6})(?:[ \t]|$)'
     label         = New-QlRx '^[ ]{0,3}(?:[-*+][ \t]+)?(?:\*\*|__)?Blockers(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*(.*)$'
-    sentenceBreak = New-QlRx '(?<=[.;!?])[ \t]+'
+    # Emphasis inside a line (Prior **B1** persists, __B1__ fixed): every * run, and _ runs at a word's edge (test_a_b.py
+    # keeps its _). Each alternative starts only at the start of its run, so a long run is read once.
+    emphasis      = New-QlRx '\*+|(?<![A-Za-z0-9_])_+|(?<!_)(?>_+)(?![A-Za-z0-9])'
+    # Clauses: a sentence end, or a contrast (", but", "however") that starts a new assertion. Each break starts only where
+    # its run of spaces starts.
+    clauseBreak   = New-QlRx '(?<=[.;!?])[ \t]+|,?(?<![ \t])[ \t]+(?>(?i:but|however|although|though|whereas))\b[ \t,]*'
     # Meaning. B<n> is case-sensitive (Blocked is not B1); the words around it are not.
-    leadB         = New-QlRx '^B\d'
-    closedB       = New-QlRx "^B\d+(?:/B\d+)*,?[ \t]+(?:(?:is|was|are|now)[ \t]+)?(?i:$QlClosedWords)\b"
-    currentB      = New-QlRx "\bB\d+\b(?:[ \t]+\([^()\r\n]{0,120}\))?:?[ \t]+(?:(?i:is|are|still|also)[ \t]+)?(?:(?i:is|are|still|also)[ \t]+)?(?i:persists|persist|persisting|remains|remain|remaining|retained|stands|open|unresolved|unfixed|reproduces|new|current)\b(?![ \t]+(?i:$QlClosedWords|in[ \t]+place)\b)"
-    currentBPre   = New-QlRx '\b(?i:new|current|remaining|retained|persisting|open|unresolved|outstanding|unfixed)[ \t]+(?:SHARED[ \t]+)?B\d+\b'
+    leadB         = New-QlRx '^B[0-9]'
+    closedB       = New-QlRx "^$QlClosedRef"
+    closedRef     = New-QlRx "\b$QlClosedRef"
+    # A "B1: <how>" line that states its own closure through a verb (B1: a.ps1:3 is now fixed); "tools/fixed.ps1" is not one.
+    ownClosed     = New-QlRx "(?i)\b(?:is|are|was|were|now|been)[ \t]+(?:(?:now|also)[ \t]+)?$QlClosedWords\b"
+    currentB      = New-QlRx "\bB[0-9]+\b(?:[ \t]+\([^()\r\n]{0,120}\))?:?[ \t]+(?:(?i:is|are|still|also)[ \t]+)?(?:(?i:is|are|still|also)[ \t]+)?(?i:persists|persist|persisting|remains|remain|remaining|retained|stands|open|unresolved|unfixed|reproduces|new|current)\b(?![ \t]+(?i:$QlClosedWords|in[ \t]+place)\b)"
+    currentBPre   = New-QlRx '\b(?i:new|current|remaining|retained|persisting|open|unresolved|outstanding|unfixed)[ \t]+(?:SHARED[ \t]+)?B[0-9]+\b'
     stillWord     = New-QlRx "(?i)\b(?:persists|persist|persisting|remains|remain|remaining|retained|still|unresolved|unfixed)\b(?![ \t]+$QlClosedWords\b)"
-    negated       = New-QlRx '^\(?(?i:no|none|not|nothing|n/a)\b'
     # A CI run named as such (CI, shard 2, job123, an Actions run link, the exact or current head): "checks" alone is often a
     # verb in source prose ("it checks the lock and fails the run").
-    ciNoun        = New-QlRx '(?i)\bCI\b|\bshard[ \t]*\d|\bjob[ \t]*\d|/actions/runs/|\b(?:exact|current)[ -]head\b'
+    ciNoun        = New-QlRx '(?i)\bCI\b|\bshard[ \t]*[0-9]|\bjob[ \t]*[0-9]|/actions/runs/|\b(?:exact|current)[ -]head\b'
     # The CoS often glues a time or count to the verb (failed16:17:43, fail:). "fails closed" names a design, not a failure;
     # only that one occurrence is skipped, so "job1 fails the gate meant to fail closed" still fails.
     ciFail        = New-QlRx '(?i)\b(?:fail|fails|failed|failing)(?![A-Za-z])(?![ \t-]+(?:closed|open|safe)\b)'
@@ -138,12 +150,13 @@ $QlRx = @{
     ciNot         = New-QlRx '(?i)\b(?:no|none|not|nothing|never|without|if|unless|would|could|can|may|might|prior|previous|previously|earlier|historical|historically|was|were|formerly|longer)\b'
     # A negation anywhere before the B<n> words ("There is no current B1", "It is not true that B1 remains").
     bNot          = New-QlRx '(?i)\b(?:no|not|none|never|neither|nor|without)\b'
-    # Explicit no-blocker text: "None..." or "(none)", or "No ..." that says what there is none of (No new demonstrated defect,
-    # No current failing check, No remaining B2). "No assessment has been made" says nothing about blockers.
-    cleanNone     = New-QlRx '^\(?(?i:none)\b'
-    cleanNo       = New-QlRx '^(?i:no)\b[^\r\n]*?(?i:\bblockers?\b|\bdefects?\b|\bfindings?\b|\bfailing\b|\bfailures?\b|\bregressions?\b)|^(?i:no)\b[^\r\n]*?\bB\d+\b'
+    # Explicit no-blocker text: "None..." or "(none)" (not "None of ..."), or "No" then only qualifier words, then what there
+    # is none of (No new demonstrated defect, No current failing check, No remaining B2). "No assessment of the reported
+    # blocker has been made" says nothing about blockers. The qualifier count is bounded, so the pattern stays linear.
+    cleanNone     = New-QlRx '^\(?(?i:none)\b(?![ \t]+(?i:of)\b)'
+    cleanNo       = New-QlRx "^(?i:no)(?:[ \t]+$QlNoWord(?:/$QlNoWord)*){0,8}[ \t]+(?:(?i:blockers?|defects?|failing|failures?|regressions?|findings?)\b|B[0-9]+\b)"
     priorOpen     = New-QlRx '^(?i:prior|inherited|earlier)\b'
-    bName         = New-QlRx '\bB\d+\b'
+    bName         = New-QlRx '\bB[0-9]+\b'
     closedWord    = New-QlRx "(?i)\b$QlClosedWords\b"
     notClosed     = New-QlRx "(?i)\bnot[ \t]+(?:yet[ \t]+)?$QlClosedWords\b|\bun(?:fixed|resolved|addressed|remedied)\b"
     # GitHub and git output.
@@ -272,37 +285,47 @@ function Get-QlBlockerClass([string]$Sec) {
     $lines = Get-QlBlockerSection $Sec
     if ($null -eq $lines) { return @{ cls = 'unknown'; text = '(no Blockers section)' } }
     if (-not $lines.Count) { return @{ cls = 'unknown'; text = '(empty Blockers section)' } }
-    $first = (Remove-QlMarks $lines[0]).Trim()
-    $open = $QlRx.sentenceBreak.Split($first)[0]
-    $priorClosed = $QlRx.priorOpen.IsMatch($open) -and $QlRx.bName.IsMatch($open) -and $QlRx.closedWord.IsMatch($open) -and -not $QlRx.notClosed.IsMatch($open)
+    # Each line is read with its leading marks stripped and its inner emphasis removed (Prior **B1** persists), in clauses.
+    $bare = @(foreach ($ln in $lines) { $QlRx.emphasis.Replace((Remove-QlMarks $ln), '').Trim() })
+    $open = $QlRx.clauseBreak.Split($bare[0])[0]
+    $priorClosed = $QlRx.priorOpen.IsMatch($open) -and $QlRx.closedRef.IsMatch($open) -and -not $QlRx.notClosed.IsMatch($open)
     $saysNone = $QlRx.cleanNone.IsMatch($open) -or $QlRx.cleanNo.IsMatch($open) -or $priorClosed
-    # The B<n>s the section states closed or addressed (Prior B1/B2 are source-addressed): only those may have a
-    # "B1: <how it was addressed>" disposition line under a no-blocker opener.
+    # The B<n>s the section states closed or addressed, each by name (Prior B1/B2 are source-addressed): only those may have
+    # a "B1: <how it was addressed>" disposition line under a no-blocker opener. A closure word elsewhere in the clause
+    # (tools/fixed.ps1, "B2 is fixed") closes nothing else.
     $closedIds = @{}
-    foreach ($ln in $lines) {
-        foreach ($s in $QlRx.sentenceBreak.Split((Remove-QlMarks $ln).Trim())) {
-            if ($QlRx.closedWord.IsMatch($s) -and -not $QlRx.notClosed.IsMatch($s)) { foreach ($b in $QlRx.bName.Matches($s)) { $closedIds[$b.Value] = 1 } }
+    foreach ($b in $bare) {
+        foreach ($s in $QlRx.clauseBreak.Split($b)) {
+            if ($QlRx.notClosed.IsMatch($s)) { continue }
+            foreach ($m in $QlRx.closedRef.Matches($s)) { foreach ($id in $QlRx.bName.Matches($m.Value)) { $closedIds[$id.Value] = 1 } }
         }
     }
-    foreach ($ln in $lines) {
-        $bare = (Remove-QlMarks $ln).Trim()
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $ln = $lines[$i]; $b = $bare[$i]
         # Under an explicit no-blocker opener a "B1: ..." line is a disposition note, not a new blocker, when that B<n> is
-        # stated closed or addressed here and its first sentence does not say it still stands (B2 validation mismatch remains).
-        if ($QlRx.leadB.IsMatch($bare) -and -not $QlRx.closedB.IsMatch($bare)) {
-            $s0 = $QlRx.sentenceBreak.Split($bare)[0]
-            $note = $saysNone -and $closedIds.ContainsKey($QlRx.bName.Match($bare).Value) -and -not $QlRx.stillWord.IsMatch($s0)
+        # stated closed or addressed here and its first clause does not say it still stands (B2 validation mismatch remains).
+        if ($QlRx.leadB.IsMatch($b) -and -not $QlRx.closedB.IsMatch($b)) {
+            $c0 = $QlRx.clauseBreak.Split($b)[0]
+            # Its own closure counts only when its first clause names no other B<n> (B1: B2 is fixed closes B2, not B1).
+            $own = $QlRx.ownClosed.IsMatch($c0) -and $QlRx.bName.Matches($c0).Count -eq 1 -and -not $QlRx.notClosed.IsMatch($c0)
+            $note = $saysNone -and ($closedIds.ContainsKey($QlRx.bName.Match($b).Value) -or $own) -and -not $QlRx.stillWord.IsMatch($c0)
             if (-not $note) { return @{ cls = 'blocked'; text = $ln } }
         }
-        foreach ($s in $QlRx.sentenceBreak.Split($bare)) {
-            if ($QlRx.negated.IsMatch($s)) { continue }
+        foreach ($s in $QlRx.clauseBreak.Split($b)) {
+            # A negation counts only before the words, in their own clause (There is no current B1). A negation before one
+            # match precedes every later one, so comparing the first match with the first negation decides the clause.
+            $neg = $QlRx.bNot.Match($s)
+            $negAt = $(if ($neg.Success) { $neg.Index } else { [int]::MaxValue })
             foreach ($rx in @($QlRx.currentB, $QlRx.currentBPre)) {
                 $m = $rx.Match($s)
-                if ($m.Success -and -not $QlRx.bNot.IsMatch($s.Substring(0, $m.Index))) { return @{ cls = 'blocked'; text = $ln } }
+                if ($m.Success -and $m.Index -lt $negAt) { return @{ cls = 'blocked'; text = $ln } }
             }
-            # A negation or hedge counts only before the failure word: '... shard 2 fails: received "(kill not confirmed)"'; and
-            # "not green" says the same as the failure it introduces ("CI is not green: job1 failed16:17:43").
+            # The same for a CI failure and a negation or hedge: '... shard 2 fails: received "(kill not confirmed)"'. "not
+            # green" says the same as the failure it introduces ("CI is not green: job1 failed16:17:43"), so it is blanked.
             $f = $QlRx.ciFail.Match($s)
-            if ($f.Success -and $QlRx.ciNoun.IsMatch($s) -and -not $QlRx.ciNot.IsMatch($QlRx.notGreen.Replace($s.Substring(0, $f.Index), ''))) { return @{ cls = 'blocked'; text = $ln } }
+            if (-not $f.Success -or -not $QlRx.ciNoun.IsMatch($s)) { continue }
+            $hedge = $QlRx.ciNot.Match($QlRx.notGreen.Replace($s, { param($x) ' ' * $x.Length }))
+            if (-not $hedge.Success -or $f.Index -lt $hedge.Index) { return @{ cls = 'blocked'; text = $ln } }
         }
     }
     if ($saysNone -or $QlRx.closedB.IsMatch($open)) { return @{ cls = 'clean'; text = $lines[0] } }
@@ -607,6 +630,8 @@ function Add-QlJsonLine([string]$Path, [string]$Line) {
 function Format-QlOf($n, $w) { "$n of $($w.blocked)$(if ($w.statusUnknown) { " ($($w.statusUnknown) unknown)" })" }
 function Format-QlFirst($w) { if ($w.noPriorKey -is [string]) { 'unknown' } else { Format-QlOf $w.noPriorKey $w } }
 function Format-QlProxy($w) { Format-QlOf $w.statusBeforeCos.noPriorStatus $w }
+# First-round blocked PRs over the PRs whose first head is classified; unclassified first heads are named apart.
+function Format-QlFirstRound($w) { "$($w.firstRoundBlocked)/$($w.prs - $w.firstRoundUnknown)$(if ($w.firstRoundUnknown) { " ($($w.firstRoundUnknown) unclassified)" })" }
 
 # One run per project folder at a time: the corpus check-then-append and the cache rewrite are not safe to interleave. A run
 # that cannot take the lock within -LockWaitSec writes nothing and reports a source error.
@@ -753,12 +778,12 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
 
     $pct = { param($x) if ($null -eq $x) { 'n/a' } else { "$([math]::Round(100 * [double]$x))%" } }
     $md = @()
-    $md += "QUALITY-LIFT $Proj $($now.ToString('yyyy-MM-ddTHH:mm'))Z: CoS blocker rate 24h $(& $pct $d1.blockedRate) (since $($Since.Substring(0,10)) $(& $pct $all.blockedRate)); unclassified CoS passes 24h $($d1.blockerUnknown); first-round blocked 24h $($d1.firstRoundBlocked)/$($d1.prs); CoS read first 24h $(Format-QlFirst $d1); true misses 24h $($d1.trueMiss); review evidence: $($d1.reviewSource); no status before CoS 24h (proxy) $(Format-QlProxy $d1); adversary-pass PRs 24h $($adopt.withAdversaryLine)/$($adopt.prs)$(if ($errors) { "; ERRORS $($errors.Count)" })"
+    $md += "QUALITY-LIFT $Proj $($now.ToString('yyyy-MM-ddTHH:mm'))Z: CoS blocker rate 24h $(& $pct $d1.blockedRate) (since $($Since.Substring(0,10)) $(& $pct $all.blockedRate)); unclassified CoS passes 24h $($d1.blockerUnknown); first-round blocked 24h $(Format-QlFirstRound $d1); CoS read first 24h $(Format-QlFirst $d1); true misses 24h $($d1.trueMiss); review evidence: $($d1.reviewSource); no status before CoS 24h (proxy) $(Format-QlProxy $d1); adversary-pass PRs 24h $($adopt.withAdversaryLine)/$($adopt.prs)$(if ($errors) { "; ERRORS $($errors.Count)" })"
     if (-not $busOk) { $md[0] = "QUALITY-LIFT $Proj NOT MEASURED: the bus read failed; ERRORS $($errors.Count)" }
     $md += ''
     $md += "| window | CoS passes | blocked | unclassified | first-round blocked (PRs) | CoS read first | true misses | no status before CoS (proxy) | CoS rounds per PR |"
     $md += "|---|---|---|---|---|---|---|---|---|"
-    foreach ($w in @($all, $d1)) { $md += "| $($w.window) | $($w.passes) | $($w.blocked) ($(& $pct $w.blockedRate)) | $($w.blockerUnknown) | $($w.firstRoundBlocked)/$($w.prs)$(if ($w.firstRoundUnknown) { " ($($w.firstRoundUnknown) unclassified)" }) | $(Format-QlFirst $w) | $($w.trueMiss) | $(Format-QlProxy $w) | $($w.roundsPerPr) (max $($w.roundsPerPrMax)) |" }
+    foreach ($w in @($all, $d1)) { $md += "| $($w.window) | $($w.passes) | $($w.blocked) ($(& $pct $w.blockedRate)) | $($w.blockerUnknown) | $(Format-QlFirstRound $w) | $(Format-QlFirst $w) | $($w.trueMiss) | $(Format-QlProxy $w) | $($w.roundsPerPr) (max $($w.roundsPerPrMax)) |" }
     $md += ''
     $md += "Blocked: the CoS named a current blocker (a B<n> item, a B<n> that persists or remains, or a failing CI run). Unclassified: the Blockers section is missing, or says neither that nor 'None'/'No ...'; it is counted apart, and the blocked rate is over classified passes only."
     $md += ''
@@ -825,7 +850,7 @@ $tp = 0; $tb = 0; $tk = 0; $tu = 0; $np = 0; $nd = 0; $dn = 0; $dm = 0; $db = 0;
 $notMeasured = @()
 foreach ($r in ($results | Where-Object { $_.all.passes -gt 0 -or $_.errors } | Sort-Object { - $_.all.passes }, project)) {
     if (-not $r.all.measured) { $fl += "| $($r.project) | not measured | | | | $($r.all.reviewSource) | | | | | | $($r.errors) |"; $notMeasured += $r.project; continue }
-    $fl += "| $($r.project) | $($r.all.passes) | $($r.all.blocked) ($(& $pct $r.all.blockedRate)) | $($r.all.blockerUnknown) | $($r.all.firstRoundBlocked)/$($r.all.prs) | $($r.all.reviewSource) | $(Format-QlFirst $r.all) | $($r.all.trueMiss) | $(Format-QlProxy $r.all) | $($r.all.roundsPerPr) | $($r.adopt.withAdversaryLine)/$($r.adopt.prs) | $($r.errors) |"
+    $fl += "| $($r.project) | $($r.all.passes) | $($r.all.blocked) ($(& $pct $r.all.blockedRate)) | $($r.all.blockerUnknown) | $(Format-QlFirstRound $r.all) | $($r.all.reviewSource) | $(Format-QlFirst $r.all) | $($r.all.trueMiss) | $(Format-QlProxy $r.all) | $($r.all.roundsPerPr) | $($r.adopt.withAdversaryLine)/$($r.adopt.prs) | $($r.errors) |"
     $np++; $tp += $r.all.passes; $tb += $r.all.blocked; $tk += $r.all.blockerUnknown; $tu += $r.all.statusUnknown; $sn += $r.all.statusBeforeCos.noPriorStatus
     if ($r.all.noPriorKey -isnot [string]) { $nd++; $dn += $r.all.noPriorKey; $dm += $r.all.trueMiss; $db += $r.all.blocked; $du += $r.all.statusUnknown }
 }

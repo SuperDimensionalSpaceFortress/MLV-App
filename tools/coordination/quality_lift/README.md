@@ -42,22 +42,26 @@ the last row per repo@head. Rows are never rewritten. `-Since` must carry an off
   `## Improvements` and `- B1 ...`, leaves the section empty), or for a bare `Blockers:` label to its first blank line.
   Blank and thematic-break lines (`---`, `***`, `___`) carry nothing. A head written in capitals is read in lowercase.
 - **What it says, by meaning** (every line of the section, not only the first; leading quote, list, number, heading and
-  `*`/`_` marks are stripped by a linear scan):
+  `*`/`_` marks are stripped by a linear scan, emphasis inside the line is read through, and each clause is read on its
+  own: a sentence, or the part after `, but` / `however` / `although` / `whereas`):
   - **blocked:** a line starts `B<n>` (`- **B1 / P1:**`, `B2 validation mismatch remains.`), unless it says that B<n> is
-    closed, or it is a disposition note: the section opened with no-blocker text, says that B<n> was closed or addressed
-    (`Prior B1/B2 are source-addressed`), and the line (`B1: <how>`) does not say it still stands. Or a sentence names a
+    closed, or it is a disposition note: the section opened with no-blocker text, says that this B<n> was closed or
+    addressed (`Prior B1/B2 are source-addressed`, or the line's own `B1: a.ps1:3 is now fixed`), and the line does not
+    say it still stands. A closure word elsewhere (`tools/fixed.ps1`, `B1: B2 is fixed`) closes nothing. Or a clause names a
     B<n> as persisting, remaining, retained, open or current (`Prior612 B1 persists`, `Inherited #4 B1 remains`, `the
     current B2`) with no negation before those words (`There is no current B1` says neither). Or a sentence reports a CI
     run failing (`- CI: ... job119584694731 fails`, `actual [Windows shard 2](...) fails`, `CI is not green: ... failed`),
     with no negation, hedge or look back before the failure word (`none has failed`, `would fail`, `Prior CI failed`).
     `fails closed` names a design, not a failure.
-  - **clean:** nothing blocked, and the section opens with explicit no-blocker text: `None ...` or `(none)`; `No ...` that
-    says what there is none of (`No new demonstrated defect`, `No current failing check`, `No remaining B2`); `B1 closed`; or
-    a prior blocker stated fixed or addressed (`Prior B1 is source-fixed.`, but not `Prior B1 is not fixed.`).
+  - **clean:** nothing blocked, and the section opens with explicit no-blocker text: `None ...` or `(none)` (not `None of
+    ...`); `No` then only qualifier words, then what there is none of (`No new demonstrated defect`, `No current failing
+    check`, `No remaining B2`; not `No assessment of the reported blocker ...`); `B1 closed`; or a prior blocker stated fixed
+    or addressed (`Prior B1 is source-fixed.`, `Prior B1 remains closed.`, but not `Prior B1 is not fixed.`).
   - **unclassified (unknown):** anything else, a missing or empty section included (`G1 OPEN`, `P2, high confidence: ...`,
     `Readiness hold: ...`, `No assessment has been made.`). It is counted apart (`blockerUnknown`, listed in
-    `blockerUnknownHeads`), never as clean, and the blocked and first-round rates are over classified passes only. A head
-    with a clean pass and a later unclassified one is unclassified; any blocking pass makes it blocked.
+    `blockerUnknownHeads`), never as clean, and the blocked and first-round rates are over classified passes only (the
+    reports print first-round blocked as `n/classified PRs (k unclassified)`). A head with a clean pass and a later
+    unclassified one is unclassified; any blocking pass makes it blocked.
 - Bus and GitHub text is untrusted. Every pattern that reads it is linear and carries a 2 s match timeout. A timeout in a
   CoS file names the file and leaves the project not measured; in a PR body it leaves the adoption count unknown (null)
   with a named error. Neither stalls the run.
