@@ -252,8 +252,10 @@ class BachelorAgentHeavySlotGatePins(unittest.TestCase):
 @unittest.skipUnless(os.name == "nt", "runs the Windows agent's PowerShell functions")
 class BachelorAgentHeavySlotGateUnit(unittest.TestCase):
     def test_pure_function_cases_pass(self) -> None:
+        # A hang guard, not a speed bound. -UnitOnly also runs the quiet-lease and stage-exempt suites in their own processes;
+        # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3 runs real (fake) status probes there, and the whole run took 312 s on a loaded host.
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(FIFO_TEST), "-UnitOnly"],
-                              capture_output=True, text=True, timeout=300)
+                              capture_output=True, text=True, timeout=600)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         out = json.loads(proc.stdout)
         self.assertEqual(out["status"], "PASS")
