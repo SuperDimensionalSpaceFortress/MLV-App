@@ -487,8 +487,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     if ($bw.waitSec -gt 0) {
         if ($bw.openUtc -ge $deadline) {
             $b.endReason = 'DEADLINE'; $b.endDetail = "lease-$($bw.reason.ToLowerInvariant())-wait: the next lease may open at $($bw.openUtc.ToString('o')) (usedSec=$($bw.usedSec) in the 3 h window), after the deadline"
-            Set-Stop 'DEADLINE' 3; Write-BatchReceipt $b
-            L "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=$($b.endDetail)"
+            Set-Stop 'DEADLINE' 3
+            LogBest "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=$($b.endDetail)"   # r7 (sol r6b): the line is tried before the receipt snapshots logWriteFailures
+            $b.logWriteFailures = $script:logWriteFailures; Write-BatchReceipt $b
             break
         }
         L "BATCH_WAIT batch=$batchNo reason=$($bw.reason) waitSec=$($bw.waitSec) usedSec=$($bw.usedSec) capSec=$LeaseCapSec budgetSec=$LeaseBudgetSec windowSec=$LeaseBudgetWindowSec cooldownSec=$LeaseCooldownSec (Bachelor's lease caps; not a failure, no claim held)"
@@ -507,8 +508,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     }
     if ($null -eq $claim) {
         $b.endReason = 'DEADLINE'; $b.endDetail = 'claim-held'; Set-Stop 'DEADLINE' 3
-        Write-BatchReceipt $b
-        L "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=claim-held"
+        LogBest "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=claim-held"   # r7 (sol r6b): the line is tried before the receipt snapshots logWriteFailures
+        $b.logWriteFailures = $script:logWriteFailures; Write-BatchReceipt $b
         break
     }
     $b.claimNonce = $claim.nonce
@@ -826,9 +827,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # r6 (Dot r5 B5): the release no longer follows a log call that can throw, and a release that throws is a result, not a skipped receipt.
         $relResult = try { Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir } catch { "ERROR: $($_.Exception.Message -replace '\s+', ' ')" }
         LogBest "CLAIM_RELEASED batch=$batchNo result=$relResult"
+        # r7 (sol r6b): BATCH_END is logged BEFORE the receipt snapshots logWriteFailures, so a failure logging it is counted in the receipt written for that batch.
+        LogBest "BATCH_END batch=$batchNo token=$token lease=$($b.leaseId) reason=$($b.endReason) attempted=$($b.legsAttempted) ran=$($b.legsRan) counted=$($b.legsCounted) retries=$($b.retries) probeRetries=$($b.probeRetries) legRetries=$($b.legRetries) refusals=$(@($b.refusals).Count) exit75=$($b.exit75Refusals)/$($b.exit75Class) renewOkMaxGapSec=$($b.renewOkMaxGapSec) preOpenWait=$($b.preOpenWait.reason):$($b.preOpenWait.waitSec)s close=$($b.closeOutcome) agentEnd=$(if ($b.agent) { $b.agent.endReason })$(if ($b.endDetail) { " detail=$($b.endDetail)" })"
         $b.logWriteFailures = $script:logWriteFailures
         Write-BatchReceipt $b
-        LogBest "BATCH_END batch=$batchNo token=$token lease=$($b.leaseId) reason=$($b.endReason) attempted=$($b.legsAttempted) ran=$($b.legsRan) counted=$($b.legsCounted) retries=$($b.retries) probeRetries=$($b.probeRetries) legRetries=$($b.legRetries) refusals=$(@($b.refusals).Count) exit75=$($b.exit75Refusals)/$($b.exit75Class) renewOkMaxGapSec=$($b.renewOkMaxGapSec) preOpenWait=$($b.preOpenWait.reason):$($b.preOpenWait.waitSec)s close=$($b.closeOutcome) agentEnd=$(if ($b.agent) { $b.agent.endReason })$(if ($b.endDetail) { " detail=$($b.endDetail)" })"
     }
 }
 foreach ($leg in $pending) { Add-Result $leg 'NOT_RUN' @{ verdict = $(if ($stopReason) { $stopReason } else { 'NOT_RUN' }); reason = 'run-stopped' }; LogBest "LEG $($leg.name) NOT_RUN $stopReason reason=run-stopped" }
@@ -843,7 +845,12 @@ $summary = [ordered]@{
 }
 if ($legPlanMode) { $summary.legPlan = [ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
 $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch { Register-LogFailure $_.Exception.Message }   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
+try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch {   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
+    # r7 (sol r6b): the count was serialized before this append, so the append that just failed is counted and the line for stdout is serialized again with it (stdout is the authority when batch.log is broken).
+    Register-LogFailure $_.Exception.Message
+    $summary.logWriteFailures = $script:logWriteFailures
+    $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
+}
 Write-Output $resultLine
 Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned at its timeout would otherwise keep this process alive until it ends
 exit $exitCode

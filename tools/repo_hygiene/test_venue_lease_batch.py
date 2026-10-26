@@ -2001,6 +2001,55 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(batch_result(r.stdout)["ran"], 4)
         self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (simulated result-line append failure)", r.stderr)
 
+    def test_r7_sol_a_final_result_append_that_fails_is_counted_in_the_logwritefailures_the_result_line_reports(self) -> None:
+        # sol r6b blocker: logWriteFailures was serialized into the result line BEFORE the final append was attempted, so an IOException on that append left the live
+        # counter at 1 and the stdout summary at 0 (exit 0, ran 4). The count the summary reports includes the append that just failed.
+        anchor = "try { Add-Content -LiteralPath $batchLog -Value $resultLine }"
+        runner = self._patched_runner(anchor, "try { throw [IO.IOException]::new('locked'); Add-Content -LiteralPath $batchLog -Value $resultLine }")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual(res["ran"], 4)
+        self.assertEqual(res["logWriteFailures"], 1, "the failed final append is in the count the result line reports")
+        self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (locked)", r.stderr)
+
+    def test_r7_sol_a_batch_end_log_failure_is_counted_in_the_batch_receipt_and_the_summary(self) -> None:
+        # sol r6b sibling: the batch receipt was written BEFORE the BATCH_END line was logged, so a failure logging BATCH_END was missing from the receipt's logWriteFailures
+        # (and the receipt claimed 0 failures for a batch that had one). The receipt and the summary both carry it.
+        anchor = "function L([string]$Message) {\n"
+        runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'BATCH_END*') { throw [IO.IOException]::new('locked') }\n")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual(res["ran"], 4)
+        [b] = self.batches()
+        self.assertEqual(b["logWriteFailures"], 1, "the BATCH_END failure is in the receipt written for that batch")
+        self.assertEqual(res["logWriteFailures"], 1)
+        self.assertIn("BATCH_END", r.stdout, "the line still reaches stdout")
+        self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (locked)", r.stderr)
+
+    def test_r7_sol_b_the_pre_claim_deadline_batch_end_failure_is_counted_in_the_receipt_written_for_that_batch(self) -> None:
+        # sol r6b sibling class: the two pre-claim DEADLINE exits wrote the batch receipt BEFORE logging BATCH_END (and never carried logWriteFailures at all), so a
+        # failure logging BATCH_END was missing from the receipt, and an unprotected L threw out of the batch. The receipt carries the count after the line is tried.
+        self.claims.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        rows = [{"venue": "bachelor", "leaseId": "old-1", "startUtc": utc_iso(now - timedelta(minutes=105)), "endUtc": utc_iso(now - timedelta(minutes=60))},
+                {"venue": "bachelor", "leaseId": "old-2", "startUtc": utc_iso(now - timedelta(minutes=45)), "endUtc": utc_iso(now - timedelta(minutes=1))}]
+        (self.claims / "bachelor.lease-ledger.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
+        anchor = "function L([string]$Message) {\n"
+        runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'BATCH_END*') { throw [IO.IOException]::new('locked') }\n")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["preOpenWait"]["reason"]), ("DEADLINE", "BUDGET"))
+        self.assertEqual(b["logWriteFailures"], 1, "the BATCH_END failure is in the receipt written for that batch")
+        self.assertEqual(batch_result(r.stdout)["logWriteFailures"], 1)
     def test_r5_adv_a1_a_throw_after_a_leg_ran_does_not_record_that_leg_as_not_run(self) -> None:
         # adversary r5 A1: the new batch catch left the leg whose child had completed (its output file could not be written) in pending, and the summary then said
         # NOT_RUN for a leg that ran. The leg is recorded LEG_FAILED / reason BATCH_ERROR (its result is unknown); only the legs never started are NOT_RUN.
