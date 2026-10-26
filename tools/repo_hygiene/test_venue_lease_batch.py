@@ -82,6 +82,15 @@ switch ($mode) {
 # close job appends the agent's receipt line to <share>\logs\lease-batch-<token>.jsonl.
 FAKE_UMRUN = r"""
 param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec, [int]$MaxAdmissionWaitSec, [string]$NotAfterUtc = '<unset>')
+if ($JobId -like 'venue-quiet-probe-caps-*') {
+    # BACHELOR-DEDICATED-CAPS-RUNNER-1: the exempt light probe that prints Bachelor's heavy-slot.lease.json. Logged apart from the lease-batch events (FAKE_CAPS_EVENTS)
+    # so every other case reads the same event order. FAKE_CAPS_MODE: fail (um-run threw: the default, so a case that does not care reads the fallback) | live
+    # (stdout = FAKE_CAPS_JSON) | exit1 (the probe job exited 1 with the JSON on stdout).
+    Add-Content -LiteralPath $env:FAKE_CAPS_EVENTS -Value ("{0} CAPS {1} claimHeld={2} notAfter={3} body={4}" -f [DateTime]::UtcNow.Ticks, $JobId, [bool]($env:FAKE_CLAIM_PATH -and (Test-Path -LiteralPath $env:FAKE_CLAIM_PATH)), $NotAfterUtc, ((Get-Content -LiteralPath $ScriptPath -Raw) -replace '\s+', ' ').Trim())
+    $cm = $(if ($env:FAKE_CAPS_MODE) { $env:FAKE_CAPS_MODE } else { 'fail' })
+    if ($cm -eq 'fail') { throw "UNRESOLVED: $JobId (fake) was not taken by the agent before -MaxQueueWaitSec" }
+    return [pscustomobject]@{ jobId = $JobId; exitCode = $(if ($cm -eq 'exit1') { 1 } else { 0 }); endedUtc = [DateTimeOffset]::UtcNow.ToString('o'); admission = [pscustomobject]@{ label = 'exempt-light' }; stdout = [string]$env:FAKE_CAPS_JSON }
+}
 $stateFile = Join-Path $AgentShare 'fake-agent-state.json'
 $st = $(if (Test-Path -LiteralPath $stateFile) { Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json } else { [pscustomobject]@{ opens = 0; leaseId = $null; token = $null } })
 $held = [bool]($env:FAKE_CLAIM_PATH -and (Test-Path -LiteralPath $env:FAKE_CLAIM_PATH))
@@ -320,6 +329,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.claims = self.case / "claims"
         self.claim_path = self.claims / "bachelor.claim.json"
         self.events = self.case / "events.log"
+        self.caps_events = self.case / "caps-events.log"
         self.run_dir = self.case / "run"
         self.runner = RUNNER
 
@@ -329,11 +339,16 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
 
     def batch_cmd(self, specs: list[Path] | None = None, *extra: str, **env: str) -> tuple[list[str], dict]:
         e = dict(os.environ)
-        e.update({"FAKE_EVENTS": str(self.events), "FAKE_SHARE": str(self.share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case)})
+        e.update({"FAKE_EVENTS": str(self.events), "FAKE_SHARE": str(self.share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case),
+                  "FAKE_CAPS_EVENTS": str(self.caps_events)})
+        omit = [x for x in env.pop("OMIT_DEFAULTS", "").split(",") if x]
         e.update(env)
-        # Bachelor's 30 min cooldown is waited out between batches; the offline cases (a stub um-run) relax it unless they test it. A case may override any default.
+        # Bachelor's 30 min cooldown is waited out between batches; the offline cases (a stub um-run) relax it unless they test it. A case may override any default
+        # (in extra) or drop one (OMIT_DEFAULTS=-LeaseCooldownSec), which is how a case reads the caps the runner takes from the live probe.
         defaults = {"-LegBudgetSec": "60", "-LeaseMarginSec": "0", "-ClaimPollSec": "1", "-RecheckSec": "1",
                     "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
+        for k in omit:
+            defaults.pop(k)
         args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.runner), "-LegSpec", ",".join(str(s) for s in (specs or self.specs[:2])),
                 "-RunDir", str(self.run_dir), "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST, "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
@@ -589,8 +604,9 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         base = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-LegSpec", str(self.specs[0]), "-RunDir", str(self.run_dir),
                 "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST, "-ClaimDir", str(self.claims), "-QuietScript", str(self.tmp / "fake-quiet.ps1"),
                 "-LegScript", str(self.tmp / "fake-leg.ps1"), "-AgentShare", str(self.share)]
-        for extra, needle in ((["-LeaseCooldownSec", "0"], "LEASE_CAP_RELAXED"), (["-LeaseBudgetWindowSec", "3600"], "LEASE_CAP_RELAXED"),
-                              (["-LeaseCapSec", "2701"], "LeaseCapSec"), (["-RenewGapMaxSec", "121"], "RenewGapMaxSec"), (["-LeaseBudgetSec", "5401"], "LeaseBudgetSec")):
+        # (a shortened -LeaseCooldownSec is judged against the LIVE caps after the probe: test_a_caller_may_only_tighten_the_live_caps)
+        for extra, needle in ((["-LeaseBudgetWindowSec", "3600"], "LEASE_CAP_RELAXED"),
+                              (["-LeaseCapSec", "2701"], "LeaseCapSec"), (["-RenewGapMaxSec", "121"], "RenewGapMaxSec"), (["-LeaseBudgetSec", "10801"], "LeaseBudgetSec")):
             with self.subTest(extra=extra):
                 out = subprocess.run(base + extra, capture_output=True, text=True, timeout=120)
                 self.assertNotEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -618,6 +634,210 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # leases at -120..-75 and -45..0 min: the cooldown ends at +30, and the first lease leaves the window ending at open + 45 only at +60
         self.assertEqual((got["budget"]["reason"], got["budget"]["waitSec"], got["budget"]["usedSec"]), ("BUDGET", 3600, 2700))
         self.assertEqual(got["old"], {"reason": "NONE", "waitSec": 0, "usedSec": 0})
+
+    # ---------------------------------------------------------------- BACHELOR-DEDICATED-CAPS-RUNNER-1: the caps are read live, not mirrored
+    LIVE_CAPS = {"enabled": True, "max_minutes": 45, "pending_max_minutes": 30, "cooldown_minutes": 5, "max_fraction_per_3h": 0.9, "renew_stale_s": 120}
+
+    def caps_events_raw(self) -> list[str]:
+        return self.caps_events.read_text(encoding="utf-8").splitlines() if self.caps_events.exists() else []
+
+    def seed_ledger(self, *spans: tuple[float, float]) -> None:
+        """Earlier leases of this venue, as (start, end) minutes from now (negative = past)."""
+        self.claims.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        rows = [{"venue": "bachelor", "leaseId": f"old-{i}", "startUtc": utc_iso(now + timedelta(minutes=s)), "endUtc": utc_iso(now + timedelta(minutes=e))}
+                for i, (s, e) in enumerate(spans, 1)]
+        (self.claims / "bachelor.lease-ledger.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
+
+    def test_the_live_caps_come_from_one_exempt_probe_job_and_are_in_the_receipt(self) -> None:
+        r = self.run_batch([self.specs[0]], FAKE_CAPS_MODE="live", FAKE_CAPS_JSON=json.dumps(self.LIVE_CAPS), OMIT_DEFAULTS="-LeaseCooldownSec")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        probes = self.caps_events_raw()
+        self.assertEqual(len(probes), 1, probes)
+        self.assertRegex(probes[0].split(" ", 3)[2], r"^venue-quiet-probe-caps-\d{8}T\d{6}Z-[0-9a-f]{8,}$")
+        self.assertIn("heavy-slot.lease.json", probes[0], "the probe prints Bachelor's lease config")
+        self.assertIn(r"C:\Users\layib\.claude\ops\heavy-slot.lease.json", probes[0])
+        self.assertIn("notAfter=<unset>", probes[0])
+        [b] = self.batches()
+        self.assertEqual((b["capsSource"], b["capsCooldownSec"], b["capsBudgetSec"], b["capsCapSec"]), ("live", 300, 9720, 2700), b)
+        self.assertEqual(batch_result(r.stdout)["capsSource"], "live")
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertRegex(log, r" CAPS source=live cooldownSec=300 budgetSec=9720 capSec=2700 ")
+        self.assertLess(log.index(" CAPS source="), log.index(" BATCH_OPEN batch=1 "), "the caps are read before the first lease is requested")
+
+    def test_a_live_5_minute_cooldown_is_waited_not_the_old_30(self) -> None:
+        # the last lease ended 4 min 50 s ago: Bachelor's live cooldown (5 min) leaves about 10 s, the old mirrored 30 min would pass the 240 s deadline.
+        self.seed_ledger((-50.0, -4.0 - 50 / 60))
+        r = self.run_batch([self.specs[0]], FAKE_CAPS_MODE="live", FAKE_CAPS_JSON=json.dumps(self.LIVE_CAPS), OMIT_DEFAULTS="-LeaseCooldownSec")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual(b["preOpenWait"]["reason"], "COOLDOWN")
+        self.assertTrue(1 <= b["preOpenWait"]["waitSec"] <= 300, b["preOpenWait"])
+        self.assertEqual(len([x for x in self.kinds() if x.startswith("OPEN:")]), 1)
+
+    def test_the_live_budget_fraction_paces_the_3_hour_window_not_50_percent(self) -> None:
+        # two 45 min leases (90 min) in the window: 50 % (90 min) leaves no room for a third, live 0.9 (162 min) does, so the open is not delayed.
+        self.seed_ledger((-130.0, -85.0), (-51.0, -6.0))
+        r = self.run_batch([self.specs[0]], FAKE_CAPS_MODE="live", FAKE_CAPS_JSON=json.dumps(self.LIVE_CAPS), OMIT_DEFAULTS="-LeaseCooldownSec")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["preOpenWait"]["reason"], b["preOpenWait"]["waitSec"]), ("NONE", 0))
+        self.assertEqual(b["capsBudgetSec"], 9720)
+        self.assertEqual(b["preOpenWait"]["budgetRoomSec"], 2700)
+
+    def test_live_caps_that_cannot_be_read_or_do_not_validate_fall_back_to_the_old_constants(self) -> None:
+        bad = {
+            "probe-failed": ("fail", ""),
+            "file-missing": ("live", "HEAVY_SLOT_LEASE_JSON_MISSING"),
+            "not-json": ("live", "{ not json"),
+            "empty": ("live", ""),
+            "not-an-object": ("live", "[1, 2]"),
+            "probe-exit-1": ("exit1", json.dumps(self.LIVE_CAPS)),
+            "disabled": ("live", json.dumps({**self.LIVE_CAPS, "enabled": False})),
+            "enabled-missing": ("live", json.dumps({k: v for k, v in self.LIVE_CAPS.items() if k != "enabled"})),
+            "negative-cooldown": ("live", json.dumps({**self.LIVE_CAPS, "cooldown_minutes": -1})),
+            "zero-max-minutes": ("live", json.dumps({**self.LIVE_CAPS, "max_minutes": 0})),
+            "text-fraction": ("live", json.dumps({**self.LIVE_CAPS, "max_fraction_per_3h": "0.9"})),
+            "missing-renew": ("live", json.dumps({k: v for k, v in self.LIVE_CAPS.items() if k != "renew_stale_s"})),
+        }
+        for name, (mode, text) in bad.items():
+            with self.subTest(name):
+                self.setUp()
+                r = self.run_batch([self.specs[0]], FAKE_CAPS_MODE=mode, FAKE_CAPS_JSON=text, OMIT_DEFAULTS="-LeaseCooldownSec")
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                [b] = self.batches()
+                self.assertEqual((b["capsSource"], b["capsCooldownSec"], b["capsBudgetSec"], b["capsCapSec"]), ("fallback", 1800, 5400, 2700), b)
+                self.assertTrue(b["capsFallbackReason"], b)
+                self.assertEqual(batch_result(r.stdout)["capsSource"], "fallback")
+                self.assertRegex((self.run_dir / "batch.log").read_text(encoding="utf-8"), r" CAPS source=fallback cooldownSec=1800 budgetSec=5400 capSec=2700 ")
+
+    def test_the_old_constants_still_pace_a_fallback_run(self) -> None:
+        # unreadable caps: a lease that ended 4 min ago still holds the run for the old 30 min cooldown, which passes the deadline.
+        self.seed_ledger((-45.0, -4.0))
+        r = self.run_batch([self.specs[0]], OMIT_DEFAULTS="-LeaseCooldownSec")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["preOpenWait"]["reason"], b["capsSource"]), ("DEADLINE", "COOLDOWN", "fallback"))
+
+    def test_live_caps_tighter_than_the_old_ones_bind_too(self) -> None:
+        # the owner may also tighten: a 20 min lease cap and a 60 min cooldown read live bind the run the same way.
+        caps = {**self.LIVE_CAPS, "max_minutes": 20, "cooldown_minutes": 60, "max_fraction_per_3h": 0.25}
+        r = self.run_batch([self.specs[0]], FAKE_CAPS_MODE="live", FAKE_CAPS_JSON=json.dumps(caps), OMIT_DEFAULTS="-LeaseCooldownSec", FAKE_LEASE_REMAIN="1200", FAKE_LEG_REMAIN="1100")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["capsSource"], b["capsCooldownSec"], b["capsBudgetSec"], b["capsCapSec"]), ("live", 3600, 2700, 1200), b)
+
+    def test_a_caller_may_only_tighten_the_live_caps(self) -> None:
+        # Resolve-VenueLeaseCaps: against the real um-run an explicit cooldown below the live one, or a budget above it, is LEASE_CAP_RELAXED; tighter is kept;
+        # only an offline stub may go looser. Get-VenueLeaseCaps reads the probe's text with heavy-slot.py's rules.
+        live = json.dumps(self.LIVE_CAPS)
+        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+$live = Get-VenueLeaseCaps -Text '{live}'
+$fb = Get-VenueLeaseCaps -Text 'HEAVY_SLOT_LEASE_JSON_MISSING'
+$o = [ordered]@{{ live = "$($live.source) $($live.cooldownSec) $($live.budgetSec) $($live.capSec)"; fb = "$($fb.source) $($fb.cooldownSec) $($fb.budgetSec) $($fb.capSec)" }}
+function Test-Caps($caps, [int]$cd, [bool]$cdx, [int]$bud, [bool]$budx, [bool]$relax) {{
+    $r = Resolve-VenueLeaseCaps -Caps $caps -CooldownSec $cd -CooldownExplicit $cdx -BudgetSec $bud -BudgetExplicit $budx -CapSec 2700 -AllowRelax $relax
+    "$($r.ok) $($r.cooldownSec) $($r.budgetSec) $($r.capSec) $($r.error)".Trim()
+}}
+$o['default'] = Test-Caps $live 1800 $false 5400 $false $false
+$o['equal'] = Test-Caps $live 300 $true 9720 $true $false
+$o['tighter'] = Test-Caps $live 600 $true 5000 $true $false
+$o['cooldown-looser'] = Test-Caps $live 60 $true 5400 $false $false
+$o['budget-looser'] = Test-Caps $live 1800 $false 10000 $true $false
+$o['stub-looser'] = Test-Caps $live 0 $true 10000 $true $true
+$o['fb-cooldown-looser'] = Test-Caps $fb 300 $true 5400 $false $false
+$o['fb-budget-looser'] = Test-Caps $fb 1800 $false 9000 $true $false
+$o['fb-tighter'] = Test-Caps $fb 2400 $true 3000 $true $false
+$o | ConvertTo-Json -Compress
+"""
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["live"], "live 300 9720 2700")
+        self.assertEqual(got["fb"], "fallback 1800 5400 2700")
+        self.assertEqual(got["default"], "True 300 9720 2700", "not explicit: the live caps apply")
+        self.assertEqual(got["equal"], "True 300 9720 2700")
+        self.assertEqual(got["tighter"], "True 600 5000 2700")
+        self.assertTrue(got["cooldown-looser"].startswith("False") and "LEASE_CAP_RELAXED" in got["cooldown-looser"], got["cooldown-looser"])
+        self.assertTrue(got["budget-looser"].startswith("False") and "LEASE_CAP_RELAXED" in got["budget-looser"], got["budget-looser"])
+        self.assertEqual(got["stub-looser"], "True 0 10000 2700", "the offline stub keeps the old shortening rule")
+        self.assertIn("LEASE_CAP_RELAXED", got["fb-cooldown-looser"])
+        self.assertIn("LEASE_CAP_RELAXED", got["fb-budget-looser"])
+        self.assertEqual(got["fb-tighter"], "True 2400 3000 2700")
+
+    def test_r2_b1_a_non_default_window_never_loosens_the_budget_of_the_fixed_3_hour_basis(self) -> None:
+        # CoS/Dot B1 on affa0d1a: budget = max_fraction_per_3h * 10800 whatever -LeaseBudgetWindowSec says (it used to be fraction * the CALLER's window, so 21600 doubled
+        # it). A longer window can only count MORE of the earlier leases against the same budget; a shorter one may only shrink the budget, never raise it.
+        caps = json.dumps({**self.LIVE_CAPS, "cooldown_minutes": 0, "max_fraction_per_3h": 0.5})
+        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+$now = [DateTime]::UtcNow
+$o = [ordered]@{{}}
+foreach ($w in 10800, 21600, 86400, 3600, 600) {{
+    $c = Get-VenueLeaseCaps -Text '{caps}' -WindowSec $w
+    # 5400 s of leases that ended just now (the exact CoS example): a 45 min lease needs 5400 - 2700 or less already used in its window
+    $leases = @([pscustomobject]@{{ startUtc = $now.AddSeconds(-5400).ToString('o'); endUtc = $now.ToString('o') }})
+    $b = Get-VenueLeaseBudgetWait -Leases $leases -NowUtc $now -CapSec $c.capSec -CooldownSec $c.cooldownSec -WindowSec $w -BudgetSec $c.budgetSec
+    $o["w$w"] = [ordered]@{{ source = $c.source; budgetSec = $c.budgetSec; reason = $b.reason; waitSec = $b.waitSec }}
+}}
+$o | ConvertTo-Json -Compress -Depth 4
+"""
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["w10800"]["budgetSec"], 5400)
+        for w in (21600, 86400):
+            with self.subTest(window=w):
+                self.assertEqual(got[f"w{w}"]["budgetSec"], 5400, "a longer window must not raise the budget")
+                self.assertEqual(got[f"w{w}"]["reason"], "BUDGET", "5400 s taken, fraction 0.5: the next lease WAITS")
+                self.assertGreater(got[f"w{w}"]["waitSec"], 0)
+        for w in (3600, 600):
+            with self.subTest(window=w):
+                self.assertLessEqual(got[f"w{w}"]["budgetSec"], 5400, "a shorter window may only tighten")
+                self.assertEqual(got[f"w{w}"]["budgetSec"], w // 2, "the fraction of the shorter window")
+        self.assertEqual(got["w10800"]["reason"], "BUDGET")
+
+    def test_r2_b1b_a_configured_cooldown_is_never_silently_shortened(self) -> None:
+        # CoS/Dot B1b on affa0d1a: cooldown_minutes 2880 (2 days) was clipped to 86400 s. The exact value is kept up to what an int of seconds holds; beyond that the
+        # config is unrepresentable and is the FALLBACK with a typed reason (never a shorter cooldown than the one configured).
+        def caps(minutes: float) -> str:
+            return json.dumps({**self.LIVE_CAPS, "cooldown_minutes": minutes})
+        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+$o = [ordered]@{{}}
+$i = 0
+foreach ($t in '{caps(1440)}', '{caps(2880)}', '{caps(10080)}', '{caps(0.5)}', '{caps(1e9)}') {{
+    $c = Get-VenueLeaseCaps -Text $t
+    $o["c$i"] = "$($c.source) $($c.cooldownSec) $($c.reason)".Trim(); $i++
+}}
+$o | ConvertTo-Json -Compress
+"""
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["c0"], "live 86400")
+        self.assertEqual(got["c1"], "live 172800", "2880 min is 172800 s, not the old 86400 clip")
+        self.assertEqual(got["c2"], "live 604800")
+        self.assertEqual(got["c3"], "live 30")
+        self.assertTrue(got["c4"].startswith("fallback 1800 cooldown_minutes-unrepresentable"), got["c4"])
+
+    def test_r2_i1_two_caps_probe_ids_built_in_the_same_second_differ_and_keep_the_agents_shapes(self) -> None:
+        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+$ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
+[ordered]@{{ ids = $ids; distinct = @($ids | Select-Object -Unique).Count }} | ConvertTo-Json -Compress
+"""
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout)
+        self.assertEqual(got["distinct"], 40, "40 ids built back to back (the same second) must all differ")
+        for i in got["ids"]:
+            self.assertRegex(i, r"^venue-quiet-probe-caps-\d{8}T\d{6}Z-[0-9a-f]{8,}$")
+            self.assertRegex(i, r"^(venue-quiet-probe|agent-swap)-", "the agent's GateExemptJobPattern")
+            self.assertRegex(i, r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$", "UmRunDrop's job id rule")
+
+    def test_an_explicit_tighter_cooldown_and_budget_win_over_the_live_caps_in_a_run(self) -> None:
+        r = self.run_batch([self.specs[0]], "-LeaseCooldownSec", "900", "-LeaseBudgetSec", "6000", FAKE_CAPS_MODE="live", FAKE_CAPS_JSON=json.dumps(self.LIVE_CAPS))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["capsSource"], b["capsCooldownSec"], b["capsBudgetSec"]), ("live", 900, 6000), b)
 
     # ---------------------------------------------------------------- r3: sol r2 B1 (no lease after the runner exits) and B2 (no leg past the lease's end)
     def test_r3_an_open_held_in_the_gate_through_the_deadline_is_cancelled_and_reconciled_before_the_claim_is_released(self) -> None:

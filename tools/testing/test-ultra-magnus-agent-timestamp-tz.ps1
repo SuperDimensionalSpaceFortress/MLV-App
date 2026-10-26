@@ -21,6 +21,11 @@ param(
 #   find-child  - Find-LaunchedJobChild reads launchingUtc the same way; a missing or bad value is "unknown"
 #   adopt       - Invoke-AdoptStartedJob (the restart-and-adopt path): the deadline is startedUtc + timeoutSec in UTC. A job past
 #                 it is killed at once; a job inside it is not; a missing startedUtc still throws (fail closed)
+#   out of range - AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a time at DateTime.MinValue or MaxValue never throws out of the three
+#                 sites above (a throw there ends the agent): queue age is clamped to [0, Int32.MaxValue], a launchingUtc
+#                 within 2 s of MinValue makes find-child unknown, and an adopt deadline that cannot be represented reads as
+#                 passed. Both edges are pinned from the valid side too: MinValue + 2 s is accepted (found, never unknown), and an
+#                 unrepresentable deadline with an identity MISMATCH kills nothing (the identity check still runs first)
 # r2: the shift only shows when the process is NOT on UTC, so this test never trusts the host's zone. It FORCES the zone of the
 # process: once at UTC-5 (what moves a deadline 5 h LATE on a pwsh 7 JSON read-back) and once at UTC+5:30 (what moves it early
 # and kills a live job), and asserts the effective offset is non-zero and the forced one BEFORE any other assertion; a zero or
@@ -166,6 +171,14 @@ try {
             'no-offset'     = $noOff
         }
     }
+    # One agent call under an error preference, inside a try as the agent's are: the agent runs under 'Continue', but its whole
+    # body (startup recovery and the poll loop) sits in one try/finally, so a failed .NET call unwinds to it and the agent exits
+    # under either preference. Returns @{ value; threw } (threw = the message).
+    function Invoke-UnderPreference([string]$Preference, [scriptblock]$Call) {
+        $ErrorActionPreference = $Preference
+        try { return @{ value = (& $Call 2>$null); threw = $null } }
+        catch { return @{ value = $null; threw = $_.Exception.Message } }
+    }
 
     # ---------------------------------------------------------------- spelling self-check
     # Under the forced zone each wrong spelling must give a different instant for a bare string (both editions) and for the
@@ -236,6 +249,65 @@ try {
     $ageBad = Get-QueueAgeSeconds -Job $job -Metadata ([pscustomobject]@{ submitUtc = 'not a time' })
     $ageCases['unparseable'] = $ageBad
     if ([Math]::Abs($ageBad - 400) -gt 15) { $failures.Add("queue-age unparseable: expected the file creation time (about 400 s), got $ageBad") }
+    # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: an age that does not fit an [int] is clamped to [0, Int32.MaxValue] (a submitUtc at
+    # DateTime.MinValue is as old as an age can be; one at MaxValue is in the future, 0). Before, the [int] cast threw out of the
+    # poll loop and ended the agent. Every age the cast could hold keeps its old answer: r1 adversary A1 (2147483647.x s old,
+    # -2147483648.x s old, the latter beside a 1950 file time) and A2 (no submitUtc, a 1950 file time; base gap, same class).
+    $oldJob = [pscustomobject]@{ CreationTimeUtc = [DateTime]::new(1950, 1, 1, 0, 0, 0, [DateTimeKind]::Utc) }
+    $maxInt = [int]::MaxValue
+    $edges = [ordered]@{
+        'minvalue'    = @{ at = [DateTime]::MinValue; job = $job; want = $maxInt; shapes = $null }
+        'maxvalue'    = @{ at = [DateTime]::MaxValue.AddSeconds(-1); job = $job; want = 0; shapes = $null }
+        'a1-posmax'   = @{ at = [DateTime]::UtcNow.AddSeconds(-2147483647.2); job = $job; want = $maxInt; shapes = @('json-readback', 'z-string') }
+        'a1-negmin'   = @{ at = [DateTime]::UtcNow.AddSeconds(2147483648.2); job = $job; want = 0; shapes = @('json-readback', 'z-string') }
+        'a1-old-file' = @{ at = [DateTime]::UtcNow.AddSeconds(2147483648.2); job = $oldJob; want = 0; shapes = @('json-readback', 'z-string') }
+    }
+    foreach ($edge in $edges.GetEnumerator()) {
+        foreach ($kv in (New-Shapes ([DateTime]::SpecifyKind($edge.Value.at, [DateTimeKind]::Utc))).GetEnumerator()) {
+            if ($null -ne $edge.Value.shapes -and $kv.Key -notin $edge.Value.shapes) { continue }
+            foreach ($pref in @('Continue', 'Stop')) {
+                $r = Invoke-UnderPreference $pref { Get-QueueAgeSeconds -Job $edge.Value.job -Metadata ([pscustomobject]@{ submitUtc = $kv.Value }) }
+                $ageCases["$($edge.Key)-$($kv.Key)-$pref"] = if ($r.threw) { 'threw' } else { $r.value }
+                if ($r.threw) { $failures.Add("queue-age $($edge.Key) $($kv.Key) ($pref): must not throw, threw $($r.threw)") }
+                elseif ($r.value -ne $edge.Value.want) { $failures.Add("queue-age $($edge.Key) $($kv.Key) ($pref): expected $($edge.Value.want), got '$($r.value)'") }
+            }
+        }
+    }
+    foreach ($pref in @('Continue', 'Stop')) {
+        $r = Invoke-UnderPreference $pref { Get-QueueAgeSeconds -Job $oldJob -Metadata ([pscustomobject]@{ submitUtc = $null }) }
+        $ageCases["a2-missing-old-file-$pref"] = if ($r.threw) { 'threw' } else { $r.value }
+        if ($r.threw) { $failures.Add("queue-age a2 missing submitUtc, 1950 file ($pref): must not throw, threw $($r.threw)") }
+        elseif ($r.value -ne $maxInt) { $failures.Add("queue-age a2 missing submitUtc, 1950 file ($pref): expected $maxInt, got '$($r.value)'") }
+    }
+    # Adversary r2 A1: the clamp makes a saturated age EQUAL a limit of Int32.MaxValue, so the expiry test must treat an age at the
+    # clamp as "at least this old". A 1950 submitUtc (older than an [int] can hold) against the largest limit is expired.
+    # The four expiry checks are inline in the agent; each one's literal condition is lifted from the source and evaluated.
+    $agentSource = [IO.File]::ReadAllText($agentScript)
+    $siteForms = [ordered]@{
+        'gate-wait' = @{ pattern = '\$maxAge -gt 0 -and \(\$age -gt \$maxAge -or \$age -ge \[int\]::MaxValue\)'; count = 2 }
+        'queued'    = @{ pattern = '\[int\]\$metadata\.maxQueueAgeSec -gt 0 -and \(\$queueAgeSec -gt \[int\]\$metadata\.maxQueueAgeSec -or \$queueAgeSec -ge \[int\]::MaxValue\)'; count = 2 }
+    }
+    $oldAge = Get-QueueAgeSeconds -Job $job -Metadata ([pscustomobject]@{ submitUtc = [DateTime]::new(1950, 1, 1, 0, 0, 0, [DateTimeKind]::Utc) })
+    $expiryCases = [ordered]@{
+        'saturated-vs-intmax' = @{ age = $oldAge; max = $maxInt; want = $true }
+        'over-limit'          = @{ age = 4000; max = 3600; want = $true }
+        'at-limit'            = @{ age = 3600; max = 3600; want = $false }
+        'under-limit'         = @{ age = 90; max = 3600; want = $false }
+        'no-limit'            = @{ age = $maxInt; max = 0; want = $false }
+        'intmax-limit-young'  = @{ age = 90; max = $maxInt; want = $false }
+    }
+    foreach ($site in $siteForms.GetEnumerator()) {
+        $found = [regex]::Matches($agentSource, $site.Value.pattern)
+        if ($found.Count -ne $site.Value.count) { $failures.Add("queue-age expiry $($site.Key): expected $($site.Value.count) checks that treat an age at Int32.MaxValue as expired, found $($found.Count)"); continue }
+        $cond = [scriptblock]::Create($found[0].Value)
+        foreach ($kv in $expiryCases.GetEnumerator()) {
+            $maxAge = $kv.Value.max; $age = $kv.Value.age; $queueAgeSec = $kv.Value.age; $metadata = [pscustomobject]@{ maxQueueAgeSec = $kv.Value.max }
+            $got = [bool](& $cond)
+            $ageCases["expired-$($site.Key)-$($kv.Key)"] = $got
+            if ($got -ne $kv.Value.want) { $failures.Add("queue-age expiry $($site.Key) $($kv.Key): age $($kv.Value.age) vs limit $($kv.Value.max) expected $($kv.Value.want), got $got") }
+        }
+    }
+    if ($agentSource -match '\$age -gt \$maxAge\)' -or $agentSource -match '\$queueAgeSec -gt \[int\]\$metadata\.maxQueueAgeSec\)') { $failures.Add('queue-age expiry: a check still compares with a bare -gt, which never expires an age clamped to Int32.MaxValue') }
     $results['queueAge'] = $ageCases
 
     # ---------------------------------------------------------------- find-child
@@ -268,6 +340,32 @@ try {
         $childCases["bad-$badValue"] = [string]$unk.state
         if ($unk.state -ne 'unknown') { $failures.Add("find-child '$badValue': expected unknown, got $($unk.state)") }
     }
+    # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a launchingUtc at or within 2 s of DateTime.MinValue cannot have the 2 s slack taken
+    # off it. It is unknown and never throws, under the agent's own 'Continue' preference and under 'Stop'. Before, AddSeconds
+    # threw out of startup recovery and ended the agent, and the next start read the same marker.
+    foreach ($edgeSec in @(0, 1)) {
+        foreach ($kv in (New-Shapes ([DateTime]::SpecifyKind([DateTime]::MinValue.AddSeconds($edgeSec), [DateTimeKind]::Utc))).GetEnumerator()) {
+            foreach ($pref in @('Continue', 'Stop')) {
+                $r = Invoke-UnderPreference $pref { Find-LaunchedJobChild -Marker ([pscustomobject]@{ launchScriptPath = 'C:\jobs\the-job.ps1'; launchImagePath = ''; launchingUtc = $kv.Value }) }
+                $label = if ($r.threw) { 'threw' } else { [string]$r.value.state }
+                $childCases["minvalue+${edgeSec}s-$($kv.Key)-$pref"] = $label
+                if ($r.threw) { $failures.Add("find-child minvalue+${edgeSec}s $($kv.Key) ($pref): must not throw, threw $($r.threw)") }
+                elseif ($r.value.state -ne 'unknown' -or [string]$r.value.why -notmatch 'launchingUtc') { $failures.Add("find-child minvalue+${edgeSec}s $($kv.Key) ($pref): expected unknown naming launchingUtc, got $($r.value.state) ($($r.value.why))") }
+            }
+        }
+    }
+    # The VALID edge (adversary Dot, r2): MinValue + 2 s is the earliest launchingUtc whose 2 s slack can be taken off (notBefore is
+    # exactly MinValue). It is accepted and processed like any other time: a live process is found, nothing throws, and it is
+    # never "unknown" (the guard above is strict, `-lt MinValue + 2 s`).
+    foreach ($kv in (New-Shapes ([DateTime]::SpecifyKind([DateTime]::MinValue.AddSeconds(2), [DateTimeKind]::Utc))).GetEnumerator()) {
+        foreach ($pref in @('Continue', 'Stop')) {
+            $r = Invoke-UnderPreference $pref { Find-LaunchedJobChild -Marker ([pscustomobject]@{ launchScriptPath = 'C:\jobs\the-job.ps1'; launchImagePath = ''; launchingUtc = $kv.Value }) }
+            $label = if ($r.threw) { 'threw' } else { [string]$r.value.state }
+            $childCases["minvalue+2s-valid-$($kv.Key)-$pref"] = $label
+            if ($r.threw) { $failures.Add("find-child minvalue+2s (valid boundary) $($kv.Key) ($pref): must not throw, threw $($r.threw)") }
+            elseif ($r.value.state -ne 'found') { $failures.Add("find-child minvalue+2s (valid boundary) $($kv.Key) ($pref): expected found (a valid time, never unknown), got $($r.value.state) ($($r.value.why))") }
+        }
+    }
     $results['findChild'] = $childCases
 
     # ---------------------------------------------------------------- adopt
@@ -294,12 +392,13 @@ try {
         return [pscustomobject]@{ jobId = 'j-adopt'; childPid = 4242; childStartUtc = $null; childStartEpochMs = 1; childImagePath = 'C:\pwsh.exe'
             startedUtc = $StartedValue; timeoutSec = $TimeoutSec; admission = $null; errFile = $errFile; outFile = $outFile; sourceInboxPath = '' }
     }
-    function Invoke-AdoptCase([string]$Name, $StartedValue, [int]$TimeoutSec, [bool[]]$Identity, [string]$Expect) {
+    function Invoke-AdoptCase([string]$Name, $StartedValue, [int]$TimeoutSec, [bool[]]$Identity, [string]$Expect, [string]$Preference = 'Stop') {
         $script:Calls.Clear(); $script:Published = $null
         $script:IdentitySeq = [System.Collections.Generic.List[bool]]::new()
         foreach ($b in $Identity) { $script:IdentitySeq.Add($b) }
         $outcome = 'adopted'
-        try { Invoke-AdoptStartedJob -Marker (New-AdoptMarker $StartedValue $TimeoutSec) -MarkerPath (Join-Path $fx 'm.json') -Match ([pscustomobject]@{ matches = $true }) }
+        $ErrorActionPreference = $Preference
+        try { Invoke-AdoptStartedJob -Marker (New-AdoptMarker $StartedValue $TimeoutSec) -MarkerPath (Join-Path $fx 'm.json') -Match ([pscustomobject]@{ matches = $true }) 2>$null }
         catch { $outcome = if ($_.Exception.Message -like 'SENTINEL*') { 'held-past-deadline' } else { 'threw' }; $why = $_.Exception.Message }
         $killed = $script:Calls.Contains('kill')
         $label = "$outcome/killed=$killed"
@@ -322,6 +421,20 @@ try {
     # Missing or unreadable startedUtc: no deadline can be computed, so the adopt still throws before waiting or killing.
     Invoke-AdoptCase 'missing' $null 2 @($true) 'threw/killed=False'
     Invoke-AdoptCase 'unparseable' 'not a time' 2 @($true) 'threw/killed=False'
+    # AGENT-LAUNCH-MARKER-MINVALUE-GUARD-1: a startedUtc whose deadline (startedUtc + timeoutSec) cannot be represented reads as a
+    # deadline already passed: the live child is killed at once, never an uncaught AddSeconds (which ended the agent).
+    foreach ($kv in (New-Shapes ([DateTime]::SpecifyKind([DateTime]::MaxValue.AddSeconds(-1), [DateTimeKind]::Utc))).GetEnumerator()) {
+        foreach ($pref in @('Continue', 'Stop')) {
+            Invoke-AdoptCase "maxvalue-$($kv.Key)-$pref" $kv.Value 3600 @($true) 'adopted/killed=True' $pref
+        }
+    }
+    # The same unrepresentable deadline, but the identity check says the pid is NOT this job's child (it was reused): the deadline
+    # reads as passed, yet the identity check still runs first (the final look), so nothing is killed.
+    foreach ($kv in (New-Shapes ([DateTime]::SpecifyKind([DateTime]::MaxValue.AddSeconds(-1), [DateTimeKind]::Utc))).GetEnumerator()) {
+        foreach ($pref in @('Continue', 'Stop')) {
+            Invoke-AdoptCase "maxvalue-mismatch-$($kv.Key)-$pref" $kv.Value 3600 @($false) 'adopted/killed=False' $pref
+        }
+    }
     $results['adopt'] = $script:AdoptSummary
 
     if ($failures.Count -gt 0) { throw ("FAIL: forced offset $forced min, edition $($results['edition']):`n  " + ($failures -join "`n  ")) }

@@ -95,6 +95,29 @@ class AssignTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             shard.load_weights("solaris")
 
+    def test_a_malformed_weight_table_is_refused(self) -> None:
+        # Adversary A1 sibling (r1, 980a921c): a boolean or non-finite weight is not seconds.
+        bad = (
+            {"schema": 1, "seconds": {"windows": {"a.A": True}}},
+            {"schema": 1, "seconds": {"windows": {"a.A": "3"}}},
+            {"schema": 1, "seconds": {"windows": {"a.A": None}}},
+            {"schema": 1, "seconds": {"windows": {"a.A": -1.0}}},
+            {"schema": 1, "seconds": {"windows": ["a.A"]}},
+            {"schema": 1, "seconds": ["windows"]},
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "weights.json"
+            for table in bad:
+                with self.subTest(table=table):
+                    path.write_text(json.dumps(table), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        shard.load_weights("windows", path)
+            path.write_text('{"schema": 1, "seconds": {"windows": {"a.A": Infinity}}}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                shard.load_weights("windows", path)
+            path.write_text(json.dumps({"schema": 1, "seconds": {"windows": {"a.A": 2, "b.B": 0.5}}}), encoding="utf-8")
+            self.assertEqual(shard.load_weights("windows", path), {"a.A": 2.0, "b.B": 0.5})
+
 
 class CoverageTests(unittest.TestCase):
     def test_shards_are_an_exact_cover_of_discover(self) -> None:
@@ -122,6 +145,29 @@ class CoverageTests(unittest.TestCase):
     def test_no_collected_module_failed_to_import(self) -> None:
         self.assertEqual(shard.import_failures(_TESTS), [])
 
+    def test_the_planned_jobs_are_an_exact_cover_of_discover(self) -> None:
+        # CI-WINDOWS-UNITTEST-SHARD-8-1: windows runs the 7-way partition plus the heavy job's
+        # parts; together they must hold every discovered id exactly once. Ubuntu has no heavy
+        # set, so its 3-way partition alone must still cover everything.
+        expected = sorted(test.id() for test in _TESTS)
+        for profile, shards in (("windows", 7), ("ubuntu", 3)):
+            with self.subTest(profile=profile):
+                partition, heavy = shard.plan_buckets(_COUNTS, profile, shards)
+                self.assertEqual(len(partition), shards)
+                covered = sorted(
+                    test.id() for bucket in [*partition, *heavy] for test in shard.shard_tests(_UNITS, bucket)
+                )
+                self.assertEqual(covered, expected)
+                if profile == "ubuntu":
+                    self.assertEqual(heavy, [])
+
+    def test_the_partition_excludes_exactly_the_heavy_set(self) -> None:
+        classes, parts = shard.load_heavy_set("windows")
+        partition, heavy = shard.plan_buckets(_COUNTS, "windows", 7)
+        self.assertEqual(len(heavy), parts)
+        self.assertEqual(sorted(key for bucket in heavy for key in bucket), sorted(classes))
+        self.assertEqual({key for bucket in partition for key in bucket} & set(classes), set())
+
 
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "tests.yml"
 WINDOWS_SHARD_JOB = "repo-hygiene-python-windows-shard"
@@ -141,6 +187,13 @@ MAX_UNMEASURED_TEST_SHARE = 0.05
 
 
 UBUNTU_SHARD_JOB = "repo-hygiene-python-ubuntu-shard"
+WINDOWS_HEAVY_JOB = "repo-hygiene-python-windows-unittest-heavy"
+WINDOWS_AGGREGATE_JOB = "repo-hygiene-python-windows"
+HEAVY_RUN = "python -m tools.repo_hygiene.ci_unittest_shard --profile windows --heavy-part ${{ matrix.part }}"
+# ...and no windows unittest job may be expected above this share of that budget: at least 15 %
+# headroom, so a PR that adds tests does not tip a shard over it. Master sat at 1439 of 1440 s
+# (99.9 %) and merge_group run 40233119003 failed at 1445 s.
+MAX_CAP_SHARE_USED = 0.85
 
 
 def _workflow_job(job_name: str) -> str:
@@ -164,7 +217,7 @@ class ShardDurationBudgetTests(unittest.TestCase):
         self.assertIsNotNone(of)
         budget = int(cap.group(1)) * 60 * CAP_SHARE
         weights = shard.load_weights("windows")
-        buckets = shard.assign(_COUNTS, int(of.group(1)), weights)
+        buckets, _heavy = shard.plan_buckets(_COUNTS, "windows", int(of.group(1)))
         expected = [
             SETUP_SECONDS + sum(shard.unit_weight(key, _COUNTS[key], weights) for key in bucket)
             for bucket in buckets
@@ -176,6 +229,47 @@ class ShardDurationBudgetTests(unittest.TestCase):
                 f"windows shard {index}/{of.group(1)} is expected at {seconds:.0f} s, over "
                 f"{CAP_SHARE:.0%} of its {cap.group(1)} min cap ({budget:.0f} s); re-derive "
                 "ci_unittest_shard_weights.json from fresh hosted logs or add shards",
+            )
+
+    def test_every_windows_unittest_shard_keeps_headroom_under_the_cap_share(self) -> None:
+        job = _windows_shard_job()
+        cap = re.search(r"(?m)^    timeout-minutes: (\d+)$", job)
+        of = re.search(r"ci_unittest_shard --profile windows --of (\d+) --shard", job)
+        self.assertIsNotNone(cap)
+        self.assertIsNotNone(of)
+        budget = int(cap.group(1)) * 60 * CAP_SHARE
+        limit = budget * MAX_CAP_SHARE_USED
+        weights = shard.load_weights("windows")
+        buckets, _heavy = shard.plan_buckets(_COUNTS, "windows", int(of.group(1)))
+        for index, bucket in enumerate(buckets, start=1):
+            seconds = SETUP_SECONDS + sum(shard.unit_weight(key, _COUNTS[key], weights) for key in bucket)
+            self.assertLessEqual(
+                seconds,
+                limit,
+                f"windows shard {index}/{of.group(1)} is expected at {seconds:.1f} s, "
+                f"{seconds / budget:.1%} of its cap share ({budget:.0f} s); the limit is "
+                f"{MAX_CAP_SHARE_USED:.0%} ({limit:.0f} s) so new tests have headroom; move a measured "
+                "class into ci_unittest_heavy_set.json or re-derive the weights from hosted logs",
+            )
+
+    def test_every_heavy_part_is_expected_within_its_cap_share_with_headroom(self) -> None:
+        job = _workflow_job(WINDOWS_HEAVY_JOB)
+        cap = re.search(r"(?m)^    timeout-minutes: (\d+)$", job)
+        self.assertIsNotNone(cap)
+        budget = int(cap.group(1)) * 60 * CAP_SHARE
+        self.assertLessEqual(budget, MAX_BUDGET_SECONDS + 1e-6)
+        limit = budget * MAX_CAP_SHARE_USED
+        weights = shard.load_weights("windows")
+        _partition, heavy = shard.plan_buckets(_COUNTS, "windows", 7)
+        self.assertTrue(heavy)
+        for index, bucket in enumerate(heavy, start=1):
+            seconds = SETUP_SECONDS + sum(shard.unit_weight(key, _COUNTS[key], weights) for key in bucket)
+            self.assertLessEqual(
+                seconds,
+                limit,
+                f"windows heavy part {index}/{len(heavy)} is expected at {seconds:.1f} s, over "
+                f"{MAX_CAP_SHARE_USED:.0%} of its {cap.group(1)} min cap share ({limit:.0f} s); "
+                "raise the heavy set's parts",
             )
 
     def test_the_expected_time_budget_stays_at_the_original_24_minutes(self) -> None:
@@ -214,6 +308,12 @@ class JobCapPinTests(unittest.TestCase):
                 self.assertIn(f"ci_unittest_shard --profile {profile} --of", job)
                 self.assertEqual(shard.JOB_CAP_MINUTES[profile], int(cap.group(1)))
 
+    def test_the_heavy_job_cap_equals_the_windows_runner_cap(self) -> None:
+        # run_shard warns against JOB_CAP_MINUTES["windows"] in the heavy job too.
+        cap = re.search(r"(?m)^    timeout-minutes: (\d+)$", _workflow_job(WINDOWS_HEAVY_JOB))
+        self.assertIsNotNone(cap)
+        self.assertEqual(shard.JOB_CAP_MINUTES["windows"], int(cap.group(1)))
+
     def test_every_profile_has_a_cap(self) -> None:
         self.assertEqual(set(shard.JOB_CAP_MINUTES), set(shard.PROFILES))
 
@@ -231,6 +331,7 @@ class JobStartEpochStepPinTests(unittest.TestCase):
     CLOCKS = {
         UBUNTU_SHARD_JOB: "date +%s",
         WINDOWS_SHARD_JOB: "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()",
+        WINDOWS_HEAVY_JOB: "[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()",
     }
 
     def _first_step(self, job_name: str) -> str:
@@ -258,6 +359,142 @@ class JobStartEpochStepPinTests(unittest.TestCase):
                 job = _workflow_job(job_name)
                 self.assertIn(shard.JOB_START_ENV, job)
                 self.assertLess(job.index(shard.JOB_START_ENV), job.index("actions/checkout@"))
+
+
+class HeavySetTests(unittest.TestCase):
+    """CI-WINDOWS-UNITTEST-SHARD-8-1: the heaviest windows classes run in their own job.
+
+    The 7-way partition excludes the tracked set in ci_unittest_heavy_set.json and the heavy
+    job runs it, split into the set's ``parts``. Both read the one ``HEAVY_SET_PATH``, so the
+    exclusion and the job that runs what was excluded cannot name different sets.
+    """
+
+    def _strip_comments(self, text: str) -> str:
+        return re.sub(r"(?m)^\s*#.*$", "", text)
+
+    def test_every_heavy_class_is_discovered_and_measured(self) -> None:
+        # An unmeasured class would be sized by test count, and a stale one would vanish from
+        # both the partition and the heavy job; --verify-partition also refuses the latter.
+        classes, parts = shard.load_heavy_set("windows")
+        self.assertTrue(classes)
+        self.assertGreaterEqual(parts, 1)
+        weights = shard.load_weights("windows")
+        for key in classes:
+            with self.subTest(key=key):
+                self.assertIn(key, _COUNTS)
+                self.assertIn(key, weights)
+
+    def test_the_ubuntu_profile_has_no_heavy_set(self) -> None:
+        self.assertEqual(shard.load_heavy_set("ubuntu"), ([], 0))
+
+    def test_a_malformed_heavy_set_is_refused(self) -> None:
+        bad = (
+            {"schema": 1, "profiles": {"windows": {"parts": 0, "classes": ["a.A"]}}},
+            {"schema": 1, "profiles": {"windows": {"parts": 2, "classes": ["a.A", "a.A"]}}},
+            {"schema": 1, "profiles": {"windows": {"parts": 2, "classes": []}}},
+            {"schema": 2, "profiles": {}},
+            {"schema": 1, "profiles": {"solaris": {"parts": 1, "classes": ["a.A"]}}},
+            # Adversary A1 (r1, 980a921c): a wrong shape must not be coerced into a valid one.
+            {"schema": 1, "profiles": {"windows": {"parts": 1, "classes": {"a.A": False}}}},
+            {"schema": 1, "profiles": {"windows": {"parts": 1, "classes": "a.A"}}},
+            {"schema": 1, "profiles": {"windows": {"parts": 1, "classes": [None]}}},
+            {"schema": 1, "profiles": {"windows": {"parts": 1, "classes": [""]}}},
+            {"schema": True, "profiles": {"windows": {"parts": 1, "classes": ["a.A"]}}},
+            {"schema": 1, "profiles": ["windows"]},
+            {"schema": 1, "profiles": {"windows": ["a.A"]}},
+            {"schema": 1, "profiles": {"windows": {"parts": True, "classes": ["a.A"]}}},
+            [],
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "heavy.json"
+            for table in bad:
+                with self.subTest(table=table):
+                    path.write_text(json.dumps(table), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        shard.load_heavy_set("windows", path)
+
+    def test_a_heavy_class_that_discover_does_not_collect_fails_the_partition_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "heavy.json"
+            path.write_text(
+                json.dumps({"schema": 1, "profiles": {"windows": {"parts": 1, "classes": ["tools.repo_hygiene.test_gone.Gone"]}}}),
+                encoding="utf-8",
+            )
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                code = shard.verify_partition("windows", 7, heavy_path=path)
+        self.assertEqual(code, 1)
+        self.assertIn("tools.repo_hygiene.test_gone.Gone", err.getvalue())
+
+    def test_the_partition_proof_covers_the_heavy_parts(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            code = shard.verify_partition("windows", 7)
+        self.assertEqual(code, 0, out.getvalue())
+        _classes, parts = shard.load_heavy_set("windows")
+        for part in range(1, parts + 1):
+            self.assertIn(f"heavy part {part}/{parts}:", out.getvalue())
+        self.assertIn(f"shards and heavy parts total {len(_TESTS)}", out.getvalue())
+
+    def test_the_heavy_part_cli_lists_its_part_and_refuses_a_bad_part(self) -> None:
+        classes, parts = shard.load_heavy_set("windows")
+        listed: list[str] = []
+        for part in range(1, parts + 1):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = shard.main(["--repo-root", str(REPO_ROOT), "--profile", "windows", "--heavy-part", str(part), "--list"])
+            self.assertEqual(code, 0)
+            listed.extend(out.getvalue().split())
+        self.assertEqual(sorted(listed), sorted(classes))
+        for argv in (
+            ["--profile", "windows", "--heavy-part", str(parts + 1)],
+            ["--profile", "windows", "--heavy-part", "0"],
+            ["--profile", "ubuntu", "--heavy-part", "1"],
+            ["--profile", "windows", "--heavy-part", "1", "--shard", "1", "--of", "7"],
+            ["--profile", "windows", "--heavy-part", "1", "--verify-partition", "--of", "7"],
+            ["--profile", "windows", "--shard", "1"],
+        ):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                shard.main(["--repo-root", str(REPO_ROOT), *argv])
+
+    def test_the_heavy_job_runs_each_part_of_the_tracked_set_once(self) -> None:
+        _classes, parts = shard.load_heavy_set("windows")
+        job = _workflow_job(WINDOWS_HEAVY_JOB)
+        plain = self._strip_comments(job)
+        matrix = re.search(r"(?m)^        part: \[([0-9, ]+)\]$", job)
+        self.assertIsNotNone(matrix)
+        self.assertEqual([int(n) for n in matrix.group(1).split(",")], list(range(1, parts + 1)))
+        self.assertIn(f"    name: Repo Hygiene Python windows unittest heavy ${{{{ matrix.part }}}}/{parts}\n", job)
+        self.assertIn("      fail-fast: false\n", job)
+        # One step runs the tool, on the matrix's own part, unconditionally.
+        self.assertEqual(plain.count("ci_unittest_shard"), 1)
+        self.assertIn(f"        run: {HEAVY_RUN}\n", job)
+        self.assertNotRegex(plain, r"(?m)^\s+if:")
+        self.assertNotRegex(plain, r"--heavy-part\s+(?!\$\{\{ matrix\.part \}\})")
+        self.assertIn("    runs-on: windows-latest\n", job)
+
+    def test_the_shard_job_never_runs_a_heavy_part(self) -> None:
+        self.assertNotIn("--heavy-part", _windows_shard_job())
+
+    def test_the_heavy_job_has_the_shard_jobs_setup(self) -> None:
+        def setup_steps(job: str, first_own_step: str) -> str:
+            return job[job.index("      - uses: actions/checkout@") : job.index(first_own_step)]
+
+        self.assertEqual(
+            setup_steps(_workflow_job(WINDOWS_HEAVY_JOB), "      - name: Run repo hygiene heavy unittest part"),
+            setup_steps(_windows_shard_job(), "      - name: Prove the unittest shards cover every discovered test"),
+        )
+
+    def test_the_required_windows_check_needs_the_heavy_job(self) -> None:
+        aggregate = _workflow_job(WINDOWS_AGGREGATE_JOB)
+        needs = re.search(r"(?m)^    needs: \[([a-z0-9, -]+)\]$", aggregate)
+        self.assertIsNotNone(needs)
+        self.assertIn(WINDOWS_HEAVY_JOB, [name.strip() for name in needs.group(1).split(",")])
+        self.assertIn("    if: ${{ always() }}\n", aggregate)
+        step = aggregate[aggregate.index("      - name: Require the heavy unittest job to have passed") :]
+        step = step.split("\n      - ")[0]
+        self.assertIn(f"UNITTEST_HEAVY_RESULT: ${{{{ needs.{WINDOWS_HEAVY_JOB}.result }}}}", step)
+        self.assertIn('test "$UNITTEST_HEAVY_RESULT" = "success"', step)
 
 
 class FakeClock:
