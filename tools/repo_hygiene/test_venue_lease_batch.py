@@ -21,6 +21,7 @@ claim lives in a temp -ClaimDir. Nothing here reaches a venue. Windows-only (Pow
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -34,6 +35,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -295,6 +297,39 @@ def read_claim_json(path: Path, timeout_s: float = 10.0, sleep_s: float = 0.1) -
                     raise json.JSONDecodeError(f"{path}: {e.msg}", e.doc, e.pos) from e
                 raise type(e)(e.errno, f"{e.strerror} (still failing after {timeout_s}s): {path}") from e
             time.sleep(sleep_s)
+
+
+class ExclusiveHold:
+    """`path` held open with share mode 0 (what Request-/Update-VenueClaim's FileShare.None does) until release() closes it.
+
+    No thread and no timer: the hold ends only when release() runs, on whichever thread calls it, synchronously. A hold that expires on its own can lapse
+    before the assertion that needs it, and a release that waits for another thread to be scheduled can land after a reader's deadline; neither is possible
+    here (CI-FLAKE-LEASE-BATCH-CLAIM-READ-RACE-HARDEN-1 r2, sol r1). release() is idempotent and thread-safe; callers put it in a finally."""
+
+    def __init__(self, path: Path) -> None:
+        import ctypes
+        from ctypes import wintypes
+        self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._k32.CreateFileW.restype = wintypes.HANDLE
+        self._k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        self._k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self._k32.CloseHandle.restype = wintypes.BOOL
+        self._handle = self._k32.CreateFileW(str(path), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
+        if self._handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        self._lock = threading.Lock()
+        self.closed = False
+
+    def release(self) -> bool:
+        """Close the handle; True only for the call that closed it. A CloseHandle that fails raises OSError and leaves closed False: the hold may still be up."""
+        import ctypes
+        with self._lock:
+            if self.closed:
+                return False
+            if not self._k32.CloseHandle(self._handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.closed = True
+            return True
 
 
 def batch_result(stdout: str) -> dict:
@@ -1032,24 +1067,87 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             p.stderr.close()
 
     # ---------------------------------------------------------------- CI-FLAKE-LEASE-BATCH-CLAIM-READ-RACE-1 (merge_group 40211588250)
-    def _hold_exclusive(self, path: Path, hold_s: float) -> threading.Thread:
-        """Hold `path` open with share mode 0 (what Request-/Update-VenueClaim's FileShare.None does) for hold_s seconds on a background thread."""
-        import ctypes
-        from ctypes import wintypes
-        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        k32.CreateFileW.restype = wintypes.HANDLE
-        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
-        k32.CloseHandle.argtypes = [wintypes.HANDLE]
-        handle = k32.CreateFileW(str(path), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
-        self.assertNotEqual(handle, wintypes.HANDLE(-1).value, "could not take the exclusive handle")
+    def _read_claim_while_writer_holds(self, *, reader_timeout_s: float, pause_after_start_s: float = 0.0, pause_before_direct_s: float = 0.0,
+                                       reader=None, foreign_sleeper: bool = False) -> dict:
+        """The race scenario with the parent's scheduling made injectable: the writer holds the claim, the direct read raises, and read_claim_json waits it out.
 
-        def hold() -> None:
-            time.sleep(hold_s)
-            k32.CloseHandle(handle)
+        The test's outcome must not depend on the parent being scheduled before any deadline, so the parent never releases the writer: the reader's own first
+        retry sleep does, synchronously, on the reader's thread. The hold has no timer, so a pause before the direct read cannot end it, and a pause after the
+        reader starts cannot make the release late against the reader's budget. pause_before_direct_s / pause_after_start_s are real parent pauses (the stress
+        test passes values longer than reader_timeout_s to stand in for a descheduled runner). reader is the function under test (default read_claim_json);
+        foreign_sleeper runs a time.sleep on another thread while the spy is installed and before the reader's first read, which must not count as the reader's
+        retry. Returns the reader's {"body"|"error"} plus "retried", "held_at_retry", "reader_ident", "sleeps" ((thread ident, hold still held) per sleep the
+        spy acted on) and "reads" (the reader thread's read_text outcomes in order: an exception's class name, or "ok")."""
+        real_sleep = time.sleep
+        real_read_text = Path.read_text
+        reader_fn = read_claim_json if reader is None else reader
+        hold = ExclusiveHold(self.claim_path)
+        out: dict = {"held_at_retry": None, "retried": False, "reader_ident": None, "sleeps": [], "reads": []}
+        reader_thread = None
+        try:
+            real_sleep(pause_before_direct_s)
+            with self.assertRaises(PermissionError):
+                self.claim_path.read_text(encoding="utf-8")
 
-        t = threading.Thread(target=hold, daemon=True)
-        t.start()
-        return t
+            def spy_sleep(s: float) -> None:
+                # Runs on the reader's thread at its first retry: the file is still held here, and the release is this thread's own, so no parent step sits between
+                # the reader's PermissionError and the file becoming readable.
+                # time.sleep is patched process-wide, so only the reader's own thread may touch the scenario state: any other caller (a foreign thread, a timer)
+                # goes straight to the real sleep (sol r2 on fefea29b).
+                if threading.get_ident() != out["reader_ident"]:
+                    real_sleep(s)
+                    return
+                out["sleeps"].append((threading.get_ident(), not hold.closed))
+                if not out["retried"]:
+                    out["held_at_retry"] = not hold.closed
+                    out["retried"] = True
+                    hold.release()
+                real_sleep(s)
+
+            def spy_read_text(path_self, *a, **k):
+                if threading.get_ident() != out["reader_ident"]:
+                    return real_read_text(path_self, *a, **k)
+                try:
+                    text = real_read_text(path_self, *a, **k)
+                except BaseException as e:
+                    out["reads"].append(type(e).__name__)
+                    raise
+                out["reads"].append("ok")
+                return text
+
+            def read() -> None:
+                out["reader_ident"] = threading.get_ident()
+                try:
+                    out["body"] = reader_fn(self.claim_path, timeout_s=reader_timeout_s)
+                except BaseException as e:   # surfaced on the test thread below
+                    out["error"] = e
+
+            reader_thread = threading.Thread(target=read, daemon=True)
+            with mock.patch.object(time, "sleep", spy_sleep), mock.patch.object(Path, "read_text", spy_read_text):
+                if foreign_sleeper:
+                    foreign = threading.Thread(target=lambda: time.sleep(0.001), daemon=True)
+                    foreign.start()
+                    foreign.join(30)
+                reader_thread.start()
+                real_sleep(pause_after_start_s)
+                reader_thread.join(reader_timeout_s + 30)
+        finally:
+            hold.release()   # a test that died above must not leave the claim held
+            if reader_thread is not None:
+                reader_thread.join(5)
+        self.assertFalse(reader_thread.is_alive(), "the reader returned")
+        self.assertTrue(hold.closed, "the writer's hold ended")
+        return out
+
+    def _assert_reader_waited_out(self, out: dict, body: dict) -> None:
+        """The scenario's verdict: the reader itself met the held file (a PermissionError read, then a sleep on its own thread with the hold still up) and then
+        returned the claim. A sleep on any other thread proves nothing about the reader (sol r2 on fefea29b)."""
+        mine = [held for ident, held in out["sleeps"] if ident == out["reader_ident"]]
+        self.assertTrue(out["retried"] and out["held_at_retry"], f"the reader hit PermissionError and went to sleep while the writer still held the file: {out}")
+        self.assertTrue(mine and mine[0], f"the reader's own first sleep came while the writer held the file: {out}")
+        self.assertEqual(out["reads"][:1], ["PermissionError"], f"the reader's first read was a locked read: {out}")
+        self.assertEqual(out["reads"][-1:], ["ok"], f"the reader's last read succeeded: {out}")
+        self.assertEqual({k: out[k] for k in ("body", "error") if k in out}, {"body": body}, f"returns the full JSON once the writer releases: {out}")
 
     def test_the_claim_reader_waits_out_a_writer_that_holds_the_file(self) -> None:
         # The race the merge_group flake hit: a reader that lands while the runner holds the claim (FileShare.None on the take or a renewal) got PermissionError;
@@ -1059,11 +1157,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         full = json.dumps(body)
         self.claim_path.write_text(full, encoding="utf-8")
 
-        t = self._hold_exclusive(self.claim_path, 1.0)
-        with self.assertRaises(PermissionError):
-            self.claim_path.read_text(encoding="utf-8")
-        self.assertEqual(read_claim_json(self.claim_path), body, "returns the full JSON once the writer releases")
-        t.join(5)
+        self._assert_reader_waited_out(self._read_claim_while_writer_holds(reader_timeout_s=120.0), body)
 
         self.claim_path.write_text('{"schema": "mlv-app/ven', encoding="utf-8")   # a half-written claim
         with self.assertRaises(json.JSONDecodeError):
@@ -1081,6 +1175,77 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         with self.assertRaises(json.JSONDecodeError) as cm:
             read_claim_json(self.claim_path, timeout_s=0.5, sleep_s=0.1)
         self.assertIn(str(self.claim_path), str(cm.exception))
+
+    def test_the_claim_reader_scenario_survives_a_descheduled_parent(self) -> None:
+        # sol r1 on effee436: a parent paused longer than the reader's budget after the reader's first retry failed a valid test (the parent owned the release,
+        # the reader's own deadline kept running), and a pause longer than the hold's 60 s wait before the direct read let the hold lapse. Scaled down: a 2 s
+        # reader budget and 3 s parent pauses at both points. The outcome must be the same as with no pause.
+        self.claims.mkdir()
+        body = {"schema": "mlv-app/venue-claim/v1", "venue": "bachelor", "nonce": "n" * 32}
+        self.claim_path.write_text(json.dumps(body), encoding="utf-8")
+        self._assert_reader_waited_out(self._read_claim_while_writer_holds(reader_timeout_s=2.0, pause_after_start_s=3.0, pause_before_direct_s=3.0), body)
+
+    def test_the_claim_reader_scenario_ignores_a_foreign_sleeper(self) -> None:
+        # sol r2 on fefea29b: the sleep spy was process-wide, so another thread's time.sleep set retried/held_at_retry and released the hold before the reader's
+        # first read; the reader then never met a locked file and the scenario still passed. A foreign sleep, before the reader starts, must change nothing.
+        self.claims.mkdir()
+        body = {"schema": "mlv-app/venue-claim/v1", "venue": "bachelor", "nonce": "n" * 32}
+        self.claim_path.write_text(json.dumps(body), encoding="utf-8")
+        self._assert_reader_waited_out(self._read_claim_while_writer_holds(reader_timeout_s=30.0, foreign_sleeper=True), body)
+
+    def test_the_claim_reader_scenario_rejects_a_reader_that_does_not_retry(self) -> None:
+        # The mutation the scenario exists to catch: a reader that reads once. It must fail the scenario's verdict with and without a foreign sleeper.
+        self.claims.mkdir()
+        body = {"schema": "mlv-app/venue-claim/v1", "venue": "bachelor", "nonce": "n" * 32}
+        self.claim_path.write_text(json.dumps(body), encoding="utf-8")
+
+        def read_once(path: Path, timeout_s: float = 0.0) -> dict:
+            return json.loads(path.read_text(encoding="utf-8"))
+
+        for foreign in (False, True):
+            with self.subTest(foreign_sleeper=foreign):
+                out = self._read_claim_while_writer_holds(reader_timeout_s=30.0, reader=read_once, foreign_sleeper=foreign)
+                with self.assertRaises(AssertionError):
+                    self._assert_reader_waited_out(out, body)
+
+    def test_exclusive_hold_release_reports_a_close_handle_failure(self) -> None:
+        # CloseHandle returns 0 on failure; the hold may then still be up while release() claimed it was over.
+        target = self.case / "held.txt"
+        target.write_text("x", encoding="utf-8")
+        hold = ExclusiveHold(target)
+        real_k32 = hold._k32
+
+        class FailingK32:
+            calls = 0
+
+            def CloseHandle(self, handle) -> int:
+                FailingK32.calls += 1
+                return 0
+
+        try:
+            hold._k32 = FailingK32()
+            with self.assertRaises(OSError):
+                hold.release()
+            self.assertFalse(hold.closed, "a failed CloseHandle is not a closed hold")
+            self.assertEqual(FailingK32.calls, 1)
+        finally:
+            hold._k32 = real_k32
+            hold.release()   # really close it so the file can be removed
+        self.assertTrue(hold.closed)
+
+    def test_the_flaky_test_reads_its_claims_through_read_claim_json(self) -> None:
+        # CI-FLAKE-LEASE-BATCH-CLAIM-READ-RACE-HARDEN-1 (b): read_claim_json is only a fix while the flaky test calls it. Reverting its c0/c1 reads to
+        # json.loads(path.read_text()) stayed green, so pin the call site by source: c0 and c1 are assigned from read_claim_json and the method has no raw read_text.
+        name = "test_a_long_foreign_refusal_wait_does_not_let_the_live_claim_expire"
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        fns = [n for c in tree.body if isinstance(c, ast.ClassDef) and c.name == type(self).__name__ for n in c.body if isinstance(n, ast.FunctionDef) and n.name == name]
+        self.assertEqual(len(fns), 1, f"{name} was renamed or removed: re-point this pin at the test that reads the live claim")
+        fn = fns[0]
+        via_helper = {t.id for a in ast.walk(fn) if isinstance(a, ast.Assign) and isinstance(a.value, ast.Call) and isinstance(a.value.func, ast.Name) and a.value.func.id == "read_claim_json"
+                      for t in a.targets if isinstance(t, ast.Name)}
+        self.assertEqual(via_helper, {"c0", "c1"}, "c0 and c1 are read with read_claim_json")
+        raw = [ast.unparse(n) for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "read_text"]
+        self.assertEqual(raw, [], "no raw read_text in the flaky test: a claim read there races the runner's FileShare.None write")
 
     # ---------------------------------------------------------------- r5: the claim is renewed for as long as it is held (dot 242171b3 B1)
     def test_a_long_foreign_refusal_wait_does_not_let_the_live_claim_expire(self) -> None:
