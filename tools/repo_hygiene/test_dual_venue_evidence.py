@@ -6085,6 +6085,9 @@ $obj = $arr[[Math]::Min($n, $arr.Count - 1)]
             "empty instance": ([dict(hot, instance="")], "invalid-core-instance"),
             "instance that is not group,core": ([dict(hot, instance="cpu2")], "invalid-core-instance"),
             "null instance": ([dict(hot, instance=None)], "invalid-core-instance"),
+            # adversary pass r6 round 2 (A1): .NET `$` accepts a trailing line feed, and \d accepts non-ASCII digits; the name is exactly ASCII digits, comma, ASCII digits
+            "instance with a trailing line feed": ([dict(hot, instance="0,2\n")], "invalid-core-instance"),
+            "instance with Arabic-Indic digits": ([dict(hot, instance="٠,٢")], "invalid-core-instance"),
         }
         for name, (cores, reason) in cases.items():
             with self.subTest(name):

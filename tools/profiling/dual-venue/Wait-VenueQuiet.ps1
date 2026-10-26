@@ -1345,7 +1345,7 @@ function Get-VenuePerCoreVerdict($Probe, [double]$Threshold, [bool]$Enabled) {
             if (-not (Test-PerCoreNumber $v) -or -not [double]::IsFinite([double]$v) -or [double]$v -lt 0.0 -or [double]$v -gt 100.0) { $reasons += 'invalid-core-percent'; continue }
             # a fast core is named by its "<group>,<core>" instance (a missing, array, numeric or free-text name would be a made-up core in the blocked line)
             if ($isFast) {
-                if ($row.instance -isnot [string] -or $row.instance -cnotmatch '^\d+,\d+$') { $reasons += 'invalid-core-instance'; continue }
+                if ($row.instance -isnot [string] -or $row.instance -cnotmatch '^[0-9]+,[0-9]+\z') { $reasons += 'invalid-core-instance'; continue }
                 $fast += [pscustomobject]@{ instance = [string]$row.instance; percent = [double]$v }
             }
         }
