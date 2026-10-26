@@ -313,7 +313,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         cls.specs = []
         for name in ("fx-a", "fx-b", "fx-c"):
             p = cls.tmp / f"{name}.json"
-            p.write_text(json.dumps({"legId": name}), encoding="utf-8")
+            # the shape Invoke-VenueLeg accepts (schema + the backends it may run), so a -LegPlan item can be checked against it before any lease
+            p.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": name, "backends": ["cpu", "cuda"]}), encoding="utf-8")
             cls.specs.append(p)
 
     @classmethod
@@ -1716,6 +1717,81 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         for label, doc in cases.items():
             with self.subTest(case=label):
                 self.assert_whole_plan_refused(self.write_raw_plan(doc), "LEG_PLAN_UNREADABLE")
+
+    def test_r3_a1_a_plan_order_in_any_letter_case_still_interleaves(self) -> None:
+        # sol r3 A1: -PlanOrder is bound case-insensitively but was dispatched case-sensitively, so 'interleave' was accepted and ran A A B B.
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "interleave")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [bt] = self.batches()
+        self.assertEqual([l["arm"] for l in bt["legs"]], ["A", "B", "A", "B"])
+        self.assertEqual(batch_result(r.stdout)["legPlan"]["order"], "Interleave", "the receipt names the canonical order, not the spelling typed")
+
+    def test_r3_a2_arms_that_differ_only_in_case_are_separate_arms(self) -> None:
+        # sol r3 A2: the arm label is validated case-sensitively (A and a are both legal) but the interleave keyed its queues case-insensitively, merging them.
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            "$items = 'AAaa'.ToCharArray() | ForEach-Object -Begin { $i = 0 } -Process { $i++; [pscustomobject]@{ arm = [string]$_; n = $i } }\n"
+            "(@(Get-VenueInterleavedLegPlan -Items @($items)) | ForEach-Object { \"$($_.arm)$($_.n)\" }) -join ' '\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(out.stdout.strip(), "A1 a3 A2 a4")
+
+    def test_r3_a3_a_trailing_line_feed_never_passes_a_plan_item_pattern(self) -> None:
+        # sol r3 A3: '$' also matches before a final LF, so arm "A\n" (an illegal Windows file name once it is in a leg output name) and a 40-hex commit or
+        # 64-hex manifest with a trailing LF passed the item patterns. \z is the end of the string.
+        a = self.commit_a
+        bad = {
+            "BAD_ARM": self.item(self.specs[0], "B\n", a),
+            "BAD_SOURCE_COMMIT": self.item(self.specs[0], "B", a + "\n", manifest=self.manifests[a]),
+            "BAD_MANIFEST_SHA256": self.item(self.specs[0], "B", a, manifest=self.manifests[a] + "\n"),
+        }
+        for reason, item in bad.items():
+            with self.subTest(reason=reason):
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), item]), f"{reason} item=2 ")
+
+    def test_r3_a3_a_spec_legid_with_a_trailing_line_feed_falls_back_to_the_file_name(self) -> None:
+        spec = self.case / "fx-nl.json"
+        spec.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": "bad\n", "backends": ["cpu"]}), encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([l["name"] for l in batch_result(r.stdout)["legs"]], ["01-fx-nl-cpu-A"])
+
+    def test_r3_a4_an_item_the_leg_script_would_throw_on_is_refused_before_the_lease(self) -> None:
+        # sol r3 A4: Invoke-VenueLeg throws DVE_LEG_SPEC_INVALID when the item's backend is not one the spec lists (or the spec is not a leg spec), AFTER the
+        # lease is open, which ends as LEG_FAILED / exit 7 instead of the whole plan being refused with exit 2 and nothing submitted.
+        a = self.commit_a
+
+        def spec(name: str, text: str) -> Path:
+            p = self.case / name
+            p.write_text(text, encoding="utf-8")
+            return p
+        cpu_only = spec("cpu-only.json", json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": "cpu-only", "backends": ["cpu"]}))
+        wrong_schema = spec("wrong-schema.json", json.dumps({"schema": "nope", "legId": "ws", "backends": ["cpu"]}))
+        not_json = spec("not-json.json", "this is not json")
+        no_backends = spec("no-backends.json", json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": "nb"}))
+        cases = {
+            "BAD_BACKEND": self.item(cpu_only, "B", a, backend="cuda"),
+            "LEG_SPEC_INVALID wrong schema": self.item(wrong_schema, "B", a),
+            "LEG_SPEC_INVALID not json": self.item(not_json, "B", a),
+            "BAD_BACKEND no backends listed": self.item(no_backends, "B", a),
+        }
+        for label, item in cases.items():
+            with self.subTest(case=label):
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), item]), f"{label.split(' ')[0]} item=2 ")
+
+    def test_r3_a5_a_refusal_whose_log_line_cannot_be_written_still_says_so_on_stderr_and_exits_2(self) -> None:
+        # sol r3 A5: Stop-PlanRefused wrote batch.log first; with the log held by another process that write threw, so the typed refusal never reached stderr and
+        # the exit was 1, not 2.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        log = self.run_dir / "batch.log"
+        log.write_text("", encoding="utf-8")
+        hold = self._hold_exclusive(log, 90)
+        r = self.run_plan(self.case / "missing-plan.json")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BATCH_USAGE LEG_PLAN_REFUSED reason=LEG_PLAN_UNREADABLE", r.stderr)
+        self.assertEqual(self.kinds(), [])
+        del hold
 
     def test_the_plan_and_the_scalar_form_are_mutually_exclusive(self) -> None:
         args, e = self.plan_cmd(self.ab_block_plan(), "-SourceCommit", SHA)

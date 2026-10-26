@@ -980,15 +980,17 @@ function Get-VenueInterleavedLegPlan {
     The -Items objects, reordered.
     #>
     param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items)
-    $queues = [ordered]@{}
+    # An arm label is case-sensitive (the plan validates it with -cnotmatch, so A and a are two labels): an [ordered]@{} would key them case-insensitively and merge them.
+    $queues = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.Queue[object]]]::new([StringComparer]::Ordinal)
+    $armOrder = [System.Collections.Generic.List[string]]::new()
     foreach ($it in $Items) {
         $arm = [string]$it.arm
-        if (-not $queues.Contains($arm)) { $queues[$arm] = [System.Collections.Generic.Queue[object]]::new() }
+        if (-not $queues.ContainsKey($arm)) { $queues[$arm] = [System.Collections.Generic.Queue[object]]::new(); $armOrder.Add($arm) }
         $queues[$arm].Enqueue($it)
     }
     $left = $Items.Count
     while ($left -gt 0) {
-        foreach ($q in $queues.Values) { if ($q.Count -gt 0) { $q.Dequeue(); $left-- } }
+        foreach ($arm in $armOrder) { $q = $queues[$arm]; if ($q.Count -gt 0) { $q.Dequeue(); $left-- } }
     }
 }
 
