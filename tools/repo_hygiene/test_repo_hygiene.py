@@ -923,7 +923,7 @@ class RepoHygieneTests(unittest.TestCase):
         bridge_workflow = (ROOT / ".github" / "workflows" / "factory-bridge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(workflow.count('python-version-file: ".python-version"'), 8)
+        self.assertEqual(workflow.count('python-version-file: ".python-version"'), 9)
         self.assertEqual(bridge_workflow.count('python-version-file: ".python-version"'), 1)
         # The moved job retains the same locked dependency policy; count both
         # reviewed workflow surfaces so relocation cannot weaken its checks.
@@ -942,7 +942,7 @@ class RepoHygieneTests(unittest.TestCase):
             for line in workflow.splitlines()
             if "-m pip install " in line
         ]
-        self.assertEqual(len(install_lines), 17)
+        self.assertEqual(len(install_lines), 19)
         for line in install_lines:
             for required_flag in (
                 "--disable-pip-version-check",
@@ -954,7 +954,7 @@ class RepoHygieneTests(unittest.TestCase):
                 self.assertIn(required_flag, line, f"unsafe Python install command: {line}")
             lock_path = line.rsplit(" -r ", 1)[1].strip()
             self.assertIn(lock_path, allowed_locks, f"unapproved Python lock: {lock_path}")
-        self.assertEqual(workflow.count("python -m pip check"), 8)
+        self.assertEqual(workflow.count("python -m pip check"), 9)
 
         observed_locks: dict[str, dict[str, str]] = {}
         for relative_path, roots in PYTHON_LOCK_ROOTS.items():
@@ -1062,6 +1062,7 @@ class RepoHygieneTests(unittest.TestCase):
             "repo-hygiene-python-windows-shard": 50,
             "repo-hygiene-python-windows-containment": 45,
             "repo-hygiene-python-windows-coordination-heavy": 45,
+            "repo-hygiene-python-windows-unittest-heavy": 50,
             "repo-hygiene-python-windows": 5,
             "windows-product-oracles-part": 60,
             "windows-product-oracles": 5,
@@ -1076,7 +1077,7 @@ class RepoHygieneTests(unittest.TestCase):
         expected_remote_uses = [
             ("actions/checkout", "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09", "v5"),
             ("actions/setup-python", "ece7cb06caefa5fff74198d8649806c4678c61a1", "v6"),
-        ] * 8 + [
+        ] * 9 + [
             ("actions/upload-artifact", "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", "v7"),
         ] * 3
         uses_entries = []
@@ -1115,7 +1116,7 @@ class RepoHygieneTests(unittest.TestCase):
             r"\s+persist-credentials: false\s*$",
             workflow,
         )
-        self.assertEqual(len(checkout_blocks), 8)
+        self.assertEqual(len(checkout_blocks), 9)
 
         aqt_steps = re.findall(
             r"(?ms)^      - name: Install Qt 6\.10\.2 \+ MinGW 13\.1\r?\n"
@@ -1290,7 +1291,8 @@ class RepoHygieneTests(unittest.TestCase):
                     # The lane containment job gates the same required check as the shards.
                     self.assertIn(
                         f"    needs: [{shard_id}, repo-hygiene-python-windows-containment, "
-                        "repo-hygiene-python-windows-coordination-heavy]",
+                        "repo-hygiene-python-windows-coordination-heavy, "
+                        "repo-hygiene-python-windows-unittest-heavy]",
                         aggregator,
                     )
                     self.assertIn("needs.repo-hygiene-python-windows-containment.result", aggregator)
@@ -1298,6 +1300,9 @@ class RepoHygieneTests(unittest.TestCase):
                     # So does the heavy coordination job.
                     self.assertIn("needs.repo-hygiene-python-windows-coordination-heavy.result", aggregator)
                     self.assertIn('test "$HEAVY_RESULT" = "success"', aggregator)
+                    # And the unittest heavy job (CI-WINDOWS-UNITTEST-SHARD-8-1).
+                    self.assertIn("needs.repo-hygiene-python-windows-unittest-heavy.result", aggregator)
+                    self.assertIn('test "$UNITTEST_HEAVY_RESULT" = "success"', aggregator)
                 else:
                     self.assertIn(f"    needs: {shard_id}", aggregator)
                 self.assertIn(f"needs.{shard_id}.result", aggregator)
@@ -2028,8 +2033,8 @@ class RepoHygieneTests(unittest.TestCase):
 
         expected_remote_inventory = Counter(
             {
-                ("actions/checkout", "v5"): 14,
-                ("actions/setup-python", "v6"): 13,
+                ("actions/checkout", "v5"): 15,
+                ("actions/setup-python", "v6"): 14,
                 ("actions/upload-artifact", "v7"): 13,
                 ("ConorMacBride/install-package", "v1"): 3,
             }
