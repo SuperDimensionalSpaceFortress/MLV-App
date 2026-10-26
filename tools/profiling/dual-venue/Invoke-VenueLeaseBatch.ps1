@@ -261,6 +261,25 @@ public static class VenueLeaseBatchFinalPath {
     static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder buffer, uint length, uint flags);
+    [StructLayout(LayoutKind.Sequential)]
+    struct FileTime { public uint Low; public uint High; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct ByHandleFileInformation {
+        public uint Attributes; public FileTime Created; public FileTime Accessed; public FileTime Written;
+        public uint VolumeSerial; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation info);
+    // volume serial + file index = the file's identity, whatever name or link reached it (a hard link is a second name for the same file); Links is how many names it has
+    public static string Identity(string path, out uint links) {
+        using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (h.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            ByHandleFileInformation info;
+            if (!GetFileInformationByHandle(h, out info)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            links = info.Links;
+            return info.VolumeSerial.ToString("x8") + ":" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8");
+        }
+    }
     public static string Resolve(string path) {
         // access 0 (attributes only), share all, OPEN_EXISTING, BACKUP_SEMANTICS (a directory opens too); no OPEN_REPARSE_POINT, so a link is followed to its target
         using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
@@ -286,9 +305,17 @@ public static class VenueLeaseBatchFinalPath {
     [VenueLeaseBatchFinalPath]::Resolve([IO.Path]::GetFullPath($Path))
 }
 
+function Get-FileIdentity([string]$Path) {
+    # r10 (adversary r10 A1): a hard link has its own final path but is the SAME file, so a path comparison cannot see it; the volume + file index can. links > 1 = the file has another name.
+    [uint32]$links = 0
+    $key = [VenueLeaseBatchFinalPath]::Identity([IO.Path]::GetFullPath($Path), [ref]$links)
+    [pscustomobject]@{ key = $key; links = [int]$links }
+}
+
 function Get-RunDirOutputRefusal([string]$Path) {
     # '' when $Path is not a file this run writes; else the sentence for the refusal. r10 (adversary r9 A1): PHYSICAL paths on both sides (Get-PhysicalPath), so neither a spelling of -RunDir
     # (\.\, ..\, a trailing \) nor a junction or symlink that reaches it (the input, an ancestor of it, or -RunDir itself) slips past. Every caller goes through here.
+    $hardLinkOf = ''
     try {
         $full = Get-PhysicalPath $Path
         $root = (Get-PhysicalPath $RunDir).TrimEnd('\')
@@ -299,8 +326,27 @@ function Get-RunDirOutputRefusal([string]$Path) {
             foreach ($p in $script:RunDirOutputLeafPatterns) { if ($c.Name -imatch $p) { $owned = $true } }
             if ($owned) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = (Get-PhysicalPath $c.FullName) } }
         }
+        # r10 (adversary r10 A1): and a HARD link is a second name for the same file, with its own final path, so the paths differ while the file is the one the runner writes. Compare file
+        # identity: only an input with more than one name can be one, and then only the outputs that already exist can be its other name.
+        $id = Get-FileIdentity $full
+        if ($id.links -gt 1) {
+            $scan = [System.Collections.Generic.List[object]]::new()
+            foreach ($c in @(Get-ChildItem -LiteralPath $root -Force -File -ErrorAction Stop)) {
+                foreach ($p in $script:RunDirOutputLeafPatterns) { if ($c.Name -imatch $p) { $scan.Add($c); break } }
+            }
+            foreach ($d in $script:RunDirOutputDirs) {
+                $dp = Join-Path $root $d
+                $lk = @($linked | Where-Object { $_.isDir -and $_.name -ieq $d })
+                if ($lk.Count -gt 0) { $dp = $lk[0].physical }
+                if (Test-Path -LiteralPath $dp -PathType Container) { foreach ($c in @(Get-ChildItem -LiteralPath $dp -Force -File -Recurse -ErrorAction Stop)) { $scan.Add($c) } }
+            }
+            foreach ($c in $scan) {
+                if (((Get-FileIdentity $c.FullName).key -ceq $id.key) -and ((Get-PhysicalPath $c.FullName) -ine $full)) { $hardLinkOf = $c.FullName; break }
+            }
+        }
     } catch { return "'$Path' cannot be resolved to a physical path ($($_.Exception.Message -replace '\s+', ' ')); an input whose location is unknown is refused" }
     $shown = $(if ($full -ieq [IO.Path]::GetFullPath($Path)) { "'$full'" } else { "'$Path' (physical path '$full')" })
+    if ($hardLinkOf) { return "$shown is a hard link to $hardLinkOf, a file this run writes under -RunDir" }
     foreach ($l in $linked) {
         if (-not $l.isDir -and $full -ieq $l.physical) { return "$shown is a file this run writes into -RunDir ($($l.name), a link to it)" }
         if ($l.isDir -and ($full + '\').StartsWith($l.physical.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $($l.name)\, a link to a directory this run writes into under -RunDir" }

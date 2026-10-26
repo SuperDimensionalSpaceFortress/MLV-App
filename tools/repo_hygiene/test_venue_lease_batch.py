@@ -2448,6 +2448,55 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
         self._assert_alias_refused(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
 
+    # r10 second pass (adversary A1): a HARD link to a runner output has its own final path and is not a reparse point, so a path comparison, however physical, accepts it
+    # while the runner overwrites the same file through the output's name. The guard also compares file identity (volume + file index).
+    def _hard_linked(self, output: Path, name: Path) -> str:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        name.parent.mkdir(parents=True, exist_ok=True)
+        os.link(output, name)
+        return output.read_text(encoding="utf-8")
+
+    def test_r10_a_plan_item_spec_hard_linked_to_a_runner_output_is_refused_before_the_claim(self) -> None:
+        for leaf in ("leg-plan.json", "gate.log", "batch-jobs/x.json", "quiet/x.json"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                safe = self.case / "safe" / "fx-a.json"
+                safe.unlink(missing_ok=True)
+                before = self._hard_linked(self.run_dir / leaf, safe)
+                r = self.run_plan(self.write_plan([self.item(safe, "A", self.commit_a)]))
+                self._assert_alias_refused(r, safe, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                self.assertIn("is a hard link to", r.stderr)
+
+    def test_r10_a_plan_file_hard_linked_to_a_runner_output_is_refused_before_the_claim(self) -> None:
+        self._fresh_run_dir()
+        plan = self.case / "safe-plan.json"
+        plan.unlink(missing_ok=True)
+        output = self.run_dir / "leg-plan.json"
+        output.write_text(json.dumps({"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": [self.item(self.specs[0], "A", self.commit_a)]}), encoding="utf-8")
+        os.link(output, plan)
+        before = plan.read_text(encoding="utf-8")
+        r = self.run_plan(plan)
+        self._assert_alias_refused(r, plan, before, "LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT")
+
+    def test_r10_a_scalar_spec_hard_linked_to_a_runner_output_is_refused_before_the_claim(self) -> None:
+        self._fresh_run_dir()
+        safe = self.case / "safe" / "fx-a.json"
+        safe.unlink(missing_ok=True)
+        before = self._hard_linked(self.run_dir / "gate.log", safe)
+        r = self.run_batch([safe])
+        self._assert_alias_refused(r, safe, before, "BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT")
+
+    def test_r10_a_hard_linked_spec_whose_other_name_is_not_a_runner_output_is_not_refused(self) -> None:
+        # more than one name is not the test: the other name must be a file this run writes
+        self._fresh_run_dir()
+        safe = self.case / "safe" / "fx-a.json"
+        safe.unlink(missing_ok=True)
+        self._hard_linked(self.run_dir / "gate.log.spec.json", safe)
+        r = self.run_plan(self.write_plan([self.item(safe, "A", self.commit_a)]))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_r10_an_input_whose_physical_path_cannot_be_resolved_is_refused_before_the_claim(self) -> None:
         # fail closed: the resolver is made to fail (as it does for a path the file system will not open); the plan file, a plan item's spec and a scalar spec each refuse
         anchor = "[VenueLeaseBatchFinalPath]::Resolve([IO.Path]::GetFullPath($Path))"
