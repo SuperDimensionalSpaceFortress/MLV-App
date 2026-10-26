@@ -2363,6 +2363,30 @@ def test_save_dirty_worktree_evidence_resolves_a_relative_destination_against_th
 
 
 @dirty_save_only
+def test_save_dirty_worktree_evidence_keeps_the_real_diff_staged_work_untracked_names_and_one_line(tmp_path):
+    wt, dest = _dirty_save_repo(tmp_path)
+    (wt / ".gitattributes").write_text("src/a.txt diff=hide\n")
+    git(wt, "add", ".gitattributes")
+    git(wt, "commit", "-qm", "attrs")
+    git(wt, "config", "diff.hide.textconv", "git --version")  # a textconv driver that maps every version to the same text would make the patch empty
+    git(wt, "config", "status.showUntrackedFiles", "no")
+    (wt / "untracked.txt").write_text("u\n")
+    (wt / "src" / "a.txt").write_text("staged\n")
+    git(wt, "add", "src/a.txt")
+    (wt / "src" / "a.txt").write_text("one\n")  # staged, then edited back to HEAD: diff HEAD is empty, the index still holds the work
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName ('C1' + [char]10 + 'C2') -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVED card=C1 C2 ") and len(out.stdout.strip().splitlines()) == 1, out.stdout + out.stderr
+    status = next(dest.glob("dirty-worktree-*.status.txt")).read_text(encoding="utf-8")
+    assert "untracked.txt" in status, status
+    staged = list(dest.glob("dirty-worktree-staged-*.diff"))
+    assert len(staged) == 1 and "+staged" in staged[0].read_text(encoding="utf-8"), staged
+    (wt / "src" / "a.txt").write_text("edited\n")
+    again = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert "verified=reverse-apply-ok" in again.stdout, again.stdout + again.stderr
+    assert "+edited" in next(p for p in dest.glob("dirty-worktree-*.patch")).read_text(encoding="utf-8")
+
+
+@dirty_save_only
 def test_save_dirty_worktree_evidence_fails_soft_and_refuses_a_non_root_directory(tmp_path):
     wt = tmp_path / "wt"
     wt.mkdir()
