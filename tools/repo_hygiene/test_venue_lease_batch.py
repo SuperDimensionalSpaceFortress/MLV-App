@@ -21,6 +21,7 @@ claim lives in a temp -ClaimDir. Nothing here reaches a venue. Windows-only (Pow
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -34,6 +35,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -1029,8 +1031,11 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             p.stderr.close()
 
     # ---------------------------------------------------------------- CI-FLAKE-LEASE-BATCH-CLAIM-READ-RACE-1 (merge_group 40211588250)
-    def _hold_exclusive(self, path: Path, hold_s: float) -> threading.Thread:
-        """Hold `path` open with share mode 0 (what Request-/Update-VenueClaim's FileShare.None does) for hold_s seconds on a background thread."""
+    def _hold_exclusive(self, path: Path) -> tuple[threading.Event, threading.Thread]:
+        """Hold `path` open with share mode 0 (what Request-/Update-VenueClaim's FileShare.None does) on a background thread until the returned event is set.
+
+        No timed hold: a hold that expires on its own can lapse before the assertion that needs it (a slow runner), so the test releases it. The 60 s wait is only
+        a leak bound for a test that dies before releasing; nothing synchronizes on it."""
         import ctypes
         from ctypes import wintypes
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1040,13 +1045,15 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         handle = k32.CreateFileW(str(path), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
         self.assertNotEqual(handle, wintypes.HANDLE(-1).value, "could not take the exclusive handle")
 
+        release = threading.Event()
+
         def hold() -> None:
-            time.sleep(hold_s)
+            release.wait(60)
             k32.CloseHandle(handle)
 
         t = threading.Thread(target=hold, daemon=True)
         t.start()
-        return t
+        return release, t
 
     def test_the_claim_reader_waits_out_a_writer_that_holds_the_file(self) -> None:
         # The race the merge_group flake hit: a reader that lands while the runner holds the claim (FileShare.None on the take or a renewal) got PermissionError;
@@ -1056,11 +1063,34 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         full = json.dumps(body)
         self.claim_path.write_text(full, encoding="utf-8")
 
-        t = self._hold_exclusive(self.claim_path, 1.0)
+        release, t = self._hold_exclusive(self.claim_path)
         with self.assertRaises(PermissionError):
             self.claim_path.read_text(encoding="utf-8")
-        self.assertEqual(read_claim_json(self.claim_path), body, "returns the full JSON once the writer releases")
+        # The reader runs while the hold is still taken: it must have retried (hit the first sleep) before the test releases the writer.
+        retried, got = threading.Event(), {}
+        real_sleep = time.sleep
+
+        def spy_sleep(s: float) -> None:
+            retried.set()
+            real_sleep(s)
+
+        def read() -> None:
+            try:
+                got["body"] = read_claim_json(self.claim_path)
+            except BaseException as e:   # surfaced on the test thread below
+                got["error"] = e
+
+        reader = threading.Thread(target=read, daemon=True)
+        with mock.patch.object(time, "sleep", spy_sleep):
+            reader.start()
+            try:
+                self.assertTrue(retried.wait(30), "the reader hit PermissionError and went to sleep while the writer still held the file")
+            finally:
+                release.set()
+            reader.join(30)
         t.join(5)
+        self.assertFalse(reader.is_alive(), "the reader returned after the writer released")
+        self.assertEqual(got, {"body": body}, "returns the full JSON once the writer releases")
 
         self.claim_path.write_text('{"schema": "mlv-app/ven', encoding="utf-8")   # a half-written claim
         with self.assertRaises(json.JSONDecodeError):
@@ -1078,6 +1108,20 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         with self.assertRaises(json.JSONDecodeError) as cm:
             read_claim_json(self.claim_path, timeout_s=0.5, sleep_s=0.1)
         self.assertIn(str(self.claim_path), str(cm.exception))
+
+    def test_the_flaky_test_reads_its_claims_through_read_claim_json(self) -> None:
+        # CI-FLAKE-LEASE-BATCH-CLAIM-READ-RACE-HARDEN-1 (b): read_claim_json is only a fix while the flaky test calls it. Reverting its c0/c1 reads to
+        # json.loads(path.read_text()) stayed green, so pin the call site by source: c0 and c1 are assigned from read_claim_json and the method has no raw read_text.
+        name = "test_a_long_foreign_refusal_wait_does_not_let_the_live_claim_expire"
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        fns = [n for c in tree.body if isinstance(c, ast.ClassDef) and c.name == type(self).__name__ for n in c.body if isinstance(n, ast.FunctionDef) and n.name == name]
+        self.assertEqual(len(fns), 1, f"{name} was renamed or removed: re-point this pin at the test that reads the live claim")
+        fn = fns[0]
+        via_helper = {t.id for a in ast.walk(fn) if isinstance(a, ast.Assign) and isinstance(a.value, ast.Call) and isinstance(a.value.func, ast.Name) and a.value.func.id == "read_claim_json"
+                      for t in a.targets if isinstance(t, ast.Name)}
+        self.assertEqual(via_helper, {"c0", "c1"}, "c0 and c1 are read with read_claim_json")
+        raw = [ast.unparse(n) for n in ast.walk(fn) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "read_text"]
+        self.assertEqual(raw, [], "no raw read_text in the flaky test: a claim read there races the runner's FileShare.None write")
 
     # ---------------------------------------------------------------- r5: the claim is renewed for as long as it is held (dot 242171b3 B1)
     def test_a_long_foreign_refusal_wait_does_not_let_the_live_claim_expire(self) -> None:
