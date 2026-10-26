@@ -22,6 +22,7 @@ QL = ROOT / "tools" / "coordination" / "quality_lift"
 TEMPLATE = QL / "adversary-pass-prompt.md"
 RENDERER = QL / "Render-AdversaryPrompt.ps1"
 HARNESS = Path(__file__).resolve().parent / "quality_lift_run_prescribed_git.ps1"
+ECHO = HARNESS.with_name("quality_lift_echo_args.ps1")
 SHELLS = [exe for exe in (shutil.which("pwsh"), shutil.which("powershell")) if exe]
 
 HEAD = "0123456789abcdef0123456789abcdef01234567"
@@ -38,6 +39,7 @@ WORKDIRS = {
     "bang_and_space": "C:\\!Layi Wkspc\\lane x",
     "token_shaped": "C:\\repo\\@@BASE@@",
     "semicolon": "C:\\repo\\a;b",
+    "backslash_and_space_inside": "C:\\my repo\\x y",
 }
 
 
@@ -85,6 +87,12 @@ class AdversaryTemplateLiteralPathTests(unittest.TestCase):
             "head_with_trailing_newline": {"head": HEAD + "\n"},
             "option_shaped_base": {"base": "--output=x"},
             "blank_base": {"base": " "},
+            "trailing_backslash_with_space_workdir": {"workdir": "C:\\my repo\\"},
+            "double_quote_workdir": {"workdir": 'C:\\a"b'},
+            "double_quote_base": {"base": 'feature/a"b'},
+            "c1_control_workdir": {"workdir": "C:\\repo\\a" + chr(0x85) + "b"},
+            "c1_control_base": {"base": "feature/a" + chr(0x9F) + "b"},
+            "line_separator_workdir": {"workdir": "C:\\repo\\a" + chr(0x2028) + "b"},
         }
         with tempfile.TemporaryDirectory() as tmp:
             for exe in SHELLS:
@@ -110,7 +118,7 @@ class AdversaryTemplateLiteralPathTests(unittest.TestCase):
                     self.assertTrue(text.startswith(f"subject {HEAD} ADVERSARY PASS"))
 
     def test_base_lands_in_the_json_example_as_a_valid_json_string(self):
-        base = 'feature/a"b\\c'
+        base = "feature/a\\b c"
         with tempfile.TemporaryDirectory() as tmp:
             for exe in SHELLS:
                 with self.subTest(shell=Path(exe).stem):
@@ -127,7 +135,7 @@ class TemplateShapeTests(unittest.TestCase):
 
     def test_powershell_files_of_this_change_are_ascii_only(self):
         # Windows PowerShell 5.1 reads a BOM-less script as ANSI, so a non-ASCII byte is misdecoded there.
-        for path in (RENDERER, HARNESS):
+        for path in (RENDERER, HARNESS, ECHO):
             with self.subTest(path=path.name):
                 path.read_bytes().decode("ascii")
 
