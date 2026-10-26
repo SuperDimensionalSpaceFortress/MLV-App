@@ -5991,10 +5991,17 @@ $obj = $arr[[Math]::Min($n, $arr.Count - 1)]
             "negative counts": ([dict(hot, validSamples=-1, totalSamples=-1)], "incomplete-samples"),
             "fractional counts": ([dict(hot, validSamples=3.5, totalSamples=3)], "incomplete-samples"),
             "more valid than total": ([dict(hot, validSamples=4, totalSamples=3)], "incomplete-samples"),
+            # adversary pass r4 round 2 (A1 A2): the incomplete flag is a boolean or it is not evidence; notes is an object or it cannot say nothing was omitted
+            "an object incomplete flag": ([dict(hot, incomplete={})], "incomplete-samples"),
+            "a string incomplete flag": ([dict(hot, incomplete="false")], "incomplete-samples"),
+            "a numeric incomplete flag": ([dict(hot, incomplete=0)], "incomplete-samples"),
+            "a null incomplete flag": ([dict(hot, incomplete=None)], "incomplete-samples"),
+            "notes as an array": ([dict(hot)], "invalid-notes", {"notes": [{"cores_omitted": "1 core had no valid sample and was omitted"}]}),
+            "notes as a string": ([dict(hot)], "invalid-notes", {"notes": "cores_omitted"}),
         }
-        for name, (cores, reason) in cases.items():
+        for name, (cores, reason, *extra) in cases.items():
             with self.subTest(name):
-                probe = self.probe(cores)
+                probe = dict(self.probe(cores), **(extra[0] if extra else {}))
                 proc = self.gate(probe, "-PerCoreEnforce")
                 self.assertRegex(proc.stdout, r"(?m)^QUIET ", proc.stdout + proc.stderr)
                 self.assertIn(f"would_block=null reason={reason}", proc.stdout)
