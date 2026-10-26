@@ -22,7 +22,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $bytes = (Get-Item -LiteralPath $tmp).Length
         if (Test-Path -LiteralPath $patch) { Remove-Item -LiteralPath $tmp -Force } else { Move-Item -LiteralPath $tmp -Destination $patch }
         $tmp = $null
-        $status = @(& git -C $Wt status --porcelain 2>$null)
+        $status = @(& git -C $Wt -c core.quotepath=false status --porcelain 2>$null)
         Set-Content -LiteralPath $stat -Value $status -Encoding ascii
         & git -C $Wt apply --check -R $patch 2>$null
         $verified = if ($bytes -eq 0) { 'empty-diff' } elseif ($LASTEXITCODE -eq 0) { 'reverse-apply-ok' } else { 'reverse-apply-FAILED' }
