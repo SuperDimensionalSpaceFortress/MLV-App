@@ -776,7 +776,9 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         ("L1TypedGlobal", "    param([System.Diagnostics.EventLog]$global:r)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
         # Control: a scoped parameter with ANOTHER name does not touch $r, which stays a fresh literal.
         ("L1TypedOther", "    param([System.Diagnostics.EventLog]$local:other)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
-    ]
+        # r5 (Dot B8 = r4 adversary A3): a data section binds its variable to a command result, so the setter below it reaches a
+        # FileInfo, not the hashtable assigned first.
+        ("L1DataStatement", "    $r = @{}\n    data r -SupportedCommand Get-Item { Get-Item -LiteralPath 'C:\\fixture\\target' }\n    $r.Attributes = 'Hidden'"),    ]
 
     # Adversary A8 (same class as A3): template shapes that name a parameter by alias or abbreviation.
     TEMPLATE_ALIASES = (
@@ -918,6 +920,20 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Copy-Item -LiteralPath function:Redirect -Destination ('function:Join-Path')",
         # r4 adversary pass 1 (A2): a single-element array expression is the constant it holds.
         "Rename-Item -LiteralPath ([string]@('function:Redirect')) -NewName ([string]@('Join-Path'))",
+        # r5 (Dot B5): a route built from constants ends in a protected name the plain-string check never sees; the tail is read
+        # after the route is stripped, and an empty or wildcard tail fails closed.
+        "Copy-Item function:Redirect ('fun'+'ction:Join-Path')",
+        "Copy-Item function:Redirect ('function:' + 'Split-Path')",
+        "Copy-Item -LiteralPath function:Redirect -Destination ('function:' + '*')",
+        "Copy-Item function:Redirect ('function:' + '')",
+        # r5 (Dot B6 = r4 adversary A1): './', '.\' and doubled separators after the drive name the same command, as does a scope
+        # qualifier among them.
+        "Set-Item -LiteralPath function:./Join-Path -Value { param($p, $c) 'C:\\fixture\\Dirty.psm1' }",
+        "Set-Item -LiteralPath function:.\\Join-Path -Value { param($p, $c) 'C:\\fixture\\Dirty.psm1' }",
+        "Set-Item -LiteralPath function:\\\\Join-Path -Value { param($p, $c) 'C:\\fixture\\Dirty.psm1' }",
+        "Set-Item -LiteralPath function:.\\local:Split-Path -Value { 'C:\\fixture' }",
+        "Set-Item -Path alias:./New-Object -Value Redirect",
+        "${function:./Join-Path} = { 'C:\\fixture\\Dirty.psm1' }",
     )
     # r4: a rename or move that touches the function: / alias: drive, or names an evaluated command, with an operand the scan cannot
     # reduce to a constant, could be installing a shadow: it fails closed, in a kind of its own.
@@ -1021,7 +1037,7 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         self.assertEqual([f for f in self.of(self.l1, "L1IndexLocal") if f["rule"] == "R5"], [])
 
     def test_l1_a_variable_bound_by_foreach_out_variable_a_multi_target_assignment_ref_or_a_parameter_is_not_fresh(self) -> None:
-        for name in ("L1Foreach", "L1OutVariable", "L1MultiTarget", "L1Ref", "L1ParamAlso"):
+        for name in ("L1Foreach", "L1OutVariable", "L1MultiTarget", "L1Ref", "L1ParamAlso", "L1DataStatement"):
             found = self.of(self.l1, name)
             self.assertIn(("R5", "$r.Attributes"), self.unlisted(found), f"{name}\n" + describe(found))
 
@@ -1235,6 +1251,7 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         self.assertEqual(self.modules_of(self.l2_default, "DirtyOnly"), [])
 
 
+@requires_pwsh
 class SplicedBodyScanPsScriptRootTests(unittest.TestCase):
     """r4 (adversary r3 A2 = Dot B3): `Join-Path $PSScriptRoot '<child>'` is read as the generator's own directory, which holds only
     while `$PSScriptRoot` is the automatic value. A generator that rebinds it (any assignment, scope qualifier, parameter, loop
@@ -1267,6 +1284,17 @@ class SplicedBodyScanPsScriptRootTests(unittest.TestCase):
         "PsrProviderQualified": "Set-Item -LiteralPath Microsoft.PowerShell.Core\\Variable::PSScriptRoot 'C:\\dirty'\n",
         "PsrParam": "function Rebind { param($PSScriptRoot) }\n",
         "PsrComputed": "Set-Variable -Name $someName -Value 'C:\\dirty'\n",
+        # r5 (Dot B7 = r4 adversary A2): './', '.\' and doubled separators, with or without a scope qualifier, name the same variable.
+        "PsrDriveDotSlash": "Set-Item -LiteralPath variable:./PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrDriveDotBack": "Set-Item -LiteralPath variable:.\\PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrDriveDoubledLocal": "Set-Item -LiteralPath variable:\\\\local:PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrDriveDotLocal": "Set-Item -LiteralPath variable:local:./PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrBracedDot": "${variable:./PSScriptRoot} = 'C:\\dirty'\n",
+        # A route built from constants has no string node of its own.
+        "PsrDriveReduced": "Set-Item -LiteralPath ('vari'+'able:PSScriptRoot') -Value 'C:\\dirty'\n",
+        # r5 (Dot B8 = r4 adversary A3): a data section assigns its result to the named variable.
+        "PsrDataStatement": "data PSScriptRoot { 'C:\\dirty' }\n",
+        "PsrDataStatementCommand": "data PSScriptRoot -SupportedCommand Get-Item { Get-Item -LiteralPath 'C:\\dirty' }\n",
     }
     CONTROLS = {
         # No rebinding: the call still binds to Clean.psm1 by full path.
@@ -1285,7 +1313,17 @@ class SplicedBodyScanPsScriptRootTests(unittest.TestCase):
             generator = cls.dir / f"gen-{name}.ps1"
             generator.write_text(line + "$e = " + cls.CALL.format(name=name), encoding="utf-8")
             sources.append(generator)
-        cls.result = run_scan(modules=[cls.dir / "Clean.psm1"], splice_sources=sources)
+        # r5 (Dot B8): a data section also binds a destination variable and $Work, which the template proofs read as assignments.
+        cls.template = cls.dir / "template-data.ps1"
+        cls.template.write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$d = Join-Path $Work 'ok'\ndata d { 'C:\\outside' }\n"
+                                "New-Item -ItemType Directory -Path $d -Force | Out-Null\n"
+                                "data Work { 'C:\\outside' }\n", encoding="utf-8")
+        cls.result = run_scan(templates=[cls.template], modules=[cls.dir / "Clean.psm1"], splice_sources=sources)
+
+    def test_r5_b8_a_data_section_binding_a_destination_variable_or_work_is_a_finding(self) -> None:
+        found = [(v["rule"], v["reason"]) for v in self.result["violations"] if v["source"] == str(self.template)]
+        self.assertTrue([r for rule, r in found if rule == "R2" and "destination is not provably under" in r], f"{found}")
+        self.assertTrue([r for rule, r in found if rule == "R5" and "data statement" in r], f"{found}")
 
     def findings_for(self, name: str) -> list[dict]:
         return [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and f"'{name}'" in f["text"]]

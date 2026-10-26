@@ -315,6 +315,31 @@ function Get-AliasNameArguments($Command, [string]$Cmdlet = 'Set-Alias') {
 
 $script:providerRoutePattern = '^\s*(?:[A-Za-z0-9_.]+\\)?(?:alias|function)::?'
 
+function Get-ProviderLeaf([string]$Path) {
+    # What a provider path names once its drive or provider prefix is gone. PowerShell's globber drops leading whitespace, '.\' and
+    # './' segments and doubled separators, and a scope qualifier (local: script: private: global:) may sit before or between
+    # them ('./Join-Path', '\\Join-Path', '\\local:Join-Path', 'local:./Join-Path'). Every comparison of an alias: / function: /
+    # variable: tail goes through here, so none of them reads './Join-Path' as a different name from 'Join-Path'.
+    $text = $Path
+    do {
+        $previous = $text
+        $text = $text -replace '^(?:\s|\.?[\\/])+', ''
+        $text = $text -replace '^[A-Za-z]+:', ''
+    } while ($text -cne $previous)
+    return $text.Trim()
+}
+
+function Get-RoutedLeaf([string]$Value) {
+    # $null when $Value is not an alias: / function: route, otherwise the normalized name the route ends in.
+    if ($Value -notmatch $script:providerRoutePattern) { return $null }
+    return (Get-ProviderLeaf ($Value -replace $script:providerRoutePattern, ''))
+}
+
+function Test-RouteTailUnproven([string]$Leaf, [string[]]$Names) {
+    # Nothing after the drive, a wildcard or a computed part: the name comes from somewhere else, so it is unproven (fails closed).
+    return ($Leaf -eq '' -or $Leaf -match '[*?\[\]$(]' -or (Test-ShadowedName $Leaf $Names))
+}
+
 function Get-UnwrappedOperand($Ast) {
     # The expression inside any parentheses, one-expression sub-expression or @( ), single-statement pipeline and [string] cast
     # around it; the node itself when it is none of those (or holds more than one statement). @('x') binds a string parameter as
@@ -408,7 +433,15 @@ function Get-ShadowKind($Node, [string[]]$Names) {
                         if (Test-BuiltFromLiteralsOnly $operand) { $fixedButUnread = $true }
                         continue
                     }
-                    if ($constant -match $script:providerRoutePattern) { $routed = $true }
+                    if ($constant -match $script:providerRoutePattern) {
+                        $routed = $true
+                        # A plain string is its own node's finding; a reduced one ('fun'+'ction:Join-Path') has no node of its
+                        # own, so its tail is read here (empty, wildcard or computed fails closed).
+                        $plain = Get-UnwrappedOperand $operand
+                        if ($plain -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                            $plain -isnot [System.Management.Automation.Language.ExpandableStringExpressionAst] -and
+                            (Test-RouteTailUnproven (Get-RoutedLeaf $constant) $Names)) { $named = $true }
+                    }
                     elseif (Test-ShadowedName $constant $Names) { $named = $true }
                 }
             }
@@ -435,16 +468,15 @@ function Get-ShadowKind($Node, [string[]]$Names) {
     $routePattern = $script:providerRoutePattern
     if ($Node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $Node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
         $value = [string]$Node.Value
-        if ($value -notmatch $routePattern) { return '' }
-        $rest = ($value -replace $routePattern, '').Trim().TrimStart('\', '/')
-        # Nothing after the drive, a wildcard or a computed part: the name comes from somewhere else, so it is unproven.
-        if ($rest -eq '' -or $rest -match '[*?\[\]$(]' -or (Test-ShadowedName $rest $Names)) { return 'provider-path' }
+        $rest = Get-RoutedLeaf $value
+        if ($null -eq $rest) { return '' }
+        if (Test-RouteTailUnproven $rest $Names) { return 'provider-path' }
         return ''
     }
     if ($Node -is [System.Management.Automation.Language.VariableExpressionAst]) {
         $user = $Node.VariablePath.UserPath
         # ${function:\Join-Path} and ${function:/Join-Path} name the same command as ${function:Join-Path}.
-        if ($user -match '^(?i:alias|function):(.*)$' -and (Test-ShadowedName $Matches[1].TrimStart('\', '/') $Names)) { return 'provider-path' }
+        if ($user -match '^(?i:alias|function):(.*)$' -and (Test-ShadowedName (Get-ProviderLeaf $Matches[1]) $Names)) { return 'provider-path' }
     }
     return ''
 }
@@ -622,6 +654,16 @@ function Test-DominatesSetter($Assignment, $Setter) {
     return $false
 }
 
+function Test-DataStatementBinds($Node, [string]$Name) {
+    # `data r { ... }` and `data r -SupportedCommand Get-Item { ... }` bind $r to the section's result, like an assignment does.
+    if ($Node -isnot [System.Management.Automation.Language.DataStatementAst] -or [string]::IsNullOrEmpty($Node.Variable)) { return $false }
+    return ([string]$Node.Variable -ieq $Name)
+}
+
+function Get-DataStatementsBinding($Root, [string]$Name) {
+    @($Root.FindAll({ param($n) Test-DataStatementBinds $n $Name }, $true))
+}
+
 function Get-OtherBindings($Root, [string]$Name, [switch]$SkipVariableParameters) {
     # Every way a variable gets a value besides `$v = <expr>`: a parameter ('unbound'), and a foreach variable, a
     # multi-target assignment, [ref], and -OutVariable / -ErrorVariable / ... (including their aliases and
@@ -635,6 +677,9 @@ function Get-OtherBindings($Root, [string]$Name, [switch]$SkipVariableParameters
             if ((Get-VariableName $node.Name).name -ieq $Name) { $tags.Add('unbound') }
         } elseif ($node -is [System.Management.Automation.Language.ForEachStatementAst]) {
             if ((Get-VariableName $node.Variable).name -ieq $Name) { $tags.Add('other') }
+        } elseif ($node -is [System.Management.Automation.Language.DataStatementAst]) {
+            # `data r -SupportedCommand Get-Item { ... }` assigns the section's result to $r: a binding of unknown origin.
+            if (Test-DataStatementBinds $node $Name) { $tags.Add('other') }
         } elseif ($node -is [System.Management.Automation.Language.AssignmentStatementAst]) {
             $left = $node.Left
             if ($left -is [System.Management.Automation.Language.ArrayLiteralAst] -or $left -is [System.Management.Automation.Language.ParenExpressionAst]) {
@@ -691,6 +736,8 @@ function Test-Provable($Ast, $Root, $Visiting) {
         try {
             $assignments = @(Get-AssignmentsTo $Root $v.name)
             if ($assignments.Count -eq 0) { return $false }
+            # A data section binds the variable to a value this proof cannot read.
+            if (@(Get-DataStatementsBinding $Root $v.name).Count -gt 0) { return $false }
             foreach ($a in $assignments) {
                 if ($a.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) { return $false }
                 if ($a.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { return $false }
@@ -835,6 +882,9 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
 
     # R5 assignments
     $workAssignments = @(Get-AssignmentsTo $root 'Work')
+    foreach ($data in @(Get-DataStatementsBinding $root 'Work')) {
+        Add-Violation $Source $data 'R5' '$Work is bound by a data statement, not assigned once in a canonical shape'
+    }
     if ($FunctionBody) {
         # A function body is not a job: the "$Work assigned exactly once, at top level" proof belongs to the template.
     } elseif ($workAssignments.Count -ne 1) {
@@ -938,6 +988,7 @@ function Get-PsScriptRootRebinding($Root) {
     # relatives, a parameter, Set-Variable / New-Variable / Remove-Variable / Clear-Variable (a computed name could be it), and
     # the variable: drive. `Join-Path $PSScriptRoot '<child>'` is the generator's directory only while none of these appears.
     if (@(Get-AssignmentsTo $Root 'PSScriptRoot').Count -gt 0) { return 'an assignment' }
+    if (@(Get-DataStatementsBinding $Root 'PSScriptRoot').Count -gt 0) { return 'a data statement' }
     if (@(Get-OtherBindings $Root 'PSScriptRoot' -SkipVariableParameters).Count -gt 0) { return 'a parameter, loop variable, multi-target assignment or [ref]' }
     # -OutVariable / -ErrorVariable / -WarningVariable / -InformationVariable / -PipelineVariable by name, alias or unique prefix
     # (-OutV, -ErrorV, -ev). A one-letter prefix of a native tool's switch (`git cat-file -e`) is not one of them, so the
@@ -968,6 +1019,20 @@ function Get-PsScriptRootRebinding($Root) {
     $variableRoute = '^\s*(?:[A-Za-z0-9_.]+\\)?variable::?\s*[\\/]?(.*)$'
     foreach ($n in @($Root.FindAll({ param($x) $true }, $true))) {
         if ($n -is [System.Management.Automation.Language.CommandAst]) {
+            # A route built from constants ('vari' + 'able:PSScriptRoot') has no string node of its own; a plain string is read below.
+            foreach ($element in @($n.CommandElements | Select-Object -Skip 1)) {
+                $operandRoot = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
+                if ($null -eq $operandRoot) { continue }
+                foreach ($operand in @(Expand-Operands $operandRoot)) {
+                    $plain = Get-UnwrappedOperand $operand
+                    if ($plain -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $plain -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) { continue }
+                    $constant = Get-ConstantString $operand
+                    if ($null -ne $constant -and $constant -match $variableRoute) {
+                        $reducedRest = Get-ProviderLeaf $Matches[1]
+                        if ($reducedRest -eq '' -or $reducedRest -match '[$(]' -or 'PSScriptRoot' -like $reducedRest) { return 'the variable: drive' }
+                    }
+                }
+            }
             $commandName = $n.GetCommandName()
             if ($null -eq $commandName) { continue }
             $commandName = $commandName.Substring($commandName.LastIndexOf('\') + 1).ToLowerInvariant()
@@ -982,12 +1047,13 @@ function Get-PsScriptRootRebinding($Root) {
         elseif ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
             if (([string]$n.Value) -match $variableRoute) {
                 # variable:local:PSScriptRoot / variable:\script:PSScriptRoot: the drive takes its own scope qualifier.
-                $rest = ($Matches[1].Trim() -replace '^[A-Za-z]+:', '').TrimStart('\', '/')
+                # './PSScriptRoot', '.\PSScriptRoot' and '\\PSScriptRoot' name it too (Get-ProviderLeaf).
+                $rest = Get-ProviderLeaf $Matches[1]
                 if ($rest -eq '' -or $rest -match '[$(]' -or 'PSScriptRoot' -like $rest) { return 'the variable: drive' }
             }
         }
         elseif ($n -is [System.Management.Automation.Language.VariableExpressionAst]) {
-            if ($n.VariablePath.UserPath -match '^(?i:variable):(.*)$' -and ('PSScriptRoot' -like (($Matches[1] -replace '^[A-Za-z]+:', '').TrimStart('\', '/')))) { return 'the variable: drive' }
+            if ($n.VariablePath.UserPath -match '^(?i:variable):(.*)$' -and ('PSScriptRoot' -like (Get-ProviderLeaf $Matches[1]))) { return 'the variable: drive' }
         }
     }
     return ''
