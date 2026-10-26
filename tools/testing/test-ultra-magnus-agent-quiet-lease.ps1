@@ -2329,6 +2329,7 @@ function Exit-HeavySlot {
             Assert-True (@($r7.snaps | Where-Object { $_ -match ' phase=request ' }).Count -eq 1 -and @($r7.snaps | Where-Object { $_ -match ' phase=grant ' }).Count -eq 1 -and $script:StatusCalls -eq 2) "heat-trace: one request snapshot and one grant snapshot across a refuse-then-active job: $($r7.snaps -join ' || ') calls=$($script:StatusCalls)"
             Exit-HeavySlot
             # (e) adversary r1 A1: heavy-slot.py may add fields after the timestamp (", held 5 min"): the age is still read.
+            $since = (Get-Date).AddSeconds(-300).ToString('yyyy-MM-dd HH:mm:ss')   # r3: re-stamped, as the cases above now run real probes and take longer than the age window
             $script:StatusStub = @{ ok = $true; error = $null; lines = @("slot 1: suite X (pid 77, since $since, held 5 min) [exclusive]", 'slot 2: free') }
             $r8 = Invoke-HeatTraceCase 'jHt8' @{ request = 'active'; active_after = 1.5 }
             Assert-True (@($r8.snaps | Where-Object { $_ -notmatch 'slot 1: suite X pid=77 age=(29[5-9]|3[0-2]\d)s' }).Count -eq 0 -and $r8.snaps.Count -eq 2) "heat-trace A1: a status line with a field after 'since <ts>' still yields the age: $($r8.snaps -join ' || ')"
