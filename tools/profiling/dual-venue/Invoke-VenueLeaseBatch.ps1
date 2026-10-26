@@ -299,6 +299,8 @@ if ($legPlanMode) {
             if ($arm -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}\z') { Stop-PlanRefused 'BAD_ARM' $n "arm '$arm' is not a label of 1-32 of [A-Za-z0-9._-]" }
             $path = $(if ($ref) { Resolve-LegSpecPath $ref $planDir } else { $null })
             if (-not $path) { Stop-PlanRefused 'LEG_SPEC_MISSING' $n "no leg spec at '$ref'" }
+            # adversary r7 pass 2 A1: a spec that IS one of the files this run writes into -RunDir (leg-plan.json, batch.log, a batch receipt, a leg output) would be overwritten after the lease opened.
+            if ((([IO.Path]::GetFullPath((Split-Path -Parent $path))).TrimEnd('\') -ieq ([IO.Path]::GetFullPath($RunDir)).TrimEnd('\')) -and ((Split-Path -Leaf $path) -match '^(leg-plan\.json|batch\.log|batches\.jsonl|batch-\d+\.json|leg-.*\.out\.txt)\z')) { Stop-PlanRefused 'LEG_SPEC_IS_RUN_OUTPUT' $n "the leg spec '$path' is a file this run writes into -RunDir" }
             $specRefusal = Get-LegSpecRefusal $path $be
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
