@@ -108,7 +108,8 @@
 # 3 DEADLINE before every leg ran (a cooldown, budget or exit-75 wait that reached it included); 4 GATE_UNREADABLE and 5 HOST_MISMATCH from Wait-VenueQuiet; 6 a probe ended VENUE_QUIET_UNKNOWN; 7 a leg process exited
 # non-zero (LEG_FAILED) or was killed at the lease's end (LEASE_EXPIRED; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
 # UNRESOLVED or not admitted, or never submitted because its sidecar could not be written: LIVENESS_UNAVAILABLE); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
-# 7a). A stopping code (2-6, 9, 10) replaces 0 or 7; 11 replaces every other code.
+# 7a); 12 an unexpected throw inside a batch after its claim was taken (BATCH_ERROR: the claim keeper is stopped, the claim released and the batch receipt written
+# first; the legs not run are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
 [CmdletBinding(DefaultParameterSetName = 'Scalar')]
 param(
@@ -232,8 +233,10 @@ function Get-LegSpecId([string]$Path) {
 function Get-LegSpecRefusal([string]$Path, [string]$Backend) {
     # sol r3 A4: the refusal Invoke-VenueLeg would throw (DVE_LEG_SPEC_INVALID) AFTER the lease is open, found before it. '' when the leg can take this backend.
     # Same reads as Invoke-VenueLeg: the file's bytes as UTF-8, ConvertFrom-Json, the schema, then the backend against the spec's own list.
-    # sol r3 second pass A1: then every spec field the leg process casts or validates before it submits anything (playSeconds, visualCapture and its opt-out
-    # reason, scaleFactor and acceptedEffectiveScale, displayMode), by calling the very functions it calls, so the two cannot drift.
+    # sol r3 second pass A1: then the spec fields Invoke-VenueLeg casts or validates BEFORE its terminal try (playSeconds, visualCapture and its opt-out reason,
+    # scaleFactor and acceptedEffectiveScale, displayMode), by calling the functions it calls. r5 (key3 F2): and the card and legId it binds to New-DvReceipt's
+    # Mandatory [string] parameters. NOT mirrored: the leg's pre-submit REFUSALS (LEG_SPEC_NOT_COMMITTED, the playSeconds floor, clipId admission; OPEN
+    # LEASE-BATCH-PLAN-PREFLIGHT-ADMISSION-PARITY-1) and the generatorArgs casts, which sit inside the leg's try and end as a typed receipt.
     $spec = try { [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json } catch { $null }
     if ($null -eq $spec -or $spec -isnot [System.Management.Automation.PSCustomObject]) { return 'LEG_SPEC_INVALID', "'$Path' is not a JSON object" }
     if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { return 'LEG_SPEC_INVALID', "'$Path' schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
@@ -243,6 +246,8 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend) {
         $null = Get-DvVisualCaptureRequest -Spec $spec
         $null = Get-DvScaleEvidence -Spec $spec -Backend $Backend -LogText $null
         $null = Get-DvDisplayEvidence -Spec $spec -LogText $null
+        if ([string]::IsNullOrEmpty([string]$spec.card)) { throw 'the spec has no card (Invoke-VenueLeg binds it to New-DvReceipt, which refuses an empty one)' }
+        if ([string]::IsNullOrEmpty([string]$spec.legId)) { throw 'the spec has no legId (Invoke-VenueLeg binds it to New-DvReceipt, which refuses an empty one)' }
     } catch { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $($_.Exception.Message -replace '\s+', ' ')" }
     return '', ''
 }
@@ -494,14 +499,16 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     # r5 (dot 242171b3 B1): the claim's expiry is renewed for as long as the batch holds it (the open's wait for the lease, the by-name wait and the legs can all
     # outlast -ClaimTtlSec), so Get-VenueClaimStaleReason never finds a live owner's claim expired. The keeper dies with this process.
     $claimKeeper = Start-VenueClaimKeeper -Venue $Venue -Nonce $claim.nonce -TtlSec $ClaimTtlSec -RenewSec $ClaimRenewSec -ClaimDir $ClaimDir
-    L "CLAIM_TAKEN batch=$batchNo nonce=$($claim.nonce) expiresUtc=$($claim.expiresUtc) renewSec=$ClaimRenewSec ttlSec=$ClaimTtlSec"
-    # sol r3 second pass A3: the validated plan is kept only while this run holds the venue claim, so a second invocation on the same -RunDir that is still waiting
-    # for the claim cannot replace the plan a running one preserved. Rewritten after each claim taken: it is always the holder's own plan.
-    if ($legPlanMode) { [IO.File]::WriteAllText((Join-Path $RunDir 'leg-plan.json'), ($planRecord | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false)) }
     # r3 (Dot B1): $openSubmitted is true from the moment Submit-AgentJob is called for the open. The finally block's cancel, close and ledger charge follow
     # that flag, never "$op is null": a null $op before the call (a throw while the sidecar was checked) means nothing was sent.
     $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null; $openLive = $null; $cr = $null; $openSubmitted = $false
+    # r5 (key3 F1): the try opens IMMEDIATELY after the keeper starts, so every throw from here on ends with the keeper stopped, the claim released and the batch
+    # receipt written (the finally), and as a typed exit 12 (the catch). A throw outside it left the keeper runspace renewing the claim of a process that had died.
     try {
+        L "CLAIM_TAKEN batch=$batchNo nonce=$($claim.nonce) expiresUtc=$($claim.expiresUtc) renewSec=$ClaimRenewSec ttlSec=$ClaimTtlSec"
+        # sol r3 second pass A3: the validated plan is kept only while this run holds the venue claim, so a second invocation on the same -RunDir that is still waiting
+        # for the claim cannot replace the plan a running one preserved. Rewritten after each claim taken: it is always the holder's own plan.
+        if ($legPlanMode) { [IO.File]::WriteAllText((Join-Path $RunDir 'leg-plan.json'), ($planRecord | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false)) }
         # (2) OPEN: the lease first. Nothing is probed or run before the agent reports this batch's lease active.
         $b.openJobId = "lease-batch-open-$stamp-lb$token"
         $wait = [int][Math]::Max(60, [Math]::Min($OpenAdmissionWaitSec, ($deadline - [DateTime]::UtcNow).TotalSeconds))
@@ -729,6 +736,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $b.endReason = 'LEG_BUDGET_EXCEEDS_LEASE'; Set-Stop 'LEG_BUDGET_EXCEEDS_LEASE' 2
             }
         }
+    } catch {
+        # r5 (key3 F1): an unexpected throw anywhere in the batch is a typed stop, not an unhandled exit 1 that skips the summary. The finally below runs first; 12 replaces every code.
+        $b.endReason = 'BATCH_ERROR'; $b.endDetail = ($_.Exception.Message -replace '\s+', ' ')
+        $script:stopReason = 'BATCH_ERROR'; $script:exitCode = 12
+        try { L "BATCH_ERROR batch=$batchNo $($b.endDetail)" } catch { }   # a batch.log another process holds must not turn the typed stop back into an unhandled throw
     } finally {
         # (4) END: release the lease now (a light close job), read the agent's receipt for it, release the claim, write the batch receipt.
         # r3 (sol r2 B1): an open with no result in hand (um-run gave up on it, the deadline came while its result was awaited, or this batch threw) may still

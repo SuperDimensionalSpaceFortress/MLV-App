@@ -314,7 +314,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         for name in ("fx-a", "fx-b", "fx-c"):
             p = cls.tmp / f"{name}.json"
             # the shape Invoke-VenueLeg accepts (schema + the backends it may run + the scaleFactor every real leg spec carries and its receipt block reads), so a -LegPlan item can be checked against it before any lease
-            p.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": name, "backends": ["cpu", "cuda"], "scaleFactor": 1}), encoding="utf-8")
+            # (card + legId are what Invoke-VenueLeg hands New-DvReceipt's Mandatory parameters; every committed leg spec carries both)
+            p.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": name, "backends": ["cpu", "cuda"], "scaleFactor": 1}), encoding="utf-8")
             cls.specs.append(p)
 
     @classmethod
@@ -1752,7 +1753,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def test_r3_a3_a_spec_legid_with_a_trailing_line_feed_falls_back_to_the_file_name(self) -> None:
         spec = self.case / "fx-nl.json"
-        spec.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": "bad\n", "backends": ["cpu"], "scaleFactor": 1}), encoding="utf-8")
+        spec.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "bad\n", "backends": ["cpu"], "scaleFactor": 1}), encoding="utf-8")
         r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual([l["name"] for l in batch_result(r.stdout)["legs"]], ["01-fx-nl-cpu-A"])
@@ -1797,7 +1798,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # sol r3 second pass A1: Invoke-VenueLeg also throws on a malformed visualCapture / opt-out pair, a playSeconds outside [int], a scaleFactor that is not a
         # number and a bad acceptedEffectiveScale. Preflight checked only the schema and the backend, so each of these opened a lease and ended LEG_FAILED / exit 7.
         a = self.commit_a
-        base = {"schema": "mlv-app/dual-venue-leg/v1", "legId": "fx-bad", "backends": ["cpu"], "scaleFactor": 1}
+        base = {"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-bad", "backends": ["cpu"], "scaleFactor": 1}
         cases = {
             "visualCapture is a string": {"visualCapture": "true"},
             "visualCapture false without a reason": {"visualCapture": False},
@@ -1816,7 +1817,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_r4_a1_a_valid_opt_out_and_scale_still_run(self) -> None:
         # the added preflight is the leg process's own predicates, no stricter: a well-formed opt-out, scale and playSeconds are accepted
         p = self.case / "fx-ok.json"
-        p.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": "fx-ok", "backends": ["cpu"], "visualCapture": False, "visualCaptureOptOutReason": "no window",
+        p.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-ok", "backends": ["cpu"], "visualCapture": False, "visualCaptureOptOutReason": "no window",
                                  "playSeconds": 30, "scaleFactor": 2, "acceptedEffectiveScale": {"cpu": 1}}), encoding="utf-8")
         r = self.run_plan(self.write_plan([self.item(p, "A", self.commit_a)]))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -1850,6 +1851,64 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         kept = json.loads((self.run_dir / "leg-plan.json").read_text(encoding="utf-8"))
         self.assertEqual([x["arm"] for x in kept["legs"]], ["A", "B", "A", "B"])
+
+    def test_r5_f2_a_spec_without_a_card_or_a_legid_is_refused_before_the_claim_and_the_lease(self) -> None:
+        # key3 F2 (fable, opus, sol, Dot B3): Invoke-VenueLeg binds [string]$spec.card and [string]$spec.legId to New-DvReceipt's Mandatory [string] parameters before it
+        # submits anything; an empty one is a binding error. Preflight never read either, so such a spec opened a lease and ended LEG_FAILED / exit 7.
+        a = self.commit_a
+        base = {"schema": "mlv-app/dual-venue-leg/v1", "backends": ["cpu"], "scaleFactor": 1}
+        cases = {
+            "no card (the key3 repro)": {"legId": "fx-a"},
+            "card is empty": {"card": "", "legId": "fx-a"},
+            "card is null": {"card": None, "legId": "fx-a"},
+            "card present, no legId": {"card": "TEST-CARD"},
+            "card present, legId is empty": {"card": "TEST-CARD", "legId": ""},
+            "card present, legId is null": {"card": "TEST-CARD", "legId": None},
+            "neither": {},
+        }
+        for label, extra in cases.items():
+            with self.subTest(case=label):
+                p = self.case / "fx-noid.json"
+                p.write_text(json.dumps({**base, **extra}), encoding="utf-8")
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(p, "B", a)]), "LEG_SPEC_INVALID item=2 ")
+
+    def test_r5_f2_a_spec_with_a_card_and_a_legid_still_runs(self) -> None:
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_r5_f1_a_throw_after_the_claim_keeper_starts_stops_the_keeper_releases_the_claim_and_ends_the_process(self) -> None:
+        # key3 F1 (fable, opus, sol, Dot B2): leg-plan.json was written after Start-VenueClaimKeeper and before the batch try, so a throw there skipped Stop-VenueKeeper and
+        # Release-VenueClaim: the keeper runspace kept renewing the claim and the process never exited. A directory of that name makes the write throw.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "leg-plan.json").mkdir()
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+        except subprocess.TimeoutExpired as ex:
+            self.fail(f"the process did not end within 90 s (the claim keeper outlived the throw): {ex.stdout!r}")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        self.assertEqual(self.kinds(), [], "no open was submitted: the throw came before the lease")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
+        self.assertEqual((res["ran"], res["notRun"]), (0, 4))
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn(" CLAIM_RELEASED batch=1 result=", log)
+        self.assertIn(" BATCH_ERROR batch=1 ", log)
+        [b] = self.batches()
+        self.assertEqual(b["endReason"], "BATCH_ERROR")
+
+    def test_r5_h2_the_interleave_helper_keeps_an_array_valued_item_whole(self) -> None:
+        # key3 H2 (sol): the bare Dequeue() output was enumerated, so one array-valued item came back as its elements.
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            "$items = [object[]]::new(2); $items[0] = @([pscustomobject]@{ arm = 'A' }, [pscustomobject]@{ arm = 'B' }); $items[1] = [pscustomobject]@{ arm = 'A' }\n"
+            "$one = [object[]]::new(1); $one[0] = $items[0]\n"
+            "[ordered]@{ one = @(Get-VenueInterleavedLegPlan -Items $one).Count; two = @(Get-VenueInterleavedLegPlan -Items $items).Count } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"one": 1, "two": 2})
 
     def test_the_plan_and_the_scalar_form_are_mutually_exclusive(self) -> None:
         args, e = self.plan_cmd(self.ab_block_plan(), "-SourceCommit", SHA)

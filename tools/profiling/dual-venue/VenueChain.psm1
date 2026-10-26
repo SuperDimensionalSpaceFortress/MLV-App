@@ -990,7 +990,8 @@ function Get-VenueInterleavedLegPlan {
     }
     $left = $Items.Count
     while ($left -gt 0) {
-        foreach ($arm in $armOrder) { $q = $queues[$arm]; if ($q.Count -gt 0) { $q.Dequeue(); $left-- } }
+        # the comma keeps an array-valued item ONE output object (a bare Dequeue() result would be enumerated into its elements)
+        foreach ($arm in $armOrder) { $q = $queues[$arm]; if ($q.Count -gt 0) { , $q.Dequeue(); $left-- } }
     }
 }
 
