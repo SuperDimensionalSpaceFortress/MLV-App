@@ -483,7 +483,8 @@ function Get-ShadowKind($Node, [string[]]$Names) {
     if ($Node -is [System.Management.Automation.Language.VariableExpressionAst]) {
         $user = $Node.VariablePath.UserPath
         # ${function:\Join-Path} and ${function:/Join-Path} name the same command as ${function:Join-Path}.
-        if ($user -match '^(?i:alias|function):(.*)$' -and (Test-ShadowedName (Get-ProviderLeaf $Matches[1]) $Names)) { return 'provider-path' }
+        # A wildcard or empty tail (${function:Get-AttrCudaEmbeddedFunctionSourc?}) names a command the scan cannot read: it fails closed.
+        if ($user -match '^(?i:alias|function):(.*)$' -and (Test-RouteTailUnproven (Get-ProviderLeaf $Matches[1]) $Names)) { return 'provider-path' }
     }
     return ''
 }

@@ -934,6 +934,12 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Set-Item -LiteralPath function:.\\local:Split-Path -Value { 'C:\\fixture' }",
         "Set-Item -Path alias:./New-Object -Value Redirect",
         "${function:./Join-Path} = { 'C:\\fixture\\Dirty.psm1' }",
+        # r5 adversary pass 1 (A1): a braced function: / alias: variable with a wildcard or empty tail names a command the scan cannot
+        # read, so it fails closed like the string form does (the tail is a wildcard against the extractor's own name).
+        "${function:Get-AttrCudaEmbeddedFunctionSourc?} = { param($Name, $ModulePath) 'function F { }' }",
+        "${function:Join-Pa*} = { 'C:\\fixture\\Dirty.psm1' }",
+        "${alias:./Split-Pat[h]} = 'Redirect'",
+        "${function:} = { 1 }",
     )
     # r4: a rename or move that touches the function: / alias: drive, or names an evaluated command, with an operand the scan cannot
     # reduce to a constant, could be installing a shadow: it fails closed, in a kind of its own.
