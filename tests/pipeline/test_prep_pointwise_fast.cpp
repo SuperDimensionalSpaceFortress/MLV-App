@@ -1,7 +1,9 @@
 // CPU-LOOKASSIST-PLAYBACK-COST-1: the prep route's pointwise fast path.
 //  F1  it is ADMITTED for the M16-1243 Look Assist ON stage set (levels, WB
 //      matrix, full-res shadows/highlights, in-loop contrast, camera matrix +
-//      gamut compression, gamma, vibrance, creative curves) and for Look Assist OFF.
+//      gamut compression, gamma, vibrance, creative curves) and for Look Assist OFF,
+//      each with AgX off and with AgX on (CPU-LOOKASSIST-AGX-FASTPATH-1: the
+//      cinematic and classic Look Assist renders, and AgX's default-on LA off).
 //  F2  it is BYTE-IDENTICAL (max abs diff 0, all three channels) to
 //      gpuPreviewProcessingApplyCpuReference -- the reference loop, which is the
 //      CUDA/GL parity oracle and never takes the fast path -- on a 1808x2268
@@ -9,11 +11,13 @@
 //      the tier-1-off default) and fused 8-bit, at OpenMP 1 and 4. The team size
 //      the pass reports is read inside its region.
 //  F3  every parity-fixture stage config, each on a fresh processing object and
-//      asserted to enable exactly the stages it is named for: admitted ones match;
-//      refused ones name the stage, fall back to the reference loop and still
-//      match; the kill switch does the same.
+//      asserted to enable exactly the stages it is named for: admitted ones (AgX
+//      included) match; refused ones (vignette, gradient, hue-vs, LUT) name the
+//      stage, fall back to the reference loop and still match; the kill switch
+//      does the same.
 //  F4  opt-in (MLVAPP_PREP_POINTWISE_FAST_BENCH=1, never in CI): reference vs
-//      fast on a std::thread, as the prep thread runs it. Printed, never asserted.
+//      fast on a std::thread, as the prep thread runs it, for Look Assist on with
+//      AgX off and for the three AgX-on shapes. Printed, never asserted.
 // No assertion here reads a duration.
 #include "../common/minitest.h"
 
@@ -120,6 +124,34 @@ void applyM16LookAssistPreset(processingObject_t * p)
     processingSetShadows(p, -8 * 1.5 / 100.0);
     processingSetHighlights(p, -43 * 1.5 / 100.0);
     processingSetVibrance(p, std::pow((11 + 100) / 200.0 * 2.0, std::log(3.6) / std::log(2.0)));
+}
+
+/* The M16-1243 classic Look Assist preset (r3 D1 receipt 245f23d0: exposure=380
+ * contrast=15 pivot=55 shadows=12 highlights=-28 vibrance=5 temperature=6485
+ * tint=-12), through the same slider maps. */
+void applyM16ClassicLookAssistPreset(processingObject_t * p)
+{
+    processingAllowCreativeAdjustments(p);
+    processingSetExposureStops(p, 380 / 100.0 + 1.2);
+    processingSetWhiteBalance(p, 6485.0, -12 / 10.0);
+    processingSetSimpleContrast(p, 15 / 100.0);
+    processingSetPivot(p, 55 / 100.0);
+    processingSetShadows(p, 12 * 1.5 / 100.0);
+    processingSetHighlights(p, -28 * 1.5 / 100.0);
+    processingSetVibrance(p, std::pow((5 + 100) / 200.0 * 2.0, std::log(3.6) / std::log(2.0)));
+}
+
+/* Look Assist off: the Standard profile's creative curves, every slider at its
+ * neutral position, the same WB. */
+void applyLookAssistOff(processingObject_t * p)
+{
+    processingAllowCreativeAdjustments(p);
+    processingSetExposureStops(p, 0 / 100.0 + 1.2);
+    processingSetSimpleContrast(p, 0.0);
+    processingSetShadows(p, 0.0);
+    processingSetHighlights(p, 0.0);
+    processingSetVibrance(p, 1.0);
+    processingSetWhiteBalance(p, 6485.0, -12 / 10.0);
 }
 
 /* Deterministic synthetic RGB16 frame: full-range ramps (every LUT index), a band
@@ -325,11 +357,34 @@ constexpr int kFullHeight = 2268;
 constexpr int kMatrixWidth = 452;  /* the stage matrix: a quarter of each side */
 constexpr int kMatrixHeight = 568;
 
+/* Both AgX matrices have a non-zero off-diagonal, so an AgX case cannot pass by
+ * the matrices being the identity. */
+bool agxMatricesMixChannels(const GpuPreviewProcessingConfig & config)
+{
+    bool forward = false;
+    bool inverse = false;
+    for (int row = 0; row < 3; ++row)
+        for (int col = 0; col < 3; ++col)
+            if (row != col)
+            {
+                if (config.agxForward[row * 3 + col] != 0.0f) forward = true;
+                if (config.agxInverse[row * 3 + col] != 0.0f) inverse = true;
+            }
+    return forward && inverse;
+}
+
+/* preset: the Look Assist slider set; agx: AgX on, as every venue Look Assist
+ * render runs it (configureBaseSubset turns it off). */
 GpuPreviewProcessingConfig buildLookAssistOnConfig(MlvPipelineFixture & fixture,
                                                    const std::vector<uint16_t> & blur,
-                                                   int width, int height)
+                                                   int width, int height,
+                                                   void (*preset)(processingObject_t *) = applyM16LookAssistPreset,
+                                                   bool agx = false)
 {
-    GpuPreviewProcessingConfig config = buildConfig(fixture, applyM16LookAssistPreset);
+    GpuPreviewProcessingConfig config = buildConfig(fixture, [preset, agx](processingObject_t * p) {
+        preset(p);
+        if (agx) processingEnableAgX(p);
+    });
     /* The stage set the venue log reports for M16-1243 LA on. */
     ASSERT_TRUE(config.applyShadowsHighlights);
     ASSERT_TRUE(config.applyInLoopContrast);
@@ -337,8 +392,11 @@ GpuPreviewProcessingConfig buildLookAssistOnConfig(MlvPipelineFixture & fixture,
     ASSERT_TRUE(config.applyCreativeCurves);
     ASSERT_TRUE(config.useCameraMatrix);
     ASSERT_TRUE(config.applyGamutCompression);
-    ASSERT_TRUE(!config.applyVignette && !config.applyGradient && !config.applyLut
-                && !config.applyHighlightReconstruction && !config.applyAgx && !config.applyHueVs);
+    ASSERT_EQ(agx, config.applyAgx);
+    if (agx) ASSERT_TRUE(agxMatricesMixChannels(config));
+    ASSERT_TRUE(!config.applyVignette && !config.applyGradient && !config.applyGradientContrast
+                && !config.applyLut && !config.applyHighlightReconstruction && !config.applyHueVs
+                && !config.applySaturation && !config.applyToning);
     ASSERT_TRUE(!gpuPreviewProcessingCpuHasSpatialPostPass(config));
     attachBlur(&config, blur, width, height, false);
     ASSERT_EQ(static_cast<uint32_t>(GpuPreviewCpuStageShadowsHighlights),
@@ -457,22 +515,57 @@ TEST(PrepPointwiseFast, LookAssistOnAndOffAreAdmittedAndByteIdenticalAtFullSize)
     checkConfig("m16_la_on.sh_index_mask_flipped", laOnIndexMask, frame, kFullWidth, kFullHeight, "");
 
     /* Look Assist off, on a fresh fixture (the preset's contrast and vibrance stay
-     * on a processing object): the Standard profile's creative curves, every
-     * slider at its neutral position, the same WB. */
+     * on a processing object). */
     MlvPipelineFixture offFixture;
     openFixture(offFixture);
-    const GpuPreviewProcessingConfig laOff = buildConfig(offFixture, [](processingObject_t * p) {
-        processingAllowCreativeAdjustments(p);
-        processingSetExposureStops(p, 0 / 100.0 + 1.2);
-        processingSetSimpleContrast(p, 0.0);
-        processingSetShadows(p, 0.0);
-        processingSetHighlights(p, 0.0);
-        processingSetVibrance(p, 1.0);
-        processingSetWhiteBalance(p, 6485.0, -12 / 10.0);
-    });
+    const GpuPreviewProcessingConfig laOff = buildConfig(offFixture, applyLookAssistOff);
     ASSERT_TRUE(!laOff.applyShadowsHighlights && !laOff.applyInLoopContrast && !laOff.applyVibrance);
     ASSERT_EQ(std::string(""), std::string(gpuPreviewProcessingPointwiseFastRefusal(laOff)));
     checkConfig("m16_la_off", laOff, frame, kFullWidth, kFullHeight, "");
+}
+
+/* CPU-LOOKASSIST-AGX-FASTPATH-1: the shapes every committed M16-1243 CPU venue leg
+ * renders. AgX is on by default (raw_processing.c initProcessingObject) and in
+ * both Look Assist flavours, so these are the configs the prep worker actually
+ * sees; each is on a fresh fixture so no slider from another shape rides along. */
+TEST(PrepPointwiseFast, AgxOnLookAssistShapesAreAdmittedAndByteIdenticalAtFullSize)
+{
+    const std::vector<uint16_t> frame = makeSyntheticFrame(kFullWidth, kFullHeight, 0x1243u);
+    const std::vector<uint16_t> blur = makeBlockBlur(frame, kFullWidth, kFullHeight);
+
+    /* a) cinematic Look Assist on (C1, C3). */
+    MlvPipelineFixture cinematicFixture;
+    openFixture(cinematicFixture);
+    const GpuPreviewProcessingConfig cinematic = buildLookAssistOnConfig(
+        cinematicFixture, blur, kFullWidth, kFullHeight, applyM16LookAssistPreset, true);
+    ASSERT_EQ(std::string(""), std::string(gpuPreviewProcessingPointwiseFastRefusal(cinematic)));
+    checkConfig("m16_cinematic_agx_on", cinematic, frame, kFullWidth, kFullHeight, "");
+
+    /* d) the same with the engine's other S/H mode. */
+    GpuPreviewProcessingConfig cinematicIndexMask = cinematic;
+    cinematicIndexMask.shadowsHighlightsCurveIndexMask = !cinematic.shadowsHighlightsCurveIndexMask;
+    checkConfig("m16_cinematic_agx_on.sh_index_mask_flipped", cinematicIndexMask,
+                frame, kFullWidth, kFullHeight, "");
+
+    /* b) classic Look Assist on (D1). */
+    MlvPipelineFixture classicFixture;
+    openFixture(classicFixture);
+    const GpuPreviewProcessingConfig classic = buildLookAssistOnConfig(
+        classicFixture, blur, kFullWidth, kFullHeight, applyM16ClassicLookAssistPreset, true);
+    checkConfig("m16_classic_agx_on", classic, frame, kFullWidth, kFullHeight, "");
+
+    /* c) Look Assist off with AgX at its default (D2). */
+    MlvPipelineFixture offFixture;
+    openFixture(offFixture);
+    const GpuPreviewProcessingConfig laOff = buildConfig(offFixture, [](processingObject_t * p) {
+        applyLookAssistOff(p);
+        processingEnableAgX(p);
+    });
+    ASSERT_TRUE(laOff.applyAgx);
+    ASSERT_TRUE(!laOff.applyShadowsHighlights && !laOff.applyInLoopContrast && !laOff.applyVibrance);
+    ASSERT_TRUE(!laOff.applyVignette && !laOff.applyGradient && !laOff.applyGradientContrast
+                && !laOff.applyLut && !laOff.applyHueVs);
+    checkConfig("m16_la_off_agx_on", laOff, frame, kFullWidth, kFullHeight, "");
 }
 
 TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
@@ -495,6 +588,45 @@ TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
     constexpr uint32_t kSh = kStageCreative | kStageShadowsHighlights;
     constexpr uint32_t kM16 = kStageCreative | kStageInLoopContrast | kStageShadowsHighlights | kStageVibrance
                             | kStageWb | kStageExposure;
+    constexpr uint32_t kCombo = kStageCreative | kStageToning | kStageSaturation | kStageVibrance | kStageInLoopContrast;
+    /* The setups more than one case uses; an AgX case is the same setup plus
+     * processingEnableAgX. */
+    const std::function<void(processingObject_t *)> vignetteSetup = [uw, uh](processingObject_t * p) {
+        processingSetVignetteMask(p, uw, uh, 0.5f, 0.2f, 1.0f, 1.4f); processingSetVignetteStrength(p, 60); };
+    const std::function<void(processingObject_t *)> gradientSetup = [uw, uh](processingObject_t * p) {
+        processingSetGradientEnable(p, 1);
+        processingSetGradientMask(p, uw, uh, 0.0f, 0.0f, static_cast<float>(uw), static_cast<float>(uh));
+        processingSetGradientExposure(p, 1.0); };
+    const std::function<void(processingObject_t *)> hueVsSetup = [](processingObject_t * p) {
+        processingAllowCreativeAdjustments(p);
+        for (int i = 0; i < 36000; ++i) p->hue_vs_hue[i] = 0.5f;
+        p->hue_vs_hue_used = 1; };
+    const std::function<void(processingObject_t *)> lut3dSetup = [](processingObject_t * p) {
+        lut_t * lut = p->lut;
+        ASSERT_TRUE(lut != nullptr);
+        if (lut->cube) { free(lut->cube); lut->cube = nullptr; }
+        const int dim = 17;
+        lut->dimension = static_cast<uint16_t>(dim);
+        lut->is3d = 1;
+        lut->intensity = 100;
+        for (int i = 0; i < 3; ++i) { lut->domain_min[i] = 0.0f; lut->domain_max[i] = 1.0f; }
+        lut->cube = static_cast<float *>(malloc(static_cast<size_t>(dim) * dim * dim * 3 * sizeof(float)));
+        ASSERT_TRUE(lut->cube != nullptr);
+        for (int e = 0; e < dim * dim * dim; ++e)
+            for (int c = 0; c < 3; ++c)
+                lut->cube[e * 3 + c] = static_cast<float>((e * 3 + c) % dim) / (dim - 1);
+        p->lut_on = 1; };
+    const std::function<void(processingObject_t *)> comboSetup = [](processingObject_t * p) {
+        processingAllowCreativeAdjustments(p); processingSetToning(p, 255, 192, 0, 40);
+        processingSetSaturation(p, 1.5); processingSetVibrance(p, 0.6); processingSetSimpleContrast(p, 1.0); };
+    const std::function<void(processingObject_t *)> hlReconDualIsoSetup = [](processingObject_t * p) {
+        p->highlight_reconstruction = 1; if (p->dual_iso) *p->dual_iso = 1; p->highest_green_diso = 30000; };
+    auto withAgx = [](std::function<void(processingObject_t *)> setup) {
+        return std::function<void(processingObject_t *)>([setup](processingObject_t * p) {
+            setup(p);
+            processingEnableAgX(p);
+        });
+    };
     const Case cases[] = {
         { "plain", "", 0, [](processingObject_t *) {}, 0 },
         { "creative_standard", "", kStageCreative, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); }, 0 },
@@ -508,7 +640,7 @@ TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
         { "no_camera_matrix", "", kStageNoCameraMatrix, [](processingObject_t * p) { p->use_cam_matrix = 0; }, 0 },
         { "wb_3000k", "", kStageWb, [](processingObject_t * p) { processingSetWhiteBalance(p, 3000.0, 0.0); }, 0 },
         { "hl_recon", "", kStageHighlightRecon | kStageDualIsoOff, [](processingObject_t * p) { p->highlight_reconstruction = 1; if (p->dual_iso) *p->dual_iso = 0; }, 0 },
-        { "hl_recon_dual_iso", "", kStageHighlightRecon, [](processingObject_t * p) { p->highlight_reconstruction = 1; if (p->dual_iso) *p->dual_iso = 1; p->highest_green_diso = 30000; }, 0 },
+        { "hl_recon_dual_iso", "", kStageHighlightRecon, hlReconDualIsoSetup, 0 },
         { "sh_full", "", kSh, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 1 },
         { "sh_quarter", "", kSh, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 2 },
         { "sh_no_frame_state", "", kSh, [](processingObject_t * p) { processingAllowCreativeAdjustments(p); processingSetShadows(p, 0.32); processingSetHighlights(p, -0.26); }, 3 },
@@ -522,39 +654,31 @@ TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
         { "chroma_r2", "", kStageChroma, [](processingObject_t * p) { processingEnableChromaSeparation(p); processingSetChromaBlurRadius(p, 2); }, 0 },
         { "sharpen", "", kStageSharpen, [](processingObject_t * p) { processingSetSharpening(p, 0.5); }, 0 },
         { "median_w3", "", kStageMedian, [](processingObject_t * p) { p->denoiserWindow = 3; p->denoiserStrength = 80; }, 0 },
-        /* Refused: the stages the fast path does not carry. */
-        { "vignette", "vignette", kStageVignette, [uw, uh](processingObject_t * p) { processingSetVignetteMask(p, uw, uh, 0.5f, 0.2f, 1.0f, 1.4f); processingSetVignetteStrength(p, 60); }, 0 },
-        { "gradient", "gradient", kStageGradient, [uw, uh](processingObject_t * p) {
-              processingSetGradientEnable(p, 1);
-              processingSetGradientMask(p, uw, uh, 0.0f, 0.0f, static_cast<float>(uw), static_cast<float>(uh));
-              processingSetGradientExposure(p, 1.0); }, 0 },
-        { "agx", "agx", kStageAgx, [](processingObject_t * p) { processingEnableAgX(p); }, 0 },
-        { "hue_vs", "hue_vs", kStageCreative | kStageHueVs, [](processingObject_t * p) {
-              processingAllowCreativeAdjustments(p);
-              for (int i = 0; i < 36000; ++i) p->hue_vs_hue[i] = 0.5f;
-              p->hue_vs_hue_used = 1; }, 0 },
-        { "lut3d", "lut", kStageLut, [](processingObject_t * p) {
-              lut_t * lut = p->lut;
-              ASSERT_TRUE(lut != nullptr);
-              if (lut->cube) { free(lut->cube); lut->cube = nullptr; }
-              const int dim = 17;
-              lut->dimension = static_cast<uint16_t>(dim);
-              lut->is3d = 1;
-              lut->intensity = 100;
-              for (int i = 0; i < 3; ++i) { lut->domain_min[i] = 0.0f; lut->domain_max[i] = 1.0f; }
-              lut->cube = static_cast<float *>(malloc(static_cast<size_t>(dim) * dim * dim * 3 * sizeof(float)));
-              ASSERT_TRUE(lut->cube != nullptr);
-              for (int e = 0; e < dim * dim * dim; ++e)
-                  for (int c = 0; c < 3; ++c)
-                      lut->cube[e * 3 + c] = static_cast<float>((e * 3 + c) % dim) / (dim - 1);
-              p->lut_on = 1; }, 0 },
+        /* AgX (CPU-LOOKASSIST-AGX-FASTPATH-1): admitted alone and with every
+         * stage that changes what reaches its forward or inverse matrix. */
+        { "agx", "", kStageAgx, [](processingObject_t * p) { processingEnableAgX(p); }, 0 },
+        { "agx_m16_la_on", "", kM16 | kStageAgx, withAgx(applyM16LookAssistPreset), 1 },
+        { "agx_combo_toning_saturation_vibrance_contrast", "", kCombo | kStageAgx, withAgx(comboSetup), 0 },
+        { "agx_hl_recon_dual_iso", "", kStageHighlightRecon | kStageAgx, withAgx(hlReconDualIsoSetup), 0 },
+        { "agx_no_camera_matrix", "", kStageNoCameraMatrix | kStageAgx,
+          withAgx([](processingObject_t * p) { p->use_cam_matrix = 0; }), 0 },
+        { "agx_exr_mode", "", kStageNoGamutCompression | kStageAgx,
+          withAgx([](processingObject_t * p) { p->exr_mode = 1; }), 0 },
+        { "agx_gamut_rec2020", "", kStageGamut | kStageAgx,
+          withAgx([](processingObject_t * p) { processingSetGamut(p, GAMUT_Rec2020); }), 0 },
+        /* Refused: the stages the fast path does not carry, alone and with AgX
+         * (the refusal names the uncarried stage, never AgX). */
+        { "vignette", "vignette", kStageVignette, vignetteSetup, 0 },
+        { "gradient", "gradient", kStageGradient, gradientSetup, 0 },
+        { "hue_vs", "hue_vs", kStageCreative | kStageHueVs, hueVsSetup, 0 },
+        { "lut3d", "lut", kStageLut, lut3dSetup, 0 },
+        { "agx_vignette", "vignette", kStageVignette | kStageAgx, withAgx(vignetteSetup), 0 },
+        { "agx_gradient", "gradient", kStageGradient | kStageAgx, withAgx(gradientSetup), 0 },
+        { "agx_hue_vs", "hue_vs", kStageCreative | kStageHueVs | kStageAgx, withAgx(hueVsSetup), 0 },
+        { "agx_lut3d", "lut", kStageLut | kStageAgx, withAgx(lut3dSetup), 0 },
         /* Intentional combinations, named as such (the single-stage cases above
          * once reached these only through settings left on a shared object). */
-        { "combo_toning_saturation_vibrance_contrast", "",
-          kStageCreative | kStageToning | kStageSaturation | kStageVibrance | kStageInLoopContrast,
-          [](processingObject_t * p) {
-              processingAllowCreativeAdjustments(p); processingSetToning(p, 255, 192, 0, 40);
-              processingSetSaturation(p, 1.5); processingSetVibrance(p, 0.6); processingSetSimpleContrast(p, 1.0); }, 0 },
+        { "combo_toning_saturation_vibrance_contrast", "", kCombo, comboSetup, 0 },
         { "combo_no_camera_matrix_wb_3000k", "", kStageNoCameraMatrix | kStageWb, [](processingObject_t * p) {
               p->use_cam_matrix = 0; processingSetWhiteBalance(p, 3000.0, 0.0); }, 0 },
         { "combo_m16_la_on_no_camera_matrix", "", kM16 | kStageNoCameraMatrix, [](processingObject_t * p) {
@@ -577,6 +701,7 @@ TEST(PrepPointwiseFast, EveryParityFixtureStageMatchesAndRefusedStagesFallBack)
         if (stages != c.stages)
             stageMismatches += std::string(" ") + c.label + ": expected=" + caseStageText(c.stages)
                              + " got=" + caseStageText(stages) + ";";
+        if (config.applyAgx) ASSERT_TRUE(agxMatricesMixChannels(config));
         if (c.blurMode != 0) ASSERT_TRUE(config.applyShadowsHighlights);
         if (c.blurMode == 1)
         {
@@ -627,8 +752,19 @@ TEST(PrepPointwiseFast, KillSwitchRestoresTheReferenceLoop)
         EnvScope kill(name, off);
         ASSERT_EQ(std::string(""), std::string(gpuPreviewProcessingPointwiseFastRefusal(laOn)));
     }
+
+    /* The cinematic AgX-on shape the venue legs render, on a fresh fixture. */
+    MlvPipelineFixture agxFixture;
+    openFixture(agxFixture);
+    const GpuPreviewProcessingConfig cinematicAgx = buildLookAssistOnConfig(
+        agxFixture, blur, kMatrixWidth, kMatrixHeight, applyM16LookAssistPreset, true);
+    {
+        EnvScope kill(name, "1");
+        checkConfig("kill_switch.cinematic_agx_on", cinematicAgx, frame, kMatrixWidth, kMatrixHeight, "kill_switch");
+    }
     EnvScope unset(name, nullptr);
     ASSERT_EQ(std::string(""), std::string(gpuPreviewProcessingPointwiseFastRefusal(laOn)));
+    ASSERT_EQ(std::string(""), std::string(gpuPreviewProcessingPointwiseFastRefusal(cinematicAgx)));
 }
 
 TEST(PrepPointwiseFast, OptInBenchmarkOnAPrepStyleThread)
@@ -637,11 +773,40 @@ TEST(PrepPointwiseFast, OptInBenchmarkOnAPrepStyleThread)
     {
         SKIP_TEST("opt-in: set MLVAPP_PREP_POINTWISE_FAST_BENCH=1");
     }
-    MlvPipelineFixture fixture;
-    openFixture(fixture);
     const std::vector<uint16_t> frame = makeSyntheticFrame(kFullWidth, kFullHeight, 0x1243u);
     const std::vector<uint16_t> blur = makeBlockBlur(frame, kFullWidth, kFullHeight);
-    const GpuPreviewProcessingConfig laOn = buildLookAssistOnConfig(fixture, blur, kFullWidth, kFullHeight);
+    /* Each shape on its own fixture, as the full-size admission tests build them. */
+    struct BenchConfig
+    {
+        const char * name;
+        GpuPreviewProcessingConfig config;
+    };
+    std::vector<BenchConfig> configs;
+    {
+        MlvPipelineFixture fixture;
+        openFixture(fixture);
+        configs.push_back({ "la_on", buildLookAssistOnConfig(fixture, blur, kFullWidth, kFullHeight) });
+    }
+    {
+        MlvPipelineFixture fixture;
+        openFixture(fixture);
+        configs.push_back({ "cinematic_agx_on", buildLookAssistOnConfig(
+            fixture, blur, kFullWidth, kFullHeight, applyM16LookAssistPreset, true) });
+    }
+    {
+        MlvPipelineFixture fixture;
+        openFixture(fixture);
+        configs.push_back({ "classic_agx_on", buildLookAssistOnConfig(
+            fixture, blur, kFullWidth, kFullHeight, applyM16ClassicLookAssistPreset, true) });
+    }
+    {
+        MlvPipelineFixture fixture;
+        openFixture(fixture);
+        configs.push_back({ "la_off_agx_on", buildConfig(fixture, [](processingObject_t * p) {
+            applyLookAssistOff(p);
+            processingEnableAgX(p);
+        }) });
+    }
     const char * kill = gpuPreviewProcessingPointwiseFastKillSwitchName();
     EnvScope killUnset(kill, nullptr);
     /* Production thread counts: no test-harness override, so the fast team is
@@ -650,73 +815,81 @@ TEST(PrepPointwiseFast, OptInBenchmarkOnAPrepStyleThread)
     EnvScope forced("MLVAPP_FORCE_THREADS", nullptr);
 
     constexpr int kReps = 7;
-    std::vector<double> refMs, fastMs, refMs1, fastMs1;
-    int workerMaxThreads = 0, refTeam = 0, fastTeam = 0;
-    bool identical = true;
-    /* A plain std::thread, as MainWindow::playbackPrepThreadLoop is: its OpenMP
-     * ICVs are the process defaults, not the render thread's. */
-    std::thread worker([&]() {
-        workerMaxThreads = omp_get_max_threads();
-        std::vector<uint16_t> refOut(frame.size()), fastOut(frame.size());
-        for (int rep = 0; rep < kReps; ++rep)
-        {
-            for (int leg = 0; leg < 2; ++leg)
-            {
-                const bool reference = ((rep + leg) % 2) == 0;   /* interleaved, alternating first */
-                GpuPreviewProcessingCpuSpans spans;
-                if (reference)
-                {
-                    qputenv(kill, QByteArray("1"));
-                    gpuPreviewProcessingApplyCpuReferenceTimed(laOn, frame.data(), refOut.data(),
-                                                               kFullWidth, kFullHeight, &spans);
-                    qunsetenv(kill);
-                    refMs.push_back(spans.pointwiseMs);
-                    refTeam = spans.pointwiseOmpThreads;
-                }
-                else
-                {
-                    gpuPreviewProcessingApplyCpuReferenceTimed(laOn, frame.data(), fastOut.data(),
-                                                               kFullWidth, kFullHeight, &spans);
-                    fastMs.push_back(spans.pointwiseMs);
-                    fastTeam = spans.pointwiseOmpThreads;
-                    if (!spans.pointwiseFast) identical = false;
-                }
-            }
-            if (refOut != fastOut) identical = false;
-        }
-        /* Scaling: both loops on one thread (3 reps each, interleaved). */
-        omp_set_num_threads(1);
-        qputenv("MLVAPP_FORCE_THREADS", QByteArray("1"));
-        for (int rep = 0; rep < 3; ++rep)
-        {
-            GpuPreviewProcessingCpuSpans spans;
-            qputenv(kill, QByteArray("1"));
-            gpuPreviewProcessingApplyCpuReferenceTimed(laOn, frame.data(), refOut.data(),
-                                                       kFullWidth, kFullHeight, &spans);
-            qunsetenv(kill);
-            refMs1.push_back(spans.pointwiseMs);
-            gpuPreviewProcessingApplyCpuReferenceTimed(laOn, frame.data(), fastOut.data(),
-                                                       kFullWidth, kFullHeight, &spans);
-            fastMs1.push_back(spans.pointwiseMs);
-            if (refOut != fastOut || spans.pointwiseOmpThreads != 1) identical = false;
-        }
-        qunsetenv("MLVAPP_FORCE_THREADS");
-    });
-    worker.join();
     auto median = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
-    const double refMed = median(refMs);
-    const double fastMed = median(fastMs);
-    std::printf("[PREP-FAST-BENCH] frame=%dx%d reps=%d worker_omp_get_max_threads=%d "
-                "reference_team=%d fast_team=%d reference_median_ms=%.3f fast_median_ms=%.3f "
-                "speedup=%.3f byte_identical=%d\n",
-                kFullWidth, kFullHeight, kReps, workerMaxThreads, refTeam, fastTeam,
-                refMed, fastMed, fastMed > 0.0 ? refMed / fastMed : 0.0, identical ? 1 : 0);
-    for (int rep = 0; rep < kReps; ++rep)
-        std::printf("[PREP-FAST-BENCH] rep=%d reference_ms=%.3f fast_ms=%.3f\n", rep, refMs[rep], fastMs[rep]);
-    std::printf("[PREP-FAST-BENCH] one_thread reference_median_ms=%.3f fast_median_ms=%.3f "
-                "reference_ns_per_px=%.2f fast_ns_per_px=%.2f\n",
-                median(refMs1), median(fastMs1),
-                median(refMs1) * 1.0e6 / (static_cast<double>(kFullWidth) * kFullHeight),
-                median(fastMs1) * 1.0e6 / (static_cast<double>(kFullWidth) * kFullHeight));
-    ASSERT_TRUE(identical);
+    bool allIdentical = true;
+    for (const BenchConfig & bench : configs)
+    {
+        const GpuPreviewProcessingConfig & config = bench.config;
+        std::vector<double> refMs, fastMs, refMs1, fastMs1;
+        int workerMaxThreads = 0, refTeam = 0, fastTeam = 0;
+        bool identical = true;
+        /* A plain std::thread, as MainWindow::playbackPrepThreadLoop is: its OpenMP
+         * ICVs are the process defaults, not the render thread's. */
+        std::thread worker([&]() {
+            workerMaxThreads = omp_get_max_threads();
+            std::vector<uint16_t> refOut(frame.size()), fastOut(frame.size());
+            for (int rep = 0; rep < kReps; ++rep)
+            {
+                for (int leg = 0; leg < 2; ++leg)
+                {
+                    const bool reference = ((rep + leg) % 2) == 0;   /* interleaved, alternating first */
+                    GpuPreviewProcessingCpuSpans spans;
+                    if (reference)
+                    {
+                        qputenv(kill, QByteArray("1"));
+                        gpuPreviewProcessingApplyCpuReferenceTimed(config, frame.data(), refOut.data(),
+                                                                   kFullWidth, kFullHeight, &spans);
+                        qunsetenv(kill);
+                        refMs.push_back(spans.pointwiseMs);
+                        refTeam = spans.pointwiseOmpThreads;
+                    }
+                    else
+                    {
+                        gpuPreviewProcessingApplyCpuReferenceTimed(config, frame.data(), fastOut.data(),
+                                                                   kFullWidth, kFullHeight, &spans);
+                        fastMs.push_back(spans.pointwiseMs);
+                        fastTeam = spans.pointwiseOmpThreads;
+                        if (!spans.pointwiseFast) identical = false;
+                    }
+                }
+                if (refOut != fastOut) identical = false;
+            }
+            /* Scaling: both loops on one thread (3 reps each, interleaved). */
+            omp_set_num_threads(1);
+            qputenv("MLVAPP_FORCE_THREADS", QByteArray("1"));
+            for (int rep = 0; rep < 3; ++rep)
+            {
+                GpuPreviewProcessingCpuSpans spans;
+                qputenv(kill, QByteArray("1"));
+                gpuPreviewProcessingApplyCpuReferenceTimed(config, frame.data(), refOut.data(),
+                                                           kFullWidth, kFullHeight, &spans);
+                qunsetenv(kill);
+                refMs1.push_back(spans.pointwiseMs);
+                gpuPreviewProcessingApplyCpuReferenceTimed(config, frame.data(), fastOut.data(),
+                                                           kFullWidth, kFullHeight, &spans);
+                fastMs1.push_back(spans.pointwiseMs);
+                if (refOut != fastOut || spans.pointwiseOmpThreads != 1 || !spans.pointwiseFast) identical = false;
+            }
+            qunsetenv("MLVAPP_FORCE_THREADS");
+        });
+        worker.join();
+        const double refMed = median(refMs);
+        const double fastMed = median(fastMs);
+        std::printf("[PREP-FAST-BENCH] config=%s agx=%d frame=%dx%d reps=%d worker_omp_get_max_threads=%d "
+                    "reference_team=%d fast_team=%d reference_median_ms=%.3f fast_median_ms=%.3f "
+                    "speedup=%.3f byte_identical=%d\n",
+                    bench.name, config.applyAgx ? 1 : 0, kFullWidth, kFullHeight, kReps, workerMaxThreads,
+                    refTeam, fastTeam, refMed, fastMed, fastMed > 0.0 ? refMed / fastMed : 0.0, identical ? 1 : 0);
+        for (int rep = 0; rep < kReps; ++rep)
+            std::printf("[PREP-FAST-BENCH] config=%s rep=%d reference_ms=%.3f fast_ms=%.3f\n",
+                        bench.name, rep, refMs[rep], fastMs[rep]);
+        std::printf("[PREP-FAST-BENCH] config=%s one_thread reference_median_ms=%.3f fast_median_ms=%.3f "
+                    "speedup=%.3f reference_ns_per_px=%.2f fast_ns_per_px=%.2f\n",
+                    bench.name, median(refMs1), median(fastMs1),
+                    median(fastMs1) > 0.0 ? median(refMs1) / median(fastMs1) : 0.0,
+                    median(refMs1) * 1.0e6 / (static_cast<double>(kFullWidth) * kFullHeight),
+                    median(fastMs1) * 1.0e6 / (static_cast<double>(kFullWidth) * kFullHeight));
+        if (!identical) allIdentical = false;
+    }
+    ASSERT_TRUE(allIdentical);
 }
