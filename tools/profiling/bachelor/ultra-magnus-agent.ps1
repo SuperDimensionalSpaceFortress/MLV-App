@@ -2007,6 +2007,29 @@ function Read-HeavySlotFeedMetrics {
     }
 }
 
+function Test-LeaseLocalFixedPath {
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r4 (Dot B4; adversary r4-6abf870f A3). Whether a path the lease wait's LOGGING touches synchronously is on a
+    # local fixed disk: fully qualified, a drive letter, DriveType Fixed, and no reparse point (junction, symlink, mount) on the way to it, each
+    # component checked from the root down without following one. A component that does not exist ends the walk (an access then fails fast).
+    # -LeafLinkOk allows the last component itself to be a link (python.exe may be an app-execution alias). Never throws: an error is $false.
+    param([AllowNull()][AllowEmptyString()][string]$Path, [switch]$LeafLinkOk)
+    try {
+        if (-not [System.IO.Path]::IsPathFullyQualified([string]$Path)) { return $false }
+        $full = [System.IO.Path]::GetFullPath($Path)
+        if ($full -notmatch '^[A-Za-z]:\\' -or [System.IO.DriveInfo]::new($full.Substring(0, 1)).DriveType -ne [System.IO.DriveType]::Fixed) { return $false }
+        $segs = @($full.Substring(3).Split([char]'\') | Where-Object { $_ })
+        $cur = $full.Substring(0, 3)
+        for ($i = 0; $i -lt $segs.Count; $i++) {
+            $cur = [System.IO.Path]::Combine($cur, $segs[$i])
+            try { $attr = [System.IO.File]::GetAttributes($cur) }
+            catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { return $true }
+            if (($attr -band [System.IO.FileAttributes]::ReparsePoint) -and -not ($LeafLinkOk -and $i -eq $segs.Count - 1)) { return $false }
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
 function Get-LeaseWaitHeatField {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1: the heat fields of a quiet-lease waiting line, from ONE feed read, in the gate's own terms
     # (Get-SustainedHeatVerdict: throttled rows of the window, the window's mean C) plus the feed's age. An unreadable feed is
@@ -2017,17 +2040,7 @@ function Get-LeaseWaitHeatField {
     # share) is heat=skipped reason=non-local-feed, so a stalled share never holds the loop past a queue ceiling or a deadline. The grant-time
     # and status-mode reads are unchanged.
     try {
-        $p = [string]$HeavySlotFeed
-        if (-not [System.IO.Path]::IsPathFullyQualified($p)) { return "heat=skipped reason=non-local-feed" }
-        $full = [System.IO.Path]::GetFullPath($p)
-        if ($full -notmatch '^[A-Za-z]:\\' -or [System.IO.DriveInfo]::new($full.Substring(0, 1)).DriveType -ne [System.IO.DriveType]::Fixed) { return "heat=skipped reason=non-local-feed" }
-        $cur = $full.Substring(0, 3)
-        foreach ($seg in @($full.Substring(3).Split([char]'\') | Where-Object { $_ })) {
-            $cur = [System.IO.Path]::Combine($cur, $seg)
-            try { $attr = [System.IO.File]::GetAttributes($cur) }
-            catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { break }   # nothing further exists: the read finds it missing
-            if ($attr -band [System.IO.FileAttributes]::ReparsePoint) { return "heat=skipped reason=non-local-feed" }
-        }
+        if (-not (Test-LeaseLocalFixedPath -Path $HeavySlotFeed)) { return "heat=skipped reason=non-local-feed" }
         $feed = Read-HeavySlotFeedMetrics
         # adversary r1 A3: a feed whose timestamp is far in the future (or an absurd age) must not turn a readable heat into unknown.
         $age = "unknown"
@@ -2110,6 +2123,12 @@ function Add-LeaseSlotSnapshot {
             Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=skipped($([long][Math]::Floor($HeadroomSec)) s before a deadline or the lease end, within the ${skipBelow} s a status probe may take)"
             return
         }
+        # adversary r4-6abf870f A3: Start-HeavySlotCli checks python and heavy-slot.py synchronously, before the probe's bound exists, so a probe
+        # whose script or configured interpreter is not on a local fixed disk (Test-LeaseLocalFixedPath) is not started.
+        if (-not (Test-LeaseLocalFixedPath -Path $HeavySlotScript -LeafLinkOk) -or -not (Test-LeaseLocalFixedPath -Path $HeavySlotPython -LeafLinkOk)) {
+            Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=skipped(heavy-slot.py or its python is not on a local fixed disk)"
+            return
+        }
         $call = Start-HeavySlotCli -Arguments @("status", "--slots", "$HeavySlotCount")
         if (-not $call.ok) {
             Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown($(([string]$call.why) -replace '\s+', ' '))"
@@ -2153,6 +2172,24 @@ function Update-LeaseSlotSnapshots {
             try { Add-AgentLogLine "quiet-lease: slots-snapshot job=$($s.jobId) phase=$($s.phase) slots=unknown(snapshot failed: $(([string]$_.Exception.Message) -replace '\s+', ' '))" } catch { }
         }
     }
+}
+
+function Get-LeaseSlotSnapshotWaitMs {
+    # adversary r4-6abf870f A2: how long a caller about to wait MaxMs (the wait loop's sleep, the job monitor loop's slice) may wait before the
+    # earliest snapshot probe in flight reaches its LeaseSnapshotProbeSec bound (at least 1 ms), so the next Update-LeaseSlotSnapshots kills it
+    # AT its bound, not a poll slice later. MaxMs when none is in flight. Never throws.
+    param([int]$MaxMs)
+    $ms = [Math]::Max(1, $MaxMs)
+    try {
+        if ($null -eq $script:LeaseSlotSnapshots -or $script:LeaseSlotSnapshots.Count -lt 1) { return $ms }
+        $bound = if ($script:LeaseSnapshotProbeSec -gt 0) { [double]$script:LeaseSnapshotProbeSec } else { 30.0 }
+        foreach ($s in @($script:LeaseSlotSnapshots.ToArray())) {
+            $left = [Math]::Ceiling(($bound - $s.clock.Elapsed.TotalSeconds) * 1000.0)
+            $ms = [int][Math]::Max(1, [Math]::Min([double]$ms, $left))
+        }
+    }
+    catch { }
+    return $ms
 }
 
 function Write-LeaseSlotSnapshotLine {
@@ -3641,7 +3678,7 @@ function Wait-QuietLeaseAdmission {
             }
             Update-LeaseSlotSnapshots   # r3: logs a snapshot probe that has exited; never waits
             Write-AgentHeartbeat -Activity "gate-wait job=$JobId state=$state waited=$([int]((Get-Date) - $t0).TotalSeconds)s"
-            Start-Sleep -Milliseconds $script:GateLoopSleepMs
+            Start-Sleep -Milliseconds (Get-LeaseSlotSnapshotWaitMs -MaxMs $script:GateLoopSleepMs)   # r4 (adversary A2): no longer than a probe's bound
         }
     }
     finally {
@@ -3953,6 +3990,7 @@ function Invoke-QueuedJob {
             if ($null -ne $leaseStop) { break }
             Write-AgentHeartbeat -Activity "job=$jobId"
             $remainingMs = [Math]::Max(1, [int][Math]::Min($waitSliceMs, ($deadline - (Get-Date)).TotalMilliseconds))
+            $remainingMs = Get-LeaseSlotSnapshotWaitMs -MaxMs $remainingMs   # AGENT-LEASE-PENDING-HEAT-TRACE-1 r4 (adversary A2): wake at a snapshot probe's bound
             [void]$jobProcess.WaitForExit($remainingMs)
         }
 

@@ -70,7 +70,7 @@ if ($null -ne $classifyFn) { . ([scriptblock]::Create($classifyFn.Extent.Text)) 
 # probe is the fake below answering `status` (unexpected: exit 9, so slots=unknown(...)), started without waiting and polled by Update-LeaseSlotSnapshots;
 # Reset-Case kills one still in flight before it clears calls.jsonl, so it never lands in the next case's calls.
 foreach ($name in @('Get-LeaseWaitHeatField', 'Get-LeaseSlotAgeText', 'ConvertFrom-HeavySlotHolderText', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec',
-        'Write-LeaseSlotSnapshotLine', 'Update-LeaseSlotSnapshots', 'Set-LeaseCoverageAtLaunch')) { $fn = Find-Function $name; if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) } }
+        'Write-LeaseSlotSnapshotLine', 'Update-LeaseSlotSnapshots', 'Set-LeaseCoverageAtLaunch', 'Test-LeaseLocalFixedPath', 'Get-LeaseSlotSnapshotWaitMs')) { $fn = Find-Function $name; if ($null -ne $fn) { . ([scriptblock]::Create($fn.Extent.Text)) } }
 $script:LeaseSlotSnapshots = [System.Collections.Generic.List[object]]::new()
 $script:LeaseSnapshotProbeSec = 30
 # BACHELOR-LEASE-BATCH-LEGS-1 r5: Invoke-QueuedJob and the lease wait call the lease-batch block (no batch is open here); lifted when present.

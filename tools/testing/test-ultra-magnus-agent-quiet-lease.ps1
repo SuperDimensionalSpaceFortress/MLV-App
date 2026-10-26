@@ -114,7 +114,7 @@ foreach ($name in $liftNotAfter) {
 }
 # lease-batch r4 (the merge of not-after r1): the same, so batch-refusal-ends-batch fails on behaviour against an agent without it.
 foreach ($name in @('Close-LeaseBatchAfterRelease', 'ConvertTo-UtcDateTime', 'Get-LeaseWaitHeatField', 'Get-LeaseSlotAgeText', 'ConvertFrom-HeavySlotHolderText', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec',
-        'Write-LeaseSlotSnapshotLine', 'Update-LeaseSlotSnapshots', 'Set-LeaseCoverageAtLaunch')) {   # from ConvertTo-UtcDateTime on: AGENT-LEASE-PENDING-HEAT-TRACE-1 (ConvertTo-UtcDateTime: the headroom helper reads the sidecar bound with it; the last three: r3, the asynchronous probe and the coverage at launch)
+        'Write-LeaseSlotSnapshotLine', 'Update-LeaseSlotSnapshots', 'Set-LeaseCoverageAtLaunch', 'Test-LeaseLocalFixedPath', 'Get-LeaseSlotSnapshotWaitMs')) {   # r4: the last two (the local-path rule, the bound-capped wait); from ConvertTo-UtcDateTime on: AGENT-LEASE-PENDING-HEAT-TRACE-1 (ConvertTo-UtcDateTime: the headroom helper reads the sidecar bound with it; the last three: r3, the asynchronous probe and the coverage at launch)
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -2570,7 +2570,37 @@ function Exit-HeavySlot {
             $HeavySlotFeed = Join-Path $fx 'feed-local.csv'
             $fLocal = Get-LeaseWaitHeatField
             Assert-True ($script:FeedReads -eq 1 -and $fLocal -match '^heat=unknown\(feed missing \(stub\)\)') "heat-trace B4: a local fixed-disk path is read: reads=$($script:FeedReads) $fLocal"
-            $results.leaseHeatTraceNonlocalFeed = [ordered]@{ local = $outN.local.waitedSec; unc = $outN.unc.waitedSec; uncLabel = $outN.unc.label; uncSample = $outN.unc.waits[0] }
+            # adversary r4-6abf870f A3: the snapshot's Start-HeavySlotCli checks heavy-slot.py and python synchronously, before the probe's bound
+            # exists. A script or configured python off a local fixed disk is slots=skipped(...), and no probe is started.
+            $savedScript = $HeavySlotScript; $savedPy = $HeavySlotPython
+            $cliReal = ${function:Start-HeavySlotCli}
+            $script:CliCalls = 0
+            function Start-HeavySlotCli { param([string[]]$Arguments) $script:CliCalls++; return [pscustomobject]@{ ok = $false; why = 'stub: not started' } }
+            try {
+                $HeavySlotScript = '\\heat-trace-unc.invalid\share\heavy-slot.py'
+                Add-LeaseSlotSnapshot -JobId 'jHtS1' -Phase 'grant'
+                $HeavySlotScript = $savedScript; $HeavySlotPython = '\\heat-trace-unc.invalid\share\python.exe'
+                Add-LeaseSlotSnapshot -JobId 'jHtS2' -Phase 'request'
+            }
+            finally { $HeavySlotScript = $savedScript; $HeavySlotPython = $savedPy; Set-Item -LiteralPath Function:\Start-HeavySlotCli -Value $cliReal }
+            $sS = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtS*' })
+            Assert-True ($script:CliCalls -eq 0 -and $sS.Count -eq 2 -and @($sS | Where-Object { $_ -notmatch ' slots=skipped\(heavy-slot\.py or its python is not on a local fixed disk\)$' }).Count -eq 0) "heat-trace A3(r4): a UNC heavy-slot.py or python starts no snapshot probe and logs slots=skipped(...): cli=$($script:CliCalls) $($sS -join ' || ')"
+            # adversary r4-6abf870f A2: a caller about to wait (the job monitor loop's slice, the wait loop's sleep) wakes at the earliest probe's bound,
+            # so a probe 29.5 s into its 30 s bound is killed at ~30 s, not a 5 s slice later. Pure, on a private probe list; then both callers use it.
+            Assert-True ($null -ne (Get-Command Get-LeaseSlotSnapshotWaitMs -ErrorAction SilentlyContinue)) "heat-trace A2(r4): the agent defines Get-LeaseSlotSnapshotWaitMs"
+            $savedSnaps = $script:LeaseSlotSnapshots
+            try {
+                $script:LeaseSlotSnapshots = [System.Collections.Generic.List[object]]::new()
+                $wNone = Get-LeaseSlotSnapshotWaitMs -MaxMs 5000
+                $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = 'jHtW'; phase = 'grant'; call = $null; clock = [pscustomobject]@{ Elapsed = [TimeSpan]::FromSeconds(29.5) } })
+                $wNear = Get-LeaseSlotSnapshotWaitMs -MaxMs 5000
+                $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = 'jHtW2'; phase = 'grant'; call = $null; clock = [pscustomobject]@{ Elapsed = [TimeSpan]::FromSeconds(31) } })
+                $wPast = Get-LeaseSlotSnapshotWaitMs -MaxMs 5000
+            }
+            finally { $script:LeaseSlotSnapshots = $savedSnaps }
+            Assert-True ($wNone -eq 5000 -and $wNear -ge 1 -and $wNear -le 500 -and $wPast -eq 1) "heat-trace A2(r4): the wait is capped at the earliest bound: none=$wNone near(29.5 s)=$wNear past=$wPast"
+            Assert-True ($agentText.Contains('Start-Sleep -Milliseconds (Get-LeaseSlotSnapshotWaitMs -MaxMs $script:GateLoopSleepMs)') -and $agentText.Contains('$remainingMs = Get-LeaseSlotSnapshotWaitMs -MaxMs $remainingMs')) "heat-trace A2(r4): the wait loop's sleep and the job monitor loop's slice are both capped by it"
+            $results.leaseHeatTraceNonlocalFeed = [ordered]@{ local = $outN.local.waitedSec; unc = $outN.unc.waitedSec; uncLabel = $outN.unc.label; uncSample = $outN.unc.waits[0]; scriptSkip = $sS[0]; waitNearMs = $wNear }
         }
         finally {
             $HeavySlotFeed = $savedFeed; $script:FeedStallSec = 0
