@@ -916,6 +916,8 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Move-Item function:Redirect (('New-' + 'Object'))",
         "Rename-Item -LiteralPath function:Redirect -NewName ([string]'Join-Path')",
         "Copy-Item -LiteralPath function:Redirect -Destination ('function:Join-Path')",
+        # r4 adversary pass 1 (A2): a single-element array expression is the constant it holds.
+        "Rename-Item -LiteralPath ([string]@('function:Redirect')) -NewName ([string]@('Join-Path'))",
     )
     # r4: a rename or move that touches the function: / alias: drive, or names an evaluated command, with an operand the scan cannot
     # reduce to a constant, could be installing a shadow: it fails closed, in a kind of its own.
@@ -923,6 +925,11 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Rename-Item -LiteralPath function:Redirect -NewName ($renameBase + '-Path')",
         "Move-Item function:Redirect $moveTarget",
         "Rename-Item -LiteralPath $renameSource -NewName 'Join-Path'",
+        # r4 adversary pass 1 (A2): an operand built ONLY from literals is decided by the source text, not at run time, so one the scan
+        # cannot reduce fails closed on its own, whether or not a route or an evaluated name sits beside it.
+        "Rename-Item -LiteralPath ('function:Redirect') -NewName (('Join', 'Path') -join '-')",
+        "Move-Item function:Redirect ('{0}-Path' -f 'Join')",
+        "Rename-Item -LiteralPath (('function', 'Redirect') -join ':') -NewName (('Join', 'Path') -join '-')",
     )
     # Not shadows: the alias is for a command the scan does not evaluate, and a read of an unrelated function.
     ALIAS_CONTROLS = (
@@ -932,6 +939,7 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Rename-Item -LiteralPath function:Redirect -NewName Other-Name",
         "Rename-Item -LiteralPath function:Redirect -NewName ('Other-Name')",
         "Move-Item -LiteralPath $someFile -Destination $someFolder -Force",
+        "Move-Item -LiteralPath 'C:\\a.txt', 'C:\\b.txt' -Destination 'C:\\dir' -Force:$true",
     )
     ALIAS_PREAMBLE = ("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
                       + "".join(f"{line}\n" for line in ALIAS_SHADOWS + ALIAS_COMPUTED + PROVIDER_ROUTES + RENAME_COMPUTED + ALIAS_CONTROLS))
@@ -1252,6 +1260,11 @@ class SplicedBodyScanPsScriptRootTests(unittest.TestCase):
         "PsrSv": "sv PSScriptRoot 'C:\\dirty' -Scope Script\n",
         "PsrDrive": "Set-Item -Path variable:PSScriptRoot -Value 'C:\\dirty'\n",
         "PsrBraced": "${variable:PSScriptRoot} = 'C:\\dirty'\n",
+        # r4 adversary pass 1 (A1): the variable: drive takes a scope qualifier of its own after the drive name.
+        "PsrDriveLocal": "Set-Item -LiteralPath variable:local:PSScriptRoot 'C:\\dirty'\n",
+        "PsrDriveScript": "Set-Item -Path 'variable:\\script:PSScriptRoot' -Value 'C:\\dirty'\n",
+        "PsrBracedGlobal": "${variable:global:PSScriptRoot} = 'C:\\dirty'\n",
+        "PsrProviderQualified": "Set-Item -LiteralPath Microsoft.PowerShell.Core\\Variable::PSScriptRoot 'C:\\dirty'\n",
         "PsrParam": "function Rebind { param($PSScriptRoot) }\n",
         "PsrComputed": "Set-Variable -Name $someName -Value 'C:\\dirty'\n",
     }

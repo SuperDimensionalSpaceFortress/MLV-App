@@ -86,7 +86,9 @@
 # could name, such a command (`Set-Item alias:Join-Path`, `${function:Join-Path} = ...`). A rename, move or copy
 # operand written as ('Join-Path'), $('Join-Path'), [string]'Join-Path' or 'Join-' + 'Path' is read as the constant
 # it is; on those commands an operand the scan cannot reduce to a constant, next to a function: / alias: route or an
-# evaluated name, is a finding of its own kind ('computed-rename'). Left OPEN: a drive
+# evaluated name, is a finding of its own kind ('computed-rename'); so is an operand built only from literals that
+# the scan cannot reduce (`('Join', 'Path') -join '-'`), whatever sits beside it, because the source text fixes its
+# value. An operand holding a variable or a command is a run-time-built value and stays a declared limit. Left OPEN: a drive
 # path built at run time (`'al' + 'ias:'`), Import-Alias, and a relative path after `Set-Location alias:`.
 #
 # $PSScriptRoot (r4, adversary r3 A2). `Join-Path $PSScriptRoot '<child>'` is read as the directory of the file that
@@ -313,27 +315,44 @@ function Get-AliasNameArguments($Command, [string]$Cmdlet = 'Set-Alias') {
 
 $script:providerRoutePattern = '^\s*(?:[A-Za-z0-9_.]+\\)?(?:alias|function)::?'
 
-function Get-ConstantString($Ast) {
-    # The string a command operand always evaluates to, or $null when the scan cannot prove one. Parentheses, a one-expression
-    # sub-expression, a [string] cast, a quoted string with nothing to expand and a '+' of such parts are all the same constant.
+function Get-UnwrappedOperand($Ast) {
+    # The expression inside any parentheses, one-expression sub-expression or @( ), single-statement pipeline and [string] cast
+    # around it; the node itself when it is none of those (or holds more than one statement). @('x') binds a string parameter as
+    # 'x'; more elements, or none, are not one value.
     while ($true) {
         if ($Ast -is [System.Management.Automation.Language.ParenExpressionAst]) { $Ast = $Ast.Pipeline; continue }
-        if ($Ast -is [System.Management.Automation.Language.SubExpressionAst]) {
-            if ($Ast.SubExpression.Statements.Count -ne 1) { return $null }
+        if ($Ast -is [System.Management.Automation.Language.SubExpressionAst] -or $Ast -is [System.Management.Automation.Language.ArrayExpressionAst]) {
+            if ($Ast.SubExpression.Statements.Count -ne 1) { break }
             $Ast = $Ast.SubExpression.Statements[0]; continue
         }
         if ($Ast -is [System.Management.Automation.Language.PipelineAst]) {
-            if ($Ast.PipelineElements.Count -ne 1) { return $null }
+            if ($Ast.PipelineElements.Count -ne 1) { break }
             $Ast = $Ast.PipelineElements[0]; continue
         }
         if ($Ast -is [System.Management.Automation.Language.CommandExpressionAst]) {
-            if ($Ast.Redirections.Count -gt 0) { return $null }
+            if ($Ast.Redirections.Count -gt 0) { break }
             $Ast = $Ast.Expression; continue
         }
         if ($Ast -is [System.Management.Automation.Language.ConvertExpressionAst] -and $Ast.Type.TypeName.FullName -ieq 'string') { $Ast = $Ast.Child; continue }
         break
     }
-    if ($Ast -is [System.Management.Automation.Language.StringConstantExpressionAst]) { return [string]$Ast.Value }
+    return $Ast
+}
+
+function Expand-Operands($Ast) {
+    # An operand as the separate values it carries: a comma list (`'a', 'b'`, @('a', 'b')) is its elements, anything else itself.
+    $inner = Get-UnwrappedOperand $Ast
+    if ($inner -is [System.Management.Automation.Language.ArrayLiteralAst]) { return @($inner.Elements | ForEach-Object { Expand-Operands $_ }) }
+    return @($Ast)
+}
+
+function Get-ConstantString($Ast) {
+    # The string a command operand always evaluates to, or $null when the scan cannot prove one. Parentheses, a one-expression
+    # sub-expression, @( ) of one element, a [string] cast, a quoted string with nothing to expand, a number, $true / $false /
+    # $null and a '+' of such parts are all constants.
+    $Ast = Get-UnwrappedOperand $Ast
+    if ($Ast -is [System.Management.Automation.Language.ConstantExpressionAst]) { return [string]$Ast.Value }
+    if ($Ast -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $Ast.Splatted -and @('true', 'false', 'null') -contains $Ast.VariablePath.UserPath.ToLowerInvariant()) { return '' }
     if ($Ast -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
         if ($Ast.NestedExpressions.Count -eq 0) { return [string]$Ast.Value }
         return $null
@@ -346,6 +365,18 @@ function Get-ConstantString($Ast) {
         return $left + $right
     }
     return $null
+}
+
+function Test-BuiltFromLiteralsOnly($Ast) {
+    # True when nothing in the expression is decided at run time: no variable (other than $true / $false / $null), no command and
+    # no sub-expression holding one. Its value is fixed by the source text, so a scan that cannot read that value fails closed;
+    # an operand that DOES hold a variable or a command is a run-time-built value, a declared limit of this scan.
+    foreach ($n in @($Ast.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -or $x -is [System.Management.Automation.Language.CommandAst] -or
+                                           $x -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -or $x -is [System.Management.Automation.Language.UsingExpressionAst] }, $true))) {
+        if ($n -is [System.Management.Automation.Language.VariableExpressionAst] -and @('true', 'false', 'null') -contains $n.VariablePath.UserPath.ToLowerInvariant()) { continue }
+        return $false
+    }
+    return $true
 }
 
 function Get-ShadowKind($Node, [string[]]$Names) {
@@ -366,17 +397,23 @@ function Get-ShadowKind($Node, [string[]]$Names) {
             # written as ('Join-Path'), $('Join-Path') or 'Join-' + 'Path' is read as the constant it is; on a rename, move or
             # copy, an operand the scan cannot read as a constant, next to a route or an evaluated name, fails closed.
             $renameCommands = @('rename-item', 'rni', 'ren', 'move-item', 'mi', 'move', 'mv', 'copy-item', 'cpi', 'copy', 'cp')
-            $routed = $false; $named = $false; $unreadable = $false
+            $routed = $false; $named = $false; $unreadable = $false; $fixedButUnread = $false
             foreach ($element in @($Node.CommandElements | Select-Object -Skip 1)) {
-                $operand = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
-                if ($null -eq $operand) { continue }
-                $constant = Get-ConstantString $operand
-                if ($null -eq $constant) { $unreadable = $true; continue }
-                if ($constant -match $script:providerRoutePattern) { $routed = $true }
-                elseif (Test-ShadowedName $constant $Names) { $named = $true }
+                $operandRoot = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
+                if ($null -eq $operandRoot) { continue }
+                foreach ($operand in @(Expand-Operands $operandRoot)) {
+                    $constant = Get-ConstantString $operand
+                    if ($null -eq $constant) {
+                        $unreadable = $true
+                        if (Test-BuiltFromLiteralsOnly $operand) { $fixedButUnread = $true }
+                        continue
+                    }
+                    if ($constant -match $script:providerRoutePattern) { $routed = $true }
+                    elseif (Test-ShadowedName $constant $Names) { $named = $true }
+                }
             }
             if ($routed -and $named) { return 'provider-path' }
-            if ($unreadable -and ($routed -or $named) -and $renameCommands -contains $commandName.ToLowerInvariant()) { return 'computed-rename' }
+            if ($renameCommands -contains $commandName.ToLowerInvariant() -and ($fixedButUnread -or ($unreadable -and ($routed -or $named)))) { return 'computed-rename' }
             return ''
         }
         # Any constant element naming a shadowed command counts, whichever parameter it follows (the conservative reading).
@@ -944,12 +981,13 @@ function Get-PsScriptRootRebinding($Root) {
         }
         elseif ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
             if (([string]$n.Value) -match $variableRoute) {
-                $rest = $Matches[1].Trim()
+                # variable:local:PSScriptRoot / variable:\script:PSScriptRoot: the drive takes its own scope qualifier.
+                $rest = ($Matches[1].Trim() -replace '^[A-Za-z]+:', '').TrimStart('\', '/')
                 if ($rest -eq '' -or $rest -match '[$(]' -or 'PSScriptRoot' -like $rest) { return 'the variable: drive' }
             }
         }
         elseif ($n -is [System.Management.Automation.Language.VariableExpressionAst]) {
-            if ($n.VariablePath.UserPath -match '^(?i:variable):(.*)$' -and ('PSScriptRoot' -like $Matches[1].TrimStart('\', '/'))) { return 'the variable: drive' }
+            if ($n.VariablePath.UserPath -match '^(?i:variable):(.*)$' -and ('PSScriptRoot' -like (($Matches[1] -replace '^[A-Za-z]+:', '').TrimStart('\', '/')))) { return 'the variable: drive' }
         }
     }
     return ''
