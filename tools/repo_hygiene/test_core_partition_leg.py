@@ -470,10 +470,86 @@ $ec = Read-CorePartitionFeedSince $fb ([int64]$mb.length) ([string]$mb.before)
 $r.integrityTruncated = @($ec.truncated, (Get-CorePartitionFeedSummary $mb $ec 120).reasons['rows'], (Get-CorePartitionFeedSummary $mb $ec 120).pkgWattsMax)
 # adversary r2 A1: a helper that was not ready at the measured launch fails the topology, bench and load flags closed
 $helperGood = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[]}' | ConvertFrom-Json
-$nr = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w 'helper-not-ready-at-launch'
+$nr = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w 'helper-not-ready-at-launch' $true
 $okc = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w $null
 $r.notReady = @($nr.corePartitionTopologyOk, $nr.benchAffinityApplied, $nr.partitionLoadApplied, $nr.corePartitionNullReasons, $okc.corePartitionTopologyOk, $okc.benchAffinityApplied, $okc.partitionLoadApplied)
+# sol r3 CP-01: the guard is the dedicated flag, so a reason text that no longer says "not ready" cannot re-open the criteria
+$nrText = Get-CorePartitionScalars $helperGood $feed 4095 1044480 8 $w 'helper-killed-after-stop-timeout' $true
+$r.notReadyFlag = @($nrText.corePartitionTopologyOk, $nrText.benchAffinityApplied, $nrText.partitionLoadApplied)
+# opus H2 (CORE-PARTITION-FEED-NOT-READY-REASON-1): with a not-ready helper every package-feed field is null and names the not-ready reason
+$r.notReadyFeed = @($nr.pkgWattsMean, $nr.pkgWattsMax, $nr.pkgTempCMean, $nr.pkgTempCMax, $nr.pkgThrottledRows, $nr.pkgTempCAtStart, $okc.pkgWattsMean, $okc.pkgTempCAtStart)
 $r | ConvertTo-Json -Depth 6 -Compress
+"""
+
+# sol r3 CP-01: the generator's own job text, not a copy. The readiness lines (the helper-reason/flag initialisation and the not-ready rule) come from
+# the pre-launch region, the cleanup block is the finally region verbatim, the scalar line is the success region's; the helper is a process double.
+CLEANUP_DRIVER = r"""
+$src = [IO.File]::ReadAllText($env:CP_GEN) -replace "`r`n", "`n"
+$postAt = $src.IndexOf('$cpPost = $cpOpen')
+if ($postAt -lt 0) { throw 'no $cpPost region in the generator' }
+$b = $src.IndexOf("@'`n", $postAt) + 3
+$e = $src.IndexOf("`n'@", $b)
+$cleanup = $src.Substring($b, $e - $b)
+$preLines = @([regex]::Matches($src.Substring(0, $postAt), '(?m)^(\$corePartitionHelper(Why|NotReady) = .*|if \(\$null -ne \$corePartitionHelper -and -not \$corePartitionHelperLaunch\.ready\).*)$') | ForEach-Object { $_.Value })
+if (@($preLines | Where-Object { $_.StartsWith('if ') }).Count -ne 1) { throw "the not-ready rule is not one line: $($preLines -join ' | ')" }
+$scalarLine = [regex]::Match($src, '(?m)^\$corePartitionScalars = Get-CorePartitionScalars .*$').Value
+if (-not $scalarLine) { throw 'no scalar line in the generator' }
+function Write-JobTrace([string]$Message) { }
+function Publish-AttrCudaText { param([string]$Path, [string]$Value) }
+function New-AttrCudaDirectory { param([string]$Path) }
+function Save-Json { param($Object, $Path) }
+function New-HelperDouble([string]$Mode) {
+    $d = [pscustomobject]@{ Id = 4242; Mode = $Mode; Killed = $false }
+    $d | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param([int]$Ms) if ($this.Mode -eq 'throw') { throw 'wait failed' }; if ($this.Mode -eq 'timeout' -and -not $this.Killed) { return $false }; return $true }
+    $d | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.Killed = $true }
+    $d
+}
+$CorePartitionBenchMask = [int64]4095
+$CorePartitionLoadMask = [int64]1044480
+$CorePartitionLoadThreads = 8
+$CorePartitionHelperMask = [int64]1044480
+$record = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[{"app":true,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}]}'
+$cases = @(
+    @{ name = 'stop-timeout'; mode = 'timeout'; record = 'valid'; ready = $false },
+    @{ name = 'normal-exit'; mode = 'exit'; record = 'valid'; ready = $false },
+    @{ name = 'wait-exception'; mode = 'throw'; record = 'valid'; ready = $false },
+    @{ name = 'record-unparseable'; mode = 'exit'; record = 'garbage'; ready = $false },
+    @{ name = 'record-missing'; mode = 'exit'; record = 'none'; ready = $false },
+    @{ name = 'stop-timeout-record-unparseable'; mode = 'timeout'; record = 'garbage'; ready = $false },
+    @{ name = 'ready-stop-timeout-control'; mode = 'timeout'; record = 'valid'; ready = $true })
+$out = [ordered]@{}
+foreach ($c in $cases) {
+    $dir = Join-Path $env:CP_TMP $c.name
+    [void](New-Item -ItemType Directory -Path $dir)
+    $Work = $dir; $Pub = $dir
+    $corePartitionHelperOut = Join-Path $dir 'core-partition-helper.json'
+    if ($c.record -eq 'valid') { [IO.File]::WriteAllText($corePartitionHelperOut, $record) } elseif ($c.record -eq 'garbage') { [IO.File]::WriteAllText($corePartitionHelperOut, '{"topologyCheck":') }
+    $corePartitionStopFile = Join-Path $dir 'core-partition.stop'
+    $corePartitionFeedPath = Join-Path $dir 'feed.csv'
+    [IO.File]::WriteAllText($corePartitionFeedPath, "26.10.2026,01:00:00,x,30,10,No,No`n")
+    $corePartitionFeedPreHelper = Read-CorePartitionFeedMark $corePartitionFeedPath
+    $corePartitionFeedStart = Read-CorePartitionFeedMark $corePartitionFeedPath
+    [IO.File]::AppendAllText($corePartitionFeedPath, "26.10.2026,01:00:01,x,70,45,No,No`n26.10.2026,01:00:02,x,80,55,No,No`n")
+    $corePartitionPreHelperUtc = (Get-Date).ToUniversalTime()
+    $corePartitionMeasuredLaunchUtc = $corePartitionPreHelperUtc
+    $corePartitionErrors = [Collections.Generic.List[string]]::new()
+    $corePartitionJob = [ordered]@{ affinityBefore = $null; affinityRequested = '0x00FFF'; affinityApplied = '0x00FFF'; affinityRestored = $null }
+    $corePartitionHelperNotReady = $null
+    foreach ($l in $preLines) { if (-not $l.StartsWith('if ')) { . ([scriptblock]::Create($l)) } }
+    $corePartitionHelper = New-HelperDouble $c.mode
+    $corePartitionHelperLaunch = [ordered]@{ pid = 4242; ready = $c.ready; readyWaitMs = 30000 }
+    foreach ($l in $preLines) { if ($l.StartsWith('if ')) { . ([scriptblock]::Create($l)) } }
+    . ([scriptblock]::Create($cleanup))
+    $rawLog = "playback_smoke.start session=1 worker_threads=16`n"
+    . ([scriptblock]::Create($scalarLine))
+    $s = $corePartitionScalars
+    $out[$c.name] = [ordered]@{
+        topo = $s.corePartitionTopologyOk; bench = $s.benchAffinityApplied; load = $s.partitionLoadApplied; why = [string]$s.corePartitionNullReasons
+        helperWhy = $corePartitionHelperWhy; notReady = [bool]$corePartitionHelperNotReady; killed = $corePartitionHelper.Killed
+        pkg = @($s.pkgWattsMean, $s.pkgWattsMax, $s.pkgTempCMean, $s.pkgTempCMax, $s.pkgThrottledRows, $s.pkgTempCAtStart)
+    }
+}
+$out | ConvertTo-Json -Depth 6 -Compress
 """
 
 
@@ -538,6 +614,48 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         self.assertEqual(not_ready[:3], [False, False, False])
         self.assertIn("corePartitionTopologyOk=helper-not-ready-at-launch", not_ready[3])
         self.assertEqual(control, [True, True, True], "the same record with a ready helper is accepted")
+        self.assertEqual(self.r["notReadyFlag"], [False, False, False], "the not-ready flag, not the reason text, holds the criteria closed")
+
+    def test_a_helper_not_ready_at_launch_publishes_no_package_feed_values(self) -> None:
+        """opus H2: the late helper's load ran inside the window, so the feed fields are null with a per-field not-ready reason."""
+        self.assertEqual(self.r["notReadyFeed"][:6], [None] * 6)
+        self.assertEqual(self.r["notReadyFeed"][6:], [50.0, 62.5], "a ready helper still publishes the feed")
+        for f in ("pkgWattsMean", "pkgWattsMax", "pkgTempCMean", "pkgTempCMax", "pkgThrottledRows", "pkgTempCAtStart"):
+            self.assertIn(f"{f}=helper-not-ready-at-launch", self.r["notReady"][3])
+
+    def test_launch_readiness_rejection_survives_every_cleanup_outcome(self) -> None:
+        """sol r3 CP-01: the job's exact cleanup block (lifted from the generator) run against a helper process double that was not ready at the
+        measured launch, then the job's exact scalar line. A late helper that publishes a valid B2 record must never regain the criteria."""
+        driver = Path(self._tmp.name) / "cleanup-driver.ps1"
+        driver.write_text(LIFT + CLEANUP_DRIVER, encoding="ascii")
+        work = Path(self._tmp.name) / "cleanup"
+        work.mkdir(exist_ok=True)
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": str(work)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        first = {
+            "stop-timeout": "helper-not-ready-at-launch+helper-killed-after-stop-timeout",
+            "normal-exit": "helper-not-ready-at-launch",
+            "wait-exception": "helper-not-ready-at-launch",
+            "record-unparseable": "helper-not-ready-at-launch+helper-record-unparseable",
+            "record-missing": "helper-not-ready-at-launch",
+            "stop-timeout-record-unparseable": "helper-not-ready-at-launch+helper-killed-after-stop-timeout+helper-record-unparseable",
+        }
+        for case, why in first.items():
+            with self.subTest(case=case):
+                c = got[case]
+                self.assertEqual([c["topo"], c["bench"], c["load"]], [False, False, False], f"a not-ready helper regained a criterion: {c}")
+                self.assertEqual(c["helperWhy"], why, "the first reason is kept, a later cleanup reason is appended")
+                self.assertTrue(c["notReady"], c)
+                self.assertIn("corePartitionTopologyOk=helper-not-ready-at-launch", c["why"])
+                self.assertEqual(c["pkg"], [None] * 6, f"a not-ready helper published package-feed values: {c}")
+                self.assertIn("pkgWattsMean=helper-not-ready-at-launch", c["why"])
+        self.assertTrue(got["stop-timeout"]["killed"], "the stop-timeout double was killed (the branch under test ran)")
+        control = got["ready-stop-timeout-control"]
+        self.assertEqual([control["topo"], control["bench"], control["load"]], [True, True, True], f"the same late kill with a ready helper is accepted: {control}")
+        self.assertEqual(control["helperWhy"], "helper-killed-after-stop-timeout")
+        self.assertFalse(control["notReady"])
+        self.assertEqual(control["pkg"][:4], [50.0, 55.0, 75.0, 80.0], "a ready helper's window still carries the feed")
 
     def test_summary_scalars(self) -> None:
         b2 = self.r["b2"]

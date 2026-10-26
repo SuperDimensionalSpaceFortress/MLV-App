@@ -4401,8 +4401,16 @@ function Get-CorePartitionWorkerThreads([string]$LogText) {
     @{ value = [int]$ms[$ms.Count - 1].Groups[1].Value; why = $null }
 }
 
+# PURE. sol r3 CP-01: a helper reason is never replaced; a later one is appended to the first ('first+later').
+function Join-CorePartitionWhy([string]$First, [string]$Later) {
+    if (-not $First) { return $Later }
+    if (-not $Later) { return $First }
+    "$First+$Later"
+}
+
 # PURE. The summary scalars from the helper's record (or $null when it wrote none), the feed summary and the requested masks.
-function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$LoadMask, [int]$LoadThreads, $Workers, [string]$HelperWhy) {
+# $HelperNotReady (sol r3 CP-01) is the not-ready guard; it is a flag, so no change to the reason text can re-open the criteria.
+function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$LoadMask, [int]$LoadThreads, $Workers, [string]$HelperWhy, [bool]$HelperNotReady) {
     $why = [ordered]@{}
     $h = $Helper
     $topoOk = $false; $pMask = [int64]0; $eMask = [int64]0
@@ -4417,8 +4425,8 @@ function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$Loa
     if ($null -eq $first) { $why['appAffinityObserved'] = $(if ($null -eq $app) { 'app-not-seen' } else { 'app-affinity-unread' }) }
     elseif ($null -eq $last -or $last -eq $first) { $observed = Format-CorePartitionMask $first }
     else { $observed = (Format-CorePartitionMask $first) + '/' + (Format-CorePartitionMask $last) }
-    $notReady = ($HelperWhy -eq 'helper-not-ready-at-launch')
-    if ($notReady) { $topoOk = $false; $why['corePartitionTopologyOk'] = $HelperWhy }
+    $notReady = $HelperNotReady
+    if ($notReady) { $topoOk = $false; $why['corePartitionTopologyOk'] = $(if ($HelperWhy) { $HelperWhy } else { 'helper-not-ready-at-launch' }) }
     $benchApplied = (-not $notReady -and $BenchMask -ne 0 -and $null -ne $first -and $null -ne $last -and $first -eq $BenchMask -and $last -eq $BenchMask)
     $load = if ($null -ne $h) { $h.load } else { $null }
     $loadSec = if ($null -ne $load -and $null -ne $load.seconds) { [double]$load.seconds } else { 0.0 }
@@ -4431,6 +4439,12 @@ function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$Loa
     if ($null -eq $cs) { foreach ($f in @('pcoreMHzMean', 'ecoreMHzMean', 'pcoreParkedSampleFraction')) { $why[$f] = $(if (-not $topoOk) { 'topology-not-ok' } else { 'samples-missing' }) } }
     else { foreach ($f in @('pcoreMHzMean', 'ecoreMHzMean', 'pcoreParkedSampleFraction')) { if ($null -eq $cs.$f) { $why[$f] = 'no-app-samples' } } }
     foreach ($k in $Feed.reasons.Keys) { $why[$k] = $Feed.reasons[$k] }
+    # opus H2 (CORE-PARTITION-FEED-NOT-READY-REASON-1): a helper not ready at launch started its load inside the window, so no feed field is evidence.
+    $pkg = $Feed
+    if ($notReady) {
+        $pkg = @{}
+        foreach ($f in @('pkgWattsMean', 'pkgWattsMax', 'pkgTempCMean', 'pkgTempCMax', 'pkgThrottledRows', 'pkgTempCAtStart')) { $why[$f] = Join-CorePartitionWhy 'helper-not-ready-at-launch' $why[$f] }
+    }
     if ($null -eq $Workers.value) { $why['playbackWorkerThreads'] = $Workers.why }
     [ordered]@{
         corePartitionTelemetry = $true
@@ -4442,12 +4456,12 @@ function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$Loa
         partitionLoadThreads = $LoadThreads
         partitionLoadApplied = [bool]$loadApplied
         partitionLoadGBps = $gbps
-        pkgWattsMean = $Feed.pkgWattsMean
-        pkgWattsMax = $Feed.pkgWattsMax
-        pkgTempCMean = $Feed.pkgTempCMean
-        pkgTempCMax = $Feed.pkgTempCMax
-        pkgThrottledRows = $Feed.pkgThrottledRows
-        pkgTempCAtStart = $Feed.pkgTempCAtStart
+        pkgWattsMean = $pkg.pkgWattsMean
+        pkgWattsMax = $pkg.pkgWattsMax
+        pkgTempCMean = $pkg.pkgTempCMean
+        pkgTempCMax = $pkg.pkgTempCMax
+        pkgThrottledRows = $pkg.pkgThrottledRows
+        pkgTempCAtStart = $pkg.pkgTempCAtStart
         pcoreMHzMean = $(if ($null -ne $cs) { $cs.pcoreMHzMean } else { $null })
         ecoreMHzMean = $(if ($null -ne $cs) { $cs.ecoreMHzMean } else { $null })
         pcoreParkedSampleFraction = $(if ($null -ne $cs) { $cs.pcoreParkedSampleFraction } else { $null })
@@ -5209,7 +5223,7 @@ if ($CorePartitionTelemetry) {
     $cpHelperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cpHelperSource))
     if ($cpHelperEncoded.Length -gt 30000) { throw "CORE_PARTITION_HELPER_TOO_LONG the encoded helper is $($cpHelperEncoded.Length) chars (limit 30000, one command line)" }
     $cpHelperAffinity = if ($corePartitionArgs.load -ne 0) { $corePartitionArgs.load } else { $corePartitionArgs.helper }
-    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Get-CorePartitionScalars', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince') "`n"
+    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Join-CorePartitionWhy', 'Get-CorePartitionScalars', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince') "`n"
     $cpLaunchOld = @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
@@ -5234,6 +5248,7 @@ $cpJobFunctions
 $corePartitionErrors = [Collections.Generic.List[string]]::new()
 $corePartitionHelper = $null
 $corePartitionHelperWhy = $null
+$corePartitionHelperNotReady = $false
 $corePartitionJobProc = [Diagnostics.Process]::GetCurrentProcess()
 $corePartitionJob = [ordered]@{ affinityBefore = $null; affinityRequested = $(if ($CorePartitionBenchMask -ne 0) { Format-CorePartitionMask $CorePartitionBenchMask } else { $null }); affinityApplied = $null; affinityRestored = $null }
 $corePartitionStopFile = Join-Path $Work 'core-partition.stop'
@@ -5275,7 +5290,8 @@ try {
     $corePartitionErrors.Add("helper-start: $([string]$_.Exception.Message)")
 }
 # Adversary r2 A1: a helper that is not ready when the measured launch happens fails every telemetry criterion closed (its record cannot cover the window).
-if ($null -ne $corePartitionHelper -and -not $corePartitionHelperLaunch.ready) { $corePartitionHelperWhy = 'helper-not-ready-at-launch' }
+# sol r3 CP-01: the flag, not the reason text, carries it to the scalars, and every later helper reason is appended to this one.
+if ($null -ne $corePartitionHelper -and -not $corePartitionHelperLaunch.ready) { $corePartitionHelperNotReady = $true; $corePartitionHelperWhy = 'helper-not-ready-at-launch' }
 if ($CorePartitionBenchMask -ne 0) {
     try {
         $corePartitionJobProc.ProcessorAffinity = [IntPtr]$CorePartitionBenchMask
@@ -5318,15 +5334,15 @@ try {
         try { [void](Publish-AttrCudaText -Path $corePartitionStopFile -Value 'stop') } catch { $corePartitionErrors.Add("helper-stop-file: $([string]$_.Exception.Message)") }
         try {
             if (-not $corePartitionHelper.WaitForExit(20000)) {
-                $corePartitionHelperWhy = 'helper-killed-after-stop-timeout'
+                $corePartitionHelperWhy = Join-CorePartitionWhy $corePartitionHelperWhy 'helper-killed-after-stop-timeout'
                 $corePartitionHelper.Kill()
                 [void]$corePartitionHelper.WaitForExit(5000)
             }
         } catch { $corePartitionErrors.Add("helper-stop: $([string]$_.Exception.Message)") }
-    } else { $corePartitionHelperWhy = 'helper-not-started' }
+    } else { $corePartitionHelperWhy = Join-CorePartitionWhy $corePartitionHelperWhy 'helper-not-started' }
     $corePartitionHelperRecord = $null
     if (Test-Path -LiteralPath $corePartitionHelperOut -PathType Leaf) {
-        try { $corePartitionHelperRecord = [IO.File]::ReadAllText($corePartitionHelperOut) | ConvertFrom-Json } catch { $corePartitionHelperWhy = 'helper-record-unparseable' }
+        try { $corePartitionHelperRecord = [IO.File]::ReadAllText($corePartitionHelperOut) | ConvertFrom-Json } catch { $corePartitionHelperWhy = Join-CorePartitionWhy $corePartitionHelperWhy 'helper-record-unparseable' }
     } elseif (-not $corePartitionHelperWhy) { $corePartitionHelperWhy = 'helper-record-missing' }
     $corePartitionFeedSummary = Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120
     try {
@@ -5337,6 +5353,7 @@ try {
             job = $corePartitionJob
             helperLaunch = $corePartitionHelperLaunch
             helperWhy = $corePartitionHelperWhy
+            helperNotReady = $corePartitionHelperNotReady
             helper = $corePartitionHelperRecord
             feed = [ordered]@{
                 path = $corePartitionFeedPath
@@ -5358,7 +5375,7 @@ Write-JobTrace "step smoke-launch done rc=$smokeRc"
     $text = Edit-DualVenueTemplate $text $cpLaunchOld ($cpPre + "`n" + $cpPost)
     $cpMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
     $text = Edit-DualVenueTemplate $text $cpMetricsAnchor ($cpOpen + "`n" + @'
-$corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy
+$corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady
 '@ + "`n" + $cpClose + "`n" + $cpMetricsAnchor)
     $cpMetricsAt = $text.IndexOf($cpMetricsAnchor, [StringComparison]::Ordinal)
     $cpKeysAnchor = '    cpuFrames = $gpuSummary.cpuFrames' + $cpEol
