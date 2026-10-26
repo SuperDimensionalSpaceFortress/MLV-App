@@ -718,8 +718,8 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
     extractor call reads, so a same-named helper in another module could be scanned in its place.
     This is a regression tripwire, not a security boundary (see the scan's header).
 
-    Three scans cover every case (one generator holds many call sites, one helper name per case), so the class
-    costs three pwsh starts, not one per test: the Windows shard budget has no slack for more.
+    Five scans cover every case (one generator holds many call sites, one helper name per case), so the class
+    costs five pwsh starts, not one per test: the Windows shard budget has no slack for more.
     """
 
     RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
@@ -849,10 +849,15 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         # r3 (Dot B1): the colon form `-Name:Join-Path` keeps the name in the parameter's own Argument, so a scan that read
         # only the command's string elements never saw it. One scan covers every spelling, computed name and provider route.
         cls.alias = cls._scan("alias", [
-            ("Clean.psm1", [("DotF", cls.CLEAN)]),
-            ("Dirty.psm1", [("DotF", cls.RAW_WRITE)]),
+            ("Clean.psm1", [(n, cls.CLEAN) for n in ("DotF", "QualF", "DriveF", "RootF")]),
+            ("Dirty.psm1", [(n, cls.RAW_WRITE) for n in ("DotF", "QualF", "DriveF", "RootF")]),
         ], ["Clean.psm1", "Dirty.psm1"], [
             "Get-AttrCudaEmbeddedFunctionSource -Name 'DotF' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')",
+            # Third-pass adversary A2 / A3: a module-qualified extractor runs another module's extractor, and a drive-relative
+            # or root-relative literal is "rooted" yet resolves against the working directory of whoever runs it.
+            "Dirty\\Get-AttrCudaEmbeddedFunctionSource -Name 'QualF'",
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'DriveF' -ModulePath 'C:Clean.psm1'",
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'RootF' -ModulePath '\\Clean.psm1'",
         ], generator_preamble=cls.ALIAS_PREAMBLE, template_extra=cls.ALIAS_TEMPLATE)
 
     # Every line is its own finding, found again by its exact text. Redirect is the Dot counterexample's replacement command.
@@ -875,6 +880,9 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         'New-Alias "$aliasPrefix-Path" Redirect',
         "Set-Alias -Value:Redirect $aliasName",
         "Set-Alias @aliasSplat",
+        # Adversary A1: -vb / -db are switches, so the computed name after them is still the alias name.
+        "Set-Alias -vb $aliasVb Redirect",
+        "New-Alias -db $aliasDb Redirect",
     )
     # Other routes to a command called Join-Path / Split-Path / New-Object: the alias: and function: drives.
     PROVIDER_ROUTES = (
@@ -895,7 +903,9 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
     ALIAS_PREAMBLE = ("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
                       + "".join(f"{line}\n" for line in ALIAS_SHADOWS + ALIAS_COMPUTED + PROVIDER_ROUTES + ALIAS_CONTROLS))
     # The template is held to the same rule; only the colon-form lines (the ones the old scan missed) go in it.
-    ALIAS_TEMPLATE = "Set-Alias -Name:Join-Path -Value:Redirect\nNew-Alias -N:'New-Object' -Value:Redirect\nSet-Alias -Name:$templateName -Value:Redirect\nSet-Alias -Name:Get-Item -Value:Get-Date\n"
+    # Advisory A4 (same class): a mutator's positional source path after -vb must not be read as that switch's value.
+    ALIAS_TEMPLATE = ("Set-Alias -Name:Join-Path -Value:Redirect\nNew-Alias -N:'New-Object' -Value:Redirect\nSet-Alias -Name:$templateName -Value:Redirect\n"
+                      "Set-Alias -Name:Get-Item -Value:Get-Date\nExpand-Archive -DestinationPath $Work -vb 'C:\\archive.zip'\n")
 
     @classmethod
     def _scan(cls, label: str, modules: list, on_list: list, calls: list, *, extra_files=(), template_extra: str = "", raw_modules=None,
@@ -1054,6 +1064,20 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         for line in ("Set-Alias -Name:Join-Path -Value:Redirect", "New-Alias -N:'New-Object' -Value:Redirect", "Set-Alias -Name:$templateName -Value:Redirect"):
             self.assertIn(line, shadows, f"template line `{line}` was not flagged\n" + json.dumps(self.alias["violations"], indent=2))
         self.assertNotIn("Set-Alias -Name:Get-Item -Value:Get-Date", shadows)
+
+    def test_b1_a_module_qualified_extractor_and_a_drive_or_root_relative_literal_module_path_are_findings(self) -> None:
+        for needle, reason in (("Dirty\\Get-AttrCudaEmbeddedFunctionSource", "module-qualified"),
+                               ("'DriveF' -ModulePath 'C:Clean.psm1'", "relative"),
+                               ("'RootF' -ModulePath '\\Clean.psm1'", "relative")):
+            found = self.call_findings(self.alias, needle)
+            self.assertEqual(len(found), 1, f"{needle}\n" + describe(self.alias["splicedViolations"]))
+            self.assertIn(reason, found[0]["reason"], needle)
+        for name in ("QualF", "DriveF", "RootF"):
+            self.assertEqual(self.modules_of(self.alias, name), [], f"{name}: a module was scanned in place of the one the call reads")
+
+    def test_b1_a_mutators_positional_path_after_the_common_switch_alias_vb_is_a_finding(self) -> None:
+        texts = [v["text"] for v in self.alias["violations"]]
+        self.assertTrue([t for t in texts if t.startswith("Expand-Archive") and "-vb" in t], json.dumps(self.alias["violations"], indent=2))
 
     def test_l1_template_parameters_named_by_alias_or_abbreviation_are_still_judged(self) -> None:
         # Advisory A8, same class as A3: -RSO / -RSE are aliases of Start-Process -RedirectStandardOutput / -Error, -N: abbreviates -Name.

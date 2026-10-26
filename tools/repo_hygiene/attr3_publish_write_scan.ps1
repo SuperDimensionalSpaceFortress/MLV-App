@@ -275,7 +275,8 @@ function Get-AliasNameArguments($Command) {
     # What Set-Alias / New-Alias binds to -Name: every -Name argument (any unique prefix, separated or colon form), or,
     # when none, the first positional element -- skipping the value each preceding parameter consumes. A splat is returned
     # as itself (it can carry a name the scan cannot read).
-    $switches = @('PassThru', 'Force', 'Confirm', 'WhatIf', 'Verbose', 'Debug')
+    # -vb and -db are the common switches' aliases; read as value parameters they would swallow the name that follows.
+    $switches = @('PassThru', 'Force', 'Confirm', 'WhatIf', 'Verbose', 'Debug', 'vb', 'db')
     $arguments = [System.Collections.Generic.List[object]]::new()
     $elements = $Command.CommandElements
     foreach ($element in @($elements | Select-Object -Skip 1)) {
@@ -390,7 +391,7 @@ function Get-PositionalCount($Command, [string[]]$SwitchNames = @()) {
     # as positional -- conservative for the mutators, which never need a positional argument.
     # -SwitchNames replaces the mutators' list with the switches of another command (the extractor's own are
     # Verbose and Debug), because a short prefix such as -N would otherwise be read as -NoNewWindow.
-    $switchNames = if ($SwitchNames.Count -gt 0) { $SwitchNames } else { @('Force', 'NoTypeInformation', 'PassThru', 'Wait', 'NoNewWindow', 'Recurse', 'Confirm', 'WhatIf', 'Append', 'NoClobber') }
+    $switchNames = if ($SwitchNames.Count -gt 0) { $SwitchNames } else { @('Force', 'NoTypeInformation', 'PassThru', 'Wait', 'NoNewWindow', 'Recurse', 'Confirm', 'WhatIf', 'Append', 'NoClobber', 'Verbose', 'Debug', 'vb', 'db') }
     $elements = $Command.CommandElements
     $count = 0
     for ($i = 1; $i -lt $elements.Count; $i++) {
@@ -863,7 +864,9 @@ function Get-SpliceModuleBinding($Call, [string]$SourceDir) {
     $child = $null
     if ($node -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
         if ([string]::IsNullOrWhiteSpace([string]$node.Value)) { return [pscustomobject]@{ kind = 'default'; path = ''; reason = '' } }
-        if (-not [IO.Path]::IsPathRooted([string]$node.Value)) {
+        # Fully qualified, not merely rooted: 'C:Clean.psm1' (drive-relative) and '\Clean.psm1' (root-relative) are rooted
+        # yet resolve against the working directory of whoever runs them.
+        if (-not [IO.Path]::IsPathFullyQualified([string]$node.Value)) {
             return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = '-ModulePath is a relative literal path, which depends on the working directory' }
         }
         try { return [pscustomobject]@{ kind = 'path'; path = [IO.Path]::GetFullPath([string]$node.Value); reason = '' } }
@@ -933,7 +936,9 @@ function Get-SpliceCallSites([string]$Path) {
             Add-SpliceFinding $source $call.Extent.StartLineNumber '' $text 'the -Name list is not a literal list of function names, so the spliced bodies cannot be enumerated'
             continue
         }
-        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; bind = (Get-SpliceModuleBinding $call $sourceDir) }
+        $callName = $call.GetCommandName()
+        $qualifier = if ($callName.Contains('\')) { $callName.Substring(0, $callName.LastIndexOf('\')) } else { '' }
+        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; qualifier = $qualifier; bind = (Get-SpliceModuleBinding $call $sourceDir) }
     }
 }
 
@@ -968,6 +973,13 @@ if ($SpliceSource.Count -gt 0) {
                     $candidates = @($moduleTexts.Keys | Where-Object { $moduleFullPaths[$_] -ieq $site.bind.path })
                     if ($candidates.Count -ne 1) { $bindingFailure = "-ModulePath names '$($site.bind.path)', which is not a scanner -ModulePath module" }
                 }
+            }
+            # <Module>\Get-AttrCudaEmbeddedFunctionSource runs THAT module's extractor. Only the real extractor module
+            # (AttrCudaArtifacts) or the one module this call was bound to is the extractor this scan reads; any other
+            # qualifier may run an extractor, and read a module, the scan never saw.
+            if (-not $bindingFailure -and $site.qualifier -and $site.qualifier -ine 'AttrCudaArtifacts' -and
+                -not ($candidates.Count -eq 1 -and [IO.Path]::GetFileNameWithoutExtension($candidates[0]) -ieq $site.qualifier)) {
+                $bindingFailure = "the call is module-qualified by '$($site.qualifier)', which is not the module this scan binds"
             }
             if ($bindingFailure) {
                 Add-SpliceFinding $site.source $site.line '' $site.text "the extractor module this call reads cannot be bound: $bindingFailure"
