@@ -204,6 +204,17 @@ function L([string]$Message) {
     Write-Output $line
 }
 
+# r6 (Dot r5 B5): the log is best effort wherever a mandatory step (keeper stop, claim release, receipt, summary, exit code) follows it. A batch.log another process holds
+# exclusively must not skip them: the failure is swallowed, counted (logWriteFailures in the receipt and the summary), said once on stderr, and the line still reaches stdout.
+$script:logWriteFailures = 0
+function LogBest([string]$Message) {
+    try { L $Message } catch {
+        $script:logWriteFailures++
+        if ($script:logWriteFailures -eq 1) { try { [Console]::Error.WriteLine("BATCH_LOG_FAILED the batch log cannot be written ($($_.Exception.Message -replace '\s+', ' ')); later failures are counted in the batch receipt as logWriteFailures") } catch { } }
+        try { Write-Output "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message" } catch { }
+    }
+}
+
 function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
     # LEASE-BATCH-MULTI-BUILD-1 (item 9a): a -LegPlan item that cannot run refuses the WHOLE plan before any claim, open or lease. Nothing was submitted.
     $line = "LEG_PLAN_REFUSED reason=$Reason$(if ($Item -gt 0) { " item=$Item" }) $Detail"
@@ -484,7 +495,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     $claim = $null; $lastHolder = ''
     while ($true) {
         $req = Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir
-        foreach ($bk in $req.broken) { L "CLAIM_STALE_BROKEN venue=$Venue reason=$($bk.reason) ownerPid=$($bk.claim.ownerPid) runDir=$($bk.claim.runDir) expiresUtc=$($bk.claim.expiresUtc)" }
+        foreach ($bk in $req.broken) { LogBest "CLAIM_STALE_BROKEN venue=$Venue reason=$($bk.reason) ownerPid=$($bk.claim.ownerPid) runDir=$($bk.claim.runDir) expiresUtc=$($bk.claim.expiresUtc)" }
         if ($req.granted) { $claim = $req.claim; break }
         $holder = $(if ($req.claim) { "pid=$($req.claim.ownerPid) runDir=$($req.claim.runDir) purpose=$($req.claim.purpose)" } else { $req.state })
         if ($holder -cne $lastHolder) { L "CLAIM_HELD batch=$batchNo state=$($req.state) holder $holder -> wait"; $lastHolder = $holder }
@@ -752,7 +763,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $inFlightLeg
             }
         } catch { }
-        try { L "BATCH_ERROR batch=$batchNo $($b.endDetail)" } catch { }   # a batch.log another process holds must not turn the typed stop back into an unhandled throw
+        LogBest "BATCH_ERROR batch=$batchNo $($b.endDetail)"   # a batch.log another process holds must not turn the typed stop back into an unhandled throw
     } finally {
         # (4) END: release the lease now (a light close job), read the agent's receipt for it, release the claim, write the batch receipt.
         # r3 (sol r2 B1): an open with no result in hand (um-run gave up on it, the deadline came while its result was awaited, or this batch threw) may still
@@ -763,7 +774,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $openSent = ($b.openJobId -and $openSubmitted)
         if ($openSent -and ($null -eq $op -or ($op.outcome -cne 'RECEIPT' -and $op.outcome -cne 'RECEIPT_BY_NAME' -and $op.outcome -cne 'RETRACTED'))) {
             $cx = Request-VenueJobCancel -AgentShare $AgentShare -JobId $b.openJobId
-            L "BATCH_OPEN_CANCEL batch=$batchNo job=$($b.openJobId) requested=$($cx.state)$(if ($cx.error) { " error=$($cx.error)" }) (read by name for up to ${CancelReconcileSec}s before the lease is closed and the claim released)"
+            LogBest "BATCH_OPEN_CANCEL batch=$batchNo job=$($b.openJobId) requested=$($cx.state)$(if ($cx.error) { " error=$($cx.error)" }) (read by name for up to ${CancelReconcileSec}s before the lease is closed and the claim released)"
             $tc = [DateTime]::UtcNow; $cPoll = [Math]::Min($ClaimPollSec, 5); $cr = $null
             while ($true) {
                 $cr = Get-VenueJobResult -AgentShare $AgentShare -JobId $b.openJobId
@@ -777,14 +788,14 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 elseif ($null -ne $ca -and $null -ne $ca.leaseBatch -and $ca.leaseBatch.leaseId) { 'RAN_BEFORE_CANCEL' } else { 'ENDED' })
             if ($cState -ceq 'RAN_BEFORE_CANCEL' -and -not $b.leaseId) { $b.leaseId = [string]$ca.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc }
             $b.openCancel = [ordered]@{ requested = $cx.state; state = $cState; resultState = $cr.state; resultLabel = $(if ($null -ne $ca) { [string]$ca.label } else { $null }); waitedSec = [int]([DateTime]::UtcNow - $tc).TotalSeconds; error = $(if ($cx.error) { $cx.error } else { $cr.error }) }
-            L "BATCH_OPEN_RECONCILED batch=$batchNo state=$cState result=$($cr.state) label=$($b.openCancel.resultLabel) requested=$($cx.state) waitedSec=$($b.openCancel.waitedSec)"
+            LogBest "BATCH_OPEN_RECONCILED batch=$batchNo state=$cState result=$($cr.state) label=$($b.openCancel.resultLabel) requested=$($cx.state) waitedSec=$($b.openCancel.waitedSec)"
             if ($cState -ceq 'UNRECONCILED') { $stopReason = 'OPEN_CANCEL_UNRECONCILED'; $exitCode = 11 }
         }
         # r5: this run lets go of the open here. Reconciled: its sidecar goes. Unreconciled (or the batch threw first): it is rewritten lapsed and left, so an agent
         # still holding the open ends it at its next check. Idempotent when the open's result was in hand already.
         if ($null -ne $openLive) {
             $b.openLiveness = Stop-VenueJobLiveness $openLive -Remove:($null -ne $cr -and $cr.state -ceq 'FOUND')
-            L "BATCH_OPEN_LIVENESS_END batch=$batchNo job=$($b.openJobId) end=$($b.openLiveness.end) writes=$($b.openLiveness.writes) writeFailures=$($b.openLiveness.writeFailures) lastAliveUntilUtc=$($b.openLiveness.lastAliveUntilUtc)"
+            LogBest "BATCH_OPEN_LIVENESS_END batch=$batchNo job=$($b.openJobId) end=$($b.openLiveness.end) writes=$($b.openLiveness.writes) writeFailures=$($b.openLiveness.writeFailures) lastAliveUntilUtc=$($b.openLiveness.lastAliveUntilUtc)"
         }
         if ($openSent) {
             $b.closeJobId = "lease-batch-close-$stamp-lb$token"
@@ -801,24 +812,27 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             elseif ($null -ne $b.openCancel -and $b.openCancel.state -ceq 'UNRECONCILED') { $n0 = [DateTime]::UtcNow; $row = [ordered]@{ venue = $Venue; token = $token; leaseId = $null; startUtc = $n0.ToString('o'); endUtc = $n0.AddSeconds($LeaseCapSec).ToString('o'); runDir = $RunDir; basis = 'open-unreconciled' } }
             if ($null -ne $row) {
                 $b.ledger = $row
-                try { Add-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -Row ([pscustomobject]$row) } catch { L "LEDGER_WRITE_FAILED batch=$batchNo $($_.Exception.Message)" }
+                try { Add-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -Row ([pscustomobject]$row) } catch { LogBest "LEDGER_WRITE_FAILED batch=$batchNo $($_.Exception.Message)" }
                 $leases.Add([pscustomobject]@{ startUtc = $row.startUtc; endUtc = $row.endUtc; leaseId = $row.leaseId })
             }
         }
         $ckInTime = Stop-VenueKeeper -Keeper $claimKeeper
         $cks = $claimKeeper.state
         $b.claimRenew = [ordered]@{ renewSec = $ClaimRenewSec; ttlSec = $ClaimTtlSec; renews = $cks.renews; errors = $cks.errors; lastError = $cks.lastError; lost = $cks.lost; lastExpiresUtc = $cks.expiresUtc; stoppedInTime = $ckInTime }
-        L "CLAIM_RENEW batch=$batchNo renews=$($cks.renews) errors=$($cks.errors) lost=$(if ($cks.lost) { $cks.lost } else { 'no' }) lastExpiresUtc=$($cks.expiresUtc)"
-        L "CLAIM_RELEASED batch=$batchNo result=$(Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir)"
+        LogBest "CLAIM_RENEW batch=$batchNo renews=$($cks.renews) errors=$($cks.errors) lost=$(if ($cks.lost) { $cks.lost } else { 'no' }) lastExpiresUtc=$($cks.expiresUtc)"
+        # r6 (Dot r5 B5): the release no longer follows a log call that can throw, and a release that throws is a result, not a skipped receipt.
+        $relResult = try { Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir } catch { "ERROR: $($_.Exception.Message -replace '\s+', ' ')" }
+        LogBest "CLAIM_RELEASED batch=$batchNo result=$relResult"
+        $b.logWriteFailures = $script:logWriteFailures
         Write-BatchReceipt $b
-        L "BATCH_END batch=$batchNo token=$token lease=$($b.leaseId) reason=$($b.endReason) attempted=$($b.legsAttempted) ran=$($b.legsRan) counted=$($b.legsCounted) retries=$($b.retries) probeRetries=$($b.probeRetries) legRetries=$($b.legRetries) refusals=$(@($b.refusals).Count) exit75=$($b.exit75Refusals)/$($b.exit75Class) renewOkMaxGapSec=$($b.renewOkMaxGapSec) preOpenWait=$($b.preOpenWait.reason):$($b.preOpenWait.waitSec)s close=$($b.closeOutcome) agentEnd=$(if ($b.agent) { $b.agent.endReason })$(if ($b.endDetail) { " detail=$($b.endDetail)" })"
+        LogBest "BATCH_END batch=$batchNo token=$token lease=$($b.leaseId) reason=$($b.endReason) attempted=$($b.legsAttempted) ran=$($b.legsRan) counted=$($b.legsCounted) retries=$($b.retries) probeRetries=$($b.probeRetries) legRetries=$($b.legRetries) refusals=$(@($b.refusals).Count) exit75=$($b.exit75Refusals)/$($b.exit75Class) renewOkMaxGapSec=$($b.renewOkMaxGapSec) preOpenWait=$($b.preOpenWait.reason):$($b.preOpenWait.waitSec)s close=$($b.closeOutcome) agentEnd=$(if ($b.agent) { $b.agent.endReason })$(if ($b.endDetail) { " detail=$($b.endDetail)" })"
     }
 }
-foreach ($leg in $pending) { Add-Result $leg 'NOT_RUN' @{ verdict = $(if ($stopReason) { $stopReason } else { 'NOT_RUN' }); reason = 'run-stopped' }; L "LEG $($leg.name) NOT_RUN $stopReason reason=run-stopped" }
+foreach ($leg in $pending) { Add-Result $leg 'NOT_RUN' @{ verdict = $(if ($stopReason) { $stopReason } else { 'NOT_RUN' }); reason = 'run-stopped' }; LogBest "LEG $($leg.name) NOT_RUN $stopReason reason=run-stopped" }
 
 $summary = [ordered]@{
     schema = 'mlv-app/venue-lease-batch-result/v1'; venue = $Venue; runDir = $RunDir; startedUtc = $t0.ToString('o'); finishedUtc = [DateTime]::UtcNow.ToString('o')
-    exitCode = $exitCode; stopReason = $stopReason; capsSource = $capsReceipt.capsSource; legs = @($results)
+    exitCode = $exitCode; stopReason = $stopReason; capsSource = $capsReceipt.capsSource; logWriteFailures = $script:logWriteFailures; legs = @($results)
     ran = @($results | Where-Object { $_.status -ceq 'RAN' }).Count; counted = @($results | Where-Object { $_.status -ceq 'RAN' -and $_.counted }).Count
     failed = @($results | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($results | Where-Object { $_.status -ceq 'NOT_RUN' }).Count
     leaseExpired = @($results | Where-Object { $_.status -ceq 'LEASE_EXPIRED' }).Count
@@ -826,7 +840,7 @@ $summary = [ordered]@{
 }
 if ($legPlanMode) { $summary.legPlan = [ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
 $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-Add-Content -LiteralPath $batchLog -Value $resultLine
+try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch { }   # r6 (Dot r5 B5): the result line on stdout and the typed exit code never depend on batch.log
 Write-Output $resultLine
 Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned at its timeout would otherwise keep this process alive until it ends
 exit $exitCode

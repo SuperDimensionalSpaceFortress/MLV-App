@@ -1902,6 +1902,88 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         [b] = self.batches()
         self.assertEqual(b["endReason"], "BATCH_ERROR")
 
+    def _lock_log_once_the_claim_is_taken(self, log: Path, give_up_s: float = 120) -> tuple[threading.Event, threading.Thread]:
+        """Take `log` with share mode 0 as soon as the venue claim file exists, and hold it until the returned event is set. Windows only (CreateFileW)."""
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        done = threading.Event()
+
+        def hold() -> None:
+            end = time.monotonic() + give_up_s
+            while not done.is_set() and time.monotonic() < end:
+                if self.claim_path.exists() and log.exists():
+                    h = k32.CreateFileW(str(log), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
+                    if h != wintypes.HANDLE(-1).value:
+                        done.wait(give_up_s)
+                        k32.CloseHandle(h)
+                        return
+                time.sleep(0.02)
+
+        t = threading.Thread(target=hold, daemon=True)
+        t.start()
+        return done, t
+
+    def test_r6_b5_a_batch_log_another_process_holds_after_the_claim_cannot_skip_the_release_the_receipt_or_the_summary(self) -> None:
+        # Dot r5 B5: the finally logged CLAIM_RENEW before Release-VenueClaim; with batch.log held exclusively after the claim was taken, that log call threw out of the
+        # finally, so the claim stayed, no receipt or summary was written and the typed exit 12 was lost (an unhandled exit 1). Every mandatory step runs, logging or not.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "batch.log").write_text("", encoding="utf-8")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        done, t = self._lock_log_once_the_claim_is_taken(self.run_dir / "batch.log")
+        t0 = time.monotonic()
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+        except subprocess.TimeoutExpired as ex:
+            self.fail(f"the process did not end within 90 s: {ex.stdout!r}")
+        finally:
+            elapsed = time.monotonic() - t0
+            done.set()
+            t.join(5)
+        self.assertLess(elapsed, 60, "bounded: the lock must not stretch the run")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        self.assertEqual(self.kinds(), [], "no open was submitted")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
+        self.assertEqual(res["ran"], 0)
+        [b] = self.batches()
+        self.assertEqual(b["endReason"], "BATCH_ERROR")
+        self.assertGreaterEqual(b["logWriteFailures"], 1, "the swallowed logging failures are recorded in the receipt")
+        self.assertIn("BATCH_LOG_FAILED", r.stderr)
+
+    def test_r6_b5_sibling_a_log_failure_right_after_a_stale_claim_is_broken_does_not_leave_the_new_claim_behind(self) -> None:
+        # B5's class: Request-VenueClaim had granted the claim when CLAIM_STALE_BROKEN was logged, and that line sat outside the try, so a log failure there left the new
+        # claim (and no keeper yet) behind with no release. The line is best effort now; the batch carries on and ends normally. The failure is injected into a copy of the runner.
+        self.claims.mkdir(parents=True, exist_ok=True)
+        seed = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\dead-run' -Purpose dead -TtlSec 3600 -ClaimDir '{self.claims}' -OwnerPid {os.getpid()}\n"
+                "$r.granted\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", seed], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
+        # the owner is gone (a pid no process has): the next claim request breaks it as dead-pid, the way the STEAL fake leaves a foreign claim
+        self.claim_path.write_text(re.sub(r'"ownerPid":\s*\d+', '"ownerPid":99999999', self.claim_path.read_text(encoding="utf-8")), encoding="utf-8")
+        tree = self.case / "tree" / "tools" / "profiling"
+        shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
+        (tree / "bachelor").mkdir()
+        shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
+        runner = tree / "dual-venue" / RUNNER.name
+        text = runner.read_text(encoding="utf-8")
+        anchor = "function L([string]$Message) {\n"
+        self.assertEqual(text.count(anchor), 1, "the log function moved: update this fixture")
+        runner.write_text(text.replace(anchor, anchor + "    if ($Message -like 'CLAIM_STALE_BROKEN*') { throw 'simulated log failure' }\n"), encoding="utf-8")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["notRun"]), (4, 0))
+        self.assertIn("BATCH_LOG_FAILED", r.stderr)
+
     def test_r5_adv_a1_a_throw_after_a_leg_ran_does_not_record_that_leg_as_not_run(self) -> None:
         # adversary r5 A1: the new batch catch left the leg whose child had completed (its output file could not be written) in pending, and the summary then said
         # NOT_RUN for a leg that ran. The leg is recorded LEG_FAILED / reason BATCH_ERROR (its result is unknown); only the legs never started are NOT_RUN.
