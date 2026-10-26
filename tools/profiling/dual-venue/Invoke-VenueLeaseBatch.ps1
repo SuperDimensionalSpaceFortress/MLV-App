@@ -89,13 +89,14 @@
 #      a. EVERY item is validated BEFORE any claim or lease: the hex patterns of the scalar form, backend, arm, the leg spec found, and its build STAGED on the
 #         venue with exactly that manifest (Get-VenueStagedBuildManifest, the file Invoke-VenueLeg hashes). One bad item refuses the whole plan on stderr,
 #         BATCH_USAGE LEG_PLAN_REFUSED reason=<BAD_ITEM_SHAPE | BAD_SOURCE_COMMIT | BAD_MANIFEST_SHA256 | BAD_BACKEND | BAD_ARM | LEG_SPEC_MISSING | BUILD_NOT_STAGED |
-#         BUILD_MANIFEST_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID> item=<n> (or LEG_PLAN_UNREADABLE), exit 2: nothing is submitted, so no lease ever fails
-#         halfway on a build. A spec that is not a mlv-app/dual-venue-leg/v1 spec, or does not list the item's backend, is refused here (LEG_SPEC_INVALID, BAD_BACKEND)
+#         BUILD_MANIFEST_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
+#         halfway on a build. A spec that is not a mlv-app/dual-venue-leg/v1 spec, does not list the item's backend, or has a field Invoke-VenueLeg casts or validates
+#         (playSeconds, visualCapture and its opt-out reason, scaleFactor, acceptedEffectiveScale) it would throw on, is refused here (LEG_SPEC_INVALID, BAD_BACKEND)
 #         because Invoke-VenueLeg would throw on it only after the lease is open.
 #      b. The legs run in plan order (-PlanOrder AsGiven), or with the arms INTERLEAVED, A B A B (-PlanOrder Interleave, Get-VenueInterleavedLegPlan), so lease
 #         position and venue heat fall on every arm alike. Per-leg budget, re-check, claim loss and deadline handling are the scalar form's, leg by leg.
 #      c. Each leg process gets its own -SourceCommit / -BuildManifestSha256 / -Backend; each batch leg row and run result carries name, arm, backend, sourceCommit
-#         and buildManifestSha256; the LEG ... RUN line names them; <RunDir>\leg-plan.json keeps the validated plan in run order and each build's staged state.
+#         and buildManifestSha256; the LEG ... RUN line names them; <RunDir>\leg-plan.json (written once the claim is held) keeps the validated plan in run order and each build's staged state.
 # It changes nothing on Bachelor: not heavy-slot.py's caps, not its lease file, not the quiet threshold. A batch run needs the lease-batch agent deployed.
 #
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeaseBatch.ps1 -LegSpec a.json,b.json -Backend cpu -RunDir <rd> `
@@ -215,7 +216,8 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
 function Resolve-LegSpecPath([string]$Ref, [string]$BesideDir) {
     # a leg spec as given, then beside the plan file (-LegPlan only), then legs\<name>; $null when none is a file
     foreach ($c in @($Ref, $(if ($BesideDir -and -not [IO.Path]::IsPathRooted($Ref)) { Join-Path $BesideDir $Ref }), (Join-Path $here "legs\$Ref"))) {
-        if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return (Resolve-Path -LiteralPath $c).Path }
+        # a candidate the file system cannot probe (a NUL in the name, sol r3 second pass A2) is not a file
+        try { if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return (Resolve-Path -LiteralPath $c).Path } } catch { }
     }
     $null
 }
@@ -227,13 +229,21 @@ function Get-LegSpecId([string]$Path) {
     $legId
 }
 
-function Get-LegSpecBackendRefusal([string]$Path, [string]$Backend) {
+function Get-LegSpecRefusal([string]$Path, [string]$Backend) {
     # sol r3 A4: the refusal Invoke-VenueLeg would throw (DVE_LEG_SPEC_INVALID) AFTER the lease is open, found before it. '' when the leg can take this backend.
     # Same reads as Invoke-VenueLeg: the file's bytes as UTF-8, ConvertFrom-Json, the schema, then the backend against the spec's own list.
+    # sol r3 second pass A1: then every spec field the leg process casts or validates before it submits anything (playSeconds, visualCapture and its opt-out
+    # reason, scaleFactor and acceptedEffectiveScale, displayMode), by calling the very functions it calls, so the two cannot drift.
     $spec = try { [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json } catch { $null }
     if ($null -eq $spec -or $spec -isnot [System.Management.Automation.PSCustomObject]) { return 'LEG_SPEC_INVALID', "'$Path' is not a JSON object" }
     if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { return 'LEG_SPEC_INVALID', "'$Path' schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
     if ($Backend -notin @($spec.backends)) { return 'BAD_BACKEND', "backend '$Backend' is not one of this leg's backends ($(@($spec.backends) -join ', ')) in '$Path'" }
+    try {
+        if ($null -ne $spec.PSObject.Properties['playSeconds']) { $null = [int]$spec.playSeconds }
+        $null = Get-DvVisualCaptureRequest -Spec $spec
+        $null = Get-DvScaleEvidence -Spec $spec -Backend $Backend -LogText $null
+        $null = Get-DvDisplayEvidence -Spec $spec -LogText $null
+    } catch { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $($_.Exception.Message -replace '\s+', ' ')" }
     return '', ''
 }
 
@@ -242,54 +252,59 @@ $plan = [System.Collections.Generic.List[object]]::new()
 $planRecord = $null
 if ($legPlanMode) {
     # LEASE-BATCH-MULTI-BUILD-1 (item 9): read the plan, validate EVERY item (shape first, then each build staged with that manifest), then order it.
-    $planPath = $(if (Test-Path -LiteralPath $LegPlan -PathType Leaf) { (Resolve-Path -LiteralPath $LegPlan).Path } else { $null })
-    if (-not $planPath) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "no plan file at '$LegPlan'" }
-    $doc = try { [IO.File]::ReadAllText($planPath) | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
-    # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
-    $rawItems = $null
-    if ($doc -is [array]) { $rawItems = $doc }
-    elseif ($doc -is [System.Management.Automation.PSCustomObject] -and $doc.PSObject.Properties['legs']) {
-        if ($doc.PSObject.Properties['schema'] -and [string]$doc.schema -cne 'mlv-app/venue-lease-leg-plan/v1') { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "schema '$($doc.schema)' is not mlv-app/venue-lease-leg-plan/v1" }
-        if ($doc.legs -isnot [array]) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'legs' in '$planPath' is not an array (a single leg is a one-item array)" }
-        $rawItems = $doc.legs
+    try {
+        Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force   # the leg process's own spec predicates, run in preflight (Get-LegSpecRefusal)
+        $planPath = $(if (Test-Path -LiteralPath $LegPlan -PathType Leaf) { (Resolve-Path -LiteralPath $LegPlan).Path } else { $null })
+        if (-not $planPath) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "no plan file at '$LegPlan'" }
+        $doc = try { [IO.File]::ReadAllText($planPath) | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
+        # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
+        $rawItems = $null
+        if ($doc -is [array]) { $rawItems = $doc }
+        elseif ($doc -is [System.Management.Automation.PSCustomObject] -and $doc.PSObject.Properties['legs']) {
+            if ($doc.PSObject.Properties['schema'] -and [string]$doc.schema -cne 'mlv-app/venue-lease-leg-plan/v1') { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "schema '$($doc.schema)' is not mlv-app/venue-lease-leg-plan/v1" }
+            if ($doc.legs -isnot [array]) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'legs' in '$planPath' is not an array (a single leg is a one-item array)" }
+            $rawItems = $doc.legs
+        }
+        if ($null -eq $rawItems -or $rawItems.Count -eq 0) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' names no legs (an array of items, or an object with a legs array)" }
+        $planDir = Split-Path -Parent $planPath
+        $items = [System.Collections.Generic.List[object]]::new()
+        for ($i = 0; $i -lt $rawItems.Count; $i++) {
+            $it = $rawItems[$i]; $n = $i + 1
+            if ($it -isnot [System.Management.Automation.PSCustomObject]) { Stop-PlanRefused 'BAD_ITEM_SHAPE' $n "an item is an object {legSpec, backend, sourceCommit, buildManifestSha256, arm}, not $(if ($null -eq $it) { 'null' } else { $it.GetType().Name }); the whole plan is refused" }
+            $sc = [string]$it.sourceCommit; $ms = [string]$it.buildManifestSha256; $be = [string]$it.backend; $arm = [string]$it.arm; $ref = [string]$it.legSpec
+            # the scalar form's own patterns (ValidatePattern, case-insensitive) and backend set; \z, not $, so a final LF is not accepted (sol r3 A3)
+            if ($sc -notmatch '^[0-9a-f]{40}\z') { Stop-PlanRefused 'BAD_SOURCE_COMMIT' $n "sourceCommit '$sc' is not 40 hex" }
+            if ($ms -notmatch '^[0-9a-f]{64}\z') { Stop-PlanRefused 'BAD_MANIFEST_SHA256' $n "buildManifestSha256 '$ms' is not 64 hex" }
+            if ($be -notin @('cuda', 'cpu')) { Stop-PlanRefused 'BAD_BACKEND' $n "backend '$be' is not cuda or cpu" }
+            if ($arm -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}\z') { Stop-PlanRefused 'BAD_ARM' $n "arm '$arm' is not a label of 1-32 of [A-Za-z0-9._-]" }
+            $path = $(if ($ref) { Resolve-LegSpecPath $ref $planDir } else { $null })
+            if (-not $path) { Stop-PlanRefused 'LEG_SPEC_MISSING' $n "no leg spec at '$ref'" }
+            $specRefusal = Get-LegSpecRefusal $path $be
+            if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
+            $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
+        }
+        # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
+        $builds = [ordered]@{}
+        foreach ($it in $items) {
+            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -TimeoutSec 30 }
+            $st = $builds[$it.sourceCommit]
+            $short = $it.sourceCommit.Substring(0, 12)
+            if ($st.state -ceq 'UNREACHABLE') { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
+            if ($st.state -cne 'STAGED') { Stop-PlanRefused 'BUILD_NOT_STAGED' $it.item "no staged build manifest for $short at $($st.path); the runner stages and builds nothing" }
+            if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
+        }
+        $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
+        foreach ($it in $ordered) {
+            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
+                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item })
+        }
+        $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
+            legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
+            builds = @($builds.Keys | ForEach-Object { [ordered]@{ sourceCommit = $_; state = $builds[$_].state; sha256 = $builds[$_].sha256; path = $builds[$_].path } }) }
+    } catch {
+        # sol r3 second pass A2: whatever else a plan item makes the validation throw on is still the typed refusal of the whole plan (exit 2, BATCH_USAGE), never an exit 1.
+        Stop-PlanRefused 'LEG_PLAN_INVALID' 0 "the plan could not be validated: $($_.Exception.Message -replace '\s+', ' ')"
     }
-    if ($null -eq $rawItems -or $rawItems.Count -eq 0) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' names no legs (an array of items, or an object with a legs array)" }
-    $planDir = Split-Path -Parent $planPath
-    $items = [System.Collections.Generic.List[object]]::new()
-    for ($i = 0; $i -lt $rawItems.Count; $i++) {
-        $it = $rawItems[$i]; $n = $i + 1
-        if ($it -isnot [System.Management.Automation.PSCustomObject]) { Stop-PlanRefused 'BAD_ITEM_SHAPE' $n "an item is an object {legSpec, backend, sourceCommit, buildManifestSha256, arm}, not $(if ($null -eq $it) { 'null' } else { $it.GetType().Name }); the whole plan is refused" }
-        $sc = [string]$it.sourceCommit; $ms = [string]$it.buildManifestSha256; $be = [string]$it.backend; $arm = [string]$it.arm; $ref = [string]$it.legSpec
-        # the scalar form's own patterns (ValidatePattern, case-insensitive) and backend set; \z, not $, so a final LF is not accepted (sol r3 A3)
-        if ($sc -notmatch '^[0-9a-f]{40}\z') { Stop-PlanRefused 'BAD_SOURCE_COMMIT' $n "sourceCommit '$sc' is not 40 hex" }
-        if ($ms -notmatch '^[0-9a-f]{64}\z') { Stop-PlanRefused 'BAD_MANIFEST_SHA256' $n "buildManifestSha256 '$ms' is not 64 hex" }
-        if ($be -notin @('cuda', 'cpu')) { Stop-PlanRefused 'BAD_BACKEND' $n "backend '$be' is not cuda or cpu" }
-        if ($arm -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}\z') { Stop-PlanRefused 'BAD_ARM' $n "arm '$arm' is not a label of 1-32 of [A-Za-z0-9._-]" }
-        $path = $(if ($ref) { Resolve-LegSpecPath $ref $planDir } else { $null })
-        if (-not $path) { Stop-PlanRefused 'LEG_SPEC_MISSING' $n "no leg spec at '$ref'" }
-        $specRefusal = Get-LegSpecBackendRefusal $path $be
-        if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
-        $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
-    }
-    # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
-    $builds = [ordered]@{}
-    foreach ($it in $items) {
-        if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -TimeoutSec 30 }
-        $st = $builds[$it.sourceCommit]
-        $short = $it.sourceCommit.Substring(0, 12)
-        if ($st.state -ceq 'UNREACHABLE') { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
-        if ($st.state -cne 'STAGED') { Stop-PlanRefused 'BUILD_NOT_STAGED' $it.item "no staged build manifest for $short at $($st.path); the runner stages and builds nothing" }
-        if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
-    }
-    $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
-    foreach ($it in $ordered) {
-        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
-                arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item })
-    }
-    $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
-        legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
-        builds = @($builds.Keys | ForEach-Object { [ordered]@{ sourceCommit = $_; state = $builds[$_].state; sha256 = $builds[$_].sha256; path = $builds[$_].path } }) }
-    [IO.File]::WriteAllText((Join-Path $RunDir 'leg-plan.json'), ($planRecord | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false))
 } elseif ($LegSet) {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
     $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
@@ -480,6 +495,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     # outlast -ClaimTtlSec), so Get-VenueClaimStaleReason never finds a live owner's claim expired. The keeper dies with this process.
     $claimKeeper = Start-VenueClaimKeeper -Venue $Venue -Nonce $claim.nonce -TtlSec $ClaimTtlSec -RenewSec $ClaimRenewSec -ClaimDir $ClaimDir
     L "CLAIM_TAKEN batch=$batchNo nonce=$($claim.nonce) expiresUtc=$($claim.expiresUtc) renewSec=$ClaimRenewSec ttlSec=$ClaimTtlSec"
+    # sol r3 second pass A3: the validated plan is kept only while this run holds the venue claim, so a second invocation on the same -RunDir that is still waiting
+    # for the claim cannot replace the plan a running one preserved. Rewritten after each claim taken: it is always the holder's own plan.
+    if ($legPlanMode) { [IO.File]::WriteAllText((Join-Path $RunDir 'leg-plan.json'), ($planRecord | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false)) }
     # r3 (Dot B1): $openSubmitted is true from the moment Submit-AgentJob is called for the open. The finally block's cancel, close and ledger charge follow
     # that flag, never "$op is null": a null $op before the call (a throw while the sidecar was checked) means nothing was sent.
     $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null; $openLive = $null; $cr = $null; $openSubmitted = $false

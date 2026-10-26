@@ -313,8 +313,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         cls.specs = []
         for name in ("fx-a", "fx-b", "fx-c"):
             p = cls.tmp / f"{name}.json"
-            # the shape Invoke-VenueLeg accepts (schema + the backends it may run), so a -LegPlan item can be checked against it before any lease
-            p.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": name, "backends": ["cpu", "cuda"]}), encoding="utf-8")
+            # the shape Invoke-VenueLeg accepts (schema + the backends it may run + the scaleFactor every real leg spec carries and its receipt block reads), so a -LegPlan item can be checked against it before any lease
+            p.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": name, "backends": ["cpu", "cuda"], "scaleFactor": 1}), encoding="utf-8")
             cls.specs.append(p)
 
     @classmethod
@@ -1752,7 +1752,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def test_r3_a3_a_spec_legid_with_a_trailing_line_feed_falls_back_to_the_file_name(self) -> None:
         spec = self.case / "fx-nl.json"
-        spec.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": "bad\n", "backends": ["cpu"]}), encoding="utf-8")
+        spec.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": "bad\n", "backends": ["cpu"], "scaleFactor": 1}), encoding="utf-8")
         r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual([l["name"] for l in batch_result(r.stdout)["legs"]], ["01-fx-nl-cpu-A"])
@@ -1792,6 +1792,64 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("BATCH_USAGE LEG_PLAN_REFUSED reason=LEG_PLAN_UNREADABLE", r.stderr)
         self.assertEqual(self.kinds(), [])
         del hold
+
+    def test_r4_a1_a_spec_the_leg_process_would_throw_on_is_refused_before_the_claim_and_the_lease(self) -> None:
+        # sol r3 second pass A1: Invoke-VenueLeg also throws on a malformed visualCapture / opt-out pair, a playSeconds outside [int], a scaleFactor that is not a
+        # number and a bad acceptedEffectiveScale. Preflight checked only the schema and the backend, so each of these opened a lease and ended LEG_FAILED / exit 7.
+        a = self.commit_a
+        base = {"schema": "mlv-app/dual-venue-leg/v1", "legId": "fx-bad", "backends": ["cpu"], "scaleFactor": 1}
+        cases = {
+            "visualCapture is a string": {"visualCapture": "true"},
+            "visualCapture false without a reason": {"visualCapture": False},
+            "visualCapture null": {"visualCapture": None},
+            "a reason without the opt-out": {"visualCaptureOptOutReason": "because"},
+            "playSeconds beyond int": {"playSeconds": 2147483648},
+            "scaleFactor is not a number": {"scaleFactor": "bad"},
+            "acceptedEffectiveScale is not a number": {"scaleFactor": 1, "acceptedEffectiveScale": {"cpu": "bad"}},
+        }
+        for label, extra in cases.items():
+            with self.subTest(case=label):
+                p = self.case / "fx-bad.json"
+                p.write_text(json.dumps({**base, **extra}), encoding="utf-8")
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(p, "B", a)]), "LEG_SPEC_INVALID item=2 ")
+
+    def test_r4_a1_a_valid_opt_out_and_scale_still_run(self) -> None:
+        # the added preflight is the leg process's own predicates, no stricter: a well-formed opt-out, scale and playSeconds are accepted
+        p = self.case / "fx-ok.json"
+        p.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": "fx-ok", "backends": ["cpu"], "visualCapture": False, "visualCaptureOptOutReason": "no window",
+                                 "playSeconds": 30, "scaleFactor": 2, "acceptedEffectiveScale": {"cpu": 1}}), encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(p, "A", self.commit_a)]))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_r4_a2_a_plan_item_whose_path_cannot_be_probed_is_a_typed_refusal(self) -> None:
+        # sol r3 second pass A2: Test-Path throws on a NUL in legSpec; the throw bypassed Stop-PlanRefused and exited 1 with no BATCH_USAGE line.
+        a = self.commit_a
+        for label, ref in {"NUL in the middle": "a\u0000b", "NUL only": "\u0000", "a wildcard-only name": "*", "a drive-only name": "Z:"}.items():
+            with self.subTest(case=label):
+                item = {"legSpec": ref, "backend": "cpu", "sourceCommit": a, "buildManifestSha256": self.manifests[a], "arm": "B"}
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), item]), "LEG_SPEC_MISSING item=2 ")
+
+    def test_r4_a3_a_second_invocation_on_the_same_run_dir_never_overwrites_the_plan_before_it_holds_the_claim(self) -> None:
+        # sol r3 second pass A3: leg-plan.json was written during validation, before the venue claim. A second invocation that is still waiting for another
+        # run's claim replaced the first run's preserved plan. Here a live foreign claim holds the venue and the run ends DEADLINE claim-held: the file stays.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        keep = self.run_dir / "leg-plan.json"
+        keep.write_text('{"preserved":"first invocation"}\n', encoding="utf-8")
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\other-run' -Purpose foreign -TtlSec 3600 -ClaimDir '{self.claims}' -OwnerPid {os.getpid()}\n"
+                  "$r.granted\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
+        r = self.run_plan(self.ab_block_plan(), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=8)))
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(self.kinds(), [], "no open: the venue claim was never held")
+        self.assertEqual(keep.read_text(encoding="utf-8"), '{"preserved":"first invocation"}\n')
+
+    def test_r4_a3_the_plan_is_kept_once_the_claim_is_held(self) -> None:
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        kept = json.loads((self.run_dir / "leg-plan.json").read_text(encoding="utf-8"))
+        self.assertEqual([x["arm"] for x in kept["legs"]], ["A", "B", "A", "B"])
 
     def test_the_plan_and_the_scalar_form_are_mutually_exclusive(self) -> None:
         args, e = self.plan_cmd(self.ab_block_plan(), "-SourceCommit", SHA)
