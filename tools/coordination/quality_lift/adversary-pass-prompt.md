@@ -3,7 +3,8 @@ subject @@HEAD@@ ADVERSARY PASS for change @@CARD@@ round @@ROUND@@. ATTACKER ro
      hands the text to a read-only reviewer: @@HEAD@@ the exact 40-hex local head, @@BASE@@ the diff base (default
      merge-base of the target branch and HEAD), @@WORKDIR@@ the worktree, @@DIFF@@ the exported base...head patch, @@INTENT@@
      the commit subjects of base..head, @@CARD@@ and @@ROUND@@ the producer's own work id and round. A token inside a command
-     is the _PS twin, a PowerShell single-quoted literal the runner builds: @@WORKDIR_PS@@, @@RANGE_PS@@ (base...head).
+     is the _PS twin, a PowerShell single-quoted literal the runner builds: @@WORKDIR_PS@@, @@RANGE_PS@@ (base...head);
+     inside the JSON example it is the _JSON twin, a complete JSON string: @@BASE_JSON@@.
      Render with Render-AdversaryPrompt.ps1 beside this file. Line 1 starts with
      'subject <40-hex>' so a runner can key one pass per exact head. -->
 
@@ -79,7 +80,7 @@ CLEAN only if you tried every applicable row on every invariant and found no act
 in the findings list.
 End your final message with exactly ONE json block (paste shas verbatim from git output, never retype):
 ```json
-{"verdict":"CLEAN|FINDINGS","verified_head":"<40-hex HEAD you printed>","base":"@@BASE@@","invariants":<count>,
+{"verdict":"CLEAN|FINDINGS","verified_head":"<40-hex HEAD you printed>","base":@@BASE_JSON@@,"invariants":<count>,
  "findings":[{"id":"A1","file":"path/relative/to/repo","line":123,"invariant":"...","input":"...","outcome":"...","severity":"blocker|major|minor","introduced":true,"siblings":["path:line", "..."]}],
  "rows_tried":[1,2,3],"notes":"..."}
 ```

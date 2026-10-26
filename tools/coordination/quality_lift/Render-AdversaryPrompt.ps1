@@ -3,6 +3,9 @@
   Fill adversary-pass-prompt.md for one exact head and write the result as UTF-8 (no BOM).
 
 .DESCRIPTION
+  ASCII-only on purpose: Windows PowerShell 5.1 reads a BOM-less script as ANSI, so every non-ASCII character
+  below is built from its code point.
+
   Replaces every @@NAME@@ token in ONE pass, so text inside a value (a worktree path or a commit subject that
   looks like a token) is never expanded again. Whole <!-- ... --> comment blocks are dropped first.
 
@@ -10,9 +13,10 @@
   that lands inside a command the reviewer is told to run has a _PS twin that the renderer fills with a
   PowerShell single-quoted literal (@@WORKDIR_PS@@, @@RANGE_PS@@ = base...head): every quote character
   PowerShell accepts (' and the typographic U+2018 U+2019 U+201A U+201B) is doubled, so $name, $(...), a
-  backtick or a semicolon in the value reaches git unchanged. Quoting lives here, never in the template text.
-  An unknown token, a blank or control-character path, a head that is not 40 lowercase hex, a base that is
-  blank or starts with '-', or a path holding two backticks in a row (it would end the markdown code span the
+  backtick or a semicolon in the value reaches git unchanged. A token inside the JSON example has a _JSON twin
+  (@@BASE_JSON@@, a complete JSON string). Quoting lives here, never in the template text.
+  An unknown token, a blank or control-character path, a head that is not exactly 40 lowercase hex, a base that
+  is blank or starts with '-', or a path holding two backticks in a row (it would end the markdown code span the
   command sits in) is refused and nothing is written.
 #>
 [CmdletBinding()]
@@ -30,12 +34,17 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function ConvertTo-PsSingleQuoted([string]$Value) {
-    return "'" + [regex]::Replace($Value, "['‘’‚‛]", { param($m) $m.Value + $m.Value }) + "'"
+    foreach ($code in 0x27, 0x2018, 0x2019, 0x201A, 0x201B) {
+        $q = [string][char]$code
+        $Value = $Value.Replace($q, $q + $q)
+    }
+    return "'" + $Value + "'"
 }
 
+# \z, not $: $ also matches before a final line feed.
 if ([string]::IsNullOrWhiteSpace($WorkDir) -or $WorkDir -match '[\x00-\x1F\x7F]') { throw "WORKDIR_INVALID blank or control character in -WorkDir" }
 if ($WorkDir.Contains('``')) { throw "WORKDIR_INVALID two backticks in a row in -WorkDir" }
-if ($Head -cnotmatch '^[0-9a-f]{40}$') { throw "HEAD_INVALID -Head must be 40 lowercase hex" }
+if ($Head -cnotmatch '\A[0-9a-f]{40}\z') { throw "HEAD_INVALID -Head must be exactly 40 lowercase hex" }
 if ([string]::IsNullOrWhiteSpace($Base) -or $Base -match '[\x00-\x1F\x7F]' -or $Base.StartsWith('-') -or $Base.Contains('``')) { throw "BASE_INVALID blank, control character, leading '-' or two backticks in -Base" }
 
 $tpl = Get-Content -LiteralPath $TemplatePath -Raw
@@ -43,6 +52,7 @@ $tpl = [regex]::Replace($tpl, '(?s)<!--.*?-->[ \t]*\r?\n?', '')
 $map = @{
     HEAD = $Head; BASE = $Base; CARD = $Card; ROUND = $Round; WORKDIR = $WorkDir; DIFF = $Diff; INTENT = $Intent
     WORKDIR_PS = (ConvertTo-PsSingleQuoted $WorkDir); RANGE_PS = (ConvertTo-PsSingleQuoted "$Base...$Head")
+    BASE_JSON = (ConvertTo-Json -InputObject $Base -Compress)
 }
 $out = [regex]::Replace($tpl, '@@([A-Z][A-Z_]*)@@', {
         param($m)
