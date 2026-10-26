@@ -2386,6 +2386,132 @@ def test_save_dirty_worktree_evidence_keeps_the_real_diff_staged_work_untracked_
     assert "+edited" in next(p for p in dest.glob("dirty-worktree-*.patch")).read_text(encoding="utf-8")
 
 
+STAGED_DIFF_ARGS = ["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"]
+
+
+def _stage_then_edit_back(wt):
+    """Staged work the working tree no longer has: `diff HEAD` is empty, only the index still holds it."""
+    (wt / "src" / "a.txt").write_text("staged\n")
+    git(wt, "add", "src/a.txt")
+    (wt / "src" / "a.txt").write_text("one\n")
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_never_overwrites_an_occupied_staged_name(tmp_path):
+    # LANE-HUBCHAT-DETACHED-DISPATCH-1 r3 adversary A1: the staged file used to be skipped by an existence-only test, so an occupied name dropped the new diff.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    _stage_then_edit_back(wt)
+    cached = subprocess.run(["git", "-C", str(wt), *STAGED_DIFF_ARGS], capture_output=True, check=True).stdout
+    occupied = dest / f"dirty-worktree-staged-{hashlib.sha256(cached).hexdigest()[:8]}.diff"
+    occupied.write_bytes(b"X")  # stands in for a different staged diff that shares the 8-hex name prefix
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVED"), out.stdout + out.stderr
+    assert occupied.read_bytes() == b"X", "an occupied evidence name must never be rewritten"
+    staged = sorted(dest.glob("dirty-worktree-staged-*.diff"))
+    assert len(staged) == 2 and any(p != occupied and p.read_bytes() == cached for p in staged), staged
+    assert not list(dest.glob("*.tmp"))
+    again = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert again.stdout.startswith("DIRTY_TREE_SAVED") and len(list(dest.glob("dirty-worktree-staged-*.diff"))) == 2, "the same staged diff must keep one name"
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_typed_when_the_staged_diff_cannot_be_written(tmp_path):
+    # r3 adversary A2: a failing `git diff --cached` (here: the staged blob is gone from the object store) used to be swallowed and reported as DIRTY_TREE_SAVED.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    _stage_then_edit_back(wt)
+    blob = git(wt, "rev-parse", ":src/a.txt")
+    obj = wt / ".git" / "objects" / blob[:2] / blob[2:]
+    obj.chmod(0o666)
+    obj.unlink()
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=git-staged-diff-exit-"), out.stdout + out.stderr
+    assert not list(dest.glob("*.tmp")) and not list(dest.glob("dirty-worktree-staged-*")), "no partial staged evidence may be left under a final name"
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_typed_on_a_short_staged_write_with_exit_zero(tmp_path):
+    # r3 adversary A2 (volume quota): even when git reports success, a truncated staged diff must not be reported as saved.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    (wt / "src" / "a.txt").write_text("".join(f"line {i}\n" for i in range(40)))
+    git(wt, "add", "src/a.txt")
+    git(wt, "commit", "-qm", "wide")
+    (wt / "src" / "a.txt").write_text("".join(f"staged {i}\n" for i in range(40)))
+    git(wt, "add", "src/a.txt")
+    (wt / "src" / "a.txt").write_text("".join(f"line {i}\n" for i in range(40)))
+    # A PowerShell function named git outranks git.exe for the helper's `& git` calls: it runs the real git, then halves the staged diff's output file and keeps git's exit code 0.
+    shim = (f"$script:RealGit = '{shutil.which('git')}'; "
+            "function git { & $script:RealGit @args; $code = $LASTEXITCODE; "
+            "if ($args -contains 'diff' -and $args -contains '--cached') { "
+            "$o = @($args | Where-Object { $_ -like '--output=*' })[0]; "
+            "if ($o) { $p = $o.Substring(9); $b = [System.IO.File]::ReadAllBytes($p); [System.IO.File]::WriteAllBytes($p, $b[0..([int]($b.Length / 2))]) } }; "
+            "$global:LASTEXITCODE = $code }")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=staged-diff-incomplete"), out.stdout + out.stderr
+    assert not list(dest.glob("dirty-worktree-staged-*")) and not list(dest.glob("*.tmp"))
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_pins_the_patch_shape_against_diff_config(tmp_path):
+    # r3 adversary A3: diff.context=0 in a repo or user config made both saved diffs context-free, which plain `git apply` rejects.
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    make_repo(wt)
+    (wt / "src").mkdir()
+    (wt / "src" / "a.txt").write_text("alpha\nbeta\ngamma\n")
+    git(wt, "add", "src/a.txt")
+    git(wt, "commit", "-qm", "base")
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(wt), str(clone))
+    git(wt, "config", "diff.context", "0")
+    git(wt, "config", "diff.interHunkContext", "0")
+    git(wt, "config", "color.ui", "always")
+    git(wt, "config", "diff.submodule", "log")
+    (wt / "src" / "a.txt").write_text("alpha\nBETA\ngamma\n")
+    git(wt, "add", "src/a.txt")  # also stage it, so the staged diff is exercised
+    dest = tmp_path / "run"
+    dest.mkdir()
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVED") and "verified=reverse-apply-ok" in out.stdout, out.stdout + out.stderr
+    for saved in (next(dest.glob("dirty-worktree-*.patch")), next(dest.glob("dirty-worktree-staged-*.diff"))):
+        text = saved.read_text(encoding="utf-8")
+        assert " alpha\n" in text and " gamma\n" in text and "\x1b[" not in text, (saved.name, text)
+        fresh = tmp_path / ("clone-" + saved.suffix.lstrip("."))
+        git(tmp_path, "clone", "-q", str(clone), str(fresh))
+        git(fresh, "apply", str(saved))  # the advertised plain reapply command
+        assert (fresh / "src" / "a.txt").read_text() == "alpha\nBETA\ngamma\n", saved.name
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_accepts_every_staged_shape(tmp_path):
+    # The staged completeness check (reverse-apply to the index) must not turn legitimate staged work into a save failure.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    (wt / "gone.txt").write_text("bye\n")
+    (wt / "moved.txt").write_text("".join(f"row {i}\n" for i in range(20)))
+    (wt / "mode.sh").write_text("echo hi\n")
+    (wt / "bin.dat").write_bytes(bytes(range(256)))
+    git(wt, "add", "gone.txt", "moved.txt", "mode.sh", "bin.dat")
+    git(wt, "commit", "-qm", "shapes")
+    git(wt, "rm", "-q", "gone.txt")
+    git(wt, "mv", "moved.txt", "renamed.txt")
+    git(wt, "update-index", "--chmod=+x", "mode.sh")
+    (wt / "bin.dat").write_bytes(bytes(reversed(range(256))))
+    (wt / "fresh.txt").write_text("new file\n")
+    (wt / "empty.txt").write_text("")
+    git(wt, "add", "bin.dat", "fresh.txt", "empty.txt")
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVED") and " staged=none " not in out.stdout, out.stdout + out.stderr
+    staged = next(dest.glob("dirty-worktree-staged-*.diff"))
+    clone = tmp_path / "clone"
+    git(tmp_path, "clone", "-q", str(wt), str(clone))
+    git(clone, "reset", "-q", "--hard", "HEAD")
+    git(clone, "apply", "--index", str(staged))
+    assert git(clone, "diff", "--cached", "--name-status") == git(wt, "diff", "--cached", "--name-status")
+
+
 @dirty_save_only
 def test_save_dirty_worktree_evidence_fails_soft_and_refuses_a_non_root_directory(tmp_path):
     wt = tmp_path / "wt"
