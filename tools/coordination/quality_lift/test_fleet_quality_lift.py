@@ -105,46 +105,54 @@ def _front(pr: int, head: str, body: str, repo: str = "acme/widget") -> str:
 
 SAMPLES = HERE / "fixtures" / "cos-samples"
 # Real CoS records copied verbatim from the bus (<project>--pr-<n>--<doctrine commit>.md): the pass each names, and what the
-# CoS said of its blockers: blocked, clean, or unknown (no explicit no-blocker text and no current blocker; counted apart,
-# never as clean). The first five were read as clean (or not read at all) by the meter at 58806c8e; the eight blocked ones
-# from pr-613 on were read as clean at 49720f53 (B5: a blocker carried in prose, a CI bullet or a later paragraph).
+# CoS said of its blockers: blocked, clean, or unknown (counted apart, never as clean). Since r5 (B7) the class is read
+# conservatively: blocked only from a line that starts B<n> or SHARED BLOCKER, clean only from a whole section on the exact
+# whitelist in blocker-classes.json, unknown otherwise. "r4: x" notes a record r4's meaning-based reading labelled x; each
+# moved to unknown because its text is prose or mixed, never between blocked and clean.
 SAMPLE_PASSES = {
     "mlv-app--pr-608--b2283ba4d6f6.md": ("SuperDimensionalSpaceFortress/MLV-App", 608, "073fc4f1a84439a8edf75cf6081defd81f08aee3", "blocked"),
     "mlv-app--pr-612--84e86b2e8171.md": ("SuperDimensionalSpaceFortress/MLV-App", 612, "a297f0e5cd0fec6260632162c0e8b203666c1e9d", "blocked"),
-    "adobe-ingester--pr-4--c38e3dfd5a56.md": ("layibabalola/adobe-document-cloud-ingester", 4, "23270dcc9113118048e722b64ad617e50b79445d", "blocked"),
+    # r4: blocked. Its B1 line also says 'Keep fixed allowlisted labels', and a B<n> line that says fixed is not read as blocked.
+    "adobe-ingester--pr-4--c38e3dfd5a56.md": ("layibabalola/adobe-document-cloud-ingester", 4, "23270dcc9113118048e722b64ad617e50b79445d", "unknown"),
     "mlv-app--pr-493--8c755c572106.md": ("SuperDimensionalSpaceFortress/MLV-App", 493, "79db95afcef4959a45daa83aabe54b2c8de9fb6c", "blocked"),
     "mlv-app--pr-480--3a2c8a01e2f9.md": ("SuperDimensionalSpaceFortress/MLV-App", 480, "e5dd4b473b0afbb58acddc22d72c03e1ec26e0f8", "blocked"),
-    "mlv-app--pr-578--4587c6e6dcea.md": ("SuperDimensionalSpaceFortress/MLV-App", 578, "a8858093c127a30b446a26343f7e2c30dad7781c", "clean"),
-    "mlv-app--pr-537--c4893fcf509a.md": ("SuperDimensionalSpaceFortress/MLV-App", 537, "7538f47b58a53ce35022516656a6c13800980587", "clean"),
+    # r4: clean. 'None demonstrated. No SHARED BLOCKER.' followed by more sentences on the same line: not the whole section.
+    "mlv-app--pr-578--4587c6e6dcea.md": ("SuperDimensionalSpaceFortress/MLV-App", 578, "a8858093c127a30b446a26343f7e2c30dad7781c", "unknown"),
+    # r4: clean. 'None demonstrated in the independent source-first pass.' plus two more sentences.
+    "mlv-app--pr-537--c4893fcf509a.md": ("SuperDimensionalSpaceFortress/MLV-App", 537, "7538f47b58a53ce35022516656a6c13800980587", "unknown"),
     # No Blockers section at all: the CoS stated nothing about blockers, so it is unknown, not clean.
     "mlv-app--pr-533--5c3efd9c33ae.md": ("SuperDimensionalSpaceFortress/MLV-App", 533, "20a58d87b5ab7de25a1543281adc3aa78566dc30", "unknown"),
-    # 'Prior612 B1 persists' plus 'Current-head Ubuntu shard1 independently fails'.
-    "mlv-app--pr-613--b26f3e7db3d4.md": ("SuperDimensionalSpaceFortress/MLV-App", 613, "a6fa535270bd665c1445e542e023e7f042a9e51f", "blocked"),
-    "agent-bridge--pr-267--6049af278f2d.md": ("layibabalola/agent-bridge", 267, "ce87de3e3b9f2e4ebab949dc205917a1609a056e", "blocked"),
-    "agent-bridge--pr-268--c6d474d8461f.md": ("layibabalola/agent-bridge", 268, "a9fd2604ee0f8286163034a40e9c02c15d5ca0e1", "blocked"),
-    "agent-bridge--pr-270--6a1d388d7b15.md": ("layibabalola/agent-bridge", 270, "5db5a5ea6d950df2d4804e6a617f788217f6ceae", "blocked"),
-    "adobe-ingester--pr-5--3af1813220b0.md": ("layibabalola/adobe-document-cloud-ingester", 5, "ea8cf4558da328b4c37db505e55938d9389e1baf", "blocked"),
-    # The bus SCHEMA.md bullet form: '- CI: ... exact-head canonical job119584694731 fails gate...'.
-    "context-ultra-salesforce--pr-112--41b9dbaeb8ce.md": ("layibabalola/context-ultra-salesforce", 112, "e6601ebf4477f011b75d635d4941e341aa9ad365", "blocked"),
-    # A path bullet: '- tools/...:193: actual [Windows shard 2](.../actions/runs/...) fails at 07:42:20Z'.
-    "mlv-app--pr-508--3636d6cb349f.md": ("SuperDimensionalSpaceFortress/MLV-App", 508, "24fdc1986e94655da05adab911904ceb811893a7", "blocked"),
-    # Opens 'Prior timing B1 is source-fixed', and its second paragraph is 'B2 validation mismatch remains.'.
+    # r4: blocked. 'Prior612 B1 persists' plus a failing shard, in prose: no line starts B<n>.
+    "mlv-app--pr-613--b26f3e7db3d4.md": ("SuperDimensionalSpaceFortress/MLV-App", 613, "a6fa535270bd665c1445e542e023e7f042a9e51f", "unknown"),
+    # r4: blocked (all three). 'Prior829ec450 B1 remains', 'Inherited #267 B1 remains', 'Inherited ownership B1 remains': prose.
+    "agent-bridge--pr-267--6049af278f2d.md": ("layibabalola/agent-bridge", 267, "ce87de3e3b9f2e4ebab949dc205917a1609a056e", "unknown"),
+    "agent-bridge--pr-268--c6d474d8461f.md": ("layibabalola/agent-bridge", 268, "a9fd2604ee0f8286163034a40e9c02c15d5ca0e1", "unknown"),
+    "agent-bridge--pr-270--6a1d388d7b15.md": ("layibabalola/agent-bridge", 270, "5db5a5ea6d950df2d4804e6a617f788217f6ceae", "unknown"),
+    # r4: blocked. 'Inherited #4 B1 remains: ...': prose.
+    "adobe-ingester--pr-5--3af1813220b0.md": ("layibabalola/adobe-document-cloud-ingester", 5, "ea8cf4558da328b4c37db505e55938d9389e1baf", "unknown"),
+    # r4: blocked. The bus SCHEMA.md bullet form '- CI: ... job119584694731 fails gate...': a CI failure in prose.
+    "context-ultra-salesforce--pr-112--41b9dbaeb8ce.md": ("layibabalola/context-ultra-salesforce", 112, "e6601ebf4477f011b75d635d4941e341aa9ad365", "unknown"),
+    # r4: blocked. A path bullet: '- tools/...:193: actual [Windows shard 2](...) fails at 07:42:20Z'.
+    "mlv-app--pr-508--3636d6cb349f.md": ("SuperDimensionalSpaceFortress/MLV-App", 508, "24fdc1986e94655da05adab911904ceb811893a7", "unknown"),
+    # Opens 'Prior timing B1 is source-fixed', and its second paragraph starts 'B2 validation mismatch remains.'.
     "mlv-app--pr-657--c4ead2a24093.md": ("SuperDimensionalSpaceFortress/MLV-App", 657, "4ea77b883438c587583fa6c1de45141b7b397f5b", "blocked"),
-    # 'actual [Windows shard 1](...) and [Ubuntu shard 3](...) fail: ...' (a plural verb).
-    "mlv-app--pr-465--3636d6cb349f.md": ("SuperDimensionalSpaceFortress/MLV-App", 465, "37b6e55bafed02078740512f8c07a3f966d8f369", "blocked"),
-    # 'No new demonstrated defect ... Existing CI is not green: Bridge.../job120921170318 failed16:17:43'.
-    "mlv-app--pr-663--6485a13f0388.md": ("SuperDimensionalSpaceFortress/MLV-App", 663, "32d97f32dd4f1bc84bc1d6ed951f74416fd68b2e", "blocked"),
-    # 'None newly demonstrated. Prior B1/B2 are source-addressed', then 'B1: <how>' and 'B2: <how>' disposition lines.
-    "mlv-app--pr-689--120cf0f02411.md": ("SuperDimensionalSpaceFortress/MLV-App", 689, "58806c8ebf76683374593d1454a5ffe56f34833b", "clean"),
-    "mlv-app--pr-664--7678ef2deb44.md": ("SuperDimensionalSpaceFortress/MLV-App", 664, "87f34507ef29f7c344cbf3495161a9c85f571251", "clean"),
-    # 'No remaining B2 demonstrated': a qualifier under No is not a remaining blocker.
-    "mlv-app--pr-456--b8398105b1d2.md": ("SuperDimensionalSpaceFortress/MLV-App", 456, "580e6c6b55ee6f2d8e8628249277f054037ed6e7", "clean"),
-    # 'No current failing check demonstrated. Prior B1 was an actual failure of ... job...': a past failure.
-    "mlv-app--pr-671--c3c8acfcab09.md": ("SuperDimensionalSpaceFortress/MLV-App", 671, "06ebdd1903e8474d385fe504323f4c0358aeca06", "clean"),
-    # 'Existing Ubuntu shard1 confirms both previously failing B3 tests pass'.
-    "mlv-app--pr-618--f6c06ffc9be6.md": ("SuperDimensionalSpaceFortress/MLV-App", 618, "7570642b94b1ca01efcfa6c1b39cbbb9252fcffc", "clean"),
-    # 'None newly demonstrated.' over bullets, then 'Prior B1/B2/I1 source-addressed dispositions remain.'.
-    "mlv-app--pr-689--8da382374548.md": ("SuperDimensionalSpaceFortress/MLV-App", 689, "7f6189570adfe4fdc3877e327f3a9c901c768620", "clean"),
+    # r4: blocked. 'actual [Windows shard 1](...) and [Ubuntu shard 3](...) fail: ...': a CI failure in prose.
+    "mlv-app--pr-465--3636d6cb349f.md": ("SuperDimensionalSpaceFortress/MLV-App", 465, "37b6e55bafed02078740512f8c07a3f966d8f369", "unknown"),
+    # r4: blocked. 'No new demonstrated defect ... Existing CI is not green: ... failed': mixed.
+    "mlv-app--pr-663--6485a13f0388.md": ("SuperDimensionalSpaceFortress/MLV-App", 663, "32d97f32dd4f1bc84bc1d6ed951f74416fd68b2e", "unknown"),
+    # r4: clean. 'None newly demonstrated. Prior B1/B2 are source-addressed', then 'B1: <how>' and 'B2: <how>' lines: mixed (a
+    # B<n> line under a None opener is unknown, not blocked).
+    "mlv-app--pr-689--120cf0f02411.md": ("SuperDimensionalSpaceFortress/MLV-App", 689, "58806c8ebf76683374593d1454a5ffe56f34833b", "unknown"),
+    # r4: clean. 'Prior B1 is source-fixed. ... No new demonstrated blocker ...': prose.
+    "mlv-app--pr-664--7678ef2deb44.md": ("SuperDimensionalSpaceFortress/MLV-App", 664, "87f34507ef29f7c344cbf3495161a9c85f571251", "unknown"),
+    # r4: clean. 'No remaining B2 demonstrated in this delta. Prior SHARED BLOCKER source-resolved: ...': prose.
+    "mlv-app--pr-456--b8398105b1d2.md": ("SuperDimensionalSpaceFortress/MLV-App", 456, "580e6c6b55ee6f2d8e8628249277f054037ed6e7", "unknown"),
+    # r4: clean. 'No current failing check demonstrated. Prior B1 was an actual failure of ... job...': prose.
+    "mlv-app--pr-671--c3c8acfcab09.md": ("SuperDimensionalSpaceFortress/MLV-App", 671, "06ebdd1903e8474d385fe504323f4c0358aeca06", "unknown"),
+    # r4: clean. 'None demonstrated in corrective delta. Prior612/613 B1 closed: ...': prose.
+    "mlv-app--pr-618--f6c06ffc9be6.md": ("SuperDimensionalSpaceFortress/MLV-App", 618, "7570642b94b1ca01efcfa6c1b39cbbb9252fcffc", "unknown"),
+    # r4: clean. 'None newly demonstrated. Prior B3/B4 source remedies verified:' over bullets: more than the whitelist.
+    "mlv-app--pr-689--8da382374548.md": ("SuperDimensionalSpaceFortress/MLV-App", 689, "7f6189570adfe4fdc3877e327f3a9c901c768620", "unknown"),
     # 'P2, high confidence: ...', a G1 governance hold, and G2/G3 holds with 'none has failed': not B<n>, not no-blocker.
     "mlv-app--pr-525--c7453f5ec647.md": ("SuperDimensionalSpaceFortress/MLV-App", 525, "c831ed5f348472fc0695dc003b8d5a119510f4e3", "unknown"),
     "mlv-app--pr-507--3c7af4ac0f2f.md": ("SuperDimensionalSpaceFortress/MLV-App", 507, "825bd26ca3093e9fef1ba4be4aa556b56f3c026f", "unknown"),
@@ -160,6 +168,8 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($Meter, [ref]$null, [r
 $defs = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $false) | ForEach-Object { $_.Extent.Text })
 $vars = @($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -like '$Ql*' } | ForEach-Object { $_.Extent.Text })
 . ([scriptblock]::Create(($defs + $vars) -join "`n"))
+# The meter loads its classes in its main code, which does not run here.
+$QlClasses = Read-QlBlockerClasses (Join-Path (Split-Path -Parent $Meter) 'blocker-classes.json')
 function Invoke-Case($c) {
     if ($c.kind -eq 'class') { return (Get-QlBlockerClass $c.text).cls }
     if ($c.kind -eq 'identity') { $id = Get-QlIdentity $c.text; if ($id) { return $id.head } else { return '' } }
@@ -1264,43 +1274,51 @@ class MeterFixtureTests(unittest.TestCase):
         unknown = {u["head"] for u in since["blockerUnknownHeads"]}
         return since, {h: ("blocked" if h in got else "unknown" if h in unknown else "clean") for h in heads}
 
-    def test_blockers_are_read_by_meaning_blocked_clean_or_unknown(self) -> None:  # B5
+    def test_blockers_are_read_conservatively_blocked_clean_or_unknown(self) -> None:  # B5 inputs, B7 rules
+        # B7 (r5): r4 read these by meaning; every prose or mixed section is now unknown by design. A row whose class
+        # changed from r4 says so ("r4: x"); none moved between blocked and clean.
         bodies = [
-            # Blocked: a B<n> named as persisting, remaining, retained, open or current, wherever it stands; a later line
-            # that starts B<n>; a CI job, shard or check reported failing on the head.
-            ("## Blockers\nPrior612 B1 persists: a.py:71 pins 203.\n", "blocked"),
-            ("## Blockers\nPrior829ec450 B1 remains: a.py:359 replaces runtime.\n", "blocked"),
-            ("## Blockers\nInherited #267 B1 remains source-unfixed at a.py:361.\n", "blocked"),
-            ("## Blockers\nInherited ownership B1 remains at a.py:363.\n", "blocked"),
-            ("## Blockers\nNo new demonstrated blocker. Prior B1 remains: a.ps1:3 still overwrites.\n", "blocked"),
+            # Blocked: a line that starts B<n> (or SHARED BLOCKER) and does not say it was fixed, under no None/No opener.
+            ("## Blockers\nPrior612 B1 persists: a.py:71 pins 203.\n", "unknown"),  # r4: blocked
+            ("## Blockers\nPrior829ec450 B1 remains: a.py:359 replaces runtime.\n", "unknown"),  # r4: blocked
+            ("## Blockers\nInherited #267 B1 remains source-unfixed at a.py:361.\n", "unknown"),  # r4: blocked
+            ("## Blockers\nInherited ownership B1 remains at a.py:363.\n", "unknown"),  # r4: blocked
+            ("## Blockers\nNo new demonstrated blocker. Prior B1 remains: a.ps1:3 still overwrites.\n", "unknown"),  # r4: blocked
             ("## Blockers\nPrior timing B1 is source-fixed.\n\nB2 validation mismatch remains.\n", "blocked"),
-            ("## Blockers\nNone newly demonstrated. The current B2 still breaks the guard.\n", "blocked"),
+            ("## Blockers\nNone newly demonstrated. The current B2 still breaks the guard.\n", "unknown"),  # r4: blocked
             ("## Blockers\nB1 (medium confidence) is retained at a.ps1:9.\n", "blocked"),
-            ("## Blockers\n- CI: a.md:3 is new, but exact-head canonical job119584694731 fails gate.x.\n", "blocked"),
-            ("## Blockers\n- a.py:193: actual [Windows shard 2](https://github.com/o/r/actions/runs/1/job/2) fails at 07:42:20Z.\n", "blocked"),
-            ("## Blockers\nCurrent-head Ubuntu shard1 independently fails at :954.\n", "blocked"),
-            ("## Blockers\nB1 partially resolved. a.ps1:9 still races.\n", "blocked"),
-            ("## Blockers\n- a.py:181: actual [shard 1](https://github.com/o/r/actions/runs/1/job/2) and [shard 3](x) fail: 227 tests.\n", "blocked"),
-            ("## Blockers\nNo new demonstrated defect. Existing CI is not green: Bridge401/job120921170318 failed16:17:43.\n", "blocked"),
-            ("## Blockers\n- a.py:193: actual Windows shard 2 fails: received \"(kill not confirmed)\".\n", "blocked"),
-            ("## Blockers\nNone newly demonstrated. Prior B1/B2 are source-addressed.\n\nB2: b.ps1:9 still drops the lock.\n", "blocked"),
-            # Clean: explicit no-blocker text, a prior blocker stated closed, and nothing current.
+            ("## Blockers\n- CI: a.md:3 is new, but exact-head canonical job119584694731 fails gate.x.\n", "unknown"),  # r4: blocked
+            ("## Blockers\n- a.py:193: actual [Windows shard 2](https://github.com/o/r/actions/runs/1/job/2) fails at 07:42:20Z.\n", "unknown"),  # r4: blocked
+            ("## Blockers\nCurrent-head Ubuntu shard1 independently fails at :954.\n", "unknown"),  # r4: blocked
+            ("## Blockers\nB1 partially resolved. a.ps1:9 still races.\n", "unknown"),  # r4: blocked; the line says resolved
+            ("## Blockers\n- a.py:181: actual [shard 1](https://github.com/o/r/actions/runs/1/job/2) and [shard 3](x) fail: 227 tests.\n", "unknown"),  # r4: blocked
+            ("## Blockers\nNo new demonstrated defect. Existing CI is not green: Bridge401/job120921170318 failed16:17:43.\n", "unknown"),  # r4: blocked
+            ("## Blockers\n- a.py:193: actual Windows shard 2 fails: received \"(kill not confirmed)\".\n", "unknown"),  # r4: blocked
+            ("## Blockers\nNone newly demonstrated. Prior B1/B2 are source-addressed.\n\nB2: b.ps1:9 still drops the lock.\n", "unknown"),  # r4: blocked; mixed
+            ("## Blockers\nSHARED BLOCKER (Dot, CoS-confirmed): the lock is checked before it is taken.\n", "blocked"),
+            ("## Blockers\n- **B3 --** a.ps1:9 drops the lock.\n", "blocked"),
+            ("## Blockers\nB2 - a.ps1:9 drops the lock.\n", "blocked"),
+            ("## Blockers\nG1 OPEN: an ask is unanswered.\nB4: a.ps1:9 drops the lock.\n", "blocked"),
+            # Clean: the whole section is one entry of the exact whitelist (blocker-classes.json).
             ("## Blockers\nNone.\n", "clean"),
             ("## Blockers\n(none)\n", "clean"),
             ("## Blockers\nNone demonstrated. No SHARED BLOCKER.\n", "clean"),
-            ("## Blockers\nNo new demonstrated blocker. Prior B1 is source-fixed.\n", "clean"),
-            ("## Blockers\nPrior metadata-I/O B1 is source-addressed.\n", "clean"),
-            ("## Blockers\nPrior B1 remains closed.\n", "clean"),
-            ("## Blockers\nNo remaining B2 demonstrated in this delta.\n", "clean"),
-            ("## Blockers\nNone newly demonstrated. Prior B3/B4 source remedies remain; B1/B2/I1 dispositions preserved.\n", "clean"),
-            ("## Blockers\nNo current failing check demonstrated. Prior B1 was an actual failure of job12 at 07:42.\n", "clean"),
-            ("## Blockers\nNone demonstrated. Thirteen checks succeed, none has failed.\n", "clean"),
-            ("## Blockers\nNone demonstrated. Prior CI failed on r4; the r5 job passes.\n", "clean"),
-            ("## Blockers\nNone demonstrated. The gate check fails closed when the job is missing.\n", "clean"),
-            ("## Blockers\nB1 closed: a.ps1:3 now checks.\n", "clean"),
-            # Under a no-blocker opener, "B1: <how it was addressed>" is a disposition note, not a new blocker.
-            ("## Blockers\nNone newly demonstrated. Prior B1/B2 are source-addressed.\nB1: a.ps1:3 now checks the lock.\nB2: b.ps1:9 adds a regression; old failures remain history.\n", "clean"),
+            ("## Blockers\n**None demonstrated.**\n", "clean"),
+            ("## Blockers\nNo new demonstrated blocker. Prior B1 is source-fixed.\n", "unknown"),  # r4: clean
+            ("## Blockers\nPrior metadata-I/O B1 is source-addressed.\n", "unknown"),  # r4: clean
+            ("## Blockers\nPrior B1 remains closed.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNo remaining B2 demonstrated in this delta.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNone newly demonstrated. Prior B3/B4 source remedies remain; B1/B2/I1 dispositions preserved.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNo current failing check demonstrated. Prior B1 was an actual failure of job12 at 07:42.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNone demonstrated. Thirteen checks succeed, none has failed.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNone demonstrated. Prior CI failed on r4; the r5 job passes.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNone demonstrated. The gate check fails closed when the job is missing.\n", "unknown"),  # r4: clean
+            ("## Blockers\nB1 closed: a.ps1:3 now checks.\n", "blocked"),  # r4: clean; 'closed' is not one of the five fixed words
+            ("## Blockers\nB1 fixed: a.ps1:3 now checks.\n", "unknown"),
+            ("## Blockers\nNone newly demonstrated. Prior B1/B2 are source-addressed.\nB1: a.ps1:3 now checks the lock.\nB2: b.ps1:9 adds a regression; old failures remain history.\n", "unknown"),  # r4: clean; mixed
             ("Blockers: None established; no SHARED BLOCKER.\n", "clean"),
+            ("## Blockers\nNone.\nNone.\n", "unknown"),  # two sentences, though both are on the whitelist
+            ("## Blockers\nnone.\n", "unknown"),  # the whitelist is exact, case included
             # Unknown: neither explicit no-blocker text nor a current blocker, a missing or empty section included.
             ("## Blockers\nP2, high confidence: a.ps1:3 races.\n", "unknown"),
             ("## Blockers\nG1 OPEN, response duty: answer the ask.\n", "unknown"),
@@ -1320,52 +1338,87 @@ class MeterFixtureTests(unittest.TestCase):
         # The rate is over the passes the meter could classify: an unknown pass is never counted as clean.
         self.assertEqual(since["blockedRate"], round(n_blocked / (len(bodies) - n_unknown), 3))
 
-    def test_adversary_r4_meaning_cases(self) -> None:  # adversary r4 on e5d54282: A1-A4
+    def test_adversary_r4_cases_under_the_conservative_rules(self) -> None:  # adversary r4 on e5d54282 and 8694a086
+        # The r4 adversary inputs, kept as regressions. Every one of them that is prose or mixed is unknown since r5 (B7);
+        # "r4: x" marks a changed class, and none moved between blocked and clean.
         bodies = [
-            # A1: under a no-blocker opener, only a B<n> the section says was addressed is a disposition note.
-            ("## Blockers\nNone newly demonstrated.\nB1: tools/lease.ps1:9 deletes another owner's lock.\n", "blocked"),
-            ("## Blockers\nNone newly demonstrated. Prior B1 is source-addressed.\nB2: a.ps1:9 drops the lock.\n", "blocked"),
-            ("## Blockers\nNone newly demonstrated.\nB1: a.ps1:3 is now fixed by the claim check.\n", "clean"),
-            # A2: a negation before the B<n> words, wherever it stands in the sentence.
-            ("## Blockers\nNone.\nThere is no current B1.\n", "clean"),
-            ("## Blockers\nNone.\nIt is not true that B1 remains open.\n", "clean"),
-            # A3: a later fail-safe phrase does not hide an earlier failure.
-            ("## Blockers\nNone.\nThe exact-head job1 fails the gate that is intended to fail closed.\n", "blocked"),
-            # A4: 'No' opens explicit no-blocker text only when it says what there is none of.
+            ("## Blockers\nNone newly demonstrated.\nB1: tools/lease.ps1:9 deletes another owner's lock.\n", "unknown"),  # r4: blocked; mixed
+            ("## Blockers\nNone newly demonstrated. Prior B1 is source-addressed.\nB2: a.ps1:9 drops the lock.\n", "unknown"),  # r4: blocked; mixed
+            ("## Blockers\nNone newly demonstrated.\nB1: a.ps1:3 is now fixed by the claim check.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNone.\nThere is no current B1.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNone.\nIt is not true that B1 remains open.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNone.\nThe exact-head job1 fails the gate that is intended to fail closed.\n", "unknown"),  # r4: blocked
             ("## Blockers\nNo assessment has been made.\n", "unknown"),
             ("## Blockers\nNothing was reviewed.\n", "unknown"),
-            ("## Blockers\nNo new demonstrated defect in this delta.\n", "clean"),
-            ("## Blockers\nNo current failing check demonstrated.\n", "clean"),
-        ]
-        _, got = self._classes(bodies)
-        want = {f"{i + 1:040x}": c for i, (_, c) in enumerate(bodies)}
-        self.assertEqual(got, want, [(b, got[h], c) for (b, c), h in zip(bodies, want) if got[h] != c])
-
-    def test_adversary_r4_rerun_meaning_cases(self) -> None:  # adversary r4 rerun on 8694a086: A1-A4
-        bodies = [
-            # A1: "No"/"None" open clean text only when they say there is no blocker, defect or failure.
+            ("## Blockers\nNo new demonstrated defect in this delta.\n", "unknown"),  # r4: clean; not on the whitelist
+            ("## Blockers\nNo current failing check demonstrated.\n", "unknown"),  # r4: clean
             ("## Blockers\nNo assessment of the reported blocker has been made.\n", "unknown"),
             ("## Blockers\nNone of the blockers have been reviewed.\n", "unknown"),
-            ("## Blockers\nNo new independently established code blocker or SHARED BLOCKER.\n", "clean"),
-            ("## Blockers\nNo newly demonstrated behavior/security/CI blocker.\n", "clean"),
-            # A2: a closure counts for the B<n> it is stated of, not for every B<n> near a closure word.
-            ("## Blockers\nNone newly demonstrated.\nB1: tools/fixed.ps1:9 deletes another owner's lock.\n", "blocked"),
+            ("## Blockers\nNo new independently established code blocker or SHARED BLOCKER.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNo newly demonstrated behavior/security/CI blocker.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNone newly demonstrated.\nB1: tools/fixed.ps1:9 deletes another owner's lock.\n", "unknown"),  # r4: blocked; mixed
             ("## Blockers\nPrior B1: tools/fixed.ps1:9 deletes another owner's lock.\n", "unknown"),
-            ("## Blockers\nNone newly demonstrated.\nB1: B2 is fixed, but the lock deletion race occurs on every run.\n", "blocked"),
-            ("## Blockers\nNone newly demonstrated. Prior B1/B2/I1 are source-addressed.\nB2: b.ps1:9 adds a regression.\n", "clean"),
-            # A3: each clause is read on its own; a negation in one does not cover the next.
-            ("## Blockers\nNone newly demonstrated.\nNo new defects were found, but B1 remains open.\n", "blocked"),
-            ("## Blockers\nNone newly demonstrated.\nThere is no regression in the reader, but B1 remains open in the writer.\n", "blocked"),
-            ("## Blockers\nNone newly demonstrated.\nCI job1 did not fail, but job2 fails on the exact head.\n", "blocked"),
-            # A4: emphasis inside the line is read through.
-            ("## Blockers\nNone newly demonstrated.\nPrior **B1** persists at a.ps1:9.\n", "blocked"),
-            ("## Blockers\n**B1** closed: the lock is checked.\n", "clean"),
-            ("## Blockers\n__B1__ fixed: the lock is checked.\n", "clean"),
+            ("## Blockers\nB1: tools/lease.ps1:9 deletes another owner's lock.\n", "blocked"),
+            ("## Blockers\nB1: B2 is fixed, but the lock deletion race occurs on every run.\n", "unknown"),  # the line says fixed
+            ("## Blockers\nNone newly demonstrated. Prior B1/B2/I1 are source-addressed.\nB2: b.ps1:9 adds a regression.\n", "unknown"),  # r4: clean
+            ("## Blockers\nNone newly demonstrated.\nNo new defects were found, but B1 remains open.\n", "unknown"),  # r4: blocked
+            ("## Blockers\nNone newly demonstrated.\nCI job1 did not fail, but job2 fails on the exact head.\n", "unknown"),  # r4: blocked
+            ("## Blockers\nNone newly demonstrated.\nPrior **B1** persists at a.ps1:9.\n", "unknown"),  # r4: blocked
+            ("## Blockers\n**B1** closed: the lock is checked.\n", "blocked"),  # r4: clean; a declared limit ('closed' is not a fixed word)
+            ("## Blockers\n__B1__ fixed: the lock is checked.\n", "unknown"),  # r4: clean
             ("## Blockers\n- **B1 / P1:** a.ps1:3 races.\n", "blocked"),
         ]
         _, got = self._classes(bodies)
         want = {f"{i + 1:040x}": c for i, (_, c) in enumerate(bodies)}
         self.assertEqual(got, want, [(b, got[h], c) for (b, c), h in zip(bodies, want) if got[h] != c])
+
+    def test_dot_b7_counterexamples_are_unknown(self) -> None:  # B7 (Dot on a82b77cd; factory packet 6410642859)
+        bodies = [
+            ("## Blockers\nNo blockers have been reviewed.\n", "unknown"),
+            ("## Blockers\nNone.\nCI job1 did not fail, and job2 fails on the exact head\n", "unknown"),
+            ("## Blockers\nNone.\nB1: writer is now fixed, but the race still reproduces\n", "unknown"),
+            # May be unknown or clean, never blocked: no line starts B<n>.
+            ("## Blockers\nThere isn't a current B1\n", "unknown"),
+            ("## Blockers\nNone.\nThere isn't a current B1\n", "unknown"),
+            # r4 adversary rerun 2 A4: a contraction before a CI failure.
+            ("## Blockers\nNone.\nCI job1 hasn't failed.\n", "unknown"),
+        ]
+        _, got = self._classes(bodies)
+        want = {f"{i + 1:040x}": c for i, (_, c) in enumerate(bodies)}
+        self.assertEqual(got, want, [(b, got[h], c) for (b, c), h in zip(bodies, want) if got[h] != c])
+
+    def test_every_whitelisted_section_is_clean_and_nothing_else_is(self) -> None:  # B7
+        data = json.loads((HERE / "blocker-classes.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["schema"], "fleet/quality-lift/blocker-classes/v1")
+        self.assertEqual(data["closedWords"], ["source-addressed", "remedied", "resolved", "verified", "fixed"])
+        clean = [e["text"] for e in data["clean"]]
+        for required in ("None.", "None", "None demonstrated.", "No new demonstrated defect.", "No new demonstrated blocker.",
+                         "No demonstrated new defect."):
+            self.assertIn(required, clean)
+        self.assertEqual(len(clean), len(set(clean)))
+        bodies = [(f"## Blockers\n{t}\n", "clean") for t in clean]
+        # An extra sentence, a second line, or a near miss is not on the whitelist.
+        bodies += [(f"## Blockers\n{t} Merge once CI is green.\n", "unknown") for t in clean[:3]]
+        bodies += [(f"## Blockers\n{t}\nG1 OPEN.\n", "unknown") for t in clean[:3]]
+        bodies += [(f"## Blockers\n{e['text']}\n", "unknown") for e in data["excluded"]]
+        _, got = self._classes(bodies)
+        want = {f"{i + 1:040x}": c for i, (_, c) in enumerate(bodies)}
+        self.assertEqual(got, want, [(b, got[h], c) for (b, c), h in zip(bodies, want) if got[h] != c])
+
+    def test_a_missing_or_malformed_blocker_classes_file_is_a_usage_error(self) -> None:  # B7
+        for content in (None, "{", json.dumps({"schema": "fleet/quality-lift/blocker-classes/v1", "clean": [], "closedWords": ["fixed"]}),
+                        json.dumps({"schema": "fleet/quality-lift/blocker-classes/v1", "clean": [{"text": "None."}], "closedWords": [""]}),
+                        json.dumps({"schema": "x", "clean": [{"text": "None."}], "closedWords": ["fixed"]})):
+            where = self._dir()
+            shutil.copy(METER, where / METER.name)
+            shutil.copy(HERE / "review-sources.json", where / "review-sources.json")
+            if content is not None:
+                (where / "blocker-classes.json").write_text(content, encoding="utf-8")
+            proc = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(where / METER.name), "-Bus", str(self.bus),
+                                   "-Project", "demo", "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(self._dir()), "-NoStatuses", "-NoFetch"],
+                                  capture_output=True, text=True, timeout=120)
+            self.assertEqual(proc.returncode, 4, (content, proc.stdout + proc.stderr))
+            self.assertIn("blocker-classes", proc.stdout)
 
     def test_the_first_round_fraction_is_over_classified_prs(self) -> None:  # adversary r4 rerun A5
         bus = self._small_bus([
@@ -1388,7 +1441,7 @@ class MeterFixtureTests(unittest.TestCase):
             (p, _section(7, H1, "None demonstrated."), "2026-10-21T10:00:00+00:00", "h1 clean"),
             (p, _section(7, H1, "Readiness hold: a receipt is missing."), "2026-10-21T11:00:00+00:00", "h1 unknown later"),
             (q, _section(8, H2, "G1 OPEN: an ask is unanswered."), "2026-10-21T10:00:00+00:00", "h2 unknown"),
-            (q, _section(8, H2, "Prior B1 persists: a.ps1:3."), "2026-10-21T12:00:00+00:00", "h2 blocked later"),
+            (q, _section(8, H2, "B1 persists: a.ps1:3."), "2026-10-21T12:00:00+00:00", "h2 blocked later"),
             (q, _section(8, H3, "None."), "2026-10-21T13:00:00+00:00", "h3 clean"),
         ])
         cache = {f"acme/widget@{H2}": {"fetched": "2026-10-25T00:00:00Z", "rows": []}}
@@ -1401,7 +1454,7 @@ class MeterFixtureTests(unittest.TestCase):
         # PR 7's first head is unknown, PR 8's first head (H2) is blocked.
         self.assertEqual((since["prs"], since["firstRoundBlocked"], since["firstRoundUnknown"], since["firstRoundBlockedRate"]), (2, 1, 1, 1.0))
         self.assertEqual([r["head"] for r in self._corpus(out)], [H2])
-        self.assertTrue(self._corpus(out)[0]["blocker"].startswith("Prior B1 persists"), self._corpus(out))
+        self.assertTrue(self._corpus(out)[0]["blocker"].startswith("B1 persists"), self._corpus(out))
         md = (out / "quality-lift.md").read_text(encoding="utf-8-sig")
         self.assertIn("| since | 3 | 1 (50%) | 1 |", md)
         fleet_out = self._dir()
@@ -1450,8 +1503,8 @@ class MeterFixtureTests(unittest.TestCase):
             ("spaced thematic break", "class", sec("* " * 500), "unknown"),
             ("mixed marks before B1", "class", sec("*_" * 500 + "B1 x."), "blocked"),
             ("1000 bullets before B1", "class", sec("- " * 500 + "B1 x."), "blocked"),
-            ("long prose", "class", sec("None. " + "a check fails closed " * 5000), "clean"),
-            ("long B note", "class", sec("None. x B1 (" + "a" * 100000), "clean"),
+            ("long prose", "class", sec("None. " + "a check fails closed " * 5000), "unknown"),  # r4: clean
+            ("long B note", "class", sec("None. x B1 (" + "a" * 100000), "unknown"),  # r4: clean
             ("Blockers heading then spaces", "class", f"# a/b #1 / {H1}\n\n## Blockers{' ' * 5000}x\n", "unknown"),
             ("Blockers heading spaces and colons", "class", f"# a/b #1 / {H1}\n\n## Blockers{' :' * 5000}x\n", "unknown"),
             ("Blockers label then spaces", "class", f"# a/b #1 / {H1}\n\nBlockers{' ' * 5000}x\n", "unknown"),
@@ -1470,12 +1523,19 @@ class MeterFixtureTests(unittest.TestCase):
             ("PR number 2147483647", "identity", f"# a/b #2147483647 / {H1}\n", H1),
             ("PR number 2147483648", "identity", f"# a/b #2147483648 / {H1}\n", ""),
             ("front matter PR 2147483648", "identity", f"schema: cos-feedback.v1\nrepo: a/b\npr: 2147483648\nhead: {H1}\n\n", ""),
-            # The rerun fixes' own inputs: inner emphasis, clause breaks and many matches after one negation stay linear.
-            ("underscore run inside a word", "class", sec("None. a" + "_" * 100000 + "b"), "clean"),
-            ("star run inside a line", "class", sec("None. a" + "*" * 100000 + "b"), "clean"),
-            ("spaces before no contrast word", "class", sec("None. x" + " " * 100000 + "y"), "clean"),
-            ("many failures after a hedge", "class", sec("None. CI would " + "fails " * 20000), "clean"),
-            ("many current B1s after a negation", "class", sec("None. It is not true that " + "B1 remains " * 20000), "clean"),
+            # The r4 rerun fixes' inputs (r4: clean, each now unknown: more than a whitelisted section) stay linear.
+            ("underscore run inside a word", "class", sec("None. a" + "_" * 100000 + "b"), "unknown"),
+            ("star run inside a line", "class", sec("None. a" + "*" * 100000 + "b"), "unknown"),
+            ("spaces before no contrast word", "class", sec("None. x" + " " * 100000 + "y"), "unknown"),
+            ("many failures after a hedge", "class", sec("None. CI would " + "fails " * 20000), "unknown"),
+            ("many current B1s after a negation", "class", sec("None. It is not true that " + "B1 remains " * 20000), "unknown"),
+            # B7 (r5): the B<n> lead, the fixed-word scan and the whitelist on long untrusted lines.
+            ("long B line", "class", sec("B1 " + "fixe " * 40000), "blocked"),
+            ("long B line ending fixed", "class", sec("B1 " + "x" * 200000 + " fixed"), "unknown"),
+            ("SHARED then spaces", "class", sec("SHARED" + " " * 100000 + "x"), "unknown"),
+            ("None then spaces", "class", sec("None" + " " * 100000 + "."), "unknown"),
+            ("trailing marks after None.", "class", sec("None." + "*_" * 50000), "clean"),
+            ("many B lines", "class", sec("\n".join(["B1 fixed x."] * 1000)), "unknown"),
             # adversary r4 rerun A6 (minor): a non-ASCII digit names no pass (it used to throw and unmeasure the project).
             ("PR number in Arabic-Indic digits", "identity", f"# a/b #١ / {H1}\n", ""),
             ("front matter PR in Arabic-Indic digits", "identity", f"schema: cos-feedback.v1\nrepo: a/b\npr: ١\nhead: {H1}\n\n", ""),

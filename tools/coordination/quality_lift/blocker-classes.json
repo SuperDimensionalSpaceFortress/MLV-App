@@ -1,0 +1,42 @@
+{
+  "schema": "fleet/quality-lift/blocker-classes/v1",
+  "about": "Frozen data for Get-QlBlockerClass (B7, r5). clean: the exact texts that make a whole Blockers section clean (one content line, leading markdown marks and trailing * _ stripped, compared case-sensitively). Any other section is unknown unless a line is a blocker. closedWords: a line that starts B<n> or SHARED BLOCKER and says one of these words (whole word, any case) is not read as a blocker.",
+  "derivedFrom": {
+    "bus": "softwarefactory-fleet-doctrine d4d92caf3a5a60acb31d95ac82312880b7f87f03",
+    "since": "2026-08-01T00:00:00Z",
+    "passes": 1673,
+    "rule": "the six texts the B7 ruling names, plus every whole-section text seen at least twice in the corpus that states only that no blocker was found (with or without 'No SHARED BLOCKER'); seen counts are passes in the corpus"
+  },
+  "clean": [
+    { "text": "None.", "seen": 8 },
+    { "text": "None", "seen": 0 },
+    { "text": "None demonstrated.", "seen": 17 },
+    { "text": "No new demonstrated defect.", "seen": 0 },
+    { "text": "No new demonstrated blocker.", "seen": 0 },
+    { "text": "No demonstrated new defect.", "seen": 2 },
+    { "text": "(none)", "seen": 444 },
+    { "text": "(none in code)", "seen": 10 },
+    { "text": "None demonstrated. No SHARED BLOCKER.", "seen": 47 },
+    { "text": "None demonstrated; no SHARED BLOCKER.", "seen": 6 },
+    { "text": "None established. No SHARED BLOCKER.", "seen": 9 },
+    { "text": "None established; no SHARED BLOCKER.", "seen": 3 },
+    { "text": "None identified. No SHARED BLOCKER.", "seen": 2 },
+    { "text": "None demonstrated in this delta. No SHARED BLOCKER.", "seen": 3 },
+    { "text": "None demonstrated in inspected change. No SHARED BLOCKER.", "seen": 2 },
+    { "text": "None independently demonstrated in changed code. No SHARED BLOCKER.", "seen": 2 },
+    { "text": "None demonstrated in this delta.", "seen": 2 },
+    { "text": "None demonstrated in new delta.", "seen": 3 },
+    { "text": "None demonstrated in the owned delta.", "seen": 2 },
+    { "text": "None demonstrated in changed source.", "seen": 2 },
+    { "text": "None demonstrated in the source-first pass.", "seen": 2 },
+    { "text": "None demonstrated in source-first first pass.", "seen": 2 },
+    { "text": "None demonstrated in shipped default routing.", "seen": 2 },
+    { "text": "None on r3.", "seen": 2 }
+  ],
+  "excluded": [
+    { "text": "No new code blocker identified. The outstanding governance gates below remain incomplete.", "seen": 2, "why": "a second sentence names an open hold" },
+    { "text": "None remaining in the inspected exact-head evidence. No unresolved applicable ask identified.", "seen": 2, "why": "a second sentence is about asks, not blockers" },
+    { "text": "None on content. Merge once tip CI settles green.", "seen": 2, "why": "a second sentence sets a merge condition" }
+  ],
+  "closedWords": ["source-addressed", "remedied", "resolved", "verified", "fixed"]
+}

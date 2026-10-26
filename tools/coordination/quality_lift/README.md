@@ -1,12 +1,13 @@
 # Quality lift: measure the CoS-first-reader gap, then shift the adversary left
 
-Two portable, project-neutral files. Neither names a project, host or board path, and neither grants any runtime
+Portable, project-neutral files. Neither names a project, host or board path, and neither grants any runtime
 authority. The per-project values (which evidence is a project's review) live only in `review-sources.json`: the Chief-of-Staff (CoS) stays advisory (bus RULINGS.md R18.1), and the adversary pass is not a review key.
 
 | file | what it is |
 |---|---|
 | `Measure-FleetQualityLift.ps1` | Read-only meter. From the bus history of `cos-feedback/<project>/pr-*.md` (plus GitHub commit statuses, native PR reviews where declared, and PR bodies) it reports, per project and fleet-wide: CoS passes, blocked rate, first-round blocked PRs, heads CoS read first (no declared review evidence before CoS), true misses (a declared approval before CoS blocked), the raw status proxy (`statusBeforeCos`), CoS rounds per PR, and how many new PRs carry an `Adversary pass` line. The header lists the definitions and exit codes. |
 | `review-sources.json` | Which evidence each project's factory review leaves (`-ReviewSources`). "CoS read first" and true misses are claimed only from it; a project it does not name reads `unknown`. |
+| `blocker-classes.json` | Frozen classifier data: the exact whole-section texts that read clean and the words that exempt a `B<n>` line, with how they were derived from the bus corpus. |
 | `adversary-pass-prompt.md` | Template for ONE read-only contract-attack pass on an exact local head: list the invariants, build accepted inputs that break each, cite file:line, sweep the class. Only blocker/major findings that the diff introduced are actionable; minor and pre-existing ones are advisories. |
 | `test_fleet_quality_lift.py` | Fixture proof for the meter (`py -3 -m unittest tools/coordination/quality_lift/test_fleet_quality_lift.py`). |
 | `fixtures/cos-samples/` | Real CoS records copied verbatim from the bus, named `<project>--pr-<n>--<bus commit>.md`. With `FACTORY_BUS_CLONE` set, a test checks each one against the bus at that commit. |
@@ -41,27 +42,26 @@ the last row per repo@head. Rows are never rewritten. `-Since` must carry an off
   `#`s allowed) or a `Blockers:` label line. It runs to the next level-1 or level-2 heading (so `## Blockers`, then
   `## Improvements` and `- B1 ...`, leaves the section empty), or for a bare `Blockers:` label to its first blank line.
   Blank and thematic-break lines (`---`, `***`, `___`) carry nothing. A head written in capitals is read in lowercase.
-- **What it says, by meaning** (every line of the section, not only the first; leading quote, list, number, heading and
-  `*`/`_` marks are stripped by a linear scan, emphasis inside the line is read through, and each clause is read on its
-  own: a sentence, or the part after `, but` / `however` / `although` / `whereas`):
-  - **blocked:** a line starts `B<n>` (`- **B1 / P1:**`, `B2 validation mismatch remains.`), unless it says that B<n> is
-    closed, or it is a disposition note: the section opened with no-blocker text, says that this B<n> was closed or
-    addressed (`Prior B1/B2 are source-addressed`, or the line's own `B1: a.ps1:3 is now fixed`), and the line does not
-    say it still stands. A closure word elsewhere (`tools/fixed.ps1`, `B1: B2 is fixed`) closes nothing. Or a clause names a
-    B<n> as persisting, remaining, retained, open or current (`Prior612 B1 persists`, `Inherited #4 B1 remains`, `the
-    current B2`) with no negation before those words (`There is no current B1` says neither). Or a sentence reports a CI
-    run failing (`- CI: ... job119584694731 fails`, `actual [Windows shard 2](...) fails`, `CI is not green: ... failed`),
-    with no negation, hedge or look back before the failure word (`none has failed`, `would fail`, `Prior CI failed`).
-    `fails closed` names a design, not a failure.
-  - **clean:** nothing blocked, and the section opens with explicit no-blocker text: `None ...` or `(none)` (not `None of
-    ...`); `No` then only qualifier words, then what there is none of (`No new demonstrated defect`, `No current failing
-    check`, `No remaining B2`; not `No assessment of the reported blocker ...`); `B1 closed`; or a prior blocker stated fixed
-    or addressed (`Prior B1 is source-fixed.`, `Prior B1 remains closed.`, but not `Prior B1 is not fixed.`).
-  - **unclassified (unknown):** anything else, a missing or empty section included (`G1 OPEN`, `P2, high confidence: ...`,
-    `Readiness hold: ...`, `No assessment has been made.`). It is counted apart (`blockerUnknown`, listed in
-    `blockerUnknownHeads`), never as clean, and the blocked and first-round rates are over classified passes only (the
-    reports print first-round blocked as `n/classified PRs (k unclassified)`). A head with a clean pass and a later
-    unclassified one is unclassified; any blocking pass makes it blocked.
+- **What it says, read conservatively** (every line of the section; leading quote, list, number, heading and `*`/`_`
+  marks are stripped by a linear scan, and nothing is inferred from prose). Earlier rounds read prose by meaning; each
+  patch opened a new corner (`No blockers have been reviewed.` read clean), so the rules are now:
+  - **blocked:** a line's first token is `B<n>` or the `SHARED BLOCKER` label (`- **B1 / P1:**`, `B2 -- x`, `B2
+    validation mismatch remains.`, `SHARED BLOCKER (Dot): x`), that line does not say one of the `closedWords` in
+    `blocker-classes.json` (`source-addressed`, `remedied`, `resolved`, `verified`, `fixed`, as whole words), and the
+    section does not open with `None` or `No` (a B<n> line under such an opener is mixed, so unknown).
+  - **clean:** the whole section is one content line that, with trailing `*`/`_` also stripped, is exactly one of the
+    `clean` texts in `blocker-classes.json` (`None.`, `None demonstrated.`, `(none)`, `None demonstrated. No SHARED
+    BLOCKER.`, ...). The match is exact, case included; the file records how the list was derived from the bus corpus.
+  - **unclassified (unknown):** everything else. That includes prose (`Prior612 B1 persists`, `Inherited #4 B1 remains`,
+    a CI run that `fails`), every mixed section (`None.` and then any other line), a negation plus a later claim, a
+    missing or empty section, `G1 OPEN`, `P2, high confidence: ...`. It is counted apart (`blockerUnknown`, listed in
+    `blockerUnknownHeads`), never as clean or blocked, and the blocked and first-round rates are over classified passes
+    only (the reports print first-round blocked as `n/classified PRs (k unclassified)`). A head with a clean pass and a
+    later unclassified one is unclassified; any blocking pass makes it blocked.
+  - **Declared limits:** the unknown share is large by design (most CoS sections are prose). A `B<n>` line that only says
+    `closed` (`B1 closed: x`) reads blocked, because the corpus uses `closed` mostly in real blockers (`fail-closed`,
+    `CLOSED:`); a real `B<n>` line that also says `fixed` anywhere (`Keep fixed labels`) reads unknown.
+  - `blocker-classes.json` sits beside the meter; a missing or malformed one is a usage error (exit 4).
 - Bus and GitHub text is untrusted. Every pattern that reads it is linear and carries a 2 s match timeout. A timeout in a
   CoS file names the file and leaves the project not measured; in a PR body it leaves the adoption count unknown (null)
   with a named error. Neither stalls the run.
