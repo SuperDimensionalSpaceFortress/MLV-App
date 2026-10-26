@@ -806,8 +806,8 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         l2_dir = cls.tmp / "l2"
         # No -ModulePath module defines the extractor here, so every module is a candidate for a call that names none.
         cls.l2 = cls._scan("l2", [
-            ("Clean.psm1", [(n, cls.CLEAN) for n in ("LitClean", "LitDirty", "OffList", "Ambig", "AmbigDyn", "Spl", "Collide", "CollideSub", "IdxAmbig", "Nm")]),
-            ("Dirty.psm1", [(n, cls.RAW_WRITE) for n in ("LitClean", "LitDirty", "Ambig", "AmbigDyn", "IdxAmbig", "NmNm")]),
+            ("Clean.psm1", [(n, cls.CLEAN) for n in ("LitClean", "LitDirty", "OffList", "Ambig", "AmbigDyn", "Spl", "Collide", "CollideSub", "IdxAmbig", "Nm", "RedirA", "RedirB")]),
+            ("Dirty.psm1", [(n, cls.RAW_WRITE) for n in ("LitClean", "LitDirty", "Ambig", "AmbigDyn", "IdxAmbig", "NmNm", "RedirA", "RedirB")]),
             ("Only.psm1", [("OnlyHere", cls.CLEAN)]),
         ], ["Clean.psm1", "Dirty.psm1", "Only.psm1"], [
             "Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1') -Name @('LitClean')",
@@ -827,6 +827,11 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
             f"Get-AttrCudaEmbeddedFunctionSource -Name @('IdxAmbig') -ModulePath (@('{l2_dir / 'Dirty.psm1'}', '{l2_dir / 'Clean.psm1'}')[0])",
             # A7: a -Name that is an expression is not a literal name list.
             "Get-AttrCudaEmbeddedFunctionSource -Name ('Nm' + 'Nm')",
+            # r7 (adversary r6 A5): a redirection discards the value, so the extractor gets no -ModulePath at all; the call binds to no module.
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('RedirA') -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1' > $null)",
+            f"Get-AttrCudaEmbeddedFunctionSource -Name @('RedirB') -ModulePath ('{l2_dir / 'Clean.psm1'}' > $null)",
+            # r7 (adversary r6 A4 advisory): a comma list inside a comma list binds the inner list as one joined string.
+            "Get-AttrCudaEmbeddedFunctionSource -Name (('Nes','ted'),'Safe') -ModulePath 'C:\\fixture\\Bodies.psm1'",
         ], extra_files=[("sub/Clean.psm1", [("CollideSub", cls.RAW_WRITE)])])
         # The extractor's own module is on the list, so a call that names no -ModulePath reads exactly that module.
         cls.l2_default = cls._scan("l2-default", [
@@ -974,6 +979,8 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         # r7 (adversary r6 A4): $true / $false are 'True' / 'False' after a string and are an error before one, never ''.
         "Rename-Item -LiteralPath function:Redirect -NewName ($true + 'Join-Path')",
         "Rename-Item -LiteralPath function:Redirect -NewName (1 + 2)",
+        # r7 (adversary r6 A3): a comma list inside a comma list is one joined string (OFS), so it is never split into harmless fragments.
+        "Set-Item -Path (('function:Jo','in-Path'),'function:Harmless') -Value { 'C:\\fixture\\Dirty.psm1' }",
     )
     # Not shadows: the alias is for a command the scan does not evaluate, and a read of an unrelated function.
     ALIAS_CONTROLS = (
@@ -1258,6 +1265,16 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         self.assertEqual(self.modules_of(self.l2, "Nm"), [])
         self.assertEqual(self.modules_of(self.l2, "NmNm"), [])
 
+    def test_r7_a5_a_redirected_module_path_is_not_the_path_it_names(self) -> None:
+        for name in ("RedirA", "RedirB"):
+            self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2, name)], [("splice", name)], describe(self.of(self.l2, name)))
+            self.assertEqual(self.modules_of(self.l2, name), [], name)
+
+    def test_r7_a4_a_comma_list_inside_the_name_list_is_not_a_literal_list_of_names(self) -> None:
+        found = self.call_findings(self.l2, "(('Nes','ted'),'Safe')")
+        self.assertEqual(len(found), 1, describe(self.l2["splicedViolations"]))
+        self.assertIn("not a literal list of function names", found[0]["reason"])
+
     def test_l2_an_abbreviated_parameter_name_binds_like_the_full_one(self) -> None:
         # PowerShell binds -M to -ModulePath and -N to -Name.
         self.assertEqual(self.modules_of(self.l2_default, "AbbrevM"), ["Dirty.psm1"], json.dumps(self.l2_default["spliced"], indent=2))
@@ -1346,12 +1363,22 @@ class SplicedBodyScanPsScriptRootTests(unittest.TestCase):
         # r7 (adversary r6 A1): a cast over a comma list is one string at run time (joined by $OFS); on an item command it is never split.
         "PsrDriveCastList": "Set-Item -LiteralPath ([string]@('variable:PSScript','Root')) -Value 'C:\\dirty'\n",
         "PsrDriveCastListNew": "New-Item -Path ([string]('variable:PSScript','Root')) -Value 'C:\\dirty' -Force\n",
+        # r7 (adversary r6 A3): a comma list INSIDE a comma list binds as one string (joined by $OFS), so it is not split into fragments.
+        "PsrDriveNestedList": "$OFS = ''\nSet-Item -Path (('variable:PSScript','Root'),'variable:other') -Value 'C:\\dirty'\n",
+        # r7 (adversary r6 A1): `set` is an alias of Set-Variable.
+        "PsrSetAlias": "set PSScriptRoot 'C:\\dirty'\n",
+        "PsrSetAliasNamed": "set -Name PSScriptRoot -Value 'C:\\dirty'\n",
+        # r7 (adversary r6 A2): a cmdlet's own variable parameter binds the variable like -OutVariable does.
+        "PsrTeeVariable": "'C:\\dirty' | Tee-Object -Variable PSScriptRoot | Out-Null\n",
+        "PsrTeeVar": "'C:\\dirty' | Tee-Object -Var PSScriptRoot | Out-Null\n",
+        "PsrSessionVariable": "Invoke-WebRequest -Uri 'http://example.invalid' -SessionVariable PSScriptRoot | Out-Null\n",
     }
     CONTROLS = {
         # No rebinding: the call still binds to Clean.psm1 by full path.
         "PsrPlain": "$other = 'C:\\x'\nSet-Variable -Name Unrelated -Value 1\nGet-Date -OutVariable unrelated | Out-Null\n",
         # r7: a wrapped target that is some OTHER variable, and a cast list on an item command that names no variable, are not rebindings.
-        "PsrWrappedOther": "[object][string]$other = 'C:\\x'\n[ValidateNotNull()][string]$script:unrelated = 'y'\nSet-Item -Path variable:harmless -Value 5\n",
+        "PsrTeeOther": "'x' | Tee-Object -Variable keep | Out-Null\nset other 1\n",
+        "PsrWrappedOther":"[object][string]$other = 'C:\\x'\n[ValidateNotNull()][string]$script:unrelated = 'y'\nSet-Item -Path variable:harmless -Value 5\n",
     }
 
     @classmethod

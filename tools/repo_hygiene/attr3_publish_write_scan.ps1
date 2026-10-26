@@ -391,7 +391,13 @@ function Expand-Operands($Ast) {
     # callers read an operand built only from literals that has none as a fail-closed one. $OFS is never evaluated.
     $passedCast = $false
     $inner = Get-UnwrappedOperand $Ast ([ref]$passedCast)
-    if ($inner -is [System.Management.Automation.Language.ArrayLiteralAst] -and -not $passedCast) { return @($inner.Elements | ForEach-Object { Expand-Operands $_ }) }
+    # An ELEMENT that is itself a comma list is not split either (r7, adversary A3): `(('variable:PSScript','Root'),'x')` binds to a
+    # string[] whose first item is the inner list converted to ONE string (joined by $OFS), so it comes back whole.
+    if ($inner -is [System.Management.Automation.Language.ArrayLiteralAst] -and -not $passedCast) {
+        return @($inner.Elements | ForEach-Object {
+            if ((Get-UnwrappedOperand $_) -is [System.Management.Automation.Language.ArrayLiteralAst]) { $_ } else { Expand-Operands $_ }
+        })
+    }
     return @($Ast)
 }
 
@@ -599,7 +605,10 @@ function Get-PositionalCount($Command, [string[]]$SwitchNames = @()) {
 }
 
 function Test-SafeChild($Ast) {
-    if ($Ast -is [System.Management.Automation.Language.CommandExpressionAst]) { $Ast = $Ast.Expression }
+    if ($Ast -is [System.Management.Automation.Language.CommandExpressionAst]) {
+        if ($Ast.Redirections.Count -gt 0) { return $false }
+        $Ast = $Ast.Expression
+    }
     if ($Ast -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) { return $false }
     $value = [string]$Ast.Value
     if ([string]::IsNullOrWhiteSpace($value)) { return $false }
@@ -649,7 +658,10 @@ function Get-AssignedObjectOrigin($Assignment) {
     $node = $Assignment.Right
     while ($true) {
         if ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1) { $node = $node.PipelineElements[0]; continue }
-        if ($node -is [System.Management.Automation.Language.CommandExpressionAst]) { $node = $node.Expression; continue }
+        if ($node -is [System.Management.Automation.Language.CommandExpressionAst]) {
+            if ($node.Redirections.Count -gt 0) { return 'other' }   # `@{} > $null` binds nothing
+            $node = $node.Expression; continue
+        }
         break
     }
     if ($node -is [System.Management.Automation.Language.ConvertExpressionAst]) {
@@ -747,7 +759,8 @@ function Get-OtherBindings($Root, [string]$Name, [switch]$SkipVariableParameters
     # prefixes), which all bind a value of unknown origin ('other'). A -XxxVariable whose argument is not a
     # literal name could name any variable, so it counts against every receiver.
     $tags = [System.Collections.Generic.List[string]]::new()
-    $variableParameters = @('OutVariable', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'PipelineVariable', 'ov', 'ev', 'wv', 'iv', 'pv')
+    $variableParameters = @('OutVariable', 'ErrorVariable', 'WarningVariable', 'InformationVariable', 'PipelineVariable', 'ov', 'ev', 'wv', 'iv', 'pv',
+                            'Variable', 'SessionVariable', 'ResponseHeadersVariable', 'StatusCodeVariable')
     foreach ($node in $Root.FindAll({ param($n) $true }, $true)) {
         if ($node -is [System.Management.Automation.Language.ParameterAst]) {
             # `param([T]$local:r)` binds the same variable as `$r`: compare the name without its scope qualifier.
@@ -788,14 +801,18 @@ function Get-OtherBindings($Root, [string]$Name, [switch]$SkipVariableParameters
 
 function Test-Provable($Ast, $Root, $Visiting) {
     if ($null -eq $Ast) { return $false }
-    if ($Ast -is [System.Management.Automation.Language.CommandExpressionAst]) { return (Test-Provable $Ast.Expression $Root $Visiting) }
+    # A redirection (`Join-Path $Work 'x' > $null`) discards the value, so the expression is not the path it names.
+    if ($Ast -is [System.Management.Automation.Language.CommandExpressionAst]) {
+        if ($Ast.Redirections.Count -gt 0) { return $false }
+        return (Test-Provable $Ast.Expression $Root $Visiting)
+    }
     if ($Ast -is [System.Management.Automation.Language.ParenExpressionAst]) { return (Test-Provable $Ast.Pipeline $Root $Visiting) }
     if ($Ast -is [System.Management.Automation.Language.PipelineAst]) {
         if ($Ast.PipelineElements.Count -ne 1) { return $false }
         return (Test-Provable $Ast.PipelineElements[0] $Root $Visiting)
     }
     if ($Ast -is [System.Management.Automation.Language.CommandAst]) {
-        if ($Ast.GetCommandName() -cne 'Join-Path' -or $Ast.InvocationOperator -ne 'Unknown') { return $false }
+        if ($Ast.GetCommandName() -cne 'Join-Path' -or $Ast.InvocationOperator -ne 'Unknown' -or $Ast.Redirections.Count -gt 0) { return $false }
         $elements = @($Ast.CommandElements | Select-Object -Skip 1)
         # Exactly `Join-Path <base> <child>` (positional), nothing else.
         if ($elements.Count -ne 2) { return $false }
@@ -1070,7 +1087,11 @@ function Get-PsScriptRootRebinding($Root) {
     # (-OutV, -ErrorV, -ev). A one-letter prefix of a native tool's switch (`git cat-file -e`) is not one of them, so the
     # shortest prefix read is the shortest unique among the common parameters; -p is read only when it names PSScriptRoot.
     $variableParameters = @(@{ Full = 'ErrorVariable'; Alias = 'ev'; Min = 6 }, @{ Full = 'WarningVariable'; Alias = 'wv'; Min = 8 }, @{ Full = 'InformationVariable'; Alias = 'iv'; Min = 12 },
-                            @{ Full = 'OutVariable'; Alias = 'ov'; Min = 4 }, @{ Full = 'PipelineVariable'; Alias = 'pv'; Min = 1 })
+                            @{ Full = 'OutVariable'; Alias = 'ov'; Min = 4 }, @{ Full = 'PipelineVariable'; Alias = 'pv'; Min = 1 },
+                            # r7 (adversary A2): the cmdlets with a variable parameter of their own. -Var is the shortest -Variable (Tee-Object); -Va is
+                            # also -Value, so it is not read as one.
+                            @{ Full = 'Variable'; Alias = ''; Min = 3 }, @{ Full = 'SessionVariable'; Alias = ''; Min = 8 },
+                            @{ Full = 'ResponseHeadersVariable'; Alias = ''; Min = 16 }, @{ Full = 'StatusCodeVariable'; Alias = ''; Min = 11 })
     foreach ($command in @($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true))) {
         $elements = $command.CommandElements
         for ($i = 1; $i -lt $elements.Count; $i++) {
@@ -1091,7 +1112,7 @@ function Get-PsScriptRootRebinding($Root) {
             }
         }
     }
-    $variableCommands = @('set-variable', 'sv', 'new-variable', 'nv', 'remove-variable', 'rv', 'clear-variable', 'clv')
+    $variableCommands = @('set-variable', 'sv', 'set', 'new-variable', 'nv', 'remove-variable', 'rv', 'clear-variable', 'clv')
     $variableRoute = '^\s*(?:[A-Za-z0-9_.]+\\)?variable::?\s*[\\/]?(.*)$'
     foreach ($n in @($Root.FindAll({ param($x) $true }, $true))) {
         if ($n -is [System.Management.Automation.Language.CommandAst]) {
@@ -1176,10 +1197,11 @@ function Get-SpliceModuleBinding($Call, [string]$SourceDir, [string]$RootRebindi
     while ($true) {
         if ($node -is [System.Management.Automation.Language.ParenExpressionAst]) { $node = $node.Pipeline; continue }
         if ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1) { $node = $node.PipelineElements[0]; continue }
-        if ($node -is [System.Management.Automation.Language.CommandExpressionAst]) { $node = $node.Expression; continue }
+        # A redirection (`'C:\x\Clean.psm1' > $null`) discards the value: the extractor receives nothing, so it is not that path.
+        if ($node -is [System.Management.Automation.Language.CommandExpressionAst] -and $node.Redirections.Count -eq 0) { $node = $node.Expression; continue }
         break
     }
-    $dynamic = [pscustomobject]@{ kind = 'dynamic'; path = ''; reason = '' }
+    $dynamic =[pscustomobject]@{ kind = 'dynamic'; path = ''; reason = '' }
     if ($node -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $node.Splatted -and $node.VariablePath.UserPath -ieq 'null') {
         return [pscustomobject]@{ kind = 'default'; path = ''; reason = '' }
     }
@@ -1194,7 +1216,7 @@ function Get-SpliceModuleBinding($Call, [string]$SourceDir, [string]$RootRebindi
         try { return [pscustomobject]@{ kind = 'path'; path = [IO.Path]::GetFullPath([string]$node.Value); reason = '' } }
         catch { return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = '-ModulePath is not a valid path' } }
     }
-    if ($node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ieq 'Join-Path' -and $node.InvocationOperator -eq 'Unknown') {
+    if ($node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -ieq 'Join-Path' -and $node.InvocationOperator -eq 'Unknown' -and $node.Redirections.Count -eq 0) {
         $parts = @($node.CommandElements | Select-Object -Skip 1)
         if ($parts.Count -eq 2 -and @($parts | Where-Object { $_ -is [System.Management.Automation.Language.CommandParameterAst] }).Count -eq 0 -and
             $parts[0] -is [System.Management.Automation.Language.VariableExpressionAst] -and $parts[0].VariablePath.UserPath -ieq 'PSScriptRoot' -and
@@ -1254,6 +1276,8 @@ function Get-SpliceCallSites([string]$Path) {
                       ($n -is [System.Management.Automation.Language.PipelineAst]) -or ($n -is [System.Management.Automation.Language.CommandExpressionAst]) -or
                       ($n -is [System.Management.Automation.Language.ParenExpressionAst]))
         }, $true)).Count -gt 0
+        # A comma list inside a comma list (`(('Dan','ger'),'Safe')`) binds its inner list as ONE joined string, not as its elements.
+        if (-not $dynamic -and @($argument.FindAll({ param($n) $n -is [System.Management.Automation.Language.ArrayLiteralAst] }, $true)).Count -gt 1) { $dynamic = $true }
         $names = @()
         if (-not $dynamic) {
             $names = @($argument.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value })
