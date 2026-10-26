@@ -1479,6 +1479,16 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
         "AdvRenameVar": ("New-Variable -Name sourceRoute -Value '{dir}\\sub'\nRename-Item variable:sourceRoute PSScriptRoot -Force", PSR_CALL),
         "AdvRenamePipe": ("Get-Item variable:sourceRoute | Rename-Item -NewName PSScriptRoot", PSR_CALL),
         "AdvMoveComputed": ("Move-Item variable:sourceRoute $newName", PSR_CALL),
+        # r9 adversary pass 2 (A3): $PSCmdlet.GetVariableValue reaches the defaults dictionary by a name built from fragments.
+        "AdvGetVarValue": ("[CmdletBinding()]param()\n$PSCmdlet.GetVariableValue(('PSDefault' + 'ParameterValues'))['Get-AttrCudaEmbeddedFunctionSource:ModulePath'] = '{dirty}'", DEF_CALL),
+    }
+    # r9 adversary pass 2 (A1): a collection inside the -Name list binds as ONE string joined by $OFS ('Danger'), not as its elements.
+    NAME_LIST_CALLS = {
+        "AdvNestedNames": ("$OFS = ''", "Get-AttrCudaEmbeddedFunctionSource -Name @(@('Dan'; 'ger'), '{name}') -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"),
+    }
+    # r9 adversary pass 2 (A2): pipeline input to a rename is a source the scan cannot read; the new name is an evaluated command.
+    SHADOW_CALLS = {
+        "AdvPipeRename": ("function Redirect {{ param($Path, $ChildPath) '{dirty}' }}\nGet-Item function:Redirect | Rename-Item -NewName Join-Path", PSR_CALL),
     }
     # Not unproven: an unrelated variable parameter, the default module, an exact common-parameter alias.
     CALL_CONTROLS = {
@@ -1523,8 +1533,8 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
         cls.addClassCleanup(cls._tmp.cleanup)
         d = _long_path(Path(cls._tmp.name))
         dirty = d / "Dirty.psm1"
-        names = list(cls.CALLS) + list(cls.CALL_CONTROLS)
-        clean = "".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names)
+        names = list(cls.CALLS) + list(cls.CALL_CONTROLS) + list(cls.NAME_LIST_CALLS) + list(cls.SHADOW_CALLS) + ["Dan", "ger", "Danger"]
+        clean ="".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names)
         (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n" + clean, encoding="utf-8")
         (d / "Clean.psm1").write_text(clean, encoding="utf-8")
         dirty.write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
@@ -1533,6 +1543,8 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
         sources = []
         cases = {n: (pre, call) for n, (pre, call) in cls.CALLS.items()}
         cases.update({n: (pre, call) for n, (pre, call, _) in cls.CALL_CONTROLS.items()})
+        cases.update(cls.NAME_LIST_CALLS)
+        cases.update(cls.SHADOW_CALLS)
         for name, (pre, call) in cases.items():
             generator = d / f"gen-{name}.ps1"
             preamble = pre.format(dirty=dirty, dir=d)
@@ -1552,7 +1564,11 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
         cls.template.write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$PSDefaultParameterValues['New-Item:Name'] = '..\\..\\escape'\n"
                                 "New-Item -ItemType Directory -Path $Work -Force | Out-Null\n", encoding="utf-8")
         # r9 adversary A3 (advisory): a foreach variable replaces the value an assignment proved, for $Work as for a destination.
-        cls.foreach_templates = [d / "template-foreach-work.ps1", d / "template-foreach-dest.ps1"]
+        cls.foreach_templates = [d / "template-foreach-work.ps1", d / "template-foreach-dest.ps1", d / "template-param-shadow.ps1"]
+        # r9 adversary pass 2 (A4): a nested function's parameter shadows the outer destination inside the function that writes it.
+        cls.foreach_templates[2].write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$d = Join-Path $Work 'ok'\n"
+                                            "function Mutate { param([string]$d) New-Item -ItemType Directory -Path $d -Force }\n"
+                                            "Mutate 'C:\\outside'\n", encoding="utf-8")
         cls.foreach_templates[0].write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n"
                                             "foreach ($Work in @('C:\\outside')) { New-Item -ItemType Directory -Path $Work -Force }\n", encoding="utf-8")
         cls.foreach_templates[1].write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$dest = Join-Path $Work 'ok'\n"
@@ -1607,6 +1623,19 @@ class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
             self.assertEqual(len(setters), 1, describe(found))
             self.assertIn("other", setters[0]["origin"].split(";"), describe(setters))
             self.assertIn(("R5", "$r.Attributes"), SplicedBodyScanCoverageLimitTests.unlisted(found), f"{name}: the policy dropped the setter")
+
+    def test_r9_pass2_a1_a_collection_inside_the_name_list_is_not_a_literal_list_of_names(self) -> None:
+        for name in self.NAME_LIST_CALLS:
+            found = self.call_findings(name)
+            self.assertEqual(len(found), 1, describe(self.result["splicedViolations"]))
+            self.assertIn("not a literal list of function names", found[0]["reason"])
+            for scanned in ("Dan", "ger", name):
+                self.assertEqual(self.bound(scanned), [], f"{scanned} was scanned in place of the joined name runtime reads")
+
+    def test_r9_pass2_a2_a_rename_fed_by_the_pipeline_that_installs_an_evaluated_command_is_a_finding(self) -> None:
+        shadows = [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and "Rename-Item -NewName Join-Path" in f["text"]]
+        self.assertEqual(len(shadows), 1, describe(self.result["splicedViolations"]))
+        self.assertIn("not a string constant", shadows[0]["reason"])
 
     def test_r9_a3_a_foreach_variable_that_replaces_work_or_a_destination_is_not_provable(self) -> None:
         for template in self.foreach_templates:

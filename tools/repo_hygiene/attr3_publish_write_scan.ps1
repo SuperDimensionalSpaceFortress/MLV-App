@@ -498,6 +498,9 @@ function Get-ShadowKind($Node, [string[]]$Names) {
             # copy, an operand the scan cannot read as a constant, next to a route or an evaluated name, fails closed.
             $renameCommands = @('rename-item', 'rni', 'ren', 'move-item', 'mi', 'move', 'mv', 'copy-item', 'cpi', 'copy', 'cp')
             $routed = $false; $named = $false; $unreadable = $false; $fixedButUnread = $false
+            # r9 adversary A2: pipeline input (`Get-Item function:Redirect | Rename-Item -NewName Join-Path`) is a source the scan
+            # cannot read, so a constant new name next to it fails closed like one next to an unreadable operand.
+            if ($Node.Parent -is [System.Management.Automation.Language.PipelineAst] -and $Node.Parent.PipelineElements.IndexOf($Node) -gt 0) { $unreadable = $true }
             foreach ($element in @($Node.CommandElements | Select-Object -Skip 1)) {
                 $operandRoot = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
                 if ($null -eq $operandRoot) { continue }
@@ -1004,7 +1007,8 @@ function Get-VariableRouteBinding($Root, [string]$Name) {
         }
         elseif ($n -is [System.Management.Automation.Language.MemberExpressionAst]) {
             $memberName = $n.Member.Extent.Text.Trim('''', '"')
-            if (@('SessionState', 'SessionStateProxy', 'PSVariable') -icontains $memberName) { return "the session-state API (.$memberName)" }
+            # r9 adversary A3: $PSCmdlet.GetVariableValue(<name>) hands back a variable's value (the defaults dictionary itself) by a name.
+            if (@('SessionState', 'SessionStateProxy', 'PSVariable', 'GetVariableValue') -icontains $memberName) { return "the session-state API (.$memberName)" }
         }
         elseif ($n -is [System.Management.Automation.Language.TypeExpressionAst] -or $n -is [System.Management.Automation.Language.TypeConstraintAst]) {
             if ($n.TypeName.FullName -match '(?i)(^|\.)(psvariable|SessionState|SessionStateProxy|PSVariableIntrinsics)$') { return "the session-state API ([$($n.TypeName.FullName)])" }
@@ -1028,7 +1032,8 @@ function Get-DefaultParameterValuesReference($Root) {
             }
             elseif ((Get-ProviderLeaf $user) -ieq 'PSDefaultParameterValues') { return [pscustomobject]@{ Ast = $n; Reason = 'a reference to $PSDefaultParameterValues' } }
         }
-        elseif (([string]$n.Value) -match '(?i)PSDefaultParameterValues') { return [pscustomobject]@{ Ast = $n; Reason = 'a string that names PSDefaultParameterValues' } }
+        # r9 adversary A3: a name built from fragments ('PSDefault' + 'ParameterValues') has no string node of its own, so a fragment counts.
+        elseif (([string]$n.Value) -match '(?i)PSDefault|ParameterValues') { return [pscustomobject]@{ Ast = $n; Reason = 'a string that names, or is a fragment of, PSDefaultParameterValues' } }
     }
     $route = Get-VariableRouteBinding $Root 'PSDefaultParameterValues'
     if ($route) { return [pscustomobject]@{ Ast = $Root; Reason = $route } }
@@ -1063,8 +1068,15 @@ function Test-Provable($Ast, $Root, $Visiting) {
         if ($v.name -eq 'null') { return $true }
         # r9 adversary A3 (advisory, same class): a foreach variable, a multi-target assignment, [ref], a variable parameter or a variable
         # route replaces the value an assignment proved (`foreach ($dest in @('C:\outside'))`), for $Work as for any destination. A
-        # parameter of a nested function binds only inside it and is not counted here.
+        # parameter of a nested function binds only inside it, so it counts when it encloses THIS use (r9 adversary A4: `function Mutate
+        # { param([string]$d) New-Item -Path $d }` writes wherever the caller says, whatever the outer `$d = Join-Path $Work 'ok'` holds).
         if (@(Get-OtherBindings $Root $v.name | Where-Object { $_ -ne 'unbound' }).Count -gt 0 -or (Get-VariableRouteBinding $Root $v.name)) { return $false }
+        for ($scope = $Ast.Parent; $null -ne $scope; $scope = $scope.Parent) {
+            $parameters = @()
+            if ($scope -is [System.Management.Automation.Language.ScriptBlockAst] -and $null -ne $scope.ParamBlock) { $parameters += @($scope.ParamBlock.Parameters) }
+            if ($scope -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $null -ne $scope.Parameters) { $parameters += @($scope.Parameters) }
+            if (@($parameters | Where-Object { (Get-VariableName $_.Name).name -ieq $v.name }).Count -gt 0) { return $false }
+        }
         if ($v.name -ceq 'Work') { return $true }   # R5 separately proves $Work's single canonical assignment
         if (-not $Visiting.Add($v.name.ToLowerInvariant())) { return $false }
         try {
@@ -1423,6 +1435,29 @@ function Get-SpliceModuleBinding($Call, [string]$SourceDir, [string]$RootRebindi
     return $dynamic
 }
 
+function Test-FlatNameList($Ast, [bool]$Top) {
+    # True when $Ast is a string constant, or (only at the top, where @( ) of one statement is the list itself) a comma list or
+    # an @( ) of statements whose every element is a string constant. Parentheses around a string are transparent; a collection
+    # inside the list is not, because PowerShell converts it to ONE string for a [string[]] parameter.
+    while ($true) {
+        if ($Ast -is [System.Management.Automation.Language.ParenExpressionAst]) { $Ast = $Ast.Pipeline; continue }
+        if ($Ast -is [System.Management.Automation.Language.PipelineAst] -and $Ast.PipelineElements.Count -eq 1) { $Ast = $Ast.PipelineElements[0]; continue }
+        if ($Ast -is [System.Management.Automation.Language.CommandExpressionAst] -and $Ast.Redirections.Count -eq 0) { $Ast = $Ast.Expression; continue }
+        break
+    }
+    if ($Ast -is [System.Management.Automation.Language.StringConstantExpressionAst]) { return $true }
+    if (-not $Top) { return $false }
+    if ($Ast -is [System.Management.Automation.Language.ArrayExpressionAst]) {
+        $statements = @($Ast.SubExpression.Statements)
+        if ($statements.Count -eq 1) { return (Test-FlatNameList $statements[0] $true) }
+        return (@($statements | Where-Object { -not (Test-FlatNameList $_ $false) }).Count -eq 0)
+    }
+    if ($Ast -is [System.Management.Automation.Language.ArrayLiteralAst]) {
+        return (@($Ast.Elements | Where-Object { -not (Test-FlatNameList $_ $false) }).Count -eq 0)
+    }
+    return $false
+}
+
 function Get-SpliceCallSites([string]$Path) {
     # Every Get-AttrCudaEmbeddedFunctionSource call in the file, with the literal function names it asks for.
     $tokens = $null; $errors = $null
@@ -1473,6 +1508,9 @@ function Get-SpliceCallSites([string]$Path) {
             $names = @($argument.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value })
             if ($argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $names = @([string]$argument.Value) }
         }
+        # r9 adversary A1: a collection inside the list (`@(@('Dan'; 'ger'), 'Safe')`) binds as ONE string joined by $OFS, whatever
+        # node builds it, so only a string, or a flat list whose every element is a string, is a list of names.
+        if (-not $dynamic -and -not (Test-FlatNameList $argument $true)) { $dynamic = $true }
         if ($dynamic -or $names.Count -eq 0) {
             Add-SpliceFinding $source $call.Extent.StartLineNumber '' $text 'the -Name list is not a literal list of function names, so the spliced bodies cannot be enumerated'
             continue
