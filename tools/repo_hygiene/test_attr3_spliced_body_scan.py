@@ -961,6 +961,13 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Rename-Item -LiteralPath ('function:Redirect') -NewName (('Join', 'Path') -join '-')",
         "Move-Item function:Redirect ('{0}-Path' -f 'Join')",
         "Rename-Item -LiteralPath (('function', 'Redirect') -join ':') -NewName (('Join', 'Path') -join '-')",
+        # r6 (Dot B9): a cast over a comma list is ONE string at run time (joined by $OFS), so it is never split into the elements the
+        # scan would read as harmless constants; the whole operand is built only from literals the scan cannot reduce.
+        "Copy-Item -LiteralPath function:Redirect -Destination ([string]@('fun','ction:Join-Path'))",
+        "Rename-Item -LiteralPath function:Redirect -NewName ([string]@('Join','-Path'))",
+        "Move-Item function:Redirect ([string]('a','b'))",
+        # Elements that no scope-qualified-name reading flags on its own ('function:Join', '-Path'): only the whole cast operand is a finding.
+        "Copy-Item -LiteralPath function:Redirect -Destination ([string]@('function:Join','-Path'))",
     )
     # Not shadows: the alias is for a command the scan does not evaluate, and a read of an unrelated function.
     ALIAS_CONTROLS = (
@@ -971,6 +978,8 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "Rename-Item -LiteralPath function:Redirect -NewName ('Other-Name')",
         "Move-Item -LiteralPath $someFile -Destination $someFolder -Force",
         "Move-Item -LiteralPath 'C:\\a.txt', 'C:\\b.txt' -Destination 'C:\\dir' -Force:$true",
+        # r6 (Dot B9): a plain comma list (no cast) is still split into its elements and is not over-refused.
+        "Copy-Item function:Redirect 'a','b'",
     )
     ALIAS_PREAMBLE = ("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
                       + "".join(f"{line}\n" for line in ALIAS_SHADOWS + ALIAS_COMPUTED + PROVIDER_ROUTES + RENAME_COMPUTED + ALIAS_CONTROLS))
@@ -1149,8 +1158,9 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
     def test_r4_a1_a_rename_or_move_with_an_operand_the_scan_cannot_reduce_to_a_constant_fails_closed(self) -> None:
         by_text = {f["text"]: f for f in self.alias_findings()}
         for line in self.RENAME_COMPUTED:
-            self.assertIn(line, by_text, f"no finding for the computed rename operand in `{line}`\n" + describe(self.alias["splicedViolations"]))
-            self.assertIn("not a string constant", by_text[line]["reason"], line)
+            with self.subTest(line=line):
+                self.assertIn(line, by_text, f"no finding for the computed rename operand in `{line}`\n" + describe(self.alias["splicedViolations"]))
+                self.assertIn("not a string constant", by_text[line]["reason"], line)
 
     def test_r4_a1_the_template_is_held_to_the_same_rename_rule(self) -> None:
         shadows = {v["text"] for v in self.alias["violations"] if "shadow" in v["reason"] or "not a string constant" in v["reason"]}

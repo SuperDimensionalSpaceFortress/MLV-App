@@ -88,7 +88,8 @@
 # it is; on those commands an operand the scan cannot reduce to a constant, next to a function: / alias: route or an
 # evaluated name, is a finding of its own kind ('computed-rename'); so is an operand built only from literals that
 # the scan cannot reduce (`('Join', 'Path') -join '-'`), whatever sits beside it, because the source text fixes its
-# value. An operand holding a variable or a command is a run-time-built value and stays a declared limit. Left OPEN: a drive
+# value; a cast over an array-valued operand (`[string]@('fun', 'ction:Join-Path')`) is never split and fails closed (OFS-dependent).
+# An operand holding a variable or a command is a run-time-built value and stays a declared limit. Left OPEN: a drive
 # path built at run time (`'al' + 'ias:'`), Import-Alias, and a relative path after `Set-Location alias:`.
 #
 # $PSScriptRoot (r4, adversary r3 A2). `Join-Path $PSScriptRoot '<child>'` is read as the directory of the file that
@@ -353,10 +354,10 @@ function Test-VariableTailReachesRoot([string]$Leaf) {
     return ($Leaf -eq '' -or $Leaf -match '[$(\\/]' -or 'PSScriptRoot' -like $Leaf)
 }
 
-function Get-UnwrappedOperand($Ast) {
+function Get-UnwrappedOperand($Ast, [ref]$PassedCast) {
     # The expression inside any parentheses, one-expression sub-expression or @( ), single-statement pipeline and [string] cast
     # around it; the node itself when it is none of those (or holds more than one statement). @('x') binds a string parameter as
-    # 'x'; more elements, or none, are not one value.
+    # 'x'; more elements, or none, are not one value. $PassedCast (optional) is set when a cast sat on the way in.
     while ($true) {
         if ($Ast -is [System.Management.Automation.Language.ParenExpressionAst]) { $Ast = $Ast.Pipeline; continue }
         if ($Ast -is [System.Management.Automation.Language.SubExpressionAst] -or $Ast -is [System.Management.Automation.Language.ArrayExpressionAst]) {
@@ -371,7 +372,10 @@ function Get-UnwrappedOperand($Ast) {
             if ($Ast.Redirections.Count -gt 0) { break }
             $Ast = $Ast.Expression; continue
         }
-        if ($Ast -is [System.Management.Automation.Language.ConvertExpressionAst] -and $Ast.Type.TypeName.FullName -ieq 'string') { $Ast = $Ast.Child; continue }
+        if ($Ast -is [System.Management.Automation.Language.ConvertExpressionAst] -and $Ast.Type.TypeName.FullName -ieq 'string') {
+            if ($null -ne $PassedCast) { $PassedCast.Value = $true }
+            $Ast = $Ast.Child; continue
+        }
         break
     }
     return $Ast
@@ -379,8 +383,12 @@ function Get-UnwrappedOperand($Ast) {
 
 function Expand-Operands($Ast) {
     # An operand as the separate values it carries: a comma list (`'a', 'b'`, @('a', 'b')) is its elements, anything else itself.
-    $inner = Get-UnwrappedOperand $Ast
-    if ($inner -is [System.Management.Automation.Language.ArrayLiteralAst]) { return @($inner.Elements | ForEach-Object { Expand-Operands $_ }) }
+    # A cast over a comma list is NOT split: `[string]@('fun', 'ction:Join-Path')` is one string, joined by $OFS at run time, so its
+    # elements are not the values the command receives. It is returned whole; Get-ConstantString has no value for it, and the
+    # callers read an operand built only from literals that has none as a fail-closed one. $OFS is never evaluated.
+    $passedCast = $false
+    $inner = Get-UnwrappedOperand $Ast ([ref]$passedCast)
+    if ($inner -is [System.Management.Automation.Language.ArrayLiteralAst] -and -not $passedCast) { return @($inner.Elements | ForEach-Object { Expand-Operands $_ }) }
     return @($Ast)
 }
 
