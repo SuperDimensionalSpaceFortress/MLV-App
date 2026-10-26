@@ -64,6 +64,60 @@ def _stop_process_tree(proc, deadline=WRAPPER_KILL_DEADLINE, taskkill=_taskkill_
     return "; ".join(notes) if notes else "killed and reaped"
 
 
+FIXTURE_TMP_REMOVE_DEADLINE = 10  # seconds _FixtureTmp keeps retrying the removal of its temp dir before it reports the dir as left behind
+
+
+def _remove_tree_bounded(path, deadline=FIXTURE_TMP_REMOVE_DEADLINE):
+    """UM-SSH-FIXTURE-DIAG-PRESERVE-1: remove path, retrying for up to deadline s (a dying child may still hold a file).
+
+    Returns "" when the dir is gone, else a one-line note naming the last error.
+    """
+    end = time.monotonic() + deadline
+    while True:
+        try:
+            shutil.rmtree(path)
+            return ""
+        except OSError as exc:
+            if not os.path.exists(path):
+                return ""
+            last = exc
+        if time.monotonic() >= end:
+            return "temp dir %s was not removed within %d s: %s: %s" % (path, deadline, type(last).__name__, last)
+        time.sleep(0.25)
+
+
+class _FixtureTmp:
+    """Replacement for tempfile.TemporaryDirectory in this file's fixtures.
+
+    TemporaryDirectory.__exit__ raises PermissionError when a Windows file is still open, and that REPLACES the
+    failure in flight (the guard output, the stop/cleanup notes, the real assertion). Here the removal is bounded,
+    and a removal that fails is APPENDED to the failure in flight; with no failure in flight it is raised itself,
+    so a leaked handle is never swallowed. Assertions that read the guard output belong INSIDE the with block.
+    """
+
+    def __init__(self, deadline=FIXTURE_TMP_REMOVE_DEADLINE, remove=_remove_tree_bounded):
+        self._deadline = deadline
+        self._remove = remove
+        self.path = None
+
+    def __enter__(self):
+        self.path = tempfile.mkdtemp(prefix="um-ssh-fixture-")
+        return self.path
+
+    def __exit__(self, exc_type, exc, tb):
+        note = self._remove(self.path, self._deadline)
+        if not note:
+            return False
+        line = "[fixture cleanup] " + note
+        if exc is None:
+            raise AssertionError(line)
+        # Only AssertionError renders its args[0] as str(); other types (TimeoutExpired, OSError) would drop the note.
+        if isinstance(exc, AssertionError) and exc.args and isinstance(exc.args[0], str):
+            exc.args = (exc.args[0] + "\n" + line,) + exc.args[1:]
+            return False
+        raise AssertionError("%s\n(while handling %s: %s)" % (line, exc_type.__name__, exc)) from exc
+
+
 class UmSshStdinBoundTests(unittest.TestCase):
     def test_guard_files_exist(self):
         self.assertTrue(GUARD.is_file(), GUARD)
@@ -94,7 +148,8 @@ class UmSshStdinBoundTests(unittest.TestCase):
         # Measured 6.4-6.8 s at a 3 s deadline on the loaded hub VM (~3.5 s of pwsh start-up and the guard's own
         # um-ssh scenario); 15 s of headroom is ~4x that and still far below a delayed-failure mutant (30 s).
         allowance = deadline + 15
-        with tempfile.TemporaryDirectory() as tmp:
+        # The assertions sit inside the with: a teardown failure is then appended to them (see _FixtureTmp).
+        with _FixtureTmp() as tmp:
             pidfile = Path(tmp) / "hung-probe.pid"
             env = dict(os.environ, MLV_HUNG_PROBE_PIDFILE=str(pidfile))
             started = time.monotonic()
@@ -121,13 +176,13 @@ class UmSshStdinBoundTests(unittest.TestCase):
             cleanup_note = _best_effort_taskkill(probe_pid) if probe_pid else ""
             if cleanup_note:
                 text += "\n[fixture cleanup] " + cleanup_note
-        self.assertFalse(timed_out, "the guard was still blocked on a hung ssh -G probe long after its %d s deadline (%s)" % (deadline, stop_note))
-        self.assertTrue(probe_pid, "the hung probe never started:\n" + text)
-        self.assertEqual(guard.returncode, 1, text)
-        self.assertIn("ssh -G did not exit within %d s" % deadline, text)
-        self.assertIn("OVERALL FAIL", text)
-        self.assertLess(elapsed, allowance, "the guard took %.1f s for a %d s deadline (allowance %d s)" % (elapsed, deadline, allowance))
-        self.assertFalse(still_alive, "the hung probe (pid %s) was left running after the deadline (or tasklist did not answer within %d s)\n%s" % (probe_pid, TASKLIST_DEADLINE, text))
+            self.assertFalse(timed_out, "the guard was still blocked on a hung ssh -G probe long after its %d s deadline (%s)" % (deadline, stop_note))
+            self.assertTrue(probe_pid, "the hung probe never started:\n" + text)
+            self.assertEqual(guard.returncode, 1, text)
+            self.assertIn("ssh -G did not exit within %d s" % deadline, text)
+            self.assertIn("OVERALL FAIL", text)
+            self.assertLess(elapsed, allowance, "the guard took %.1f s for a %d s deadline (allowance %d s)" % (elapsed, deadline, allowance))
+            self.assertFalse(still_alive, "the hung probe (pid %s) was left running after the deadline (or tasklist did not answer within %d s)\n%s" % (probe_pid, TASKLIST_DEADLINE, text))
 
     @unittest.skipUnless(sys.platform == "win32", "um-ssh.ps1 is Windows-only")
     def test_guard_without_ssh_exe_on_path_takes_the_argv_fallback(self):
@@ -135,7 +190,7 @@ class UmSshStdinBoundTests(unittest.TestCase):
         pwsh = shutil.which("pwsh")
         if not pwsh:
             self.skipTest("pwsh not installed")
-        with tempfile.TemporaryDirectory() as tmp:
+        with _FixtureTmp() as tmp:
             # The seam is PATH itself: the guard looks ssh.exe up with Get-Command, and the only PATH entry
             # is an empty directory. pwsh is launched by absolute path, so it needs no PATH to start.
             env = dict(os.environ, PATH=tmp)
@@ -143,11 +198,11 @@ class UmSshStdinBoundTests(unittest.TestCase):
                 [pwsh, "-NoProfile", "-NonInteractive", "-File", str(GUARD), "-KnownHostsOnly"],
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120, env=env, cwd=tmp,
             )
-        text = result.stdout + result.stderr
-        self.assertNotIn("cannot be found on this object", text)
-        self.assertEqual(result.returncode, 0, text)
-        self.assertIn("PASS known_hosts path with space and ! stays one file", text)
-        self.assertIn("OVERALL PASS", text)
+            text = result.stdout + result.stderr
+            self.assertNotIn("cannot be found on this object", text)
+            self.assertEqual(result.returncode, 0, text)
+            self.assertIn("PASS known_hosts path with space and ! stays one file", text)
+            self.assertIn("OVERALL PASS", text)
 
     # ---- UM-SSH-G-PROBE-CLEANUP-HONESTY-1 ------------------------------------------------------------
     # Every fake below is made by the test itself in a temp dir; no lane, venue or host process is touched.
@@ -213,20 +268,20 @@ class UmSshStdinBoundTests(unittest.TestCase):
         if not shutil.which("pwsh"):
             self.skipTest("pwsh not installed")
         deadline = 5
-        with tempfile.TemporaryDirectory() as tmp:
+        with _FixtureTmp() as tmp:
             probe = self._make_fake_probe(tmp, "drain-probe", self._DRAIN_PROBE)
             rc, text, timed_out, _ = self._run_guard(
                 tmp, ["-KnownHostsOnly", "-ProbeSshPath", str(probe), "-ProbeDeadlineSeconds", str(deadline)],
                 pidfile=Path(tmp) / "drain.pids", allowance=deadline + 25)
-        self.assertFalse(timed_out, text)
-        self.assertEqual(rc, 1, text)
-        self.assertIn("OVERALL FAIL", text)
-        self.assertIn("drain did not finish within %d s" % deadline, text)
-        # A likely cause, not an observed one: descendants are not tracked once the root exits.
-        self.assertIn("a descendant may still hold the pipe open (descendants are not tracked once the root exits)", text)
-        self.assertNotIn("descendant still holds", text)
-        self.assertNotIn("the probe tree was killed", text)
-        self.assertNotIn("did not exit within", text)  # the root DID exit; that is the process-timeout wording
+            self.assertFalse(timed_out, text)
+            self.assertEqual(rc, 1, text)
+            self.assertIn("OVERALL FAIL", text)
+            self.assertIn("drain did not finish within %d s" % deadline, text)
+            # A likely cause, not an observed one: descendants are not tracked once the root exits.
+            self.assertIn("a descendant may still hold the pipe open (descendants are not tracked once the root exits)", text)
+            self.assertNotIn("descendant still holds", text)
+            self.assertNotIn("the probe tree was killed", text)
+            self.assertNotIn("did not exit within", text)  # the root DID exit; that is the process-timeout wording
 
     @unittest.skipUnless(sys.platform == "win32", "um-ssh.ps1 is Windows-only")
     def test_hung_probe_reports_kill_attempted_and_reap_confirmed(self):
@@ -234,18 +289,18 @@ class UmSshStdinBoundTests(unittest.TestCase):
         if not shutil.which("pwsh"):
             self.skipTest("pwsh not installed")
         deadline = 5
-        with tempfile.TemporaryDirectory() as tmp:
+        with _FixtureTmp() as tmp:
             probe = self._make_fake_probe(tmp, "hung-probe", self._HUNG_PROBE)
             rc, text, timed_out, _ = self._run_guard(
                 tmp, ["-KnownHostsOnly", "-ProbeSshPath", str(probe), "-ProbeDeadlineSeconds", str(deadline)],
                 pidfile=Path(tmp) / "hung.pids", allowance=deadline + 25)
-        self.assertFalse(timed_out, text)
-        self.assertEqual(rc, 1, text)
-        self.assertIn("ssh -G did not exit within %d s" % deadline, text)
-        self.assertIn("kill attempted", text)
-        self.assertIn("reap confirmed", text)
-        self.assertNotIn("reap unconfirmed", text)
-        self.assertNotIn("the probe tree was killed", text)
+            self.assertFalse(timed_out, text)
+            self.assertEqual(rc, 1, text)
+            self.assertIn("ssh -G did not exit within %d s" % deadline, text)
+            self.assertIn("kill attempted", text)
+            self.assertIn("reap confirmed", text)
+            self.assertNotIn("reap unconfirmed", text)
+            self.assertNotIn("the probe tree was killed", text)
 
     @unittest.skipUnless(sys.platform == "win32", "um-ssh.ps1 is Windows-only")
     def test_a_reap_that_cannot_be_confirmed_is_reported_as_unconfirmed(self):
@@ -253,18 +308,18 @@ class UmSshStdinBoundTests(unittest.TestCase):
         if not shutil.which("pwsh"):
             self.skipTest("pwsh not installed")
         deadline = 5
-        with tempfile.TemporaryDirectory() as tmp:
+        with _FixtureTmp() as tmp:
             probe = self._make_fake_probe(tmp, "hung-probe", self._HUNG_PROBE)
             rc, text, timed_out, _ = self._run_guard(
                 tmp, ["-KnownHostsOnly", "-ProbeSshPath", str(probe), "-ProbeDeadlineSeconds", str(deadline),
                       "-ProbeKill", "Noop"],
                 pidfile=Path(tmp) / "noop.pids", allowance=deadline + 30)
-        self.assertFalse(timed_out, text)
-        self.assertEqual(rc, 1, text)
-        self.assertIn("kill attempted", text)
-        self.assertIn("reap unconfirmed", text)
-        self.assertNotIn("reap confirmed", text)
-        self.assertNotIn("the probe tree was killed", text)
+            self.assertFalse(timed_out, text)
+            self.assertEqual(rc, 1, text)
+            self.assertIn("kill attempted", text)
+            self.assertIn("reap unconfirmed", text)
+            self.assertNotIn("reap confirmed", text)
+            self.assertNotIn("the probe tree was killed", text)
 
     @unittest.skipUnless(sys.platform == "win32", "um-ssh.ps1 is Windows-only")
     def test_a_kill_exception_is_named_not_swallowed(self):
@@ -272,17 +327,17 @@ class UmSshStdinBoundTests(unittest.TestCase):
         if not shutil.which("pwsh"):
             self.skipTest("pwsh not installed")
         deadline = 5
-        with tempfile.TemporaryDirectory() as tmp:
+        with _FixtureTmp() as tmp:
             probe = self._make_fake_probe(tmp, "hung-probe", self._HUNG_PROBE)
             rc, text, timed_out, _ = self._run_guard(
                 tmp, ["-KnownHostsOnly", "-ProbeSshPath", str(probe), "-ProbeDeadlineSeconds", str(deadline),
                       "-ProbeKill", "Throw"],
                 pidfile=Path(tmp) / "throw.pids", allowance=deadline + 30)
-        self.assertFalse(timed_out, text)
-        self.assertEqual(rc, 1, text)
-        self.assertIn("kill attempted but threw", text)
-        self.assertIn("simulated kill failure", text)
-        self.assertIn("reap unconfirmed", text)
+            self.assertFalse(timed_out, text)
+            self.assertEqual(rc, 1, text)
+            self.assertIn("kill attempted but threw", text)
+            self.assertIn("simulated kill failure", text)
+            self.assertIn("reap unconfirmed", text)
 
     @unittest.skipUnless(sys.platform == "win32", "um-ssh.ps1 is Windows-only")
     def test_probe_deadline_must_be_positive_and_bounded(self):
@@ -290,7 +345,7 @@ class UmSshStdinBoundTests(unittest.TestCase):
         if not shutil.which("pwsh"):
             self.skipTest("pwsh not installed")
         for bad in ("0", "-1", "301", "99999"):
-            with self.subTest(deadline=bad), tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(deadline=bad), _FixtureTmp() as tmp:
                 rc, text, timed_out, _ = self._run_guard(tmp, ["-KnownHostsOnly", "-ProbeDeadlineSeconds", bad], allowance=60)
                 self.assertFalse(timed_out, text)
                 self.assertEqual(rc, 2, text)
@@ -304,7 +359,7 @@ class UmSshStdinBoundTests(unittest.TestCase):
         if not shutil.which("pwsh"):
             self.skipTest("pwsh not installed")
         for ok in ("1", "300"):
-            with self.subTest(deadline=ok), tempfile.TemporaryDirectory() as tmp:
+            with self.subTest(deadline=ok), _FixtureTmp() as tmp:
                 probe = self._make_fake_probe(tmp, "quick-probe", "[Console]::Out.Write('userknownhostsfile x')\nexit 0\n")
                 rc, text, timed_out, _ = self._run_guard(
                     tmp, ["-KnownHostsOnly", "-ProbeSshPath", str(probe), "-ProbeDeadlineSeconds", ok], allowance=60)
@@ -421,6 +476,91 @@ class FixtureCleanupBoundTests(unittest.TestCase):
             return lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=text, stderr="")
         self.assertTrue(_pid_alive("4242", run=answer("python.exe   4242 Console   1   10,000 K\n")))
         self.assertFalse(_pid_alive("4242", run=answer("INFO: No tasks are running which match the specified criteria.\n")))
+
+    # ---- UM-SSH-FIXTURE-DIAG-PRESERVE-1 --------------------------------------------------------------
+    # tempfile.TemporaryDirectory raises PermissionError from __exit__ when a Windows file is still open, which
+    # replaces the guard output and the real assertion. _FixtureTmp keeps the original failure and appends the note.
+
+    @staticmethod
+    def _failing_remove(path, deadline):
+        return "temp dir %s was not removed within %d s: PermissionError: simulated open handle" % (path, deadline)
+
+    def test_a_cleanup_failure_is_appended_to_the_failure_in_flight(self):
+        with self.assertRaises(AssertionError) as caught:
+            with _FixtureTmp(remove=self._failing_remove) as tmp:
+                self.assertEqual(1, 2, "GUARD-OUTPUT-MARKER for " + tmp)
+        message = str(caught.exception)
+        self.assertIn("GUARD-OUTPUT-MARKER", message)
+        self.assertIn("[fixture cleanup] temp dir", message)
+        self.assertIn("simulated open handle", message)
+        shutil.rmtree(tmp)
+
+    def test_a_cleanup_failure_after_a_passing_body_is_raised_not_swallowed(self):
+        with self.assertRaises(AssertionError) as caught:
+            with _FixtureTmp(remove=self._failing_remove) as tmp:
+                pass
+        self.assertIn("[fixture cleanup]", str(caught.exception))
+        self.assertIn("simulated open handle", str(caught.exception))
+        shutil.rmtree(tmp)
+
+    def test_a_non_assertion_failure_is_chained_with_the_cleanup_note(self):
+        with self.assertRaises(AssertionError) as caught:
+            with _FixtureTmp(remove=self._failing_remove) as tmp:
+                raise subprocess.TimeoutExpired("guard", 5)
+        self.assertIn("[fixture cleanup]", str(caught.exception))
+        self.assertIn("TimeoutExpired", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, subprocess.TimeoutExpired)
+        shutil.rmtree(tmp)
+
+    def test_a_clean_teardown_removes_the_dir_and_adds_nothing(self):
+        with self.assertRaises(AssertionError) as caught:
+            with _FixtureTmp() as tmp:
+                (Path(tmp) / "f.txt").write_text("x")
+                self.fail("ONLY-THE-ORIGINAL")
+        self.assertEqual(str(caught.exception), "ONLY-THE-ORIGINAL")
+        self.assertFalse(Path(tmp).exists())
+
+    def test_no_fixture_in_this_file_uses_the_raw_temporary_directory(self):
+        import ast
+
+        raw = [
+            node.lineno
+            for node in ast.walk(ast.parse(Path(__file__).read_text(encoding="utf-8")))
+            if isinstance(node, ast.Attribute) and node.attr == "TemporaryDirectory"
+        ]
+        self.assertEqual(raw, [], "tempfile.TemporaryDirectory raises PermissionError from __exit__ and hides the guard output; use _FixtureTmp (lines %s)" % raw)
+
+    @unittest.skipUnless(sys.platform == "win32", "an open file blocks directory removal on Windows only")
+    def test_an_open_handle_at_teardown_keeps_the_guard_diagnostic(self):
+        held = None
+        tmp = None
+        try:
+            with self.assertRaises(AssertionError) as caught:
+                with _FixtureTmp(deadline=1) as tmp:
+                    held = open(Path(tmp) / "held-by-fixture.txt", "w")
+                    self.fail("GUARD-OUTPUT-MARKER: OVERALL FAIL")
+        finally:
+            if held:
+                held.close()
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+        message = str(caught.exception)
+        self.assertIn("GUARD-OUTPUT-MARKER: OVERALL FAIL", message)
+        self.assertIn("[fixture cleanup]", message)
+        self.assertIn("held-by-fixture.txt", message)
+        self.assertNotIsInstance(caught.exception, PermissionError)
+
+    @unittest.skipUnless(sys.platform == "win32", "an open file blocks directory removal on Windows only")
+    def test_a_handle_released_within_the_deadline_is_retried_not_reported(self):
+        import threading
+
+        held = {}
+        with _FixtureTmp(deadline=10) as tmp:
+            held["f"] = open(Path(tmp) / "late-release.txt", "w")
+            timer = threading.Timer(1.0, held["f"].close)
+            timer.start()
+        timer.join(timeout=15)
+        self.assertFalse(Path(tmp).exists())
 
 
 if __name__ == "__main__":
