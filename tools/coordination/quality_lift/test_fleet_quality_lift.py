@@ -59,6 +59,7 @@ if ($args[0] -eq 'api') {
     exit 0
 }
 if ($args[0] -eq 'pr' -and $args[1] -eq 'list') {
+    if (Test-Path -LiteralPath (Join-Path $dir 'fail-pr-list')) { exit 1 }
     $repo = $args[[array]::IndexOf($args, '--repo') + 1]
     $limit = [int]$args[[array]::IndexOf($args, '--limit') + 1]
     $file = Join-Path $dir ('prs-{0}.json' -f $repo.Replace('/', '_'))
@@ -727,7 +728,8 @@ class MeterFixtureTests(unittest.TestCase):
         out = self._dir()
         proc = self._run("-Bus", str(bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoStatuses", "-NoFetch")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
-        self.assertRegex((out / "fleet.md").read_text(encoding="utf-8-sig"), r"(?m)^\| x \| 0 \|.*\| 1 \|$")
+        # Its bus read failed, so it is named as not measured, never as 0 passes (adversary r3 A4).
+        self.assertRegex((out / "fleet.md").read_text(encoding="utf-8-sig"), r"(?m)^\| x \| not measured \|.*\| 1 \|$")
 
     # -- paths git would quote (CI DG-GIT-PATHLIST on 01639c98)
 
@@ -977,6 +979,110 @@ class MeterFixtureTests(unittest.TestCase):
                                   ("acme/widget", 7, "events"): [_dismissed(5, "approved", "2026-10-21T11:00:00Z")]})
         result, _ = self._measure_bus(bus, "p", cache=cache, gh=gh, declared=self.NATIVE_KEYBOT)
         self.assertEqual((result["windows"][0]["statusUnknown"], result["windows"][0]["trueMiss"]), (0, 1))
+
+    # -- adversary pass r3 on b522ea11
+
+    def test_more_heading_and_emphasis_forms_are_read(self) -> None:  # A1, A2
+        bodies = ["## Blockers [2026-10-21]\nB1 x.\n", "## **Blockers:**\nB1 x.\n", "## __Blockers:__\nB1 x.\n", "## **Blockers**:\nB1 x.\n",
+                  "## Blockers\n***B1*** x.\n", "## Blockers\n___B1___ x.\n", "## Blockers\n- ***B1 / P1:*** x.\n"]
+        commits, heads = [], []
+        for i, body in enumerate(bodies):
+            head = f"{i + 1:040x}"
+            heads.append(head)
+            commits.append((f"cos-feedback/p/pr-{i + 1}.md", f"# acme/widget #{i + 1} / {head}\n\n{body}", f"2026-10-21T10:0{i}:00+00:00", f"v{i}"))
+        _, got = self._blocked_heads(self._small_bus(commits), "p", heads)
+        self.assertEqual(sorted(got), sorted(heads), [(b, h in got) for b, h in zip(bodies, heads)])
+
+    def test_an_uppercase_head_names_the_pass_in_lowercase(self) -> None:  # A3
+        upper = H1.upper().replace("1", "A")
+        bus = self._small_bus([
+            ("cos-feedback/p/pr-7.md", f"# acme/widget #7 / {H2}\n\n## Blockers\nNone.\n\n# acme/widget #7 / {upper}\n\n## Blockers\nB1 x.\n",
+             "2026-10-21T10:00:00+00:00", "uppercase heading after a lowercase one"),
+            ("cos-feedback/p/pr-8.md", _front(8, H3.upper().replace("3", "C"), "## Blockers\n- B1 x.\n"), "2026-10-21T10:01:00+00:00", "uppercase front matter"),
+        ])
+        result, got = self._blocked_heads(bus, "p", [upper.lower(), H3.upper().replace("3", "C").lower()])
+        self.assertEqual(sorted(got), sorted([upper.lower(), "c" * 40]))
+        self.assertEqual((result["windows"][0]["passes"], result["windows"][0]["unparsed"]), (2, 0))
+
+    def test_an_unreadable_bus_is_not_measured_not_a_known_zero(self) -> None:  # A4, A5
+        bus = self._dir()
+        _git(bus, "init", "-q")
+        _commit(bus, "cos-feedback/x/pr-1.md", _section(1, H1, "B1 x."), "2026-10-20T00:00:00+00:00", "x")
+        _commit(bus, "cos-feedback/y/pr-2.md", _section(2, H2, "B1 x."), "2026-10-20T01:00:00+00:00", "y")
+        blob = _git(bus, "rev-parse", "HEAD:cos-feedback/x/pr-1.md")
+        loose = bus / ".git" / "objects" / blob[:2] / blob[2:]
+        os.chmod(loose, stat.S_IWRITE | stat.S_IREAD)
+        loose.unlink()
+        out = self._dir()
+        proc = self._run("-Bus", str(bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoStatuses", "-NoFetch",
+                         "-ReviewSources", str(self._sources({"x": REVIEW_STATUS, "y": REVIEW_STATUS})))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        x = json.loads((out / "x" / "quality-lift.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual([w["measured"] for w in x["windows"]], [False, False])
+        self.assertTrue((out / "x" / "quality-lift.md").read_text(encoding="utf-8-sig").startswith("QUALITY-LIFT x NOT MEASURED"))
+        self.assertFalse((out / "x" / "history.jsonl").exists(), "a failed read must not add a zero to the trend")
+        fleet = (out / "fleet.md").read_text(encoding="utf-8-sig")
+        self.assertRegex(fleet, r"(?m)^\| x \| not measured \|")
+        self.assertIn("| **fleet** | 1 | 1 (100%) |", fleet)  # y only
+        self.assertIn("Not measured, so not in the fleet totals: x", fleet)
+        self.assertTrue(json.loads((out / "y" / "quality-lift.json").read_text(encoding="utf-8-sig"))["windows"][0]["measured"])
+
+    def test_a_failed_pr_listing_leaves_adoption_unknown_not_zero(self) -> None:  # A4
+        gh = self._fake_gh(prs={"acme/widget": [{"number": 5, "body": "Adversary pass: x", "createdAt": _iso(NOW - timedelta(hours=1))}]})
+        (gh / "fail-pr-list").write_text("", encoding="utf-8")
+        result = self._measure("twin", self._dir(), gh=gh, expect=2)  # twin names acme/widget and fork/widget
+        self.assertEqual(result["shiftLeft"], {"prs": None, "withAdversaryLine": None})
+
+    def test_a_held_lock_in_fleet_mode_is_named_not_measured(self) -> None:  # A5
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7"),
+                               ("cos-feedback/q/pr-8.md", _section(8, H2, "B1 x."), "2026-10-21T11:00:00+00:00", "pr8")])
+        out = self._dir()
+        (out / "p").mkdir()
+        with open(out / "p" / ".quality-lift.lock", "a", encoding="utf-8"):
+            proc = self._run("-Bus", str(bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoStatuses", "-NoFetch", "-LockWaitSec", "0")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        fleet = (out / "fleet.md").read_text(encoding="utf-8-sig")
+        self.assertRegex(fleet, r"(?m)^\| p \| not measured \|")
+        self.assertIn("| **fleet** | 1 | 1 (100%) |", fleet)
+        self.assertFalse((out / "p" / "quality-lift.json").exists())
+
+    def test_a_corpus_row_from_weaker_evidence_is_superseded(self) -> None:  # A6
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7")])
+        out = self._dir()
+        # A row written by the 58806c8e meter, which read the dismissed approval as no approval.
+        (out / "corpus.jsonl").write_text(json.dumps({
+            "addedUtc": "2026-10-21T12:00:00Z", "cosUtc": "2026-10-21T10:00:00Z", "repo": "acme/widget", "pr": 7, "head": H1,
+            "blocker": "B1 x.", "successBeforeCos": [], "reviewApprovedBeforeCos": [], "nativeApprovedBeforeCos": [],
+            "reviewSource": "native reviews by keybot"}) + "\n", encoding="utf-8")
+        gh = self._fake_gh(pulls={("acme/widget", 7, "reviews"): [_review("keybot", "DISMISSED", "2026-10-21T09:00:00Z", H1, rid=5)],
+                                  ("acme/widget", 7, "events"): [_dismissed(5, "approved", "2026-10-21T11:00:00Z")]})
+        sources = self._sources({"p": self.NATIVE_KEYBOT})
+        args = ["-Bus", str(bus), "-Project", "p", "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoFetch", "-ReviewSources", str(sources)]
+        self.assertEqual(self._run(*args, gh=gh).returncode, 0)
+        rows = self._corpus(out)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[-1]["nativeApprovedBeforeCos"], rows[-1]["supersedes"]), (["pull-request-review/keybot"], True))
+        self.assertEqual(self._run(*args, gh=gh).returncode, 0)
+        self.assertEqual(len(self._corpus(out)), 2, "the same evidence basis is written once")
+        # A head first written while its project declared nothing gets a declared row once it declares.
+        out2 = self._dir()
+        cache = {f"acme/widget@{H1}": {"fetched": "2026-10-21T12:00:00Z", "rows": []}}
+        (out2 / "status-cache.json").write_text(json.dumps(cache), encoding="utf-8")
+        for declared in ({}, {"p": REVIEW_STATUS}):
+            proc = self._run("-Bus", str(bus), "-Project", "p", "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out2), "-NoFetch",
+                             "-NoStatuses", "-ReviewSources", str(self._sources(declared)))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([r["reviewApprovedBeforeCos"] for r in self._corpus(out2)], ["unknown", []])
+
+    def test_a_cache_time_that_is_not_text_is_malformed(self) -> None:  # A7
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7")])
+        base = {"context": "pull-request-review/keybot", "source": "review", "login": "keybot", "firstUtc": "2026-10-21T09:00:00Z",
+                "state": "DISMISSED", "successUtc": None, "failureUtc": None}
+        for field in ("unknownUtc", "successUtc", "failureUtc", "firstUtc"):
+            row = dict(base, **{field: {}})
+            cache = {f"acme/widget@{H1}": {"fetched": "2026-10-22T00:00:00Z", "native": True, "dismissals": True, "prs": [7], "rows": [row]}}
+            result, _ = self._measure_bus(bus, "p", cache=cache, expect=2, declared=self.NATIVE_KEYBOT)
+            self.assertEqual(result["windows"][0]["statusUnknown"], 1, field)
 
     def test_the_meter_is_ascii_and_names_no_board_path(self) -> None:
         raw = METER.read_bytes()

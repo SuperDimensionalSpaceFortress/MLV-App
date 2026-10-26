@@ -89,32 +89,34 @@ function Get-QlKey($p) { "$($p.repo)@$($p.head)" }
 # CoS text forms, all as the CoS writes them on the bus (measured 2026-10-26; tests carry real records):
 #   identity  the last "# <owner>/<repo> #<n> / <40-hex head>" heading, else the cos-feedback.v1 front matter (the
 #             leading "schema: cos-feedback.v1" block, up to its first blank line) naming repo:, pr: and head:
-#   section   a "## Blockers" or "### Blockers" heading (bold, a trailing colon or a parenthesised note allowed), or a
+#   section   a "## Blockers" or "### Blockers" heading (bold, a colon inside or after the bold, a note in () or []), or a
 #             "Blockers:" label line (bold or bulleted allowed) whose text may follow on the same line
 #   blocker   the section's first content line starts B<n>, after optional quote, heading (###+), bullet (- * +), number
-#             (1. 1)) and emphasis (** __ * _) marks. A line under the next level-1 or -2 heading is outside the section.
-$QlHeading = '(?m)^# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d+) / ([0-9a-f]{40})'
-$QlBlockedLine = '^(?:>[ \t]*)?(?:#{3,6}[ \t]+)?(?:[-*+][ \t]+|\d+[.)][ \t]+)?(?:\*\*|__|\*|_)?B\d'
+#             (1. 1)) and emphasis (one to three * or _) marks. A line under the next level-1 or -2 heading is outside it.
+#   A head may be written in either case; it is kept in lowercase, as git and GitHub print it.
+$QlHeading = '(?m)^# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d+) / ([0-9a-fA-F]{40})'
+$QlCorpusEvidence = 'r3'   # corpus row format: bump when a meter change can alter a row already written
+$QlBlockedLine = '^(?:>[ \t]*)?(?:#{3,6}[ \t]+)?(?:[-*+][ \t]+|\d+[.)][ \t]+)?(?:\*{1,3}|_{1,3})?B\d'
 
 # The pass a CoS file names: @{ repo; pr; head; section }, or $null when it names none.
 function Get-QlIdentity([string]$Txt) {
     $ms = [regex]::Matches($Txt, $QlHeading)
     if ($ms.Count) {
         $m = $ms[$ms.Count - 1]
-        return @{ repo = $m.Groups[1].Value; pr = [int]$m.Groups[2].Value; head = $m.Groups[3].Value; section = $Txt.Substring($m.Index) }
+        return @{ repo = $m.Groups[1].Value; pr = [int]$m.Groups[2].Value; head = $m.Groups[3].Value.ToLowerInvariant(); section = $Txt.Substring($m.Index) }
     }
     $fm = [regex]::Match($Txt, '\A(?:\uFEFF)?schema:[ \t]*cos-feedback\.v1[ \t]*\r?\n(?:[^\r\n]*\S[^\r\n]*\r?\n)*')
     if (-not $fm.Success) { return $null }
     $repo = [regex]::Match($fm.Value, '(?m)^repo:[ \t]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)[ \t]*\r?$')
     $pr = [regex]::Match($fm.Value, '(?m)^pr:[ \t]*(\d+)[ \t]*\r?$')
-    $head = [regex]::Match($fm.Value, '(?m)^head:[ \t]*([0-9a-f]{40})[ \t]*\r?$')
+    $head = [regex]::Match($fm.Value, '(?m)^head:[ \t]*([0-9a-fA-F]{40})[ \t]*\r?$')
     if (-not ($repo.Success -and $pr.Success -and $head.Success)) { return $null }
-    @{ repo = $repo.Groups[1].Value; pr = [int]$pr.Groups[1].Value; head = $head.Groups[1].Value; section = $Txt.Substring($fm.Length) }
+    @{ repo = $repo.Groups[1].Value; pr = [int]$pr.Groups[1].Value; head = $head.Groups[1].Value.ToLowerInvariant(); section = $Txt.Substring($fm.Length) }
 }
 
 # The first content line of the Blockers section ('' when there is none, or the section is empty).
 function Get-QlBlockerLine([string]$Sec) {
-    $h = [regex]::Match($Sec, '(?m)^#{2,3}[ \t]+(?:\*\*|__)?Blockers(?:\*\*|__)?[ \t]*:?[ \t]*(?:\([^)\r\n]*\))?[ \t]*\r?$')
+    $h = [regex]::Match($Sec, '(?m)^#{2,3}[ \t]+(?:\*\*|__)?Blockers[ \t]*:?(?:\*\*|__)?[ \t]*:?[ \t]*(?:\([^)\r\n]*\)|\[[^\]\r\n]*\])?[ \t]*\r?$')
     $l = [regex]::Match($Sec, '(?m)^(?:[-*+][ \t]+)?(?:\*\*|__)?Blockers(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*([^\r\n]*)')
     if (-not $h.Success -and -not $l.Success) { return '' }
     if ($l.Success -and (-not $h.Success -or $l.Index -lt $h.Index)) {
@@ -152,7 +154,7 @@ function Get-QlPasses([string]$Proj, [string]$From) {
             $blk = Get-QlBlockerLine $id.section
             $out += [pscustomobject]@{
                 utc = (ConvertTo-QlUtc $t); seq = $seq; parsed = $true; repo = $id.repo; pr = $id.pr
-                head = $id.head; blocked = ($blk -match $QlBlockedLine); blocker = $(if ($blk.Length -gt 160) { $blk.Substring(0, 160) } else { $blk })
+                head = $id.head; blocked = ($blk -cmatch $QlBlockedLine); blocker = $(if ($blk.Length -gt 160) { $blk.Substring(0, 160) } else { $blk })
             }
         }
     }
@@ -174,7 +176,7 @@ function Group-QlHeads([object[]]$Raw) {
 # --null prints each path verbatim before a NUL, so the pr-*.md filter runs on the literal project folder.
 function Get-QlRepos([string]$Proj) {
     # Either identity form names the repository: the heading, or the front matter's repo: line.
-    $lines = @(git -C $Bus grep --null -I -E -e '^# [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+ #[0-9]+ / [0-9a-f]{40}' -e '^repo:[[:blank:]]*[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+[[:blank:]]*$' HEAD -- ":(literal)cos-feedback/$Proj/" 2>$null)
+    $lines = @(git -C $Bus grep --null -I -E -e '^# [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+ #[0-9]+ / [0-9a-fA-F]{40}' -e '^repo:[[:blank:]]*[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+[[:blank:]]*$' HEAD -- ":(literal)cos-feedback/$Proj/" 2>$null)
     if ($LASTEXITCODE -gt 1) { throw "git grep of cos-feedback/$Proj failed (exit $LASTEXITCODE)" }
     $like = "HEAD:cos-feedback/$([WildcardPattern]::Escape($Proj))/pr-*.md"
     @($lines | ForEach-Object {
@@ -232,6 +234,8 @@ function Test-QlCacheEntry($e) {
             if ($null -ne $r.source -and $r.source -notin 'status', 'review', 'review-comment') { return $false }
             if ($r.source -in 'review', 'review-comment' -and ($r.login -isnot [string] -or -not $r.login)) { return $false }
             if ($r.source -eq 'review-comment' -and $null -ne $r.successUtc -and "$($r.successUtc)" -ne '') { return $false }
+            # A time is text (or the DateTime ConvertFrom-Json makes of it): an object would read as '' and so as "never".
+            foreach ($v in @($r.firstUtc, $r.successUtc, $r.failureUtc, $r.unknownUtc)) { if ($null -ne $v -and $v -isnot [string] -and $v -isnot [DateTime]) { return $false } }
             if ($null -ne $r.unknownUtc -and "$($r.unknownUtc)" -ne '') { if ($r.source -ne 'review') { return $false }; $null = ConvertTo-QlUtc $r.unknownUtc }
             $null = ConvertTo-QlUtc $r.firstUtc
             foreach ($v in @($r.successUtc, $r.failureUtc)) { if ($null -ne $v -and "$v" -ne '') { $null = ConvertTo-QlUtc $v } }
@@ -375,7 +379,7 @@ function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache, $Decl, [in
     }
     $rounds = @($P | Group-Object { "$($_.repo)#$($_.pr)" } | ForEach-Object { $_.Count })
     [ordered]@{
-        window = $Name; passes = $P.Count; unparsed = $Unparsed; blocked = $blocked.Count
+        window = $Name; measured = $true; passes = $P.Count; unparsed = $Unparsed; blocked = $blocked.Count
         blockedRate = $(if ($P.Count) { [math]::Round($blocked.Count / $P.Count, 3) } else { $null })
         prs = $firstPerPr.Count; firstRoundBlocked = @($firstPerPr | Where-Object blocked).Count
         firstRoundBlockedRate = $(if ($firstPerPr.Count) { [math]::Round(@($firstPerPr | Where-Object blocked).Count / $firstPerPr.Count, 3) } else { $null })
@@ -416,6 +420,7 @@ function Measure-QlProject([string]$Proj, [string]$Dir) {
     }
     if (-not $lock) {
         $empty = Get-QlWindow @() 'since' @{} $script:ReviewDecl[$Proj]
+        $empty.measured = $false
         return [pscustomobject]@{ project = $Proj; headline = "QUALITY-LIFT $Proj NOT MEASURED: another run holds the lock $lockPath"; all = $empty; d1 = $empty; adopt = [ordered]@{ prs = $null; withAdversaryLine = $null }; errors = 1 }
     }
     try { Measure-QlProjectLocked $Proj $Dir } finally { $lock.Dispose() }
@@ -429,7 +434,9 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
     $needNative = [bool]($decl -and $decl.nativeReviews)
     $raw = @()
     $from = $(if ($script:SinceUtc -lt $d1Start) { $script:SinceUtc } else { $d1Start })
-    try { $raw = @(Get-QlPasses $Proj $from.ToString('yyyy-MM-ddTHH:mm:ssZ')) } catch { $errors += "bus ${Proj}: $($_.Exception.Message)" }
+    # A failed bus read leaves the project NOT MEASURED: its counts are not zeros, and no history row is written.
+    $busOk = $true
+    try { $raw = @(Get-QlPasses $Proj $from.ToString('yyyy-MM-ddTHH:mm:ssZ')) } catch { $errors += "bus ${Proj}: $($_.Exception.Message)"; $busOk = $false }
     # Cut to the window FIRST, then fold per head: a blocking pass outside the window must not hide a clean pass inside it.
     $raw = @($raw | Where-Object { $_.utc -le $now })
     $unparsed = @($raw | Where-Object { -not $_.parsed })
@@ -473,13 +480,14 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
 
     $all = Get-QlWindow $passes 'since' $cache $decl @($unparsed | Where-Object { $_.utc -ge $script:SinceUtc }).Count
     $d1 = Get-QlWindow $passes24 'last-24h' $cache $decl @($unparsed | Where-Object { $_.utc -ge $d1Start }).Count
+    $all.measured = $busOk; $d1.measured = $busOk
 
     $adopt = [ordered]@{ prs = $null; withAdversaryLine = $null }
     $repos = @($heads | ForEach-Object repo)
     if (-not $NoStatuses) { try { $repos += @(Get-QlRepos $Proj) } catch { $errors += "repos ${Proj}: $($_.Exception.Message)" } }
     $repos = @($repos | Sort-Object -Unique)
     if ($repos.Count -and -not $NoStatuses) {
-        $n = 0; $w = 0
+        $n = 0; $w = 0; $listFailed = $false
         foreach ($rp in $repos) {
             try {
                 # No --search: where gh resolves through a .cmd shim, '>' in "created:>=" becomes a redirect.
@@ -492,18 +500,31 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
                 }
                 $prs = @($listed | Where-Object { $c = ConvertTo-QlUtc $_.createdAt; $c -ge $d1Start -and $c -le $now })
                 $n += $prs.Count; $w += @($prs | Where-Object { $_.body -match '(?im)^\W*Adversary pass' }).Count
-            } catch { $errors += "pr list ${rp}: $($_.Exception.Message)" }
+            } catch { $errors += "pr list ${rp}: $($_.Exception.Message)"; $listFailed = $true }
         }
-        $adopt.prs = $n; $adopt.withAdversaryLine = $w
+        # One failed listing makes the count unknown (null), never a partial sum read as complete.
+        if (-not $listFailed) { $adopt.prs = $n; $adopt.withAdversaryLine = $w }
     }
 
-    # The corpus keeps one row per blocked repo@head whose evidence is KNOWN; an unknown head is written on a later run.
+    # The corpus keeps one row per blocked repo@head and evidence basis whose evidence is KNOWN; an unknown head is written on
+    # a later run. The basis is the declared review source plus the row format (evidence = $QlCorpusEvidence): a head first
+    # written under weaker evidence (an older meter, or before its project declared review evidence) gets a new row with
+    # supersedes = true, and the LAST row per repo@head is the current one. Rows are never rewritten.
     # successBeforeCos is raw (every status context that said success); reviewApprovedBeforeCos (declared status contexts)
     # and nativeApprovedBeforeCos (declared native reviewers) are the declared approvals only. A line that does not parse
     # (a torn append) is kept as it is and named.
     $corpusFile = Join-Path $Dir 'corpus.jsonl'
-    $known = @{}; $badLines = 0
-    if (Test-Path -LiteralPath $corpusFile) { Get-Content -LiteralPath $corpusFile | Where-Object { $_.Trim() } | ForEach-Object { try { $known[(Get-QlKey ($_ | ConvertFrom-Json))] = 1 } catch { $badLines++ } } }
+    $source = Format-QlSource $decl
+    $known = @{}; $seen = @{}; $badLines = 0
+    if (Test-Path -LiteralPath $corpusFile) {
+        Get-Content -LiteralPath $corpusFile | Where-Object { $_.Trim() } | ForEach-Object {
+            try {
+                $row = $_ | ConvertFrom-Json
+                $seen[(Get-QlKey $row)] = 1
+                if ($row.evidence -eq $QlCorpusEvidence -and $row.reviewSource -eq $source) { $known[(Get-QlKey $row)] = 1 }
+            } catch { $badLines++ }
+        }
+    }
     if ($badLines) { $errors += "corpus.jsonl has $badLines line(s) that do not parse; kept as they are, their heads are not counted as recorded" }
     $newCorpus = 0
     foreach ($b in ($heads | Where-Object blocked | Sort-Object utc)) {
@@ -516,18 +537,19 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
             $approved = @($okRows | Where-Object { (Test-QlStatusRow $_) -and (Test-QlReviewRow $_ $decl) } | ForEach-Object context)
             $nativeApproved = @($okRows | Where-Object { -not (Test-QlStatusRow $_) -and (Test-QlReviewRow $_ $decl) } | ForEach-Object context)
         } else { $approved = 'unknown'; $nativeApproved = 'unknown' }
-        Add-QlJsonLine $corpusFile ([ordered]@{ addedUtc = $now.ToString('o'); cosUtc = $b.utc.ToString('o'); repo = $b.repo; pr = $b.pr; head = $b.head; blocker = $b.blocker; successBeforeCos = $prior; reviewApprovedBeforeCos = $approved; nativeApprovedBeforeCos = $nativeApproved; reviewSource = (Format-QlSource $decl) } | ConvertTo-Json -Compress)
-        $known[$k] = 1
+        Add-QlJsonLine $corpusFile ([ordered]@{ addedUtc = $now.ToString('o'); cosUtc = $b.utc.ToString('o'); repo = $b.repo; pr = $b.pr; head = $b.head; blocker = $b.blocker; successBeforeCos = $prior; reviewApprovedBeforeCos = $approved; nativeApprovedBeforeCos = $nativeApproved; reviewSource = $source; evidence = $QlCorpusEvidence; supersedes = $seen.ContainsKey($k) } | ConvertTo-Json -Compress)
+        $known[$k] = 1; $seen[$k] = 1
         $newCorpus++
     }
 
     $res = [ordered]@{ schema = 'fleet/quality-lift/v1'; project = $Proj; utc = $now.ToString('o'); since = $Since; windows = @($all, $d1); shiftLeft = $adopt; corpusNew = $newCorpus; errors = $errors }
     ($res | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath (Join-Path $Dir 'quality-lift.json') -Encoding utf8
-    Add-QlJsonLine (Join-Path $Dir 'history.jsonl') ([ordered]@{ utc = $now.ToString('o'); project = $Proj; blockedRate24h = $d1.blockedRate; firstRound24h = $d1.firstRoundBlockedRate; noPriorKey24h = $d1.noPriorKey; trueMiss24h = $d1.trueMiss; statusUnknown24h = $d1.statusUnknown; noPriorStatus24h = $d1.statusBeforeCos.noPriorStatus; reviewSource = $d1.reviewSource; rounds24h = $d1.roundsPerPr; adversaryLine = $adopt.withAdversaryLine; prs24h = $adopt.prs } | ConvertTo-Json -Compress)
+    if ($busOk) { Add-QlJsonLine (Join-Path $Dir 'history.jsonl') ([ordered]@{ utc = $now.ToString('o'); project = $Proj; blockedRate24h = $d1.blockedRate; firstRound24h = $d1.firstRoundBlockedRate; noPriorKey24h = $d1.noPriorKey; trueMiss24h = $d1.trueMiss; statusUnknown24h = $d1.statusUnknown; noPriorStatus24h = $d1.statusBeforeCos.noPriorStatus; reviewSource = $d1.reviewSource; rounds24h = $d1.roundsPerPr; adversaryLine = $adopt.withAdversaryLine; prs24h = $adopt.prs } | ConvertTo-Json -Compress) }
 
     $pct = { param($x) if ($null -eq $x) { 'n/a' } else { "$([math]::Round(100 * [double]$x))%" } }
     $md = @()
     $md += "QUALITY-LIFT $Proj $($now.ToString('yyyy-MM-ddTHH:mm'))Z: CoS blocker rate 24h $(& $pct $d1.blockedRate) (since $($Since.Substring(0,10)) $(& $pct $all.blockedRate)); first-round blocked 24h $($d1.firstRoundBlocked)/$($d1.prs); CoS read first 24h $(Format-QlFirst $d1); true misses 24h $($d1.trueMiss); review evidence: $($d1.reviewSource); no status before CoS 24h (proxy) $(Format-QlProxy $d1); adversary-pass PRs 24h $($adopt.withAdversaryLine)/$($adopt.prs)$(if ($errors) { "; ERRORS $($errors.Count)" })"
+    if (-not $busOk) { $md[0] = "QUALITY-LIFT $Proj NOT MEASURED: the bus read failed; ERRORS $($errors.Count)" }
     $md += ''
     $md += "| window | CoS passes | blocked | first-round blocked (PRs) | CoS read first | true misses | no status before CoS (proxy) | CoS rounds per PR |"
     $md += "|---|---|---|---|---|---|---|---|"
@@ -585,7 +607,10 @@ $fl += "|---|---|---|---|---|---|---|---|---|---|---|"
 # The fleet's CoS-first and true-miss counts sum ONLY projects that declare review evidence; the proxy sums every project.
 $tp = 0; $tb = 0; $tu = 0; $np = 0; $nd = 0; $dn = 0; $dm = 0; $db = 0; $du = 0; $sn = 0
 # A project with no passes is listed when it has errors (a held lock, an unreadable bus object), so its diagnostic shows.
+# A project that was not measured (its bus read failed, or another run held its lock) is named and left out of the totals.
+$notMeasured = @()
 foreach ($r in ($results | Where-Object { $_.all.passes -gt 0 -or $_.errors } | Sort-Object { - $_.all.passes }, project)) {
+    if (-not $r.all.measured) { $fl += "| $($r.project) | not measured | | | $($r.all.reviewSource) | | | | | | $($r.errors) |"; $notMeasured += $r.project; continue }
     $fl += "| $($r.project) | $($r.all.passes) | $($r.all.blocked) ($(& $pct $r.all.blockedRate)) | $($r.all.firstRoundBlocked)/$($r.all.prs) | $($r.all.reviewSource) | $(Format-QlFirst $r.all) | $($r.all.trueMiss) | $(Format-QlProxy $r.all) | $($r.all.roundsPerPr) | $($r.adopt.withAdversaryLine)/$($r.adopt.prs) | $($r.errors) |"
     $np++; $tp += $r.all.passes; $tb += $r.all.blocked; $tu += $r.all.statusUnknown; $sn += $r.all.statusBeforeCos.noPriorStatus
     if ($r.all.noPriorKey -isnot [string]) { $nd++; $dn += $r.all.noPriorKey; $dm += $r.all.trueMiss; $db += $r.all.blocked; $du += $r.all.statusUnknown }
@@ -593,6 +618,7 @@ foreach ($r in ($results | Where-Object { $_.all.passes -gt 0 -or $_.errors } | 
 $fleetFirst = $(if ($nd) { Format-QlOf $dn ([pscustomobject]@{ blocked = $db; statusUnknown = $du }) } else { 'unknown' })
 $fleetMiss = $(if ($nd) { $dm } else { 'unknown' })
 $fl += "| **fleet** | $tp | $tb ($(if ($tp) { [math]::Round(100 * $tb / $tp) } else { 'n/a' })%) | | $nd of $np projects | $fleetFirst | $fleetMiss | $(Format-QlOf $sn ([pscustomobject]@{ blocked = $tb; statusUnknown = $tu })) | | | |"
+if ($notMeasured) { $fl += ''; $fl += "Not measured, so not in the fleet totals: $($notMeasured -join ', ') (see source errors)" }
 if ($skipped) { $fl += ''; $fl += "Not measured (bus folders starting with _ or .): $($skipped -join ', ')" }
 $unnamed = @($results | Where-Object { $_.all.unparsed } | ForEach-Object { "$($_.project) $($_.all.unparsed)" })
 if ($unnamed) { $fl += ''; $fl += "CoS files that name no pass (not measured): $($unnamed -join ', ')" }

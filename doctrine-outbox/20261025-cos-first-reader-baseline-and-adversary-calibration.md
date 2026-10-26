@@ -18,7 +18,7 @@ law4: attested
 
 Two more projects had 3 clean passes. Correction: an earlier draft read 202 passes, 53 blocked. That meter skipped files naming their pass only in cos-feedback.v1 front matter (the other 140 passes) and read listed or bold blockers (`- B1`, `- **B1 / P1:**`, `Blockers: B1`) as clean.
 
-Before CoS, mlv-app heads carried only review/fable, review/sol, review/opus. New mlv-app PRs with an Adversary pass line, last 24 h: 8 of 38.
+Before CoS, mlv-app heads carried only review/fable, review/sol, review/opus. New mlv-app PRs with an Adversary pass line, last 24 h: 10 of 38.
 
 **mlv-app calibration.** One read-only Codex pass per head, given worktree, diff and commit subjects, never the CoS text. A hit (criterion fixed before reading results) is the CoS blocker's file, code region and invariant.
 - Four heads factory keys approved and CoS later blocked: 4 of 4 hit blind (3 exact, 1 same line and invariant): a caller window loosening a 3 h lease budget; null plan entries dropped before validation; a file vanishing between existence check and hash; a default-parameter binder escaping a stale-literal guard.

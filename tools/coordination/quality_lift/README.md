@@ -23,7 +23,14 @@ pwsh -NoProfile -File tools/coordination/quality_lift/Measure-FleetQualityLift.p
 (it writes `<OutDir>\fleet.md`). The meter writes only under `-OutDir`, except one `git pull --ff-only` of the bus
 before it measures; `-NoFetch` skips that pull, and a pull that fails is a named source error. `-NoStatuses` reads
 nothing from GitHub: blocked heads with no cached statuses then count as "unknown", never as "CoS read first". Exit 0
-means measured, 2 measured with source errors (named in the report), 3 bus unreadable, and 4 a usage error.
+means measured, 2 measured with source errors (named in the report), 3 bus unreadable, and 4 a usage error. A project
+whose bus history cannot be read, or whose lock another run holds, is reported as **not measured**: its report says so,
+it adds no history row, and the fleet table names it and leaves it out of the fleet totals. When a PR listing fails, the
+adoption count is unknown (null), never a partial sum.
+
+`corpus.jsonl` holds one row per blocked head and evidence basis (the declared review source and the row format,
+`evidence`). A head first written under weaker evidence gets a new row with `supersedes: true`, so read the last row
+per repo@head. Rows are never rewritten.
 
 ## What the meter reads from a CoS file
 
@@ -31,8 +38,9 @@ means measured, 2 measured with source errors (named in the report), 3 bus unrea
   (`repo:`, `pr:` and `head:` in the leading `schema: cos-feedback.v1` block). A file with neither is counted as
   "names no pass" in the report, never silently dropped.
 - **Blocked:** the first content line of the Blockers section starts `B<n>`. The section is a `## Blockers` or
-  `### Blockers` heading (bold, a trailing colon or a note in brackets allowed) or a `Blockers:` label line. The line may
-  carry quote, list (`- * +`, `1.`, `1)`), `###` heading or bold/italic marks before `B<n>`. A line under the next level-1
+  `### Blockers` heading (bold, a colon inside or after the bold, a note in `()` or `[]` allowed) or a `Blockers:` label
+  line. The line may carry quote, list (`- * +`, `1.`, `1)`), `###` heading or one to three `*`/`_` marks before `B<n>`.
+  A head written in capitals is read as the same head in lowercase. A line under the next level-1
   or level-2 heading is outside the section, so `## Blockers` followed by `## Improvements` and `- B1 ...` is clean.
   `None demonstrated.`, `- None.` and `Prior B1 is fixed.` are clean.
 
