@@ -5,6 +5,7 @@ um-ssh.ps1 is Windows-only (ssh.exe, taskkill), so this wrapper skips elsewhere.
 """
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,18 @@ def _stop_process_tree(proc, deadline=WRAPPER_KILL_DEADLINE, taskkill=_taskkill_
 FIXTURE_TMP_REMOVE_DEADLINE = 10  # seconds _FixtureTmp keeps retrying the removal of its temp dir before it reports the dir as left behind
 
 
+def _rmtree_clearing_readonly(path):
+    """shutil.rmtree that clears a Windows read-only attribute and retries the entry, as TemporaryDirectory does."""
+    def clear(func, target, _error):
+        os.chmod(target, stat.S_IWRITE)
+        func(target)
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=clear)
+    else:
+        shutil.rmtree(path, onerror=clear)
+
+
 def _remove_tree_bounded(path, deadline=FIXTURE_TMP_REMOVE_DEADLINE):
     """UM-SSH-FIXTURE-DIAG-PRESERVE-1: remove path, retrying for up to deadline s (a dying child may still hold a file).
 
@@ -75,11 +88,15 @@ def _remove_tree_bounded(path, deadline=FIXTURE_TMP_REMOVE_DEADLINE):
     end = time.monotonic() + deadline
     while True:
         try:
-            shutil.rmtree(path)
+            _rmtree_clearing_readonly(path)
             return ""
         except OSError as exc:
-            if not os.path.exists(path):
-                return ""
+            try:
+                os.stat(path)
+            except FileNotFoundError:
+                return ""  # gone; os.path.exists is not used because it reads any stat error (PermissionError) as gone
+            except OSError:
+                pass
             last = exc
         if time.monotonic() >= end:
             return "temp dir %s was not removed within %d s: %s: %s" % (path, deadline, type(last).__name__, last)
@@ -529,6 +546,39 @@ class FixtureCleanupBoundTests(unittest.TestCase):
             if isinstance(node, ast.Attribute) and node.attr == "TemporaryDirectory"
         ]
         self.assertEqual(raw, [], "tempfile.TemporaryDirectory raises PermissionError from __exit__ and hides the guard output; use _FixtureTmp (lines %s)" % raw)
+
+    def test_a_read_only_file_with_no_open_handle_is_still_removed(self):
+        """Adversary A3: TemporaryDirectory clears the read-only attribute before it retries; plain rmtree does not."""
+        with _FixtureTmp(deadline=2) as tmp:
+            target = Path(tmp) / "readonly.txt"
+            target.write_text("x")
+            os.chmod(target, stat.S_IREAD)
+        self.assertFalse(Path(tmp).exists())
+
+    def test_a_dir_that_cannot_be_stat_ed_is_not_reported_as_gone(self):
+        """Adversary A2: os.path.exists turns a PermissionError into False; only FileNotFoundError means gone."""
+        path = tempfile.mkdtemp(prefix="um-ssh-fixture-")
+        real_stat = os.stat
+
+        def denied(target, *args, **kwargs):
+            if os.fspath(target) == path:
+                raise PermissionError(13, "Access is denied", path)
+            return real_stat(target, *args, **kwargs)
+
+        def refuse(target, *args, **kwargs):
+            raise PermissionError(13, "Access is denied", target)
+
+        try:
+            from unittest import mock
+
+            # os.path.exists reports False for ANY stat error; the stub models that, so only an explicit os.stat can tell.
+            with mock.patch.object(shutil, "rmtree", refuse), mock.patch.object(os, "stat", denied), \
+                    mock.patch.object(os.path, "exists", lambda target: False):
+                note = _remove_tree_bounded(path, deadline=0)
+        finally:
+            shutil.rmtree(path, ignore_errors=True)
+        self.assertIn("was not removed", note)
+        self.assertIn("PermissionError", note)
 
     @unittest.skipUnless(sys.platform == "win32", "an open file blocks directory removal on Windows only")
     def test_an_open_handle_at_teardown_keeps_the_guard_diagnostic(self):
