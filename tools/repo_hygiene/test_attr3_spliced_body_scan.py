@@ -450,7 +450,9 @@ class SplicedBodyScanHeaderTests(unittest.TestCase):
             self.assertIn(needle, limits, f"the scan header's EXPLICIT LIMITS block lost: {needle}")
         # ATTR3-SCAN-COVERAGE-LIMITS-1: the header states the module binding and the property-set origin exactly.
         for needle in ("MODULE BINDING", "the module the extractor will read for THAT call", "fail closed",
-                       "PROPERTY SETS IN BODIES", "'constructed:<Type>'", "this script still decides nothing"):
+                       "PROPERTY SETS IN BODIES", "'constructed:<Type>'", "this script still decides nothing",
+                       # r9: the class rule, and the rules a spliced body is held to (R8 included).
+                       "UNPROVEN BINDING", "unproven-binding", "$PSDefaultParameterValues", "R1 R2 R3 R4 R5 R6 R8"):
             self.assertIn(needle, flat, f"the scan header no longer states: {needle}")
         self.assertNotIn("security boundary", flat.replace("NOT a security boundary", "").replace("not a security boundary", ""),
                          "the scan is a regression tripwire; its header must not claim it is a security boundary")
@@ -480,6 +482,9 @@ class SplicedBodyScanOnRealSourcesTests(unittest.TestCase):
         self.assertGreater(len(spliced), 40, "suspiciously few spliced functions enumerated")
         unresolved = [v for v in self.result["splicedViolations"] if v["rule"] == "splice"]
         self.assertEqual(unresolved, [], describe(unresolved))
+        # r9: no real call, body or module binds by a route the scan cannot prove.
+        unproven = [v for v in self.result["splicedViolations"] if "unproven-binding" in (v["rule"], v["token"])]
+        self.assertEqual(unproven, [], describe(unproven))
         names = {s["name"] for s in spliced}
         # Anchors from each generator family: an enumeration that lost a family would drop these.
         for anchor in ("Publish-AttrCudaText", "Remove-AttrCudaTree", "Get-AttrCudaSessionLocked",
@@ -1276,10 +1281,13 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         self.assertIn("not a literal list of function names", found[0]["reason"])
 
     def test_l2_an_abbreviated_parameter_name_binds_like_the_full_one(self) -> None:
-        # PowerShell binds -M to -ModulePath and -N to -Name.
-        self.assertEqual(self.modules_of(self.l2_default, "AbbrevM"), ["Dirty.psm1"], json.dumps(self.l2_default["spliced"], indent=2))
-        self.assertEqual([(f["rule"], f["token"]) for f in self.of(self.l2_default, "AbbrevM")], [("R2", "New-Item")])
-        self.assertEqual(self.modules_of(self.l2_default, "NameAbbrev"), ["Extractor.psm1"])
+        # PowerShell binds -M to -ModulePath and -N to -Name, by prefix against the extractor's parameter set AT RUN TIME. r9 (hub
+        # ruling, rule 3): the scan does not prove that set, so an abbreviation is an unproven binding (fails closed), never a scan of
+        # the module the prefix merely looks like. Before r9, -M was read as -ModulePath and Dirty.psm1's body was scanned.
+        for name, needle in (("AbbrevM", "-M (Join-Path"), ("NameAbbrev", "-N @('NameAbbrev')")):
+            found = self.call_findings(self.l2_default, needle)
+            self.assertEqual([f["token"] for f in found], ["unproven-binding"], describe(self.l2_default["splicedViolations"]))
+            self.assertEqual(self.modules_of(self.l2_default, name), [], f"{name}: a module was scanned for an unproven binding")
 
     def test_l2_an_empty_blank_or_null_module_path_is_the_default_module(self) -> None:
         found = self.of(self.l2_default, "EmptyOnly")
@@ -1419,6 +1427,155 @@ class SplicedBodyScanPsScriptRootTests(unittest.TestCase):
         for name in self.CONTROLS:
             self.assertEqual(self.findings_for(name), [], describe(self.result["splicedViolations"]))
             self.assertEqual([s["module"].rsplit("/", 1)[-1] for s in self.result["spliced"] if s["name"] == name], ["Clean.psm1"])
+
+
+@requires_pwsh
+@unittest.skipUnless(os.name == "nt", "the ATTR-3 host jobs and their helpers are Windows-only")
+class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
+    """r9 (hub ruling; opus r8 B1/B2, sol r8 L2): the UNPROVEN-BINDING class rule. Eight rounds each closed one construct that changes
+    WHICH module or object a name binds to at run time, and the next key found another. The rule is the class: a route the scan
+    cannot evaluate statically makes the binding unproven, and the scan reports that (token 'unproven-binding') instead of reading
+    the module or object it would merely assume.
+
+    One scan covers every case: each generator case lives in its own file (a $PSDefaultParameterValues reference is per file), each
+    body case is its own function. Extractor.psm1 (clean, defines the extractor) is what an unchanged reading binds; Dirty.psm1 is what
+    runtime reads.
+    """
+
+    RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
+    PSR_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"
+    DEF_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}'"
+    # name -> (preamble, call). {dirty} is Dirty.psm1's full path, {dir} the fixture directory.
+    CALLS = {
+        # sol r8, verbatim shapes: a literal default redirects the extractor (named, positional, wildcard) or Join-Path.
+        "SolNamed": ("$PSDefaultParameterValues = @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        "SolPositional": ("$PSDefaultParameterValues = @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", "Get-AttrCudaEmbeddedFunctionSource '{name}'"),
+        "SolWildcard": ("$PSDefaultParameterValues = @{{ '*:ModulePath' = '{dirty}' }}", DEF_CALL),
+        "SolJoinPath": ("$PSDefaultParameterValues = @{{ 'Join-Path:AdditionalChildPath' = '..\\Dirty.psm1' }}",
+                        "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Extractor.psm1')"),
+        # rule 1: every form that reads or changes $PSDefaultParameterValues.
+        "DpvIndex": ("$PSDefaultParameterValues['Get-AttrCudaEmbeddedFunctionSource:ModulePath'] = '{dirty}'", DEF_CALL),
+        "DpvAdd": ("$PSDefaultParameterValues.Add('Get-AttrCudaEmbeddedFunctionSource:ModulePath', '{dirty}')", DEF_CALL),
+        "DpvGlobal": ("$global:PSDefaultParameterValues = @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        "DpvAliasRef": ("$d = $PSDefaultParameterValues\n$d['Get-AttrCudaEmbeddedFunctionSource:ModulePath'] = '{dirty}'", DEF_CALL),
+        "DpvMember": ("$script:PSDefaultParameterValues.'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}'", DEF_CALL),
+        "DpvSetVar": ("Set-Variable -Name PSDefaultParameterValues -Value @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        "DpvBraced": ("${{variable:PSDefaultParameterValues}} = @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        "DpvGetVarWild": ("(Get-Variable PSDefault*).Value['Get-AttrCudaEmbeddedFunctionSource:ModulePath'] = '{dirty}'", DEF_CALL),
+        "DpvPsVariable": ("$ExecutionContext.SessionState.PSVariable.Set('PSDefaultParameterValues', @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }})", DEF_CALL),
+        "DpvReduced": ("Set-Variable -Name ('PSDefault' + 'ParameterValues') -Value @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        # opus r8 B2, verbatim shapes: a prefix unique for THAT command rebinds $PSScriptRoot (Tee-Object -Va, Invoke-WebRequest -Ses).
+        "OpusTeeVa": ("'{dir}' | Tee-Object -Va PSScriptRoot | Out-Null", PSR_CALL),
+        "OpusSes": ("Invoke-WebRequest -Uri 'http://example.invalid' -Ses PSScriptRoot", PSR_CALL),
+        # rule 2 on the extractor input $PSScriptRoot: the variable object, the session-state API, a computed name after a short prefix.
+        "PsrGetVar": ("(Get-Variable PSScriptRoot).Value = '{dir}\\sub'", PSR_CALL),
+        "PsrPsVariable": ("$ExecutionContext.SessionState.PSVariable.Set('PSScriptRoot', '{dir}\\sub')", PSR_CALL),
+        "PsrTeeVaComp": ("'{dir}\\sub' | Tee-Object -Va $someName | Out-Null", PSR_CALL),
+        # rule 3: an abbreviated extractor parameter, and a splat.
+        "AbbrevMod": ("", "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -Mod (Join-Path $PSScriptRoot 'Clean.psm1')"),
+        "AbbrevNa": ("", "Get-AttrCudaEmbeddedFunctionSource -Na '{name}'"),
+        "SplatBound": ("", "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' @PSBoundParameters"),
+    }
+    # Not unproven: an unrelated variable parameter, the default module, an exact common-parameter alias.
+    CALL_CONTROLS = {
+        "CtlPlain": ("$other = @{{ a = 1 }}\n'x' | Tee-Object -Variable keep | Out-Null", PSR_CALL, "Clean.psm1"),
+        "CtlDefault": ("", DEF_CALL, "Extractor.psm1"),
+        "CtlAlias": ("", "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -vb -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')", "Clean.psm1"),
+    }
+    # opus r8 B1 and rule 2 on an R5 receiver: a binder the origin model did not follow left the receiver 'literal'.
+    BODIES = {
+        "B1SetVariable": "    param([string]$Target)\n    $r = @{}\n    Set-Variable -Name r -Value (Get-Item -LiteralPath $Target)\n    $r.Attributes = 'Hidden'",
+        "B1NewItemVar": "    param([string]$Target)\n    $r = @{}\n    New-Item -Path variable:r -Value (Get-Item $Target) -Force\n    $r.Attributes = 1",
+        "B1Sv": "    param([string]$Target)\n    $r = @{}\n    sv r (Get-Item -LiteralPath $Target)\n    $r.Attributes = 'Hidden'",
+        "B1Set": "    param([string]$Target)\n    $r = @{}\n    set r (Get-Item -LiteralPath $Target)\n    $r.Attributes = 'Hidden'",
+        "B1NewVariable": "    param([string]$Target)\n    $r = @{}\n    New-Variable -Name r -Value (Get-Item -LiteralPath $Target) -Force\n    $r.Attributes = 'Hidden'",
+        "B1PsVarSet": "    param([string]$Target)\n    $r = @{}\n    $ExecutionContext.SessionState.PSVariable.Set('r', (Get-Item $Target))\n    $r.Attributes = 1",
+        "B1GetVarValue": "    param([string]$Target)\n    $r = @{}\n    (Get-Variable r).Value = Get-Item -LiteralPath $Target\n    $r.Attributes = 1",
+        "B1SetItemVar": "    param([string]$Target)\n    $r = @{}\n    Set-Item -Path variable:r -Value (Get-Item $Target)\n    $r.Attributes = 1",
+        "B1Computed": "    param([string]$Target, [string]$n)\n    $r = @{}\n    Set-Variable -Name $n -Value (Get-Item $Target)\n    $r.Attributes = 1",
+        "B1RemoveVar": "    $r = @{}\n    Remove-Variable -Name r\n    $r.Attributes = 1",
+        "B1TeeVa": "    param([string]$Target)\n    $r = @{}\n    Get-Item $Target | Tee-Object -Va r | Out-Null\n    $r.Attributes = 1",
+    }
+    BODY_CONTROLS = {
+        "B1CtlOther": "    $r = @{}\n    Set-Variable -Name other -Value 1\n    $r.a = 1",
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-unproven-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        d = _long_path(Path(cls._tmp.name))
+        dirty = d / "Dirty.psm1"
+        names = list(cls.CALLS) + list(cls.CALL_CONTROLS)
+        clean = "".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names)
+        (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n" + clean, encoding="utf-8")
+        (d / "Clean.psm1").write_text(clean, encoding="utf-8")
+        dirty.write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
+        (d / "sub").mkdir()
+        (d / "sub" / "Clean.psm1").write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
+        sources = []
+        cases = {n: (pre, call) for n, (pre, call) in cls.CALLS.items()}
+        cases.update({n: (pre, call) for n, (pre, call, _) in cls.CALL_CONTROLS.items()})
+        for name, (pre, call) in cases.items():
+            generator = d / f"gen-{name}.ps1"
+            preamble = pre.format(dirty=dirty, dir=d)
+            generator.write_text((preamble + "\n" if preamble else "") + "$e = " + call.format(name=name) + "\n", encoding="utf-8")
+            sources.append(generator)
+        bodies = {**cls.BODIES, **cls.BODY_CONTROLS}
+        (d / "Body.psm1").write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in bodies.items()), encoding="utf-8")
+        body_gen = d / "gen-body.ps1"
+        body_gen.write_text("$e = Get-AttrCudaEmbeddedFunctionSource -Name @(" + ", ".join(f"'{n}'" for n in bodies)
+                            + ") -ModulePath (Join-Path $PSScriptRoot 'Body.psm1')\n", encoding="utf-8")
+        sources.append(body_gen)
+        # A module the generator imports runs its top-level code in the generator's session; a template is held to rule 1 too
+        # ('New-Item:Name' hands New-Item the -Name R2 forbids).
+        (d / "Imported.psm1").write_text("$global:PSDefaultParameterValues['Get-AttrCudaEmbeddedFunctionSource:ModulePath'] = 'C:\\fixture\\Dirty.psm1'\n"
+                                         "function ImportedHelper {\n    Get-Date\n}\n", encoding="utf-8")
+        cls.template = d / "template-defaults.ps1"
+        cls.template.write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$PSDefaultParameterValues['New-Item:Name'] = '..\\..\\escape'\n"
+                                "New-Item -ItemType Directory -Path $Work -Force | Out-Null\n", encoding="utf-8")
+        modules = [d / "Extractor.psm1", d / "Clean.psm1", dirty, d / "Body.psm1", d / "Imported.psm1"]
+        cls.result = run_scan(templates=[cls.template], modules=modules, splice_sources=sources)
+
+    def call_findings(self, name: str) -> list[dict]:
+        return [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and f"'{name}'" in f["text"]]
+
+    def bound(self, name: str) -> list[str]:
+        return sorted(s["module"].rsplit("/", 1)[-1] for s in self.result["spliced"] if s["name"] == name)
+
+    def test_r9_a_binding_redirect_on_an_extractor_call_is_an_unproven_binding_not_a_scan_of_the_assumed_module(self) -> None:
+        for name in self.CALLS:
+            with self.subTest(name=name):
+                found = self.call_findings(name)
+                self.assertEqual([f["token"] for f in found], ["unproven-binding"], f"{name}\n" + describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [], f"{name}: a module was scanned in place of the one runtime reads")
+
+    def test_r9_a_call_with_no_redirect_still_binds_its_module(self) -> None:
+        for name, (_, _, module) in self.CALL_CONTROLS.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.call_findings(name), [], describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [module])
+
+    def test_r9_a_receiver_bound_by_a_route_the_origin_cannot_follow_is_an_unproven_binding_and_stays_a_finding(self) -> None:
+        for name in self.BODIES:
+            with self.subTest(name=name):
+                found = [f for f in self.result["splicedViolations"] if f["function"] == name]
+                self.assertTrue([f for f in found if f["rule"] == "unproven-binding" and f["token"] == "unproven-binding"], describe(found))
+                setters = [f for f in found if f["rule"] == "R5" and f["token"] == "$r.Attributes"]
+                self.assertEqual(len(setters), 1, describe(found))
+                self.assertIn("unproven-binding", setters[0]["origin"].split(";"), describe(setters))
+                self.assertIn(("R5", "$r.Attributes"), SplicedBodyScanCoverageLimitTests.unlisted(found), f"{name}: the policy dropped the setter")
+
+    def test_r9_a_receiver_no_route_reaches_stays_a_fresh_literal(self) -> None:
+        found = [f for f in self.result["splicedViolations"] if f["function"] == "B1CtlOther"]
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+        self.assertEqual([f for f in found if f["rule"] == "unproven-binding"], [], describe(found))
+
+    def test_r9_an_imported_module_or_a_template_that_refers_to_psdefaultparametervalues_is_an_unproven_binding(self) -> None:
+        module = [f for f in self.result["splicedViolations"] if f["token"] == "unproven-binding" and f["source"].endswith("Imported.psm1")]
+        self.assertEqual(len(module), 1, describe(self.result["splicedViolations"]))
+        template = [v for v in self.result["violations"] if v["source"] == str(self.template) and v["rule"] == "unproven-binding"]
+        self.assertEqual(len(template), 1, json.dumps(self.result["violations"], indent=2))
 
 
 class SpliceInventoryCallShapeTests(unittest.TestCase):

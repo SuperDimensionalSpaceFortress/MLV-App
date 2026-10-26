@@ -35,7 +35,7 @@
 # inside its body used to pass. With -SpliceSource <files> the scan enumerates every
 # Get-AttrCudaEmbeddedFunctionSource call site in those files (every literal -Name; a name list that
 # is not literal is a 'splice' finding, never a silent skip), reads each body with the extractor's own
-# regex, and runs R1 R2 R3 R4 R5 R6 over it exactly as over a template, minus the "$Work assigned once
+# regex, and runs R1 R2 R3 R4 R5 R6 R8 over it exactly as over a template, minus the "$Work assigned once
 # at top level" half of R5 (a function body is not a job). Findings are reported separately as
 # splicedViolations with the function, its module line and the offending token; the template verdict in
 # `violations` is unchanged.
@@ -52,14 +52,33 @@
 #     text): every -ModulePath module is a candidate, so the name must be defined by exactly one of them;
 #   - a call that splats, or passes a second positional argument (which binds -ModulePath), or repeats
 #     -ModulePath, or gives a relative literal path: a 'splice' finding, because its module is unknown.
-# The extractor's parameters are matched the way PowerShell binds them, by any prefix (-M, -N), and a
-# -Name that is anything but string constants in @( ) / , / parentheses (a + expression, a variable) is a
-# 'splice' finding. Template parameters of New-Item, Expand-Archive, Export-Csv and Start-Process are
+# The extractor's parameters are read only by their exact names or declared aliases (-Name, -ModulePath, the common
+# parameters and -vb / -db / -ea ...); an abbreviation (-M, -Na) binds by prefix against a parameter set this scan does not
+# prove, so it is an unproven binding (r9, below). A -Name that is anything but string constants in @( ) / , / parentheses
+# (a + expression, a variable) is a 'splice' finding. Template parameters of New-Item, Expand-Archive, Export-Csv and Start-Process are
 # likewise matched by prefix and by the cmdlet's own aliases (-RSO, -RSE, -LP).
 # A name the bound module does not define, a name two candidates define, or a module the scan was not
 # given is a 'splice' finding (fail closed): the scan never reads a same-named helper from a module the
 # extractor will not read. A variable -ModulePath is bound only by uniqueness; the text of the temp file
-# a job passes there is not read.
+# a job passes there is not read (a declared limit, left OPEN on ATTR3-SCAN-DYNAMIC-PATH-LITERAL-BIND-1).
+#
+# UNPROVEN BINDING (r9 hub ruling, the CLASS rule; opus r8 B1/B2, sol r8 L2). Eight rounds each closed one construct that
+# changes WHICH module or object a name binds to at run time, and the next key found another of the same class. The rule is
+# the class, not the instance: when the scan cannot prove a binding statically it reports an 'unproven-binding' finding
+# (token 'unproven-binding'; rule 'splice' on a call or module, rule 'unproven-binding' in a template or body) and fails
+# closed, instead of scanning the module or trusting the object it would merely assume. Every binding failure of a call above
+# carries that token. The routes, one shared model (Get-VariableRouteBinding):
+#   1. $PSDefaultParameterValues: ANY reference to it in a splice source, a -ModulePath module (its top-level code runs in the
+#      generator's session), a template or a body -- an assignment, an index or member set, .Add(), a second variable holding
+#      it, Set-Variable / the variable: drive / Get-Variable naming it (a wildcard or a name built from constants included), a
+#      string that names it -- because a default it holds binds a parameter the command does not name
+#      ('Get-AttrCudaEmbeddedFunctionSource:ModulePath', '*:ModulePath', 'Join-Path:AdditionalChildPath', 'New-Item:Name').
+#   2. A variable bound by Set- / New- / Remove- / Clear- / Get-Variable (and sv, set, nv, rv, clv, gv; a name the scan cannot
+#      read, a wildcard that matches, or no name at all), the variable: drive, a variable parameter by any prefix the command's
+#      OWN parameter set accepts (Tee-Object -Va, Invoke-WebRequest -Ses), or the session-state API ($ExecutionContext,
+#      .SessionState, .SessionStateProxy, .PSVariable, [psvariable]): for $PSScriptRoot (an extractor input) the call is
+#      unproven; for an R5 receiver the origin gains 'unproven-binding' (never inert) and a separate finding names the route.
+#   3. An extractor call that abbreviates a parameter or splats.
 #
 # PROPERTY SETS IN BODIES (ATTR3-SCAN-COVERAGE-LIMITS-1 L1). `$receiver.Member = ...` is an R5 finding
 # (token = the target text), and in a spliced body each one carries an `origin` for the receiver:
@@ -123,8 +142,8 @@
 # GRAMMAR (declared before ATTR3-SCANNER-HARDEN-1 r2). The scan judges the PowerShell language AST,
 # System.Management.Automation.Language.Parser ParseInput / ParseFile, over (a) the generator template
 # with its placeholders neutralised and (b) each helper body that Get-AttrCudaEmbeddedFunctionSource
-# splices into the emitted job, read with the extractor's own regex. Rules R1 to R6 above apply to both;
-# a spliced body skips only the top-level "$Work assigned once" half of R5.
+# splices into the emitted job, read with the extractor's own regex. Rules R1 to R6 and R8 above, and the
+# UNPROVEN BINDING rule, apply to both; a spliced body skips only the top-level "$Work assigned once" half of R5.
 #
 # EXPLICIT LIMITS / NON-PROMISES (booked as ATTR3-SCANNER-HARDEN-1, sol PR #133 r7; restated r2). A
 # counterexample outside this grammar is debt against these lines, not a defect in the scan:
@@ -164,6 +183,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+# r9: Get-VariableParameterSpellings reads a command's own parameter set with module auto-loading off; the modules that hold the
+# cmdlets with variable parameters of their own (Tee-Object, Invoke-WebRequest, ...) are loaded here so those resolve.
+Import-Module Microsoft.PowerShell.Utility, Microsoft.PowerShell.Management -ErrorAction SilentlyContinue
 
 # `pwsh -File` cannot pass an array, so ';'-separated lists are accepted too.
 $GeneratorPath = @($GeneratorPath | ForEach-Object { $_ -split ';' } | Where-Object { $_ })
@@ -217,11 +239,11 @@ $violations = [System.Collections.Generic.List[object]]::new()
 $scanned = [System.Collections.Generic.List[string]]::new()
 $script:bodyMode = $false
 
-function Add-Violation([string]$Source, $Ast, [string]$Rule, [string]$Reason, [string]$Origin = '') {
+function Add-Violation([string]$Source, $Ast, [string]$Rule, [string]$Reason, [string]$Origin = '', [string]$Token = '') {
     $text = ($Ast.Extent.Text -replace '\s+', ' ')
     if ($text.Length -gt 160) { $text = $text.Substring(0, 160) }
     $record = [ordered]@{ source = $Source; line = $Ast.Extent.StartLineNumber; rule = $Rule; text = $text; reason = $Reason }
-    if ($script:bodyMode) { $record['token'] = Get-ViolationToken $Ast; $record['origin'] = $Origin }
+    if ($script:bodyMode) { $record['token'] = if ($Token) { $Token } else { Get-ViolationToken $Ast }; $record['origin'] = $Origin }
     $violations.Add($record)
 }
 
@@ -350,11 +372,6 @@ function Test-RouteTailUnproven([string]$Leaf, [string[]]$Names) {
     # Nothing after the drive, a wildcard, a computed part or a separator still inside the tail ('x/../Join-Path'): the name comes
     # from somewhere else, so it is unproven (fails closed).
     return ($Leaf -eq '' -or $Leaf -match '[*?\[\]$(\\/]' -or (Test-ShadowedName $Leaf $Names))
-}
-
-function Test-VariableTailReachesRoot([string]$Leaf) {
-    # The same fail-closed reading for a variable: tail that may name $PSScriptRoot.
-    return ($Leaf -eq '' -or $Leaf -match '[$(\\/]' -or 'PSScriptRoot' -like $Leaf)
 }
 
 function Get-UnwrappedOperand($Ast, [ref]$PassedCast) {
@@ -691,6 +708,8 @@ function Get-ReceiverOrigin($Target, $Root) {
     #   other                          some assignment binds a command / member / parameter-derived value
     #   unbound                        no assignment in the body: a parameter, loop variable or captured variable
     #   nested | scoped | complex      `$a.b.c = ...`, `$script:a.b = ...`, a receiver that is not a plain variable
+    #   unproven-binding               a route this scan cannot follow may bind the variable (Get-VariableRouteBinding)
+    $script:receiverRouteReason = ''
     $node = $Target
     $depth = 0
     while ($node -is [System.Management.Automation.Language.MemberExpressionAst]) {
@@ -715,6 +734,11 @@ function Get-ReceiverOrigin($Target, $Root) {
     })
     $origins = @($assignments | ForEach-Object { Get-AssignedObjectOrigin $_ }) + @(Get-OtherBindings $Root $v.name)
     if ($allAssignments.Count -gt $assignments.Count) { $origins += 'other' }
+    # r9 (opus r8 B1, the unproven-binding class rule): Set-Variable / New-Variable / Remove-Variable / Clear-Variable / Get-Variable,
+    # the variable: drive, a variable parameter and the session-state API bind the receiver by a route this origin cannot follow, so
+    # the receiver is unproven, never 'literal'. The reason is kept for the separate unproven-binding finding Invoke-Scan reports.
+    $script:receiverRouteReason = Get-VariableRouteBinding $Root $v.name
+    if ($script:receiverRouteReason) { $origins += 'unproven-binding' }
     if ($origins.Count -eq 0) { return 'unbound' }
     # A receiver is fresh only if an assignment of a fresh object comes first, in a block that encloses the property
     # set and not across a function boundary; a later, conditional or nested-function assignment says nothing about the
@@ -799,6 +823,182 @@ function Get-OtherBindings($Root, [string]$Name, [switch]$SkipVariableParameters
     return $tags.ToArray()
 }
 
+# ---- r9: the unproven-binding class rule (opus r8 B1/B2, sol r8 L2) ----
+# Eight rounds each closed one construct that changes WHICH module or object a name binds to at run time, and the next key found
+# another of the same class. The rule is the class, not the instance: a route this scan cannot evaluate statically makes the
+# binding UNPROVEN, and the scan reports that (fails closed) instead of reading the module or object it would merely assume.
+$script:variableCommands = @('set-variable', 'sv', 'set', 'new-variable', 'nv', 'remove-variable', 'rv', 'clear-variable', 'clv', 'get-variable', 'gv')
+$script:variableRoute = '^\s*(?:[A-Za-z0-9_.]+\\)?variable::?\s*[\\/]?(.*)$'
+$script:variableParameterSpellings = @{}
+
+function Test-NameMatchesPattern([string]$Name, [string]$Pattern) {
+    # $Name -like $Pattern; a pattern PowerShell cannot parse as a wildcard counts as a match (fails closed).
+    try { return ($Name -like $Pattern) } catch { return $true }
+}
+
+function Test-VariableTailReaches([string]$Leaf, [string]$Name) {
+    # A variable: tail that names $Name or could: empty, computed, a separator still inside it, or a wildcard that matches it.
+    return ($Leaf -eq '' -or $Leaf -match '[$(\\/]' -or (Test-NameMatchesPattern $Name $Leaf))
+}
+
+function Get-VariableParameterSpellings([string]$CommandName) {
+    # The names and aliases of every parameter ending in 'Variable' on the command as this session resolves it (Tee-Object
+    # -Variable, Invoke-WebRequest -SessionVariable, the common -OutVariable ...), so a prefix is read against the command's OWN
+    # parameter set: PowerShell binds any prefix unique for that command (`Tee-Object -Va`, `Invoke-WebRequest -Ses`, opus r8 B2).
+    # Empty when the name does not resolve to a cmdlet or function here. Module auto-loading is off, so no module is imported.
+    $key = $CommandName.ToLowerInvariant()
+    if (-not $script:variableParameterSpellings.ContainsKey($key)) {
+        $spellings = [System.Collections.Generic.List[string]]::new()
+        $PSModuleAutoLoadingPreference = 'None'
+        $info = Get-Command -Name $CommandName -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $info -and [string]$info.CommandType -eq 'Alias') { $info = $info.ResolvedCommand }
+        if ($null -ne $info -and @('Cmdlet', 'Function', 'Filter') -contains [string]$info.CommandType -and $null -ne $info.Parameters) {
+            foreach ($parameter in @($info.Parameters.Values)) {
+                if ($parameter.Name -notmatch 'Variable$') { continue }
+                $spellings.Add($parameter.Name)
+                foreach ($alias in @($parameter.Aliases)) { $spellings.Add($alias) }
+            }
+        }
+        $script:variableParameterSpellings[$key] = $spellings.ToArray()
+    }
+    return $script:variableParameterSpellings[$key]
+}
+
+function Get-VariableRouteBinding($Root, [string]$Name) {
+    # '' when nothing in $Root can bind the variable $Name by a route other than the assignments, parameters, loop variables,
+    # multi-target assignments, [ref] and data sections the callers model themselves; otherwise a short description of the first
+    # route that could. Routes: a variable parameter (-OutVariable and its relatives, Tee-Object -Variable, -SessionVariable, by name,
+    # alias or any prefix the command's own parameter set accepts); Set- / New- / Remove- / Clear- / Get-Variable (a name the scan
+    # cannot read, a wildcard that matches, or no name at all counts); the variable: drive; and the session-state API
+    # ($ExecutionContext, .SessionState, .SessionStateProxy, .PSVariable, [psvariable]), which reaches a variable by a name the scan
+    # never sees. Shared by $PSScriptRoot (an extractor input), $PSDefaultParameterValues and an R5 receiver.
+    # -OutVariable / -ErrorVariable / -WarningVariable / -InformationVariable / -PipelineVariable by name, alias or unique prefix
+    # (-OutV, -ErrorV, -ev). A one-letter prefix of a native tool's switch (`git cat-file -e`) is not one of them, so the
+    # shortest prefix read is the shortest unique among the common parameters; -p is read only when it names the variable.
+    $variableParameters = @(@{ Full = 'ErrorVariable'; Alias = 'ev'; Min = 6 }, @{ Full = 'WarningVariable'; Alias = 'wv'; Min = 8 }, @{ Full = 'InformationVariable'; Alias = 'iv'; Min = 12 },
+                            @{ Full = 'OutVariable'; Alias = 'ov'; Min = 4 }, @{ Full = 'PipelineVariable'; Alias = 'pv'; Min = 1 },
+                            # r7 (adversary A2): the cmdlets with a variable parameter of their own. -Var is the shortest -Variable (Tee-Object); -Va is
+                            # also -Value, so it is not read as one -- unless the command's own parameter set says it is (r9, below).
+                            @{ Full = 'Variable'; Alias = ''; Min = 3 }, @{ Full = 'SessionVariable'; Alias = ''; Min = 8 },
+                            @{ Full = 'ResponseHeadersVariable'; Alias = ''; Min = 16 }, @{ Full = 'StatusCodeVariable'; Alias = ''; Min = 11 })
+    foreach ($command in @($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+        $elements = $command.CommandElements
+        $commandName = $command.GetCommandName()
+        $ownSpellings = @()
+        if (-not [string]::IsNullOrEmpty($commandName)) { $ownSpellings = @(Get-VariableParameterSpellings ($commandName.Substring($commandName.LastIndexOf('\') + 1))) }
+        for ($i = 1; $i -lt $elements.Count; $i++) {
+            $element = $elements[$i]
+            if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+            $spelling = $element.ParameterName
+            # r9 (opus r8 B2): a prefix the command's own parameter set binds to one of its variable parameters counts at any length.
+            $ownBinds = @($ownSpellings | Where-Object { $_.StartsWith($spelling, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0
+            $binds = $ownBinds -or @($variableParameters | Where-Object {
+                $spelling -ieq $_.Alias -or ($spelling.Length -ge $_.Min -and $_.Full.StartsWith($spelling, [StringComparison]::OrdinalIgnoreCase))
+            }).Count -gt 0
+            if (-not $binds) { continue }
+            $value = $element.Argument
+            if ($null -eq $value -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $value = $elements[$i + 1] }
+            $constant = if ($null -ne $value) { Get-ConstantString $value } else { $null }
+            if ($null -ne $constant) {
+                if (($constant.TrimStart('+') -replace '^[A-Za-z]+:', '') -ieq $Name) { return "-$spelling $Name" }
+            } elseif ($ownBinds -or $spelling.Length -gt 1) {
+                return "-$spelling with a variable name the scan cannot read as a string constant"
+            }
+        }
+    }
+    foreach ($n in @($Root.FindAll({ param($x) $true }, $true))) {
+        if ($n -is [System.Management.Automation.Language.CommandAst]) {
+            # A route built from constants ('vari' + 'able:PSScriptRoot') has no string node of its own; a plain string is read below.
+            $itemCommandName = $n.GetCommandName()
+            $isItemCommand = $false
+            if ($null -ne $itemCommandName) {
+                $itemCommandName = $itemCommandName.Substring($itemCommandName.LastIndexOf('\') + 1).ToLowerInvariant()
+                $isItemCommand = $script:itemCommands -contains $itemCommandName
+            }
+            foreach ($element in @($n.CommandElements | Select-Object -Skip 1)) {
+                $operandRoot = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
+                if ($null -eq $operandRoot) { continue }
+                foreach ($operand in @(Expand-Operands $operandRoot)) {
+                    $plain = Get-UnwrappedOperand $operand
+                    if ($plain -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $plain -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) { continue }
+                    $constant = Get-ConstantString $operand
+                    if ($null -ne $constant -and $constant -match $script:variableRoute) {
+                        $reducedRest = Get-ProviderLeaf $Matches[1]
+                        if (Test-VariableTailReaches $reducedRest $Name) { return 'the variable: drive' }
+                    }
+                    # An item command's path built only from literals the scan cannot reduce (a cast over a comma list, a -join) is
+                    # decided by the source text but unreadable here: it could name variable:<the variable>, so it fails closed.
+                    # Only when its literal fragments, put together, can spell the drive name ('vari', 'able:' in any order of joining).
+                    if ($isItemCommand -and $null -eq $constant -and (Test-BuiltFromLiteralsOnly $operand) -and -not (Test-DataLiteralOperand $operand) -and
+                        (-join @($operand.FindAll({ param($x) $x -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value })) -match '(?i)variable') {
+                        return 'the variable: drive (an item command path the scan cannot read as a string constant)'
+                    }
+                }
+            }
+            $commandName = $n.GetCommandName()
+            if ($null -eq $commandName) { continue }
+            $commandName = $commandName.Substring($commandName.LastIndexOf('\') + 1).ToLowerInvariant()
+            if ($script:variableCommands -notcontains $commandName) { continue }
+            # r9: Get-Variable hands back the variable object itself (`(Get-Variable r).Value = ...`), and -Include selects by wildcard;
+            # a variable command with no name argument at all reaches every variable.
+            $nameArguments = [System.Collections.Generic.List[object]]::new()
+            foreach ($argument in (Get-AliasNameArguments $n 'Set-Variable')) { $nameArguments.Add($argument) }
+            foreach ($argument in (Get-NamedArguments $n @('Include') 'Get-Variable')) { if ($null -ne $argument) { $nameArguments.Add($argument) } }
+            if ($nameArguments.Count -eq 0) { return "$commandName with no variable name (it reaches every variable)" }
+            foreach ($argument in $nameArguments) {
+                foreach ($operand in @(Expand-Operands $argument)) {
+                    $constant = Get-ConstantString $operand
+                    if ($null -eq $constant) { return "$commandName with a variable name the scan cannot read as a string constant" }
+                    $bare = $constant -replace '^[A-Za-z]+:', ''
+                    if (Test-NameMatchesPattern $Name $bare) { return "$commandName naming $Name" }
+                }
+            }
+        }
+        elseif ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
+            if (([string]$n.Value) -match $script:variableRoute) {
+                # variable:local:PSScriptRoot / variable:\script:PSScriptRoot: the drive takes its own scope qualifier.
+                # './PSScriptRoot', '.\PSScriptRoot' and '\\PSScriptRoot' name it too (Get-ProviderLeaf).
+                $rest = Get-ProviderLeaf $Matches[1]
+                if (Test-VariableTailReaches $rest $Name) { return 'the variable: drive' }
+            }
+        }
+        elseif ($n -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            if ($n.VariablePath.UserPath -match '^(?i:variable):(.*)$' -and (Test-VariableTailReaches (Get-ProviderLeaf $Matches[1]) $Name)) { return 'the variable: drive' }
+            if ((Get-ProviderLeaf $n.VariablePath.UserPath) -ieq 'ExecutionContext') { return 'the session-state API ($ExecutionContext)' }
+        }
+        elseif ($n -is [System.Management.Automation.Language.MemberExpressionAst]) {
+            $memberName = $n.Member.Extent.Text.Trim('''', '"')
+            if (@('SessionState', 'SessionStateProxy', 'PSVariable') -icontains $memberName) { return "the session-state API (.$memberName)" }
+        }
+        elseif ($n -is [System.Management.Automation.Language.TypeExpressionAst] -or $n -is [System.Management.Automation.Language.TypeConstraintAst]) {
+            if ($n.TypeName.FullName -match '(?i)(^|\.)(psvariable|SessionState|SessionStateProxy|PSVariableIntrinsics)$') { return "the session-state API ([$($n.TypeName.FullName)])" }
+        }
+    }
+    return ''
+}
+
+function Get-DefaultParameterValuesReference($Root) {
+    # $null when nothing in $Root can read or change $PSDefaultParameterValues, otherwise @{ Ast; Reason }. A default it holds binds a
+    # parameter the call does not name ('Get-AttrCudaEmbeddedFunctionSource:ModulePath', '*:ModulePath', 'Join-Path:AdditionalChildPath',
+    # 'New-Item:Name'), so no command in the file binds the way its text reads (r9, sol r8). Any reference counts, not only an
+    # assignment: the dictionary is changed in place ([...] =, .Add(), a member set) and can be reached through a second variable.
+    foreach ($n in @($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -or
+                                               $x -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+                                               $x -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true))) {
+        if ($n -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            $user = $n.VariablePath.UserPath
+            if ($user -match '^(?i:variable):(.*)$') {
+                if (Test-VariableTailReaches (Get-ProviderLeaf $Matches[1]) 'PSDefaultParameterValues') { return [pscustomobject]@{ Ast = $n; Reason = 'the variable: drive' } }
+            }
+            elseif ((Get-ProviderLeaf $user) -ieq 'PSDefaultParameterValues') { return [pscustomobject]@{ Ast = $n; Reason = 'a reference to $PSDefaultParameterValues' } }
+        }
+        elseif (([string]$n.Value) -match '(?i)PSDefaultParameterValues') { return [pscustomobject]@{ Ast = $n; Reason = 'a string that names PSDefaultParameterValues' } }
+    }
+    $route = Get-VariableRouteBinding $Root 'PSDefaultParameterValues'
+    if ($route) { return [pscustomobject]@{ Ast = $Root; Reason = $route } }
+    return $null
+}
+
 function Test-Provable($Ast, $Root, $Visiting) {
     if ($null -eq $Ast) { return $false }
     # A redirection (`Join-Path $Work 'x' > $null`) discards the value, so the expression is not the path it names.
@@ -859,6 +1059,12 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
     }
     if ($null -ne $root.ScriptRequirements) {
         Add-Violation $Source $root 'R8' '#requires is not allowed in a job template'
+    }
+    # r9 rule 1: a $PSDefaultParameterValues entry binds parameters a command does not name ('New-Item:Name' hands New-Item the -Name
+    # R2 forbids), so with any reference to it the scan's reading of every command here is unproven.
+    $defaults = Get-DefaultParameterValuesReference $root
+    if ($null -ne $defaults) {
+        Add-Violation $Source $defaults.Ast 'unproven-binding' "`$PSDefaultParameterValues is reachable here ($($defaults.Reason)); a default it holds binds parameters no command names, so this scan's reading of every command is unproven" '' 'unproven-binding'
     }
     foreach ($shadow in @(Get-ShadowingDefinitions $root @($allowedCmdlets + 'New-Object'))) {
         Add-Violation $Source $shadow.Ast 'R1' (Get-ShadowReason $shadow.Kind ', so the scan cannot trust its own evaluation of that command')
@@ -1008,6 +1214,9 @@ function Invoke-Scan([string]$Source, [string]$Text, [string[]]$ModuleFunctions,
         if ($left -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
             $origin = if ($left -is [System.Management.Automation.Language.MemberExpressionAst]) { Get-ReceiverOrigin $left $root } else { '' }
             Add-Violation $Source $a 'R5' "assignment to $($left.GetType().Name) is not allowed" $origin
+            if ($left -is [System.Management.Automation.Language.MemberExpressionAst] -and $script:receiverRouteReason) {
+                Add-Violation $Source $a 'unproven-binding' "the receiver may be bound by $($script:receiverRouteReason), a route this scan cannot follow, so the object this property set reaches is unproven" $origin 'unproven-binding'
+            }
             continue
         }
         $v = Get-VariableName $left
@@ -1070,8 +1279,9 @@ function Get-RepoRelativePath([string]$Path) {
     return ($full -replace '\\', '/')
 }
 
-function Add-SpliceFinding([string]$Source, [int]$Line, [string]$Function, [string]$Text, [string]$Reason) {
-    $splicedViolations.Add([ordered]@{ source = $Source; module = ''; function = $Function; line = $Line; rule = 'splice'; token = 'splice'; origin = ''; text = $Text; reason = $Reason })
+function Add-SpliceFinding([string]$Source, [int]$Line, [string]$Function, [string]$Text, [string]$Reason, [string]$Token = 'splice') {
+    # -Token 'unproven-binding' marks the r9 class: the module (or default) a call binds to cannot be proven statically.
+    $splicedViolations.Add([ordered]@{ source = $Source; module = ''; function = $Function; line = $Line; rule = 'splice'; token = $Token; origin = ''; text = $Text; reason = $Reason })
 }
 
 function Get-PsScriptRootRebinding($Root) {
@@ -1083,97 +1293,35 @@ function Get-PsScriptRootRebinding($Root) {
     if (@(Get-AssignmentsTo $Root 'PSScriptRoot').Count -gt 0) { return 'an assignment' }
     if (@(Get-DataStatementsBinding $Root 'PSScriptRoot').Count -gt 0) { return 'a data statement' }
     if (@(Get-OtherBindings $Root 'PSScriptRoot' -SkipVariableParameters).Count -gt 0) { return 'a parameter, loop variable, multi-target assignment or [ref]' }
-    # -OutVariable / -ErrorVariable / -WarningVariable / -InformationVariable / -PipelineVariable by name, alias or unique prefix
-    # (-OutV, -ErrorV, -ev). A one-letter prefix of a native tool's switch (`git cat-file -e`) is not one of them, so the
-    # shortest prefix read is the shortest unique among the common parameters; -p is read only when it names PSScriptRoot.
-    $variableParameters = @(@{ Full = 'ErrorVariable'; Alias = 'ev'; Min = 6 }, @{ Full = 'WarningVariable'; Alias = 'wv'; Min = 8 }, @{ Full = 'InformationVariable'; Alias = 'iv'; Min = 12 },
-                            @{ Full = 'OutVariable'; Alias = 'ov'; Min = 4 }, @{ Full = 'PipelineVariable'; Alias = 'pv'; Min = 1 },
-                            # r7 (adversary A2): the cmdlets with a variable parameter of their own. -Var is the shortest -Variable (Tee-Object); -Va is
-                            # also -Value, so it is not read as one.
-                            @{ Full = 'Variable'; Alias = ''; Min = 3 }, @{ Full = 'SessionVariable'; Alias = ''; Min = 8 },
-                            @{ Full = 'ResponseHeadersVariable'; Alias = ''; Min = 16 }, @{ Full = 'StatusCodeVariable'; Alias = ''; Min = 11 })
-    foreach ($command in @($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] }, $true))) {
-        $elements = $command.CommandElements
-        for ($i = 1; $i -lt $elements.Count; $i++) {
-            $element = $elements[$i]
-            if ($element -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
-            $spelling = $element.ParameterName
-            $binds = @($variableParameters | Where-Object {
-                $spelling -ieq $_.Alias -or ($spelling.Length -ge $_.Min -and $_.Full.StartsWith($spelling, [StringComparison]::OrdinalIgnoreCase))
-            }).Count -gt 0
-            if (-not $binds) { continue }
-            $value = $element.Argument
-            if ($null -eq $value -and $i + 1 -lt $elements.Count -and $elements[$i + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $value = $elements[$i + 1] }
-            $constant = if ($null -ne $value) { Get-ConstantString $value } else { $null }
-            if ($null -ne $constant) {
-                if (($constant.TrimStart('+') -replace '^[A-Za-z]+:', '') -ieq 'PSScriptRoot') { return "-$spelling PSScriptRoot" }
-            } elseif ($spelling.Length -gt 1) {
-                return "-$spelling with a variable name the scan cannot read as a string constant"
-            }
-        }
-    }
-    $variableCommands = @('set-variable', 'sv', 'set', 'new-variable', 'nv', 'remove-variable', 'rv', 'clear-variable', 'clv')
-    $variableRoute = '^\s*(?:[A-Za-z0-9_.]+\\)?variable::?\s*[\\/]?(.*)$'
-    foreach ($n in @($Root.FindAll({ param($x) $true }, $true))) {
-        if ($n -is [System.Management.Automation.Language.CommandAst]) {
-            # A route built from constants ('vari' + 'able:PSScriptRoot') has no string node of its own; a plain string is read below.
-            $itemCommandName = $n.GetCommandName()
-            $isItemCommand = $false
-            if ($null -ne $itemCommandName) {
-                $itemCommandName = $itemCommandName.Substring($itemCommandName.LastIndexOf('\') + 1).ToLowerInvariant()
-                $isItemCommand = $script:itemCommands -contains $itemCommandName
-            }
-            foreach ($element in @($n.CommandElements | Select-Object -Skip 1)) {
-                $operandRoot = if ($element -is [System.Management.Automation.Language.CommandParameterAst]) { $element.Argument } else { $element }
-                if ($null -eq $operandRoot) { continue }
-                foreach ($operand in @(Expand-Operands $operandRoot)) {
-                    $plain = Get-UnwrappedOperand $operand
-                    if ($plain -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $plain -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) { continue }
-                    $constant = Get-ConstantString $operand
-                    if ($null -ne $constant -and $constant -match $variableRoute) {
-                        $reducedRest = Get-ProviderLeaf $Matches[1]
-                        if (Test-VariableTailReachesRoot $reducedRest) { return 'the variable: drive' }
-                    }
-                    # An item command's path built only from literals the scan cannot reduce (a cast over a comma list, a -join) is
-                    # decided by the source text but unreadable here: it could name variable:PSScriptRoot, so it fails closed.
-                    # Only when its literal fragments, put together, can spell the drive name ('vari', 'able:' in any order of joining).
-                    if ($isItemCommand -and $null -eq $constant -and (Test-BuiltFromLiteralsOnly $operand) -and -not (Test-DataLiteralOperand $operand) -and
-                        (-join @($operand.FindAll({ param($x) $x -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) | ForEach-Object { [string]$_.Value })) -match '(?i)variable') {
-                        return 'the variable: drive (an item command path the scan cannot read as a string constant)'
-                    }
-                }
-            }
-            $commandName = $n.GetCommandName()
-            if ($null -eq $commandName) { continue }
-            $commandName = $commandName.Substring($commandName.LastIndexOf('\') + 1).ToLowerInvariant()
-            if ($variableCommands -notcontains $commandName) { continue }
-            foreach ($argument in (Get-AliasNameArguments $n 'Set-Variable')) {
-                $constant = Get-ConstantString $argument
-                if ($null -eq $constant) { return "$commandName with a variable name the scan cannot read as a string constant" }
-                $bare = $constant -replace '^[A-Za-z]+:', ''
-                if ('PSScriptRoot' -like $bare) { return "$commandName naming PSScriptRoot" }
-            }
-        }
-        elseif ($n -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst]) {
-            if (([string]$n.Value) -match $variableRoute) {
-                # variable:local:PSScriptRoot / variable:\script:PSScriptRoot: the drive takes its own scope qualifier.
-                # './PSScriptRoot', '.\PSScriptRoot' and '\\PSScriptRoot' name it too (Get-ProviderLeaf).
-                $rest = Get-ProviderLeaf $Matches[1]
-                if (Test-VariableTailReachesRoot $rest) { return 'the variable: drive' }
-            }
-        }
-        elseif ($n -is [System.Management.Automation.Language.VariableExpressionAst]) {
-            if ($n.VariablePath.UserPath -match '^(?i:variable):(.*)$' -and (Test-VariableTailReachesRoot (Get-ProviderLeaf $Matches[1]))) { return 'the variable: drive' }
-        }
-    }
-    return ''
+    # r9: every other route (a variable parameter by any prefix its command accepts, the variable cmdlets including Get-Variable, the
+    # variable: drive, the session-state API) is one shared model, the one an R5 receiver and $PSDefaultParameterValues use too.
+    return (Get-VariableRouteBinding $Root 'PSScriptRoot')
 }
 
-function Get-SpliceModuleBinding($Call, [string]$SourceDir, [string]$RootRebinding = '') {
+function Get-SpliceModuleBinding($Call, [string]$SourceDir, [string]$RootRebinding = '', [string]$DefaultsReference = '') {
     # Which module the extractor will read for this call: kind 'default' (no -ModulePath, or an empty / blank /
     # $null one: the extractor's own module), 'path' (a rooted literal or Join-Path $PSScriptRoot '<child>': bound
     # by FULL path), 'dynamic' (any other expression) or 'unsupported' (a call shape whose -ModulePath cannot be
-    # read, so the binding is unknown).
+    # read, so the binding is unknown: reported as an unproven-binding finding).
+    # r9 rule 1 (sol r8): a $PSDefaultParameterValues entry binds -ModulePath, -Name or Join-Path's arguments that the call does not
+    # name ('Get-AttrCudaEmbeddedFunctionSource:ModulePath', '*:ModulePath', 'Join-Path:AdditionalChildPath'), so with any reference to
+    # it in the file no call there binds the way its text reads.
+    if ($DefaultsReference) {
+        # One route (a computed Set-Variable name, the session-state API) can reach both variables; the reason names each one it reaches.
+        $alsoRoot = if ($RootRebinding) { "; `$PSScriptRoot may be rebound too (via $RootRebinding)" } else { '' }
+        return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "the file that holds the call refers to `$PSDefaultParameterValues ($DefaultsReference), whose defaults can bind -ModulePath, -Name or Join-Path's arguments at run time$alsoRoot" }
+    }
+    # r9 rule 3: PowerShell binds an abbreviated parameter by prefix against the extractor's parameter set as it is at run time, which
+    # this scan does not prove (a module-qualified or replaced extractor, or one more parameter, changes what -Mod or -Na selects).
+    # Only the exact name or a declared alias of a parameter the extractor has is read; anything else is an unproven binding.
+    $exactSpellings = @('Name', 'ModulePath', 'Verbose', 'vb', 'Debug', 'db', 'ErrorAction', 'ea', 'WarningAction', 'wa', 'InformationAction', 'infa',
+                        'ErrorVariable', 'ev', 'WarningVariable', 'wv', 'InformationVariable', 'iv', 'OutVariable', 'ov', 'OutBuffer', 'ob',
+                        'PipelineVariable', 'pv', 'ProgressAction', 'proga')
+    foreach ($element in $Call.CommandElements) {
+        if ($element -is [System.Management.Automation.Language.CommandParameterAst] -and $exactSpellings -inotcontains $element.ParameterName) {
+            return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "the call names -$($element.ParameterName), which is not the exact name or an alias of an extractor parameter, so the parameter it binds by prefix is unproven" }
+        }
+    }
     foreach ($element in $Call.CommandElements) {
         if ($element -is [System.Management.Automation.Language.VariableExpressionAst] -and $element.Splatted) {
             return [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = 'the call splats arguments, which can hide a -ModulePath' }
@@ -1252,6 +1400,8 @@ function Get-SpliceCallSites([string]$Path) {
         Add-SpliceFinding $source $shadow.Ast.Extent.StartLineNumber '' $shadowText (Get-ShadowReason $shadow.Kind ', so the module binding it computed cannot be trusted')
     }
     $rootRebinding = Get-PsScriptRootRebinding $ast
+    $defaults = Get-DefaultParameterValuesReference $ast
+    $defaultsReference = if ($null -ne $defaults) { $defaults.Reason } else { '' }
     # Command names are case-insensitive and a module-qualified name (<Module>\Get-AttrCudaEmbeddedFunctionSource)
     # resolves to the same command: compare the part after the last backslash, ignoring case.
     $extractorCalls = $ast.FindAll({
@@ -1289,7 +1439,7 @@ function Get-SpliceCallSites([string]$Path) {
         }
         $callName = $call.GetCommandName()
         $qualifier = if ($callName.Contains('\')) { $callName.Substring(0, $callName.LastIndexOf('\')) } else { '' }
-        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; qualifier = $qualifier; bind = (Get-SpliceModuleBinding $call $sourceDir $rootRebinding) }
+        [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; qualifier = $qualifier; bind = (Get-SpliceModuleBinding $call $sourceDir $rootRebinding $defaultsReference) }
     }
 }
 
@@ -1301,6 +1451,14 @@ if ($SpliceSource.Count -gt 0) {
         $full = (Resolve-Path -LiteralPath $modulePath).Path
         $moduleTexts[$key] = [IO.File]::ReadAllText($full)
         $moduleFullPaths[$key] = [IO.Path]::GetFullPath($full)
+        # r9 rule 1: a generator imports these modules, and their top-level code runs in its session, so a reference to
+        # $PSDefaultParameterValues in one rebinds an extractor call as one in the generator does.
+        $moduleTokens = $null; $moduleErrors = $null
+        $moduleAst = [System.Management.Automation.Language.Parser]::ParseInput($moduleTexts[$key], [ref]$moduleTokens, [ref]$moduleErrors)
+        $moduleDefaults = Get-DefaultParameterValuesReference $moduleAst
+        if ($null -ne $moduleDefaults) {
+            Add-SpliceFinding $key $moduleDefaults.Ast.Extent.StartLineNumber '' $key "the module refers to `$PSDefaultParameterValues ($($moduleDefaults.Reason)), whose defaults can bind any extractor call's -ModulePath or -Name at run time" 'unproven-binding'
+        }
     }
     $entries = [ordered]@{}
     # The module the extractor reads when a call names no -ModulePath is the module that defines the extractor
@@ -1333,7 +1491,7 @@ if ($SpliceSource.Count -gt 0) {
                 $bindingFailure = "the call is module-qualified by '$($site.qualifier)', which is not the module this scan binds"
             }
             if ($bindingFailure) {
-                Add-SpliceFinding $site.source $site.line '' $site.text "the extractor module this call reads cannot be bound: $bindingFailure"
+                Add-SpliceFinding $site.source $site.line '' $site.text "the extractor module this call reads cannot be bound: $bindingFailure" 'unproven-binding'
                 continue
             }
             foreach ($functionName in $site.names) {
@@ -1346,7 +1504,7 @@ if ($SpliceSource.Count -gt 0) {
                     continue
                 }
                 if ($definers.Count -gt 1) {
-                    Add-SpliceFinding $site.source $site.line $functionName $site.text "'$functionName' is defined by more than one candidate module ($($definers -join ', ')) and the call does not bind it to one"
+                    Add-SpliceFinding $site.source $site.line $functionName $site.text "'$functionName' is defined by more than one candidate module ($($definers -join ', ')) and the call does not bind it to one" 'unproven-binding'
                     continue
                 }
                 $module = $definers[0]
