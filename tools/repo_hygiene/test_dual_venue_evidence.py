@@ -5822,11 +5822,6 @@ class VenueQuietAttributionTests(unittest.TestCase):
         self.assertIn("would_block=false", proc.stdout)
         self.assertNotIn("percore blocked", proc.stdout, "blocked is only for a mean-QUIET venue the per-core check overrode")
 
-    def test_an_unmeasured_venue_prints_no_percore_line_and_exits_six(self) -> None:
-        proc = self.gate(self.probe(_pc_cores(self.HOT), samples=[5.0, None, 5.0]), "-PerCoreEnforce")
-        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
-        self.assertEqual(self.percore_lines(proc), [])
-
     def test_the_offline_decision_output_is_unchanged(self) -> None:
         proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-SamplesJson", "[12.5, 18.0, 21.0]"],
                               capture_output=True, text=True, timeout=120)
@@ -5841,6 +5836,94 @@ class VenueQuietAttributionTests(unittest.TestCase):
         text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
         body = re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
         self.assertIn("percent_exact", body)
+
+    # ---- adversary pass r1 (A1 A2 A3 A4 A5 A6 A7) ---------------------------------------------------------------
+    SEQ_STUB = r"""param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec)
+# test stub for tools\profiling\um-run.ps1: answers probe N of the JSON array in UMSTUB_LINES (the last one repeats); UMSTUB_COUNTER holds N
+$arr = @(ConvertFrom-Json -InputObject $env:UMSTUB_LINES)
+$n = 0; if (Test-Path -LiteralPath $env:UMSTUB_COUNTER) { $n = [int](Get-Content -LiteralPath $env:UMSTUB_COUNTER -TotalCount 1) }
+Set-Content -LiteralPath $env:UMSTUB_COUNTER -Value ($n + 1)
+$obj = $arr[[Math]::Min($n, $arr.Count - 1)]
+[pscustomobject]@{ exitCode = 0; stdout = 'VENUE_QUIET=' + ($obj | ConvertTo-Json -Compress -Depth 9) }
+"""
+
+    def gate_seq(self, probes: list, *extra: str) -> subprocess.CompletedProcess:
+        import os
+        (self.tree / "tools" / "profiling" / "um-run.ps1").write_text(self.SEQ_STUB, encoding="utf-8")
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                               "-WorkDir", str(self.work), "-MaxWaitSec", "120", "-RecheckSec", "1", "-ForeignFloorProbes", "0", *extra],
+                              capture_output=True, text=True, timeout=240,
+                              env=dict(os.environ, UMSTUB_LINES=json.dumps(probes), UMSTUB_COUNTER=str(self.tmp / "seq.counter")))
+
+    def test_every_probe_logs_its_own_percore_line_not_only_the_last(self) -> None:
+        busy_hot = self.probe(_pc_cores(self.HOT), samples=[50.0, 50.0, 50.0])
+        quiet_cool = self.probe(_pc_cores(self.COOL))
+        proc = self.gate_seq([busy_hot, quiet_cool])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=false threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true",
+                          "  percore enabled=false threshold=60.0% busiest_fast_core=0_0 busiest_fast_pct=30.0% would_block=false"],
+                         "the first probe's observation must survive the second probe")
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% ")
+
+    def test_an_unmeasured_probe_that_carries_cores_still_logs_the_observation(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.HOT), samples=[5.0, None, 5.0]), "-PerCoreEnforce")
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=true threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true"],
+                         "logged, but an UNKNOWN venue is still UNKNOWN: no blocked line and exit 6")
+
+    def test_a_core_omitted_for_having_no_valid_sample_makes_the_answer_null(self) -> None:
+        probe = self.probe(_pc_cores(self.COOL, self.EHOT))
+        probe["notes"] = {"cores_omitted": "1 core(s) had no valid sample and are omitted"}
+        proc = self.gate(probe, "-PerCoreEnforce")
+        self.assertRegex(proc.stdout, r"(?m)^QUIET ", "unknown never blocks")
+        self.assertIn("busiest_fast_core=0_0 busiest_fast_pct=30.0% would_block=null reason=cores-omitted", proc.stdout)
+
+    def test_fewer_valid_samples_than_total_is_incomplete_even_without_the_flag(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(("0,2", "P", 82.0, {"validSamples": 2, "totalSamples": 3, "incomplete": False}))))
+        self.assertIn("would_block=null reason=incomplete-samples", proc.stdout)
+
+    def test_a_non_numeric_exact_percent_is_invalid_and_never_falls_back_to_the_rounded_one(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(("0,2", "P", 60.0, {"percent_exact": "hot"}))))
+        self.assertIn("would_block=null reason=invalid-core-percent", proc.stdout)
+        arr = self.gate(self.probe(_pc_cores(("0,2", "P", [1]))))
+        self.assertIn("would_block=null reason=invalid-core-percent", arr.stdout, "a one-element array is not a number")
+
+    def test_the_percore_line_is_culture_invariant_and_comma_free(self) -> None:
+        import os
+        cmd = ("[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('de-DE'); "
+               f"& '{self.dv / 'Wait-VenueQuiet.ps1'}' -Venue bachelor -WorkDir '{self.work}' -MaxWaitSec 1 -RecheckSec 1")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=180,
+                              env=dict(os.environ, UMSTUB_LINE=json.dumps(self.probe(_pc_cores(self.HOT)))))
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=false threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true"], proc.stdout + proc.stderr)
+
+    def test_a_gate_log_sink_failure_in_the_percore_writer_never_escapes(self) -> None:
+        script = (DV / "Wait-VenueQuiet.ps1").as_posix()
+        cmd = (f"$t=$null;$e=$null;$ast=[System.Management.Automation.Language.Parser]::ParseFile('{script}',[ref]$t,[ref]$e);"
+               "foreach($n in 'Format-PerCorePct','ConvertTo-IdentToken','Write-PerCoreLines'){ $f=$ast.Find({param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -ceq $n},$true); . ([scriptblock]::Create($f.Extent.Text)) }; "
+               "function Write-Gate([string]$Line) { Write-Output $Line; throw 'sink locked' }; "
+               "$pc=[pscustomobject]@{enabled=$false;threshold=60.0;busiest_fast_core='0,2';busiest_fast_percent=82.0;would_block=$true;reason=$null}; "
+               "try { Write-PerCoreLines $pc $true; 'NO_ESCAPE' } catch { 'ESCAPED ' + $_.Exception.Message }")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
+        self.assertIn("NO_ESCAPE", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("ESCAPED", proc.stdout)
+
+    def test_the_busy_probe_summary_follows_the_gate_when_per_core_enforcement_is_on(self) -> None:
+        raw = self.tmp / "venue-quiet-probe-20261026T000000000Z.json"
+        raw.write_text(json.dumps(self.probe(_pc_cores(self.HOT, self.COOL))), encoding="utf-8")
+        summarize = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"), "-ProbeJson", str(raw)]
+        off = subprocess.run(summarize, capture_output=True, text=True, timeout=120)
+        self.assertEqual(off.returncode, 0, off.stdout + off.stderr)
+        self.assertIn("Busy probes summarized: 0 (quiet skipped 1", off.stdout, "default: the mean rule, as before")
+        on = subprocess.run(summarize + ["-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(on.returncode, 0, on.stdout + on.stderr)
+        self.assertIn("Busy probes summarized: 1 (quiet skipped 0", on.stdout, "enforcing: the gate would have called this probe BUSY")
+        cool = self.tmp / "venue-quiet-probe-20261026T000100000Z.json"
+        cool.write_text(json.dumps(self.probe(_pc_cores(self.COOL))), encoding="utf-8")
+        raised = subprocess.run([*summarize[:-1], str(cool), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
+        self.assertIn("Busy probes summarized: 0 (quiet skipped 1", raised.stdout)
 
 
 # ---------------------------------------------------------------------------------------------------

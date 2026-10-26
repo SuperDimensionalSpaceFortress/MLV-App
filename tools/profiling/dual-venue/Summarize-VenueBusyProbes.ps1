@@ -25,12 +25,17 @@
 # never lists a venue share, and refuses with exit 2 PROBE_PATH_IN_VENUE_SHARE any path under a venue's agentShare / agentRoot in venues.json.
 # Every input (each -ProbeJson entry as given and its comma parts, and -ProbeDir) is judged as TEXT before any Test-Path, Get-Item or read: a UNC (\\host\...) or provider-qualified
 # (FileSystem::...) path is refused PROBE_PATH_UNC, so a hung or dead remote share is never touched.
+# -PerCoreEnforce / -PerCoreThresholdPercent (VENUE-QUIET-PER-CORE-VERDICT-1) mirror the gate's switches of the same name: with -PerCoreEnforce a mean-QUIET probe whose busiest fast core
+# is at or over the threshold counts as BUSY here exactly as the gate decided it, by the gate's own Get-VenuePerCoreVerdict (lifted by AST, no second copy; DECISION_LIFT_FAILED when it
+# cannot be). Off (the default) the mean rule alone decides, as before. The retained raw file does not record which switch the gate ran with, so the caller passes the one it used.
 # Exit codes: 0 summarized; 2 usage error, PROBE_PATH_UNC or PROBE_PATH_IN_VENUE_SHARE; 3 DECISION_LIFT_FAILED.
 [CmdletBinding()]
 param(
     [string[]]$ProbeJson = @(),
     [string]$ProbeDir = '',
     [double]$ThresholdPercent = 20.0,
+    [ValidateRange(0.0, 100.0)][double]$PerCoreThresholdPercent = 60.0,
+    [switch]$PerCoreEnforce,
     [switch]$IncludeQuiet,
     [switch]$Json,
     [string]$DecisionSource = ''
@@ -92,8 +97,16 @@ try {
     $ast = [System.Management.Automation.Language.Parser]::ParseFile($DecisionSource, [ref]$tokens, [ref]$errs)
     $fn = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq 'Get-VenueQuietDecision' }, $true))
     if ($fn.Count -eq 1) { . ([scriptblock]::Create($fn[0].Extent.Text)); $lifted = [bool](Get-Command Get-VenueQuietDecision -CommandType Function -ErrorAction SilentlyContinue) }
+    if ($lifted -and $PerCoreEnforce) {
+        foreach ($name in 'Test-PerCoreNumber', 'Get-VenuePerCoreVerdict') {
+            $f = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -ceq $name }, $true))
+            if ($f.Count -ne 1) { $lifted = $false; break }
+            . ([scriptblock]::Create($f[0].Extent.Text))
+        }
+        if ($lifted) { $lifted = [bool](Get-Command Get-VenuePerCoreVerdict -CommandType Function -ErrorAction SilentlyContinue) }
+    }
 } catch { $lifted = $false }
-if (-not $lifted) { Stop-Usage "DECISION_LIFT_FAILED Get-VenueQuietDecision could not be lifted from '$DecisionSource'; there is no second copy of the quiet rule" 3 }
+if (-not $lifted) { Stop-Usage "DECISION_LIFT_FAILED Get-VenueQuietDecision$(if ($PerCoreEnforce) { ' / Get-VenuePerCoreVerdict' }) could not be lifted from '$DecisionSource'; there is no second copy of the quiet rule" 3 }
 
 # 3. the files
 $candidates = @()
@@ -116,6 +129,7 @@ foreach ($f in $files) {
     $probe = $null
     try { $probe = [IO.File]::ReadAllText($f) | ConvertFrom-Json; if ($null -eq $probe -or $probe -isnot [pscustomobject]) { throw 'not a JSON object' } } catch { $unreadable++; continue }
     $d = Get-VenueQuietDecision -Samples @($probe.samples) -Threshold $ThresholdPercent
+    if ($PerCoreEnforce -and $d.state -ceq 'QUIET' -and (Get-VenuePerCoreVerdict $probe $PerCoreThresholdPercent $true).would_block -eq $true) { $d = [pscustomobject]@{ state = 'BUSY'; mean = $d.mean } }
     if ($d.state -ceq 'UNKNOWN') { $unknownSkipped++; continue }
     if ($d.state -ceq 'QUIET' -and -not $IncludeQuiet) { $quietSkipped++; continue }
     $busy++
