@@ -2041,6 +2041,26 @@ function Get-LeaseSnapshotHeadroomSec {
     return $left
 }
 
+function Get-LeaseSlotAgeText {
+    # adversary r2 A2: how long ago a status line's "since" wall-clock time (local to this host, no UTC offset) was, as "<n>s" or "unknown". Read through
+    # TimeZoneInfo, not by subtracting local DateTimes, so a DST change between then and now is counted; a time that is ambiguous (the fall-back hour) or
+    # does not exist (the spring-forward hour) in the zone, a time in the future, or one that does not parse is "unknown" -- never a wrong number.
+    param([string]$Since, [DateTime]$NowUtc = [DateTime]::MinValue, [TimeZoneInfo]$Zone = $null)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Since)) { return "unknown" }
+        if ($null -eq $Zone) { $Zone = [TimeZoneInfo]::Local }
+        $now = if ($NowUtc -eq [DateTime]::MinValue) { [DateTime]::UtcNow } else { $NowUtc }
+        $dt = [DateTime]::MinValue
+        if (-not [DateTime]::TryParse($Since, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$dt)) { return "unknown" }
+        $dt = [DateTime]::SpecifyKind($dt, [DateTimeKind]::Unspecified)
+        if ($Zone.IsInvalidTime($dt) -or $Zone.IsAmbiguousTime($dt)) { return "unknown" }
+        $utc = [TimeZoneInfo]::ConvertTimeToUtc($dt, $Zone)
+        if ($utc -gt $now) { return "unknown" }
+        return "$([long][Math]::Floor(($now - $utc).TotalSeconds))s"
+    }
+    catch { return "unknown" }
+}
+
 function Add-LeaseSlotSnapshot {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1: ONE `heavy-slot.py status` probe, logged as who holds each slot (owner, pid, age) and how many runs
     # are queued; Phase is request | grant. The probe is Invoke-HeavySlotStatus, so it is bounded by that helper's own 30 s timeout (which
@@ -2076,10 +2096,7 @@ function Add-LeaseSlotSnapshot {
                 $owner = $Matches[1]
                 $ownerPid = $Matches[2]
                 $since = $Matches[3]
-                $age = "unknown"
-                $dt = [DateTime]::MinValue
-                if ($since -and [DateTime]::TryParse($since, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeLocal, [ref]$dt) -and $dt -le $now) { $age = "$([long][Math]::Floor(($now - $dt).TotalSeconds))s" }
-                $parts.Add("slot ${n}: $owner pid=$ownerPid age=$age")
+                $parts.Add("slot ${n}: $owner pid=$ownerPid age=$(Get-LeaseSlotAgeText -Since $since)")
             }
             else { $parts.Add("slot ${n}: $who") }
         }
@@ -3476,7 +3493,7 @@ function Wait-QuietLeaseAdmission {
                     if ($null -ne $batchToken) { $adm | Add-Member -NotePropertyName leaseBatch -NotePropertyValue (Open-LeaseBatch -Token $batchToken -Lease $script:QuietLease -JobId $JobId -Refusals $refusals.ToArray() -Requests $requests) }
                     if ($null -ne $script:GateHour) { $script:GateHour.admitted++; $script:GateHour.waitSecTotal += [int]$waited }
                     Add-AgentLogLine "quiet-lease: active job=$JobId slot=$($a.slot) held=$($a.held) until=$([long]$a.until) minutes=$minutes waited=$($adm.waitedSec)s requests=$requests refusals=$($refusals.Count) owner=[$($adm.leaseOwner)] heat=[$($heat.why)]"
-                    Add-LeaseSlotSnapshot -JobId $JobId -Phase "grant" -WaitedSec $waited -HeadroomSec (Get-LeaseSnapshotHeadroomSec -Verdict $vNow -Lease $script:QuietLease)
+                    Add-LeaseSlotSnapshot -JobId $JobId -Phase "grant" -WaitedSec $waited -HeadroomSec (Get-LeaseSnapshotHeadroomSec -Verdict $vNow -Lease $script:QuietLease -QueueLeftSec $(if ($maxAge -gt 0) { [double]$maxAge - [double](Get-QueueAgeSeconds -Job $Job -Metadata $Metadata) } else { [double]::PositiveInfinity }))
                     if (-not $covers) { Add-AgentLogLine "quiet-lease: lease-shorter-than-timeout job=$JobId minutes=$minutes timeoutSec=$timeoutSec; legs past until=$([long]$a.until) run without the lease (admission.leaseCoversTimeout=false)" }
                     return $adm
                 }

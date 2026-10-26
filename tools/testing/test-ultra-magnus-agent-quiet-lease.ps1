@@ -113,7 +113,7 @@ foreach ($name in $liftNotAfter) {
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
 # lease-batch r4 (the merge of not-after r1): the same, so batch-refusal-ends-batch fails on behaviour against an agent without it.
-foreach ($name in @('Close-LeaseBatchAfterRelease', 'ConvertTo-UtcDateTime', 'Get-LeaseWaitHeatField', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec')) {   # the last four: AGENT-LEASE-PENDING-HEAT-TRACE-1 (ConvertTo-UtcDateTime: the headroom helper reads the sidecar bound with it)
+foreach ($name in @('Close-LeaseBatchAfterRelease', 'ConvertTo-UtcDateTime', 'Get-LeaseWaitHeatField', 'Get-LeaseSlotAgeText', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec')) {   # the last five: AGENT-LEASE-PENDING-HEAT-TRACE-1 (ConvertTo-UtcDateTime: the headroom helper reads the sidecar bound with it)
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -635,7 +635,7 @@ try {
     Reset-Case @{ request = 'hang' }
     $script:TokC = 'cccccccccccc'; $script:CloseQueuedAt = $null
     $script:AgeAfter = (Get-Date).AddSeconds(20)
-    function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return 0 }
+    function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return [int]$script:HtAge }   # HtAge: lease-pending-heat-trace sets a queue age (unset = 0)
     $admC = Wait-QuietLeaseAdmission -JobId "lease-batch-open-20261023T2200Z-lb$script:TokC" -Job ([pscustomobject]@{}) -Metadata $meta
     $reqC = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
     $lateC = @($reqC | Where-Object { $null -ne $script:CloseQueuedAt -and $_.ts -gt $script:CloseQueuedAt })
@@ -749,7 +749,7 @@ try {
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
     # (a FAIL on the label assert), never a hang.
-    function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return 0 }
+    function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return [int]$script:HtAge }   # HtAge: lease-pending-heat-trace sets a queue age (unset = 0)
     function Get-FakeFlag { try { return ([IO.File]::ReadAllText((Join-Path $fx 'quiet-lease.json')) | ConvertFrom-Json) } catch { return $null } }
     function New-NotAfterMeta([double]$InSec) { return [pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 600; notAfterUtc = [DateTime]::UtcNow.AddSeconds($InSec).ToString('o') } }
     function Get-RequestArg($Call, [string]$Flag) { $a = @($Call.argv); $i = [Array]::IndexOf($a, $Flag); if ($i -lt 0) { return $null }; return $a[$i + 1] }
@@ -2292,11 +2292,31 @@ function Exit-HeavySlot {
             Assert-True ($r12.waits.Count -ge 1 -and @($r12.waits | Where-Object { $_ -notmatch ' heat=hot throttled=6/60 meanC=88\.2 feedAge=unknown( |$)' }).Count -eq 0) "heat-trace A3: a far-future feed stamp keeps the readable heat and reports feedAge=unknown: $($r12.waits -join ' || ')"
             Exit-HeavySlot
             $script:FeedStub = @{ metrics = $hotMetrics; why = $null; ageSec = 12 }
-            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: suite X (pid 77, since 0001-01-02 00:00:00) [exclusive]', 'slot 2: free') }
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: suite X (pid 77, since 0100-01-02 00:00:00) [exclusive]', 'slot 2: free') }
             $r13 = Invoke-HeatTraceCase 'jHt13' @{ request = 'active'; active_after = 1.5 }
             Assert-True ($r13.snaps.Count -eq 2 -and @($r13.snaps | Where-Object { $_ -notmatch 'slot 1: suite X pid=77 age=\d{10,}s; slot 2: free' }).Count -eq 0) "heat-trace A3: a status age beyond Int32 is logged, not a whole-snapshot failure: $($r13.snaps -join ' || ')"
             Exit-HeavySlot
             $script:StatusStub = $slotsOk
+
+            # (h) adversary r2 A1: the GRANT probe also respects the queue ceiling (a job 570 s into a 600 s ceiling would be queue-expired by the probe's 30 s).
+            $script:HtAge = 570
+            Reset-Case @{ request = 'active'; active_after = 1.0 }
+            $script:AgeAfter = (Get-Date).AddSeconds(60); $script:StatusCalls = 0
+            $adm14 = Wait-QuietLeaseAdmission -JobId 'jHt14' -Job ([pscustomobject]@{}) -Metadata $meta
+            $script:HtAge = 0
+            $script:Admission = $adm14
+            $sk14 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHt14 *' })
+            Assert-True ($adm14.label -eq 'clear' -and $script:StatusCalls -eq 0 -and $sk14.Count -eq 2 -and @($sk14 | Where-Object { $_ -notmatch ' slots=skipped\(' }).Count -eq 0) "heat-trace A1(r2): 30 s of queue headroom skips BOTH probes (request and grant): calls=$($script:StatusCalls) $($sk14 -join ' || ')"
+            Exit-HeavySlot
+
+            # (i) adversary r2 A2: the age is counted across a DST change (TimeZoneInfo, not local DateTime subtraction); an ambiguous or non-existent local time is unknown.
+            $cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+            $spring = Get-LeaseSlotAgeText -Since '2026-03-08 01:55:00' -NowUtc ([DateTime]::new(2026, 3, 8, 8, 5, 0, [DateTimeKind]::Utc)) -Zone $cst
+            $fall = Get-LeaseSlotAgeText -Since '2026-11-01 01:45:00' -NowUtc ([DateTime]::new(2026, 11, 1, 7, 15, 0, [DateTimeKind]::Utc)) -Zone $cst
+            $gap = Get-LeaseSlotAgeText -Since '2026-03-08 02:30:00' -NowUtc ([DateTime]::new(2026, 3, 8, 9, 0, 0, [DateTimeKind]::Utc)) -Zone $cst
+            $plain = Get-LeaseSlotAgeText -Since '2026-10-25 10:00:00' -NowUtc ([DateTime]::new(2026, 10, 25, 16, 5, 0, [DateTimeKind]::Utc)) -Zone $cst
+            $future = Get-LeaseSlotAgeText -Since '2026-10-25 12:00:00' -NowUtc ([DateTime]::new(2026, 10, 25, 16, 5, 0, [DateTimeKind]::Utc)) -Zone $cst
+            Assert-True ($spring -ceq '600s' -and $fall -ceq 'unknown' -and $gap -ceq 'unknown' -and $plain -ceq '3900s' -and $future -ceq 'unknown' -and (Get-LeaseSlotAgeText -Since 'x') -ceq 'unknown') "heat-trace A2(r2): spring-forward 01:55 CST -> 03:05 CDT is 600 s (not 4200), the ambiguous/non-existent hours are unknown, a plain age is exact: spring=$spring fall=$fall gap=$gap plain=$plain future=$future"
             $results.leasePendingHeatTrace = [ordered]@{ waitLines = $r.waits.Count; sample = $r.waits[0]; requestSnapshot = $sReq[0]; grantSnapshot = $sGrant[0]; staleSample = $r2.waits[0]; timeoutSample = $r5.snaps[0] }
         }
         finally {
