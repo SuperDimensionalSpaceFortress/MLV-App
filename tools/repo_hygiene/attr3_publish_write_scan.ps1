@@ -97,6 +97,13 @@
 # New-Variable / Remove-Variable / Clear-Variable (a name the scan cannot read counts), or the variable: drive makes the
 # binding a 'splice' finding naming that reason. Parameter and variable names are compared without their scope
 # qualifier (`param([T]$local:r)` binds $r).
+#
+# Provider paths and data sections (r5, Dot B5-B8). Every comparison of an alias: / function: / variable: tail reads it through
+# Get-ProviderLeaf, which drops leading whitespace, './', '.\' and doubled separators and scope qualifiers, so
+# `function:./Join-Path` and `variable:\\local:PSScriptRoot` name what `function:Join-Path` and `variable:PSScriptRoot` do. A
+# route built from constants (`'fun' + 'ction:Join-Path'`) is read the same way; an empty or wildcard tail fails closed. A `data r
+# { ... }` section binds $r like an assignment: the receiver origin is unknown, $PSScriptRoot is rebound, and a destination
+# variable or $Work is no longer provable.
 # Not covered, and left OPEN: a freshness proof that
 # crosses a dynamic-scope or deferred-execution route this scan does not model (adversary A2-A5 inputs beyond the
 # scoped, trap, deferred-block and shadowed-constructor shapes above).
