@@ -6071,6 +6071,37 @@ $obj = $arr[[Math]::Min($n, $arr.Count - 1)]
                     self.assertNotIn("Cannot convert", out)
                     self.assertNotIn("percore blocked", proc.stdout, "an UNKNOWN mean is never turned into a measured BUSY by the per-core check")
 
+    # ---- r6 adversary pass (A1 A2): cores[] is an ARRAY of rows and a fast row names its core as "<group>,<core>"; anything else is typed unknown, never a definite verdict or a made-up core name ----
+    def test_a_cores_value_that_is_not_an_array_or_a_fast_row_without_a_core_name_is_unknown(self) -> None:
+        hot = _pc_cores(self.HOT)[0]
+        nameless = {k: v for k, v in hot.items() if k != "instance"}
+        cases = {
+            "cores as one object": (dict(hot), "invalid-cores"),
+            "cores as a string": ("0,2", "invalid-cores"),
+            "cores as a number": (82, "invalid-cores"),
+            "missing instance": ([nameless], "invalid-core-instance"),
+            "array instance": ([dict(hot, instance=["0,0", "0,2"])], "invalid-core-instance"),
+            "numeric instance": ([dict(hot, instance=2)], "invalid-core-instance"),
+            "empty instance": ([dict(hot, instance="")], "invalid-core-instance"),
+            "instance that is not group,core": ([dict(hot, instance="cpu2")], "invalid-core-instance"),
+            "null instance": ([dict(hot, instance=None)], "invalid-core-instance"),
+        }
+        for name, (cores, reason) in cases.items():
+            with self.subTest(name):
+                probe = self.probe(cores)
+                for flags in (("-PerCoreEnforce",), ()):
+                    proc = self.gate(probe, *flags)
+                    self.assertRegex(proc.stdout, r"(?m)^QUIET ", proc.stdout + proc.stderr)
+                    self.assertIn(f"would_block=null reason={reason}", proc.stdout)
+                    self.assertNotIn("percore blocked", proc.stdout)
+                    self.assertNotIn("0_0_0_2", proc.stdout)
+                self.assertIn("Busy probes summarized: 0 (quiet skipped 1", self._summary_for(probe, "r6-" + str(abs(hash(name)))).stdout)
+
+    def test_an_efficiency_core_row_without_a_core_name_does_not_make_the_check_unknown(self) -> None:
+        ecore = {k: v for k, v in _pc_cores(self.EHOT)[0].items() if k != "instance"}
+        proc = self.gate(self.probe(_pc_cores(self.COOL) + [ecore]), "-PerCoreEnforce")
+        self.assertIn("would_block=false", proc.stdout, proc.stdout + proc.stderr)
+
     # ---- adversary pass r4 (A4): a sink that fails on the observation line must not also swallow the blocked-core line ----
     def test_a_sink_failure_on_the_observation_line_still_prints_the_blocked_core_line(self) -> None:
         script = (DV / "Wait-VenueQuiet.ps1").as_posix()

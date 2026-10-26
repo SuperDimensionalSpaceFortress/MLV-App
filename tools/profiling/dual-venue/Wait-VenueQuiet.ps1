@@ -84,7 +84,7 @@
 #          `  percore enabled=<bool> threshold=<t>% busiest_fast_core=<instance|n/a> busiest_fast_pct=<p>%|n/a would_block=<true|false|null>[ reason=<code>]`
 #        <instance> is the probe's `<group>,<core>` with the comma written as `_` (gate text is comma-free, as for every other line the run-local drivers split).
 #        would_block is what the check says about that probe; with the switch OFF it changes nothing, so the log measures how often enforcing would have fired before anyone turns it on.
-#        UNKNOWN IS NULL, NEVER FALSE, AND NEVER A BLOCK: would_block=null with reason no-probe (the probe itself was unavailable), no-cores (no cores[] rows), core-class-unknown (a row whose class is not P / E / uniform, so it
+#        UNKNOWN IS NULL, NEVER FALSE, AND NEVER A BLOCK: would_block=null with reason no-probe (the probe itself was unavailable), no-cores (no cores[] rows), invalid-cores (cores is not an array), invalid-core-instance (a fast core whose instance is not a "<group>,<core>" string), core-class-unknown (a row whose class is not P / E / uniform, so it
 #        might be a fast core), invalid-core-row (an entry in cores[] that is not a JSON object: null, a scalar, a nested array), incomplete-samples (a fast or unknown-class row flagged incomplete, with
 #        validSamples != totalSamples, or with a count that is not a whole number >= 1 or an incomplete flag that is not a boolean), invalid-notes (a notes property that is present but not an object, an explicit null included; an absent property is an older probe and is unchanged), cores-omitted (the probe omitted a core for having no
 #        valid sample: notes.cores_omitted) or invalid-core-percent (a non-numeric, array or out-of-range
@@ -1310,6 +1310,8 @@ function Get-VenuePerCoreVerdict($Probe, [double]$Threshold, [bool]$Enabled) {
     try {
         if ($null -eq $Probe -or $Probe -isnot [pscustomobject]) { $r.reason = 'no-probe'; return [pscustomobject]$r }
         if ($null -eq $Probe.cores) { $r.reason = 'no-cores'; return [pscustomobject]$r }
+        # cores[] is an array of rows; one object (which @() would wrap as a single row), a string or a number is no list of cores
+        if ($Probe.cores -isnot [array]) { $r.reason = 'invalid-cores'; return [pscustomobject]$r }
         $all = @($Probe.cores)
         if ($all.Count -eq 0) { $r.reason = 'no-cores'; return [pscustomobject]$r }
         $fast = @(); $reasons = @()
@@ -1341,7 +1343,11 @@ function Get-VenuePerCoreVerdict($Probe, [double]$Threshold, [bool]$Enabled) {
             # percent_exact when the row carries the property (even a null or bad one: no fallback to the rounded figure), else the older probe's 2-dp percent; plain assignment keeps a one-element array an array
             if ($null -ne $row.PSObject.Properties['percent_exact']) { $v = $row.percent_exact } else { $v = $row.percent }
             if (-not (Test-PerCoreNumber $v) -or -not [double]::IsFinite([double]$v) -or [double]$v -lt 0.0 -or [double]$v -gt 100.0) { $reasons += 'invalid-core-percent'; continue }
-            if ($isFast) { $fast += [pscustomobject]@{ instance = [string]$row.instance; percent = [double]$v } }
+            # a fast core is named by its "<group>,<core>" instance (a missing, array, numeric or free-text name would be a made-up core in the blocked line)
+            if ($isFast) {
+                if ($row.instance -isnot [string] -or $row.instance -cnotmatch '^\d+,\d+$') { $reasons += 'invalid-core-instance'; continue }
+                $fast += [pscustomobject]@{ instance = [string]$row.instance; percent = [double]$v }
+            }
         }
         if ($fast.Count -gt 0) {
             $top = $fast | Sort-Object -Property @{ Expression = { $_.percent }; Descending = $true } | Select-Object -First 1
