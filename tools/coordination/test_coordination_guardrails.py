@@ -2454,6 +2454,66 @@ def test_save_dirty_worktree_evidence_fails_typed_on_a_short_staged_write_with_e
 
 
 @dirty_save_only
+def test_save_dirty_worktree_evidence_never_overwrites_a_status_snapshot_for_the_same_patch(tmp_path):
+    # r3 round-2 adversary A1: the status name follows the patch id, so the same tracked diff with a different untracked set rewrote the first snapshot.
+    wt, dest = _dirty_save_repo(tmp_path)
+    (wt / "orphan.txt").write_text("x\n")
+    first = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert first.stdout.startswith("DIRTY_TREE_SAVED"), first.stdout + first.stderr
+    (wt / "orphan.txt").unlink()
+    (wt / "other.txt").write_text("y\n")
+    second = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r2")
+    assert second.stdout.startswith("DIRTY_TREE_SAVED"), second.stdout + second.stderr
+    statuses = sorted(dest.glob("dirty-worktree-*.status*.txt"))
+    texts = sorted(p.read_text(encoding="utf-8") for p in statuses)
+    assert len(statuses) == 2 and any("orphan.txt" in t for t in texts) and any("other.txt" in t for t in texts), (statuses, texts)
+    assert len(list(dest.glob("dirty-worktree-*.patch"))) == 1, "the identical tracked diff keeps one patch name"
+    third = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r3")
+    assert third.stdout.startswith("DIRTY_TREE_SAVED") and len(list(dest.glob("dirty-worktree-*.status*.txt"))) == 2, "an identical status snapshot is reused, not duplicated"
+
+
+def _truncate_staged_at_second_file_shim(second_marker):
+    # A PowerShell function named git outranks git.exe for the helper's `& git` calls: it runs the real git, then cuts the output file of `diff --cached` / `diff HEAD`
+    # right before the SECOND file header (so the first file's patch stays whole) and keeps git's exit code 0.
+    return (f"$script:RealGit = '{shutil.which('git')}'; "
+            "function git { & $script:RealGit @args; $code = $LASTEXITCODE; "
+            "$o = @($args | Where-Object { $_ -like '--output=*' })[0]; "
+            "if ($o -and $args -contains 'diff') { $p = $o.Substring(9); $t = [System.IO.File]::ReadAllText($p); "
+            f"$i = $t.IndexOf(\"`ndiff --git a/{second_marker}\"); if ($i -gt 0) {{ [System.IO.File]::WriteAllText($p, $t.Substring(0, $i + 1)) }} }}; "
+            "$global:LASTEXITCODE = $code }")
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_typed_when_a_staged_diff_loses_a_whole_file(tmp_path):
+    # r3 round-2 adversary A2: a diff cut exactly before the second file header is a valid, applicable one-file patch, so reverse-apply alone cannot see the loss.
+    wt, dest = _dirty_save_repo(tmp_path)
+    (wt / "src" / "b.txt").write_text("one\n")
+    git(wt, "add", "src/b.txt")
+    git(wt, "commit", "-qm", "b")
+    for name in ("a.txt", "b.txt"):
+        (wt / "src" / name).write_text("staged-" + name + "\n")
+        git(wt, "add", f"src/{name}")
+        (wt / "src" / name).write_text("one\n")
+    out = dirty_save_pwsh(f"{_truncate_staged_at_second_file_shim('src/b.txt')}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=staged-diff-incomplete"), out.stdout + out.stderr
+    assert not list(dest.glob("dirty-worktree-staged-*")) and not list(dest.glob("*.tmp"))
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_typed_when_the_main_patch_loses_a_whole_file(tmp_path):
+    # Same class on the main patch (adversary siblings :41 / :77): a complete one-file prefix used to be reported as verified=reverse-apply-ok.
+    wt, dest = _dirty_save_repo(tmp_path)
+    (wt / "src" / "b.txt").write_text("one\n")
+    git(wt, "add", "src/b.txt")
+    git(wt, "commit", "-qm", "b")
+    (wt / "src" / "a.txt").write_text("edited-a\n")
+    (wt / "src" / "b.txt").write_text("edited-b\n")
+    out = dirty_save_pwsh(f"{_truncate_staged_at_second_file_shim('src/b.txt')}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=patch-incomplete"), out.stdout + out.stderr
+    assert not list(dest.glob("dirty-worktree-*.patch")) and not list(dest.glob("*.tmp"))
+
+
+@dirty_save_only
 def test_save_dirty_worktree_evidence_pins_the_patch_shape_against_diff_config(tmp_path):
     # r3 adversary A3: diff.context=0 in a repo or user config made both saved diffs context-free, which plain `git apply` rejects.
     wt = tmp_path / "wt"
@@ -2493,8 +2553,12 @@ def test_save_dirty_worktree_evidence_accepts_every_staged_shape(tmp_path):
     (wt / "moved.txt").write_text("".join(f"row {i}\n" for i in range(20)))
     (wt / "mode.sh").write_text("echo hi\n")
     (wt / "bin.dat").write_bytes(bytes(range(256)))
-    git(wt, "add", "gone.txt", "moved.txt", "mode.sh", "bin.dat")
+    (wt / "é.txt").write_text("accent\n")
+    git(wt, "add", "gone.txt", "moved.txt", "mode.sh", "bin.dat", "é.txt")
     git(wt, "commit", "-qm", "shapes")
+    (wt / "é.txt").write_text("accent\nchanged\n")
+    git(wt, "add", "é.txt")
+    git(wt, "update-index", "--add", "--cacheinfo", f"160000,{git(wt, 'rev-parse', 'HEAD')},vendor/sub")  # a staged gitlink (submodule pointer)
     git(wt, "rm", "-q", "gone.txt")
     git(wt, "mv", "moved.txt", "renamed.txt")
     git(wt, "update-index", "--chmod=+x", "mode.sh")
@@ -2508,8 +2572,8 @@ def test_save_dirty_worktree_evidence_accepts_every_staged_shape(tmp_path):
     clone = tmp_path / "clone"
     git(tmp_path, "clone", "-q", str(wt), str(clone))
     git(clone, "reset", "-q", "--hard", "HEAD")
-    git(clone, "apply", "--index", str(staged))
-    assert git(clone, "diff", "--cached", "--name-status") == git(wt, "diff", "--cached", "--name-status")
+    git(clone, "apply", "--cached", str(staged))
+    assert git(clone, "diff", "--cached", "--name-status", "--no-renames") == git(wt, "diff", "--cached", "--name-status", "--no-renames")
 
 
 @dirty_save_only
