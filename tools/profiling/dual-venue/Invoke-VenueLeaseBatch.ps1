@@ -280,6 +280,14 @@ public static class VenueLeaseBatchFinalPath {
             return info.VolumeSerial.ToString("x8") + ":" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8");
         }
     }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool GetVolumeInformationW(string root, StringBuilder volumeName, uint volumeNameSize, out uint serial, out uint maxComponent, out uint flags, StringBuilder fsName, uint fsNameSize);
+    // r11 (sol r10 blocker 2): the longest single path component the volume holding $root accepts (255 on NTFS)
+    public static int MaxComponent(string root) {
+        uint serial, maxComponent, flags;
+        if (!GetVolumeInformationW(root, null, 0, out serial, out maxComponent, out flags, null, 0)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        return (int)maxComponent;
+    }
     public static string Resolve(string path) {
         // access 0 (attributes only), share all, OPEN_EXISTING, BACKUP_SEMANTICS (a directory opens too); no OPEN_REPARSE_POINT, so a link is followed to its target
         using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
@@ -312,55 +320,116 @@ function Get-FileIdentity([string]$Path) {
     [pscustomobject]@{ key = $key; links = [int]$links }
 }
 
+# r11 (sol r10 blocker 1 / fable H1; card LEASE-BATCH-MULTI-BUILD-1): the runner's outputs are not only the files in -RunDir. VenueChain.psm1 also writes, under the claim dir, every
+# file it names with Join-Path / Get-VenueClaimPath / Get-VenueTicketDir / Get-VenueLeaseLedgerPath: <venue>.claim.json (Invoke-VenueClaimAttempt creates it, Update-VenueClaim rewrites it,
+# Remove-VenueClaimIfUnchanged deletes it, and deletes an unparseable one as a stale claim), <venue>.lease-ledger.jsonl (Add-VenueLeaseLedger appends) and <venue>.tickets\ (New-VenueTicket
+# creates <ticks>-p<pid>-<start>.ticket.json files there). The claim dir is a second zone beside -RunDir (they may be the same folder), listed here and nowhere else, like the -RunDir one above.
+$script:ClaimDirOutputLeafPatterns = @(
+    ('^' + [regex]::Escape("$Venue.claim.json") + '\z')
+    ('^' + [regex]::Escape("$Venue.lease-ledger.jsonl") + '\z')
+)
+$script:ClaimDirOutputDirs = @("$Venue.tickets")
+$script:ClaimDirPath = $(try { [string](Split-Path -Parent (Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir)) } catch { '' })
+
+function Get-OutputZones {
+    # The folders this run writes into: -RunDir, then the claim dir when it already exists (nothing can sit in one that does not). root = the PHYSICAL path.
+    $zones = @([pscustomobject]@{ label = '-RunDir'; root = (Get-PhysicalPath $RunDir).TrimEnd('\'); leaf = $script:RunDirOutputLeafPatterns; dirs = $script:RunDirOutputDirs; linked = @() })
+    if ($script:ClaimDirPath -and (Test-Path -LiteralPath $script:ClaimDirPath -PathType Container)) {
+        $zones += [pscustomobject]@{ label = '-ClaimDir'; root = (Get-PhysicalPath $script:ClaimDirPath).TrimEnd('\'); leaf = $script:ClaimDirOutputLeafPatterns; dirs = $script:ClaimDirOutputDirs; linked = @() }
+    }
+    $zones
+}
+
 function Get-RunDirOutputRefusal([string]$Path) {
     # '' when $Path is not a file this run writes; else the sentence for the refusal. r10 (adversary r9 A1): PHYSICAL paths on both sides (Get-PhysicalPath), so neither a spelling of -RunDir
-    # (\.\, ..\, a trailing \) nor a junction or symlink that reaches it (the input, an ancestor of it, or -RunDir itself) slips past. Every caller goes through here.
-    $hardLinkOf = ''
+    # (\.\, ..\, a trailing \) nor a junction or symlink that reaches it (the input, an ancestor of it, or -RunDir itself) slips past. Every caller goes through here, and so does the
+    # re-check once the claim is held (Get-InputOutputRefusal). r11: and the same for each zone of Get-OutputZones (-RunDir, then the claim dir).
+    $hardLinkOf = ''; $hardLinkZone = $null
     try {
         $full = Get-PhysicalPath $Path
-        $root = (Get-PhysicalPath $RunDir).TrimEnd('\')
-        # a runner-owned name inside -RunDir that is itself a link: what the runner writes under that name lands at the link's target, so the target is the output
-        $linked = @()
-        foreach ($c in @(Get-ChildItem -LiteralPath $root -Force -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
-            $owned = ($c.Name -iin $script:RunDirOutputDirs)
-            foreach ($p in $script:RunDirOutputLeafPatterns) { if ($c.Name -imatch $p) { $owned = $true } }
-            if ($owned) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = (Get-PhysicalPath $c.FullName) } }
+        $zones = @(Get-OutputZones)
+        foreach ($z in $zones) {
+            # a runner-owned name inside the zone that is itself a link: what the runner writes under that name lands at the link's target, so the target is the output
+            $linked = @()
+            foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
+                $owned = ($c.Name -iin $z.dirs)
+                foreach ($p in $z.leaf) { if ($c.Name -imatch $p) { $owned = $true } }
+                if ($owned) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = (Get-PhysicalPath $c.FullName) } }
+            }
+            $z.linked = $linked
         }
         # r10 (adversary r10 A1): and a HARD link is a second name for the same file, with its own final path, so the paths differ while the file is the one the runner writes. Compare file
         # identity: only an input with more than one name can be one, and then only the outputs that already exist can be its other name.
         $id = Get-FileIdentity $full
         if ($id.links -gt 1) {
-            $scan = [System.Collections.Generic.List[object]]::new()
-            foreach ($c in @(Get-ChildItem -LiteralPath $root -Force -File -ErrorAction Stop)) {
-                foreach ($p in $script:RunDirOutputLeafPatterns) { if ($c.Name -imatch $p) { $scan.Add($c); break } }
-            }
-            foreach ($d in $script:RunDirOutputDirs) {
-                $dp = Join-Path $root $d
-                $lk = @($linked | Where-Object { $_.isDir -and $_.name -ieq $d })
-                if ($lk.Count -gt 0) { $dp = $lk[0].physical }
-                if (Test-Path -LiteralPath $dp -PathType Container) { foreach ($c in @(Get-ChildItem -LiteralPath $dp -Force -File -Recurse -ErrorAction Stop)) { $scan.Add($c) } }
-            }
-            foreach ($c in $scan) {
-                if (((Get-FileIdentity $c.FullName).key -ceq $id.key) -and ((Get-PhysicalPath $c.FullName) -ine $full)) { $hardLinkOf = $c.FullName; break }
+            foreach ($z in $zones) {
+                $scan = [System.Collections.Generic.List[object]]::new()
+                foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -File -ErrorAction Stop)) {
+                    foreach ($p in $z.leaf) { if ($c.Name -imatch $p) { $scan.Add($c); break } }
+                }
+                foreach ($d in $z.dirs) {
+                    $dp = Join-Path $z.root $d
+                    $lk = @($z.linked | Where-Object { $_.isDir -and $_.name -ieq $d })
+                    if ($lk.Count -gt 0) { $dp = $lk[0].physical }
+                    if (Test-Path -LiteralPath $dp -PathType Container) { foreach ($c in @(Get-ChildItem -LiteralPath $dp -Force -File -Recurse -ErrorAction Stop)) { $scan.Add($c) } }
+                }
+                foreach ($c in $scan) {
+                    if (((Get-FileIdentity $c.FullName).key -ceq $id.key) -and ((Get-PhysicalPath $c.FullName) -ine $full)) { $hardLinkOf = $c.FullName; $hardLinkZone = $z; break }
+                }
+                if ($hardLinkOf) { break }
             }
         }
     } catch { return "'$Path' cannot be resolved to a physical path ($($_.Exception.Message -replace '\s+', ' ')); an input whose location is unknown is refused" }
     $shown = $(if ($full -ieq [IO.Path]::GetFullPath($Path)) { "'$full'" } else { "'$Path' (physical path '$full')" })
-    if ($hardLinkOf) { return "$shown is a hard link to $hardLinkOf, a file this run writes under -RunDir" }
-    foreach ($l in $linked) {
-        if (-not $l.isDir -and $full -ieq $l.physical) { return "$shown is a file this run writes into -RunDir ($($l.name), a link to it)" }
-        if ($l.isDir -and ($full + '\').StartsWith($l.physical.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $($l.name)\, a link to a directory this run writes into under -RunDir" }
-    }
+    if ($hardLinkOf) { return "$shown is a hard link to $hardLinkOf, a file this run writes under $($hardLinkZone.label)" }
     $parent = [IO.Path]::GetDirectoryName($full).TrimEnd('\')
-    if ($parent -ieq $root) {
-        $leaf = [IO.Path]::GetFileName($full)
-        foreach ($p in $script:RunDirOutputLeafPatterns) { if ($leaf -imatch $p) { return "$shown is a file this run writes into -RunDir ($leaf)" } }
-        return ''
-    }
-    foreach ($d in $script:RunDirOutputDirs) {
-        if (($parent + '\').StartsWith($root + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $d\, a directory this run writes into under -RunDir" }
+    foreach ($z in $zones) {
+        foreach ($l in $z.linked) {
+            if (-not $l.isDir -and $full -ieq $l.physical) { return "$shown is a file this run writes into $($z.label) ($($l.name), a link to it)" }
+            if ($l.isDir -and ($full + '\').StartsWith($l.physical.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $($l.name)\, a link to a directory this run writes into under $($z.label)" }
+        }
+        if ($parent -ieq $z.root) {
+            $leaf = [IO.Path]::GetFileName($full)
+            foreach ($p in $z.leaf) { if ($leaf -imatch $p) { return "$shown is a file this run writes into $($z.label) ($leaf)" } }
+        }
+        foreach ($d in $z.dirs) {
+            if (($parent + '\').StartsWith($z.root + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $d\, a directory this run writes into under $($z.label)" }
+        }
     }
     ''
+}
+
+function Get-OutputNameRefusal([string]$LegName) {
+    # r11 (sol r10 blocker 2): '' when every file name the runner generates from $LegName can be opened, else the sentence. The names are Invoke-QuietProbe's quiet-<leg>-<phase>.out.txt and the
+    # leg's leg-<leg>-b<nn>-a<n>.out.txt (the two generated ones; the rest are fixed names). The batch and attempt numbers are not known yet, so the check reserves room for the widest
+    # it will print (b9999-a999999). A name over the volume's longest component (GetVolumeInformationW; 255 when it cannot be read), or a full path over 32000 characters, is refused.
+    if ($null -eq $script:MaxNameComponent) {
+        $script:MaxNameComponent = 255
+        try { $n = [VenueLeaseBatchFinalPath]::MaxComponent([IO.Path]::GetPathRoot((Get-PhysicalPath $RunDir))); if ($n -gt 0) { $script:MaxNameComponent = $n } } catch { }
+    }
+    $phase = 'b9999-a999999'
+    foreach ($name in @("quiet-$LegName-$phase.out.txt", "leg-$LegName-$phase.out.txt")) {
+        if ($name.Length -gt $script:MaxNameComponent) { return "the file name '$name' this run would write is $($name.Length) characters, over the $($script:MaxNameComponent) the volume allows in one name (reserving room for batch and attempt numbers)" }
+        if ($RunDir.TrimEnd('\').Length + 1 + $name.Length -gt 32000) { return "the path to '$name' under -RunDir is over 32000 characters" }
+    }
+    ''
+}
+
+function Get-InputOutputRefusal {
+    # r11 (sol r10 blocker 3): the first validated input (the plan file, then each leg spec) that is now a file this run writes; $null when none is. Defined once the plan is built;
+    # the very guard the preflight uses (Get-RunDirOutputRefusal), run again once the claim is held, because an alias can appear while the batch waits for a foreign claim.
+    foreach ($g in $script:guardedInputs) {
+        $why = Get-RunDirOutputRefusal $g.path
+        if ($why) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why } }
+    }
+    $null
+}
+
+function Stop-InputIsOutput($Hit) {
+    # the typed refusal of Get-InputOutputRefusal's hit: the same reason words and exit 2 as the preflight's
+    if ($Hit.kind -ceq 'plan') { Stop-PlanRefused 'LEG_PLAN_IS_RUN_OUTPUT' 0 "the plan file $($Hit.why)" }
+    elseif ($legPlanMode) { Stop-PlanRefused 'LEG_SPEC_IS_RUN_OUTPUT' $Hit.item "the leg spec $($Hit.why)" }
+    else { Stop-Usage "LEG_SPEC_IS_RUN_OUTPUT the leg spec $($Hit.why)" }
 }
 
 function Resolve-LegSpecPath([string]$Ref, [string]$BesideDir) {
@@ -482,6 +551,20 @@ if ($legPlanMode) {
         }
     }
 }
+# r11 (sol r10 blocker 2): every generated output name is checked HERE, before any claim, for every form: a leg name built from an accepted spec's own basename (the legId fallback) and a
+# 32-character arm can pass every earlier check and then name a file the volume cannot hold, which would fail after the lease opened.
+foreach ($leg in $plan) {
+    $nameRefusal = Get-OutputNameRefusal $leg.name
+    if ($nameRefusal) {
+        if ($legPlanMode) { Stop-PlanRefused 'OUTPUT_NAME_TOO_LONG' $leg.planItem "leg $($leg.name): $nameRefusal" }
+        else { Stop-Usage "OUTPUT_NAME_TOO_LONG leg $($leg.name): $nameRefusal" }
+    }
+}
+# r11 (sol r10 blocker 3): the validated inputs, kept for the re-check once the claim is held (Get-InputOutputRefusal). A -LegSet's specs are inputs too, so they are checked now as well.
+$script:guardedInputs = [System.Collections.Generic.List[object]]::new()
+if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPath; kind = 'plan'; item = 0 }) }
+foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }) }) }
+if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }
 # The scalar form's one build rides on every leg, so each leg is launched with its own build in either form.
 if (-not $legPlanMode) { foreach ($p in $plan) { $p | Add-Member -NotePropertyName sourceCommit -NotePropertyValue $SourceCommit; $p | Add-Member -NotePropertyName buildManifestSha256 -NotePropertyValue $BuildManifestSha256 } }
 
@@ -641,6 +724,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     $claim = $null; $lastHolder = ''
     while ($true) {
         $req = Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir
+        # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
+        # before the first write (the CLAIM_* log lines, leg-plan.json): a hit releases a claim just taken, opens no lease and ends in the typed refusal (exit 2).
+        $hit = Get-InputOutputRefusal
+        if ($hit) {
+            if ($req.granted) { try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { } }
+            Stop-InputIsOutput $hit
+        }
         foreach ($bk in $req.broken) { LogBest "CLAIM_STALE_BROKEN venue=$Venue reason=$($bk.reason) ownerPid=$($bk.claim.ownerPid) runDir=$($bk.claim.runDir) expiresUtc=$($bk.claim.expiresUtc)" }
         if ($req.granted) { $claim = $req.claim; break }
         $holder = $(if ($req.claim) { "pid=$($req.claim.ownerPid) runDir=$($req.claim.runDir) purpose=$($req.claim.purpose)" } else { $req.state })

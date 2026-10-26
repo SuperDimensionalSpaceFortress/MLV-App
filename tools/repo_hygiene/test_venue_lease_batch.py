@@ -2525,6 +2525,203 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertNotIn("IS_RUN_OUTPUT", r.stderr)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    # r11 (sol r10 blockers 1-3 = producer OPEN r10-A1..A3). Round one item 2: every input is validated BEFORE the lease opens, and no accepted input is overwritten, deleted or made
+    # unusable later. A1: the runner's outputs are not only <RunDir>\ files: VenueChain.psm1 also writes <ClaimDir>\bachelor.claim.json (deleted as a stale claim when unparseable),
+    # <ClaimDir>\bachelor.lease-ledger.jsonl (appended to) and <ClaimDir>\bachelor.tickets\ (ticket files). A2: every generated output name must be openable. A3: the guard runs again
+    # once the claim is held, because an alias can appear while the batch waits on a foreign claim.
+    CLAIM_DIR_OUTPUTS = ("bachelor.claim.json", "bachelor.lease-ledger.jsonl", "bachelor.tickets/0000000000000000001-p1-1.ticket.json")
+
+    def _claim_dir_input(self, leaf: str, age_s: int = 31) -> tuple[Path, str]:
+        spec = self.claims / leaf
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        old = time.time() - age_s
+        os.utime(spec, (old, old))
+        return spec, spec.read_text(encoding="utf-8")
+
+    def _assert_nothing_submitted_input_intact(self, r: subprocess.CompletedProcess, path: Path, before: str, marker: str) -> None:
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(marker, r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertTrue(path.exists(), "the accepted input was not removed")
+        self.assertEqual(path.read_text(encoding="utf-8"), before, "the accepted input is byte-unchanged")
+
+    def test_r11_a1_a_plan_item_spec_at_a_claim_dir_file_is_refused_when_run_dir_is_the_claim_dir(self) -> None:
+        # sol r10 blocker 1, literal: RunDir=ClaimDir, a valid spec at bachelor.claim.json (age 31 s: past the 30 s grace, so the claim reader types it STALE/unreadable and
+        # Invoke-VenueClaimAttempt removes it) and at its ledger sibling (Add-VenueLeaseLedger appends to it).
+        for leaf in self.CLAIM_DIR_OUTPUTS:
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                shutil.rmtree(self.claims, ignore_errors=True)
+                self.run_dir = self.claims
+                spec, before = self._claim_dir_input(leaf)
+                r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+
+    def test_r11_a1_a_claim_dir_file_is_refused_whatever_the_run_dir_is(self) -> None:
+        # the claim dir is a runner output location in its own right, not only when it is also -RunDir
+        for leaf in self.CLAIM_DIR_OUTPUTS:
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                shutil.rmtree(self.claims, ignore_errors=True)
+                spec, before = self._claim_dir_input(leaf)
+                r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                shutil.rmtree(self.claims, ignore_errors=True)
+                spec, before = self._claim_dir_input(leaf)
+                r = self.run_batch([spec])
+                self._assert_nothing_submitted_input_intact(r, spec, before, "BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT")
+
+    def test_r11_a1_a_plan_file_at_a_claim_dir_file_is_refused_before_the_claim(self) -> None:
+        for leaf in ("bachelor.claim.json", "bachelor.lease-ledger.jsonl"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                shutil.rmtree(self.claims, ignore_errors=True)
+                self.run_dir = self.claims
+                plan = self.claims / leaf
+                plan.parent.mkdir(parents=True, exist_ok=True)
+                plan.write_text(json.dumps({"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": [self.item(self.specs[0], "A", self.commit_a)]}), encoding="utf-8")
+                old = time.time() - 31
+                os.utime(plan, (old, old))
+                before = plan.read_text(encoding="utf-8")
+                r = self.run_plan(plan)
+                self._assert_nothing_submitted_input_intact(r, plan, before, "LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT")
+
+    def test_r11_a1_a_spec_hard_linked_to_a_claim_dir_file_is_refused_before_the_claim(self) -> None:
+        for leaf in ("bachelor.claim.json", "bachelor.lease-ledger.jsonl"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                shutil.rmtree(self.claims, ignore_errors=True)
+                safe = self.case / "safe" / "fx-a.json"
+                safe.unlink(missing_ok=True)
+                before = self._hard_linked(self.claims / leaf, safe)
+                r = self.run_plan(self.write_plan([self.item(safe, "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, safe, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                self.assertIn("is a hard link to", r.stderr)
+
+    def test_r11_a1_a_spec_in_the_claim_dir_under_another_name_is_not_refused(self) -> None:
+        self._fresh_run_dir()
+        shutil.rmtree(self.claims, ignore_errors=True)
+        self.run_dir = self.claims
+        spec, _ = self._claim_dir_input("fx-a.spec.json")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def _long_name_spec(self, basename_len: int) -> Path:
+        # a spec whose legId is not a usable leg name (82 chars, over the 81 the runner takes), so the file's own basename becomes the leg name (sol r10 blocker 2, literal)
+        # (kept off the deep test temp folder: the spec's own path must stay under MAX_PATH, so the only over-long name is the one the RUNNER generates from it)
+        d = None
+        for root in (os.environ.get("PUBLIC", ""), (os.environ.get("SystemDrive", "C:") + "\\"), tempfile.gettempdir()):
+            try:
+                cand = Path(tempfile.mkdtemp(prefix="lb", dir=root)) if root else None
+            except OSError:
+                continue
+            if cand is not None and len(str(cand / ("a" * basename_len + ".json"))) < 259:
+                d = cand
+                break
+            if cand is not None:
+                shutil.rmtree(cand, ignore_errors=True)
+        if d is None:
+            self.skipTest("no folder is shallow enough to keep the spec's own path under MAX_PATH")
+        self.addCleanup(shutil.rmtree, d, True)
+        spec = d / ("a" * basename_len + ".json")
+        spec.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "x" * 82, "backends": ["cpu"], "scaleFactor": 1}), encoding="utf-8")
+        return spec
+
+    def test_r11_a2_a_generated_output_name_over_the_volume_limit_is_refused_before_the_claim(self) -> None:
+        # 205-char basename + 32-char arm: the quiet output is 266 characters, the volume's component limit 255; redirecting into it failed AFTER the lease opened.
+        spec = self._long_name_spec(205)
+        r = self.run_plan(self.write_plan([self.item(spec, "A" * 32, self.commit_a)]))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=OUTPUT_NAME_TOO_LONG item=1 ", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_r11_a2_the_scalar_form_refuses_a_generated_output_name_over_the_limit_too(self) -> None:
+        spec = self._long_name_spec(220)   # no -Backend: the leg name ends in "-spec", and quiet-01-<220>-spec-b9999-a999999.out.txt is 256 characters
+        r = self.run_batch([spec])
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BATCH_USAGE OUTPUT_NAME_TOO_LONG", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_r11_a2_a_short_name_with_a_full_length_arm_still_runs(self) -> None:
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A" * 32, self.commit_a)]))
+        self.assertNotIn("OUTPUT_NAME_TOO_LONG", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def _foreign_live_claim(self) -> None:
+        # a LIVE claim of another owner: a real sleeping process, its real start time (Get-VenueClaimStaleReason finds a live owner and the claim not yet expired)
+        holder = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"])
+        self.addCleanup(lambda: holder.poll() is None and subprocess.run(["taskkill", "/PID", str(holder.pid), "/T", "/F"], capture_output=True, text=True, timeout=60))
+        t = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f"(Get-Process -Id {holder.pid}).StartTime.ToUniversalTime().ToString('o')"],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        now = datetime.now(timezone.utc)
+        self.claims.mkdir(parents=True, exist_ok=True)
+        self.claim_path.write_text(json.dumps({"schema": "mlv-app/venue-claim/v1", "venue": "bachelor", "ownerPid": holder.pid, "ownerCreatedUtc": t.stdout.strip(),
+                                               "host": os.environ.get("COMPUTERNAME", ""), "runDir": str(self.case / "foreign"), "purpose": "foreign", "claimedUtc": utc_iso(now),
+                                               "expiresUtc": utc_iso(now + timedelta(hours=1)), "nonce": "f" * 32}, separators=(",", ":")) + "\n", encoding="utf-8")
+
+    def _wait_for_log(self, text: str, timeout_s: float = 90) -> None:
+        end = time.monotonic() + timeout_s
+        log = self.run_dir / "batch.log"
+        while time.monotonic() < end:
+            try:
+                if text in log.read_text(encoding="utf-8"):
+                    return
+            except OSError:
+                pass
+            time.sleep(0.2)
+        self.fail(f"{text!r} never reached {log}")
+
+    def _alias_during_claim_wait(self, args: list[str], e: dict, spec: Path, alias: Path) -> tuple[int, str, str]:
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("CLAIM_HELD")
+            os.link(spec, alias)
+            self.claim_path.unlink()   # the foreign owner lets go: this run takes the claim next poll
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        return p.returncode, so, se
+
+    def test_r11_a3_an_output_alias_added_while_the_batch_waits_on_a_foreign_claim_is_refused_after_the_wait(self) -> None:
+        # sol r10 blocker 3, literal: ordinary single-link spec; while the runner waits (CLAIM_HELD) a hard link <RunDir>\leg-plan.json -> the spec appears; the foreign claim
+        # is then released. The guard ran only before the wait, so leg-plan.json was written THROUGH the link, over the accepted spec, before the lease opened.
+        self._fresh_run_dir()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        before = spec.read_text(encoding="utf-8")
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        code, so, se = self._alias_during_claim_wait(args, e, spec, self.run_dir / "leg-plan.json")
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
+        self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is byte-unchanged")
+
+    def test_r11_a3_a_scalar_spec_aliased_while_waiting_is_refused_after_the_wait(self) -> None:
+        self._fresh_run_dir()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        before = spec.read_text(encoding="utf-8")
+        self._foreign_live_claim()
+        args, e = self.batch_cmd([spec])
+        code, so, se = self._alias_during_claim_wait(args, e, spec, self.run_dir / "gate.log")
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
+        self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is byte-unchanged")
+
     def test_r5_adv_a1_a_throw_after_a_leg_ran_does_not_record_that_leg_as_not_run(self) -> None:
         # adversary r5 A1: the new batch catch left the leg whose child had completed (its output file could not be written) in pending, and the summary then said
         # NOT_RUN for a leg that ran. The leg is recorded LEG_FAILED / reason BATCH_ERROR (its result is unknown); only the legs never started are NOT_RUN.
