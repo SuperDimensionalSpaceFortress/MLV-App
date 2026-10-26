@@ -104,18 +104,78 @@ def _front(pr: int, head: str, body: str, repo: str = "acme/widget") -> str:
 
 
 SAMPLES = HERE / "fixtures" / "cos-samples"
-# Real CoS records copied verbatim from the bus (<project>--pr-<n>--<doctrine commit>.md): the pass each names, and whether
-# the CoS blocked it. The first five were read as clean (or not read at all) by the meter at 58806c8e.
+# Real CoS records copied verbatim from the bus (<project>--pr-<n>--<doctrine commit>.md): the pass each names, and what the
+# CoS said of its blockers: blocked, clean, or unknown (no explicit no-blocker text and no current blocker; counted apart,
+# never as clean). The first five were read as clean (or not read at all) by the meter at 58806c8e; the eight blocked ones
+# from pr-613 on were read as clean at 49720f53 (B5: a blocker carried in prose, a CI bullet or a later paragraph).
 SAMPLE_PASSES = {
-    "mlv-app--pr-608--b2283ba4d6f6.md": ("SuperDimensionalSpaceFortress/MLV-App", 608, "073fc4f1a84439a8edf75cf6081defd81f08aee3", True),
-    "mlv-app--pr-612--84e86b2e8171.md": ("SuperDimensionalSpaceFortress/MLV-App", 612, "a297f0e5cd0fec6260632162c0e8b203666c1e9d", True),
-    "adobe-ingester--pr-4--c38e3dfd5a56.md": ("layibabalola/adobe-document-cloud-ingester", 4, "23270dcc9113118048e722b64ad617e50b79445d", True),
-    "mlv-app--pr-493--8c755c572106.md": ("SuperDimensionalSpaceFortress/MLV-App", 493, "79db95afcef4959a45daa83aabe54b2c8de9fb6c", True),
-    "mlv-app--pr-480--3a2c8a01e2f9.md": ("SuperDimensionalSpaceFortress/MLV-App", 480, "e5dd4b473b0afbb58acddc22d72c03e1ec26e0f8", True),
-    "mlv-app--pr-578--4587c6e6dcea.md": ("SuperDimensionalSpaceFortress/MLV-App", 578, "a8858093c127a30b446a26343f7e2c30dad7781c", False),
-    "mlv-app--pr-537--c4893fcf509a.md": ("SuperDimensionalSpaceFortress/MLV-App", 537, "7538f47b58a53ce35022516656a6c13800980587", False),
-    "mlv-app--pr-533--5c3efd9c33ae.md": ("SuperDimensionalSpaceFortress/MLV-App", 533, "20a58d87b5ab7de25a1543281adc3aa78566dc30", False),
+    "mlv-app--pr-608--b2283ba4d6f6.md": ("SuperDimensionalSpaceFortress/MLV-App", 608, "073fc4f1a84439a8edf75cf6081defd81f08aee3", "blocked"),
+    "mlv-app--pr-612--84e86b2e8171.md": ("SuperDimensionalSpaceFortress/MLV-App", 612, "a297f0e5cd0fec6260632162c0e8b203666c1e9d", "blocked"),
+    "adobe-ingester--pr-4--c38e3dfd5a56.md": ("layibabalola/adobe-document-cloud-ingester", 4, "23270dcc9113118048e722b64ad617e50b79445d", "blocked"),
+    "mlv-app--pr-493--8c755c572106.md": ("SuperDimensionalSpaceFortress/MLV-App", 493, "79db95afcef4959a45daa83aabe54b2c8de9fb6c", "blocked"),
+    "mlv-app--pr-480--3a2c8a01e2f9.md": ("SuperDimensionalSpaceFortress/MLV-App", 480, "e5dd4b473b0afbb58acddc22d72c03e1ec26e0f8", "blocked"),
+    "mlv-app--pr-578--4587c6e6dcea.md": ("SuperDimensionalSpaceFortress/MLV-App", 578, "a8858093c127a30b446a26343f7e2c30dad7781c", "clean"),
+    "mlv-app--pr-537--c4893fcf509a.md": ("SuperDimensionalSpaceFortress/MLV-App", 537, "7538f47b58a53ce35022516656a6c13800980587", "clean"),
+    # No Blockers section at all: the CoS stated nothing about blockers, so it is unknown, not clean.
+    "mlv-app--pr-533--5c3efd9c33ae.md": ("SuperDimensionalSpaceFortress/MLV-App", 533, "20a58d87b5ab7de25a1543281adc3aa78566dc30", "unknown"),
+    # 'Prior612 B1 persists' plus 'Current-head Ubuntu shard1 independently fails'.
+    "mlv-app--pr-613--b26f3e7db3d4.md": ("SuperDimensionalSpaceFortress/MLV-App", 613, "a6fa535270bd665c1445e542e023e7f042a9e51f", "blocked"),
+    "agent-bridge--pr-267--6049af278f2d.md": ("layibabalola/agent-bridge", 267, "ce87de3e3b9f2e4ebab949dc205917a1609a056e", "blocked"),
+    "agent-bridge--pr-268--c6d474d8461f.md": ("layibabalola/agent-bridge", 268, "a9fd2604ee0f8286163034a40e9c02c15d5ca0e1", "blocked"),
+    "agent-bridge--pr-270--6a1d388d7b15.md": ("layibabalola/agent-bridge", 270, "5db5a5ea6d950df2d4804e6a617f788217f6ceae", "blocked"),
+    "adobe-ingester--pr-5--3af1813220b0.md": ("layibabalola/adobe-document-cloud-ingester", 5, "ea8cf4558da328b4c37db505e55938d9389e1baf", "blocked"),
+    # The bus SCHEMA.md bullet form: '- CI: ... exact-head canonical job119584694731 fails gate...'.
+    "context-ultra-salesforce--pr-112--41b9dbaeb8ce.md": ("layibabalola/context-ultra-salesforce", 112, "e6601ebf4477f011b75d635d4941e341aa9ad365", "blocked"),
+    # A path bullet: '- tools/...:193: actual [Windows shard 2](.../actions/runs/...) fails at 07:42:20Z'.
+    "mlv-app--pr-508--3636d6cb349f.md": ("SuperDimensionalSpaceFortress/MLV-App", 508, "24fdc1986e94655da05adab911904ceb811893a7", "blocked"),
+    # Opens 'Prior timing B1 is source-fixed', and its second paragraph is 'B2 validation mismatch remains.'.
+    "mlv-app--pr-657--c4ead2a24093.md": ("SuperDimensionalSpaceFortress/MLV-App", 657, "4ea77b883438c587583fa6c1de45141b7b397f5b", "blocked"),
+    # 'actual [Windows shard 1](...) and [Ubuntu shard 3](...) fail: ...' (a plural verb).
+    "mlv-app--pr-465--3636d6cb349f.md": ("SuperDimensionalSpaceFortress/MLV-App", 465, "37b6e55bafed02078740512f8c07a3f966d8f369", "blocked"),
+    # 'No new demonstrated defect ... Existing CI is not green: Bridge.../job120921170318 failed16:17:43'.
+    "mlv-app--pr-663--6485a13f0388.md": ("SuperDimensionalSpaceFortress/MLV-App", 663, "32d97f32dd4f1bc84bc1d6ed951f74416fd68b2e", "blocked"),
+    # 'None newly demonstrated. Prior B1/B2 are source-addressed', then 'B1: <how>' and 'B2: <how>' disposition lines.
+    "mlv-app--pr-689--120cf0f02411.md": ("SuperDimensionalSpaceFortress/MLV-App", 689, "58806c8ebf76683374593d1454a5ffe56f34833b", "clean"),
+    "mlv-app--pr-664--7678ef2deb44.md": ("SuperDimensionalSpaceFortress/MLV-App", 664, "87f34507ef29f7c344cbf3495161a9c85f571251", "clean"),
+    # 'No remaining B2 demonstrated': a qualifier under No is not a remaining blocker.
+    "mlv-app--pr-456--b8398105b1d2.md": ("SuperDimensionalSpaceFortress/MLV-App", 456, "580e6c6b55ee6f2d8e8628249277f054037ed6e7", "clean"),
+    # 'No current failing check demonstrated. Prior B1 was an actual failure of ... job...': a past failure.
+    "mlv-app--pr-671--c3c8acfcab09.md": ("SuperDimensionalSpaceFortress/MLV-App", 671, "06ebdd1903e8474d385fe504323f4c0358aeca06", "clean"),
+    # 'Existing Ubuntu shard1 confirms both previously failing B3 tests pass'.
+    "mlv-app--pr-618--f6c06ffc9be6.md": ("SuperDimensionalSpaceFortress/MLV-App", 618, "7570642b94b1ca01efcfa6c1b39cbbb9252fcffc", "clean"),
+    # 'None newly demonstrated.' over bullets, then 'Prior B1/B2/I1 source-addressed dispositions remain.'.
+    "mlv-app--pr-689--8da382374548.md": ("SuperDimensionalSpaceFortress/MLV-App", 689, "7f6189570adfe4fdc3877e327f3a9c901c768620", "clean"),
+    # 'P2, high confidence: ...', a G1 governance hold, and G2/G3 holds with 'none has failed': not B<n>, not no-blocker.
+    "mlv-app--pr-525--c7453f5ec647.md": ("SuperDimensionalSpaceFortress/MLV-App", 525, "c831ed5f348472fc0695dc003b8d5a119510f4e3", "unknown"),
+    "mlv-app--pr-507--3c7af4ac0f2f.md": ("SuperDimensionalSpaceFortress/MLV-App", 507, "825bd26ca3093e9fef1ba4be4aa556b56f3c026f", "unknown"),
+    "mlv-app--pr-480--cffec45e2b99.md": ("SuperDimensionalSpaceFortress/MLV-App", 480, "bd745d6e13f471cd8f47ec01f813347e6e4e9943", "unknown"),
 }
+
+# Loads the meter's functions and $Ql* values from its syntax tree (no top-level code runs) and times each case: the best of
+# three runs after a warm-up, so first-call compilation is not counted as the parser's cost.
+TIMING_HELPER = r"""
+param([string]$Meter, [string]$Cases, [string]$Out)
+$ErrorActionPreference = 'Stop'
+$ast = [Management.Automation.Language.Parser]::ParseFile($Meter, [ref]$null, [ref]$null)
+$defs = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] }, $false) | ForEach-Object { $_.Extent.Text })
+$vars = @($ast.EndBlock.Statements | Where-Object { $_ -is [Management.Automation.Language.AssignmentStatementAst] -and $_.Left.Extent.Text -like '$Ql*' } | ForEach-Object { $_.Extent.Text })
+. ([scriptblock]::Create(($defs + $vars) -join "`n"))
+function Invoke-Case($c) {
+    if ($c.kind -eq 'class') { return (Get-QlBlockerClass $c.text).cls }
+    if ($c.kind -eq 'identity') { $id = Get-QlIdentity $c.text; if ($id) { return $id.head } else { return '' } }
+    [string]$QlRx[$c.kind.Substring(3)].IsMatch($c.text)
+}
+$res = foreach ($c in @(Get-Content -LiteralPath $Cases -Raw | ConvertFrom-Json)) {
+    $null = Invoke-Case ([pscustomobject]@{ kind = $c.kind; text = 'x' })
+    $best = [double]::MaxValue; $r = $null
+    for ($k = 0; $k -lt 3; $k++) {
+        $sw = [Diagnostics.Stopwatch]::StartNew(); $r = Invoke-Case $c; $sw.Stop()
+        $best = [Math]::Min($best, $sw.Elapsed.TotalMilliseconds)
+    }
+    [pscustomobject]@{ name = $c.name; ms = $best; result = "$r" }
+}
+ConvertTo-Json -InputObject @($res) | Set-Content -LiteralPath $Out -Encoding utf8
+"""
 
 
 def _sample_text(name: str) -> str:
@@ -208,14 +268,14 @@ class MeterFixtureTests(unittest.TestCase):
         path.write_text(json.dumps({"schema": "fleet/quality-lift/review-sources/v1", "projects": projects}), encoding="utf-8")
         return path
 
-    def _run(self, *args: str, env: dict[str, str] | None = None, gh: Path | None = None) -> subprocess.CompletedProcess:
+    def _run(self, *args: str, env: dict[str, str] | None = None, gh: Path | None = None, timeout: int = 300) -> subprocess.CompletedProcess:
         env = dict(os.environ if env is None else env)
         if gh is not None:
             env["PATH"] = str(gh) + os.pathsep + env.get("PATH", "")
             env["QL_FAKE_GH_DIR"] = str(gh)
         return subprocess.run(
             [PWSH, "-NoProfile", "-NonInteractive", "-File", str(METER), *args],
-            capture_output=True, text=True, env=env, timeout=300)
+            capture_output=True, text=True, env=env, timeout=timeout)
 
     def _measure(self, project: str, out: Path, cache: dict | None = None, gh: Path | None = None,
                  since: str = "2026-10-01T00:00:00Z", expect: int = 0, declared: dict | None = REVIEW_STATUS) -> dict:
@@ -380,7 +440,7 @@ class MeterFixtureTests(unittest.TestCase):
                          "-NoFetch", "-ReviewSources", str(self._sources({})))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         fleet = (fleet_out / "fleet.md").read_text(encoding="utf-8-sig")
-        self.assertIn("| **fleet** | 12 | 9 (75%) | | 0 of 5 projects | unknown | unknown | 0 of 9 (9 unknown) |", fleet)
+        self.assertIn("| **fleet** | 12 | 9 (75%) | 0 | | 0 of 5 projects | unknown | unknown | 0 of 9 (9 unknown) |", fleet)
 
     def test_a_missing_or_malformed_review_sources_file_is_a_usage_error(self) -> None:
         out = self._dir()
@@ -715,7 +775,7 @@ class MeterFixtureTests(unittest.TestCase):
         other = json.loads((out / "other" / "quality-lift.json").read_text(encoding="utf-8-sig"))
         self.assertEqual(other["windows"][0]["passes"], 1)  # the later commit that deletes pr-1.md is not an error
         fleet = (out / "fleet.md").read_text(encoding="utf-8-sig")
-        self.assertIn("| **fleet** | 12 | 9 (75%) | | 5 of 5 projects | 0 of 9 (9 unknown) | 0 | 0 of 9 (9 unknown) |", fleet)
+        self.assertIn("| **fleet** | 12 | 9 (75%) | 0 | | 5 of 5 projects | 0 of 9 (9 unknown) | 0 | 0 of 9 (9 unknown) |", fleet)
 
     def test_fleet_markdown_names_a_project_that_errored_with_no_passes(self) -> None:
         bus = self._dir()
@@ -900,17 +960,24 @@ class MeterFixtureTests(unittest.TestCase):
 
     def test_real_cos_records_are_read_as_the_cos_wrote_them(self) -> None:
         commits, by_project = [], {}
+        start = datetime(2026, 10, 21, 10, 0, tzinfo=timezone.utc)
         for i, (name, (repo, pr, head, _)) in enumerate(sorted(SAMPLE_PASSES.items())):
             project = name.split("--")[0]
             by_project.setdefault(project, []).append((repo, head))
-            commits.append((f"cos-feedback/{project}/pr-{pr}.md", _sample_text(name), f"2026-10-21T1{i}:00:00+00:00", name))
+            commits.append((f"cos-feedback/{project}/pr-{pr}.md", _sample_text(name), _iso(start + timedelta(minutes=i)), name))
         bus = self._small_bus(commits)
         for project, passes in by_project.items():
             cache = {f"{repo}@{head}": {"fetched": "2026-10-25T00:00:00Z", "rows": []} for repo, head in passes}
             result, out = self._measure_bus(bus, project, cache=cache)
-            want = sorted(h for n, (_, _, h, b) in SAMPLE_PASSES.items() if b and n.startswith(project + "--"))
+            mine = {h: c for n, (_, _, h, c) in SAMPLE_PASSES.items() if n.startswith(project + "--")}
+            want = sorted(h for h, c in mine.items() if c == "blocked")
             self.assertEqual(sorted(r["head"] for r in self._corpus(out)), want, project)
-            self.assertEqual((result["windows"][0]["passes"], result["windows"][0]["unparsed"]), (len(passes), 0), project)
+            since = result["windows"][0]
+            self.assertEqual((since["passes"], since["unparsed"]), (len(passes), 0), project)
+            self.assertEqual((since["blocked"], since["blockerUnknown"]),
+                             (len(want), sum(1 for c in mine.values() if c == "unknown")), project)
+            self.assertEqual(sorted(u["head"] for u in since["blockerUnknownHeads"]),
+                             sorted(h for h, c in mine.items() if c == "unknown"), project)
 
     @unittest.skipUnless(os.environ.get("FACTORY_BUS_CLONE"), "binds the samples to the bus; set FACTORY_BUS_CLONE to a bus clone")
     def test_the_real_records_match_the_bus_at_their_doctrine_commit(self) -> None:
@@ -1178,6 +1245,171 @@ class MeterFixtureTests(unittest.TestCase):
         gh = self._fake_gh(prs={"acme/widget": [{"number": 5, "body": "Adversary pass: x", "createdAt": _iso(NOW - timedelta(hours=1))}]})
         result, _ = self._measure_bus(bus, "p", since=_iso(NOW - timedelta(hours=2)), gh=gh, expect=2)
         self.assertEqual(result["shiftLeft"], {"prs": None, "withAdversaryLine": None})
+
+    # -- r4 on 49720f53: blockers read by meaning (B5) and linear parsing of untrusted bus text (B6)
+
+    def _classes(self, bodies: list[tuple[str, str]]) -> tuple[dict, dict[str, str]]:
+        """Measures one pass per body (the text after the identity heading); returns the since window and head -> class."""
+        commits, heads = [], []
+        for i, (body, _) in enumerate(bodies):
+            head = f"{i + 1:040x}"
+            heads.append(head)
+            commits.append((f"cos-feedback/p/pr-{i + 1}.md", f"# acme/widget #{i + 1} / {head}\n\nVerdict.\n\n{body}",
+                            _iso(datetime(2026, 10, 21, 10, 0, tzinfo=timezone.utc) + timedelta(minutes=i)), f"b{i}"))
+        result, got = self._blocked_heads(self._small_bus(commits), "p", heads)
+        since = result["windows"][0]
+        unknown = {u["head"] for u in since["blockerUnknownHeads"]}
+        return since, {h: ("blocked" if h in got else "unknown" if h in unknown else "clean") for h in heads}
+
+    def test_blockers_are_read_by_meaning_blocked_clean_or_unknown(self) -> None:  # B5
+        bodies = [
+            # Blocked: a B<n> named as persisting, remaining, retained, open or current, wherever it stands; a later line
+            # that starts B<n>; a CI job, shard or check reported failing on the head.
+            ("## Blockers\nPrior612 B1 persists: a.py:71 pins 203.\n", "blocked"),
+            ("## Blockers\nPrior829ec450 B1 remains: a.py:359 replaces runtime.\n", "blocked"),
+            ("## Blockers\nInherited #267 B1 remains source-unfixed at a.py:361.\n", "blocked"),
+            ("## Blockers\nInherited ownership B1 remains at a.py:363.\n", "blocked"),
+            ("## Blockers\nNo new demonstrated blocker. Prior B1 remains: a.ps1:3 still overwrites.\n", "blocked"),
+            ("## Blockers\nPrior timing B1 is source-fixed.\n\nB2 validation mismatch remains.\n", "blocked"),
+            ("## Blockers\nNone newly demonstrated. The current B2 still breaks the guard.\n", "blocked"),
+            ("## Blockers\nB1 (medium confidence) is retained at a.ps1:9.\n", "blocked"),
+            ("## Blockers\n- CI: a.md:3 is new, but exact-head canonical job119584694731 fails gate.x.\n", "blocked"),
+            ("## Blockers\n- a.py:193: actual [Windows shard 2](https://github.com/o/r/actions/runs/1/job/2) fails at 07:42:20Z.\n", "blocked"),
+            ("## Blockers\nCurrent-head Ubuntu shard1 independently fails at :954.\n", "blocked"),
+            ("## Blockers\nB1 partially resolved. a.ps1:9 still races.\n", "blocked"),
+            ("## Blockers\n- a.py:181: actual [shard 1](https://github.com/o/r/actions/runs/1/job/2) and [shard 3](x) fail: 227 tests.\n", "blocked"),
+            ("## Blockers\nNo new demonstrated defect. Existing CI is not green: Bridge401/job120921170318 failed16:17:43.\n", "blocked"),
+            ("## Blockers\n- a.py:193: actual Windows shard 2 fails: received \"(kill not confirmed)\".\n", "blocked"),
+            ("## Blockers\nNone newly demonstrated. Prior B1/B2 are source-addressed.\n\nB2: b.ps1:9 still drops the lock.\n", "blocked"),
+            # Clean: explicit no-blocker text, a prior blocker stated closed, and nothing current.
+            ("## Blockers\nNone.\n", "clean"),
+            ("## Blockers\n(none)\n", "clean"),
+            ("## Blockers\nNone demonstrated. No SHARED BLOCKER.\n", "clean"),
+            ("## Blockers\nNo new demonstrated blocker. Prior B1 is source-fixed.\n", "clean"),
+            ("## Blockers\nPrior metadata-I/O B1 is source-addressed.\n", "clean"),
+            ("## Blockers\nPrior B1 remains closed.\n", "clean"),
+            ("## Blockers\nNo remaining B2 demonstrated in this delta.\n", "clean"),
+            ("## Blockers\nNone newly demonstrated. Prior B3/B4 source remedies remain; B1/B2/I1 dispositions preserved.\n", "clean"),
+            ("## Blockers\nNo current failing check demonstrated. Prior B1 was an actual failure of job12 at 07:42.\n", "clean"),
+            ("## Blockers\nNone demonstrated. Thirteen checks succeed, none has failed.\n", "clean"),
+            ("## Blockers\nNone demonstrated. Prior CI failed on r4; the r5 job passes.\n", "clean"),
+            ("## Blockers\nNone demonstrated. The gate check fails closed when the job is missing.\n", "clean"),
+            ("## Blockers\nB1 closed: a.ps1:3 now checks.\n", "clean"),
+            # Under a no-blocker opener, "B1: <how it was addressed>" is a disposition note, not a new blocker.
+            ("## Blockers\nNone newly demonstrated. Prior B1/B2 are source-addressed.\nB1: a.ps1:3 now checks the lock.\nB2: b.ps1:9 adds a regression; old failures remain history.\n", "clean"),
+            ("Blockers: None established; no SHARED BLOCKER.\n", "clean"),
+            # Unknown: neither explicit no-blocker text nor a current blocker, a missing or empty section included.
+            ("## Blockers\nP2, high confidence: a.ps1:3 races.\n", "unknown"),
+            ("## Blockers\nG1 OPEN, response duty: answer the ask.\n", "unknown"),
+            ("## Blockers\nReadiness hold: the A/B receipt is missing.\n", "unknown"),
+            ("## Blockers\nHistorical finding on reviewed head, addressed in later merged source:\n", "unknown"),
+            ("## Blockers\nPrior B1 is not fixed.\n", "unknown"),
+            ("## Blockers\nBlocked by nothing; B1 closed.\n", "unknown"),
+            ("## Blockers\n\n## Notes\nB1 x.\n", "unknown"),
+            ("## Notes\nNothing to say.\n", "unknown"),
+        ]
+        since, got = self._classes(bodies)
+        want = {f"{i + 1:040x}": c for i, (_, c) in enumerate(bodies)}
+        self.assertEqual(got, want, [(b, got[h], c) for (b, c), h in zip(bodies, want) if got[h] != c])
+        n_blocked = sum(1 for _, c in bodies if c == "blocked")
+        n_unknown = sum(1 for _, c in bodies if c == "unknown")
+        self.assertEqual((since["passes"], since["blocked"], since["blockerUnknown"]), (len(bodies), n_blocked, n_unknown))
+        # The rate is over the passes the meter could classify: an unknown pass is never counted as clean.
+        self.assertEqual(since["blockedRate"], round(n_blocked / (len(bodies) - n_unknown), 3))
+
+    def test_an_unknown_pass_folds_apart_and_never_as_clean(self) -> None:  # B5
+        p, q = "cos-feedback/p/pr-7.md", "cos-feedback/p/pr-8.md"
+        bus = self._small_bus([
+            (p, _section(7, H1, "None demonstrated."), "2026-10-21T10:00:00+00:00", "h1 clean"),
+            (p, _section(7, H1, "Readiness hold: a receipt is missing."), "2026-10-21T11:00:00+00:00", "h1 unknown later"),
+            (q, _section(8, H2, "G1 OPEN: an ask is unanswered."), "2026-10-21T10:00:00+00:00", "h2 unknown"),
+            (q, _section(8, H2, "Prior B1 persists: a.ps1:3."), "2026-10-21T12:00:00+00:00", "h2 blocked later"),
+            (q, _section(8, H3, "None."), "2026-10-21T13:00:00+00:00", "h3 clean"),
+        ])
+        cache = {f"acme/widget@{H2}": {"fetched": "2026-10-25T00:00:00Z", "rows": []}}
+        result, out = self._measure_bus(bus, "p", cache=cache)
+        since = result["windows"][0]
+        # H1: clean then unknown -> unknown (the later pass may carry a blocker); H2: unknown then blocked -> blocked.
+        self.assertEqual((since["passes"], since["blocked"], since["blockerUnknown"]), (3, 1, 1))
+        self.assertEqual([u["head"] for u in since["blockerUnknownHeads"]], [H1])
+        self.assertEqual(since["blockedRate"], 0.5)
+        # PR 7's first head is unknown, PR 8's first head (H2) is blocked.
+        self.assertEqual((since["prs"], since["firstRoundBlocked"], since["firstRoundUnknown"], since["firstRoundBlockedRate"]), (2, 1, 1, 1.0))
+        self.assertEqual([r["head"] for r in self._corpus(out)], [H2])
+        self.assertTrue(self._corpus(out)[0]["blocker"].startswith("Prior B1 persists"), self._corpus(out))
+        md = (out / "quality-lift.md").read_text(encoding="utf-8-sig")
+        self.assertIn("| since | 3 | 1 (50%) | 1 |", md)
+        fleet_out = self._dir()
+        proc = self._run("-Bus", str(bus), "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(fleet_out), "-NoStatuses", "-NoFetch",
+                         "-ReviewSources", str(self._sources({"p": REVIEW_STATUS})))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        fleet = (fleet_out / "fleet.md").read_text(encoding="utf-8-sig")
+        self.assertIn("| p | 3 | 1 (50%) | 1 |", fleet)
+        self.assertIn("| **fleet** | 3 | 1 (50%) | 1 |", fleet)
+
+    def test_long_marker_lines_finish_and_are_classified(self) -> None:  # B6, end to end
+        head = lambda i: f"{i:040x}"  # noqa: E731
+        texts = [
+            f"# acme/widget #1 / {head(1)}\n\n## Blockers\n{'*' * 1000}\n",
+            f"# acme/widget #2 / {head(2)}\n\n## Blockers\n{'_' * 1000}\n",
+            f"# acme/widget #3 / {head(3)}\n\n## Blockers\n{'*_' * 500}\n",
+            f"# acme/widget #4 / {head(4)}\n\n## Blockers\n{'* ' * 500}\n",
+            f"# acme/widget #5 / {head(5)}\n\n## Blockers\n{'*' * 1000}B1 x.\n",
+            f"# acme/widget #6 / {head(6)}\n\n## Blockers\n{'_' * 1000}None.\n",
+            f"# acme/widget #7 / {head(7)}\n\n## Blockers{' ' * 3000}x\nB1 x.\n",
+            f"schema: cos-feedback.v1\nrepo: acme/widget\npr: 8\nhead: {head(8)}\n{'x' * 100000}",
+            f"# acme/widget #9 / {head(9)}\n\n## Blockers\n- --- {'-' * 1000} x\n\n{'-' * 1000}\nNone.\n",
+        ]
+        commits = [(f"cos-feedback/p/pr-{i + 1}.md", t, f"2026-10-21T10:0{i}:00+00:00", f"long {i}") for i, t in enumerate(texts)]
+        bus = self._small_bus(commits)
+        out = self._dir()
+        cache = {f"acme/widget@{head(i)}": {"fetched": "2026-10-25T00:00:00Z", "rows": []} for i in range(1, 10)}
+        (out / "status-cache.json").write_text(json.dumps(cache), encoding="utf-8")
+        proc = self._run("-Bus", str(bus), "-Project", "p", "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoFetch",
+                         "-NoStatuses", "-ReviewSources", str(self._sources({"p": REVIEW_STATUS})), timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        since = json.loads((out / "quality-lift.json").read_text(encoding="utf-8-sig"))["windows"][0]
+        self.assertEqual([r["head"] for r in self._corpus(out)], [head(5)])
+        # 1-4: a thematic break or only marks, so an empty section; 7: not a Blockers heading; 8: no section; 9: a bullet whose
+        # text is dashes then x opens the section (not no-blocker text), and the later dash line is a thematic break.
+        self.assertEqual(sorted(u["head"] for u in since["blockerUnknownHeads"]), [head(i) for i in (1, 2, 3, 4, 7, 8, 9)])
+        self.assertEqual((since["passes"], since["blocked"], since["blockerUnknown"]), (9, 1, 7))
+
+    def test_bus_text_parsers_are_linear_on_long_untrusted_input(self) -> None:  # B6 and its class sweep
+        sec = lambda body: f"# acme/widget #1 / {H1}\n\n## Blockers\n{body}\n"  # noqa: E731
+        fm = "schema: cos-feedback.v1\nrepo: acme/widget\npr: 8\n"
+        cases = [
+            ("1000 stars", "class", sec("*" * 1000), "unknown"),
+            ("1000 underscores", "class", sec("_" * 1000), "unknown"),
+            ("mixed marks", "class", sec("*_" * 500), "unknown"),
+            ("spaced thematic break", "class", sec("* " * 500), "unknown"),
+            ("mixed marks before B1", "class", sec("*_" * 500 + "B1 x."), "blocked"),
+            ("1000 bullets before B1", "class", sec("- " * 500 + "B1 x."), "blocked"),
+            ("long prose", "class", sec("None. " + "a check fails closed " * 5000), "clean"),
+            ("long B note", "class", sec("None. x B1 (" + "a" * 100000), "clean"),
+            ("Blockers heading then spaces", "class", f"# a/b #1 / {H1}\n\n## Blockers{' ' * 5000}x\n", "unknown"),
+            ("Blockers heading spaces and colons", "class", f"# a/b #1 / {H1}\n\n## Blockers{' :' * 5000}x\n", "unknown"),
+            ("Blockers label then spaces", "class", f"# a/b #1 / {H1}\n\nBlockers{' ' * 5000}x\n", "unknown"),
+            ("front matter long last line", "identity", fm + "x" * 200000, ""),
+            ("front matter blank-looking line", "identity", fm + " " * 200000, ""),
+            ("identity heading long name", "identity", "# " + "a" * 200000 + "\n", ""),
+            ("identity heading long repo", "identity", "# " + "a" * 100000 + "/" + "b" * 100000 + " #1 / x\n", ""),
+            ("adversary line long marks", "rx:adversary", "!" * 200000, "False"),
+            ("repo line long spaces", "rx:repoLine", "repo:" + " " * 100000 + "a/b" + " " * 100000 + "x", "False"),
+        ]
+        work = self._dir()
+        helper = work / "time-parsers.ps1"
+        helper.write_text(TIMING_HELPER, encoding="utf-8")
+        (work / "cases.json").write_text(json.dumps([{"name": n, "kind": k, "text": t} for n, k, t, _ in cases]), encoding="utf-8")
+        proc = subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-File", str(helper), "-Meter", str(METER),
+                               "-Cases", str(work / "cases.json"), "-Out", str(work / "out.json")],
+                              capture_output=True, text=True, timeout=180)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        got = {r["name"]: r for r in json.loads((work / "out.json").read_text(encoding="utf-8-sig"))}
+        for name, _, _, want in cases:
+            with self.subTest(name):
+                self.assertEqual(got[name]["result"], want)
+                self.assertLess(got[name]["ms"], 100, got[name])
 
     def test_the_meter_is_ascii_and_names_no_board_path(self) -> None:
         raw = METER.read_bytes()

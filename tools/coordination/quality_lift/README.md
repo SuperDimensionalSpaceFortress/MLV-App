@@ -37,12 +37,26 @@ the last row per repo@head. Rows are never rewritten. `-Since` must carry an off
 - **The pass:** the last `# <owner>/<repo> #<n> / <40-hex head>` heading, or else the `cos-feedback.v1` front matter
   (`repo:`, `pr:` and `head:` in the leading `schema: cos-feedback.v1` block). A file with neither is counted as
   "names no pass" in the report, never silently dropped.
-- **Blocked:** the first content line of the Blockers section starts `B<n>`. The section is a `## Blockers` or
-  `### Blockers` heading (bold, a colon inside or after the bold, a note in `()` or `[]` allowed) or a `Blockers:` label
-  line. The line may carry quote, list (`- * +`, `1.`, `1)`), `###` heading or one to three `*`/`_` marks before `B<n>`.
-  A head written in capitals is read as the same head in lowercase. A line under the next level-1
-  or level-2 heading is outside the section, so `## Blockers` followed by `## Improvements` and `- B1 ...` is clean.
-  `None demonstrated.`, `- None.` and `Prior B1 is fixed.` are clean.
+- **The Blockers section:** a `## Blockers` or `### Blockers` heading (bold, colons, a note in `()` or `[]`, closing
+  `#`s allowed) or a `Blockers:` label line. It runs to the next level-1 or level-2 heading (so `## Blockers`, then
+  `## Improvements` and `- B1 ...`, leaves the section empty), or for a bare `Blockers:` label to its first blank line.
+  Blank and thematic-break lines (`---`, `***`, `___`) carry nothing. A head written in capitals is read in lowercase.
+- **What it says, by meaning** (every line of the section, not only the first; leading quote, list, number, heading and
+  `*`/`_` marks are stripped by a linear scan):
+  - **blocked:** a line starts `B<n>` (`- **B1 / P1:**`, `B2 validation mismatch remains.`), unless it says that B<n> is
+    closed, or the section opened with no-blocker text and the line only records how B<n> was addressed; or a sentence
+    names a B<n> as persisting, remaining, retained, open or current (`Prior612 B1 persists`, `Inherited #4 B1 remains`,
+    `the current B2`); or a sentence reports a CI run failing (`- CI: ... job119584694731 fails`, `actual [Windows shard 2](...)
+    fails`, `CI is not green: ... failed`). A sentence that opens `No`/`None`, or that negates, hedges or looks back before
+    the failure (`none has failed`, `would fail`, `Prior CI failed`, `fails closed`), says neither.
+  - **clean:** nothing blocked, and the section opens with explicit no-blocker text: `None ...`, `No ...`, `(none)`,
+    `B1 closed`, or a prior blocker stated fixed or addressed (`Prior B1 is source-fixed.`, but not `Prior B1 is not fixed.`).
+  - **unclassified (unknown):** anything else, a missing or empty section included (`G1 OPEN`, `P2, high confidence: ...`,
+    `Readiness hold: ...`). It is counted apart (`blockerUnknown`, listed in `blockerUnknownHeads`), never as clean, and the
+    blocked and first-round rates are over classified passes only. A head with a clean pass and a later unclassified one is
+    unclassified; any blocking pass makes it blocked.
+- Bus and GitHub text is untrusted. Every pattern that reads it is linear and carries a 2 s match timeout; a timeout names
+  the file and leaves the project not measured, never stalled.
 
 ## Declare your review evidence
 

@@ -6,19 +6,19 @@ law4: attested
 ---
 ### mlv-app, 2026-10-25 - receipt: the CoS-first-reader baseline and the adversary-pass calibration
 
-**Fleet baseline.** The meter (tools/coordination/quality_lift/Measure-FleetQualityLift.ps1 in SuperDimensionalSpaceFortress/MLV-App), bus cos-feedback 2026-10-18 to bus 4928a22 (2026-10-25 23:09Z). "CoS first" (no declared review evidence before the CoS pass) and "true miss" (a declared approval before CoS blocked) count only review-sources.json evidence; only mlv-app declares (review/*). The proxy (no status before CoS) proves nothing about reviews.
+**Fleet baseline.** Meter: tools/coordination/quality_lift/Measure-FleetQualityLift.ps1 (SuperDimensionalSpaceFortress/MLV-App); bus cos-feedback 2026-10-18 to fc633a0. Blocked: the CoS names a current blocker (a B<n> item, a B<n> that persists or remains, a failing CI run). Clean: explicit no-blocker text. Anything else is unclassified, counted apart, never clean; rates exclude it. "CoS first" (no declared review evidence before CoS) and "true miss" (a declared approval before CoS blocked) use only review-sources.json; only mlv-app declares (review/*).
 
-| project | CoS passes | blocked | first-round blocked PRs | CoS first | true misses | proxy | rounds per PR |
+| project | CoS passes | blocked | unclassified | first-round blocked PRs | CoS first | true misses | rounds per PR |
 |---|---|---|---|---|---|---|---|
-| mlv-app | 248 | 43 (17%) | 25 of 179 | 33 of 43 | 10 | 33 of 43 | 1.39 |
-| adversarialllm | 44 | 15 (34%) | 9 of 23 | unknown | unknown | 15 of 15 | 1.91 |
-| agent-bridge | 30 | 2 (7%) | 2 of 25 | unknown | unknown | 2 of 2 | 1.2 |
-| adobe-ingester | 17 | 9 (53%) | 3 of 4 | unknown | unknown | 9 of 9 | 4.25 |
-| fleet (6 projects) | 342 | 69 (20%) | | 33 of 43 | 10 | 59 of 69 | |
+| mlv-app | 263 | 58 (24%) | 16 | 28/184 | 45/58 | 11 | 1.43 |
+| adversarialllm | 46 | 18 (40%) | 1 | 10/24 | unknown | unknown | 1.92 |
+| agent-bridge | 30 | 5 (17%) | 0 | 4/25 | unknown | unknown | 1.2 |
+| adobe-ingester | 17 | 10 (59%) | 0 | 4/4 | unknown | unknown | 4.25 |
+| fleet (6 projects) | 359 | 92/342 (27%) | 17 | | 45/58 | 11 | |
 
-Two more projects had 3 clean passes. Correction: an earlier draft read 202 passes, 53 blocked. That meter skipped files naming their pass only in cos-feedback.v1 front matter (the other 140 passes) and read listed or bold blockers (`- B1`, `- **B1 / P1:**`, `Blockers: B1`) as clean.
+context-ultra-salesforce: 1 of 2 blocked; cloudvore: 1 clean pass. Unclassified: no Blockers section, governance or readiness holds, P2 findings. Correction: r3 published 69/342 at bus 4928a22 from a leading first-line B<n> only, so prose (`Prior612 B1 persists`), CI bullets and later paragraphs read clean; this meter reads 81 blocked, 17 unclassified there.
 
-Before CoS, mlv-app heads carried only review/fable, review/sol, review/opus. New mlv-app PRs with an Adversary pass line, 24 h to 2026-10-26 02:27Z: 12 of 40.
+Before CoS, mlv-app heads carried only review/fable, review/sol, review/opus. New mlv-app PRs with an Adversary pass line, 24 h to 2026-10-26 05:22Z: 20 of 44.
 
 **mlv-app calibration.** One read-only Codex pass per head, given worktree, diff and commit subjects, never the CoS text. A hit (criterion fixed before reading results) is the CoS blocker's file, code region and invariant.
 - Four heads factory keys approved and CoS later blocked: 4 of 4 hit blind (3 exact, 1 same line and invariant): a caller window loosening a 3 h lease budget; null plan entries dropped before validation; a file vanishing between existence check and hash; a default-parameter binder escaping a stale-literal guard.
@@ -26,4 +26,4 @@ Before CoS, mlv-app heads carried only review/fable, review/sol, review/opus. Ne
 - On merged #677, called clean by CoS, the pass found a real low-reach regression the diff introduced.
 - Cost: 421-833 s lane time per head; 1108-1780 s end to end, mostly admission wait.
 
-**Falsifier:** rerun the meter on a bus clone at 4928a22 with -NoFetch and -Since 2026-10-18T00:00:00Z (the pin ends the window); different counts falsify this receipt (statuses can be added later).
+**Falsifier:** rerun the meter on a bus clone at fc633a0 with -NoFetch and -Since 2026-10-18T00:00:00Z (the pin ends the window); different counts falsify this receipt (statuses can be added later).

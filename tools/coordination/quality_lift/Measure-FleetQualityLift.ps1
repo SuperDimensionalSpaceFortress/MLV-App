@@ -7,13 +7,14 @@
 # READ-ONLY on GitHub. On the bus it only reads, except the one `git pull --ff-only` before measuring, which -NoFetch skips.
 # It reads:
 #   - the bus history of cos-feedback/<project>/pr-*.md (one CoS pass per commit and file; the section header
-#     "# <owner>/<repo> #<n> / <40-hex head>", else the cos-feedback.v1 front matter, names the repo, PR and head; the
-#     Blockers section's first line starting B<n>, in plain, bulleted, numbered or bold form, = blocked; see Get-QlIdentity)
+#     "# <owner>/<repo> #<n> / <40-hex head>", else the cos-feedback.v1 front matter, names the repo, PR and head; what
+#     the Blockers section says, by meaning, makes it blocked, clean or unclassified; see Get-QlBlockerClass)
 #   - GitHub commit statuses on each blocked head (every page, every context, reported per context)
 #   - for a project that declares native reviews: the PR's reviews (on that head's commit_id) and review comments
 #     (written on that head: original_commit_id), every page, folded per author; for a DISMISSED review, the PR's
 #     review_dismissed issue events, which keep the state it was submitted with
 #   - PR bodies created in the last 24 h, for an "Adversary pass" line (shift-left adoption; bodies only, never comments)
+# Bus and GitHub text is untrusted: it is read by a linear scan or by patterns that are linear and carry a match timeout.
 # It writes ONLY under -OutDir:
 #   single project (-Project x): <OutDir>\quality-lift.md|.json, history.jsonl, corpus.jsonl, status-cache.json
 #   all projects (default):      <OutDir>\<project>\... per project, plus <OutDir>\fleet.md and fleet.json
@@ -23,11 +24,14 @@
 # APPROVED, or it was APPROVED when submitted and later dismissed; every other review state and every review comment is
 # review evidence, never an approval. A dismissed review whose earlier state cannot be read makes the head unknown.
 # Definitions (lower is better on every rate). A "round" is one head CoS reviewed:
-#   blockedRate        share of CoS-reviewed heads (one pass per repo, PR and head; a head re-reviewed clean-then-blocked counts
-#                      at its first BLOCKING pass) whose first Blockers line starts B<n>
+#   blockedRate        share of classified CoS-reviewed heads (one pass per repo, PR and head; a head re-reviewed clean-then-
+#                      blocked counts at its first BLOCKING pass) that the CoS called blocked (Get-QlBlockerClass)
+#   blockerUnknown     CoS-reviewed heads whose Blockers section is neither blocked nor explicit no-blocker text (or is
+#                      missing); counted apart, listed in blockerUnknownHeads, and out of every rate's denominator
 #   unparsed           CoS files in the window that name no pass (neither identity form); counted and reported, not measured
 #   firstRoundBlocked  PRs whose first CoS-reviewed head (ordered by its first pass in the window) was blocked; clean-then-
-#                      blocked on that head counts as blocked. Each window is cut from the raw passes before heads are folded.
+#                      blocked on that head counts as blocked; firstRoundUnknown PRs whose first head is unclassified. Each
+#                      window is cut from the raw passes before heads are folded.
 #   noPriorKey         blocked heads whose evidence is known and that carry no DECLARED review evidence from before the CoS
 #                      pass (CoS read it first). 'unknown' for a project that declares no review evidence.
 #   trueMiss           blocked heads with a DECLARED approval (a declared status context's 'success', or an APPROVED native
@@ -89,46 +93,194 @@ function Get-QlKey($p) { "$($p.repo)@$($p.head)" }
 # CoS text forms, all as the CoS writes them on the bus (measured 2026-10-26; tests carry real records):
 #   identity  the last "# <owner>/<repo> #<n> / <40-hex head>" heading, else the cos-feedback.v1 front matter (the
 #             leading "schema: cos-feedback.v1" block, up to its first blank line) naming repo:, pr: and head:
-#   section   a "## Blockers" or "### Blockers" heading (bold, a colon inside or after the bold, a note in () or []), or a
-#             "Blockers:" label line (bold or bulleted allowed) whose text may follow on the same line
-#   blocker   the section's first content line starts B<n>, after optional quote, heading (###+), bullet (- * +), number
-#             (1. 1)) and emphasis (one to three * or _) marks. A line under the next level-1 or -2 heading is outside it.
+#   section   a "## Blockers" or "### Blockers" heading (bold, colons, notes in () or [], closing #s), or a "Blockers:" label
+#             line (bold or bulleted allowed) whose text may follow on the same line, when that text is the whole section.
+#             It runs to the next level-1 or -2 heading (level 3 too under a ### heading, unless that heading is a B<n>
+#             item), or for a bare label to its first blank line. Blank and thematic-break lines (--- *** ___) carry nothing.
+#   class     what the section says, by meaning: see Get-QlBlockerClass. blocked, clean, or unknown (counted on its own,
+#             never as clean).
 #   A head may be written in either case; it is kept in lowercase, as git and GitHub print it.
 # Up to three leading spaces (still a markdown heading); exactly 40 hex (41 is no head); a PR number that fits an Int32.
-$QlHeading = '(?m)^[ ]{0,3}# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d{1,9}) / ([0-9a-fA-F]{40})(?![0-9A-Za-z])'
-$QlCorpusEvidence = 'r3'   # corpus row format: bump when a meter change can alter a row already written
-# Markers in any order and nesting (> - ### **B1): each is a quote, a heading, a bullet or number, or emphasis.
-$QlBlockedLine = '^(?:[ \t]*(?:>|#{1,6}[ \t]|[-*+][ \t]|\d+[.)][ \t]|\*{1,3}|_{1,3}))*[ \t]*B\d'
+$QlCorpusEvidence = 'r4'   # corpus row format: bump when a meter change can alter a row already written
+# Every pattern that reads bus or GitHub text is linear by construction: no quantified group whose body can match the same
+# text more than one way, and no two variable runs over the same characters side by side. A match timeout bounds each one
+# as well, so a later edit that is not linear fails as a named source error instead of hanging under the project lock.
+$QlRxTimeout = [TimeSpan]::FromSeconds(2)
+function New-QlRx([string]$Pattern, [Text.RegularExpressions.RegexOptions]$Options = 'None') { [regex]::new($Pattern, $Options, $QlRxTimeout) }
+# The words a CoS uses to say a blocker is closed, in either order with B<n>.
+$QlClosedWords = '(?:closed|fixed|source-fixed|resolved|source-resolved|addressed|source-addressed|remedied|source-remedied|withdrawn|superseded)'
+$QlRx = @{
+    heading       = New-QlRx '^[ ]{0,3}# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d{1,9}) / ([0-9a-fA-F]{40})(?![0-9A-Za-z])' 'Multiline'
+    # Header lines run to the first blank one: leading blanks, one non-blank, then the rest of the line (three disjoint runs).
+    frontMatter   = New-QlRx '\A(?:\uFEFF)?schema:[ \t]*cos-feedback\.v1[ \t]*\r?\n(?:[^\S\r\n]*\S[^\r\n]*\r?\n)*'
+    fmRepo        = New-QlRx '^repo:[ \t]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)[ \t]*\r?$' 'Multiline'
+    fmPr          = New-QlRx '^pr:[ \t]*(\d{1,9})[ \t]*\r?$' 'Multiline'
+    fmHead        = New-QlRx '^head:[ \t]*([0-9a-fA-F]{40})[ \t]*\r?$' 'Multiline'
+    # One line at a time. The heading's text is checked by Test-QlBlockersHeading, not by a pattern.
+    hashLine      = New-QlRx '^[ ]{0,3}(#{2,3})[ \t]+(.*)$'
+    anyHeading    = New-QlRx '^[ \t]*(#{1,6})(?:[ \t]|$)'
+    label         = New-QlRx '^[ ]{0,3}(?:[-*+][ \t]+)?(?:\*\*|__)?Blockers(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*(.*)$'
+    sentenceBreak = New-QlRx '(?<=[.;!?])[ \t]+'
+    # Meaning. B<n> is case-sensitive (Blocked is not B1); the words around it are not.
+    leadB         = New-QlRx '^B\d'
+    closedB       = New-QlRx "^B\d+(?:/B\d+)*,?[ \t]+(?:(?:is|was|are|now)[ \t]+)?(?i:$QlClosedWords)\b"
+    currentB      = New-QlRx "\bB\d+\b(?:[ \t]+\([^()\r\n]{0,120}\))?:?[ \t]+(?:(?i:is|are|still|also)[ \t]+)?(?:(?i:is|are|still|also)[ \t]+)?(?i:persists|persist|persisting|remains|remain|remaining|retained|stands|open|unresolved|unfixed|reproduces|new|current)\b(?![ \t]+(?i:$QlClosedWords|in[ \t]+place)\b)"
+    currentBPre   = New-QlRx '\b(?i:new|current|remaining|retained|persisting|open|unresolved|outstanding|unfixed)[ \t]+(?:SHARED[ \t]+)?B\d+\b'
+    stillWord     = New-QlRx "(?i)\b(?:persists|persist|persisting|remains|remain|remaining|retained|still|unresolved|unfixed)\b(?![ \t]+$QlClosedWords\b)"
+    negated       = New-QlRx '^\(?(?i:no|none|not|nothing|n/a)\b'
+    # A CI run named as such (CI, shard 2, job123, an Actions run link, the exact or current head): "checks" alone is often a
+    # verb in source prose ("it checks the lock and fails the run").
+    ciNoun        = New-QlRx '(?i)\bCI\b|\bshard[ \t]*\d|\bjob[ \t]*\d|/actions/runs/|\b(?:exact|current)[ -]head\b'
+    # The CoS often glues a time or count to the verb (failed16:17:43, fail:).
+    ciFail        = New-QlRx '(?i)\b(?:fail|fails|failed|failing)(?![A-Za-z])'
+    notGreen      = New-QlRx '(?i)\bnot[ \t]+green\b'
+    ciNot         = New-QlRx '(?i)\b(?:no|none|not|nothing|never|without|if|unless|would|could|can|may|might|prior|previous|previously|earlier|historical|historically|was|were|formerly|longer)\b'
+    failSafe      = New-QlRx '(?i)\bfail(?:s|ed|ing)?[ \t-]+(?:closed|open|safe)\b'
+    cleanOpen     = New-QlRx '^\(?(?i:none|no|nothing|n/a)\b'
+    priorOpen     = New-QlRx '^(?i:prior|inherited|earlier)\b'
+    bName         = New-QlRx '\bB\d+\b'
+    closedWord    = New-QlRx "(?i)\b$QlClosedWords\b"
+    notClosed     = New-QlRx "(?i)\bnot[ \t]+(?:yet[ \t]+)?$QlClosedWords\b|\bun(?:fixed|resolved|addressed|remedied)\b"
+    # GitHub and git output.
+    repoLine      = New-QlRx '^(?:[ ]{0,3}# |repo:[ \t]*)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?: #|[ \t]*\r?$)' 'IgnoreCase'
+    adversary     = New-QlRx '^\W*Adversary pass' 'IgnoreCase, Multiline'
+    busPath       = New-QlRx '^cos-feedback/([^/]+)/'
+}
 
 # The pass a CoS file names: @{ repo; pr; head; section }, or $null when it names none.
 function Get-QlIdentity([string]$Txt) {
-    $ms = [regex]::Matches($Txt, $QlHeading)
+    $ms = $QlRx.heading.Matches($Txt)
     if ($ms.Count) {
         $m = $ms[$ms.Count - 1]
         return @{ repo = $m.Groups[1].Value; pr = [int]$m.Groups[2].Value; head = $m.Groups[3].Value.ToLowerInvariant(); section = $Txt.Substring($m.Index) }
     }
-    $fm = [regex]::Match($Txt, '\A(?:\uFEFF)?schema:[ \t]*cos-feedback\.v1[ \t]*\r?\n(?:[^\r\n]*\S[^\r\n]*\r?\n)*')
+    $fm = $QlRx.frontMatter.Match($Txt)
     if (-not $fm.Success) { return $null }
-    $repo = [regex]::Match($fm.Value, '(?m)^repo:[ \t]*([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)[ \t]*\r?$')
-    $pr = [regex]::Match($fm.Value, '(?m)^pr:[ \t]*(\d{1,9})[ \t]*\r?$')
-    $head = [regex]::Match($fm.Value, '(?m)^head:[ \t]*([0-9a-fA-F]{40})[ \t]*\r?$')
+    $repo = $QlRx.fmRepo.Match($fm.Value)
+    $pr = $QlRx.fmPr.Match($fm.Value)
+    $head = $QlRx.fmHead.Match($fm.Value)
     if (-not ($repo.Success -and $pr.Success -and $head.Success)) { return $null }
     @{ repo = $repo.Groups[1].Value; pr = [int]$pr.Groups[1].Value; head = $head.Groups[1].Value.ToLowerInvariant(); section = $Txt.Substring($fm.Length) }
 }
 
-# The first content line of the Blockers section ('' when there is none, or the section is empty).
-function Get-QlBlockerLine([string]$Sec) {
-    # Up to three leading spaces, and closing #s on a heading, are markdown too.
-    $h = [regex]::Match($Sec, '(?m)^[ ]{0,3}#{2,3}[ \t]+(?:\*\*|__)?Blockers[ \t]*:?[ \t]*(?:\([^)\r\n]*\)|\[[^\]\r\n]*\])?[ \t]*:?(?:\*\*|__)?[ \t]*:?[ \t]*(?:\([^)\r\n]*\)|\[[^\]\r\n]*\])?[ \t]*(?:#+[ \t]*)?\r?$')
-    $l = [regex]::Match($Sec, '(?m)^[ ]{0,3}(?:[-*+][ \t]+)?(?:\*\*|__)?Blockers(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*([^\r\n]*)')
-    if (-not $h.Success -and -not $l.Success) { return '' }
-    if ($l.Success -and (-not $h.Success -or $l.Index -lt $h.Index)) {
-        if ($l.Groups[1].Value.Trim()) { return $l.Groups[1].Value.Trim() }
-        $rest = $Sec.Substring($l.Index + $l.Length)
-    } else { $rest = $Sec.Substring($h.Index + $h.Length) }
-    $first = (($rest -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 1) + ''
-    if ($first -match '^[ \t]*#{1,2}([ \t]|$)') { return '' }   # the next section: this one is empty
-    $first.Trim()
+# A line with its leading markdown marks removed: quotes, headings (1 to 6 #, then a space), bullets (- + then a space),
+# numbers (1. 1) then a space) and runs of * and _ (emphasis, or a * bullet), in any order and nesting. One scan from the
+# left, no pattern: linear in the line's length whatever the marks are (B6: a nested pattern backtracked exponentially).
+function Remove-QlMarks([string]$Line) {
+    $i = 0; $n = $Line.Length
+    while ($i -lt $n) {
+        $c = $Line[$i]
+        if ($c -eq [char]' ' -or $c -eq [char]"`t" -or $c -eq [char]'>') { $i++; continue }
+        if ($c -eq [char]'*' -or $c -eq [char]'_') { $i++; continue }
+        $j = $i
+        if ($c -eq [char]'#') {
+            while ($j -lt $n -and $Line[$j] -eq [char]'#') { $j++ }
+            if ($j - $i -le 6 -and ($j -eq $n -or $Line[$j] -eq [char]' ' -or $Line[$j] -eq [char]"`t")) { $i = $j; continue }
+            break
+        }
+        if ($c -eq [char]'-' -or $c -eq [char]'+') {
+            if ($i + 1 -lt $n -and ($Line[$i + 1] -eq [char]' ' -or $Line[$i + 1] -eq [char]"`t")) { $i += 2; continue }
+            break
+        }
+        if ($c -ge [char]'0' -and $c -le [char]'9') {
+            while ($j -lt $n -and $Line[$j] -ge [char]'0' -and $Line[$j] -le [char]'9') { $j++ }
+            if ($j + 1 -lt $n -and ($Line[$j] -eq [char]'.' -or $Line[$j] -eq [char]')') -and ($Line[$j + 1] -eq [char]' ' -or $Line[$j + 1] -eq [char]"`t")) { $i = $j + 2; continue }
+            break
+        }
+        break
+    }
+    $Line.Substring($i)
+}
+
+# A thematic break: three or more of one of - * _ and nothing else but spaces. It separates; it says nothing.
+function Test-QlThematicBreak([string]$Line) {
+    $t = $Line.Replace(' ', '').Replace("`t", '')
+    $t.Length -ge 3 -and ($t[0] -eq [char]'-' -or $t[0] -eq [char]'*' -or $t[0] -eq [char]'_') -and $t.Trim($t[0]).Length -eq 0
+}
+
+# The level (2 or 3) of a Blockers heading line, else 0: "Blockers" (bold allowed), then only colons, spaces, notes in ()
+# or [] and closing #s. Read by a scan: the old single pattern held six adjacent optional runs of spaces (polynomial).
+function Test-QlBlockersHeading([string]$Line) {
+    $m = $QlRx.hashLine.Match($Line)
+    if (-not $m.Success) { return 0 }
+    $t = $m.Groups[2].Value.TrimEnd().TrimEnd('#').Replace('**', '').Replace('__', '')
+    if (-not $t.StartsWith('Blockers', [StringComparison]::Ordinal)) { return 0 }
+    $t = $t.Substring(8)
+    while ($true) {
+        $t = $t.TrimStart(' ', "`t", ':')
+        if (-not $t) { return $m.Groups[1].Length }
+        $close = $(if ($t[0] -eq [char]'(') { ')' } elseif ($t[0] -eq [char]'[') { ']' } else { '' })
+        if (-not $close) { return 0 }
+        $k = $t.IndexOf($close)
+        if ($k -lt 0) { return 0 }
+        $t = $t.Substring($k + 1)
+    }
+}
+
+# The content lines of the first Blockers section, trimmed, in order ($null when the text has no Blockers section).
+function Get-QlBlockerSection([string]$Sec) {
+    $lines = $Sec -split "`n"
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $ln = $lines[$i].TrimEnd("`r")
+        $level = Test-QlBlockersHeading $ln
+        $bare = $false
+        if (-not $level) {
+            $l = $QlRx.label.Match($ln)
+            if (-not $l.Success) { continue }
+            if ($l.Groups[1].Value.Trim()) { return , @($l.Groups[1].Value.Trim()) }   # "Blockers: <text>": that text is all of it
+            $bare = $true; $level = 2
+        }
+        $out = [Collections.Generic.List[string]]::new()
+        for ($j = $i + 1; $j -lt $lines.Count; $j++) {
+            $x = $lines[$j].TrimEnd("`r")
+            if (-not $x.Trim() -or (Test-QlThematicBreak $x)) { if ($bare -and $out.Count) { break }; continue }
+            $h = $QlRx.anyHeading.Match($x)
+            if ($h.Success -and $h.Groups[1].Length -le $level -and -not $QlRx.leadB.IsMatch((Remove-QlMarks $x))) { break }
+            if ((Remove-QlMarks $x).Trim()) { $out.Add($x.Trim()) }   # a line of marks only carries nothing
+        }
+        return , $out.ToArray()
+    }
+    $null
+}
+
+# What the CoS said about blockers, by meaning (B5), as @{ cls = blocked | clean | unknown; text = the line that decided }.
+#   blocked  any content line starts B<n> (after its marks), unless it states that B<n> closed or fixed (B1 closed:), or the
+#            section opened with no-blocker text and the line's first sentence does not say the B<n> still stands; or a
+#            sentence that does not open No/None/Not names a B<n> as persisting, remaining, retained, open, unresolved, new
+#            or current, after it (Prior612 B1 persists, Inherited #4 B1 remains) or before it (the remaining B2); or a
+#            sentence reports a CI run failing (CI, a shard or job number, an Actions link, the exact or current head: exact-
+#            head job1 fails, actual shard 2 fails), unless it negates, hedges or looks back (none has failed, would fail,
+#            Prior CI failed, fails closed).
+#   clean    nothing blocked, and the section opens with explicit no-blocker text: None..., No..., (none), n/a, B<n> closed,
+#            or a Prior/Inherited B<n> stated closed, fixed or addressed (not "not fixed").
+#   unknown  anything else, a missing or empty Blockers section included: a governance hold (G1 OPEN), a P2 finding, a
+#            readiness hold. Counted on its own, never as clean.
+function Get-QlBlockerClass([string]$Sec) {
+    $lines = Get-QlBlockerSection $Sec
+    if ($null -eq $lines) { return @{ cls = 'unknown'; text = '(no Blockers section)' } }
+    if (-not $lines.Count) { return @{ cls = 'unknown'; text = '(empty Blockers section)' } }
+    $first = (Remove-QlMarks $lines[0]).Trim()
+    $open = $QlRx.sentenceBreak.Split($first)[0]
+    $priorClosed = $QlRx.priorOpen.IsMatch($open) -and $QlRx.bName.IsMatch($open) -and $QlRx.closedWord.IsMatch($open) -and -not $QlRx.notClosed.IsMatch($open)
+    $saysNone = $QlRx.cleanOpen.IsMatch($open) -or $priorClosed
+    foreach ($ln in $lines) {
+        $bare = (Remove-QlMarks $ln).Trim()
+        # Under an explicit no-blocker opener a "B1: <how it was addressed>" line is a disposition note, not a new blocker,
+        # unless its first sentence says the B<n> still stands (B2 validation mismatch remains).
+        if ($QlRx.leadB.IsMatch($bare) -and -not $QlRx.closedB.IsMatch($bare) -and
+            (-not $saysNone -or $QlRx.stillWord.IsMatch($QlRx.sentenceBreak.Split($bare)[0]))) { return @{ cls = 'blocked'; text = $ln } }
+        foreach ($s in $QlRx.sentenceBreak.Split($bare)) {
+            if ($QlRx.negated.IsMatch($s)) { continue }
+            if ($QlRx.currentB.IsMatch($s) -or $QlRx.currentBPre.IsMatch($s)) { return @{ cls = 'blocked'; text = $ln } }
+            # A negation or hedge counts only before the failure word: '... shard 2 fails: received "(kill not confirmed)"'; and
+            # "not green" says the same as the failure it introduces ("CI is not green: job1 failed16:17:43").
+            $f = $QlRx.ciFail.Match($s)
+            if ($f.Success -and $QlRx.ciNoun.IsMatch($s) -and -not $QlRx.ciNot.IsMatch($QlRx.notGreen.Replace($s.Substring(0, $f.Index), '')) -and
+                -not $QlRx.failSafe.IsMatch($s)) { return @{ cls = 'blocked'; text = $ln } }
+        }
+    }
+    if ($saysNone -or $QlRx.closedB.IsMatch($open)) { return @{ cls = 'clean'; text = $lines[0] } }
+    @{ cls = 'unknown'; text = $lines[0] }
 }
 
 # Every CoS pass (one per commit and file) since $From, unfolded. --since-as-filter, not --since: --since stops the walk at
@@ -150,28 +302,31 @@ function Get-QlPasses([string]$Proj, [string]$From) {
         foreach ($f in ($names | Where-Object { $_ -like $like })) {
             $txt = (git -C $Bus show "${h}:$f" 2>$null) -join "`n"
             if ($LASTEXITCODE -ne 0) { throw "git show $($h.Substring(0,12)):$f failed (exit $LASTEXITCODE)" }
-            $id = Get-QlIdentity $txt
+            # A pattern that hits its match timeout names the file: the project is then not measured, never stalled.
+            try { $id = Get-QlIdentity $txt; $c = $(if ($id) { Get-QlBlockerClass $id.section }) }
+            catch { throw "reading $($h.Substring(0,12)):$f failed: $($_.Exception.Message)" }
             # A file that names no pass is counted (parsed = false) and reported, never silently dropped.
             if (-not $id) { $out += [pscustomobject]@{ utc = (ConvertTo-QlUtc $t); seq = $seq; parsed = $false; file = $f }; continue }
-            # The heading line, not the phrase: a verdict that mentions "## Blockers" mid-line is not the section.
-            $blk = Get-QlBlockerLine $id.section
+            $blk = [string]$c.text
             $out += [pscustomobject]@{
-                utc = (ConvertTo-QlUtc $t); seq = $seq; parsed = $true; repo = $id.repo; pr = $id.pr
-                head = $id.head; blocked = ($blk -cmatch $QlBlockedLine); blocker = $(if ($blk.Length -gt 160) { $blk.Substring(0, 160) } else { $blk })
+                utc = (ConvertTo-QlUtc $t); seq = $seq; parsed = $true; repo = $id.repo; pr = $id.pr; head = $id.head
+                cls = $c.cls; blocked = ($c.cls -eq 'blocked'); blocker = $(if ($blk.Length -gt 160) { $blk.Substring(0, 160) } else { $blk })
             }
         }
     }
     $out
 }
 
-# One record per repo, PR and head, from passes ALREADY cut to a window: the first blocking pass if any, else the first pass.
+# One record per repo, PR and head, from passes ALREADY cut to a window: the first blocking pass if any; else the first
+# unknown pass if any (a clean pass then an unknown one is unknown: the later pass may carry a blocker); else the first pass.
 # firstSeen/firstSeq (the head's first pass in the window) order the heads of a PR; utc (the blocking pass) is the CoS time
 # that statuses are compared against. Passes in the same second keep their commit order (seq).
 function Group-QlHeads([object[]]$Raw) {
     @(@($Raw) | Where-Object { $null -ne $_ } | Sort-Object utc, seq | Group-Object { "$($_.repo)|$($_.pr)|$($_.head)" } | ForEach-Object {
         $bl = @($_.Group | Where-Object blocked)
-        $rep = $(if ($bl.Count) { $bl[0] } else { $_.Group[0] })
-        [pscustomobject]@{ utc = $rep.utc; firstSeen = $_.Group[0].utc; firstSeq = $_.Group[0].seq; repo = $rep.repo; pr = $rep.pr; head = $rep.head; blocked = $rep.blocked; blocker = $rep.blocker }
+        $un = @($_.Group | Where-Object { $_.cls -eq 'unknown' })
+        $rep = $(if ($bl.Count) { $bl[0] } elseif ($un.Count) { $un[0] } else { $_.Group[0] })
+        [pscustomobject]@{ utc = $rep.utc; firstSeen = $_.Group[0].utc; firstSeq = $_.Group[0].seq; repo = $rep.repo; pr = $rep.pr; head = $rep.head; cls = $rep.cls; blocked = $rep.blocked; blocker = $rep.blocker }
     })
 }
 
@@ -187,7 +342,7 @@ function Get-QlRepos([string]$Proj) {
     $like = "HEAD:cos-feedback/$([WildcardPattern]::Escape($Proj))/pr-*.md"
     @($lines | ForEach-Object {
         $path, $text = $_.Split([char]0, 2)
-        if ($path -like $like -and $text -match '^(?:[ ]{0,3}# |repo:[ \t]*)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?: #|[ \t]*\r?$)') { $Matches[1] }
+        if ($path -like $like) { $m = $QlRx.repoLine.Match("$text"); if ($m.Success) { $m.Groups[1].Value } }
     })
 }
 
@@ -370,7 +525,10 @@ function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache, $Decl, [in
     # An empty window can arrive as $null, and @($null) is one element: drop nulls so it counts zero passes.
     $P = @($P | Where-Object { $null -ne $_ })
     $blocked = @($P | Where-Object blocked)
+    # Unknown heads are counted apart and left out of every rate's denominator: an unknown pass is never read as clean.
+    $unknownHeads = @($P | Where-Object { $_.cls -eq 'unknown' })
     $firstPerPr = @($P | Group-Object { "$($_.repo)#$($_.pr)" } | ForEach-Object { $_.Group | Sort-Object firstSeen, firstSeq | Select-Object -First 1 })
+    $firstKnown = @($firstPerPr | Where-Object { $_.cls -ne 'unknown' })
     # Status contexts and native review rows are counted apart: a status may carry any context text, a native one's included.
     $noKey = 0; $trueMiss = 0; $unknown = 0; $noStatus = 0; $okStatus = 0; $ctxStats = [ordered]@{}; $natStats = [ordered]@{}
     foreach ($b in $blocked) {
@@ -393,17 +551,19 @@ function Get-QlWindow([object[]]$P, [string]$Name, [hashtable]$Cache, $Decl, [in
         }
     }
     $rounds = @($P | Group-Object { "$($_.repo)#$($_.pr)" } | ForEach-Object { $_.Count })
+    $classified = $P.Count - $unknownHeads.Count
     [ordered]@{
-        window = $Name; measured = $true; passes = $P.Count; unparsed = $Unparsed; blocked = $blocked.Count
-        blockedRate = $(if ($P.Count) { [math]::Round($blocked.Count / $P.Count, 3) } else { $null })
-        prs = $firstPerPr.Count; firstRoundBlocked = @($firstPerPr | Where-Object blocked).Count
-        firstRoundBlockedRate = $(if ($firstPerPr.Count) { [math]::Round(@($firstPerPr | Where-Object blocked).Count / $firstPerPr.Count, 3) } else { $null })
+        window = $Name; measured = $true; passes = $P.Count; unparsed = $Unparsed; blocked = $blocked.Count; blockerUnknown = $unknownHeads.Count
+        blockedRate = $(if ($classified) { [math]::Round($blocked.Count / $classified, 3) } else { $null })
+        prs = $firstPerPr.Count; firstRoundBlocked = @($firstPerPr | Where-Object blocked).Count; firstRoundUnknown = $firstPerPr.Count - $firstKnown.Count
+        firstRoundBlockedRate = $(if ($firstKnown.Count) { [math]::Round(@($firstPerPr | Where-Object blocked).Count / $firstKnown.Count, 3) } else { $null })
         reviewSource = (Format-QlSource $Decl)
         noPriorKey = $(if ($Decl) { $noKey } else { 'unknown' }); trueMiss = $(if ($Decl) { $trueMiss } else { 'unknown' }); statusUnknown = $unknown
         statusBeforeCos = [ordered]@{ noPriorStatus = $noStatus; successBeforeCos = $okStatus }
         roundsPerPr = $(if ($rounds.Count) { [math]::Round(($rounds | Measure-Object -Average).Average, 2) } else { $null })
         roundsPerPrMax = $(if ($rounds.Count) { ($rounds | Measure-Object -Maximum).Maximum } else { $null })
         contextsBeforeCos = $ctxStats; nativeBeforeCos = $natStats
+        blockerUnknownHeads = @($unknownHeads | ForEach-Object { [ordered]@{ repo = $_.repo; pr = $_.pr; head = $_.head; text = $_.blocker } })
     }
 }
 
@@ -515,7 +675,7 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
                     throw "more than $PrListLimit PRs were created in the last 24 h; the listing is truncated"
                 }
                 $prs = @($listed | Where-Object { $c = ConvertTo-QlUtc $_.createdAt; $c -ge $d1Start -and $c -le $now })
-                $n += $prs.Count; $w += @($prs | Where-Object { $_.body -match '(?im)^\W*Adversary pass' }).Count
+                $n += $prs.Count; $w += @($prs | Where-Object { $QlRx.adversary.IsMatch("$($_.body)") }).Count
             } catch { $errors += "pr list ${rp}: $($_.Exception.Message)"; $listFailed = $true }
         }
         # One failed listing makes the count unknown (null), never a partial sum read as complete.
@@ -563,16 +723,18 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
 
     $res = [ordered]@{ schema = 'fleet/quality-lift/v1'; project = $Proj; utc = $now.ToString('o'); since = $Since; windows = @($all, $d1); shiftLeft = $adopt; corpusNew = $newCorpus; errors = $errors }
     ($res | ConvertTo-Json -Depth 8) | Set-Content -LiteralPath (Join-Path $Dir 'quality-lift.json') -Encoding utf8
-    if ($busOk) { Add-QlJsonLine (Join-Path $Dir 'history.jsonl') ([ordered]@{ utc = $now.ToString('o'); project = $Proj; blockedRate24h = $d1.blockedRate; firstRound24h = $d1.firstRoundBlockedRate; noPriorKey24h = $d1.noPriorKey; trueMiss24h = $d1.trueMiss; statusUnknown24h = $d1.statusUnknown; noPriorStatus24h = $d1.statusBeforeCos.noPriorStatus; reviewSource = $d1.reviewSource; rounds24h = $d1.roundsPerPr; adversaryLine = $adopt.withAdversaryLine; prs24h = $adopt.prs } | ConvertTo-Json -Compress) }
+    if ($busOk) { Add-QlJsonLine (Join-Path $Dir 'history.jsonl') ([ordered]@{ utc = $now.ToString('o'); project = $Proj; blockedRate24h = $d1.blockedRate; blockerUnknown24h = $d1.blockerUnknown; firstRound24h = $d1.firstRoundBlockedRate; noPriorKey24h = $d1.noPriorKey; trueMiss24h = $d1.trueMiss; statusUnknown24h = $d1.statusUnknown; noPriorStatus24h = $d1.statusBeforeCos.noPriorStatus; reviewSource = $d1.reviewSource; rounds24h = $d1.roundsPerPr; adversaryLine = $adopt.withAdversaryLine; prs24h = $adopt.prs } | ConvertTo-Json -Compress) }
 
     $pct = { param($x) if ($null -eq $x) { 'n/a' } else { "$([math]::Round(100 * [double]$x))%" } }
     $md = @()
-    $md += "QUALITY-LIFT $Proj $($now.ToString('yyyy-MM-ddTHH:mm'))Z: CoS blocker rate 24h $(& $pct $d1.blockedRate) (since $($Since.Substring(0,10)) $(& $pct $all.blockedRate)); first-round blocked 24h $($d1.firstRoundBlocked)/$($d1.prs); CoS read first 24h $(Format-QlFirst $d1); true misses 24h $($d1.trueMiss); review evidence: $($d1.reviewSource); no status before CoS 24h (proxy) $(Format-QlProxy $d1); adversary-pass PRs 24h $($adopt.withAdversaryLine)/$($adopt.prs)$(if ($errors) { "; ERRORS $($errors.Count)" })"
+    $md += "QUALITY-LIFT $Proj $($now.ToString('yyyy-MM-ddTHH:mm'))Z: CoS blocker rate 24h $(& $pct $d1.blockedRate) (since $($Since.Substring(0,10)) $(& $pct $all.blockedRate)); unclassified CoS passes 24h $($d1.blockerUnknown); first-round blocked 24h $($d1.firstRoundBlocked)/$($d1.prs); CoS read first 24h $(Format-QlFirst $d1); true misses 24h $($d1.trueMiss); review evidence: $($d1.reviewSource); no status before CoS 24h (proxy) $(Format-QlProxy $d1); adversary-pass PRs 24h $($adopt.withAdversaryLine)/$($adopt.prs)$(if ($errors) { "; ERRORS $($errors.Count)" })"
     if (-not $busOk) { $md[0] = "QUALITY-LIFT $Proj NOT MEASURED: the bus read failed; ERRORS $($errors.Count)" }
     $md += ''
-    $md += "| window | CoS passes | blocked | first-round blocked (PRs) | CoS read first | true misses | no status before CoS (proxy) | CoS rounds per PR |"
-    $md += "|---|---|---|---|---|---|---|---|"
-    foreach ($w in @($all, $d1)) { $md += "| $($w.window) | $($w.passes) | $($w.blocked) ($(& $pct $w.blockedRate)) | $($w.firstRoundBlocked)/$($w.prs) | $(Format-QlFirst $w) | $($w.trueMiss) | $(Format-QlProxy $w) | $($w.roundsPerPr) (max $($w.roundsPerPrMax)) |" }
+    $md += "| window | CoS passes | blocked | unclassified | first-round blocked (PRs) | CoS read first | true misses | no status before CoS (proxy) | CoS rounds per PR |"
+    $md += "|---|---|---|---|---|---|---|---|---|"
+    foreach ($w in @($all, $d1)) { $md += "| $($w.window) | $($w.passes) | $($w.blocked) ($(& $pct $w.blockedRate)) | $($w.blockerUnknown) | $($w.firstRoundBlocked)/$($w.prs)$(if ($w.firstRoundUnknown) { " ($($w.firstRoundUnknown) unclassified)" }) | $(Format-QlFirst $w) | $($w.trueMiss) | $(Format-QlProxy $w) | $($w.roundsPerPr) (max $($w.roundsPerPrMax)) |" }
+    $md += ''
+    $md += "Blocked: the CoS named a current blocker (a B<n> item, a B<n> that persists or remains, or a failing CI run). Unclassified: the Blockers section is missing, or says neither that nor 'None'/'No ...'; it is counted apart, and the blocked rate is over classified passes only."
     $md += ''
     $md += "CoS read first and true misses count only declared review evidence ($($all.reviewSource)); 'unknown' when none is declared."
     $md += ''
@@ -581,6 +743,10 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
     $md += "Contexts that existed before CoS on blocked heads (review = declared review evidence):"
     foreach ($k in $all.contextsBeforeCos.Keys) { $v = $all.contextsBeforeCos[$k]; $md += "- status $k$(if ($v.review) { ' [review]' }) : success $($v.successBeforeCos), failure $($v.failureBeforeCos)" }
     foreach ($k in $all.nativeBeforeCos.Keys) { $v = $all.nativeBeforeCos[$k]; $md += "- native $k$(if ($v.review) { ' [review]' }) : approved $($v.successBeforeCos), changes requested $($v.failureBeforeCos)" }
+    if ($all.blockerUnknown) {
+        $md += ''; $md += "Unclassified CoS passes since $($Since.Substring(0,10)) (first 20; all in quality-lift.json):"
+        foreach ($u in @($all.blockerUnknownHeads | Select-Object -First 20)) { $md += "- $($u.repo) #$($u.pr) $($u.head.Substring(0, 12)): $($u.text)" }
+    }
     if ($errors) { $md += ''; $md += 'Errors:'; $errors | Select-Object -First 10 | ForEach-Object { $md += "- $_" } }
     $md | Set-Content -LiteralPath (Join-Path $Dir 'quality-lift.md') -Encoding utf8
     [pscustomobject]@{ project = $Proj; headline = $md[0]; all = $all; d1 = $d1; adopt = $adopt; errors = $errors.Count }
@@ -614,7 +780,7 @@ if ($LASTEXITCODE -ne 0) { $SharedErrors += "git log of cos-feedback/ failed (ex
 # Folders starting with _ or . are bus plumbing (such as _bus, _example), not projects: they are named in the report, never
 # measured. A project named like a fleet report would overwrite it (or be overwritten), so it is a named error instead.
 $folders = @(@(Get-ChildItem -LiteralPath (Join-Path $Bus 'cos-feedback') -Directory | ForEach-Object Name) +
-    @($touched | ForEach-Object { if ($_ -match '^cos-feedback/([^/]+)/') { $Matches[1] } }) | Where-Object { $_ } | Sort-Object -Unique)
+    @($touched | ForEach-Object { $m = $QlRx.busPath.Match("$_"); if ($m.Success) { $m.Groups[1].Value } }) | Where-Object { $_ } | Sort-Object -Unique)
 $skipped = @($folders | Where-Object { $_ -match '^[_.]' })
 $FleetErrors = @($folders | Where-Object { $_ -in 'fleet.md', 'fleet.json' } | ForEach-Object { "project folder '$_' has the name of a fleet report; not measured (rename the folder or measure it with -Project into its own -OutDir)" })
 $projects = @($folders | Where-Object { $_ -notmatch '^[_.]' -and $_ -notin 'fleet.md', 'fleet.json' })
@@ -623,22 +789,23 @@ $pct = { param($x) if ($null -eq $x) { 'n/a' } else { "$([math]::Round(100 * [do
 $fl = @()
 $fl += "# Fleet quality lift ($([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm'))Z, since $($Since.Substring(0,10)))"
 $fl += ''
-$fl += "| project | CoS passes | blocked | first-round blocked | review evidence | CoS read first | true misses | no status before CoS (proxy) | rounds/PR | adversary-pass PRs 24h | source errors |"
-$fl += "|---|---|---|---|---|---|---|---|---|---|---|"
+$fl += "| project | CoS passes | blocked | unclassified | first-round blocked | review evidence | CoS read first | true misses | no status before CoS (proxy) | rounds/PR | adversary-pass PRs 24h | source errors |"
+$fl += "|---|---|---|---|---|---|---|---|---|---|---|---|"
 # The fleet's CoS-first and true-miss counts sum ONLY projects that declare review evidence; the proxy sums every project.
-$tp = 0; $tb = 0; $tu = 0; $np = 0; $nd = 0; $dn = 0; $dm = 0; $db = 0; $du = 0; $sn = 0
+# The blocked share is over classified passes: unclassified ones are summed apart, never read as clean.
+$tp = 0; $tb = 0; $tk = 0; $tu = 0; $np = 0; $nd = 0; $dn = 0; $dm = 0; $db = 0; $du = 0; $sn = 0
 # A project with no passes is listed when it has errors (a held lock, an unreadable bus object), so its diagnostic shows.
 # A project that was not measured (its bus read failed, or another run held its lock) is named and left out of the totals.
 $notMeasured = @()
 foreach ($r in ($results | Where-Object { $_.all.passes -gt 0 -or $_.errors } | Sort-Object { - $_.all.passes }, project)) {
-    if (-not $r.all.measured) { $fl += "| $($r.project) | not measured | | | $($r.all.reviewSource) | | | | | | $($r.errors) |"; $notMeasured += $r.project; continue }
-    $fl += "| $($r.project) | $($r.all.passes) | $($r.all.blocked) ($(& $pct $r.all.blockedRate)) | $($r.all.firstRoundBlocked)/$($r.all.prs) | $($r.all.reviewSource) | $(Format-QlFirst $r.all) | $($r.all.trueMiss) | $(Format-QlProxy $r.all) | $($r.all.roundsPerPr) | $($r.adopt.withAdversaryLine)/$($r.adopt.prs) | $($r.errors) |"
-    $np++; $tp += $r.all.passes; $tb += $r.all.blocked; $tu += $r.all.statusUnknown; $sn += $r.all.statusBeforeCos.noPriorStatus
+    if (-not $r.all.measured) { $fl += "| $($r.project) | not measured | | | | $($r.all.reviewSource) | | | | | | $($r.errors) |"; $notMeasured += $r.project; continue }
+    $fl += "| $($r.project) | $($r.all.passes) | $($r.all.blocked) ($(& $pct $r.all.blockedRate)) | $($r.all.blockerUnknown) | $($r.all.firstRoundBlocked)/$($r.all.prs) | $($r.all.reviewSource) | $(Format-QlFirst $r.all) | $($r.all.trueMiss) | $(Format-QlProxy $r.all) | $($r.all.roundsPerPr) | $($r.adopt.withAdversaryLine)/$($r.adopt.prs) | $($r.errors) |"
+    $np++; $tp += $r.all.passes; $tb += $r.all.blocked; $tk += $r.all.blockerUnknown; $tu += $r.all.statusUnknown; $sn += $r.all.statusBeforeCos.noPriorStatus
     if ($r.all.noPriorKey -isnot [string]) { $nd++; $dn += $r.all.noPriorKey; $dm += $r.all.trueMiss; $db += $r.all.blocked; $du += $r.all.statusUnknown }
 }
 $fleetFirst = $(if ($nd) { Format-QlOf $dn ([pscustomobject]@{ blocked = $db; statusUnknown = $du }) } else { 'unknown' })
 $fleetMiss = $(if ($nd) { $dm } else { 'unknown' })
-$fl += "| **fleet** | $tp | $tb ($(if ($tp) { [math]::Round(100 * $tb / $tp) } else { 'n/a' })%) | | $nd of $np projects | $fleetFirst | $fleetMiss | $(Format-QlOf $sn ([pscustomobject]@{ blocked = $tb; statusUnknown = $tu })) | | | |"
+$fl += "| **fleet** | $tp | $tb ($(if ($tp - $tk) { "$([math]::Round(100 * $tb / ($tp - $tk)))%" } else { 'n/a' })) | $tk | | $nd of $np projects | $fleetFirst | $fleetMiss | $(Format-QlOf $sn ([pscustomobject]@{ blocked = $tb; statusUnknown = $tu })) | | | |"
 if ($notMeasured) { $fl += ''; $fl += "Not measured, so not in the fleet totals: $($notMeasured -join ', ') (see source errors)" }
 if ($skipped) { $fl += ''; $fl += "Not measured (bus folders starting with _ or .): $($skipped -join ', ')" }
 $unnamed = @($results | Where-Object { $_.all.unparsed } | ForEach-Object { "$($_.project) $($_.all.unparsed)" })
