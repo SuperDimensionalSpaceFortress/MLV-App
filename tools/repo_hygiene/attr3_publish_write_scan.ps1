@@ -330,7 +330,7 @@ function Get-ProviderLeaf([string]$Path) {
     $text = $Path
     do {
         $previous = $text
-        $text = $text -replace '^(?:\s|\.?[\\/])+', ''
+        $text = $text -replace '^(?:\s|\.{1,2}[\\/]|[\\/])+', ''
         $text = $text -replace '^[A-Za-z]+:', ''
     } while ($text -cne $previous)
     return $text.Trim()
@@ -343,8 +343,14 @@ function Get-RoutedLeaf([string]$Value) {
 }
 
 function Test-RouteTailUnproven([string]$Leaf, [string[]]$Names) {
-    # Nothing after the drive, a wildcard or a computed part: the name comes from somewhere else, so it is unproven (fails closed).
-    return ($Leaf -eq '' -or $Leaf -match '[*?\[\]$(]' -or (Test-ShadowedName $Leaf $Names))
+    # Nothing after the drive, a wildcard, a computed part or a separator still inside the tail ('x/../Join-Path'): the name comes
+    # from somewhere else, so it is unproven (fails closed).
+    return ($Leaf -eq '' -or $Leaf -match '[*?\[\]$(\\/]' -or (Test-ShadowedName $Leaf $Names))
+}
+
+function Test-VariableTailReachesRoot([string]$Leaf) {
+    # The same fail-closed reading for a variable: tail that may name $PSScriptRoot.
+    return ($Leaf -eq '' -or $Leaf -match '[$(\\/]' -or 'PSScriptRoot' -like $Leaf)
 }
 
 function Get-UnwrappedOperand($Ast) {
@@ -643,6 +649,9 @@ function Get-ReceiverOrigin($Target, $Root) {
     # object the property set reaches (it may be a caller's, found by dynamic scope).
     $freshAssignments = @($assignments | Where-Object { (Get-AssignedObjectOrigin $_) -ne 'other' })
     if ($freshAssignments.Count -gt 0 -and @($freshAssignments | Where-Object { Test-DominatesSetter $_ $Target }).Count -eq 0) { $origins += 'undominated' }
+    # A trap that continues resumes after a throwing statement: `trap { continue }; $r = @{ x = $(throw 'bad') }; $r.Value = 99`
+    # reaches the setter although the assignment never ran, so with a trap in the body no assignment proves the receiver fresh.
+    elseif ($freshAssignments.Count -gt 0 -and @($Root.FindAll({ param($n) $n -is [System.Management.Automation.Language.TrapStatementAst] }, $true)).Count -gt 0) { $origins += 'undominated' }
     return (@($origins | Sort-Object -Unique) -join ';')
 }
 
@@ -1037,7 +1046,7 @@ function Get-PsScriptRootRebinding($Root) {
                     $constant = Get-ConstantString $operand
                     if ($null -ne $constant -and $constant -match $variableRoute) {
                         $reducedRest = Get-ProviderLeaf $Matches[1]
-                        if ($reducedRest -eq '' -or $reducedRest -match '[$(]' -or 'PSScriptRoot' -like $reducedRest) { return 'the variable: drive' }
+                        if (Test-VariableTailReachesRoot $reducedRest) { return 'the variable: drive' }
                     }
                 }
             }
@@ -1057,11 +1066,11 @@ function Get-PsScriptRootRebinding($Root) {
                 # variable:local:PSScriptRoot / variable:\script:PSScriptRoot: the drive takes its own scope qualifier.
                 # './PSScriptRoot', '.\PSScriptRoot' and '\\PSScriptRoot' name it too (Get-ProviderLeaf).
                 $rest = Get-ProviderLeaf $Matches[1]
-                if ($rest -eq '' -or $rest -match '[$(]' -or 'PSScriptRoot' -like $rest) { return 'the variable: drive' }
+                if (Test-VariableTailReachesRoot $rest) { return 'the variable: drive' }
             }
         }
         elseif ($n -is [System.Management.Automation.Language.VariableExpressionAst]) {
-            if ($n.VariablePath.UserPath -match '^(?i:variable):(.*)$' -and ('PSScriptRoot' -like (Get-ProviderLeaf $Matches[1]))) { return 'the variable: drive' }
+            if ($n.VariablePath.UserPath -match '^(?i:variable):(.*)$' -and (Test-VariableTailReachesRoot (Get-ProviderLeaf $Matches[1]))) { return 'the variable: drive' }
         }
     }
     return ''

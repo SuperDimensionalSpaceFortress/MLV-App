@@ -778,7 +778,10 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         ("L1TypedOther", "    param([System.Diagnostics.EventLog]$local:other)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
         # r5 (Dot B8 = r4 adversary A3): a data section binds its variable to a command result, so the setter below it reaches a
         # FileInfo, not the hashtable assigned first.
-        ("L1DataStatement", "    $r = @{}\n    data r -SupportedCommand Get-Item { Get-Item -LiteralPath 'C:\\fixture\\target' }\n    $r.Attributes = 'Hidden'"),    ]
+        # r5 adversary pass 2 (A2): a trap that continues lets the setter run although the throwing construction never assigned $r,
+        # so the receiver is the caller's object, not the literal.
+        ("L1TrapConstruct", "    trap { continue }\n    $r = @{ x = $(throw 'bad') }\n    $r.Attributes = 'Hidden'"),
+        ("L1DataStatement","    $r = @{}\n    data r -SupportedCommand Get-Item { Get-Item -LiteralPath 'C:\\fixture\\target' }\n    $r.Attributes = 'Hidden'"),    ]
 
     # Adversary A8 (same class as A3): template shapes that name a parameter by alias or abbreviation.
     TEMPLATE_ALIASES = (
@@ -940,6 +943,12 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         "${function:Join-Pa*} = { 'C:\\fixture\\Dirty.psm1' }",
         "${alias:./Split-Pat[h]} = 'Redirect'",
         "${function:} = { 1 }",
+        # r5 adversary pass 2 (A1): '..' segments resolve to the same provider item, and a separator left inside the tail is a path
+        # the scan cannot read as one name.
+        "Set-Item -LiteralPath function:../Join-Path -Value { 'C:\\fixture\\Dirty.psm1' }",
+        "Set-Item -LiteralPath alias:../Join-Path -Value Redirect",
+        "${function:../Join-Path} = { 'C:\\fixture\\Dirty.psm1' }",
+        "Set-Item -LiteralPath function:Redirect/../Split-Path -Value { 'C:\\fixture' }",
     )
     # r4: a rename or move that touches the function: / alias: drive, or names an evaluated command, with an operand the scan cannot
     # reduce to a constant, could be installing a shadow: it fails closed, in a kind of its own.
@@ -1043,7 +1052,7 @@ class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
         self.assertEqual([f for f in self.of(self.l1, "L1IndexLocal") if f["rule"] == "R5"], [])
 
     def test_l1_a_variable_bound_by_foreach_out_variable_a_multi_target_assignment_ref_or_a_parameter_is_not_fresh(self) -> None:
-        for name in ("L1Foreach", "L1OutVariable", "L1MultiTarget", "L1Ref", "L1ParamAlso", "L1DataStatement"):
+        for name in ("L1Foreach", "L1OutVariable", "L1MultiTarget", "L1Ref", "L1ParamAlso", "L1DataStatement", "L1TrapConstruct"):
             found = self.of(self.l1, name)
             self.assertIn(("R5", "$r.Attributes"), self.unlisted(found), f"{name}\n" + describe(found))
 
@@ -1300,7 +1309,10 @@ class SplicedBodyScanPsScriptRootTests(unittest.TestCase):
         "PsrDriveReduced": "Set-Item -LiteralPath ('vari'+'able:PSScriptRoot') -Value 'C:\\dirty'\n",
         # r5 (Dot B8 = r4 adversary A3): a data section assigns its result to the named variable.
         "PsrDataStatement": "data PSScriptRoot { 'C:\\dirty' }\n",
-        "PsrDataStatementCommand": "data PSScriptRoot -SupportedCommand Get-Item { Get-Item -LiteralPath 'C:\\dirty' }\n",
+        "PsrDriveParent": "Set-Item -LiteralPath variable:../PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrDriveInnerParent": "Set-Item -LiteralPath variable:x/../PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrBracedParent": "${variable:../PSScriptRoot} = 'C:\\dirty'\n",
+        "PsrDataStatementCommand":"data PSScriptRoot -SupportedCommand Get-Item { Get-Item -LiteralPath 'C:\\dirty' }\n",
     }
     CONTROLS = {
         # No rebinding: the call still binds to Clean.psm1 by full path.
