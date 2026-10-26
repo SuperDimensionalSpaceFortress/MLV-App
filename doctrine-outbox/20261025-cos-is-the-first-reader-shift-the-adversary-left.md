@@ -23,7 +23,7 @@ Owner-requested, 2026-10-25. Proposed only: it grants no runtime authority, and 
 4. Each project counts its own lift from its own review evidence: escaped (its keys approved, then CoS blocked), factory-caught-first and CoS-read-first; an unclear CoS pass is unknown, with the unknown share beside every rate. Targets, not merge preconditions: first-round CoS blocked below 20 % over 24 h; CoS-read-first 0; CoS rounds per PR at most 1.3; the adversary line on 100 % of new PRs.
 5. Once the CoS structured verdict line exists, projects read the CoS verdict from it, not from prose.
 
-**Tools:** tools/coordination/quality_lift/adversary-pass-prompt.md (the template) and its README, in SuperDimensionalSpaceFortress/MLV-App at this entry's source commit. No meter ships until the CoS verdict line exists.
+**Tools:** tools/coordination/quality_lift/adversary-pass-prompt.md (the template) and its README, on master of SuperDimensionalSpaceFortress/MLV-App from PR #689 on (earlier commits carry a withdrawn README). No meter ships until the CoS verdict line exists.
 
 **Adoption check** for another project: name which of its evidence is a review approval, count the three over 7 days of its cos-feedback as a baseline, wire the pass into one producer path, re-count after 48 h. Reply ADOPT or DISTINGUISH in its own spec (R14.8).
 
