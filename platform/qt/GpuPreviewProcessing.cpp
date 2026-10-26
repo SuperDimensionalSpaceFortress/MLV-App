@@ -4331,7 +4331,9 @@ const char * gpuPreviewProcessingPointwiseFastRefusal(const GpuPreviewProcessing
     if ( !config.enabled ) return "config_disabled";
     if ( config.applyVignette ) return "vignette";
     if ( config.applyGradient || config.applyGradientContrast ) return "gradient";
-    if ( config.applyAgx ) return "agx";
+    /* AgX is admitted (CPU-LOOKASSIST-AGX-FASTPATH-1): both matrices are per
+     * pixel, and pointwiseFastPixel runs the reference's blocks verbatim. The
+     * gradient layer's own AgX copy stays in the reference loop with gradient. */
     if ( config.applyHueVs ) return "hue_vs";
     if ( config.applyLut ) return "lut";
     if ( config.gammaLut.size() < static_cast<int>(65536u * sizeof(uint16_t)) ) return "gamma_lut_missing";
@@ -4398,12 +4400,15 @@ struct PointwiseFastView
     bool gamutCompression;
     bool vibrance;
     bool saturation;
+    bool agx;
     int highestGreen;
     int highestGreenDiso;
     float vibranceValue;
     float saturationValue;
     float properWbMatrix[9];
     float rgbToY[3];
+    float agxForward[9];
+    float agxInverse[9];
 };
 
 /* Writable table pointers for the fill pass (never the thread_local itself:
@@ -4488,6 +4493,9 @@ void pointwiseFastPrepare(const GpuPreviewProcessingConfig & config,
     view->saturationValue = config.saturation;
     std::memcpy(view->properWbMatrix, config.properWbMatrix, sizeof(view->properWbMatrix));
     std::memcpy(view->rgbToY, config.rgbToY, sizeof(view->rgbToY));
+    view->agx = config.applyAgx;
+    std::memcpy(view->agxForward, config.agxForward, sizeof(view->agxForward));
+    std::memcpy(view->agxInverse, config.agxInverse, sizeof(view->agxInverse));
 }
 
 /* Entry `index` of every table, from the same calls applyPreviewProcessingPixel makes. */
@@ -4630,6 +4638,27 @@ inline void pointwiseFastPixel(const PointwiseFastView & v,
         std::memcpy(matrixApplied, wbApplied, sizeof(matrixApplied));
     }
 
+    if ( v.agx )
+    {
+        /* AgX forward, the reference's block verbatim (double accumulation in
+         * the same term order, float coeffs, clamp+truncate, renormalize). */
+        double av[3];
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            av[channel] = static_cast<double>(matrixApplied[channel]) * 65535.0;
+            if ( av[channel] < 0.0 ) av[channel] = 0.0;
+        }
+        const double a[3] = {
+            av[0] * v.agxForward[0] + av[1] * v.agxForward[1] + av[2] * v.agxForward[2],
+            av[0] * v.agxForward[3] + av[1] * v.agxForward[4] + av[2] * v.agxForward[5],
+            av[0] * v.agxForward[6] + av[1] * v.agxForward[7] + av[2] * v.agxForward[8] };
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const double clamped = a[channel] < 0.0 ? 0.0 : (a[channel] > 65535.0 ? 65535.0 : a[channel]);
+            matrixApplied[channel] = static_cast<float>(static_cast<uint16_t>(clamped)) / 65535.0f;
+        }
+    }
+
     uint16_t gammaOut[3];
     for (int channel = 0; channel < 3; ++channel)
     {
@@ -4695,6 +4724,23 @@ inline void pointwiseFastPixel(const PointwiseFastView & v,
     for (int channel = 0; channel < 3; ++channel)
     {
         outputPixel[channel] = v.tail[channel] ? v.tail[channel][gammaOut[channel]] : gammaOut[channel];
+    }
+
+    if ( v.agx )
+    {
+        /* AgX inverse on the tail's uint16 output, the reference's block verbatim. */
+        const double f0 = static_cast<double>(outputPixel[0]);
+        const double f1 = static_cast<double>(outputPixel[1]);
+        const double f2 = static_cast<double>(outputPixel[2]);
+        const double iv[3] = {
+            f0 * v.agxInverse[0] + f1 * v.agxInverse[1] + f2 * v.agxInverse[2],
+            f0 * v.agxInverse[3] + f1 * v.agxInverse[4] + f2 * v.agxInverse[5],
+            f0 * v.agxInverse[6] + f1 * v.agxInverse[7] + f2 * v.agxInverse[8] };
+        for (int channel = 0; channel < 3; ++channel)
+        {
+            const double clamped = iv[channel] < 0.0 ? 0.0 : (iv[channel] > 65535.0 ? 65535.0 : iv[channel]);
+            outputPixel[channel] = static_cast<uint16_t>(clamped);
+        }
     }
 }
 
