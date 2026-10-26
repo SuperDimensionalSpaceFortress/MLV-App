@@ -28,9 +28,9 @@ whose bus history cannot be read, or whose lock another run holds, is reported a
 it adds no history row, and the fleet table names it and leaves it out of the fleet totals. When a PR listing fails, the
 adoption count is unknown (null), never a partial sum.
 
-`corpus.jsonl` holds one row per blocked head and evidence basis (the declared review source and the row format,
-`evidence`). A head first written under weaker evidence gets a new row with `supersedes: true`, so read the last row
-per repo@head. Rows are never rewritten.
+`corpus.jsonl` holds the blocked heads with known evidence. When the last row of a head has another evidence basis (the
+exact declaration, `reviewBasis`, and the row format, `evidence`), a new row with `supersedes: true` is appended, so read
+the last row per repo@head. Rows are never rewritten. `-Since` must carry an offset or `Z`; a bare date is a usage error.
 
 ## What the meter reads from a CoS file
 

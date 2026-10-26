@@ -1084,6 +1084,62 @@ class MeterFixtureTests(unittest.TestCase):
             result, _ = self._measure_bus(bus, "p", cache=cache, expect=2, declared=self.NATIVE_KEYBOT)
             self.assertEqual(result["windows"][0]["statusUnknown"], 1, field)
 
+    # -- adversary pass r3 rerun on ffe9fd57
+
+    def test_closing_hashes_and_indented_blockers_open_the_section(self) -> None:  # A1
+        bodies = ["## Blockers ##\nB1 x.\n", "  ## Blockers\nB1 x.\n", "  Blockers: B1 x.\n", "   ### Blockers ###\n- B1 x.\n"]
+        commits, heads = [], []
+        for i, body in enumerate(bodies):
+            head = f"{i + 1:040x}"
+            heads.append(head)
+            commits.append((f"cos-feedback/p/pr-{i + 1}.md", f"# acme/widget #{i + 1} / {head}\n\n{body}", f"2026-10-21T10:0{i}:00+00:00", f"v{i}"))
+        _, got = self._blocked_heads(self._small_bus(commits), "p", heads)
+        self.assertEqual(sorted(got), sorted(heads), [(b, h in got) for b, h in zip(bodies, heads)])
+
+    def test_a_head_longer_than_40_hex_names_no_pass(self) -> None:  # A2
+        bus = self._small_bus([
+            ("cos-feedback/p/pr-7.md", f"# acme/widget #7 / {'a' * 41}\n\n## Blockers\nB1 x.\n", "2026-10-21T10:00:00+00:00", "41 hex"),
+            ("cos-feedback/p/pr-8.md", f"# acme/widget #8 / {H2}\n\n## Blockers\nB1 x.\n\n# acme/widget #8 / {'b' * 41}\n", "2026-10-21T10:01:00+00:00",
+             "a valid heading, then a 41-hex one"),
+        ])
+        result, got = self._blocked_heads(bus, "p", [H2, "a" * 40, "b" * 40])
+        self.assertEqual(got, [H2])
+        self.assertEqual((result["windows"][0]["passes"], result["windows"][0]["unparsed"]), (1, 1))
+
+    def test_cache_trust_flags_must_be_booleans(self) -> None:  # A3
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7")])
+        for flags in ({"native": True, "dismissals": 1}, {"native": True, "dismissals": "true"}, {"native": 1, "dismissals": True}):
+            cache = {f"acme/widget@{H1}": dict({"fetched": "2026-10-21T12:00:00Z", "prs": [7], "rows": []}, **flags)}
+            result, _ = self._measure_bus(bus, "p", cache=cache, declared=self.NATIVE_KEYBOT, expect=2)
+            self.assertEqual(result["windows"][0]["statusUnknown"], 1, flags)
+            self.assertTrue(any("malformed" in e for e in result["errors"]), (flags, result["errors"]))
+
+    def _corpus_runs(self, declarations: list[dict]) -> list[dict]:
+        bus = self._small_bus([("cos-feedback/p/pr-7.md", _section(7, H1, "B1 x."), "2026-10-21T10:00:00+00:00", "pr7")])
+        out = self._dir()
+        rows = [{"context": "review/a", "firstUtc": "2026-10-21T09:00:00Z", "state": "success", "successUtc": "2026-10-21T09:00:00Z", "failureUtc": None}]
+        cache = {f"acme/widget@{H1}": {"fetched": "2026-10-21T12:00:00Z", "native": True, "dismissals": True, "prs": [7], "rows": rows}}
+        (out / "status-cache.json").write_text(json.dumps(cache), encoding="utf-8")
+        for declared in declarations:
+            proc = self._run("-Bus", str(bus), "-Project", "p", "-Since", "2026-10-01T00:00:00Z", "-OutDir", str(out), "-NoFetch",
+                             "-NoStatuses", "-ReviewSources", str(self._sources({"p": declared})))
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return self._corpus(out)
+
+    def test_the_last_corpus_row_decides_whether_a_head_is_current(self) -> None:  # A4
+        statuses = {"statusContexts": ["review/*"]}
+        rows = self._corpus_runs([statuses, self.NATIVE_KEYBOT, statuses])
+        self.assertEqual([r["reviewApprovedBeforeCos"] for r in rows], [["review/a"], [], ["review/a"]])
+
+    def test_declarations_that_print_alike_are_distinct_corpus_bases(self) -> None:  # A5
+        rows = self._corpus_runs([{"statusContexts": ["review/a, review/b"]}, {"statusContexts": ["review/a", "review/b"]}])
+        self.assertEqual([r["reviewApprovedBeforeCos"] for r in rows], [[], ["review/a"]])
+
+    def test_a_since_without_an_offset_is_a_usage_error(self) -> None:  # A6
+        for since in ("10/21/2026", "2026-10-21", "2026-10-21T00:00:00"):
+            proc = self._run("-Bus", str(self.bus), "-Project", "demo", "-Since", since, "-OutDir", str(self._dir()), "-NoStatuses", "-NoFetch")
+            self.assertEqual(proc.returncode, 4, (since, proc.stdout + proc.stderr))
+
     def test_the_meter_is_ascii_and_names_no_board_path(self) -> None:
         raw = METER.read_bytes()
         self.assertTrue(all(b < 128 for b in raw), "Measure-FleetQualityLift.ps1 must be ASCII-only")

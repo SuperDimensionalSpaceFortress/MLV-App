@@ -94,7 +94,7 @@ function Get-QlKey($p) { "$($p.repo)@$($p.head)" }
 #   blocker   the section's first content line starts B<n>, after optional quote, heading (###+), bullet (- * +), number
 #             (1. 1)) and emphasis (one to three * or _) marks. A line under the next level-1 or -2 heading is outside it.
 #   A head may be written in either case; it is kept in lowercase, as git and GitHub print it.
-$QlHeading = '(?m)^# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d+) / ([0-9a-fA-F]{40})'
+$QlHeading = '(?m)^# ([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+) #(\d+) / ([0-9a-fA-F]{40})(?![0-9A-Za-z])'   # exactly 40: 41 hex is no head
 $QlCorpusEvidence = 'r3'   # corpus row format: bump when a meter change can alter a row already written
 $QlBlockedLine = '^(?:>[ \t]*)?(?:#{3,6}[ \t]+)?(?:[-*+][ \t]+|\d+[.)][ \t]+)?(?:\*{1,3}|_{1,3})?B\d'
 
@@ -116,8 +116,9 @@ function Get-QlIdentity([string]$Txt) {
 
 # The first content line of the Blockers section ('' when there is none, or the section is empty).
 function Get-QlBlockerLine([string]$Sec) {
-    $h = [regex]::Match($Sec, '(?m)^#{2,3}[ \t]+(?:\*\*|__)?Blockers[ \t]*:?(?:\*\*|__)?[ \t]*:?[ \t]*(?:\([^)\r\n]*\)|\[[^\]\r\n]*\])?[ \t]*\r?$')
-    $l = [regex]::Match($Sec, '(?m)^(?:[-*+][ \t]+)?(?:\*\*|__)?Blockers(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*([^\r\n]*)')
+    # Up to three leading spaces, and closing #s on a heading, are markdown too.
+    $h = [regex]::Match($Sec, '(?m)^[ ]{0,3}#{2,3}[ \t]+(?:\*\*|__)?Blockers[ \t]*:?(?:\*\*|__)?[ \t]*:?[ \t]*(?:\([^)\r\n]*\)|\[[^\]\r\n]*\])?[ \t]*(?:#+[ \t]*)?\r?$')
+    $l = [regex]::Match($Sec, '(?m)^[ ]{0,3}(?:[-*+][ \t]+)?(?:\*\*|__)?Blockers(?:\*\*|__)?[ \t]*:(?:\*\*|__)?[ \t]*([^\r\n]*)')
     if (-not $h.Success -and -not $l.Success) { return '' }
     if ($l.Success -and (-not $h.Success -or $l.Index -lt $h.Index)) {
         if ($l.Groups[1].Value.Trim()) { return $l.Groups[1].Value.Trim() }
@@ -211,6 +212,13 @@ function Read-QlReviewSources([string]$Path) {
     $map
 }
 
+# The declaration exactly, as compact JSON: the corpus basis. Format-QlSource is for reading and can print two different
+# declarations alike (a pattern may hold a comma).
+function Format-QlBasis($Decl) {
+    if (-not $Decl) { return 'undeclared' }
+    [ordered]@{ statusContexts = @($Decl.statusContexts); nativeReviews = [bool]$Decl.nativeReviews; reviewAuthors = @($Decl.reviewAuthors) } | ConvertTo-Json -Compress
+}
+
 function Format-QlSource($Decl) {
     if (-not $Decl) { return 'undeclared' }
     $parts = @()
@@ -228,6 +236,8 @@ function Test-QlCacheEntry($e) {
         if ($null -eq $e -or $null -eq $e.fetched) { return $false }
         $null = ConvertTo-QlUtc $e.fetched
         if ($e.rows -isnot [array]) { return $false }
+        # Trust flags are booleans: 1 or "true" would pass a loose -eq $true.
+        foreach ($flag in @($e.native, $e.dismissals)) { if ($null -ne $flag -and $flag -isnot [bool]) { return $false } }
         if ($e.native -eq $true -and ($e.prs -isnot [array] -or @($e.prs | Where-Object { $_ -isnot [long] -and $_ -isnot [int] }).Count)) { return $false }
         foreach ($r in $e.rows) {
             if ($null -eq $r -or $r -is [string] -or $r.context -isnot [string] -or -not $r.context) { return $false }
@@ -507,21 +517,24 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
     }
 
     # The corpus keeps one row per blocked repo@head and evidence basis whose evidence is KNOWN; an unknown head is written on
-    # a later run. The basis is the declared review source plus the row format (evidence = $QlCorpusEvidence): a head first
-    # written under weaker evidence (an older meter, or before its project declared review evidence) gets a new row with
-    # supersedes = true, and the LAST row per repo@head is the current one. Rows are never rewritten.
+    # a later run. The basis is the exact declaration (reviewBasis) plus the row format (evidence = $QlCorpusEvidence): when
+    # the LAST row of a repo@head has another basis (an older meter, an undeclared project, a changed declaration), a new row
+    # with supersedes = true is appended, so the last row per repo@head is always the current one. Rows are never rewritten.
     # successBeforeCos is raw (every status context that said success); reviewApprovedBeforeCos (declared status contexts)
     # and nativeApprovedBeforeCos (declared native reviewers) are the declared approvals only. A line that does not parse
     # (a torn append) is kept as it is and named.
     $corpusFile = Join-Path $Dir 'corpus.jsonl'
     $source = Format-QlSource $decl
+    $basis = Format-QlBasis $decl
     $known = @{}; $seen = @{}; $badLines = 0
     if (Test-Path -LiteralPath $corpusFile) {
         Get-Content -LiteralPath $corpusFile | Where-Object { $_.Trim() } | ForEach-Object {
             try {
                 $row = $_ | ConvertFrom-Json
-                $seen[(Get-QlKey $row)] = 1
-                if ($row.evidence -eq $QlCorpusEvidence -and $row.reviewSource -eq $source) { $known[(Get-QlKey $row)] = 1 }
+                $k = Get-QlKey $row
+                $seen[$k] = 1
+                # File order: a later row replaces the verdict of an earlier one.
+                $known[$k] = ($row.evidence -eq $QlCorpusEvidence -and $row.reviewBasis -is [string] -and $row.reviewBasis -ceq $basis)
             } catch { $badLines++ }
         }
     }
@@ -530,15 +543,15 @@ function Measure-QlProjectLocked([string]$Proj, [string]$Dir) {
     foreach ($b in ($heads | Where-Object blocked | Sort-Object utc)) {
         $k = Get-QlKey $b
         $e = Get-QlEvidence $cache $b $needNative
-        if ($known.ContainsKey($k) -or -not $e -or (Test-QlPriorUnknown @($e.rows) $b.utc $decl)) { continue }
+        if ($known[$k] -eq $true -or -not $e -or (Test-QlPriorUnknown @($e.rows) $b.utc $decl)) { continue }
         $okRows = @($e.rows | Where-Object { $null -ne $_ -and (Test-QlApprovedBefore $_ $b.utc) })
         $prior = @($okRows | Where-Object { Test-QlStatusRow $_ } | ForEach-Object context)
         if ($decl) {
             $approved = @($okRows | Where-Object { (Test-QlStatusRow $_) -and (Test-QlReviewRow $_ $decl) } | ForEach-Object context)
             $nativeApproved = @($okRows | Where-Object { -not (Test-QlStatusRow $_) -and (Test-QlReviewRow $_ $decl) } | ForEach-Object context)
         } else { $approved = 'unknown'; $nativeApproved = 'unknown' }
-        Add-QlJsonLine $corpusFile ([ordered]@{ addedUtc = $now.ToString('o'); cosUtc = $b.utc.ToString('o'); repo = $b.repo; pr = $b.pr; head = $b.head; blocker = $b.blocker; successBeforeCos = $prior; reviewApprovedBeforeCos = $approved; nativeApprovedBeforeCos = $nativeApproved; reviewSource = $source; evidence = $QlCorpusEvidence; supersedes = $seen.ContainsKey($k) } | ConvertTo-Json -Compress)
-        $known[$k] = 1; $seen[$k] = 1
+        Add-QlJsonLine $corpusFile ([ordered]@{ addedUtc = $now.ToString('o'); cosUtc = $b.utc.ToString('o'); repo = $b.repo; pr = $b.pr; head = $b.head; blocker = $b.blocker; successBeforeCos = $prior; reviewApprovedBeforeCos = $approved; nativeApprovedBeforeCos = $nativeApproved; reviewSource = $source; reviewBasis = $basis; evidence = $QlCorpusEvidence; supersedes = $seen.ContainsKey($k) } | ConvertTo-Json -Compress)
+        $known[$k] = $true; $seen[$k] = 1
         $newCorpus++
     }
 
@@ -572,6 +585,8 @@ if (-not (Test-Path -LiteralPath (Join-Path $Bus 'cos-feedback'))) { Write-Outpu
 git -C $Bus rev-parse --verify -q HEAD 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Output "BUS_UNREADABLE $Bus (not a git repository with a commit)"; exit 3 }
 if (-not $OutDir) { Write-Output "USAGE -OutDir is required (the folder the reports are written to)"; exit 4 }
+# An ISO time WITH an offset or Z: a bare date or local time would be read in the host's zone.
+if ($Since -notmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$') { Write-Output "USAGE -Since '$Since' is not an ISO time with an offset or Z"; exit 4 }
 try { $SinceUtc = ConvertTo-QlUtc $Since; $Since = $SinceUtc.ToString('o') } catch { Write-Output "USAGE -Since '$Since' is not an ISO time"; exit 4 }
 try { $ReviewDecl = Read-QlReviewSources $ReviewSources } catch { Write-Output "USAGE -ReviewSources is missing or malformed: $($_.Exception.Message)"; exit 4 }
 $SharedErrors = @()
