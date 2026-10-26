@@ -88,6 +88,14 @@
 #      An alias the scan cannot resolve (a target that is not a literal or that no command answers to, a splatted alias command,
 #      Import-Alias, an alias: drive use or path it does not model, a rename fed a source it cannot read in a file that uses the alias:
 #      drive, a function: drive body that is not a script block) makes every variable binding in the file unproven.
+#   5. (r11, Dot B11, r10 adversary A1/A2.) A member name built only from literals (.('GetVariableValue'), .('Session'+'State'),
+#      .$('PS'+'Variable')) is folded and judged as the literal name in route 2 (.InvokeCommand included), and a name built from
+#      literals that folds to PSDefaultParameterValues is a route 1 reference. A member name the scan cannot fold, on a receiver
+#      that may be the session ($PSCmdlet, $ExecutionContext, $Host, $MyInvocation, a variable bound from one, a type, a command
+#      result; $_ / $input / $args in a tree that names one), makes every binding it could reach unproven. An alias a -ModulePath
+#      module defines for a command the scan evaluates (Join-Path, Split-Path, New-Object, the extractor) makes every call in the
+#      importing source unproven. OPEN (successor ATTR3-SCAN-IMPORT-FOLLOW-1): the aliases of a module a source imports from
+#      OUTSIDE -ModulePath, or by a path the scan cannot read, are not followed.
 #
 # PROPERTY SETS IN BODIES (ATTR3-SCAN-COVERAGE-LIMITS-1 L1). `$receiver.Member = ...` is an R5 finding
 # (token = the target text), and in a spliced body each one carries an `origin` for the receiver:
@@ -1163,6 +1171,49 @@ function Test-VariableTailReaches([string]$Leaf, [string]$Name) {
     return ($Leaf -eq '' -or $Leaf -match '[$(\\/]' -or (Test-NameMatchesPattern $Name $Leaf))
 }
 
+function Get-MemberNameValue($Member) {
+    # The name a member access reads, or $null when the source text does not fix it. A quoted name is its parsed value; a name
+    # built only from literals (.('Get' + 'VariableValue'), .$('Session' + 'State')) is folded as an operand is (Get-ConstantString).
+    if ($Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { return [string]$Member.Value }
+    return (Get-ConstantString $Member)
+}
+
+# The engine-bound variables that are, or can hand back, the session itself ($PSCmdlet.SessionState, $ExecutionContext.SessionState,
+# $MyInvocation.MyCommand.Module.SessionState, $Host.Runspace.SessionStateProxy). The engine-bound inputs ($_, $PSItem, $input, $args)
+# carry whatever was handed in, so they count only in a tree that names a session root somewhere (`$PSCmdlet | % { $_.$m }`).
+$script:sessionRootVariables = @('PSCmdlet', 'ExecutionContext', 'Host', 'MyInvocation', 'this')
+$script:engineInputVariables = @('_', 'PSItem', 'input', 'args')
+
+function Test-MemberReceiverMayBeSession($Member, $Root) {
+    # r11: true when the receiver of a member access whose name the scan cannot fold may be (or reach) the session: it starts at a
+    # session root variable, a variable: path, a type, a command result or any other value that is not a plain variable, or a
+    # variable an assignment binds from a session root, a variable command (Get-Variable) or an engine type ([runspace],
+    # [powershell], System.Management.Automation.*). Only a plain variable none of whose assignments names one is not one
+    # (`$table = ... | ConvertFrom-Json; $table.venues.$name`).
+    $node = $Member.Expression
+    while ($true) {
+        if ($node -is [System.Management.Automation.Language.MemberExpressionAst]) { $node = $node.Expression; continue }
+        if ($node -is [System.Management.Automation.Language.IndexExpressionAst]) { $node = $node.Target; continue }
+        break
+    }
+    if ($node -isnot [System.Management.Automation.Language.VariableExpressionAst] -or $node.Splatted) { return $true }
+    $user = $node.VariablePath.UserPath
+    if ($user -match '^(?i:variable):') { return $true }
+    $name = (Get-VariableName $node).name
+    if ($script:sessionRootVariables -icontains $name) { return $true }
+    if ($script:engineInputVariables -icontains $name) {
+        return (@($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -and $script:sessionRootVariables -icontains (Get-VariableName $x).name }, $true)).Count -gt 0)
+    }
+    foreach ($assignment in @(Get-AssignmentsTo $Root $name)) {
+        $sessionUse = @($assignment.Right.FindAll({ param($x)
+            ($x -is [System.Management.Automation.Language.VariableExpressionAst] -and ($script:sessionRootVariables -icontains (Get-VariableName $x).name -or $x.VariablePath.UserPath -match '^(?i:variable):')) -or
+            ($x -is [System.Management.Automation.Language.TypeExpressionAst] -and $x.TypeName.FullName -match '(?i)runspace|powershell|SessionState|psvariable|Management\.Automation') -or
+            ($x -is [System.Management.Automation.Language.CommandAst] -and @(Get-ResolvedCommandNames $x | Where-Object { @('get-variable', 'gv') -contains $_ }).Count -gt 0) }, $true))
+        if ($sessionUse.Count -gt 0) { return $true }
+    }
+    return $false
+}
+
 function Get-VariableParameterSpellings([string]$CommandName) {
     # The names and aliases of every parameter ending in 'Variable' on the command as this session resolves it (Tee-Object
     # -Variable, Invoke-WebRequest -SessionVariable, the common -OutVariable ...), so a prefix is read against the command's OWN
@@ -1317,9 +1368,16 @@ function Get-VariableRouteBinding($Root, [string]$Name) {
         }
         elseif ($n -is [System.Management.Automation.Language.MemberExpressionAst]) {
             # r10 adversary A3: a quoted member name is read by its parsed value ("GetVariab`leValue" is GetVariableValue).
-            $memberName = if ($n.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { [string]$n.Member.Value } else { $n.Member.Extent.Text.Trim('''', '"') }
+            # r11 (Dot B11, r10 adversary A1): so is a member name built from literals (.('GetVariableValue'), .('Session'+'State')).
+            $memberName = Get-MemberNameValue $n.Member
+            if ($null -eq $memberName) {
+                # A member name the scan cannot fold may be any of them, on a receiver that may be the session itself.
+                if (Test-MemberReceiverMayBeSession $n $Root) { return "a member name the scan cannot read as a string constant ($($n.Member.Extent.Text)), on a receiver that may reach the session-state API" }
+                continue
+            }
             # r9 adversary A3: $PSCmdlet.GetVariableValue(<name>) hands back a variable's value (the defaults dictionary itself) by a name.
-            if (@('SessionState', 'SessionStateProxy', 'PSVariable', 'GetVariableValue') -icontains $memberName) { return "the session-state API (.$memberName)" }
+            # r11: .InvokeCommand runs a script or resolves a command in the caller's session (InvokeScript, GetCommand).
+            if (@('SessionState', 'SessionStateProxy', 'PSVariable', 'GetVariableValue', 'InvokeCommand') -icontains $memberName) { return "the session-state API (.$memberName)" }
         }
         elseif ($n -is [System.Management.Automation.Language.TypeExpressionAst] -or $n -is [System.Management.Automation.Language.TypeConstraintAst]) {
             if ($n.TypeName.FullName -match '(?i)(^|\.)(psvariable|SessionState|SessionStateProxy|PSVariableIntrinsics)$') { return "the session-state API ([$($n.TypeName.FullName)])" }
@@ -1335,7 +1393,20 @@ function Get-DefaultParameterValuesReference($Root) {
     # assignment: the dictionary is changed in place ([...] =, .Add(), a member set) and can be reached through a second variable.
     foreach ($n in @($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -or
                                                $x -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
-                                               $x -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true))) {
+                                               $x -is [System.Management.Automation.Language.ExpandableStringExpressionAst] -or
+                                               $x -is [System.Management.Automation.Language.BinaryExpressionAst] -or
+                                               $x -is [System.Management.Automation.Language.MemberExpressionAst] }, $true))) {
+        # r11 (Dot B11, r10 adversary A1): a name built from literals is read by the string it folds to ('PS'+'Default'+'Parameter'+'Values',
+        # 'PSDef'+'aultPara'+'meterValues'), whether it is an operand or a member name.
+        if ($n -is [System.Management.Automation.Language.BinaryExpressionAst]) {
+            $folded = Get-ConstantString $n
+            if ($null -ne $folded -and $folded -match '(?i)PSDefault|ParameterValues') { return [pscustomobject]@{ Ast = $n; Reason = "a name built from literals that folds to '$folded'" } }
+            continue
+        }
+        if ($n -is [System.Management.Automation.Language.MemberExpressionAst]) {
+            if ((Get-MemberNameValue $n.Member) -ieq 'PSDefaultParameterValues') { return [pscustomobject]@{ Ast = $n; Reason = 'a member named PSDefaultParameterValues' } }
+            continue
+        }
         if ($n -is [System.Management.Automation.Language.VariableExpressionAst]) {
             $user = $n.VariablePath.UserPath
             if ($user -match '^(?i:variable):(.*)$') {
@@ -1794,6 +1865,14 @@ function Get-SpliceCallSites([string]$Path) {
         if ($shadowText.Length -gt 160) { $shadowText = $shadowText.Substring(0, 160) }
         Add-SpliceFinding $source $shadow.Ast.Extent.StartLineNumber '' $shadowText (Get-ShadowReason $shadow.Kind ', so the module binding it computed cannot be trusted')
     }
+    # r11 (r10 adversary A2): an alias a -ModulePath module's top-level code defines (`Set-Alias Join-Path Redirect -Scope Global`)
+    # replaces, in the importing source, the command the scan evaluates (Join-Path for the binding, the extractor itself), so every
+    # call there binds the way the replacement says, not the way its text reads. The source's own aliases are the shadow rule above.
+    $importedReplacement = ''
+    foreach ($evaluated in @('Join-Path', 'Split-Path', 'New-Object', 'Get-AttrCudaEmbeddedFunctionSource')) {
+        $runsAs = @(Resolve-CommandNames $evaluated $script:importedAliases.map $script:importedAliases.wildcard | Where-Object { $_ -ne $evaluated.ToLowerInvariant() })
+        if ($runsAs.Count -gt 0) { $importedReplacement = "an alias a -ModulePath module defines makes $evaluated run as $($runsAs -join ', ')"; break }
+    }
     $rootRebinding = Get-PsScriptRootRebinding $ast
     $defaults = Get-DefaultParameterValuesReference $ast
     $defaultsReference = if ($null -ne $defaults) { $defaults.Reason } else { '' }
@@ -1843,6 +1922,10 @@ function Get-SpliceCallSites([string]$Path) {
         if ($callName.Substring($callName.LastIndexOf('\') + 1) -ine 'Get-AttrCudaEmbeddedFunctionSource') {
             # Reached through an alias the source defines: which extractor (and so which module) it runs is not what the text names.
             $bind = [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "the extractor is called through the alias '$callName' the source defines, so the extractor it runs is unproven" }
+        }
+        if ($importedReplacement) {
+            $prior = if ($bind.kind -eq 'unsupported') { "$($bind.reason); and " } else { '' }
+            $bind = [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "${prior}$importedReplacement, so the module this call reads is unproven" }
         }
         [pscustomobject]@{ source = $source; line = $call.Extent.StartLineNumber; text = $text; names = $names; qualifier = $qualifier; bind = $bind }
     }

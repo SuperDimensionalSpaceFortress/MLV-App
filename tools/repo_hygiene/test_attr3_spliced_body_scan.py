@@ -1838,6 +1838,158 @@ class SplicedBodyScanSourceAliasTests(unittest.TestCase):
         self.assertEqual(len(shadows), 1, describe(self.result["splicedViolations"]))
 
 
+@requires_pwsh
+@unittest.skipUnless(os.name == "nt", "the ATTR-3 host jobs and their helpers are Windows-only")
+class SplicedBodyScanConstantMemberTests(unittest.TestCase):
+    """r11 (Dot B11; r10 adversary A1): a member name built from literals (.('GetVariableValue'), .('Session'+'State'),
+    .$('Session'+'State')) is folded and judged as the literal name is, and a name built from literals that folds to
+    PSDefaultParameterValues is a defaults reference. A member name the scan cannot fold, on a receiver that may be the session
+    ($PSCmdlet, a copy of it, a type), makes every binding it could reach an unproven binding.
+
+    One scan covers every case, as in SplicedBodyScanUnprovenBindingTests: each generator case is its own file, each body its own function.
+    """
+
+    RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
+    PSR_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"
+    DEF_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}'"
+    CALLS = {
+        # Dot B11, verbatim.
+        "DotB11": ("[CmdletBinding()]param()\n$PSCmdlet.('GetVariableValue')(('PS'+'Default'+'Parameter'+'Values'))"
+                   "['Get-AttrCudaEmbeddedFunctionSource:ModulePath']='C:\\fixture\\Dirty.psm1'", DEF_CALL),
+        # r10 adversary A1, generator sibling, verbatim.
+        "AdvA1Generator": ("[CmdletBinding()]param(); $PSCmdlet.('GetVariable'+'Value')(('PSDef'+'aultPara'+'meterValues'))['*:ModulePath']='C:\\fixture\\Dirty.psm1'", DEF_CALL),
+        # The class: a folded route on the extractor input, a sub-expression name, .InvokeCommand, an unfoldable name on the session.
+        "FoldedRoute": ("[CmdletBinding()]param()\n$PSCmdlet.('Session'+'State').('PS'+'Variable').Set('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
+        "SubexprName": ("[CmdletBinding()]param()\n$PSCmdlet.$('Session'+'State').PSVariable.Set('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
+        "InvokeCommand": ("[CmdletBinding()]param()\n$PSCmdlet.('Invoke'+'Command').InvokeScript('Set-Variable -Name PSScriptRoot -Value C:\\dirty -Scope Script')", PSR_CALL),
+        "VariableName": ("[CmdletBinding()]param()\n$m = 'Session' + 'State'\n$p = 'PSVar' + 'iable'\n$PSCmdlet.$m.$p.Set('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
+        "CopiedRoot": ("[CmdletBinding()]param()\n$c = $PSCmdlet\n$m = 'Session' + 'State'\n$p = 'PSVar' + 'iable'\n$c.$m.$p.Set('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
+        "TypeRoot": ("$m = 'Session' + 'StateProxy'\n[runspace]::DefaultRunspace.$m.SetVariable('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
+        "PipelineRoot": ("[CmdletBinding()]param()\n$m = 'Session' + 'State'\n$p = 'PSVar' + 'iable'\n$PSCmdlet | ForEach-Object {{ $_.$m.$p.Set('PSScriptRoot', 'C:\\dirty') }}", PSR_CALL),
+        "DefaultsMember": ("$h = Get-Thing\n$h.('PSDefault' + 'ParameterValues')['*:ModulePath'] = '{dirty}'", DEF_CALL),
+    }
+    # Not unproven: a computed member of parsed data (the real playback-attr-3-cuda-job.ps1 shape), a folded name that is not a route.
+    CALL_CONTROLS = {
+        "CtlDataMember": ("$table = ConvertFrom-Json '{{\"venues\":{{\"a\":1}}}}'\n$venue = 'a'\n$entry = $table.venues.$venue", PSR_CALL, "Clean.psm1"),
+        "CtlFoldedOther": ("$o = @{{ a = 1 }}\n$v = $o.('a' + '')", PSR_CALL, "Clean.psm1"),
+        # The real playback-attr-3-cuda-job.ps1 template shape: a computed member of a pipeline item in a tree with no session root.
+        "CtlPipelineData": ("$rows = @(@{{ a_ms = 1 }})\n$name = 'a'\n$v = @($rows | ForEach-Object {{ [double]$_.$($name + '_ms') }})", PSR_CALL, "Clean.psm1"),
+    }
+    BODIES = {
+        # r10 adversary A1, receiver, verbatim.
+        "AdvA1Receiver": " [CmdletBinding()]param($Target)\n $r=@{}\n $PSCmdlet.('Session'+'State').('PS'+'Variable').Set('r',$Target)\n $r.Attributes=1",
+        "BodyUnfoldable": "    param($Target)\n    $r = @{}\n    $m = 'Session' + 'State'\n    $p = 'PSVar' + 'iable'\n    $PSCmdlet.$m.$p.Set('r', $Target)\n    $r.Attributes = 1",
+    }
+    BODY_CONTROLS = {
+        "BodyCtlDataMember": "    $r = @{}\n    $k = 'a'\n    $r.a = $r.$k",
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-member-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        d = _long_path(Path(cls._tmp.name))
+        dirty = d / "Dirty.psm1"
+        names = list(cls.CALLS) + list(cls.CALL_CONTROLS)
+        clean = "".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names)
+        (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n" + clean, encoding="utf-8")
+        (d / "Clean.psm1").write_text(clean, encoding="utf-8")
+        dirty.write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
+        sources = []
+        cases = dict(cls.CALLS)
+        cases.update({n: (pre, call) for n, (pre, call, _) in cls.CALL_CONTROLS.items()})
+        for name, (pre, call) in cases.items():
+            generator = d / f"gen-{name}.ps1"
+            generator.write_text(pre.format(dirty=dirty, dir=d) + "\n$e = " + call.format(name=name) + "\n", encoding="utf-8")
+            sources.append(generator)
+        bodies = {**cls.BODIES, **cls.BODY_CONTROLS}
+        (d / "Body.psm1").write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in bodies.items()), encoding="utf-8")
+        body_gen = d / "gen-body.ps1"
+        body_gen.write_text("$e = Get-AttrCudaEmbeddedFunctionSource -Name @(" + ", ".join(f"'{n}'" for n in bodies)
+                            + ") -ModulePath (Join-Path $PSScriptRoot 'Body.psm1')\n", encoding="utf-8")
+        sources.append(body_gen)
+        modules = [d / "Extractor.psm1", d / "Clean.psm1", dirty, d / "Body.psm1"]
+        cls.result = run_scan(modules=modules, splice_sources=sources)
+
+    def call_findings(self, name: str) -> list[dict]:
+        return [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and f"'{name}'" in f["text"]]
+
+    def bound(self, name: str) -> list[str]:
+        return sorted(s["module"].rsplit("/", 1)[-1] for s in self.result["spliced"] if s["name"] == name)
+
+    def test_r11_a_member_name_built_from_literals_or_unfoldable_on_the_session_is_an_unproven_binding(self) -> None:
+        for name in self.CALLS:
+            with self.subTest(name=name):
+                found = self.call_findings(name)
+                self.assertEqual([f["token"] for f in found], ["unproven-binding"], f"{name}\n" + describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [], f"{name}: a module was scanned in place of the one runtime reads")
+
+    def test_r11_a_computed_member_of_plain_data_leaves_the_call_bound(self) -> None:
+        for name, (_, _, module) in self.CALL_CONTROLS.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.call_findings(name), [], describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [module])
+
+    def test_r11_a_receiver_a_folded_or_unfoldable_session_route_rebinds_is_an_unproven_binding(self) -> None:
+        for name in self.BODIES:
+            with self.subTest(name=name):
+                found = [f for f in self.result["splicedViolations"] if f["function"] == name]
+                self.assertTrue([f for f in found if f["rule"] == "unproven-binding" and f["token"] == "unproven-binding"], describe(found))
+                setters = [f for f in found if f["rule"] == "R5" and f["token"] == "$r.Attributes"]
+                self.assertEqual(len(setters), 1, describe(found))
+                self.assertIn("unproven-binding", setters[0]["origin"].split(";"), describe(setters))
+                self.assertIn(("R5", "$r.Attributes"), SplicedBodyScanCoverageLimitTests.unlisted(found), f"{name}: the policy dropped the setter")
+
+    def test_r11_a_receiver_with_a_computed_member_of_its_own_literal_stays_a_fresh_literal(self) -> None:
+        found = [f for f in self.result["splicedViolations"] if f["function"] == "BodyCtlDataMember"]
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+        self.assertEqual([f for f in found if f["rule"] == "unproven-binding"], [], describe(found))
+
+
+@requires_pwsh
+@unittest.skipUnless(os.name == "nt", "the ATTR-3 host jobs and their helpers are Windows-only")
+class SplicedBodyScanImportedAliasTests(unittest.TestCase):
+    """r11 (r10 adversary A2): an alias a -ModulePath module's top-level code defines for a command the scan evaluates (Join-Path,
+    the extractor itself) replaces that command in the importing source, so the call's binding is unproven. Each case is its own
+    scan: the alias is global, so it reaches every source in the scan. (An alias of a command the scan does not evaluate is the
+    AliasFromModule / CtlAlias* control in SplicedBodyScanSourceAliasTests.)
+    """
+
+    RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-imported-alias-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        d = _long_path(Path(cls._tmp.name))
+        (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n", encoding="utf-8")
+        (d / "Clean.psm1").write_text("function Probe {\n Get-Date\n}\n", encoding="utf-8")
+        (d / "Dirty.psm1").write_text("function Probe {\n" + cls.RAW_WRITE + "\n}\n", encoding="utf-8")
+        # r10 adversary A2, verbatim (Aliases.psm1 and gen.ps1; the fixture directory stands for C:\fixture).
+        (d / "Aliases.psm1").write_text(f"function Redirect {{\n param($Path,$ChildPath)\n '{d / 'Dirty.psm1'}'\n}}\n"
+                                        "Set-Alias Join-Path Redirect -Scope Global\nExport-ModuleMember -Function Redirect\n", encoding="utf-8")
+        (d / "gen.ps1").write_text(f"Import-Module '{d / 'Aliases.psm1'}'\n"
+                                   "Get-AttrCudaEmbeddedFunctionSource -Name 'Probe' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n", encoding="utf-8")
+        cls.join_path = run_scan(modules=[d / "Extractor.psm1", d / "Aliases.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen.ps1"])
+        # The A2 sibling: an imported alias replacing the extractor itself, on a call that names no -ModulePath.
+        (d / "ExtractorAlias.psm1").write_text("function Redirect2 {\n param($Name,$ModulePath)\n 'x'\n}\n"
+                                               "Set-Alias Get-AttrCudaEmbeddedFunctionSource Redirect2 -Scope Global\n", encoding="utf-8")
+        (d / "gen-default.ps1").write_text(f"Import-Module '{d / 'ExtractorAlias.psm1'}'\nGet-AttrCudaEmbeddedFunctionSource -Name 'Probe'\n", encoding="utf-8")
+        cls.extractor = run_scan(modules=[d / "Extractor.psm1", d / "ExtractorAlias.psm1", d / "Clean.psm1"], splice_sources=[d / "gen-default.ps1"])
+
+    def check(self, result: dict) -> None:
+        calls = [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and "'Probe'" in f["text"]]
+        self.assertEqual([f["token"] for f in calls], ["unproven-binding"], describe(result["splicedViolations"]))
+        self.assertIn("alias", calls[0]["reason"])
+        self.assertEqual([s for s in result["spliced"] if s["name"] == "Probe"], [], "a module was scanned in place of the one runtime reads")
+
+    def test_r11_an_imported_alias_of_join_path_makes_the_binding_unproven(self) -> None:
+        self.check(self.join_path)
+
+    def test_r11_an_imported_alias_of_the_extractor_makes_the_binding_unproven(self) -> None:
+        self.check(self.extractor)
+
+
 class SpliceInventoryCallShapeTests(unittest.TestCase):
     """The census of splice sources, and the bound on the subprocesses, in a throwaway tree (never the real one)."""
 
