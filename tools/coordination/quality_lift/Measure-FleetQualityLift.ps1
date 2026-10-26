@@ -127,8 +127,9 @@ $QlRx = @{
     # A B<n> item heading inside the section does not end it.
     leadB         = New-QlRx '^B[0-9]'
     # A blocker line's first token, after its leading marks: B<n> (B1, B1:, B1 --, B1 -, **B1**, B1 / P1) or the SHARED
-    # BLOCKER label. Case-sensitive: Blocked is not B1, and B12x is no item. Anchored, so each line is read once.
-    blockerLead   = New-QlRx '^(?:B[0-9]+|SHARED[ \t]+BLOCKER)(?![0-9A-Za-z])'
+    # BLOCKER label. Case-sensitive: Blocked is not B1, and B12x is no item. Anchored, so each line is read once. The token
+    # ends as a closed word does (adversary r5b A2 class): B1_x and B1 plus an accented letter are no item, B1_: is one.
+    blockerLead   = New-QlRx '^(?:B[0-9]+|SHARED[ \t]+BLOCKER)(?!_*[\p{L}\p{M}\p{Nd}])'
     # A section that opens with None or No (None., (none), No new ...) and also has a B<n> line is mixed: unknown, not blocked.
     noneOpener    = New-QlRx '^\(?(?i:none|no)\b'
     # GitHub and git output.
@@ -239,11 +240,35 @@ function Get-QlBlockerSection([string]$Sec) {
     $null
 }
 
+# A config file's JSON text, parsed, after every object in it is checked for a repeated key: ConvertFrom-Json keeps the last
+# of two equal keys (in any case) without a word, so a repeated "clean" or "projects" would silently replace the first.
+function ConvertFrom-QlConfigJson([string]$Path) {
+    $raw = Get-Content -LiteralPath $Path -Raw
+    $doc = [Text.Json.JsonDocument]::Parse($raw)
+    try {
+        $todo = [Collections.Generic.Stack[Text.Json.JsonElement]]::new()
+        $todo.Push($doc.RootElement)
+        while ($todo.Count) {
+            $e = $todo.Pop()
+            if ($e.ValueKind -eq [Text.Json.JsonValueKind]::Object) {
+                $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                foreach ($p in $e.EnumerateObject()) {
+                    if (-not $seen.Add($p.Name)) { throw "duplicate key '$($p.Name)'" }
+                    $todo.Push($p.Value)
+                }
+            } elseif ($e.ValueKind -eq [Text.Json.JsonValueKind]::Array) {
+                foreach ($x in $e.EnumerateArray()) { $todo.Push($x) }
+            }
+        }
+    } finally { $doc.Dispose() }
+    $raw | ConvertFrom-Json
+}
+
 # blocker-classes.json -> @{ clean = the exact whole-section texts (ordinal set); closed = a pattern for the closedWords }.
 # Throws on anything malformed: a guessed whitelist would turn unknown text into clean.
 function Read-QlBlockerClasses([string]$Path) {
     if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "not found: '$Path'" }
-    $j = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $j = ConvertFrom-QlConfigJson $Path
     if ($null -eq $j -or "$($j.schema)" -cne 'fleet/quality-lift/blocker-classes/v1') { throw "schema is not fleet/quality-lift/blocker-classes/v1" }
     if ($j.clean -isnot [array] -or -not $j.clean.Count) { throw "'clean' must be a non-empty array" }
     $clean = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -254,8 +279,12 @@ function Read-QlBlockerClasses([string]$Path) {
     if ($j.closedWords -isnot [array] -or -not $j.closedWords.Count -or @($j.closedWords | Where-Object { $_ -isnot [string] -or $_ -notmatch '^[A-Za-z][A-Za-z-]*$' }).Count) {
         throw "'closedWords' must be a non-empty array of words"
     }
-    # A whole word: source-fixed says fixed, source-unfixed does not.
-    @{ clean = $clean; closed = (New-QlRx "(?i)(?<![A-Za-z0-9])(?:$(($j.closedWords | ForEach-Object { [regex]::Escape($_) }) -join '|'))(?![A-Za-z0-9])") }
+    # A whole word (adversary r5b A2): source-fixed says fixed, source-unfixed and fixed plus an accented letter do not. A word character is any
+    # letter, mark or digit. _ inside a word joins it (fixed_under, re_fixed are other words); a run of _ at a word's edge is
+    # a markdown emphasis mark, so _fixed_ and __fixed__ say fixed. The (?=\p{L}) gate lets the lookbehind scan back over a
+    # run of _ only from the letter after it, so the scan stays linear on a long run.
+    $w = '[\p{L}\p{M}\p{Nd}]'
+    @{ clean = $clean; closed = (New-QlRx "(?i)(?=\p{L})(?<!${w}_*)(?:$(($j.closedWords | ForEach-Object { [regex]::Escape($_) }) -join '|'))(?!_*$w)") }
 }
 
 # What the CoS said about blockers, read conservatively (B7), as @{ cls = blocked | clean | unknown; text = the line that
@@ -348,7 +377,7 @@ function Get-QlRepos([string]$Proj) {
 # exactly the review provenance this file exists to keep honest.
 function Read-QlReviewSources([string]$Path) {
     if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "not found: '$Path'" }
-    $j = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    $j = ConvertFrom-QlConfigJson $Path
     if ($null -eq $j -or $null -eq $j.projects -or $j.projects -isnot [Management.Automation.PSCustomObject]) { throw "no 'projects' object" }
     $map = @{}
     foreach ($p in $j.projects.PSObject.Properties) {

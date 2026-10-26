@@ -465,6 +465,15 @@ class MeterFixtureTests(unittest.TestCase):
             proc = self._run("-Bus", str(self.bus), "-Project", "demo", "-OutDir", str(out), "-NoStatuses", "-NoFetch",
                              "-ReviewSources", str(self._sources(projects)))
             self.assertEqual(proc.returncode, 4, (projects, proc.stdout + proc.stderr))
+        # adversary r5b A1 sibling: ConvertFrom-Json keeps the last of two equal keys, so a duplicate is refused before it.
+        for raw in ('{"schema": "fleet/quality-lift/review-sources/v1", "projects": {"demo": {"statusContexts": ["review/*"]}},'
+                    ' "projects": {"demo": {"statusContexts": ["*"]}}}',
+                    '{"projects": {"demo": {"statusContexts": ["review/*"], "StatusContexts": ["*"]}}}'):
+            path = self._dir() / "review-sources.json"
+            path.write_text(raw, encoding="utf-8")
+            proc = self._run("-Bus", str(self.bus), "-Project", "demo", "-OutDir", str(out), "-NoStatuses", "-NoFetch", "-ReviewSources", str(path))
+            self.assertEqual(proc.returncode, 4, (raw, proc.stdout + proc.stderr))
+            self.assertIn("duplicate key", proc.stdout)
         self.assertFalse((out / "quality-lift.json").exists())
 
     # -- adversary pass r2 on f6b187b0
@@ -1315,6 +1324,21 @@ class MeterFixtureTests(unittest.TestCase):
             ("## Blockers\nNone demonstrated. The gate check fails closed when the job is missing.\n", "unknown"),  # r4: clean
             ("## Blockers\nB1 closed: a.ps1:3 now checks.\n", "blocked"),  # r4: clean; 'closed' is not one of the five fixed words
             ("## Blockers\nB1 fixed: a.ps1:3 now checks.\n", "unknown"),
+            # adversary r5b A2: a closed word is a whole word. _ inside a word joins it (fixed_under, re_fixed are other
+            # words), and _ at a word's edge is a markdown emphasis mark (_fixed_, __fixed__ say fixed).
+            ("## Blockers\nB1 fixed_under review: data loss remains.\n", "blocked"),
+            ("## Blockers\nB1 un_fixed_ yet: data loss remains.\n", "blocked"),
+            ("## Blockers\nB1 re_fixed: data loss remains.\n", "blocked"),
+            ("## Blockers\nB1 fixedé: data loss remains.\n", "blocked"),
+            ("## Blockers\nB1 _fixed_: a.ps1:3 now checks.\n", "unknown"),
+            ("## Blockers\nB1 __fixed__ in a.ps1:3.\n", "unknown"),
+            ("## Blockers\nB1 is fixed_.\n", "unknown"),
+            ("## Blockers\nB1 unfixed: a.ps1:3 still races.\n", "blocked"),
+            ("## Blockers\nB1 is source-fixed.\n", "unknown"),
+            # The B<n> lead ends the same way: B1_x and B1é are other tokens, _B1_: is emphasis around B1.
+            ("## Blockers\nB1_x still races.\n", "unknown"),
+            ("## Blockers\nB1é still races.\n", "unknown"),
+            ("## Blockers\n_B1_: a.ps1:3 still races.\n", "blocked"),
             ("## Blockers\nNone newly demonstrated. Prior B1/B2 are source-addressed.\nB1: a.ps1:3 now checks the lock.\nB2: b.ps1:9 adds a regression; old failures remain history.\n", "unknown"),  # r4: clean; mixed
             ("Blockers: None established; no SHARED BLOCKER.\n", "clean"),
             ("## Blockers\nNone.\nNone.\n", "unknown"),  # two sentences, though both are on the whitelist
@@ -1408,7 +1432,11 @@ class MeterFixtureTests(unittest.TestCase):
     def test_a_missing_or_malformed_blocker_classes_file_is_a_usage_error(self) -> None:  # B7
         for content in (None, "{", json.dumps({"schema": "fleet/quality-lift/blocker-classes/v1", "clean": [], "closedWords": ["fixed"]}),
                         json.dumps({"schema": "fleet/quality-lift/blocker-classes/v1", "clean": [{"text": "None."}], "closedWords": [""]}),
-                        json.dumps({"schema": "x", "clean": [{"text": "None."}], "closedWords": ["fixed"]})):
+                        json.dumps({"schema": "x", "clean": [{"text": "None."}], "closedWords": ["fixed"]}),
+                        # adversary r5b A1: a duplicate key (ConvertFrom-Json keeps the last one, here a widened whitelist).
+                        '{"schema": "fleet/quality-lift/blocker-classes/v1", "clean": [{"text": "None."}],'
+                        ' "clean": [{"text": "No new blockers were found."}], "closedWords": ["fixed"]}',
+                        '{"schema": "fleet/quality-lift/blocker-classes/v1", "clean": [{"text": "None.", "Text": "x"}], "closedWords": ["fixed"]}'):
             where = self._dir()
             shutil.copy(METER, where / METER.name)
             shutil.copy(HERE / "review-sources.json", where / "review-sources.json")
@@ -1536,6 +1564,11 @@ class MeterFixtureTests(unittest.TestCase):
             ("None then spaces", "class", sec("None" + " " * 100000 + "."), "unknown"),
             ("trailing marks after None.", "class", sec("None." + "*_" * 50000), "clean"),
             ("many B lines", "class", sec("\n".join(["B1 fixed x."] * 1000)), "unknown"),
+            # adversary r5b A2: the closed-word lookarounds scan a run of _ at a word's edge, once per run.
+            ("B line with a long _ run", "class", sec("B1 " + "_" * 200000 + "x"), "blocked"),
+            ("B line with _ runs between words", "class", sec("B1 " + "a_" * 100000 + "fixed"), "blocked"),
+            ("B line with long _ runs around fixed", "class", sec("B1 " + "_" * 100000 + "fixed" + "_" * 100000), "unknown"),
+            ("B line with many fixed_ words", "class", sec("B1 " + "fixed_x " * 20000), "blocked"),
             # adversary r4 rerun A6 (minor): a non-ASCII digit names no pass (it used to throw and unmeasure the project).
             ("PR number in Arabic-Indic digits", "identity", f"# a/b #١ / {H1}\n", ""),
             ("front matter PR in Arabic-Indic digits", "identity", f"schema: cos-feedback.v1\nrepo: a/b\npr: ١\nhead: {H1}\n\n", ""),

@@ -47,7 +47,9 @@ the last row per repo@head. Rows are never rewritten. `-Since` must carry an off
   patch opened a new corner (`No blockers have been reviewed.` read clean), so the rules are now:
   - **blocked:** a line's first token is `B<n>` or the `SHARED BLOCKER` label (`- **B1 / P1:**`, `B2 -- x`, `B2
     validation mismatch remains.`, `SHARED BLOCKER (Dot): x`), that line does not say one of the `closedWords` in
-    `blocker-classes.json` (`source-addressed`, `remedied`, `resolved`, `verified`, `fixed`, as whole words), and the
+    `blocker-classes.json` (`source-addressed`, `remedied`, `resolved`, `verified`, `fixed`, as whole words: a letter,
+    mark, digit or word-internal `_` joins a word, so `unfixed`, `fixed_under` and `re_fixed` do not say fixed, while
+    `source-fixed`, `_fixed_` and `__fixed__` (a `_` run at a word's edge is emphasis) do), and the
     section does not open with `None` or `No` (a B<n> line under such an opener is mixed, so unknown).
   - **clean:** the whole section is one content line that, with trailing `*`/`_` also stripped, is exactly one of the
     `clean` texts in `blocker-classes.json` (`None.`, `None demonstrated.`, `(none)`, `None demonstrated. No SHARED
@@ -61,7 +63,8 @@ the last row per repo@head. Rows are never rewritten. `-Since` must carry an off
   - **Declared limits:** the unknown share is large by design (most CoS sections are prose). A `B<n>` line that only says
     `closed` (`B1 closed: x`) reads blocked, because the corpus uses `closed` mostly in real blockers (`fail-closed`,
     `CLOSED:`); a real `B<n>` line that also says `fixed` anywhere (`Keep fixed labels`) reads unknown.
-  - `blocker-classes.json` sits beside the meter; a missing or malformed one is a usage error (exit 4).
+  - `blocker-classes.json` sits beside the meter; a missing or malformed one (a repeated key included) is a usage error
+    (exit 4). `review-sources.json` refuses a repeated key the same way.
 - Bus and GitHub text is untrusted. Every pattern that reads it is linear and carries a 2 s match timeout. A timeout in a
   CoS file names the file and leaves the project not measured; in a PR body it leaves the adoption count unknown (null)
   with a named error. Neither stalls the run.
