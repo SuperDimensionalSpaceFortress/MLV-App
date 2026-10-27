@@ -3088,6 +3088,26 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertLessEqual(got["sec"], 6, f"the call (timeout 3 s) took {got['sec']} s: {got}")
         self.assertIn("could not be hashed", got["error"])
 
+    # adversary r2 A2: with no explicit bound the hash gets what is left of -TimeoutSec, and a 1 s floor ran a 1 s call to 2 s (850 ms manifest read + 900 ms hash, then STAGED). Now less than a whole second
+    # left is UNREACHABLE at once, so no call outlasts its own -TimeoutSec by more than the manifest read itself.
+    def test_artifact_preflight_adv_r2_a2_a_call_with_under_a_second_left_for_the_hash_ends_unreachable_not_over_its_timeout(self) -> None:
+        c = "3" * 40
+        self.stage(c, "tight")
+        manifest_probe = ("param($p) [Threading.Thread]::Sleep(850); ('a' * 64); 'C:" + c + "'; 'D:' + ('f' * 64); 'S:bool'; "
+                          "'A:packageZip=ok'; 'H:packageZip=' + ('1' * 64); 'A:exe=ok'; 'H:exe=' + ('2' * 64); 'A:dll=ok'; 'H:dll=' + ('3' * 64)")
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 1 -VerifyArtifacts "
+                  f"-ProbeScript {{ {manifest_probe} }} -ArtifactProbeScript {{ param($i) [Threading.Thread]::Sleep(900) }}\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; ms = [int]$sw.Elapsed.TotalMilliseconds; error = [string]$r.error }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["state"], "UNREACHABLE", got)
+        self.assertLess(got["ms"], 1500, f"the call (timeout 1 s) ran {got['ms']} ms: {got}")
+        self.assertIn("no time is left", got["error"])
+
     # adversary r1 A2: the post-claim guard runs between the grant and the claim keeper's start. A hash that outlasts ClaimTtlSec - ClaimRenewSec made every guard "lapse" the claim, release it and
     # ask again until the deadline. The runner has no seam that slows a real hash, so the budget's derivation is pinned in the source: set from the grant time, handed to the artifact read, cleared after.
     def test_artifact_preflight_adv_a2_the_post_claim_guard_hashes_inside_the_claim_guard_budget(self) -> None:
@@ -3098,8 +3118,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertLess(call, clear)
         self.assertLess(clear, text.index("if ($hit) {", grant))
         guard = text[text.index("function Get-InputContentRefusal"):text.index("function Stop-InputIsOutput")]
-        self.assertIn("-ArtifactTimeoutSec $artSec", guard)
+        # adversary r2 A1: the manifest read AND the hash come out of ONE share of the budget (a read of up to 30 s, the rest for the hash), and a share too small for both is a typed refusal
         self.assertIn("$script:claimGuardDeadlineUtc - [DateTime]::UtcNow", guard)
+        self.assertIn("-TimeoutSec $manifestSec -VerifyArtifacts -ArtifactTimeoutSec ($share - $manifestSec)", guard)
+        self.assertIn("$manifestSec = [int][Math]::Min(30, $share - 1)", guard)
+        self.assertIn("if ($share -lt 2) { return", guard)
+        self.assertNotIn("-TimeoutSec 30", guard)
         # and the pre-claim preflight, which holds no claim, asks for its own explicit bound
         self.assertIn("-VerifyArtifacts -ArtifactTimeoutSec 300 }", text)
 

@@ -534,14 +534,17 @@ function Get-InputContentRefusal {
             $sr = @(Get-LegSpecRefusal $g.path $g.backend)
             if ($sr[0]) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = [string]$sr[0]; why = [string]$sr[1] } }
         } elseif ($g.kind -ceq 'build') {
-            # adversary r1 A2: this guard runs between the claim grant and the keeper's start, so it must end inside $ClaimTtlSec less $ClaimRenewSec of the grant or the claim is let go and
-            # asked for again, for ever. The artifact hash gets an equal share of what is left of that budget (script:claimGuardDeadlineUtc, set by the grant loop; a pre-claim call has none);
-            # one that cannot finish in its share ends UNREACHABLE below -- a typed refusal, never a release-and-retry loop.
-            $artSec = 300
-            if ($null -ne $script:claimGuardDeadlineUtc) { $artSec = [int][Math]::Min(300, [Math]::Max(1, [Math]::Floor(($script:claimGuardDeadlineUtc - [DateTime]::UtcNow).TotalSeconds / [Math]::Max(1, $buildsLeft)))) }
-            $buildsLeft--
-            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec $artSec
+            # adversary r1 A2, r2 A1: this guard runs between the claim grant and the keeper's start, so it must end inside $ClaimTtlSec less $ClaimRenewSec of the grant or the claim is let go
+            # and asked for again, for ever. Each build gets an equal share of what is left of that budget (script:claimGuardDeadlineUtc, set by the grant loop; a pre-claim call has none, 300 s)
+            # and the manifest read AND the artifact hash both come out of that share: at most 30 s for the read, the rest for the hash. A share under 2 s cannot hold both and is a typed
+            # SHARE_UNREACHABLE refusal, as is a hash that does not finish in its part -- never a release-and-retry loop.
             $short = $g.commit.Substring(0, 12)
+            $share = 300
+            if ($null -ne $script:claimGuardDeadlineUtc) { $share = [int][Math]::Min(300, [Math]::Floor(($script:claimGuardDeadlineUtc - [DateTime]::UtcNow).TotalSeconds / [Math]::Max(1, $buildsLeft))) }
+            $buildsLeft--
+            if ($share -lt 2) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "no time is left in the claim guard (-ClaimTtlSec $ClaimTtlSec less -ClaimRenewSec $ClaimRenewSec) to read and hash the staged build for $short; no lease is opened" } }
+            $manifestSec = [int][Math]::Min(30, $share - 1)
+            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $manifestSec -VerifyArtifacts -ArtifactTimeoutSec ($share - $manifestSec)
             if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short could not be read after the claim wait at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no lease is opened" } }
             if ($st.state -cne 'STAGED' -and $st.state -cne 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short read as '$($st.state)' after the claim wait; only STAGED with the validated digest opens a lease" } }
             if ($st.state -ceq 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_NOT_STAGED'; why = "no staged build manifest for $short at $($st.path) any more; the runner stages and builds nothing" } }

@@ -682,8 +682,14 @@ function Get-VenueStagedBuildManifest {
                             if ($got -cne $i.sha) { 'MISMATCH:' + $i.label + ':' + $i.name + ':' + $got }
                         }
                     } })
-            $artSec = $(if ($ArtifactTimeoutSec -gt 0) { $ArtifactTimeoutSec } else { [int][Math]::Max(1, [Math]::Floor($TimeoutSec - $callClock.Elapsed.TotalSeconds)) })
-            $ar = Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec
+            # adversary r2 A2: with no explicit bound the hash gets whole seconds of what is LEFT of -TimeoutSec, and none when less than a second is left (a 1 s floor would run the call past its own bound)
+            $artSec = $ArtifactTimeoutSec
+            if ($artSec -le 0) {
+                $left = [Math]::Floor($TimeoutSec - $callClock.Elapsed.TotalSeconds)
+                if ($left -lt 1) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $TimeoutSec after the manifest read"; contentProblem = $null; artifactProblem = $null } }
+                $artSec = [int]$left
+            }
+            $ar =Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec
             if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null } }
             $lines = @($ar.value | ForEach-Object { [string]$_ })
             $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
