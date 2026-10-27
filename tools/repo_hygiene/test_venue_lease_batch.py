@@ -2998,10 +2998,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "exit1": (9, "OPEN_FAILED", ()),
             "nobatch": (10, "AGENT_NOT_BATCH_CAPABLE", ()),
             "gatewait": (2, "LEG_SPEC_IS_RUN_OUTPUT", ()),
-            "gatehold": (11, "OPEN_CANCEL_UNRECONCILED", ("-CancelReconcileSec", "3", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=60)))),
+            "gatehold": (11, "OPEN_CANCEL_UNRECONCILED", ("-CancelReconcileSec", "3", "-DeadlineUtc", "+60")),
         }
         for mode, (code, reason, extra) in cases.items():
             with self.subTest(open=mode):
+                # the deadline is placed when this subtest starts, not when the table was built (the subtests before it take a minute or more under load)
+                extra = tuple(utc_iso(datetime.now(timezone.utc) + timedelta(seconds=int(x[1:]))) if x.startswith("+") else x for x in extra)
                 self._alias_in_open_wait(mode, code, reason, extra)
 
     def _alias_in_open_wait(self, mode: str, code: int, reason: str, extra: tuple[str, ...]) -> None:
