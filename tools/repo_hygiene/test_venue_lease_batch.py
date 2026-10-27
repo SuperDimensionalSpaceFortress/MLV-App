@@ -3179,12 +3179,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # bounded by the lease's room less -LeaseMarginSec, the leg budget and 1 s, and a re-hash that cannot fit is refused typed while the leg budget is still left. The card's numbers
     # (cap 120, leg 60, margin 0, a 70 s hash) are scaled to cap 95 and a 40 s hash so the case stays near 30 s (-LegBudgetSec cannot go under 60). The hash is slow only once the
     # open was answered (the fake agent's state file exists), so the preflight and the claim guard stay fast.
-    def _post_open_hash_run(self, hash_sec: float, *extra: str, cap: str = "95", leg: str = "60", margin: str = "0", **env: str) -> tuple[subprocess.CompletedProcess, float]:
+    def _post_open_hash_run(self, hash_sec: float, *extra: str, cap: str = "95", leg: str = "60", margin: str = "0", items: list | None = None, **env: str) -> tuple[subprocess.CompletedProcess, float]:
         state = self.share / "fake-agent-state.json"
         self.assertFalse(state.exists())
         probe = self.case / "artifact-probe-post-open.ps1"
         probe.write_text("param($items)\n" + f"if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ [Threading.Thread]::Sleep({int(hash_sec * 1000)}) }}\n", encoding="utf-8")
-        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", cap, "-LegBudgetSec", leg, "-LeaseMarginSec", margin,
+        r = self.run_plan(self.write_plan(items or [self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", cap, "-LegBudgetSec", leg, "-LeaseMarginSec", margin,
                           "-ArtifactProbeScript", str(probe), *extra, **env)
         ticks = {}
         for line in self.events_raw():
@@ -3377,6 +3377,27 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("LEG_PLAN_REFUSED reason=LEG_BUDGET_EXCEEDS_LEASE ", r.stderr)
         self.assertEqual(self.leg_calls(), [])
         self.assertLess(held, 4.5, f"the lease was held {held:.1f} s: the 5 s spec read ran on a lease with no room for it")
+
+    def test_artifact_preflight_r4_adv_p2_a1_no_room_bounds_a_slow_location_read_to_2s_not_10s(self) -> None:
+        # r4 adversary pass 2 A1 (on 336d318d): with about 1 s of room the location checks were given 10 s, so a 5 s identity read ran to its end before the refusal. They get 2 s
+        # now; one still running then fails closed (no more writes into -RunDir), typed with the no-room reason.
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:identity=5", cap="62")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_BUDGET_EXCEEDS_LEASE", r.stderr)
+        self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertLess(held, 4.5, f"the lease was held {held:.1f} s: the 5 s identity read ran on a lease with no room for it")
+
+    def test_artifact_preflight_r4_adv_p2_a2_no_spec_read_starts_once_an_earlier_read_used_the_room(self) -> None:
+        # r4 adversary pass 2 A2 (on 336d318d): cap 66 / leg 60 / margin 0 leaves about 5 s; two leg specs whose reads take 3 s each. The no-room check ran once, before the first
+        # read, so the second started with under 2 s left. It is checked before each read now: the first read runs, the second is refused before it starts.
+        items = [self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "A", self.commit_a)]
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:spec=3", cap="66", items=items)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_BUDGET_EXCEEDS_LEASE item=2 ", r.stderr)
+        self.assertNotIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertLess(held, 5.5, f"the lease was held {held:.1f} s: a second 3 s spec read started with under 2 s of room")
 
     def test_artifact_preflight_r4_item2_a_delayed_read_in_the_claim_guard_ends_typed_inside_the_claim_budget(self) -> None:
         # the claim guard's sibling: -ClaimTtlSec 60 / -ClaimRenewSec 30 gives 30 s; a 40 s identity read ends SHARE_UNREACHABLE inside it, the claim released, no lease opened,

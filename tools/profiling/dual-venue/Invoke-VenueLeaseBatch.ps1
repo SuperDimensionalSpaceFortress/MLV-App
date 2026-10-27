@@ -531,8 +531,10 @@ function Invoke-InputGuard {
     $gb = $script:guardBudget
     if ($null -eq $gb) { return Get-InputOutputRefusal }
     $left = $gb.sec - $gb.clock.Elapsed.TotalSeconds
-    # no room to read in (a short lease): the location checks still run, for the write suppression, inside 10 s; the content check then refuses with $gb.code before any read
-    $bound = $(if ($left -ge 2) { $left + 0.5 } else { 10 })
+    # no room to read in (a short lease, no leg can start on it): the location checks still run, for the write suppression, inside 2 s (r4 adversary pass 2 A1: not 10, which ran
+    # far past such a room); the content check then refuses with $gb.code before any content read. A location check still running then fails closed, typed $gb.code.
+    $noRoom = $left -lt 2
+    $bound = $(if ($noRoom) { 2 } else { $left + 0.5 })
     $prog = [hashtable]::Synchronized(@{ locationsDone = $false; item = 0; at = 'the start of the guard' })
     $vars = @{ guardedInputs = $script:guardedInputs; guardBudget = $gb; guardProgress = $prog; guardDelaySeam = $script:guardDelaySeam; legPlanMode = $legPlanMode; AgentShare = $AgentShare
         stagedBuildProbe = $stagedBuildProbe; artifactProbe = $artifactProbe; RunDir = $RunDir; Venue = $Venue; ClaimDir = $ClaimDir; here = $here; ClaimDirPath = $script:ClaimDirPath
@@ -550,7 +552,7 @@ function Invoke-InputGuard {
             & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
             try { [void]$ps.BeginStop($null, $null) } catch { }
             $unknown = -not $prog.locationsDone
-            return [pscustomobject]@{ kind = 'content'; item = [int]$prog.item; code = 'SHARE_UNREACHABLE'; locationUnknown = $unknown
+            return [pscustomobject]@{ kind = 'content'; item = [int]$prog.item; code = $(if ($noRoom -and $gb.code) { $gb.code } else { 'SHARE_UNREACHABLE' }); locationUnknown = $unknown
                 why = "the guard's reads did not finish within $($gb.what) (still reading $($prog.at) after $([Math]::Round($gb.clock.Elapsed.TotalSeconds, 1)) s)$(if ($unknown) { '; an input whose location is unknown is refused, and nothing more is written into -RunDir' }); no leg runs on it" }
         }
         $out = @($ps.EndInvoke($async))
@@ -632,13 +634,12 @@ function Get-InputContentRefusal {
     # r3 adversary A2: the open still held in the agent's gate is guarded for locations only; its content is checked once the result is in hand, inside the lease's room
     if ($null -ne $script:guardBudget -and $script:guardBudget.contentOff) { return $null }
     $buildsLeft = @($script:guardedInputs | Where-Object { $_.kind -ceq 'build' }).Count
-    # r4 adversary A1: under 2 s left of the budget no content read starts (a spec read included, which comes before the builds): the typed refusal is at once, never after a read
-    # that spends the leg reserve. Invoke-InputGuard's 10 s floor for that case covers the location checks only.
-    if ($null -ne $script:guardBudget -and ($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) -lt 2) {
-        $first = @($script:guardedInputs | Where-Object { $_.kind -ceq 'spec' -or $_.kind -ceq 'build' })[0]
-        if ($null -ne $first) { return [pscustomobject]@{ kind = 'content'; item = $first.item; code = $script:guardBudget.code; why = "no time is left in $($script:guardBudget.what) to re-read the leg specs and staged builds; no leg runs on them" } }
-    }
     foreach ($g in $script:guardedInputs) {
+        # r4 adversary A1 (pass 1), A2 (pass 2): under 2 s left of the budget no content read STARTS, checked before EACH spec and build read (a spec read comes before the builds,
+        # and an earlier read can use up the room): the typed refusal is at once, never after a read that spends the leg reserve
+        if (($g.kind -ceq 'spec' -or $g.kind -ceq 'build') -and $null -ne $script:guardBudget -and ($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) -lt 2) {
+            return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; why = "no time is left in $($script:guardBudget.what) to re-read the $($g.kind) input $($g.path); no leg runs on it" }
+        }
         if ($script:guardProgress) { $script:guardProgress.item = $g.item; $script:guardProgress.at = "the $($g.kind) input $($g.path)" }
         if ($g.kind -ceq 'spec') {
             Wait-GuardReadSeam 'spec'
