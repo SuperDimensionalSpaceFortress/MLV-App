@@ -4433,10 +4433,11 @@ function Test-CorePartitionFeedMarkAccounted($Mark) {
 # completed within $SlackMs (the declared slack, 2000 ms) of the window's end; a later read (a delayed job) may hold rows written after the run:
 # feed-read-after-window. No window end is feed-window-end-unknown.
 # r11 B1 (sol r10 B1 = key3 r10, CP-FEED-END-ANCHOR): the job stamps $WindowEndMs as soon as the smoke call returns, but a stall before that stamp
-# still moves it late, so it is cross-checked against independent evidence: $AppGoneMs, the measured app's exit as the helper observed it on the
-# same monotonic base (Get-CorePartitionAppGoneMonoMs). A window end more than $EndLagSlackMs (the declared slack for the runner's own post-exit
-# work, 10000 ms) after that exit is feed-window-end-late; no such evidence is feed-window-end-unverified. Either way no window row is published.
-function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $null, $WindowEndMs = $null, [double]$SlackMs = 2000, $AppGoneMs = $null, [double]$EndLagSlackMs = 10000) {
+# still moves it late, so it is cross-checked against independent evidence: $AppAliveMs, the measured app's last poll the helper saw it alive in,
+# on the same monotonic base (Get-CorePartitionAppAliveMonoMs; the earliest the app can have exited, adversary r11 5f75e044 A1: never the poll
+# that saw it gone, which a descheduled helper makes late). A window end more than $EndLagSlackMs (the declared slack for the runner's own
+# post-exit work, 10000 ms) after it is feed-window-end-late; no such evidence is feed-window-end-unverified. Either way no window row is published.
+function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $null, $WindowEndMs = $null, [double]$SlackMs = 2000, $AppAliveMs = $null, [double]$EndLagSlackMs = 10000) {
     $s = [ordered]@{ rows = $null; pkgWattsMean = $null; pkgWattsMax = $null; pkgTempCMean = $null; pkgTempCMax = $null; pkgThrottledRows = $null; pkgTempCAtStart = $null; reasons = [ordered]@{} }
     $windowFields = @('rows', 'pkgWattsMean', 'pkgWattsMax', 'pkgTempCMean', 'pkgTempCMax', 'pkgThrottledRows')
     $code = $null
@@ -4457,7 +4458,7 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $
     elseif ($End.truncated) { $code = 'feed-window-truncated' }
     if ($null -eq $code) {
         $we = (ConvertFrom-CorePartitionNumber $WindowEndMs 'double').value; $ed = (ConvertFrom-CorePartitionNumber $End.doneMs 'double').value
-        $ag = (ConvertFrom-CorePartitionNumber $AppGoneMs 'double').value
+        $ag = (ConvertFrom-CorePartitionNumber $AppAliveMs 'double').value
         # an end read without a usable completion time is refused below by Test-CorePartitionFeedFresh (feed-freshness-unverified)
         if ($null -eq $we) { $code = 'feed-window-end-unknown' }
         elseif ($null -eq $ag) { $code = 'feed-window-end-unverified' }
@@ -4581,17 +4582,19 @@ function Get-CorePartitionReadyFeed($Feed, [bool]$NotReady) {
     $s
 }
 
-# PURE. r11 B1 (CP-FEED-END-ANCHOR): the measured app's exit as the helper observed it, on the job's monotonic base (Get-CorePartitionMonoMs, the
+# PURE. r11 B1 (CP-FEED-END-ANCHOR): the earliest the measured app can have exited, on the job's monotonic base (Get-CorePartitionMonoMs, the
 # shared Stopwatch clock): the helper's Stopwatch origin on that clock (monoBaseMs, read just before its Stopwatch starts, so it can only be early,
-# which makes the window end look later, never earlier) plus the app's goneMs. The app must be the helper's bound app and the measured pid. $null
-# when the record, its app, either number or the binding is missing, so the feed window end is unverified. Never throws.
-function Get-CorePartitionAppGoneMonoMs($Helper, [int64]$MeasuredPid) {
+# which makes the window end look later, never earlier) plus the app's aliveMs, the last poll that saw it alive. adversary r11 (5f75e044) A1: not
+# its goneMs, the poll that saw it gone, which a helper descheduled after the exit moves as late as a stalled job's end stamp. The app must be the
+# helper's bound app and the measured pid, and its exit must have been observed (goneMs at or after aliveMs). $null when the record, its app,
+# any number or the binding is missing, so the feed window end is unverified. Never throws.
+function Get-CorePartitionAppAliveMonoMs($Helper, [int64]$MeasuredPid) {
     try {
         if ($null -eq $Helper -or $null -eq $Helper.app -or $MeasuredPid -le 0) { return $null }
         $ap = (ConvertFrom-CorePartitionNumber $Helper.app.pid 'int64').value; $gm = (ConvertFrom-CorePartitionNumber $Helper.app.goneMs 'int64').value
-        $mb = (ConvertFrom-CorePartitionNumber $Helper.monoBaseMs 'double').value
-        if ($ap -ne $MeasuredPid -or $null -eq $gm -or $null -eq $mb -or $gm -lt 0 -or $mb -lt 0) { return $null }
-        $mb + $gm
+        $am = (ConvertFrom-CorePartitionNumber $Helper.app.aliveMs 'int64').value; $mb = (ConvertFrom-CorePartitionNumber $Helper.monoBaseMs 'double').value
+        if ($ap -ne $MeasuredPid -or $null -eq $gm -or $null -eq $am -or $null -eq $mb -or $am -lt 0 -or $gm -lt $am -or $mb -lt 0) { return $null }
+        $mb + $am
     } catch { $null }
 }
 
@@ -5703,7 +5706,7 @@ if ($CorePartitionTelemetry) {
     # record HMAC took the helper past the earlier 30000).
     if ($cpHelperEncoded.Length -gt 32000) { throw "CORE_PARTITION_HELPER_TOO_LONG the encoded helper is $($cpHelperEncoded.Length) chars (limit 32000, one command line)" }
     $cpHelperAffinity = if ($corePartitionArgs.load -ne 0) { $corePartitionArgs.load } else { $corePartitionArgs.helper }
-    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'ConvertFrom-CorePartitionNumber', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Split-CorePartitionFeedLines', 'Test-CorePartitionFeedFresh', 'Test-CorePartitionFeedRowAfter', 'Test-CorePartitionFeedMarkAccounted', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Join-CorePartitionWhy', 'Get-CorePartitionReadyFeed', 'ConvertTo-CorePartitionUtcTicks', 'Test-CorePartitionHelperRecordShape', 'Test-CorePartitionHelperMac', 'Test-CorePartitionHelperRecord', 'Test-CorePartitionMeasuredApp', 'Get-CorePartitionAppGoneMonoMs', 'Get-CorePartitionScalars', 'Get-CorePartitionFeedHandleInfo', 'Read-CorePartitionFeedBytes', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince', 'Get-CorePartitionReadyToken', 'Get-CorePartitionClockSkewMs', 'Get-CorePartitionMonoMs', 'Test-CorePartitionReadyMarker') "`n"
+    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'ConvertFrom-CorePartitionNumber', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Split-CorePartitionFeedLines', 'Test-CorePartitionFeedFresh', 'Test-CorePartitionFeedRowAfter', 'Test-CorePartitionFeedMarkAccounted', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Join-CorePartitionWhy', 'Get-CorePartitionReadyFeed', 'ConvertTo-CorePartitionUtcTicks', 'Test-CorePartitionHelperRecordShape', 'Test-CorePartitionHelperMac', 'Test-CorePartitionHelperRecord', 'Test-CorePartitionMeasuredApp', 'Get-CorePartitionAppAliveMonoMs', 'Get-CorePartitionScalars', 'Get-CorePartitionFeedHandleInfo', 'Read-CorePartitionFeedBytes', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince', 'Get-CorePartitionReadyToken', 'Get-CorePartitionClockSkewMs', 'Get-CorePartitionMonoMs', 'Test-CorePartitionReadyMarker') "`n"
     $cpLaunchOld = @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
@@ -5819,7 +5822,7 @@ try {
     $cpPost = $cpOpen + "`n" + @'
     # r10 B2: the measured window's end on the monotonic clock; the feed's end read must complete within its declared slack of it. r11 B1 (sol r10
     # B1 = key3 r10, CP-FEED-END-ANCHOR): stamped FIRST, as the smoke call returns, before the affinity restore or any other cleanup, so a stall in
-    # cleanup counts against the end read, never moves the end. The end is then cross-checked against the helper's observed app exit (below).
+    # cleanup counts against the end read, never moves the end. The end is then cross-checked against the app's last observed-alive poll (below).
     $corePartitionSmokeEndMonoMs = Get-CorePartitionMonoMs
     $corePartitionSmokeEndedAtUtc = (Get-Date).ToUniversalTime()
     try {
@@ -5876,9 +5879,9 @@ try {
         } catch { $cpRecordWhy = 'helper-record-unparseable'; $corePartitionErrors.Add("helper-record: $([string]$_.Exception.Message)") }
         if ($cpRecordWhy) { $corePartitionHelperWhy = Join-CorePartitionWhy $corePartitionHelperWhy $cpRecordWhy }
     } elseif (-not $corePartitionHelperWhy) { $corePartitionHelperWhy = 'helper-record-missing' }
-    # r11 B1: the measured app's exit as the helper observed it, on the job's monotonic base ($null without an accepted record that has it)
-    $corePartitionAppGoneMonoMs = Get-CorePartitionAppGoneMonoMs $corePartitionHelperRecord $corePartitionMeasuredPid
-    $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppGoneMonoMs 10000) $corePartitionHelperNotReady
+    # r11 B1: the measured app's last observed-alive poll on the job's monotonic base ($null without an accepted record that observed its exit)
+    $corePartitionAppAliveMonoMs = Get-CorePartitionAppAliveMonoMs $corePartitionHelperRecord $corePartitionMeasuredPid
+    $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppAliveMonoMs 10000) $corePartitionHelperNotReady
     # sol r4 CP-05: set until core-partition.json is saved, so any failure on the way leaves every acceptance flag false with this reason.
     $corePartitionPublishWhy = 'core-partition-json-unpublished'
     try {
@@ -5905,9 +5908,10 @@ try {
                 endMark = [ordered]@{ exists = $corePartitionFeedEnd.exists; length = $corePartitionFeedEnd.length; shortRead = $corePartitionFeedEnd.shortRead; monoMs = $corePartitionFeedEnd.monoMs; doneMs = $corePartitionFeedEnd.doneMs; readUtcTicks = $corePartitionFeedEnd.readUtcTicks; lastWriteUtcTicks = $corePartitionFeedEnd.lastWriteUtcTicks; windowStartsMidRow = $corePartitionFeedEnd.windowStartsMidRow }
                 windowUtc = [ordered]@{ start = $corePartitionMeasuredLaunchUtc.ToString('o'); end = $corePartitionSmokeEndedAtUtc.ToString('o') }
                 # r11 (CORE-PARTITION-FEED-WINDOW-PROVENANCE-1): the boundary Get-CorePartitionFeedSummary judged, so it is auditable here: the window
-                # end, the end read's slack past it, the observed app exit it was cross-checked against, the lag between them and that lag's slack
-                windowEndMonoMs = $corePartitionSmokeEndMonoMs; endReadSlackMs = 2000; appGoneMonoMs = $corePartitionAppGoneMonoMs
-                windowEndLagMs = $(if ($null -ne $corePartitionAppGoneMonoMs) { $corePartitionSmokeEndMonoMs - $corePartitionAppGoneMonoMs }); endLagSlackMs = 10000
+                # end, the end read's slack past it, the app's last observed-alive poll it was cross-checked against, the lag between them and that
+                # lag's slack
+                windowEndMonoMs = $corePartitionSmokeEndMonoMs; endReadSlackMs = 2000; appLastAliveMonoMs = $corePartitionAppAliveMonoMs
+                windowEndLagMs = $(if ($null -ne $corePartitionAppAliveMonoMs) { $corePartitionSmokeEndMonoMs - $corePartitionAppAliveMonoMs }); endLagSlackMs = 10000
                 summary = $corePartitionFeedSummary
             }
             perCoreTemperature = 'not in the feed (column 3 is the package / hottest core); adding columns is the Bachelor session''s work'
