@@ -1868,6 +1868,11 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         "PipelineRoot": ("[CmdletBinding()]param()\n$m = 'Session' + 'State'\n$p = 'PSVar' + 'iable'\n$PSCmdlet | ForEach-Object {{ $_.$m.$p.Set('PSScriptRoot', 'C:\\dirty') }}", PSR_CALL),
         # r11 adversary A1, the PSScriptRoot form: the same chain of copies on the extractor input.
         "AdvR11CopyChainRoot": ("[CmdletBinding()]param()\n$a=$PSCmdlet; $b=$a; $m='Session'+'State'; $p='PSVar'+'iable'; $b.$m.$p.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
+        # r11 adversary pass 2, the PSScriptRoot forms: a foreach variable, a function result, reflection by a string index.
+        "AdvR11ForeachRoot": ("[CmdletBinding()]param()\n$m='Session'+'State'; $p='PSVar'+'iable'\nforeach($s in @($PSCmdlet)){{$s.$m.$p.Set('PSScriptRoot','C:\\dirty')}}", PSR_CALL),
+        "AdvR11FunctionResult": ("[CmdletBinding()]param()\nfunction Get-SessionCopy {{ $PSCmdlet }}\n$s = Get-SessionCopy\n$m='Session'+'State'; $p='PSVar'+'iable'\n$s.$m.$p.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
+        "AdvR11ReflectionRoot": ("[CmdletBinding()]param()\n$PSCmdlet.PSObject.Properties['SessionState'].Value.PSObject.Properties['PSVariable'].Value.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
+        "AdvR11ReflectionFolded": ("$h = Get-Thing\n$h.PSObject.Properties['Session' + 'State'].Value.PSVariable.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
         "DefaultsMember": ("$h = Get-Thing\n$h.('PSDefault' + 'ParameterValues')['*:ModulePath'] = '{dirty}'", DEF_CALL),
     }
     # Not unproven: a computed member of parsed data (the real playback-attr-3-cuda-job.ps1 shape), a folded name that is not a route.
@@ -1883,6 +1888,10 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         "BodyUnfoldable": "    param($Target)\n    $r = @{}\n    $m = 'Session' + 'State'\n    $p = 'PSVar' + 'iable'\n    $PSCmdlet.$m.$p.Set('r', $Target)\n    $r.Attributes = 1",
         # r11 adversary A1, verbatim body: the session root reaches the receiver through a chain of copies.
         "AdvR11CopyChain": " [CmdletBinding()]param($Target); $r=@{}; $a=$PSCmdlet; $b=$a; $m='Session'+'State'; $p='PSVar'+'iable'; $b.$m.$p.Set('r',$Target); $r.Attributes=1",
+        # r11 adversary pass 2, verbatim bodies. A1: a foreach variable carries the session root; A2: reflection by a string index.
+        "AdvR11Foreach": " [CmdletBinding()]param($Target)\n $r=@{}\n $m='Session'+'State'; $p='PSVar'+'iable'\n foreach($s in @($PSCmdlet)){$s.$m.$p.Set('r',$Target)}\n $r.Attributes=1",
+        "AdvR11Reflection": " [CmdletBinding()]param($Target)\n $r=@{}\n $PSCmdlet.PSObject.Properties['SessionState'].Value.PSObject.Properties['PSVariable'].Value.Set('r',$Target)\n $r.Attributes=1",
+        "AdvR11MultiTarget": " [CmdletBinding()]param($Target)\n $r=@{}\n $m='Session'+'State'; $p='PSVar'+'iable'\n $s,$ignored=$PSCmdlet,0\n $s.$m.$p.Set('r',$Target)\n $r.Attributes=1",
     }
     BODY_CONTROLS = {
         "BodyCtlDataMember": "    $r = @{}\n    $k = 'a'\n    $r.a = $r.$k",
@@ -1985,6 +1994,10 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
         (d / "B.psm1").write_text(f"(Fetch P*Values -Scope Global).Value['*:ModulePath']='{d / 'Dirty.psm1'}'\n", encoding="utf-8")
         (d / "gen-modules.ps1").write_text(f"Import-Module '{d / 'A.psm1'}'\nImport-Module '{d / 'B.psm1'}'\nGet-AttrCudaEmbeddedFunctionSource -Name 'Probe'\n", encoding="utf-8")
         cls.module_defaults = run_scan(modules=[d / "Extractor.psm1", d / "A.psm1", d / "B.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-modules.ps1"])
+        # r11 adversary pass 2 (A3), verbatim: a -ModulePath module that defines (and exports) a function named Join-Path.
+        (d / "Redirect.psm1").write_text(f"function Join-Path {{ param($Path,$ChildPath) '{d / 'Dirty.psm1'}' }}; Export-ModuleMember -Function Join-Path\n", encoding="utf-8")
+        (d / "gen-function.ps1").write_text(f"Import-Module '{d / 'Redirect.psm1'}'; Get-AttrCudaEmbeddedFunctionSource -Name 'Probe' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n", encoding="utf-8")
+        cls.join_path_function = run_scan(modules=[d / "Extractor.psm1", d / "Redirect.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-function.ps1"])
 
     def check(self, result: dict) -> None:
         calls = [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and "'Probe'" in f["text"]]
@@ -1997,6 +2010,9 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
 
     def test_r11_an_imported_alias_of_the_extractor_makes_the_binding_unproven(self) -> None:
         self.check(self.extractor)
+
+    def test_r11_pass2_a3_an_imported_function_named_join_path_makes_the_binding_unproven(self) -> None:
+        self.check(self.join_path_function)
 
     def test_r11_a2_a_module_that_reaches_the_defaults_through_another_modules_alias_is_an_unproven_binding(self) -> None:
         found = [f for f in self.module_defaults["splicedViolations"] if f["token"] == "unproven-binding" and f["source"].endswith("B.psm1")]

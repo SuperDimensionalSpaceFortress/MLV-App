@@ -1183,6 +1183,7 @@ function Get-MemberNameValue($Member) {
 # carry whatever was handed in, so they count only in a tree that names a session root somewhere (`$PSCmdlet | % { $_.$m }`).
 $script:sessionRootVariables = @('PSCmdlet', 'ExecutionContext', 'Host', 'MyInvocation', 'this')
 $script:engineInputVariables = @('_', 'PSItem', 'input', 'args')
+$script:sessionMemberNames = @('SessionState', 'SessionStateProxy', 'PSVariable', 'GetVariableValue', 'InvokeCommand')
 
 function Test-MemberReceiverMayBeSession($Member, $Root) {
     # r11: true when the receiver of a member access whose name the scan cannot fold may be (or reach) the session: it starts at a
@@ -1190,6 +1191,9 @@ function Test-MemberReceiverMayBeSession($Member, $Root) {
     # variable an assignment binds from a session root, a variable command (Get-Variable) or an engine type ([runspace],
     # [powershell], System.Management.Automation.*). Only a plain variable none of whose assignments names one is not one
     # (`$table = ... | ConvertFrom-Json; $table.venues.$name`).
+    # r11 adversary pass 2 (A1): in a tree that names a session root anywhere, a foreach variable, a multi-target assignment or a
+    # function's result can carry it to any receiver (`foreach ($s in @($PSCmdlet)) { $s.$m... }`), so every receiver counts there.
+    if (@($Root.FindAll({ param($v) $v -is [System.Management.Automation.Language.VariableExpressionAst] -and $script:sessionRootVariables -icontains (Get-VariableName $v).name }, $true)).Count -gt 0) { return $true }
     $node = $Member.Expression
     while ($true) {
         if ($node -is [System.Management.Automation.Language.MemberExpressionAst]) { $node = $node.Expression; continue }
@@ -1383,6 +1387,12 @@ function Get-VariableRouteBinding($Root, [string]$Name) {
                 $rest = Get-ProviderLeaf $Matches[1]
                 if (Test-VariableTailReaches $rest $Name) { return 'the variable: drive' }
             }
+            # r11 adversary pass 2 (A2): reflection reaches a member by a string (.PSObject.Properties['SessionState'], .Methods['GetVariableValue']).
+            if ($script:sessionMemberNames -icontains ([string]$n.Value).Trim()) { return "a string naming the session-state API ('$($n.Value)'), which reflection reaches by name" }
+        }
+        elseif ($n -is [System.Management.Automation.Language.BinaryExpressionAst]) {
+            $folded = Get-ConstantString $n
+            if ($null -ne $folded -and $script:sessionMemberNames -icontains $folded.Trim()) { return "a string built from literals naming the session-state API ('$folded'), which reflection reaches by name" }
         }
         elseif ($n -is [System.Management.Automation.Language.VariableExpressionAst]) {
             if ($n.VariablePath.UserPath -match '^(?i:variable):(.*)$' -and (Test-VariableTailReaches (Get-ProviderLeaf $Matches[1]) $Name)) { return 'the variable: drive' }
@@ -1399,7 +1409,7 @@ function Get-VariableRouteBinding($Root, [string]$Name) {
             }
             # r9 adversary A3: $PSCmdlet.GetVariableValue(<name>) hands back a variable's value (the defaults dictionary itself) by a name.
             # r11: .InvokeCommand runs a script or resolves a command in the caller's session (InvokeScript, GetCommand).
-            if (@('SessionState', 'SessionStateProxy', 'PSVariable', 'GetVariableValue', 'InvokeCommand') -icontains $memberName) { return "the session-state API (.$memberName)" }
+            if ($script:sessionMemberNames -icontains $memberName) { return "the session-state API (.$memberName)" }
         }
         elseif ($n -is [System.Management.Automation.Language.TypeExpressionAst] -or $n -is [System.Management.Automation.Language.TypeConstraintAst]) {
             if ($n.TypeName.FullName -match '(?i)(^|\.)(psvariable|SessionState|SessionStateProxy|PSVariableIntrinsics)$') { return "the session-state API ([$($n.TypeName.FullName)])" }
@@ -1894,6 +1904,18 @@ function Get-SpliceCallSites([string]$Path) {
     foreach ($evaluated in @('Join-Path', 'Split-Path', 'New-Object', 'Get-AttrCudaEmbeddedFunctionSource')) {
         $runsAs = @(Resolve-CommandNames $evaluated $script:importedAliases.map $script:importedAliases.wildcard | Where-Object { $_ -ne $evaluated.ToLowerInvariant() })
         if ($runsAs.Count -gt 0) { $importedReplacement = "an alias a -ModulePath module defines makes $evaluated run as $($runsAs -join ', ')"; break }
+    }
+    # r11 adversary pass 2 (A3): so does a function a -ModulePath module defines under that name (`function Join-Path { ... }`, exported).
+    # The extractor's own definition is the extractor module itself, which the default-module rule already judges. A function defined
+    # inside another function is local to it when it runs (a spliced body's own shadow, judged by R1), so only a top-level one counts.
+    if (-not $importedReplacement) {
+        foreach ($moduleKey in @($moduleAsts.Keys)) {
+            $replaced = @($moduleAsts[$moduleKey].FindAll({ param($x)
+                if ($x -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -or @('join-path', 'split-path', 'new-object') -notcontains (Get-BareCommandName $x.Name)) { return $false }
+                for ($p = $x.Parent; $null -ne $p; $p = $p.Parent) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false } }
+                return $true }, $true) | Select-Object -First 1)
+            if ($replaced.Count -gt 0) { $importedReplacement = "an alias or function a -ModulePath module defines ($moduleKey) replaces $($replaced[0].Name)"; break }
+        }
     }
     $rootRebinding = Get-PsScriptRootRebinding $ast
     $defaults = Get-DefaultParameterValuesReference $ast
