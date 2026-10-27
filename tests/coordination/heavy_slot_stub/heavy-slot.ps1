@@ -10,7 +10,8 @@
 #   readyexit  stands in for a holder that wrote its ready file and then ended: write the ready file named in the
 #              holder's -EncodedCommand, wait STUB_HEAVY_SLOT_HOLD_S seconds (default 0), exit STUB_HEAVY_SLOT_CODE (default 0)
 #   pinwarn    print heavy-slot's own PIN MISMATCH warning, then behave as run
-#   readyorphan  a holder child writes the ready file and ends, while heavy-slot itself stays up STUB_HEAVY_SLOT_HOLD_S
+#   readyorphan  a holder child writes the ready file and ends (after STUB_HEAVY_SLOT_CHILD_S seconds, default 0), while
+#              heavy-slot itself stays up STUB_HEAVY_SLOT_HOLD_S
 #              seconds (its release work after the child), then exits STUB_HEAVY_SLOT_CODE (default 0)
 #   locklog    hold this run's log open with read access and no read sharing, print the PIN MISMATCH warning, then run
 # STUB_HEAVY_SLOT_DELAY_S (run, pinwarn and readyexit) waits that many seconds before starting the child, like a queue wait for the slot.
@@ -58,8 +59,9 @@ switch ($mode) {
     }
     'readyorphan' {
         $ready = (Get-StubReadyPath) -replace "'", "''"
+        $childS = if ($env:STUB_HEAVY_SLOT_CHILD_S) { [double]$env:STUB_HEAVY_SLOT_CHILD_S } else { 0 }
         $record.childStart = [DateTime]::UtcNow.ToString('o')
-        & $command[0] -NoProfile -NonInteractive -Command "Set-Content -LiteralPath '$ready' -Value @('${ticket}:$PID', ('holder={0}@{1}' -f `$PID, (Get-Process -Id `$PID).StartTime.ToUniversalTime().Ticks)) -Encoding ascii"
+        & $command[0] -NoProfile -NonInteractive -Command "Set-Content -LiteralPath '$ready' -Value @('${ticket}:$PID', ('holder={0}@{1}' -f `$PID, (Get-Process -Id `$PID).StartTime.ToUniversalTime().Ticks)) -Encoding ascii; Start-Sleep -Seconds $childS"
         $record.childEnd = [DateTime]::UtcNow.ToString('o')
         if ($env:STUB_HEAVY_SLOT_HOLD_S) { Start-Sleep -Seconds ([double]$env:STUB_HEAVY_SLOT_HOLD_S) }
         $code = $stubCode

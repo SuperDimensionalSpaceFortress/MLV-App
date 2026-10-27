@@ -1167,6 +1167,52 @@ def test_an_unreadable_heavy_slot_log_at_admission_fails_closed(box) -> None:
     assert call["childEnd"], "the slot was given back"
 
 
+def test_a_holder_lost_after_its_ready_file_vanished_is_still_classified(box) -> None:
+    # r2 adversary pass 2 A2: the holder ends and its ready file is gone while the wrapper still runs; the identity read
+    # at admission is kept, so the release still reports the loss.
+    hs = box["dir"] / "heavy-slot"
+    fragment = (
+        f"$r = @(Get-ChildItem -LiteralPath '{hs}' -Filter *.ready)[0].FullName; "
+        "$h = [int]([regex]::Match((Get-Content -LiteralPath $r -Raw), 'holder=(\\d+)').Groups[1].Value); "
+        "$d = (Get-Date).AddSeconds(30); while ((Get-Process -Id $h -ErrorAction Ignore) -and (Get-Date) -lt $d) "
+        "{ Start-Sleep -Milliseconds 100 }; Remove-Item -LiteralPath $r -Force; "
+        f"Set-Content -LiteralPath '{box['marker']}' -Value ran; exit 7"
+    )
+    done = _heavy(box, "readyorphan", ["-Command", fragment],
+                  extra={"STUB_HEAVY_SLOT_CHILD_S": "3", "STUB_HEAVY_SLOT_HOLD_S": "10"})
+    assert done.returncode == 7, done.stdout + done.stderr
+    assert "heavy-slot: admitted" in done.stderr
+    assert "HEAVY_SLOT_LOST_DURING_ACTION label=build code=0 utc=" in done.stdout, done.stdout + done.stderr
+    assert "heavy-slot: released" not in done.stderr
+    assert box["marker"].exists()
+
+
+def test_a_stop_file_that_cannot_be_written_still_ends_the_holder(box) -> None:
+    # r2 adversary pass 2 A1: the heavy-slot dir denies file creation at release, in a host that lives on.
+    hs = box["dir"] / "heavy-slot"
+    pid_file = box["dir"] / "holder-pid.txt"
+    deny = ("[System.Security.AccessControl.FileSystemAccessRule]::new("
+            "[Security.Principal.WindowsIdentity]::GetCurrent().User, 'CreateFiles', 'Deny')")
+    done = _library_driver(
+        box,
+        "Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        f"    $r = @(Get-ChildItem -LiteralPath '{hs}' -Filter *.ready)[0].FullName\n"
+        f"    Set-Content -LiteralPath '{pid_file}' -Value ([regex]::Match((Get-Content -LiteralPath $r -Raw), 'holder=(\\d+)').Groups[1].Value)\n"
+        f"    $acl = Get-Acl -LiteralPath '{hs}'; $acl.AddAccessRule({deny}); Set-Acl -LiteralPath '{hs}' -AclObject $acl }}\n",
+        str(box["lock"]),
+        host_tail=(
+            f"$acl = Get-Acl -LiteralPath '{hs}'; [void]$acl.RemoveAccessRule({deny}); Set-Acl -LiteralPath '{hs}' -AclObject $acl\n"
+            f"$h = [int](Get-Content -LiteralPath '{pid_file}' -Raw)\n"
+            "$d = (Get-Date).AddSeconds(20)\n"
+            "while ((Get-Process -Id $h -ErrorAction Ignore) -and (Get-Date) -lt $d) { Start-Sleep -Milliseconds 200 }\n"
+            "Write-Output \"holder-ended=$(-not (Get-Process -Id $h -ErrorAction Ignore))\"\n"
+        ),
+    )
+    assert "holder-ended=True" in done.stdout, done.stdout + done.stderr
+    assert "stop file not written" in done.stderr, done.stderr
+    assert "BUILD_HEAVY_SLOT_" not in done.stdout, "admitted and built, never refused"
+
+
 def test_the_hung_tool_bound_is_monotonic() -> None:
     # r2 adversary A4: a wall-clock step must not move the bound. A clock step needs admin, so this pins the source.
     text = GUARD.read_text(encoding="ascii")

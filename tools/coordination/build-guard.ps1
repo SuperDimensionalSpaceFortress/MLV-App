@@ -382,12 +382,24 @@ function Remove-HeavySlotFiles($Lease) {
 
 function Get-HeavySlotHolderState($Lease) {
     # 'alive' or 'gone' for the holder named in the ready file (pid + start ticks); '' while that line is not readable yet.
-    $text = Get-Content -LiteralPath $Lease.Ready -Raw -ErrorAction SilentlyContinue
-    if (-not ($text -match '(?m)^holder=(\d+)@(\d+)\s*$')) { return '' }
-    $p = Get-Process -Id ([int]$Matches[1]) -ErrorAction SilentlyContinue
+    # The first identity read is kept, so a ready file that later vanishes cannot hide a holder that has ended.
+    if (-not $Lease.Holder) {
+        $text = Get-Content -LiteralPath $Lease.Ready -Raw -ErrorAction SilentlyContinue
+        if (-not ($text -match '(?m)^holder=(\d+)@(\d+)\s*$')) { return '' }
+        $Lease.Holder = @{ Pid = [int]$Matches[1]; Ticks = [long]$Matches[2] }
+    }
+    $p = Get-Process -Id $Lease.Holder.Pid -ErrorAction SilentlyContinue
     if (-not $p) { return 'gone' }
-    try { if ($p.StartTime.ToUniversalTime().Ticks -ne [long]$Matches[2]) { return 'gone' } } catch { }
+    try { if ($p.StartTime.ToUniversalTime().Ticks -ne $Lease.Holder.Ticks) { return 'gone' } } catch { }
     return 'alive'
+}
+
+function Send-HeavySlotStop($Lease) {
+    # Writes the stop file. When it cannot be written, heavy-slot's process tree is ended instead (the OS then frees its
+    # slot mutex), so a holder that would never see the file cannot keep the machine slot.
+    try { Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -ErrorAction Stop; return } catch { $why = $_.Exception.Message }
+    Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} stop file not written ({1}); ending heavy-slot pid {2} and its children' -f $Lease.Label, $why, $Lease.Process.Id)
+    if (-not $Lease.Process.HasExited) { $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $Lease.Process.Id /T /F 2>&1 }
 }
 
 function Get-HeavySlotExitCode($Lease) {
@@ -438,7 +450,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     $lease = @{
         Label = 'mlv:{0}:build' -f (Get-HeavySlotLane); BuildLabel = $Label
         Ready = Join-Path $dir "$id.ready"; Stop = Join-Path $dir "$id.stop"; ExitFile = Join-Path $dir "$id.exit.json"
-        Log = Join-Path $dir "$id.log"; Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''; LogUnread = $false
+        Log = Join-Path $dir "$id.log"; Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''; LogUnread = $false; Holder = $null
     }
     # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a
     # file, never a pipe, so nothing it writes while it holds the slot can block it (adversary A4).
@@ -521,7 +533,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         # Every way out before admission (exit, throw, Ctrl+C) leaves the stop file while heavy-slot still runs, even when a
         # ready file appeared after the last check, so its holder ends at once instead of holding the machine slot
         # (adversary A2; r1 adversary A1).
-        if (-not $admitted -and -not $lease.Process.HasExited) { Set-Content -LiteralPath $lease.Stop -Value stop -Encoding ascii -ErrorAction SilentlyContinue }
+        if (-not $admitted -and -not $lease.Process.HasExited) { Send-HeavySlotStop $lease }
     }
 }
 
@@ -531,8 +543,8 @@ function Exit-HeavySlot($Lease) {
     if (-not $Lease) { return }
     # The holder (or heavy-slot) ended before the stop file: part of the build ran without the machine slot. The build
     # is not failed for it (the slot is a throttle, not a correctness lock), but the line lets a receipt call it unprotected.
-    $lost = $Lease.Process.HasExited -or (Get-HeavySlotHolderState $Lease) -eq 'gone'
-    Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -ErrorAction SilentlyContinue
+    $lost = $Lease.Process.HasExited -or (Get-HeavySlotHolderState $Lease) -ne 'alive'
+    Send-HeavySlotStop $Lease
     if ($lost) {
         $line = 'HEAVY_SLOT_LOST_DURING_ACTION label={0} code={1} utc={2}' -f $Lease.BuildLabel, (Get-HeavySlotExitCode $Lease), [DateTime]::UtcNow.ToString('o')
         Write-BuildGuardLog $line
