@@ -801,13 +801,28 @@ $stBase = @{ exists = $true; length = 500; monoMs = [int64]4805000; readUtcTicks
 $stShort = $stBase.Clone(); $stShort.monoMs = [int64]5000000
 $stc = @(foreach ($b in @($stBase, $stShort)) { $sb2 = @{}; if ($hasBase) { $sb2.Base = $b }; [string](Get-CorePartitionFeedSummary $start $end 120 @sb2).reasons['pkgTempCAtStart'] })
 $r.monotonic = @($cp9.rows, $cp9.pkgWattsMean, [string]$cp9.reasons['rows'], $cpSh.rows, $cpSh.pkgWattsMean, [string]$cpSh.reasons['rows'], $noMono[0], $noMono[1], $noMono[2]) + @($stc)
-# sol r6 CP-07: the one guarded number parse (absent in a pre-r7 generator)
+# adversary r7 (15b3bbf7) A1 (literal): the clock steps +100 s before the write at real +1 s and -100 s before the end read at real +200 s, so the
+# endpoint wall and monotonic spans agree (200 s) and the stamp says 99 s; only the 200 s monotonic span counts
+$a1S = @{ exists = $true; length = 34; created = 639284400000000000; fileId = '0000ABCD-0000000000000001'; monoMs = [int64]9000000; readUtcTicks = $T0; lastWriteUtcTicks = $T0; ageSec = 0.0; before = "26.10.2026,12:00:00,x,30,10,No,No`n"; window = ''; windowStartsMidRow = $false }
+$a1E = @{ exists = $true; length = 68; created = 639284400000000000; fileId = '0000ABCD-0000000000000001'; monoMs = [int64]9200000; readUtcTicks = $T0 + 2000000000; lastWriteUtcTicks = $T0 + 1010000000; ageSec = 99.0; before = ''; window = "26.10.2026,12:01:41,x,70,45,No,No`n"; windowStartsMidRow = $false; replaced = $false; truncated = $false }
+$a1 = Get-CorePartitionFeedSummary $a1S $a1E 120 $a1S
+# adversary r7 (15b3bbf7) A2 (literal): the feed replaced between the pre-helper and start reads by a file whose newest row is a day old
+$a2B = @{ exists = $true; length = 34; created = $T0 - 1728000000000; fileId = '0000ABCD-0000000000000001'; monoMs = [int64]8995000; readUtcTicks = $T0 - 50000000; lastWriteUtcTicks = $T0 - 864000000000 }
+$a2S = @{ exists = $true; length = 34; created = $T0 - 864000000000; fileId = '0000ABCD-0000000000000002'; monoMs = [int64]9000000; readUtcTicks = $T0; lastWriteUtcTicks = $T0 - 864000000000; before = "25.10.2026,12:00:00,x,20,10,No,No`n"; window = ''; windowStartsMidRow = $false }
+$a2E = @{ exists = $true; length = 68; created = $T0 - 864000000000; fileId = '0000ABCD-0000000000000002'; monoMs = [int64]9020000; readUtcTicks = $T0 + 200000000; lastWriteUtcTicks = $T0 + 200000000; before = ''; window = "26.10.2026,12:00:20,x,70,45,No,No`n"; windowStartsMidRow = $false; replaced = $false; truncated = $false }
+$a2 = Get-CorePartitionFeedSummary $a2S $a2E 120 $a2B
+# the same file grown after the pre-helper read only by an unfinished row: the newest complete row ends before the pre-helper offset (183 < 190)
+$pB = @{ exists = $true; length = 190; monoMs = [int64]8995000 }
+$pS = @{ exists = $true; length = 200; monoMs = [int64]9000000; before = "26.10.2026,12:00:00,x,20,10,No,No`n26.10.2026,12:00"; window = ''; windowStartsMidRow = $false }
+$pBok = $pB.Clone(); $pBok.length = 180
+$r.adversaryR7 = @([string]$a1.reasons['rows'], $a1.rows, $a1.pkgWattsMean, $a2.rows, $a2.pkgWattsMean, $a2.pkgTempCAtStart, [string]$a2.reasons['pkgTempCAtStart'],
+    [string](Get-CorePartitionFeedSummary $pS $a2E 120 $pB).reasons['pkgTempCAtStart'], (Get-CorePartitionFeedSummary $pS $a2E 120 $pBok).pkgTempCAtStart)# sol r6 CP-07: the one guarded number parse (absent in a pre-r7 generator)
 $r.number = 'absent'
 if (Get-Command ConvertFrom-CorePartitionNumber -ErrorAction SilentlyContinue) {
     $big = ('{"v":99999999999999999999}' | ConvertFrom-Json).v
     $tick = ('{"v":639286128040000000}' | ConvertFrom-Json).v
     $r.number = @(foreach ($p in @(@(4242, 'int64'), @('4242', 'int64'), @('oops', 'int64'), @($true, 'int64'), @(1.5, 'int64'), @($tick, 'int64'), @(1e19, 'int64'), @($big, 'int64'),
-            @(, @(1, 2)), @('1e309', 'double'), @('NaN', 'double'), @($null, 'double'), @(2.5, 'double'), @('oops', 'double'))) {
+            @(, @(1, 2)), @('1e309', 'double'), @('NaN', 'double'), @($null, 'double'), @(2.5, 'double'), @('oops', 'double'), @(9.21e18, 'int64'))) {
         if ($p.Count -eq 1) { $p = @(@(1, 2), 'int64') }
         $n = ConvertFrom-CorePartitionNumber $p[0] $p[1]; , @($n.ok, $n.value) })
 }
@@ -1077,7 +1092,7 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         self.assertEqual(self.r["feed"], [3, 50.0, 55.0, 75.0, 80.0, 1, 62.5, 0])
         self.assertEqual(self.r["feedWhole"], 4, "a window that starts on a row boundary keeps its first row")
         self.assertEqual(self.r["rotated"], ["feed-rotated", 62.5])
-        self.assertEqual(self.r["stale"], "feed-stale")
+        self.assertEqual(self.r["stale"], "feed-freshness-unverified", "sol r6 CP-09: rows appended inside a 200 s span may be older than the 120 s limit")
         self.assertEqual(self.r["unparseable"], "feed-unparseable")
         self.assertEqual(self.r["empty"], "feed-no-rows-in-window")
         self.assertEqual(self.r["missing"], ["feed-missing", "feed-missing"])
@@ -1202,23 +1217,33 @@ class CorePartitionPureHelperTests(unittest.TestCase):
                 self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"a same-path process gone before the measured app started is no overlap: {control}")
 
     def test_a_negative_feed_age_is_no_freshness(self) -> None:
-        """adversary r5 (40038f92) A4: a backward clock step must not turn a 199 s old feed into package values (r7: the monotonic clock sees the
-        step); a future last-write stamp over a long window is still a negative age; a short window reads whatever the stamps say."""
-        self.assertEqual(self.r["negativeAge"], ["feed-clock-stepped", None, "feed-age-negative", 1])
+        """adversary r5 (40038f92) A4: a backward clock step must not turn a 199 s old feed into package values. r7: freshness is monotonic only,
+        so a 200 s window (stepped clock or a future stamp) proves nothing and a 30 s window reads whatever the stamps say."""
+        self.assertEqual(self.r["negativeAge"], ["feed-freshness-unverified", None, "feed-freshness-unverified", 1])
 
     def test_feed_freshness_is_measured_on_the_monotonic_clock(self) -> None:
         """sol r6 CP-09 (= adversary r6 A4), its literal: last write at real +1 s, end read at real +200 s after a 100 s backward UTC step, limit 120 s."""
         m = self.r["monotonic"]
-        self.assertEqual(m[:3], [None, None, "feed-clock-stepped"], f"a feed 199 s old was published as fresh after a backward clock step: {m}")
+        self.assertEqual(m[:3], [None, None, "feed-freshness-unverified"], f"a feed 199 s old was published as fresh after a backward clock step: {m}")
         self.assertEqual(m[3:6], [1, 45.0, ""], f"a 30 s monotonic window is fresh whatever the wall clock did: {m}")
         for got in m[6:9]:
             self.assertEqual(got, [None, "feed-freshness-unverified"], f"a mark without a usable monotonic baseline proved freshness: {m}")
         self.assertEqual(m[9:], ["feed-stale", "feed-freshness-unverified"], "a feed unchanged for 200 s monotonic is stale; unchanged over 5 s proves nothing")
 
+    def test_no_wall_clock_shape_or_file_swap_makes_an_old_row_fresh(self) -> None:
+        """adversary r7 (15b3bbf7) A1 and A2, their literals: a two-way clock step whose endpoints agree, and a feed replaced by a day-old file between
+        the pre-helper and start reads; plus a start mark grown only by an unfinished row since the pre-helper read, and its control."""
+        a = self.r["adversaryR7"]
+        self.assertEqual(a[:3], ["feed-freshness-unverified", None, None], f"A1: a 199 s old row was published: {a}")
+        self.assertEqual(a[3:5], [1, 45.0], f"A2: the 20 s window itself is fresh: {a}")
+        self.assertEqual(a[5:7], [None, "feed-freshness-unverified"], f"A2: a replaced file's day-old row was the start temperature: {a}")
+        self.assertEqual(a[7:], ["feed-freshness-unverified", 20.0], f"only a complete row ending after the pre-helper offset is fresh: {a}")
+
     def test_one_guarded_parse_reads_every_record_number(self) -> None:
         """sol r6 CP-07: JSON numbers and invariant numeric text parse; text, flags, arrays, fractions, out-of-range and non-finite values do not."""
         self.assertEqual(self.r["number"], [[True, 4242], [True, 4242], [False, None], [False, None], [False, None], [True, 639286128040000000], [False, None],
-                                            [False, None], [False, None], [False, None], [False, None], [True, None], [True, 2.5], [False, None]])
+                                            [False, None], [False, None], [False, None], [False, None], [True, None], [True, 2.5], [False, None],
+                                            [True, 9210000000000000000]])
 
     def test_a_non_numeric_record_value_reaching_a_consumer_never_throws(self) -> None:
         """sol r6 CP-07 sites :4299 :4399 :4404 :4473 :4498 :4501 :4512 :4514, each called directly with a non-number."""

@@ -4309,7 +4309,7 @@ function ConvertFrom-CorePartitionNumber($Value, [string]$Kind) {
             if ($Value -is [string]) { if ([int64]::TryParse($Value, [Globalization.NumberStyles]::AllowLeadingSign, $inv, [ref]$l)) { return @{ ok = $true; value = $l } }; return $no }
             # an out-of-range BigInteger / UInt64 / decimal throws in the cast, which the catch turns into $no
             if ($isInt) { if ($Value -is [decimal] -and [decimal]::Truncate($Value) -ne $Value) { return $no }; return @{ ok = $true; value = [int64]$Value } }
-            if ($isReal) { $d = [double]$Value; if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or [math]::Floor($d) -ne $d -or [math]::Abs($d) -ge 9.2e18) { return $no }; return @{ ok = $true; value = [int64]$d } }
+            if ($isReal) { $d = [double]$Value; if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or [math]::Floor($d) -ne $d -or $d -lt -9223372036854775808.0 -or $d -ge 9223372036854775808.0) { return $no }; return @{ ok = $true; value = [int64]$d } }
             return $no
         }
         if ($Kind -eq 'double') {
@@ -4363,29 +4363,33 @@ function Split-CorePartitionFeedLines([string]$Text) {
     , $l
 }
 
-# PURE. sol r6 CP-09: a feed mark's freshness on the monotonic clock, never on wall-clock differences alone. Each mark carries monoMs (the
-# Stopwatch clock at its read), readUtcTicks, length, lastWriteUtcTicks and fileId. The feed's last write is known to fall inside the monotonic
-# span from $Base's read to $Mark's read only when the feed changed between the two reads (length, last-write stamp or file id; compared, never
-# subtracted). Changed and a span of at most $StaleSec: fresh. Unchanged over a longer span: stale. Changed over a longer span: fresh only when
-# the wall clock moved with the monotonic clock over the span (within 2 s, so it did not step) and the wall-clock age at the read is -5..$StaleSec
-# seconds. No usable monotonic time on either mark, a span that runs backwards, or no change over a short span proves nothing. $null = fresh,
-# else feed-freshness-unverified / feed-clock-stepped / feed-age-negative / feed-stale.
-function Test-CorePartitionFeedFresh($Base, $Mark, [double]$StaleSec) {
+# PURE. sol r6 CP-09 (+ adversary r7 15b3bbf7 A1/A2): a feed mark's freshness on the monotonic clock only; no wall-clock time (read time, last-write
+# stamp) takes part, so no clock step, however it is shaped, can make an old row look new. Each mark carries monoMs, the Stopwatch clock at its read.
+# $RowAppended says (the caller proves it from the bytes) that a complete row was appended to the SAME file after $Base's read and before $Mark's,
+# so the feed's newest row was written inside that monotonic span. Appended within a span of at most $StaleSec: fresh. Appended within a longer
+# span: unprovable (the row may be older than the limit). Nothing appended over a longer span: stale. No usable monotonic time, a span that runs
+# backwards, or nothing appended over a short span proves nothing. $null = fresh, else feed-freshness-unverified / feed-stale.
+function Test-CorePartitionFeedFresh($Base, $Mark, [double]$StaleSec, [bool]$RowAppended) {
     if ($null -eq $Base -or $null -eq $Mark -or -not $Base.exists -or -not $Mark.exists) { return 'feed-freshness-unverified' }
     $b0 = (ConvertFrom-CorePartitionNumber $Base.monoMs 'int64').value; $m0 = (ConvertFrom-CorePartitionNumber $Mark.monoMs 'int64').value
     if ($null -eq $b0 -or $null -eq $m0 -or $m0 -lt $b0) { return 'feed-freshness-unverified' }
     $spanSec = ($m0 - $b0) / 1000.0
-    $changed = ([string]$Base.length -ne [string]$Mark.length -or [string]$Base.lastWriteUtcTicks -ne [string]$Mark.lastWriteUtcTicks -or [string]$Base.fileId -ne [string]$Mark.fileId)
-    if (-not $changed) { if ($spanSec -gt $StaleSec) { return 'feed-stale' }; return 'feed-freshness-unverified' }
-    if ($spanSec -le $StaleSec) { return $null }
-    $bw = (ConvertFrom-CorePartitionNumber $Base.readUtcTicks 'int64').value; $mw = (ConvertFrom-CorePartitionNumber $Mark.readUtcTicks 'int64').value
-    $lw = (ConvertFrom-CorePartitionNumber $Mark.lastWriteUtcTicks 'int64').value
-    if ($null -eq $bw -or $null -eq $mw -or $null -eq $lw) { return 'feed-freshness-unverified' }
-    if ([math]::Abs(($mw - $bw) / 1e7 - $spanSec) -gt 2) { return 'feed-clock-stepped' }
-    $age = ($mw - $lw) / 1e7
-    if ($age -lt -5) { return 'feed-age-negative' }
-    if ($age -gt $StaleSec) { return 'feed-stale' }
+    if (-not $RowAppended) { if ($spanSec -gt $StaleSec) { return 'feed-stale' }; return 'feed-freshness-unverified' }
+    if ($spanSec -gt $StaleSec) { return 'feed-freshness-unverified' }
     $null
+}
+
+# PURE. adversary r7 (15b3bbf7) A2: whether the start mark's newest complete row was appended to the same file after the pre-helper read ($Base):
+# both marks are the same file (file id and creation time; a replaced file proves no write of its rows) and the newline that ends the last complete
+# row of $Start.before sits at or after $Base's length (byte offset), i.e. it was written after that read.
+function Test-CorePartitionFeedRowAfter($Base, $Start) {
+    if ($null -eq $Base -or $null -eq $Start -or -not $Base.exists -or -not $Start.exists) { return $false }
+    if ([string]$Base.fileId -ne [string]$Start.fileId -or [string]$Base.created -ne [string]$Start.created) { return $false }
+    $bl = (ConvertFrom-CorePartitionNumber $Base.length 'int64').value; $sl = (ConvertFrom-CorePartitionNumber $Start.length 'int64').value
+    $before = [string]$Start.before
+    $nl = $before.LastIndexOf("`n")
+    if ($null -eq $bl -or $null -eq $sl -or $nl -lt 0) { return $false }
+    ($sl - [Text.Encoding]::UTF8.GetByteCount($before.Substring($nl + 1)) - 1) -ge $bl
 }
 
 # PURE. The feed rows appended between the launch mark and the end mark, plus the newest row before the launch (the start temperature).
@@ -4409,14 +4413,15 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $
     elseif (($Start.fileId -or $End.fileId) -and [string]$Start.fileId -ne [string]$End.fileId) { $code = 'feed-replaced' }
     elseif ($End.replaced) { $code = 'feed-replaced' }
     elseif ($End.truncated) { $code = 'feed-window-truncated' }
-    # sol r6 CP-09 (was wall-clock ageSec, which a backward clock step shrinks): the end mark is fresh on the monotonic clock from the start mark.
-    else { $code = Test-CorePartitionFeedFresh $Start $End $StaleSec }
     if ($null -eq $code) {
         $lines = Split-CorePartitionFeedLines ([string]$End.window)
         if ($End.windowStartsMidRow) { $lines = @($lines | Select-Object -Skip 1) }
         $parsed = ConvertFrom-CorePartitionFeedRows $lines
         if ($null -eq $parsed.rows) { $code = $parsed.why }
-        else {
+        # sol r6 CP-09 (was wall-clock ageSec, which a clock step shrinks): every window row is a complete row appended to the same file after the
+        # start mark's read, so the end mark is fresh on the monotonic clock when that span is at most the limit.
+        else { $code = Test-CorePartitionFeedFresh $Start $End $StaleSec $true }
+        if ($null -eq $code) {
             $rows = @($parsed.rows)
             $wm = [double]($rows | Measure-Object -Property w -Average).Average
             $tm = [double]($rows | Measure-Object -Property c -Average).Average
@@ -4436,8 +4441,8 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $
     $startCode = $null
     if ($null -eq $Start -or -not $Start.exists) { $startCode = 'feed-missing' }
     else {
-        # sol r6 CP-09: the start mark is fresh on the monotonic clock from the pre-helper mark ($Base).
-        $startCode = Test-CorePartitionFeedFresh $Base $Start $StaleSec
+        # sol r6 CP-09: the start mark is fresh on the monotonic clock from the pre-helper mark ($Base), its newest row appended after that read.
+        $startCode = Test-CorePartitionFeedFresh $Base $Start $StaleSec (Test-CorePartitionFeedRowAfter $Base $Start)
         if ($null -eq $startCode) {
             $bp = ConvertFrom-CorePartitionFeedRows (Split-CorePartitionFeedLines ([string]$Start.before))
             if ($null -eq $bp.rows) { $startCode = $bp.why } else { $s.pkgTempCAtStart = [double]@($bp.rows)[-1].c }
@@ -5483,7 +5488,7 @@ if ($CorePartitionTelemetry) {
     # record HMAC took the helper past the earlier 30000).
     if ($cpHelperEncoded.Length -gt 32000) { throw "CORE_PARTITION_HELPER_TOO_LONG the encoded helper is $($cpHelperEncoded.Length) chars (limit 32000, one command line)" }
     $cpHelperAffinity = if ($corePartitionArgs.load -ne 0) { $corePartitionArgs.load } else { $corePartitionArgs.helper }
-    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'ConvertFrom-CorePartitionNumber', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Split-CorePartitionFeedLines', 'Test-CorePartitionFeedFresh', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Join-CorePartitionWhy', 'Get-CorePartitionReadyFeed', 'ConvertTo-CorePartitionUtcTicks', 'Test-CorePartitionHelperRecordShape', 'Test-CorePartitionHelperMac', 'Test-CorePartitionHelperRecord', 'Test-CorePartitionMeasuredApp', 'Get-CorePartitionScalars', 'Get-CorePartitionFeedHandleInfo', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince') "`n"
+    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'ConvertFrom-CorePartitionNumber', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Split-CorePartitionFeedLines', 'Test-CorePartitionFeedFresh', 'Test-CorePartitionFeedRowAfter', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Join-CorePartitionWhy', 'Get-CorePartitionReadyFeed', 'ConvertTo-CorePartitionUtcTicks', 'Test-CorePartitionHelperRecordShape', 'Test-CorePartitionHelperMac', 'Test-CorePartitionHelperRecord', 'Test-CorePartitionMeasuredApp', 'Get-CorePartitionScalars', 'Get-CorePartitionFeedHandleInfo', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince') "`n"
     $cpLaunchOld = @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
