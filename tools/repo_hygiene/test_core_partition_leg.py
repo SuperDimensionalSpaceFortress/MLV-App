@@ -175,6 +175,7 @@ function Write-JobTrace([string]$Message) { }
 function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText($Path, $Value) }
 function New-AttrCudaDirectory { param([string]$Path) }
 function Save-Json { param($Object, $Path) $global:cpSaved = $Object }
+function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) $p = Join-Path $ContainingRoot 'run.log'; if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'run log unresolvable' }; [pscustomobject]@{ path = $p } }
 $exePath = 'C:\no\such\MLVApp.exe'
 $SmokeProcessTimeoutMs = 60000
 $out = [ordered]@{}
@@ -199,6 +200,8 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
         $rb = [Text.Encoding]::UTF8.GetBytes('{"schema":"mlv-app/core-partition-helper/v1","pid":' + $corePartitionHelperLaunch.pid + ',"monoBaseMs":' + $mb + ',"app":' + $inst + ',"instances":[' + $inst + '],"others":[],"clockSkewMaxMs":0}')
         [IO.File]::WriteAllBytes($corePartitionHelperOut, $rb)
         [IO.File]::WriteAllText("$corePartitionHelperOut.mac", [Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($corePartitionHelperNonce)).ComputeHash($rb)))
+        # r13 (CP-FEED-START-ANCHOR): the run log the result names; the measured session's playback starts 100 ms after the measured launch
+        [IO.File]::WriteAllText((Join-Path $Work 'run.log'), '[' + $corePartitionMeasuredLaunchUtc.AddMilliseconds(100).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 worker_threads=16`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(110).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n")
     }
     $global:cpSaved = $null
     . ([scriptblock]::Create($regions[1]))
