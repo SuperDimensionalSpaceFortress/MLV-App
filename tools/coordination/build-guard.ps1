@@ -96,6 +96,8 @@
 #   Library:   . tools\coordination\build-guard.ps1 -Library
 #              Invoke-BuildGuard -Label x -Action { param($Jobs) ... }  (pre-flight + slot + jobs, then
 #              the action, slot released in finally). Used by the PowerShell build launchers.
+#              -NoSlot takes neither the heavy slot nor the build slot; it is for callers that build nothing
+#              (-PrintJobs uses it) and always writes BUILD_GUARD_NO_SLOT on stderr.
 #
 # -RequestedJobs N (library/command) caps the choice: jobs = min(chosen, N). A caller can build
 # smaller than the guard allows, never larger.
@@ -375,10 +377,18 @@ function New-HeavySlotHolder([string]$ReadyFile, [string]$StopFile) {
 function Send-HeavySlotLines($Lease) {
     # Relays the lines heavy-slot has written to its log file since the last call, and keeps them for the marker check.
     # A log that exists but cannot be read sets LogUnread, so admission can fail closed instead of seeing no lines.
-    try { $all = @(Get-Content -LiteralPath $Lease.Log -ErrorAction Stop); $Lease.LogUnread = $false } catch {
-        $all = @()
+    # While heavy-slot runs, only newline-terminated lines are taken: a last line still being written stays in $Lease.Tail
+    # for a later call, so a half-written line is never kept in place of the whole one (r4 adversary A2). Once heavy-slot
+    # has ended, its last line is complete with or without a newline.
+    try { $raw = [string](Get-Content -LiteralPath $Lease.Log -Raw -ErrorAction Stop); $Lease.LogUnread = $false } catch {
+        $raw = ''
         $Lease.LogUnread = [bool](Test-Path -LiteralPath $Lease.Log)
     }
+    $all = @($raw -split '\r?\n')
+    $last = $all[-1]
+    $all = @(if ($all.Count -gt 1) { $all[0..($all.Count - 2)] })
+    $Lease.Tail = ''
+    if ($last) { if ($Lease.Process -and $Lease.Process.HasExited) { $all += $last } else { $Lease.Tail = $last } }
     for ($i = $Lease.Lines.Count; $i -lt $all.Count; $i++) {
         $Lease.Lines.Add([string]$all[$i])
         [Console]::Error.WriteLine([string]$all[$i])
@@ -452,14 +462,18 @@ function Get-HeavySlotHolderState($Lease) {
     if (-not $Lease.Holder) {
         $text = [string](Get-Content -LiteralPath $Lease.Ready -Raw -ErrorAction SilentlyContinue)
         if (-not ($text -match '(?m)^end\s*$')) { return '' }
-        if (-not ($text -match '(?m)^holder=(\d+)@(\d+)\s*$')) { return 'unreadable' }
-        $holder = @{ Pid = [int]$Matches[1]; Ticks = [long]$Matches[2] }
+        # A pid or tick count too large for its type is unreadable too, never a throw (r4 adversary A3).
+        [int]$n = 0; [long]$t = 0
+        if (-not ($text -match '(?m)^holder=(\d+)@(\d+)\s*$' -and [int]::TryParse($Matches[1], [ref]$n) -and [long]::TryParse($Matches[2], [ref]$t))) { return 'unreadable' }
+        $holder = @{ Pid = $n; Ticks = $t }
         # The owner's identity is the one the holder verified against HEAVY_SLOT_HELD_START (owner=<pid>@<ticks>; -1 when it
         # was gone or not verifiable), never a pid looked up now, which may have been reused (r3b adversary A1, r4 sol B2).
         # 'owner=none' (heavy-slot ran the holder without its slot) leaves only the holder to check; no owner line is unreadable.
         $owner = $null
-        if ($text -match '(?m)^owner=(\d+)@(-?\d+)\s*$') { $owner = @{ Pid = [int]$Matches[1]; Ticks = [long]$Matches[2] } }
-        elseif (-not ($text -match '(?m)^owner=none\s*$')) { return 'unreadable' }
+        if ($text -match '(?m)^owner=(\d+)@(-?\d+)\s*$') {
+            if (-not ([int]::TryParse($Matches[1], [ref]$n) -and [long]::TryParse($Matches[2], [ref]$t))) { return 'unreadable' }
+            $owner = @{ Pid = $n; Ticks = $t }
+        } elseif (-not ($text -match '(?m)^owner=none\s*$')) { return 'unreadable' }
         $Lease.Holder = $holder
         $Lease.Owner = $owner
     }
@@ -551,7 +565,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Label = 'mlv:{0}:build' -f (Get-HeavySlotLane); BuildLabel = $Label
         Ready = Join-Path $dir "$id.ready"; Stop = Join-Path $dir "$id.stop"; ExitFile = Join-Path $dir "$id.exit.json"
         Log = Join-Path $dir "$id.log"; Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''; LogUnread = $false; Holder = $null
-        Owner = $null; Gone = ''
+        Owner = $null; Gone = ''; Tail = ''
     }
     # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a
     # file, never a pipe, so nothing it writes while it holds the slot can block it (adversary A4).
@@ -622,11 +636,14 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             Start-Sleep -Milliseconds 250
         }
         Send-HeavySlotLines $lease
+        # A line still unfinished at admission is given up to 2 s to end (r4 adversary A2).
+        for ($i = 0; $lease.Tail -and $i -lt 20; $i++) { [Threading.Thread]::Sleep(100); Send-HeavySlotLines $lease }
         if ((Get-HeavySlotHolderState $lease) -ne 'alive') { Exit-HeavySlotHolderGone $lease }
-        if ($lease.LogUnread) {
+        if ($lease.LogUnread -or $lease.Tail) {
             # Its lines (a PIN MISMATCH among them) cannot be checked, so the slot is given back and nothing is built.
+            $what = if ($lease.LogUnread) { 'heavy-slot log unreadable at admission' } else { 'heavy-slot log line unfinished at admission' }
             Exit-HeavySlot $lease
-            Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code=1 reason=heavy-slot log unreadable at admission utc={1}' -f $Label, [DateTime]::UtcNow.ToString('o'))
+            Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code=1 reason={1} utc={2}' -f $Label, $what, [DateTime]::UtcNow.ToString('o'))
             exit 1
         }
         # heavy-slot only warns when the script it runs is not the pin (it may have changed after the hash above), so
@@ -699,6 +716,11 @@ function Invoke-BuildGuard {
     # The machine heavy slot is the OUTERMOST lock of a build: the memory floor and the build slot below nest inside it,
     # and the outer finally gives it back on every way out, a throw a Library caller catches included (adversary A2).
     $heavy = $null
+    if ($NoSlot) {
+        # -NoSlot is for a caller that builds nothing (-PrintJobs): it takes neither slot, so the bypass is a typed line a
+        # receipt can classify, never a silent one (r4 adversary A1).
+        Write-BuildGuardLog ('BUILD_GUARD_NO_SLOT label={0} reason=-NoSlot: no machine heavy slot and no build slot taken; for callers that build nothing' -f $Label)
+    }
     try {
         if (-not $NoSlot) { $heavy = Enter-HeavySlot -Options $o -Label $Label }
         $started = [DateTime]::UtcNow

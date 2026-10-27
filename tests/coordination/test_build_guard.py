@@ -1484,6 +1484,65 @@ def test_a_start_time_that_cannot_be_read_after_the_lookup_is_gone_never_alive(b
     assert "state=gone gone=holder-exited" in done.stdout, done.stdout + done.stderr
 
 
+def test_a_half_written_log_line_is_never_kept_in_place_of_the_whole_one(box) -> None:
+    # r4 adversary A2: the log is read while heavy-slot is still writing its PIN MISMATCH warning. The half line must not be
+    # kept, or the finished line (same line count) is never read and the pin refusal is missed. Once heavy-slot has ended,
+    # a last line without a newline is complete and is kept.
+    log = box["dir"] / "x.log"
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n"
+                f"$lease = @{{ Log = '{log}'; Lines = [System.Collections.Generic.List[string]]::new(); LogUnread = $false; Tail = ''; "
+                "Process = [pscustomobject]@{ HasExited = $false } }\n"
+                f"[IO.File]::WriteAllText('{log}', \"HEAVY-SLOT TICKET t1 11111111111111111111111111111111`nHEAVY-SLOT WARN: PIN MIS\")\n"
+                "Send-HeavySlotLines $lease 2>$null\n"
+                f"[IO.File]::AppendAllText('{log}', \"MATCH: running changed script`n\")\n"
+                "Send-HeavySlotLines $lease 2>$null\n"
+                "Write-Output \"pin=$(@($lease.Lines | Where-Object { $_ -match 'PIN MISMATCH' }).Count) n=$($lease.Lines.Count)\"\n"
+                f"[IO.File]::AppendAllText('{log}', 'HEAVY-SLOT last words')\n"
+                "Send-HeavySlotLines $lease 2>$null\n"
+                "Write-Output \"running=$($lease.Lines.Count) tail=[$($lease.Tail)]\"\n"
+                "$lease.Process = [pscustomobject]@{ HasExited = $true }\n"
+                "Send-HeavySlotLines $lease 2>$null\n"
+                "Write-Output \"ended=$($lease.Lines.Count) last=[$($lease.Lines[-1])]\"\n"])
+    assert "pin=1 n=2" in done.stdout, done.stdout + done.stderr
+    assert "running=2 tail=[HEAVY-SLOT last words]" in done.stdout, done.stdout + done.stderr
+    assert "ended=3 last=[HEAVY-SLOT last words]" in done.stdout, done.stdout + done.stderr
+
+
+def test_no_slot_is_a_typed_line_never_a_silent_bypass(box) -> None:
+    # r4 adversary A1: -NoSlot takes neither slot (it is for callers that build nothing, like -PrintJobs). The bypass is
+    # written as a typed line, so it can never pass for a build under the machine heavy slot.
+    done = _library_driver(
+        box,
+        "Invoke-BuildGuard -Label 'nslot' -NoSlot -Options $opts -Action { param($Jobs) Write-Output \"ACTION_RAN jobs=$Jobs\" }\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "ACTION_RAN jobs=4" in done.stdout
+    assert "BUILD_GUARD_NO_SLOT label=nslot reason=-NoSlot" in done.stderr, done.stderr
+    assert _stub_calls(box) == []
+    printed = _heavy(box, "run", ["-PrintJobs"])
+    assert printed.stdout.strip() == "-j4" and "BUILD_GUARD_NO_SLOT label=build" in printed.stderr
+
+
+@pytest.mark.parametrize("holder, owner", [
+    ("holder=2147483648@638971000020000000", "owner=none"),
+    ("holder=1@9223372036854775808", "owner=none"),
+    ("holder=1@638971000020000000", "owner=2147483648@1"),
+    ("holder=1@638971000020000000", "owner=1@9223372036854775808"),
+])
+def test_an_out_of_range_identity_in_the_ready_file_is_unreadable_not_a_throw(box, holder, owner) -> None:
+    # r4 adversary A3 (advisory): a pid or tick count too large for its type is a typed unreadable, never a throw that skips
+    # the COULD-NOT-CHECK path.
+    ready = box["dir"] / "x.ready"
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n"
+                f"Set-Content -LiteralPath '{ready}' -Value @('t:1', '{holder}', '{owner}', 'end') -Encoding ascii\n"
+                f"$lease = @{{ Ready = '{ready}'; Holder = $null; Owner = $null; Gone = ''; Process = [pscustomobject]@{{ HasExited = $false }} }}\n"
+                "try { Write-Output \"state=$(Get-HeavySlotHolderState $lease)\" } catch { Write-Output \"threw=$($_.Exception.GetType().Name)\" }\n"])
+    assert "state=unreadable" in done.stdout, done.stdout + done.stderr
+
+
 def test_explicit_empty_inputs_reach_the_guard_as_given(box) -> None:
     # sol hardening (r3b review): _heavy(memory=[]) and sha='' are test inputs, not requests for the defaults.
     done = _heavy(box, "run", ["-Command", _marker_command(box)], sha="", memory=[])
