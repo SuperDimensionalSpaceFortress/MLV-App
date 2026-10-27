@@ -2146,7 +2146,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         [b] = self.batches()
         self.assertEqual(b["endReason"], "BATCH_ERROR")
 
-    def _runner_paused_at_claim_taken(self, message: str = "CLAIM_TAKEN", release_at: str = "") -> tuple[Path, Path, Path]:
+    def _runner_paused_at_claim_taken(self, message: str = "CLAIM_TAKEN", release_at: str = "", more: tuple = ()) -> tuple[Path, Path, Path]:
         """A copy of the runner that PAUSES when it is about to log a line starting `message` (CLAIM_TAKEN by default): it writes `paused` and waits (at most 60 s) for `locked` to appear.
         With `release_at`, the first line starting with it once `locked` exists writes `release-wanted` and waits (at most 60 s) for `released`: the lock holder lets go there.
         Returns (runner, paused, locked). Dot on #684: the lock helper used to poll for the claim file and hope to win the race with the runner's next log line; the handshake makes the order a fact.
@@ -2160,7 +2160,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             pause += (f"    if ($Message.StartsWith('{psq(release_at)}', [StringComparison]::Ordinal) -and (Test-Path -LiteralPath '{psq(locked)}') -and -not (Test-Path -LiteralPath '{psq(released)}')) {{ "
                       f"Set-Content -LiteralPath '{psq(wanted)}' -Value 'release'; $sw = [Diagnostics.Stopwatch]::StartNew(); "
                       f"while (-not (Test-Path -LiteralPath '{psq(released)}') -and $sw.Elapsed.TotalSeconds -lt 60) {{ Start-Sleep -Milliseconds 20 }} }}\n")
-        return self._patched_runner(anchor, anchor + pause), paused, locked
+        return self._patched_runner(anchor, anchor + pause, *more), paused, locked
 
     def _lock_log_while_the_runner_is_paused(self, log: Path, paused: Path, locked: Path, give_up_s: float = 120) -> tuple[threading.Event, threading.Thread, dict]:
         """Wait (at most give_up_s, monotonic) for the runner's `paused` marker, take `log` with share mode 0, write the `locked` marker (the runner resumes only now), and hold the lock
@@ -2184,7 +2184,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             end, seen = time.monotonic() + give_up_s, False
             while not done.is_set() and time.monotonic() < end:
                 if paused.exists():
-                    seen = True
+                    seen = not done.is_set() and time.monotonic() < end   # adversary r3 pass 2 A2: a look that returned after the deadline does not count
                     break
                 done.wait(0.01)
             if not seen:
@@ -2269,16 +2269,18 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual((res["ran"], res["notRun"]), (4, 0))
         self.assertIn("BATCH_LOG_FAILED", r.stderr)
 
-    def _patched_runner(self, old: str, new: str) -> Path:
-        """A copy of the dual-venue tree whose runner has `old` (found exactly once) replaced by `new`; returns the copy's runner."""
+    def _patched_runner(self, old: str, new: str, *more: tuple[str, str]) -> Path:
+        """A copy of the dual-venue tree whose runner has `old` (found exactly once) replaced by `new`, and each further (old, new) pair in `more` likewise; returns the copy's runner."""
         tree = self.case / "tree" / "tools" / "profiling"
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
         shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
         runner = tree / "dual-venue" / RUNNER.name
         text = runner.read_text(encoding="utf-8")
-        self.assertEqual(text.count(old), 1, "the runner line moved: update this fixture")
-        runner.write_text(text.replace(old, new), encoding="utf-8")
+        for o, n in ((old, new), *more):
+            self.assertEqual(text.count(o), 1, "the runner line moved: update this fixture")
+            text = text.replace(o, n)
+        runner.write_text(text, encoding="utf-8")
         return runner
 
     def test_r6_adv_a3_a_result_line_that_cannot_be_appended_to_the_log_is_still_said_on_stderr(self) -> None:
@@ -2460,12 +2462,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     # r2 (Dot advisory on #704): the generated-runner pause helper embedded its paths unescaped in a PowerShell single-quoted literal (an apostrophe in the temp dir broke the runner),
     # and two receipt-write paths had no test: the batch-NN.json rewrite when only the diagnostic's own log write fails, and both receipt destinations failing at once.
-    def _run_with_log_held_at(self, args: list[str], e: dict, message: str, release_at: str = "", give_up_s: float = 120) -> tuple[subprocess.CompletedProcess, dict]:
+    def _run_with_log_held_at(self, args: list[str], e: dict, message: str, release_at: str = "", give_up_s: float = 120, more: tuple = ()) -> tuple[subprocess.CompletedProcess, dict]:
         """Run `args` on a runner copy that pauses at the first log line starting `message`, with batch.log held exclusively from that moment (until the first line starting `release_at`
-        once held, else until the run ends). Returns (result, the lock helper's state); the caller asserts it with _assert_handshake."""
+        once held, else until the run ends); `more` is further (old, new) runner patches. Returns (result, the lock helper's state); the caller asserts it with _assert_handshake."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "batch.log").write_text("", encoding="utf-8")
-        runner, paused, locked = self._runner_paused_at_claim_taken(message, release_at)
+        runner, paused, locked = self._runner_paused_at_claim_taken(message, release_at, more)
         args[args.index("-File") + 1] = str(runner)
         done, t, state = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", paused, locked, give_up_s)
         try:
@@ -2603,17 +2605,34 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(re.findall(r'(?<![\w-])L "[A-Z_]+', between), [], "a direct L call outside the batch try throws out of the script on a held batch.log")
         self.assertIn('LogBest "BATCH_WAIT batch=', between)
 
-    def _two_batch_plan_refused_at_batch_2(self, inject: str) -> tuple[subprocess.CompletedProcess, Path]:
-        """A two-leg plan whose first lease holds one leg (two batches), batches.jsonl a directory, and `inject` (PowerShell) run in batch 2 just before the claim-time input guard."""
+    def _two_batch_plan(self, inject: str) -> tuple[list[str], dict, tuple[str, str]]:
+        """A two-leg plan whose first lease holds one leg (two batches), batches.jsonl a directory: (args, env, the runner patch that runs `inject` (PowerShell) in batch 2 just before
+        the claim-time input guard)."""
         self._occupy_with_directory("batches.jsonl")
         spec2 = self.case / "fx-b-copy.json"
         spec2.write_text(self.specs[1].read_text(encoding="utf-8"), encoding="utf-8")
         plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(spec2, "A", self.commit_a)])
         anchor = "        $hit = Get-InputOutputRefusal\n        if ($hit) {\n"
-        runner = self._patched_runner(anchor, f"        if ($batchNo -eq 2) {{ {inject} }}\n" + anchor)
         args, e = self.plan_cmd(plan, FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
-        args[args.index("-File") + 1] = str(runner)
-        return subprocess.run(args, capture_output=True, text=True, timeout=120, env=e), spec2
+        return args, e, (anchor, f"        if ($batchNo -eq 2) {{ {inject} }}\n" + anchor)
+
+    def _two_batch_plan_refused_at_batch_2(self, inject: str) -> tuple[subprocess.CompletedProcess, Path]:
+        args, e, patch = self._two_batch_plan(inject)
+        args[args.index("-File") + 1] = str(self._patched_runner(*patch))
+        return subprocess.run(args, capture_output=True, text=True, timeout=120, env=e), self.case / "fx-b-copy.json"
+
+    def test_r3_adv_a1_a_refusal_line_that_cannot_be_logged_is_in_the_count_the_summary_reports(self) -> None:
+        # adversary r3 pass 2 A1: the summary was printed BEFORE Stop-PlanRefused tried its own log line, and that append's failure was swallowed uncounted, so the authoritative
+        # result under-reported logWriteFailures. batch.log is held from batch 1's RECEIPT_PERSIST_FAILED to the end: that diagnostic, the refusal line, the NOT_RUN line and the
+        # result line all fail, and the summary, now the last thing written, counts all four.
+        args, e, patch = self._two_batch_plan("Set-Content -LiteralPath '{}' -Value '{{}}'".format(psq(self.case / "fx-b-copy.json")))
+        r, state = self._run_with_log_held_at(args, e, "RECEIPT_PERSIST_FAILED", more=(patch,))
+        self._assert_handshake(state, "RECEIPT_PERSIST_FAILED", r)
+        m = re.search(r"LEG_PLAN_REFUSED reason=(\S+) item=2 ", r.stderr)
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        self._assert_refused_at_batch_2_with_the_summary(r, m.group(1))
+        self.assertEqual(batch_result(r.stdout)["logWriteFailures"], 4, "the diagnostic, the refusal line, the NOT_RUN line and the result line\n" + r.stdout + r.stderr)
+        self.assertNotIn("LEG_PLAN_REFUSED", (self.run_dir / "batch.log").read_text(encoding="utf-8"), "the refusal line was tried while batch.log was held (the case under test)")
 
     def _assert_refused_at_batch_2_with_the_summary(self, r: subprocess.CompletedProcess, reason: str) -> None:
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)

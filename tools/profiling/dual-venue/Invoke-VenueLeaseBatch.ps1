@@ -167,7 +167,8 @@ $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 
-function Stop-Usage([string]$Message) { [Console]::Error.WriteLine("BATCH_USAGE $Message"); exit 2 }
+$script:summaryBeforeExit = $null   # r3: set once a refusal ends a run that already has a batch receipt; the typed refusal prints the summary just before its exit 2
+function Stop-Usage([string]$Message) { [Console]::Error.WriteLine("BATCH_USAGE $Message"); if ($script:summaryBeforeExit) { & $script:summaryBeforeExit }; exit 2 }
 
 # `pwsh -File` passes an array argument as ONE string, so -LegSpec a.json,b.json is split on commas (an entry that is itself an existing path is kept whole;
 # PWSH-FILE-ARRAY-PASSTHRU-1, test_pwsh_string_array_file_params.py).
@@ -241,9 +242,12 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
         elseif (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (Get-FileIdentity $batchLog).links -le 1) { $logPlain = $true }
     } catch { }
     if ($logPlain -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT')) {
-        try { Add-Content -LiteralPath $batchLog -Value "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $line" } catch { }
+        # r3 pass 3 (adversary r3 A1): a failed append is counted when a summary follows (a refusal once a batch receipt exists), so the count that summary reports includes it
+        try { Add-Content -LiteralPath $batchLog -Value "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $line" } catch { if ($script:summaryBeforeExit) { Register-LogFailure $_.Exception.Message } }
     }
     [Console]::Error.WriteLine("BATCH_USAGE $line")
+    # r3 pass 3: the summary is the LAST thing this run writes, after the refusal line, so no append it reports on is still to come
+    if ($script:summaryBeforeExit) { & $script:summaryBeforeExit }
     try { Complete-VenueProcess -ExitCode 2 } catch { }
     exit 2
 }
@@ -922,10 +926,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             if ($req.granted) { try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { } }
             # r3 (opus r2b H3): once a batch receipt exists, this refusal ends the run like any other stop: the summary (receiptPersistFailures included) is printed before the typed
             # exit 2. A location hit turns the write suppression on first (Test-OpenOutputAlias's rule): the refused input may be batch.log itself, so nothing more goes into -RunDir.
+            # r3 pass 3 (adversary r3 A1): the summary runs inside the refusal, AFTER its own log line, so the logWriteFailures it reports counts that line too.
             if ($batches.Count -gt 0) {
                 if ($hit.kind -cne 'content') { $script:RunOutputAliased = $true; $script:batchLog = $null }
                 Set-Stop $(if ($hit.kind -ceq 'content') { $hit.code } elseif ($hit.kind -ceq 'plan') { 'LEG_PLAN_IS_RUN_OUTPUT' } elseif ($hit.kind -ceq 'build') { 'BUILD_MANIFEST_IS_RUN_OUTPUT' } else { 'LEG_SPEC_IS_RUN_OUTPUT' }) 2
-                Write-RunSummary
+                $script:summaryBeforeExit = { Write-RunSummary }
             }
             Stop-InputIsOutput $hit
         }
