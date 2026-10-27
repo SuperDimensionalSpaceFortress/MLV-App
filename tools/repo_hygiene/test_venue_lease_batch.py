@@ -3127,6 +3127,47 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # and the pre-claim preflight, which holds no claim, asks for its own explicit bound
         self.assertIn("-VerifyArtifacts -ArtifactTimeoutSec 300 }", text)
 
+    # r2 (Dot fd08838 cos-feedback/mlv-app/pr-705.md): the test above pins the source; this one TIMES the guard through the runner's offline probe seams. With -ClaimTtlSec 60 and
+    # -ClaimRenewSec 30 (their floors) the guard has 30 s from the grant. Inside the guard (the claim file exists; the preflight before it is fast) the manifest read takes 18 s and the
+    # artifact hash 18 s more. On 22d5ad64 the hash had a whole share of the budget, taken BEFORE the manifest read: it answered at about 36 s, the claim lapsed in the guard and was
+    # asked for again until DEADLINE (exit 3). The manifest read and the hash must share ONE bound: the hash runs out first and the plan is refused SHARE_UNREACHABLE, inside 30 s.
+    def test_artifact_preflight_r2_a_slow_manifest_read_and_a_slow_hash_end_typed_inside_the_claim_guard_budget(self) -> None:
+        c = self.commit_a
+        doc = json.loads((self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json").read_text(encoding="utf-8"))
+        started = self.case / "guard-read-started.txt"
+        in_guard = f"if (Test-Path -LiteralPath '{self.claim_path}' -PathType Leaf) {{ "
+        facts = [self.manifests[c], "C:" + c, "D:" + "f" * 64, "S:bool"] + [x for k in ("packageZip", "exe", "dll") for x in (f"A:{k}=ok", f"H:{k}={doc[k]['sha256']}")]
+        manifest_probe, artifact_probe = self.case / "manifest-probe.ps1", self.case / "artifact-probe.ps1"
+        manifest_probe.write_text("param($p)\n" + in_guard + f"[IO.File]::AppendAllText('{started}', [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.ffffff', [Globalization.CultureInfo]::InvariantCulture) + [Environment]::NewLine); [Threading.Thread]::Sleep(18000) }}\n"
+                                  + "".join(f"'{f}'\n" for f in facts), encoding="utf-8")
+        artifact_probe.write_text("param($items)\n" + in_guard + "[Threading.Thread]::Sleep(18000) }\n", encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c)]), "-ClaimTtlSec", "60", "-ClaimRenewSec", "30",
+                          "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=75)),
+                          "-StagedBuildProbeScript", str(manifest_probe), "-ArtifactProbeScript", str(artifact_probe))
+        ended = datetime.now(timezone.utc)
+        log = self.run_dir / "batch.log"
+        text = r.stdout + r.stderr + (log.read_text(encoding="utf-8", errors="replace") if log.exists() else "")
+        self.assertNotIn("CLAIM_LAPSED_IN_GUARD", text, "the guard outlasted the claim's TTL less one renew interval and the claim was asked for again")
+        self.assertEqual(r.returncode, 2, text)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("could not be hashed", r.stderr)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
+        starts = started.read_text(encoding="utf-8").split()
+        self.assertEqual(len(starts), 1, f"one guard read, no release-and-retry: {starts}")
+        guard_sec = (ended - datetime.fromisoformat(starts[0]).replace(tzinfo=timezone.utc)).total_seconds()
+        self.assertLess(guard_sec, 30, f"the guard (and the refusal after it) took {guard_sec:.1f} s of a 30 s claim-guard budget")
+
+    def test_artifact_preflight_r2_the_probe_seams_are_refused_with_the_real_um_run(self) -> None:
+        probe = self.case / "probe.ps1"
+        probe.write_text("param($p) ''\n", encoding="utf-8")
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-ArtifactProbeScript", str(probe))
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BATCH_USAGE -StagedBuildProbeScript and -ArtifactProbeScript are offline test seams", r.stderr)
+        self.assertEqual(self.kinds(), [])
+
     def test_artifact_preflight_the_artifact_names_are_the_ones_the_leg_job_derives(self) -> None:
         script = (f"Import-Module '{ROOT / 'tools' / 'profiling' / 'bachelor' / 'AttrCudaArtifacts.psm1'}' -Force -DisableNameChecking\n"
                   "$n = Get-AttrCudaArtifactNames -SourceCommit ('3' * 40)\n"

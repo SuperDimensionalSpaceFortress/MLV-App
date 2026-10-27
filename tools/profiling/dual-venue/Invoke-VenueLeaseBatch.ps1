@@ -112,7 +112,7 @@
 # OPEN_JOB_WRITE_FAILED, no cancel, no close, no ledger charge); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
 # 7a); 12 an unexpected throw inside a batch after its claim was taken (BATCH_ERROR: the claim keeper is stopped, the claim released and the batch receipt written
 # first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
-# -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
+# -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir / -StagedBuildProbeScript / -ArtifactProbeScript are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
 [CmdletBinding(DefaultParameterSetName = 'Scalar')]
 param(
     [ValidateSet('bachelor')][string]$Venue = 'bachelor',
@@ -159,7 +159,11 @@ param(
     [string]$QuietScript = '',
     [string]$LegScript = '',
     [string]$UmRunScript = '',
-    [string]$AgentShare = ''
+    [string]$AgentShare = '',
+    # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r2: a .ps1 whose text replaces Get-VenueStagedBuildManifest's manifest read (-ProbeScript) or its artifact hash (-ArtifactProbeScript), in the
+    # preflight and in the claim guard alike, so a test can time a slow share. Offline only: refused with the real um-run.ps1.
+    [string]$StagedBuildProbeScript = '',
+    [string]$ArtifactProbeScript = ''
 )
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
@@ -180,6 +184,10 @@ $umRunIsReal = ([IO.Path]::GetFullPath($UmRunScript) -ieq $realUmRun) -or ((Test
 if ($umRunIsReal -and $LeaseBudgetWindowSec -lt 10800) {
     Stop-Usage "LEASE_CAP_RELAXED -LeaseBudgetWindowSec $LeaseBudgetWindowSec is looser than Bachelor's 10800 s window"
 }
+if ($umRunIsReal -and ($StagedBuildProbeScript -or $ArtifactProbeScript)) { Stop-Usage '-StagedBuildProbeScript and -ArtifactProbeScript are offline test seams: with the real um-run.ps1 the staged build is read from the share' }
+foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object { $_ }) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage "no script at '$s'" } }
+$stagedBuildProbe = $(if ($StagedBuildProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript)) } else { $null })
+$artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript)) } else { $null })
 $cooldownExplicit = $PSBoundParameters.ContainsKey('LeaseCooldownSec'); $budgetExplicit = $PSBoundParameters.ContainsKey('LeaseBudgetSec')
 if ($ClaimRenewSec -eq 0) { $ClaimRenewSec = [int][Math]::Max(1, [Math]::Min(600, [Math]::Floor($ClaimTtlSec / 4))) }
 if (2 * $ClaimRenewSec -gt $ClaimTtlSec) { Stop-Usage "-ClaimRenewSec $ClaimRenewSec is over half of -ClaimTtlSec ${ClaimTtlSec}: one late renewal would let the claim expire" }
@@ -544,7 +552,7 @@ function Get-InputContentRefusal {
             $buildsLeft--
             if ($share -lt 2) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "no time is left in the claim guard (-ClaimTtlSec $ClaimTtlSec less -ClaimRenewSec $ClaimRenewSec) to read and hash the staged build for $short; no lease is opened" } }
             $manifestSec = [int][Math]::Min(30, $share - 1)
-            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $manifestSec -VerifyArtifacts -ArtifactTimeoutSec ($share - $manifestSec)
+            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $manifestSec -VerifyArtifacts -ArtifactTimeoutSec ($share - $manifestSec) -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe
             if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short could not be read after the claim wait at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no lease is opened" } }
             if ($st.state -cne 'STAGED' -and $st.state -cne 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short read as '$($st.state)' after the claim wait; only STAGED with the validated digest opens a lease" } }
             if ($st.state -ceq 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_NOT_STAGED'; why = "no staged build manifest for $short at $($st.path) any more; the runner stages and builds nothing" } }
@@ -647,7 +655,7 @@ if ($legPlanMode) {
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
         foreach ($it in $items) {
-            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }
+            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }
             $st = $builds[$it.sourceCommit]
             $short = $it.sourceCommit.Substring(0, 12)
             if ($st.state -ceq 'UNREACHABLE') { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
