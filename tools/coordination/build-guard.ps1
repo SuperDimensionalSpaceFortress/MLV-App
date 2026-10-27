@@ -38,12 +38,24 @@
 #     BUILD_HEAVY_SLOT_REQUEUE and exits 3, like BUILD_SLOT_BUSY. It is never a build failure.
 #   - Any other exit before admission (a 75-77 without a matching marker included) prints
 #     BUILD_HEAVY_SLOT_COULD_NOT_CHECK and exits with that code (0 becomes 1). It is never a pass.
-#   - The shim missing (not at MLV_HEAVY_SLOT_CMD / on PATH / at the install path) or not startable FAILS
-#     OPEN: one "HEAVY_SLOT_WARN" line on stderr, and the build runs without the heavy slot. A slot mutex
+#   - The ready file admits ONLY while heavy-slot (so its holder) still runs, checked when the file is seen
+#     and again just before "heavy-slot: admitted". A holder that wrote it and has already exited has given
+#     the slot back: BUILD_HEAVY_SLOT_REQUEUE reason=holder-exited-after-ready code=<its exit code>, exit 3,
+#     and the build never runs without the slot on this path.
+#   - The shim missing (not at MLV_HEAVY_SLOT_CMD / on PATH / at the install path) or not startable (it cannot
+#     be started, or cmd exits 9009 before admission because the shim's own interpreter is not found), or a
+#     shim, lock dir or pwsh path holding '%' (cmd would expand it), FAILS OPEN: one "HEAVY_SLOT_WARN" line
+#     on stderr, and the build runs without the heavy slot. A slot mutex
 #     that cannot be opened is heavy-slot's own fail-open (M6): it prints HEAVY-SLOT WARN and runs the
 #     holder unguarded, which this guard relays to stderr.
 #   - heavy-slot.ps1 beside the shim whose SHA-256 is not the pin prints BUILD_HEAVY_SLOT_REFUSED
-#     reason=pin-mismatch and exits 3 before anything runs.
+#     reason=pin-mismatch and exits 3 before anything runs. If heavy-slot itself reports PIN MISMATCH by the
+#     time it admits (the script changed after the hash), the slot is given back, BUILD_HEAVY_SLOT_REFUSED
+#     reason=pin-mismatch-at-run is printed and the guard exits 3 before the build.
+#   - Losing the slot DURING the build (heavy-slot ended before the guard wrote its stop file) does not kill
+#     or fail the build: the slot is a machine-concurrency throttle, not a correctness lock. The guard prints
+#     HEAVY_SLOT_LOST_DURING_ACTION label=<l> code=<heavy-slot exit> utc=<o> on stderr AND stdout, so a
+#     receipt can classify the build as unprotected, and the build's own exit code is returned unchanged.
 #   - A heavy-slot call inside a build action does not pass through (the holder is a child of this guard,
 #     not an ancestor of the action), so it would wait for its own guard: do not nest one there.
 #   - heavy-slot's output goes to a log file beside the lock, never a pipe, so it can never block while it
@@ -91,7 +103,7 @@
 # Exit codes: 3 = refused (memory, slot, heavy-slot REQUEUE or pin mismatch), 2 = usage, 1 = the command fragment failed without a non-zero
 # code of its own, otherwise the fragment's non-zero code (its failing native command's or its own 'exit'),
 # or, when the fragment ended with 0 after a native failure, the first failing native code (0 when nothing
-# failed).
+# failed). Continuation policy: HEAVY_SLOT_LOST_DURING_ACTION never changes the exit code (see MACHINE HEAVY SLOT).
 [CmdletBinding()]
 param(
     [switch]$Library,
@@ -358,6 +370,16 @@ function Remove-HeavySlotFiles($Lease) {
     foreach ($f in @($Lease.Ready, $Lease.Stop, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 }
 
+function Exit-HeavySlotHolderGone($Lease) {
+    # A ready file from a holder that has already exited is no admission: heavy-slot has given the machine slot back,
+    # so nothing is built on it (Dot advisory pr-702). REQUEUE, like a marked 75.
+    Send-HeavySlotLines $Lease
+    foreach ($l in $Lease.Lines) { if ($l -match '^HEAVY-SLOT TICKET (\S+) ') { $Lease.Ticket = $Matches[1] } }
+    Remove-HeavySlotFiles $Lease
+    Write-Output ('BUILD_HEAVY_SLOT_REQUEUE label={0} code={1} ticket={2} reason=holder-exited-after-ready utc={3}' -f $Lease.BuildLabel, $Lease.Process.ExitCode, $Lease.Ticket, [DateTime]::UtcNow.ToString('o'))
+    exit 3
+}
+
 function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # Takes the machine heavy slot for one build unit (see the header). Returns the lease, or $null when it fails
     # open. A pin mismatch, a REQUEUE or a COULD-NOT-CHECK prints its typed line and exits here: nothing ran.
@@ -376,15 +398,21 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # A relative -LockPath is resolved first, so its parent is never empty (adversary A1).
     $lockFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Options.LockPath)
     $dir = Join-Path (Split-Path -Parent $lockFull) 'heavy-slot'
+    $exe = [Environment]::ProcessPath
+    if (-not $exe) { $exe = (Get-Process -Id $PID).Path }
+    # cmd expands %VAR% even inside quotes, so a path with '%' would not reach heavy-slot as given (r1 adversary A3).
+    $pct = @($cmd, $dir, $exe) | Where-Object { ([string]$_).Contains('%') } | Select-Object -First 1
+    if ($pct) {
+        Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=$cmd path-has-percent: $pct; building WITHOUT the machine heavy slot (fail open)"
+        return $null
+    }
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $id = '{0}-{1}' -f $PID, [Guid]::NewGuid().ToString('N')
     $lease = @{
-        Label = 'mlv:{0}:build' -f (Get-HeavySlotLane)
+        Label = 'mlv:{0}:build' -f (Get-HeavySlotLane); BuildLabel = $Label
         Ready = Join-Path $dir "$id.ready"; Stop = Join-Path $dir "$id.stop"; ExitFile = Join-Path $dir "$id.exit.json"
         Log = Join-Path $dir "$id.log"; Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''
     }
-    $exe = [Environment]::ProcessPath
-    if (-not $exe) { $exe = (Get-Process -Id $PID).Path }
     # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a
     # file, never a pipe, so nothing it writes while it holds the slot can block it (adversary A4).
     $quoted = @($cmd, 'run', '--class', 'shared', '--label', $lease.Label, '--eta', ('{0}m' -f $Options.HeavySlotEtaMinutes),
@@ -393,7 +421,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         ForEach-Object { '"' + ([string]$_ -replace '"', '""') + '"' }
     $psi = [System.Diagnostics.ProcessStartInfo]::new($env:ComSpec)
     $psi.UseShellExecute = $false
-    $psi.Arguments = '/d /s /c "' + ($quoted -join ' ') + ' >"' + $lease.Log + '" 2>&1"'
+    $psi.Arguments = '/d /v:off /s /c "' + ($quoted -join ' ') + ' >"' + $lease.Log + '" 2>&1"'
     $psi.Environment['HEAVY_SLOT_EXPECT_SHA256'] = $expected
     $psi.Environment['HEAVY_SLOT_EXPECT_KEEPER'] = '1'
     try { $lease.Process = [System.Diagnostics.Process]::Start($psi) } catch {
@@ -403,15 +431,27 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     Write-BuildGuardLog ('heavy-slot: waiting label={0} wait={1}m exit-file={2} shim={3}' -f $lease.Label, $Options.HeavySlotWaitMinutes, $lease.ExitFile, $cmd)
     # heavy-slot ends its own wait (a marked 75) and its admit cap; this bound only catches a hung tool.
     $giveUp = [DateTime]::UtcNow.AddMinutes($Options.HeavySlotWaitMinutes + 15)
+    $admitted = $false
     try {
-        while (-not (Test-Path -LiteralPath $lease.Ready)) {
+        while ($true) {
             Send-HeavySlotLines $lease
+            # The ready file admits only while its holder still runs (checked after the file is seen, and again below).
+            if (Test-Path -LiteralPath $lease.Ready) {
+                if (-not $lease.Process.HasExited) { break }
+                Exit-HeavySlotHolderGone $lease
+            }
             $why = ''
             $code = 1
             if ($lease.Process.HasExited) {
-                if (Test-Path -LiteralPath $lease.Ready) { break }
+                if (Test-Path -LiteralPath $lease.Ready) { Exit-HeavySlotHolderGone $lease }
                 Send-HeavySlotLines $lease
                 $code = $lease.Process.ExitCode
+                if ($code -eq 9009) {
+                    # cmd's "is not recognized": the shim started but its own interpreter did not (r1 adversary A2).
+                    Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=$cmd not-startable: exit 9009 before admission; building WITHOUT the machine heavy slot (fail open)"
+                    Remove-HeavySlotFiles $lease
+                    return $null
+                }
                 $why = Test-HeavySlotMarker $lease $code
                 if (-not $why) {
                     Remove-HeavySlotFiles $lease
@@ -429,20 +469,40 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             }
             Start-Sleep -Milliseconds 250
         }
+        Send-HeavySlotLines $lease
+        if ($lease.Process.HasExited) { Exit-HeavySlotHolderGone $lease }
+        # heavy-slot only warns when the script it runs is not the pin (it may have changed after the hash above), so
+        # its own PIN MISMATCH line refuses here too, after the slot is given back (r1 adversary A4).
+        if (@($lease.Lines | Where-Object { $_ -match 'PIN MISMATCH' }).Count -gt 0) {
+            Exit-HeavySlot $lease
+            Write-Output ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=pin-mismatch-at-run cli={1} utc={2}' -f $Label, $cli, [DateTime]::UtcNow.ToString('o'))
+            exit 3
+        }
+        Write-BuildGuardLog ('heavy-slot: admitted label={0} held={1}' -f $lease.Label, ((Get-Content -LiteralPath $lease.Ready -Raw -ErrorAction SilentlyContinue) -replace '\s', ''))
+        $admitted = $true
+        return $lease
     } finally {
-        # Every way out before admission (exit, throw, Ctrl+C) leaves the stop file, so a holder heavy-slot starts later
-        # ends at once instead of holding the machine slot (adversary A2).
-        if (-not $lease.Process.HasExited -and -not (Test-Path -LiteralPath $lease.Ready)) { Set-Content -LiteralPath $lease.Stop -Value stop -Encoding ascii -ErrorAction SilentlyContinue }
+        # Every way out before admission (exit, throw, Ctrl+C) leaves the stop file while heavy-slot still runs, even when a
+        # ready file appeared after the last check, so its holder ends at once instead of holding the machine slot
+        # (adversary A2; r1 adversary A1).
+        if (-not $admitted -and -not $lease.Process.HasExited) { Set-Content -LiteralPath $lease.Stop -Value stop -Encoding ascii -ErrorAction SilentlyContinue }
     }
-    Send-HeavySlotLines $lease
-    Write-BuildGuardLog ('heavy-slot: admitted label={0} held={1}' -f $lease.Label, ((Get-Content -LiteralPath $lease.Ready -Raw -ErrorAction SilentlyContinue) -replace '\s', ''))
-    return $lease
 }
 
 function Exit-HeavySlot($Lease) {
     # Gives the slot back: the holder sees the stop file and exits, so heavy-slot releases. The build's verdict
     # never depends on this; a release that does not end cleanly is a WARN only.
     if (-not $Lease) { return }
+    if ($Lease.Process.HasExited) {
+        # heavy-slot ended before the stop file: part of the build ran without the machine slot. The build is not
+        # failed for it (the slot is a throttle, not a correctness lock), but the line lets a receipt call it unprotected.
+        Send-HeavySlotLines $Lease
+        $lost = 'HEAVY_SLOT_LOST_DURING_ACTION label={0} code={1} utc={2}' -f $Lease.BuildLabel, $Lease.Process.ExitCode, [DateTime]::UtcNow.ToString('o')
+        Write-BuildGuardLog $lost
+        [Console]::Out.WriteLine($lost)
+        Remove-HeavySlotFiles $Lease
+        return
+    }
     Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -ErrorAction SilentlyContinue
     if ($Lease.Process.WaitForExit(60000)) {
         Send-HeavySlotLines $Lease

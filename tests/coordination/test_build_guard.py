@@ -788,17 +788,19 @@ def _stub_sha() -> str:
     return hashlib.sha256((HEAVY_STUB_DIR / "heavy-slot.ps1").read_bytes()).hexdigest()
 
 
-def _heavy(box: dict, mode: str, mode_args: list, sha: str = None, shim: Path = HEAVY_STUB) -> subprocess.CompletedProcess:
+def _heavy(box: dict, mode: str, mode_args: list, sha: str = None, shim: Path = HEAVY_STUB, extra: dict = None,
+           lock: Path = None) -> subprocess.CompletedProcess:
     memory_file = _write_json(box["dir"] / "memory.json", OK_MEMORY)
     table_file = _write_json(box["dir"] / "table.json", [])
     env = _env(heavy_slot=shim, extra={
         "STUB_HEAVY_SLOT_MODE": mode,
         "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log"),
         "MLV_LANE_RUN_DIR": str(box["dir"] / "lane-CARD-HS-1-r2-20261027T1420Z"),
+        **(extra or {}),
     })
     return subprocess.run(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GUARD),
-         "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(box["lock"]),
+         "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(lock or box["lock"]),
          "-ExemptLogPath", str(box["exempt_log"]), "-HeavySlotSha256", sha or _stub_sha(), *mode_args],
         capture_output=True, text=True, timeout=120, env=env, check=False,
     )
@@ -868,7 +870,8 @@ def test_a_marker_for_a_non_heavy_slot_code_is_never_a_requeue(box) -> None:
     assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
 
 
-def _library_driver(box: dict, body: str, lock: str, cwd: Path = None) -> subprocess.CompletedProcess:
+def _library_driver(box: dict, body: str, lock: str, cwd: Path = None, extra: dict = None,
+                    host_tail: str = None) -> subprocess.CompletedProcess:
     driver = box["dir"] / "lib-driver.ps1"
     driver.write_text(
         "param([string]$Guard, [string]$Lock, [string]$Mem, [string]$Table, [string]$Sha)\n"
@@ -877,11 +880,18 @@ def _library_driver(box: dict, body: str, lock: str, cwd: Path = None) -> subpro
         + body,
         encoding="ascii",
     )
-    env = _env(heavy_slot=HEAVY_STUB, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log")})
+    env = _env(heavy_slot=HEAVY_STUB, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log"),
+                                             **(extra or {})})
+    driver_args = ["-Guard", str(GUARD), "-Lock", lock, "-Mem", _write_json(box["dir"] / "memory.json", OK_MEMORY),
+                   "-Table", _write_json(box["dir"] / "table.json", []), "-Sha", _stub_sha()]
+    if host_tail is None:
+        invocation = ["-File", str(driver), *driver_args]
+    else:
+        # A persistent host: an 'exit' in the guard ends the driver script, and the host goes on to run host_tail.
+        quoted = " ".join(a if i % 2 == 0 else "'" + a.replace("'", "''") + "'" for i, a in enumerate(driver_args))
+        invocation = ["-Command", f"& '{driver}' {quoted}; Write-Output \"driver-exit=$LASTEXITCODE\"\n{host_tail}"]
     return subprocess.run(
-        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver), "-Guard", str(GUARD), "-Lock", lock,
-         "-Mem", _write_json(box["dir"] / "memory.json", OK_MEMORY), "-Table", _write_json(box["dir"] / "table.json", []),
-         "-Sha", _stub_sha()],
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", *invocation],
         capture_output=True, text=True, timeout=120, env=env, check=False, cwd=str(cwd or box["dir"]),
     )
 
@@ -987,6 +997,140 @@ def test_a_killed_guard_does_not_leave_the_heavy_slot_held(box) -> None:
         assert time.monotonic() < deadline, "the holder outlived its guard, so the heavy slot stayed held"
         time.sleep(0.2)
     assert _stub_calls(box)[0]["childEnd"]
+
+
+# r2 (Dot advisory pr-702): a ready file admits only while its holder still runs.
+# Start-Sleep is shadowed in the driver so the guard's next look is taken only after heavy-slot has ended; that makes
+# "the holder wrote ready and exited before the guard read it" deterministic instead of a 250 ms race.
+_SLEEP_UNTIL_HEAVY_SLOT_ENDS = (
+    "function Start-Sleep { param([int]$Milliseconds, [int]$Seconds)\n"
+    "    $d = (Get-Date).AddSeconds(30)\n"
+    "    while (-not ($lease -and $lease.Process.HasExited) -and (Get-Date) -lt $d) { [Threading.Thread]::Sleep(50) } }\n"
+)
+
+
+def test_a_ready_file_from_a_holder_that_already_exited_is_a_requeue(box) -> None:
+    done = _library_driver(
+        box,
+        _SLEEP_UNTIL_HEAVY_SLOT_ENDS
+        + f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+        extra={"STUB_HEAVY_SLOT_MODE": "readyexit", "STUB_HEAVY_SLOT_DELAY_S": "1"},
+    )
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build code=0 ticket=stub-" in done.stdout, done.stdout + done.stderr
+    assert "reason=holder-exited-after-ready" in done.stdout
+    assert "heavy-slot: admitted" not in done.stderr
+    assert not box["marker"].exists() and not box["lock"].exists(), "nothing is built without a live heavy slot"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == []
+
+
+def test_a_live_holder_admits_runs_once_and_releases_cleanly(box) -> None:
+    # Positive control: the holder stays alive until the stop file.
+    done = _heavy(box, "run", ["-Command", f"Add-Content -LiteralPath '{box['marker']}' -Value ran; exit 5"])
+    assert done.returncode == 5, done.stdout + done.stderr
+    assert "heavy-slot: admitted label=mlv:CARD-HS-1:build" in done.stderr
+    assert "heavy-slot: released label=mlv:CARD-HS-1:build" in done.stderr
+    assert box["marker"].read_text(encoding="ascii").splitlines() == ["ran"], "the action ran exactly once"
+    assert "HEAVY_SLOT_LOST_DURING_ACTION" not in done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
+    [call] = _stub_calls(box)
+    assert call["childEnd"]
+    assert list((box["dir"] / "heavy-slot").iterdir()) == []
+
+
+@pytest.mark.parametrize("code", [75, 76, 77])
+def test_a_marked_heavy_slot_code_before_ready_stays_a_requeue(box, code) -> None:
+    done = _heavy(box, "marked", ["-Command", _marker_command(box)], extra={"STUB_HEAVY_SLOT_CODE": str(code)})
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert f"BUILD_HEAVY_SLOT_REQUEUE label=build code={code} ticket=stub-" in done.stdout
+    assert "holder-exited-after-ready" not in done.stdout
+    assert not box["marker"].exists()
+
+
+def test_exit_1_before_ready_stays_could_not_check(box) -> None:
+    done = _heavy(box, "bare", ["-Command", _marker_command(box)], extra={"STUB_HEAVY_SLOT_CODE": "1"})
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=1 reason=heavy-slot ended before admitting the build" in done.stdout
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
+    assert not box["marker"].exists()
+
+
+def test_losing_the_heavy_slot_during_the_build_is_classified_not_silent(box) -> None:
+    # heavy-slot ends 3 s after admission while the build still runs; the build is not killed and keeps its code.
+    stub_log = box["dir"] / "stub.log"
+    fragment = (
+        f"$d = (Get-Date).AddSeconds(30); while (-not (Test-Path -LiteralPath '{stub_log}') -and (Get-Date) -lt $d) "
+        "{ Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 2; "
+        f"Set-Content -LiteralPath '{box['marker']}' -Value ran; exit 7"
+    )
+    done = _heavy(box, "readyexit", ["-Command", fragment], extra={"STUB_HEAVY_SLOT_HOLD_S": "3"})
+    assert done.returncode == 7, done.stdout + done.stderr
+    assert "heavy-slot: admitted" in done.stderr
+    assert "HEAVY_SLOT_LOST_DURING_ACTION label=build code=0 utc=" in done.stdout, done.stdout + done.stderr
+    assert "HEAVY_SLOT_LOST_DURING_ACTION label=build code=0 utc=" in done.stderr
+    assert "heavy-slot: released" not in done.stderr
+    assert box["marker"].exists(), "the build ran to its end"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == []
+
+
+def test_a_ready_file_after_the_give_up_still_gets_a_stop_file(box) -> None:
+    # r1 adversary A1: the give-up fires, then the holder writes ready before the finally; the host lives on.
+    done = _library_driver(
+        box,
+        "function Write-Output { param([Parameter(ValueFromPipeline = $true)] $InputObject)\n"
+        "    $d = (Get-Date).AddSeconds(30)\n"
+        "    while ($lease -and -not (Test-Path -LiteralPath $lease.Ready) -and (Get-Date) -lt $d) { [Threading.Thread]::Sleep(50) }\n"
+        "    Microsoft.PowerShell.Utility\\Write-Output $InputObject }\n"
+        "$opts.HeavySlotWaitMinutes = -15\n"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+        host_tail=(
+            "$d = (Get-Date).AddSeconds(20)\n"
+            f"while (-not (Test-Path -LiteralPath '{box['dir'] / 'stub.log'}') -and (Get-Date) -lt $d) {{ Start-Sleep -Milliseconds 200 }}\n"
+            f"Write-Output \"released=$(Test-Path -LiteralPath '{box['dir'] / 'stub.log'}')\"\n"
+        ),
+    )
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=1 reason=no admission" in done.stdout, done.stdout + done.stderr
+    assert "driver-exit=1" in done.stdout
+    assert "released=True" in done.stdout, "the holder must end while the host is still alive"
+    assert not box["marker"].exists()
+
+
+def test_a_shim_whose_interpreter_cannot_start_fails_open(box) -> None:
+    # r1 adversary A2: the shim starts, but its bare interpreter does not resolve (cmd exit 9009).
+    shim_dir = box["dir"] / "shim"
+    shim_dir.mkdir()
+    shutil.copyfile(HEAVY_STUB_DIR / "heavy-slot.ps1", shim_dir / "heavy-slot.ps1")
+    shim = shim_dir / "heavy-slot.cmd"
+    shim.write_text("@echo off\r\nno-such-pwsh-for-a2 -NoProfile -File \"%~dp0heavy-slot.ps1\" %*\r\nexit /b %ERRORLEVEL%\r\n", encoding="ascii")
+    done = _heavy(box, "run", ["-Command", _marker_command(box)], shim=shim)
+    assert done.returncode == 0, done.stdout + done.stderr
+    warns = [line for line in done.stderr.splitlines() if "HEAVY_SLOT_WARN" in line]
+    assert len(warns) == 1 and "not-startable" in warns[0] and "fail open" in warns[0], done.stderr
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK" not in done.stdout
+    assert box["marker"].exists(), "fail open: the build still runs"
+
+
+def test_a_percent_in_the_lock_dir_fails_open_instead_of_being_expanded(box) -> None:
+    # r1 adversary A3: cmd expands %OS% inside quotes, so the path heavy-slot would see is not the one given.
+    lock = box["dir"] / "pct-%OS%" / "build-slot.lock"
+    done = _heavy(box, "run", ["-Command", _marker_command(box)], lock=lock)
+    assert done.returncode == 0, done.stdout + done.stderr
+    warns = [line for line in done.stderr.splitlines() if "HEAVY_SLOT_WARN" in line]
+    assert len(warns) == 1 and "path-has-percent" in warns[0] and "fail open" in warns[0], done.stderr
+    assert box["marker"].exists()
+    assert _stub_calls(box) == []
+
+
+def test_heavy_slots_own_pin_mismatch_refuses_before_the_build(box) -> None:
+    # r1 adversary A4: the script heavy-slot runs may differ from the one hashed; its own PIN MISMATCH line refuses.
+    done = _heavy(box, "pinwarn", ["-Command", _marker_command(box)])
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=pin-mismatch-at-run" in done.stdout
+    assert not box["marker"].exists() and not box["lock"].exists()
+    [call] = _stub_calls(box)
+    assert call["childEnd"], "the slot was given back before the refusal"
 
 
 def test_the_guard_pins_the_installed_heavy_slot_sha() -> None:
