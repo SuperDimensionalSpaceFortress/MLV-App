@@ -9,6 +9,7 @@ needed. The last class is the hygiene pin: CLAUDE.md and the routed launchers mu
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1257,7 +1258,9 @@ def test_a_ready_file_whose_slot_owner_died_is_no_admission(box) -> None:
         ),
     )
     assert "driver-exit=3" in done.stdout, done.stdout + done.stderr
-    assert "BUILD_HEAVY_SLOT_REQUEUE label=build " in done.stdout and "reason=slot-owner-exited-after-ready" in done.stdout
+    # Either the guard sees the owner gone first, or the holder (which watches its owner since r3b) has already ended.
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build " in done.stdout, done.stdout + done.stderr
+    assert re.search(r"reason=(slot-owner|holder)-exited-after-ready", done.stdout), done.stdout
     assert "heavy-slot: admitted" not in done.stderr
     assert not box["marker"].exists() and not box["lock"].exists(), "nothing is built on a slot whose owner is gone"
     assert "holder-ended=True" in done.stdout, "the orphaned holder is stopped while the host lives on"
@@ -1305,6 +1308,51 @@ def test_a_holder_that_outlived_its_slot_owner_still_sees_the_release(box) -> No
     assert "HEAVY_SLOT_LOST_DURING_ACTION label=build " in done.stdout, done.stdout + done.stderr
     assert "holder-ended=True" in done.stdout, "the holder missed the stop file and outlived the release"
     assert list(hs.iterdir()) == [], "the stop file goes once the holder has ended"
+
+
+def test_the_slot_owner_identity_is_the_holders_never_a_reused_pid(box) -> None:
+    # r3b adversary 78c7d246-A1: the owner pid is reused before the guard's first read. The identity the holder wrote
+    # (owner=<pid>@<ticks>) is what counts, so a live process with another start time under that pid is not the owner.
+    ready = box["dir"] / "x.ready"
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n"
+                "$t = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks\n"
+                f"Set-Content -LiteralPath '{ready}' -Value @(\"stub-1:$PID\", \"holder=$PID@$t\", \"owner=$PID@$($t + 1)\") -Encoding ascii\n"
+                f"$lease = @{{ Ready = '{ready}'; Holder = $null; Owner = $null; Gone = ''; Process = (Get-Process -Id $PID) }}\n"
+                "Write-Output \"state=$(Get-HeavySlotHolderState $lease) gone=$($lease.Gone)\"\n"
+                f"Set-Content -LiteralPath '{ready}' -Value @(\"stub-1:$PID\", \"holder=$PID@$t\", \"owner=$PID@$t\") -Encoding ascii\n"
+                f"$lease = @{{ Ready = '{ready}'; Holder = $null; Owner = $null; Gone = ''; Process = (Get-Process -Id $PID) }}\n"
+                "Write-Output \"control=$(Get-HeavySlotHolderState $lease)\"\n"])
+    assert "state=gone gone=slot-owner-exited" in done.stdout, done.stdout + done.stderr
+    assert "control=alive" in done.stdout, "the owner the holder named, still running, is alive"
+
+
+def test_a_holder_whose_owner_died_ends_even_when_the_stop_file_cannot_be_written(box) -> None:
+    # r3b adversary 78c7d246-A2: the slot owner (and so heavy-slot's wrapper) ends during the action and the heavy-slot dir
+    # denies file creation at release, in a host that lives on. The holder must still end.
+    hs = box["dir"] / "heavy-slot"
+    holder_file = box["dir"] / "holder-pid.txt"
+    deny = ("[System.Security.AccessControl.FileSystemAccessRule]::new("
+            "[Security.Principal.WindowsIdentity]::GetCurrent().User, 'CreateFiles', 'Deny')")
+    done = _library_driver(
+        box,
+        "Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        f"    $t = Get-Content -LiteralPath @(Get-ChildItem -LiteralPath '{hs}' -Filter *.ready)[0].FullName -Raw\n"
+        f"    Set-Content -LiteralPath '{holder_file}' -Value ([regex]::Match($t, 'holder=(\\d+)').Groups[1].Value)\n"
+        f"    $acl = Get-Acl -LiteralPath '{hs}'; $acl.AddAccessRule({deny}); Set-Acl -LiteralPath '{hs}' -AclObject $acl\n"
+        "    $o = [int]([regex]::Match($t, '\\A[^\\r\\n]*:(\\d+)').Groups[1].Value)\n"
+        "    Stop-Process -Id $o -Force; Wait-Process -Id $o -Timeout 20 -ErrorAction Ignore }\n",
+        str(box["lock"]),
+        host_tail=(
+            f"$acl = Get-Acl -LiteralPath '{hs}'; [void]$acl.RemoveAccessRule({deny}); Set-Acl -LiteralPath '{hs}' -AclObject $acl\n"
+            f"$h = [int](Get-Content -LiteralPath '{holder_file}' -Raw)\n"
+            "$d = (Get-Date).AddSeconds(15)\n"
+            "while ((Get-Process -Id $h -ErrorAction Ignore) -and (Get-Date) -lt $d) { [Threading.Thread]::Sleep(100) }\n"
+            "Write-Output \"holder-ended=$(-not (Get-Process -Id $h -ErrorAction Ignore))\"\n"
+        ),
+    )
+    assert "HEAVY_SLOT_LOST_DURING_ACTION label=build " in done.stdout, done.stdout + done.stderr
+    assert "holder-ended=True" in done.stdout, "a holder that outlived its slot owner kept running while the host lived"
 
 
 @pytest.mark.parametrize("value", ["15372286720L", "'NaN'", "'sixty'"])

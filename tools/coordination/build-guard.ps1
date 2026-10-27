@@ -334,12 +334,25 @@ function New-HeavySlotHolder([string]$ReadyFile, [string]$StopFile) {
     $startTicks = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
     # The ready file names the holder (pid@start ticks): heavy-slot holds the slot exactly while this child runs, so the
     # guard checks the holder itself, not the cmd wrapper, which can outlive the release.
+    # It also names heavy-slot's own process (the slot mutex owner, HEAVY_SLOT_HELD = <ticket>:<pid>) by pid + start ticks,
+    # read here while that owner is waiting on this child, so a reused pid can never pass for it later; and it ends itself
+    # when that owner ends, so a holder never outlives the slot it stands for (r3b adversary A1/A2).
     $text = @(
         "`$me = Get-Process -Id `$PID"
-        "Set-Content -LiteralPath $(& $quote $ReadyFile) -Value @([string]`$env:HEAVY_SLOT_HELD, ('holder={0}@{1}' -f `$PID, `$me.StartTime.ToUniversalTime().Ticks)) -Encoding ascii"
+        "`$owner = `$null; `$ownerTicks = -1L; `$ownerLine = 'owner=none'"
+        "if ([string]`$env:HEAVY_SLOT_HELD -match ':(\d+)`$') {"
+        "    `$ownerPid = [int]`$Matches[1]; `$owner = Get-Process -Id `$ownerPid -ErrorAction SilentlyContinue"
+        "    if (`$owner) { `$ownerTicks = `$owner.StartTime.ToUniversalTime().Ticks }"
+        "    `$ownerLine = 'owner={0}@{1}' -f `$ownerPid, `$ownerTicks"
+        "}"
+        "Set-Content -LiteralPath $(& $quote $ReadyFile) -Value @([string]`$env:HEAVY_SLOT_HELD, ('holder={0}@{1}' -f `$PID, `$me.StartTime.ToUniversalTime().Ticks), `$ownerLine) -Encoding ascii"
         "while (-not (Test-Path -LiteralPath $(& $quote $StopFile))) {"
         "    `$p = Get-Process -Id $PID -ErrorAction SilentlyContinue"
         "    if (-not `$p -or `$p.StartTime.ToUniversalTime().Ticks -ne $startTicks) { exit 1 }"
+        "    if (`$ownerLine -ne 'owner=none') {"
+        "        `$o = Get-Process -Id `$ownerPid -ErrorAction SilentlyContinue"
+        "        if (-not `$o -or `$o.StartTime.ToUniversalTime().Ticks -ne `$ownerTicks) { exit 1 }"
+        "    }"
         "    Start-Sleep -Milliseconds 500"
         "}"
     ) -join "`n"
@@ -413,14 +426,10 @@ function Get-HeavySlotHolderState($Lease) {
         $text = Get-Content -LiteralPath $Lease.Ready -Raw -ErrorAction SilentlyContinue
         if (-not ($text -match '(?m)^holder=(\d+)@(\d+)\s*$')) { return '' }
         $Lease.Holder = @{ Pid = [int]$Matches[1]; Ticks = [long]$Matches[2] }
-        # No owner pid on the first line (heavy-slot ran the holder without its slot) leaves only the holder to check.
-        if ($text -match '\A[^\r\n]*:(\d+)[ \t]*(\r?\n|\z)') {
-            $ownerPid = [int]$Matches[1]
-            $owner = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
-            $ticks = -1L   # not running at the first read: never alive
-            if ($owner) { try { $ticks = $owner.StartTime.ToUniversalTime().Ticks } catch { $ticks = $null } }
-            $Lease.Owner = @{ Pid = $ownerPid; Ticks = $ticks }
-        }
+        # The owner's identity is the one the holder read while the owner was waiting on it (owner=<pid>@<ticks>; -1 when it
+        # was already gone), never a pid looked up now, which may have been reused (r3b adversary A1). 'owner=none' (heavy-slot
+        # ran the holder without its slot) or no owner line at all leaves only the holder to check.
+        if ($text -match '(?m)^owner=(\d+)@(-?\d+)\s*$') { $Lease.Owner = @{ Pid = [int]$Matches[1]; Ticks = [long]$Matches[2] } }
     }
     if (-not (Test-HeavySlotIdentity $Lease.Holder)) { $Lease.Gone = 'holder-exited'; return 'gone' }
     if ($Lease.Owner -and -not (Test-HeavySlotIdentity $Lease.Owner)) { $Lease.Gone = 'slot-owner-exited'; return 'gone' }
@@ -434,6 +443,8 @@ function Send-HeavySlotStop($Lease) {
     try { Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -ErrorAction Stop; return } catch { $why = $_.Exception.Message }
     Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} stop file not written ({1}); ending heavy-slot pid {2} and its children' -f $Lease.Label, $why, $Lease.Process.Id)
     if (-not $Lease.Process.HasExited) { $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $Lease.Process.Id /T /F 2>&1 }
+    # A holder that outlived heavy-slot is no longer in that tree: it is ended by its own identity (r3b adversary A2).
+    if ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder)) { Stop-Process -Id $Lease.Holder.Pid -Force -ErrorAction SilentlyContinue }
 }
 
 function Get-HeavySlotExitCode($Lease) {
