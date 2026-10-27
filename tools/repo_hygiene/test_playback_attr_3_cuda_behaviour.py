@@ -846,6 +846,25 @@ class SmokeRunLogSelectorTests(_PwshCase):
         )
         self.assert_throws(proc, "ATTRCUDA_SMOKE_LOG_SHA_MISMATCH")
 
+    def test_r13b_a2_the_resolver_hands_back_the_bytes_it_hashed_not_a_path_to_reopen(self) -> None:
+        """adversary r13 (028f4619) A2: a same-length rewrite AFTER the check is never what a caller reads. The resolver returns the hashed bytes
+        (.content) and their text (.text); rewriting the file after it returns changes neither, and .sha256 / .bytes describe .content."""
+        self.write_run(cuda="1", r16="1")
+        original = self.run_log.read_bytes()
+        proc = self.run_with_module(
+            f"$runLog = Resolve-AttrCudaSmokeRunLog -ResultJsonPath '{self.result_json}' -ContainingRoot '{self.work}'\n"
+            f"$swapped = [IO.File]::ReadAllText('{self.run_log}').Replace('reason=\"ok\"', 'reason=\"XX\"')\n"
+            f"[IO.File]::WriteAllText('{self.run_log}', $swapped)\n"
+            "$h = [Security.Cryptography.SHA256]::Create(); $sha = [BitConverter]::ToString($h.ComputeHash([byte[]]$runLog.content)).Replace('-', '').ToLowerInvariant()\n"
+            f"$onDisk = [IO.File]::ReadAllText('{self.run_log}')\n"
+            "[ordered]@{ text = $runLog.text; n = $runLog.content.Length; bytes = $runLog.bytes; shaOk = ($sha -eq $runLog.sha256); swappedOnDisk = $onDisk.Contains('reason=\"XX\"') } | ConvertTo-Json -Compress\n"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(got["swappedOnDisk"], got)
+        self.assertEqual(got["text"], original.decode("utf-8"), got)
+        self.assertEqual([got["n"], got["bytes"], got["shaOk"]], [len(original), len(original), True], got)
+
     def _rewrite_declared_length(self, value) -> None:
         data = json.loads(self.result_json.read_text(encoding="utf-8"))
         if value is None:

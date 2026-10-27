@@ -813,7 +813,8 @@ class JobTemplateDisplayBlockWiringTests(unittest.TestCase):
         self.assertIn("$displayPreferSubstring = 'PA329C'", tail)
 
     def test_app_selection_is_reparsed_once_the_smoke_log_is_available(self) -> None:
-        raw_log_at = self.template.index("$rawLog = [IO.File]::ReadAllText($logPath)")
+        # r13b (adversary r13 A2 sibling): the log text is the resolver's own hashed read
+        raw_log_at = self.template.index("$rawLog = [string]$runLog.text")
         reparse_at = self.template.index(
             "$appDisplaySelection = Get-AttrCudaGuiSmokeDisplaySelection -LogText $rawLog", raw_log_at)
         rebuild_at = self.template.index("$displayBlock = Build-AttrCudaDisplayBlock", reparse_at)

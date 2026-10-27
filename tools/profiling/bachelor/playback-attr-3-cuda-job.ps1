@@ -3080,7 +3080,8 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
             try {
                 $failedRunLog = Resolve-AttrCudaSmokeRunLog -ResultJsonPath $resultPath -ContainingRoot $Work
                 [void](New-AttrCudaDirectory -Path (Join-Path $Pub 'logs'))
-                [void](Publish-AttrCudaFileCopy -Source $failedRunLog.path -Destination (Join-Path $Pub 'logs\smoke-run.log'))
+                # r13b (adversary r13 A2 sibling): the resolver's hashed bytes, never the path copied again after the check
+                [void](Publish-AttrCudaBytes -Path (Join-Path $Pub 'logs\smoke-run.log') -Bytes $failedRunLog.content)
                 $smokeRunLogPublished = $true
                 $smokeRunLogSource = $failedRunLog.source
             } catch {
@@ -3190,7 +3191,8 @@ try {
     exit 16
 }
 $logPath = $runLog.path
-$rawLog = [IO.File]::ReadAllText($logPath)
+# r13b (adversary r13 028f4619 A2 sibling): the text the resolver hashed, never the path reopened after its check
+$rawLog = [string]$runLog.text
 $measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog
 # UM-DISPLAY-SELECT-AND-LOG-1 item 2b: the app's own gui_smoke.display_screen/display_target/
 # window_placement lines are only ever knowable once the smoke log itself is in hand -- recomputed
@@ -3225,7 +3227,8 @@ $earlyAppSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog
 [void](Publish-AttrCudaFileCopy -Source (Join-Path $legOut 'smoke-stderr.txt') -Destination (Join-Path $Pub 'smoke-stderr.txt'))
 [void](Publish-AttrCudaFileCopy -Source (Join-Path $legOut 'probe-timeline.csv') -Destination (Join-Path $Pub 'probe-timeline.csv'))
 [void](New-AttrCudaDirectory -Path (Join-Path $Pub 'logs'))
-[void](Publish-AttrCudaFileCopy -Source $logPath -Destination (Join-Path $Pub 'logs\smoke-run.log'))
+# r13b (adversary r13 A2 sibling): the bytes the resolver hashed and $rawLog was decoded from, never the path copied again after the check
+[void](Publish-AttrCudaBytes -Path (Join-Path $Pub 'logs\smoke-run.log') -Bytes $runLog.content)
 
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-2 (sol BLOCKER 1 / fable HARDENING): PresentMon is waited on
 # only now, AFTER every smoke artifact above is already on disk. A wait failure -- a hang past
@@ -4612,10 +4615,19 @@ function Get-CorePartitionAppAliveMonoMs($Helper, $AppVerdict) {
 # mark's read: $LaunchMonoMs + (stamp - $LaunchUtcTicks) - $StartMarkMonoMs, the wall span converted at the launch's own clock pair. The wall clock
 # can drift from the monotonic one by up to $ClockSkewMs (Get-CorePartitionClockSkewMs) over the job, which is counted against the bound: a gap
 # over $StartSlackMs once the skew is added is feed-window-start-late. No session, no start line, an unparseable stamp, an unknown skew or clock
-# read, or a start before the window opened (beyond the skew) is feed-window-start-unverified. Returns @{ why; gapMs; playbackStartUtcTicks;
-# session; slackMs }; gapMs is reported whenever it is computable, refused or not. Never throws.
-function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $LaunchMonoMs, $StartMarkMonoMs, $ClockSkewMs, [double]$StartSlackMs = 10000) {
-    $r = [ordered]@{ why = 'feed-window-start-unverified'; gapMs = $null; playbackStartUtcTicks = $null; session = $null; slackMs = $StartSlackMs }
+# read, or a start before the window opened (beyond the skew) is feed-window-start-unverified. Returns @{ why; gapMs; gapMonoMaxMs;
+# stampDisagreeMs; playbackStartUtcTicks; session; slackMs }; gapMs is reported whenever it is computable, refused or not. Never throws.
+# r13b (adversary r13 028f4619 A1): the stamp is one wall-clock read, and a step that comes and goes between two skew samples (the job's three, the
+# helper's 200 ms polls) is never sampled, so a 60000 ms startup could read as 3000 ms. The stamp is therefore trusted only when the app's own
+# MONOTONIC clock agrees with it: the same session's playback_smoke.summary line carries elapsed_ms, measured on QPC (mlv_stage_timing_now) from
+# the instant the start line was logged, so its stamp less the start stamp must equal elapsed_ms within $ClockSkewMs plus $StampToleranceMs
+# (250 ms: the code between each clock read and its log write; the venue logs of 2026-10-27 agree within 0.2 ms). A step on either line, or a
+# session without a summary or elapsed_ms, is feed-window-start-unverified, with the disagreement published (stampDisagreeMs). On the job's own
+# monotonic clock alone the summary was logged before the smoke returned ($WindowEndMonoMs), so the playback started no later than $WindowEndMonoMs
+# less elapsed_ms: gapMonoMaxMs, the start gap's clock-proof ceiling (it also holds the app's teardown, so it is published, not bounded). A stamped
+# gap past that ceiling (beyond the same tolerance) is the clocks disagreeing too: feed-window-start-unverified. No window end is unverified.
+function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $LaunchMonoMs, $StartMarkMonoMs, $ClockSkewMs, [double]$StartSlackMs = 10000, $WindowEndMonoMs = $null, [double]$StampToleranceMs = 250) {
+    $r = [ordered]@{ why = 'feed-window-start-unverified'; gapMs = $null; gapMonoMaxMs = $null; stampDisagreeMs = $null; playbackStartUtcTicks = $null; session = $null; slackMs = $StartSlackMs }
     try {
         if ([string]::IsNullOrEmpty($LogText)) { return $r }
         $lines = @($LogText -split "`r?`n")
@@ -4637,6 +4649,22 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         if ([double]::IsNaN($gap) -or [double]::IsInfinity($gap)) { return $r }
         $r.gapMs = [math]::Round($gap, 1)
         if ($gap + $sk -lt 0) { return $r }
+        # r13b A1: the same session's summary stamp and its monotonic elapsed_ms (the first summary line for the session)
+        $sumStamp = $null; $sumElapsed = $null
+        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.summary session=' + $sid + '\s[^\r\n]*?\belapsed_ms=(?<e>\d+(?:\.\d+)?)(\s|$)'); if ($mm.Success) { $sumStamp = $mm.Groups['ts'].Value; $sumElapsed = $mm.Groups['e'].Value; break } }
+        if ($null -eq $sumStamp) { return $r }
+        $st = [DateTime]::MinValue; $el = 0.0
+        if (-not [DateTime]::TryParse($sumStamp, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$st)) { return $r }
+        if (-not [double]::TryParse($sumElapsed, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$el) -or [double]::IsInfinity($el)) { return $r }
+        $tol = $sk + [math]::Max(0.0, $StampToleranceMs)
+        $disagree = [math]::Abs(($st.Ticks - $r.playbackStartUtcTicks) / 1e4 - $el)
+        $r.stampDisagreeMs = [math]::Round($disagree, 1)
+        if ($disagree -gt $tol) { return $r }
+        $we = (ConvertFrom-CorePartitionNumber $WindowEndMonoMs 'double').value
+        if ($null -eq $we) { return $r }
+        $ceiling = $we - $el - $sm
+        $r.gapMonoMaxMs = [math]::Round($ceiling, 1)
+        if ($gap -gt $ceiling + $tol) { return $r }
         $r.why = $(if ($gap + $sk -gt $StartSlackMs) { 'feed-window-start-late' } else { $null })
         $r
     } catch { $r }
@@ -5965,8 +5993,13 @@ try {
     # playback means, so the window fields are refused (feed-window-start-late). The gap is published either way (feed.startGapMs).
     $corePartitionStartSlackMs = 10000
     $cpRunLogText = $null
-    try { $cpRunLogText = [IO.File]::ReadAllText((Resolve-AttrCudaSmokeRunLog -ResultJsonPath $resultPath -ContainingRoot $Work).path) } catch { $corePartitionErrors.Add("playback-start-log: $([string]$_.Exception.Message)") }
-    $corePartitionPlaybackStart = Get-CorePartitionPlaybackStart $cpRunLogText $corePartitionMeasuredLaunchUtc.Ticks $corePartitionMeasuredLaunchMonoMs $corePartitionFeedStart.monoMs $corePartitionJobClockSkewMs $corePartitionStartSlackMs
+    # r13b (adversary r13 028f4619 A2): the text is the resolver's own hashed read (.text), never the path reopened after the hash check, so a
+    # same-length rewrite between the check and this read is never consumed
+    try { $cpRunLogText = [string](Resolve-AttrCudaSmokeRunLog -ResultJsonPath $resultPath -ContainingRoot $Work).text } catch { $corePartitionErrors.Add("playback-start-log: $([string]$_.Exception.Message)") }
+    # r13b (A1): the skew counted against the start is the larger of the job's own (three reads) and the helper's (its 200 ms polls), when it has one
+    $cpStartSkewMs = $corePartitionJobClockSkewMs
+    if ($null -ne $corePartitionHelperRecord -and $null -ne $cpStartSkewMs) { $cpHelperSkew = (ConvertFrom-CorePartitionNumber $corePartitionHelperRecord.clockSkewMaxMs 'double').value; if ($null -ne $cpHelperSkew) { $cpStartSkewMs = [math]::Max([double]$cpStartSkewMs, [math]::Abs($cpHelperSkew)) } }
+    $corePartitionPlaybackStart = Get-CorePartitionPlaybackStart $cpRunLogText $corePartitionMeasuredLaunchUtc.Ticks $corePartitionMeasuredLaunchMonoMs $corePartitionFeedStart.monoMs $cpStartSkewMs $corePartitionStartSlackMs $corePartitionSmokeEndMonoMs
     $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionStartBoundFeed (Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppAliveMonoMs 10000) $corePartitionPlaybackStart) $corePartitionHelperNotReady
     # sol r4 CP-05: set until core-partition.json is saved, so any failure on the way leaves every acceptance flag false with this reason.
     $corePartitionPublishWhy = 'core-partition-json-unpublished'
@@ -6001,6 +6034,8 @@ try {
                 # playback_smoke.start log stamp), its gap after the start mark in ms (published refused or not), the declared slack and the verdict
                 playbackStartUtcTicks = $corePartitionPlaybackStart.playbackStartUtcTicks; playbackSession = $corePartitionPlaybackStart.session
                 startGapMs = $corePartitionPlaybackStart.gapMs; startSlackMs = $corePartitionStartSlackMs; startWhy = $corePartitionPlaybackStart.why
+                # r13b (A1): the start stamp's disagreement with the app's monotonic elapsed_ms, and the gap's clock-proof ceiling on the job's clock
+                startStampDisagreeMs = $corePartitionPlaybackStart.stampDisagreeMs; startGapMonoMaxMs = $corePartitionPlaybackStart.gapMonoMaxMs
                 summary = $corePartitionFeedSummary
             }
             perCoreTemperature = 'not in the feed (column 3 is the package / hottest core); adding columns is the Bachelor session''s work'

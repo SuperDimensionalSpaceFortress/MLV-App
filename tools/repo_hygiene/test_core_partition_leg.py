@@ -175,7 +175,7 @@ function Write-JobTrace([string]$Message) { }
 function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText($Path, $Value) }
 function New-AttrCudaDirectory { param([string]$Path) }
 function Save-Json { param($Object, $Path) $global:cpSaved = $Object }
-function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) $p = Join-Path $ContainingRoot 'run.log'; if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'run log unresolvable' }; [pscustomobject]@{ path = $p } }
+function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) $p = Join-Path $ContainingRoot 'run.log'; if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'run log unresolvable' }; $b = [IO.File]::ReadAllBytes($p); [pscustomobject]@{ path = $p; content = $b; text = [Text.Encoding]::UTF8.GetString($b) } }
 $exePath = 'C:\no\such\MLVApp.exe'
 $SmokeProcessTimeoutMs = 60000
 $out = [ordered]@{}
@@ -201,7 +201,8 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
         [IO.File]::WriteAllBytes($corePartitionHelperOut, $rb)
         [IO.File]::WriteAllText("$corePartitionHelperOut.mac", [Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($corePartitionHelperNonce)).ComputeHash($rb)))
         # r13 (CP-FEED-START-ANCHOR): the run log the result names; the measured session's playback starts 100 ms after the measured launch
-        [IO.File]::WriteAllText((Join-Path $Work 'run.log'), '[' + $corePartitionMeasuredLaunchUtc.AddMilliseconds(100).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 worker_threads=16`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(110).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n")
+        # r13b (A1): and its summary, whose stamp less the start's equals its monotonic elapsed_ms
+        [IO.File]::WriteAllText((Join-Path $Work 'run.log'), '[' + $corePartitionMeasuredLaunchUtc.AddMilliseconds(100).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 worker_threads=16`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(110).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(150).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=50.000 presented_frames=1`n")
     }
     $global:cpSaved = $null
     . ([scriptblock]::Create($regions[1]))
@@ -2263,7 +2264,11 @@ function Save-Json { param($Object, $Path) $global:cpSaved = $Object }
 function Get-CorePartitionMonoMs { [double]$global:cpClk }
 # r13 (CP-FEED-START-ANCHOR): the run log the result names; the R13 driver sets $global:cpLog per case ($null: the resolver throws, as the real one
 # does for a result without a verified log)
-function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) if (-not $global:cpLog) { throw 'run log unresolvable' }; [pscustomobject]@{ path = $global:cpLog } }
+# r13b (A2): like the real one, it returns the bytes it read (.content, .text); $global:cpSwap, when set, is written over the file AFTER that read
+# (a same-length rewrite between the resolver's check and any later reopen of .path)
+function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) if (-not $global:cpLog) { throw 'run log unresolvable' }; $b = [IO.File]::ReadAllBytes($global:cpLog)
+    if ($null -ne $global:cpSwap) { [IO.File]::WriteAllText($global:cpLog, $global:cpSwap) }
+    [pscustomobject]@{ path = $global:cpLog; content = $b; text = [Text.Encoding]::UTF8.GetString($b) } }
 $row = "26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
 function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
     $m = $global:cpClk; $global:cpClk += 500
@@ -2296,8 +2301,10 @@ foreach ($k in $cases.Keys) {
     $corePartitionClockPairs = [Collections.Generic.List[object]]::new(); $corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, [double]1000))
     $corePartitionMeasuredLaunchMonoMs = [double]1000
     # r13: the measured session's playback starts 500 ms after the start mark, inside the start slack, so the start bound passes these cases
-    $global:cpLog = Join-Path $dir 'run.log'
-    [IO.File]::WriteAllText($global:cpLog, '[' + [DateTime]::new((& $W 1500), [DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 position=0`n[" + [DateTime]::new((& $W 1600), [DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n")
+    # r13b (A1): the session's summary at 20000, its stamp less the start's equal to its monotonic elapsed_ms
+    $global:cpLog = Join-Path $dir 'run.log'; $global:cpSwap = $null
+    $S = { param([double]$m) [DateTime]::new((& $W $m), [DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') }
+    [IO.File]::WriteAllText($global:cpLog, '[' + (& $S 1500) + "] [info] [0x1] playback_smoke.start session=1 position=0`n[" + (& $S 1600) + "] [info] [0x1] playback_smoke.measured_session id=1`n[" + (& $S 20000) + "] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=18500.000 presented_frames=1`n")
     $corePartitionFeedPath = Join-Path $dir 'feed.csv'
     $corePartitionFeedPreHelper = @{ exists = $true; length = 0; beforeOffset = 0; before = ''; shortRead = $false; monoMs = [int64]500; doneMs = [int64]500; created = 123; fileId = 'same'; readUtcTicks = 0; lastWriteUtcTicks = 0 }
     $corePartitionFeedStart = @{ exists = $true; length = 34; beforeOffset = 0; shortRead = $false; monoMs = [int64]1000; doneMs = [int64]1000; created = 123; fileId = 'same'
@@ -2428,20 +2435,29 @@ class CorePartitionR11Tests(unittest.TestCase):
 # r13 (Dot 6452868627 = hub ruling HUB-TICK 20261027T2058Z, CP-FEED-START-ANCHOR): the same lifted cleanup region with a 90 s window whose rows
 # are $c[6] idle rows (10 W / 30 C) then $c[7] playback rows (100 W / 80 C), and a run log whose measured session starts playback at monotonic
 # $c[5] ($null: the log has no playback_smoke.start line; -1: the result names no resolvable log). The start mark is read at 1000.
+# r13b: the session's summary is logged at 90500 with elapsed_ms = 90500 - $c[5] (the app's monotonic clock). $c[8], when set, is where the wall
+# clock STAMPED the start line (adversary r13 A1: a backward step between two skew samples); $c[9] true rewrites the log after the resolver read it
+# with both stamps 57000 ms earlier, same length and consistent with each other (adversary r13 A2: swap after validate).
 def _r13_start_driver() -> str:
     d = R11_CLEANUP
+    write_at = d.index("    [IO.File]::WriteAllText($global:cpLog, '[' + (& $S 1500)")
+    write_line = d[write_at:d.index("\n", write_at) + 1]
     for old, new in (
             ("length = 34 + $row.Length", "length = 34 + $global:cpWindow.Length"),
             ("window = $row;", "window = $global:cpWindow;"),
             ("(& $W 20850)", "(& $W 90850)"),
-            ("$global:cpLog = Join-Path $dir 'run.log'\n",
-             "$global:cpLog = $(if ($c[5] -eq -1) { $null } else { Join-Path $dir 'run.log' })\n"
+            ("$global:cpLog = Join-Path $dir 'run.log'; $global:cpSwap = $null\n",
+             "$global:cpLog = $(if ($c[5] -eq -1) { $null } else { Join-Path $dir 'run.log' }); $global:cpSwap = $null\n"
              "    $global:cpWindow = ('26.10.2026,12:00:00,x,30,10,No,No' + \"`n\") * $c[6] + ('26.10.2026,12:01:00,x,80,100,No,No' + \"`n\") * $c[7]\n"),
-            ("    [IO.File]::WriteAllText($global:cpLog, '[' + [DateTime]::new((& $W 1500), [DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + \"] [info] [0x1] playback_smoke.start session=1 position=0`n[\" + ",
-             "    if ($null -ne $global:cpLog) { [IO.File]::WriteAllText($global:cpLog, $(if ($null -eq $c[5]) { '' } else { '[' + [DateTime]::new((& $W $c[5]), [DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + \"] [info] [0x1] playback_smoke.start session=1 position=0`n\" }) + '[' + "),
-            ("playback_smoke.measured_session id=1`n\")\n", "playback_smoke.measured_session id=1`n\") }\n"),
+            (write_line,
+             "    $Body = { param($ps, $pe) $(if ($null -eq $c[5]) { '' } else { '[' + (& $S $ps) + \"] [info] [0x1] playback_smoke.start session=1 position=0`n\" }) + '[' + (& $S 1600) + \"] [info] [0x1] playback_smoke.measured_session id=1`n\""
+             " + $(if ($null -eq $c[5]) { '' } else { '[' + (& $S $pe) + \"] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=\" + (90500 - $c[5]).ToString('0.000', [Globalization.CultureInfo]::InvariantCulture) + \" presented_frames=1`n\" }) }\n"
+             "    if ($null -ne $global:cpLog) {\n"
+             "        [IO.File]::WriteAllText($global:cpLog, (& $Body $(if ($c.Count -gt 8 -and $null -ne $c[8]) { $c[8] } else { $c[5] }) 90500))\n"
+             "        if ($c.Count -gt 9 -and $c[9]) { $global:cpSwap = & $Body ($c[5] - 57000) (90500 - 57000) }\n"
+             "    }\n"),
             ("    $out[$k] = [ordered]@{ end = $corePartitionSmokeEndMonoMs;",
-             "    $out[$k] = [ordered]@{ wattsMean = $f.pkgWattsMean; tempMean = $f.pkgTempCMean; start = @($pf.startGapMs, $pf.startSlackMs, [string]$pf.startWhy, $pf.playbackSession, ($null -ne $pf.playbackStartUtcTicks)); end = $corePartitionSmokeEndMonoMs;")):
+             "    $out[$k] = [ordered]@{ wattsMean = $f.pkgWattsMean; tempMean = $f.pkgTempCMean; start = @($pf.startGapMs, $pf.startSlackMs, [string]$pf.startWhy, $pf.playbackSession, ($null -ne $pf.playbackStartUtcTicks)); start2 = @($pf.startStampDisagreeMs, $pf.startGapMonoMaxMs); swapped = $(if ($null -ne $global:cpLog) { [IO.File]::ReadAllText($global:cpLog) -eq $global:cpSwap } else { $false }); end = $corePartitionSmokeEndMonoMs;")):
         if d.count(old) != 1:
             raise AssertionError(f"R11_CLEANUP changed shape near {old!r}")
         d = d.replace(old, new)
@@ -2452,6 +2468,8 @@ def _r13_start_driver() -> str:
     'playback-within-slack-control' = @(91000, 0, 90900, 90750, 2000, 4000, 3, 87)
     'no-playback-start-line' = @(91000, 0, 90900, 90750, 2000, $null, 60, 30)
     'no-run-log' = @(91000, 0, 90900, 90750, 2000, -1, 60, 30)
+    'adversary-r13-a1-utc-step-at-the-start-line' = @(91000, 0, 90900, 90750, 2000, 61000, 60, 30, 4000)
+    'adversary-r13-a2-swap-after-validate' = @(91000, 0, 90900, 90750, 2000, 61000, 60, 30, $null, $true)
 }
 """ + d[to:]
 
@@ -2462,21 +2480,38 @@ R13_PURE = r"""
 $L = [DateTime]::new(2026, 10, 27, 21, 0, 0, [DateTimeKind]::Utc)
 function Ln([double]$AfterMs, [string]$Msg) { '[' + $L.AddMilliseconds($AfterMs).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + '] [info] [0x1a2b] ' + $Msg }
 function Pick($v) { @([string]$v.why, $v.gapMs, $v.session) }
-$m1 = (Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1')
+# r13b (A1): a session's summary line, stamped $At ms after L, carrying the app's monotonic elapsed_ms
+function Sm([double]$At, [string]$Elapsed, [int]$Sid = 1) { Ln $At ('playback_smoke.summary session=' + $Sid + ' reason=play-stop elapsed_ms=' + $Elapsed + ' presented_frames=1') }
+function Pick2($v) { @([string]$v.why, $v.gapMs, $v.stampDisagreeMs, $v.gapMonoMaxMs) }
+$m1 = (Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30000.000')
 $r = [ordered]@{}
-$r.withinSlackNoSkew = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0)
-$r.skewCountsAgainstTheBound = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 1500)
-$r.startMarkReadBeforeTheLaunch = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 2500 1000 0)
-$r.namedSlack = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 8000)
-$r.beforeTheWindow = Pick (Get-CorePartitionPlaybackStart ((Ln -5000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 100 'playback_smoke.measured_session id=1')) $L.Ticks 1000 1000 100)
-$r.warmupSessionIgnored = Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=1 position=0'), (Ln 30000 'playback_smoke.start session=2 position=0'), (Ln 30100 'playback_smoke.measured_session id=2')) -join "`n") $L.Ticks 1000 1000 0)
-$r.sessionPrefixIsNotTheSession = Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=12 position=0'), (Ln 1100 'playback_smoke.measured_session id=1')) -join "`r`n") $L.Ticks 1000 1000 0)
-$r.summaryFallback = Pick (Get-CorePartitionPlaybackStart (@((Ln 2000 'playback_smoke.start session=3 position=0'), (Ln 40000 'playback_smoke.summary session=3 frames=1')) -join "`n") $L.Ticks 1000 1000 0)
-$r.unknownSkew = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 $null)
-$r.noSinkStamp = Pick (Get-CorePartitionPlaybackStart "playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0)
-$r.unparseableStamp = Pick (Get-CorePartitionPlaybackStart "[not-a-time] [info] [0x1] playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0)
-$r.noSession = Pick (Get-CorePartitionPlaybackStart (Ln 1000 'playback_smoke.start session=1 position=0') $L.Ticks 1000 1000 0)
-$r.emptyLog = Pick (Get-CorePartitionPlaybackStart '' $L.Ticks 1000 1000 0)
+$r.withinSlackNoSkew = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 41000)
+$r.skewCountsAgainstTheBound = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 1500 10000 41000)
+$r.startMarkReadBeforeTheLaunch = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 2500 1000 0 10000 42500)
+$r.namedSlack = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 8000 41000)
+$r.beforeTheWindow = Pick (Get-CorePartitionPlaybackStart ((Ln -5000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 100 'playback_smoke.measured_session id=1') + "`n" + (Sm 25000 '30000.000')) $L.Ticks 1000 1000 100 10000 41000)
+$r.warmupSessionIgnored = Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=1 position=0'), (Sm 29000 '28000.000' 1), (Ln 30000 'playback_smoke.start session=2 position=0'), (Ln 30100 'playback_smoke.measured_session id=2'), (Sm 60000 '30000.000' 2)) -join "`n") $L.Ticks 1000 1000 0 10000 62000)
+$r.sessionPrefixIsNotTheSession = Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=12 position=0'), (Ln 1100 'playback_smoke.measured_session id=1'), (Sm 31000 '30000.000')) -join "`r`n") $L.Ticks 1000 1000 0 10000 41000)
+$r.summaryFallback = Pick (Get-CorePartitionPlaybackStart (@((Ln 2000 'playback_smoke.start session=3 position=0'), (Sm 40000 '38000.000' 3)) -join "`n") $L.Ticks 1000 1000 0 10000 42000)
+$r.unknownSkew = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 $null 10000 41000)
+$r.noSinkStamp = Pick (Get-CorePartitionPlaybackStart "playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0 10000 41000)
+$r.unparseableStamp = Pick (Get-CorePartitionPlaybackStart "[not-a-time] [info] [0x1] playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0 10000 41000)
+$r.noSession = Pick (Get-CorePartitionPlaybackStart (Ln 1000 'playback_smoke.start session=1 position=0') $L.Ticks 1000 1000 0 10000 41000)
+$r.emptyLog = Pick (Get-CorePartitionPlaybackStart '' $L.Ticks 1000 1000 0 10000 41000)
+# r13b (adversary r13 028f4619 A1): the stamp is trusted only when the app's monotonic elapsed_ms agrees with it, and the stamped gap is under the
+# job's monotonic ceiling. The adversary's input: playback really starts at L+60000 (mono 61000); a backward step between two polls stamps it L+3000.
+$a1 = @((Ln 3000 'playback_smoke.start session=1 position=0 worker_threads=8'), (Ln 3010 'playback_smoke.measured_session id=1'), (Sm 89500 '29500.000')) -join "`n"
+$r.a1StepAtTheStartLine = Pick2 (Get-CorePartitionPlaybackStart $a1 $L.Ticks 1000 1000 0 10000 91000)
+$r.a1StepAtTheSummaryLine = Pick2 (Get-CorePartitionPlaybackStart (@((Ln 9000 'playback_smoke.start session=1 position=0'), (Ln 9100 'playback_smoke.measured_session id=1'), (Sm 20000 '30000.000')) -join "`n") $L.Ticks 1000 1000 0 10000 41000)
+$r.a1NoSummary = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1')) $L.Ticks 1000 1000 0 10000 41000)
+$r.a1SummaryWithoutElapsed = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Ln 39000 'playback_smoke.summary session=1 reason=play-stop paced_elapsed_ms=30000.000')) $L.Ticks 1000 1000 0 10000 41000)
+$r.a1AnotherSessionsSummary = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30000.000' 2)) $L.Ticks 1000 1000 0 10000 41000)
+$r.a1WithinTolerance = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30200.000')) $L.Ticks 1000 1000 0 10000 41000)
+$r.a1PastTolerance = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30300.000')) $L.Ticks 1000 1000 0 10000 41000)
+$r.a1SkewWidensTolerance = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30300.000')) $L.Ticks 1000 1000 100 10000 41000)
+$r.a1NoWindowEnd = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 $null)
+$r.a1StampPastTheMonotonicCeiling = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 35000)
+$r.a1Consistent = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 41000)
 $feed = [ordered]@{ rows = 3; pkgWattsMean = 40.0; pkgWattsMax = 100.0; pkgTempCMean = 46.67; pkgTempCMax = 80.0; pkgThrottledRows = 0; pkgTempCAtStart = 30.0; reasons = [ordered]@{ pkgThrottledRows = 'feed-unparseable' } }
 $late = Get-CorePartitionStartBoundFeed $feed @{ why = 'feed-window-start-late' }
 $r.bound = @($late.rows, $late.pkgWattsMean, $late.pkgTempCMean, $late.pkgTempCAtStart, $late.reasons['rows'], $late.reasons['pkgTempCMean'], $late.reasons['pkgThrottledRows'], $late.reasons.Contains('pkgTempCAtStart'))
@@ -2567,6 +2602,38 @@ class CorePartitionR13StartTests(unittest.TestCase):
         self.assertEqual(r["boundTwice"], ["feed-window-start-late"])
         self.assertEqual(r["missingVerdict"], [unverified])
         self.assertEqual(r["passThrough"], [3, 40.0, False])
+        # r13b (A1): the stamp agrees with the app's monotonic elapsed_ms and sits under the job's monotonic ceiling, or it is unverified
+        self.assertEqual(r["a1StepAtTheStartLine"], [unverified, 3000, 57000, None])
+        self.assertEqual(r["a1StepAtTheSummaryLine"], [unverified, 9000, 19000, None])
+        self.assertEqual(r["a1NoSummary"], [unverified, 9000, None, None])
+        self.assertEqual(r["a1SummaryWithoutElapsed"], [unverified, 9000, None, None])
+        self.assertEqual(r["a1AnotherSessionsSummary"], [unverified, 9000, None, None])
+        self.assertEqual(r["a1WithinTolerance"], ["", 9000, 200, 9800])
+        self.assertEqual(r["a1PastTolerance"], [unverified, 9000, 300, None])
+        self.assertEqual(r["a1SkewWidensTolerance"], ["", 9000, 300, 9700])
+        self.assertEqual(r["a1NoWindowEnd"], [unverified, 9000, 0, None])
+        self.assertEqual(r["a1StampPastTheMonotonicCeiling"], [unverified, 9000, 0, 4000])
+        self.assertEqual(r["a1Consistent"], ["", 9000, 0, 10000])
+
+    def test_r13b_adversary_a1_a_backward_utc_step_at_the_start_line_is_refused_not_averaged(self) -> None:
+        """adversary r13 (028f4619) A1, its exact input: playback really starts at mono 61000 (60000 ms after the start mark), but a backward UTC
+        step between two helper polls stamps the start line L+3000; job and helper skew are zero. On 028f4619 the start verdict accepts a
+        3000 ms gap and the feed publishes 40 W / 46.67 C. Now the stamp disagrees with the session's monotonic elapsed_ms (29500 ms against a
+        86500 ms stamp span) by 57000 ms: every window field is null with feed-window-start-unverified, and the disagreement is published."""
+        got = self.r["adversary-r13-a1-utc-step-at-the-start-line"]
+        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [None, None, None, "feed-window-start-unverified"], got)
+        self.assertEqual(got["start"][1:3], [10000, "feed-window-start-unverified"], got)
+        self.assertAlmostEqual(got["start2"][0], 57000, delta=1, msg=got)
+
+    def test_r13b_adversary_a2_a_swap_after_validate_is_never_read(self) -> None:
+        """adversary r13 (028f4619) A2: the resolver checks the genuine log (playback 60000 ms after the start mark), then a same-length rewrite
+        moves both the start and the summary stamps 57000 ms earlier (consistent with each other, so the A1 check alone would pass it). On
+        028f4619 the job reopens the path, reads the rewrite and publishes 40 W / 46.67 C. Now it reads only the bytes the resolver hashed: the
+        genuine 60000 ms gap, feed-window-start-late."""
+        got = self.r["adversary-r13-a2-swap-after-validate"]
+        self.assertTrue(got["swapped"], f"the rewrite must be on disk when the job reads: {got}")
+        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [None, None, None, "feed-window-start-late"], got)
+        self.assertAlmostEqual(got["start"][0], 60000, delta=1, msg=got)
 
 
 PARAMS_ANCHOR = "$AutomationSettingsDir,$GpuPreLaunches)"
