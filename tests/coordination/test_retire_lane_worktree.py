@@ -3081,14 +3081,20 @@ UNRESOLVED_EXECUTED_SITES = {
     ],
     "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1": [
         ("[scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript))",
-         "LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r2 offline test seam: the text of the -StagedBuildProbeScript file its caller names. :190 refuses both seams "
-         "(BATCH_USAGE, exit 2) whenever -UmRunScript is the real um-run.ps1, by full path or by content hash (:185-186), before either scriptblock is compiled; "
-         ":191 refuses a seam file that does not exist. The block is only handed to Get-VenueStagedBuildManifest -ProbeScript, which runs its .ToString() on the "
+         "LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r2 offline test seam: the text of the -StagedBuildProbeScript file its caller names. :195 refuses both seams "
+         "(BATCH_USAGE, exit 2) whenever -UmRunScript is the real um-run.ps1, by full path or by content hash (:190-191), before either scriptblock is compiled; "
+         ":196 refuses a seam file that does not exist. The block is only handed to Get-VenueStagedBuildManifest -ProbeScript, which runs its .ToString() on the "
          "bounded manifest-read worker runspace (VenueChain.psm1 Invoke-VenueBoundedRead); production passes no seam and never reaches this site"),
         ("[scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript))",
-         "the second r2 seam, the same guard: the text of the -ArtifactProbeScript file its caller names, refused with the real um-run.ps1 (:190, by path or by "
-         "content hash :185-186) and when absent (:191) before it is compiled, and only handed to Get-VenueStagedBuildManifest -ArtifactProbeScript, which runs it "
+         "the second r2 seam, the same guard: the text of the -ArtifactProbeScript file its caller names, refused with the real um-run.ps1 (:195, by path or by "
+         "content hash :190-191) and when absent (:196) before it is compiled, and only handed to Get-VenueStagedBuildManifest -ArtifactProbeScript, which runs it "
          "on the bounded artifact-hash worker runspace (Invoke-VenueBoundedRead, inside the call's own -ArtifactTimeoutSec)"),
+        ("[void]$ps.AddScript($script:GuardWorker.ToString())",
+         "LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r4 (sol r3 B1): Invoke-InputGuard runs the input guard on a worker runspace it abandons at the guard's deadline. "
+         "$script:GuardWorker is the { } literal at :514 in this file (its only writer), which the AST scans as code: it imports VenueChain.psm1 and "
+         "DualVenueRunner.psm1 beside this file, sets the script values it is handed and calls Get-InputOutputRefusal. The worker's functions (:542, "
+         "SessionStateFunctionEntry) are this file's own definitions, named in $script:GuardWorkerFunctions (:513) and read back by name from function:, "
+         "each scanned in place; they only read files and launch nothing"),
     ],
     "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
         ("[void]$ps.AddScript($Script.ToString())",
@@ -3194,12 +3200,16 @@ def test_launcher_census_the_lease_batch_probe_seams_are_classified_per_site_and
     path = "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1"
     text = (REPO / path).read_text(encoding="utf-8")
     inventory = {path: UNRESOLVED_EXECUTED_SITES[path]}
-    assert len(inventory[path]) == 2
+    # r4: plus the guard worker's AddScript (Invoke-InputGuard), a { } literal of this file
+    assert len(inventory[path]) == 3
     assert not _census_problems({path: text}, {}, {}, kinds=("unresolved",), unresolved_inventory=inventory)
     # the classification rests on the guard: both seams are refused with the real um-run.ps1, and a missing seam file, BEFORE either is compiled
     refuse = text.index("if ($umRunIsReal -and ($StagedBuildProbeScript -or $ArtifactProbeScript)) { Stop-Usage")
     exists = text.index("foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object { $_ }) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage")
-    assert refuse < exists < min(text.index(pin) for pin, _why in inventory[path])
+    assert refuse < exists < min(text.index(pin) for pin, _why in inventory[path] if "Create(" in pin)
+    worker = text.index("$script:GuardWorker = {")
+    assert worker < text.index("[void]$ps.AddScript($script:GuardWorker.ToString())")
+    assert text.count("$script:GuardWorker = ") == 1, "the guard worker literal has one writer"
     third = text + "\n$extra = [scriptblock]::Create([IO.File]::ReadAllText($LegScript))\n& $extra\n"
     problems = _census_problems({path: third}, {}, {}, kinds=("unresolved",), unresolved_inventory=inventory)
     assert len(problems) == 1 and "unclassified launch site" in problems[0] and "($LegScript)" in problems[0], problems
