@@ -125,6 +125,7 @@ if ($JobId -like 'lease-batch-open-*') {
     if ($sleep -gt 0) { Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} OPENWAIT {1} sec={2}" -f [DateTime]::UtcNow.Ticks, $JobId, $sleep); Start-Sleep -Seconds $sleep; $now = [DateTimeOffset]::UtcNow }
     if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $false }
     $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
+    if ($mode -eq 'exit1') { $res.exitCode = 1 }   # r14: the open job's receipt says it failed (OPEN_FAILED)
     if ($mode -eq 'gatehold') {
         # r3: um-run gave up while the agent still holds the open in its gate, and NO result lands: the agent keeps re-asking until it is cancelled.
         throw "UNRESOLVED: $JobId was held unlaunched in the agent's heavy-slot admission gate (fake, held) for the full -MaxAdmissionWaitSec"
@@ -2987,6 +2988,51 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertTrue(any(k.startswith("CLOSE") for k in self.kinds()), "the lease was closed")
         self.assertFalse(self.claim_path.exists(), "the claim was released")
         self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is byte-unchanged")
+
+    # r14 (Dot 2e6eb21d; adversary r13 pass 3 A1, A2): the post-open guard ran only on a clean receipt, and its write suppression was set only in the refusal branch. An open that
+    # failed (OPEN_FAILED), came back without a lease batch (AGENT_NOT_BATCH_CAPABLE), or was held in the agent's gate (logged before the guard; or held to the deadline, the guard
+    # skipped) won the classification, and the cleanup log lines and the result line were appended through a batch.log that had become a hard link to the accepted spec.
+    def test_r14_an_alias_made_in_the_open_wait_is_never_written_through_whatever_the_open_returned(self) -> None:
+        cases = {
+            # mode: (exit code, the typed reason the run still reports, extra args)
+            "exit1": (9, "OPEN_FAILED", ()),
+            "nobatch": (10, "AGENT_NOT_BATCH_CAPABLE", ()),
+            "gatewait": (2, "LEG_SPEC_IS_RUN_OUTPUT", ()),
+            "gatehold": (11, "OPEN_CANCEL_UNRECONCILED", ("-CancelReconcileSec", "3", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=60)))),
+        }
+        for mode, (code, reason, extra) in cases.items():
+            with self.subTest(open=mode):
+                self._alias_in_open_wait(mode, code, reason, extra)
+
+    def _alias_in_open_wait(self, mode: str, code: int, reason: str, extra: tuple[str, ...]) -> None:
+        import hashlib
+        self._fresh_run_dir()
+        (self.share / "fake-agent-state.json").unlink(missing_ok=True)
+        shutil.rmtree(self.share / "outbox", ignore_errors=True)
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.unlink(missing_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        before = hashlib.sha256(spec.read_bytes()).hexdigest()
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), *extra, FAKE_OPEN_SLEEP="12", FAKE_OPEN_MODES=mode)
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            time.sleep(2)
+            (self.run_dir / "batch.log").unlink(missing_ok=True)
+            os.link(spec, self.run_dir / "batch.log")
+            so, se = p.communicate(timeout=300)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertEqual(hashlib.sha256(spec.read_bytes()).hexdigest(), before, "the accepted input is byte-unchanged: nothing was appended through the alias")
+        self.assertEqual(p.returncode, code, so + se)
+        self.assertEqual(batch_result(so)["stopReason"], reason, "the typed reason still reaches stdout")
+        self.assertIn("BATCH_OUTPUT_ALIASED ", se, "the alias is said on stderr")
+        self.assertEqual(self.leg_calls(), [], "no leg ran")
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+        self.assertTrue(any(k.startswith("CLOSE") for k in self.kinds()), "the lease was closed")
 
     # r12 (adversary r12 A2): TrimEnd('\') turned the drive root C:\ into C:, the drive's current directory, so a root zone was listed from the wrong folder. A real volume root cannot be
     # written to by a test, so the function that decides it is run on its own: its source is taken from the runner, so this cannot drift from what the runner does.

@@ -461,6 +461,20 @@ function Get-InputOutputRefusal {
     Get-InputContentRefusal
 }
 
+function Test-OpenOutputAlias {
+    # r14 (Dot 2e6eb21d; adversary r13 pass 3 A1, A2): the guard run once the open returns, WHATEVER it returned (a failed open, one with no lease batch, one still held in the gate, one
+    # held to the deadline), before anything more is written. A location hit means a runner output IS an accepted input, so it turns the write suppression on by itself: the log and
+    # the receipt go to stderr, the close job file to a fresh folder under TEMP, the ledger row is said, not appended. Which typed stop the run then takes is decided apart from it.
+    $hit = Get-InputOutputRefusal
+    if ($hit -and $hit.kind -cne 'content' -and -not $script:RunOutputAliased) {
+        $script:RunOutputAliased = $true
+        $script:jobDir = Join-Path ([IO.Path]::GetTempPath()) "venue-lease-batch-close-$token"; New-Item -ItemType Directory -Force -Path $script:jobDir | Out-Null
+        $script:batchLog = Join-Path $script:jobDir 'batch.log'   # the final result-line append lands there, not in -RunDir
+        [Console]::Error.WriteLine("BATCH_OUTPUT_ALIASED kind=$($hit.kind) item=$($hit.item) $($hit.why) (found once the open returned: nothing more is written into -RunDir; the log and the receipt go to stderr)")
+    }
+    $hit
+}
+
 function Get-InputContentRefusal {
     # r12 pass 2 (adversary r12 A2'): the CONTENT the preflight validated (each leg spec the leg would run, each staged build manifest's digest and fields) can change in the same wait as
     # a location can, and the leg job would then throw or refuse after the lease opened. The same reads and the same typed reasons as the preflight, run again with the location re-check.
@@ -871,6 +885,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # CAPS d: um-run stopped while the agent still holds the open in its gate, re-asking a refused (exit 75) request. That is a wait, not a failure:
             # the open is never resubmitted (a second open would queue behind it); its result is read by name until the deadline.
             $b.openLeaseWait = 'EXIT_75_WAIT'
+            $null = Test-OpenOutputAlias   # r14 (adversary r13 pass 3 A2): the open returned (still held), so the guard runs before this line is written; it runs again below
             L "BATCH_OPEN_STILL_WAITING batch=$batchNo job=$($b.openJobId) (held in the agent's admission gate: exit 75 is wait-and-retry; reading its result by name until $($deadline.ToString('o')))"
             while ($true) {
                 $jr = Get-VenueJobResult -AgentShare $AgentShare -JobId $b.openJobId
@@ -893,7 +908,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # r13 pass 2 (adversary A3): the lease's end is placed from the moment the result was read, BEFORE the guard's reads (which can take a while), never after them
         $openReadUtc = [DateTime]::UtcNow
         $leaseEnd = Get-LeaseEndUtc $op.result
-        $openHit = $(if ($op.outcome -ceq 'RECEIPT' -or $op.outcome -ceq 'RECEIPT_BY_NAME') { Get-InputOutputRefusal } else { $null })
+        # r14 (Dot 2e6eb21d; adversary r13 pass 3 A1, A2): the guard runs for EVERY outcome, a gate hold that reached the deadline included, and a location hit suppresses the writes
+        # whichever typed stop wins below (OPEN_FAILED, AGENT_NOT_BATCH_CAPABLE, DEADLINE, ...); only a clean open turns a hit into the refusal itself.
+        $openHit = Test-OpenOutputAlias
         if ($op.outcome -ceq 'NOT_SUBMITTED' -and $crossed) {
             $b.endReason = 'DEADLINE'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
             Set-Stop 'DEADLINE' 3
@@ -914,13 +931,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 elseif ($openHit.kind -ceq 'build') { 'BUILD_MANIFEST_IS_RUN_OUTPUT', $openHit.item, "the staged build manifest $($openHit.why)" } else { 'LEG_SPEC_IS_RUN_OUTPUT', $openHit.item, "the leg spec $($openHit.why)" })
             # the lease is held: the finally closes it and charges the ledger from the open's submit (no earlier start is known without reading its end)
             $b.leaseId = [string]$adm.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc; $b.endReason = $hr[0]
-            # r13 pass 2 (adversary A1): a location hit means a runner output IS the input, so from here nothing is written into -RunDir or the claim dir's outputs: the log and the
-            # receipt go to stderr, the close job file is written to a fresh folder under TEMP, and the ledger row is said, not appended (the ledger may be that input).
-            if ($openHit.kind -cne 'content') {
-                $script:RunOutputAliased = $true
-                $script:jobDir = Join-Path ([IO.Path]::GetTempPath()) "venue-lease-batch-close-$token"; New-Item -ItemType Directory -Force -Path $script:jobDir | Out-Null
-                $script:batchLog = Join-Path $script:jobDir 'batch.log'   # the final result-line append lands there, not in -RunDir
-            } $b.endDetail = "after the open, before any probe or leg: $($hr[2])"
+            # r13 pass 2 (adversary A1): a location hit means a runner output IS the input, so from here nothing is written into -RunDir or the claim dir's outputs (the ledger may be
+            # that input). r14: Test-OpenOutputAlias above already turned that suppression on, for this branch and every other.
+            $b.endDetail = "after the open, before any probe or leg: $($hr[2])"
             [Console]::Error.WriteLine("BATCH_USAGE $(if ($legPlanMode) { "LEG_PLAN_REFUSED reason=$($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" })" } else { $hr[0] }) $($hr[2]) (found after the open: no probe or leg ran; the lease is closed)")
             Set-Stop $hr[0] 2
         } else {
