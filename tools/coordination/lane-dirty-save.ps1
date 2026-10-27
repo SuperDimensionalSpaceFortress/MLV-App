@@ -11,9 +11,14 @@
 # An unmerged index (a lane that died mid `git merge`) has no staged diff to write: `git diff --cached` prints only '* Unmerged path <file>' and exits 0. That state is recorded in the merge-state file and the
 # line is DIRTY_TREE_SAVE_FAILED reason=unmerged-index. Every DIRTY_TREE_SAVE_FAILED that comes after evidence was placed ends with the files already there: patch=<path> status=<path> merge-state=<path>,
 # and a file moved into place whose bytes could not be proven to be the validated ones is named last as unverified=<path>. Every diff is digested before it is checked
-# and must still hold those bytes when it is placed (reason=evidence-changed-after-validation otherwise). A .git that names another repository by the end of the root checks,
-# or a git or common directory whose hold has another directory open than the one git named at the first read (same path, other volume serial + file index), is reason=worktree-git-dir-changed;
-# the files that name the repository (.git gitfile, commondir) and the git and common directories are held for the save, and one that cannot be held is reason=git-metadata-not-held.
+# and must still hold those bytes when it is placed (reason=evidence-changed-after-validation otherwise). The git dir and the common dir are sampled (volume serial + file index)
+# from the .git gitfile and commondir BEFORE git reads anything; git's first answer, each hold and every later check must name those same directories (reason=worktree-git-dir-changed /
+# worktree-common-dir-changed), and a .git that names another repository by the end of the root checks is worktree-git-dir-changed. The files that name the repository (.git gitfile,
+# commondir) and the git and common directories are held for the save (one that cannot be held is reason=git-metadata-not-held); a naming file (commondir, gitdir) absent from the
+# git dir at the sample must still be absent at every check before a write or a publish and after the last git call (reason=git-metadata-appeared). Not covered: a worktree already
+# changed before the call (DIRTY-SAVE-DISPATCHER-IDENTITY-HANDOFF-1), and a naming file created and removed again between two of those checks (r10-R1).
+# Every temp file is created by the saver with CREATE_NEW and held (no rename, no delete) until it is moved; a name that already exists is reason=temp-path-exists, a temp
+# file with a second name is temp-file-linked, and a moved file that is not the one created is evidence-identity-changed:<path>.
 # The helper judges every git exit code itself and sets $PSNativeCommandUseErrorActionPreference = $false for its own calls, so the expected exit 1 of `git diff --cached --quiet` cannot throw under a caller that set it.
 # It refuses a -Dest inside the worktree it describes (reason=dest-inside-worktree): evidence written there would show in the next status and be captured by the next save.
 # -Dest is resolved once to its physical path and every write uses that path; a destination that changed identity before a write or publish is reason=dest-identity-changed.
@@ -27,41 +32,66 @@
 # The move fails rather than overwrites, so an occupied name is compared by hash (same bytes = reuse, anything else = lengthen the name) and never clobbered.
 # When the name already holds these exact bytes, $Tmp is left for the caller's cleanup. A non-empty $FirstName is tried before the hash-derived names.
 # It always returns a hashtable: Path is the placed (or reused) file, or $null with Reason = name-collision (every length is taken by a DIFFERENT file) or
-# move-failed:<HResult> <message> (the move threw an IOException and the target does not exist: a sharing violation or an AV lock on $Tmp, not a name clash).
+# move-failed:<HResult> <message> (the move threw, and not an IOException over an existing target: a sharing violation, an AV lock or access denied on $Tmp, not a name clash).
 # A file moved into place whose bytes cannot be proven to hash to $Full comes back as Path = $null, Placed = <that file> and Reason = evidence-changed-before-publish:<file>
 # or evidence-unverified-after-publish (its hash could not be read). Every result carries the Placed key ($null unless a file was moved into place): the caller reads it, and
 # under Set-StrictMode -Version Latest (Invoke-Workstream.ps1) reading an absent key throws and buries the typed reason (r9, adversary 2181cd97-A2).
 function Invoke-DirtyFileMove([string]$From, [string]$To) { [System.IO.File]::Move($From, $To) }  # one seam, so a test can stand in for a locked file
 
-function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem, [string]$Ext, [string]$Full, [string]$FirstName = '', [scriptblock]$Guard = $null) {
-    if ($Full -cnotmatch '^[0-9a-f]{64}\z') { return @{ Path = $null; Placed = $null; Reason = 'bad-digest' } }  # every name below is cut from a lower-case SHA-256; anything else is refused, not thrown (r6 adversary A3; \z, not $, which matches before a final LF)
-    if (-not $Tmp -or -not $Dir) { return @{ Path = $null; Placed = $null; Reason = 'bad-argument' } }  # Join-Path below throws on an empty -Dir (r6 iter 2 adversary A4)
-    $names = @()
-    if ($FirstName) { $names += , @($FirstName, '') }
-    foreach ($n in 8, 16, 32, 64) { $names += , @("$Stem$($Full.Substring(0, $n))$Ext", $Full.Substring(0, $n)) }
-    foreach ($pair in $names) {
-        $cand = Join-Path $Dir $pair[0]
-        if ($Guard) { $why = & $Guard 'before-publish'; if ($why) { return @{ Path = $null; Placed = $null; Reason = $why } } }  # the destination is re-proven right before each rename into place
-        try { Invoke-DirtyFileMove $Tmp $cand }
-        catch [System.IO.IOException] {
-            $ex = $_.Exception
-            while ($ex.InnerException -and $ex -isnot [System.IO.IOException]) { $ex = $ex.InnerException }  # a method call wraps the real IOException
-            if (-not (Test-Path -LiteralPath $cand)) { return @{ Path = $null; Placed = $null; Reason = ('move-failed:0x{0:X8} {1}' -f $ex.HResult, ($ex.Message -replace '\s+', ' ')) } }
-            # An occupied name that cannot be read is not proven to hold these bytes, so the next length is tried (r8, adversary 98e161fc-A3 sibling :48: the hash used to throw out of the helper).
-            $held = $null
-            try { if (Test-Path -LiteralPath $cand -PathType Leaf) { $held = (Get-FileHash -LiteralPath $cand -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } } catch { $held = $null }
-            if ($held -ceq $Full) { return @{ Path = $cand; Placed = $null; Id = $pair[1]; Moved = $false } }
-            continue
+# Nothing escapes it (r10, sol r9 B4): a move that throws anything but a name clash is move-failed, and a throw anywhere else (a -Guard that throws, Join-Path on a drive
+# that does not exist) is placement-failed:<HResult> <message>, with Placed naming a file already moved into place.
+# -Hold is the caller's New-DirtyHeldTemp record for $Tmp: right before the move the held file must still have one name, the hold is released (a held file cannot be
+# renamed), and the file moved into place must be that file (same volume serial + file index, one name); otherwise Placed = <it> and Reason = evidence-identity-changed:<it> (r10, sol r9 B3).
+function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem, [string]$Ext, [string]$Full, [string]$FirstName = '', [scriptblock]$Guard = $null, $Hold = $null) {
+    $placedNow = $null
+    try {
+        if ($Full -cnotmatch '^[0-9a-f]{64}\z') { return @{ Path = $null; Placed = $null; Reason = 'bad-digest' } }  # every name below is cut from a lower-case SHA-256; anything else is refused, not thrown (r6 adversary A3; \z, not $, which matches before a final LF)
+        if (-not $Tmp -or -not $Dir) { return @{ Path = $null; Placed = $null; Reason = 'bad-argument' } }  # Join-Path below throws on an empty -Dir (r6 iter 2 adversary A4)
+        $names = @()
+        if ($FirstName) { $names += , @($FirstName, '') }
+        foreach ($n in 8, 16, 32, 64) { $names += , @("$Stem$($Full.Substring(0, $n))$Ext", $Full.Substring(0, $n)) }
+        foreach ($pair in $names) {
+            $cand = Join-Path $Dir $pair[0]
+            # Every write into the temp is done, so its hold is released before the destination is re-proven: a held child would block the very rename of -Dest the guard looks for.
+            if ($Hold -and $null -ne $Hold.Handle) {
+                $why = Test-DirtyTempHeld $Hold
+                if ($why) { return @{ Path = $null; Placed = $null; Reason = $why } }
+                Unlock-DirtyTemp $Hold
+            }
+            if ($Guard) { $why = & $Guard 'before-publish'; if ($why) { return @{ Path = $null; Placed = $null; Reason = $why } } }  # the destination is re-proven right before each rename into place
+            try { Invoke-DirtyFileMove $Tmp $cand }
+            catch {
+                $ex = $_.Exception
+                while ($ex.InnerException -and $ex -isnot [System.IO.IOException]) { $ex = $ex.InnerException }  # a method call wraps the real exception
+                $moveFailed = @{ Path = $null; Placed = $null; Reason = ('move-failed:0x{0:X8} {1}' -f $ex.HResult, ($ex.Message -replace '\s+', ' ')) }
+                if ($ex -isnot [System.IO.IOException] -or -not (Test-Path -LiteralPath $cand)) { return $moveFailed }
+                # An occupied name that cannot be read is not proven to hold these bytes, so the next length is tried (r8, adversary 98e161fc-A3 sibling :48: the hash used to throw out of the helper).
+                $held = $null
+                try { if (Test-Path -LiteralPath $cand -PathType Leaf) { $held = (Get-FileHash -LiteralPath $cand -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } } catch { $held = $null }
+                if ($held -ceq $Full) { return @{ Path = $cand; Placed = $null; Id = $pair[1]; Moved = $false } }
+                continue
+            }
+            # Placed. The bytes published must be the bytes validated: a temp file rewritten after its checks would otherwise be placed and reported (r7 iter 2, adversary 43a1998e-A1).
+            # From here every failure names the placed file as Placed, so the caller's line reports it (unverified=<path>) instead of losing it (r8, adversary 98e161fc-A3).
+            $placedNow = $cand
+            if ($Hold) {
+                $placedId = $null
+                try { $placedId = [DirtyFinalPath]::FileIdentity($cand) } catch { $placedId = $null }
+                if ($placedId -cne ($Hold.Id + '/1')) { return @{ Path = $null; Placed = $cand; Reason = "evidence-identity-changed:$cand" } }
+            }
+            $now = $null
+            try { $now = (Get-FileHash -LiteralPath $cand -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch { $now = $null }
+            if ($null -eq $now) { return @{ Path = $null; Placed = $cand; Reason = 'evidence-unverified-after-publish' } }
+            if ($now -cne $Full) { return @{ Path = $null; Placed = $cand; Reason = "evidence-changed-before-publish:$cand" } }
+            return @{ Path = $cand; Placed = $null; Id = $pair[1]; Moved = $true }
         }
-        # Placed. The bytes published must be the bytes validated: a temp file rewritten after its checks would otherwise be placed and reported (r7 iter 2, adversary 43a1998e-A1).
-        # From here every failure names the placed file as Placed, so the caller's line reports it (unverified=<path>) instead of losing it (r8, adversary 98e161fc-A3).
-        $now = $null
-        try { $now = (Get-FileHash -LiteralPath $cand -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch { $now = $null }
-        if ($null -eq $now) { return @{ Path = $null; Placed = $cand; Reason = 'evidence-unverified-after-publish' } }
-        if ($now -cne $Full) { return @{ Path = $null; Placed = $cand; Reason = "evidence-changed-before-publish:$cand" } }
-        return @{ Path = $cand; Placed = $null; Id = $pair[1]; Moved = $true }
+        return @{ Path = $null; Placed = $null; Reason = 'name-collision' }
     }
-    return @{ Path = $null; Placed = $null; Reason = 'name-collision' }
+    catch {
+        $ex = $_.Exception
+        while ($ex.InnerException -and $ex -is [System.Management.Automation.MethodInvocationException]) { $ex = $ex.InnerException }
+        return @{ Path = $null; Placed = $placedNow; Reason = ('placement-failed:0x{0:X8} {1}' -f $ex.HResult, ($ex.Message -replace '\s+', ' ')) }
+    }
 }
 
 # The canonical spelling of an existing path: every component in the case and long-name form the file system stores it under (an 8.3 alias or a different case
@@ -126,6 +156,30 @@ public static class DirtyFinalPath {
     public static IntPtr PinFile(string path) {
         IntPtr h = CreateFileW(path, 0x80000000, 1, IntPtr.Zero, 3, 0, IntPtr.Zero);
         return h == (IntPtr)(-1) ? IntPtr.Zero : h;
+    }
+    // Creates a NEW file (CREATE_NEW: fails when the name exists, a planted hard link included) and holds it for reading, sharing READ and WRITE but not DELETE: git and the
+    // checks can open it, nobody can rename or delete it, so the name keeps naming this file until Unpin (r10, sol r9 B3). Error is the Win32 code when it returns IntPtr.Zero.
+    // The \\?\ spelling of a full path, so a temp name in a deep run dir is not cut off at MAX_PATH (the managed file APIs add it themselves; a direct CreateFileW does not).
+    static string Long(string path) {
+        if (path.StartsWith(@"\\?\") || path.StartsWith(@"\\.\")) return path;
+        string full = System.IO.Path.GetFullPath(path);
+        return full.StartsWith(@"\\") ? @"\\?\UNC\" + full.Substring(2) : @"\\?\" + full;
+    }
+    public static IntPtr CreateHeld(string path, out int error) {
+        IntPtr h = CreateFileW(Long(path), 0x80000000, 3, IntPtr.Zero, 1, 0x80, IntPtr.Zero);
+        error = h == (IntPtr)(-1) ? Marshal.GetLastWin32Error() : 0;
+        return h == (IntPtr)(-1) ? IntPtr.Zero : h;
+    }
+    // Volume serial + file index + link count of what a held handle has open, or of the name itself (a link at the name is not followed); null when unknown.
+    public static string HandleFileIdentity(IntPtr h) {
+        ByHandleInfo i;
+        if (h == IntPtr.Zero || !GetFileInformationByHandle(h, out i)) return null;
+        return i.Volume.ToString("X8") + ":" + i.IndexHigh.ToString("X8") + i.IndexLow.ToString("X8") + "/" + i.Links.ToString();
+    }
+    public static string FileIdentity(string path) {
+        IntPtr h = CreateFileW(Long(path), 0, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+        if (h == (IntPtr)(-1)) return null;
+        try { return HandleFileIdentity(h); } finally { CloseHandle(h); }
     }
     public static void Unpin(IntPtr handle) { if (handle != IntPtr.Zero) CloseHandle(handle); }
 }
@@ -209,6 +263,63 @@ function Lock-DirtyFile([string]$Path) {
 }
 # The identity of the directory a hold has open, read from the held handle and never by reopening a path (two plain renames can put another directory behind the same path); $null when unknown.
 function Get-DirtyHeldIdentity($Handle) { if ($null -eq $Handle) { return $null }; try { return [DirtyFinalPath]::HandleIdentity([IntPtr]$Handle) } catch { return $null } }
+
+# Every temp file is created by the saver itself, before git or any writer opens it (r10, sol r9 B3): git --output and WriteAllLines open a path for truncating output, so a hard
+# link planted at a generated name to a file in the worktree would have that file overwritten while the tracked diff, and so SAVED, stayed unchanged. CREATE_NEW refuses a name
+# that already exists (reason=temp-path-exists), and the hold (DirtyFinalPath.CreateHeld) keeps the name on this file until the move: nobody can rename or delete it.
+# Returns @{ Path; Handle; Id } (Id = volume serial + file index) or @{ Path = $null; Reason }. The file must still have one name at every use (Test-DirtyTempHeld).
+function New-DirtyHeldTemp([string]$Dir, [string]$Name) {
+    $path = Join-Path $Dir $Name
+    if (-not ('DirtyFinalPath' -as [type])) { $null = Get-DirtyKernelPath $Dir }  # defines the type
+    if (-not ('DirtyFinalPath' -as [type])) { return @{ Path = $null; Reason = 'temp-not-held' } }
+    $err = 0
+    $h = [DirtyFinalPath]::CreateHeld($path, [ref]$err)
+    if ($h -eq [IntPtr]::Zero) { return @{ Path = $null; Reason = $(if ($err -in 80, 183) { 'temp-path-exists' } else { "temp-not-held:$err" }) } }
+    $id = [DirtyFinalPath]::HandleFileIdentity($h)
+    $temp = @{ Path = $path; Handle = $h; Id = $(if ($id) { $id.Split('/')[0] } else { $null }) }
+    if (-not $id -or -not $id.EndsWith('/1')) { Remove-DirtyTemp $temp; return @{ Path = $null; Reason = 'temp-file-linked' } }
+    return $temp
+}
+# '' while a held temp is still one file with one name, read from the held handle (a link added to it would let a later write or the move reach another name); else the reason.
+function Test-DirtyTempHeld($Temp) {
+    $now = $null
+    if ($null -ne $Temp.Handle) { try { $now = [DirtyFinalPath]::HandleFileIdentity([IntPtr]$Temp.Handle) } catch { $now = $null } }
+    if (-not $now) { return 'temp-not-held' }
+    if ($now -cne ($Temp.Id + '/1')) { return 'temp-file-linked' }
+    return ''
+}
+function Unlock-DirtyTemp($Temp) { if ($Temp -and $null -ne $Temp.Handle) { try { [DirtyFinalPath]::Unpin([IntPtr]$Temp.Handle) } catch { }; $Temp.Handle = $null } }  # not the directory-hold seam
+# Deletes a temp the saver created, and only while its name still opens onto that file: a replacement put at the name after the hold was released is left alone.
+function Remove-DirtyTemp($Temp) {
+    if (-not $Temp -or -not $Temp.Path) { return }
+    Unlock-DirtyTemp $Temp
+    try {
+        $now = [DirtyFinalPath]::FileIdentity($Temp.Path)
+        if ($now -and $Temp.Id -and $now.StartsWith($Temp.Id + '/')) { [System.IO.File]::Delete($Temp.Path) }
+    } catch { }
+}
+# Writes lines (UTF-8, no BOM, each ended like WriteAllLines) into a held temp through its existing name, which the hold keeps on that file; the file is opened, never created.
+function Write-DirtyTempLines($Temp, [string[]]$Lines) {
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    $bytes = $enc.GetBytes((@($Lines | ForEach-Object { $_ + [Environment]::NewLine }) -join ''))
+    $fs = [System.IO.File]::Open($Temp.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+    try { $fs.SetLength(0); $fs.Write($bytes, 0, $bytes.Length); $fs.Flush() } finally { $fs.Dispose() }
+}
+
+# The files that name a repository to git (a gitfile's target, its commondir) and the directories they name, sampled BEFORE git reads anything (r10, sol r9 B1/B2).
+# CommonDir is where git will take refs and objects from: <git dir>\commondir resolved against the git dir (git's get_common_dir_noenv), or the git dir itself.
+# Absent lists the naming files (commondir, gitdir) that do not exist in the git dir: git's files ref backend reads commondir even under GIT_COMMON_DIR, so one created
+# mid-save would redirect every later ref lookup. Each must still be absent at every later check (reason=git-metadata-appeared).
+function Get-DirtyRepoSample([string]$GitDir) {
+    $common = $GitDir
+    $cdFile = Join-Path $GitDir 'commondir'
+    if (Test-Path -LiteralPath $cdFile -PathType Leaf) {
+        $text = [System.IO.File]::ReadAllText($cdFile).TrimEnd([char[]]@("`r", "`n"))
+        $common = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($GitDir, $text))
+    }
+    $absent = @(foreach ($n in 'commondir', 'gitdir') { $p = Join-Path $GitDir $n; if (-not (Test-Path -LiteralPath $p)) { $p } })
+    return @{ GitId = (Get-DirtyDirIdentity $GitDir); CommonDir = $common; CommonId = (Get-DirtyDirIdentity $common); Absent = $absent }
+}
 
 # True when $Path is the directory with this identity or sits anywhere below it. A spelling the path comparison cannot relate to the worktree (an SMB share of it, \\localhost\share,
 # whose resolved name is in the share's namespace) still opens onto the same volume serial + file index (r5 adversary A4).
@@ -366,12 +477,14 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         # The common directory (refs and objects) is read with it: a linked worktree names it in its commondir file, which every unpinned git call reads again (r8 iter 1, adversary a8807691-A1).
         # The same path strings can name another directory: a .git directory moved away and another moved onto its name between this read and the holds below would be held
         # in its place, and a replacement whose HEAD and index match the working bytes saves as an empty diff. So the identity (volume serial + file index) of each directory
-        # git names is sampled at this read, and each hold must have that same directory open, read from the held handle (r9, adversary 2181cd97-A1, Dot 99ace7b). The
-        # directory git is about to use is sampled BEFORE git reads it: a main worktree's .git directory, or the target a linked worktree's .git gitfile names (read here and
-        # spelled in full), so a replacement between git's read and a later sample cannot be the one sampled (r9 iter 1, adversary 586f103a-A2). A linked worktree's common
-        # dir contains that target, so replacing the common dir moves the target too. The gitfile and commondir are held below.
+        # git names is sampled at this read, and each hold must have that same directory open, read from the held handle (r9, adversary 2181cd97-A1, Dot 99ace7b). Both
+        # directories git is about to use are sampled BEFORE git reads anything (Get-DirtyRepoSample): the git dir (a main worktree's .git directory, or the target a linked
+        # worktree's .git gitfile names, read here and spelled in full; r9 iter 1, adversary 586f103a-A2) and the common dir its commondir file names (r10, sol r9 B1: a common dir
+        # replaced after git's read, with the original worktrees\<name> carried into the replacement, kept the git dir's identity, so only a sample of the common dir itself
+        # taken before git's read shows it). git's answer must name those two directories (worktree-git-dir-changed / worktree-common-dir-changed), and so must each hold.
+        # A worktree changed before this point (before the caller's own git status, or between it and this call) is not seen here: DIRTY-SAVE-DISPATCHER-IDENTITY-HANDOFF-1.
         $dotGit = Join-Path $Wt '.git'
-        $dotGitId = $null
+        $sample = $null
         $dotGitDir = $null
         if (Test-Path -LiteralPath $dotGit -PathType Container) { $dotGitDir = $dotGit }
         elseif (Test-Path -LiteralPath $dotGit -PathType Leaf) {
@@ -381,18 +494,28 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             $dotGitDir = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($Wt, $m.Groups[1].Value))
         }
         if ($dotGitDir) {
-            $dotGitId = Get-DirtyDirIdentity $dotGitDir
-            if (-not $dotGitId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
+            $sample = Get-DirtyRepoSample $dotGitDir
+            if (-not $sample.GitId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
+            if (-not $sample.CommonId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-common-dir-changed" }
         }
         $gitDir = @(& git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir 2>$null)
         if ($LASTEXITCODE -ne 0 -or $gitDir.Count -ne 2) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
         $gitDirIds = @($gitDir | ForEach-Object { Get-DirtyDirIdentity $_ })
         if (@($gitDirIds | Where-Object { -not $_ }).Count -gt 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
-        if ($null -ne $dotGitId -and $gitDirIds[0] -cne $dotGitId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
+        if ($null -ne $sample -and $gitDirIds[0] -cne $sample.GitId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
+        if ($null -ne $sample -and $gitDirIds[1] -cne $sample.CommonId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-common-dir-changed" }
         # Pinning GIT_COMMON_DIR is not enough: git's ref store reads a linked worktree's commondir file itself. So the files that name the repository (the -Wt\.git gitfile and
         # commondir) are held against any write, rename or delete, and the git and common directories like -Dest, until the save ends; the second read below then binds (r8 iter 1).
+        # A naming file that does not exist cannot be held: it must still be absent at every later check ($repoCheck, reason=git-metadata-appeared; r10, sol r9 B2).
+        $absentMeta = @(if ($null -ne $sample) { $sample.Absent })
         foreach ($meta in @((Join-Path $Wt '.git'), (Join-Path $gitDir[0] 'commondir'))) {
-            if (-not (Test-Path -LiteralPath $meta -PathType Leaf)) { continue }  # a main worktree has a .git directory and no commondir
+            if (-not (Test-Path -LiteralPath $meta -PathType Leaf)) {  # a main worktree has a .git directory and no commondir
+                if ((Split-Path -Leaf $meta) -ceq 'commondir') {
+                    if ($null -ne $sample -and $sample.CommonDir -cne $dotGitDir) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-metadata-not-held" }  # read before git, gone now
+                    $absentMeta += $meta
+                }
+                continue
+            }
             $h = Lock-DirtyFile $meta
             if ($null -eq $h) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-metadata-not-held" }
             $metaLocks += , $h
@@ -401,7 +524,16 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             $h = Lock-DirtyDirectory $gitDir[$i]
             if ($null -eq $h) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-metadata-not-held" }
             $metaLocks += , $h
-            if ((Get-DirtyHeldIdentity $h) -cne $gitDirIds[$i]) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }  # the hold has another directory open (r9)
+            if ((Get-DirtyHeldIdentity $h) -cne $gitDirIds[$i]) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$(if ($i -eq 0) { 'worktree-git-dir-changed' } else { 'worktree-common-dir-changed' })" }  # the hold has another directory open (r9)
+        }
+        # Re-run at every before-write and before-publish check and after the last git call: the git and common directories still open onto the sampled ones, and no naming
+        # file that was absent has appeared (r10, sol r9 B1/B2). A naming file created and removed again between two of these checks is not seen (OPEN r10-R1).
+        $repoCheck = {
+            for ($i = 0; $i -lt $gitDir.Count; $i++) {
+                if ((Get-DirtyDirIdentity $gitDir[$i]) -cne $gitDirIds[$i]) { return $(if ($i -eq 0) { 'worktree-git-dir-changed' } else { 'worktree-common-dir-changed' }) }
+            }
+            foreach ($p in $absentMeta) { if (Test-Path -LiteralPath $p) { return 'git-metadata-appeared' } }
+            return ''
         }
         $prefix = @(& git -C $Wt rev-parse --show-prefix 2>$null)
         if ($LASTEXITCODE -ne 0 -or ($prefix -join '').Trim() -ne '') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
@@ -424,28 +556,33 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             if ($LASTEXITCODE -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-raw-exit-$LASTEXITCODE" }
             if (@($raw | Where-Object { $_ -cmatch '^:(160000 [0-7]{6}|[0-7]{6} 160000) ' }).Count -gt 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved" }
         }
-        $guard ={ param($stage) Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -WtIdentity $wtId -Stage $stage }
+        # Every before-write and before-publish check re-proves the destination AND the repository ($repoCheck) (r10, sol r9 B1/B2).
+        $guard ={ param($stage) $w = Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -WtIdentity $wtId -Stage $stage; if ($w) { return $w }; & $repoCheck }
         $why = & $guard 'before-write'
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }
-        $tmp = Join-Path $Dest ('dirty-worktree-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        # Every temp file is created here, exclusively, before git or any writer opens it, and held until it is moved (New-DirtyHeldTemp; r10, sol r9 B3).
+        $tmp = New-DirtyHeldTemp $Dest ('dirty-worktree-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        if (-not $tmp.Path) { $why = $tmp.Reason; $tmp = $null; return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }
         # The diff shape is pinned on every diff the saver runs, so no user, global or repo config can change what `git apply` (default -p1) has to read back:
         # a/ b/ prefixes (diff.noprefix / diff.mnemonicPrefix), no external driver or textconv (diff.external), -U3 (diff.context=0 and diff.interHunkContext would
         # emit a patch plain git apply rejects), no color (color.ui=always), short submodule lines (diff.submodule=log), submodules never ignored
         # (diff.ignoreSubmodules=all would hide a gitlink change) and no rename detection (diff.renames).
         $shape = @('--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--submodule=short', '--ignore-submodules=none', '-U3', '--src-prefix=a/', '--dst-prefix=b/')
-        & git -C $Wt diff HEAD @shape "--output=$tmp" 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-exit-$LASTEXITCODE" }
+        & git -C $Wt diff HEAD @shape "--output=$($tmp.Path)" 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp.Path)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-exit-$LASTEXITCODE" }
+        $why = Test-DirtyTempHeld $tmp
+        if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }
         # Digest first, then the checks on those bytes, then the file must still hold them before it is placed (r8, adversary 98e161fc-A1; see Read-DirtyEvidence).
-        $patchEv = Read-DirtyEvidence $tmp
+        $patchEv = Read-DirtyEvidence $tmp.Path
         $full = $patchEv.Full
         if (-not (Test-DirtyPatchComplete -Wt $Wt -Full $full -GitDiffArgs (@('diff', 'HEAD') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=patch-incomplete" }
         if (Test-DirtyDiffHasGitlink $patchEv.Bytes) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved" }
-        if (-not (Test-DirtyEvidenceUnchanged -Path $tmp -Full $full)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=evidence-changed-after-validation" }
+        if (-not (Test-DirtyEvidenceUnchanged -Path $tmp.Path -Full $full)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=evidence-changed-after-validation" }
         # The name is the first 8 hex of the hash, lengthened until it is free or already holds these exact bytes (two different diffs may share a prefix).
         $bytes = $patchEv.Bytes.Length
         # A placement that moved a file but could not prove its bytes names it as unverified=<path> after the evidence placed so far (r8, adversary 98e161fc-A3).
         $placeFailed = { param($r) "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($r.Reason)$evidence" + $(if ($r.Placed) { " unverified=$($r.Placed)" } else { '' }) }
-        $placed = Move-DirtyEvidenceToFreeName -Tmp $tmp -Dir $Dest -Stem 'dirty-worktree-' -Ext '.patch' -Full $full -Guard $guard
+        $placed = Move-DirtyEvidenceToFreeName -Tmp $tmp.Path -Dir $Dest -Stem 'dirty-worktree-' -Ext '.patch' -Full $full -Guard $guard -Hold $tmp
         if (-not $placed.Path) { if ($placed.Placed) { $tmp = $null }; return (& $placeFailed $placed) }
         if ($placed.Moved) { $tmp = $null }
         $id = $placed.Id
@@ -460,10 +597,11 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         # free or identical, otherwise a hash-named sibling. A later save never rewrites an earlier snapshot.
         $why = & $guard 'before-write'
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-        $statTmp = Join-Path $Dest ('dirty-worktree-status-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-        [System.IO.File]::WriteAllLines($statTmp, [string[]]$status, (New-Object System.Text.UTF8Encoding($false)))  # UTF-8: quotepath=false prints literal non-ASCII names
-        $statFull = (Get-FileHash -LiteralPath $statTmp -Algorithm SHA256).Hash.ToLowerInvariant()
-        $statPlaced = Move-DirtyEvidenceToFreeName -Tmp $statTmp -Dir $Dest -Stem "dirty-worktree-$id.status-" -Ext '.txt' -Full $statFull -FirstName "dirty-worktree-$id.status.txt" -Guard $guard
+        $statTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-status-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        if (-not $statTmp.Path) { $why = $statTmp.Reason; $statTmp = $null; return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
+        Write-DirtyTempLines $statTmp $status  # UTF-8: quotepath=false prints literal non-ASCII names
+        $statFull = (Get-FileHash -LiteralPath $statTmp.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $statPlaced = Move-DirtyEvidenceToFreeName -Tmp $statTmp.Path -Dir $Dest -Stem "dirty-worktree-$id.status-" -Ext '.txt' -Full $statFull -FirstName "dirty-worktree-$id.status.txt" -Guard $guard -Hold $statTmp
         if (-not $statPlaced.Path) { if ($statPlaced.Placed) { $statTmp = $null }; return (& $placeFailed $statPlaced) }
         if ($statPlaced.Moved) { $statTmp = $null }
         $stat = $statPlaced.Path
@@ -483,10 +621,11 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             $state += $unmerged
             $why = & $guard 'before-write'
             if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-            $mergeTmp = Join-Path $Dest ('dirty-worktree-merge-state-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-            [System.IO.File]::WriteAllLines($mergeTmp, [string[]]$state, (New-Object System.Text.UTF8Encoding($false)))
-            $mergeFull = (Get-FileHash -LiteralPath $mergeTmp -Algorithm SHA256).Hash.ToLowerInvariant()
-            $mergePlaced = Move-DirtyEvidenceToFreeName -Tmp $mergeTmp -Dir $Dest -Stem 'dirty-worktree-merge-state-' -Ext '.txt' -Full $mergeFull -Guard $guard
+            $mergeTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-merge-state-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+            if (-not $mergeTmp.Path) { $why = $mergeTmp.Reason; $mergeTmp = $null; return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
+            Write-DirtyTempLines $mergeTmp $state
+            $mergeFull = (Get-FileHash -LiteralPath $mergeTmp.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            $mergePlaced = Move-DirtyEvidenceToFreeName -Tmp $mergeTmp.Path -Dir $Dest -Stem 'dirty-worktree-merge-state-' -Ext '.txt' -Full $mergeFull -Guard $guard -Hold $mergeTmp
             if (-not $mergePlaced.Path) { if ($mergePlaced.Placed) { $mergeTmp = $null }; return (& $placeFailed $mergePlaced) }
             if ($mergePlaced.Moved) { $mergeTmp = $null }
             return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=unmerged-index$evidence merge-state=$($mergePlaced.Path)"
@@ -500,26 +639,29 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         if ($stagedState -eq 1) {
             $why = & $guard 'before-write'
             if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-            $stagedTmp = Join-Path $Dest ('dirty-worktree-staging-' + [Guid]::NewGuid().ToString('N') + '.tmp')
-            & git -C $Wt diff --cached @shape "--output=$stagedTmp" 2>$null
+            $stagedTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-staging-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+            if (-not $stagedTmp.Path) { $why = $stagedTmp.Reason; $stagedTmp = $null; return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
+            & git -C $Wt diff --cached @shape "--output=$($stagedTmp.Path)" 2>$null
             $stagedExit = $LASTEXITCODE
             if ($stagedExit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-staged-diff-exit-$stagedExit$evidence" }
             # A full volume can cut the file short without git saying so: the staged diff must be non-empty and byte-identical to git's own stream for the index.
             # Digest first; every check below runs on these bytes, and the file must still hold them before it is placed (r8, adversary 98e161fc-A1).
-            if (-not (Test-Path -LiteralPath $stagedTmp)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
-            $stagedEv = Read-DirtyEvidence $stagedTmp
+            if (-not (Test-Path -LiteralPath $stagedTmp.Path)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
+            $why = Test-DirtyTempHeld $stagedTmp
+            if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
+            $stagedEv = Read-DirtyEvidence $stagedTmp.Path
             $stagedFull = $stagedEv.Full
             if ($stagedEv.Bytes.Length -eq 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
             if (-not (Test-DirtyPatchComplete -Wt $Wt -Full $stagedFull -GitDiffArgs (@('diff', '--cached') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
             # The header's promise, kept for every input: the diff must reverse-apply to the index it was taken from. --whitespace=nowarn: apply.whitespace=error in a user or repo config would
             # reject a reversed line with trailing blanks, which says nothing about whether the evidence is whole.
-            & git -C $Wt apply --cached --check -R --whitespace=nowarn $stagedTmp 2>$null
+            & git -C $Wt apply --cached --check -R --whitespace=nowarn $stagedTmp.Path 2>$null
             $applyExit = $LASTEXITCODE
             if ($applyExit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-not-applicable$evidence" }
             if (Test-DirtyDiffHasGitlink $stagedEv.Bytes) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved$evidence" }
-            # `git apply` above read the file, not the bytes; this re-hash also proves it read the bytes that were digested (unless rewritten and put back in between: LANE-DIRTY-SAVE-RACE-CLASS-1).
-            if (-not (Test-DirtyEvidenceUnchanged -Path $stagedTmp -Full $stagedFull)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=evidence-changed-after-validation$evidence" }
-            $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull -Guard $guard
+            # `git apply` above read the file, not the bytes; this re-hash also proves it read the bytes that were digested (unless rewritten and put back in between: OPEN r10-R2).
+            if (-not (Test-DirtyEvidenceUnchanged -Path $stagedTmp.Path -Full $stagedFull)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=evidence-changed-after-validation$evidence" }
+            $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp.Path -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull -Guard $guard -Hold $stagedTmp
             if (-not $stagedPlaced.Path) { if ($stagedPlaced.Placed) { $stagedTmp = $null }; return (& $placeFailed $stagedPlaced) }
             if ($stagedPlaced.Moved) { $stagedTmp = $null }
             $stagedOut = $stagedPlaced.Path
@@ -529,14 +671,19 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         if ($bytes -ne 0) {
             & git -C $Wt apply --check -R --whitespace=nowarn $patch 2>$null
             $verified = if ($LASTEXITCODE -eq 0) { 'reverse-apply-ok' } else { 'reverse-apply-FAILED' }
+            # git read the placed file by its name: it must still hold the validated bytes, or the verdict is about other bytes (r10 class sweep).
+            if (-not (Test-DirtyEvidenceUnchanged -Path $patch -Full $full)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=evidence-changed-after-validation$evidence" }
         }
+        # After the last git call: the repository every call read must still be the one sampled before the first (r10, sol r9 B1/B2).
+        $why = & $repoCheck
+        if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
         return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=git -C $(ConvertTo-DirtySingleQuoted $Wt) --git-dir $(ConvertTo-DirtySingleQuoted (Join-Path $Wt '.git')) --work-tree $(ConvertTo-DirtySingleQuoted $Wt) apply --whitespace=nowarn $(ConvertTo-DirtySingleQuoted $patch)"
         # nowarn: apply.whitespace=error would refuse a line with trailing blanks that the saver verified. --git-dir / --work-tree: the saver clears GIT_DIR and GIT_WORK_TREE only
         # for its own calls, and the command is pasted where they are back; the explicit options beat them (r6 adversary A1).
     }
     catch { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($_.Exception.Message -replace '\s+', ' ')$evidence" }  # a throw after a placement still names what was placed (r4 adversary A2)
     finally {
-        foreach ($t in $tmp, $stagedTmp, $statTmp, $mergeTmp) { if ($t -and (Test-Path -LiteralPath $t)) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } }
+        foreach ($t in $tmp, $stagedTmp, $statTmp, $mergeTmp) { Remove-DirtyTemp $t }  # only the file each name was created for (r10 class sweep: the cleanup used to delete whatever the name held)
         if ($null -ne $prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { } }
         foreach ($h in $metaLocks) { Unlock-DirtyDirectory $h }
         Unlock-DirtyDirectory $wtLock; Unlock-DirtyDirectory $destLock  # released only after the temp cleanup, which still runs inside the held destination

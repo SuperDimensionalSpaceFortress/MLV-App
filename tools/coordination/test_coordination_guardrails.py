@@ -2874,6 +2874,125 @@ def test_move_dirty_evidence_names_the_placed_file_when_it_cannot_prove_the_plac
 
 
 @dirty_save_only
+@pytest.mark.parametrize("swap", [True, False], ids=["replaced", "control"])
+def test_save_dirty_worktree_evidence_refuses_a_common_dir_replaced_with_the_worktree_admin_dir_carried_in(tmp_path, swap):
+    # r10 (sol r9 B1, adversary 7c56bf2b-A1): a linked worktree's common dir replaced right after git's first read, with the original worktrees\linked moved into the
+    # replacement, kept the git dir's identity, so the post-read sample bound the replacement; its lane branch holding the working bytes made the save report
+    # SAVED bytes=0 empty-diff and drop the staged edit. The common dir is now sampled from the admin dir's commondir before git reads anything.
+    main, dest = _dirty_save_repo(tmp_path)
+    git(main, "checkout", "--", "src/a.txt")
+    wt = tmp_path / "linked"
+    git(main, "worktree", "add", "-q", "-b", "lane", str(wt))
+    (wt / "src" / "a.txt").write_text("two\n")
+    git(wt, "add", "src/a.txt")  # lane HEAD one; index and working tree two
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", str(main), str(other))
+    git(other, "config", "user.email", "t@e.com")
+    git(other, "config", "user.name", "T")
+    git(other, "checkout", "-q", "-b", "lane")
+    (other / "src" / "a.txt").write_text("two\n")
+    git(other, "commit", "-qam", "lane in the replacement")
+    common = main / ".git"
+    away = tmp_path / "main-git-away"
+    # The seam: the first identity read of git's own forward-slash answer for the linked git dir, i.e. right after git has named both directories.
+    shim = (f"$script:Swap = ${'true' if swap else 'false'}; $script:Swapped = $false; "
+            "$script:RealId = (Get-Command Get-DirtyDirIdentity -CommandType Function).ScriptBlock; "
+            "function Get-DirtyDirIdentity([string]$Path) { "
+            "if ($script:Swap -and -not $script:Swapped -and $Path.EndsWith('/worktrees/linked')) { $script:Swapped = $true; "
+            f"[System.IO.Directory]::Move('{common}', '{away}'); [System.IO.Directory]::Move('{other / '.git'}', '{common}'); "
+            f"$null = [System.IO.Directory]::CreateDirectory('{common / 'worktrees'}'); [System.IO.Directory]::Move('{away / 'worktrees' / 'linked'}', '{common / 'worktrees' / 'linked'}') }}; "
+            "& $script:RealId $Path }")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output \"swapped=$script:Swapped\"")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] == f"swapped={swap}", (out.stdout, out.stderr)
+    if swap:
+        assert away.is_dir() and (common / "worktrees" / "linked" / "HEAD").is_file(), "the shim must have replaced the common dir and carried the admin dir in"
+        assert lines[0] == "DIRTY_TREE_SAVE_FAILED card=C1 reason=worktree-common-dir-changed", (out.stdout, out.stderr)
+        assert not list(dest.iterdir()), sorted(p.name for p in dest.iterdir())
+    else:
+        assert lines[0].startswith("DIRTY_TREE_SAVED card=C1") and "verified=reverse-apply-ok" in lines[0], (out.stdout, out.stderr)
+        text = next(dest.glob("dirty-worktree-*.patch")).read_text(encoding="utf-8")
+        assert "-one" in text and "+two" in text, text
+
+
+@dirty_save_only
+@pytest.mark.parametrize("create", [True, False], ids=["created", "control"])
+def test_save_dirty_worktree_evidence_refuses_a_commondir_created_in_the_git_dir_mid_save(tmp_path, create):
+    # r10 (sol r9 B2, adversary 7c56bf2b-A2): a main worktree's .git has no commondir, so nothing was held there; one created at the first before-write check, naming a
+    # repository whose branch holds the working bytes, redirected git's ref store (it reads commondir even under GIT_COMMON_DIR) and the save reported SAVED without the
+    # staged change. A naming file absent at the sample must still be absent at every later check.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "add", "src/a.txt")  # HEAD one; index and working tree two
+    branch = git(wt, "symbolic-ref", "--short", "HEAD")
+    two = git(wt, "commit-tree", git(wt, "write-tree"), "-p", "HEAD", "-m", "two")
+    git(wt, "update-ref", "refs/heads/side", two)
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", "--no-checkout", str(wt), str(other))
+    git(other, "update-ref", f"refs/heads/{branch}", two)
+    commondir = wt / ".git" / "commondir"
+    assert not commondir.exists()
+    shim = (f"$script:Create = ${'true' if create else 'false'}; $script:Created = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) {{ "
+            f"if ($script:Create -and -not $script:Created -and $Stage -eq 'before-write') {{ $script:Created = $true; "
+            f"[System.IO.File]::WriteAllText('{commondir}', '{str(other).replace(chr(92), '/')}/.git') }} }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output \"created=$script:Created\"")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] == f"created={create}", (out.stdout, out.stderr)
+    if create:
+        assert commondir.is_file(), "the shim must have created commondir"
+        assert lines[0] == "DIRTY_TREE_SAVE_FAILED card=C1 reason=git-metadata-appeared", (out.stdout, out.stderr)
+        assert not list(dest.iterdir()), sorted(p.name for p in dest.iterdir())
+    else:
+        assert lines[0].startswith("DIRTY_TREE_SAVED card=C1") and "verified=reverse-apply-ok" in lines[0] and " staged=none " not in lines[0], (out.stdout, out.stderr)
+        text = next(dest.glob("dirty-worktree-*.patch")).read_text(encoding="utf-8")
+        assert "-one" in text and "+two" in text, text
+
+
+@dirty_save_only
+@pytest.mark.parametrize("prefix", ["dirty-worktree-saving-", "dirty-worktree-status-", "dirty-worktree-staging-", "dirty-worktree-merge-state-saving-"])
+def test_save_dirty_worktree_evidence_never_writes_through_a_hard_link_planted_at_a_temp_name(tmp_path, prefix):
+    # r10 (sol r9 B3, adversary 7c56bf2b-A3): git --output and WriteAllLines open a generated temp name for truncating output, so a hard link planted at that name to an
+    # untracked worktree file had the file overwritten while the tracked diff, and so SAVED, stayed unchanged. Every temp is now created with CREATE_NEW before anything
+    # writes it: the planted name is refused (temp-path-exists) and the linked file keeps its bytes.
+    wt, dest = _dirty_save_repo(tmp_path)
+    if prefix == "dirty-worktree-staging-":
+        git(wt, "add", "src/a.txt")
+        (wt / "src" / "a.txt").write_text("three\n")
+    if prefix == "dirty-worktree-merge-state-saving-":
+        _leave_a_conflicted_merge(wt)
+    victim = wt / "orphan.txt"
+    victim.write_bytes(b"DO NOT LOSE\n")
+    # The seam: the Join-Path that names the temp file. The link is made right after the name is chosen and before the saver or git opens it.
+    shim = ("$script:RealJP = Get-Command Join-Path -CommandType Cmdlet; $script:Planted = $false; "
+            "function Join-Path { $r = & $script:RealJP @args; "
+            f"if (-not $script:Planted -and \"$($args[1])\" -like '{prefix}*') {{ $script:Planted = $true; $null = New-Item -ItemType HardLink -Path $r -Target '{victim}' }}; $r }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output \"planted=$script:Planted\"")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] == "planted=True", (out.stdout, out.stderr)
+    assert victim.read_bytes() == b"DO NOT LOSE\n", ("the linked worktree file was overwritten", out.stdout, out.stderr)
+    assert lines[0].startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=temp-path-exists") and "DIRTY_TREE_SAVED" not in out.stdout, (out.stdout, out.stderr)
+
+
+@dirty_save_only
+@pytest.mark.parametrize("case", ["access-denied", "guard-throws", "missing-drive"])
+def test_move_dirty_evidence_returns_its_failure_table_whatever_throws(tmp_path, case):
+    # r10 (sol r9 B4, adversary 7c56bf2b-A4): an UnauthorizedAccessException from the move, a -Guard that throws and Join-Path on a drive that does not exist escaped the
+    # helper's always-returns-a-hashtable contract. Each now returns the failure table, Placed key included, and the temp file is left as it was.
+    tmp = tmp_path / "a.tmp"
+    tmp.write_text("x\n")
+    seam, extra, expected = {
+        "access-denied": ("function Invoke-DirtyFileMove([string]$From, [string]$To) { throw [System.UnauthorizedAccessException]::new('access denied') }; ",
+                          f"-Dir '{tmp_path}'", "move-failed:0x80070005 access denied"),
+        "guard-throws": ("", f"-Dir '{tmp_path}' -Guard {{ throw [System.IO.IOException]::new('guard read failed') }}", "placement-failed:"),
+        "missing-drive": ("", "-Dir 'PR698MissingDrive:\\run'", "placement-failed:"),
+    }[case]
+    out = dirty_save_pwsh(f"$ErrorActionPreference = 'Stop'; Set-StrictMode -Version Latest; {seam}"
+                          f"$r = Move-DirtyEvidenceToFreeName -Tmp '{tmp}' {extra} -Stem dirty-worktree- -Ext .patch -Full ('a' * 64); "
+                          "Write-Output ('{0}|{1}|{2}|{3}' -f ($r -is [hashtable]), $r.ContainsKey('Placed'), ($null -eq $r.Path), $r.Reason)")
+    assert out.stdout.strip().startswith(f"True|True|True|{expected}"), (out.stdout, out.stderr)
+    assert tmp.read_text() == "x\n"
+
+
+@dirty_save_only
 def test_save_dirty_worktree_evidence_fails_typed_when_the_main_patch_loses_a_whole_file(tmp_path):
     # Same class on the main patch (adversary siblings :41 / :77): a complete one-file prefix used to be reported as verified=reverse-apply-ok.
     wt, dest = _dirty_save_repo(tmp_path)
