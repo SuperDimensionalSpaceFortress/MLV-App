@@ -14,6 +14,12 @@
 #              heavy-slot itself stays up STUB_HEAVY_SLOT_HOLD_S
 #              seconds (its release work after the child), then exits STUB_HEAVY_SLOT_CODE (default 0)
 #   locklog    hold this run's log open with read access and no read sharing, print the PIN MISMATCH warning, then run
+#   readypartial  publish the ready file in two writes, like a reader catching it half written: first only the ticket and
+#              holder lines (no owner, no 'end'), then after STUB_HEAVY_SLOT_CHILD_S seconds (default 2) the complete record,
+#              whose owner=<pid>@1 names no running process (a dead slot owner); STUB_HEAVY_SLOT_FINAL=malformed writes a
+#              complete record whose holder line does not parse instead. Then it waits STUB_HEAVY_SLOT_HOLD_S and exits.
+# The real-path modes (run, pinwarn, locklog) export HEAVY_SLOT_HELD and HEAVY_SLOT_HELD_START (this process's start time,
+# or STUB_HEAVY_SLOT_HELD_START, which stands in for a pid reused since the slot owner exported its start time).
 # STUB_HEAVY_SLOT_DELAY_S (run, pinwarn and readyexit) waits that many seconds before starting the child, like a queue wait for the slot.
 # Every call appends one JSON line (argv, the two EXPECT variables, and the child's start and end) to STUB_HEAVY_SLOT_LOG.
 $argv = @($args)
@@ -51,7 +57,7 @@ switch ($mode) {
     'readyexit' {
         if ($env:STUB_HEAVY_SLOT_DELAY_S) { Start-Sleep -Seconds ([int]$env:STUB_HEAVY_SLOT_DELAY_S) }
         $ticks = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
-        Set-Content -LiteralPath (Get-StubReadyPath) -Value @("${ticket}:$PID", "holder=$PID@$ticks") -Encoding ascii
+        Set-Content -LiteralPath (Get-StubReadyPath) -Value @("${ticket}:$PID", "holder=$PID@$ticks", 'owner=none', 'end') -Encoding ascii
         $record.childStart = [DateTime]::UtcNow.ToString('o')
         if ($env:STUB_HEAVY_SLOT_HOLD_S) { Start-Sleep -Seconds ([double]$env:STUB_HEAVY_SLOT_HOLD_S) }
         $record.childEnd = [DateTime]::UtcNow.ToString('o')
@@ -61,15 +67,30 @@ switch ($mode) {
         $ready = (Get-StubReadyPath) -replace "'", "''"
         $childS = if ($env:STUB_HEAVY_SLOT_CHILD_S) { [double]$env:STUB_HEAVY_SLOT_CHILD_S } else { 0 }
         $record.childStart = [DateTime]::UtcNow.ToString('o')
-        & $command[0] -NoProfile -NonInteractive -Command "Set-Content -LiteralPath '$ready' -Value @('${ticket}:$PID', ('holder={0}@{1}' -f `$PID, (Get-Process -Id `$PID).StartTime.ToUniversalTime().Ticks)) -Encoding ascii; Start-Sleep -Seconds $childS"
+        & $command[0] -NoProfile -NonInteractive -Command "Set-Content -LiteralPath '$ready' -Value @('${ticket}:$PID', ('holder={0}@{1}' -f `$PID, (Get-Process -Id `$PID).StartTime.ToUniversalTime().Ticks), 'owner=none', 'end') -Encoding ascii; Start-Sleep -Seconds $childS"
         $record.childEnd = [DateTime]::UtcNow.ToString('o')
         if ($env:STUB_HEAVY_SLOT_HOLD_S) { Start-Sleep -Seconds ([double]$env:STUB_HEAVY_SLOT_HOLD_S) }
+        $code = $stubCode
+    }
+    'readypartial' {
+        $ready = Get-StubReadyPath
+        $ticks = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
+        $record.childStart = [DateTime]::UtcNow.ToString('o')
+        Set-Content -LiteralPath $ready -Value @("${ticket}:$PID", "holder=$PID@$ticks") -Encoding ascii
+        Start-Sleep -Seconds $(if ($env:STUB_HEAVY_SLOT_CHILD_S) { [double]$env:STUB_HEAVY_SLOT_CHILD_S } else { 2 })
+        $final = if ($env:STUB_HEAVY_SLOT_FINAL -eq 'malformed') { @("${ticket}:$PID", "holder=$PID", 'owner=none', 'end') }
+                 else { @("${ticket}:$PID", "holder=$PID@$ticks", "owner=$PID@1", 'end') }
+        Set-Content -LiteralPath $ready -Value $final -Encoding ascii
+        if ($env:STUB_HEAVY_SLOT_HOLD_S) { Start-Sleep -Seconds ([double]$env:STUB_HEAVY_SLOT_HOLD_S) }
+        $record.childEnd = [DateTime]::UtcNow.ToString('o')
         $code = $stubCode
     }
     default {
         if ($env:STUB_HEAVY_SLOT_DELAY_S) { Start-Sleep -Seconds ([int]$env:STUB_HEAVY_SLOT_DELAY_S) }
         $record.childStart = [DateTime]::UtcNow.ToString('o')
         $env:HEAVY_SLOT_HELD = "${ticket}:$PID"
+        # Like the real CLI, the owner's start time goes beside it; STUB_HEAVY_SLOT_HELD_START stands in for a reused pid.
+        $env:HEAVY_SLOT_HELD_START = if ($env:STUB_HEAVY_SLOT_HELD_START) { $env:STUB_HEAVY_SLOT_HELD_START } else { (Get-Process -Id $PID).StartTime.ToUniversalTime().ToString('o') }
         $exe = $command[0]
         $rest = @(if ($command.Count -gt 1) { $command[1..($command.Count - 1)] })
         & $exe @rest

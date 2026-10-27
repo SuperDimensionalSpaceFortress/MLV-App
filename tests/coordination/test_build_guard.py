@@ -791,7 +791,8 @@ def _stub_sha() -> str:
 
 def _heavy(box: dict, mode: str, mode_args: list, sha: str = None, shim: Path = HEAVY_STUB, extra: dict = None,
            lock: Path = None, memory: list = None) -> subprocess.CompletedProcess:
-    memory_file = _write_json(box["dir"] / "memory.json", memory or OK_MEMORY)
+    # Only an omitted argument takes the default: an explicit [] or '' is a test input and reaches the guard as given.
+    memory_file = _write_json(box["dir"] / "memory.json", OK_MEMORY if memory is None else memory)
     table_file = _write_json(box["dir"] / "table.json", [])
     env = _env(heavy_slot=shim, extra={
         "STUB_HEAVY_SLOT_MODE": mode,
@@ -802,7 +803,7 @@ def _heavy(box: dict, mode: str, mode_args: list, sha: str = None, shim: Path = 
     return subprocess.run(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GUARD),
          "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(lock or box["lock"]),
-         "-ExemptLogPath", str(box["exempt_log"]), "-HeavySlotSha256", sha or _stub_sha(), *mode_args],
+         "-ExemptLogPath", str(box["exempt_log"]), "-HeavySlotSha256", _stub_sha() if sha is None else sha, *mode_args],
         capture_output=True, text=True, timeout=120, env=env, check=False,
     )
 
@@ -1317,10 +1318,10 @@ def test_the_slot_owner_identity_is_the_holders_never_a_reused_pid(box) -> None:
     done = _ps(["-Command",
                 f". '{GUARD}' -Library\n"
                 "$t = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks\n"
-                f"Set-Content -LiteralPath '{ready}' -Value @(\"stub-1:$PID\", \"holder=$PID@$t\", \"owner=$PID@$($t + 1)\") -Encoding ascii\n"
+                f"Set-Content -LiteralPath '{ready}' -Value @(\"stub-1:$PID\", \"holder=$PID@$t\", \"owner=$PID@$($t + 1)\", 'end') -Encoding ascii\n"
                 f"$lease = @{{ Ready = '{ready}'; Holder = $null; Owner = $null; Gone = ''; Process = (Get-Process -Id $PID) }}\n"
                 "Write-Output \"state=$(Get-HeavySlotHolderState $lease) gone=$($lease.Gone)\"\n"
-                f"Set-Content -LiteralPath '{ready}' -Value @(\"stub-1:$PID\", \"holder=$PID@$t\", \"owner=$PID@$t\") -Encoding ascii\n"
+                f"Set-Content -LiteralPath '{ready}' -Value @(\"stub-1:$PID\", \"holder=$PID@$t\", \"owner=$PID@$t\", 'end') -Encoding ascii\n"
                 f"$lease = @{{ Ready = '{ready}'; Holder = $null; Owner = $null; Gone = ''; Process = (Get-Process -Id $PID) }}\n"
                 "Write-Output \"control=$(Get-HeavySlotHolderState $lease)\"\n"])
     assert "state=gone gone=slot-owner-exited" in done.stdout, done.stdout + done.stderr
@@ -1353,6 +1354,143 @@ def test_a_holder_whose_owner_died_ends_even_when_the_stop_file_cannot_be_writte
     )
     assert "HEAVY_SLOT_LOST_DURING_ACTION label=build " in done.stdout, done.stdout + done.stderr
     assert "holder-ended=True" in done.stdout, "a holder that outlived its slot owner kept running while the host lived"
+
+
+def test_a_partly_written_ready_file_never_skips_the_owner_check(box) -> None:
+    # r4 sol B1: the guard reads the ready file after its ticket and holder lines and before its owner line. That read must
+    # not be kept: the complete record names a slot owner that is not running, so nothing is admitted or built.
+    done = _heavy(box, "readypartial", ["-Command", _marker_command(box)],
+                  extra={"STUB_HEAVY_SLOT_CHILD_S": "2", "STUB_HEAVY_SLOT_HOLD_S": "1"})
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build " in done.stdout, done.stdout + done.stderr
+    assert "reason=slot-owner-exited-after-ready" in done.stdout, done.stdout
+    assert "heavy-slot: admitted" not in done.stderr
+    assert not box["marker"].exists() and not box["lock"].exists(), "nothing is built before the owner line is read"
+
+
+def test_a_complete_ready_file_that_does_not_parse_is_could_not_check(box) -> None:
+    # r4 sol B1: a ready file with its 'end' line whose holder line does not parse is a typed COULD-NOT-CHECK, never an
+    # admission and never a wait that ends as a REQUEUE.
+    done = _heavy(box, "readypartial", ["-Command", _marker_command(box)],
+                  extra={"STUB_HEAVY_SLOT_CHILD_S": "0", "STUB_HEAVY_SLOT_FINAL": "malformed", "STUB_HEAVY_SLOT_HOLD_S": "1"})
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=1 reason=ready file unreadable" in done.stdout, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout and "heavy-slot: admitted" not in done.stderr
+    assert not box["marker"].exists() and not box["lock"].exists()
+
+
+def test_the_holder_binds_the_slot_owner_to_its_exported_start_time(box) -> None:
+    # r4 sol B2: the holder names the owner only when the process under the HEAVY_SLOT_HELD pid started at the exported
+    # HEAVY_SLOT_HELD_START. Another start time (the pid was reused) or no readable value is written as @-1, which no
+    # process matches. The owner here is this pwsh; the stop file exists, so each holder writes its ready file and ends.
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n"
+                f"$stop = '{box['dir'] / 'x.stop'}'; Set-Content -LiteralPath $stop -Value stop\n"
+                "$me = (Get-Process -Id $PID).StartTime.ToUniversalTime()\n"
+                "$exe = (Get-Process -Id $PID).Path\n"
+                "foreach ($case in @(@('match', $me.ToString('o')), @('reused', '2025-10-26T18:26:40.0000000Z'), @('missing', ''), @('garbage', 'not-a-time'))) {\n"
+                f"    $ready = '{box['dir']}' + '\\' + $case[0] + '.ready'\n"
+                "    $env:HEAVY_SLOT_HELD = \"t-1:$PID\"; $env:HEAVY_SLOT_HELD_START = $case[1]\n"
+                "    $null = & $exe -NoProfile -NonInteractive -EncodedCommand (New-HeavySlotHolder $ready $stop)\n"
+                "    $owner = [regex]::Match((Get-Content -LiteralPath $ready -Raw), '(?m)^owner=(.*)$').Groups[1].Value.Trim()\n"
+                "    Write-Output (\"{0}={1}\" -f $case[0], ($owner -replace \"^$PID@\", 'me@'))\n"
+                "}\n"
+                "Write-Output \"ticks=$($me.Ticks)\"\n"])
+    out = done.stdout
+    ticks = re.search(r"ticks=(\d+)", out)
+    assert ticks, out + done.stderr
+    assert f"match=me@{ticks.group(1)}" in out, out + done.stderr
+    for case in ("reused", "missing", "garbage"):
+        assert f"{case}=me@-1" in out, out + done.stderr
+
+
+def test_a_slot_owner_whose_start_time_is_not_the_exported_one_is_no_admission(box) -> None:
+    # r4 sol B2 end to end: heavy-slot exports a start time its pid no longer has; the build is never admitted.
+    done = _heavy(box, "run", ["-Command", _marker_command(box)],
+                  extra={"STUB_HEAVY_SLOT_HELD_START": "2025-10-26T18:26:40.0000000Z"})
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build " in done.stdout, done.stdout + done.stderr
+    assert re.search(r"reason=(slot-owner|holder)-exited-after-ready", done.stdout), done.stdout
+    assert "heavy-slot: admitted" not in done.stderr
+    assert not box["marker"].exists() and not box["lock"].exists()
+
+
+def test_a_slot_lost_while_the_admitted_line_is_written_is_a_requeue_before_the_action(box) -> None:
+    # r4 sol B3: the admitted line can block on an undrained stderr; the holder ends while it does (the log call is wrapped
+    # to end it). The slot is checked again after the line, so the action never starts and the loss is not "during".
+    done = _library_driver(
+        box,
+        "$script:origLog = ${function:Write-BuildGuardLog}\n"
+        "function Write-BuildGuardLog([string]$Message) {\n"
+        "    if ($Message -like 'admitted label=*' -and $heavy -and $heavy.Holder) {\n"
+        "        Stop-Process -Id $heavy.Holder.Pid -Force; Wait-Process -Id $heavy.Holder.Pid -Timeout 20 -ErrorAction Ignore }\n"
+        "    & $script:origLog $Message }\n"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build " in done.stdout and "reason=holder-exited-before-action" in done.stdout, done.stdout + done.stderr
+    assert "HEAVY_SLOT_LOST_DURING_ACTION" not in done.stdout + done.stderr
+    assert not box["marker"].exists() and not box["lock"].exists(), "nothing is built without a live heavy slot"
+
+
+# r4 sol B4/B5 seams: Get-Process is shadowed so the pid's process can change between calls (a reused pid) or lose its start
+# time after the lookup (it ended). Stop-Process is shadowed too, so nothing real is ever stopped.
+_PROCESS_SEAM = (
+    "$script:calls = [System.Collections.Generic.List[string]]::new()\n"
+    "function New-FakeProcess([long]$Ticks, [string]$Name, [switch]$Throws) {\n"
+    "    $p = [pscustomobject]@{ Id = 8420; HasExited = $false; Handle = [IntPtr]1; Name = $Name }\n"
+    "    if ($Throws) { $p | Add-Member -MemberType ScriptProperty -Name StartTime -Value { throw 'the process has exited' } }\n"
+    "    else { $p | Add-Member -MemberType ScriptProperty -Name StartTime -Value ([scriptblock]::Create(\"[DateTime]::new($Ticks, 'Utc')\")) }\n"
+    "    $p | Add-Member -MemberType ScriptMethod -Name Kill -Value { $script:calls.Add('KILL ' + $this.Name) }\n"
+    "    return $p }\n"
+    "function Stop-Process { param([int]$Id, [switch]$Force, $ErrorAction) $script:calls.Add(\"STOP-PID $Id\") }\n"
+    "$script:seq = @()\n"
+    "function Get-Process { param([int]$Id, $ErrorAction) $next = $script:seq[0]; if ($script:seq.Count -gt 1) { $script:seq = @($script:seq | Select-Object -Skip 1) }; $next }\n"
+)
+
+
+def test_a_holder_stop_never_reaches_a_process_that_took_its_pid(box) -> None:
+    # r4 sol B4: the stop file cannot be written and the wrapper has ended, so the holder is stopped directly. Only the
+    # process whose identity was checked may be stopped (through that same handle), never a pid resolved again later.
+    lease = ("$lease = @{{ Label = 'mlv:t:build'; Stop = '{stop}'; Process = [pscustomobject]@{{ Id = 1; HasExited = $true }}; "
+             "Holder = @{{ Pid = 8420; Ticks = 638971000020000000 }} }}\n").format(stop=box["dir"] / "no-such-dir" / "x.stop")
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n" + _PROCESS_SEAM + lease
+                + "$orig = New-FakeProcess 638971000020000000 'original'; $repl = New-FakeProcess 638971000030000000 'replacement'\n"
+                # Reused after the identity check: the first lookup is the holder, every later one the replacement.
+                "$script:seq = @($orig, $repl); Send-HeavySlotStop $lease\n"
+                "Write-Output \"after=[$($script:calls -join ',')]\"; $script:calls.Clear()\n"
+                # Reused before the check: no lookup ever returns the holder.
+                "$script:seq = @($repl); Send-HeavySlotStop $lease\n"
+                "Write-Output \"before=[$($script:calls -join ',')]\"\n"])
+    assert "after=[KILL original]" in done.stdout, done.stdout + done.stderr
+    assert "before=[]" in done.stdout, done.stdout + done.stderr
+    assert "reason=identity-unverified" in done.stderr, done.stderr
+
+
+def test_a_start_time_that_cannot_be_read_after_the_lookup_is_gone_never_alive(box) -> None:
+    # r4 sol B5: the holder is found, then ends before its start time is read, so the read throws. That is no proof of
+    # life: the identity check is false and the holder state is gone, never alive.
+    ready = box["dir"] / "x.ready"
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n" + _PROCESS_SEAM
+                + f"Set-Content -LiteralPath '{ready}' -Value @('stub-1:8420', 'holder=8420@638971000020000000', 'owner=none', 'end') -Encoding ascii\n"
+                "$script:seq = @((New-FakeProcess 0 'ended' -Throws))\n"
+                "Write-Output \"identity=$(Test-HeavySlotIdentity @{ Pid = 8420; Ticks = 638971000020000000 })\"\n"
+                f"$lease = @{{ Ready = '{ready}'; Holder = $null; Owner = $null; Gone = ''; Process = [pscustomobject]@{{ HasExited = $false }} }}\n"
+                "Write-Output \"state=$(Get-HeavySlotHolderState $lease) gone=$($lease.Gone)\"\n"])
+    assert "identity=False" in done.stdout, done.stdout + done.stderr
+    assert "state=gone gone=holder-exited" in done.stdout, done.stdout + done.stderr
+
+
+def test_explicit_empty_inputs_reach_the_guard_as_given(box) -> None:
+    # sol hardening (r3b review): _heavy(memory=[]) and sha='' are test inputs, not requests for the defaults.
+    done = _heavy(box, "run", ["-Command", _marker_command(box)], sha="", memory=[])
+    assert json.loads((box["dir"] / "memory.json").read_text(encoding="ascii")) == []
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert f"BUILD_HEAVY_SLOT_REFUSED label=build reason=pin-mismatch expected= actual={_stub_sha()}" in done.stdout
+    assert _stub_calls(box) == [] and not box["marker"].exists()
 
 
 @pytest.mark.parametrize("value", ["15372286720L", "'NaN'", "'sixty'"])

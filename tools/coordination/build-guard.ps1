@@ -44,7 +44,11 @@
 #     BUILD_HEAVY_SLOT_REQUEUE reason=holder-exited-after-ready code=<heavy-slot exit code>, exit 3, and the
 #     build never runs without the slot on this path. A heavy-slot log that exists but cannot be read at
 #     admission gives the slot back and prints BUILD_HEAVY_SLOT_COULD_NOT_CHECK code=1 (its lines are unchecked).
-#     The hung-tool bound (wait + 15 min) is numeric and measured on a monotonic clock.
+#     The ready file counts only once its closing 'end' line is on disk; a complete one whose holder or owner line
+#     does not parse prints BUILD_HEAVY_SLOT_COULD_NOT_CHECK code=1. The slot owner counts only when its start time is
+#     the HEAVY_SLOT_HELD_START heavy-slot exported, and the slot is checked once more after the admitted line, right
+#     before the action. A start time that cannot be read means gone; a holder is only ever stopped through the handle
+#     its identity was checked on. The hung-tool bound (wait + 15 min) is numeric and measured on a monotonic clock.
 #   - The shim missing (not at MLV_HEAVY_SLOT_CMD / on PATH / at the install path) or not startable (it cannot
 #     be started, or cmd exits 9009 before admission because the shim's own interpreter is not found), or a
 #     shim, lock dir or pwsh path holding '%' (cmd would expand it), FAILS OPEN: one "HEAVY_SLOT_WARN" line
@@ -337,15 +341,24 @@ function New-HeavySlotHolder([string]$ReadyFile, [string]$StopFile) {
     # It also names heavy-slot's own process (the slot mutex owner, HEAVY_SLOT_HELD = <ticket>:<pid>) by pid + start ticks,
     # read here while that owner is waiting on this child, so a reused pid can never pass for it later; and it ends itself
     # when that owner ends, so a holder never outlives the slot it stands for (r3b adversary A1/A2).
+    # The owner counts only when the process under that pid started at HEAVY_SLOT_HELD_START, the start time heavy-slot
+    # exports beside it; a missing or unreadable value, or another start time (a reused pid), is written as @-1, which no
+    # process matches (r4 sol B2). Any error ends the holder (exit 1), so an unreadable identity is never one still held
+    # (r4 sol B5). The ready file ends with an 'end' line, so a partly written one is never read as complete (r4 sol B1).
     $text = @(
+        "`$ErrorActionPreference = 'Stop'; trap { exit 1 }"
         "`$me = Get-Process -Id `$PID"
-        "`$owner = `$null; `$ownerTicks = -1L; `$ownerLine = 'owner=none'"
+        "`$ownerTicks = -1L; `$ownerLine = 'owner=none'"
         "if ([string]`$env:HEAVY_SLOT_HELD -match ':(\d+)`$') {"
-        "    `$ownerPid = [int]`$Matches[1]; `$owner = Get-Process -Id `$ownerPid -ErrorAction SilentlyContinue"
-        "    if (`$owner) { `$ownerTicks = `$owner.StartTime.ToUniversalTime().Ticks }"
+        "    `$ownerPid = [int]`$Matches[1]"
+        "    try {"
+        "        `$want = [DateTime]::Parse([string]`$env:HEAVY_SLOT_HELD_START, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime().Ticks"
+        "        `$owner = Get-Process -Id `$ownerPid -ErrorAction SilentlyContinue"
+        "        if (`$owner -and `$owner.StartTime.ToUniversalTime().Ticks -eq `$want) { `$ownerTicks = `$want }"
+        "    } catch { `$ownerTicks = -1L }"
         "    `$ownerLine = 'owner={0}@{1}' -f `$ownerPid, `$ownerTicks"
         "}"
-        "Set-Content -LiteralPath $(& $quote $ReadyFile) -Value @([string]`$env:HEAVY_SLOT_HELD, ('holder={0}@{1}' -f `$PID, `$me.StartTime.ToUniversalTime().Ticks), `$ownerLine) -Encoding ascii"
+        "Set-Content -LiteralPath $(& $quote $ReadyFile) -Value @([string]`$env:HEAVY_SLOT_HELD, ('holder={0}@{1}' -f `$PID, `$me.StartTime.ToUniversalTime().Ticks), `$ownerLine, 'end') -Encoding ascii"
         "while (-not (Test-Path -LiteralPath $(& $quote $StopFile))) {"
         "    `$p = Get-Process -Id $PID -ErrorAction SilentlyContinue"
         "    if (-not `$p -or `$p.StartTime.ToUniversalTime().Ticks -ne $startTicks) { exit 1 }"
@@ -397,10 +410,9 @@ function Remove-HeavySlotLeaseFiles($Lease) {
     # After the stop file is written: a holder that outlived heavy-slot (its slot owner gone) polls for the stop file every
     # 500 ms, so it is given 10 s to see it and end. The stop file is deleted only once neither heavy-slot nor that holder
     # runs; otherwise it stays, so the holder still sees it (r3b adversary A2). The other lease files go either way.
-    if ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder)) {
-        $h = Get-Process -Id $Lease.Holder.Pid -ErrorAction SilentlyContinue
-        if ($h) { [void]$h.WaitForExit(10000) }
-    }
+    # The wait is on the verified holder's own handle, never on whatever process holds its pid later (r4 sol B4).
+    $h = if ($Lease.Holder) { Get-HeavySlotProcess $Lease.Holder }
+    if ($h) { try { [void]$h.WaitForExit(10000) } finally { $h.Dispose() } }
     if (-not $Lease.Process.HasExited -or ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder))) {
         foreach ($f in @($Lease.Ready, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
         return
@@ -408,28 +420,48 @@ function Remove-HeavySlotLeaseFiles($Lease) {
     Remove-HeavySlotFiles $Lease
 }
 
+function Get-HeavySlotProcess($Identity) {
+    # The running process named by pid + start ticks, returned with its handle open (the caller disposes it), so that pid
+    # cannot pass to another process while it is used; else $null. A property that cannot be read after the lookup (the
+    # process ended in between) is $null, never a process still running (r4 sol B5).
+    $p = Get-Process -Id $Identity.Pid -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p) { return $null }
+    try {
+        if ($null -ne $p.Handle -and -not $p.HasExited -and $p.StartTime.ToUniversalTime().Ticks -eq [long]$Identity.Ticks) { return $p }
+    } catch { }
+    if ($p -is [IDisposable]) { $p.Dispose() }
+    return $null
+}
+
 function Test-HeavySlotIdentity($Identity) {
-    # True while the process named by pid + start ticks still runs ($null ticks: the start time was not readable).
-    $p = Get-Process -Id $Identity.Pid -ErrorAction SilentlyContinue
+    # True only while the process named by pid + start ticks provably still runs.
+    $p = Get-HeavySlotProcess $Identity
     if (-not $p) { return $false }
-    if ($null -eq $Identity.Ticks) { return $true }
-    try { return ($p.StartTime.ToUniversalTime().Ticks -eq $Identity.Ticks) } catch { return $true }
+    if ($p -is [IDisposable]) { $p.Dispose() }
+    return $true
 }
 
 function Get-HeavySlotHolderState($Lease) {
-    # 'alive' or 'gone' for the machine slot behind the ready file; '' while its holder line is not readable yet. 'alive'
-    # needs all three: the holder named in the ready file (pid + start ticks), the heavy-slot process that owns the slot
-    # mutex (the pid on the ready file's first line, HEAVY_SLOT_HELD = <ticket>:<pid>), and heavy-slot's cmd wrapper (r2
-    # adversary A2: a holder whose mutex owner has died holds nothing). $Lease.Gone names the first one found gone.
-    # The first identity read is kept, so a ready file that later vanishes cannot hide a holder that has ended.
+    # 'alive' or 'gone' for the machine slot behind the ready file; '' while the ready file is not complete yet (no 'end'
+    # line); 'unreadable' for a complete one whose holder or owner line does not parse. 'alive' needs all three: the holder
+    # named in the ready file (pid + start ticks), the heavy-slot process that owns the slot mutex (the pid on the ready
+    # file's first line, HEAVY_SLOT_HELD = <ticket>:<pid>), and heavy-slot's cmd wrapper (r2 adversary A2: a holder whose
+    # mutex owner has died holds nothing). $Lease.Gone names the first one found gone.
+    # The first complete read is kept, so a ready file that later vanishes cannot hide a holder that has ended. A partial
+    # read is never kept: its owner line may not be on disk yet, and owner validation must never be skipped (r4 sol B1).
     if (-not $Lease.Holder) {
-        $text = Get-Content -LiteralPath $Lease.Ready -Raw -ErrorAction SilentlyContinue
-        if (-not ($text -match '(?m)^holder=(\d+)@(\d+)\s*$')) { return '' }
-        $Lease.Holder = @{ Pid = [int]$Matches[1]; Ticks = [long]$Matches[2] }
-        # The owner's identity is the one the holder read while the owner was waiting on it (owner=<pid>@<ticks>; -1 when it
-        # was already gone), never a pid looked up now, which may have been reused (r3b adversary A1). 'owner=none' (heavy-slot
-        # ran the holder without its slot) or no owner line at all leaves only the holder to check.
-        if ($text -match '(?m)^owner=(\d+)@(-?\d+)\s*$') { $Lease.Owner = @{ Pid = [int]$Matches[1]; Ticks = [long]$Matches[2] } }
+        $text = [string](Get-Content -LiteralPath $Lease.Ready -Raw -ErrorAction SilentlyContinue)
+        if (-not ($text -match '(?m)^end\s*$')) { return '' }
+        if (-not ($text -match '(?m)^holder=(\d+)@(\d+)\s*$')) { return 'unreadable' }
+        $holder = @{ Pid = [int]$Matches[1]; Ticks = [long]$Matches[2] }
+        # The owner's identity is the one the holder verified against HEAVY_SLOT_HELD_START (owner=<pid>@<ticks>; -1 when it
+        # was gone or not verifiable), never a pid looked up now, which may have been reused (r3b adversary A1, r4 sol B2).
+        # 'owner=none' (heavy-slot ran the holder without its slot) leaves only the holder to check; no owner line is unreadable.
+        $owner = $null
+        if ($text -match '(?m)^owner=(\d+)@(-?\d+)\s*$') { $owner = @{ Pid = [int]$Matches[1]; Ticks = [long]$Matches[2] } }
+        elseif (-not ($text -match '(?m)^owner=none\s*$')) { return 'unreadable' }
+        $Lease.Holder = $holder
+        $Lease.Owner = $owner
     }
     if (-not (Test-HeavySlotIdentity $Lease.Holder)) { $Lease.Gone = 'holder-exited'; return 'gone' }
     if ($Lease.Owner -and -not (Test-HeavySlotIdentity $Lease.Owner)) { $Lease.Gone = 'slot-owner-exited'; return 'gone' }
@@ -443,8 +475,17 @@ function Send-HeavySlotStop($Lease) {
     try { Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -ErrorAction Stop; return } catch { $why = $_.Exception.Message }
     Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} stop file not written ({1}); ending heavy-slot pid {2} and its children' -f $Lease.Label, $why, $Lease.Process.Id)
     if (-not $Lease.Process.HasExited) { $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $Lease.Process.Id /T /F 2>&1 }
-    # A holder that outlived heavy-slot is no longer in that tree: it is ended by its own identity (r3b adversary A2).
-    if ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder)) { Stop-Process -Id $Lease.Holder.Pid -Force -ErrorAction SilentlyContinue }
+    # (The wrapper's pid cannot be reused here: $Lease.Process has held its handle since Process.Start.)
+    # A holder that outlived heavy-slot is no longer in that tree: it is ended by its own identity (r3b adversary A2), and only
+    # through the handle that identity was verified on, so a process that took its pid later is never stopped (r4 sol B4).
+    if (-not $Lease.Holder) { return }
+    $h = Get-HeavySlotProcess $Lease.Holder
+    if ($h) {
+        try { $h.Kill() } catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} holder {1}@{2} not stopped ({3})' -f $Lease.Label, $Lease.Holder.Pid, $Lease.Holder.Ticks, $_.Exception.Message) }
+        finally { if ($h -is [IDisposable]) { $h.Dispose() } }
+    } elseif (Get-Process -Id $Lease.Holder.Pid -ErrorAction SilentlyContinue) {
+        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} holder {1}@{2} not stopped: reason=identity-unverified (the process under that pid is not the verified holder)' -f $Lease.Label, $Lease.Holder.Pid, $Lease.Holder.Ticks)
+    }
 }
 
 function Get-HeavySlotExitCode($Lease) {
@@ -465,6 +506,17 @@ function Exit-HeavySlotHolderGone($Lease, [string]$When = 'after-ready') {
     $gone = if ($Lease.Gone) { $Lease.Gone } else { 'holder-exited' }
     Write-Output ('BUILD_HEAVY_SLOT_REQUEUE label={0} code={1} ticket={2} reason={3}-{4} utc={5}' -f $Lease.BuildLabel, $code, $Lease.Ticket, $gone, $When, [DateTime]::UtcNow.ToString('o'))
     exit 3
+}
+
+function Exit-HeavySlotUnreadable($Lease, [string]$Label) {
+    # A complete ready file whose holder or owner line does not parse cannot be checked, so it is never an admission
+    # (r4 sol B1): the stop file goes, heavy-slot is given up to 60 s to end, and nothing is built.
+    Send-HeavySlotStop $Lease
+    $code = Get-HeavySlotExitCode $Lease
+    Send-HeavySlotLines $Lease
+    Remove-HeavySlotLeaseFiles $Lease
+    Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code=1 reason=ready file unreadable (heavy-slot exit {1}) utc={2}' -f $Label, $code, [DateTime]::UtcNow.ToString('o'))
+    exit 1
 }
 
 function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
@@ -537,6 +589,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             if (Test-Path -LiteralPath $lease.Ready) {
                 $holder = Get-HeavySlotHolderState $lease
                 if ($holder -eq 'alive') { break }
+                if ($holder -eq 'unreadable') { Exit-HeavySlotUnreadable $lease $Label }
                 if ($holder -eq 'gone' -or $lease.Process.HasExited) { Exit-HeavySlotHolderGone $lease }
             }
             $why = ''
@@ -681,14 +734,20 @@ function Invoke-BuildGuard {
             # build slot or the process census is a REQUEUE with nothing built, not a build classified as unprotected
             # afterwards. The check is the last step before the action (r3b adversary A1: the census can take seconds).
             # Every caller (command mode, build-release, qscreen-probe, the attr-3 assembler) reaches its action through here.
-            if ($heavy -and (Get-HeavySlotHolderState $heavy) -ne 'alive') {
-                $lost = $heavy
-                $heavy = $null
-                Remove-BuildSlot $ticket
-                $ticket = $null
-                Exit-HeavySlotHolderGone $lost 'before-action'
+            # The admitted line is written between two checks: a write to a stderr nobody drains can block for as long as it
+            # likes, so the slot is checked again after it, with nothing left between that check and the action (r4 sol B3).
+            for ($check = 1; $check -le 2; $check++) {
+                if ($heavy -and (Get-HeavySlotHolderState $heavy) -ne 'alive') {
+                    $lost = $heavy
+                    $heavy = $null
+                    Remove-BuildSlot $ticket
+                    $ticket = $null
+                    Exit-HeavySlotHolderGone $lost 'before-action'
+                }
+                if ($check -eq 1) {
+                    Write-BuildGuardLog ('admitted label={0} jobs={1} reason={2} peers=[{3}] freePhysGB={4} freeCommitGB={5} slot={6}' -f $Label, $jobs, $choice.Reason, ($choice.Peers -join ','), $mem.PhysGB, $mem.CommitGB, $(if ($ticket) { 'held' } else { 'none' }))
+                }
             }
-            Write-BuildGuardLog ('admitted label={0} jobs={1} reason={2} peers=[{3}] freePhysGB={4} freeCommitGB={5} slot={6}' -f $Label, $jobs, $choice.Reason, ($choice.Peers -join ','), $mem.PhysGB, $mem.CommitGB, $(if ($ticket) { 'held' } else { 'none' }))
             & $Action $jobs
         } finally {
             Remove-BuildSlot $ticket
