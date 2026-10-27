@@ -9691,11 +9691,18 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             playback_frame_range::smokePlayRequestSeconds(
                 options.durationMs, options.targetPresentedFrames, presentedTargetFps ) * 1000.0 );
         m_contactSheetCaptureTargetMs.clear();
+        m_contactSheetCaptureTargetSourceFrames.clear();
+        // VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2 (sol B1): unpaced, the Play stops at its required source frames,
+        // which a fast run reaches before the wall-clock centres; its targets are source-frame centres instead.
+        m_contactSheetCaptureUnpaced = m_automationPacingIsolated && mlvappPlaybackUnpacedRequested();
         for( int i = 0; i < options.contactSheetFrames; ++i )
         {
             m_contactSheetCaptureTargetMs.append( static_cast<qint64>(
                 playback_frame_range::contactSheetInPassTargetMs(
                     i, options.contactSheetFrames, contactSheetWindowMs ) ) );
+            m_contactSheetCaptureTargetSourceFrames.append( static_cast<qint64>(
+                playback_frame_range::contactSheetInPassTargetSourceFrames(
+                    i, options.contactSheetFrames, m_playRequiredSourceFrames ) ) );
         }
         m_contactSheetPendingGrabs.clear();
         m_contactSheetCaptureNextTargetIndex = 0;
@@ -28134,8 +28141,14 @@ void MainWindow::noteContactSheetPresentedFrame(
     // CONTACT-SHEET-PLAYBACK-PARITY-1: armed on the MEASURED Play. Targets are ascending times since
     // that Play started, so the first frame presented at or after the next target is its grab --
     // whatever fps the leg reaches, every target falls inside the play window.
+    // Unpaced, the targets are source frames consumed instead (contactSheetInPassTargetDue).
     const qint64 grabElapsedMs = m_contactSheetCaptureClock.elapsed();
-    if( grabElapsedMs < m_contactSheetCaptureTargetMs.at( m_contactSheetCaptureNextTargetIndex ) ) return;
+    const qint64 grabConsumedSourceFrames = static_cast<qint64>( m_sourceAdvance.consumed() );
+    if( !playback_frame_range::contactSheetInPassTargetDue(
+            m_contactSheetCaptureUnpaced, grabElapsedMs,
+            m_contactSheetCaptureTargetMs.at( m_contactSheetCaptureNextTargetIndex ),
+            grabConsumedSourceFrames,
+            m_contactSheetCaptureTargetSourceFrames.value( m_contactSheetCaptureNextTargetIndex ) ) ) return;
 
     const int i = m_contactSheetCaptureNextTargetIndex;
     // The readback below runs on the GUI thread inside the measured interval: it is timed and
@@ -28235,6 +28248,12 @@ void MainWindow::noteContactSheetPresentedFrame(
     frameJson.insert( QStringLiteral("elapsed_ms"), static_cast<double>( grabElapsedMs ) );
     frameJson.insert( QStringLiteral("target_ms"),
         static_cast<double>( m_contactSheetCaptureTargetMs.at( i ) ) );
+    // Which target made this grab due: the wall clock (paced) or the source frames consumed (unpaced).
+    frameJson.insert( QStringLiteral("target_basis"),
+        m_contactSheetCaptureUnpaced ? QStringLiteral("source_frames") : QStringLiteral("wall_clock") );
+    frameJson.insert( QStringLiteral("target_source_frames"),
+        static_cast<double>( m_contactSheetCaptureTargetSourceFrames.value( i ) ) );
+    frameJson.insert( QStringLiteral("consumed_source_frames"), static_cast<double>( grabConsumedSourceFrames ) );
     frameJson.insert( QStringLiteral("texture_source"), contactFrameSource );
     frameJson.insert( QStringLiteral("render_path"), contactFrameRenderPath );
     frameJson.insert( QStringLiteral("playback_path"), true );
