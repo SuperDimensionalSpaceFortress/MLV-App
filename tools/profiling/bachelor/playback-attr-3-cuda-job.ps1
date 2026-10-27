@@ -4555,6 +4555,7 @@ function Test-CorePartitionHelperRecordShape($Record) {
         if ($null -ne $Record.app) { foreach ($n in @('pid', 'startUtcTicks', 'affinityFirst', 'affinityLast')) { $num.Add(@($Record.app.$n, 'int64')) } }
         foreach ($i in @(@($Record.instances) + @($Record.others) | Where-Object { $null -ne $_ })) { foreach ($n in @('pid', 'startUtcTicks', 'goneUtcTicks')) { $num.Add(@($i.$n, 'int64')) } }
         if ($null -ne $Record.load) { $num.Add(@($Record.load.seconds, 'double')); $num.Add(@($Record.load.bytes, 'double')) }
+        $num.Add(@($Record.clockSkewMaxMs, 'double'))
         foreach ($smp in @($Record.samples | Where-Object { $null -ne $_ })) {
             if ($null -ne $smp.app -and $smp.app -isnot [bool]) { return 'helper-record-malformed' }
             foreach ($n in @('freq', 'perf', 'park')) { foreach ($v in @($smp.$n)) { $num.Add(@($v, 'double')) } }
@@ -4573,6 +4574,33 @@ function Test-CorePartitionHelperMac([byte[]]$Bytes, [string]$Mac, [string]$Key)
         try { $want = [BitConverter]::ToString($hm.ComputeHash($Bytes)).Replace('-', '') } finally { $hm.Dispose() }
         [string]::Equals($want, $Mac.Trim(), [StringComparison]::OrdinalIgnoreCase)
     } catch { $false }
+}
+
+# PURE. r8 A4: the text of the helper's ready marker, the hex HMAC-SHA256 of "ready:<helper pid>" under the per-job key (the helper writes the same
+# from MLV_CP_NONCE and its own $PID), so the marker names this job and this helper without the key ever being written.
+function Get-CorePartitionReadyToken([string]$Key, $HelperPid) {
+    $u8 = [Text.Encoding]::UTF8
+    $hm = [Security.Cryptography.HMACSHA256]::new($u8.GetBytes($Key))
+    try { [Convert]::ToHexString($hm.ComputeHash($u8.GetBytes("ready:$HelperPid"))) } finally { $hm.Dispose() }
+}
+
+# PURE. r8 A1: the largest gap, in ms, between wall-clock and monotonic elapsed time over $Pairs (each @(wall UTC ticks, monotonic ms), read together),
+# measured from the first pair. $null (unverified) with fewer than two pairs or any reading that does not parse. Never throws.
+function Get-CorePartitionClockSkewMs($Pairs) {
+    try {
+        $p = @($Pairs)
+        if ($p.Count -lt 2) { return $null }
+        $max = 0.0; $w0 = $null; $m0 = $null
+        foreach ($x in $p) {
+            if ($null -eq $x -or @($x).Count -ne 2) { return $null }
+            $w = (ConvertFrom-CorePartitionNumber $x[0] 'int64').value; $m = (ConvertFrom-CorePartitionNumber $x[1] 'double').value
+            if ($null -eq $w -or $null -eq $m) { return $null }
+            if ($null -eq $w0) { $w0 = $w; $m0 = $m; continue }
+            $gap = [math]::Abs(($w - $w0) / 1e4 - ($m - $m0))
+            if ($gap -gt $max) { $max = $gap }
+        }
+        $max
+    } catch { $null }
 }
 
 # PURE. sol r6 CP-06 / CP-07: the parsed record at the helper's output name is the helper's own and usable only when (1) the launch pid is a positive
@@ -4603,12 +4631,21 @@ function Test-CorePartitionHelperRecord($Record, $LaunchPid, $ExitCode, [bool]$M
 # on the record and is not refused here (LIMIT A3, CORE-PARTITION-PROCESS-START-EVENTS-1). Overlap is judged on exact process start times (adversary
 # r5 A2: never on first-observed times): another process is alive from its start until the helper saw it gone (still alive at the end: forever),
 # the measured app from its start until the runner saw it exit. @{ why } is $null, else a typed reason.
-function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks) {
+# r8 A1 (adversary r7 6fac125a A1): those times are wall-clock, so a wall-clock step inside the window can move a gone time before the measured start
+# and hide a real overlap. The verdict is trusted only when the wall-clock and monotonic elapsed times agree within the CLOCK TOLERANCE, 1000 ms, for
+# both the helper's polls (its record's clockSkewMaxMs) and the job's own reads ($ClockSkewMs, Get-CorePartitionClockSkewMs); over it the verdict is
+# clock-discontinuity, and a gap nobody recorded is clock-unverified. Process start times are the OS's wall-clock stamps (a step before the helper
+# started is not seen here: LIMIT, CORE-PARTITION-PROCESS-START-EVENTS-1).
+function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0) {
     if ($MeasuredPid -le 0) { return @{ why = 'measured-pid-unknown' } }
     if ($MeasuredStartTicks -le 0 -or $MeasuredEndTicks -lt $MeasuredStartTicks) { return @{ why = 'measured-window-unknown' } }
     # sol r6 CP-07: every record number below went through the one guarded parse first
     $shapeWhy = Test-CorePartitionHelperRecordShape $Helper
     if ($shapeWhy) { return @{ why = $shapeWhy } }
+    foreach ($gap in @((ConvertFrom-CorePartitionNumber $Helper.clockSkewMaxMs 'double').value, (ConvertFrom-CorePartitionNumber $ClockSkewMs 'double').value)) {
+        if ($null -eq $gap) { return @{ why = 'clock-unverified' } }
+        if ([math]::Abs($gap) -gt 1000) { return @{ why = 'clock-discontinuity' } }
+    }
     $all = @(@($Helper.instances) + @($Helper.others) | Where-Object { $null -ne $_ } | ForEach-Object {
         [pscustomobject]@{ pid = (ConvertFrom-CorePartitionNumber $_.pid 'int64').value; start = (ConvertFrom-CorePartitionNumber $_.startUtcTicks 'int64').value; gone = (ConvertFrom-CorePartitionNumber $_.goneUtcTicks 'int64').value } })
     # adversary r5 (40038f92) A3: a process with that pid already seen gone before the runner's launch is a predecessor, never the launched one.
@@ -4631,13 +4668,14 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
 # $HelperNotReady (sol r3 CP-01) is the not-ready guard; it is a flag, so no change to the reason text can re-open the criteria.
 # $MeasuredPid, $MeasuredStartTicks, $MeasuredEndTicks (sol r4 CP-02): the app evidence is used only when Test-CorePartitionMeasuredApp binds it to them.
 # $PublishWhy (sol r4 CP-05): set when core-partition.json was not published; every acceptance flag is then false with that reason.
-function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$LoadMask, [int]$LoadThreads, $Workers, [string]$HelperWhy, [bool]$HelperNotReady, [int64]$MeasuredPid, [string]$PublishWhy, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks) {
+# $ClockSkewMs (r8 A1): the job's own wall/monotonic gap across the measured window, for Test-CorePartitionMeasuredApp.
+function Get-CorePartitionScalars($Helper, $Feed, [int64]$BenchMask, [int64]$LoadMask, [int]$LoadThreads, $Workers, [string]$HelperWhy, [bool]$HelperNotReady, [int64]$MeasuredPid, [string]$PublishWhy, [int64]$MeasuredStartTicks, [int64]$MeasuredEndTicks, $ClockSkewMs = 0) {
     $why = [ordered]@{}
     $h = $Helper
     # sol r6 CP-07: a record with a number that does not parse is no record (its reason is appended to the helper's), so nothing below can throw on it.
     $shapeWhy = Test-CorePartitionHelperRecordShape $h
     if ($shapeWhy) { $h = $null; $HelperWhy = Join-CorePartitionWhy $HelperWhy $shapeWhy }
-    $appWhy = if ($null -ne $h) { (Test-CorePartitionMeasuredApp $h $MeasuredPid $MeasuredStartTicks $MeasuredEndTicks).why } else { $null }
+    $appWhy = if ($null -ne $h) { (Test-CorePartitionMeasuredApp $h $MeasuredPid $MeasuredStartTicks $MeasuredEndTicks $ClockSkewMs).why } else { $null }
     $topoOk = $false; $pMask = [int64]0; $eMask = [int64]0
     if ($null -eq $h) { $why['corePartitionTopologyOk'] = $(if ($HelperWhy) { $HelperWhy } else { 'helper-record-missing' }) }
     elseif ($null -eq $h.topologyCheck) { $why['corePartitionTopologyOk'] = 'topology-check-missing' }
@@ -4775,6 +4813,26 @@ function Read-CorePartitionFeedSince([string]$Path, [int64]$Offset, [string]$Exp
     catch { @{ exists = $false; length = 0; monoMs = $null; before = ''; window = ''; windowStartsMidRow = $false; error = [string]$_.Exception.Message } }
 }
 
+# I/O. r8 A1: the monotonic clock in ms (Stopwatch), read beside each of the job's wall-clock samples across the measured window.
+function Get-CorePartitionMonoMs { [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000 }
+
+# I/O, bounded (256 bytes). r8 A4 (adversary r7 6fac125a A4: Test-Path accepted a directory): $null when the ready marker at $Path is a regular file
+# whose text (surrounding whitespace ignored) is $Token (Get-CorePartitionReadyToken: this job's key, this helper's pid); else a typed reason:
+# ready-marker-missing / -not-a-file (a directory) / -empty / -foreign (another key or pid, the pre-r8 'ready' text, over 256 bytes) / -unreadable
+# (the helper still holds it open while writing, or no access). Never throws.
+function Test-CorePartitionReadyMarker([string]$Path, [string]$Token) {
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return 'ready-marker-missing' }
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 'ready-marker-not-a-file' }
+        $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        try { $buf = New-Object byte[] 257; $got = $fs.Read($buf, 0, 257) } finally { $fs.Dispose() }
+        $text = [Text.Encoding]::UTF8.GetString($buf, 0, $got).Trim()
+        if ($text.Length -eq 0) { return 'ready-marker-empty' }
+        if ($got -gt 256 -or [string]::IsNullOrEmpty($Token) -or -not [string]::Equals($text, $Token, [StringComparison]::OrdinalIgnoreCase)) { return 'ready-marker-foreign' }
+        $null
+    } catch { 'ready-marker-unreadable' }
+}
+
 # The source text of generator functions, for splicing into the emitted job / helper (one definition, here).
 function Get-CorePartitionFunctionSource([string[]]$Name, [string]$Eol) {
     (@($Name | ForEach-Object { (Get-Item -LiteralPath "function:$_").ScriptBlock.Ast.Extent.Text }) -join "`n") -replace "\r?\n", $Eol
@@ -4796,7 +4854,12 @@ $exe = [string]$env:MLV_CP_EXE; $stop = [string]$env:MLV_CP_STOP; $outPath = [st
 $bench = [int64]$env:MLV_CP_BENCH; $loadMask = [int64]$env:MLV_CP_LOAD; $helperMask = [int64]$env:MLV_CP_HELPER; $threads = [int]$env:MLV_CP_THREADS
 $deadline = [int64]$env:MLV_CP_DEADLINE_TICKS
 $rec = [ordered]@{ schema = 'mlv-app/core-partition-helper/v1'; pid = $PID; startedUtc = [DateTime]::UtcNow.ToString('o'); topology = $null; topologyReason = $null; topologyCheck = $null
-    helperAffinityObserved = $null; helperPriorityObserved = $null; app = $null; instances = @(); load = [ordered]@{ threads = $threads; bytes = [int64]0; seconds = 0.0; sessions = 0 }; samples = @(); errors = @(); endedBy = $null; endedUtc = $null }
+    helperAffinityObserved = $null; helperPriorityObserved = $null; app = $null; instances = @(); load = [ordered]@{ threads = $threads; bytes = [int64]0; seconds = 0.0; sessions = 0 }; samples = @(); errors = @(); endedBy = $null; endedUtc = $null; clockSkewMaxMs = 0.0 }
+# r8: the ready marker and the record's MAC are HMACs under the job's key (A4); each wall-clock read in the poll loop keeps the largest gap between
+# wall-clock and monotonic elapsed time since this instant in clockSkewMaxMs (A1).
+$u8 = [Text.Encoding]::UTF8; $hk = [Security.Cryptography.HMACSHA256]::new($u8.GetBytes([string]$env:MLV_CP_NONCE))
+$c0 = [DateTime]::UtcNow.Ticks; $cw = [Diagnostics.Stopwatch]::StartNew()
+$clk = { $t = [DateTime]::UtcNow.Ticks; $g = [math]::Abs(($t - $c0) / 1e4 - $cw.Elapsed.TotalMilliseconds); if ($g -gt $rec.clockSkewMaxMs) { $rec.clockSkewMaxMs = $g }; $t }
 $errs = [Collections.Generic.List[string]]::new()
 $samples = [Collections.Generic.List[object]]::new()
 $instances = [Collections.Generic.List[object]]::new()
@@ -4831,7 +4894,7 @@ public static class MlvCorePartitionLoad {
     }
     $cat = [Diagnostics.PerformanceCounterCategory]::new('Processor Information')
     $prev = $cat.ReadCategory()
-    Write-CorePartitionNewFile $ready 'ready'
+    Write-CorePartitionNewFile $ready ([Convert]::ToHexString($hk.ComputeHash($u8.GetBytes("ready:$PID"))))
     $appName = [IO.Path]::GetFileNameWithoutExtension($exe)
     # sol r4 CP-02: every same-path process a 200 ms poll sees once the launch instant is known is tracked (key pid,start) until a poll sees it gone
     # (goneUtcTicks): started after the launch in instances, before it in others (adversary r5 A1), so a second process alive beside the measured app
@@ -4841,6 +4904,7 @@ public static class MlvCorePartitionLoad {
     $nextSample = [DateTime]::UtcNow.AddSeconds(1)
     $t0 = [DateTime]::UtcNow
     while ($true) {
+        [void](& $clk)
         if (Test-Path -LiteralPath $stop) { $rec.endedBy = 'stop-file'; break }
         if ([DateTime]::UtcNow.Ticks -ge $deadline) { $rec.endedBy = 'deadline'; break }
         foreach ($k in @($live.Keys)) {
@@ -4851,7 +4915,7 @@ public static class MlvCorePartitionLoad {
                 $q.r.lastSeenUtcTicks = [DateTime]::UtcNow.Ticks
             } else {
                 if ($k -eq $own) { if ($loadOn) { [MlvCorePartitionLoad]::End(); $q.r.loadSec += ([DateTime]::UtcNow.Ticks - $loadStartTicks) / 1e7; $q.r.loadBytes += [MlvCorePartitionLoad]::Bytes - $loadStartBytes; $loadOn = $false }; $own = $null }
-                $q.r.goneUtcTicks = [DateTime]::UtcNow.Ticks; $live.Remove($k)
+                $q.r.goneUtcTicks = & $clk; $live.Remove($k)
             }
         }
         if ($null -eq $launchUtc -and $launchFile -and (Test-Path -LiteralPath $launchFile)) {
@@ -4911,10 +4975,10 @@ finally {
     if (-not $rec.endedBy) { $rec.endedBy = 'error' }
     # sol r6 CP-06: the record, then its HMAC-SHA256 under the per-job key (MLV_CP_NONCE, which is never written anywhere) beside it. A refused
     # CreateNew throws out of this finally, so the helper exits non-zero; the job accepts the record only after an exit code of 0.
+    [void](& $clk)
     $j = $rec | ConvertTo-Json -Depth 8 -Compress
     Write-CorePartitionNewFile $outPath $j
-    $u8 = [Text.Encoding]::UTF8
-    Write-CorePartitionNewFile "$outPath.mac" ([Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new($u8.GetBytes([string]$env:MLV_CP_NONCE)).ComputeHash($u8.GetBytes($j))))
+    Write-CorePartitionNewFile "$outPath.mac" ([Convert]::ToHexString($hk.ComputeHash($u8.GetBytes($j))))
 }
 exit 0
 '@
@@ -5497,7 +5561,7 @@ if ($CorePartitionTelemetry) {
     # record HMAC took the helper past the earlier 30000).
     if ($cpHelperEncoded.Length -gt 32000) { throw "CORE_PARTITION_HELPER_TOO_LONG the encoded helper is $($cpHelperEncoded.Length) chars (limit 32000, one command line)" }
     $cpHelperAffinity = if ($corePartitionArgs.load -ne 0) { $corePartitionArgs.load } else { $corePartitionArgs.helper }
-    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'ConvertFrom-CorePartitionNumber', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Split-CorePartitionFeedLines', 'Test-CorePartitionFeedFresh', 'Test-CorePartitionFeedRowAfter', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Join-CorePartitionWhy', 'Get-CorePartitionReadyFeed', 'ConvertTo-CorePartitionUtcTicks', 'Test-CorePartitionHelperRecordShape', 'Test-CorePartitionHelperMac', 'Test-CorePartitionHelperRecord', 'Test-CorePartitionMeasuredApp', 'Get-CorePartitionScalars', 'Get-CorePartitionFeedHandleInfo', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince') "`n"
+    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'ConvertFrom-CorePartitionNumber', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Split-CorePartitionFeedLines', 'Test-CorePartitionFeedFresh', 'Test-CorePartitionFeedRowAfter', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Join-CorePartitionWhy', 'Get-CorePartitionReadyFeed', 'ConvertTo-CorePartitionUtcTicks', 'Test-CorePartitionHelperRecordShape', 'Test-CorePartitionHelperMac', 'Test-CorePartitionHelperRecord', 'Test-CorePartitionMeasuredApp', 'Get-CorePartitionScalars', 'Get-CorePartitionFeedHandleInfo', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince', 'Get-CorePartitionReadyToken', 'Get-CorePartitionClockSkewMs', 'Get-CorePartitionMonoMs', 'Test-CorePartitionReadyMarker') "`n"
     $cpLaunchOld = @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
@@ -5533,7 +5597,10 @@ $corePartitionHelperOut = Join-Path $Work 'core-partition-helper.json'
 $corePartitionFeedPath = $(if ($env:HEAVY_SLOT_FEED) { $env:HEAVY_SLOT_FEED } else { 'C:\temp\hwinfo-log-adapter.csv' })
 $corePartitionFeedPreHelper = Read-CorePartitionFeedMark $corePartitionFeedPath
 $corePartitionPreHelperUtc = (Get-Date).ToUniversalTime()
-$corePartitionHelperLaunch =[ordered]@{ pid = $null; affinityRequested = (Format-CorePartitionMask $CorePartitionHelperAffinity); affinityObserved = $null; priorityObserved = $null; ready = $false; readyWaitMs = $null }
+# r8 A1: a monotonic reading beside each of the job's wall-clock samples across the measured window (Get-CorePartitionClockSkewMs at the end)
+$corePartitionClockPairs = [Collections.Generic.List[object]]::new()
+$corePartitionClockPairs.Add(@($corePartitionPreHelperUtc.Ticks, (Get-CorePartitionMonoMs)))
+$corePartitionHelperLaunch =[ordered]@{ pid = $null; affinityRequested = (Format-CorePartitionMask $CorePartitionHelperAffinity); affinityObserved = $null; priorityObserved = $null; ready = $false; readyWhy = $null; readyWaitMs = $null }
 # sol r6 CP-06: a per-job random key, handed to the helper only (its environment; never a trace, the command line or core-partition.json). The helper
 # HMACs its record with it, so a record at its output name that this key does not verify is not the helper's.
 $cpKeyBytes = New-Object byte[] 32; $cpRng = [Security.Cryptography.RandomNumberGenerator]::Create(); try { $cpRng.GetBytes($cpKeyBytes) } finally { $cpRng.Dispose() }
@@ -5564,16 +5631,21 @@ try {
     $corePartitionHelper.Refresh()
     $corePartitionHelperLaunch.affinityObserved = Format-CorePartitionMask ([int64]$corePartitionHelper.ProcessorAffinity)
     $corePartitionHelperLaunch.priorityObserved = [string]$corePartitionHelper.PriorityClass
+    # r8 A4 (adversary r7 6fac125a A4: Test-Path accepted a directory): ready means Test-CorePartitionReadyMarker accepts the marker, a regular file
+    # carrying the HMAC of this helper's pid under this job's key; anything else at the 30 s limit (or when the helper has exited) keeps its typed reason.
+    $cpReadyToken = Get-CorePartitionReadyToken $corePartitionHelperNonce $corePartitionHelper.Id
     $cpReadyWatch = [Diagnostics.Stopwatch]::StartNew()
-    while (-not (Test-Path -LiteralPath $corePartitionReadyFile) -and -not $corePartitionHelper.HasExited -and $cpReadyWatch.ElapsedMilliseconds -lt 30000) { Start-Sleep -Milliseconds 100 }
-    $corePartitionHelperLaunch.ready = (Test-Path -LiteralPath $corePartitionReadyFile)
+    while ((Test-CorePartitionReadyMarker $corePartitionReadyFile $cpReadyToken) -and -not $corePartitionHelper.HasExited -and $cpReadyWatch.ElapsedMilliseconds -lt 30000) { Start-Sleep -Milliseconds 100 }
+    $corePartitionHelperLaunch.readyWhy = Test-CorePartitionReadyMarker $corePartitionReadyFile $cpReadyToken
+    $corePartitionHelperLaunch.ready = ($null -eq $corePartitionHelperLaunch.readyWhy)
     $corePartitionHelperLaunch.readyWaitMs = [int]$cpReadyWatch.ElapsedMilliseconds
 } catch {
     $corePartitionErrors.Add("helper-start: $([string]$_.Exception.Message)")
 }
 # Adversary r2 A1: a helper that is not ready when the measured launch happens fails every telemetry criterion closed (its record cannot cover the window).
 # sol r3 CP-01: the flag, not the reason text, carries it to the scalars, and every later helper reason is appended to this one.
-if ($null -ne $corePartitionHelper -and -not $corePartitionHelperLaunch.ready) { $corePartitionHelperNotReady = $true; $corePartitionHelperWhy = 'helper-not-ready-at-launch' }
+# r8 A3 (adversary r7 6fac125a A3): no helper object (Process.Start threw) is not-ready too, helper-start-failed; the rule no longer needs a helper.
+if ($null -eq $corePartitionHelper -or -not $corePartitionHelperLaunch.ready) { $corePartitionHelperNotReady = $true; $corePartitionHelperWhy = $(if ($null -eq $corePartitionHelper) { 'helper-start-failed' } else { Join-CorePartitionWhy 'helper-not-ready-at-launch' ([string]$corePartitionHelperLaunch.readyWhy) }) }
 if ($CorePartitionBenchMask -ne 0) {
     try {
         $corePartitionJobProc.ProcessorAffinity = [IntPtr]$CorePartitionBenchMask
@@ -5587,6 +5659,7 @@ if ($CorePartitionBenchMask -ne 0) {
 # (the pre-helper mark above is recorded separately and never windows the feed).
 $corePartitionFeedStart = Read-CorePartitionFeedMark $corePartitionFeedPath
 $corePartitionMeasuredLaunchUtc = (Get-Date).ToUniversalTime()
+$corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, (Get-CorePartitionMonoMs)))
 try { [void](Publish-AttrCudaText -Path $corePartitionLaunchFile -Value ([string]$corePartitionMeasuredLaunchUtc.Ticks)) } catch { $corePartitionErrors.Add("launch-file: $([string]$_.Exception.Message)") }
 Write-JobTrace "step core-partition start helperPid=$($corePartitionHelperLaunch.pid) helperAffinity=$($corePartitionHelperLaunch.affinityObserved) ready=$($corePartitionHelperLaunch.ready) readyWaitMs=$($corePartitionHelperLaunch.readyWaitMs) jobAffinity=$($corePartitionJob.affinityApplied)"
 '@ + "`n" + $cpClose + "`n" + @'
@@ -5611,6 +5684,8 @@ try {
         $corePartitionErrors.Add("job-affinity-restore: $([string]$_.Exception.Message)")
     }
     $corePartitionSmokeEndedAtUtc = (Get-Date).ToUniversalTime()
+    # r8 A1: the job's own wall/monotonic gap over its pre-helper, measured-launch and smoke-end reads ($null, so clock-unverified, when unknown)
+    $corePartitionJobClockSkewMs = Get-CorePartitionClockSkewMs (@($corePartitionClockPairs | Where-Object { $null -ne $_ }) + , @($corePartitionSmokeEndedAtUtc.Ticks, (Get-CorePartitionMonoMs)))
     $corePartitionFeedEnd = Read-CorePartitionFeedSince $corePartitionFeedPath ([int64]$corePartitionFeedStart.length) ([string]$corePartitionFeedStart.before)
     # sol r4 CP-02: the measured app is the process the smoke runner launched (its result.json process.id); 0 when unknown, which binds nothing.
     # Its launch..exit window (process.startedAtUtc / endedAtUtc) binds the pid to that process, not a later one reusing it (adversary r5 A3).
@@ -5666,8 +5741,8 @@ try {
             helperLaunch = $corePartitionHelperLaunch
             helperWhy = $corePartitionHelperWhy
             helperNotReady = $corePartitionHelperNotReady
-            measured = [ordered]@{ pid = $corePartitionMeasuredPid; startUtcTicks = $corePartitionMeasuredStartTicks; endUtcTicks = $corePartitionMeasuredEndTicks }
-            measuredApp = (Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks).why
+            measured = [ordered]@{ pid = $corePartitionMeasuredPid; startUtcTicks = $corePartitionMeasuredStartTicks; endUtcTicks = $corePartitionMeasuredEndTicks; jobClockSkewMs = $corePartitionJobClockSkewMs }
+            measuredApp = (Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs).why
             helper = $corePartitionHelperRecord
             feed = [ordered]@{
                 path = $corePartitionFeedPath
@@ -5691,7 +5766,7 @@ Write-JobTrace "step smoke-launch done rc=$smokeRc"
     $text = Edit-DualVenueTemplate $text $cpLaunchOld ($cpPre + "`n" + $cpPost)
     $cpMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
     $text = Edit-DualVenueTemplate $text $cpMetricsAnchor ($cpOpen + "`n" + @'
-$corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks
+$corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs
 '@ + "`n" + $cpClose + "`n" + $cpMetricsAnchor)
     $cpMetricsAt = $text.IndexOf($cpMetricsAnchor, [StringComparison]::Ordinal)
     $cpKeysAnchor = '    cpuFrames = $gpuSummary.cpuFrames' + $cpEol
