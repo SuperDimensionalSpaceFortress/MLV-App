@@ -1866,6 +1866,8 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         "CopiedRoot": ("[CmdletBinding()]param()\n$c = $PSCmdlet\n$m = 'Session' + 'State'\n$p = 'PSVar' + 'iable'\n$c.$m.$p.Set('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
         "TypeRoot": ("$m = 'Session' + 'StateProxy'\n[runspace]::DefaultRunspace.$m.SetVariable('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
         "PipelineRoot": ("[CmdletBinding()]param()\n$m = 'Session' + 'State'\n$p = 'PSVar' + 'iable'\n$PSCmdlet | ForEach-Object {{ $_.$m.$p.Set('PSScriptRoot', 'C:\\dirty') }}", PSR_CALL),
+        # r11 adversary A1, the PSScriptRoot form: the same chain of copies on the extractor input.
+        "AdvR11CopyChainRoot": ("[CmdletBinding()]param()\n$a=$PSCmdlet; $b=$a; $m='Session'+'State'; $p='PSVar'+'iable'; $b.$m.$p.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
         "DefaultsMember": ("$h = Get-Thing\n$h.('PSDefault' + 'ParameterValues')['*:ModulePath'] = '{dirty}'", DEF_CALL),
     }
     # Not unproven: a computed member of parsed data (the real playback-attr-3-cuda-job.ps1 shape), a folded name that is not a route.
@@ -1879,6 +1881,8 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         # r10 adversary A1, receiver, verbatim.
         "AdvA1Receiver": " [CmdletBinding()]param($Target)\n $r=@{}\n $PSCmdlet.('Session'+'State').('PS'+'Variable').Set('r',$Target)\n $r.Attributes=1",
         "BodyUnfoldable": "    param($Target)\n    $r = @{}\n    $m = 'Session' + 'State'\n    $p = 'PSVar' + 'iable'\n    $PSCmdlet.$m.$p.Set('r', $Target)\n    $r.Attributes = 1",
+        # r11 adversary A1, verbatim body: the session root reaches the receiver through a chain of copies.
+        "AdvR11CopyChain": " [CmdletBinding()]param($Target); $r=@{}; $a=$PSCmdlet; $b=$a; $m='Session'+'State'; $p='PSVar'+'iable'; $b.$m.$p.Set('r',$Target); $r.Attributes=1",
     }
     BODY_CONTROLS = {
         "BodyCtlDataMember": "    $r = @{}\n    $k = 'a'\n    $r.a = $r.$k",
@@ -1976,6 +1980,11 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
                                                "Set-Alias Get-AttrCudaEmbeddedFunctionSource Redirect2 -Scope Global\n", encoding="utf-8")
         (d / "gen-default.ps1").write_text(f"Import-Module '{d / 'ExtractorAlias.psm1'}'\nGet-AttrCudaEmbeddedFunctionSource -Name 'Probe'\n", encoding="utf-8")
         cls.extractor = run_scan(modules=[d / "Extractor.psm1", d / "ExtractorAlias.psm1", d / "Clean.psm1"], splice_sources=[d / "gen-default.ps1"])
+        # r11 adversary A2, verbatim modules: an alias one module defines reaches $PSDefaultParameterValues in another module.
+        (d / "A.psm1").write_text("Set-Alias Fetch Get-Variable -Scope Global\n", encoding="utf-8")
+        (d / "B.psm1").write_text(f"(Fetch P*Values -Scope Global).Value['*:ModulePath']='{d / 'Dirty.psm1'}'\n", encoding="utf-8")
+        (d / "gen-modules.ps1").write_text(f"Import-Module '{d / 'A.psm1'}'\nImport-Module '{d / 'B.psm1'}'\nGet-AttrCudaEmbeddedFunctionSource -Name 'Probe'\n", encoding="utf-8")
+        cls.module_defaults = run_scan(modules=[d / "Extractor.psm1", d / "A.psm1", d / "B.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-modules.ps1"])
 
     def check(self, result: dict) -> None:
         calls = [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and "'Probe'" in f["text"]]
@@ -1988,6 +1997,10 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
 
     def test_r11_an_imported_alias_of_the_extractor_makes_the_binding_unproven(self) -> None:
         self.check(self.extractor)
+
+    def test_r11_a2_a_module_that_reaches_the_defaults_through_another_modules_alias_is_an_unproven_binding(self) -> None:
+        found = [f for f in self.module_defaults["splicedViolations"] if f["token"] == "unproven-binding" and f["source"].endswith("B.psm1")]
+        self.assertEqual(len(found), 1, describe(self.module_defaults["splicedViolations"]))
 
 
 class SpliceInventoryCallShapeTests(unittest.TestCase):

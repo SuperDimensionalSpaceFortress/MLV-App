@@ -1204,12 +1204,34 @@ function Test-MemberReceiverMayBeSession($Member, $Root) {
     if ($script:engineInputVariables -icontains $name) {
         return (@($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -and $script:sessionRootVariables -icontains (Get-VariableName $x).name }, $true)).Count -gt 0)
     }
-    foreach ($assignment in @(Get-AssignmentsTo $Root $name)) {
-        $sessionUse = @($assignment.Right.FindAll({ param($x)
-            ($x -is [System.Management.Automation.Language.VariableExpressionAst] -and ($script:sessionRootVariables -icontains (Get-VariableName $x).name -or $x.VariablePath.UserPath -match '^(?i:variable):')) -or
-            ($x -is [System.Management.Automation.Language.TypeExpressionAst] -and $x.TypeName.FullName -match '(?i)runspace|powershell|SessionState|psvariable|Management\.Automation') -or
-            ($x -is [System.Management.Automation.Language.CommandAst] -and @(Get-ResolvedCommandNames $x | Where-Object { @('get-variable', 'gv') -contains $_ }).Count -gt 0) }, $true))
-        if ($sessionUse.Count -gt 0) { return $true }
+    return (Test-VariableMayHoldSession $Root $name ([System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)))
+}
+
+function Test-VariableMayHoldSession($Root, [string]$Name, $Visiting) {
+    # r11 adversary A1: an assignment binds $Name from a session root, a variable command, an engine type, or (followed to the end of
+    # the chain: `$a = $PSCmdlet; $b = $a`) another variable that may hold one.
+    if (-not $Visiting.Add($Name)) { return $false }
+    foreach ($assignment in @(Get-AssignmentsTo $Root $Name)) {
+        foreach ($x in @($assignment.Right.FindAll({ param($n)
+                $n -is [System.Management.Automation.Language.VariableExpressionAst] -or $n -is [System.Management.Automation.Language.TypeExpressionAst] -or
+                $n -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+            if ($x -is [System.Management.Automation.Language.TypeExpressionAst]) {
+                if ($x.TypeName.FullName -match '(?i)runspace|powershell|SessionState|psvariable|Management\.Automation') { return $true }
+                continue
+            }
+            if ($x -is [System.Management.Automation.Language.CommandAst]) {
+                if (@(Get-ResolvedCommandNames $x | Where-Object { @('get-variable', 'gv') -contains $_ }).Count -gt 0) { return $true }
+                continue
+            }
+            if ($x.VariablePath.UserPath -match '^(?i:variable):') { return $true }
+            $source = (Get-VariableName $x).name
+            if ($script:sessionRootVariables -icontains $source) { return $true }
+            if ($script:engineInputVariables -icontains $source) {
+                if (@($Root.FindAll({ param($v) $v -is [System.Management.Automation.Language.VariableExpressionAst] -and $script:sessionRootVariables -icontains (Get-VariableName $v).name }, $true)).Count -gt 0) { return $true }
+                continue
+            }
+            if (Test-VariableMayHoldSession $Root $source $Visiting) { return $true }
+        }
     }
     return $false
 }
@@ -1946,10 +1968,6 @@ if ($SpliceSource.Count -gt 0) {
         $moduleAst = [System.Management.Automation.Language.Parser]::ParseInput($moduleTexts[$key], [ref]$moduleTokens, [ref]$moduleErrors)
         # r10: the aliases its top-level code defines are the generator's aliases too (Get-AliasContext -Imported).
         $moduleAsts[$key] = $moduleAst
-        $moduleDefaults = Get-DefaultParameterValuesReference $moduleAst
-        if ($null -ne $moduleDefaults) {
-            Add-SpliceFinding $key $moduleDefaults.Ast.Extent.StartLineNumber '' $key "the module refers to `$PSDefaultParameterValues ($($moduleDefaults.Reason)), whose defaults can bind any extractor call's -ModulePath or -Name at run time" 'unproven-binding'
-        }
     }
     # r10: the aliases the modules' top-level code defines, read together until nothing is added (adversary A1: an alias of Set-Alias
     # one module defines can define the alias another module uses), so a chain across modules is followed like one inside a file.
@@ -1964,6 +1982,16 @@ if ($SpliceSource.Count -gt 0) {
         $after = @($script:importedAliases.map.Values | ForEach-Object { @($_).Count } | Measure-Object -Sum).Sum + $script:importedAliases.wildcard.Count
         if ($after -eq $before) { break }
         if ($pass -eq 7 -and -not $script:importedAliases.problem) { $script:importedAliases.problem = 'aliases of alias commands the scan stopped following after eight passes' }
+    }
+    # r11 adversary A2: a module's reference to $PSDefaultParameterValues is judged only after every module's aliases are known, and
+    # through them (`Set-Alias Fetch Get-Variable` in one module, `(Fetch P*Values).Value[...]` in another), so the module's alias
+    # context is built -Imported before anything reads (and caches) it.
+    foreach ($key in @($moduleAsts.Keys)) {
+        $null = Get-AliasContext $moduleAsts[$key] -Imported
+        $moduleDefaults = Get-DefaultParameterValuesReference $moduleAsts[$key]
+        if ($null -ne $moduleDefaults) {
+            Add-SpliceFinding $key $moduleDefaults.Ast.Extent.StartLineNumber '' $key "the module refers to `$PSDefaultParameterValues ($($moduleDefaults.Reason)), whose defaults can bind any extractor call's -ModulePath or -Name at run time" 'unproven-binding'
+        }
     }
     $entries = [ordered]@{}
     # The module the extractor reads when a call names no -ModulePath is the module that defines the extractor
