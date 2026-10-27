@@ -248,6 +248,17 @@ function Test-DirtyPatchComplete([string]$Wt, [string]$Patch, [string[]]$GitDiff
     return ($live -ceq (Get-FileHash -LiteralPath $Patch -Algorithm SHA256).Hash.ToLowerInvariant())
 }
 
+# True when an exported diff records a gitlink (mode 160000) in a file header. Content lines start with ' ', '+', '-' or '\', and a base85 binary line holds no space,
+# so only a header can match. Checked on the exported bytes, so a gitlink staged after the up-front scan is still refused before the diff is placed (r7 iter 1, adversary 6433989c-A1).
+# The reader is disposed explicitly: leaving a foreach over File.ReadLines early keeps the file open, and the temp cleanup then cannot remove it.
+function Test-DirtyDiffHasGitlink([string]$Path) {
+    $reader = New-Object System.IO.StreamReader($Path)
+    try {
+        while ($null -ne ($line = $reader.ReadLine())) { if ($line -cmatch '^(index [0-9a-f]+\.\.[0-9a-f]+ 160000|(new file|deleted file|old|new) mode 160000)$') { return $true } }
+        return $false
+    } finally { $reader.Dispose() }
+}
+
 function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardName = '', [string]$RoundName = '') {
     $tmp = $null; $stagedTmp = $null; $statTmp = $null; $mergeTmp = $null; $destLock = $null; $wtLock = $null; $prevEnc = $null
     $PSNativeCommandUseErrorActionPreference = $false  # local to this call: every git exit code below is judged here, never thrown (git diff --cached --quiet exits 1 when something is staged)
@@ -305,12 +316,19 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $Dest = $destReal; $Wt = $wtReal
         $prefix = @(& git -C $Wt rev-parse --show-prefix 2>$null)
         if ($LASTEXITCODE -ne 0 -or ($prefix -join '').Trim() -ne '') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
+        # The prefix is also empty OUTSIDE the work tree git uses: a core.worktree in the (worktree) config sends every later git call to another directory while the holds and
+        # containment checks describe -Wt. The top level git reports must be the held directory itself (r7 iter 1, adversary 6433989c-A2).
+        $top = @(& git -C $Wt rev-parse --show-toplevel 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $top.Count -ne 1 -or (Get-DirtyDirIdentity $top[0]) -cne $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
         if (Test-DirtyPathInside -Inner $destReal -Outer $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-inside-worktree" }
         # A gitlink (mode 160000: a submodule pointer, or a submodule checked out at another commit) is written into the patch, but the advertised plain `git apply` skips its
         # commit ids and the reverse-apply check never looks at them, so SAVED would promise a recovery that drops the change. Such a diff is refused before anything is written (r7, adversary cd31735a-A2).
-        $raw = @(& git -C $Wt diff HEAD --raw --no-renames --no-ext-diff --ignore-submodules=none 2>$null)
-        if ($LASTEXITCODE -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-raw-exit-$LASTEXITCODE" }
-        if (@($raw | Where-Object { $_ -cmatch '^:(160000 [0-7]{6}|[0-7]{6} 160000) ' }).Count -gt 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved" }
+        # The index is asked as well as the working tree: a file turned into a gitlink only in the index shows in neither the HEAD diff nor its scan (r7 iter 1, adversary 6433989c-A1).
+        foreach ($side in 'HEAD', '--cached') {
+            $raw = @(& git -C $Wt diff $side --raw --no-renames --no-ext-diff --ignore-submodules=none 2>$null)
+            if ($LASTEXITCODE -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-raw-exit-$LASTEXITCODE" }
+            if (@($raw | Where-Object { $_ -cmatch '^:(160000 [0-7]{6}|[0-7]{6} 160000) ' }).Count -gt 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved" }
+        }
         $guard ={ param($stage) Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -WtIdentity $wtId -Stage $stage }
         $why = & $guard 'before-write'
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }
@@ -323,6 +341,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         & git -C $Wt diff HEAD @shape "--output=$tmp" 2>$null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-exit-$LASTEXITCODE" }
         if (-not (Test-DirtyPatchComplete -Wt $Wt -Patch $tmp -GitDiffArgs (@('diff', 'HEAD') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=patch-incomplete" }
+        if (Test-DirtyDiffHasGitlink $tmp) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved" }
         $full = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
         # The name is the first 8 hex of the hash, lengthened until it is free or already holds these exact bytes (two different diffs may share a prefix).
         $bytes = (Get-Item -LiteralPath $tmp).Length
@@ -393,6 +412,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             & git -C $Wt apply --cached --check -R --whitespace=nowarn $stagedTmp 2>$null
             $applyExit = $LASTEXITCODE
             if ($applyExit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-not-applicable$evidence" }
+            if (Test-DirtyDiffHasGitlink $stagedTmp) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved$evidence" }
             $stagedFull = (Get-FileHash -LiteralPath $stagedTmp -Algorithm SHA256).Hash.ToLowerInvariant()
             $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull -Guard $guard
             if (-not $stagedPlaced.Path) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($stagedPlaced.Reason)$evidence" }

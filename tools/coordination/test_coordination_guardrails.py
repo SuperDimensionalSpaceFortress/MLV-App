@@ -2588,6 +2588,51 @@ def test_save_dirty_worktree_evidence_refuses_a_gitlink_change_plain_apply_canno
 
 
 @dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_staged_only_gitlink_and_one_that_appears_after_the_scan(tmp_path):
+    # r7 iter 1 (adversary 6433989c-A1): a file turned into a gitlink only in the index is invisible to the HEAD-to-working-tree scan and was published in the staged diff under
+    # SAVED; and a gitlink staged after the scan reached the exported patch. The index is scanned too, and every exported diff is checked again before it is placed.
+    wt, dest = _dirty_save_repo(tmp_path)
+    (wt / "b.txt").write_text("b\n")
+    git(wt, "add", "b.txt")
+    git(wt, "commit", "-qm", "b")
+    git(wt, "checkout", "--", "src/a.txt")
+    git(wt, "update-index", "--cacheinfo", f"160000,{'2' * 40},src/a.txt")  # src/a.txt stays an ordinary file in the working tree
+    (wt / "b.txt").write_text("bb\n")
+    assert "160000" not in git(wt, "diff", "HEAD", "--raw", "--ignore-submodules=none"), "the HEAD scan must not see it, or this is not the reported case"
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=gitlink-change-not-saved", (out.stdout, out.stderr)
+    assert not list(dest.iterdir())
+    git(wt, "reset", "-q", "--", "src/a.txt")
+    # Concurrent variant: the first before-write checkpoint (after the scan, before the export) stages a gitlink at a new path.
+    shim = ("$script:Staged = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
+            f"if (-not $script:Staged) {{ $script:Staged = $true; & git -C '{wt}' update-index --add --cacheinfo \"160000,{'3' * 40},vendor/late\" }} }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    # The late gitlink is only in the index, so it is caught on the exported staged diff, after the main patch and status were placed: the failure names them (header contract).
+    assert out.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=gitlink-change-not-saved patch="), (out.stdout, out.stderr)
+    assert "vendor/late" in git(wt, "ls-files", "-s", "vendor/late") and not list(dest.glob("dirty-worktree-staged-*")) and not list(dest.glob("*.tmp"))
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_worktree_whose_config_points_git_elsewhere(tmp_path):
+    # r7 iter 1 (adversary 6433989c-A2): a linked worktree whose config.worktree sets core.worktree to another directory still printed an empty --show-prefix, so git read
+    # that directory while the holds and containment checks used -Wt; evidence went inside the directory git read. The top level git reports must be -Wt itself.
+    main, _ = _dirty_save_repo(tmp_path)
+    git(main, "checkout", "--", "src/a.txt")
+    wt = tmp_path / "linked"
+    git(main, "worktree", "add", "-q", str(wt))
+    other = tmp_path / "other"
+    (other / "src").mkdir(parents=True)
+    (other / "src" / "a.txt").write_text("two\n")
+    dest = other / "run"
+    dest.mkdir()
+    git(wt, "config", "extensions.worktreeConfig", "true")
+    git(wt, "config", "--worktree", "core.worktree", str(other).replace("\\", "/"))
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=not-a-worktree-root", (out.stdout, out.stderr)
+    assert not list(dest.iterdir())
+
+
+@dirty_save_only
 def test_save_dirty_worktree_evidence_fails_typed_when_the_main_patch_loses_a_whole_file(tmp_path):
     # Same class on the main patch (adversary siblings :41 / :77): a complete one-file prefix used to be reported as verified=reverse-apply-ok.
     wt, dest = _dirty_save_repo(tmp_path)
