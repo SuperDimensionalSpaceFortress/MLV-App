@@ -1198,45 +1198,14 @@ function Test-SessionCarrierCommand($Command) {
     # prefix of it, or a splat that may hold it).
     $names = @(Get-ResolvedCommandNames $Command | Where-Object { $script:sessionCarrierCommands -contains $_ })
     if ($names.Count -eq 0) { return $false }
-    # Get-Command on one constant executable name selected as an application only (`Get-Command python.exe -CommandType Application`)
-    # hands back an ApplicationInfo, which carries no module. r12b (Dot B13): the name alone proves nothing, since a supplied module
-    # can export `function python.exe`, whose FunctionInfo .Module reaches its session state; so the type set must be exactly one
-    # constant Application (-CommandType or its alias -Type, any prefix, once), else the selection is unproven.
-    # r12c: and the arguments prove only what the builtin selects, so the command must be the builtin (Test-BuiltinGetCommand).
-    if (@($names | Where-Object { @('get-command', 'gcm') -notcontains $_ }).Count -eq 0) {
-        if (@($Command.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count -gt 0) { return $true }
-        $types = Get-NamedArguments $Command @('CommandType') 'Get-Command'
-        if (@($types).Count -ne 1 -or $null -eq $types[0] -or (Get-SingleConstant $types[0]) -ine 'Application') { return $true }
-        $named = Get-NamedArguments $Command @('Name')
-        $operand = if (@($named).Count -eq 1) { $named[0] } elseif (@($named).Count -eq 0 -and $Command.CommandElements.Count -gt 1 -and $Command.CommandElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $Command.CommandElements[1] } else { $null }
-        $commandName = if ($null -eq $operand) { $null } elseif ($operand -is [System.Management.Automation.Language.StringConstantExpressionAst]) { [string]$operand.Value } else { Get-SingleConstant $operand }
-        if ($null -ne $commandName -and $commandName -match '(?i)^[^*?\[\]]+\.(exe|com|cmd|bat)$' -and (Test-BuiltinGetCommand $Command)) { return $false }
-        return $true
-    }
+    # r13: every Get-Command result is a carrier, whatever -CommandType says. r12b/r12c exempted an Application-only selection of
+    # one executable name once its arguments and the builtin's identity were proven, but identity cannot be proven in this grammar:
+    # a dynamic module named Microsoft.PowerShell.Core (sol r12c S-08) or a function's [Alias('Get-Command')] attribute (fable r12c)
+    # runs a replacement that hands back a FunctionInfo, whose .Module reaches its session state. No tracked probe needs the exception.
     if (@($names | Where-Object { @('import-module', 'ipmo') -notcontains $_ }).Count -gt 0) { return $true }
     return (@($Command.CommandElements | Where-Object {
         ($_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName.Length -ge 2 -and 'passthru'.StartsWith($_.ParameterName.ToLowerInvariant())) -or
         ($_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted) }).Count -gt 0)
-}
-
-# r12c (Dot on 8bb454b1, sol r12b S-07): a -ModulePath module can define, alias, or export under an Import-Module -Prefix, a
-# replacement Get-Command that hands back a FunctionInfo whatever -CommandType says. Its identity is proven only for
-# Microsoft.PowerShell.Core\Get-Command, or for a plain Get-Command / gcm that runs as nothing else and that no shadow
-# (Get-ShadowingDefinitions, the model the extractor and Join-Path are judged by) in the calling tree or a -ModulePath module
-# defines, under every name a constant -Prefix there turns into Get-Command or gcm. Anything else is unproven (fails closed).
-$script:getCommandTrees = [System.Collections.Generic.Dictionary[object, object]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
-$script:suppliedModuleAsts = $null
-
-function Get-SuppliedModuleAsts {
-    # The -ModulePath modules' trees: the splice pass's own ($moduleAsts) once it has parsed them, else parsed here once.
-    $built = Get-Variable -Name moduleAsts -Scope Script -ValueOnly -ErrorAction SilentlyContinue
-    if ($null -ne $built) { return @($built.Values) }
-    if ($null -eq $script:suppliedModuleAsts) {
-        $script:suppliedModuleAsts = @($ModulePath | ForEach-Object {
-            $tokens = $null; $errors = $null
-            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $_).Path, [ref]$tokens, [ref]$errors) })
-    }
-    return $script:suppliedModuleAsts
 }
 
 function Get-PrefixRenamedNames($Trees, [string[]]$Targets) {
@@ -1272,34 +1241,6 @@ function Get-PrefixRenamedNames($Trees, [string[]]$Targets) {
         }
     }
     return , $names.ToArray()
-}
-
-function Test-BuiltinGetCommand($Command) {
-    $name = Get-LiteralCommandName $Command
-    if ([string]::IsNullOrEmpty($name)) { return $false }
-    $base = @('Get-Command', 'gcm')
-    if ($name.Contains('\')) {
-        $qualifier = $name.Substring(0, $name.LastIndexOf('\'))
-        if ($qualifier -ine 'Microsoft.PowerShell.Core' -or (Get-BareCommandName $name) -ne 'get-command' -or
-            @($ModulePath | Where-Object { [IO.Path]::GetFileNameWithoutExtension($_) -ieq $qualifier }).Count -gt 0) { return $false }
-        # r12c adversary A3: an alias or function named by the qualified spelling itself runs in the builtin's place.
-        $base = @($name)
-    }
-    if (@(Get-ResolvedCommandNames $Command | Where-Object { @('get-command', 'gcm') -notcontains $_ }).Count -gt 0) { return $false }
-    $top = $Command
-    while ($null -ne $top.Parent) { $top = $top.Parent }
-    if (-not $script:getCommandTrees.ContainsKey($top)) { $script:getCommandTrees[$top] = @{} }
-    $key = $base -join '|'
-    if (-not $script:getCommandTrees[$top].ContainsKey($key)) { $script:getCommandTrees[$top][$key] = Test-GetCommandUnshadowed $top $base }
-    return $script:getCommandTrees[$top][$key]
-}
-
-function Test-GetCommandUnshadowed($Top, [string[]]$Base) {
-    $trees = @($Top) + @(Get-SuppliedModuleAsts)
-    $names = Get-PrefixRenamedNames $trees $Base
-    if ($null -eq $names) { return $false }
-    foreach ($tree in $trees) { if (@(Get-ShadowingDefinitions $tree $names).Count -gt 0) { return $false } }
-    return $true
 }
 
 function Test-TreeNamesSessionCarrier($Root) {
