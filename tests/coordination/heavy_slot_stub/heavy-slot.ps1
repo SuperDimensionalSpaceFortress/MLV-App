@@ -4,6 +4,7 @@
 #   marked75   print the ticket line, write a marker that names this run to --exit-file, exit 75
 #   unmarked75 print the ticket line, exit 75 with no marker
 #   forged75   print the ticket line, write a marker with another nonce, exit 75
+#   marked9    print the ticket line, write a matching marker that says code 9, exit 9 (not a heavy-slot code)
 # STUB_HEAVY_SLOT_DELAY_S (run mode) waits that many seconds before starting the child, like a queue wait for the slot.
 # Every call appends one JSON line (argv, the two EXPECT variables, and the child's start and end) to STUB_HEAVY_SLOT_LOG.
 $argv = @($args)
@@ -18,8 +19,8 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
     if ($argv[$i] -eq '--') { $command = @($argv | Select-Object -Skip ($i + 1)); break }
 }
 $record = [ordered]@{ argv = $argv; expectSha = $env:HEAVY_SLOT_EXPECT_SHA256; expectKeeper = $env:HEAVY_SLOT_EXPECT_KEEPER; mode = $mode; childStart = $null; childEnd = $null }
-function Write-StubMarker([string]$Nonce) {
-    $marker = [ordered]@{ source = 'heavy-slot'; code = 75; reason = 'timed out after 3600s waiting for the slot'; ticket = $ticket; nonce = $Nonce; pid = $PID }
+function Write-StubMarker([string]$Nonce, [int]$Code = 75) {
+    $marker = [ordered]@{ source = 'heavy-slot'; code = $Code; reason = 'timed out after 3600s waiting for the slot'; ticket = $ticket; nonce = $Nonce; pid = $PID }
     if ($exitFile) { Set-Content -LiteralPath $exitFile -Value ($marker | ConvertTo-Json -Compress) -Encoding ascii }
 }
 $code = 0
@@ -27,6 +28,7 @@ switch ($mode) {
     'marked75' { Write-StubMarker $nonce; $code = 75 }
     'forged75' { Write-StubMarker ([Guid]::NewGuid().ToString('N')); $code = 75 }
     'unmarked75' { $code = 75 }
+    'marked9' { Write-StubMarker $nonce 9; $code = 9 }
     default {
         if ($env:STUB_HEAVY_SLOT_DELAY_S) { Start-Sleep -Seconds ([int]$env:STUB_HEAVY_SLOT_DELAY_S) }
         $record.childStart = [DateTime]::UtcNow.ToString('o')
