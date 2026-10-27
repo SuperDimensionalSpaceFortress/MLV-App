@@ -1293,7 +1293,8 @@ $fence
                     if (-not (Get-Command Protect-LaneWorktreeFsmonitor -ErrorAction SilentlyContinue)) { . (Join-Path $PSScriptRoot 'lane-fsmonitor.ps1') }
                     $null = Protect-LaneWorktreeFsmonitor -WorkDir $existingWt
                 } catch { Write-Output "WORKSTREAM: fsmonitor protect skipped for ${existingWt}: $($_.Exception.Message)" }
-                $dirty = @(& git -C $existingWt status --porcelain 2>$null | Where-Object { $_ })
+                # --untracked-files=all: status.showUntrackedFiles=no (repo or user config) must not hide an untracked orphan from the refusal and from the save below (LANE-HUBCHAT-DETACHED-DISPATCH-1 r4 K5).
+                $dirty = @(& git -C $existingWt status --porcelain --untracked-files=all 2>$null | Where-Object { $_ })
                 if ($LASTEXITCODE -ne 0) {
                     Write-Output "WORKSTREAM: CANNOT-DETERMINE - status failed in existing worktree $existingWt"
                     Write-DispatchAttempt -Outcome 'refused-before-launch' -Cause 'cannot-determine-worktree-status' -ExitCode 3 -Detail "workDir=$existingWt branch=$branch"

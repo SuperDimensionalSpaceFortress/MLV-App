@@ -2253,6 +2253,28 @@ def test_continuation_dirty_refusal_saves_the_tracked_diff_first_and_still_exits
         subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=tmp_path, check=False, capture_output=True)
 
 
+def test_continuation_dirty_refusal_sees_an_untracked_orphan_despite_show_untracked_files_no(tmp_path):
+    # r4 K5 (opus + sol, pre-existing): the dispatcher's own `git status --porcelain` obeys status.showUntrackedFiles=no, so an untracked orphan skipped both the refusal and the save.
+    dual, head = editing_board(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "product/TEST-EDIT-CONT-9"], cwd=tmp_path, check=True)
+    (tmp_path / "stage1.txt").write_text("stage one\n")
+    subprocess.run(["git", "add", "stage1.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "stage one"], cwd=tmp_path, check=True)
+    tip = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "checkout", "-q", "--detach", head], cwd=tmp_path, check=True)
+    wt = tmp_path / "wt-cont-9"
+    subprocess.run(["git", "worktree", "add", str(wt), "product/TEST-EDIT-CONT-9"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "status.showUntrackedFiles", "no"], cwd=tmp_path, check=True)
+    (wt / "orphan.txt").write_text("a dead lane's new file\n")
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-9")], "TEST-EDIT-CONT-9", extra=("-ContinueFromSha", tip))
+        assert result.returncode == 6 and "REFUSED continuation-worktree-dirty" in result.stdout and "orphan.txt" in result.stdout, result.stdout + result.stderr
+        saved = re.search(r"DIRTY_TREE_SAVED card=TEST-EDIT-CONT-9 .*? status=(.+?\.status\.txt) reapply=", result.stdout)
+        assert saved and "orphan.txt" in Path(saved.group(1)).read_text(encoding="utf-8"), result.stdout
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=tmp_path, check=False, capture_output=True)
+
+
 DIRTY_SAVE_PWSH = shutil.which("pwsh")
 dirty_save_only = pytest.mark.skipif(DIRTY_SAVE_PWSH is None, reason="the PowerShell helper needs pwsh")
 
@@ -2608,7 +2630,8 @@ def test_save_dirty_worktree_evidence_pins_the_patch_shape_against_diff_config(t
 
 @dirty_save_only
 def test_save_dirty_worktree_evidence_accepts_every_staged_shape(tmp_path):
-    # The staged completeness check (reverse-apply to the index) must not turn legitimate staged work into a save failure.
+    # Every legitimate staged shape (rename, delete, mode change, binary, gitlink, non-ASCII name) must pass both the byte-exact stream check and the
+    # `git apply --cached --check -R` applicability check, and the saved file must re-apply to a clean index.
     wt, dest = _dirty_save_repo(tmp_path)
     git(wt, "checkout", "--", "src/a.txt")
     (wt / "gone.txt").write_text("bye\n")
@@ -2636,6 +2659,187 @@ def test_save_dirty_worktree_evidence_accepts_every_staged_shape(tmp_path):
     git(clone, "reset", "-q", "--hard", "HEAD")
     git(clone, "apply", "--cached", str(staged))
     assert git(clone, "diff", "--cached", "--name-status", "--no-renames") == git(wt, "diff", "--cached", "--name-status", "--no-renames")
+
+
+ZERO_SHA = "0" * 40
+
+
+def _leave_a_conflicted_merge(wt):
+    """A lane that died mid `git merge fork/master`: HEAD src/a.txt='ours', index stages 1/2/3 for it, a working file with a local edit on top."""
+    (wt / "src" / "a.txt").write_text("ours\n")
+    git(wt, "add", "src/a.txt")
+    git(wt, "commit", "-qm", "ours")
+    # bytes on stdin: text mode would turn every LF into CRLF on Windows and git would read a different blob / a malformed index-info line
+    blobs = {s: subprocess.run(["git", "-C", str(wt), "hash-object", "-w", "--stdin"], input=text, capture_output=True, check=True).stdout.decode().strip()
+             for s, text in ((1, b"base\n"), (2, b"ours\n"), (3, b"theirs\n"))}
+    info = (f"0 {ZERO_SHA}\tsrc/a.txt\n" + "".join(f"100644 {blobs[s]} {s}\tsrc/a.txt\n" for s in (1, 2, 3))).encode()
+    subprocess.run(["git", "-C", str(wt), "update-index", "--index-info"], input=info, capture_output=True, check=True)
+    (wt / ".git" / "MERGE_HEAD").write_text(git(wt, "rev-parse", "HEAD") + "\n")
+    (wt / "src" / "a.txt").write_text("ours\nlocal edit\n")
+    assert git(wt, "ls-files", "-u").count("\n") == 2, "the fixture must leave three unmerged stages: " + git(wt, "ls-files", "-s")
+    assert subprocess.run(["git", "-C", str(wt), "diff", "--cached"], text=True, capture_output=True).stdout.strip() == "* Unmerged path src/a.txt"
+
+
+def _assert_unmerged_failure(out, dest, wt):
+    # r4 K1 (opus + sol BLOCKER): `git diff --cached` writes only '* Unmerged path src/a.txt' with exit 0, and that was returned as DIRTY_TREE_SAVED staged=<that line>.
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=unmerged-index "), out.stdout + out.stderr
+    assert "DIRTY_TREE_SAVED" not in line and len(line.splitlines()) == 1, line
+    named = {key: Path(m.group(1)) for key in ("patch", "status", "merge-state") if (m := re.search(rf" {key}=(.+?\.(?:patch|txt))(?: |$)", line))}
+    assert set(named) == {"patch", "status", "merge-state"}, line
+    assert all(p.is_file() and p.parent == dest for p in named.values()), (named, line)
+    state = named["merge-state"].read_text(encoding="utf-8")
+    assert git(wt, "rev-parse", "HEAD") in state and "MERGE_HEAD" in state, state
+    assert state.count("src/a.txt") == 3 and "\t" in state, state  # the `git ls-files -u` listing: one line per stage
+    assert "local edit" in named["patch"].read_text(encoding="utf-8"), "the working-tree edit stays in the patch"
+    assert not list(dest.glob("dirty-worktree-staged-*")) and not list(dest.glob("*.tmp")), sorted(p.name for p in dest.iterdir())
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_typed_and_names_every_file_when_the_index_is_unmerged(tmp_path):
+    wt, dest = _dirty_save_repo(tmp_path)
+    _leave_a_conflicted_merge(wt)
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    _assert_unmerged_failure(out, dest, wt)
+    again = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert again.stdout == out.stdout and len(list(dest.glob("dirty-worktree-merge-state-*.txt"))) == 1, "the same merge state keeps one name"
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_reports_an_unmerged_index_without_a_merge_head_and_under_the_native_exit_preference(tmp_path):
+    # Same input as the test above without MERGE_HEAD (a `git checkout -m` / stash-pop conflict), run under the strictest caller preference: the typed line must survive both.
+    wt, dest = _dirty_save_repo(tmp_path)
+    _leave_a_conflicted_merge(wt)
+    (wt / ".git" / "MERGE_HEAD").unlink()
+    out = dirty_save_pwsh(f"$PSNativeCommandUseErrorActionPreference = $true; $ErrorActionPreference = 'Stop'; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=unmerged-index "), out.stdout + out.stderr
+    state = Path(re.search(r" merge-state=(.+?\.txt)(?: |$)", line).group(1)).read_text(encoding="utf-8")
+    assert "MERGE_HEAD=none" in state and state.count("src/a.txt") == 3, state
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_typed_when_a_claimed_staged_diff_does_not_reverse_apply_to_the_index(tmp_path):
+    # r4 K1: the header promises "no reverse-apply to the index is never SAVED" for every input. git is shimmed to refuse the applicability check only, so the
+    # byte-exact stream check still passes and the typed failure can only come from the `git apply --cached --check -R` result.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    _stage_then_edit_back(wt)
+    shim = (f"$script:RealGit = '{shutil.which('git')}'; "
+            "function git { if ($args -contains 'apply' -and $args -contains '--cached') { $global:LASTEXITCODE = 1; return }; & $script:RealGit @args }")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=staged-diff-not-applicable "), out.stdout + out.stderr
+    assert re.search(r" patch=\S+\.patch", line) and re.search(r" status=\S+\.txt", line), line
+    assert not list(dest.glob("dirty-worktree-staged-*")) and not list(dest.glob("*.tmp"))
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_checks_applicability_with_the_whitespace_policy_pinned(tmp_path):
+    # An apply.whitespace=error setting must not turn a staged line with trailing blanks into a false not-applicable failure (nor verified=reverse-apply-FAILED on the patch).
+    wt, dest = _dirty_save_repo(tmp_path)
+    # HEAD holds the blank-padded line, so the REVERSED patch (the one the check applies) adds it back.
+    (wt / "src" / "a.txt").write_bytes(b"trailing   \n")
+    git(wt, "add", "src/a.txt")
+    git(wt, "commit", "-qm", "padded")
+    git(wt, "config", "apply.whitespace", "error")
+    git(wt, "config", "core.whitespace", "trailing-space")
+    (wt / "src" / "a.txt").write_bytes(b"clean\n")
+    git(wt, "add", "src/a.txt")
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVED") and "verified=reverse-apply-ok" in out.stdout and " staged=none " not in out.stdout, out.stdout + out.stderr
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_saves_staged_only_work_under_the_native_exit_preference(tmp_path):
+    # r4 K2 (sol BLOCKER): with $PSNativeCommandUseErrorActionPreference = $true and $ErrorActionPreference = 'Stop' in the caller, the expected exit 1 of
+    # `git diff --cached --quiet` threw and the staged capture was lost. HEAD and working src/a.txt='one', index 'staged'.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    _stage_then_edit_back(wt)
+    out = dirty_save_pwsh(f"$PSNativeCommandUseErrorActionPreference = $true; $ErrorActionPreference = 'Stop'; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVED card=C1") and " staged=none " not in out.stdout and "verified=empty-diff" in out.stdout, out.stdout + out.stderr
+    staged = list(dest.glob("dirty-worktree-staged-*.diff"))
+    assert len(staged) == 1 and "+staged" in staged[0].read_text(encoding="utf-8"), staged
+    assert not list(dest.glob("*.tmp"))
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_restores_nothing_in_the_callers_native_exit_preference(tmp_path):
+    # The preference is set for the helper's own calls only; the caller's value is unchanged on return.
+    wt, dest = _dirty_save_repo(tmp_path)
+    out = dirty_save_pwsh(f"$PSNativeCommandUseErrorActionPreference = $true; $null = Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1; Write-Output \"pref=$PSNativeCommandUseErrorActionPreference\"")
+    assert out.stdout.strip() == "pref=True", out.stdout + out.stderr
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_reports_the_real_reason_when_a_move_fails_without_a_name_clash(tmp_path):
+    # r4 K3 (opus): a sharing violation / AV lock on the temp file used to be reported as reason=name-collision after four attempts.
+    wt, dest = _dirty_save_repo(tmp_path)
+    shim = "function Invoke-DirtyFileMove([string]$From, [string]$To) { throw [System.IO.IOException]::new('The process cannot access the file because it is being used by another process.', 0x80070020) }"
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=move-failed:0x80070020"), out.stdout + out.stderr
+    assert "name-collision" not in line and len(line.splitlines()) == 1, line
+    assert not list(dest.iterdir()), "no temp file may be left behind"
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_still_reports_a_name_collision_as_one_and_names_the_placed_patch(tmp_path):
+    # K3 counterpart: a genuine clash (the target exists and holds different bytes at every length) stays name-collision, and the line names the patch already placed.
+    wt, dest = _dirty_save_repo(tmp_path)
+    shim = ("function Invoke-DirtyFileMove([string]$From, [string]$To) { "
+            "if ((Split-Path -Leaf $To) -like 'dirty-worktree-*.status*') { [System.IO.File]::WriteAllText($To, 'other'); throw [System.IO.IOException]::new('exists') }; "
+            "[System.IO.File]::Move($From, $To) }")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    patch = next(dest.glob("dirty-worktree-*.patch"))
+    assert line == f"DIRTY_TREE_SAVE_FAILED card=C1 reason=name-collision patch={patch}", (line, out.stderr)
+    assert all(p.read_text() == "other" for p in dest.glob("dirty-worktree-*.status*.txt")) and not list(dest.glob("*.tmp"))
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_destination_inside_the_source_worktree(tmp_path):
+    # r4 K4 (sol r2-A4): evidence must never be written into the tree it describes (the next status would list it and a later save would capture its own output).
+    wt, _ = _dirty_save_repo(tmp_path)
+    inside = wt / "run"
+    inside.mkdir()
+    for spelling in (str(inside), str(wt), str(wt / "src" / ".." / "run"), str(wt).upper() if os.name == "nt" else str(wt)):
+        if not Path(spelling).exists():
+            continue
+        out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{spelling}' -CardName C1 -RoundName r1")
+        assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-inside-worktree", (spelling, out.stdout, out.stderr)
+    assert not list(inside.iterdir()) and not [p for p in wt.glob("dirty-worktree-*")], "nothing may be written into the source worktree"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a directory junction is the Windows spelling of an alias to the worktree")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_destination_that_reaches_the_worktree_through_a_junction(tmp_path):
+    wt, _ = _dirty_save_repo(tmp_path)
+    (wt / "run").mkdir()
+    alias = tmp_path / "alias-run"
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(wt / "run")], capture_output=True, text=True)
+    if made.returncode != 0:
+        pytest.skip("cannot create a junction here: " + made.stderr)
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{alias}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-inside-worktree", out.stdout + out.stderr
+    assert not list((wt / "run").iterdir())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="8.3 short names exist on Windows volumes only")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_destination_spelled_with_an_8_3_short_name(tmp_path):
+    import ctypes
+    wt = tmp_path / "a-worktree-with-a-long-name"
+    wt.mkdir()
+    make_repo(wt)
+    (wt / "a-long-run-directory").mkdir()
+    buf = ctypes.create_unicode_buffer(1024)
+    if not ctypes.windll.kernel32.GetShortPathNameW(str(wt / "a-long-run-directory"), buf, 1024) or buf.value.lower() == str(wt / "a-long-run-directory").lower():
+        pytest.skip("this volume has no 8.3 short names")
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{buf.value}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-inside-worktree", out.stdout + out.stderr
+    assert not list((wt / "a-long-run-directory").iterdir())
 
 
 @dirty_save_only
