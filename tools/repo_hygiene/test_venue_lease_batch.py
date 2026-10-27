@@ -3116,6 +3116,63 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED ", se)
         self.assertFalse(self.claim_path.exists(), "the claim was released")
 
+    def test_r14_adv2_a2_a_temp_junction_into_the_run_dir_gets_no_redirect_there(self) -> None:
+        alias = self.case / "r14-temp-junction"
+        if alias.exists():
+            os.rmdir(alias)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._junction(alias, self.run_dir)
+        p, spec, sha = self._spawn_open_wait("exit1", env={"TEMP": str(alias), "TMP": str(alias)})
+        before = sha(spec.read_bytes()).hexdigest()
+        (self.run_dir / "batch.log").unlink(missing_ok=True)
+        os.link(spec, self.run_dir / "batch.log")
+        so, se = self._finish(p)
+        self.assertEqual(sha(spec.read_bytes()).hexdigest(), before)
+        self.assertEqual(p.returncode, 9, so + se)
+        self.assertEqual([d.name for d in self.run_dir.iterdir() if d.name.startswith("venue-lease-batch-close-")], [], "the redirect was made inside -RunDir through the junction")
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED ", se)
+
+    def test_r14_adv2_a1_an_alias_found_in_the_gate_wait_still_refuses_after_the_link_is_removed(self) -> None:
+        import hashlib
+        self._fresh_run_dir()
+        (self.share / "fake-agent-state.json").unlink(missing_ok=True)
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.unlink(missing_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        before = hashlib.sha256(spec.read_bytes()).hexdigest()
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), FAKE_OPEN_SLEEP="12", FAKE_OPEN_MODES="gatehold")
+        err = self.case / "r14-adv2-a1.err.txt"
+        with open(err, "w", encoding="utf-8") as ef:
+            p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=ef, text=True, env=e)
+            try:
+                self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+                time.sleep(2)
+                (self.run_dir / "batch.log").unlink(missing_ok=True)
+                os.link(spec, self.run_dir / "batch.log")
+                end = time.monotonic() + 90
+                while "BATCH_OUTPUT_ALIASED " not in err.read_text(encoding="utf-8") and time.monotonic() < end:
+                    time.sleep(0.2)
+                (self.run_dir / "batch.log").unlink()   # the link is gone before the open's result lands by name
+                [job] = [j.name[: -len(".job.ps1")] for j in (self.share / "inbox").iterdir() if j.name.startswith("lease-batch-open-")]
+                token, now = job[-12:], datetime.now(timezone.utc)
+                adm = {"gate": "fake", "mode": "lease", "label": "clear", "heavySlotHeld": "1:1001", "slot": "C:\\t\\.heavy-slots\\1", "leaseMinutes": 45, "waitedSec": 7,
+                       "leaseRequests": 2, "leaseRefusals": [], "leaseBatch": {"token": token, "leaseId": "lease-1", "seq": 1, "reused": False,
+                                                                                "untilEpoch": int(now.timestamp()) + 2700, "remainingSec": 2700}}
+                (self.share / "outbox").mkdir(parents=True, exist_ok=True)
+                (self.share / "outbox" / f"{job}.result.json").write_text(json.dumps({"jobId": job, "exitCode": 0, "endedUtc": utc_iso(now), "admission": adm, "stdout": "LEASE_BATCH_OPEN"}), encoding="utf-8")
+                so, _ = p.communicate(timeout=300)
+            finally:
+                if p.poll() is None:
+                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                    p.wait(timeout=60)
+        se = err.read_text(encoding="utf-8")
+        self.assertEqual(hashlib.sha256(spec.read_bytes()).hexdigest(), before)
+        self.assertEqual(self.leg_calls(), [], "a leg ran after the alias was found: " + so + se)
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe ran")
+        self.assertEqual(p.returncode, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ", se)
+
     def test_r14_adv_a3_the_claim_keeper_stops_writing_a_claim_file_that_became_the_input_once_the_alias_is_found(self) -> None:
         claim = self.run_dir / "bachelor.claim.json"
         p, spec, sha = self._spawn_open_wait("gatehold", "-ClaimTtlSec", "60", "-ClaimRenewSec", "1", "-CancelReconcileSec", "3",

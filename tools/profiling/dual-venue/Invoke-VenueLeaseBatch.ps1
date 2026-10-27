@@ -198,7 +198,7 @@ $deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globali
 $pwshExe = [Environment]::ProcessPath
 if (-not $Purpose) { $Purpose = "Invoke-VenueLeaseBatch $(Split-Path -Leaf $RunDir)" }
 
-$script:RunOutputAliased = $false; $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null
+$script:RunOutputAliased = $false; $script:openAliasHit = $null; $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null
 function L([string]$Message) {
     $line = "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message"
     # r13 (adversary r13 pass 2 A1): once an accepted input was found to BE a runner output after the open, nothing more is written into -RunDir (batch.log may be that input); stderr carries the line
@@ -465,8 +465,12 @@ function Test-OpenOutputAlias {
     # r14 (Dot 2e6eb21d; adversary r13 pass 3 A1, A2): the guard run once the open returns, WHATEVER it returned (a failed open, one with no lease batch, one still held in the gate, one
     # held to the deadline), before anything more is written. A location hit means a runner output IS an accepted input, so it turns the write suppression on by itself: the log and
     # the receipt go to stderr, the close job file to a fresh folder under TEMP, the ledger row is said, not appended. Which typed stop the run then takes is decided apart from it.
+    # adversary r14 pass 2 A1: a location hit is sticky. The gate-wait guard can find it and a later call find the link gone, but the keeper is stopped and the writes are
+    # suppressed by then, so the run must still end in the refusal: no probe or leg ever runs once an alias was found.
+    if ($script:openAliasHit) { return $script:openAliasHit }
     $hit = Get-InputOutputRefusal
     if ($hit -and $hit.kind -cne 'content' -and -not $script:RunOutputAliased) {
+        $script:openAliasHit = $hit
         # Suppression first, so nothing below can leave it off: no batch.log at all until a redirect exists (the final append then fails, is counted and said on stderr).
         $script:RunOutputAliased = $true; $script:batchLog = $null
         # adversary r14 A3: the claim keeper rewrites the claim file in place, and that file may be the input too: it is stopped now, not after the close. The claim can then lapse
@@ -477,9 +481,12 @@ function Test-OpenOutputAlias {
         $redirect = Join-Path ([IO.Path]::GetTempPath()) "venue-lease-batch-close-$token-$([guid]::NewGuid().ToString('N'))"
         $script:jobDir = $redirect
         try {
-            # TEMP set inside -RunDir would put the redirect back in it: refused (a junction there still yields a folder this run just made, which holds no input)
-            $rd = Remove-TrailingSeparator $RunDir; if (-not $rd.EndsWith('\')) { $rd += '\' }
-            if ([IO.Path]::GetFullPath($redirect).StartsWith($rd, [StringComparison]::OrdinalIgnoreCase)) { throw "TEMP ($([IO.Path]::GetTempPath())) is inside -RunDir" }
+            # TEMP set inside -RunDir would put the redirect back in it: refused, by spelling and (adversary r14 pass 2 A2: a junction to -RunDir) by the physical path of both
+            foreach ($pair in @(@($RunDir, [IO.Path]::GetTempPath()), @((Get-PhysicalPath $RunDir), (Get-PhysicalPath ([IO.Path]::GetTempPath()))))) {
+                $rd = Remove-TrailingSeparator $pair[0]; if (-not $rd.EndsWith('\')) { $rd += '\' }
+                $tp = Remove-TrailingSeparator ([IO.Path]::GetFullPath($pair[1])); if (-not $tp.EndsWith('\')) { $tp += '\' }
+                if ($tp.StartsWith($rd, [StringComparison]::OrdinalIgnoreCase)) { throw "TEMP ($([IO.Path]::GetTempPath())) is inside -RunDir (physical $($pair[1]))" }
+            }
             $null = New-Item -ItemType Directory -Path $redirect -ErrorAction Stop; $script:batchLog = Join-Path $redirect 'batch.log'
         }
         catch { [Console]::Error.WriteLine("BATCH_OUTPUT_REDIRECT_FAILED $redirect ($($_.Exception.Message -replace '\s+', ' ')): the close job cannot be written; the result line is on stdout only") }
