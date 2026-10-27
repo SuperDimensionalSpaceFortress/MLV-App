@@ -28,6 +28,7 @@
 # -PerCoreEnforce / -PerCoreThresholdPercent (VENUE-QUIET-PER-CORE-VERDICT-1) mirror the gate's switches of the same name: with -PerCoreEnforce a mean-QUIET probe whose busiest fast core
 # is at or over the threshold counts as BUSY here exactly as the gate decided it, by the gate's own Get-VenuePerCoreVerdict (lifted by AST, no second copy; DECISION_LIFT_FAILED when it
 # cannot be). Off (the default) the mean rule alone decides, as before. The retained raw file does not record which switch the gate ran with, so the caller passes the one it used.
+# -Json records the two settings as per_core_enforce and per_core_threshold_percent beside threshold_percent (additive keys; the schema string is unchanged).
 # Exit codes: 0 summarized; 2 usage error, PROBE_PATH_UNC or PROBE_PATH_IN_VENUE_SHARE; 3 DECISION_LIFT_FAILED.
 [CmdletBinding()]
 param(
@@ -186,6 +187,8 @@ if ($Json) {
     [ordered]@{
         schema = 'mlv-app/venue-busy-probe-summary/v1'
         threshold_percent = $ThresholdPercent
+        per_core_enforce = [bool]$PerCoreEnforce
+        per_core_threshold_percent = $PerCoreThresholdPercent
         busy_probes = $busy; quiet_skipped = $quietSkipped; unknown_skipped = $unknownSkipped; unreadable = $unreadable
         projects = $projects
         gpu_heavy = $gpu

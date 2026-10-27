@@ -9784,6 +9784,32 @@ class VenueBusyProbeSummaryTests(unittest.TestCase):
         self.assertEqual(j["projects"][0]["examples"][0], {"name": "python", "script": "bench.py", "owner": "BACHELOR\\layib"})
         self.assertEqual([g["pid"] for g in j["gpu_heavy"]], [16372, 16892])
 
+    def test_json_records_the_per_core_settings_next_to_the_mean_threshold_default_off(self) -> None:
+        # VENUE-BUSY-PROBE-SUMMARY-SETTINGS-1: a reader of the JSON must be able to tell which per-core decision produced busy_probes
+        self.fixtures()
+        proc = self.summarize("-ProbeDir", str(self.probes), "-Json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        j = json.loads(proc.stdout)
+        self.assertIs(j["per_core_enforce"], False)
+        self.assertEqual(j["per_core_threshold_percent"], 60.0)
+        # the existing keys and their values are unchanged
+        self.assertEqual(j["schema"], "mlv-app/venue-busy-probe-summary/v1")
+        self.assertEqual(j["threshold_percent"], 20.0)
+        self.assertEqual((j["busy_probes"], j["quiet_skipped"], j["unknown_skipped"], j["unreadable"]), (3, 1, 0, 0))
+        self.assertEqual([p["project"] for p in j["projects"]], ["mlv-app", "unknown(no-identity)", "unknown"])
+        self.assertEqual([g["pid"] for g in j["gpu_heavy"]], [16372, 16892])
+
+    def test_json_records_the_per_core_settings_the_caller_passed(self) -> None:
+        self.fixtures()
+        proc = self.summarize("-ProbeDir", str(self.probes), "-Json", "-PerCoreEnforce", "-PerCoreThresholdPercent", "45")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        j = json.loads(proc.stdout)
+        self.assertIs(j["per_core_enforce"], True)
+        self.assertEqual(j["per_core_threshold_percent"], 45.0)
+        self.assertEqual(j["schema"], "mlv-app/venue-busy-probe-summary/v1")
+        self.assertEqual(j["threshold_percent"], 20.0)
+        self.assertEqual(list(j)[:4], ["schema", "threshold_percent", "per_core_enforce", "per_core_threshold_percent"])
+
     def test_include_quiet_keeps_the_quiet_probes(self) -> None:
         self.fixtures()
         proc = self.summarize("-ProbeDir", str(self.probes), "-IncludeQuiet")
