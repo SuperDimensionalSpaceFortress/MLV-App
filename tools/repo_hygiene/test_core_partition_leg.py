@@ -160,7 +160,7 @@ if ($m -eq 'directory') { [void](New-Item -ItemType Directory -Path $r) }
 elseif ($m -eq 'foreign-key') { [IO.File]::WriteAllText($r, (Get-Mac 'a-key-the-job-never-handed-out')) }
 elseif ($m -eq 'pre-r8-text') { [IO.File]::WriteAllText($r, 'ready') }
 elseif ($m -eq 'empty') { [IO.File]::WriteAllText($r, '') }
-elseif ($m -eq 'good') { [IO.File]::WriteAllText($r, (Get-Mac ([string]$env:MLV_CP_NONCE))) }
+elseif ($m -like 'good*') { [IO.File]::WriteAllText($r, (Get-Mac ([string]$env:MLV_CP_NONCE))) }
 Start-Sleep -Seconds 2
 """
 MARKER_DRIVER = r"""
@@ -190,7 +190,7 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     try { . ([scriptblock]::Create($pre)) } finally { $env:ProgramFiles = $pf }
     [IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, "26.10.2026,01:00:02,x,70.0,45.0,No,No`n")
     $resultPath = Join-Path $Work 'result.json'
-    if ($mode -eq 'good') {
+    if ($mode -like 'good*') {
         # r11 B1: the stand-in helper writes no record, so the driver writes the genuine helper's (signed under the job's key, the runner's pid,
         # the app's last alive poll 110 ms ago and its observed exit on the job's monotonic base); without it the window end is unverified
         $now = [DateTime]::UtcNow
@@ -208,12 +208,14 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     . ([scriptblock]::Create($regions[1]))
     # r13b (A2 binding): the metrics read the same run log the start verdict read
     $rawLog = $(if (Test-Path -LiteralPath (Join-Path $Work 'run.log')) { [IO.File]::ReadAllText((Join-Path $Work 'run.log')) } else { "playback_smoke.start session=1 worker_threads=16`n" })
+    # r13b (adversary r13b e02b23e3 A1): good-rebound's metrics read a different snapshot than the start verdict did
+    if ($mode -eq 'good-rebound') { $rawLog = $rawLog.Replace('worker_threads=16', 'worker_threads=8') }
     . ([scriptblock]::Create($regions[2]))
     $ps = $global:cpSaved.feed.summary; $sc = $corePartitionScalars
     $out[$mode] = [ordered]@{
         started = ($null -ne $corePartitionHelper); ready = [bool]$corePartitionHelperLaunch.ready; readyWhy = [string]$corePartitionHelperLaunch['readyWhy']
         notReady = [bool]$corePartitionHelperNotReady; helperWhy = [string]$corePartitionHelperWhy; publishedNotReady = [bool]$global:cpSaved.helperNotReady
-        published = @($ps.rows, $ps.pkgWattsMean, $ps.pkgTempCMean, [string]$ps.reasons['pkgWattsMean']); pkg = @($sc.pkgWattsMean, $sc.pkgWattsMax, $sc.pkgTempCMean, $sc.pkgTempCMax)
+        published = @($ps.rows, $ps.pkgWattsMean, $ps.pkgTempCMean, [string]$ps.reasons['pkgWattsMean']); startWhy = [string]$global:cpSaved.feed.startWhy; pkg = @($sc.pkgWattsMean, $sc.pkgWattsMax, $sc.pkgTempCMean, $sc.pkgTempCMax)
         topo = $sc.corePartitionTopologyOk; why = [string]$sc.corePartitionNullReasons; errors = @($corePartitionErrors)
     }
     if ($null -ne $corePartitionHelper -and -not $corePartitionHelper.HasExited) { $corePartitionHelper.Kill() }
@@ -755,7 +757,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         work.mkdir()
         driver = self.tmp / "marker-driver.ps1"
         driver.write_text(LIFT + MARKER_DRIVER, encoding="ascii")
-        modes = ["start-throws", "directory", "foreign-key", "pre-r8-text", "empty", "good"]
+        modes = ["start-throws", "directory", "foreign-key", "pre-r8-text", "empty", "good", "good-rebound"]
         proc = run_pwsh(["-File", str(driver)], env_extra={"CP_JOB": str(self.out["a"]), "CP_OPEN": OPEN, "CP_CLOSE": CLOSE, "CP_FAKE_HELPER": MARKER_HELPER,
                                                            "CP_WORK": str(work), "CP_MODES": ",".join(modes), "CP_GEN": str(GENERATOR)})
         self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
@@ -788,6 +790,13 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertNotIn("threw", good, good)
         self.assertEqual([good["ready"], good["notReady"], good["readyWhy"]], [True, False, ""], good)
         self.assertEqual(good["published"][:3], [1, 45.0, 70.0], f"the right marker no longer opens the feed: {good}")
+        # r13b (adversary r13b e02b23e3 A1): the same good run whose metrics read a different run-log text than the start verdict: on e02b23e3
+        # core-partition.json kept rows 1 / 45 W / 70 C with startWhy null; now it is published again refused, as the summary is
+        rebound = got["good-rebound"]
+        self.assertNotIn("threw", rebound, rebound)
+        self.assertEqual(rebound["published"], [None, None, None, "run-log-snapshot-mismatch"], rebound)
+        self.assertEqual(rebound["startWhy"], "run-log-snapshot-mismatch", rebound)
+        self.assertEqual(rebound["pkg"], [None] * 4, rebound)
 
     def test_the_jobs_key_reaches_only_the_helper(self) -> None:
         """sol r6 CP-06: the per-job key is drawn at run time, handed to the helper by environment (never the command line), never traced or

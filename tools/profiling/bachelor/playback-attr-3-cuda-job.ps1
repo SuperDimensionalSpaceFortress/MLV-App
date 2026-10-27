@@ -6019,7 +6019,8 @@ try {
     $corePartitionPublishWhy = 'core-partition-json-unpublished'
     try {
         [void](New-AttrCudaDirectory -Path $Pub)
-        Save-Json ([ordered]@{
+        # r13b (adversary r13b e02b23e3 A1): the record is kept, so a later snapshot mismatch can publish it again refused
+        $corePartitionRecord = [ordered]@{
             schema = 'mlv-app/core-partition/v1'; card = 'BACHELOR-CORE-PARTITION-AB-1'
             requested = [ordered]@{ benchMask = $corePartitionJob.affinityRequested; loadMask = $(if ($CorePartitionLoadMask -ne 0) { Format-CorePartitionMask $CorePartitionLoadMask } else { $null }); loadThreads = $CorePartitionLoadThreads; helperMask = (Format-CorePartitionMask $CorePartitionHelperMask) }
             job = $corePartitionJob
@@ -6054,7 +6055,8 @@ try {
             }
             perCoreTemperature = 'not in the feed (column 3 is the package / hottest core); adding columns is the Bachelor session''s work'
             errors = $corePartitionErrors.ToArray()
-        }) (Join-Path $Pub 'core-partition.json')
+        }
+        Save-Json $corePartitionRecord (Join-Path $Pub 'core-partition.json')
         $corePartitionPublishWhy = $null
     } catch { $corePartitionErrors.Add("publish: $([string]$_.Exception.Message)") }
     Write-JobTrace "step core-partition done helperWhy=$corePartitionHelperWhy publishWhy=$corePartitionPublishWhy jobAffinityRestored=$($corePartitionJob.affinityRestored) errors=$($corePartitionErrors.Count)"
@@ -6067,8 +6069,16 @@ Write-JobTrace "step smoke-launch done rc=$smokeRc"
     $text = Edit-DualVenueTemplate $text $cpMetricsAnchor ($cpOpen + "`n" + @'
 # r13b (adversary r13b 82510ec1 A2): the window's start was judged on the core-partition read of the run log ($cpRunLogText, hash-checked at
 # the smoke's end); the metrics resolve and read it again ($rawLog). Two texts that differ did not come from one snapshot, so the start verdict
-# does not hold for these metrics: every window field is refused (run-log-snapshot-mismatch).
-if (-not [string]::Equals([string]$rawLog, [string]$cpRunLogText, [StringComparison]::Ordinal)) { $corePartitionFeedSummary = Get-CorePartitionStartBoundFeed $corePartitionFeedSummary @{ why = 'run-log-snapshot-mismatch' } }
+# does not hold for these metrics: every window field is refused (run-log-snapshot-mismatch). adversary r13b (e02b23e3) A1: in core-partition.json
+# too, which is published again with the refused summary and startWhy run-log-snapshot-mismatch (a failed re-publish is core-partition-json-unpublished).
+if (-not [string]::Equals([string]$rawLog, [string]$cpRunLogText, [StringComparison]::Ordinal)) {
+    $corePartitionFeedSummary = Get-CorePartitionStartBoundFeed $corePartitionFeedSummary @{ why = 'run-log-snapshot-mismatch' }
+    try {
+        if ($null -eq $corePartitionRecord) { throw 'no core-partition record to refuse' }
+        $corePartitionRecord.feed.summary = $corePartitionFeedSummary; $corePartitionRecord.feed.startWhy = 'run-log-snapshot-mismatch'
+        Save-Json $corePartitionRecord (Join-Path $Pub 'core-partition.json')
+    } catch { $corePartitionPublishWhy = 'core-partition-json-unpublished'; $corePartitionErrors.Add("republish: $([string]$_.Exception.Message)") }
+}
 $corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs
 '@ + "`n" + $cpClose + "`n" + $cpMetricsAnchor)
     $cpMetricsAt = $text.IndexOf($cpMetricsAnchor, [StringComparison]::Ordinal)
