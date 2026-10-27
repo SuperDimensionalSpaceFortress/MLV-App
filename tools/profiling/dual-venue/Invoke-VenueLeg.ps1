@@ -411,10 +411,17 @@ try {
     }
     # LOOK-ASSIST-FILM-FLAVOR-2 r2: a look leg's optional receipt (the GUI smoke applies it before playback). Its bytes are the blob COMMITTED at the admission
     # head (offline test mode: the repo's HEAD), never the working copy, and must hash to look.receiptSha256, which legSpecSha256 binds.
+    # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: a capture-free pace leg (a speed leg forcing Look Assist) may name the same receipt in
+    # generatorArgs.lookReceipt / lookReceiptSha256, read the same way. Named anywhere else (a look leg, or a speed leg not forcing Look Assist) it is refused, never ignored.
     $lookReceiptPath = $null
-    if ($isLook) {
+    $paceReceiptLook = $null
+    if ($null -ne $spec.PSObject.Properties['generatorArgs'] -and ($spec.generatorArgs.PSObject.Properties['lookReceipt'] -or $spec.generatorArgs.PSObject.Properties['lookReceiptSha256'])) {
+        if ($isLook -or -not ($spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist)) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
+        $paceReceiptLook = [pscustomobject]@{ receipt = [string]$spec.generatorArgs.lookReceipt; receiptSha256 = [string]$spec.generatorArgs.lookReceiptSha256 }
+    }
+    if ($isLook -or $null -ne $paceReceiptLook) {
         $receiptCommit = if ($OfflineTestMode) { [string](& git -C $RepoRoot rev-parse --verify HEAD 2>$null) } else { [string]$sources.headCommit }
-        $lookReceipt = Read-DvCommittedLookReceipt -RepoRoot $RepoRoot -Commit $receiptCommit.Trim() -Look $spec.look
+        $lookReceipt = Read-DvCommittedLookReceipt -RepoRoot $RepoRoot -Commit $receiptCommit.Trim() -Look $(if ($isLook) { $spec.look } else { $paceReceiptLook })
         if (-not $lookReceipt.ok) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
         if ($lookReceipt.present) {
             $lookReceiptPath = Join-Path $workDirResolved "$jobStem.look-receipt.marxml"
@@ -463,6 +470,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['warmReuseMissDump'] -and [bool]$spec.generatorArgs.warmReuseMissDump) { $gen['WarmReuseMissDump'] = $true }
         # CUDA-HEADROOM-1: an unpaced throughput leg (no pace guard, drop-frame off), for any leg; judged below by the app's own pace_unpaced line.
         if ($spec.generatorArgs.PSObject.Properties['unpaced'] -and [bool]$spec.generatorArgs.unpaced) { $gen['Unpaced'] = $true }
+        # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the #680 prep pointwise fast path's kill switch, for any leg.
+        if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and [bool]$spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }
@@ -473,6 +482,8 @@ try {
             $gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true
             if ($spec.generatorArgs.PSObject.Properties['lookFlavor']) { $gen['LookFlavor'] = [string]$spec.generatorArgs.lookFlavor }
             if ($spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }
+            # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the pace leg's committed look receipt (read and bound above).
+            if ($null -ne $lookReceiptPath) { $gen['LookReceiptPath'] = $lookReceiptPath }
         }
     }
     # PLAYBACK-VISUAL-INSPECTION-1: the post-measurement window capture, for every speed leg that does not opt out.
