@@ -3112,14 +3112,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # ask again until the deadline. The runner has no seam that slows a real hash, so the budget's derivation is pinned in the source: set from the grant time, handed to the artifact read, cleared after.
     def test_artifact_preflight_adv_a2_the_post_claim_guard_hashes_inside_the_claim_guard_budget(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")
-        grant = text.index("$script:claimGuardDeadlineUtc = $(if ($req.granted) { $grantReadUtc.AddSeconds($ClaimTtlSec - $ClaimRenewSec) } else { $null })")
-        call, clear = text.index("$hit = Get-InputOutputRefusal", grant), text.index("$script:claimGuardDeadlineUtc = $null", grant)
+        # r3: the budget is New-GuardBudget's (a Stopwatch started at the grant read), so the claim guard and the post-open guard count on one monotonic clock each
+        grant = text.index("$script:guardBudget = $(if ($req.granted) { New-GuardBudget ($ClaimTtlSec - $ClaimRenewSec) ")
+        self.assertLess(text.index("$grantReadUtc = [DateTime]::UtcNow", grant - 2000), grant)
+        call, clear = text.index("$hit = Get-InputOutputRefusal", grant), text.index("$script:guardBudget = $null", grant)
         self.assertLess(grant, call)
         self.assertLess(call, clear)
         self.assertLess(clear, text.index("if ($hit) {", grant))
+        self.assertIn("clock = [Diagnostics.Stopwatch]::StartNew()", text[text.index("function New-GuardBudget"):text.index("function Get-InputContentRefusal")])
         guard = text[text.index("function Get-InputContentRefusal"):text.index("function Stop-InputIsOutput")]
         # adversary r2 A1: the manifest read AND the hash come out of ONE share of the budget (a read of up to 30 s, the rest for the hash), and a share too small for both is a typed refusal
-        self.assertIn("$script:claimGuardDeadlineUtc - [DateTime]::UtcNow", guard)
+        self.assertIn("($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds)", guard)
         self.assertIn("-TimeoutSec $manifestSec -VerifyArtifacts -ArtifactTimeoutSec ($share - $manifestSec)", guard)
         self.assertIn("$manifestSec = [int][Math]::Min(30, $share - 1)", guard)
         self.assertIn("if ($share -lt 2) { return", guard)
@@ -3167,6 +3170,57 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("BATCH_USAGE -StagedBuildProbeScript and -ArtifactProbeScript are offline test seams", r.stderr)
         self.assertEqual(self.kinds(), [])
+
+    # r3 (Dot 780783c4; hub ACK 6449516541): once the open returns, the guard re-reads and re-hashes every build on the LEASE's time. On f0e12522 it had a fixed 300 s for that while
+    # the lease end is clamped (-LeaseCapSec), so a healthy but slow re-hash left less than the leg budget: LEG_BUDGET_EXCEEDS_LEASE, a lease charged with no leg. The guard is now
+    # bounded by the lease's room less -LeaseMarginSec, the leg budget and 1 s, and a re-hash that cannot fit is refused typed while the leg budget is still left. The card's numbers
+    # (cap 120, leg 60, margin 0, a 70 s hash) are scaled to cap 95 and a 40 s hash so the case stays near 30 s (-LegBudgetSec cannot go under 60). The hash is slow only once the
+    # open was answered (the fake agent's state file exists), so the preflight and the claim guard stay fast.
+    def _post_open_hash_run(self, hash_sec: int, **env: str) -> tuple[subprocess.CompletedProcess, float]:
+        state = self.share / "fake-agent-state.json"
+        self.assertFalse(state.exists())
+        probe = self.case / "artifact-probe-post-open.ps1"
+        probe.write_text("param($items)\n" + f"if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ [Threading.Thread]::Sleep({hash_sec * 1000}) }}\n", encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "95", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
+                          "-ArtifactProbeScript", str(probe), **env)
+        ticks = {}
+        for line in self.events_raw():
+            t, kind, rest = line.split(" ", 2)
+            if kind == "UMRUN":
+                ticks.setdefault("open" if rest.startswith("lease-batch-open-") else "close", int(t))
+        self.assertIn("open", ticks, r.stdout + r.stderr)
+        self.assertIn("close", ticks, r.stdout + r.stderr)
+        return r, (ticks["close"] - ticks["open"]) / 1e7
+
+    def test_artifact_preflight_r3_a_slow_post_open_rehash_is_refused_typed_before_the_leg_budget_is_spent(self) -> None:
+        r, held = self._post_open_hash_run(40)
+        log = self.run_dir / "batch.log"
+        text = r.stdout + r.stderr + (log.read_text(encoding="utf-8", errors="replace") if log.exists() else "")
+        self.assertEqual(r.returncode, 2, text)
+        self.assertNotIn("LEG_BUDGET_EXCEEDS_LEASE", text, "the re-hash spent the lease's leg budget and the lease was charged with no leg")
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("could not be hashed", r.stderr)
+        self.assertIn("the lease's room after the open", r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"]), ("SHARE_UNREACHABLE", 0))
+        self.assertEqual(self.leg_calls(), [])
+        # refused while a leg budget was still left in the 95 s lease, not after the 40 s hash
+        self.assertLess(held, 95 - 60, f"the lease was held {held:.1f} s before the close: the re-hash ran into the leg budget")
+
+    def test_artifact_preflight_r3_a_fast_post_open_rehash_still_runs_the_leg(self) -> None:
+        r, held = self._post_open_hash_run(0)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["legsRan"]), ("ALL_LEGS_DONE", 1, 1))
+        self.assertEqual(len(self.leg_calls()), 1)
+
+    def test_artifact_preflight_r3_a_lease_with_no_room_for_one_leg_skips_the_rehash_and_ends_as_before(self) -> None:
+        # noLeg: no leg can run on a lease shorter than the leg budget, so its builds are not re-hashed on its time; the leg loop ends LEG_BUDGET_EXCEEDS_LEASE as it always did, at once
+        r, held = self._post_open_hash_run(40, FAKE_LEASE_REMAIN="30")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"]), ("LEG_BUDGET_EXCEEDS_LEASE", 0))
+        self.assertLess(held, 20, f"the lease was held {held:.1f} s: the 40 s re-hash ran on a lease that could hold no leg")
 
     def test_artifact_preflight_the_artifact_names_are_the_ones_the_leg_job_derives(self) -> None:
         script = (f"Import-Module '{ROOT / 'tools' / 'profiling' / 'bachelor' / 'AttrCudaArtifacts.psm1'}' -Force -DisableNameChecking\n"

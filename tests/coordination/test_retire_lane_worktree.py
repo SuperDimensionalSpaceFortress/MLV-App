@@ -3079,6 +3079,17 @@ UNRESOLVED_EXECUTED_SITES = {
          "Invoke-Bounded runs its caller's [scriptblock] on a worker runspace; both callers in this file pass a { } literal (a Test-Path / "
          "Get-FileHash read), which the AST scans as code"),
     ],
+    "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1": [
+        ("[scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript))",
+         "LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r2 offline test seam: the text of the -StagedBuildProbeScript file its caller names. :189 refuses both seams "
+         "(BATCH_USAGE, exit 2) whenever -UmRunScript is the real um-run.ps1, by full path or by content hash (:184-185), before either scriptblock is compiled; "
+         ":190 refuses a seam file that does not exist. The block is only handed to Get-VenueStagedBuildManifest -ProbeScript, which runs its .ToString() on the "
+         "bounded manifest-read worker runspace (VenueChain.psm1 Invoke-VenueBoundedRead); production passes no seam and never reaches this site"),
+        ("[scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript))",
+         "the second r2 seam, the same guard: the text of the -ArtifactProbeScript file its caller names, refused with the real um-run.ps1 (:189, by path or by "
+         "content hash :184-185) and when absent (:190) before it is compiled, and only handed to Get-VenueStagedBuildManifest -ArtifactProbeScript, which runs it "
+         "on the bounded artifact-hash worker runspace (Invoke-VenueBoundedRead, inside the call's own -ArtifactTimeoutSec)"),
+    ],
     "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
         ("[void]$ps.AddScript($Script.ToString())",
          "the same Invoke-Bounded pattern: every caller in this file hands it a { } literal share read, which the AST scans as code"),
@@ -3176,6 +3187,22 @@ def test_launcher_census_every_executed_string_built_at_run_time_is_classified()
     problems = _census_problems(src, {}, {}, kinds=("unresolved",), unresolved_inventory=UNRESOLVED_EXECUTED_SITES)
     assert not problems, ("\n".join(problems) + "\nBuild the executed string from literals the census can read, or classify the site in "
                           "UNRESOLVED_EXECUTED_SITES with what the string is built from (drop an entry whose site is gone).")
+
+
+def test_launcher_census_the_lease_batch_probe_seams_are_classified_per_site_and_a_third_executed_string_still_fails():
+    """LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r3: the two r2 seam sites are classified one by one, not the file: one more [scriptblock]::Create in it fails."""
+    path = "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1"
+    text = (REPO / path).read_text(encoding="utf-8")
+    inventory = {path: UNRESOLVED_EXECUTED_SITES[path]}
+    assert len(inventory[path]) == 2
+    assert not _census_problems({path: text}, {}, {}, kinds=("unresolved",), unresolved_inventory=inventory)
+    # the classification rests on the guard: both seams are refused with the real um-run.ps1, and a missing seam file, BEFORE either is compiled
+    refuse = text.index("if ($umRunIsReal -and ($StagedBuildProbeScript -or $ArtifactProbeScript)) { Stop-Usage")
+    exists = text.index("foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object { $_ }) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage")
+    assert refuse < exists < min(text.index(pin) for pin, _why in inventory[path])
+    third = text + "\n$extra = [scriptblock]::Create([IO.File]::ReadAllText($LegScript))\n& $extra\n"
+    problems = _census_problems({path: third}, {}, {}, kinds=("unresolved",), unresolved_inventory=inventory)
+    assert len(problems) == 1 and "unclassified launch site" in problems[0] and "($LegScript)" in problems[0], problems
 
 
 def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir():
