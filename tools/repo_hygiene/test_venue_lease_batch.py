@@ -267,9 +267,13 @@ def _wait_pid_gone(pid: int, timeout_s: float) -> bool:
     return not _pid_alive(pid)
 
 
+PS_SINGLE_QUOTES = "'‘’‚‛"   # the five characters PowerShell's tokenizer treats as a single quote
+
+
 def psq(value: object) -> str:
-    """`value` for the inside of a PowerShell single-quoted literal: every embedded ' is doubled (a temp dir or a message may carry an apostrophe)."""
-    return str(value).replace("'", "''")
+    """`value` for the inside of a PowerShell single-quoted literal: every embedded single-quote character (the ASCII one and the four typographic ones PowerShell also accepts) is
+    doubled, so a temp dir or a message that carries an apostrophe cannot end the literal."""
+    return "".join(c * 2 if c in PS_SINGLE_QUOTES else c for c in str(value))
 
 
 def utc_iso(dt: datetime) -> str:
@@ -2450,6 +2454,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         res = batch_result(r.stdout)
         self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
         self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_r2_adv_a1_psq_escapes_every_quote_character_powershell_treats_as_a_single_quote(self) -> None:
+        # adversary r2 A1 (advisory, introduced by psq): PowerShell's tokenizer also takes U+2018, U+2019, U+201A and U+201B as single quotes, so a temp dir such as C:\temp\o<U+2019>Brien
+        # ended the literal early even with the ASCII quote doubled. Each character, alone and inside a path, must parse and come back unchanged.
+        samples = ["C:\\temp\\o'Brien", "C:\\temp\\o\u2018Brien", "C:\\temp\\o\u2019Brien", "C:\\temp\\o\u201aBrien", "C:\\temp\\o\u201bBrien", "\u2019\u2019", "plain"]
+        lines = [f"$v = '{psq(s)}'; ($v.ToCharArray() | ForEach-Object {{ [int]$_ }}) -join ','" for s in samples]
+        script = self.case / "psq-probe.ps1"
+        script.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), [",".join(str(ord(c)) for c in s) for s in samples], r.stdout + r.stderr)
 
     def test_r2_cov_a_jsonl_append_failure_whose_diagnostic_cannot_be_logged_rewrites_batch_receipt_with_the_count_and_exits_13(self) -> None:
         # batch-01.json is written first (count 0) and succeeds; the batches.jsonl append fails (a directory); its RECEIPT_PERSIST_FAILED line cannot be logged (batch.log held), which bumps
