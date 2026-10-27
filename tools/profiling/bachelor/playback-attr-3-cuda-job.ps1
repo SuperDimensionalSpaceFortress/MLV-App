@@ -4490,7 +4490,7 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $
 # P-CPU readings whose Parking Status is non-zero. $Samples: @{ app; m; inst = @('0,0', ...); freq = @(); perf = @(); park = @() } each.
 # r9 (Dot 4 = adversary r8 aeacec83 A4): with $AliveMs (the helper's monotonic ms at the last poll that saw the measured app alive) a sample counts
 # only when its own monotonic stamp m parses and is at or before it, so a sample taken after the app exited (before the next poll saw it gone)
-# is not the app's. The residual endpoint error is one poll interval (core-partition.json measured.endpointErrorBoundMs).
+# is not the app's. The residual endpoint error is the gap from that poll to the one that saw it gone (core-partition.json measured.endpointErrorBoundMs).
 function Get-CorePartitionCounterSummary($Samples, [int64]$PMask, [int64]$EMask, $AliveMs = $null) {
     $pm = [Collections.Generic.List[double]]::new(); $em = [Collections.Generic.List[double]]::new()
     $pk = 0; $pn = 0; $n = 0
@@ -4702,7 +4702,12 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     # aliveMs is the monotonic ms of the last poll that saw it alive; without it no sample or load can be clipped to the exit (coverage-unverified).
     if ($null -eq $a.gone -or $null -eq $a.goneMs) { return @{ why = $(if ([string]$Helper.endedBy -eq 'stop-file') { 'coverage-stop-before-runner-exit' } else { 'coverage-ended-before-runner-exit' }) } }
     if ($null -eq $a.aliveMs -or $a.aliveMs -gt $a.goneMs) { return @{ why = 'coverage-unverified' } }
-    @{ why = $null; aliveMs = $a.aliveMs }
+    # adversary r9 (5592421d) A2: the app exited between its last alive poll and the poll that saw it gone, so that gap (goneMs - aliveMs) IS the
+    # endpoint error bound (endpointMs, published as measured.endpointErrorBoundMs); over the 1000 ms CLOCK TOLERANCE (a descheduled helper) the
+    # uncovered tail is too long to accept: coverage-endpoint-gap.
+    $endpointMs = $a.goneMs - $a.aliveMs
+    if ($endpointMs -gt 1000) { return @{ why = 'coverage-endpoint-gap'; endpointMs = $endpointMs } }
+    @{ why = $null; aliveMs = $a.aliveMs; endpointMs = $endpointMs }
 }
 
 # PURE. The summary scalars from the helper's record (or $null when it wrote none), the feed summary and the requested masks.
@@ -4967,6 +4972,8 @@ public static class MlvCorePartitionLoad {
     # r9 (Dot 1 = adversary r8 aeacec83 A1): each pass polls every tracked process BEFORE it looks for the stop file, so the job's stop (written
     # after the runner saw the app exit) finds the exit observed (goneUtcTicks + monotonic goneMs, the coverage end); a stop that arrives while the
     # app is alive leaves it unobserved, which the job refuses (coverage-stop-before-runner-exit). aliveMs: the monotonic ms of the last poll that saw it alive.
+    # adversary r9 (5592421d) A1: the stop file is looked for only after the pass's same-path enumeration too, so the final pass also records a
+    # process that started since the previous enumeration (it is then refused as an overlap when it was alive beside the app).
     while ($true) {
         [void](& $clk)
         if ($cw.ElapsedMilliseconds -ge $deadline) { $rec.endedBy = 'deadline'; break }
@@ -4981,7 +4988,6 @@ public static class MlvCorePartitionLoad {
                 $q.r.goneUtcTicks = & $clk; $q.r.goneMs = $cw.ElapsedMilliseconds; $live.Remove($k)
             }
         }
-        if (Test-Path -LiteralPath $stop) { $rec.endedBy = 'stop-file'; break }
         if ($null -eq $launchUtc -and $launchFile -and (Test-Path -LiteralPath $launchFile)) {
             try { $launchUtc = [DateTime]::new([int64]([IO.File]::ReadAllText($launchFile).Trim()), [DateTimeKind]::Utc) } catch { }
         }
@@ -5003,6 +5009,7 @@ public static class MlvCorePartitionLoad {
                 }
             }
         }
+        if (Test-Path -LiteralPath $stop) { $rec.endedBy = 'stop-file'; break }
         if ([DateTime]::UtcNow -ge $nextSample) {
             $nextSample = $nextSample.AddSeconds(1)
             try {
@@ -5800,6 +5807,7 @@ try {
     $corePartitionPublishWhy = 'core-partition-json-unpublished'
     try {
         [void](New-AttrCudaDirectory -Path $Pub)
+        $cpAppVerdict = Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs
         Save-Json ([ordered]@{
             schema = 'mlv-app/core-partition/v1'; card = 'BACHELOR-CORE-PARTITION-AB-1'
             requested = [ordered]@{ benchMask = $corePartitionJob.affinityRequested; loadMask = $(if ($CorePartitionLoadMask -ne 0) { Format-CorePartitionMask $CorePartitionLoadMask } else { $null }); loadThreads = $CorePartitionLoadThreads; helperMask = (Format-CorePartitionMask $CorePartitionHelperMask) }
@@ -5808,9 +5816,10 @@ try {
             helperWhy = $corePartitionHelperWhy
             helperNotReady = $corePartitionHelperNotReady
             # r9 (Dot 4): the samples and load are clipped to the helper's last poll that saw the app alive, so the window's end is known to within
-            # one poll interval (the helper's 200 ms sleep): endpointErrorBoundMs. LIMIT, CORE-PARTITION-PROCESS-START-EVENTS-1.
-            measured = [ordered]@{ pid = $corePartitionMeasuredPid; startUtcTicks = $corePartitionMeasuredStartTicks; endUtcTicks = $corePartitionMeasuredEndTicks; jobClockSkewMs = $corePartitionJobClockSkewMs; endpointErrorBoundMs = 200 }
-            measuredApp = (Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs).why
+            # the gap between that poll and the one that saw it gone (adversary r9 5592421d A2: the measured gap, nominally one 200 ms poll interval,
+            # not a constant; null when the app evidence is refused): endpointErrorBoundMs. LIMIT, CORE-PARTITION-PROCESS-START-EVENTS-1.
+            measured = [ordered]@{ pid = $corePartitionMeasuredPid; startUtcTicks = $corePartitionMeasuredStartTicks; endUtcTicks = $corePartitionMeasuredEndTicks; jobClockSkewMs = $corePartitionJobClockSkewMs; endpointErrorBoundMs = $cpAppVerdict.endpointMs }
+            measuredApp = $cpAppVerdict.why
             helper = $corePartitionHelperRecord
             feed = [ordered]@{
                 path = $corePartitionFeedPath

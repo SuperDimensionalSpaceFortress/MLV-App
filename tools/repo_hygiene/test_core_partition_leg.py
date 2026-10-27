@@ -858,8 +858,15 @@ class CorePartitionGeneratorTests(unittest.TestCase):
                 text = lf(self.job(key))
                 self.assertIn("$cpPsi.Environment['MLV_CP_DEADLINE_MS'] = [string][int64](30000 + [double]$SmokeProcessTimeoutMs + 60000)\n", text)
                 self.assertNotIn("MLV_CP_DEADLINE_TICKS", text)
-                # r9 Dot 4: core-partition.json names the residual endpoint error bound, one helper poll interval
-                self.assertIn("endpointErrorBoundMs = 200 }", text)
+                # r9 Dot 4 + adversary r9 (5592421d) A2: core-partition.json names the residual endpoint error bound, the measured app's observed
+                # alive-to-gone gap (the measured-app verdict's endpointMs), never a constant
+                self.assertIn("endpointErrorBoundMs = $cpAppVerdict.endpointMs }", text)
+                self.assertIn("measuredApp = $cpAppVerdict.why\n", text)
+        # adversary r9 (5592421d) A1: the final pass enumerates same-path processes before it looks for the stop file
+        src = base64.b64decode(re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a")).group(1)).decode("utf-16-le")
+        loop = src[src.index("while ($true) {"):]
+        self.assertLess(loop.index("$q.r.goneMs = "), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass polls the tracked processes")
+        self.assertLess(loop.index("Get-Process -Name $appName"), loop.index("Test-Path -LiteralPath $stop"), "the stop file is looked for before the pass enumerates same-path processes")
 
 
 # --- the pure helpers, lifted from the generator by AST -------------------------------------------------------------------------------------
@@ -1747,22 +1754,27 @@ function New-R9Record([string]$Gone, [string]$GoneMs, [string]$AliveMs, [string]
 }
 $mp = @{ MeasuredPid = [int64]5000; MeasuredStartTicks = $L + 29000000; MeasuredEndTicks = $L + 230000000 }
 $r.dot1 = [ordered]@{}
-foreach ($k in @('stop-while-alive', 'deadline-while-alive', 'full-window-control')) {
+foreach ($k in @('stop-while-alive', 'deadline-while-alive', 'endpoint-gap-3400ms', 'full-window-control')) {
     $rec = switch ($k) {
         'stop-while-alive' { New-R9Record 'null' 'null' '4900' 'stop-file' }
         'deadline-while-alive' { New-R9Record 'null' 'null' '4900' 'deadline' }
+        # adversary r9 (5592421d) A2 (literal): last alive poll 20000 ms, exit seen at 23400 ms (a descheduled helper); steady clocks
+        'endpoint-gap-3400ms' { New-R9Record ([string]($L + 234000000)) '23400' '20000' 'stop-file' }
         'full-window-control' { New-R9Record ([string]($L + 230500000)) '23050' '22950' 'stop-file' }
     }
     $s = Get-CorePartitionScalars $rec $feed 4095 1044480 8 $w $null $false @mp
-    $r.dot1[$k] = @($s.benchAffinityApplied, $s.partitionLoadApplied, $s.appAffinityObserved, [string]$s.corePartitionNullReasons)
+    $r.dot1[$k] = @($s.benchAffinityApplied, $s.partitionLoadApplied, $s.appAffinityObserved, [string]$s.corePartitionNullReasons, (Test-CorePartitionMeasuredApp $rec 5000 $mp.MeasuredStartTicks $mp.MeasuredEndTicks 0).endpointMs)
 }
 # Dot 4 (= adversary r8 aeacec83 A4, literal): measured 5000 runs +3..+23 s; the helper saw it alive at 22.95 s (aliveMs), was descheduled, took a sample at
 # 24 s still tagged with 5000 (inst 0,0, 2500 MHz at 80 %), and saw it gone at 24.2 s. Control: the same sample taken at 20 s.
 $r.dot4 = [ordered]@{}
-foreach ($k in @('post-exit-sample', 'in-window-control')) {
-    $m = $(if ($k -eq 'post-exit-sample') { 24000 } else { 20000 })
+# The literal's exit seen at 24.2 s is a 1250 ms alive-to-gone gap, which r9 refuses outright (adversary r9 5592421d A2: coverage-endpoint-gap); the
+# sub-tolerance variant (exit seen at 23.9 s, the sample at 23.5 s) isolates the sample clip.
+foreach ($k in @('post-exit-sample', 'literal-gone-24200', 'in-window-control')) {
+    $m = $(switch ($k) { 'post-exit-sample' { 23500 } 'literal-gone-24200' { 24000 } default { 20000 } })
+    $gm = $(if ($k -eq 'literal-gone-24200') { 24200 } else { 23900 })
     $smp = '[{"tMs":' + $m + ',"m":' + $m + ',"app":true,"appPid":5000,"inst":["0,0"],"freq":[2500],"perf":[80],"park":[0]}]'
-    $s = Get-CorePartitionScalars (New-R9Record ([string]($L + 242000000)) '24200' '22950' 'stop-file' $smp) $feed 4095 1044480 8 $w $null $false @mp
+    $s = Get-CorePartitionScalars (New-R9Record ([string]($L + [int64]$gm * 10000)) ([string]$gm) '22950' 'stop-file' $smp) $feed 4095 1044480 8 $w $null $false @mp
     $r.dot4[$k] = @($s.pcoreMHzMean, [string]$s.corePartitionNullReasons)
 }
 # Dot 2 (Dot literal): an old 34-byte row at byte 0; the pre-helper read saw 100 bytes. The start read stat 200 bytes, the file was truncated under it,
@@ -1839,18 +1851,25 @@ class CorePartitionR9Tests(unittest.TestCase):
     def test_a_record_whose_watch_ended_before_the_runners_exit_is_refused_typed(self) -> None:
         """Dot 1 (= adversary r8 aeacec83 A1): a genuinely authenticated record whose app exit the helper never observed does not cover the runner's
         window, so bench and load acceptance are false with a typed coverage reason; the full-window control stays accepted."""
-        for case, code in (("stop-while-alive", "coverage-stop-before-runner-exit"), ("deadline-while-alive", "coverage-ended-before-runner-exit")):
+        for case, code in (("stop-while-alive", "coverage-stop-before-runner-exit"), ("deadline-while-alive", "coverage-ended-before-runner-exit"),
+                           ("endpoint-gap-3400ms", "coverage-endpoint-gap")):
             with self.subTest(case=case):
-                bench, load, observed, why = self.r["dot1"][case]
+                bench, load, observed, why, _endpoint = self.r["dot1"][case]
                 self.assertEqual([bench, load, observed], [False, False, None], f"a record that did not cover the window was accepted: {why}")
                 for field in ("appAffinityObserved", "partitionLoadGBps", "pcoreMHzMean"):
                     self.assertIn(f"{field}={code}", why)
         self.assertEqual(self.r["dot1"]["full-window-control"][:3], [True, True, "0x00FFF"], self.r["dot1"]["full-window-control"])
+        # adversary r9 (5592421d) A2: the published endpoint bound is the observed gap (100 ms here), and 3400 ms is reported, not hidden
+        self.assertEqual(self.r["dot1"]["full-window-control"][4], 100, self.r["dot1"])
+        self.assertEqual(self.r["dot1"]["endpoint-gap-3400ms"][4], 3400, self.r["dot1"])
 
     def test_a_sample_taken_after_the_last_poll_that_saw_the_app_alive_is_not_the_apps(self) -> None:
-        """Dot 4 (= adversary r8 aeacec83 A4): the post-exit sample (24 s, after the 22.95 s alive poll) is excluded; the in-window control counts."""
+        """Dot 4 (= adversary r8 aeacec83 A4): a sample after the 22.95 s alive poll is excluded (23.5 s, exit seen at 23.9 s); the literal (sample 24 s,
+        exit seen 24.2 s) is refused outright by its 1250 ms alive-to-gone gap; the in-window control counts."""
         self.assertEqual(self.r["dot4"]["post-exit-sample"][0], None, self.r["dot4"])
         self.assertIn("pcoreMHzMean=no-app-samples", self.r["dot4"]["post-exit-sample"][1])
+        self.assertEqual(self.r["dot4"]["literal-gone-24200"][0], None, self.r["dot4"])
+        self.assertIn("pcoreMHzMean=coverage-endpoint-gap", self.r["dot4"]["literal-gone-24200"][1])
         self.assertEqual(self.r["dot4"]["in-window-control"][0], 2000.0, self.r["dot4"])
 
     def test_a_short_or_torn_feed_read_is_a_typed_not_ready_never_a_row_position(self) -> None:
