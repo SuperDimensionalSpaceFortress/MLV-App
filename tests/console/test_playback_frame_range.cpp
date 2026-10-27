@@ -175,6 +175,77 @@ TEST( PlaybackFrameRange, ContactSheetInPassTargetsAreSliceCentresStrictlyInside
     ASSERT_EQ( static_cast<long long>( 0 ), playback_frame_range::contactSheetInPassTargetMs( 0, 0, windowMs ) );
 }
 
+namespace
+{
+// One measured Play as runGuiPlaybackSmoke runs it: frame k is presented at k*1000/fps ms with k+1 source frames
+// consumed; the present hook (noteContactSheetPresentedFrame) takes each due target, then the wait loop asks
+// evaluatePlayStop and stops on Reached. Returns the in-pass targets captured before the stop.
+int simulateInPassCaptures( bool unpaced, double fps, int frameCount, double playSeconds, double nativeFps )
+{
+    const int64_t required = playback_frame_range::requiredSourceFrames( nativeFps, playSeconds );
+    const long long windowMs = std::llround( playSeconds * 1000.0 );
+    const int64_t safetyMs = playback_frame_range::playSafetyMs( playSeconds );
+    int next = 0;
+    for( int64_t k = 0; ; ++k )
+    {
+        const int64_t elapsedMs = static_cast<int64_t>( std::llround( static_cast<double>( k ) * 1000.0 / fps ) );
+        const int64_t consumed = k + 1;
+        // The hook takes at most one target per present.
+        if( next < frameCount
+         && playback_frame_range::contactSheetInPassTargetDue(
+                unpaced, elapsedMs, playback_frame_range::contactSheetInPassTargetMs( next, frameCount, windowMs ),
+                consumed, playback_frame_range::contactSheetInPassTargetSourceFrames( next, frameCount, required ) ) )
+        {
+            ++next;
+        }
+        const playback_frame_range::PlayStopState state = playback_frame_range::evaluatePlayStop(
+            consumed, required, true, elapsedMs, safetyMs, playback_frame_range::PlayPaceMode::MeasuredInformational );
+        if( state != playback_frame_range::PlayStopState::Continue ) return next;
+    }
+}
+} // namespace
+
+// VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2 (sol B1 counterexample): the shipped unpaced look leg
+// (m16-1243-look-scale2-cinematic-agxoff-unpaced.json: playSeconds 20, contactSheetFrames 1) on a 24 fps clip
+// needs 480 source frames. Unpaced at 60 fps it stops at 8000 ms; its one wall-clock target is 10000 ms, so zero of
+// one were captured and the healthy faster run exited 14. Declared ceiling: every fps up to 120 must capture all of
+// its targets (and below the paced rate too); frameCount 1 and 6 both.
+TEST( PlaybackFrameRange, UnpacedInPassTargetsAreReachedBeforeTheSourceFrameStopAtAnyFpsUpTo120 )
+{
+    ASSERT_EQ( static_cast<int64_t>( 480 ), playback_frame_range::requiredSourceFrames( 24.0, 20.0 ) );
+    ASSERT_EQ( static_cast<int64_t>( 240 ), playback_frame_range::contactSheetInPassTargetSourceFrames( 0, 1, 480 ) );
+    ASSERT_EQ( 1, simulateInPassCaptures( true, 60.0, 1, 20.0, 24.0 ) );
+    for( int fps = 12; fps <= 120; ++fps )
+    {
+        ASSERT_EQ( 1, simulateInPassCaptures( true, static_cast<double>( fps ), 1, 20.0, 24.0 ) );
+        ASSERT_EQ( 6, simulateInPassCaptures( true, static_cast<double>( fps ), 6, 20.0, 24.0 ) );
+    }
+    // Every unpaced target is strictly inside the required frames, ascending.
+    int64_t previous = 0;
+    for( int i = 0; i < 6; ++i )
+    {
+        const int64_t target = playback_frame_range::contactSheetInPassTargetSourceFrames( i, 6, 480 );
+        ASSERT_TRUE( target > previous );
+        ASSERT_TRUE( target < 480 );
+        previous = target;
+    }
+    ASSERT_EQ( static_cast<int64_t>( 0 ), playback_frame_range::contactSheetInPassTargetSourceFrames( 0, 0, 480 ) );
+    ASSERT_EQ( static_cast<int64_t>( 0 ), playback_frame_range::contactSheetInPassTargetSourceFrames( 0, 1, 0 ) );
+    // Never due on an unknown requirement, whatever the wall clock says.
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetDue( true, 999999, 10000, 999, 0 ) );
+}
+
+// The paced rule is unchanged: a PACED Play that stops before a wall-clock target leaves that target uncaptured, so
+// the sheet stays short and runGuiPlaybackSmoke still exits 14 ("only %1 of %2 in-pass targets" in MainWindow.cpp,
+// pinned by test_contact_sheet_capture_wiring.cpp). Source frames never make a paced target due.
+TEST( PlaybackFrameRange, PacedInPassTargetsStayOnTheWallClockAndAMissedOneStaysMissed )
+{
+    ASSERT_EQ( 0, simulateInPassCaptures( false, 60.0, 1, 20.0, 24.0 ) );
+    ASSERT_EQ( 1, simulateInPassCaptures( false, 24.0, 1, 20.0, 24.0 ) );
+    ASSERT_FALSE( playback_frame_range::contactSheetInPassTargetDue( false, 8000, 10000, 480, 240 ) );
+    ASSERT_TRUE( playback_frame_range::contactSheetInPassTargetDue( false, 10000, 10000, 1, 240 ) );
+}
+
 // The grabs run on the GUI thread inside the measured interval, so the honest figure next to the
 // leg's fps is the fps with their recorded cost taken out of the elapsed time. It can only be the
 // same or higher, and it equals the measured fps when nothing was grabbed.

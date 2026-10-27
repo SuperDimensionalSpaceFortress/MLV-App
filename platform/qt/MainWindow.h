@@ -1213,6 +1213,10 @@ private:
     };
     QElapsedTimer m_contactSheetCaptureClock;
     QVector<qint64> m_contactSheetCaptureTargetMs;
+    // VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2: an unpaced measured Play keys its targets to source frames consumed
+    // (contactSheetInPassTargetDue), so a run that outpaces the wall-clock centres still takes them before it stops.
+    QVector<qint64> m_contactSheetCaptureTargetSourceFrames;
+    bool m_contactSheetCaptureUnpaced = false;
     QVector<ContactSheetPendingGrab> m_contactSheetPendingGrabs;
     int m_contactSheetCaptureNextTargetIndex = 0;
     int m_contactSheetCaptureStartFrame = 0;
