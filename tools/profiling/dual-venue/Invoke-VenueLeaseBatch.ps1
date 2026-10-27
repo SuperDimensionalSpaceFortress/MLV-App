@@ -199,7 +199,8 @@ $artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::
 if ($umRunIsReal -and $GuardReadDelay) { Stop-Usage '-GuardReadDelay is an offline test seam: with the real um-run.ps1 the guard reads are never delayed' }
 $script:guardDelaySeam = $null
 if ($GuardReadDelay) {
-    if ($GuardReadDelay -cnotmatch '^(claim|open):(existence|identity|spec)=(\d{1,4})\z') { Stop-Usage "-GuardReadDelay '$GuardReadDelay' is not <claim|open>:<existence|identity|spec>=<sec>" }
+    # r4 adversary A3: [0-9], not \d, which also matches non-ASCII decimal digits that [int] then throws on
+    if ($GuardReadDelay -cnotmatch '^(claim|open):(existence|identity|spec)=([0-9]{1,4})\z') { Stop-Usage "-GuardReadDelay '$GuardReadDelay' is not <claim|open>:<existence|identity|spec>=<sec>" }
     $script:guardDelaySeam = [pscustomobject]@{ guard = $Matches[1]; read = $Matches[2]; ms = [int]$Matches[3] * 1000 }
 }
 $cooldownExplicit = $PSBoundParameters.ContainsKey('LeaseCooldownSec'); $budgetExplicit = $PSBoundParameters.ContainsKey('LeaseBudgetSec')
@@ -631,6 +632,12 @@ function Get-InputContentRefusal {
     # r3 adversary A2: the open still held in the agent's gate is guarded for locations only; its content is checked once the result is in hand, inside the lease's room
     if ($null -ne $script:guardBudget -and $script:guardBudget.contentOff) { return $null }
     $buildsLeft = @($script:guardedInputs | Where-Object { $_.kind -ceq 'build' }).Count
+    # r4 adversary A1: under 2 s left of the budget no content read starts (a spec read included, which comes before the builds): the typed refusal is at once, never after a read
+    # that spends the leg reserve. Invoke-InputGuard's 10 s floor for that case covers the location checks only.
+    if ($null -ne $script:guardBudget -and ($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) -lt 2) {
+        $first = @($script:guardedInputs | Where-Object { $_.kind -ceq 'spec' -or $_.kind -ceq 'build' })[0]
+        if ($null -ne $first) { return [pscustomobject]@{ kind = 'content'; item = $first.item; code = $script:guardBudget.code; why = "no time is left in $($script:guardBudget.what) to re-read the leg specs and staged builds; no leg runs on them" } }
+    }
     foreach ($g in $script:guardedInputs) {
         if ($script:guardProgress) { $script:guardProgress.item = $g.item; $script:guardProgress.at = "the $($g.kind) input $($g.path)" }
         if ($g.kind -ceq 'spec') {

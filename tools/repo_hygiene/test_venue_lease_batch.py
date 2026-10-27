@@ -3369,6 +3369,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertLess(held, 20)
         self.assertFalse(self.claim_path.exists())
 
+    def test_artifact_preflight_r4_adv_a1_no_room_refuses_before_a_slow_spec_read(self) -> None:
+        # r4 adversary A1 (pass 1 on 31d1fdaf): cap 62 / leg 60 / margin 0 leaves the post-open guard about 1 s. Invoke-InputGuard's 10 s floor for that case (meant for the location
+        # checks) let the content check read a spec that took 5 s before it noticed no time was left, so the refusal came after the leg reserve was spent. Now no content read starts.
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:spec=5", cap="62")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_BUDGET_EXCEEDS_LEASE ", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertLess(held, 4.5, f"the lease was held {held:.1f} s: the 5 s spec read ran on a lease with no room for it")
+
     def test_artifact_preflight_r4_item2_a_delayed_read_in_the_claim_guard_ends_typed_inside_the_claim_budget(self) -> None:
         # the claim guard's sibling: -ClaimTtlSec 60 / -ClaimRenewSec 30 gives 30 s; a 40 s identity read ends SHARE_UNREACHABLE inside it, the claim released, no lease opened,
         # never CLAIM_LAPSED_IN_GUARD and a release-and-retry
@@ -3389,9 +3398,11 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("BATCH_USAGE -GuardReadDelay is an offline test seam", r.stderr)
-        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", "open:hash=5")
-        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("is not <claim|open>:<existence|identity|spec>=<sec>", r.stderr)
+        # r4 adversary A3: a non-ASCII decimal digit (U+0661) is refused typed, not accepted by \d and thrown on by [int]
+        for bad in ("open:hash=5", "open:spec=١"):
+            r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", bad)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("is not <claim|open>:<existence|identity|spec>=<sec>", r.stderr)
         self.assertEqual(self.kinds(), [])
 
     # r4 ITEM 3 (key3 r3 H3): the claim guard runs before the batch try, so a throw in it once the claim was granted left the claim held, with no keeper, until its TTL (and the run
