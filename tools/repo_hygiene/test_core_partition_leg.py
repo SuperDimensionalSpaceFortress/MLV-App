@@ -129,7 +129,8 @@ try {
     for ($i = 0; $i -lt 40 -and -not $ready; $i++) { $ready = (Get-Content -LiteralPath $corePartitionReadyFile -Raw -ErrorAction SilentlyContinue); if (-not $ready) { Start-Sleep -Milliseconds 100 } }
     [IO.File]::AppendAllText($corePartitionFeedPath, "26.10.2026,01:00:02,x,70.0,45.0,No,No`n26.10.2026,01:00:03,x,80.0,55.0,No,No`n26.10.2026,01:00:04,x,75.0,50.0,No,No`n")
     $end = Read-CorePartitionFeedSince $corePartitionFeedPath ([int64]$corePartitionFeedStart.length)
-    $sum = Get-CorePartitionFeedSummary $corePartitionFeedStart $end 120
+    $fb = @{}; if ((Get-Command Get-CorePartitionFeedSummary).Parameters.ContainsKey('Base')) { $fb.Base = $corePartitionFeedPreHelper }
+    $sum = Get-CorePartitionFeedSummary $corePartitionFeedStart $end 120 @fb
     [ordered]@{
         helperReady = $corePartitionHelperLaunch.ready; readyLength = [int64]([string]$ready).Trim(); startLength = $corePartitionFeedStart.length
         rows = $sum.rows; wattsMean = $sum.pkgWattsMean; tempAtStart = $sum.pkgTempCAtStart
@@ -276,6 +277,40 @@ try {
     if ($null -ne $other -and -not $other.HasExited) { $other.Kill() }
     if ($null -ne $pre -and -not $pre.HasExited) { $pre.Kill() }
 }
+"""
+
+
+# sol r6 CP-06: the decoded helper run for real, told to stop at once. Clean: it exits 0 and its record's HMAC under the job's key verifies (the
+# generator's own Test-CorePartitionHelperMac, lifted). Planted: a file already sits at its record name, so its CreateNew refuses and it exits non-zero.
+EXIT_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+function Start-CpHelper([string]$Sub, [bool]$Plant) {
+    $d = Join-Path $env:CP_DIR $Sub
+    [void](New-Item -ItemType Directory -Path $d)
+    [IO.File]::WriteAllText((Join-Path $d 'stop'), 'stop')
+    if ($Plant) { [IO.File]::WriteAllText((Join-Path $d 'helper.json'), '{"schema":"mlv-app/core-partition-helper/v1","pid":1}') }
+    $psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $($env:CP_ENCODED)")
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.Environment['MLV_CP_EXE'] = Join-Path $d 'no-such-app.exe'
+    $psi.Environment['MLV_CP_STOP'] = Join-Path $d 'stop'
+    $psi.Environment['MLV_CP_READY'] = Join-Path $d 'ready'
+    $psi.Environment['MLV_CP_OUT'] = Join-Path $d 'helper.json'
+    $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $d 'launch'
+    $psi.Environment['MLV_CP_MEASURED'] = Join-Path $d 'measured'
+    $psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
+    $psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(60).Ticks)
+    $psi.Environment['MLV_CP_NONCE'] = 'exit-driver-key-0123456789abcdef'
+    $h = [Diagnostics.Process]::Start($psi)
+    if (-not $h.WaitForExit(60000)) { $h.Kill(); [void]$h.WaitForExit(5000) }
+    $mac = Join-Path $d 'helper.json.mac'
+    $bytes = [IO.File]::ReadAllBytes((Join-Path $d 'helper.json'))
+    $macText = $(if (Test-Path -LiteralPath $mac) { [IO.File]::ReadAllText($mac) })
+    $ok = $(if (Get-Command Test-CorePartitionHelperMac -ErrorAction SilentlyContinue) { @((Test-CorePartitionHelperMac $bytes $macText 'exit-driver-key-0123456789abcdef'), (Test-CorePartitionHelperMac $bytes $macText 'another-key')) } else { @('absent') })
+    @{ exit = $h.ExitCode; macFile = (Test-Path -LiteralPath $mac); mac = $ok; nonceInRecord = ([Text.Encoding]::UTF8.GetString($bytes)).Contains('exit-driver-key') }
+}
+$clean = Start-CpHelper 'clean' $false
+$planted = Start-CpHelper 'planted' $true
+[ordered]@{ clean = $clean; planted = $planted } | ConvertTo-Json -Compress -Depth 4
 """
 
 
@@ -507,6 +542,42 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(got["original"], "original-bytes", "the file behind the planted link was changed")
         self.assertEqual(got["fresh"], "ok")
 
+    def test_the_helper_vouches_for_its_record_by_exit_code_and_an_hmac_under_the_jobs_key(self) -> None:
+        """sol r6 CP-06, the real helper: a clean run exits 0 with a record whose HMAC verifies under the key it was handed (and no other), and
+        the key itself is never in the record; a planted record name makes its CreateNew refuse and it exits non-zero."""
+        m = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a"))
+        self.assertIsNotNone(m)
+        work = self.tmp / "exit-work"
+        work.mkdir()
+        driver = self.tmp / "exit-driver.ps1"
+        driver.write_text(LIFT + EXIT_DRIVER, encoding="ascii")
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1), "CP_GEN": str(GENERATOR)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["clean"]["exit"], 0, got)
+        self.assertTrue(got["clean"]["macFile"], got)
+        self.assertEqual(got["clean"]["mac"], [True, False], got)
+        self.assertFalse(got["clean"]["nonceInRecord"], "the job's key must never be written into the record")
+        self.assertNotEqual(got["planted"]["exit"], 0, f"a helper whose record write was refused exited 0: {got}")
+        self.assertFalse(got["planted"]["macFile"], got)
+
+    def test_the_jobs_key_reaches_only_the_helper(self) -> None:
+        """sol r6 CP-06: the per-job key is drawn at run time, handed to the helper by environment (never the command line), never traced or
+        published, and the job checks the record with it, the helper's exit code and the launch pid."""
+        for key in ("a", "b1", "b2", "cuda-b2"):
+            with self.subTest(job=key):
+                text = lf(self.job(key))
+                uses = [ln.strip() for ln in text.splitlines() if "$corePartitionHelperNonce" in ln]
+                self.assertEqual(len(uses), 3, uses)
+                self.assertTrue(uses[0].startswith("$corePartitionHelperNonce = "), uses)
+                self.assertIn("$cpKeyBytes", uses[0])
+                self.assertIn("RandomNumberGenerator]::Create()", text)
+                self.assertEqual(uses[1], "$cpPsi.Environment['MLV_CP_NONCE'] = $corePartitionHelperNonce")
+                self.assertIn("Test-CorePartitionHelperRecord ", uses[2])
+                self.assertIn("$corePartitionHelperExit", uses[2])
+                self.assertFalse([ln for ln in uses if "Write-JobTrace" in ln or "Save-Json" in ln], uses)
+                self.assertIn("$corePartitionHelperExit = $corePartitionHelper.ExitCode", text)
+
     def test_the_jobs_and_the_encoded_helper_parse(self) -> None:
         files = [self.out[k] for k in ("a", "b1", "b2", "cuda-b2") if self.job(k)]
         helpers = []
@@ -517,7 +588,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
             for name in ("function Get-CorePartitionTopology", "function Test-CorePartitionMaskClass", "function Format-CorePartitionMask", "MlvCorePartitionLoad",
                          "ReadCategory()", "'Parking Status'", "MLV_CP_DEADLINE_TICKS"):
                 self.assertIn(name, src, f.name)
-            self.assertLess(len(m.group(1)), 30000)
+            self.assertLess(len(m.group(1)), 32000)
             h = self.tmp / (f.stem + ".helper.ps1")
             h.write_text(src, encoding="utf-8")
             helpers.append(h)
@@ -558,15 +629,23 @@ $uni = @{}; for ($i = 0; $i -lt 8; $i++) { $uni["0,$i"] = 0 }
 $uniform = Test-CorePartitionMaskClass $uni 15 @(240)
 $r.topo = @($ok.ok, $ok.pMask, $ok.eMask, $badBench.ok, $badBench.reason, $badLow.ok, $badLow.reason, $noBench.ok, $uniform.ok, $uniform.reason)
 $r.mhz = @((Get-CorePartitionEffectiveMHz 2500 160), (Get-CorePartitionEffectiveMHz $null 100), (Get-CorePartitionEffectiveMHz 0 100), (Get-CorePartitionEffectiveMHz 2500 -1))
-$start = @{ exists = $true; length = 500; ageSec = 1.0; before = "26.10.2026,01:00:00,x,61.0,20.5,No,No`n26.10.2026,01:00:01,x,62.5,21.0,No,No`n"; window = ''; windowStartsMidRow = $false }
-$end = @{ exists = $true; length = 900; ageSec = 0.5; before = ''; window = "5,00,x,99.0,99.0,Yes,Yes`n26.10.2026,01:00:02,x,70,45,No,No`r`n26.10.2026,01:00:03,x,80,55,Yes,No`nDate,Time,a,b,c,d,e`n26.10.2026,01:00:04,x,75,50,No,No`n"; windowStartsMidRow = $true }
+# sol r6 CP-09: every mark carries its read's monotonic time (monoMs), wall time (readUtcTicks) and the feed's last-write stamp. The pre-helper
+# mark ($base) is the start mark's baseline (Get-CorePartitionFeedSummary -Base), the default of the wrapper below; a pre-r7 generator ignores the 4th argument.
+$T0 = [int64]639286128000000000
+$hasBase = (Get-Command Get-CorePartitionFeedSummary).Parameters.ContainsKey('Base')
+$base = @{ exists = $true; length = 400; ageSec = 1.0; monoMs = [int64]5000000; readUtcTicks = $T0 - 50000000; lastWriteUtcTicks = $T0 - 60000000 }
+$cpFeedSummaryImpl = ${function:Get-CorePartitionFeedSummary}
+function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $base) { & $cpFeedSummaryImpl $Start $End $StaleSec $Base }
+$start = @{ exists = $true; length = 500; ageSec = 1.0; before = "26.10.2026,01:00:00,x,61.0,20.5,No,No`n26.10.2026,01:00:01,x,62.5,21.0,No,No`n"; window = ''; windowStartsMidRow = $false; monoMs = [int64]5005000; readUtcTicks = $T0; lastWriteUtcTicks = $T0 - 10000000 }
+$end = @{ exists = $true; length = 900; ageSec = 0.5; before = ''; window = "5,00,x,99.0,99.0,Yes,Yes`n26.10.2026,01:00:02,x,70,45,No,No`r`n26.10.2026,01:00:03,x,80,55,Yes,No`nDate,Time,a,b,c,d,e`n26.10.2026,01:00:04,x,75,50,No,No`n"; windowStartsMidRow = $true; monoMs = [int64]5035000; readUtcTicks = $T0 + 300000000; lastWriteUtcTicks = $T0 + 295000000 }
 $feed = Get-CorePartitionFeedSummary $start $end 120
 $r.feed = @($feed.rows, $feed.pkgWattsMean, $feed.pkgWattsMax, $feed.pkgTempCMean, $feed.pkgTempCMax, $feed.pkgThrottledRows, $feed.pkgTempCAtStart, $feed.reasons.Count)
 $whole = $end.Clone(); $whole.windowStartsMidRow = $false
 $r.feedWhole = (Get-CorePartitionFeedSummary $start $whole 120).rows
 $rot = $end.Clone(); $rot.length = 100
 $r.rotated = @((Get-CorePartitionFeedSummary $start $rot 120).reasons['pkgWattsMean'], (Get-CorePartitionFeedSummary $start $rot 120).pkgTempCAtStart)
-$stale = $end.Clone(); $stale.ageSec = 500
+# a 200 s window (monotonic and wall agree) whose feed last wrote 150 s before the end read
+$stale = $end.Clone(); $stale.ageSec = 500; $stale.monoMs = $start.monoMs + 200000; $stale.readUtcTicks = $T0 + 2000000000; $stale.lastWriteUtcTicks = $T0 + 500000000
 $r.stale = (Get-CorePartitionFeedSummary $start $stale 120).reasons['pkgTempCMax']
 $bad = $end.Clone(); $bad.window = "26.10.2026,01:00:02,x,abc,45,No,No`n"; $bad.windowStartsMidRow = $false
 $r.unparseable = (Get-CorePartitionFeedSummary $start $bad 120).reasons['rows']
@@ -603,11 +682,14 @@ $badTopo = '{"topologyCheck":{"ok":false,"reason":"topology-uniform (1 efficienc
 $r.badTopo = @((Get-CorePartitionScalars $badTopo $feed 4095 0 0 $w $null).corePartitionTopologyOk, (Get-CorePartitionScalars $badTopo $feed 4095 0 0 $w $null).corePartitionNullReasons)
 # adversary r2 A3 / A4: a replaced or over-cap feed is no evidence (real files, the I/O readers)
 $fa = Join-Path $env:CP_TMP 'feed-a.csv'
-[IO.File]::WriteAllText($fa, "26.10.2026,01:00:00,x,30,10,No,No`n")
+[IO.File]::WriteAllText($fa, "26.10.2026,00:59:59,x,30,10,No,No`n")
+$pa = Read-CorePartitionFeedMark $fa
+[IO.File]::AppendAllText($fa, "26.10.2026,01:00:00,x,30,10,No,No`n")
 $ma = Read-CorePartitionFeedMark $fa
 [IO.File]::AppendAllText($fa, "26.10.2026,01:00:01,x,90,99,Yes,No`n")
 $ea = Read-CorePartitionFeedSince $fa ([int64]$ma.length) ([string]$ma.before)
-$sa = Get-CorePartitionFeedSummary $ma $ea 120
+$fbase = @{}; if ($hasBase) { $fbase.Base = $pa }
+$sa = Get-CorePartitionFeedSummary $ma $ea 120 @fbase
 $r.integrityAppend = @($ea.replaced, $ea.truncated, $sa.rows, $sa.pkgWattsMean, $sa.reasons.Count)
 $mc = $ma.Clone(); $mc.created = [int64]$ma.created - 10000000
 $r.integrityCreated = (Get-CorePartitionFeedSummary $mc $ea 120).reasons['rows']
@@ -694,11 +776,60 @@ foreach ($k in $cases.Keys) {
     $r.measured[$k] = @($sc.corePartitionTopologyOk, $sc.benchAffinityApplied, $sc.partitionLoadApplied, $sc.appAffinityObserved, $sc.partitionLoadGBps, $sc.pcoreMHzMean, [string]$sc.corePartitionNullReasons)
 }
 # adversary r5 (40038f92) A4 (literal): the end read after a 600 s backward clock step computes ageSec = -401 for a feed really 199 s old
+# (start read at real 0, last write at real +1 s, end read at real +200 s: monotonic span 200 s, wall span -400 s)
 $negEnd = $end.Clone(); $negEnd.ageSec = -401; $negEnd.window = "26.10.2026,12:00:01,x,70,45,No,No`n"; $negEnd.windowStartsMidRow = $false
-$negStart = $start.Clone(); $negStart.ageSec = -401
-$smallNeg = $negEnd.Clone(); $smallNeg.ageSec = -0.5
+$negEnd.monoMs = $start.monoMs + 200000; $negEnd.readUtcTicks = $T0 - 4000000000; $negEnd.lastWriteUtcTicks = $T0 + 10000000
+# a feed whose last-write stamp is 401 s in the future, the wall clock steady over a 200 s window
+$fwdEnd = $negEnd.Clone(); $fwdEnd.readUtcTicks = $T0 + 2000000000; $fwdEnd.lastWriteUtcTicks = $T0 + 6010000000
+$smallNeg = $negEnd.Clone(); $smallNeg.ageSec = -0.5; $smallNeg.monoMs = $start.monoMs + 30000; $smallNeg.readUtcTicks = $T0 + 300000000; $smallNeg.lastWriteUtcTicks = $T0 + 305000000
 $r.negativeAge = @([string](Get-CorePartitionFeedSummary $start $negEnd 120).reasons['rows'], (Get-CorePartitionFeedSummary $start $negEnd 120).pkgWattsMean,
-    [string](Get-CorePartitionFeedSummary $negStart $whole 120).reasons['pkgTempCAtStart'], (Get-CorePartitionFeedSummary $start $smallNeg 120).rows)
+    [string](Get-CorePartitionFeedSummary $start $fwdEnd 120).reasons['rows'], (Get-CorePartitionFeedSummary $start $smallNeg 120).rows)
+# sol r6 CP-09 (literal): the feed last updated at real +1 s, read at real +200 s after a 100 s backward UTC step (computed age 99 s), limit 120 s
+$cpS = @{ exists = $true; length = 32; ageSec = 0.0; created = 123; fileId = 'same'; before = "26.10.2026,12:00:00,x,30,10,No,No`n"; window = ''; windowStartsMidRow = $false; monoMs = [int64]9000000; readUtcTicks = $T0; lastWriteUtcTicks = $T0 }
+$cpE = @{ exists = $true; length = 64; ageSec = 99.0; created = 123; fileId = 'same'; before = ''; window = "26.10.2026,12:00:01,x,70,45,No,No`n"; windowStartsMidRow = $false; replaced = $false; truncated = $false; monoMs = [int64]9200000; readUtcTicks = $T0 + 1000000000; lastWriteUtcTicks = $T0 + 10000000 }
+$cp9 = Get-CorePartitionFeedSummary $cpS $cpE 120
+# a 30 s monotonic window is fresh whatever the wall clock did (here it stepped back 100 s: computed age -71 s)
+$cpShort = $cpE.Clone(); $cpShort.monoMs = [int64]9030000; $cpShort.readUtcTicks = $T0 - 700000000; $cpShort.ageSec = -71.0
+$cpSh = Get-CorePartitionFeedSummary $cpS $cpShort 120
+# no monotonic baseline (marks without monoMs), a monotonic time that runs backwards, a non-numeric one
+$noMono = @(foreach ($k in @('none', 'backwards', 'oops')) {
+    $s0 = $cpS.Clone(); $e0 = $cpE.Clone(); $e0.ageSec = 1.0
+    if ($k -eq 'none') { $s0.Remove('monoMs'); $e0.Remove('monoMs') } elseif ($k -eq 'backwards') { $e0.monoMs = [int64]8000000 } else { $e0.monoMs = 'oops' }
+    try { $x = Get-CorePartitionFeedSummary $s0 $e0 120; , @($x.rows, [string]$x.reasons['rows']) } catch { , @('threw', [string]$_.Exception.Message) } })
+# the start temperature: the feed unchanged since the pre-helper mark 200 s (monotonic) earlier is stale; unchanged over 5 s proves nothing
+$stBase = @{ exists = $true; length = 500; monoMs = [int64]4805000; readUtcTicks = $T0 - 2000000000; lastWriteUtcTicks = $T0 - 10000000 }
+$stShort = $stBase.Clone(); $stShort.monoMs = [int64]5000000
+$stc = @(foreach ($b in @($stBase, $stShort)) { $sb2 = @{}; if ($hasBase) { $sb2.Base = $b }; [string](Get-CorePartitionFeedSummary $start $end 120 @sb2).reasons['pkgTempCAtStart'] })
+$r.monotonic = @($cp9.rows, $cp9.pkgWattsMean, [string]$cp9.reasons['rows'], $cpSh.rows, $cpSh.pkgWattsMean, [string]$cpSh.reasons['rows'], $noMono[0], $noMono[1], $noMono[2]) + @($stc)
+# sol r6 CP-07: the one guarded number parse (absent in a pre-r7 generator)
+$r.number = 'absent'
+if (Get-Command ConvertFrom-CorePartitionNumber -ErrorAction SilentlyContinue) {
+    $big = ('{"v":99999999999999999999}' | ConvertFrom-Json).v
+    $tick = ('{"v":639286128040000000}' | ConvertFrom-Json).v
+    $r.number = @(foreach ($p in @(@(4242, 'int64'), @('4242', 'int64'), @('oops', 'int64'), @($true, 'int64'), @(1.5, 'int64'), @($tick, 'int64'), @(1e19, 'int64'), @($big, 'int64'),
+            @(, @(1, 2)), @('1e309', 'double'), @('NaN', 'double'), @($null, 'double'), @(2.5, 'double'), @('oops', 'double'))) {
+        if ($p.Count -eq 1) { $p = @(@(1, 2), 'int64') }
+        $n = ConvertFrom-CorePartitionNumber $p[0] $p[1]; , @($n.ok, $n.value) })
+}
+# sol r6 CP-07 (sites :4299 :4399 :4404 :4473 :4498 :4501 :4512 :4514): a non-numeric value reaching each consumer directly is no throw
+$cpTry = { param($Block) try { & $Block } catch { 'threw: ' + [string]$_.Exception.Message } }
+$r.consumers = @(
+    (& $cpTry { [string](Get-CorePartitionEffectiveMHz 'oops' 100) }),
+    (& $cpTry { [string](Get-CorePartitionEffectiveMHz 2500 'oops') }),
+    (& $cpTry { [string](Get-CorePartitionCounterSummary @(@{ app = $true; inst = @('0,99999999999'); freq = @(2500); perf = @(100); park = @(0) }) 1 0).pcoreMHzMean }),
+    (& $cpTry { [string](Get-CorePartitionCounterSummary @(@{ app = $true; inst = @('0,0'); freq = @(2500); perf = @(100); park = @('oops') }) 1 0).pcoreParkedSampleFraction }),
+    (& $cpTry { [string](Get-CorePartitionCounterSummary @(@{ app = 'false'; inst = @('0,0'); freq = @(2500); perf = @(100); park = @(0) }) 1 0).appSamples }),
+    (& $cpTry { [string](Test-CorePartitionMeasuredApp ((New-CpRecord $i5000 @($i5000.Replace('"pid":5000', '"pid":"oops"')))) 5000 ($L + 29000000) ($L + 191000000)).why }),
+    (& $cpTry { $x = Get-CorePartitionScalars ($helper.PSObject.Copy() | ForEach-Object { $_.helperAffinityObserved = 'oops'; $_ }) $feed 4095 1044480 8 $w $null $false @mp; '{0}|{1}|{2}' -f $x.partitionLoadApplied, $x.benchAffinityApplied, $x.corePartitionNullReasons }),
+    (& $cpTry { $x = Get-CorePartitionScalars ('{"topologyCheck":{"ok":"false","pMask":"oops","eMask":1044480},"app":{"pid":5000,"affinityFirst":4095,"affinityLast":4095},"samples":[]}' | ConvertFrom-Json) $feed 4095 0 0 $w $null $false @mp; '{0}|{1}' -f $x.corePartitionTopologyOk, $x.corePartitionNullReasons }))
+# sol r6 CP-06: the record's HMAC under the per-job key (absent in a pre-r7 generator)
+$r.mac = 'absent'
+if (Get-Command Test-CorePartitionHelperMac -ErrorAction SilentlyContinue) {
+    $mb2 = [Text.Encoding]::UTF8.GetBytes('{"schema":"mlv-app/core-partition-helper/v1","pid":4242}')
+    $good = [BitConverter]::ToString([Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes('k-0123456789')).ComputeHash($mb2)).Replace('-', '')
+    $r.mac = @((Test-CorePartitionHelperMac $mb2 $good 'k-0123456789'), (Test-CorePartitionHelperMac $mb2 $good.ToLowerInvariant() 'k-0123456789'), (Test-CorePartitionHelperMac $mb2 ($good + "`r`n") 'k-0123456789'),
+        (Test-CorePartitionHelperMac $mb2 $good 'k-other'), (Test-CorePartitionHelperMac $mb2 $null 'k-0123456789'), (Test-CorePartitionHelperMac $mb2 $good ''), (Test-CorePartitionHelperMac $mb2 'zz' 'k-0123456789'))
+}
 # the runner's result.json times as the job reads them: a DateTime (pwsh 7 ConvertFrom-Json), an ISO string, absent, unreadable
 $r.utcTicks = 'absent'
 if (Get-Command ConvertTo-CorePartitionUtcTicks -ErrorAction SilentlyContinue) {
@@ -767,12 +898,20 @@ function Save-Json {
     if (Test-Path -LiteralPath $Path -PathType Container) { throw [IO.IOException]::new("'$Path' is a directory") }
     $global:cpSaved = $Object
 }
+# sol r6 CP-06: the double's exit as the job reads it: exit -> 0, exit-nonzero -> 1, a killed helper -> -1, a failed wait -> not exited (unread).
 function New-HelperDouble([string]$Mode) {
     $d = [pscustomobject]@{ Id = 4242; Mode = $Mode; Killed = $false }
     $d | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param([int]$Ms) if ($this.Mode -eq 'throw') { throw 'wait failed' }; if ($this.Mode -eq 'timeout' -and -not $this.Killed) { return $false }; return $true }
     $d | Add-Member -MemberType ScriptMethod -Name Kill -Value { $this.Killed = $true }
+    $d | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $this.Mode -ne 'throw' -and ($this.Mode -ne 'timeout' -or $this.Killed) }
+    $d | Add-Member -MemberType ScriptProperty -Name ExitCode -Value { if ($this.Mode -eq 'exit-nonzero') { 1 } elseif ($this.Killed) { -1 } else { 0 } }
     $d
 }
+# sol r6 CP-06: the per-job key the job hands only to the helper, and the record's HMAC under it (what the helper writes beside the record)
+$corePartitionHelperNonce = 'driver-key-00112233445566778899aabbccddeeff'
+function Get-CpMac([string]$Json, [string]$Key) { [BitConverter]::ToString([Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($Key)).ComputeHash([Text.Encoding]::UTF8.GetBytes($Json))).Replace('-', '') }
+# sol r6 CP-07: the valid record with one numeric (or flag) field replaced by a non-number, HMAC'd under the job's key
+function Set-CpField([string]$Json, [scriptblock]$Edit) { $o = $Json | ConvertFrom-Json; & $Edit $o; $o | ConvertTo-Json -Depth 8 -Compress }
 $CorePartitionBenchMask = [int64]4095
 $CorePartitionLoadMask = [int64]1044480
 $CorePartitionLoadThreads = 8
@@ -792,17 +931,61 @@ $cases = @(
     @{ name = 'publish-io-exception'; mode = 'exit'; record = 'valid'; ready = $true; publish = 'throw' },
     @{ name = 'publish-directory'; mode = 'exit'; record = 'valid'; ready = $true; publish = 'directory' },
     @{ name = 'measured-pid-missing'; mode = 'exit'; record = 'valid'; ready = $true; result = 'none' },
-    @{ name = 'record-not-the-helpers'; mode = 'exit'; record = 'planted'; ready = $true })
+    @{ name = 'record-not-the-helpers'; mode = 'exit'; record = 'planted'; ready = $true },
+    # sol r6 CP-06 (= adversary A1, literal): the helper's schema and its live pid 4242 (printed on the job's trace line), no HMAC / an HMAC under
+    # another key; a genuine record whose bytes were replaced after the helper wrote them; the helper never started (launch pid null) and a record
+    # with pid 0; an otherwise valid record from a helper that exited non-zero.
+    @{ name = 'planted-live-pid-no-mac'; mode = 'exit'; record = 'planted-live'; ready = $true },
+    @{ name = 'planted-live-pid-wrong-key'; mode = 'exit'; record = 'planted-live-wrong-key'; ready = $true },
+    @{ name = 'replaced-after-the-helper-wrote'; mode = 'exit'; record = 'replaced'; ready = $true },
+    @{ name = 'launch-pid-null-record-pid-0'; mode = 'none'; record = 'pid0'; ready = $true; launchPid = 'null' },
+    @{ name = 'helper-exit-nonzero'; mode = 'exit-nonzero'; record = 'valid'; ready = $true },
+    # sol r6 CP-07 (= adversary A2, literal): {"schema":...,"pid":"oops"} as planted (no HMAC) and as the helper's own (HMAC'd)
+    @{ name = 'pid-oops-planted'; mode = 'exit'; record = 'pid-oops'; ready = $true },
+    @{ name = 'pid-oops-macd'; mode = 'exit'; record = 'pid-oops-mac'; ready = $true })
+# sol r6 CP-07: one non-numeric value in each numeric (or flag) field class the job reads from the record
+$fieldEdits = [ordered]@{
+    'topology-ok' = { param($o) $o.topologyCheck.ok = 'false' }
+    'topology-pmask' = { param($o) $o.topologyCheck.pMask = 'oops' }
+    'topology-emask' = { param($o) $o.topologyCheck.eMask = 'oops' }
+    'helper-affinity' = { param($o) $o.helperAffinityObserved = 'oops' }
+    'app-pid' = { param($o) $o.app.pid = 'oops' }
+    'app-start' = { param($o) $o.app.startUtcTicks = 'oops' }
+    'app-affinity-first' = { param($o) $o.app.affinityFirst = 'oops' }
+    'app-affinity-last' = { param($o) $o.app.affinityLast = 'oops' }
+    'instance-pid' = { param($o) $o.instances[0].pid = 'oops' }
+    'instance-start' = { param($o) $o.instances[0].startUtcTicks = 'oops' }
+    'instance-gone' = { param($o) $o.instances[0].goneUtcTicks = 'oops' }
+    'load-seconds' = { param($o) $o.load.seconds = 'oops' }
+    'load-bytes' = { param($o) $o.load.bytes = 'oops' }
+    'sample-app' = { param($o) $o.samples[0].app = 'yes' }
+    'sample-freq' = { param($o) $o.samples[0].freq[0] = 'oops' }
+    'sample-perf' = { param($o) $o.samples[0].perf[0] = 'oops' }
+    'sample-park' = { param($o) $o.samples[0].park[0] = 'oops' }
+}
+foreach ($k in $fieldEdits.Keys) { $cases += @{ name = "field-$k"; mode = 'exit'; record = 'field'; edit = $fieldEdits[$k]; ready = $true } }
 # adversary r5 (40038f92) A2 (literal): another writer's record at the helper's output name
 $planted = '{"schema":"not-the-helper-schema","pid":999999,"topologyCheck":{"ok":true,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"instances":[{"pid":5000,"startUtcTicks":639286128040000000}],"others":[],"load":{"seconds":19,"bytes":38000000000},"samples":[]}'
+# adversary r6 A1 (literal): the helper's schema and live pid 4242 with forged app, instances and load
+$plantedLive = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"goneUtcTicks":639286128202000000}],"others":[],"load":{"seconds":15,"bytes":30000000000},"samples":[]}'
 $out = [ordered]@{}
 foreach ($c in $cases) {
+  try {
     $dir = Join-Path $env:CP_TMP $c.name
     [void](New-Item -ItemType Directory -Path $dir)
     $Work = $dir; $Pub = $dir
     $corePartitionHelperOut = Join-Path $dir 'core-partition-helper.json'
-    if ($c.record -eq 'valid') { [IO.File]::WriteAllText($corePartitionHelperOut, $record) } elseif ($c.record -eq 'garbage') { [IO.File]::WriteAllText($corePartitionHelperOut, '{"topologyCheck":') }
+    $mac = Join-Path $dir 'core-partition-helper.json.mac'
+    if ($c.record -eq 'valid') { [IO.File]::WriteAllText($corePartitionHelperOut, $record); [IO.File]::WriteAllText($mac, (Get-CpMac $record $corePartitionHelperNonce)) }
+    elseif ($c.record -eq 'garbage') { [IO.File]::WriteAllText($corePartitionHelperOut, '{"topologyCheck":') }
     elseif ($c.record -eq 'planted') { [IO.File]::WriteAllText($corePartitionHelperOut, $planted) }
+    elseif ($c.record -eq 'planted-live') { [IO.File]::WriteAllText($corePartitionHelperOut, $plantedLive) }
+    elseif ($c.record -eq 'planted-live-wrong-key') { [IO.File]::WriteAllText($corePartitionHelperOut, $plantedLive); [IO.File]::WriteAllText($mac, (Get-CpMac $plantedLive 'a-key-the-job-never-handed-out')) }
+    elseif ($c.record -eq 'replaced') { [IO.File]::WriteAllText($mac, (Get-CpMac $record $corePartitionHelperNonce)); [IO.File]::WriteAllText($corePartitionHelperOut, $plantedLive) }
+    elseif ($c.record -eq 'pid0') { $j = $record.Replace('"pid":4242', '"pid":0'); [IO.File]::WriteAllText($corePartitionHelperOut, $j); [IO.File]::WriteAllText($mac, (Get-CpMac $j $corePartitionHelperNonce)) }
+    elseif ($c.record -eq 'pid-oops') { [IO.File]::WriteAllText($corePartitionHelperOut, '{"schema":"mlv-app/core-partition-helper/v1","pid":"oops"}') }
+    elseif ($c.record -eq 'pid-oops-mac') { $j = '{"schema":"mlv-app/core-partition-helper/v1","pid":"oops"}'; [IO.File]::WriteAllText($corePartitionHelperOut, $j); [IO.File]::WriteAllText($mac, (Get-CpMac $j $corePartitionHelperNonce)) }
+    elseif ($c.record -eq 'field') { $j = Set-CpField $record $c.edit; [IO.File]::WriteAllText($corePartitionHelperOut, $j); [IO.File]::WriteAllText($mac, (Get-CpMac $j $corePartitionHelperNonce)) }
     $corePartitionStopFile = Join-Path $dir 'core-partition.stop'
     $corePartitionMeasuredFile = Join-Path $dir 'core-partition.measured'
     # sol r4 CP-02: the smoke runner's result.json names the process it launched (the record's bound pid)
@@ -820,10 +1003,11 @@ foreach ($c in $cases) {
     $corePartitionErrors = [Collections.Generic.List[string]]::new()
     $corePartitionJob = [ordered]@{ affinityBefore = $null; affinityRequested = '0x00FFF'; affinityApplied = '0x00FFF'; affinityRestored = $null }
     $corePartitionHelperNotReady = $null
+    $corePartitionHelperExit = $null; $corePartitionHelperRecord = $null
     $global:cpSaved = $null
     foreach ($l in $preLines) { if (-not $l.StartsWith('if ')) { . ([scriptblock]::Create($l)) } }
-    $corePartitionHelper = New-HelperDouble $c.mode
-    $corePartitionHelperLaunch = [ordered]@{ pid = 4242; ready = $c.ready; readyWaitMs = 30000 }
+    $corePartitionHelper = $(if ($c.mode -ne 'none') { New-HelperDouble $c.mode })
+    $corePartitionHelperLaunch = [ordered]@{ pid = $(if ($c.launchPid -ne 'null') { 4242 }); ready = $c.ready; readyWaitMs = 30000 }
     foreach ($l in $preLines) { if ($l.StartsWith('if ')) { . ([scriptblock]::Create($l)) } }
     . ([scriptblock]::Create($cleanup))
     $rawLog = "playback_smoke.start session=1 worker_threads=16`n"
@@ -835,7 +1019,11 @@ foreach ($c in $cases) {
         pkg = @($s.pkgWattsMean, $s.pkgWattsMax, $s.pkgTempCMean, $s.pkgTempCMax, $s.pkgThrottledRows, $s.pkgTempCAtStart)
         published = $(if ($null -ne $global:cpSaved) { $ps = $global:cpSaved.feed.summary; @($ps.rows, $ps.pkgWattsMean, $ps.pkgWattsMax, $ps.pkgTempCMean, $ps.pkgTempCMax, $ps.pkgThrottledRows, $ps.pkgTempCAtStart, [string]$ps.reasons['pkgWattsMean']) } else { @('not-published') })
         errors = @($corePartitionErrors)
+        # core-partition.json carries no refused record, and the summary scalars were computed (the summary line's input)
+        publishedHelper = $(if ($null -ne $global:cpSaved) { $null -ne $global:cpSaved.helper } else { 'not-published' })
+        scalars = ($null -ne $s -and @($s.Keys).Count -eq 20)
     }
+  } catch { $out[$c.name] = [ordered]@{ threw = [string]$_.Exception.Message } }
 }
 $out | ConvertTo-Json -Depth 6 -Compress
 """
@@ -937,10 +1125,11 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         """sol r3 CP-01: the job's exact cleanup block (lifted from the generator) run against a helper process double that was not ready at the
         measured launch, then the job's exact scalar line. A late helper that publishes a valid B2 record must never regain the criteria."""
         got = self.cleanup_cases()
+        # sol r6 CP-06: a killed helper (exit -1) or one whose exit was never read cannot vouch for its record; that reason is appended too
         first = {
-            "stop-timeout": "helper-not-ready-at-launch+helper-killed-after-stop-timeout",
+            "stop-timeout": "helper-not-ready-at-launch+helper-killed-after-stop-timeout+helper-exit-nonzero",
             "normal-exit": "helper-not-ready-at-launch",
-            "wait-exception": "helper-not-ready-at-launch",
+            "wait-exception": "helper-not-ready-at-launch+helper-exit-unread",
             "record-unparseable": "helper-not-ready-at-launch+helper-record-unparseable",
             "record-missing": "helper-not-ready-at-launch",
             "stop-timeout-record-unparseable": "helper-not-ready-at-launch+helper-killed-after-stop-timeout+helper-record-unparseable",
@@ -957,12 +1146,16 @@ class CorePartitionPureHelperTests(unittest.TestCase):
                 # sol r4 A1: core-partition.json's feed summary is held to the same rule as the success-summary scalars
                 self.assertEqual(c["published"], [None] * 7 + ["helper-not-ready-at-launch"], f"core-partition.json published feed values: {c}")
         self.assertTrue(got["stop-timeout"]["killed"], "the stop-timeout double was killed (the branch under test ran)")
-        control = got["ready-stop-timeout-control"]
-        self.assertEqual([control["topo"], control["bench"], control["load"]], [True, True, True], f"the same late kill with a ready helper is accepted: {control}")
-        self.assertEqual(control["helperWhy"], "helper-killed-after-stop-timeout")
-        self.assertFalse(control["notReady"])
-        self.assertEqual(control["pkg"][:4], [50.0, 55.0, 75.0, 80.0], "a ready helper's window still carries the feed")
-        self.assertEqual(control["published"][:3], [2, 50.0, 55.0], "a ready helper's core-partition.json still carries the feed")
+        # sol r6 CP-06: a ready helper the job had to kill no longer vouches for its record (exit -1); the feed window is still published
+        killed = got["ready-stop-timeout-control"]
+        self.assertEqual([killed["topo"], killed["bench"], killed["load"]], [False, False, False], f"a killed helper's record was accepted: {killed}")
+        self.assertEqual(killed["helperWhy"], "helper-killed-after-stop-timeout+helper-exit-nonzero")
+        self.assertFalse(killed["notReady"])
+        self.assertEqual(killed["pkg"][:4], [50.0, 55.0, 75.0, 80.0], "a ready helper's window still carries the feed")
+        self.assertEqual(killed["published"][:3], [2, 50.0, 55.0], "a ready helper's core-partition.json still carries the feed")
+        control = got["ready-normal-exit-control"]
+        self.assertEqual([control["topo"], control["bench"], control["load"]], [True, True, True], f"a ready helper that exited 0 with its HMAC'd record is accepted: {control}")
+        self.assertIsNone(control["helperWhy"], control)
 
     def test_summary_scalars(self) -> None:
         b2 = self.r["b2"]
@@ -1009,8 +1202,76 @@ class CorePartitionPureHelperTests(unittest.TestCase):
                 self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"a same-path process gone before the measured app started is no overlap: {control}")
 
     def test_a_negative_feed_age_is_no_freshness(self) -> None:
-        """adversary r5 (40038f92) A4: a backward clock step must not turn a 199 s old feed into package values; a sub-second negative age still reads."""
-        self.assertEqual(self.r["negativeAge"], ["feed-age-negative", None, "feed-age-negative", 1])
+        """adversary r5 (40038f92) A4: a backward clock step must not turn a 199 s old feed into package values (r7: the monotonic clock sees the
+        step); a future last-write stamp over a long window is still a negative age; a short window reads whatever the stamps say."""
+        self.assertEqual(self.r["negativeAge"], ["feed-clock-stepped", None, "feed-age-negative", 1])
+
+    def test_feed_freshness_is_measured_on_the_monotonic_clock(self) -> None:
+        """sol r6 CP-09 (= adversary r6 A4), its literal: last write at real +1 s, end read at real +200 s after a 100 s backward UTC step, limit 120 s."""
+        m = self.r["monotonic"]
+        self.assertEqual(m[:3], [None, None, "feed-clock-stepped"], f"a feed 199 s old was published as fresh after a backward clock step: {m}")
+        self.assertEqual(m[3:6], [1, 45.0, ""], f"a 30 s monotonic window is fresh whatever the wall clock did: {m}")
+        for got in m[6:9]:
+            self.assertEqual(got, [None, "feed-freshness-unverified"], f"a mark without a usable monotonic baseline proved freshness: {m}")
+        self.assertEqual(m[9:], ["feed-stale", "feed-freshness-unverified"], "a feed unchanged for 200 s monotonic is stale; unchanged over 5 s proves nothing")
+
+    def test_one_guarded_parse_reads_every_record_number(self) -> None:
+        """sol r6 CP-07: JSON numbers and invariant numeric text parse; text, flags, arrays, fractions, out-of-range and non-finite values do not."""
+        self.assertEqual(self.r["number"], [[True, 4242], [True, 4242], [False, None], [False, None], [False, None], [True, 639286128040000000], [False, None],
+                                            [False, None], [False, None], [False, None], [False, None], [True, None], [True, 2.5], [False, None]])
+
+    def test_a_non_numeric_record_value_reaching_a_consumer_never_throws(self) -> None:
+        """sol r6 CP-07 sites :4299 :4399 :4404 :4473 :4498 :4501 :4512 :4514, each called directly with a non-number."""
+        c = self.r["consumers"]
+        self.assertFalse([x for x in c if str(x).startswith("threw")], f"a consumer threw on a non-numeric record value: {c}")
+        self.assertEqual(c[:5], ["", "", "", "", "0"], c)
+        self.assertEqual(c[5], "helper-record-malformed")
+        self.assertTrue(c[6].startswith("False|False|"), c[6])
+        self.assertIn("corePartitionTopologyOk=helper-record-malformed", c[6])
+        self.assertTrue(c[7].startswith("False|"), c[7])
+        self.assertIn("corePartitionTopologyOk=helper-record-malformed", c[7])
+
+    def test_the_record_hmac_is_checked_under_the_jobs_key(self) -> None:
+        """sol r6 CP-06: the right key verifies (any hex case, trailing line ending); another key, no MAC, no key or non-hex text does not."""
+        self.assertEqual(self.r["mac"], [True, True, True, False, False, False, False])
+
+    def test_a_record_not_provably_the_helpers_own_is_refused(self) -> None:
+        """sol r6 CP-06 (= adversary r6 A1), through the job's cleanup block and scalar line: no HMAC or another key's HMAC on a record with the
+        helper's schema and live pid, a genuine record's bytes replaced after the helper wrote them, a null launch pid with record pid 0, and a
+        non-zero helper exit. Each is refused with a typed reason, every acceptance flag false, core-partition.json still published without it."""
+        got = self.cleanup_cases()
+        expect = {
+            "planted-live-pid-no-mac": "helper-record-not-the-helpers",
+            "planted-live-pid-wrong-key": "helper-record-not-the-helpers",
+            "replaced-after-the-helper-wrote": "helper-record-not-the-helpers",
+            "launch-pid-null-record-pid-0": "helper-not-started+helper-record-not-the-helpers",
+            "helper-exit-nonzero": "helper-exit-nonzero",
+        }
+        for case, why in expect.items():
+            with self.subTest(case=case):
+                c = got[case]
+                self.assertNotIn("threw", c, c)
+                self.assertEqual([c["topo"], c["bench"], c["load"]], [False, False, False], f"a record not provably the helper's was accepted: {c}")
+                self.assertEqual(c["helperWhy"], why, c)
+                self.assertIn(f"corePartitionTopologyOk={why}", c["why"])
+                self.assertIs(c["publishedHelper"], False, f"core-partition.json carried the refused record or was not published: {c}")
+                self.assertTrue(c["scalars"], c)
+
+    def test_a_malformed_number_in_the_record_is_a_typed_refusal_and_everything_still_publishes(self) -> None:
+        """sol r6 CP-07 (= adversary r6 A2), its literal {"schema":...,"pid":"oops"} (planted and HMAC'd) and one non-number in each numeric (or
+        flag) field class of an otherwise valid HMAC'd record: a typed refusal, all flags false, core-partition.json and the summary scalars present."""
+        got = self.cleanup_cases()
+        cases = {"pid-oops-planted": "helper-record-not-the-helpers", "pid-oops-macd": "helper-record-malformed"}
+        cases.update({k: "helper-record-malformed" for k in got if k.startswith("field-")})
+        self.assertEqual(len([k for k in cases if k.startswith("field-")]), 17, sorted(got))
+        for case, why in cases.items():
+            with self.subTest(case=case):
+                c = got[case]
+                self.assertNotIn("threw", c, f"a malformed record aborted the cleanup: {c}")
+                self.assertEqual([c["topo"], c["bench"], c["load"]], [False, False, False], c)
+                self.assertEqual(c["helperWhy"], why, c)
+                self.assertIs(c["publishedHelper"], False, f"core-partition.json missing or carrying the malformed record: {c}")
+                self.assertTrue(c["scalars"], c)
 
     def test_a_record_another_writer_put_at_the_helpers_name_is_not_the_helpers(self) -> None:
         """adversary r5 (40038f92) A2, its literal record, through the job's cleanup block and scalar line."""
