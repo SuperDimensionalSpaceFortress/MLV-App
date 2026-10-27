@@ -650,6 +650,22 @@ function Stop-VerifiedProcessIdentities {
     return @($killed)
 }
 
+function Stop-ProcessAfterStartFailure {
+    # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): a launch helper whose Process.Start returned a process, and that then failed
+    # (stream, timestamp or record setup threw), stops that process's whole tree BEFORE it reports the start as failed, so no caller is told
+    # ok=$false while a child it cannot see still runs. Returns stopped | already-exited | stop-failed. Never throws and reads no clock (the
+    # failure being handled may be the clock). It never disposes: on stop-failed the caller still holds the Process and hands it back.
+    param($Process)
+    $exitedBefore = $false
+    try { $exitedBefore = [bool]$Process.HasExited } catch { }
+    try { $Process.Kill($true) } catch { }
+    $exited = $false
+    try { $exited = [bool]$Process.WaitForExit(2000) } catch { }
+    if (-not $exited) { return "stop-failed" }
+    if ($exitedBefore) { return "already-exited" }
+    return "stopped"
+}
+
 function Start-WindowlessRedirectedProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -677,12 +693,14 @@ function Start-WindowlessRedirectedProcess {
     $outStream = $null
     $errStream = $null
     $process = $null
+    $started = $false
     try {
         $outStream = [System.IO.File]::Open($OutFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
         $errStream = [System.IO.File]::Open($ErrFile, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
         $process = [System.Diagnostics.Process]::new()
         $process.StartInfo = $startInfo
         if (-not $process.Start()) { throw "Process.Start returned false for $FilePath" }
+        $started = $true
         return [pscustomobject]@{
             Process = $process
             OutStream = $outStream
@@ -692,9 +710,19 @@ function Start-WindowlessRedirectedProcess {
         }
     }
     catch {
+        # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): a child that was created before the pipe copies failed is stopped
+        # before the throw. The thrown message and Data.postStartStop name the outcome; on stop-failed Data.process is the undisposed Process.
+        $ex = $null
+        if ($started) {
+            $stop = Stop-ProcessAfterStartFailure -Process $process
+            $ex = [System.InvalidOperationException]::new("$($_.Exception.Message) (after the process started; postStartStop=$stop)", $_.Exception)
+            $ex.Data["postStartStop"] = $stop
+            if ($stop -eq "stop-failed") { $ex.Data["process"] = $process; $process = $null }
+        }
         if ($null -ne $process) { $process.Dispose() }
         if ($null -ne $outStream) { $outStream.Dispose() }
         if ($null -ne $errStream) { $errStream.Dispose() }
+        if ($null -ne $ex) { throw $ex }
         throw
     }
 }
@@ -2019,7 +2047,14 @@ function Invoke-HeavySlotStatus {
         return @{ ok = $true; lines = $lines; error = $null }
     }
     catch {
-        return @{ ok = $false; lines = @(); error = "status failed: $($_.Exception.Message)" }
+        $msg = "status failed: $($_.Exception.Message)"
+        if ($null -eq $p) { return @{ ok = $false; lines = @(); error = $msg } }
+        # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): a probe that started is stopped before the failure is returned; on
+        # stop-failed it is returned undisposed (proc) instead of being dropped.
+        $stop = Stop-ProcessAfterStartFailure -Process $p
+        $live = $null
+        if ($stop -eq "stop-failed") { $live = $p; $p = $null }
+        return @{ ok = $false; lines = @(); error = "$msg (postStartStop=$stop)"; postStartStop = $stop; proc = $live }
     }
     finally {
         if ($null -ne $p) { $p.Dispose() }
@@ -2248,6 +2283,9 @@ function Add-LeaseSlotSnapshot {
         }
         $call = Start-HeavySlotCli -Arguments @("status", "--slots", "$HeavySlotCount") -Python $HeavySlotPython -Script $HeavySlotScript
         if (-not $call.ok) {
+            # r2 (sol r1 B4-post-start): a start that failed AFTER its process was created has stopped it (postStartStop= in why); one it
+            # could not stop comes back with its proc and is stopped again here, never left running unwatched.
+            Stop-HeavySlotCli -Call $call
             $dog.Disarm()
             Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown($(([string]$call.why) -replace '\s+', ' '))"
             return
@@ -2264,7 +2302,7 @@ function Add-LeaseSlotSnapshot {
     }
     catch {
         # A probe started but never registered (the registration threw) is stopped now: nothing would poll it.
-        try { if (-not $registered -and $null -ne $call -and $call.ok) { Stop-HeavySlotCli -Call $call } } catch { }
+        try { if (-not $registered -and $null -ne $call) { Stop-HeavySlotCli -Call $call } } catch { }
         try { if (-not $registered -and $null -ne $dog) { $dog.Disarm() } } catch { }
         try { Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown(snapshot failed: $(([string]$_.Exception.Message) -replace '\s+', ' '))" } catch { }
     }
@@ -2592,23 +2630,54 @@ function Start-HeavySlotHolder {
             -Environment @{ HEAVY_SLOT_DIR = $HeavySlotDir; HEAVY_SLOT_FEED = $HeavySlotFeed; HEAVY_SLOT_HELD = $null }
     }
     catch {
+        # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): the launch helper has already stopped a holder that started before
+        # it threw; one it could not stop (Data.process) is stopped again and its release file written, so its sentinel frees the slot at once.
+        $left = $null
+        try { $left = $_.Exception.Data["process"] } catch { }
+        if ($null -ne $left) {
+            $null = Stop-ProcessAfterStartFailure -Process $left
+            try { [System.IO.File]::WriteAllText($rel, "post-start stop failed") } catch { }
+        }
         return [pscustomobject]@{ ok = $false; why = "holder launch failed: $($_.Exception.Message)" }
     }
     # The record goes down FIRST, from the Process object (no CIM query), so an agent killed right after the start still
     # leaves a record its successor can stop (Stop-StaleHeavySlotHolders matches pid + start time). A holder orphaned
     # anyway resolves itself: when its ticket reaches the head, its sentinel finds this agent gone and exits at once.
-    $recordFile = Join-Path $slotHolders "$id.holder.json"
-    $startMs = $null
-    try { $startMs = [DateTimeOffset]::new($launch.Process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() } catch { }
-    $rec = [ordered]@{ id = $id; jobId = $JobId; label = $label; pid = $launch.Process.Id; startEpochMs = $startMs; acquiredFile = $acq; releaseFile = $rel; agentPid = $PID; agentProcessStartUtc = $script:AgentProcessStartUtc }
-    $w = Write-JsonFileAtomic -Path $recordFile -InputObject $rec
-    $identity = Get-ProcessIdentity -ProcessId $launch.Process.Id
-    $h = [pscustomobject]@{
-        ok = $true; id = $id; jobId = $JobId; label = $label; launch = $launch; pid = $launch.Process.Id; identity = $identity
-        acquiredFile = $acq; releaseFile = $rel; recordFile = $recordFile; why = $null
+    # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): a throw from here until the holder is returned stops the holder tree and
+    # returns ok=$false naming postStartStop (the wait keeps waiting, as on a failed start). A stopped holder's record is removed; one it could
+    # not stop keeps its record for the successor agent (Stop-StaleHeavySlotHolders) and is returned as launch.
+    $recordFile = $null
+    try {
+        $recordFile = Join-Path $slotHolders "$id.holder.json"
+        $startMs = $null
+        try { $startMs = [DateTimeOffset]::new($launch.Process.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() } catch { }
+        $rec = [ordered]@{ id = $id; jobId = $JobId; label = $label; pid = $launch.Process.Id; startEpochMs = $startMs; acquiredFile = $acq; releaseFile = $rel; agentPid = $PID; agentProcessStartUtc = $script:AgentProcessStartUtc }
+        $w = Write-JsonFileAtomic -Path $recordFile -InputObject $rec
+        $identity = Get-ProcessIdentity -ProcessId $launch.Process.Id
+        $h = [pscustomobject]@{
+            ok = $true; id = $id; jobId = $JobId; label = $label; launch = $launch; pid = $launch.Process.Id; identity = $identity
+            acquiredFile = $acq; releaseFile = $rel; recordFile = $recordFile; why = $null
+        }
+        Add-AgentLogLine "heavy-slot-gate: holder started job=$JobId pid=$($h.pid) label='$label' (heavy-slot.py run --exclusive; its FIFO ticket) record=$($w.ok)"
+        return $h
     }
-    Add-AgentLogLine "heavy-slot-gate: holder started job=$JobId pid=$($h.pid) label='$label' (heavy-slot.py run --exclusive; its FIFO ticket) record=$($w.ok)"
-    return $h
+    catch {
+        $msg = "holder failed after it started: $($_.Exception.Message)"
+        $stop = Stop-ProcessAfterStartFailure -Process $launch.Process
+        $live = $null
+        if ($stop -eq "stop-failed") {
+            # Its sentinel releases the slot as soon as it acquires it: the release file is written now.
+            $live = $launch
+            try { [System.IO.File]::WriteAllText($rel, "post-start stop failed") } catch { }
+        }
+        else {
+            try { $launch.OutStream.Dispose() } catch { }
+            try { $launch.ErrStream.Dispose() } catch { }
+            try { $launch.Process.Dispose() } catch { }
+            if ($recordFile) { Remove-Item -LiteralPath $recordFile -Force -ErrorAction SilentlyContinue }
+        }
+        return [pscustomobject]@{ ok = $false; launch = $live; postStartStop = $stop; why = "$msg (postStartStop=$stop)" }
+    }
 }
 
 function Get-HeavySlotHolderState {
@@ -2842,7 +2911,10 @@ function Wait-HeavySlotAdmission {
             if ($null -eq $holder -and $now -ge $nextHolderAt) {
                 $h = Start-HeavySlotHolder -JobId $JobId -Label $label
                 if ($h.ok) { $holder = $h; $holderStarts++; $state = "queued"; $why = "ticket filed by heavy-slot.py run --exclusive" }
-                else { $state = "holder-unavailable"; $why = $h.why; $nextHolderAt = $now.AddSeconds($GateProbeSec) }
+                else {
+                    if ($null -ne $h.launch) { $null = Stop-ProcessAfterStartFailure -Process $h.launch.Process }   # r2: a holder its start could not stop
+                    $state = "holder-unavailable"; $why = $h.why; $nextHolderAt = $now.AddSeconds($GateProbeSec)
+                }
             }
             $hs = if ($null -ne $holder) { Get-HeavySlotHolderState -Holder $holder } else { $null }
             if ($null -ne $hs -and $hs.state -eq "exited") {
@@ -3055,6 +3127,7 @@ function Start-HeavySlotCli {
     }
     $scr = if ($Script) { $Script } else { $HeavySlotScript }
     if (-not (Test-Path -LiteralPath $scr -PathType Leaf)) { return [pscustomobject]@{ ok = $false; why = "heavy-slot.py not found ($scr)" } }
+    $p = $null
     try {
         $si = [System.Diagnostics.ProcessStartInfo]::new()
         $si.FileName = $py
@@ -3070,7 +3143,17 @@ function Start-HeavySlotCli {
         return [pscustomobject]@{ ok = $true; proc = $p; out = $p.StandardOutput.ReadToEndAsync(); err = $p.StandardError.ReadToEndAsync(); started = (Get-Date); why = $null }
     }
     catch {
-        return [pscustomobject]@{ ok = $false; why = "heavy-slot.py $($Arguments -join ' ') failed to start: $($_.Exception.Message)" }
+        $msg = "heavy-slot.py $($Arguments -join ' ') failed to start: $($_.Exception.Message)"
+        if ($null -eq $p) { return [pscustomobject]@{ ok = $false; why = $msg } }
+        # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): Process.Start returned a process and a later statement threw (the
+        # pipe reads or the timestamp). That process is stopped HERE, before ok=$false is returned, so no caller is left with a live call it was
+        # told never started. why and postStartStop name the outcome; on stop-failed proc is the still-undisposed Process, for the caller to
+        # stop again (Stop-HeavySlotCli takes a failed call that carries one), never dropped.
+        $stop = Stop-ProcessAfterStartFailure -Process $p
+        $live = $null
+        if ($stop -eq "stop-failed") { $live = $p }
+        else { try { $p.Dispose() } catch { } }
+        return [pscustomobject]@{ ok = $false; proc = $live; postStartStop = $stop; why = "$msg (after the process started; postStartStop=$stop)" }
     }
 }
 
@@ -3091,8 +3174,9 @@ function Stop-HeavySlotCli {
     # Kills a call that did not return in time (its whole tree) and disposes it.
     # AGENT-LEASE-PENDING-HEAT-TRACE-1 r5 (adversary r5-2ca9f68f A1): the tree is killed even when its root has exited, so a child the root left
     # running (holding the call's output pipes) does not outlive it; Kill(true) on an exited root still ends its children.
+    # r2 (sol r1 B4-post-start): a FAILED call that still carries a process (Start-HeavySlotCli's postStartStop=stop-failed) is stopped too.
     param($Call)
-    if ($null -eq $Call -or -not $Call.ok) { return }
+    if ($null -eq $Call -or $null -eq $Call.proc) { return }
     try { $Call.proc.Kill($true) } catch { }
     try { [void]$Call.proc.WaitForExit(2000) } catch { }
     try { $Call.proc.Dispose() } catch { }
@@ -3101,17 +3185,28 @@ function Stop-HeavySlotCli {
 function Complete-HeavySlotCli {
     # Waits up to TimeoutSec for a Start-HeavySlotCli call, heartbeating every 5 s (the VM reads a heartbeat older than 30 s
     # as a possibly-dead agent). Returns Receive-HeavySlotCli's record, or done=$false (the call was killed) when it is slow.
+    # r2 (sol r1 B4-post-start): a failed start that still carries a process is stopped again here (the release and pre-launch renew callers),
+    # and a wait that throws stops its call before the exception goes on, so no caller of this waiter is left with a live call.
     param([Parameter(Mandatory = $true)]$Call, [int]$TimeoutSec = 30, [string]$HeartbeatActivity = "")
-    if (-not $Call.ok) { return [pscustomobject]@{ done = $false; rc = $null; stdout = ""; stderr = ""; why = $Call.why } }
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while (-not $Call.proc.WaitForExit(1000)) {
-        if ((Get-Date) -ge $deadline) {
-            Stop-HeavySlotCli -Call $Call
-            return [pscustomobject]@{ done = $false; rc = $null; stdout = ""; stderr = ""; why = "did not return within $TimeoutSec s" }
-        }
-        if ($HeartbeatActivity) { Write-AgentHeartbeat -Activity $HeartbeatActivity }
+    if (-not $Call.ok) {
+        Stop-HeavySlotCli -Call $Call
+        return [pscustomobject]@{ done = $false; rc = $null; stdout = ""; stderr = ""; why = $Call.why }
     }
-    return Receive-HeavySlotCli -Call $Call
+    try {
+        $deadline = (Get-Date).AddSeconds($TimeoutSec)
+        while (-not $Call.proc.WaitForExit(1000)) {
+            if ((Get-Date) -ge $deadline) {
+                Stop-HeavySlotCli -Call $Call
+                return [pscustomobject]@{ done = $false; rc = $null; stdout = ""; stderr = ""; why = "did not return within $TimeoutSec s" }
+            }
+            if ($HeartbeatActivity) { Write-AgentHeartbeat -Activity $HeartbeatActivity }
+        }
+        return Receive-HeavySlotCli -Call $Call
+    }
+    catch {
+        Stop-HeavySlotCli -Call $Call
+        throw
+    }
 }
 
 function Start-QuietLeaseRequest {
@@ -3147,25 +3242,48 @@ function Start-QuietLeaseRequest {
         $p = [System.Diagnostics.Process]::Start($si)
     }
     catch {
-        return [pscustomobject]@{ ok = $false; why = "lease request failed to start: $($_.Exception.Message)" }
+        $msg = "lease request failed to start: $($_.Exception.Message)"
+        if ($null -eq $p) { return [pscustomobject]@{ ok = $false; why = $msg } }
+        $stop = Stop-ProcessAfterStartFailure -Process $p
+        $live = $null
+        if ($stop -eq "stop-failed") { $live = $p } else { try { $p.Dispose() } catch { } }
+        return [pscustomobject]@{ ok = $false; proc = $live; postStartStop = $stop; why = "$msg (after the process started; postStartStop=$stop)" }
     }
-    $recordFile = Join-Path $slotHolders "$id.lease.json"
-    $startMs = $null
-    try { $startMs = [DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() } catch { }
-    $rec = [ordered]@{ id = $id; jobId = $JobId; label = $script:QuietLeaseLabel; minutes = $Minutes; pid = $p.Id; startEpochMs = $startMs; agentPid = $PID; agentProcessStartUtc = $script:AgentProcessStartUtc }
-    $w = Write-JsonFileAtomic -Path $recordFile -InputObject $rec
-    $lease = [pscustomobject]@{
-        ok = $true; id = $id; jobId = $JobId; label = $script:QuietLeaseLabel; minutes = $Minutes; proc = $p; pid = $p.Id
-        admitTimeoutSec = $AdmitTimeoutSec; admitTimeoutSource = $AdmitTimeoutSource
-        identity = (Get-ProcessIdentity -ProcessId $p.Id); recordFile = $recordFile; requested = (Get-Date)
-        outLines = [System.Collections.Generic.List[string]]::new(); outTask = $p.StandardOutput.ReadLineAsync(); outEof = $false
-        errTask = $p.StandardError.ReadToEndAsync(); active = $null; activeAt = $null; ownerCheck = $null
-        renewCall = $null; lastRenewStart = $null; renewStarts = 0; renewsOk = 0; renewFailures = 0; renewSlow = 0; renewMaxGapSec = 0
-        lastRenewOkStart = $null; renewOkMaxGapSec = 0
-        lostLogged = $false; why = $null
+    # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): from here the wrapper runs. A throw before the lease is returned (the record,
+    # the identity, the stdout read, the log line) stops it and returns ok=$false naming postStartStop, as a failed start; the wait would
+    # otherwise hold no reference to a live request. A stopped wrapper's record is removed; a wrapper it could not stop keeps its record, so
+    # this agent's successor ends it (Stop-StaleQuietLeases), and is returned as proc.
+    $recordFile = $null
+    try {
+        $recordFile = Join-Path $slotHolders "$id.lease.json"
+        $startMs = $null
+        try { $startMs = [DateTimeOffset]::new($p.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds() } catch { }
+        $rec = [ordered]@{ id = $id; jobId = $JobId; label = $script:QuietLeaseLabel; minutes = $Minutes; pid = $p.Id; startEpochMs = $startMs; agentPid = $PID; agentProcessStartUtc = $script:AgentProcessStartUtc }
+        $w = Write-JsonFileAtomic -Path $recordFile -InputObject $rec
+        $lease = [pscustomobject]@{
+            ok = $true; id = $id; jobId = $JobId; label = $script:QuietLeaseLabel; minutes = $Minutes; proc = $p; pid = $p.Id
+            admitTimeoutSec = $AdmitTimeoutSec; admitTimeoutSource = $AdmitTimeoutSource
+            identity = (Get-ProcessIdentity -ProcessId $p.Id); recordFile = $recordFile; requested = (Get-Date)
+            outLines = [System.Collections.Generic.List[string]]::new(); outTask = $p.StandardOutput.ReadLineAsync(); outEof = $false
+            errTask = $p.StandardError.ReadToEndAsync(); active = $null; activeAt = $null; ownerCheck = $null
+            renewCall = $null; lastRenewStart = $null; renewStarts = 0; renewsOk = 0; renewFailures = 0; renewSlow = 0; renewMaxGapSec = 0
+            lastRenewOkStart = $null; renewOkMaxGapSec = 0
+            lostLogged = $false; why = $null
+        }
+        Add-AgentLogLine "quiet-lease: request started job=$JobId pid=$($p.Id) label='$($script:QuietLeaseLabel)' minutes=$Minutes admitTimeout=${AdmitTimeoutSec}s admitTimeoutSource=$AdmitTimeoutSource record=$($w.ok)"
+        return $lease
     }
-    Add-AgentLogLine "quiet-lease: request started job=$JobId pid=$($p.Id) label='$($script:QuietLeaseLabel)' minutes=$Minutes admitTimeout=${AdmitTimeoutSec}s admitTimeoutSource=$AdmitTimeoutSource record=$($w.ok)"
-    return $lease
+    catch {
+        $msg = "lease request failed after it started: $($_.Exception.Message)"
+        $stop = Stop-ProcessAfterStartFailure -Process $p
+        $live = $null
+        if ($stop -eq "stop-failed") { $live = $p }
+        else {
+            try { $p.Dispose() } catch { }
+            if ($recordFile) { Remove-Item -LiteralPath $recordFile -Force -ErrorAction SilentlyContinue }
+        }
+        return [pscustomobject]@{ ok = $false; proc = $live; postStartStop = $stop; why = "$msg (postStartStop=$stop)" }
+    }
 }
 
 function Test-QuietLeaseOwnerPid {
@@ -3279,6 +3397,7 @@ function Update-QuietLeaseRenew {
     $c = Start-HeavySlotCli -Arguments @("lease", "renew", "--label", $Lease.label)
     if ($c.ok) { $Lease.renewCall = $c }
     else {
+        Stop-HeavySlotCli -Call $c   # r2 (sol r1 B4-post-start): a failed start still carrying its process (stop-failed) is stopped again
         $Lease.renewFailures++
         Add-AgentLogLine "quiet-lease: renew-failed job=$($Lease.jobId) why=[$($c.why)]; not fatal"
     }
@@ -3734,6 +3853,9 @@ function Wait-QuietLeaseAdmission {
                 # light job too) stops renewing it once that deadline passes.
                 if ($l.ok) { $l | Add-Member -NotePropertyName notAfterUtc -NotePropertyValue $v.notAfterUtc -Force; $lease = $l; $script:QuietLeaseWaiting = $l; $requests++; $state = "lease-pending"; $why = "lease request pid=$($l.pid) pending" }
                 else {
+                    # r2 (sol r1 B4-post-start): a request that failed after its wrapper started and could not be stopped (proc) is stopped
+                    # again; its record stays on disk for a successor agent either way.
+                    if ($null -ne $l.proc) { $null = Stop-ProcessAfterStartFailure -Process $l.proc }
                     $state = "lease-unavailable"; $why = $l.why; $nextRequestAt = $now.AddSeconds($LeaseRetrySec)
                     Add-AgentLogLine "quiet-lease: unavailable job=$JobId why=[$why]; the job is NOT run unleased; asking again in ${LeaseRetrySec}s"
                 }
@@ -4195,6 +4317,11 @@ function Invoke-QueuedJob {
     }
     catch {
         $exit = 1
+        # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): a job child the launch helper started and then could not stop
+        # (Data.process, postStartStop=stop-failed) is stopped again here, never dropped while it runs.
+        $left = $null
+        try { $left = $_.Exception.Data["process"] } catch { }
+        if ($null -ne $left) { $null = Stop-ProcessAfterStartFailure -Process $left; try { $left.Dispose() } catch { } }
         "agent failed to launch or monitor job: $($_.Exception.Message)" |
             Add-Content -Encoding ASCII $errFile
     }

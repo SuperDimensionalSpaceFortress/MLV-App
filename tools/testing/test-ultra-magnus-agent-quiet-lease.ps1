@@ -118,7 +118,9 @@ foreach ($name in $liftNotAfter) {
 }
 # lease-batch r4 (the merge of not-after r1): the same, so batch-refusal-ends-batch fails on behaviour against an agent without it.
 foreach ($name in @('Close-LeaseBatchAfterRelease', 'ConvertTo-UtcDateTime', 'Get-LeaseWaitHeatField', 'Get-LeaseSlotAgeText', 'ConvertFrom-HeavySlotHolderText', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec',
-        'Write-LeaseSlotSnapshotLine', 'Update-LeaseSlotSnapshots', 'Set-LeaseCoverageAtLaunch', 'Test-LeaseLocalFixedPath', 'Get-LeaseSlotSnapshotWaitMs', 'Initialize-LeaseProbeWatchdog')) {   # r5: the last one (the probe's own watchdog; called below, as the agent does at start). r4: the two before it (the local-path rule, the bound-capped wait); from ConvertTo-UtcDateTime on: AGENT-LEASE-PENDING-HEAT-TRACE-1 (ConvertTo-UtcDateTime: the headroom helper reads the sidecar bound with it; the last three: r3, the asynchronous probe and the coverage at launch)
+        'Write-LeaseSlotSnapshotLine', 'Update-LeaseSlotSnapshots', 'Set-LeaseCoverageAtLaunch', 'Test-LeaseLocalFixedPath', 'Get-LeaseSlotSnapshotWaitMs', 'Initialize-LeaseProbeWatchdog',
+        'Stop-ProcessAfterStartFailure')) {   # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2: the post-start stop (sol r1 B4-post-start); absent on a base agent
+   # r5: the last one (the probe's own watchdog; called below, as the agent does at start). r4: the two before it (the local-path rule, the bound-capped wait); from ConvertTo-UtcDateTime on: AGENT-LEASE-PENDING-HEAT-TRACE-1 (ConvertTo-UtcDateTime: the headroom helper reads the sidecar bound with it; the last three: r3, the asynchronous probe and the coverage at launch)
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -804,7 +806,8 @@ try {
         'batch-close-before-reuse', 'batch-runner-killed-liveness', 'lease-pending-heat-trace',
         'lease-heat-trace-async-retry', 'lease-heat-trace-grant-coverage', 'queuedjob-lease-coverage-at-launch', 'lease-heat-trace-nonlocal-feed',
         'lease-heat-trace-checked-python', 'lease-heat-trace-probe-watchdog',
-        'lease-snapshot-bound-straddle', 'lease-probe-watchdog-add-type-failure', 'lease-probe-watchdog-ctor-failure', 'lease-probe-watchdog-arm-paths')
+        'lease-snapshot-bound-straddle', 'lease-probe-watchdog-add-type-failure', 'lease-probe-watchdog-ctor-failure', 'lease-probe-watchdog-arm-paths',
+        'lease-start-post-start-failure')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -3054,6 +3057,111 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             Set-Item -LiteralPath Function:\Start-HeavySlotCli -Value $script:ApCliReal
             foreach ($k in @($script:ApProcs)) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
             $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 0
+            Update-LeaseSlotSnapshots -Abandon 'test case end'
+        }
+    }
+    # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): Process.Start returns a live child and a LATER statement in the launch
+    # helper throws. Sol's seam: Get-Date's -Date defaults to 'not-a-date' only while the named helper is on the call stack, with WarningPreference
+    # Stop (the failed default binding is a warning, so Stop makes it a throw); the seam records the helper's $p, the child it had started. Each
+    # child must be stopped before the failure is reported (RED on 88c907eb: alive, stopCalls=0):
+    #   snapshot - Add-LeaseSlotSnapshot (the B4 caller, HeadroomSec 600): not registered, the line names postStartStop=stopped;
+    #   direct   - Start-HeavySlotCli: ok=$false, postStartStop=stopped, no proc handed back;
+    #   complete - Complete-HeavySlotCli over that start (the release and pre-launch renew callers): done=$false;
+    #   renew    - Update-QuietLeaseRenew (the renew caller; the fake's renew hangs 30 s): no renewCall, renewFailures 1;
+    #   request  - Start-QuietLeaseRequest, its timestamp after the start (the wrapper waits for a release): ok=$false, its record removed;
+    #   status   - Invoke-HeavySlotStatus, its deadline after the start: ok=$false naming postStartStop=stopped.
+    if (Test-Case 'lease-start-post-start-failure') {
+        $psFails = [System.Collections.Generic.List[string]]::new()
+        $script:PsSeamFn = ''
+        $script:PsSeamPids = [System.Collections.Generic.List[int]]::new()
+        $script:PsStops = 0
+        $script:PsStopCliReal = ${function:Stop-HeavySlotCli}
+        $script:PsStopAfterReal = ${function:Stop-ProcessAfterStartFailure}   # $null on a base agent
+        $psStatusReal = ${function:Invoke-HeavySlotStatus}
+        $psSavedList = $script:LeaseSlotSnapshots
+        $psSavedWarn = $WarningPreference
+        function Stop-HeavySlotCli { param($Call) $script:PsStops++; & $script:PsStopCliReal @PSBoundParameters }
+        if ($null -ne $script:PsStopAfterReal) { function Stop-ProcessAfterStartFailure { param($Process) $script:PsStops++; return (& $script:PsStopAfterReal @PSBoundParameters) } }
+        function Invoke-PsSeam([string]$Fn, [scriptblock]$Body) {
+            # Returns @{ out; threw; pids; alive; stops }: alive is the started children still running 3 s after the helper returned.
+            $script:PsSeamFn = $Fn; $script:PsSeamPids.Clear(); $script:PsStops = 0
+            $out = $null; $threw = $null
+            $PSDefaultParameterValues['Get-Date:Date'] = {
+                $f = @(Get-PSCallStack | Where-Object { $_.Command -eq $script:PsSeamFn }) | Select-Object -First 1
+                if ($null -eq $f) { return [DateTime]::Now }
+                $v = $null
+                try { $v = $f.GetFrameVariables()['p'] } catch { }
+                if ($null -ne $v -and $v.Value -is [System.Diagnostics.Process]) { try { if (-not $script:PsSeamPids.Contains($v.Value.Id)) { $script:PsSeamPids.Add($v.Value.Id) } } catch { } }
+                'not-a-date'
+            }
+            $WarningPreference = 'Stop'
+            try { $out = & $Body 3>$null } catch { $threw = $_.Exception.Message }   # 3>$null: the seam's warning still throws (Stop), unprinted (the -UnitOnly caller parses stdout)
+            finally { $PSDefaultParameterValues.Remove('Get-Date:Date'); $WarningPreference = $psSavedWarn; $script:PsSeamFn = '' }
+            $pids = @($script:PsSeamPids)
+            $null = Wait-Until { @($pids | Where-Object { Test-PidAlive $_ }).Count -eq 0 } 3
+            return [pscustomobject]@{ out = $out; threw = $threw; pids = $pids; alive = @($pids | Where-Object { Test-PidAlive $_ }); stops = $script:PsStops }
+        }
+        function Test-PsStopped([string]$Case, $R) {
+            if ($R.pids.Count -ne 1) { $psFails.Add("($Case) the seam fired after Process.Start returned exactly one child: pids=[$($R.pids -join ',')] threw=[$($R.threw)]"); return }
+            if ($R.alive.Count -ne 0 -or $R.stops -lt 1) { $psFails.Add("($Case) the started child is stopped before the failure is reported: alive=[$($R.alive -join ',')] stopCalls=$($R.stops)") }
+        }
+        try {
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: free', 'slot 2: free') }; $script:StatusDelaySec = 300
+            Reset-Case @{ request = 'active' }
+            Sync-FakeStatus
+            # snapshot
+            $n0 = $script:LeaseSlotSnapshots.Count
+            $rS = Invoke-PsSeam 'Start-HeavySlotCli' { Add-LeaseSlotSnapshot -JobId 'jPsSn' -Phase 'grant' -HeadroomSec 600 }
+            $regS = $script:LeaseSlotSnapshots.Count - $n0
+            $lS = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jPsSn *' })
+            Test-PsStopped 'snapshot' $rS
+            if ($regS -ne 0) { $psFails.Add("(snapshot) a probe whose start failed is not registered: registered=$regS") }
+            if ($lS.Count -ne 1 -or $lS[0] -notmatch ' phase=grant slots=unknown\(heavy-slot\.py status --slots \d+ failed to start: .*postStartStop=stopped\)\)?$') { $psFails.Add("(snapshot) the line names postStartStop=stopped: [$($lS -join ' || ')]") }
+            # direct
+            $rD = Invoke-PsSeam 'Start-HeavySlotCli' { Start-HeavySlotCli -Arguments @('status', '--slots', '2') }
+            Test-PsStopped 'direct' $rD
+            if ($null -eq $rD.out -or $rD.out.ok -ne $false -or [string]$rD.out.postStartStop -cne 'stopped' -or $null -ne $rD.out.proc -or [string]$rD.out.why -notmatch 'postStartStop=stopped') { $psFails.Add("(direct) ok=False postStartStop=stopped and no proc: ok=$($rD.out.ok) postStartStop=$($rD.out.postStartStop) proc=$($null -ne $rD.out.proc) why=[$($rD.out.why)]") }
+            # complete
+            $rC = Invoke-PsSeam 'Start-HeavySlotCli' { Complete-HeavySlotCli -Call (Start-HeavySlotCli -Arguments @('status', '--slots', '2')) -TimeoutSec 5 }
+            Test-PsStopped 'complete' $rC
+            if ($null -eq $rC.out -or $rC.out.done -ne $false) { $psFails.Add("(complete) done=False: [$($rC.out | ConvertTo-Json -Compress)] threw=[$($rC.threw)]") }
+            # renew
+            Reset-Case @{ request = 'active'; renew_hang = $true }
+            $me = [System.Diagnostics.Process]::GetCurrentProcess()
+            $lR = [pscustomobject]@{ jobId = 'jPsRn'; label = 'quiet-lease mlv'; proc = $me; active = [pscustomobject]@{ slot = 1 }; renewCall = $null
+                lastRenewStart = [DateTime]::Now.AddSeconds(-600); renewMaxGapSec = 0; renewStarts = 0; renewFailures = 0; renewSlow = 0; renewsOk = 0 }
+            $rR = Invoke-PsSeam 'Start-HeavySlotCli' { Update-QuietLeaseRenew -Lease $lR }
+            Test-PsStopped 'renew' $rR
+            if ($null -ne $lR.renewCall -or $lR.renewFailures -ne 1) { $psFails.Add("(renew) a failed start is a renew failure, never a renew in flight: renewCall=$($null -ne $lR.renewCall) renewFailures=$($lR.renewFailures)") }
+            if ($null -ne $lR.renewCall) { try { $lR.renewCall.proc.Kill($true) } catch { } }
+            # request
+            Reset-Case @{ request = 'active' }
+            $recs0 = @(Get-ChildItem -LiteralPath $slotHolders -Filter '*.lease.json' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+            $rQ = Invoke-PsSeam 'Start-QuietLeaseRequest' { Start-QuietLeaseRequest -JobId 'jPsRq' -Minutes 5 -AdmitTimeoutSec 60 }
+            $recsNew = @(Get-ChildItem -LiteralPath $slotHolders -Filter '*.lease.json' -File -ErrorAction SilentlyContinue | Where-Object { $recs0 -notcontains $_.Name })
+            Test-PsStopped 'request' $rQ
+            if ($null -eq $rQ.out -or $rQ.out.ok -ne $false -or [string]$rQ.out.postStartStop -cne 'stopped' -or [string]$rQ.out.why -notmatch 'postStartStop=stopped') { $psFails.Add("(request) ok=False postStartStop=stopped: ok=$($rQ.out.ok) why=[$($rQ.out.why)] threw=[$($rQ.threw)]") }
+            if ($recsNew.Count -ne 0) { $psFails.Add("(request) a stopped wrapper's record is removed: [$($recsNew.Name -join ',')]") }
+            foreach ($f in $recsNew) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
+            # status
+            . ([scriptblock]::Create((Get-FunctionBody 'Invoke-HeavySlotStatus')))
+            Reset-Case @{ request = 'active' }
+            Sync-FakeStatus
+            $rT = Invoke-PsSeam 'Invoke-HeavySlotStatus' { Invoke-HeavySlotStatus -HeartbeatActivity 'unit' }
+            Test-PsStopped 'status' $rT
+            if ($null -eq $rT.out -or $rT.out.ok -ne $false -or [string]$rT.out.error -notmatch 'postStartStop=stopped') { $psFails.Add("(status) ok=False naming postStartStop=stopped: ok=$($rT.out.ok) error=[$($rT.out.error)]") }
+            Assert-True ($psFails.Count -eq 0) "post-start failure stops the started child (sol r1 B4-post-start): $($psFails -join ' ;; ')"
+            $results.leaseStartPostStartFailure = [ordered]@{ snapshot = $lS; direct = $rD.out.why; request = $rQ.out.why; status = $rT.out.error }
+        }
+        finally {
+            $PSDefaultParameterValues.Remove('Get-Date:Date')
+            $WarningPreference = $psSavedWarn
+            $script:LeaseSlotSnapshots = $psSavedList
+            Set-Item -LiteralPath Function:\Stop-HeavySlotCli -Value $script:PsStopCliReal
+            if ($null -ne $script:PsStopAfterReal) { Set-Item -LiteralPath Function:\Stop-ProcessAfterStartFailure -Value $script:PsStopAfterReal }
+            if ($null -ne $psStatusReal) { Set-Item -LiteralPath Function:\Invoke-HeavySlotStatus -Value $psStatusReal }
+            foreach ($k in @($script:PsSeamPids)) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
+            $script:StatusDelaySec = 0
             Update-LeaseSlotSnapshots -Abandon 'test case end'
         }
     }
