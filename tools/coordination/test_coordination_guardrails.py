@@ -2276,7 +2276,9 @@ def test_continuation_dirty_refusal_sees_an_untracked_orphan_despite_show_untrac
 
 
 DIRTY_SAVE_PWSH = shutil.which("pwsh")
-dirty_save_only = pytest.mark.skipif(DIRTY_SAVE_PWSH is None, reason="the PowerShell helper needs pwsh")
+# The saver writes only where it can hold a directory open (Windows); elsewhere it refuses every save (r7), so the save tests run on Windows and dirty_save_posix runs the refusal.
+dirty_save_only = pytest.mark.skipif(DIRTY_SAVE_PWSH is None or os.name != "nt", reason="the PowerShell helper needs pwsh, and saves only on Windows")
+dirty_save_posix = pytest.mark.skipif(DIRTY_SAVE_PWSH is None or os.name == "nt", reason="the PowerShell helper needs pwsh; the platform refusal is POSIX behaviour")
 
 
 def dirty_save_pwsh(body):
@@ -2567,20 +2569,22 @@ def test_save_dirty_worktree_evidence_ignores_git_environment_that_changes_the_d
 
 
 @dirty_save_only
-def test_save_dirty_worktree_evidence_keeps_a_staged_gitlink_despite_ignore_submodules_config(tmp_path):
-    # r3 round-3 adversary A3: diff.ignoreSubmodules=all hid the gitlink from the quiet query and from both diffs, so SAVED reported staged=none.
+def test_save_dirty_worktree_evidence_refuses_a_gitlink_change_plain_apply_cannot_move(tmp_path):
+    # r7 (adversary cd31735a-A2): the patch recorded a changed gitlink, but the advertised plain `git apply` ignores a submodule's commit ids and leaves the pointer where it
+    # was, and the reverse-apply check passes without looking at it, so SAVED promised a recovery that silently dropped the change. A tracked diff holding a mode-160000
+    # entry is refused before anything is written. diff.ignoreSubmodules=all must not hide it (r3 round-3 adversary A3).
     wt, dest = _dirty_save_repo(tmp_path)
     git(wt, "checkout", "--", "src/a.txt")
-    head = git(wt, "rev-parse", "HEAD")
-    git(wt, "update-index", "--add", "--cacheinfo", f"160000,{head},vendor/sub")
+    git(wt, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},vendor/sub")
     git(wt, "commit", "-qm", "gitlink")
     (wt / "vendor" / "sub").mkdir(parents=True)  # an uninitialised submodule directory
-    git(wt, "update-index", "--cacheinfo", f"160000,{'1' * 40},vendor/sub")
+    git(wt, "update-index", "--cacheinfo", f"160000,{'2' * 40},vendor/sub")
+    (wt / "src" / "a.txt").write_text("two\n")  # an ordinary edit beside it does not make the save whole
     git(wt, "config", "diff.ignoreSubmodules", "all")
+    before = git(wt, "status", "--porcelain")
     out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
-    assert out.stdout.startswith("DIRTY_TREE_SAVED") and " staged=none " not in out.stdout, out.stdout + out.stderr
-    staged = next(dest.glob("dirty-worktree-staged-*.diff")).read_text(encoding="utf-8")
-    assert "Subproject commit " + "1" * 40 in staged, staged
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=gitlink-change-not-saved", (out.stdout, out.stderr)
+    assert not list(dest.iterdir()) and git(wt, "status", "--porcelain") == before
 
 
 @dirty_save_only
@@ -2630,8 +2634,8 @@ def test_save_dirty_worktree_evidence_pins_the_patch_shape_against_diff_config(t
 
 @dirty_save_only
 def test_save_dirty_worktree_evidence_accepts_every_staged_shape(tmp_path):
-    # Every legitimate staged shape (rename, delete, mode change, binary, gitlink, non-ASCII name) must pass both the byte-exact stream check and the
-    # `git apply --cached --check -R` applicability check, and the saved file must re-apply to a clean index.
+    # Every legitimate staged shape (rename, delete, mode change, binary, non-ASCII name) must pass both the byte-exact stream check and the
+    # `git apply --cached --check -R` applicability check, and the saved file must re-apply to a clean index. A gitlink is refused instead (r7, see the test above).
     wt, dest = _dirty_save_repo(tmp_path)
     git(wt, "checkout", "--", "src/a.txt")
     (wt / "gone.txt").write_text("bye\n")
@@ -2643,7 +2647,6 @@ def test_save_dirty_worktree_evidence_accepts_every_staged_shape(tmp_path):
     git(wt, "commit", "-qm", "shapes")
     (wt / "é.txt").write_text("accent\nchanged\n")
     git(wt, "add", "é.txt")
-    git(wt, "update-index", "--add", "--cacheinfo", f"160000,{git(wt, 'rev-parse', 'HEAD')},vendor/sub")  # a staged gitlink (submodule pointer)
     git(wt, "rm", "-q", "gone.txt")
     git(wt, "mv", "moved.txt", "renamed.txt")
     git(wt, "update-index", "--chmod=+x", "mode.sh")
@@ -3020,6 +3023,27 @@ def test_save_dirty_worktree_evidence_refuses_a_destination_it_cannot_hold(tmp_p
     assert not list(dest.iterdir()) and not [p for p in wt.glob("dirty-worktree-*")]
 
 
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_closed_on_a_platform_with_no_directory_hold(tmp_path):
+    # r7 (Dot 3d137411, sol r5 blocker 2, adversary a0496049-A1 / cd31735a-A3): off Windows Lock-DirtyDirectory has nothing to hold and returned $null, which was accepted, so a
+    # rename after the last guard could steer the diff --output, and the cleanup could follow a replacement. The saver now refuses before any write, reapply line or cleanup.
+    # The platform switch is forced here ($IsWindows is read-only, not constant, and $env:OS is what the fallback test reads), so the real Lock-DirtyDirectory takes no hold.
+    wt, dest = _dirty_save_repo(tmp_path)
+    before = git(wt, "status", "--porcelain")
+    off_windows = "Set-Variable -Name IsWindows -Value $false -Scope Global -Force; Remove-Item -LiteralPath Env:OS -ErrorAction SilentlyContinue"
+    out = dirty_save_pwsh(f"{off_windows}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=no-directory-hold-on-this-platform", (out.stdout, out.stderr)
+    assert not list(dest.iterdir()) and not list(wt.glob("dirty-worktree-*")) and git(wt, "status", "--porcelain") == before
+
+
+@dirty_save_posix
+def test_save_dirty_worktree_evidence_refuses_every_save_on_posix(tmp_path):
+    wt, dest = _dirty_save_repo(tmp_path)
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=no-directory-hold-on-this-platform", (out.stdout, out.stderr)
+    assert not list(dest.iterdir())
+
+
 @pytest.mark.skipif(os.name != "nt", reason="a directory junction is the Windows spelling of a retargetable alias")
 @dirty_save_only
 def test_save_dirty_worktree_evidence_refuses_a_worktree_replaced_between_resolving_and_holding_it(tmp_path):
@@ -3092,8 +3116,7 @@ def test_save_dirty_worktree_evidence_refuses_a_resolved_path_that_would_break_t
         assert not list(dest.iterdir())
 
 
-@pytest.mark.skipif(os.name == "nt", reason="only a POSIX file system lets a directory name hold LF")
-@dirty_save_only
+@dirty_save_posix  # only a POSIX file system lets a directory name hold LF; the control-character refusal comes before the hold
 def test_save_dirty_worktree_evidence_keeps_one_line_for_a_posix_destination_holding_lf(tmp_path):
     wt, _ = _dirty_save_repo(tmp_path)
     dest = tmp_path / "round\n5"
@@ -3249,13 +3272,14 @@ def _gitlink_checked_out_elsewhere(wt):
 
 
 @dirty_save_only
-def test_save_dirty_worktree_evidence_status_lists_a_submodule_checked_out_at_another_commit(tmp_path):
+def test_save_dirty_worktree_evidence_sees_a_submodule_checked_out_at_another_commit(tmp_path):
+    # diff.ignoreSubmodules=all must not hide it; since r7 the gitlink change is refused rather than saved under a reapply command that would drop it.
     wt, dest = _dirty_save_repo(tmp_path)
     git(wt, "checkout", "--", "src/a.txt")
     _gitlink_checked_out_elsewhere(wt)
     out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
-    assert out.stdout.startswith("DIRTY_TREE_SAVED"), out.stdout + out.stderr
-    assert "vendor/sub" in next(dest.glob("dirty-worktree-*.status.txt")).read_text(encoding="utf-8")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=gitlink-change-not-saved", (out.stdout, out.stderr)
+    assert not list(dest.iterdir())
 
 
 def test_continuation_dirty_refusal_sees_a_submodule_checked_out_at_another_commit(tmp_path):
@@ -3275,7 +3299,7 @@ def test_continuation_dirty_refusal_sees_a_submodule_checked_out_at_another_comm
     try:
         result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-10")], "TEST-EDIT-CONT-10", extra=("-ContinueFromSha", tip))
         assert result.returncode == 6 and "REFUSED continuation-worktree-dirty" in result.stdout and "vendor/sub" in result.stdout, result.stdout + result.stderr
-        assert "DIRTY_TREE_SAVED card=TEST-EDIT-CONT-10 " in result.stdout, result.stdout
+        assert "DIRTY_TREE_SAVE_FAILED card=TEST-EDIT-CONT-10 reason=gitlink-change-not-saved" in result.stdout, result.stdout  # r7: refused, not saved without the pointer
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=tmp_path, check=False, capture_output=True)
 

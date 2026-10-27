@@ -14,6 +14,8 @@
 # It refuses a -Dest inside the worktree it describes (reason=dest-inside-worktree): evidence written there would show in the next status and be captured by the next save.
 # -Dest is resolved once to its physical path and every write uses that path; a destination that changed identity before a write or publish is reason=dest-identity-changed.
 # On Windows -Dest and -Wt are each held open, and the held handle must be the directory whose identity was sampled before the resolve (worktree-identity-changed / dest-identity-changed).
+# Where no directory can be held (any other platform) every save is refused before anything is written: reason=no-directory-hold-on-this-platform. A tracked diff holding a
+# gitlink is refused the same way (reason=gitlink-change-not-saved): the plain `git apply` reapply command would leave the submodule pointer where it was.
 # Read-only on the worktree (nothing is restored, so the caller's refusal and exit code are unchanged), idempotent (same diff = same name), fail-soft (never throws), and it
 # refuses a directory that is not itself a worktree root (that would resolve to an ENCLOSING repo and save its diff). The same logic is deployed board-local in
 # hub-autopilot\dispatch-fix-round.ps1; keep the two in step.
@@ -161,7 +163,7 @@ function Get-DirtyDirIdentity([string]$Path) {
 function Invoke-DirtyDestCheckpoint([string]$Stage) { }
 
 # Holds a directory open so that it (and every directory above it) cannot be renamed or removed until Unlock-DirtyDirectory (see DirtyFinalPath.Pin); $null where that is not possible,
-# in which case the identity check in Test-DirtyDestStable is the only defence. Seam: a test overrides this to model such a platform.
+# and the saver then refuses (dest-not-held / worktree-not-held, or no-directory-hold-on-this-platform off Windows). Seam: a test overrides this to model a failed hold.
 function Lock-DirtyDirectory([string]$Path) {
     if (-not ($IsWindows -or $env:OS -eq 'Windows_NT')) { return $null }
     try {
@@ -278,9 +280,12 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $destReal = Resolve-DirtyRealPath $Dest
         if ($destReal -match $breaksLine) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-path-control-char" }
         if (Test-DirtyUncLocalHost $destReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-unc-local-host" }
+        # A destination that cannot be held cannot be trusted not to be swapped (r5 adversary A5). Off Windows no hold exists at all: a rename after the last guard could steer the
+        # diff --output or the temp cleanup, and the identity there is only a path. The saver runs on the Windows board host, so there it fails closed before any write (r7, Dot 3d137411).
+        $platformNoHold = 'no-directory-hold-on-this-platform'
         $destLock = Lock-DirtyDirectory $destReal
-        if ($onWindows -and $null -eq $destLock) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-not-held" }  # a destination that cannot be held cannot be trusted not to be swapped (r5 adversary A5)
-        if ($onWindows -and (Get-DirtyHeldIdentity $destLock) -cne $destId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-identity-changed" }
+        if ($null -eq $destLock) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$(if ($onWindows) { 'dest-not-held' } else { $platformNoHold })" }
+        if ((Get-DirtyHeldIdentity $destLock) -cne $destId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-identity-changed" }
         $wtId = Get-DirtyDirIdentity $Wt
         if (-not $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
         $wtReal = Resolve-DirtyRealPath $Wt
@@ -292,8 +297,8 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         if (Test-DirtyUncLocalHost $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-unc-local-host" }
         if ((& $isUnc $destReal) -and (& $isUnc $wtReal)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-unc-unproven" }
         $wtLock = Lock-DirtyDirectory $wtReal
-        if ($onWindows -and $null -eq $wtLock) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-not-held" }
-        if ($onWindows -and (Get-DirtyHeldIdentity $wtLock) -cne $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
+        if ($null -eq $wtLock) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$(if ($onWindows) { 'worktree-not-held' } else { $platformNoHold })" }
+        if ((Get-DirtyHeldIdentity $wtLock) -cne $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
         # Between the resolve and the hold a rename plus a junction could have put another directory behind the same name: the hold would then pin that one. Resolving again, now that
         # the hold is in place, must give the same physical path (r5 adversary A3).
         if ((Resolve-DirtyRealPath $wtReal) -ine $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
@@ -301,7 +306,12 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $prefix = @(& git -C $Wt rev-parse --show-prefix 2>$null)
         if ($LASTEXITCODE -ne 0 -or ($prefix -join '').Trim() -ne '') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
         if (Test-DirtyPathInside -Inner $destReal -Outer $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-inside-worktree" }
-        $guard = { param($stage) Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -WtIdentity $wtId -Stage $stage }
+        # A gitlink (mode 160000: a submodule pointer, or a submodule checked out at another commit) is written into the patch, but the advertised plain `git apply` skips its
+        # commit ids and the reverse-apply check never looks at them, so SAVED would promise a recovery that drops the change. Such a diff is refused before anything is written (r7, adversary cd31735a-A2).
+        $raw = @(& git -C $Wt diff HEAD --raw --no-renames --no-ext-diff --ignore-submodules=none 2>$null)
+        if ($LASTEXITCODE -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-raw-exit-$LASTEXITCODE" }
+        if (@($raw | Where-Object { $_ -cmatch '^:(160000 [0-7]{6}|[0-7]{6} 160000) ' }).Count -gt 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved" }
+        $guard ={ param($stage) Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -WtIdentity $wtId -Stage $stage }
         $why = & $guard 'before-write'
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }
         $tmp = Join-Path $Dest ('dirty-worktree-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
