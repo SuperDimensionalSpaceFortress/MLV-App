@@ -1582,10 +1582,11 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
                 self.assertNotIn(" BATCH_OPEN_RECONCILED ", log)
 
     def test_r3_a_submit_that_throws_is_an_uncertain_open_and_keeps_the_conservative_cancel_close_and_ledger_row(self) -> None:
-        # Control for the case above: here the open IS (maybe) submitted. Submit-AgentJob throws for the open job before it reports anything, so $op stays null; the
+        # Control for the case above: here the open IS (maybe) submitted. Submit-AgentJob throws for the open job before it reports anything; the
         # submitted flag, not $op, tells the finally block the open may be in the agent's gate: cancel requested, close submitted, open-unreconciled row charged.
-        anchor = '    $f = Join-Path $jobDir "$JobId.job.ps1"'
-        self._mirror_with_bad_sidecar(runner_patches=((anchor, "    if ($JobId -like 'lease-batch-open-*') { throw 'simulated submit failure' }\n" + anchor),))
+        # r16 (sol r15 B1; hub ruling 08:18:44Z): "submitted" now starts when um-run.ps1 is called (a job file never written reached no one), so the throw is placed there.
+        anchor = "        $script:umRunCalled[$JobId] = $true"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, anchor + "\n        if ($JobId -like 'lease-batch-open-*') { throw 'simulated submit failure' }"),))
         r = self.run_batch([self.specs[0]], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=30)), "-CancelReconcileSec", "3")
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         [b] = self.batches()
@@ -1593,6 +1594,64 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         self.assertTrue((self.share / "cancel" / f"{b['openJobId']}.cancel").exists(), "the cancel request stays for the agent")
         self.assertTrue(b["closeJobId"], "the close was not submitted")
         self.assertEqual(b["ledger"]["basis"], "open-unreconciled", b["ledger"])
+        self.assertTrue((self.claims / "bachelor.lease-ledger.jsonl").exists())
+
+    # ---------------------------------------------------------------- r16 (sol r15 B1): an open whose job file was never complete here never reached um-run
+    # The local File.Open(CreateNew) of the open's job file, or the write into it, fails before um-run is called. RED on 5c73c842: $openSubmitted was already true, so
+    # the finally requested a cancel, submitted a close, charged a full 2700 s open-unreconciled lease and ended OPEN_CANCEL_UNRECONCILED (exit 11).
+    OPEN_JOB_CREATE = "$fs = [IO.File]::Open($f, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)"
+    OPEN_JOB_WRITE = "$fs.Write($jb, 0, $jb.Length)"
+
+    def _assert_open_never_submitted(self, r: subprocess.CompletedProcess) -> None:
+        self.assertEqual(r.returncode, 9, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual(res["stopReason"], "OPEN_JOB_WRITE_FAILED", res)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["openOutcome"]), ("OPEN_JOB_WRITE_FAILED", "JOB_WRITE_FAILED"), b)
+        self.assertEqual(self.kinds(), [], "um-run was called for the open or a close, or a probe or a leg ran")
+        self.assertEqual(list((self.share / "cancel").iterdir()), [], "a cancel was requested for an open that never reached um-run")
+        self.assertEqual((b["openCancel"], b["closeJobId"], b["ledger"]), (None, None, None), b)
+        self.assertFalse((self.claims / "bachelor.lease-ledger.jsonl").exists(), "the lease budget was charged for an open that never reached um-run")
+        self.assertEqual(list((self.share / "notafter").iterdir()), [], "the open's liveness sidecar was left behind")
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+
+    def test_r16_b1_an_open_job_file_that_cannot_be_created_is_never_submitted(self) -> None:
+        seam = "if ($JobId -like 'lease-batch-open-*') { throw [IO.IOException]::new(\"simulated: the file '$f' exists\") }; " + self.OPEN_JOB_CREATE
+        self._mirror_with_bad_sidecar(runner_patches=((self.OPEN_JOB_CREATE, seam),))
+        self._assert_open_never_submitted(self.run_batch([self.specs[0]], "-CancelReconcileSec", "3"))
+
+    def test_r16_b1_an_open_job_file_whose_write_fails_is_never_submitted(self) -> None:
+        seam = "if ($JobId -like 'lease-batch-open-*') { throw [IO.IOException]::new('simulated: there is not enough space on the disk') }; " + self.OPEN_JOB_WRITE
+        self._mirror_with_bad_sidecar(runner_patches=((self.OPEN_JOB_WRITE, seam),))
+        self._assert_open_never_submitted(self.run_batch([self.specs[0]], "-CancelReconcileSec", "3"))
+
+    def test_r16_b1_a_job_folder_that_refuses_new_files_submits_no_open(self) -> None:
+        # the real failure, no seam: <RunDir>\batch-jobs denies this user "create files" (the caps probe fails there too and reads the fallback caps)
+        jobs = self.run_dir / "batch-jobs"
+        jobs.mkdir(parents=True)
+        user = subprocess.run(["whoami"], capture_output=True, text=True, timeout=60).stdout.strip()
+        deny = subprocess.run(["icacls", str(jobs), "/deny", f"{user}:(WD)"], capture_output=True, text=True, timeout=60)
+        if deny.returncode != 0:
+            self.skipTest(f"icacls could not deny file creation: {deny.stdout} {deny.stderr}")
+        try:
+            r = self.run_batch([self.specs[0]], "-CancelReconcileSec", "3")
+        finally:
+            subprocess.run(["icacls", str(jobs), "/remove:d", user], capture_output=True, text=True, timeout=60)
+        self._assert_open_never_submitted(r)
+
+    def test_r16_b1_control_an_open_that_reached_um_run_and_stays_unreconciled_is_still_charged_a_full_lease(self) -> None:
+        # the hub's control (ruling 08:18:44Z): um-run WAS called for the open and gave up while the agent still holds it in its gate, and nothing answers the cancel
+        r = self.run_batch([self.specs[0]], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=12)), "-CancelReconcileSec", "3", FAKE_OPEN_MODES="gatehold")
+        self.assertEqual(r.returncode, 11, r.stdout + r.stderr)
+        self.assertEqual(batch_result(r.stdout)["stopReason"], "OPEN_CANCEL_UNRECONCILED")
+        [b] = self.batches()
+        self.assertTrue([k for k in self.kinds() if k.startswith("OPEN:")], "um-run was not called for the open")
+        self.assertEqual((b["openCancel"]["requested"], b["openCancel"]["state"]), ("REQUESTED", "UNRECONCILED"), b)
+        self.assertTrue((self.share / "cancel" / f"{b['openJobId']}.cancel").exists())
+        self.assertTrue(b["closeJobId"], "the close was not submitted")
+        self.assertEqual(b["ledger"]["basis"], "open-unreconciled", b["ledger"])
+        span = datetime.fromisoformat(b["ledger"]["endUtc"].replace("Z", "+00:00")) - datetime.fromisoformat(b["ledger"]["startUtc"].replace("Z", "+00:00"))
+        self.assertEqual(round(span.total_seconds()), 2700, b["ledger"])
         self.assertTrue((self.claims / "bachelor.lease-ledger.jsonl").exists())
 
     # ---------------------------------------------------------------- r5b: no probe or leg without the claim (Grok G1, 6389240991)
@@ -3192,6 +3251,38 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("close=RECEIPT", so + se, "the lease close was still submitted")
         # the keeper renews every second; stopped at the alias, its last write is long before the cancel the finally requests at the deadline
         self.assertLess(spec.stat().st_mtime, cancel.stat().st_mtime - 5, "the keeper went on rewriting the input after the alias was found")
+
+    # r16 (sol r15 B2 = fable r15 H2 = adversary r14 A2): the redirect's path was built with Join-Path BEFORE its try, so TEMP on a drive that does not exist threw into the batch
+    # catch: BATCH_ERROR (exit 12) replaced the open's typed stop, and the close job was still written into <RunDir>\batch-jobs. fable r15 H1: the containment test compared spellings
+    # and final paths only, so a loopback UNC TEMP (\\localhost\C$\<RunDir>) put the redirect inside -RunDir.
+    def _assert_redirect_refused_and_nothing_more_in_the_run_dir(self, temp: str) -> None:
+        p, spec, sha = self._spawn_open_wait("exit1", env={"TEMP": temp, "TMP": temp})
+        before = sha(spec.read_bytes()).hexdigest()
+        jobs_before = sorted(j.name for j in (self.run_dir / "batch-jobs").iterdir())
+        (self.run_dir / "batch.log").unlink(missing_ok=True)
+        os.link(spec, self.run_dir / "batch.log")
+        so, se = self._finish(p)
+        self.assertEqual(sha(spec.read_bytes()).hexdigest(), before, "the accepted input is byte-unchanged")
+        self.assertEqual(p.returncode, 9, so + se)
+        self.assertEqual([d.name for d in self.run_dir.iterdir() if d.name.startswith("venue-lease-batch-close-")], [], "the redirect was made inside -RunDir")
+        self.assertEqual(sorted(j.name for j in (self.run_dir / "batch-jobs").iterdir()), jobs_before, "a job file was written into -RunDir after the alias was found")
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED ", se)
+        res = batch_result(so)
+        self.assertEqual(res["stopReason"], "OPEN_FAILED", "the open's typed stop is kept")
+        self.assertEqual(res["outputRedirect"]["state"], "FAILED", res)
+        self.assertTrue(res["outputRedirect"]["error"], res)
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+
+    def test_r16_b2_a_temp_on_a_drive_that_does_not_exist_keeps_the_open_s_stop_and_writes_no_job_into_the_run_dir(self) -> None:
+        free = [c for c in "ZYXWVUTSRQPONMLKJIHGFED" if not os.path.exists(f"{c}:\\")]
+        if not free:
+            self.skipTest("every drive letter is in use")
+        self._assert_redirect_refused_and_nothing_more_in_the_run_dir(f"{free[0]}:\\missing")
+
+    def test_r16_h1_a_loopback_unc_temp_that_is_the_run_dir_gets_no_redirect_there(self) -> None:
+        self._fresh_run_dir()
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_redirect_refused_and_nothing_more_in_the_run_dir(str(self._loopback_unc(self.run_dir)))
 
     # r12 (adversary r12 A2): TrimEnd('\') turned the drive root C:\ into C:, the drive's current directory, so a root zone was listed from the wrong folder. A real volume root cannot be
     # written to by a test, so the function that decides it is run on its own: its source is taken from the runner, so this cannot drift from what the runner does.
