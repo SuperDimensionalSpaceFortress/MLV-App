@@ -483,9 +483,9 @@ function Test-OpenOutputAlias {
         try {
             # TEMP set inside -RunDir would put the redirect back in it: refused, by spelling and (adversary r14 pass 2 A2: a junction to -RunDir) by the physical path of both
             foreach ($pair in @(@($RunDir, [IO.Path]::GetTempPath()), @((Get-PhysicalPath $RunDir), (Get-PhysicalPath ([IO.Path]::GetTempPath()))))) {
-                $rd = Remove-TrailingSeparator $pair[0]; if (-not $rd.EndsWith('\')) { $rd += '\' }
+                $runDirPrefix = Remove-TrailingSeparator $pair[0]; if (-not $runDirPrefix.EndsWith('\')) { $runDirPrefix += '\' }
                 $tp = Remove-TrailingSeparator ([IO.Path]::GetFullPath($pair[1])); if (-not $tp.EndsWith('\')) { $tp += '\' }
-                if ($tp.StartsWith($rd, [StringComparison]::OrdinalIgnoreCase)) { throw "TEMP ($([IO.Path]::GetTempPath())) is inside -RunDir (physical $($pair[1]))" }
+                if ($tp.StartsWith($runDirPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "TEMP ($([IO.Path]::GetTempPath())) is inside -RunDir (physical $($pair[1]))" }
             }
             $null = New-Item -ItemType Directory -Path $redirect -ErrorAction Stop; $script:batchLog = Join-Path $redirect 'batch.log'
         }
