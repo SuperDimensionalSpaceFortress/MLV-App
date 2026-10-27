@@ -2761,6 +2761,94 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
         self.assertEqual(manifest.read_text(encoding="utf-8"), before, "the accepted build manifest is byte-unchanged")
 
+    # r12 pass 2 (adversary r12 A1'): a link BELOW a runner-owned directory writes through to its target whatever that target's link count, so the root-only reparse listing missed it.
+    def test_r12_a1b_a_spec_behind_a_junction_nested_in_a_runner_owned_directory_is_refused_before_the_claim(self) -> None:
+        for owned in ("quiet", "batch-jobs"):
+            with self.subTest(owned=owned):
+                self._fresh_run_dir()
+                (self.run_dir / owned).mkdir()
+                elsewhere = self.case / f"elsewhere-{owned}"
+                shutil.rmtree(elsewhere, ignore_errors=True)
+                self._junction(self.run_dir / owned / "sub", elsewhere)
+                spec = elsewhere / "fx-a.json"
+                spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = spec.read_text(encoding="utf-8")
+                r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                os.rmdir(self.run_dir / owned / "sub")
+
+    def test_r12_a1b_a_spec_that_a_file_symlink_in_a_runner_owned_directory_points_at_is_refused_before_the_claim(self) -> None:
+        self._fresh_run_dir()
+        (self.run_dir / "quiet").mkdir()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        try:
+            os.symlink(spec, self.run_dir / "quiet" / "venue-quiet-probe-20261026T180000000Z.job.ps1")
+        except OSError as exc:
+            self.skipTest(f"file symlinks need a privilege this account lacks here: {exc}")
+        before = spec.read_text(encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self._assert_nothing_submitted_input_intact(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+
+    # r12 pass 2 (adversary r12 A2'): what the preflight validated must still hold when the claim is taken, or the leg throws / refuses after the lease opened.
+    def _during_claim_wait(self, args: list[str], e: dict, change) -> tuple[int, str, str]:
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("CLAIM_HELD")
+            change()
+            self.claim_path.unlink()   # the foreign owner lets go: this run takes the claim next poll
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        return p.returncode, so, se
+
+    def _assert_refused_after_the_wait(self, code: int, so: str, se: str, marker: str) -> None:
+        self.assertEqual(code, 2, so + se)
+        self.assertIn(marker, se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
+
+    def test_r12_a2b_a_leg_spec_the_leg_would_throw_on_after_the_wait_is_refused_before_the_lease(self) -> None:
+        self._fresh_run_dir()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        # playSeconds past Int32: Invoke-VenueLeg's [int] cast throws, which the preflight (Get-LegSpecRefusal) already refuses up front
+        changed = json.loads(spec.read_text(encoding="utf-8"))
+        changed["playSeconds"] = 2147483648
+        code, so, se = self._during_claim_wait(args, e, lambda: spec.write_text(json.dumps(changed), encoding="utf-8"))
+        self._assert_refused_after_the_wait(code, so, se, "LEG_PLAN_REFUSED reason=LEG_SPEC_INVALID item=1 ")
+
+    def test_r12_a2b_a_staged_build_manifest_that_changed_during_the_wait_is_refused_before_the_lease(self) -> None:
+        self._fresh_run_dir()
+        manifest = self._staged_manifest(self.commit_a)
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        code, so, se = self._during_claim_wait(args, e, lambda: manifest.write_bytes(manifest.read_bytes() + b" "))
+        self._assert_refused_after_the_wait(code, so, se, "LEG_PLAN_REFUSED reason=BUILD_MANIFEST_MISMATCH item=1 ")
+
+    def test_r12_a2b_a_staged_build_manifest_removed_during_the_wait_is_refused_before_the_lease(self) -> None:
+        self._fresh_run_dir()
+        manifest = self._staged_manifest(self.commit_a)
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        code, so, se = self._during_claim_wait(args, e, lambda: manifest.unlink())
+        self._assert_refused_after_the_wait(code, so, se, "LEG_PLAN_REFUSED reason=BUILD_NOT_STAGED item=1 ")
+
+    def test_r12_a2b_an_unchanged_plan_still_runs_after_a_claim_wait(self) -> None:
+        self._fresh_run_dir()
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        code, so, se = self._during_claim_wait(args, e, lambda: None)
+        self.assertEqual(code, 0, so + se)
+        self.assertNotIn("LEG_PLAN_REFUSED", se)
+
     # r12 (adversary r12 A2): TrimEnd('\') turned the drive root C:\ into C:, the drive's current directory, so a root zone was listed from the wrong folder. A real volume root cannot be
     # written to by a test, so the function that decides it is run on its own: its source is taken from the runner, so this cannot drift from what the runner does.
     def test_r12_a2_a_drive_root_keeps_its_backslash_when_trailing_separators_are_removed(self) -> None:

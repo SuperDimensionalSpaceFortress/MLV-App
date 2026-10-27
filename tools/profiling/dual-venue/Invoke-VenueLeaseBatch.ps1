@@ -364,6 +364,18 @@ function Get-RunDirOutputRefusal([string]$Path) {
                 foreach ($p in $z.leaf) { if ($c.Name -imatch $p) { $owned = $true } }
                 if ($owned) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = (Get-PhysicalPath $c.FullName) } }
             }
+            # r12 pass 2 (adversary r12 A1'): and a link BELOW an owned directory (quiet\x.job.ps1 -> a spec, or a junction in it) writes through just the same, whatever the target's link count:
+            # anything under an owned directory is a runner output, so every reparse point found there is listed with its physical target. A link that cannot be resolved points at nothing.
+            foreach ($d in $z.dirs) {
+                $dp = Join-Path $z.root $d
+                $top = @($linked | Where-Object { $_.isDir -and $_.name -ieq $d })
+                if ($top.Count -gt 0) { $dp = $top[0].physical }
+                if (-not (Test-Path -LiteralPath $dp -PathType Container)) { continue }
+                foreach ($c in @(Get-ChildItem -LiteralPath $dp -Force -Recurse -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
+                    $target = $(try { Get-PhysicalPath $c.FullName } catch { $null })
+                    if ($target) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = $target; nested = $true } }
+                }
+            }
             $z.linked = $linked
         }
         # r10 (adversary r10 A1): and a HARD link is a second name for the same file, with its own final path, so the paths differ while the file is the one the runner writes. Compare file
@@ -377,7 +389,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
                 }
                 foreach ($d in $z.dirs) {
                     $dp = Join-Path $z.root $d
-                    $lk = @($z.linked | Where-Object { $_.isDir -and $_.name -ieq $d })
+                    $lk = @($z.linked | Where-Object { $_.isDir -and -not $_.nested -and $_.name -ieq $d })
                     if ($lk.Count -gt 0) { $dp = $lk[0].physical }
                     if (Test-Path -LiteralPath $dp -PathType Container) { foreach ($c in @(Get-ChildItem -LiteralPath $dp -Force -File -Recurse -ErrorAction Stop)) { $scan.Add($c) } }
                 }
@@ -427,15 +439,38 @@ function Get-InputOutputRefusal {
     # r11 (sol r10 blocker 3): the first validated input (the plan file, then each leg spec) that is now a file this run writes; $null when none is. Defined once the plan is built;
     # the very guard the preflight uses (Get-RunDirOutputRefusal), run again once the claim is held, because an alias can appear while the batch waits for a foreign claim.
     foreach ($g in $script:guardedInputs) {
+        # a staged build manifest that is gone has no location to compare; Get-InputContentRefusal types that (BUILD_NOT_STAGED)
+        if ($g.kind -ceq 'build' -and -not (Test-Path -LiteralPath $g.path -PathType Leaf)) { continue }
         $why = Get-RunDirOutputRefusal $g.path
         if ($why) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why } }
+    }
+    Get-InputContentRefusal
+}
+
+function Get-InputContentRefusal {
+    # r12 pass 2 (adversary r12 A2'): the CONTENT the preflight validated (each leg spec the leg would run, each staged build manifest's digest and fields) can change in the same wait as
+    # a location can, and the leg job would then throw or refuse after the lease opened. The same reads and the same typed reasons as the preflight, run again with the location re-check.
+    # $null when nothing changed. A share that cannot be read now is not a hit: the open and the leg report that themselves, typed.
+    if (-not $legPlanMode) { return $null }
+    foreach ($g in $script:guardedInputs) {
+        if ($g.kind -ceq 'spec') {
+            $sr = @(Get-LegSpecRefusal $g.path $g.backend)
+            if ($sr[0]) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = [string]$sr[0]; why = [string]$sr[1] } }
+        } elseif ($g.kind -ceq 'build') {
+            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec 30
+            $short = $g.commit.Substring(0, 12)
+            if ($st.state -ceq 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_NOT_STAGED'; why = "no staged build manifest for $short at $($st.path) any more; the runner stages and builds nothing" } }
+            if ($st.state -ceq 'STAGED' -and $st.sha256 -cne $g.sha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_MANIFEST_MISMATCH'; why = "the staged build manifest for $short changed while the batch waited: sha256 $($st.sha256), not $($g.sha256)" } }
+            if ($st.state -ceq 'STAGED' -and $st.contentProblem) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_MANIFEST_MISMATCH'; why = "the staged build manifest for $short at $($st.path) is no longer one the leg job accepts: $($st.contentProblem)" } }
+        }
     }
     $null
 }
 
 function Stop-InputIsOutput($Hit) {
     # the typed refusal of Get-InputOutputRefusal's hit: the same reason words and exit 2 as the preflight's
-    if ($Hit.kind -ceq 'plan') { Stop-PlanRefused 'LEG_PLAN_IS_RUN_OUTPUT' 0 "the plan file $($Hit.why)" }
+    if ($Hit.kind -ceq 'content') { Stop-PlanRefused $Hit.code $Hit.item $Hit.why }
+    elseif ($Hit.kind -ceq 'plan') { Stop-PlanRefused 'LEG_PLAN_IS_RUN_OUTPUT' 0 "the plan file $($Hit.why)" }
     elseif ($Hit.kind -ceq 'build') { Stop-PlanRefused 'BUILD_MANIFEST_IS_RUN_OUTPUT' $Hit.item "the staged build manifest $($Hit.why)" }
     elseif ($legPlanMode) { Stop-PlanRefused 'LEG_SPEC_IS_RUN_OUTPUT' $Hit.item "the leg spec $($Hit.why)" }
     else { Stop-Usage "LEG_SPEC_IS_RUN_OUTPUT the leg spec $($Hit.why)" }
@@ -576,9 +611,9 @@ foreach ($leg in $plan) {
 # r11 (sol r10 blocker 3): the validated inputs, kept for the re-check once the claim is held (Get-InputOutputRefusal). A -LegSet's specs are inputs too, so they are checked now as well.
 $script:guardedInputs = [System.Collections.Generic.List[object]]::new()
 if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPath; kind = 'plan'; item = 0 }) }
-foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }) }) }
+foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend }) }
 # r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
-if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = @($items | Where-Object { $_.sourceCommit -ceq $b.Key })[0].item }) } }
+if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { $_.sourceCommit -ceq $b.Key })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
 if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }
 # The scalar form's one build rides on every leg, so each leg is launched with its own build in either form.
 if (-not $legPlanMode) { foreach ($p in $plan) { $p | Add-Member -NotePropertyName sourceCommit -NotePropertyValue $SourceCommit; $p | Add-Member -NotePropertyName buildManifestSha256 -NotePropertyValue $BuildManifestSha256 } }
