@@ -923,7 +923,11 @@ $clockCases = [ordered]@{
     'unrecorded' = @((New-CpClockRecord $null @((New-CpInst 4242 -5 0.06 4 (-95)))), 0)
     'job-step' = @((New-CpClockRecord 0 @((New-CpInst 4242 -5 0.06 4 (-95)))), 100000.0)
     'job-unverified' = @((New-CpClockRecord 0 @((New-CpInst 4242 -5 0.06 4 (-95)))), $null)
-    'under-tolerance-control' = @((New-CpClockRecord 999.0 @((New-CpInst 4242 -5 0.06 1.9 2))), 0)
+    # adversary r8 (e1ce216c) A1 (literal): an 800 ms backward step at real +3.3 s stamps 4242's gone time L+2.6 s (it lived to +3.35 s); the app
+    # started at +3.0 s. Under the tolerance, but the overlap test must widen 4242's interval by twice the gap, so the overlap is still found.
+    'sub-tolerance-step-overlap' = @((New-CpClockRecord 800.0 @((New-CpInst 4242 -5 0.06 2.5 2.6))), 0)
+    # control: a 999 ms gap and 4242 truly gone at +0.9 s, more than twice the gap before the app's start
+    'under-tolerance-control' = @((New-CpClockRecord 999.0 @((New-CpInst 4242 -5 0.06 0.8 0.9))), 0)
 }
 $r.clock = [ordered]@{}
 foreach ($k in $clockCases.Keys) {
@@ -979,7 +983,8 @@ $a2 = Get-CorePartitionFeedSummary $a2S $a2E 120 $a2B
 # the same file grown after the pre-helper read only by an unfinished row: the newest complete row ends before the pre-helper offset (183 < 190)
 $pB = @{ exists = $true; length = 190; monoMs = [int64]8995000 }
 $pS = @{ exists = $true; length = 200; monoMs = [int64]9000000; before = "26.10.2026,12:00:00,x,20,10,No,No`n26.10.2026,12:00"; window = ''; windowStartsMidRow = $false }
-$pBok = $pB.Clone(); $pBok.length = 180
+# adversary r8 (e1ce216c) A2: the row must START at or after the pre-helper offset (here it starts at 150), not merely end after it
+$pBok = $pB.Clone(); $pBok.length = 150
 $r.adversaryR7 = @([string]$a1.reasons['rows'], $a1.rows, $a1.pkgWattsMean, $a2.rows, $a2.pkgWattsMean, $a2.pkgTempCAtStart, [string]$a2.reasons['pkgTempCAtStart'],
     [string](Get-CorePartitionFeedSummary $pS $a2E 120 $pB).reasons['pkgTempCAtStart'], (Get-CorePartitionFeedSummary $pS $a2E 120 $pBok).pkgTempCAtStart)# adversary r7 (6fac125a) A2 (literal): the same file, a day-old data row before the pre-helper read; only a bare newline (length 35) or a header
 # line (length 77) appended after it; and the control, a new data row appended after it
@@ -989,6 +994,11 @@ $b2Nl = @{ exists = $true; length = 35; monoMs = [int64]2000; before = $dayOld +
 $b2Hd = @{ exists = $true; length = 77; monoMs = [int64]2000; before = $dayOld + "Date,Time,x,Temp,Power,Throttle1,Throttle2`n"; window = ''; windowStartsMidRow = $false }
 $b2Ok = @{ exists = $true; length = 68; monoMs = [int64]2000; before = $dayOld + "26.10.2026,01:00:00,x,61,40,No,No`n"; window = ''; windowStartsMidRow = $false }
 $b2E = @{ exists = $true; length = 200; monoMs = [int64]22000; before = ''; window = "26.10.2026,01:00:20,x,70,45,No,No`n"; windowStartsMidRow = $false; replaced = $false; truncated = $false }
+# adversary r8 (e1ce216c) A2 (literal): the pre-helper read saw a complete-looking row without its LF (length 33); only the LF was appended (34)
+$r8B = @{ exists = $true; length = 33; monoMs = [int64]1000 }
+$r8S = @{ exists = $true; length = 34; monoMs = [int64]2000; before = "25.10.2026,01:00:00,x,30,10,No,No`n"; window = ''; windowStartsMidRow = $false }
+$r8x = Get-CorePartitionFeedSummary $r8S $b2E.Clone() 120 $r8B
+$r.adversaryR8 = @($r8x.rows, $r8x.pkgTempCAtStart, [string]$r8x.reasons['pkgTempCAtStart'])
 $r.adversaryR7b = @(foreach ($sm in @($b2Nl, $b2Hd, $b2Ok)) { $e2 = $b2E.Clone(); $x = Get-CorePartitionFeedSummary $sm $e2 120 $b2B; $x.pkgTempCAtStart; [string]$x.reasons['pkgTempCAtStart'] })# sol r6 CP-07: the one guarded number parse (absent in a pre-r7 generator)
 $r.number = 'absent'
 if (Get-Command ConvertFrom-CorePartitionNumber -ErrorAction SilentlyContinue) {
@@ -1402,7 +1412,9 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         before the measured app's start, so the wall-clock overlap test passes. A wall/monotonic gap over the 1000 ms tolerance (the helper's or the
         job's), or a gap nobody recorded, refuses the verdict with a typed reason; bench and load acceptance are then false."""
         refused = {"step-100s-back": "clock-discontinuity", "step-6s-restored": "clock-discontinuity", "job-step": "clock-discontinuity",
-                   "unrecorded": "clock-unverified", "job-unverified": "clock-unverified"}
+                   "unrecorded": "clock-unverified", "job-unverified": "clock-unverified",
+                   # adversary r8 (e1ce216c) A1: under the tolerance the gap widens the overlap test instead
+                   "sub-tolerance-step-overlap": "same-path-instance-overlap"}
         for case, code in refused.items():
             with self.subTest(case=case):
                 topo, bench, load, observed, gbps, pcore, why = self.r["clock"][case]
@@ -1447,6 +1459,8 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         self.assertEqual(a[7:], ["feed-freshness-unverified", 20.0], f"only a complete row ending after the pre-helper offset is fresh: {a}")
         # adversary r7 (6fac125a) A2: a bare newline or a header line appended after the pre-helper read proves no new data row
         self.assertEqual(self.r["adversaryR7b"], [None, "feed-freshness-unverified", None, "feed-freshness-unverified", 61.0, ""], self.r["adversaryR7b"])
+        # adversary r8 (e1ce216c) A2: an LF that only completes a row already there at the pre-helper read proves no new data
+        self.assertEqual(self.r["adversaryR8"], [1, None, "feed-freshness-unverified"], self.r["adversaryR8"])
 
     def test_one_guarded_parse_reads_every_record_number(self) -> None:
         """sol r6 CP-07: JSON numbers and invariant numeric text parse; text, flags, arrays, fractions, out-of-range and non-finite values do not."""

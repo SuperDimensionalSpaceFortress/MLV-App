@@ -4394,8 +4394,10 @@ function Test-CorePartitionFeedRowAfter($Base, $Start) {
     for ($k = $lines.Count - 2; $k -ge 0; $k--) {
         $c = $lines[$k].TrimEnd("`r").Split(',')
         if ($c.Count -ge 7 -and $c[0].Length -ge 1 -and [char]::IsDigit($c[0], 0)) {
+            # adversary r8 (e1ce216c) A2: the row's FIRST byte, not its ending newline, must sit at or after $Base's length; a newline that only
+            # completes a row already (partly) there at the pre-helper read proves no new data
             $after = [Text.Encoding]::UTF8.GetByteCount(($lines[($k + 1)..($lines.Count - 1)]) -join "`n")
-            return (($sl - $after - 1) -ge $bl)
+            return (($sl - $after - 1 - [Text.Encoding]::UTF8.GetByteCount($lines[$k])) -ge $bl)
         }
     }
     $false
@@ -4642,9 +4644,13 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     # sol r6 CP-07: every record number below went through the one guarded parse first
     $shapeWhy = Test-CorePartitionHelperRecordShape $Helper
     if ($shapeWhy) { return @{ why = $shapeWhy } }
+    # adversary r8 (e1ce216c) A1: under the tolerance a gap still moves each wall-clock stamp by up to that gap, so two stamps by up to twice it;
+    # another process's interval is widened by twice the larger gap on both sides before the overlap test ($slack, ticks)
+    $slack = [int64]0
     foreach ($gap in @((ConvertFrom-CorePartitionNumber $Helper.clockSkewMaxMs 'double').value, (ConvertFrom-CorePartitionNumber $ClockSkewMs 'double').value)) {
         if ($null -eq $gap) { return @{ why = 'clock-unverified' } }
         if ([math]::Abs($gap) -gt 1000) { return @{ why = 'clock-discontinuity' } }
+        $slack = [math]::Max($slack, [int64][math]::Ceiling(2 * [math]::Abs($gap) * 1e4))
     }
     $all = @(@($Helper.instances) + @($Helper.others) | Where-Object { $null -ne $_ } | ForEach-Object {
         [pscustomobject]@{ pid = (ConvertFrom-CorePartitionNumber $_.pid 'int64').value; start = (ConvertFrom-CorePartitionNumber $_.startUtcTicks 'int64').value; gone = (ConvertFrom-CorePartitionNumber $_.goneUtcTicks 'int64').value } })
@@ -4655,8 +4661,8 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     $a = $m[0]; $aStart = $a.start
     foreach ($o in $all) {
         if ([object]::ReferenceEquals($o, $a)) { continue }
-        $oStart = if ($null -ne $o.start) { $o.start } else { [int64]::MinValue }
-        $oEnd = if ($null -ne $o.gone) { $o.gone } else { [int64]::MaxValue }
+        $oStart = if ($null -ne $o.start) { $o.start - $slack } else { [int64]::MinValue }
+        $oEnd = if ($null -ne $o.gone) { $o.gone + $slack } else { [int64]::MaxValue }
         if ($oStart -le $MeasuredEndTicks -and $aStart -le $oEnd) { return @{ why = 'same-path-instance-overlap' } }
     }
     $appPid = $(if ($null -ne $Helper.app) { (ConvertFrom-CorePartitionNumber $Helper.app.pid 'int64').value }); $appStart = $(if ($null -ne $Helper.app) { (ConvertFrom-CorePartitionNumber $Helper.app.startUtcTicks 'int64').value })
