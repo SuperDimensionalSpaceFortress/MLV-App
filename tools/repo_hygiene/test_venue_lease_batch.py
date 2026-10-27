@@ -3273,6 +3273,28 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertTrue(res["outputRedirect"]["error"], res)
         self.assertFalse(self.claim_path.exists(), "the claim was released")
 
+    # r16 (adversary r16 A1 on fd258854): the staged manifest's digest and content refusals ran BEFORE its location guard, so a manifest that IS <RunDir>\batch.log (a hard link) was
+    # appended to by the BUILD_MANIFEST_MISMATCH refusal's own log line: the refused input changed. The guard now comes first, and no refusal appends through a linked batch.log.
+    def test_r16_adv_a1_a_staged_manifest_that_is_batch_log_is_never_appended_to_by_its_own_refusal(self) -> None:
+        import hashlib
+        c = "7" * 40
+        cases = {
+            "a wrong (well-formed) digest": ({}, "0" * 64),
+            "a content problem": ({"pendingSymbolPresence": "false"}, None),
+        }
+        for label, (override, digest) in cases.items():
+            with self.subTest(case=label):
+                staged = self.stage(c, "linked build", **override)
+                manifest = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
+                self._fresh_run_dir()
+                os.link(manifest, self.run_dir / "batch.log")
+                before = hashlib.sha256(manifest.read_bytes()).hexdigest()
+                r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c, manifest=digest or staged)]))
+                self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(), before, "the refused staged manifest was appended to through batch.log: " + r.stderr)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted")
+
     def test_r16_b2_a_temp_on_a_drive_that_does_not_exist_keeps_the_open_s_stop_and_writes_no_job_into_the_run_dir(self) -> None:
         free = [c for c in "ZYXWVUTSRQPONMLKJIHGFED" if not os.path.exists(f"{c}:\\")]
         if not free:
