@@ -3172,6 +3172,11 @@ def test_move_dirty_evidence_returns_a_reason_for_a_digest_it_cannot_name_a_file
     out = dirty_save_pwsh(f"$ErrorActionPreference = 'Stop'; foreach ($f in '', 'x', ('A' * 64)) {{ $r = Move-DirtyEvidenceToFreeName -Tmp '{tmp_path / 'none.tmp'}' -Dir '{tmp_path}' -Stem x -Ext .patch -Full $f; "
                           "Write-Output ('{0}|{1}' -f ($r -is [hashtable]), $r.Reason) }")
     assert out.stdout.split() == ["True|bad-digest"] * 3, (out.stdout, out.stderr)
+    # r6 iter 2 adversary A5: '$' also matched before a trailing LF; A4: an empty -Dir threw from Join-Path outside the try.
+    out = dirty_save_pwsh("$ErrorActionPreference = 'Stop'; function Invoke-DirtyFileMove([string]$From, [string]$To) { throw [System.IO.IOException]::new('no write') }; "
+                          f"foreach ($a in @(@('{tmp_path / 'none.tmp'}', '{tmp_path}', (('a' * 64) + [char]10)), @('', '', ('a' * 64)))) {{ "
+                          "$r = Move-DirtyEvidenceToFreeName -Tmp $a[0] -Dir $a[1] -Stem x -Ext .patch -Full $a[2]; Write-Output ('{0}|{1}' -f ($r -is [hashtable]), $r.Reason) }")
+    assert out.stdout.split() == ["True|bad-digest", "True|bad-argument"], (out.stdout, out.stderr)
 
 
 @dirty_save_only
