@@ -860,6 +860,63 @@ def test_a_75_without_a_matching_marker_is_could_not_check(box, mode, why) -> No
     assert not box["marker"].exists()
 
 
+def test_a_marker_for_a_non_heavy_slot_code_is_never_a_requeue(box) -> None:
+    # Adversary A6: only 75-77 can be the tool's own; a matching marker that says 9 must not turn exit 9 into 3.
+    done = _heavy(box, "marked9", ["-Command", _marker_command(box)])
+    assert done.returncode == 9, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=9 " in done.stdout
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
+
+
+def _library_driver(box: dict, body: str, lock: str, cwd: Path = None) -> subprocess.CompletedProcess:
+    driver = box["dir"] / "lib-driver.ps1"
+    driver.write_text(
+        "param([string]$Guard, [string]$Lock, [string]$Mem, [string]$Table, [string]$Sha)\n"
+        ". $Guard -Library\n"
+        "$opts = @{ LockPath = $Lock; MemoryProbeFile = $Mem; ProcessTableFile = $Table; HeavySlotSha256 = $Sha; PollSeconds = 0.2 }\n"
+        + body,
+        encoding="ascii",
+    )
+    env = _env(heavy_slot=HEAVY_STUB, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log")})
+    return subprocess.run(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver), "-Guard", str(GUARD), "-Lock", lock,
+         "-Mem", _write_json(box["dir"] / "memory.json", OK_MEMORY), "-Table", _write_json(box["dir"] / "table.json", []),
+         "-Sha", _stub_sha()],
+        capture_output=True, text=True, timeout=120, env=env, check=False, cwd=str(cwd or box["dir"]),
+    )
+
+
+def test_a_relative_lock_path_still_builds_under_the_heavy_slot(box) -> None:
+    # Adversary A1: Split-Path of a bare file name is empty; the guard resolves the lock path first.
+    done = _library_driver(
+        box,
+        "$ErrorActionPreference = 'Stop'\n"
+        "Invoke-BuildGuard -Label 'rel' -Options $opts -Action { param($Jobs) Write-Output \"built=$Jobs\" }\n",
+        "build-slot.lock",
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "built=4" in done.stdout
+    assert len(_stub_calls(box)) == 1
+
+
+def test_a_throw_after_admission_still_releases_the_heavy_slot(box) -> None:
+    # Adversary A2: a Library host that catches a throw raised after admission must not keep the machine slot.
+    done = _library_driver(
+        box,
+        # DeadlineMinutes this large makes AddMinutes throw after admission and before the build slot (the adversary's input).
+        "$opts.DeadlineMinutes = 10000000000\n"
+        "try { Invoke-BuildGuard -Label 'thrower' -Options $opts -Action { param($Jobs) } } catch { Write-Output \"caught=$($_.Exception.GetType().Name)\" }\n"
+        "$deadline = (Get-Date).AddSeconds(30)\n"
+        f"while (-not (Test-Path -LiteralPath '{box['dir'] / 'stub.log'}') -and (Get-Date) -lt $deadline) {{ Start-Sleep -Milliseconds 200 }}\n"
+        f"Write-Output \"released=$(Test-Path -LiteralPath '{box['dir'] / 'stub.log'}')\"\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "caught=" in done.stdout, done.stdout + done.stderr
+    assert "released=True" in done.stdout, "the holder must end while the host that caught the throw is still alive"
+    assert _stub_calls(box)[0]["childEnd"]
+
+
 def test_a_missing_shim_fails_open_with_one_warn(box) -> None:
     done = _heavy(box, "run", ["-Command", _marker_command(box)], shim=NO_HEAVY_SLOT)
     assert done.returncode == 0, done.stdout + done.stderr

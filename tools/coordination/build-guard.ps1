@@ -46,6 +46,10 @@
 #     reason=pin-mismatch and exits 3 before anything runs.
 #   - A heavy-slot call inside a build action does not pass through (the holder is a child of this guard,
 #     not an ancestor of the action), so it would wait for its own guard: do not nest one there.
+#   - heavy-slot's output goes to a log file beside the lock, never a pipe, so it can never block while it
+#     holds the slot. Known limit: a guard killed ALONE while still queued (not a tree kill) leaves its
+#     heavy-slot waiter queued; once admitted it may sample load (up to its 10 min admit cap) before the
+#     holder starts, sees the guard gone and exits. A tree kill (taskkill /T) ends the waiter with it.
 #   Lane FULL-SUITE runs take the same slot by hand, no new runner: from the lane worktree,
 #      $env:HEAVY_SLOT_EXPECT_SHA256 = '<pin below>'; $env:HEAVY_SLOT_EXPECT_KEEPER = '1'
 #      heavy-slot.cmd run --class shared --label mlv:<lane>:pytest --eta 45m --wait 60m --exit-file <fresh> -- py -3 -m pytest <args>
@@ -324,22 +328,19 @@ function New-HeavySlotHolder([string]$ReadyFile, [string]$StopFile) {
     return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($text))
 }
 
-function Receive-HeavySlotLines($Lease, [int]$WaitMs) {
-    # Relays heavy-slot's stderr as it arrives and keeps it for the marker check; $WaitMs bounds each next line.
-    try {
-        while ($Lease.Read -and $Lease.Read.Wait($WaitMs)) {
-            $line = $Lease.Read.Result
-            if ($null -eq $line) { $Lease.Read = $null; break }
-            $Lease.Lines.Add($line)
-            [Console]::Error.WriteLine($line)
-            $Lease.Read = $Lease.Process.StandardError.ReadLineAsync()
-        }
-    } catch { $Lease.Read = $null }
+function Send-HeavySlotLines($Lease) {
+    # Relays the lines heavy-slot has written to its log file since the last call, and keeps them for the marker check.
+    $all = @(Get-Content -LiteralPath $Lease.Log -ErrorAction SilentlyContinue)
+    for ($i = $Lease.Lines.Count; $i -lt $all.Count; $i++) {
+        $Lease.Lines.Add([string]$all[$i])
+        [Console]::Error.WriteLine([string]$all[$i])
+    }
 }
 
 function Test-HeavySlotMarker($Lease, [int]$Code) {
     # B1: a 75-77 is heavy-slot's own only when the --exit-file marker names THIS run: source heavy-slot, the same
     # code, and the ticket + nonce from its HEAVY-SLOT TICKET stderr line. Returns '' when it does, else why not.
+    if ($Code -lt 75 -or $Code -gt 77) { return "exit $Code is not a heavy-slot code" }
     $ticket = ''
     $nonce = ''
     foreach ($l in $Lease.Lines) { if ($l -match '^HEAVY-SLOT TICKET (\S+) ([0-9a-f]{32})\s*$') { $ticket = $Matches[1]; $nonce = $Matches[2] } }
@@ -354,7 +355,7 @@ function Test-HeavySlotMarker($Lease, [int]$Code) {
 }
 
 function Remove-HeavySlotFiles($Lease) {
-    foreach ($f in @($Lease.Ready, $Lease.Stop, $Lease.ExitFile)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+    foreach ($f in @($Lease.Ready, $Lease.Stop, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 }
 
 function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
@@ -372,61 +373,68 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Write-Output ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=pin-mismatch expected={1} actual={2} cli={3} utc={4}' -f $Label, $expected, $actual, $cli, [DateTime]::UtcNow.ToString('o'))
         exit 3
     }
-    $dir = Join-Path (Split-Path -Parent $Options.LockPath) 'heavy-slot'
+    # A relative -LockPath is resolved first, so its parent is never empty (adversary A1).
+    $lockFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Options.LockPath)
+    $dir = Join-Path (Split-Path -Parent $lockFull) 'heavy-slot'
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $id = '{0}-{1}' -f $PID, [Guid]::NewGuid().ToString('N')
     $lease = @{
         Label = 'mlv:{0}:build' -f (Get-HeavySlotLane)
         Ready = Join-Path $dir "$id.ready"; Stop = Join-Path $dir "$id.stop"; ExitFile = Join-Path $dir "$id.exit.json"
-        Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Read = $null; Ticket = ''; Reason = ''
+        Log = Join-Path $dir "$id.log"; Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''
     }
     $exe = [Environment]::ProcessPath
     if (-not $exe) { $exe = (Get-Process -Id $PID).Path }
-    $psi = [System.Diagnostics.ProcessStartInfo]::new($cmd)
+    # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a
+    # file, never a pipe, so nothing it writes while it holds the slot can block it (adversary A4).
+    $quoted = @($cmd, 'run', '--class', 'shared', '--label', $lease.Label, '--eta', ('{0}m' -f $Options.HeavySlotEtaMinutes),
+        '--wait', ('{0}m' -f $Options.HeavySlotWaitMinutes), '--exit-file', $lease.ExitFile,
+        '--', $exe, '-NoProfile', '-NonInteractive', '-EncodedCommand', (New-HeavySlotHolder $lease.Ready $lease.Stop)) |
+        ForEach-Object { '"' + ([string]$_ -replace '"', '""') + '"' }
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($env:ComSpec)
     $psi.UseShellExecute = $false
-    $psi.RedirectStandardError = $true
-    foreach ($a in @('run', '--class', 'shared', '--label', $lease.Label, '--eta', ('{0}m' -f $Options.HeavySlotEtaMinutes),
-            '--wait', ('{0}m' -f $Options.HeavySlotWaitMinutes), '--exit-file', $lease.ExitFile,
-            '--', $exe, '-NoProfile', '-NonInteractive', '-EncodedCommand', (New-HeavySlotHolder $lease.Ready $lease.Stop))) {
-        $psi.ArgumentList.Add([string]$a)
-    }
+    $psi.Arguments = '/d /s /c "' + ($quoted -join ' ') + ' >"' + $lease.Log + '" 2>&1"'
     $psi.Environment['HEAVY_SLOT_EXPECT_SHA256'] = $expected
     $psi.Environment['HEAVY_SLOT_EXPECT_KEEPER'] = '1'
     try { $lease.Process = [System.Diagnostics.Process]::Start($psi) } catch {
         Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=$cmd start-failed: $($_.Exception.Message); building WITHOUT the machine heavy slot (fail open)"
         return $null
     }
-    $lease.Read = $lease.Process.StandardError.ReadLineAsync()
     Write-BuildGuardLog ('heavy-slot: waiting label={0} wait={1}m exit-file={2} shim={3}' -f $lease.Label, $Options.HeavySlotWaitMinutes, $lease.ExitFile, $cmd)
     # heavy-slot ends its own wait (a marked 75) and its admit cap; this bound only catches a hung tool.
     $giveUp = [DateTime]::UtcNow.AddMinutes($Options.HeavySlotWaitMinutes + 15)
-    while (-not (Test-Path -LiteralPath $lease.Ready)) {
-        Receive-HeavySlotLines $lease 0
-        $why = ''
-        $code = 1
-        if ($lease.Process.HasExited) {
-            Receive-HeavySlotLines $lease 5000
-            if (Test-Path -LiteralPath $lease.Ready) { break }
-            $code = $lease.Process.ExitCode
-            $why = Test-HeavySlotMarker $lease $code
-            if (-not $why) {
-                Remove-HeavySlotFiles $lease
-                Write-Output ('BUILD_HEAVY_SLOT_REQUEUE label={0} code={1} ticket={2} reason={3} utc={4}' -f $Label, $code, $lease.Ticket, ($lease.Reason -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
-                exit 3
+    try {
+        while (-not (Test-Path -LiteralPath $lease.Ready)) {
+            Send-HeavySlotLines $lease
+            $why = ''
+            $code = 1
+            if ($lease.Process.HasExited) {
+                if (Test-Path -LiteralPath $lease.Ready) { break }
+                Send-HeavySlotLines $lease
+                $code = $lease.Process.ExitCode
+                $why = Test-HeavySlotMarker $lease $code
+                if (-not $why) {
+                    Remove-HeavySlotFiles $lease
+                    Write-Output ('BUILD_HEAVY_SLOT_REQUEUE label={0} code={1} ticket={2} reason={3} utc={4}' -f $Label, $code, $lease.Ticket, ($lease.Reason -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
+                    exit 3
+                }
+                if ($code -lt 75 -or $code -gt 77) { $why = 'heavy-slot ended before admitting the build' }
+            } elseif ([DateTime]::UtcNow -ge $giveUp) {
+                $why = 'no admission and no exit within the wait plus 15 min'
             }
-            if ($code -lt 75 -or $code -gt 77) { $why = 'heavy-slot ended before admitting the build' }
-        } elseif ([DateTime]::UtcNow -ge $giveUp) {
-            $why = 'no admission and no exit within the wait plus 15 min'
-            Set-Content -LiteralPath $lease.Stop -Value stop -Encoding ascii -ErrorAction SilentlyContinue
+            if ($why) {
+                if ($code -eq 0) { $code = 1 }
+                Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code={1} reason={2} utc={3}' -f $Label, $code, $why, [DateTime]::UtcNow.ToString('o'))
+                exit $code
+            }
+            Start-Sleep -Milliseconds 250
         }
-        if ($why) {
-            if ($code -eq 0) { $code = 1 }
-            Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code={1} reason={2} utc={3}' -f $Label, $code, $why, [DateTime]::UtcNow.ToString('o'))
-            exit $code
-        }
-        Start-Sleep -Milliseconds 250
+    } finally {
+        # Every way out before admission (exit, throw, Ctrl+C) leaves the stop file, so a holder heavy-slot starts later
+        # ends at once instead of holding the machine slot (adversary A2).
+        if (-not $lease.Process.HasExited -and -not (Test-Path -LiteralPath $lease.Ready)) { Set-Content -LiteralPath $lease.Stop -Value stop -Encoding ascii -ErrorAction SilentlyContinue }
     }
-    Receive-HeavySlotLines $lease 0
+    Send-HeavySlotLines $lease
     Write-BuildGuardLog ('heavy-slot: admitted label={0} held={1}' -f $lease.Label, ((Get-Content -LiteralPath $lease.Ready -Raw -ErrorAction SilentlyContinue) -replace '\s', ''))
     return $lease
 }
@@ -437,13 +445,15 @@ function Exit-HeavySlot($Lease) {
     if (-not $Lease) { return }
     Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -ErrorAction SilentlyContinue
     if ($Lease.Process.WaitForExit(60000)) {
-        Receive-HeavySlotLines $Lease 5000
+        Send-HeavySlotLines $Lease
         if ($Lease.Process.ExitCode -ne 0) { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} heavy-slot ended with {1} after release' -f $Lease.Label, $Lease.Process.ExitCode) }
         else { Write-BuildGuardLog ('heavy-slot: released label={0}' -f $Lease.Label) }
+        Remove-HeavySlotFiles $Lease
     } else {
-        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} heavy-slot did not end within 60 s of release; its holder exits when this guard does' -f $Lease.Label)
+        # The stop file stays: a holder that has not been scheduled yet must still see it (adversary A3).
+        Send-HeavySlotLines $Lease
+        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} heavy-slot did not end within 60 s of release; the stop file stays at {1}' -f $Lease.Label, $Lease.Stop)
     }
-    Remove-HeavySlotFiles $Lease
 }
 
 function Invoke-BuildGuard {
@@ -469,43 +479,46 @@ function Invoke-BuildGuard {
             Add-BuildGuardLogLine -Path $o.ExemptLogPath -Line $line -Encoding ([Text.Encoding]::ASCII)
         } catch { Write-BuildGuardLog "exemption log not written: $($_.Exception.Message)" }
     }
-    # The machine heavy slot is the OUTERMOST lock of a build: the memory floor and the build slot below nest inside it.
+    # The machine heavy slot is the OUTERMOST lock of a build: the memory floor and the build slot below nest inside it,
+    # and the outer finally gives it back on every way out, a throw a Library caller catches included (adversary A2).
     $heavy = $null
-    if (-not $NoSlot) { $heavy = Enter-HeavySlot -Options $o -Label $Label }
-    $started = [DateTime]::UtcNow
-    $deadline = $started.AddMinutes($o.DeadlineMinutes)
-    $ticket = $null
-    $mem = @{ PhysGB = 0.0; CommitGB = 0.0 }
-    while ($true) {
-        $mem = Get-BuildGuardMemory -Options $o
-        $memOk = [bool]$exempt -or ($mem.PhysGB -ge $o.MinFreePhysGB -and $mem.CommitGB -ge $o.MinFreeCommitGB)
-        $held = ''
-        if ($memOk) {
-            if ($NoSlot) { break }
-            $slot = Invoke-BuildSlotAcquire -Options $o -Label $Label
-            if ($slot.Acquired) { $ticket = $slot.Ticket; break }
-            $held = $slot.Held
-        }
-        if ([DateTime]::UtcNow -ge $deadline) {
-            $waited = [int]([DateTime]::UtcNow - $started).TotalSeconds
-            if (-not $memOk) {
-                Write-Output ('BUILD_MEM_REFUSED label={0} freePhysGB={1} freeCommitGB={2} need={3}/{4} waitedSec={5} utc={6}' -f $Label, $mem.PhysGB, $mem.CommitGB, $o.MinFreePhysGB, $o.MinFreeCommitGB, $waited, [DateTime]::UtcNow.ToString('o'))
-            } else {
-                Write-Output ('BUILD_SLOT_BUSY label={0} heldBy=[{1}] waitedSec={2} utc={3}' -f $Label, $held, $waited, [DateTime]::UtcNow.ToString('o'))
-            }
-            Exit-HeavySlot $heavy
-            exit 3
-        }
-        Start-Sleep -Milliseconds ([int]($o.PollSeconds * 1000))
-    }
     try {
-        $choice = Get-BuildGuardJobs -Options $o -SelfPid $PID
-        $jobs = $choice.Jobs
-        if ($RequestedJobs -gt 0) { $jobs = [math]::Min($jobs, $RequestedJobs) }
-        Write-BuildGuardLog ('admitted label={0} jobs={1} reason={2} peers=[{3}] freePhysGB={4} freeCommitGB={5} slot={6}' -f $Label, $jobs, $choice.Reason, ($choice.Peers -join ','), $mem.PhysGB, $mem.CommitGB, $(if ($ticket) { 'held' } else { 'none' }))
-        & $Action $jobs
+        if (-not $NoSlot) { $heavy = Enter-HeavySlot -Options $o -Label $Label }
+        $started = [DateTime]::UtcNow
+        $deadline = $started.AddMinutes($o.DeadlineMinutes)
+        $ticket = $null
+        $mem = @{ PhysGB = 0.0; CommitGB = 0.0 }
+        while ($true) {
+            $mem = Get-BuildGuardMemory -Options $o
+            $memOk = [bool]$exempt -or ($mem.PhysGB -ge $o.MinFreePhysGB -and $mem.CommitGB -ge $o.MinFreeCommitGB)
+            $held = ''
+            if ($memOk) {
+                if ($NoSlot) { break }
+                $slot = Invoke-BuildSlotAcquire -Options $o -Label $Label
+                if ($slot.Acquired) { $ticket = $slot.Ticket; break }
+                $held = $slot.Held
+            }
+            if ([DateTime]::UtcNow -ge $deadline) {
+                $waited = [int]([DateTime]::UtcNow - $started).TotalSeconds
+                if (-not $memOk) {
+                    Write-Output ('BUILD_MEM_REFUSED label={0} freePhysGB={1} freeCommitGB={2} need={3}/{4} waitedSec={5} utc={6}' -f $Label, $mem.PhysGB, $mem.CommitGB, $o.MinFreePhysGB, $o.MinFreeCommitGB, $waited, [DateTime]::UtcNow.ToString('o'))
+                } else {
+                    Write-Output ('BUILD_SLOT_BUSY label={0} heldBy=[{1}] waitedSec={2} utc={3}' -f $Label, $held, $waited, [DateTime]::UtcNow.ToString('o'))
+                }
+                exit 3
+            }
+            Start-Sleep -Milliseconds ([int]($o.PollSeconds * 1000))
+        }
+        try {
+            $choice = Get-BuildGuardJobs -Options $o -SelfPid $PID
+            $jobs = $choice.Jobs
+            if ($RequestedJobs -gt 0) { $jobs = [math]::Min($jobs, $RequestedJobs) }
+            Write-BuildGuardLog ('admitted label={0} jobs={1} reason={2} peers=[{3}] freePhysGB={4} freeCommitGB={5} slot={6}' -f $Label, $jobs, $choice.Reason, ($choice.Peers -join ','), $mem.PhysGB, $mem.CommitGB, $(if ($ticket) { 'held' } else { 'none' }))
+            & $Action $jobs
+        } finally {
+            Remove-BuildSlot $ticket
+        }
     } finally {
-        Remove-BuildSlot $ticket
         Exit-HeavySlot $heavy
     }
 }
