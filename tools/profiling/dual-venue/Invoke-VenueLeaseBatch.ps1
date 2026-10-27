@@ -341,9 +341,10 @@ function Remove-TrailingSeparator([string]$Path) {
 
 function Get-OutputZones {
     # The folders this run writes into: -RunDir, then the claim dir when it already exists (nothing can sit in one that does not). root = the PHYSICAL path.
-    $zones = @([pscustomobject]@{ label = '-RunDir'; root = (Remove-TrailingSeparator (Get-PhysicalPath $RunDir)); leaf = $script:RunDirOutputLeafPatterns; dirs = $script:RunDirOutputDirs; linked = @() })
+    # r13: rootId / ownedIds are the zone's and each existing owned directory's file identity (Get-RunDirOutputRefusal fills them)
+    $zones = @([pscustomobject]@{ label = '-RunDir'; root = (Remove-TrailingSeparator (Get-PhysicalPath $RunDir)); leaf = $script:RunDirOutputLeafPatterns; dirs = $script:RunDirOutputDirs; linked = @(); rootId = $null; ownedIds = @{} })
     if ($script:ClaimDirPath -and (Test-Path -LiteralPath $script:ClaimDirPath -PathType Container)) {
-        $zones += [pscustomobject]@{ label = '-ClaimDir'; root = (Remove-TrailingSeparator (Get-PhysicalPath $script:ClaimDirPath)); leaf = $script:ClaimDirOutputLeafPatterns; dirs = $script:ClaimDirOutputDirs; linked = @() }
+        $zones += [pscustomobject]@{ label = '-ClaimDir'; root = (Remove-TrailingSeparator (Get-PhysicalPath $script:ClaimDirPath)); leaf = $script:ClaimDirOutputLeafPatterns; dirs = $script:ClaimDirOutputDirs; linked = @(); rootId = $null; ownedIds = @{} }
     }
     $zones
 }
@@ -377,10 +378,19 @@ function Get-RunDirOutputRefusal([string]$Path) {
                 }
             }
             $z.linked = $linked
+            # r13 (Dot A2''): a final path has more than one SPELLING (\\localhost\C$\run\gate.log and C:\run\gate.log are one file, one link, no reparse point), so every location
+            # below is also compared by identity (volume serial + file index), which no spelling changes. One that cannot be read refuses the input (the catch).
+            $z.rootId = (Get-FileIdentity $z.root).key
+            foreach ($d in $z.dirs) { $dp = Join-Path $z.root $d; if (Test-Path -LiteralPath $dp -PathType Container) { $z.ownedIds[$d] = (Get-FileIdentity $dp).key } }
+            foreach ($l in $z.linked) { $l | Add-Member -NotePropertyName id -NotePropertyValue (Get-FileIdentity $l.physical).key }
         }
         # r10 (adversary r10 A1): and a HARD link is a second name for the same file, with its own final path, so the paths differ while the file is the one the runner writes. Compare file
         # identity: only an input with more than one name can be one, and then only the outputs that already exist can be its other name.
         $id = Get-FileIdentity $full
+        # r13 (Dot A2''): the identity of every directory above the input, nearest first, for the zone and owned-directory comparisons below
+        $aboveIds = [System.Collections.Generic.List[string]]::new()
+        $a = [IO.Path]::GetDirectoryName($full)
+        while ($a) { $aboveIds.Add((Get-FileIdentity $a).key); $a = [IO.Path]::GetDirectoryName($a) }
         if ($id.links -gt 1) {
             foreach ($z in $zones) {
                 $scan = [System.Collections.Generic.List[object]]::new()
@@ -404,16 +414,17 @@ function Get-RunDirOutputRefusal([string]$Path) {
     if ($hardLinkOf) { return "$shown is a hard link to $hardLinkOf, a file this run writes under $($hardLinkZone.label)" }
     $parent = Remove-TrailingSeparator ([IO.Path]::GetDirectoryName($full))
     foreach ($z in $zones) {
+        # each test by spelling OR by identity (r13, Dot A2''): the same file or directory reached by another spelling is the same output
         foreach ($l in $z.linked) {
-            if (-not $l.isDir -and $full -ieq $l.physical) { return "$shown is a file this run writes into $($z.label) ($($l.name), a link to it)" }
-            if ($l.isDir -and ($full + '\').StartsWith($l.physical.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $($l.name)\, a link to a directory this run writes into under $($z.label)" }
+            if (-not $l.isDir -and ($full -ieq $l.physical -or $id.key -ceq $l.id)) { return "$shown is a file this run writes into $($z.label) ($($l.name), a link to it)" }
+            if ($l.isDir -and (($full + '\').StartsWith($l.physical.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -or $aboveIds -ccontains $l.id)) { return "$shown is inside $($l.name)\, a link to a directory this run writes into under $($z.label)" }
         }
-        if ($parent -ieq $z.root) {
+        if ($parent -ieq $z.root -or ($aboveIds.Count -gt 0 -and $aboveIds[0] -ceq $z.rootId)) {
             $leaf = [IO.Path]::GetFileName($full)
             foreach ($p in $z.leaf) { if ($leaf -imatch $p) { return "$shown is a file this run writes into $($z.label) ($leaf)" } }
         }
         foreach ($d in $z.dirs) {
-            if (($parent.TrimEnd('\') + '\').StartsWith($z.root.TrimEnd('\') + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $d\, a directory this run writes into under $($z.label)" }
+            if (($parent.TrimEnd('\') + '\').StartsWith($z.root.TrimEnd('\') + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase) -or ($z.ownedIds.ContainsKey($d) -and $aboveIds -ccontains $z.ownedIds[$d])) { return "$shown is inside $d\, a directory this run writes into under $($z.label)" }
         }
     }
     ''
@@ -450,7 +461,8 @@ function Get-InputOutputRefusal {
 function Get-InputContentRefusal {
     # r12 pass 2 (adversary r12 A2'): the CONTENT the preflight validated (each leg spec the leg would run, each staged build manifest's digest and fields) can change in the same wait as
     # a location can, and the leg job would then throw or refuse after the lease opened. The same reads and the same typed reasons as the preflight, run again with the location re-check.
-    # $null when nothing changed. A share that cannot be read now is not a hit: the open and the leg report that themselves, typed.
+    # $null when nothing changed. r13 (Dot A1''): a manifest whose bytes cannot be read now (write-locked, the share not answering) is a hit too, SHARE_UNREACHABLE as in the preflight:
+    # its digest cannot be re-validated, and no lease is opened on a build nobody re-validated.
     if (-not $legPlanMode) { return $null }
     foreach ($g in $script:guardedInputs) {
         if ($g.kind -ceq 'spec') {
@@ -459,6 +471,8 @@ function Get-InputContentRefusal {
         } elseif ($g.kind -ceq 'build') {
             $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec 30
             $short = $g.commit.Substring(0, 12)
+            if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short could not be read after the claim wait at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no lease is opened" } }
+            if ($st.state -cne 'STAGED' -and $st.state -cne 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short read as '$($st.state)' after the claim wait; only STAGED with the validated digest opens a lease" } }
             if ($st.state -ceq 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_NOT_STAGED'; why = "no staged build manifest for $short at $($st.path) any more; the runner stages and builds nothing" } }
             if ($st.state -ceq 'STAGED' -and $st.sha256 -cne $g.sha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_MANIFEST_MISMATCH'; why = "the staged build manifest for $short changed while the batch waited: sha256 $($st.sha256), not $($g.sha256)" } }
             if ($st.state -ceq 'STAGED' -and $st.contentProblem) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_MANIFEST_MISMATCH'; why = "the staged build manifest for $short at $($st.path) is no longer one the leg job accepts: $($st.contentProblem)" } }

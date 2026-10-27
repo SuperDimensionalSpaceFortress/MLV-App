@@ -611,6 +611,9 @@ function Get-VenueStagedBuildManifest {
     $read = $(if ($null -ne $ProbeScript) { $ProbeScript } else {
             {
                 param($p)
+                # r13 (Dot A1''): a read that fails (a manifest a writer holds open, a share error) ends the read, so it is UNREACHABLE with its own error. Under the runspace's default
+                # Continue, a failed ReadAllBytes went on with no bytes and the read reported NOT_STAGED, a manifest it never looked at.
+                $ErrorActionPreference = 'Stop'
                 if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return '' }
                 # ONE read: the digest and the facts below come from the same bytes (a file replaced between two reads would pair one version's hash with another's content)
                 $bytes = [IO.File]::ReadAllBytes($p)

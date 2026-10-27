@@ -2849,6 +2849,83 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(code, 0, so + se)
         self.assertNotIn("LEG_PLAN_REFUSED", se)
 
+    # r13 (Dot A1''): a staged manifest whose bytes cannot be read after the wait (write-locked: the location and metadata still read) was "not a hit", so the lease opened on a build
+    # nobody re-validated. Its digest cannot be checked, so it is refused before the lease, typed, like the preflight's own unreadable manifest.
+    def _lock_exclusive(self, path: Path) -> None:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = ctypes.c_void_p
+        k32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        # a writer that still lets others read: GENERIC_READ | GENERIC_WRITE, share READ, OPEN_EXISTING. Test-Path and the location still answer; ReadAllBytes (share READ, which a
+        # handle with write access breaks) does not. (Share NONE hides the file from Test-Path too, which is the BUILD_NOT_STAGED refusal r12 already covers.)
+        h = k32.CreateFileW(str(path), 0xC0000000, 1, None, 3, 0x80, None)
+        self.assertNotIn(h, (None, ctypes.c_void_p(-1).value), f"could not lock {path}: {ctypes.get_last_error()}")
+        self.addCleanup(k32.CloseHandle, h)
+
+    def test_r13_a1_a_staged_build_manifest_write_locked_during_the_wait_is_refused_before_the_lease(self) -> None:
+        self._fresh_run_dir()
+        manifest = self._staged_manifest(self.commit_a)
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        code, so, se = self._during_claim_wait(args, e, lambda: self._lock_exclusive(manifest))
+        self._assert_refused_after_the_wait(code, so, se, "LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ")
+        self.assertIn("could not be read after the claim wait", se)
+
+    # r13 (Dot A2''): one file, two spellings. A loopback UNC name (\\localhost\C$\...) and the local name reach the same single-link file, and the guard compared spellings, so the
+    # UNC spelling of a runner output was accepted as an input. It now compares file and directory identity (volume serial + file index), which no spelling changes.
+    def _loopback_unc(self, p: Path) -> Path:
+        drive, rest = os.path.splitdrive(str(p.resolve()))
+        if len(drive) != 2 or drive[1] != ":":
+            self.skipTest(f"{p} is not on a drive letter")
+        unc = Path("\\\\localhost\\" + drive[0] + "$" + rest)
+        if not unc.exists():
+            self.skipTest(f"no loopback admin share reaches {p} as {unc}")
+        return unc
+
+    def _plan_with_share(self, share: Path) -> subprocess.CompletedProcess:
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        args[args.index("-AgentShare") + 1] = str(share)
+        return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+
+    def test_r13_a2_a_staged_build_manifest_reached_by_a_loopback_unc_agent_share_inside_a_runner_owned_directory_is_refused(self) -> None:
+        # the share is <RunDir>\quiet (a directory the runner writes), named \\localhost\C$\...\quiet: the manifest's UNC path shares no prefix with the local -RunDir, one link, no reparse point
+        self._fresh_run_dir()
+        inside = self.run_dir / "quiet"
+        shutil.copytree(self.share, inside)
+        manifest = inside / "cache" / f"playback-attr-3-cuda-{self.commit_a[:12]}-build.json"
+        before = manifest.read_text(encoding="utf-8")
+        r = self._plan_with_share(self._loopback_unc(inside))
+        self._assert_nothing_submitted_input_intact(r, manifest, before, "LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ")
+        self.assertIn("inside quiet\\", r.stderr)
+
+    def test_r13_a2_a_loopback_unc_agent_share_outside_the_run_still_runs(self) -> None:
+        self._fresh_run_dir()
+        r = self._plan_with_share(self._loopback_unc(self.share))
+        self.assertNotIn("LEG_PLAN_REFUSED", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_r13_a2_a_leg_spec_named_by_a_loopback_unc_alias_of_a_runner_output_is_refused_before_the_claim(self) -> None:
+        # (already refused on b9b2f710: Resolve-LegSpecPath hands a UNC spec back provider-qualified, which the guard cannot resolve; this pins that the refusal holds)
+        for case in ("gate.log", "quiet/x.json", "junction quiet"):
+            with self.subTest(output=case):
+                self._fresh_run_dir()
+                self.run_dir.mkdir(parents=True, exist_ok=True)
+                if case == "junction quiet":
+                    elsewhere = self.case / "elsewhere-unc"
+                    shutil.rmtree(elsewhere, ignore_errors=True)
+                    self._junction(self.run_dir / "quiet", elsewhere)
+                    local = elsewhere / "x.json"
+                else:
+                    local = self.run_dir / case
+                    local.parent.mkdir(parents=True, exist_ok=True)
+                local.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = local.read_text(encoding="utf-8")
+                r = self.run_plan(self.write_plan([self.item(self._loopback_unc(local), "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, local, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                if case == "junction quiet":
+                    os.rmdir(self.run_dir / "quiet")
+
     # r12 (adversary r12 A2): TrimEnd('\') turned the drive root C:\ into C:, the drive's current directory, so a root zone was listed from the wrong folder. A real volume root cannot be
     # written to by a test, so the function that decides it is run on its own: its source is taken from the runner, so this cannot drift from what the runner does.
     def test_r12_a2_a_drive_root_keeps_its_backslash_when_trailing_separators_are_removed(self) -> None:
