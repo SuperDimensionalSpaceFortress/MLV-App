@@ -4963,8 +4963,10 @@ function Test-CorePartitionReadyMarker([string]$Path, [string]$Token) {
 }
 
 # The source text of generator functions, for splicing into the emitted job / helper (one definition, here).
-function Get-CorePartitionFunctionSource([string[]]$Name, [string]$Eol) {
-    (@($Name | ForEach-Object { (Get-Item -LiteralPath "function:$_").ScriptBlock.Ast.Extent.Text }) -join "`n") -replace "\r?\n", $Eol
+# r12 (Dot 6449902548): callers hand the functions as static ${function:Name} reads, never a function: path built at run time, which the
+# merged #691 scanner (attr3_publish_write_scan.ps1) fails closed as a possible shadow. A missing function throws, as the old Get-Item did.
+function Get-CorePartitionFunctionSource([scriptblock[]]$Function, [string]$Eol) {
+    (@($Function | ForEach-Object { if ($null -eq $_) { throw 'CORE_PARTITION_FUNCTION_MISSING a spliced core-partition function is not defined' }; $_.Ast.Extent.Text }) -join "`n") -replace "\r?\n", $Eol
 }
 
 # The helper's body (runs in its own pwsh, affinity = the helper mask, BelowNormal). Inputs arrive as MLV_CP_* environment variables.
@@ -5716,7 +5718,7 @@ if ($CorePartitionTelemetry) {
     $cpOpen = '# BACHELOR-CORE-PARTITION-AB-1 >>>'
     $cpClose = '# BACHELOR-CORE-PARTITION-AB-1 <<<'
     $cpEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $cpHelperSource = (Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'Get-CorePartitionTopology', 'Test-CorePartitionMaskClass') "`n") + "`n" + $corePartitionHelperBody
+    $cpHelperSource = (Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:Get-CorePartitionTopology}, ${function:Test-CorePartitionMaskClass}) "`n") + "`n" + $corePartitionHelperBody
     # Indentation and whole-line comments are dropped so the encoded command fits one command line (the C# here-string's closing "@ stays at column 0).
     $cpHelperSource = (@($cpHelperSource -split "\r?\n" | ForEach-Object { $_.TrimStart() } | Where-Object { $_ -ne '' -and -not $_.StartsWith('#') }) -join "`n")
     $cpHelperEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($cpHelperSource))
@@ -5724,7 +5726,7 @@ if ($CorePartitionTelemetry) {
     # record HMAC took the helper past the earlier 30000).
     if ($cpHelperEncoded.Length -gt 32000) { throw "CORE_PARTITION_HELPER_TOO_LONG the encoded helper is $($cpHelperEncoded.Length) chars (limit 32000, one command line)" }
     $cpHelperAffinity = if ($corePartitionArgs.load -ne 0) { $corePartitionArgs.load } else { $corePartitionArgs.helper }
-    $cpJobFunctions = Get-CorePartitionFunctionSource @('Format-CorePartitionMask', 'ConvertFrom-CorePartitionNumber', 'Get-CorePartitionEffectiveMHz', 'ConvertFrom-CorePartitionFeedRows', 'Split-CorePartitionFeedLines', 'Test-CorePartitionFeedFresh', 'Test-CorePartitionFeedRowAfter', 'Test-CorePartitionFeedMarkAccounted', 'Get-CorePartitionFeedSummary', 'Get-CorePartitionCounterSummary', 'Get-CorePartitionWorkerThreads', 'Join-CorePartitionWhy', 'Get-CorePartitionReadyFeed', 'ConvertTo-CorePartitionUtcTicks', 'Test-CorePartitionHelperRecordShape', 'Test-CorePartitionHelperMac', 'Test-CorePartitionHelperRecord', 'Test-CorePartitionMeasuredApp', 'Get-CorePartitionAppAliveMonoMs', 'Get-CorePartitionScalars', 'Get-CorePartitionFeedHandleInfo', 'Read-CorePartitionFeedBytes', 'Read-CorePartitionFeedMark', 'Read-CorePartitionFeedSince', 'Get-CorePartitionReadyToken', 'Get-CorePartitionClockSkewMs', 'Get-CorePartitionMonoMs', 'Test-CorePartitionReadyMarker') "`n"
+    $cpJobFunctions = Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:ConvertFrom-CorePartitionNumber}, ${function:Get-CorePartitionEffectiveMHz}, ${function:ConvertFrom-CorePartitionFeedRows}, ${function:Split-CorePartitionFeedLines}, ${function:Test-CorePartitionFeedFresh}, ${function:Test-CorePartitionFeedRowAfter}, ${function:Test-CorePartitionFeedMarkAccounted}, ${function:Get-CorePartitionFeedSummary}, ${function:Get-CorePartitionCounterSummary}, ${function:Get-CorePartitionWorkerThreads}, ${function:Join-CorePartitionWhy}, ${function:Get-CorePartitionReadyFeed}, ${function:ConvertTo-CorePartitionUtcTicks}, ${function:Test-CorePartitionHelperRecordShape}, ${function:Test-CorePartitionHelperMac}, ${function:Test-CorePartitionHelperRecord}, ${function:Test-CorePartitionMeasuredApp}, ${function:Get-CorePartitionAppAliveMonoMs}, ${function:Get-CorePartitionScalars}, ${function:Get-CorePartitionFeedHandleInfo}, ${function:Read-CorePartitionFeedBytes}, ${function:Read-CorePartitionFeedMark}, ${function:Read-CorePartitionFeedSince}, ${function:Get-CorePartitionReadyToken}, ${function:Get-CorePartitionClockSkewMs}, ${function:Get-CorePartitionMonoMs}, ${function:Test-CorePartitionReadyMarker}) "`n"
     $cpLaunchOld = @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
