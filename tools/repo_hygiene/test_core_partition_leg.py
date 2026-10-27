@@ -222,7 +222,7 @@ try {
     $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
     $psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
     $psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
-    $psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(90).Ticks)
+    $psi.Environment['MLV_CP_DEADLINE_MS'] = '90000'
     $h = [Diagnostics.Process]::Start($psi)
     $sw = [Diagnostics.Stopwatch]::StartNew()
     while (-not (Test-Path (Join-Path $dir 'ready')) -and -not $h.HasExited -and $sw.ElapsedMilliseconds -lt 30000) { Start-Sleep -Milliseconds 100 }
@@ -262,7 +262,7 @@ $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
 $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
 $psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
 $psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '1'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '1'
-$psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(120).Ticks)
+$psi.Environment['MLV_CP_DEADLINE_MS'] = '120000'
 $h = [Diagnostics.Process]::Start($psi)
 try {
     $sw = [Diagnostics.Stopwatch]::StartNew()
@@ -305,7 +305,7 @@ $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
 $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
 $psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
 $psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '1'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '1'
-$psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(120).Ticks)
+$psi.Environment['MLV_CP_DEADLINE_MS'] = '120000'
 $h = [Diagnostics.Process]::Start($psi)
 $other = $null; $pre = $null
 try {
@@ -358,7 +358,7 @@ function Start-CpHelper([string]$Sub, [bool]$Plant) {
     $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $d 'launch'
     $psi.Environment['MLV_CP_MEASURED'] = Join-Path $d 'measured'
     $psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
-    $psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(60).Ticks)
+    $psi.Environment['MLV_CP_DEADLINE_MS'] = '60000'
     $psi.Environment['MLV_CP_NONCE'] = 'exit-driver-key-0123456789abcdef'
     $h = [Diagnostics.Process]::Start($psi)
     if (-not $h.WaitForExit(60000)) { $h.Kill(); [void]$h.WaitForExit(5000) }
@@ -394,6 +394,85 @@ try { Write-CorePartitionNewFile $ready 'ready' } catch { $threw = $true }
 $fresh = Join-Path $env:CP_DIR 'fresh.txt'
 Write-CorePartitionNewFile $fresh 'ok'
 [ordered]@{ threw = $threw; original = [IO.File]::ReadAllText($owner); fresh = [IO.File]::ReadAllText($fresh) } | ConvertTo-Json -Compress
+"""
+
+
+# r9 Dot 1 (= adversary r8 aeacec83 A1), the real helper (stand-in exe, never MLVApp). stop-while-alive: the measured pid and the stop file are
+# written while the measured app still runs (an early stop), so the helper's watch ends before the runner's exit. stop-right-after-exit (control):
+# both are written the instant the measured app exits, as the job does after the runner; the helper must still observe that exit.
+COVERAGE_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$out = [ordered]@{}
+foreach ($mode in @('stop-while-alive', 'stop-right-after-exit')) {
+    $dir = Join-Path $env:CP_DIR $mode
+    [void](New-Item -ItemType Directory -Path $dir)
+    $exe = Join-Path $dir 'mlvfake.exe'
+    Copy-Item -LiteralPath 'C:\Windows\System32\PING.EXE' -Destination $exe
+    $psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $($env:CP_ENCODED)")
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $psi.Environment['MLV_CP_EXE'] = $exe
+    $psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
+    $psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
+    $psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
+    $psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
+    $psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
+    $psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
+    $psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(120).Ticks); $psi.Environment['MLV_CP_DEADLINE_MS'] = '120000'
+    $h = [Diagnostics.Process]::Start($psi)
+    $measured = $null
+    try {
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        while (-not (Test-Path (Join-Path $dir 'ready')) -and -not $h.HasExited -and $sw.ElapsedMilliseconds -lt 60000) { Start-Sleep -Milliseconds 100 }
+        [IO.File]::WriteAllText((Join-Path $dir 'launch'), [string][DateTime]::UtcNow.Ticks)
+        Start-Sleep -Milliseconds 300
+        $measured = Start-Process -FilePath $exe -ArgumentList @('-n', $(if ($mode -eq 'stop-while-alive') { '12' } else { '4' }), '127.0.0.1') -PassThru -WindowStyle Hidden
+        $measuredStart = $measured.StartTime.ToUniversalTime().Ticks - 5000000
+        if ($mode -eq 'stop-while-alive') { Start-Sleep -Seconds 2 } else { [void]$measured.WaitForExit(30000) }
+        [IO.File]::WriteAllText((Join-Path $dir 'measured'), [string]$measured.Id)
+        [IO.File]::WriteAllText((Join-Path $dir 'stop'), 'stop')
+        if (-not $h.WaitForExit(30000)) { $h.Kill() }
+        [void]$measured.WaitForExit(30000)
+        $measuredEnd = [DateTime]::UtcNow.Ticks
+        $r = Get-Content -LiteralPath (Join-Path $dir 'helper.json') -Raw | ConvertFrom-Json
+        $inst = @($r.instances | Where-Object { $_.pid -eq $measured.Id })
+        $bench = [int64]@($inst)[0].affinityFirst
+        $s = Get-CorePartitionScalars $r ([ordered]@{ reasons = [ordered]@{} }) $bench 0 0 @{ value = 1; why = $null } $null $false -MeasuredPid ([int64]$measured.Id) -MeasuredStartTicks $measuredStart -MeasuredEndTicks $measuredEnd
+        $out[$mode] = [ordered]@{ endedBy = $r.endedBy; app = $r.app.pid; measuredPid = $measured.Id; gone = @($inst)[0].goneUtcTicks; goneMs = @($inst)[0].goneMs; aliveMs = @($inst)[0].aliveMs
+            bench = $s.benchAffinityApplied; observed = $s.appAffinityObserved; why = [string]$s.corePartitionNullReasons }
+    } finally {
+        if (-not $h.HasExited) { $h.Kill() }
+        if ($null -ne $measured -and -not $measured.HasExited) { $measured.Kill() }
+    }
+}
+$out | ConvertTo-Json -Compress -Depth 4
+"""
+
+
+# r9 Dot 3 (= adversary r8 aeacec83 A3), the real helper with no stop file and a lost parent. A backward wall-clock step makes a wall-clock deadline
+# lie far in the future: the seam hands the helper a wall deadline an hour away (MLV_CP_DEADLINE_TICKS, what an aeacec83 helper reads) and a 4 s
+# monotonic budget (MLV_CP_DEADLINE_MS). The helper must end itself at the monotonic budget (endedBy=deadline), not run on for the hour.
+DEADLINE_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$dir = $env:CP_DIR
+$psi = [Diagnostics.ProcessStartInfo]::new("$env:ProgramFiles\PowerShell\7\pwsh.exe", "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $($env:CP_ENCODED)")
+$psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+$psi.Environment['MLV_CP_EXE'] = Join-Path $dir 'no-such-app.exe'
+$psi.Environment['MLV_CP_STOP'] = Join-Path $dir 'stop'
+$psi.Environment['MLV_CP_READY'] = Join-Path $dir 'ready'
+$psi.Environment['MLV_CP_OUT'] = Join-Path $dir 'helper.json'
+$psi.Environment['MLV_CP_LAUNCH'] = Join-Path $dir 'launch'
+$psi.Environment['MLV_CP_MEASURED'] = Join-Path $dir 'measured'
+$psi.Environment['MLV_CP_BENCH'] = '0'; $psi.Environment['MLV_CP_LOAD'] = '0'; $psi.Environment['MLV_CP_HELPER'] = '1'; $psi.Environment['MLV_CP_THREADS'] = '0'
+$psi.Environment['MLV_CP_DEADLINE_TICKS'] = [string]([DateTime]::UtcNow.AddSeconds(3600).Ticks)
+$psi.Environment['MLV_CP_DEADLINE_MS'] = '4000'
+$sw = [Diagnostics.Stopwatch]::StartNew()
+$h = [Diagnostics.Process]::Start($psi)
+$ended = $h.WaitForExit(45000)
+$sec = $sw.Elapsed.TotalSeconds
+if (-not $ended) { $h.Kill(); [void]$h.WaitForExit(5000) }
+$p = Join-Path $dir 'helper.json'
+$endedBy = $(if (Test-Path -LiteralPath $p) { ([IO.File]::ReadAllText($p) | ConvertFrom-Json).endedBy } else { 'no-record' })
+[ordered]@{ endedItself = $ended; seconds = [math]::Round($sec, 1); endedBy = $endedBy } | ConvertTo-Json -Compress
 """
 
 
@@ -717,7 +796,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
             self.assertIsNotNone(m, f.name)
             src = base64.b64decode(m.group(1)).decode("utf-16-le")
             for name in ("function Get-CorePartitionTopology", "function Test-CorePartitionMaskClass", "function Format-CorePartitionMask", "MlvCorePartitionLoad",
-                         "ReadCategory()", "'Parking Status'", "MLV_CP_DEADLINE_TICKS"):
+                         "ReadCategory()", "'Parking Status'", "MLV_CP_DEADLINE_MS", "$cw.ElapsedMilliseconds -ge $deadline"):
                 self.assertIn(name, src, f.name)
             self.assertLess(len(m.group(1)), 32000)
             h = self.tmp / (f.stem + ".helper.ps1")
@@ -731,6 +810,56 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(len(counts), len(files) + len(helpers))
         for name, count in counts.items():
             self.assertEqual(count.strip(), "0", f"{name} has parse errors")
+
+    def test_a_stop_before_the_helper_observed_the_measured_apps_exit_refuses_its_coverage(self) -> None:
+        """r9 Dot 1 (= adversary r8 aeacec83 A1), the real helper: a stop file written while the measured app still runs ends the helper's watch
+        before the runner's exit, so its genuinely authenticated record does not cover the window: refused with coverage-stop-before-runner-exit
+        and bench acceptance is false. Control: the stop written the instant the app exits (as the job does) still finds the exit observed."""
+        m = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a"))
+        self.assertIsNotNone(m)
+        work = self.tmp / "coverage-work"
+        work.mkdir()
+        driver = self.tmp / "coverage-driver.ps1"
+        driver.write_text(LIFT + COVERAGE_DRIVER, encoding="ascii")
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1), "CP_GEN": str(GENERATOR)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        early = got["stop-while-alive"]
+        self.assertEqual(early["app"], early["measuredPid"], early)
+        self.assertEqual(early["endedBy"], "stop-file", early)
+        self.assertIsNone(early["gone"], f"the driver did not stop the helper while the app ran: {early}")
+        self.assertFalse(early["bench"], f"a record whose watch ended before the runner's exit was accepted: {early}")
+        self.assertIsNone(early["observed"], early)
+        self.assertIn("appAffinityObserved=coverage-stop-before-runner-exit", early["why"])
+        control = got["stop-right-after-exit"]
+        self.assertEqual(control["app"], control["measuredPid"], control)
+        self.assertIsNotNone(control["gone"], f"the helper ended on the stop file without polling the exited app first: {control}")
+        self.assertIsNotNone(control["goneMs"], control)
+        self.assertLessEqual(control["aliveMs"], control["goneMs"], control)
+        self.assertTrue(control["bench"], f"a full-window record was refused: {control}")
+
+    def test_the_helpers_self_deadline_is_monotonic_not_the_wall_clock(self) -> None:
+        """r9 Dot 3 (= adversary r8 aeacec83 A3): with its parent lost and a wall-clock deadline an hour away (what a backward step makes of it), the
+        real helper still ends itself at its 4 s monotonic budget with endedBy=deadline."""
+        m = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a"))
+        self.assertIsNotNone(m)
+        work = self.tmp / "deadline-work"
+        work.mkdir()
+        driver = self.tmp / "deadline-driver.ps1"
+        driver.write_text(DEADLINE_DRIVER, encoding="ascii")
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_DIR": str(work), "CP_ENCODED": m.group(1)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(got["endedItself"], f"the helper ran on past its monotonic deadline: {got}")
+        self.assertEqual(got["endedBy"], "deadline", got)
+        self.assertLess(got["seconds"], 30, got)
+        for key in ("a", "b1", "b2", "cuda-b2"):
+            with self.subTest(job=key):
+                text = lf(self.job(key))
+                self.assertIn("$cpPsi.Environment['MLV_CP_DEADLINE_MS'] = [string][int64](30000 + [double]$SmokeProcessTimeoutMs + 60000)\n", text)
+                self.assertNotIn("MLV_CP_DEADLINE_TICKS", text)
+                # r9 Dot 4: core-partition.json names the residual endpoint error bound, one helper poll interval
+                self.assertIn("endpointErrorBoundMs = 200 }", text)
 
 
 # --- the pure helpers, lifted from the generator by AST -------------------------------------------------------------------------------------
@@ -768,6 +897,10 @@ $base = @{ exists = $true; length = 400; ageSec = 1.0; monoMs = [int64]5000000; 
 $cpFeedSummaryImpl = ${function:Get-CorePartitionFeedSummary}
 function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $base) { & $cpFeedSummaryImpl $Start $End $StaleSec $Base }
 $start = @{ exists = $true; length = 500; ageSec = 1.0; before = "26.10.2026,01:00:00,x,61.0,20.5,No,No`n26.10.2026,01:00:01,x,62.5,21.0,No,No`n"; window = ''; windowStartsMidRow = $false; monoMs = [int64]5005000; readUtcTicks = $T0; lastWriteUtcTicks = $T0 - 10000000 }
+# r9 (Dot 2): a start mark's text is the bytes its read returned, from beforeOffset to length (Read-CorePartitionFeedMark); each hand-built start mark
+# below says where its text starts
+function Set-CpOffset($Mark) { $Mark.beforeOffset = [int64]$Mark.length - [Text.Encoding]::UTF8.GetByteCount([string]$Mark.before) }
+Set-CpOffset $start
 $end = @{ exists = $true; length = 900; ageSec = 0.5; before = ''; window = "5,00,x,99.0,99.0,Yes,Yes`n26.10.2026,01:00:02,x,70,45,No,No`r`n26.10.2026,01:00:03,x,80,55,Yes,No`nDate,Time,a,b,c,d,e`n26.10.2026,01:00:04,x,75,50,No,No`n"; windowStartsMidRow = $true; monoMs = [int64]5035000; readUtcTicks = $T0 + 300000000; lastWriteUtcTicks = $T0 + 295000000 }
 $feed = Get-CorePartitionFeedSummary $start $end 120
 $r.feed = @($feed.rows, $feed.pkgWattsMean, $feed.pkgWattsMax, $feed.pkgTempCMean, $feed.pkgTempCMax, $feed.pkgThrottledRows, $feed.pkgTempCAtStart, $feed.reasons.Count)
@@ -793,8 +926,8 @@ $cs = Get-CorePartitionCounterSummary $samples 1 4096
 $r.counters = @($cs.appSamples, $cs.pcoreMHzMean, $cs.ecoreMHzMean, $cs.pcoreParkedSampleFraction)
 $r.workers = @((Get-CorePartitionWorkerThreads "playback_smoke.start session=1 worker_threads=16 x=1`nplayback_smoke.start session=3 scale_request=1 worker_threads=12 start_serial=2`n").value,
     (Get-CorePartitionWorkerThreads "nothing here").why, (Get-CorePartitionWorkerThreads '').why)
-$one = '"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000}],"clockSkewMaxMs":0'
-$helper = ('{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":10.0,"bytes":20000000000},"samples":[{"app":true,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],' + $one + '}') | ConvertFrom-Json
+$one = '"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0'
+$helper = ('{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":10.0,"bytes":20000000000},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],' + $one + '}') | ConvertFrom-Json
 $w = @{ value = 16; why = $null }
 $b2 = Get-CorePartitionScalars $helper $feed 4095 1044480 8 $w $null @mp
 $r.b2 = @($b2.corePartitionTopologyOk, $b2.appAffinityObserved, $b2.benchAffinityRequested, $b2.benchAffinityApplied, $b2.partitionLoadMask, $b2.partitionLoadApplied, $b2.partitionLoadGBps,
@@ -850,20 +983,20 @@ $r.notReadyFeed = @($nr.pkgWattsMean, $nr.pkgWattsMax, $nr.pkgTempCMean, $nr.pkg
 # sol r4 A3: a row the writer has not finished (no newline yet) is not a row, at the window's end or at the start mark
 $part = $end.Clone(); $part.window = "26.10.2026,01:00:02,x,70,45,No,Y"; $part.windowStartsMidRow = $false
 $partTwo = $end.Clone(); $partTwo.window = "26.10.2026,01:00:01,x,60,40,No,No`n26.10.2026,01:00:02,x,70,45,No,Y"; $partTwo.windowStartsMidRow = $false
-$startPart = $start.Clone(); $startPart.before = "26.10.2026,01:00:00,x,61.0,20.5,No,No`n26.10.2026,01:00:01,x,6,20,No,N"
+$startPart = $start.Clone(); $startPart.before = "26.10.2026,01:00:00,x,61.0,20.5,No,No`n26.10.2026,01:00:01,x,6,20,No,N"; Set-CpOffset $startPart
 $r.partialRow = @((Get-CorePartitionFeedSummary $start $part 120).reasons['rows'], (Get-CorePartitionFeedSummary $start $partTwo 120).rows, (Get-CorePartitionFeedSummary $start $partTwo 120).pkgWattsMax,
     (Get-CorePartitionFeedSummary $startPart $whole 120).pkgTempCAtStart)
 # sol r4 A4: NaN, Infinity and an overflowing exponent are not measured values
 $r.nonFinite = @(foreach ($row in @("26.10.2026,01:00:02,x,NaN,45,No,No`n", "26.10.2026,01:00:02,x,70,1e309,No,No`n", "26.10.2026,01:00:02,x,Infinity,45,No,No`n", "26.10.2026,01:00:02,x,70,-Infinity,No,No`n")) {
     $nf = $end.Clone(); $nf.window = $row; $nf.windowStartsMidRow = $false; (Get-CorePartitionFeedSummary $start $nf 120).reasons['pkgWattsMean'] })
-$nfs = $start.Clone(); $nfs.before = "26.10.2026,01:00:00,x,NaN,20.5,No,No`n"
+$nfs = $start.Clone(); $nfs.before = "26.10.2026,01:00:00,x,NaN,20.5,No,No`n"; Set-CpOffset $nfs
 $r.nonFiniteStart = (Get-CorePartitionFeedSummary $nfs $whole 120).reasons['pkgTempCAtStart']
 # sol r4 CP-02 (literal): launch mark 2026-10-26T12:00:00Z; unrelated same-path pid 4242 starts at +50 ms with affinity 4095 and lives throughout;
 # the measured pid 5000 starts later. One record as the r4 helper wrote it (4242 bound), one as an r5 helper binds it (5000, 4242 still alive).
 $L = 639286128000000000
 function New-CpInst([int]$ProcId, [double]$Start, [double]$First, [double]$Last, $Gone) {
     $g = if ($null -eq $Gone) { 'null' } else { [string]($L + [int64]($Gone * 1e7)) }
-    '{"pid":' + $ProcId + ',"startUtcTicks":' + ($L + [int64]($Start * 1e7)) + ',"firstSeenUtcTicks":' + ($L + [int64]($First * 1e7)) + ',"lastSeenUtcTicks":' + ($L + [int64]($Last * 1e7)) + ',"goneUtcTicks":' + $g + ',"affinityFirst":4095,"affinityLast":4095,"loadSec":15.0,"loadBytes":30000000000}'
+    '{"pid":' + $ProcId + ',"startUtcTicks":' + ($L + [int64]($Start * 1e7)) + ',"firstSeenUtcTicks":' + ($L + [int64]($First * 1e7)) + ',"lastSeenUtcTicks":' + ($L + [int64]($Last * 1e7)) + ',"goneUtcTicks":' + $g + ',"aliveMs":' + [int64]($Last * 1000) + ',"goneMs":' + $(if ($null -eq $Gone) { 'null' } else { [int64]($Gone * 1000) }) + ',"affinityFirst":4095,"affinityLast":4095,"loadSec":15.0,"loadBytes":30000000000}'
 }
 # seconds after the launch mark: start, first seen, last seen, seen gone ($null = still alive when the helper ended)
 $i4242 = New-CpInst 4242 0.05 0.06 20 $null
@@ -880,7 +1013,7 @@ $i5000A2 = New-CpInst 5000 3 3.1 10 10.2
 $i4242A2 = New-CpInst 4242 9.9 10.2 20 20.2
 # adversary r5 A3 (literal): the runner's 5000 ran 12:00:03Z..12:00:23Z unseen; the helper saw only a replacement 5000 at 12:00:24Z..12:00:28Z
 $i5000A3 = New-CpInst 5000 24 24.1 28 28.1
-$hb = '"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"samples":[{"app":true,"appPid":5000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"clockSkewMaxMs":0'
+$hb = '"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"samples":[{"app":true,"appPid":5000,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"clockSkewMaxMs":0'
 function New-CpRecord([string]$App, [string[]]$Inst, [string[]]$Others = @()) { ('{' + $hb + ',"app":' + $App + ',"load":{"seconds":15.0,"bytes":30000000000},"instances":[' + ($Inst -join ',') + '],"others":[' + ($Others -join ',') + ']}') | ConvertFrom-Json }
 # record, measured pid, the runner's launch / exit (seconds after the launch mark)
 $cases = [ordered]@{
@@ -977,12 +1110,12 @@ $a1E = @{ exists = $true; length = 68; created = 639284400000000000; fileId = '0
 $a1 = Get-CorePartitionFeedSummary $a1S $a1E 120 $a1S
 # adversary r7 (15b3bbf7) A2 (literal): the feed replaced between the pre-helper and start reads by a file whose newest row is a day old
 $a2B = @{ exists = $true; length = 34; created = $T0 - 1728000000000; fileId = '0000ABCD-0000000000000001'; monoMs = [int64]8995000; readUtcTicks = $T0 - 50000000; lastWriteUtcTicks = $T0 - 864000000000 }
-$a2S = @{ exists = $true; length = 34; created = $T0 - 864000000000; fileId = '0000ABCD-0000000000000002'; monoMs = [int64]9000000; readUtcTicks = $T0; lastWriteUtcTicks = $T0 - 864000000000; before = "25.10.2026,12:00:00,x,20,10,No,No`n"; window = ''; windowStartsMidRow = $false }
+$a2S = @{ exists = $true; length = 34; created = $T0 - 864000000000; fileId = '0000ABCD-0000000000000002'; monoMs = [int64]9000000; readUtcTicks = $T0; lastWriteUtcTicks = $T0 - 864000000000; before = "25.10.2026,12:00:00,x,20,10,No,No`n"; window = ''; windowStartsMidRow = $false }; Set-CpOffset $a2S
 $a2E = @{ exists = $true; length = 68; created = $T0 - 864000000000; fileId = '0000ABCD-0000000000000002'; monoMs = [int64]9020000; readUtcTicks = $T0 + 200000000; lastWriteUtcTicks = $T0 + 200000000; before = ''; window = "26.10.2026,12:00:20,x,70,45,No,No`n"; windowStartsMidRow = $false; replaced = $false; truncated = $false }
 $a2 = Get-CorePartitionFeedSummary $a2S $a2E 120 $a2B
 # the same file grown after the pre-helper read only by an unfinished row: the newest complete row ends before the pre-helper offset (183 < 190)
 $pB = @{ exists = $true; length = 190; monoMs = [int64]8995000 }
-$pS = @{ exists = $true; length = 200; monoMs = [int64]9000000; before = "26.10.2026,12:00:00,x,20,10,No,No`n26.10.2026,12:00"; window = ''; windowStartsMidRow = $false }
+$pS = @{ exists = $true; length = 200; monoMs = [int64]9000000; before = "26.10.2026,12:00:00,x,20,10,No,No`n26.10.2026,12:00"; window = ''; windowStartsMidRow = $false }; Set-CpOffset $pS
 # adversary r8 (e1ce216c) A2: the row must START at or after the pre-helper offset (here it starts at 150), not merely end after it
 $pBok = $pB.Clone(); $pBok.length = 150
 $r.adversaryR7 = @([string]$a1.reasons['rows'], $a1.rows, $a1.pkgWattsMean, $a2.rows, $a2.pkgWattsMean, $a2.pkgTempCAtStart, [string]$a2.reasons['pkgTempCAtStart'],
@@ -993,10 +1126,11 @@ $b2B = @{ exists = $true; length = 34; monoMs = [int64]1000 }
 $b2Nl = @{ exists = $true; length = 35; monoMs = [int64]2000; before = $dayOld + "`n"; window = ''; windowStartsMidRow = $false }
 $b2Hd = @{ exists = $true; length = 77; monoMs = [int64]2000; before = $dayOld + "Date,Time,x,Temp,Power,Throttle1,Throttle2`n"; window = ''; windowStartsMidRow = $false }
 $b2Ok = @{ exists = $true; length = 68; monoMs = [int64]2000; before = $dayOld + "26.10.2026,01:00:00,x,61,40,No,No`n"; window = ''; windowStartsMidRow = $false }
+foreach ($sm in @($b2Nl, $b2Hd, $b2Ok)) { Set-CpOffset $sm }
 $b2E = @{ exists = $true; length = 200; monoMs = [int64]22000; before = ''; window = "26.10.2026,01:00:20,x,70,45,No,No`n"; windowStartsMidRow = $false; replaced = $false; truncated = $false }
 # adversary r8 (e1ce216c) A2 (literal): the pre-helper read saw a complete-looking row without its LF (length 33); only the LF was appended (34)
 $r8B = @{ exists = $true; length = 33; monoMs = [int64]1000 }
-$r8S = @{ exists = $true; length = 34; monoMs = [int64]2000; before = "25.10.2026,01:00:00,x,30,10,No,No`n"; window = ''; windowStartsMidRow = $false }
+$r8S = @{ exists = $true; length = 34; monoMs = [int64]2000; before = "25.10.2026,01:00:00,x,30,10,No,No`n"; window = ''; windowStartsMidRow = $false }; Set-CpOffset $r8S
 $r8x = Get-CorePartitionFeedSummary $r8S $b2E.Clone() 120 $r8B
 $r.adversaryR8 = @($r8x.rows, $r8x.pkgTempCAtStart, [string]$r8x.reasons['pkgTempCAtStart'])
 $r.adversaryR7b = @(foreach ($sm in @($b2Nl, $b2Hd, $b2Ok)) { $e2 = $b2E.Clone(); $x = Get-CorePartitionFeedSummary $sm $e2 120 $b2B; $x.pkgTempCAtStart; [string]$x.reasons['pkgTempCAtStart'] })# sol r6 CP-07: the one guarded number parse (absent in a pre-r7 generator)
@@ -1035,7 +1169,7 @@ if (Get-Command ConvertTo-CorePartitionUtcTicks -ErrorAction SilentlyContinue) {
     $r.utcTicks = @((ConvertTo-CorePartitionUtcTicks ('{"t":"' + $iso + '"}' | ConvertFrom-Json).t), (ConvertTo-CorePartitionUtcTicks $iso), (ConvertTo-CorePartitionUtcTicks $null), (ConvertTo-CorePartitionUtcTicks 'garbage'))
 }
 # sol r4 CP-03 (literal): fresh unchanged marks, two complete rows of finite 1e308 values; a watts-only overflow too
-$s308 = $start.Clone(); $s308.before = "26.10.2026,01:00:00,x,30,10,No,No`n"
+$s308 = $start.Clone(); $s308.before = "26.10.2026,01:00:00,x,30,10,No,No`n"; Set-CpOffset $s308
 $w308 = $end.Clone(); $w308.window = "26.10.2026,01:00:01,x,1e308,1e308,No,No`n26.10.2026,01:00:02,x,1e308,1e308,No,No`n"; $w308.windowStartsMidRow = $false
 $f308 = Get-CorePartitionFeedSummary $s308 $w308 120
 $r.aggregate = @($f308.rows, $f308.pkgWattsMean, $f308.pkgWattsMax, $f308.pkgTempCMean, $f308.pkgTempCMax, $f308.pkgThrottledRows, [string]$f308.reasons['pkgWattsMean'], [string]$f308.reasons['pkgTempCMean'], [string]$f308.reasons['rows'], $f308.pkgTempCAtStart)
@@ -1114,7 +1248,7 @@ $CorePartitionBenchMask = [int64]4095
 $CorePartitionLoadMask = [int64]1044480
 $CorePartitionLoadThreads = 8
 $CorePartitionHelperMask = [int64]1044480
-$record = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[{"app":true,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000}],"clockSkewMaxMs":0}'
+$record = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[{"app":true,"m":1000,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000,"aliveMs":16000,"goneMs":16200}],"clockSkewMaxMs":0}'
 # the runner's result.json: the launched pid and its launch..exit window, as the runner writes them (ISO 'o' strings)
 $runnerResult = '{"process":{"id":5000,"startedAtUtc":"' + [DateTime]::new([int64]639286128030000000, [DateTimeKind]::Utc).ToString('o') + '","endedAtUtc":"' + [DateTime]::new([int64]639286128230000000, [DateTimeKind]::Utc).ToString('o') + '"}}'
 $cases = @(
@@ -1596,6 +1730,149 @@ class CorePartitionPureHelperTests(unittest.TestCase):
 
 
 # --- the runner's mapping (offline test mode, stub generator) -------------------------------------------------------------------------------
+# r9: the Dot items' literals against the generator's own pure consumers (lifted). Each RED case fails on aeacec83; each control passes on both.
+R9_PURE = r"""
+$L = 639286128000000000
+$r = [ordered]@{}
+$feed = [ordered]@{ reasons = [ordered]@{} }
+$w = @{ value = 16; why = $null }
+# Dot 1 (= adversary r8 aeacec83 A1, literal): B2 masks bench 0x00FFF, load/helper 0xFF000, 8 threads. Helper 4242; app 5000 starts 12:00:03Z, runner
+# window 12:00:02.9Z..12:00:23Z. A stop file at 12:00:04.95Z ends the genuine helper's watch; it signs at 12:00:05Z with affinityFirst = affinityLast
+# = 4095, load 2 s and positive bytes, the app's goneUtcTicks null, clockSkewMaxMs 0. Control: the same run stopped after the observed exit.
+function New-R9Record([string]$Gone, [string]$GoneMs, [string]$AliveMs, [string]$EndedBy, [string]$Samples = '[]') {
+    ('{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,' +
+        '"app":{"pid":5000,"startUtcTicks":' + ($L + 30000000) + ',"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":2.0,"bytes":4000000000},"samples":' + $Samples + ',' +
+        '"instances":[{"pid":5000,"startUtcTicks":' + ($L + 30000000) + ',"firstSeenUtcTicks":' + ($L + 31000000) + ',"lastSeenUtcTicks":' + ($L + 49000000) + ',"goneUtcTicks":' + $Gone +
+        ',"aliveMs":' + $AliveMs + ',"goneMs":' + $GoneMs + ',"affinityFirst":4095,"affinityLast":4095}],"others":[],"clockSkewMaxMs":0,"endedBy":"' + $EndedBy + '"}') | ConvertFrom-Json
+}
+$mp = @{ MeasuredPid = [int64]5000; MeasuredStartTicks = $L + 29000000; MeasuredEndTicks = $L + 230000000 }
+$r.dot1 = [ordered]@{}
+foreach ($k in @('stop-while-alive', 'deadline-while-alive', 'full-window-control')) {
+    $rec = switch ($k) {
+        'stop-while-alive' { New-R9Record 'null' 'null' '4900' 'stop-file' }
+        'deadline-while-alive' { New-R9Record 'null' 'null' '4900' 'deadline' }
+        'full-window-control' { New-R9Record ([string]($L + 230500000)) '23050' '22950' 'stop-file' }
+    }
+    $s = Get-CorePartitionScalars $rec $feed 4095 1044480 8 $w $null $false @mp
+    $r.dot1[$k] = @($s.benchAffinityApplied, $s.partitionLoadApplied, $s.appAffinityObserved, [string]$s.corePartitionNullReasons)
+}
+# Dot 4 (= adversary r8 aeacec83 A4, literal): measured 5000 runs +3..+23 s; the helper saw it alive at 22.95 s (aliveMs), was descheduled, took a sample at
+# 24 s still tagged with 5000 (inst 0,0, 2500 MHz at 80 %), and saw it gone at 24.2 s. Control: the same sample taken at 20 s.
+$r.dot4 = [ordered]@{}
+foreach ($k in @('post-exit-sample', 'in-window-control')) {
+    $m = $(if ($k -eq 'post-exit-sample') { 24000 } else { 20000 })
+    $smp = '[{"tMs":' + $m + ',"m":' + $m + ',"app":true,"appPid":5000,"inst":["0,0"],"freq":[2500],"perf":[80],"park":[0]}]'
+    $s = Get-CorePartitionScalars (New-R9Record ([string]($L + 242000000)) '24200' '22950' 'stop-file' $smp) $feed 4095 1044480 8 $w $null $false @mp
+    $r.dot4[$k] = @($s.pcoreMHzMean, [string]$s.corePartitionNullReasons)
+}
+# Dot 2 (Dot literal): an old 34-byte row at byte 0; the pre-helper read saw 100 bytes. The start read stat 200 bytes, the file was truncated under it,
+# and the read returned only the old row: an aeacec83 mark keeps length 200 and invents row start 166 (>= 100), so its 99 C start temperature is published.
+$old = "25.10.2026,12:00:00,x,99,10,No,No`n"
+$base = @{ exists = $true; length = 100; monoMs = [int64]1000; created = 123; fileId = 'same' }
+$end = @{ exists = $true; length = 300; monoMs = [int64]9000; created = 123; fileId = 'same'; before = ''; window = "26.10.2026,12:00:08,x,70,45,No,No`n"; windowStartsMidRow = $false; replaced = $false; truncated = $false }
+$aeacec83Mark = @{ exists = $true; length = 200; monoMs = [int64]6000; created = 123; fileId = 'same'; before = $old; window = ''; windowStartsMidRow = $false }
+# the same short read as an r9 reader reports it: the bytes read (length 34 from offset 0) and shortRead
+$r9Mark = @{ exists = $true; length = 34; beforeOffset = 0; shortRead = $true; monoMs = [int64]6000; created = 123; fileId = 'same'; before = $old; window = ''; windowStartsMidRow = $false }
+# control: a complete full-length read (134 bytes): the old row, a non-data line, then a new row starting at byte 100
+$full = $old + ('x' * 65) + "`n" + "26.10.2026,12:00:05,x,61,40,No,No`n"
+$fullMark = @{ exists = $true; length = 134; beforeOffset = 0; shortRead = $false; monoMs = [int64]6000; created = 123; fileId = 'same'; before = $full; window = ''; windowStartsMidRow = $false }
+$r.dot2 = [ordered]@{}
+foreach ($k in @('aeacec83-mark', 'r9-short-read', 'full-read-control')) {
+    $sm = switch ($k) { 'aeacec83-mark' { $aeacec83Mark } 'r9-short-read' { $r9Mark } 'full-read-control' { $fullMark } }
+    $x = Get-CorePartitionFeedSummary $sm $end.Clone() 120 $base
+    $r.dot2[$k] = @($x.pkgTempCAtStart, [string]$x.reasons['pkgTempCAtStart'])
+}
+# Dot 2, the real reader: a short read through its byte-read seam (the file truncated to the old row between the stat and the read), and complete
+# reads of a small and a >4 KiB file, whose text must be exactly the bytes from beforeOffset to length
+$r.dot2Reader = 'absent'
+if (Get-Command Read-CorePartitionFeedBytes -ErrorAction SilentlyContinue) {
+    $fp = Join-Path $env:CP_TMP 'r9-feed.csv'
+    [IO.File]::WriteAllText($fp, $full)
+    $impl = ${function:Read-CorePartitionFeedBytes}
+    function Read-CorePartitionFeedBytes($Stream, $Buffer, $Count) {
+        $tw = [IO.File]::Open($fp, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete); try { $tw.SetLength(34) } finally { $tw.Dispose() }
+        & $impl $Stream $Buffer $Count
+    }
+    $short = Read-CorePartitionFeedMark $fp
+    Remove-Item function:Read-CorePartitionFeedBytes; Set-Item function:Read-CorePartitionFeedBytes $impl
+    [IO.File]::WriteAllText($fp, $full)
+    $whole = Read-CorePartitionFeedMark $fp
+    $sb = [Text.StringBuilder]::new(); for ($i = 0; $i -lt 200; $i++) { [void]$sb.Append("26.10.2026,12:00:00,x,30,10,No,No`n") }
+    [IO.File]::WriteAllText($fp, $sb.ToString())
+    $big = Read-CorePartitionFeedMark $fp
+    $shortSince = $null
+    [IO.File]::WriteAllText($fp, $full)
+    function Read-CorePartitionFeedBytes($Stream, $Buffer, $Count) {
+        $tw = [IO.File]::Open($fp, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete); try { $tw.SetLength(60) } finally { $tw.Dispose() }
+        & $impl $Stream $Buffer $Count
+    }
+    $shortSince = Read-CorePartitionFeedSince $fp 34 $old
+    Remove-Item function:Read-CorePartitionFeedBytes; Set-Item function:Read-CorePartitionFeedBytes $impl
+    $r.dot2Reader = [ordered]@{
+        short = @($short.length, $short.beforeOffset, $short.shortRead, [string](Test-CorePartitionFeedMarkAccounted $short), [string](Get-CorePartitionFeedSummary $short $end.Clone() 120 $base).reasons['pkgTempCAtStart'])
+        whole = @($whole.length, $whole.beforeOffset, $whole.shortRead, [string](Test-CorePartitionFeedMarkAccounted $whole))
+        big = @($big.length, $big.beforeOffset, $big.shortRead, [string](Test-CorePartitionFeedMarkAccounted $big), ($big.beforeOffset % 34))
+        since = @($shortSince.length, $shortSince.shortRead, [string](Get-CorePartitionFeedSummary $whole $shortSince 120 $base).reasons['rows'])
+    }
+}
+$r | ConvertTo-Json -Depth 6 -Compress
+"""
+
+
+@requires_windows_pwsh
+class CorePartitionR9Tests(unittest.TestCase):
+    """r9 (Dot record a65f1786 = adversary r8 aeacec83 A1, A2, A4): the literals against the generator's own pure consumers and readers."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="core-partition-r9-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        script = Path(cls._tmp.name) / "r9.ps1"
+        script.write_text(LIFT + R9_PURE, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name})
+        cls.raw = proc
+        cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the lifted helpers did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+
+    def test_a_record_whose_watch_ended_before_the_runners_exit_is_refused_typed(self) -> None:
+        """Dot 1 (= adversary r8 aeacec83 A1): a genuinely authenticated record whose app exit the helper never observed does not cover the runner's
+        window, so bench and load acceptance are false with a typed coverage reason; the full-window control stays accepted."""
+        for case, code in (("stop-while-alive", "coverage-stop-before-runner-exit"), ("deadline-while-alive", "coverage-ended-before-runner-exit")):
+            with self.subTest(case=case):
+                bench, load, observed, why = self.r["dot1"][case]
+                self.assertEqual([bench, load, observed], [False, False, None], f"a record that did not cover the window was accepted: {why}")
+                for field in ("appAffinityObserved", "partitionLoadGBps", "pcoreMHzMean"):
+                    self.assertIn(f"{field}={code}", why)
+        self.assertEqual(self.r["dot1"]["full-window-control"][:3], [True, True, "0x00FFF"], self.r["dot1"]["full-window-control"])
+
+    def test_a_sample_taken_after_the_last_poll_that_saw_the_app_alive_is_not_the_apps(self) -> None:
+        """Dot 4 (= adversary r8 aeacec83 A4): the post-exit sample (24 s, after the 22.95 s alive poll) is excluded; the in-window control counts."""
+        self.assertEqual(self.r["dot4"]["post-exit-sample"][0], None, self.r["dot4"])
+        self.assertIn("pcoreMHzMean=no-app-samples", self.r["dot4"]["post-exit-sample"][1])
+        self.assertEqual(self.r["dot4"]["in-window-control"][0], 2000.0, self.r["dot4"])
+
+    def test_a_short_or_torn_feed_read_is_a_typed_not_ready_never_a_row_position(self) -> None:
+        """Dot 2 (= adversary r8 aeacec83 A2, the Dot literal): no start temperature from a mark whose text does not reach its length; the r9 reader's
+        short read is typed; a complete full-length read still publishes."""
+        self.assertEqual(self.r["dot2"]["aeacec83-mark"], [None, "feed-mark-torn"], self.r["dot2"])
+        self.assertEqual(self.r["dot2"]["r9-short-read"], [None, "feed-short-read"], self.r["dot2"])
+        self.assertEqual(self.r["dot2"]["full-read-control"], [61.0, ""], self.r["dot2"])
+
+    def test_the_feed_readers_describe_only_the_bytes_they_read(self) -> None:
+        """Dot 2 siblings (Read-CorePartitionFeedMark / Read-CorePartitionFeedSince): a file truncated between the stat and the read gives a mark of the
+        bytes read, flagged shortRead and typed feed-short-read; complete reads account for every byte from beforeOffset to length."""
+        rd = self.r["dot2Reader"]
+        self.assertNotEqual(rd, "absent", "the readers have no byte-read seam")
+        self.assertEqual(rd["short"], [34, 0, True, "feed-short-read", "feed-short-read"], rd)
+        self.assertEqual(rd["whole"], [134, 0, False, ""], rd)
+        self.assertEqual(rd["big"][0], 6800, rd)
+        self.assertEqual(rd["big"][2:], [False, "", 0], f"a >4 KiB mark's text does not start on a row boundary or does not add up: {rd}")
+        self.assertEqual(rd["since"][:2], [60, True], rd)
+        self.assertEqual(rd["since"][2], "feed-short-read", rd)
+
+
 PARAMS_ANCHOR = "$AutomationSettingsDir,$GpuPreLaunches)"
 CP_STUB_GENERATOR = STUB_GENERATOR.replace(PARAMS_ANCHOR, "$AutomationSettingsDir,$GpuPreLaunches,$BenchAffinityMask,$PartitionLoadMask,$PartitionLoadThreads,"
                                                           "[switch]$CorePartitionTelemetry,$CorePartitionHelperMask)")
