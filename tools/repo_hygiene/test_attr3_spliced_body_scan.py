@@ -1874,6 +1874,15 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         "AdvR11ReflectionRoot": ("[CmdletBinding()]param()\n$PSCmdlet.PSObject.Properties['SessionState'].Value.PSObject.Properties['PSVariable'].Value.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
         "AdvR11ReflectionFolded": ("$h = Get-Thing\n$h.PSObject.Properties['Session' + 'State'].Value.PSVariable.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
         "DefaultsMember": ("$h = Get-Thing\n$h.('PSDefault' + 'ParameterValues')['*:ModulePath'] = '{dirty}'", DEF_CALL),
+        # r12 adversary A2, verbatim (the fixture directory stands for C:\fixture): a module object's session state, by computed names.
+        "AdvR12ModuleObject": ("Import-Module '{dir}\\Extractor.psm1'; $module=Get-Module Extractor; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
+                               "$module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')", DEF_CALL),
+        # Its siblings: the other engine commands whose result carries a module (and so its session state).
+        "AdvR12PassThru": ("$m = Import-Module '{dir}\\Extractor.psm1' -PassThru; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n"
+                           "$m.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')", DEF_CALL),
+        "AdvR12CommandInfo": ("$c = gcm Get-AttrCudaEmbeddedFunctionSource; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n"
+                              "$c.Module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')", DEF_CALL),
+        "AdvR12ModuleType": ("$m = [psmoduleinfo]$null; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n$m.$sn.$vn.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
     }
     # Not unproven: a computed member of parsed data (the real playback-attr-3-cuda-job.ps1 shape), a folded name that is not a route.
     CALL_CONTROLS = {
@@ -1892,6 +1901,8 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         "AdvR11Foreach": " [CmdletBinding()]param($Target)\n $r=@{}\n $m='Session'+'State'; $p='PSVar'+'iable'\n foreach($s in @($PSCmdlet)){$s.$m.$p.Set('r',$Target)}\n $r.Attributes=1",
         "AdvR11Reflection": " [CmdletBinding()]param($Target)\n $r=@{}\n $PSCmdlet.PSObject.Properties['SessionState'].Value.PSObject.Properties['PSVariable'].Value.Set('r',$Target)\n $r.Attributes=1",
         "AdvR11MultiTarget": " [CmdletBinding()]param($Target)\n $r=@{}\n $m='Session'+'State'; $p='PSVar'+'iable'\n $s,$ignored=$PSCmdlet,0\n $s.$m.$p.Set('r',$Target)\n $r.Attributes=1",
+        # r12 adversary A2, the receiver form: a module object reaches the session that holds the receiver.
+        "AdvR12ModuleReceiver": " param($Target)\n $r=@{}\n $module=Get-Module Body; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n $module.$sn.$vn.Set('r',$Target)\n $r.Attributes=1",
     }
     BODY_CONTROLS = {
         "BodyCtlDataMember": "    $r = @{}\n    $k = 'a'\n    $r.a = $r.$k",
@@ -1998,6 +2009,16 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
         (d / "Redirect.psm1").write_text(f"function Join-Path {{ param($Path,$ChildPath) '{d / 'Dirty.psm1'}' }}; Export-ModuleMember -Function Join-Path\n", encoding="utf-8")
         (d / "gen-function.ps1").write_text(f"Import-Module '{d / 'Redirect.psm1'}'; Get-AttrCudaEmbeddedFunctionSource -Name 'Probe' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n", encoding="utf-8")
         cls.join_path_function = run_scan(modules=[d / "Extractor.psm1", d / "Redirect.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-function.ps1"])
+        # r12 adversary A1, verbatim: a -ModulePath module defines Join-Path through the function: drive from a script block.
+        (d / "DriveRedirect.psm1").write_text(f"Set-Item function:global:Join-Path -Value {{ param($Path,$ChildPath) '{d / 'Dirty.psm1'}' }}\n", encoding="utf-8")
+        (d / "gen-drive.ps1").write_text(f"Import-Module '{d / 'DriveRedirect.psm1'}'; Import-Module '{d / 'Extractor.psm1'}'\n"
+                                         "Get-AttrCudaEmbeddedFunctionSource -Name 'Probe' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n", encoding="utf-8")
+        cls.join_path_drive = run_scan(modules=[d / "Extractor.psm1", d / "DriveRedirect.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-drive.ps1"])
+        # Its sibling: a $function: variable assignment of a script block (Get-AliasDefinitions :1028).
+        (d / "VarRedirect.psm1").write_text(f"${{function:global:Split-Path}} = {{ param($Path) '{d}' }}\n$function:global:Join-Path = {{ param($Path,$ChildPath) '{d / 'Dirty.psm1'}' }}\n", encoding="utf-8")
+        (d / "gen-var.ps1").write_text(f"Import-Module '{d / 'VarRedirect.psm1'}'\n"
+                                       "Get-AttrCudaEmbeddedFunctionSource -Name 'Probe' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n", encoding="utf-8")
+        cls.join_path_variable = run_scan(modules=[d / "Extractor.psm1", d / "VarRedirect.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-var.ps1"])
 
     def check(self, result: dict) -> None:
         calls = [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and "'Probe'" in f["text"]]
@@ -2013,6 +2034,12 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
 
     def test_r11_pass2_a3_an_imported_function_named_join_path_makes_the_binding_unproven(self) -> None:
         self.check(self.join_path_function)
+
+    def test_r12_a1_an_imported_function_drive_definition_of_join_path_makes_the_binding_unproven(self) -> None:
+        self.check(self.join_path_drive)
+
+    def test_r12_a1_an_imported_function_variable_assignment_of_join_path_makes_the_binding_unproven(self) -> None:
+        self.check(self.join_path_variable)
 
     def test_r11_a2_a_module_that_reaches_the_defaults_through_another_modules_alias_is_an_unproven_binding(self) -> None:
         found = [f for f in self.module_defaults["splicedViolations"] if f["token"] == "unproven-binding" and f["source"].endswith("B.psm1")]

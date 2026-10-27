@@ -1184,6 +1184,11 @@ function Get-MemberNameValue($Member) {
 $script:sessionRootVariables = @('PSCmdlet', 'ExecutionContext', 'Host', 'MyInvocation', 'this')
 $script:engineInputVariables = @('_', 'PSItem', 'input', 'args')
 $script:sessionMemberNames = @('SessionState', 'SessionStateProxy', 'PSVariable', 'GetVariableValue', 'InvokeCommand')
+# r12 adversary A2: the engine commands whose result is, or hands back, a variable, a module (.SessionState), a command (.Module) or a
+# host or runspace (.Runspace.SessionStateProxy), and the engine types such a value has.
+$script:sessionCarrierCommands = @('get-variable', 'gv', 'get-module', 'gmo', 'import-module', 'ipmo', 'new-module', 'nmo', 'get-command', 'gcm',
+                                   'get-host', 'get-runspace', 'get-pscallstack')
+$script:sessionCarrierTypePattern = '(?i)runspace|powershell|SessionState|psvariable|Management\.Automation|psmoduleinfo|commandinfo|functioninfo|scriptblock|^host$|pshost'
 
 function Test-MemberReceiverMayBeSession($Member, $Root) {
     # r11: true when the receiver of a member access whose name the scan cannot fold may be (or reach) the session: it starts at a
@@ -1214,17 +1219,19 @@ function Test-MemberReceiverMayBeSession($Member, $Root) {
 function Test-VariableMayHoldSession($Root, [string]$Name, $Visiting) {
     # r11 adversary A1: an assignment binds $Name from a session root, a variable command, an engine type, or (followed to the end of
     # the chain: `$a = $PSCmdlet; $b = $a`) another variable that may hold one.
+    # r12 adversary A2: or from a module, command, host or runspace command (`$module = Get-Module Extractor; $module.$sn.$vn.Set(...)`),
+    # or a cast to an engine type (`[psmoduleinfo]$x`).
     if (-not $Visiting.Add($Name)) { return $false }
     foreach ($assignment in @(Get-AssignmentsTo $Root $Name)) {
         foreach ($x in @($assignment.Right.FindAll({ param($n)
                 $n -is [System.Management.Automation.Language.VariableExpressionAst] -or $n -is [System.Management.Automation.Language.TypeExpressionAst] -or
-                $n -is [System.Management.Automation.Language.CommandAst] }, $true))) {
-            if ($x -is [System.Management.Automation.Language.TypeExpressionAst]) {
-                if ($x.TypeName.FullName -match '(?i)runspace|powershell|SessionState|psvariable|Management\.Automation') { return $true }
+                $n -is [System.Management.Automation.Language.TypeConstraintAst] -or $n -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+            if ($x -is [System.Management.Automation.Language.TypeExpressionAst] -or $x -is [System.Management.Automation.Language.TypeConstraintAst]) {
+                if ($x.TypeName.FullName -match $script:sessionCarrierTypePattern) { return $true }
                 continue
             }
             if ($x -is [System.Management.Automation.Language.CommandAst]) {
-                if (@(Get-ResolvedCommandNames $x | Where-Object { @('get-variable', 'gv') -contains $_ }).Count -gt 0) { return $true }
+                if (@(Get-ResolvedCommandNames $x | Where-Object { $script:sessionCarrierCommands -contains $_ }).Count -gt 0) { return $true }
                 continue
             }
             if ($x.VariablePath.UserPath -match '^(?i:variable):') { return $true }
@@ -1908,13 +1915,19 @@ function Get-SpliceCallSites([string]$Path) {
     # r11 adversary pass 2 (A3): so does a function a -ModulePath module defines under that name (`function Join-Path { ... }`, exported).
     # The extractor's own definition is the extractor module itself, which the default-module rule already judges. A function defined
     # inside another function is local to it when it runs (a spliced body's own shadow, judged by R1), so only a top-level one counts.
+    # r12 adversary A1: and so does one it defines through the function: drive (`Set-Item function:global:Join-Path -Value { ... }`,
+    # `$function:Join-Path = { ... }`): the module's top level is judged by the same shadow model as the source's own code.
     if (-not $importedReplacement) {
         foreach ($moduleKey in @($moduleAsts.Keys)) {
-            $replaced = @($moduleAsts[$moduleKey].FindAll({ param($x)
-                if ($x -isnot [System.Management.Automation.Language.FunctionDefinitionAst] -or @('join-path', 'split-path', 'new-object') -notcontains (Get-BareCommandName $x.Name)) { return $false }
-                for ($p = $x.Parent; $null -ne $p; $p = $p.Parent) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false } }
-                return $true }, $true) | Select-Object -First 1)
-            if ($replaced.Count -gt 0) { $importedReplacement = "an alias or function a -ModulePath module defines ($moduleKey) replaces $($replaced[0].Name)"; break }
+            $replaced = @(Get-ShadowingDefinitions $moduleAsts[$moduleKey] @('Join-Path', 'Split-Path', 'New-Object') | Where-Object {
+                for ($p = $_.Ast.Parent; $null -ne $p; $p = $p.Parent) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false } }
+                return $true } | Select-Object -First 1)
+            if ($replaced.Count -gt 0) {
+                $replacedText = ($replaced[0].Ast.Extent.Text -replace '\s+', ' ')
+                if ($replacedText.Length -gt 120) { $replacedText = $replacedText.Substring(0, 120) }
+                $importedReplacement = "an alias or function a -ModulePath module defines ($moduleKey) replaces a command the scan evaluates ($replacedText)"
+                break
+            }
         }
     }
     $rootRebinding = Get-PsScriptRootRebinding $ast
