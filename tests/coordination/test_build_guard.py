@@ -1133,6 +1133,48 @@ def test_heavy_slots_own_pin_mismatch_refuses_before_the_build(box) -> None:
     assert call["childEnd"], "the slot was given back before the refusal"
 
 
+def test_a_ready_file_from_an_ended_holder_is_a_requeue_while_heavy_slot_still_runs(box) -> None:
+    # r2 adversary A1: the cmd wrapper outlives the release (heavy-slot's own work after its child), so liveness is the
+    # holder's, named in the ready file, not the wrapper's.
+    done = _heavy(box, "readyorphan", ["-Command", _marker_command(box)], extra={"STUB_HEAVY_SLOT_HOLD_S": "4"})
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build code=0 ticket=stub-" in done.stdout
+    assert "reason=holder-exited-after-ready" in done.stdout
+    assert not box["marker"].exists() and not box["lock"].exists()
+
+
+def test_a_string_wait_is_numeric_in_the_hung_tool_bound(box) -> None:
+    # r2 adversary A2: '0.01' + 15 must be 15.01 minutes, not the string '0.0115' (0.69 s).
+    done = _library_driver(
+        box,
+        "$opts.HeavySlotWaitMinutes = '0.01'\n"
+        "Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs) Write-Output \"built=$Jobs\" }\n",
+        str(box["lock"]),
+        extra={"STUB_HEAVY_SLOT_DELAY_S": "3"},
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "built=4" in done.stdout
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK" not in done.stdout
+
+
+def test_an_unreadable_heavy_slot_log_at_admission_fails_closed(box) -> None:
+    # r2 adversary A3: a log nobody can read hides a PIN MISMATCH; the slot is given back and nothing is built.
+    done = _heavy(box, "locklog", ["-Command", _marker_command(box)])
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=1 reason=heavy-slot log unreadable at admission" in done.stdout
+    assert not box["marker"].exists() and not box["lock"].exists()
+    [call] = _stub_calls(box)
+    assert call["childEnd"], "the slot was given back"
+
+
+def test_the_hung_tool_bound_is_monotonic() -> None:
+    # r2 adversary A4: a wall-clock step must not move the bound. A clock step needs admin, so this pins the source.
+    text = GUARD.read_text(encoding="ascii")
+    body = text[text.index("function Enter-HeavySlot"):text.index("function Exit-HeavySlot(")]
+    assert "[System.Diagnostics.Stopwatch]::StartNew()" in body and "$waitClock.Elapsed -ge $giveUp" in body
+    assert "[DateTime]::UtcNow.AddMinutes" not in body and "[DateTime]::UtcNow -ge" not in body
+
+
 def test_the_guard_pins_the_installed_heavy_slot_sha() -> None:
     text = GUARD.read_text(encoding="ascii")
     assert text.count(f"'{PINNED_HEAVY_SLOT_SHA}'") == 2, "the param default and the library default"

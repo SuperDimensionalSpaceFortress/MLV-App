@@ -10,6 +10,9 @@
 #   readyexit  stands in for a holder that wrote its ready file and then ended: write the ready file named in the
 #              holder's -EncodedCommand, wait STUB_HEAVY_SLOT_HOLD_S seconds (default 0), exit STUB_HEAVY_SLOT_CODE (default 0)
 #   pinwarn    print heavy-slot's own PIN MISMATCH warning, then behave as run
+#   readyorphan  a holder child writes the ready file and ends, while heavy-slot itself stays up STUB_HEAVY_SLOT_HOLD_S
+#              seconds (its release work after the child), then exits STUB_HEAVY_SLOT_CODE (default 0)
+#   locklog    hold this run's log open with read access and no read sharing, print the PIN MISMATCH warning, then run
 # STUB_HEAVY_SLOT_DELAY_S (run, pinwarn and readyexit) waits that many seconds before starting the child, like a queue wait for the slot.
 # Every call appends one JSON line (argv, the two EXPECT variables, and the child's start and end) to STUB_HEAVY_SLOT_LOG.
 $argv = @($args)
@@ -30,7 +33,13 @@ function Write-StubMarker([string]$Nonce, [int]$Code = 75) {
 }
 $code = 0
 $stubCode = if ($env:STUB_HEAVY_SLOT_CODE) { [int]$env:STUB_HEAVY_SLOT_CODE } else { 0 }
-if ($mode -eq 'pinwarn') { [Console]::Error.WriteLine('HEAVY-SLOT WARN: PIN MISMATCH: this heavy-slot.ps1 is 00, HEAVY_SLOT_EXPECT_SHA256 is 11') }
+if ($mode -eq 'locklog') { $held = [IO.File]::Open(($exitFile -replace '\.exit\.json$', '.log'), 'Open', 'Read', 'Write') }
+if ($mode -in 'pinwarn', 'locklog') { [Console]::Error.WriteLine('HEAVY-SLOT WARN: PIN MISMATCH: this heavy-slot.ps1 is 00, HEAVY_SLOT_EXPECT_SHA256 is 11') }
+function Get-StubReadyPath {
+    $encoded = $command[[array]::IndexOf($command, '-EncodedCommand') + 1]
+    $holder = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
+    if ($holder -match "(?m)^Set-Content -LiteralPath '((?:[^']|'')+)'") { return ($Matches[1] -replace "''", "'") }
+}
 switch ($mode) {
     'marked75' { Write-StubMarker $nonce; $code = 75 }
     'forged75' { Write-StubMarker ([Guid]::NewGuid().ToString('N')); $code = 75 }
@@ -40,12 +49,19 @@ switch ($mode) {
     'bare' { $code = $stubCode }
     'readyexit' {
         if ($env:STUB_HEAVY_SLOT_DELAY_S) { Start-Sleep -Seconds ([int]$env:STUB_HEAVY_SLOT_DELAY_S) }
-        $encoded = $command[[array]::IndexOf($command, '-EncodedCommand') + 1]
-        $holder = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
-        if ($holder -match "^Set-Content -LiteralPath '((?:[^']|'')+)'") { Set-Content -LiteralPath ($Matches[1] -replace "''", "'") -Value "${ticket}:$PID" -Encoding ascii }
+        $ticks = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
+        Set-Content -LiteralPath (Get-StubReadyPath) -Value @("${ticket}:$PID", "holder=$PID@$ticks") -Encoding ascii
         $record.childStart = [DateTime]::UtcNow.ToString('o')
         if ($env:STUB_HEAVY_SLOT_HOLD_S) { Start-Sleep -Seconds ([double]$env:STUB_HEAVY_SLOT_HOLD_S) }
         $record.childEnd = [DateTime]::UtcNow.ToString('o')
+        $code = $stubCode
+    }
+    'readyorphan' {
+        $ready = (Get-StubReadyPath) -replace "'", "''"
+        $record.childStart = [DateTime]::UtcNow.ToString('o')
+        & $command[0] -NoProfile -NonInteractive -Command "Set-Content -LiteralPath '$ready' -Value @('${ticket}:$PID', ('holder={0}@{1}' -f `$PID, (Get-Process -Id `$PID).StartTime.ToUniversalTime().Ticks)) -Encoding ascii"
+        $record.childEnd = [DateTime]::UtcNow.ToString('o')
+        if ($env:STUB_HEAVY_SLOT_HOLD_S) { Start-Sleep -Seconds ([double]$env:STUB_HEAVY_SLOT_HOLD_S) }
         $code = $stubCode
     }
     default {
