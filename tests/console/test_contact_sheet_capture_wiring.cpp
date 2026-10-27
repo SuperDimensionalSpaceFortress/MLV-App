@@ -266,6 +266,41 @@ TEST(ContactSheetCaptureWiring, InPassHookOnlyReadsBackAndTimesTheGrabInsideTheM
     ASSERT_FALSE(hookBody.contains(QStringLiteral("toJson(")));
 }
 
+// VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2 (sol B1): the hook decides through the ONE predicate the header tests execute
+// (test_playback_frame_range.cpp), keyed to source frames exactly when the run is unpaced the way the pace guard and
+// the pace_unpaced disclosure define it; each sidecar records which basis made it due; and a short sheet still exits 14.
+TEST(ContactSheetCaptureWiring, UnpacedInPassTargetsAreSourceFramesThroughTheSharedPredicateAndAShortSheetStillExits14)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const QString smokeBody = smokeBodyOf(source);
+    ASSERT_FALSE(smokeBody.isEmpty());
+    const int armAt = smokeBody.indexOf(QString::fromLatin1(kInPassArmMarker));
+    const int armEndAt = smokeBody.indexOf(QStringLiteral("m_contactSheetCaptureActive = true;"), armAt);
+    ASSERT_TRUE(armAt >= 0 && armEndAt > armAt);
+    const QString armBlock = smokeBody.mid(armAt, armEndAt - armAt);
+    ASSERT_TRUE(armBlock.contains(QStringLiteral(
+        "m_contactSheetCaptureUnpaced = m_automationPacingIsolated && mlvappPlaybackUnpacedRequested();")));
+    ASSERT_TRUE(armBlock.contains(QStringLiteral("playback_frame_range::contactSheetInPassTargetSourceFrames(")));
+    ASSERT_TRUE(armBlock.contains(QStringLiteral("m_playRequiredSourceFrames")));
+
+    const QString hookBody = sliceBetween(source,
+        QStringLiteral("void MainWindow::noteContactSheetPresentedFrame("),
+        QStringLiteral("void MainWindow::finishPlaybackSmokeTelemetry"));
+    ASSERT_FALSE(hookBody.isEmpty());
+    ASSERT_TRUE(hookBody.contains(QStringLiteral("playback_frame_range::contactSheetInPassTargetDue(")));
+    ASSERT_TRUE(hookBody.contains(QStringLiteral("m_sourceAdvance.consumed()")));
+    ASSERT_FALSE(hookBody.contains(QStringLiteral("if( grabElapsedMs < m_contactSheetCaptureTargetMs")));
+    ASSERT_TRUE(hookBody.contains(QStringLiteral("QStringLiteral(\"target_basis\")")));
+    ASSERT_TRUE(hookBody.contains(QStringLiteral("QStringLiteral(\"source_frames\") : QStringLiteral(\"wall_clock\")")));
+
+    ASSERT_TRUE(smokeBody.contains(QStringLiteral("in-pass targets were presented before the measured Play stopped")));
+    const int incompleteAt = smokeBody.indexOf(QStringLiteral("contact sheet capture incomplete; requested="));
+    ASSERT_TRUE(incompleteAt >= 0);
+    const int returnAt = smokeBody.indexOf(QStringLiteral("return "), incompleteAt);
+    ASSERT_TRUE(returnAt > incompleteAt);
+    ASSERT_EQ(returnAt, smokeBody.indexOf(QStringLiteral("return 14;"), incompleteAt));
+}
+
 TEST(ContactSheetCaptureWiring, InPassWriterRecordsTheGrabCostAndWhetherEachGrabFellInTheMeasuredInterval)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));

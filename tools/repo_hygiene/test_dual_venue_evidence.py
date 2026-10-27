@@ -161,7 +161,11 @@ LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head
 # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the L1..L4 self-heal proof, ONE cuda speed leg whose job runs three pre-launches and the measured run on one settings store.
 SELF_HEAL_LEG = "legs/m16-1243-gpu-self-heal-l1-l4.json"
 SHIPPED_LEGS = (*SHIPPED_LEGS, SELF_HEAL_LEG)
-SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
+# VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1: the s2 Cinematic AgX-off look leg run unpaced at swap interval 0 (the s2 headroom under the pace cap), keyed to its
+# paced source. A look leg, because only a look leg carries a look receipt; not in AGXOFF_LEGS, whose members are byte copies of their source.
+AGXOFF_UNPACED_LEGS = {"legs/m16-1243-look-scale2-cinematic-agxoff-unpaced.json": "legs/m16-1243-look-scale2-cinematic-agxoff.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_UNPACED_LEGS)
+SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
 LAUNCHER = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
@@ -5523,6 +5527,22 @@ V2_PROBE = {"schema": "mlv-app/venue-quiet-probe/v2", "host": "BACHELOR", "sampl
             "notes": {}}
 
 
+# ---------------------------------------------------------------------------------------------------
+# VENUE-QUIET-PER-CORE-VERDICT-1: the machine-wide mean (-ThresholdPercent 20) can call a venue QUIET while one fast core runs flat out (one saturated core on 20 logical CPUs
+# is ~5 % of the total; BACHELOR-HEAT-WHILE-QUIET-DIAG-1 r1 measured busiest cores of 66 % and 82-92 % under a < 20 % mean, at 100 C). The gate adds a busiest-FAST-core check
+# beside the mean: LOGGED FIRST (one `  percore` line, always) and OFF by default (-PerCoreEnforce turns the BUSY verdict on). Off, every verdict, exit code and existing line is unchanged.
+def _pc_cores(*rows) -> list:
+    """rows: (instance, core_class, percent[, extra dict])"""
+    out = []
+    for r in rows:
+        row = {"instance": r[0], "core_class": r[1], "efficiency_class": {"P": 1, "E": 0, "uniform": 0}.get(r[1]), "percent": r[2],
+               "validSamples": 3, "totalSamples": 3, "incomplete": False}
+        if len(r) > 3:
+            row.update(r[3])
+        out.append(row)
+    return out
+
+
 @requires_windows_pwsh
 class VenueQuietAttributionTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -5542,10 +5562,10 @@ class VenueQuietAttributionTests(unittest.TestCase):
         (self.tree / "tools" / "profiling" / "um-run.ps1").write_text(STUB_UM_RUN_FOR_QUIET_LINE, encoding="utf-8")
         self.work = self.tmp / "work"
 
-    def gate(self, probe: dict) -> subprocess.CompletedProcess:
+    def gate(self, probe: dict, *extra: str) -> subprocess.CompletedProcess:
         import os
         return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
-                               "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1"],
+                               "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1", *extra],
                               capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_LINE=json.dumps(probe)))
 
     def test_a_v2_line_is_attributed_after_the_verdict_and_the_verdict_is_unchanged(self) -> None:
@@ -5705,6 +5725,401 @@ class VenueQuietAttributionTests(unittest.TestCase):
         if p["core_topology"] == "unknown":
             self.assertIn("core_class", p["notes"])
         self.assertTrue(all(isinstance(k, str) and isinstance(v, str) and v for k, v in p["notes"].items()))
+
+    QUIET_SAMPLES = [10.0, 10.0, 10.0]
+
+    def probe(self, cores: list, samples: list | None = None) -> dict:
+        return dict(json.loads(json.dumps(V2_PROBE)), samples=self.QUIET_SAMPLES if samples is None else samples, cores=cores)
+
+    def percore_lines(self, proc: subprocess.CompletedProcess) -> list:
+        return [ln for ln in proc.stdout.splitlines() if ln.startswith("  percore ")]
+
+    HOT = ("0,2", "P", 82.0)
+    COOL = ("0,0", "P", 30.0)
+    EHOT = ("0,8", "E", 95.0)
+
+    def test_off_by_default_a_quiet_mean_stays_quiet_and_the_line_records_what_the_check_would_have_said(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.COOL, self.HOT, self.EHOT)))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% threshold=20(\.0)?% waitedSec=\d+$", "off: the verdict is the mean's, unchanged")
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=false threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true"])
+
+    def test_on_a_hot_fast_core_under_a_quiet_mean_is_busy_and_names_the_core(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.COOL, self.HOT)), "-PerCoreEnforce")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=10\.0% threshold=20(\.0)?% waitedSec=\d+$")
+        self.assertNotRegex(proc.stdout, r"(?m)^QUIET ")
+        self.assertRegex(proc.stdout, r"(?m)^PROBE \S+ bachelor samples=10\.0/10\.0/10\.0 mean=10\.0% state=BUSY note=percore core=0_2 ")
+        lines = self.percore_lines(proc)
+        self.assertEqual(lines[0], "  percore enabled=true threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true")
+        self.assertIn("  percore blocked core=0_2 percent=82.0% threshold=60.0%", lines)
+
+    def test_on_a_cool_fast_core_leaves_the_quiet_verdict_alone(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.COOL, ("0,2", "P", 47.0), self.EHOT)), "-PerCoreEnforce")
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% ")
+        self.assertEqual(self.percore_lines(proc), ["  percore enabled=true threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=47.0% would_block=false"])
+
+    def test_the_threshold_is_inclusive_and_a_parameter(self) -> None:
+        at = self.gate(self.probe(_pc_cores(("0,2", "P", 60.0))))
+        self.assertIn("would_block=true", at.stdout, "busiest >= threshold")
+        raised = self.gate(self.probe(_pc_cores(self.HOT)), "-PerCoreThresholdPercent", "90", "-PerCoreEnforce")
+        self.assertRegex(raised.stdout, r"(?m)^QUIET ")
+        self.assertIn("threshold=90.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=false", raised.stdout)
+
+    def test_an_efficiency_core_never_counts_and_a_uniform_class_is_fast(self) -> None:
+        e_only_hot = self.gate(self.probe(_pc_cores(self.COOL, self.EHOT)), "-PerCoreEnforce")
+        self.assertRegex(e_only_hot.stdout, r"(?m)^QUIET ", "a busy E-core is not the fast-core check's business")
+        self.assertIn("busiest_fast_core=0_0 busiest_fast_pct=30.0% would_block=false", e_only_hot.stdout)
+        uniform = self.gate(self.probe(_pc_cores(("0,0", "uniform", 20.0), ("0,1", "uniform", 71.0))))
+        self.assertIn("busiest_fast_core=0_1 busiest_fast_pct=71.0% would_block=true", uniform.stdout)
+
+    def test_the_unrounded_per_core_mean_decides_not_the_two_decimal_display(self) -> None:
+        # the probe rounds `percent` to 2 dp; percent_exact is the unrounded valid-sample mean. 59.9996 prints as 60.0 but is below 60.
+        core = _pc_cores(("0,2", "P", 60.0, {"percent_exact": 59.9996}))
+        proc = self.gate(self.probe(core), "-PerCoreEnforce")
+        self.assertRegex(proc.stdout, r"(?m)^QUIET ", "three 20.04 % samples are BUSY at 20 for the mean rule; the same unrounded rule applies per core")
+        self.assertIn("would_block=false", proc.stdout)
+        over = self.gate(self.probe(_pc_cores(("0,2", "P", 60.0, {"percent_exact": 60.0004}))))
+        self.assertIn("would_block=true", over.stdout)
+
+    def test_an_unknown_class_core_makes_the_answer_null_with_a_reason_and_never_blocks(self) -> None:
+        for flags in ((), ("-PerCoreEnforce",)):
+            proc = self.gate(self.probe(_pc_cores(self.HOT, ("0,5", "unknown", 20.0))), *flags)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% ", f"unknown never blocks (flags={flags})")
+            line = self.percore_lines(proc)[0]
+            self.assertIn("would_block=null reason=core-class-unknown", line)
+            self.assertNotIn("would_block=false", line, "never a silent false")
+
+    def test_no_cores_is_null_with_a_reason(self) -> None:
+        for drop_field in (False, True):
+            probe = self.probe([])
+            if drop_field:
+                del probe["cores"]
+            proc = self.gate(probe)
+            self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% ")
+            self.assertEqual(self.percore_lines(proc), ["  percore enabled=false threshold=60.0% busiest_fast_core=n/a busiest_fast_pct=n/a would_block=null reason=no-cores"])
+
+    def test_an_incomplete_fast_core_is_null_with_a_reason_but_an_incomplete_efficiency_core_is_not(self) -> None:
+        partial = {"validSamples": 2, "incomplete": True}
+        bad = self.gate(self.probe(_pc_cores(("0,2", "P", 82.0, partial), self.COOL)), "-PerCoreEnforce")
+        self.assertRegex(bad.stdout, r"(?m)^QUIET ", "unknown is not a block")
+        self.assertIn("would_block=null reason=incomplete-samples", bad.stdout)
+        fine = self.gate(self.probe(_pc_cores(self.COOL, ("0,8", "E", 90.0, partial))))
+        self.assertIn("would_block=false", fine.stdout)
+
+    def test_a_non_numeric_core_percent_is_null_not_zero(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(("0,2", "P", "hot"), self.COOL)))
+        self.assertIn("would_block=null reason=invalid-core-percent", proc.stdout)
+
+    def test_a_v1_probe_prints_no_percore_line_off_and_a_null_line_on(self) -> None:
+        off = self.gate(V1_PROBE)
+        self.assertEqual(self.percore_lines(off), [], "a probe without v2 prints exactly what it printed before")
+        on = self.gate(V1_PROBE, "-PerCoreEnforce")
+        self.assertRegex(on.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+        self.assertIn("would_block=null reason=no-cores", on.stdout)
+
+    def test_the_probe_fixture_keeps_an_explicit_empty_sample_list(self) -> None:
+        self.assertEqual(self.probe([], samples=[])["samples"], [], "an explicit empty list is not 'use the default'")
+        self.assertEqual(self.probe([])["samples"], self.QUIET_SAMPLES)
+
+    def test_a_core_bearing_v1_probe_logs_the_observation_with_enforcement_off(self) -> None:
+        # sol r3 V-02: the observation was gated on schema v2, so a v1 probe that carries cores[] logged nothing while the header promises one line per cores[] probe
+        v1 = {"schema": "mlv-app/venue-quiet-probe/v1", "host": "BACHELOR", "samples": [10, 10, 10], "cores": _pc_cores(self.HOT)}
+        proc = self.gate(v1)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% ", "off: logged only, the verdict is the mean's")
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=false threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true"])
+
+    def test_an_unavailable_probe_logs_one_typed_null_observation_when_enforcing(self) -> None:
+        # sol r3 V-02: a failed probe left probe = $null, so no observation at all; it must be one null line with a typed reason, and the verdict stays UNKNOWN (exit 6)
+        import os
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                               "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1", "-PerCoreEnforce"],
+                              capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_LINE="{ not json"))
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=true threshold=60.0% busiest_fast_core=n/a busiest_fast_pct=n/a would_block=null reason=no-probe"])
+        self.assertIn("VENUE_QUIET_UNKNOWN", proc.stdout)
+        off = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                              "-WorkDir", str(self.work), "-MaxWaitSec", "1", "-RecheckSec", "1"],
+                             capture_output=True, text=True, timeout=180, env=dict(os.environ, UMSTUB_LINE="{ not json"))
+        self.assertEqual(off.returncode, 6, off.stdout + off.stderr)
+        self.assertEqual(self.percore_lines(off), [], "off and no cores[] to report: nothing to log")
+
+    def test_the_mean_rule_still_wins_when_the_mean_is_busy(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.COOL), samples=[50.0, 50.0, 50.0]), "-PerCoreEnforce")
+        self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+        self.assertIn("would_block=false", proc.stdout)
+        self.assertNotIn("percore blocked", proc.stdout, "blocked is only for a mean-QUIET venue the per-core check overrode")
+
+    def test_the_offline_decision_output_is_unchanged(self) -> None:
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-SamplesJson", "[12.5, 18.0, 21.0]"],
+                              capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.stdout.strip(), "DECISION QUIET mean=17.2%", proc.stdout + proc.stderr)
+
+    def test_the_header_documents_the_default_threshold_and_the_evidence(self) -> None:
+        header = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8").split("[CmdletBinding", 1)[0]
+        for token in ("VENUE-QUIET-PER-CORE-VERDICT-1", "-PerCoreEnforce", "-PerCoreThresholdPercent", "default 60", "OFF by default", "would_block"):
+            self.assertIn(token, header)
+
+    def test_the_real_probe_job_emits_the_unrounded_core_mean_beside_the_rounded_one(self) -> None:
+        text = (DV / "Wait-VenueQuiet.ps1").read_text(encoding="utf-8")
+        body = re.search(r"\$probeText = @'\r?\n(.*?)\r?\n'@", text, re.S).group(1)
+        self.assertIn("percent_exact", body)
+
+    # ---- adversary pass r1 (A1 A2 A3 A4 A5 A6 A7) ---------------------------------------------------------------
+    SEQ_STUB = r"""param([string]$ScriptPath, [string]$JobId, [string]$AgentShare, [int]$TimeoutSec, [int]$MaxQueueWaitSec, [int]$MaxClaimedWaitSec)
+# test stub for tools\profiling\um-run.ps1: answers probe N of the JSON array in UMSTUB_LINES (the last one repeats); UMSTUB_COUNTER holds N
+$arr = @(ConvertFrom-Json -InputObject $env:UMSTUB_LINES)
+$n = 0; if (Test-Path -LiteralPath $env:UMSTUB_COUNTER) { $n = [int](Get-Content -LiteralPath $env:UMSTUB_COUNTER -TotalCount 1) }
+Set-Content -LiteralPath $env:UMSTUB_COUNTER -Value ($n + 1)
+$obj = $arr[[Math]::Min($n, $arr.Count - 1)]
+[pscustomobject]@{ exitCode = 0; stdout = 'VENUE_QUIET=' + ($obj | ConvertTo-Json -Compress -Depth 9) }
+"""
+
+    def gate_seq(self, probes: list, *extra: str) -> subprocess.CompletedProcess:
+        import os
+        (self.tree / "tools" / "profiling" / "um-run.ps1").write_text(self.SEQ_STUB, encoding="utf-8")
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Wait-VenueQuiet.ps1"), "-Venue", "bachelor",
+                               "-WorkDir", str(self.work), "-MaxWaitSec", "120", "-RecheckSec", "1", "-ForeignFloorProbes", "0", *extra],
+                              capture_output=True, text=True, timeout=240,
+                              env=dict(os.environ, UMSTUB_LINES=json.dumps(probes), UMSTUB_COUNTER=str(self.tmp / "seq.counter")))
+
+    def test_every_probe_logs_its_own_percore_line_not_only_the_last(self) -> None:
+        busy_hot = self.probe(_pc_cores(self.HOT), samples=[50.0, 50.0, 50.0])
+        quiet_cool = self.probe(_pc_cores(self.COOL))
+        proc = self.gate_seq([busy_hot, quiet_cool])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=false threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true",
+                          "  percore enabled=false threshold=60.0% busiest_fast_core=0_0 busiest_fast_pct=30.0% would_block=false"],
+                         "the first probe's observation must survive the second probe")
+        self.assertRegex(proc.stdout, r"(?m)^QUIET mean=10\.0% ")
+
+    def test_an_unmeasured_probe_that_carries_cores_still_logs_the_observation(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(self.HOT), samples=[5.0, None, 5.0]), "-PerCoreEnforce")
+        self.assertEqual(proc.returncode, 6, proc.stdout + proc.stderr)
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=true threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true"],
+                         "logged, but an UNKNOWN venue is still UNKNOWN: no blocked line and exit 6")
+
+    def test_a_core_omitted_for_having_no_valid_sample_makes_the_answer_null(self) -> None:
+        probe = self.probe(_pc_cores(self.COOL, self.EHOT))
+        probe["notes"] = {"cores_omitted": "1 core(s) had no valid sample and are omitted"}
+        proc = self.gate(probe, "-PerCoreEnforce")
+        self.assertRegex(proc.stdout, r"(?m)^QUIET ", "unknown never blocks")
+        self.assertIn("busiest_fast_core=0_0 busiest_fast_pct=30.0% would_block=null reason=cores-omitted", proc.stdout)
+
+    def test_fewer_valid_samples_than_total_is_incomplete_even_without_the_flag(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(("0,2", "P", 82.0, {"validSamples": 2, "totalSamples": 3, "incomplete": False}))))
+        self.assertIn("would_block=null reason=incomplete-samples", proc.stdout)
+
+    def test_a_non_numeric_exact_percent_is_invalid_and_never_falls_back_to_the_rounded_one(self) -> None:
+        proc = self.gate(self.probe(_pc_cores(("0,2", "P", 60.0, {"percent_exact": "hot"}))))
+        self.assertIn("would_block=null reason=invalid-core-percent", proc.stdout)
+        arr = self.gate(self.probe(_pc_cores(("0,2", "P", [1]))))
+        self.assertIn("would_block=null reason=invalid-core-percent", arr.stdout, "a one-element array is not a number")
+
+    def test_the_percore_line_is_culture_invariant_and_comma_free(self) -> None:
+        import os
+        cmd = ("[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('de-DE'); "
+               f"& '{self.dv / 'Wait-VenueQuiet.ps1'}' -Venue bachelor -WorkDir '{self.work}' -MaxWaitSec 1 -RecheckSec 1")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=180,
+                              env=dict(os.environ, UMSTUB_LINE=json.dumps(self.probe(_pc_cores(self.HOT)))))
+        self.assertEqual(self.percore_lines(proc),
+                         ["  percore enabled=false threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true"], proc.stdout + proc.stderr)
+
+    def test_a_gate_log_sink_failure_in_the_percore_writer_never_escapes(self) -> None:
+        script = (DV / "Wait-VenueQuiet.ps1").as_posix()
+        cmd = (f"$t=$null;$e=$null;$ast=[System.Management.Automation.Language.Parser]::ParseFile('{script}',[ref]$t,[ref]$e);"
+               "foreach($n in 'Format-PerCorePct','ConvertTo-IdentToken','Write-PerCoreLines'){ $f=$ast.Find({param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -ceq $n},$true); . ([scriptblock]::Create($f.Extent.Text)) }; "
+               "function Write-Gate([string]$Line) { Write-Output $Line; throw 'sink locked' }; "
+               "$pc=[pscustomobject]@{enabled=$false;threshold=60.0;busiest_fast_core='0,2';busiest_fast_percent=82.0;would_block=$true;reason=$null}; "
+               "try { Write-PerCoreLines $pc $true; 'NO_ESCAPE' } catch { 'ESCAPED ' + $_.Exception.Message }")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
+        self.assertIn("NO_ESCAPE", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("ESCAPED", proc.stdout)
+
+    def test_the_busy_probe_summary_follows_the_gate_when_per_core_enforcement_is_on(self) -> None:
+        raw = self.tmp / "venue-quiet-probe-20261026T000000000Z.json"
+        raw.write_text(json.dumps(self.probe(_pc_cores(self.HOT, self.COOL))), encoding="utf-8")
+        summarize = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"), "-ProbeJson", str(raw)]
+        off = subprocess.run(summarize, capture_output=True, text=True, timeout=120)
+        self.assertEqual(off.returncode, 0, off.stdout + off.stderr)
+        self.assertIn("Busy probes summarized: 0 (quiet skipped 1", off.stdout, "default: the mean rule, as before")
+        on = subprocess.run(summarize + ["-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
+        self.assertEqual(on.returncode, 0, on.stdout + on.stderr)
+        self.assertIn("Busy probes summarized: 1 (quiet skipped 0", on.stdout, "enforcing: the gate would have called this probe BUSY")
+        cool = self.tmp / "venue-quiet-probe-20261026T000100000Z.json"
+        cool.write_text(json.dumps(self.probe(_pc_cores(self.COOL))), encoding="utf-8")
+        raised = subprocess.run([*summarize[:-1], str(cool), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
+        self.assertIn("Busy probes summarized: 0 (quiet skipped 1", raised.stdout)
+
+    # ---- adversary pass r2 (A1 A2 A3): a malformed core row is UNKNOWN (null), never a definite true or false, in the gate and in the summary ----
+    def test_a_malformed_core_row_is_unknown_in_the_gate_and_never_busy_in_the_summary(self) -> None:
+        hot = {"instance": "0,2", "core_class": "P", "efficiency_class": 1, "percent": 82.0, "validSamples": 3, "totalSamples": 3, "incomplete": False}
+        cases = {
+            "null percent_exact": ([dict(hot, percent_exact=None)], "invalid-core-percent"),
+            "null row beside a hot row": ([None, dict(hot)], "invalid-core-row"),
+            "null row beside a cool row": ([None, dict(hot, instance="0,0", percent=30.0)], "invalid-core-row"),
+            "string totalSamples": ([dict(hot, totalSamples="3")], "incomplete-samples"),
+            "null validSamples": ([dict(hot, validSamples=None)], "incomplete-samples"),
+        }
+        for name, (cores, reason) in cases.items():
+            with self.subTest(name):
+                probe = self.probe(cores)
+                proc = self.gate(probe, "-PerCoreEnforce")
+                self.assertRegex(proc.stdout, r"(?m)^QUIET ", proc.stdout + proc.stderr)
+                self.assertIn(f"would_block=null reason={reason}", proc.stdout)
+                self.assertNotIn("percore blocked", proc.stdout)
+                raw = self.tmp / f"venue-quiet-probe-{abs(hash(name))}.json"
+                raw.write_text(json.dumps(probe), encoding="utf-8")
+                summ = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"),
+                                       "-ProbeJson", str(raw), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
+                self.assertIn("Busy probes summarized: 0 (quiet skipped 1", summ.stdout, summ.stdout + summ.stderr)
+
+    # ---- adversary pass r4 (A1 A2 A5): row SHAPE and sample COUNTS are validated exactly, not coerced; the same helper serves the gate and the summary ----
+    def test_a_row_of_the_wrong_shape_or_an_impossible_count_is_unknown_in_the_gate_and_the_summary(self) -> None:
+        hot = {"instance": "0,2", "core_class": "P", "efficiency_class": 1, "percent": 82.0, "validSamples": 3, "totalSamples": 3, "incomplete": False}
+        cases = {
+            "a row nested in an array": ([[dict(hot, validSamples="3", totalSamples="3")]], "invalid-core-row"),
+            "a nested array beside a cool row": ([[dict(hot)], dict(hot, instance="0,0", percent=30.0)], "invalid-core-row"),
+            "a scalar row": ([82], "invalid-core-row"),
+            "a lone null row": ([None], "invalid-core-row"),
+            "an array core_class": ([dict(hot, core_class=["P"])], "core-class-unknown"),
+            "counts beyond double precision": ([dict(hot, validSamples=9007199254740992, totalSamples=9007199254740993)], "incomplete-samples"),
+            "zero of zero samples": ([dict(hot, validSamples=0, totalSamples=0)], "incomplete-samples"),
+            "negative counts": ([dict(hot, validSamples=-1, totalSamples=-1)], "incomplete-samples"),
+            "fractional counts": ([dict(hot, validSamples=3.5, totalSamples=3)], "incomplete-samples"),
+            "more valid than total": ([dict(hot, validSamples=4, totalSamples=3)], "incomplete-samples"),
+            # adversary pass r4 round 2 (A1 A2): the incomplete flag is a boolean or it is not evidence; notes is an object or it cannot say nothing was omitted
+            "an object incomplete flag": ([dict(hot, incomplete={})], "incomplete-samples"),
+            "a string incomplete flag": ([dict(hot, incomplete="false")], "incomplete-samples"),
+            "a numeric incomplete flag": ([dict(hot, incomplete=0)], "incomplete-samples"),
+            "a null incomplete flag": ([dict(hot, incomplete=None)], "incomplete-samples"),
+            "notes as an array": ([dict(hot)], "invalid-notes", {"notes": [{"cores_omitted": "1 core had no valid sample and was omitted"}]}),
+            "notes as a string": ([dict(hot)], "invalid-notes", {"notes": "cores_omitted"}),
+        }
+        for name, (cores, reason, *extra) in cases.items():
+            with self.subTest(name):
+                probe = dict(self.probe(cores), **(extra[0] if extra else {}))
+                proc = self.gate(probe, "-PerCoreEnforce")
+                self.assertRegex(proc.stdout, r"(?m)^QUIET ", proc.stdout + proc.stderr)
+                self.assertIn(f"would_block=null reason={reason}", proc.stdout)
+                self.assertNotIn("percore blocked", proc.stdout)
+                raw = self.tmp / f"venue-quiet-probe-r4-{abs(hash(name))}.json"
+                raw.write_text(json.dumps(probe), encoding="utf-8")
+                summ = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"),
+                                       "-ProbeJson", str(raw), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
+                self.assertIn("Busy probes summarized: 0 (quiet skipped 1", summ.stdout, summ.stdout + summ.stderr)
+
+    # ---- r5 (sol r4 V-03 / Dot B3): a PRESENT notes property whose value is null is invalid-notes, never a definite verdict; an ABSENT property and an empty object are unchanged ----
+    def _summary_for(self, probe: dict, tag: str) -> subprocess.CompletedProcess:
+        raw = self.tmp / f"venue-quiet-probe-r5-{tag}.json"
+        raw.write_text(json.dumps(probe), encoding="utf-8")
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.dv / "Summarize-VenueBusyProbes.ps1"),
+                               "-ProbeJson", str(raw), "-PerCoreEnforce"], capture_output=True, text=True, timeout=120)
+
+    def test_an_explicit_null_notes_is_invalid_notes_in_the_gate_and_the_summary(self) -> None:
+        for name, cores in {"hot 82": _pc_cores(self.HOT), "cool 30": _pc_cores(self.COOL)}.items():
+            with self.subTest(name):
+                probe = dict(self.probe(cores), notes=None)
+                self.assertIn('"notes": null', json.dumps(probe))
+                proc = self.gate(probe, "-PerCoreEnforce")
+                self.assertRegex(proc.stdout, r"(?m)^QUIET ", proc.stdout + proc.stderr)
+                self.assertIn("would_block=null reason=invalid-notes", proc.stdout)
+                self.assertNotIn("percore blocked", proc.stdout)
+                off = self.gate(probe)
+                self.assertIn("would_block=null reason=invalid-notes", off.stdout, "the observation line reports the same typed unknown when enforcement is off")
+                self.assertRegex(off.stdout, r"(?m)^QUIET ")
+                summ = self._summary_for(probe, name.replace(" ", "-"))
+                self.assertIn("Busy probes summarized: 0 (quiet skipped 1", summ.stdout, summ.stdout + summ.stderr)
+
+    def test_an_absent_notes_property_and_an_empty_notes_object_keep_the_definite_verdict(self) -> None:
+        for name, extra in {"absent": None, "empty object": {}}.items():
+            with self.subTest(name):
+                hot = self.probe(_pc_cores(self.HOT))
+                cool = self.probe(_pc_cores(self.COOL))
+                for p in (hot, cool):
+                    p.pop("notes", None)
+                    if extra is not None:
+                        p["notes"] = extra
+                self.assertEqual("notes" in hot, extra is not None)
+                blocked = self.gate(hot, "-PerCoreEnforce")
+                self.assertIn("would_block=true", blocked.stdout, blocked.stdout + blocked.stderr)
+                self.assertNotIn("reason=invalid-notes", blocked.stdout)
+                self.assertIn("percore blocked", blocked.stdout)
+                self.assertIn("would_block=false", self.gate(cool, "-PerCoreEnforce").stdout)
+                self.assertIn("Busy probes summarized: 1 (quiet skipped 0", self._summary_for(hot, "ok-" + name.replace(" ", "-")).stdout)
+
+    # ---- r6 (sol r5 B4 / Dot B4): a malformed ACCEPTED sample must not stop the probe being logged first: the PROBE line, the percore lines and the typed UNKNOWN exit 6 all still happen ----
+    def test_a_malformed_sample_still_logs_the_probe_and_percore_lines_and_ends_unknown(self) -> None:
+        cases = {
+            "string sample": ([10, "hot", 10], "10.0/bad:string/10.0"),
+            "object sample": ([10, {"x": 1}, 10], "10.0/bad:object/10.0"),
+            "nested array sample": ([10, [1, 2], 10], "10.0/bad:array/10.0"),
+            "boolean sample": ([10, True, 10], "10.0/bad:bool/10.0"),
+        }
+        for name, (samples, shown) in cases.items():
+            for flags in ((), ("-PerCoreEnforce",)):
+                with self.subTest(name, enforce=bool(flags)):
+                    proc = self.gate(self.probe(_pc_cores(self.HOT), samples=samples), *flags)
+                    out = proc.stdout + proc.stderr
+                    self.assertEqual(proc.returncode, 6, out)
+                    self.assertRegex(proc.stdout, r"(?m)^PROBE venue-quiet-probe-\S+ bachelor samples=" + re.escape(shown) + r" mean=UNKNOWN state=UNKNOWN", out)
+                    self.assertIn(f"  percore enabled={'true' if flags else 'false'} threshold=60.0% busiest_fast_core=0_2 busiest_fast_pct=82.0% would_block=true", proc.stdout, out)
+                    self.assertRegex(proc.stdout, r"(?m)^VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=", out)
+                    self.assertNotIn("Cannot convert", out)
+                    self.assertNotIn("percore blocked", proc.stdout, "an UNKNOWN mean is never turned into a measured BUSY by the per-core check")
+
+    # ---- r6 adversary pass (A1 A2): cores[] is an ARRAY of rows and a fast row names its core as "<group>,<core>"; anything else is typed unknown, never a definite verdict or a made-up core name ----
+    def test_a_cores_value_that_is_not_an_array_or_a_fast_row_without_a_core_name_is_unknown(self) -> None:
+        hot = _pc_cores(self.HOT)[0]
+        nameless = {k: v for k, v in hot.items() if k != "instance"}
+        cases = {
+            "cores as one object": (dict(hot), "invalid-cores"),
+            "cores as a string": ("0,2", "invalid-cores"),
+            "cores as a number": (82, "invalid-cores"),
+            "missing instance": ([nameless], "invalid-core-instance"),
+            "array instance": ([dict(hot, instance=["0,0", "0,2"])], "invalid-core-instance"),
+            "numeric instance": ([dict(hot, instance=2)], "invalid-core-instance"),
+            "empty instance": ([dict(hot, instance="")], "invalid-core-instance"),
+            "instance that is not group,core": ([dict(hot, instance="cpu2")], "invalid-core-instance"),
+            "null instance": ([dict(hot, instance=None)], "invalid-core-instance"),
+            # adversary pass r6 round 2 (A1): .NET `$` accepts a trailing line feed, and \d accepts non-ASCII digits; the name is exactly ASCII digits, comma, ASCII digits
+            "instance with a trailing line feed": ([dict(hot, instance="0,2\n")], "invalid-core-instance"),
+            "instance with Arabic-Indic digits": ([dict(hot, instance="٠,٢")], "invalid-core-instance"),
+        }
+        for name, (cores, reason) in cases.items():
+            with self.subTest(name):
+                probe = self.probe(cores)
+                for flags in (("-PerCoreEnforce",), ()):
+                    proc = self.gate(probe, *flags)
+                    self.assertRegex(proc.stdout, r"(?m)^QUIET ", proc.stdout + proc.stderr)
+                    self.assertIn(f"would_block=null reason={reason}", proc.stdout)
+                    self.assertNotIn("percore blocked", proc.stdout)
+                    self.assertNotIn("0_0_0_2", proc.stdout)
+                self.assertIn("Busy probes summarized: 0 (quiet skipped 1", self._summary_for(probe, "r6-" + str(abs(hash(name)))).stdout)
+
+    def test_an_efficiency_core_row_without_a_core_name_does_not_make_the_check_unknown(self) -> None:
+        ecore = {k: v for k, v in _pc_cores(self.EHOT)[0].items() if k != "instance"}
+        proc = self.gate(self.probe(_pc_cores(self.COOL) + [ecore]), "-PerCoreEnforce")
+        self.assertIn("would_block=false", proc.stdout, proc.stdout + proc.stderr)
+
+    # ---- adversary pass r4 (A4): a sink that fails on the observation line must not also swallow the blocked-core line ----
+    def test_a_sink_failure_on_the_observation_line_still_prints_the_blocked_core_line(self) -> None:
+        script = (DV / "Wait-VenueQuiet.ps1").as_posix()
+        cmd = (f"$t=$null;$e=$null;$ast=[System.Management.Automation.Language.Parser]::ParseFile('{script}',[ref]$t,[ref]$e);"
+               "foreach($n in 'Format-PerCorePct','ConvertTo-IdentToken','Write-PerCoreLines'){ $f=$ast.Find({param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -ceq $n},$true); . ([scriptblock]::Create($f.Extent.Text)) }; "
+               "function Write-Gate([string]$Line) { Write-Output $Line; if ($Line -like '  percore enabled=*') { throw 'sink locked' } }; "
+               "$pc=[pscustomobject]@{enabled=$true;threshold=60.0;busiest_fast_core='0,2';busiest_fast_percent=82.0;would_block=$true;reason=$null}; "
+               "try { Write-PerCoreLines $pc $true; 'NO_ESCAPE' } catch { 'ESCAPED ' + $_.Exception.Message }")
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
+        self.assertIn("NO_ESCAPE", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("  percore blocked core=0_2 percent=82.0% threshold=60.0%", proc.stdout)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -6415,12 +6830,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in HEADROOM_LEGS:
+        for rel in (*HEADROOM_LEGS, *AGXOFF_UNPACED_LEGS):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in HEADROOM_LEGS:
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *AGXOFF_UNPACED_LEGS):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -6457,6 +6872,12 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
+            elif spec["card"] == "VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1":   # the unpaced s2 AgX-off look leg, named by flavor
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-look-scale2-(cinematic|film|vision50d)-agxoff-unpaced$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+                self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
+                self.assertEqual(spec["look"]["receipt"], "look-receipts/agx-off.marxml", path.name)
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
@@ -6671,6 +7092,7 @@ NO_PACE_TWIN_BY_DESIGN = {
     "m16-1243-look-scale2-vision50d": "Vision50d flavor-parity contact-sheet leg at scale 2; no merged PR cites an absolute figure from it",
     **{f"m16-1243-look-scale2-{flavor}-agxoff": "carries a look receipt (agx-off.marxml) that a speed leg cannot carry, so no speed leg can be the same condition"
        for flavor in ("cinematic", "film", "vision50d")},
+    "m16-1243-look-scale2-cinematic-agxoff-unpaced": "an unpaced headroom leg carrying a look receipt; no speed leg can carry the receipt, and its timing claim is the unpaced rate, not a paced figure",
 }
 
 
@@ -6884,6 +7306,32 @@ class LookReceiptLegSpecTests(unittest.TestCase):
                 text = lambda n: (DV / "legs" / f"{n}.json").read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
                 diff = [(a, b) for a, b in zip(text(agx_id).split("\n"), text(source_id).split("\n")) if a != b]
                 self.assertEqual(len(diff), 2, "byte copies: only the legId line and the look line differ")
+
+    def test_the_agxoff_unpaced_leg_is_its_source_plus_only_the_unpaced_headroom_keys(self) -> None:
+        """VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1: the AgX-off look leg run unpaced at swap interval 0, so its s2 rate is not pinned at the pace cap. It is its
+        paced source except legId, card, playSeconds (the headroom legs' 20 s), the three unpaced-headroom generatorArgs, the tearing reason those force,
+        and one contact-sheet grab (a look leg grabs inside the timed Play); the receipt and its bound hash are the source's own."""
+        for rel, source_rel in AGXOFF_UNPACED_LEGS.items():
+            with self.subTest(leg=rel):
+                leg = json.loads((DV / rel).read_text(encoding="utf-8"))
+                source = json.loads((DV / source_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(leg, self.schema)
+                self.assertEqual(leg["legId"], Path(rel).stem)
+                self.assertEqual(leg["card"], "VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1")
+                self.assertEqual(leg["playSeconds"], 20)
+                for field in ("receipt", "receiptSha256"):
+                    self.assertEqual(leg["look"][field], source["look"][field], field)
+                self.assertEqual(leg["look"]["receiptSha256"], self.receipt_sha, "the spec binds the committed receipt's bytes")
+                self.assertEqual(leg["look"]["contactSheetFrames"], 1)
+                self.assertEqual(leg["generatorArgs"], dict(source["generatorArgs"], swapInterval=0, unpaced=True, presentTrace=True))
+                self.assertEqual(list(leg["generatorArgs"]), [*source["generatorArgs"], "swapInterval", "unpaced", "presentTrace"])
+                self.assertNotIn("presentTearingExpectedReason", source)
+                self.assertGreaterEqual(len(leg["presentTearingExpectedReason"]), 12)
+                self.assertEqual(leg, dict(source, legId=leg["legId"], card=leg["card"], playSeconds=20, generatorArgs=leg["generatorArgs"],
+                                           presentTearingExpectedReason=leg["presentTearingExpectedReason"], look=dict(source["look"], contactSheetFrames=1)))
+                self.assertEqual([k for k in leg if k != "presentTearingExpectedReason"], list(source), "the source's keys in the source's order")
+                text = lambda r: (DV / r).read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
+                self.assertEqual(text(rel).split('"criteria"', 1)[1], text(source_rel).split('"criteria"', 1)[1], "criteria are a byte copy")
 
     def test_no_leg_spec_that_existed_at_the_base_changed(self) -> None:
         if not _base_commit_available():
@@ -9335,6 +9783,32 @@ class VenueBusyProbeSummaryTests(unittest.TestCase):
         self.assertEqual((j["projects"][0]["probes"], j["projects"][0]["cpu_seconds"]), (2, 58.1))
         self.assertEqual(j["projects"][0]["examples"][0], {"name": "python", "script": "bench.py", "owner": "BACHELOR\\layib"})
         self.assertEqual([g["pid"] for g in j["gpu_heavy"]], [16372, 16892])
+
+    def test_json_records_the_per_core_settings_next_to_the_mean_threshold_default_off(self) -> None:
+        # VENUE-BUSY-PROBE-SUMMARY-SETTINGS-1: a reader of the JSON must be able to tell which per-core decision produced busy_probes
+        self.fixtures()
+        proc = self.summarize("-ProbeDir", str(self.probes), "-Json")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        j = json.loads(proc.stdout)
+        self.assertIs(j["per_core_enforce"], False)
+        self.assertEqual(j["per_core_threshold_percent"], 60.0)
+        # the existing keys and their values are unchanged
+        self.assertEqual(j["schema"], "mlv-app/venue-busy-probe-summary/v1")
+        self.assertEqual(j["threshold_percent"], 20.0)
+        self.assertEqual((j["busy_probes"], j["quiet_skipped"], j["unknown_skipped"], j["unreadable"]), (3, 1, 0, 0))
+        self.assertEqual([p["project"] for p in j["projects"]], ["mlv-app", "unknown(no-identity)", "unknown"])
+        self.assertEqual([g["pid"] for g in j["gpu_heavy"]], [16372, 16892])
+
+    def test_json_records_the_per_core_settings_the_caller_passed(self) -> None:
+        self.fixtures()
+        proc = self.summarize("-ProbeDir", str(self.probes), "-Json", "-PerCoreEnforce", "-PerCoreThresholdPercent", "45")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        j = json.loads(proc.stdout)
+        self.assertIs(j["per_core_enforce"], True)
+        self.assertEqual(j["per_core_threshold_percent"], 45.0)
+        self.assertEqual(j["schema"], "mlv-app/venue-busy-probe-summary/v1")
+        self.assertEqual(j["threshold_percent"], 20.0)
+        self.assertEqual(list(j)[:4], ["schema", "threshold_percent", "per_core_enforce", "per_core_threshold_percent"])
 
     def test_include_quiet_keeps_the_quiet_probes(self) -> None:
         self.fixtures()

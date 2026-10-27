@@ -119,11 +119,27 @@ Environment::GetFolderPath IO.DriveInfo::new IO.File::OpenRead IO.File::ReadAllB
 # New-Object is NOT here: it can build a StreamWriter, so each type it builds needs its own row.
 INERT_COMMANDS = frozenset("Get-Command Get-Counter Get-Item Group-Object Write-Warning".split())
 
-# An R5 finding on `$local.property = ...` sets a property of a helper's own local object (a result
-# record, a ProcessStartInfo). It cannot be a publish destination; the template-side member-assignment
-# rule exists to stop `(Get-Item $Pub).Attributes = ...` shapes, which keep their token (the full
-# member text of a non-local receiver) and stay findings.
+# An R5 finding on `$local.property = ...` is inert only when the scan proves the receiver is an object
+# this same body just BUILT: every assignment to the variable is a hashtable / [ordered] / [pscustomobject]
+# literal ("literal") or a New-Object / [Type]::new of a type on INERT_LOCAL_TYPES ("constructed:<Type>").
+# A receiver that came from a command, a member or a parameter ("other", "unbound", "nested", ...) can be a
+# foreign object, and `$f = Get-Item $Pub; $f.Attributes = ...` is a file write: that stays a finding and
+# needs a reviewed ALLOWLIST row. The scan reports the receiver's origin; this file decides.
 LOCAL_PROPERTY_SET = re.compile(r"^\$(?!Work\b|Pub\b|Cache\b|AgentRoot\b|Root\b)[A-Za-z_]\w*(\.\w+)+$")
+# Types a body builds only to fill in and hand to an effectful call that is itself a finding (Process.Start):
+# setting their fields touches no file, process or registry. A variable that is ALSO bound some other way
+# (foreach, [ref], -OutVariable, a parameter, a multi-target assignment) is no longer provably this object.
+INERT_LOCAL_TYPES = frozenset("""
+System.Diagnostics.ProcessStartInfo Diagnostics.ProcessStartInfo
+""".split())
+
+
+def local_property_set_is_inert(finding: dict) -> bool:
+    if finding["rule"] != "R5" or not LOCAL_PROPERTY_SET.match(finding["token"]):
+        return False
+    origins = [o for o in finding.get("origin", "").split(";") if o]
+    return bool(origins) and all(
+        o == "literal" or (o.startswith("constructed:") and o[len("constructed:"):] in INERT_LOCAL_TYPES) for o in origins)
 
 # (function, rule, offending token) -> (how many times the body holds it, one-line reason). REVIEWED
 # rows only: every row names a helper whose job is to be the runtime boundary, or a read-only / inert
@@ -298,6 +314,25 @@ _allow("Get-AttrCudaGuiSmokeDisplaySelection",
        "fallback dot-source of the sibling gui-smoke-display-identity.ps1, taken only when ConvertFrom-GuiSmokeDisplayLog is NOT defined; the emitted job embeds that function, so the branch is dead there",
        ("R3", ". (dot-source)", 1))
 
+# ---- property sets whose receiver the scan could not prove is a fresh local object (ATTR3-SCAN-COVERAGE-LIMITS-1 L1) ----
+_allow("Get-AttrCudaPresentMonWindowResult",
+       "mutates a shallow PSObject.Copy() of the caller's parsed result and its nested process record; in-memory data only, nothing is written back to a file",
+       ("R5", "$clone.process", 1), ("R5", "$clone.process.endedAtUtc", 1))
+_allow("Get-AttrCudaWindowsDisplayInventory",
+       "sets the size field of an AttrCudaDisplayDevice / AttrCudaDevMode struct this body built with New-Object, which EnumDisplay* then fills through [ref]; in-memory only",
+       ("R5", "$adapter.cb", 1), ("R5", "$monitor.cb", 1), ("R5", "$mode.dmSize", 1))
+_allow("Remove-AttrCudaFileByProof",
+       "sets fields of the FileDispositionInfo / FileBasicInfo structs this body built with ::new() and hands to SetFileInformationByHandle through [ref]; the call is the finding",
+       ("R5", "$disposition.DeleteFile", 1), ("R5", "$basic.FileAttributes", 1))
+_allow("Invoke-AttrCudaBoundedProbe",
+       "attaches the throwaway runspace to the [powershell]::Create() shell this body made; the runspace and its commands stay findings on their own",
+       ("R5", "$probeShell.Runspace", 1))
+_allow("Start-AttrCudaDisplayWakeKeepAlive",
+       "writes counters and messages into the synchronized in-memory $NudgeState table the body builds and shares with its keep-alive runspace, and attaches the runspace to its shell",
+       ("R5", "$NudgeState.count", 3), ("R5", "$NudgeState.failureCount", 4), ("R5", "$NudgeState.lastDesktopName", 1),
+       ("R5", "$NudgeState.lastError", 4), ("R5", "$NudgeState.lastFailureUtc", 4), ("R5", "$NudgeState.sessionLockReason", 2),
+       ("R5", "$NudgeState.successCount", 1), ("R5", "$shell.Runspace", 1))
+
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 
 
@@ -371,7 +406,7 @@ def in_scope(findings: list[dict]) -> list[dict]:
             continue
         if f["rule"] == "R1" and f["token"] in INERT_COMMANDS:
             continue
-        if f["rule"] == "R5" and LOCAL_PROPERTY_SET.match(f["token"]):
+        if local_property_set_is_inert(f):
             continue
         kept.append(f)
     return kept
@@ -413,6 +448,14 @@ class SplicedBodyScanHeaderTests(unittest.TestCase):
                        "reference-frame-runner-job.ps1", "Attr3Footage", "child executables",
                        "trusted as reviewed"):
             self.assertIn(needle, limits, f"the scan header's EXPLICIT LIMITS block lost: {needle}")
+        # ATTR3-SCAN-COVERAGE-LIMITS-1: the header states the module binding and the property-set origin exactly.
+        for needle in ("MODULE BINDING", "the module the extractor will read for THAT call", "fail closed",
+                       "PROPERTY SETS IN BODIES", "'constructed:<Type>'", "this script still decides nothing",
+                       # r9: the class rule, and the rules a spliced body is held to (R8 included).
+                       "UNPROVEN BINDING", "unproven-binding", "$PSDefaultParameterValues", "R1 R2 R3 R4 R5 R6 R8"):
+            self.assertIn(needle, flat, f"the scan header no longer states: {needle}")
+        self.assertNotIn("security boundary", flat.replace("NOT a security boundary", "").replace("not a security boundary", ""),
+                         "the scan is a regression tripwire; its header must not claim it is a security boundary")
         # The parser calls the header names are the ones the scan really makes.
         self.assertGreaterEqual(text.count("[System.Management.Automation.Language.Parser]::ParseInput("), 1)
         self.assertGreaterEqual(text.count("[System.Management.Automation.Language.Parser]::ParseFile("), 1)
@@ -439,6 +482,9 @@ class SplicedBodyScanOnRealSourcesTests(unittest.TestCase):
         self.assertGreater(len(spliced), 40, "suspiciously few spliced functions enumerated")
         unresolved = [v for v in self.result["splicedViolations"] if v["rule"] == "splice"]
         self.assertEqual(unresolved, [], describe(unresolved))
+        # r9: no real call, body or module binds by a route the scan cannot prove.
+        unproven = [v for v in self.result["splicedViolations"] if "unproven-binding" in (v["rule"], v["token"])]
+        self.assertEqual(unproven, [], describe(unproven))
         names = {s["name"] for s in spliced}
         # Anchors from each generator family: an enumeration that lost a family would drop these.
         for anchor in ("Publish-AttrCudaText", "Remove-AttrCudaTree", "Get-AttrCudaSessionLocked",
@@ -664,6 +710,1521 @@ class SplicedBodyScanFixtureTests(unittest.TestCase):
 
     def test_a_lowercase_module_qualified_extractor_call_with_a_positional_list_is_scanned(self) -> None:
         self.assert_the_variant_call_is_scanned("attrcudaartifacts\\GET-ATTRCUDAEMBEDDEDFUNCTIONSOURCE @('Publish-AttrCudaFixtureHelper')")
+
+
+@requires_pwsh
+@unittest.skipUnless(os.name == "nt", "the ATTR-3 host jobs and their helpers are Windows-only")
+class SplicedBodyScanCoverageLimitTests(unittest.TestCase):
+    """ATTR3-SCAN-COVERAGE-LIMITS-1: the two limits Dot recorded on #655, pinned with concrete inputs.
+
+    L1: a `$local.Property = ...` finding inside a spliced helper body was dropped by SHAPE alone, so a helper
+    that sets a property on a foreign object (`$f = Get-Item $Pub; $f.Attributes = ...`) passed the policy.
+    L2: a splice call site was resolved against EVERY -ModulePath module instead of the module its own
+    extractor call reads, so a same-named helper in another module could be scanned in its place.
+    This is a regression tripwire, not a security boundary (see the scan's header).
+
+    Five scans cover every case (one generator holds many call sites, one helper name per case), so the class
+    costs five pwsh starts, not one per test: the Windows shard budget has no slack for more.
+    """
+
+    RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
+    CLEAN = "    Get-Date"
+    TEMPLATE = "$Work = Join-Path 'C:\\mlvtmp' $JobId\n__EMBEDDED_FUNCTIONS__\n"
+
+    L1_BODIES = [
+        ("L1Foreign", "    param([string]$Target)\n    $item = Get-Item -LiteralPath $Target\n    $item.Attributes = 'Hidden'"),
+        ("L1Param", "    param($Target)\n    $Target.IsReadOnly = $true"),
+        ("L1Mixed", "    param([string]$Target)\n    $r = [ordered]@{}\n    $r = Get-Item -LiteralPath $Target\n    $r.Attributes = 'Hidden'"),
+        # New-Object itself is judged on its own (R1, per type); a property set on a FileInfo writes the file's attributes.
+        ("L1FileInfo", "    param([string]$Target)\n    $fi = New-Object System.IO.FileInfo $Target\n    $fi.IsReadOnly = $true"),
+        ("L1Nested", "    $r = [ordered]@{ inner = $null }\n    $r.inner.Attributes = 'Hidden'"),
+        ("L1Root", "    $Pub.Attributes = 'Hidden'"),
+        ("L1Fresh", "    $r = [ordered]@{}\n    $r.a = 1\n    $o = [pscustomobject]@{ a = 1 }\n    $o.a = 2\n"
+                    "    $psi = New-Object System.Diagnostics.ProcessStartInfo\n    $psi.FileName = 'x'"),
+        ("L1IndexRoot", "    $Pub['k'] = 1"),
+        ("L1IndexLocal", "    $h = @{}\n    $h['k'] = 1\n    $list = New-Object 'System.Collections.Generic.List[object]'"),
+        # Adversary A1: a variable is also bound by foreach, -OutVariable, a multi-target assignment, [ref] and a parameter.
+        ("L1Foreach", "    param([string]$Target)\n    $r = @{}\n    foreach ($r in (Get-Item -LiteralPath $Target)) { $r.Attributes = 'Hidden' }"),
+        ("L1OutVariable", "    param([string]$Target)\n    $r = @{}\n    Get-Item -LiteralPath $Target -ov r | Out-Null\n    $r.Attributes = 'Hidden'"),
+        ("L1MultiTarget", "    param([string]$Target)\n    $r = @{}\n    $x, $r = Get-Item -LiteralPath $Target\n    $r.Attributes = 'Hidden'"),
+        ("L1Ref", "    $r = @{}\n    $null = [int]::TryParse('1', [ref]$r)\n    $r.Attributes = 'Hidden'"),
+        ("L1ParamAlso", "    param($r)\n    $r = @{}\n    $r.Attributes = 'Hidden'"),
+        # Adversary round 2. A1: automatic pipeline variables; A2: scope-qualified binders; A3: a type conversion is not a
+        # literal; A4: an assignment must come first, in an enclosing block, outside any nested function.
+        ("L1AutoUnderscore", "    param($Target)\n    $_ = @{}\n    Get-Item -LiteralPath $Target | ForEach-Object { $_.Attributes = 'Hidden' }"),
+        ("L1AutoPSItem", "    param($Target)\n    $PSItem = @{}\n    Get-Item -LiteralPath $Target | ForEach-Object { $PSItem.Attributes = 'Hidden' }"),
+        ("L1ScopedForeach", "    param($Target)\n    $r = @{}\n    foreach ($local:r in (Get-Item -LiteralPath $Target)) { $r.Attributes = 'Hidden' }"),
+        ("L1ScopedPipeVar", "    param($Target)\n    $r = @{}\n    Get-Item -LiteralPath $Target -PipelineVariable local:r | ForEach-Object { $r.Attributes = 'Hidden' }"),
+        ("L1CastRhs", "    $r = [System.Diagnostics.EventLog]@{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        ("L1CastLhs", "    [System.Diagnostics.EventLog]$r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        ("L1NestedAssign", "    function G { $r = @{} }\n    $r.Attributes = 'Hidden'"),
+        ("L1LateAssign", "    $r.Attributes = 'Hidden'\n    $r = @{}"),
+        ("L1ConditionalAssign", "    param($Cond)\n    if ($Cond) { $r = @{} }\n    $r.Attributes = 'Hidden'"),
+        ("L1SetterInNestedFunction", "    $r = @{}\n    function G { $r.Attributes = 'Hidden' }"),
+        # Still fresh: the assignment comes first in an enclosing block, and the setter sits in a deeper block.
+        ("L1FreshNested", "    $r = [ordered]@{}\n    if ($true) { $r.a = 1 }"),
+        # Round 2 (third adversary pass, A2-A5): only an UNSCOPED assignment makes a receiver fresh; a trap or a deferred
+        # script block runs when the caller says, not where it is written; a local function named like a command the
+        # scan reasons about (New-Object) changes what that command does.
+        ("L1ScopedAssign", "    $script:r = @{}\n    $r.Attributes = 2"),
+        ("L1TrapSetter", "    throw 'boom'\n    $r = @{}\n    trap { $r.Attributes = 2; continue }"),
+        ("L1DeferredBlock", "    $r = @{}\n    { $r.Attributes = 2 }"),
+        ("L1ShadowNew", "    param([string]$Target)\n    function New-Object { param($TypeName) Get-Item -LiteralPath $Target }\n"
+                        "    $r = New-Object System.Diagnostics.ProcessStartInfo\n    $r.Attributes = 2"),
+        # Still fresh: a script block handed to a command runs in line.
+        ("L1InlineBlock", "    $r = [ordered]@{}\n    1 | ForEach-Object { $r.a = $_ }"),
+        # r4 (adversary r3 A3 = Dot B4): a typed parameter named WITH a scope qualifier binds the same variable, so the
+        # hashtable assigned after it is converted to the parameter's type (an EventLog) and the setter writes the log.
+        ("L1TypedLocal", "    param([System.Diagnostics.EventLog]$local:r)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        ("L1TypedScript", "    param([System.Diagnostics.EventLog]$script:r)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        ("L1TypedPrivate", "    param([System.Diagnostics.EventLog]$private:r)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        ("L1TypedGlobal", "    param([System.Diagnostics.EventLog]$global:r)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        # Control: a scoped parameter with ANOTHER name does not touch $r, which stays a fresh literal.
+        ("L1TypedOther", "    param([System.Diagnostics.EventLog]$local:other)\n    $r = @{ Log = 'Application' }\n    $r.MaximumKilobytes = 1024"),
+        # r5 (Dot B8 = r4 adversary A3): a data section binds its variable to a command result, so the setter below it reaches a
+        # FileInfo, not the hashtable assigned first.
+        # r5 adversary pass 2 (A2): a trap that continues lets the setter run although the throwing construction never assigned $r,
+        # so the receiver is the caller's object, not the literal.
+        ("L1TrapConstruct", "    trap { continue }\n    $r = @{ x = $(throw 'bad') }\n    $r.Attributes = 'Hidden'"),
+        ("L1DataStatement","    $r = @{}\n    data r -SupportedCommand Get-Item { Get-Item -LiteralPath 'C:\\fixture\\target' }\n    $r.Attributes = 'Hidden'"),    ]
+
+    # Adversary A8 (same class as A3): template shapes that name a parameter by alias or abbreviation.
+    TEMPLATE_ALIASES = (
+        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c echo x' -RSO 'C:\\outside\\stdout.txt'\n"
+        "Start-Process -FilePath 'cmd.exe' -ArgumentList '/c echo x' -RSE 'C:\\outside\\stderr.txt'\n"
+        "New-Item -ItemType Directory -Path $Work -N:'..\\escape' -Force\n"
+        # Third adversary pass A7: a template function named like a command the proof evaluates changes the proof.
+        "function Join-Path { param($Path, $ChildPath) 'C:\\outside' }\n"
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-coverage-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.tmp = _long_path(Path(cls._tmp.name))
+        names = ", ".join(repr(n) for n, _ in cls.L1_BODIES)
+        cls.l1 = cls._scan("l1", [("Body.psm1", cls.L1_BODIES)], ["Body.psm1"],
+                           [f"Get-AttrCudaEmbeddedFunctionSource -Name @({names})"], template_extra=cls.TEMPLATE_ALIASES)
+        outside = cls.tmp / "outside"
+        outside.mkdir()
+        (outside / "Clean.psm1").write_text(f"function Collide {{\n{cls.RAW_WRITE}\n}}\n", encoding="utf-8")
+        l2_dir = cls.tmp / "l2"
+        # No -ModulePath module defines the extractor here, so every module is a candidate for a call that names none.
+        cls.l2 = cls._scan("l2", [
+            ("Clean.psm1", [(n, cls.CLEAN) for n in ("LitClean", "LitDirty", "OffList", "Ambig", "AmbigDyn", "Spl", "Collide", "CollideSub", "IdxAmbig", "Nm", "RedirA", "RedirB")]),
+            ("Dirty.psm1", [(n, cls.RAW_WRITE) for n in ("LitClean", "LitDirty", "Ambig", "AmbigDyn", "IdxAmbig", "NmNm", "RedirA", "RedirB")]),
+            ("Only.psm1", [("OnlyHere", cls.CLEAN)]),
+        ], ["Clean.psm1", "Dirty.psm1", "Only.psm1"], [
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1') -Name @('LitClean')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('LitDirty') -ModulePath (Join-Path $PSScriptRoot 'Dirty.psm1')",
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'Off.psm1') -Name @('OffList')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('OffOnly')",
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'Off.psm1') -Name @('OffOnly')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('Ambig')",
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath $somePath -Name @('AmbigDyn')",
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath $somePath -Name @('OnlyHere')",
+            "Get-AttrCudaEmbeddedFunctionSource @('Spl') (Join-Path $PSScriptRoot 'Dirty.psm1')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('Spl') @extra",
+            # A2: a same-named file OUTSIDE the scanned set must not be matched by its base name.
+            f"Get-AttrCudaEmbeddedFunctionSource -Name @('Collide') -ModulePath '{outside / 'Clean.psm1'}'",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('CollideSub') -ModulePath (Join-Path $PSScriptRoot 'sub\\Clean.psm1')",
+            # A4: an expression that evaluates to a module path is not a literal one.
+            f"Get-AttrCudaEmbeddedFunctionSource -Name @('IdxAmbig') -ModulePath (@('{l2_dir / 'Dirty.psm1'}', '{l2_dir / 'Clean.psm1'}')[0])",
+            # A7: a -Name that is an expression is not a literal name list.
+            "Get-AttrCudaEmbeddedFunctionSource -Name ('Nm' + 'Nm')",
+            # r7 (adversary r6 A5): a redirection discards the value, so the extractor gets no -ModulePath at all; the call binds to no module.
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('RedirA') -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1' > $null)",
+            f"Get-AttrCudaEmbeddedFunctionSource -Name @('RedirB') -ModulePath ('{l2_dir / 'Clean.psm1'}' > $null)",
+            # r7 (adversary r6 A4 advisory): a comma list inside a comma list binds the inner list as one joined string.
+            "Get-AttrCudaEmbeddedFunctionSource -Name (('Nes','ted'),'Safe') -ModulePath 'C:\\fixture\\Bodies.psm1'",
+        ], extra_files=[("sub/Clean.psm1", [("CollideSub", cls.RAW_WRITE)])])
+        # The extractor's own module is on the list, so a call that names no -ModulePath reads exactly that module.
+        cls.l2_default = cls._scan("l2-default", [
+            ("Extractor.psm1", [("Get-AttrCudaEmbeddedFunctionSource", "    param($Name)"), ("DefHelper", cls.CLEAN), ("AbbrevM", cls.CLEAN), ("NameAbbrev", cls.CLEAN), ("CaseRoot", cls.CLEAN)]),
+            ("Dirty.psm1", [("DefHelper", cls.RAW_WRITE), ("DirtyOnly", cls.RAW_WRITE), ("AbbrevM", cls.RAW_WRITE), ("EmptyOnly", cls.RAW_WRITE), ("CaseRoot", cls.RAW_WRITE)]),
+        ], ["Extractor.psm1", "Dirty.psm1", "Notes.psm1"], [
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('DefHelper')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('DirtyOnly')",
+            # A3: PowerShell binds -M to -ModulePath and -N to -Name (unique prefixes).
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('AbbrevM') -M (Join-Path $PSScriptRoot 'Dirty.psm1')",
+            "Get-AttrCudaEmbeddedFunctionSource -N @('NameAbbrev')",
+            # A5: an empty, blank or null -ModulePath makes the extractor fall back to its own module.
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath ''",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath ' '",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath $null",
+            # Round 2 A5: PowerShell variable and command names are case-insensitive.
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('EmptyOnly') -ModulePath $NULL",
+            "Get-AttrCudaEmbeddedFunctionSource -Name @('CaseRoot') -ModulePath (join-path $psscriptroot 'Dirty.psm1')",
+        ], raw_modules={"Notes.psm1": "<#\nfunction Get-AttrCudaEmbeddedFunctionSource {\n}\n#>\n"})
+        # Third adversary pass A1 / A6: a positional path after a common-parameter ALIAS (-vb, -db) binds -ModulePath, and a
+        # generator that defines its own Join-Path / Split-Path / alias changes what the scan's own evaluation means.
+        cls.shadow = cls._scan("shadow", [
+            ("Clean.psm1", [("PosVb", cls.CLEAN), ("PosDb", cls.CLEAN), ("ShadowF", cls.CLEAN)]),
+            ("Dirty.psm1", [("ShadowF", cls.RAW_WRITE)]),
+        ], ["Clean.psm1", "Dirty.psm1"], [
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'PosVb' -vb (Join-Path $PSScriptRoot 'Dirty.psm1')",
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'PosDb' -db (Join-Path $PSScriptRoot 'Dirty.psm1')",
+            "Get-AttrCudaEmbeddedFunctionSource -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1') -Name 'ShadowF'",
+        ], generator_preamble=("function Join-Path { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
+                               "function global:Split-Path { param($Path) 'C:\\fixture' }\n"
+                               "Set-Alias -Name Get-Item -Value Get-Date\n"
+                               "New-Alias New-Object Get-Date\n"))
+        # r3 (Dot B1): the colon form `-Name:Join-Path` keeps the name in the parameter's own Argument, so a scan that read
+        # only the command's string elements never saw it. One scan covers every spelling, computed name and provider route.
+        cls.alias = cls._scan("alias", [
+            ("Clean.psm1", [(n, cls.CLEAN) for n in ("DotF", "QualF", "DriveF", "RootF", "RenF")]),
+            ("Dirty.psm1", [(n, cls.RAW_WRITE) for n in ("DotF", "QualF", "DriveF", "RootF", "RenF")]),
+        ], ["Clean.psm1", "Dirty.psm1"], [
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'DotF' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')",
+            # Third-pass adversary A2 / A3: a module-qualified extractor runs another module's extractor, and a drive-relative
+            # or root-relative literal is "rooted" yet resolves against the working directory of whoever runs it.
+            "Dirty\\Get-AttrCudaEmbeddedFunctionSource -Name 'QualF'",
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'DriveF' -ModulePath 'C:Clean.psm1'",
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'RootF' -ModulePath '\\Clean.psm1'",
+            # r4 (A1): the rename in the preamble (`-NewName ('Join-Path')`) makes runtime read Dirty.psm1 here.
+            "Get-AttrCudaEmbeddedFunctionSource -Name 'RenF' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')",
+        ], generator_preamble=cls.ALIAS_PREAMBLE, template_extra=cls.ALIAS_TEMPLATE)
+
+    # Every line is its own finding, found again by its exact text. Redirect is the Dot counterexample's replacement command.
+    ALIAS_SHADOWS = (
+        "Set-Alias -Name:Join-Path -Value:Redirect",
+        "New-Alias -Name:Join-Path -Value:Redirect",
+        "Set-Alias -N:Join-Path -Value:Redirect",
+        "Set-Alias -Na:Split-Path -Value:Redirect",
+        "Set-Alias -Name:'Join-Path' -Value Redirect",
+        'Set-Alias -Name:"Split-Path" -Value:Redirect',
+        "New-Alias -Name:New-Object -Value:Redirect",
+        "Set-Alias -Name:global:Join-Path -Value:Redirect",
+        "sal -Name:JOIN-PATH Redirect",
+        "Microsoft.PowerShell.Utility\\New-Alias -Value:Redirect -Name:Split-Path",
+    )
+    # A name the scan cannot read as a string constant could be any command, so each of these is a finding of its own kind.
+    ALIAS_COMPUTED = (
+        "Set-Alias -Name:$aliasName -Value:Redirect",
+        "Set-Alias -Name ($aliasPrefix + '-Path') Redirect",
+        'New-Alias "$aliasPrefix-Path" Redirect',
+        "Set-Alias -Value:Redirect $aliasName",
+        "Set-Alias @aliasSplat",
+        # Adversary A1: -vb / -db are switches, so the computed name after them is still the alias name.
+        "Set-Alias -vb $aliasVb Redirect",
+        "New-Alias -db $aliasDb Redirect",
+    )
+    # Other routes to a command called Join-Path / Split-Path / New-Object: the alias: and function: drives.
+    PROVIDER_ROUTES = (
+        "Set-Item -Path alias:Join-Path -Value Redirect",
+        "New-Item -Path function:\\Split-Path -Value { 'C:\\fixture' }",
+        "Set-Item -LiteralPath:Alias::New-Object Redirect",
+        "${function:Join-Path} = { 'C:\\fixture\\Dirty.psm1' }",
+        "${alias:global:Split-Path} = 'Redirect'",
+        "New-Item -Path alias: -Name Join-Path -Value Redirect",
+        'Set-Item -Path "function:$routeName" -Value { 1 }',
+        # Adversary pass 2: a leading separator after the drive, and a rename or move whose NEW name is the evaluated command.
+        "${function:\\Join-Path} = { 'C:\\fixture\\Dirty.psm1' }",
+        "Rename-Item -LiteralPath function:Redirect -NewName Join-Path",
+        "Rename-Item -LiteralPath alias:RedirectAlias -NewName:Split-Path",
+        "Move-Item function:Redirect New-Object",
+        # r4 (adversary r3 A1 = Dot B2): a constant wrapped in parentheses, a sub-expression, a cast or a concatenation is still
+        # a constant, and a source or new name written that way is the same rename.
+        "Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path')",
+        "Rename-Item -LiteralPath ('function:Redirect') -NewName Split-Path",
+        "Rename-Item -LiteralPath function:Redirect -NewName:$('Split-Path')",
+        "Move-Item function:Redirect (('New-' + 'Object'))",
+        "Rename-Item -LiteralPath function:Redirect -NewName ([string]'Join-Path')",
+        "Copy-Item -LiteralPath function:Redirect -Destination ('function:Join-Path')",
+        # r4 adversary pass 1 (A2): a single-element array expression is the constant it holds.
+        "Rename-Item -LiteralPath ([string]@('function:Redirect')) -NewName ([string]@('Join-Path'))",
+        # r5 (Dot B5): a route built from constants ends in a protected name the plain-string check never sees; the tail is read
+        # after the route is stripped, and an empty or wildcard tail fails closed.
+        "Copy-Item function:Redirect ('fun'+'ction:Join-Path')",
+        "Copy-Item function:Redirect ('function:' + 'Split-Path')",
+        "Copy-Item -LiteralPath function:Redirect -Destination ('function:' + '*')",
+        "Copy-Item function:Redirect ('function:' + '')",
+        # r5 (Dot B6 = r4 adversary A1): './', '.\' and doubled separators after the drive name the same command, as does a scope
+        # qualifier among them.
+        "Set-Item -LiteralPath function:./Join-Path -Value { param($p, $c) 'C:\\fixture\\Dirty.psm1' }",
+        "Set-Item -LiteralPath function:.\\Join-Path -Value { param($p, $c) 'C:\\fixture\\Dirty.psm1' }",
+        "Set-Item -LiteralPath function:\\\\Join-Path -Value { param($p, $c) 'C:\\fixture\\Dirty.psm1' }",
+        "Set-Item -LiteralPath function:.\\local:Split-Path -Value { 'C:\\fixture' }",
+        "Set-Item -Path alias:./New-Object -Value Redirect",
+        "${function:./Join-Path} = { 'C:\\fixture\\Dirty.psm1' }",
+        # r5 adversary pass 1 (A1): a braced function: / alias: variable with a wildcard or empty tail names a command the scan cannot
+        # read, so it fails closed like the string form does (the tail is a wildcard against the extractor's own name).
+        "${function:Get-AttrCudaEmbeddedFunctionSourc?} = { param($Name, $ModulePath) 'function F { }' }",
+        "${function:Join-Pa*} = { 'C:\\fixture\\Dirty.psm1' }",
+        "${alias:./Split-Pat[h]} = 'Redirect'",
+        "${function:} = { 1 }",
+        # r5 adversary pass 2 (A1): '..' segments resolve to the same provider item, and a separator left inside the tail is a path
+        # the scan cannot read as one name.
+        "Set-Item -LiteralPath function:../Join-Path -Value { 'C:\\fixture\\Dirty.psm1' }",
+        "Set-Item -LiteralPath alias:../Join-Path -Value Redirect",
+        "${function:../Join-Path} = { 'C:\\fixture\\Dirty.psm1' }",
+        "Set-Item -LiteralPath function:Redirect/../Split-Path -Value { 'C:\\fixture' }",
+    )
+    # r4: a rename or move that touches the function: / alias: drive, or names an evaluated command, with an operand the scan cannot
+    # reduce to a constant, could be installing a shadow: it fails closed, in a kind of its own.
+    RENAME_COMPUTED = (
+        "Rename-Item -LiteralPath function:Redirect -NewName ($renameBase + '-Path')",
+        "Move-Item function:Redirect $moveTarget",
+        "Rename-Item -LiteralPath $renameSource -NewName 'Join-Path'",
+        # r4 adversary pass 1 (A2): an operand built ONLY from literals is decided by the source text, not at run time, so one the scan
+        # cannot reduce fails closed on its own, whether or not a route or an evaluated name sits beside it.
+        "Rename-Item -LiteralPath ('function:Redirect') -NewName (('Join', 'Path') -join '-')",
+        "Move-Item function:Redirect ('{0}-Path' -f 'Join')",
+        "Rename-Item -LiteralPath (('function', 'Redirect') -join ':') -NewName (('Join', 'Path') -join '-')",
+        # r6 (Dot B9): a cast over a comma list is ONE string at run time (joined by $OFS), so it is never split into the elements the
+        # scan would read as harmless constants; the whole operand is built only from literals the scan cannot reduce.
+        "Copy-Item -LiteralPath function:Redirect -Destination ([string]@('fun','ction:Join-Path'))",
+        "Rename-Item -LiteralPath function:Redirect -NewName ([string]@('Join','-Path'))",
+        "Move-Item function:Redirect ([string]('a','b'))",
+        # Elements that no scope-qualified-name reading flags on its own ('function:Join', '-Path'): only the whole cast operand is a finding.
+        "Copy-Item -LiteralPath function:Redirect -Destination ([string]@('function:Join','-Path'))",
+        # r7 (adversary r6 A1): the same cast over a comma list on an item command (Set-Item, New-Item) that writes the drive directly.
+        "Set-Item -LiteralPath ([string]@('function:Join','-Path')) -Value { 'C:\\fixture\\Dirty.psm1' }",
+        "New-Item -Path ([string]('alias:Split','-Path')) -Value Redirect",
+        # r7 (adversary r6 A4): $true / $false are 'True' / 'False' after a string and are an error before one, never ''.
+        "Rename-Item -LiteralPath function:Redirect -NewName ($true + 'Join-Path')",
+        "Rename-Item -LiteralPath function:Redirect -NewName (1 + 2)",
+        # r7 (adversary r6 A3): a comma list inside a comma list is one joined string (OFS), so it is never split into harmless fragments.
+        "Set-Item -Path (('function:Jo','in-Path'),'function:Harmless') -Value { 'C:\\fixture\\Dirty.psm1' }",
+    )
+    # Not shadows: the alias is for a command the scan does not evaluate, and a read of an unrelated function.
+    ALIAS_CONTROLS = (
+        "Set-Alias -Name:Get-Item -Value:Get-Date",
+        "New-Alias -Name:'Get-Thing' -Value Get-Date",
+        "Get-Item -Path function:Get-Date",
+        "Rename-Item -LiteralPath function:Redirect -NewName Other-Name",
+        "Rename-Item -LiteralPath function:Redirect -NewName ('Other-Name')",
+        "Move-Item -LiteralPath $someFile -Destination $someFolder -Force",
+        "Move-Item -LiteralPath 'C:\\a.txt', 'C:\\b.txt' -Destination 'C:\\dir' -Force:$true",
+        # r6 (Dot B9): a plain comma list (no cast) is still split into its elements and is not over-refused.
+        "Copy-Item function:Redirect 'a','b'",
+        # r7 (adversary r6 A4): $false / $true read as 'False' / 'True', so these name 'Join-PathFalse' / 'Join-PathTrue', not Join-Path.
+        "Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path' + $false)",
+        "Copy-Item function:Redirect ('function:Join-Pat' + $true + 'h')",
+        # r7: a literal hashtable value on an item command is not a name.
+        "Set-Item -Path variable:harmless -Value @{ a = 1 }",
+    )
+    ALIAS_PREAMBLE = ("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
+                      + "".join(f"{line}\n" for line in ALIAS_SHADOWS + ALIAS_COMPUTED + PROVIDER_ROUTES + RENAME_COMPUTED + ALIAS_CONTROLS))
+    # The template is held to the same rule; only the colon-form lines (the ones the old scan missed) go in it.
+    # Advisory A4 (same class): a mutator's positional source path after -vb must not be read as that switch's value.
+    ALIAS_TEMPLATE = ("Set-Alias -Name:Join-Path -Value:Redirect\nNew-Alias -N:'New-Object' -Value:Redirect\nSet-Alias -Name:$templateName -Value:Redirect\n"
+                      "Set-Alias -Name:Get-Item -Value:Get-Date\nExpand-Archive -DestinationPath $Work -vb 'C:\\archive.zip'\n"
+                      "Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path')\nMove-Item function:Redirect $moveTarget\n")
+
+    @classmethod
+    def _scan(cls, label: str, modules: list, on_list: list, calls: list, *, extra_files=(), template_extra: str = "", raw_modules=None,
+              generator_preamble: str = "") -> dict:
+        directory = cls.tmp / label
+        directory.mkdir()
+        for file_name, text in (raw_modules or {}).items():
+            (directory / file_name).write_text(text, encoding="utf-8")
+        # extra_files are written but NOT given to the scan (-ModulePath): the files the job would read and the scan does not.
+        for file_name, functions in list(modules) + list(extra_files):
+            target = directory / file_name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in functions), encoding="utf-8")
+        generator = directory / "fixture-gen.ps1"
+        template = cls.TEMPLATE.replace("__EMBEDDED_FUNCTIONS__", template_extra + "__EMBEDDED_FUNCTIONS__")
+        generator.write_text(generator_preamble + "".join(f"$e = {call}\n" for call in calls) + "$template = @'\n" + template + "'@\n", encoding="utf-8")
+        return run_scan(generators=[generator], modules=[directory / m for m in on_list], splice_sources=[generator])
+
+    @staticmethod
+    def of(result: dict, function: str) -> list[dict]:
+        return [f for f in result["splicedViolations"] if f["function"] == function]
+
+    @staticmethod
+    def call_findings(result: dict, needle: str) -> list[dict]:
+        """Findings about a call as a whole (no function name), picked by the call text they carry."""
+        return [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and needle in f["text"]]
+
+    @staticmethod
+    def modules_of(result: dict, name: str) -> list[str]:
+        return sorted(s["module"].rsplit("/", 1)[-1] for s in result["spliced"] if s["name"] == name)
+
+    @staticmethod
+    def unlisted(findings: list[dict]) -> list[tuple[str, str]]:
+        """What the real policy (in_scope + the reviewed allowlist) leaves of body findings, as (rule, token)."""
+        return [(f["rule"], f["token"]) for f in apply_allowlist(in_scope([x for x in findings if x["rule"] != "splice"]))[0]]
+
+    # ---- L1: property and index assignments in a spliced body ----
+
+    def test_l1_a_property_set_on_an_object_a_command_returned_stays_a_finding(self) -> None:
+        found = self.of(self.l1, "L1Foreign")
+        self.assertEqual(self.unlisted(found), [("R5", "$item.Attributes")], describe(found))
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["other"])
+
+    def test_l1_a_property_set_on_a_parameter_stays_a_finding(self) -> None:
+        self.assertEqual(self.unlisted(self.of(self.l1, "L1Param")), [("R5", "$Target.IsReadOnly")])
+
+    def test_l1_a_variable_that_is_sometimes_a_foreign_object_stays_a_finding(self) -> None:
+        found = self.of(self.l1, "L1Mixed")
+        self.assertEqual(self.unlisted(found), [("R5", "$r.Attributes")], describe(found))
+
+    def test_l1_a_property_set_on_a_constructed_file_object_stays_a_finding(self) -> None:
+        found = self.of(self.l1, "L1FileInfo")
+        self.assertIn(("R5", "$fi.IsReadOnly"), self.unlisted(found), describe(found))
+
+    def test_l1_a_nested_property_chain_stays_a_finding(self) -> None:
+        self.assertEqual(self.unlisted(self.of(self.l1, "L1Nested")), [("R5", "$r.inner.Attributes")])
+
+    def test_l1_a_property_set_on_a_root_variable_stays_a_finding(self) -> None:
+        self.assertEqual(self.unlisted(self.of(self.l1, "L1Root")), [("R5", "$Pub.Attributes")])
+
+    def test_l1_property_sets_on_freshly_built_in_memory_objects_are_not_findings(self) -> None:
+        found = self.of(self.l1, "L1Fresh")
+        r5 = [f for f in found if f["rule"] == "R5"]
+        self.assertEqual(sorted(f["origin"] for f in r5),
+                         ["constructed:System.Diagnostics.ProcessStartInfo", "literal", "literal"], describe(r5))
+        self.assertEqual([k for k in self.unlisted(found) if k[0] == "R5"], [])
+
+    def test_l1_index_assignments_to_a_root_variable_are_findings_and_to_a_local_are_not(self) -> None:
+        # Pinned, not new behaviour: the index half of R5 already worked; this keeps it from regressing.
+        self.assertEqual([(f["rule"], f["token"]) for f in self.of(self.l1, "L1IndexRoot")], [("R5", "$Pub['k']")])
+        self.assertEqual([f for f in self.of(self.l1, "L1IndexLocal") if f["rule"] == "R5"], [])
+
+    def test_l1_a_variable_bound_by_foreach_out_variable_a_multi_target_assignment_ref_or_a_parameter_is_not_fresh(self) -> None:
+        for name in ("L1Foreach", "L1OutVariable", "L1MultiTarget", "L1Ref", "L1ParamAlso", "L1DataStatement", "L1TrapConstruct"):
+            found = self.of(self.l1, name)
+            self.assertIn(("R5", "$r.Attributes"), self.unlisted(found), f"{name}\n" + describe(found))
+
+    def test_l1_automatic_variables_scope_qualified_binders_conversions_and_unordered_assignments_are_not_fresh(self) -> None:
+        for name in ("L1AutoUnderscore", "L1AutoPSItem", "L1ScopedForeach", "L1ScopedPipeVar", "L1NestedAssign", "L1LateAssign",
+                     "L1ConditionalAssign", "L1SetterInNestedFunction"):
+            found = self.of(self.l1, name)
+            self.assertTrue([k for k in self.unlisted(found) if k[0] == "R5"], f"{name} was judged fresh\n" + describe(found))
+        for name in ("L1CastRhs", "L1CastLhs"):
+            found = self.of(self.l1, name)
+            self.assertIn(("R5", "$r.MaximumKilobytes"), self.unlisted(found), f"{name}\n" + describe(found))
+
+    def test_r4_a3_a_typed_parameter_named_with_a_scope_qualifier_is_the_same_variable_so_the_receiver_is_not_fresh(self) -> None:
+        # Adversary r3 A3 / Dot B4: `param([EventLog]$local:r)` binds $r; the hashtable assigned later is converted to an EventLog.
+        for name in ("L1TypedLocal", "L1TypedScript", "L1TypedPrivate", "L1TypedGlobal"):
+            found = self.of(self.l1, name)
+            self.assertIn(("R5", "$r.MaximumKilobytes"), self.unlisted(found), f"{name} was judged a literal\n" + describe(found))
+            self.assertIn("unbound", [o for f in found if f["rule"] == "R5" for o in f["origin"].split(";")], f"{name}\n" + describe(found))
+        found = self.of(self.l1, "L1TypedOther")
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+
+    def test_l1_an_assignment_that_comes_first_in_an_enclosing_block_still_makes_a_receiver_fresh(self) -> None:
+        found = self.of(self.l1, "L1FreshNested")
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+        self.assertEqual([k for k in self.unlisted(found) if k[0] == "R5"], [])
+
+    def test_l1_a_scoped_assignment_a_trap_a_deferred_block_or_a_shadowed_constructor_does_not_make_a_receiver_fresh(self) -> None:
+        for name in ("L1ScopedAssign", "L1TrapSetter", "L1DeferredBlock"):
+            found = self.of(self.l1, name)
+            self.assertIn(("R5", "$r.Attributes"), self.unlisted(found), f"{name} was judged fresh\n" + describe(found))
+        found = self.of(self.l1, "L1ShadowNew")
+        self.assertTrue([f for f in found if "shadow" in f["reason"]], "a local New-Object was trusted\n" + describe(found))
+        self.assertIn(("R1", "function New-Object"), self.unlisted(found), describe(found))
+
+    def test_l1_a_script_block_handed_to_a_command_still_runs_in_line_so_a_fresh_receiver_stays_fresh(self) -> None:
+        found = self.of(self.l1, "L1InlineBlock")
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+        self.assertEqual([k for k in self.unlisted(found) if k[0] == "R5"], [])
+
+    def test_l1_a_template_function_named_like_join_path_is_a_finding(self) -> None:
+        shadows = [v for v in self.l1["violations"] if "shadow" in v["reason"] and "Join-Path" in v["text"]]
+        self.assertEqual(len(shadows), 1, json.dumps(self.l1["violations"], indent=2))
+
+    def test_l2_a_positional_module_path_after_a_common_parameter_alias_is_a_finding(self) -> None:
+        for name, flag in (("PosVb", "-vb"), ("PosDb", "-db")):
+            self.assertEqual(len(self.call_findings(self.shadow, f"'{name}' {flag}")), 1, describe(self.shadow["splicedViolations"]))
+            self.assertEqual(self.modules_of(self.shadow, name), [], f"{flag}: the clean default module was scanned in place of the path")
+
+    def test_l2_a_splice_source_that_defines_join_path_split_path_or_an_alias_of_a_command_the_scan_evaluates_is_a_finding(self) -> None:
+        shadows = [f for f in self.shadow["splicedViolations"] if f["rule"] == "splice" and "shadow" in f["reason"]]
+        texts = " | ".join(f["text"] for f in shadows)
+        for needle in ("Join-Path", "Split-Path", "New-Object"):
+            self.assertIn(needle, texts, f"no shadow finding names {needle}\n" + describe(self.shadow["splicedViolations"]))
+        self.assertNotIn("Get-Item", texts, "Get-Item is not a command the scan evaluates")
+
+    def alias_findings(self) -> list[dict]:
+        return [f for f in self.alias["splicedViolations"] if f["rule"] == "splice" and "shadow" in f["reason"]]
+
+    def alias_texts(self) -> list[str]:
+        return [f["text"] for f in self.alias_findings()]
+
+    def test_b1_a_colon_form_prefixed_quoted_scoped_or_reordered_alias_of_an_evaluated_command_is_a_finding(self) -> None:
+        texts = self.alias_texts()
+        for line in self.ALIAS_SHADOWS:
+            self.assertIn(line, texts, f"no shadow finding for `{line}`\n" + describe(self.alias["splicedViolations"]))
+
+    def test_b1_the_dot_counterexample_end_to_end_is_a_finding_while_the_call_still_resolves_to_the_clean_module(self) -> None:
+        # Runtime would read Dirty.psm1 (the alias redirects Join-Path); the scan evaluates Join-Path by its stock behaviour
+        # and reads Clean.psm1. The shadow finding is what stops that divergence from passing.
+        self.assertIn("Set-Alias -Name:Join-Path -Value:Redirect", self.alias_texts(), describe(self.alias["splicedViolations"]))
+        # r10 (sol r9, catalogue S-06): this generator also holds aliases the scan cannot resolve (`Set-Alias @aliasSplat`, a rename of
+        # the undefined alias:RedirectAlias), which may run Set-Variable, so the call is now an unproven binding as well: no module is
+        # scanned, where before r10 the clean one was. Tightened, not widened: the shadow finding above still holds.
+        self.assert_unproven_by_an_alias("'DotF'")
+        self.assertEqual(self.modules_of(self.alias, "DotF"), [])
+
+    def assert_unproven_by_an_alias(self, needle: str) -> None:
+        found = self.call_findings(self.alias, needle)
+        self.assertEqual([f["token"] for f in found], ["unproven-binding"], describe(self.alias["splicedViolations"]))
+        self.assertIn("an alias the scan cannot resolve", found[0]["reason"])
+
+    def test_b1_an_alias_whose_name_is_not_a_string_constant_is_a_finding_of_its_own_kind(self) -> None:
+        by_text = {f["text"]: f for f in self.alias_findings()}
+        for line in self.ALIAS_COMPUTED:
+            self.assertIn(line, by_text, f"no finding for the computed alias name in `{line}`\n" + describe(self.alias["splicedViolations"]))
+            self.assertIn("not a string constant", by_text[line]["reason"], line)
+
+    def test_b1_a_function_or_alias_drive_route_to_an_evaluated_command_is_a_finding(self) -> None:
+        texts = self.alias_texts()
+        for line in self.PROVIDER_ROUTES:
+            self.assertIn(line, texts, f"no shadow finding for `{line}`\n" + describe(self.alias["splicedViolations"]))
+
+    def test_b1_an_alias_of_a_command_the_scan_does_not_evaluate_and_a_read_of_an_unrelated_function_are_not_findings(self) -> None:
+        texts = " | ".join(self.alias_texts())
+        for line in self.ALIAS_CONTROLS:
+            self.assertNotIn(line, texts, f"`{line}` is not a shadow\n" + describe(self.alias["splicedViolations"]))
+
+    def test_r4_a1_a_parenthesized_rename_operand_still_ends_in_a_shadow_finding_while_the_call_resolves_to_the_clean_module(self) -> None:
+        # Adversary r3 A1 / Dot B2, end to end: runtime Join-Path returns Dirty.psm1 after the rename; the scan binds Clean.psm1.
+        self.assertIn("Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path')", self.alias_texts(), describe(self.alias["splicedViolations"]))
+        # r10: unproven too, for the same unresolvable aliases as DotF (tightened: no module is scanned, the shadow finding still holds).
+        self.assert_unproven_by_an_alias("'RenF'")
+        self.assertEqual(self.modules_of(self.alias, "RenF"), [])
+
+    def test_r4_a1_a_rename_or_move_with_an_operand_the_scan_cannot_reduce_to_a_constant_fails_closed(self) -> None:
+        by_text = {f["text"]: f for f in self.alias_findings()}
+        for line in self.RENAME_COMPUTED:
+            with self.subTest(line=line):
+                self.assertIn(line, by_text, f"no finding for the computed rename operand in `{line}`\n" + describe(self.alias["splicedViolations"]))
+                self.assertIn("not a string constant", by_text[line]["reason"], line)
+
+    def test_r4_a1_the_template_is_held_to_the_same_rename_rule(self) -> None:
+        shadows = {v["text"] for v in self.alias["violations"] if "shadow" in v["reason"] or "not a string constant" in v["reason"]}
+        for line in ("Rename-Item -LiteralPath function:Redirect -NewName ('Join-Path')", "Move-Item function:Redirect $moveTarget"):
+            self.assertIn(line, shadows, f"template line `{line}` was not flagged\n" + json.dumps(self.alias["violations"], indent=2))
+
+    def test_b1_the_template_is_held_to_the_same_rule(self) -> None:
+        shadows = {v["text"]: v for v in self.alias["violations"] if "shadow" in v["reason"]}
+        for line in ("Set-Alias -Name:Join-Path -Value:Redirect", "New-Alias -N:'New-Object' -Value:Redirect", "Set-Alias -Name:$templateName -Value:Redirect"):
+            self.assertIn(line, shadows, f"template line `{line}` was not flagged\n" + json.dumps(self.alias["violations"], indent=2))
+        self.assertNotIn("Set-Alias -Name:Get-Item -Value:Get-Date", shadows)
+
+    def test_b1_a_module_qualified_extractor_and_a_drive_or_root_relative_literal_module_path_are_findings(self) -> None:
+        for needle, reason in (("Dirty\\Get-AttrCudaEmbeddedFunctionSource", "module-qualified"),
+                               ("'DriveF' -ModulePath 'C:Clean.psm1'", "relative"),
+                               ("'RootF' -ModulePath '\\Clean.psm1'", "relative")):
+            found = self.call_findings(self.alias, needle)
+            self.assertEqual(len(found), 1, f"{needle}\n" + describe(self.alias["splicedViolations"]))
+            self.assertIn(reason, found[0]["reason"], needle)
+        for name in ("QualF", "DriveF", "RootF"):
+            self.assertEqual(self.modules_of(self.alias, name), [], f"{name}: a module was scanned in place of the one the call reads")
+
+    def test_b1_a_mutators_positional_path_after_the_common_switch_alias_vb_is_a_finding(self) -> None:
+        texts = [v["text"] for v in self.alias["violations"]]
+        self.assertTrue([t for t in texts if t.startswith("Expand-Archive") and "-vb" in t], json.dumps(self.alias["violations"], indent=2))
+
+    def test_l1_template_parameters_named_by_alias_or_abbreviation_are_still_judged(self) -> None:
+        # Advisory A8, same class as A3: -RSO / -RSE are aliases of Start-Process -RedirectStandardOutput / -Error, -N: abbreviates -Name.
+        texts = " | ".join(v["text"] for v in self.l1["violations"])
+        for needle in ("-RSO", "-RSE", "-N:"):
+            self.assertIn(needle, texts, f"the template line using {needle} was not flagged\n" + json.dumps(self.l1["violations"], indent=2))
+
+    def test_l1_every_reviewed_property_set_row_names_a_plain_local_receiver(self) -> None:
+        for (function, rule, token) in ALLOWLIST:
+            if rule == "R5":
+                self.assertRegex(token, LOCAL_PROPERTY_SET, f"{function}: an R5 row must name a plain local receiver")
+
+    # ---- L2: a splice call site is bound to the module its extractor call reads ----
+
+    def test_l2_a_literal_module_path_binds_the_call_to_that_module_not_to_a_same_named_helper_elsewhere(self) -> None:
+        self.assertEqual(self.modules_of(self.l2, "LitClean"), ["Clean.psm1"])
+        self.assertEqual(self.of(self.l2, "LitClean"), [], describe(self.of(self.l2, "LitClean")))
+
+    def test_l2_a_literal_module_path_to_the_dirty_module_reports_its_body_only(self) -> None:
+        self.assertEqual(self.modules_of(self.l2, "LitDirty"), ["Dirty.psm1"])
+        self.assertEqual([(f["rule"], f["token"]) for f in self.of(self.l2, "LitDirty")], [("R2", "New-Item")])
+
+    def test_l2_a_module_path_off_the_scanners_module_list_is_a_finding_even_if_another_module_defines_the_name(self) -> None:
+        # OffList is defined (clean) in Clean.psm1, which IS on the list; the call reads Off.psm1, which is not.
+        self.assertEqual(len(self.call_findings(self.l2, "'OffList'")), 1, describe(self.l2["splicedViolations"]))
+        self.assertEqual(self.modules_of(self.l2, "OffList"), [], "the scan must not read Clean.psm1's body in place of Off.psm1's")
+
+    def test_l2_a_helper_defined_only_off_the_module_list_is_a_finding_not_a_silent_pass(self) -> None:
+        self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2, "OffOnly")], [("splice", "OffOnly")])
+        self.assertEqual(len(self.call_findings(self.l2, "Off.psm1') -Name @('OffOnly')")), 1)
+        self.assertEqual(self.modules_of(self.l2, "OffOnly"), [])
+
+    def test_l2_a_name_two_candidate_modules_define_and_the_call_does_not_bind_is_ambiguous(self) -> None:
+        for name in ("Ambig", "AmbigDyn"):
+            self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2, name)], [("splice", name)], describe(self.of(self.l2, name)))
+            self.assertEqual(self.modules_of(self.l2, name), [])
+
+    def test_l2_a_dynamic_module_path_resolves_a_name_only_one_module_defines(self) -> None:
+        self.assertEqual(self.modules_of(self.l2, "OnlyHere"), ["Only.psm1"])
+        self.assertEqual(self.of(self.l2, "OnlyHere"), [])
+
+    def test_l2_a_positional_module_path_or_a_splat_is_a_finding_because_the_binding_is_unknown(self) -> None:
+        self.assertEqual(len(self.call_findings(self.l2, "@('Spl') (Join-Path")), 1, describe(self.l2["splicedViolations"]))
+        self.assertEqual(len(self.call_findings(self.l2, "-Name @('Spl') @extra")), 1)
+        self.assertEqual(self.modules_of(self.l2, "Spl"), [])
+
+    def test_l2_a_same_named_module_file_outside_the_scanned_set_is_not_matched_by_its_base_name(self) -> None:
+        self.assertEqual(self.modules_of(self.l2, "Collide"), [], "outside\\Clean.psm1 was matched to the listed l2\\Clean.psm1")
+        self.assertEqual(len(self.call_findings(self.l2, "'Collide'")), 1, describe(self.l2["splicedViolations"]))
+        self.assertEqual(self.modules_of(self.l2, "CollideSub"), [])
+        self.assertEqual(len(self.call_findings(self.l2, "'CollideSub'")), 1)
+
+    def test_l2_a_module_path_expression_that_merely_contains_a_path_is_not_a_literal_path(self) -> None:
+        self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2, "IdxAmbig")], [("splice", "IdxAmbig")], describe(self.of(self.l2, "IdxAmbig")))
+        self.assertEqual(self.modules_of(self.l2, "IdxAmbig"), [])
+
+    def test_l2_a_name_list_that_is_an_expression_is_a_finding_not_a_scan_of_different_names(self) -> None:
+        self.assertEqual(len(self.call_findings(self.l2, "('Nm' + 'Nm')")), 1, describe(self.l2["splicedViolations"]))
+        self.assertEqual(self.modules_of(self.l2, "Nm"), [])
+        self.assertEqual(self.modules_of(self.l2, "NmNm"), [])
+
+    def test_r7_a5_a_redirected_module_path_is_not_the_path_it_names(self) -> None:
+        for name in ("RedirA", "RedirB"):
+            self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2, name)], [("splice", name)], describe(self.of(self.l2, name)))
+            self.assertEqual(self.modules_of(self.l2, name), [], name)
+
+    def test_r7_a4_a_comma_list_inside_the_name_list_is_not_a_literal_list_of_names(self) -> None:
+        found = self.call_findings(self.l2, "(('Nes','ted'),'Safe')")
+        self.assertEqual(len(found), 1, describe(self.l2["splicedViolations"]))
+        self.assertIn("not a literal list of function names", found[0]["reason"])
+
+    def test_l2_an_abbreviated_parameter_name_binds_like_the_full_one(self) -> None:
+        # PowerShell binds -M to -ModulePath and -N to -Name, by prefix against the extractor's parameter set AT RUN TIME. r9 (hub
+        # ruling, rule 3): the scan does not prove that set, so an abbreviation is an unproven binding (fails closed), never a scan of
+        # the module the prefix merely looks like. Before r9, -M was read as -ModulePath and Dirty.psm1's body was scanned.
+        for name, needle in (("AbbrevM", "-M (Join-Path"), ("NameAbbrev", "-N @('NameAbbrev')")):
+            found = self.call_findings(self.l2_default, needle)
+            self.assertEqual([f["token"] for f in found], ["unproven-binding"], describe(self.l2_default["splicedViolations"]))
+            self.assertEqual(self.modules_of(self.l2_default, name), [], f"{name}: a module was scanned for an unproven binding")
+
+    def test_l2_an_empty_blank_or_null_module_path_is_the_default_module(self) -> None:
+        found = self.of(self.l2_default, "EmptyOnly")
+        self.assertEqual([(f["rule"], f["function"]) for f in found], [("splice", "EmptyOnly")] * 4, describe(found))  # '', ' ', $null, $NULL
+        self.assertEqual(self.modules_of(self.l2_default, "EmptyOnly"), [])
+
+    def test_l2_variable_and_command_names_in_a_module_path_are_case_insensitive(self) -> None:
+        self.assertEqual(self.modules_of(self.l2_default, "CaseRoot"), ["Dirty.psm1"], json.dumps(self.l2_default["spliced"], indent=2))
+
+    def test_l2_a_comment_that_mentions_the_extractor_does_not_make_a_second_default_module(self) -> None:
+        # Notes.psm1 holds the extractor's definition inside a block comment only; DefHelper still resolves to Extractor.psm1.
+        self.assertEqual(self.modules_of(self.l2_default, "DefHelper"), ["Extractor.psm1"])
+        self.assertEqual([f for f in self.l2_default["splicedViolations"] if f["rule"] == "splice" and "default module is ambiguous" in f["reason"]], [])
+
+    def test_l2_without_a_module_path_the_call_reads_the_extractors_own_module(self) -> None:
+        self.assertEqual(self.modules_of(self.l2_default, "DefHelper"), ["Extractor.psm1"])
+        self.assertEqual(self.of(self.l2_default, "DefHelper"), [], describe(self.of(self.l2_default, "DefHelper")))
+
+    def test_l2_without_a_module_path_a_name_the_extractors_module_lacks_is_a_finding(self) -> None:
+        # At run time the extractor throws for a name its own module does not define; the scan must not find it elsewhere.
+        self.assertEqual([(f["rule"], f["function"]) for f in self.of(self.l2_default, "DirtyOnly")], [("splice", "DirtyOnly")])
+        self.assertEqual(self.modules_of(self.l2_default, "DirtyOnly"), [])
+
+
+@requires_pwsh
+class SplicedBodyScanPsScriptRootTests(unittest.TestCase):
+    """r4 (adversary r3 A2 = Dot B3): `Join-Path $PSScriptRoot '<child>'` is read as the generator's own directory, which holds only
+    while `$PSScriptRoot` is the automatic value. A generator that rebinds it (any assignment, scope qualifier, parameter, loop
+    variable, [ref], -OutVariable, Set-Variable / New-Variable, the variable: drive) makes runtime read another directory's module.
+
+    One scan covers every variant: each lives in its own generator file with its own function name, and the scan takes them all as
+    splice sources.
+    """
+
+    CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n"
+    REBINDS = {
+        "PsrAssign": "$PSScriptRoot = 'C:\\dirty'\n",
+        "PsrScoped": "$script:PSScriptRoot = 'C:\\dirty'\n",
+        "PsrGlobal": "$global:PSScriptRoot = 'C:\\dirty'\n",
+        "PsrTyped": "[string]$PSScriptRoot = 'C:\\dirty'\n",
+        "PsrCompound": "$PSScriptRoot += 'x'\n",
+        "PsrMulti": "$a, $PSScriptRoot = 'C:\\x', 'C:\\dirty'\n",
+        "PsrForeach": "foreach ($PSScriptRoot in @('C:\\dirty')) { }\n",
+        "PsrRef": "$null = [int]::TryParse('1', [ref]$PSScriptRoot)\n",
+        "PsrOutVar": "Get-Date -OutVariable PSScriptRoot | Out-Null\n",
+        "PsrSetVariable": "Set-Variable -Name PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrNewVariable": "New-Variable PSScriptRoot 'C:\\dirty' -Force\n",
+        "PsrSv": "sv PSScriptRoot 'C:\\dirty' -Scope Script\n",
+        "PsrDrive": "Set-Item -Path variable:PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrBraced": "${variable:PSScriptRoot} = 'C:\\dirty'\n",
+        # r4 adversary pass 1 (A1): the variable: drive takes a scope qualifier of its own after the drive name.
+        "PsrDriveLocal": "Set-Item -LiteralPath variable:local:PSScriptRoot 'C:\\dirty'\n",
+        "PsrDriveScript": "Set-Item -Path 'variable:\\script:PSScriptRoot' -Value 'C:\\dirty'\n",
+        "PsrBracedGlobal": "${variable:global:PSScriptRoot} = 'C:\\dirty'\n",
+        "PsrProviderQualified": "Set-Item -LiteralPath Microsoft.PowerShell.Core\\Variable::PSScriptRoot 'C:\\dirty'\n",
+        "PsrParam": "function Rebind { param($PSScriptRoot) }\n",
+        "PsrComputed": "Set-Variable -Name $someName -Value 'C:\\dirty'\n",
+        # r5 (Dot B7 = r4 adversary A2): './', '.\' and doubled separators, with or without a scope qualifier, name the same variable.
+        "PsrDriveDotSlash": "Set-Item -LiteralPath variable:./PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrDriveDotBack": "Set-Item -LiteralPath variable:.\\PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrDriveDoubledLocal": "Set-Item -LiteralPath variable:\\\\local:PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrDriveDotLocal": "Set-Item -LiteralPath variable:local:./PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrBracedDot": "${variable:./PSScriptRoot} = 'C:\\dirty'\n",
+        # A route built from constants has no string node of its own.
+        "PsrDriveReduced": "Set-Item -LiteralPath ('vari'+'able:PSScriptRoot') -Value 'C:\\dirty'\n",
+        # r5 (Dot B8 = r4 adversary A3): a data section assigns its result to the named variable.
+        "PsrDataStatement": "data PSScriptRoot { 'C:\\dirty' }\n",
+        "PsrDriveParent": "Set-Item -LiteralPath variable:../PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrDriveInnerParent": "Set-Item -LiteralPath variable:x/../PSScriptRoot -Value 'C:\\dirty'\n",
+        "PsrBracedParent": "${variable:../PSScriptRoot} = 'C:\\dirty'\n",
+        "PsrDataStatementCommand":"data PSScriptRoot -SupportedCommand Get-Item { Get-Item -LiteralPath 'C:\\dirty' }\n",
+        # r7 (Dot B10 = r6 adversary A2): an assignment target wrapped in more than one type conversion, or in a validation attribute, is
+        # still an assignment to the variable; every wrapper is stripped, not just the outermost.
+        "PsrDoubleTyped": "[object][string]$PSScriptRoot = 'C:\\dirty'\n",
+        "PsrDoubleTypedScoped": "[object][string]$script:PSScriptRoot = 'C:\\dirty'\n",
+        "PsrDoubleTypedGlobal": "[object][string]$global:PSScriptRoot = 'C:\\dirty'\n",
+        "PsrTripleTyped": "[object][psobject][string]$PSScriptRoot = 'C:\\dirty'\n",
+        "PsrAttributed": "[ValidateNotNull()][string]$PSScriptRoot = 'C:\\dirty'\n",
+        "PsrAttributedTwice": "[ValidateNotNull()][ValidateNotNullOrEmpty()][object][string]$script:PSScriptRoot = 'C:\\dirty'\n",
+        "PsrDoubleTypedCompound": "[object][string]$PSScriptRoot += 'x'\n",
+        # r7 (adversary r6 A1): a cast over a comma list is one string at run time (joined by $OFS); on an item command it is never split.
+        "PsrDriveCastList": "Set-Item -LiteralPath ([string]@('variable:PSScript','Root')) -Value 'C:\\dirty'\n",
+        "PsrDriveCastListNew": "New-Item -Path ([string]('variable:PSScript','Root')) -Value 'C:\\dirty' -Force\n",
+        # r7 (adversary r6 A3): a comma list INSIDE a comma list binds as one string (joined by $OFS), so it is not split into fragments.
+        "PsrDriveNestedList": "$OFS = ''\nSet-Item -Path (('variable:PSScript','Root'),'variable:other') -Value 'C:\\dirty'\n",
+        # r7 (adversary r6 A1): `set` is an alias of Set-Variable.
+        "PsrSetAlias": "set PSScriptRoot 'C:\\dirty'\n",
+        "PsrSetAliasNamed": "set -Name PSScriptRoot -Value 'C:\\dirty'\n",
+        # r7 (adversary r6 A2): a cmdlet's own variable parameter binds the variable like -OutVariable does.
+        "PsrTeeVariable": "'C:\\dirty' | Tee-Object -Variable PSScriptRoot | Out-Null\n",
+        "PsrTeeVar": "'C:\\dirty' | Tee-Object -Var PSScriptRoot | Out-Null\n",
+        "PsrSessionVariable": "Invoke-WebRequest -Uri 'http://example.invalid' -SessionVariable PSScriptRoot | Out-Null\n",
+    }
+    CONTROLS = {
+        # No rebinding: the call still binds to Clean.psm1 by full path.
+        "PsrPlain": "$other = 'C:\\x'\nSet-Variable -Name Unrelated -Value 1\nGet-Date -OutVariable unrelated | Out-Null\n",
+        # r7: a wrapped target that is some OTHER variable, and a cast list on an item command that names no variable, are not rebindings.
+        "PsrTeeOther": "'x' | Tee-Object -Variable keep | Out-Null\nset other 1\n",
+        "PsrWrappedOther":"[object][string]$other = 'C:\\x'\n[ValidateNotNull()][string]$script:unrelated = 'y'\nSet-Item -Path variable:harmless -Value 5\n",
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-psroot-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.dir = _long_path(Path(cls._tmp.name))
+        names = list(cls.REBINDS) + list(cls.CONTROLS)
+        (cls.dir / "Clean.psm1").write_text("".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names), encoding="utf-8")
+        sources = []
+        for name, line in {**cls.REBINDS, **cls.CONTROLS}.items():
+            generator = cls.dir / f"gen-{name}.ps1"
+            generator.write_text(line + "$e = " + cls.CALL.format(name=name), encoding="utf-8")
+            sources.append(generator)
+        # r5 (Dot B8): a data section also binds a destination variable and $Work, which the template proofs read as assignments.
+        cls.template = cls.dir / "template-data.ps1"
+        cls.template.write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$d = Join-Path $Work 'ok'\ndata d { 'C:\\outside' }\n"
+                                "New-Item -ItemType Directory -Path $d -Force | Out-Null\n"
+                                "data Work { 'C:\\outside' }\n", encoding="utf-8")
+        cls.result = run_scan(templates=[cls.template], modules=[cls.dir / "Clean.psm1"], splice_sources=sources)
+
+    def test_r5_b8_a_data_section_binding_a_destination_variable_or_work_is_a_finding(self) -> None:
+        found = [(v["rule"], v["reason"]) for v in self.result["violations"] if v["source"] == str(self.template)]
+        self.assertTrue([r for rule, r in found if rule == "R2" and "destination is not provably under" in r], f"{found}")
+        self.assertTrue([r for rule, r in found if rule == "R5" and "data statement" in r], f"{found}")
+
+    def findings_for(self, name: str) -> list[dict]:
+        return [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and f"'{name}'" in f["text"]]
+
+    def test_r4_a2_a_rebound_psscriptroot_makes_the_module_binding_a_finding_not_a_scan_of_the_generators_directory(self) -> None:
+        for name in self.REBINDS:
+            found = self.findings_for(name)
+            self.assertEqual(len(found), 1, f"{name}\n" + describe(self.result["splicedViolations"]))
+            self.assertIn("PSScriptRoot", found[0]["reason"], name)
+            self.assertEqual([s for s in self.result["spliced"] if s["name"] == name], [], f"{name}: Clean.psm1 was scanned in place of the module runtime reads")
+
+    def test_r4_a2_an_unrebound_psscriptroot_still_binds_to_the_generators_directory(self) -> None:
+        for name in self.CONTROLS:
+            self.assertEqual(self.findings_for(name), [], describe(self.result["splicedViolations"]))
+            self.assertEqual([s["module"].rsplit("/", 1)[-1] for s in self.result["spliced"] if s["name"] == name], ["Clean.psm1"])
+
+
+@requires_pwsh
+@unittest.skipUnless(os.name == "nt", "the ATTR-3 host jobs and their helpers are Windows-only")
+class SplicedBodyScanUnprovenBindingTests(unittest.TestCase):
+    """r9 (hub ruling; opus r8 B1/B2, sol r8 L2): the UNPROVEN-BINDING class rule. Eight rounds each closed one construct that changes
+    WHICH module or object a name binds to at run time, and the next key found another. The rule is the class: a route the scan
+    cannot evaluate statically makes the binding unproven, and the scan reports that (token 'unproven-binding') instead of reading
+    the module or object it would merely assume.
+
+    One scan covers every case: each generator case lives in its own file (a $PSDefaultParameterValues reference is per file), each
+    body case is its own function. Extractor.psm1 (clean, defines the extractor) is what an unchanged reading binds; Dirty.psm1 is what
+    runtime reads.
+    """
+
+    RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
+    PSR_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"
+    DEF_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}'"
+    # name -> (preamble, call). {dirty} is Dirty.psm1's full path, {dir} the fixture directory.
+    CALLS = {
+        # sol r8, verbatim shapes: a literal default redirects the extractor (named, positional, wildcard) or Join-Path.
+        "SolNamed": ("$PSDefaultParameterValues = @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        "SolPositional": ("$PSDefaultParameterValues = @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", "Get-AttrCudaEmbeddedFunctionSource '{name}'"),
+        "SolWildcard": ("$PSDefaultParameterValues = @{{ '*:ModulePath' = '{dirty}' }}", DEF_CALL),
+        "SolJoinPath": ("$PSDefaultParameterValues = @{{ 'Join-Path:AdditionalChildPath' = '..\\Dirty.psm1' }}",
+                        "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Extractor.psm1')"),
+        # rule 1: every form that reads or changes $PSDefaultParameterValues.
+        "DpvIndex": ("$PSDefaultParameterValues['Get-AttrCudaEmbeddedFunctionSource:ModulePath'] = '{dirty}'", DEF_CALL),
+        "DpvAdd": ("$PSDefaultParameterValues.Add('Get-AttrCudaEmbeddedFunctionSource:ModulePath', '{dirty}')", DEF_CALL),
+        "DpvGlobal": ("$global:PSDefaultParameterValues = @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        "DpvAliasRef": ("$d = $PSDefaultParameterValues\n$d['Get-AttrCudaEmbeddedFunctionSource:ModulePath'] = '{dirty}'", DEF_CALL),
+        "DpvMember": ("$script:PSDefaultParameterValues.'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}'", DEF_CALL),
+        "DpvSetVar": ("Set-Variable -Name PSDefaultParameterValues -Value @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        "DpvBraced": ("${{variable:PSDefaultParameterValues}} = @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        "DpvGetVarWild": ("(Get-Variable PSDefault*).Value['Get-AttrCudaEmbeddedFunctionSource:ModulePath'] = '{dirty}'", DEF_CALL),
+        "DpvPsVariable": ("$ExecutionContext.SessionState.PSVariable.Set('PSDefaultParameterValues', @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }})", DEF_CALL),
+        "DpvReduced": ("Set-Variable -Name ('PSDefault' + 'ParameterValues') -Value @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        # opus r8 B2, verbatim shapes: a prefix unique for THAT command rebinds $PSScriptRoot (Tee-Object -Va, Invoke-WebRequest -Ses).
+        "OpusTeeVa": ("'{dir}' | Tee-Object -Va PSScriptRoot | Out-Null", PSR_CALL),
+        "OpusSes": ("Invoke-WebRequest -Uri 'http://example.invalid' -Ses PSScriptRoot", PSR_CALL),
+        # rule 2 on the extractor input $PSScriptRoot: the variable object, the session-state API, a computed name after a short prefix.
+        "PsrGetVar": ("(Get-Variable PSScriptRoot).Value = '{dir}\\sub'", PSR_CALL),
+        "PsrPsVariable": ("$ExecutionContext.SessionState.PSVariable.Set('PSScriptRoot', '{dir}\\sub')", PSR_CALL),
+        "PsrTeeVaComp": ("'{dir}\\sub' | Tee-Object -Va $someName | Out-Null", PSR_CALL),
+        # rule 3: an abbreviated extractor parameter, and a splat.
+        "AbbrevMod": ("", "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -Mod (Join-Path $PSScriptRoot 'Clean.psm1')"),
+        "AbbrevNa": ("", "Get-AttrCudaEmbeddedFunctionSource -Na '{name}'"),
+        "SplatBound": ("", "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' @PSBoundParameters"),
+        # r9 adversary A1: a rename, move or copy on the variable: drive makes its NEW name a variable.
+        "AdvRenameVar": ("New-Variable -Name sourceRoute -Value '{dir}\\sub'\nRename-Item variable:sourceRoute PSScriptRoot -Force", PSR_CALL),
+        "AdvRenamePipe": ("Get-Item variable:sourceRoute | Rename-Item -NewName PSScriptRoot", PSR_CALL),
+        "AdvMoveComputed": ("Move-Item variable:sourceRoute $newName", PSR_CALL),
+        # r9 adversary pass 2 (A3): $PSCmdlet.GetVariableValue reaches the defaults dictionary by a name built from fragments.
+        "AdvGetVarValue": ("[CmdletBinding()]param()\n$PSCmdlet.GetVariableValue(('PSDefault' + 'ParameterValues'))['Get-AttrCudaEmbeddedFunctionSource:ModulePath'] = '{dirty}'", DEF_CALL),
+    }
+    # r9 adversary pass 2 (A1): a collection inside the -Name list binds as ONE string joined by $OFS ('Danger'), not as its elements.
+    NAME_LIST_CALLS = {
+        "AdvNestedNames": ("$OFS = ''", "Get-AttrCudaEmbeddedFunctionSource -Name @(@('Dan'; 'ger'), '{name}') -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"),
+    }
+    # r9 adversary pass 2 (A2): pipeline input to a rename is a source the scan cannot read; the new name is an evaluated command.
+    SHADOW_CALLS = {
+        "AdvPipeRename": ("function Redirect {{ param($Path, $ChildPath) '{dirty}' }}\nGet-Item function:Redirect | Rename-Item -NewName Join-Path", PSR_CALL),
+    }
+    # Not unproven: an unrelated variable parameter, the default module, an exact common-parameter alias.
+    CALL_CONTROLS = {
+        "CtlPlain": ("$other = @{{ a = 1 }}\n'x' | Tee-Object -Variable keep | Out-Null", PSR_CALL, "Clean.psm1"),
+        "CtlDefault": ("", DEF_CALL, "Extractor.psm1"),
+        "CtlAlias": ("", "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -vb -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')", "Clean.psm1"),
+        # A file copy that names no variable and touches no variable: route.
+        "CtlCopyFile": ("Copy-Item 'C:\\fixture\\a.txt' 'C:\\fixture\\b.txt'", PSR_CALL, "Clean.psm1"),
+    }
+    # opus r8 B1 and rule 2 on an R5 receiver: a binder the origin model did not follow left the receiver 'literal'.
+    BODIES = {
+        "B1SetVariable": "    param([string]$Target)\n    $r = @{}\n    Set-Variable -Name r -Value (Get-Item -LiteralPath $Target)\n    $r.Attributes = 'Hidden'",
+        "B1NewItemVar": "    param([string]$Target)\n    $r = @{}\n    New-Item -Path variable:r -Value (Get-Item $Target) -Force\n    $r.Attributes = 1",
+        "B1Sv": "    param([string]$Target)\n    $r = @{}\n    sv r (Get-Item -LiteralPath $Target)\n    $r.Attributes = 'Hidden'",
+        "B1Set": "    param([string]$Target)\n    $r = @{}\n    set r (Get-Item -LiteralPath $Target)\n    $r.Attributes = 'Hidden'",
+        "B1NewVariable": "    param([string]$Target)\n    $r = @{}\n    New-Variable -Name r -Value (Get-Item -LiteralPath $Target) -Force\n    $r.Attributes = 'Hidden'",
+        "B1PsVarSet": "    param([string]$Target)\n    $r = @{}\n    $ExecutionContext.SessionState.PSVariable.Set('r', (Get-Item $Target))\n    $r.Attributes = 1",
+        "B1GetVarValue": "    param([string]$Target)\n    $r = @{}\n    (Get-Variable r).Value = Get-Item -LiteralPath $Target\n    $r.Attributes = 1",
+        "B1SetItemVar": "    param([string]$Target)\n    $r = @{}\n    Set-Item -Path variable:r -Value (Get-Item $Target)\n    $r.Attributes = 1",
+        "B1Computed": "    param([string]$Target, [string]$n)\n    $r = @{}\n    Set-Variable -Name $n -Value (Get-Item $Target)\n    $r.Attributes = 1",
+        "B1RemoveVar": "    $r = @{}\n    Remove-Variable -Name r\n    $r.Attributes = 1",
+        "B1TeeVa": "    param([string]$Target)\n    $r = @{}\n    Get-Item $Target | Tee-Object -Va r | Out-Null\n    $r.Attributes = 1",
+        "B1RenameVar": "    $r = @{}\n    Rename-Item variable:other r\n    $r.Attributes = 1",
+    }
+    BODY_CONTROLS = {
+        "B1CtlOther": "    $r = @{}\n    Set-Variable -Name other -Value 1\n    $r.a = 1",
+    }
+    # r9 adversary A2: an attribute on the assignment target (an ArgumentTransformationAttribute declared in the body) replaces the value.
+    ATTRIBUTED_BODIES = {
+        "A2Borrow": ("    class Borrow : System.Management.Automation.ArgumentTransformationAttribute {\n"
+                     "        [object] Transform([System.Management.Automation.EngineIntrinsics]$e, [object]$d) {\n"
+                     "            return (Get-Item -LiteralPath 'C:\\outside\\target.txt')\n"
+                     "        }\n"
+                     "    }\n"
+                     "    [Borrow()]$r = @{}\n"
+                     "    $r.Attributes = 1"),
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-unproven-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        d = _long_path(Path(cls._tmp.name))
+        dirty = d / "Dirty.psm1"
+        names = list(cls.CALLS) + list(cls.CALL_CONTROLS) + list(cls.NAME_LIST_CALLS) + list(cls.SHADOW_CALLS) + ["Dan", "ger", "Danger"]
+        clean ="".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names)
+        (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n" + clean, encoding="utf-8")
+        (d / "Clean.psm1").write_text(clean, encoding="utf-8")
+        dirty.write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
+        (d / "sub").mkdir()
+        (d / "sub" / "Clean.psm1").write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
+        sources = []
+        cases = {n: (pre, call) for n, (pre, call) in cls.CALLS.items()}
+        cases.update({n: (pre, call) for n, (pre, call, _) in cls.CALL_CONTROLS.items()})
+        cases.update(cls.NAME_LIST_CALLS)
+        cases.update(cls.SHADOW_CALLS)
+        for name, (pre, call) in cases.items():
+            generator = d / f"gen-{name}.ps1"
+            preamble = pre.format(dirty=dirty, dir=d)
+            generator.write_text((preamble + "\n" if preamble else "") + "$e = " + call.format(name=name) + "\n", encoding="utf-8")
+            sources.append(generator)
+        bodies = {**cls.BODIES, **cls.BODY_CONTROLS, **cls.ATTRIBUTED_BODIES}
+        (d / "Body.psm1").write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in bodies.items()), encoding="utf-8")
+        body_gen = d / "gen-body.ps1"
+        body_gen.write_text("$e = Get-AttrCudaEmbeddedFunctionSource -Name @(" + ", ".join(f"'{n}'" for n in bodies)
+                            + ") -ModulePath (Join-Path $PSScriptRoot 'Body.psm1')\n", encoding="utf-8")
+        sources.append(body_gen)
+        # A module the generator imports runs its top-level code in the generator's session; a template is held to rule 1 too
+        # ('New-Item:Name' hands New-Item the -Name R2 forbids).
+        (d / "Imported.psm1").write_text("$global:PSDefaultParameterValues['Get-AttrCudaEmbeddedFunctionSource:ModulePath'] = 'C:\\fixture\\Dirty.psm1'\n"
+                                         "function ImportedHelper {\n    Get-Date\n}\n", encoding="utf-8")
+        cls.template = d / "template-defaults.ps1"
+        cls.template.write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$PSDefaultParameterValues['New-Item:Name'] = '..\\..\\escape'\n"
+                                "New-Item -ItemType Directory -Path $Work -Force | Out-Null\n", encoding="utf-8")
+        # r9 adversary A3 (advisory): a foreach variable replaces the value an assignment proved, for $Work as for a destination.
+        cls.foreach_templates = [d / "template-foreach-work.ps1", d / "template-foreach-dest.ps1", d / "template-param-shadow.ps1"]
+        # r9 adversary pass 2 (A4): a nested function's parameter shadows the outer destination inside the function that writes it.
+        cls.foreach_templates[2].write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$d = Join-Path $Work 'ok'\n"
+                                            "function Mutate { param([string]$d) New-Item -ItemType Directory -Path $d -Force }\n"
+                                            "Mutate 'C:\\outside'\n", encoding="utf-8")
+        cls.foreach_templates[0].write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n"
+                                            "foreach ($Work in @('C:\\outside')) { New-Item -ItemType Directory -Path $Work -Force }\n", encoding="utf-8")
+        cls.foreach_templates[1].write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$dest = Join-Path $Work 'ok'\n"
+                                            "foreach ($dest in @('C:\\outside')) { New-Item -ItemType Directory -Path $dest -Force }\n", encoding="utf-8")
+        modules = [d / "Extractor.psm1", d / "Clean.psm1", dirty, d / "Body.psm1", d / "Imported.psm1"]
+        cls.result = run_scan(templates=[cls.template, *cls.foreach_templates], modules=modules, splice_sources=sources)
+
+    def call_findings(self, name: str) -> list[dict]:
+        return [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and f"'{name}'" in f["text"]]
+
+    def bound(self, name: str) -> list[str]:
+        return sorted(s["module"].rsplit("/", 1)[-1] for s in self.result["spliced"] if s["name"] == name)
+
+    def test_r9_a_binding_redirect_on_an_extractor_call_is_an_unproven_binding_not_a_scan_of_the_assumed_module(self) -> None:
+        for name in self.CALLS:
+            with self.subTest(name=name):
+                found = self.call_findings(name)
+                self.assertEqual([f["token"] for f in found], ["unproven-binding"], f"{name}\n" + describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [], f"{name}: a module was scanned in place of the one runtime reads")
+
+    def test_r9_a_call_with_no_redirect_still_binds_its_module(self) -> None:
+        for name, (_, _, module) in self.CALL_CONTROLS.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.call_findings(name), [], describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [module])
+
+    def test_r9_a_receiver_bound_by_a_route_the_origin_cannot_follow_is_an_unproven_binding_and_stays_a_finding(self) -> None:
+        for name in self.BODIES:
+            with self.subTest(name=name):
+                found = [f for f in self.result["splicedViolations"] if f["function"] == name]
+                self.assertTrue([f for f in found if f["rule"] == "unproven-binding" and f["token"] == "unproven-binding"], describe(found))
+                setters = [f for f in found if f["rule"] == "R5" and f["token"] == "$r.Attributes"]
+                self.assertEqual(len(setters), 1, describe(found))
+                self.assertIn("unproven-binding", setters[0]["origin"].split(";"), describe(setters))
+                self.assertIn(("R5", "$r.Attributes"), SplicedBodyScanCoverageLimitTests.unlisted(found), f"{name}: the policy dropped the setter")
+
+    def test_r9_a_receiver_no_route_reaches_stays_a_fresh_literal(self) -> None:
+        found = [f for f in self.result["splicedViolations"] if f["function"] == "B1CtlOther"]
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+        self.assertEqual([f for f in found if f["rule"] == "unproven-binding"], [], describe(found))
+
+    def test_r9_an_imported_module_or_a_template_that_refers_to_psdefaultparametervalues_is_an_unproven_binding(self) -> None:
+        module = [f for f in self.result["splicedViolations"] if f["token"] == "unproven-binding" and f["source"].endswith("Imported.psm1")]
+        self.assertEqual(len(module), 1, describe(self.result["splicedViolations"]))
+        template = [v for v in self.result["violations"] if v["source"] == str(self.template) and v["rule"] == "unproven-binding"]
+        self.assertEqual(len(template), 1, json.dumps(self.result["violations"], indent=2))
+
+    def test_r9_a2_an_attribute_on_the_assignment_target_makes_the_receiver_not_a_literal(self) -> None:
+        for name in self.ATTRIBUTED_BODIES:
+            found = [f for f in self.result["splicedViolations"] if f["function"] == name]
+            setters = [f for f in found if f["rule"] == "R5" and f["token"] == "$r.Attributes"]
+            self.assertEqual(len(setters), 1, describe(found))
+            self.assertIn("other", setters[0]["origin"].split(";"), describe(setters))
+            self.assertIn(("R5", "$r.Attributes"), SplicedBodyScanCoverageLimitTests.unlisted(found), f"{name}: the policy dropped the setter")
+
+    def test_r9_pass2_a1_a_collection_inside_the_name_list_is_not_a_literal_list_of_names(self) -> None:
+        for name in self.NAME_LIST_CALLS:
+            found = self.call_findings(name)
+            self.assertEqual(len(found), 1, describe(self.result["splicedViolations"]))
+            self.assertIn("not a literal list of function names", found[0]["reason"])
+            for scanned in ("Dan", "ger", name):
+                self.assertEqual(self.bound(scanned), [], f"{scanned} was scanned in place of the joined name runtime reads")
+
+    def test_r9_pass2_a2_a_rename_fed_by_the_pipeline_that_installs_an_evaluated_command_is_a_finding(self) -> None:
+        shadows = [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and "Rename-Item -NewName Join-Path" in f["text"]]
+        self.assertEqual(len(shadows), 1, describe(self.result["splicedViolations"]))
+        self.assertIn("not a string constant", shadows[0]["reason"])
+
+    def test_r9_a3_a_foreach_variable_that_replaces_work_or_a_destination_is_not_provable(self) -> None:
+        for template in self.foreach_templates:
+            found = [v for v in self.result["violations"] if v["source"] == str(template) and v["rule"] == "R2"]
+            self.assertTrue([v for v in found if "destination is not provably under" in v["reason"]], json.dumps(self.result["violations"], indent=2))
+
+
+@requires_pwsh
+@unittest.skipUnless(os.name == "nt", "the ATTR-3 host jobs and their helpers are Windows-only")
+class SplicedBodyScanSourceAliasTests(unittest.TestCase):
+    """r10 (sol r9 blocker; catalogue row S-06): an alias the scanned source defines itself (Set-Alias, New-Alias, the alias: drive,
+    a rename or copy on alias: / function:) is resolved, chains followed, before the binding model runs, so an alias of Set-Variable,
+    Get-Variable, Tee-Object, ... is judged exactly like the cmdlet. An alias the scan cannot resolve (a name or target that is not a
+    literal, a target no command answers to, Import-Alias, an alias: drive write it does not model) makes every binding it could reach
+    an unproven binding.
+
+    One scan covers every case, as in SplicedBodyScanUnprovenBindingTests: each generator case is its own file, each body its own function.
+    """
+
+    RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
+    PSR_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"
+    DEF_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}'"
+    # name -> (preamble, call): the alias is followed to its cmdlet, and the cmdlet's binding is a rebinding / defaults finding.
+    CALLS = {
+        # sol r9, verbatim repros 1-3.
+        "SolRebind": ("Set-Alias Rebind Set-Variable; Rebind -Name PSScriptRoot -Value 'C:\\dirty'", PSR_CALL),
+        "SolReadVar": ("Set-Alias ReadVar Get-Variable; (ReadVar PSScriptRoot).Value='C:\\dirty'", PSR_CALL),
+        "SolReadVarDefaults": ("Set-Alias ReadVar Get-Variable; (ReadVar -Name ('PSDef'+'aultParameter'+'Values')).Value"
+                               "['Get-AttrCudaEmbeddedFunctionSource:ModulePath']='C:\\dirty.psm1'", DEF_CALL),
+        # The class: every alias-defining command, the alias: drive, a chain, a qualified target and every variable cmdlet.
+        "AliasNewAlias": ("New-Alias Rebind Set-Variable\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasSalToSv": ("sal -Name Rebind -Value sv\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasNalNewVariable": ("nal Rebind New-Variable\nRebind PSScriptRoot 'C:\\dirty' -Force", PSR_CALL),
+        "AliasQualifiedTarget": ("Set-Alias Rebind Microsoft.PowerShell.Utility\\Set-Variable\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasChain": ("Set-Alias First Set-Variable\nSet-Alias -Value First -Name Second\nSecond PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasOfSetAlias": ("Set-Alias MakeAlias Set-Alias\nMakeAlias Rebind Set-Variable\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasClearVariable": ("Set-Alias Wipe Clear-Variable\nWipe PSScriptRoot", PSR_CALL),
+        "AliasRemoveVariable": ("Set-Alias Drop Remove-Variable\nDrop -Name PSScriptRoot", PSR_CALL),
+        "AliasTeeVa": ("Set-Alias T Tee-Object\n'C:\\dirty' | T -Va PSScriptRoot | Out-Null", PSR_CALL),
+        "AliasRenameItemVarDrive": ("Set-Alias Ren2 Rename-Item\nRen2 variable:sourceRoute PSScriptRoot", PSR_CALL),
+        "AliasDriveNewItem": ("New-Item -Path alias:Rebind -Value Set-Variable | Out-Null\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveNewItemName": ("New-Item -Path alias: -Name Rebind -Value Set-Variable | Out-Null\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveSetItem": ("Set-Item alias:Rebind Set-Variable\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveReduced": ("Set-Item -Path ('ali' + 'as:Rebind') -Value Set-Variable\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveBraced": ("${{alias:Rebind}} = 'Set-Variable'\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveRename": ("Rename-Item alias:sv Rebind\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "AliasDriveCopy": ("Copy-Item alias:gv alias:ReadVar\n(ReadVar PSScriptRoot).Value = 'C:\\dirty'", PSR_CALL),
+        "AliasDefaultsSetVar": ("Set-Alias Rebind Set-Variable\nRebind PSDefaultParameterValues @{{ 'Get-AttrCudaEmbeddedFunctionSource:ModulePath' = '{dirty}' }}", DEF_CALL),
+        # A computed alias NAME with a literal target: any command could be that alias, so each one is also read as the target.
+        "AliasComputedName": ("Set-Alias $aliasName Set-Variable\nGet-Thing PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        # A -ModulePath module's top-level code runs in the generator's session: its alias is the generator's alias.
+        "AliasFromModule": ("RebindFromModule PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        # r10 adversary pass 1. A1: an alias of Set-Alias one module defines defines the alias another module's top-level code uses.
+        "AdvCrossModuleChain": ("RebindChained PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        # A2: a constant after `&` names the command as surely as a bare word.
+        "AdvAmpParen": ("Set-Alias Rebind Set-Variable; & ('Rebind') PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        # A3: a quoted, backtick-escaped member name is the member it parses to.
+        "AdvQuotedMember": ("[CmdletBinding()]param()\n$PSCmdlet.\"GetVariab`leValue\"(('PSDef'+'aultPara'+'meterValues'))['*:ModulePath']='C:\\dirty\\Clean.psm1'", DEF_CALL),
+        # A4 (advisory, base defect, same class): an alias the source defines for the extractor itself is an extractor call.
+        "AdvExtractorAlias": ("Set-Alias Extract AttrCudaArtifacts\\Get-AttrCudaEmbeddedFunctionSource",
+                              "Extract -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"),
+    }
+    # Fail closed: an alias the scan cannot resolve makes every binding it could reach unproven.
+    UNRESOLVABLE = {
+        "UnresComputedTarget": ("Set-Alias Rebind $aliasTarget\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "UnresUnknownTarget": ("Set-Alias Rebind Not-ACommandAnywhere\nRebind PSScriptRoot 'C:\\dirty'", PSR_CALL),
+        "UnresSplat": ("Set-Alias @aliasArgs", PSR_CALL),
+        "UnresImportAlias": ("Import-Alias -Path 'C:\\fixture\\aliases.csv'", PSR_CALL),
+        "UnresPipeRename": ("Get-Item alias:sv | Rename-Item -NewName Rebind", PSR_CALL),
+        "UnresDriveContent": ("Set-Content -Path alias:Rebind -Value Set-Variable", PSR_CALL),
+        "UnresFunctionText": ("Set-Item function:Rebind -Value 'Set-Variable -Name PSScriptRoot -Value C:\\dirty -Scope Script'\nRebind", PSR_CALL),
+        "UnresDefaults": ("Set-Alias ReadVar $aliasTarget", DEF_CALL),
+    }
+    # Not unproven: an alias of a command that binds no variable, an alias binding another variable, a read of the alias: drive.
+    CALL_CONTROLS = {
+        "CtlAliasUnrelated": ("Set-Alias Stamp Get-Date\nStamp | Out-Null", PSR_CALL, "Clean.psm1"),
+        "CtlAliasOtherVariable": ("Set-Alias Rebind Set-Variable\nRebind -Name other -Value 1", PSR_CALL, "Clean.psm1"),
+        "CtlAliasDriveRead": ("$known = Test-Path alias:sv", PSR_CALL, "Clean.psm1"),
+        "CtlAliasOfFunction": ("function Helper {{ Get-Date }}\nSet-Alias H Helper\nH | Out-Null", PSR_CALL, "Clean.psm1"),
+        "CtlAliasDefault": ("Set-Alias Stamp Get-Date", DEF_CALL, "Extractor.psm1"),
+    }
+    # sol r9 repro 4, verbatim, and its siblings: a receiver the alias rebinds is not a fresh literal.
+    BODIES = {
+        "SolBodyRebind": "    param([string]$Target)\n    $r=@{}; Set-Alias Rebind Set-Variable; Rebind r (Get-Item $Target); $r.Attributes=1",
+        "BodyDriveAlias": "    param([string]$Target)\n    $r = @{}\n    New-Item -Path alias:Rebind -Value Set-Variable | Out-Null\n    Rebind r (Get-Item $Target)\n    $r.Attributes = 1",
+        "BodyGetVarAlias": "    param([string]$Target)\n    $r = @{}\n    Set-Alias ReadVar Get-Variable\n    (ReadVar r).Value = Get-Item $Target\n    $r.Attributes = 1",
+        "BodyUnresolvable": "    $r = @{}\n    Set-Alias Rebind $aliasTarget\n    $r.Attributes = 1",
+    }
+    BODY_CONTROLS = {
+        "BodyCtlAlias": "    $r = @{}\n    Set-Alias Stamp Get-Date\n    $r.a = 1",
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-alias-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        d = _long_path(Path(cls._tmp.name))
+        dirty = d / "Dirty.psm1"
+        names = list(cls.CALLS) + list(cls.UNRESOLVABLE) + list(cls.CALL_CONTROLS)
+        clean = "".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names)
+        (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n" + clean, encoding="utf-8")
+        (d / "Clean.psm1").write_text(clean, encoding="utf-8")
+        dirty.write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
+        # Top-level code of a module the generator imports: the alias it defines is visible to the generator.
+        (d / "Aliases.psm1").write_text("Set-Alias -Name RebindFromModule -Value Set-Variable -Scope Global\nfunction AliasesHelper {\n    Get-Date\n}\n", encoding="utf-8")
+        (d / "AliasesA.psm1").write_text("Set-Alias MakeAlias Set-Alias -Scope Global\n", encoding="utf-8")
+        (d / "AliasesB.psm1").write_text("MakeAlias RebindChained Set-Variable -Scope Global\n", encoding="utf-8")
+        sources = []
+        cases = {**cls.CALLS, **cls.UNRESOLVABLE}
+        cases.update({n: (pre, call) for n, (pre, call, _) in cls.CALL_CONTROLS.items()})
+        for name, (pre, call) in cases.items():
+            generator = d / f"gen-{name}.ps1"
+            preamble = pre.format(dirty=dirty, dir=d)
+            generator.write_text(preamble + "\n$e = " + call.format(name=name) + "\n", encoding="utf-8")
+            sources.append(generator)
+        bodies = {**cls.BODIES, **cls.BODY_CONTROLS}
+        (d / "Body.psm1").write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in bodies.items()), encoding="utf-8")
+        body_gen = d / "gen-body.ps1"
+        body_gen.write_text("$e = Get-AttrCudaEmbeddedFunctionSource -Name @(" + ", ".join(f"'{n}'" for n in bodies)
+                            + ") -ModulePath (Join-Path $PSScriptRoot 'Body.psm1')\n", encoding="utf-8")
+        sources.append(body_gen)
+        # A template destination an alias of Set-Variable rebinds is not provable; an alias of Set-Alias still installs a shadow.
+        cls.template = d / "template-alias-dest.ps1"
+        cls.template.write_text("$Work = Join-Path 'C:\\mlvtmp' $JobId\n$d = Join-Path $Work 'ok'\nSet-Alias Rebind Set-Variable\n"
+                                "Rebind d 'C:\\outside'\nNew-Item -ItemType Directory -Path $d -Force | Out-Null\n", encoding="utf-8")
+        cls.shadow_gen = d / "gen-shadow.ps1"
+        cls.shadow_gen.write_text("function Redirect { param($Path, $ChildPath) 'C:\\fixture\\Dirty.psm1' }\n"
+                                  "Set-Alias MakeAlias Set-Alias\nMakeAlias Join-Path Redirect\n", encoding="utf-8")
+        sources.append(cls.shadow_gen)
+        modules = [d / "Extractor.psm1", d / "Clean.psm1", dirty, d / "Body.psm1", d / "Aliases.psm1", d / "AliasesB.psm1", d / "AliasesA.psm1"]
+        cls.result = run_scan(templates=[cls.template], modules=modules, splice_sources=sources)
+
+    def call_findings(self, name: str) -> list[dict]:
+        return [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and f"'{name}'" in f["text"]]
+
+    def bound(self, name: str) -> list[str]:
+        return sorted(s["module"].rsplit("/", 1)[-1] for s in self.result["spliced"] if s["name"] == name)
+
+    def test_r10_a_literal_source_defined_alias_of_a_variable_cmdlet_is_followed_to_the_cmdlets_binding(self) -> None:
+        for name in self.CALLS:
+            with self.subTest(name=name):
+                found = self.call_findings(name)
+                self.assertEqual([f["token"] for f in found], ["unproven-binding"], f"{name}\n" + describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [], f"{name}: a module was scanned in place of the one runtime reads")
+
+    def test_r10_an_alias_the_scan_cannot_resolve_makes_every_binding_it_could_reach_unproven(self) -> None:
+        for name in self.UNRESOLVABLE:
+            with self.subTest(name=name):
+                found = self.call_findings(name)
+                self.assertEqual([f["token"] for f in found], ["unproven-binding"], f"{name}\n" + describe(self.result["splicedViolations"]))
+                self.assertIn("alias", found[0]["reason"], name)
+                self.assertEqual(self.bound(name), [], f"{name}: a module was scanned for an unproven binding")
+
+    def test_r10_an_alias_that_reaches_no_variable_binding_leaves_the_call_bound(self) -> None:
+        for name, (_, _, module) in self.CALL_CONTROLS.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.call_findings(name), [], describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [module])
+
+    def test_r10_a_receiver_an_alias_rebinds_is_an_unproven_binding_and_stays_a_finding(self) -> None:
+        for name in self.BODIES:
+            with self.subTest(name=name):
+                found = [f for f in self.result["splicedViolations"] if f["function"] == name]
+                self.assertTrue([f for f in found if f["rule"] == "unproven-binding" and f["token"] == "unproven-binding"], describe(found))
+                setters = [f for f in found if f["rule"] == "R5" and f["token"] == "$r.Attributes"]
+                self.assertEqual(len(setters), 1, describe(found))
+                self.assertIn("unproven-binding", setters[0]["origin"].split(";"), describe(setters))
+                self.assertIn(("R5", "$r.Attributes"), SplicedBodyScanCoverageLimitTests.unlisted(found), f"{name}: the policy dropped the setter")
+
+    def test_r10_a5_the_separate_unproven_binding_record_carries_no_origin(self) -> None:
+        # r10 adversary A5 (advisory): the header says origin is '' for every finding but an R5 property set.
+        for name in self.BODIES:
+            with self.subTest(name=name):
+                records = [f for f in self.result["splicedViolations"] if f["function"] == name and f["rule"] == "unproven-binding"]
+                self.assertTrue(records, describe(records))
+                self.assertEqual({f["origin"] for f in records}, {""}, describe(records))
+
+    def test_r10_a_receiver_an_unrelated_alias_does_not_reach_stays_a_fresh_literal(self) -> None:
+        found = [f for f in self.result["splicedViolations"] if f["function"] == "BodyCtlAlias"]
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+        self.assertEqual([f for f in found if f["rule"] == "unproven-binding"], [], describe(found))
+
+    def test_r10_a_template_destination_an_alias_rebinds_is_not_provable(self) -> None:
+        found = [v for v in self.result["violations"] if v["source"] == str(self.template) and v["rule"] == "R2"]
+        self.assertTrue([v for v in found if "destination is not provably under" in v["reason"]], json.dumps(self.result["violations"], indent=2))
+
+    def test_r10_an_alias_of_set_alias_that_installs_an_evaluated_command_is_a_shadow_finding(self) -> None:
+        shadows = [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and "shadow" in f["reason"] and "MakeAlias Join-Path" in f["text"]]
+        self.assertEqual(len(shadows), 1, describe(self.result["splicedViolations"]))
+
+
+@requires_pwsh
+@unittest.skipUnless(os.name == "nt", "the ATTR-3 host jobs and their helpers are Windows-only")
+class SplicedBodyScanConstantMemberTests(unittest.TestCase):
+    """r11 (Dot B11; r10 adversary A1): a member name built from literals (.('GetVariableValue'), .('Session'+'State'),
+    .$('Session'+'State')) is folded and judged as the literal name is, and a name built from literals that folds to
+    PSDefaultParameterValues is a defaults reference. A member name the scan cannot fold, on a receiver that may be the session
+    ($PSCmdlet, a copy of it, a type), makes every binding it could reach an unproven binding.
+
+    One scan covers every case, as in SplicedBodyScanUnprovenBindingTests: each generator case is its own file, each body its own function.
+    """
+
+    RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
+    PSR_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"
+    DEF_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}'"
+    B13_PRE = "Import-Module '{dir}\\Extractor.psm1'; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
+    B13_SET = "){{$c.Module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')}}"
+    B13_CTL = "$table = ConvertFrom-Json '{{\"venues\":{{\"a\":1}}}}'\n$venue = 'a'\n$entry = $table.venues.$venue\nforeach($c in @(Get-Command "
+    CALLS = {
+        # Dot B11, verbatim.
+        "DotB11": ("[CmdletBinding()]param()\n$PSCmdlet.('GetVariableValue')(('PS'+'Default'+'Parameter'+'Values'))"
+                   "['Get-AttrCudaEmbeddedFunctionSource:ModulePath']='C:\\fixture\\Dirty.psm1'", DEF_CALL),
+        # r10 adversary A1, generator sibling, verbatim.
+        "AdvA1Generator": ("[CmdletBinding()]param(); $PSCmdlet.('GetVariable'+'Value')(('PSDef'+'aultPara'+'meterValues'))['*:ModulePath']='C:\\fixture\\Dirty.psm1'", DEF_CALL),
+        # The class: a folded route on the extractor input, a sub-expression name, .InvokeCommand, an unfoldable name on the session.
+        "FoldedRoute": ("[CmdletBinding()]param()\n$PSCmdlet.('Session'+'State').('PS'+'Variable').Set('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
+        "SubexprName": ("[CmdletBinding()]param()\n$PSCmdlet.$('Session'+'State').PSVariable.Set('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
+        "InvokeCommand": ("[CmdletBinding()]param()\n$PSCmdlet.('Invoke'+'Command').InvokeScript('Set-Variable -Name PSScriptRoot -Value C:\\dirty -Scope Script')", PSR_CALL),
+        "VariableName": ("[CmdletBinding()]param()\n$m = 'Session' + 'State'\n$p = 'PSVar' + 'iable'\n$PSCmdlet.$m.$p.Set('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
+        "CopiedRoot": ("[CmdletBinding()]param()\n$c = $PSCmdlet\n$m = 'Session' + 'State'\n$p = 'PSVar' + 'iable'\n$c.$m.$p.Set('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
+        "TypeRoot": ("$m = 'Session' + 'StateProxy'\n[runspace]::DefaultRunspace.$m.SetVariable('PSScriptRoot', 'C:\\dirty')", PSR_CALL),
+        "PipelineRoot": ("[CmdletBinding()]param()\n$m = 'Session' + 'State'\n$p = 'PSVar' + 'iable'\n$PSCmdlet | ForEach-Object {{ $_.$m.$p.Set('PSScriptRoot', 'C:\\dirty') }}", PSR_CALL),
+        # r11 adversary A1, the PSScriptRoot form: the same chain of copies on the extractor input.
+        "AdvR11CopyChainRoot": ("[CmdletBinding()]param()\n$a=$PSCmdlet; $b=$a; $m='Session'+'State'; $p='PSVar'+'iable'; $b.$m.$p.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
+        # r11 adversary pass 2, the PSScriptRoot forms: a foreach variable, a function result, reflection by a string index.
+        "AdvR11ForeachRoot": ("[CmdletBinding()]param()\n$m='Session'+'State'; $p='PSVar'+'iable'\nforeach($s in @($PSCmdlet)){{$s.$m.$p.Set('PSScriptRoot','C:\\dirty')}}", PSR_CALL),
+        "AdvR11FunctionResult": ("[CmdletBinding()]param()\nfunction Get-SessionCopy {{ $PSCmdlet }}\n$s = Get-SessionCopy\n$m='Session'+'State'; $p='PSVar'+'iable'\n$s.$m.$p.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
+        "AdvR11ReflectionRoot": ("[CmdletBinding()]param()\n$PSCmdlet.PSObject.Properties['SessionState'].Value.PSObject.Properties['PSVariable'].Value.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
+        "AdvR11ReflectionFolded": ("$h = Get-Thing\n$h.PSObject.Properties['Session' + 'State'].Value.PSVariable.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
+        "DefaultsMember": ("$h = Get-Thing\n$h.('PSDefault' + 'ParameterValues')['*:ModulePath'] = '{dirty}'", DEF_CALL),
+        # r12 adversary A2, verbatim (the fixture directory stands for C:\fixture): a module object's session state, by computed names.
+        "AdvR12ModuleObject": ("Import-Module '{dir}\\Extractor.psm1'; $module=Get-Module Extractor; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
+                               "$module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')", DEF_CALL),
+        # Its siblings: the other engine commands whose result carries a module (and so its session state).
+        "AdvR12PassThru": ("$m = Import-Module '{dir}\\Extractor.psm1' -PassThru; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n"
+                           "$m.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')", DEF_CALL),
+        "AdvR12CommandInfo": ("$c = gcm Get-AttrCudaEmbeddedFunctionSource; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n"
+                              "$c.Module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')", DEF_CALL),
+        # r12 adversary pass 2 (A1), verbatim: a foreach variable carries the module object; and its pipeline sibling ($_).
+        "AdvR12ForeachModule": ("Import-Module '{dir}\\Extractor.psm1'; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
+                                "foreach($module in @(Get-Module Extractor)){{$module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')}}", DEF_CALL),
+        "AdvR12PipelineModule": ("Import-Module '{dir}\\Extractor.psm1'; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
+                                 "Get-Module Extractor | ForEach-Object {{ $_.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}') }}", DEF_CALL),
+        "AdvR12ModuleType": ("$m = [psmoduleinfo]$null; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n$m.$sn.$vn.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
+        # r12b (Dot B13), verbatim: the supplied Extractor.psm1 also exports `function python.exe`, so Get-Command python.exe
+        # -CommandType Function hands back its FunctionInfo, whose .Module reaches the extractor's session state.
+        "DotB13": ("Import-Module '{dir}\\Extractor.psm1'; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
+                   "foreach($c in @(Get-Command python.exe -CommandType Function)){{$c.Module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')}}", DEF_CALL),
+        # Its siblings: every type set that is not exactly Application, and a name the scan cannot fix.
+        "B13Alias": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType Alias)" + B13_SET, DEF_CALL),
+        "B13All": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType All)" + B13_SET, DEF_CALL),
+        "B13NoType": (B13_PRE + "foreach($c in @(Get-Command python.exe)" + B13_SET, DEF_CALL),
+        "B13NamedNoType": (B13_PRE + "foreach($c in @(Get-Command -Name python.exe -ErrorAction SilentlyContinue)" + B13_SET, DEF_CALL),
+        "B13TypeAlias": (B13_PRE + "foreach($c in @(Get-Command python.exe -Type Function)" + B13_SET, DEF_CALL),
+        "B13TypeList": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType Application, Function)" + B13_SET, DEF_CALL),
+        "B13TypeString": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType 'Application,Function')" + B13_SET, DEF_CALL),
+        "B13TypeVariable": (B13_PRE + "$t='Function'; foreach($c in @(Get-Command python.exe -CommandType $t)" + B13_SET, DEF_CALL),
+        "B13TypeColon": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType:Function)" + B13_SET, DEF_CALL),
+        "B13TypeTwice": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType Application -CommandType Function)" + B13_SET, DEF_CALL),
+        "B13FoldedName": (B13_PRE + "foreach($c in @(Get-Command ('python'+'.exe') -CommandType Function)" + B13_SET, DEF_CALL),
+        "B13VariableName": (B13_PRE + "$n='python.exe'; foreach($c in @(Get-Command $n -CommandType Application)" + B13_SET, DEF_CALL),
+        # r12c (Dot on 8bb454b1, sol r12b S-07): a Get-Command qualified by a module other than Microsoft.PowerShell.Core is not
+        # the builtin, so its Application-only arguments prove nothing (Rogue need not be a -ModulePath module).
+        "B13QualifiedRogue": (B13_PRE + "foreach($c in @(Rogue\\Get-Command python.exe -CommandType Application)" + B13_SET, DEF_CALL),
+        # r13: the r12b/r12c controls below were expected clean (a proven application-only selection). The exception is deleted
+        # (sol r12c S-08 and fable r12c's [Alias()] attribute both escaped its identity proof), so each now fails closed.
+        "CtlGcmApplication": (B13_CTL + "python.exe -CommandType Application)){{ $p = $c.Source }}", PSR_CALL),
+        "CtlGcmApplicationNamed": (B13_CTL + "-Name 'python.exe' -CommandType Application -ErrorAction SilentlyContinue)){{ $p = $c.Source }}", PSR_CALL),
+        "CtlGcmApplicationColon": (B13_CTL + "python.exe -CommandType:Application)){{ $p = $c.Source }}", PSR_CALL),
+        "CtlGcmApplicationCore": (B13_CTL.replace("@(Get-Command ", "@(Microsoft.PowerShell.Core\\Get-Command ")
+                                  + "python.exe -CommandType Application)){{ $p = $c.Source }}", PSR_CALL),
+    }
+    # Not unproven: a computed member of parsed data (the real playback-attr-3-cuda-job.ps1 shape), a folded name that is not a route.
+    CALL_CONTROLS = {
+        "CtlDataMember": ("$table = ConvertFrom-Json '{{\"venues\":{{\"a\":1}}}}'\n$venue = 'a'\n$entry = $table.venues.$venue", PSR_CALL, "Clean.psm1"),
+        "CtlFoldedOther": ("$o = @{{ a = 1 }}\n$v = $o.('a' + '')", PSR_CALL, "Clean.psm1"),
+        # The real playback-attr-3-cuda-job.ps1 template shape: a computed member of a pipeline item in a tree with no session root.
+        "CtlPipelineData": ("$rows = @(@{{ a_ms = 1 }})\n$name = 'a'\n$v = @($rows | ForEach-Object {{ [double]$_.$($name + '_ms') }})", PSR_CALL, "Clean.psm1"),
+    }
+    BODIES = {
+        # r10 adversary A1, receiver, verbatim.
+        "AdvA1Receiver": " [CmdletBinding()]param($Target)\n $r=@{}\n $PSCmdlet.('Session'+'State').('PS'+'Variable').Set('r',$Target)\n $r.Attributes=1",
+        "BodyUnfoldable": "    param($Target)\n    $r = @{}\n    $m = 'Session' + 'State'\n    $p = 'PSVar' + 'iable'\n    $PSCmdlet.$m.$p.Set('r', $Target)\n    $r.Attributes = 1",
+        # r11 adversary A1, verbatim body: the session root reaches the receiver through a chain of copies.
+        "AdvR11CopyChain": " [CmdletBinding()]param($Target); $r=@{}; $a=$PSCmdlet; $b=$a; $m='Session'+'State'; $p='PSVar'+'iable'; $b.$m.$p.Set('r',$Target); $r.Attributes=1",
+        # r11 adversary pass 2, verbatim bodies. A1: a foreach variable carries the session root; A2: reflection by a string index.
+        "AdvR11Foreach": " [CmdletBinding()]param($Target)\n $r=@{}\n $m='Session'+'State'; $p='PSVar'+'iable'\n foreach($s in @($PSCmdlet)){$s.$m.$p.Set('r',$Target)}\n $r.Attributes=1",
+        "AdvR11Reflection": " [CmdletBinding()]param($Target)\n $r=@{}\n $PSCmdlet.PSObject.Properties['SessionState'].Value.PSObject.Properties['PSVariable'].Value.Set('r',$Target)\n $r.Attributes=1",
+        "AdvR11MultiTarget": " [CmdletBinding()]param($Target)\n $r=@{}\n $m='Session'+'State'; $p='PSVar'+'iable'\n $s,$ignored=$PSCmdlet,0\n $s.$m.$p.Set('r',$Target)\n $r.Attributes=1",
+        # r12 adversary A2, the receiver form: a module object reaches the session that holds the receiver.
+        "AdvR12ForeachReceiver": " param($Target)\n $r=@{}\n $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n foreach($module in @(Get-Module Body)){$module.$sn.$vn.Set('r',$Target)}\n $r.Attributes=1",
+        "AdvR12ModuleReceiver": " param($Target)\n $r=@{}\n $module=Get-Module Body; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n $module.$sn.$vn.Set('r',$Target)\n $r.Attributes=1",
+    }
+    BODY_CONTROLS = {
+        "BodyCtlDataMember": "    $r = @{}\n    $k = 'a'\n    $r.a = $r.$k",
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-member-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        d = _long_path(Path(cls._tmp.name))
+        dirty = d / "Dirty.psm1"
+        names = list(cls.CALLS) + list(cls.CALL_CONTROLS)
+        clean = "".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names)
+        # r12b (Dot B13): the supplied extractor module also exports a function named like an executable.
+        (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n"
+                                          "function python.exe {\n    Get-Date\n}\n\n" + clean, encoding="utf-8")
+        (d / "Clean.psm1").write_text(clean, encoding="utf-8")
+        dirty.write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
+        sources = []
+        cases = dict(cls.CALLS)
+        cases.update({n: (pre, call) for n, (pre, call, _) in cls.CALL_CONTROLS.items()})
+        for name, (pre, call) in cases.items():
+            generator = d / f"gen-{name}.ps1"
+            generator.write_text(pre.format(dirty=dirty, dir=d) + "\n$e = " + call.format(name=name) + "\n", encoding="utf-8")
+            sources.append(generator)
+        bodies = {**cls.BODIES, **cls.BODY_CONTROLS}
+        (d / "Body.psm1").write_text("".join(f"function {n} {{\n{b}\n}}\n\n" for n, b in bodies.items()), encoding="utf-8")
+        body_gen = d / "gen-body.ps1"
+        body_gen.write_text("$e = Get-AttrCudaEmbeddedFunctionSource -Name @(" + ", ".join(f"'{n}'" for n in bodies)
+                            + ") -ModulePath (Join-Path $PSScriptRoot 'Body.psm1')\n", encoding="utf-8")
+        sources.append(body_gen)
+        modules = [d / "Extractor.psm1", d / "Clean.psm1", dirty, d / "Body.psm1"]
+        cls.result = run_scan(modules=modules, splice_sources=sources)
+
+    def call_findings(self, name: str) -> list[dict]:
+        return [f for f in self.result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and f"'{name}'" in f["text"]]
+
+    def bound(self, name: str) -> list[str]:
+        return sorted(s["module"].rsplit("/", 1)[-1] for s in self.result["spliced"] if s["name"] == name)
+
+    def test_r11_a_member_name_built_from_literals_or_unfoldable_on_the_session_is_an_unproven_binding(self) -> None:
+        for name in self.CALLS:
+            with self.subTest(name=name):
+                found = self.call_findings(name)
+                self.assertEqual([f["token"] for f in found], ["unproven-binding"], f"{name}\n" + describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [], f"{name}: a module was scanned in place of the one runtime reads")
+
+    def test_r11_a_computed_member_of_plain_data_leaves_the_call_bound(self) -> None:
+        for name, (_, _, module) in self.CALL_CONTROLS.items():
+            with self.subTest(name=name):
+                self.assertEqual(self.call_findings(name), [], describe(self.result["splicedViolations"]))
+                self.assertEqual(self.bound(name), [module])
+
+    def test_r11_a_receiver_a_folded_or_unfoldable_session_route_rebinds_is_an_unproven_binding(self) -> None:
+        for name in self.BODIES:
+            with self.subTest(name=name):
+                found = [f for f in self.result["splicedViolations"] if f["function"] == name]
+                self.assertTrue([f for f in found if f["rule"] == "unproven-binding" and f["token"] == "unproven-binding"], describe(found))
+                setters = [f for f in found if f["rule"] == "R5" and f["token"] == "$r.Attributes"]
+                self.assertEqual(len(setters), 1, describe(found))
+                self.assertIn("unproven-binding", setters[0]["origin"].split(";"), describe(setters))
+                self.assertIn(("R5", "$r.Attributes"), SplicedBodyScanCoverageLimitTests.unlisted(found), f"{name}: the policy dropped the setter")
+
+    def test_r11_a_receiver_with_a_computed_member_of_its_own_literal_stays_a_fresh_literal(self) -> None:
+        found = [f for f in self.result["splicedViolations"] if f["function"] == "BodyCtlDataMember"]
+        self.assertEqual([f["origin"] for f in found if f["rule"] == "R5"], ["literal"], describe(found))
+        self.assertEqual([f for f in found if f["rule"] == "unproven-binding"], [], describe(found))
+
+
+@requires_pwsh
+@unittest.skipUnless(os.name == "nt", "the ATTR-3 host jobs and their helpers are Windows-only")
+class SplicedBodyScanImportedAliasTests(unittest.TestCase):
+    """r11 (r10 adversary A2): an alias a -ModulePath module's top-level code defines for a command the scan evaluates (Join-Path,
+    the extractor itself) replaces that command in the importing source, so the call's binding is unproven. Each case is its own
+    scan: the alias is global, so it reaches every source in the scan. (An alias of a command the scan does not evaluate is the
+    AliasFromModule / CtlAlias* control in SplicedBodyScanSourceAliasTests.)
+    """
+
+    RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="attr3-imported-alias-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        d = _long_path(Path(cls._tmp.name))
+        (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n", encoding="utf-8")
+        (d / "Clean.psm1").write_text("function Probe {\n Get-Date\n}\n", encoding="utf-8")
+        (d / "Dirty.psm1").write_text("function Probe {\n" + cls.RAW_WRITE + "\n}\n", encoding="utf-8")
+        # r10 adversary A2, verbatim (Aliases.psm1 and gen.ps1; the fixture directory stands for C:\fixture).
+        (d / "Aliases.psm1").write_text(f"function Redirect {{\n param($Path,$ChildPath)\n '{d / 'Dirty.psm1'}'\n}}\n"
+                                        "Set-Alias Join-Path Redirect -Scope Global\nExport-ModuleMember -Function Redirect\n", encoding="utf-8")
+        (d / "gen.ps1").write_text(f"Import-Module '{d / 'Aliases.psm1'}'\n"
+                                   "Get-AttrCudaEmbeddedFunctionSource -Name 'Probe' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n", encoding="utf-8")
+        cls.join_path = run_scan(modules=[d / "Extractor.psm1", d / "Aliases.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen.ps1"])
+        # The A2 sibling: an imported alias replacing the extractor itself, on a call that names no -ModulePath.
+        (d / "ExtractorAlias.psm1").write_text("function Redirect2 {\n param($Name,$ModulePath)\n 'x'\n}\n"
+                                               "Set-Alias Get-AttrCudaEmbeddedFunctionSource Redirect2 -Scope Global\n", encoding="utf-8")
+        (d / "gen-default.ps1").write_text(f"Import-Module '{d / 'ExtractorAlias.psm1'}'\nGet-AttrCudaEmbeddedFunctionSource -Name 'Probe'\n", encoding="utf-8")
+        cls.extractor = run_scan(modules=[d / "Extractor.psm1", d / "ExtractorAlias.psm1", d / "Clean.psm1"], splice_sources=[d / "gen-default.ps1"])
+        # r11 adversary A2, verbatim modules: an alias one module defines reaches $PSDefaultParameterValues in another module.
+        (d / "A.psm1").write_text("Set-Alias Fetch Get-Variable -Scope Global\n", encoding="utf-8")
+        (d / "B.psm1").write_text(f"(Fetch P*Values -Scope Global).Value['*:ModulePath']='{d / 'Dirty.psm1'}'\n", encoding="utf-8")
+        (d / "gen-modules.ps1").write_text(f"Import-Module '{d / 'A.psm1'}'\nImport-Module '{d / 'B.psm1'}'\nGet-AttrCudaEmbeddedFunctionSource -Name 'Probe'\n", encoding="utf-8")
+        cls.module_defaults = run_scan(modules=[d / "Extractor.psm1", d / "A.psm1", d / "B.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-modules.ps1"])
+        # r11 adversary pass 2 (A3), verbatim: a -ModulePath module that defines (and exports) a function named Join-Path.
+        (d / "Redirect.psm1").write_text(f"function Join-Path {{ param($Path,$ChildPath) '{d / 'Dirty.psm1'}' }}; Export-ModuleMember -Function Join-Path\n", encoding="utf-8")
+        (d / "gen-function.ps1").write_text(f"Import-Module '{d / 'Redirect.psm1'}'; Get-AttrCudaEmbeddedFunctionSource -Name 'Probe' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n", encoding="utf-8")
+        cls.join_path_function = run_scan(modules=[d / "Extractor.psm1", d / "Redirect.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-function.ps1"])
+        # r12 adversary A1, verbatim: a -ModulePath module defines Join-Path through the function: drive from a script block.
+        (d / "DriveRedirect.psm1").write_text(f"Set-Item function:global:Join-Path -Value {{ param($Path,$ChildPath) '{d / 'Dirty.psm1'}' }}\n", encoding="utf-8")
+        (d / "gen-drive.ps1").write_text(f"Import-Module '{d / 'DriveRedirect.psm1'}'; Import-Module '{d / 'Extractor.psm1'}'\n"
+                                         "Get-AttrCudaEmbeddedFunctionSource -Name 'Probe' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n", encoding="utf-8")
+        cls.join_path_drive = run_scan(modules=[d / "Extractor.psm1", d / "DriveRedirect.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-drive.ps1"])
+        # Its sibling: a $function: variable assignment of a script block (Get-AliasDefinitions :1028).
+        (d / "VarRedirect.psm1").write_text(f"${{function:global:Split-Path}} = {{ param($Path) '{d}' }}\n$function:global:Join-Path = {{ param($Path,$ChildPath) '{d / 'Dirty.psm1'}' }}\n", encoding="utf-8")
+        (d / "gen-var.ps1").write_text(f"Import-Module '{d / 'VarRedirect.psm1'}'\n"
+                                       "Get-AttrCudaEmbeddedFunctionSource -Name 'Probe' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n", encoding="utf-8")
+        # r12 adversary pass 2 (A2), verbatim: a -ModulePath module replaces the extractor itself through the function: drive.
+        (d / "Shadow.psm1").write_text("Set-Item function:global:Get-AttrCudaEmbeddedFunctionSource -Value { param([string[]]$Name,[string]$ModulePath); "
+                                       f"Extractor\\Get-AttrCudaEmbeddedFunctionSource -Name $Name -ModulePath '{d / 'Dirty.psm1'}' }}\n", encoding="utf-8")
+        (d / "gen-shadow.ps1").write_text(f"Import-Module '{d / 'Extractor.psm1'}'; Import-Module '{d / 'Shadow.psm1'}'\n"
+                                          f"Get-AttrCudaEmbeddedFunctionSource -Name Probe -ModulePath '{d / 'Clean.psm1'}'\n", encoding="utf-8")
+        cls.extractor_drive = run_scan(modules=[d / "Extractor.psm1", d / "Shadow.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-shadow.ps1"])
+        cls.join_path_variable = run_scan(modules=[d / "Extractor.psm1", d / "VarRedirect.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-var.ps1"])
+        # r12c (Dot on 8bb454b1, sol r12b S-07): a supplied module that replaces Get-Command makes `-CommandType Application`
+        # prove nothing, so the Application-only exception needs the builtin's identity. Each replacement route is its own scan.
+        cls.gcm = {}
+        lookup = " param($Name, $CommandType)\n Microsoft.PowerShell.Management\\Get-Item function:python.exe\n"
+        dirty_probe = "function Probe {\n    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null\n}\n"
+        extractor = ("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n"
+                     "function Probe {\n    Get-Date\n}\n\nfunction python.exe {\n    Get-Date\n}\n")
+        real = (BACHELOR / "AttrCudaArtifacts.psm1").read_text(encoding="utf-8")
+        standard = ("$script:AttrCudaModulePath = $PSCommandPath\n\n"
+                    + re.search(r"(?ms)^function Get-AttrCudaEmbeddedFunctionSource \{.*?^\}", real).group(0).replace("\r\n", "\n")
+                    + "\n\nfunction Probe {\n    Get-Date\n}\n\nfunction python.exe {\n    Get-Date\n}\n")
+        routes = {
+            # Sol r12b, verbatim: the supplied Extractor.psm1 itself exports the replacement.
+            "replacement": {"Extractor.psm1": extractor + "\nfunction Get-Command {\n    param($Name, $CommandType)\n"
+                                                          "    Microsoft.PowerShell.Management\\Get-Item function:python.exe\n}\n"},
+            # An alias named Get-Command (or gcm) that a supplied module defines and exports.
+            "alias": {"Extractor.psm1": extractor,
+                      "Rogue.psm1": "function Rogue-Lookup {\n" + lookup + "}\nSet-Alias Get-Command Rogue-Lookup -Scope Global\n"
+                                    "Set-Alias gcm Rogue-Lookup -Scope Global\nExport-ModuleMember -Function Rogue-Lookup -Alias Get-Command, gcm\n"},
+            # A supplied module whose export becomes Get-Command once imported with -Prefix Com (Get-mand -> Get-Command).
+            "prefix": {"Extractor.psm1": extractor, "Prefixed.psm1": "function Get-mand {\n" + lookup + "}\n"},
+            # r12c adversary A2, verbatim: prefixes compose (Get-and -> Get-mand in Wrapper -> Get-Command in the source).
+            "nested": {"Extractor.psm1": extractor + "\nfunction Get-and {\n" + lookup + "}\n",
+                       "Wrapper.psm1": "Import-Module '{ext}' -Prefix m\nExport-ModuleMember -Function Get-mand\n"},
+            # r12c adversary A3, verbatim: an alias named by the qualified spelling itself, of Get-Command and of the extractor.
+            "qualified": {"Extractor.psm1": extractor, "Clean.psm1": "function Probe {\n    Get-Date\n}\n"},
+            # r12c adversary A1, verbatim: an export -Prefix P renames into Join-Path (Join-ath -> Join-Path).
+            "joinprefix": {"Extractor.psm1": extractor, "Clean.psm1": "function Probe {\n    Get-Date\n}\n",
+                           "Prefixed.psm1": "function Join-ath {\n param($Path, $ChildPath)\n '{dirty}'\n}\nExport-ModuleMember -Function Join-ath\n"},
+            # r13 (sol r12c S-08), verbatim: a literal dynamic module named Microsoft.PowerShell.Core exports a replacement
+            # Get-Command, so the qualified spelling is not the builtin. The extractor is the standard implementation (Dot).
+            "dynamiccore": {"Extractor.psm1": standard},
+            # r13 (fable r12c), verbatim: a differently named function carries [Alias('Get-Command')] in its param block; a script
+            # module exports it with its functions by default, and no Set-Alias names it.
+            "attribute": {"Extractor.psm1": standard + "\nfunction Rogue-Lookup {\n    [Alias('Get-Command')]\n" + lookup + "}\n"},
+        }
+        pre = "Import-Module '{ext}'\n$s1='Session'; $s2='State'; $sn=$s1+$s2\n$v1='PS'; $v2='Variable'; $vn=$v1+$v2\n"
+        body = (")) {{\n    $c.Module.$sn.$vn.Set(\n        'script:AttrCudaModulePath', '{dirty}')\n}}\n"
+                "Get-AttrCudaEmbeddedFunctionSource -Name Probe\n")
+        data = ("Import-Module '{ext}'\n$table = ConvertFrom-Json '{{\"venues\":{{\"a\":1}}}}'\n$venue = 'a'\n$entry = $table.venues.$venue\n"
+                "foreach ($c in @({gcm} python.exe -CommandType Application)) {{ $p = $c.Source }}\nGet-AttrCudaEmbeddedFunctionSource -Name Probe\n")
+        sources = {
+            "replacement": {
+                "Named": pre + "foreach ($c in @(Get-Command -Name python.exe -CommandType Application" + body,
+                "Positional": pre + "foreach ($c in @(Get-Command python.exe -CommandType Application" + body,
+                "CtlCore": data.replace("{gcm}", "Microsoft.PowerShell.Core\\Get-Command"),
+            },
+            "alias": {
+                "Named": "Import-Module '{dir}\\Rogue.psm1'\n" + pre + "foreach ($c in @(Get-Command -Name python.exe -CommandType Application" + body,
+                "Gcm": "Import-Module '{dir}\\Rogue.psm1'\n" + pre + "foreach ($c in @(gcm python.exe -CommandType Application" + body,
+            },
+            "prefix": {
+                "Prefixed": "Import-Module '{dir}\\Prefixed.psm1' -Prefix Com\n" + pre + "foreach ($c in @(Get-Command -Name python.exe -CommandType Application" + body,
+                "ComputedPrefix": "$p = 'Co' + $env:X + 'm'\nImport-Module '{dir}\\Prefixed.psm1' -Prefix $p\n" + pre
+                                  + "foreach ($c in @(Get-Command python.exe -CommandType Application" + body,
+                "SplatPrefix": "$a = @{{ Name = '{dir}\\Prefixed.psm1'; Prefix = 'Com' }}\nImport-Module @a\n" + pre
+                               + "foreach ($c in @(Get-Command python.exe -CommandType Application" + body,
+                "CtlNoPrefix": "Import-Module '{dir}\\Prefixed.psm1'\n" + data.replace("{gcm}", "Get-Command"),
+            },
+            "nested": {
+                "Composed": "Import-Module '{dir}\\Wrapper.psm1' -Prefix Com\n" + pre + "foreach ($c in @(Get-Command python.exe -CommandType Application" + body,
+            },
+            "qualified": {
+                "CoreAlias": "function Rogue {{\n" + lookup + "}}\nSet-Alias -Name 'Microsoft.PowerShell.Core\\Get-Command' -Value Rogue\n" + pre
+                             + "foreach ($c in @(Microsoft.PowerShell.Core\\Get-Command python.exe -CommandType Application" + body,
+                "ExtractorAlias": "function Redirect {{ param($Name, $ModulePath) 'dirty-body' }}\n"
+                                  "Set-Alias -Name 'AttrCudaArtifacts\\Get-AttrCudaEmbeddedFunctionSource' -Value Redirect\n"
+                                  "AttrCudaArtifacts\\Get-AttrCudaEmbeddedFunctionSource -Name Probe -ModulePath '{dir}\\Clean.psm1'\n",
+            },
+            "joinprefix": {
+                "JoinPrefix": "Import-Module '{ext}'\nImport-Module '{dir}\\Prefixed.psm1' -Prefix P\n"
+                              "Get-AttrCudaEmbeddedFunctionSource -Name Probe -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n",
+            },
+            "dynamiccore": {
+                "Assigned": pre + "$rogue = New-Module -Name Microsoft.PowerShell.Core -ScriptBlock {{\n    function Get-Command {{\n" + lookup
+                            + "    }}\n    Export-ModuleMember -Function Get-Command\n}}\nImport-Module $rogue\n"
+                            + "foreach ($c in @(Microsoft.PowerShell.Core\\Get-Command -Name python.exe -CommandType Application" + body,
+                "Nested": pre + "Import-Module (New-Module -Name Microsoft.PowerShell.Core -ScriptBlock {{\n    function Get-Command {{\n" + lookup
+                          + "    }}\n    Export-ModuleMember -Function Get-Command\n}})\n"
+                          + "foreach ($c in @(Microsoft.PowerShell.Core\\Get-Command -Name python.exe -CommandType Application" + body,
+            },
+            "attribute": {
+                "Named": pre + "foreach ($c in @(Get-Command -Name python.exe -CommandType Application" + body,
+            },
+        }
+        for route, modules in routes.items():
+            rd = d / f"gcm-{route}"
+            rd.mkdir()
+            for name, text in modules.items():
+                (rd / name).write_text(text.replace("{ext}", str(rd / "Extractor.psm1")).replace("{dirty}", str(rd / "Dirty.psm1")), encoding="utf-8")
+            (rd / "Dirty.psm1").write_text(dirty_probe, encoding="utf-8")
+            gens = []
+            for case, text in sources[route].items():
+                gen = rd / f"gen-{case}.ps1"
+                gen.write_text(text.format(ext=rd / "Extractor.psm1", dirty=rd / "Dirty.psm1", dir=rd), encoding="utf-8")
+                gens.append(gen)
+            cls.gcm[route] = run_scan(modules=[rd / n for n in modules] + [rd / "Dirty.psm1"], splice_sources=gens)
+
+    def gcm_case(self, route: str, case: str) -> tuple[list, list]:
+        result = self.gcm[route]
+        calls = [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["source"].endswith(f"gen-{case}.ps1")]
+        bound = [s["module"].rsplit("/", 1)[-1] for s in result["spliced"] if s["name"] == "Probe" and any(c.endswith(f"gen-{case}.ps1") for c in s["callers"])]
+        return calls, bound
+
+    def test_r12c_get_command_replaced_by_a_supplied_module_makes_the_application_only_selection_unproven(self) -> None:
+        for route, case in (("replacement", "Named"), ("replacement", "Positional"), ("alias", "Named"), ("alias", "Gcm"),
+                            ("prefix", "Prefixed"), ("prefix", "ComputedPrefix"), ("prefix", "SplatPrefix"), ("nested", "Composed"),
+                            ("qualified", "CoreAlias"), ("joinprefix", "JoinPrefix")):
+            with self.subTest(route=route, case=case):
+                calls, bound = self.gcm_case(route, case)
+                self.assertEqual([f["token"] for f in calls], ["unproven-binding"], describe(self.gcm[route]["splicedViolations"]))
+                self.assertEqual(bound, [], f"{route}/{case}: a module was scanned in place of the one runtime reads")
+
+    def test_r12c_a3_an_alias_named_by_the_qualified_extractor_spelling_is_a_shadow_finding(self) -> None:
+        # Judged as an alias named by the plain extractor spelling is (SplicedBodyScanCoverageLimitTests b1): a shadow finding.
+        calls, _ = self.gcm_case("qualified", "ExtractorAlias")
+        self.assertTrue([f for f in calls if "shadows it" in f["reason"]], describe(self.gcm["qualified"]["splicedViolations"]))
+
+    def test_r13_a_dynamic_core_module_or_an_alias_attribute_replacing_get_command_is_an_unproven_binding(self) -> None:
+        # sol r12c S-08 (assigned and nested New-Module forms) and fable r12c ([Alias('Get-Command')] on a supplied function).
+        for route, case in (("dynamiccore", "Assigned"), ("dynamiccore", "Nested"), ("attribute", "Named")):
+            with self.subTest(route=route, case=case):
+                calls, bound = self.gcm_case(route, case)
+                self.assertEqual([f["token"] for f in calls], ["unproven-binding"], describe(self.gcm[route]["splicedViolations"]))
+                self.assertEqual(bound, [], f"{route}/{case}: a module was scanned in place of the one runtime reads")
+
+    def test_r13_get_command_application_only_has_no_exception_even_for_the_builtin(self) -> None:
+        # r12c expected these two clean (proven builtin identity). r13 deletes the exception: builtin identity cannot be proven
+        # statically, so every Get-Command result whose value flows on is a carrier, and the call fails closed.
+        for route, case in (("replacement", "CtlCore"), ("prefix", "CtlNoPrefix")):
+            with self.subTest(route=route, case=case):
+                calls, bound = self.gcm_case(route, case)
+                self.assertEqual([f["token"] for f in calls], ["unproven-binding"], describe(self.gcm[route]["splicedViolations"]))
+                self.assertEqual(bound, [])
+
+    def check(self, result: dict) -> None:
+        calls = [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and re.search(r"-Name '?Probe\b", f["text"])]
+        self.assertEqual([f["token"] for f in calls], ["unproven-binding"], describe(result["splicedViolations"]))
+        self.assertIn("alias", calls[0]["reason"])
+        self.assertEqual([s for s in result["spliced"] if s["name"] == "Probe"], [], "a module was scanned in place of the one runtime reads")
+
+    def test_r11_an_imported_alias_of_join_path_makes_the_binding_unproven(self) -> None:
+        self.check(self.join_path)
+
+    def test_r11_an_imported_alias_of_the_extractor_makes_the_binding_unproven(self) -> None:
+        self.check(self.extractor)
+
+    def test_r11_pass2_a3_an_imported_function_named_join_path_makes_the_binding_unproven(self) -> None:
+        self.check(self.join_path_function)
+
+    def test_r12_a1_an_imported_function_drive_definition_of_join_path_makes_the_binding_unproven(self) -> None:
+        self.check(self.join_path_drive)
+
+    def test_r12_a1_an_imported_function_variable_assignment_of_join_path_makes_the_binding_unproven(self) -> None:
+        self.check(self.join_path_variable)
+
+    def test_r12_pass2_a2_an_imported_function_drive_replacement_of_the_extractor_makes_the_binding_unproven(self) -> None:
+        self.check(self.extractor_drive)
+
+    def test_r11_a2_a_module_that_reaches_the_defaults_through_another_modules_alias_is_an_unproven_binding(self) -> None:
+        found = [f for f in self.module_defaults["splicedViolations"] if f["token"] == "unproven-binding" and f["source"].endswith("B.psm1")]
+        self.assertEqual(len(found), 1, describe(self.module_defaults["splicedViolations"]))
 
 
 class SpliceInventoryCallShapeTests(unittest.TestCase):
