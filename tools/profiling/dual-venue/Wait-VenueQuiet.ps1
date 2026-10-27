@@ -72,6 +72,25 @@
 #        DEVPKEY_Device_PowerData, which does not wake it, and nvidia-smi only when it is already D0 (else skipped_wake_risk = true and nothing else is read);
 #        seconds_since_last_lease + last_lease{} = the newest quiet-lease event in the agent's logs\agent.log. Every null has a typed reason; none of it reaches the
 #        decision. The gate prints three `tele` lines after the ident lines. The contract is documented above $telemetrySchema in the job.
+#      BUSIEST FAST CORE (VENUE-QUIET-PER-CORE-VERDICT-1): the mean below is machine-wide, so on a 20-logical-CPU host one foreign process saturating ONE fast core is ~5 % of the
+#        total and cannot move it. BACHELOR-HEAT-WHILE-QUIET-DIAG-1 r1 measured exactly that: probes read QUIET (mean < 20 %) while the busiest core sat at 66 % (03a3: 6/60 throttled
+#        rows, 87.9 C mean, 44 W at 100 C), 82-92 % (03a4: 6/60 throttled) and 26-47 % where the heat was clear (03a2, 0/60, 62.5 C). A busiest-FAST-core check now sits beside the
+#        mean, over the probe's own cores[] rows (core_class P, or uniform where the host has one class; E-cores never count). It is LOGGED FIRST and OFF by default:
+#          -PerCoreThresholdPercent <n>   default 60: above the 47 % busiest core of the cool wait and below the 66 % of the first hot one. A core is hot at busiest >= threshold.
+#          -PerCoreEnforce                the check blocks: a mean-QUIET probe whose busiest fast core is at or over the threshold is BUSY (the PROBE line ends `note=percore core=<instance>
+#                                         percent=<p>%`, the final verdict is COOLDOWN_UNMET and a `  percore blocked core=<instance> percent=<p>% threshold=<t>%` line names the core).
+#        EVERY probe that carries cores[] (whatever its schema), every v2 probe, and every probe at all once -PerCoreEnforce is on (an UNKNOWN one included, and an unavailable one:
+#        reason no-probe) prints ONE line right after its `  raw` line, whatever the switch says:
+#          `  percore enabled=<bool> threshold=<t>% busiest_fast_core=<instance|n/a> busiest_fast_pct=<p>%|n/a would_block=<true|false|null>[ reason=<code>]`
+#        <instance> is the probe's `<group>,<core>` with the comma written as `_` (gate text is comma-free, as for every other line the run-local drivers split).
+#        would_block is what the check says about that probe; with the switch OFF it changes nothing, so the log measures how often enforcing would have fired before anyone turns it on.
+#        UNKNOWN IS NULL, NEVER FALSE, AND NEVER A BLOCK: would_block=null with reason no-probe (the probe itself was unavailable), no-cores (no cores[] rows), invalid-cores (cores is not an array), invalid-core-instance (a fast core whose instance is not a "<group>,<core>" string), core-class-unknown (a row whose class is not P / E / uniform, so it
+#        might be a fast core), invalid-core-row (an entry in cores[] that is not a JSON object: null, a scalar, a nested array), incomplete-samples (a fast or unknown-class row flagged incomplete, with
+#        validSamples != totalSamples, or with a count that is not a whole number >= 1 or an incomplete flag that is not a boolean), invalid-notes (a notes property that is present but not an object, an explicit null included; an absent property is an older probe and is unchanged), cores-omitted (the probe omitted a core for having no
+#        valid sample: notes.cores_omitted) or invalid-core-percent (a non-numeric, array or out-of-range
+#        value). The figure compared is the unrounded valid-sample mean (`percent_exact`, which the probe job now emits beside the 2-dp `percent`; an older probe falls back to
+#        `percent`), as the mean rule decides on the unrounded mean. A core-level BUSY never replaces UNKNOWN, a measured-busy mean or any exit code. Turning the switch ON for a
+#        caller is a later ruling, after the logged line has shown how often it would fire.
 #   3. decides: QUIET when the UNROUNDED mean of the 3 samples is <= -ThresholdPercent (the printed mean is rounded to 0.1 for display only). A
 #      failed counter read makes the check UNKNOWN, never quiet.
 #   4. re-probes every -RecheckSec until QUIET or -MaxWaitSec, then prints `QUIET mean=<x>` or `COOLDOWN_UNMET mean=<x>` (a MEASURED busy venue) and the top
@@ -131,6 +150,8 @@ param(
     [Parameter(ParameterSetName = 'Live')][ValidateRange(1, 86400)][int]$MaxAdmissionWaitSec = 7200,
     [Parameter(ParameterSetName = 'Live')][ValidateRange(0, 100)][int]$ForeignFloorProbes = 3,
     [Parameter(ParameterSetName = 'Live')][ValidateRange(0.0, 100.0)][double]$ForeignFloorTrendMarginPoints = 2.0,
+    [Parameter(ParameterSetName = 'Live')][ValidateRange(0.0, 100.0)][double]$PerCoreThresholdPercent = 60.0,
+    [Parameter(ParameterSetName = 'Live')][switch]$PerCoreEnforce,
     [Parameter(ParameterSetName = 'Offline', Mandatory = $true)][string]$SamplesJson,
     [double]$ThresholdPercent = 20.0
 )
@@ -490,7 +511,7 @@ foreach ($k in @($coreAcc.Keys | Sort-Object { $a = $_ -split ','; ([int]$a[0]) 
     $eff = $(if ($topo.map.ContainsKey($k)) { [int]$topo.map[$k] } else { $null })
     $cls = $(if ($null -eq $eff) { 'unknown' } elseif ($classes.Count -le 1) { 'uniform' } elseif ($eff -eq ($classes | Measure-Object -Maximum).Maximum) { 'P' } else { 'E' })
     $pct = [math]::Round($coreAcc[$k].sum / $coreAcc[$k].n, 2)
-    $cores += [pscustomobject]@{ instance = $k; core_class = $cls; efficiency_class = $eff; percent = $pct; validSamples = $coreAcc[$k].n; totalSamples = $nSets; incomplete = ($coreAcc[$k].n -lt $nSets) }
+    $cores += [pscustomobject]@{ instance = $k; core_class = $cls; efficiency_class = $eff; percent = $pct; percent_exact = ($coreAcc[$k].sum / $coreAcc[$k].n); validSamples = $coreAcc[$k].n; totalSamples = $nSets; incomplete = ($coreAcc[$k].n -lt $nSets) }
 }
 $coreInc = @($cores | Where-Object { $_.incomplete }).Count
 if ($coreInc -gt 0) { $notes['cores_incomplete'] = "$coreInc of $($cores.Count) core rows have fewer valid samples than the $nSets sample sets; each is the mean of its valid samples" }
@@ -1279,6 +1300,101 @@ function Get-ForeignFloorOwners($Probe) {
 # PURE: no downward trend over the window of means, oldest first (the newest is not below the first by more than the margin; the epsilon only absorbs float noise).
 function Test-NoDownwardTrend([double[]]$Means, [double]$MarginPoints) { ($Means[0] - $Means[-1]) -le ($MarginPoints + 1e-9) }
 
+# BUSIEST FAST CORE (see the header). PURE: what the per-core check says about one probe. would_block is $true / $false only when every core row that could be a fast core is
+# readable; anything else is $null with a typed reason, never a silent $false. E-cores never count; a row whose class is not P / E / uniform might be a fast core, so it makes the
+# answer unknown rather than being skipped, and so does a core the probe omitted for having no valid sample (notes.cores_omitted). The figure is percent_exact (the unrounded
+# valid-sample mean), else the probe's 2-dp percent.
+function Test-PerCoreNumber($v) { $v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [decimal] }
+function Get-VenuePerCoreVerdict($Probe, [double]$Threshold, [bool]$Enabled) {
+    $r = [ordered]@{ enabled = $Enabled; threshold = $Threshold; busiest_fast_core = $null; busiest_fast_percent = $null; would_block = $null; reason = $null }
+    try {
+        if ($null -eq $Probe -or $Probe -isnot [pscustomobject]) { $r.reason = 'no-probe'; return [pscustomobject]$r }
+        if ($null -eq $Probe.cores) { $r.reason = 'no-cores'; return [pscustomobject]$r }
+        # cores[] is an array of rows; one object (which @() would wrap as a single row), a string or a number is no list of cores
+        if ($Probe.cores -isnot [array]) { $r.reason = 'invalid-cores'; return [pscustomobject]$r }
+        $all = @($Probe.cores)
+        if ($all.Count -eq 0) { $r.reason = 'no-cores'; return [pscustomobject]$r }
+        $fast = @(); $reasons = @()
+        # a whole count as an exact [long] (never a double: 2^53 and 2^53+1 are the same double), else $null
+        $wholeCount = { param($v)
+            if ($v -is [int] -or $v -is [long]) { return [long]$v }
+            if ($v -is [double] -and [double]::IsFinite($v) -and [Math]::Floor($v) -eq $v -and [Math]::Abs($v) -lt 9007199254740992.0) { return [long]$v }
+            return $null
+        }
+        foreach ($row in $all) {
+            # a row that is not a JSON object (null, a scalar, an array nested in cores[]) could not be read, and it might have been a fast core: unknown, never dropped or enumerated
+            if ($row -isnot [pscustomobject]) { $reasons += 'invalid-core-row'; continue }
+            # a class that is not a plain string (an array would stringify to its first element) is no class
+            $cls = $row.core_class; if ($cls -isnot [string]) { $cls = '' }
+            $isFast = ($cls -ceq 'P' -or $cls -ceq 'uniform')
+            $isUnknown = -not ($isFast -or $cls -ceq 'E')
+            if (-not ($isFast -or $isUnknown)) { continue }
+            if ($isUnknown) { $reasons += 'core-class-unknown' }
+            # sample counts: when the row carries either count, both must be whole numbers with valid == total >= 1; anything else (a string, a fraction, zero, a negative, valid > total) is not evidence of completeness
+            $short = $false
+            if ($null -ne $row.PSObject.Properties['validSamples'] -or $null -ne $row.PSObject.Properties['totalSamples']) {
+                $vs = & $wholeCount $row.validSamples; $ts = & $wholeCount $row.totalSamples
+                if ($null -eq $vs -or $null -eq $ts -or $ts -lt 1 -or $vs -ne $ts) { $short = $true }
+            }
+            # the flag, when the row carries it, is a boolean; a non-boolean (an object, a string, a number, a null) is not evidence of completeness
+            $flag = $row.PSObject.Properties['incomplete']
+            if ($null -ne $flag -and $flag.Value -isnot [bool]) { $short = $true }
+            if ($row.incomplete -eq $true -or $short) { $reasons += 'incomplete-samples' }
+            # percent_exact when the row carries the property (even a null or bad one: no fallback to the rounded figure), else the older probe's 2-dp percent; plain assignment keeps a one-element array an array
+            if ($null -ne $row.PSObject.Properties['percent_exact']) { $v = $row.percent_exact } else { $v = $row.percent }
+            if (-not (Test-PerCoreNumber $v) -or -not [double]::IsFinite([double]$v) -or [double]$v -lt 0.0 -or [double]$v -gt 100.0) { $reasons += 'invalid-core-percent'; continue }
+            # a fast core is named by its "<group>,<core>" instance (a missing, array, numeric or free-text name would be a made-up core in the blocked line)
+            if ($isFast) {
+                if ($row.instance -isnot [string] -or $row.instance -cnotmatch '^[0-9]+,[0-9]+\z') { $reasons += 'invalid-core-instance'; continue }
+                $fast += [pscustomobject]@{ instance = [string]$row.instance; percent = [double]$v }
+            }
+        }
+        if ($fast.Count -gt 0) {
+            $top = $fast | Sort-Object -Property @{ Expression = { $_.percent }; Descending = $true } | Select-Object -First 1
+            $r.busiest_fast_core = $top.instance; $r.busiest_fast_percent = $top.percent
+        }
+        # notes is an object; any other shape (an array, a string, an explicit null) cannot say that nothing was omitted, so it is unknown rather than silently clean. Only an ABSENT
+        # property (an older probe that never carried notes) is skipped: "present with a null value" is told apart from "absent" by the property itself, not by its value.
+        $notesProp = $Probe.PSObject.Properties['notes']
+        if ($null -ne $notesProp) {
+            if ($notesProp.Value -isnot [pscustomobject]) { $reasons += 'invalid-notes' }
+            elseif ($null -ne $notesProp.Value.PSObject.Properties['cores_omitted']) { $reasons += 'cores-omitted' }
+        }
+        $reasons = @($reasons | Select-Object -Unique)
+        if ($reasons.Count -gt 0) { $r.reason = $reasons -join '+' }
+        elseif ($fast.Count -eq 0) { $r.reason = 'no-fast-cores' }
+        else { $r.would_block = ($r.busiest_fast_percent -ge $Threshold) }
+    } catch { $r.would_block = $null; $r.reason = 'no-cores' }
+    [pscustomobject]$r
+}
+# invariant-culture percent text ('82.0%', never '82,0%': gate text is comma-free)
+function Format-PerCorePct($v) { if ($null -eq $v) { 'n/a' } else { ([double]$v).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture) + '%' } }
+# One probe sample as log text, TOTAL: a number prints '{0:0.0}', null prints 'null', anything else a typed token (never a cast, so a malformed sample the decision already called UNKNOWN
+# cannot stop the PROBE line, the percore lines or the VENUE_QUIET_UNKNOWN exit from being written).
+function Format-VenueSample($v) {
+    try {
+        if ($null -eq $v) { return 'null' }
+        if (Test-PerCoreNumber $v) { return ('{0:0.0}' -f [double]$v) }
+        if ($v -is [string]) { return 'bad:string' }
+        if ($v -is [bool]) { return 'bad:bool' }
+        if ($v -is [array]) { return 'bad:array' }
+        if ($v -is [pscustomobject]) { return 'bad:object' }
+    } catch { }
+    'bad:other'
+}
+# Logging only: a failing -GateLog sink (a lock, a full disk) loses this line from the log and nothing else. The line is written to stdout first by Write-Gate, and the catch does
+# NOT write through the same failing sink again, so the verdict and every exit code stay what they were with the check off.
+function Write-PerCoreLines($Pc, [bool]$Blocked) {
+    # each line has its own guard: a sink that fails on the observation line must not also swallow the blocked-core line
+    try {
+        $wb = $(if ($null -eq $Pc.would_block) { 'null' } elseif ($Pc.would_block) { 'true' } else { 'false' })
+        Write-Gate (("  percore enabled={0} threshold={1} busiest_fast_core={2} busiest_fast_pct={3} would_block={4}" -f $Pc.enabled.ToString().ToLowerInvariant(), (Format-PerCorePct $Pc.threshold), (ConvertTo-IdentToken $Pc.busiest_fast_core), (Format-PerCorePct $Pc.busiest_fast_percent), $wb) + $(if ($Pc.reason) { ' reason=' + (ConvertTo-IdentToken $Pc.reason) } else { '' }))
+    } catch { try { [Console]::Error.WriteLine("percore line not logged: $($_.Exception.Message)") } catch { } }
+    try {
+        if ($Blocked) { Write-Gate ("  percore blocked core={0} percent={1} threshold={2}" -f (ConvertTo-IdentToken $Pc.busiest_fast_core), (Format-PerCorePct $Pc.busiest_fast_percent), (Format-PerCorePct $Pc.threshold)) }
+    } catch { try { [Console]::Error.WriteLine("percore line not logged: $($_.Exception.Message)") } catch { } }
+}
+
 $last = $null
 $floorMeans = @(); $foreignFloor = $null
 while ($true) {
@@ -1307,10 +1423,21 @@ while ($true) {
     }
     $samples = $(if ($null -ne $probe) { @($probe.samples) } else { @() })
     $d =Get-VenueQuietDecision -Samples $samples -Threshold $ThresholdPercent
-    $last = [pscustomobject]@{ decision = $d; probe = $probe; why = $why; whyKind = $(if ($whyKind) { $whyKind } else { 'invalid-samples' }) }
-    $sampleText = $(if ($samples.Count) { ($samples | ForEach-Object { if ($null -eq $_) { 'null' } else { '{0:0.0}' -f [double]$_ } }) -join '/' } else { 'none' })
-    Write-Gate "PROBE $jobId $Venue samples=$sampleText mean=$(Format-Mean $d.mean) state=$($d.state)$(if ($why) { " note=$why" }) $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
+    # BUSIEST FAST CORE: always evaluated for a v2 probe (or any probe once enforcing) so the line can be logged; it changes the decision only under -PerCoreEnforce, only for a
+    # mean-QUIET probe, and only on a measured would_block = $true (null is unknown and never blocks).
+    $pc = $null; $pcBlocked = $false; $pcNote = ''
+    # Eligible = the probe carries cores[] (whatever its schema) or is v2, or enforcement is on (an unavailable probe then gets one typed-null line). The schema version is not the gate.
+    if ($PerCoreEnforce -or ($null -ne $probe -and ($null -ne $probe.cores -or [string]$probe.schema -ceq 'mlv-app/venue-quiet-probe/v2'))) { $pc = Get-VenuePerCoreVerdict $probe $PerCoreThresholdPercent ([bool]$PerCoreEnforce) }
+    if ($PerCoreEnforce -and $d.state -ceq 'QUIET' -and $null -ne $pc -and $pc.would_block -eq $true) {
+        $d = [pscustomobject]@{ state = 'BUSY'; mean = $d.mean }
+        $pcBlocked = $true
+        $pcNote = " note=percore core=$(ConvertTo-IdentToken $pc.busiest_fast_core) percent=$(Format-PerCorePct $pc.busiest_fast_percent)"
+    }
+    $last = [pscustomobject]@{ decision = $d; probe = $probe; why = $why; whyKind = $(if ($whyKind) { $whyKind } else { 'invalid-samples' }); percore = $pc }
+    $sampleText = $(if ($samples.Count) { (@($samples | ForEach-Object { Format-VenueSample $_ })) -join '/' } else { 'none' })
+    Write-Gate "PROBE $jobId $Venue samples=$sampleText mean=$(Format-Mean $d.mean) state=$($d.state)$(if ($why) { " note=$why" })$pcNote $([DateTime]::UtcNow.ToString('HH:mm:ssZ'))"
     if ($rawPath) { Write-Gate "  raw $rawPath" } elseif ($rawErr) { Write-Gate "  raw UNWRITABLE $rawErr" }
+    if ($null -ne $pc) { Write-PerCoreLines $pc $pcBlocked }
     if ($d.state -ceq 'QUIET') { break }
     # the run of consecutive MEASURED busy probes that name foreign owners; anything else (UNKNOWN, an MLV owner, no owner named) starts it again
     $owners = $(if ($d.state -ceq 'BUSY') { @(Get-ForeignFloorOwners $probe) } else { @() })
