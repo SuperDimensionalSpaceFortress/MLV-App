@@ -1199,6 +1199,7 @@ function Test-SessionCarrierCommand($Command) {
     # hands back an ApplicationInfo, which carries no module. r12b (Dot B13): the name alone proves nothing, since a supplied module
     # can export `function python.exe`, whose FunctionInfo .Module reaches its session state; so the type set must be exactly one
     # constant Application (-CommandType or its alias -Type, any prefix, once), else the selection is unproven.
+    # r12c: and the arguments prove only what the builtin selects, so the command must be the builtin (Test-BuiltinGetCommand).
     if (@($names | Where-Object { @('get-command', 'gcm') -notcontains $_ }).Count -eq 0) {
         if (@($Command.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count -gt 0) { return $true }
         $types = Get-NamedArguments $Command @('CommandType') 'Get-Command'
@@ -1206,13 +1207,73 @@ function Test-SessionCarrierCommand($Command) {
         $named = Get-NamedArguments $Command @('Name')
         $operand = if (@($named).Count -eq 1) { $named[0] } elseif (@($named).Count -eq 0 -and $Command.CommandElements.Count -gt 1 -and $Command.CommandElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $Command.CommandElements[1] } else { $null }
         $commandName = if ($null -eq $operand) { $null } elseif ($operand -is [System.Management.Automation.Language.StringConstantExpressionAst]) { [string]$operand.Value } else { Get-SingleConstant $operand }
-        if ($null -ne $commandName -and $commandName -match '(?i)^[^*?\[\]]+\.(exe|com|cmd|bat)$') { return $false }
+        if ($null -ne $commandName -and $commandName -match '(?i)^[^*?\[\]]+\.(exe|com|cmd|bat)$' -and (Test-BuiltinGetCommand $Command)) { return $false }
         return $true
     }
     if (@($names | Where-Object { @('import-module', 'ipmo') -notcontains $_ }).Count -gt 0) { return $true }
     return (@($Command.CommandElements | Where-Object {
         ($_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName.Length -ge 2 -and 'passthru'.StartsWith($_.ParameterName.ToLowerInvariant())) -or
         ($_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted) }).Count -gt 0)
+}
+
+# r12c (Dot on 8bb454b1, sol r12b S-07): a -ModulePath module can define, alias, or export under an Import-Module -Prefix, a
+# replacement Get-Command that hands back a FunctionInfo whatever -CommandType says. Its identity is proven only for
+# Microsoft.PowerShell.Core\Get-Command, or for a plain Get-Command / gcm that runs as nothing else and that no shadow
+# (Get-ShadowingDefinitions, the model the extractor and Join-Path are judged by) in the calling tree or a -ModulePath module
+# defines, under every name a constant -Prefix there turns into Get-Command or gcm. Anything else is unproven (fails closed).
+$script:getCommandTrees = [System.Collections.Generic.Dictionary[object, object]]::new([System.Collections.Generic.ReferenceEqualityComparer]::Instance)
+$script:suppliedModuleAsts = $null
+
+function Get-SuppliedModuleAsts {
+    # The -ModulePath modules' trees: the splice pass's own ($moduleAsts) once it has parsed them, else parsed here once.
+    $built = Get-Variable -Name moduleAsts -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    if ($null -ne $built) { return @($built.Values) }
+    if ($null -eq $script:suppliedModuleAsts) {
+        $script:suppliedModuleAsts = @($ModulePath | ForEach-Object {
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path -LiteralPath $_).Path, [ref]$tokens, [ref]$errors) })
+    }
+    return $script:suppliedModuleAsts
+}
+
+function Test-BuiltinGetCommand($Command) {
+    $name = Get-LiteralCommandName $Command
+    if ([string]::IsNullOrEmpty($name)) { return $false }
+    if ($name.Contains('\')) {
+        $qualifier = $name.Substring(0, $name.LastIndexOf('\'))
+        return ($qualifier -ieq 'Microsoft.PowerShell.Core' -and (Get-BareCommandName $name) -eq 'get-command' -and
+                @($ModulePath | Where-Object { [IO.Path]::GetFileNameWithoutExtension($_) -ieq $qualifier }).Count -eq 0)
+    }
+    if (@(Get-ResolvedCommandNames $Command | Where-Object { @('get-command', 'gcm') -notcontains $_ }).Count -gt 0) { return $false }
+    $top = $Command
+    while ($null -ne $top.Parent) { $top = $top.Parent }
+    if (-not $script:getCommandTrees.ContainsKey($top)) { $script:getCommandTrees[$top] = Test-GetCommandUnshadowed $top }
+    return $script:getCommandTrees[$top]
+}
+
+function Test-GetCommandUnshadowed($Top) {
+    $trees = @($Top) + @(Get-SuppliedModuleAsts)
+    $names = [System.Collections.Generic.List[string]]::new()
+    $names.Add('Get-Command'); $names.Add('gcm')
+    foreach ($tree in $trees) {
+        $imports = @($tree.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] -and
+                                     @(Get-ResolvedCommandNames $x | Where-Object { @('import-module', 'ipmo') -contains $_ }).Count -gt 0 }, $true))
+        foreach ($import in $imports) {
+            if (@($import.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count -gt 0) { return $false }
+            $prefixes = Get-NamedArguments $import @('Prefix') 'Import-Module'
+            foreach ($operand in $prefixes) {
+                $prefix = Get-SingleConstant $operand
+                if ($null -eq $prefix) { return $false }
+                # -Prefix P renames Verb-Noun to Verb-PNoun and a name with no noun to PName.
+                if ($prefix.Length -gt 0 -and 'Command'.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $names.Add('Get-' + 'Command'.Substring($prefix.Length)) }
+                foreach ($target in @('Get-Command', 'gcm')) {
+                    if ($target.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $names.Add($target.Substring($prefix.Length)) }
+                }
+            }
+        }
+    }
+    foreach ($tree in $trees) { if (@(Get-ShadowingDefinitions $tree $names.ToArray()).Count -gt 0) { return $false } }
+    return $true
 }
 
 function Test-TreeNamesSessionCarrier($Root) {

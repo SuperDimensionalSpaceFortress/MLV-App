@@ -1908,6 +1908,9 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         "B13TypeTwice": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType Application -CommandType Function)" + B13_SET, DEF_CALL),
         "B13FoldedName": (B13_PRE + "foreach($c in @(Get-Command ('python'+'.exe') -CommandType Function)" + B13_SET, DEF_CALL),
         "B13VariableName": (B13_PRE + "$n='python.exe'; foreach($c in @(Get-Command $n -CommandType Application)" + B13_SET, DEF_CALL),
+        # r12c (Dot on 8bb454b1, sol r12b S-07): a Get-Command qualified by a module other than Microsoft.PowerShell.Core is not
+        # the builtin, so its Application-only arguments prove nothing (Rogue need not be a -ModulePath module).
+        "B13QualifiedRogue": (B13_PRE + "foreach($c in @(Rogue\\Get-Command python.exe -CommandType Application)" + B13_SET, DEF_CALL),
     }
     # Not unproven: a computed member of parsed data (the real playback-attr-3-cuda-job.ps1 shape), a folded name that is not a route.
     CALL_CONTROLS = {
@@ -1919,6 +1922,9 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         "CtlGcmApplication": (B13_CTL + "python.exe -CommandType Application)){{ $p = $c.Source }}", PSR_CALL, "Clean.psm1"),
         "CtlGcmApplicationNamed": (B13_CTL + "-Name 'python.exe' -CommandType Application -ErrorAction SilentlyContinue)){{ $p = $c.Source }}", PSR_CALL, "Clean.psm1"),
         "CtlGcmApplicationColon": (B13_CTL + "python.exe -CommandType:Application)){{ $p = $c.Source }}", PSR_CALL, "Clean.psm1"),
+        # r12c control: the module-qualified builtin is the builtin.
+        "CtlGcmApplicationCore": (B13_CTL.replace("@(Get-Command ", "@(Microsoft.PowerShell.Core\\Get-Command ")
+                                  + "python.exe -CommandType Application)){{ $p = $c.Source }}", PSR_CALL, "Clean.psm1"),
     }
     BODIES = {
         # r10 adversary A1, receiver, verbatim.
@@ -2057,6 +2063,81 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
                                           f"Get-AttrCudaEmbeddedFunctionSource -Name Probe -ModulePath '{d / 'Clean.psm1'}'\n", encoding="utf-8")
         cls.extractor_drive = run_scan(modules=[d / "Extractor.psm1", d / "Shadow.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-shadow.ps1"])
         cls.join_path_variable = run_scan(modules=[d / "Extractor.psm1", d / "VarRedirect.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-var.ps1"])
+        # r12c (Dot on 8bb454b1, sol r12b S-07): a supplied module that replaces Get-Command makes `-CommandType Application`
+        # prove nothing, so the Application-only exception needs the builtin's identity. Each replacement route is its own scan.
+        cls.gcm = {}
+        lookup = " param($Name, $CommandType)\n Microsoft.PowerShell.Management\\Get-Item function:python.exe\n"
+        dirty_probe = "function Probe {\n    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null\n}\n"
+        extractor = ("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n"
+                     "function Probe {\n    Get-Date\n}\n\nfunction python.exe {\n    Get-Date\n}\n")
+        routes = {
+            # Sol r12b, verbatim: the supplied Extractor.psm1 itself exports the replacement.
+            "replacement": {"Extractor.psm1": extractor + "\nfunction Get-Command {\n    param($Name, $CommandType)\n"
+                                                          "    Microsoft.PowerShell.Management\\Get-Item function:python.exe\n}\n"},
+            # An alias named Get-Command (or gcm) that a supplied module defines and exports.
+            "alias": {"Extractor.psm1": extractor,
+                      "Rogue.psm1": "function Rogue-Lookup {\n" + lookup + "}\nSet-Alias Get-Command Rogue-Lookup -Scope Global\n"
+                                    "Set-Alias gcm Rogue-Lookup -Scope Global\nExport-ModuleMember -Function Rogue-Lookup -Alias Get-Command, gcm\n"},
+            # A supplied module whose export becomes Get-Command once imported with -Prefix Com (Get-mand -> Get-Command).
+            "prefix": {"Extractor.psm1": extractor, "Prefixed.psm1": "function Get-mand {\n" + lookup + "}\n"},
+        }
+        pre = "Import-Module '{ext}'\n$s1='Session'; $s2='State'; $sn=$s1+$s2\n$v1='PS'; $v2='Variable'; $vn=$v1+$v2\n"
+        body = (")) {{\n    $c.Module.$sn.$vn.Set(\n        'script:AttrCudaModulePath', '{dirty}')\n}}\n"
+                "Get-AttrCudaEmbeddedFunctionSource -Name Probe\n")
+        data = ("Import-Module '{ext}'\n$table = ConvertFrom-Json '{{\"venues\":{{\"a\":1}}}}'\n$venue = 'a'\n$entry = $table.venues.$venue\n"
+                "foreach ($c in @({gcm} python.exe -CommandType Application)) {{ $p = $c.Source }}\nGet-AttrCudaEmbeddedFunctionSource -Name Probe\n")
+        sources = {
+            "replacement": {
+                "Named": pre + "foreach ($c in @(Get-Command -Name python.exe -CommandType Application" + body,
+                "Positional": pre + "foreach ($c in @(Get-Command python.exe -CommandType Application" + body,
+                "CtlCore": data.replace("{gcm}", "Microsoft.PowerShell.Core\\Get-Command"),
+            },
+            "alias": {
+                "Named": "Import-Module '{dir}\\Rogue.psm1'\n" + pre + "foreach ($c in @(Get-Command -Name python.exe -CommandType Application" + body,
+                "Gcm": "Import-Module '{dir}\\Rogue.psm1'\n" + pre + "foreach ($c in @(gcm python.exe -CommandType Application" + body,
+            },
+            "prefix": {
+                "Prefixed": "Import-Module '{dir}\\Prefixed.psm1' -Prefix Com\n" + pre + "foreach ($c in @(Get-Command -Name python.exe -CommandType Application" + body,
+                "ComputedPrefix": "$p = 'Co' + $env:X + 'm'\nImport-Module '{dir}\\Prefixed.psm1' -Prefix $p\n" + pre
+                                  + "foreach ($c in @(Get-Command python.exe -CommandType Application" + body,
+                "SplatPrefix": "$a = @{{ Name = '{dir}\\Prefixed.psm1'; Prefix = 'Com' }}\nImport-Module @a\n" + pre
+                               + "foreach ($c in @(Get-Command python.exe -CommandType Application" + body,
+                "CtlNoPrefix": "Import-Module '{dir}\\Prefixed.psm1'\n" + data.replace("{gcm}", "Get-Command"),
+            },
+        }
+        for route, modules in routes.items():
+            rd = d / f"gcm-{route}"
+            rd.mkdir()
+            for name, text in modules.items():
+                (rd / name).write_text(text, encoding="utf-8")
+            (rd / "Dirty.psm1").write_text(dirty_probe, encoding="utf-8")
+            gens = []
+            for case, text in sources[route].items():
+                gen = rd / f"gen-{case}.ps1"
+                gen.write_text(text.format(ext=rd / "Extractor.psm1", dirty=rd / "Dirty.psm1", dir=rd), encoding="utf-8")
+                gens.append(gen)
+            cls.gcm[route] = run_scan(modules=[rd / n for n in modules] + [rd / "Dirty.psm1"], splice_sources=gens)
+
+    def gcm_case(self, route: str, case: str) -> tuple[list, list]:
+        result = self.gcm[route]
+        calls = [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["source"].endswith(f"gen-{case}.ps1")]
+        bound = [s["module"].rsplit("/", 1)[-1] for s in result["spliced"] if s["name"] == "Probe" and any(c.endswith(f"gen-{case}.ps1") for c in s["callers"])]
+        return calls, bound
+
+    def test_r12c_get_command_replaced_by_a_supplied_module_makes_the_application_only_selection_unproven(self) -> None:
+        for route, case in (("replacement", "Named"), ("replacement", "Positional"), ("alias", "Named"), ("alias", "Gcm"),
+                            ("prefix", "Prefixed"), ("prefix", "ComputedPrefix"), ("prefix", "SplatPrefix")):
+            with self.subTest(route=route, case=case):
+                calls, bound = self.gcm_case(route, case)
+                self.assertEqual([f["token"] for f in calls], ["unproven-binding"], describe(self.gcm[route]["splicedViolations"]))
+                self.assertEqual(bound, [], f"{route}/{case}: a module was scanned in place of the one runtime reads")
+
+    def test_r12c_get_command_with_proven_builtin_identity_keeps_the_application_only_exception(self) -> None:
+        for route, case in (("replacement", "CtlCore"), ("prefix", "CtlNoPrefix")):
+            with self.subTest(route=route, case=case):
+                calls, bound = self.gcm_case(route, case)
+                self.assertEqual(calls, [], describe(self.gcm[route]["splicedViolations"]))
+                self.assertEqual(bound, ["Extractor.psm1"])
 
     def check(self, result: dict) -> None:
         calls = [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and re.search(r"-Name '?Probe\b", f["text"])]
