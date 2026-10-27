@@ -78,11 +78,26 @@ public static class DirtyFinalPath {
         IntPtr h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
         if (h == (IntPtr)(-1)) return null;
         try {
-            StringBuilder sb = new StringBuilder(2048);
-            uint n = GetFinalPathNameByHandleW(h, sb, 2048, 0);
-            return (n == 0 || n >= 2048) ? null : sb.ToString();
+            // The call returns the length it needs when the buffer is too small (a long path under a SUBST drive), so ask again with that size instead of giving up.
+            uint size = 2048;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                StringBuilder sb = new StringBuilder((int)size);
+                uint n = GetFinalPathNameByHandleW(h, sb, size, 0);
+                if (n == 0) return null;
+                if (n < size) return sb.ToString();
+                size = n + 1;
+            }
+            return null;
         } finally { CloseHandle(h); }
     }
+    // Opens the directory for listing (FILE_LIST_DIRECTORY) and shares READ|WRITE but not DELETE: while the handle is open Windows refuses to rename or remove that directory or any
+    // directory above it, so the physical path resolved earlier cannot be swapped for a junction. (A zero-access open takes no part in share-mode checks and pins nothing.)
+    // Returns IntPtr.Zero when it cannot be opened.
+    public static IntPtr Pin(string path) {
+        IntPtr h = CreateFileW(path, 1, 3, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+        return h == (IntPtr)(-1) ? IntPtr.Zero : h;
+    }
+    public static void Unpin(IntPtr handle) { if (handle != IntPtr.Zero) CloseHandle(handle); }
 }
 '@
         }
@@ -96,7 +111,7 @@ public static class DirtyFinalPath {
 
 function Resolve-DirtyRealPath([string]$Path) {
     $kernel = Get-DirtyKernelPath ([System.IO.Path]::GetFullPath($Path))
-    if ($kernel) { return $kernel.TrimEnd([char[]]@('\', '/')) }
+    if ($kernel) { return Format-DirtyResolved $kernel }
     $cur = [System.IO.Path]::GetFullPath($Path)
     for ($round = 0; $round -lt 32; $round++) {
         $root = [System.IO.Path]::GetPathRoot($cur)
@@ -114,9 +129,16 @@ function Resolve-DirtyRealPath([string]$Path) {
             }
             $acc = $next
         }
-        if (-not $relinked) { return $acc.TrimEnd([char[]]@('\', '/')) }
+        if (-not $relinked) { return Format-DirtyResolved $acc }
     }
-    return $cur.TrimEnd([char[]]@('\', '/'))
+    return Format-DirtyResolved $cur
+}
+
+# No trailing separator, except on a drive root: 'C:' alone means the drive's current directory, 'C:\' is the root (r5 adversary A6).
+function Format-DirtyResolved([string]$Path) {
+    $t = $Path.TrimEnd([char[]]@('\', '/'))
+    if ($t.Length -eq 2 -and $t[1] -eq ':') { return $t + '\' }
+    return $t
 }
 
 # Volume serial + file index of the directory a path opens onto (every link followed); where the kernel cannot answer, the resolved path stands in for it.
@@ -130,14 +152,39 @@ function Get-DirtyDirIdentity([string]$Path) {
 # One seam, so a test can retarget or swap the destination at a named point; $Stage is 'before-write' or 'before-publish'.
 function Invoke-DirtyDestCheckpoint([string]$Stage) { }
 
+# Holds a directory open so that it (and every directory above it) cannot be renamed or removed until Unlock-DirtyDirectory (see DirtyFinalPath.Pin); $null where that is not possible,
+# in which case the identity check in Test-DirtyDestStable is the only defence. Seam: a test overrides this to model such a platform.
+function Lock-DirtyDirectory([string]$Path) {
+    if (-not ($IsWindows -or $env:OS -eq 'Windows_NT')) { return $null }
+    try {
+        if (-not ('DirtyFinalPath' -as [type])) { $null = Get-DirtyKernelPath $Path }  # defines the type
+        $h = [DirtyFinalPath]::Pin($Path)
+        if ($h -ne [IntPtr]::Zero) { return $h }
+    } catch { }
+    return $null
+}
+function Unlock-DirtyDirectory($Handle) { if ($null -ne $Handle) { try { [DirtyFinalPath]::Unpin($Handle) } catch { } } }
+
+# True when $Path is the directory with this identity or sits anywhere below it. A spelling the path comparison cannot relate to the worktree (an SMB share of it, \\localhost\share,
+# whose resolved name is in the share's namespace) still opens onto the same volume serial + file index (r5 adversary A4).
+function Test-DirtyUnderIdentity([string]$Path, [string]$Identity) {
+    if (-not $Identity) { return $false }
+    $cur = $Path
+    for ($i = 0; $cur -and $i -lt 128; $i++) {
+        if ((Get-DirtyDirIdentity $cur) -ceq $Identity) { return $true }
+        $cur = [System.IO.Path]::GetDirectoryName($cur)
+    }
+    return $false
+}
+
 # The destination was resolved once, to its physical path, and every write goes to that literal path. Before each write and each publish the directory behind that path
 # must still be the same directory (same identity, same resolved path) and still outside the worktree; returns '' when it is, otherwise the typed reason.
-function Test-DirtyDestStable([string]$Dest, [string]$Identity, [string]$WtReal, [string]$Stage) {
+function Test-DirtyDestStable([string]$Dest, [string]$Identity, [string]$WtReal, [string]$WtIdentity, [string]$Stage) {
     $null = Invoke-DirtyDestCheckpoint $Stage
     if ((Get-DirtyDirIdentity $Dest) -cne $Identity) { return 'dest-identity-changed' }
     $now = Resolve-DirtyRealPath $Dest
     if ($now -ine $Dest) { return 'dest-identity-changed' }
-    if (Test-DirtyPathInside -Inner $now -Outer $WtReal) { return 'dest-inside-worktree' }
+    if ((Test-DirtyPathInside -Inner $now -Outer $WtReal) -or (Test-DirtyUnderIdentity -Path $now -Identity $WtIdentity)) { return 'dest-inside-worktree' }
     return ''
 }
 
@@ -151,7 +198,8 @@ function ConvertTo-DirtySingleQuoted([string]$Text) {
 function Test-DirtyPathInside([string]$Inner, [string]$Outer) {
     $cmp = if ($IsWindows -or $env:OS -eq 'Windows_NT') { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
     $sep = [System.IO.Path]::DirectorySeparatorChar
-    return ($Inner + $sep).StartsWith($Outer + $sep, $cmp)
+    $trim = [char[]]@('\', '/')
+    return ($Inner.TrimEnd($trim) + $sep).StartsWith($Outer.TrimEnd($trim) + $sep, $cmp)  # a drive root keeps its separator when resolved; the comparison must not double it
 }
 
 # True only when the saved file is byte-identical to what git writes to a pipe for the same diff (GitDiffArgs = the arguments after `git -C <Wt>`, without --output).
@@ -175,7 +223,7 @@ function Test-DirtyPatchComplete([string]$Wt, [string]$Patch, [string[]]$GitDiff
 }
 
 function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardName = '', [string]$RoundName = '') {
-    $tmp = $null; $stagedTmp = $null; $statTmp = $null; $mergeTmp = $null
+    $tmp = $null; $stagedTmp = $null; $statTmp = $null; $mergeTmp = $null; $destLock = $null; $wtLock = $null
     $PSNativeCommandUseErrorActionPreference = $false  # local to this call: every git exit code below is judged here, never thrown (git diff --cached --quiet exits 1 when something is staged)
     $evidence = ''  # ' patch=.. status=..' for the files placed so far; every failure after the first placement ends with it
     $CardName = $CardName -replace '\s+', ' '; $RoundName = $RoundName -replace '\s+', ' '  # the result is one line
@@ -190,18 +238,22 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         # A relative -Wt means the caller's PowerShell location; git -C and [IO.Path]::GetFullPath would read it against the process directory, which can differ (r4 adversary A1).
         if (-not (Test-Path -LiteralPath $Wt -PathType Container)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
         $Wt = (Resolve-Path -LiteralPath $Wt).ProviderPath
+        # -Dest and -Wt are each resolved ONCE, to their physical paths (every link and junction followed), and held open (Lock-DirtyDirectory) so neither can be renamed or swapped for a
+        # junction while the save runs. Every git call and write below uses those literal paths and never reopens the -Dest / -Wt spelling, so a junction retargeted after this point cannot
+        # steer evidence into the worktree or make git read another repository. $guard also re-proves the destination (same volume serial + file index, same resolved path, outside the
+        # worktree by path and by identity) right before each write and each rename into place, and a change is DIRTY_TREE_SAVE_FAILED reason=dest-identity-changed.
+        $destReal = Resolve-DirtyRealPath $Dest
+        $destLock = Lock-DirtyDirectory $destReal
+        $wtReal = Resolve-DirtyRealPath $Wt
+        $wtLock = Lock-DirtyDirectory $wtReal
+        $Dest = $destReal; $Wt = $wtReal
         $prefix = @(& git -C $Wt rev-parse --show-prefix 2>$null)
         if ($LASTEXITCODE -ne 0 -or ($prefix -join '').Trim() -ne '') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
-        # -Dest is resolved ONCE, to its physical path (every link and junction followed), and containment is judged on that path. Every write below goes to that literal path and never
-        # reopens the -Dest spelling, so a junction retargeted after this point cannot steer evidence into the worktree; $guard also re-proves the directory (same volume serial + file
-        # index, same resolved path, still outside the worktree) right before each write and each rename into place, and a change is DIRTY_TREE_SAVE_FAILED reason=dest-identity-changed.
-        $destReal = Resolve-DirtyRealPath $Dest
-        $wtReal = Resolve-DirtyRealPath $Wt
         if (Test-DirtyPathInside -Inner $destReal -Outer $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-inside-worktree" }
         $destId = Get-DirtyDirIdentity $destReal
+        $wtId = Get-DirtyDirIdentity $wtReal
         if (-not $destId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-identity-changed" }
-        $Dest = if ($destReal.Length -eq 2 -and $destReal[1] -eq ':') { $destReal + '\' } else { $destReal }  # a drive root keeps its separator, or Join-Path would mean the drive's current directory
-        $guard = { param($stage) Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -Stage $stage }
+        $guard = { param($stage) Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -WtIdentity $wtId -Stage $stage }
         $why = & $guard 'before-write'
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }
         $tmp = Join-Path $Dest ('dirty-worktree-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
@@ -300,6 +352,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
     catch { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($_.Exception.Message -replace '\s+', ' ')$evidence" }  # a throw after a placement still names what was placed (r4 adversary A2)
     finally {
         foreach ($t in $tmp, $stagedTmp, $statTmp, $mergeTmp) { if ($t -and (Test-Path -LiteralPath $t)) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } }
+        Unlock-DirtyDirectory $wtLock; Unlock-DirtyDirectory $destLock  # released only after the temp cleanup, which still runs inside the held destination
         foreach ($v in $savedEnv.Keys) { Set-Item -LiteralPath "Env:$v" -Value $savedEnv[$v] }
     }
 }

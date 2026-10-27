@@ -2894,7 +2894,8 @@ def test_save_dirty_worktree_evidence_refuses_to_publish_when_the_destination_id
     dest = tmp_path / "outside"
     dest.mkdir()
     before = git(wt, "status", "--porcelain")
-    shim = ("$script:Swapped = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
+    # Lock-DirtyDirectory is overridden to model a platform that cannot hold the directory open, so the identity check is what has to catch the swap.
+    shim = ("function Lock-DirtyDirectory([string]$Path) { $null }; $script:Swapped = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
             f"if ($Stage -eq 'before-publish' -and -not $script:Swapped) {{ $script:Swapped = $true; [System.IO.Directory]::Move('{dest}', '{dest}.moved'); "
             f"$null = New-Item -ItemType Junction -Path '{dest}' -Target '{wt / 'run'}' }} }}")
     out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
@@ -2903,6 +2904,92 @@ def test_save_dirty_worktree_evidence_refuses_to_publish_when_the_destination_id
     assert len(line.splitlines()) == 1 and "DIRTY_TREE_SAVED" not in line
     assert not list((wt / "run").iterdir()) and not [p for p in wt.glob("dirty-worktree-*")], "nothing may be written inside the source worktree"
     assert git(wt, "status", "--porcelain") == before
+
+
+@pytest.mark.skipif(os.name != "nt", reason="holding a directory open against rename is Windows share-mode behaviour")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_holds_the_destination_open_so_it_cannot_be_swapped_mid_save(tmp_path):
+    # r5 adversary A1: between the guard and the write there is a window no re-check can close; the destination is therefore held open (no FILE_SHARE_DELETE), and the attempt to
+    # rename it away mid-save fails, so the write cannot land in a replacement junction (and the temp cleanup cannot delete a same-named file in the source).
+    wt, _ = _dirty_save_repo(tmp_path)
+    (wt / "run").mkdir()
+    dest = tmp_path / "outside"
+    dest.mkdir()
+    shim = ("$script:Tried = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
+            f"if ($Stage -eq 'before-publish' -and -not $script:Tried) {{ $script:Tried = $true; try {{ [System.IO.Directory]::Move('{dest}', '{dest}.moved'); $script:Swap = 'swap=ALLOWED' }} catch {{ $script:Swap = 'swap=blocked' }} }} }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output $script:Swap")
+    assert "swap=blocked" in out.stdout and "swap=ALLOWED" not in out.stdout, (out.stdout, out.stderr)
+    assert "DIRTY_TREE_SAVED card=C1" in out.stdout and list(dest.glob("dirty-worktree-*.patch")) and not Path(str(dest) + ".moved").exists()
+    assert not list((wt / "run").iterdir()) and not [p for p in wt.glob("dirty-worktree-*")]
+    after = dirty_save_pwsh(f"[System.IO.Directory]::Move('{dest}', '{dest}.after'); Write-Output moved")
+    assert "moved" in after.stdout, "the hold must be released when the save returns"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a directory junction is the Windows spelling of a retargetable alias")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_reads_the_resolved_worktree_when_the_wt_junction_is_retargeted(tmp_path):
+    # r5 adversary A2: -Wt was only resolved for the containment check, then git read the -Wt alias again; a junction retargeted to another dirty repository made the saver describe
+    # (and write into) the wrong tree. The retarget happens in the Resolve-DirtyRealPath call that names the junction, so it exists on the pre-fix head as well.
+    wt_a, dest = _dirty_save_repo(tmp_path)
+    (tmp_path / "b").mkdir()
+    wt_b, _ = _dirty_save_repo(tmp_path / "b")
+    (wt_b / "src" / "a.txt").write_text("bee\n")
+    lane = tmp_path / "lane"
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(lane), str(wt_a)], capture_output=True, text=True)
+    if made.returncode != 0:
+        pytest.skip("cannot create a junction here: " + made.stderr)
+    before_b = git(wt_b, "status", "--porcelain")
+    shim = ("$script:RealRR = (Get-Command Resolve-DirtyRealPath -CommandType Function).ScriptBlock; $script:Retargeted = $false; "
+            "function Resolve-DirtyRealPath([string]$Path) { $r = & $script:RealRR $Path; "
+            f"if (-not $script:Retargeted -and $Path -eq '{lane}') {{ $script:Retargeted = $true; [System.IO.Directory]::Delete('{lane}'); "
+            f"$null = New-Item -ItemType Junction -Path '{lane}' -Target '{wt_b}' }}; $r }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{lane}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    patches = list(dest.glob("dirty-worktree-*.patch"))
+    assert out.stdout.startswith("DIRTY_TREE_SAVED card=C1") and len(patches) == 1, (out.stdout, out.stderr)
+    text = patches[0].read_text(encoding="utf-8")
+    assert "+two" in text and "+bee" not in text, "the patch must describe the worktree that was validated, not the one the junction was retargeted to"
+    assert git(wt_b, "status", "--porcelain") == before_b and not [p for p in wt_b.glob("dirty-worktree-*")]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the kernel path API is Windows-only")
+@dirty_save_only
+def test_get_dirty_kernel_path_resolves_a_path_longer_than_the_first_buffer(tmp_path):
+    # r5 adversary A3: GetFinalPathNameByHandle returns the size it needs when the 2048-char buffer is short; the helper used to give up there, so a long path fell back to the managed
+    # walk, which cannot see through a SUBST drive.
+    deep = Path("\\\\?\\" + str(tmp_path))
+    for _ in range(9):
+        deep = deep / ("d" * 230)
+    try:
+        os.makedirs(str(deep))
+        out = dirty_save_pwsh(f"$k = Get-DirtyKernelPath '{deep}'; if ($k) {{ Write-Output ('len=' + $k.Length) }} else {{ Write-Output 'len=none' }}")
+        assert out.stdout.strip() == f"len={len(str(deep)) - 4}", (out.stdout.strip()[:80], out.stderr[:200])
+    finally:
+        import shutil
+        shutil.rmtree("\\\\?\\" + str(tmp_path / ("d" * 230)), ignore_errors=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="an SMB share spelling is a Windows namespace")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_destination_that_reaches_the_worktree_through_an_smb_share_spelling(tmp_path):
+    # r5 adversary A4: \\localhost\C$\... resolves into the share namespace, where no local-prefix comparison relates it to the worktree; the volume serial + file index do.
+    wt, _ = _dirty_save_repo(tmp_path)
+    (wt / "run").mkdir()
+    drive, rest = os.path.splitdrive(str(wt / "run"))
+    unc = f"\\\\localhost\\{drive[0]}$" + rest
+    if not os.path.isdir(unc):
+        pytest.skip("no administrative share on this host")
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{unc}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-inside-worktree", (out.stdout, out.stderr)
+    assert not list((wt / "run").iterdir())
+
+
+@dirty_save_only
+def test_dirty_path_helpers_keep_the_drive_root_separator(tmp_path):
+    # r5 adversary A6: 'C:' alone is the drive's current directory; a resolved drive root must stay 'C:\' and still contain what is below it.
+    out = dirty_save_pwsh("Write-Output (Format-DirtyResolved 'C:\\'); Write-Output (Test-DirtyPathInside -Inner 'C:\\x' -Outer 'C:\\')") if os.name == "nt" else None
+    if out is None:
+        pytest.skip("drive roots are a Windows spelling")
+    assert out.stdout.split() == ["C:\\", "True"], (out.stdout, out.stderr)
 
 
 @dirty_save_only
