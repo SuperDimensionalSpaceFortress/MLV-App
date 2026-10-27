@@ -12,6 +12,7 @@
 # line is DIRTY_TREE_SAVE_FAILED reason=unmerged-index. Every DIRTY_TREE_SAVE_FAILED that comes after evidence was placed ends with the files already there: patch=<path> status=<path> merge-state=<path>.
 # The helper judges every git exit code itself and sets $PSNativeCommandUseErrorActionPreference = $false for its own calls, so the expected exit 1 of `git diff --cached --quiet` cannot throw under a caller that set it.
 # It refuses a -Dest inside the worktree it describes (reason=dest-inside-worktree): evidence written there would show in the next status and be captured by the next save.
+# -Dest is resolved once to its physical path and every write uses that path; a destination that changed identity before a write or publish is reason=dest-identity-changed.
 # Read-only on the worktree (nothing is restored, so the caller's refusal and exit code are unchanged), idempotent (same diff = same name), fail-soft (never throws), and it
 # refuses a directory that is not itself a worktree root (that would resolve to an ENCLOSING repo and save its diff). The same logic is deployed board-local in
 # hub-autopilot\dispatch-fix-round.ps1; keep the two in step.
@@ -22,12 +23,13 @@
 # move-failed:<HResult> <message> (the move threw an IOException and the target does not exist: a sharing violation or an AV lock on $Tmp, not a name clash).
 function Invoke-DirtyFileMove([string]$From, [string]$To) { [System.IO.File]::Move($From, $To) }  # one seam, so a test can stand in for a locked file
 
-function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem, [string]$Ext, [string]$Full, [string]$FirstName = '') {
+function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem, [string]$Ext, [string]$Full, [string]$FirstName = '', [scriptblock]$Guard = $null) {
     $names = @()
     if ($FirstName) { $names += , @($FirstName, '') }
     foreach ($n in 8, 16, 32, 64) { $names += , @("$Stem$($Full.Substring(0, $n))$Ext", $Full.Substring(0, $n)) }
     foreach ($pair in $names) {
         $cand = Join-Path $Dir $pair[0]
+        if ($Guard) { $why = & $Guard 'before-publish'; if ($why) { return @{ Path = $null; Reason = $why } } }  # the destination is re-proven right before each rename into place
         try { Invoke-DirtyFileMove $Tmp $cand; return @{ Path = $cand; Id = $pair[1]; Moved = $true } }
         catch [System.IO.IOException] {
             $ex = $_.Exception
@@ -57,6 +59,20 @@ public static class DirtyFinalPath {
     static extern uint GetFinalPathNameByHandleW(IntPtr handle, StringBuilder buffer, uint length, uint flags);
     [DllImport("kernel32.dll")]
     static extern bool CloseHandle(IntPtr handle);
+    [StructLayout(LayoutKind.Sequential)]
+    struct ByHandleInfo { public uint Attributes, CtLo, CtHi, AtLo, AtHi, WtLo, WtHi, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandle(IntPtr handle, out ByHandleInfo info);
+    // Volume serial + file index of what the path opens onto after every link is followed: two names for the same directory share it, a retargeted junction does not.
+    public static string Identity(string path) {
+        IntPtr h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+        if (h == (IntPtr)(-1)) return null;
+        try {
+            ByHandleInfo i;
+            if (!GetFileInformationByHandle(h, out i)) return null;
+            return i.Volume.ToString("X8") + ":" + i.IndexHigh.ToString("X8") + i.IndexLow.ToString("X8");
+        } finally { CloseHandle(h); }
+    }
     // No access rights, full sharing, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a directory can be opened).
     public static string Resolve(string path) {
         IntPtr h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
@@ -101,6 +117,28 @@ function Resolve-DirtyRealPath([string]$Path) {
         if (-not $relinked) { return $acc.TrimEnd([char[]]@('\', '/')) }
     }
     return $cur.TrimEnd([char[]]@('\', '/'))
+}
+
+# Volume serial + file index of the directory a path opens onto (every link followed); where the kernel cannot answer, the resolved path stands in for it.
+function Get-DirtyDirIdentity([string]$Path) {
+    if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+        try { if ('DirtyFinalPath' -as [type]) { return [DirtyFinalPath]::Identity($Path) } } catch { return $null }
+    }
+    return 'path:' + (Resolve-DirtyRealPath $Path)
+}
+
+# One seam, so a test can retarget or swap the destination at a named point; $Stage is 'before-write' or 'before-publish'.
+function Invoke-DirtyDestCheckpoint([string]$Stage) { }
+
+# The destination was resolved once, to its physical path, and every write goes to that literal path. Before each write and each publish the directory behind that path
+# must still be the same directory (same identity, same resolved path) and still outside the worktree; returns '' when it is, otherwise the typed reason.
+function Test-DirtyDestStable([string]$Dest, [string]$Identity, [string]$WtReal, [string]$Stage) {
+    $null = Invoke-DirtyDestCheckpoint $Stage
+    if ((Get-DirtyDirIdentity $Dest) -cne $Identity) { return 'dest-identity-changed' }
+    $now = Resolve-DirtyRealPath $Dest
+    if ($now -ine $Dest) { return 'dest-identity-changed' }
+    if (Test-DirtyPathInside -Inner $now -Outer $WtReal) { return 'dest-inside-worktree' }
+    return ''
 }
 
 # A PowerShell literal that survives pasting: inside double quotes a path such as C:\work\$lane would expand a variable; single quotes expand nothing, and the quote characters
@@ -154,7 +192,18 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $Wt = (Resolve-Path -LiteralPath $Wt).ProviderPath
         $prefix = @(& git -C $Wt rev-parse --show-prefix 2>$null)
         if ($LASTEXITCODE -ne 0 -or ($prefix -join '').Trim() -ne '') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
-        if (Test-DirtyPathInside -Inner (Resolve-DirtyRealPath $Dest) -Outer (Resolve-DirtyRealPath $Wt)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-inside-worktree" }
+        # -Dest is resolved ONCE, to its physical path (every link and junction followed), and containment is judged on that path. Every write below goes to that literal path and never
+        # reopens the -Dest spelling, so a junction retargeted after this point cannot steer evidence into the worktree; $guard also re-proves the directory (same volume serial + file
+        # index, same resolved path, still outside the worktree) right before each write and each rename into place, and a change is DIRTY_TREE_SAVE_FAILED reason=dest-identity-changed.
+        $destReal = Resolve-DirtyRealPath $Dest
+        $wtReal = Resolve-DirtyRealPath $Wt
+        if (Test-DirtyPathInside -Inner $destReal -Outer $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-inside-worktree" }
+        $destId = Get-DirtyDirIdentity $destReal
+        if (-not $destId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-identity-changed" }
+        $Dest = if ($destReal.Length -eq 2 -and $destReal[1] -eq ':') { $destReal + '\' } else { $destReal }  # a drive root keeps its separator, or Join-Path would mean the drive's current directory
+        $guard = { param($stage) Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -Stage $stage }
+        $why = & $guard 'before-write'
+        if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }
         $tmp = Join-Path $Dest ('dirty-worktree-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
         # The diff shape is pinned on every diff the saver runs, so no user, global or repo config can change what `git apply` (default -p1) has to read back:
         # a/ b/ prefixes (diff.noprefix / diff.mnemonicPrefix), no external driver or textconv (diff.external), -U3 (diff.context=0 and diff.interHunkContext would
@@ -167,7 +216,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $full = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
         # The name is the first 8 hex of the hash, lengthened until it is free or already holds these exact bytes (two different diffs may share a prefix).
         $bytes = (Get-Item -LiteralPath $tmp).Length
-        $placed = Move-DirtyEvidenceToFreeName -Tmp $tmp -Dir $Dest -Stem 'dirty-worktree-' -Ext '.patch' -Full $full
+        $placed = Move-DirtyEvidenceToFreeName -Tmp $tmp -Dir $Dest -Stem 'dirty-worktree-' -Ext '.patch' -Full $full -Guard $guard
         if (-not $placed.Path) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($placed.Reason)" }
         if ($placed.Moved) { $tmp = $null }
         $id = $placed.Id
@@ -180,10 +229,12 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         if ($statusExit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-status-exit-$statusExit$evidence" }
         # The same tracked diff can come back with a different untracked set, so the status file is placed like every other evidence file: <patch name>.status.txt when
         # free or identical, otherwise a hash-named sibling. A later save never rewrites an earlier snapshot.
+        $why = & $guard 'before-write'
+        if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
         $statTmp = Join-Path $Dest ('dirty-worktree-status-' + [Guid]::NewGuid().ToString('N') + '.tmp')
         [System.IO.File]::WriteAllLines($statTmp, [string[]]$status, (New-Object System.Text.UTF8Encoding($false)))  # UTF-8: quotepath=false prints literal non-ASCII names
         $statFull = (Get-FileHash -LiteralPath $statTmp -Algorithm SHA256).Hash.ToLowerInvariant()
-        $statPlaced = Move-DirtyEvidenceToFreeName -Tmp $statTmp -Dir $Dest -Stem "dirty-worktree-$id.status-" -Ext '.txt' -Full $statFull -FirstName "dirty-worktree-$id.status.txt"
+        $statPlaced = Move-DirtyEvidenceToFreeName -Tmp $statTmp -Dir $Dest -Stem "dirty-worktree-$id.status-" -Ext '.txt' -Full $statFull -FirstName "dirty-worktree-$id.status.txt" -Guard $guard
         if (-not $statPlaced.Path) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($statPlaced.Reason)$evidence" }
         if ($statPlaced.Moved) { $statTmp = $null }
         $stat = $statPlaced.Path
@@ -201,10 +252,12 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             }
             $state += 'unmerged index entries (mode sha stage<TAB>path):'
             $state += $unmerged
+            $why = & $guard 'before-write'
+            if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
             $mergeTmp = Join-Path $Dest ('dirty-worktree-merge-state-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
             [System.IO.File]::WriteAllLines($mergeTmp, [string[]]$state, (New-Object System.Text.UTF8Encoding($false)))
             $mergeFull = (Get-FileHash -LiteralPath $mergeTmp -Algorithm SHA256).Hash.ToLowerInvariant()
-            $mergePlaced = Move-DirtyEvidenceToFreeName -Tmp $mergeTmp -Dir $Dest -Stem 'dirty-worktree-merge-state-' -Ext '.txt' -Full $mergeFull
+            $mergePlaced = Move-DirtyEvidenceToFreeName -Tmp $mergeTmp -Dir $Dest -Stem 'dirty-worktree-merge-state-' -Ext '.txt' -Full $mergeFull -Guard $guard
             if (-not $mergePlaced.Path) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($mergePlaced.Reason)$evidence" }
             if ($mergePlaced.Moved) { $mergeTmp = $null }
             return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=unmerged-index$evidence merge-state=$($mergePlaced.Path)"
@@ -216,6 +269,8 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         if ($stagedState -notin 0, 1) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-staged-check-exit-$stagedState$evidence" }
         $stagedOut = 'none'
         if ($stagedState -eq 1) {
+            $why = & $guard 'before-write'
+            if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
             $stagedTmp = Join-Path $Dest ('dirty-worktree-staging-' + [Guid]::NewGuid().ToString('N') + '.tmp')
             & git -C $Wt diff --cached @shape "--output=$stagedTmp" 2>$null
             $stagedExit = $LASTEXITCODE
@@ -229,7 +284,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             $applyExit = $LASTEXITCODE
             if ($applyExit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-not-applicable$evidence" }
             $stagedFull = (Get-FileHash -LiteralPath $stagedTmp -Algorithm SHA256).Hash.ToLowerInvariant()
-            $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull
+            $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull -Guard $guard
             if (-not $stagedPlaced.Path) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($stagedPlaced.Reason)$evidence" }
             if ($stagedPlaced.Moved) { $stagedTmp = $null }
             $stagedOut = $stagedPlaced.Path

@@ -2859,6 +2859,52 @@ def test_save_dirty_worktree_evidence_refuses_a_destination_reached_through_a_su
         subprocess.run(["subst", f"{letter}:", "/d"], capture_output=True)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="a directory junction is the Windows spelling of a retargetable alias")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_keeps_writes_bound_to_the_validated_destination_when_a_junction_is_retargeted(tmp_path):
+    # r5 (sol r4 blocker): containment was checked once and every later write reopened the -Dest alias, so a junction retargeted into the worktree after the check
+    # wrote the evidence inside the tree it describes. The retarget happens inside the containment check itself (the Resolve-DirtyRealPath call that names the
+    # worktree), so no sleep race is involved and the seam exists on the pre-fix head too.
+    wt, _ = _dirty_save_repo(tmp_path)
+    (wt / "run").mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    alias = tmp_path / "alias-run"
+    made = subprocess.run(["cmd", "/c", "mklink", "/J", str(alias), str(outside)], capture_output=True, text=True)
+    if made.returncode != 0:
+        pytest.skip("cannot create a junction here: " + made.stderr)
+    before = git(wt, "status", "--porcelain")
+    shim = ("$script:RealRR = (Get-Command Resolve-DirtyRealPath -CommandType Function).ScriptBlock; $script:Retargeted = $false; "
+            "function Resolve-DirtyRealPath([string]$Path) { $r = & $script:RealRR $Path; "
+            f"if (-not $script:Retargeted -and $Path -eq '{wt}') {{ $script:Retargeted = $true; [System.IO.Directory]::Delete('{alias}'); "
+            f"$null = New-Item -ItemType Junction -Path '{alias}' -Target '{wt / 'run'}' }}; $r }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{alias}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert not list((wt / "run").iterdir()) and not [p for p in wt.glob("dirty-worktree-*")], ("evidence landed inside the source worktree", line, out.stderr)
+    assert git(wt, "status", "--porcelain") == before, "the source worktree must show no new file"
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED") or (line.startswith("DIRTY_TREE_SAVED") and list(outside.glob("dirty-worktree-*.patch"))), (line, out.stderr)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a directory junction is the Windows spelling of a retargetable alias")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_to_publish_when_the_destination_identity_changed(tmp_path):
+    # r5: the validated destination itself is swapped (renamed away, a junction into the worktree put in its place) between the temp write and the publish.
+    wt, _ = _dirty_save_repo(tmp_path)
+    (wt / "run").mkdir()
+    dest = tmp_path / "outside"
+    dest.mkdir()
+    before = git(wt, "status", "--porcelain")
+    shim = ("$script:Swapped = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
+            f"if ($Stage -eq 'before-publish' -and -not $script:Swapped) {{ $script:Swapped = $true; [System.IO.Directory]::Move('{dest}', '{dest}.moved'); "
+            f"$null = New-Item -ItemType Junction -Path '{dest}' -Target '{wt / 'run'}' }} }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-identity-changed"), (line, out.stderr)
+    assert len(line.splitlines()) == 1 and "DIRTY_TREE_SAVED" not in line
+    assert not list((wt / "run").iterdir()) and not [p for p in wt.glob("dirty-worktree-*")], "nothing may be written inside the source worktree"
+    assert git(wt, "status", "--porcelain") == before
+
+
 @dirty_save_only
 def test_save_dirty_worktree_evidence_names_the_placed_patch_when_a_later_step_throws(tmp_path):
     # r4 adversary A2: a throw after the patch was published (here: hashing a locked status candidate) came back from the general catch without the evidence already on disk.
