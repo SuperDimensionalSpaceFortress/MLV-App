@@ -3214,13 +3214,47 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual((b["endReason"], b["legsAttempted"], b["legsRan"]), ("ALL_LEGS_DONE", 1, 1))
         self.assertEqual(len(self.leg_calls()), 1)
 
-    def test_artifact_preflight_r3_a_lease_with_no_room_for_one_leg_skips_the_rehash_and_ends_as_before(self) -> None:
-        # noLeg: no leg can run on a lease shorter than the leg budget, so its builds are not re-hashed on its time; the leg loop ends LEG_BUDGET_EXCEEDS_LEASE as it always did, at once
+    def test_artifact_preflight_r3_a_lease_with_no_room_for_the_rehash_and_one_leg_is_refused_at_once(self) -> None:
+        # a lease shorter than the leg budget cannot start the re-read: LEG_BUDGET_EXCEEDS_LEASE at once, typed by the guard, before any probe and without the 40 s re-hash
         r, held = self._post_open_hash_run(40, FAKE_LEASE_REMAIN="30")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_BUDGET_EXCEEDS_LEASE item=1 ", r.stderr)
         [b] = self.batches()
         self.assertEqual((b["endReason"], b["legsAttempted"]), ("LEG_BUDGET_EXCEEDS_LEASE", 0))
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
         self.assertLess(held, 20, f"the lease was held {held:.1f} s: the 40 s re-hash ran on a lease that could hold no leg")
+
+    # r3 adversary A1 (pass 1 on 5c3407ff): the guard skipped the content re-check when the lease's room (a float) was under the leg budget, but the leg loop rounds the room to whole
+    # seconds, so a room of 59.9 s with a 60 s budget skipped the check AND let a probe and a leg run on a manifest changed in the open wait. The content is never skipped now.
+    def test_artifact_preflight_r3_adv_a1_a_lease_room_just_under_the_leg_budget_runs_no_probe_on_an_unchecked_build(self) -> None:
+        manifest = self.share / "cache" / f"playback-attr-3-cuda-{self.commit_a[:12]}-build.json"
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "95", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
+                                FAKE_OPEN_SLEEP="6", FAKE_LEASE_REMAIN="60")
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            time.sleep(1)
+            with open(manifest, "a", encoding="utf-8") as f:
+                f.write("\n")
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertEqual(p.returncode, 2, so + se)
+        self.assertRegex(se, r"LEG_PLAN_REFUSED reason=(LEG_BUDGET_EXCEEDS_LEASE|BUILD_MANIFEST_MISMATCH) item=1 ")
+        self.assertIn("found after the open", se)
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
+        self.assertEqual(self.leg_calls(), [])
+
+    # r3 adversary A2 (pass 1 on 5c3407ff): an open held in the agent's gate ran the guard at once with no budget (300 s), so a slow re-hash ran while the agent had already admitted
+    # the open and published its result, and the lease was held through it before the lease-aware guard below ever started. That call now checks locations only.
+    def test_artifact_preflight_r3_adv_a2_a_gate_held_open_is_not_rehashed_before_its_result_is_read(self) -> None:
+        r, held = self._post_open_hash_run(40, FAKE_OPEN_MODES="gatewait")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertLess(held, 95 - 60, f"the lease was held {held:.1f} s before the close: a re-hash ran outside the lease's room")
 
     def test_artifact_preflight_the_artifact_names_are_the_ones_the_leg_job_derives(self) -> None:
         script = (f"Import-Module '{ROOT / 'tools' / 'profiling' / 'bachelor' / 'AttrCudaArtifacts.psm1'}' -Force -DisableNameChecking\n"

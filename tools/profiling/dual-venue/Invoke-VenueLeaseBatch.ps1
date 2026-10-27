@@ -95,7 +95,8 @@
 #         (playSeconds, visualCapture and its opt-out reason, scaleFactor, acceptedEffectiveScale) it would throw on, is refused here (LEG_SPEC_INVALID, BAD_BACKEND)
 #         because Invoke-VenueLeg would throw on it only after the lease is open.
 #         The same content checks run again once the claim is held (inside -ClaimTtlSec less -ClaimRenewSec) and once the lease is open (inside the lease's room less
-#         -LeaseMarginSec and the leg budget, so a slow re-hash ends SHARE_UNREACHABLE before the lease is spent, never LEG_BUDGET_EXCEEDS_LEASE after it).
+#         -LeaseMarginSec and the leg budget, so a slow re-hash ends SHARE_UNREACHABLE before the lease is spent, never LEG_BUDGET_EXCEEDS_LEASE after it; a lease whose
+#         room cannot start the re-read is refused reason=LEG_BUDGET_EXCEEDS_LEASE at once, before any probe).
 #      b. The legs run in plan order (-PlanOrder AsGiven), or with the arms INTERLEAVED, A B A B (-PlanOrder Interleave, Get-VenueInterleavedLegPlan), so lease
 #         position and venue heat fall on every arm alike. Per-leg budget, re-check, claim loss and deadline handling are the scalar form's, leg by leg.
 #      c. Each leg process gets its own -SourceCommit / -BuildManifestSha256 / -Backend; each batch leg row and run result carries name, arm, backend, sourceCommit
@@ -532,9 +533,10 @@ function Test-OpenOutputAlias {
     $hit
 }
 
-function New-GuardBudget([double]$Sec, [string]$What, [bool]$NoLeg) {
-    # r3 (Dot 780783c4): the time the guard's content reads may take, counted on ONE monotonic clock started here (a Stopwatch, never the wall clock, which can step)
-    [pscustomobject]@{ clock = [Diagnostics.Stopwatch]::StartNew(); sec = $Sec; what = $What; noLeg = $NoLeg }
+function New-GuardBudget([double]$Sec, [string]$What, [string]$Code, [bool]$ContentOff) {
+    # r3 (Dot 780783c4): the time the guard's content reads may take, counted on ONE monotonic clock started here (a Stopwatch, never the wall clock, which can step). $Code types a
+    # share too small to start a read in. $ContentOff: this call checks locations only, because the content is checked again, on its own budget, before anything can run on it.
+    [pscustomobject]@{ clock = [Diagnostics.Stopwatch]::StartNew(); sec = $Sec; what = $What; code = $Code; contentOff = $ContentOff }
 }
 
 function Get-InputContentRefusal {
@@ -543,8 +545,8 @@ function Get-InputContentRefusal {
     # $null when nothing changed. r13 (Dot A1''): a manifest whose bytes cannot be read now (write-locked, the share not answering) is a hit too, SHARE_UNREACHABLE as in the preflight:
     # its digest cannot be re-validated, and no lease is opened on a build nobody re-validated.
     if (-not $legPlanMode) { return $null }
-    # r3 (Dot 780783c4): a lease with no room for one leg runs none (the leg loop ends LEG_BUDGET_EXCEEDS_LEASE before any probe), so its builds are not re-read on its time
-    if ($null -ne $script:guardBudget -and $script:guardBudget.noLeg) { return $null }
+    # r3 adversary A2: the open still held in the agent's gate is guarded for locations only; its content is checked once the result is in hand, inside the lease's room
+    if ($null -ne $script:guardBudget -and $script:guardBudget.contentOff) { return $null }
     $buildsLeft = @($script:guardedInputs | Where-Object { $_.kind -ceq 'build' }).Count
     foreach ($g in $script:guardedInputs) {
         if ($g.kind -ceq 'spec') {
@@ -560,7 +562,7 @@ function Get-InputContentRefusal {
             $share = 300
             if ($null -ne $script:guardBudget) { $share = [int][Math]::Min(300, [Math]::Floor(($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) / [Math]::Max(1, $buildsLeft))) }
             $buildsLeft--
-            if ($share -lt 2) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
+            if ($share -lt 2) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
             $manifestSec = [int][Math]::Min(30, $share - 1)
             $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $manifestSec -VerifyArtifacts -ArtifactTimeoutSec ($share - $manifestSec) -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe
             $within = $(if ($null -ne $script:guardBudget) { "a ${share} s share of $($script:guardBudget.what)" } else { "a ${share} s bound" })
@@ -901,7 +903,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $grantReadUtc = [DateTime]::UtcNow
         # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
         # before the first write (the CLAIM_* log lines, leg-plan.json): a hit releases a claim just taken, opens no lease and ends in the typed refusal (exit 2).
-        $script:guardBudget = $(if ($req.granted) { New-GuardBudget ($ClaimTtlSec - $ClaimRenewSec) "the claim guard (-ClaimTtlSec $ClaimTtlSec less -ClaimRenewSec $ClaimRenewSec)" $false } else { $null })
+        $script:guardBudget = $(if ($req.granted) { New-GuardBudget ($ClaimTtlSec - $ClaimRenewSec) "the claim guard (-ClaimTtlSec $ClaimTtlSec less -ClaimRenewSec $ClaimRenewSec)" 'SHARE_UNREACHABLE' $false } else { $null })
         $hit = Get-InputOutputRefusal
         $script:guardBudget = $null
         if ($hit) {
@@ -980,7 +982,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # CAPS d: um-run stopped while the agent still holds the open in its gate, re-asking a refused (exit 75) request. That is a wait, not a failure:
             # the open is never resubmitted (a second open would queue behind it); its result is read by name until the deadline.
             $b.openLeaseWait = 'EXIT_75_WAIT'
-            $null = Test-OpenOutputAlias   # r14 (adversary r13 pass 3 A2): the open returned (still held), so the guard runs before this line is written; it runs again below
+            # r14 (adversary r13 pass 3 A2): the open returned (still held), so the guard runs before this line is written; it runs again below. r3 adversary A2: for locations
+            # only -- the agent may admit the open and publish its result while a re-hash runs here, so the content is checked below, inside the lease's room, once the result is read.
+            $script:guardBudget = New-GuardBudget 0 'the gate wait (locations only)' '' $true
+            $null = Test-OpenOutputAlias
+            $script:guardBudget = $null
             L "BATCH_OPEN_STILL_WAITING batch=$batchNo job=$($b.openJobId) (held in the agent's admission gate: exit 75 is wait-and-retry; reading its result by name until $($deadline.ToString('o')))"
             while ($true) {
                 $jr = Get-VenueJobResult -AgentShare $AgentShare -JobId $b.openJobId
@@ -1003,16 +1009,16 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # and the run ends in the same typed refusal (exit 2). A link made after this check is a race no re-check closes (an instant later), and is not claimed here.
         # r13 pass 2 (adversary A3): the lease's end is placed from the moment the result was read, BEFORE the guard's reads (which can take a while), never after them
         $openReadUtc = [DateTime]::UtcNow
-        $openGuard = New-GuardBudget 0 '' $true   # its clock starts with the read time every bound below is measured from
+        $openGuard = New-GuardBudget 0 '' 'LEG_BUDGET_EXCEEDS_LEASE' $false   # its clock starts with the read time every bound below is measured from
         $leaseEnd = Get-LeaseEndUtc $op.result
         # r3 (Dot 780783c4): the guard's content reads run on the lease's time, so they are bounded by what the lease can spare: its end (clamped as the legs' is below, from the same
         # read time) less -LeaseMarginSec, the leg budget and 1 s for the leg loop's whole-second rounding. A re-hash that cannot finish in that is a typed SHARE_UNREACHABLE refusal while
-        # a leg budget is still left, never a leg-less LEG_BUDGET_EXCEEDS_LEASE after it was spent. A lease with no room for one leg skips the content reads (noLeg): it runs no leg.
+        # a leg budget is still left, never a leg-less LEG_BUDGET_EXCEEDS_LEASE after it was spent. r3 adversary A1: the content is never skipped; a lease whose room cannot start a
+        # re-read (under 2 s left of that, a lease shorter than the leg budget included) is refused LEG_BUDGET_EXCEEDS_LEASE at once, before any probe.
         $guardEnd = $(if ($null -ne $leaseEnd) { $leaseEnd } else { $openReadUtc })
         $guardCapEnd = $openReadUtc.AddSeconds([Math]::Min($LeaseCapSec, [Math]::Max(0, $bw.budgetRoomSec)))
         if ($guardEnd -gt $guardCapEnd) { $guardEnd = $guardCapEnd }
-        $guardRoomSec = ($guardEnd - $openReadUtc).TotalSeconds - $LeaseMarginSec
-        $openGuard.sec = $guardRoomSec - $legBudget - 1; $openGuard.noLeg = ($guardRoomSec -lt $legBudget)
+        $openGuard.sec = ($guardEnd - $openReadUtc).TotalSeconds - $LeaseMarginSec - $legBudget - 1
         $openGuard.what = "the lease's room after the open (until $($guardEnd.ToString('o')) less -LeaseMarginSec $LeaseMarginSec, the ${legBudget} s leg budget and 1 s)"
         # r14 (Dot 2e6eb21d; adversary r13 pass 3 A1, A2): the guard runs for EVERY outcome, a gate hold that reached the deadline included, and a location hit suppresses the writes
         # whichever typed stop wins below (OPEN_FAILED, AGENT_NOT_BATCH_CAPABLE, DEADLINE, ...); only a clean open turns a hit into the refusal itself.

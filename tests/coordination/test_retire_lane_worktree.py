@@ -3081,13 +3081,13 @@ UNRESOLVED_EXECUTED_SITES = {
     ],
     "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1": [
         ("[scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript))",
-         "LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r2 offline test seam: the text of the -StagedBuildProbeScript file its caller names. :189 refuses both seams "
-         "(BATCH_USAGE, exit 2) whenever -UmRunScript is the real um-run.ps1, by full path or by content hash (:184-185), before either scriptblock is compiled; "
-         ":190 refuses a seam file that does not exist. The block is only handed to Get-VenueStagedBuildManifest -ProbeScript, which runs its .ToString() on the "
+         "LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r2 offline test seam: the text of the -StagedBuildProbeScript file its caller names. :190 refuses both seams "
+         "(BATCH_USAGE, exit 2) whenever -UmRunScript is the real um-run.ps1, by full path or by content hash (:185-186), before either scriptblock is compiled; "
+         ":191 refuses a seam file that does not exist. The block is only handed to Get-VenueStagedBuildManifest -ProbeScript, which runs its .ToString() on the "
          "bounded manifest-read worker runspace (VenueChain.psm1 Invoke-VenueBoundedRead); production passes no seam and never reaches this site"),
         ("[scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript))",
-         "the second r2 seam, the same guard: the text of the -ArtifactProbeScript file its caller names, refused with the real um-run.ps1 (:189, by path or by "
-         "content hash :184-185) and when absent (:190) before it is compiled, and only handed to Get-VenueStagedBuildManifest -ArtifactProbeScript, which runs it "
+         "the second r2 seam, the same guard: the text of the -ArtifactProbeScript file its caller names, refused with the real um-run.ps1 (:190, by path or by "
+         "content hash :185-186) and when absent (:191) before it is compiled, and only handed to Get-VenueStagedBuildManifest -ArtifactProbeScript, which runs it "
          "on the bounded artifact-hash worker runspace (Invoke-VenueBoundedRead, inside the call's own -ArtifactTimeoutSec)"),
     ],
     "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
