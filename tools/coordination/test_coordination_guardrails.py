@@ -2842,6 +2842,80 @@ def test_save_dirty_worktree_evidence_refuses_a_destination_spelled_with_an_8_3_
     assert not list((wt / "a-long-run-directory").iterdir())
 
 
+@pytest.mark.skipif(os.name != "nt", reason="SUBST is a Windows drive mapping")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_destination_reached_through_a_subst_drive(tmp_path):
+    # r4 adversary A1: no managed API reports a SUBST drive, so X:\run was compared as a different tree from the worktree it physically sits in.
+    wt, _ = _dirty_save_repo(tmp_path)
+    (wt / "run").mkdir()
+    letter = next((c for c in "XWVUTSRQPONM" if not Path(f"{c}:\\").exists()), None)
+    if letter is None or subprocess.run(["subst", f"{letter}:", str(wt)], capture_output=True).returncode != 0:
+        pytest.skip("cannot map a SUBST drive here")
+    try:
+        out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{letter}:\\run' -CardName C1 -RoundName r1")
+        assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-inside-worktree", out.stdout + out.stderr
+        assert not list((wt / "run").iterdir())
+    finally:
+        subprocess.run(["subst", f"{letter}:", "/d"], capture_output=True)
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_names_the_placed_patch_when_a_later_step_throws(tmp_path):
+    # r4 adversary A2: a throw after the patch was published (here: hashing a locked status candidate) came back from the general catch without the evidence already on disk.
+    wt, dest = _dirty_save_repo(tmp_path)
+    first = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert first.stdout.startswith("DIRTY_TREE_SAVED"), first.stdout + first.stderr
+    patch = next(dest.glob("dirty-worktree-*.patch"))
+    shim = ("$script:RealFH = Get-Command Get-FileHash -CommandType Cmdlet; "
+            "function Get-FileHash { if (@($args | Where-Object { \"$_\" -like '*.status.txt' }).Count) { throw [System.IO.IOException]::new('locked by another process') }; & $script:RealFH @args }")
+    out = dirty_save_pwsh(f"$ErrorActionPreference = 'Stop'; {shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=") and "locked by another process" in line, out.stdout + out.stderr
+    assert line.endswith(f" patch={patch}"), line
+
+
+def _gitlink_checked_out_elsewhere(wt):
+    """A submodule recorded at one commit in HEAD and the index but checked out at another."""
+    git(wt, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},vendor/sub")
+    git(wt, "commit", "-qm", "gitlink")
+    sub = wt / "vendor" / "sub"
+    sub.mkdir(parents=True)
+    make_repo(sub)
+    git(wt, "config", "diff.ignoreSubmodules", "all")
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_status_lists_a_submodule_checked_out_at_another_commit(tmp_path):
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    _gitlink_checked_out_elsewhere(wt)
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVED"), out.stdout + out.stderr
+    assert "vendor/sub" in next(dest.glob("dirty-worktree-*.status.txt")).read_text(encoding="utf-8")
+
+
+def test_continuation_dirty_refusal_sees_a_submodule_checked_out_at_another_commit(tmp_path):
+    # r4 adversary A3: diff.ignoreSubmodules=all made `git status` empty, so the dirty branch was skipped, nothing was saved and the lane reused the tree.
+    dual, head = editing_board(tmp_path)
+    subprocess.run(["git", "checkout", "-q", "-b", "product/TEST-EDIT-CONT-10"], cwd=tmp_path, check=True)
+    (tmp_path / "stage1.txt").write_text("stage one\n")
+    subprocess.run(["git", "add", "stage1.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},vendor/sub"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "stage one"], cwd=tmp_path, check=True)
+    tip = git(tmp_path, "rev-parse", "HEAD")
+    subprocess.run(["git", "checkout", "-q", "--detach", head], cwd=tmp_path, check=True)
+    wt = tmp_path / "wt-cont-10"
+    subprocess.run(["git", "worktree", "add", str(wt), "product/TEST-EDIT-CONT-10"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(["git", "config", "diff.ignoreSubmodules", "all"], cwd=tmp_path, check=True)
+    make_repo(wt / "vendor" / "sub")
+    try:
+        result = run_editing_dispatch(tmp_path, [_reuse_card(dual, "TEST-EDIT-CONT-10")], "TEST-EDIT-CONT-10", extra=("-ContinueFromSha", tip))
+        assert result.returncode == 6 and "REFUSED continuation-worktree-dirty" in result.stdout and "vendor/sub" in result.stdout, result.stdout + result.stderr
+        assert "DIRTY_TREE_SAVED card=TEST-EDIT-CONT-10 " in result.stdout, result.stdout
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=tmp_path, check=False, capture_output=True)
+
+
 @dirty_save_only
 def test_save_dirty_worktree_evidence_fails_soft_and_refuses_a_non_root_directory(tmp_path):
     wt = tmp_path / "wt"

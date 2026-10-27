@@ -41,7 +41,46 @@ function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem,
 
 # The canonical spelling of an existing path: every component in the case and long-name form the file system stores it under (an 8.3 alias or a different case
 # would defeat a prefix comparison), and every directory link or junction on the way replaced by its target. Used only to decide whether two paths overlap.
+# On Windows the kernel answers first (GetFinalPathNameByHandle), because only it sees through a SUBST drive, which no managed API reports; the walk below is the fallback.
+function Get-DirtyKernelPath([string]$Path) {
+    if (-not ($IsWindows -or $env:OS -eq 'Windows_NT')) { return $null }
+    try {
+        if (-not ('DirtyFinalPath' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class DirtyFinalPath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandleW(IntPtr handle, StringBuilder buffer, uint length, uint flags);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+    // No access rights, full sharing, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a directory can be opened).
+    public static string Resolve(string path) {
+        IntPtr h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
+        if (h == (IntPtr)(-1)) return null;
+        try {
+            StringBuilder sb = new StringBuilder(2048);
+            uint n = GetFinalPathNameByHandleW(h, sb, 2048, 0);
+            return (n == 0 || n >= 2048) ? null : sb.ToString();
+        } finally { CloseHandle(h); }
+    }
+}
+'@
+        }
+        $final = [DirtyFinalPath]::Resolve($Path)
+        if (-not $final) { return $null }
+        if ($final.StartsWith('\\?\UNC\')) { return '\\' + $final.Substring(8) }
+        if ($final.StartsWith('\\?\')) { return $final.Substring(4) }
+        return $final
+    } catch { return $null }
+}
+
 function Resolve-DirtyRealPath([string]$Path) {
+    $kernel = Get-DirtyKernelPath ([System.IO.Path]::GetFullPath($Path))
+    if ($kernel) { return $kernel.TrimEnd([char[]]@('\', '/')) }
     $cur = [System.IO.Path]::GetFullPath($Path)
     for ($round = 0; $round -lt 32; $round++) {
         $root = [System.IO.Path]::GetPathRoot($cur)
@@ -125,7 +164,8 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $patch = $placed.Path
         $evidence = " patch=$patch"
         # --untracked-files=all: a status.showUntrackedFiles=no config must not hide the untracked names this file exists to keep.
-        $status = @(& git -C $Wt -c core.quotepath=false status --porcelain --untracked-files=all 2>$null)
+        # --ignore-submodules=none: diff.ignoreSubmodules=all / submodule.<name>.ignore=all would hide a submodule checked out at another commit, which the patch (pinned the same way) records.
+        $status = @(& git -C $Wt -c core.quotepath=false status --porcelain --untracked-files=all --ignore-submodules=none 2>$null)
         $statusExit = $LASTEXITCODE
         if ($statusExit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-status-exit-$statusExit$evidence" }
         # The same tracked diff can come back with a different untracked set, so the status file is placed like every other evidence file: <patch name>.status.txt when
@@ -183,6 +223,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             if (-not $stagedPlaced.Path) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($stagedPlaced.Reason)$evidence" }
             if ($stagedPlaced.Moved) { $stagedTmp = $null }
             $stagedOut = $stagedPlaced.Path
+            $evidence += " staged=$stagedOut"
         }
         $verified = 'empty-diff'  # git apply refuses an empty patch (exit 128), so there is nothing to ask it
         if ($bytes -ne 0) {
@@ -191,7 +232,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         }
         return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=git -C `"$Wt`" apply `"$patch`""
     }
-    catch { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($_.Exception.Message -replace '\s+', ' ')" }
+    catch { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($_.Exception.Message -replace '\s+', ' ')$evidence" }  # a throw after a placement still names what was placed (r4 adversary A2)
     finally {
         foreach ($t in $tmp, $stagedTmp, $statTmp, $mergeTmp) { if ($t -and (Test-Path -LiteralPath $t)) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } }
         foreach ($v in $savedEnv.Keys) { Set-Item -LiteralPath "Env:$v" -Value $savedEnv[$v] }
