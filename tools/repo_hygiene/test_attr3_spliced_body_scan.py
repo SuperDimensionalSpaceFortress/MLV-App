@@ -1882,6 +1882,11 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
                            "$m.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')", DEF_CALL),
         "AdvR12CommandInfo": ("$c = gcm Get-AttrCudaEmbeddedFunctionSource; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n"
                               "$c.Module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')", DEF_CALL),
+        # r12 adversary pass 2 (A1), verbatim: a foreach variable carries the module object; and its pipeline sibling ($_).
+        "AdvR12ForeachModule": ("Import-Module '{dir}\\Extractor.psm1'; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
+                                "foreach($module in @(Get-Module Extractor)){{$module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')}}", DEF_CALL),
+        "AdvR12PipelineModule": ("Import-Module '{dir}\\Extractor.psm1'; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
+                                 "Get-Module Extractor | ForEach-Object {{ $_.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}') }}", DEF_CALL),
         "AdvR12ModuleType": ("$m = [psmoduleinfo]$null; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n$m.$sn.$vn.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
     }
     # Not unproven: a computed member of parsed data (the real playback-attr-3-cuda-job.ps1 shape), a folded name that is not a route.
@@ -1902,6 +1907,7 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         "AdvR11Reflection": " [CmdletBinding()]param($Target)\n $r=@{}\n $PSCmdlet.PSObject.Properties['SessionState'].Value.PSObject.Properties['PSVariable'].Value.Set('r',$Target)\n $r.Attributes=1",
         "AdvR11MultiTarget": " [CmdletBinding()]param($Target)\n $r=@{}\n $m='Session'+'State'; $p='PSVar'+'iable'\n $s,$ignored=$PSCmdlet,0\n $s.$m.$p.Set('r',$Target)\n $r.Attributes=1",
         # r12 adversary A2, the receiver form: a module object reaches the session that holds the receiver.
+        "AdvR12ForeachReceiver": " param($Target)\n $r=@{}\n $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n foreach($module in @(Get-Module Body)){$module.$sn.$vn.Set('r',$Target)}\n $r.Attributes=1",
         "AdvR12ModuleReceiver": " param($Target)\n $r=@{}\n $module=Get-Module Body; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n $module.$sn.$vn.Set('r',$Target)\n $r.Attributes=1",
     }
     BODY_CONTROLS = {
@@ -2018,10 +2024,16 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
         (d / "VarRedirect.psm1").write_text(f"${{function:global:Split-Path}} = {{ param($Path) '{d}' }}\n$function:global:Join-Path = {{ param($Path,$ChildPath) '{d / 'Dirty.psm1'}' }}\n", encoding="utf-8")
         (d / "gen-var.ps1").write_text(f"Import-Module '{d / 'VarRedirect.psm1'}'\n"
                                        "Get-AttrCudaEmbeddedFunctionSource -Name 'Probe' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n", encoding="utf-8")
+        # r12 adversary pass 2 (A2), verbatim: a -ModulePath module replaces the extractor itself through the function: drive.
+        (d / "Shadow.psm1").write_text("Set-Item function:global:Get-AttrCudaEmbeddedFunctionSource -Value { param([string[]]$Name,[string]$ModulePath); "
+                                       f"Extractor\\Get-AttrCudaEmbeddedFunctionSource -Name $Name -ModulePath '{d / 'Dirty.psm1'}' }}\n", encoding="utf-8")
+        (d / "gen-shadow.ps1").write_text(f"Import-Module '{d / 'Extractor.psm1'}'; Import-Module '{d / 'Shadow.psm1'}'\n"
+                                          f"Get-AttrCudaEmbeddedFunctionSource -Name Probe -ModulePath '{d / 'Clean.psm1'}'\n", encoding="utf-8")
+        cls.extractor_drive = run_scan(modules=[d / "Extractor.psm1", d / "Shadow.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-shadow.ps1"])
         cls.join_path_variable = run_scan(modules=[d / "Extractor.psm1", d / "VarRedirect.psm1", d / "Clean.psm1", d / "Dirty.psm1"], splice_sources=[d / "gen-var.ps1"])
 
     def check(self, result: dict) -> None:
-        calls = [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and "'Probe'" in f["text"]]
+        calls = [f for f in result["splicedViolations"] if f["rule"] == "splice" and f["function"] == "" and re.search(r"-Name '?Probe\b", f["text"])]
         self.assertEqual([f["token"] for f in calls], ["unproven-binding"], describe(result["splicedViolations"]))
         self.assertIn("alias", calls[0]["reason"])
         self.assertEqual([s for s in result["spliced"] if s["name"] == "Probe"], [], "a module was scanned in place of the one runtime reads")
@@ -2040,6 +2052,9 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
 
     def test_r12_a1_an_imported_function_variable_assignment_of_join_path_makes_the_binding_unproven(self) -> None:
         self.check(self.join_path_variable)
+
+    def test_r12_pass2_a2_an_imported_function_drive_replacement_of_the_extractor_makes_the_binding_unproven(self) -> None:
+        self.check(self.extractor_drive)
 
     def test_r11_a2_a_module_that_reaches_the_defaults_through_another_modules_alias_is_an_unproven_binding(self) -> None:
         found = [f for f in self.module_defaults["splicedViolations"] if f["token"] == "unproven-binding" and f["source"].endswith("B.psm1")]

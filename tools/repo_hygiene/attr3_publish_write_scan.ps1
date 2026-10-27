@@ -1190,6 +1190,57 @@ $script:sessionCarrierCommands = @('get-variable', 'gv', 'get-module', 'gmo', 'i
                                    'get-host', 'get-runspace', 'get-pscallstack')
 $script:sessionCarrierTypePattern = '(?i)runspace|powershell|SessionState|psvariable|Management\.Automation|psmoduleinfo|commandinfo|functioninfo|scriptblock|^host$|pshost'
 
+function Test-SessionCarrierCommand($Command) {
+    # r12 adversary A2: a command whose result may carry the session. Import-Module hands back the module only with -PassThru (any
+    # prefix of it, or a splat that may hold it).
+    $names = @(Get-ResolvedCommandNames $Command | Where-Object { $script:sessionCarrierCommands -contains $_ })
+    if ($names.Count -eq 0) { return $false }
+    # Get-Command on one constant executable name (`Get-Command python.exe`, the real generator's probe) hands back an ApplicationInfo,
+    # which carries no module.
+    if (@($names | Where-Object { @('get-command', 'gcm') -notcontains $_ }).Count -eq 0) {
+        $named = @(Get-NamedArguments $Command @('Name') | Where-Object { $_ -is [System.Management.Automation.Language.Ast] })
+        $operand = if ($named.Count -eq 1) { $named[0] } elseif ($named.Count -eq 0 -and $Command.CommandElements.Count -gt 1 -and $Command.CommandElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $Command.CommandElements[1] } else { $null }
+        $commandName = if ($null -eq $operand -or @($Command.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count -gt 0) { $null } elseif ($operand -is [System.Management.Automation.Language.StringConstantExpressionAst]) { [string]$operand.Value } else { Get-SingleConstant $operand }
+        if ($null -ne $commandName -and $commandName -match '(?i)^[^*?\[\]]+\.(exe|com|cmd|bat)$') { return $false }
+        return $true
+    }
+    if (@($names | Where-Object { @('import-module', 'ipmo') -notcontains $_ }).Count -gt 0) { return $true }
+    return (@($Command.CommandElements | Where-Object {
+        ($_ -is [System.Management.Automation.Language.CommandParameterAst] -and $_.ParameterName.Length -ge 2 -and 'passthru'.StartsWith($_.ParameterName.ToLowerInvariant())) -or
+        ($_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted) }).Count -gt 0)
+}
+
+function Test-TreeNamesSessionCarrier($Root) {
+    # r11 adversary pass 2 (A1), widened by r12 adversary pass 2 (A1): a tree that names a session root variable, calls a command whose
+    # result may carry the session (Get-Module, Get-Command, ...) or names an engine type anywhere can hand that value to any receiver
+    # through a foreach variable, the pipeline's $_, a multi-target assignment or a function result
+    # (`foreach ($module in @(Get-Module Extractor)) { $module.$sn... }`), so every receiver of an unfoldable member counts there.
+    # A carrier command counts here only where its value flows on (a foreach source, a pipeline stage that is not the last, a block's
+    # output); one assigned to a variable is that variable's (Test-VariableMayHoldSession), one tested in place (`if (Get-Command X)`)
+    # hands nothing on. Only the engine types that are or reach the session count, not every System.Management.Automation type.
+    if (-not $script:sessionCarrierTrees.ContainsKey($Root)) {
+        $script:sessionCarrierTrees[$Root] = @($Root.FindAll({ param($x)
+            ($x -is [System.Management.Automation.Language.VariableExpressionAst] -and $script:sessionRootVariables -icontains (Get-VariableName $x).name) -or
+            ($x -is [System.Management.Automation.Language.CommandAst] -and (Test-SessionCarrierCommand $x) -and (Test-CarrierValueFlowsOn $x)) -or
+            (($x -is [System.Management.Automation.Language.TypeExpressionAst] -or $x -is [System.Management.Automation.Language.TypeConstraintAst]) -and $x.TypeName.FullName -match $script:sessionTreeTypePattern) }, $true)).Count -gt 0
+    }
+    return $script:sessionCarrierTrees[$Root]
+}
+$script:sessionCarrierTrees = @{}
+$script:sessionTreeTypePattern = '(?i)(^|\.)(runspace|runspacefactory|powershell|SessionState|SessionStateProxy|psvariable|PSVariableIntrinsics|EngineIntrinsics|psmoduleinfo|commandinfo|functioninfo|scriptblock|pshost|PSCmdlet)$'
+
+function Test-CarrierValueFlowsOn($Command) {
+    $pipe = $Command.Parent
+    if ($pipe -isnot [System.Management.Automation.Language.PipelineAst]) { return $true }
+    if ($pipe.PipelineElements.IndexOf($Command) -lt $pipe.PipelineElements.Count - 1) { return $true }
+    if ($pipe.Parent -is [System.Management.Automation.Language.StatementBlockAst] -or $pipe.Parent -is [System.Management.Automation.Language.NamedBlockAst]) { return $true }
+    for ($p = $pipe.Parent; $null -ne $p; $p = $p.Parent) {
+        if ($p -is [System.Management.Automation.Language.ForEachStatementAst] -and $Command.Extent.StartOffset -ge $p.Condition.Extent.StartOffset -and $Command.Extent.EndOffset -le $p.Condition.Extent.EndOffset) { return $true }
+        if ($p -is [System.Management.Automation.Language.StatementAst] -and $p -isnot [System.Management.Automation.Language.PipelineBaseAst] -and $p -isnot [System.Management.Automation.Language.CommandBaseAst]) { break }
+    }
+    return $false
+}
+
 function Test-MemberReceiverMayBeSession($Member, $Root) {
     # r11: true when the receiver of a member access whose name the scan cannot fold may be (or reach) the session: it starts at a
     # session root variable, a variable: path, a type, a command result or any other value that is not a plain variable, or a
@@ -1198,7 +1249,7 @@ function Test-MemberReceiverMayBeSession($Member, $Root) {
     # (`$table = ... | ConvertFrom-Json; $table.venues.$name`).
     # r11 adversary pass 2 (A1): in a tree that names a session root anywhere, a foreach variable, a multi-target assignment or a
     # function's result can carry it to any receiver (`foreach ($s in @($PSCmdlet)) { $s.$m... }`), so every receiver counts there.
-    if (@($Root.FindAll({ param($v) $v -is [System.Management.Automation.Language.VariableExpressionAst] -and $script:sessionRootVariables -icontains (Get-VariableName $v).name }, $true)).Count -gt 0) { return $true }
+    if (Test-TreeNamesSessionCarrier $Root) { return $true }
     $node = $Member.Expression
     while ($true) {
         if ($node -is [System.Management.Automation.Language.MemberExpressionAst]) { $node = $node.Expression; continue }
@@ -1211,7 +1262,7 @@ function Test-MemberReceiverMayBeSession($Member, $Root) {
     $name = (Get-VariableName $node).name
     if ($script:sessionRootVariables -icontains $name) { return $true }
     if ($script:engineInputVariables -icontains $name) {
-        return (@($Root.FindAll({ param($x) $x -is [System.Management.Automation.Language.VariableExpressionAst] -and $script:sessionRootVariables -icontains (Get-VariableName $x).name }, $true)).Count -gt 0)
+        return (Test-TreeNamesSessionCarrier $Root)
     }
     return (Test-VariableMayHoldSession $Root $name ([System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)))
 }
@@ -1238,7 +1289,7 @@ function Test-VariableMayHoldSession($Root, [string]$Name, $Visiting) {
             $source = (Get-VariableName $x).name
             if ($script:sessionRootVariables -icontains $source) { return $true }
             if ($script:engineInputVariables -icontains $source) {
-                if (@($Root.FindAll({ param($v) $v -is [System.Management.Automation.Language.VariableExpressionAst] -and $script:sessionRootVariables -icontains (Get-VariableName $v).name }, $true)).Count -gt 0) { return $true }
+                if (Test-TreeNamesSessionCarrier $Root) { return $true }
                 continue
             }
             if (Test-VariableMayHoldSession $Root $source $Visiting) { return $true }
@@ -1919,7 +1970,10 @@ function Get-SpliceCallSites([string]$Path) {
     # `$function:Join-Path = { ... }`): the module's top level is judged by the same shadow model as the source's own code.
     if (-not $importedReplacement) {
         foreach ($moduleKey in @($moduleAsts.Keys)) {
-            $replaced = @(Get-ShadowingDefinitions $moduleAsts[$moduleKey] @('Join-Path', 'Split-Path', 'New-Object') | Where-Object {
+            # r12 adversary pass 2 (A2): the extractor too (`Set-Item function:global:Get-AttrCudaEmbeddedFunctionSource -Value { ... }`);
+            # only its own `function` definition is the extractor module, judged by the default-module rule.
+            $replaced = @(Get-ShadowingDefinitions $moduleAsts[$moduleKey] @('Join-Path', 'Split-Path', 'New-Object', 'Get-AttrCudaEmbeddedFunctionSource') | Where-Object {
+                if ($_.Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and (Get-BareCommandName $_.Ast.Name) -eq 'get-attrcudaembeddedfunctionsource') { return $false }
                 for ($p = $_.Ast.Parent; $null -ne $p; $p = $p.Parent) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false } }
                 return $true } | Select-Object -First 1)
             if ($replaced.Count -gt 0) {
