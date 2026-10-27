@@ -919,6 +919,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             if ($openHit.kind -cne 'content') {
                 $script:RunOutputAliased = $true
                 $script:jobDir = Join-Path ([IO.Path]::GetTempPath()) "venue-lease-batch-close-$token"; New-Item -ItemType Directory -Force -Path $script:jobDir | Out-Null
+                $script:batchLog = Join-Path $script:jobDir 'batch.log'   # the final result-line append lands there, not in -RunDir
             } $b.endDetail = "after the open, before any probe or leg: $($hr[2])"
             [Console]::Error.WriteLine("BATCH_USAGE $(if ($legPlanMode) { "LEG_PLAN_REFUSED reason=$($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" })" } else { $hr[0] }) $($hr[2]) (found after the open: no probe or leg ran; the lease is closed)")
             Set-Stop $hr[0] 2
@@ -1178,7 +1179,7 @@ $summary = [ordered]@{
 }
 if ($legPlanMode) { $summary.legPlan = [ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
 $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-try { if (-not $script:RunOutputAliased) { Add-Content -LiteralPath $batchLog -Value $resultLine } } catch {   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
+try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch {   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
     # r7 (sol r6b): the count was serialized before this append, so the append that just failed is counted and the line for stdout is serialized again with it (stdout is the authority when batch.log is broken).
     Register-LogFailure $_.Exception.Message
     $summary.logWriteFailures = $script:logWriteFailures
