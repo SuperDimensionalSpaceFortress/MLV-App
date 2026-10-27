@@ -612,7 +612,7 @@ function Get-VenueStagedBuildManifest {
             {
                 param($p)
                 # r13 (Dot A1''): a read that fails (a manifest a writer holds open, a share error) ends the read, so it is UNREACHABLE with its own error. Under the runspace's default
-                # Continue, a failed ReadAllBytes went on with no bytes and the read reported NOT_STAGED, a manifest it never looked at.
+                # Continue, a failed byte read went on with no bytes and the read reported NOT_STAGED, a manifest it never looked at.
                 $ErrorActionPreference = 'Stop'
                 if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return '' }
                 # ONE read: the digest and the facts below come from the same bytes (a file replaced between two reads would pair one version's hash with another's content)
@@ -625,6 +625,12 @@ function Get-VenueStagedBuildManifest {
                 $c = $m.PSObject.Properties['sourceCommit']; 'C:' + $(if ($null -eq $c) { '' } else { [string]$c.Value })
                 $d = $m.PSObject.Properties['dllPairManifestSha256']; 'D:' + $(if ($null -eq $d) { '' } else { ([string]$d.Value).ToLowerInvariant() })
                 $s = $m.PSObject.Properties['pendingSymbolPresence']; 'S:' + $(if ($null -ne $s -and $s.Value -is [bool]) { 'bool' } else { 'bad' })
+                # r13 (adversary r13 A1): and the three artifact digests the job hashes the cached artifacts against (playback-attr-3-cuda-job.ps1 $manifestChecks): a string of
+                # 64 hex, the only value Get-Sha's digest can ever equal; a blank one makes the job throw, a non-string one throws in ToUpperInvariant.
+                foreach ($k in 'packageZip', 'exe', 'dll') {
+                    $o = $m.PSObject.Properties[$k]; $v = $(if ($null -ne $o -and $o.Value -is [System.Management.Automation.PSCustomObject] -and $o.Value.PSObject.Properties['sha256']) { $o.Value.sha256 } else { $null })
+                    'A:' + $k + '=' + $(if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'ok' } else { 'bad' })
+                }
             } })
     $r = Invoke-VenueBoundedRead -ScriptText $read.ToString() -Argument $path -TimeoutSec $TimeoutSec
     if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
@@ -640,6 +646,7 @@ function Get-VenueStagedBuildManifest {
                 elseif ($commit.Substring(2) -ne $SourceCommit) { "ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH the staged manifest declares '$($commit.Substring(2))', expected '$SourceCommit'" }
                 elseif ($dll.Substring(2) -notmatch '^[0-9a-f]{64}$') { "ATTRCUDA_BUILD_MANIFEST_DLLPAIR_UNBOUND the staged manifest carries no well-formed dllPairManifestSha256 (got '$($dll.Substring(2))')" }
                 elseif ($sym -ne 'S:bool') { 'ATTRCUDA_BUILD_MANIFEST_SYMBOL_PRESENCE_INVALID the staged manifest pendingSymbolPresence is not a boolean' }
+                elseif ($badArt = @('packageZip', 'exe', 'dll' | Where-Object { $facts -cnotcontains "A:$_=ok" })) { "ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING the staged manifest carries no 64-hex sha256 for $($badArt -join ', ') (the leg job hashes the cached artifact against it)" }
                 else { '' })
         }
         return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null; contentProblem = $problem }

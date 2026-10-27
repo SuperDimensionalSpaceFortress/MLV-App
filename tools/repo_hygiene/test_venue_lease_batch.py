@@ -48,6 +48,8 @@ requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32",
 
 SHA = "a" * 40
 MANIFEST = "b" * 64
+# r13 (adversary r13 A1): the three artifact digests the leg job hashes the cached artifacts against (playback-attr-3-cuda-job.ps1 $manifestChecks), in every staged manifest
+ARTIFACT_SHAS = {"packageZip": {"sha256": "a" * 64}, "exe": {"sha256": "b" * 64}, "dll": {"sha256": "c" * 64}}
 ABSENT = object()   # a staged build manifest field left out (stage(): dllPairManifestSha256=ABSENT)
 
 # Wait-VenueQuiet stand-in: mode per call from FAKE_QUIET_MODES (comma list, the last repeats), counted in the run dir; each call is logged with UTC ticks.
@@ -1724,7 +1726,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         cache = self.share / "cache"
         cache.mkdir(exist_ok=True)
         p = cache / f"playback-attr-3-cuda-{commit[:12]}-build.json"
-        doc = {"sourceCommit": commit, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, "body": body}
+        doc = {"sourceCommit": commit, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **ARTIFACT_SHAS, "body": body}
         doc.update(override)
         p.write_text(json.dumps({k: v for k, v in doc.items() if v is not ABSENT}), encoding="utf-8")
         import hashlib
@@ -2926,6 +2928,56 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 if case == "junction quiet":
                     os.rmdir(self.run_dir / "quiet")
 
+    # r13 (adversary r13 A1): the leg job also reads packageZip.sha256, exe.sha256 and dll.sha256 from the manifest and hashes the cached artifacts against them
+    # (playback-attr-3-cuda-job.ps1 $manifestChecks); a manifest without one passed preflight and the job threw after the lease opened.
+    def test_r13_adv_a1_a_staged_build_without_an_artifact_digest_is_refused_before_the_claim_and_the_lease(self) -> None:
+        a, c = self.commit_a, "3" * 40
+        cases = {
+            "no packageZip": {"packageZip": ABSENT},
+            "exe.sha256 blank": {"exe": {"sha256": ""}},
+            "dll.sha256 a number": {"dll": {"sha256": 1}},
+            "exe.sha256 not hex": {"exe": {"sha256": "z" * 64}},
+            "dll is a string": {"dll": "c" * 64},
+        }
+        for label, override in cases.items():
+            with self.subTest(case=label):
+                manifest = self.stage(c, "bad build", **override)
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_MANIFEST_MISMATCH item=2 ")
+
+    def test_r13_adv_a1_the_artifact_refusal_names_the_missing_digest(self) -> None:
+        c = "3" * 40
+        manifest = self.stage(c, "bad build", exe={"sha256": ""})
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c, manifest=manifest)]))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING", r.stderr)
+        self.assertIn("for exe ", r.stderr)
+
+    # r13 (adversary r13 A2): the open can wait long in the agent's gate, and a link to an output made in that wait was written through by the first probe (gate.log).
+    def test_r13_adv_a2_an_output_alias_added_while_the_open_waits_is_refused_before_any_probe(self) -> None:
+        self._fresh_run_dir()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        before = spec.read_text(encoding="utf-8")
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), FAKE_OPEN_SLEEP="12")
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("BATCH_OPEN_SUBMIT")
+            os.link(spec, self.run_dir / "gate.log")   # the probe's -GateLog, which Wait-VenueQuiet appends to
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertEqual(p.returncode, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ", se)
+        self.assertIn("found after the open", se)
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertTrue(any(k.startswith("CLOSE") for k in self.kinds()), "the lease was closed")
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+        self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is byte-unchanged")
+
     # r12 (adversary r12 A2): TrimEnd('\') turned the drive root C:\ into C:, the drive's current directory, so a root zone was listed from the wrong folder. A real volume root cannot be
     # written to by a test, so the function that decides it is run on its own: its source is taken from the runner, so this cannot drift from what the runner does.
     def test_r12_a2_a_drive_root_keeps_its_backslash_when_trailing_separators_are_removed(self) -> None:
@@ -3010,7 +3062,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_r5_adv2_a3_a_staged_manifest_with_a_byte_order_mark_is_still_read(self) -> None:
         c = "5" * 40
         p = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
-        p.write_bytes(b"\xef\xbb\xbf" + json.dumps({"sourceCommit": c, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False}).encode("utf-8"))
+        p.write_bytes(b"\xef\xbb\xbf" + json.dumps({"sourceCommit": c, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **ARTIFACT_SHAS}).encode("utf-8"))
         script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
                   f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30\n"
                   "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sha = $r.sha256; problem = $r.contentProblem }\n")
@@ -3024,7 +3076,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # [IO.File]::ReadAllText (one BOM, UTF-16/32 by BOM). A doubled BOM was accepted here and rejected by the leg job after the lease opened; a UTF-16 manifest the
         # job accepts was refused here. The oracle below is that very read; preflight must agree with it on every input.
         c = "6" * 40
-        body = json.dumps({"sourceCommit": c, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False})
+        body = json.dumps({"sourceCommit": c, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **ARTIFACT_SHAS})
         cases = {
             "no BOM": (body.encode("utf-8"), ""),
             "one UTF-8 BOM": (b"\xef\xbb\xbf" + body.encode("utf-8"), ""),

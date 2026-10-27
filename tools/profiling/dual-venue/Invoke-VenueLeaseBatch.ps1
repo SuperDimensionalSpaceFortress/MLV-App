@@ -873,6 +873,10 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $b.openExit75Refusals = $(if ($null -ne $adm) { @(@($adm.leaseRefusals) | Where-Object { $null -ne $_ -and [string]$_.rc -eq '75' }).Count } else { 0 })
         $b.exit75Refusals = $b.openExit75Refusals
         if ($b.exit75Refusals -gt 0 -or $b.openLeaseWait -cne 'NONE') { $b.exit75Class = 'WAIT_RETRY' }
+        # r13 (adversary r13 A2): the open can wait long in the agent's admission gate (and by name after it), and an alias to an output, or a changed input, can appear in that
+        # wait as in the claim wait. The same guard runs again once a lease is in hand, before the first probe or leg writes: a hit runs nothing, the finally closes the lease,
+        # and the run ends in the same typed refusal (exit 2). A link made after this check is a race no re-check closes (an instant later), and is not claimed here.
+        $openHit = $(if ($op.outcome -ceq 'RECEIPT' -or $op.outcome -ceq 'RECEIPT_BY_NAME') { Get-InputOutputRefusal } else { $null })
         if ($op.outcome -ceq 'NOT_SUBMITTED' -and $crossed) {
             $b.endReason = 'DEADLINE'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
             Set-Stop 'DEADLINE' 3
@@ -888,6 +892,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         } elseif ($null -eq $adm.leaseBatch -or [string]$adm.leaseBatch.token -cne $token -or -not $adm.leaseBatch.leaseId) {
             $b.endReason = 'AGENT_NOT_BATCH_CAPABLE'; $b.endDetail = "admission.mode=$($adm.mode) gate=$($adm.gate) (no admission.leaseBatch for token ${token}: the lease-batch agent is not deployed)"
             Set-Stop 'AGENT_NOT_BATCH_CAPABLE' 10
+        } elseif ($openHit) {
+            $hr = $(if ($openHit.kind -ceq 'content') { $openHit.code, $openHit.item, $openHit.why } elseif ($openHit.kind -ceq 'plan') { 'LEG_PLAN_IS_RUN_OUTPUT', 0, "the plan file $($openHit.why)" }
+                elseif ($openHit.kind -ceq 'build') { 'BUILD_MANIFEST_IS_RUN_OUTPUT', $openHit.item, "the staged build manifest $($openHit.why)" } else { 'LEG_SPEC_IS_RUN_OUTPUT', $openHit.item, "the leg spec $($openHit.why)" })
+            # the lease is held: the finally closes it and charges the ledger from the open's submit (no earlier start is known without reading its end)
+            $b.leaseId = [string]$adm.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc; $b.endReason = $hr[0]; $b.endDetail = "after the open, before any probe or leg: $($hr[2])"
+            [Console]::Error.WriteLine("BATCH_USAGE $(if ($legPlanMode) { "LEG_PLAN_REFUSED reason=$($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" })" } else { $hr[0] }) $($hr[2]) (found after the open: no probe or leg ran; the lease is closed)")
+            Set-Stop $hr[0] 2
         } else {
             $b.leaseId = [string]$adm.leaseBatch.leaseId; $b.held = [string]$adm.heavySlotHeld; $b.slot = $adm.slot; $b.leaseMinutes = $adm.leaseMinutes
             $b.leaseUntilEpoch = $adm.leaseBatch.untilEpoch; $b.openWaitedSec = $adm.waitedSec; $b.openRequests = $adm.leaseRequests; $b.refusals = @($adm.leaseRefusals)
