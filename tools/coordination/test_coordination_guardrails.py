@@ -2730,6 +2730,9 @@ def test_save_dirty_worktree_evidence_keeps_reading_the_proven_common_dir_when_c
     (wt / "src" / "a.txt").write_text("two\n")
     other = tmp_path / "other"
     git(tmp_path, "clone", "-q", str(main), str(other))
+    # A clone does not inherit the source repository's local identity, and a hosted runner has no global one (r9: `git commit` exited 128 on CI).
+    git(other, "config", "user.email", "t@e.com")
+    git(other, "config", "user.name", "T")
     git(other, "checkout", "-q", "-b", "lane")
     (other / "src" / "a.txt").write_text("two\n")
     git(other, "commit", "-qam", "lane in the clone")
@@ -2747,6 +2750,66 @@ def test_save_dirty_worktree_evidence_keeps_reading_the_proven_common_dir_when_c
     assert lines[0].startswith("DIRTY_TREE_SAVED card=C1") and "verified=reverse-apply-ok" in lines[0], (out.stdout, out.stderr)
     text = next(dest.glob("dirty-worktree-*.patch")).read_text(encoding="utf-8")
     assert "-one" in text and "+two" in text, text
+
+
+@dirty_save_only
+@pytest.mark.parametrize("swap", [True, False], ids=["replaced", "control"])
+def test_save_dirty_worktree_evidence_refuses_a_git_directory_replaced_between_its_first_read_and_its_hold(tmp_path, swap):
+    # r9 (adversary 2181cd97-A1, Dot 99ace7b): a main worktree's .git DIRECTORY replaced after the first repository read and before its hold keeps every path string, so
+    # the hold pinned the replacement; one whose HEAD and index match the working bytes made the save report SAVED bytes=0 empty-diff and drop the worktree's own edit.
+    # The git dir's identity is sampled at the first read and the held handle must still be that directory. The control proves the seam alone changes nothing.
+    wt, dest = _dirty_save_repo(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    make_repo(other)
+    (other / "src").mkdir()
+    (other / "src" / "a.txt").write_text("two\n")
+    git(other, "add", "src/a.txt")
+    git(other, "commit", "-qm", "other")
+    away = tmp_path / "wt-git-away"
+    # The seam: the hold of the git dir itself, the last point before the directory is pinned. Directory.Move is a same-path replacement on one volume.
+    shim = (f"$script:Swap = ${'true' if swap else 'false'}; $script:Swapped = $false; "
+            "$script:RealLock = (Get-Command Lock-DirtyDirectory -CommandType Function).ScriptBlock; "
+            "function Lock-DirtyDirectory([string]$Path) { "
+            "if ($script:Swap -and -not $script:Swapped -and $Path.Replace([char]92, [char]47).EndsWith('/.git')) { $script:Swapped = $true; "
+            f"[System.IO.Directory]::Move('{wt / '.git'}', '{away}'); [System.IO.Directory]::Move('{other / '.git'}', '{wt / '.git'}') }}; "
+            "& $script:RealLock $Path }")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output \"swapped=$script:Swapped\"")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] == f"swapped={swap}", (out.stdout, out.stderr)
+    if swap:
+        assert away.is_dir() and (wt / ".git").is_dir(), "the shim must have replaced the git directory"
+        assert lines[0] == "DIRTY_TREE_SAVE_FAILED card=C1 reason=worktree-git-dir-changed", (out.stdout, out.stderr)
+        assert not list(dest.iterdir()), sorted(p.name for p in dest.iterdir())
+    else:
+        assert lines[0].startswith("DIRTY_TREE_SAVED card=C1") and "verified=reverse-apply-ok" in lines[0], (out.stdout, out.stderr)
+        text = next(dest.glob("dirty-worktree-*.patch")).read_text(encoding="utf-8")
+        assert "-one" in text and "+two" in text, text
+
+
+@dirty_save_only
+@pytest.mark.parametrize("case", ["move-failed", "name-collision", "guard", "control"])
+def test_save_dirty_worktree_evidence_keeps_placement_reasons_typed_under_strict_mode(tmp_path, case):
+    # r9 (adversary 2181cd97-A2): Invoke-Workstream.ps1 runs under Set-StrictMode -Version Latest, where reading the Placed key of a helper result that lacks it throws, so
+    # move-failed, name-collision and guard reasons came back as a missing-property message. Every helper result carries Placed.
+    wt, dest = _dirty_save_repo(tmp_path)
+    seams = {
+        "move-failed": ("function Invoke-DirtyFileMove([string]$From, [string]$To) { throw [System.IO.IOException]::new('The process cannot access the file because it is being used by another process.', 0x80070020) }",
+                        "DIRTY_TREE_SAVE_FAILED card=C1 reason=move-failed:0x80070020 "),
+        "name-collision": ("function Invoke-DirtyFileMove([string]$From, [string]$To) { "
+                           "if ((Split-Path -Leaf $To) -like 'dirty-worktree-*.status*') { [System.IO.File]::WriteAllText($To, 'other'); throw [System.IO.IOException]::new('exists') }; "
+                           "[System.IO.File]::Move($From, $To) }",
+                           "DIRTY_TREE_SAVE_FAILED card=C1 reason=name-collision patch="),
+        "guard": ("function Test-DirtyDestStable([string]$Dest, [string]$Identity, [string]$WtReal, [string]$WtIdentity, [string]$Stage) { "
+                  "if ($Stage -eq 'before-publish') { 'dest-identity-changed' } else { '' } }",
+                  "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-identity-changed"),
+        "control": ("", "DIRTY_TREE_SAVED card=C1 round=r1 "),
+    }
+    shim, expected = seams[case]
+    out = dirty_save_pwsh(f"{shim}; Set-StrictMode -Version Latest; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert line.startswith(expected) and len(line.splitlines()) == 1, (out.stdout, out.stderr)
+    assert "cannot be found" not in line and "unverified=" not in line, line
 
 
 @dirty_save_only
