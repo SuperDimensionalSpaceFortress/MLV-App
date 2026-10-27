@@ -2874,6 +2874,41 @@ def test_save_dirty_worktree_evidence_names_the_placed_patch_when_a_later_step_t
     assert line.endswith(f" patch={patch}"), line
 
 
+@dirty_save_only
+def test_save_dirty_worktree_evidence_reads_a_relative_worktree_against_the_powershell_location(tmp_path):
+    # r4 adversary A2-1: GetFullPath('.') used the process directory while the caller's Set-Location named the worktree, so an external parent destination was refused as inside it.
+    wt, _ = _dirty_save_repo(tmp_path)
+    out = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command",
+                          f". '{DIRTY_SAVE_LIB}'; Set-Location '{wt}'; Save-DirtyWorktreeEvidence -Wt '.' -Dest '{tmp_path}' -CardName C1 -RoundName r1"],
+                         text=True, capture_output=True, cwd=tmp_path.parent)
+    assert out.stdout.startswith("DIRTY_TREE_SAVED") and "verified=reverse-apply-ok" in out.stdout, out.stdout + out.stderr
+    assert len(list(tmp_path.glob("dirty-worktree-*.patch"))) == 1 and not list(wt.glob("dirty-worktree-*"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the paths below use a dollar sign in a Windows directory name")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_reapply_command_survives_dollar_signs_and_quotes_in_paths(tmp_path):
+    # r4 adversary A2-2: the advertised command was built inside double quotes, so C:\work\$lane expanded a variable and addressed another path.
+    base = tmp_path / "it's $lane"
+    base.mkdir()
+    wt = base / "w$lane"
+    wt.mkdir()
+    make_repo(wt)
+    (wt / "src").mkdir()
+    (wt / "src" / "a.txt").write_text("one\n")
+    git(wt, "add", "src/a.txt")
+    git(wt, "commit", "-qm", "base")
+    (wt / "src" / "a.txt").write_text("two\n")
+    dest = base / "r$round"
+    dest.mkdir()
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{str(wt).replace(chr(39), chr(39) * 2)}' -Dest '{str(dest).replace(chr(39), chr(39) * 2)}' -CardName C1 -RoundName r1")
+    saved = re.search(r" reapply=(git -C .+)$", out.stdout.strip())
+    assert out.stdout.startswith("DIRTY_TREE_SAVED") and saved, out.stdout + out.stderr
+    git(wt, "checkout", "--", "src/a.txt")
+    again = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", saved.group(1)], text=True, capture_output=True)
+    assert again.returncode == 0 and (wt / "src" / "a.txt").read_text().replace("\r\n", "\n") == "two\n", (saved.group(1), again.stdout, again.stderr)
+
+
 def _gitlink_checked_out_elsewhere(wt):
     """A submodule recorded at one commit in HEAD and the index but checked out at another."""
     git(wt, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},vendor/sub")

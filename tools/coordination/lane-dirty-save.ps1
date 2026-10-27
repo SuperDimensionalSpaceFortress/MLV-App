@@ -103,6 +103,13 @@ function Resolve-DirtyRealPath([string]$Path) {
     return $cur.TrimEnd([char[]]@('\', '/'))
 }
 
+# A PowerShell literal that survives pasting: inside double quotes a path such as C:\work\$lane would expand a variable; single quotes expand nothing, and the quote characters
+# PowerShell accepts (the ASCII one and the four typographic ones) are doubled.
+function ConvertTo-DirtySingleQuoted([string]$Text) {
+    $quotes = "['" + [char]0x2018 + [char]0x2019 + [char]0x201A + [char]0x201B + ']'
+    return "'" + [regex]::Replace($Text, $quotes, '$0$0') + "'"
+}
+
 function Test-DirtyPathInside([string]$Inner, [string]$Outer) {
     $cmp = if ($IsWindows -or $env:OS -eq 'Windows_NT') { [System.StringComparison]::OrdinalIgnoreCase } else { [System.StringComparison]::Ordinal }
     $sep = [System.IO.Path]::DirectorySeparatorChar
@@ -142,6 +149,9 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
     try {
         if (-not (Test-Path -LiteralPath $Dest -PathType Container)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=no-run-dir" }
         $Dest = (Resolve-Path -LiteralPath $Dest).ProviderPath  # git -C $Wt would resolve a relative --output against the worktree, not the caller
+        # A relative -Wt means the caller's PowerShell location; git -C and [IO.Path]::GetFullPath would read it against the process directory, which can differ (r4 adversary A1).
+        if (-not (Test-Path -LiteralPath $Wt -PathType Container)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
+        $Wt = (Resolve-Path -LiteralPath $Wt).ProviderPath
         $prefix = @(& git -C $Wt rev-parse --show-prefix 2>$null)
         if ($LASTEXITCODE -ne 0 -or ($prefix -join '').Trim() -ne '') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
         if (Test-DirtyPathInside -Inner (Resolve-DirtyRealPath $Dest) -Outer (Resolve-DirtyRealPath $Wt)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-inside-worktree" }
@@ -230,7 +240,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             & git -C $Wt apply --check -R --whitespace=nowarn $patch 2>$null
             $verified = if ($LASTEXITCODE -eq 0) { 'reverse-apply-ok' } else { 'reverse-apply-FAILED' }
         }
-        return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=git -C `"$Wt`" apply `"$patch`""
+        return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=git -C $(ConvertTo-DirtySingleQuoted $Wt) apply $(ConvertTo-DirtySingleQuoted $patch)"
     }
     catch { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($_.Exception.Message -replace '\s+', ' ')$evidence" }  # a throw after a placement still names what was placed (r4 adversary A2)
     finally {
