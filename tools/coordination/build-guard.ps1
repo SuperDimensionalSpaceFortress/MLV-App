@@ -380,6 +380,21 @@ function Remove-HeavySlotFiles($Lease) {
     foreach ($f in @($Lease.Ready, $Lease.Stop, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
 }
 
+function Remove-HeavySlotLeaseFiles($Lease) {
+    # After the stop file is written: a holder that outlived heavy-slot (its slot owner gone) polls for the stop file every
+    # 500 ms, so it is given 10 s to see it and end. The stop file is deleted only once neither heavy-slot nor that holder
+    # runs; otherwise it stays, so the holder still sees it (r3b adversary A2). The other lease files go either way.
+    if ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder)) {
+        $h = Get-Process -Id $Lease.Holder.Pid -ErrorAction SilentlyContinue
+        if ($h) { [void]$h.WaitForExit(10000) }
+    }
+    if (-not $Lease.Process.HasExited -or ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder))) {
+        foreach ($f in @($Lease.Ready, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+        return
+    }
+    Remove-HeavySlotFiles $Lease
+}
+
 function Test-HeavySlotIdentity($Identity) {
     # True while the process named by pid + start ticks still runs ($null ticks: the start time was not readable).
     $p = Get-Process -Id $Identity.Pid -ErrorAction SilentlyContinue
@@ -433,14 +448,9 @@ function Exit-HeavySlotHolderGone($Lease, [string]$When = 'after-ready') {
     # holder that outlived its slot owner ends too, and it stays while that holder still runs.
     Send-HeavySlotStop $Lease
     $code = Get-HeavySlotExitCode $Lease
-    if ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder)) {
-        $h = Get-Process -Id $Lease.Holder.Pid -ErrorAction SilentlyContinue
-        if ($h) { [void]$h.WaitForExit(10000) }
-    }
     Send-HeavySlotLines $Lease
     foreach ($l in $Lease.Lines) { if ($l -match '^HEAVY-SLOT TICKET (\S+) ') { $Lease.Ticket = $Matches[1] } }
-    Remove-HeavySlotFiles $Lease
-    if (-not $Lease.Process.HasExited -or ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder))) { Send-HeavySlotStop $Lease }
+    Remove-HeavySlotLeaseFiles $Lease
     $gone = if ($Lease.Gone) { $Lease.Gone } else { 'holder-exited' }
     Write-Output ('BUILD_HEAVY_SLOT_REQUEUE label={0} code={1} ticket={2} reason={3}-{4} utc={5}' -f $Lease.BuildLabel, $code, $Lease.Ticket, $gone, $When, [DateTime]::UtcNow.ToString('o'))
     exit 3
@@ -591,7 +601,7 @@ function Exit-HeavySlot($Lease) {
         if ($lost) { Write-BuildGuardLog ('heavy-slot: ended before release label={0}' -f $Lease.Label) }
         elseif ($Lease.Process.ExitCode -ne 0) { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} heavy-slot ended with {1} after release' -f $Lease.Label, $Lease.Process.ExitCode) }
         else { Write-BuildGuardLog ('heavy-slot: released label={0}' -f $Lease.Label) }
-        Remove-HeavySlotFiles $Lease
+        Remove-HeavySlotLeaseFiles $Lease
     } else {
         # The stop file stays: a holder that has not been scheduled yet must still see it (adversary A3).
         Send-HeavySlotLines $Lease
@@ -653,9 +663,13 @@ function Invoke-BuildGuard {
             Start-Sleep -Milliseconds ([int]($o.PollSeconds * 1000))
         }
         try {
-            # The action starts only under a live heavy slot (r2 adversary A1): a slot lost while waiting for memory or the
-            # build slot is a REQUEUE with nothing built, not a build classified as unprotected afterwards. Every caller
-            # (command mode, build-release, qscreen-probe, the attr-3 assembler) reaches its action through here.
+            $choice = Get-BuildGuardJobs -Options $o -SelfPid $PID
+            $jobs = $choice.Jobs
+            if ($RequestedJobs -gt 0) { $jobs = [math]::Min($jobs, $RequestedJobs) }
+            # The action starts only under a live heavy slot (r2 adversary A1): a slot lost while waiting for memory, the
+            # build slot or the process census is a REQUEUE with nothing built, not a build classified as unprotected
+            # afterwards. The check is the last step before the action (r3b adversary A1: the census can take seconds).
+            # Every caller (command mode, build-release, qscreen-probe, the attr-3 assembler) reaches its action through here.
             if ($heavy -and (Get-HeavySlotHolderState $heavy) -ne 'alive') {
                 $lost = $heavy
                 $heavy = $null
@@ -663,9 +677,6 @@ function Invoke-BuildGuard {
                 $ticket = $null
                 Exit-HeavySlotHolderGone $lost 'before-action'
             }
-            $choice = Get-BuildGuardJobs -Options $o -SelfPid $PID
-            $jobs = $choice.Jobs
-            if ($RequestedJobs -gt 0) { $jobs = [math]::Min($jobs, $RequestedJobs) }
             Write-BuildGuardLog ('admitted label={0} jobs={1} reason={2} peers=[{3}] freePhysGB={4} freeCommitGB={5} slot={6}' -f $Label, $jobs, $choice.Reason, ($choice.Peers -join ','), $mem.PhysGB, $mem.CommitGB, $(if ($ticket) { 'held' } else { 'none' }))
             & $Action $jobs
         } finally {

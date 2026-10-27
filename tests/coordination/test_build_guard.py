@@ -1263,6 +1263,50 @@ def test_a_ready_file_whose_slot_owner_died_is_no_admission(box) -> None:
     assert "holder-ended=True" in done.stdout, "the orphaned holder is stopped while the host lives on"
 
 
+def test_a_heavy_slot_lost_during_the_process_census_is_a_requeue_before_the_action(box) -> None:
+    # r3b adversary b16f1589-A1: the holder is alive after the build slot is taken and ends during the process census
+    # (Get-BuildGuardJobs is wrapped to end it); the check before the action must come after the census.
+    done = _library_driver(
+        box,
+        "$script:origJobs = ${function:Get-BuildGuardJobs}\n"
+        "function Get-BuildGuardJobs([hashtable]$Options, [int]$SelfPid) {\n"
+        "    if ($heavy -and $heavy.Holder) { Stop-Process -Id $heavy.Holder.Pid -Force; Wait-Process -Id $heavy.Holder.Pid -Timeout 20 -ErrorAction Ignore }\n"
+        "    & $script:origJobs -Options $Options -SelfPid $SelfPid }\n"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "heavy-slot: admitted" in done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build " in done.stdout and "reason=holder-exited-before-action" in done.stdout, done.stdout + done.stderr
+    assert "HEAVY_SLOT_LOST_DURING_ACTION" not in done.stdout + done.stderr
+    assert not box["marker"].exists() and not box["lock"].exists(), "nothing is built without a live heavy slot"
+
+
+def test_a_holder_that_outlived_its_slot_owner_still_sees_the_release(box) -> None:
+    # r3b adversary b16f1589-A2: the slot owner (and so heavy-slot's wrapper) ends during the action; the holder lives on
+    # in its 500 ms poll. The release must keep the stop file until that holder has seen it, while the host lives on.
+    hs = box["dir"] / "heavy-slot"
+    holder_file = box["dir"] / "holder-pid.txt"
+    done = _library_driver(
+        box,
+        "Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        f"    $t = Get-Content -LiteralPath @(Get-ChildItem -LiteralPath '{hs}' -Filter *.ready)[0].FullName -Raw\n"
+        f"    Set-Content -LiteralPath '{holder_file}' -Value ([regex]::Match($t, 'holder=(\\d+)').Groups[1].Value)\n"
+        "    $o = [int]([regex]::Match($t, '\\A[^\\r\\n]*:(\\d+)').Groups[1].Value)\n"
+        "    Stop-Process -Id $o -Force; Wait-Process -Id $o -Timeout 20 -ErrorAction Ignore }\n",
+        str(box["lock"]),
+        host_tail=(
+            f"$h = [int](Get-Content -LiteralPath '{holder_file}' -Raw)\n"
+            "$d = (Get-Date).AddSeconds(15)\n"
+            "while ((Get-Process -Id $h -ErrorAction Ignore) -and (Get-Date) -lt $d) { [Threading.Thread]::Sleep(100) }\n"
+            "Write-Output \"holder-ended=$(-not (Get-Process -Id $h -ErrorAction Ignore))\"\n"
+        ),
+    )
+    assert "HEAVY_SLOT_LOST_DURING_ACTION label=build " in done.stdout, done.stdout + done.stderr
+    assert "holder-ended=True" in done.stdout, "the holder missed the stop file and outlived the release"
+    assert list(hs.iterdir()) == [], "the stop file goes once the holder has ended"
+
+
 @pytest.mark.parametrize("value", ["15372286720L", "'NaN'", "'sixty'"])
 def test_a_wait_the_hung_tool_bound_cannot_hold_is_refused_before_heavy_slot_starts(box, value) -> None:
     # r2 adversary 090d9006-A3: a Library host that catches throws passes a wait that overflows TimeSpan (or is not a
