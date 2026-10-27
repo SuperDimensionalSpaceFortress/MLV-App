@@ -5,7 +5,12 @@
 #   unmarked75 print the ticket line, exit 75 with no marker
 #   forged75   print the ticket line, write a marker with another nonce, exit 75
 #   marked9    print the ticket line, write a matching marker that says code 9, exit 9 (not a heavy-slot code)
-# STUB_HEAVY_SLOT_DELAY_S (run mode) waits that many seconds before starting the child, like a queue wait for the slot.
+#   marked     print the ticket line, write a matching marker for STUB_HEAVY_SLOT_CODE, exit with it (75/76/77)
+#   bare       print the ticket line, exit STUB_HEAVY_SLOT_CODE before any admission, no marker
+#   readyexit  stands in for a holder that wrote its ready file and then ended: write the ready file named in the
+#              holder's -EncodedCommand, wait STUB_HEAVY_SLOT_HOLD_S seconds (default 0), exit STUB_HEAVY_SLOT_CODE (default 0)
+#   pinwarn    print heavy-slot's own PIN MISMATCH warning, then behave as run
+# STUB_HEAVY_SLOT_DELAY_S (run, pinwarn and readyexit) waits that many seconds before starting the child, like a queue wait for the slot.
 # Every call appends one JSON line (argv, the two EXPECT variables, and the child's start and end) to STUB_HEAVY_SLOT_LOG.
 $argv = @($args)
 $mode = if ($env:STUB_HEAVY_SLOT_MODE) { $env:STUB_HEAVY_SLOT_MODE } else { 'run' }
@@ -24,11 +29,25 @@ function Write-StubMarker([string]$Nonce, [int]$Code = 75) {
     if ($exitFile) { Set-Content -LiteralPath $exitFile -Value ($marker | ConvertTo-Json -Compress) -Encoding ascii }
 }
 $code = 0
+$stubCode = if ($env:STUB_HEAVY_SLOT_CODE) { [int]$env:STUB_HEAVY_SLOT_CODE } else { 0 }
+if ($mode -eq 'pinwarn') { [Console]::Error.WriteLine('HEAVY-SLOT WARN: PIN MISMATCH: this heavy-slot.ps1 is 00, HEAVY_SLOT_EXPECT_SHA256 is 11') }
 switch ($mode) {
     'marked75' { Write-StubMarker $nonce; $code = 75 }
     'forged75' { Write-StubMarker ([Guid]::NewGuid().ToString('N')); $code = 75 }
     'unmarked75' { $code = 75 }
     'marked9' { Write-StubMarker $nonce 9; $code = 9 }
+    'marked' { Write-StubMarker $nonce $stubCode; $code = $stubCode }
+    'bare' { $code = $stubCode }
+    'readyexit' {
+        if ($env:STUB_HEAVY_SLOT_DELAY_S) { Start-Sleep -Seconds ([int]$env:STUB_HEAVY_SLOT_DELAY_S) }
+        $encoded = $command[[array]::IndexOf($command, '-EncodedCommand') + 1]
+        $holder = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))
+        if ($holder -match "^Set-Content -LiteralPath '((?:[^']|'')+)'") { Set-Content -LiteralPath ($Matches[1] -replace "''", "'") -Value "${ticket}:$PID" -Encoding ascii }
+        $record.childStart = [DateTime]::UtcNow.ToString('o')
+        if ($env:STUB_HEAVY_SLOT_HOLD_S) { Start-Sleep -Seconds ([double]$env:STUB_HEAVY_SLOT_HOLD_S) }
+        $record.childEnd = [DateTime]::UtcNow.ToString('o')
+        $code = $stubCode
+    }
     default {
         if ($env:STUB_HEAVY_SLOT_DELAY_S) { Start-Sleep -Seconds ([int]$env:STUB_HEAVY_SLOT_DELAY_S) }
         $record.childStart = [DateTime]::UtcNow.ToString('o')
