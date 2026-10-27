@@ -81,27 +81,50 @@
 #         next batch, which takes the claim again.
 #      c. AN UNRESOLVED LEG IS WITHDRAWN (hub 13:21Z B2 clause). A leg whose job has no agent result by name (um-run said UNRESOLVED, or the read failed) gets
 #         its cancel file at once (row withdraw, LEG_WITHDRAWN), so the agent never launches it later on a parked lease.
+#   9. MULTI-BUILD LEG PLAN (LEASE-BATCH-MULTI-BUILD-1). The scalar form runs one build and one backend per call, so an A/B driver paid a lease (and its 30 min
+#      cooldown) per build. -LegPlan <json> instead names an ordered list of legs, each with its own build: {"schema": "mlv-app/venue-lease-leg-plan/v1", "legs":
+#      [{legSpec, backend, sourceCommit, buildManifestSha256, arm}, ...]} (a bare array of items is read too). legSpec is a path (as given, then beside the plan
+#      file, then legs\<name>); backend is cuda or cpu; arm is a free label (A, B, base, cand...). It is a parameter set of its own: -LegSpec / -LegSet / -Repeats /
+#      -Backend / -SourceCommit / -BuildManifestSha256 cannot be passed with it, and the scalar call is unchanged (same receipts, rows and exit codes).
+#      a. EVERY item is validated BEFORE any claim or lease: the hex patterns of the scalar form, backend, arm, the leg spec found, and its build STAGED on the
+#         venue with exactly that manifest (Get-VenueStagedBuildManifest, the file Invoke-VenueLeg hashes). One bad item refuses the whole plan on stderr,
+#         BATCH_USAGE LEG_PLAN_REFUSED reason=<BAD_ITEM_SHAPE | BAD_SOURCE_COMMIT | BAD_MANIFEST_SHA256 | BAD_BACKEND | BAD_ARM | LEG_SPEC_MISSING | BUILD_NOT_STAGED |
+#         BUILD_MANIFEST_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
+#         halfway on a build. A spec that is not a mlv-app/dual-venue-leg/v1 spec, does not list the item's backend, or has a field Invoke-VenueLeg casts or validates
+#         (playSeconds, visualCapture and its opt-out reason, scaleFactor, acceptedEffectiveScale) it would throw on, is refused here (LEG_SPEC_INVALID, BAD_BACKEND)
+#         because Invoke-VenueLeg would throw on it only after the lease is open.
+#      b. The legs run in plan order (-PlanOrder AsGiven), or with the arms INTERLEAVED, A B A B (-PlanOrder Interleave, Get-VenueInterleavedLegPlan), so lease
+#         position and venue heat fall on every arm alike. Per-leg budget, re-check, claim loss and deadline handling are the scalar form's, leg by leg.
+#      c. Each leg process gets its own -SourceCommit / -BuildManifestSha256 / -Backend; each batch leg row and run result carries name, arm, backend, sourceCommit
+#         and buildManifestSha256; the LEG ... RUN line names them; <RunDir>\leg-plan.json (written once the claim is held) keeps the validated plan in run order and each build's staged state.
 # It changes nothing on Bachelor: not heavy-slot.py's caps, not its lease file, not the quiet threshold. A batch run needs the lease-batch agent deployed.
 #
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeaseBatch.ps1 -LegSpec a.json,b.json -Backend cpu -RunDir <rd> `
 #       -SourceCommit <40-hex> -BuildManifestSha256 <64-hex> [-DeadlineUtc <iso>]
+#   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeaseBatch.ps1 -LegPlan ab-plan.json -PlanOrder Interleave -RunDir <rd> [-DeadlineUtc <iso>]
 #
-# Exit codes (a leg's OUTCOME is never the exit code: read LEASE_BATCH_RESULT and the receipts): 0 every leg ran; 2 usage (or a leg budget no lease can hold);
+# Exit codes (a leg's OUTCOME is never the exit code: read LEASE_BATCH_RESULT and the receipts): 0 every leg ran; 2 usage (or a leg budget no lease can hold,
+# or a refused -LegPlan: LEG_PLAN_REFUSED);
 # 3 DEADLINE before every leg ran (a cooldown, budget or exit-75 wait that reached it included); 4 GATE_UNREADABLE and 5 HOST_MISMATCH from Wait-VenueQuiet; 6 a probe ended VENUE_QUIET_UNKNOWN; 7 a leg process exited
 # non-zero (LEG_FAILED) or was killed at the lease's end (LEASE_EXPIRED; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
-# UNRESOLVED or not admitted, or never submitted because its sidecar could not be written: LIVENESS_UNAVAILABLE); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
-# 7a). A stopping code (2-6, 9, 10) replaces 0 or 7; 11 replaces every other code.
+# UNRESOLVED or not admitted, or never submitted because its sidecar could not be written: LIVENESS_UNAVAILABLE, or its job file could not be written here:
+# OPEN_JOB_WRITE_FAILED, no cancel, no close, no ledger charge); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
+# 7a); 12 an unexpected throw inside a batch after its claim was taken (BATCH_ERROR: the claim keeper is stopped, the claim released and the batch receipt written
+# first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Scalar')]
 param(
     [ValidateSet('bachelor')][string]$Venue = 'bachelor',
-    [string[]]$LegSpec = @(),
-    [string]$LegSet = '',
-    [ValidateRange(1, 20)][int]$Repeats = 1,
-    [ValidateSet('cuda', 'cpu')][string]$Backend,
+    [Parameter(ParameterSetName = 'Scalar')][string[]]$LegSpec = @(),
+    [Parameter(ParameterSetName = 'Scalar')][string]$LegSet = '',
+    [Parameter(ParameterSetName = 'Scalar')][ValidateRange(1, 20)][int]$Repeats = 1,
+    [Parameter(ParameterSetName = 'Scalar')][ValidateSet('cuda', 'cpu')][string]$Backend,
     [Parameter(Mandatory = $true)][string]$RunDir,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
-    [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
+    [Parameter(ParameterSetName = 'Scalar', Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit,
+    [Parameter(ParameterSetName = 'Scalar', Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
+    # LEASE-BATCH-MULTI-BUILD-1 (item 9): an ordered leg plan, each leg with its own build, backend and arm, run in ONE batched lease series
+    [Parameter(ParameterSetName = 'Plan', Mandatory = $true)][string]$LegPlan,
+    [Parameter(ParameterSetName = 'Plan')][ValidateSet('AsGiven', 'Interleave')][string]$PlanOrder = 'AsGiven',
     [string]$Purpose = '',
     [string]$SheetCopyDir = '',
     # passed through to Wait-VenueQuiet.ps1 (never relaxed here)
@@ -160,7 +183,10 @@ $cooldownExplicit = $PSBoundParameters.ContainsKey('LeaseCooldownSec'); $budgetE
 if ($ClaimRenewSec -eq 0) { $ClaimRenewSec = [int][Math]::Max(1, [Math]::Min(600, [Math]::Floor($ClaimTtlSec / 4))) }
 if (2 * $ClaimRenewSec -gt $ClaimTtlSec) { Stop-Usage "-ClaimRenewSec $ClaimRenewSec is over half of -ClaimTtlSec ${ClaimTtlSec}: one late renewal would let the claim expire" }
 if (2 * $LivenessRenewSec -gt $LivenessWindowSec) { Stop-Usage "-LivenessRenewSec $LivenessRenewSec is over half of -LivenessWindowSec ${LivenessWindowSec}: one late write would lapse a live runner" }
-if (($LegSpec.Count -gt 0) -eq [bool]$LegSet) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
+$legPlanMode = ($PSCmdlet.ParameterSetName -ceq 'Plan')
+# -PlanOrder binds case-insensitively; every later test of it is case-sensitive, so name the canonical spelling once (sol r3 A1)
+$PlanOrder = @('AsGiven', 'Interleave') | Where-Object { $_ -ieq $PlanOrder } | Select-Object -First 1
+if (-not $legPlanMode -and (($LegSpec.Count -gt 0) -eq [bool]$LegSet)) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
 if (-not $AgentShare) { $AgentShare = try { [string](([IO.File]::ReadAllText((Join-Path $here 'venues.json')) | ConvertFrom-Json).venues.$Venue.agentShare) } catch { '' } }
 if (-not $AgentShare) { Stop-Usage "venues.json names no agentShare for $Venue" }
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
@@ -173,28 +199,507 @@ $deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globali
 $pwshExe = [Environment]::ProcessPath
 if (-not $Purpose) { $Purpose = "Invoke-VenueLeaseBatch $(Split-Path -Leaf $RunDir)" }
 
+$script:RunOutputAliased = $false; $script:openAliasHit = $null; $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null; $script:outputRedirect = $null
+# r16 (sol r15 B1): the job ids um-run.ps1 was called for (Submit-AgentJob sets one just before the call), so a job whose file was never complete here is known never sent
+$script:umRunCalled = @{}
 function L([string]$Message) {
     $line = "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message"
-    Add-Content -LiteralPath $batchLog -Value $line
+    # r13 (adversary r13 pass 2 A1): once an accepted input was found to BE a runner output after the open, nothing more is written into -RunDir (batch.log may be that input); stderr carries the line
+    if ($script:RunOutputAliased) { [Console]::Error.WriteLine($line); return }
+    try { Add-Content -LiteralPath $batchLog -Value $line } catch { Register-LogFailure $_.Exception.Message; throw }   # r7 (adversary A1): every append failure is counted and said, whichever call site wrote the line
     Write-Output $line
+}
+
+# r6 (Dot r5 B5): the log is best effort wherever a mandatory step (keeper stop, claim release, receipt, summary, exit code) follows it. A batch.log another process holds
+# exclusively must not skip them: the failure is swallowed, counted (logWriteFailures in the receipt and the summary), said once on stderr, and the line still reaches stdout.
+$script:logWriteFailures = 0
+function Register-LogFailure([string]$Why) {
+    $script:logWriteFailures++
+    if ($script:logWriteFailures -eq 1) { try { [Console]::Error.WriteLine("BATCH_LOG_FAILED the batch log cannot be written ($($Why -replace '\s+', ' ')); later failures are counted in the batch receipt as logWriteFailures") } catch { } }
+}
+function LogBest([string]$Message) {
+    $failuresBefore = $script:logWriteFailures
+    try { L $Message } catch {
+        if ($script:logWriteFailures -eq $failuresBefore) { Register-LogFailure $_.Exception.Message }   # L counts a failed append itself
+        try { Write-Output "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message" } catch { }
+    }
+}
+
+function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
+    # LEASE-BATCH-MULTI-BUILD-1 (item 9a): a -LegPlan item that cannot run refuses the WHOLE plan before any claim, open or lease. Nothing was submitted.
+    $line = "LEG_PLAN_REFUSED reason=$Reason$(if ($Item -gt 0) { " item=$Item" }) $Detail"
+    # The log line is best effort (sol r3 A5): a batch.log another process holds must not turn the typed refusal into an unhandled exit 1 with no BATCH_USAGE line.
+    # r9: not for a refusal of an input that IS a runner output (it may be batch.log itself): the refusal must leave that file as it found it; stderr carries the line.
+    # r16 (adversary r16 A1, the class): and not through a batch.log that is a link (more than one name, or a reparse point): its other name can be an input any refusal
+    # names (a staged manifest refused for its digest), so only a plain one-name batch.log, or none yet, is appended to. One that cannot be read is not appended to either.
+    $logPlain = $false
+    try {
+        if (-not (Test-Path -LiteralPath $batchLog)) { $logPlain = $true }
+        elseif (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (Get-FileIdentity $batchLog).links -le 1) { $logPlain = $true }
+    } catch { }
+    if ($logPlain -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT')) {
+        try { Add-Content -LiteralPath $batchLog -Value "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $line" } catch { }
+    }
+    [Console]::Error.WriteLine("BATCH_USAGE $line")
+    try { Complete-VenueProcess -ExitCode 2 } catch { }
+    exit 2
+}
+
+# r9 (Sol r8 / Dot B7 / card LEASE-BATCH-RUNDIR-OUTPUT-COLLISION-GUARD-1): every file this runner writes under -RunDir, in ONE place. An input (a plan, a leg spec) that resolves to one
+# of them would be overwritten or appended to after the lease opened, so preflight refuses it before any claim. A new output is added HERE and nowhere else: the files named
+# directly in RunDir (leaf patterns, matched whole and case-insensitively) and the subdirectories the runner owns (anything under them).
+$script:RunDirOutputLeafPatterns = @(
+    '^quiet-.+\.out\.txt\z'     # Invoke-QuietProbe: each probe's output
+    '^leg-.+\.out\.txt\z'       # the leg's output (leg-<name>-b<nn>-a<n>.out.txt)
+    '^gate\.log\z'              # Wait-VenueQuiet -GateLog
+    '^batch-\d+\.json\z'        # the per-batch receipt
+    '^batches\.jsonl\z'         # one line per batch
+    '^batch\.log\z'             # one line per event
+    '^leg-plan\.json\z'         # the validated -LegPlan run record
+)
+$script:RunDirOutputDirs = @('batch-jobs', 'quiet')   # the agent job files; Wait-VenueQuiet -WorkDir
+
+function Get-PhysicalPath([string]$Path) {
+    # r10 (adversary r9 A1): the path the file system opens for $Path, every junction, symlink, subst and 8.3 spelling resolved (GetFinalPathNameByHandle), so two spellings
+    # of one file compare equal. THE one resolver of every comparison below. Throws when the path cannot be opened (the caller refuses: an unknown location is not a safe one).
+    if (-not ('VenueLeaseBatchFinalPath' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+public static class VenueLeaseBatchFinalPath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder buffer, uint length, uint flags);
+    [StructLayout(LayoutKind.Sequential)]
+    struct FileTime { public uint Low; public uint High; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct ByHandleFileInformation {
+        public uint Attributes; public FileTime Created; public FileTime Accessed; public FileTime Written;
+        public uint VolumeSerial; public uint SizeHigh; public uint SizeLow; public uint Links; public uint IndexHigh; public uint IndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetFileInformationByHandle(SafeFileHandle handle, out ByHandleFileInformation info);
+    // volume serial + file index = the file's identity, whatever name or link reached it (a hard link is a second name for the same file); Links is how many names it has
+    public static string Identity(string path, out uint links) {
+        using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (h.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            ByHandleFileInformation info;
+            if (!GetFileInformationByHandle(h, out info)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            links = info.Links;
+            return info.VolumeSerial.ToString("x8") + ":" + info.IndexHigh.ToString("x8") + info.IndexLow.ToString("x8");
+        }
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool GetVolumeInformationW(string root, StringBuilder volumeName, uint volumeNameSize, out uint serial, out uint maxComponent, out uint flags, StringBuilder fsName, uint fsNameSize);
+    // r11 (sol r10 blocker 2): the longest single path component the volume holding $root accepts (255 on NTFS)
+    public static int MaxComponent(string root) {
+        uint serial, maxComponent, flags;
+        if (!GetVolumeInformationW(root, null, 0, out serial, out maxComponent, out flags, null, 0)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        return (int)maxComponent;
+    }
+    public static string Resolve(string path) {
+        // access 0 (attributes only), share all, OPEN_EXISTING, BACKUP_SEMANTICS (a directory opens too); no OPEN_REPARSE_POINT, so a link is followed to its target
+        using (SafeFileHandle h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (h.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+            uint size = 1024;
+            while (true) {
+                StringBuilder sb = new StringBuilder((int)size);
+                uint n = GetFinalPathNameByHandleW(h, sb, size, 0);
+                if (n == 0) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                if (n < size) {
+                    string s = sb.ToString();
+                    if (s.StartsWith(@"\\?\UNC\", StringComparison.Ordinal)) { return @"\\" + s.Substring(8); }
+                    if (s.StartsWith(@"\\?\", StringComparison.Ordinal)) { return s.Substring(4); }
+                    return s;
+                }
+                size = n + 1;
+            }
+        }
+    }
+}
+'@
+    }
+    [VenueLeaseBatchFinalPath]::Resolve([IO.Path]::GetFullPath($Path))
+}
+
+function Get-FileIdentity([string]$Path) {
+    # r10 (adversary r10 A1): a hard link has its own final path but is the SAME file, so a path comparison cannot see it; the volume + file index can. links > 1 = the file has another name.
+    [uint32]$links = 0
+    $key = [VenueLeaseBatchFinalPath]::Identity([IO.Path]::GetFullPath($Path), [ref]$links)
+    [pscustomobject]@{ key = $key; links = [int]$links }
+}
+
+# r11 (sol r10 blocker 1 / fable H1; card LEASE-BATCH-MULTI-BUILD-1): the runner's outputs are not only the files in -RunDir. VenueChain.psm1 also writes, under the claim dir, every
+# file it names with Join-Path / Get-VenueClaimPath / Get-VenueTicketDir / Get-VenueLeaseLedgerPath: <venue>.claim.json (Invoke-VenueClaimAttempt creates it, Update-VenueClaim rewrites it,
+# Remove-VenueClaimIfUnchanged deletes it, and deletes an unparseable one as a stale claim), <venue>.lease-ledger.jsonl (Add-VenueLeaseLedger appends) and <venue>.tickets\ (New-VenueTicket
+# creates <ticks>-p<pid>-<start>.ticket.json files there). The claim dir is a second zone beside -RunDir (they may be the same folder), listed here and nowhere else, like the -RunDir one above.
+$script:ClaimDirOutputLeafPatterns = @(
+    ('^' + [regex]::Escape("$Venue.claim.json") + '\z')
+    ('^' + [regex]::Escape("$Venue.lease-ledger.jsonl") + '\z')
+)
+$script:ClaimDirOutputDirs = @("$Venue.tickets")
+$script:ClaimDirPath = $(try { [string](Split-Path -Parent (Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir)) } catch { '' })
+
+function Remove-TrailingSeparator([string]$Path) {
+    # r12 (adversary r12 A2): TrimEnd('\') turns the drive root C:\ into C:, which every file API reads as the drive's CURRENT directory, so a guard that listed a root zone looked at the
+    # wrong folder and missed a hard link or a link directly under it. A drive root keeps its one backslash; every other path (UNC share roots too) loses its trailing ones.
+    $t = $Path.TrimEnd('\')
+    if ($t -match '^[A-Za-z]:\z') { return $t + '\' }
+    $t
+}
+
+function Get-OutputZones {
+    # The folders this run writes into: -RunDir, then the claim dir when it already exists (nothing can sit in one that does not). root = the PHYSICAL path.
+    # r13: rootId / ownedIds are the zone's and each existing owned directory's file identity (Get-RunDirOutputRefusal fills them)
+    $zones = @([pscustomobject]@{ label = '-RunDir'; root = (Remove-TrailingSeparator (Get-PhysicalPath $RunDir)); leaf = $script:RunDirOutputLeafPatterns; dirs = $script:RunDirOutputDirs; linked = @(); rootId = $null; ownedIds = @{} })
+    if ($script:ClaimDirPath -and (Test-Path -LiteralPath $script:ClaimDirPath -PathType Container)) {
+        $zones += [pscustomobject]@{ label = '-ClaimDir'; root = (Remove-TrailingSeparator (Get-PhysicalPath $script:ClaimDirPath)); leaf = $script:ClaimDirOutputLeafPatterns; dirs = $script:ClaimDirOutputDirs; linked = @(); rootId = $null; ownedIds = @{} }
+    }
+    $zones
+}
+
+function Get-RunDirOutputRefusal([string]$Path) {
+    # '' when $Path is not a file this run writes; else the sentence for the refusal. r10 (adversary r9 A1): PHYSICAL paths on both sides (Get-PhysicalPath), so neither a spelling of -RunDir
+    # (\.\, ..\, a trailing \) nor a junction or symlink that reaches it (the input, an ancestor of it, or -RunDir itself) slips past. Every caller goes through here, and so does the
+    # re-check once the claim is held (Get-InputOutputRefusal). r11: and the same for each zone of Get-OutputZones (-RunDir, then the claim dir).
+    $hardLinkOf = ''; $hardLinkZone = $null
+    try {
+        $full = Get-PhysicalPath $Path
+        $zones = @(Get-OutputZones)
+        foreach ($z in $zones) {
+            # a runner-owned name inside the zone that is itself a link: what the runner writes under that name lands at the link's target, so the target is the output
+            $linked = @()
+            foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
+                $owned = ($c.Name -iin $z.dirs)
+                foreach ($p in $z.leaf) { if ($c.Name -imatch $p) { $owned = $true } }
+                if ($owned) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = (Get-PhysicalPath $c.FullName) } }
+            }
+            # r12 pass 2 (adversary r12 A1'): and a link BELOW an owned directory (quiet\x.job.ps1 -> a spec, or a junction in it) writes through just the same, whatever the target's link count:
+            # anything under an owned directory is a runner output, so every reparse point found there is listed with its physical target. A link that cannot be resolved points at nothing.
+            foreach ($d in $z.dirs) {
+                $dp = Join-Path $z.root $d
+                $top = @($linked | Where-Object { $_.isDir -and $_.name -ieq $d })
+                if ($top.Count -gt 0) { $dp = $top[0].physical }
+                if (-not (Test-Path -LiteralPath $dp -PathType Container)) { continue }
+                foreach ($c in @(Get-ChildItem -LiteralPath $dp -Force -Recurse -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {
+                    $target = $(try { Get-PhysicalPath $c.FullName } catch { $null })
+                    if ($target) { $linked += [pscustomobject]@{ name = $c.Name; isDir = [bool]$c.PSIsContainer; physical = $target; nested = $true } }
+                }
+            }
+            $z.linked = $linked
+            # r13 (Dot A2''): a final path has more than one SPELLING (\\localhost\C$\run\gate.log and C:\run\gate.log are one file, one link, no reparse point), so every location
+            # below is also compared by identity (volume serial + file index), which no spelling changes. One that cannot be read refuses the input (the catch).
+            $z.rootId = (Get-FileIdentity $z.root).key
+            foreach ($d in $z.dirs) { $dp = Join-Path $z.root $d; if (Test-Path -LiteralPath $dp -PathType Container) { $z.ownedIds[$d] = (Get-FileIdentity $dp).key } }
+            foreach ($l in $z.linked) { $l | Add-Member -NotePropertyName id -NotePropertyValue (Get-FileIdentity $l.physical).key }
+        }
+        # r10 (adversary r10 A1): and a HARD link is a second name for the same file, with its own final path, so the paths differ while the file is the one the runner writes. Compare file
+        # identity: only an input with more than one name can be one, and then only the outputs that already exist can be its other name.
+        $id = Get-FileIdentity $full
+        # r13 (Dot A2''): the identity of every directory above the input, nearest first, for the zone and owned-directory comparisons below
+        $aboveIds = [System.Collections.Generic.List[string]]::new()
+        $a = [IO.Path]::GetDirectoryName($full)
+        while ($a) { $aboveIds.Add((Get-FileIdentity $a).key); $a = [IO.Path]::GetDirectoryName($a) }
+        if ($id.links -gt 1) {
+            foreach ($z in $zones) {
+                $scan = [System.Collections.Generic.List[object]]::new()
+                foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -File -ErrorAction Stop)) {
+                    foreach ($p in $z.leaf) { if ($c.Name -imatch $p) { $scan.Add($c); break } }
+                }
+                foreach ($d in $z.dirs) {
+                    $dp = Join-Path $z.root $d
+                    $lk = @($z.linked | Where-Object { $_.isDir -and -not $_.nested -and $_.name -ieq $d })
+                    if ($lk.Count -gt 0) { $dp = $lk[0].physical }
+                    if (Test-Path -LiteralPath $dp -PathType Container) { foreach ($c in @(Get-ChildItem -LiteralPath $dp -Force -File -Recurse -ErrorAction Stop)) { $scan.Add($c) } }
+                }
+                foreach ($c in $scan) {
+                    if (((Get-FileIdentity $c.FullName).key -ceq $id.key) -and ((Get-PhysicalPath $c.FullName) -ine $full)) { $hardLinkOf = $c.FullName; $hardLinkZone = $z; break }
+                }
+                if ($hardLinkOf) { break }
+            }
+        }
+    } catch { return "'$Path' cannot be resolved to a physical path ($($_.Exception.Message -replace '\s+', ' ')); an input whose location is unknown is refused" }
+    $shown = $(if ($full -ieq [IO.Path]::GetFullPath($Path)) { "'$full'" } else { "'$Path' (physical path '$full')" })
+    if ($hardLinkOf) { return "$shown is a hard link to $hardLinkOf, a file this run writes under $($hardLinkZone.label)" }
+    $parent = Remove-TrailingSeparator ([IO.Path]::GetDirectoryName($full))
+    foreach ($z in $zones) {
+        # each test by spelling OR by identity (r13, Dot A2''): the same file or directory reached by another spelling is the same output
+        foreach ($l in $z.linked) {
+            if (-not $l.isDir -and ($full -ieq $l.physical -or $id.key -ceq $l.id)) { return "$shown is a file this run writes into $($z.label) ($($l.name), a link to it)" }
+            if ($l.isDir -and (($full + '\').StartsWith($l.physical.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase) -or $aboveIds -ccontains $l.id)) { return "$shown is inside $($l.name)\, a link to a directory this run writes into under $($z.label)" }
+        }
+        if ($parent -ieq $z.root -or ($aboveIds.Count -gt 0 -and $aboveIds[0] -ceq $z.rootId)) {
+            $leaf = [IO.Path]::GetFileName($full)
+            foreach ($p in $z.leaf) { if ($leaf -imatch $p) { return "$shown is a file this run writes into $($z.label) ($leaf)" } }
+        }
+        foreach ($d in $z.dirs) {
+            if (($parent.TrimEnd('\') + '\').StartsWith($z.root.TrimEnd('\') + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase) -or ($z.ownedIds.ContainsKey($d) -and $aboveIds -ccontains $z.ownedIds[$d])) { return "$shown is inside $d\, a directory this run writes into under $($z.label)" }
+        }
+    }
+    ''
+}
+
+function Get-OutputNameRefusal([string]$LegName) {
+    # r11 (sol r10 blocker 2): '' when every file name the runner generates from $LegName can be opened, else the sentence. The names are Invoke-QuietProbe's quiet-<leg>-<phase>.out.txt and the
+    # leg's leg-<leg>-b<nn>-a<n>.out.txt (the two generated ones; the rest are fixed names). The batch and attempt numbers are not known yet, so the check reserves room for the widest
+    # it will print (b9999-a999999). A name over the volume's longest component (GetVolumeInformationW; 255 when it cannot be read), or a full path over 32000 characters, is refused.
+    if ($null -eq $script:MaxNameComponent) {
+        $script:MaxNameComponent = 255
+        try { $n = [VenueLeaseBatchFinalPath]::MaxComponent([IO.Path]::GetPathRoot((Get-PhysicalPath $RunDir))); if ($n -gt 0) { $script:MaxNameComponent = $n } } catch { }
+    }
+    $phase = 'b9999-a999999'
+    foreach ($name in @("quiet-$LegName-$phase.out.txt", "leg-$LegName-$phase.out.txt")) {
+        if ($name.Length -gt $script:MaxNameComponent) { return "the file name '$name' this run would write is $($name.Length) characters, over the $($script:MaxNameComponent) the volume allows in one name (reserving room for batch and attempt numbers)" }
+        if ($RunDir.TrimEnd('\').Length + 1 + $name.Length -gt 32000) { return "the path to '$name' under -RunDir is over 32000 characters" }
+    }
+    ''
+}
+
+function Get-InputOutputRefusal {
+    # r11 (sol r10 blocker 3): the first validated input (the plan file, then each leg spec) that is now a file this run writes; $null when none is. Defined once the plan is built;
+    # the very guard the preflight uses (Get-RunDirOutputRefusal), run again once the claim is held, because an alias can appear while the batch waits for a foreign claim.
+    foreach ($g in $script:guardedInputs) {
+        # a staged build manifest that is gone has no location to compare; Get-InputContentRefusal types that (BUILD_NOT_STAGED)
+        if ($g.kind -ceq 'build' -and -not (Test-Path -LiteralPath $g.path -PathType Leaf)) { continue }
+        $why = Get-RunDirOutputRefusal $g.path
+        if ($why) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why } }
+    }
+    Get-InputContentRefusal
+}
+
+function Test-OpenOutputAlias {
+    # r14 (Dot 2e6eb21d; adversary r13 pass 3 A1, A2): the guard run once the open returns, WHATEVER it returned (a failed open, one with no lease batch, one still held in the gate, one
+    # held to the deadline), before anything more is written. A location hit means a runner output IS an accepted input, so it turns the write suppression on by itself: the log and
+    # the receipt go to stderr, the close job file to a fresh folder under TEMP, the ledger row is said, not appended. Which typed stop the run then takes is decided apart from it.
+    # adversary r14 pass 2 A1: a location hit is sticky. The gate-wait guard can find it and a later call find the link gone, but the keeper is stopped and the writes are
+    # suppressed by then, so the run must still end in the refusal: no probe or leg ever runs once an alias was found.
+    if ($script:openAliasHit) { return $script:openAliasHit }
+    $hit = Get-InputOutputRefusal
+    if ($hit -and $hit.kind -cne 'content' -and -not $script:RunOutputAliased) {
+        $script:openAliasHit = $hit
+        # Suppression first, so nothing below can leave it off: no batch.log at all until a redirect exists (the final append then fails, is counted and said on stderr).
+        $script:RunOutputAliased = $true; $script:batchLog = $null
+        # adversary r14 A3: the claim keeper rewrites the claim file in place, and that file may be the input too: it is stopped now, not after the close. The claim can then lapse
+        # at its TTL while the lease is closed; it is still released (by nonce, a delete that changes no linked input's bytes) in the finally.
+        $script:keeperStoppedEarly = $true; $script:keeperStoppedInTime = Stop-VenueKeeper -Keeper $claimKeeper
+        # adversary r14 A1, A2: the redirect is a NEW folder with an unguessable name, created without -Force (an existing one, prepared with links, is never reused), and its files are
+        # created new (Submit-AgentJob). A redirect that cannot be made is no throw: the close job then cannot be written, its submit is typed JOB_WRITE_FAILED, and the finally goes on.
+        # r16 (sol r15 B2): no job folder at all until the redirect is made, and the redirect's path is built inside the try: TEMP on a drive that does not exist threw from Join-Path
+        # before it, so BATCH_ERROR replaced the open's typed stop and the close job was still written into <RunDir>\batch-jobs. The failure is the outputRedirect field instead.
+        $script:jobDir = $null; $tempDir = [IO.Path]::GetTempPath(); $redirect = $null
+        try {
+            $redirect = [IO.Path]::Combine($tempDir, "venue-lease-batch-close-$token-$([guid]::NewGuid().ToString('N'))")
+            # TEMP set inside -RunDir would put the redirect back in it: refused, by spelling and (adversary r14 pass 2 A2: a junction to -RunDir) by the physical path of both
+            foreach ($pair in @(@($RunDir, $tempDir), @((Get-PhysicalPath $RunDir), (Get-PhysicalPath $tempDir)))) {
+                $runDirPrefix = Remove-TrailingSeparator $pair[0]; if (-not $runDirPrefix.EndsWith('\')) { $runDirPrefix += '\' }
+                $tp = Remove-TrailingSeparator ([IO.Path]::GetFullPath($pair[1])); if (-not $tp.EndsWith('\')) { $tp += '\' }
+                if ($tp.StartsWith($runDirPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "TEMP ($tempDir) is inside -RunDir (physical $($pair[1]))" }
+            }
+            # r16 (fable r15 H1): and by identity, as Get-RunDirOutputRefusal compares (volume serial + file index): a loopback UNC TEMP (\\localhost\C$\<RunDir>) has no
+            # prefix in common with -RunDir by spelling or by final path, so every existing folder from TEMP up is compared with -RunDir itself
+            $runDirId = (Get-FileIdentity $RunDir).key
+            $up = Remove-TrailingSeparator ([IO.Path]::GetFullPath($tempDir))
+            while ($up) {
+                if ((Test-Path -LiteralPath $up -PathType Container) -and (Get-FileIdentity $up).key -ceq $runDirId) { throw "TEMP ($tempDir) is inside -RunDir ($up is -RunDir by file identity)" }
+                $up = [IO.Path]::GetDirectoryName($up)
+            }
+            $null = New-Item -ItemType Directory -Path $redirect -ErrorAction Stop
+            $script:jobDir = $redirect; $script:batchLog = Join-Path $redirect 'batch.log'
+            $script:outputRedirect = [ordered]@{ state = 'MADE'; path = $redirect; temp = $tempDir; error = $null }
+        }
+        catch {
+            $why = $_.Exception.Message -replace '\s+', ' '
+            $script:outputRedirect = [ordered]@{ state = 'FAILED'; path = $redirect; temp = $tempDir; error = $why }
+            [Console]::Error.WriteLine("BATCH_OUTPUT_REDIRECT_FAILED temp=$tempDir redirect=$redirect ($why): the close job cannot be written (nothing is written into -RunDir instead); the result line is on stdout only")
+        }
+        [Console]::Error.WriteLine("BATCH_OUTPUT_ALIASED kind=$($hit.kind) item=$($hit.item) $($hit.why) (found once the open returned: nothing more is written into -RunDir; the log and the receipt go to stderr; claim keeper stopped inTime=$($script:keeperStoppedInTime))")
+    }
+    $hit
+}
+
+function Get-InputContentRefusal {
+    # r12 pass 2 (adversary r12 A2'): the CONTENT the preflight validated (each leg spec the leg would run, each staged build manifest's digest and fields) can change in the same wait as
+    # a location can, and the leg job would then throw or refuse after the lease opened. The same reads and the same typed reasons as the preflight, run again with the location re-check.
+    # $null when nothing changed. r13 (Dot A1''): a manifest whose bytes cannot be read now (write-locked, the share not answering) is a hit too, SHARE_UNREACHABLE as in the preflight:
+    # its digest cannot be re-validated, and no lease is opened on a build nobody re-validated.
+    if (-not $legPlanMode) { return $null }
+    foreach ($g in $script:guardedInputs) {
+        if ($g.kind -ceq 'spec') {
+            $sr = @(Get-LegSpecRefusal $g.path $g.backend)
+            if ($sr[0]) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = [string]$sr[0]; why = [string]$sr[1] } }
+        } elseif ($g.kind -ceq 'build') {
+            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec 30
+            $short = $g.commit.Substring(0, 12)
+            if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short could not be read after the claim wait at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no lease is opened" } }
+            if ($st.state -cne 'STAGED' -and $st.state -cne 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short read as '$($st.state)' after the claim wait; only STAGED with the validated digest opens a lease" } }
+            if ($st.state -ceq 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_NOT_STAGED'; why = "no staged build manifest for $short at $($st.path) any more; the runner stages and builds nothing" } }
+            if ($st.state -ceq 'STAGED' -and $st.sha256 -cne $g.sha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_MANIFEST_MISMATCH'; why = "the staged build manifest for $short changed while the batch waited: sha256 $($st.sha256), not $($g.sha256)" } }
+            if ($st.state -ceq 'STAGED' -and $st.contentProblem) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_MANIFEST_MISMATCH'; why = "the staged build manifest for $short at $($st.path) is no longer one the leg job accepts: $($st.contentProblem)" } }
+        }
+    }
+    $null
+}
+
+function Stop-InputIsOutput($Hit) {
+    # the typed refusal of Get-InputOutputRefusal's hit: the same reason words and exit 2 as the preflight's
+    if ($Hit.kind -ceq 'content') { Stop-PlanRefused $Hit.code $Hit.item $Hit.why }
+    elseif ($Hit.kind -ceq 'plan') { Stop-PlanRefused 'LEG_PLAN_IS_RUN_OUTPUT' 0 "the plan file $($Hit.why)" }
+    elseif ($Hit.kind -ceq 'build') { Stop-PlanRefused 'BUILD_MANIFEST_IS_RUN_OUTPUT' $Hit.item "the staged build manifest $($Hit.why)" }
+    elseif ($legPlanMode) { Stop-PlanRefused 'LEG_SPEC_IS_RUN_OUTPUT' $Hit.item "the leg spec $($Hit.why)" }
+    else { Stop-Usage "LEG_SPEC_IS_RUN_OUTPUT the leg spec $($Hit.why)" }
+}
+
+function Resolve-LegSpecPath([string]$Ref, [string]$BesideDir) {
+    # a leg spec as given, then beside the plan file (-LegPlan only), then legs\<name>; $null when none is a file
+    foreach ($c in @($Ref, $(if ($BesideDir -and -not [IO.Path]::IsPathRooted($Ref)) { Join-Path $BesideDir $Ref }), (Join-Path $here "legs\$Ref"))) {
+        # a candidate the file system cannot probe (a NUL in the name, sol r3 second pass A2) is not a file
+        try { if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return (Resolve-Path -LiteralPath $c).Path } } catch { }
+    }
+    $null
+}
+
+function Get-LegSpecId([string]$Path) {
+    $legId = try { [string](([IO.File]::ReadAllText($Path) | ConvertFrom-Json).legId) } catch { '' }
+    # \z, not $: '$' also matches before a final LF, which would ride into the leg name and then into file names (sol r3 A3)
+    if ($legId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}\z') { $legId = [IO.Path]::GetFileNameWithoutExtension($Path) }
+    $legId
+}
+
+function Get-LegSpecRefusal([string]$Path, [string]$Backend) {
+    # sol r3 A4: the refusal Invoke-VenueLeg would throw (DVE_LEG_SPEC_INVALID) AFTER the lease is open, found before it. '' when the leg can take this backend.
+    # Same reads as Invoke-VenueLeg: the file's bytes as UTF-8, ConvertFrom-Json, the schema, then the backend against the spec's own list.
+    # sol r3 second pass A1: then the spec fields Invoke-VenueLeg casts or validates BEFORE its terminal try (playSeconds, visualCapture and its opt-out reason,
+    # scaleFactor and acceptedEffectiveScale, displayMode), by calling the functions it calls. r5 (key3 F2): and the card and legId it binds to New-DvReceipt's
+    # Mandatory [string] parameters. NOT mirrored: the leg's pre-submit REFUSALS (LEG_SPEC_NOT_COMMITTED, the playSeconds floor, clipId admission; OPEN
+    # LEASE-BATCH-PLAN-PREFLIGHT-ADMISSION-PARITY-1) and the generatorArgs casts, which sit inside the leg's try and end as a typed receipt.
+    $spec = try { [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($Path)) | ConvertFrom-Json } catch { $null }
+    if ($null -eq $spec -or $spec -isnot [System.Management.Automation.PSCustomObject]) { return 'LEG_SPEC_INVALID', "'$Path' is not a JSON object" }
+    if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { return 'LEG_SPEC_INVALID', "'$Path' schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
+    if ($Backend -notin @($spec.backends)) { return 'BAD_BACKEND', "backend '$Backend' is not one of this leg's backends ($(@($spec.backends) -join ', ')) in '$Path'" }
+    try {
+        if ($null -ne $spec.PSObject.Properties['playSeconds']) { $null = [int]$spec.playSeconds }
+        $null = Get-DvVisualCaptureRequest -Spec $spec
+        $null = Get-DvScaleEvidence -Spec $spec -Backend $Backend -LogText $null
+        $null = Get-DvDisplayEvidence -Spec $spec -LogText $null
+        if ([string]::IsNullOrEmpty([string]$spec.card)) { throw 'the spec has no card (Invoke-VenueLeg binds it to New-DvReceipt, which refuses an empty one)' }
+        if ([string]::IsNullOrEmpty([string]$spec.legId)) { throw 'the spec has no legId (Invoke-VenueLeg binds it to New-DvReceipt, which refuses an empty one)' }
+    } catch { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $($_.Exception.Message -replace '\s+', ' ')" }
+    return '', ''
 }
 
 # The planned legs: name, spec path, backend ('' = whatever the spec lists). Same naming as Invoke-VenueChain.
 $plan = [System.Collections.Generic.List[object]]::new()
-if ($LegSet) {
+$planRecord = $null
+if ($legPlanMode) {
+    # LEASE-BATCH-MULTI-BUILD-1 (item 9): read the plan, validate EVERY item (shape first, then each build staged with that manifest), then order it.
+    try {
+        Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force   # the leg process's own spec predicates, run in preflight (Get-LegSpecRefusal)
+        $planPath = $(if (Test-Path -LiteralPath $LegPlan -PathType Leaf) { (Resolve-Path -LiteralPath $LegPlan).Path } else { $null })
+        if (-not $planPath) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "no plan file at '$LegPlan'" }
+        $outputRefusal = Get-RunDirOutputRefusal $planPath   # r9: the plan is an input too (leg-plan.json is written over it once the claim is held)
+        if ($outputRefusal) { Stop-PlanRefused 'LEG_PLAN_IS_RUN_OUTPUT' 0 "the plan file $outputRefusal" }
+        $doc = try { [IO.File]::ReadAllText($planPath) | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
+        # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
+        $rawItems = $null
+        if ($doc -is [array]) { $rawItems = $doc }
+        elseif ($doc -is [System.Management.Automation.PSCustomObject] -and $doc.PSObject.Properties['legs']) {
+            if ($doc.PSObject.Properties['schema'] -and [string]$doc.schema -cne 'mlv-app/venue-lease-leg-plan/v1') { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "schema '$($doc.schema)' is not mlv-app/venue-lease-leg-plan/v1" }
+            if ($doc.legs -isnot [array]) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'legs' in '$planPath' is not an array (a single leg is a one-item array)" }
+            $rawItems = $doc.legs
+        }
+        if ($null -eq $rawItems -or $rawItems.Count -eq 0) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' names no legs (an array of items, or an object with a legs array)" }
+        $planDir = Split-Path -Parent $planPath
+        $items = [System.Collections.Generic.List[object]]::new()
+        for ($i = 0; $i -lt $rawItems.Count; $i++) {
+            $it = $rawItems[$i]; $n = $i + 1
+            if ($it -isnot [System.Management.Automation.PSCustomObject]) { Stop-PlanRefused 'BAD_ITEM_SHAPE' $n "an item is an object {legSpec, backend, sourceCommit, buildManifestSha256, arm}, not $(if ($null -eq $it) { 'null' } else { $it.GetType().Name }); the whole plan is refused" }
+            $sc = [string]$it.sourceCommit; $ms = [string]$it.buildManifestSha256; $be = [string]$it.backend; $arm = [string]$it.arm; $ref = [string]$it.legSpec
+            # the scalar form's own patterns (ValidatePattern, case-insensitive) and backend set; \z, not $, so a final LF is not accepted (sol r3 A3)
+            if ($sc -notmatch '^[0-9a-f]{40}\z') { Stop-PlanRefused 'BAD_SOURCE_COMMIT' $n "sourceCommit '$sc' is not 40 hex" }
+            if ($ms -notmatch '^[0-9a-f]{64}\z') { Stop-PlanRefused 'BAD_MANIFEST_SHA256' $n "buildManifestSha256 '$ms' is not 64 hex" }
+            if ($be -notin @('cuda', 'cpu')) { Stop-PlanRefused 'BAD_BACKEND' $n "backend '$be' is not cuda or cpu" }
+            if ($arm -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,31}\z') { Stop-PlanRefused 'BAD_ARM' $n "arm '$arm' is not a label of 1-32 of [A-Za-z0-9._-]" }
+            $path = $(if ($ref) { Resolve-LegSpecPath $ref $planDir } else { $null })
+            if (-not $path) { Stop-PlanRefused 'LEG_SPEC_MISSING' $n "no leg spec at '$ref'" }
+            # adversary r7 pass 2 A1, r9: a spec that IS one of the files this run writes under -RunDir (the one list above) would be overwritten after the lease opened.
+            $outputRefusal = Get-RunDirOutputRefusal $path
+            if ($outputRefusal) { Stop-PlanRefused 'LEG_SPEC_IS_RUN_OUTPUT' $n "the leg spec $outputRefusal" }
+            $specRefusal = Get-LegSpecRefusal $path $be
+            if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
+            $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
+        }
+        # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
+        $builds = [ordered]@{}
+        foreach ($it in $items) {
+            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -TimeoutSec 30 }
+            $st = $builds[$it.sourceCommit]
+            $short = $it.sourceCommit.Substring(0, 12)
+            if ($st.state -ceq 'UNREACHABLE') { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
+            if ($st.state -cne 'STAGED') { Stop-PlanRefused 'BUILD_NOT_STAGED' $it.item "no staged build manifest for $short at $($st.path); the runner stages and builds nothing" }
+            # r12 (adversary r12 A1): the manifest is an input the legs read, so it gets the guard the plan and the specs get: a hard link or a link that makes it one of the files this run writes
+            # (leg-plan.json, a batch receipt, ...) would have it overwritten after the lease opened. r16 (adversary r16 A1): BEFORE its digest and content refusals, as the specs' guard
+            # comes before theirs: a manifest that is batch.log was appended to by the BUILD_MANIFEST_MISMATCH refusal's own log line.
+            $outputRefusal = Get-RunDirOutputRefusal $st.path
+            if ($outputRefusal) { Stop-PlanRefused 'BUILD_MANIFEST_IS_RUN_OUTPUT' $it.item "the staged build manifest for $short $outputRefusal" }
+            if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
+            # r5 (adversary A2): and the manifest must be one the leg job's validator accepts (its commit, dll pair digest and symbol presence), not only the one named by hash
+            if ($st.contentProblem) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short at $($st.path) is not one the leg job accepts: $($st.contentProblem)" }
+        }
+        $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
+        foreach ($it in $ordered) {
+            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
+                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item })
+        }
+        $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
+            legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
+            builds = @($builds.Keys | ForEach-Object { [ordered]@{ sourceCommit = $_; state = $builds[$_].state; sha256 = $builds[$_].sha256; path = $builds[$_].path } }) }
+    } catch {
+        # sol r3 second pass A2: whatever else a plan item makes the validation throw on is still the typed refusal of the whole plan (exit 2, BATCH_USAGE), never an exit 1.
+        Stop-PlanRefused 'LEG_PLAN_INVALID' 0 "the plan could not be validated: $($_.Exception.Message -replace '\s+', ' ')"
+    }
+} elseif ($LegSet) {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
     $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
     foreach ($e in $sp.plan) { $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend }) }
 } else {
     foreach ($ref in $LegSpec) {
-        $path = $(if (Test-Path -LiteralPath $ref -PathType Leaf) { $ref } elseif (Test-Path -LiteralPath (Join-Path $here "legs\$ref") -PathType Leaf) { Join-Path $here "legs\$ref" } else { Stop-Usage "no leg spec at '$ref'" })
-        $path = (Resolve-Path -LiteralPath $path).Path
-        $legId = try { [string](([IO.File]::ReadAllText($path) | ConvertFrom-Json).legId) } catch { '' }
-        if ($legId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$') { $legId = [IO.Path]::GetFileNameWithoutExtension($path) }
+        $path = Resolve-LegSpecPath $ref ''
+        if (-not $path) { Stop-Usage "no leg spec at '$ref'" }
+        $outputRefusal = Get-RunDirOutputRefusal $path   # r9: the same guard as a -LegPlan item's spec
+        if ($outputRefusal) { Stop-Usage "LEG_SPEC_IS_RUN_OUTPUT the leg spec $outputRefusal" }
+        $legId = Get-LegSpecId $path
         for ($r = 1; $r -le $Repeats; $r++) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })
         }
     }
+}
+# r11 (sol r10 blocker 2): every generated output name is checked HERE, before any claim, for every form: a leg name built from an accepted spec's own basename (the legId fallback) and a
+# 32-character arm can pass every earlier check and then name a file the volume cannot hold, which would fail after the lease opened.
+foreach ($leg in $plan) {
+    $nameRefusal = Get-OutputNameRefusal $leg.name
+    if ($nameRefusal) {
+        if ($legPlanMode) { Stop-PlanRefused 'OUTPUT_NAME_TOO_LONG' $leg.planItem "leg $($leg.name): $nameRefusal" }
+        else { Stop-Usage "OUTPUT_NAME_TOO_LONG leg $($leg.name): $nameRefusal" }
+    }
+}
+# r11 (sol r10 blocker 3): the validated inputs, kept for the re-check once the claim is held (Get-InputOutputRefusal). A -LegSet's specs are inputs too, so they are checked now as well.
+$script:guardedInputs = [System.Collections.Generic.List[object]]::new()
+if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPath; kind = 'plan'; item = 0 }) }
+foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend }) }
+# r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
+if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { $_.sourceCommit -ceq $b.Key })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
+if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }
+# The scalar form's one build rides on every leg, so each leg is launched with its own build in either form.
+if (-not $legPlanMode) { foreach ($p in $plan) { $p | Add-Member -NotePropertyName sourceCommit -NotePropertyValue $SourceCommit; $p | Add-Member -NotePropertyName buildManifestSha256 -NotePropertyValue $BuildManifestSha256 } }
+
+function Add-PlanIdentity([object]$Row, [object]$Leg) {
+    # LEASE-BATCH-MULTI-BUILD-1 (item 9c): a -LegPlan leg's batch row names its own leg, arm, backend and build. A scalar run's rows are left as they were.
+    if (-not $legPlanMode) { return }
+    foreach ($k in 'name', 'arm', 'backend', 'sourceCommit', 'buildManifestSha256') { $Row | Add-Member -NotePropertyName $k -NotePropertyValue $Leg.$k -Force }
 }
 
 function Format-Mean($m) { if ($null -eq $m) { 'UNKNOWN' } else { '{0:0.0}' -f $m } }
@@ -229,11 +734,22 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
 function Submit-AgentJob([string]$JobId, [string]$Body, [int]$TimeoutSec, [int]$WaitSec, [string]$NotAfterUtc = '') {
     # One job through um-run.ps1 (the only writer to a venue share). RECEIPT | RETRACTED | UNRESOLVED | ERROR; a thrown RETRACTED / UNRESOLVED is data here.
     # r4: -NotAfterUtc (the open only) goes to um-run.ps1 -NotAfterUtc, meta.json notAfterUtc: the agent takes no lease for the job past it.
-    $f = Join-Path $jobDir "$JobId.job.ps1"
-    [IO.File]::WriteAllText($f, $Body + "`r`n", [Text.Encoding]::ASCII)
+    # r16 (sol r15 B1): JOB_WRITE_FAILED = the job file was never complete here (no job folder, the create or the write failed), so um-run.ps1 was never called and
+    # nothing reached the agent. Every other outcome follows the call, which $script:umRunCalled records first.
     $bound = @{}
     if ($NotAfterUtc) { $bound.NotAfterUtc = $NotAfterUtc }
     try {
+        if (-not $jobDir) { throw 'no job folder: the output redirect could not be made' }
+        $f = Join-Path $jobDir "$JobId.job.ps1"
+        # adversary r14 A1, A2: the job file is created NEW (a file already at its name, a link prepared there included, is refused, never truncated), and a write that fails is
+        # this job's outcome, not a throw out of the finally's close (which would skip the keeper stop, the claim release and the receipt)
+        $fs = [IO.File]::Open($f, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $jb = [Text.Encoding]::ASCII.GetBytes($Body + "`r`n"); $fs.Write($jb, 0, $jb.Length) } finally { $fs.Dispose() }
+    } catch {
+        return [pscustomobject]@{ outcome = 'JOB_WRITE_FAILED'; result = $null; message = "the job file for $JobId could not be written ($($_.Exception.Message -replace '\s+', ' ')): um-run was not called" }
+    }
+    try {
+        $script:umRunCalled[$JobId] = $true
         $o = @(& $UmRunScript -ScriptPath $f -JobId $JobId -AgentShare $AgentShare -TimeoutSec $TimeoutSec -MaxQueueWaitSec $WaitSec -MaxClaimedWaitSec 300 -MaxAdmissionWaitSec $WaitSec @bound 6>$null)
         [pscustomobject]@{ outcome = 'RECEIPT'; result = $(if ($o.Count -gt 0) { $o[-1] } else { $null }); message = $null }
     } catch {
@@ -279,6 +795,7 @@ $batchNo = 0
 function Write-BatchReceipt([System.Collections.IDictionary]$B) {
     $B.endedUtc = [DateTime]::UtcNow.ToString('o')
     $rec = [pscustomobject]$B
+    if ($script:RunOutputAliased) { [Console]::Error.WriteLine("BATCH_RECEIPT_NOT_WRITTEN batch=$($B.batch) (an accepted input is a runner output; nothing more is written into -RunDir) $($rec | ConvertTo-Json -Compress -Depth 8)"); $batches.Add($rec); return }
     [IO.File]::WriteAllText((Join-Path $RunDir ('batch-{0:00}.json' -f $B.batch)), ($rec | ConvertTo-Json -Depth 8) + "`n", [Text.UTF8Encoding]::new($false))
     Add-Content -LiteralPath (Join-Path $RunDir 'batches.jsonl') -Value ($rec | ConvertTo-Json -Compress -Depth 8)
     $batches.Add($rec)
@@ -307,11 +824,12 @@ foreach ($l in @(Read-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -SinceU
 function Set-Stop([string]$Reason, [int]$Code) { $script:stopReason = $Reason; if ($script:exitCode -eq 0 -or $script:exitCode -eq 7) { $script:exitCode = $Code } }
 function Add-Result([object]$Leg, [string]$Status, [hashtable]$Extra) {
     $r = [ordered]@{ name = $Leg.name; spec = $Leg.spec; backend = $Leg.backend; status = $Status }
+    if ($legPlanMode) { $r.arm = $Leg.arm; $r.sourceCommit = $Leg.sourceCommit; $r.buildManifestSha256 = $Leg.buildManifestSha256 }
     foreach ($k in $Extra.Keys) { $r[$k] = $Extra[$k] }
     $results.Add([pscustomobject]$r)
 }
 
-L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript"
+L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
 
 while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     if ([DateTime]::UtcNow -ge $deadline) { Set-Stop 'DEADLINE' 3; break }
@@ -334,8 +852,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     if ($bw.waitSec -gt 0) {
         if ($bw.openUtc -ge $deadline) {
             $b.endReason = 'DEADLINE'; $b.endDetail = "lease-$($bw.reason.ToLowerInvariant())-wait: the next lease may open at $($bw.openUtc.ToString('o')) (usedSec=$($bw.usedSec) in the 3 h window), after the deadline"
-            Set-Stop 'DEADLINE' 3; Write-BatchReceipt $b
-            L "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=$($b.endDetail)"
+            Set-Stop 'DEADLINE' 3
+            LogBest "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=$($b.endDetail)"   # r7 (sol r6b): the line is tried before the receipt snapshots logWriteFailures
+            $b.logWriteFailures = $script:logWriteFailures; Write-BatchReceipt $b
             break
         }
         L "BATCH_WAIT batch=$batchNo reason=$($bw.reason) waitSec=$($bw.waitSec) usedSec=$($bw.usedSec) capSec=$LeaseCapSec budgetSec=$LeaseBudgetSec windowSec=$LeaseBudgetWindowSec cooldownSec=$LeaseCooldownSec (Bachelor's lease caps; not a failure, no claim held)"
@@ -345,7 +864,24 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     $claim = $null; $lastHolder = ''
     while ($true) {
         $req = Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir
-        foreach ($bk in $req.broken) { L "CLAIM_STALE_BROKEN venue=$Venue reason=$($bk.reason) ownerPid=$($bk.claim.ownerPid) runDir=$($bk.claim.runDir) expiresUtc=$($bk.claim.expiresUtc)" }
+        $grantReadUtc = [DateTime]::UtcNow
+        # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
+        # before the first write (the CLAIM_* log lines, leg-plan.json): a hit releases a claim just taken, opens no lease and ends in the typed refusal (exit 2).
+        $hit = Get-InputOutputRefusal
+        if ($hit) {
+            if ($req.granted) { try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { } }
+            Stop-InputIsOutput $hit
+        }
+        foreach ($bk in $req.broken) { LogBest "CLAIM_STALE_BROKEN venue=$Venue reason=$($bk.reason) ownerPid=$($bk.claim.ownerPid) runDir=$($bk.claim.runDir) expiresUtc=$($bk.claim.expiresUtc)" }
+        # r13 pass 2 (adversary A2): the keeper starts only after that guard, whose reads can take a while; a claim granted longer ago than its TTL less one renew interval may lapse
+        # (and be taken by another claimant) before the keeper's first renewal, so it is let go and asked for again, never carried into an open.
+        $guardSec = ([DateTime]::UtcNow - $grantReadUtc).TotalSeconds
+        if ($req.granted -and $guardSec -ge ($ClaimTtlSec - $ClaimRenewSec)) {
+            try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { }
+            L "CLAIM_LAPSED_IN_GUARD batch=$batchNo guardSec=$([int]$guardSec) ttlSec=$ClaimTtlSec renewSec=$ClaimRenewSec (the claim was let go before the keeper started; asked for again)"
+            if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
+            continue
+        }
         if ($req.granted) { $claim = $req.claim; break }
         $holder = $(if ($req.claim) { "pid=$($req.claim.ownerPid) runDir=$($req.claim.runDir) purpose=$($req.claim.purpose)" } else { $req.state })
         if ($holder -cne $lastHolder) { L "CLAIM_HELD batch=$batchNo state=$($req.state) holder $holder -> wait"; $lastHolder = $holder }
@@ -354,19 +890,26 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     }
     if ($null -eq $claim) {
         $b.endReason = 'DEADLINE'; $b.endDetail = 'claim-held'; Set-Stop 'DEADLINE' 3
-        Write-BatchReceipt $b
-        L "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=claim-held"
+        LogBest "BATCH_END batch=$batchNo token=$token reason=DEADLINE detail=claim-held"   # r7 (sol r6b): the line is tried before the receipt snapshots logWriteFailures
+        $b.logWriteFailures = $script:logWriteFailures; Write-BatchReceipt $b
         break
     }
     $b.claimNonce = $claim.nonce
     # r5 (dot 242171b3 B1): the claim's expiry is renewed for as long as the batch holds it (the open's wait for the lease, the by-name wait and the legs can all
     # outlast -ClaimTtlSec), so Get-VenueClaimStaleReason never finds a live owner's claim expired. The keeper dies with this process.
     $claimKeeper = Start-VenueClaimKeeper -Venue $Venue -Nonce $claim.nonce -TtlSec $ClaimTtlSec -RenewSec $ClaimRenewSec -ClaimDir $ClaimDir
-    L "CLAIM_TAKEN batch=$batchNo nonce=$($claim.nonce) expiresUtc=$($claim.expiresUtc) renewSec=$ClaimRenewSec ttlSec=$ClaimTtlSec"
-    # r3 (Dot B1): $openSubmitted is true from the moment Submit-AgentJob is called for the open. The finally block's cancel, close and ledger charge follow
-    # that flag, never "$op is null": a null $op before the call (a throw while the sidecar was checked) means nothing was sent.
-    $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null; $openLive = $null; $cr = $null; $openSubmitted = $false
+    $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null
+    # r3 (Dot B1): the finally block's cancel, close and ledger charge follow whether the open was SUBMITTED, never "$op is null": a null $op before the call (a throw while
+    # the sidecar was checked) means nothing was sent. r16 (sol r15 B1; hub ruling 08:18:44Z): submitted = um-run.ps1 was called for it ($script:umRunCalled), not merely
+    # Submit-AgentJob: a job file that could not be created or written here (JOB_WRITE_FAILED) reached no one.
+    $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null; $openLive = $null; $cr = $null; $inFlightLeg = $null
+    # r5 (key3 F1): the try opens IMMEDIATELY after the keeper starts, so every throw from here on ends with the keeper stopped, the claim released and the batch
+    # receipt written (the finally), and as a typed exit 12 (the catch). A throw outside it left the keeper runspace renewing the claim of a process that had died.
     try {
+        L "CLAIM_TAKEN batch=$batchNo nonce=$($claim.nonce) expiresUtc=$($claim.expiresUtc) renewSec=$ClaimRenewSec ttlSec=$ClaimTtlSec"
+        # sol r3 second pass A3: the validated plan is kept only while this run holds the venue claim, so a second invocation on the same -RunDir that is still waiting
+        # for the claim cannot replace the plan a running one preserved. Rewritten after each claim taken: it is always the holder's own plan.
+        if ($legPlanMode) { [IO.File]::WriteAllText((Join-Path $RunDir 'leg-plan.json'), ($planRecord | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false)) }
         # (2) OPEN: the lease first. Nothing is probed or run before the agent reports this batch's lease active.
         $b.openJobId = "lease-batch-open-$stamp-lb$token"
         $wait = [int][Math]::Max(60, [Math]::Min($OpenAdmissionWaitSec, ($deadline - [DateTime]::UtcNow).TotalSeconds))
@@ -395,13 +938,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $b.openLiveness = Stop-VenueJobLiveness $openLive -Remove
             $op = [pscustomobject]@{ outcome = 'NOT_SUBMITTED'; result = $null; message = "first liveness write $($openLive.first.state)$(if ($openLive.first.error) { ": $($openLive.first.error)" })$(if ($crossed) { ", but the batch deadline passed first (the sidecar is live; read-back: $($rb.why))" } elseif ($null -ne $rb -and -not $rb.live) { ", but the agent's own parser does not read it as live (read-back $($rb.livenessState)): $($rb.why)" })" }
         } else {
-            $openSubmitted = $true
             $op = Submit-AgentJob $b.openJobId "Write-Output ('LEASE_BATCH_OPEN token=$token held=' + [string]`$env:HEAVY_SLOT_HELD + ' admission=' + [string]`$env:MLV_AGENT_ADMISSION)" 120 $wait $b.openNotAfterUtc
         }
         if ($op.outcome -ceq 'UNRESOLVED' -and $op.message -match 'admission gate') {
             # CAPS d: um-run stopped while the agent still holds the open in its gate, re-asking a refused (exit 75) request. That is a wait, not a failure:
             # the open is never resubmitted (a second open would queue behind it); its result is read by name until the deadline.
             $b.openLeaseWait = 'EXIT_75_WAIT'
+            $null = Test-OpenOutputAlias   # r14 (adversary r13 pass 3 A2): the open returned (still held), so the guard runs before this line is written; it runs again below
             L "BATCH_OPEN_STILL_WAITING batch=$batchNo job=$($b.openJobId) (held in the agent's admission gate: exit 75 is wait-and-retry; reading its result by name until $($deadline.ToString('o')))"
             while ($true) {
                 $jr = Get-VenueJobResult -AgentShare $AgentShare -JobId $b.openJobId
@@ -413,17 +956,31 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $adm = $(if ($null -ne $op.result) { $op.result.admission } else { $null })
         # r5: the open's result is in hand (or it was retracted before the agent saw it): this run no longer owns it, so its sidecar goes. Otherwise it is kept
         # renewed until the end of the batch cancels and reconciles the open.
-        if ($op.outcome -ceq 'RECEIPT' -or $op.outcome -ceq 'RECEIPT_BY_NAME' -or $op.outcome -ceq 'RETRACTED') { $b.openLiveness = Stop-VenueJobLiveness $openLive -Remove }
+        # r16: and an open whose job file was never written was never anyone's (JOB_WRITE_FAILED)
+        if ($op.outcome -ceq 'RECEIPT' -or $op.outcome -ceq 'RECEIPT_BY_NAME' -or $op.outcome -ceq 'RETRACTED' -or $op.outcome -ceq 'JOB_WRITE_FAILED') { $b.openLiveness = Stop-VenueJobLiveness $openLive -Remove }
         $b.openOutcome = $op.outcome
         $b.openExit75Refusals = $(if ($null -ne $adm) { @(@($adm.leaseRefusals) | Where-Object { $null -ne $_ -and [string]$_.rc -eq '75' }).Count } else { 0 })
         $b.exit75Refusals = $b.openExit75Refusals
         if ($b.exit75Refusals -gt 0 -or $b.openLeaseWait -cne 'NONE') { $b.exit75Class = 'WAIT_RETRY' }
+        # r13 (adversary r13 A2): the open can wait long in the agent's admission gate (and by name after it), and an alias to an output, or a changed input, can appear in that
+        # wait as in the claim wait. The same guard runs again once a lease is in hand, before the first probe or leg writes: a hit runs nothing, the finally closes the lease,
+        # and the run ends in the same typed refusal (exit 2). A link made after this check is a race no re-check closes (an instant later), and is not claimed here.
+        # r13 pass 2 (adversary A3): the lease's end is placed from the moment the result was read, BEFORE the guard's reads (which can take a while), never after them
+        $openReadUtc = [DateTime]::UtcNow
+        $leaseEnd = Get-LeaseEndUtc $op.result
+        # r14 (Dot 2e6eb21d; adversary r13 pass 3 A1, A2): the guard runs for EVERY outcome, a gate hold that reached the deadline included, and a location hit suppresses the writes
+        # whichever typed stop wins below (OPEN_FAILED, AGENT_NOT_BATCH_CAPABLE, DEADLINE, ...); only a clean open turns a hit into the refusal itself.
+        $openHit = Test-OpenOutputAlias
         if ($op.outcome -ceq 'NOT_SUBMITTED' -and $crossed) {
             $b.endReason = 'DEADLINE'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
             Set-Stop 'DEADLINE' 3
         } elseif ($op.outcome -ceq 'NOT_SUBMITTED') {
             $b.endReason = 'LIVENESS_UNAVAILABLE'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
             Set-Stop 'LIVENESS_UNAVAILABLE' 9
+        } elseif ($op.outcome -ceq 'JOB_WRITE_FAILED') {
+            # r16 (sol r15 B1): the open's job file was never complete here, so um-run was never called: no cancel, no close, no lease-budget charge (the finally reads $script:umRunCalled)
+            $b.endReason = 'OPEN_JOB_WRITE_FAILED'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
+            Set-Stop 'OPEN_JOB_WRITE_FAILED' 9
         } elseif ($op.outcome -ceq 'UNRESOLVED' -and $b.openLeaseWait -cne 'NONE') {
             $b.endReason = 'DEADLINE'; $b.endDetail = "lease-wait: the open was still held in the agent's admission gate (exit-75 refusals, not a failure) at the deadline"
             Set-Stop 'DEADLINE' 3
@@ -433,11 +990,19 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         } elseif ($null -eq $adm.leaseBatch -or [string]$adm.leaseBatch.token -cne $token -or -not $adm.leaseBatch.leaseId) {
             $b.endReason = 'AGENT_NOT_BATCH_CAPABLE'; $b.endDetail = "admission.mode=$($adm.mode) gate=$($adm.gate) (no admission.leaseBatch for token ${token}: the lease-batch agent is not deployed)"
             Set-Stop 'AGENT_NOT_BATCH_CAPABLE' 10
+        } elseif ($openHit) {
+            $hr = $(if ($openHit.kind -ceq 'content') { $openHit.code, $openHit.item, $openHit.why } elseif ($openHit.kind -ceq 'plan') { 'LEG_PLAN_IS_RUN_OUTPUT', 0, "the plan file $($openHit.why)" }
+                elseif ($openHit.kind -ceq 'build') { 'BUILD_MANIFEST_IS_RUN_OUTPUT', $openHit.item, "the staged build manifest $($openHit.why)" } else { 'LEG_SPEC_IS_RUN_OUTPUT', $openHit.item, "the leg spec $($openHit.why)" })
+            # the lease is held: the finally closes it and charges the ledger from the open's submit (no earlier start is known without reading its end)
+            $b.leaseId = [string]$adm.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc; $b.endReason = $hr[0]
+            # r13 pass 2 (adversary A1): a location hit means a runner output IS the input, so from here nothing is written into -RunDir or the claim dir's outputs (the ledger may be
+            # that input). r14: Test-OpenOutputAlias above already turned that suppression on, for this branch and every other.
+            $b.endDetail = "after the open, before any probe or leg: $($hr[2])"
+            [Console]::Error.WriteLine("BATCH_USAGE $(if ($legPlanMode) { "LEG_PLAN_REFUSED reason=$($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" })" } else { $hr[0] }) $($hr[2]) (found after the open: no probe or leg ran; the lease is closed)")
+            Set-Stop $hr[0] 2
         } else {
             $b.leaseId = [string]$adm.leaseBatch.leaseId; $b.held = [string]$adm.heavySlotHeld; $b.slot = $adm.slot; $b.leaseMinutes = $adm.leaseMinutes
             $b.leaseUntilEpoch = $adm.leaseBatch.untilEpoch; $b.openWaitedSec = $adm.waitedSec; $b.openRequests = $adm.leaseRequests; $b.refusals = @($adm.leaseRefusals)
-            $openReadUtc = [DateTime]::UtcNow
-            $leaseEnd = Get-LeaseEndUtc $op.result
             if ($null -eq $leaseEnd) { $leaseEnd = $openReadUtc }   # cannot place the lease's end: no leg fits
             # Where the lease began, for the ledger: its end less the minutes it asked for, never before the open was submitted.
             $leaseStartUtc = $(if ($b.leaseMinutes) { $leaseEnd.AddMinutes(-[double]$b.leaseMinutes) } else { $openSubmitUtc })
@@ -451,7 +1016,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # (3) the legs, under the lease
             $attempt = 0
             while ($pending.Count -gt 0) {
-                $leg = $pending[0]
+                $leg = $pending[0]; $inFlightLeg = $null
                 if ([DateTime]::UtcNow -ge $deadline) { $b.endReason = 'DEADLINE'; Set-Stop 'DEADLINE' 3; break }
                 # r5b (Grok G1): no probe and no leg without the venue claim. Lost (NOT_OURS / ABSENT) or past its last good expiry, the batch ends CLAIM_LOST
                 # (uncounted); the legs already run stay as measured and the rest go to the next batch, which takes the claim again.
@@ -490,15 +1055,20 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($cl) { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "before leg $($leg.name): $($cl.detail)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=leg $($cl.detail)"; break }
                 $b.legsAttempted++
                 $out = Join-Path $RunDir "leg-$($leg.name)-b$('{0:00}' -f $batchNo)-a$attempt.out.txt"
-                $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $SourceCommit, '-BuildManifestSha256', $BuildManifestSha256, '-LeaseBatch', $token)
+                $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $leg.sourceCommit, '-BuildManifestSha256', $leg.buildManifestSha256, '-LeaseBatch', $token)
                 if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
                 if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
-                L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })"
+                L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })$(if ($legPlanMode) { " arm=$($leg.arm) sourceCommit=$($leg.sourceCommit) buildManifestSha256=$($leg.buildManifestSha256)" })"
                 $tLeg = [DateTime]::UtcNow
                 # r3 (sol r2 B2): the leg runs only while the lease does. It is a bounded child: still running at the lease's end, it is killed with its whole
                 # process tree (Kill($true), Invoke-VenueBoundedProcess) and typed LEASE_EXPIRED below. The agent stops its job at the same bound (lease-batch r3).
                 $legBoundSec = [int][Math]::Max(1, [Math]::Floor(($leaseEnd - [DateTime]::UtcNow).TotalSeconds))
-                $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec
+                # adversary r7 A2: Process.Start failing (a command line past 32767 characters, a missing exe) throws a Win32Exception before any child exists: the leg stays NOT_RUN.
+                $inFlightLeg = $leg   # adversary r5 pass 2 A2: marked at the launch itself, so a throw while the RUN line was logged leaves a leg that never started NOT_RUN
+                try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {
+                    if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
+                    throw
+                }
                 [IO.File]::WriteAllText($out, [string]$lp.stdout + [string]$lp.stderr, [Text.UTF8Encoding]::new($false))
                 $legCode = $lp.exit
                 $legSec = [int]([DateTime]::UtcNow - $tLeg).TotalSeconds
@@ -519,6 +1089,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $cx = $(if ($legJobId) { Request-VenueJobCancel -AgentShare $AgentShare -JobId $legJobId } else { [pscustomobject]@{ state = 'UNKNOWN'; error = 'the leg printed no job id' } })
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state }
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEASE_EXPIRED' $row; $pending.RemoveAt(0)
+                    Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) was still running at the lease's end ($legSec s, bound $legBoundSec s): killed with its process tree; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
                     L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) (killed with its process tree at the lease's end)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
@@ -528,6 +1099,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     # Invoke-VenueLeg exits 0 whenever it wrote a receipt; non-zero means it died without one. Not evidence: LEG_FAILED, the run goes on.
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec }
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEG_FAILED' $row; $pending.RemoveAt(0)
+                    Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "LEG $($leg.name) LEG_FAILED batch=$batchNo exit=$legCode outcome=INVALID printedOutcome=$outcome (the leg exited non-zero: no usable receipt)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     continue
@@ -562,6 +1134,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     # The leg's own <= 20 % re-check at its start failed: it never played. Retry INSIDE the same lease (on a lost or demoted lease, in the next batch).
                     $b.retries++; $b.legRetries++
                     $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef; withdraw = $withdraw })
+                    Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT receipt=$receipt onLease=$onLease $leaseWhy"
                     if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
                     continue
@@ -579,6 +1152,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($agentStop) { $row['leaseStop'] = $agentStop }
                 if ($withdraw) { $row['withdraw'] = $withdraw }
                 $b.legs.Add([pscustomobject]$row); Add-Result $leg 'RAN' $row; $pending.RemoveAt(0)
+                Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                 $b.legsRan++; if ($counted) { $b.legsCounted++ }
                 L "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
                 if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
@@ -590,17 +1164,32 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $b.endReason = 'LEG_BUDGET_EXCEEDS_LEASE'; Set-Stop 'LEG_BUDGET_EXCEEDS_LEASE' 2
             }
         }
+    } catch {
+        # r5 (key3 F1): an unexpected throw anywhere in the batch is a typed stop, not an unhandled exit 1 that skips the summary. The finally below runs first; 12 replaces every code.
+        $b.endReason = 'BATCH_ERROR'; $b.endDetail = ($_.Exception.Message -replace '\s+', ' ')
+        $script:stopReason = 'BATCH_ERROR'; $script:exitCode = 12
+        # adversary r5 A1: a leg whose child had started but whose result was not recorded yet RAN (or may have): LEG_FAILED / reason BATCH_ERROR, outcome unknown,
+        # uncounted, never NOT_RUN. Only the legs never started stay pending for the NOT_RUN loop below.
+        try {
+            if ($null -ne $inFlightLeg -and $pending.Contains($inFlightLeg)) {
+                $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; reason = 'BATCH_ERROR'; detail = $b.endDetail; counted = $false }
+                $b.legs.Add([pscustomobject]$row); Add-Result $inFlightLeg 'LEG_FAILED' $row; $null = $pending.Remove($inFlightLeg)
+                Add-PlanIdentity $b.legs[$b.legs.Count - 1] $inFlightLeg
+            }
+        } catch { }
+        LogBest "BATCH_ERROR batch=$batchNo $($b.endDetail)"   # a batch.log another process holds must not turn the typed stop back into an unhandled throw
     } finally {
         # (4) END: release the lease now (a light close job), read the agent's receipt for it, release the claim, write the batch receipt.
         # r3 (sol r2 B1): an open with no result in hand (um-run gave up on it, the deadline came while its result was awaited, or this batch threw) may still
         # be in the agent's admission gate, re-asking for a lease. It is CANCELLED and reconciled BY NAME first, so it can never take a lease once this runner
         # lets go: the agent reads the cancel file at the top of every gate loop, before any request. A RETRACTED open never reached the agent.
-        # r5b: an open never submitted (NOT_SUBMITTED) has nothing to cancel and no lease to close. r3: "never submitted" is the $openSubmitted flag, so a throw before
-        # the call (op still null) is also never sent, while a throw or timeout inside the call (flag set, op null or not) stays a maybe-sent open.
-        $openSent = ($b.openJobId -and $openSubmitted)
+        # r5b: an open never submitted (NOT_SUBMITTED) has nothing to cancel and no lease to close. r3: "never submitted" is not "$op is null", so a throw before the
+        # call (op still null) is also never sent, while a throw or timeout once um-run was called (op null or not) stays a maybe-sent open. r16 (sol r15 B1): submitted means
+        # um-run.ps1 was called for the open ($script:umRunCalled), so a job file that could not be created or written here (JOB_WRITE_FAILED) is never sent either.
+        $openSent = [bool]($b.openJobId -and $script:umRunCalled.ContainsKey([string]$b.openJobId))
         if ($openSent -and ($null -eq $op -or ($op.outcome -cne 'RECEIPT' -and $op.outcome -cne 'RECEIPT_BY_NAME' -and $op.outcome -cne 'RETRACTED'))) {
             $cx = Request-VenueJobCancel -AgentShare $AgentShare -JobId $b.openJobId
-            L "BATCH_OPEN_CANCEL batch=$batchNo job=$($b.openJobId) requested=$($cx.state)$(if ($cx.error) { " error=$($cx.error)" }) (read by name for up to ${CancelReconcileSec}s before the lease is closed and the claim released)"
+            LogBest "BATCH_OPEN_CANCEL batch=$batchNo job=$($b.openJobId) requested=$($cx.state)$(if ($cx.error) { " error=$($cx.error)" }) (read by name for up to ${CancelReconcileSec}s before the lease is closed and the claim released)"
             $tc = [DateTime]::UtcNow; $cPoll = [Math]::Min($ClaimPollSec, 5); $cr = $null
             while ($true) {
                 $cr = Get-VenueJobResult -AgentShare $AgentShare -JobId $b.openJobId
@@ -614,14 +1203,14 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 elseif ($null -ne $ca -and $null -ne $ca.leaseBatch -and $ca.leaseBatch.leaseId) { 'RAN_BEFORE_CANCEL' } else { 'ENDED' })
             if ($cState -ceq 'RAN_BEFORE_CANCEL' -and -not $b.leaseId) { $b.leaseId = [string]$ca.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc }
             $b.openCancel = [ordered]@{ requested = $cx.state; state = $cState; resultState = $cr.state; resultLabel = $(if ($null -ne $ca) { [string]$ca.label } else { $null }); waitedSec = [int]([DateTime]::UtcNow - $tc).TotalSeconds; error = $(if ($cx.error) { $cx.error } else { $cr.error }) }
-            L "BATCH_OPEN_RECONCILED batch=$batchNo state=$cState result=$($cr.state) label=$($b.openCancel.resultLabel) requested=$($cx.state) waitedSec=$($b.openCancel.waitedSec)"
+            LogBest "BATCH_OPEN_RECONCILED batch=$batchNo state=$cState result=$($cr.state) label=$($b.openCancel.resultLabel) requested=$($cx.state) waitedSec=$($b.openCancel.waitedSec)"
             if ($cState -ceq 'UNRECONCILED') { $stopReason = 'OPEN_CANCEL_UNRECONCILED'; $exitCode = 11 }
         }
         # r5: this run lets go of the open here. Reconciled: its sidecar goes. Unreconciled (or the batch threw first): it is rewritten lapsed and left, so an agent
         # still holding the open ends it at its next check. Idempotent when the open's result was in hand already.
         if ($null -ne $openLive) {
             $b.openLiveness = Stop-VenueJobLiveness $openLive -Remove:($null -ne $cr -and $cr.state -ceq 'FOUND')
-            L "BATCH_OPEN_LIVENESS_END batch=$batchNo job=$($b.openJobId) end=$($b.openLiveness.end) writes=$($b.openLiveness.writes) writeFailures=$($b.openLiveness.writeFailures) lastAliveUntilUtc=$($b.openLiveness.lastAliveUntilUtc)"
+            LogBest "BATCH_OPEN_LIVENESS_END batch=$batchNo job=$($b.openJobId) end=$($b.openLiveness.end) writes=$($b.openLiveness.writes) writeFailures=$($b.openLiveness.writeFailures) lastAliveUntilUtc=$($b.openLiveness.lastAliveUntilUtc)"
         }
         if ($openSent) {
             $b.closeJobId = "lease-batch-close-$stamp-lb$token"
@@ -638,31 +1227,44 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             elseif ($null -ne $b.openCancel -and $b.openCancel.state -ceq 'UNRECONCILED') { $n0 = [DateTime]::UtcNow; $row = [ordered]@{ venue = $Venue; token = $token; leaseId = $null; startUtc = $n0.ToString('o'); endUtc = $n0.AddSeconds($LeaseCapSec).ToString('o'); runDir = $RunDir; basis = 'open-unreconciled' } }
             if ($null -ne $row) {
                 $b.ledger = $row
-                try { Add-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -Row ([pscustomobject]$row) } catch { L "LEDGER_WRITE_FAILED batch=$batchNo $($_.Exception.Message)" }
+                if ($script:RunOutputAliased) { LogBest "LEDGER_NOT_WRITTEN batch=$batchNo (an accepted input is a runner output) row=$($row | ConvertTo-Json -Compress)" }
+                else { try { Add-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -Row ([pscustomobject]$row) } catch { LogBest "LEDGER_WRITE_FAILED batch=$batchNo $($_.Exception.Message)" } }
                 $leases.Add([pscustomobject]@{ startUtc = $row.startUtc; endUtc = $row.endUtc; leaseId = $row.leaseId })
             }
         }
-        $ckInTime = Stop-VenueKeeper -Keeper $claimKeeper
+        $ckInTime = $(if ($script:keeperStoppedEarly) { $script:keeperStoppedInTime } else { Stop-VenueKeeper -Keeper $claimKeeper })   # r14: stopped at the alias already
         $cks = $claimKeeper.state
         $b.claimRenew = [ordered]@{ renewSec = $ClaimRenewSec; ttlSec = $ClaimTtlSec; renews = $cks.renews; errors = $cks.errors; lastError = $cks.lastError; lost = $cks.lost; lastExpiresUtc = $cks.expiresUtc; stoppedInTime = $ckInTime }
-        L "CLAIM_RENEW batch=$batchNo renews=$($cks.renews) errors=$($cks.errors) lost=$(if ($cks.lost) { $cks.lost } else { 'no' }) lastExpiresUtc=$($cks.expiresUtc)"
-        L "CLAIM_RELEASED batch=$batchNo result=$(Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir)"
+        LogBest "CLAIM_RENEW batch=$batchNo renews=$($cks.renews) errors=$($cks.errors) lost=$(if ($cks.lost) { $cks.lost } else { 'no' }) lastExpiresUtc=$($cks.expiresUtc)"
+        # r6 (Dot r5 B5): the release no longer follows a log call that can throw, and a release that throws is a result, not a skipped receipt.
+        $relResult = try { Release-VenueClaim -Venue $Venue -Nonce $claim.nonce -ClaimDir $ClaimDir } catch { "ERROR: $($_.Exception.Message -replace '\s+', ' ')" }
+        LogBest "CLAIM_RELEASED batch=$batchNo result=$relResult"
+        # r7 (sol r6b): BATCH_END is logged BEFORE the receipt snapshots logWriteFailures, so a failure logging it is counted in the receipt written for that batch.
+        LogBest "BATCH_END batch=$batchNo token=$token lease=$($b.leaseId) reason=$($b.endReason) attempted=$($b.legsAttempted) ran=$($b.legsRan) counted=$($b.legsCounted) retries=$($b.retries) probeRetries=$($b.probeRetries) legRetries=$($b.legRetries) refusals=$(@($b.refusals).Count) exit75=$($b.exit75Refusals)/$($b.exit75Class) renewOkMaxGapSec=$($b.renewOkMaxGapSec) preOpenWait=$($b.preOpenWait.reason):$($b.preOpenWait.waitSec)s close=$($b.closeOutcome) agentEnd=$(if ($b.agent) { $b.agent.endReason })$(if ($b.endDetail) { " detail=$($b.endDetail)" })"
+        $b.logWriteFailures = $script:logWriteFailures
+        if ($script:outputRedirect) { $b.outputRedirect = $script:outputRedirect }   # r16 (sol r15 B2): MADE, or FAILED with its error (the close job then had no folder)
         Write-BatchReceipt $b
-        L "BATCH_END batch=$batchNo token=$token lease=$($b.leaseId) reason=$($b.endReason) attempted=$($b.legsAttempted) ran=$($b.legsRan) counted=$($b.legsCounted) retries=$($b.retries) probeRetries=$($b.probeRetries) legRetries=$($b.legRetries) refusals=$(@($b.refusals).Count) exit75=$($b.exit75Refusals)/$($b.exit75Class) renewOkMaxGapSec=$($b.renewOkMaxGapSec) preOpenWait=$($b.preOpenWait.reason):$($b.preOpenWait.waitSec)s close=$($b.closeOutcome) agentEnd=$(if ($b.agent) { $b.agent.endReason })$(if ($b.endDetail) { " detail=$($b.endDetail)" })"
     }
 }
-foreach ($leg in $pending) { Add-Result $leg 'NOT_RUN' @{ verdict = $(if ($stopReason) { $stopReason } else { 'NOT_RUN' }); reason = 'run-stopped' }; L "LEG $($leg.name) NOT_RUN $stopReason reason=run-stopped" }
+foreach ($leg in $pending) { Add-Result $leg 'NOT_RUN' @{ verdict = $(if ($stopReason) { $stopReason } else { 'NOT_RUN' }); reason = 'run-stopped' }; LogBest "LEG $($leg.name) NOT_RUN $stopReason reason=run-stopped" }
 
 $summary = [ordered]@{
     schema = 'mlv-app/venue-lease-batch-result/v1'; venue = $Venue; runDir = $RunDir; startedUtc = $t0.ToString('o'); finishedUtc = [DateTime]::UtcNow.ToString('o')
-    exitCode = $exitCode; stopReason = $stopReason; capsSource = $capsReceipt.capsSource; legs = @($results)
+    exitCode = $exitCode; stopReason = $stopReason; capsSource = $capsReceipt.capsSource; logWriteFailures = $script:logWriteFailures; legs = @($results)
     ran = @($results | Where-Object { $_.status -ceq 'RAN' }).Count; counted = @($results | Where-Object { $_.status -ceq 'RAN' -and $_.counted }).Count
     failed = @($results | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($results | Where-Object { $_.status -ceq 'NOT_RUN' }).Count
     leaseExpired = @($results | Where-Object { $_.status -ceq 'LEASE_EXPIRED' }).Count
     batches = @($batches | ForEach-Object { [ordered]@{ batch = $_.batch; token = $_.token; leaseId = $_.leaseId; endReason = $_.endReason; legsAttempted = $_.legsAttempted; legsRan = $_.legsRan; legsCounted = $_.legsCounted; retries = $_.retries } })
 }
+if ($script:outputRedirect) { $summary.outputRedirect = $script:outputRedirect }
+if ($legPlanMode) { $summary.legPlan =[ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
 $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-Add-Content -LiteralPath $batchLog -Value $resultLine
+try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch {   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
+    # r7 (sol r6b): the count was serialized before this append, so the append that just failed is counted and the line for stdout is serialized again with it (stdout is the authority when batch.log is broken).
+    Register-LogFailure $_.Exception.Message
+    $summary.logWriteFailures = $script:logWriteFailures
+    $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
+}
 Write-Output $resultLine
 Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned at its timeout would otherwise keep this process alive until it ends
 exit $exitCode
