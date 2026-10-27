@@ -2180,10 +2180,14 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         invalid = wintypes.HANDLE(-1).value
 
         def hold() -> None:
-            end = time.monotonic() + give_up_s
-            while not paused.exists() and not done.is_set() and time.monotonic() < end:
+            # the decision is the loop's own observation (adversary r3 A1): a marker that appears only after the wait expired or was cancelled takes no lock either
+            end, seen = time.monotonic() + give_up_s, False
+            while not done.is_set() and time.monotonic() < end:
+                if paused.exists():
+                    seen = True
+                    break
                 done.wait(0.01)
-            if not paused.exists():
+            if not seen:
                 state["outcome"] = "cancelled" if done.is_set() else "never-paused"
                 return
             h = k32.CreateFileW(str(log), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
@@ -2664,6 +2668,34 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                     done.set()
                     t.join(5)
                     locked.unlink(missing_ok=True)
+
+    def test_r3_adv_a1_a_pause_marker_that_appears_only_after_the_wait_expired_takes_no_lock(self) -> None:
+        # adversary r3 A1: the helper re-checked the marker AFTER its wait loop, so a marker that appeared between the expiry and that check was locked on. The marker double is
+        # absent on its first look and present on every later one; with give_up_s=0 the wait has expired before any later look.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        log = self.run_dir / "batch.log"
+        log.write_text("", encoding="utf-8")
+        locked = self.case / "log-locked.marker"
+
+        class LateMarker:
+            parent = self.case
+            looks = 0
+
+            def exists(self) -> bool:
+                LateMarker.looks += 1
+                return LateMarker.looks > 1
+
+        done, t, *rest = self._lock_log_while_the_runner_is_paused(log, LateMarker(), locked, give_up_s=0)
+        try:
+            t.join(5)
+            self.assertFalse(locked.exists(), "a marker seen only after the wait expired was locked on")
+            with open(log, "a", encoding="utf-8") as f:   # PermissionError here = the lock was taken
+                f.write("")
+            if rest:
+                self.assertEqual(rest[0]["outcome"], "never-paused")
+        finally:
+            done.set()
+            t.join(5)
 
     def test_r3_b2_the_lock_is_let_go_when_the_locked_marker_cannot_be_written(self) -> None:
         # sol r2b hardening: an exception writing the marker after CreateFileW skipped CloseHandle. The marker path is a directory, so the write raises; the handle is closed anyway.
