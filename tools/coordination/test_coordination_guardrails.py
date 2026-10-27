@@ -2973,6 +2973,59 @@ def test_save_dirty_worktree_evidence_never_writes_through_a_hard_link_planted_a
 
 
 @dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_worktree_with_no_git_before_asking_git(tmp_path):
+    # r10 iter 1 (adversary 76fcbf8b-A1): with no .git at all nothing was sampled, every comparison with the sample was skipped, and a gitfile put in place right before
+    # git's first read named another repository whose HEAD and index hold the working bytes: SAVED bytes=0 empty-diff. No .git is refused before git is asked.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "add", "src/a.txt")
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", str(wt), str(other))
+    git(other, "config", "user.email", "t@e.com")
+    git(other, "config", "user.name", "T")
+    (other / "src" / "a.txt").write_text("two\n")
+    git(other, "commit", "-qam", "two in the other repository")
+    shutil.move(str(wt / ".git"), str(tmp_path / "wt-git-away"))
+    shim = (f"$script:RealGit = '{shutil.which('git')}'; $script:Installed = $false; "
+            "function git { if (-not $script:Installed -and $args -contains '--absolute-git-dir') { $script:Installed = $true; "
+            f"[System.IO.File]::WriteAllText('{wt / '.git'}', 'gitdir: {str(other).replace(chr(92), '/')}/.git') }}; "
+            "& $script:RealGit @args; $global:LASTEXITCODE = $LASTEXITCODE }")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=not-a-worktree-root", (out.stdout, out.stderr)
+    assert not list(dest.iterdir()), sorted(p.name for p in dest.iterdir())
+
+
+@dirty_save_only
+@pytest.mark.parametrize("which", ["dirty-worktree-status-", "dirty-worktree-merge-state-saving-"])
+def test_save_dirty_worktree_evidence_never_publishes_a_status_or_merge_state_rewritten_after_it_was_written(tmp_path, which):
+    # r10 iter 1 (adversary 76fcbf8b-A3): the status and merge-state digests were read back from the temp file, which another writer could rewrite after the saver wrote
+    # it ('?? invented.txt', orphan.txt dropped); the substitute then matched its own digest and was published. The digest is now of the bytes the saver wrote.
+    wt, dest = _dirty_save_repo(tmp_path)
+    (wt / "orphan.txt").write_text("x\n")
+    if which == "dirty-worktree-merge-state-saving-":
+        _leave_a_conflicted_merge(wt)
+    shim = ("$script:RealW = (Get-Command Write-DirtyTempLines -CommandType Function).ScriptBlock; "
+            "function Write-DirtyTempLines($Temp, [string[]]$Lines) { $r = & $script:RealW $Temp $Lines; "
+            f"if ($Temp.Path -like '*{which}*') {{ [System.IO.File]::WriteAllText($Temp.Path, '?? invented.txt' + [char]13 + [char]10) }}; $r }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=evidence-changed-before-publish:") and "DIRTY_TREE_SAVED" not in line, (out.stdout, out.stderr)
+    assert " unverified=" in line and len(line.splitlines()) == 1, line
+
+
+@dirty_save_only
+def test_remove_dirty_temp_deletes_only_the_file_it_created_through_the_handle_it_checked(tmp_path):
+    # r10 iter 1 (adversary 76fcbf8b-A2): the cleanup checked the name's identity and then deleted the name, so a file renamed onto it in between was deleted. The identity is
+    # now read from, and the delete set on, one handle (DirtyFinalPath.DeleteIfIdentity). The race window itself is traced, not executed; this pins both outcomes.
+    out = dirty_save_pwsh(f"$t = New-DirtyHeldTemp '{tmp_path}' 'a.tmp'; $id = $t.Id; Unlock-DirtyTemp $t; "
+                          f"[System.IO.File]::Move('{tmp_path / 'a.tmp'}', '{tmp_path / 'aside.tmp'}'); [System.IO.File]::WriteAllText('{tmp_path / 'a.tmp'}', 'KEEP'); "
+                          "$kept = [DirtyFinalPath]::DeleteIfIdentity($t.Path, $id); "
+                          f"$t2 = New-DirtyHeldTemp '{tmp_path}' 'b.tmp'; Remove-DirtyTemp $t2; "
+                          "Write-Output ('{0}|{1}' -f $kept, (Test-Path -LiteralPath $t2.Path))")
+    assert out.stdout.strip() == "False|False", (out.stdout, out.stderr)
+    assert (tmp_path / "a.tmp").read_text() == "KEEP" and (tmp_path / "aside.tmp").is_file()
+
+
+@dirty_save_only
 @pytest.mark.parametrize("case", ["access-denied", "guard-throws", "missing-drive"])
 def test_move_dirty_evidence_returns_its_failure_table_whatever_throws(tmp_path, case):
     # r10 (sol r9 B4, adversary 7c56bf2b-A4): an UnauthorizedAccessException from the move, a -Guard that throws and Join-Path on a drive that does not exist escaped the

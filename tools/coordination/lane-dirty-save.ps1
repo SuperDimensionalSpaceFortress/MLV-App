@@ -181,6 +181,22 @@ public static class DirtyFinalPath {
         if (h == (IntPtr)(-1)) return null;
         try { return HandleFileIdentity(h); } finally { CloseHandle(h); }
     }
+    [StructLayout(LayoutKind.Sequential)]
+    struct DispositionInfo { public byte DeleteFile; }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetFileInformationByHandle(IntPtr handle, int infoClass, ref DispositionInfo info, uint size);
+    // Deletes the name only when the file it opens onto has this identity (volume serial + file index): the identity is read from, and the delete is set on, ONE handle
+    // (DELETE | FILE_READ_ATTRIBUTES, a link at the name not followed), so a replacement renamed onto the name after a check is never the file deleted (r10 iter 1, adversary 76fcbf8b-A2).
+    public static bool DeleteIfIdentity(string path, string identity) {
+        IntPtr h = CreateFileW(Long(path), 0x00010080, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+        if (h == (IntPtr)(-1)) return false;
+        try {
+            string now = HandleFileIdentity(h);
+            if (now == null || identity == null || !now.StartsWith(identity + "/")) return false;
+            DispositionInfo d = new DispositionInfo(); d.DeleteFile = 1;
+            return SetFileInformationByHandle(h, 4, ref d, 1);
+        } finally { CloseHandle(h); }
+    }
     public static void Unpin(IntPtr handle) { if (handle != IntPtr.Zero) CloseHandle(handle); }
 }
 '@
@@ -293,17 +309,18 @@ function Unlock-DirtyTemp($Temp) { if ($Temp -and $null -ne $Temp.Handle) { try 
 function Remove-DirtyTemp($Temp) {
     if (-not $Temp -or -not $Temp.Path) { return }
     Unlock-DirtyTemp $Temp
-    try {
-        $now = [DirtyFinalPath]::FileIdentity($Temp.Path)
-        if ($now -and $Temp.Id -and $now.StartsWith($Temp.Id + '/')) { [System.IO.File]::Delete($Temp.Path) }
-    } catch { }
+    try { $null = [DirtyFinalPath]::DeleteIfIdentity($Temp.Path, $Temp.Id) } catch { }
 }
 # Writes lines (UTF-8, no BOM, each ended like WriteAllLines) into a held temp through its existing name, which the hold keeps on that file; the file is opened, never created.
+# Returns the SHA-256 of the bytes it wrote: that is the digest the file must hash to when it is placed, never a re-read of the file, which another writer could have
+# rewritten in between (the hold shares WRITE so git can write the diff temps; r10 iter 1, adversary 76fcbf8b-A3).
 function Write-DirtyTempLines($Temp, [string[]]$Lines) {
     $enc = New-Object System.Text.UTF8Encoding($false)
     $bytes = $enc.GetBytes((@($Lines | ForEach-Object { $_ + [Environment]::NewLine }) -join ''))
     $fs = [System.IO.File]::Open($Temp.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
     try { $fs.SetLength(0); $fs.Write($bytes, 0, $bytes.Length); $fs.Flush() } finally { $fs.Dispose() }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
 }
 
 # The files that name a repository to git (a gitfile's target, its commondir) and the directories they name, sampled BEFORE git reads anything (r10, sol r9 B1/B2).
@@ -493,11 +510,12 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             if ($null -eq $m -or -not $m.Success) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
             $dotGitDir = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($Wt, $m.Groups[1].Value))
         }
-        if ($dotGitDir) {
-            $sample = Get-DirtyRepoSample $dotGitDir
-            if (-not $sample.GitId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
-            if (-not $sample.CommonId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-common-dir-changed" }
-        }
+        # No .git at all is not a worktree root, and it is refused here, before git is asked: git would find an enclosing repository, or a .git put in place after
+        # these checks, with nothing sampled to compare it against (r10 iter 1, adversary 76fcbf8b-A1). Every git read below is therefore compared with $sample.
+        else { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
+        $sample = Get-DirtyRepoSample $dotGitDir
+        if (-not $sample.GitId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
+        if (-not $sample.CommonId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-common-dir-changed" }
         $gitDir = @(& git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir 2>$null)
         if ($LASTEXITCODE -ne 0 -or $gitDir.Count -ne 2) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
         $gitDirIds = @($gitDir | ForEach-Object { Get-DirtyDirIdentity $_ })
@@ -599,8 +617,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
         $statTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-status-' + [Guid]::NewGuid().ToString('N') + '.tmp')
         if (-not $statTmp.Path) { $why = $statTmp.Reason; $statTmp = $null; return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-        Write-DirtyTempLines $statTmp $status  # UTF-8: quotepath=false prints literal non-ASCII names
-        $statFull = (Get-FileHash -LiteralPath $statTmp.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        $statFull = Write-DirtyTempLines $statTmp $status  # UTF-8: quotepath=false prints literal non-ASCII names; the digest is of the bytes written
         $statPlaced = Move-DirtyEvidenceToFreeName -Tmp $statTmp.Path -Dir $Dest -Stem "dirty-worktree-$id.status-" -Ext '.txt' -Full $statFull -FirstName "dirty-worktree-$id.status.txt" -Guard $guard -Hold $statTmp
         if (-not $statPlaced.Path) { if ($statPlaced.Placed) { $statTmp = $null }; return (& $placeFailed $statPlaced) }
         if ($statPlaced.Moved) { $statTmp = $null }
@@ -623,8 +640,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
             $mergeTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-merge-state-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
             if (-not $mergeTmp.Path) { $why = $mergeTmp.Reason; $mergeTmp = $null; return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-            Write-DirtyTempLines $mergeTmp $state
-            $mergeFull = (Get-FileHash -LiteralPath $mergeTmp.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+            $mergeFull = Write-DirtyTempLines $mergeTmp $state
             $mergePlaced = Move-DirtyEvidenceToFreeName -Tmp $mergeTmp.Path -Dir $Dest -Stem 'dirty-worktree-merge-state-' -Ext '.txt' -Full $mergeFull -Guard $guard -Hold $mergeTmp
             if (-not $mergePlaced.Path) { if ($mergePlaced.Placed) { $mergeTmp = $null }; return (& $placeFailed $mergePlaced) }
             if ($mergePlaced.Moved) { $mergeTmp = $null }
