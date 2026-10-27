@@ -4604,6 +4604,61 @@ function Get-CorePartitionAppAliveMonoMs($Helper, $AppVerdict) {
     } catch { $null }
 }
 
+# PURE. r13 (Dot 6452868627, CP-FEED-START-ANCHOR): the window opens at the start mark, before the smoke launches the app, loads the clip and
+# settles, so every row of that startup is averaged into the playback means (a 60 s pause at 10 W / 30 C before 30 s at 100 W / 80 C reads
+# 40 W / 46.67 C). The playback start is the measured session's own playback_smoke.start line (Get-MeasuredSmokeSessionId's rule: the
+# playback_smoke.measured_session marker, else the first playback_smoke.summary session), stamped by the app's log sink in UTC with ms
+# (CrashForensics.cpp writeLogLine: "[<ISODateWithMs UTC>] [level] [thread] message"). gapMs is that start on the job's monotonic clock less the start
+# mark's read: $LaunchMonoMs + (stamp - $LaunchUtcTicks) - $StartMarkMonoMs, the wall span converted at the launch's own clock pair. The wall clock
+# can drift from the monotonic one by up to $ClockSkewMs (Get-CorePartitionClockSkewMs) over the job, which is counted against the bound: a gap
+# over $StartSlackMs once the skew is added is feed-window-start-late. No session, no start line, an unparseable stamp, an unknown skew or clock
+# read, or a start before the window opened (beyond the skew) is feed-window-start-unverified. Returns @{ why; gapMs; playbackStartUtcTicks;
+# session; slackMs }; gapMs is reported whenever it is computable, refused or not. Never throws.
+function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $LaunchMonoMs, $StartMarkMonoMs, $ClockSkewMs, [double]$StartSlackMs = 10000) {
+    $r = [ordered]@{ why = 'feed-window-start-unverified'; gapMs = $null; playbackStartUtcTicks = $null; session = $null; slackMs = $StartSlackMs }
+    try {
+        if ([string]::IsNullOrEmpty($LogText)) { return $r }
+        $lines = @($LogText -split "`r?`n")
+        $sid = $null
+        foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.measured_session id=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } }
+        if ($null -eq $sid) { foreach ($ln in $lines) { $mm = [regex]::Match($ln, 'playback_smoke\.summary session=(\d+)'); if ($mm.Success) { $sid = $mm.Groups[1].Value; break } } }
+        if ($null -eq $sid) { return $r }
+        $r.session = [int64]$sid
+        $stamp = $null
+        foreach ($ln in $lines) { $mm = [regex]::Match($ln, '^\[(?<ts>[^\]]+)\] \[[^\]]*\] \[[^\]]*\] playback_smoke\.start session=' + $sid + '(\s|$)'); if ($mm.Success) { $stamp = $mm.Groups['ts'].Value; break } }
+        if ($null -eq $stamp) { return $r }
+        $pt = [DateTime]::MinValue
+        if (-not [DateTime]::TryParse($stamp, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$pt)) { return $r }
+        $r.playbackStartUtcTicks = [int64]$pt.Ticks
+        $lt = (ConvertFrom-CorePartitionNumber $LaunchUtcTicks 'int64').value; $lm = (ConvertFrom-CorePartitionNumber $LaunchMonoMs 'double').value
+        $sm = (ConvertFrom-CorePartitionNumber $StartMarkMonoMs 'double').value; $sk = (ConvertFrom-CorePartitionNumber $ClockSkewMs 'double').value
+        if ($null -eq $lt -or $lt -le 0 -or $null -eq $lm -or $null -eq $sm -or $null -eq $sk -or $sk -lt 0 -or $lm -lt $sm) { return $r }
+        $gap = $lm + ($r.playbackStartUtcTicks - $lt) / 1e4 - $sm
+        if ([double]::IsNaN($gap) -or [double]::IsInfinity($gap)) { return $r }
+        $r.gapMs = [math]::Round($gap, 1)
+        if ($gap + $sk -lt 0) { return $r }
+        $r.why = $(if ($gap + $sk -gt $StartSlackMs) { 'feed-window-start-late' } else { $null })
+        $r
+    } catch { $r }
+}
+
+# PURE. r13 (CP-FEED-START-ANCHOR): a feed whose window start is not bound to the playback start ($PlaybackStart from
+# Get-CorePartitionPlaybackStart refused, or is missing) publishes no window field: each is null, and one that was measured gets the start code as
+# its reason (one already refused keeps the reason it has; the start verdict is published beside it in core-partition.json feed.startWhy). pkgTempCAtStart is the start mark's own row, not a window row, and is left as it was. Idempotent.
+function Get-CorePartitionStartBoundFeed($Feed, $PlaybackStart) {
+    $code = $(if ($null -eq $PlaybackStart) { 'feed-window-start-unverified' } else { [string]$PlaybackStart.why })
+    if (-not $code) { return $Feed }
+    $s = [ordered]@{}; $why = [ordered]@{}
+    if ($null -ne $Feed) { foreach ($k in $Feed.Keys) { if ($k -ne 'reasons') { $s[$k] = $Feed[$k] } } }
+    if ($null -ne $Feed -and $null -ne $Feed.reasons) { foreach ($k in $Feed.reasons.Keys) { $why[$k] = $Feed.reasons[$k] } }
+    foreach ($f in @('rows', 'pkgWattsMean', 'pkgWattsMax', 'pkgTempCMean', 'pkgTempCMax', 'pkgThrottledRows')) {
+        $s[$f] = $null
+        if (-not $why[$f]) { $why[$f] = $code }
+    }
+    $s.reasons = $why
+    $s
+}
+
 # PURE. A result.json time (pwsh 7 ConvertFrom-Json hands an ISO 'Z' string back as a DateTime; older shapes keep the string) as UTC ticks; 0 when absent or unreadable.
 function ConvertTo-CorePartitionUtcTicks($Value) {
     if ($null -eq $Value) { return [int64]0 }
@@ -5726,7 +5781,7 @@ if ($CorePartitionTelemetry) {
     # record HMAC took the helper past the earlier 30000).
     if ($cpHelperEncoded.Length -gt 32000) { throw "CORE_PARTITION_HELPER_TOO_LONG the encoded helper is $($cpHelperEncoded.Length) chars (limit 32000, one command line)" }
     $cpHelperAffinity = if ($corePartitionArgs.load -ne 0) { $corePartitionArgs.load } else { $corePartitionArgs.helper }
-    $cpJobFunctions = Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:ConvertFrom-CorePartitionNumber}, ${function:Get-CorePartitionEffectiveMHz}, ${function:ConvertFrom-CorePartitionFeedRows}, ${function:Split-CorePartitionFeedLines}, ${function:Test-CorePartitionFeedFresh}, ${function:Test-CorePartitionFeedRowAfter}, ${function:Test-CorePartitionFeedMarkAccounted}, ${function:Get-CorePartitionFeedSummary}, ${function:Get-CorePartitionCounterSummary}, ${function:Get-CorePartitionWorkerThreads}, ${function:Join-CorePartitionWhy}, ${function:Get-CorePartitionReadyFeed}, ${function:ConvertTo-CorePartitionUtcTicks}, ${function:Test-CorePartitionHelperRecordShape}, ${function:Test-CorePartitionHelperMac}, ${function:Test-CorePartitionHelperRecord}, ${function:Test-CorePartitionMeasuredApp}, ${function:Get-CorePartitionAppAliveMonoMs}, ${function:Get-CorePartitionScalars}, ${function:Get-CorePartitionFeedHandleInfo}, ${function:Read-CorePartitionFeedBytes}, ${function:Read-CorePartitionFeedMark}, ${function:Read-CorePartitionFeedSince}, ${function:Get-CorePartitionReadyToken}, ${function:Get-CorePartitionClockSkewMs}, ${function:Get-CorePartitionMonoMs}, ${function:Test-CorePartitionReadyMarker}) "`n"
+    $cpJobFunctions = Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:ConvertFrom-CorePartitionNumber}, ${function:Get-CorePartitionEffectiveMHz}, ${function:ConvertFrom-CorePartitionFeedRows}, ${function:Split-CorePartitionFeedLines}, ${function:Test-CorePartitionFeedFresh}, ${function:Test-CorePartitionFeedRowAfter}, ${function:Test-CorePartitionFeedMarkAccounted}, ${function:Get-CorePartitionFeedSummary}, ${function:Get-CorePartitionCounterSummary}, ${function:Get-CorePartitionWorkerThreads}, ${function:Join-CorePartitionWhy}, ${function:Get-CorePartitionReadyFeed}, ${function:ConvertTo-CorePartitionUtcTicks}, ${function:Test-CorePartitionHelperRecordShape}, ${function:Test-CorePartitionHelperMac}, ${function:Test-CorePartitionHelperRecord}, ${function:Test-CorePartitionMeasuredApp}, ${function:Get-CorePartitionAppAliveMonoMs}, ${function:Get-CorePartitionPlaybackStart}, ${function:Get-CorePartitionStartBoundFeed}, ${function:Get-CorePartitionScalars}, ${function:Get-CorePartitionFeedHandleInfo}, ${function:Read-CorePartitionFeedBytes}, ${function:Read-CorePartitionFeedMark}, ${function:Read-CorePartitionFeedSince}, ${function:Get-CorePartitionReadyToken}, ${function:Get-CorePartitionClockSkewMs}, ${function:Get-CorePartitionMonoMs}, ${function:Test-CorePartitionReadyMarker}) "`n"
     $cpLaunchOld = @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
@@ -5825,7 +5880,8 @@ if ($CorePartitionBenchMask -ne 0) {
 # (the pre-helper mark above is recorded separately and never windows the feed).
 $corePartitionFeedStart = Read-CorePartitionFeedMark $corePartitionFeedPath
 $corePartitionMeasuredLaunchUtc = (Get-Date).ToUniversalTime()
-$corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, (Get-CorePartitionMonoMs)))
+$corePartitionMeasuredLaunchMonoMs = Get-CorePartitionMonoMs
+$corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, $corePartitionMeasuredLaunchMonoMs))
 try { [void](Publish-AttrCudaText -Path $corePartitionLaunchFile -Value ([string]$corePartitionMeasuredLaunchUtc.Ticks)) } catch { $corePartitionErrors.Add("launch-file: $([string]$_.Exception.Message)") }
 Write-JobTrace "step core-partition start helperPid=$($corePartitionHelperLaunch.pid) helperAffinity=$($corePartitionHelperLaunch.affinityObserved) ready=$($corePartitionHelperLaunch.ready) readyWaitMs=$($corePartitionHelperLaunch.readyWaitMs) jobAffinity=$($corePartitionJob.affinityApplied)"
 '@ + "`n" + $cpClose + "`n" + @'
@@ -5903,7 +5959,15 @@ try {
     $cpAppVerdict = @{ why = 'measured-app-unverified' }
     try { $cpAppVerdict = Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs } catch { $corePartitionErrors.Add("measured-app: $([string]$_.Exception.Message)") }
     $corePartitionAppAliveMonoMs = Get-CorePartitionAppAliveMonoMs $corePartitionHelperRecord $cpAppVerdict
-    $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppAliveMonoMs 10000) $corePartitionHelperNotReady
+    # r13 (Dot 6452868627, CP-FEED-START-ANCHOR): the window's start is bound to the measured session's playback start, read from the run log the
+    # result names (the same hash-checked snapshot the metrics read; unresolvable is feed-window-start-unverified). The declared slack, 10000 ms,
+    # covers the runner's own start, the app launch, the clip load and the runner's 2500 ms settle; past it the startup rows would dilute the
+    # playback means, so the window fields are refused (feed-window-start-late). The gap is published either way (feed.startGapMs).
+    $corePartitionStartSlackMs = 10000
+    $cpRunLogText = $null
+    try { $cpRunLogText = [IO.File]::ReadAllText((Resolve-AttrCudaSmokeRunLog -ResultJsonPath $resultPath -ContainingRoot $Work).path) } catch { $corePartitionErrors.Add("playback-start-log: $([string]$_.Exception.Message)") }
+    $corePartitionPlaybackStart = Get-CorePartitionPlaybackStart $cpRunLogText $corePartitionMeasuredLaunchUtc.Ticks $corePartitionMeasuredLaunchMonoMs $corePartitionFeedStart.monoMs $corePartitionJobClockSkewMs $corePartitionStartSlackMs
+    $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionStartBoundFeed (Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppAliveMonoMs 10000) $corePartitionPlaybackStart) $corePartitionHelperNotReady
     # sol r4 CP-05: set until core-partition.json is saved, so any failure on the way leaves every acceptance flag false with this reason.
     $corePartitionPublishWhy = 'core-partition-json-unpublished'
     try {
@@ -5933,6 +5997,10 @@ try {
                 # lag's slack
                 windowEndMonoMs = $corePartitionSmokeEndMonoMs; endReadSlackMs = 2000; appLastAliveMonoMs = $corePartitionAppAliveMonoMs
                 windowEndLagMs = $(if ($null -ne $corePartitionAppAliveMonoMs) { $corePartitionSmokeEndMonoMs - $corePartitionAppAliveMonoMs }); endLagSlackMs = 10000
+                # r13 (CP-FEED-START-ANCHOR): the start side of the same boundary: the measured session's playback start (UTC ticks, from its
+                # playback_smoke.start log stamp), its gap after the start mark in ms (published refused or not), the declared slack and the verdict
+                playbackStartUtcTicks = $corePartitionPlaybackStart.playbackStartUtcTicks; playbackSession = $corePartitionPlaybackStart.session
+                startGapMs = $corePartitionPlaybackStart.gapMs; startSlackMs = $corePartitionStartSlackMs; startWhy = $corePartitionPlaybackStart.why
                 summary = $corePartitionFeedSummary
             }
             perCoreTemperature = 'not in the feed (column 3 is the package / hottest core); adding columns is the Bachelor session''s work'

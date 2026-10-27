@@ -2258,6 +2258,9 @@ function Publish-AttrCudaText { param([string]$Path, [string]$Value) }
 function New-AttrCudaDirectory { param([string]$Path) }
 function Save-Json { param($Object, $Path) $global:cpSaved = $Object }
 function Get-CorePartitionMonoMs { [double]$global:cpClk }
+# r13 (CP-FEED-START-ANCHOR): the run log the result names; the R13 driver sets $global:cpLog per case ($null: the resolver throws, as the real one
+# does for a result without a verified log)
+function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) if (-not $global:cpLog) { throw 'run log unresolvable' }; [pscustomobject]@{ path = $global:cpLog } }
 $row = "26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
 function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
     $m = $global:cpClk; $global:cpClk += 500
@@ -2288,6 +2291,10 @@ foreach ($k in $cases.Keys) {
     $W = { param([double]$m) $L.AddMilliseconds($m - 1000).Ticks }
     $corePartitionMeasuredLaunchUtc = $L; $corePartitionPreHelperUtc = $L.AddSeconds(-1)
     $corePartitionClockPairs = [Collections.Generic.List[object]]::new(); $corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, [double]1000))
+    $corePartitionMeasuredLaunchMonoMs = [double]1000
+    # r13: the measured session's playback starts 500 ms after the start mark, inside the start slack, so the start bound passes these cases
+    $global:cpLog = Join-Path $dir 'run.log'
+    [IO.File]::WriteAllText($global:cpLog, '[' + [DateTime]::new((& $W 1500), [DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 position=0`n[" + [DateTime]::new((& $W 1600), [DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n")
     $corePartitionFeedPath = Join-Path $dir 'feed.csv'
     $corePartitionFeedPreHelper = @{ exists = $true; length = 0; beforeOffset = 0; before = ''; shortRead = $false; monoMs = [int64]500; doneMs = [int64]500; created = 123; fileId = 'same'; readUtcTicks = 0; lastWriteUtcTicks = 0 }
     $corePartitionFeedStart = @{ exists = $true; length = 34; beforeOffset = 0; shortRead = $false; monoMs = [int64]1000; doneMs = [int64]1000; created = 123; fileId = 'same'
@@ -2413,6 +2420,150 @@ class CorePartitionR11Tests(unittest.TestCase):
         self.assertLessEqual(got["t0"], got["monoBaseMs"], got)
         self.assertLessEqual(got["t0"], got["monoBaseMs"] + got["goneMs"], got)
         self.assertLessEqual(got["monoBaseMs"] + got["goneMs"], got["t1"], got)
+
+
+# r13 (Dot 6452868627 = hub ruling HUB-TICK 20261027T2058Z, CP-FEED-START-ANCHOR): the same lifted cleanup region with a 90 s window whose rows
+# are $c[6] idle rows (10 W / 30 C) then $c[7] playback rows (100 W / 80 C), and a run log whose measured session starts playback at monotonic
+# $c[5] ($null: the log has no playback_smoke.start line; -1: the result names no resolvable log). The start mark is read at 1000.
+def _r13_start_driver() -> str:
+    d = R11_CLEANUP
+    for old, new in (
+            ("length = 34 + $row.Length", "length = 34 + $global:cpWindow.Length"),
+            ("window = $row;", "window = $global:cpWindow;"),
+            ("(& $W 20850)", "(& $W 90850)"),
+            ("$global:cpLog = Join-Path $dir 'run.log'\n",
+             "$global:cpLog = $(if ($c[5] -eq -1) { $null } else { Join-Path $dir 'run.log' })\n"
+             "    $global:cpWindow = ('26.10.2026,12:00:00,x,30,10,No,No' + \"`n\") * $c[6] + ('26.10.2026,12:01:00,x,80,100,No,No' + \"`n\") * $c[7]\n"),
+            ("    [IO.File]::WriteAllText($global:cpLog, '[' + [DateTime]::new((& $W 1500), [DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + \"] [info] [0x1] playback_smoke.start session=1 position=0`n[\" + ",
+             "    if ($null -ne $global:cpLog) { [IO.File]::WriteAllText($global:cpLog, $(if ($null -eq $c[5]) { '' } else { '[' + [DateTime]::new((& $W $c[5]), [DateTimeKind]::Utc).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + \"] [info] [0x1] playback_smoke.start session=1 position=0`n\" }) + '[' + "),
+            ("playback_smoke.measured_session id=1`n\")\n", "playback_smoke.measured_session id=1`n\") }\n"),
+            ("    $out[$k] = [ordered]@{ end = $corePartitionSmokeEndMonoMs;",
+             "    $out[$k] = [ordered]@{ wattsMean = $f.pkgWattsMean; tempMean = $f.pkgTempCMean; start = @($pf.startGapMs, $pf.startSlackMs, [string]$pf.startWhy, $pf.playbackSession, ($null -ne $pf.playbackStartUtcTicks)); end = $corePartitionSmokeEndMonoMs;")):
+        if d.count(old) != 1:
+            raise AssertionError(f"R11_CLEANUP changed shape near {old!r}")
+        d = d.replace(old, new)
+    at = d.index("$cases = [ordered]@{")
+    to = d.index("}\n", d.index("'a-later-instance-with-the-measured-pid'")) + 2
+    return d[:at] + """$cases = [ordered]@{
+    'dot-60s-idle-then-30s-playback' = @(91000, 0, 90900, 90750, 2000, 61000, 60, 30)
+    'playback-within-slack-control' = @(91000, 0, 90900, 90750, 2000, 4000, 3, 87)
+    'no-playback-start-line' = @(91000, 0, 90900, 90750, 2000, $null, 60, 30)
+    'no-run-log' = @(91000, 0, 90900, 90750, 2000, -1, 60, 30)
+}
+""" + d[to:]
+
+
+R13_START_DRIVER = _r13_start_driver()
+
+R13_PURE = r"""
+$L = [DateTime]::new(2026, 10, 27, 21, 0, 0, [DateTimeKind]::Utc)
+function Ln([double]$AfterMs, [string]$Msg) { '[' + $L.AddMilliseconds($AfterMs).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + '] [info] [0x1a2b] ' + $Msg }
+function Pick($v) { @([string]$v.why, $v.gapMs, $v.session) }
+$m1 = (Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1')
+$r = [ordered]@{}
+$r.withinSlackNoSkew = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0)
+$r.skewCountsAgainstTheBound = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 1500)
+$r.startMarkReadBeforeTheLaunch = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 2500 1000 0)
+$r.namedSlack = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 8000)
+$r.beforeTheWindow = Pick (Get-CorePartitionPlaybackStart ((Ln -5000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 100 'playback_smoke.measured_session id=1')) $L.Ticks 1000 1000 100)
+$r.warmupSessionIgnored = Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=1 position=0'), (Ln 30000 'playback_smoke.start session=2 position=0'), (Ln 30100 'playback_smoke.measured_session id=2')) -join "`n") $L.Ticks 1000 1000 0)
+$r.sessionPrefixIsNotTheSession = Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=12 position=0'), (Ln 1100 'playback_smoke.measured_session id=1')) -join "`r`n") $L.Ticks 1000 1000 0)
+$r.summaryFallback = Pick (Get-CorePartitionPlaybackStart (@((Ln 2000 'playback_smoke.start session=3 position=0'), (Ln 40000 'playback_smoke.summary session=3 frames=1')) -join "`n") $L.Ticks 1000 1000 0)
+$r.unknownSkew = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 $null)
+$r.noSinkStamp = Pick (Get-CorePartitionPlaybackStart "playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0)
+$r.unparseableStamp = Pick (Get-CorePartitionPlaybackStart "[not-a-time] [info] [0x1] playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0)
+$r.noSession = Pick (Get-CorePartitionPlaybackStart (Ln 1000 'playback_smoke.start session=1 position=0') $L.Ticks 1000 1000 0)
+$r.emptyLog = Pick (Get-CorePartitionPlaybackStart '' $L.Ticks 1000 1000 0)
+$feed = [ordered]@{ rows = 3; pkgWattsMean = 40.0; pkgWattsMax = 100.0; pkgTempCMean = 46.67; pkgTempCMax = 80.0; pkgThrottledRows = 0; pkgTempCAtStart = 30.0; reasons = [ordered]@{ pkgThrottledRows = 'feed-unparseable' } }
+$late = Get-CorePartitionStartBoundFeed $feed @{ why = 'feed-window-start-late' }
+$r.bound = @($late.rows, $late.pkgWattsMean, $late.pkgTempCMean, $late.pkgTempCAtStart, $late.reasons['rows'], $late.reasons['pkgTempCMean'], $late.reasons['pkgThrottledRows'], $late.reasons.Contains('pkgTempCAtStart'))
+$r.boundTwice = @((Get-CorePartitionStartBoundFeed $late @{ why = 'feed-window-start-late' }).reasons['rows'])
+$r.missingVerdict = @((Get-CorePartitionStartBoundFeed $feed $null).reasons['pkgWattsMean'])
+$ok = Get-CorePartitionStartBoundFeed $feed @{ why = $null }
+$r.passThrough = @($ok.rows, $ok.pkgWattsMean, $ok.reasons.Contains('rows'))
+$r | ConvertTo-Json -Compress -Depth 5
+"""
+
+
+@requires_windows_pwsh
+class CorePartitionR13StartTests(unittest.TestCase):
+    """r13 (Dot 6452868627, CP-FEED-START-ANCHOR): the feed window's start is bound to the measured session's playback start, or refused typed."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="core-partition-r13-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.tmp = Path(cls._tmp.name)
+        work = cls.tmp / "cleanup"
+        work.mkdir()
+        script = cls.tmp / "r13-cleanup.ps1"
+        script.write_text(LIFT + R13_START_DRIVER, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(work)})
+        cls.raw = proc
+        cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the lifted cleanup region did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+        for case, got in self.r.items():
+            self.assertNotIn("threw", got, f"{case}: {got}")
+
+    def test_r13_dot_counterexample_a_pre_playback_idle_span_is_refused_not_averaged(self) -> None:
+        """Dot 6452868627 (literal): 60 s of startup rows (10 W / 30 C) then 30 s of playback rows (100 W / 80 C) in a 90 s window that passes the
+        120 s freshness bound and every END bound. On a751394f the window means are 40 W / 46.67 C (rows 90, no reason). The measured session's
+        playback starts 60000 ms after the start mark, past the declared 10000 ms slack: every window field is null with feed-window-start-late, and
+        core-partition.json publishes the gap, the slack and the verdict."""
+        got = self.r["dot-60s-idle-then-30s-playback"]
+        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [None, None, None, "feed-window-start-late"], got)
+        gap, slack, why, session, stamped = got["start"]
+        self.assertEqual([slack, why, session, stamped], [10000, "feed-window-start-late", 1, True], got)
+        self.assertAlmostEqual(gap, 60000, delta=1, msg=got)
+
+    def test_r13_control_playback_within_the_slack_keeps_todays_means(self) -> None:
+        """No-delay control: playback starts 3000 ms after the start mark (inside the slack); the window is published exactly as before r13 (rows
+        90, 97 W / 78.33 C means), with the gap and a null start verdict beside it."""
+        got = self.r["playback-within-slack-control"]
+        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [90, 97.0, 78.33, ""], got)
+        gap, slack, why, _session, _stamped = got["start"]
+        self.assertEqual([slack, why], [10000, ""], got)
+        self.assertAlmostEqual(gap, 3000, delta=1, msg=got)
+
+    def test_r13_no_playback_start_signal_is_a_typed_refusal_never_a_measured_value(self) -> None:
+        """A run log without the measured session's playback_smoke.start line, or no resolvable run log at all: feed-window-start-unverified on
+        every window field, and no gap. On a751394f both publish the 40 W / 46.67 C means."""
+        for case in ("no-playback-start-line", "no-run-log"):
+            with self.subTest(case=case):
+                got = self.r[case]
+                self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [None, None, None, "feed-window-start-unverified"], got)
+                self.assertEqual(got["start"][:3], [None, 10000, "feed-window-start-unverified"], got)
+
+    def test_r13_the_start_rule(self) -> None:
+        """Get-CorePartitionPlaybackStart and Get-CorePartitionStartBoundFeed, pure: the clock skew counts against the slack, the slack is a named
+        parameter, the gap runs from the start mark (not the launch stamp), only the measured session's start line counts (session=12 is not
+        session=1; a warmup session's earlier start is not the measured one), the summary-session fallback, and every missing or unusable signal
+        is feed-window-start-unverified. The bound nulls the window fields only, keeps a reason already there and leaves pkgTempCAtStart."""
+        script = self.tmp / "r13-pure.ps1"
+        script.write_text(LIFT + R13_PURE, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+        r = json.loads(proc.stdout.strip().splitlines()[-1])
+        unverified = "feed-window-start-unverified"
+        self.assertEqual(r["withinSlackNoSkew"], ["", 9000, 1])
+        self.assertEqual(r["skewCountsAgainstTheBound"], ["feed-window-start-late", 9000, 1])
+        self.assertEqual(r["startMarkReadBeforeTheLaunch"], ["feed-window-start-late", 10500, 1])
+        self.assertEqual(r["namedSlack"], ["feed-window-start-late", 9000, 1])
+        self.assertEqual(r["beforeTheWindow"], [unverified, -5000, 1])
+        self.assertEqual(r["warmupSessionIgnored"], ["feed-window-start-late", 30000, 2])
+        self.assertEqual(r["sessionPrefixIsNotTheSession"], [unverified, None, 1])
+        self.assertEqual(r["summaryFallback"], ["", 2000, 3])
+        self.assertEqual(r["unknownSkew"], [unverified, None, 1])
+        self.assertEqual(r["noSinkStamp"], [unverified, None, 1])
+        self.assertEqual(r["unparseableStamp"], [unverified, None, 1])
+        self.assertEqual(r["noSession"], [unverified, None, None])
+        self.assertEqual(r["emptyLog"], [unverified, None, None])
+        self.assertEqual(r["bound"], [None, None, None, 30.0, "feed-window-start-late", "feed-window-start-late", "feed-unparseable", False])
+        self.assertEqual(r["boundTwice"], ["feed-window-start-late"])
+        self.assertEqual(r["missingVerdict"], [unverified])
+        self.assertEqual(r["passThrough"], [3, 40.0, False])
 
 
 PARAMS_ANCHOR = "$AutomationSettingsDir,$GpuPreLaunches)"
