@@ -11,7 +11,8 @@
 # An unmerged index (a lane that died mid `git merge`) has no staged diff to write: `git diff --cached` prints only '* Unmerged path <file>' and exits 0. That state is recorded in the merge-state file and the
 # line is DIRTY_TREE_SAVE_FAILED reason=unmerged-index. Every DIRTY_TREE_SAVE_FAILED that comes after evidence was placed ends with the files already there: patch=<path> status=<path> merge-state=<path>,
 # and a file moved into place whose bytes could not be proven to be the validated ones is named last as unverified=<path>. Every diff is digested before it is checked
-# and must still hold those bytes when it is placed (reason=evidence-changed-after-validation otherwise). A .git that names another repository by the end of the root checks is reason=worktree-git-dir-changed.
+# and must still hold those bytes when it is placed (reason=evidence-changed-after-validation otherwise). A .git that names another repository by the end of the root checks is reason=worktree-git-dir-changed;
+# the files that name the repository (.git gitfile, commondir) and the git and common directories are held for the save, and one that cannot be held is reason=git-metadata-not-held.
 # The helper judges every git exit code itself and sets $PSNativeCommandUseErrorActionPreference = $false for its own calls, so the expected exit 1 of `git diff --cached --quiet` cannot throw under a caller that set it.
 # It refuses a -Dest inside the worktree it describes (reason=dest-inside-worktree): evidence written there would show in the next status and be captured by the next save.
 # -Dest is resolved once to its physical path and every write uses that path; a destination that changed identity before a write or publish is reason=dest-identity-changed.
@@ -119,6 +120,11 @@ public static class DirtyFinalPath {
         IntPtr h = CreateFileW(path, 1, 3, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
         return h == (IntPtr)(-1) ? IntPtr.Zero : h;
     }
+    // Opens a file for reading and shares READ only: others can still read it (git does), but nobody can write, truncate, rename or delete it until Unpin. IntPtr.Zero when it cannot be opened.
+    public static IntPtr PinFile(string path) {
+        IntPtr h = CreateFileW(path, 0x80000000, 1, IntPtr.Zero, 3, 0, IntPtr.Zero);
+        return h == (IntPtr)(-1) ? IntPtr.Zero : h;
+    }
     public static void Unpin(IntPtr handle) { if (handle != IntPtr.Zero) CloseHandle(handle); }
 }
 '@
@@ -189,6 +195,16 @@ function Lock-DirtyDirectory([string]$Path) {
     return $null
 }
 function Unlock-DirtyDirectory($Handle) { if ($null -ne $Handle) { try { [DirtyFinalPath]::Unpin($Handle) } catch { } } }
+# Holds a file open so that nobody can rewrite, rename or delete it (git can still read it) until Unlock-DirtyDirectory; $null where that is not possible. Seam, like Lock-DirtyDirectory.
+function Lock-DirtyFile([string]$Path) {
+    if (-not ($IsWindows -or $env:OS -eq 'Windows_NT')) { return $null }
+    try {
+        if (-not ('DirtyFinalPath' -as [type])) { $null = Get-DirtyKernelPath $Path }  # defines the type
+        $h = [DirtyFinalPath]::PinFile($Path)
+        if ($h -ne [IntPtr]::Zero) { return $h }
+    } catch { }
+    return $null
+}
 # The identity of the directory a hold has open, read from the held handle and never by reopening a path (two plain renames can put another directory behind the same path); $null when unknown.
 function Get-DirtyHeldIdentity($Handle) { if ($null -eq $Handle) { return $null }; try { return [DirtyFinalPath]::HandleIdentity([IntPtr]$Handle) } catch { return $null } }
 
@@ -289,7 +305,7 @@ function Test-DirtyDiffHasGitlink([byte[]]$Bytes) {
 }
 
 function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardName = '', [string]$RoundName = '') {
-    $tmp = $null; $stagedTmp = $null; $statTmp = $null; $mergeTmp = $null; $destLock = $null; $wtLock = $null; $prevEnc = $null
+    $tmp = $null; $stagedTmp = $null; $statTmp = $null; $mergeTmp = $null; $destLock = $null; $wtLock = $null; $prevEnc = $null; $metaLocks = @()
     $PSNativeCommandUseErrorActionPreference = $false  # local to this call: every git exit code below is judged here, never thrown (git diff --cached --quiet exits 1 when something is staged)
     $evidence = ''  # ' patch=.. status=..' for the files placed so far; every failure after the first placement ends with it
     $CardName = $CardName -replace '\s+', ' '; $RoundName = $RoundName -replace '\s+', ' '  # the result is one line
@@ -345,19 +361,34 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $Dest = $destReal; $Wt = $wtReal
         # The repository is read FIRST, the root checks run, and the repository is read again and must be the same one: a .git gitfile rewritten anywhere in between would
         # otherwise have the checks prove one repository and the pins below select another, whose HEAD and index are then saved under the proven work tree (r8, adversary 98e161fc-A2).
-        $gitDir = @(& git -C $Wt rev-parse --absolute-git-dir 2>$null)
-        if ($LASTEXITCODE -ne 0 -or $gitDir.Count -ne 1) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
+        # The common directory (refs and objects) is read with it: a linked worktree names it in its commondir file, which every unpinned git call reads again (r8 iter 1, adversary a8807691-A1).
+        $gitDir = @(& git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $gitDir.Count -ne 2) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
+        # Pinning GIT_COMMON_DIR is not enough: git's ref store reads a linked worktree's commondir file itself. So the files that name the repository (the -Wt\.git gitfile and
+        # commondir) are held against any write, rename or delete, and the git and common directories like -Dest, until the save ends; the second read below then binds (r8 iter 1).
+        foreach ($meta in @((Join-Path $Wt '.git'), (Join-Path $gitDir[0] 'commondir'))) {
+            if (-not (Test-Path -LiteralPath $meta -PathType Leaf)) { continue }  # a main worktree has a .git directory and no commondir
+            $h = Lock-DirtyFile $meta
+            if ($null -eq $h) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-metadata-not-held" }
+            $metaLocks += , $h
+        }
+        foreach ($meta in $gitDir) {
+            $h = Lock-DirtyDirectory $meta
+            if ($null -eq $h) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-metadata-not-held" }
+            $metaLocks += , $h
+        }
         $prefix = @(& git -C $Wt rev-parse --show-prefix 2>$null)
         if ($LASTEXITCODE -ne 0 -or ($prefix -join '').Trim() -ne '') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
         # The prefix is also empty OUTSIDE the work tree git uses: a core.worktree in the (worktree) config sends every later git call to another directory while the holds and
         # containment checks describe -Wt. The top level git reports must be the held directory itself (r7 iter 1, adversary 6433989c-A2).
         $top = @(& git -C $Wt rev-parse --show-toplevel 2>$null)
         if ($LASTEXITCODE -ne 0 -or $top.Count -ne 1 -or (Get-DirtyDirIdentity $top[0]) -cne $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
-        $again = @(& git -C $Wt rev-parse --absolute-git-dir 2>$null)
-        if ($LASTEXITCODE -ne 0 -or $again.Count -ne 1 -or $again[0] -cne $gitDir[0]) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
+        $again = @(& git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $again.Count -ne 2 -or $again[0] -cne $gitDir[0] -or $again[1] -cne $gitDir[1]) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
         # Every later git call rereads its config, so a core.worktree written after this check would move it elsewhere again: the repository and work tree just proven are pinned
-        # for the rest of the save (GIT_DIR / GIT_WORK_TREE beat core.worktree and the gitfile; the finally puts the caller's values back) (r7 iter 2, adversary 43a1998e-A2).
-        $env:GIT_DIR = $gitDir[0]; $env:GIT_WORK_TREE = $Wt
+        # for the rest of the save (GIT_DIR / GIT_WORK_TREE beat core.worktree and the gitfile, GIT_COMMON_DIR beats commondir; the finally puts the caller's values back)
+        # (r7 iter 2, adversary 43a1998e-A2; r8 iter 1, adversary a8807691-A1).
+        $env:GIT_DIR = $gitDir[0]; $env:GIT_COMMON_DIR = $gitDir[1]; $env:GIT_WORK_TREE = $Wt
         if (Test-DirtyPathInside -Inner $destReal -Outer $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-inside-worktree" }
         # A gitlink (mode 160000: a submodule pointer, or a submodule checked out at another commit) is written into the patch, but the advertised plain `git apply` skips its
         # commit ids and the reverse-apply check never looks at them, so SAVED would promise a recovery that drops the change. Such a diff is refused before anything is written (r7, adversary cd31735a-A2).
@@ -481,8 +512,9 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
     finally {
         foreach ($t in $tmp, $stagedTmp, $statTmp, $mergeTmp) { if ($t -and (Test-Path -LiteralPath $t)) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } }
         if ($null -ne $prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { } }
+        foreach ($h in $metaLocks) { Unlock-DirtyDirectory $h }
         Unlock-DirtyDirectory $wtLock; Unlock-DirtyDirectory $destLock  # released only after the temp cleanup, which still runs inside the held destination
-        foreach ($v in 'GIT_DIR', 'GIT_WORK_TREE') { Remove-Item -LiteralPath "Env:$v" -ErrorAction SilentlyContinue }  # the pins set above; the caller's own values come back next
+        foreach ($v in 'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE') { Remove-Item -LiteralPath "Env:$v" -ErrorAction SilentlyContinue }  # the pins set above; the caller's own values come back next
         foreach ($v in $savedEnv.Keys) { Set-Item -LiteralPath "Env:$v" -Value $savedEnv[$v] }
     }
 }

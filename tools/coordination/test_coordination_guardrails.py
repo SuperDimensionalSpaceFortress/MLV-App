@@ -2704,8 +2704,10 @@ def test_save_dirty_worktree_evidence_refuses_a_gitfile_repointed_between_its_ro
     git(other, "commit", "-qm", "other")
     gitfile = wt / ".git"
     # The seam: the identity check of git's own top-level answer (a forward-slash spelling) is the first point after the top level is read. The gitfile is hidden, which a
-    # create-always write refuses, so it is truncated in place.
-    shim = ("$script:RealId = (Get-Command Get-DirtyDirIdentity -CommandType Function).ScriptBlock; $script:Flipped = $false; "
+    # create-always write refuses, so it is truncated in place. The file holds of r8 iter 1 would refuse the rewrite outright (see the commondir test below), so they are
+    # modelled as failing open here: the second read of the git dir must still refuse.
+    shim = ("function Lock-DirtyFile([string]$Path) { [IntPtr]::Zero }; "
+            "$script:RealId = (Get-Command Get-DirtyDirIdentity -CommandType Function).ScriptBlock; $script:Flipped = $false; "
             "function Get-DirtyDirIdentity([string]$Path) { "
             f"if (-not $script:Flipped -and $Path.Contains('/')) {{ $script:Flipped = $true; $b = [System.Text.Encoding]::ASCII.GetBytes('gitdir: {str(other).replace(chr(92), '/')}/.git'); "
             f"$f = [System.IO.File]::Open('{gitfile}', 'Truncate', 'Write'); $f.Write($b, 0, $b.Length); $f.Dispose() }}; "
@@ -2714,6 +2716,37 @@ def test_save_dirty_worktree_evidence_refuses_a_gitfile_repointed_between_its_ro
     assert gitfile.read_text().startswith("gitdir: " + str(other).replace("\\", "/")), ("the shim must have repointed the gitfile", out.stdout, out.stderr)
     assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=worktree-git-dir-changed", (out.stdout, out.stderr)
     assert not list(dest.iterdir())
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_keeps_reading_the_proven_common_dir_when_commondir_is_rewritten_mid_save(tmp_path):
+    # r8 iter 1 (adversary a8807691-A1): only GIT_DIR was pinned, so every later git call derived the common directory (refs, objects) again from the linked worktree's
+    # commondir file. Rewritten at the first before-write checkpoint to a clone whose branch already holds the working bytes, it made the save report an empty patch.
+    # git's ref store reads commondir even under GIT_COMMON_DIR, so the files naming the repository are held for the save: the rewrite (and one of the gitfile) is refused.
+    main, dest = _dirty_save_repo(tmp_path)
+    git(main, "checkout", "--", "src/a.txt")
+    wt = tmp_path / "linked"
+    git(main, "worktree", "add", "-q", "-b", "lane", str(wt))
+    (wt / "src" / "a.txt").write_text("two\n")
+    other = tmp_path / "other"
+    git(tmp_path, "clone", "-q", str(main), str(other))
+    git(other, "checkout", "-q", "-b", "lane")
+    (other / "src" / "a.txt").write_text("two\n")
+    git(other, "commit", "-qam", "lane in the clone")
+    commondir = main / ".git" / "worktrees" / "linked" / "commondir"
+    assert commondir.is_file(), "the fixture must be a linked worktree with a commondir file"
+    shim = ("$script:Moved = $false; $script:Tries = @(); function Invoke-DirtyDestCheckpoint([string]$Stage) { "
+            f"if (-not $script:Moved) {{ $script:Moved = $true; "
+            f"foreach ($t in @(@('{commondir}', '{str(other).replace(chr(92), '/')}/.git'), @('{wt / '.git'}', 'gitdir: {str(other).replace(chr(92), '/')}/.git'))) {{ "
+            "try { $b = [System.Text.Encoding]::ASCII.GetBytes($t[1]); $f = [System.IO.File]::Open($t[0], 'Truncate', 'Write'); $f.Write($b, 0, $b.Length); $f.Dispose(); $script:Tries += 'rewritten' } "
+            "catch { $script:Tries += 'blocked' } } } }")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output ('tries=' + ($script:Tries -join ','))")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] == "tries=blocked,blocked", (out.stdout, out.stderr)
+    assert not commondir.read_text().startswith(str(other).replace("\\", "/"))
+    assert lines[0].startswith("DIRTY_TREE_SAVED card=C1") and "verified=reverse-apply-ok" in lines[0], (out.stdout, out.stderr)
+    text = next(dest.glob("dirty-worktree-*.patch")).read_text(encoding="utf-8")
+    assert "-one" in text and "+two" in text, text
 
 
 @dirty_save_only
