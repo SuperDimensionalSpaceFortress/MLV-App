@@ -789,8 +789,8 @@ def _stub_sha() -> str:
 
 
 def _heavy(box: dict, mode: str, mode_args: list, sha: str = None, shim: Path = HEAVY_STUB, extra: dict = None,
-           lock: Path = None) -> subprocess.CompletedProcess:
-    memory_file = _write_json(box["dir"] / "memory.json", OK_MEMORY)
+           lock: Path = None, memory: list = None) -> subprocess.CompletedProcess:
+    memory_file = _write_json(box["dir"] / "memory.json", memory or OK_MEMORY)
     table_file = _write_json(box["dir"] / "table.json", [])
     env = _env(heavy_slot=shim, extra={
         "STUB_HEAVY_SLOT_MODE": mode,
@@ -1211,6 +1211,77 @@ def test_a_stop_file_that_cannot_be_written_still_ends_the_holder(box) -> None:
     assert "holder-ended=True" in done.stdout, done.stdout + done.stderr
     assert "stop file not written" in done.stderr, done.stderr
     assert "BUILD_HEAVY_SLOT_" not in done.stdout, "admitted and built, never refused"
+
+
+def test_a_heavy_slot_lost_while_waiting_for_memory_is_a_requeue_before_the_action(box) -> None:
+    # r2 adversary 090d9006-A1: the holder is alive at admission, ends during a 5 s memory poll, and the next poll passes;
+    # the action must not start on a slot that is already gone.
+    done = _heavy(box, "readyexit", ["-PollSeconds", "5", "-DeadlineMinutes", "1", "-Command", _marker_command(box)],
+                  extra={"STUB_HEAVY_SLOT_HOLD_S": "3"}, memory=[LOW_PHYS, OK_MEMORY[0]])
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "heavy-slot: admitted" in done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build code=0 ticket=stub-" in done.stdout, done.stdout + done.stderr
+    assert "reason=holder-exited-before-action" in done.stdout
+    assert "HEAVY_SLOT_LOST_DURING_ACTION" not in done.stdout + done.stderr
+    assert not box["marker"].exists() and not box["lock"].exists(), "nothing is built without a live heavy slot"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == []
+
+
+def test_a_ready_file_whose_slot_owner_died_is_no_admission(box) -> None:
+    # r2 adversary 090d9006-A2: only the heavy-slot process named on the ready file's first line (it owns the slot mutex)
+    # is killed, after the ready file and before the guard's next look; the holder child and the guard live on. The host
+    # outlives the guard, so the holder ending proves the stop file, not the guard's death.
+    holder_file = box["dir"] / "holder-pid.txt"
+    kill_owner = (
+        "function Start-Sleep { param([int]$Milliseconds, [int]$Seconds)\n"
+        "    if (-not $lease -or $script:ownerKilled) { return }\n"
+        "    $d = (Get-Date).AddSeconds(30)\n"
+        "    while (-not ((Get-Content -LiteralPath $lease.Ready -Raw -ErrorAction Ignore) -match 'holder=') -and (Get-Date) -lt $d) { [Threading.Thread]::Sleep(50) }\n"
+        "    $text = Get-Content -LiteralPath $lease.Ready -Raw\n"
+        "    $owner = [int]([regex]::Match($text, '\\A[^\\r\\n]*:(\\d+)').Groups[1].Value)\n"
+        f"    Set-Content -LiteralPath '{holder_file}' -Value ([regex]::Match($text, 'holder=(\\d+)').Groups[1].Value)\n"
+        "    Stop-Process -Id $owner -Force; Wait-Process -Id $owner -Timeout 20 -ErrorAction Ignore\n"
+        "    $script:ownerKilled = $true }\n"
+    )
+    done = _library_driver(
+        box,
+        kill_owner
+        + f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+        extra={"STUB_HEAVY_SLOT_DELAY_S": "1"},
+        host_tail=(
+            f"$h = [int](Get-Content -LiteralPath '{holder_file}' -Raw)\n"
+            "$d = (Get-Date).AddSeconds(15)\n"
+            "while ((Get-Process -Id $h -ErrorAction Ignore) -and (Get-Date) -lt $d) { [Threading.Thread]::Sleep(100) }\n"
+            "Write-Output \"holder-ended=$(-not (Get-Process -Id $h -ErrorAction Ignore))\"\n"
+        ),
+    )
+    assert "driver-exit=3" in done.stdout, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build " in done.stdout and "reason=slot-owner-exited-after-ready" in done.stdout
+    assert "heavy-slot: admitted" not in done.stderr
+    assert not box["marker"].exists() and not box["lock"].exists(), "nothing is built on a slot whose owner is gone"
+    assert "holder-ended=True" in done.stdout, "the orphaned holder is stopped while the host lives on"
+
+
+@pytest.mark.parametrize("value", ["15372286720L", "'NaN'", "'sixty'"])
+def test_a_wait_the_hung_tool_bound_cannot_hold_is_refused_before_heavy_slot_starts(box, value) -> None:
+    # r2 adversary 090d9006-A3: a Library host that catches throws passes a wait that overflows TimeSpan (or is not a
+    # number). It is a typed refusal with nothing launched, not a throw after heavy-slot started.
+    done = _library_driver(
+        box,
+        f"$opts.HeavySlotWaitMinutes = {value}\n"
+        "try { Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        f"    Set-Content -LiteralPath '{box['marker']}' -Value ran }} }} catch {{ Write-Output \"caught=$($_.Exception.GetType().Name)\" }}\n",
+        str(box["lock"]),
+        host_tail="Start-Sleep -Seconds 2\nWrite-Output host-alive\n",
+    )
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option HeavySlotWaitMinutes=" in done.stdout, done.stdout + done.stderr
+    assert "driver-exit=2" in done.stdout and "caught=" not in done.stdout
+    assert "host-alive" in done.stdout
+    assert _stub_calls(box) == [], "heavy-slot is never started"
+    hs = box["dir"] / "heavy-slot"
+    assert not hs.exists() or list(hs.iterdir()) == []
+    assert not box["marker"].exists() and not box["lock"].exists()
 
 
 def test_the_hung_tool_bound_is_monotonic() -> None:
