@@ -2671,6 +2671,73 @@ def test_save_dirty_worktree_evidence_refuses_evidence_rewritten_between_its_che
 
 
 @dirty_save_only
+@pytest.mark.parametrize("temp_glob, placed_glob", [("dirty-worktree-saving-*.tmp", "dirty-worktree-*.patch"), ("dirty-worktree-staging-*.tmp", "dirty-worktree-staged-*")])
+def test_save_dirty_worktree_evidence_refuses_evidence_rewritten_after_its_last_check_and_before_its_digest(tmp_path, temp_glob, placed_glob):
+    # r8 (adversary 98e161fc-A1, Dot A1): the digest was taken AFTER the checks, so a temp file emptied after the last check (the gitlink scan) was accepted under the empty
+    # file's hash, the post-placement check matched that hash, and SAVED reported empty evidence. Main patch and staged diff alike. HEAD 'one', index 'two', working 'three'.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "add", "src/a.txt")
+    (wt / "src" / "a.txt").write_text("three\n")
+    shim = ("function Test-DirtyDiffHasGitlink { "
+            f"Get-ChildItem -LiteralPath '{dest}' -Filter '{temp_glob}' | ForEach-Object {{ [System.IO.File]::WriteAllBytes($_.FullName, [byte[]]@()) }}; $false }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=evidence-changed-after-validation"), (out.stdout, out.stderr)
+    assert "DIRTY_TREE_SAVED" not in line and not list(dest.glob(placed_glob)) and not list(dest.glob("*.tmp")), (line, sorted(p.name for p in dest.iterdir()))
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_gitfile_repointed_between_its_root_checks_and_its_pins(tmp_path):
+    # r8 (adversary 98e161fc-A2, Dot A2): the top level was proven and the git dir then read in a separate call; a linked worktree's .git gitfile rewritten in between pinned
+    # another repository (whose HEAD matches the working bytes) under the proven work tree, and SAVED reported an empty diff that omitted the worktree's own edit.
+    main, dest = _dirty_save_repo(tmp_path)
+    git(main, "checkout", "--", "src/a.txt")
+    wt = tmp_path / "linked"
+    git(main, "worktree", "add", "-q", str(wt))
+    (wt / "src" / "a.txt").write_text("two\n")
+    other = tmp_path / "other"
+    other.mkdir()
+    make_repo(other)
+    (other / "src").mkdir()
+    (other / "src" / "a.txt").write_text("two\n")
+    git(other, "add", "src/a.txt")
+    git(other, "commit", "-qm", "other")
+    gitfile = wt / ".git"
+    # The seam: the identity check of git's own top-level answer (a forward-slash spelling) is the first point after the top level is read. The gitfile is hidden, which a
+    # create-always write refuses, so it is truncated in place.
+    shim = ("$script:RealId = (Get-Command Get-DirtyDirIdentity -CommandType Function).ScriptBlock; $script:Flipped = $false; "
+            "function Get-DirtyDirIdentity([string]$Path) { "
+            f"if (-not $script:Flipped -and $Path.Contains('/')) {{ $script:Flipped = $true; $b = [System.Text.Encoding]::ASCII.GetBytes('gitdir: {str(other).replace(chr(92), '/')}/.git'); "
+            f"$f = [System.IO.File]::Open('{gitfile}', 'Truncate', 'Write'); $f.Write($b, 0, $b.Length); $f.Dispose() }}; "
+            "& $script:RealId $Path }")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert gitfile.read_text().startswith("gitdir: " + str(other).replace("\\", "/")), ("the shim must have repointed the gitfile", out.stdout, out.stderr)
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=worktree-git-dir-changed", (out.stdout, out.stderr)
+    assert not list(dest.iterdir())
+
+
+@dirty_save_only
+@pytest.mark.parametrize("mode", ["hash-throws", "bytes-change"])
+def test_move_dirty_evidence_names_the_placed_file_when_it_cannot_prove_the_placed_bytes(tmp_path, mode):
+    # r8 (adversary 98e161fc-A3, Dot A3): a Get-FileHash throw after a successful move (another process holds the new name) left the helper without naming the file it had placed,
+    # so the failure line omitted it. Every return after the move names the placed file, and the saver reports it as unverified=<path>.
+    wt, dest = _dirty_save_repo(tmp_path)
+    if mode == "hash-throws":
+        seam = ("function Invoke-DirtyFileMove([string]$From, [string]$To) { [System.IO.File]::Move($From, $To); "
+                "if ((Split-Path -Leaf $To) -like 'dirty-worktree-*.status.txt') { $script:Lock = [System.IO.File]::Open($To, 'Open', 'Read', 'None') } }")
+    else:
+        seam = ("function Invoke-DirtyFileMove([string]$From, [string]$To) { [System.IO.File]::Move($From, $To); "
+                "if ((Split-Path -Leaf $To) -like 'dirty-worktree-*.status.txt') { [System.IO.File]::WriteAllText($To, 'other') } }")
+    out = dirty_save_pwsh(f"{seam}; $r = Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; if ($script:Lock) {{ $script:Lock.Dispose() }}; $r")
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=evidence-"), (out.stdout, out.stderr)
+    assert len(line.splitlines()) == 1 and "DIRTY_TREE_SAVED" not in line, line
+    m = re.search(r" unverified=(.+\.status\.txt)$", line)
+    assert m and Path(m.group(1)).is_file() and Path(m.group(1)).parent == dest, line
+    assert re.search(r" patch=(.+?\.patch) ", line), line
+
+
+@dirty_save_only
 def test_save_dirty_worktree_evidence_fails_typed_when_the_main_patch_loses_a_whole_file(tmp_path):
     # Same class on the main patch (adversary siblings :41 / :77): a complete one-file prefix used to be reported as verified=reverse-apply-ok.
     wt, dest = _dirty_save_repo(tmp_path)
@@ -2808,7 +2875,10 @@ def test_save_dirty_worktree_evidence_reports_an_unmerged_index_without_a_merge_
 def test_save_dirty_worktree_evidence_fails_typed_when_a_claimed_staged_diff_does_not_reverse_apply_to_the_index(tmp_path):
     # r4 K1: the header promises "no reverse-apply to the index is never SAVED" for every input. git is shimmed to refuse the applicability check only, so the
     # byte-exact stream check still passes and the typed failure can only come from the `git apply --cached --check -R` result.
-    wt, dest = _dirty_save_repo(tmp_path)
+    # The fixture sits under a directory with a space, and the paths are read by their field delimiters, not as non-space runs (r8, adversary 98e161fc-A4).
+    spaced = tmp_path / "with space"
+    spaced.mkdir()
+    wt, dest = _dirty_save_repo(spaced)
     git(wt, "checkout", "--", "src/a.txt")
     _stage_then_edit_back(wt)
     shim = (f"$script:RealGit = '{shutil.which('git')}'; "
@@ -2816,7 +2886,8 @@ def test_save_dirty_worktree_evidence_fails_typed_when_a_claimed_staged_diff_doe
     out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
     line = out.stdout.strip()
     assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=staged-diff-not-applicable "), out.stdout + out.stderr
-    assert re.search(r" patch=\S+\.patch", line) and re.search(r" status=\S+\.txt", line), line
+    m = re.search(r" patch=(.+?\.patch) status=(.+?\.txt)$", line)
+    assert m and all(Path(p).is_file() and Path(p).parent == dest for p in m.groups()), line
     assert not list(dest.glob("dirty-worktree-staged-*")) and not list(dest.glob("*.tmp"))
 
 
@@ -3301,12 +3372,24 @@ def test_save_dirty_worktree_evidence_names_the_placed_patch_when_a_later_step_t
     first = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
     assert first.stdout.startswith("DIRTY_TREE_SAVED"), first.stdout + first.stderr
     patch = next(dest.glob("dirty-worktree-*.patch"))
-    shim = ("$script:RealFH = Get-Command Get-FileHash -CommandType Cmdlet; "
-            "function Get-FileHash { if (@($args | Where-Object { \"$_\" -like '*.status.txt' }).Count) { throw [System.IO.IOException]::new('locked by another process') }; & $script:RealFH @args }")
+    # r8: the throw now comes from naming the status temp file. Hashing an occupied name no longer throws out of the move helper (adversary 98e161fc-A3 sibling :48), see below.
+    shim = ("$script:RealJP = Get-Command Join-Path -CommandType Cmdlet; "
+            "function Join-Path { if (\"$($args[1])\" -like 'dirty-worktree-status-*') { throw [System.IO.IOException]::new('locked by another process') }; & $script:RealJP @args }")
     out = dirty_save_pwsh(f"$ErrorActionPreference = 'Stop'; {shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
     line = out.stdout.strip()
     assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=") and "locked by another process" in line, out.stdout + out.stderr
     assert line.endswith(f" patch={patch}"), line
+    # An occupied name whose hash cannot be read is not proven to hold these bytes: the helper returns its shape and tries the next length, never overwriting the first snapshot.
+    status = patch.with_suffix(".status.txt")
+    first_status = status.read_bytes()
+    (wt / "untracked.txt").write_text("new name in the status\n")
+    shim = ("$script:RealFH = Get-Command Get-FileHash -CommandType Cmdlet; "
+            "function Get-FileHash { if (@($args | Where-Object { \"$_\" -like '*.status.txt' }).Count) { throw [System.IO.IOException]::new('locked by another process') }; & $script:RealFH @args }")
+    out = dirty_save_pwsh(f"$ErrorActionPreference = 'Stop'; {shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    m = re.search(r" status=(.+?\.status-[0-9a-f]{8}\.txt) reapply=", line)
+    assert line.startswith("DIRTY_TREE_SAVED card=C1") and m and "untracked.txt" in Path(m.group(1)).read_text(encoding="utf-8"), (out.stdout, out.stderr)
+    assert status.read_bytes() == first_status
 
 
 @dirty_save_only

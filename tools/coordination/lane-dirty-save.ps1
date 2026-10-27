@@ -9,7 +9,9 @@
 # It RETURNS one line (the caller prints it): DIRTY_TREE_SAVED ... staged=<path|none> verified=reverse-apply-ok|empty-diff|reverse-apply-FAILED reapply=<command>, or DIRTY_TREE_SAVE_FAILED reason=<why>.
 # A staged diff that cannot be written whole (git exit, empty or truncated file, no `git apply --cached --check -R` against the index) is DIRTY_TREE_SAVE_FAILED, never SAVED; no evidence name is ever overwritten.
 # An unmerged index (a lane that died mid `git merge`) has no staged diff to write: `git diff --cached` prints only '* Unmerged path <file>' and exits 0. That state is recorded in the merge-state file and the
-# line is DIRTY_TREE_SAVE_FAILED reason=unmerged-index. Every DIRTY_TREE_SAVE_FAILED that comes after evidence was placed ends with the files already there: patch=<path> status=<path> merge-state=<path>.
+# line is DIRTY_TREE_SAVE_FAILED reason=unmerged-index. Every DIRTY_TREE_SAVE_FAILED that comes after evidence was placed ends with the files already there: patch=<path> status=<path> merge-state=<path>,
+# and a file moved into place whose bytes could not be proven to be the validated ones is named last as unverified=<path>. Every diff is digested before it is checked
+# and must still hold those bytes when it is placed (reason=evidence-changed-after-validation otherwise). A .git that names another repository by the end of the root checks is reason=worktree-git-dir-changed.
 # The helper judges every git exit code itself and sets $PSNativeCommandUseErrorActionPreference = $false for its own calls, so the expected exit 1 of `git diff --cached --quiet` cannot throw under a caller that set it.
 # It refuses a -Dest inside the worktree it describes (reason=dest-inside-worktree): evidence written there would show in the next status and be captured by the next save.
 # -Dest is resolved once to its physical path and every write uses that path; a destination that changed identity before a write or publish is reason=dest-identity-changed.
@@ -24,6 +26,8 @@
 # When the name already holds these exact bytes, $Tmp is left for the caller's cleanup. A non-empty $FirstName is tried before the hash-derived names.
 # It always returns a hashtable: Path is the placed (or reused) file, or $null with Reason = name-collision (every length is taken by a DIFFERENT file) or
 # move-failed:<HResult> <message> (the move threw an IOException and the target does not exist: a sharing violation or an AV lock on $Tmp, not a name clash).
+# A file moved into place whose bytes cannot be proven to hash to $Full comes back as Path = $null, Placed = <that file> and Reason = evidence-changed-before-publish:<file>
+# or evidence-unverified-after-publish (its hash could not be read).
 function Invoke-DirtyFileMove([string]$From, [string]$To) { [System.IO.File]::Move($From, $To) }  # one seam, so a test can stand in for a locked file
 
 function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem, [string]$Ext, [string]$Full, [string]$FirstName = '', [scriptblock]$Guard = $null) {
@@ -35,18 +39,24 @@ function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem,
     foreach ($pair in $names) {
         $cand = Join-Path $Dir $pair[0]
         if ($Guard) { $why = & $Guard 'before-publish'; if ($why) { return @{ Path = $null; Reason = $why } } }  # the destination is re-proven right before each rename into place
-        try {
-            Invoke-DirtyFileMove $Tmp $cand
-            # The bytes published must be the bytes validated: a temp file rewritten after its checks would otherwise be placed and reported (r7 iter 2, adversary 43a1998e-A1).
-            if ((Get-FileHash -LiteralPath $cand -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Full) { return @{ Path = $null; Reason = "evidence-changed-before-publish:$cand" } }
-            return @{ Path = $cand; Id = $pair[1]; Moved = $true }
-        }
+        try { Invoke-DirtyFileMove $Tmp $cand }
         catch [System.IO.IOException] {
             $ex = $_.Exception
             while ($ex.InnerException -and $ex -isnot [System.IO.IOException]) { $ex = $ex.InnerException }  # a method call wraps the real IOException
             if (-not (Test-Path -LiteralPath $cand)) { return @{ Path = $null; Reason = ('move-failed:0x{0:X8} {1}' -f $ex.HResult, ($ex.Message -replace '\s+', ' ')) } }
-            if ((Test-Path -LiteralPath $cand -PathType Leaf) -and (Get-FileHash -LiteralPath $cand -Algorithm SHA256).Hash.ToLowerInvariant() -eq $Full) { return @{ Path = $cand; Id = $pair[1]; Moved = $false } }
+            # An occupied name that cannot be read is not proven to hold these bytes, so the next length is tried (r8, adversary 98e161fc-A3 sibling :48: the hash used to throw out of the helper).
+            $held = $null
+            try { if (Test-Path -LiteralPath $cand -PathType Leaf) { $held = (Get-FileHash -LiteralPath $cand -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } } catch { $held = $null }
+            if ($held -ceq $Full) { return @{ Path = $cand; Id = $pair[1]; Moved = $false } }
+            continue
         }
+        # Placed. The bytes published must be the bytes validated: a temp file rewritten after its checks would otherwise be placed and reported (r7 iter 2, adversary 43a1998e-A1).
+        # From here every failure names the placed file as Placed, so the caller's line reports it (unverified=<path>) instead of losing it (r8, adversary 98e161fc-A3).
+        $now = $null
+        try { $now = (Get-FileHash -LiteralPath $cand -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch { $now = $null }
+        if ($null -eq $now) { return @{ Path = $null; Placed = $cand; Reason = 'evidence-unverified-after-publish' } }
+        if ($now -cne $Full) { return @{ Path = $null; Placed = $cand; Reason = "evidence-changed-before-publish:$cand" } }
+        return @{ Path = $cand; Id = $pair[1]; Moved = $true }
     }
     return @{ Path = $null; Reason = 'name-collision' }
 }
@@ -233,11 +243,24 @@ function Test-DirtyPathInside([string]$Inner, [string]$Outer) {
     return ($Inner.TrimEnd($trim) + $sep).StartsWith($Outer.TrimEnd($trim) + $sep, $cmp)  # a drive root keeps its separator when resolved; the comparison must not double it
 }
 
-# True only when the saved file is byte-identical to what git writes to a pipe for the same diff (GitDiffArgs = the arguments after `git -C <Wt>`, without --output).
+# Reads an exported diff ONCE: Full is the SHA-256 of exactly these Bytes. Every check after this runs on the bytes or their digest, never on a re-read of the file, and the file must
+# still hash to Full right before it is placed (Test-DirtyEvidenceUnchanged) and right after (Move-DirtyEvidenceToFreeName). A digest taken after the checks would accept whatever a
+# concurrent writer left in the temp file between the last check and the hash (r8, adversary 98e161fc-A1).
+function Read-DirtyEvidence([string]$Path) {
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $full = ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+    return @{ Bytes = $bytes; Full = $full }
+}
+function Test-DirtyEvidenceUnchanged([string]$Path, [string]$Full) {
+    try { return ((Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() -ceq $Full) } catch { return $false }
+}
+
+# True only when the saved bytes (their digest, $Full) are byte-identical to what git writes to a pipe for the same diff (GitDiffArgs = the arguments after `git -C <Wt>`, without --output).
 # A cut at a file boundary, a hunk boundary or just before `\ No newline at end of file` is still a well-formed patch that keeps every line count and reverse-applies, and a
 # full volume can make git write less than it was given without a non-zero exit; only a byte-exact comparison against git's own stream sees every such loss.
-function Test-DirtyPatchComplete([string]$Wt, [string]$Patch, [string[]]$GitDiffArgs) {
-    if (-not (Test-Path -LiteralPath $Patch)) { return $false }
+function Test-DirtyPatchComplete([string]$Wt, [string]$Full, [string[]]$GitDiffArgs) {
+    if ($Full -cnotmatch '^[0-9a-f]{64}\z') { return $false }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = @(Get-Command git -CommandType Application)[0].Source
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
@@ -250,14 +273,15 @@ function Test-DirtyPatchComplete([string]$Wt, [string]$Patch, [string[]]$GitDiff
         $p.WaitForExit()
         if ($p.ExitCode -ne 0) { return $false }
     } finally { $p.Dispose() }
-    return ($live -ceq (Get-FileHash -LiteralPath $Patch -Algorithm SHA256).Hash.ToLowerInvariant())
+    return ($live -ceq $Full)
 }
 
 # True when an exported diff records a gitlink (mode 160000) in a file header. Content lines start with ' ', '+', '-' or '\', and a base85 binary line holds no space,
 # so only a header can match. Checked on the exported bytes, so a gitlink staged after the up-front scan is still refused before the diff is placed (r7 iter 1, adversary 6433989c-A1).
-# The reader is disposed explicitly: leaving a foreach over File.ReadLines early keeps the file open, and the temp cleanup then cannot remove it.
-function Test-DirtyDiffHasGitlink([string]$Path) {
-    $reader = New-Object System.IO.StreamReader($Path)
+# It reads the bytes Read-DirtyEvidence returned, not the file (r8, adversary 98e161fc-A1).
+function Test-DirtyDiffHasGitlink([byte[]]$Bytes) {
+    if ($null -eq $Bytes) { $Bytes = [byte[]]::new(0) }
+    $reader = [System.IO.StreamReader]::new([System.IO.MemoryStream]::new($Bytes))
     try {
         while ($null -ne ($line = $reader.ReadLine())) { if ($line -cmatch '^(index [0-9a-f]+\.\.[0-9a-f]+ 160000|(new file|deleted file|old|new) mode 160000)$') { return $true } }
         return $false
@@ -319,16 +343,20 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         # the hold is in place, must give the same physical path (r5 adversary A3).
         if ((Resolve-DirtyRealPath $wtReal) -ine $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
         $Dest = $destReal; $Wt = $wtReal
+        # The repository is read FIRST, the root checks run, and the repository is read again and must be the same one: a .git gitfile rewritten anywhere in between would
+        # otherwise have the checks prove one repository and the pins below select another, whose HEAD and index are then saved under the proven work tree (r8, adversary 98e161fc-A2).
+        $gitDir = @(& git -C $Wt rev-parse --absolute-git-dir 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $gitDir.Count -ne 1) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
         $prefix = @(& git -C $Wt rev-parse --show-prefix 2>$null)
         if ($LASTEXITCODE -ne 0 -or ($prefix -join '').Trim() -ne '') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
         # The prefix is also empty OUTSIDE the work tree git uses: a core.worktree in the (worktree) config sends every later git call to another directory while the holds and
         # containment checks describe -Wt. The top level git reports must be the held directory itself (r7 iter 1, adversary 6433989c-A2).
         $top = @(& git -C $Wt rev-parse --show-toplevel 2>$null)
         if ($LASTEXITCODE -ne 0 -or $top.Count -ne 1 -or (Get-DirtyDirIdentity $top[0]) -cne $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
+        $again = @(& git -C $Wt rev-parse --absolute-git-dir 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $again.Count -ne 1 -or $again[0] -cne $gitDir[0]) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
         # Every later git call rereads its config, so a core.worktree written after this check would move it elsewhere again: the repository and work tree just proven are pinned
-        # for the rest of the save (GIT_DIR / GIT_WORK_TREE beat core.worktree; the finally puts the caller's values back) (r7 iter 2, adversary 43a1998e-A2).
-        $gitDir = @(& git -C $Wt rev-parse --absolute-git-dir 2>$null)
-        if ($LASTEXITCODE -ne 0 -or $gitDir.Count -ne 1) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
+        # for the rest of the save (GIT_DIR / GIT_WORK_TREE beat core.worktree and the gitfile; the finally puts the caller's values back) (r7 iter 2, adversary 43a1998e-A2).
         $env:GIT_DIR = $gitDir[0]; $env:GIT_WORK_TREE = $Wt
         if (Test-DirtyPathInside -Inner $destReal -Outer $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-inside-worktree" }
         # A gitlink (mode 160000: a submodule pointer, or a submodule checked out at another commit) is written into the patch, but the advertised plain `git apply` skips its
@@ -350,13 +378,18 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $shape = @('--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--submodule=short', '--ignore-submodules=none', '-U3', '--src-prefix=a/', '--dst-prefix=b/')
         & git -C $Wt diff HEAD @shape "--output=$tmp" 2>$null
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-exit-$LASTEXITCODE" }
-        if (-not (Test-DirtyPatchComplete -Wt $Wt -Patch $tmp -GitDiffArgs (@('diff', 'HEAD') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=patch-incomplete" }
-        if (Test-DirtyDiffHasGitlink $tmp) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved" }
-        $full = (Get-FileHash -LiteralPath $tmp -Algorithm SHA256).Hash.ToLowerInvariant()
+        # Digest first, then the checks on those bytes, then the file must still hold them before it is placed (r8, adversary 98e161fc-A1; see Read-DirtyEvidence).
+        $patchEv = Read-DirtyEvidence $tmp
+        $full = $patchEv.Full
+        if (-not (Test-DirtyPatchComplete -Wt $Wt -Full $full -GitDiffArgs (@('diff', 'HEAD') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=patch-incomplete" }
+        if (Test-DirtyDiffHasGitlink $patchEv.Bytes) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved" }
+        if (-not (Test-DirtyEvidenceUnchanged -Path $tmp -Full $full)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=evidence-changed-after-validation" }
         # The name is the first 8 hex of the hash, lengthened until it is free or already holds these exact bytes (two different diffs may share a prefix).
-        $bytes = (Get-Item -LiteralPath $tmp).Length
+        $bytes = $patchEv.Bytes.Length
+        # A placement that moved a file but could not prove its bytes names it as unverified=<path> after the evidence placed so far (r8, adversary 98e161fc-A3).
+        $placeFailed = { param($r) "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($r.Reason)$evidence" + $(if ($r.Placed) { " unverified=$($r.Placed)" } else { '' }) }
         $placed = Move-DirtyEvidenceToFreeName -Tmp $tmp -Dir $Dest -Stem 'dirty-worktree-' -Ext '.patch' -Full $full -Guard $guard
-        if (-not $placed.Path) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($placed.Reason)" }
+        if (-not $placed.Path) { if ($placed.Placed) { $tmp = $null }; return (& $placeFailed $placed) }
         if ($placed.Moved) { $tmp = $null }
         $id = $placed.Id
         $patch = $placed.Path
@@ -374,7 +407,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         [System.IO.File]::WriteAllLines($statTmp, [string[]]$status, (New-Object System.Text.UTF8Encoding($false)))  # UTF-8: quotepath=false prints literal non-ASCII names
         $statFull = (Get-FileHash -LiteralPath $statTmp -Algorithm SHA256).Hash.ToLowerInvariant()
         $statPlaced = Move-DirtyEvidenceToFreeName -Tmp $statTmp -Dir $Dest -Stem "dirty-worktree-$id.status-" -Ext '.txt' -Full $statFull -FirstName "dirty-worktree-$id.status.txt" -Guard $guard
-        if (-not $statPlaced.Path) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($statPlaced.Reason)$evidence" }
+        if (-not $statPlaced.Path) { if ($statPlaced.Placed) { $statTmp = $null }; return (& $placeFailed $statPlaced) }
         if ($statPlaced.Moved) { $statTmp = $null }
         $stat = $statPlaced.Path
         $evidence += " status=$stat"
@@ -397,7 +430,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             [System.IO.File]::WriteAllLines($mergeTmp, [string[]]$state, (New-Object System.Text.UTF8Encoding($false)))
             $mergeFull = (Get-FileHash -LiteralPath $mergeTmp -Algorithm SHA256).Hash.ToLowerInvariant()
             $mergePlaced = Move-DirtyEvidenceToFreeName -Tmp $mergeTmp -Dir $Dest -Stem 'dirty-worktree-merge-state-' -Ext '.txt' -Full $mergeFull -Guard $guard
-            if (-not $mergePlaced.Path) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($mergePlaced.Reason)$evidence" }
+            if (-not $mergePlaced.Path) { if ($mergePlaced.Placed) { $mergeTmp = $null }; return (& $placeFailed $mergePlaced) }
             if ($mergePlaced.Moved) { $mergeTmp = $null }
             return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=unmerged-index$evidence merge-state=$($mergePlaced.Path)"
         }
@@ -415,17 +448,22 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             $stagedExit = $LASTEXITCODE
             if ($stagedExit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-staged-diff-exit-$stagedExit$evidence" }
             # A full volume can cut the file short without git saying so: the staged diff must be non-empty and byte-identical to git's own stream for the index.
-            if (-not (Test-Path -LiteralPath $stagedTmp) -or (Get-Item -LiteralPath $stagedTmp).Length -eq 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
-            if (-not (Test-DirtyPatchComplete -Wt $Wt -Patch $stagedTmp -GitDiffArgs (@('diff', '--cached') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
+            # Digest first; every check below runs on these bytes, and the file must still hold them before it is placed (r8, adversary 98e161fc-A1).
+            if (-not (Test-Path -LiteralPath $stagedTmp)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
+            $stagedEv = Read-DirtyEvidence $stagedTmp
+            $stagedFull = $stagedEv.Full
+            if ($stagedEv.Bytes.Length -eq 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
+            if (-not (Test-DirtyPatchComplete -Wt $Wt -Full $stagedFull -GitDiffArgs (@('diff', '--cached') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
             # The header's promise, kept for every input: the diff must reverse-apply to the index it was taken from. --whitespace=nowarn: apply.whitespace=error in a user or repo config would
             # reject a reversed line with trailing blanks, which says nothing about whether the evidence is whole.
             & git -C $Wt apply --cached --check -R --whitespace=nowarn $stagedTmp 2>$null
             $applyExit = $LASTEXITCODE
             if ($applyExit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-not-applicable$evidence" }
-            if (Test-DirtyDiffHasGitlink $stagedTmp) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved$evidence" }
-            $stagedFull = (Get-FileHash -LiteralPath $stagedTmp -Algorithm SHA256).Hash.ToLowerInvariant()
+            if (Test-DirtyDiffHasGitlink $stagedEv.Bytes) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved$evidence" }
+            # `git apply` above read the file, not the bytes; this re-hash also proves it read the bytes that were digested (unless rewritten and put back in between: LANE-DIRTY-SAVE-RACE-CLASS-1).
+            if (-not (Test-DirtyEvidenceUnchanged -Path $stagedTmp -Full $stagedFull)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=evidence-changed-after-validation$evidence" }
             $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull -Guard $guard
-            if (-not $stagedPlaced.Path) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($stagedPlaced.Reason)$evidence" }
+            if (-not $stagedPlaced.Path) { if ($stagedPlaced.Placed) { $stagedTmp = $null }; return (& $placeFailed $stagedPlaced) }
             if ($stagedPlaced.Moved) { $stagedTmp = $null }
             $stagedOut = $stagedPlaced.Path
             $evidence += " staged=$stagedOut"
