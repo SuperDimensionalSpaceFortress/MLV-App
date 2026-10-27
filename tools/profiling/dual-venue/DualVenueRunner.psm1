@@ -2389,8 +2389,14 @@ function Test-DvReceiptValid {
                     if ([string](Get-DvProp $ev.summary 'lookReceiptSha256') -cne [string](Get-DvProp (Get-DvProp $spec 'look') 'receiptSha256')) { $invalid.Add('LOOK_RECEIPT_MISMATCH: the hashed summary.json''s lookReceiptSha256 is not the committed spec''s look.receiptSha256') }
                 }
                 # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: a speed leg's lookReceiptSha256 is accepted only when the committed spec names a pace-leg receipt with that hash
-                # (generatorArgs.lookReceiptSha256; both absent is every speed leg before this round).
-                elseif ([string](Get-DvProp (Get-DvProp $spec 'generatorArgs') 'lookReceiptSha256') -cne [string](Get-DvProp $ev.summary 'lookReceiptSha256')) { $invalid.Add('LOOK_RECEIPT_MISMATCH: the hashed summary.json''s lookReceiptSha256 is not the committed spec''s generatorArgs.lookReceiptSha256') }
+                # (generatorArgs.lookReceiptSha256; both absent is every speed leg before this round). Outside the chain above, so a product-failure terminal is held
+                # to it too: a hash its summary states must be the spec's (its summary may state none: the variant edit reaches the SUCCESS summary only).
+                if (-not $specLook) {
+                    $paceRunReceipt = [string](Get-DvProp $ev.summary 'lookReceiptSha256')
+                    if ([string](Get-DvProp (Get-DvProp $spec 'generatorArgs') 'lookReceiptSha256') -cne $paceRunReceipt -and -not ($failureTerminal -and [string]::IsNullOrEmpty($paceRunReceipt))) {
+                        $invalid.Add('LOOK_RECEIPT_MISMATCH: the hashed summary.json''s lookReceiptSha256 is not the committed spec''s generatorArgs.lookReceiptSha256')
+                    }
+                }
             }
         }
 

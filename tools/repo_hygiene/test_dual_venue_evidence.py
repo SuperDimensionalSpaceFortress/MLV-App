@@ -926,8 +926,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                 self.assertEqual(on.count("'MLVAPP_PLAYBACK_UNPACED=1',"), 1, name)
                 self.assertEqual(on.replace(line, ""), off, f"{name}: the kill switch is the only difference from the same job without it")
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
-        mapping = ("if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and [bool]$spec.generatorArgs.disablePrepPointwiseFast) "
-                   "{ $gen['DisablePrepPointwiseFast'] = $true }")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and $spec.generatorArgs.disablePrepPointwiseFast -is [bool] "
+                   "-and $spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }")
         self.assertEqual(runner.count(mapping), 1)
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
                         "the mapping must sit outside the forceLookAssist branch")
@@ -7571,6 +7571,8 @@ class LookReceiptRunnerTests(RunnerHarness, unittest.TestCase):
         for name, leg_type, args in (("working-copy hash", "speed", dict(force, lookReceipt="look-receipts/agx-off.marxml", lookReceiptSha256=hashlib.sha256(self.working).hexdigest())),
                                      ("hash alone", "speed", dict(force, lookReceiptSha256=sha)),
                                      ("receipt alone", "speed", dict(force, lookReceipt="look-receipts/agx-off.marxml")),
+                                     ("both null (adversary A2)", "speed", dict(force, lookReceipt=None, lookReceiptSha256=None)),
+                                     ("both empty", "speed", dict(force, lookReceipt="", lookReceiptSha256="")),
                                      ("not forcing Look Assist", "speed", {"lookReceipt": "look-receipts/agx-off.marxml", "lookReceiptSha256": sha}),
                                      ("on a look leg", "look", {"lookReceipt": "look-receipts/agx-off.marxml", "lookReceiptSha256": sha})):
             with self.subTest(case=name):
@@ -7622,7 +7624,15 @@ class LookReceiptValidatorTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.expect(pl[1], "ADVISORY", "with the rule removed a receipt hash on a plain leg is believed")
 
     # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the same rule for a capture-free pace leg, whose spec names its receipt in generatorArgs.
-    PACE_RULE = "elseif ([string](Get-DvProp (Get-DvProp $spec 'generatorArgs') 'lookReceiptSha256') -cne"
+    PACE_RULE = "if ([string](Get-DvProp (Get-DvProp $spec 'generatorArgs') 'lookReceiptSha256') -cne $paceRunReceipt"
+
+    def pace_failure_evidence(self, name: str, receipt_sha: str | None) -> Path:
+        summary = dict(real_failure_summary("GPU_RECON_FRAMES_ZERO"))
+        if receipt_sha is not None:
+            summary["lookReceiptSha256"] = receipt_sha
+        ev = self.evidence(name, source_frames=False, exact_summary=summary, token="GPU_RECON_FRAMES_ZERO", exit_code=13)
+        (ev / "evidence-manifest.json").unlink()   # the job writes none on a product-failure terminal
+        return ev
 
     def pace_cases(self, module: Path | None = None) -> tuple[list, list]:
         spec = json.loads(self.write_spec(leg_type="speed").read_text(encoding="utf-8"))
@@ -7635,7 +7645,12 @@ class LookReceiptValidatorTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         bound = self.evidence("pr-bound", backend="cpu", summary={"lookReceiptSha256": self.sha})
         foreign = self.evidence("pr-foreign", backend="cpu", summary={"lookReceiptSha256": "0" * 64})
         none = self.evidence("pr-none", backend="cpu")
-        rc = self.status_batch(receipt_repo, [(self.receipt_for(receipt_repo, ev, backend="cpu", spec_path=receipt_spec), None) for ev in (bound, foreign, none)], module=module)
+        # (a product-failure terminal: its summary states a hash only when the job wrote one; a stated hash is held to the spec's)
+        ft_foreign = self.pace_failure_evidence("pr-ft-foreign", "0" * 64)
+        ft_bound = self.pace_failure_evidence("pr-ft-bound", self.sha)
+        ft_none = self.pace_failure_evidence("pr-ft-none", None)
+        rc = self.status_batch(receipt_repo, [(self.receipt_for(receipt_repo, ev, backend="cpu", spec_path=receipt_spec), None) for ev in (bound, foreign, none)]
+                               + [(self.receipt_for(receipt_repo, ev, outcome="FAIL", spec_path=receipt_spec), None) for ev in (ft_foreign, ft_bound, ft_none)], module=module)
         pl = self.status_batch(plain_repo, [(self.receipt_for(plain_repo, ev, backend="cpu", spec_path=plain_spec), None) for ev in (none, bound)], module=module)
         return rc, pl
 
@@ -7644,13 +7659,17 @@ class LookReceiptValidatorTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.expect(rc[0], "ADVISORY", "the pace spec's receipt, bound in the hashed summary")
         self.expect(rc[1], "INVALID", "another receipt hash", "LOOK_RECEIPT_MISMATCH")
         self.expect(rc[2], "INVALID", "a pace receipt leg whose run recorded none", "LOOK_RECEIPT_MISMATCH")
+        self.expect(rc[3], "INVALID", "a failure terminal stating another receipt hash (adversary A1)", "LOOK_RECEIPT_MISMATCH")
+        self.expect(rc[4], "ADVISORY", "a failure terminal stating the spec's receipt hash")
+        self.expect(rc[5], "ADVISORY", "a failure terminal stating none (the variant edit reaches the success summary only)")
         self.expect(pl[0], "ADVISORY", "no receipt on either side (every earlier speed leg)")
         self.expect(pl[1], "INVALID", "a receipt hash on a speed leg whose spec names none", "LOOK_RECEIPT_MISMATCH")
 
     def test_mutation_without_the_pace_rule_a_foreign_pace_receipt_hash_is_advisory(self) -> None:
-        mutated = self.mutated_module([(self.PACE_RULE, self.PACE_RULE.replace("elseif (", "elseif ($false -and ", 1))])
+        mutated = self.mutated_module([(self.PACE_RULE, self.PACE_RULE.replace("if (", "if ($false -and ", 1))])
         rc, pl = self.pace_cases(module=mutated)
         self.expect(rc[1], "ADVISORY", "with the pace rule removed a foreign receipt hash is believed -- so the rule is what refuses it")
+        self.expect(rc[3], "ADVISORY", "with the pace rule removed a failure terminal's foreign hash is believed")
         self.expect(pl[1], "ADVISORY", "with the pace rule removed a receipt hash on a plain speed leg is believed")
 
 

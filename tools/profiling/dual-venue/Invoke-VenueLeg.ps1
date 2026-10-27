@@ -423,6 +423,8 @@ try {
         $receiptCommit = if ($OfflineTestMode) { [string](& git -C $RepoRoot rev-parse --verify HEAD 2>$null) } else { [string]$sources.headCommit }
         $lookReceipt = Read-DvCommittedLookReceipt -RepoRoot $RepoRoot -Commit $receiptCommit.Trim() -Look $(if ($isLook) { $spec.look } else { $paceReceiptLook })
         if (-not $lookReceipt.ok) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
+        # (a pace leg that names the keys must name a receipt: empty or null values are refused, never read as "no receipt")
+        if ($null -ne $paceReceiptLook -and -not $lookReceipt.present) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
         if ($lookReceipt.present) {
             $lookReceiptPath = Join-Path $workDirResolved "$jobStem.look-receipt.marxml"
             [IO.File]::WriteAllBytes($lookReceiptPath, $lookReceipt.bytes)
@@ -470,8 +472,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['warmReuseMissDump'] -and [bool]$spec.generatorArgs.warmReuseMissDump) { $gen['WarmReuseMissDump'] = $true }
         # CUDA-HEADROOM-1: an unpaced throughput leg (no pace guard, drop-frame off), for any leg; judged below by the app's own pace_unpaced line.
         if ($spec.generatorArgs.PSObject.Properties['unpaced'] -and [bool]$spec.generatorArgs.unpaced) { $gen['Unpaced'] = $true }
-        # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the #680 prep pointwise fast path's kill switch, for any leg.
-        if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and [bool]$spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }
+        # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the #680 prep pointwise fast path's kill switch, for any leg. Only a JSON true arms it (a string "false" is not true).
+        if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and $spec.generatorArgs.disablePrepPointwiseFast -is [bool] -and $spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }
