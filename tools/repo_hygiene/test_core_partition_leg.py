@@ -816,7 +816,15 @@ $pB = @{ exists = $true; length = 190; monoMs = [int64]8995000 }
 $pS = @{ exists = $true; length = 200; monoMs = [int64]9000000; before = "26.10.2026,12:00:00,x,20,10,No,No`n26.10.2026,12:00"; window = ''; windowStartsMidRow = $false }
 $pBok = $pB.Clone(); $pBok.length = 180
 $r.adversaryR7 = @([string]$a1.reasons['rows'], $a1.rows, $a1.pkgWattsMean, $a2.rows, $a2.pkgWattsMean, $a2.pkgTempCAtStart, [string]$a2.reasons['pkgTempCAtStart'],
-    [string](Get-CorePartitionFeedSummary $pS $a2E 120 $pB).reasons['pkgTempCAtStart'], (Get-CorePartitionFeedSummary $pS $a2E 120 $pBok).pkgTempCAtStart)# sol r6 CP-07: the one guarded number parse (absent in a pre-r7 generator)
+    [string](Get-CorePartitionFeedSummary $pS $a2E 120 $pB).reasons['pkgTempCAtStart'], (Get-CorePartitionFeedSummary $pS $a2E 120 $pBok).pkgTempCAtStart)# adversary r7 (6fac125a) A2 (literal): the same file, a day-old data row before the pre-helper read; only a bare newline (length 35) or a header
+# line (length 77) appended after it; and the control, a new data row appended after it
+$dayOld = "25.10.2026,01:00:00,x,75,50,No,No`n"
+$b2B = @{ exists = $true; length = 34; monoMs = [int64]1000 }
+$b2Nl = @{ exists = $true; length = 35; monoMs = [int64]2000; before = $dayOld + "`n"; window = ''; windowStartsMidRow = $false }
+$b2Hd = @{ exists = $true; length = 77; monoMs = [int64]2000; before = $dayOld + "Date,Time,x,Temp,Power,Throttle1,Throttle2`n"; window = ''; windowStartsMidRow = $false }
+$b2Ok = @{ exists = $true; length = 68; monoMs = [int64]2000; before = $dayOld + "26.10.2026,01:00:00,x,61,40,No,No`n"; window = ''; windowStartsMidRow = $false }
+$b2E = @{ exists = $true; length = 200; monoMs = [int64]22000; before = ''; window = "26.10.2026,01:00:20,x,70,45,No,No`n"; windowStartsMidRow = $false; replaced = $false; truncated = $false }
+$r.adversaryR7b = @(foreach ($sm in @($b2Nl, $b2Hd, $b2Ok)) { $e2 = $b2E.Clone(); $x = Get-CorePartitionFeedSummary $sm $e2 120 $b2B; $x.pkgTempCAtStart; [string]$x.reasons['pkgTempCAtStart'] })# sol r6 CP-07: the one guarded number parse (absent in a pre-r7 generator)
 $r.number = 'absent'
 if (Get-Command ConvertFrom-CorePartitionNumber -ErrorAction SilentlyContinue) {
     $big = ('{"v":99999999999999999999}' | ConvertFrom-Json).v
@@ -1050,7 +1058,10 @@ class CorePartitionPureHelperTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls._tmp = tempfile.TemporaryDirectory(prefix="core-partition-feed-")
         cls.addClassCleanup(cls._tmp.cleanup)
-        proc = run_pwsh(["-Command", LIFT + FIXTURES], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name})
+        # a file, not -Command: the fixtures outgrew the 32767-char command line in r7
+        script = Path(cls._tmp.name) / "fixtures.ps1"
+        script.write_text(LIFT + FIXTURES, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_TMP": cls._tmp.name})
         cls.raw = proc
         cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
 
@@ -1238,6 +1249,8 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         self.assertEqual(a[3:5], [1, 45.0], f"A2: the 20 s window itself is fresh: {a}")
         self.assertEqual(a[5:7], [None, "feed-freshness-unverified"], f"A2: a replaced file's day-old row was the start temperature: {a}")
         self.assertEqual(a[7:], ["feed-freshness-unverified", 20.0], f"only a complete row ending after the pre-helper offset is fresh: {a}")
+        # adversary r7 (6fac125a) A2: a bare newline or a header line appended after the pre-helper read proves no new data row
+        self.assertEqual(self.r["adversaryR7b"], [None, "feed-freshness-unverified", None, "feed-freshness-unverified", 61.0, ""], self.r["adversaryR7b"])
 
     def test_one_guarded_parse_reads_every_record_number(self) -> None:
         """sol r6 CP-07: JSON numbers and invariant numeric text parse; text, flags, arrays, fractions, out-of-range and non-finite values do not."""

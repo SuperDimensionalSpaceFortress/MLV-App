@@ -4379,17 +4379,26 @@ function Test-CorePartitionFeedFresh($Base, $Mark, [double]$StaleSec, [bool]$Row
     $null
 }
 
-# PURE. adversary r7 (15b3bbf7) A2: whether the start mark's newest complete row was appended to the same file after the pre-helper read ($Base):
-# both marks are the same file (file id and creation time; a replaced file proves no write of its rows) and the newline that ends the last complete
-# row of $Start.before sits at or after $Base's length (byte offset), i.e. it was written after that read.
+# PURE. adversary r7 (15b3bbf7) A2: whether the start mark's newest complete DATA row (the start temperature's row) was appended to the same file
+# after the pre-helper read ($Base): both marks are the same file (file id and creation time; a replaced file proves no write of its rows) and the
+# newline that ends that row sits at or after $Base's length (byte offset), i.e. it was written after that read. adversary r7 (6fac125a) A2: a bare
+# newline or a header line appended after the read is no data row, so the day-old row before it stays unproven. A data row is
+# ConvertFrom-CorePartitionFeedRows's (starts with a digit, 7+ columns).
 function Test-CorePartitionFeedRowAfter($Base, $Start) {
     if ($null -eq $Base -or $null -eq $Start -or -not $Base.exists -or -not $Start.exists) { return $false }
     if ([string]$Base.fileId -ne [string]$Start.fileId -or [string]$Base.created -ne [string]$Start.created) { return $false }
     $bl = (ConvertFrom-CorePartitionNumber $Base.length 'int64').value; $sl = (ConvertFrom-CorePartitionNumber $Start.length 'int64').value
-    $before = [string]$Start.before
-    $nl = $before.LastIndexOf("`n")
-    if ($null -eq $bl -or $null -eq $sl -or $nl -lt 0) { return $false }
-    ($sl - [Text.Encoding]::UTF8.GetByteCount($before.Substring($nl + 1)) - 1) -ge $bl
+    if ($null -eq $bl -or $null -eq $sl) { return $false }
+    # the last element is the text after the final newline (an unfinished row, or empty); only the lines before it are complete
+    $lines = ([string]$Start.before).Split("`n")
+    for ($k = $lines.Count - 2; $k -ge 0; $k--) {
+        $c = $lines[$k].TrimEnd("`r").Split(',')
+        if ($c.Count -ge 7 -and $c[0].Length -ge 1 -and [char]::IsDigit($c[0], 0)) {
+            $after = [Text.Encoding]::UTF8.GetByteCount(($lines[($k + 1)..($lines.Count - 1)]) -join "`n")
+            return (($sl - $after - 1) -ge $bl)
+        }
+    }
+    $false
 }
 
 # PURE. The feed rows appended between the launch mark and the end mark, plus the newest row before the launch (the start temperature).
