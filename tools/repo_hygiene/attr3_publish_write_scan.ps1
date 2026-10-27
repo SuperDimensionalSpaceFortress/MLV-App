@@ -1195,12 +1195,17 @@ function Test-SessionCarrierCommand($Command) {
     # prefix of it, or a splat that may hold it).
     $names = @(Get-ResolvedCommandNames $Command | Where-Object { $script:sessionCarrierCommands -contains $_ })
     if ($names.Count -eq 0) { return $false }
-    # Get-Command on one constant executable name (`Get-Command python.exe`, the real generator's probe) hands back an ApplicationInfo,
-    # which carries no module.
+    # Get-Command on one constant executable name selected as an application only (`Get-Command python.exe -CommandType Application`)
+    # hands back an ApplicationInfo, which carries no module. r12b (Dot B13): the name alone proves nothing, since a supplied module
+    # can export `function python.exe`, whose FunctionInfo .Module reaches its session state; so the type set must be exactly one
+    # constant Application (-CommandType or its alias -Type, any prefix, once), else the selection is unproven.
     if (@($names | Where-Object { @('get-command', 'gcm') -notcontains $_ }).Count -eq 0) {
-        $named = @(Get-NamedArguments $Command @('Name') | Where-Object { $_ -is [System.Management.Automation.Language.Ast] })
-        $operand = if ($named.Count -eq 1) { $named[0] } elseif ($named.Count -eq 0 -and $Command.CommandElements.Count -gt 1 -and $Command.CommandElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $Command.CommandElements[1] } else { $null }
-        $commandName = if ($null -eq $operand -or @($Command.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count -gt 0) { $null } elseif ($operand -is [System.Management.Automation.Language.StringConstantExpressionAst]) { [string]$operand.Value } else { Get-SingleConstant $operand }
+        if (@($Command.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count -gt 0) { return $true }
+        $types = Get-NamedArguments $Command @('CommandType') 'Get-Command'
+        if (@($types).Count -ne 1 -or $null -eq $types[0] -or (Get-SingleConstant $types[0]) -ine 'Application') { return $true }
+        $named = Get-NamedArguments $Command @('Name')
+        $operand = if (@($named).Count -eq 1) { $named[0] } elseif (@($named).Count -eq 0 -and $Command.CommandElements.Count -gt 1 -and $Command.CommandElements[1] -isnot [System.Management.Automation.Language.CommandParameterAst]) { $Command.CommandElements[1] } else { $null }
+        $commandName = if ($null -eq $operand) { $null } elseif ($operand -is [System.Management.Automation.Language.StringConstantExpressionAst]) { [string]$operand.Value } else { Get-SingleConstant $operand }
         if ($null -ne $commandName -and $commandName -match '(?i)^[^*?\[\]]+\.(exe|com|cmd|bat)$') { return $false }
         return $true
     }

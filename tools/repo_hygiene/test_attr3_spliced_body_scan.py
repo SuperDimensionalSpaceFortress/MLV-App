@@ -1852,6 +1852,9 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
     RAW_WRITE = "    New-Item -ItemType Directory -Path (Join-Path $Pub 'sneaky') -Force | Out-Null"
     PSR_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}' -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')"
     DEF_CALL = "Get-AttrCudaEmbeddedFunctionSource -Name '{name}'"
+    B13_PRE = "Import-Module '{dir}\\Extractor.psm1'; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
+    B13_SET = "){{$c.Module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')}}"
+    B13_CTL = "$table = ConvertFrom-Json '{{\"venues\":{{\"a\":1}}}}'\n$venue = 'a'\n$entry = $table.venues.$venue\nforeach($c in @(Get-Command "
     CALLS = {
         # Dot B11, verbatim.
         "DotB11": ("[CmdletBinding()]param()\n$PSCmdlet.('GetVariableValue')(('PS'+'Default'+'Parameter'+'Values'))"
@@ -1888,6 +1891,23 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         "AdvR12PipelineModule": ("Import-Module '{dir}\\Extractor.psm1'; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
                                  "Get-Module Extractor | ForEach-Object {{ $_.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}') }}", DEF_CALL),
         "AdvR12ModuleType": ("$m = [psmoduleinfo]$null; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2\n$m.$sn.$vn.Set('PSScriptRoot','C:\\dirty')", PSR_CALL),
+        # r12b (Dot B13), verbatim: the supplied Extractor.psm1 also exports `function python.exe`, so Get-Command python.exe
+        # -CommandType Function hands back its FunctionInfo, whose .Module reaches the extractor's session state.
+        "DotB13": ("Import-Module '{dir}\\Extractor.psm1'; $s1='Session'; $s2='State'; $sn=$s1+$s2; $v1='PS'; $v2='Variable'; $vn=$v1+$v2; "
+                   "foreach($c in @(Get-Command python.exe -CommandType Function)){{$c.Module.$sn.$vn.Set('script:AttrCudaModulePath','{dirty}')}}", DEF_CALL),
+        # Its siblings: every type set that is not exactly Application, and a name the scan cannot fix.
+        "B13Alias": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType Alias)" + B13_SET, DEF_CALL),
+        "B13All": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType All)" + B13_SET, DEF_CALL),
+        "B13NoType": (B13_PRE + "foreach($c in @(Get-Command python.exe)" + B13_SET, DEF_CALL),
+        "B13NamedNoType": (B13_PRE + "foreach($c in @(Get-Command -Name python.exe -ErrorAction SilentlyContinue)" + B13_SET, DEF_CALL),
+        "B13TypeAlias": (B13_PRE + "foreach($c in @(Get-Command python.exe -Type Function)" + B13_SET, DEF_CALL),
+        "B13TypeList": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType Application, Function)" + B13_SET, DEF_CALL),
+        "B13TypeString": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType 'Application,Function')" + B13_SET, DEF_CALL),
+        "B13TypeVariable": (B13_PRE + "$t='Function'; foreach($c in @(Get-Command python.exe -CommandType $t)" + B13_SET, DEF_CALL),
+        "B13TypeColon": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType:Function)" + B13_SET, DEF_CALL),
+        "B13TypeTwice": (B13_PRE + "foreach($c in @(Get-Command python.exe -CommandType Application -CommandType Function)" + B13_SET, DEF_CALL),
+        "B13FoldedName": (B13_PRE + "foreach($c in @(Get-Command ('python'+'.exe') -CommandType Function)" + B13_SET, DEF_CALL),
+        "B13VariableName": (B13_PRE + "$n='python.exe'; foreach($c in @(Get-Command $n -CommandType Application)" + B13_SET, DEF_CALL),
     }
     # Not unproven: a computed member of parsed data (the real playback-attr-3-cuda-job.ps1 shape), a folded name that is not a route.
     CALL_CONTROLS = {
@@ -1895,6 +1915,10 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         "CtlFoldedOther": ("$o = @{{ a = 1 }}\n$v = $o.('a' + '')", PSR_CALL, "Clean.psm1"),
         # The real playback-attr-3-cuda-job.ps1 template shape: a computed member of a pipeline item in a tree with no session root.
         "CtlPipelineData": ("$rows = @(@{{ a_ms = 1 }})\n$name = 'a'\n$v = @($rows | ForEach-Object {{ [double]$_.$($name + '_ms') }})", PSR_CALL, "Clean.psm1"),
+        # r12b control: a proven application-only selection hands back only ApplicationInfo, which carries no module.
+        "CtlGcmApplication": (B13_CTL + "python.exe -CommandType Application)){{ $p = $c.Source }}", PSR_CALL, "Clean.psm1"),
+        "CtlGcmApplicationNamed": (B13_CTL + "-Name 'python.exe' -CommandType Application -ErrorAction SilentlyContinue)){{ $p = $c.Source }}", PSR_CALL, "Clean.psm1"),
+        "CtlGcmApplicationColon": (B13_CTL + "python.exe -CommandType:Application)){{ $p = $c.Source }}", PSR_CALL, "Clean.psm1"),
     }
     BODIES = {
         # r10 adversary A1, receiver, verbatim.
@@ -1922,7 +1946,9 @@ class SplicedBodyScanConstantMemberTests(unittest.TestCase):
         dirty = d / "Dirty.psm1"
         names = list(cls.CALLS) + list(cls.CALL_CONTROLS)
         clean = "".join(f"function {n} {{\n    Get-Date\n}}\n\n" for n in names)
-        (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n" + clean, encoding="utf-8")
+        # r12b (Dot B13): the supplied extractor module also exports a function named like an executable.
+        (d / "Extractor.psm1").write_text("function Get-AttrCudaEmbeddedFunctionSource {\n    param([string[]]$Name, [string]$ModulePath)\n}\n\n"
+                                          "function python.exe {\n    Get-Date\n}\n\n" + clean, encoding="utf-8")
         (d / "Clean.psm1").write_text(clean, encoding="utf-8")
         dirty.write_text("".join(f"function {n} {{\n{cls.RAW_WRITE}\n}}\n\n" for n in names), encoding="utf-8")
         sources = []
