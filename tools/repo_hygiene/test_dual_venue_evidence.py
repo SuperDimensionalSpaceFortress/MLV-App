@@ -164,7 +164,11 @@ LOOK_RECEIPT_BASE = "6b6f66f52d5344a97de5068b2e7cae1a61edf295"   # the #328 head
 # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the L1..L4 self-heal proof, ONE cuda speed leg whose job runs three pre-launches and the measured run on one settings store.
 SELF_HEAL_LEG = "legs/m16-1243-gpu-self-heal-l1-l4.json"
 SHIPPED_LEGS = (*SHIPPED_LEGS, SELF_HEAL_LEG)
-SHIPPED_LEGS_PS = ", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
+# VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1: the s2 Cinematic AgX-off look leg run unpaced at swap interval 0 (the s2 headroom under the pace cap), keyed to its
+# paced source. A look leg, because only a look leg carries a look receipt; not in AGXOFF_LEGS, whose members are byte copies of their source.
+AGXOFF_UNPACED_LEGS = {"legs/m16-1243-look-scale2-cinematic-agxoff-unpaced.json": "legs/m16-1243-look-scale2-cinematic-agxoff.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_UNPACED_LEGS)
+SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
 LAUNCHER = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
@@ -6829,12 +6833,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS):
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS):
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -6871,6 +6875,12 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
+            elif spec["card"] == "VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1":   # the unpaced s2 AgX-off look leg, named by flavor
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-look-scale2-(cinematic|film|vision50d)-agxoff-unpaced$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+                self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
+                self.assertEqual(spec["look"]["receipt"], "look-receipts/agx-off.marxml", path.name)
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
@@ -7089,6 +7099,7 @@ NO_PACE_TWIN_BY_DESIGN = {
     "m16-1243-look-scale2-vision50d": "Vision50d flavor-parity contact-sheet leg at scale 2; no merged PR cites an absolute figure from it",
     **{f"m16-1243-look-scale2-{flavor}-agxoff": "carries a look receipt (agx-off.marxml) that a speed leg cannot carry, so no speed leg can be the same condition"
        for flavor in ("cinematic", "film", "vision50d")},
+    "m16-1243-look-scale2-cinematic-agxoff-unpaced": "an unpaced headroom leg carrying a look receipt; no speed leg can carry the receipt, and its timing claim is the unpaced rate, not a paced figure",
 }
 
 
@@ -7302,6 +7313,32 @@ class LookReceiptLegSpecTests(unittest.TestCase):
                 text = lambda n: (DV / "legs" / f"{n}.json").read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
                 diff = [(a, b) for a, b in zip(text(agx_id).split("\n"), text(source_id).split("\n")) if a != b]
                 self.assertEqual(len(diff), 2, "byte copies: only the legId line and the look line differ")
+
+    def test_the_agxoff_unpaced_leg_is_its_source_plus_only_the_unpaced_headroom_keys(self) -> None:
+        """VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1: the AgX-off look leg run unpaced at swap interval 0, so its s2 rate is not pinned at the pace cap. It is its
+        paced source except legId, card, playSeconds (the headroom legs' 20 s), the three unpaced-headroom generatorArgs, the tearing reason those force,
+        and one contact-sheet grab (a look leg grabs inside the timed Play); the receipt and its bound hash are the source's own."""
+        for rel, source_rel in AGXOFF_UNPACED_LEGS.items():
+            with self.subTest(leg=rel):
+                leg = json.loads((DV / rel).read_text(encoding="utf-8"))
+                source = json.loads((DV / source_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(leg, self.schema)
+                self.assertEqual(leg["legId"], Path(rel).stem)
+                self.assertEqual(leg["card"], "VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1")
+                self.assertEqual(leg["playSeconds"], 20)
+                for field in ("receipt", "receiptSha256"):
+                    self.assertEqual(leg["look"][field], source["look"][field], field)
+                self.assertEqual(leg["look"]["receiptSha256"], self.receipt_sha, "the spec binds the committed receipt's bytes")
+                self.assertEqual(leg["look"]["contactSheetFrames"], 1)
+                self.assertEqual(leg["generatorArgs"], dict(source["generatorArgs"], swapInterval=0, unpaced=True, presentTrace=True))
+                self.assertEqual(list(leg["generatorArgs"]), [*source["generatorArgs"], "swapInterval", "unpaced", "presentTrace"])
+                self.assertNotIn("presentTearingExpectedReason", source)
+                self.assertGreaterEqual(len(leg["presentTearingExpectedReason"]), 12)
+                self.assertEqual(leg, dict(source, legId=leg["legId"], card=leg["card"], playSeconds=20, generatorArgs=leg["generatorArgs"],
+                                           presentTearingExpectedReason=leg["presentTearingExpectedReason"], look=dict(source["look"], contactSheetFrames=1)))
+                self.assertEqual([k for k in leg if k != "presentTearingExpectedReason"], list(source), "the source's keys in the source's order")
+                text = lambda r: (DV / r).read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
+                self.assertEqual(text(rel).split('"criteria"', 1)[1], text(source_rel).split('"criteria"', 1)[1], "criteria are a byte copy")
 
     def test_no_leg_spec_that_existed_at_the_base_changed(self) -> None:
         if not _base_commit_available():
