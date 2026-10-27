@@ -605,7 +605,8 @@ function Get-VenueStagedBuildManifest {
     .OUTPUTS
     [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
-    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][int]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null)
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][int]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
+        [switch]$VerifyArtifacts, [ValidateRange(1, 600)][int]$ArtifactTimeoutSec = 300, [scriptblock]$ArtifactProbeScript = $null)
     $path = $AgentShare.TrimEnd('\') + '\cache\playback-attr-3-cuda-' + $SourceCommit.Substring(0, 12) + '-build.json'
     # -ProbeScript is the offline test seam for a read that never answers; production passes none.
     $read = $(if ($null -ne $ProbeScript) { $ProbeScript } else {
@@ -630,6 +631,8 @@ function Get-VenueStagedBuildManifest {
                 foreach ($k in 'packageZip', 'exe', 'dll') {
                     $o = $m.PSObject.Properties[$k]; $v = $(if ($null -ne $o -and $o.Value -is [System.Management.Automation.PSCustomObject] -and $o.Value.PSObject.Properties['sha256']) { $o.Value.sha256 } else { $null })
                     'A:' + $k + '=' + $(if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'ok' } else { 'bad' })
+                    # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: the digest itself, for -VerifyArtifacts (the same bytes as the facts above)
+                    if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'H:' + $k + '=' + $v.ToLowerInvariant() }
                 }
             } })
     $r = Invoke-VenueBoundedRead -ScriptText $read.ToString() -Argument $path -TimeoutSec $TimeoutSec
@@ -649,9 +652,56 @@ function Get-VenueStagedBuildManifest {
                 elseif ($badArt = @('packageZip', 'exe', 'dll' | Where-Object { $facts -cnotcontains "A:$_=ok" })) { "ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING the staged manifest carries no 64-hex sha256 for $($badArt -join ', ') (the leg job hashes the cached artifact against it)" }
                 else { '' })
         }
-        return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null; contentProblem = $problem }
+        # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 (Dot 6440180395): a manifest whose digests are well-formed is not yet a build the leg job can run -- it hashes the CACHED exe, dll and
+        # package zip against them (playback-attr-3-cuda-job.ps1 $manifestChecks) and throws after the lease opened when one is absent or differs. With -VerifyArtifacts the same
+        # hash is taken here, once the manifest content is sound: artifactProblem is '' (all three match), BUILD_ARTIFACT_MISSING or BUILD_ARTIFACT_MISMATCH (first word = the typed
+        # code), or $null (not asked, or the digests were not read). An artifact read that does not answer is UNREACHABLE, as a manifest read that does not answer is.
+        $artifactProblem = $null
+        if ($VerifyArtifacts -and $problem -ceq '') {
+            $names = Get-VenueStagedArtifactNames -SourceCommit $SourceCommit
+            $cacheDir = $AgentShare.TrimEnd('\') + '\cache'
+            $items = @(foreach ($k in 'packageZip', 'exe', 'dll') {
+                    $h = @($r.value | Select-Object -Skip 1 | ForEach-Object { [string]$_ } | Where-Object { $_.StartsWith("H:$k=") }) | Select-Object -First 1
+                    @{ label = $k; name = $names[$k]; path = ($cacheDir + '\' + $names[$k]); sha = $h.Substring(("H:$k=").Length) }
+                })
+            $probe = $(if ($null -ne $ArtifactProbeScript) { $ArtifactProbeScript } else {
+                    {
+                        param($items)
+                        # a read that fails ends the read (UNREACHABLE), never "absent": an unreadable file is not a missing one
+                        $ErrorActionPreference = 'Stop'
+                        foreach ($i in $items) {
+                            if (-not (Test-Path -LiteralPath $i.path -PathType Leaf)) { 'MISSING:' + $i.label + ':' + $i.name; continue }
+                            $fs = [IO.File]::Open($i.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                            try {
+                                $sha = [Security.Cryptography.SHA256]::Create()
+                                try { $got = ([BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+                            } finally { $fs.Dispose() }
+                            if ($got -cne $i.sha) { 'MISMATCH:' + $i.label + ':' + $i.name + ':' + $got }
+                        }
+                    } })
+            $ar = Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $ArtifactTimeoutSec
+            if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null } }
+            $lines = @($ar.value | ForEach-Object { [string]$_ })
+            $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
+            $differs = @($lines | Where-Object { $_.StartsWith('MISMATCH:') } | ForEach-Object { $p = $_.Split(':', 4); "$($p[1]) $($p[2]) hashes to $($p[3])" })
+            $artifactProblem = $(if ($missing.Count) { "BUILD_ARTIFACT_MISSING the cached artifact is absent from $cacheDir`: $($missing -join '; ') (the leg job hashes it against the build manifest and throws after the lease opened)" }
+                elseif ($differs.Count) { "BUILD_ARTIFACT_MISMATCH the cached artifact does not hash to the build manifest's digest in ${cacheDir}: $($differs -join '; ') (the leg job throws after the lease opened)" }
+                else { '' })
+        }
+        return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null; contentProblem = $problem; artifactProblem = $artifactProblem }
     }
-    [pscustomobject]@{ state = 'NOT_STAGED'; sha256 = $null; path = $path; error = $null; contentProblem = $null }
+    [pscustomobject]@{ state = 'NOT_STAGED'; sha256 = $null; path = $path; error = $null; contentProblem = $null; artifactProblem = $null }
+}
+
+function Get-VenueStagedArtifactNames {
+    <#
+    .SYNOPSIS
+    The cached artifact file names for a build, by the formulas Get-AttrCudaArtifactNames (tools/profiling/bachelor/AttrCudaArtifacts.psm1) derives and the leg job reads from the
+    agent cache. Kept here as a copy because this module imports nothing from the bachelor tree; test_venue_lease_batch.py pins the two together.
+    #>
+    param([Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit)
+    $s = $SourceCommit.Substring(0, 12)
+    @{ exe = "MLVApp-playback-attr-3-cuda-$s.exe"; dll = "igpu_recon_cuda-playback-attr-3-cuda-$s.dll"; packageZip = "MLVApp-playback-attr-3-cuda-$s-pkg.zip" }
 }
 
 $script:VenueAbandonedReads = 0
@@ -1232,6 +1282,6 @@ function Get-VenueDriverScriptMissing {
 Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
-    Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
+    Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
     Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

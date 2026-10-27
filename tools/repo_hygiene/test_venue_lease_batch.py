@@ -1786,11 +1786,24 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         cache = self.share / "cache"
         cache.mkdir(exist_ok=True)
         p = cache / f"playback-attr-3-cuda-{commit[:12]}-build.json"
-        doc = {"sourceCommit": commit, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **ARTIFACT_SHAS, "body": body}
+        import hashlib
+        # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: the three cached artifacts the manifest digests name are staged beside it, each hashing to its digest (an override replaces the
+        # digest and leaves that artifact unstaged, as the digest-shape cases below need)
+        digests = {}
+        for label in ARTIFACT_SHAS:
+            content = f"{label}:{commit}:{body}".encode("utf-8")
+            self.artifact_path(commit, label).write_bytes(content)
+            digests[label] = {"sha256": hashlib.sha256(content).hexdigest()}
+        doc = {"sourceCommit": commit, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **digests, "body": body}
         doc.update(override)
         p.write_text(json.dumps({k: v for k, v in doc.items() if v is not ABSENT}), encoding="utf-8")
-        import hashlib
         return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    def artifact_path(self, commit: str, label: str) -> Path:
+        # the names the leg job reads from the agent cache (Get-AttrCudaArtifactNames)
+        s = commit[:12]
+        name = {"exe": f"MLVApp-playback-attr-3-cuda-{s}.exe", "dll": f"igpu_recon_cuda-playback-attr-3-cuda-{s}.dll", "packageZip": f"MLVApp-playback-attr-3-cuda-{s}-pkg.zip"}[label]
+        return self.share / "cache" / name
 
     def item(self, spec: Path, arm: str, commit: str, backend: str = "cpu", manifest: str | None = None) -> dict:
         return {"legSpec": str(spec), "backend": backend, "sourceCommit": commit, "buildManifestSha256": manifest or self.manifests[commit], "arm": arm}
@@ -3011,6 +3024,62 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING", r.stderr)
         self.assertIn("for exe ", r.stderr)
+
+    # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 (Dot 6440180395 on #684): the preflight checked that the manifest's artifact digests were well-formed, never that the cached artifacts
+    # exist and hash to them; the leg job found out after the lease opened (playback-attr-3-cuda-job.ps1 $manifestChecks), so the lease was spent and nothing was measured.
+    def test_artifact_preflight_a_staged_build_whose_cached_artifact_is_absent_is_refused_before_the_claim_and_the_lease(self) -> None:
+        a, c = self.commit_a, "3" * 40
+        for label in ("exe", "dll", "packageZip"):
+            with self.subTest(absent=label):
+                manifest = self.stage(c, f"no {label}")
+                self.artifact_path(c, label).unlink()
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_ARTIFACT_MISSING item=2 ")
+
+    def test_artifact_preflight_a_staged_build_whose_cached_artifact_differs_from_its_digest_is_refused_before_the_claim_and_the_lease(self) -> None:
+        a, c = self.commit_a, "3" * 40
+        for label in ("exe", "dll", "packageZip"):
+            with self.subTest(differs=label):
+                manifest = self.stage(c, f"stale {label}")
+                self.artifact_path(c, label).write_bytes(b"a different build's bytes")
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_ARTIFACT_MISMATCH item=2 ")
+
+    def test_artifact_preflight_the_refusal_names_the_artifact_and_a_fully_staged_build_still_opens_the_lease(self) -> None:
+        c = "3" * 40
+        manifest = self.stage(c, "named")
+        self.artifact_path(c, "dll").unlink()
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c, manifest=manifest)]))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("igpu_recon_cuda-playback-attr-3-cuda-333333333333.dll", r.stderr)
+        # the control: every artifact staged and matching
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        self.events.unlink(missing_ok=True)
+        ok = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "B", self.commit_b, "cuda")]))
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, self.kinds())
+
+    def test_artifact_preflight_an_artifact_that_changes_while_the_batch_waits_on_a_foreign_claim_is_refused_after_the_wait(self) -> None:
+        self._fresh_run_dir()
+        exe = self.artifact_path(self.commit_a, "exe")
+        original = exe.read_bytes()
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        try:
+            code, so, se = self._during_claim_wait(args, e, lambda: exe.write_bytes(b"replaced while the batch waited"))
+        finally:
+            exe.write_bytes(original)
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=BUILD_ARTIFACT_MISMATCH item=1 ", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
+
+    def test_artifact_preflight_the_artifact_names_are_the_ones_the_leg_job_derives(self) -> None:
+        script = (f"Import-Module '{ROOT / 'tools' / 'profiling' / 'bachelor' / 'AttrCudaArtifacts.psm1'}' -Force -DisableNameChecking\n"
+                  "$n = Get-AttrCudaArtifactNames -SourceCommit ('3' * 40)\n"
+                  "ConvertTo-Json -Compress -InputObject ([ordered]@{ exe = $n.exeName; dll = $n.reconName; packageZip = $n.packageZipName })\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        for label, name in json.loads(out.stdout).items():
+            self.assertEqual(self.artifact_path("3" * 40, label).name, name, label)
 
     # r13 (adversary r13 A2): the open can wait long in the agent's gate, and a link to an output made in that wait was written through by the first probe (gate.log).
     def test_r13_adv_a2_an_output_alias_added_while_the_open_waits_is_refused_before_any_probe(self) -> None:

@@ -87,9 +87,10 @@
 #      file, then legs\<name>); backend is cuda or cpu; arm is a free label (A, B, base, cand...). It is a parameter set of its own: -LegSpec / -LegSet / -Repeats /
 #      -Backend / -SourceCommit / -BuildManifestSha256 cannot be passed with it, and the scalar call is unchanged (same receipts, rows and exit codes).
 #      a. EVERY item is validated BEFORE any claim or lease: the hex patterns of the scalar form, backend, arm, the leg spec found, and its build STAGED on the
-#         venue with exactly that manifest (Get-VenueStagedBuildManifest, the file Invoke-VenueLeg hashes). One bad item refuses the whole plan on stderr,
+#         venue with exactly that manifest (Get-VenueStagedBuildManifest, the file Invoke-VenueLeg hashes) and its cached exe, dll and package zip present and
+#         hashing to the manifest's digests (-VerifyArtifacts; BUILD_ARTIFACT_MISSING / BUILD_ARTIFACT_MISMATCH). One bad item refuses the whole plan on stderr,
 #         BATCH_USAGE LEG_PLAN_REFUSED reason=<BAD_ITEM_SHAPE | BAD_SOURCE_COMMIT | BAD_MANIFEST_SHA256 | BAD_BACKEND | BAD_ARM | LEG_SPEC_MISSING | BUILD_NOT_STAGED |
-#         BUILD_MANIFEST_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
+#         BUILD_MANIFEST_MISMATCH | BUILD_ARTIFACT_MISSING | BUILD_ARTIFACT_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
 #         halfway on a build. A spec that is not a mlv-app/dual-venue-leg/v1 spec, does not list the item's backend, or has a field Invoke-VenueLeg casts or validates
 #         (playSeconds, visualCapture and its opt-out reason, scaleFactor, acceptedEffectiveScale) it would throw on, is refused here (LEG_SPEC_INVALID, BAD_BACKEND)
 #         because Invoke-VenueLeg would throw on it only after the lease is open.
@@ -532,13 +533,14 @@ function Get-InputContentRefusal {
             $sr = @(Get-LegSpecRefusal $g.path $g.backend)
             if ($sr[0]) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = [string]$sr[0]; why = [string]$sr[1] } }
         } elseif ($g.kind -ceq 'build') {
-            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec 30
+            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec 30 -VerifyArtifacts
             $short = $g.commit.Substring(0, 12)
             if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short could not be read after the claim wait at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no lease is opened" } }
             if ($st.state -cne 'STAGED' -and $st.state -cne 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short read as '$($st.state)' after the claim wait; only STAGED with the validated digest opens a lease" } }
             if ($st.state -ceq 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_NOT_STAGED'; why = "no staged build manifest for $short at $($st.path) any more; the runner stages and builds nothing" } }
             if ($st.state -ceq 'STAGED' -and $st.sha256 -cne $g.sha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_MANIFEST_MISMATCH'; why = "the staged build manifest for $short changed while the batch waited: sha256 $($st.sha256), not $($g.sha256)" } }
             if ($st.state -ceq 'STAGED' -and $st.contentProblem) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_MANIFEST_MISMATCH'; why = "the staged build manifest for $short at $($st.path) is no longer one the leg job accepts: $($st.contentProblem)" } }
+            if ($st.state -ceq 'STAGED' -and $st.artifactProblem) { $ap = $st.artifactProblem -split ' ', 2; return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $ap[0]; why = "the staged build for $short after the claim wait: $($ap[1])" } }
         }
     }
     $null
@@ -635,7 +637,7 @@ if ($legPlanMode) {
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
         foreach ($it in $items) {
-            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -TimeoutSec 30 }
+            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -TimeoutSec 30 -VerifyArtifacts }
             $st = $builds[$it.sourceCommit]
             $short = $it.sourceCommit.Substring(0, 12)
             if ($st.state -ceq 'UNREACHABLE') { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
@@ -648,6 +650,8 @@ if ($legPlanMode) {
             if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
             # r5 (adversary A2): and the manifest must be one the leg job's validator accepts (its commit, dll pair digest and symbol presence), not only the one named by hash
             if ($st.contentProblem) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short at $($st.path) is not one the leg job accepts: $($st.contentProblem)" }
+            # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: and the cached artifacts the manifest's digests name must exist and hash to them (the leg job throws on either after the lease opened)
+            if ($st.artifactProblem) { $ap = $st.artifactProblem -split ' ', 2; Stop-PlanRefused $ap[0] $it.item "the staged build for ${short}: $($ap[1])" }
         }
         $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
         foreach ($it in $ordered) {
