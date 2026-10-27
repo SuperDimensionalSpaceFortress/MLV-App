@@ -135,6 +135,8 @@ try {
     $fb = @{}; if ((Get-Command Get-CorePartitionFeedSummary).Parameters.ContainsKey('Base')) { $fb.Base = $corePartitionFeedPreHelper }
     # r10 B2: the window ends as this end read starts (the job reads the feed right after the smoke run ends)
     if ((Get-Command Get-CorePartitionFeedSummary).Parameters.ContainsKey('WindowEndMs')) { $fb.WindowEndMs = $end.monoMs }
+    # r11 B1: and the app's observed exit at it too (the window end lags no exit)
+    if ((Get-Command Get-CorePartitionFeedSummary).Parameters.ContainsKey('AppGoneMs')) { $fb.AppGoneMs = $end.monoMs }
     $sum = Get-CorePartitionFeedSummary $corePartitionFeedStart $end 120 @fb
     [ordered]@{
         helperReady = $corePartitionHelperLaunch.ready; readyLength = [int64]([string]$ready).Trim(); startLength = $corePartitionFeedStart.length
@@ -187,6 +189,16 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     try { . ([scriptblock]::Create($pre)) } finally { $env:ProgramFiles = $pf }
     [IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, "26.10.2026,01:00:02,x,70.0,45.0,No,No`n")
     $resultPath = Join-Path $Work 'result.json'
+    if ($mode -eq 'good') {
+        # r11 B1: the stand-in helper writes no record, so the driver writes the genuine helper's (signed under the job's key, the runner's pid,
+        # the app's observed exit 100 ms ago on the job's monotonic base); without it the window end is unverified and nothing is published
+        $now = [DateTime]::UtcNow
+        [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = [ordered]@{ id = 5000; startedAtUtc = $now.AddSeconds(-5).ToString('o'); endedAtUtc = $now.ToString('o') } } | ConvertTo-Json -Depth 3))
+        $mb = ((Get-CorePartitionMonoMs) - 150).ToString([Globalization.CultureInfo]::InvariantCulture)
+        $rb = [Text.Encoding]::UTF8.GetBytes('{"schema":"mlv-app/core-partition-helper/v1","pid":' + $corePartitionHelperLaunch.pid + ',"monoBaseMs":' + $mb + ',"app":{"pid":5000,"startUtcTicks":' + $now.AddSeconds(-5).Ticks + ',"goneMs":50},"clockSkewMaxMs":0}')
+        [IO.File]::WriteAllBytes($corePartitionHelperOut, $rb)
+        [IO.File]::WriteAllText("$corePartitionHelperOut.mac", [Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($corePartitionHelperNonce)).ComputeHash($rb)))
+    }
     $global:cpSaved = $null
     . ([scriptblock]::Create($regions[1]))
     $rawLog = "playback_smoke.start session=1 worker_threads=16`n"
@@ -870,9 +882,11 @@ class CorePartitionGeneratorTests(unittest.TestCase):
                 # alive-to-gone gap (the measured-app verdict's endpointMs), never a constant
                 self.assertIn("endpointErrorBoundMs = $cpAppVerdict.endpointMs }", text)
                 self.assertIn("measuredApp = $cpAppVerdict.why\n", text)
-                # r10 B2: the feed window ends at the smoke run's monotonic end, with the declared 2000 ms slack for the end read
+                # r10 B2: the feed window ends at the smoke run's monotonic end, with the declared 2000 ms slack for the end read; r11 B1: that end is
+                # stamped before the affinity restore and cross-checked against the helper's observed app exit, with the declared 10000 ms slack
                 self.assertIn("$corePartitionSmokeEndMonoMs = Get-CorePartitionMonoMs\n", text)
-                self.assertIn("(Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000)", text)
+                self.assertIn("(Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppGoneMonoMs 10000)", text)
+                self.assertLess(text.index("$corePartitionSmokeEndMonoMs = Get-CorePartitionMonoMs\n"), text.index("$corePartitionJobProc.ProcessorAffinity = [IntPtr][Convert]::ToInt64("))
                 self.assertLess(text.index("$corePartitionSmokeEndMonoMs = Get-CorePartitionMonoMs\n"), text.index("$corePartitionFeedEnd = Read-CorePartitionFeedSince"))
         # adversary r9 (5592421d) A1: the final pass enumerates same-path processes before it looks for the stop file
         src = base64.b64decode(re.search(r"(?m)^\$CorePartitionHelperEncoded = '([A-Za-z0-9+/=]+)'$", self.job("a")).group(1)).decode("utf-16-le")
@@ -921,7 +935,9 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $
     $s0 = $Start; $e0 = $End
     if ($s0 -is [hashtable] -and $s0.ContainsKey('monoMs') -and -not $s0.ContainsKey('doneMs')) { $s0 = $s0.Clone(); $s0.doneMs = $s0.monoMs }
     if ($e0 -is [hashtable] -and $e0.ContainsKey('monoMs') -and -not $e0.ContainsKey('doneMs')) { $e0 = $e0.Clone(); $e0.doneMs = $e0.monoMs }
-    & $cpFeedSummaryImpl $s0 $e0 $StaleSec $Base $(if ($null -ne $e0 -and $e0.doneMs -is [ValueType]) { $e0.doneMs } else { 0 })
+    # r11 B1: the app's observed exit is at the window end (a pre-r11 generator ignores the extra arguments)
+    $we = $(if ($null -ne $e0 -and $e0.doneMs -is [ValueType]) { $e0.doneMs } else { 0 })
+    & $cpFeedSummaryImpl $s0 $e0 $StaleSec $Base $we 2000 $we
 }
 $start = @{ exists = $true; length = 500; ageSec = 1.0; before = "26.10.2026,01:00:00,x,61.0,20.5,No,No`n26.10.2026,01:00:01,x,62.5,21.0,No,No`n"; window = ''; windowStartsMidRow = $false; monoMs = [int64]5005000; readUtcTicks = $T0; lastWriteUtcTicks = $T0 - 10000000 }
 # r9 (Dot 2): a start mark's text is the bytes its read returned, from beforeOffset to length (Read-CorePartitionFeedMark); each hand-built start mark
@@ -1510,16 +1526,20 @@ class CorePartitionPureHelperTests(unittest.TestCase):
                 self.assertIn("corePartitionTopologyOk=helper-not-ready-at-launch", c["why"])
                 self.assertEqual(c["pkg"], [None] * 6, f"a not-ready helper published package-feed values: {c}")
                 self.assertIn("pkgWattsMean=helper-not-ready-at-launch", c["why"])
-                # sol r4 A1: core-partition.json's feed summary is held to the same rule as the success-summary scalars
-                self.assertEqual(c["published"], [None] * 7 + ["helper-not-ready-at-launch"], f"core-partition.json published feed values: {c}")
+                # sol r4 A1: core-partition.json's feed summary is held to the same rule as the success-summary scalars. r11 B1: no accepted record
+                # carries the app's observed exit, so the window end is unverified too, appended after the not-ready reason
+                self.assertEqual(c["published"], [None] * 7 + ["helper-not-ready-at-launch+feed-window-end-unverified"], f"core-partition.json published feed values: {c}")
         self.assertTrue(got["stop-timeout"]["killed"], "the stop-timeout double was killed (the branch under test ran)")
-        # sol r6 CP-06: a ready helper the job had to kill no longer vouches for its record (exit -1); the feed window is still published
+        # sol r6 CP-06: a ready helper the job had to kill no longer vouches for its record (exit -1). r11 B1 (CP-FEED-END-ANCHOR): nor for the
+        # app's observed exit, the only independent bound on the feed window's end, so the window rows are unverified evidence (until r11 the
+        # window was still published here)
         killed = got["ready-stop-timeout-control"]
         self.assertEqual([killed["topo"], killed["bench"], killed["load"]], [False, False, False], f"a killed helper's record was accepted: {killed}")
         self.assertEqual(killed["helperWhy"], "helper-killed-after-stop-timeout+helper-exit-nonzero")
         self.assertFalse(killed["notReady"])
-        self.assertEqual(killed["pkg"][:4], [50.0, 55.0, 75.0, 80.0], "a ready helper's window still carries the feed")
-        self.assertEqual(killed["published"][:3], [2, 50.0, 55.0], "a ready helper's core-partition.json still carries the feed")
+        self.assertEqual(killed["pkg"][:4], [None] * 4, f"a window end no observed exit bounds was published: {killed}")
+        self.assertIn("pkgWattsMean=feed-window-end-unverified", killed["why"])
+        self.assertEqual(killed["published"][:3], [None] * 3, f"a window end no observed exit bounds was published: {killed}")
         control = got["ready-normal-exit-control"]
         self.assertEqual([control["topo"], control["bench"], control["load"]], [True, True, True], f"a ready helper that exited 0 with its HMAC'd record is accepted: {control}")
         self.assertIsNone(control["helperWhy"], control)
@@ -1593,7 +1613,7 @@ class CorePartitionPureHelperTests(unittest.TestCase):
         self.assertTrue(c["notReady"], f"a helper that never started left the feed open: {c}")
         self.assertEqual(c["helperWhy"], "helper-start-failed+helper-not-started", c)
         self.assertEqual(c["pkg"], [None] * 6, f"the summary published package-feed values: {c}")
-        self.assertEqual(c["published"], [None] * 7 + ["helper-not-ready-at-launch"], f"core-partition.json published package-feed values: {c}")
+        self.assertEqual(c["published"], [None] * 7 + ["helper-not-ready-at-launch+feed-window-end-unverified"], f"core-partition.json published package-feed values: {c}")
         self.assertEqual([c["topo"], c["bench"], c["load"]], [False, False, False], c)
 
     def test_a_negative_feed_age_is_no_freshness(self) -> None:
@@ -1769,7 +1789,9 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $
     $s0 = $Start; $e0 = $End
     if ($s0 -is [hashtable] -and $s0.ContainsKey('monoMs') -and -not $s0.ContainsKey('doneMs')) { $s0 = $s0.Clone(); $s0.doneMs = $s0.monoMs }
     if ($e0 -is [hashtable] -and $e0.ContainsKey('monoMs') -and -not $e0.ContainsKey('doneMs')) { $e0 = $e0.Clone(); $e0.doneMs = $e0.monoMs }
-    & $cpFeedSummaryImpl $s0 $e0 $StaleSec $Base $(if ($null -ne $e0 -and $e0.doneMs -is [ValueType]) { $e0.doneMs } else { 0 })
+    # r11 B1: the app's observed exit is at the window end (a pre-r11 generator ignores the extra arguments)
+    $we = $(if ($null -ne $e0 -and $e0.doneMs -is [ValueType]) { $e0.doneMs } else { 0 })
+    & $cpFeedSummaryImpl $s0 $e0 $StaleSec $Base $we 2000 $we
 }
 # Dot 1 (= adversary r8 aeacec83 A1, literal): B2 masks bench 0x00FFF, load/helper 0xFF000, 8 threads. Helper 4242; app 5000 starts 12:00:03Z, runner
 # window 12:00:02.9Z..12:00:23Z. A stop file at 12:00:04.95Z ends the genuine helper's watch; it signs at 12:00:05Z with affinityFirst = affinityLast
@@ -1962,7 +1984,8 @@ foreach ($k in @('not-joined', 'join-unrecorded', 'joined-control')) {
 }
 # B2 (sol r9 B2, literal): same file; start mark read at mono 1000; the smoke ends at 21000; the end reader stamps 21000 but its Length and read are
 # delayed until 141000, and a 99 W / 99 C row appended at 140000 is in its window. Variants: the window row appended at 2000 (139 s old at the read);
-# a 40 s delay (inside the 120 s staleness limit). Control: the read completes 500 ms after the smoke end.
+# a 40 s delay (inside the 120 s staleness limit). Control: the read completes 500 ms after the smoke end. r11: the helper saw the app gone at 20900
+# (a pre-r11 generator ignores that argument).
 $row = "26.10.2026,12:02:20,x,99,99,Yes,Yes`n"
 $s2 = @{ exists = $true; length = 34; beforeOffset = 0; shortRead = $false; monoMs = [int64]1000; doneMs = [int64]1000; created = 123; fileId = 'same'; before = "26.10.2026,12:00:00,x,30,10,No,No`n"; window = ''; windowStartsMidRow = $false }
 $b2b = @{ exists = $true; length = 0; monoMs = [int64]500; doneMs = [int64]500; created = 123; fileId = 'same' }
@@ -1975,15 +1998,15 @@ $b2 = [ordered]@{
     'in-window-control' = (New-R10End 21500 "26.10.2026,12:00:10,x,61,40,No,No`n")
 }
 foreach ($k in $b2.Keys) {
-    $x = Get-CorePartitionFeedSummary $s2 $b2[$k] 120 $b2b 21000 2000
+    $x = Get-CorePartitionFeedSummary $s2 $b2[$k] 120 $b2b 21000 2000 20900
     $r.b2[$k] = @($x.rows, $x.pkgWattsMean, $x.pkgTempCMax, [string]$x.reasons['rows'])
 }
 # the start mark's freshness runs to its read's completion too: stamped at 2000 (row appended after the pre-helper read), completed at 200000
 $late = $s2.Clone(); $late.monoMs = [int64]2000; $late.doneMs = [int64]200000; $late.length = 34; $late.beforeOffset = 0
 $lb = @{ exists = $true; length = 0; monoMs = [int64]1000; created = 123; fileId = 'same' }
-$x = Get-CorePartitionFeedSummary $late (New-R10End 21500 "26.10.2026,12:00:10,x,61,40,No,No`n") 120 $lb 21000 2000
+$x = Get-CorePartitionFeedSummary $late (New-R10End 21500 "26.10.2026,12:00:10,x,61,40,No,No`n") 120 $lb 21000 2000 20900
 $ok = $late.Clone(); $ok.doneMs = [int64]2100
-$y = Get-CorePartitionFeedSummary $ok (New-R10End 21500 "26.10.2026,12:00:10,x,61,40,No,No`n") 120 $lb 21000 2000
+$y = Get-CorePartitionFeedSummary $ok (New-R10End 21500 "26.10.2026,12:00:10,x,61,40,No,No`n") 120 $lb 21000 2000 20900
 $r.b2Start = @($x.pkgTempCAtStart, [string]$x.reasons['pkgTempCAtStart'], $y.pkgTempCAtStart, [string]$y.reasons['pkgTempCAtStart'])
 # the readers: a read delayed 1500 ms after its stamp (through the byte-read seam) carries a completion time at least 1500 ms after the stamp
 $r.b2Reader = 'absent'
@@ -2214,6 +2237,165 @@ class CorePartitionR10Tests(unittest.TestCase):
         self.assertEqual(got["bWorkers"], 8, got)
         self.assertLessEqual(got["heldWorkerPassesInB"], 1, f"the old worker kept running inside session B: {got}")
         self.assertEqual(got["bBytes"], got["bOwnWorkersBytes"], f"session B's bytes are not its own workers': {got}")
+
+
+# r11 B1 (sol r10 B1 = key3 r10 on d5233ef9, CP-FEED-END-ANCHOR): the job's own cleanup region (the body of the generator's $cpPost, lifted by AST; no
+# job is generated, so the same driver runs against any generator) on a fake monotonic clock. The smoke call returned at mono 21000; 'entry' later
+# than that is a stall before the region's first statement. The job's affinity restore stalls 'restore' ms (its setter advances the clock). The feed's
+# 99 W / 99 C row was appended just before the end read, which completes 500 ms after it starts. The helper's signed record (accepted: this job's key,
+# its launch pid, exit 0) puts the measured app's observed exit at 'gone' on the job's monotonic base; $null is a record without that base.
+R11_CLEANUP = r"""
+$asg = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$cpPost' }, $true) | Select-Object -First 1
+if ($null -eq $asg) { throw 'the generator has no $cpPost cleanup region' }
+$post = @($asg.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.StringConstantType -eq 'SingleQuotedHereString' }, $true))[0].Value
+function Write-JobTrace([string]$Message) { }
+function Publish-AttrCudaText { param([string]$Path, [string]$Value) }
+function New-AttrCudaDirectory { param([string]$Path) }
+function Save-Json { param($Object, $Path) $global:cpSaved = $Object }
+function Get-CorePartitionMonoMs { [double]$global:cpClk }
+$row = "26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
+function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
+    $m = $global:cpClk; $global:cpClk += 500
+    @{ exists = $true; length = 34 + $row.Length; monoMs = [int64]$m; doneMs = [int64]$global:cpClk; created = 123; fileId = 'same'; before = ''; window = $row; windowStartsMidRow = $false
+        replaced = $false; truncated = $false; shortRead = $false; readUtcTicks = 0; lastWriteUtcTicks = 0 }
+}
+$cases = [ordered]@{
+    'zero-delay-control' = @(21000, 0, 20900)
+    'restore-stall-40s' = @(21000, 40000, 20900)
+    'restore-stall-80s' = @(21000, 80000, 20900)
+    'stall-before-the-end-stamp-40s' = @(61000, 0, 20900)
+    'no-observed-exit' = @(21000, 0, $null)
+}
+$u8 = [Text.Encoding]::UTF8
+$out = [ordered]@{}
+foreach ($k in $cases.Keys) {
+  try {
+    $c = $cases[$k]; $dir = Join-Path $env:CP_DIR $k; [void](New-Item -ItemType Directory -Path $dir)
+    $global:cpClk = [double]$c[0]; $global:cpDelay = [double]$c[1]
+    $corePartitionJob = [ordered]@{ affinityRequested = '0x00FFF'; affinityApplied = '0x00FFF'; affinityBefore = '0xFFFFF'; affinityRestored = $null }
+    $corePartitionJobProc = [pscustomobject]@{}
+    $corePartitionJobProc | Add-Member -MemberType ScriptProperty -Name ProcessorAffinity -Value { [int64]1048575 } -SecondValue { $global:cpClk += $global:cpDelay }
+    $corePartitionJobProc | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+    $now = [DateTime]::UtcNow
+    $corePartitionMeasuredLaunchUtc = $now.AddSeconds(-20); $corePartitionPreHelperUtc = $now.AddSeconds(-21)
+    $corePartitionClockPairs = [Collections.Generic.List[object]]::new(); $corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, [double]1000))
+    $corePartitionFeedPath = Join-Path $dir 'feed.csv'
+    $corePartitionFeedPreHelper = @{ exists = $true; length = 0; beforeOffset = 0; before = ''; shortRead = $false; monoMs = [int64]500; doneMs = [int64]500; created = 123; fileId = 'same'; readUtcTicks = 0; lastWriteUtcTicks = 0 }
+    $corePartitionFeedStart = @{ exists = $true; length = 34; beforeOffset = 0; shortRead = $false; monoMs = [int64]1000; doneMs = [int64]1000; created = 123; fileId = 'same'
+        before = "26.10.2026,12:00:00,x,30,10,No,No`n"; window = ''; windowStartsMidRow = $false; readUtcTicks = 0; lastWriteUtcTicks = 0 }
+    $resultPath = Join-Path $dir 'result.json'
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = [ordered]@{ id = 5000; startedAtUtc = $now.AddSeconds(-20).ToString('o'); endedAtUtc = $now.ToString('o') } } | ConvertTo-Json -Depth 3))
+    $corePartitionHelper = [pscustomobject]@{ HasExited = $true; ExitCode = 0 }
+    $corePartitionHelper | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { $true }
+    $corePartitionHelper | Add-Member -MemberType ScriptMethod -Name Kill -Value { }
+    $corePartitionHelperLaunch = [ordered]@{ pid = 4242; ready = $true }
+    $corePartitionHelperNonce = 'r11-end-anchor'; $corePartitionHelperOut = Join-Path $dir 'helper.json'
+    $corePartitionMeasuredFile = Join-Path $dir 'measured'; $corePartitionStopFile = Join-Path $dir 'stop'
+    $mb = $(if ($null -ne $c[2]) { ',"monoBaseMs":' + ($c[2] - 20100) } else { '' })
+    $rb = $u8.GetBytes('{"schema":"mlv-app/core-partition-helper/v1","pid":4242' + $mb + ',"app":{"pid":5000,"startUtcTicks":' + $now.AddSeconds(-20).Ticks + ',"aliveMs":19950,"goneMs":20100},"clockSkewMaxMs":0}')
+    [IO.File]::WriteAllBytes($corePartitionHelperOut, $rb)
+    [IO.File]::WriteAllText("$corePartitionHelperOut.mac", [Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new($u8.GetBytes($corePartitionHelperNonce)).ComputeHash($rb)))
+    $corePartitionHelperNotReady = $false; $corePartitionHelperWhy = $null; $corePartitionHelperExit = $null
+    $corePartitionErrors = [Collections.Generic.List[string]]::new()
+    $Pub = $dir; $CorePartitionBenchMask = [int64]4095; $CorePartitionLoadMask = [int64]1044480; $CorePartitionLoadThreads = 8; $CorePartitionHelperMask = [int64]1044480
+    $global:cpSaved = $null
+    . ([scriptblock]::Create($post))
+    $f = $corePartitionFeedSummary; $pf = $global:cpSaved.feed
+    $out[$k] = [ordered]@{ end = $corePartitionSmokeEndMonoMs; endRead = @($corePartitionFeedEnd.monoMs, $corePartitionFeedEnd.doneMs); rows = $f.rows; watts = $f.pkgWattsMax; temp = $f.pkgTempCMax
+        why = [string]$f.reasons['rows']; helperWhy = [string]$corePartitionHelperWhy; published = @($pf.windowEndMonoMs, $pf.endReadSlackMs, $pf.appGoneMonoMs, $pf.windowEndLagMs, $pf.endLagSlackMs) }
+  } catch { $out[$k] = [ordered]@{ threw = [string]$_.Exception.Message + ' @ ' + [string]$_.InvocationInfo.PositionMessage } }
+}
+$out | ConvertTo-Json -Compress -Depth 5
+"""
+
+
+def _r11_helper_base_driver() -> str:
+    """B1_DRIVER's real helper body and process double, tight poll only, reporting the helper's monoBaseMs beside the driver's own reads of the
+    shared monotonic clock before the helper starts (t0) and after it exits (t1)."""
+    d = B1_DRIVER
+    for old, new in (("foreach ($mode in @('delayed', 'tight')) {", "foreach ($mode in @('tight')) {"),
+                     ("    $sw = [Diagnostics.Stopwatch]::StartNew()\n    $h = [Diagnostics.Process]::Start($psi)\n",
+                      "    $t0 = [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000\n"
+                      "    $sw = [Diagnostics.Stopwatch]::StartNew()\n    $h = [Diagnostics.Process]::Start($psi)\n"),
+                     ("    $end = [DateTime]::UtcNow.Ticks\n",
+                      "    $end = [DateTime]::UtcNow.Ticks\n    $t1 = [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000\n"),
+                     ("    $out[$mode] = [ordered]@{ endedBy = $rec.endedBy;", "    $out[$mode] = [ordered]@{ t0 = $t0; t1 = $t1; monoBaseMs = $rec.monoBaseMs; endedBy = $rec.endedBy;")):
+        if d.count(old) != 1:
+            raise AssertionError(f"B1_DRIVER changed shape near {old!r}")
+        d = d.replace(old, new)
+    return d
+
+
+R11_HELPER_BASE_DRIVER = _r11_helper_base_driver()
+
+
+@requires_windows_pwsh
+class CorePartitionR11Tests(unittest.TestCase):
+    """r11 (sol r10 B1 = key3 r10 on d5233ef9, CP-FEED-END-ANCHOR): the feed window's end is bound independently of the job's cleanup."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="core-partition-r11-")
+        cls.addClassCleanup(cls._tmp.cleanup)
+        cls.tmp = Path(cls._tmp.name)
+        work = cls.tmp / "cleanup"
+        work.mkdir()
+        script = cls.tmp / "r11-cleanup.ps1"
+        script.write_text(LIFT + R11_CLEANUP, encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(work)})
+        cls.raw = proc
+        cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+
+    def setUp(self) -> None:
+        self.assertIsNotNone(self.r, f"the lifted cleanup region did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
+        for case, got in self.r.items():
+            self.assertNotIn("threw", got, f"{case}: {got}")
+
+    def test_b1_a_stall_in_cleanup_after_the_smoke_returns_does_not_move_the_window_end(self) -> None:
+        """B1 (sol r10 B1, literal): the smoke ends at 21000 and the job's affinity restore stalls 40 s (or 80 s); the 99 W / 99 C row appended
+        after the run is in the end read, which completes 500 ms after the restore. On d5233ef9 the end is stamped after the restore (61000 or
+        101000), the read passes the 2000 ms slack and the row is published (rows 1, 99 W, 99 C, no reason). The end is now stamped as the smoke
+        call returns (21000), so the late read is feed-read-after-window. Control: no stall, the in-window row is published."""
+        for case in ("restore-stall-40s", "restore-stall-80s"):
+            with self.subTest(case=case):
+                got = self.r[case]
+                self.assertEqual([got["rows"], got["watts"], got["temp"], got["why"]], [None, None, None, "feed-read-after-window"], got)
+                self.assertEqual(got["end"], 21000, f"a cleanup stall moved the window end: {got}")
+        control = self.r["zero-delay-control"]
+        self.assertEqual([control["rows"], control["watts"], control["temp"], control["why"]], [1, 99.0, 99.0, ""], control)
+        self.assertEqual(control["end"], 21000, control)
+
+    def test_b1_a_window_end_that_lags_the_apps_observed_exit_is_refused(self) -> None:
+        """B1 (cross-check): a stall before the end stamp itself (the job resumes 40 s after the smoke returned) moves the end and the read
+        together, so only independent evidence can catch it: the helper saw the app gone at 20900, 40100 ms before that end, over the declared
+        10000 ms slack: feed-window-end-late. A record without the observed exit on the job's clock leaves the end unverifiable:
+        feed-window-end-unverified. On d5233ef9 both publish the post-run row."""
+        for case, code in (("stall-before-the-end-stamp-40s", "feed-window-end-late"), ("no-observed-exit", "feed-window-end-unverified")):
+            with self.subTest(case=case):
+                got = self.r[case]
+                self.assertEqual([got["rows"], got["watts"], got["temp"], got["why"]], [None, None, None, code], got)
+
+    def test_the_feed_window_boundary_is_published(self) -> None:
+        """CORE-PARTITION-FEED-WINDOW-PROVENANCE-1: core-partition.json carries the window end, the end read's slack, the observed app exit, the lag
+        between them and its slack (r10's PR body claimed the first two; d5233ef9 published neither)."""
+        self.assertEqual(self.r["zero-delay-control"]["published"], [21000, 2000, 20900, 100, 10000], self.r["zero-delay-control"])
+        self.assertEqual(self.r["no-observed-exit"]["published"], [21000, 2000, None, None, 10000], self.r["no-observed-exit"])
+
+    def test_the_helper_records_its_stopwatch_origin_on_the_shared_monotonic_clock(self) -> None:
+        """The real helper body (the B1 process double, a tight poll): monoBaseMs is read on the clock the job reads (Stopwatch.GetTimestamp), so
+        the app's observed exit, monoBaseMs + goneMs, falls between the driver's own clock reads before the helper started and after it exited."""
+        work = self.tmp / "helper-base"
+        work.mkdir()
+        driver = self.tmp / "helper-base.ps1"
+        driver.write_text(LIFT + R11_HELPER_BASE_DRIVER, encoding="utf-8")
+        proc = run_pwsh(["-File", str(driver)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(work)})
+        self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])["tight"]
+        self.assertEqual([got["endedBy"], got["exit"]], ["stop-file", 0], got)
+        self.assertIsInstance(got["monoBaseMs"], (int, float), f"the helper's record carries no monotonic origin: {got}")
+        self.assertLessEqual(got["t0"], got["monoBaseMs"], got)
+        self.assertLessEqual(got["t0"], got["monoBaseMs"] + got["goneMs"], got)
+        self.assertLessEqual(got["monoBaseMs"] + got["goneMs"], got["t1"], got)
 
 
 PARAMS_ANCHOR = "$AutomationSettingsDir,$GpuPreLaunches)"
