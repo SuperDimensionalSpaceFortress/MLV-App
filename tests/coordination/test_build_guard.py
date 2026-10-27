@@ -6,6 +6,7 @@ sample file and a process-table file), so no real build, no real memory pressure
 needed. The last class is the hygiene pin: CLAUDE.md and the routed launchers must not default to -j8.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -27,6 +28,13 @@ ROUTED_LAUNCHERS = (BUILD_RELEASE, STAGE_PROBE, ATTR3_ASSEMBLE)
 
 PWSH = shutil.which("pwsh.exe") or shutil.which("pwsh")
 
+# MLV-VM-HEAVY-SLOT-ADOPT-1: no test reaches the live machine heavy slot. By default the shim is a path that does
+# not exist, so the guard fails open with one WARN; the heavy-slot tests point it at the stub beside this file.
+HEAVY_STUB_DIR = Path(__file__).resolve().parent / "heavy_slot_stub"
+HEAVY_STUB = HEAVY_STUB_DIR / "heavy-slot.cmd"
+NO_HEAVY_SLOT = HEAVY_STUB_DIR / "absent" / "heavy-slot.cmd"
+PINNED_HEAVY_SLOT_SHA = "691efb4c2cc1b98cd5a7379e03a2bb5b9eebaa1174a03b11ee7a48741fc06534"
+
 pytestmark = pytest.mark.skipif(
     os.name != "nt" or not PWSH, reason="the build guard is a Windows PowerShell 7 tool"
 )
@@ -37,11 +45,15 @@ LOW_COMMIT = {"freePhysGB": 10, "freeCommitGB": 7.9}
 FAST = ["-PollSeconds", "0.2"]
 
 
-def _env(exempt=None) -> dict:
+def _env(exempt=None, heavy_slot: Path = NO_HEAVY_SLOT, extra: dict = None) -> dict:
     env = dict(os.environ)
     env.pop("MLV_BUILD_GUARD_EXEMPT", None)
+    for name in ("HEAVY_SLOT_HELD", "HEAVY_SLOT_HELD_START", "HEAVY_SLOT_HELD_NAME", "MLV_LANE_RUN_DIR"):
+        env.pop(name, None)
+    env["MLV_HEAVY_SLOT_CMD"] = str(heavy_slot)
     if exempt is not None:
         env["MLV_BUILD_GUARD_EXEMPT"] = exempt
+    env.update(extra or {})
     return env
 
 
@@ -767,6 +779,163 @@ def test_live_unexpired_lock_blocks_the_build_with_slot_busy(box) -> None:
     finally:
         holder.kill()
         holder.wait()
+
+
+# --- the machine heavy slot (MLV-VM-HEAVY-SLOT-ADOPT-1) -----------------------------------------
+
+
+def _stub_sha() -> str:
+    return hashlib.sha256((HEAVY_STUB_DIR / "heavy-slot.ps1").read_bytes()).hexdigest()
+
+
+def _heavy(box: dict, mode: str, mode_args: list, sha: str = None, shim: Path = HEAVY_STUB) -> subprocess.CompletedProcess:
+    memory_file = _write_json(box["dir"] / "memory.json", OK_MEMORY)
+    table_file = _write_json(box["dir"] / "table.json", [])
+    env = _env(heavy_slot=shim, extra={
+        "STUB_HEAVY_SLOT_MODE": mode,
+        "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log"),
+        "MLV_LANE_RUN_DIR": str(box["dir"] / "lane-CARD-HS-1-r2-20261027T1420Z"),
+    })
+    return subprocess.run(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GUARD),
+         "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(box["lock"]),
+         "-ExemptLogPath", str(box["exempt_log"]), "-HeavySlotSha256", sha or _stub_sha(), *mode_args],
+        capture_output=True, text=True, timeout=120, env=env, check=False,
+    )
+
+
+def _stub_calls(box: dict) -> list:
+    log = box["dir"] / "stub.log"
+    return [json.loads(line) for line in log.read_text(encoding="ascii").splitlines()] if log.exists() else []
+
+
+def test_heavy_slot_is_outermost_and_the_build_exit_passes_through(box) -> None:
+    stamp = box["dir"] / "built-at.txt"
+    fragment = (
+        f"Set-Content -LiteralPath '{stamp}' -Value ([DateTime]::UtcNow.ToString('o')) -Encoding ascii; "
+        f"Write-Output \"held=$(Test-Path -LiteralPath '{box['lock']}')\"; cmd /c exit 9"
+    )
+    done = _heavy(box, "run", ["-Command", fragment])
+    assert done.returncode == 9, done.stdout + done.stderr
+    assert "held=True" in done.stdout, "the MLV build slot is still taken, nested inside the heavy slot"
+    assert "HEAVY-SLOT TICKET stub-" in done.stderr, "heavy-slot's stderr is relayed"
+    [call] = _stub_calls(box)
+    argv = call["argv"]
+    sep = argv.index("--")
+    assert argv[:sep] == ["run", "--class", "shared", "--label", "mlv:CARD-HS-1:build", "--eta", "20m", "--wait", "60m",
+                          "--exit-file", argv[sep - 1]]
+    assert argv[sep + 1].lower().endswith("pwsh.exe") and "-EncodedCommand" in argv[sep + 2:]
+    assert call["expectSha"] == _stub_sha() and call["expectKeeper"] == "1"
+    # Outermost: the holder (heavy-slot's child) started before the build ran and ended after it.
+    assert call["childStart"] < stamp.read_text(encoding="ascii").strip() < call["childEnd"]
+    assert not Path(argv[sep - 1]).exists() and not box["lock"].exists()
+
+
+def test_each_call_gets_a_fresh_exit_file(box) -> None:
+    for _ in range(2):
+        done = _heavy(box, "run", ["-Command", "cmd /c exit 0"])
+        assert done.returncode == 0, done.stdout + done.stderr
+    first, second = (c["argv"][c["argv"].index("--exit-file") + 1] for c in _stub_calls(box))
+    assert first != second
+
+
+def test_a_marked_75_is_a_requeue_never_a_build_failure(box) -> None:
+    done = _heavy(box, "marked75", ["-Command", _marker_command(box)])
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build code=75 ticket=stub-" in done.stdout
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK" not in done.stdout
+    assert "BUILD_GUARD_COMMAND_FAILED" not in done.stderr
+    assert not box["marker"].exists() and not box["lock"].exists(), "nothing is built or held without the heavy slot"
+
+
+@pytest.mark.parametrize(
+    "mode, why", [("unmarked75", "no readable exit marker"), ("forged75", "does not name this run")]
+)
+def test_a_75_without_a_matching_marker_is_could_not_check(box, mode, why) -> None:
+    done = _heavy(box, mode, ["-Command", _marker_command(box)])
+    assert done.returncode == 75, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=75 reason=" in done.stdout
+    assert why in done.stdout
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
+    assert not box["marker"].exists()
+
+
+def test_a_missing_shim_fails_open_with_one_warn(box) -> None:
+    done = _heavy(box, "run", ["-Command", _marker_command(box)], shim=NO_HEAVY_SLOT)
+    assert done.returncode == 0, done.stdout + done.stderr
+    warns = [line for line in done.stderr.splitlines() if "HEAVY_SLOT_WARN" in line]
+    assert len(warns) == 1 and "shim=missing" in warns[0] and "fail open" in warns[0], done.stderr
+    assert box["marker"].exists(), "fail open: the build still runs"
+    assert _stub_calls(box) == []
+
+
+def test_a_pin_mismatch_refuses_before_anything_runs(box) -> None:
+    done = _heavy(box, "run", ["-Command", _marker_command(box)], sha=PINNED_HEAVY_SLOT_SHA)
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=pin-mismatch" in done.stdout
+    assert f"expected={PINNED_HEAVY_SLOT_SHA} actual={_stub_sha()}" in done.stdout
+    assert _stub_calls(box) == [], "heavy-slot is never called"
+    assert not box["marker"].exists() and not box["lock"].exists()
+
+
+def test_print_jobs_takes_no_heavy_slot(box) -> None:
+    done = _heavy(box, "run", ["-PrintJobs"])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert done.stdout.strip() == "-j4"
+    assert _stub_calls(box) == []
+
+
+def test_library_mode_builds_are_wrapped_too(box) -> None:
+    driver = box["dir"] / "lib-heavy.ps1"
+    driver.write_text(
+        "param([string]$Guard, [string]$Lock, [string]$Mem, [string]$Table, [string]$Sha)\n"
+        ". $Guard -Library\n"
+        "$opts = @{ LockPath = $Lock; MemoryProbeFile = $Mem; ProcessTableFile = $Table; HeavySlotSha256 = $Sha }\n"
+        "Invoke-BuildGuard -Label 'lib-heavy' -Options $opts -Action { param($Jobs) Write-Output \"jobs=$Jobs\" }\n",
+        encoding="ascii",
+    )
+    env = _env(heavy_slot=HEAVY_STUB, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log")})
+    done = subprocess.run(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(driver), "-Guard", str(GUARD),
+         "-Lock", str(box["lock"]), "-Mem", _write_json(box["dir"] / "memory.json", OK_MEMORY),
+         "-Table", _write_json(box["dir"] / "table.json", []), "-Sha", _stub_sha()],
+        capture_output=True, text=True, timeout=120, env=env, check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "jobs=4" in done.stdout
+    [call] = _stub_calls(box)
+    assert "mlv:hub:build" in call["argv"], "no lane run dir: the hub's label"
+
+
+def test_a_killed_guard_does_not_leave_the_heavy_slot_held(box) -> None:
+    memory_file = _write_json(box["dir"] / "memory.json", OK_MEMORY)
+    table_file = _write_json(box["dir"] / "table.json", [])
+    env = _env(heavy_slot=HEAVY_STUB, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log")})
+    guard = subprocess.Popen(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(GUARD), "-MemoryProbeFile", memory_file,
+         "-ProcessTableFile", table_file, "-LockPath", str(box["lock"]), "-ExemptLogPath", str(box["exempt_log"]),
+         "-HeavySlotSha256", _stub_sha(), "-Command", "Start-Sleep -Seconds 90"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not list((box["dir"] / "heavy-slot").glob("*.ready")):
+            assert guard.poll() is None and time.monotonic() < deadline, "the holder never started"
+            time.sleep(0.1)
+    finally:
+        guard.kill()
+        guard.wait()
+    deadline = time.monotonic() + 30
+    while not _stub_calls(box):
+        assert time.monotonic() < deadline, "the holder outlived its guard, so the heavy slot stayed held"
+        time.sleep(0.2)
+    assert _stub_calls(box)[0]["childEnd"]
+
+
+def test_the_guard_pins_the_installed_heavy_slot_sha() -> None:
+    text = GUARD.read_text(encoding="ascii")
+    assert text.count(f"'{PINNED_HEAVY_SLOT_SHA}'") == 2, "the param default and the library default"
+    assert "'--', $exe" in text and "heavy-slot.cmd" in text, "the shim with a quoted '--', never a bare -- to '&'"
 
 
 # --- hygiene pin: no local launcher defaults to -j8 --------------------------------------------
