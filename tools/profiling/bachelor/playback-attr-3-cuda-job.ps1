@@ -4348,6 +4348,8 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec) {
     elseif ($End.replaced) { $code = 'feed-replaced' }
     elseif ($End.truncated) { $code = 'feed-window-truncated' }
     elseif ($null -eq $End.ageSec -or [double]$End.ageSec -gt $StaleSec) { $code = 'feed-stale' }
+    # adversary r5 (40038f92) A4: an age below zero (the clock stepped back, or a future timestamp) proves no freshness.
+    elseif ([double]$End.ageSec -lt -5) { $code = 'feed-age-negative' }
     if ($null -eq $code) {
         $lines = Split-CorePartitionFeedLines ([string]$End.window)
         if ($End.windowStartsMidRow) { $lines = @($lines | Select-Object -Skip 1) }
@@ -4373,6 +4375,7 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec) {
     $startCode = $null
     if ($null -eq $Start -or -not $Start.exists) { $startCode = 'feed-missing' }
     elseif ($null -eq $Start.ageSec -or [double]$Start.ageSec -gt $StaleSec) { $startCode = 'feed-stale' }
+    elseif ([double]$Start.ageSec -lt -5) { $startCode = 'feed-age-negative' }
     else {
         $bp = ConvertFrom-CorePartitionFeedRows (Split-CorePartitionFeedLines ([string]$Start.before))
         if ($null -eq $bp.rows) { $startCode = $bp.why } else { $s.pkgTempCAtStart = [double]@($bp.rows)[-1].c }
@@ -4466,7 +4469,8 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     if ($MeasuredPid -le 0) { return @{ why = 'measured-pid-unknown' } }
     if ($MeasuredStartTicks -le 0 -or $MeasuredEndTicks -lt $MeasuredStartTicks) { return @{ why = 'measured-window-unknown' } }
     $all = @(@($Helper.instances) + @($Helper.others) | Where-Object { $null -ne $_ })
-    $m = @($all | Where-Object { [int64]$_.pid -eq $MeasuredPid -and $null -ne $_.startUtcTicks -and [int64]$_.startUtcTicks -ge ($MeasuredStartTicks - 20000000) -and [int64]$_.startUtcTicks -le $MeasuredEndTicks })
+    # adversary r5 (40038f92) A3: a process with that pid already seen gone before the runner's launch is a predecessor, never the launched one.
+    $m = @($all | Where-Object { [int64]$_.pid -eq $MeasuredPid -and $null -ne $_.startUtcTicks -and [int64]$_.startUtcTicks -ge ($MeasuredStartTicks - 20000000) -and [int64]$_.startUtcTicks -le $MeasuredEndTicks -and ($null -eq $_.goneUtcTicks -or [int64]$_.goneUtcTicks -ge $MeasuredStartTicks) })
     if ($m.Count -eq 0) { return @{ why = 'measured-app-not-observed' } }
     if ($m.Count -gt 1) { return @{ why = 'measured-pid-ambiguous' } }
     $a = $m[0]; $aStart = [int64]$a.startUtcTicks
@@ -5459,6 +5463,11 @@ try {
     $corePartitionHelperRecord = $null
     if (Test-Path -LiteralPath $corePartitionHelperOut -PathType Leaf) {
         try { $corePartitionHelperRecord = [IO.File]::ReadAllText($corePartitionHelperOut) | ConvertFrom-Json } catch { $corePartitionHelperWhy = Join-CorePartitionWhy $corePartitionHelperWhy 'helper-record-unparseable' }
+        # adversary r5 (40038f92) A2: a record another writer put at the helper's name (the helper's CreateNew then refuses) is not the helper's.
+        if ($null -ne $corePartitionHelperRecord -and ([string]$corePartitionHelperRecord.schema -ne 'mlv-app/core-partition-helper/v1' -or $null -eq $corePartitionHelperRecord.pid -or [int64]$corePartitionHelperRecord.pid -ne [int64]$corePartitionHelperLaunch.pid)) {
+            $corePartitionHelperRecord = $null
+            $corePartitionHelperWhy = Join-CorePartitionWhy $corePartitionHelperWhy 'helper-record-not-the-helpers'
+        }
     } elseif (-not $corePartitionHelperWhy) { $corePartitionHelperWhy = 'helper-record-missing' }
     $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120) $corePartitionHelperNotReady
     # sol r4 CP-05: set until core-partition.json is saved, so any failure on the way leaves every acceptance flag false with this reason.

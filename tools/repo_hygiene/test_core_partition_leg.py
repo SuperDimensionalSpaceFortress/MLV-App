@@ -681,6 +681,8 @@ $cases = [ordered]@{
     'pre-launch-alive' = @((New-CpRecord $i5000A1 @($i5000A1) @($i4242pre)), 5000, 3, 23)
     'start-time-overlap' = @((New-CpRecord $i5000A2 @($i5000A2, $i4242A2)), 5000, 2.9, 10.5)
     'replacement-after-exit' = @((New-CpRecord $i5000A3 @($i5000A3)), 5000, 3, 23)
+    # adversary r5 (40038f92) A3 (literal): only a predecessor 5000 (start +2.1 s, gone +3.9 s) is recorded; the runner launched its 5000 at +4 s
+    'predecessor-gone-before-launch' = @((New-CpRecord (New-CpInst 5000 2.1 2.2 3.8 3.9) @((New-CpInst 5000 2.1 2.2 3.8 3.9))), 5000, 4, 24)
     'probe-then-app-control' = @((New-CpRecord $i5000 @($i4100, $i5000)), 5000, 2.9, 19.1)
     'pid-reused-before-window-control' = @((New-CpRecord $i5000 @($i5000early, $i5000)), 5000, 2.9, 19.1)
 }
@@ -691,6 +693,12 @@ foreach ($k in $cases.Keys) {
     $sc = Get-CorePartitionScalars $cases[$k][0] $feed 4095 1044480 8 $w $null $false @mpk
     $r.measured[$k] = @($sc.corePartitionTopologyOk, $sc.benchAffinityApplied, $sc.partitionLoadApplied, $sc.appAffinityObserved, $sc.partitionLoadGBps, $sc.pcoreMHzMean, [string]$sc.corePartitionNullReasons)
 }
+# adversary r5 (40038f92) A4 (literal): the end read after a 600 s backward clock step computes ageSec = -401 for a feed really 199 s old
+$negEnd = $end.Clone(); $negEnd.ageSec = -401; $negEnd.window = "26.10.2026,12:00:01,x,70,45,No,No`n"; $negEnd.windowStartsMidRow = $false
+$negStart = $start.Clone(); $negStart.ageSec = -401
+$smallNeg = $negEnd.Clone(); $smallNeg.ageSec = -0.5
+$r.negativeAge = @([string](Get-CorePartitionFeedSummary $start $negEnd 120).reasons['rows'], (Get-CorePartitionFeedSummary $start $negEnd 120).pkgWattsMean,
+    [string](Get-CorePartitionFeedSummary $negStart $whole 120).reasons['pkgTempCAtStart'], (Get-CorePartitionFeedSummary $start $smallNeg 120).rows)
 # the runner's result.json times as the job reads them: a DateTime (pwsh 7 ConvertFrom-Json), an ISO string, absent, unreadable
 $r.utcTicks = 'absent'
 if (Get-Command ConvertTo-CorePartitionUtcTicks -ErrorAction SilentlyContinue) {
@@ -769,7 +777,7 @@ $CorePartitionBenchMask = [int64]4095
 $CorePartitionLoadMask = [int64]1044480
 $CorePartitionLoadThreads = 8
 $CorePartitionHelperMask = [int64]1044480
-$record = '{"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[{"app":true,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000}]}'
+$record = '{"schema":"mlv-app/core-partition-helper/v1","pid":4242,"topologyCheck":{"ok":true,"reason":null,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"load":{"seconds":15,"bytes":30000000000},"samples":[{"app":true,"inst":["0,0","0,12"],"freq":[2500,2500],"perf":[160,80],"park":[0,0]}],"instances":[{"pid":5000,"startUtcTicks":639286128040000000,"firstSeenUtcTicks":639286128041000000,"lastSeenUtcTicks":639286128200000000,"goneUtcTicks":639286128202000000}]}'
 # the runner's result.json: the launched pid and its launch..exit window, as the runner writes them (ISO 'o' strings)
 $runnerResult = '{"process":{"id":5000,"startedAtUtc":"' + [DateTime]::new([int64]639286128030000000, [DateTimeKind]::Utc).ToString('o') + '","endedAtUtc":"' + [DateTime]::new([int64]639286128230000000, [DateTimeKind]::Utc).ToString('o') + '"}}'
 $cases = @(
@@ -783,7 +791,10 @@ $cases = @(
     @{ name = 'ready-normal-exit-control'; mode = 'exit'; record = 'valid'; ready = $true },
     @{ name = 'publish-io-exception'; mode = 'exit'; record = 'valid'; ready = $true; publish = 'throw' },
     @{ name = 'publish-directory'; mode = 'exit'; record = 'valid'; ready = $true; publish = 'directory' },
-    @{ name = 'measured-pid-missing'; mode = 'exit'; record = 'valid'; ready = $true; result = 'none' })
+    @{ name = 'measured-pid-missing'; mode = 'exit'; record = 'valid'; ready = $true; result = 'none' },
+    @{ name = 'record-not-the-helpers'; mode = 'exit'; record = 'planted'; ready = $true })
+# adversary r5 (40038f92) A2 (literal): another writer's record at the helper's output name
+$planted = '{"schema":"not-the-helper-schema","pid":999999,"topologyCheck":{"ok":true,"pMask":4095,"eMask":1044480},"helperAffinityObserved":1044480,"app":{"pid":5000,"startUtcTicks":639286128040000000,"affinityFirst":4095,"affinityLast":4095},"instances":[{"pid":5000,"startUtcTicks":639286128040000000}],"others":[],"load":{"seconds":19,"bytes":38000000000},"samples":[]}'
 $out = [ordered]@{}
 foreach ($c in $cases) {
     $dir = Join-Path $env:CP_TMP $c.name
@@ -791,6 +802,7 @@ foreach ($c in $cases) {
     $Work = $dir; $Pub = $dir
     $corePartitionHelperOut = Join-Path $dir 'core-partition-helper.json'
     if ($c.record -eq 'valid') { [IO.File]::WriteAllText($corePartitionHelperOut, $record) } elseif ($c.record -eq 'garbage') { [IO.File]::WriteAllText($corePartitionHelperOut, '{"topologyCheck":') }
+    elseif ($c.record -eq 'planted') { [IO.File]::WriteAllText($corePartitionHelperOut, $planted) }
     $corePartitionStopFile = Join-Path $dir 'core-partition.stop'
     $corePartitionMeasuredFile = Join-Path $dir 'core-partition.measured'
     # sol r4 CP-02: the smoke runner's result.json names the process it launched (the record's bound pid)
@@ -981,6 +993,8 @@ class CorePartitionPureHelperTests(unittest.TestCase):
             "pre-launch-alive": "same-path-instance-overlap",
             "start-time-overlap": "same-path-instance-overlap",
             "replacement-after-exit": "measured-app-not-observed",
+            # adversary r5 (40038f92) A3
+            "predecessor-gone-before-launch": "measured-app-not-observed",
         }
         for case, code in refused.items():
             with self.subTest(case=case):
@@ -993,6 +1007,17 @@ class CorePartitionPureHelperTests(unittest.TestCase):
             with self.subTest(case=case):
                 control = self.r["measured"][case]
                 self.assertEqual(control[:6], [True, True, True, "0x00FFF", 2.0, 4000.0], f"a same-path process gone before the measured app started is no overlap: {control}")
+
+    def test_a_negative_feed_age_is_no_freshness(self) -> None:
+        """adversary r5 (40038f92) A4: a backward clock step must not turn a 199 s old feed into package values; a sub-second negative age still reads."""
+        self.assertEqual(self.r["negativeAge"], ["feed-age-negative", None, "feed-age-negative", 1])
+
+    def test_a_record_another_writer_put_at_the_helpers_name_is_not_the_helpers(self) -> None:
+        """adversary r5 (40038f92) A2, its literal record, through the job's cleanup block and scalar line."""
+        c = self.cleanup_cases()["record-not-the-helpers"]
+        self.assertEqual([c["topo"], c["bench"], c["load"]], [False, False, False], f"a planted helper record was accepted: {c}")
+        self.assertEqual(c["helperWhy"], "helper-record-not-the-helpers")
+        self.assertIn("corePartitionTopologyOk=helper-record-not-the-helpers", c["why"])
 
     def test_the_runners_launch_and_exit_times_read_as_utc_ticks(self) -> None:
         """adversary r5 A3: the measured window comes from result.json; a DateTime and its ISO string give the same ticks, absent or unreadable is 0."""
