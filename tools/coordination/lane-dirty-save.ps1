@@ -366,12 +366,22 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         # The common directory (refs and objects) is read with it: a linked worktree names it in its commondir file, which every unpinned git call reads again (r8 iter 1, adversary a8807691-A1).
         # The same path strings can name another directory: a .git directory moved away and another moved onto its name between this read and the holds below would be held
         # in its place, and a replacement whose HEAD and index match the working bytes saves as an empty diff. So the identity (volume serial + file index) of each directory
-        # git names is sampled at this read, and each hold must have that same directory open, read from the held handle (r9, adversary 2181cd97-A1, Dot 99ace7b). A main
-        # worktree's .git directory is sampled before git reads it at all; a linked worktree's gitfile target only once git has named it (the gitfile and commondir are held below).
+        # git names is sampled at this read, and each hold must have that same directory open, read from the held handle (r9, adversary 2181cd97-A1, Dot 99ace7b). The
+        # directory git is about to use is sampled BEFORE git reads it: a main worktree's .git directory, or the target a linked worktree's .git gitfile names (read here and
+        # spelled in full), so a replacement between git's read and a later sample cannot be the one sampled (r9 iter 1, adversary 586f103a-A2). A linked worktree's common
+        # dir contains that target, so replacing the common dir moves the target too. The gitfile and commondir are held below.
         $dotGit = Join-Path $Wt '.git'
         $dotGitId = $null
-        if (Test-Path -LiteralPath $dotGit -PathType Container) {
-            $dotGitId = Get-DirtyDirIdentity $dotGit
+        $dotGitDir = $null
+        if (Test-Path -LiteralPath $dotGit -PathType Container) { $dotGitDir = $dotGit }
+        elseif (Test-Path -LiteralPath $dotGit -PathType Leaf) {
+            $first = @(Get-Content -LiteralPath $dotGit -TotalCount 1 -ErrorAction Stop)
+            $m = if ($first.Count -eq 1) { [regex]::Match($first[0], '^gitdir: (.+?)\s*$') } else { $null }
+            if ($null -eq $m -or -not $m.Success) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
+            $dotGitDir = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($Wt, $m.Groups[1].Value))
+        }
+        if ($dotGitDir) {
+            $dotGitId = Get-DirtyDirIdentity $dotGitDir
             if (-not $dotGitId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-git-dir-changed" }
         }
         $gitDir = @(& git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir 2>$null)

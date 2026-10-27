@@ -2788,6 +2788,46 @@ def test_save_dirty_worktree_evidence_refuses_a_git_directory_replaced_between_i
 
 
 @dirty_save_only
+@pytest.mark.parametrize("swap", [True, False], ids=["replaced", "control"])
+def test_save_dirty_worktree_evidence_refuses_a_linked_git_dir_replaced_between_its_first_read_and_its_sample(tmp_path, swap):
+    # r9 iter 1 (adversary 586f103a-A2): a linked worktree's .git is a gitfile, so its target was sampled only after git had named it; a metadata directory replaced
+    # in between (same path, HEAD/index matching the working bytes) was sampled, held and saved as SAVED bytes=0 empty-diff. The gitfile target is now read and
+    # sampled before git reads anything, and the directory git names must be that one.
+    main, dest = _dirty_save_repo(tmp_path)
+    git(main, "checkout", "--", "src/a.txt")
+    wt = tmp_path / "linked"
+    git(main, "worktree", "add", "-q", "-b", "lane", str(wt))
+    (wt / "src" / "a.txt").write_text("two\n")
+    (main / "src" / "a.txt").write_text("two\n")
+    git(main, "commit", "-qam", "two")
+    two = git(main, "rev-parse", "HEAD")
+    admin = main / ".git" / "worktrees" / "linked"
+    replacement = tmp_path / "replacement"
+    shutil.copytree(admin, replacement)
+    (replacement / "HEAD").write_text(two + "\n")
+    git(main, "read-tree", f"--index-output={replacement / 'index'}", two)
+    away = tmp_path / "linked-admin-away"
+    # The seam: the first identity read of git's own forward-slash answer for the linked git dir, i.e. right after git has named it.
+    shim = (f"$script:Swap = ${'true' if swap else 'false'}; $script:Swapped = $false; "
+            "$script:RealId = (Get-Command Get-DirtyDirIdentity -CommandType Function).ScriptBlock; "
+            "function Get-DirtyDirIdentity([string]$Path) { "
+            "if ($script:Swap -and -not $script:Swapped -and $Path.EndsWith('/worktrees/linked')) { $script:Swapped = $true; "
+            f"[System.IO.Directory]::Move('{admin}', '{away}'); [System.IO.Directory]::Move('{replacement}', '{admin}') }}; "
+            "& $script:RealId $Path }")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output \"swapped=$script:Swapped\"")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] == f"swapped={swap}", (out.stdout, out.stderr)
+    if swap:
+        assert away.is_dir() and (admin / "HEAD").read_text().strip() == two, "the shim must have replaced the linked git dir"
+        assert lines[0] == "DIRTY_TREE_SAVE_FAILED card=C1 reason=worktree-git-dir-changed", (out.stdout, out.stderr)
+        assert not list(dest.iterdir()), sorted(p.name for p in dest.iterdir())
+    else:
+        assert lines[0].startswith("DIRTY_TREE_SAVED card=C1") and "verified=reverse-apply-ok" in lines[0], (out.stdout, out.stderr)
+        text = next(dest.glob("dirty-worktree-*.patch")).read_text(encoding="utf-8")
+        assert "-one" in text and "+two" in text, text
+
+
+@dirty_save_only
 @pytest.mark.parametrize("case", ["move-failed", "name-collision", "guard", "control"])
 def test_save_dirty_worktree_evidence_keeps_placement_reasons_typed_under_strict_mode(tmp_path, case):
     # r9 (adversary 2181cd97-A2): Invoke-Workstream.ps1 runs under Set-StrictMode -Version Latest, where reading the Placed key of a helper result that lacks it throws, so
