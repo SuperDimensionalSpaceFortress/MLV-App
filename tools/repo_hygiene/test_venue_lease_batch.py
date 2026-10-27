@@ -267,6 +267,11 @@ def _wait_pid_gone(pid: int, timeout_s: float) -> bool:
     return not _pid_alive(pid)
 
 
+def psq(value: object) -> str:
+    """`value` for the inside of a PowerShell single-quoted literal: every embedded ' is doubled (a temp dir or a message may carry an apostrophe)."""
+    return str(value).replace("'", "''")
+
+
 def utc_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -362,7 +367,10 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self) -> None:
-        self.case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
+        self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+
+    def _init_case(self, case: Path) -> None:
+        self.case = case
         self.share = self.case / "share"
         self.share.mkdir()
         (self.share / "cancel").mkdir()   # the agent's cooperative cancel folder (the agent creates it on the real share)
@@ -662,7 +670,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         def m(x: float) -> str:
             return utc_iso(now + timedelta(minutes=x))
         cases = {"none": [], "cooldown": [(m(-40), m(-10))], "budget": [(m(-120), m(-75)), (m(-45), m(0))], "old": [(m(-400), m(-355))]}
-        script = f"Import-Module '{MODULE}' -Force -DisableNameChecking\n$now = '{utc_iso(now)}'\n$o = [ordered]@{{}}\n"
+        script = f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n$now = '{utc_iso(now)}'\n$o = [ordered]@{{}}\n"
         for name, leases in cases.items():
             arr = ", ".join(f"[pscustomobject]@{{ startUtc = '{s}'; endUtc = '{e}' }}" for s, e in leases)
             script += f"$w = Get-VenueLeaseBudgetWait -Leases @({arr}) -NowUtc $now; $o['{name}'] = [ordered]@{{ reason = $w.reason; waitSec = $w.waitSec; usedSec = $w.usedSec }}\n"
@@ -772,7 +780,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # Resolve-VenueLeaseCaps: against the real um-run an explicit cooldown below the live one, or a budget above it, is LEASE_CAP_RELAXED; tighter is kept;
         # only an offline stub may go looser. Get-VenueLeaseCaps reads the probe's text with heavy-slot.py's rules.
         live = json.dumps(self.LIVE_CAPS)
-        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+        script = f"""Import-Module '{psq(MODULE)}' -Force -DisableNameChecking
 $live = Get-VenueLeaseCaps -Text '{live}'
 $fb = Get-VenueLeaseCaps -Text 'HEAVY_SLOT_LEASE_JSON_MISSING'
 $o = [ordered]@{{ live = "$($live.source) $($live.cooldownSec) $($live.budgetSec) $($live.capSec)"; fb = "$($fb.source) $($fb.cooldownSec) $($fb.budgetSec) $($fb.capSec)" }}
@@ -810,7 +818,7 @@ $o | ConvertTo-Json -Compress
         # CoS/Dot B1 on affa0d1a: budget = max_fraction_per_3h * 10800 whatever -LeaseBudgetWindowSec says (it used to be fraction * the CALLER's window, so 21600 doubled
         # it). A longer window can only count MORE of the earlier leases against the same budget; a shorter one may only shrink the budget, never raise it.
         caps = json.dumps({**self.LIVE_CAPS, "cooldown_minutes": 0, "max_fraction_per_3h": 0.5})
-        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+        script = f"""Import-Module '{psq(MODULE)}' -Force -DisableNameChecking
 $now = [DateTime]::UtcNow
 $o = [ordered]@{{}}
 foreach ($w in 10800, 21600, 86400, 3600, 600) {{
@@ -842,7 +850,7 @@ $o | ConvertTo-Json -Compress -Depth 4
         # config is unrepresentable and is the FALLBACK with a typed reason (never a shorter cooldown than the one configured).
         def caps(minutes: float) -> str:
             return json.dumps({**self.LIVE_CAPS, "cooldown_minutes": minutes})
-        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+        script = f"""Import-Module '{psq(MODULE)}' -Force -DisableNameChecking
 $o = [ordered]@{{}}
 $i = 0
 foreach ($t in '{caps(1440)}', '{caps(2880)}', '{caps(10080)}', '{caps(0.5)}', '{caps(1e9)}') {{
@@ -861,7 +869,7 @@ $o | ConvertTo-Json -Compress
         self.assertTrue(got["c4"].startswith("fallback 1800 cooldown_minutes-unrepresentable"), got["c4"])
 
     def test_r2_i1_two_caps_probe_ids_built_in_the_same_second_differ_and_keep_the_agents_shapes(self) -> None:
-        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+        script = f"""Import-Module '{psq(MODULE)}' -Force -DisableNameChecking
 $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
 [ordered]@{{ ids = $ids; distinct = @($ids | Select-Object -Unique).Count }} | ConvertTo-Json -Compress
 """
@@ -1005,9 +1013,9 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
     def _agent_verdict(self, notafter_dir: Path, job_id: str, not_after_utc: str) -> dict:
         """The agent's OWN reader and verdict (Read-JobNotAfterSidecar, Get-JobNotAfterVerdict, lifted from ultra-magnus-agent.ps1) on a sidecar folder."""
         script = (
-            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{AGENT}', [ref]$null, [ref]$null)\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(AGENT)}', [ref]$null, [ref]$null)\n"
             "foreach ($n in 'Get-JobNotAfterVerdict', 'Read-JobNotAfterSidecar') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
-            f"$notAfterDir = '{notafter_dir}'\n"
+            f"$notAfterDir = '{psq(notafter_dir)}'\n"
             f"$v = Get-JobNotAfterVerdict -Metadata ([pscustomobject]@{{ notAfterUtc = '{not_after_utc}' }}) -Sidecar (Read-JobNotAfterSidecar -JobId '{job_id}')\n"
             "[ordered]@{ state = $v.state; source = $v.source; livenessState = $v.livenessState; livenessSeq = $v.livenessSeq; why = $v.why } | ConvertTo-Json -Compress\n"
         )
@@ -1266,7 +1274,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             while datetime.now(timezone.utc) < claimed + timedelta(seconds=70):
                 time.sleep(0.5)
             self.assertIsNone(p.poll(), "the run is still in its open's wait at TTL + 10 s")
-            script = f"Import-Module '{MODULE}' -Force -DisableNameChecking\n$c = Get-VenueClaim -Venue bachelor -ClaimDir '{self.claims}'\n[ordered]@{{ state = $c.state; reason = $c.reason; nonce = $c.claim.nonce }} | ConvertTo-Json -Compress\n"
+            script = f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n$c = Get-VenueClaim -Venue bachelor -ClaimDir '{psq(self.claims)}'\n[ordered]@{{ state = $c.state; reason = $c.reason; nonce = $c.claim.nonce }} | ConvertTo-Json -Compress\n"
             out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
             seen = json.loads(out.stdout)
@@ -1290,15 +1298,15 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         # Update-VenueClaim renews only the claim with its nonce: another owner's claim (a new one after a break) is NOT_OURS and left byte for byte.
         self.claims.mkdir()
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-            f"$c = Request-VenueClaim -Venue bachelor -RunDir 'x' -TtlSec 60 -ClaimDir '{self.claims}'\n"
-            f"$before = [IO.File]::ReadAllText('{self.claim_path}')\n"
-            f"$other = Update-VenueClaim -Venue bachelor -Nonce 'not-the-nonce' -TtlSec 600 -ClaimDir '{self.claims}'\n"
-            f"$same = ([IO.File]::ReadAllText('{self.claim_path}') -ceq $before)\n"
-            f"$mine = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{self.claims}'\n"
-            f"$after = Get-VenueClaim -Venue bachelor -ClaimDir '{self.claims}'\n"
-            f"$rel = Release-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -ClaimDir '{self.claims}'\n"
-            f"$gone = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{self.claims}'\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$c = Request-VenueClaim -Venue bachelor -RunDir 'x' -TtlSec 60 -ClaimDir '{psq(self.claims)}'\n"
+            f"$before = [IO.File]::ReadAllText('{psq(self.claim_path)}')\n"
+            f"$other = Update-VenueClaim -Venue bachelor -Nonce 'not-the-nonce' -TtlSec 600 -ClaimDir '{psq(self.claims)}'\n"
+            f"$same = ([IO.File]::ReadAllText('{psq(self.claim_path)}') -ceq $before)\n"
+            f"$mine = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{psq(self.claims)}'\n"
+            f"$after = Get-VenueClaim -Venue bachelor -ClaimDir '{psq(self.claims)}'\n"
+            f"$rel = Release-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -ClaimDir '{psq(self.claims)}'\n"
+            f"$gone = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{psq(self.claims)}'\n"
             "[ordered]@{ other = $other.state; same = $same; mine = $mine.state; live = $after.state; ttlLeft = [int](($after.claim.expiresUtc.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds); rel = $rel; gone = $gone.state } | ConvertTo-Json -Compress\n"
         )
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
@@ -1477,11 +1485,11 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         empty = self.case / "no-fns.ps1"
         empty.write_text("function Something-Else { 1 }\n", encoding="utf-8")
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             "[ordered]@{\n"
-            f"  noFns = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1' -AgentScript '{empty}'\n"
-            f"  noFile = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1' -AgentScript '{self.case / 'missing.ps1'}'\n"
-            f"  noSidecar = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1'\n"
+            f"  noFns = Test-VenueJobLivenessReadback -AgentShare '{psq(self.share)}' -JobId 'j1' -AgentScript '{psq(empty)}'\n"
+            f"  noFile = Test-VenueJobLivenessReadback -AgentShare '{psq(self.share)}' -JobId 'j1' -AgentScript '{psq(self.case / 'missing.ps1')}'\n"
+            f"  noSidecar = Test-VenueJobLivenessReadback -AgentShare '{psq(self.share)}' -JobId 'j1'\n"
             "} | ConvertTo-Json -Compress -Depth 4\n"
         )
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
@@ -1512,8 +1520,8 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         stall = self.case / "stalled-agent.ps1"
         stall.write_text("function Get-JobNotAfterVerdict { param($Metadata, $Sidecar) 1 }\nfunction Read-JobNotAfterSidecar { param($JobId) Start-Sleep -Seconds 120 }\n", encoding="utf-8")
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-            f"$t = [Diagnostics.Stopwatch]::StartNew(); $r = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1' -AgentScript '{stall}' -TimeoutSec 1; $t.Stop()\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$t = [Diagnostics.Stopwatch]::StartNew(); $r = Test-VenueJobLivenessReadback -AgentShare '{psq(self.share)}' -JobId 'j1' -AgentScript '{psq(stall)}' -TimeoutSec 1; $t.Stop()\n"
             "[ordered]@{ live = $r.live; state = $r.state; livenessState = $r.livenessState; error = $r.error; ms = $t.ElapsedMilliseconds } | ConvertTo-Json -Compress\n"
             "Complete-VenueProcess -ExitCode 0\n"
         )
@@ -1718,7 +1726,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         self.assertIn('$probeJobId = "$jobStem-health"', leg)
         stem = "dve-m16-1243-display-windowed-s1-bachelor-cpu-20261023184200-lb0123456789ab"
         script = (
-            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{AGENT}', [ref]$null, [ref]$null)\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(AGENT)}', [ref]$null, [ref]$null)\n"
             "foreach ($n in 'Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
             "$p = ($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'GateExemptJobPattern' }).DefaultValue.Value\n"
             f"[ordered]@{{ leg = Get-LeaseBatchToken '{stem}'; health = Get-LeaseBatchToken '{stem}-health'; healthLight = ('{stem}-health' -match $p); legLight = ('{stem}' -match $p)\n"
@@ -1744,8 +1752,8 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         (self.share / "logs" / "lease-batch-0123456789ab.jsonl").write_text(
             json.dumps({"leaseId": "L0", "endReason": "idle"}) + "\n" + json.dumps({"leaseId": "L1", "endReason": "closed"}) + "\n", encoding="utf-8")
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-            f"$s = '{self.share}'\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$s = '{psq(self.share)}'\n"
             "[ordered]@{ found = (Get-VenueJobResult -AgentShare $s -JobId 'j1').result.admission.leaseBatch.leaseId; absent = (Get-VenueJobResult -AgentShare $s -JobId 'j2').state\n"
             "  bad = (Get-VenueJobResult -AgentShare $s -JobId '..\\x').state; rec = (Read-VenueLeaseBatchReceipt -AgentShare $s -Token '0123456789ab' -LeaseId 'L1').record.endReason\n"
             "  none = (Read-VenueLeaseBatchReceipt -AgentShare $s -Token '0123456789ab' -LeaseId 'L9').state; nofile = (Read-VenueLeaseBatchReceipt -AgentShare $s -Token 'ffffffffffff' -LeaseId 'L1').state } | ConvertTo-Json -Compress\n"
@@ -1777,6 +1785,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def setUp(self) -> None:
         super().setUp()
+        self._stage_case()
+
+    def _stage_case(self) -> None:
         self.leg_args = self.case / "leg-args.jsonl"
         # two builds staged in the venue's cache, by the path Invoke-VenueLeg hashes
         self.manifests = {c: self.stage(c, f"build {c[:1]}") for c in (self.commit_a, self.commit_b)}
@@ -1961,7 +1972,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_r3_a2_arms_that_differ_only_in_case_are_separate_arms(self) -> None:
         # sol r3 A2: the arm label is validated case-sensitively (A and a are both legal) but the interleave keyed its queues case-insensitively, merging them.
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             "$items = 'AAaa'.ToCharArray() | ForEach-Object -Begin { $i = 0 } -Process { $i++; [pscustomobject]@{ arm = [string]$_; n = $i } }\n"
             "(@(Get-VenueInterleavedLegPlan -Items @($items)) | ForEach-Object { \"$($_.arm)$($_.n)\" }) -join ' '\n"
         )
@@ -2069,8 +2080,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.run_dir.mkdir(parents=True, exist_ok=True)
         keep = self.run_dir / "leg-plan.json"
         keep.write_text('{"preserved":"first invocation"}\n', encoding="utf-8")
-        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-                  f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\other-run' -Purpose foreign -TtlSec 3600 -ClaimDir '{self.claims}' -OwnerPid {os.getpid()}\n"
+        script = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+                  f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\other-run' -Purpose foreign -TtlSec 3600 -ClaimDir '{psq(self.claims)}' -OwnerPid {os.getpid()}\n"
                   "$r.granted\n")
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
@@ -2136,8 +2147,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         Returns (runner, paused, locked). Dot on #684: the lock helper used to poll for the claim file and hope to win the race with the runner's next log line; the handshake makes the order a fact."""
         paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
         anchor = "function L([string]$Message) {\n"
-        pause = (f"    if ($Message -like '{message}*') {{ Set-Content -LiteralPath '{paused}' -Value 'paused'; $w = [DateTime]::UtcNow.AddSeconds(60); "
-                 f"while (-not (Test-Path -LiteralPath '{locked}') -and [DateTime]::UtcNow -lt $w) {{ Start-Sleep -Milliseconds 20 }} }}\n")
+        pause = (f"    if ($Message -like '{psq(message)}*') {{ Set-Content -LiteralPath '{psq(paused)}' -Value 'paused'; $w = [DateTime]::UtcNow.AddSeconds(60); "
+                 f"while (-not (Test-Path -LiteralPath '{psq(locked)}') -and [DateTime]::UtcNow -lt $w) {{ Start-Sleep -Milliseconds 20 }} }}\n")
         return self._patched_runner(anchor, anchor + pause), paused, locked
 
     def _lock_log_while_the_runner_is_paused(self, log: Path, paused: Path, locked: Path, give_up_s: float = 120) -> tuple[threading.Event, threading.Thread]:
@@ -2200,8 +2211,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # B5's class: Request-VenueClaim had granted the claim when CLAIM_STALE_BROKEN was logged, and that line sat outside the try, so a log failure there left the new
         # claim (and no keeper yet) behind with no release. The line is best effort now; the batch carries on and ends normally. The failure is injected into a copy of the runner.
         self.claims.mkdir(parents=True, exist_ok=True)
-        seed = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-                f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\dead-run' -Purpose dead -TtlSec 3600 -ClaimDir '{self.claims}' -OwnerPid {os.getpid()}\n"
+        seed = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+                f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\dead-run' -Purpose dead -TtlSec 3600 -ClaimDir '{psq(self.claims)}' -OwnerPid {os.getpid()}\n"
                 "$r.granted\n")
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", seed], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
@@ -2406,6 +2417,103 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         res = batch_result(r.stdout)
         self.assertEqual((res["exitCode"], res["receiptPersistFailures"], res["logWriteFailures"]), (0, [], 0))
         self.assertNotIn("RECEIPT_PERSIST_FAILED", r.stdout)
+
+    # r2 (Dot advisory on #704): the generated-runner pause helper embedded its paths unescaped in a PowerShell single-quoted literal (an apostrophe in the temp dir broke the runner),
+    # and two receipt-write paths had no test: the batch-NN.json rewrite when only the diagnostic's own log write fails, and both receipt destinations failing at once.
+    def _run_plan_with_log_held_at(self, message: str, give_up_s: float = 120) -> tuple[subprocess.CompletedProcess, Path]:
+        """Run the A/B plan on a runner copy that pauses at the first log line starting `message`, with batch.log held exclusively from that moment. Returns (result, the `locked` marker)."""
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "batch.log").write_text("", encoding="utf-8")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        runner, paused, locked = self._runner_paused_at_claim_taken(message)
+        args[args.index("-File") + 1] = str(runner)
+        done, t = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", paused, locked, give_up_s)
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+        except subprocess.TimeoutExpired as ex:
+            self.fail(f"the process did not end within 90 s: {ex.stdout!r}")
+        finally:
+            done.set()
+            t.join(5)
+        return r, locked
+
+    def test_r2_nit_a_case_dir_with_an_apostrophe_does_not_break_the_generated_runner_or_its_pause_markers(self) -> None:
+        # Dot nit (source-confirmed at 1a880fee): `-LiteralPath '{paused}'` and `'{locked}'` were embedded unescaped, so a temp dir such as C:\...\case-o'brien-x made the generated runner
+        # unparseable (the process died before it paused). Every path embedded in a generated PowerShell literal now goes through psq (the quote doubled).
+        self._init_case(Path(tempfile.mkdtemp(prefix="case-o'brien-", dir=self.tmp)))
+        self._stage_case()
+        self.assertIn("'", str(self.case))
+        self.assertEqual(psq("a'b''c"), "a''b''''c")
+        r, locked = self._run_plan_with_log_held_at("CLAIM_TAKEN", give_up_s=20)
+        self.assertEqual(locked.read_text(encoding="utf-8"), "locked", "the handshake: the generated runner parsed, paused before CLAIM_TAKEN and resumed only once the lock was held\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_r2_cov_a_jsonl_append_failure_whose_diagnostic_cannot_be_logged_rewrites_batch_receipt_with_the_count_and_exits_13(self) -> None:
+        # batch-01.json is written first (count 0) and succeeds; the batches.jsonl append fails (a directory); its RECEIPT_PERSIST_FAILED line cannot be logged (batch.log held), which bumps
+        # logWriteFailures; so the already-written batch-01.json is rewritten with the live count (Write-BatchReceipt's second per-batch write). The typed record and exit 13 are unchanged.
+        self._occupy_with_directory("batches.jsonl")
+        r, locked = self._run_plan_with_log_held_at("RECEIPT_PERSIST_FAILED")
+        self.assertEqual(locked.read_text(encoding="utf-8"), "locked", "the handshake: the runner paused at the persist diagnostic and resumed only once the lock was held")
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["counted"]), (13, "RECEIPT_PERSIST_FAILED", 4, 4))
+        self._assert_persist_failure_said(r, res, "batches.jsonl")
+        self.assertGreaterEqual(res["logWriteFailures"], 1, "the diagnostic's own log failure is counted")
+        per_batch = json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))
+        self.assertEqual(per_batch["endReason"], "ALL_LEGS_DONE")
+        self.assertGreaterEqual(per_batch["logWriteFailures"], 1, "batch-01.json was rewritten once the diagnostic's log failure was counted")
+        self.assertLessEqual(per_batch["logWriteFailures"], res["logWriteFailures"], "lines logged after the rewrite (the result line) may add more, never fewer")
+
+    def test_r2_cov_both_receipt_destinations_failing_are_both_named_and_the_clean_run_exits_13(self) -> None:
+        self._occupy_with_directory("batch-01.json", "batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["counted"], res["notRun"]), (13, "RECEIPT_PERSIST_FAILED", 4, 4, 0))
+        self._assert_persist_failure_said(r, res, "batch-01.json", "batches.jsonl")
+        self.assertEqual(sorted(Path(f["file"]).name for f in res["receiptPersistFailures"]), ["batch-01.json", "batches.jsonl"])
+        self.assertEqual([x["endReason"] for x in res["batches"]], ["ALL_LEGS_DONE"], "the in-memory row is kept")
+
+    def test_r2_cov_both_receipt_destinations_failing_keep_exit_12_for_a_batch_error(self) -> None:
+        self._occupy_with_directory("leg-plan.json", "batch-01.json", "batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (12, "BATCH_ERROR", 0, 4))
+        self._assert_persist_failure_said(r, res, "batch-01.json", "batches.jsonl")
+
+    def test_r2_cov_both_receipt_destinations_failing_keep_exit_7_for_a_failed_leg(self) -> None:
+        self._occupy_with_directory("batch-01.json", "batches.jsonl")
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), FAKE_LEG_MODES="exit3")
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["failed"]), (7, 1))
+        self._assert_persist_failure_said(r, res, "batch-01.json", "batches.jsonl")
+
+    def test_r2_cov_both_receipt_destinations_failing_keep_exit_3_for_a_pre_claim_deadline(self) -> None:
+        self.claims.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        rows = [{"venue": "bachelor", "leaseId": "old-1", "startUtc": utc_iso(now - timedelta(minutes=105)), "endUtc": utc_iso(now - timedelta(minutes=60))},
+                {"venue": "bachelor", "leaseId": "old-2", "startUtc": utc_iso(now - timedelta(minutes=45)), "endUtc": utc_iso(now - timedelta(minutes=1))}]
+        (self.claims / "bachelor.lease-ledger.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
+        self._occupy_with_directory("batch-01.json", "batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (3, "DEADLINE", 0, 4))
+        self._assert_persist_failure_said(r, res, "batch-01.json", "batches.jsonl")
+
+    def test_r2_cov_both_receipt_destinations_failing_keep_exit_11_for_an_unreconciled_open(self) -> None:
+        self._occupy_with_directory("batch-01.json", "batches.jsonl")
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=12))
+        r = self.run_batch([self.specs[0]], "-DeadlineUtc", deadline, "-CancelReconcileSec", "3", FAKE_OPEN_MODES="gatehold")
+        self.assertEqual(r.returncode, 11, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (11, "OPEN_CANCEL_UNRECONCILED"))
+        self._assert_persist_failure_said(r, res, "batch-01.json", "batches.jsonl")
 
     def test_r7_adv_a1_a_direct_log_line_that_cannot_be_appended_is_counted_and_said(self) -> None:
         # adversary r7 A1: L's own append threw into the batch catch without Register-LogFailure, so a held batch.log at CLAIM_TAKEN turned a healthy batch into
@@ -3518,8 +3626,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         c = "5" * 40
         p = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
         p.write_bytes(b"\xef\xbb\xbf" + json.dumps({"sourceCommit": c, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **ARTIFACT_SHAS}).encode("utf-8"))
-        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30\n"
+        script = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{psq(self.share)}' -SourceCommit '{c}' -TimeoutSec 30\n"
                   "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sha = $r.sha256; problem = $r.contentProblem }\n")
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -3543,9 +3651,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         for label, (data, expected) in cases.items():
             with self.subTest(case=label):
                 p.write_bytes(data)
-                script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-                          f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30\n"
-                          f"$oracle = try {{ $null -ne ([IO.File]::ReadAllText('{p}') | ConvertFrom-Json) }} catch {{ $false }}\n"
+                script = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+                          f"$r = Get-VenueStagedBuildManifest -AgentShare '{psq(self.share)}' -SourceCommit '{c}' -TimeoutSec 30\n"
+                          f"$oracle = try {{ $null -ne ([IO.File]::ReadAllText('{psq(p)}') | ConvertFrom-Json) }} catch {{ $false }}\n"
                           "ConvertTo-Json -Compress -InputObject @{ state = $r.state; problem = [string]$r.contentProblem; validatorParses = $oracle }\n")
                 out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
                 self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -3558,7 +3666,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_r5_h2_the_interleave_helper_keeps_an_array_valued_item_whole(self) -> None:
         # key3 H2 (sol): the bare Dequeue() output was enumerated, so one array-valued item came back as its elements.
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             "$items = [object[]]::new(2); $items[0] = @([pscustomobject]@{ arm = 'A' }, [pscustomobject]@{ arm = 'B' }); $items[1] = [pscustomobject]@{ arm = 'A' }\n"
             "$one = [object[]]::new(1); $one[0] = $items[0]\n"
             "[ordered]@{ one = @(Get-VenueInterleavedLegPlan -Items $one).Count; two = @(Get-VenueInterleavedLegPlan -Items $items).Count } | ConvertTo-Json -Compress\n"
@@ -3575,7 +3683,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def test_the_interleave_helper(self) -> None:
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             "function P([string]$arms) { @($arms.ToCharArray() | ForEach-Object -Begin { $i = 0 } -Process { $i++; [pscustomobject]@{ arm = [string]$_; n = $i } }) }\n"
             "function S($items) { (@(Get-VenueInterleavedLegPlan -Items $items) | ForEach-Object { \"$($_.arm)$($_.n)\" }) -join ' ' }\n"
             "[ordered]@{ block = S (P 'AABB'); uneven = S (P 'AAAB'); three = S (P 'AABBCC'); one = S (P 'AAA'); mixed = S (P 'ABBA') } | ConvertTo-Json -Compress\n"
@@ -3606,8 +3714,8 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
         """Seconds from now to the lease end Get-LeaseEndUtc returns, per input shape. The function is the runner's own text (AST), not a copy."""
         until = int(cls.ENDED.timestamp()) + cls.LEFT
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
             "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-LeaseEndUtc' }, $true)\n"
             ". ([scriptblock]::Create($fn.Extent.Text))\n"
             f"$until = {until}\n"
