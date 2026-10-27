@@ -2894,8 +2894,8 @@ def test_save_dirty_worktree_evidence_refuses_to_publish_when_the_destination_id
     dest = tmp_path / "outside"
     dest.mkdir()
     before = git(wt, "status", "--porcelain")
-    # Lock-DirtyDirectory is overridden to model a platform that cannot hold the directory open, so the identity check is what has to catch the swap.
-    shim = ("function Lock-DirtyDirectory([string]$Path) { $null }; $script:Swapped = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
+    # Lock-DirtyDirectory is overridden with a hold that holds nothing (and Unlock with a no-op), so the identity check is what has to catch the swap.
+    shim = ("function Lock-DirtyDirectory([string]$Path) { 1 }; function Unlock-DirtyDirectory($Handle) { }; $script:Swapped = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
             f"if ($Stage -eq 'before-publish' -and -not $script:Swapped) {{ $script:Swapped = $true; [System.IO.Directory]::Move('{dest}', '{dest}.moved'); "
             f"$null = New-Item -ItemType Junction -Path '{dest}' -Target '{wt / 'run'}' }} }}")
     out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
@@ -2979,8 +2979,87 @@ def test_save_dirty_worktree_evidence_refuses_a_destination_that_reaches_the_wor
     if not os.path.isdir(unc):
         pytest.skip("no administrative share on this host")
     out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{unc}' -CardName C1 -RoundName r1")
-    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-inside-worktree", (out.stdout, out.stderr)
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-unc-local-host", (out.stdout, out.stderr)
     assert not list((wt / "run").iterdir())
+    # r5 iter 2 (adversary A2): a share of the worktree's own subfolder ends its ancestry at the share root, so no identity walk can relate it; any UNC path whose host is this machine
+    # is refused, including one that is not inside the worktree.
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    drive, rest = os.path.splitdrive(str(outside))
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '\\\\localhost\\{drive[0]}${rest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-unc-local-host" and not list(outside.iterdir()), (out.stdout, out.stderr)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the deep path needs the extended-length prefix, a Windows spelling")
+@dirty_save_only
+def test_dirty_identity_walk_reaches_the_worktree_however_deep_the_destination_is(tmp_path):
+    # r5 iter 2 (adversary A2): the walk up from the destination stopped after 128 parents, short of a worktree further up.
+    wt, _ = _dirty_save_repo(tmp_path)
+    deep = "\\\\?\\" + str(wt)
+    for _ in range(140):
+        deep += "\\a"
+    try:
+        os.makedirs(deep)
+        out = dirty_save_pwsh(f"Write-Output (Test-DirtyUnderIdentity -Path '{deep}' -Identity (Get-DirtyDirIdentity '{wt}'))")
+        assert out.stdout.strip() == "True", (out.stdout, out.stderr)
+    finally:
+        import shutil
+        shutil.rmtree("\\\\?\\" + str(wt) + "\\a", ignore_errors=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="holding a directory open is Windows share-mode behaviour")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_destination_it_cannot_hold(tmp_path):
+    # r5 iter 2 (adversary A5): a failed hold was accepted as 'no hold', leaving the destination swappable for the whole save.
+    wt, dest = _dirty_save_repo(tmp_path)
+    out = dirty_save_pwsh(f"function Lock-DirtyDirectory([string]$Path) {{ $null }}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-not-held", (out.stdout, out.stderr)
+    assert not list(dest.iterdir()) and not [p for p in wt.glob("dirty-worktree-*")]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a directory junction is the Windows spelling of a retargetable alias")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_worktree_replaced_between_resolving_and_holding_it(tmp_path):
+    # r5 iter 2 (adversary A3): the worktree was resolved and then held in two steps; a rename plus a junction in between made the hold pin another repository, which was then saved.
+    wt_a, dest = _dirty_save_repo(tmp_path)
+    (tmp_path / "b").mkdir()
+    wt_b, _ = _dirty_save_repo(tmp_path / "b")
+    (wt_b / "src" / "a.txt").write_text("bee\n")
+    before_b = git(wt_b, "status", "--porcelain")
+    shim = ("$script:RealLock = (Get-Command Lock-DirtyDirectory -CommandType Function).ScriptBlock; $script:Swapped = $false; "
+            "function Lock-DirtyDirectory([string]$Path) { "
+            f"if ($Path -ieq '{wt_a}' -and -not $script:Swapped) {{ $script:Swapped = $true; [System.IO.Directory]::Move('{wt_a}', '{wt_a}.old'); "
+            f"$null = New-Item -ItemType Junction -Path '{wt_a}' -Target '{wt_b}' }}; & $script:RealLock $Path }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt_a}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=worktree-identity-changed", (out.stdout, out.stderr)
+    assert not list(dest.iterdir()) and git(wt_b, "status", "--porcelain") == before_b
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the console encoding is a Windows console property")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_keeps_non_ascii_names_under_an_ascii_console_encoding(tmp_path):
+    # r5 iter 2 (adversary A4): PowerShell decodes git's output with [Console]::OutputEncoding, so an ASCII console saved 'e-acute.txt' as '??.txt'.
+    wt, dest = _dirty_save_repo(tmp_path)
+    (wt / "é.txt").write_text("x\n")
+    out = dirty_save_pwsh(f"[Console]::OutputEncoding = [System.Text.Encoding]::ASCII; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVED"), (out.stdout, out.stderr)
+    status = next(dest.glob("dirty-worktree-*.status.txt")).read_text(encoding="utf-8")
+    assert "?? é.txt" in status.splitlines() and "??.txt" not in status, status
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_reapply_command_survives_apply_whitespace_error(tmp_path):
+    # r5 iter 2 (adversary A1): the saver verifies the patch with --whitespace=nowarn, so the advertised command must carry it too, or apply.whitespace=error refuses trailing blanks.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "config", "apply.whitespace", "error")
+    git(wt, "config", "core.whitespace", "trailing-space")
+    (wt / "src" / "a.txt").write_bytes(b"two   \n")
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    saved = re.search(r" reapply=(git -C .+)$", out.stdout.strip())
+    assert out.stdout.startswith("DIRTY_TREE_SAVED") and saved, (out.stdout, out.stderr)
+    git(wt, "checkout", "--", "src/a.txt")
+    again = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", saved.group(1)], text=True, capture_output=True)
+    assert again.returncode == 0 and (wt / "src" / "a.txt").read_bytes().replace(b"\r\n", b"\n") == b"two   \n", (saved.group(1), again.stdout, again.stderr)
 
 
 @dirty_save_only

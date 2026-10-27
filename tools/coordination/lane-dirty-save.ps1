@@ -144,7 +144,10 @@ function Format-DirtyResolved([string]$Path) {
 # Volume serial + file index of the directory a path opens onto (every link followed); where the kernel cannot answer, the resolved path stands in for it.
 function Get-DirtyDirIdentity([string]$Path) {
     if ($IsWindows -or $env:OS -eq 'Windows_NT') {
-        try { if ('DirtyFinalPath' -as [type]) { return [DirtyFinalPath]::Identity($Path) } } catch { return $null }
+        try {
+            if (-not ('DirtyFinalPath' -as [type])) { $null = Get-DirtyKernelPath $Path }  # defines the type; without it an identity would come back in the path-based form
+            if ('DirtyFinalPath' -as [type]) { return [DirtyFinalPath]::Identity($Path) }
+        } catch { return $null }
     }
     return 'path:' + (Resolve-DirtyRealPath $Path)
 }
@@ -170,11 +173,25 @@ function Unlock-DirtyDirectory($Handle) { if ($null -ne $Handle) { try { [DirtyF
 function Test-DirtyUnderIdentity([string]$Path, [string]$Identity) {
     if (-not $Identity) { return $false }
     $cur = $Path
-    for ($i = 0; $cur -and $i -lt 128; $i++) {
+    while ($cur) {  # every step shortens the path, so this ends at the root however deep the destination is (r5 adversary A2: a cap of 128 stopped short of the worktree)
         if ((Get-DirtyDirIdentity $cur) -ceq $Identity) { return $true }
         $cur = [System.IO.Path]::GetDirectoryName($cur)
     }
     return $false
+}
+
+# True for a UNC path (\\host\share\...) whose host is this machine under ANY name: localhost, the machine name, a DNS alias, an address. Such a share can expose the worktree itself,
+# and its ancestry stops at the share root, which the volume serial + file index walk above can then never relate to the worktree (r5 adversary A2). A host on another machine cannot.
+function Test-DirtyUncLocalHost([string]$Path) {
+    if (-not $Path.StartsWith('\\') -or $Path.StartsWith('\\?\')) { return $false }
+    $hostName = ($Path.Substring(2) -split '\\')[0]
+    if (-not $hostName) { return $false }
+    try {
+        $local = @([System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() | ForEach-Object { $_.GetIPProperties().UnicastAddresses.Address.IPAddressToString })
+        $target = @([System.Net.Dns]::GetHostAddresses($hostName.Split('%')[0].Trim('[', ']')) | ForEach-Object { $_.IPAddressToString })
+        foreach ($a in $target) { if ($a -in $local -or $a -eq '::1' -or $a.StartsWith('127.')) { return $true } }
+        return $false
+    } catch { return $true }  # a name that cannot be placed is not proven remote
 }
 
 # The destination was resolved once, to its physical path, and every write goes to that literal path. Before each write and each publish the directory behind that path
@@ -223,7 +240,7 @@ function Test-DirtyPatchComplete([string]$Wt, [string]$Patch, [string[]]$GitDiff
 }
 
 function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardName = '', [string]$RoundName = '') {
-    $tmp = $null; $stagedTmp = $null; $statTmp = $null; $mergeTmp = $null; $destLock = $null; $wtLock = $null
+    $tmp = $null; $stagedTmp = $null; $statTmp = $null; $mergeTmp = $null; $destLock = $null; $wtLock = $null; $prevEnc = $null
     $PSNativeCommandUseErrorActionPreference = $false  # local to this call: every git exit code below is judged here, never thrown (git diff --cached --quiet exits 1 when something is staged)
     $evidence = ''  # ' patch=.. status=..' for the files placed so far; every failure after the first placement ends with it
     $CardName = $CardName -replace '\s+', ' '; $RoundName = $RoundName -replace '\s+', ' '  # the result is one line
@@ -233,6 +250,8 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
     $savedEnv = @{}
     foreach ($v in $gitEnv) { if (Test-Path -LiteralPath "Env:$v") { $savedEnv[$v] = (Get-Item -LiteralPath "Env:$v").Value; Remove-Item -LiteralPath "Env:$v" } }  # removed, not emptied: git reads an empty GIT_DIR as a path
     try {
+        # PowerShell decodes git's output with [Console]::OutputEncoding; under an ASCII or OEM console a UTF-8 file name would come back as '??' and be saved under the wrong name (r5 adversary A4).
+        try { $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { $prevEnc = $null }
         if (-not (Test-Path -LiteralPath $Dest -PathType Container)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=no-run-dir" }
         $Dest = (Resolve-Path -LiteralPath $Dest).ProviderPath  # git -C $Wt would resolve a relative --output against the worktree, not the caller
         # A relative -Wt means the caller's PowerShell location; git -C and [IO.Path]::GetFullPath would read it against the process directory, which can differ (r4 adversary A1).
@@ -242,10 +261,17 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         # junction while the save runs. Every git call and write below uses those literal paths and never reopens the -Dest / -Wt spelling, so a junction retargeted after this point cannot
         # steer evidence into the worktree or make git read another repository. $guard also re-proves the destination (same volume serial + file index, same resolved path, outside the
         # worktree by path and by identity) right before each write and each rename into place, and a change is DIRTY_TREE_SAVE_FAILED reason=dest-identity-changed.
+        $onWindows = [bool]($IsWindows -or $env:OS -eq 'Windows_NT')
         $destReal = Resolve-DirtyRealPath $Dest
+        if (Test-DirtyUncLocalHost $destReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-unc-local-host" }
         $destLock = Lock-DirtyDirectory $destReal
+        if ($onWindows -and $null -eq $destLock) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-not-held" }  # a destination that cannot be held cannot be trusted not to be swapped (r5 adversary A5)
         $wtReal = Resolve-DirtyRealPath $Wt
         $wtLock = Lock-DirtyDirectory $wtReal
+        if ($onWindows -and $null -eq $wtLock) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-not-held" }
+        # Between the resolve and the hold a rename plus a junction could have put another directory behind the same name: the hold would then pin that one. Resolving again, now that
+        # the hold is in place, must give the same physical path (r5 adversary A3).
+        if ((Resolve-DirtyRealPath $wtReal) -ine $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
         $Dest = $destReal; $Wt = $wtReal
         $prefix = @(& git -C $Wt rev-parse --show-prefix 2>$null)
         if ($LASTEXITCODE -ne 0 -or ($prefix -join '').Trim() -ne '') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
@@ -347,11 +373,12 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             & git -C $Wt apply --check -R --whitespace=nowarn $patch 2>$null
             $verified = if ($LASTEXITCODE -eq 0) { 'reverse-apply-ok' } else { 'reverse-apply-FAILED' }
         }
-        return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=git -C $(ConvertTo-DirtySingleQuoted $Wt) apply $(ConvertTo-DirtySingleQuoted $patch)"
+        return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=git -C $(ConvertTo-DirtySingleQuoted $Wt) apply --whitespace=nowarn $(ConvertTo-DirtySingleQuoted $patch)"  # nowarn: apply.whitespace=error would refuse a line with trailing blanks that the saver verified
     }
     catch { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($_.Exception.Message -replace '\s+', ' ')$evidence" }  # a throw after a placement still names what was placed (r4 adversary A2)
     finally {
         foreach ($t in $tmp, $stagedTmp, $statTmp, $mergeTmp) { if ($t -and (Test-Path -LiteralPath $t)) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } }
+        if ($null -ne $prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { } }
         Unlock-DirtyDirectory $wtLock; Unlock-DirtyDirectory $destLock  # released only after the temp cleanup, which still runs inside the held destination
         foreach ($v in $savedEnv.Keys) { Set-Item -LiteralPath "Env:$v" -Value $savedEnv[$v] }
     }
