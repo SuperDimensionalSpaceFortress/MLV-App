@@ -3026,7 +3026,30 @@ def test_remove_dirty_temp_deletes_only_the_file_it_created_through_the_handle_i
 
 
 @dirty_save_only
-@pytest.mark.parametrize("case", ["access-denied", "guard-throws", "missing-drive"])
+def test_save_dirty_worktree_evidence_refuses_a_repository_naming_file_that_is_a_symbolic_link(tmp_path):
+    # r10 iter 2 (adversary a80a10d3-A1): the file hold followed a symbolic link, so it held the link's target while the link itself, which git follows to find the common
+    # dir, could be pointed at another repository mid-save. The naming file is now held as itself, and a reparse point is refused (git-metadata-not-held).
+    main, dest = _dirty_save_repo(tmp_path)
+    git(main, "checkout", "--", "src/a.txt")
+    wt = tmp_path / "linked"
+    git(main, "worktree", "add", "-q", "-b", "lane", str(wt))
+    (wt / "src" / "a.txt").write_text("two\n")
+    commondir = main / ".git" / "worktrees" / "linked" / "commondir"
+    real = tmp_path / "commondir-target"
+    real.write_bytes(commondir.read_bytes())
+    commondir.unlink()
+    try:
+        os.symlink(real, commondir)
+    except OSError as exc:
+        pytest.skip(f"cannot create a symbolic link here: {exc}")
+    assert git(wt, "rev-parse", "--path-format=absolute", "--git-common-dir").replace("\\", "/").rstrip("/").lower() == str(main / ".git").replace("\\", "/").lower()
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=git-metadata-not-held", (out.stdout, out.stderr)
+    assert not list(dest.iterdir()), sorted(p.name for p in dest.iterdir())
+
+
+@dirty_save_only
+@pytest.mark.parametrize("case", ["access-denied", "guard-throws", "missing-drive", "missing-drive-continue"])
 def test_move_dirty_evidence_returns_its_failure_table_whatever_throws(tmp_path, case):
     # r10 (sol r9 B4, adversary 7c56bf2b-A4): an UnauthorizedAccessException from the move, a -Guard that throws and Join-Path on a drive that does not exist escaped the
     # helper's always-returns-a-hashtable contract. Each now returns the failure table, Placed key included, and the temp file is left as it was.
@@ -3037,6 +3060,8 @@ def test_move_dirty_evidence_returns_its_failure_table_whatever_throws(tmp_path,
                           f"-Dir '{tmp_path}'", "move-failed:0x80070005 access denied"),
         "guard-throws": ("", f"-Dir '{tmp_path}' -Guard {{ throw [System.IO.IOException]::new('guard read failed') }}", "placement-failed:"),
         "missing-drive": ("", "-Dir 'PR698MissingDrive:\\run'", "placement-failed:"),
+        # r10 iter 2 (adversary a80a10d3-A2): under the default preference Join-Path only wrote an error and the empty name came back as move-failed.
+        "missing-drive-continue": ("$ErrorActionPreference = 'Continue'; ", "-Dir 'PR698MissingDrive:\\run'", "placement-failed:"),
     }[case]
     out = dirty_save_pwsh(f"$ErrorActionPreference = 'Stop'; Set-StrictMode -Version Latest; {seam}"
                           f"$r = Move-DirtyEvidenceToFreeName -Tmp '{tmp}' {extra} -Stem dirty-worktree- -Ext .patch -Full ('a' * 64); "

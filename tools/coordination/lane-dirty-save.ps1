@@ -51,7 +51,7 @@ function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem,
         if ($FirstName) { $names += , @($FirstName, '') }
         foreach ($n in 8, 16, 32, 64) { $names += , @("$Stem$($Full.Substring(0, $n))$Ext", $Full.Substring(0, $n)) }
         foreach ($pair in $names) {
-            $cand = Join-Path $Dir $pair[0]
+            $cand = Join-Path $Dir $pair[0] -ErrorAction Stop  # a missing drive is placement-failed under any caller preference (r10 iter 2, adversary a80a10d3-A2)
             # Every write into the temp is done, so its hold is released before the destination is re-proven: a held child would block the very rename of -Dest the guard looks for.
             if ($Hold -and $null -ne $Hold.Handle) {
                 $why = Test-DirtyTempHeld $Hold
@@ -153,9 +153,14 @@ public static class DirtyFinalPath {
         return h == (IntPtr)(-1) ? IntPtr.Zero : h;
     }
     // Opens a file for reading and shares READ only: others can still read it (git does), but nobody can write, truncate, rename or delete it until Unpin. IntPtr.Zero when it cannot be opened.
+    // The name itself is opened (FILE_FLAG_OPEN_REPARSE_POINT) and a reparse point is refused: holding a symbolic link's target would leave the link, which git follows,
+    // free to be pointed elsewhere (r10 iter 2, adversary a80a10d3-A1).
     public static IntPtr PinFile(string path) {
-        IntPtr h = CreateFileW(path, 0x80000000, 1, IntPtr.Zero, 3, 0, IntPtr.Zero);
-        return h == (IntPtr)(-1) ? IntPtr.Zero : h;
+        IntPtr h = CreateFileW(path, 0x80000000, 1, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero);
+        if (h == (IntPtr)(-1)) return IntPtr.Zero;
+        ByHandleInfo i;
+        if (!GetFileInformationByHandle(h, out i) || (i.Attributes & 0x400) != 0) { CloseHandle(h); return IntPtr.Zero; }
+        return h;
     }
     // Creates a NEW file (CREATE_NEW: fails when the name exists, a planted hard link included) and holds it for reading, sharing READ and WRITE but not DELETE: git and the
     // checks can open it, nobody can rename or delete it, so the name keeps naming this file until Unpin (r10, sol r9 B3). Error is the Win32 code when it returns IntPtr.Zero.
@@ -285,7 +290,7 @@ function Get-DirtyHeldIdentity($Handle) { if ($null -eq $Handle) { return $null 
 # that already exists (reason=temp-path-exists), and the hold (DirtyFinalPath.CreateHeld) keeps the name on this file until the move: nobody can rename or delete it.
 # Returns @{ Path; Handle; Id } (Id = volume serial + file index) or @{ Path = $null; Reason }. The file must still have one name at every use (Test-DirtyTempHeld).
 function New-DirtyHeldTemp([string]$Dir, [string]$Name) {
-    $path = Join-Path $Dir $Name
+    $path = Join-Path $Dir $Name -ErrorAction Stop
     if (-not ('DirtyFinalPath' -as [type])) { $null = Get-DirtyKernelPath $Dir }  # defines the type
     if (-not ('DirtyFinalPath' -as [type])) { return @{ Path = $null; Reason = 'temp-not-held' } }
     $err = 0
