@@ -528,12 +528,19 @@ function Get-InputContentRefusal {
     # $null when nothing changed. r13 (Dot A1''): a manifest whose bytes cannot be read now (write-locked, the share not answering) is a hit too, SHARE_UNREACHABLE as in the preflight:
     # its digest cannot be re-validated, and no lease is opened on a build nobody re-validated.
     if (-not $legPlanMode) { return $null }
+    $buildsLeft = @($script:guardedInputs | Where-Object { $_.kind -ceq 'build' }).Count
     foreach ($g in $script:guardedInputs) {
         if ($g.kind -ceq 'spec') {
             $sr = @(Get-LegSpecRefusal $g.path $g.backend)
             if ($sr[0]) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = [string]$sr[0]; why = [string]$sr[1] } }
         } elseif ($g.kind -ceq 'build') {
-            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec 30 -VerifyArtifacts
+            # adversary r1 A2: this guard runs between the claim grant and the keeper's start, so it must end inside $ClaimTtlSec less $ClaimRenewSec of the grant or the claim is let go and
+            # asked for again, for ever. The artifact hash gets an equal share of what is left of that budget (script:claimGuardDeadlineUtc, set by the grant loop; a pre-claim call has none);
+            # one that cannot finish in its share ends UNREACHABLE below -- a typed refusal, never a release-and-retry loop.
+            $artSec = 300
+            if ($null -ne $script:claimGuardDeadlineUtc) { $artSec = [int][Math]::Min(300, [Math]::Max(1, [Math]::Floor(($script:claimGuardDeadlineUtc - [DateTime]::UtcNow).TotalSeconds / [Math]::Max(1, $buildsLeft)))) }
+            $buildsLeft--
+            $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec $artSec
             $short = $g.commit.Substring(0, 12)
             if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short could not be read after the claim wait at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no lease is opened" } }
             if ($st.state -cne 'STAGED' -and $st.state -cne 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short read as '$($st.state)' after the claim wait; only STAGED with the validated digest opens a lease" } }
@@ -637,7 +644,7 @@ if ($legPlanMode) {
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
         foreach ($it in $items) {
-            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -TimeoutSec 30 -VerifyArtifacts }
+            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }
             $st = $builds[$it.sourceCommit]
             $short = $it.sourceCommit.Substring(0, 12)
             if ($st.state -ceq 'UNREACHABLE') { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
@@ -871,7 +878,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $grantReadUtc = [DateTime]::UtcNow
         # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
         # before the first write (the CLAIM_* log lines, leg-plan.json): a hit releases a claim just taken, opens no lease and ends in the typed refusal (exit 2).
+        $script:claimGuardDeadlineUtc = $(if ($req.granted) { $grantReadUtc.AddSeconds($ClaimTtlSec - $ClaimRenewSec) } else { $null })
         $hit = Get-InputOutputRefusal
+        $script:claimGuardDeadlineUtc = $null
         if ($hit) {
             if ($req.granted) { try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { } }
             Stop-InputIsOutput $hit

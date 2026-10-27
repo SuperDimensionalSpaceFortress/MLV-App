@@ -606,7 +606,10 @@ function Get-VenueStagedBuildManifest {
     [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
     param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][int]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
-        [switch]$VerifyArtifacts, [ValidateRange(1, 600)][int]$ArtifactTimeoutSec = 300, [scriptblock]$ArtifactProbeScript = $null)
+        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null)
+    # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (at least 1 s), so the whole call stays inside -TimeoutSec, as
+    # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
+    $callClock = [Diagnostics.Stopwatch]::StartNew()
     $path = $AgentShare.TrimEnd('\') + '\cache\playback-attr-3-cuda-' + $SourceCommit.Substring(0, 12) + '-build.json'
     # -ProbeScript is the offline test seam for a read that never answers; production passes none.
     $read = $(if ($null -ne $ProbeScript) { $ProbeScript } else {
@@ -679,7 +682,8 @@ function Get-VenueStagedBuildManifest {
                             if ($got -cne $i.sha) { 'MISMATCH:' + $i.label + ':' + $i.name + ':' + $got }
                         }
                     } })
-            $ar = Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $ArtifactTimeoutSec
+            $artSec = $(if ($ArtifactTimeoutSec -gt 0) { $ArtifactTimeoutSec } else { [int][Math]::Max(1, [Math]::Floor($TimeoutSec - $callClock.Elapsed.TotalSeconds)) })
+            $ar = Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec
             if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null } }
             $lines = @($ar.value | ForEach-Object { [string]$_ })
             $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })

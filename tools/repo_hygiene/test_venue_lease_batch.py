@@ -3072,6 +3072,37 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(self.kinds(), [], "no lease was opened")
         self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
 
+    # adversary r1 A1: the supplementary route calls with -TimeoutSec 30, and the artifact hash had its own 300 s default, so a stalled share held the primary chain for five minutes.
+    def test_artifact_preflight_adv_a1_the_artifact_hash_stays_inside_the_calls_own_timeout(self) -> None:
+        c = "3" * 40
+        self.stage(c, "slow share")
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 3 -VerifyArtifacts -ArtifactProbeScript {{ param($i) [Threading.Thread]::Sleep(25000); 'late' }}\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sec = [int]$sw.Elapsed.TotalSeconds; error = [string]$r.error }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["state"], "UNREACHABLE", got)
+        self.assertLessEqual(got["sec"], 6, f"the call (timeout 3 s) took {got['sec']} s: {got}")
+        self.assertIn("could not be hashed", got["error"])
+
+    # adversary r1 A2: the post-claim guard runs between the grant and the claim keeper's start. A hash that outlasts ClaimTtlSec - ClaimRenewSec made every guard "lapse" the claim, release it and
+    # ask again until the deadline. The runner has no seam that slows a real hash, so the budget's derivation is pinned in the source: set from the grant time, handed to the artifact read, cleared after.
+    def test_artifact_preflight_adv_a2_the_post_claim_guard_hashes_inside_the_claim_guard_budget(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        grant = text.index("$script:claimGuardDeadlineUtc = $(if ($req.granted) { $grantReadUtc.AddSeconds($ClaimTtlSec - $ClaimRenewSec) } else { $null })")
+        call, clear = text.index("$hit = Get-InputOutputRefusal", grant), text.index("$script:claimGuardDeadlineUtc = $null", grant)
+        self.assertLess(grant, call)
+        self.assertLess(call, clear)
+        self.assertLess(clear, text.index("if ($hit) {", grant))
+        guard = text[text.index("function Get-InputContentRefusal"):text.index("function Stop-InputIsOutput")]
+        self.assertIn("-ArtifactTimeoutSec $artSec", guard)
+        self.assertIn("$script:claimGuardDeadlineUtc - [DateTime]::UtcNow", guard)
+        # and the pre-claim preflight, which holds no claim, asks for its own explicit bound
+        self.assertIn("-VerifyArtifacts -ArtifactTimeoutSec 300 }", text)
+
     def test_artifact_preflight_the_artifact_names_are_the_ones_the_leg_job_derives(self) -> None:
         script = (f"Import-Module '{ROOT / 'tools' / 'profiling' / 'bachelor' / 'AttrCudaArtifacts.psm1'}' -Force -DisableNameChecking\n"
                   "$n = Get-AttrCudaArtifactNames -SourceCommit ('3' * 40)\n"
