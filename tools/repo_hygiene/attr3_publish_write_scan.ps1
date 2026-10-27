@@ -2131,14 +2131,6 @@ function Get-SpliceCallSites([string]$Path) {
             # Reached through an alias the source defines: which extractor (and so which module) it runs is not what the text names.
             $bind = [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "the extractor is called through the alias '$callName' the source defines, so the extractor it runs is unproven" }
         }
-        else {
-            # r12c adversary A3 sibling: an alias named by the extractor's own spelling, qualified or not
-            # (`Set-Alias -Name 'AttrCudaArtifacts\Get-AttrCudaEmbeddedFunctionSource' -Value Redirect`), runs in its place.
-            $runsAs = @(Get-ResolvedCommandNames $call | Where-Object { $_ -ne 'get-attrcudaembeddedfunctionsource' })
-            if ($runsAs.Count -gt 0) {
-                $bind = [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "an alias named '$callName' makes the call run as $($runsAs -join ', '), so the extractor it runs is unproven" }
-            }
-        }
         if ($importedReplacement) {
             $prior = if ($bind.kind -eq 'unsupported') { "$($bind.reason); and " } else { '' }
             $bind = [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "${prior}$importedReplacement, so the module this call reads is unproven" }

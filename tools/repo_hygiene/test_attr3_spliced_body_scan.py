@@ -2155,10 +2155,10 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
                 self.assertEqual([f["token"] for f in calls], ["unproven-binding"], describe(self.gcm[route]["splicedViolations"]))
                 self.assertEqual(bound, [], f"{route}/{case}: a module was scanned in place of the one runtime reads")
 
-    def test_r12c_a3_an_alias_named_by_the_qualified_extractor_spelling_makes_the_binding_unproven(self) -> None:
-        calls, bound = self.gcm_case("qualified", "ExtractorAlias")
-        self.assertIn("unproven-binding", [f["token"] for f in calls], describe(self.gcm["qualified"]["splicedViolations"]))
-        self.assertEqual(bound, [], "a module was scanned in place of the one runtime reads")
+    def test_r12c_a3_an_alias_named_by_the_qualified_extractor_spelling_is_a_shadow_finding(self) -> None:
+        # Judged as an alias named by the plain extractor spelling is (SplicedBodyScanCoverageLimitTests b1): a shadow finding.
+        calls, _ = self.gcm_case("qualified", "ExtractorAlias")
+        self.assertTrue([f for f in calls if "shadows it" in f["reason"]], describe(self.gcm["qualified"]["splicedViolations"]))
 
     def test_r12c_get_command_with_proven_builtin_identity_keeps_the_application_only_exception(self) -> None:
         for route, case in (("replacement", "CtlCore"), ("prefix", "CtlNoPrefix")):
