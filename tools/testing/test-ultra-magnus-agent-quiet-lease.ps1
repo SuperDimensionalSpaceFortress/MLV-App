@@ -3150,6 +3150,16 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             $rT = Invoke-PsSeam 'Invoke-HeavySlotStatus' { Invoke-HeavySlotStatus -HeartbeatActivity 'unit' }
             Test-PsStopped 'status' $rT
             if ($null -eq $rT.out -or $rT.out.ok -ne $false -or [string]$rT.out.error -notmatch 'postStartStop=stopped') { $psFails.Add("(status) ok=False naming postStartStop=stopped: ok=$($rT.out.ok) error=[$($rT.out.error)]") }
+            # partial (adversary r2-7778595e A1): Kill(true) ends the root but throws AggregateException for a descendant it could not end;
+            # that is stop-failed (the caller keeps the process), never stopped. A fake process: Kill throws, WaitForExit says the root exited.
+            if ($null -eq $script:PsStopAfterReal) { $psFails.Add("(partial) Stop-ProcessAfterStartFailure exists") }
+            else {
+                $fake = [pscustomobject]@{ HasExited = $false }
+                $fake | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($t) throw [System.AggregateException]::new('unit: not all processes in the tree could be terminated') }
+                $fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) return $true }
+                $pp = & $script:PsStopAfterReal -Process $fake
+                if ([string]$pp -cne 'stop-failed') { $psFails.Add("(partial) a tree Kill that threw AggregateException is stop-failed: got [$pp]") }
+            }
             Assert-True ($psFails.Count -eq 0) "post-start failure stops the started child (sol r1 B4-post-start): $($psFails -join ' ;; ')"
             $results.leaseStartPostStartFailure = [ordered]@{ snapshot = $lS; direct = $rD.out.why; request = $rQ.out.why; status = $rT.out.error }
         }

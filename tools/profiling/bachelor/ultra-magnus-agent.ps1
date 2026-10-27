@@ -655,13 +655,20 @@ function Stop-ProcessAfterStartFailure {
     # (stream, timestamp or record setup threw), stops that process's whole tree BEFORE it reports the start as failed, so no caller is told
     # ok=$false while a child it cannot see still runs. Returns stopped | already-exited | stop-failed. Never throws and reads no clock (the
     # failure being handled may be the clock). It never disposes: on stop-failed the caller still holds the Process and hands it back.
+    # Adversary r2-7778595e A1: Kill(true) that could not end every process of the tree throws AggregateException even when the root died; that
+    # is stop-failed (a descendant may still hold the pipes), never stopped.
     param($Process)
     $exitedBefore = $false
     try { $exitedBefore = [bool]$Process.HasExited } catch { }
-    try { $Process.Kill($true) } catch { }
+    $partial = $false
+    try { $Process.Kill($true) }
+    catch {
+        # PowerShell wraps it (MethodInvocationException, ...): the whole inner chain is searched.
+        for ($e = $_.Exception; $null -ne $e; $e = $e.InnerException) { if ($e -is [System.AggregateException]) { $partial = $true; break } }
+    }
     $exited = $false
     try { $exited = [bool]$Process.WaitForExit(2000) } catch { }
-    if (-not $exited) { return "stop-failed" }
+    if (-not $exited -or $partial) { return "stop-failed" }
     if ($exitedBefore) { return "already-exited" }
     return "stopped"
 }
