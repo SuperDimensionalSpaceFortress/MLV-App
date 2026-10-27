@@ -2954,16 +2954,26 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     # r13 (adversary r13 A2): the open can wait long in the agent's gate, and a link to an output made in that wait was written through by the first probe (gate.log).
     def test_r13_adv_a2_an_output_alias_added_while_the_open_waits_is_refused_before_any_probe(self) -> None:
+        # gate.log: the probe's -GateLog, which Wait-VenueQuiet appends to. batch.log (r13 pass 2 A1): the runner's own log, which the finally wrote through after the refusal.
+        for leaf in ("gate.log", "batch.log"):
+            with self.subTest(output=leaf):
+                self._open_wait_alias(leaf)
+
+    def _open_wait_alias(self, leaf: str) -> None:
         self._fresh_run_dir()
         spec = self.case / "safe" / "fx-a.json"
         spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.unlink(missing_ok=True)
         shutil.copy2(self.specs[0], spec)
         before = spec.read_text(encoding="utf-8")
         args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), FAKE_OPEN_SLEEP="12")
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
-            self._wait_for_log("BATCH_OPEN_SUBMIT")
-            os.link(spec, self.run_dir / "gate.log")   # the probe's -GateLog, which Wait-VenueQuiet appends to
+            # the last line before um-run blocks (FAKE_OPEN_SLEEP); a link made before it is written through at once, the race no re-check closes
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            time.sleep(2)
+            (self.run_dir / leaf).unlink(missing_ok=True)
+            os.link(spec, self.run_dir / leaf)
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:

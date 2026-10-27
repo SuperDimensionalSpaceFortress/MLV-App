@@ -198,8 +198,11 @@ $deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globali
 $pwshExe = [Environment]::ProcessPath
 if (-not $Purpose) { $Purpose = "Invoke-VenueLeaseBatch $(Split-Path -Leaf $RunDir)" }
 
+$script:RunOutputAliased = $false
 function L([string]$Message) {
     $line = "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message"
+    # r13 (adversary r13 pass 2 A1): once an accepted input was found to BE a runner output after the open, nothing more is written into -RunDir (batch.log may be that input); stderr carries the line
+    if ($script:RunOutputAliased) { [Console]::Error.WriteLine($line); return }
     try { Add-Content -LiteralPath $batchLog -Value $line } catch { Register-LogFailure $_.Exception.Message; throw }   # r7 (adversary A1): every append failure is counted and said, whichever call site wrote the line
     Write-Output $line
 }
@@ -720,6 +723,7 @@ $batchNo = 0
 function Write-BatchReceipt([System.Collections.IDictionary]$B) {
     $B.endedUtc = [DateTime]::UtcNow.ToString('o')
     $rec = [pscustomobject]$B
+    if ($script:RunOutputAliased) { [Console]::Error.WriteLine("BATCH_RECEIPT_NOT_WRITTEN batch=$($B.batch) (an accepted input is a runner output; nothing more is written into -RunDir) $($rec | ConvertTo-Json -Compress -Depth 8)"); $batches.Add($rec); return }
     [IO.File]::WriteAllText((Join-Path $RunDir ('batch-{0:00}.json' -f $B.batch)), ($rec | ConvertTo-Json -Depth 8) + "`n", [Text.UTF8Encoding]::new($false))
     Add-Content -LiteralPath (Join-Path $RunDir 'batches.jsonl') -Value ($rec | ConvertTo-Json -Compress -Depth 8)
     $batches.Add($rec)
@@ -788,6 +792,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     $claim = $null; $lastHolder = ''
     while ($true) {
         $req = Request-VenueClaim -Venue $Venue -RunDir $RunDir -Purpose "$Purpose batch $batchNo" -TtlSec $ClaimTtlSec -ClaimDir $ClaimDir
+        $grantReadUtc = [DateTime]::UtcNow
         # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
         # before the first write (the CLAIM_* log lines, leg-plan.json): a hit releases a claim just taken, opens no lease and ends in the typed refusal (exit 2).
         $hit = Get-InputOutputRefusal
@@ -796,6 +801,15 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             Stop-InputIsOutput $hit
         }
         foreach ($bk in $req.broken) { LogBest "CLAIM_STALE_BROKEN venue=$Venue reason=$($bk.reason) ownerPid=$($bk.claim.ownerPid) runDir=$($bk.claim.runDir) expiresUtc=$($bk.claim.expiresUtc)" }
+        # r13 pass 2 (adversary A2): the keeper starts only after that guard, whose reads can take a while; a claim granted longer ago than its TTL less one renew interval may lapse
+        # (and be taken by another claimant) before the keeper's first renewal, so it is let go and asked for again, never carried into an open.
+        $guardSec = ([DateTime]::UtcNow - $grantReadUtc).TotalSeconds
+        if ($req.granted -and $guardSec -ge ($ClaimTtlSec - $ClaimRenewSec)) {
+            try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { }
+            L "CLAIM_LAPSED_IN_GUARD batch=$batchNo guardSec=$([int]$guardSec) ttlSec=$ClaimTtlSec renewSec=$ClaimRenewSec (the claim was let go before the keeper started; asked for again)"
+            if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
+            continue
+        }
         if ($req.granted) { $claim = $req.claim; break }
         $holder = $(if ($req.claim) { "pid=$($req.claim.ownerPid) runDir=$($req.claim.runDir) purpose=$($req.claim.purpose)" } else { $req.state })
         if ($holder -cne $lastHolder) { L "CLAIM_HELD batch=$batchNo state=$($req.state) holder $holder -> wait"; $lastHolder = $holder }
@@ -876,6 +890,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # r13 (adversary r13 A2): the open can wait long in the agent's admission gate (and by name after it), and an alias to an output, or a changed input, can appear in that
         # wait as in the claim wait. The same guard runs again once a lease is in hand, before the first probe or leg writes: a hit runs nothing, the finally closes the lease,
         # and the run ends in the same typed refusal (exit 2). A link made after this check is a race no re-check closes (an instant later), and is not claimed here.
+        # r13 pass 2 (adversary A3): the lease's end is placed from the moment the result was read, BEFORE the guard's reads (which can take a while), never after them
+        $openReadUtc = [DateTime]::UtcNow
+        $leaseEnd = Get-LeaseEndUtc $op.result
         $openHit = $(if ($op.outcome -ceq 'RECEIPT' -or $op.outcome -ceq 'RECEIPT_BY_NAME') { Get-InputOutputRefusal } else { $null })
         if ($op.outcome -ceq 'NOT_SUBMITTED' -and $crossed) {
             $b.endReason = 'DEADLINE'; $b.endDetail = "$($op.message) (the open was not submitted: nothing ran, nothing counted)"
@@ -896,14 +913,18 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $hr = $(if ($openHit.kind -ceq 'content') { $openHit.code, $openHit.item, $openHit.why } elseif ($openHit.kind -ceq 'plan') { 'LEG_PLAN_IS_RUN_OUTPUT', 0, "the plan file $($openHit.why)" }
                 elseif ($openHit.kind -ceq 'build') { 'BUILD_MANIFEST_IS_RUN_OUTPUT', $openHit.item, "the staged build manifest $($openHit.why)" } else { 'LEG_SPEC_IS_RUN_OUTPUT', $openHit.item, "the leg spec $($openHit.why)" })
             # the lease is held: the finally closes it and charges the ledger from the open's submit (no earlier start is known without reading its end)
-            $b.leaseId = [string]$adm.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc; $b.endReason = $hr[0]; $b.endDetail = "after the open, before any probe or leg: $($hr[2])"
+            $b.leaseId = [string]$adm.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc; $b.endReason = $hr[0]
+            # r13 pass 2 (adversary A1): a location hit means a runner output IS the input, so from here nothing is written into -RunDir or the claim dir's outputs: the log and the
+            # receipt go to stderr, the close job file is written to a fresh folder under TEMP, and the ledger row is said, not appended (the ledger may be that input).
+            if ($openHit.kind -cne 'content') {
+                $script:RunOutputAliased = $true
+                $script:jobDir = Join-Path ([IO.Path]::GetTempPath()) "venue-lease-batch-close-$token"; New-Item -ItemType Directory -Force -Path $script:jobDir | Out-Null
+            } $b.endDetail = "after the open, before any probe or leg: $($hr[2])"
             [Console]::Error.WriteLine("BATCH_USAGE $(if ($legPlanMode) { "LEG_PLAN_REFUSED reason=$($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" })" } else { $hr[0] }) $($hr[2]) (found after the open: no probe or leg ran; the lease is closed)")
             Set-Stop $hr[0] 2
         } else {
             $b.leaseId = [string]$adm.leaseBatch.leaseId; $b.held = [string]$adm.heavySlotHeld; $b.slot = $adm.slot; $b.leaseMinutes = $adm.leaseMinutes
             $b.leaseUntilEpoch = $adm.leaseBatch.untilEpoch; $b.openWaitedSec = $adm.waitedSec; $b.openRequests = $adm.leaseRequests; $b.refusals = @($adm.leaseRefusals)
-            $openReadUtc = [DateTime]::UtcNow
-            $leaseEnd = Get-LeaseEndUtc $op.result
             if ($null -eq $leaseEnd) { $leaseEnd = $openReadUtc }   # cannot place the lease's end: no leg fits
             # Where the lease began, for the ledger: its end less the minutes it asked for, never before the open was submitted.
             $leaseStartUtc = $(if ($b.leaseMinutes) { $leaseEnd.AddMinutes(-[double]$b.leaseMinutes) } else { $openSubmitUtc })
@@ -1127,7 +1148,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             elseif ($null -ne $b.openCancel -and $b.openCancel.state -ceq 'UNRECONCILED') { $n0 = [DateTime]::UtcNow; $row = [ordered]@{ venue = $Venue; token = $token; leaseId = $null; startUtc = $n0.ToString('o'); endUtc = $n0.AddSeconds($LeaseCapSec).ToString('o'); runDir = $RunDir; basis = 'open-unreconciled' } }
             if ($null -ne $row) {
                 $b.ledger = $row
-                try { Add-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -Row ([pscustomobject]$row) } catch { LogBest "LEDGER_WRITE_FAILED batch=$batchNo $($_.Exception.Message)" }
+                if ($script:RunOutputAliased) { LogBest "LEDGER_NOT_WRITTEN batch=$batchNo (an accepted input is a runner output) row=$($row | ConvertTo-Json -Compress)" }
+                else { try { Add-VenueLeaseLedger -Venue $Venue -ClaimDir $ClaimDir -Row ([pscustomobject]$row) } catch { LogBest "LEDGER_WRITE_FAILED batch=$batchNo $($_.Exception.Message)" } }
                 $leases.Add([pscustomobject]@{ startUtc = $row.startUtc; endUtc = $row.endUtc; leaseId = $row.leaseId })
             }
         }
@@ -1156,7 +1178,7 @@ $summary = [ordered]@{
 }
 if ($legPlanMode) { $summary.legPlan = [ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
 $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch {   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
+try { if (-not $script:RunOutputAliased) { Add-Content -LiteralPath $batchLog -Value $resultLine } } catch {   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
     # r7 (sol r6b): the count was serialized before this append, so the append that just failed is counted and the line for stdout is serialized again with it (stdout is the authority when batch.log is broken).
     Register-LogFailure $_.Exception.Message
     $summary.logWriteFailures = $script:logWriteFailures
