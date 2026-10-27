@@ -4585,15 +4585,16 @@ function Get-CorePartitionReadyFeed($Feed, [bool]$NotReady) {
 # PURE. r11 B1 (CP-FEED-END-ANCHOR): the earliest the measured app can have exited, on the job's monotonic base (Get-CorePartitionMonoMs, the
 # shared Stopwatch clock): the helper's Stopwatch origin on that clock (monoBaseMs, read just before its Stopwatch starts, so it can only be early,
 # which makes the window end look later, never earlier) plus the app's aliveMs, the last poll that saw it alive. adversary r11 (5f75e044) A1: not
-# its goneMs, the poll that saw it gone, which a helper descheduled after the exit moves as late as a stalled job's end stamp. The app must be the
-# helper's bound app and the measured pid, and its exit must have been observed (goneMs at or after aliveMs). $null when the record, its app,
-# any number or the binding is missing, so the feed window end is unverified. Never throws.
-function Get-CorePartitionAppAliveMonoMs($Helper, [int64]$MeasuredPid) {
+# its goneMs, the poll that saw it gone, which a helper descheduled after the exit moves as late as a stalled job's end stamp. adversary r11
+# (4078c9a7) A1: the aliveMs is the measured-app verdict's ($AppVerdict, Test-CorePartitionMeasuredApp accepted: the runner's pid inside its
+# launch window, its exit observed within the endpoint bound, no overlap, clocks within tolerance), never the helper's pid-only app binding, which a
+# later instance reusing the pid satisfies. $null when the verdict refused, or the record or a number is missing, so the feed window end is
+# unverified. Never throws.
+function Get-CorePartitionAppAliveMonoMs($Helper, $AppVerdict) {
     try {
-        if ($null -eq $Helper -or $null -eq $Helper.app -or $MeasuredPid -le 0) { return $null }
-        $ap = (ConvertFrom-CorePartitionNumber $Helper.app.pid 'int64').value; $gm = (ConvertFrom-CorePartitionNumber $Helper.app.goneMs 'int64').value
-        $am = (ConvertFrom-CorePartitionNumber $Helper.app.aliveMs 'int64').value; $mb = (ConvertFrom-CorePartitionNumber $Helper.monoBaseMs 'double').value
-        if ($ap -ne $MeasuredPid -or $null -eq $gm -or $null -eq $am -or $null -eq $mb -or $am -lt 0 -or $gm -lt $am -or $mb -lt 0) { return $null }
+        if ($null -eq $Helper -or $null -eq $AppVerdict -or $AppVerdict.why) { return $null }
+        $am = (ConvertFrom-CorePartitionNumber $AppVerdict.aliveMs 'int64').value; $mb = (ConvertFrom-CorePartitionNumber $Helper.monoBaseMs 'double').value
+        if ($null -eq $am -or $null -eq $mb -or $am -lt 0 -or $mb -lt 0) { return $null }
         $mb + $am
     } catch { $null }
 }
@@ -5879,14 +5880,15 @@ try {
         } catch { $cpRecordWhy = 'helper-record-unparseable'; $corePartitionErrors.Add("helper-record: $([string]$_.Exception.Message)") }
         if ($cpRecordWhy) { $corePartitionHelperWhy = Join-CorePartitionWhy $corePartitionHelperWhy $cpRecordWhy }
     } elseif (-not $corePartitionHelperWhy) { $corePartitionHelperWhy = 'helper-record-missing' }
-    # r11 B1: the measured app's last observed-alive poll on the job's monotonic base ($null without an accepted record that observed its exit)
-    $corePartitionAppAliveMonoMs = Get-CorePartitionAppAliveMonoMs $corePartitionHelperRecord $corePartitionMeasuredPid
+    # r11 B1: the measured app's last observed-alive poll on the job's monotonic base, from the measured-app verdict ($null when it refused)
+    $cpAppVerdict = @{ why = 'measured-app-unverified' }
+    try { $cpAppVerdict = Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs } catch { $corePartitionErrors.Add("measured-app: $([string]$_.Exception.Message)") }
+    $corePartitionAppAliveMonoMs = Get-CorePartitionAppAliveMonoMs $corePartitionHelperRecord $cpAppVerdict
     $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppAliveMonoMs 10000) $corePartitionHelperNotReady
     # sol r4 CP-05: set until core-partition.json is saved, so any failure on the way leaves every acceptance flag false with this reason.
     $corePartitionPublishWhy = 'core-partition-json-unpublished'
     try {
         [void](New-AttrCudaDirectory -Path $Pub)
-        $cpAppVerdict = Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs
         Save-Json ([ordered]@{
             schema = 'mlv-app/core-partition/v1'; card = 'BACHELOR-CORE-PARTITION-AB-1'
             requested = [ordered]@{ benchMask = $corePartitionJob.affinityRequested; loadMask = $(if ($CorePartitionLoadMask -ne 0) { Format-CorePartitionMask $CorePartitionLoadMask } else { $null }); loadThreads = $CorePartitionLoadThreads; helperMask = (Format-CorePartitionMask $CorePartitionHelperMask) }

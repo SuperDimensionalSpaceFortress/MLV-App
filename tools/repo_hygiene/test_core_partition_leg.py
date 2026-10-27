@@ -195,7 +195,8 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
         $now = [DateTime]::UtcNow
         [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = [ordered]@{ id = 5000; startedAtUtc = $now.AddSeconds(-5).ToString('o'); endedAtUtc = $now.ToString('o') } } | ConvertTo-Json -Depth 3))
         $mb = ((Get-CorePartitionMonoMs) - 150).ToString([Globalization.CultureInfo]::InvariantCulture)
-        $rb = [Text.Encoding]::UTF8.GetBytes('{"schema":"mlv-app/core-partition-helper/v1","pid":' + $corePartitionHelperLaunch.pid + ',"monoBaseMs":' + $mb + ',"app":{"pid":5000,"startUtcTicks":' + $now.AddSeconds(-5).Ticks + ',"aliveMs":40,"goneMs":50},"clockSkewMaxMs":0}')
+        $inst = '{"pid":5000,"startUtcTicks":' + $now.AddSeconds(-5).Ticks + ',"firstSeenUtcTicks":' + $now.AddSeconds(-4.9).Ticks + ',"firstMs":10,"aliveMs":40,"goneUtcTicks":' + $now.Ticks + ',"goneMs":50}'
+        $rb = [Text.Encoding]::UTF8.GetBytes('{"schema":"mlv-app/core-partition-helper/v1","pid":' + $corePartitionHelperLaunch.pid + ',"monoBaseMs":' + $mb + ',"app":' + $inst + ',"instances":[' + $inst + '],"others":[],"clockSkewMaxMs":0}')
         [IO.File]::WriteAllBytes($corePartitionHelperOut, $rb)
         [IO.File]::WriteAllText("$corePartitionHelperOut.mac", [Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($corePartitionHelperNonce)).ComputeHash($rb)))
     }
@@ -2245,6 +2246,9 @@ class CorePartitionR10Tests(unittest.TestCase):
 # 99 W / 99 C row was appended just before the end read, which completes 500 ms after it starts. The helper's signed record (accepted: this job's key,
 # its launch pid, exit 0) puts the measured app's last alive poll at 'alive' and the poll that saw it gone at 'gone' on the job's monotonic base;
 # 'gone' $null is a record without that base. adversary r11 (5f75e044) A1: a helper descheduled 40 s after the app exited sees it gone late.
+# The wall clock runs with the fake monotonic one (the end stamp's wall read is "now"), so the measured-app verdict sees consistent clocks; the
+# runner launched pid 5000 at mono 1500 and saw it exit at 20850; the recorded instance with that pid started at 'start' (adversary r11 4078c9a7 A1:
+# a later instance reusing the pid, started after the runner's exit).
 R11_CLEANUP = r"""
 $asg = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$cpPost' }, $true) | Select-Object -First 1
 if ($null -eq $asg) { throw 'the generator has no $cpPost cleanup region' }
@@ -2261,12 +2265,13 @@ function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
         replaced = $false; truncated = $false; shortRead = $false; readUtcTicks = 0; lastWriteUtcTicks = 0 }
 }
 $cases = [ordered]@{
-    'zero-delay-control' = @(21000, 0, 20900, 20750)
-    'restore-stall-40s' = @(21000, 40000, 20900, 20750)
-    'restore-stall-80s' = @(21000, 80000, 20900, 20750)
-    'stall-before-the-end-stamp-40s' = @(61000, 0, 20900, 20750)
-    'no-observed-exit' = @(21000, 0, $null, 20750)
-    'helper-saw-the-exit-40s-late' = @(61000, 0, 61000, 20800)
+    'zero-delay-control' = @(21000, 0, 20900, 20750, 2000)
+    'restore-stall-40s' = @(21000, 40000, 20900, 20750, 2000)
+    'restore-stall-80s' = @(21000, 80000, 20900, 20750, 2000)
+    'stall-before-the-end-stamp-40s' = @(61000, 0, 20900, 20750, 2000)
+    'no-observed-exit' = @(21000, 0, $null, 20750, 2000)
+    'helper-saw-the-exit-40s-late' = @(61000, 0, 61000, 20800, 2000)
+    'a-later-instance-with-the-measured-pid' = @(61000, 0, 60200, 60000, 22000)
 }
 $u8 = [Text.Encoding]::UTF8
 $out = [ordered]@{}
@@ -2279,14 +2284,16 @@ foreach ($k in $cases.Keys) {
     $corePartitionJobProc | Add-Member -MemberType ScriptProperty -Name ProcessorAffinity -Value { [int64]1048575 } -SecondValue { $global:cpClk += $global:cpDelay }
     $corePartitionJobProc | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
     $now = [DateTime]::UtcNow
-    $corePartitionMeasuredLaunchUtc = $now.AddSeconds(-20); $corePartitionPreHelperUtc = $now.AddSeconds(-21)
+    $L = $now.AddMilliseconds(1000 - $c[0])
+    $W = { param([double]$m) $L.AddMilliseconds($m - 1000).Ticks }
+    $corePartitionMeasuredLaunchUtc = $L; $corePartitionPreHelperUtc = $L.AddSeconds(-1)
     $corePartitionClockPairs = [Collections.Generic.List[object]]::new(); $corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, [double]1000))
     $corePartitionFeedPath = Join-Path $dir 'feed.csv'
     $corePartitionFeedPreHelper = @{ exists = $true; length = 0; beforeOffset = 0; before = ''; shortRead = $false; monoMs = [int64]500; doneMs = [int64]500; created = 123; fileId = 'same'; readUtcTicks = 0; lastWriteUtcTicks = 0 }
     $corePartitionFeedStart = @{ exists = $true; length = 34; beforeOffset = 0; shortRead = $false; monoMs = [int64]1000; doneMs = [int64]1000; created = 123; fileId = 'same'
         before = "26.10.2026,12:00:00,x,30,10,No,No`n"; window = ''; windowStartsMidRow = $false; readUtcTicks = 0; lastWriteUtcTicks = 0 }
     $resultPath = Join-Path $dir 'result.json'
-    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = [ordered]@{ id = 5000; startedAtUtc = $now.AddSeconds(-20).ToString('o'); endedAtUtc = $now.ToString('o') } } | ConvertTo-Json -Depth 3))
+    [IO.File]::WriteAllText($resultPath, ([ordered]@{ process = [ordered]@{ id = 5000; startedAtUtc = [DateTime]::new((& $W 1500), [DateTimeKind]::Utc).ToString('o'); endedAtUtc = [DateTime]::new((& $W 20850), [DateTimeKind]::Utc).ToString('o') } } | ConvertTo-Json -Depth 3))
     $corePartitionHelper = [pscustomobject]@{ HasExited = $true; ExitCode = 0 }
     $corePartitionHelper | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { $true }
     $corePartitionHelper | Add-Member -MemberType ScriptMethod -Name Kill -Value { }
@@ -2294,8 +2301,9 @@ foreach ($k in $cases.Keys) {
     $corePartitionHelperNonce = 'r11-end-anchor'; $corePartitionHelperOut = Join-Path $dir 'helper.json'
     $corePartitionMeasuredFile = Join-Path $dir 'measured'; $corePartitionStopFile = Join-Path $dir 'stop'
     $mb = $(if ($null -ne $c[2]) { ',"monoBaseMs":800' } else { '' })
-    $gm = $(if ($null -ne $c[2]) { $c[2] - 800 } else { 20100 })
-    $rb = $u8.GetBytes('{"schema":"mlv-app/core-partition-helper/v1","pid":4242' + $mb + ',"app":{"pid":5000,"startUtcTicks":' + $now.AddSeconds(-20).Ticks + ',"aliveMs":' + ($c[3] - 800) + ',"goneMs":' + $gm + '},"clockSkewMaxMs":0}')
+    $gone = $(if ($null -ne $c[2]) { $c[2] } else { 20900 })
+    $inst = '{"pid":5000,"startUtcTicks":' + (& $W $c[4]) + ',"firstSeenUtcTicks":' + (& $W ($c[4] + 100)) + ',"firstMs":' + ($c[4] + 100 - 800) + ',"aliveMs":' + ($c[3] - 800) + ',"goneUtcTicks":' + (& $W $gone) + ',"goneMs":' + ($gone - 800) + '}'
+    $rb = $u8.GetBytes('{"schema":"mlv-app/core-partition-helper/v1","pid":4242' + $mb + ',"app":' + $inst + ',"instances":[' + $inst + '],"others":[],"clockSkewMaxMs":0}')
     [IO.File]::WriteAllBytes($corePartitionHelperOut, $rb)
     [IO.File]::WriteAllText("$corePartitionHelperOut.mac", [Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new($u8.GetBytes($corePartitionHelperNonce)).ComputeHash($rb)))
     $corePartitionHelperNotReady = $false; $corePartitionHelperWhy = $null; $corePartitionHelperExit = $null
@@ -2374,9 +2382,12 @@ class CorePartitionR11Tests(unittest.TestCase):
         declared 10000 ms slack: feed-window-end-late. A record without the observed exit on the job's clock leaves the end unverifiable:
         feed-window-end-unverified. On d5233ef9 both publish the post-run row. adversary r11 (5f75e044) A1 (literal shape): the helper itself was
         descheduled after the exit and saw the app gone 40 s late, at the stalled end stamp; its last alive poll (20800) still bounds the exit,
-        so the end is late. On 5f75e044 (the gone poll as the anchor) the row is published."""
+        so the end is not bounded: the measured-app verdict refuses that gap (coverage-endpoint-gap) and the end is unverified. On 5f75e044 (the gone
+        poll as the anchor) the row is published. adversary r11 (4078c9a7) A1 (literal shape): the helper recorded only a later instance reusing the
+        runner's pid 5000 (started 22000, after the runner saw its app exit at 20850), alive at 60000; the verdict binds no instance
+        (measured-app-not-observed), so its alive poll bounds nothing. On 4078c9a7 (the helper's pid-only app) the row is published."""
         for case, code in (("stall-before-the-end-stamp-40s", "feed-window-end-late"), ("no-observed-exit", "feed-window-end-unverified"),
-                           ("helper-saw-the-exit-40s-late", "feed-window-end-late")):
+                           ("helper-saw-the-exit-40s-late", "feed-window-end-unverified"), ("a-later-instance-with-the-measured-pid", "feed-window-end-unverified")):
             with self.subTest(case=case):
                 got = self.r[case]
                 self.assertEqual([got["rows"], got["watts"], got["temp"], got["why"]], [None, None, None, code], got)
