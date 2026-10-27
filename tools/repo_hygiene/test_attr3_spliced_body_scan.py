@@ -2080,6 +2080,14 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
                                     "Set-Alias gcm Rogue-Lookup -Scope Global\nExport-ModuleMember -Function Rogue-Lookup -Alias Get-Command, gcm\n"},
             # A supplied module whose export becomes Get-Command once imported with -Prefix Com (Get-mand -> Get-Command).
             "prefix": {"Extractor.psm1": extractor, "Prefixed.psm1": "function Get-mand {\n" + lookup + "}\n"},
+            # r12c adversary A2, verbatim: prefixes compose (Get-and -> Get-mand in Wrapper -> Get-Command in the source).
+            "nested": {"Extractor.psm1": extractor + "\nfunction Get-and {\n" + lookup + "}\n",
+                       "Wrapper.psm1": "Import-Module '{ext}' -Prefix m\nExport-ModuleMember -Function Get-mand\n"},
+            # r12c adversary A3, verbatim: an alias named by the qualified spelling itself, of Get-Command and of the extractor.
+            "qualified": {"Extractor.psm1": extractor, "Clean.psm1": "function Probe {\n    Get-Date\n}\n"},
+            # r12c adversary A1, verbatim: an export -Prefix P renames into Join-Path (Join-ath -> Join-Path).
+            "joinprefix": {"Extractor.psm1": extractor, "Clean.psm1": "function Probe {\n    Get-Date\n}\n",
+                           "Prefixed.psm1": "function Join-ath {\n param($Path, $ChildPath)\n '{dirty}'\n}\nExport-ModuleMember -Function Join-ath\n"},
         }
         pre = "Import-Module '{ext}'\n$s1='Session'; $s2='State'; $sn=$s1+$s2\n$v1='PS'; $v2='Variable'; $vn=$v1+$v2\n"
         body = (")) {{\n    $c.Module.$sn.$vn.Set(\n        'script:AttrCudaModulePath', '{dirty}')\n}}\n"
@@ -2104,12 +2112,26 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
                                + "foreach ($c in @(Get-Command python.exe -CommandType Application" + body,
                 "CtlNoPrefix": "Import-Module '{dir}\\Prefixed.psm1'\n" + data.replace("{gcm}", "Get-Command"),
             },
+            "nested": {
+                "Composed": "Import-Module '{dir}\\Wrapper.psm1' -Prefix Com\n" + pre + "foreach ($c in @(Get-Command python.exe -CommandType Application" + body,
+            },
+            "qualified": {
+                "CoreAlias": "function Rogue {{\n" + lookup + "}}\nSet-Alias -Name 'Microsoft.PowerShell.Core\\Get-Command' -Value Rogue\n" + pre
+                             + "foreach ($c in @(Microsoft.PowerShell.Core\\Get-Command python.exe -CommandType Application" + body,
+                "ExtractorAlias": "function Redirect {{ param($Name, $ModulePath) 'dirty-body' }}\n"
+                                  "Set-Alias -Name 'AttrCudaArtifacts\\Get-AttrCudaEmbeddedFunctionSource' -Value Redirect\n"
+                                  "AttrCudaArtifacts\\Get-AttrCudaEmbeddedFunctionSource -Name Probe -ModulePath '{dir}\\Clean.psm1'\n",
+            },
+            "joinprefix": {
+                "JoinPrefix": "Import-Module '{ext}'\nImport-Module '{dir}\\Prefixed.psm1' -Prefix P\n"
+                              "Get-AttrCudaEmbeddedFunctionSource -Name Probe -ModulePath (Join-Path $PSScriptRoot 'Clean.psm1')\n",
+            },
         }
         for route, modules in routes.items():
             rd = d / f"gcm-{route}"
             rd.mkdir()
             for name, text in modules.items():
-                (rd / name).write_text(text, encoding="utf-8")
+                (rd / name).write_text(text.replace("{ext}", str(rd / "Extractor.psm1")).replace("{dirty}", str(rd / "Dirty.psm1")), encoding="utf-8")
             (rd / "Dirty.psm1").write_text(dirty_probe, encoding="utf-8")
             gens = []
             for case, text in sources[route].items():
@@ -2126,11 +2148,17 @@ class SplicedBodyScanImportedAliasTests(unittest.TestCase):
 
     def test_r12c_get_command_replaced_by_a_supplied_module_makes_the_application_only_selection_unproven(self) -> None:
         for route, case in (("replacement", "Named"), ("replacement", "Positional"), ("alias", "Named"), ("alias", "Gcm"),
-                            ("prefix", "Prefixed"), ("prefix", "ComputedPrefix"), ("prefix", "SplatPrefix")):
+                            ("prefix", "Prefixed"), ("prefix", "ComputedPrefix"), ("prefix", "SplatPrefix"), ("nested", "Composed"),
+                            ("qualified", "CoreAlias"), ("joinprefix", "JoinPrefix")):
             with self.subTest(route=route, case=case):
                 calls, bound = self.gcm_case(route, case)
                 self.assertEqual([f["token"] for f in calls], ["unproven-binding"], describe(self.gcm[route]["splicedViolations"]))
                 self.assertEqual(bound, [], f"{route}/{case}: a module was scanned in place of the one runtime reads")
+
+    def test_r12c_a3_an_alias_named_by_the_qualified_extractor_spelling_makes_the_binding_unproven(self) -> None:
+        calls, bound = self.gcm_case("qualified", "ExtractorAlias")
+        self.assertIn("unproven-binding", [f["token"] for f in calls], describe(self.gcm["qualified"]["splicedViolations"]))
+        self.assertEqual(bound, [], "a module was scanned in place of the one runtime reads")
 
     def test_r12c_get_command_with_proven_builtin_identity_keeps_the_application_only_exception(self) -> None:
         for route, case in (("replacement", "CtlCore"), ("prefix", "CtlNoPrefix")):

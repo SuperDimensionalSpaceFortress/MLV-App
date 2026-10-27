@@ -330,8 +330,11 @@ function Get-ShadowReason([string]$Kind, [string]$Consequence) {
 }
 
 function Test-ShadowedName([string]$Value, [string[]]$Names) {
-    # A name with its scope prefix (global:Join-Path) removed, compared case-insensitively.
-    @($Names | Where-Object { $_ -ieq ($Value -replace '^[A-Za-z]+:', '') }).Count -gt 0
+    # A name with its scope prefix (global:Join-Path) removed, compared case-insensitively, whole or (r12c adversary A3) after any
+    # module qualifier: an alias named 'AttrCudaArtifacts\Get-AttrCudaEmbeddedFunctionSource' runs in place of that spelling.
+    $plain = $Value -replace '^[A-Za-z]+:', ''
+    $bare = $plain.Substring($plain.LastIndexOf('\') + 1)
+    @($Names | Where-Object { $_ -ieq $plain -or $_ -ieq $bare }).Count -gt 0
 }
 
 function Get-AliasNameArguments($Command, [string]$Cmdlet = 'Set-Alias') {
@@ -1236,43 +1239,66 @@ function Get-SuppliedModuleAsts {
     return $script:suppliedModuleAsts
 }
 
+function Get-PrefixRenamedNames($Trees, [string[]]$Targets) {
+    # $Targets and every name a chain of Import-Module -Prefix renames in $Trees turns into one of them, or $null when an
+    # Import-Module there splats or names a prefix that is not a string constant. -Prefix P renames Verb-Noun to Verb-PNoun (a name
+    # with no noun to PName), and (r12c adversary A2) a module that imports another with a prefix and exports the result composes
+    # the two, so the names are unprefixed until nothing is added (each step is shorter, so it ends).
+    $prefixes = [System.Collections.Generic.List[string]]::new()
+    foreach ($tree in $Trees) {
+        $imports = @($tree.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] -and
+                                     @(Get-ResolvedCommandNames $x | Where-Object { @('import-module', 'ipmo') -contains $_ }).Count -gt 0 }, $true))
+        foreach ($import in $imports) {
+            if (@($import.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count -gt 0) { return $null }
+            $operands = Get-NamedArguments $import @('Prefix') 'Import-Module'
+            foreach ($operand in $operands) {
+                $prefix = Get-SingleConstant $operand
+                if ($null -eq $prefix) { return $null }
+                if ($prefix.Length -gt 0 -and -not $prefixes.Contains($prefix)) { $prefixes.Add($prefix) }
+            }
+        }
+    }
+    $names = [System.Collections.Generic.List[string]]::new()
+    $queue = [System.Collections.Generic.Queue[string]]::new()
+    foreach ($target in $Targets) { $queue.Enqueue($target) }
+    while ($queue.Count -gt 0) {
+        $name = $queue.Dequeue()
+        if (@($names | Where-Object { $_ -ieq $name }).Count -gt 0) { continue }
+        $names.Add($name)
+        $dash = $name.IndexOf('-')
+        foreach ($prefix in $prefixes) {
+            if ($dash -ge 0 -and $name.Substring($dash + 1).StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $queue.Enqueue($name.Substring(0, $dash + 1) + $name.Substring($dash + 1 + $prefix.Length)) }
+            if ($name.Length -gt $prefix.Length -and $name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $queue.Enqueue($name.Substring($prefix.Length)) }
+        }
+    }
+    return , $names.ToArray()
+}
+
 function Test-BuiltinGetCommand($Command) {
     $name = Get-LiteralCommandName $Command
     if ([string]::IsNullOrEmpty($name)) { return $false }
+    $base = @('Get-Command', 'gcm')
     if ($name.Contains('\')) {
         $qualifier = $name.Substring(0, $name.LastIndexOf('\'))
-        return ($qualifier -ieq 'Microsoft.PowerShell.Core' -and (Get-BareCommandName $name) -eq 'get-command' -and
-                @($ModulePath | Where-Object { [IO.Path]::GetFileNameWithoutExtension($_) -ieq $qualifier }).Count -eq 0)
+        if ($qualifier -ine 'Microsoft.PowerShell.Core' -or (Get-BareCommandName $name) -ne 'get-command' -or
+            @($ModulePath | Where-Object { [IO.Path]::GetFileNameWithoutExtension($_) -ieq $qualifier }).Count -gt 0) { return $false }
+        # r12c adversary A3: an alias or function named by the qualified spelling itself runs in the builtin's place.
+        $base = @($name)
     }
     if (@(Get-ResolvedCommandNames $Command | Where-Object { @('get-command', 'gcm') -notcontains $_ }).Count -gt 0) { return $false }
     $top = $Command
     while ($null -ne $top.Parent) { $top = $top.Parent }
-    if (-not $script:getCommandTrees.ContainsKey($top)) { $script:getCommandTrees[$top] = Test-GetCommandUnshadowed $top }
-    return $script:getCommandTrees[$top]
+    if (-not $script:getCommandTrees.ContainsKey($top)) { $script:getCommandTrees[$top] = @{} }
+    $key = $base -join '|'
+    if (-not $script:getCommandTrees[$top].ContainsKey($key)) { $script:getCommandTrees[$top][$key] = Test-GetCommandUnshadowed $top $base }
+    return $script:getCommandTrees[$top][$key]
 }
 
-function Test-GetCommandUnshadowed($Top) {
+function Test-GetCommandUnshadowed($Top, [string[]]$Base) {
     $trees = @($Top) + @(Get-SuppliedModuleAsts)
-    $names = [System.Collections.Generic.List[string]]::new()
-    $names.Add('Get-Command'); $names.Add('gcm')
-    foreach ($tree in $trees) {
-        $imports = @($tree.FindAll({ param($x) $x -is [System.Management.Automation.Language.CommandAst] -and
-                                     @(Get-ResolvedCommandNames $x | Where-Object { @('import-module', 'ipmo') -contains $_ }).Count -gt 0 }, $true))
-        foreach ($import in $imports) {
-            if (@($import.CommandElements | Where-Object { $_ -is [System.Management.Automation.Language.VariableExpressionAst] -and $_.Splatted }).Count -gt 0) { return $false }
-            $prefixes = Get-NamedArguments $import @('Prefix') 'Import-Module'
-            foreach ($operand in $prefixes) {
-                $prefix = Get-SingleConstant $operand
-                if ($null -eq $prefix) { return $false }
-                # -Prefix P renames Verb-Noun to Verb-PNoun and a name with no noun to PName.
-                if ($prefix.Length -gt 0 -and 'Command'.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $names.Add('Get-' + 'Command'.Substring($prefix.Length)) }
-                foreach ($target in @('Get-Command', 'gcm')) {
-                    if ($target.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { $names.Add($target.Substring($prefix.Length)) }
-                }
-            }
-        }
-    }
-    foreach ($tree in $trees) { if (@(Get-ShadowingDefinitions $tree $names.ToArray()).Count -gt 0) { return $false } }
+    $names = Get-PrefixRenamedNames $trees $Base
+    if ($null -eq $names) { return $false }
+    foreach ($tree in $trees) { if (@(Get-ShadowingDefinitions $tree $names).Count -gt 0) { return $false } }
     return $true
 }
 
@@ -2034,11 +2060,16 @@ function Get-SpliceCallSites([string]$Path) {
     # inside another function is local to it when it runs (a spliced body's own shadow, judged by R1), so only a top-level one counts.
     # r12 adversary A1: and so does one it defines through the function: drive (`Set-Item function:global:Join-Path -Value { ... }`,
     # `$function:Join-Path = { ... }`): the module's top level is judged by the same shadow model as the source's own code.
+    # r12c adversary A1: and so does one an Import-Module -Prefix renames into it (`function Join-ath` imported with -Prefix P).
+    $evaluatedNames = Get-PrefixRenamedNames (@($ast) + @($moduleAsts.Values)) @('Join-Path', 'Split-Path', 'New-Object', 'Get-AttrCudaEmbeddedFunctionSource')
+    if (-not $importedReplacement -and $null -eq $evaluatedNames) {
+        $importedReplacement = "an Import-Module that splats or names a -Prefix that is not a string constant may rename a command into one the scan evaluates"
+    }
     if (-not $importedReplacement) {
         foreach ($moduleKey in @($moduleAsts.Keys)) {
             # r12 adversary pass 2 (A2): the extractor too (`Set-Item function:global:Get-AttrCudaEmbeddedFunctionSource -Value { ... }`);
             # only its own `function` definition is the extractor module, judged by the default-module rule.
-            $replaced = @(Get-ShadowingDefinitions $moduleAsts[$moduleKey] @('Join-Path', 'Split-Path', 'New-Object', 'Get-AttrCudaEmbeddedFunctionSource') | Where-Object {
+            $replaced = @(Get-ShadowingDefinitions $moduleAsts[$moduleKey] $evaluatedNames | Where-Object {
                 if ($_.Ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and (Get-BareCommandName $_.Ast.Name) -eq 'get-attrcudaembeddedfunctionsource') { return $false }
                 for ($p = $_.Ast.Parent; $null -ne $p; $p = $p.Parent) { if ($p -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $false } }
                 return $true } | Select-Object -First 1)
@@ -2099,6 +2130,14 @@ function Get-SpliceCallSites([string]$Path) {
         if ($callName.Substring($callName.LastIndexOf('\') + 1) -ine 'Get-AttrCudaEmbeddedFunctionSource') {
             # Reached through an alias the source defines: which extractor (and so which module) it runs is not what the text names.
             $bind = [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "the extractor is called through the alias '$callName' the source defines, so the extractor it runs is unproven" }
+        }
+        else {
+            # r12c adversary A3 sibling: an alias named by the extractor's own spelling, qualified or not
+            # (`Set-Alias -Name 'AttrCudaArtifacts\Get-AttrCudaEmbeddedFunctionSource' -Value Redirect`), runs in its place.
+            $runsAs = @(Get-ResolvedCommandNames $call | Where-Object { $_ -ne 'get-attrcudaembeddedfunctionsource' })
+            if ($runsAs.Count -gt 0) {
+                $bind = [pscustomobject]@{ kind = 'unsupported'; path = ''; reason = "an alias named '$callName' makes the call run as $($runsAs -join ', '), so the extractor it runs is unproven" }
+            }
         }
         if ($importedReplacement) {
             $prior = if ($bind.kind -eq 'unsupported') { "$($bind.reason); and " } else { '' }
