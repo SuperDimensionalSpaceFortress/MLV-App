@@ -3034,6 +3034,106 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertFalse(self.claim_path.exists(), "the claim was released")
         self.assertTrue(any(k.startswith("CLOSE") for k in self.kinds()), "the lease was closed")
 
+    # adversary r14 A1, A2, A3 (on 2ea93e0f): the redirect folder was named from the token alone and reused with -Force, so links prepared in it were written through; TEMP inside -RunDir
+    # put the redirect back in it; a redirect that could not be made threw, and the close then threw out of the finally (no claim release, no result); and the claim keeper went on
+    # rewriting a claim file that had become the input until the close returned.
+    def _spawn_open_wait(self, mode: str, *extra: str, env: dict | None = None, claim_dir: Path | None = None):
+        import hashlib
+        self._fresh_run_dir()
+        (self.share / "fake-agent-state.json").unlink(missing_ok=True)
+        shutil.rmtree(self.share / "outbox", ignore_errors=True)
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.unlink(missing_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), *extra, FAKE_OPEN_SLEEP="12", FAKE_OPEN_MODES=mode, **(env or {}))
+        if claim_dir is not None:
+            args[args.index("-ClaimDir") + 1] = str(claim_dir)
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+        time.sleep(2)
+        return p, spec, hashlib.sha256
+
+    def _finish(self, p) -> tuple[str, str]:
+        try:
+            return p.communicate(timeout=300)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+
+    def _open_token(self) -> str:
+        [job] = [j.name for j in (self.share / "inbox").iterdir() if j.name.startswith("lease-batch-open-")]
+        return job[: -len(".job.ps1")][-12:]
+
+    def test_r14_adv_a1_a_redirect_folder_prepared_with_links_is_never_written_through(self) -> None:
+        tmp = self.case / "r14-temp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        shutil.rmtree(self.share / "inbox", ignore_errors=True)
+        p, spec, sha = self._spawn_open_wait("exit1", env={"TEMP": str(tmp), "TMP": str(tmp)})
+        before = sha(spec.read_bytes()).hexdigest()
+        token = self._open_token()
+        prepared = tmp / f"venue-lease-batch-close-{token}"
+        prepared.mkdir()
+        os.link(spec, prepared / "batch.log")
+        [close] = [f"lease-batch-close-{j.name[len('lease-batch-open-'):]}" for j in (self.share / "inbox").iterdir() if j.name.startswith("lease-batch-open-")]
+        os.link(spec, prepared / close)
+        (self.run_dir / "batch.log").unlink(missing_ok=True)
+        os.link(spec, self.run_dir / "batch.log")
+        so, se = self._finish(p)
+        self.assertEqual(sha(spec.read_bytes()).hexdigest(), before, "nothing was written through a link prepared in the redirect folder")
+        self.assertEqual(p.returncode, 9, so + se)
+        self.assertIn("BATCH_OUTPUT_ALIASED ", se)
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+
+    def test_r14_adv_a1_a_temp_inside_the_run_dir_gets_no_redirect_there(self) -> None:
+        p, spec, sha = self._spawn_open_wait("exit1", env={"TEMP": str(self.run_dir), "TMP": str(self.run_dir)})
+        before = sha(spec.read_bytes()).hexdigest()
+        (self.run_dir / "batch.log").unlink(missing_ok=True)
+        os.link(spec, self.run_dir / "batch.log")
+        so, se = self._finish(p)
+        self.assertEqual(sha(spec.read_bytes()).hexdigest(), before)
+        self.assertEqual(p.returncode, 9, so + se)
+        self.assertEqual([d.name for d in self.run_dir.iterdir() if d.name.startswith("venue-lease-batch-close-")], [], "the redirect was made inside -RunDir")
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED ", se)
+        self.assertIn("LEASE_BATCH_RESULT=", so)
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+
+    def test_r14_adv_a2_a_redirect_that_cannot_be_made_still_releases_the_claim_and_reports_a_typed_exit(self) -> None:
+        blocker = self.case / "r14-not-a-dir"
+        blocker.unlink(missing_ok=True)
+        blocker.write_text("a file, so no folder can be made below it", encoding="utf-8")
+        bad = blocker / "temp"
+        p, spec, sha = self._spawn_open_wait("exit1", env={"TEMP": str(bad), "TMP": str(bad)})
+        before = sha(spec.read_bytes()).hexdigest()
+        (self.run_dir / "batch.log").unlink(missing_ok=True)
+        os.link(spec, self.run_dir / "batch.log")
+        so, se = self._finish(p)
+        self.assertEqual(sha(spec.read_bytes()).hexdigest(), before)
+        self.assertEqual(p.returncode, 9, so + se)
+        self.assertEqual(batch_result(so)["stopReason"], "OPEN_FAILED")
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED ", se)
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+
+    def test_r14_adv_a3_the_claim_keeper_stops_writing_a_claim_file_that_became_the_input_once_the_alias_is_found(self) -> None:
+        claim = self.run_dir / "bachelor.claim.json"
+        p, spec, sha = self._spawn_open_wait("gatehold", "-ClaimTtlSec", "60", "-ClaimRenewSec", "1", "-CancelReconcileSec", "3",
+                                             "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=45)), claim_dir=self.run_dir)
+        nonce = json.loads(claim.read_text(encoding="utf-8"))["nonce"]
+        body = json.loads(spec.read_text(encoding="utf-8"))
+        body.update({"nonce": nonce, "expiresUtc": "2026-10-26T12:00:00Z"})
+        spec.write_text(json.dumps(body, separators=(",", ":")), encoding="utf-8")
+        claim.unlink()
+        os.link(spec, claim)
+        so, se = self._finish(p)
+        self.assertIn("BATCH_OUTPUT_ALIASED ", se, so + se)
+        cancel = self.share / "cancel" / f"lease-batch-open-{[j.name for j in (self.share / 'inbox').iterdir() if j.name.startswith('lease-batch-open-')][0][len('lease-batch-open-'):-len('.job.ps1')]}.cancel"
+        self.assertTrue(cancel.exists(), so + se)
+        self.assertIn("close=RECEIPT", so + se, "the lease close was still submitted")
+        # the keeper renews every second; stopped at the alias, its last write is long before the cancel the finally requests at the deadline
+        self.assertLess(spec.stat().st_mtime, cancel.stat().st_mtime - 5, "the keeper went on rewriting the input after the alias was found")
+
     # r12 (adversary r12 A2): TrimEnd('\') turned the drive root C:\ into C:, the drive's current directory, so a root zone was listed from the wrong folder. A real volume root cannot be
     # written to by a test, so the function that decides it is run on its own: its source is taken from the runner, so this cannot drift from what the runner does.
     def test_r12_a2_a_drive_root_keeps_its_backslash_when_trailing_separators_are_removed(self) -> None:

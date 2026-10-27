@@ -198,7 +198,7 @@ $deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globali
 $pwshExe = [Environment]::ProcessPath
 if (-not $Purpose) { $Purpose = "Invoke-VenueLeaseBatch $(Split-Path -Leaf $RunDir)" }
 
-$script:RunOutputAliased = $false
+$script:RunOutputAliased = $false; $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null
 function L([string]$Message) {
     $line = "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message"
     # r13 (adversary r13 pass 2 A1): once an accepted input was found to BE a runner output after the open, nothing more is written into -RunDir (batch.log may be that input); stderr carries the line
@@ -467,10 +467,23 @@ function Test-OpenOutputAlias {
     # the receipt go to stderr, the close job file to a fresh folder under TEMP, the ledger row is said, not appended. Which typed stop the run then takes is decided apart from it.
     $hit = Get-InputOutputRefusal
     if ($hit -and $hit.kind -cne 'content' -and -not $script:RunOutputAliased) {
-        $script:RunOutputAliased = $true
-        $script:jobDir = Join-Path ([IO.Path]::GetTempPath()) "venue-lease-batch-close-$token"; New-Item -ItemType Directory -Force -Path $script:jobDir | Out-Null
-        $script:batchLog = Join-Path $script:jobDir 'batch.log'   # the final result-line append lands there, not in -RunDir
-        [Console]::Error.WriteLine("BATCH_OUTPUT_ALIASED kind=$($hit.kind) item=$($hit.item) $($hit.why) (found once the open returned: nothing more is written into -RunDir; the log and the receipt go to stderr)")
+        # Suppression first, so nothing below can leave it off: no batch.log at all until a redirect exists (the final append then fails, is counted and said on stderr).
+        $script:RunOutputAliased = $true; $script:batchLog = $null
+        # adversary r14 A3: the claim keeper rewrites the claim file in place, and that file may be the input too: it is stopped now, not after the close. The claim can then lapse
+        # at its TTL while the lease is closed; it is still released (by nonce, a delete that changes no linked input's bytes) in the finally.
+        $script:keeperStoppedEarly = $true; $script:keeperStoppedInTime = Stop-VenueKeeper -Keeper $claimKeeper
+        # adversary r14 A1, A2: the redirect is a NEW folder with an unguessable name, created without -Force (an existing one, prepared with links, is never reused), and its files are
+        # created new (Submit-AgentJob). A redirect that cannot be made is no throw: the close job then cannot be written, its submit is typed ERROR, and the finally goes on.
+        $redirect = Join-Path ([IO.Path]::GetTempPath()) "venue-lease-batch-close-$token-$([guid]::NewGuid().ToString('N'))"
+        $script:jobDir = $redirect
+        try {
+            # TEMP set inside -RunDir would put the redirect back in it: refused (a junction there still yields a folder this run just made, which holds no input)
+            $rd = Remove-TrailingSeparator $RunDir; if (-not $rd.EndsWith('\')) { $rd += '\' }
+            if ([IO.Path]::GetFullPath($redirect).StartsWith($rd, [StringComparison]::OrdinalIgnoreCase)) { throw "TEMP ($([IO.Path]::GetTempPath())) is inside -RunDir" }
+            $null = New-Item -ItemType Directory -Path $redirect -ErrorAction Stop; $script:batchLog = Join-Path $redirect 'batch.log'
+        }
+        catch { [Console]::Error.WriteLine("BATCH_OUTPUT_REDIRECT_FAILED $redirect ($($_.Exception.Message -replace '\s+', ' ')): the close job cannot be written; the result line is on stdout only") }
+        [Console]::Error.WriteLine("BATCH_OUTPUT_ALIASED kind=$($hit.kind) item=$($hit.item) $($hit.why) (found once the open returned: nothing more is written into -RunDir; the log and the receipt go to stderr; claim keeper stopped inTime=$($script:keeperStoppedInTime))")
     }
     $hit
 }
@@ -688,10 +701,13 @@ function Submit-AgentJob([string]$JobId, [string]$Body, [int]$TimeoutSec, [int]$
     # One job through um-run.ps1 (the only writer to a venue share). RECEIPT | RETRACTED | UNRESOLVED | ERROR; a thrown RETRACTED / UNRESOLVED is data here.
     # r4: -NotAfterUtc (the open only) goes to um-run.ps1 -NotAfterUtc, meta.json notAfterUtc: the agent takes no lease for the job past it.
     $f = Join-Path $jobDir "$JobId.job.ps1"
-    [IO.File]::WriteAllText($f, $Body + "`r`n", [Text.Encoding]::ASCII)
     $bound = @{}
     if ($NotAfterUtc) { $bound.NotAfterUtc = $NotAfterUtc }
     try {
+        # adversary r14 A1, A2: the job file is created NEW (a file already at its name, a link prepared there included, is refused, never truncated), and a write that fails is
+        # this job's ERROR outcome, not a throw out of the finally's close (which would skip the keeper stop, the claim release and the receipt)
+        $fs = [IO.File]::Open($f, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $jb = [Text.Encoding]::ASCII.GetBytes($Body + "`r`n"); $fs.Write($jb, 0, $jb.Length) } finally { $fs.Dispose() }
         $o = @(& $UmRunScript -ScriptPath $f -JobId $JobId -AgentShare $AgentShare -TimeoutSec $TimeoutSec -MaxQueueWaitSec $WaitSec -MaxClaimedWaitSec 300 -MaxAdmissionWaitSec $WaitSec @bound 6>$null)
         [pscustomobject]@{ outcome = 'RECEIPT'; result = $(if ($o.Count -gt 0) { $o[-1] } else { $null }); message = $null }
     } catch {
@@ -840,6 +856,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     # r5 (dot 242171b3 B1): the claim's expiry is renewed for as long as the batch holds it (the open's wait for the lease, the by-name wait and the legs can all
     # outlast -ClaimTtlSec), so Get-VenueClaimStaleReason never finds a live owner's claim expired. The keeper dies with this process.
     $claimKeeper = Start-VenueClaimKeeper -Venue $Venue -Nonce $claim.nonce -TtlSec $ClaimTtlSec -RenewSec $ClaimRenewSec -ClaimDir $ClaimDir
+    $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null
     # r3 (Dot B1): $openSubmitted is true from the moment Submit-AgentJob is called for the open. The finally block's cancel, close and ledger charge follow
     # that flag, never "$op is null": a null $op before the call (a throw while the sidecar was checked) means nothing was sent.
     $op = $null; $leaseStartUtc = $null; $openSubmitUtc = $null; $openLive = $null; $cr = $null; $openSubmitted = $false; $inFlightLeg = $null
@@ -1167,7 +1184,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $leases.Add([pscustomobject]@{ startUtc = $row.startUtc; endUtc = $row.endUtc; leaseId = $row.leaseId })
             }
         }
-        $ckInTime = Stop-VenueKeeper -Keeper $claimKeeper
+        $ckInTime = $(if ($script:keeperStoppedEarly) { $script:keeperStoppedInTime } else { Stop-VenueKeeper -Keeper $claimKeeper })   # r14: stopped at the alias already
         $cks = $claimKeeper.state
         $b.claimRenew = [ordered]@{ renewSec = $ClaimRenewSec; ttlSec = $ClaimTtlSec; renews = $cks.renews; errors = $cks.errors; lastError = $cks.lastError; lost = $cks.lost; lastExpiresUtc = $cks.expiresUtc; stoppedInTime = $ckInTime }
         LogBest "CLAIM_RENEW batch=$batchNo renews=$($cks.renews) errors=$($cks.errors) lost=$(if ($cks.lost) { $cks.lost } else { 'no' }) lastExpiresUtc=$($cks.expiresUtc)"
