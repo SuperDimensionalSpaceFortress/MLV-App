@@ -3100,6 +3100,11 @@ UNRESOLVED_EXECUTED_SITES = {
          "r4 (from #661): dot-sources the text of the one FunctionDefinitionAst named Get-VenueQuietDecision (-ceq, exactly one) parsed "
          "from -DecisionSource, which defaults to the tracked Wait-VenueQuiet.ps1 beside it (:42); that pure function (:140-154) is scanned "
          "in its own file. Dot-sourcing a definition only defines the function, which is then called in-process at :118"),
+        (". ([scriptblock]::Create($f[0].Extent.Text))",
+         "r3 (from #692): dot-sources the text of exactly one FunctionDefinitionAst per name (-ceq; refuses unless exactly one is found) for "
+         "Test-PerCoreNumber and Get-VenuePerCoreVerdict (:101-105), parsed from -DecisionSource, which defaults to the tracked Wait-VenueQuiet.ps1 "
+         "beside it (:47); both are pure functions (Wait-VenueQuiet.ps1:1306-1345) scanned in their own file. Only reached with -PerCoreEnforce. "
+         "Dot-sourcing a definition only defines the function, which is then called in-process at :132"),
     ],
     "tools/profiling/dual-venue/VenueChain.psm1": [
         ("[void]$ps.AddScript($ScriptText)",
