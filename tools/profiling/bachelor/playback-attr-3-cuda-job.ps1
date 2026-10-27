@@ -3080,8 +3080,7 @@ if ($null -ne $smokeLaunchException -or $smokeRc -ne 0 -or -not (Test-Path -Lite
             try {
                 $failedRunLog = Resolve-AttrCudaSmokeRunLog -ResultJsonPath $resultPath -ContainingRoot $Work
                 [void](New-AttrCudaDirectory -Path (Join-Path $Pub 'logs'))
-                # r13b (adversary r13 A2 sibling): the resolver's hashed bytes, never the path copied again after the check
-                [void](Publish-AttrCudaBytes -Path (Join-Path $Pub 'logs\smoke-run.log') -Bytes $failedRunLog.content)
+                [void](Publish-AttrCudaFileCopy -Source $failedRunLog.path -Destination (Join-Path $Pub 'logs\smoke-run.log'))
                 $smokeRunLogPublished = $true
                 $smokeRunLogSource = $failedRunLog.source
             } catch {
@@ -3191,8 +3190,7 @@ try {
     exit 16
 }
 $logPath = $runLog.path
-# r13b (adversary r13 028f4619 A2 sibling): the text the resolver hashed, never the path reopened after its check
-$rawLog = [string]$runLog.text
+$rawLog = [IO.File]::ReadAllText($logPath)
 $measuredSmokeSessionId = Get-MeasuredSmokeSessionId $rawLog
 # UM-DISPLAY-SELECT-AND-LOG-1 item 2b: the app's own gui_smoke.display_screen/display_target/
 # window_placement lines are only ever knowable once the smoke log itself is in hand -- recomputed
@@ -3227,8 +3225,7 @@ $earlyAppSwapTelemetry = Get-AttrCudaAppSwapTelemetry -LogText $rawLog
 [void](Publish-AttrCudaFileCopy -Source (Join-Path $legOut 'smoke-stderr.txt') -Destination (Join-Path $Pub 'smoke-stderr.txt'))
 [void](Publish-AttrCudaFileCopy -Source (Join-Path $legOut 'probe-timeline.csv') -Destination (Join-Path $Pub 'probe-timeline.csv'))
 [void](New-AttrCudaDirectory -Path (Join-Path $Pub 'logs'))
-# r13b (adversary r13 A2 sibling): the bytes the resolver hashed and $rawLog was decoded from, never the path copied again after the check
-[void](Publish-AttrCudaBytes -Path (Join-Path $Pub 'logs\smoke-run.log') -Bytes $runLog.content)
+[void](Publish-AttrCudaFileCopy -Source $logPath -Destination (Join-Path $Pub 'logs\smoke-run.log'))
 
 # CUDA-PERF-DISPLAY-IDENTITY-HARNESS-2 (sol BLOCKER 1 / fable HARDENING): PresentMon is waited on
 # only now, AFTER every smoke artifact above is already on disk. A wait failure -- a hang past
@@ -4626,7 +4623,12 @@ function Get-CorePartitionAppAliveMonoMs($Helper, $AppVerdict) {
 # monotonic clock alone the summary was logged before the smoke returned ($WindowEndMonoMs), so the playback started no later than $WindowEndMonoMs
 # less elapsed_ms: gapMonoMaxMs, the start gap's clock-proof ceiling (it also holds the app's teardown, so it is published, not bounded). A stamped
 # gap past that ceiling (beyond the same tolerance) is the clocks disagreeing too: feed-window-start-unverified. No window end is unverified.
-function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $LaunchMonoMs, $StartMarkMonoMs, $ClockSkewMs, [double]$StartSlackMs = 10000, $WindowEndMonoMs = $null, [double]$StampToleranceMs = 250) {
+# adversary r13b (82510ec1) A1: an excursion that covers BOTH stamps (and that no poll sampled) keeps them consistent with elapsed_ms, so the
+# ceiling itself is bounded too: it is the start gap plus the teardown after the summary (the app's post-summary work, 2.4 s and 9.1 s to the last
+# log line in the 2026-10-27 venue logs 705ca6f7 / 95ccf29f, plus the runner's post-exit work, which the END bound allows up to 10000 ms), so a
+# ceiling over $StartSlackMs + $TeardownSlackMs (20000 ms) cannot show the start within the slack whatever the stamps say:
+# feed-window-start-unverified. LIMIT: an unsampled excursion can still hide up to $TeardownSlackMs less the real teardown of startup.
+function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $LaunchMonoMs, $StartMarkMonoMs, $ClockSkewMs, [double]$StartSlackMs = 10000, $WindowEndMonoMs = $null, [double]$StampToleranceMs = 250, [double]$TeardownSlackMs = 20000) {
     $r = [ordered]@{ why = 'feed-window-start-unverified'; gapMs = $null; gapMonoMaxMs = $null; stampDisagreeMs = $null; playbackStartUtcTicks = $null; session = $null; slackMs = $StartSlackMs }
     try {
         if ([string]::IsNullOrEmpty($LogText)) { return $r }
@@ -4665,7 +4667,10 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         $ceiling = $we - $el - $sm
         $r.gapMonoMaxMs = [math]::Round($ceiling, 1)
         if ($gap -gt $ceiling + $tol) { return $r }
-        $r.why = $(if ($gap + $sk -gt $StartSlackMs) { 'feed-window-start-late' } else { $null })
+        if ($gap + $sk -gt $StartSlackMs) { $r.why = 'feed-window-start-late'; return $r }
+        # adversary r13b A1: the clock-proof bound
+        if ($ceiling -gt $StartSlackMs + [math]::Max(0.0, $TeardownSlackMs)) { return $r }
+        $r.why = $null
         $r
     } catch { $r }
 }
@@ -5993,9 +5998,18 @@ try {
     # playback means, so the window fields are refused (feed-window-start-late). The gap is published either way (feed.startGapMs).
     $corePartitionStartSlackMs = 10000
     $cpRunLogText = $null
-    # r13b (adversary r13 028f4619 A2): the text is the resolver's own hashed read (.text), never the path reopened after the hash check, so a
-    # same-length rewrite between the check and this read is never consumed
-    try { $cpRunLogText = [string](Resolve-AttrCudaSmokeRunLog -ResultJsonPath $resultPath -ContainingRoot $Work).text } catch { $corePartitionErrors.Add("playback-start-log: $([string]$_.Exception.Message)") }
+    # r13b (adversary r13 028f4619 A2): the resolver hashes the snapshot and returns its path, so the bytes read here are hashed again and used
+    # only when they are the bytes it checked (its sha256, bound to result.json's evidence.runLogSnapshot); a same-length rewrite between the
+    # check and this read is refused (run-log-changed-after-check; no text, so feed-window-start-unverified), never consumed. $cpRunLogText is
+    # also what the later metrics read must equal (r13b A2 binding, below).
+    try {
+        $cpRunLogResolved = Resolve-AttrCudaSmokeRunLog -ResultJsonPath $resultPath -ContainingRoot $Work
+        $cpRunLogBytes = [IO.File]::ReadAllBytes([string]$cpRunLogResolved.path)
+        $cpRunLogHasher = [Security.Cryptography.SHA256]::Create()
+        try { $cpRunLogSha = [BitConverter]::ToString($cpRunLogHasher.ComputeHash($cpRunLogBytes)).Replace('-', '').ToLowerInvariant() } finally { $cpRunLogHasher.Dispose() }
+        if ([string]::IsNullOrEmpty([string]$cpRunLogResolved.sha256) -or $cpRunLogSha -ne ([string]$cpRunLogResolved.sha256).ToLowerInvariant()) { $corePartitionErrors.Add('playback-start-log: run-log-changed-after-check') }
+        else { $cpRunLogText = [Text.Encoding]::UTF8.GetString($cpRunLogBytes) }
+    } catch { $corePartitionErrors.Add("playback-start-log: $([string]$_.Exception.Message)") }
     # r13b (A1): the skew counted against the start is the larger of the job's own (three reads) and the helper's (its 200 ms polls), when it has one
     $cpStartSkewMs = $corePartitionJobClockSkewMs
     if ($null -ne $corePartitionHelperRecord -and $null -ne $cpStartSkewMs) { $cpHelperSkew = (ConvertFrom-CorePartitionNumber $corePartitionHelperRecord.clockSkewMaxMs 'double').value; if ($null -ne $cpHelperSkew) { $cpStartSkewMs = [math]::Max([double]$cpStartSkewMs, [math]::Abs($cpHelperSkew)) } }
@@ -6051,6 +6065,10 @@ Write-JobTrace "step smoke-launch done rc=$smokeRc"
     $text = Edit-DualVenueTemplate $text $cpLaunchOld ($cpPre + "`n" + $cpPost)
     $cpMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
     $text = Edit-DualVenueTemplate $text $cpMetricsAnchor ($cpOpen + "`n" + @'
+# r13b (adversary r13b 82510ec1 A2): the window's start was judged on the core-partition read of the run log ($cpRunLogText, hash-checked at
+# the smoke's end); the metrics resolve and read it again ($rawLog). Two texts that differ did not come from one snapshot, so the start verdict
+# does not hold for these metrics: every window field is refused (run-log-snapshot-mismatch).
+if (-not [string]::Equals([string]$rawLog, [string]$cpRunLogText, [StringComparison]::Ordinal)) { $corePartitionFeedSummary = Get-CorePartitionStartBoundFeed $corePartitionFeedSummary @{ why = 'run-log-snapshot-mismatch' } }
 $corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs
 '@ + "`n" + $cpClose + "`n" + $cpMetricsAnchor)
     $cpMetricsAt = $text.IndexOf($cpMetricsAnchor, [StringComparison]::Ordinal)

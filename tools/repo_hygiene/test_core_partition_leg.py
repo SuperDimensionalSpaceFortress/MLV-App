@@ -175,7 +175,7 @@ function Write-JobTrace([string]$Message) { }
 function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText($Path, $Value) }
 function New-AttrCudaDirectory { param([string]$Path) }
 function Save-Json { param($Object, $Path) $global:cpSaved = $Object }
-function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) $p = Join-Path $ContainingRoot 'run.log'; if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'run log unresolvable' }; $b = [IO.File]::ReadAllBytes($p); [pscustomobject]@{ path = $p; content = $b; text = [Text.Encoding]::UTF8.GetString($b) } }
+function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) $p = Join-Path $ContainingRoot 'run.log'; if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'run log unresolvable' }; [pscustomobject]@{ path = $p; sha256 = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() } }
 $exePath = 'C:\no\such\MLVApp.exe'
 $SmokeProcessTimeoutMs = 60000
 $out = [ordered]@{}
@@ -206,7 +206,8 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     }
     $global:cpSaved = $null
     . ([scriptblock]::Create($regions[1]))
-    $rawLog = "playback_smoke.start session=1 worker_threads=16`n"
+    # r13b (A2 binding): the metrics read the same run log the start verdict read
+    $rawLog = $(if (Test-Path -LiteralPath (Join-Path $Work 'run.log')) { [IO.File]::ReadAllText((Join-Path $Work 'run.log')) } else { "playback_smoke.start session=1 worker_threads=16`n" })
     . ([scriptblock]::Create($regions[2]))
     $ps = $global:cpSaved.feed.summary; $sc = $corePartitionScalars
     $out[$mode] = [ordered]@{
@@ -2264,11 +2265,11 @@ function Save-Json { param($Object, $Path) $global:cpSaved = $Object }
 function Get-CorePartitionMonoMs { [double]$global:cpClk }
 # r13 (CP-FEED-START-ANCHOR): the run log the result names; the R13 driver sets $global:cpLog per case ($null: the resolver throws, as the real one
 # does for a result without a verified log)
-# r13b (A2): like the real one, it returns the bytes it read (.content, .text); $global:cpSwap, when set, is written over the file AFTER that read
-# (a same-length rewrite between the resolver's check and any later reopen of .path)
-function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) if (-not $global:cpLog) { throw 'run log unresolvable' }; $b = [IO.File]::ReadAllBytes($global:cpLog)
+# r13b (A2): like the real one, it returns the path and the sha256 it checked; $global:cpSwap, when set, is written over the file AFTER that
+# check (a same-length rewrite between the resolver's check and the caller's read of .path)
+function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) if (-not $global:cpLog) { throw 'run log unresolvable' }; $h = (Get-FileHash -LiteralPath $global:cpLog -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($null -ne $global:cpSwap) { [IO.File]::WriteAllText($global:cpLog, $global:cpSwap) }
-    [pscustomobject]@{ path = $global:cpLog; content = $b; text = [Text.Encoding]::UTF8.GetString($b) } }
+    [pscustomobject]@{ path = $global:cpLog; sha256 = $h } }
 $row = "26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
 function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
     $m = $global:cpClk; $global:cpClk += 500
@@ -2457,7 +2458,7 @@ def _r13_start_driver() -> str:
              "        if ($c.Count -gt 9 -and $c[9]) { $global:cpSwap = & $Body ($c[5] - 57000) (90500 - 57000) }\n"
              "    }\n"),
             ("    $out[$k] = [ordered]@{ end = $corePartitionSmokeEndMonoMs;",
-             "    $out[$k] = [ordered]@{ wattsMean = $f.pkgWattsMean; tempMean = $f.pkgTempCMean; start = @($pf.startGapMs, $pf.startSlackMs, [string]$pf.startWhy, $pf.playbackSession, ($null -ne $pf.playbackStartUtcTicks)); start2 = @($pf.startStampDisagreeMs, $pf.startGapMonoMaxMs); swapped = $(if ($null -ne $global:cpLog) { [IO.File]::ReadAllText($global:cpLog) -eq $global:cpSwap } else { $false }); end = $corePartitionSmokeEndMonoMs;")):
+             "    $out[$k] = [ordered]@{ wattsMean = $f.pkgWattsMean; tempMean = $f.pkgTempCMean; start = @($pf.startGapMs, $pf.startSlackMs, [string]$pf.startWhy, $pf.playbackSession, ($null -ne $pf.playbackStartUtcTicks)); start2 = @($pf.startStampDisagreeMs, $pf.startGapMonoMaxMs); errors = @($corePartitionErrors); swapped = $(if ($null -ne $global:cpLog) { [IO.File]::ReadAllText($global:cpLog) -eq $global:cpSwap } else { $false }); end = $corePartitionSmokeEndMonoMs;")):
         if d.count(old) != 1:
             raise AssertionError(f"R11_CLEANUP changed shape near {old!r}")
         d = d.replace(old, new)
@@ -2512,6 +2513,11 @@ $r.a1SkewWidensTolerance = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'play
 $r.a1NoWindowEnd = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 $null)
 $r.a1StampPastTheMonotonicCeiling = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 35000)
 $r.a1Consistent = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 41000)
+# adversary r13b (82510ec1) A1, its exact input: a -60000 ms excursion covers BOTH stamps (start T+3000, summary T+23000, elapsed_ms 20000, so
+# they agree); launch mono 100000, start mark 99990, the smoke returned at mono 185000. The ceiling (65010 ms) is past slack + teardown (30000).
+$a1b = @((Ln 3000 'playback_smoke.start session=1 position=0'), (Ln 3010 'playback_smoke.measured_session id=1'), (Sm 23000 '20000.000')) -join "`n"
+$r.a1bExcursionCoversBothStamps = Pick2 (Get-CorePartitionPlaybackStart $a1b $L.Ticks 100000 99990 0 10000 185000)
+$r.a1bNamedTeardownSlack = Pick2 (Get-CorePartitionPlaybackStart $a1b $L.Ticks 100000 99990 0 10000 185000 250 60000)
 $feed = [ordered]@{ rows = 3; pkgWattsMean = 40.0; pkgWattsMax = 100.0; pkgTempCMean = 46.67; pkgTempCMax = 80.0; pkgThrottledRows = 0; pkgTempCAtStart = 30.0; reasons = [ordered]@{ pkgThrottledRows = 'feed-unparseable' } }
 $late = Get-CorePartitionStartBoundFeed $feed @{ why = 'feed-window-start-late' }
 $r.bound = @($late.rows, $late.pkgWattsMean, $late.pkgTempCMean, $late.pkgTempCAtStart, $late.reasons['rows'], $late.reasons['pkgTempCMean'], $late.reasons['pkgThrottledRows'], $late.reasons.Contains('pkgTempCAtStart'))
@@ -2614,6 +2620,9 @@ class CorePartitionR13StartTests(unittest.TestCase):
         self.assertEqual(r["a1NoWindowEnd"], [unverified, 9000, 0, None])
         self.assertEqual(r["a1StampPastTheMonotonicCeiling"], [unverified, 9000, 0, 4000])
         self.assertEqual(r["a1Consistent"], ["", 9000, 0, 10000])
+        # adversary r13b (82510ec1) A1: an excursion over both stamps; the clock-proof ceiling (start gap + teardown) bounds it
+        self.assertEqual(r["a1bExcursionCoversBothStamps"], [unverified, 3010, 0, 65010])
+        self.assertEqual(r["a1bNamedTeardownSlack"], ["", 3010, 0, 65010])
 
     def test_r13b_adversary_a1_a_backward_utc_step_at_the_start_line_is_refused_not_averaged(self) -> None:
         """adversary r13 (028f4619) A1, its exact input: playback really starts at mono 61000 (60000 ms after the start mark), but a backward UTC
@@ -2628,12 +2637,13 @@ class CorePartitionR13StartTests(unittest.TestCase):
     def test_r13b_adversary_a2_a_swap_after_validate_is_never_read(self) -> None:
         """adversary r13 (028f4619) A2: the resolver checks the genuine log (playback 60000 ms after the start mark), then a same-length rewrite
         moves both the start and the summary stamps 57000 ms earlier (consistent with each other, so the A1 check alone would pass it). On
-        028f4619 the job reopens the path, reads the rewrite and publishes 40 W / 46.67 C. Now it reads only the bytes the resolver hashed: the
-        genuine 60000 ms gap, feed-window-start-late."""
+        028f4619 the job reopens the path, reads the rewrite and publishes 40 W / 46.67 C. Now the bytes it reads are hashed again and do not
+        match what the resolver checked: a typed refusal (feed-window-start-unverified, error run-log-changed-after-check), never a value."""
         got = self.r["adversary-r13-a2-swap-after-validate"]
         self.assertTrue(got["swapped"], f"the rewrite must be on disk when the job reads: {got}")
-        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [None, None, None, "feed-window-start-late"], got)
-        self.assertAlmostEqual(got["start"][0], 60000, delta=1, msg=got)
+        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [None, None, None, "feed-window-start-unverified"], got)
+        self.assertEqual(got["start"][0], None, got)
+        self.assertIn("playback-start-log: run-log-changed-after-check", got["errors"], got)
 
 
 PARAMS_ANCHOR = "$AutomationSettingsDir,$GpuPreLaunches)"

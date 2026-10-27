@@ -496,8 +496,7 @@ class SmokeRunFailedKeepsItsEvidenceTests(SliceHarness, unittest.TestCase):
         for label, old, probe in (
                 ("stderr", "Publish-AttrCudaFileCopy -Source $smokeStderrPath -Destination (Join-Path $Pub 'smoke-stderr.txt')", lambda pub: not (pub / "smoke-stderr.txt").exists()),
                 ("result", "Publish-AttrCudaFileCopy -Source $resultPath -Destination (Join-Path $Pub 'result.json')", lambda pub: not (pub / "result.json").exists()),
-                # r13b (adversary r13 A2 sibling): the run log is published from the resolver's hashed bytes, not copied by path after the check
-                ("runlog", "Publish-AttrCudaBytes -Path (Join-Path $Pub 'logs\\smoke-run.log') -Bytes $failedRunLog.content", lambda pub: not (pub / "logs" / "smoke-run.log").exists())):
+                ("runlog", "Publish-AttrCudaFileCopy -Source $failedRunLog.path -Destination (Join-Path $Pub 'logs\\smoke-run.log')", lambda pub: not (pub / "logs" / "smoke-run.log").exists())):
             block = smoke_block()
             self.assertEqual(block.count(old), 1, f"{label}: the SMOKE_RUN_FAILED branch publishes it exactly once")
             mutated = TEMPLATE.replace(old, "$null", 1)

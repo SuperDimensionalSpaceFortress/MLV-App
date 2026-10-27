@@ -3777,12 +3777,7 @@ function Resolve-AttrCudaSmokeRunLog {
             throw "ATTRCUDA_SMOKE_LOG_OUTSIDE_ROOT $fullLogPath is not under $root"
         }
     }
-    # adversary r13 (028f4619) A2: the snapshot is read ONCE. Its hash, its length and the bytes and text returned to every caller (.content,
-    # .text) come from that one read, so a writer that rewrites the file after this check (same length, one changed stamp) is never consumed: a
-    # caller reads .text or publishes .content, and never reopens .path.
-    $snapshotBytes = [IO.File]::ReadAllBytes($fullLogPath)
-    $snapshotHasher = [Security.Cryptography.SHA256]::Create()
-    try { $actualSha = [BitConverter]::ToString($snapshotHasher.ComputeHash($snapshotBytes)).Replace('-', '').ToLowerInvariant() } finally { $snapshotHasher.Dispose() }
+    $actualSha = (Get-FileHash -LiteralPath $fullLogPath -Algorithm SHA256).Hash.ToLowerInvariant()
 
     $declaredSha = ''
     $declaredLength = $null
@@ -3806,7 +3801,7 @@ function Resolve-AttrCudaSmokeRunLog {
         throw "ATTRCUDA_SMOKE_LOG_SHA_MISMATCH $fullLogPath declared=$declaredSha actual=$actualSha"
     }
     # sol, PR #133 r3: the smoke runner binds the snapshot by sha256 AND length; both are checked.
-    $actualLength = [int64]$snapshotBytes.Length
+    $actualLength = [int64](Get-Item -LiteralPath $fullLogPath).Length
     [int64]$parsedLength = -1
     if ($null -eq $declaredLength -or -not [int64]::TryParse($declaredLength, [ref]$parsedLength)) {
         throw "ATTRCUDA_SMOKE_LOG_LENGTH_UNBOUND $ResultJsonPath carries no integer evidence.runLogSnapshot.length"
@@ -3819,10 +3814,7 @@ function Resolve-AttrCudaSmokeRunLog {
     [pscustomobject]@{
         path = $fullLogPath
         sha256 = $actualSha
-        bytes = $actualLength
-        # A2: the hashed bytes themselves, and their text decoded as File.ReadAllText would (UTF-8, a BOM honoured)
-        content = $snapshotBytes
-        text = ([IO.StreamReader]::new([IO.MemoryStream]::new($snapshotBytes), [Text.Encoding]::UTF8, $true)).ReadToEnd()
+        bytes = (Get-Item -LiteralPath $fullLogPath).Length
         runNonce = $runNonce
         source = 'result.json log.path (run log snapshot)'
         aggregateSourcePath = if ($null -eq $aggregateProperty) { $null } else { $aggregateProperty.Value }
