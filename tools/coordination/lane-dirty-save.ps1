@@ -13,10 +13,11 @@
 # The helper judges every git exit code itself and sets $PSNativeCommandUseErrorActionPreference = $false for its own calls, so the expected exit 1 of `git diff --cached --quiet` cannot throw under a caller that set it.
 # It refuses a -Dest inside the worktree it describes (reason=dest-inside-worktree): evidence written there would show in the next status and be captured by the next save.
 # -Dest is resolved once to its physical path and every write uses that path; a destination that changed identity before a write or publish is reason=dest-identity-changed.
+# On Windows -Dest and -Wt are each held open, and the held handle must be the directory whose identity was sampled before the resolve (worktree-identity-changed / dest-identity-changed).
 # Read-only on the worktree (nothing is restored, so the caller's refusal and exit code are unchanged), idempotent (same diff = same name), fail-soft (never throws), and it
 # refuses a directory that is not itself a worktree root (that would resolve to an ENCLOSING repo and save its diff). The same logic is deployed board-local in
 # hub-autopilot\dispatch-fix-round.ps1; keep the two in step.
-# Moves $Tmp to <Dir>\<Stem><first 8|16|32|64 hex of $Full><Ext> and returns @{ Path; Id }, or $null when every length is taken by a DIFFERENT file.
+# Moves $Tmp to <Dir>\<Stem><first 8|16|32|64 hex of $Full><Ext> and returns @{ Path; Id; Moved }, or @{ Path = $null; Reason } when it cannot place it (below).
 # The move fails rather than overwrites, so an occupied name is compared by hash (same bytes = reuse, anything else = lengthen the name) and never clobbered.
 # When the name already holds these exact bytes, $Tmp is left for the caller's cleanup. A non-empty $FirstName is tried before the hash-derived names.
 # It always returns a hashtable: Path is the placed (or reused) file, or $null with Reason = name-collision (every length is taken by a DIFFERENT file) or
@@ -67,11 +68,13 @@ public static class DirtyFinalPath {
     public static string Identity(string path) {
         IntPtr h = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero);
         if (h == (IntPtr)(-1)) return null;
-        try {
-            ByHandleInfo i;
-            if (!GetFileInformationByHandle(h, out i)) return null;
-            return i.Volume.ToString("X8") + ":" + i.IndexHigh.ToString("X8") + i.IndexLow.ToString("X8");
-        } finally { CloseHandle(h); }
+        try { return HandleIdentity(h); } finally { CloseHandle(h); }
+    }
+    // The same identity read from a handle already open (a Pin): it names the directory the handle holds, whatever has been renamed onto its path since.
+    public static string HandleIdentity(IntPtr h) {
+        ByHandleInfo i;
+        if (h == IntPtr.Zero || !GetFileInformationByHandle(h, out i)) return null;
+        return i.Volume.ToString("X8") + ":" + i.IndexHigh.ToString("X8") + i.IndexLow.ToString("X8");
     }
     // No access rights, full sharing, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a directory can be opened).
     public static string Resolve(string path) {
@@ -167,6 +170,8 @@ function Lock-DirtyDirectory([string]$Path) {
     return $null
 }
 function Unlock-DirtyDirectory($Handle) { if ($null -ne $Handle) { try { [DirtyFinalPath]::Unpin($Handle) } catch { } } }
+# The identity of the directory a hold has open, read from the held handle and never by reopening a path (two plain renames can put another directory behind the same path); $null when unknown.
+function Get-DirtyHeldIdentity($Handle) { if ($null -eq $Handle) { return $null }; try { return [DirtyFinalPath]::HandleIdentity([IntPtr]$Handle) } catch { return $null } }
 
 # True when $Path is the directory with this identity or sits anywhere below it. A spelling the path comparison cannot relate to the worktree (an SMB share of it, \\localhost\share,
 # whose resolved name is in the share's namespace) still opens onto the same volume serial + file index (r5 adversary A4).
@@ -261,14 +266,26 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         # junction while the save runs. Every git call and write below uses those literal paths and never reopens the -Dest / -Wt spelling, so a junction retargeted after this point cannot
         # steer evidence into the worktree or make git read another repository. $guard also re-proves the destination (same volume serial + file index, same resolved path, outside the
         # worktree by path and by identity) right before each write and each rename into place, and a change is DIRTY_TREE_SAVE_FAILED reason=dest-identity-changed.
+        # Each directory's identity is sampled FIRST, before it is resolved or held, and the hold must then have that same directory open (read from the held handle, not the path):
+        # two plain renames between the resolve and the hold (a -> a.old, b -> a) keep the resolved spelling, so only the identity shows that the hold pins another directory (r6, Dot R5-B1).
+        # A resolved path holding a line break or other control character is refused before anything is held or written: it would split the one-line result (r6, sol r5 blocker 3).
         $onWindows = [bool]($IsWindows -or $env:OS -eq 'Windows_NT')
+        $breaksLine = '[\p{Cc}' + [char]0x2028 + [char]0x2029 + ']'  # C0/C1 controls and the Unicode line and paragraph separators
+        $destId = Get-DirtyDirIdentity $Dest
+        if (-not $destId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-identity-changed" }
         $destReal = Resolve-DirtyRealPath $Dest
+        if ($destReal -match $breaksLine) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-path-control-char" }
         if (Test-DirtyUncLocalHost $destReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-unc-local-host" }
         $destLock = Lock-DirtyDirectory $destReal
         if ($onWindows -and $null -eq $destLock) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-not-held" }  # a destination that cannot be held cannot be trusted not to be swapped (r5 adversary A5)
+        if ($onWindows -and (Get-DirtyHeldIdentity $destLock) -cne $destId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-identity-changed" }
+        $wtId = Get-DirtyDirIdentity $Wt
+        if (-not $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
         $wtReal = Resolve-DirtyRealPath $Wt
+        if ($wtReal -match $breaksLine) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-path-control-char" }
         $wtLock = Lock-DirtyDirectory $wtReal
         if ($onWindows -and $null -eq $wtLock) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-not-held" }
+        if ($onWindows -and (Get-DirtyHeldIdentity $wtLock) -cne $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
         # Between the resolve and the hold a rename plus a junction could have put another directory behind the same name: the hold would then pin that one. Resolving again, now that
         # the hold is in place, must give the same physical path (r5 adversary A3).
         if ((Resolve-DirtyRealPath $wtReal) -ine $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
@@ -276,9 +293,6 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $prefix = @(& git -C $Wt rev-parse --show-prefix 2>$null)
         if ($LASTEXITCODE -ne 0 -or ($prefix -join '').Trim() -ne '') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
         if (Test-DirtyPathInside -Inner $destReal -Outer $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-inside-worktree" }
-        $destId = Get-DirtyDirIdentity $destReal
-        $wtId = Get-DirtyDirIdentity $wtReal
-        if (-not $destId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-identity-changed" }
         $guard = { param($stage) Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -WtIdentity $wtId -Stage $stage }
         $why = & $guard 'before-write'
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }

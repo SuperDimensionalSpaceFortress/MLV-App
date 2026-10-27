@@ -2894,8 +2894,11 @@ def test_save_dirty_worktree_evidence_refuses_to_publish_when_the_destination_id
     dest = tmp_path / "outside"
     dest.mkdir()
     before = git(wt, "status", "--porcelain")
-    # Lock-DirtyDirectory is overridden with a hold that holds nothing (and Unlock with a no-op), so the identity check is what has to catch the swap.
-    shim = ("function Lock-DirtyDirectory([string]$Path) { 1 }; function Unlock-DirtyDirectory($Handle) { }; $script:Swapped = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
+    # Lock-DirtyDirectory is overridden with a hold that holds nothing (and Unlock with a no-op), so the identity check is what has to catch the swap. The fake handles
+    # report the identity of the path they were taken on, as a real hold does at the moment it is taken (r6).
+    shim = ("$script:Held = @{}; function Lock-DirtyDirectory([string]$Path) { $k = $script:Held.Count + 1; $script:Held[$k] = $Path; $k }; "
+            "function Get-DirtyHeldIdentity($Handle) { Get-DirtyDirIdentity $script:Held[$Handle] }; "
+            "function Unlock-DirtyDirectory($Handle) { }; $script:Swapped = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
             f"if ($Stage -eq 'before-publish' -and -not $script:Swapped) {{ $script:Swapped = $true; [System.IO.Directory]::Move('{dest}', '{dest}.moved'); "
             f"$null = New-Item -ItemType Junction -Path '{dest}' -Target '{wt / 'run'}' }} }}")
     out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
@@ -3033,6 +3036,71 @@ def test_save_dirty_worktree_evidence_refuses_a_worktree_replaced_between_resolv
     out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt_a}' -Dest '{dest}' -CardName C1 -RoundName r1")
     assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=worktree-identity-changed", (out.stdout, out.stderr)
     assert not list(dest.iterdir()) and git(wt_b, "status", "--porcelain") == before_b
+
+
+@pytest.mark.skipif(os.name != "nt", reason="holding a directory open is Windows share-mode behaviour")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_worktree_renamed_away_and_replaced_between_resolving_and_holding_it(tmp_path):
+    # r6 (Dot R5-B1, sol r5 blocker 1): two ORDINARY renames (a -> a.old, b -> a) between the resolve and the hold keep the resolved spelling, so the path re-check passed and the
+    # first identity sample was already b's: b was exported while a's edits stayed unsaved. The identity is now sampled before the hold and compared with the held handle's.
+    wt_a, dest = _dirty_save_repo(tmp_path)
+    (tmp_path / "b").mkdir()
+    wt_b, _ = _dirty_save_repo(tmp_path / "b")
+    (wt_b / "src" / "a.txt").write_text("bee\n")
+    for repo in (wt_a, wt_b):  # the destination is outside both repositories and above neither, so its hold cannot obstruct the renames
+        assert os.path.commonpath([str(dest), str(repo)]) not in (str(dest), str(repo))
+    before_b = git(wt_b, "status", "--porcelain")
+    shim = ("$script:RealLock = (Get-Command Lock-DirtyDirectory -CommandType Function).ScriptBlock; $script:Swapped = $false; "
+            "function Lock-DirtyDirectory([string]$Path) { "
+            f"if ($Path -ieq '{wt_a}' -and -not $script:Swapped) {{ $script:Swapped = $true; [System.IO.Directory]::Move('{wt_a}', '{wt_a}.old'); "
+            f"[System.IO.Directory]::Move('{wt_b}', '{wt_a}'); $script:Swap = 'swap=done' }}; & $script:RealLock $Path }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt_a}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output $script:Swap")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] == "swap=done", (out.stdout, out.stderr)
+    assert lines[0] == "DIRTY_TREE_SAVE_FAILED card=C1 reason=worktree-identity-changed", (out.stdout, out.stderr)
+    assert not list(dest.iterdir()), "nothing may be saved from the repository that was swapped in"
+    assert git(wt_a, "status", "--porcelain") == before_b and (Path(str(wt_a) + ".old") / "src" / "a.txt").read_text() == "two\n"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="holding a directory open is Windows share-mode behaviour")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_destination_renamed_away_and_replaced_between_resolving_and_holding_it(tmp_path):
+    # r6 sibling of R5-B1 (sol r5 class sweep, :265-267,279): the same two ordinary renames on -Dest; the replacement is still outside the worktree, but it is not the
+    # directory that was validated, so the save is refused rather than written somewhere nobody named.
+    wt, dest = _dirty_save_repo(tmp_path)
+    other = tmp_path / "other-run"
+    other.mkdir()
+    shim = ("$script:RealLock = (Get-Command Lock-DirtyDirectory -CommandType Function).ScriptBlock; $script:Swapped = $false; "
+            "function Lock-DirtyDirectory([string]$Path) { "
+            f"if ($Path -ieq '{dest}' -and -not $script:Swapped) {{ $script:Swapped = $true; [System.IO.Directory]::Move('{dest}', '{dest}.old'); "
+            f"[System.IO.Directory]::Move('{other}', '{dest}') }}; & $script:RealLock $Path }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-identity-changed", (out.stdout, out.stderr)
+    assert not list(dest.iterdir()) and not list(Path(str(dest) + ".old").iterdir())
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_resolved_path_that_would_break_the_one_line_result(tmp_path):
+    # r6 (sol r5 blocker 3): a POSIX directory name may hold LF; it went raw into patch=, status= and reapply=, so the one-line result became four lines. A resolved -Dest or -Wt
+    # holding a line break or other control character is refused before anything is held or written. Windows names cannot hold LF, so the resolver seam supplies one.
+    wt, dest = _dirty_save_repo(tmp_path)
+    for target, reason in ((dest, "dest-path-control-char"), (wt, "worktree-path-control-char")):
+        shim = ("$script:RealRR = (Get-Command Resolve-DirtyRealPath -CommandType Function).ScriptBlock; "
+                f"function Resolve-DirtyRealPath([string]$Path) {{ $r = & $script:RealRR $Path; if ($r -ieq '{target}') {{ $r + \"`n5\" }} else {{ $r }} }}")
+        out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+        assert out.stdout.strip() == f"DIRTY_TREE_SAVE_FAILED card=C1 reason={reason}", (target, out.stdout, out.stderr)
+        assert not list(dest.iterdir())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="only a POSIX file system lets a directory name hold LF")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_keeps_one_line_for_a_posix_destination_holding_lf(tmp_path):
+    wt, _ = _dirty_save_repo(tmp_path)
+    dest = tmp_path / "round\n5"
+    dest.mkdir()
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-path-control-char", (out.stdout, out.stderr)
+    assert not list(dest.iterdir())
 
 
 @pytest.mark.skipif(os.name != "nt", reason="the console encoding is a Windows console property")
