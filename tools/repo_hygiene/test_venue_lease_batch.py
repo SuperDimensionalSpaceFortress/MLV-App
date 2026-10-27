@@ -2722,6 +2722,65 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
         self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is byte-unchanged")
 
+    # r12 (adversary r12 A1): the staged build manifest is an input too. A hard link <RunDir>\<output> -> the manifest made the runner write the output through it, over the accepted build.
+    def _staged_manifest(self, commit: str) -> Path:
+        return self.share / "cache" / f"playback-attr-3-cuda-{commit[:12]}-build.json"
+
+    def test_r12_a1_a_staged_build_manifest_hard_linked_to_a_runner_output_is_refused_before_the_claim(self) -> None:
+        for leaf in ("leg-plan.json", "gate.log", "batch.log", "batch-01.json", "batch-jobs/x.json", "quiet/x.json"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                manifest = self._staged_manifest(self.commit_a)
+                (self.run_dir / leaf).parent.mkdir(parents=True, exist_ok=True)
+                os.link(manifest, self.run_dir / leaf)
+                before = manifest.read_text(encoding="utf-8")
+                r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, manifest, before, "LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ")
+                self.assertIn("is a hard link to", r.stderr)
+                os.unlink(self.run_dir / leaf)
+
+    def test_r12_a1_the_refusal_names_the_item_that_reads_the_build(self) -> None:
+        self._fresh_run_dir()
+        manifest = self._staged_manifest(self.commit_b)
+        os.link(manifest, self.run_dir / "leg-plan.json")
+        before = manifest.read_text(encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "B", self.commit_b)]))
+        self._assert_nothing_submitted_input_intact(r, manifest, before, "LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=2 ")
+        os.unlink(self.run_dir / "leg-plan.json")
+
+    def test_r12_a1_a_staged_build_manifest_aliased_while_the_batch_waits_on_a_foreign_claim_is_refused_after_the_wait(self) -> None:
+        self._fresh_run_dir()
+        manifest = self._staged_manifest(self.commit_a)
+        before = manifest.read_text(encoding="utf-8")
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        code, so, se = self._alias_during_claim_wait(args, e, manifest, self.run_dir / "leg-plan.json")
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
+        self.assertEqual(manifest.read_text(encoding="utf-8"), before, "the accepted build manifest is byte-unchanged")
+
+    # r12 (adversary r12 A2): TrimEnd('\') turned the drive root C:\ into C:, the drive's current directory, so a root zone was listed from the wrong folder. A real volume root cannot be
+    # written to by a test, so the function that decides it is run on its own: its source is taken from the runner, so this cannot drift from what the runner does.
+    def test_r12_a2_a_drive_root_keeps_its_backslash_when_trailing_separators_are_removed(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("function Remove-TrailingSeparator")
+        end = text.index("\nfunction ", start + 1)
+        script = self.case / "trim-probe.ps1"
+        script.write_text(text[start:end] + "\n" + "\n".join(
+            f"'{raw}' + ' => ' + (Remove-TrailingSeparator '{raw}')" for raw in ("C:\\", "C:\\\\", "d:\\", "C:\\run\\", "C:\\run", "\\\\srv\\share\\", "C:\\a\\b\\\\")) + "\n", encoding="ascii")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = [l for l in r.stdout.splitlines() if " => " in l]
+        self.assertEqual(got, ["C:\\ => C:\\", "C:\\\\ => C:\\", "d:\\ => d:\\", "C:\\run\\ => C:\\run", "C:\\run => C:\\run", "\\\\srv\\share\\ => \\\\srv\\share", "C:\\a\\b\\\\ => C:\\a\\b"])
+
+    def test_r12_a2_no_zone_root_or_parent_is_trimmed_with_a_bare_trimend(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("function Get-OutputZones")
+        end = text.index("function Get-OutputNameRefusal")
+        self.assertNotIn(".TrimEnd('\\')", text[start:end].replace(".root.TrimEnd('\\')", "").replace("$parent.TrimEnd('\\')", "").replace("$l.physical.TrimEnd('\\')", ""))
+
     def test_r5_adv_a1_a_throw_after_a_leg_ran_does_not_record_that_leg_as_not_run(self) -> None:
         # adversary r5 A1: the new batch catch left the leg whose child had completed (its output file could not be written) in pending, and the summary then said
         # NOT_RUN for a leg that ran. The leg is recorded LEG_FAILED / reason BATCH_ERROR (its result is unknown); only the legs never started are NOT_RUN.

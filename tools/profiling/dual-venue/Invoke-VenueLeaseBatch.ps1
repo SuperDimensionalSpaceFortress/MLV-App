@@ -224,7 +224,7 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
     $line = "LEG_PLAN_REFUSED reason=$Reason$(if ($Item -gt 0) { " item=$Item" }) $Detail"
     # The log line is best effort (sol r3 A5): a batch.log another process holds must not turn the typed refusal into an unhandled exit 1 with no BATCH_USAGE line.
     # r9: not for a refusal of an input that IS a runner output (it may be batch.log itself): the refusal must leave that file as it found it; stderr carries the line.
-    if ($Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT')) {
+    if ($Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT')) {
         try { Add-Content -LiteralPath $batchLog -Value "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $line" } catch { }
     }
     [Console]::Error.WriteLine("BATCH_USAGE $line")
@@ -331,11 +331,19 @@ $script:ClaimDirOutputLeafPatterns = @(
 $script:ClaimDirOutputDirs = @("$Venue.tickets")
 $script:ClaimDirPath = $(try { [string](Split-Path -Parent (Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir)) } catch { '' })
 
+function Remove-TrailingSeparator([string]$Path) {
+    # r12 (adversary r12 A2): TrimEnd('\') turns the drive root C:\ into C:, which every file API reads as the drive's CURRENT directory, so a guard that listed a root zone looked at the
+    # wrong folder and missed a hard link or a link directly under it. A drive root keeps its one backslash; every other path (UNC share roots too) loses its trailing ones.
+    $t = $Path.TrimEnd('\')
+    if ($t -match '^[A-Za-z]:\z') { return $t + '\' }
+    $t
+}
+
 function Get-OutputZones {
     # The folders this run writes into: -RunDir, then the claim dir when it already exists (nothing can sit in one that does not). root = the PHYSICAL path.
-    $zones = @([pscustomobject]@{ label = '-RunDir'; root = (Get-PhysicalPath $RunDir).TrimEnd('\'); leaf = $script:RunDirOutputLeafPatterns; dirs = $script:RunDirOutputDirs; linked = @() })
+    $zones = @([pscustomobject]@{ label = '-RunDir'; root = (Remove-TrailingSeparator (Get-PhysicalPath $RunDir)); leaf = $script:RunDirOutputLeafPatterns; dirs = $script:RunDirOutputDirs; linked = @() })
     if ($script:ClaimDirPath -and (Test-Path -LiteralPath $script:ClaimDirPath -PathType Container)) {
-        $zones += [pscustomobject]@{ label = '-ClaimDir'; root = (Get-PhysicalPath $script:ClaimDirPath).TrimEnd('\'); leaf = $script:ClaimDirOutputLeafPatterns; dirs = $script:ClaimDirOutputDirs; linked = @() }
+        $zones += [pscustomobject]@{ label = '-ClaimDir'; root = (Remove-TrailingSeparator (Get-PhysicalPath $script:ClaimDirPath)); leaf = $script:ClaimDirOutputLeafPatterns; dirs = $script:ClaimDirOutputDirs; linked = @() }
     }
     $zones
 }
@@ -382,7 +390,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
     } catch { return "'$Path' cannot be resolved to a physical path ($($_.Exception.Message -replace '\s+', ' ')); an input whose location is unknown is refused" }
     $shown = $(if ($full -ieq [IO.Path]::GetFullPath($Path)) { "'$full'" } else { "'$Path' (physical path '$full')" })
     if ($hardLinkOf) { return "$shown is a hard link to $hardLinkOf, a file this run writes under $($hardLinkZone.label)" }
-    $parent = [IO.Path]::GetDirectoryName($full).TrimEnd('\')
+    $parent = Remove-TrailingSeparator ([IO.Path]::GetDirectoryName($full))
     foreach ($z in $zones) {
         foreach ($l in $z.linked) {
             if (-not $l.isDir -and $full -ieq $l.physical) { return "$shown is a file this run writes into $($z.label) ($($l.name), a link to it)" }
@@ -393,7 +401,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
             foreach ($p in $z.leaf) { if ($leaf -imatch $p) { return "$shown is a file this run writes into $($z.label) ($leaf)" } }
         }
         foreach ($d in $z.dirs) {
-            if (($parent + '\').StartsWith($z.root + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $d\, a directory this run writes into under $($z.label)" }
+            if (($parent.TrimEnd('\') + '\').StartsWith($z.root.TrimEnd('\') + '\' + $d + '\', [StringComparison]::OrdinalIgnoreCase)) { return "$shown is inside $d\, a directory this run writes into under $($z.label)" }
         }
     }
     ''
@@ -428,6 +436,7 @@ function Get-InputOutputRefusal {
 function Stop-InputIsOutput($Hit) {
     # the typed refusal of Get-InputOutputRefusal's hit: the same reason words and exit 2 as the preflight's
     if ($Hit.kind -ceq 'plan') { Stop-PlanRefused 'LEG_PLAN_IS_RUN_OUTPUT' 0 "the plan file $($Hit.why)" }
+    elseif ($Hit.kind -ceq 'build') { Stop-PlanRefused 'BUILD_MANIFEST_IS_RUN_OUTPUT' $Hit.item "the staged build manifest $($Hit.why)" }
     elseif ($legPlanMode) { Stop-PlanRefused 'LEG_SPEC_IS_RUN_OUTPUT' $Hit.item "the leg spec $($Hit.why)" }
     else { Stop-Usage "LEG_SPEC_IS_RUN_OUTPUT the leg spec $($Hit.why)" }
 }
@@ -522,6 +531,10 @@ if ($legPlanMode) {
             if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
             # r5 (adversary A2): and the manifest must be one the leg job's validator accepts (its commit, dll pair digest and symbol presence), not only the one named by hash
             if ($st.contentProblem) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short at $($st.path) is not one the leg job accepts: $($st.contentProblem)" }
+            # r12 (adversary r12 A1): the manifest is an input the legs read, so it gets the guard the plan and the specs get: a hard link or a link that makes it one of the files this run writes
+            # (leg-plan.json, a batch receipt, ...) would have it overwritten after the lease opened.
+            $outputRefusal = Get-RunDirOutputRefusal $st.path
+            if ($outputRefusal) { Stop-PlanRefused 'BUILD_MANIFEST_IS_RUN_OUTPUT' $it.item "the staged build manifest for $short $outputRefusal" }
         }
         $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
         foreach ($it in $ordered) {
@@ -564,6 +577,8 @@ foreach ($leg in $plan) {
 $script:guardedInputs = [System.Collections.Generic.List[object]]::new()
 if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPath; kind = 'plan'; item = 0 }) }
 foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }) }) }
+# r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
+if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = @($items | Where-Object { $_.sourceCommit -ceq $b.Key })[0].item }) } }
 if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }
 # The scalar form's one build rides on every leg, so each leg is launched with its own build in either form.
 if (-not $legPlanMode) { foreach ($p in $plan) { $p | Add-Member -NotePropertyName sourceCommit -NotePropertyValue $SourceCommit; $p | Add-Member -NotePropertyName buildManifestSha256 -NotePropertyValue $BuildManifestSha256 } }
