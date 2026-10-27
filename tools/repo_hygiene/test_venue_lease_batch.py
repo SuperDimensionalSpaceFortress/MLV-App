@@ -48,6 +48,9 @@ requires_windows_pwsh = unittest.skipIf(PWSH is None or sys.platform != "win32",
 
 SHA = "a" * 40
 MANIFEST = "b" * 64
+# r13 (adversary r13 A1): the three artifact digests the leg job hashes the cached artifacts against (playback-attr-3-cuda-job.ps1 $manifestChecks), in every staged manifest
+ARTIFACT_SHAS = {"packageZip": {"sha256": "a" * 64}, "exe": {"sha256": "b" * 64}, "dll": {"sha256": "c" * 64}}
+ABSENT = object()   # a staged build manifest field left out (stage(): dllPairManifestSha256=ABSENT)
 
 # Wait-VenueQuiet stand-in: mode per call from FAKE_QUIET_MODES (comma list, the last repeats), counted in the run dir; each call is logged with UTC ticks.
 FAKE_QUIET = r"""
@@ -122,6 +125,7 @@ if ($JobId -like 'lease-batch-open-*') {
     if ($sleep -gt 0) { Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} OPENWAIT {1} sec={2}" -f [DateTime]::UtcNow.Ticks, $JobId, $sleep); Start-Sleep -Seconds $sleep; $now = [DateTimeOffset]::UtcNow }
     if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $false }
     $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
+    if ($mode -eq 'exit1') { $res.exitCode = 1 }   # r14: the open job's receipt says it failed (OPEN_FAILED)
     if ($mode -eq 'gatehold') {
         # r3: um-run gave up while the agent still holds the open in its gate, and NO result lands: the agent keeps re-asking until it is cancelled.
         throw "UNRESOLVED: $JobId was held unlaunched in the agent's heavy-slot admission gate (fake, held) for the full -MaxAdmissionWaitSec"
@@ -348,7 +352,9 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         cls.specs = []
         for name in ("fx-a", "fx-b", "fx-c"):
             p = cls.tmp / f"{name}.json"
-            p.write_text(json.dumps({"legId": name}), encoding="utf-8")
+            # the shape Invoke-VenueLeg accepts (schema + the backends it may run + the scaleFactor every real leg spec carries and its receipt block reads), so a -LegPlan item can be checked against it before any lease
+            # (card + legId are what Invoke-VenueLeg hands New-DvReceipt's Mandatory parameters; every committed leg spec carries both)
+            p.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": name, "backends": ["cpu", "cuda"], "scaleFactor": 1}), encoding="utf-8")
             cls.specs.append(p)
 
     @classmethod
@@ -1576,10 +1582,11 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
                 self.assertNotIn(" BATCH_OPEN_RECONCILED ", log)
 
     def test_r3_a_submit_that_throws_is_an_uncertain_open_and_keeps_the_conservative_cancel_close_and_ledger_row(self) -> None:
-        # Control for the case above: here the open IS (maybe) submitted. Submit-AgentJob throws for the open job before it reports anything, so $op stays null; the
+        # Control for the case above: here the open IS (maybe) submitted. Submit-AgentJob throws for the open job before it reports anything; the
         # submitted flag, not $op, tells the finally block the open may be in the agent's gate: cancel requested, close submitted, open-unreconciled row charged.
-        anchor = '    $f = Join-Path $jobDir "$JobId.job.ps1"'
-        self._mirror_with_bad_sidecar(runner_patches=((anchor, "    if ($JobId -like 'lease-batch-open-*') { throw 'simulated submit failure' }\n" + anchor),))
+        # r16 (sol r15 B1; hub ruling 08:18:44Z): "submitted" now starts when um-run.ps1 is called (a job file never written reached no one), so the throw is placed there.
+        anchor = "        $script:umRunCalled[$JobId] = $true"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, anchor + "\n        if ($JobId -like 'lease-batch-open-*') { throw 'simulated submit failure' }"),))
         r = self.run_batch([self.specs[0]], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=30)), "-CancelReconcileSec", "3")
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
         [b] = self.batches()
@@ -1587,6 +1594,64 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         self.assertTrue((self.share / "cancel" / f"{b['openJobId']}.cancel").exists(), "the cancel request stays for the agent")
         self.assertTrue(b["closeJobId"], "the close was not submitted")
         self.assertEqual(b["ledger"]["basis"], "open-unreconciled", b["ledger"])
+        self.assertTrue((self.claims / "bachelor.lease-ledger.jsonl").exists())
+
+    # ---------------------------------------------------------------- r16 (sol r15 B1): an open whose job file was never complete here never reached um-run
+    # The local File.Open(CreateNew) of the open's job file, or the write into it, fails before um-run is called. RED on 5c73c842: $openSubmitted was already true, so
+    # the finally requested a cancel, submitted a close, charged a full 2700 s open-unreconciled lease and ended OPEN_CANCEL_UNRECONCILED (exit 11).
+    OPEN_JOB_CREATE = "$fs = [IO.File]::Open($f, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)"
+    OPEN_JOB_WRITE = "$fs.Write($jb, 0, $jb.Length)"
+
+    def _assert_open_never_submitted(self, r: subprocess.CompletedProcess) -> None:
+        self.assertEqual(r.returncode, 9, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual(res["stopReason"], "OPEN_JOB_WRITE_FAILED", res)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["openOutcome"]), ("OPEN_JOB_WRITE_FAILED", "JOB_WRITE_FAILED"), b)
+        self.assertEqual(self.kinds(), [], "um-run was called for the open or a close, or a probe or a leg ran")
+        self.assertEqual(list((self.share / "cancel").iterdir()), [], "a cancel was requested for an open that never reached um-run")
+        self.assertEqual((b["openCancel"], b["closeJobId"], b["ledger"]), (None, None, None), b)
+        self.assertFalse((self.claims / "bachelor.lease-ledger.jsonl").exists(), "the lease budget was charged for an open that never reached um-run")
+        self.assertEqual(list((self.share / "notafter").iterdir()), [], "the open's liveness sidecar was left behind")
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+
+    def test_r16_b1_an_open_job_file_that_cannot_be_created_is_never_submitted(self) -> None:
+        seam = "if ($JobId -like 'lease-batch-open-*') { throw [IO.IOException]::new(\"simulated: the file '$f' exists\") }; " + self.OPEN_JOB_CREATE
+        self._mirror_with_bad_sidecar(runner_patches=((self.OPEN_JOB_CREATE, seam),))
+        self._assert_open_never_submitted(self.run_batch([self.specs[0]], "-CancelReconcileSec", "3"))
+
+    def test_r16_b1_an_open_job_file_whose_write_fails_is_never_submitted(self) -> None:
+        seam = "if ($JobId -like 'lease-batch-open-*') { throw [IO.IOException]::new('simulated: there is not enough space on the disk') }; " + self.OPEN_JOB_WRITE
+        self._mirror_with_bad_sidecar(runner_patches=((self.OPEN_JOB_WRITE, seam),))
+        self._assert_open_never_submitted(self.run_batch([self.specs[0]], "-CancelReconcileSec", "3"))
+
+    def test_r16_b1_a_job_folder_that_refuses_new_files_submits_no_open(self) -> None:
+        # the real failure, no seam: <RunDir>\batch-jobs denies this user "create files" (the caps probe fails there too and reads the fallback caps)
+        jobs = self.run_dir / "batch-jobs"
+        jobs.mkdir(parents=True)
+        user = subprocess.run(["whoami"], capture_output=True, text=True, timeout=60).stdout.strip()
+        deny = subprocess.run(["icacls", str(jobs), "/deny", f"{user}:(WD)"], capture_output=True, text=True, timeout=60)
+        if deny.returncode != 0:
+            self.skipTest(f"icacls could not deny file creation: {deny.stdout} {deny.stderr}")
+        try:
+            r = self.run_batch([self.specs[0]], "-CancelReconcileSec", "3")
+        finally:
+            subprocess.run(["icacls", str(jobs), "/remove:d", user], capture_output=True, text=True, timeout=60)
+        self._assert_open_never_submitted(r)
+
+    def test_r16_b1_control_an_open_that_reached_um_run_and_stays_unreconciled_is_still_charged_a_full_lease(self) -> None:
+        # the hub's control (ruling 08:18:44Z): um-run WAS called for the open and gave up while the agent still holds it in its gate, and nothing answers the cancel
+        r = self.run_batch([self.specs[0]], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=12)), "-CancelReconcileSec", "3", FAKE_OPEN_MODES="gatehold")
+        self.assertEqual(r.returncode, 11, r.stdout + r.stderr)
+        self.assertEqual(batch_result(r.stdout)["stopReason"], "OPEN_CANCEL_UNRECONCILED")
+        [b] = self.batches()
+        self.assertTrue([k for k in self.kinds() if k.startswith("OPEN:")], "um-run was not called for the open")
+        self.assertEqual((b["openCancel"]["requested"], b["openCancel"]["state"]), ("REQUESTED", "UNRECONCILED"), b)
+        self.assertTrue((self.share / "cancel" / f"{b['openJobId']}.cancel").exists())
+        self.assertTrue(b["closeJobId"], "the close was not submitted")
+        self.assertEqual(b["ledger"]["basis"], "open-unreconciled", b["ledger"])
+        span = datetime.fromisoformat(b["ledger"]["endUtc"].replace("Z", "+00:00")) - datetime.fromisoformat(b["ledger"]["startUtc"].replace("Z", "+00:00"))
+        self.assertEqual(round(span.total_seconds()), 2700, b["ledger"])
         self.assertTrue((self.claims / "bachelor.lease-ledger.jsonl").exists())
 
     # ---------------------------------------------------------------- r5b: no probe or leg without the claim (Grok G1, 6389240991)
@@ -1688,6 +1753,1715 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"found": "L1", "absent": "ABSENT", "bad": "UNKNOWN", "rec": "closed", "none": "ABSENT", "nofile": "ABSENT"})
+
+
+# LEASE-BATCH-MULTI-BUILD-1: a wrapper around fake-leg.ps1 that records the build, backend and spec each leg was called with, then runs the fake leg unchanged.
+FAKE_LEG_ARGS = r"""
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$LeaseBatch = '')
+Add-Content -LiteralPath $env:FAKE_LEG_ARGS -Value (([ordered]@{ leaf = [IO.Path]::GetFileNameWithoutExtension($LegSpec); sourceCommit = $SourceCommit; buildManifestSha256 = $BuildManifestSha256; backend = $Backend; leaseBatch = $LeaseBatch }) | ConvertTo-Json -Compress)
+& (Join-Path $PSScriptRoot 'fake-leg.ps1') @PSBoundParameters
+exit $LASTEXITCODE
+"""
+
+
+@requires_windows_pwsh
+class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
+    """LEASE-BATCH-MULTI-BUILD-1: one batched lease carries legs of more than one build and backend (-LegPlan), validated before the lease is requested, and
+    an interleaving order (A B A B) across arms. Same fakes and seams as the runner tests above; nothing reaches a venue."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        (cls.tmp / "fake-leg-args.ps1").write_text(FAKE_LEG_ARGS, encoding="utf-8")
+        cls.commit_a, cls.commit_b = "1" * 40, "2" * 40
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.leg_args = self.case / "leg-args.jsonl"
+        # two builds staged in the venue's cache, by the path Invoke-VenueLeg hashes
+        self.manifests = {c: self.stage(c, f"build {c[:1]}") for c in (self.commit_a, self.commit_b)}
+
+    def stage(self, commit: str, body: str, **override: object) -> str:
+        # the three fields Assert-AttrCudaBuildManifest (the leg job's own validator) requires: the build's commit, its dll pair digest and a boolean symbol presence
+        cache = self.share / "cache"
+        cache.mkdir(exist_ok=True)
+        p = cache / f"playback-attr-3-cuda-{commit[:12]}-build.json"
+        doc = {"sourceCommit": commit, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **ARTIFACT_SHAS, "body": body}
+        doc.update(override)
+        p.write_text(json.dumps({k: v for k, v in doc.items() if v is not ABSENT}), encoding="utf-8")
+        import hashlib
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+
+    def item(self, spec: Path, arm: str, commit: str, backend: str = "cpu", manifest: str | None = None) -> dict:
+        return {"legSpec": str(spec), "backend": backend, "sourceCommit": commit, "buildManifestSha256": manifest or self.manifests[commit], "arm": arm}
+
+    def write_plan(self, items: list[dict]) -> Path:
+        p = self.case / "plan.json"
+        p.write_text(json.dumps({"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": items}), encoding="utf-8")
+        return p
+
+    def plan_cmd(self, plan: Path, *extra: str, **env: str) -> tuple[list[str], dict]:
+        e = dict(os.environ)
+        e.update({"FAKE_EVENTS": str(self.events), "FAKE_SHARE": str(self.share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case),
+                  "FAKE_LEG_ARGS": str(self.leg_args)})
+        e.update(env)
+        defaults = {"-LegBudgetSec": "60", "-LeaseMarginSec": "0", "-ClaimPollSec": "1", "-RecheckSec": "1",
+                    "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
+        args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-LegPlan", str(plan),
+                "-RunDir", str(self.run_dir), "-ClaimDir", str(self.claims),
+                "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg-args.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
+                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *extra]
+        return args, e
+
+    def run_plan(self, plan: Path, *extra: str, **env: str) -> subprocess.CompletedProcess:
+        args, e = self.plan_cmd(plan, *extra, **env)
+        return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+
+    def leg_calls(self) -> list[dict]:
+        return [json.loads(l) for l in self.leg_args.read_text(encoding="utf-8").splitlines() if l.strip()] if self.leg_args.exists() else []
+
+    def ab_block_plan(self) -> Path:
+        # block order on purpose (A A B B): -PlanOrder Interleave must run it A B A B
+        a, b = self.commit_a, self.commit_b
+        return self.write_plan([self.item(self.specs[0], "A", a, "cpu"), self.item(self.specs[1], "A", a, "cpu"),
+                                self.item(self.specs[0], "B", b, "cuda"), self.item(self.specs[1], "B", b, "cuda")])
+
+    def test_two_builds_interleaved_in_one_lease_each_row_carrying_its_own_build(self) -> None:
+        # RED on 3723b76d: the runner has no -LegPlan (one build per call, so an A/B pair takes a lease per build).
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        k = self.kinds()
+        opens = [x for x in k if x.startswith("OPEN:")]
+        self.assertEqual(len(opens), 1, f"ONE lease request for both builds: {k}")
+        token = opens[0].split(":")[1]
+        self.assertEqual(k, [f"OPEN:{token}", "QUIET:QUIET", f"LEG:fx-a:{token}", "QUIET:QUIET", f"LEG:fx-a:{token}",
+                             "QUIET:QUIET", f"LEG:fx-b:{token}", "QUIET:QUIET", f"LEG:fx-b:{token}", f"CLOSE:{token}"])
+        a, b = self.commit_a, self.commit_b
+        want = [("fx-a", "A", a, "cpu"), ("fx-a", "B", b, "cuda"), ("fx-b", "A", a, "cpu"), ("fx-b", "B", b, "cuda")]
+        # each leg process was handed its own build and backend
+        calls = self.leg_calls()
+        self.assertEqual([(c["leaf"], c["sourceCommit"], c["buildManifestSha256"], c["backend"], c["leaseBatch"]) for c in calls],
+                         [(leaf, c, self.manifests[c], be, token) for leaf, _arm, c, be in want])
+        # each batch row and each run result records its own build, backend and arm, in A B A B order
+        [bt] = self.batches()
+        self.assertEqual((bt["endReason"], bt["legsRan"], bt["legsCounted"], bt["leaseId"]), ("ALL_LEGS_DONE", 4, 4, "lease-1"))
+        self.assertEqual([(l["arm"], l["sourceCommit"], l["buildManifestSha256"], l["backend"]) for l in bt["legs"]],
+                         [(arm, c, self.manifests[c], be) for _leaf, arm, c, be in want])
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["counted"], res["legPlan"]["order"]), (4, 4, "Interleave"))
+        self.assertEqual([(l["name"], l["arm"], l["sourceCommit"], l["buildManifestSha256"], l["backend"]) for l in res["legs"]],
+                         [(f"{i + 1:02d}-{leaf}-{be}-{arm}", arm, c, self.manifests[c], be) for i, (leaf, arm, c, be) in enumerate(want)])
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn(f"LEG 02-fx-a-cuda-B RUN batch=1 ", log)
+        self.assertIn(f" arm=B sourceCommit={b} buildManifestSha256={self.manifests[b]}", log)
+        # the validated, ordered plan is kept beside the receipts
+        kept = json.loads((self.run_dir / "leg-plan.json").read_text(encoding="utf-8"))
+        self.assertEqual([x["arm"] for x in kept["legs"]], ["A", "B", "A", "B"])
+        self.assertEqual(sorted((s["sourceCommit"], s["state"]) for s in kept["builds"]), [(a, "STAGED"), (b, "STAGED")])
+
+    def test_the_plan_runs_as_given_without_the_interleave_option(self) -> None:
+        r = self.run_plan(self.ab_block_plan())
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [bt] = self.batches()
+        self.assertEqual([l["arm"] for l in bt["legs"]], ["A", "A", "B", "B"])
+        self.assertEqual(batch_result(r.stdout)["legPlan"]["order"], "AsGiven")
+
+    def test_a_build_that_is_not_staged_is_refused_before_the_lease_is_requested(self) -> None:
+        unstaged = "3" * 40
+        plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[0], "B", unstaged, manifest="c" * 64)])
+        r = self.run_plan(plan, "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=BUILD_NOT_STAGED item=2 ", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted (no open, no probe, no leg) when one build is not staged")
+        self.assertFalse((self.run_dir / "batches.jsonl").exists())
+        self.assertFalse(self.claim_path.exists())
+
+    def test_every_item_is_validated_before_the_lease(self) -> None:
+        a = self.commit_a
+        bad = {
+            "BUILD_MANIFEST_MISMATCH": self.item(self.specs[0], "B", a, manifest="d" * 64),
+            "BAD_BACKEND": self.item(self.specs[0], "B", a, backend="metal"),
+            "BAD_SOURCE_COMMIT": self.item(self.specs[0], "B", "xyz", manifest=self.manifests[a]),
+            "BAD_MANIFEST_SHA256": self.item(self.specs[0], "B", a, manifest="e" * 63),
+            "BAD_ARM": self.item(self.specs[0], "", a),
+            "LEG_SPEC_MISSING": self.item(self.case / "no-such-spec.json", "B", a),
+        }
+        for reason, item in bad.items():
+            with self.subTest(reason=reason):
+                r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", a), item]))
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(f"LEG_PLAN_REFUSED reason={reason} item=2 ", r.stderr)
+                self.assertEqual(self.kinds(), [])
+
+    def write_raw_plan(self, doc: object) -> Path:
+        p = self.case / "plan.json"
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        return p
+
+    def assert_whole_plan_refused(self, plan: Path, want: str) -> None:
+        # subtests share one fixture directory: clear what an earlier subtest's run left, so a run that wrongly proceeds cannot fail the next case instead of itself
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        r = self.run_plan(plan)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"LEG_PLAN_REFUSED reason={want}", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_a_null_or_non_object_entry_refuses_the_whole_plan_at_its_original_position(self) -> None:
+        # Dot B1 (e2160c2d): the null was dropped BEFORE the shape check, so [A, null, B] ran as a two-item plan (B became item 2) and finished ALL_LEGS_DONE.
+        a, b = self.commit_a, self.commit_b
+        ok_a, ok_b = self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", b, "cuda")
+        cases = {
+            "null in the middle": ([ok_a, None, ok_b], 2),
+            "null first": ([None, ok_a, ok_b], 1),
+            "null last": ([ok_a, ok_b, None], 3),
+            "string in the middle": ([ok_a, "leg-b", ok_b], 2),
+            "number in the middle": ([ok_a, 7, ok_b], 2),
+            "array in the middle": ([ok_a, [ok_b], ok_b], 2),
+            "only a null": ([None], 1),
+        }
+        for label, (legs, n) in cases.items():
+            for container in ("object", "bare-array"):
+                with self.subTest(case=label, container=container):
+                    doc = {"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": legs} if container == "object" else legs
+                    self.assert_whole_plan_refused(self.write_raw_plan(doc), f"BAD_ITEM_SHAPE item={n} ")
+
+    def test_a_legs_value_that_is_not_an_array_is_refused_not_wrapped_into_a_one_item_plan(self) -> None:
+        one = self.item(self.specs[0], "A", self.commit_a)
+        schema = "mlv-app/venue-lease-leg-plan/v1"
+        cases = {
+            "a single item object as legs": {"schema": schema, "legs": one},
+            "legs is a string": {"schema": schema, "legs": "leg-a"},
+            "legs is a number": {"schema": schema, "legs": 3},
+            "legs is null": {"schema": schema, "legs": None},
+            "legs is an empty array": {"schema": schema, "legs": []},
+            "a bare item object with no legs container": one,
+            "the document is a string": "plan",
+            "the document is a number": 5,
+            "the document is null": None,
+            "the document is an empty array": [],
+            "the legs container is named something else": {"schema": schema, "items": [one]},
+        }
+        for label, doc in cases.items():
+            with self.subTest(case=label):
+                self.assert_whole_plan_refused(self.write_raw_plan(doc), "LEG_PLAN_UNREADABLE")
+
+    def test_r3_a1_a_plan_order_in_any_letter_case_still_interleaves(self) -> None:
+        # sol r3 A1: -PlanOrder is bound case-insensitively but was dispatched case-sensitively, so 'interleave' was accepted and ran A A B B.
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "interleave")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [bt] = self.batches()
+        self.assertEqual([l["arm"] for l in bt["legs"]], ["A", "B", "A", "B"])
+        self.assertEqual(batch_result(r.stdout)["legPlan"]["order"], "Interleave", "the receipt names the canonical order, not the spelling typed")
+
+    def test_r3_a2_arms_that_differ_only_in_case_are_separate_arms(self) -> None:
+        # sol r3 A2: the arm label is validated case-sensitively (A and a are both legal) but the interleave keyed its queues case-insensitively, merging them.
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            "$items = 'AAaa'.ToCharArray() | ForEach-Object -Begin { $i = 0 } -Process { $i++; [pscustomobject]@{ arm = [string]$_; n = $i } }\n"
+            "(@(Get-VenueInterleavedLegPlan -Items @($items)) | ForEach-Object { \"$($_.arm)$($_.n)\" }) -join ' '\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(out.stdout.strip(), "A1 a3 A2 a4")
+
+    def test_r3_a3_a_trailing_line_feed_never_passes_a_plan_item_pattern(self) -> None:
+        # sol r3 A3: '$' also matches before a final LF, so arm "A\n" (an illegal Windows file name once it is in a leg output name) and a 40-hex commit or
+        # 64-hex manifest with a trailing LF passed the item patterns. \z is the end of the string.
+        a = self.commit_a
+        bad = {
+            "BAD_ARM": self.item(self.specs[0], "B\n", a),
+            "BAD_SOURCE_COMMIT": self.item(self.specs[0], "B", a + "\n", manifest=self.manifests[a]),
+            "BAD_MANIFEST_SHA256": self.item(self.specs[0], "B", a, manifest=self.manifests[a] + "\n"),
+        }
+        for reason, item in bad.items():
+            with self.subTest(reason=reason):
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), item]), f"{reason} item=2 ")
+
+    def test_r3_a3_a_spec_legid_with_a_trailing_line_feed_falls_back_to_the_file_name(self) -> None:
+        spec = self.case / "fx-nl.json"
+        spec.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "bad\n", "backends": ["cpu"], "scaleFactor": 1}), encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([l["name"] for l in batch_result(r.stdout)["legs"]], ["01-fx-nl-cpu-A"])
+
+    def test_r3_a4_an_item_the_leg_script_would_throw_on_is_refused_before_the_lease(self) -> None:
+        # sol r3 A4: Invoke-VenueLeg throws DVE_LEG_SPEC_INVALID when the item's backend is not one the spec lists (or the spec is not a leg spec), AFTER the
+        # lease is open, which ends as LEG_FAILED / exit 7 instead of the whole plan being refused with exit 2 and nothing submitted.
+        a = self.commit_a
+
+        def spec(name: str, text: str) -> Path:
+            p = self.case / name
+            p.write_text(text, encoding="utf-8")
+            return p
+        cpu_only = spec("cpu-only.json", json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": "cpu-only", "backends": ["cpu"]}))
+        wrong_schema = spec("wrong-schema.json", json.dumps({"schema": "nope", "legId": "ws", "backends": ["cpu"]}))
+        not_json = spec("not-json.json", "this is not json")
+        no_backends = spec("no-backends.json", json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "legId": "nb"}))
+        cases = {
+            "BAD_BACKEND": self.item(cpu_only, "B", a, backend="cuda"),
+            "LEG_SPEC_INVALID wrong schema": self.item(wrong_schema, "B", a),
+            "LEG_SPEC_INVALID not json": self.item(not_json, "B", a),
+            "BAD_BACKEND no backends listed": self.item(no_backends, "B", a),
+        }
+        for label, item in cases.items():
+            with self.subTest(case=label):
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), item]), f"{label.split(' ')[0]} item=2 ")
+
+    def test_r3_a5_a_refusal_whose_log_line_cannot_be_written_still_says_so_on_stderr_and_exits_2(self) -> None:
+        # sol r3 A5: Stop-PlanRefused wrote batch.log first; with the log held by another process that write threw, so the typed refusal never reached stderr and
+        # the exit was 1, not 2.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        log = self.run_dir / "batch.log"
+        log.write_text("", encoding="utf-8")
+        hold = ExclusiveHold(log)
+        try:
+            r = self.run_plan(self.case / "missing-plan.json")
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("BATCH_USAGE LEG_PLAN_REFUSED reason=LEG_PLAN_UNREADABLE", r.stderr)
+            self.assertEqual(self.kinds(), [])
+        finally:
+            hold.release()
+
+    def test_r4_a1_a_spec_the_leg_process_would_throw_on_is_refused_before_the_claim_and_the_lease(self) -> None:
+        # sol r3 second pass A1: Invoke-VenueLeg also throws on a malformed visualCapture / opt-out pair, a playSeconds outside [int], a scaleFactor that is not a
+        # number and a bad acceptedEffectiveScale. Preflight checked only the schema and the backend, so each of these opened a lease and ended LEG_FAILED / exit 7.
+        a = self.commit_a
+        base = {"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-bad", "backends": ["cpu"], "scaleFactor": 1}
+        cases = {
+            "visualCapture is a string": {"visualCapture": "true"},
+            "visualCapture false without a reason": {"visualCapture": False},
+            "visualCapture null": {"visualCapture": None},
+            "a reason without the opt-out": {"visualCaptureOptOutReason": "because"},
+            "playSeconds beyond int": {"playSeconds": 2147483648},
+            "scaleFactor is not a number": {"scaleFactor": "bad"},
+            "acceptedEffectiveScale is not a number": {"scaleFactor": 1, "acceptedEffectiveScale": {"cpu": "bad"}},
+        }
+        for label, extra in cases.items():
+            with self.subTest(case=label):
+                p = self.case / "fx-bad.json"
+                p.write_text(json.dumps({**base, **extra}), encoding="utf-8")
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(p, "B", a)]), "LEG_SPEC_INVALID item=2 ")
+
+    def test_r4_a1_a_valid_opt_out_and_scale_still_run(self) -> None:
+        # the added preflight is the leg process's own predicates, no stricter: a well-formed opt-out, scale and playSeconds are accepted
+        p = self.case / "fx-ok.json"
+        p.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-ok", "backends": ["cpu"], "visualCapture": False, "visualCaptureOptOutReason": "no window",
+                                 "playSeconds": 30, "scaleFactor": 2, "acceptedEffectiveScale": {"cpu": 1}}), encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(p, "A", self.commit_a)]))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_r4_a2_a_plan_item_whose_path_cannot_be_probed_is_a_typed_refusal(self) -> None:
+        # sol r3 second pass A2: Test-Path throws on a NUL in legSpec; the throw bypassed Stop-PlanRefused and exited 1 with no BATCH_USAGE line.
+        a = self.commit_a
+        for label, ref in {"NUL in the middle": "a\u0000b", "NUL only": "\u0000", "a wildcard-only name": "*", "a drive-only name": "Z:"}.items():
+            with self.subTest(case=label):
+                item = {"legSpec": ref, "backend": "cpu", "sourceCommit": a, "buildManifestSha256": self.manifests[a], "arm": "B"}
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), item]), "LEG_SPEC_MISSING item=2 ")
+
+    def test_r4_a3_a_second_invocation_on_the_same_run_dir_never_overwrites_the_plan_before_it_holds_the_claim(self) -> None:
+        # sol r3 second pass A3: leg-plan.json was written during validation, before the venue claim. A second invocation that is still waiting for another
+        # run's claim replaced the first run's preserved plan. Here a live foreign claim holds the venue and the run ends DEADLINE claim-held: the file stays.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        keep = self.run_dir / "leg-plan.json"
+        keep.write_text('{"preserved":"first invocation"}\n', encoding="utf-8")
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\other-run' -Purpose foreign -TtlSec 3600 -ClaimDir '{self.claims}' -OwnerPid {os.getpid()}\n"
+                  "$r.granted\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
+        r = self.run_plan(self.ab_block_plan(), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=8)))
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(self.kinds(), [], "no open: the venue claim was never held")
+        self.assertEqual(keep.read_text(encoding="utf-8"), '{"preserved":"first invocation"}\n')
+
+    def test_r4_a3_the_plan_is_kept_once_the_claim_is_held(self) -> None:
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        kept = json.loads((self.run_dir / "leg-plan.json").read_text(encoding="utf-8"))
+        self.assertEqual([x["arm"] for x in kept["legs"]], ["A", "B", "A", "B"])
+
+    def test_r5_f2_a_spec_without_a_card_or_a_legid_is_refused_before_the_claim_and_the_lease(self) -> None:
+        # key3 F2 (fable, opus, sol, Dot B3): Invoke-VenueLeg binds [string]$spec.card and [string]$spec.legId to New-DvReceipt's Mandatory [string] parameters before it
+        # submits anything; an empty one is a binding error. Preflight never read either, so such a spec opened a lease and ended LEG_FAILED / exit 7.
+        a = self.commit_a
+        base = {"schema": "mlv-app/dual-venue-leg/v1", "backends": ["cpu"], "scaleFactor": 1}
+        cases = {
+            "no card (the key3 repro)": {"legId": "fx-a"},
+            "card is empty": {"card": "", "legId": "fx-a"},
+            "card is null": {"card": None, "legId": "fx-a"},
+            "card present, no legId": {"card": "TEST-CARD"},
+            "card present, legId is empty": {"card": "TEST-CARD", "legId": ""},
+            "card present, legId is null": {"card": "TEST-CARD", "legId": None},
+            "neither": {},
+        }
+        for label, extra in cases.items():
+            with self.subTest(case=label):
+                p = self.case / "fx-noid.json"
+                p.write_text(json.dumps({**base, **extra}), encoding="utf-8")
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(p, "B", a)]), "LEG_SPEC_INVALID item=2 ")
+
+    def test_r5_f2_a_spec_with_a_card_and_a_legid_still_runs(self) -> None:
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_r5_f1_a_throw_after_the_claim_keeper_starts_stops_the_keeper_releases_the_claim_and_ends_the_process(self) -> None:
+        # key3 F1 (fable, opus, sol, Dot B2): leg-plan.json was written after Start-VenueClaimKeeper and before the batch try, so a throw there skipped Stop-VenueKeeper and
+        # Release-VenueClaim: the keeper runspace kept renewing the claim and the process never exited. A directory of that name makes the write throw.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "leg-plan.json").mkdir()
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+        except subprocess.TimeoutExpired as ex:
+            self.fail(f"the process did not end within 90 s (the claim keeper outlived the throw): {ex.stdout!r}")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        self.assertEqual(self.kinds(), [], "no open was submitted: the throw came before the lease")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
+        self.assertEqual((res["ran"], res["notRun"]), (0, 4))
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertIn(" CLAIM_RELEASED batch=1 result=", log)
+        self.assertIn(" BATCH_ERROR batch=1 ", log)
+        [b] = self.batches()
+        self.assertEqual(b["endReason"], "BATCH_ERROR")
+
+    def _lock_log_once_the_claim_is_taken(self, log: Path, give_up_s: float = 120) -> tuple[threading.Event, threading.Thread]:
+        """Take `log` with share mode 0 as soon as the venue claim file exists, and hold it until the returned event is set. Windows only (CreateFileW)."""
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        done = threading.Event()
+
+        def hold() -> None:
+            end = time.monotonic() + give_up_s
+            while not done.is_set() and time.monotonic() < end:
+                if self.claim_path.exists() and log.exists():
+                    h = k32.CreateFileW(str(log), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
+                    if h != wintypes.HANDLE(-1).value:
+                        done.wait(give_up_s)
+                        k32.CloseHandle(h)
+                        return
+                time.sleep(0.02)
+
+        t = threading.Thread(target=hold, daemon=True)
+        t.start()
+        return done, t
+
+    def test_r6_b5_a_batch_log_another_process_holds_after_the_claim_cannot_skip_the_release_the_receipt_or_the_summary(self) -> None:
+        # Dot r5 B5: the finally logged CLAIM_RENEW before Release-VenueClaim; with batch.log held exclusively after the claim was taken, that log call threw out of the
+        # finally, so the claim stayed, no receipt or summary was written and the typed exit 12 was lost (an unhandled exit 1). Every mandatory step runs, logging or not.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "batch.log").write_text("", encoding="utf-8")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        done, t = self._lock_log_once_the_claim_is_taken(self.run_dir / "batch.log")
+        t0 = time.monotonic()
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+        except subprocess.TimeoutExpired as ex:
+            self.fail(f"the process did not end within 90 s: {ex.stdout!r}")
+        finally:
+            elapsed = time.monotonic() - t0
+            done.set()
+            t.join(5)
+        self.assertLess(elapsed, 60, "bounded: the lock must not stretch the run")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        self.assertEqual(self.kinds(), [], "no open was submitted")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
+        self.assertEqual(res["ran"], 0)
+        [b] = self.batches()
+        self.assertEqual(b["endReason"], "BATCH_ERROR")
+        self.assertGreaterEqual(b["logWriteFailures"], 1, "the swallowed logging failures are recorded in the receipt")
+        self.assertIn("BATCH_LOG_FAILED", r.stderr)
+
+    def test_r6_b5_sibling_a_log_failure_right_after_a_stale_claim_is_broken_does_not_leave_the_new_claim_behind(self) -> None:
+        # B5's class: Request-VenueClaim had granted the claim when CLAIM_STALE_BROKEN was logged, and that line sat outside the try, so a log failure there left the new
+        # claim (and no keeper yet) behind with no release. The line is best effort now; the batch carries on and ends normally. The failure is injected into a copy of the runner.
+        self.claims.mkdir(parents=True, exist_ok=True)
+        seed = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\dead-run' -Purpose dead -TtlSec 3600 -ClaimDir '{self.claims}' -OwnerPid {os.getpid()}\n"
+                "$r.granted\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", seed], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
+        # the owner is gone (a pid no process has): the next claim request breaks it as dead-pid, the way the STEAL fake leaves a foreign claim
+        self.claim_path.write_text(re.sub(r'"ownerPid":\s*\d+', '"ownerPid":99999999', self.claim_path.read_text(encoding="utf-8")), encoding="utf-8")
+        anchor = "function L([string]$Message) {\n"
+        runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'CLAIM_STALE_BROKEN*') { throw 'simulated log failure' }\n")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["notRun"]), (4, 0))
+        self.assertIn("BATCH_LOG_FAILED", r.stderr)
+
+    def _patched_runner(self, old: str, new: str) -> Path:
+        """A copy of the dual-venue tree whose runner has `old` (found exactly once) replaced by `new`; returns the copy's runner."""
+        tree = self.case / "tree" / "tools" / "profiling"
+        shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
+        (tree / "bachelor").mkdir()
+        shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
+        runner = tree / "dual-venue" / RUNNER.name
+        text = runner.read_text(encoding="utf-8")
+        self.assertEqual(text.count(old), 1, "the runner line moved: update this fixture")
+        runner.write_text(text.replace(old, new), encoding="utf-8")
+        return runner
+
+    def test_r6_adv_a3_a_result_line_that_cannot_be_appended_to_the_log_is_still_said_on_stderr(self) -> None:
+        # adversary r6 A3: the final LEASE_BATCH_RESULT append failed inside an empty catch, so no BATCH_LOG_FAILED diagnostic was ever emitted for it. The run still ends
+        # 0 with the result on stdout; the failure is injected into a copy of the runner (the real cause is a batch.log another process holds at that instant).
+        anchor = "try { Add-Content -LiteralPath $batchLog -Value $resultLine }"
+        runner = self._patched_runner(anchor, "try { throw 'simulated result-line append failure'; Add-Content -LiteralPath $batchLog -Value $resultLine }")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(batch_result(r.stdout)["ran"], 4)
+        self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (simulated result-line append failure)", r.stderr)
+
+    def test_r7_sol_a_final_result_append_that_fails_is_counted_in_the_logwritefailures_the_result_line_reports(self) -> None:
+        # sol r6b blocker: logWriteFailures was serialized into the result line BEFORE the final append was attempted, so an IOException on that append left the live
+        # counter at 1 and the stdout summary at 0 (exit 0, ran 4). The count the summary reports includes the append that just failed.
+        anchor = "try { Add-Content -LiteralPath $batchLog -Value $resultLine }"
+        runner = self._patched_runner(anchor, "try { throw [IO.IOException]::new('locked'); Add-Content -LiteralPath $batchLog -Value $resultLine }")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual(res["ran"], 4)
+        self.assertEqual(res["logWriteFailures"], 1, "the failed final append is in the count the result line reports")
+        self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (locked)", r.stderr)
+
+    def test_r7_sol_a_batch_end_log_failure_is_counted_in_the_batch_receipt_and_the_summary(self) -> None:
+        # sol r6b sibling: the batch receipt was written BEFORE the BATCH_END line was logged, so a failure logging BATCH_END was missing from the receipt's logWriteFailures
+        # (and the receipt claimed 0 failures for a batch that had one). The receipt and the summary both carry it.
+        anchor = "function L([string]$Message) {\n"
+        runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'BATCH_END*') { throw [IO.IOException]::new('locked') }\n")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual(res["ran"], 4)
+        [b] = self.batches()
+        self.assertEqual(b["logWriteFailures"], 1, "the BATCH_END failure is in the receipt written for that batch")
+        self.assertEqual(res["logWriteFailures"], 1)
+        self.assertIn("BATCH_END", r.stdout, "the line still reaches stdout")
+        self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (locked)", r.stderr)
+
+    def test_r7_sol_b_the_pre_claim_deadline_batch_end_failure_is_counted_in_the_receipt_written_for_that_batch(self) -> None:
+        # sol r6b sibling class: the two pre-claim DEADLINE exits wrote the batch receipt BEFORE logging BATCH_END (and never carried logWriteFailures at all), so a
+        # failure logging BATCH_END was missing from the receipt, and an unprotected L threw out of the batch. The receipt carries the count after the line is tried.
+        self.claims.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        rows = [{"venue": "bachelor", "leaseId": "old-1", "startUtc": utc_iso(now - timedelta(minutes=105)), "endUtc": utc_iso(now - timedelta(minutes=60))},
+                {"venue": "bachelor", "leaseId": "old-2", "startUtc": utc_iso(now - timedelta(minutes=45)), "endUtc": utc_iso(now - timedelta(minutes=1))}]
+        (self.claims / "bachelor.lease-ledger.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
+        anchor = "function L([string]$Message) {\n"
+        runner = self._patched_runner(anchor, anchor + "    if ($Message -like 'BATCH_END*') { throw [IO.IOException]::new('locked') }\n")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["preOpenWait"]["reason"]), ("DEADLINE", "BUDGET"))
+        self.assertEqual(b["logWriteFailures"], 1, "the BATCH_END failure is in the receipt written for that batch")
+        self.assertEqual(batch_result(r.stdout)["logWriteFailures"], 1)
+
+    def test_r7_adv_a1_a_direct_log_line_that_cannot_be_appended_is_counted_and_said(self) -> None:
+        # adversary r7 A1: L's own append threw into the batch catch without Register-LogFailure, so a held batch.log at CLAIM_TAKEN turned a healthy batch into
+        # BATCH_ERROR / exit 12 (unchanged, r6's typed stop) with logWriteFailures=0 and no BATCH_LOG_FAILED line. Every append failure is counted and said, and counted once.
+        anchor = "Add-Content -LiteralPath $batchLog -Value $line"
+        runner = self._patched_runner(anchor, "if ($Message -like 'CLAIM_TAKEN*') { throw [IO.IOException]::new('locked') }; " + anchor)
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
+        self.assertEqual(res["logWriteFailures"], 1, "one failed append is one failure, not two")
+        [b] = self.batches()
+        self.assertEqual(b["logWriteFailures"], 1)
+        self.assertIn("BATCH_LOG_FAILED the batch log cannot be written (locked)", r.stderr)
+
+    def test_r7_adv_a2_a_leg_whose_process_cannot_be_created_stays_not_run(self) -> None:
+        # adversary r7 A2: the in-flight marker was set before Process.Start, so a command line past Windows' 32767 characters (an unrestricted -SheetCopyDir) failed at
+        # process creation and the leg that never started was recorded LEG_FAILED. A launch that throws a Win32Exception started nothing: the leg stays NOT_RUN.
+        # The 40000-character -SheetCopyDir cannot be fed to the runner itself (its own command line is past the limit), so the launch is made to fail the same way:
+        # Process.Start on a file that does not exist throws the same Win32Exception, before any child exists.
+        anchor = "Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs"
+        runner = self._patched_runner(anchor, "Invoke-VenueBoundedProcess -FilePath (Join-Path $RunDir 'no-such-pwsh.exe') -ArgumentList $lArgs")
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        self.assertEqual(self.leg_calls(), [], "no child was started")
+        res = batch_result(r.stdout)
+        self.assertEqual([(l["name"], l["status"]) for l in res["legs"]], [("01-fx-a-cpu-A", "NOT_RUN")], res["legs"])
+        self.assertEqual((res["ran"], res["failed"], res["notRun"], res["stopReason"]), (0, 0, 1, "BATCH_ERROR"))
+
+    def test_r7_adv2_a1_a_leg_spec_that_is_a_file_the_run_writes_is_refused_before_the_claim(self) -> None:
+        # adversary r7 pass 2 A1: preflight accepted a spec at <RunDir>\leg-plan.json, the claim keeper then wrote the run plan over it, and the leg failed after the lease
+        # opened with the accepted input destroyed. A spec that is one of the runner's own output files is refused with the whole plan, before any claim.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        spec = self.run_dir / "leg-plan.json"
+        spec.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-a", "backends": ["cpu"], "scaleFactor": 1}), encoding="utf-8")
+        before = spec.read_text(encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+        self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is untouched")
+
+    # r9 (Sol r8 / Dot B7 / producer OPEN A1; card LEASE-BATCH-RUNDIR-OUTPUT-COLLISION-GUARD-1): the r7 guard named five of the runner's outputs and missed quiet-*.out.txt and
+    # gate.log, so a valid spec there passed preflight and was overwritten after the lease opened. One case per output name the runner writes under -RunDir, plus the two
+    # directories it owns (batch-jobs\, quiet\). A new output that is not in the runner's one list is a failing case here, not a quiet hole.
+    RUN_OUTPUT_PATHS = (
+        "quiet-01-fx-a-cpu-A-leg.out.txt", "quiet-caps.out.txt", "leg-01-fx-a-cpu-A-b01-a1.out.txt", "gate.log", "batch-01.json", "batches.jsonl", "batch.log",
+        "leg-plan.json", "batch-jobs/lease-batch-open-x.job.ps1", "quiet/venue-quiet-probe-x.json",
+    )
+
+    def _valid_leg_spec_text(self) -> str:
+        return json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-a", "backends": ["cpu"], "scaleFactor": 1})
+
+    def test_r9_a_leg_spec_at_any_runner_output_path_is_refused_before_the_claim(self) -> None:
+        for leaf in self.RUN_OUTPUT_PATHS:
+            with self.subTest(output=leaf):
+                for p in (self.events, self.leg_args, self.claim_path):
+                    p.unlink(missing_ok=True)
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                spec = self.run_dir / leaf
+                spec.parent.mkdir(parents=True, exist_ok=True)
+                spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = spec.read_text(encoding="utf-8")
+                r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertEqual(self.leg_calls(), [])
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+                self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is untouched")
+
+    def test_r9_a_plan_file_at_a_runner_output_path_is_refused_before_the_claim(self) -> None:
+        # the plan is an input too: leg-plan.json is written over it once the claim is held, and batch.log / gate.log are appended to
+        for leaf in ("leg-plan.json", "batch.log", "gate.log", "quiet-01-fx-a-cpu-A-leg.out.txt", "batch-jobs/plan.json"):
+            with self.subTest(output=leaf):
+                for p in (self.events, self.leg_args, self.claim_path):
+                    p.unlink(missing_ok=True)
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                plan = self.run_dir / leaf
+                plan.parent.mkdir(parents=True, exist_ok=True)
+                plan.write_text(json.dumps({"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": [self.item(self.specs[0], "A", self.commit_a)]}), encoding="utf-8")
+                before = plan.read_text(encoding="utf-8")
+                r = self.run_plan(plan)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+                self.assertEqual(plan.read_text(encoding="utf-8"), before, "the accepted input is untouched")
+
+    def test_r9_a_scalar_leg_spec_at_a_runner_output_path_is_refused_before_the_claim(self) -> None:
+        for leaf in ("gate.log", "quiet-01-fx-a-cpu-A-leg.out.txt", "leg-plan.json", "batch-03.json"):
+            with self.subTest(output=leaf):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                shutil.rmtree(self.run_dir, ignore_errors=True)
+                spec = self.run_dir / leaf
+                spec.parent.mkdir(parents=True, exist_ok=True)
+                spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = spec.read_text(encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+                self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is untouched")
+
+    def test_r9_a_spec_in_the_run_dir_under_another_name_is_not_refused(self) -> None:
+        # the guard names the runner's outputs, not the directory: a spec kept beside them under any other name still runs
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        self.run_dir.mkdir(parents=True)
+        spec = self.run_dir / "gate.log.spec.json"
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self.assertNotIn("LEG_SPEC_IS_RUN_OUTPUT", r.stderr)
+        self.assertNotEqual(r.returncode, 2, r.stdout + r.stderr)
+
+    # r10 (adversary r9 A1): the r9 guard compared LEXICAL parents, so an input reached through a junction that targets -RunDir (or an ancestor of it) passed preflight and was
+    # overwritten after the claim. One case per call site of the one helper (the plan file, a plan item's spec, a scalar spec), the aliases that matter (the input, an ancestor
+    # of it, -RunDir itself, a runner-owned directory that is a link) and the fail-closed case. Each asserts the physical file is byte-unchanged and nothing was submitted.
+    def _junction(self, link: Path, target: Path) -> None:
+        target.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def _assert_alias_refused(self, r: subprocess.CompletedProcess, physical: Path, before: str, marker: str) -> None:
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(marker, r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+        self.assertEqual(physical.read_text(encoding="utf-8"), before, "the physical file is byte-unchanged")
+
+    def _fresh_run_dir(self) -> None:
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+        self.run_dir.mkdir(parents=True)
+
+    def test_r10_a_leg_spec_reached_through_a_junction_to_the_run_dir_is_refused_before_the_claim(self) -> None:
+        for leaf in ("leg-plan.json", "gate.log", "batch.log", "batch-jobs/x.json"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                alias = self.case / "alias"
+                if alias.exists():
+                    os.rmdir(alias)
+                self._junction(alias, self.run_dir)
+                spec = self.run_dir / leaf
+                spec.parent.mkdir(parents=True, exist_ok=True)
+                spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = spec.read_text(encoding="utf-8")
+                r = self.run_plan(self.write_plan([self.item(alias / leaf, "A", self.commit_a)]))
+                self._assert_alias_refused(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                os.rmdir(alias)
+
+    def test_r10_a_leg_spec_reached_through_a_junction_to_an_ancestor_of_the_run_dir_is_refused(self) -> None:
+        self._fresh_run_dir()
+        alias = self.tmp / f"up-{self.case.name}"
+        self._junction(alias, self.case)
+        try:
+            spec = self.run_dir / "leg-plan.json"
+            spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+            before = spec.read_text(encoding="utf-8")
+            r = self.run_plan(self.write_plan([self.item(alias / "run" / "leg-plan.json", "A", self.commit_a)]))
+            self._assert_alias_refused(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+        finally:
+            os.rmdir(alias)
+
+    def test_r10_a_plan_file_reached_through_a_junction_to_the_run_dir_is_refused_before_the_claim(self) -> None:
+        for leaf in ("leg-plan.json", "batch.log", "batch-jobs/plan.json"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                alias = self.case / "alias"
+                if alias.exists():
+                    os.rmdir(alias)
+                self._junction(alias, self.run_dir)
+                plan = self.run_dir / leaf
+                plan.parent.mkdir(parents=True, exist_ok=True)
+                plan.write_text(json.dumps({"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": [self.item(self.specs[0], "A", self.commit_a)]}), encoding="utf-8")
+                before = plan.read_text(encoding="utf-8")
+                r = self.run_plan(alias / leaf)
+                self._assert_alias_refused(r, plan, before, "LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT")
+                os.rmdir(alias)
+
+    def test_r10_a_scalar_leg_spec_reached_through_a_junction_to_the_run_dir_is_refused_before_the_claim(self) -> None:
+        for leaf in ("gate.log", "leg-plan.json", "quiet/x.json"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                alias = self.case / "alias"
+                if alias.exists():
+                    os.rmdir(alias)
+                self._junction(alias, self.run_dir)
+                spec = self.run_dir / leaf
+                spec.parent.mkdir(parents=True, exist_ok=True)
+                spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = spec.read_text(encoding="utf-8")
+                r = self.run_batch([alias / leaf])
+                self._assert_alias_refused(r, spec, before, "BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT")
+                os.rmdir(alias)
+
+    def test_r10_a_run_dir_given_as_a_junction_alias_still_refuses_the_physical_output(self) -> None:
+        # the other direction: -RunDir is the alias, the input is spelled with the physical path
+        real = self.case / "real-run"
+        real.mkdir()
+        spec = real / "gate.log"
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        before = spec.read_text(encoding="utf-8")
+        alias = self.case / "run-alias"
+        self._junction(alias, real)
+        try:
+            self.run_dir = alias
+            r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+            self._assert_alias_refused(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+        finally:
+            os.rmdir(alias)
+
+    def test_r10_a_spec_inside_a_runner_owned_directory_that_is_a_link_is_refused(self) -> None:
+        # <RunDir>\quiet is a junction elsewhere: Wait-VenueQuiet -WorkDir writes into the target, so a spec there is a runner output
+        self._fresh_run_dir()
+        elsewhere = self.case / "elsewhere"
+        self._junction(self.run_dir / "quiet", elsewhere)
+        spec = elsewhere / "venue-quiet-probe-x.json"
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        before = spec.read_text(encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self._assert_alias_refused(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+
+    # r10 second pass (adversary A1): a HARD link to a runner output has its own final path and is not a reparse point, so a path comparison, however physical, accepts it
+    # while the runner overwrites the same file through the output's name. The guard also compares file identity (volume + file index).
+    def _hard_linked(self, output: Path, name: Path) -> str:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        name.parent.mkdir(parents=True, exist_ok=True)
+        os.link(output, name)
+        return output.read_text(encoding="utf-8")
+
+    def test_r10_a_plan_item_spec_hard_linked_to_a_runner_output_is_refused_before_the_claim(self) -> None:
+        for leaf in ("leg-plan.json", "gate.log", "batch-jobs/x.json", "quiet/x.json"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                safe = self.case / "safe" / "fx-a.json"
+                safe.unlink(missing_ok=True)
+                before = self._hard_linked(self.run_dir / leaf, safe)
+                r = self.run_plan(self.write_plan([self.item(safe, "A", self.commit_a)]))
+                self._assert_alias_refused(r, safe, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                self.assertIn("is a hard link to", r.stderr)
+
+    def test_r10_a_plan_file_hard_linked_to_a_runner_output_is_refused_before_the_claim(self) -> None:
+        self._fresh_run_dir()
+        plan = self.case / "safe-plan.json"
+        plan.unlink(missing_ok=True)
+        output = self.run_dir / "leg-plan.json"
+        output.write_text(json.dumps({"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": [self.item(self.specs[0], "A", self.commit_a)]}), encoding="utf-8")
+        os.link(output, plan)
+        before = plan.read_text(encoding="utf-8")
+        r = self.run_plan(plan)
+        self._assert_alias_refused(r, plan, before, "LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT")
+
+    def test_r10_a_scalar_spec_hard_linked_to_a_runner_output_is_refused_before_the_claim(self) -> None:
+        self._fresh_run_dir()
+        safe = self.case / "safe" / "fx-a.json"
+        safe.unlink(missing_ok=True)
+        before = self._hard_linked(self.run_dir / "gate.log", safe)
+        r = self.run_batch([safe])
+        self._assert_alias_refused(r, safe, before, "BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT")
+
+    def test_r10_a_hard_linked_spec_whose_other_name_is_not_a_runner_output_is_not_refused(self) -> None:
+        # more than one name is not the test: the other name must be a file this run writes
+        self._fresh_run_dir()
+        safe = self.case / "safe" / "fx-a.json"
+        safe.unlink(missing_ok=True)
+        self._hard_linked(self.run_dir / "gate.log.spec.json", safe)
+        r = self.run_plan(self.write_plan([self.item(safe, "A", self.commit_a)]))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_r10_an_input_whose_physical_path_cannot_be_resolved_is_refused_before_the_claim(self) -> None:
+        # fail closed: the resolver is made to fail (as it does for a path the file system will not open); the plan file, a plan item's spec and a scalar spec each refuse
+        anchor = "[VenueLeaseBatchFinalPath]::Resolve([IO.Path]::GetFullPath($Path))"
+        runner = self._patched_runner(anchor, "throw 'injected: the path will not open'")
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a)])
+        spec_text = self.specs[0].read_text(encoding="utf-8")
+        args, e = self.plan_cmd(plan)
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self._assert_alias_refused(r, self.specs[0], spec_text, "LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT")
+        self.assertIn("cannot be resolved to a physical path", r.stderr)
+        args, e = self.batch_cmd([self.specs[0]])
+        args[args.index("-File") + 1] = str(runner)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self._assert_alias_refused(r, self.specs[0], spec_text, "BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertIn("cannot be resolved to a physical path", r.stderr)
+
+    def test_r10_a_junction_that_does_not_reach_the_run_dir_is_not_refused(self) -> None:
+        # the guard resolves paths, it does not distrust links: a spec kept behind a junction elsewhere still runs
+        self._fresh_run_dir()
+        kept = self.case / "kept-specs"
+        self._junction(self.case / "spec-alias", kept)
+        shutil.copy2(self.specs[0], kept / "fx-a.json")
+        r = self.run_plan(self.write_plan([self.item(self.case / "spec-alias" / "fx-a.json", "A", self.commit_a)]))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # r11 (sol r10 blockers 1-3 = producer OPEN r10-A1..A3). Round one item 2: every input is validated BEFORE the lease opens, and no accepted input is overwritten, deleted or made
+    # unusable later. A1: the runner's outputs are not only <RunDir>\ files: VenueChain.psm1 also writes <ClaimDir>\bachelor.claim.json (deleted as a stale claim when unparseable),
+    # <ClaimDir>\bachelor.lease-ledger.jsonl (appended to) and <ClaimDir>\bachelor.tickets\ (ticket files). A2: every generated output name must be openable. A3: the guard runs again
+    # once the claim is held, because an alias can appear while the batch waits on a foreign claim.
+    CLAIM_DIR_OUTPUTS = ("bachelor.claim.json", "bachelor.lease-ledger.jsonl", "bachelor.tickets/0000000000000000001-p1-1.ticket.json")
+
+    def _claim_dir_input(self, leaf: str, age_s: int = 31) -> tuple[Path, str]:
+        spec = self.claims / leaf
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        old = time.time() - age_s
+        os.utime(spec, (old, old))
+        return spec, spec.read_text(encoding="utf-8")
+
+    def _assert_nothing_submitted_input_intact(self, r: subprocess.CompletedProcess, path: Path, before: str, marker: str) -> None:
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(marker, r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertTrue(path.exists(), "the accepted input was not removed")
+        self.assertEqual(path.read_text(encoding="utf-8"), before, "the accepted input is byte-unchanged")
+
+    def test_r11_a1_a_plan_item_spec_at_a_claim_dir_file_is_refused_when_run_dir_is_the_claim_dir(self) -> None:
+        # sol r10 blocker 1, literal: RunDir=ClaimDir, a valid spec at bachelor.claim.json (age 31 s: past the 30 s grace, so the claim reader types it STALE/unreadable and
+        # Invoke-VenueClaimAttempt removes it) and at its ledger sibling (Add-VenueLeaseLedger appends to it).
+        for leaf in self.CLAIM_DIR_OUTPUTS:
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                shutil.rmtree(self.claims, ignore_errors=True)
+                self.run_dir = self.claims
+                spec, before = self._claim_dir_input(leaf)
+                r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+
+    def test_r11_a1_a_claim_dir_file_is_refused_whatever_the_run_dir_is(self) -> None:
+        # the claim dir is a runner output location in its own right, not only when it is also -RunDir
+        for leaf in self.CLAIM_DIR_OUTPUTS:
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                shutil.rmtree(self.claims, ignore_errors=True)
+                spec, before = self._claim_dir_input(leaf)
+                r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                shutil.rmtree(self.claims, ignore_errors=True)
+                spec, before = self._claim_dir_input(leaf)
+                r = self.run_batch([spec])
+                self._assert_nothing_submitted_input_intact(r, spec, before, "BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT")
+
+    def test_r11_a1_a_plan_file_at_a_claim_dir_file_is_refused_before_the_claim(self) -> None:
+        for leaf in ("bachelor.claim.json", "bachelor.lease-ledger.jsonl"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                shutil.rmtree(self.claims, ignore_errors=True)
+                self.run_dir = self.claims
+                plan = self.claims / leaf
+                plan.parent.mkdir(parents=True, exist_ok=True)
+                plan.write_text(json.dumps({"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": [self.item(self.specs[0], "A", self.commit_a)]}), encoding="utf-8")
+                old = time.time() - 31
+                os.utime(plan, (old, old))
+                before = plan.read_text(encoding="utf-8")
+                r = self.run_plan(plan)
+                self._assert_nothing_submitted_input_intact(r, plan, before, "LEG_PLAN_REFUSED reason=LEG_PLAN_IS_RUN_OUTPUT")
+
+    def test_r11_a1_a_spec_hard_linked_to_a_claim_dir_file_is_refused_before_the_claim(self) -> None:
+        for leaf in ("bachelor.claim.json", "bachelor.lease-ledger.jsonl"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                shutil.rmtree(self.claims, ignore_errors=True)
+                safe = self.case / "safe" / "fx-a.json"
+                safe.unlink(missing_ok=True)
+                before = self._hard_linked(self.claims / leaf, safe)
+                r = self.run_plan(self.write_plan([self.item(safe, "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, safe, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                self.assertIn("is a hard link to", r.stderr)
+
+    def test_r11_a1_a_spec_in_the_claim_dir_under_another_name_is_not_refused(self) -> None:
+        self._fresh_run_dir()
+        shutil.rmtree(self.claims, ignore_errors=True)
+        self.run_dir = self.claims
+        spec, _ = self._claim_dir_input("fx-a.spec.json")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def _long_name_spec(self, basename_len: int) -> Path:
+        # a spec whose legId is not a usable leg name (82 chars, over the 81 the runner takes), so the file's own basename becomes the leg name (sol r10 blocker 2, literal)
+        # (kept off the deep test temp folder: the spec's own path must stay under MAX_PATH, so the only over-long name is the one the RUNNER generates from it)
+        d = None
+        for root in (os.environ.get("PUBLIC", ""), (os.environ.get("SystemDrive", "C:") + "\\"), tempfile.gettempdir()):
+            try:
+                cand = Path(tempfile.mkdtemp(prefix="lb", dir=root)) if root else None
+            except OSError:
+                continue
+            if cand is not None and len(str(cand / ("a" * basename_len + ".json"))) < 259:
+                d = cand
+                break
+            if cand is not None:
+                shutil.rmtree(cand, ignore_errors=True)
+        if d is None:
+            self.skipTest("no folder is shallow enough to keep the spec's own path under MAX_PATH")
+        self.addCleanup(shutil.rmtree, d, True)
+        spec = d / ("a" * basename_len + ".json")
+        spec.write_text(json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "x" * 82, "backends": ["cpu"], "scaleFactor": 1}), encoding="utf-8")
+        return spec
+
+    def test_r11_a2_a_generated_output_name_over_the_volume_limit_is_refused_before_the_claim(self) -> None:
+        # 205-char basename + 32-char arm: the quiet output is 266 characters, the volume's component limit 255; redirecting into it failed AFTER the lease opened.
+        spec = self._long_name_spec(205)
+        r = self.run_plan(self.write_plan([self.item(spec, "A" * 32, self.commit_a)]))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=OUTPUT_NAME_TOO_LONG item=1 ", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_r11_a2_the_scalar_form_refuses_a_generated_output_name_over_the_limit_too(self) -> None:
+        spec = self._long_name_spec(220)   # no -Backend: the leg name ends in "-spec", and quiet-01-<220>-spec-b9999-a999999.out.txt is 256 characters
+        r = self.run_batch([spec])
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("BATCH_USAGE OUTPUT_NAME_TOO_LONG", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_r11_a2_a_short_name_with_a_full_length_arm_still_runs(self) -> None:
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A" * 32, self.commit_a)]))
+        self.assertNotIn("OUTPUT_NAME_TOO_LONG", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def _foreign_live_claim(self) -> None:
+        # a LIVE claim of another owner: a real sleeping process, its real start time (Get-VenueClaimStaleReason finds a live owner and the claim not yet expired)
+        holder = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 300"])
+        self.addCleanup(lambda: holder.poll() is None and subprocess.run(["taskkill", "/PID", str(holder.pid), "/T", "/F"], capture_output=True, text=True, timeout=60))
+        t = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f"(Get-Process -Id {holder.pid}).StartTime.ToUniversalTime().ToString('o')"],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(t.returncode, 0, t.stdout + t.stderr)
+        now = datetime.now(timezone.utc)
+        self.claims.mkdir(parents=True, exist_ok=True)
+        self.claim_path.write_text(json.dumps({"schema": "mlv-app/venue-claim/v1", "venue": "bachelor", "ownerPid": holder.pid, "ownerCreatedUtc": t.stdout.strip(),
+                                               "host": os.environ.get("COMPUTERNAME", ""), "runDir": str(self.case / "foreign"), "purpose": "foreign", "claimedUtc": utc_iso(now),
+                                               "expiresUtc": utc_iso(now + timedelta(hours=1)), "nonce": "f" * 32}, separators=(",", ":")) + "\n", encoding="utf-8")
+
+    def _wait_for_log(self, text: str, timeout_s: float = 90) -> None:
+        end = time.monotonic() + timeout_s
+        log = self.run_dir / "batch.log"
+        while time.monotonic() < end:
+            try:
+                if text in log.read_text(encoding="utf-8"):
+                    return
+            except OSError:
+                pass
+            time.sleep(0.2)
+        self.fail(f"{text!r} never reached {log}")
+
+    def _alias_during_claim_wait(self, args: list[str], e: dict, spec: Path, alias: Path) -> tuple[int, str, str]:
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("CLAIM_HELD")
+            os.link(spec, alias)
+            self.claim_path.unlink()   # the foreign owner lets go: this run takes the claim next poll
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        return p.returncode, so, se
+
+    def test_r11_a3_an_output_alias_added_while_the_batch_waits_on_a_foreign_claim_is_refused_after_the_wait(self) -> None:
+        # sol r10 blocker 3, literal: ordinary single-link spec; while the runner waits (CLAIM_HELD) a hard link <RunDir>\leg-plan.json -> the spec appears; the foreign claim
+        # is then released. The guard ran only before the wait, so leg-plan.json was written THROUGH the link, over the accepted spec, before the lease opened.
+        self._fresh_run_dir()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        before = spec.read_text(encoding="utf-8")
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        code, so, se = self._alias_during_claim_wait(args, e, spec, self.run_dir / "leg-plan.json")
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
+        self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is byte-unchanged")
+
+    def test_r11_a3_a_scalar_spec_aliased_while_waiting_is_refused_after_the_wait(self) -> None:
+        self._fresh_run_dir()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        before = spec.read_text(encoding="utf-8")
+        self._foreign_live_claim()
+        args, e = self.batch_cmd([spec])
+        code, so, se = self._alias_during_claim_wait(args, e, spec, self.run_dir / "gate.log")
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("BATCH_USAGE LEG_SPEC_IS_RUN_OUTPUT", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
+        self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is byte-unchanged")
+
+    # r12 (adversary r12 A1): the staged build manifest is an input too. A hard link <RunDir>\<output> -> the manifest made the runner write the output through it, over the accepted build.
+    def _staged_manifest(self, commit: str) -> Path:
+        return self.share / "cache" / f"playback-attr-3-cuda-{commit[:12]}-build.json"
+
+    def test_r12_a1_a_staged_build_manifest_hard_linked_to_a_runner_output_is_refused_before_the_claim(self) -> None:
+        for leaf in ("leg-plan.json", "gate.log", "batch.log", "batch-01.json", "batch-jobs/x.json", "quiet/x.json"):
+            with self.subTest(output=leaf):
+                self._fresh_run_dir()
+                manifest = self._staged_manifest(self.commit_a)
+                (self.run_dir / leaf).parent.mkdir(parents=True, exist_ok=True)
+                os.link(manifest, self.run_dir / leaf)
+                before = manifest.read_text(encoding="utf-8")
+                r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, manifest, before, "LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ")
+                self.assertIn("is a hard link to", r.stderr)
+                os.unlink(self.run_dir / leaf)
+
+    def test_r12_a1_the_refusal_names_the_item_that_reads_the_build(self) -> None:
+        self._fresh_run_dir()
+        manifest = self._staged_manifest(self.commit_b)
+        os.link(manifest, self.run_dir / "leg-plan.json")
+        before = manifest.read_text(encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "B", self.commit_b)]))
+        self._assert_nothing_submitted_input_intact(r, manifest, before, "LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=2 ")
+        os.unlink(self.run_dir / "leg-plan.json")
+
+    def test_r12_a1_a_staged_build_manifest_aliased_while_the_batch_waits_on_a_foreign_claim_is_refused_after_the_wait(self) -> None:
+        self._fresh_run_dir()
+        manifest = self._staged_manifest(self.commit_a)
+        before = manifest.read_text(encoding="utf-8")
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        code, so, se = self._alias_during_claim_wait(args, e, manifest, self.run_dir / "leg-plan.json")
+        self.assertEqual(code, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ", se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
+        self.assertEqual(manifest.read_text(encoding="utf-8"), before, "the accepted build manifest is byte-unchanged")
+
+    # r12 pass 2 (adversary r12 A1'): a link BELOW a runner-owned directory writes through to its target whatever that target's link count, so the root-only reparse listing missed it.
+    def test_r12_a1b_a_spec_behind_a_junction_nested_in_a_runner_owned_directory_is_refused_before_the_claim(self) -> None:
+        for owned in ("quiet", "batch-jobs"):
+            with self.subTest(owned=owned):
+                self._fresh_run_dir()
+                (self.run_dir / owned).mkdir()
+                elsewhere = self.case / f"elsewhere-{owned}"
+                shutil.rmtree(elsewhere, ignore_errors=True)
+                self._junction(self.run_dir / owned / "sub", elsewhere)
+                spec = elsewhere / "fx-a.json"
+                spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = spec.read_text(encoding="utf-8")
+                r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                os.rmdir(self.run_dir / owned / "sub")
+
+    def test_r12_a1b_a_spec_that_a_file_symlink_in_a_runner_owned_directory_points_at_is_refused_before_the_claim(self) -> None:
+        self._fresh_run_dir()
+        (self.run_dir / "quiet").mkdir()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+        try:
+            os.symlink(spec, self.run_dir / "quiet" / "venue-quiet-probe-20261026T180000000Z.job.ps1")
+        except OSError as exc:
+            self.skipTest(f"file symlinks need a privilege this account lacks here: {exc}")
+        before = spec.read_text(encoding="utf-8")
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        self._assert_nothing_submitted_input_intact(r, spec, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+
+    # r12 pass 2 (adversary r12 A2'): what the preflight validated must still hold when the claim is taken, or the leg throws / refuses after the lease opened.
+    def _during_claim_wait(self, args: list[str], e: dict, change) -> tuple[int, str, str]:
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("CLAIM_HELD")
+            change()
+            self.claim_path.unlink()   # the foreign owner lets go: this run takes the claim next poll
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        return p.returncode, so, se
+
+    def _assert_refused_after_the_wait(self, code: int, so: str, se: str, marker: str) -> None:
+        self.assertEqual(code, 2, so + se)
+        self.assertIn(marker, se)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertFalse(self.claim_path.exists(), "the claim taken after the wait was released")
+
+    def test_r12_a2b_a_leg_spec_the_leg_would_throw_on_after_the_wait_is_refused_before_the_lease(self) -> None:
+        self._fresh_run_dir()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        # playSeconds past Int32: Invoke-VenueLeg's [int] cast throws, which the preflight (Get-LegSpecRefusal) already refuses up front
+        changed = json.loads(spec.read_text(encoding="utf-8"))
+        changed["playSeconds"] = 2147483648
+        code, so, se = self._during_claim_wait(args, e, lambda: spec.write_text(json.dumps(changed), encoding="utf-8"))
+        self._assert_refused_after_the_wait(code, so, se, "LEG_PLAN_REFUSED reason=LEG_SPEC_INVALID item=1 ")
+
+    def test_r12_a2b_a_staged_build_manifest_that_changed_during_the_wait_is_refused_before_the_lease(self) -> None:
+        self._fresh_run_dir()
+        manifest = self._staged_manifest(self.commit_a)
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        code, so, se = self._during_claim_wait(args, e, lambda: manifest.write_bytes(manifest.read_bytes() + b" "))
+        self._assert_refused_after_the_wait(code, so, se, "LEG_PLAN_REFUSED reason=BUILD_MANIFEST_MISMATCH item=1 ")
+
+    def test_r12_a2b_a_staged_build_manifest_removed_during_the_wait_is_refused_before_the_lease(self) -> None:
+        self._fresh_run_dir()
+        manifest = self._staged_manifest(self.commit_a)
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        code, so, se = self._during_claim_wait(args, e, lambda: manifest.unlink())
+        self._assert_refused_after_the_wait(code, so, se, "LEG_PLAN_REFUSED reason=BUILD_NOT_STAGED item=1 ")
+
+    def test_r12_a2b_an_unchanged_plan_still_runs_after_a_claim_wait(self) -> None:
+        self._fresh_run_dir()
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        code, so, se = self._during_claim_wait(args, e, lambda: None)
+        self.assertEqual(code, 0, so + se)
+        self.assertNotIn("LEG_PLAN_REFUSED", se)
+
+    # r13 (Dot A1''): a staged manifest whose bytes cannot be read after the wait (write-locked: the location and metadata still read) was "not a hit", so the lease opened on a build
+    # nobody re-validated. Its digest cannot be checked, so it is refused before the lease, typed, like the preflight's own unreadable manifest.
+    def _lock_exclusive(self, path: Path) -> None:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = ctypes.c_void_p
+        k32.CreateFileW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_void_p]
+        k32.CloseHandle.argtypes = [ctypes.c_void_p]
+        # a writer that still lets others read: GENERIC_READ | GENERIC_WRITE, share READ, OPEN_EXISTING. Test-Path and the location still answer; ReadAllBytes (share READ, which a
+        # handle with write access breaks) does not. (Share NONE hides the file from Test-Path too, which is the BUILD_NOT_STAGED refusal r12 already covers.)
+        h = k32.CreateFileW(str(path), 0xC0000000, 1, None, 3, 0x80, None)
+        self.assertNotIn(h, (None, ctypes.c_void_p(-1).value), f"could not lock {path}: {ctypes.get_last_error()}")
+        self.addCleanup(k32.CloseHandle, h)
+
+    def test_r13_a1_a_staged_build_manifest_write_locked_during_the_wait_is_refused_before_the_lease(self) -> None:
+        self._fresh_run_dir()
+        manifest = self._staged_manifest(self.commit_a)
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        code, so, se = self._during_claim_wait(args, e, lambda: self._lock_exclusive(manifest))
+        self._assert_refused_after_the_wait(code, so, se, "LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ")
+        self.assertIn("could not be read after the claim wait", se)
+
+    # r13 (Dot A2''): one file, two spellings. A loopback UNC name (\\localhost\C$\...) and the local name reach the same single-link file, and the guard compared spellings, so the
+    # UNC spelling of a runner output was accepted as an input. It now compares file and directory identity (volume serial + file index), which no spelling changes.
+    def _loopback_unc(self, p: Path) -> Path:
+        drive, rest = os.path.splitdrive(str(p.resolve()))
+        if len(drive) != 2 or drive[1] != ":":
+            self.skipTest(f"{p} is not on a drive letter")
+        unc = Path("\\\\localhost\\" + drive[0] + "$" + rest)
+        if not unc.exists():
+            self.skipTest(f"no loopback admin share reaches {p} as {unc}")
+        return unc
+
+    def _plan_with_share(self, share: Path) -> subprocess.CompletedProcess:
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
+        args[args.index("-AgentShare") + 1] = str(share)
+        return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+
+    def test_r13_a2_a_staged_build_manifest_reached_by_a_loopback_unc_agent_share_inside_a_runner_owned_directory_is_refused(self) -> None:
+        # the share is <RunDir>\quiet (a directory the runner writes), named \\localhost\C$\...\quiet: the manifest's UNC path shares no prefix with the local -RunDir, one link, no reparse point
+        self._fresh_run_dir()
+        inside = self.run_dir / "quiet"
+        shutil.copytree(self.share, inside)
+        manifest = inside / "cache" / f"playback-attr-3-cuda-{self.commit_a[:12]}-build.json"
+        before = manifest.read_text(encoding="utf-8")
+        r = self._plan_with_share(self._loopback_unc(inside))
+        self._assert_nothing_submitted_input_intact(r, manifest, before, "LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ")
+        self.assertIn("inside quiet\\", r.stderr)
+
+    def test_r13_a2_a_loopback_unc_agent_share_outside_the_run_still_runs(self) -> None:
+        self._fresh_run_dir()
+        r = self._plan_with_share(self._loopback_unc(self.share))
+        self.assertNotIn("LEG_PLAN_REFUSED", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_r13_a2_a_leg_spec_named_by_a_loopback_unc_alias_of_a_runner_output_is_refused_before_the_claim(self) -> None:
+        # (already refused on b9b2f710: Resolve-LegSpecPath hands a UNC spec back provider-qualified, which the guard cannot resolve; this pins that the refusal holds)
+        for case in ("gate.log", "quiet/x.json", "junction quiet"):
+            with self.subTest(output=case):
+                self._fresh_run_dir()
+                self.run_dir.mkdir(parents=True, exist_ok=True)
+                if case == "junction quiet":
+                    elsewhere = self.case / "elsewhere-unc"
+                    shutil.rmtree(elsewhere, ignore_errors=True)
+                    self._junction(self.run_dir / "quiet", elsewhere)
+                    local = elsewhere / "x.json"
+                else:
+                    local = self.run_dir / case
+                    local.parent.mkdir(parents=True, exist_ok=True)
+                local.write_text(self._valid_leg_spec_text(), encoding="utf-8")
+                before = local.read_text(encoding="utf-8")
+                r = self.run_plan(self.write_plan([self.item(self._loopback_unc(local), "A", self.commit_a)]))
+                self._assert_nothing_submitted_input_intact(r, local, before, "LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ")
+                if case == "junction quiet":
+                    os.rmdir(self.run_dir / "quiet")
+
+    # r13 (adversary r13 A1): the leg job also reads packageZip.sha256, exe.sha256 and dll.sha256 from the manifest and hashes the cached artifacts against them
+    # (playback-attr-3-cuda-job.ps1 $manifestChecks); a manifest without one passed preflight and the job threw after the lease opened.
+    def test_r13_adv_a1_a_staged_build_without_an_artifact_digest_is_refused_before_the_claim_and_the_lease(self) -> None:
+        a, c = self.commit_a, "3" * 40
+        cases = {
+            "no packageZip": {"packageZip": ABSENT},
+            "exe.sha256 blank": {"exe": {"sha256": ""}},
+            "dll.sha256 a number": {"dll": {"sha256": 1}},
+            "exe.sha256 not hex": {"exe": {"sha256": "z" * 64}},
+            "dll is a string": {"dll": "c" * 64},
+        }
+        for label, override in cases.items():
+            with self.subTest(case=label):
+                manifest = self.stage(c, "bad build", **override)
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_MANIFEST_MISMATCH item=2 ")
+
+    def test_r13_adv_a1_the_artifact_refusal_names_the_missing_digest(self) -> None:
+        c = "3" * 40
+        manifest = self.stage(c, "bad build", exe={"sha256": ""})
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c, manifest=manifest)]))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING", r.stderr)
+        self.assertIn("for exe ", r.stderr)
+
+    # r13 (adversary r13 A2): the open can wait long in the agent's gate, and a link to an output made in that wait was written through by the first probe (gate.log).
+    def test_r13_adv_a2_an_output_alias_added_while_the_open_waits_is_refused_before_any_probe(self) -> None:
+        # gate.log: the probe's -GateLog, which Wait-VenueQuiet appends to. batch.log (r13 pass 2 A1): the runner's own log, which the finally wrote through after the refusal.
+        for leaf in ("gate.log", "batch.log"):
+            with self.subTest(output=leaf):
+                self._open_wait_alias(leaf)
+
+    def _open_wait_alias(self, leaf: str) -> None:
+        self._fresh_run_dir()
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.unlink(missing_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        before = spec.read_text(encoding="utf-8")
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), FAKE_OPEN_SLEEP="12")
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            # the last line before um-run blocks (FAKE_OPEN_SLEEP); a link made before it is written through at once, the race no re-check closes
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            time.sleep(2)
+            (self.run_dir / leaf).unlink(missing_ok=True)
+            os.link(spec, self.run_dir / leaf)
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertEqual(p.returncode, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ", se)
+        self.assertIn("found after the open", se)
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
+        self.assertEqual(self.leg_calls(), [])
+        self.assertTrue(any(k.startswith("CLOSE") for k in self.kinds()), "the lease was closed")
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+        self.assertEqual(spec.read_text(encoding="utf-8"), before, "the accepted input is byte-unchanged")
+
+    # r14 (Dot 2e6eb21d; adversary r13 pass 3 A1, A2): the post-open guard ran only on a clean receipt, and its write suppression was set only in the refusal branch. An open that
+    # failed (OPEN_FAILED), came back without a lease batch (AGENT_NOT_BATCH_CAPABLE), or was held in the agent's gate (logged before the guard; or held to the deadline, the guard
+    # skipped) won the classification, and the cleanup log lines and the result line were appended through a batch.log that had become a hard link to the accepted spec.
+    def test_r14_an_alias_made_in_the_open_wait_is_never_written_through_whatever_the_open_returned(self) -> None:
+        cases = {
+            # mode: (exit code, the typed reason the run still reports, extra args)
+            "exit1": (9, "OPEN_FAILED", ()),
+            "nobatch": (10, "AGENT_NOT_BATCH_CAPABLE", ()),
+            "gatewait": (2, "LEG_SPEC_IS_RUN_OUTPUT", ()),
+            "gatehold": (11, "OPEN_CANCEL_UNRECONCILED", ("-CancelReconcileSec", "3", "-DeadlineUtc", "+60")),
+        }
+        for mode, (code, reason, extra) in cases.items():
+            with self.subTest(open=mode):
+                # the deadline is placed when this subtest starts, not when the table was built (the subtests before it take a minute or more under load)
+                extra = tuple(utc_iso(datetime.now(timezone.utc) + timedelta(seconds=int(x[1:]))) if x.startswith("+") else x for x in extra)
+                self._alias_in_open_wait(mode, code, reason, extra)
+
+    def _alias_in_open_wait(self, mode: str, code: int, reason: str, extra: tuple[str, ...]) -> None:
+        import hashlib
+        self._fresh_run_dir()
+        (self.share / "fake-agent-state.json").unlink(missing_ok=True)
+        shutil.rmtree(self.share / "outbox", ignore_errors=True)
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.unlink(missing_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        before = hashlib.sha256(spec.read_bytes()).hexdigest()
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), *extra, FAKE_OPEN_SLEEP="12", FAKE_OPEN_MODES=mode)
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            time.sleep(2)
+            (self.run_dir / "batch.log").unlink(missing_ok=True)
+            os.link(spec, self.run_dir / "batch.log")
+            so, se = p.communicate(timeout=300)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertEqual(hashlib.sha256(spec.read_bytes()).hexdigest(), before, "the accepted input is byte-unchanged: nothing was appended through the alias")
+        self.assertEqual(p.returncode, code, so + se)
+        self.assertEqual(batch_result(so)["stopReason"], reason, "the typed reason still reaches stdout")
+        self.assertIn("BATCH_OUTPUT_ALIASED ", se, "the alias is said on stderr")
+        self.assertEqual(self.leg_calls(), [], "no leg ran")
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+        self.assertTrue(any(k.startswith("CLOSE") for k in self.kinds()), "the lease was closed")
+
+    # adversary r14 A1, A2, A3 (on 2ea93e0f): the redirect folder was named from the token alone and reused with -Force, so links prepared in it were written through; TEMP inside -RunDir
+    # put the redirect back in it; a redirect that could not be made threw, and the close then threw out of the finally (no claim release, no result); and the claim keeper went on
+    # rewriting a claim file that had become the input until the close returned.
+    def _spawn_open_wait(self, mode: str, *extra: str, env: dict | None = None, claim_dir: Path | None = None):
+        import hashlib
+        self._fresh_run_dir()
+        (self.share / "fake-agent-state.json").unlink(missing_ok=True)
+        shutil.rmtree(self.share / "outbox", ignore_errors=True)
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.unlink(missing_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), *extra, FAKE_OPEN_SLEEP="12", FAKE_OPEN_MODES=mode, **(env or {}))
+        if claim_dir is not None:
+            args[args.index("-ClaimDir") + 1] = str(claim_dir)
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+        time.sleep(2)
+        return p, spec, hashlib.sha256
+
+    def _finish(self, p) -> tuple[str, str]:
+        try:
+            return p.communicate(timeout=300)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+
+    def _open_token(self) -> str:
+        [job] = [j.name for j in (self.share / "inbox").iterdir() if j.name.startswith("lease-batch-open-")]
+        return job[: -len(".job.ps1")][-12:]
+
+    def test_r14_adv_a1_a_redirect_folder_prepared_with_links_is_never_written_through(self) -> None:
+        tmp = self.case / "r14-temp"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        shutil.rmtree(self.share / "inbox", ignore_errors=True)
+        p, spec, sha = self._spawn_open_wait("exit1", env={"TEMP": str(tmp), "TMP": str(tmp)})
+        before = sha(spec.read_bytes()).hexdigest()
+        token = self._open_token()
+        prepared = tmp / f"venue-lease-batch-close-{token}"
+        prepared.mkdir()
+        os.link(spec, prepared / "batch.log")
+        [close] = [f"lease-batch-close-{j.name[len('lease-batch-open-'):]}" for j in (self.share / "inbox").iterdir() if j.name.startswith("lease-batch-open-")]
+        os.link(spec, prepared / close)
+        (self.run_dir / "batch.log").unlink(missing_ok=True)
+        os.link(spec, self.run_dir / "batch.log")
+        so, se = self._finish(p)
+        self.assertEqual(sha(spec.read_bytes()).hexdigest(), before, "nothing was written through a link prepared in the redirect folder")
+        self.assertEqual(p.returncode, 9, so + se)
+        self.assertIn("BATCH_OUTPUT_ALIASED ", se)
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+
+    def test_r14_adv_a1_a_temp_inside_the_run_dir_gets_no_redirect_there(self) -> None:
+        p, spec, sha = self._spawn_open_wait("exit1", env={"TEMP": str(self.run_dir), "TMP": str(self.run_dir)})
+        before = sha(spec.read_bytes()).hexdigest()
+        (self.run_dir / "batch.log").unlink(missing_ok=True)
+        os.link(spec, self.run_dir / "batch.log")
+        so, se = self._finish(p)
+        self.assertEqual(sha(spec.read_bytes()).hexdigest(), before)
+        self.assertEqual(p.returncode, 9, so + se)
+        self.assertEqual([d.name for d in self.run_dir.iterdir() if d.name.startswith("venue-lease-batch-close-")], [], "the redirect was made inside -RunDir")
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED ", se)
+        self.assertIn("LEASE_BATCH_RESULT=", so)
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+
+    def test_r14_adv_a2_a_redirect_that_cannot_be_made_still_releases_the_claim_and_reports_a_typed_exit(self) -> None:
+        blocker = self.case / "r14-not-a-dir"
+        blocker.unlink(missing_ok=True)
+        blocker.write_text("a file, so no folder can be made below it", encoding="utf-8")
+        bad = blocker / "temp"
+        p, spec, sha = self._spawn_open_wait("exit1", env={"TEMP": str(bad), "TMP": str(bad)})
+        before = sha(spec.read_bytes()).hexdigest()
+        (self.run_dir / "batch.log").unlink(missing_ok=True)
+        os.link(spec, self.run_dir / "batch.log")
+        so, se = self._finish(p)
+        self.assertEqual(sha(spec.read_bytes()).hexdigest(), before)
+        self.assertEqual(p.returncode, 9, so + se)
+        self.assertEqual(batch_result(so)["stopReason"], "OPEN_FAILED")
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED ", se)
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+
+    def test_r14_adv2_a2_a_temp_junction_into_the_run_dir_gets_no_redirect_there(self) -> None:
+        alias = self.case / "r14-temp-junction"
+        if alias.exists():
+            os.rmdir(alias)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._junction(alias, self.run_dir)
+        p, spec, sha = self._spawn_open_wait("exit1", env={"TEMP": str(alias), "TMP": str(alias)})
+        before = sha(spec.read_bytes()).hexdigest()
+        (self.run_dir / "batch.log").unlink(missing_ok=True)
+        os.link(spec, self.run_dir / "batch.log")
+        so, se = self._finish(p)
+        self.assertEqual(sha(spec.read_bytes()).hexdigest(), before)
+        self.assertEqual(p.returncode, 9, so + se)
+        self.assertEqual([d.name for d in self.run_dir.iterdir() if d.name.startswith("venue-lease-batch-close-")], [], "the redirect was made inside -RunDir through the junction")
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED ", se)
+
+    def test_r14_adv2_a1_an_alias_found_in_the_gate_wait_still_refuses_after_the_link_is_removed(self) -> None:
+        import hashlib
+        self._fresh_run_dir()
+        (self.share / "fake-agent-state.json").unlink(missing_ok=True)
+        spec = self.case / "safe" / "fx-a.json"
+        spec.parent.mkdir(parents=True, exist_ok=True)
+        spec.unlink(missing_ok=True)
+        shutil.copy2(self.specs[0], spec)
+        before = hashlib.sha256(spec.read_bytes()).hexdigest()
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), FAKE_OPEN_SLEEP="12", FAKE_OPEN_MODES="gatehold")
+        err = self.case / "r14-adv2-a1.err.txt"
+        with open(err, "w", encoding="utf-8") as ef:
+            p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=ef, text=True, env=e)
+            try:
+                self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+                time.sleep(2)
+                (self.run_dir / "batch.log").unlink(missing_ok=True)
+                os.link(spec, self.run_dir / "batch.log")
+                end = time.monotonic() + 90
+                while "BATCH_OUTPUT_ALIASED " not in err.read_text(encoding="utf-8") and time.monotonic() < end:
+                    time.sleep(0.2)
+                (self.run_dir / "batch.log").unlink()   # the link is gone before the open's result lands by name
+                [job] = [j.name[: -len(".job.ps1")] for j in (self.share / "inbox").iterdir() if j.name.startswith("lease-batch-open-")]
+                token, now = job[-12:], datetime.now(timezone.utc)
+                adm = {"gate": "fake", "mode": "lease", "label": "clear", "heavySlotHeld": "1:1001", "slot": "C:\\t\\.heavy-slots\\1", "leaseMinutes": 45, "waitedSec": 7,
+                       "leaseRequests": 2, "leaseRefusals": [], "leaseBatch": {"token": token, "leaseId": "lease-1", "seq": 1, "reused": False,
+                                                                                "untilEpoch": int(now.timestamp()) + 2700, "remainingSec": 2700}}
+                (self.share / "outbox").mkdir(parents=True, exist_ok=True)
+                (self.share / "outbox" / f"{job}.result.json").write_text(json.dumps({"jobId": job, "exitCode": 0, "endedUtc": utc_iso(now), "admission": adm, "stdout": "LEASE_BATCH_OPEN"}), encoding="utf-8")
+                so, _ = p.communicate(timeout=300)
+            finally:
+                if p.poll() is None:
+                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                    p.wait(timeout=60)
+        se = err.read_text(encoding="utf-8")
+        self.assertEqual(hashlib.sha256(spec.read_bytes()).hexdigest(), before)
+        self.assertEqual(self.leg_calls(), [], "a leg ran after the alias was found: " + so + se)
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe ran")
+        self.assertEqual(p.returncode, 2, so + se)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_IS_RUN_OUTPUT item=1 ", se)
+
+    def test_r14_adv_a3_the_claim_keeper_stops_writing_a_claim_file_that_became_the_input_once_the_alias_is_found(self) -> None:
+        claim = self.run_dir / "bachelor.claim.json"
+        p, spec, sha = self._spawn_open_wait("gatehold", "-ClaimTtlSec", "60", "-ClaimRenewSec", "1", "-CancelReconcileSec", "3",
+                                             "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=45)), claim_dir=self.run_dir)
+        nonce = json.loads(claim.read_text(encoding="utf-8"))["nonce"]
+        body = json.loads(spec.read_text(encoding="utf-8"))
+        body.update({"nonce": nonce, "expiresUtc": "2026-10-26T12:00:00Z"})
+        spec.write_text(json.dumps(body, separators=(",", ":")), encoding="utf-8")
+        claim.unlink()
+        os.link(spec, claim)
+        so, se = self._finish(p)
+        self.assertIn("BATCH_OUTPUT_ALIASED ", se, so + se)
+        cancel = self.share / "cancel" / f"lease-batch-open-{[j.name for j in (self.share / 'inbox').iterdir() if j.name.startswith('lease-batch-open-')][0][len('lease-batch-open-'):-len('.job.ps1')]}.cancel"
+        self.assertTrue(cancel.exists(), so + se)
+        self.assertIn("close=RECEIPT", so + se, "the lease close was still submitted")
+        # the keeper renews every second; stopped at the alias, its last write is long before the cancel the finally requests at the deadline
+        self.assertLess(spec.stat().st_mtime, cancel.stat().st_mtime - 5, "the keeper went on rewriting the input after the alias was found")
+
+    # r16 (sol r15 B2 = fable r15 H2 = adversary r14 A2): the redirect's path was built with Join-Path BEFORE its try, so TEMP on a drive that does not exist threw into the batch
+    # catch: BATCH_ERROR (exit 12) replaced the open's typed stop, and the close job was still written into <RunDir>\batch-jobs. fable r15 H1: the containment test compared spellings
+    # and final paths only, so a loopback UNC TEMP (\\localhost\C$\<RunDir>) put the redirect inside -RunDir.
+    def _assert_redirect_refused_and_nothing_more_in_the_run_dir(self, temp: str) -> None:
+        p, spec, sha = self._spawn_open_wait("exit1", env={"TEMP": temp, "TMP": temp})
+        before = sha(spec.read_bytes()).hexdigest()
+        jobs_before = sorted(j.name for j in (self.run_dir / "batch-jobs").iterdir())
+        (self.run_dir / "batch.log").unlink(missing_ok=True)
+        os.link(spec, self.run_dir / "batch.log")
+        so, se = self._finish(p)
+        self.assertEqual(sha(spec.read_bytes()).hexdigest(), before, "the accepted input is byte-unchanged")
+        self.assertEqual(p.returncode, 9, so + se)
+        self.assertEqual([d.name for d in self.run_dir.iterdir() if d.name.startswith("venue-lease-batch-close-")], [], "the redirect was made inside -RunDir")
+        self.assertEqual(sorted(j.name for j in (self.run_dir / "batch-jobs").iterdir()), jobs_before, "a job file was written into -RunDir after the alias was found")
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED ", se)
+        res = batch_result(so)
+        self.assertEqual(res["stopReason"], "OPEN_FAILED", "the open's typed stop is kept")
+        self.assertEqual(res["outputRedirect"]["state"], "FAILED", res)
+        self.assertTrue(res["outputRedirect"]["error"], res)
+        self.assertFalse(self.claim_path.exists(), "the claim was released")
+
+    # r16 (adversary r16 A1 on fd258854): the staged manifest's digest and content refusals ran BEFORE its location guard, so a manifest that IS <RunDir>\batch.log (a hard link) was
+    # appended to by the BUILD_MANIFEST_MISMATCH refusal's own log line: the refused input changed. The guard now comes first, and no refusal appends through a linked batch.log.
+    def test_r16_adv_a1_a_staged_manifest_that_is_batch_log_is_never_appended_to_by_its_own_refusal(self) -> None:
+        import hashlib
+        c = "7" * 40
+        cases = {
+            "a wrong (well-formed) digest": ({}, "0" * 64),
+            "a content problem": ({"pendingSymbolPresence": "false"}, None),
+        }
+        for label, (override, digest) in cases.items():
+            with self.subTest(case=label):
+                staged = self.stage(c, "linked build", **override)
+                manifest = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
+                self._fresh_run_dir()
+                os.link(manifest, self.run_dir / "batch.log")
+                before = hashlib.sha256(manifest.read_bytes()).hexdigest()
+                r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c, manifest=digest or staged)]))
+                self.assertEqual(hashlib.sha256(manifest.read_bytes()).hexdigest(), before, "the refused staged manifest was appended to through batch.log: " + r.stderr)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted")
+
+    def test_r16_b2_a_temp_on_a_drive_that_does_not_exist_keeps_the_open_s_stop_and_writes_no_job_into_the_run_dir(self) -> None:
+        free = [c for c in "ZYXWVUTSRQPONMLKJIHGFED" if not os.path.exists(f"{c}:\\")]
+        if not free:
+            self.skipTest("every drive letter is in use")
+        self._assert_redirect_refused_and_nothing_more_in_the_run_dir(f"{free[0]}:\\missing")
+
+    def test_r16_h1_a_loopback_unc_temp_that_is_the_run_dir_gets_no_redirect_there(self) -> None:
+        self._fresh_run_dir()
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._assert_redirect_refused_and_nothing_more_in_the_run_dir(str(self._loopback_unc(self.run_dir)))
+
+    # r12 (adversary r12 A2): TrimEnd('\') turned the drive root C:\ into C:, the drive's current directory, so a root zone was listed from the wrong folder. A real volume root cannot be
+    # written to by a test, so the function that decides it is run on its own: its source is taken from the runner, so this cannot drift from what the runner does.
+    def test_r12_a2_a_drive_root_keeps_its_backslash_when_trailing_separators_are_removed(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("function Remove-TrailingSeparator")
+        end = text.index("\nfunction ", start + 1)
+        script = self.case / "trim-probe.ps1"
+        script.write_text(text[start:end] + "\n" + "\n".join(
+            f"'{raw}' + ' => ' + (Remove-TrailingSeparator '{raw}')" for raw in ("C:\\", "C:\\\\", "d:\\", "C:\\run\\", "C:\\run", "\\\\srv\\share\\", "C:\\a\\b\\\\")) + "\n", encoding="ascii")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        got = [l for l in r.stdout.splitlines() if " => " in l]
+        self.assertEqual(got, ["C:\\ => C:\\", "C:\\\\ => C:\\", "d:\\ => d:\\", "C:\\run\\ => C:\\run", "C:\\run => C:\\run", "\\\\srv\\share\\ => \\\\srv\\share", "C:\\a\\b\\\\ => C:\\a\\b"])
+
+    def test_r12_a2_no_zone_root_or_parent_is_trimmed_with_a_bare_trimend(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("function Get-OutputZones")
+        end = text.index("function Get-OutputNameRefusal")
+        self.assertNotIn(".TrimEnd('\\')", text[start:end].replace(".root.TrimEnd('\\')", "").replace("$parent.TrimEnd('\\')", "").replace("$l.physical.TrimEnd('\\')", ""))
+
+    def test_r5_adv_a1_a_throw_after_a_leg_ran_does_not_record_that_leg_as_not_run(self) -> None:
+        # adversary r5 A1: the new batch catch left the leg whose child had completed (its output file could not be written) in pending, and the summary then said
+        # NOT_RUN for a leg that ran. The leg is recorded LEG_FAILED / reason BATCH_ERROR (its result is unknown); only the legs never started are NOT_RUN.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "leg-01-fx-a-cpu-A-b01-a1.out.txt").mkdir()
+        a = self.commit_a
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "A", a)]))
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        self.assertEqual(len(self.leg_calls()), 1, "the first leg's child ran")
+        res = batch_result(r.stdout)
+        self.assertEqual([(l["name"], l["status"]) for l in res["legs"]], [("01-fx-a-cpu-A", "LEG_FAILED"), ("02-fx-b-cpu-A", "NOT_RUN")], res["legs"])
+        self.assertEqual((res["ran"], res["failed"], res["notRun"], res["stopReason"]), (0, 1, 1, "BATCH_ERROR"))
+        self.assertEqual(res["legs"][0]["reason"], "BATCH_ERROR")
+        [b] = self.batches()
+        self.assertEqual([(l["name"], l["status"]) for l in b["legs"]], [("01-fx-a-cpu-A", "LEG_FAILED")])
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_r5_adv_a2_a_staged_build_the_leg_job_would_reject_is_refused_before_the_claim_and_the_lease(self) -> None:
+        # adversary r5 A2: preflight read the staged manifest's sha256 only. The leg job's validator (Assert-AttrCudaBuildManifest) also needs the manifest to declare
+        # the same sourceCommit, a well-formed dllPairManifestSha256 and a boolean pendingSymbolPresence, so a hash-matching manifest that fails any of them opened a lease first.
+        a, c = self.commit_a, "3" * 40
+        cases = {
+            "declares another commit": {"sourceCommit": "4" * 40},
+            "no sourceCommit": {"sourceCommit": ABSENT},
+            "no dllPairManifestSha256": {"dllPairManifestSha256": ABSENT},
+            "dllPairManifestSha256 malformed": {"dllPairManifestSha256": "xyz"},
+            "no pendingSymbolPresence": {"pendingSymbolPresence": ABSENT},
+            "pendingSymbolPresence is a string": {"pendingSymbolPresence": "false"},
+        }
+        for label, override in cases.items():
+            with self.subTest(case=label):
+                manifest = self.stage(c, "bad build", **override)
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_MANIFEST_MISMATCH item=2 ")
+
+    def test_r5_adv_a2_a_staged_build_that_is_not_json_is_refused(self) -> None:
+        c = "3" * 40
+        cache = self.share / "cache"
+        p = cache / f"playback-attr-3-cuda-{c[:12]}-build.json"
+        p.write_text("this is not json", encoding="utf-8")
+        import hashlib
+        manifest = hashlib.sha256(p.read_bytes()).hexdigest()
+        self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_MANIFEST_MISMATCH item=2 ")
+
+    def test_r5_adv2_a2_a_leg_is_marked_in_flight_at_the_launch_not_before_its_run_line_is_logged(self) -> None:
+        # adversary r5 pass 2 A2: the marker was set before the "LEG .. RUN" log line, so a throw while that line was appended recorded a leg whose child never started as
+        # LEG_FAILED. It is set on the line before the child is launched, after everything that can throw without having started it.
+        text = RUNNER.read_text(encoding="utf-8")
+        run_line, launch = text.index('L "LEG $($leg.name) RUN batch='), text.index("$lp = Invoke-VenueBoundedProcess -FilePath $pwshExe")
+        marks = [i for i in range(len(text)) if text.startswith("$inFlightLeg = $leg", i)]
+        self.assertEqual(len(marks), 1, marks)
+        self.assertTrue(run_line < marks[0] < launch, (run_line, marks, launch))
+        self.assertEqual(text[marks[0]:launch].count("\n"), 1, "nothing between the marker and the launch but the launch's own line")
+
+    def test_r5_adv2_a3_the_staged_manifest_digest_and_facts_come_from_one_read(self) -> None:
+        # adversary r5 pass 2 A3: Get-FileHash and a second read of the same file could pair one version's digest with another's content.
+        text = MODULE.read_text(encoding="utf-8")
+        body = text[text.index("function Get-VenueStagedBuildManifest"):text.index("$script:VenueAbandonedReads = 0")]
+        self.assertEqual(body.count("ReadAllBytes"), 1, body)
+        self.assertNotIn("Get-FileHash", body)
+        self.assertNotIn("ReadAllText", body)
+
+    def test_r5_adv2_a3_a_staged_manifest_with_a_byte_order_mark_is_still_read(self) -> None:
+        c = "5" * 40
+        p = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
+        p.write_bytes(b"\xef\xbb\xbf" + json.dumps({"sourceCommit": c, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **ARTIFACT_SHAS}).encode("utf-8"))
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sha = $r.sha256; problem = $r.contentProblem }\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        import hashlib
+        self.assertEqual(json.loads(out.stdout), {"state": "STAGED", "sha": hashlib.sha256(p.read_bytes()).hexdigest(), "problem": ""})
+
+    def test_r6_adv_a1_preflight_decodes_the_staged_manifest_exactly_as_the_leg_jobs_validator_does(self) -> None:
+        # adversary r6 A1: preflight stripped every leading U+FEFF from a UTF-8 decode and never honoured a UTF-16 BOM, while Assert-AttrCudaBuildManifest reads with
+        # [IO.File]::ReadAllText (one BOM, UTF-16/32 by BOM). A doubled BOM was accepted here and rejected by the leg job after the lease opened; a UTF-16 manifest the
+        # job accepts was refused here. The oracle below is that very read; preflight must agree with it on every input.
+        c = "6" * 40
+        body = json.dumps({"sourceCommit": c, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **ARTIFACT_SHAS})
+        cases = {
+            "no BOM": (body.encode("utf-8"), ""),
+            "one UTF-8 BOM": (b"\xef\xbb\xbf" + body.encode("utf-8"), ""),
+            "two UTF-8 BOMs": (b"\xef\xbb\xbf\xef\xbb\xbf" + body.encode("utf-8"), "ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE"),
+            "UTF-16LE with a BOM": (b"\xff\xfe" + body.encode("utf-16-le"), ""),
+            "UTF-16BE with a BOM": (b"\xfe\xff" + body.encode("utf-16-be"), ""),
+        }
+        p = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
+        for label, (data, expected) in cases.items():
+            with self.subTest(case=label):
+                p.write_bytes(data)
+                script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                          f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30\n"
+                          f"$oracle = try {{ $null -ne ([IO.File]::ReadAllText('{p}') | ConvertFrom-Json) }} catch {{ $false }}\n"
+                          "ConvertTo-Json -Compress -InputObject @{ state = $r.state; problem = [string]$r.contentProblem; validatorParses = $oracle }\n")
+                out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+                self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+                got = json.loads(out.stdout)
+                self.assertEqual(got["state"], "STAGED")
+                self.assertEqual(got["validatorParses"], expected == "", "the oracle (the validator's own read) disagrees with the fixture's expectation")
+                self.assertTrue(got["problem"].startswith(expected), got)
+                self.assertEqual(got["problem"] == "", got["validatorParses"], "preflight and the validator disagree")
+
+    def test_r5_h2_the_interleave_helper_keeps_an_array_valued_item_whole(self) -> None:
+        # key3 H2 (sol): the bare Dequeue() output was enumerated, so one array-valued item came back as its elements.
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            "$items = [object[]]::new(2); $items[0] = @([pscustomobject]@{ arm = 'A' }, [pscustomobject]@{ arm = 'B' }); $items[1] = [pscustomobject]@{ arm = 'A' }\n"
+            "$one = [object[]]::new(1); $one[0] = $items[0]\n"
+            "[ordered]@{ one = @(Get-VenueInterleavedLegPlan -Items $one).Count; two = @(Get-VenueInterleavedLegPlan -Items $items).Count } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"one": 1, "two": 2})
+
+    def test_the_plan_and_the_scalar_form_are_mutually_exclusive(self) -> None:
+        args, e = self.plan_cmd(self.ab_block_plan(), "-SourceCommit", SHA)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.kinds(), [])
+
+    def test_the_interleave_helper(self) -> None:
+        script = (
+            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            "function P([string]$arms) { @($arms.ToCharArray() | ForEach-Object -Begin { $i = 0 } -Process { $i++; [pscustomobject]@{ arm = [string]$_; n = $i } }) }\n"
+            "function S($items) { (@(Get-VenueInterleavedLegPlan -Items $items) | ForEach-Object { \"$($_.arm)$($_.n)\" }) -join ' ' }\n"
+            "[ordered]@{ block = S (P 'AABB'); uneven = S (P 'AAAB'); three = S (P 'AABBCC'); one = S (P 'AAA'); mixed = S (P 'ABBA') } | ConvertTo-Json -Compress\n"
+        )
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"block": "A1 B3 A2 B4", "uneven": "A1 B4 A2 A3", "three": "A1 B3 C5 A2 B4 C6", "one": "A1 A2 A3", "mixed": "A1 B2 A4 B3"})
+
+
+# the runner cases are inherited only for their fixtures: they run once, in their own class (unittest collects callable test_* attributes only)
+for _name in [n for n in vars(VenueLeaseBatchRunnerTests) if n.startswith("test_")]:
+    setattr(VenueLeaseBatchLegPlanTests, _name, None)
+del _name
 
 
 # 2026-10-25 LEASE-BATCH-LEASE-END-TZ-1: the agent's result reaches the runner through ConvertFrom-Json, which on PowerShell 7 turns "endedUtc": "...Z" into a
