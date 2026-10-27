@@ -567,10 +567,30 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Log = Join-Path $dir "$id.log"; Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''; LogUnread = $false; Holder = $null
         Owner = $null; Gone = ''; Tail = ''
     }
+    # heavy-slot ends its own wait (a marked 75) and its admit cap; this bound only catches a hung tool. It is numeric even
+    # when a Library caller passes the minutes as a string, and monotonic, so a wall-clock step cannot move it. It is
+    # computed BEFORE heavy-slot starts: a value it cannot hold (an overflow, NaN, text) is a typed refusal with nothing
+    # launched, never a throw after the launch that skips the stop file (r2 adversary A3).
+    # --wait and --eta are written in the invariant culture: heavy-slot reads only plain decimals ('0.5m'), never the
+    # '0,5m' a de-DE culture writes. An eta that is not a finite number >= 0 is refused here too (r4 adversary A1).
+    $giveUp = $null
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    try {
+        $waitMin = [double]$Options.HeavySlotWaitMinutes
+        $etaMin = [double]$Options.HeavySlotEtaMinutes
+        if (-not ($etaMin -ge 0) -or [double]::IsInfinity($etaMin)) { throw 'HeavySlotEtaMinutes is not a finite number >= 0' }
+        $waitArg = $waitMin.ToString('0.##########', $inv) + 'm'
+        $etaArg = $etaMin.ToString('0.##########', $inv) + 'm'
+        $giveUp = [TimeSpan]::FromMinutes($waitMin + 15)
+    } catch { $why = $_.Exception.Message }
+    if ($null -eq $giveUp) {
+        Write-Output ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} ({3}) utc={4}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
+        exit 2
+    }
     # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a
     # file, never a pipe, so nothing it writes while it holds the slot can block it (adversary A4).
-    $quoted = @($cmd, 'run', '--class', 'shared', '--label', $lease.Label, '--eta', ('{0}m' -f $Options.HeavySlotEtaMinutes),
-        '--wait', ('{0}m' -f $Options.HeavySlotWaitMinutes), '--exit-file', $lease.ExitFile,
+    $quoted = @($cmd, 'run', '--class', 'shared', '--label', $lease.Label, '--eta', $etaArg,
+        '--wait', $waitArg, '--exit-file', $lease.ExitFile,
         '--', $exe, '-NoProfile', '-NonInteractive', '-EncodedCommand', (New-HeavySlotHolder $lease.Ready $lease.Stop)) |
         ForEach-Object { '"' + ([string]$_ -replace '"', '""') + '"' }
     $psi = [System.Diagnostics.ProcessStartInfo]::new($env:ComSpec)
@@ -578,16 +598,6 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     $psi.Arguments = '/d /v:off /s /c "' + ($quoted -join ' ') + ' >"' + $lease.Log + '" 2>&1"'
     $psi.Environment['HEAVY_SLOT_EXPECT_SHA256'] = $expected
     $psi.Environment['HEAVY_SLOT_EXPECT_KEEPER'] = '1'
-    # heavy-slot ends its own wait (a marked 75) and its admit cap; this bound only catches a hung tool. It is numeric even
-    # when a Library caller passes the minutes as a string, and monotonic, so a wall-clock step cannot move it. It is
-    # computed BEFORE heavy-slot starts: a value it cannot hold (an overflow, NaN, text) is a typed refusal with nothing
-    # launched, never a throw after the launch that skips the stop file (r2 adversary A3).
-    $giveUp = $null
-    try { $giveUp = [TimeSpan]::FromMinutes([double]$Options.HeavySlotWaitMinutes + 15) } catch { $why = $_.Exception.Message }
-    if ($null -eq $giveUp) {
-        Write-Output ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} ({2}) utc={3}' -f $Label, $Options.HeavySlotWaitMinutes, ($why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
-        exit 2
-    }
     try { $lease.Process = [System.Diagnostics.Process]::Start($psi) } catch {
         Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=$cmd start-failed: $($_.Exception.Message); building WITHOUT the machine heavy slot (fail open)"
         return $null

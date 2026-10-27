@@ -1543,6 +1543,38 @@ def test_an_out_of_range_identity_in_the_ready_file_is_unreadable_not_a_throw(bo
     assert "state=unreadable" in done.stdout, done.stdout + done.stderr
 
 
+def test_fractional_minutes_reach_heavy_slot_as_plain_decimals_in_any_culture(box) -> None:
+    # r4 adversary 326a0345-A1: a Library caller under de-DE passes 0.5 minutes. heavy-slot reads only ^\d+(\.\d+)?m$, so
+    # '0,5m' would be a usage error (a marked 77, a REQUEUE with nothing built). Both --wait and --eta go out as '0.5m'.
+    done = _library_driver(
+        box,
+        "[cultureinfo]::CurrentCulture = 'de-DE'\n"
+        "$opts.HeavySlotWaitMinutes = 0.5; $opts.HeavySlotEtaMinutes = 0.5\n"
+        "Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs) Write-Output \"built=$Jobs\" }\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 0 and "built=4" in done.stdout, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    argv = call["argv"]
+    assert argv[argv.index("--wait") + 1] == "0.5m" and argv[argv.index("--eta") + 1] == "0.5m", argv
+    assert all(re.match(r"^\d+(\.\d+)?m$", argv[argv.index(flag) + 1]) for flag in ("--wait", "--eta")), argv
+
+
+@pytest.mark.parametrize("value", ["'soon'", "-5", "'NaN'"])
+def test_an_eta_heavy_slot_cannot_read_is_refused_before_heavy_slot_starts(box, value) -> None:
+    # r4 adversary 326a0345-A1 sibling: --eta gets the same pre-launch check as --wait, so a value heavy-slot would reject
+    # is a typed refusal with nothing launched, never a usage exit turned into a REQUEUE.
+    done = _library_driver(
+        box,
+        f"$opts.HeavySlotEtaMinutes = {value}\n"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option HeavySlotWaitMinutes=60 HeavySlotEtaMinutes=" in done.stdout, done.stdout
+    assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
 def test_explicit_empty_inputs_reach_the_guard_as_given(box) -> None:
     # sol hardening (r3b review): _heavy(memory=[]) and sha='' are test inputs, not requests for the defaults.
     done = _heavy(box, "run", ["-Command", _marker_command(box)], sha="", memory=[])
