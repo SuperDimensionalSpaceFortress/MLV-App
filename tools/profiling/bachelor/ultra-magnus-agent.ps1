@@ -1883,38 +1883,58 @@ function Initialize-LeaseProbeWatchdog {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1 r5 (sol r4 S1, adversary r4-e98a2780 A1): a snapshot probe's bound must hold whether or not the agent polls
     # (the pre-launch renew, Confirm-HeavySlotHeldForLaunch and a lease release block without polling). Add-LeaseSlotSnapshot arms one of these on
     # each probe it starts: a thread-pool timer that kills the probe's tree at its bound and records the probe's age at the kill. Nothing ever
-    # waits on it. Compiled once at agent start (never on the wait loop); $false when it cannot be, and the poll's own bound check then stands alone.
+    # waits on it. Compiled once at agent start (never on the wait loop).
+    # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 (sol r5 B4): $false when it cannot be compiled OR its type does not load, and then no snapshot probe
+    # starts at all (Add-LeaseSlotSnapshot: no watchdog, no probe). The timer is armed BEFORE the probe starts and the probe is attached to it
+    # once started (Attach); a timer that fires before the attach kills the probe at the attach.
     if ($null -ne ('MlvApp.Agent.LeaseProbeWatchdog' -as [type])) { return $true }
     try {
         Add-Type -TypeDefinition @"
 namespace MlvApp.Agent {
     public sealed class LeaseProbeWatchdog {
         private readonly object _gate = new object();
-        private readonly System.Diagnostics.Process _proc;
         private readonly System.Diagnostics.Stopwatch _clock;
-        private readonly System.Threading.Tasks.Task _out;
-        private readonly System.Threading.Tasks.Task _err;
+        private System.Diagnostics.Process _proc;
+        private System.Threading.Tasks.Task _out;
+        private System.Threading.Tasks.Task _err;
         private System.Threading.Timer _timer;
         private bool _disarmed;
+        private bool _fired;
         private long _killedAtMs = -1;
-        public LeaseProbeWatchdog(System.Diagnostics.Process proc, System.Diagnostics.Stopwatch clock, long dueMs, System.Threading.Tasks.Task stdout, System.Threading.Tasks.Task stderr) {
-            _proc = proc;
+        public LeaseProbeWatchdog(System.Diagnostics.Stopwatch clock, long dueMs) {
+            if (clock == null) { throw new System.ArgumentNullException("clock"); }
             _clock = clock;
-            _out = stdout;
-            _err = stderr;
             _timer = new System.Threading.Timer(Fire, null, dueMs < 0 ? 0 : dueMs, System.Threading.Timeout.Infinite);
         }
         private void Fire(object state) {
             lock (_gate) {
-                try {
-                    // adversary r5-2ca9f68f A1: the probe is done only when its root has exited AND its output pipes are closed; a root that exited
-                    // leaving a child holding them is not, and Kill(true) on an exited root still ends that child.
-                    if (_disarmed || (_proc.HasExited && _out.IsCompleted && _err.IsCompleted)) { return; }
-                    long age = _clock.ElapsedMilliseconds;
-                    _proc.Kill(true);
-                    _killedAtMs = age;
-                }
-                catch { }
+                _fired = true;
+                if (_proc != null) { KillLocked(); }
+            }
+        }
+        // Called under _gate only.
+        private void KillLocked() {
+            try {
+                // adversary r5-2ca9f68f A1: the probe is done only when its root has exited AND its output pipes are closed; a root that exited
+                // leaving a child holding them is not, and Kill(true) on an exited root still ends that child.
+                if (_disarmed || (_proc.HasExited && _out.IsCompleted && _err.IsCompleted)) { return; }
+                long age = _clock.ElapsedMilliseconds;
+                _proc.Kill(true);
+                _killedAtMs = age;
+            }
+            catch { }
+        }
+        // The started probe; throws (attaching nothing) on a null argument or a second attach. Past its bound already: killed here.
+        public void Attach(System.Diagnostics.Process proc, System.Threading.Tasks.Task stdout, System.Threading.Tasks.Task stderr) {
+            if (proc == null) { throw new System.ArgumentNullException("proc"); }
+            if (stdout == null) { throw new System.ArgumentNullException("stdout"); }
+            if (stderr == null) { throw new System.ArgumentNullException("stderr"); }
+            lock (_gate) {
+                if (_proc != null) { throw new System.InvalidOperationException("a probe is already attached"); }
+                _proc = proc;
+                _out = stdout;
+                _err = stderr;
+                if (_fired) { KillLocked(); }
             }
         }
         // Read under the lock Fire holds for its whole kill, so a probe seen exited is never read as not-yet-killed mid-kill.
@@ -1927,10 +1947,14 @@ namespace MlvApp.Agent {
     }
 }
 "@ -ErrorAction Stop
+        if ($null -eq ('MlvApp.Agent.LeaseProbeWatchdog' -as [type])) {
+            Add-AgentLogLine "quiet-lease: snapshot probe watchdog unavailable (no slot snapshot probe will start): the type did not load"
+            return $false
+        }
         return $true
     }
     catch {
-        Add-AgentLogLine "quiet-lease: snapshot probe watchdog unavailable (the poll's bound check stands alone): $(([string]$_.Exception.Message) -replace '\s+', ' ')"
+        Add-AgentLogLine "quiet-lease: snapshot probe watchdog unavailable (no slot snapshot probe will start): $(([string]$_.Exception.Message) -replace '\s+', ' ')"
         return $false
     }
 }
@@ -2190,6 +2214,9 @@ function Add-LeaseSlotSnapshot {
     # polls. Logging only: nothing here throws, gates or changes a return value,
     # and a failed log line is dropped.
     param([Parameter(Mandatory = $true)][string]$JobId, [Parameter(Mandatory = $true)][string]$Phase, [double]$WaitedSec = 0, [double]$HeadroomSec = [double]::PositiveInfinity)
+    $call = $null
+    $dog = $null
+    $registered = $false
     try {
         # adversary r1 A2: a probe whose answer could only land after a job deadline, the queue ceiling or the lease's own end is not started.
         $skipBelow = if ($script:LeaseSnapshotSkipBelowSec -gt 0) { [double]$script:LeaseSnapshotSkipBelowSec } else { 70.0 }
@@ -2208,19 +2235,37 @@ function Add-LeaseSlotSnapshot {
         # r5 (sol r4 S2): the paths just checked are the ones started (-Python/-Script), never re-resolved: a checked python gone by now is
         # slots=unknown(python not found at its checked path ...), never a PATH search. r5 (sol r4 S1): the clock starts with the probe, and
         # the probe's own watchdog (Initialize-LeaseProbeWatchdog) kills it at its bound whether or not the agent polls.
+        # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 (sol r5 B4): no watchdog, no probe. The watchdog is armed BEFORE the probe starts; a type that did
+        # not compile or load (null) or a constructor that throws starts no probe, and a started probe the watchdog cannot take (Attach throws) is
+        # stopped at once. Each is slots=unknown(watchdog unavailable), and the wait goes on unchanged.
+        $bound = if ($script:LeaseSnapshotProbeSec -gt 0) { [double]$script:LeaseSnapshotProbeSec } else { 30.0 }
+        $dogType = 'MlvApp.Agent.LeaseProbeWatchdog' -as [type]
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        if ($null -ne $dogType) { try { $dog = $dogType::new($clock, [long][Math]::Ceiling($bound * 1000.0)) } catch { $dog = $null } }
+        if ($null -eq $dog) {
+            Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown(watchdog unavailable)"
+            return
+        }
         $call = Start-HeavySlotCli -Arguments @("status", "--slots", "$HeavySlotCount") -Python $HeavySlotPython -Script $HeavySlotScript
         if (-not $call.ok) {
+            $dog.Disarm()
             Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown($(([string]$call.why) -replace '\s+', ' '))"
             return
         }
-        $bound = if ($script:LeaseSnapshotProbeSec -gt 0) { [double]$script:LeaseSnapshotProbeSec } else { 30.0 }
-        $dog = $null
-        $dogType = 'MlvApp.Agent.LeaseProbeWatchdog' -as [type]
-        if ($null -ne $dogType) { try { $dog = $dogType::new($call.proc, $clock, [long][Math]::Ceiling($bound * 1000.0 - $clock.Elapsed.TotalMilliseconds), $call.out, $call.err) } catch { $dog = $null } }
+        try { $dog.Attach($call.proc, $call.out, $call.err) }
+        catch {
+            try { $dog.Disarm() } catch { }
+            Stop-HeavySlotCli -Call $call
+            Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown(watchdog unavailable)"
+            return
+        }
         $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = $JobId; phase = $Phase; call = $call; clock = $clock; dog = $dog })
+        $registered = $true
     }
     catch {
+        # A probe started but never registered (the registration threw) is stopped now: nothing would poll it.
+        try { if (-not $registered -and $null -ne $call -and $call.ok) { Stop-HeavySlotCli -Call $call } } catch { }
+        try { if (-not $registered -and $null -ne $dog) { $dog.Disarm() } } catch { }
         try { Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown(snapshot failed: $(([string]$_.Exception.Message) -replace '\s+', ' '))" } catch { }
     }
 }
@@ -2240,15 +2285,20 @@ function Update-LeaseSlotSnapshots {
     foreach ($s in @($script:LeaseSlotSnapshots.ToArray())) {
         try {
             $st = $null
-            $el = $s.clock.Elapsed.TotalSeconds
             $dog = $s.dog
             # read BEFORE the watchdog's record: a kill it made before this read is then always seen below. Done = the root exited AND its pipes
             # closed (adversary r5-2ca9f68f A1: a root that exited leaving a child holding them is still running).
+            # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 (sol r5 B1): done is sampled ONCE, BEFORE the age, and the outcome comes from these two samples
+            # only, never a re-read. A probe seen done finished no later than the age read after it, so done under the bound is a success; one that
+            # finishes after the done sample is not done here, and the next poll judges it past the bound if it finished past it (sol: sampled at
+            # 29.990 s, done at 30.010 s: a timeout, never a success). Done with the age AT or past the bound is a timeout (seen), by design: when
+            # it finished within the last poll interval is unknown.
             $done = $s.call.proc.HasExited -and $s.call.out.IsCompleted -and $s.call.err.IsCompleted
+            $el = $s.clock.Elapsed.TotalSeconds
             $killedMs = if ($null -ne $dog) { [long]$dog.KilledAtMs } else { [long]-1 }
             if ($killedMs -ge 0) { Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = [string]::Format($inv, "timeout {0} s; killed at {1:F1} s", [long]$bound, $killedMs / 1000.0) } }
             elseif ($el -ge $bound) { $how = if ($done) { "seen" } else { "killed" }; Stop-HeavySlotCli -Call $s.call; $st = @{ ok = $false; lines = @(); error = [string]::Format($inv, "timeout {0} s; {1} at {2:F1} s", [long]$bound, $how, $el) } }
-            elseif ($s.call.proc.HasExited -and $s.call.out.IsCompleted -and $s.call.err.IsCompleted) {
+            elseif ($done) {
                 $r = Receive-HeavySlotCli -Call $s.call
                 $lines = @(([string]$r.stdout) -split "`r?`n" | Where-Object { $_ -ne "" })
                 $st = if ($r.rc -eq 0) { @{ ok = $true; lines = $lines; error = $null } } else { @{ ok = $false; lines = $lines; error = "status exit $($r.rc): $($r.stderr)" } }

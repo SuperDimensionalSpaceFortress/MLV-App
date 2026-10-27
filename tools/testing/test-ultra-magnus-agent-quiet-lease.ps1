@@ -63,6 +63,10 @@ param(
 #               queuedjob-holder-lost-prelaunch, exit-release-pin): the queue-expired exit after admission and the pre-launch
 #               holder-lost refusal release the lease and record that release (leaseRelease) before Exit-HeavySlot, and every
 #               Exit-HeavySlot call site is either preceded by a recorded release or allowlisted with a reason.
+#   snapshot bound hardening - AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r1 (cases lease-snapshot-bound-straddle, lease-probe-watchdog-*): a slot
+#               snapshot probe is classified from one completion sample and the age sampled after it (sol r5 B1), and no probe starts
+#               without an armed watchdog: an Add-Type failure, a type that did not load, a constructor throw, a failed attach, a
+#               failed start and a failed registration each leave no unprotected probe (sol r5 B4).
 # Prints one JSON object with status PASS, or throws.
 
 $ErrorActionPreference = 'Stop'
@@ -799,7 +803,8 @@ try {
         'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin',
         'batch-close-before-reuse', 'batch-runner-killed-liveness', 'lease-pending-heat-trace',
         'lease-heat-trace-async-retry', 'lease-heat-trace-grant-coverage', 'queuedjob-lease-coverage-at-launch', 'lease-heat-trace-nonlocal-feed',
-        'lease-heat-trace-checked-python', 'lease-heat-trace-probe-watchdog')
+        'lease-heat-trace-checked-python', 'lease-heat-trace-probe-watchdog',
+        'lease-snapshot-bound-straddle', 'lease-probe-watchdog-add-type-failure', 'lease-probe-watchdog-ctor-failure', 'lease-probe-watchdog-arm-paths')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -2799,6 +2804,257 @@ function Exit-HeavySlot {
             foreach ($k in @($script:OrphanKids)) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
             $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 0
             if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test case end' }
+        }
+    }
+    # ------------------------------------------------------------ lease-snapshot-bound-straddle (AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r1, sol r5 B1)
+    # A probe's outcome comes from ONE completion sample and the age sampled AFTER it, never a re-read. Sol's shape: bound 30 s, the poll samples
+    # 29.990 s with the probe not done, the probe completes at 30.010 s, and a second completion read accepts a success past the bound. Designed:
+    # done with an age under the bound is a success; done with an age AT or past it is a timeout (seen), since when it finished inside the last
+    # poll interval is unknown; not done past it is a timeout (killed). Controlled dependencies: a fake probe whose completion lands at a chosen
+    # read and a fake clock; the agent's own Update-LeaseSlotSnapshots classifies it (Stop-/Receive-HeavySlotCli stubbed and counted).
+    if (Test-Case 'lease-snapshot-bound-straddle') {
+        $script:BsStopReal = ${function:Stop-HeavySlotCli}; $script:BsRecvReal = ${function:Receive-HeavySlotCli}
+        $bsFails = [System.Collections.Generic.List[string]]::new()
+        try {
+            $script:LeaseSnapshotProbeSec = 30
+            Update-LeaseSlotSnapshots -Abandon 'test case start'
+            function Stop-HeavySlotCli { param($Call) $script:BsStops++ }
+            function Receive-HeavySlotCli { param($Call) $script:BsRecv++; return [pscustomobject]@{ done = $true; rc = 0; stdout = "slot 1: free`nslot 2: free"; stderr = ''; why = $null } }
+            function Add-BsProbe([string]$JobId, [double[]]$Ages, [string]$Land) {
+                # Land: 'start' (done before the poll) | 'age1' (lands right after the first age read) | 'done1' (right after the first completion read) | 'never'
+                $st = [pscustomobject]@{ done = ($Land -eq 'start'); ages = [System.Collections.Generic.Queue[double]]::new([double[]]$Ages); last = 0.0; land = $Land; ageReads = 0; doneReads = 0 }
+                $clock = [pscustomobject]@{ st = $st }
+                $clock | Add-Member -MemberType ScriptProperty -Name Elapsed -Value { $s = $this.st; if ($s.ages.Count -gt 0) { $s.last = $s.ages.Dequeue() }; $s.ageReads++; if ($s.land -eq 'age1' -and $s.ageReads -eq 1) { $s.done = $true }; [TimeSpan]::FromSeconds($s.last) }
+                $proc = [pscustomobject]@{ st = $st }
+                $proc | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $s = $this.st; $d = $s.done; $s.doneReads++; if ($s.land -eq 'done1' -and $s.doneReads -eq 1) { $s.done = $true }; $d }
+                $pipe = [pscustomobject]@{ st = $st }
+                $pipe | Add-Member -MemberType ScriptProperty -Name IsCompleted -Value { $this.st.done }
+                $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = $JobId; phase = 'grant'; call = [pscustomobject]@{ ok = $true; proc = $proc; out = $pipe; err = $pipe }; clock = $clock; dog = $null })
+            }
+            function Invoke-BsPoll([string]$JobId) {
+                $script:BsStops = 0; $script:BsRecv = 0
+                $n0 = $script:Log.Count
+                Update-LeaseSlotSnapshots
+                return [pscustomobject]@{ lines = @($script:Log | Select-Object -Skip $n0 | Where-Object { $_ -like "quiet-lease: slots-snapshot job=$JobId *" }); stops = $script:BsStops; recv = $script:BsRecv; inFlight = @($script:LeaseSlotSnapshots | Where-Object { $_.jobId -eq $JobId }).Count }
+            }
+            $bsOk = ' slots=[slot 1: free; slot 2: free] queued=0'
+            $bsSeen = ' slots=unknown(timeout 30 s; seen at 30.0 s)'
+            $bsRes = [ordered]@{}
+            # (a) sol's replay: sampled not done at 29.990 s; the completion lands right after that completion sample (30.010 s); next poll 30.025 s.
+            # (b) the completion lands between the age sample and the completion sample, so an age read before the completion would be stale.
+            foreach ($land in @('done1', 'age1')) {
+                $j = "jBs-$land"
+                Add-BsProbe $j @(29.990, 30.025) $land
+                $p1 = Invoke-BsPoll $j
+                if ($p1.lines.Count -ne 0 -or $p1.recv -ne 0 -or $p1.inFlight -ne 1) { $bsFails.Add("($land) a completion that lands after the poll's 29.990 s sample is not a success at that poll: lines=[$($p1.lines -join ' || ')] received=$($p1.recv) inFlight=$($p1.inFlight)") }
+                else {
+                    $p2 = Invoke-BsPoll $j
+                    if ($p2.lines.Count -ne 1 -or -not $p2.lines[0].EndsWith($bsSeen) -or $p2.recv -ne 0 -or $p2.inFlight -ne 0) { $bsFails.Add("($land) the next poll (30.025 s) sees it done past the bound, a timeout: lines=[$($p2.lines -join ' || ')] received=$($p2.recv)") }
+                    $bsRes[$land] = @($p2.lines)
+                }
+                $script:LeaseSlotSnapshots.Clear()
+            }
+            # (c) done before the 29.990 s sample: a success.
+            Add-BsProbe 'jBs-in' @(29.990) 'start'
+            $pc = Invoke-BsPoll 'jBs-in'
+            if ($pc.lines.Count -ne 1 -or -not $pc.lines[0].EndsWith($bsOk) -or $pc.recv -ne 1 -or $pc.stops -ne 0) { $bsFails.Add("(in) done with its age under the bound is a success: lines=[$($pc.lines -join ' || ')] received=$($pc.recv) stops=$($pc.stops)") }
+            $script:LeaseSlotSnapshots.Clear()
+            # (d) done, age sampled exactly at the bound: a timeout (seen), by design.
+            Add-BsProbe 'jBs-at' @(30.000) 'start'
+            $pd = Invoke-BsPoll 'jBs-at'
+            if ($pd.lines.Count -ne 1 -or -not $pd.lines[0].EndsWith($bsSeen) -or $pd.recv -ne 0 -or $pd.stops -ne 1) { $bsFails.Add("(at) done with its age sampled at the bound is a timeout (seen): lines=[$($pd.lines -join ' || ')] received=$($pd.recv) stops=$($pd.stops)") }
+            $script:LeaseSlotSnapshots.Clear()
+            # (e) not done past the bound: a timeout (killed).
+            Add-BsProbe 'jBs-past' @(30.010) 'never'
+            $pe = Invoke-BsPoll 'jBs-past'
+            if ($pe.lines.Count -ne 1 -or -not $pe.lines[0].EndsWith(' slots=unknown(timeout 30 s; killed at 30.0 s)') -or $pe.stops -ne 1) { $bsFails.Add("(past) not done past the bound is a timeout (killed): lines=[$($pe.lines -join ' || ')] stops=$($pe.stops)") }
+            $script:LeaseSlotSnapshots.Clear()
+            $bsRes.in = @($pc.lines); $bsRes.at = @($pd.lines); $bsRes.past = @($pe.lines)
+            Assert-True ($bsFails.Count -eq 0) "bound-straddle (sol r5 B1): $($bsFails -join ' ;; ')"
+            $results.leaseSnapshotBoundStraddle = $bsRes
+        }
+        finally {
+            $script:LeaseSlotSnapshots.Clear()
+            Set-Item -LiteralPath Function:\Stop-HeavySlotCli -Value $script:BsStopReal
+            Set-Item -LiteralPath Function:\Receive-HeavySlotCli -Value $script:BsRecvReal
+        }
+    }
+    # ------------------------------------------------------------ lease-probe-watchdog-add-type-failure (AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r1, sol r5 B4)
+    # No watchdog, no probe. The watchdog type is compiled once per process, and this process already has it, so the Add-Type failure runs in a
+    # fresh pwsh: the agent's own Initialize-LeaseProbeWatchdog and Add-LeaseSlotSnapshot, with Add-Type shadowed to throw (throw) or to return
+    # without loading the type (noop: the null type). Start-HeavySlotCli is a counting stub: a call to it is a probe started.
+    if (Test-Case 'lease-probe-watchdog-add-type-failure') {
+        $atFails = [System.Collections.Generic.List[string]]::new()
+        $atChild = @'
+param([string]$Agent, [string]$Mode, [string]$Py)
+$ErrorActionPreference = 'Stop'
+$tk = $null; $pe = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Agent, [ref]$tk, [ref]$pe)
+foreach ($n in @('Initialize-LeaseProbeWatchdog', 'Add-LeaseSlotSnapshot')) {
+    $fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true)
+    . ([scriptblock]::Create($fn.Extent.Text))
+}
+$script:Log = [System.Collections.Generic.List[string]]::new()
+function Add-AgentLogLine([string]$Message) { $script:Log.Add($Message) }
+if ($Mode -eq 'throw') { function Add-Type { throw 'unit: Add-Type failed (no compiler)' } } else { function Add-Type { } }
+function Test-LeaseLocalFixedPath { param([string]$Path, [switch]$LeafLinkOk) return $true }
+$script:Starts = 0
+function Start-HeavySlotCli { param([string[]]$Arguments, [string]$Python = '', [string]$Script = '') $script:Starts++; return [pscustomobject]@{ ok = $true; proc = $null; out = $null; err = $null; started = (Get-Date); why = $null } }
+$HeavySlotScript = $Agent; $HeavySlotPython = $Py; $HeavySlotCount = 2
+$script:LeaseSlotSnapshots = [System.Collections.Generic.List[object]]::new()
+$script:LeaseSnapshotProbeSec = 30
+$script:LeaseSnapshotSkipBelowSec = 70
+$ready = Initialize-LeaseProbeWatchdog
+$typeLoaded = $null -ne ('MlvApp.Agent.LeaseProbeWatchdog' -as [type])
+$threw = $null; $out = @()
+try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $threw = [string]$_.Exception.Message }
+[pscustomobject]@{ ready = [bool]$ready; typeLoaded = $typeLoaded; starts = $script:Starts; registered = $script:LeaseSlotSnapshots.Count; output = $out.Count; threw = $threw; log = @($script:Log) } | ConvertTo-Json -Compress -Depth 4
+'@
+        $atPath = Join-Path $fx 'add-type-failure-child.ps1'
+        [IO.File]::WriteAllText($atPath, $atChild, [Text.UTF8Encoding]::new($false))
+        $pwshExe = (Get-Process -Id $PID).Path
+        $atRes = [ordered]@{}
+        foreach ($mode in @('throw', 'noop')) {
+            $raw = @(& { $ErrorActionPreference = 'Continue'; & $pwshExe -NoProfile -NonInteractive -File $atPath -Agent $agentScript -Mode $mode -Py $Python 2>&1 } | ForEach-Object { [string]$_ })
+            $r = $null; try { $r = ($raw | Where-Object { $_.StartsWith('{') } | Select-Object -Last 1) | ConvertFrom-Json } catch { $r = $null }
+            if ($null -eq $r) { $atFails.Add("($mode) the child reported: $($raw -join ' | ')"); continue }
+            $u = @($r.log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4a *' })
+            if ($r.typeLoaded) { $atFails.Add("($mode) setup: the watchdog type must not load here") }
+            if ($r.ready) { $atFails.Add("($mode) Initialize-LeaseProbeWatchdog reports the watchdog unavailable: ready=$($r.ready)") }
+            if ($r.starts -ne 0 -or $r.registered -ne 0) { $atFails.Add("($mode) no probe is started without a watchdog: Start-HeavySlotCli calls=$($r.starts) registered=$($r.registered)") }
+            if ($u.Count -ne 1 -or $u[0] -notmatch ' phase=request slots=unknown\(watchdog unavailable\)$') { $atFails.Add("($mode) the snapshot line is slots=unknown(watchdog unavailable): [$($u -join ' || ')]") }
+            if ($r.threw -or $r.output -ne 0) { $atFails.Add("($mode) the snapshot neither throws nor returns anything (the wait goes on unchanged): threw=$($r.threw) output=$($r.output)") }
+            $atRes[$mode] = $r
+        }
+        Assert-True ($atFails.Count -eq 0) "watchdog Add-Type failure (sol r5 B4): $($atFails -join ' ;; ')"
+        $results.leaseProbeWatchdogAddTypeFailure = $atRes
+    }
+    # ------------------------------------------------------------ lease-probe-watchdog-ctor-failure (AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r1, sol r5 B4)
+    # The agent's own watchdog constructor throws: its Timer rejects a due time past 4294967294 ms, so a 5,000,000 s bound is a real throw of the
+    # real type. No probe starts (the fake heavy-slot.py logs every status call it gets), the line is slots=unknown(watchdog unavailable), and a
+    # whole wait with both snapshots failing closed admits the job exactly as before.
+    if (Test-Case 'lease-probe-watchdog-ctor-failure') {
+        $ctFails = [System.Collections.Generic.List[string]]::new()
+        try {
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: free', 'slot 2: free') }; $script:StatusDelaySec = 20
+            Reset-Case @{ request = 'active' }
+            Sync-FakeStatus
+            $script:LeaseSnapshotProbeSec = 5000000
+            $n0 = $script:LeaseSlotSnapshots.Count
+            $o1 = @(Add-LeaseSlotSnapshot -JobId 'jB4c' -Phase 'request')
+            $reg = $script:LeaseSlotSnapshots.Count - $n0
+            $null = Wait-Until { @(Get-Calls | Where-Object { $_.cmd -eq 'status' }).Count -gt 0 } 4
+            $sc = @(Get-Calls | Where-Object { $_.cmd -eq 'status' }).Count
+            $l1 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4c *' })
+            if ($reg -ne 0 -or $sc -ne 0) { $ctFails.Add("(probe) no probe is started when the watchdog's constructor throws: registered=$reg statusCalls=$sc") }
+            if ($l1.Count -ne 1 -or $l1[0] -notmatch ' phase=request slots=unknown\(watchdog unavailable\)$') { $ctFails.Add("(probe) the line is slots=unknown(watchdog unavailable): [$($l1 -join ' || ')]") }
+            if ($o1.Count -ne 0) { $ctFails.Add("(probe) the snapshot returns nothing: $($o1.Count)") }
+            Update-LeaseSlotSnapshots -Abandon 'test step'
+            $script:StatusDelaySec = 0
+            Reset-Case @{ request = 'active'; active_after = 0.3 }
+            $script:AgeAfter = (Get-Date).AddSeconds(120)
+            Sync-FakeStatus
+            $admC = Wait-QuietLeaseAdmission -JobId 'jB4w' -Job ([pscustomobject]@{}) -Metadata $meta
+            $script:Admission = $admC
+            $null = Wait-Until { @(Get-Calls | Where-Object { $_.cmd -eq 'status' }).Count -gt 0 } 3
+            $scW = @(Get-Calls | Where-Object { $_.cmd -eq 'status' }).Count
+            $lW = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4w *' })
+            if ($admC.label -cne 'clear' -or $admC.mode -ne 'lease' -or $admC.leaseMinutes -ne 31 -or -not $admC.leaseCoversTimeout) { $ctFails.Add("(wait) the job is admitted on its lease as without the snapshots: $($admC | ConvertTo-Json -Compress -Depth 3)") }
+            if ($scW -ne 0 -or $lW.Count -ne 2 -or @($lW | Where-Object { $_ -match ' phase=(request|grant) slots=unknown\(watchdog unavailable\)$' }).Count -ne 2) { $ctFails.Add("(wait) request and grant each log slots=unknown(watchdog unavailable) and start no probe: statusCalls=$scW [$($lW -join ' || ')]") }
+            Exit-HeavySlot
+            Assert-True ($ctFails.Count -eq 0) "watchdog constructor failure (sol r5 B4): $($ctFails -join ' ;; ')"
+            $results.leaseProbeWatchdogCtorFailure = [ordered]@{ probeLine = $l1; waitLines = $lW; admitted = $admC.label }
+        }
+        finally {
+            $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 0
+            Update-LeaseSlotSnapshots -Abandon 'test case end'
+        }
+    }
+    # ------------------------------------------------------------ lease-probe-watchdog-arm-paths (AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r1, sol r5 B4)
+    # The remedy's own failure paths. The watchdog is armed BEFORE the probe starts (a wrapper around the agent's own Start-HeavySlotCli reads the
+    # snapshot's $dog at the moment of the start) and the started probe is then attached to it, so:
+    #   attach - the started probe cannot be attached (its stderr task is null): it is stopped at once, never registered;
+    #   start  - the probe fails to start: the armed watchdog is disarmed (a probe attached to it later past its bound is not killed);
+    #   early  - the watchdog fires before the attach: the attach kills the probe at once and records the kill;
+    #   list   - the registration throws after the attach: the probe is stopped at once (snapshot failed).
+    if (Test-Case 'lease-probe-watchdog-arm-paths') {
+        $apFails = [System.Collections.Generic.List[string]]::new()
+        $script:ApCliReal = ${function:Start-HeavySlotCli}
+        $apSavedList = $script:LeaseSlotSnapshots
+        $script:ApProcs = [System.Collections.Generic.List[int]]::new()   # pids: the agent disposes the Process objects it stops
+        try {
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: free', 'slot 2: free') }; $script:StatusDelaySec = 300
+            Reset-Case @{ request = 'active' }
+            Sync-FakeStatus
+            $script:ApMode = 'attach'
+            function Start-HeavySlotCli {
+                param([string[]]$Arguments, [string]$Python = '', [string]$Script = '')
+                $script:ApArmed = Get-Variable -Name dog -Scope 1 -ValueOnly -ErrorAction SilentlyContinue
+                if ($script:ApMode -eq 'start') { return [pscustomobject]@{ ok = $false; why = 'unit: start failed' } }
+                $c = & $script:ApCliReal @PSBoundParameters
+                if ($c.ok) { $script:ApProcs.Add($c.proc.Id) }
+                if ($script:ApMode -eq 'attach' -and $c.ok) { return [pscustomobject]@{ ok = $true; proc = $c.proc; out = $c.out; err = $null; started = $c.started; why = $null } }
+                return $c
+            }
+            # attach
+            $script:ApArmed = $null; $script:ApProcs.Clear()
+            $n0 = $script:LeaseSlotSnapshots.Count
+            Add-LeaseSlotSnapshot -JobId 'jB4at' -Phase 'grant'
+            $regA = $script:LeaseSlotSnapshots.Count - $n0
+            $lA = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4at *' })
+            $pA = @($script:ApProcs)
+            if ($null -eq $script:ApArmed) { $apFails.Add('(attach) a watchdog is armed when the probe starts') }
+            if ($regA -ne 0 -or $pA.Count -ne 1 -or -not (Wait-Until { -not (Test-PidAlive $pA[0]) } 3)) { $apFails.Add("(attach) the probe that cannot be attached is stopped at once and not registered: registered=$regA started=$($pA.Count)") }
+            if ($lA.Count -ne 1 -or $lA[0] -notmatch ' phase=grant slots=unknown\(watchdog unavailable\)$') { $apFails.Add("(attach) the line is slots=unknown(watchdog unavailable): [$($lA -join ' || ')]") }
+            Update-LeaseSlotSnapshots -Abandon 'test step'
+            # start
+            $script:ApMode = 'start'; $script:ApArmed = $null; $script:LeaseSnapshotProbeSec = 1
+            Add-LeaseSlotSnapshot -JobId 'jB4st' -Phase 'grant'
+            $dS = $script:ApArmed
+            $lS = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4st *' })
+            if ($lS.Count -ne 1 -or $lS[0] -notmatch ' slots=unknown\(unit: start failed\)$') { $apFails.Add("(start) the start failure is logged as before: [$($lS -join ' || ')]") }
+            if ($null -eq $dS) { $apFails.Add('(start) a watchdog is armed when the probe starts') }
+            else {
+                Start-Sleep -Milliseconds 1500
+                $cS = & $script:ApCliReal -Arguments @('status', '--slots', '2')
+                if ($cS.ok) { $script:ApProcs.Add($cS.proc.Id) }
+                try { $dS.Attach($cS.proc, $cS.out, $cS.err) } catch { $apFails.Add("(start) a disarmed watchdog still takes an attach: $($_.Exception.Message)") }
+                $killedS = $cS.proc.WaitForExit(1500)
+                if ($killedS -or $dS.KilledAtMs -ge 0) { $apFails.Add("(start) the watchdog of a probe that failed to start is disarmed (it kills nothing past its bound): exited=$killedS killedAtMs=$($dS.KilledAtMs)") }
+                if (-not $cS.proc.HasExited) { try { $cS.proc.Kill($true) } catch { } }
+            }
+            # early
+            $dogT = 'MlvApp.Agent.LeaseProbeWatchdog' -as [type]
+            $dE = $null
+            try { $dE = $dogT::new([System.Diagnostics.Stopwatch]::StartNew(), [long]0) } catch { $apFails.Add("(early) the watchdog is constructed before its probe: $($_.Exception.Message)") }
+            if ($null -ne $dE) {
+                Start-Sleep -Milliseconds 300
+                $cE = & $script:ApCliReal -Arguments @('status', '--slots', '2')
+                if ($cE.ok) { $script:ApProcs.Add($cE.proc.Id) }
+                try { $dE.Attach($cE.proc, $cE.out, $cE.err) } catch { $apFails.Add("(early) attach: $($_.Exception.Message)") }
+                $killedE = $cE.proc.WaitForExit(3000)
+                if (-not $killedE -or $dE.KilledAtMs -lt 0) { $apFails.Add("(early) a watchdog that fired before its probe was attached kills it at the attach: exited=$killedE killedAtMs=$($dE.KilledAtMs)") }
+                $dE.Disarm()
+            }
+            # list
+            $script:ApMode = 'list'; $script:ApProcs.Clear(); $script:LeaseSnapshotProbeSec = 30
+            $script:LeaseSlotSnapshots = [pscustomobject]@{ Count = 0 }
+            $script:LeaseSlotSnapshots | Add-Member -MemberType ScriptMethod -Name Add -Value { throw 'unit: registration failed' }
+            Add-LeaseSlotSnapshot -JobId 'jB4ls' -Phase 'grant'
+            $script:LeaseSlotSnapshots = $apSavedList
+            $pL = @($script:ApProcs)
+            $lL = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4ls *' })
+            if ($pL.Count -ne 1 -or -not (Wait-Until { -not (Test-PidAlive $pL[0]) } 3)) { $apFails.Add("(list) a probe whose registration throws is stopped at once: started=$($pL.Count)") }
+            if ($lL.Count -ne 1 -or $lL[0] -notmatch ' slots=unknown\(snapshot failed: .*unit: registration failed.*\)$') { $apFails.Add("(list) the line is snapshot failed: [$($lL -join ' || ')]") }
+            Assert-True ($apFails.Count -eq 0) "watchdog arm paths (sol r5 B4 remedy): $($apFails -join ' ;; ')"
+            $results.leaseProbeWatchdogArmPaths = [ordered]@{ attach = $lA; start = $lS; list = $lL }
+        }
+        finally {
+            $script:LeaseSlotSnapshots = $apSavedList
+            Set-Item -LiteralPath Function:\Start-HeavySlotCli -Value $script:ApCliReal
+            foreach ($k in @($script:ApProcs)) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
+            $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 0
+            Update-LeaseSlotSnapshots -Abandon 'test case end'
         }
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
