@@ -25,6 +25,7 @@
 function Invoke-DirtyFileMove([string]$From, [string]$To) { [System.IO.File]::Move($From, $To) }  # one seam, so a test can stand in for a locked file
 
 function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem, [string]$Ext, [string]$Full, [string]$FirstName = '', [scriptblock]$Guard = $null) {
+    if ($Full -cnotmatch '^[0-9a-f]{64}$') { return @{ Path = $null; Reason = 'bad-digest' } }  # every name below is cut from a lower-case SHA-256; anything else is refused, not thrown (r6 adversary A3)
     $names = @()
     if ($FirstName) { $names += , @($FirstName, '') }
     foreach ($n in 8, 16, 32, 64) { $names += , @("$Stem$($Full.Substring(0, $n))$Ext", $Full.Substring(0, $n)) }
@@ -283,6 +284,12 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         if (-not $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
         $wtReal = Resolve-DirtyRealPath $Wt
         if ($wtReal -match $breaksLine) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-path-control-char" }
+        # Over SMB a path's ancestry ends at its share root, so neither the prefix nor the identity walk can relate two shares where one exposes a folder inside the other
+        # (ReviewRoot$ = D:\repo, ReviewRuns$ = D:\repo\run): a UNC destination is refused when the worktree is UNC as well, and a worktree reached over a share of this machine
+        # is refused like such a destination (r6 adversary A2).
+        $isUnc = { param($p) $p.StartsWith('\\') -and -not $p.StartsWith('\\?\') }
+        if (Test-DirtyUncLocalHost $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-unc-local-host" }
+        if ((& $isUnc $destReal) -and (& $isUnc $wtReal)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-unc-unproven" }
         $wtLock = Lock-DirtyDirectory $wtReal
         if ($onWindows -and $null -eq $wtLock) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-not-held" }
         if ($onWindows -and (Get-DirtyHeldIdentity $wtLock) -cne $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=worktree-identity-changed" }
@@ -387,7 +394,9 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             & git -C $Wt apply --check -R --whitespace=nowarn $patch 2>$null
             $verified = if ($LASTEXITCODE -eq 0) { 'reverse-apply-ok' } else { 'reverse-apply-FAILED' }
         }
-        return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=git -C $(ConvertTo-DirtySingleQuoted $Wt) apply --whitespace=nowarn $(ConvertTo-DirtySingleQuoted $patch)"  # nowarn: apply.whitespace=error would refuse a line with trailing blanks that the saver verified
+        return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=git -C $(ConvertTo-DirtySingleQuoted $Wt) --git-dir $(ConvertTo-DirtySingleQuoted (Join-Path $Wt '.git')) --work-tree $(ConvertTo-DirtySingleQuoted $Wt) apply --whitespace=nowarn $(ConvertTo-DirtySingleQuoted $patch)"
+        # nowarn: apply.whitespace=error would refuse a line with trailing blanks that the saver verified. --git-dir / --work-tree: the saver clears GIT_DIR and GIT_WORK_TREE only
+        # for its own calls, and the command is pasted where they are back; the explicit options beat them (r6 adversary A1).
     }
     catch { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($_.Exception.Message -replace '\s+', ' ')$evidence" }  # a throw after a placement still names what was placed (r4 adversary A2)
     finally {

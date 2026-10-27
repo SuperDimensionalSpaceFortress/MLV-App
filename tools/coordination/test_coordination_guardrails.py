@@ -3131,6 +3131,50 @@ def test_save_dirty_worktree_evidence_reapply_command_survives_apply_whitespace_
 
 
 @dirty_save_only
+def test_save_dirty_worktree_evidence_reapply_command_survives_an_inherited_git_work_tree_and_git_dir(tmp_path):
+    # r6 adversary A1: the saver clears GIT_WORK_TREE / GIT_DIR for its own calls and puts them back, so the advertised command, pasted into that same environment, read the
+    # worktree as a subdirectory of the inherited work tree and skipped src/a.txt with exit 0. The command names its repository and work tree itself.
+    wt, dest = _dirty_save_repo(tmp_path)
+    for inherited in ({"GIT_WORK_TREE": str(tmp_path)}, {"GIT_WORK_TREE": str(tmp_path), "GIT_DIR": str(wt / ".git")}):
+        env = dict(os.environ, **inherited)
+        (wt / "src" / "a.txt").write_text("two\n")
+        out = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command",
+                              f". '{DIRTY_SAVE_LIB}'; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1"], text=True, capture_output=True, env=env)
+        saved = re.search(r" reapply=(git -C .+)$", out.stdout.strip())
+        assert out.stdout.startswith("DIRTY_TREE_SAVED") and saved, (inherited, out.stdout, out.stderr)
+        git(wt, "checkout", "--", "src/a.txt")
+        again = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", saved.group(1)], text=True, capture_output=True, env=env)
+        assert again.returncode == 0 and (wt / "src" / "a.txt").read_text().replace("\r\n", "\n") == "two\n", (inherited, saved.group(1), again.stdout, again.stderr)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="an SMB share spelling is a Windows namespace")
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_unc_spellings_whose_containment_cannot_be_proven(tmp_path):
+    # r6 adversary A2: two shares on one remote server, one a subfolder of the other (ReviewRoot$ = D:\review\repo, ReviewRuns$ = D:\review\repo\run): the prefixes differ and the
+    # destination's ancestry ends at its share root, so nothing related it to the worktree and evidence was written inside it. A UNC destination is therefore refused when the
+    # worktree is also UNC, and a worktree reached over a share of this machine is refused like such a destination. The remote server is modelled by the local-host seam.
+    wt, dest = _dirty_save_repo(tmp_path)
+    drive, rest_wt = os.path.splitdrive(str(wt))
+    rest_dest = os.path.splitdrive(str(dest))[1]
+    unc_wt = f"\\\\localhost\\{drive[0]}$" + rest_wt
+    if not os.path.isdir(unc_wt):
+        pytest.skip("no administrative share on this host")
+    out = dirty_save_pwsh(f"function Test-DirtyUncLocalHost([string]$Path) {{ $false }}; Save-DirtyWorktreeEvidence -Wt '{unc_wt}' -Dest '\\\\127.0.0.1\\{drive[0]}${rest_dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-unc-unproven", (out.stdout, out.stderr)
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{unc_wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.strip() == "DIRTY_TREE_SAVE_FAILED card=C1 reason=worktree-unc-local-host", (out.stdout, out.stderr)
+    assert not list(dest.iterdir())
+
+
+@dirty_save_only
+def test_move_dirty_evidence_returns_a_reason_for_a_digest_it_cannot_name_a_file_after(tmp_path):
+    # r6 adversary A3 (advisory): -Full shorter than 8 hex threw from Substring instead of returning the promised hashtable.
+    out = dirty_save_pwsh(f"$ErrorActionPreference = 'Stop'; foreach ($f in '', 'x', ('A' * 64)) {{ $r = Move-DirtyEvidenceToFreeName -Tmp '{tmp_path / 'none.tmp'}' -Dir '{tmp_path}' -Stem x -Ext .patch -Full $f; "
+                          "Write-Output ('{0}|{1}' -f ($r -is [hashtable]), $r.Reason) }")
+    assert out.stdout.split() == ["True|bad-digest"] * 3, (out.stdout, out.stderr)
+
+
+@dirty_save_only
 def test_dirty_path_helpers_keep_the_drive_root_separator(tmp_path):
     # r5 adversary A6: 'C:' alone is the drive's current directory; a resolved drive root must stay 'C:\' and still contain what is below it.
     out = dirty_save_pwsh("Write-Output (Format-DirtyResolved 'C:\\'); Write-Output (Test-DirtyPathInside -Inner 'C:\\x' -Outer 'C:\\')") if os.name == "nt" else None
