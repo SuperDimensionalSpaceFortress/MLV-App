@@ -113,6 +113,7 @@
 # first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
 # 13 a receipt file could not be written (batch-NN.json or batches.jsonl, e.g. occupied by a directory): RECEIPT_PERSIST_FAILED file=<path> reason=<msg> is logged once per failure, the summary still prints with
 # receiptPersistFailures, and every other code keeps its own meaning (13 replaces only a clean 0), so a lost receipt is never an exit 0. Each receipt is serialized with the live logWriteFailures (the diagnostic itself can fail to log).
+# Once a batch receipt exists, every end prints LEASE_BATCH_RESULT: a log line between batches is best effort, and an input refused at a later claim (exit 2) prints the summary first.
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
 [CmdletBinding(DefaultParameterSetName = 'Scalar')]
 param(
@@ -849,6 +850,32 @@ function Add-Result([object]$Leg, [string]$Status, [hashtable]$Extra) {
     foreach ($k in $Extra.Keys) { $r[$k] = $Extra[$k] }
     $results.Add([pscustomobject]$r)
 }
+# r3 (opus r2b H3): the end of a run in ONE place, so no stop can skip a part of it: the legs never started are NOT_RUN, a receipt that could not be written is never an exit 0, and
+# LEASE_BATCH_RESULT is printed (and tried on batch.log). The normal end and an input-is-output refusal once a batch receipt exists both call it.
+function Write-RunSummary {
+    foreach ($leg in $pending) { Add-Result $leg 'NOT_RUN' @{ verdict = $(if ($script:stopReason) { $script:stopReason } else { 'NOT_RUN' }); reason = 'run-stopped' }; LogBest "LEG $($leg.name) NOT_RUN $($script:stopReason) reason=run-stopped" }
+    $pending.Clear()
+    # A receipt that could not be written is never an exit 0 (13 replaces only a clean 0: every code the outcome selected, 7 included, keeps its own meaning).
+    if ($script:receiptPersistFailures.Count -gt 0 -and $script:exitCode -eq 0) { $script:exitCode = 13; $script:stopReason = 'RECEIPT_PERSIST_FAILED' }
+    $summary = [ordered]@{
+        schema = 'mlv-app/venue-lease-batch-result/v1'; venue = $Venue; runDir = $RunDir; startedUtc = $t0.ToString('o'); finishedUtc = [DateTime]::UtcNow.ToString('o')
+        exitCode = $script:exitCode; stopReason = $script:stopReason; capsSource = $capsReceipt.capsSource; logWriteFailures = $script:logWriteFailures; receiptPersistFailures = @($script:receiptPersistFailures); legs = @($results)
+        ran = @($results | Where-Object { $_.status -ceq 'RAN' }).Count; counted = @($results | Where-Object { $_.status -ceq 'RAN' -and $_.counted }).Count
+        failed = @($results | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($results | Where-Object { $_.status -ceq 'NOT_RUN' }).Count
+        leaseExpired = @($results | Where-Object { $_.status -ceq 'LEASE_EXPIRED' }).Count
+        batches = @($batches | ForEach-Object { [ordered]@{ batch = $_.batch; token = $_.token; leaseId = $_.leaseId; endReason = $_.endReason; legsAttempted = $_.legsAttempted; legsRan = $_.legsRan; legsCounted = $_.legsCounted; retries = $_.retries } })
+    }
+    if ($script:outputRedirect) { $summary.outputRedirect = $script:outputRedirect }
+    if ($legPlanMode) { $summary.legPlan =[ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
+    $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
+    try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch {   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
+        # r7 (sol r6b): the count was serialized before this append, so the append that just failed is counted and the line for stdout is serialized again with it (stdout is the authority when batch.log is broken).
+        Register-LogFailure $_.Exception.Message
+        $summary.logWriteFailures = $script:logWriteFailures
+        $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
+    }
+    Write-Output $resultLine
+}
 
 L "BATCH_RUN_START venue=$Venue legs=$($plan.Count) runDir=$RunDir agentShare=$AgentShare deadline=$($deadline.ToString('o')) threshold=$ThresholdPercent legBudgetSec=$LegBudgetSec leaseMarginSec=$LeaseMarginSec recheckSec=$RecheckSec cooldownSec=$CooldownSec pid=$PID quietScript=$QuietScript legScript=$LegScript umRunScript=$UmRunScript$(if ($legPlanMode) { " legPlan=$($planRecord.legPlan) planOrder=$PlanOrder arms=$($planRecord.arms -join ',') builds=$(@($planRecord.builds).Count)" })"
 
@@ -878,7 +905,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $b.logWriteFailures = $script:logWriteFailures; Write-BatchReceipt $b
             break
         }
-        L "BATCH_WAIT batch=$batchNo reason=$($bw.reason) waitSec=$($bw.waitSec) usedSec=$($bw.usedSec) capSec=$LeaseCapSec budgetSec=$LeaseBudgetSec windowSec=$LeaseBudgetWindowSec cooldownSec=$LeaseCooldownSec (Bachelor's lease caps; not a failure, no claim held)"
+        # r3 (sol r2b B1): this line, CLAIM_LAPSED_IN_GUARD and CLAIM_HELD sit between batches, outside the batch try: a batch.log held after an earlier batch's receipt (or its
+        # RECEIPT_PERSIST_FAILED) threw out of the script here, so the summary and the typed exit were lost. Best effort, like every line a mandatory step follows.
+        LogBest "BATCH_WAIT batch=$batchNo reason=$($bw.reason) waitSec=$($bw.waitSec) usedSec=$($bw.usedSec) capSec=$LeaseCapSec budgetSec=$LeaseBudgetSec windowSec=$LeaseBudgetWindowSec cooldownSec=$LeaseCooldownSec (Bachelor's lease caps; not a failure, no claim held)"
         Start-Sleep -Seconds $bw.waitSec
     }
     # (1) the claim, once per batch. A LIVE claim of another chain is waited out; stale claims are broken once each.
@@ -891,6 +920,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $hit = Get-InputOutputRefusal
         if ($hit) {
             if ($req.granted) { try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { } }
+            # r3 (opus r2b H3): once a batch receipt exists, this refusal ends the run like any other stop: the summary (receiptPersistFailures included) is printed before the typed
+            # exit 2. A location hit turns the write suppression on first (Test-OpenOutputAlias's rule): the refused input may be batch.log itself, so nothing more goes into -RunDir.
+            if ($batches.Count -gt 0) {
+                if ($hit.kind -cne 'content') { $script:RunOutputAliased = $true; $script:batchLog = $null }
+                Set-Stop $(if ($hit.kind -ceq 'content') { $hit.code } elseif ($hit.kind -ceq 'plan') { 'LEG_PLAN_IS_RUN_OUTPUT' } elseif ($hit.kind -ceq 'build') { 'BUILD_MANIFEST_IS_RUN_OUTPUT' } else { 'LEG_SPEC_IS_RUN_OUTPUT' }) 2
+                Write-RunSummary
+            }
             Stop-InputIsOutput $hit
         }
         foreach ($bk in $req.broken) { LogBest "CLAIM_STALE_BROKEN venue=$Venue reason=$($bk.reason) ownerPid=$($bk.claim.ownerPid) runDir=$($bk.claim.runDir) expiresUtc=$($bk.claim.expiresUtc)" }
@@ -899,13 +935,13 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $guardSec = ([DateTime]::UtcNow - $grantReadUtc).TotalSeconds
         if ($req.granted -and $guardSec -ge ($ClaimTtlSec - $ClaimRenewSec)) {
             try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { }
-            L "CLAIM_LAPSED_IN_GUARD batch=$batchNo guardSec=$([int]$guardSec) ttlSec=$ClaimTtlSec renewSec=$ClaimRenewSec (the claim was let go before the keeper started; asked for again)"
+            LogBest "CLAIM_LAPSED_IN_GUARD batch=$batchNo guardSec=$([int]$guardSec) ttlSec=$ClaimTtlSec renewSec=$ClaimRenewSec (the claim was let go before the keeper started; asked for again)"
             if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
             continue
         }
         if ($req.granted) { $claim = $req.claim; break }
         $holder = $(if ($req.claim) { "pid=$($req.claim.ownerPid) runDir=$($req.claim.runDir) purpose=$($req.claim.purpose)" } else { $req.state })
-        if ($holder -cne $lastHolder) { L "CLAIM_HELD batch=$batchNo state=$($req.state) holder $holder -> wait"; $lastHolder = $holder }
+        if ($holder -cne $lastHolder) { LogBest "CLAIM_HELD batch=$batchNo state=$($req.state) holder $holder -> wait"; $lastHolder = $holder }
         if ([DateTime]::UtcNow.AddSeconds($ClaimPollSec) -ge $deadline) { break }
         Start-Sleep -Seconds $ClaimPollSec
     }
@@ -1267,27 +1303,6 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         Write-BatchReceipt $b
     }
 }
-foreach ($leg in $pending) { Add-Result $leg 'NOT_RUN' @{ verdict = $(if ($stopReason) { $stopReason } else { 'NOT_RUN' }); reason = 'run-stopped' }; LogBest "LEG $($leg.name) NOT_RUN $stopReason reason=run-stopped" }
-# A receipt that could not be written is never an exit 0 (13 replaces only a clean 0: every code the outcome selected, 7 included, keeps its own meaning).
-if ($script:receiptPersistFailures.Count -gt 0 -and $exitCode -eq 0) { $exitCode = 13; $stopReason = 'RECEIPT_PERSIST_FAILED' }
-
-$summary = [ordered]@{
-    schema = 'mlv-app/venue-lease-batch-result/v1'; venue = $Venue; runDir = $RunDir; startedUtc = $t0.ToString('o'); finishedUtc = [DateTime]::UtcNow.ToString('o')
-    exitCode = $exitCode; stopReason = $stopReason; capsSource = $capsReceipt.capsSource; logWriteFailures = $script:logWriteFailures; receiptPersistFailures = @($script:receiptPersistFailures); legs = @($results)
-    ran = @($results | Where-Object { $_.status -ceq 'RAN' }).Count; counted = @($results | Where-Object { $_.status -ceq 'RAN' -and $_.counted }).Count
-    failed = @($results | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($results | Where-Object { $_.status -ceq 'NOT_RUN' }).Count
-    leaseExpired = @($results | Where-Object { $_.status -ceq 'LEASE_EXPIRED' }).Count
-    batches = @($batches | ForEach-Object { [ordered]@{ batch = $_.batch; token = $_.token; leaseId = $_.leaseId; endReason = $_.endReason; legsAttempted = $_.legsAttempted; legsRan = $_.legsRan; legsCounted = $_.legsCounted; retries = $_.retries } })
-}
-if ($script:outputRedirect) { $summary.outputRedirect = $script:outputRedirect }
-if ($legPlanMode) { $summary.legPlan =[ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
-$resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch {   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
-    # r7 (sol r6b): the count was serialized before this append, so the append that just failed is counted and the line for stdout is serialized again with it (stdout is the authority when batch.log is broken).
-    Register-LogFailure $_.Exception.Message
-    $summary.logWriteFailures = $script:logWriteFailures
-    $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-}
-Write-Output $resultLine
+Write-RunSummary
 Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned at its timeout would otherwise keep this process alive until it ends
 exit $exitCode
