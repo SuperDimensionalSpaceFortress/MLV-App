@@ -719,18 +719,26 @@ function Start-WindowlessRedirectedProcess {
     catch {
         # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): a child that was created before the pipe copies failed is stopped
         # before the throw. The thrown message and Data.postStartStop name the outcome; on stop-failed Data.process is the undisposed Process.
+        # r3 (sol r2b B1): each disposal below is guarded on its own. A Dispose that throws (a buffered FileStream flushes on Dispose and
+        # propagates the I/O failure) never replaces the exception being delivered and never skips a later disposal: its message is appended
+        # as Data.cleanupErrors, so postStartStop and Data.process always reach the caller.
+        $cause = $_
         $ex = $null
         if ($started) {
             $stop = Stop-ProcessAfterStartFailure -Process $process
-            $ex = [System.InvalidOperationException]::new("$($_.Exception.Message) (after the process started; postStartStop=$stop)", $_.Exception)
+            $ex = [System.InvalidOperationException]::new("$($cause.Exception.Message) (after the process started; postStartStop=$stop)", $cause.Exception)
             $ex.Data["postStartStop"] = $stop
             if ($stop -eq "stop-failed") { $ex.Data["process"] = $process; $process = $null }
         }
-        if ($null -ne $process) { $process.Dispose() }
-        if ($null -ne $outStream) { $outStream.Dispose() }
-        if ($null -ne $errStream) { $errStream.Dispose() }
+        $cleanupErrors = [System.Collections.Generic.List[string]]::new()
+        foreach ($disposable in @($process, $outStream, $errStream)) {
+            if ($null -eq $disposable) { continue }
+            try { $disposable.Dispose() } catch { $cleanupErrors.Add([string]$_.Exception.Message) }
+        }
+        $delivered = if ($null -ne $ex) { $ex } else { $cause.Exception }
+        if ($cleanupErrors.Count -gt 0) { try { $delivered.Data["cleanupErrors"] = @($cleanupErrors) } catch { } }
         if ($null -ne $ex) { throw $ex }
-        throw
+        throw $cause
     }
 }
 
@@ -2064,7 +2072,8 @@ function Invoke-HeavySlotStatus {
         return @{ ok = $false; lines = @(); error = "$msg (postStartStop=$stop)"; postStartStop = $stop; proc = $live }
     }
     finally {
-        if ($null -ne $p) { $p.Dispose() }
+        # r3 (sol r2b B1 class sweep): a throwing Dispose here would replace the typed result just returned (postStartStop=stopped included).
+        if ($null -ne $p) { try { $p.Dispose() } catch { } }
     }
 }
 

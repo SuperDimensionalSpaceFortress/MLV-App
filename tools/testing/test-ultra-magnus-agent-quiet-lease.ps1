@@ -67,6 +67,8 @@ param(
 #               snapshot probe is classified from one completion sample and the age sampled after it (sol r5 B1), and no probe starts
 #               without an armed watchdog: an Add-Type failure, a type that did not load, a constructor throw, a failed attach, a
 #               failed start and a failed registration each leave no unprotected probe (sol r5 B4).
+#               r3 (case lease-start-post-start-cleanup-throws, sol r2b B1): a cleanup Dispose that throws after a post-start failure never
+#               replaces the prepared exception, so the holder and job launch sites still get postStartStop and the child to stop again.
 # Prints one JSON object with status PASS, or throws.
 
 $ErrorActionPreference = 'Stop'
@@ -807,7 +809,7 @@ try {
         'lease-heat-trace-async-retry', 'lease-heat-trace-grant-coverage', 'queuedjob-lease-coverage-at-launch', 'lease-heat-trace-nonlocal-feed',
         'lease-heat-trace-checked-python', 'lease-heat-trace-probe-watchdog',
         'lease-snapshot-bound-straddle', 'lease-probe-watchdog-add-type-failure', 'lease-probe-watchdog-ctor-failure', 'lease-probe-watchdog-arm-paths',
-        'lease-start-post-start-failure')
+        'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
@@ -1128,7 +1130,8 @@ function Exit-HeavySlot {
     # what the verdict sees when the clock passes the deadline there.
     $qjCases = @('notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker', 'notafter-prelaunch-confirm', 'notafter-meta-unreadable',
         'queuedjob-cancel-post-admission', 'notafter-meta-sticky', 'liveness-queuedjob', 'liveness-root-shape',
-        'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'batch-close-before-reuse', 'queuedjob-lease-coverage-at-launch')
+        'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'batch-close-before-reuse', 'queuedjob-lease-coverage-at-launch',
+        'lease-start-post-start-cleanup-throws')
     if (@($qjCases | Where-Object { Test-Case $_ }).Count -gt 0) {
         # STAGE-JOB-LEASE-EXEMPT-1 r2: Invoke-QueuedJob classifies the job through Get-GateExemptClass, which reads both patterns.
         foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult', 'Get-GateExemptClass')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
@@ -3173,6 +3176,90 @@ try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $
             foreach ($k in @($script:PsSeamPids)) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
             $script:StatusDelaySec = 0
             Update-LeaseSlotSnapshots -Abandon 'test case end'
+        }
+    }
+    # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r3 (sol r2b B1): a child that started, then a failed setup, then a cleanup Dispose that throws (a buffered
+    # FileStream flushes on Dispose). Controlled objects, not a real child or a real disk fault: a fake Process whose stop is stopped or stop-failed
+    # and fake out/err streams, one of whose Dispose throws IOException. One table, {out, err} Dispose throws x {stop-failed, stopped}; every cell:
+    #   helper  - Start-WindowlessRedirectedProcess's catch body, replayed from the agent's AST: the exception delivered is the prepared one (never the
+    #             Dispose's), postStartStop is present, Data.process is present on stop-failed, and the other disposal still ran;
+    #   holder  - Start-HeavySlotHolder RUN over that throw (A:2643): on stop-failed it stops the handed-back holder again and writes its release file;
+    #   post    - Start-HeavySlotHolder RUN with a launch whose record setup throws (A:2671): it stops the holder (deleting that call goes RED), keeps
+    #             a stop-failed launch with its release file, and disposes both streams and the process of a stopped one, the throwing one included;
+    #   job     - Invoke-QueuedJob RUN over that throw (A:4330): on stop-failed it stops the handed-back child again; its stderr names postStartStop.
+    # RED on 3d793edb: the Dispose's exception replaced the prepared one (no postStartStop, no Data.process) and skipped the later disposal.
+    if (Test-Case 'lease-start-post-start-cleanup-throws') {
+        $pcFails = [System.Collections.Generic.List[string]]::new()
+        $pcLaunchReal = ${function:Start-WindowlessRedirectedProcess}   # the queued-job cases' stub
+        foreach ($name in @('Start-HeavySlotHolder', 'New-HeavySlotSentinelCommand')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
+        $pcSavedAgentProcess = $script:AgentProcess
+        $script:AgentProcess = [System.Diagnostics.Process]::GetCurrentProcess()   # the sentinel command reads the agent's start time (never run here)
+        $pcFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-WindowlessRedirectedProcess' }, $true)
+        $pcTry = $pcFn.Body.Find({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] }, $true)
+        Assert-True ($null -ne $pcTry -and $pcTry.CatchClauses.Count -eq 1) "Start-WindowlessRedirectedProcess has one try with one catch"
+        $script:PcReplay = [scriptblock]::Create("param(`$process, `$outStream, `$errStream, [bool]`$started)`ntry { throw 'unit: the pipe copy failed after the start' }`ncatch $($pcTry.CatchClauses[0].Body.Extent.Text)")
+        function New-PcFake([string]$Stop, [string]$Throws, [string]$Id = '') {
+            $proc = [pscustomobject]@{ tag = "pc-$([guid]::NewGuid().ToString('N').Substring(0, 8))"; HasExited = $false; Id = $Id; kills = 0; disposed = 0; exits = ($Stop -ceq 'stopped') }
+            $proc | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($t) $this.kills++ }
+            $proc | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) return [bool]$this.exits }
+            $proc | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.disposed++ }
+            $streams = foreach ($n in @('out', 'err')) {
+                $s = [pscustomobject]@{ name = $n; disposed = 0; throws = ($Throws -ceq $n) }
+                $s | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.disposed++; if ($this.throws) { throw [System.IO.IOException]::new('unit: flush failed') } }
+                $s
+            }
+            return [pscustomobject]@{ proc = $proc; out = $streams[0]; err = $streams[1] }
+        }
+        function Get-PcDataValue($Exception, [string]$Key) { try { return $Exception.Data[$Key] } catch { return $null } }
+        $pcRows = [ordered]@{}
+        try {
+            foreach ($cell in @(@('out', 'stop-failed'), @('err', 'stop-failed'), @('out', 'stopped'), @('err', 'stopped'))) {
+                $throws = $cell[0]; $stop = $cell[1]; $c = "$throws/$stop"; $k = "$($throws.Substring(0, 1))$(if ($stop -ceq 'stopped') { 's' } else { 'f' })"
+                # helper
+                $f = New-PcFake $stop $throws
+                $got = $null
+                try { & $script:PcReplay $f.proc $f.out $f.err $true } catch { $got = $_.Exception }
+                $gotProc = Get-PcDataValue $got 'process'
+                if ($got -isnot [System.InvalidOperationException] -or [string](Get-PcDataValue $got 'postStartStop') -cne $stop) { $pcFails.Add("($c helper) the prepared exception is delivered with postStartStop=${stop}: got $(if ($null -ne $got) { $got.GetType().Name }) [$(if ($null -ne $got) { $got.Message })]") }
+                if ($stop -ceq 'stop-failed' -and ($null -eq $gotProc -or [string]$gotProc.tag -cne $f.proc.tag)) { $pcFails.Add("($c helper) Data.process is the undisposed child: present=$($null -ne $gotProc)") }
+                if ($stop -ceq 'stopped' -and ($null -ne $gotProc -or $f.proc.disposed -ne 1)) { $pcFails.Add("($c helper) a stopped child is disposed, not handed back: handed=$($null -ne $gotProc) disposed=$($f.proc.disposed)") }
+                if ($f.out.disposed -ne 1 -or $f.err.disposed -ne 1) { $pcFails.Add("($c helper) both streams are disposed when one Dispose throws: out=$($f.out.disposed) err=$($f.err.disposed)") }
+                if (@(Get-PcDataValue $got 'cleanupErrors') -join ' ' -notmatch 'flush failed') { $pcFails.Add("($c helper) the Dispose failure is appended as Data.cleanupErrors: [$(@(Get-PcDataValue $got 'cleanupErrors') -join ' | ')]") }
+                # holder (A:2643)
+                $script:PcF = New-PcFake $stop $throws
+                function Start-WindowlessRedirectedProcess { param([string]$FilePath, [string[]]$ArgumentList, [string]$OutFile, [string]$ErrFile, [string]$WorkingDirectory, [hashtable]$Environment) & $script:PcReplay $script:PcF.proc $script:PcF.out $script:PcF.err $true }
+                $h = Start-HeavySlotHolder -JobId "jPcH$k" -Label 'unit pc'
+                $hRel = @(Get-ChildItem -LiteralPath $fx -Filter "jPcH$k.*.release" -File -ErrorAction SilentlyContinue)
+                if ($null -eq $h -or $h.ok -ne $false) { $pcFails.Add("($c holder) ok=False: $($h | ConvertTo-Json -Compress -Depth 2)") }
+                if ($stop -ceq 'stop-failed' -and ($script:PcF.proc.kills -ne 2 -or $hRel.Count -ne 1)) { $pcFails.Add("($c holder) the handed-back holder is stopped again and its release file written: kills=$($script:PcF.proc.kills) release=$($hRel.Count) why=[$($h.why)]") }
+                if ($stop -ceq 'stopped' -and ($script:PcF.proc.kills -ne 1 -or [string]$h.why -notmatch 'postStartStop=stopped')) { $pcFails.Add("($c holder) a stopped holder is reported stopped: kills=$($script:PcF.proc.kills) why=[$($h.why)]") }
+                # post (A:2671): the launch returned; Get-ProcessIdentity's [int] binding of a non-numeric pid throws inside the record setup.
+                $script:PcF = New-PcFake $stop $throws 'unit-not-a-pid'
+                function Start-WindowlessRedirectedProcess { param([string]$FilePath, [string[]]$ArgumentList, [string]$OutFile, [string]$ErrFile, [string]$WorkingDirectory, [hashtable]$Environment) return [pscustomobject]@{ Process = $script:PcF.proc; OutStream = $script:PcF.out; ErrStream = $script:PcF.err } }
+                $hp = Start-HeavySlotHolder -JobId "jPcP$k" -Label 'unit pc'
+                $pRel = @(Get-ChildItem -LiteralPath $fx -Filter "jPcP$k.*.release" -File -ErrorAction SilentlyContinue)
+                $pp = $script:PcF
+                if ($null -eq $hp -or $hp.ok -ne $false -or [string]$hp.postStartStop -cne $stop -or $pp.proc.kills -ne 1) { $pcFails.Add("($c post) the holder is stopped once and reported postStartStop=${stop}: ok=$($hp.ok) postStartStop=$($hp.postStartStop) kills=$($pp.proc.kills)") }
+                if ($stop -ceq 'stop-failed' -and ($null -eq $hp.launch -or [string]$hp.launch.Process.tag -cne $pp.proc.tag -or $pRel.Count -ne 1 -or $pp.out.disposed + $pp.err.disposed + $pp.proc.disposed -ne 0)) { $pcFails.Add("($c post) a stop-failed holder is kept undisposed with its release file: launch=$($null -ne $hp.launch) release=$($pRel.Count) disposed=$($pp.out.disposed)/$($pp.err.disposed)/$($pp.proc.disposed)") }
+                if ($stop -ceq 'stopped' -and ($null -ne $hp.launch -or $pp.out.disposed -ne 1 -or $pp.err.disposed -ne 1 -or $pp.proc.disposed -ne 1)) { $pcFails.Add("($c post) a stopped holder's streams and process are all disposed: launch=$($null -ne $hp.launch) disposed=$($pp.out.disposed)/$($pp.err.disposed)/$($pp.proc.disposed)") }
+                # job (A:4330)
+                $job = Reset-QueuedJobCase @{ request = 'active' } "jPcJ$k" (New-NotAfterMetaJson 600)
+                $script:PcF = New-PcFake $stop $throws
+                function Start-WindowlessRedirectedProcess { param([string]$FilePath, [string[]]$ArgumentList, [string]$OutFile, [string]$ErrFile, [string]$WorkingDirectory, [hashtable]$Environment) $script:QJ.launches.Add("$FilePath $($ArgumentList -join ' ')"); & $script:PcReplay $script:PcF.proc $script:PcF.out $script:PcF.err $true }
+                try { $null = Invoke-QueuedJob -Job $job } finally { Exit-HeavySlot }
+                $jp = @($script:QJ.published)
+                if ($script:QJ.launches.Count -ne 1 -or $jp.Count -ne 1 -or [string]$jp[0].stderr -notmatch "postStartStop=$stop") { $pcFails.Add("($c job) the launch is reached once and its stderr names postStartStop=${stop}: launches=$($script:QJ.launches.Count) stderr=[$(if ($jp.Count -gt 0) { $jp[0].stderr })]") }
+                if ($stop -ceq 'stop-failed' -and ($script:PcF.proc.kills -ne 2 -or $script:PcF.proc.disposed -ne 1)) { $pcFails.Add("($c job) the handed-back child is stopped again and then disposed: kills=$($script:PcF.proc.kills) disposed=$($script:PcF.proc.disposed)") }
+                if ($stop -ceq 'stopped' -and $script:PcF.proc.kills -ne 1) { $pcFails.Add("($c job) a stopped child is not stopped again: kills=$($script:PcF.proc.kills)") }
+                $pcRows[$c] = [ordered]@{ delivered = $(if ($null -ne $got) { $got.GetType().Name }); postStartStop = (Get-PcDataValue $got 'postStartStop'); holderWhy = $h.why; post = $hp.postStartStop }
+            }
+            Assert-True ($pcFails.Count -eq 0) "post-start handoff survives a throwing cleanup Dispose (sol r2b B1): $($pcFails -join ' ;; ')"
+            $results.leaseStartPostStartCleanupThrows = $pcRows
+        }
+        finally {
+            Set-Item -LiteralPath Function:\Start-WindowlessRedirectedProcess -Value $pcLaunchReal
+            $script:AgentProcess = $pcSavedAgentProcess
+            foreach ($f2 in @(Get-ChildItem -LiteralPath $fx -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'jPc[HP]*' })) { Remove-Item -LiteralPath $f2.FullName -Force -ErrorAction SilentlyContinue }
         }
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
