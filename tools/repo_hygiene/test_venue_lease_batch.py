@@ -2131,8 +2131,18 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         [b] = self.batches()
         self.assertEqual(b["endReason"], "BATCH_ERROR")
 
-    def _lock_log_once_the_claim_is_taken(self, log: Path, give_up_s: float = 120) -> tuple[threading.Event, threading.Thread]:
-        """Take `log` with share mode 0 as soon as the venue claim file exists, and hold it until the returned event is set. Windows only (CreateFileW)."""
+    def _runner_paused_at_claim_taken(self) -> tuple[Path, Path, Path]:
+        """A copy of the runner that PAUSES when it is about to log CLAIM_TAKEN: it writes `paused` and waits (at most 60 s) for `locked` to appear. Returns (runner, paused, locked).
+        Dot on #684: the lock helper used to poll for the claim file and hope to win the race with the runner's next log line; the handshake makes the order a fact."""
+        paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
+        anchor = "function L([string]$Message) {\n"
+        pause = (f"    if ($Message -like 'CLAIM_TAKEN*') {{ Set-Content -LiteralPath '{paused}' -Value 'paused'; $w = [DateTime]::UtcNow.AddSeconds(60); "
+                 f"while (-not (Test-Path -LiteralPath '{locked}') -and [DateTime]::UtcNow -lt $w) {{ Start-Sleep -Milliseconds 20 }} }}\n")
+        return self._patched_runner(anchor, anchor + pause), paused, locked
+
+    def _lock_log_while_the_runner_is_paused(self, log: Path, paused: Path, locked: Path, give_up_s: float = 120) -> tuple[threading.Event, threading.Thread]:
+        """Wait for the runner's `paused` marker, take `log` with share mode 0, write the `locked` marker (the runner resumes only now), and hold the lock until the returned event
+        is set. Windows only (CreateFileW). The marker is the only thing waited on; a lock that cannot be taken still writes `locked` so the runner never waits out its 60 s."""
         import ctypes
         from ctypes import wintypes
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -2143,14 +2153,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
         def hold() -> None:
             end = time.monotonic() + give_up_s
-            while not done.is_set() and time.monotonic() < end:
-                if self.claim_path.exists() and log.exists():
-                    h = k32.CreateFileW(str(log), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
-                    if h != wintypes.HANDLE(-1).value:
-                        done.wait(give_up_s)
-                        k32.CloseHandle(h)
-                        return
-                time.sleep(0.02)
+            while not paused.exists() and not done.is_set() and time.monotonic() < end:
+                done.wait(0.01)
+            h = k32.CreateFileW(str(log), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
+            locked.write_text("locked" if h != wintypes.HANDLE(-1).value else "lock-failed", encoding="utf-8")
+            if h != wintypes.HANDLE(-1).value:
+                done.wait(give_up_s)
+                k32.CloseHandle(h)
 
         t = threading.Thread(target=hold, daemon=True)
         t.start()
@@ -2162,7 +2171,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "batch.log").write_text("", encoding="utf-8")
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
-        done, t = self._lock_log_once_the_claim_is_taken(self.run_dir / "batch.log")
+        runner, paused, locked = self._runner_paused_at_claim_taken()
+        args[args.index("-File") + 1] = str(runner)
+        done, t = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", paused, locked)
         t0 = time.monotonic()
         try:
             r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
@@ -2172,6 +2183,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             elapsed = time.monotonic() - t0
             done.set()
             t.join(5)
+        self.assertEqual(locked.read_text(encoding="utf-8"), "locked", "the handshake: the runner paused before CLAIM_TAKEN and resumed only once the lock was held")
         self.assertLess(elapsed, 60, "bounded: the lock must not stretch the run")
         self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
         self.assertFalse(self.claim_path.exists(), "the claim was left behind")
@@ -2279,6 +2291,98 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual((b["endReason"], b["preOpenWait"]["reason"]), ("DEADLINE", "BUDGET"))
         self.assertEqual(b["logWriteFailures"], 1, "the BATCH_END failure is in the receipt written for that batch")
         self.assertEqual(batch_result(r.stdout)["logWriteFailures"], 1)
+
+    # LEASE-BATCH-RECEIPT-PERSIST-FAILURE-REPORTING-1 (Dot B6 on #684, DISTINGUISHed to this card): a receipt file the run cannot write (batches.jsonl, batch-NN.json or leg-plan.json
+    # occupied by a DIRECTORY) used to throw out of Write-BatchReceipt, which sits in the batch's finally (or, pre-claim, outside any try): the summary was skipped and the exit was
+    # an unhandled 1 instead of the typed code the outcome had selected. The error evidence is kept, said once as RECEIPT_PERSIST_FAILED, and the typed code is still the exit.
+    def _occupy_with_directory(self, *names: str) -> None:
+        for n in names:
+            (self.run_dir / n).mkdir(parents=True, exist_ok=True)
+
+    def _assert_persist_failure_said(self, r: subprocess.CompletedProcess, res: dict, *names: str) -> None:
+        for n in names:
+            want = f"RECEIPT_PERSIST_FAILED file={self.run_dir / n} reason="
+            self.assertIn(want, r.stdout, f"the typed line for {n}: {r.stdout}")
+            self.assertTrue(any(f["file"] == str(self.run_dir / n) and f["reason"] for f in res["receiptPersistFailures"]), res.get("receiptPersistFailures"))
+        self.assertEqual(len(res["receiptPersistFailures"]), len(names), res["receiptPersistFailures"])
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_persist_a_post_claim_batch_error_with_batches_jsonl_a_directory_still_emits_the_summary_and_exits_12(self) -> None:
+        # leg-plan.json is a directory: the plan write after the claim throws (BATCH_ERROR, exit 12). batches.jsonl is a directory too, so the receipt append in the finally threw
+        # out of it: no summary, exit 1. Now: the summary names the unwritten receipt, the in-memory results are kept, and the exit is the BATCH_ERROR 12.
+        self._occupy_with_directory("leg-plan.json", "batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (12, "BATCH_ERROR", 0, 4))
+        self._assert_persist_failure_said(r, res, "batches.jsonl")
+        self.assertEqual([x["endReason"] for x in res["batches"]], ["BATCH_ERROR"], "the in-memory batch row is kept")
+        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "the receipt that could be written was written")
+
+    def test_persist_a_post_claim_batch_error_with_only_leg_plan_json_a_directory_is_still_exit_12_with_a_summary(self) -> None:
+        # the sibling that already held: leg-plan.json alone is the BATCH_ERROR trigger and every receipt writes, so nothing is reported as a persist failure
+        self._occupy_with_directory("leg-plan.json")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
+        self.assertEqual(res["receiptPersistFailures"], [])
+        [b] = self.batches()
+        self.assertEqual(b["endReason"], "BATCH_ERROR")
+
+    def test_persist_a_pre_claim_deadline_with_batches_jsonl_and_leg_plan_json_directories_still_emits_the_summary_and_exits_3(self) -> None:
+        # the pre-claim DEADLINE exit (the 3 h budget is spent) wrote its receipt outside any try: an unwritable batches.jsonl threw out of the script. leg-plan.json as a directory is
+        # never touched on this path (it is written once the claim is held) and must change nothing.
+        self.claims.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        rows = [{"venue": "bachelor", "leaseId": "old-1", "startUtc": utc_iso(now - timedelta(minutes=105)), "endUtc": utc_iso(now - timedelta(minutes=60))},
+                {"venue": "bachelor", "leaseId": "old-2", "startUtc": utc_iso(now - timedelta(minutes=45)), "endUtc": utc_iso(now - timedelta(minutes=1))}]
+        (self.claims / "bachelor.lease-ledger.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
+        self._occupy_with_directory("leg-plan.json", "batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (3, "DEADLINE", 0, 4))
+        self._assert_persist_failure_said(r, res, "batches.jsonl")
+        self.assertEqual(self.kinds(), [], "no claim, no open")
+
+    def test_persist_an_otherwise_successful_batch_whose_receipt_cannot_be_written_exits_13_with_the_summary(self) -> None:
+        # nothing else went wrong: every leg ran. The receipt is not on disk, so the run must not claim success: exit 13, the legs still reported as RAN in the summary.
+        self._occupy_with_directory("batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["counted"], res["notRun"]), (13, "RECEIPT_PERSIST_FAILED", 4, 4, 0))
+        self._assert_persist_failure_said(r, res, "batches.jsonl")
+        self.assertEqual([x["endReason"] for x in res["batches"]], ["ALL_LEGS_DONE"])
+        self.assertTrue((self.run_dir / "batch-01.json").is_file())
+
+    def test_persist_a_batch_receipt_file_that_is_a_directory_is_reported_and_the_jsonl_line_is_still_written(self) -> None:
+        # the two receipt writes are independent: batch-01.json failing must not skip the batches.jsonl line (the other copy of the same record)
+        self._occupy_with_directory("batch-01.json")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["ran"]), (13, 4))
+        self._assert_persist_failure_said(r, res, "batch-01.json")
+        [b] = self.batches()
+        self.assertEqual(b["endReason"], "ALL_LEGS_DONE")
+
+    def test_persist_a_leg_failure_keeps_its_exit_7_when_the_receipt_cannot_be_written_either(self) -> None:
+        # 13 replaces only a clean 0: a run that already selected a failing code keeps it, and the summary still names the unwritten receipt
+        self._occupy_with_directory("batches.jsonl")
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), FAKE_LEG_MODES="exit3")
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["failed"]), (7, None, 1))
+        self._assert_persist_failure_said(r, res, "batches.jsonl")
+
+    def test_persist_a_clean_run_reports_no_persist_failure(self) -> None:
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["receiptPersistFailures"], res["logWriteFailures"]), (0, [], 0))
+        self.assertNotIn("RECEIPT_PERSIST_FAILED", r.stdout)
 
     def test_r7_adv_a1_a_direct_log_line_that_cannot_be_appended_is_counted_and_said(self) -> None:
         # adversary r7 A1: L's own append threw into the batch catch without Register-LogFailure, so a held batch.log at CLAIM_TAKEN turned a healthy batch into

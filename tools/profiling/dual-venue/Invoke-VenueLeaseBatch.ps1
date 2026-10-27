@@ -111,6 +111,8 @@
 # OPEN_JOB_WRITE_FAILED, no cancel, no close, no ledger charge); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
 # 7a); 12 an unexpected throw inside a batch after its claim was taken (BATCH_ERROR: the claim keeper is stopped, the claim released and the batch receipt written
 # first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
+# 13 a receipt file could not be written (batch-NN.json or batches.jsonl, e.g. occupied by a directory): RECEIPT_PERSIST_FAILED file=<path> reason=<msg> is logged once per failure, the summary still prints with
+# receiptPersistFailures, and every other code keeps its own meaning (13 replaces only a clean 0), so a lost receipt is never an exit 0.
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
 [CmdletBinding(DefaultParameterSetName = 'Scalar')]
 param(
@@ -792,13 +794,25 @@ $exitCode = 0
 $stopReason = $null
 $legBudget = $LegBudgetSec
 $batchNo = 0
+# LEASE-BATCH-RECEIPT-PERSIST-FAILURE-REPORTING-1 (Dot B6 on #684): a receipt file the run cannot write (batches.jsonl or batch-NN.json occupied by a directory, a held or full disk) is a
+# RESULT, not a throw. Each write is tried on its own; a failure keeps the in-memory row ($batches) and its error here, is logged once as RECEIPT_PERSIST_FAILED file=<path> reason=<msg>,
+# and reaches the summary (receiptPersistFailures) and the exit code (13 when nothing worse was selected), so the summary is never skipped and a lost receipt is never exit 0.
+$script:receiptPersistFailures = [System.Collections.Generic.List[object]]::new()
+function Write-ReceiptFile([int]$Batch, [string]$Path, [scriptblock]$Write) {
+    try { & $Write } catch {
+        $why = ($_.Exception.Message -replace '\s+', ' ')
+        $script:receiptPersistFailures.Add([ordered]@{ batch = $Batch; file = $Path; reason = $why })
+        LogBest "RECEIPT_PERSIST_FAILED file=$Path reason=$why"
+    }
+}
 function Write-BatchReceipt([System.Collections.IDictionary]$B) {
     $B.endedUtc = [DateTime]::UtcNow.ToString('o')
     $rec = [pscustomobject]$B
     if ($script:RunOutputAliased) { [Console]::Error.WriteLine("BATCH_RECEIPT_NOT_WRITTEN batch=$($B.batch) (an accepted input is a runner output; nothing more is written into -RunDir) $($rec | ConvertTo-Json -Compress -Depth 8)"); $batches.Add($rec); return }
-    [IO.File]::WriteAllText((Join-Path $RunDir ('batch-{0:00}.json' -f $B.batch)), ($rec | ConvertTo-Json -Depth 8) + "`n", [Text.UTF8Encoding]::new($false))
-    Add-Content -LiteralPath (Join-Path $RunDir 'batches.jsonl') -Value ($rec | ConvertTo-Json -Compress -Depth 8)
-    $batches.Add($rec)
+    $batches.Add($rec)   # the in-memory row first: the summary reports it whatever the files do
+    $perBatch = Join-Path $RunDir ('batch-{0:00}.json' -f $B.batch); $jsonl = Join-Path $RunDir 'batches.jsonl'
+    Write-ReceiptFile $B.batch $perBatch { [IO.File]::WriteAllText($perBatch, ($rec | ConvertTo-Json -Depth 8) + "`n", [Text.UTF8Encoding]::new($false)) }
+    Write-ReceiptFile $B.batch $jsonl { Add-Content -LiteralPath $jsonl -Value ($rec | ConvertTo-Json -Compress -Depth 8) -ErrorAction Stop }
 }
 # BACHELOR-DEDICATED-CAPS-RUNNER-1: the caps are Bachelor's heavy-slot.lease.json (the owner moves them), so they are READ, not mirrored: one light exempt job
 # (GateExemptJobPattern ^venue-quiet-probe-: no lease, no slot, no venue claim) prints the file; anything unreadable or invalid is the old constants (the tightest ever
@@ -1247,10 +1261,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
     }
 }
 foreach ($leg in $pending) { Add-Result $leg 'NOT_RUN' @{ verdict = $(if ($stopReason) { $stopReason } else { 'NOT_RUN' }); reason = 'run-stopped' }; LogBest "LEG $($leg.name) NOT_RUN $stopReason reason=run-stopped" }
+# A receipt that could not be written is never an exit 0 (13 replaces only a clean 0: every code the outcome selected, 7 included, keeps its own meaning).
+if ($script:receiptPersistFailures.Count -gt 0 -and $exitCode -eq 0) { $exitCode = 13; $stopReason = 'RECEIPT_PERSIST_FAILED' }
 
 $summary = [ordered]@{
     schema = 'mlv-app/venue-lease-batch-result/v1'; venue = $Venue; runDir = $RunDir; startedUtc = $t0.ToString('o'); finishedUtc = [DateTime]::UtcNow.ToString('o')
-    exitCode = $exitCode; stopReason = $stopReason; capsSource = $capsReceipt.capsSource; logWriteFailures = $script:logWriteFailures; legs = @($results)
+    exitCode = $exitCode; stopReason = $stopReason; capsSource = $capsReceipt.capsSource; logWriteFailures = $script:logWriteFailures; receiptPersistFailures = @($script:receiptPersistFailures); legs = @($results)
     ran = @($results | Where-Object { $_.status -ceq 'RAN' }).Count; counted = @($results | Where-Object { $_.status -ceq 'RAN' -and $_.counted }).Count
     failed = @($results | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($results | Where-Object { $_.status -ceq 'NOT_RUN' }).Count
     leaseExpired = @($results | Where-Object { $_.status -ceq 'LEASE_EXPIRED' }).Count
