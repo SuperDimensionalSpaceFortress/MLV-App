@@ -2131,12 +2131,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         [b] = self.batches()
         self.assertEqual(b["endReason"], "BATCH_ERROR")
 
-    def _runner_paused_at_claim_taken(self) -> tuple[Path, Path, Path]:
-        """A copy of the runner that PAUSES when it is about to log CLAIM_TAKEN: it writes `paused` and waits (at most 60 s) for `locked` to appear. Returns (runner, paused, locked).
-        Dot on #684: the lock helper used to poll for the claim file and hope to win the race with the runner's next log line; the handshake makes the order a fact."""
+    def _runner_paused_at_claim_taken(self, message: str = "CLAIM_TAKEN") -> tuple[Path, Path, Path]:
+        """A copy of the runner that PAUSES when it is about to log a line starting `message` (CLAIM_TAKEN by default): it writes `paused` and waits (at most 60 s) for `locked` to appear.
+        Returns (runner, paused, locked). Dot on #684: the lock helper used to poll for the claim file and hope to win the race with the runner's next log line; the handshake makes the order a fact."""
         paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
         anchor = "function L([string]$Message) {\n"
-        pause = (f"    if ($Message -like 'CLAIM_TAKEN*') {{ Set-Content -LiteralPath '{paused}' -Value 'paused'; $w = [DateTime]::UtcNow.AddSeconds(60); "
+        pause = (f"    if ($Message -like '{message}*') {{ Set-Content -LiteralPath '{paused}' -Value 'paused'; $w = [DateTime]::UtcNow.AddSeconds(60); "
                  f"while (-not (Test-Path -LiteralPath '{locked}') -and [DateTime]::UtcNow -lt $w) {{ Start-Sleep -Milliseconds 20 }} }}\n")
         return self._patched_runner(anchor, anchor + pause), paused, locked
 
@@ -2367,6 +2367,29 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self._assert_persist_failure_said(r, res, "batch-01.json")
         [b] = self.batches()
         self.assertEqual(b["endReason"], "ALL_LEGS_DONE")
+
+    def test_persist_adv_a1_a_log_failure_in_the_persist_diagnostic_is_counted_in_the_receipt_written_after_it(self) -> None:
+        # adversary r1 A1: the batch snapshots logWriteFailures before Write-BatchReceipt; the RECEIPT_PERSIST_FAILED line for batch-01.json (a directory) then failed to log (batch.log held),
+        # which bumped the live counter, and the batches.jsonl line was serialized from the stale snapshot (0) while the summary said more. Each receipt is serialized with the live count.
+        self._occupy_with_directory("batch-01.json")
+        (self.run_dir / "batch.log").write_text("", encoding="utf-8")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        runner, paused, locked = self._runner_paused_at_claim_taken("RECEIPT_PERSIST_FAILED")
+        args[args.index("-File") + 1] = str(runner)
+        done, t = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", paused, locked)
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+        except subprocess.TimeoutExpired as ex:
+            self.fail(f"the process did not end within 90 s: {ex.stdout!r}")
+        finally:
+            done.set()
+            t.join(5)
+        self.assertEqual(locked.read_text(encoding="utf-8"), "locked", "the handshake: the runner paused at the persist diagnostic and resumed only once the lock was held")
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertGreaterEqual(res["logWriteFailures"], 1)
+        [b] = self.batches()
+        self.assertGreaterEqual(b["logWriteFailures"], 1, "the surviving batches.jsonl line carries the failure the diagnostic itself hit")
 
     def test_persist_a_leg_failure_keeps_its_exit_7_when_the_receipt_cannot_be_written_either(self) -> None:
         # 13 replaces only a clean 0: a run that already selected a failing code keeps it, and the summary still names the unwritten receipt

@@ -112,7 +112,7 @@
 # 7a); 12 an unexpected throw inside a batch after its claim was taken (BATCH_ERROR: the claim keeper is stopped, the claim released and the batch receipt written
 # first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
 # 13 a receipt file could not be written (batch-NN.json or batches.jsonl, e.g. occupied by a directory): RECEIPT_PERSIST_FAILED file=<path> reason=<msg> is logged once per failure, the summary still prints with
-# receiptPersistFailures, and every other code keeps its own meaning (13 replaces only a clean 0), so a lost receipt is never an exit 0.
+# receiptPersistFailures, and every other code keeps its own meaning (13 replaces only a clean 0), so a lost receipt is never an exit 0. Each receipt is serialized with the live logWriteFailures (the diagnostic itself can fail to log).
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
 [CmdletBinding(DefaultParameterSetName = 'Scalar')]
 param(
@@ -799,7 +799,8 @@ $batchNo = 0
 # and reaches the summary (receiptPersistFailures) and the exit code (13 when nothing worse was selected), so the summary is never skipped and a lost receipt is never exit 0.
 $script:receiptPersistFailures = [System.Collections.Generic.List[object]]::new()
 function Write-ReceiptFile([int]$Batch, [string]$Path, [scriptblock]$Write) {
-    try { & $Write } catch {
+    $script:receiptFileWritten = $false   # not a return value: L writes its line to the output stream, which a captured return would swallow
+    try { & $Write; $script:receiptFileWritten = $true } catch {
         $why = ($_.Exception.Message -replace '\s+', ' ')
         $script:receiptPersistFailures.Add([ordered]@{ batch = $Batch; file = $Path; reason = $why })
         LogBest "RECEIPT_PERSIST_FAILED file=$Path reason=$why"
@@ -811,8 +812,14 @@ function Write-BatchReceipt([System.Collections.IDictionary]$B) {
     if ($script:RunOutputAliased) { [Console]::Error.WriteLine("BATCH_RECEIPT_NOT_WRITTEN batch=$($B.batch) (an accepted input is a runner output; nothing more is written into -RunDir) $($rec | ConvertTo-Json -Compress -Depth 8)"); $batches.Add($rec); return }
     $batches.Add($rec)   # the in-memory row first: the summary reports it whatever the files do
     $perBatch = Join-Path $RunDir ('batch-{0:00}.json' -f $B.batch); $jsonl = Join-Path $RunDir 'batches.jsonl'
-    Write-ReceiptFile $B.batch $perBatch { [IO.File]::WriteAllText($perBatch, ($rec | ConvertTo-Json -Depth 8) + "`n", [Text.UTF8Encoding]::new($false)) }
-    Write-ReceiptFile $B.batch $jsonl { Add-Content -LiteralPath $jsonl -Value ($rec | ConvertTo-Json -Compress -Depth 8) -ErrorAction Stop }
+    # adversary r1 A1: the diagnostic of one failed write is itself a log line that can fail and bump logWriteFailures, so every serialization takes the live count (the callers snapshot it
+    # before this function), and the overwritable batch-NN.json is written once more when a later diagnostic bumped it (the append-only jsonl line is the only one that cannot be).
+    $snap = @{ perBatch = -1 }
+    $putPerBatch = { $rec.logWriteFailures = $script:logWriteFailures; $snap.perBatch = $script:logWriteFailures; [IO.File]::WriteAllText($perBatch, ($rec | ConvertTo-Json -Depth 8) + "`n", [Text.UTF8Encoding]::new($false)) }
+    Write-ReceiptFile $B.batch $perBatch $putPerBatch
+    $perBatchOk = $script:receiptFileWritten
+    Write-ReceiptFile $B.batch $jsonl { $rec.logWriteFailures = $script:logWriteFailures; Add-Content -LiteralPath $jsonl -Value ($rec | ConvertTo-Json -Compress -Depth 8) -ErrorAction Stop }
+    if ($perBatchOk -and $snap.perBatch -ne $script:logWriteFailures) { Write-ReceiptFile $B.batch $perBatch $putPerBatch }
 }
 # BACHELOR-DEDICATED-CAPS-RUNNER-1: the caps are Bachelor's heavy-slot.lease.json (the owner moves them), so they are READ, not mirrored: one light exempt job
 # (GateExemptJobPattern ^venue-quiet-probe-: no lease, no slot, no venue claim) prints the file; anything unreadable or invalid is the old constants (the tightest ever
