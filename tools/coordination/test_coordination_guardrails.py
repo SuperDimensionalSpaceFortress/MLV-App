@@ -2633,6 +2633,44 @@ def test_save_dirty_worktree_evidence_refuses_a_worktree_whose_config_points_git
 
 
 @dirty_save_only
+def test_save_dirty_worktree_evidence_keeps_reading_the_proven_worktree_when_its_config_changes_mid_save(tmp_path):
+    # r7 iter 2 (adversary 43a1998e-A2): core.worktree written after the top-level check sent every later git call to another directory; the save exported that directory's
+    # change as SAVED and omitted the worktree's own edit. The proven repository and work tree are pinned (GIT_DIR / GIT_WORK_TREE) for the rest of the save.
+    main, _ = _dirty_save_repo(tmp_path)
+    git(main, "checkout", "--", "src/a.txt")
+    wt = tmp_path / "linked"
+    git(main, "worktree", "add", "-q", str(wt))
+    git(wt, "config", "extensions.worktreeConfig", "true")
+    (wt / "src" / "a.txt").write_text("two\n")
+    other = tmp_path / "other"
+    (other / "src").mkdir(parents=True)
+    (other / "src" / "a.txt").write_text("bee\n")
+    dest = other / "run"
+    dest.mkdir()
+    shim = ("$script:Moved = $false; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
+            f"if (-not $script:Moved) {{ $script:Moved = $true; & git -C '{wt}' config --worktree core.worktree '{str(other).replace(chr(92), '/')}' }} }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert git(wt, "config", "--worktree", "--get", "core.worktree") == str(other).replace("\\", "/"), "the shim must have redirected the worktree"
+    assert out.stdout.startswith("DIRTY_TREE_SAVED card=C1"), (out.stdout, out.stderr)
+    text = next(dest.glob("dirty-worktree-*.patch")).read_text(encoding="utf-8")
+    assert "+two" in text and "bee" not in text, text
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_evidence_rewritten_between_its_checks_and_its_publication(tmp_path):
+    # r7 iter 2 (adversary 43a1998e-A1): the staged temp file was validated (non-empty, byte-exact, reverse-applies) and then emptied at the before-publish checkpoint; the empty
+    # file was placed and SAVED reported it. The placed bytes must hash to the digest that was validated.
+    wt, dest = _dirty_save_repo(tmp_path)
+    (wt / "src" / "a.txt").write_text("staged\n")
+    git(wt, "add", "src/a.txt")
+    (wt / "src" / "a.txt").write_text("one\n")
+    shim = ("function Invoke-DirtyDestCheckpoint([string]$Stage) { if ($Stage -eq 'before-publish') { "
+            f"Get-ChildItem -LiteralPath '{dest}' -Filter 'dirty-worktree-staging-*.tmp' | ForEach-Object {{ [System.IO.File]::WriteAllBytes($_.FullName, [byte[]]@()) }} }} }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    assert out.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=evidence-changed-before-publish:"), (out.stdout, out.stderr)
+
+
+@dirty_save_only
 def test_save_dirty_worktree_evidence_fails_typed_when_the_main_patch_loses_a_whole_file(tmp_path):
     # Same class on the main patch (adversary siblings :41 / :77): a complete one-file prefix used to be reported as verified=reverse-apply-ok.
     wt, dest = _dirty_save_repo(tmp_path)

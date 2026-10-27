@@ -35,7 +35,12 @@ function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem,
     foreach ($pair in $names) {
         $cand = Join-Path $Dir $pair[0]
         if ($Guard) { $why = & $Guard 'before-publish'; if ($why) { return @{ Path = $null; Reason = $why } } }  # the destination is re-proven right before each rename into place
-        try { Invoke-DirtyFileMove $Tmp $cand; return @{ Path = $cand; Id = $pair[1]; Moved = $true } }
+        try {
+            Invoke-DirtyFileMove $Tmp $cand
+            # The bytes published must be the bytes validated: a temp file rewritten after its checks would otherwise be placed and reported (r7 iter 2, adversary 43a1998e-A1).
+            if ((Get-FileHash -LiteralPath $cand -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Full) { return @{ Path = $null; Reason = "evidence-changed-before-publish:$cand" } }
+            return @{ Path = $cand; Id = $pair[1]; Moved = $true }
+        }
         catch [System.IO.IOException] {
             $ex = $_.Exception
             while ($ex.InnerException -and $ex -isnot [System.IO.IOException]) { $ex = $ex.InnerException }  # a method call wraps the real IOException
@@ -320,6 +325,11 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         # containment checks describe -Wt. The top level git reports must be the held directory itself (r7 iter 1, adversary 6433989c-A2).
         $top = @(& git -C $Wt rev-parse --show-toplevel 2>$null)
         if ($LASTEXITCODE -ne 0 -or $top.Count -ne 1 -or (Get-DirtyDirIdentity $top[0]) -cne $wtId) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
+        # Every later git call rereads its config, so a core.worktree written after this check would move it elsewhere again: the repository and work tree just proven are pinned
+        # for the rest of the save (GIT_DIR / GIT_WORK_TREE beat core.worktree; the finally puts the caller's values back) (r7 iter 2, adversary 43a1998e-A2).
+        $gitDir = @(& git -C $Wt rev-parse --absolute-git-dir 2>$null)
+        if ($LASTEXITCODE -ne 0 -or $gitDir.Count -ne 1) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=not-a-worktree-root" }
+        $env:GIT_DIR = $gitDir[0]; $env:GIT_WORK_TREE = $Wt
         if (Test-DirtyPathInside -Inner $destReal -Outer $wtReal) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=dest-inside-worktree" }
         # A gitlink (mode 160000: a submodule pointer, or a submodule checked out at another commit) is written into the patch, but the advertised plain `git apply` skips its
         # commit ids and the reverse-apply check never looks at them, so SAVED would promise a recovery that drops the change. Such a diff is refused before anything is written (r7, adversary cd31735a-A2).
@@ -434,6 +444,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         foreach ($t in $tmp, $stagedTmp, $statTmp, $mergeTmp) { if ($t -and (Test-Path -LiteralPath $t)) { Remove-Item -LiteralPath $t -Force -ErrorAction SilentlyContinue } }
         if ($null -ne $prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { } }
         Unlock-DirtyDirectory $wtLock; Unlock-DirtyDirectory $destLock  # released only after the temp cleanup, which still runs inside the held destination
+        foreach ($v in 'GIT_DIR', 'GIT_WORK_TREE') { Remove-Item -LiteralPath "Env:$v" -ErrorAction SilentlyContinue }  # the pins set above; the caller's own values come back next
         foreach ($v in $savedEnv.Keys) { Set-Item -LiteralPath "Env:$v" -Value $savedEnv[$v] }
     }
 }
