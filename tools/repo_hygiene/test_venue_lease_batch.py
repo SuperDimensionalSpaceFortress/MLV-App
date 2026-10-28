@@ -3125,7 +3125,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # adversary r2 A1: the manifest read AND the hash come out of ONE share of the budget, and a share too small for both is a typed refusal. r4 (hub ruling 17:18:14Z): ONE deadline
         # through both phases, so no fixed split: the timed r4 cases below hold the behaviour (Dot's literal case, key3 row L-04, the post-open 500 s room)
         self.assertIn("($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds)", guard)
-        self.assertIn("-TimeoutSec $share -VerifyArtifacts -ProbeScript", guard)
+        # r5 (key3 r4 B1): -VerifyArtifacts is off only under a budget that says so (the claim wait, no claim held)
+        self.assertIn("-TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ProbeScript", guard)
+        self.assertIn("$verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)", guard)
         self.assertNotIn("$manifestSec", guard)
         self.assertNotIn("-ArtifactTimeoutSec", guard)
         self.assertIn("if ($share -lt 2) { return", guard)
@@ -3413,6 +3415,80 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
         self.assertLess(took, 40, f"the run took {took:.1f} s: the 40 s read was waited for")
 
+    # r5 ITEM 1 (key3 r4 B1, catalogue row L-05; Dot 6457724432): an attempt the claim was NOT granted for ran the guard inline with no budget, and the guard hashed every cached
+    # artifact (-VerifyArtifacts) on the venue's share on every -ClaimPollSec poll while a foreign chain held the venue (and measured). Master's wait read the manifests only.
+    def test_artifact_preflight_r5_l05_no_artifact_read_while_a_foreign_claim_is_waited_out_then_one_hash_under_the_claim(self) -> None:
+        self._fresh_run_dir()
+        state = self.share / "fake-agent-state.json"
+        self.assertFalse(state.exists())
+        manifest_calls, artifact_calls = self.case / "manifest-calls.txt", self.case / "artifact-calls.txt"
+        manifest_probe, artifact_probe = self._timed_probes(0, 0)
+        # every manifest read (one per build per guard, a denied poll's included) and every artifact hash (one per build per -VerifyArtifacts call) appends a line;
+        # a hash says whether the open was answered yet (the fake agent's state file), so the claim guard's hash is told from the post-open guard's
+        manifest_probe.write_text(manifest_probe.read_text(encoding="utf-8").replace("param($p)\n", f"param($p)\n[IO.File]::AppendAllText('{manifest_calls}', 'm' + [Environment]::NewLine)\n", 1),
+                                  encoding="utf-8")
+        artifact_probe.write_text("param($items)\n" + f"$w = $(if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ 'open' }} else {{ 'before-open' }})\n"
+                                  + f"[IO.File]::AppendAllText('{artifact_calls}', $w + [Environment]::NewLine)\n", encoding="utf-8")
+
+        def lines(p: Path) -> list[str]:
+            return p.read_text(encoding="utf-8").split() if p.exists() else []
+
+        self._foreign_live_claim()
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]),
+                                "-StagedBuildProbeScript", str(manifest_probe), "-ArtifactProbeScript", str(artifact_probe))
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("CLAIM_HELD")
+            # the reset after the one-time preflight (Dot): CLAIM_HELD is logged after the first denied poll's guard, so the preflight's one hash is all there may be by now
+            at_held = len(lines(artifact_calls))
+            m0 = len(lines(manifest_calls))
+            end = time.monotonic() + 120
+            while len(lines(manifest_calls)) < m0 + 3 and time.monotonic() < end and p.poll() is None:
+                time.sleep(0.2)
+            denied_polls = len(lines(manifest_calls)) - m0
+            during = len(lines(artifact_calls)) - at_held
+            mark = len(lines(artifact_calls))
+            self.claim_path.unlink()   # the foreign owner lets go: this run takes the claim next poll
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertGreaterEqual(denied_polls, 3, f"three more denied polls re-read the manifest (the manifest check is kept while no claim is held): {so + se}")
+        self.assertEqual(at_held, 1, f"only the one-time preflight hashed before the first denied poll ended; the denied poll hashed too: {lines(artifact_calls)}")
+        self.assertEqual(during, 0, f"{during} artifact hashes during {denied_polls} denied polls while a foreign claim held the venue")
+        self.assertEqual(p.returncode, 0, so + se)
+        after = lines(artifact_calls)[mark:]
+        self.assertEqual(after.count("before-open"), 1, f"exactly one hash under the claim guard's budget once the claim was granted: {after}")
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsRan"]), ("ALL_LEGS_DONE", 1))
+
+    # r5 ITEM 2 (sol r4 B1; key3 r4 H-B): once Invoke-InputGuard gave up on a location read (locationUnknown), Test-OpenOutputAlias re-resolved -RunDir (Get-PhysicalPath) and read
+    # its identity on the main thread, unbounded, and the claim-time refusal probed batch.log: a -RunDir that stopped answering (a UNC share, a junction whose target went away) then
+    # held the run before the typed refusal and the lease close. '<guard>:rundir=<sec>' stalls every read of -RunDir in that guard and after it; GUARD_READ_DELAY_SEAM on stderr names
+    # each main-thread read that reached the stall.
+    def test_artifact_preflight_r5_item2_a_stalled_rundir_after_the_open_reaches_the_typed_refusal_and_the_close_inside_the_room(self) -> None:
+        # sol's repro: cap 75, leg budget 60, margin 0 (the post-open guard has 14 s); -RunDir's metadata reads stall 40 s once the open is answered
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75")
+        self.assertNotIn("GUARD_READ_DELAY_SEAM", r.stderr, "a -RunDir read ran on the main thread after the guard gave up on that location")
+        self._assert_delayed_read_refused_inside_the_room(r, held)
+        self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertNotIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, "the close job still has its TEMP folder (TEMP compared with -RunDir as the preflight found it)")
+
+    def test_artifact_preflight_r5_item2_a_stalled_rundir_in_the_claim_guard_refuses_without_probing_batch_log(self) -> None:
+        # the claim-time sibling (sol r4 B1, Stop-PlanRefused): -ClaimTtlSec 60 / -ClaimRenewSec 30 gives the claim guard 30 s; -RunDir stalls 40 s
+        t0 = time.monotonic()
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-ClaimTtlSec", "60", "-ClaimRenewSec", "30", "-GuardReadDelay", "claim:rundir=40")
+        took = time.monotonic() - t0
+        self.assertNotIn("GUARD_READ_DELAY_SEAM", r.stderr, "batch.log was probed after the guard gave up on -RunDir's location")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertEqual(self.kinds(), [], "no lease was opened")
+        self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
+        self.assertLess(took, 40, f"the run took {took:.1f} s: the stalled -RunDir was read again after the 30 s guard")
+
     def test_artifact_preflight_r4_the_guard_read_delay_seam_is_refused_with_the_real_um_run_and_checked_for_shape(self) -> None:
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", "open:spec=5")
         args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
@@ -3423,7 +3499,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         for bad in ("open:hash=5", "open:spec=١"):
             r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", bad)
             self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-            self.assertIn("is not <claim|open>:<existence|identity|spec>=<sec>", r.stderr)
+            self.assertIn("is not <claim|open>:<existence|identity|spec|rundir>=<sec>", r.stderr)
         self.assertEqual(self.kinds(), [])
 
     # r4 ITEM 3 (key3 r3 H3): the claim guard runs before the batch try, so a throw in it once the claim was granted left the claim held, with no keeper, until its TTL (and the run
