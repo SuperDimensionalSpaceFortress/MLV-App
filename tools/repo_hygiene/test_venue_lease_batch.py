@@ -2883,6 +2883,43 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertEqual(len(self.batches()), 1)
                 self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=INPUT_UNREADABLE", r.stderr)
 
+    def test_r5b_adv2_a1_a_staged_manifest_gone_after_the_final_leg_ends_the_run_on_it_never_exit_0(self) -> None:
+        # adversary r5b pass 2 A1: a staged manifest that is gone skips the location guard (BUILD_NOT_STAGED is the content guard's), and the receipt guard kept only unresolved hits,
+        # so that content hit was dropped and the run ended exit 0. Every hit the receipt guard sees is kept: the receipts are written and the run ends on it.
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        manifest = self._staged_manifest(self.commit_a)
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Delete('{psq(manifest)}')")
+        self.assertFalse(manifest.exists(), "the staged manifest was deleted (the case under test)")
+        self.assertEqual(r.returncode, 2, "a manifest gone after the final leg was an exit 0\n" + r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"]), (2, "BUILD_NOT_STAGED", 1, []))
+        self.assertTrue((self.run_dir / "batch-01.json").is_file())
+        self.assertEqual(len(self.batches()), 1)
+        self.assertIn("BATCH_RECEIPT_INPUT_CHANGED batch=1 reason=BUILD_NOT_STAGED", r.stderr)
+        self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=BUILD_NOT_STAGED", r.stderr)
+
+    def test_r5b_adv2_a2_a_spec_whose_data_cannot_be_read_is_input_unreadable_never_exit_0(self) -> None:
+        # adversary r5b pass 2 A2: the guard's opens ask for no access, so a spec whose FILE_READ_DATA is denied (metadata still readable) passed them, and the scalar form has no
+        # content check: exit 0. The input is now opened for reading: INPUT_UNREADABLE, the receipts written, exit 2.
+        for form in ("scalar", "plan"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                self.addCleanup(subprocess.run, ["icacls", str(spec), "/reset"], capture_output=True)
+                args, e = self.batch_cmd([spec]) if form == "scalar" else self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                deny = f"$null = icacls '{psq(spec)}' /deny ([Security.Principal.WindowsIdentity]::GetCurrent().Name + ':(RD)')"
+                r = self._r5_run(args, e, self._FINAL_RECEIPT, deny)
+                with self.assertRaises(PermissionError, msg="the spec's data cannot be read (the case under test)"):
+                    spec.read_bytes()
+                self.assertEqual(r.returncode, 2, "an unreadable spec was an exit 0\n" + r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"]), (2, "INPUT_UNREADABLE", 1, []))
+                self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+                self.assertTrue((self.run_dir / "batch-01.json").is_file())
+                subprocess.run(["icacls", str(spec), "/reset"], capture_output=True)
+
     def test_r5b_adv_a2_a_plan_missing_only_while_one_guard_ran_is_no_alias_and_suppresses_nothing(self) -> None:
         # adversary r5b A2: the guard failed to open the plan (moved away in a save-as-rename), the plan was back before Get-InputUnresolvedCode probed it, and that stale failure was
         # labelled LEG_PLAN_IS_RUN_OUTPUT: both receipts suppressed, exit 2. Only a refusal reached with the input itself open is an alias; this one is asked again and is clean.
@@ -2890,7 +2927,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         plan = self.write_plan([self.item(spec, "A", self.commit_a)])
         args, e = self.plan_cmd(plan)
         p, away = psq(plan), psq(plan) + ".away"
-        anchor = "function Get-InputUnresolvedCode([string]$Path) {\n"
+        # the probe's own signature, whichever form the runner has (r5b pass 2 added -SkipRead)
+        anchor = next(a for a in ("function Get-InputUnresolvedCode([string]$Path, [switch]$SkipRead) {\n", "function Get-InputUnresolvedCode([string]$Path) {\n")
+                      if a in RUNNER.read_text(encoding="utf-8"))
         restore = anchor + f"    if ([IO.File]::Exists('{away}')) {{ [IO.File]::Move('{away}', '{p}') }}\n"
         new = f"        if ($true) {{ [IO.File]::Move('{p}', '{away}') }}\n" + self._FINAL_RECEIPT
         args[args.index("-File") + 1] = str(self._patched_runner(self._FINAL_RECEIPT, new, (anchor, restore)))

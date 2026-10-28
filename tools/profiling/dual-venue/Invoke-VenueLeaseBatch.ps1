@@ -469,12 +469,19 @@ function Get-OutputNameRefusal([string]$LegName) {
     ''
 }
 
-function Get-InputUnresolvedCode([string]$Path) {
+function Get-InputUnresolvedCode([string]$Path, [switch]$SkipRead) {
     # r5 (opus r4b B1, the second trigger): Get-RunDirOutputRefusal refuses an input it cannot open, which is right before any claim, but once the claim is held a spec deleted after
     # its leg ran, or a plan briefly gone in a save-as-rename, is not a runner output. '' when the input itself opens (its refusal stands); INPUT_VANISHED when nothing is left at its
     # name and the folder it was in still resolves; INPUT_UNREADABLE for an input that is there but will not open (a dangling link, a share not answering).
     # r5b (adversary r5b A1): or that is no file any more: a folder at its name opens like one (BACKUP_SEMANTICS) and reads as nothing, so it is INPUT_UNREADABLE too.
-    try { $null = Get-PhysicalPath $Path; $null = Get-FileIdentity $Path; if ([IO.Directory]::Exists($Path)) { return 'INPUT_UNREADABLE' }; return '' } catch { }
+    # r5b pass 2 (adversary A2): the guard's opens ask for no access (0), so a file whose data cannot be read (FILE_READ_DATA denied) passed them: it is opened for reading here.
+    # -SkipRead: a staged build manifest's bytes are the content guard's (SHARE_UNREACHABLE, r13), so only its location and kind are checked here.
+    try {
+        $null = Get-PhysicalPath $Path; $null = Get-FileIdentity $Path
+        if ([IO.Directory]::Exists($Path)) { return 'INPUT_UNREADABLE' }
+        if (-not $SkipRead) { $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)); $fs.Dispose() }
+        return ''
+    } catch { }
     $entry = $true
     try { $null = Get-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { $entry = $false }
     if (-not $entry) { try { $null = Get-PhysicalPath ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))); return 'INPUT_VANISHED' } catch { } }
@@ -500,7 +507,7 @@ function Get-InputOutputRefusal {
         }
         if ($why -and $script:refusalInputUnopened -and -not $code) { $code = 'INPUT_UNREADABLE' }
         # r5b (adversary r5b A1): no output, but the input may be a folder now (it opens, and reads as nothing)
-        if (-not $why) { $code = Get-InputUnresolvedCode $g.path }
+        if (-not $why) { $code = Get-InputUnresolvedCode $g.path -SkipRead:($g.kind -ceq 'build') }
         if (-not $code) { if ($why) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why } }; continue }
         if (-not $unresolved) {
             $label = $(if ($g.kind -ceq 'plan') { 'the plan file' } elseif ($g.kind -ceq 'build') { 'the staged build manifest' } else { 'the leg spec' })
@@ -866,9 +873,10 @@ function Test-ReceiptWriteSuppressed([int]$Batch, [string]$Path) {
     if (-not $script:RunOutputAliased) {
         $guardHit = Get-InputOutputRefusal
         if (-not (Test-AliasHit $guardHit)) {
-            if ($guardHit -and $guardHit.kind -ceq 'unresolved' -and -not $script:receiptGuardHit) {
+            # r5b pass 2 (adversary A1): a content hit is kept too (a staged manifest gone after the final leg is BUILD_NOT_STAGED there), so no hit seen here is dropped
+            if ($guardHit -and -not $script:receiptGuardHit) {
                 $script:receiptGuardHit = $guardHit
-                [Console]::Error.WriteLine("BATCH_RECEIPT_INPUT_UNRESOLVED batch=$Batch reason=$($guardHit.code) item=$($guardHit.item) $($guardHit.why) (no alias: the receipt is still written; the run ends on it)")
+                [Console]::Error.WriteLine("BATCH_RECEIPT_INPUT_$(if ($guardHit.kind -ceq 'unresolved') { 'UNRESOLVED' } else { 'CHANGED' }) batch=$Batch reason=$($guardHit.code) item=$($guardHit.item) $($guardHit.why) (no alias: the receipt is still written; the run ends on it)")
             }
             return $false
         }
