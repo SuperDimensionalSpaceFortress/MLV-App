@@ -4898,6 +4898,9 @@ function Test-CorePartitionMeasuredApp($Helper, [int64]$MeasuredPid, [int64]$Mea
     # sol r6 CP-07: every record number below went through the one guarded parse first
     $shapeWhy = Test-CorePartitionHelperRecordShape $Helper
     if ($shapeWhy) { return @{ why = $shapeWhy } }
+    # adversary r14b (c05dc76b) A1: the helper records a same-name process whose path (or, on the app's path, start time) it could not read as
+    # unidentified; it cannot be ruled out as a competing instance, so no overlap verdict holds
+    if (@(@($Helper.instances) + @($Helper.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified }).Count -gt 0) { return @{ why = 'same-path-instance-unidentified' } }
     # adversary r8 (e1ce216c) A1: under the tolerance a gap still moves each wall-clock stamp by up to that gap, so two stamps by up to twice it;
     # another process's interval is widened by twice the larger gap on both sides before the overlap test ($slack, ticks)
     $slack = [int64]0
@@ -5257,6 +5260,9 @@ public sealed class MlvCorePartitionLoad {
                 $pp = $null; try { $pp = [string]$p.Path } catch { }
                 $pst = $null; try { $pst = $p.StartTime.ToUniversalTime() } catch { }
                 $k = "$($p.Id),$($pst.Ticks)"
+                # adversary r14b (c05dc76b) A1: a same-name process whose path (or, on the app's path, start time) cannot be read cannot be ruled out
+                # as a competing instance, so it is recorded unidentified (the job refuses same-path-instance-unidentified), never dropped
+                if ((!$pp -or ($pp -ieq $exe -and !$pst)) -and !$seen.ContainsKey($k)) { $seen[$k] = 1; $others.Add(@{ pid = $p.Id; unidentified = 1 }) }
                 if ($pp -and $pp -ieq $exe -and $pst -and -not $seen.ContainsKey($k)) {
                     $seen[$k] = 1; $fs = & $clk
                     $r = [ordered]@{ pid = $p.Id; startUtcTicks = $pst.Ticks; firstSeenUtcTicks = $fs; lastSeenUtcTicks = $fs; firstMs = $cw.ElapsedMilliseconds; goneUtcTicks = $null; aliveMs = $me; goneMs = $null; affinityFirst = $null; affinityLast = $null; priorityFirst = $null; priorityLast = $null; loadSec = 0.0; loadBytes = [int64]0; loadJoined = $null }

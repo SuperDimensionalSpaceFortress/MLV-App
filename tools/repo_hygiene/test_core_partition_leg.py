@@ -2406,6 +2406,30 @@ $res | ConvertTo-Json -Compress
 """
 
 
+def _r14b_unidentified_driver() -> str:
+    """adversary r14b (c05dc76b) A1: B1_DRIVER's real helper body and measured-app double (tight poll), plus a second process double of the same
+    name (pid 200, started 5 s before the launch, alive throughout) whose Path getter (unreadable-path) or StartTime getter (unreadable-start, on
+    the app's own path) throws Win32Exception(5). tight is the control: no second process."""
+    d = B1_DRIVER
+    for old, new in (("$global:cpP | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }\n",
+                      "$global:cpP | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }\n"
+                      "$global:cpQ = [pscustomobject]@{ Id = 200; PriorityClass = 'Normal'; ProcessorAffinity = [int64]4095; HasExited = $false }\n"
+                      "$global:cpQ | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }\n"
+                      "$global:cpQ | Add-Member -MemberType ScriptProperty -Name Path -Value { if ($env:CP_MODE -eq 'unreadable-path') { throw [ComponentModel.Win32Exception]::new(5) }; $env:MLV_CP_EXE }\n"
+                      "$global:cpQ | Add-Member -MemberType ScriptProperty -Name StartTime -Value { if ($env:CP_MODE -eq 'unreadable-start') { throw [ComponentModel.Win32Exception]::new(5) }; $global:cpF.start.AddSeconds(-5) }\n"),
+                     ("$global:cpF.exitAt) { $global:cpP } }", "$global:cpF.exitAt) { $global:cpP }; if ($env:CP_MODE -like 'unreadable-*') { $global:cpQ } }"),
+                     ("foreach ($mode in @('delayed', 'tight')) {", "foreach ($mode in @('unreadable-path', 'unreadable-start', 'tight')) {"),
+                     ("    $out[$mode] = [ordered]@{ endedBy = $rec.endedBy;",
+                      "    $out[$mode] = [ordered]@{ vwhy = [string]$v.why; unidentified = @(@($rec.others) | Where-Object { $null -ne $_ -and $null -ne $_.unidentified }).Count; endedBy = $rec.endedBy;")):
+        if d.count(old) != 1:
+            raise AssertionError(f"B1_DRIVER changed shape near {old!r}")
+        d = d.replace(old, new)
+    return d
+
+
+R14B_UNIDENTIFIED_DRIVER = _r14b_unidentified_driver()
+
+
 @requires_windows_pwsh
 class CorePartitionR10Tests(unittest.TestCase):
     """r10 (sol r9 B1-B4 on 8cf7e883): the literals against the generator's own consumers, readers, helper body and load class."""
@@ -2448,6 +2472,23 @@ class CorePartitionR10Tests(unittest.TestCase):
         self.assertIn("partitionLoadGBps=coverage-endpoint-gap", delayed["why"])
         self.assertLessEqual(tight["endpointMs"], 1000, tight)
         self.assertEqual([tight["bench"], tight["load"]], [True, True], f"a tight-poll exit was refused: {tight}")
+
+    def test_r14b_a1_a_same_name_process_the_helper_cannot_identify_refuses_the_overlap_verdict(self) -> None:
+        """adversary r14b (c05dc76b) A1, the real helper body: a same-name process alive across the whole run whose Path (or, on the app's path,
+        StartTime) read throws was dropped from the helper's enumeration, so the overlap check never saw it and bench was accepted. It is now
+        recorded unidentified and the run is refused same-path-instance-unidentified. Control: no second process, accepted as before."""
+        got = self.drive("r14b-a1", R14B_UNIDENTIFIED_DRIVER, True)
+        for mode in ("unreadable-path", "unreadable-start", "tight"):
+            self.assertEqual([got[mode]["endedBy"], got[mode]["exit"]], ["stop-file", 0], got)
+        for mode in ("unreadable-path", "unreadable-start"):
+            with self.subTest(mode=mode):
+                case = got[mode]
+                self.assertEqual(case["unidentified"], 1, f"the helper dropped a process it could not identify: {case}")
+                self.assertEqual(case["vwhy"], "same-path-instance-unidentified", case)
+                self.assertFalse(case["bench"], f"an unidentified same-name process escaped the overlap refusal: {case}")
+                self.assertIn("appAffinityObserved=same-path-instance-unidentified", case["why"])
+        tight = got["tight"]
+        self.assertEqual([tight["unidentified"], tight["vwhy"], tight["bench"], tight["load"]], [0, "", True, True], f"the control was refused: {tight}")
 
     def test_b2_a_feed_read_completed_after_the_window_publishes_no_row(self) -> None:
         """B2 (sol r9 B2 = adversary r9 8cf7e883 A2, literal): an end read that completed 120 s (or 40 s) after the smoke end may hold rows written
