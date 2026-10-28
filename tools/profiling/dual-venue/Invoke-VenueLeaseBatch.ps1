@@ -113,6 +113,8 @@
 # first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
 # 13 a receipt file could not be written (batch-NN.json or batches.jsonl, e.g. occupied by a directory): RECEIPT_PERSIST_FAILED file=<path> reason=<msg> is logged once per failure, the summary still prints with
 # receiptPersistFailures, and every other code keeps its own meaning (13 replaces only a clean 0), so a lost receipt is never an exit 0. Each receipt is serialized with the live logWriteFailures (the diagnostic itself can fail to log).
+# r5: a receipt write the input guard skipped (an accepted input is a runner output) is a receiptPersistFailures entry too (reason WRITE_SUPPRESSED <stop reason>), and a hit seen at a receipt
+# write that no later claim guard consumed is the run's typed stop (exit 2) on the final batch. An input that can no longer be opened is INPUT_VANISHED / INPUT_UNREADABLE (exit 2), never an alias.
 # Once a batch receipt exists, every end prints LEASE_BATCH_RESULT: a log line between batches is best effort, and an input refused at a later claim (exit 2) prints the summary first.
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
 [CmdletBinding(DefaultParameterSetName = 'Scalar')]
@@ -203,7 +205,7 @@ $deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globali
 $pwshExe = [Environment]::ProcessPath
 if (-not $Purpose) { $Purpose = "Invoke-VenueLeaseBatch $(Split-Path -Leaf $RunDir)" }
 
-$script:RunOutputAliased = $false; $script:openAliasHit = $null; $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null; $script:outputRedirect = $null
+$script:RunOutputAliased = $false; $script:openAliasHit = $null; $script:suppressionHit = $null; $script:keeperStoppedEarly = $false; $script:keeperStoppedInTime = $null; $script:outputRedirect = $null
 # r16 (sol r15 B1): the job ids um-run.ps1 was called for (Submit-AgentJob sets one just before the call), so a job whose file was never complete here is known never sent
 $script:umRunCalled = @{}
 function L([string]$Message) {
@@ -466,16 +468,50 @@ function Get-OutputNameRefusal([string]$LegName) {
     ''
 }
 
+function Get-InputUnresolvedCode([string]$Path) {
+    # r5 (opus r4b B1, the second trigger): Get-RunDirOutputRefusal refuses an input it cannot open, which is right before any claim, but once the claim is held a spec deleted after
+    # its leg ran, or a plan briefly gone in a save-as-rename, is not a runner output. '' when the input itself opens (its refusal stands); INPUT_VANISHED when nothing is left at its
+    # name and the folder it was in still resolves; INPUT_UNREADABLE for an input that is there but will not open (a dangling link, a share not answering).
+    try { $null = Get-PhysicalPath $Path; $null = Get-FileIdentity $Path; return '' } catch { }
+    $entry = $true
+    try { $null = Get-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { $entry = $false }
+    if (-not $entry) { try { $null = Get-PhysicalPath ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))); return 'INPUT_VANISHED' } catch { } }
+    'INPUT_UNREADABLE'
+}
+
 function Get-InputOutputRefusal {
     # r11 (sol r10 blocker 3): the first validated input (the plan file, then each leg spec) that is now a file this run writes; $null when none is. Defined once the plan is built;
     # the very guard the preflight uses (Get-RunDirOutputRefusal), run again once the claim is held, because an alias can appear while the batch waits for a foreign claim.
+    # r5: an input that cannot be opened any more is its own hit (kind unresolved, Get-InputUnresolvedCode), never "an input is a runner output", and a real alias outranks it.
+    $unresolved = $null
     foreach ($g in $script:guardedInputs) {
         # a staged build manifest that is gone has no location to compare; Get-InputContentRefusal types that (BUILD_NOT_STAGED)
         if ($g.kind -ceq 'build' -and -not (Test-Path -LiteralPath $g.path -PathType Leaf)) { continue }
         $why = Get-RunDirOutputRefusal $g.path
-        if ($why) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why } }
+        if (-not $why) { continue }
+        $code = Get-InputUnresolvedCode $g.path
+        if (-not $code) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why } }
+        if (-not $unresolved) {
+            $label = $(if ($g.kind -ceq 'plan') { 'the plan file' } elseif ($g.kind -ceq 'build') { 'the staged build manifest' } else { 'the leg spec' })
+            $unresolved = [pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = $code; path = $g.path
+                why = "$label '$($g.path)' $(if ($code -ceq 'INPUT_VANISHED') { 'is gone (nothing at that name any more)' } else { 'can no longer be opened' }) since it was accepted" }
+        }
     }
+    if ($unresolved) { return $unresolved }
     Get-InputContentRefusal
+}
+
+function Test-AliasHit($Hit) {
+    # r5: a guard hit that means an accepted input IS a runner output (the hits that suppress every write into -RunDir); a content or unresolved hit is not one
+    [bool]($Hit -and $Hit.kind -cne 'content' -and $Hit.kind -cne 'unresolved')
+}
+
+function Get-HitRefusal($Hit) {
+    # r5: the typed reason, plan item and sentence of a guard hit, in ONE place (the claim guard, the open, the receipt guard and the summary name a hit alike)
+    if ($Hit.kind -ceq 'content' -or $Hit.kind -ceq 'unresolved') { return $Hit.code, $Hit.item, $Hit.why }
+    if ($Hit.kind -ceq 'plan') { return 'LEG_PLAN_IS_RUN_OUTPUT', 0, "the plan file $($Hit.why)" }
+    if ($Hit.kind -ceq 'build') { return 'BUILD_MANIFEST_IS_RUN_OUTPUT', $Hit.item, "the staged build manifest $($Hit.why)" }
+    return 'LEG_SPEC_IS_RUN_OUTPUT', $Hit.item, "the leg spec $($Hit.why)"
 }
 
 function Test-OpenOutputAlias {
@@ -486,9 +522,9 @@ function Test-OpenOutputAlias {
     # suppressed by then, so the run must still end in the refusal: no probe or leg ever runs once an alias was found.
     if ($script:openAliasHit) { return $script:openAliasHit }
     $hit = Get-InputOutputRefusal
-    if ($hit -and $hit.kind -cne 'content' -and -not $script:RunOutputAliased) {
-        $script:openAliasHit = $hit
-        # Suppression first, so nothing below can leave it off: no batch.log at all until a redirect exists (the final append then fails, is counted and said on stderr).
+    if ((Test-AliasHit $hit) -and -not $script:RunOutputAliased) {
+        $script:openAliasHit = $hit; $script:suppressionHit = $hit
+        # Suppression first, so nothing below can leave it off: no batch.log at all until a redirect exists (r5: the result line is then on stdout only, and no log failure).
         $script:RunOutputAliased = $true; $script:batchLog = $null
         # adversary r14 A3: the claim keeper rewrites the claim file in place, and that file may be the input too: it is stopped now, not after the close. The claim can then lapse
         # at its TTL while the lease is closed; it is still released (by nonce, a delete that changes no linked input's bytes) in the finally.
@@ -553,11 +589,8 @@ function Get-InputContentRefusal {
 
 function Stop-InputIsOutput($Hit) {
     # the typed refusal of Get-InputOutputRefusal's hit: the same reason words and exit 2 as the preflight's
-    if ($Hit.kind -ceq 'content') { Stop-PlanRefused $Hit.code $Hit.item $Hit.why }
-    elseif ($Hit.kind -ceq 'plan') { Stop-PlanRefused 'LEG_PLAN_IS_RUN_OUTPUT' 0 "the plan file $($Hit.why)" }
-    elseif ($Hit.kind -ceq 'build') { Stop-PlanRefused 'BUILD_MANIFEST_IS_RUN_OUTPUT' $Hit.item "the staged build manifest $($Hit.why)" }
-    elseif ($legPlanMode) { Stop-PlanRefused 'LEG_SPEC_IS_RUN_OUTPUT' $Hit.item "the leg spec $($Hit.why)" }
-    else { Stop-Usage "LEG_SPEC_IS_RUN_OUTPUT the leg spec $($Hit.why)" }
+    $hr = Get-HitRefusal $Hit
+    if ($legPlanMode) { Stop-PlanRefused $hr[0] $hr[1] $hr[2] } else { Stop-Usage "$($hr[0]) $($hr[2])" }
 }
 
 function Resolve-LegSpecPath([string]$Ref, [string]$BesideDir) {
@@ -805,17 +838,33 @@ $batchNo = 0
 $script:receiptPersistFailures = [System.Collections.Generic.List[object]]::new()
 # adversary r4 A1/A2 (the class of the rewrite alias): an accepted input (the next leg's spec, the plan) can become a link to a receipt file in the window between the last alias guard and ANY receipt
 # write, most easily inside the diagnostic of the write before it. So every receipt write asks first (this is the one function they all go through), a location hit skips the write and turns the
-# suppression on (Test-OpenOutputAlias's rule: nothing more goes into -RunDir), and the hit is STICKY ($script:receiptAliasHit): the next batch's claim guard re-reports it even if the link
+# suppression on (Test-OpenOutputAlias's rule: nothing more goes into -RunDir), and the hit is STICKY ($script:receiptGuardHit): the next batch's claim guard re-reports it even if the link
 # is gone by then, so no probe, leg or write follows an alias that was seen. A content hit is no alias: the write goes on. Writes to stderr only (never the output stream).
-$script:receiptAliasHit = $null
+# r5 (opus r4b B1 = sol r4b B1; folds LEASE-BATCH-FINAL-RECEIPT-ALIAS-EXIT-1): a skipped write recorded nothing, and only the next batch's claim guard read the saved hit, so on the final
+# batch (or a deadline path's) the run ended exit 0 with no receipt on disk. Every suppressed receipt write is now a typed receiptPersistFailures entry (Add-SuppressedReceipt), and a hit
+# no claim guard consumed is the run's typed stop in Write-RunSummary. An input that cannot be opened (INPUT_VANISHED / INPUT_UNREADABLE) is no alias: the receipts are written, and the
+# hit is still kept, so the run ends on it, never exit 0.
+$script:receiptGuardHit = $null
+function Add-SuppressedReceipt([int]$Batch, [string]$Path) {
+    $hr = $(if ($script:suppressionHit) { Get-HitRefusal $script:suppressionHit } else { 'RUN_OUTPUT_ALIASED', 0, 'an accepted input is a runner output' })
+    $reason = "WRITE_SUPPRESSED $($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" }): $($hr[2] -replace '\s+', ' ') (nothing more is written into -RunDir)"
+    $script:receiptPersistFailures.Add([ordered]@{ batch = $Batch; file = $Path; reason = $reason; suppressedBy = $hr[0] })
+    [Console]::Error.WriteLine("BATCH_RECEIPT_WRITE_SKIPPED batch=$Batch file=$Path reason=$reason")
+}
 function Test-ReceiptWriteSuppressed([int]$Batch, [string]$Path) {
     if (-not $script:RunOutputAliased) {
-        $aliasHit = Get-InputOutputRefusal
-        if (-not ($aliasHit -and $aliasHit.kind -cne 'content')) { return $false }
-        $script:receiptAliasHit = $aliasHit
+        $guardHit = Get-InputOutputRefusal
+        if (-not (Test-AliasHit $guardHit)) {
+            if ($guardHit -and $guardHit.kind -ceq 'unresolved' -and -not $script:receiptGuardHit) {
+                $script:receiptGuardHit = $guardHit
+                [Console]::Error.WriteLine("BATCH_RECEIPT_INPUT_UNRESOLVED batch=$Batch reason=$($guardHit.code) item=$($guardHit.item) $($guardHit.why) (no alias: the receipt is still written; the run ends on it)")
+            }
+            return $false
+        }
+        $script:receiptGuardHit = $guardHit; $script:suppressionHit = $guardHit
         $script:RunOutputAliased = $true; $script:batchLog = $null
     }
-    [Console]::Error.WriteLine("BATCH_RECEIPT_WRITE_SKIPPED batch=$Batch file=$Path (an accepted input is a runner output; nothing more is written into -RunDir)")
+    Add-SuppressedReceipt $Batch $Path
     $true
 }
 function Write-ReceiptFile([int]$Batch, [string]$Path, [scriptblock]$Write) {
@@ -830,9 +879,13 @@ function Write-ReceiptFile([int]$Batch, [string]$Path, [scriptblock]$Write) {
 function Write-BatchReceipt([System.Collections.IDictionary]$B) {
     $B.endedUtc = [DateTime]::UtcNow.ToString('o')
     $rec = [pscustomobject]$B
-    if ($script:RunOutputAliased) { [Console]::Error.WriteLine("BATCH_RECEIPT_NOT_WRITTEN batch=$($B.batch) (an accepted input is a runner output; nothing more is written into -RunDir) $($rec | ConvertTo-Json -Compress -Depth 8)"); $batches.Add($rec); return }
-    $batches.Add($rec)   # the in-memory row first: the summary reports it whatever the files do
     $perBatch = Join-Path $RunDir ('batch-{0:00}.json' -f $B.batch); $jsonl = Join-Path $RunDir 'batches.jsonl'
+    if ($script:RunOutputAliased) {
+        [Console]::Error.WriteLine("BATCH_RECEIPT_NOT_WRITTEN batch=$($B.batch) (an accepted input is a runner output; nothing more is written into -RunDir) $($rec | ConvertTo-Json -Compress -Depth 8)"); $batches.Add($rec)
+        foreach ($f in $perBatch, $jsonl) { Add-SuppressedReceipt $B.batch $f }   # r5: both lost receipts are named in the summary
+        return
+    }
+    $batches.Add($rec)   # the in-memory row first: the summary reports it whatever the files do
     # adversary r1 A1: the diagnostic of one failed write is itself a log line that can fail and bump logWriteFailures, so every serialization takes the live count (the callers snapshot it
     # before this function), and the overwritable batch-NN.json is written once more when a later diagnostic bumped it (the append-only jsonl line is the only one that cannot be).
     $snap = @{ perBatch = -1 }
@@ -873,6 +926,13 @@ function Add-Result([object]$Leg, [string]$Status, [hashtable]$Extra) {
 # r3 (opus r2b H3): the end of a run in ONE place, so no stop can skip a part of it: the legs never started are NOT_RUN, a receipt that could not be written is never an exit 0, and
 # LEASE_BATCH_RESULT is printed (and tried on batch.log). The normal end and an input-is-output refusal once a batch receipt exists both call it.
 function Write-RunSummary {
+    # r5 (opus r4b B1): a hit the receipt guard saw that no later claim guard consumed (the final batch's, a deadline path's) is the run's typed stop, as that guard would have made it.
+    # A stopping code already selected (3, 9, 12, ...) keeps its meaning; the suppressed receipts are in receiptPersistFailures either way.
+    if ($script:receiptGuardHit -and ($script:exitCode -eq 0 -or $script:exitCode -eq 7)) {
+        $hr = Get-HitRefusal $script:receiptGuardHit
+        Set-Stop $hr[0] 2
+        [Console]::Error.WriteLine("BATCH_RECEIPT_GUARD_STOP reason=$($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" }) $($hr[2]) (seen while a batch receipt was written; no later guard consumed it)")
+    }
     foreach ($leg in $pending) { Add-Result $leg 'NOT_RUN' @{ verdict = $(if ($script:stopReason) { $script:stopReason } else { 'NOT_RUN' }); reason = 'run-stopped' }; LogBest "LEG $($leg.name) NOT_RUN $($script:stopReason) reason=run-stopped" }
     $pending.Clear()
     # A receipt that could not be written is never an exit 0 (13 replaces only a clean 0: every code the outcome selected, 7 included, keeps its own meaning).
@@ -888,12 +948,14 @@ function Write-RunSummary {
     if ($script:outputRedirect) { $summary.outputRedirect = $script:outputRedirect }
     if ($legPlanMode) { $summary.legPlan =[ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
     $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-    try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch {   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
+    # r5 (opus r4b B1 sweep): with the writes suppressed and no redirect there is no batch.log to append to: the line is on stdout only, which is no log failure
+    if ($script:RunOutputAliased -and -not $script:batchLog) { [Console]::Error.WriteLine('BATCH_RESULT_NOT_LOGGED (an accepted input is a runner output: nothing is appended into -RunDir; the result line is on stdout)') }
+    else { try { Add-Content -LiteralPath $batchLog -Value $resultLine } catch {   # r6 (Dot r5 B5; adversary A3): the result line on stdout and the typed exit code never depend on batch.log, and the failure is still said on stderr
         # r7 (sol r6b): the count was serialized before this append, so the append that just failed is counted and the line for stdout is serialized again with it (stdout is the authority when batch.log is broken).
         Register-LogFailure $_.Exception.Message
         $summary.logWriteFailures = $script:logWriteFailures
         $resultLine = 'LEASE_BATCH_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-    }
+    } }
     Write-Output $resultLine
 }
 
@@ -938,15 +1000,16 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
         # before the first write (the CLAIM_* log lines, leg-plan.json): a hit releases a claim just taken, opens no lease and ends in the typed refusal (exit 2).
         $hit = Get-InputOutputRefusal
-        if (-not $hit -and $script:receiptAliasHit) { $hit = $script:receiptAliasHit }   # adversary r4 A2: an alias seen while a receipt was written stays seen, whatever the link is by now
+        # adversary r4 A2: an alias seen while a receipt was written stays seen, whatever the link is by now. r5: it outranks a live hit that is no alias; an unresolved one is kept too
+        if ((Test-AliasHit $script:receiptGuardHit) -and -not (Test-AliasHit $hit)) { $hit = $script:receiptGuardHit } elseif (-not $hit -and $script:receiptGuardHit) { $hit = $script:receiptGuardHit }
         if ($hit) {
             if ($req.granted) { try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { } }
             # r3 (opus r2b H3): once a batch receipt exists, this refusal ends the run like any other stop: the summary (receiptPersistFailures included) is printed before the typed
             # exit 2. A location hit turns the write suppression on first (Test-OpenOutputAlias's rule): the refused input may be batch.log itself, so nothing more goes into -RunDir.
             # r3 pass 3 (adversary r3 A1): the summary runs inside the refusal, AFTER its own log line, so the logWriteFailures it reports counts that line too.
             if ($batches.Count -gt 0) {
-                if ($hit.kind -cne 'content') { $script:RunOutputAliased = $true; $script:batchLog = $null }
-                Set-Stop $(if ($hit.kind -ceq 'content') { $hit.code } elseif ($hit.kind -ceq 'plan') { 'LEG_PLAN_IS_RUN_OUTPUT' } elseif ($hit.kind -ceq 'build') { 'BUILD_MANIFEST_IS_RUN_OUTPUT' } else { 'LEG_SPEC_IS_RUN_OUTPUT' }) 2
+                if (Test-AliasHit $hit) { $script:RunOutputAliased = $true; $script:batchLog = $null; $script:suppressionHit = $hit }
+                Set-Stop (Get-HitRefusal $hit)[0] 2
                 $script:summaryBeforeExit = { Write-RunSummary }
             }
             Stop-InputIsOutput $hit
@@ -1070,8 +1133,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $b.endReason = 'AGENT_NOT_BATCH_CAPABLE'; $b.endDetail = "admission.mode=$($adm.mode) gate=$($adm.gate) (no admission.leaseBatch for token ${token}: the lease-batch agent is not deployed)"
             Set-Stop 'AGENT_NOT_BATCH_CAPABLE' 10
         } elseif ($openHit) {
-            $hr = $(if ($openHit.kind -ceq 'content') { $openHit.code, $openHit.item, $openHit.why } elseif ($openHit.kind -ceq 'plan') { 'LEG_PLAN_IS_RUN_OUTPUT', 0, "the plan file $($openHit.why)" }
-                elseif ($openHit.kind -ceq 'build') { 'BUILD_MANIFEST_IS_RUN_OUTPUT', $openHit.item, "the staged build manifest $($openHit.why)" } else { 'LEG_SPEC_IS_RUN_OUTPUT', $openHit.item, "the leg spec $($openHit.why)" })
+            $hr = Get-HitRefusal $openHit
             # the lease is held: the finally closes it and charges the ledger from the open's submit (no earlier start is known without reading its end)
             $b.leaseId = [string]$adm.leaseBatch.leaseId; $leaseStartUtc = $openSubmitUtc; $b.endReason = $hr[0]
             # r13 pass 2 (adversary A1): a location hit means a runner output IS the input, so from here nothing is written into -RunDir or the claim dir's outputs (the ledger may be

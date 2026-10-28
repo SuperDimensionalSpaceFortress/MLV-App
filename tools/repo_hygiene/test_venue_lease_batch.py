@@ -2773,6 +2773,154 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertGreaterEqual(json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))["logWriteFailures"], 1, "batch-01.json was rewritten with the diagnostic's log failure")
         self.assertNotIn("BATCH_RECEIPT_WRITE_SKIPPED", r.stderr)
 
+    # r5 (opus r4b B1 = sol r4b B1 = adversary r4b OPEN A1; catalogue RPF-04, RPF-05; folds LEASE-BATCH-FINAL-RECEIPT-ALIAS-EXIT-1): a receipt write the input guard skipped recorded nothing,
+    # and only the NEXT batch's claim guard read the saved hit, so on the final batch the run exited 0 with neither receipt on disk. And an input that could not be opened (a spec that already
+    # ran, deleted) was taken for "an input is a runner output". Each case changes an input inside a copy of the runner, at the receipt write it names.
+    _FINAL_RECEIPT = "        Write-BatchReceipt $b\n    }\n}\nWrite-RunSummary\n"
+    _PRECLAIM_DEADLINE = "reason=DEADLINE detail=$($b.endDetail)\"   # r7 (sol r6b): the line is tried before the receipt snapshots logWriteFailures\n"
+    _CLAIM_HELD_DEADLINE = "reason=DEADLINE detail=claim-held\"   # r7 (sol r6b): the line is tried before the receipt snapshots logWriteFailures\n"
+
+    def _r5_spec(self, name: str, src: Path) -> Path:
+        p = self.case / "r5" / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(src.read_bytes())
+        return p
+
+    def _r5_link_to_batch_log(self, spec: Path) -> tuple[str, Path]:
+        """PowerShell that makes `spec` a hard link to RunDir\\batch.log and snapshots batch.log; (the code, the snapshot)."""
+        snap, s = self.case / "r5-batch.log.snap", psq(spec)
+        return (f"[IO.File]::Delete('{s}'); New-Item -ItemType HardLink -Path '{s}' -Value (Join-Path $RunDir 'batch.log') | Out-Null; "
+                f"Copy-Item -LiteralPath (Join-Path $RunDir 'batch.log') -Destination '{psq(snap)}'"), snap
+
+    def _r5_run(self, args: list[str], e: dict, anchor: str, inject: str, batch: int = 0) -> subprocess.CompletedProcess:
+        """Run `args` on a runner copy that runs `inject` at `anchor` (before the final receipt write, in batch `batch` when > 0; after a deadline anchor's line)."""
+        if anchor == self._FINAL_RECEIPT:
+            new = f"        if ({'$true' if batch <= 0 else f'$batchNo -eq {batch}'}) {{ {inject} }}\n" + anchor
+        else:
+            new = anchor + ("            " if anchor == self._PRECLAIM_DEADLINE else "        ") + inject + "\n"
+        args[args.index("-File") + 1] = str(self._patched_runner(anchor, new))
+        return subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+
+    def _r5_assert_suppressed(self, res: dict, reason: str, batches: tuple = (1,)) -> None:
+        got = sorted((f["batch"], Path(f["file"]).name) for f in res["receiptPersistFailures"])
+        self.assertEqual(got, sorted((b, n) for b in batches for n in (f"batch-{b:02d}.json", "batches.jsonl")), res["receiptPersistFailures"])
+        for f in res["receiptPersistFailures"]:
+            self.assertTrue(f["reason"].startswith(f"WRITE_SUPPRESSED {reason}"), f)
+            self.assertEqual(f["suppressedBy"], reason, f)
+
+    def test_r5_b1_rpf04_a_final_batch_alias_seen_at_the_receipt_write_is_a_typed_nonzero_exit_naming_both_receipts(self) -> None:
+        for form in ("plan", "scalar"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                link, snap = self._r5_link_to_batch_log(spec)
+                args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)])) if form == "plan" else self.batch_cmd([spec])
+                r = self._r5_run(args, e, self._FINAL_RECEIPT, link)
+                self.assertTrue(snap.exists(), "the link was made before the final receipt write (the case under test)\n" + r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 2, "a lost receipt was an exit 0\n" + r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"]), (2, "LEG_SPEC_IS_RUN_OUTPUT", 1))
+                self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+                self.assertFalse((self.run_dir / "batch-01.json").exists())
+                self.assertFalse((self.run_dir / "batches.jsonl").exists())
+                self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes(), "nothing was appended to the linked batch.log")
+                self.assertEqual(res["logWriteFailures"], 0, "the suppressed result-line append is no log failure")
+                self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=LEG_SPEC_IS_RUN_OUTPUT", r.stderr)
+                self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_r5_b1_rpf05_a_final_batch_spec_that_already_ran_and_was_deleted_is_input_vanished_with_the_receipts_written(self) -> None:
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Delete('{psq(spec)}')")
+        self.assertFalse(spec.exists(), "the spec was deleted (the case under test)")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"], res["logWriteFailures"]), (2, "INPUT_VANISHED", 1, [], 0))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr, "a deleted input is not a runner output")
+        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "a deleted input suppresses no receipt")
+        [b] = self.batches()
+        self.assertEqual(b["endReason"], "ALL_LEGS_DONE")
+        self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=INPUT_VANISHED item=1 ", r.stderr)
+
+    def test_r5_b1_a_leg_plan_moved_away_during_the_final_batch_is_input_vanished_and_one_replaced_in_full_is_clean(self) -> None:
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+        args, e = self.plan_cmd(plan)
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Move('{psq(plan)}', '{psq(plan)}.away')")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["stopReason"], res["receiptPersistFailures"]), ("INPUT_VANISHED", []))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+        self.assertTrue((self.run_dir / "batch-01.json").is_file())
+        # the control: the plan replaced in one step (rename over it) is never missing, so the run is clean: exit 0, both receipts on disk
+        self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+        self._stage_case()
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+        args, e = self.plan_cmd(plan)
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Copy('{psq(plan)}', '{psq(plan)}.new'); [IO.File]::Move('{psq(plan)}.new', '{psq(plan)}', $true)")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["receiptPersistFailures"]), (0, None, []))
+        self.assertTrue((self.run_dir / "batch-01.json").is_file())
+        self.assertEqual(len(self.batches()), 1)
+
+    def _r5_two_batch_args(self) -> tuple[list[str], dict, Path, Path]:
+        a, b = self._r5_spec("fx-a.json", self.specs[0]), self._r5_spec("fx-b.json", self.specs[1])
+        args, e = self.plan_cmd(self.write_plan([self.item(a, "A", self.commit_a), self.item(b, "A", self.commit_a)]), FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
+        return args, e, a, b
+
+    def test_r5_b1_mid_run_an_alias_seen_at_batch_1s_receipt_write_names_both_lost_receipts_and_stops_typed(self) -> None:
+        args, e, _a, b = self._r5_two_batch_args()
+        link, snap = self._r5_link_to_batch_log(b)
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, link, batch=1)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (2, "LEG_SPEC_IS_RUN_OUTPUT", 1, 1))
+        self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, "no lease is opened for batch 2")
+        self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes())
+
+    def test_r5_b1_mid_run_a_spec_that_already_ran_and_was_deleted_stops_input_vanished_not_as_a_run_output(self) -> None:
+        args, e, a, _b = self._r5_two_batch_args()
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Delete('{psq(a)}')", batch=1)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=INPUT_VANISHED item=1 ", r.stderr)
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"], res["receiptPersistFailures"]), (2, "INPUT_VANISHED", 1, 1, []))
+        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "batch 1's receipt is written")
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1)
+
+    def test_r5_b1_the_pre_claim_deadline_path_records_a_receipt_the_guard_suppressed(self) -> None:
+        self.claims.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        rows = [{"venue": "bachelor", "leaseId": "old-1", "startUtc": utc_iso(now - timedelta(minutes=105)), "endUtc": utc_iso(now - timedelta(minutes=60))},
+                {"venue": "bachelor", "leaseId": "old-2", "startUtc": utc_iso(now - timedelta(minutes=45)), "endUtc": utc_iso(now - timedelta(minutes=1))}]
+        (self.claims / "bachelor.lease-ledger.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        link, snap = self._r5_link_to_batch_log(spec)
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        r = self._r5_run(args, e, self._PRECLAIM_DEADLINE, link)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (3, "DEADLINE"))
+        self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes())
+
+    def test_r5_b1_the_claim_held_deadline_path_records_a_receipt_the_guard_suppressed(self) -> None:
+        self._foreign_live_claim()
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        link, snap = self._r5_link_to_batch_log(spec)
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=12)))
+        r = self._r5_run(args, e, self._CLAIM_HELD_DEADLINE, link)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (3, "DEADLINE"))
+        self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes())
+
     # r3 (sol r2b B2 = catalogue RPF-02): the lock helper took batch.log after its marker wait expired or was cancelled, whether or not the runner had paused, so a slow start was
     # locked ahead of the pause (and died on its next direct L), and 'locked' was written for a runner that never paused. These drive the helper alone: no runner, no pause marker.
     def test_r3_b2_an_expired_or_cancelled_marker_wait_takes_no_lock_and_signals_nothing(self) -> None:
