@@ -1518,7 +1518,9 @@ function Get-PresentMonProcessSnapshot() {
     $commandLines = @{}
     $commandLineError = $null
     try {
-        foreach ($row in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine -ErrorAction Stop)) { $commandLines[[int]$row.ProcessId] = [string]$row.CommandLine }
+        # r4 (adversary A1 on 9ebee964): the row's image name is kept so a command line is used only for the process it was read from (a pid reused between this query and the
+        # enumeration below carries another image name; its stale command line then counts as unreadable and the process is held)
+        foreach ($row in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine, Name -ErrorAction Stop)) { $commandLines[[int]$row.ProcessId] = [pscustomobject]@{ commandLine = [string]$row.CommandLine; name = [string]$row.Name } }
     } catch {
         $commandLineError = $_.Exception.Message
     }
@@ -1536,7 +1538,7 @@ function Get-PresentMonProcessSnapshot() {
         $pathReadable = ($candidatePath -ne '')
         $candidateName = [string]$candidate.Name
         $commandLine = ''
-        if ($commandLines.ContainsKey($candidateId)) { $commandLine = [string]$commandLines[$candidateId] }
+        if ($commandLines.ContainsKey($candidateId) -and (([string]$commandLines[$candidateId].name -replace '\.exe$', '') -ieq $candidateName)) { $commandLine = [string]$commandLines[$candidateId].commandLine }
         if ($null -eq $commandLineError -and $commandLine.Trim() -eq '') { $unreadableCommandLineCount = $unreadableCommandLineCount + 1 }
         $namesSession = ($commandLine -match $sessionCommandLinePattern)
         $pinnedHash = $false

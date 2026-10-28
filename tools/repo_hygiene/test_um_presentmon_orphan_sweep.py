@@ -485,7 +485,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
                   go_live_as: tuple[int, str, str | None] | None = None, command_lines: tuple[tuple[int | str, str], ...] = (), command_line_query_fails_from: int = 0,
                   go_live_command_line: str | None = None, pm_name: str = STUB_EXE, presentmon_sha: str | None = None,
                   pinned_copies: tuple[Path, ...] = (), session_ids: dict[int, int | str | None] | None = None,
-                  job_session: int | str | None = None) -> tuple[int, dict, Path, str]:
+                  job_session: int | str | None = None, command_line_names: dict[int, str] | None = None) -> tuple[int, dict, Path, str]:
         # r4: `session_ids` gives a process row (others / go_live_as, by pid) its SessionId: an int, None (a null value) or SESSION_THROWS (the getter throws); a pid not in it has none at all.
         # `job_session` adds the sweeping job's own row ($PID) to Get-Process with that SessionId (None: no row, as before -- the job's session is then unknown)
         # r2: `processes` are the Win32_Process rows (id, name, parent id, creation minute or None for an unreadable CreationDate) the parent read sees; `go_live_as` is the process that appears
@@ -577,6 +577,12 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         if job_session is not None:
             job_row = process_row("$PID", "pwsh", JOB_IMAGE)
             extra += f"    $all += {job_row}\n"
+        names_by_pid: dict[int | str, str] = {i: n for i, n, _p in others}
+        names_by_pid["$PID"] = "pwsh"
+
+        def cim_name(i: int | str) -> str:
+            return (command_line_names or {}).get(i, names_by_pid.get(i, "") + ".exe")
+
         go_live_row = (process_row(*go_live_as) if go_live_as is not None
                        else "[pscustomobject]@{ Id = 5151; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }")
         service_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}' }}" for i, n in services)
@@ -611,8 +617,9 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "    if ($ClassName -eq 'Win32_Process' -and -not $Filter) {\n"
             "        $global:commandLineQueries = 1 + [int]$global:commandLineQueries\n"
             f"        if ({command_line_query_fails_from} -gt 0 -and $global:commandLineQueries -ge {command_line_query_fails_from}) {{ Write-Error 'stub Win32_Process command-line query failure'; return }}\n"
-            + "".join(f"        [pscustomobject]@{{ ProcessId = {i}; CommandLine = {ps_quote(c)} }}\n" for i, c in command_lines)
-            + (f"        if (Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') {{ [pscustomobject]@{{ ProcessId = {(go_live_as or (5151,))[0]}; CommandLine = {ps_quote(go_live_command_line)} }} }}\n" if go_live_command_line else "")
+            # r4: each row carries its image name (<name>.exe, from the process table above; command_line_names overrides it -- a reused pid's stale row)
+            + "".join(f"        [pscustomobject]@{{ ProcessId = {i}; CommandLine = {ps_quote(c)}; Name = {ps_quote(cim_name(i))} }}\n" for i, c in command_lines)
+            + (f"        if (Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') {{ [pscustomobject]@{{ ProcessId = {(go_live_as or (5151,))[0]}; CommandLine = {ps_quote(go_live_command_line)}; Name = {ps_quote((go_live_as[1] if go_live_as else '') + '.exe')} }} }}\n" if go_live_command_line else "")
             + "        return\n"
             "    }\n"
             + ("    if ($ClassName -eq 'Win32_Service') { Write-Error 'stub Get-CimInstance failure'; return }\n" if service_lookup_fails else "")
@@ -1119,6 +1126,20 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assert_refused_unidentified(sweep, d)
         self.assertTrue(sweep["unidentifiedCaptureOwners"][0]["pathReadable"])
+
+    def test_r4_a1b_a_reused_pids_stale_command_line_is_no_identity(self) -> None:
+        # r4 adversary A1 on 9ebee964: the command-line query read explorer's row for pid 6100; before the enumeration the pid was reused by a renamed capture
+        code, sweep, d, out = self.run_start("r4-a1b-reused-pid", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6200, "capture", "C:\\other-harness\\cache\\capture.exe")),
+                                             processes=self.INTEL_TREE, command_lines=((6200, "C:\\Windows\\explorer.exe /factory"),), command_line_names={6200: "explorer.exe"})
+        self.assertEqual(code, 0, out)
+        self.assert_refused_unidentified(sweep, d)
+
+    def test_mutation_a_command_line_used_for_any_process_under_its_pid_sweeps_the_reused_pid_again(self) -> None:
+        mutated = mutate(TEMPLATE, "if ($commandLines.ContainsKey($candidateId) -and (([string]$commandLines[$candidateId].name -replace '\\.exe$', '') -ieq $candidateName)) {",
+                         "if ($commandLines.ContainsKey($candidateId)) {")
+        _code, sweep, d, _out = self.run_start("mut-r4-a1b", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6200, "capture", "C:\\other-harness\\cache\\capture.exe")),
+                                               processes=self.INTEL_TREE, command_lines=((6200, "C:\\Windows\\explorer.exe /factory"),), command_line_names={6200: "explorer.exe"}, text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)))
 
     # controls: GREEN on a79a5a89 and after (they read only fields both heads record)
     def test_r4_control_an_unreadable_registered_service_beside_the_intel_service_does_not_block(self) -> None:
