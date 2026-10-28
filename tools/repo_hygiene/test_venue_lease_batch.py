@@ -122,7 +122,13 @@ if ($JobId -like 'lease-batch-open-*') {
     # r5b: FAKE_OPEN_CLAIM_READONLY per open (1 = the claim file is read-only for that wait, so every renewal comes back BUSY; writable again after it)
     $ro = (Pick $env:FAKE_OPEN_CLAIM_READONLY $n '0') -eq '1'
     if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $true }
-    if ($sleep -gt 0) { Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} OPENWAIT {1} sec={2}" -f [DateTime]::UtcNow.Ticks, $JobId, $sleep); Start-Sleep -Seconds $sleep; $now = [DateTimeOffset]::UtcNow }
+    # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r8: FAKE_OPEN_RELEASE (a path) ends that wait the moment the file exists, with FAKE_OPEN_SLEEP its upper bound, so a case that acts
+    # during the wait releases the open when it is done instead of sleeping out a fixed margin
+    if ($sleep -gt 0) {
+        Add-Content -LiteralPath $env:FAKE_EVENTS -Value ("{0} OPENWAIT {1} sec={2}" -f [DateTime]::UtcNow.Ticks, $JobId, $sleep)
+        if ($env:FAKE_OPEN_RELEASE) { $until = [DateTime]::UtcNow.AddSeconds($sleep); while (-not (Test-Path -LiteralPath $env:FAKE_OPEN_RELEASE) -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 50 } } else { Start-Sleep -Seconds $sleep }
+        $now = [DateTimeOffset]::UtcNow
+    }
     if ($ro) { Set-ItemProperty -LiteralPath $env:FAKE_CLAIM_PATH -Name IsReadOnly -Value $false }
     $res = [pscustomobject]@{ jobId = $JobId; exitCode = 0; endedUtc = $now.ToString('o'); admission = [pscustomobject]$adm; stdout = 'LEASE_BATCH_OPEN' }
     if ($mode -eq 'exit1') { $res.exitCode = 1 }   # r14: the open job's receipt says it failed (OPEN_FAILED)
@@ -1255,7 +1261,11 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         # -ClaimTtlSec 60 (its floor), and um-run blocks 80 s on the open while the agent re-asks a refused (exit 75) request: longer than the claim's TTL. At
         # TTL + 10 s VenueChain.psm1's own Get-VenueClaim (Get-VenueClaimStaleReason) still finds the claim LIVE, with the same nonce and a later expiresUtc,
         # and no waiting chain could break it. RED (no renewal): the claim reads STALE reason=expired while its owner is alive and holding the venue.
-        args, e = self.batch_cmd([self.specs[0]], "-ClaimTtlSec", "60", FAKE_OPEN_SLEEP="80")
+        # r8: the open is released as soon as the TTL + 10 s checks are made (FAKE_OPEN_RELEASE; 120 s is only its bound), not slept out to 80 s. The 70 s horizon itself stays:
+        # -ClaimTtlSec has a 60 s floor, and a claim that survives its TTL can only be seen after it.
+        release = self.case / "open.release"
+        release.unlink(missing_ok=True)
+        args, e = self.batch_cmd([self.specs[0]], "-ClaimTtlSec", "60", FAKE_OPEN_SLEEP="120", FAKE_OPEN_RELEASE=str(release))
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
         try:
             end = time.monotonic() + 60
@@ -1274,6 +1284,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             c1 = read_claim_json(self.claim_path)
             self.assertGreater(parse_utc(c1["expiresUtc"]), datetime.now(timezone.utc), c1)
             self.assertEqual({k: v for k, v in c1.items() if k != "expiresUtc"}, {k: v for k, v in c0.items() if k != "expiresUtc"}, "only expiresUtc changes")
+            release.write_text("go", encoding="utf-8")
             so, se = p.communicate(timeout=300)
         finally:
             if p.poll() is None:
@@ -2752,6 +2763,24 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             time.sleep(0.2)
         self.fail(f"{text!r} never reached {log}")
 
+    def _open_release(self) -> Path:
+        """The file whose existence ends the fake um-run's open wait (FAKE_OPEN_RELEASE); absent until the case releases the open."""
+        rel = self.case / "open.release"
+        rel.unlink(missing_ok=True)
+        return rel
+
+    def _wait_for_open_wait(self, timeout_s: float = 90) -> None:
+        """Returns once the fake um-run is blocked in the open's wait (its OPENWAIT event, logged just before it blocks), so what the case does next lands inside that wait."""
+        end = time.monotonic() + timeout_s
+        while time.monotonic() < end:
+            try:
+                if any(" OPENWAIT " in line for line in self.events_raw()):
+                    return
+            except OSError:
+                pass
+            time.sleep(0.05)
+        self.fail("the open never reached its wait")
+
     def _alias_during_claim_wait(self, args: list[str], e: dict, spec: Path, alias: Path) -> tuple[int, str, str]:
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
@@ -3185,11 +3214,14 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # bounded by the lease's room less -LeaseMarginSec, the leg budget and 1 s, and a re-hash that cannot fit is refused typed while the leg budget is still left. The card's numbers
     # (cap 120, leg 60, margin 0, a 70 s hash) are scaled to cap 95 and a 40 s hash so the case stays near 30 s (-LegBudgetSec cannot go under 60). The hash is slow only once the
     # open was answered (the fake agent's state file exists), so the preflight and the claim guard stay fast.
-    def _post_open_hash_run(self, hash_sec: float, *extra: str, cap: str = "95", leg: str = "60", margin: str = "0", items: list | None = None, **env: str) -> tuple[subprocess.CompletedProcess, float]:
+    def _post_open_hash_run(self, hash_sec: float, *extra: str, cap: str = "95", leg: str = "60", margin: str = "0", items: list | None = None, post_open: str | None = None,
+                            **env: str) -> tuple[subprocess.CompletedProcess, float]:
+        # post_open: PowerShell run in the artifact probe once the open was answered, in place of the hash_sec sleep
         state = self.share / "fake-agent-state.json"
         self.assertFalse(state.exists())
         probe = self.case / "artifact-probe-post-open.ps1"
-        probe.write_text("param($items)\n" + f"if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ [Threading.Thread]::Sleep({int(hash_sec * 1000)}) }}\n", encoding="utf-8")
+        body = post_open if post_open is not None else f"[Threading.Thread]::Sleep({int(hash_sec * 1000)})"
+        probe.write_text("param($items)\n" + f"if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ {body} }}\n", encoding="utf-8")
         r = self.run_plan(self.write_plan(items or [self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", cap, "-LegBudgetSec", leg, "-LeaseMarginSec", margin,
                           "-ArtifactProbeScript", str(probe), *extra, **env)
         ticks = {}
@@ -3205,8 +3237,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("close", ticks, r.stdout + r.stderr)
         return r, (ticks["close"] - ticks["open"]) / 1e7
 
+    # r8: the slow-rehash cases run in the cap 75 / leg 60 room (14 s) the guard-read cases already use, with the hash 6 s over the room as the 40 s hash was over the 34 s room of
+    # cap 95: the refusal must land inside the room (held < 75 - 60 + 4), never after the hash has spent the leg budget (LEG_BUDGET_EXCEEDS_LEASE)
     def test_artifact_preflight_r3_a_slow_post_open_rehash_is_refused_typed_before_the_leg_budget_is_spent(self) -> None:
-        r, held = self._post_open_hash_run(40)
+        r, held = self._post_open_hash_run(20, cap="75")
         log = self.run_dir / "batch.log"
         text = r.stdout + r.stderr + (log.read_text(encoding="utf-8", errors="replace") if log.exists() else "")
         self.assertEqual(r.returncode, 2, text)
@@ -3217,8 +3251,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         [b] = self.batches()
         self.assertEqual((b["endReason"], b["legsAttempted"]), ("SHARE_UNREACHABLE", 0))
         self.assertEqual(self.leg_calls(), [])
-        # refused while a leg budget was still left in the 95 s lease, not after the 40 s hash
-        self.assertLess(held, 95 - 60, f"the lease was held {held:.1f} s before the close: the re-hash ran into the leg budget")
+        # refused while a leg budget was still left in the 75 s lease, not after the 20 s hash
+        self.assertLess(held, 75 - 60 + 4, f"the lease was held {held:.1f} s before the close: the re-hash ran into the leg budget")
 
     def test_artifact_preflight_r3_a_fast_post_open_rehash_still_runs_the_leg(self) -> None:
         r, held = self._post_open_hash_run(0)
@@ -3263,11 +3297,11 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # r3 adversary A2 (pass 1 on 5c3407ff): an open held in the agent's gate ran the guard at once with no budget (300 s), so a slow re-hash ran while the agent had already admitted
     # the open and published its result, and the lease was held through it before the lease-aware guard below ever started. That call now checks locations only.
     def test_artifact_preflight_r3_adv_a2_a_gate_held_open_is_not_rehashed_before_its_result_is_read(self) -> None:
-        r, held = self._post_open_hash_run(40, FAKE_OPEN_MODES="gatewait")
+        r, held = self._post_open_hash_run(20, cap="75", FAKE_OPEN_MODES="gatewait")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
         self.assertEqual(self.leg_calls(), [])
-        self.assertLess(held, 95 - 60, f"the lease was held {held:.1f} s before the close: a re-hash ran outside the lease's room")
+        self.assertLess(held, 75 - 60 + 4, f"the lease was held {held:.1f} s before the close: a re-hash ran outside the lease's room")
 
     # r4 ITEM 1 (hub ruling 2026-10-27T17:18:14Z: one absolute deadline through both phases; key3 and fable r3 B1). On 02612714 each build's share was split into a fixed manifest
     # part (min(30, share - 1)) and the rest for the hash, so read time the manifest did not use never reached the hash and a check that fits was refused SHARE_UNREACHABLE.
@@ -3318,12 +3352,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_artifact_preflight_r4_item1_control_a_hash_over_the_remainder_is_still_refused_inside_the_room(self) -> None:
         # the control: the one deadline still binds. A 0.1 s manifest read and a 40 s re-hash in the 34 s room end SHARE_UNREACHABLE while the leg budget is left (the r3 40 s case
         # above holds the same with a fast manifest read).
-        r, held = self._post_open_hash_run(40)
+        r, held = self._post_open_hash_run(20, cap="75")
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
         self.assertIn("could not be hashed", r.stderr)
         self.assertEqual(self.leg_calls(), [])
-        self.assertLess(held, 95 - 60, f"the lease was held {held:.1f} s: the re-hash ran into the leg budget")
+        self.assertLess(held, 75 - 60 + 4, f"the lease was held {held:.1f} s: the re-hash ran into the leg budget")
 
     # r4 ITEM 2 (sol r3 B1; Dot 6454756990): the guard's own file system reads -- a build manifest's existence (Test-Path), each input's physical path and identity
     # (Get-RunDirOutputRefusal), each leg spec's bytes (Get-LegSpecRefusal) -- ran OUTSIDE the bounded reader, so one that blocked spent the lease's leg reserve and the refusal came
@@ -3592,12 +3626,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self._junction(link, old)
         self.addCleanup(lambda: os.path.lexists(link) and os.rmdir(link))
         self.run_dir = link
+        # r8: the open blocks until the junction is removed (FAKE_OPEN_RELEASE), not for a fixed 6 s; the 3 s -GuardReadDelay is only what a main-thread -RunDir read would stall on
+        # (GUARD_READ_DELAY_SEAM on stderr says it did), so it does not have to outlast anything
+        release = self._open_release()
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "75", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
-                                "-GuardReadDelay", "open:rundir=10", FAKE_OPEN_SLEEP="6")
+                                "-GuardReadDelay", "open:rundir=3", FAKE_OPEN_SLEEP="60", FAKE_OPEN_RELEASE=str(release))
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            self._wait_for_open_wait()
             os.rmdir(link)   # the junction itself; its target stays
+            release.write_text("go", encoding="utf-8")
             so, se = p.communicate(timeout=240)
         finally:
             if p.poll() is None:
@@ -3761,13 +3800,21 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual((got["state"], got["problem"]), ("STAGED", ""), got)
 
     # r7 adversary A1 (pass 1 on dbe8a7a0): the guard capped a build's share at 300 s while the room was larger, so a 310 s post-open hash (one the preflight's 30 s + 300 s
-    # bounds accept) in a 519 s room was refused SHARE_UNREACHABLE and the lease charged with no leg. The cap is now the preflight's own 330 s. The adversary's input, literally
-    # (about 6 minutes: the hash sleeps 310 s).
+    # bounds accept) in a 519 s room was refused SHARE_UNREACHABLE and the lease charged with no leg. The cap is now the preflight's own 330 s. The adversary's input, literally.
+    # r8: the hash bound is read, not waited out. Invoke-VenueBoundedRead gives the post-open hash exactly (endSec - clock) seconds, so the probe records that bound at its start and
+    # hashes at once: a 310 s hash is accepted iff the bound it was given is over 310 s. RED on a 300 s cap: the bound is at most 300 s and this fails, as the 310 s sleep did.
     def test_artifact_preflight_r7_adv_a1_a_310s_post_open_hash_in_a_519s_room_runs_the_leg(self) -> None:
-        r, held = self._post_open_hash_run(310, "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=900)), cap="1000", leg="360", margin="120")
+        bounds = self.case / "post-open-hash-bounds.txt"
+        bounds.unlink(missing_ok=True)
+        record = f"[IO.File]::AppendAllText('{bounds}', ([string]($items[0].endSec - $items[0].clock.Elapsed.TotalSeconds) + [Environment]::NewLine))"
+        r, held = self._post_open_hash_run(0, "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=900)), cap="1000", leg="360", margin="120", post_open=record)
         self.assertNotIn("LEG_PLAN_REFUSED", r.stderr, r.stderr)
         [b] = self.batches()
         self.assertEqual((b["endReason"], b["legsRan"]), ("ALL_LEGS_DONE", 1), b)
+        given = [float(x) for x in bounds.read_text(encoding="utf-8").split()]
+        self.assertTrue(given, "the post-open hash probe ran")
+        self.assertGreater(max(given), 310, f"the post-open hash was given at most {max(given):.1f} s: a 310 s hash the preflight accepts would be refused")
+        self.assertLessEqual(max(given), 330, f"the post-open hash was given {max(given):.1f} s: over the preflight's own 330 s bounds")
 
     def test_artifact_preflight_r7_adv_a1_the_guard_share_cap_is_the_preflights_own_bounds(self) -> None:
         text = RUNNER.read_text(encoding="utf-8")
@@ -3855,7 +3902,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "exit1": (9, "OPEN_FAILED", ()),
             "nobatch": (10, "AGENT_NOT_BATCH_CAPABLE", ()),
             "gatewait": (2, "LEG_SPEC_IS_RUN_OUTPUT", ()),
-            "gatehold": (11, "OPEN_CANCEL_UNRECONCILED", ("-CancelReconcileSec", "3", "-DeadlineUtc", "+60")),
+            # r8: the held open is waited for until the deadline, so the deadline is the case's whole run time: 20 s (it was 60) is still 6-7 times what the run needs to reach the open
+            "gatehold": (11, "OPEN_CANCEL_UNRECONCILED", ("-CancelReconcileSec", "3", "-DeadlineUtc", "+20")),
         }
         for mode, (code, reason, extra) in cases.items():
             with self.subTest(open=mode):
@@ -3873,13 +3921,16 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         spec.unlink(missing_ok=True)
         shutil.copy2(self.specs[0], spec)
         before = hashlib.sha256(spec.read_bytes()).hexdigest()
-        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), *extra, FAKE_OPEN_SLEEP="12", FAKE_OPEN_MODES=mode)
+        # r8: the open blocks until the link is made (FAKE_OPEN_RELEASE) -- 60 s is only its bound -- instead of for a fixed 12 s
+        release = self._open_release()
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), *extra, FAKE_OPEN_SLEEP="60", FAKE_OPEN_RELEASE=str(release), FAKE_OPEN_MODES=mode)
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
-            time.sleep(2)
+            self._wait_for_open_wait()
             (self.run_dir / "batch.log").unlink(missing_ok=True)
             os.link(spec, self.run_dir / "batch.log")
+            release.write_text("go", encoding="utf-8")
             so, se = p.communicate(timeout=300)
         finally:
             if p.poll() is None:
