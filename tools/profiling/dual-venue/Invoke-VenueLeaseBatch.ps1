@@ -108,7 +108,8 @@
 # 3 DEADLINE before every leg ran (a cooldown, budget or exit-75 wait that reached it included); 4 GATE_UNREADABLE and 5 HOST_MISMATCH from Wait-VenueQuiet; 6 a probe ended VENUE_QUIET_UNKNOWN; 7 a leg process exited
 # non-zero (LEG_FAILED) or was killed at the lease's end (LEASE_EXPIRED; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
 # UNRESOLVED or not admitted, or never submitted because its sidecar could not be written: LIVENESS_UNAVAILABLE, or its job file could not be written here:
-# OPEN_JOB_WRITE_FAILED, no cancel, no close, no ledger charge); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
+# OPEN_JOB_WRITE_FAILED, or refused at its dispatch because the agent could admit it after the claim's last good expiry while the keeper is not renewing the claim:
+# OPEN_OUTLIVES_CLAIM (CLAIM_LOST when the keeper found it lost), no cancel, no close, no ledger charge); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
 # 7a); 12 an unexpected throw inside a batch after its claim was taken (BATCH_ERROR: the claim keeper is stopped, the claim released and the batch receipt written
 # first; a leg whose child had started is LEG_FAILED reason=BATCH_ERROR, the legs never started are NOT_RUN). A stopping code (2-6, 9, 10) replaces 0 or 7; 12 replaces every other code but 11, and 11 replaces every other code.
 # 13 a receipt file could not be written (batch-NN.json or batches.jsonl, e.g. occupied by a directory): RECEIPT_PERSIST_FAILED file=<path> reason=<msg> is logged once per failure, the summary still prints with
@@ -120,6 +121,8 @@
 # r7: every writer into -RunDir (and the claim dir's ledger) asks Test-RunDirWrite right before it writes: a destination that is an accepted input (as accepted or as its path resolves now),
 # will not resolve, or could be reached through an accepted input that is there but will not resolve, is not written; the suppression turns on and the run ends in that typed stop (exit 2).
 # An input that no longer resolves (INPUT_VANISHED / INPUT_UNREADABLE) suppresses the writes at the open and at a later claim, as an alias does.
+# r8 (Dot residual B2): no open is sent once a write was refused, whichever writer found it (a log line just before the open, the open's own job folder): the open's dispatch asks
+# one predicate (Get-OpenDispatchRefusal) right before um-run is called; the claim is released, and a close the run still owes (an open already sent) is still submitted.
 # Once a batch receipt exists, every end prints LEASE_BATCH_RESULT: a log line between batches is best effort, and an input refused at a later claim (exit 2) prints the summary first.
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
 [CmdletBinding(DefaultParameterSetName = 'Scalar')]
@@ -929,9 +932,28 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
     [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff }
 }
 
+function Get-OpenDispatchRefusal([string]$NotAfterUtc) {
+    # r8 (Dot residual B2 on 9bbfaf75): THE one predicate the open's dispatch consults, at the dispatch site (Submit-AgentJob -Open: before its job file is written and again right
+    # before um-run is called). $null = the open may be sent; else @{ reason; code; detail }, the batch's typed stop (the batch catch), and nothing is sent.
+    # (a) a write refused ANYWHERE before it (the claim guard, a log line, leg-plan.json, the open's own job folder, asked here) turned the suppression on and stopped the claim
+    #     keeper: no open follows it, whichever writer found it first.
+    if (-not $script:RunOutputAliased) { $null = Test-RunDirWrite $jobDir -Directory }
+    if ($script:RunOutputAliased) { $hr = Get-HitRefusal $script:suppressionHit; return [pscustomobject]@{ reason = $hr[0]; code = 2; detail = "a write into -RunDir was refused before the open was sent: $($hr[2])" } }
+    # (b) the claim bounds the admission: the agent may admit the open until its notAfterUtc. An admission that could come after the claim's last good expiry is refused unless the
+    #     keeper is renewing it on schedule (live, not lost, no renewal failed: none due yet, or the last one RENEWED; -ClaimRenewSec is at most half the TTL, so one is due first).
+    #     Get-VenueClaimKeeperLoss asked AT the open's notAfterUtc: $null = the claim's last good expiry is later than any admission.
+    $s = $claimKeeper.state
+    $atLatest = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc -NowUtc $NotAfterUtc
+    if ($null -eq $atLatest) { return $null }
+    $renewing = $script:keeperLive -and -not $s.lost -and [int]$s.errors -eq 0 -and ([int]$s.runs -eq 0 -or [string]$s.last -ceq 'RENEWED')
+    if ($renewing) { return $null }
+    [pscustomobject]@{ reason = $(if ($s.lost) { 'CLAIM_LOST' } else { 'OPEN_OUTLIVES_CLAIM' }); code = 9; detail = "the open may be admitted until its notAfterUtc=$NotAfterUtc, when the claim is lost unless renewed ($($atLatest.detail)), and the keeper is not renewing it (live=$([bool]$script:keeperLive) runs=$($s.runs))" }
+}
+
 function Submit-AgentJob([string]$JobId, [string]$Body, [int]$TimeoutSec, [int]$WaitSec, [string]$NotAfterUtc = '', [switch]$Open) {
-    # r7 pass 3 (adversary r7 pass 2 A1): the open's job folder refused (the keeper is stopped by then): nothing is submitted, the batch ends in that typed stop (the batch catch)
-    if ($Open -and -not $script:RunOutputAliased -and -not (Test-RunDirWrite $jobDir -Directory)) { $script:preOpenRefused = $true; throw 'the open job folder was refused before the open' }
+    # r8 (Dot residual B2): the open asks Get-OpenDispatchRefusal before its job file is written (r7 pass 3: its job folder refused) and again right before um-run (below). A refusal
+    # sends nothing: the batch ends in its typed stop (the batch catch), the claim is released, and no cancel or close follows (um-run was never called for it).
+    if ($Open) { $script:openRefusal = Get-OpenDispatchRefusal $NotAfterUtc; if ($script:openRefusal) { throw "the open was refused at its dispatch: $($script:openRefusal.detail)" } }
     # One job through um-run.ps1 (the only writer to a venue share). RECEIPT | RETRACTED | UNRESOLVED | ERROR; a thrown RETRACTED / UNRESOLVED is data here.
     # r4: -NotAfterUtc (the open only) goes to um-run.ps1 -NotAfterUtc, meta.json notAfterUtc: the agent takes no lease for the job past it.
     # r16 (sol r15 B1): JOB_WRITE_FAILED = the job file was never complete here (no job folder, the create or the write failed), so um-run.ps1 was never called and
@@ -951,6 +973,8 @@ function Submit-AgentJob([string]$JobId, [string]$Body, [int]$TimeoutSec, [int]$
     } catch {
         return [pscustomobject]@{ outcome = 'JOB_WRITE_FAILED'; result = $null; message = "the job file for $JobId could not be written ($($_.Exception.Message -replace '\s+', ' ')): um-run was not called" }
     }
+    # r8: the dispatch itself. A refusal found since the ask above (by nothing on this thread today) still sends nothing; the job file stays here, never handed to um-run.
+    if ($Open) { $script:openRefusal = Get-OpenDispatchRefusal $NotAfterUtc; if ($script:openRefusal) { throw "the open was refused at its dispatch: $($script:openRefusal.detail)" } }
     try {
         $script:umRunCalled[$JobId] = $true
         $o = @(& $UmRunScript -ScriptPath $f -JobId $JobId -AgentShare $AgentShare -TimeoutSec $TimeoutSec -MaxQueueWaitSec $WaitSec -MaxClaimedWaitSec 300 -MaxAdmissionWaitSec $WaitSec @bound 6>$null)
@@ -1246,8 +1270,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         if ($legPlanMode -and (Test-RunDirWrite $legPlanFile)) { [IO.File]::WriteAllText($legPlanFile, ($planRecord | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false)) }
         # (2) OPEN: the lease first. Nothing is probed or run before the agent reports this batch's lease active.
         # r7 pass 2 (adversary r7 A3): a write refused before the open (CLAIM_TAKEN, leg-plan.json) stopped the claim keeper: no open is submitted then (it could outlive the claim);
-        # the batch ends in that typed stop (the catch below), the claim is released and nothing was sent
-        if ($script:RunOutputAliased) { $script:preOpenRefused = $true; throw 'a write into -RunDir was refused before the open' }
+        # the batch ends in that typed stop (the catch below), the claim is released and nothing was sent. r8 (Dot residual B2): asked through the dispatch predicate, which
+        # Submit-AgentJob asks again at the dispatch itself (a refusal found by a log line below, or by the open's job folder, ends the batch the same way)
+        $script:openRefusal = Get-OpenDispatchRefusal $deadline.ToString('o'); if ($script:openRefusal) { throw "the open was refused before its sidecar: $($script:openRefusal.detail)" }
         $b.openJobId = "lease-batch-open-$stamp-lb$token"
         $wait = [int][Math]::Max(60, [Math]::Min($OpenAdmissionWaitSec, ($deadline - [DateTime]::UtcNow).TotalSeconds))
         L "BATCH_OPEN_SUBMIT batch=$batchNo token=$token job=$($b.openJobId) admissionWaitSec=$wait (the agent requests the lease; heavy-slot.py's cooldown is waited out there)"
@@ -1505,8 +1530,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             }
         }
     } catch {
-        # r7 pass 2: the refusal before the open is its own typed stop, never BATCH_ERROR
-        if ($script:preOpenRefused) { $script:preOpenRefused = $false; Stop-BatchOnSuppression $b } else {
+        # r7 pass 2: the refusal before the open is its own typed stop, never BATCH_ERROR. r8: whichever check refused it (Get-OpenDispatchRefusal), nothing was sent
+        if ($script:openRefusal) {
+            $rf = $script:openRefusal; $script:openRefusal = $null
+            $b.endReason = $rf.reason; $b.endDetail = "$($rf.detail) (the open was not submitted: nothing ran, nothing counted)"; Set-Stop $rf.reason $rf.code
+        } else {
         # r5 (key3 F1): an unexpected throw anywhere in the batch is a typed stop, not an unhandled exit 1 that skips the summary. The finally below runs first; 12 replaces every code.
         $b.endReason = 'BATCH_ERROR'; $b.endDetail = ($_.Exception.Message -replace '\s+', ' ')
         $script:stopReason = 'BATCH_ERROR'; $script:exitCode = 12

@@ -3269,6 +3269,108 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                     # adversary r7 A3 / pass 2 A1: a refusal before the open stopped the claim keeper, so no open is submitted after it (it could outlive the claim)
                     self.assertNotIn("OPEN:", " ".join(self.kinds()), "an open was submitted after a write was refused before it")
 
+    # r8 (Dot residual B2 on 9bbfaf75): a write refused before the open, by whichever writer, means no open is sent. The open's dispatch asks one predicate (Get-OpenDispatchRefusal) right
+    # before um-run is called, so a refusal found AFTER the pre-open check (a log line on the way to the open, the open's own job folder) ends the batch the same way.
+    _R8_OPEN_ANCHOR = "            $op = Submit-AgentJob $b.openJobId "
+
+    def _r8_run(self, anchor: str, make: str, *extra: str, legs: int = 1) -> tuple[subprocess.CompletedProcess, Path, Path]:
+        """One plan run with `make` (PowerShell; {b} = the last spec) run once just before `anchor`; (the run, the last spec, its snapshot taken right after `make`)."""
+        self._stage_case()
+        specs = [self._r5_spec(n, s) for n, s in (("fx-a.json", self.specs[0]), ("fx-b.json", self.specs[1]))][:max(1, legs)]
+        b, snap = specs[-1], self.case / "r8.snap"
+        args, e = self.plan_cmd(self.write_plan([self.item(s, "A", self.commit_a) for s in specs]), *extra)
+        indent = re.match(r"\s*", anchor).group(0)
+        inject = f"{indent}if (-not $script:r8Done) {{ $script:r8Done = $true; {make.format(b=psq(b))}; Copy-Item -LiteralPath '{psq(b)}' -Destination '{psq(snap)}' }}\n"
+        args[args.index("-File") + 1] = str(self._patched_runner(anchor, inject + anchor))
+        return subprocess.run(args, capture_output=True, text=True, timeout=240, env=e), b, snap
+
+    def _r8_open_jobs_written(self) -> list[str]:
+        jobs = self.run_dir / "batch-jobs"
+        return sorted(p.name for p in jobs.glob("lease-batch-open-*")) if jobs.is_dir() else []
+
+    def test_r8_b2_a_log_refusal_after_the_pre_open_check_sends_no_open(self) -> None:
+        # Dot B2 steps 1-3: batch.log becomes a hard link to the spec after the pre-open check, while the open's sidecar is written. The next log line refuses it (the keeper is
+        # stopped, the TEMP redirect made), and Submit-AgentJob then accepted the redirect and sent the OPEN. RED on dae24318: OPEN in the um-run calls.
+        relink = "[IO.File]::Delete((Join-Path $RunDir 'batch.log')); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch.log') -Value '{b}' | Out-Null"
+        for name, anchor in (("before BATCH_OPEN_SUBMIT", '        L "BATCH_OPEN_SUBMIT batch='),
+                             ("while the sidecar is written (Dot's route)", '        L "BATCH_OPEN_LIVENESS batch='),
+                             ("before the sidecar read-back line", '            L "BATCH_OPEN_LIVENESS_READBACK batch=')):
+            with self.subTest(at=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r, b, snap = self._r8_run(anchor, relink)
+                out = r.stdout + r.stderr
+                self.assertTrue(snap.exists(), "batch.log was relinked to the spec (the case under test)\n" + out)
+                self.assertEqual(b.read_bytes(), snap.read_bytes(), "a log line was appended into the accepted input\n" + out)
+                self.assertNotIn("OPEN:", " ".join(self.kinds()), "an OPEN was sent after a write was refused before it\n" + out)
+                self.assertEqual(self._r8_open_jobs_written(), [], "the open's job file was written under -RunDir")
+                self.assertIn("BATCH_WRITE_REFUSED ", r.stderr)
+                self.assertFalse(self.claim_path.exists(), "the claim was left behind\n" + out)
+                self.assertEqual(r.returncode, 2, out)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["stopReason"], res["batches"][0]["endReason"], res["batches"][0]["leaseId"]), ("LEG_SPEC_IS_RUN_OUTPUT", "LEG_SPEC_IS_RUN_OUTPUT", None), res)
+
+    def test_r8_b2_suppression_first_found_by_the_open_job_folder_guard_sends_no_open(self) -> None:
+        # Dot B2 (the :925 continuation): the open's job folder holds a hard link to the spec when the open is submitted; Submit-AgentJob's own guard is the first to see it.
+        # RED on 9bbfaf75 (the guard turned the suppression on and the open went out through the TEMP redirect); fixed on dae24318 by r7 pass 3 A1, kept by the r8 predicate.
+        r, b, snap = self._r8_run(self._R8_OPEN_ANCHOR, "New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch-jobs\\keep.json') -Value '{b}' | Out-Null")
+        out = r.stdout + r.stderr
+        self.assertTrue(snap.exists(), out)
+        self.assertEqual(b.read_bytes(), snap.read_bytes(), out)
+        self.assertNotIn("OPEN:", " ".join(self.kinds()), "an OPEN was sent after its own job folder was refused\n" + out)
+        self.assertEqual(self._r8_open_jobs_written(), [], out)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind\n" + out)
+        self.assertEqual(r.returncode, 2, out)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["stopReason"], res["batches"][0]["endReason"]), ("LEG_SPEC_IS_RUN_OUTPUT", "LEG_SPEC_IS_RUN_OUTPUT"), res)
+
+    def test_r8_a_suppression_after_the_open_was_sent_still_submits_the_close(self) -> None:
+        # The close the run owes is kept: batch.log becomes a hard link to the spec once the open has returned with its lease. The guard refuses it, nothing is probed or run,
+        # and the CLOSE still goes out (its job file under the TEMP redirect, never under -RunDir).
+        r, b, snap = self._r8_run("        $adm = $(if ($null -ne $op.result) { $op.result.admission } else { $null })",
+                                  "[IO.File]::Delete((Join-Path $RunDir 'batch.log')); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch.log') -Value '{b}' | Out-Null")
+        out = r.stdout + r.stderr
+        self.assertTrue(snap.exists(), out)
+        self.assertEqual(b.read_bytes(), snap.read_bytes(), out)
+        k = [x.split(":")[0] for x in self.kinds()]
+        self.assertEqual(k, ["OPEN", "CLOSE"], "the open was sent, so its close is owed (and nothing ran)\n" + out)
+        jobs = self.run_dir / "batch-jobs"
+        self.assertEqual(sorted(p.name for p in jobs.glob("lease-batch-close-*")) if jobs.is_dir() else [], [], "the close job was written under -RunDir")
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind\n" + out)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertEqual(batch_result(r.stdout)["stopReason"], "LEG_SPEC_IS_RUN_OUTPUT")
+
+    def test_r8_an_open_that_could_be_admitted_after_the_claim_expires_is_not_sent(self) -> None:
+        # Dot B2 step 4: the agent may admit the open until its notAfterUtc (the batch deadline, ~240 s here) and -ClaimTtlSec is 60. That is sent only while the keeper renews
+        # the claim on schedule; a keeper that is stopped or whose renewal failed refuses the open OPEN_OUTLIVES_CLAIM (exit 9), nothing sent, the claim released.
+        # RED on dae24318: the open is sent. Controls: a renewal that came back RENEWED, and a stopped keeper whose claim outlasts the open's notAfterUtc, still open.
+        stop = "$script:keeperStoppedEarly = $true; $script:keeperStoppedInTime = Stop-VenueKeeper -Keeper $claimKeeper; $script:keeperLive = $false"
+        cases = {
+            "keeper stopped": (stop, ("-ClaimTtlSec", "60"), False),
+            "last renewal BUSY": ("$claimKeeper.state.runs = 1; $claimKeeper.state.ok = 1; $claimKeeper.state.last = 'BUSY'", ("-ClaimTtlSec", "60"), False),
+            "a renewal threw": ("$claimKeeper.state.runs = 1; $claimKeeper.state.errors = 1; $claimKeeper.state.lastError = 'injected'", ("-ClaimTtlSec", "60"), False),
+            "control: last renewal RENEWED": ("$claimKeeper.state.runs = 1; $claimKeeper.state.ok = 1; $claimKeeper.state.renews = 1; $claimKeeper.state.last = 'RENEWED'",
+                                              ("-ClaimTtlSec", "60"), True),
+            "control: keeper stopped, the claim outlasts notAfterUtc": (stop, (), True),
+        }
+        for name, (make, extra, sent) in cases.items():
+            with self.subTest(case=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r, _b, snap = self._r8_run(self._R8_OPEN_ANCHOR, make, *extra)
+                out = r.stdout + r.stderr
+                self.assertTrue(snap.exists(), out)
+                self.assertFalse(self.claim_path.exists(), "the claim was left behind\n" + out)
+                k = [x.split(":")[0] for x in self.kinds()]
+                res = batch_result(r.stdout)
+                if sent:
+                    self.assertEqual((r.returncode, k[0], k[-1]), (0, "OPEN", "CLOSE"), out)
+                    continue
+                self.assertEqual(k, [], "an open that could be admitted after the claim's expiry was sent\n" + out)
+                self.assertEqual(self._r8_open_jobs_written(), [], out)
+                self.assertEqual(r.returncode, 9, out)
+                [b1] = self.batches()
+                self.assertEqual((res["stopReason"], b1["endReason"], b1["leaseId"]), ("OPEN_OUTLIVES_CLAIM", "OPEN_OUTLIVES_CLAIM", None), b1)
+                self.assertIn("notAfterUtc=", b1["endDetail"])
+
     def test_r7_adv2_a4_a_preflight_refusal_with_an_uninspectable_zone_appends_nothing_to_the_plan(self) -> None:
         # adversary r7 pass 2 A4: the plan file IS RunDir\batch.log (one name) and RunDir\gate.log is a link to nothing, so the preflight guard types OUTPUT_ZONE_UNRESOLVED; before any input
         # is accepted nothing is compared, and the refusal line was appended into the plan
