@@ -97,6 +97,14 @@
 #         position and venue heat fall on every arm alike. Per-leg budget, re-check, claim loss and deadline handling are the scalar form's, leg by leg.
 #      c. Each leg process gets its own -SourceCommit / -BuildManifestSha256 / -Backend; each batch leg row and run result carries name, arm, backend, sourceCommit
 #         and buildManifestSha256; the LEG ... RUN line names them; <RunDir>\leg-plan.json (written once the claim is held) keeps the validated plan in run order and each build's staged state.
+#  10. THERMAL (BACHELOR-THERMAL-GATE-WAIT-1, VenueThermalGate.psm1). In PR493-CONTROL-ARM-QUIET-AB-1 r1, 3 of 36 legs ran and were discarded THERMAL_HOT, each
+#      directly after a CPU-saturating leg. a. WAIT FOR COOL: a QUIET in-lease probe whose own "tele heat" reading (the agent's heavy-slot feed and hot rule)
+#      is hot is re-probed every -ThermalPollSec for up to -ThermalWaitCapSec (180) from its first hot reading in the batch; still hot then, the leg is
+#      THERMAL_HOT_SKIPPED and re-queued at the end of the run (at most -ThermalRequeueMax times; past that it stays THERMAL_HOT_SKIPPED, uncounted, exit 7).
+#      Unknown heat is not gated. Each RAN row records thermalWaitSec, heatAtProbe (the first reading), heatAtLaunch and the agent's heatAtGrant; the batch
+#      receipt counts thermalWaits and thermalSkips. b. SPREAD: -PlanOrder ThermalSpread -HeatFrom <earlier run dirs> measures heavy leg keys from those
+#      receipts (a key whose next leg on the same lease read hot) and orders the plan so no two heavy legs are adjacent (leg-plan.json thermalSpread).
+#      The inter-lease cooldown (CAPS b) is untouched.
 # It changes nothing on Bachelor: not heavy-slot.py's caps, not its lease file, not the quiet threshold. A batch run needs the lease-batch agent deployed.
 #
 #   pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueLeaseBatch.ps1 -LegSpec a.json,b.json -Backend cpu -RunDir <rd> `
@@ -106,7 +114,7 @@
 # Exit codes (a leg's OUTCOME is never the exit code: read LEASE_BATCH_RESULT and the receipts): 0 every leg ran; 2 usage (or a leg budget no lease can hold,
 # or a refused -LegPlan: LEG_PLAN_REFUSED);
 # 3 DEADLINE before every leg ran (a cooldown, budget or exit-75 wait that reached it included); 4 GATE_UNREADABLE and 5 HOST_MISMATCH from Wait-VenueQuiet; 6 a probe ended VENUE_QUIET_UNKNOWN; 7 a leg process exited
-# non-zero (LEG_FAILED) or was killed at the lease's end (LEASE_EXPIRED; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
+# non-zero (LEG_FAILED), was killed at the lease's end (LEASE_EXPIRED) or stayed THERMAL_HOT_SKIPPED past its re-queues (item 10; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
 # UNRESOLVED or not admitted, or never submitted because its sidecar could not be written: LIVENESS_UNAVAILABLE, or its job file could not be written here:
 # OPEN_JOB_WRITE_FAILED, no cancel, no close, no ledger charge); 10 the agent is not batch-capable; 11 an open left in the agent's gate was cancelled but never reconciled (OPEN_CANCEL_UNRECONCILED,
 # 7a); 12 an unexpected throw inside a batch after its claim was taken (BATCH_ERROR: the claim keeper is stopped, the claim released and the batch receipt written
@@ -124,7 +132,13 @@ param(
     [Parameter(ParameterSetName = 'Scalar', Mandatory = $true)][ValidatePattern('^[0-9a-f]{64}$')][string]$BuildManifestSha256,
     # LEASE-BATCH-MULTI-BUILD-1 (item 9): an ordered leg plan, each leg with its own build, backend and arm, run in ONE batched lease series
     [Parameter(ParameterSetName = 'Plan', Mandatory = $true)][string]$LegPlan,
-    [Parameter(ParameterSetName = 'Plan')][ValidateSet('AsGiven', 'Interleave')][string]$PlanOrder = 'AsGiven',
+    [Parameter(ParameterSetName = 'Plan')][ValidateSet('AsGiven', 'Interleave', 'ThermalSpread')][string]$PlanOrder = 'AsGiven',
+    # BACHELOR-THERMAL-GATE-WAIT-1 (item 10): the earlier lease-batch run dirs whose receipts measure which legs are heavy (-PlanOrder ThermalSpread)
+    [Parameter(ParameterSetName = 'Plan')][string[]]$HeatFrom = @(),
+    # item 10: a QUIET probe that reads hot is re-probed for up to this long before the leg is THERMAL_HOT_SKIPPED and re-queued (0 = no thermal gate)
+    [ValidateRange(0, 1800)][int]$ThermalWaitCapSec = 180,
+    [ValidateRange(1, 600)][int]$ThermalPollSec = 30,
+    [ValidateRange(0, 5)][int]$ThermalRequeueMax = 1,
     [string]$Purpose = '',
     [string]$SheetCopyDir = '',
     # passed through to Wait-VenueQuiet.ps1 (never relaxed here)
@@ -163,6 +177,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
+Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
 
 function Stop-Usage([string]$Message) { [Console]::Error.WriteLine("BATCH_USAGE $Message"); exit 2 }
 
@@ -185,7 +200,9 @@ if (2 * $ClaimRenewSec -gt $ClaimTtlSec) { Stop-Usage "-ClaimRenewSec $ClaimRene
 if (2 * $LivenessRenewSec -gt $LivenessWindowSec) { Stop-Usage "-LivenessRenewSec $LivenessRenewSec is over half of -LivenessWindowSec ${LivenessWindowSec}: one late write would lapse a live runner" }
 $legPlanMode = ($PSCmdlet.ParameterSetName -ceq 'Plan')
 # -PlanOrder binds case-insensitively; every later test of it is case-sensitive, so name the canonical spelling once (sol r3 A1)
-$PlanOrder = @('AsGiven', 'Interleave') | Where-Object { $_ -ieq $PlanOrder } | Select-Object -First 1
+$PlanOrder = @('AsGiven', 'Interleave', 'ThermalSpread') | Where-Object { $_ -ieq $PlanOrder } | Select-Object -First 1
+$HeatFrom = @($HeatFrom | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($HeatFrom.Count -gt 0 -and $PlanOrder -cne 'ThermalSpread') { Stop-Usage '-HeatFrom is read only by -PlanOrder ThermalSpread' }
 if (-not $legPlanMode -and (($LegSpec.Count -gt 0) -eq [bool]$LegSet)) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
 if (-not $AgentShare) { $AgentShare = try { [string](([IO.File]::ReadAllText((Join-Path $here 'venues.json')) | ConvertFrom-Json).venues.$Venue.agentShare) } catch { '' } }
 if (-not $AgentShare) { Stop-Usage "venues.json names no agentShare for $Venue" }
@@ -650,6 +667,15 @@ if ($legPlanMode) {
             if ($st.contentProblem) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short at $($st.path) is not one the leg job accepts: $($st.contentProblem)" }
         }
         $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
+        $spread = $null
+        if ($PlanOrder -ceq 'ThermalSpread') {
+            # item 10: heavy is measured from the -HeatFrom receipts (a leg key whose next leg on the same lease read hot), never a hand-kept list
+            $hh = Read-VenueLegHeatHistory -RunDir $HeatFrom
+            $hk = Get-VenueHeavyLegKeys -Rows @($hh.rows)
+            $sp = Get-VenueThermalSpreadOrder -Items @($items) -Heavy ([bool[]]@($items | ForEach-Object { $hk.Contains("$($_.legId)|$($_.backend)") }))
+            $ordered = @($sp.items)
+            $spread = [ordered]@{ heatFrom = @($HeatFrom); heatRows = @($hh.rows).Count; skipped = @($hh.skipped); heavyKeys = @($hk.Keys); heavyAdjacentBefore = $sp.heavyAdjacentBefore; heavyAdjacent = $sp.heavyAdjacent }
+        }
         foreach ($it in $ordered) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
                     arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item })
@@ -657,6 +683,7 @@ if ($legPlanMode) {
         $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
             legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
             builds = @($builds.Keys | ForEach-Object { [ordered]@{ sourceCommit = $_; state = $builds[$_].state; sha256 = $builds[$_].sha256; path = $builds[$_].path } }) }
+        if ($null -ne $spread) { $planRecord.thermalSpread = $spread }
     } catch {
         # sol r3 second pass A2: whatever else a plan item makes the validation throw on is still the typed refusal of the whole plan (exit 2, BATCH_USAGE), never an exit 1.
         Stop-PlanRefused 'LEG_PLAN_INVALID' 0 "the plan could not be validated: $($_.Exception.Message -replace '\s+', ' ')"
@@ -708,7 +735,7 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
     # One Wait-VenueQuiet run (its probe job is light: the agent runs it under the parked batch lease). verdict: QUIET | COOLDOWN_UNMET | GATE_BUSY |
     # GATE_UNREADABLE | HOST_MISMATCH | USAGE | VENUE_QUIET_UNKNOWN (not measured). The same exit-code reading as Invoke-VenueChain's probe.
     $out = Join-Path $RunDir "quiet-$Name-$Phase.out.txt"
-    if (-not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) { return [pscustomobject]@{ verdict = 'VENUE_QUIET_UNKNOWN'; code = 'none'; mean = $null; reason = 'PROBE_SCRIPT_MISSING'; foreignFloor = $false } }
+    if (-not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) { return [pscustomobject]@{ verdict = 'VENUE_QUIET_UNKNOWN'; code = 'none'; mean = $null; reason = 'PROBE_SCRIPT_MISSING'; foreignFloor = $false; heat = 'unknown'; heatText = 'no probe' } }
     $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript, '-Venue', $Venue, '-WorkDir', (Join-Path $RunDir 'quiet'), '-GateLog', (Join-Path $RunDir 'gate.log'),
         '-ThresholdPercent', [string]$ThresholdPercent, '-MaxWaitSec', [string]$MaxWaitSec, '-RecheckSec', [string]$RecheckSec, '-MaxAdmissionWaitSec', '120')
     & $pwshExe @qArgs *> $out
@@ -728,7 +755,9 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
         default { $reason = "undocumented-exit-$code"; 'VENUE_QUIET_UNKNOWN' }
     }
     if ($v -and $v -match '\bmean=([0-9.]+)%') { $mean = [double]$Matches[1] }
-    [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff }
+    # item 10: the probe's own reading of the agent's heavy-slot feed (its "tele heat" line): the reading the thermal gate polls
+    $ht = ConvertFrom-VenueProbeHeatLine -Lines $lines
+    [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff; heat = $ht.heat; heatText = $ht.text }
 }
 
 function Submit-AgentJob([string]$JobId, [string]$Body, [int]$TimeoutSec, [int]$WaitSec, [string]$NotAfterUtc = '') {
@@ -786,7 +815,9 @@ foreach ($p in $plan) { $pending.Add($p) }
 # r5 (V-01, Invoke-VenueChain's r4 rule): leg name -> the first FOREIGN_FLOOR line any probe of that leg printed, in any attempt or batch. Sticky: a leg
 # once seen contended is COOLDOWN_UNMET (uncounted) whatever a later QUIET probe reads; it never carries into the next leg.
 $legForeign = @{}
-$results = [System.Collections.Generic.List[object]]::new()
+# item 10: leg name -> its thermal gate state (first heat read, first hot reading in this batch, the wait, skips so far)
+$legThermal = @{}
+$results =[System.Collections.Generic.List[object]]::new()
 $batches = [System.Collections.Generic.List[object]]::new()
 $exitCode = 0
 $stopReason = $null
@@ -844,6 +875,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         endReason = $null; endDetail = $null; legs = [System.Collections.Generic.List[object]]::new(); closeJobId = $null; closeOutcome = $null; agent = $null; endedUtc = $null
         preOpenWait = $null; openLeaseWait = 'NONE'; exit75Refusals = 0; exit75Class = 'NONE'; renewOkMaxGapSec = $null; leaseEndClamp = $null; ledger = $null
         openExit75Refusals = 0; legExit75Refusals = 0; openCancel = $null; openNotAfterUtc = $null; openLiveness = $null; openLivenessReadback = $null; claimRenew = $null
+        thermalWaits = 0; thermalSkips = 0
     }
     foreach ($ck in $capsReceipt.Keys) { $b[$ck] = $capsReceipt[$ck] }
     # (0) CAPS b and c: wait out the cooldown after the last lease and the 3 h budget BEFORE the claim, so the venue is never held through either.
@@ -1050,6 +1082,36 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     if ($q.verdict -ceq 'GATE_BUSY') { Start-Sleep -Seconds ([int][Math]::Max(1, [Math]::Min($ClaimPollSec, $room - $legBudget))) }
                     continue
                 }
+                # item 10 (BACHELOR-THERMAL-GATE-WAIT-1): WAIT FOR COOL. The QUIET probe's heat reading (the agent's feed and rule) must be clear before launch:
+                # hot -> re-probe every -ThermalPollSec up to -ThermalWaitCapSec from the first hot reading in this batch; still hot then -> THERMAL_HOT_SKIPPED and
+                # re-queued at the end (at most -ThermalRequeueMax times, then the leg is THERMAL_HOT_SKIPPED for good), never run and discarded. Unknown heat runs.
+                $th = $legThermal[$leg.name]
+                if ($null -eq $th) { $th = [ordered]@{ firstHeat = $q.heat; firstHeatText = $q.heatText; firstHotUtc = $null; batch = $batchNo; waitSec = 0; polls = 0; skips = 0 }; $legThermal[$leg.name] = $th }
+                if ($th.batch -ne $batchNo) { $th.firstHotUtc = $null; $th.batch = $batchNo }
+                $gs = $(if ($ThermalWaitCapSec -gt 0) { Get-VenueThermalGateStep -Heat $q.heat -FirstHotUtc $th.firstHotUtc -NowUtc ([DateTime]::UtcNow) -CapSec $ThermalWaitCapSec } else { [pscustomobject]@{ step = 'RUN'; firstHotUtc = $null; waitSec = 0; remainingSec = 0 } })
+                $th.firstHotUtc = $gs.firstHotUtc; $th.waitSec = $gs.waitSec
+                if ($gs.step -ceq 'WAIT') {
+                    $roomNow = [int](($leaseEnd - [DateTime]::UtcNow).TotalSeconds) - $LeaseMarginSec
+                    if (($roomNow - $legBudget) -lt 1) {
+                        $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "waiting for heat ($($q.heatText), waitSec=$($gs.waitSec)) roomSec=$roomNow - legBudgetSec=${legBudget}: leg $($leg.name) goes to the next batch"
+                        break
+                    }
+                    $th.polls++; $b.thermalWaits++
+                    $sleep = [int][Math]::Max(1, [Math]::Min([Math]::Min($ThermalPollSec, $gs.remainingSec), $roomNow - $legBudget))
+                    L "THERMAL_WAIT leg=$($leg.name) batch=$batchNo heat=hot ($($q.heatText)) waitSec=$($gs.waitSec) capSec=$ThermalWaitCapSec sleepSec=$sleep roomSec=$roomNow"
+                    Start-Sleep -Seconds $sleep
+                    continue
+                }
+                if ($gs.step -ceq 'SKIP') {
+                    $th.skips++; $requeue = ($th.skips -le $ThermalRequeueMax); $th.firstHotUtc = $null
+                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'THERMAL_HOT_SKIPPED'; outcome = 'NOT_RUN'; class = 'THERMAL_HOT_SKIPPED'; counted = $false
+                        thermalWaitSec = $gs.waitSec; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText; heatAtSkip = $q.heatText; skips = $th.skips; requeued = $requeue }
+                    $b.legs.Add([pscustomobject]$row); Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg; $b.thermalSkips++
+                    $pending.RemoveAt(0)
+                    if ($requeue) { $pending.Add($leg) } else { Add-Result $leg 'THERMAL_HOT_SKIPPED' $row; if ($exitCode -eq 0) { $exitCode = 7 } }
+                    L "LEG $($leg.name) THERMAL_HOT_SKIPPED batch=$batchNo heat=hot ($($q.heatText)) waitSec=$($gs.waitSec) capSec=$ThermalWaitCapSec skips=$($th.skips) requeued=$requeue (not run: never run and discarded)"
+                    continue
+                }
                 # QUIET under the lease: the leg, on the same lease (r5b, Grok G1: while the claim is still this run's).
                 $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc
                 if ($cl) { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "before leg $($leg.name): $($cl.detail)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=leg $($cl.detail)"; break }
@@ -1149,6 +1211,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; legSec = $legSec; legExit = $legCode; exit75Refusals = $legRef; foreignFloor = $legFF }
                 if ($legFF) { $row['foreignFloorLine'] = $legForeign[$leg.name] }
                 if ($detail) { $row['outcomeDetail'] = $detail }
+                # item 10: the thermal gate's receipt per leg: how long it waited for heat, the first and the launch reading, and the agent's own at grant
+                $row['thermalWaitSec'] = $th.waitSec; $row['thermalSkips'] = $th.skips; $row['heatAtProbe'] = $th.firstHeat; $row['heatAtProbeText'] = $th.firstHeatText; $row['heatAtLaunch'] = $q.heat
+                $row['heatAtGrant'] = $(if ($null -ne $ja -and $ja.PSObject.Properties['heat'] -and $ja.heat) { [string]$ja.heat } else { 'unknown' })
                 if ($agentStop) { $row['leaseStop'] = $agentStop }
                 if ($withdraw) { $row['withdraw'] = $withdraw }
                 $b.legs.Add([pscustomobject]$row); Add-Result $leg 'RAN' $row; $pending.RemoveAt(0)
@@ -1254,7 +1319,8 @@ $summary = [ordered]@{
     ran = @($results | Where-Object { $_.status -ceq 'RAN' }).Count; counted = @($results | Where-Object { $_.status -ceq 'RAN' -and $_.counted }).Count
     failed = @($results | Where-Object { $_.status -ceq 'LEG_FAILED' }).Count; notRun = @($results | Where-Object { $_.status -ceq 'NOT_RUN' }).Count
     leaseExpired = @($results | Where-Object { $_.status -ceq 'LEASE_EXPIRED' }).Count
-    batches = @($batches | ForEach-Object { [ordered]@{ batch = $_.batch; token = $_.token; leaseId = $_.leaseId; endReason = $_.endReason; legsAttempted = $_.legsAttempted; legsRan = $_.legsRan; legsCounted = $_.legsCounted; retries = $_.retries } })
+    thermalSkipped = @($results | Where-Object { $_.status -ceq 'THERMAL_HOT_SKIPPED' }).Count
+    batches =@($batches | ForEach-Object { [ordered]@{ batch = $_.batch; token = $_.token; leaseId = $_.leaseId; endReason = $_.endReason; legsAttempted = $_.legsAttempted; legsRan = $_.legsRan; legsCounted = $_.legsCounted; retries = $_.retries } })
 }
 if ($script:outputRedirect) { $summary.outputRedirect = $script:outputRedirect }
 if ($legPlanMode) { $summary.legPlan =[ordered]@{ path = $planRecord.legPlan; order = $PlanOrder; arms = $planRecord.arms; builds = @($planRecord.builds | ForEach-Object { $_.sourceCommit }) } }
