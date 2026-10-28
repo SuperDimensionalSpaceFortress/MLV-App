@@ -2064,6 +2064,40 @@ def test_one_stderr_line_waits_at_most_the_bound_for_open_and_write_together() -
     assert second < 500, out
 
 
+def test_a_build_slot_release_never_throws_past_the_heavy_slot_stop(tmp_path) -> None:
+    # r6b adversary A1 (pass 2): the build-slot mutex name is taken by another kernel object, so opening it throws. The release
+    # stays inside its catch (a Library host with ErrorActionPreference=Stop sees no throw), and the before-action loss path
+    # sends the heavy-slot stop in a finally, whatever the release does.
+    name = f"Local\\MLV-R6B-A1-{os.getpid()}"
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n$ErrorActionPreference = 'Stop'\n"
+                f"$ev = [System.Threading.EventWaitHandle]::new($false, 'AutoReset', '{name}')\n"
+                f"try {{ Remove-BuildSlot @{{ MutexName = '{name}'; Path = '{tmp_path / 'lock.json'}'; OwnerPid = $PID; StartTicks = 1 }}; "
+                "Write-Output 'release=returned' } catch { Write-Output (\"release=threw {0}\" -f $_.Exception.GetType().Name) }\n"])
+    assert "release=returned" in done.stdout, done.stdout + done.stderr
+    text = GUARD.read_text(encoding="ascii")
+    assert "try { Remove-BuildSlot $ticket } finally { $ticket = $null; Exit-HeavySlotHolderGone $lost 'before-action' }" in text
+
+
+def test_a_closed_stdout_never_turns_a_lost_slot_release_into_a_throw(tmp_path) -> None:
+    # r6b adversary A2 (pass 2): the slot ended during the action and Console.Out is a writer the host has closed. The
+    # HEAVY_SLOT_LOST_DURING_ACTION line is warning-only: Exit-HeavySlot returns instead of throwing.
+    stop = tmp_path / "stop"
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n$ErrorActionPreference = 'Stop'\n"
+                "$p = [System.Diagnostics.Process]::Start('cmd.exe', '/c exit 0'); $p.WaitForExit()\n"
+                f"$lease = @{{ Label = 't'; BuildLabel = 't'; Process = $p; Holder = $null; Ready = '{tmp_path / 'ready'}'; "
+                f"Stop = '{stop}'; ExitFile = '{tmp_path / 'exit.json'}'; Log = '{tmp_path / 'log.txt'}'; "
+                "Lines = [System.Collections.Generic.List[string]]::new() }\n"
+                "$keep = [Console]::Out\n"
+                "$w = [System.IO.StreamWriter]::new([System.IO.MemoryStream]::new()); $w.Dispose(); [Console]::SetOut($w)\n"
+                "try { Exit-HeavySlot $lease; $r = 'release=returned' } catch { $r = \"release=threw $($_.Exception.Message)\" }\n"
+                "[Console]::SetOut($keep)\nWrite-Output $r\n"])
+    assert "release=returned" in done.stdout, done.stdout + done.stderr
+    assert "HEAVY_SLOT_LOST_DURING_ACTION label=t" in done.stderr, done.stderr
+    assert "Cannot write to a closed TextWriter" not in done.stdout, done.stdout
+
+
 def test_the_hung_tool_clock_starts_before_any_diagnostic_line() -> None:
     # r6 B1: the clock starts before the launch, and no guard stderr line bypasses the bounded writer while a slot can be held
     # (the two left are usage errors, written before any slot is taken).

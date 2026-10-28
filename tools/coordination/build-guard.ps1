@@ -379,9 +379,12 @@ function Remove-BuildSlot($Ticket) {
     # own between our read and our delete. If the mutex stays busy, the lock is left: once this process exits
     # it is reclaimable as owner-dead.
     if (-not $Ticket) { return }
-    $mutex = New-Object System.Threading.Mutex($false, $Ticket.MutexName)
+    # The mutex is opened inside the try too (r6b adversary A1): a name taken by another kernel object throws here, and a
+    # release never throws past its caller, which still has the machine heavy slot to give back.
+    $mutex = $null
     $got = $false
     try {
+        $mutex = New-Object System.Threading.Mutex($false, $Ticket.MutexName)
         try { $got = $mutex.WaitOne(15000) } catch [System.Threading.AbandonedMutexException] { $got = $true }
         if (-not $got) { Write-BuildGuardLog "release-mutex-busy: build slot left for owner-dead reclaim: $($Ticket.Path)"; return }
         $info = Get-Content -LiteralPath $Ticket.Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -391,7 +394,7 @@ function Remove-BuildSlot($Ticket) {
     } catch {
     } finally {
         if ($got) { $mutex.ReleaseMutex() }
-        $mutex.Dispose()
+        if ($mutex) { $mutex.Dispose() }
     }
 }
 
@@ -823,7 +826,8 @@ function Exit-HeavySlot($Lease) {
     if ($lost) {
         $line = 'HEAVY_SLOT_LOST_DURING_ACTION label={0} code={1} utc={2}' -f $Lease.BuildLabel, (Get-HeavySlotExitCode $Lease), [DateTime]::UtcNow.ToString('o')
         Write-BuildGuardLog $line
-        [Console]::Out.WriteLine($line)
+        # Warning-only (r6b adversary A2): a stdout that is closed or gone never turns a finished action into a throw.
+        try { [Console]::Out.WriteLine($line) } catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} stdout not written ({1})' -f $Lease.Label, ($_.Exception.Message -replace '\s+', ' ')) }
     }
     if ($Lease.Process.WaitForExit(60000)) {
         Send-HeavySlotLines $Lease
@@ -914,9 +918,9 @@ function Invoke-BuildGuard {
                 if ($heavy -and (Get-HeavySlotHolderState $heavy) -ne 'alive') {
                     $lost = $heavy
                     $heavy = $null
-                    Remove-BuildSlot $ticket
-                    $ticket = $null
-                    Exit-HeavySlotHolderGone $lost 'before-action'
+                    # The stop is sent even when the build-slot release throws (r6b adversary A1): $heavy is already
+                    # cleared, so the outer finally would not send it.
+                    try { Remove-BuildSlot $ticket } finally { $ticket = $null; Exit-HeavySlotHolderGone $lost 'before-action' }
                 }
                 if ($check -eq 1) {
                     Write-BuildGuardLog ('admitted label={0} jobs={1} reason={2} peers=[{3}] freePhysGB={4} freeCommitGB={5} slot={6}' -f $Label, $jobs, $choice.Reason, ($choice.Peers -join ','), $mem.PhysGB, $mem.CommitGB, $(if ($ticket) { 'held' } else { 'none' }))
