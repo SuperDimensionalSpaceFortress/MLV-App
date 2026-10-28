@@ -498,14 +498,15 @@ function Resolve-HeavySlotCmd([hashtable]$Options) {
 function Test-HeavySlotHeldCanonical([string]$Held) {
     # $null when the holder an inherited HEAVY_SLOT_HELD (<ticket>:<pid>) names holds the canonical machine slot: its held record
     # in heavy-slot's default state dir (the guard strips HEAVY_SLOT_DIR) says slot set Global\HeavySlot, one slot, slot 0.
-    # Otherwise why not (r7b adversary 01aa4e7b-A2). heavy-slot itself still verifies the holder's identity and ancestry.
+    # Otherwise why not (r7b adversary 01aa4e7b-A2). The name is compared case-sensitively, as the kernel names its mutexes:
+    # Global\HEAVYSLOT-0 is another slot (r7b adversary df03e61e-A1). heavy-slot still verifies the holder's identity and ancestry.
     if ($Held -notmatch '^([0-9A-Za-z-]+):(\d+)$') { return "malformed value '$Held'" }
     $path = Join-Path $script:HeavySlotHeldDir ($Matches[1] + '.json')
     try { $rec = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return "no readable held record at $path" }
     $name = [string](Get-BuildGuardJsonField $rec 'slotName')
     $count = [string](Get-BuildGuardJsonField $rec 'slotCount')
     $slots = @(Get-BuildGuardJsonField $rec 'slots')
-    if ($name -ne 'Global\HeavySlot' -or $count -ne '1' -or $slots.Count -ne 1 -or [string]$slots[0] -ne '0') {
+    if ($name -cne 'Global\HeavySlot' -or $count -cne '1' -or $slots.Count -ne 1 -or [string]$slots[0] -cne '0') {
         return "its held record names slot set '$name' x$count slots=[$($slots -join ',')], not Global\HeavySlot x1 slot 0"
     }
     return $null

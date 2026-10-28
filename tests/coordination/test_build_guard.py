@@ -1674,11 +1674,13 @@ def test_only_a_held_record_for_slot_0_of_one_counts_as_the_canonical_slot(tmp_p
         "two": {"slotName": "Global\\HeavySlot", "slotCount": 2, "slots": [1]},
         "zeroOfTwo": {"slotName": "Global\\HeavySlot", "slotCount": 2, "slots": [0]},
         "other": {"slotName": "Global\\HeavySlotTest", "slotCount": 1, "slots": [0]},
+        # r7b adversary df03e61e-A1: kernel object names are case-sensitive, so Global\HEAVYSLOT-0 is another mutex.
+        "upper": {"slotName": "Global\\HEAVYSLOT", "slotCount": 1, "slots": [0]},
     }
     for ticket, rec in records.items():
         _write_json(tmp_path / f"{ticket}.json", rec)
     (tmp_path / "junk.json").write_text("{", encoding="ascii")
-    probes = ["canon:1", "two:1", "zeroOfTwo:1", "other:1", "missing:1", "junk:1", "no-pid"]
+    probes = ["canon:1", "two:1", "zeroOfTwo:1", "other:1", "upper:1", "missing:1", "junk:1", "no-pid"]
     done = _ps(["-Command",
                 f". '{GUARD}' -Library\n$script:HeavySlotHeldDir = '{tmp_path}'\n"
                 + "".join(f"Write-Output ('{p} -> ' + [string](Test-HeavySlotHeldCanonical '{p}'))\n" for p in probes)])
