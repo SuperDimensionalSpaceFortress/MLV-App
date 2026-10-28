@@ -351,10 +351,48 @@ LANE_DIRTY_SAVE_PS_LAUNCH_WRITES = {
     "call $a.StartsWith('127.')",
     "[System.Diagnostics.Process]::Start($psi)",
 }
-# a process started, or code reached at run time, from inside the C# payload (the AST cannot see the payload; payload-only so the PowerShell lines that
+# r15 iter 2 (adversary 39a58424-A1): the pins above follow NAMES, so an alias ($x = $psi; $x.FileName = 'pwsh') or a call through a member chain
+# ($psi.ArgumentList.Add('-c')) changed the launch object unseen. Every USE of a mutable launch object is therefore pinned by its site (the enclosing
+# assignment, else the command, expression, parameter or foreach header; ps_ast_inventory.ps1 Get-UseSite), so a new alias or call is a new site.
+LANE_DIRTY_SAVE_PS_LAUNCH_OBJECTS = {"psi", "savedEnv", "gitEnv", "shape", "stagedTmp", "gitDir", "GitArgs", "GitDiffArgs"}
+LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES = {
+    "gitargs @ @('-C', $Wt) + $GitArgs", "gitargs @ param [string[]]$GitArgs",
+    "gitdiffargs @ @('-C', $Wt) + $GitDiffArgs", "gitdiffargs @ param [string[]]$GitDiffArgs",
+    "gitdir @ $cdFile = Join-Path $GitDir 'commondir'", "gitdir @ $common = $GitDir",
+    "gitdir @ $common = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($GitDir, $text))", "gitdir @ $p = Join-Path $GitDir $n",
+    "gitdir @ Get-DirtyDirIdentity $GitDir", "gitdir @ param [string]$GitDir",
+    "gitdir @ $env:GIT_COMMON_DIR = $gitDir[1]", "gitdir @ $env:GIT_DIR = $gitDir[0]", "gitdir @ $gitDir",
+    "gitdir @ $gitDir = @(& git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir 2>$null)",
+    "gitdir @ $h = Lock-DirtyDirectory $gitDir[$i]", "gitdir @ $i -lt $gitDir.Count",
+    "gitdir @ $LASTEXITCODE -ne 0 -or $again.Count -ne 2 -or $again[0] -cne $gitDir[0] -or $again[1] -cne $gitDir[1]",
+    "gitdir @ $LASTEXITCODE -ne 0 -or $gitDir.Count -ne 2", "gitdir @ Get-DirtyDirIdentity $gitDir[$i]", "gitdir @ Join-Path $gitDir[0] 'commondir'",
+    "gitenv @ $gitEnv",
+    "gitenv @ $gitEnv = 'GIT_DIFF_OPTS', 'GIT_EXTERNAL_DIFF', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX'",
+    "psi @ $p = [System.Diagnostics.Process]::Start($psi)", "psi @ $psi = New-Object System.Diagnostics.ProcessStartInfo",
+    "psi @ $psi.CreateNoWindow = $true", "psi @ $psi.FileName = @(Get-Command git -CommandType Application)[0].Source",
+    "psi @ $psi.RedirectStandardError = $true", "psi @ $psi.RedirectStandardOutput = $true", "psi @ $psi.UseShellExecute = $false",
+    "psi @ [void]$psi.ArgumentList.Add($a)",
+    "savedenv @ $savedEnv = @{}", "savedenv @ $savedEnv.Keys", "savedenv @ $savedEnv[$v] = (Get-Item -LiteralPath \"Env:$v\").Value",
+    "savedenv @ Set-Item -LiteralPath \"Env:$v\" -Value $savedEnv[$v]",
+    "shape @ $cap = Invoke-DirtyGitCapture -Wt $Wt -GitArgs (@('diff', 'HEAD') + $shape)",
+    "shape @ $shape = @('--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--submodule=short', '--ignore-submodules=none', '-U3', "
+    "'--src-prefix=a/', '--dst-prefix=b/')",
+    "shape @ $stagedCap = Invoke-DirtyGitCapture -Wt $Wt -GitArgs (@('diff', '--cached') + $shape)",
+    "shape @ @('diff', '--cached') + $shape", "shape @ @('diff', 'HEAD') + $shape",
+    "stagedtmp @ $stagedFull = Write-DirtyTempBytes $stagedTmp $stagedCap.Bytes",
+    "stagedtmp @ $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp.Path -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull "
+    "-Guard $guard -Hold $stagedTmp -DirHandle $destDir",
+    "stagedtmp @ $stagedTmp = $null",
+    "stagedtmp @ $stagedTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-staging-' + [Guid]::NewGuid().ToString('N') + '.tmp') $destDir",
+    "stagedtmp @ $tmp, $stagedTmp, $statTmp, $mergeTmp", "stagedtmp @ $why = $stagedTmp.Reason", "stagedtmp @ $why = Test-DirtyTempHeld $stagedTmp",
+    "stagedtmp @ & git -C $Wt apply --cached --check -R --whitespace=nowarn $stagedTmp.Path 2>$null", "stagedtmp @ -not $stagedTmp.Path",
+    "stagedtmp @ Test-DirtyEvidenceUnchanged -Path $stagedTmp.Path -Full $stagedFull",
+}# a process started, or code reached at run time, from inside the C# payload (the AST cannot see the payload; payload-only so the PowerShell lines that
 # legitimately name ProcessStartInfo do not count)
 _PAYLOAD_PROCESS_RE = re.compile(
-    r"\bProcess\b|ProcessStartInfo|ShellExecute|CreateProcess|WinExec|\bActivator\b|\bdynamic\b|\bGetType\s*\(|SetEnvironmentVariable")  # C# is case-sensitive: a case variant does not compile
+    r"\bProcess\b|ProcessStartInfo|ShellExecute|CreateProcess|WinExec|\bActivator\b|\bdynamic\b|\bGetType\s*\(|SetEnvironmentVariable"
+    # r15 iter 2 (adversary 39a58424-A2): PowerShell itself is a default Add-Type reference, so its scripting API runs any script from C#
+    r"|\bPowerShell\b|ScriptBlock|Runspace|AddScript|AddCommand|InvokeScript|InvokeCommand|System\.Management|\bCompile\s*\(|\bAppDomain\b|\bAssembly\b|Emit\b")  # C# is case-sensitive: a case variant does not compile
 # common parameters that write a variable by NAME (-OutVariable guard would put a pipeline's output into a call variable)
 _PS_VARIABLE_WRITING_PARAMETERS = ("outvariable", "errorvariable", "warningvariable", "informationvariable", "pipelinevariable")
 _PS_VARIABLE_WRITING_ALIASES = {"ov", "ev", "wv", "iv", "pv"}
@@ -446,7 +484,7 @@ def _ps_inventories(texts: list[str]) -> list[dict] | str:
         return "pwsh is not on PATH"
     try:
         proc = subprocess.run(
-            [pwsh, "-NoProfile", "-NonInteractive", "-File", str(PS_AST_INVENTORY)],
+            [pwsh, "-NoProfile", "-NonInteractive", "-File", str(PS_AST_INVENTORY), "-UseNames", ",".join(sorted(LANE_DIRTY_SAVE_PS_LAUNCH_OBJECTS))],
             input=json.dumps(texts).encode("ascii"), capture_output=True, timeout=_PS_INVENTORY_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as error:
         return f"the parser did not run: {type(error).__name__}: {error}"
@@ -579,6 +617,9 @@ def _ps_ast_violations(inv: dict, payload_bodies: list[str]) -> list[str]:
         if parameter["name"].lower() in launch_variables and f"param ${parameter['name']}: {'/'.join(parameter['types'])}" not in LANE_DIRTY_SAVE_PS_LAUNCH_WRITES:
             violations.append(f"{parameter['line']}: a launch variable parameter outside the pinned set: ${parameter['name']}")
     violations += [f"{row['line']}: the launch variable ${row['name']} is passed by [ref]" for row in inv["ref_vars"] if row["name"].lower() in launch_variables]
+    for use in inv["uses"]:
+        if f"{use['name'].lower()} @ {use['site']}" not in LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES:
+            violations.append(f"{use['line']}: a launch object used at a site outside the pinned set (an alias or a call through it): ${use['name']} @ {use['site']}")
     return violations
 
 
@@ -688,6 +729,10 @@ def r15_census_rows(text: str) -> dict[str, tuple[str, str]]:
     call = "NtSetInformationFile(h, out io, info, (uint)size, 10);"
     launch_file = "$psi.FileName = @(Get-Command git -CommandType Application)[0].Source"
     launch_info = "$psi = New-Object System.Diagnostics.ProcessStartInfo"
+    before_line = lambda number, inserted: "".join(lines[:number - 1]) + inserted + "\n" + "".join(lines[number - 1:])  # noqa: E731
+    alias_attack = ("$launchAlias = $psi; $launchAlias.FileName = 'pwsh.exe'; $launchAlias.ArgumentList.Add('-NoProfile'); $launchAlias.ArgumentList.Add("
+                    "'-NonInteractive'); $launchAlias.ArgumentList.Add('-Command'); $launchAlias.ArgumentList.Add(('New-Item -ItemType {0}{1} -Path "
+                    "C:/fixture/out/alias -Value C:/fixture/src.bin; #' -f 'Hard','Link'))")
     return {
         # sol r14 B1: whitespace or a continuation after the member dot, then a computed name
         "B1 a space after the dot": (at_line_50("$m = [DirtyFinalPath]. ('Get'+'Method')(('NtSet'+'InformationFile'),40)" + invoke_11), computed),
@@ -760,6 +805,18 @@ def r15_census_rows(text: str) -> dict[str, tuple[str, str]]:
         "A2 a foreach source widened": (text.replace("foreach ($side in 'HEAD', '--cached')", "foreach ($side in 'HEAD', '--ext-diff')", 1), "set by foreach outside"),
         "A2 a saved env value planted": (at_line_50("$savedEnv['GIT_EXTERNAL_DIFF'] = 'pwsh -c x'"), "written outside the pinned set"),
         "A2 a saved env value added by a method": (at_line_50("$savedEnv.Add('GIT_EXTERNAL_DIFF', 'pwsh -c x')"), "used outside the pinned set"),
+        # r15 iter 2 (adversary 39a58424): an alias or a member-chain call changes the launch object; PowerShell's scripting API runs script from C#
+        "B1 iter2 an alias of the launch object before line 569": (before_line(569, alias_attack), "a launch object used at a site outside the pinned set"),
+        "B1 iter2 an alias of the launch object before line 667": (before_line(667, alias_attack), "a launch object used at a site outside the pinned set"),
+        "B1 iter2 a direct ArgumentList.Add": (before_line(569, "$psi.ArgumentList.Add('-c')"), "a launch object used at a site outside the pinned set"),
+        "B1 iter2 a saved env alias": (at_line_50("$e = $savedEnv; $e['GIT_EXTERNAL_DIFF'] = 'pwsh -c x'"), "a launch object used at a site outside the pinned set"),
+        "B1 iter2 a git dir rewritten through an alias": (at_line_50("$d = $gitDir; $d[0] = 'C:/fixture/other'"), "a launch object used at a site outside the pinned set"),
+        "B1 iter2 a git argument array passed to a function": (at_line_50("Add-DirtyReuseHold $shape '--ext-diff'"), "a launch object used at a site outside the pinned set"),
+        "B2 iter2 PowerShell.AddScript in the C# payload": (text.replace(call, call + '\nSystem.Management.Automation.PowerShell.Create().AddScript(string.Format('
+                                                                    '"New-Item -ItemType {0}{1} -Path C:/fixture/out/alias -Value C:/fixture/src.bin", "Hard", "Link")).Invoke();', 1),
+                                                         "a process start or run-time binding"),
+        "B2 iter2 ScriptBlock.Create in the C# payload": (text.replace(call, call + "\nSystem.Management.Automation.ScriptBlock.Create(s).Invoke();", 1),
+                                                         "a process start or run-time binding"),
     }
 
 

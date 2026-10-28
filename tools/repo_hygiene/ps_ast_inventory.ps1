@@ -19,11 +19,12 @@
 #   foreach_vars [{line, name}]
 #   params      [{line, name, types}]
 #   ref_vars    [{line, name}]                         [ref]$name
+#   uses        [{line, name, site}]                   every use of a variable named in -UseNames, with the text of its site (Get-UseSite)
 #   using       [{line, text}]                         using module / assembly / namespace statements
 #   requires    {modules, assemblies, snapins}         #Requires entries that load code
 #   other       [{line, kind}]                         class / enum / configuration / dynamic keyword definitions
 # ASCII only. PowerShell 7.
-param()
+param([string]$UseNames = '')  # comma-separated variable names whose every use is reported in 'uses'
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -41,13 +42,31 @@ function Get-ExpressionKind($Statement) {
     return $node.GetType().Name
 }
 
+function Get-UseSite($Var) {
+    # where a variable is used: the enclosing assignment if there is one within its statement, else the nearest command, expression statement,
+    # parameter or foreach header, so an alias ($x = $psi) or a call through it ($psi.ArgumentList.Add(...)) is its own site
+    $node = $Var.Parent
+    $site = $null
+    while ($null -ne $node) {
+        if ($node -is [System.Management.Automation.Language.StatementBlockAst] -or $node -is [System.Management.Automation.Language.NamedBlockAst] -or $node -is [System.Management.Automation.Language.ScriptBlockAst]) { break }
+        if ($node -is [System.Management.Automation.Language.AssignmentStatementAst]) { return $node.Extent.Text }
+        if ($null -eq $site) {
+            if ($node -is [System.Management.Automation.Language.ParameterAst]) { return 'param ' + $node.Extent.Text }
+            if ($node -is [System.Management.Automation.Language.ForEachStatementAst]) { return 'foreach (' + $node.Variable.Extent.Text + ' in ' + $node.Condition.Extent.Text + ')' }
+            if ($node -is [System.Management.Automation.Language.CommandAst] -or $node -is [System.Management.Automation.Language.CommandExpressionAst]) { $site = $node.Extent.Text }
+        }
+        $node = $node.Parent
+    }
+    return $site
+}
+
 function Get-Inventory([string]$Text) {
     $tokens = $null
     $errors = $null
     $root = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
     $inv = [ordered]@{
         errors = @(); commands = @(); members = @(); functions = @(); types = @(); drive_vars = @(); assignments = @()
-        foreach_vars = @(); params = @(); ref_vars = @(); using = @(); requires = [ordered]@{ modules = 0; assemblies = 0; snapins = 0 }; other = @()
+        foreach_vars = @(); params = @(); ref_vars = @(); uses = @(); using = @(); requires = [ordered]@{ modules = 0; assemblies = 0; snapins = 0 }; other = @()
     }
     foreach ($e in @($errors)) { $inv.errors += [ordered]@{ line = $e.Extent.StartLineNumber; message = $e.Message } }
     foreach ($u in @($root.UsingStatements)) { $inv.using += [ordered]@{ line = $u.Extent.StartLineNumber; text = $u.Extent.Text } }
@@ -112,6 +131,7 @@ function Get-Inventory([string]$Text) {
             { $_ -is [System.Management.Automation.Language.AttributeAst] } { $inv.types += [ordered]@{ line = $line; name = $node.TypeName.FullName; where = 'attribute' }; break }
             { $_ -is [System.Management.Automation.Language.VariableExpressionAst] } {
                 if ($node.VariablePath.IsDriveQualified) { $inv.drive_vars += [ordered]@{ line = $line; path = $node.VariablePath.UserPath; drive = $node.VariablePath.DriveName } }
+                elseif ($useNameList -contains (Get-UnqualifiedName $node.VariablePath)) { $inv.uses += [ordered]@{ line = $line; name = (Get-UnqualifiedName $node.VariablePath); site = (Get-UseSite $node) } }
                 break
             }
             { $_ -is [System.Management.Automation.Language.AssignmentStatementAst] } {
@@ -147,10 +167,11 @@ function Get-Inventory([string]$Text) {
     return $inv
 }
 
+$useNameList = @($UseNames -split '[,\s]+' | Where-Object { $_ })  # pwsh -File may hand a comma list over joined by spaces
 $texts = @([Console]::In.ReadToEnd() | ConvertFrom-Json -NoEnumerate)
 if ($texts.Count -eq 1 -and $texts[0] -is [System.Array]) { $texts = @($texts[0]) }
 $out = @(foreach ($t in $texts) {
     # one text that the inventory cannot read fails itself (an error row the caller reports), never the batch
-    try { Get-Inventory ([string]$t) } catch { [ordered]@{ errors = @([ordered]@{ line = 0; message = "inventory failed: $($_.Exception.Message)" }); commands = @(); members = @(); functions = @(); types = @(); drive_vars = @(); assignments = @(); foreach_vars = @(); params = @(); ref_vars = @(); using = @(); requires = [ordered]@{ modules = 0; assemblies = 0; snapins = 0 }; other = @() } }
+    try { Get-Inventory ([string]$t) } catch { [ordered]@{ errors = @([ordered]@{ line = 0; message = "inventory failed: $($_.Exception.Message)" }); commands = @(); members = @(); functions = @(); types = @(); drive_vars = @(); assignments = @(); foreach_vars = @(); params = @(); ref_vars = @(); uses = @(); using = @(); requires = [ordered]@{ modules = 0; assemblies = 0; snapins = 0 }; other = @() } }
 })
 [Console]::Out.Write((ConvertTo-Json -InputObject $out -Depth 8 -Compress -EscapeHandling EscapeNonAscii))
