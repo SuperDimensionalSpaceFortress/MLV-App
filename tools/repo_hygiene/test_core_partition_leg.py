@@ -1,8 +1,11 @@
 """Tests for BACHELOR-CORE-PARTITION-AB-1: the opt-in core-partition leg (bench affinity, an MLV-owned E-core load, a telemetry helper).
 
 WHAT IS PINNED
-  * with none of the five new generator arguments the emitted job is byte-identical to the base commit's generator, for the default
-    job and for the partition legs' own shape (cpu, forced cinematic Look Assist, unpaced, windowed, scale 1);
+  * the five new generator arguments reach the job ONLY through the generator's one seam ($corePartitionEmit): a copy of the generator with
+    that seam turned off, given every argument, emits byte-for-byte the job without them (the partition legs' own cpu shape -- forced cinematic
+    Look Assist, unpaced, windowed, scale 1 -- and its cuda twin), and with no arguments byte-for-byte the default job; and a job without the
+    arguments carries no core-partition token. (r6 of BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: this replaced a byte comparison with a frozen
+    base commit's generator, which every later legitimate edit to the generator or a module it embeds turned red.);
   * every generation-time refusal is a typed CORE_PARTITION_* throw;
   * the bracketed regions exist ONLY with -CorePartitionTelemetry, wrap ONLY the measured smoke launch, and once they (and the three wrapper
     lines they need) are taken out the job is exactly the job without telemetry;
@@ -20,6 +23,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -42,8 +46,11 @@ from tools.repo_hygiene.test_dual_venue_evidence import (
     run_pwsh_many,
 )
 
-# The commit this card branched from: the generator whose job text every unset-argument job must still be.
-BASE_COMMIT = "a235df4d4c47ab77056b0016f8c4a8443811a6a9"
+# The generator's one core-partition seam, and the line a copy of the generator gets instead to turn every core-partition emission off.
+SEAM_ON = re.compile(r"(?m)^\$corePartitionEmit = \[bool\]\$CorePartitionTelemetry(?=\r?$)")
+SEAM_OFF = "$corePartitionEmit = $false"
+# Text no job without the core-partition arguments may carry (compared case-insensitively): the marks, the variables, the schema and exit names.
+CORE_PARTITION_TOKENS = ("corepartition", "core-partition", "core_partition", "partitionload", "benchaffinity")
 OPEN = "# BACHELOR-CORE-PARTITION-AB-1 >>>"
 CLOSE = "# BACHELOR-CORE-PARTITION-AB-1 <<<"
 LEGS = {
@@ -59,8 +66,9 @@ HELPER = ["-CorePartitionTelemetry", "-CorePartitionHelperMask", "0xFF000"]
 ARM_A = [*SHAPE, *HELPER]
 ARM_B1 = [*SHAPE, *HELPER, "-BenchAffinityMask", "0x00FFF"]
 ARM_B2 = [*ARM_B1, "-PartitionLoadMask", "0xFF000", "-PartitionLoadThreads", "8"]
-CUDA_B2 = ["-Backend", "cuda", "-ScaleFactor", "1", "-ExpectedScaleRequest", "1", "-DisplayMode", "windowed", "-ForceLookAssist", "-LookPaceLeg",
-           "-LookFlavor", "cinematic", "-Unpaced", *HELPER, "-BenchAffinityMask", "0x00FFF", "-PartitionLoadMask", "0xFF000", "-PartitionLoadThreads", "8"]
+CUDA_SHAPE = ["-Backend", "cuda", "-ScaleFactor", "1", "-ExpectedScaleRequest", "1", "-DisplayMode", "windowed", "-ForceLookAssist", "-LookPaceLeg",
+              "-LookFlavor", "cinematic", "-Unpaced"]
+CUDA_B2 = [*CUDA_SHAPE, *HELPER, "-BenchAffinityMask", "0x00FFF", "-PartitionLoadMask", "0xFF000", "-PartitionLoadThreads", "8"]
 REFUSALS = {
     "CORE_PARTITION_MASK_FORMAT": [*HELPER, "-BenchAffinityMask", "FFF"],
     "CORE_PARTITION_MASK_FORMAT ": [*HELPER, "-BenchAffinityMask", "0x1FFFFF"],
@@ -630,18 +638,18 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(cls.repo), "checkout", "-q", cls.head], check=True)
         for stem in FIXTURE_IDS:
             write_synthetic_mlv(cls.repo / "tests" / "fixtures" / "clips" / (stem + MLV_EXT), FRAMES_30S_AT_23976)
-        cls.base_available = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{BASE_COMMIT}^{{commit}}"], capture_output=True).returncode == 0
-        base_root = cls.tmp / "base"
-        cls.base_generator = base_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
-        if cls.base_available:
-            tar = cls.tmp / "base.tar"
-            subprocess.run(["git", "-C", str(ROOT), "archive", BASE_COMMIT, "--format=tar", "-o", str(tar), "tools/profiling", "tools/gates"], check=True)
-            base_root.mkdir()
-            subprocess.run(["tar", "-xf", str(tar), "-C", str(base_root)], check=True)
+        # The seam-off generator: this tree's tools/profiling and tools/gates (everything the generator reads through $PSScriptRoot), with the
+        # one seam line turned off. Nothing else in the copy differs from the generator under test.
+        off_root = cls.tmp / "seam-off"
+        for part in ("profiling", "gates"):
+            shutil.copytree(ROOT / "tools" / part, off_root / "tools" / part, ignore=shutil.ignore_patterns("__pycache__"))
+        cls.off_generator = off_root / GENERATOR.relative_to(ROOT)
+        source = GENERATOR.read_bytes().decode("utf-8")
+        cls.seam_sites = len(SEAM_ON.findall(source))
+        cls.off_generator.write_bytes(SEAM_ON.sub(lambda _m: SEAM_OFF, source).encode("utf-8"))
         requests: list[tuple[str, Path, list[str]]] = [("default", GENERATOR, []), ("shape", GENERATOR, SHAPE), ("a", GENERATOR, ARM_A), ("b1", GENERATOR, ARM_B1),
-                                                       ("b2", GENERATOR, ARM_B2), ("cuda-b2", GENERATOR, CUDA_B2)]
-        if cls.base_available:
-            requests += [("base-default", cls.base_generator, []), ("base-shape", cls.base_generator, SHAPE)]
+                                                       ("b2", GENERATOR, ARM_B2), ("cuda-b2", GENERATOR, CUDA_B2), ("cuda-shape", GENERATOR, CUDA_SHAPE)]
+        requests += [("off-default", cls.off_generator, []), ("off-b2", cls.off_generator, ARM_B2), ("off-cuda-b2", cls.off_generator, CUDA_B2)]
         requests += [(f"refuse-{n}", GENERATOR, extra) for n, extra in enumerate(REFUSALS.values())]
         requests += [(f"eol-{field}-{eol}", GENERATOR, build(suffix)) for field, build in EOL_FIELDS.items() for eol, suffix in EOL_SUFFIXES.items()]
         commands = []
@@ -662,13 +670,29 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, f"{key}: {proc.stdout[-2000:]}{proc.stderr[-2000:]}")
         return self.out[key].read_text(encoding="utf-8")
 
-    def test_unset_arguments_emit_the_base_commits_job_byte_for_byte(self) -> None:
-        if not self.base_available:
-            self.skipTest(f"base commit {BASE_COMMIT} is not in this clone")
-        for key in ("default", "shape"):
+    def test_unset_arguments_emit_the_job_the_generator_emits_with_its_core_partition_seam_off(self) -> None:
+        """r6 (BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1): the no-feature job comes from this tree's own generator, so an edit elsewhere in the
+        generator or in a module it embeds moves both sides; only core-partition text that escapes the seam makes them differ."""
+        self.assertEqual(self.seam_sites, 1, "the generator must carry exactly one $corePartitionEmit seam line")
+        # Control: the copy differs from the generator under test by nothing a job without the arguments can see.
+        for key in ("off-default", "default"):
+            self.job(key)
+        self.assertEqual(self.out["off-default"].read_bytes(), self.out["default"].read_bytes(), "the seam-off copy of the generator emitted a different default job")
+        for off, plain in (("off-b2", "shape"), ("off-cuda-b2", "cuda-shape")):
+            with self.subTest(job=off):
+                for key in (off, plain):
+                    self.job(key)
+                self.assertEqual(self.out[off].read_bytes(), self.out[plain].read_bytes(),
+                                 f"{off}: with the seam off, the core-partition arguments still changed the job (they reach it outside the seam)")
+                self.assertNotEqual(self.job(off.removeprefix("off-")), self.job(plain), f"{off}: the seam is on in the generator under test")
+        blob = re.search(r"(?m)^\$CorePartitionHelperEncoded = '([^']+)'", self.job("b2"))
+        self.assertIsNotNone(blob, "the b2 job carries no encoded helper")
+        for key in ("default", "shape", "cuda-shape"):
             with self.subTest(job=key):
-                self.assertEqual(self.out[key].read_bytes(), self.out["base-" + key].read_bytes() if self.proc["base-" + key].returncode == 0 else b"<base failed>",
-                                 f"{key}: a job without the core-partition arguments changed")
+                text = self.job(key)
+                low = text.lower()
+                self.assertEqual([t for t in CORE_PARTITION_TOKENS if t in low], [], f"{key}: a job without the core-partition arguments carries core-partition text")
+                self.assertNotIn(blob.group(1)[:64], text, f"{key}: a job without the core-partition arguments carries the encoded helper")
 
     def test_every_refusal_is_typed(self) -> None:
         for n, code in enumerate(REFUSALS):
