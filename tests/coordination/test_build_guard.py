@@ -1084,7 +1084,7 @@ def test_a_ready_file_after_the_give_up_still_gets_a_stop_file(box) -> None:
         "    $d = (Get-Date).AddSeconds(30)\n"
         "    while ($lease -and -not (Test-Path -LiteralPath $lease.Ready) -and (Get-Date) -lt $d) { [Threading.Thread]::Sleep(50) }\n"
         "    Microsoft.PowerShell.Utility\\Write-Output $InputObject }\n"
-        "$opts.HeavySlotWaitMinutes = -15\n"
+        "$opts.HeavySlotWaitMinutes = 0; $script:HeavySlotGiveUpSlackMinutes = 0\n"
         f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
         str(box["lock"]),
         host_tail=(
@@ -1613,6 +1613,56 @@ def test_an_eta_heavy_slot_cannot_read_is_refused_before_heavy_slot_starts(box, 
     assert done.returncode == 2, done.stdout + done.stderr
     assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option HeavySlotWaitMinutes=60 HeavySlotEtaMinutes=" in done.stdout, done.stdout
     assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+@pytest.mark.parametrize("option, value", [
+    ("HeavySlotEtaMinutes", "15372286729L"), ("HeavySlotEtaMinutes", "10081"),
+    ("HeavySlotWaitMinutes", "-1"), ("HeavySlotWaitMinutes", "10081"),
+])
+def test_a_duration_heavy_slots_parser_cannot_hold_is_refused_before_heavy_slot_starts(box, option, value) -> None:
+    # r5b adversary 7cea1a1d-A2: heavy-slot reads ^\d+(\.\d+)?m$ into TimeSpan.FromMinutes, so a finite eta past
+    # TimeSpan's range overflows its parser and a negative wait is a usage error, both after the launch (a 77 that reads as
+    # COULD_NOT_CHECK). Wait and eta must be 0..10080 minutes; anything else is a typed refusal with nothing launched.
+    done = _library_driver(
+        box,
+        f"$opts.{option} = {value}\n"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option" in done.stdout, done.stdout + done.stderr
+    assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+def test_inherited_slot_selection_variables_never_reach_heavy_slot(box) -> None:
+    # r5b adversary 7cea1a1d-A1: HEAVY_SLOT_NAME picks other mutexes, HEAVY_SLOT_COUNT raises the capacity, HEAVY_SLOT_DIR
+    # moves the queue and HEAVY_SLOT_KEEPER_OWNER relaxes the keeper check. A guarded build always takes the canonical
+    # machine slot, so none of them is passed on, whichever caller (build-release, qscreen-probe, attr-3) set it.
+    done = _library_driver(
+        box,
+        "Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs) Write-Output \"built=$Jobs\" }\n",
+        str(box["lock"]),
+        extra={"HEAVY_SLOT_NAME": "Global\\HeavySlotTest-sol", "HEAVY_SLOT_COUNT": "2",
+               "HEAVY_SLOT_DIR": str(box["dir"] / "other-slots"), "HEAVY_SLOT_KEEPER_OWNER": "S-1-1-0"},
+    )
+    assert done.returncode == 0 and "built=4" in done.stdout, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert call["slotEnv"] == {"name": None, "count": None, "dir": None, "keeperOwner": None}, call["slotEnv"]
+
+
+def test_a_heavy_slot_tree_kill_at_release_keeps_the_callers_exit_code(box) -> None:
+    # r5b adversary 7cea1a1d-A3: the action ends with native exit 9 and the stop file cannot be written, so the release
+    # ends heavy-slot with taskkill. taskkill must not overwrite the $LASTEXITCODE a Library caller exits with.
+    done = _library_driver(
+        box,
+        "Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        "    New-Item -ItemType Directory -Path $heavy.Stop | Out-Null\n"
+        "    cmd /c exit 9 }\n"
+        "exit $LASTEXITCODE\n",
+        str(box["lock"]),
+    )
+    assert "stop file not written" in done.stderr, done.stdout + done.stderr
+    assert done.returncode == 9, done.stdout + done.stderr
 
 
 def test_explicit_empty_inputs_reach_the_guard_as_given(box) -> None:

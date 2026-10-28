@@ -72,7 +72,8 @@
 #   Lane FULL-SUITE runs take the same slot by hand, no new runner: from the lane worktree,
 #      $env:HEAVY_SLOT_EXPECT_SHA256 = '<pin below>'; $env:HEAVY_SLOT_EXPECT_KEEPER = '1'
 #      heavy-slot.cmd run --class shared --label mlv:<lane>:pytest --eta 45m --wait 60m --exit-file <fresh> -- py -3 -m pytest <args>
-#   and judge 75-77 by the same marker rule (matched = REQUEUE, unmatched = COULD-NOT-CHECK); every other
+#   with HEAVY_SLOT_NAME, HEAVY_SLOT_COUNT, HEAVY_SLOT_DIR and HEAVY_SLOT_KEEPER_OWNER unset (the guard removes them from
+#   its own heavy-slot call: they select other slots or more of them, r5b adversary A1), and judge 75-77 by the same marker rule (matched = REQUEUE, unmatched = COULD-NOT-CHECK); every other
 #   code is pytest's own. The hub's fast-suites-for-diff.ps1 -Run wraps each selector the same way. Never
 #   wrap an Invoke-Lane lane, a venue leg or a scheduled beat.
 #
@@ -156,6 +157,10 @@ $script:BuildGuardDefaults = @{
 }
 $script:BuildGuardCimTimeoutSec = 30
 $script:HeavySlotInstallCmd = 'C:\ProgramData\HeavySlot\bin\heavy-slot.cmd'
+# The largest --wait / --eta passed to heavy-slot (one week; heavy-slot's own --max-hold is 90 min), and the slack the
+# hung-tool bound adds to the wait. The slack is a test seam: a Library driver may set it after dot-sourcing.
+$script:HeavySlotMaxMinutes = 10080
+$script:HeavySlotGiveUpSlackMinutes = 15
 
 function Write-BuildGuardLog([string]$Message) {
     [Console]::Error.WriteLine("[build-guard] $Message")
@@ -488,7 +493,13 @@ function Send-HeavySlotStop($Lease) {
     # slot mutex), so a holder that would never see the file cannot keep the machine slot.
     try { Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -ErrorAction Stop; return } catch { $why = $_.Exception.Message }
     Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} stop file not written ({1}); ending heavy-slot pid {2} and its children' -f $Lease.Label, $why, $Lease.Process.Id)
-    if (-not $Lease.Process.HasExited) { $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $Lease.Process.Id /T /F 2>&1 }
+    # taskkill sets the global $LASTEXITCODE, which a Library caller may exit with after the release, so it is kept
+    # (r5b adversary A3).
+    if (-not $Lease.Process.HasExited) {
+        $keep = $global:LASTEXITCODE
+        $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $Lease.Process.Id /T /F 2>&1
+        $global:LASTEXITCODE = $keep
+    }
     # (The wrapper's pid cannot be reused here: $Lease.Process has held its handle since Process.Start.)
     # A holder that outlived heavy-slot is no longer in that tree: it is ended by its own identity (r3b adversary A2), and only
     # through the handle that identity was verified on, so a process that took its pid later is never stopped (r4 sol B4).
@@ -582,15 +593,19 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # launched, never a throw after the launch that skips the stop file (r2 adversary A3).
     # --wait and --eta are written in the invariant culture: heavy-slot reads only plain decimals ('0.5m'), never the
     # '0,5m' a de-DE culture writes. An eta that is not a finite number >= 0 is refused here too (r4 adversary A1).
+    # heavy-slot reads both with ^\d+(\.\d+)?m$ into TimeSpan.FromMinutes, so a negative wait, or either one past
+    # TimeSpan's range, fails its parser after the launch; both must be 0..$script:HeavySlotMaxMinutes (r5b adversary A2).
     $giveUp = $null
     $inv = [Globalization.CultureInfo]::InvariantCulture
     try {
         $waitMin = [double]$Options.HeavySlotWaitMinutes
         $etaMin = [double]$Options.HeavySlotEtaMinutes
-        if (-not ($etaMin -ge 0) -or [double]::IsInfinity($etaMin)) { throw 'HeavySlotEtaMinutes is not a finite number >= 0' }
+        foreach ($d in @(@('HeavySlotWaitMinutes', $waitMin), @('HeavySlotEtaMinutes', $etaMin))) {
+            if (-not ($d[1] -ge 0 -and $d[1] -le $script:HeavySlotMaxMinutes)) { throw ('{0} is not a number from 0 to {1}' -f $d[0], $script:HeavySlotMaxMinutes) }
+        }
         $waitArg = $waitMin.ToString('0.##########', $inv) + 'm'
         $etaArg = $etaMin.ToString('0.##########', $inv) + 'm'
-        $giveUp = [TimeSpan]::FromMinutes($waitMin + 15)
+        $giveUp = [TimeSpan]::FromMinutes($waitMin + $script:HeavySlotGiveUpSlackMinutes)
     } catch { $why = $_.Exception.Message }
     if ($null -eq $giveUp) {
         Write-Output ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} ({3}) utc={4}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
@@ -607,6 +622,9 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     $psi.Arguments = '/d /v:off /s /c "' + ($quoted -join ' ') + ' >"' + $lease.Log + '" 2>&1"'
     $psi.Environment['HEAVY_SLOT_EXPECT_SHA256'] = $expected
     $psi.Environment['HEAVY_SLOT_EXPECT_KEEPER'] = '1'
+    # A guarded build always takes the canonical machine slot: an inherited mutex name, slot count, state dir or keeper
+    # owner would let it queue on other slots, or beside the canonical holder (r5b adversary A1).
+    foreach ($v in 'HEAVY_SLOT_NAME', 'HEAVY_SLOT_COUNT', 'HEAVY_SLOT_DIR', 'HEAVY_SLOT_KEEPER_OWNER') { $null = $psi.Environment.Remove($v) }
     try { $lease.Process = [System.Diagnostics.Process]::Start($psi) } catch {
         Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=$cmd start-failed: $($_.Exception.Message); building WITHOUT the machine heavy slot (fail open)"
         return $null

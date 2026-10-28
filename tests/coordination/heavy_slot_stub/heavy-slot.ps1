@@ -23,7 +23,8 @@
 # The real-path modes (run, pinwarn, locklog) export HEAVY_SLOT_HELD and HEAVY_SLOT_HELD_START (this process's start time,
 # or STUB_HEAVY_SLOT_HELD_START, which stands in for a pid reused since the slot owner exported its start time).
 # STUB_HEAVY_SLOT_DELAY_S (run, pinwarn and readyexit) waits that many seconds before starting the child, like a queue wait for the slot.
-# Every call appends one JSON line (argv, the two EXPECT variables, and the child's start and end) to STUB_HEAVY_SLOT_LOG.
+# Every call appends one JSON line (argv, the two EXPECT variables, the slot-selection variables it inherited, and the
+# child's start and end) to STUB_HEAVY_SLOT_LOG.
 $argv = @($args)
 $mode = if ($env:STUB_HEAVY_SLOT_MODE) { $env:STUB_HEAVY_SLOT_MODE } else { 'run' }
 $ticket = 'stub-{0}' -f $PID
@@ -35,7 +36,8 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
     if ($argv[$i] -eq '--exit-file') { $exitFile = $argv[$i + 1] }
     if ($argv[$i] -eq '--') { $command = @($argv | Select-Object -Skip ($i + 1)); break }
 }
-$record = [ordered]@{ argv = $argv; expectSha = $env:HEAVY_SLOT_EXPECT_SHA256; expectKeeper = $env:HEAVY_SLOT_EXPECT_KEEPER; mode = $mode; childStart = $null; childEnd = $null }
+$record = [ordered]@{ argv = $argv; expectSha = $env:HEAVY_SLOT_EXPECT_SHA256; expectKeeper = $env:HEAVY_SLOT_EXPECT_KEEPER; mode = $mode; childStart = $null; childEnd = $null
+    slotEnv = [ordered]@{ name = $env:HEAVY_SLOT_NAME; count = $env:HEAVY_SLOT_COUNT; dir = $env:HEAVY_SLOT_DIR; keeperOwner = $env:HEAVY_SLOT_KEEPER_OWNER } }
 function Write-StubMarker([string]$Nonce, [int]$Code = 75) {
     $marker = [ordered]@{ source = 'heavy-slot'; code = $Code; reason = 'timed out after 3600s waiting for the slot'; ticket = $ticket; nonce = $Nonce; pid = $PID }
     if ($exitFile) { Set-Content -LiteralPath $exitFile -Value ($marker | ConvertTo-Json -Compress) -Encoding ascii }
