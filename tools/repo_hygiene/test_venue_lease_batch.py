@@ -3242,6 +3242,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # adversary r7 A2: a name inside the probe's work folder (Wait-VenueQuiet writes its job files there) is already a hard link to the spec
         "probe work folder (a name inside it)": ("    $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript,",
                                                  "$null = New-Item -ItemType Directory -Force -Path (Join-Path $RunDir 'quiet'); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'quiet\\venue-quiet-probe-r7.job.ps1') -Value '{b}' | Out-Null"),
+        # adversary r7 pass 2 A1: the open's own job folder holds a hard link to the spec when the open is submitted
+        "open job folder": ("            $op = Submit-AgentJob $b.openJobId ",
+                            "New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch-jobs\\keep.json') -Value '{b}' | Out-Null"),
     }
 
     def test_r7_every_writer_asks_the_guard_right_before_it_writes(self) -> None:
@@ -3262,9 +3265,25 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertIn("BATCH_WRITE_REFUSED ", r.stderr)
                 self.assertEqual(batch_result(r.stdout)["stopReason"], "LEG_SPEC_IS_RUN_OUTPUT")
                 self.assertFalse(self.claim_path.exists(), "the claim was left behind")
-                if name == "leg-plan.json":
-                    # adversary r7 A3: a refusal before the open stopped the claim keeper, so no open is submitted after it (it could outlive the claim)
+                if name in ("leg-plan.json", "open job folder"):
+                    # adversary r7 A3 / pass 2 A1: a refusal before the open stopped the claim keeper, so no open is submitted after it (it could outlive the claim)
                     self.assertNotIn("OPEN:", " ".join(self.kinds()), "an open was submitted after a write was refused before it")
+
+    def test_r7_adv2_a4_a_preflight_refusal_with_an_uninspectable_zone_appends_nothing_to_the_plan(self) -> None:
+        # adversary r7 pass 2 A4: the plan file IS RunDir\batch.log (one name) and RunDir\gate.log is a link to nothing, so the preflight guard types OUTPUT_ZONE_UNRESOLVED; before any input
+        # is accepted nothing is compared, and the refusal line was appended into the plan
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+        log = self.run_dir / "batch.log"
+        log.write_bytes(plan.read_bytes())
+        snap = log.read_bytes()
+        subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", self._rpf06_dangling(self.run_dir / "gate.log")], check=True, capture_output=True)
+        args, e = self.plan_cmd(log)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=OUTPUT_ZONE_UNRESOLVED", r.stderr)
+        self.assertEqual(log.read_bytes(), snap, "the refusal line was appended into the plan file\n" + r.stdout + r.stderr)
 
     def test_r7_adv_a1_a_receipt_file_that_is_an_accepted_input_as_accepted_suppresses_every_write(self) -> None:
         # adversary r7 A1: after the final leg the spec is renamed to a.old and RunDir\batch-01.json is made a hard link to a.old (batch.log plain, batches.jsonl absent). The guard reads the

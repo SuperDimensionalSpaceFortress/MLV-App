@@ -251,7 +251,8 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
         elseif (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (Get-FileIdentity $batchLog).links -le 1) { $logPlain = $true }
     } catch { }
     # r7: nor for an input that no longer resolves (it is exactly when a write is unsafe), and only through the write guard (Test-RunDirWrite)
-    if ($logPlain -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT', 'INPUT_VANISHED', 'INPUT_UNREADABLE') -and
+    # r7 pass 3 (adversary r7 pass 2 A4): nor for OUTPUT_ZONE_UNRESOLVED: the guard could not tell whether the refused input is batch.log (before any input is accepted nothing is compared)
+    if ($logPlain -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT', 'INPUT_VANISHED', 'INPUT_UNREADABLE', 'OUTPUT_ZONE_UNRESOLVED') -and
         -not $script:RunOutputAliased -and (Test-RunDirWrite $batchLog)) {
         # r3 pass 3 (adversary r3 A1): a failed append is counted when a summary follows (a refusal once a batch receipt exists), so the count that summary reports includes it
         try { Add-Content -LiteralPath $batchLog -Value "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $line" } catch { if ($script:summaryBeforeExit) { Register-LogFailure $_.Exception.Message } }
@@ -572,7 +573,17 @@ function Get-WriteDestinationHit([string]$Path, [switch]$Directory) {
     # path resolves now; a name that will not resolve is refused, since where the write lands is unknown. -Directory: a folder the write creates files in (an input under it is the hit).
     # r6 pass 3 (adversary r6 pass 2 A1) compared an unresolved input by its accepted identity only and let a one-name destination through. r7 (sol r6 B2; RPF-09): a one-name destination
     # proves nothing about the INPUT side (a junction above the input retargeted at -RunDir reaches the destination with one name), so an input that is there and will not resolve refuses.
-    if (Test-NothingAtName $Path) { return $null }
+    if (Test-NothingAtName $Path) {
+        # r7 pass 3 (adversary r7 pass 2 A2): a new file is no accepted input, unless an input that is there will not resolve: a link on its side may name this very file once written
+        foreach ($g in $script:guardedInputs) {
+            if (Test-NothingAtName $g.path) { continue }
+            try { $null = Get-PhysicalPath $g.path; $null = Get-FileIdentity $g.path } catch {
+                return [pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = 'INPUT_UNREADABLE'; path = $g.path
+                    why = "the accepted input '$($g.path)' is there but cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')): a link on its side may name '$Path' once it is written" }
+            }
+        }
+        return $null
+    }
     try { $phys = (Get-PhysicalPath $Path).TrimEnd('\'); $di = Get-FileIdentity $Path }
     catch { return [pscustomobject]@{ kind = 'output'; input = ''; item = 0; code = 'OUTPUT_ZONE_UNRESOLVED'; path = $Path; why = "'$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write to it lands is unknown" } }
     $inputKeys = @{}   # r7 pass 2: file identity -> input, for the files already under a -Directory destination
@@ -661,11 +672,16 @@ function Test-RunDirWrite([string]$Path, [switch]$Directory) {
     if ($script:RunOutputAliased) { return $false }
     $hit = Get-WriteDestinationHit $Path -Directory:$Directory
     if (-not $hit) { return $true }
+    Register-WriteRefusal $Path $hit
+    $false
+}
+
+function Register-WriteRefusal([string]$Path, $hit) {
+    # r7 pass 3 (adversary r7 pass 2 A3): a refusal acts on the hit the guard found, never on a second lookup (which a swapped file could answer differently)
     if (-not $script:receiptGuardHit -or ((Test-AliasHit $hit) -and -not (Test-AliasHit $script:receiptGuardHit))) { $script:receiptGuardHit = $hit }
     $hr = Get-HitRefusal $hit
     [Console]::Error.WriteLine("BATCH_WRITE_REFUSED file=$Path reason=$($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" }) $($hr[2]) (nothing more is written into -RunDir)")
     Enable-WriteSuppression $hit
-    $false
 }
 
 function Stop-BatchOnSuppression([System.Collections.IDictionary]$B) {
@@ -913,7 +929,9 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
     [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff }
 }
 
-function Submit-AgentJob([string]$JobId, [string]$Body, [int]$TimeoutSec, [int]$WaitSec, [string]$NotAfterUtc = '') {
+function Submit-AgentJob([string]$JobId, [string]$Body, [int]$TimeoutSec, [int]$WaitSec, [string]$NotAfterUtc = '', [switch]$Open) {
+    # r7 pass 3 (adversary r7 pass 2 A1): the open's job folder refused (the keeper is stopped by then): nothing is submitted, the batch ends in that typed stop (the batch catch)
+    if ($Open -and -not $script:RunOutputAliased -and -not (Test-RunDirWrite $jobDir -Directory)) { $script:preOpenRefused = $true; throw 'the open job folder was refused before the open' }
     # One job through um-run.ps1 (the only writer to a venue share). RECEIPT | RETRACTED | UNRESOLVED | ERROR; a thrown RETRACTED / UNRESOLVED is data here.
     # r4: -NotAfterUtc (the open only) goes to um-run.ps1 -NotAfterUtc, meta.json notAfterUtc: the agent takes no lease for the job past it.
     # r16 (sol r15 B1): JOB_WRITE_FAILED = the job file was never complete here (no job folder, the create or the write failed), so um-run.ps1 was never called and
@@ -1020,7 +1038,7 @@ function Test-ReceiptWriteSuppressed([int]$Batch, [string]$Path) {
                 # will not resolve) is an alias found by a writer: the suppression turns on for every write and the hit is kept (Test-RunDirWrite)
                 $dh = Get-WriteDestinationHit $Path
                 if ($dh -and $dh.kind -ceq 'output') { Add-SuppressedReceipt $Batch $Path $guardHit $dh.why; return $true }
-                if ($dh) { $null = Test-RunDirWrite $Path; Add-SuppressedReceipt $Batch $Path; return $true }
+                if ($dh) { Register-WriteRefusal $Path $dh; Add-SuppressedReceipt $Batch $Path; return $true }
             }
             # r7: with no such hit the receipt's own file is still asked about right before the write, as every writer's is (Test-RunDirWrite)
             elseif (-not (Test-RunDirWrite $Path)) { Add-SuppressedReceipt $Batch $Path; return $true }
@@ -1257,7 +1275,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             $b.openLiveness = Stop-VenueJobLiveness $openLive -Remove
             $op = [pscustomobject]@{ outcome = 'NOT_SUBMITTED'; result = $null; message = "first liveness write $($openLive.first.state)$(if ($openLive.first.error) { ": $($openLive.first.error)" })$(if ($crossed) { ", but the batch deadline passed first (the sidecar is live; read-back: $($rb.why))" } elseif ($null -ne $rb -and -not $rb.live) { ", but the agent's own parser does not read it as live (read-back $($rb.livenessState)): $($rb.why)" })" }
         } else {
-            $op = Submit-AgentJob $b.openJobId "Write-Output ('LEASE_BATCH_OPEN token=$token held=' + [string]`$env:HEAVY_SLOT_HELD + ' admission=' + [string]`$env:MLV_AGENT_ADMISSION)" 120 $wait $b.openNotAfterUtc
+            $op = Submit-AgentJob $b.openJobId "Write-Output ('LEASE_BATCH_OPEN token=$token held=' + [string]`$env:HEAVY_SLOT_HELD + ' admission=' + [string]`$env:MLV_AGENT_ADMISSION)" 120 $wait $b.openNotAfterUtc -Open
         }
         if ($op.outcome -ceq 'UNRESOLVED' -and $op.message -match 'admission gate') {
             # CAPS d: um-run stopped while the agent still holds the open in its gate, re-asking a refused (exit 75) request. That is a wait, not a failure:
