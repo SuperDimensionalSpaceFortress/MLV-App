@@ -926,6 +926,9 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
     # r7: the probe writes its output here, and Wait-VenueQuiet its gate log and work folder: each is asked first (a refusal runs no probe: the batch ends in its typed stop)
     $asked = (Test-RunDirWrite (Join-Path $RunDir 'gate.log')) -and (Test-RunDirWrite (Join-Path $RunDir 'quiet') -Directory)
     if (-not ($asked -and (Test-RunDirWrite $out))) { return [pscustomobject]@{ verdict = 'WRITE_REFUSED'; code = 'none'; mean = $null; reason = 'WRITE_REFUSED'; foreignFloor = $false } }
+    # r8 pass 3 (adversary r8 pass 2 A3): the guards above can block on a share, so the claim is asked again at the probe's launch itself (no probe without the claim)
+    $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc
+    if ($cl) { return [pscustomobject]@{ verdict = 'CLAIM_LOST'; code = 'none'; mean = $null; reason = $cl.detail; foreignFloor = $false } }
     & $pwshExe @qArgs *> $out
     $code = $LASTEXITCODE
     $lines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
@@ -1395,6 +1398,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             L "BATCH_OPEN batch=$batchNo token=$token lease=$($b.leaseId) held=$($b.held) minutes=$($b.leaseMinutes) roomSec=$([int]($leaseEnd - [DateTime]::UtcNow).TotalSeconds) openWaitedSec=$($b.openWaitedSec) refusals=$(@($b.refusals).Count)"
             # (3) the legs, under the lease
             $attempt = 0
+            $launchShort = $false
             while ($pending.Count -gt 0) {
                 $leg = $pending[0]; $inFlightLeg = $null
                 if ($script:RunOutputAliased) { Stop-BatchOnSuppression $b; break }   # r7: a write refused anywhere in the batch: no probe or leg runs after it
@@ -1412,6 +1416,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $probeWait = [int][Math]::Max(0, [Math]::Min($ProbeMaxWaitSec, $room - $legBudget))
                 $q = Invoke-QuietProbe $leg.name "b$('{0:00}' -f $batchNo)-a$attempt" $probeWait
                 if ($q.verdict -ceq 'WRITE_REFUSED' -or $script:RunOutputAliased) { Stop-BatchOnSuppression $b; break }   # r7: the probe's outputs were refused
+                if ($q.verdict -ceq 'CLAIM_LOST') { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "at the probe's launch for leg $($leg.name): $($q.reason)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=probe-launch $($q.reason)"; break }
                 if ($q.foreignFloor -and -not $legForeign.ContainsKey($leg.name)) { $legForeign[$leg.name] = $q.foreignFloorLine }
                 L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease exit=$($q.code) verdict=$($q.verdict) mean=$(Format-Mean $q.mean) maxWaitSec=$probeWait roomSec=$room$(if ($q.reason) { " reason=$($q.reason)" })$(if ($q.foreignFloor) { ' foreignFloor=1' })"
                 if ($q.verdict -ceq 'USAGE') { $b.endReason = 'PROBE_USAGE'; Set-Stop 'USAGE' 2; break }
@@ -1443,6 +1448,16 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
                 L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })$(if ($legPlanMode) { " arm=$($leg.arm) sourceCommit=$($leg.sourceCommit) buildManifestSha256=$($leg.buildManifestSha256)" })"
                 if ($script:RunOutputAliased) { $b.legsAttempted--; Stop-BatchOnSuppression $b; break }   # r7: the RUN line itself was refused: the leg is not started
+                # r8 pass 3 (adversary r8 pass 2 A3): the launch is the leg's dispatch. The guards since the checks above (the output's, the RUN line's) can block on a share, so the
+                # claim and the lease's room are asked again HERE: a lost claim, or less room than the leg's budget, starts nothing (the leg goes to the next batch)
+                $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc
+                $roomAtLaunch = [int](($leaseEnd - [DateTime]::UtcNow).TotalSeconds) - $LeaseMarginSec
+                if ($cl -or $roomAtLaunch -lt $legBudget) {
+                    $b.legsAttempted--; $launchShort = -not $cl
+                    if ($cl) { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "at the launch of leg $($leg.name): $($cl.detail)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=launch $($cl.detail)" }
+                    else { $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "at the launch of leg $($leg.name): roomSec=$roomAtLaunch < legBudgetSec=$legBudget (leaseMarginSec=$LeaseMarginSec): it goes to the next batch" }
+                    break
+                }
                 $tLeg = [DateTime]::UtcNow
                 # r3 (sol r2 B2): the leg runs only while the lease does. It is a bounded child: still running at the lease's end, it is killed with its whole
                 # process tree (Kill($true), Invoke-VenueBoundedProcess) and typed LEASE_EXPIRED below. The agent stops its job at the same bound (lease-batch r3).
@@ -1544,7 +1559,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             }
             if ($null -eq $b.endReason -and $pending.Count -eq 0) { $b.endReason = 'ALL_LEGS_DONE' }
             # A FRESH lease with no room for even one leg can never run it: stop rather than open lease after lease.
-            if ($b.endReason -ceq 'LEASE_REMAINING_SHORT' -and $b.legsAttempted -eq 0 -and $b.probeRetries -eq 0) {
+            if ($b.endReason -ceq 'LEASE_REMAINING_SHORT' -and $b.legsAttempted -eq 0 -and $b.probeRetries -eq 0 -and -not $launchShort) {   # r8 pass 3: room the guards ate at the launch is no budget the lease cannot hold
                 $b.endReason = 'LEG_BUDGET_EXCEEDS_LEASE'; Set-Stop 'LEG_BUDGET_EXCEEDS_LEASE' 2
             }
         }

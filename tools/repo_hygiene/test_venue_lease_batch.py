@@ -3376,6 +3376,27 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertEqual((res["stopReason"], b1["endReason"], b1["leaseId"]), (reason, reason, None), b1)
                 self.assertIn("notAfterUtc=", b1["endDetail"])
 
+    def test_r8_adv2_a3_the_claim_and_the_lease_are_asked_again_at_the_launch_of_the_probe_and_the_leg(self) -> None:
+        # adversary r8 pass 2 A3: the guards between the top-of-loop checks and a launch (the leg's output and RUN line, the probe's gate log, work folder and output) can block on a
+        # share, so the claim can be lost and the lease end while they run. Injected right at the launch: nothing starts in batch 1, and batch 2 takes a fresh claim and lease and runs
+        # the leg. RED on f26a2f1c: the leg (or the probe) is started on a lost claim or an ended lease.
+        leg_anchor = "                if ($script:RunOutputAliased) { $b.legsAttempted--; Stop-BatchOnSuppression $b; break }   # r7: the RUN line itself was refused: the leg is not started"
+        cases = {
+            "leg: claim lost while its guards ran": (leg_anchor, "$claimKeeper.state.lost = 'NOT_OURS'", "CLAIM_LOST", ["OPEN", "QUIET", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
+            "leg: the lease ended while its guards ran": (leg_anchor, "$leaseEnd = [DateTime]::UtcNow.AddSeconds(-31)", "LEASE_REMAINING_SHORT", ["OPEN", "QUIET", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
+            "probe: claim lost while its guards ran": ("    if (-not ($asked -and (Test-RunDirWrite $out))) {","$claimKeeper.state.lost = 'NOT_OURS'", "CLAIM_LOST", ["OPEN", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
+        }
+        for name, (anchor, make, reason, kinds) in cases.items():
+            with self.subTest(case=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r, _b, _snap = self._r8_run(anchor, make)
+                out = r.stdout + r.stderr
+                self.assertEqual([x.split(":")[0] for x in self.kinds()], kinds, out)
+                self.assertEqual(r.returncode, 0, out)
+                b1, b2 = self.batches()
+                self.assertEqual((b1["endReason"], b1["legsAttempted"], b2["endReason"], b2["legsCounted"]), (reason, 0, "ALL_LEGS_DONE", 1), b1)
+                self.assertIn("launch", b1["endDetail"])
+
     def test_r8_adv_a1_an_input_that_cannot_be_identified_as_accepted_is_refused_before_the_claim(self) -> None:
         # adversary r8 A1: the spec is renamed away while its accepted identity is taken and put back after. The snapshot failure was swallowed (accepted = null), so every destination
         # check skipped that input as accepted, and once renamed and re-linked at the end, a receipt was written through it. Now: asked again, then refused before any claim.
