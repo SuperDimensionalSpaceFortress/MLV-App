@@ -16431,9 +16431,9 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
     }
 }
 
+// r4 (adversary ddda72d6 A2): detached, the loaded clip is not this receipt's; its levels are not a baseline.
 void MainWindow::captureLookAssistBaseline( ReceiptSettings *receipt )
 {
-    // r4 (adversary ddda72d6 A2): detached, the loaded clip is not this receipt's; its levels are not a baseline.
     if( !receipt || m_slidersDetachedFromReceipt ) return;
 
     // A fresh baseline starts with no Film curve on record (a recorded one is put back first, so it is never mistaken
