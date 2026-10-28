@@ -11079,6 +11079,9 @@ void MainWindow::importNewMlv(QString fileName)
         }
         else
         {
+            // r4 (adversary ddda72d6 A3 sibling): the new row is active but the sliders describe the previous
+            // clip; the delete below must not save them into any receipt.
+            m_slidersDetachedFromReceipt = true;
             //if open error, delete MLV
             deleteFileFromSession();
         }
@@ -16430,7 +16433,8 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
 
 void MainWindow::captureLookAssistBaseline( ReceiptSettings *receipt )
 {
-    if( !receipt ) return;
+    // r4 (adversary ddda72d6 A2): detached, the loaded clip is not this receipt's; its levels are not a baseline.
+    if( !receipt || m_slidersDetachedFromReceipt ) return;
 
     // A fresh baseline starts with no Film curve on record (a recorded one is put back first, so it is never mistaken
     // for the user's curve).
@@ -21230,6 +21234,13 @@ void MainWindow::on_actionExportCurrentFrame_triggered()
 {
     ui->actionPlay->setChecked( false );
     applyEffectiveDualIsoPlaybackSettings();
+    // r4 (adversary ddda72d6 A1): detached, the loaded object is not the active clip; it would be exported
+    // under the active clip's name.
+    if( m_slidersDetachedFromReceipt )
+    {
+        QMessageBox::information( this, tr( "Export" ), tr( "The selected clip is not loaded yet. Select it again, then export the frame." ) );
+        return;
+    }
     SingleFrameExportDialog *exportDialog = new SingleFrameExportDialog( this,
                                                                          m_pMlvObject,
                                                                          ACTIVE_RECEIPT->fileName(),
@@ -24616,7 +24627,9 @@ void MainWindow::exportHandler( void )
         const int reopenResult = openMlv( GET_RECEIPT( m_lastClipBeforeExport )->fileName() );
         // A refused reopen applies nothing (ReceiptSafety would validate this receipt against the job's
         // clip): the sliders still hold the last job's settings, so no receipt is saved from them.
-        if( clipOpenAbortedForPrep( reopenResult ) ) m_slidersDetachedFromReceipt = true;
+        // r4 (adversary ddda72d6 A3): any failed reopen (prep refusal, or a locked / vanished file) leaves the job's
+        // clip loaded, so the sliders detach; only a prep refusal is retried.
+        if( reopenResult ) m_slidersDetachedFromReceipt = true;
         else setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );
         SET_ACTIVE_CLIP_IDX( m_lastClipBeforeExport );
         if( clipOpenAbortedForPrep( reopenResult ) ) retryClipReopenAfterPrepAbort( m_lastClipBeforeExport );
@@ -31000,7 +31013,8 @@ void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged( int )
 
 void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
 {
-    if( !m_fileLoaded || !ACTIVE_RECEIPT ) return;
+    // r4 (adversary ddda72d6 A2): no Look Assist analysis or baseline pairs another clip with this receipt.
+    if( !m_fileLoaded || !ACTIVE_RECEIPT || m_slidersDetachedFromReceipt ) return;
 
     logInteractionEvent(
         QStringLiteral("look_assist.toggle.begin"),

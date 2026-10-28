@@ -220,7 +220,7 @@ TEST(ClipOpenAbortCallersWiring, SlidersThatDescribeNoReceiptAreNeverSaved)
     const QString exportEnd = bodyBetween(source, QStringLiteral("//Open last file which was opened before export"),
                                           QStringLiteral("//Unblock GUI"));
     ASSERT_TRUE(exportEnd.contains(QStringLiteral(
-        "if( clipOpenAbortedForPrep( reopenResult ) ) m_slidersDetachedFromReceipt = true;\n"
+        "if( reopenResult ) m_slidersDetachedFromReceipt = true;\n"
         "        else setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );")));
     const QString rename = bodyBetween(source, QStringLiteral("void MainWindow::renameActiveClip( void )"),
                                        QStringLiteral("void MainWindow::retryClipReopenAfterPrepAbort( int row )"));
@@ -627,6 +627,29 @@ TEST(ClipOpenAbortR4Wiring, DeferredReopenChecksGenerationAndExportBeforeShowing
     const QString fileOpen = bodyBetween(source, QStringLiteral("bool MainWindow::event(QEvent *event)"),
                                          QStringLiteral("importNewMlv( fileName );"));
     ASSERT_TRUE(fileOpen.contains(QStringLiteral("if( m_exportInProgress )")));
+}
+
+// adversary ddda72d6 A1-A3: while detached, nothing pairs the loaded object with the active row (Export Current
+// Frame, Look Assist toggle / baseline), and every failed final reopen or failed import detaches.
+TEST(ClipOpenAbortR4Wiring, DetachedSlidersBlockEveryLoadedObjectReaderOfTheActiveRow)
+{
+    const QString source = mainWindowSource();
+    const QString frame = bodyBetween(source, QStringLiteral("void MainWindow::on_actionExportCurrentFrame_triggered()"),
+                                      QStringLiteral("SingleFrameExportDialog *exportDialog = new SingleFrameExportDialog("));
+    ASSERT_TRUE(frame.contains(QStringLiteral("if( m_slidersDetachedFromReceipt )")));
+    const QString capture = bodyBetween(source, QStringLiteral("void MainWindow::captureLookAssistBaseline( ReceiptSettings *receipt )"),
+                                        QStringLiteral("void MainWindow::restoreLookAssistBaseline( ReceiptSettings *receipt )"));
+    ASSERT_TRUE(capture.contains(QStringLiteral("if( !receipt || m_slidersDetachedFromReceipt ) return;")));
+    const QString toggle = bodyBetween(source, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"),
+                                       QStringLiteral("logInteractionEvent("));
+    ASSERT_TRUE(toggle.contains(QStringLiteral("if( !m_fileLoaded || !ACTIVE_RECEIPT || m_slidersDetachedFromReceipt ) return;")));
+    const QString importBody = bodyBetween(source, QStringLiteral("void MainWindow::importNewMlv(QString fileName)"),
+                                           QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
+    const int detach = importBody.lastIndexOf(QStringLiteral("m_slidersDetachedFromReceipt = true;"));
+    const int remove = importBody.indexOf(QStringLiteral("deleteFileFromSession();"));
+    ASSERT_TRUE(remove >= 0);
+    ASSERT_TRUE(detach >= 0 && detach < remove);
+    ASSERT_TRUE(importBody.indexOf(QStringLiteral("else if( !ret )")) < detach);
 }
 
 // Dot B3: a clip the export queue refused is reported, the single-clip path never reads first() of an empty
