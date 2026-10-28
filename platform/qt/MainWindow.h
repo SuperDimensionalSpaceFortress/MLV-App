@@ -1889,6 +1889,7 @@ private:
     int showFileInEditor(int row);
     void markClipOpenSucceeded( void );
     void retryClipReopenAfterPrepAbort( int row );
+    void scheduleClipReopenRetry( int row, unsigned long long generation, int deferrals );
     void resetExportOpenAbortRetries( void );
     bool addClipToExportQueue( int row, QString fileName );
     void previewPicture( int row );

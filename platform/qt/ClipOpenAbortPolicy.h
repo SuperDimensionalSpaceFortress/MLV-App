@@ -33,12 +33,25 @@ inline bool clipOpenFailureKeptRetainedClip( int openResult )
 }
 
 // r4 (adversary A4): a deferred reopen runs only against the clip state it was scheduled for (no clip opened
-// since) and never while an export holds a clip: a disabled GUI does not stop a timer.
-inline bool deferredClipReopenMayRun( unsigned long long scheduledGeneration, unsigned long long currentGeneration,
-                                      bool exportInProgress, int row, int activeRow, int clipCount )
+// since) and never while something holds the loaded clip (a batch export, Export Current Frame, any modal
+// dialog): a disabled GUI does not stop a timer. A still-current retry is postponed while the clip is held.
+constexpr int kClipReopenAbortMaxDeferrals = 120; // x kClipReopenAbortRetryDelayMs = one minute
+
+enum class DeferredClipReopen
 {
-    if( exportInProgress || scheduledGeneration != currentGeneration ) return false;
-    return row >= 0 && row < clipCount && row == activeRow;
+    Run,
+    Postpone,
+    Drop
+};
+
+inline DeferredClipReopen deferredClipReopenDecision( unsigned long long scheduledGeneration,
+                                                      unsigned long long currentGeneration, bool clipHeld,
+                                                      int row, int activeRow, int clipCount, int deferrals )
+{
+    if( scheduledGeneration != currentGeneration ) return DeferredClipReopen::Drop;
+    if( row < 0 || row >= clipCount || row != activeRow ) return DeferredClipReopen::Drop;
+    if( clipHeld ) return deferrals < kClipReopenAbortMaxDeferrals ? DeferredClipReopen::Postpone : DeferredClipReopen::Drop;
+    return DeferredClipReopen::Run;
 }
 
 // showFileInEditor( row ) after openMlv( row ) failed. The active row moves back to the clip the sliders

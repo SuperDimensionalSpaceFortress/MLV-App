@@ -537,14 +537,64 @@ TEST(ClipOpenAbortR4Wiring, ExportRetryBudgetIsResetOnAbortCompletionAndNewBatch
 TEST(ClipOpenAbortR4, DeferredReopenIsSuppressedWhileAnExportHoldsAClip)
 {
     // rename refused -> retry scheduled for row 0 under generation 7
-    ASSERT_TRUE(deferredClipReopenMayRun(7, 7, false, 0, 0, 2));
-    // a CDNG export of row 0 started before the timer fired: suppressed (no free of the exported clip)
-    ASSERT_FALSE(deferredClipReopenMayRun(7, 7, true, 0, 0, 2));
-    // the export's own open of row 0 bumped the generation: suppressed even after the flag drops
-    ASSERT_FALSE(deferredClipReopenMayRun(7, 8, false, 0, 0, 2));
+    ASSERT_TRUE(deferredClipReopenDecision(7, 7, false, 0, 0, 2, 0) == DeferredClipReopen::Run);
+    // a CDNG export (or Export Current Frame, or any modal dialog) holds row 0's clip when the timer fires:
+    // the reopen does not run (no free of the held clip); it is postponed, never run, while the clip is held
+    ASSERT_TRUE(deferredClipReopenDecision(7, 7, true, 0, 0, 2, 0) == DeferredClipReopen::Postpone);
+    ASSERT_TRUE(deferredClipReopenDecision(7, 7, true, 0, 0, 2, kClipReopenAbortMaxDeferrals) == DeferredClipReopen::Drop);
+    // the export's own open of row 0 bumped the generation: dropped even after the hold ends
+    ASSERT_TRUE(deferredClipReopenDecision(7, 8, false, 0, 0, 2, 0) == DeferredClipReopen::Drop);
+    ASSERT_TRUE(deferredClipReopenDecision(7, 8, true, 0, 0, 2, 0) == DeferredClipReopen::Drop);
     // row checks of r3 still hold
-    ASSERT_FALSE(deferredClipReopenMayRun(7, 7, false, 1, 0, 2));
-    ASSERT_FALSE(deferredClipReopenMayRun(7, 7, false, 2, 2, 2));
+    ASSERT_TRUE(deferredClipReopenDecision(7, 7, false, 1, 0, 2, 0) == DeferredClipReopen::Drop);
+    ASSERT_TRUE(deferredClipReopenDecision(7, 7, false, 2, 2, 2, 0) == DeferredClipReopen::Drop);
+}
+
+// adversary 0e65f0cc A1: Export Current Frame holds m_pMlvObject across its dialog loop; the deferred reopen
+// treats it (and any modal dialog) as a held clip.
+TEST(ClipOpenAbortR4Wiring, ExportCurrentFrameHoldsTheClipAgainstDeferredReopens)
+{
+    const QString source = mainWindowSource();
+    const QString frame = bodyBetween(source, QStringLiteral("void MainWindow::on_actionExportCurrentFrame_triggered()"),
+                                      QStringLiteral("void MainWindow::on_checkBoxHighLightReconstruction_toggled(bool checked)"));
+    ASSERT_FALSE(frame.isEmpty());
+    const int hold = frame.indexOf(QStringLiteral("m_exportInProgress = true;"));
+    const int exec = frame.indexOf(QStringLiteral("exportDialog->exec();"));
+    const int release = frame.indexOf(QStringLiteral("m_exportInProgress = exportWasInProgress;"));
+    ASSERT_TRUE(hold >= 0);
+    ASSERT_TRUE(exec > hold);
+    ASSERT_TRUE(release > exec);
+    const QString schedule = bodyBetween(source, QStringLiteral("void MainWindow::scheduleClipReopenRetry( int row, unsigned long long generation, int deferrals )"),
+                                         QStringLiteral("void MainWindow::rightClickShowFile( void )"));
+    ASSERT_TRUE(schedule.contains(QStringLiteral(
+        "const bool clipHeld = m_exportInProgress || QApplication::activeModalWidget() != nullptr;")));
+}
+
+// adversary 0e65f0cc A2: every site that replaces the loaded clip with an empty object detaches the sliders
+// (rename close, delete-clip close, both after-free open backstops), so paste never sanitizes against it.
+TEST(ClipOpenAbortR4Wiring, EveryEmptyObjectInstallDetachesTheSliders)
+{
+    const QString source = mainWindowSource();
+    const QString rename = bodyBetween(source, QStringLiteral("void MainWindow::renameActiveClip( void )"),
+                                       QStringLiteral("//MLV\n    bool ok = QFile( fileName ).rename( newFilePath );"));
+    ASSERT_FALSE(rename.isEmpty());
+    ASSERT_TRUE(rename.indexOf(QStringLiteral("m_slidersDetachedFromReceipt = true;"))
+                > rename.indexOf(QStringLiteral("m_pMlvObject = initMlvObject();")));
+    const QString deleteClip = bodyBetween(source, QStringLiteral("freeActiveMlvObjectAfterLifecycleBarrier( \"delete-clip\" );"),
+                                           QStringLiteral("#endif"));
+    ASSERT_TRUE(deleteClip.contains(QStringLiteral("m_slidersDetachedFromReceipt = true;")));
+    const QString preview = bodyBetween(source, QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"),
+                                        QStringLiteral("void MainWindow::on_actionOpen_triggered()"));
+    const QString full = bodyBetween(source, QStringLiteral("int MainWindow::openMlv( QString fileName )"),
+                                     QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"));
+    for (const QString & body : {preview, full})
+    {
+        const int empty = body.indexOf(QStringLiteral("m_pMlvObject = initMlvObject();"));
+        const int detach = body.indexOf(QStringLiteral("m_slidersDetachedFromReceipt = true;"), empty);
+        const int refused = body.indexOf(QStringLiteral("return kClipOpenAbortedPrepBusyAfterFree;"));
+        ASSERT_TRUE(empty >= 0);
+        ASSERT_TRUE(detach > empty && detach < refused);
+    }
 }
 
 TEST(ClipOpenAbortR4Wiring, DeferredReopenChecksGenerationAndExportBeforeShowingTheClip)
@@ -553,9 +603,9 @@ TEST(ClipOpenAbortR4Wiring, DeferredReopenChecksGenerationAndExportBeforeShowing
     const QString retry = bodyBetween(source, QStringLiteral("void MainWindow::retryClipReopenAfterPrepAbort( int row )"),
                                       QStringLiteral("void MainWindow::rightClickShowFile( void )"));
     ASSERT_FALSE(retry.isEmpty());
-    const int capture = retry.indexOf(QStringLiteral("const unsigned long long generation = m_clipOpenGeneration;"));
+    const int capture = retry.indexOf(QStringLiteral("scheduleClipReopenRetry( row, m_clipOpenGeneration, 0 );"));
     const int gate = retry.indexOf(QStringLiteral(
-        "if( !deferredClipReopenMayRun( generation, m_clipOpenGeneration, m_exportInProgress, row, SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT ) )"));
+        "switch( deferredClipReopenDecision( generation, m_clipOpenGeneration, clipHeld, row, SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT, deferrals ) )"));
     const int show = retry.indexOf(QStringLiteral("showFileInEditor( row );"));
     ASSERT_TRUE(capture >= 0);
     ASSERT_TRUE(gate > capture);
@@ -631,5 +681,5 @@ TEST(ClipOpenAbortCallersWiring, EveryOpenCallerKeepsTheResult)
     // the deferred retry runs through showFileInEditor only while that row is still the active one (r4: and
     // only under the clip-open generation it was scheduled for, outside any export)
     ASSERT_TRUE(rename.contains(QStringLiteral(
-        "if( !deferredClipReopenMayRun( generation, m_clipOpenGeneration, m_exportInProgress, row, SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT ) )")));
+        "switch( deferredClipReopenDecision( generation, m_clipOpenGeneration, clipHeld, row, SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT, deferrals ) )")));
 }

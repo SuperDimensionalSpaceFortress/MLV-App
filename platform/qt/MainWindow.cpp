@@ -11157,6 +11157,7 @@ int MainWindow::openMlvForPreview(QString fileName)
         freeMlvObject( new_MlvObject );
         m_pMlvObject = initMlvObject();
         m_clipLifecycleBarrier.reopen();
+        m_slidersDetachedFromReceipt = true; // r4: an empty object is loaded; no receipt is sanitized against it
         return kClipOpenAbortedPrepBusyAfterFree;
     }
     /* Set to NEW object with a NEW MLV clip! */
@@ -11401,6 +11402,7 @@ int MainWindow::openMlv( QString fileName )
         freeMlvObject( new_MlvObject );
         m_pMlvObject = initMlvObject();
         m_clipLifecycleBarrier.reopen();
+        m_slidersDetachedFromReceipt = true; // r4: an empty object is loaded; no receipt is sanitized against it
         return kClipOpenAbortedPrepBusyAfterFree;
     }
     /* Set to NEW object with a NEW MLV clip! */
@@ -21234,7 +21236,12 @@ void MainWindow::on_actionExportCurrentFrame_triggered()
                                                                          ui->horizontalSliderPosition->value(),
                                                                          getHorizontalStretchFactor(true),
                                                                          getVerticalStretchFactor(true) );
+    // r4 (adversary 0e65f0cc A1): the dialog holds m_pMlvObject across its event loop; no deferred reopen or
+    // FileOpen may free it meanwhile.
+    const bool exportWasInProgress = m_exportInProgress;
+    m_exportInProgress = true;
     exportDialog->exec();
+    m_exportInProgress = exportWasInProgress;
     delete exportDialog;
 }
 
@@ -23760,6 +23767,7 @@ void MainWindow::deleteFileFromSession( void )
             freeActiveMlvObjectAfterLifecycleBarrier( "delete-clip" );
             m_pMlvObject = initMlvObject();
             m_clipLifecycleBarrier.reopen();
+            m_slidersDetachedFromReceipt = true; // r4: an empty object is loaded until the next successful open
 #endif
             if( MoveToTrash( GET_RECEIPT(row)->fileName() ) ) QMessageBox::critical( this, tr( "%1 - Delete clip from disk" ).arg( APPNAME ), tr( "Delete clip failed!" ) );
             //MAPP
@@ -23852,6 +23860,9 @@ void MainWindow::renameActiveClip( void )
     freeActiveMlvObjectAfterLifecycleBarrier( "rename-clip" );
     m_pMlvObject = initMlvObject();
     m_clipLifecycleBarrier.reopen();
+    // r4 (adversary 0e65f0cc A2): the sliders were saved above; until the reopen succeeds the empty object is
+    // loaded, so paste / setSliders must not sanitize this receipt against it.
+    m_slidersDetachedFromReceipt = true;
 
     //MLV
     bool ok = QFile( fileName ).rename( newFilePath );
@@ -23918,15 +23929,26 @@ void MainWindow::markClipOpenSucceeded( void )
 void MainWindow::retryClipReopenAfterPrepAbort( int row )
 {
     logInteractionEvent( QStringLiteral("playback_prep.clip_reopen_retry"), QStringLiteral("row=%1").arg( row ) );
-    const unsigned long long generation = m_clipOpenGeneration;
-    QTimer::singleShot( kClipReopenAbortRetryDelayMs, this, [this, row, generation]()
+    scheduleClipReopenRetry( row, m_clipOpenGeneration, 0 );
+}
+
+void MainWindow::scheduleClipReopenRetry( int row, unsigned long long generation, int deferrals )
+{
+    QTimer::singleShot( kClipReopenAbortRetryDelayMs, this, [this, row, generation, deferrals]()
     {
-        if( !deferredClipReopenMayRun( generation, m_clipOpenGeneration, m_exportInProgress, row, SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT ) )
+        const bool clipHeld = m_exportInProgress || QApplication::activeModalWidget() != nullptr;
+        switch( deferredClipReopenDecision( generation, m_clipOpenGeneration, clipHeld, row, SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT, deferrals ) )
         {
+        case DeferredClipReopen::Postpone:
+            scheduleClipReopenRetry( row, generation, deferrals + 1 );
+            return;
+        case DeferredClipReopen::Drop:
             logInteractionEvent( QStringLiteral("playback_prep.clip_reopen_retry_skipped"),
-                                 QStringLiteral("row=%1 export=%2 stale=%3").arg( row ).arg( m_exportInProgress ? 1 : 0 )
+                                 QStringLiteral("row=%1 held=%2 stale=%3").arg( row ).arg( clipHeld ? 1 : 0 )
                                  .arg( generation != m_clipOpenGeneration ? 1 : 0 ) );
             return;
+        case DeferredClipReopen::Run:
+            break;
         }
         m_inClipReopenRetry = true;
         showFileInEditor( row );
