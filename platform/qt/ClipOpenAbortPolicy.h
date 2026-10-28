@@ -25,6 +25,22 @@ inline bool clipOpenAbortKeptRetainedClip( int openResult )
     return openResult == kClipOpenAbortedPrepBusy;
 }
 
+// r4: openMlv detects a corrupt file and the prep-busy guard before it frees the retained clip, so only the
+// after-free refusal leaves a different (empty) object loaded.
+inline bool clipOpenFailureKeptRetainedClip( int openResult )
+{
+    return openResult != 0 && openResult != kClipOpenAbortedPrepBusyAfterFree;
+}
+
+// r4 (adversary A4): a deferred reopen runs only against the clip state it was scheduled for (no clip opened
+// since) and never while an export holds a clip: a disabled GUI does not stop a timer.
+inline bool deferredClipReopenMayRun( unsigned long long scheduledGeneration, unsigned long long currentGeneration,
+                                      bool exportInProgress, int row, int activeRow, int clipCount )
+{
+    if( exportInProgress || scheduledGeneration != currentGeneration ) return false;
+    return row >= 0 && row < clipCount && row == activeRow;
+}
+
 // showFileInEditor( row ) after openMlv( row ) failed. The active row moves back to the clip the sliders
 // still describe before anything saves a receipt, so a later setReceipt( ACTIVE_RECEIPT ) never writes
 // one clip's sliders into another clip's receipt. The old clip is reopened only when it is no longer loaded.
@@ -33,6 +49,12 @@ struct ShowFileOpenFailurePlan
     bool restoreOldActive = false;
     bool reselectOld = false;
     bool reopenOld = false;
+    // r4 (adversary A1): the sliders describe the active row only when that row is the old one again and its
+    // clip is still loaded. Otherwise (the delete path pre-activates the row that failed, or the old clip was
+    // freed) they describe no receipt until a clip opens, so nothing saves or sanitizes a receipt from them.
+    bool detachSliders = false;
+    // A prep refusal that left the sliders detached is retried once later (no reopen of the old clip runs now).
+    bool retryReopenLater = false;
 };
 
 inline ShowFileOpenFailurePlan showFileOpenFailurePlan( int openResult, int row, int oldActive,
@@ -43,6 +65,8 @@ inline ShowFileOpenFailurePlan showFileOpenFailurePlan( int openResult, int row,
     plan.restoreOldActive = oldIsOther;
     plan.reselectOld = oldIsOther && selectedCount <= 1;
     plan.reopenOld = plan.reselectOld && !oldNeverLoaded && !clipOpenAbortKeptRetainedClip( openResult );
+    plan.detachSliders = !( plan.restoreOldActive && !oldNeverLoaded && clipOpenFailureKeptRetainedClip( openResult ) );
+    plan.retryReopenLater = plan.detachSliders && !plan.reopenOld && clipOpenAbortedForPrep( openResult );
     return plan;
 }
 

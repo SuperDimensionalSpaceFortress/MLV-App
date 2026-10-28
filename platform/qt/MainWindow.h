@@ -894,7 +894,16 @@ private:
     bool m_exportRetryHeadJob = false;
     int m_exportOpenAbortRetries = 0;
     // r3: true while the sliders describe no receipt (a prep-refused open left them); setReceipt is a no-op.
+    // r4: setSliders applies nothing either; only a successful open (markClipOpenSucceeded) re-attaches them.
     bool m_slidersDetachedFromReceipt = false;
+    // r4 (adversary A4): bumped by every successful clip open; a deferred reopen scheduled under an older value
+    // is a no-op, and so is one that fires while an export holds a clip (GUI block to final reopen).
+    unsigned long long m_clipOpenGeneration = 0;
+    bool m_exportInProgress = false;
+    // r4 (adversary A3): bumped at each export batch start; a retry timer of an earlier batch is a no-op.
+    unsigned long long m_exportBatchGeneration = 0;
+    // r4: set while a deferred reopen runs, so a refusal inside it is not retried again.
+    bool m_inClipReopenRetry = false;
     bool m_zoomTo100Center;
     bool m_zoomModeChanged;
     bool m_playbackStopped;
@@ -1878,8 +1887,10 @@ private:
     void replaceReceipt(ReceiptSettings *receiptTarget, ReceiptSettings *receiptSource , bool paste);
     void resetReceiptWithDefault( ReceiptSettings *receipt );
     int showFileInEditor(int row);
+    void markClipOpenSucceeded( void );
     void retryClipReopenAfterPrepAbort( int row );
-    void addClipToExportQueue( int row, QString fileName );
+    void resetExportOpenAbortRetries( void );
+    bool addClipToExportQueue( int row, QString fileName );
     void previewPicture( int row );
     void setPreviewMode( void );
     double getFramerate( void );

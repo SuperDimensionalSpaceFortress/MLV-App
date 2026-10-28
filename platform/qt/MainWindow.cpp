@@ -3152,6 +3152,13 @@ bool MainWindow::event(QEvent *event)
         QFileOpenEvent *openEvent = static_cast<QFileOpenEvent *>(event);
         //Exit if not an MLV file or aborted
         QString fileName = openEvent->file();
+        // r4 (adversary A4 class): a FileOpen event is delivered during an export's event pump (a disabled GUI
+        // does not stop it); importing or opening a session there would free the clip the export holds.
+        if( m_exportInProgress )
+        {
+            logInteractionEvent( QStringLiteral("playback_prep.file_open_skipped"), QStringLiteral("reason=export-in-progress") );
+            return true;
+        }
         if( QFile(fileName).exists() && fileName.endsWith( ".mlv", Qt::CaseInsensitive ) )
         {
             importNewMlv( fileName );
@@ -11050,6 +11057,8 @@ void MainWindow::importNewMlv(QString fileName)
             m_pModel->removeRow( SESSION_CLIP_COUNT - 1, QModelIndex() );
             if( previousActive >= 0 && previousActive < SESSION_CLIP_COUNT ) SET_ACTIVE_CLIP_IDX( previousActive );
             else if( SESSION_CLIP_COUNT == 0 ) deleteSession();
+            // r4 (adversary A1 sibling): refused after the free, an empty object is loaded, not previousActive.
+            if( !clipOpenFailureKeptRetainedClip( ret ) ) m_slidersDetachedFromReceipt = true;
             listViewSessionUpdate();
             QMessageBox::warning( this, tr( "Import MLV" ),
                                   tr( "%1 was not imported because playback was still preparing a frame. Import it again." )
@@ -11187,6 +11196,7 @@ int MainWindow::openMlvForPreview(QString fileName)
     //Raw black & white level (needed for preview picture)
     initRawBlackAndWhite();
 
+    markClipOpenSucceeded();
     return MLV_ERR_NONE;
 }
 
@@ -11628,6 +11638,7 @@ int MainWindow::openMlv( QString fileName )
 
     m_frameChanged = true;
 
+    markClipOpenSucceeded();
     return MLV_ERR_NONE;
 }
 
@@ -15619,6 +15630,8 @@ void MainWindow::deleteSession()
     //Fake no audio track
     paintAudioTrack();
 
+    // r4: the session is empty, so no receipt is left for the sliders to describe or protect.
+    m_slidersDetachedFromReceipt = false;
     resetSliders();
 
     //Export not possible without mlv file
@@ -15697,7 +15710,9 @@ void MainWindow::pasteReceiptFromClipboardTo(int row)
     //Each selected clip gets the copied receipt
     replaceReceipt( GET_RECEIPT(row), m_pReceiptClipboard, true );
     //If the actual is selected (may have changed since copy action), set sliders and get receipt
-    if( row == SESSION_ACTIVE_CLIP_ROW )
+    // r4 (adversary A2): while detached, the loaded clip is not this row's; the receipt keeps the paste and the
+    // sliders take it when the clip opens, so nothing sanitizes it against another clip now.
+    if( row == SESSION_ACTIVE_CLIP_ROW && !m_slidersDetachedFromReceipt )
     {
         setSliders( GET_RECEIPT(row), true );
     }
@@ -15706,7 +15721,13 @@ void MainWindow::pasteReceiptFromClipboardTo(int row)
 //Set the edit sliders to settings
 void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
 {
-    m_slidersDetachedFromReceipt = false;
+    // r4 (adversary A2): detached sliders take no receipt (ReceiptSafety below would validate it against a
+    // clip that is not its own); markClipOpenSucceeded re-attaches them before the opener calls this.
+    if( m_slidersDetachedFromReceipt )
+    {
+        logInteractionEvent( QStringLiteral("playback_prep.set_sliders_skipped"), QStringLiteral("reason=detached") );
+        return;
+    }
     invalidateGpuPreviewProcessingConfigCache();
     m_setSliders = true;
     ui->horizontalSliderExposure->setValue( receipt->exposure() );
@@ -18903,6 +18924,10 @@ int MainWindow::showFileInEditor(int row)
             openResult, row, oldActive, selectedClipsList().size(), SESSION_CLIP_COUNT,
             oldActive >= 0 && oldActive < SESSION_CLIP_COUNT && GET_RECEIPT( oldActive )->wasNeverLoaded() );
         if( plan.restoreOldActive ) SET_ACTIVE_CLIP_IDX( oldActive );
+        // r4 (adversary A1): the delete path pre-activates the row that failed, so oldActive == row; the
+        // sliders then describe no receipt, and saveSession / setReceipt must not write them into this row.
+        if( plan.detachSliders ) m_slidersDetachedFromReceipt = true;
+        if( plan.retryReopenLater && !m_inClipReopenRetry ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );
         //If one file is selected, reselect the last one, else do nothing (export)
         if( plan.reselectOld )
         {
@@ -18938,7 +18963,7 @@ int MainWindow::showFileInEditor(int row)
 }
 
 //Add the clip in SessionList position "row" at last position in ExportQueue
-void MainWindow::addClipToExportQueue(int row, QString fileName)
+bool MainWindow::addClipToExportQueue(int row, QString fileName)
 {
     //A file must be opened once before being able to be exported
     if( GET_RECEIPT( row )->wasNeverLoaded() )
@@ -18947,7 +18972,8 @@ void MainWindow::addClipToExportQueue(int row, QString fileName)
         m_pStatusDialog->ui->labelEstimatedTime->setText( "" );
         m_pStatusDialog->ui->progressBar->setValue( 0 );
         m_pStatusDialog->open();
-        if( showFileInEditor( row ) ) return; //Don't add to export queue when corrupted file
+        // r4 (Dot B3): not queued (corrupt file, or a busy prep task refused the open); the caller reports it.
+        if( showFileInEditor( row ) ) return false;
         qApp->processEvents();
         setReceipt( GET_RECEIPT( row ) );
     }
@@ -19067,6 +19093,7 @@ void MainWindow::addClipToExportQueue(int row, QString fileName)
     receipt->setCutOut( GET_RECEIPT( row )->cutOut() );
     receipt->setExportFileName( fileName );
     m_exportQueue.append( receipt );
+    return true;
 }
 
 //Handles preview pictures - make sure that right clip for row is loaded before!
@@ -20968,6 +20995,7 @@ void MainWindow::on_actionExport_triggered()
 
     //Save last active clip before export
     m_lastClipBeforeExport = SESSION_ACTIVE_CLIP_ROW;
+    QStringList refusedClips;
 
     //Filename proposal in dependency to actual file
     QString saveFileName = ACTIVE_RECEIPT->fileName();
@@ -21066,7 +21094,8 @@ void MainWindow::on_actionExport_triggered()
         m_lastExportPath = QFileInfo( fileName ).absolutePath();
 
         //Get receipt into queue
-        addClipToExportQueue( SESSION_ACTIVE_CLIP_ROW, fileName );
+        const int exportRow = SESSION_ACTIVE_CLIP_ROW;
+        if( !addClipToExportQueue( exportRow, fileName ) ) refusedClips.append( GET_CLIP( exportRow )->getName() );
     }
     //if multiple files selected or >= 1 sequence
     else
@@ -21159,17 +21188,27 @@ void MainWindow::on_actionExport_triggered()
             }
 
             //Get receipt into queue
-            if( !skipFile ) addClipToExportQueue( row, fileName );
+            if( !skipFile && !addClipToExportQueue( row, fileName ) ) refusedClips.append( GET_CLIP( row )->getName() );
         }
-        if( m_exportQueue.isEmpty() )
-        {
-            QMessageBox::information( this, APPNAME, tr( "Skipped all files." ) );
-            return;
-        }
+    }
+    // r4 (Dot B3): a clip the queue refused is named, and an empty queue never reaches first() below.
+    if( !refusedClips.isEmpty() )
+    {
+        QMessageBox::warning( this, tr( "Export" ),
+                              tr( "Not exported (the file could not be opened, or playback was still preparing a frame):\n%1" )
+                              .arg( refusedClips.join( QStringLiteral("\n") ) ) );
+    }
+    if( m_exportQueue.isEmpty() )
+    {
+        m_pStatusDialog->close();
+        if( refusedClips.isEmpty() ) QMessageBox::information( this, APPNAME, tr( "Skipped all files." ) );
+        return;
     }
     //Block GUI
     setEnabled( false );
     m_pStatusDialog->setEnabled( true );
+    // r4 (adversary A4): from here to the final reopen an export holds a clip; no deferred reopen runs.
+    m_exportInProgress = true;
 
     //Scripting class wants to know the export folder
     m_pScripting->setExportDir( QFileInfo( m_exportQueue.first()->exportFileName() ).absolutePath() );
@@ -23335,6 +23374,12 @@ void MainWindow::on_actionExportSettings_triggered()
 //Reset the edit sliders to default
 void MainWindow::on_actionResetReceipt_triggered()
 {
+    // r4 (adversary A2 sibling): the loaded clip is not the active row's; its levels must not reset this receipt.
+    if( m_slidersDetachedFromReceipt )
+    {
+        logInteractionEvent( QStringLiteral("playback_prep.reset_receipt_skipped"), QStringLiteral("reason=detached") );
+        return;
+    }
     ReceiptSettings *receipt = new ReceiptSettings(); //default
     if( ui->actionUseDefaultReceipt->isChecked() ) resetReceiptWithDefault( receipt );
     receipt->setRawWhite( getMlvOriginalWhiteLevel( m_pMlvObject ) );
@@ -23858,14 +23903,34 @@ void MainWindow::renameActiveClip( void )
     if( clipOpenAbortedForPrep( reopenResult ) ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );
 }
 
+// r4: the loaded clip now matches the receipt its opener applies next, so the sliders describe a receipt again,
+// and every deferred reopen scheduled before this open is stale.
+void MainWindow::markClipOpenSucceeded( void )
+{
+    m_slidersDetachedFromReceipt = false;
+    ++m_clipOpenGeneration;
+}
+
 // r3 (key3 INV-2 sweep): a reopen a busy playback-prep task refused is retried once through
 // showFileInEditor, which saves the (already mirrored) sliders into the active receipt first.
+// r4 (adversary A4): the timer is bound to the clip-open generation at scheduling time and never runs while an
+// export holds a clip (a disabled GUI does not suppress a timer; the reopen would free the exported clip).
 void MainWindow::retryClipReopenAfterPrepAbort( int row )
 {
     logInteractionEvent( QStringLiteral("playback_prep.clip_reopen_retry"), QStringLiteral("row=%1").arg( row ) );
-    QTimer::singleShot( kClipReopenAbortRetryDelayMs, this, [this, row]()
+    const unsigned long long generation = m_clipOpenGeneration;
+    QTimer::singleShot( kClipReopenAbortRetryDelayMs, this, [this, row, generation]()
     {
-        if( row >= 0 && row < SESSION_CLIP_COUNT && row == SESSION_ACTIVE_CLIP_ROW ) showFileInEditor( row );
+        if( !deferredClipReopenMayRun( generation, m_clipOpenGeneration, m_exportInProgress, row, SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT ) )
+        {
+            logInteractionEvent( QStringLiteral("playback_prep.clip_reopen_retry_skipped"),
+                                 QStringLiteral("row=%1 export=%2 stale=%3").arg( row ).arg( m_exportInProgress ? 1 : 0 )
+                                 .arg( generation != m_clipOpenGeneration ? 1 : 0 ) );
+            return;
+        }
+        m_inClipReopenRetry = true;
+        showFileInEditor( row );
+        m_inClipReopenRetry = false;
     } );
 }
 
@@ -24427,6 +24492,11 @@ void MainWindow::exportHandler( void )
         numberOfJobs = m_exportQueue.size();
         m_exportAbortPressed = false;
         jobNumber = 0;
+        // r4 (adversary A3/A4): a new batch starts with a full retry budget, and no earlier batch's retry
+        // timer drives it; the export holds a clip until its final reopen.
+        resetExportOpenAbortRetries();
+        ++m_exportBatchGeneration;
+        m_exportInProgress = true;
         int totalFrames = 0;
         for( int i = 0; i < numberOfJobs; i++ )
         {
@@ -24449,11 +24519,18 @@ void MainWindow::exportHandler( void )
             switch( exportOpenFailureAction( openResult, m_exportOpenAbortRetries ) )
             {
             case ExportOpenFailureAction::RetryJob:
+            {
                 m_exportOpenAbortRetries++;
                 jobNumber--;
                 m_exportRetryHeadJob = true;
-                QTimer::singleShot( kExportOpenAbortRetryDelayMs, this, &MainWindow::exportHandler );
+                const unsigned long long batch = m_exportBatchGeneration;
+                QTimer::singleShot( kExportOpenAbortRetryDelayMs, this, [this, batch]()
+                {
+                    if( batch == m_exportBatchGeneration ) exportHandler();
+                    else logInteractionEvent( QStringLiteral("playback_prep.export_retry_skipped"), QStringLiteral("reason=stale-batch") );
+                } );
                 return;
+            }
             case ExportOpenFailureAction::ReportAndSkipJob:
                 QMessageBox::warning( this, tr( "Export" ),
                                       tr( "%1 was not exported: playback was still preparing a frame." )
@@ -24525,6 +24602,9 @@ void MainWindow::exportHandler( void )
         setEnabled( true );
         //Export is ready
         exportRunning = false;
+        // r4 (adversary A3/A4): the batch is over; its retry budget goes and deferred reopens may run again.
+        resetExportOpenAbortRetries();
+        m_exportInProgress = false;
 
         if( !m_exportAbortPressed )
         {
@@ -31479,11 +31559,19 @@ void MainWindow::on_groupBoxTransformation_toggled(bool arg1)
     else ui->groupBoxTransformation->setMaximumHeight( 16777215 );
 }
 
+// r4 (adversary A3): the open-retry budget belongs to one job; abort, completion and a new batch reset it.
+void MainWindow::resetExportOpenAbortRetries( void )
+{
+    m_exportOpenAbortRetries = 0;
+    m_exportRetryHeadJob = false;
+}
+
 //Abort pressed while exporting
 void MainWindow::exportAbort( void )
 {
     m_exportAbortPressed = true;
     m_exportQueue.clear();
+    resetExportOpenAbortRetries();
 }
 
 void MainWindow::recordPresentedFrame( const RenderFrameThread::ReadyFrame &readyFrame,
