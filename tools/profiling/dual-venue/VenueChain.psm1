@@ -606,7 +606,7 @@ function Get-VenueStagedBuildManifest {
     [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
     param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][int]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
-        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null)
+        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1, 600)][int]$ArtifactMinSec = 1)
     # -ArtifactTimeoutSec 0 (the default): the artifact hash gets the whole seconds left of -TimeoutSec after the manifest read (under one left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
     $callClock = [Diagnostics.Stopwatch]::StartNew()
@@ -686,7 +686,8 @@ function Get-VenueStagedBuildManifest {
             $artSec = $ArtifactTimeoutSec
             if ($artSec -le 0) {
                 $left = [Math]::Floor($TimeoutSec - $callClock.Elapsed.TotalSeconds)
-                if ($left -lt 1) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $TimeoutSec after the manifest read"; contentProblem = $null; artifactProblem = $null } }
+                # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its 2 s (no content read starts with under 2 s left)
+                if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $TimeoutSec after the manifest read"; contentProblem = $null; artifactProblem = $null } }
                 $artSec = [int]$left
             }
             $ar =Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec

@@ -3126,7 +3126,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # through both phases, so no fixed split: the timed r4 cases below hold the behaviour (Dot's literal case, key3 row L-04, the post-open 500 s room)
         self.assertIn("($script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds)", guard)
         # r5 (key3 r4 B1): -VerifyArtifacts is off only under a budget that says so (the claim wait, no claim held)
-        self.assertIn("-TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ProbeScript", guard)
+        self.assertIn("-TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ArtifactMinSec 2 -ProbeScript", guard)
         self.assertIn("$verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)", guard)
         self.assertNotIn("$manifestSec", guard)
         self.assertNotIn("-ArtifactTimeoutSec", guard)
@@ -3471,7 +3471,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # sol's repro: cap 75, leg budget 60, margin 0 (the post-open guard has 14 s); -RunDir's metadata reads stall 40 s once the open is answered
         r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75")
         self.assertNotIn("GUARD_READ_DELAY_SEAM", r.stderr, "a -RunDir read ran on the main thread after the guard gave up on that location")
-        self._assert_delayed_read_refused_inside_the_room(r, held)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
+        # the 14 s room, the close, and the documented 2 s bounded re-read of -RunDir (adversary r5 A1), never the 40 s stall
+        self.assertLess(held, 75 - 60 + 4 + 2, f"the lease was held {held:.1f} s before the close: the stalled -RunDir was waited for")
+        self.assertFalse(self.claim_path.exists(), "the claim was released (full cleanup)")
         self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
         self.assertIn("an input whose location is unknown is refused", r.stderr)
         self.assertNotIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, "the close job still has its TEMP folder (TEMP compared with -RunDir as the preflight found it)")
@@ -3488,6 +3494,53 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(self.kinds(), [], "no lease was opened")
         self.assertFalse(self.claim_path.exists(), "the claim taken for the guard was released")
         self.assertLess(took, 40, f"the run took {took:.1f} s: the stalled -RunDir was read again after the 30 s guard")
+
+    # r5 adversary A1 (pass 1 on 8559ef31): the location-unknown redirect check compared TEMP with -RunDir's preflight location only, so a -RunDir junction re-pointed AT TEMP before
+    # the open returned got its close redirect (and the close job) made inside the current -RunDir. -RunDir is now re-read on a pool thread bounded at 2 s.
+    def test_artifact_preflight_r5_adv_a1_a_rundir_junction_repointed_at_temp_gets_no_close_redirect_inside_it(self) -> None:
+        old, new, link = self.case / "rd-old", self.case / "rd-new", self.case / "run-link"
+        old.mkdir(parents=True, exist_ok=True)
+        new.mkdir(parents=True, exist_ok=True)
+        self._junction(link, old)
+        self.addCleanup(lambda: os.path.lexists(link) and os.rmdir(link))
+        self.run_dir = link
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "75", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
+                                "-GuardReadDelay", "open:identity=25", FAKE_OPEN_SLEEP="6", TEMP=str(new), TMP=str(new))
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            os.rmdir(link)                 # the junction itself, not its target
+            self._junction(link, new)      # -RunDir now IS TEMP
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        made = [x.name for x in new.iterdir() if x.name.startswith("venue-lease-batch-close-")]
+        self.assertEqual(made, [], f"the close redirect was made inside the current -RunDir: {made}\n{se}")
+        self.assertIn("an input whose location is unknown is refused", se)
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", se)
+        self.assertIn("is inside -RunDir", se)
+
+    # r5 adversary A2 (pass 1 on 8559ef31): no content read starts with under 2 s of the guard's room, but Get-VenueStagedBuildManifest started the hash with 1 s left of its call.
+    # cap 66 / leg 60 / margin 0 leaves the post-open guard about 5 s (one build: a 4 s read); the manifest read takes 2.2 s once the open is answered, so the hash would start with 1.8 s.
+    def test_artifact_preflight_r5_adv_a2_no_artifact_hash_starts_with_under_2s_of_the_guard_room(self) -> None:
+        state = self.share / "fake-agent-state.json"
+        manifest_probe, _ = self._timed_probes(2200, 0, when=f"(Test-Path -LiteralPath '{state}' -PathType Leaf)")
+        r, held = self._post_open_hash_run(0, "-StagedBuildProbeScript", str(manifest_probe), cap="66")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("no time is left of -TimeoutSec", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+
+    # r5 adversary A3 (pass 1 on 8559ef31): each build got floor(room / builds), so N healthy fast builds in a room under 2N s were refused before any read and the opened lease charged
+    # with no leg. Two builds, cap 65 / leg 60 / margin 0: about 4 s of room, 1 s each on 8559ef31; the real reads take well under a second.
+    def test_artifact_preflight_r5_adv_a3_two_fast_builds_in_a_4s_room_are_read_not_refused(self) -> None:
+        items = [self.item(self.specs[0], "A", self.commit_a), self.item(self.specs[1], "B", self.commit_b)]
+        r, held = self._post_open_hash_run(0, cap="65", items=items)
+        self.assertNotIn("to read and hash the staged build", r.stdout + r.stderr, "a build was refused for its split of the room before any read")
+        self.assertNotIn("LEG_PLAN_REFUSED", r.stderr)
+        self.assertGreaterEqual(len(self.leg_calls()), 1, r.stdout + r.stderr)
 
     def test_artifact_preflight_r4_the_guard_read_delay_seam_is_refused_with_the_real_um_run_and_checked_for_shape(self) -> None:
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", "open:spec=5")
