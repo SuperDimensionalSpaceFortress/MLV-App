@@ -49,10 +49,13 @@ function ConvertFrom-VenueProbeHeatLine {
             $thr = 0; $win = 0; $mean = 0.0
             $okT = [int]::TryParse([string]$h.throttled, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$thr)
             $okW = [int]::TryParse([string]$h.window_rows, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$win)
-            $okM = [double]::TryParse([string]$h.mean_c, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)
+            # r3 A2: the probe rounds mean_c to 0.01 (87.998 -> 88.0, which the agent's rule calls hot while the exact mean is clear): the exact mean it also writes,
+            # mean_c_exact, is the heat decision's value when present; the rounded mean_c only for a probe that predates it
+            $meanSrc = $(if ($h.PSObject.Properties['mean_c_exact'] -and $null -ne $h.mean_c_exact) { $h.mean_c_exact } else { $h.mean_c })
+            $okM = [double]::TryParse([string]$meanSrc, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)
             $v = $(if ($okT -and $okW -and $okM) { Get-VenueHeatVerdict -Throttled $thr -MeanC $mean } else { 'unknown' })
             if ($v -cne 'unknown') {
-                return [pscustomobject]@{ heat = $v; throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.00', $script:Inv)) C"; source = 'raw-json' }
+                return [pscustomobject]@{ heat = $v; throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.00#', $script:Inv)) C"; source = 'raw-json' }
             }
         }
     }
@@ -62,10 +65,13 @@ function ConvertFrom-VenueProbeHeatLine {
     $m = [regex]::Match([string]$line, '\smean=([0-9]+(?:[.,][0-9]+)?)C\s+throttled=([0-9]+)/([0-9]+)(?:\s|$)')
     if (-not $m.Success) { return $none }
     $mean = 0.0; $thr = 0; $win = 0
-    if (-not [double]::TryParse(($m.Groups[1].Value -replace ',', '.'), [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)) { return $none }
+    # r3 A2: the display mean is rounded to 0.1 C (87.96 prints 88.0): a probe that also prints mean_exact=<R> gives the exact value, which is what the heat rule is applied to
+    $mx = [regex]::Match([string]$line, '\smean_exact=([0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?)(?:\s|$)')
+    $meanText = $(if ($mx.Success) { $mx.Groups[1].Value } else { $m.Groups[1].Value })
+    if (-not [double]::TryParse(($meanText -replace ',', '.'), [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)) { return $none }
     if (-not [int]::TryParse($m.Groups[2].Value, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$thr)) { return $none }   # advisory A10: an overflow is unknown, never a throw
     if (-not [int]::TryParse($m.Groups[3].Value, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$win)) { return $none }
-    [pscustomobject]@{ heat = (Get-VenueHeatVerdict -Throttled $thr -MeanC $mean); throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.0', $script:Inv)) C"; source = 'tele-line' }
+    [pscustomobject]@{ heat = (Get-VenueHeatVerdict -Throttled $thr -MeanC $mean); throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.0##', $script:Inv)) C"; source = 'tele-line' }
 }
 
 function Get-VenueThermalGateStep {
@@ -85,6 +91,25 @@ function Get-VenueThermalGateStep {
     [pscustomobject]@{ step = $step; firstHotUtc = $first; waitSec = $waited; remainingSec = $(if ($step -ceq 'WAIT') { $CapSec - $waited } else { 0 }) }
 }
 
+function Get-VenueThermalProbeBudget {
+    # r3 (adversary A1, Dot B2): the ONE decision "may another thermal re-probe start, and how long may the runner sleep first". Every probe start of an active thermal wait goes
+    # through it: the retry sleep after a busy probe and the poll sleep after a hot one alike. The deadline is -CapSec from the first hot reading; -ElapsedSec is the time since it.
+    # -SlowestReprobeSec is the slowest RE-probe seen in this wait. The probe that made the first hot reading is not a re-probe and is not counted (Dot B2: a 255 s first probe
+    # under cap 180 used to leave no room and skipped the leg with no cooling at all): the first hot reading always gets a cooling sleep and one re-probe unless the deadline
+    # has truly passed. A later re-probe is started only if the slowest so far predicts it ends inside the deadline: fitSec = cap - elapsed - slowest, and the sleep is
+    # min(-WantSleepSec, fitSec), so the next probe starts no later than deadline - slowest. A probe's own duration cannot be bounded from the runner: the budget is
+    # cap + one probe (the receipt names the excess as thermalWaitOvershootSec).
+    param(
+        [Parameter(Mandatory)][ValidateRange(0, 86400)][int]$CapSec,
+        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$ElapsedSec,
+        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$SlowestReprobeSec,
+        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$WantSleepSec
+    )
+    $fit = [long]$CapSec - [long]$ElapsedSec - [long]$SlowestReprobeSec
+    $may = ($fit -ge 1)
+    [pscustomobject]@{ mayStartProbe = $may; fitSec = [int][Math]::Max([long][int]::MinValue, [Math]::Min([long][int]::MaxValue, $fit)); sleepSec = $(if ($may) { [int][Math]::Max(1L, [Math]::Min([long]$WantSleepSec, $fit)) } else { 0 }) }
+}
+
 function Get-VenueThermalNowUtc {
     # adversary r2b A4: the thermal wait is timed on the monotonic Stopwatch clock, not the wall clock. The wall clock can step (NTP, a VM resume, an operator), and a step
     # back made the elapsed wait read 0 (the cap not consumed, the next quiet wait too long, the overshoot receipt 0). This returns the instant the gate should treat as
@@ -94,7 +119,8 @@ function Get-VenueThermalNowUtc {
         [Parameter(Mandatory)][long]$FirstHotTimestamp,
         [long]$NowTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
     )
-    $FirstHotUtc.AddSeconds([Math]::Max(0.0, ($NowTimestamp - $FirstHotTimestamp) / [double][Diagnostics.Stopwatch]::Frequency))
+    # r3 (advisory A4): a first-hot date near DateTime.MaxValue cannot take the added seconds: it is then simply the latest instant, never a throw
+    try { $FirstHotUtc.AddSeconds([Math]::Max(0.0, ($NowTimestamp - $FirstHotTimestamp) / [double][Diagnostics.Stopwatch]::Frequency)) } catch { [DateTime]::SpecifyKind([DateTime]::MaxValue, $FirstHotUtc.Kind) }
 }
 
 function Get-VenueLegKeyFromName {
@@ -127,13 +153,16 @@ function Read-VenueLegHeatHistory {
     # The leg rows of earlier lease-batch runs, in run order, for Get-VenueHeavyLegKeys. Each -RunDir's batches.jsonl (mlv-app/venue-lease-batch/v1); a row's
     # heat is its own heatAtProbe (written by this gate), else the agent's admission.heat from agent-result-<jobId>.json beside it, else 'unknown'.
     # A dir with no batches.jsonl, or an unreadable line, is skipped and named in .skipped (never a throw).
-    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$RunDir)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$RunDir)
     $rows = [System.Collections.Generic.List[object]]::new(); $skipped = [System.Collections.Generic.List[string]]::new()
     $d = 0
     foreach ($dir in $RunDir) {
         $d++
-        $f = Join-Path $dir 'batches.jsonl'
-        if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { $skipped.Add("$dir (no batches.jsonl)"); continue }
+        # adversary r3 A3: every path is built and probed INSIDE the protected read. Join-Path resolves the drive and throws DriveNotFoundException for an unmounted one (and for an
+        # empty entry), which refused the whole plan as LEG_PLAN_INVALID; [IO.Path]::Combine is string-only, and a path that cannot be built or probed is skipped and named
+        $f = try { if ([string]::IsNullOrWhiteSpace($dir)) { $null } else { [IO.Path]::Combine([string]$dir, 'batches.jsonl') } } catch { $null }
+        $isFile = $(if ($null -eq $f) { $false } else { try { [bool](Test-Path -LiteralPath $f -PathType Leaf) } catch { $false } })
+        if (-not $isFile) { $skipped.Add("$dir (no batches.jsonl)"); continue }
         # adversary r1 A7: a file that cannot be read (held exclusively, gone) is skipped and named, never a throw that refuses the whole plan
         $lines = try { [IO.File]::ReadAllLines($f) } catch { $skipped.Add("$f (unreadable: $($_.Exception.Message -replace '\s+', ' '))"); continue }
         foreach ($line in $lines) {
@@ -153,8 +182,8 @@ function Read-VenueLegHeatHistory {
                 $heat = 'unknown'
                 if ($l.PSObject.Properties['heatAtProbe'] -and [string]$l.heatAtProbe -cin @('hot', 'clear')) { $heat = [string]$l.heatAtProbe }
                 elseif ($l.PSObject.Properties['jobId'] -and $l.jobId) {
-                    $ar = Join-Path $dir "agent-result-$($l.jobId).json"
-                    if (Test-Path -LiteralPath $ar -PathType Leaf) {
+                    $ar = try { [IO.Path]::Combine([string]$dir, "agent-result-$($l.jobId).json") } catch { $null }
+                    if ($null -ne $ar -and (try { [bool](Test-Path -LiteralPath $ar -PathType Leaf) } catch { $false })) {
                         $a = try { [IO.File]::ReadAllText($ar) | ConvertFrom-Json } catch { $null }
                         if ($null -ne $a -and $a.PSObject.Properties['admission'] -and $null -ne $a.admission -and $a.admission.PSObject.Properties['heat'] -and [string]$a.admission.heat -cin @('hot', 'clear')) { $heat = [string]$a.admission.heat }
                     }
@@ -202,5 +231,5 @@ function Get-VenueThermalSpreadOrder {
     [pscustomobject]@{ items = @($out | ForEach-Object { , $Items[$_] }); heavy = $newHeavy; heavyAdjacent = (Measure-VenueHeavyAdjacency -Heavy $newHeavy); heavyAdjacentBefore = (Measure-VenueHeavyAdjacency -Heavy $Heavy) }
 }
 
-Export-ModuleMember -Function Get-VenueHeatVerdict, ConvertFrom-VenueProbeHeatLine, Get-VenueThermalGateStep, Get-VenueThermalNowUtc, Get-VenueLegKeyFromName, Get-VenueHeavyLegKeys, Read-VenueLegHeatHistory,
+Export-ModuleMember -Function Get-VenueHeatVerdict, ConvertFrom-VenueProbeHeatLine, Get-VenueThermalGateStep, Get-VenueThermalProbeBudget, Get-VenueThermalNowUtc, Get-VenueLegKeyFromName, Get-VenueHeavyLegKeys, Read-VenueLegHeatHistory,
     Measure-VenueHeavyAdjacency, Get-VenueThermalSpreadOrder

@@ -90,6 +90,15 @@ def ps_json(script: str):
     return json.loads(ps(f"ConvertTo-Json -Depth 6 -Compress -InputObject $({script})"))
 
 
+def unmounted_drive_path() -> str:
+    """A path on a drive letter that is not mounted on this machine (Join-Path on it throws DriveNotFoundException)."""
+    import os
+    for letter in "QRSTUVWXYZ":
+        if not os.path.exists(f"{letter}:\\"):
+            return f"{letter}:\\past-run"
+    raise unittest.SkipTest("every candidate drive letter is mounted")
+
+
 @requires_windows_pwsh
 class ThermalGateModuleTests(unittest.TestCase):
     def test_hot_rule_and_constants_are_the_agents(self) -> None:
@@ -184,6 +193,66 @@ class ThermalGateModuleTests(unittest.TestCase):
                 self.assertNotIn("-NowUtc ([DateTime]::UtcNow)", line, "the gate step must not be fed the wall clock once a first hot reading exists")
         self.assertGreaterEqual(runner.count("Get-VenueThermalNowUtc"), 2)
 
+    def test_adversary_r3_a2_the_heat_rule_is_applied_to_the_exact_mean_not_the_rounded_one(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-exact-"))
+        exact = 87.99833333333333   # 60 rows: 59 at 88.0 C and one at 87.9 C; the agent's rule (mean >= 88) calls this CLEAR
+        raw = d / "venue-quiet-probe-x.json"
+        raw.write_text(json.dumps({"heat": {"mean_c": 88.0, "mean_c_exact": exact, "throttled": 0, "window_rows": 60}}), encoding="utf-8")
+        old = d / "venue-quiet-probe-old.json"   # a probe that predates mean_c_exact: only the rounded value exists, and 88.0 reads hot
+        old.write_text(json.dumps({"heat": {"mean_c": 88.0, "throttled": 0, "window_rows": 60}}), encoding="utf-8")
+        tele = "  tele heat source=x age=1.0s hottest=50.0C max15=60.0C mean=88.0C throttled=0/60 W=1"
+        got = ps_json(
+            f"$g = {{ param($l) $r = ConvertFrom-VenueProbeHeatLine -Lines $l; \"$($r.heat)|$($r.source)|$([math]::Round($r.meanC, 6))\" }}; @("
+            f"(& $g @('  raw {raw}')), (& $g @('  raw {old}')), "
+            f"(& $g @('{tele} mean_exact={exact!r}')), (& $g @('{tele} mean_exact=88')), (& $g @('{tele}')), (& $g @('{tele} mean_exact=87,99833')), (& $g @('{tele} mean_exact=junk')))")
+        self.assertEqual(got, ["clear|raw-json|87.998333", "hot|raw-json|88", "clear|tele-line|87.998333", "hot|tele-line|88", "hot|tele-line|88",
+                               "clear|tele-line|87.99833", "hot|tele-line|88"], got)
+        # the producer writes both: mean_c (rounded, unchanged) and mean_c_exact, and prints mean_exact= on the display line
+        q = QUIET.read_text(encoding="utf-8")
+        self.assertIn("$telHeat.mean_c_exact = [double]$r.m.meanC", q)
+        self.assertIn("' mean_exact=' + ([double]$h.mean_c_exact).ToString('R'", q)
+        self.assertIn("'mean_c_exact'", q.split("$heatFields = ", 1)[1].split("\n", 1)[0])
+
+    def test_adversary_r3_a3_a_history_dir_that_cannot_be_resolved_is_skipped_and_named(self) -> None:
+        import os
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-hist-ok-"))
+        (d / "batches.jsonl").write_text(json.dumps({"batch": 1, "token": "t1", "legs": [{"name": "01-a-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": "hot"}]}) + "\n", encoding="utf-8")
+        bad = unmounted_drive_path()
+        # Join-Path threw DriveNotFoundException for an unmounted drive (and for an empty entry) before the protected read: the whole history, usable dirs included, was refused
+        got = ps_json(f"$h = Read-VenueLegHeatHistory -RunDir @('{bad}', '{d}', '', '{bad}\\agent'); [pscustomobject]@{{ rows = @($h.rows).Count; skipped = @($h.skipped) }}")
+        self.assertEqual(got["rows"], 1, got)
+        self.assertEqual(len([s for s in got["skipped"] if "no batches.jsonl" in s]), 3, got)
+        self.assertTrue(any(bad in s for s in got["skipped"]), got["skipped"])
+        self.assertFalse(os.path.exists(bad))
+
+    def test_adversary_r3_a1_b2_one_function_decides_whether_another_probe_may_start(self) -> None:
+        got = ps_json(
+            "$b = { param($cap, $e, $slow, $want) $r = Get-VenueThermalProbeBudget -CapSec $cap -ElapsedSec $e -SlowestReprobeSec $slow -WantSleepSec $want; \"$($r.mayStartProbe)|$($r.fitSec)|$($r.sleepSec)\" }; "
+            # Dot B2: the first hot reading has no re-probe behind it, so it always gets a cooling sleep (the long INITIAL probe is not an input at all)
+            "$out = @((& $b 180 0 0 30), "
+            # adversary A1: elapsed 3, slowest 3, a 300 s busy sleep: the sleep is cut to what fits, so the next probe starts at 177 and is predicted to end at 180
+            "(& $b 180 3 3 300), "
+            # the deadline minus the slowest re-probe has been reached: no further probe, whatever the want
+            "(& $b 180 177 3 300), (& $b 180 180 0 30), (& $b 180 400 3 30), "
+            # a cap of 0 never starts one
+            "(& $b 0 0 0 30)); "
+            # the invariant over a grid: when a probe may start, it starts no later than the deadline less the slowest re-probe
+            "$bad = 0; foreach ($cap in 1, 5, 180) { foreach ($e in 0, 1, 4, 100, 179, 180, 200) { foreach ($s in 0, 1, 3, 50, 255) { foreach ($w in 1, 30, 300) { "
+            "$r = Get-VenueThermalProbeBudget -CapSec $cap -ElapsedSec $e -SlowestReprobeSec $s -WantSleepSec $w; "
+            "if ($r.mayStartProbe -and (($e + $r.sleepSec + $s -gt $cap) -or $r.sleepSec -lt 1 -or $r.sleepSec -gt $w)) { $bad++ }; "
+            "if (-not $r.mayStartProbe -and ($e + 1 + $s -le $cap)) { $bad++ } } } } }; $out + \"bad=$bad\"")
+        self.assertEqual(got, ["True|180|30", "True|174|174", "False|0|0", "False|0|0", "False|-223|0", "False|0|0", "bad=0"], got)
+        # advisory A4: a first-hot date at DateTime.MaxValue plus a second used to throw an unrepresentable-date exception
+        self.assertEqual(ps("(Get-VenueThermalNowUtc -FirstHotUtc ([datetime]::MaxValue) -FirstHotTimestamp 0 -NowTimestamp ([Diagnostics.Stopwatch]::Frequency)).Year"), "9999")
+        runner = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        # every probe start of an active thermal wait goes through the function: the busy sleep, the poll sleep, and the busy branch's own guard
+        self.assertGreaterEqual(runner.count("Get-VenueThermalProbeBudget"), 3)
+        self.assertNotIn("$capRanOut", runner)
+        self.assertNotIn("$sleepFit", runner)
+        self.assertNotIn("Start-Sleep -Seconds ([int][Math]::Max(1, [Math]::Min($ClaimPollSec, $room - $legBudget)))", runner)
+
     def test_adversary_r2b_a5_a_null_list_parameter_is_empty_not_a_startup_crash(self) -> None:
         # -HeatFrom $null / -LegSpec $null (or a null entry) bind fine, and Test-Path -LiteralPath $null THROWS; the normalizing line must drop nulls first
         runner = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
@@ -271,12 +340,13 @@ class ThermalGateRunnerTests(unittest.TestCase):
         [row] = b["legs"]
         self.assertEqual((row["status"], row["counted"], row["heatAtProbe"], row["heatAtLaunch"], row["thermalSkips"]), ("RAN", True, "hot", "clear", 0), row)
         self.assertGreaterEqual(row["thermalWaitSec"], 2, row)
+        self.assertEqual(row["thermalWaitOvershootSec"], 0, "a wait that ends inside the cap records no overshoot")
         self.assertEqual((b["thermalWaits"], b["thermalSkips"]), (2, 0))
         self.assertEqual(self.log().count(" THERMAL_WAIT leg=01-fx-a-spec "), 2)
         self.assertIn("heat=hot (throttled 9/60, mean 70.0 C)", self.log())
 
     def test_cap_skip_requeues_the_hot_leg_and_runs_the_next_one_first(self) -> None:
-        r = self.run_batch(self.specs[:2], "-ThermalWaitCapSec", "3", FAKE_HEAT="HOT_UNTIL_SKIP")
+        r = self.run_batch(self.specs[:2], "-ThermalWaitCapSec", "2", FAKE_HEAT="HOT_UNTIL_SKIP")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         legs = [x.split(":")[1] for x in self.kinds() if x.startswith("LEG:")]
         self.assertEqual(legs, ["fx-b", "fx-a"], "fx-a skipped hot and re-queued: fx-b ran first, fx-a after, and neither ran hot")
@@ -285,7 +355,7 @@ class ThermalGateRunnerTests(unittest.TestCase):
         self.assertEqual(len(skip), 1, b["legs"])
         self.assertEqual((skip[0]["requeued"], skip[0]["outcome"], skip[0]["counted"], skip[0]["heatAtProbe"]), (True, "NOT_RUN", False, "hot"))
         # adversary r1 A9: the skip never waits past the cap (a re-probe that could not end inside it is not started)
-        self.assertLessEqual(skip[0]["thermalWaitSec"], 3, skip[0])
+        self.assertLessEqual(skip[0]["thermalWaitSec"], 2 + 4, skip[0])
         ran = [l for l in b["legs"] if l["status"] == "RAN"]
         self.assertEqual([l["heatAtLaunch"] for l in ran], ["clear", "clear"])
         # adversary r1 A6: the re-queued fx-a's first reading is taken again after its new predecessor (fx-b), not kept from before the skip
@@ -306,7 +376,7 @@ class ThermalGateRunnerTests(unittest.TestCase):
 
     def test_adversary_r1b_a2_a_long_poll_shortens_the_sleep_instead_of_skipping(self) -> None:
         # a poll longer than the cap used to turn the first hot reading into an immediate permanent skip (exit 7); the sleep is shortened to fit instead
-        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "8", "-ThermalPollSec", "600", "-ThermalRequeueMax", "0", FAKE_HEAT="9,0")
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "3", "-ThermalPollSec", "600", "-ThermalRequeueMax", "0", FAKE_HEAT="9,0")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         [b] = self.batches()
         self.assertEqual((b["legs"][0]["status"], b["legs"][0]["heatAtLaunch"], b["thermalWaits"], b["thermalSkips"]), ("RAN", "clear", 1, 0), b["legs"])
@@ -314,31 +384,31 @@ class ThermalGateRunnerTests(unittest.TestCase):
     # BACHELOR-THERMAL-GATE-WAIT-1 r2 (Dot P2 on a523d461): the cap is a SOFT budget, cap + one probe. The runner bounds when a re-probe STARTS (from the
     # previous probe's duration) and the probe's wait for quiet, but not the probe's own sample window, so a later probe slower than the earlier ones ends past
     # the cap. The receipt names the overshoot (thermalWaitOvershootSec = max(0, thermalWaitSec - cap)); a leg still hot then is skipped, never run hot.
-    # Cap 12 s, poll 3 s, probes of about 2 s (plus the stub's start-up) then one of 8 s: the third probe was predicted to end inside the cap and ends at ~18 s.
-    SLOW_LATER = dict(FAKE_PROBE_SLEEP="2,2,8")
+    # Cap 6 s, poll 2 s, probes of about 1 s (plus the stub's start-up) then one of 5 s: the third probe was predicted to end inside the cap and ends past it.
+    SLOW_LATER = dict(FAKE_PROBE_SLEEP="1,1,5")
 
     def test_dot_p2_a_slower_later_probe_ends_past_the_cap_and_the_skip_names_the_overshoot(self) -> None:
-        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "12", "-ThermalPollSec", "3", "-ThermalRequeueMax", "0", FAKE_HEAT="9", **self.SLOW_LATER)
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "6", "-ThermalPollSec", "2", "-ThermalRequeueMax", "0", FAKE_HEAT="9", **self.SLOW_LATER)
         self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
         self.assertEqual([x for x in self.kinds() if x.startswith("LEG:")], [], "a leg still hot after the slow probe is never launched")
         [b] = self.batches()
         [row] = b["legs"]
         self.assertEqual(row["status"], "THERMAL_HOT_SKIPPED", row)
-        self.assertGreater(row["thermalWaitSec"], 12, "the slow probe really ended past the cap (else this test proves nothing)")
-        self.assertEqual(row["thermalWaitOvershootSec"], row["thermalWaitSec"] - 12, row)
-        # soft budget = cap + ONE probe: the overshoot is no more than the slow probe (8 s + stub start-up), never a second one
-        self.assertLessEqual(row["thermalWaitOvershootSec"], 8 + 7, row)
+        self.assertGreater(row["thermalWaitSec"], 6, "the slow probe really ended past the cap (else this test proves nothing)")
+        self.assertEqual(row["thermalWaitOvershootSec"], row["thermalWaitSec"] - 6, row)
+        # soft budget = cap + ONE probe: the overshoot is no more than the slow probe (5 s + stub start-up), never a second one
+        self.assertLessEqual(row["thermalWaitOvershootSec"], 5 + 7, row)
         self.assertIn(f"overshootSec={row['thermalWaitOvershootSec']}", self.log())
         self.assertIn("softBudget=cap+oneProbe", self.log())
 
     def test_dot_p2_a_slow_probe_that_reads_clear_runs_the_leg_and_records_the_overshoot(self) -> None:
-        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "12", "-ThermalPollSec", "3", FAKE_HEAT="9,9,0", **self.SLOW_LATER)
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "6", "-ThermalPollSec", "2", FAKE_HEAT="9,9,0", **self.SLOW_LATER)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         [b] = self.batches()
         [row] = b["legs"]
         self.assertEqual((row["status"], row["heatAtLaunch"]), ("RAN", "clear"), row)
-        self.assertGreater(row["thermalWaitSec"], 12, row)
-        self.assertEqual(row["thermalWaitOvershootSec"], row["thermalWaitSec"] - 12, row)
+        self.assertGreater(row["thermalWaitSec"], 6, row)
+        self.assertEqual(row["thermalWaitOvershootSec"], row["thermalWaitSec"] - 6, row)
 
     def test_adversary_r2b_a1_a_hot_cooldown_probe_during_a_thermal_wait_is_held_to_the_cap(self) -> None:
         # first probe QUIET and hot (the thermal wait starts), every later probe COOLDOWN_UNMET and hot: these used to retry in the lease with no limit, past the cap,
@@ -381,11 +451,26 @@ class ThermalGateRunnerTests(unittest.TestCase):
         self.assertNotIn("[DateTime]::UtcNow - $tProbe", runner, "a wall-clock step made probeSec negative and the next sleep too long")
         self.assertIn("$probeSec = [int][Math]::Ceiling([Math]::Max(0.0, ([Diagnostics.Stopwatch]::GetTimestamp() - $tProbeTs)", runner)
 
-    def test_no_overshoot_is_recorded_as_zero_when_the_wait_ends_inside_the_cap(self) -> None:
-        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "120", FAKE_HEAT="9,0")
+    def test_adversary_r3_a1_a_busy_probe_with_unknown_heat_cannot_sleep_past_the_cap(self) -> None:
+        # first probe QUIET and hot (the wait starts), every later probe GATE_BUSY with no heat reading, -ClaimPollSec 25: the busy branch slept the whole 25 s and then
+        # started another probe far past the cap 4 (waitSec ~27 before the skip); now the sleep is cut to what fits and no probe starts after the deadline less one probe
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "4", "-ClaimPollSec", "25", "-ThermalRequeueMax", "0", FAKE_HEAT="9,NA", FAKE_QUIET_MODES="QUIET,BUSY")
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        [b] = self.batches()
+        [row] = b["legs"]
+        self.assertEqual(row["status"], "THERMAL_HOT_SKIPPED", row)
+        self.assertLess(row["thermalWaitSec"], 4 + 10, f"the busy sleep must be bounded by the cap (cap + one probe), not ClaimPollSec: {row}")
+        self.assertLess(len([x for x in self.kinds() if x.startswith("QUIET")]), 10)
+
+    def test_dot_b2_a_first_probe_longer_than_the_cap_still_gets_a_cooling_attempt(self) -> None:
+        # the INITIAL probe takes 5 s under cap 3 and reads hot; it used to be charged against the first cooling sleep (sleepFit < 1), so the leg was skipped at once with
+        # zero thermal waiting (and, re-queued, again). Now the first hot reading always gets a cooling sleep and a re-probe: that re-probe (1 s) reads clear and the leg runs.
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "3", "-ThermalRequeueMax", "0", FAKE_HEAT="9,0", FAKE_PROBE_SLEEP="5,1")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         [b] = self.batches()
-        self.assertEqual(b["legs"][0]["thermalWaitOvershootSec"], 0, b["legs"][0])
+        [row] = b["legs"]
+        self.assertEqual((row["status"], row["heatAtProbe"], row["heatAtLaunch"], b["thermalWaits"], b["thermalSkips"]), ("RAN", "hot", "clear", 1, 0), row)
+        self.assertGreaterEqual(row["thermalWaitSec"], 1, row)
 
     def test_unknown_heat_is_not_gated(self) -> None:
         r = self.run_batch([self.specs[0]], FAKE_HEAT="NA")
@@ -436,12 +521,15 @@ class ThermalSpreadPlanTests(unittest.TestCase):
         (prior / "batches.jsonl").write_text(json.dumps({"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, "legs": rows}) + "\n", encoding="utf-8")
         a, b = self.commit_a, self.commit_b
         plan = self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[0], "B", b), self.item(self.specs[1], "A", a), self.item(self.specs[1], "B", b)])
-        r = self.run_plan(plan, "-PlanOrder", "ThermalSpread", "-HeatFrom", str(prior))
+        # adversary r3 A3: a history dir on a drive that is not mounted is skipped and named; it used to throw out of Join-Path and refuse the plan (LEG_PLAN_INVALID, exit 2)
+        gone = unmounted_drive_path()
+        r = self.run_plan(plan, "-PlanOrder", "ThermalSpread", "-HeatFrom", f"{gone},{prior}")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual([(c["leaf"], c["sourceCommit"]) for c in self.leg_calls()], [("fx-a", a), ("fx-b", a), ("fx-a", b), ("fx-b", b)])
         kept = json.loads((self.run_dir / "leg-plan.json").read_text(encoding="utf-8"))
         ts = kept["thermalSpread"]
         self.assertEqual((ts["heavyKeys"], ts["heavyAdjacentBefore"], ts["heavyAdjacent"], ts["heatRows"]), (["fx-a|cpu"], 1, 0, 2))
+        self.assertEqual(ts["skipped"], [f"{gone} (no batches.jsonl)"], ts)
         self.assertEqual(tvlb.batch_result(r.stdout)["legPlan"]["order"], "ThermalSpread")
 
     def test_heat_from_needs_thermal_spread(self) -> None:
