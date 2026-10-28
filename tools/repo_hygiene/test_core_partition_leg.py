@@ -214,7 +214,8 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
         [IO.File]::WriteAllText((Join-Path $Work 'run.log'), '[' + $corePartitionMeasuredLaunchUtc.AddMilliseconds(100).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 worker_threads=16`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(110).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(150).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=50.000 presented_frames=1`n")
     }
     $global:cpSaved = $null; $global:cpSaves = [Collections.Generic.List[object]]::new(); $global:cpSaveCalls = 0
-    $global:cpSaveThrowOn = $(if ($mode -eq 'good-rebound-republish-throws') { 2 } else { 0 })
+    # r14 (sol r13d B1): the one publication comes after the snapshot comparison, so 'publish-throws' refuses it from its first try
+    $global:cpSaveThrowOn = $(if ($mode -eq 'good-rebound-publish-throws') { 1 } else { 0 })
     . ([scriptblock]::Create($regions[1]))
     # r13b (A2 binding): the metrics read the same run log the start verdict read
     $rawLog = $(if (Test-Path -LiteralPath (Join-Path $Work 'run.log')) { [IO.File]::ReadAllText((Join-Path $Work 'run.log')) } else { "playback_smoke.start session=1 worker_threads=16`n" })
@@ -233,11 +234,109 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
         onDisk = @((Test-Path -LiteralPath $cpOnDisk -PathType Leaf), $(if (Test-Path -LiteralPath $cpOnDisk -PathType Leaf) { [string](([IO.File]::ReadAllText($cpOnDisk) | ConvertFrom-Json -AsHashtable).feed.startWhy) } else { $null }))
         started = ($null -ne $corePartitionHelper); ready = [bool]$corePartitionHelperLaunch.ready; readyWhy = [string]$corePartitionHelperLaunch['readyWhy']
         notReady = [bool]$corePartitionHelperNotReady; helperWhy = [string]$corePartitionHelperWhy; publishedNotReady = [bool]$global:cpSaved.helperNotReady
-        published = @($ps.rows, $ps.pkgWattsMean, $ps.pkgTempCMean, [string]$ps.reasons['pkgWattsMean']); startWhy = [string]$global:cpSaved.feed.startWhy; pkg = @($sc.pkgWattsMean, $sc.pkgWattsMax, $sc.pkgTempCMean, $sc.pkgTempCMax)
+        published = @($ps.rows, $ps.pkgWattsMean, $ps.pkgTempCMean, $(if ($null -ne $ps) { [string]$ps.reasons['pkgWattsMean'] })); startWhy = [string]$global:cpSaved.feed.startWhy; pkg = @($sc.pkgWattsMean, $sc.pkgWattsMax, $sc.pkgTempCMean, $sc.pkgTempCMax)
         topo = $sc.corePartitionTopologyOk; why = [string]$sc.corePartitionNullReasons; errors = @($corePartitionErrors)
     }
     if ($null -ne $corePartitionHelper -and -not $corePartitionHelper.HasExited) { $corePartitionHelper.Kill() }
   } catch { $out[$mode] = [ordered]@{ threw = [string]$_.Exception.Message + ' @ ' + [string]$_.InvocationInfo.PositionMessage } }
+}
+$out | ConvertTo-Json -Compress -Depth 8
+"""
+
+
+# r14 (sol r13d B1 = r13d OPEN A1, CORE-PARTITION-SINGLE-PUBLICATION-AFTER-SNAPSHOT-1): the job's own regions run for real inside a child pwsh
+# shaped like the job (its outer try, a terminal in it, its outer finally carrying region 4 when the job has one), one child per terminal class.
+# The run log the start verdict reads is log A; a terminal after the job's later read reads log B (worker_threads changed), as sol reproduced.
+# CP_SAVE: ok, record-throws (every core-partition.json write throws), all-throws (its typed status write throws too). Each publication is
+# kept by value (cp-save-<n>.json), so a publication before the snapshot comparison is visible even when a later one replaced it.
+TERMINAL_CHILD_HEAD = r"""
+$ErrorActionPreference = 'Stop'
+$Work = $env:CP_TWORK; $Pub = $Work
+function Write-JobTrace([string]$Message) { }
+function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText($Path, $Value) }
+function New-AttrCudaDirectory { param([string]$Path) }
+function Save-Json { param($Object, $Path)
+    $leaf = Split-Path -Leaf $Path
+    if ($leaf -eq 'core-partition.json' -and $env:CP_SAVE -ne 'ok') { throw 'save-json-refused-by-test' }
+    if ($leaf -eq 'core-partition-unpublished.json' -and $env:CP_SAVE -eq 'all-throws') { throw 'status-refused-by-test' }
+    $j = $Object | ConvertTo-Json -Depth 30
+    [IO.File]::WriteAllText($Path, $j)
+    if ($leaf -eq 'core-partition.json') { $n = @(Get-ChildItem -LiteralPath $Work -Filter 'cp-save-*.json').Count; [IO.File]::WriteAllText((Join-Path $Work "cp-save-$n.json"), $j) }
+}
+function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) $p = Join-Path $ContainingRoot 'run.log'; if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'run log unresolvable' }; [pscustomobject]@{ path = $p; sha256 = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() } }
+$exePath = 'C:\no\such\MLVApp.exe'; $SmokeProcessTimeoutMs = 60000; $FixtureRehearsal = $false; $SourceCommit = '0' * 40; $ClipId = 'terminal-driver'
+$env:HEAVY_SLOT_FEED = Join-Path $Work 'feed.csv'
+[IO.File]::WriteAllText($env:HEAVY_SLOT_FEED, "26.10.2026,00:59:59,x,20.0,5.0,No,No`n")
+$env:CP_MARKER = 'good'
+$runLogPath = Join-Path $Work 'run.log'
+$resultPath = Join-Path $Work 'result.json'
+function Set-LogB { [IO.File]::WriteAllText($runLogPath, [IO.File]::ReadAllText($runLogPath).Replace('worker_threads=16', 'worker_threads=8')) }
+try {
+"""
+# the MARKER_DRIVER 'good' setup: a window row 400 ms after the measured launch, the runner's result.json, the helper's signed record and log A
+TERMINAL_CHILD_SETUP = r"""
+[IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, $corePartitionMeasuredLaunchUtc.AddMilliseconds(400).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + ",x,70.0,45.0,No,No`n")
+$now = [DateTime]::UtcNow
+[IO.File]::WriteAllText($resultPath, ([ordered]@{ process = [ordered]@{ id = 5000; startedAtUtc = $now.AddSeconds(-5).ToString('o'); endedAtUtc = $now.ToString('o') } } | ConvertTo-Json -Depth 3))
+$mb = ((Get-CorePartitionMonoMs) - 150).ToString([Globalization.CultureInfo]::InvariantCulture)
+$inst = '{"pid":5000,"startUtcTicks":' + $now.AddSeconds(-5).Ticks + ',"firstSeenUtcTicks":' + $now.AddSeconds(-4.9).Ticks + ',"firstMs":10,"aliveMs":40,"goneUtcTicks":' + $now.Ticks + ',"goneMs":50}'
+$rb = [Text.Encoding]::UTF8.GetBytes('{"schema":"mlv-app/core-partition-helper/v1","pid":' + $corePartitionHelperLaunch.pid + ',"monoBaseMs":' + $mb + ',"app":' + $inst + ',"instances":[' + $inst + '],"others":[],"clockSkewMaxMs":0}')
+[IO.File]::WriteAllBytes($corePartitionHelperOut, $rb)
+[IO.File]::WriteAllText("$corePartitionHelperOut.mac", [Convert]::ToHexString([Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($corePartitionHelperNonce)).ComputeHash($rb)))
+[IO.File]::WriteAllText($runLogPath, '[' + $corePartitionMeasuredLaunchUtc.AddMilliseconds(100).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 worker_threads=16`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(110).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(150).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=50.000 presented_frames=1`n")
+"""
+TERMINAL_SUCCESS_TAIL = "__METRICS__\nWrite-Output \"PUBLISHWHY=$corePartitionPublishWhy\"\nexit 0\n"
+# terminal class -> (CP_SAVE, the body that follows the smoke-launch finally)
+TERMINALS = {
+    # exit 23 after the later log read (G 3376): sol r13d B1's own reproduction
+    "presentmon-unavailable": ("ok", "Set-LogB\n$rawLog = [IO.File]::ReadAllText($runLogPath)\nWrite-Output 'RESULT=PRESENTMON_UNAVAILABLE'\nexit 23\n"),
+    # an early refusal before the later log read (G 3134 / 3190: SMOKE_RUN_FAILED, SMOKE_LOG_UNAVAILABLE)
+    "smoke-log-unavailable": ("ok", "Write-Output 'RESULT=SMOKE_LOG_UNAVAILABLE'\nexit 16\n"),
+    # a mid-run failure: an uncaught throw after the later log read (G 3223-3228, a smoke artifact publication)
+    "mid-run-throw": ("ok", "Set-LogB\n$rawLog = [IO.File]::ReadAllText($runLogPath)\nthrow 'smoke artifact publish failed after the later log read'\n"),
+    # success: the snapshot matches (control) / does not (nothing may be published before the comparison)
+    "success-match": ("ok", "$rawLog = [IO.File]::ReadAllText($runLogPath)\n" + TERMINAL_SUCCESS_TAIL),
+    "success-mismatch": ("ok", "Set-LogB\n$rawLog = [IO.File]::ReadAllText($runLogPath)\n" + TERMINAL_SUCCESS_TAIL),
+    # r14 item 2: the status write fails too (success, and a failure terminal) / only the record write fails (control)
+    "success-unrecorded": ("all-throws", "$rawLog = [IO.File]::ReadAllText($runLogPath)\n" + TERMINAL_SUCCESS_TAIL),
+    "success-status-written": ("record-throws", "$rawLog = [IO.File]::ReadAllText($runLogPath)\n" + TERMINAL_SUCCESS_TAIL),
+    "terminal-unrecorded": ("all-throws", "Set-LogB\n$rawLog = [IO.File]::ReadAllText($runLogPath)\nWrite-Output 'RESULT=PRESENTMON_UNAVAILABLE'\nexit 23\n"),
+}
+TERMINAL_DRIVER = r"""
+$ErrorActionPreference = 'Stop'
+$job = [IO.File]::ReadAllText($env:CP_JOB) -replace "`r`n", "`n"
+$regions = @(); $at = 0
+while (($s = $job.IndexOf($env:CP_OPEN, $at)) -ge 0) { $e = $job.IndexOf($env:CP_CLOSE, $s); $regions += $job.Substring($s, $e - $s); $at = $e + 1 }
+$fake = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($env:CP_FAKE_HELPER))
+$pre = [regex]::Replace($regions[0], "(?m)^\`$CorePartitionHelperEncoded = '[^']*'", { "`$CorePartitionHelperEncoded = '$fake'" })
+$pre = [regex]::Replace($pre, '(?m)^\$CorePartitionHelperAffinity = \[int64\]\d+', '$CorePartitionHelperAffinity = [int64]1')
+# region 4 (the outer finally's) is every region after the summary lines; a job without one (29375694) runs its terminal with an empty finally
+$fin = $(if ($regions.Count -gt 4) { $regions[4..($regions.Count - 1)] -join "`n" } else { '' })
+$terminals = $env:CP_TERMINALS | ConvertFrom-Json -AsHashtable
+$out = [ordered]@{}
+foreach ($name in @($terminals.Keys | Sort-Object)) {
+    $dir = Join-Path $env:CP_WORK $name; [void](New-Item -ItemType Directory -Path $dir)
+    $body = ([string]$terminals[$name][1]).Replace('__METRICS__', $regions[2])
+    $kill = '    if ((Test-Path -LiteralPath ''variable:corePartitionHelper'') -and $null -ne $corePartitionHelper -and -not $corePartitionHelper.HasExited) { $corePartitionHelper.Kill() }'
+    $child = $env:CP_HEAD + "`n" + $pre + "`n" + $env:CP_SETUP + "`n" + $regions[1] + "`n" + $body + "`n} finally {`n" + $fin + "`n" + $kill + "`n}`n"
+    $childPath = Join-Path $dir 'child.ps1'; [IO.File]::WriteAllText($childPath, $child)
+    $env:CP_TWORK = $dir; $env:CP_SAVE = [string]$terminals[$name][0]
+    $stdout = @(& "$env:ProgramFiles\PowerShell\7\pwsh.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $childPath 2>&1 | ForEach-Object { [string]$_ })
+    $rc = $LASTEXITCODE
+    $cpPath = Join-Path $dir 'core-partition.json'
+    $cp = $(if (Test-Path -LiteralPath $cpPath -PathType Leaf) { [IO.File]::ReadAllText($cpPath) | ConvertFrom-Json -AsHashtable })
+    $saves = @(Get-ChildItem -LiteralPath $dir -Filter 'cp-save-*.json' | Sort-Object Name | ForEach-Object { $sv = [IO.File]::ReadAllText($_.FullName) | ConvertFrom-Json -AsHashtable; , @($sv.feed.summary.rows, [string]$sv.feed.startWhy) })
+    $stPath = Join-Path $dir 'core-partition-unpublished.json'
+    $st = $(if (Test-Path -LiteralPath $stPath -PathType Leaf) { [IO.File]::ReadAllText($stPath) | ConvertFrom-Json -AsHashtable })
+    $smPath = Join-Path $dir 'summary.json'
+    $sm = $(if (Test-Path -LiteralPath $smPath -PathType Leaf) { [IO.File]::ReadAllText($smPath) | ConvertFrom-Json -AsHashtable })
+    $out[$name] = [ordered]@{
+        rc = $rc; stdout = $stdout
+        onDisk = $(if ($null -ne $cp) { [ordered]@{ rows = $cp.feed.summary.rows; watts = $cp.feed.summary.pkgWattsMean; startWhy = [string]$cp.feed.startWhy; wattsWhy = [string]$cp.feed.summary.reasons['pkgWattsMean']; helper = ($null -ne $cp.helper) } })
+        saves = $saves
+        status = $(if ($null -ne $st) { [ordered]@{ stage = $st.stage; why = $st.why; startWhy = $st.startWhy; staleRecordOnDisk = $st.staleRecordOnDisk; errors = @($st.errors) } })
+        summary = $(if ($null -ne $sm) { [ordered]@{ result = $sm.result; reason = $sm.reason } })
+    }
 }
 $out | ConvertTo-Json -Compress -Depth 8
 """
@@ -597,7 +696,8 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         for key in ("a", "b1", "b2"):
             with self.subTest(job=key):
                 text = lf(self.job(key))
-                self.assertEqual((text.count(OPEN), text.count(CLOSE)), (4, 4), "four bracketed regions: before, finally, scalars, summary lines")
+                # r14 (sol r13d B1): the fifth is the publication at the job's outer finally
+                self.assertEqual((text.count(OPEN), text.count(CLOSE)), (5, 5), "five bracketed regions: before, finally, scalars, summary lines, outer finally")
                 self.assertEqual(strip_regions(text), plain, "outside its regions (and the try/finally wrapper) the job must be the job without telemetry")
 
     def test_only_the_measured_launch_is_wrapped_and_the_masks_are_literal(self) -> None:
@@ -775,7 +875,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         work.mkdir()
         driver = self.tmp / "marker-driver.ps1"
         driver.write_text(LIFT + MARKER_DRIVER, encoding="ascii")
-        modes = ["start-throws", "directory", "foreign-key", "pre-r8-text", "empty", "good", "good-rebound", "good-rebound-republish-throws"]
+        modes = ["start-throws", "directory", "foreign-key", "pre-r8-text", "empty", "good", "good-rebound", "good-rebound-publish-throws"]
         proc = run_pwsh(["-File", str(driver)], env_extra={"CP_JOB": str(self.out["a"]), "CP_OPEN": OPEN, "CP_CLOSE": CLOSE, "CP_FAKE_HELPER": MARKER_HELPER,
                                                            "CP_WORK": str(work), "CP_MODES": ",".join(modes), "CP_GEN": str(GENERATOR)})
         self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
@@ -818,38 +918,103 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(rebound["published"], [None, None, None, "run-log-snapshot-mismatch"], rebound)
         self.assertEqual(rebound["startWhy"], "run-log-snapshot-mismatch", rebound)
         self.assertEqual(rebound["pkg"], [None] * 4, rebound)
-        # r13c (Dot 6456731376 a/b): each publication captured by value. Two publications: the first is the good window, the second (the
-        # republish) carries run-log-snapshot-mismatch on every window field and as startWhy. With the republish deleted there is one.
-        self.assertEqual([rebound["saveCalls"], len(rebound["saves"])], [2, 2], f"a snapshot mismatch did not publish core-partition.json again: {rebound}")
-        self.assertEqual(rebound["saves"][0][:4], [1, 45.0, 70.0, ""], rebound)
-        self.assertEqual(rebound["saves"][1][:4], [None, None, None, "run-log-snapshot-mismatch"], rebound)
-        self.assertEqual(rebound["saves"][1][4], ["run-log-snapshot-mismatch"] * 6, rebound)
+        # r13c (Dot 6456731376 a/b): each publication captured by value. r14 (sol r13d B1): the snapshot comparison comes before the one
+        # publication, so the good window is never on disk first: one publication, run-log-snapshot-mismatch on every window field and as startWhy
+        # (on 29375694 there were two, the first the unrefused window).
+        self.assertEqual([rebound["saveCalls"], len(rebound["saves"])], [1, 1], f"core-partition.json was published before the snapshot comparison: {rebound}")
+        self.assertEqual(rebound["saves"][0][:4], [None, None, None, "run-log-snapshot-mismatch"], rebound)
+        self.assertEqual(rebound["saves"][0][4], ["run-log-snapshot-mismatch"] * 6, rebound)
         self.assertEqual(rebound["publishWhy"], "", rebound)
         self.assertEqual(rebound["onDisk"], [True, "run-log-snapshot-mismatch"], rebound)
         self.assertEqual(good["onDisk"], [True, ""], good)
         # r13d (Dot 6458932346): a published run writes no unpublished status
         self.assertIsNone(good["status"], good)
         self.assertIsNone(rebound["status"], rebound)
-        # r13c (Dot 6456731376 c): the republish itself fails (every Save-Json of core-partition.json after the first throws): the summary must not
-        # stand on the first publication: core-partition-json-unpublished, the republish error recorded, and no package-feed value. adversary r13c
-        # (a8c04609) A3: the republish is tried three times.
-        failed = got["good-rebound-republish-throws"]
+        # r13c (Dot 6456731376 c) / adversary r13c (a8c04609) A3: the publication fails on all three tries (250 ms apart): the summary is refused
+        # core-partition-json-unpublished, the three errors are recorded, and no package-feed value stands.
+        failed = got["good-rebound-publish-throws"]
         self.assertNotIn("threw", failed, failed)
-        self.assertEqual([failed["saveCalls"], len(failed["saves"])], [4, 1], failed)
+        self.assertEqual([failed["saveCalls"], len(failed["saves"])], [3, 0], failed)
         self.assertEqual(failed["publishWhy"], "core-partition-json-unpublished", failed)
-        self.assertEqual(failed["errors"].count("republish: save-json-refused-by-test"), 3, failed)
+        self.assertEqual(failed["errors"].count("publish: save-json-refused-by-test"), 3, failed)
         self.assertEqual(failed["pkg"], [None] * 4, failed)
         self.assertIn("pkgWattsMean=run-log-snapshot-mismatch", failed["why"], failed)
         self.assertIn("core-partition-json-unpublished", failed["why"], failed)
-        # r13d (Dot 6459551437, CI red on 51c90c3d): nothing is removed by pathname. The first, unrefused publication stays on disk, and a typed
-        # status beside it (Dot 6458932346, the durable late-error channel) names it stale, refuses it core-partition-json-unpublished and carries
-        # the three republish errors raised after the record's own error snapshot; on 51c90c3d those errors were in memory only (no status file)
-        self.assertEqual(failed["onDisk"], [True, ""], failed)
+        # r13d (Dot 6459551437): nothing is removed by pathname; r14: nothing was published, so nothing stands on disk, and the typed status
+        # (Dot 6458932346, the durable late-error channel) refuses it core-partition-json-unpublished and carries the three errors
+        self.assertEqual(failed["onDisk"], [False, None], failed)
         st = failed["status"]
-        self.assertIsNotNone(st, f"the republish failure left no durable status: {failed}")
+        self.assertIsNotNone(st, f"the publication failure left no durable status: {failed}")
         self.assertEqual([st["schema"], st["why"], st["stage"], st["staleRecordOnDisk"], st["startWhy"]],
-                         ["mlv-app/core-partition-unpublished/v1", "core-partition-json-unpublished", "republish", True, "run-log-snapshot-mismatch"], st)
-        self.assertEqual(st["errors"].count("republish: save-json-refused-by-test"), 3, st)
+                         ["mlv-app/core-partition-unpublished/v1", "core-partition-json-unpublished", "publish", False, "run-log-snapshot-mismatch"], st)
+        self.assertEqual(st["errors"].count("publish: save-json-refused-by-test"), 3, st)
+
+    def terminal_cases(self) -> dict:
+        """TERMINAL_DRIVER's per-terminal results for job "a", run once per class."""
+        cls = type(self)
+        if getattr(cls, "_terminals", None) is None:
+            self.job("a")
+            work = self.tmp / "terminal-work"
+            work.mkdir()
+            driver = self.tmp / "terminal-driver.ps1"
+            driver.write_text(TERMINAL_DRIVER, encoding="ascii")
+            proc = run_pwsh(["-File", str(driver)], env_extra={"CP_JOB": str(self.out["a"]), "CP_OPEN": OPEN, "CP_CLOSE": CLOSE, "CP_FAKE_HELPER": MARKER_HELPER,
+                                                               "CP_WORK": str(work), "CP_HEAD": TERMINAL_CHILD_HEAD, "CP_SETUP": TERMINAL_CHILD_SETUP,
+                                                               "CP_TERMINALS": json.dumps(TERMINALS)})
+            self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+            cls._terminals = json.loads(proc.stdout.strip().splitlines()[-1])
+        return cls._terminals
+
+    def test_r14_b1_every_terminal_publishes_core_partition_json_once_after_the_snapshot_comparison(self) -> None:
+        """sol r13d B1 (= r13d OPEN A1, CORE-PARTITION-SINGLE-PUBLICATION-AFTER-SNAPSHOT-1): on 29375694 core-partition.json was published in the
+        smoke launch's finally, before the job's later read of the run log, and only the success path compared the two. A failure terminal after
+        that read (PRESENTMON_UNAVAILABLE exit 23, sol's reproduction), an early refusal before it (SMOKE_LOG_UNAVAILABLE exit 16) and an uncaught
+        throw after it each left log A's unrefused window on disk (rows 1, startWhy null); a mismatched success published it unrefused first, then
+        again refused. Now each publishes once, after the comparison, refused: run-log-snapshot-mismatch, or run-log-snapshot-unconfirmed when the
+        job never made the later read. The terminal's own exit code is kept."""
+        got = self.terminal_cases()
+        expect = {"presentmon-unavailable": (23, "run-log-snapshot-mismatch"), "smoke-log-unavailable": (16, "run-log-snapshot-unconfirmed"),
+                  "mid-run-throw": (1, "run-log-snapshot-mismatch"), "success-mismatch": (0, "run-log-snapshot-mismatch")}
+        for name, (rc, why) in expect.items():
+            with self.subTest(terminal=name):
+                c = got[name]
+                self.assertEqual(c["rc"], rc, c)
+                self.assertIsNotNone(c["onDisk"], f"the terminal published no core-partition.json: {c}")
+                self.assertEqual([c["onDisk"]["rows"], c["onDisk"]["watts"], c["onDisk"]["startWhy"], c["onDisk"]["wattsWhy"]], [None, None, why, why],
+                                 f"core-partition.json kept a window measured on another run-log snapshot: {c}")
+                self.assertTrue(c["onDisk"]["helper"], c)
+                self.assertEqual(c["saves"], [[None, why]], f"core-partition.json was published before the snapshot comparison, or more than once: {c}")
+                self.assertIsNone(c["status"], c)
+        # control: a success whose later read is the same snapshot publishes the window as before, once, and the outer finally adds nothing
+        ok = got["success-match"]
+        self.assertEqual(ok["rc"], 0, ok)
+        self.assertEqual([ok["onDisk"]["rows"], ok["onDisk"]["watts"], ok["onDisk"]["startWhy"]], [1, 45.0, ""], ok)
+        self.assertEqual(ok["saves"], [[1, ""]], ok)
+        self.assertIn("PUBLISHWHY=", ok["stdout"], ok)
+        self.assertIsNone(ok["status"], ok)
+
+    def test_r14_item2_a_failed_status_write_refuses_the_summary(self) -> None:
+        """Dot pr-696 df08bde: when the core-partition-unpublished.json write itself failed (G 6133 / 6165 on 29375694) the only record of the
+        refusal was in memory and the success summary still exited 0. Now the success path ends CORE_PARTITION_UNRECORDED (exit 32, a refusal
+        summary.json); a failure terminal keeps its own non-zero exit and names CORE_PARTITION_UNRECORDED on the result stream. Control: a
+        writable status slot leaves the success standing, refused in its flags, with the three publication errors durable beside it."""
+        got = self.terminal_cases()
+        red = got["success-unrecorded"]
+        self.assertEqual(red["rc"], 32, f"a run with no durable core-partition record was not refused: {red}")
+        self.assertTrue(any(ln.startswith("RESULT=CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten ARTIFACTS=") for ln in red["stdout"]), red)
+        self.assertEqual(red["summary"], {"result": "CORE_PARTITION_UNRECORDED", "reason": "core-partition-json-unpublished+unpublished-status-unwritten"}, red)
+        self.assertEqual([red["onDisk"], red["status"], red["saves"]], [None, None, []], red)
+        term = got["terminal-unrecorded"]
+        self.assertEqual(term["rc"], 23, term)
+        self.assertTrue(any(ln.startswith("CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten") for ln in term["stdout"]), term)
+        control = got["success-status-written"]
+        self.assertEqual(control["rc"], 0, control)
+        self.assertIn("PUBLISHWHY=core-partition-json-unpublished", control["stdout"], control)
+        self.assertIsNone(control["onDisk"], control)
+        st = control["status"]
+        self.assertIsNotNone(st, control)
+        self.assertEqual([st["stage"], st["why"], st["staleRecordOnDisk"]], ["publish", "core-partition-json-unpublished", False], st)
+        self.assertEqual(st["errors"].count("publish: save-json-refused-by-test"), 3, st)
 
     def test_the_jobs_key_reaches_only_the_helper(self) -> None:
         """sol r6 CP-06: the per-job key is drawn at run time, handed to the helper by environment (never the command line), never traced or
@@ -1345,6 +1510,9 @@ $preLines = @([regex]::Matches($src.Substring(0, $postAt), '(?m)^(\$corePartitio
 if (@($preLines | Where-Object { $_.StartsWith('if ') }).Count -ne 1) { throw "the not-ready rule is not one line: $($preLines -join ' | ')" }
 $scalarLine = [regex]::Match($src, '(?m)^\$corePartitionScalars = Get-CorePartitionScalars .*$').Value
 if (-not $scalarLine) { throw 'no scalar line in the generator' }
+# r14 (sol r13d B1): the cleanup block only builds the record; the success path's region 2 publishes it (its two publication lines, lifted)
+$publishLines = @([regex]::Matches($src, '(?m)^(\$cpPublication = Publish-CorePartitionRecord .*|\$corePartitionFeedSummary = \$cpPublication\.feed.*)$') | ForEach-Object { $_.Value })
+if ($publishLines.Count -ne 2) { throw "the success path's publication is not two lines: $($publishLines -join ' | ')" }
 function Write-JobTrace([string]$Message) { }
 function Publish-AttrCudaText { param([string]$Path, [string]$Value) }
 function New-AttrCudaDirectory { param([string]$Path) }
@@ -1475,6 +1643,7 @@ foreach ($c in $cases) {
     foreach ($l in $preLines) { if ($l.StartsWith('if ')) { . ([scriptblock]::Create($l)) } }
     . ([scriptblock]::Create($cleanup))
     $rawLog = "playback_smoke.start session=1 worker_threads=16`n"
+    foreach ($l in $publishLines) { . ([scriptblock]::Create($l)) }
     . ([scriptblock]::Create($scalarLine))
     $s = $corePartitionScalars
     $out[$c.name] = [ordered]@{

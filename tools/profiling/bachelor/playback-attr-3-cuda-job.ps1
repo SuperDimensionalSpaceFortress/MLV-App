@@ -95,6 +95,8 @@
 # of the three keep-alive checkpoints (SESSION_LOCKED_OWNER_ONLY, exit 30, not KEEPALIVE_FAILED/26).
 # r4: exit 31 = LOOK_RECEIPT_SHA_MISMATCH (LOOK-ASSIST-FILM-FLAVOR-2 r2 had also taken 30; moved so
 # each exit code names one result).
+# BACHELOR-CORE-PARTITION-AB-1 r14: exit 32 = CORE_PARTITION_UNRECORDED (a -CorePartitionTelemetry job only: core-partition.json and its
+# typed unpublished status both failed to write, so the success summary is refused).
 #
 # Usage (owner clip, id-only -- no -ClipPath, no -FixtureSha256):
 #   pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-job.ps1 `
@@ -4751,6 +4753,35 @@ function Get-CorePartitionStartBoundFeed($Feed, $PlaybackStart) {
     $s
 }
 
+# r14 (sol r13d B1 = r13d OPEN A1, CORE-PARTITION-SINGLE-PUBLICATION-AFTER-SNAPSHOT-1): core-partition.json is published ONCE, here, after the
+# snapshot comparison, and every terminal reaches it: the success path before its summary, every other exit (each failure terminal's exit N, an
+# uncaught throw) from the job's outer finally. The window's start was judged on the core-partition read of the run log ($StartLog, hash-checked
+# at the smoke's end); the job's later read ($LaterLog, its $rawLog) must be the same text, or every window field is refused and startWhy names
+# why: run-log-snapshot-mismatch when the texts differ, run-log-snapshot-unconfirmed when the job ended before (or without) that later read.
+# A failed publication (tried $Tries times, $RetryMs apart) is core-partition-json-unpublished with a typed status beside it; nothing is removed
+# by pathname. r14 item 2 (Dot pr-696 df08bde): a status write that fails too leaves no durable record of it, so unrecorded is set and the
+# caller refuses the summary (CORE_PARTITION_UNRECORDED). Save-Json and New-AttrCudaDirectory are the job's own.
+function Publish-CorePartitionRecord($Record, $Feed, $LaterLog, $StartLog, [string]$Pub, $Errors, [int]$Tries = 3, [int]$RetryMs = 250) {
+    $snapWhy = $(if ($null -eq $LaterLog) { 'run-log-snapshot-unconfirmed' } elseif (-not [string]::Equals([string]$LaterLog, [string]$StartLog, [StringComparison]::Ordinal)) { 'run-log-snapshot-mismatch' })
+    if ($snapWhy) { $Feed = Get-CorePartitionStartBoundFeed $Feed @{ why = $snapWhy } }
+    $r = [ordered]@{ feed = $Feed; snapshotWhy = $snapWhy; publishWhy = 'core-partition-json-unpublished'; unrecorded = $false }
+    $cpPath = Join-Path $Pub 'core-partition.json'
+    if ($null -eq $Record) { $Errors.Add('publish: no core-partition record') }
+    else {
+        if ($snapWhy) { $Record.feed.summary = $Feed; $Record.feed.startWhy = $snapWhy }
+        for ($i = 1; $i -le $Tries -and $r.publishWhy; $i++) {
+            try { [void](New-AttrCudaDirectory -Path $Pub); $Record.errors = $Errors.ToArray(); Save-Json $Record $cpPath; $r.publishWhy = $null }
+            catch { $Errors.Add("publish: $([string]$_.Exception.Message)"); if ($i -lt $Tries) { Start-Sleep -Milliseconds $RetryMs } }
+        }
+    }
+    if ($r.publishWhy) {
+        $startWhy = $(if ($snapWhy) { $snapWhy } elseif ($null -ne $Record) { $Record.feed.startWhy })
+        try { Save-Json ([ordered]@{ schema = 'mlv-app/core-partition-unpublished/v1'; card = 'BACHELOR-CORE-PARTITION-AB-1'; why = 'core-partition-json-unpublished'; stage = 'publish'; staleRecordOnDisk = (Test-Path -LiteralPath $cpPath -PathType Leaf); startWhy = $startWhy; errors = $Errors.ToArray() }) (Join-Path $Pub 'core-partition-unpublished.json') }
+        catch { $Errors.Add("unpublished-status: $([string]$_.Exception.Message)"); $r.unrecorded = $true }
+    }
+    [pscustomobject]$r
+}
+
 # PURE. A result.json time (pwsh 7 ConvertFrom-Json hands an ISO 'Z' string back as a DateTime; older shapes keep the string) as UTC ticks; 0 when absent or unreadable.
 function ConvertTo-CorePartitionUtcTicks($Value) {
     if ($null -eq $Value) { return [int64]0 }
@@ -5859,10 +5890,13 @@ if (-not [string]::IsNullOrEmpty($ScopesDuringPlayback)) {
 # BACHELOR-CORE-PARTITION-AB-1: a core-partition leg gains three bracketed regions, on the expanded text and only when -CorePartitionTelemetry
 # asks (like --windowed above), so every other job is the text it always was. Each anchor must match exactly once (Edit-DualVenueTemplate throws):
 #   1. around the MEASURED smoke launch only (never a pre-launch): start the helper, pin this job (MLVApp inherits the mask), launch as before,
-#      then in finally restore the mask, stop the helper by stop-file (bounded; only that pid is ever killed), read the feed window and publish
-#      core-partition.json;
-#   2. before the SUCCESS summary: the scalars (the run log's worker count is read there);
-#   3. one summary line per scalar after the summary's cpuFrames line.
+#      then in finally restore the mask, stop the helper by stop-file (bounded; only that pid is ever killed), read the feed window and build
+#      the core-partition record (r14: built, not published);
+#   2. before the SUCCESS summary: the snapshot comparison, the one publication of core-partition.json and the scalars (the run log's worker
+#      count is read there);
+#   3. one summary line per scalar after the summary's cpuFrames line;
+#   4. (r14, sol r13d B1) at the top of the job's outer finally: every exit that did not reach (2) publishes core-partition.json there, once,
+#      after the same comparison (Publish-CorePartitionRecord).
 if ($CorePartitionTelemetry) {
     $cpOpen = '# BACHELOR-CORE-PARTITION-AB-1 >>>'
     $cpClose = '# BACHELOR-CORE-PARTITION-AB-1 <<<'
@@ -5875,7 +5909,7 @@ if ($CorePartitionTelemetry) {
     # record HMAC took the helper past the earlier 30000).
     if ($cpHelperEncoded.Length -gt 32000) { throw "CORE_PARTITION_HELPER_TOO_LONG the encoded helper is $($cpHelperEncoded.Length) chars (limit 32000, one command line)" }
     $cpHelperAffinity = if ($corePartitionArgs.load -ne 0) { $corePartitionArgs.load } else { $corePartitionArgs.helper }
-    $cpJobFunctions = Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:ConvertFrom-CorePartitionNumber}, ${function:Get-CorePartitionEffectiveMHz}, ${function:ConvertFrom-CorePartitionFeedRows}, ${function:Split-CorePartitionFeedLines}, ${function:Test-CorePartitionFeedFresh}, ${function:Test-CorePartitionFeedRowAfter}, ${function:Test-CorePartitionFeedMarkAccounted}, ${function:Get-CorePartitionFeedSummary}, ${function:Get-CorePartitionCounterSummary}, ${function:Get-CorePartitionWorkerThreads}, ${function:Join-CorePartitionWhy}, ${function:Get-CorePartitionReadyFeed}, ${function:ConvertTo-CorePartitionUtcTicks}, ${function:Test-CorePartitionHelperRecordShape}, ${function:Test-CorePartitionHelperMac}, ${function:Test-CorePartitionHelperRecord}, ${function:Test-CorePartitionMeasuredApp}, ${function:Get-CorePartitionAppAliveMonoMs}, ${function:Get-CorePartitionPlaybackStart}, ${function:Get-CorePartitionStartBoundFeed}, ${function:Select-CorePartitionFeedRowsFromStart}, ${function:Get-CorePartitionScalars}, ${function:Get-CorePartitionFeedHandleInfo}, ${function:Read-CorePartitionFeedBytes}, ${function:Read-CorePartitionFeedMark}, ${function:Read-CorePartitionFeedSince}, ${function:Get-CorePartitionReadyToken}, ${function:Get-CorePartitionClockSkewMs}, ${function:Get-CorePartitionMonoMs}, ${function:Test-CorePartitionReadyMarker}) "`n"
+    $cpJobFunctions = Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:ConvertFrom-CorePartitionNumber}, ${function:Get-CorePartitionEffectiveMHz}, ${function:ConvertFrom-CorePartitionFeedRows}, ${function:Split-CorePartitionFeedLines}, ${function:Test-CorePartitionFeedFresh}, ${function:Test-CorePartitionFeedRowAfter}, ${function:Test-CorePartitionFeedMarkAccounted}, ${function:Get-CorePartitionFeedSummary}, ${function:Get-CorePartitionCounterSummary}, ${function:Get-CorePartitionWorkerThreads}, ${function:Join-CorePartitionWhy}, ${function:Get-CorePartitionReadyFeed}, ${function:ConvertTo-CorePartitionUtcTicks}, ${function:Test-CorePartitionHelperRecordShape}, ${function:Test-CorePartitionHelperMac}, ${function:Test-CorePartitionHelperRecord}, ${function:Test-CorePartitionMeasuredApp}, ${function:Get-CorePartitionAppAliveMonoMs}, ${function:Get-CorePartitionPlaybackStart}, ${function:Get-CorePartitionStartBoundFeed}, ${function:Publish-CorePartitionRecord}, ${function:Select-CorePartitionFeedRowsFromStart}, ${function:Get-CorePartitionScalars}, ${function:Get-CorePartitionFeedHandleInfo}, ${function:Read-CorePartitionFeedBytes}, ${function:Read-CorePartitionFeedMark}, ${function:Read-CorePartitionFeedSince}, ${function:Get-CorePartitionReadyToken}, ${function:Get-CorePartitionClockSkewMs}, ${function:Get-CorePartitionMonoMs}, ${function:Test-CorePartitionReadyMarker}) "`n"
     $cpLaunchOld = @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
@@ -6081,9 +6115,10 @@ try {
     $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionStartBoundFeed $cpFeedWindow $corePartitionPlaybackStart) $corePartitionHelperNotReady
     # sol r4 CP-05: set until core-partition.json is saved, so any failure on the way leaves every acceptance flag false with this reason.
     $corePartitionPublishWhy = 'core-partition-json-unpublished'
+    # r14 (sol r13d B1): the record is built here and published ONCE, after the snapshot comparison (Publish-CorePartitionRecord): on the success
+    # path before its summary, on every other exit from the job's outer finally. Nothing is published before that comparison.
+    $corePartitionRecord = $null
     try {
-        [void](New-AttrCudaDirectory -Path $Pub)
-        # r13b (adversary r13b e02b23e3 A1): the record is kept, so a later snapshot mismatch can publish it again refused
         $corePartitionRecord = [ordered]@{
             schema = 'mlv-app/core-partition/v1'; card = 'BACHELOR-CORE-PARTITION-AB-1'
             requested = [ordered]@{ benchMask = $corePartitionJob.affinityRequested; loadMask = $(if ($CorePartitionLoadMask -ne 0) { Format-CorePartitionMask $CorePartitionLoadMask } else { $null }); loadThreads = $CorePartitionLoadThreads; helperMask = (Format-CorePartitionMask $CorePartitionHelperMask) }
@@ -6123,16 +6158,10 @@ try {
             perCoreTemperature = 'not in the feed (column 3 is the package / hottest core); adding columns is the Bachelor session''s work'
             errors = $corePartitionErrors.ToArray()
         }
-        Save-Json $corePartitionRecord (Join-Path $Pub 'core-partition.json')
-        $corePartitionPublishWhy = $null
-    } catch {
-        $corePartitionErrors.Add("publish: $([string]$_.Exception.Message)")
-        # r13d (Dot 6458932346): this error comes after the record's error snapshot, so a typed status beside the record carries it durably
-        # (staleRecordOnDisk: a core-partition.json file stands there all the same; it is not this run's verdict)
-        try { Save-Json ([ordered]@{ schema = 'mlv-app/core-partition-unpublished/v1'; card = 'BACHELOR-CORE-PARTITION-AB-1'; why = 'core-partition-json-unpublished'; stage = 'publish'; staleRecordOnDisk = (Test-Path -LiteralPath (Join-Path $Pub 'core-partition.json') -PathType Leaf); startWhy = $corePartitionPlaybackStart.why; errors = $corePartitionErrors.ToArray() }) (Join-Path $Pub 'core-partition-unpublished.json') }
-        catch { $corePartitionErrors.Add("unpublished-status: $([string]$_.Exception.Message)") }
-    }
-    Write-JobTrace "step core-partition done helperWhy=$corePartitionHelperWhy publishWhy=$corePartitionPublishWhy jobAffinityRestored=$($corePartitionJob.affinityRestored) errors=$($corePartitionErrors.Count)"
+    } catch { $corePartitionErrors.Add("record: $([string]$_.Exception.Message)") }
+    # r14: from here every exit publishes it once (the success path's region 2, else the outer finally's region 4)
+    $corePartitionPublishPending = $true
+    Write-JobTrace "step core-partition done helperWhy=$corePartitionHelperWhy publication=pending jobAffinityRestored=$($corePartitionJob.affinityRestored) errors=$($corePartitionErrors.Count)"
 '@ + "`n" + $cpClose + "`n" + @'
 }
 Write-JobTrace "step smoke-launch done rc=$smokeRc"
@@ -6141,29 +6170,20 @@ Write-JobTrace "step smoke-launch done rc=$smokeRc"
     $cpMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
     $text = Edit-DualVenueTemplate $text $cpMetricsAnchor ($cpOpen + "`n" + @'
 # r13b (adversary r13b 82510ec1 A2): the window's start was judged on the core-partition read of the run log ($cpRunLogText, hash-checked at
-# the smoke's end); the metrics resolve and read it again ($rawLog). Two texts that differ did not come from one snapshot, so the start verdict
-# does not hold for these metrics: every window field is refused (run-log-snapshot-mismatch). adversary r13b (e02b23e3) A1: in core-partition.json
-# too, which is published again with the refused summary and startWhy run-log-snapshot-mismatch (a failed re-publish is core-partition-json-unpublished).
-if (-not [string]::Equals([string]$rawLog, [string]$cpRunLogText, [StringComparison]::Ordinal)) {
-    $corePartitionFeedSummary = Get-CorePartitionStartBoundFeed $corePartitionFeedSummary @{ why = 'run-log-snapshot-mismatch' }
-    # adversary r13c (a8c04609) A3: a republish that fails (a reader holding the file) would leave the first, unrefused publication on disk, so it
-    # is tried three times 250 ms apart (a transient scan lock). r13d (Dot 6459551437): when every try fails nothing is removed by pathname (each
-    # try already replaced the slot through Publish-AttrCudaText's checked slot, and failed); the summary is refused core-partition-json-unpublished
-    # and a typed status beside the record (Dot 6458932346) names the record left on disk stale and carries the republish errors durably.
-    $cpRepublished = $false
-    for ($cpTry = 1; $cpTry -le 3 -and -not $cpRepublished; $cpTry++) {
-        try {
-            if ($null -eq $corePartitionRecord) { throw 'no core-partition record to refuse' }
-            $corePartitionRecord.feed.summary = $corePartitionFeedSummary; $corePartitionRecord.feed.startWhy = 'run-log-snapshot-mismatch'
-            Save-Json $corePartitionRecord (Join-Path $Pub 'core-partition.json')
-            $cpRepublished = $true
-        } catch { $corePartitionErrors.Add("republish: $([string]$_.Exception.Message)"); if ($null -eq $corePartitionRecord) { break }; if ($cpTry -lt 3) { Start-Sleep -Milliseconds 250 } }
-    }
-    if (-not $cpRepublished) {
-        $corePartitionPublishWhy = 'core-partition-json-unpublished'
-        try { Save-Json ([ordered]@{ schema = 'mlv-app/core-partition-unpublished/v1'; card = 'BACHELOR-CORE-PARTITION-AB-1'; why = 'core-partition-json-unpublished'; stage = 'republish'; staleRecordOnDisk = (Test-Path -LiteralPath (Join-Path $Pub 'core-partition.json') -PathType Leaf); startWhy = 'run-log-snapshot-mismatch'; errors = $corePartitionErrors.ToArray() }) (Join-Path $Pub 'core-partition-unpublished.json') }
-        catch { $corePartitionErrors.Add("unpublished-status: $([string]$_.Exception.Message)") }
-    }
+# the smoke's end); the metrics resolve and read it again ($rawLog). Two texts that differ did not come from one snapshot, so every window field
+# is refused (run-log-snapshot-mismatch), in the summary and in core-partition.json. r14 (sol r13d B1): that comparison now comes before the one
+# publication of core-partition.json (Publish-CorePartitionRecord), so no unrefused window is ever on disk first. Pending is cleared first, so
+# the outer finally never publishes it a second time.
+$corePartitionPublishPending = $false
+$cpPublication = Publish-CorePartitionRecord $corePartitionRecord $corePartitionFeedSummary $rawLog $cpRunLogText $Pub $corePartitionErrors
+$corePartitionFeedSummary = $cpPublication.feed; $corePartitionPublishWhy = $cpPublication.publishWhy
+Write-JobTrace "step core-partition published site=success publishWhy=$corePartitionPublishWhy snapshotWhy=$($cpPublication.snapshotWhy) errors=$($corePartitionErrors.Count)"
+# r14 item 2 (Dot pr-696 df08bde): core-partition.json and its typed status both failed to write, so no durable record says this run's partition
+# was refused: the summary is refused (CORE_PARTITION_UNRECORDED, exit 32), never a success standing on an in-memory reason.
+if ($cpPublication.unrecorded) {
+    try { Save-Json ([ordered]@{ schema='playback-attr-3-cuda-venue.v1'; result='CORE_PARTITION_UNRECORDED'; reason='core-partition-json-unpublished+unpublished-status-unwritten'; fixtureRehearsal=$FixtureRehearsal; corePartitionErrors=$corePartitionErrors.ToArray(); sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub }) (Join-Path $Pub 'summary.json') } catch { }
+    Write-Output "RESULT=CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten ARTIFACTS=$Pub"
+    exit 32
 }
 $corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs
 '@ + "`n" + $cpClose + "`n" + $cpMetricsAnchor)
@@ -6175,6 +6195,23 @@ $corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $cor
         'pkgWattsMean', 'pkgWattsMax', 'pkgTempCMean', 'pkgTempCMax', 'pkgThrottledRows', 'pkgTempCAtStart', 'pcoreMHzMean', 'ecoreMHzMean', 'pcoreParkedSampleFraction', 'playbackWorkerThreads', 'corePartitionNullReasons')
     $cpKeyLines = @("    $cpOpen") + @($cpKeyNames | ForEach-Object { "    $_ = `$corePartitionScalars['$_']" }) + @("    $cpClose")
     $text = $text.Substring(0, $cpKeysAt + $cpKeysAnchor.Length) + (($cpKeyLines -join $cpEol) + $cpEol) + $text.Substring($cpKeysAt + $cpKeysAnchor.Length)
+    # r14 (sol r13d B1): region 4, the shared finalization boundary. The job's outer finally runs on every exit from its try (each failure
+    # terminal's exit N, an uncaught throw such as a smoke-artifact publish after the later log read); a core-partition record still pending
+    # there is published once, after the same comparison: $rawLog is the job's later read of the run log, absent when the job ended before it
+    # (run-log-snapshot-unconfirmed). r14 item 2: a status write that failed too is named on the result stream (CORE_PARTITION_UNRECORDED);
+    # the exit code stays the terminal's own, already non-zero. Variables are probed by name: an exit before region 1 has none of them.
+    $cpFinallyAnchor = "} finally {`n    if (`$OwnerClipDir) {`n"
+    $text = Edit-DualVenueTemplate $text $cpFinallyAnchor ("} finally {`n    $cpOpen`n" + @'
+    if ((Test-Path -LiteralPath 'variable:corePartitionPublishPending') -and $corePartitionPublishPending) {
+        $corePartitionPublishPending = $false
+        try {
+            $cpLaterLog = $(if (Test-Path -LiteralPath 'variable:rawLog') { $rawLog })
+            $cpPublication = Publish-CorePartitionRecord $corePartitionRecord $corePartitionFeedSummary $cpLaterLog $cpRunLogText $Pub $corePartitionErrors
+            Write-JobTrace "step core-partition published site=finally publishWhy=$($cpPublication.publishWhy) snapshotWhy=$($cpPublication.snapshotWhy) errors=$($corePartitionErrors.Count)"
+            if ($cpPublication.unrecorded) { Write-Output "CORE_PARTITION_UNRECORDED REASON=core-partition-json-unpublished+unpublished-status-unwritten ARTIFACTS=$Pub" }
+        } catch { Write-Output "CORE_PARTITION_UNRECORDED REASON=finalize-threw ARTIFACTS=$Pub" }
+    }
+'@ + "`n    $cpClose`n    if (`$OwnerClipDir) {`n")
     $timeBudget['corePartitionSec'] = 90
     $timeBudget['jobTimeoutSec'] = [int]($timeBudget.jobTimeoutSec + 90)
 }
