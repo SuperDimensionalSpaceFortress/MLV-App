@@ -4250,6 +4250,40 @@ def test_save_dirty_worktree_evidence_fails_soft_and_refuses_a_non_root_director
     assert not list(dest.iterdir()), "a failed save must leave nothing behind"
 
 
+def _dirty_save_env_capture_probe(tmp_path, shadow):
+    """Save into a destination that does not exist (nothing is written) with GIT_DIFF_OPTS and GIT_EXTERNAL_DIFF inherited and Test-Path shadowed by `shadow`
+    for GIT_EXTERNAL_DIFF, the second variable the saver captures. Returns the result line and each variable as the caller sees it afterwards."""
+    body = (
+        "$ErrorActionPreference = 'Stop'; $env:GIT_DIFF_OPTS = '--unified=0'; $env:GIT_EXTERNAL_DIFF = 'review-placeholder'; "
+        "function Test-Path { param([string]$LiteralPath, [string]$PathType = 'Any') "
+        "$r = Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath -PathType $PathType; "
+        f"if ($r -and $LiteralPath -eq 'Env:GIT_EXTERNAL_DIFF') {{ {shadow} }}; $r }}; "
+        f"$out = try {{ Save-DirtyWorktreeEvidence -Wt '{tmp_path}' -Dest '{tmp_path / 'missing'}' -CardName C1 }} catch {{ 'THREW ' + $_.Exception.GetType().Name }}; "
+        "'RESULT ' + $out; 'DIFF_OPTS ' + [string]$env:GIT_DIFF_OPTS; 'EXTERNAL ' + [string]$env:GIT_EXTERNAL_DIFF"
+    )
+    result = dirty_save_pwsh(body)
+    return result.stdout.splitlines(), result.stdout + result.stderr
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_treats_a_variable_gone_between_check_and_read_as_absent(tmp_path):
+    # r16 (sol r15b B2): the inherited GIT_* capture ran before the try/finally that restores it, so a variable removed between its existence check and its
+    # read threw ItemNotFoundException out of the helper: no DIRTY_TREE_SAVE_FAILED line, and GIT_DIFF_OPTS (captured and removed first) stayed removed.
+    lines, shown = _dirty_save_env_capture_probe(tmp_path, "Microsoft.PowerShell.Management\\Remove-Item -LiteralPath Env:GIT_EXTERNAL_DIFF")
+    assert "RESULT DIRTY_TREE_SAVE_FAILED card=C1 reason=no-run-dir" in lines, shown
+    assert "DIFF_OPTS --unified=0" in lines, shown  # the earlier capture is put back
+    assert "EXTERNAL " in lines, shown  # gone before it was read: absent, so nothing to put back
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_fails_typed_and_restores_when_the_capture_throws(tmp_path):
+    # r16 (sol r15b B2): any throw while the caller's variables are captured is DIRTY_TREE_SAVE_FAILED, with every earlier capture restored
+    lines, shown = _dirty_save_env_capture_probe(tmp_path, "throw [System.IO.IOException]::new('capture check failed')")
+    assert "RESULT DIRTY_TREE_SAVE_FAILED card=C1 reason=capture check failed" in lines, shown
+    assert "DIFF_OPTS --unified=0" in lines, shown
+    assert "EXTERNAL review-placeholder" in lines, shown  # never captured, so never removed
+
+
 def test_continuation_reuses_a_clean_existing_worktree(tmp_path):
     """The arm none of the round-1 tests exercised: the branch IS checked out somewhere. Stage 1's
     tree carries its build outputs, and making stage 2 rebuild from scratch is most of why the wide

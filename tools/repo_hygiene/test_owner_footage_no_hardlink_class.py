@@ -317,8 +317,7 @@ LANE_DIRTY_SAVE_PS_LAUNCHES = {
     "Invoke-DirtyGitCapture -Wt $Wt -GitArgs (@('diff', '--cached') + $shape)",
     "Test-DirtyPatchComplete -Wt $Wt -Full $full -GitDiffArgs (@('diff', 'HEAD') + $shape)",
     "Test-DirtyPatchComplete -Wt $Wt -Full $stagedFull -GitDiffArgs (@('diff', '--cached') + $shape)",
-    "Remove-Item -LiteralPath \"Env:$v\"",
-    "Remove-Item -LiteralPath \"Env:$v\" -ErrorAction SilentlyContinue",
+   "Remove-Item -LiteralPath \"Env:$v\" -ErrorAction SilentlyContinue",
     "Set-Item -LiteralPath \"Env:$v\" -Value $savedEnv[$v]",
 }
 _PS_LAUNCH_COMMANDS = {"git", "invoke-dirtygitcapture", "test-dirtypatchcomplete", "set-item", "remove-item"}
@@ -333,7 +332,7 @@ LANE_DIRTY_SAVE_PS_LAUNCH_WRITES = {
     "$stagedTmp = $null",
     "$gitEnv = 'GIT_DIFF_OPTS', 'GIT_EXTERNAL_DIFF', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX'",
     "$savedEnv = @{}",
-    "$savedEnv[$v] = (Get-Item -LiteralPath \"Env:$v\").Value",
+    "$savedEnv[$v] = $found.Value",
     "$Wt = (Resolve-Path -LiteralPath $Wt).ProviderPath",
     "$Wt = $wtReal",
     "$gitDir = @(& git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir 2>$null)",
@@ -352,8 +351,9 @@ LANE_DIRTY_SAVE_PS_LAUNCH_WRITES = {
     "[System.Diagnostics.Process]::Start($psi)",
 }
 # r15 iter 2 (adversary 39a58424-A1): the pins above follow NAMES, so an alias ($x = $psi; $x.FileName = 'pwsh') or a call through a member chain
-# ($psi.ArgumentList.Add('-c')) changed the launch object unseen. Every USE of a mutable launch object is therefore pinned by its site (the enclosing
-# assignment, else the command, expression, parameter or foreach header; ps_ast_inventory.ps1 Get-UseSite), so a new alias or call is a new site.
+# ($psi.ArgumentList.Add('-c')) changed the launch object unseen. Every reference to a mutable launch object BY ITS NAME (any scope qualifier, $variable:
+# included since r16) is therefore pinned by its site (the enclosing assignment, else the command, expression, parameter or foreach header;
+# ps_ast_inventory.ps1 Get-UseSite), so a new alias or call is a new site. A reference by ANOTHER name (a provider path, SessionState) is the r16 rule below.
 LANE_DIRTY_SAVE_PS_LAUNCH_OBJECTS = {"psi", "savedEnv", "gitEnv", "shape", "stagedTmp", "gitDir", "GitArgs", "GitDiffArgs"}
 LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES = {
     "gitargs @ @('-C', $Wt) + $GitArgs", "gitargs @ param [string[]]$GitArgs",
@@ -372,7 +372,7 @@ LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES = {
     "psi @ $psi.CreateNoWindow = $true", "psi @ $psi.FileName = @(Get-Command git -CommandType Application)[0].Source",
     "psi @ $psi.RedirectStandardError = $true", "psi @ $psi.RedirectStandardOutput = $true", "psi @ $psi.UseShellExecute = $false",
     "psi @ [void]$psi.ArgumentList.Add($a)",
-    "savedenv @ $savedEnv = @{}", "savedenv @ $savedEnv.Keys", "savedenv @ $savedEnv[$v] = (Get-Item -LiteralPath \"Env:$v\").Value",
+    "savedenv @ $savedEnv = @{}", "savedenv @ $savedEnv.Keys", "savedenv @ $savedEnv[$v] = $found.Value",
     "savedenv @ Set-Item -LiteralPath \"Env:$v\" -Value $savedEnv[$v]",
     "shape @ $cap = Invoke-DirtyGitCapture -Wt $Wt -GitArgs (@('diff', 'HEAD') + $shape)",
     "shape @ $shape = @('--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--submodule=short', '--ignore-submodules=none', '-U3', "
@@ -387,7 +387,51 @@ LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES = {
     "stagedtmp @ $tmp, $stagedTmp, $statTmp, $mergeTmp", "stagedtmp @ $why = $stagedTmp.Reason", "stagedtmp @ $why = Test-DirtyTempHeld $stagedTmp",
     "stagedtmp @ & git -C $Wt apply --cached --check -R --whitespace=nowarn $stagedTmp.Path 2>$null", "stagedtmp @ -not $stagedTmp.Path",
     "stagedtmp @ Test-DirtyEvidenceUnchanged -Path $stagedTmp.Path -Full $stagedFull",
-}# a process started, or code reached at run time, from inside the C# payload (the AST cannot see the payload; payload-only so the PowerShell lines that
+}
+# r16 (sol r15b B1): every pin above follows a NAME, and PowerShell reaches a binding by other names too: (Get-Item Variable:psi).Value IS $psi, and
+# Set-Item Variable:isUnc rebinds a call variable. The whole provider / session-state binding class is therefore DEFAULT-DENY, whatever the variable:
+# - every *-Item, *-ItemProperty, *-ChildItem, *-Content and *-Variable call (any alias, any module qualifier) must be one of these exact texts, alone in its
+#   pipeline (so no path, literal or dynamic, arrives by an argument or by pipeline input that is not pinned here);
+# - no string literal anywhere may name the Variable:, Function: or Alias: drive (any case, any quoting, provider-qualified or not);
+# - no variable may be written with a variable:, function: or alias: qualifier ($variable:psi, ${function:x}, $alias:x);
+# - $ExecutionContext, $PSCmdlet and $PSDefaultParameterValues may not be used at all (the last rebinds a pinned cmdlet's parameters; fable r15 hardening), and
+#   no member may be SessionState, SessionStateProxy, PSVariable, InvokeProvider, InvokeCommand or Runspace (how a PSVariable is reached from code);
+# - what a pinned provider call returns ($item, $found, $first) is used only at the sites pinned below.
+# NOT pinned (the census's guarantee stops here): the string VALUE a pinned call's variable path ($Path, $dotGit) holds at run time. A path built from pieces
+# could name a binding there, and the pinned uses of its result only read LinkType / Attributes / Count / the first line, so nothing can be written through it.
+# Nor are writes to preference variables ($ErrorActionPreference and the like): they change how an error is reported, never which object a name binds.
+# WHAT THIS CENSUS PROVES, as a whole: the saver's PowerShell source names only the pinned commands, functions, members, types and scriptblock call variables;
+# every child process it can start, with its argument text and every write that reaches it, is one of the pinned ones; no pinned binding is reached by another
+# name; the one Add-Type compiles exactly the checked payload, and the payload's one NtSetInformationFile call uses class 10. It reads SOURCE: what git does
+# with repository data (config, hooks, attributes) and every run-time race are the saver's own guards, named in its header, not this census.
+LANE_DIRTY_SAVE_PS_PROVIDER_CALLS = {
+    "Get-Item -LiteralPath $Path -Force -ErrorAction Stop",
+    "Get-Item -LiteralPath \"Env:$v\" -ErrorAction SilentlyContinue",
+    "Get-Content -LiteralPath $dotGit -TotalCount 1 -ErrorAction Stop",
+    "Remove-Item -LiteralPath \"Env:$v\" -ErrorAction SilentlyContinue",
+    "Set-Item -LiteralPath \"Env:$v\" -Value $savedEnv[$v]",
+}
+_PS_PROVIDER_FAMILY_RE = re.compile(r"-(?:item|itemproperty|itempropertyvalue|childitem|content|variable)$", re.IGNORECASE)
+_PS_PROVIDER_ALIASES = {
+    "ac", "cat", "clc", "cli", "clp", "clv", "copy", "cp", "cpi", "cpp", "del", "dir", "erase", "gc", "gci", "gi", "gp", "gpv", "gv", "ii", "ls", "mi",
+    "move", "mp", "mv", "ni", "nv", "rd", "ren", "ri", "rm", "rmdir", "rni", "rnp", "rp", "rv", "sc", "set", "si", "sp", "sv", "type",
+}
+_PS_BINDING_DRIVE_RE = re.compile(r"(?:^|[\s'\"(,;|\\/}])(?:[\w.]*\\)?(variable|function|alias)::?", re.IGNORECASE)
+_PS_BINDING_QUALIFIERS = {"variable", "function", "alias"}
+_PS_SESSION_VARIABLES = {"executioncontext", "pscmdlet", "psdefaultparametervalues"}
+_PS_SESSION_MEMBERS = {"sessionstate", "sessionstateproxy", "psvariable", "invokeprovider", "invokecommand", "runspace"}
+LANE_DIRTY_SAVE_PS_PROVIDER_RESULTS = {"item", "found", "first"}
+LANE_DIRTY_SAVE_PS_PROVIDER_RESULT_USES = {
+    "item @ $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop",
+    "item @ $item.LinkType -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)",
+    "item @ $item.Attributes -band [System.IO.FileAttributes]::ReparsePoint",
+    "found @ $found = Get-Item -LiteralPath \"Env:$v\" -ErrorAction SilentlyContinue", "found @ $null -eq $found", "found @ $savedEnv[$v] = $found.Value",
+    "first @ $first = @(Get-Content -LiteralPath $dotGit -TotalCount 1 -ErrorAction Stop)",
+    "first @ $m = if ($first.Count -eq 1) { [regex]::Match($first[0], '^gitdir: (.+?)\\s*$') } else { $null }",
+    "first @ [regex]::Match($first[0], '^gitdir: (.+?)\\s*$')",
+}
+_PS_USE_NAMES = sorted(LANE_DIRTY_SAVE_PS_LAUNCH_OBJECTS | LANE_DIRTY_SAVE_PS_PROVIDER_RESULTS | {"ExecutionContext", "PSCmdlet", "PSDefaultParameterValues"})
+# a process started, or code reached at run time, from inside the C# payload (the AST cannot see the payload; payload-only so the PowerShell lines that
 # legitimately name ProcessStartInfo do not count)
 _PAYLOAD_PROCESS_RE = re.compile(
     r"\bProcess\b|ProcessStartInfo|ShellExecute|CreateProcess|WinExec|\bActivator\b|\bdynamic\b|\bGetType\s*\(|SetEnvironmentVariable"
@@ -484,7 +528,7 @@ def _ps_inventories(texts: list[str]) -> list[dict] | str:
         return "pwsh is not on PATH"
     try:
         proc = subprocess.run(
-            [pwsh, "-NoProfile", "-NonInteractive", "-File", str(PS_AST_INVENTORY), "-UseNames", ",".join(sorted(LANE_DIRTY_SAVE_PS_LAUNCH_OBJECTS))],
+            [pwsh, "-NoProfile", "-NonInteractive", "-File", str(PS_AST_INVENTORY), "-UseNames", ",".join(_PS_USE_NAMES)],
             input=json.dumps(texts).encode("ascii"), capture_output=True, timeout=_PS_INVENTORY_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as error:
         return f"the parser did not run: {type(error).__name__}: {error}"
@@ -617,9 +661,41 @@ def _ps_ast_violations(inv: dict, payload_bodies: list[str]) -> list[str]:
         if parameter["name"].lower() in launch_variables and f"param ${parameter['name']}: {'/'.join(parameter['types'])}" not in LANE_DIRTY_SAVE_PS_LAUNCH_WRITES:
             violations.append(f"{parameter['line']}: a launch variable parameter outside the pinned set: ${parameter['name']}")
     violations += [f"{row['line']}: the launch variable ${row['name']} is passed by [ref]" for row in inv["ref_vars"] if row["name"].lower() in launch_variables]
+    launch_objects = lowered(LANE_DIRTY_SAVE_PS_LAUNCH_OBJECTS)
     for use in inv["uses"]:
-        if f"{use['name'].lower()} @ {use['site']}" not in LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES:
+        if use["name"].lower() in launch_objects and f"{use['name'].lower()} @ {use['site']}" not in LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES:
             violations.append(f"{use['line']}: a launch object used at a site outside the pinned set (an alias or a call through it): ${use['name']} @ {use['site']}")
+    return violations + _ps_binding_violations(inv)
+
+
+def _ps_binding_violations(inv: dict) -> list[str]:
+    """r16 (sol r15b B1): the provider / session-state binding class, default-deny (see the block above LANE_DIRTY_SAVE_PS_PROVIDER_CALLS)."""
+    violations = []
+    what = "provider/session-state binding access"
+    for command in inv["commands"]:
+        name = command["name"]
+        if name is None:
+            continue  # a command named at run time is already a violation
+        base = name.rsplit("\\", 1)[-1].lower()
+        if _PS_PROVIDER_FAMILY_RE.search(base) or base in _PS_PROVIDER_ALIASES:
+            call = " ".join([name] + [element["text"] for element in command["elements"]])
+            if call not in LANE_DIRTY_SAVE_PS_PROVIDER_CALLS or command["pipeline"] != 1:
+                violations.append(f"{command['line']}: {what}: a provider cmdlet call outside the pinned set (its path, literal, dynamic or piped, can name "
+                                  f"a Variable:, Function: or Alias: binding): {call}")
+    for row in inv["strings"]:
+        match = _PS_BINDING_DRIVE_RE.search(row["value"])
+        if match:
+            violations.append(f"{row['line']}: {what}: a string names the {match.group(1)}: drive: {row['value'][:80]!r}")
+    violations += [f"{row['line']}: {what}: scoped variable syntax ${{{row['path']}}}" for row in inv["scoped_vars"]
+                   if row["qualifier"].lower() in _PS_BINDING_QUALIFIERS]
+    for use in inv["uses"]:
+        key = use["name"].lower()
+        if key in _PS_SESSION_VARIABLES:
+            violations.append(f"{use['line']}: {what}: ${use['name']} reaches SessionState or a cmdlet's parameter defaults: {use['site']}")
+        elif key in LANE_DIRTY_SAVE_PS_PROVIDER_RESULTS and f"{key} @ {use['site']}" not in LANE_DIRTY_SAVE_PS_PROVIDER_RESULT_USES:
+            violations.append(f"{use['line']}: {what}: a provider call's result used at a site outside the pinned set: ${use['name']} @ {use['site']}")
+    violations += [f"{member['line']}: {what}: .{member['name']}" for member in inv["members"]
+                   if member["name"] is not None and member["name"].lower() in _PS_SESSION_MEMBERS]
     return violations
 
 
@@ -719,6 +795,21 @@ def lane_dirty_save_violations(source: str | bytes) -> list[str]:
     return lane_dirty_save_violations_many([source])[0]
 
 
+# The saver's two launch loops, by their text: sol's repros name them as lines 569 and 667 of 48959b31, and a row must follow the line, not its number.
+LAUNCH_569 = "    foreach ($a in (@('-C', $Wt) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }"
+LAUNCH_667 = "    foreach ($a in (@('-C', $Wt) + $GitDiffArgs)) { [void]$psi.ArgumentList.Add($a) }"
+
+
+def _line_of(lines: list[str], at: int | str) -> int:
+    """`at` itself when it is a line number, else the 1-based number of the one line that is exactly `at` (a row whose anchor moved must not apply elsewhere)."""
+    if isinstance(at, int):
+        return at
+    found = [number for number, line in enumerate(lines, 1) if line.rstrip("\r\n") == at]
+    if len(found) != 1:
+        raise AssertionError(f"the anchor is on {len(found)} lines, not one: {at!r}")
+    return found[0]
+
+
 def r15_census_rows(text: str) -> dict[str, tuple[str, str]]:
     """name -> (the saver with one sol r14 / fable r14 attack applied, a diagnostic it must produce or '' for any). Each returned [] from the r14 census."""
     lines = text.splitlines(keepends=True)
@@ -729,7 +820,7 @@ def r15_census_rows(text: str) -> dict[str, tuple[str, str]]:
     call = "NtSetInformationFile(h, out io, info, (uint)size, 10);"
     launch_file = "$psi.FileName = @(Get-Command git -CommandType Application)[0].Source"
     launch_info = "$psi = New-Object System.Diagnostics.ProcessStartInfo"
-    before_line = lambda number, inserted: "".join(lines[:number - 1]) + inserted + "\n" + "".join(lines[number - 1:])  # noqa: E731
+    before_line = lambda at, inserted: "".join(lines[:_line_of(lines, at) - 1]) + inserted + "\n" + "".join(lines[_line_of(lines, at) - 1:])  # noqa: E731
     alias_attack = ("$launchAlias = $psi; $launchAlias.FileName = 'pwsh.exe'; $launchAlias.ArgumentList.Add('-NoProfile'); $launchAlias.ArgumentList.Add("
                     "'-NonInteractive'); $launchAlias.ArgumentList.Add('-Command'); $launchAlias.ArgumentList.Add(('New-Item -ItemType {0}{1} -Path "
                     "C:/fixture/out/alias -Value C:/fixture/src.bin; #' -f 'Hard','Link'))")
@@ -806,9 +897,9 @@ def r15_census_rows(text: str) -> dict[str, tuple[str, str]]:
         "A2 a saved env value planted": (at_line_50("$savedEnv['GIT_EXTERNAL_DIFF'] = 'pwsh -c x'"), "written outside the pinned set"),
         "A2 a saved env value added by a method": (at_line_50("$savedEnv.Add('GIT_EXTERNAL_DIFF', 'pwsh -c x')"), "used outside the pinned set"),
         # r15 iter 2 (adversary 39a58424): an alias or a member-chain call changes the launch object; PowerShell's scripting API runs script from C#
-        "B1 iter2 an alias of the launch object before line 569": (before_line(569, alias_attack), "a launch object used at a site outside the pinned set"),
-        "B1 iter2 an alias of the launch object before line 667": (before_line(667, alias_attack), "a launch object used at a site outside the pinned set"),
-        "B1 iter2 a direct ArgumentList.Add": (before_line(569, "$psi.ArgumentList.Add('-c')"), "a launch object used at a site outside the pinned set"),
+        "B1 iter2 an alias of the launch object before line 569": (before_line(LAUNCH_569, alias_attack), "a launch object used at a site outside the pinned set"),
+        "B1 iter2 an alias of the launch object before line 667": (before_line(LAUNCH_667, alias_attack), "a launch object used at a site outside the pinned set"),
+        "B1 iter2 a direct ArgumentList.Add": (before_line(LAUNCH_569, "$psi.ArgumentList.Add('-c')"), "a launch object used at a site outside the pinned set"),
         "B1 iter2 a saved env alias": (at_line_50("$e = $savedEnv; $e['GIT_EXTERNAL_DIFF'] = 'pwsh -c x'"), "a launch object used at a site outside the pinned set"),
         "B1 iter2 a git dir rewritten through an alias": (at_line_50("$d = $gitDir; $d[0] = 'C:/fixture/other'"), "a launch object used at a site outside the pinned set"),
         "B1 iter2 a git argument array passed to a function": (at_line_50("Add-DirtyReuseHold $shape '--ext-diff'"), "a launch object used at a site outside the pinned set"),
@@ -817,6 +908,82 @@ def r15_census_rows(text: str) -> dict[str, tuple[str, str]]:
                                                          "a process start or run-time binding"),
         "B2 iter2 ScriptBlock.Create in the C# payload": (text.replace(call, call + "\nSystem.Management.Automation.ScriptBlock.Create(s).Invoke();", 1),
                                                          "a process start or run-time binding"),
+    }
+
+
+def r16_census_rows(text: str) -> dict[str, tuple[str, str]]:
+    """name -> (the saver with one sol r15b B1 route applied, the binding-access diagnostic it must produce). The provider / session-state binding class:
+    the Variable:, Function: and Alias: drives through any cmdlet or alias, scoped variable syntax, and SessionState reached from $ExecutionContext or $PSCmdlet."""
+    lines = text.splitlines(keepends=True)
+    before_line = lambda at, inserted: "".join(lines[:_line_of(lines, at) - 1]) + inserted + "\n" + "".join(lines[_line_of(lines, at) - 1:])  # noqa: E731
+    at_line_50 = lambda inserted: before_line(50, inserted)  # noqa: E731
+    unc_check = "        if ((& $isUnc $destReal) -and (& $isUnc $wtReal))"
+    before_unc = lambda inserted: text.replace(unc_check, "        " + inserted + "\n" + unc_check, 1)  # noqa: E731
+    digest_item = "        if ($item.LinkType -or"
+    gitfile_first = "            $m = if ($first.Count -eq 1)"
+    file_name = "(Get-Item Variable:psi).Value.FileName = 'C:/fixture/alternate.exe'"
+    expected = "binding access"
+    return {
+        # sol r15b B1, verbatim (the saver's launch sites are lines 569 and 667 at 48959b31; the UNC check is found by its text)
+        "sol B1 Get-Item Variable:psi FileName before 569": (before_line(LAUNCH_569, file_name), expected),
+        "sol B1 Get-Item Variable:psi ArgumentList.Add before 569": (before_line(LAUNCH_569, "(Get-Item Variable:psi).Value.ArgumentList.Add('--version')"), expected),
+        "sol B1 Get-Item Variable:psi ArgumentList.Add before 667": (before_line(LAUNCH_667, "(Get-Item Variable:psi).Value.ArgumentList.Add('--version')"), expected),
+        "sol B1 Get-Item Variable:isUnc before the UNC check": (before_unc("(Get-Item Variable:isUnc).Value = 'Get-Item'"), expected),
+        # the cmdlet families, every way of naming the path
+        "F -LiteralPath": (before_line(LAUNCH_569, "(Get-Item -LiteralPath Variable:psi).Value.FileName = 'x'"), expected),
+        "F -Path quoted in mixed case": (before_line(LAUNCH_569, "(Get-Item -Path 'vArIaBlE:psi').Value.FileName = 'x'"), expected),
+        "F -Path: colon form": (before_line(LAUNCH_569, "(Get-Item -Path:Variable:psi).Value.FileName = 'x'"), expected),
+        "F positional double-quoted upper case": (before_line(LAUNCH_569, "(Get-Item \"VARIABLE:psi\").Value.FileName = 'x'"), expected),
+        "F escaped in a double-quoted string": (before_line(LAUNCH_569, "(Get-Item \"Var`iable:psi\").Value.FileName = 'x'"), expected),
+        "F provider-qualified": (before_line(LAUNCH_569, "(Get-Item -LiteralPath 'Microsoft.PowerShell.Core\\Variable::psi').Value.FileName = 'x'"), expected),
+        "F module-qualified Get-Item": (before_line(LAUNCH_569, "(Microsoft.PowerShell.Management\\Get-Item Variable:psi).Value.FileName = 'x'"), expected),
+        "F Get-Content": (before_line(LAUNCH_569, "(Get-Content Variable:psi).FileName = 'x'"), expected),
+        "F Set-Item": (before_unc("Set-Item Variable:isUnc -Value 'Get-Item'"), expected),
+        "F Set-Item on the alias drive": (at_line_50("Set-Item -LiteralPath Alias:Test-Path -Value Get-Item"), expected),
+        "F New-Item on the function drive": (at_line_50("New-Item -Path Function:Test-Path -Value { $true }"), expected),
+        "F Clear-Item": (before_unc("Clear-Item Variable:isUnc"), expected),
+        "F Copy-Item": (before_unc("Copy-Item Variable:placeFailed Variable:isUnc"), expected),
+        "F Rename-Item": (at_line_50("Rename-Item Function:Get-DirtyKernelPath Test-Path"), expected),
+        "F Remove-Item": (before_unc("Remove-Item Variable:isUnc"), expected),
+        "F Get-ChildItem": (before_line(LAUNCH_569, "(Get-ChildItem Variable: | Where-Object { $_.Name -eq 'psi' }).Value.FileName = 'x'"), expected),
+        "F Get-ItemProperty": (before_line(LAUNCH_569, "$x = Get-ItemProperty -LiteralPath Variable:psi -Name Value"), expected),
+        "F Set-ItemProperty": (before_unc("Set-ItemProperty Variable:isUnc -Name Value -Value 'Get-Item'"), expected),
+        "F Set-Content on the function drive": (at_line_50("Set-Content -Path Function:Test-Path -Value 'param($LiteralPath) $true'"), expected),
+        "F Get-Variable": (before_line(LAUNCH_569, "(Get-Variable psi -ValueOnly).FileName = 'x'"), expected),
+        "F Set-Variable": (before_unc("Set-Variable -Name isUnc -Value 'Get-Item'"), expected),
+        "F New-Variable -Force": (before_unc("New-Variable isUnc 'Get-Item' -Force"), expected),
+        "F Remove-Variable": (before_unc("Remove-Variable isUnc"), expected),
+        "F the gi alias": (before_line(LAUNCH_569, "(gi Variable:psi).Value.FileName = 'x'"), expected),
+        "F the gv alias": (before_line(LAUNCH_569, "(gv psi).Value.FileName = 'x'"), expected),
+        "F the sv alias": (before_unc("sv isUnc 'Get-Item'"), expected),
+        # a dynamic path: the drive is not in the text
+        "D a path built from pieces in a variable": (before_line(LAUNCH_569, "$p = 'Vari' + 'able:psi'; (Get-Item -LiteralPath $p).Value.FileName = 'x'"), expected),
+        "D a drive in an expandable string": (before_line(LAUNCH_569, "$d = 'Variable'; (Get-Item \"${d}:psi\").Value.FileName = 'x'"), expected),
+        "D a parenthesized path": (before_line(LAUNCH_569, "(Get-Item -LiteralPath ('Vari' + 'able:psi')).Value.FileName = 'x'"), expected),
+        "D a path from the pipeline": (before_line(LAUNCH_569, "('Variable:psi' | Get-Item).Value.FileName = 'x'"), expected),
+        "D a path added to a pinned call": (text.replace("Get-Item -LiteralPath $Path -Force", "Get-Item -LiteralPath $Path, 'Variable:psi' -Force", 1), expected),
+        "D the pinned digest item written through": (text.replace(digest_item, "        $item.Value.FileName = 'x'\n" + digest_item, 1), expected),
+        "D the pinned gitfile line written through": (text.replace(gitfile_first, "            $first[0].FileName = 'x'\n" + gitfile_first, 1), expected),
+        # scoped variable syntax
+        "V $variable:psi": (before_line(LAUNCH_569, "$variable:psi.FileName = 'x'"), expected),
+        "V ${variable:psi}": (before_line(LAUNCH_569, "${variable:psi}.ArgumentList.Add('-c')"), expected),
+        "V $VARIABLE:isUnc": (before_unc("$VARIABLE:isUnc = 'Get-Item'"), expected),
+        "V ${Variable:isUnc}": (before_unc("${Variable:isUnc} = 'Get-Item'"), expected),
+        "V ${Function:...}": (at_line_50("${Function:Get-DirtyKernelPath} = { 'x' }"), expected),
+        "V $alias:": (at_line_50("$alias:gi = 'Invoke-Expression'"), expected),
+        # SessionState
+        "S $ExecutionContext PSVariable.Get": (before_line(LAUNCH_569, "$ExecutionContext.SessionState.PSVariable.Get('psi').Value.FileName = 'x'"), expected),
+        "S $ExecutionContext PSVariable.Set": (before_unc("$ExecutionContext.SessionState.PSVariable.Set('isUnc', 'Get-Item')"), expected),
+        "S lower-case $executioncontext GetValue": (before_line(LAUNCH_569, "$executioncontext.SessionState.PSVariable.GetValue('psi').ArgumentList.Add('-c')"), expected),
+        "S $PSCmdlet": (before_unc("$PSCmdlet.SessionState.PSVariable.Set('isUnc', 'Get-Item')"), expected),
+        "S SessionState through an alias": (before_unc("$s = $ExecutionContext.SessionState; $s.PSVariable.Set('isUnc', 'Get-Item')"), expected),
+        "S ${global:ExecutionContext}": (before_unc("${global:ExecutionContext}.SessionState.PSVariable.Set('isUnc', 'Get-Item')"), expected),
+        "S InvokeProvider": (before_line(LAUNCH_569, "$ExecutionContext.InvokeProvider.Item.Get('Variable:psi')[0].Value.FileName = 'x'"), expected),
+        "S the default runspace": (before_unc("[runspace]::DefaultRunspace.SessionStateProxy.SetVariable('isUnc', 'Get-Item')"), expected),
+        "S $Host.Runspace": (before_unc("$Host.Runspace.SessionStateProxy.SetVariable('isUnc', 'Get-Item')"), expected),
+        # fable r15 hardening (LANE-DIRTY-SAVE-CENSUS-PREFERENCE-WRITES-1): a parameter default reaches a pinned cmdlet without touching its call text
+        "S $PSDefaultParameterValues": (at_line_50("$PSDefaultParameterValues['Add-Type:OutputAssembly'] = 'x.dll'"), expected),
+        "S $global:PSDefaultParameterValues": (at_line_50("$global:PSDefaultParameterValues.Add('Resolve-Path:Relative', $true)"), expected),
     }
 
 
@@ -1031,6 +1198,24 @@ class NoHardLinkCreationTests(unittest.TestCase):
         with mock.patch(f"{__name__}._ps_member_name_violation", lambda member: None):
             with self.assertRaises(AssertionError):
                 self._assert_r15_rows_rejected_quietly()
+
+    def _assert_r16_rows_rejected(self) -> None:
+        """Every row of r16_census_rows() gives the binding-access diagnostic (the class rule, not a pinned-name miss)."""
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        rows = r16_census_rows(text)
+        found = dict(zip(rows, lane_dirty_save_violations_many([mutant for mutant, _ in rows.values()])))
+        missed = [name for name, (mutant, expected) in rows.items() if mutant == text or not any(expected in violation for violation in found[name])]
+        self.assertEqual(missed, [], {name: found[name] for name in missed})
+
+    def test_the_lane_dirty_saver_census_rejects_provider_and_session_state_binding_access(self) -> None:
+        # r16 (sol r15b B1): a Variable:, Function: or Alias: provider path, scoped variable syntax or SessionState reaches a binding by another name
+        self._assert_r16_rows_rejected()
+
+    def test_dropping_the_binding_access_rule_turns_the_r16_rows_red(self) -> None:
+        # mutation test: without the binding-access rule the r16 rows lose their class diagnostic, so the row test above fails
+        with mock.patch(f"{__name__}._ps_binding_violations", lambda inv: []):
+            with self.assertRaises(AssertionError):
+                self._assert_r16_rows_rejected()
 
     def _assert_r15_rows_rejected_quietly(self) -> None:
         text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")

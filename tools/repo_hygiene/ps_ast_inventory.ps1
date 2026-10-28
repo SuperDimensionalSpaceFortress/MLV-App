@@ -1,4 +1,4 @@
-# ps_ast_inventory.ps1 - LANE-HUBCHAT-DETACHED-DISPATCH-1 r15 (folds LANE-DIRTY-SAVE-CENSUS-PS-AST-1).
+# ps_ast_inventory.ps1 - LANE-HUBCHAT-DETACHED-DISPATCH-1 r15 (folds LANE-DIRTY-SAVE-CENSUS-PS-AST-1); r16 adds scoped_vars and strings (sol r15b B1).
 # Reads a JSON array of PowerShell source texts on stdin and writes a JSON array of inventories on stdout, one per text, in order.
 # It only PARSES ([System.Management.Automation.Language.Parser]::ParseInput); nothing in a text is run, imported or compiled.
 # The parser has already resolved backticks, whitespace, quoting and escapes, so a name read here is the name PowerShell binds, whatever its spelling.
@@ -13,7 +13,10 @@
 #               args = AST types of the invoked arguments
 #   functions   [{line, name}]
 #   types       [{line, name, where}]                  type literals, type constraints and attributes
-#   drive_vars  [{line, path, drive}]                  ${drive:name} references (function:, alias:, env:, variable:, ...)
+#   drive_vars  [{line, path, drive}]                  ${drive:name} references (function:, alias:, env:, ...; the parser does NOT count variable: as a drive)
+#   scoped_vars [{line, path, qualifier}]              every variable reference written with a qualifier ($variable:x, ${function:x}, $global:x, $env:x, ...) (r16)
+#   strings     [{line, value}]                        every string literal (an expandable string unexpanded) that holds a ':', so a provider path in any
+#                                                      argument, pipeline input or assignment is seen (r16)
 #   assignments [{line, name, names, operator, right}] name = the one variable assigned (null otherwise); names = every variable on the left;
 #                                                      right = AST type of the assigned expression
 #   foreach_vars [{line, name}]
@@ -31,7 +34,8 @@ $ErrorActionPreference = 'Stop'
 function Get-UnqualifiedName($VariablePath) {
     $path = [string]$VariablePath.UserPath
     if ($VariablePath.IsDriveQualified) { return $path }
-    return ($path -replace '^(?i)(global|script|local|private|using|workflow):', '')
+    # variable: is the variable provider's own qualifier, not a drive to the parser: $variable:psi IS $psi (r16, sol r15b B1)
+    return ($path -replace '^(?i)(global|script|local|private|using|workflow|variable):', '')
 }
 
 function Get-ExpressionKind($Statement) {
@@ -65,7 +69,7 @@ function Get-Inventory([string]$Text) {
     $errors = $null
     $root = [System.Management.Automation.Language.Parser]::ParseInput($Text, [ref]$tokens, [ref]$errors)
     $inv = [ordered]@{
-        errors = @(); commands = @(); members = @(); functions = @(); types = @(); drive_vars = @(); assignments = @()
+        errors = @(); commands = @(); members = @(); functions = @(); types = @(); drive_vars = @(); scoped_vars = @(); strings = @(); assignments = @()
         foreach_vars = @(); params = @(); ref_vars = @(); uses = @(); using = @(); requires = [ordered]@{ modules = 0; assemblies = 0; snapins = 0 }; other = @()
     }
     foreach ($e in @($errors)) { $inv.errors += [ordered]@{ line = $e.Extent.StartLineNumber; message = $e.Message } }
@@ -129,7 +133,13 @@ function Get-Inventory([string]$Text) {
             { $_ -is [System.Management.Automation.Language.TypeExpressionAst] } { $inv.types += [ordered]@{ line = $line; name = $node.TypeName.FullName; where = 'literal' }; break }
             { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } { $inv.types += [ordered]@{ line = $line; name = $node.TypeName.FullName; where = 'constraint' }; break }
             { $_ -is [System.Management.Automation.Language.AttributeAst] } { $inv.types += [ordered]@{ line = $line; name = $node.TypeName.FullName; where = 'attribute' }; break }
+            { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] -or $_ -is [System.Management.Automation.Language.ExpandableStringExpressionAst] } {
+                if ([string]$node.Value -match ':') { $inv.strings += [ordered]@{ line = $line; value = [string]$node.Value } }
+                break
+            }
             { $_ -is [System.Management.Automation.Language.VariableExpressionAst] } {
+                $userPath = [string]$node.VariablePath.UserPath
+                if ($userPath -match '^([^:]+):') { $inv.scoped_vars += [ordered]@{ line = $line; path = $userPath; qualifier = $Matches[1] } }
                 if ($node.VariablePath.IsDriveQualified) { $inv.drive_vars += [ordered]@{ line = $line; path = $node.VariablePath.UserPath; drive = $node.VariablePath.DriveName } }
                 elseif ($useNameList -contains (Get-UnqualifiedName $node.VariablePath)) { $inv.uses += [ordered]@{ line = $line; name = (Get-UnqualifiedName $node.VariablePath); site = (Get-UseSite $node) } }
                 break
@@ -172,6 +182,6 @@ $texts = @([Console]::In.ReadToEnd() | ConvertFrom-Json -NoEnumerate)
 if ($texts.Count -eq 1 -and $texts[0] -is [System.Array]) { $texts = @($texts[0]) }
 $out = @(foreach ($t in $texts) {
     # one text that the inventory cannot read fails itself (an error row the caller reports), never the batch
-    try { Get-Inventory ([string]$t) } catch { [ordered]@{ errors = @([ordered]@{ line = 0; message = "inventory failed: $($_.Exception.Message)" }); commands = @(); members = @(); functions = @(); types = @(); drive_vars = @(); assignments = @(); foreach_vars = @(); params = @(); ref_vars = @(); uses = @(); using = @(); requires = [ordered]@{ modules = 0; assemblies = 0; snapins = 0 }; other = @() } }
+    try { Get-Inventory ([string]$t) } catch { [ordered]@{ errors = @([ordered]@{ line = 0; message = "inventory failed: $($_.Exception.Message)" }); commands = @(); members = @(); functions = @(); types = @(); drive_vars = @(); scoped_vars = @(); strings = @(); assignments = @(); foreach_vars = @(); params = @(); ref_vars = @(); uses = @(); using = @(); requires = [ordered]@{ modules = 0; assemblies = 0; snapins = 0 }; other = @() } }
 })
 [Console]::Out.Write((ConvertTo-Json -InputObject $out -Depth 8 -Compress -EscapeHandling EscapeNonAscii))

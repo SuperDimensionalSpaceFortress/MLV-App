@@ -32,6 +32,12 @@
 # Read-only on the worktree (nothing is restored, so the caller's refusal and exit code are unchanged), idempotent (same diff = same name), fail-soft (never throws), and it
 # refuses a directory that is not itself a worktree root (that would resolve to an ENCLOSING repo and save its diff). The same logic is deployed board-local in
 # hub-autopilot\dispatch-fix-round.ps1; keep the two in step.
+# The caller's GIT_* variables are captured and cleared inside the try whose finally puts them back: a throw while they are captured is DIRTY_TREE_SAVE_FAILED with
+# every one captured so far restored, and a variable gone between its check and its read is treated as absent (r16, sol r15b B2).
+# Still open, as successor work (not guarded here): metadata changed and changed back between two checks, a junction INTO the worktree, a link made to a placed
+# file after its flush, the dispatcher-to-saver identity handoff, parity with the board-local copy, a destination that is an ignored directory inside some other
+# worktree, git reading repository config (aliases, fsmonitor, diff drivers) from the worktree it is pointed at, and deadlines / output buffering on git calls.
+# What the source of this file may contain is pinned by tools/repo_hygiene/test_owner_footage_no_hardlink_class.py (its comments state what that census proves).
 # Moves $Tmp to <Dir>\<Stem><first 8|16|32|64 hex of $Full><Ext> and returns @{ Path; Id; Moved }, or @{ Path = $null; Reason } when it cannot place it (below).
 # The move fails rather than overwrites, so an occupied name is compared by hash (same bytes = reuse, anything else = lengthen the name) and never clobbered.
 # When the name already holds these exact bytes it is reused: the result then carries ReuseHold (the open handle those bytes were hashed through, which the caller
@@ -733,8 +739,16 @@ function Save-DirtyWorktreeEvidenceInGate([string]$Wt, [string]$Dest, [string]$C
     # These variables change which repository git reads or the shape of the diff it writes; GIT_DIFF_OPTS=--unified=0, for one, beats the explicit -U3.
     $gitEnv = 'GIT_DIFF_OPTS', 'GIT_EXTERNAL_DIFF', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX'
     $savedEnv = @{}
-    foreach ($v in $gitEnv) { if (Test-Path -LiteralPath "Env:$v") { $savedEnv[$v] = (Get-Item -LiteralPath "Env:$v").Value; Remove-Item -LiteralPath "Env:$v" } }  # removed, not emptied: git reads an empty GIT_DIR as a path
     try {
+        # Captured INSIDE the try whose finally restores them (r16, sol r15b B2): a throw here is DIRTY_TREE_SAVE_FAILED with every variable captured so far put back.
+        # A variable gone between its check and its read was not there to save: it is absent, and nothing is put back for it. Removed, not emptied: git reads an empty GIT_DIR as a path.
+        foreach ($v in $gitEnv) {
+            if (-not (Test-Path -LiteralPath "Env:$v")) { continue }
+            $found = Get-Item -LiteralPath "Env:$v" -ErrorAction SilentlyContinue
+            if ($null -eq $found) { continue }
+            $savedEnv[$v] = $found.Value
+            Remove-Item -LiteralPath "Env:$v" -ErrorAction SilentlyContinue
+        }
         # PowerShell decodes git's output with [Console]::OutputEncoding; under an ASCII or OEM console a UTF-8 file name would come back as '??' and be saved under the wrong name (r5 adversary A4).
         try { $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { $prevEnc = $null }
         if (-not (Test-Path -LiteralPath $Dest -PathType Container)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=no-run-dir" }
@@ -1012,6 +1026,6 @@ function Save-DirtyWorktreeEvidenceInGate([string]$Wt, [string]$Dest, [string]$C
         foreach ($h in $metaLocks) { Unlock-DirtyDirectory $h }
         Unlock-DirtyDirectory $wtLock; Unlock-DirtyDirectory $destLock  # released only after the temp cleanup, which still runs inside the held destination
         foreach ($v in 'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE') { Remove-Item -LiteralPath "Env:$v" -ErrorAction SilentlyContinue }  # the pins set above; the caller's own values come back next
-        foreach ($v in $savedEnv.Keys) { Set-Item -LiteralPath "Env:$v" -Value $savedEnv[$v] }
+        foreach ($v in $savedEnv.Keys) { try { Set-Item -LiteralPath "Env:$v" -Value $savedEnv[$v] } catch { } }  # one that cannot be put back never stops the rest, nor throws out of a fail-soft helper (r16)
     }
 }
