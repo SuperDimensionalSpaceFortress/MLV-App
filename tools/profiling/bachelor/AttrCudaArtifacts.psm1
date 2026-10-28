@@ -2319,8 +2319,12 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
     # every entry and its order kept, only `reason` set
     if ($Report -is [System.Collections.IDictionary]) {
         $keys = @($Report.PSBase.Keys)
-        $folded = @($keys | ForEach-Object { if ($_ -is [string]) { $_.ToLowerInvariant() } else { $null } })
-        if ($folded -contains $null -or @($folded | Select-Object -Unique).Count -ne $keys.Count) {
+        # r5 adversary A1 on c1186f3e: no hand-made case fold matches the copy's own comparer (U+03A3 and U+03C2 differ in lower case and merge in upper case), so the keys are put
+        # into the very structures the plain copy uses and any entry they merge sends the report down the exact-key path
+        $probe = [ordered]@{}
+        foreach ($key in $keys) { $probe[[string]$key] = $true }
+        $probeNames = @(([pscustomobject]$probe).PSObject.Properties)
+        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $keys.Count -or $probeNames.Count -ne $keys.Count) {
             # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
             $values = @($Report.PSBase.Values)
             $exact = [System.Collections.Specialized.OrderedDictionary]::new()
@@ -2398,8 +2402,12 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     # r5 (sol B2): a dictionary whose keys differ only by case or are no strings comes back as an exact-key ordered dictionary instead (as in Add-AttrCudaPresentMonEventsLostDetailToReport)
     if ($Report -is [System.Collections.IDictionary]) {
         $keys = @($Report.PSBase.Keys)
-        $folded = @($keys | ForEach-Object { if ($_ -is [string]) { $_.ToLowerInvariant() } else { $null } })
-        if ($folded -contains $null -or @($folded | Select-Object -Unique).Count -ne $keys.Count) {
+        # r5 adversary A1 on c1186f3e: no hand-made case fold matches the copy's own comparer (U+03A3 and U+03C2 differ in lower case and merge in upper case), so the keys are put
+        # into the very structures the plain copy uses and any entry they merge sends the report down the exact-key path
+        $probe = [ordered]@{}
+        foreach ($key in $keys) { $probe[[string]$key] = $true }
+        $probeNames = @(([pscustomobject]$probe).PSObject.Properties)
+        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $keys.Count -or $probeNames.Count -ne $keys.Count) {
             # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
             $values = @($Report.PSBase.Values)
             $exact = [System.Collections.Specialized.OrderedDictionary]::new()

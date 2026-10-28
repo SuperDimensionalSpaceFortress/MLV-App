@@ -403,6 +403,17 @@ class ModuleFunctionTests(unittest.TestCase):
             self.assertEqual((got["status"], got["upper"], got["original"]), ("S", "OTHER", "r"), helper)
             self.assertTrue(got["reason"].startswith("r ["), (helper, got["reason"]))
 
+    def test_r5_a1_keys_that_merge_only_in_upper_case_are_kept_by_both_helpers(self) -> None:
+        # r5 adversary A1 on c1186f3e: U+03A3 and U+03C2 differ in lower case, so a lower-case fold saw no collision, but the case-insensitive copy merged them and FIRST was lost
+        for helper in self.HELPERS:
+            got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                            "$report.Add('status', 'S'); $report.Add('reason', 'r'); $report.Add([string][char]0x03A3, 'FIRST'); $report.Add([string][char]0x03C2, 'SECOND')\n"
+                            f"$r = {self.HELPERS[helper]}\n"
+                            "$isDictionary = $r -is [System.Collections.IDictionary]\n"
+                            "$values = if ($isDictionary) { @($r.PSBase.Values) } else { @($r.PSObject.Properties.Value) }\n"
+                            "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ count = @($values).Count; values = @($values | ForEach-Object { [string]$_ } | Where-Object { $_ -in @('S', 'FIRST', 'SECOND') }) }) -Compress))")
+            self.assertEqual((got["count"], got["values"]), (4, ["S", "FIRST", "SECOND"]), helper)
+
     # --- r5 (sol B3 on 2c226cd8, generic-sweep-record): IDictionary.Contains(string) on a Dictionary[string,object] threw, and the silent catch returned the bare report: the typed
     # PRESENTMON_ORPHAN_SWEEP_INCOMPLETE detail was lost. A generic record is read now; a record that cannot be read at all is named in the detail, never dropped.
     def test_r5_b3_a_generic_dictionary_sweep_record_keeps_the_detail(self) -> None:
