@@ -40,13 +40,18 @@ function ConvertFrom-VenueProbeHeatLine {
     # heat{} as numbers (mean_c to 0.01, culture-invariant JSON), so it is read FIRST; the "tele heat" display line (mean to 0.1 C, in the probe's culture,
     # a decimal comma included) is only the fallback. Neither readable, or n/a values -> heat 'unknown'.
     param([AllowNull()][AllowEmptyCollection()][string[]]$Lines)
-    $rawLine = @($Lines | Where-Object { $_ -match '^\s*raw (?!UNWRITABLE )(.+\.json)\s*$' }) | Select-Object -Last 1
-    if ($rawLine -and $rawLine -match '^\s*raw (.+\.json)\s*$') {
+    # adversary r1b A3: the LAST raw line, UNWRITABLE included, is the final probe's: an earlier probe's file is never read in place of a final write that failed
+    $rawLine = @($Lines | Where-Object { $_ -match '^\s*raw ' }) | Select-Object -Last 1
+    if ($rawLine -and $rawLine -notmatch '^\s*raw UNWRITABLE ' -and $rawLine -match '^\s*raw (.+\.json)\s*$') {
         $h = try { $p = $Matches[1].Trim(); if (Test-Path -LiteralPath $p -PathType Leaf) { ([IO.File]::ReadAllText($p) | ConvertFrom-Json).heat } else { $null } } catch { $null }
-        if ($null -ne $h -and $h.PSObject.Properties['mean_c'] -and $h.PSObject.Properties['throttled'] -and $h.PSObject.Properties['window_rows']) {
-            $v = Get-VenueHeatVerdict -Throttled $h.throttled -MeanC $h.mean_c
+        if ($null -ne $h -and $h -is [System.Management.Automation.PSCustomObject] -and $h.PSObject.Properties['mean_c'] -and $h.PSObject.Properties['throttled'] -and $h.PSObject.Properties['window_rows']) {
+            # adversary r1b A8: a count that is not a whole number in Int32 range is not a reading: the display line is used instead, never a throw
+            $thr = 0; $win = 0; $mean = 0.0
+            $okT = [int]::TryParse([string]$h.throttled, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$thr)
+            $okW = [int]::TryParse([string]$h.window_rows, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$win)
+            $okM = [double]::TryParse([string]$h.mean_c, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)
+            $v = $(if ($okT -and $okW -and $okM) { Get-VenueHeatVerdict -Throttled $thr -MeanC $mean } else { 'unknown' })
             if ($v -cne 'unknown') {
-                $thr = [int]$h.throttled; $win = $(if ($null -ne $h.window_rows) { [int]$h.window_rows } else { $null }); $mean = [double]$h.mean_c
                 return [pscustomobject]@{ heat = $v; throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.00', $script:Inv)) C"; source = 'raw-json' }
             }
         }
@@ -74,7 +79,8 @@ function Get-VenueThermalGateStep {
     )
     $first = $FirstHotUtc
     if ($Heat -ceq 'hot' -and $null -eq $first) { $first = $NowUtc }
-    $waited = $(if ($null -ne $first) { [int][Math]::Max(0, [Math]::Floor(($NowUtc - $first).TotalSeconds)) } else { 0 })
+    # adversary r1b A7: clamped before the Int32 cast (a decades-old first reading is simply past any cap)
+    $waited = $(if ($null -ne $first) { [int][Math]::Min([double][int]::MaxValue, [Math]::Max(0.0, [Math]::Floor(($NowUtc - $first).TotalSeconds))) } else { 0 })
     $step = $(if ($Heat -cne 'hot') { 'RUN' } elseif ($waited -ge $CapSec) { 'SKIP' } else { 'WAIT' })
     [pscustomobject]@{ step = $step; firstHotUtc = $first; waitSec = $waited; remainingSec = $(if ($step -ceq 'WAIT') { $CapSec - $waited } else { 0 }) }
 }
@@ -98,7 +104,9 @@ function Get-VenueHeavyLegKeys {
         if ($null -eq $r) { continue }
         if ([string]$r.batch -cne [string]$lastBatch) { $lastBatch = [string]$r.batch; $lastRanKey = $null }
         if ([string]$r.heat -ceq 'hot' -and $null -ne $lastRanKey) { $heavy[$lastRanKey] = 1 + $(if ($heavy.Contains($lastRanKey)) { $heavy[$lastRanKey] } else { 0 }) }
-        if ([string]$r.status -ceq 'RAN') { $lastRanKey = [string]$r.key }
+        # adversary r1b A5: the predecessor is the last leg that LAUNCHED (RAN, LEG_FAILED, LEASE_EXPIRED); a row of unknown identity (a $null key) is a barrier, so
+        # heat is never charged across it. A leg that never launched (THERMAL_HOT_SKIPPED, a RETRY whose own re-check failed) leaves the predecessor as it was.
+        if ([string]$r.status -cnotin @('THERMAL_HOT_SKIPPED', 'RETRY')) { $lastRanKey = $(if ($r.key) { [string]$r.key } else { $null }) }
     }
     $heavy
 }
@@ -124,10 +132,10 @@ function Read-VenueLegHeatHistory {
             $lease = $(if ($b.PSObject.Properties['token'] -and $b.token) { [string]$b.token } elseif ($b.PSObject.Properties['batch']) { "batch$($b.batch)" } else { "line$($rows.Count)" })
             $unnamed = 0
             foreach ($l in @($b.legs)) {
-                if ($null -eq $l -or $l -isnot [System.Management.Automation.PSCustomObject]) { continue }
-                # adversary r1 A5: a scalar-run row carries no leg name (Add-PlanIdentity names -LegPlan rows only): counted and named in .skipped, never silently dropped
-                if (-not $l.PSObject.Properties['name'] -or -not $l.name) { $unnamed++; continue }
-                if (-not $l.PSObject.Properties['status']) { $unnamed++; continue }
+                # adversary r1 A5: a scalar-run row carries no leg name (Add-PlanIdentity names -LegPlan rows only): counted and named in .skipped, never silently dropped.
+                # r1b A5: it stays in the sequence as a barrier row (key $null), so a hot leg after it is never charged to the leg before it.
+                $bad = ($null -eq $l -or $l -isnot [System.Management.Automation.PSCustomObject] -or -not $l.PSObject.Properties['name'] -or -not $l.name -or -not $l.PSObject.Properties['status'])
+                if ($bad) { $unnamed++; $rows.Add([pscustomobject]@{ batch = "$d.$lease"; key = $null; name = $null; status = 'UNKNOWN'; heat = 'unknown' }); continue }
                 $backend = $(if ($l.PSObject.Properties['backend']) { [string]$l.backend } else { '' })
                 $arm = $(if ($l.PSObject.Properties['arm']) { [string]$l.arm } else { '' })
                 $heat = 'unknown'

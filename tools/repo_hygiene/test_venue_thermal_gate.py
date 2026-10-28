@@ -138,10 +138,34 @@ class ThermalGateModuleTests(unittest.TestCase):
                 # A5: a scalar run's rows carry no name: named in skipped, not silently dropped
                 {"batch": 3, "token": "t3", "legs": [{"status": "RAN", "class": "QUIET_PRELOAD_OK"}, {"status": "RAN"}]}]
         (d / "batches.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
-        got = ps_json(f"$h = Read-VenueLegHeatHistory -RunDir @('{d}'); $k = Get-VenueHeavyLegKeys -Rows @($h.rows); [pscustomobject]@{{ rows = @($h.rows).Count; heavy = @($k.Keys); skipped = @($h.skipped) }}")
+        got = ps_json(f"$h = Read-VenueLegHeatHistory -RunDir @('{d}'); $k = Get-VenueHeavyLegKeys -Rows @($h.rows); [pscustomobject]@{{ rows = @($h.rows | Where-Object {{ $_.key }}).Count; heavy = @($k.Keys); skipped = @($h.skipped) }}")
         self.assertEqual((got["rows"], got["heavy"]), (2, []), got)
         self.assertTrue(any("2 leg rows with no leg name" in s for s in got["skipped"]), got["skipped"])
         self.assertTrue(any("1 leg rows with no leg name or status" in s for s in got["skipped"]), got["skipped"])
+
+    def test_adversary_r1b_a3_a8_a7_a5_final_probe_raw_overflow_dates_and_barriers(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-r1b-"))
+        old = d / "p1.json"
+        old.write_text(json.dumps({"heat": {"mean_c": 70, "throttled": 0, "window_rows": 60}}), encoding="utf-8")
+        # A3: the final probe's raw write failed: its own tele line (hot) is read, never the earlier probe's clear file
+        got = ps_json(f"ConvertFrom-VenueProbeHeatLine -Lines @('  raw {old}', '  raw UNWRITABLE Access denied', 'QUIET mean=7.0%', "
+                      "'  tele heat source=x age=1.0s hottest=89.0C max15=89.0C mean=89.0C throttled=0/60 W=10')")
+        self.assertEqual((got["heat"], got["source"]), ("hot", "tele-line"))
+        # A8: an overflowing raw count falls back to the line, never a throw
+        ovf = d / "ovf.json"
+        ovf.write_text(json.dumps({"heat": {"mean_c": 70, "throttled": 2147483648, "window_rows": 60}}), encoding="utf-8")
+        got = ps_json(f"ConvertFrom-VenueProbeHeatLine -Lines @('  raw {ovf}', '  tele heat mean=70.0C throttled=0/60 W=1')")
+        self.assertEqual((got["heat"], got["source"]), ("clear", "tele-line"))
+        # A7: extreme accepted dates are past the cap, never an Int32 overflow
+        got = ps("(Get-VenueThermalGateStep -Heat hot -FirstHotUtc ([datetime]::MinValue) -NowUtc ([datetime]::MaxValue) -CapSec 180).step")
+        self.assertEqual(got, "SKIP")
+        # A5: a LEG_FAILED leg launched, so it is the predecessor; a barrier row (unknown identity) charges nobody
+        rows = json.dumps([{"batch": "1.t", "key": "light|cpu", "status": "RAN", "heat": "clear"}, {"batch": "1.t", "key": "failed|cpu", "status": "LEG_FAILED", "heat": "clear"},
+                           {"batch": "1.t", "key": "next|cpu", "status": "RAN", "heat": "hot"}, {"batch": "1.t", "key": None, "status": "UNKNOWN", "heat": "unknown"},
+                           {"batch": "1.t", "key": "after|cpu", "status": "RAN", "heat": "hot"}])
+        got = ps_json(f"$h = Get-VenueHeavyLegKeys -Rows @(ConvertFrom-Json -InputObject '{rows}'); [pscustomobject]$h")
+        self.assertEqual(got, {"failed|cpu": 1})
 
     def test_gate_step_paths_wait_cool_run_and_cap_skip(self) -> None:
         # a stub clock and a stub heat sequence through the pure step: wait (hot, under the cap), cool (clear -> run, waitSec kept), cap skip (hot at 180 s)
@@ -206,7 +230,7 @@ class ThermalGateRunnerTests(unittest.TestCase):
         tvlb.VenueLeaseBatchRunnerTests.tearDownClass.__func__(cls)
 
     def run_batch(self, specs, *extra: str, **env: str) -> subprocess.CompletedProcess:
-        args, e = self.batch_cmd(specs, "-ThermalPollSec", "1", *extra, **env)
+        args, e = self.batch_cmd(specs, *(() if "-ThermalPollSec" in extra else ("-ThermalPollSec", "1")), *extra, **env)
         return subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
 
     def log(self) -> str:
@@ -253,6 +277,13 @@ class ThermalGateRunnerTests(unittest.TestCase):
         self.assertEqual((res["ran"], res["thermalSkipped"]), (0, 1))
         self.assertEqual(res["legs"][0]["status"], "THERMAL_HOT_SKIPPED")
         self.assertFalse(res["legs"][0]["requeued"])
+
+    def test_adversary_r1b_a2_a_long_poll_shortens_the_sleep_instead_of_skipping(self) -> None:
+        # a poll longer than the cap used to turn the first hot reading into an immediate permanent skip (exit 7); the sleep is shortened to fit instead
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "8", "-ThermalPollSec", "600", "-ThermalRequeueMax", "0", FAKE_HEAT="9,0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["legs"][0]["status"], b["legs"][0]["heatAtLaunch"], b["thermalWaits"], b["thermalSkips"]), ("RAN", "clear", 1, 0), b["legs"])
 
     def test_unknown_heat_is_not_gated(self) -> None:
         r = self.run_batch([self.specs[0]], FAKE_HEAT="NA")

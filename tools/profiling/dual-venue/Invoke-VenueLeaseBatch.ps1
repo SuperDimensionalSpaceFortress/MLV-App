@@ -1061,6 +1061,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 $attempt++
                 $probeWait = [int][Math]::Max(0, [Math]::Min($ProbeMaxWaitSec, $room - $legBudget))
+                # adversary r1b A1: a re-probe during a thermal wait may wait for quiet only for what is left of the thermal cap (its fixed sample window still runs)
+                $thw = $legThermal[$leg.name]
+                if ($ThermalWaitCapSec -gt 0 -and $null -ne $thw -and $null -ne $thw.firstHotUtc -and $thw.batch -eq $batchNo) {
+                    $probeWait = [int][Math]::Max(0, [Math]::Min($probeWait, $ThermalWaitCapSec - [Math]::Floor(([DateTime]::UtcNow - $thw.firstHotUtc).TotalSeconds)))
+                }
                 $tProbe = [DateTime]::UtcNow
                 $q = Invoke-QuietProbe $leg.name "b$('{0:00}' -f $batchNo)-a$attempt" $probeWait
                 $probeSec = [int][Math]::Ceiling(([DateTime]::UtcNow - $tProbe).TotalSeconds)
@@ -1094,16 +1099,19 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($null -eq $th.firstHeat) { $th.firstHeat = $q.heat; $th.firstHeatText = $q.heatText }
                 $gs = $(if ($ThermalWaitCapSec -gt 0) { Get-VenueThermalGateStep -Heat $q.heat -FirstHotUtc $th.firstHotUtc -NowUtc ([DateTime]::UtcNow) -CapSec $ThermalWaitCapSec } else { [pscustomobject]@{ step = 'RUN'; firstHotUtc = $null; waitSec = 0; remainingSec = 0 } })
                 $th.firstHotUtc = $gs.firstHotUtc; $th.waitSec = $gs.waitSec
-                # adversary r1 A9: a re-probe is started only if it can end inside the cap (the last probe's own duration counts), so a skip never waits past it
-                if ($gs.step -ceq 'WAIT' -and ($gs.waitSec + [Math]::Min($ThermalPollSec, $gs.remainingSec) + $probeSec) -gt $ThermalWaitCapSec) { $gs = [pscustomobject]@{ step = 'SKIP'; firstHotUtc = $gs.firstHotUtc; waitSec = $gs.waitSec; remainingSec = 0 } }
+                # adversary r1 A9 / r1b A2: a re-probe is started only if it can end inside the cap (the last probe's own duration counts): the sleep is shortened
+                # to fit, and only when not even a 1 s sleep fits is the leg skipped now
+                $sleepFit = $ThermalWaitCapSec - $gs.waitSec - $probeSec
+                if ($gs.step -ceq 'WAIT' -and $sleepFit -lt 1) { $gs = [pscustomobject]@{ step = 'SKIP'; firstHotUtc = $gs.firstHotUtc; waitSec = $gs.waitSec; remainingSec = 0 } }
                 if ($gs.step -ceq 'WAIT') {
+                    # r1b A4: counted before the room check, so a batch that ran short waiting for heat never reads as LEG_BUDGET_EXCEEDS_LEASE
+                    $th.polls++; $b.thermalWaits++
                     $roomNow = [int](($leaseEnd - [DateTime]::UtcNow).TotalSeconds) - $LeaseMarginSec
                     if (($roomNow - $legBudget) -lt 1) {
                         $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "waiting for heat ($($q.heatText), waitSec=$($gs.waitSec)) roomSec=$roomNow - legBudgetSec=${legBudget}: leg $($leg.name) goes to the next batch"
                         break
                     }
-                    $th.polls++; $b.thermalWaits++
-                    $sleep = [int][Math]::Max(1, [Math]::Min([Math]::Min($ThermalPollSec, $gs.remainingSec), $roomNow - $legBudget))
+                    $sleep = [int][Math]::Max(1, [Math]::Min([Math]::Min($ThermalPollSec, $sleepFit), $roomNow - $legBudget))
                     L "THERMAL_WAIT leg=$($leg.name) batch=$batchNo heat=hot ($($q.heatText)) waitSec=$($gs.waitSec) capSec=$ThermalWaitCapSec sleepSec=$sleep roomSec=$roomNow"
                     Start-Sleep -Seconds $sleep
                     continue
