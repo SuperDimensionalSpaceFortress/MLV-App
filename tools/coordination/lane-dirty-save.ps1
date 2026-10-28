@@ -301,7 +301,8 @@ public static class DirtyFinalPath {
                 Marshal.WriteIntPtr(info, IntPtr.Size, dir);
                 Marshal.WriteInt32(info, IntPtr.Size * 2, name.Length);
                 Marshal.Copy(name, 0, IntPtr.Add(info, nameAt), name.Length);
-                // NtSetInformationFile(FileRenameInformation = 10): kernel32's FileRenameInfo refuses a RootDirectory (ERROR_INVALID_PARAMETER).
+                // The native call, class 10 = FileRenameInformation only (never 11, the hard-link class: the owner-footage census pins the class and the count):
+                // kernel32's FileRenameInfo refuses a RootDirectory (ERROR_INVALID_PARAMETER).
                 IoStatusBlock io;
                 int st = NtSetInformationFile(h, out io, info, (uint)size, 10);
                 return st < 0 ? RtlNtStatusToDosError(st) : 0;

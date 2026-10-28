@@ -67,7 +67,7 @@ HARD_LINK_TEXT_PATTERNS = (
     r"\bfsutil(?:\.exe)?\s+hardlink\b",
     r"\bmklink(?:\.exe)?\s+/[hH]\b",
     r"\bFileLinkInformation\b",
-    r"\bNtSetInformationFile\b",
+    r"\b(?:Nt|Zw)SetInformationFile\b",
 )
 HARD_LINK_TEXT_RE = re.compile("|".join(f"(?:{p})" for p in HARD_LINK_TEXT_PATTERNS), re.IGNORECASE)
 HARD_LINK_PY_ATTRIBUTES = {"link", "hardlink_to", "link_to", "CreateHardLink", "CreateHardLinkW"}
@@ -79,6 +79,13 @@ HARD_LINK_ALLOWED = {
         "temp file THIS call just created (mkstemp, beside the output, holding only the record's own JSON) "
         "onto the output name, then the temp name is unlinked. It operates only on the ledger record under "
         ".claude-state; it never reads, names or is handed a footage path.",
+    "tools/coordination/lane-dirty-save.ps1":
+        "creates NO hard link: its one NtSetInformationFile call is the in-directory RENAME of the saver's own temp "
+        "(DirtyFinalPath.MoveIn, compile-time constant info class 10 = FileRenameInformation, RootDirectory = the held "
+        "run directory; kernel32's rename refuses a RootDirectory). It never passes 11 = FileLinkInformation, and its "
+        "delete is kernel32 SetFileInformationByHandle class 4 = FileDispositionInfo, an enum with no link class. "
+        "It only saves a lane worktree's git diff into a fleet run directory and cannot reach owner footage. "
+        "test_the_lane_dirty_saver_keeps_exactly_its_one_rename_call pins the class, the count and the lines.",
 }
 
 
@@ -149,9 +156,12 @@ def _tool_sources() -> list[Path]:
 
 
 def hard_link_hits(path: Path) -> list[tuple[int, str]]:
-    text = path.read_text(encoding="utf-8", errors="ignore")
+    return hard_link_text_hits(path.read_text(encoding="utf-8", errors="ignore"), path.suffix.lower() == ".py")
+
+
+def hard_link_text_hits(text: str, is_python: bool = False) -> list[tuple[int, str]]:
     hits: list[tuple[int, str]] = []
-    if path.suffix.lower() == ".py":
+    if is_python:
         try:
             tree = ast.parse(text)
         except SyntaxError:
@@ -185,6 +195,81 @@ def hard_link_hits(path: Path) -> list[tuple[int, str]]:
     return hits
 
 
+# The lane dirty-saver's allowance is keyed by file, so this census is what keeps it narrow (PR #698 r12). On the RAW text
+# (a comment mention counts too), every native set-information spelling must be the one declaration or the counted call,
+# each call's info class is a literal from the named set, and no link name appears at all. The observed CI red was a
+# census mismatch on a rename, not a demonstrated hard link; this keeps it that way.
+LANE_DIRTY_SAVE = ROOT / "tools" / "coordination" / "lane-dirty-save.ps1"
+LANE_DIRTY_SAVE_NT_CLASSES = {"10"}  # NtSetInformationFile: FileRenameInformation. 11 (FileLinkInformation) creates a hard link.
+LANE_DIRTY_SAVE_NT_CALLS = 1
+LANE_DIRTY_SAVE_K32_CLASSES = {"4"}  # SetFileInformationByHandle: FileDispositionInfo (that enum has no link class; pinned anyway).
+_NATIVE_SET_INFO_RE = re.compile(r"\b(?:Nt|Zw)SetInformationFile\w*")
+_K32_SET_INFO_RE = re.compile(r"\bSetFileInformationByHandle\w*")
+_LINK_NAME_RE = re.compile(r"FileLinkInfo\w*|CreateHardLink\w*|\bHardLink\b", re.IGNORECASE)
+
+
+def _call_arguments(text: str, at: int) -> list[str] | None:
+    """Top-level arguments of the call whose '(' follows position `at` (whitespace allowed), or None when no call follows."""
+    match = re.compile(r"\s*\(").match(text, at)
+    if not match:
+        return None
+    depth, start, args = 1, match.end(), []
+    for index in range(match.end(), len(text)):
+        char = text[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append(text[start:index].strip())
+                return args
+        elif char == "," and depth == 1:
+            args.append(text[start:index].strip())
+            start = index + 1
+    return None
+
+
+def _native_census(text: str, pattern: re.Pattern, declaration: str, class_at: int, allowed: set[str]):
+    """(declaration lines, call lines, violations) for one native entry point in `text`."""
+    declarations, calls, violations = [], [], []
+    for match in pattern.finditer(text):
+        number = text.count("\n", 0, match.start()) + 1
+        line = text.splitlines()[number - 1].strip()
+        if match.group(0) != declaration:
+            violations.append(f"{number}: a spelling other than {declaration}: {line}")
+            continue
+        if re.search(r"\bstatic\s+extern\b[^\n;]*$", text[text.rfind("\n", 0, match.start()) + 1: match.start()]):
+            declarations.append(number)
+            continue
+        args = _call_arguments(text, match.end())
+        if args is None:
+            violations.append(f"{number}: {declaration} named but not called (a string, delegate or comment): {line}")
+            continue
+        calls.append(number)
+        info_class = args[class_at] if -len(args) <= class_at < len(args) else ""
+        if info_class not in allowed:
+            violations.append(f"{number}: info class {info_class!r} is not a literal from {sorted(allowed)}: {line}")
+    if len(declarations) != 1:
+        violations.append(f"{declaration} must be declared exactly once, found lines {declarations}")
+    return declarations, calls, violations
+
+
+def lane_dirty_save_violations(text: str) -> list[str]:
+    nt_decl, nt_calls, violations = _native_census(
+        text, _NATIVE_SET_INFO_RE, "NtSetInformationFile", -1, LANE_DIRTY_SAVE_NT_CLASSES)
+    _, _, k32_violations = _native_census(
+        text, _K32_SET_INFO_RE, "SetFileInformationByHandle", 1, LANE_DIRTY_SAVE_K32_CLASSES)
+    violations += k32_violations
+    if len(nt_calls) != LANE_DIRTY_SAVE_NT_CALLS:
+        violations.append(f"NtSetInformationFile must be called exactly {LANE_DIRTY_SAVE_NT_CALLS} time(s), found lines {nt_calls}")
+    for match in _LINK_NAME_RE.finditer(text):
+        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a link name: {match.group(0)}")
+    # the file-keyed allowance covers exactly the declaration and the counted call, never another hard-link spelling
+    extra = [f"{number}: {line}" for number, line in hard_link_text_hits(text) if number not in set(nt_decl) | set(nt_calls)]
+    violations += [f"a hard-link scan hit outside the counted rename: {hit}" for hit in extra]
+    return violations
+
+
 class NoHardLinkCreationTests(unittest.TestCase):
     def test_no_tracked_tool_creates_a_hard_link_except_the_named_exceptions(self) -> None:
         unexplained = []
@@ -204,6 +289,41 @@ class NoHardLinkCreationTests(unittest.TestCase):
         # HARD_LINK_ALLOWED is keyed by file; a SECOND call in that file must not ride the allowance.
         ledger = ROOT / "tools" / "coordination" / "record_workstream_completion.py"
         self.assertEqual(len({number for number, _ in hard_link_hits(ledger)}), 1, hard_link_hits(ledger))
+
+    def test_the_lane_dirty_saver_keeps_exactly_its_one_rename_call(self) -> None:
+        # HARD_LINK_ALLOWED is keyed by file; this keeps the allowance to the one class-10 rename (PR #698 r12).
+        self.assertEqual(lane_dirty_save_violations(LANE_DIRTY_SAVE.read_text(encoding="utf-8")), [])
+
+    def test_the_lane_dirty_saver_census_goes_red_on_every_widening(self) -> None:
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        call = re.search(r"NtSetInformationFile\(h, out io, info, \(uint\)size, 10\);", text)
+        self.assertIsNotNone(call, "the census mutants below are cut from this exact call")
+        call = call.group(0)
+        mutants = {
+            # (i) class 11 / FileLinkInformation at any site
+            "class 11": text.replace(call, call.replace(", 10)", ", 11)")),
+            "a FileLinkInformation name": text.replace(call, call + " // FileLinkInformation"),
+            "a disposition call widened to 11": text.replace("SetFileInformationByHandle(h, 4,", "SetFileInformationByHandle(h, 11,", 1),
+            # (ii) an unknown or dynamic class
+            "a variable class": text.replace(call, call.replace(", 10)", ", infoClass)")),
+            "an expression class": text.replace(call, call.replace(", 10)", ", 5 + 5)")),
+            "another constant": text.replace(call, call.replace(", 10)", ", 13)")),
+            "the same value spelled in hex": text.replace(call, call.replace(", 10)", ", 0x0A)")),
+            "a dynamic disposition class": text.replace("SetFileInformationByHandle(h, 4,", "SetFileInformationByHandle(h, cls,", 1),
+            # (iii) an additional link-capable call site or entry point
+            "a second rename call": text.replace(call, call + "\n" + call),
+            "a second declaration": text.replace(
+                "static extern int NtSetInformationFile(", "static extern int NtSetInformationFile(IntPtr a);\n    static extern int NtSetInformationFile(", 1),
+            "the Zw spelling": text.replace(call, call + "\n" + call.replace("NtSet", "ZwSet")),
+            "an EntryPoint alias": text.replace(call, call + '\n[DllImport("ntdll.dll", EntryPoint = "NtSetInformationFile")] static extern int Quiet();'),
+            "a mention in a comment": text.replace(call, call + " // NtSetInformationFile again"),
+            "a CreateHardLinkW call": text.replace(call, call + "\nCreateHardLinkW(a, b, IntPtr.Zero);"),
+            "a New-Item hard link": text + "\nNew-Item -ItemType HardLink -Path $a -Value $b\n",
+        }
+        for name, mutant in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertNotEqual(mutant, text, "the mutant did not apply")
+                self.assertTrue(lane_dirty_save_violations(mutant), f"the census missed: {name}")
 
     def test_every_named_hard_link_exception_still_matches(self) -> None:
         present = {path.relative_to(ROOT).as_posix() for path in _tool_sources() if hard_link_hits(path)}
@@ -225,6 +345,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "cmd /c mklink /H $a $b",
             "$info = [FileLinkInformation]::new()",
             "NtSetInformationFile($h, $io, $p, 24, 11)",
+            "ZwSetInformationFile($h, $io, $p, 24, 11)",
             "New-Item -ItemType 'HardLink' -Path $a -Value $b",
             "New-Item -ItemType:HardLink -Path $a -Value $b",
             "New-Item -Type HardLink -Path $a -Value $b",

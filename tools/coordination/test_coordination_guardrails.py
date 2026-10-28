@@ -3177,6 +3177,42 @@ def test_remove_dirty_temp_deletes_only_the_file_it_created_through_the_handle_i
     assert (tmp_path / "a.tmp").read_text() == "KEEP" and (tmp_path / "aside.tmp").is_file()
 
 
+@pytest.mark.skipif(DIRTY_SAVE_PWSH is None, reason="the PowerShell helper needs pwsh")
+@pytest.mark.parametrize("kind", ["SymbolicLink", "Junction"])
+def test_dirty_regular_digest_fallback_refuses_a_link_before_hashing_it(tmp_path, kind):
+    # r12 (Dot advisory on f1dec926, bus 4821093): with no handle API (off Windows; here the type is kept unloaded) Get-DirtyRegularDigest used to hash through a link at the
+    # name. A link is now refused before Get-FileHash reads anything, and a regular file still digests. (A junction needs no privilege, so the Windows run never skips both.)
+    target = tmp_path / "target.patch"
+    target.write_bytes(b"same\n")
+    link = tmp_path / "link.patch"
+    if kind == "Junction":
+        if os.name != "nt":
+            pytest.skip("a junction is a Windows reparse point")
+        (tmp_path / "junction-target").mkdir()
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(tmp_path / "junction-target")], check=True, capture_output=True)
+    else:
+        try:
+            os.symlink(target, link)
+        except OSError as exc:
+            pytest.skip(f"cannot create a symbolic link here: {exc}")
+    out = dirty_save_pwsh("function Get-DirtyKernelPath { $null }; $global:hashed = 0; "
+                          "function Get-FileHash { $global:hashed++; Microsoft.PowerShell.Utility\\Get-FileHash @args }; "
+                          f"$l = Get-DirtyRegularDigest '{link}'; $n = $global:hashed; $t = Get-DirtyRegularDigest '{target}'; "
+                          "Write-Output ('{0}|{1}|{2}|{3}' -f ($null -eq ('DirtyFinalPath' -as [type])), ($null -eq $l), $n, $t)")
+    assert out.stdout.strip() == f"True|True|0|path/1|{hashlib.sha256(b'same' + bytes([10])).hexdigest()}", (out.stdout, out.stderr)
+
+
+@dirty_save_only
+def test_open_in_refuses_a_name_component_longer_than_255_before_the_16_bit_lengths(tmp_path):
+    # r12 (Dot advisory on f1dec926, bus 4821093; adversary 1ef5cc23-A3): OpenIn put 2 * length into ushort UNICODE_STRING fields, so 32769 characters wrapped to 2 bytes and
+    # the create landed on the one-character name 'x'. A component longer than 255 is now refused (206) before that conversion, and nothing is created.
+    out = dirty_save_pwsh(f"$null = Get-DirtyKernelPath '{tmp_path}'; $d = [DirtyFinalPath]::Pin('{tmp_path}'); $e = 0; "
+                          "$codes = foreach ($n in ('x' + ('y' * 32768)), ('z' * 256)) { $h = [DirtyFinalPath]::CreateHeldIn($d, $n, [ref]$e); [DirtyFinalPath]::Unpin($h); $e }; "
+                          "[DirtyFinalPath]::Unpin($d); Write-Output ($codes -join '|')")
+    assert out.stdout.strip() == "206|206", (out.stdout, out.stderr)
+    assert sorted(p.name for p in tmp_path.iterdir()) == []
+
+
 @dirty_save_only
 def test_save_dirty_worktree_evidence_refuses_a_repository_naming_file_that_is_a_symbolic_link(tmp_path):
     # r10 iter 2 (adversary a80a10d3-A1): the file hold followed a symbolic link, so it held the link's target while the link itself, which git follows to find the common
