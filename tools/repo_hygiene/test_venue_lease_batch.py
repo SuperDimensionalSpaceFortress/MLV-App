@@ -3324,7 +3324,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def _delayed_guard_read_run(self, read: str) -> tuple[subprocess.CompletedProcess, float]:
         return self._post_open_hash_run(0, "-GuardReadDelay", f"open:{read}=25", cap="75")
 
-    def _assert_delayed_read_refused_inside_the_room(self, r: subprocess.CompletedProcess, held: float) -> None:
+    def _assert_delayed_read_refused_inside_the_room(self, r: subprocess.CompletedProcess, held: float, extra: float = 0) -> None:
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
         self.assertIn("the guard's reads did not finish within the lease's room after the open", r.stderr)
@@ -3332,19 +3332,20 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(self.leg_calls(), [])
         self.assertEqual([k for k in self.kinds() if not k.startswith(("OPEN", "CLOSE"))], [], "no probe and no leg ran")
         # the refusal came inside the 14 s room (plus the close), never after the 25 s read: the leg reserve was never spent
-        self.assertLess(held, 75 - 60 + 4, f"the lease was held {held:.1f} s before the close: the delayed read ran past the guard's room")
+        # r5 (adversary r5 A1): a location left unknown adds the documented bounded re-read of -RunDir (at most 2 s) before the close
+        self.assertLess(held, 75 - 60 + 4 + extra, f"the lease was held {held:.1f} s before the close: the delayed read ran past the guard's room")
         self.assertFalse(self.claim_path.exists(), "the claim was released (full cleanup)")
 
     def test_artifact_preflight_r4_item2_a_delayed_existence_read_after_the_open_ends_share_unreachable_inside_the_room(self) -> None:
         r, held = self._delayed_guard_read_run("existence")
-        self._assert_delayed_read_refused_inside_the_room(r, held)
+        self._assert_delayed_read_refused_inside_the_room(r, held, extra=2)
         # where an input is was never verified: nothing more is written into -RunDir (fail closed, as an unresolvable location is)
         self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
         self.assertIn("an input whose location is unknown is refused", r.stderr)
 
     def test_artifact_preflight_r4_item2_a_delayed_identity_and_path_read_after_the_open_ends_share_unreachable_inside_the_room(self) -> None:
         r, held = self._delayed_guard_read_run("identity")
-        self._assert_delayed_read_refused_inside_the_room(r, held)
+        self._assert_delayed_read_refused_inside_the_room(r, held, extra=2)
         self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
         self.assertIn("an input whose location is unknown is refused", r.stderr)
 
@@ -3521,6 +3522,30 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("an input whose location is unknown is refused", se)
         self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", se)
         self.assertIn("is inside -RunDir", se)
+
+    # r5 adversary pass 2 A2 (on 4a8e2e87): a -RunDir junction removed after the open was submitted made the worker's resolve FAIL (not time out), so the hit was a known location
+    # hit and Test-OpenOutputAlias read -RunDir again on the main thread, unbounded. A location that cannot be resolved under a guard budget is a location left unknown.
+    def test_artifact_preflight_r5_adv_p2_a2_a_rundir_junction_removed_after_the_open_is_not_read_again_on_the_main_thread(self) -> None:
+        old, link = self.case / "rd-old", self.case / "run-link"
+        self._junction(link, old)
+        self.addCleanup(lambda: os.path.lexists(link) and os.rmdir(link))
+        self.run_dir = link
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-LeaseCapSec", "75", "-LegBudgetSec", "60", "-LeaseMarginSec", "0",
+                                "-GuardReadDelay", "open:rundir=10", FAKE_OPEN_SLEEP="6")
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+        try:
+            self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            os.rmdir(link)   # the junction itself; its target stays
+            so, se = p.communicate(timeout=240)
+        finally:
+            if p.poll() is None:
+                subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                p.wait(timeout=60)
+        self.assertNotIn("GUARD_READ_DELAY_SEAM", se, "-RunDir was read again on the main thread after the guard could not resolve it")
+        self.assertEqual(p.returncode, 2, so + se)
+        self.assertIn("cannot be resolved to a physical path", se)
+        self.assertIn("BATCH_OUTPUT_ALIASED", se)
+        self.assertEqual(self.leg_calls(), [])
 
     # r5 adversary A2 (pass 1 on 8559ef31): no content read starts with under 2 s of the guard's room, but Get-VenueStagedBuildManifest started the hash with 1 s left of its call.
     # cap 66 / leg 60 / margin 0 leaves the post-open guard about 5 s (one build: a 4 s read); the manifest read takes 2.2 s once the open is answered, so the hash would start with 1.8 s.

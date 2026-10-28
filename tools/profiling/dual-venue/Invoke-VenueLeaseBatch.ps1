@@ -510,7 +510,9 @@ function Get-InputOutputRefusal {
         if ($g.kind -ceq 'build' -and -not (Test-Path -LiteralPath $g.path -PathType Leaf)) { continue }
         Wait-GuardReadSeam 'identity'
         $why = Get-RunDirOutputRefusal $g.path
-        if ($why) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why } }
+        # r5 adversary pass 2 A2: under a guard budget, a location that could not be RESOLVED (Get-RunDirOutputRefusal's catch) is a location left unknown too, so the caller
+        # neither reads it again unbounded (Test-OpenOutputAlias) nor probes batch.log (Stop-PlanRefused); the preflight's refusal of it is unchanged
+        if ($why) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why; locationUnknown = ($null -ne $script:guardBudget -and $why.EndsWith('an input whose location is unknown is refused')) } }
     }
     if ($script:guardProgress) { $script:guardProgress.locationsDone = $true }
     Get-InputContentRefusal
