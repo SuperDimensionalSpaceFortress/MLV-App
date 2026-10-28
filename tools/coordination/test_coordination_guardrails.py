@@ -2465,13 +2465,11 @@ def test_save_dirty_worktree_evidence_fails_typed_on_a_short_staged_write_with_e
     (wt / "src" / "a.txt").write_text("".join(f"staged {i}\n" for i in range(40)))
     git(wt, "add", "src/a.txt")
     (wt / "src" / "a.txt").write_text("".join(f"line {i}\n" for i in range(40)))
-    # A PowerShell function named git outranks git.exe for the helper's `& git` calls: it runs the real git, then halves the staged diff's output file and keeps git's exit code 0.
-    shim = (f"$script:RealGit = '{shutil.which('git')}'; "
-            "function git { & $script:RealGit @args; $code = $LASTEXITCODE; "
-            "if ($args -contains 'diff' -and $args -contains '--cached') { "
-            "$o = @($args | Where-Object { $_ -like '--output=*' })[0]; "
-            "if ($o) { $p = $o.Substring(9); $b = [System.IO.File]::ReadAllBytes($p); [System.IO.File]::WriteAllBytes($p, $b[0..([int]($b.Length / 2))]) } }; "
-            "$global:LASTEXITCODE = $code }")
+    # The capture seam (r11: git's output is captured and written through the hold, never given a temp name): it runs the real capture, then halves the staged diff's
+    # bytes and keeps git's exit code 0.
+    shim = ("$script:RealCap = (Get-Command Invoke-DirtyGitCapture -CommandType Function).ScriptBlock; "
+            "function Invoke-DirtyGitCapture([string]$Wt, [string[]]$GitArgs) { $r = & $script:RealCap $Wt $GitArgs; "
+            "if ($GitArgs -contains '--cached') { $r.Bytes = [byte[]]$r.Bytes[0..([int]($r.Bytes.Length / 2))] }; $r }")
     out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
     assert out.stdout.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=staged-diff-incomplete"), out.stdout + out.stderr
     assert not list(dest.glob("dirty-worktree-staged-*")) and not list(dest.glob("*.tmp"))
@@ -2497,14 +2495,12 @@ def test_save_dirty_worktree_evidence_never_overwrites_a_status_snapshot_for_the
 
 
 def _cut_diff_output_shim(marker):
-    # A PowerShell function named git outranks git.exe for the helper's `& git` calls: it runs the real git, then cuts the output file of `diff --cached` / `diff HEAD`
-    # right before the first line that starts with `marker` (the patch before it stays whole and well-formed) and keeps git's exit code 0.
-    return (f"$script:RealGit = '{shutil.which('git')}'; "
-            "function git { & $script:RealGit @args; $code = $LASTEXITCODE; "
-            "$o = @($args | Where-Object { $_ -like '--output=*' })[0]; "
-            "if ($o -and $args -contains 'diff') { $p = $o.Substring(9); $t = [System.IO.File]::ReadAllText($p); "
-            f"$i = $t.IndexOf(\"`n{marker}\"); if ($i -gt 0) {{ [System.IO.File]::WriteAllText($p, $t.Substring(0, $i + 1)) }} }}; "
-            "$global:LASTEXITCODE = $code }")
+    # The capture seam (r11: git's output is captured and written through the hold, never given a temp name): it runs the real capture of `diff --cached` / `diff HEAD`,
+    # then cuts it right before the first line that starts with `marker` (the patch before it stays whole and well-formed) and keeps git's exit code 0.
+    return ("$script:RealCap = (Get-Command Invoke-DirtyGitCapture -CommandType Function).ScriptBlock; "
+            "function Invoke-DirtyGitCapture([string]$Wt, [string[]]$GitArgs) { $r = & $script:RealCap $Wt $GitArgs; "
+            "$t = [System.Text.UTF8Encoding]::new($false).GetString($r.Bytes); "
+            f"$i = $t.IndexOf(\"`n{marker}\"); if ($i -gt 0) {{ $r.Bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($t.Substring(0, $i + 1)) }}; $r }}")
 
 
 def _truncate_staged_at_second_file_shim(second_marker):
@@ -2970,6 +2966,111 @@ def test_save_dirty_worktree_evidence_never_writes_through_a_hard_link_planted_a
     assert lines[-1] == "planted=True", (out.stdout, out.stderr)
     assert victim.read_bytes() == b"DO NOT LOSE\n", ("the linked worktree file was overwritten", out.stdout, out.stderr)
     assert lines[0].startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=temp-path-exists") and "DIRTY_TREE_SAVED" not in out.stdout, (out.stdout, out.stderr)
+
+
+# Sets a reparse point IN PLACE on an existing, open-able object (FSCTL_SET_REPARSE_POINT; no rename, no delete): a mount point (junction) on an empty directory, which needs
+# no privilege, or a symbolic link on an empty file, which needs SeCreateSymbolicLinkPrivilege. Opened with GENERIC_WRITE and full sharing, which the saver's holds allow.
+_DIRTY_REPARSE_SETTER = (
+    "if (-not ('DirtyReparseSetter' -as [type])) { Add-Type -TypeDefinition @'\n"
+    "using System; using System.Runtime.InteropServices; using System.Text;\n"
+    "public static class DirtyReparseSetter {\n"
+    "  [DllImport(\"kernel32.dll\", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateFileW(string n, uint a, uint s, IntPtr sa, uint d, uint f, IntPtr t);\n"
+    "  [DllImport(\"kernel32.dll\", SetLastError = true)] static extern bool DeviceIoControl(IntPtr h, uint code, byte[] inBuf, int inLen, IntPtr outBuf, int outLen, out int ret, IntPtr ov);\n"
+    "  [DllImport(\"kernel32.dll\")] static extern bool CloseHandle(IntPtr h);\n"
+    "  public static int Set(string path, string target, bool symlink) {\n"
+    "    byte[] sub = Encoding.Unicode.GetBytes(@\"\\??\\\" + target); byte[] pr = Encoding.Unicode.GetBytes(target);\n"
+    "    int head = symlink ? 12 : 8; int data = head + sub.Length + 2 + pr.Length + 2; byte[] b = new byte[8 + data];\n"
+    "    BitConverter.GetBytes(symlink ? 0xA000000Cu : 0xA0000003u).CopyTo(b, 0); BitConverter.GetBytes((ushort)data).CopyTo(b, 4);\n"
+    "    BitConverter.GetBytes((ushort)0).CopyTo(b, 8); BitConverter.GetBytes((ushort)sub.Length).CopyTo(b, 10);\n"
+    "    BitConverter.GetBytes((ushort)(sub.Length + 2)).CopyTo(b, 12); BitConverter.GetBytes((ushort)pr.Length).CopyTo(b, 14);\n"
+    "    sub.CopyTo(b, 8 + head); pr.CopyTo(b, 8 + head + sub.Length + 2);\n"
+    "    IntPtr h = CreateFileW(path, 0x40000000, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);\n"
+    "    if (h == (IntPtr)(-1)) return Marshal.GetLastWin32Error();\n"
+    "    try { int r; return DeviceIoControl(h, 0x000900A4, b, b.Length, IntPtr.Zero, 0, out r, IntPtr.Zero) ? 0 : Marshal.GetLastWin32Error(); } finally { CloseHandle(h); }\n"
+    "  }\n"
+    "}\n"
+    "'@ }; ")
+
+
+@dirty_save_only
+@pytest.mark.parametrize("prefix", ["dirty-worktree-saving-", "dirty-worktree-status-", "dirty-worktree-staging-", "dirty-worktree-merge-state-saving-"])
+def test_save_dirty_worktree_evidence_never_writes_a_temp_by_its_name(tmp_path, prefix):
+    # r11 (sol r10 B1): the held temp shares WRITE, and FILE_WRITE_ATTRIBUTES is outside share modes, so it can be turned IN PLACE into a symbolic link to a worktree file
+    # (same identity, one link). git --output and Write-DirtyTempLines then reopened the NAME, followed the link and truncated the worktree file. Setting a symbolic link
+    # needs a privilege, so this models it without one: the temp record's name is pointed at the worktree file while its hold stays on the real temp, exactly what a link
+    # at the name does. Every temp (main patch, status, staged diff, merge state) is now written only through its hold, so the worktree file keeps its bytes.
+    wt, dest = _dirty_save_repo(tmp_path)
+    if prefix == "dirty-worktree-staging-":
+        git(wt, "add", "src/a.txt")
+        (wt / "src" / "a.txt").write_text("three\n")
+    if prefix == "dirty-worktree-merge-state-saving-":
+        _leave_a_conflicted_merge(wt)
+    victim = wt / "orphan.txt"
+    victim.write_bytes(b"KEEP\n")
+    shim = ("$script:RealNT = (Get-Command New-DirtyHeldTemp -CommandType Function).ScriptBlock; $script:Pointed = $false; "
+            "function New-DirtyHeldTemp { $t = & $script:RealNT @args; "
+            f"if ($t.Path -and (Split-Path -Leaf $t.Path) -like '{prefix}*') {{ $script:Pointed = $true; $t.Path = '{victim}' }}; $t }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output \"pointed=$script:Pointed\"")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] == "pointed=True", (out.stdout, out.stderr)
+    assert victim.read_bytes() == b"KEEP\n", ("a temp was written by its name and the worktree file it named was overwritten", out.stdout, out.stderr)
+    assert lines[0].startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=") and "DIRTY_TREE_SAVED" not in out.stdout, (out.stdout, out.stderr)
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_never_writes_through_a_temp_turned_into_a_symbolic_link(tmp_path):
+    # r11 (sol r10 B1, the repro itself): after the empty status temp is created, it is turned in place into a symbolic link to the untracked worktree file orphan.txt.
+    # Needs SeCreateSymbolicLinkPrivilege; the unprivileged model above covers every temp. The write goes through the hold and refuses a reparse point.
+    wt, dest = _dirty_save_repo(tmp_path)
+    victim = wt / "orphan.txt"
+    victim.write_bytes(b"KEEP\n")
+    shim = (_DIRTY_REPARSE_SETTER + "$script:RealNT = (Get-Command New-DirtyHeldTemp -CommandType Function).ScriptBlock; $script:Set = 'not-reached'; "
+            "function New-DirtyHeldTemp { $t = & $script:RealNT @args; "
+            f"if ($t.Path -and (Split-Path -Leaf $t.Path) -like 'dirty-worktree-status-*') {{ $script:Set = [DirtyReparseSetter]::Set($t.Path, '{victim}', $true) }}; $t }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output \"set=$script:Set\"")
+    lines = out.stdout.strip().splitlines()
+    if lines and lines[-1] == "set=1314":
+        pytest.skip("cannot set a symbolic link reparse point here (ERROR_PRIVILEGE_NOT_HELD)")
+    assert lines[-1] == "set=0", (out.stdout, out.stderr)
+    assert victim.read_bytes() == b"KEEP\n", ("the worktree file behind the symbolic link was overwritten", out.stdout, out.stderr)
+    assert lines[0].startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=temp-reparse-point patch="), (out.stdout, out.stderr)
+
+
+@dirty_save_only
+@pytest.mark.parametrize("when", ["after-guard", "at-create", "control"])
+def test_save_dirty_worktree_evidence_creates_nothing_through_a_destination_turned_into_a_junction_after_its_guard(tmp_path, when):
+    # r11 (sol r10 B2): the held destination shares WRITE, so an EMPTY destination can be turned IN PLACE into a junction to the worktree after the before-write guard
+    # passed (no rename, which the hold would refuse). The temp was then created by walking the destination path, through the junction, and git wrote the patch inside
+    # the worktree before the before-publish guard refused. The guard now reads the reparse state from the held handle (after-guard: converted right after the
+    # destination checks passed), and temps are created inside the held directory, relative to its handle, after reading it again (at-create: converted right before
+    # the first temp is created): nothing ever appears in the worktree, and the save fails typed. Junctions need no privilege, so this runs the real race.
+    convert = when != "control"
+    wt, dest = _dirty_save_repo(tmp_path)
+    before = git(wt, "status", "--porcelain")
+    junction = f"$script:Set = [DirtyReparseSetter]::Set('{dest}', '{wt}', $false)"
+    shim = (_DIRTY_REPARSE_SETTER + "$script:Set = 'not-reached'; $script:Seen = @(); "
+            "$script:RealTS = (Get-Command Test-DirtyDestStable -CommandType Function).ScriptBlock; "
+            "$script:RealNT = (Get-Command New-DirtyHeldTemp -CommandType Function).ScriptBlock; "
+            "function Test-DirtyDestStable([string]$Dest, [string]$Identity, [string]$WtReal, [string]$WtIdentity, [string]$Stage) { "
+            "$r = & $script:RealTS -Dest $Dest -Identity $Identity -WtReal $WtReal -WtIdentity $WtIdentity -Stage $Stage; "
+            f"$script:Seen += @(Get-ChildItem -LiteralPath '{wt}' -Filter 'dirty-worktree-*' -Force | ForEach-Object Name); "
+            f"if ({'$true' if when == 'after-guard' else '$false'} -and $script:Set -eq 'not-reached' -and $Stage -eq 'before-write' -and -not $r) {{ {junction} }}; $r }}; "
+            f"function New-DirtyHeldTemp {{ if ({'$true' if when == 'at-create' else '$false'} -and $script:Set -eq 'not-reached') {{ {junction} }}; & $script:RealNT @args }}")
+    try:
+        out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; "
+                              "Write-Output \"set=$script:Set\"; Write-Output ('seen=' + ($script:Seen -join ','))")
+        lines = out.stdout.strip().splitlines()
+        seen_in_wt = sorted(p.name for p in wt.glob("dirty-worktree-*"))
+    finally:
+        if convert and os.path.isjunction(dest):
+            os.rmdir(dest)  # removes the junction only, never its target
+    if not convert:
+        assert lines[0].startswith("DIRTY_TREE_SAVED card=C1"), (out.stdout, out.stderr)
+        return
+    assert lines[-2] == "set=0", (out.stdout, out.stderr)
+    assert lines[-1] == "seen=" and not seen_in_wt, ("evidence was created inside the worktree", lines, seen_in_wt)
+    assert lines[0] == "DIRTY_TREE_SAVE_FAILED card=C1 reason=dest-identity-changed", (out.stdout, out.stderr)
+    assert git(wt, "status", "--porcelain") == before
 
 
 @dirty_save_only

@@ -18,7 +18,10 @@
 # git dir at the sample must still be absent at every check before a write or a publish and after the last git call (reason=git-metadata-appeared). Not covered: a worktree already
 # changed before the call (DIRTY-SAVE-DISPATCHER-IDENTITY-HANDOFF-1), and a naming file created and removed again between two of those checks (r10-R1).
 # Every temp file is created by the saver with CREATE_NEW and held (no rename, no delete) until it is moved; a name that already exists is reason=temp-path-exists, a temp
-# file with a second name is temp-file-linked, and a moved file that is not the one created is evidence-identity-changed:<path>.
+# file with a second name is temp-file-linked, and a moved file that is not the one created is evidence-identity-changed:<path>. Every temp is created, renamed and deleted
+# INSIDE the held -Dest (relative to its handle, no path walked) and written only THROUGH its own hold: git's output is captured, never given a temp name (--output), so a
+# -Dest turned into a junction or a temp turned into a symbolic link after a check cannot steer a write into the worktree (temp-reparse-point / dest-identity-changed; r11, sol r10 B1/B2).
+# By-name opens left after a guard only READ (git apply --check, the re-hashes, the placed-file identity): a link there can make a check fail, never change a source byte.
 # The helper judges every git exit code itself and sets $PSNativeCommandUseErrorActionPreference = $false for its own calls, so the expected exit 1 of `git diff --cached --quiet` cannot throw under a caller that set it.
 # It refuses a -Dest inside the worktree it describes (reason=dest-inside-worktree): evidence written there would show in the next status and be captured by the next save.
 # -Dest is resolved once to its physical path and every write uses that path; a destination that changed identity before a write or publish is reason=dest-identity-changed.
@@ -36,13 +39,24 @@
 # A file moved into place whose bytes cannot be proven to hash to $Full comes back as Path = $null, Placed = <that file> and Reason = evidence-changed-before-publish:<file>
 # or evidence-unverified-after-publish (its hash could not be read). Every result carries the Placed key ($null unless a file was moved into place): the caller reads it, and
 # under Set-StrictMode -Version Latest (Invoke-Workstream.ps1) reading an absent key throws and buries the typed reason (r9, adversary 2181cd97-A2).
-function Invoke-DirtyFileMove([string]$From, [string]$To) { [System.IO.File]::Move($From, $To) }  # one seam, so a test can stand in for a locked file
+# One seam, so a test can stand in for a locked file. Given the saver's hold on the directory and the temp's identity, the rename is done inside that held directory
+# (DirtyFinalPath.MoveIn: neither name is reached by walking the destination path, a link at either is not followed, and the file renamed must be the temp created);
+# an existing target is an IOException like File.Move's, and a temp that is not that file any more is evidence-identity-changed (r11, sol r10 B2).
+function Invoke-DirtyFileMove([string]$From, [string]$To, $DirHandle = $null, [string]$Identity = '') {
+    if ($DirHandle -isnot [IntPtr]) { [System.IO.File]::Move($From, $To); return }
+    $code = [DirtyFinalPath]::MoveIn($DirHandle, (Split-Path -Leaf $From), (Split-Path -Leaf $To), $Identity)
+    if ($code -eq 0) { return }
+    if ($code -eq -1) { throw [System.InvalidOperationException]::new("evidence-identity-changed:$From") }
+    if ($code -eq 4390) { throw [System.InvalidOperationException]::new('dest-identity-changed') }
+    throw [System.IO.IOException]::new(([System.ComponentModel.Win32Exception]::new($code)).Message, (0x80070000 -bor $code))
+}
 
 # Nothing escapes it (r10, sol r9 B4): a move that throws anything but a name clash is move-failed, and a throw anywhere else (a -Guard that throws, Join-Path on a drive
 # that does not exist) is placement-failed:<HResult> <message>, with Placed naming a file already moved into place.
 # -Hold is the caller's New-DirtyHeldTemp record for $Tmp: right before the move the held file must still have one name, the hold is released (a held file cannot be
 # renamed), and the file moved into place must be that file (same volume serial + file index, one name); otherwise Placed = <it> and Reason = evidence-identity-changed:<it> (r10, sol r9 B3).
-function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem, [string]$Ext, [string]$Full, [string]$FirstName = '', [scriptblock]$Guard = $null, $Hold = $null) {
+# -DirHandle is the saver's hold on $Dir: the rename is then done inside the held directory (Invoke-DirtyFileMove; r11, sol r10 B2).
+function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem, [string]$Ext, [string]$Full, [string]$FirstName = '', [scriptblock]$Guard = $null, $Hold = $null, $DirHandle = $null) {
     $placedNow = $null
     try {
         if ($Full -cnotmatch '^[0-9a-f]{64}\z') { return @{ Path = $null; Placed = $null; Reason = 'bad-digest' } }  # every name below is cut from a lower-case SHA-256; anything else is refused, not thrown (r6 adversary A3; \z, not $, which matches before a final LF)
@@ -59,10 +73,11 @@ function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem,
                 Unlock-DirtyTemp $Hold
             }
             if ($Guard) { $why = & $Guard 'before-publish'; if ($why) { return @{ Path = $null; Placed = $null; Reason = $why } } }  # the destination is re-proven right before each rename into place
-            try { Invoke-DirtyFileMove $Tmp $cand }
+            try { if ($DirHandle -is [IntPtr] -and $Hold) { Invoke-DirtyFileMove $Tmp $cand $DirHandle $Hold.Id } else { Invoke-DirtyFileMove $Tmp $cand } }
             catch {
                 $ex = $_.Exception
                 while ($ex.InnerException -and $ex -isnot [System.IO.IOException]) { $ex = $ex.InnerException }  # a method call wraps the real exception
+                if ($ex -is [System.InvalidOperationException] -and $ex.Message -cmatch '^(evidence-identity-changed:|dest-identity-changed$)') { return @{ Path = $null; Placed = $null; Reason = $ex.Message } }
                 $moveFailed = @{ Path = $null; Placed = $null; Reason = ('move-failed:0x{0:X8} {1}' -f $ex.HResult, ($ex.Message -replace '\s+', ' ')) }
                 if ($ex -isnot [System.IO.IOException] -or -not (Test-Path -LiteralPath $cand)) { return $moveFailed }
                 # An occupied name that cannot be read is not proven to hold these bytes, so the next length is tried (r8, adversary 98e161fc-A3 sibling :48: the hash used to throw out of the helper).
@@ -164,6 +179,8 @@ public static class DirtyFinalPath {
     }
     // Creates a NEW file (CREATE_NEW: fails when the name exists, a planted hard link included) and holds it for reading, sharing READ and WRITE but not DELETE: git and the
     // checks can open it, nobody can rename or delete it, so the name keeps naming this file until Unpin (r10, sol r9 B3). Error is the Win32 code when it returns IntPtr.Zero.
+    // Sharing WRITE lets another writer change the bytes (the digest catches that) and lets anyone set a reparse point on it in place (FILE_WRITE_ATTRIBUTES is outside share
+    // modes altogether), so the saver never writes it by name: WriteHeld writes through this handle (r11, sol r10 B1).
     // The \\?\ spelling of a full path, so a temp name in a deep run dir is not cut off at MAX_PATH (the managed file APIs add it themselves; a direct CreateFileW does not).
     static string Long(string path) {
         if (path.StartsWith(@"\\?\") || path.StartsWith(@"\\.\")) return path;
@@ -176,10 +193,108 @@ public static class DirtyFinalPath {
         return h == (IntPtr)(-1) ? IntPtr.Zero : h;
     }
     // Volume serial + file index + link count of what a held handle has open, or of the name itself (a link at the name is not followed); null when unknown.
+    // A reparse point (a file turned into a symbolic link in place, which keeps its identity and link count) ends in "/R", so no comparison with ".../1" accepts it (r11, sol r10 B1).
     public static string HandleFileIdentity(IntPtr h) {
         ByHandleInfo i;
         if (h == IntPtr.Zero || !GetFileInformationByHandle(h, out i)) return null;
-        return i.Volume.ToString("X8") + ":" + i.IndexHigh.ToString("X8") + i.IndexLow.ToString("X8") + "/" + i.Links.ToString();
+        return i.Volume.ToString("X8") + ":" + i.IndexHigh.ToString("X8") + i.IndexLow.ToString("X8") + "/" + i.Links.ToString() + ((i.Attributes & 0x400) != 0 ? "/R" : "");
+    }
+    // True when the object a handle has open is a reparse point now (a held directory turned into a junction in place keeps its handle); true when it cannot be read.
+    public static bool HandleIsReparse(IntPtr h) {
+        ByHandleInfo i;
+        if (h == IntPtr.Zero || !GetFileInformationByHandle(h, out i)) return true;
+        return (i.Attributes & 0x400) != 0;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct UnicodeString { public ushort Length, MaximumLength; public IntPtr Buffer; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct ObjectAttributes { public int Length; public IntPtr RootDirectory, ObjectName; public uint Attributes; public IntPtr SecurityDescriptor, SecurityQualityOfService; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct IoStatusBlock { public IntPtr Status, Information; }
+    [DllImport("ntdll.dll")]
+    static extern int NtCreateFile(out IntPtr handle, uint access, ref ObjectAttributes oa, out IoStatusBlock iosb, IntPtr allocationSize, uint attributes, uint share, uint disposition, uint options, IntPtr eaBuffer, uint eaLength);
+    [DllImport("ntdll.dll")]
+    static extern int RtlNtStatusToDosError(int status);
+    // Opens ONE name component inside the directory a held handle has open (NtCreateFile with RootDirectory = that handle): no path is walked, so a held directory turned into a
+    // junction after its last check, or any link on the way to it, is never followed; a link at the name itself is opened as itself (FILE_OPEN_REPARSE_POINT), never followed,
+    // and only a non-directory file is opened. Returns IntPtr.Zero with error = the Win32 code when it cannot (r11, sol r10 B2).
+    static IntPtr OpenIn(IntPtr dir, string name, uint access, uint share, uint disposition, out int error) {
+        error = 0;
+        if (dir == IntPtr.Zero || string.IsNullOrEmpty(name) || name == "." || name == ".." || name.IndexOfAny(new char[] { '\\', '/', ':' }) >= 0) { error = 123; return IntPtr.Zero; }
+        IntPtr text = Marshal.StringToHGlobalUni(name);
+        IntPtr us = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
+        try {
+            UnicodeString u = new UnicodeString(); u.Length = (ushort)(name.Length * 2); u.MaximumLength = (ushort)(name.Length * 2 + 2); u.Buffer = text;
+            Marshal.StructureToPtr(u, us, false);
+            ObjectAttributes oa = new ObjectAttributes(); oa.Length = Marshal.SizeOf(typeof(ObjectAttributes)); oa.RootDirectory = dir; oa.ObjectName = us; oa.Attributes = 0x40;  // OBJ_CASE_INSENSITIVE
+            IntPtr h; IoStatusBlock io;
+            // SYNCHRONIZE + FILE_SYNCHRONOUS_IO_NONALERT (0x20) | FILE_NON_DIRECTORY_FILE (0x40) | FILE_OPEN_REPARSE_POINT (0x200000)
+            int st = NtCreateFile(out h, access | 0x00100000, ref oa, out io, IntPtr.Zero, 0x80, share, disposition, 0x00200060, IntPtr.Zero, 0);
+            if (st < 0) { error = RtlNtStatusToDosError(st); return IntPtr.Zero; }
+            return h;
+        } finally { Marshal.FreeHGlobal(us); Marshal.FreeHGlobal(text); }
+    }
+    // CreateHeld, with the new file created inside the held directory itself (FILE_CREATE: fails when the name exists). A held directory that is a reparse point now is refused first.
+    public static IntPtr CreateHeldIn(IntPtr dir, string name, out int error) {
+        if (HandleIsReparse(dir)) { error = 4390; return IntPtr.Zero; }  // 4390: the sentinel the caller reports as dest-identity-changed
+        return OpenIn(dir, name, 0x80000000, 3, 2, out error);
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr ReOpenFile(IntPtr original, uint access, uint share, uint flags);
+    // Writes bytes into a held file through a handle opened FROM the held one (ReOpenFile: no name is looked up, a link at the name is not followed), and refuses before
+    // writing when that file is a reparse point now. The name is never reopened for writing, so a held temp converted in place into a symbolic link to a worktree file can
+    // never have that file truncated (r11, sol r10 B1). Returns null, or the typed reason.
+    public static string WriteHeld(IntPtr held, byte[] bytes) {
+        if (held == IntPtr.Zero) return "temp-not-held";
+        IntPtr w = ReOpenFile(held, 0x40000000 | 0x80, 3, 0x00200000);  // GENERIC_WRITE | FILE_READ_ATTRIBUTES, share READ|WRITE (the hold's own READ), FILE_FLAG_OPEN_REPARSE_POINT
+        if (w == (IntPtr)(-1)) return "temp-not-held:" + Marshal.GetLastWin32Error().ToString();
+        using (Microsoft.Win32.SafeHandles.SafeFileHandle safe = new Microsoft.Win32.SafeHandles.SafeFileHandle(w, true)) {
+            if (HandleIsReparse(w)) return "temp-reparse-point";
+            using (System.IO.FileStream fs = new System.IO.FileStream(safe, System.IO.FileAccess.Write)) { fs.SetLength(0); fs.Write(bytes, 0, bytes.Length); fs.Flush(true); }
+        }
+        return null;
+    }
+    // Renames <from> to <to>, both one name inside the held directory, through a handle on <from> opened inside that directory (DELETE, a link not followed), and only while
+    // that handle has the file with this identity, one name and no reparse point; the target is named relative to the same held directory (FILE_RENAME_INFO.RootDirectory),
+    // so no path through a junction is walked at either end. Never replaces. Returns 0, the Win32 error (80/183: <to> exists), or -1 when <from> is not that file (r11, sol r10 B2).
+    [DllImport("ntdll.dll")]
+    static extern int NtSetInformationFile(IntPtr handle, out IoStatusBlock iosb, IntPtr info, uint length, int infoClass);
+    public static int MoveIn(IntPtr dir, string from, string to, string identity) {
+        if (HandleIsReparse(dir)) return 4390;
+        if (string.IsNullOrEmpty(to) || to.IndexOfAny(new char[] { '\\', '/', ':' }) >= 0) return 123;
+        int error;
+        IntPtr h = OpenIn(dir, from, 0x00010080, 3, 1, out error);  // DELETE | FILE_READ_ATTRIBUTES, FILE_OPEN
+        if (h == IntPtr.Zero) return error;
+        try {
+            string now = HandleFileIdentity(h);
+            if (now == null || identity == null || now != identity + "/1") return -1;
+            byte[] name = Encoding.Unicode.GetBytes(to);
+            int nameAt = IntPtr.Size * 2 + 4;  // ReplaceIfExists (padded to a pointer), RootDirectory, FileNameLength, FileName
+            int size = (IntPtr.Size == 8 ? 24 : 16) + name.Length;  // sizeof(FILE_RENAME_INFO) + the name: the call refuses anything shorter (ERROR_INVALID_PARAMETER)
+            IntPtr info = Marshal.AllocHGlobal(size);
+            try {
+                for (int k = 0; k < size; k++) Marshal.WriteByte(info, k, 0);
+                Marshal.WriteIntPtr(info, IntPtr.Size, dir);
+                Marshal.WriteInt32(info, IntPtr.Size * 2, name.Length);
+                Marshal.Copy(name, 0, IntPtr.Add(info, nameAt), name.Length);
+                // NtSetInformationFile(FileRenameInformation = 10): kernel32's FileRenameInfo refuses a RootDirectory (ERROR_INVALID_PARAMETER).
+                IoStatusBlock io;
+                int st = NtSetInformationFile(h, out io, info, (uint)size, 10);
+                return st < 0 ? RtlNtStatusToDosError(st) : 0;
+            } finally { Marshal.FreeHGlobal(info); }
+        } finally { CloseHandle(h); }
+    }
+    // DeleteIfIdentity for a name inside the held directory, opened there (r11 class sweep: the cleanup no longer walks the destination path either).
+    public static bool DeleteIfIdentityIn(IntPtr dir, string name, string identity) {
+        int error;
+        IntPtr h = OpenIn(dir, name, 0x00010080, 7, 1, out error);
+        if (h == IntPtr.Zero) return false;
+        try {
+            string now = HandleFileIdentity(h);
+            if (now == null || identity == null || !now.StartsWith(identity + "/")) return false;
+            DispositionInfo d = new DispositionInfo(); d.DeleteFile = 1;
+            return SetFileInformationByHandle(h, 4, ref d, 1);
+        } finally { CloseHandle(h); }
     }
     public static string FileIdentity(string path) {
         IntPtr h = CreateFileW(Long(path), 0, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
@@ -289,43 +404,73 @@ function Get-DirtyHeldIdentity($Handle) { if ($null -eq $Handle) { return $null 
 # link planted at a generated name to a file in the worktree would have that file overwritten while the tracked diff, and so SAVED, stayed unchanged. CREATE_NEW refuses a name
 # that already exists (reason=temp-path-exists), and the hold (DirtyFinalPath.CreateHeld) keeps the name on this file until the move: nobody can rename or delete it.
 # Returns @{ Path; Handle; Id } (Id = volume serial + file index) or @{ Path = $null; Reason }. The file must still have one name at every use (Test-DirtyTempHeld).
-function New-DirtyHeldTemp([string]$Dir, [string]$Name) {
+# -DirHandle is the saver's hold on $Dir: the file is then created inside the held directory (DirtyFinalPath.CreateHeldIn), never by walking $Dir, so a destination turned into
+# a junction into the worktree after its last check gets nothing created through it (r11, sol r10 B2); a held directory that is a reparse point now is dest-identity-changed.
+function New-DirtyHeldTemp([string]$Dir, [string]$Name, $DirHandle = $null) {
     $path = Join-Path $Dir $Name -ErrorAction Stop
     if (-not ('DirtyFinalPath' -as [type])) { $null = Get-DirtyKernelPath $Dir }  # defines the type
     if (-not ('DirtyFinalPath' -as [type])) { return @{ Path = $null; Reason = 'temp-not-held' } }
     $err = 0
-    $h = [DirtyFinalPath]::CreateHeld($path, [ref]$err)
-    if ($h -eq [IntPtr]::Zero) { return @{ Path = $null; Reason = $(if ($err -in 80, 183) { 'temp-path-exists' } else { "temp-not-held:$err" }) } }
+    $h = if ($DirHandle -is [IntPtr]) { [DirtyFinalPath]::CreateHeldIn($DirHandle, (Split-Path -Leaf $path), [ref]$err) } else { [DirtyFinalPath]::CreateHeld($path, [ref]$err) }
+    if ($h -eq [IntPtr]::Zero) { return @{ Path = $null; Reason = $(if ($err -in 80, 183) { 'temp-path-exists' } elseif ($err -eq 4390) { 'dest-identity-changed' } else { "temp-not-held:$err" }) } }
     $id = [DirtyFinalPath]::HandleFileIdentity($h)
-    $temp = @{ Path = $path; Handle = $h; Id = $(if ($id) { $id.Split('/')[0] } else { $null }) }
+    $temp = @{ Path = $path; Handle = $h; Id = $(if ($id) { $id.Split('/')[0] } else { $null }); Dir = $(if ($DirHandle -is [IntPtr]) { $DirHandle } else { $null }) }
     if (-not $id -or -not $id.EndsWith('/1')) { Remove-DirtyTemp $temp; return @{ Path = $null; Reason = 'temp-file-linked' } }
     return $temp
 }
-# '' while a held temp is still one file with one name, read from the held handle (a link added to it would let a later write or the move reach another name); else the reason.
+# '' while a held temp is still one file with one name and not a reparse point, read from the held handle (a link added to it would let a later write or the move reach
+# another name; a symbolic link set on it in place keeps its identity and link count, r11 sol r10 B1); else the reason.
 function Test-DirtyTempHeld($Temp) {
     $now = $null
     if ($null -ne $Temp.Handle) { try { $now = [DirtyFinalPath]::HandleFileIdentity([IntPtr]$Temp.Handle) } catch { $now = $null } }
     if (-not $now) { return 'temp-not-held' }
+    if ($now.EndsWith('/R')) { return 'temp-reparse-point' }
     if ($now -cne ($Temp.Id + '/1')) { return 'temp-file-linked' }
     return ''
 }
 function Unlock-DirtyTemp($Temp) { if ($Temp -and $null -ne $Temp.Handle) { try { [DirtyFinalPath]::Unpin([IntPtr]$Temp.Handle) } catch { }; $Temp.Handle = $null } }  # not the directory-hold seam
 # Deletes a temp the saver created, and only while its name still opens onto that file: a replacement put at the name after the hold was released is left alone.
+# A temp created inside a held directory is deleted there too (DeleteIfIdentityIn), without walking the destination path.
 function Remove-DirtyTemp($Temp) {
     if (-not $Temp -or -not $Temp.Path) { return }
     Unlock-DirtyTemp $Temp
-    try { $null = [DirtyFinalPath]::DeleteIfIdentity($Temp.Path, $Temp.Id) } catch { }
+    try {
+        if ($Temp.Dir -is [IntPtr]) { $null = [DirtyFinalPath]::DeleteIfIdentityIn($Temp.Dir, (Split-Path -Leaf $Temp.Path), $Temp.Id) }
+        else { $null = [DirtyFinalPath]::DeleteIfIdentity($Temp.Path, $Temp.Id) }
+    } catch { }
 }
-# Writes lines (UTF-8, no BOM, each ended like WriteAllLines) into a held temp through its existing name, which the hold keeps on that file; the file is opened, never created.
-# Returns the SHA-256 of the bytes it wrote: that is the digest the file must hash to when it is placed, never a re-read of the file, which another writer could have
-# rewritten in between (the hold shares WRITE so git can write the diff temps; r10 iter 1, adversary 76fcbf8b-A3).
+# Writes bytes into a held temp THROUGH ITS HOLD (DirtyFinalPath.WriteHeld): the name is never reopened for writing, so a temp turned into a symbolic link to a worktree file
+# after it was created cannot have that file truncated or written (r11, sol r10 B1). Returns the SHA-256 of the bytes it wrote: that is the digest the file must hash to when
+# it is placed, never a re-read of the file, which another writer could have rewritten in between (r10 iter 1, adversary 76fcbf8b-A3); or, when it refuses, the typed reason
+# (temp-not-held / temp-reparse-point), which is not a digest and is reported as it is.
+function Write-DirtyTempBytes($Temp, [byte[]]$Bytes) {
+    if ($null -eq $Bytes) { $Bytes = [byte[]]::new(0) }
+    if ($null -eq $Temp.Handle) { return 'temp-not-held' }
+    $why = [DirtyFinalPath]::WriteHeld([IntPtr]$Temp.Handle, $Bytes)
+    if ($why) { return $why }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+}
+# Lines as UTF-8, no BOM, each ended like WriteAllLines, written by Write-DirtyTempBytes.
 function Write-DirtyTempLines($Temp, [string[]]$Lines) {
     $enc = New-Object System.Text.UTF8Encoding($false)
-    $bytes = $enc.GetBytes((@($Lines | ForEach-Object { $_ + [Environment]::NewLine }) -join ''))
-    $fs = [System.IO.File]::Open($Temp.Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
-    try { $fs.SetLength(0); $fs.Write($bytes, 0, $bytes.Length); $fs.Flush() } finally { $fs.Dispose() }
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try { return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+    return Write-DirtyTempBytes $Temp $enc.GetBytes((@($Lines | ForEach-Object { $_ + [Environment]::NewLine }) -join ''))
+}
+# Runs git -C $Wt <GitArgs> and returns @{ Exit; Bytes }: its standard output exactly as git wrote it. The saver writes those bytes into a held temp itself, so git is never
+# handed a temp NAME to open for truncating output (`--output=<temp>` followed a link set on the temp in place; r11, sol r10 B1). Seam: a test can cut the bytes.
+function Invoke-DirtyGitCapture([string]$Wt, [string[]]$GitArgs) {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = @(Get-Command git -CommandType Application)[0].Source
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    foreach ($a in (@('-C', $Wt) + $GitArgs)) { [void]$psi.ArgumentList.Add($a) }
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $null = $p.StandardError.ReadToEndAsync()  # drained so a chatty git cannot block on a full stderr pipe
+        $ms = New-Object System.IO.MemoryStream
+        $p.StandardOutput.BaseStream.CopyTo($ms)
+        $p.WaitForExit()
+        return @{ Exit = $p.ExitCode; Bytes = $ms.ToArray() }
+    } finally { $p.Dispose() }
 }
 
 # The files that name a repository to git (a gitfile's target, its commondir) and the directories they name, sampled BEFORE git reads anything (r10, sol r9 B1/B2).
@@ -580,24 +725,31 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             if (@($raw | Where-Object { $_ -cmatch '^:(160000 [0-7]{6}|[0-7]{6} 160000) ' }).Count -gt 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved" }
         }
         # Every before-write and before-publish check re-proves the destination AND the repository ($repoCheck) (r10, sol r9 B1/B2).
-        $guard ={ param($stage) $w = Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -WtIdentity $wtId -Stage $stage; if ($w) { return $w }; & $repoCheck }
+        # The held destination handle is asked too: a directory turned into a junction in place keeps the handle, and only its attributes show it (r11, sol r10 B2).
+        $guard ={ param($stage) $w = Test-DirtyDestStable -Dest $destReal -Identity $destId -WtReal $wtReal -WtIdentity $wtId -Stage $stage; if ($w) { return $w }
+            if ($destLock -is [IntPtr] -and [DirtyFinalPath]::HandleIsReparse($destLock)) { return 'dest-identity-changed' }; & $repoCheck }
         $why = & $guard 'before-write'
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }
         # Every temp file is created here, exclusively, before git or any writer opens it, and held until it is moved (New-DirtyHeldTemp; r10, sol r9 B3).
-        $tmp = New-DirtyHeldTemp $Dest ('dirty-worktree-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        # Each is created, written, renamed and cleaned up INSIDE the held destination ($destDir) and written only through its own hold (r11, sol r10 B1/B2): a destination
+        # turned into a junction, or a temp turned into a symbolic link, after its last check never steers a create or a write into the worktree. A hold a test fakes is
+        # not a handle, and the by-name path is kept for it.
+        $destDir = if ($destLock -is [IntPtr]) { $destLock } else { $null }
+        $tmp = New-DirtyHeldTemp $Dest ('dirty-worktree-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp') $destDir
         if (-not $tmp.Path) { $why = $tmp.Reason; $tmp = $null; return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }
         # The diff shape is pinned on every diff the saver runs, so no user, global or repo config can change what `git apply` (default -p1) has to read back:
         # a/ b/ prefixes (diff.noprefix / diff.mnemonicPrefix), no external driver or textconv (diff.external), -U3 (diff.context=0 and diff.interHunkContext would
         # emit a patch plain git apply rejects), no color (color.ui=always), short submodule lines (diff.submodule=log), submodules never ignored
         # (diff.ignoreSubmodules=all would hide a gitlink change) and no rename detection (diff.renames).
         $shape = @('--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--submodule=short', '--ignore-submodules=none', '-U3', '--src-prefix=a/', '--dst-prefix=b/')
-        & git -C $Wt diff HEAD @shape "--output=$($tmp.Path)" 2>$null
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $tmp.Path)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-exit-$LASTEXITCODE" }
+        $cap = Invoke-DirtyGitCapture -Wt $Wt -GitArgs (@('diff', 'HEAD') + $shape)
+        if ($cap.Exit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-diff-exit-$($cap.Exit)" }
+        # Digest first (of the bytes written), then the checks on those bytes, then the file must still hold them before it is placed (r8, adversary 98e161fc-A1).
+        $full = Write-DirtyTempBytes $tmp $cap.Bytes
+        if ($full -cnotmatch '^[0-9a-f]{64}\z') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$full" }
         $why = Test-DirtyTempHeld $tmp
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why" }
-        # Digest first, then the checks on those bytes, then the file must still hold them before it is placed (r8, adversary 98e161fc-A1; see Read-DirtyEvidence).
-        $patchEv = Read-DirtyEvidence $tmp.Path
-        $full = $patchEv.Full
+        $patchEv = @{ Bytes = $cap.Bytes; Full = $full }
         if (-not (Test-DirtyPatchComplete -Wt $Wt -Full $full -GitDiffArgs (@('diff', 'HEAD') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=patch-incomplete" }
         if (Test-DirtyDiffHasGitlink $patchEv.Bytes) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved" }
         if (-not (Test-DirtyEvidenceUnchanged -Path $tmp.Path -Full $full)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=evidence-changed-after-validation" }
@@ -605,7 +757,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $bytes = $patchEv.Bytes.Length
         # A placement that moved a file but could not prove its bytes names it as unverified=<path> after the evidence placed so far (r8, adversary 98e161fc-A3).
         $placeFailed = { param($r) "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($r.Reason)$evidence" + $(if ($r.Placed) { " unverified=$($r.Placed)" } else { '' }) }
-        $placed = Move-DirtyEvidenceToFreeName -Tmp $tmp.Path -Dir $Dest -Stem 'dirty-worktree-' -Ext '.patch' -Full $full -Guard $guard -Hold $tmp
+        $placed = Move-DirtyEvidenceToFreeName -Tmp $tmp.Path -Dir $Dest -Stem 'dirty-worktree-' -Ext '.patch' -Full $full -Guard $guard -Hold $tmp -DirHandle $destDir
         if (-not $placed.Path) { if ($placed.Placed) { $tmp = $null }; return (& $placeFailed $placed) }
         if ($placed.Moved) { $tmp = $null }
         $id = $placed.Id
@@ -620,10 +772,11 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         # free or identical, otherwise a hash-named sibling. A later save never rewrites an earlier snapshot.
         $why = & $guard 'before-write'
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-        $statTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-status-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        $statTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-status-' + [Guid]::NewGuid().ToString('N') + '.tmp') $destDir
         if (-not $statTmp.Path) { $why = $statTmp.Reason; $statTmp = $null; return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
         $statFull = Write-DirtyTempLines $statTmp $status  # UTF-8: quotepath=false prints literal non-ASCII names; the digest is of the bytes written
-        $statPlaced = Move-DirtyEvidenceToFreeName -Tmp $statTmp.Path -Dir $Dest -Stem "dirty-worktree-$id.status-" -Ext '.txt' -Full $statFull -FirstName "dirty-worktree-$id.status.txt" -Guard $guard -Hold $statTmp
+        if ($statFull -cnotmatch '^[0-9a-f]{64}\z') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$statFull$evidence" }
+        $statPlaced = Move-DirtyEvidenceToFreeName -Tmp $statTmp.Path -Dir $Dest -Stem "dirty-worktree-$id.status-" -Ext '.txt' -Full $statFull -FirstName "dirty-worktree-$id.status.txt" -Guard $guard -Hold $statTmp -DirHandle $destDir
         if (-not $statPlaced.Path) { if ($statPlaced.Placed) { $statTmp = $null }; return (& $placeFailed $statPlaced) }
         if ($statPlaced.Moved) { $statTmp = $null }
         $stat = $statPlaced.Path
@@ -643,10 +796,11 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             $state += $unmerged
             $why = & $guard 'before-write'
             if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-            $mergeTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-merge-state-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+            $mergeTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-merge-state-saving-' + [Guid]::NewGuid().ToString('N') + '.tmp') $destDir
             if (-not $mergeTmp.Path) { $why = $mergeTmp.Reason; $mergeTmp = $null; return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
             $mergeFull = Write-DirtyTempLines $mergeTmp $state
-            $mergePlaced = Move-DirtyEvidenceToFreeName -Tmp $mergeTmp.Path -Dir $Dest -Stem 'dirty-worktree-merge-state-' -Ext '.txt' -Full $mergeFull -Guard $guard -Hold $mergeTmp
+            if ($mergeFull -cnotmatch '^[0-9a-f]{64}\z') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$mergeFull$evidence" }
+            $mergePlaced = Move-DirtyEvidenceToFreeName -Tmp $mergeTmp.Path -Dir $Dest -Stem 'dirty-worktree-merge-state-' -Ext '.txt' -Full $mergeFull -Guard $guard -Hold $mergeTmp -DirHandle $destDir
             if (-not $mergePlaced.Path) { if ($mergePlaced.Placed) { $mergeTmp = $null }; return (& $placeFailed $mergePlaced) }
             if ($mergePlaced.Moved) { $mergeTmp = $null }
             return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=unmerged-index$evidence merge-state=$($mergePlaced.Path)"
@@ -660,18 +814,18 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         if ($stagedState -eq 1) {
             $why = & $guard 'before-write'
             if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-            $stagedTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-staging-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+            $stagedTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-staging-' + [Guid]::NewGuid().ToString('N') + '.tmp') $destDir
             if (-not $stagedTmp.Path) { $why = $stagedTmp.Reason; $stagedTmp = $null; return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-            & git -C $Wt diff --cached @shape "--output=$($stagedTmp.Path)" 2>$null
-            $stagedExit = $LASTEXITCODE
+            $stagedCap = Invoke-DirtyGitCapture -Wt $Wt -GitArgs (@('diff', '--cached') + $shape)
+            $stagedExit = $stagedCap.Exit
             if ($stagedExit -ne 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=git-staged-diff-exit-$stagedExit$evidence" }
-            # A full volume can cut the file short without git saying so: the staged diff must be non-empty and byte-identical to git's own stream for the index.
-            # Digest first; every check below runs on these bytes, and the file must still hold them before it is placed (r8, adversary 98e161fc-A1).
-            if (-not (Test-Path -LiteralPath $stagedTmp.Path)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
+            # A capture can come back short without git saying so: the staged diff must be non-empty and byte-identical to git's own stream for the index.
+            # Digest first (of the bytes written); every check below runs on these bytes, and the file must still hold them before it is placed (r8, adversary 98e161fc-A1).
+            $stagedFull = Write-DirtyTempBytes $stagedTmp $stagedCap.Bytes
+            if ($stagedFull -cnotmatch '^[0-9a-f]{64}\z') { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$stagedFull$evidence" }
             $why = Test-DirtyTempHeld $stagedTmp
             if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-            $stagedEv = Read-DirtyEvidence $stagedTmp.Path
-            $stagedFull = $stagedEv.Full
+            $stagedEv = @{ Bytes = $stagedCap.Bytes; Full = $stagedFull }
             if ($stagedEv.Bytes.Length -eq 0) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
             if (-not (Test-DirtyPatchComplete -Wt $Wt -Full $stagedFull -GitDiffArgs (@('diff', '--cached') + $shape))) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=staged-diff-incomplete$evidence" }
             # The header's promise, kept for every input: the diff must reverse-apply to the index it was taken from. --whitespace=nowarn: apply.whitespace=error in a user or repo config would
@@ -682,7 +836,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             if (Test-DirtyDiffHasGitlink $stagedEv.Bytes) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=gitlink-change-not-saved$evidence" }
             # `git apply` above read the file, not the bytes; this re-hash also proves it read the bytes that were digested (unless rewritten and put back in between: OPEN r10-R2).
             if (-not (Test-DirtyEvidenceUnchanged -Path $stagedTmp.Path -Full $stagedFull)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=evidence-changed-after-validation$evidence" }
-            $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp.Path -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull -Guard $guard -Hold $stagedTmp
+            $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp.Path -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull -Guard $guard -Hold $stagedTmp -DirHandle $destDir
             if (-not $stagedPlaced.Path) { if ($stagedPlaced.Placed) { $stagedTmp = $null }; return (& $placeFailed $stagedPlaced) }
             if ($stagedPlaced.Moved) { $stagedTmp = $null }
             $stagedOut = $stagedPlaced.Path
