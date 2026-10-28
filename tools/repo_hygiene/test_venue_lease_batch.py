@@ -2843,6 +2843,23 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(b["endReason"], "ALL_LEGS_DONE")
         self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=INPUT_VANISHED item=1 ", r.stderr)
 
+    def test_r5b_b1_a_final_batch_spec_that_is_there_but_will_not_open_is_input_unreadable_with_the_receipts_written(self) -> None:
+        # r5b (item (c)'s other half): a spec that already ran is replaced by a junction to a folder that does not exist: the name is there, nothing opens through it. INPUT_UNREADABLE, not a
+        # runner output: the receipts are written and the run still ends on it (exit 2), never exit 0.
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        nowhere = psq(self.case / "r5" / "no-such-folder")
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Delete('{psq(spec)}'); [void][IO.Directory]::CreateDirectory('{nowhere}'); "
+                         f"New-Item -ItemType Junction -Path '{psq(spec)}' -Value '{nowhere}' | Out-Null; [IO.Directory]::Delete('{nowhere}')")
+        self.assertTrue(os.path.lexists(spec) and not spec.exists(), "the spec is a dangling junction (the case under test)\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"], res["logWriteFailures"]), (2, "INPUT_UNREADABLE", 1, [], 0))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr, "an input that will not open is not a runner output")
+        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "an unreadable input suppresses no receipt")
+        self.assertEqual(len(self.batches()), 1)
+        self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=INPUT_UNREADABLE item=1 ", r.stderr)
+
     def test_r5_b1_a_leg_plan_moved_away_during_the_final_batch_is_input_vanished_and_one_replaced_in_full_is_clean(self) -> None:
         spec = self._r5_spec("fx-a.json", self.specs[0])
         plan = self.write_plan([self.item(spec, "A", self.commit_a)])
