@@ -803,7 +803,7 @@ def _heavy(box: dict, mode: str, mode_args: list, sha: str = None, shim: Path = 
     })
     return subprocess.run(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GUARD),
-         "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(lock or box["lock"]),
+         "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(box["lock"] if lock is None else lock),
          "-ExemptLogPath", str(box["exempt_log"]), "-HeavySlotSha256", _stub_sha() if sha is None else sha, *mode_args],
         capture_output=True, text=True, timeout=120, env=env, check=False,
     )
@@ -1383,7 +1383,7 @@ def test_a_complete_ready_file_that_does_not_parse_is_could_not_check(box) -> No
 @pytest.mark.parametrize("final", ["none", "empty"])
 def test_an_incomplete_ready_file_left_by_an_ended_heavy_slot_is_could_not_check(box, final) -> None:
     # sol r4 B1 (r5): the ready file was never completed (a failed Set-Content, then the holder's trap: 'none'), or is empty,
-    # and heavy-slot has ended with 1. No holder identity was ever read, so it is no identity-based REQUEUE.
+    # and heavy-slot has ended with 1. No complete record was ever read, so it is no identity-based REQUEUE.
     done = _heavy(box, "readypartial", ["-Command", _marker_command(box)],
                   extra={"STUB_HEAVY_SLOT_CHILD_S": "0", "STUB_HEAVY_SLOT_FINAL": final, "STUB_HEAVY_SLOT_CODE": "1"})
     assert done.returncode == 1, done.stdout + done.stderr
@@ -1391,7 +1391,10 @@ def test_an_incomplete_ready_file_left_by_an_ended_heavy_slot_is_could_not_check
         done.stdout + done.stderr
     assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout and "heavy-slot: admitted" not in done.stderr
     assert not box["marker"].exists() and not box["lock"].exists()
-    assert list((box["dir"] / "heavy-slot").iterdir()) == []
+    # r8 (3e68ca85-A1): the partial record's written holder line names a holder that has ended, so everything goes; an empty
+    # one names nobody, so nothing proves its holder gone and the stop file stays.
+    left = sorted(p.suffix for p in (box["dir"] / "heavy-slot").iterdir())
+    assert left == ([] if final == "none" else [".stop"]), left
 
 
 @pytest.mark.parametrize("text, verdict", [
@@ -1418,6 +1421,87 @@ def test_a_slot_gone_exit_without_a_holder_identity_never_requeues(box, text, ve
     assert done.returncode == (3 if "REQUEUE" in verdict else 1), done.stdout + done.stderr
     if "REQUEUE" not in verdict:
         assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
+
+
+# r8 (adversary 3e68ca85-A1): a partial ready file (the holder was descheduled before its owner and end lines) with heavy-slot's
+# cmd wrapper already ended. Cleanup used to delete the stop file at once, so the holder, resuming later, held the machine slot
+# for as long as the host lived. The stop file now goes only once the holder is PROVEN gone (pid + start ticks); a holder line
+# not on disk yet, or a holder still running after the 10 s wait, keeps it. The holder here sleeps through the cleanup.
+_STOP_HOLDER_LEASE = (
+    "$p = [pscustomobject]@{{ Id = 1; HasExited = $true; ExitCode = 1 }}\n"
+    "$p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {{ param($ms) $true }}\n"
+    "$lease = @{{ Label = 'mlv:t:build'; BuildLabel = 'build'; Ready = '{ready}'; Stop = '{stop}'; "
+    "ExitFile = '{d}\\x.exit.json'; Log = '{d}\\x.log'; Lines = [System.Collections.Generic.List[string]]::new(); "
+    "Process = $p; Ticket = ''; Holder = $null; Owner = $null; Gone = ''; Tail = ''; LogUnread = $false; ReadySeen = $true }}\n"
+)
+
+
+def _sleeping_holder(stop: Path, result: Path, delay: int) -> subprocess.Popen:
+    # Sleeps $delay s, then polls for the stop file for at most 20 s: 'stopped' when it saw it, else 'held'.
+    script = (f"Start-Sleep -Seconds {delay}; $t = [Diagnostics.Stopwatch]::StartNew(); "
+              f"while (-not (Test-Path -LiteralPath '{stop}')) {{ if ($t.Elapsed.TotalSeconds -gt 20) "
+              f"{{ Set-Content -LiteralPath '{result}' -Value held; exit 2 }}; Start-Sleep -Milliseconds 200 }}; "
+              f"Set-Content -LiteralPath '{result}' -Value stopped")
+    return subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], env=_env())
+
+
+@pytest.mark.parametrize("partial, delay, kept", [
+    ("holder", 2, False),    # the holder line is on disk: the 10 s wait sees the holder take the stop and end
+    ("holder", 13, True),    # still asleep after the wait: not proven gone, so the stop file stays for it
+    ("ticket", 2, True),     # no holder line yet: nothing can prove it gone, so the stop file stays
+])
+def test_a_partial_ready_file_keeps_the_stop_file_while_its_holder_may_still_run(box, partial, delay, kept) -> None:
+    d = box["dir"]
+    ready, stop, result = d / "x.ready", d / "x.stop", d / "holder-result.txt"
+    holder = _sleeping_holder(stop, result, delay)
+    try:
+        line = "\"holder={0}@{1}`n\" -f $h.Id, $h.StartTime.ToUniversalTime().Ticks" if partial == "holder" else "''"
+        done = _ps(["-Command",
+                    f". '{GUARD}' -Library\n"
+                    f"$h = Get-Process -Id {holder.pid}\n"
+                    f"[IO.File]::WriteAllText('{ready}', \"t-1:1`n\" + ({line}))\n"
+                    + _STOP_HOLDER_LEASE.format(ready=ready, stop=stop, d=d) +
+                    "Exit-HeavySlotHolderGone $lease\n"])
+        holder.wait(timeout=60)
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()
+    out = done.stdout + done.stderr
+    assert done.returncode == 1, out
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=1 reason=ready file incomplete" in done.stdout, out
+    assert result.read_text(encoding="ascii").strip() == "stopped", f"the holder never saw a stop file: {out}"
+    assert stop.exists() == kept, out
+
+
+def test_the_stop_file_is_needed_until_its_holder_is_proven_gone(box) -> None:
+    # The one predicate behind every stop-file write and delete (r8, 3e68ca85-A1 and its siblings): needed while heavy-slot's
+    # wrapper runs, and after it ended until the holder named by a written holder line, complete record or not, is gone.
+    d = box["dir"]
+    cases = {
+        "running-no-ready": (None, False),
+        "ended-no-ready": (None, True),
+        "ended-ticket-only": ("t-1:1`n", True),
+        "ended-partial-live": ("t-1:1`nholder={live}`n", True),
+        "ended-partial-dead": ("t-1:1`nholder=8420@1`n", True),
+        "ended-complete-dead": ("t-1:1`nholder=8420@1`nowner=none`nend`n", True),
+        # A holder line with no newline yet may be cut short ('8420@1' of '8420@1234...'), so it proves nothing.
+        "ended-unfinished-line": ("t-1:1`nholder=8420@1", True),
+    }
+    body = f". '{GUARD}' -Library\n$me = Get-Process -Id $PID; $live = '{{0}}@{{1}}' -f $PID, $me.StartTime.ToUniversalTime().Ticks\n"
+    for name, (text, exited) in cases.items():
+        ready = d / f"{name}.ready"
+        if text is not None:
+            body += f"[IO.File]::WriteAllText('{ready}', (\"{text}\" -replace '\\{{live\\}}', $live))\n"
+        body += (f"$p = [pscustomobject]@{{ Id = 1; HasExited = ${str(exited).lower()} }}\n"
+                 f"$lease = @{{ Ready = '{ready}'; Process = $p; Holder = $null; ReadySeen = ${str(text is not None).lower()} }}\n"
+                 f"Write-Output ('{name}=' + (Test-HeavySlotStopNeeded $lease))\n")
+    done = _ps(["-Command", body])
+    out = done.stdout + done.stderr
+    want = {"running-no-ready": True, "ended-no-ready": True, "ended-ticket-only": True, "ended-partial-live": True,
+            "ended-partial-dead": False, "ended-complete-dead": False, "ended-unfinished-line": True}
+    for name, needed in want.items():
+        assert f"{name}={needed}" in done.stdout, out
 
 
 def test_the_holder_binds_the_slot_owner_to_its_exported_start_time(box) -> None:
@@ -1953,14 +2037,16 @@ def _release_pipe(pipe, guard) -> str:
     return b"".join(chunks).decode("ascii", "replace")
 
 
-def _heavy_popen(box: dict, mode_args: list, memory: list = None, **streams) -> subprocess.Popen:
+def _heavy_popen(box: dict, mode_args: list, memory: list = None, sha: str = None, env_extra: dict = None,
+                 **streams) -> subprocess.Popen:
     memory_file = _write_json(box["dir"] / "memory.json", OK_MEMORY if memory is None else memory)
     table_file = _write_json(box["dir"] / "table.json", [])
-    env = _env(heavy_slot=HEAVY_STUB, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log")})
+    env = _env(heavy_slot=HEAVY_STUB, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log"),
+                                             **(env_extra or {})})
     return subprocess.Popen(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GUARD),
          "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(box["lock"]),
-         "-ExemptLogPath", str(box["exempt_log"]), "-HeavySlotSha256", _stub_sha(), *mode_args],
+         "-ExemptLogPath", str(box["exempt_log"]), "-HeavySlotSha256", _stub_sha() if sha is None else sha, *mode_args],
         stdout=streams.get("stdout", subprocess.DEVNULL), stderr=streams.get("stderr", subprocess.DEVNULL), env=env,
     )
 
@@ -2021,6 +2107,40 @@ def test_an_undrained_full_stdout_gives_the_heavy_slot_back_before_the_refusal(b
     assert not box["marker"].exists() and not box["lock"].exists()
 
 
+# r8 (adversary 3e68ca85-A2): an ancestor that holds a heavy slot (it exported HEAVY_SLOT_HELD) keeps it until this guard
+# ends, so no typed line may wait on an undrained stdout there: the pin-mismatch refusal (nothing taken) and a refusal after
+# the guard's own slot was given back both end the guard within the bound. The pipe is drained afterwards (no real hang).
+_ANCESTOR_REFUSALS = {
+    "pin-mismatch": (["-Command", "exit 0"], None, "0" * 64, 3),
+    "memory": (["-DeadlineMinutes", "0", "-Command", "exit 0"], [{"freePhysGB": 0, "freeCommitGB": 0}], None, 3),
+}
+
+
+@pytest.mark.parametrize("refusal", sorted(_ANCESTOR_REFUSALS))
+def test_a_refusal_under_an_ancestor_slot_never_waits_on_an_undrained_stdout(box, refusal) -> None:
+    args, memory, sha, want = _ANCESTOR_REFUSALS[refusal]
+    pipe = _full_pipe()
+    guard = _heavy_popen(box, args, memory=memory, sha=sha, env_extra={"HEAVY_SLOT_HELD": f"anc-1:{os.getpid()}"}, stdout=pipe[1])
+    try:
+        try:
+            code = guard.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            code = None
+    finally:
+        _release_pipe(pipe, guard)
+    assert code == want, f"the {refusal} refusal waited on an undrained stdout while an ancestor held the machine heavy slot"
+    assert not box["lock"].exists()
+
+
+def test_a_pin_refusal_without_an_ancestor_slot_still_reaches_a_late_stdout_reader(box) -> None:
+    # Control: no slot is held anywhere, so the typed line waits for its reader and is there once the pipe is drained.
+    pipe = _full_pipe()
+    guard = _heavy_popen(box, ["-Command", "exit 0"], sha="0" * 64, stdout=pipe[1])
+    out = _release_pipe(pipe, guard)
+    assert guard.returncode == 3, out
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=pin-mismatch expected=" + "0" * 64 in out, out
+
+
 @pytest.mark.parametrize("stream", ["stderr", "stdout"])
 def test_a_closed_output_reader_still_gives_the_typed_verdict(box, stream) -> None:
     # Control: a reader that has already closed its end is a different failure (the write fails at once). The guard still
@@ -2079,12 +2199,12 @@ def test_a_stderr_that_recovers_after_a_full_queue_gets_every_line() -> None:
     done = _ps(["-Command",
                 f". '{GUARD}' -Library\n"
                 "$tcs = [System.Threading.Tasks.TaskCompletionSource[System.IO.Stream]]::new()\n"
-                "$script:BuildGuardLogOpen = $tcs.Task\n"
+                "$script:BuildGuardStderr.Open = $tcs.Task\n"
                 "for ($i = 0; $i -lt 256; $i++) { Write-BuildGuardStderr ('queued-{0}' -f $i) }\n"
                 "$ms = [System.IO.MemoryStream]::new()\n"
                 "[void]$tcs.TrySetResult($ms)\n"
                 "$lease = Enter-HeavySlot -Options @{ HeavySlotCmd = 'C:\\no-such-heavy-slot-for-review\\heavy-slot.cmd' } -Label t\n"
-                "Write-Output (\"lease-null={0} dropped={1}\" -f ($null -eq $lease), $script:BuildGuardLogDropped)\n"
+                "Write-Output (\"lease-null={0} dropped={1}\" -f ($null -eq $lease), $script:BuildGuardStderr.Dropped)\n"
                 "Write-Output ([Text.Encoding]::ASCII.GetString($ms.ToArray()))\n"])
     out = done.stdout + done.stderr
     assert "lease-null=True dropped=0" in done.stdout, out
@@ -2133,7 +2253,7 @@ def test_a_line_queued_behind_a_late_open_is_written_when_the_guard_ends(box, en
                 f"LockPath = '{box['lock']}'; MutexName = 'Local\\MLV-R7B-A1-{os.getpid()}'; ExemptLogPath = '{box['exempt_log']}' }}\n"
                 "Invoke-BuildGuard -Label t -Options $o -Action { param($Jobs) [void]$tcs.TrySetResult($fs); "
                 + ("" if ending == "return" else ending) + " }\n"
-                "Write-Output (\"queued={0} dropped={1}\" -f $script:BuildGuardLogBytes.Count, $script:BuildGuardLogDropped)\n"])
+                "Write-Output (\"queued={0} dropped={1}\" -f $script:BuildGuardStderr.Bytes.Count, $script:BuildGuardStderr.Dropped)\n"])
     out = done.stdout + done.stderr
     written = out_file.read_bytes().decode("ascii", "replace") if out_file.exists() else ""
     if ending == "return":
@@ -2148,7 +2268,7 @@ def test_a_line_queued_behind_a_late_open_is_written_when_the_guard_ends(box, en
 
 def test_a_stderr_that_cannot_be_opened_or_written_counts_every_line_it_drops() -> None:
     # r7b (fable r6b note on :189-195): an open that faults takes no line, and a write that fails loses its line. Each one
-    # is counted in BuildGuardLogDropped, never left queued until the cap and lost silently.
+    # is counted in the stderr channel's Dropped, never left queued until the cap and lost silently.
     done = _ps(["-Command",
                 f". '{GUARD}' -Library\n"
                 "$tcs = [System.Threading.Tasks.TaskCompletionSource[System.IO.Stream]]::new()\n"
@@ -2156,13 +2276,13 @@ def test_a_stderr_that_cannot_be_opened_or_written_counts_every_line_it_drops() 
                 "function New-BuildGuardStderrOpen { return $tcs.Task }\n"
                 "Write-BuildGuardLog 'one'; Write-BuildGuardLog 'two'; Write-BuildGuardLog 'three'\n"
                 "Complete-BuildGuardStderr\n"
-                "Write-Output (\"faulted-open queued={0} dropped={1}\" -f $script:BuildGuardLogBytes.Count, $script:BuildGuardLogDropped)\n"
+                "Write-Output (\"faulted-open queued={0} dropped={1}\" -f $script:BuildGuardStderr.Bytes.Count, $script:BuildGuardStderr.Dropped)\n"
                 "$ms = [System.IO.MemoryStream]::new(); $ms.Dispose()\n"
-                "$script:BuildGuardLogOpen = [System.Threading.Tasks.Task]::FromResult([System.IO.Stream]$ms)\n"
-                "$script:BuildGuardLogDropped = 0\n"
+                "$script:BuildGuardStderr.Open = [System.Threading.Tasks.Task]::FromResult([System.IO.Stream]$ms)\n"
+                "$script:BuildGuardStderr.Dropped = 0\n"
                 "Write-BuildGuardLog 'four'; Write-BuildGuardLog 'five'\n"
                 "Complete-BuildGuardStderr\n"
-                "Write-Output (\"failed-write pending={0} dropped={1}\" -f $script:BuildGuardLogPending.Count, $script:BuildGuardLogDropped)\n"])
+                "Write-Output (\"failed-write pending={0} dropped={1}\" -f $script:BuildGuardStderr.Pending.Count, $script:BuildGuardStderr.Dropped)\n"])
     out = done.stdout + done.stderr
     assert "faulted-open queued=0 dropped=3" in done.stdout, out
     assert "failed-write pending=0 dropped=2" in done.stdout, out
@@ -2203,13 +2323,15 @@ def test_a_closed_stdout_never_turns_a_lost_slot_release_into_a_throw(tmp_path) 
 
 
 def test_the_hung_tool_clock_starts_before_any_diagnostic_line() -> None:
-    # r6 B1: the clock starts before the launch, and no guard stderr line bypasses the bounded writer while a slot can be held
-    # (the two left are usage errors, written before any slot is taken).
+    # r6 B1: the clock starts before the launch, and no guard stderr line bypasses the bounded writer while a slot can be held.
     text = GUARD.read_text(encoding="ascii")
     body = text[text.index("function Enter-HeavySlot"):text.index("function Exit-HeavySlot(")]
     clock = body.index("$waitClock = [System.Diagnostics.Stopwatch]::StartNew()")
     assert clock < body.index("[System.Diagnostics.Process]::Start($psi)") < body.index("heavy-slot: waiting label=")
-    assert text.count("[Console]::Error.WriteLine(") == 2, "a guard stderr line must go through Write-BuildGuardStderr"
+    # r8 (3e68ca85-A2): the two usage errors are bounded too, and no typed line is written to stdout unbounded.
+    assert text.count("[Console]::Error.WriteLine(") == 0, "a guard stderr line must go through Write-BuildGuardStderr"
+    assert text.count("[Console]::Out.WriteLine(") == 0, "a typed line must go through Write-BuildGuardTyped"
+    assert len(re.findall(r"Write-Output \('BUILD_|Write-Output \(\"BUILD_", text)) == 0, "a typed line must go through Write-BuildGuardTyped"
 
 
 # r7 (a34e2098-A1, sol + fable r6b; folds BUILD-GUARD-NONTERMINATING-ERROR-STDERR-1): a non-terminating error the guard's own

@@ -110,6 +110,9 @@
 # runs while a slot is held writes an error record, which the host renders to stderr synchronously, past that bound (r7,
 # a34e2098-A1): the memory probe, the process census, the build-slot acquire and its release are Stop-scoped, and each failure
 # is caught and logged, or refuses admission by a throw that the outer finally follows with the heavy-slot release.
+# Typed lines are bounded the same way (r8, adversary 3e68ca85-A2), since a heavy slot an ancestor holds stays held until the
+# guard ends: see Write-BuildGuardTyped and Complete-BuildGuardOutput. A stop file is deleted only once its holder is proven
+# gone by pid + start ticks (r8, adversary 3e68ca85-A1): see Test-HeavySlotStopNeeded.
 # Test seams (used by tests/coordination/test_build_guard.py, no real probe needed):
 #   -MemoryProbeFile   JSON array of {"freePhysGB":n,"freeCommitGB":n}, one sample per poll, last repeats
 #   -ProcessTableFile  JSON array of {"ProcessId":n,"Name":"cc1plus.exe","CreationDate":"<iso>"}
@@ -176,15 +179,21 @@ $script:HeavySlotGiveUpSlackMinutes = 15
 # Stream.WriteAsync, which runs the write on the thread pool and keeps the lines in order; the guard waits at most
 # $script:BuildGuardLogWaitMs per line, for the open and the write together. A stderr nobody drains costs one bounded wait; while a write is still pending, later
 # lines queue without waiting, at most $script:BuildGuardLogMaxPending of them (the rest are dropped and counted in
-# $script:BuildGuardLogDropped), so admission polling, the hung-tool bound and every release keep running. A drained stderr
+# the channel's Dropped), so admission polling, the hung-tool bound and every release keep running. A drained stderr
 # has each line written before the guard goes on, as before. Lines still queued when the guard ends go out in
 # Complete-BuildGuardStderr, after every slot is given back (r7b); a line an open or a write failed on is counted as dropped.
+# r8 (adversary 3e68ca85-A2): the typed lines go to stdout through the same bounded writer, on a channel of their own
+# (Write-BuildGuardTyped). A heavy slot an ancestor holds (it exported HEAVY_SLOT_HELD) is held until this guard ends, so the
+# guard never waits past the bound for a typed line there, not even at the end. With no ancestor slot every slot of this guard
+# is given back before its typed line, so at the end it waits for that line however long its reader takes, and a late reader
+# still gets it (Complete-BuildGuardOutput).
 $script:BuildGuardLogWaitMs = 2000
 $script:BuildGuardLogMaxPending = 256
-$script:BuildGuardLogDropped = 0
-$script:BuildGuardLogOpen = $null
-$script:BuildGuardLogBytes = [System.Collections.Generic.Queue[byte[]]]::new()
-$script:BuildGuardLogPending = [System.Collections.Generic.Queue[System.Threading.Tasks.Task]]::new()
+# One channel per stream: the opener, the open task, the lines waiting for it, the writes still pending, the lines dropped.
+$script:BuildGuardStderr = @{ Opener = 'New-BuildGuardStderrOpen'; Open = $null; Dropped = 0
+    Bytes = [System.Collections.Generic.Queue[byte[]]]::new(); Pending = [System.Collections.Generic.Queue[System.Threading.Tasks.Task]]::new() }
+$script:BuildGuardStdout = @{ Opener = 'New-BuildGuardStdoutOpen'; Open = $null; Dropped = 0
+    Bytes = [System.Collections.Generic.Queue[byte[]]]::new(); Pending = [System.Collections.Generic.Queue[System.Threading.Tasks.Task]]::new() }
 
 function New-BuildGuardStderrOpen {
     # The task that opens the raw stderr stream on the thread pool (a test seam: a test replaces it to open a slow stream).
@@ -192,14 +201,26 @@ function New-BuildGuardStderrOpen {
     return [System.Threading.Tasks.Task]::Run($open)
 }
 
-function Send-BuildGuardStderrQueue {
+function New-BuildGuardStdoutOpen {
+    # The same for the raw stdout stream, which carries the typed lines.
+    $open = [Delegate]::CreateDelegate([Func[System.IO.Stream]], [Console].GetMethod('OpenStandardOutput', [Type[]]@()))
+    return [System.Threading.Tasks.Task]::Run($open)
+}
+
+function Test-BuildGuardAncestorSlot {
+    # True when an ancestor holds a heavy slot (heavy-slot exports HEAVY_SLOT_HELD to the command it runs): it keeps that slot
+    # until this guard ends, so no guard output may wait on its reader without a bound.
+    return [bool]([string]$env:HEAVY_SLOT_HELD).Trim()
+}
+
+function Send-BuildGuardStderrQueue($Ch = $script:BuildGuardStderr) {
     # Once the stream is open, every queued line goes out (WriteAsync, in order); returns the last write task, or $null.
-    $open = $script:BuildGuardLogOpen
+    $open = $Ch.Open
     if (-not $open -or -not $open.IsCompleted) { return $null }
-    $waiting = $script:BuildGuardLogBytes
+    $waiting = $Ch.Bytes
     if ($open.Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion -or $null -eq $open.Result) {
-        # A stderr that could not be opened takes no line: each one is counted as dropped, never lost silently (r7b, fable r6b note).
-        $script:BuildGuardLogDropped += $waiting.Count
+        # A stream that could not be opened takes no line: each one is counted as dropped, never lost silently (r7b, fable r6b note).
+        $Ch.Dropped += $waiting.Count
         $waiting.Clear()
         return $null
     }
@@ -207,8 +228,8 @@ function Send-BuildGuardStderrQueue {
     $task = $null
     while ($waiting.Count -gt 0) {
         $bytes = $waiting.Dequeue()
-        try { $task = $stream.WriteAsync($bytes, 0, $bytes.Length) } catch { $script:BuildGuardLogDropped++; continue }
-        $script:BuildGuardLogPending.Enqueue($task)
+        try { $task = $stream.WriteAsync($bytes, 0, $bytes.Length) } catch { $Ch.Dropped++; continue }
+        $Ch.Pending.Enqueue($task)
     }
     return $task
 }
@@ -219,51 +240,66 @@ function Wait-BuildGuardStderrTask($Task, $Clock) {
     [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($Task), $left)
 }
 
-function Clear-BuildGuardStderrDone {
+function Clear-BuildGuardStderrDone($Ch = $script:BuildGuardStderr) {
     # Finished writes leave the pending queue; one that failed lost its line, which is counted as dropped (r7b).
-    $q = $script:BuildGuardLogPending
+    $q = $Ch.Pending
     while ($q.Count -gt 0 -and $q.Peek().IsCompleted) {
-        if ($q.Dequeue().Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion) { $script:BuildGuardLogDropped++ }
+        if ($q.Dequeue().Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion) { $Ch.Dropped++ }
     }
 }
 
-function Write-BuildGuardStderr([string]$Line) {
+function Write-BuildGuardStderr([string]$Line, $Ch = $script:BuildGuardStderr) {
     try {
         # One deadline for the whole line, the open and the write together (r6b adversary A2).
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        $q = $script:BuildGuardLogPending
-        $waiting = $script:BuildGuardLogBytes
-        # Lines queued while the open was still pending go out before the capacity check, so a stderr that recovers gets
+        $q = $Ch.Pending
+        $waiting = $Ch.Bytes
+        # Lines queued while the open was still pending go out before the capacity check, so a stream that recovers gets
         # them and every later line instead of dropping all of them (r6b adversary A1).
-        [void](Send-BuildGuardStderrQueue)
-        Clear-BuildGuardStderrDone
-        if ($q.Count + $waiting.Count -ge $script:BuildGuardLogMaxPending) { $script:BuildGuardLogDropped++; return }
+        [void](Send-BuildGuardStderrQueue $Ch)
+        Clear-BuildGuardStderrDone $Ch
+        if ($q.Count + $waiting.Count -ge $script:BuildGuardLogMaxPending) { $Ch.Dropped++; return }
         $waiting.Enqueue([Console]::OutputEncoding.GetBytes($Line + [Environment]::NewLine))
         # Stalled: an earlier line (or the open) is still pending, so this one only queues behind it.
-        $stalled = $q.Count -gt 0 -or ($script:BuildGuardLogOpen -and -not $script:BuildGuardLogOpen.IsCompleted)
-        if (-not $script:BuildGuardLogOpen) { $script:BuildGuardLogOpen = New-BuildGuardStderrOpen }
-        $open = $script:BuildGuardLogOpen
+        $stalled = $q.Count -gt 0 -or ($Ch.Open -and -not $Ch.Open.IsCompleted)
+        if (-not $Ch.Open) { $Ch.Open = & $Ch.Opener }
+        $open = $Ch.Open
         if (-not $stalled -and -not $open.IsCompleted) { Wait-BuildGuardStderrTask $open $clock }
-        $task = Send-BuildGuardStderrQueue
+        $task = Send-BuildGuardStderrQueue $Ch
         if (-not $stalled -and $task) { Wait-BuildGuardStderrTask $task $clock }
     } catch { }
 }
 
-function Complete-BuildGuardStderr {
+function Write-BuildGuardTyped([string]$Line) {
+    # A typed line (BUILD_HEAVY_SLOT_*, BUILD_MEM_REFUSED, BUILD_SLOT_BUSY, HEAVY_SLOT_LOST_DURING_ACTION) to stdout, bounded
+    # like a log line (r8, adversary 3e68ca85-A2); it never throws, so a closed stdout never fails a release (r6b adversary A2).
+    Write-BuildGuardStderr $Line $script:BuildGuardStdout
+}
+
+function Complete-BuildGuardStderr($Ch = $script:BuildGuardStderr, [switch]$UntilWritten) {
     # r7b (adversary 8d0c73bd-A1): a line can still be queued when the guard is done, because its open completed after the
     # last line was logged and no later line sent it (a fail-open warning before a quiet action, say). Invoke-BuildGuard
     # calls this last, in its outermost finally, after both slots are given back, on every way out (an exit included): the
     # queue goes out and the guard waits for it, at most $script:BuildGuardLogWaitMs in all, the open and the writes together.
-    # A stderr still not open after that keeps its lines queued (a later line sends them); one that failed counts them dropped.
+    # A stream still not open after that keeps its lines queued (a later line sends them); one that failed counts them dropped.
+    # -UntilWritten waits with no bound (stdout with no ancestor slot: nothing is held any more, see Complete-BuildGuardOutput).
     try {
-        $open = $script:BuildGuardLogOpen
+        $open = $Ch.Open
         if (-not $open) { return }
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        if ($script:BuildGuardLogBytes.Count -gt 0 -and -not $open.IsCompleted) { Wait-BuildGuardStderrTask $open $clock }
-        [void](Send-BuildGuardStderrQueue)
-        foreach ($t in @($script:BuildGuardLogPending.ToArray())) { Wait-BuildGuardStderrTask $t $clock }
-        Clear-BuildGuardStderrDone
+        $wait = { param($t) if ($UntilWritten) { while (-not $t.IsCompleted) { [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($t), 500) } } else { Wait-BuildGuardStderrTask $t $clock } }
+        if ($Ch.Bytes.Count -gt 0 -and -not $open.IsCompleted) { & $wait $open }
+        [void](Send-BuildGuardStderrQueue $Ch)
+        foreach ($t in @($Ch.Pending.ToArray())) { & $wait $t }
+        Clear-BuildGuardStderrDone $Ch
     } catch { }
+}
+
+function Complete-BuildGuardOutput {
+    # Invoke-BuildGuard's last step, once nothing of its own is held: the queued log lines (bounded), then the typed lines,
+    # bounded too while an ancestor holds a heavy slot, else waited for until their reader takes them.
+    Complete-BuildGuardStderr
+    Complete-BuildGuardStderr $script:BuildGuardStdout -UntilWritten:(-not (Test-BuildGuardAncestorSlot))
 }
 
 function Write-BuildGuardLog([string]$Message) {
@@ -610,20 +646,21 @@ function Test-HeavySlotMarker($Lease, [int]$Code) {
 }
 
 function Remove-HeavySlotFiles($Lease) {
-    foreach ($f in @($Lease.Ready, $Lease.Stop, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+    # The one place a stop file is deleted (r8, adversary 3e68ca85-A1): only once Test-HeavySlotStopNeeded proves no holder
+    # can still read it, decided before the ready file that names the holder goes. The other lease files go either way.
+    $keepStop = Test-HeavySlotStopNeeded $Lease
+    foreach ($f in @($Lease.Ready, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+    if (-not $keepStop) { Remove-Item -LiteralPath $Lease.Stop -Force -ErrorAction SilentlyContinue }
 }
 
 function Remove-HeavySlotLeaseFiles($Lease) {
     # After the stop file is written: a holder that outlived heavy-slot (its slot owner gone) polls for the stop file every
-    # 500 ms, so it is given 10 s to see it and end. The stop file is deleted only once neither heavy-slot nor that holder
-    # runs; otherwise it stays, so the holder still sees it (r3b adversary A2). The other lease files go either way.
-    # The wait is on the verified holder's own handle, never on whatever process holds its pid later (r4 sol B4).
-    $h = if ($Lease.Holder) { Get-HeavySlotProcess $Lease.Holder }
+    # 500 ms, so it is given 10 s to see it and end (r3b adversary A2); then Remove-HeavySlotFiles keeps the stop file unless
+    # that holder is proven gone. The wait is on the holder's own handle, checked against its pid + start ticks, never on
+    # whatever process holds its pid later (r4 sol B4); a holder known only from a partial ready file is waited for too (r8).
+    $known = Get-HeavySlotStopHolder $Lease
+    $h = if ($known) { Get-HeavySlotProcess $known }
     if ($h) { try { [void]$h.WaitForExit(10000) } finally { $h.Dispose() } }
-    if (-not $Lease.Process.HasExited -or ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder))) {
-        foreach ($f in @($Lease.Ready, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-        return
-    }
     Remove-HeavySlotFiles $Lease
 }
 
@@ -680,24 +717,47 @@ function Get-HeavySlotHolderState($Lease) {
     return 'alive'
 }
 
+function Get-HeavySlotStopHolder($Lease) {
+    # The holder that reads this run's stop file, by pid + start ticks: the verified one, else the holder line of the ready
+    # file, complete or not, once that line ends in a newline (it was written whole; '8420@1' with no newline may be cut short
+    # of '8420@1234...'). It is kept once read, so a ready file deleted later cannot hide it. $null while none was read.
+    # This identity only ever decides the stop file's lifetime; admission still needs the complete record (r4 sol B1).
+    # The lease is read through its indexer, so a hand-built one without these keys reads $null in a strict-mode host too.
+    if ($Lease['Holder']) { return $Lease['Holder'] }
+    if (-not $Lease['StopHolder'] -and $Lease['Ready']) {
+        $text = [string](Get-Content -LiteralPath $Lease['Ready'] -Raw -ErrorAction SilentlyContinue)
+        [int]$n = 0; [long]$t = 0
+        if ($text -match '(?m)^holder=(\d+)@(\d+)\r?\n' -and [int]::TryParse($Matches[1], [ref]$n) -and [long]::TryParse($Matches[2], [ref]$t)) {
+            $Lease['StopHolder'] = @{ Pid = $n; Ticks = $t }
+        }
+    }
+    return $Lease['StopHolder']
+}
+
 function Test-HeavySlotStopNeeded($Lease) {
-    # Before admission, whether a holder may still read the stop file: heavy-slot's cmd wrapper still runs, the holder it
-    # named still runs, or no ready file was ever seen. The last one covers a wrapper that ended while the heavy-slot child it
-    # started outlived it, still queued: that child may start this run's holder later, which nothing else would stop while
-    # this host lives (r7b adversary 01aa4e7b-A1). Once a ready file was seen, the run's one holder has started.
-    return (-not $Lease.Process.HasExited -or -not $Lease.ReadySeen -or ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder)))
+    # Whether a holder may still read the stop file, the one rule for every stop-file write and delete (r8, adversary
+    # 3e68ca85-A1): yes while heavy-slot's cmd wrapper runs, and after it ended until this run's holder is PROVEN gone, named
+    # by pid + start ticks (Get-HeavySlotStopHolder) and no longer running. No holder line read yet (no ready file, a partial
+    # or unreadable one) proves nothing: the wrapper may have ended while the heavy-slot child it started outlived it, still
+    # queued or descheduled mid-publication, and that holder would hold the machine slot while this host lives (r7b
+    # 01aa4e7b-A1). So unreadable or partial means keep the stop file, never clean it up.
+    if (-not $Lease.Process.HasExited) { return $true }
+    $known = Get-HeavySlotStopHolder $Lease
+    return (-not $known -or (Test-HeavySlotIdentity $known))
 }
 
 function Send-HeavySlotStop($Lease) {
     # Writes the stop file. When it cannot be written, heavy-slot's process tree is ended instead (the OS then frees its
     # slot mutex), so a holder that would never see the file cannot keep the machine slot.
+    $Lease['StopSent'] = $true
     try { Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -ErrorAction Stop; return } catch { $why = $_.Exception.Message }
     Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} stop file not written ({1}); ending heavy-slot pid {2} and its children' -f $Lease.Label, $why, $Lease.Process.Id)
     # taskkill sets the global $LASTEXITCODE, which a Library caller may exit with after the release, so it is kept
     # (r5b adversary A3), and left unset when it was unset, which strict mode cannot read (r5b pass 2 A2). taskkill's own
     # failure (heavy-slot ended after the HasExited check) never throws, even under $PSNativeCommandUseErrorActionPreference
     # (r5b pass 2 A3): the release stays warning-only and the holder fallback below still runs.
-    if (-not $Lease.Process.HasExited) {
+    $ended = $Lease.Process.HasExited
+    if (-not $ended) {
         $last = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
         $keep = if ($last) { $last.Value } else { $null }
         $PSNativeCommandUseErrorActionPreference = $false
@@ -706,20 +766,25 @@ function Send-HeavySlotStop($Lease) {
         finally {
             if ($last) { $global:LASTEXITCODE = $keep } else { Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore }
         }
-    } elseif (-not $Lease.Holder) {
-        # Its tree is gone, so a heavy-slot child that outlived the wrapper cannot be found from here (r7b, 01aa4e7b-A1 sibling).
-        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} heavy-slot wrapper pid {1} already ended: a heavy-slot child that outlived it is not stopped' -f $Lease.Label, $Lease.Process.Id)
     }
     # (The wrapper's pid cannot be reused here: $Lease.Process has held its handle since Process.Start.)
     # A holder that outlived heavy-slot is no longer in that tree: it is ended by its own identity (r3b adversary A2), and only
     # through the handle that identity was verified on, so a process that took its pid later is never stopped (r4 sol B4).
-    if (-not $Lease.Holder) { return }
-    $h = Get-HeavySlotProcess $Lease.Holder
+    # A holder named only by a partial ready file is ended the same way (r8, 3e68ca85-A1 sibling).
+    $known = Get-HeavySlotStopHolder $Lease
+    if (-not $known) {
+        if ($ended) {
+            # Its tree is gone, so a heavy-slot child that outlived the wrapper cannot be found from here (r7b, 01aa4e7b-A1 sibling).
+            Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} heavy-slot wrapper pid {1} already ended: a heavy-slot child that outlived it is not stopped' -f $Lease.Label, $Lease.Process.Id)
+        }
+        return
+    }
+    $h = Get-HeavySlotProcess $known
     if ($h) {
-        try { $h.Kill() } catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} holder {1}@{2} not stopped ({3})' -f $Lease.Label, $Lease.Holder.Pid, $Lease.Holder.Ticks, $_.Exception.Message) }
+        try { $h.Kill() } catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} holder {1}@{2} not stopped ({3})' -f $Lease.Label, $known.Pid, $known.Ticks, $_.Exception.Message) }
         finally { if ($h -is [IDisposable]) { $h.Dispose() } }
-    } elseif (Get-Process -Id $Lease.Holder.Pid -ErrorAction SilentlyContinue) {
-        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} holder {1}@{2} not stopped: reason=identity-unverified (the process under that pid is not the verified holder)' -f $Lease.Label, $Lease.Holder.Pid, $Lease.Holder.Ticks)
+    } elseif (Get-Process -Id $known.Pid -ErrorAction SilentlyContinue) {
+        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} holder {1}@{2} not stopped: reason=identity-unverified (the process under that pid is not the verified holder)' -f $Lease.Label, $known.Pid, $known.Ticks)
     }
 }
 
@@ -747,19 +812,20 @@ function Exit-HeavySlotHolderGone($Lease, [string]$When = 'after-ready') {
     foreach ($l in $Lease.Lines) { if ($l -match '^HEAVY-SLOT TICKET (\S+) ') { $Lease.Ticket = $Matches[1] } }
     Remove-HeavySlotLeaseFiles $Lease
     $gone = if ($Lease.Gone) { $Lease.Gone } else { 'holder-exited' }
-    Write-Output ('BUILD_HEAVY_SLOT_REQUEUE label={0} code={1} ticket={2} reason={3}-{4} utc={5}' -f $Lease.BuildLabel, $code, $Lease.Ticket, $gone, $When, [DateTime]::UtcNow.ToString('o'))
+    Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REQUEUE label={0} code={1} ticket={2} reason={3}-{4} utc={5}' -f $Lease.BuildLabel, $code, $Lease.Ticket, $gone, $When, [DateTime]::UtcNow.ToString('o'))
     exit 3
 }
 
 function Exit-HeavySlotUnreadable($Lease, [string]$Label, [string]$What = 'ready file unreadable') {
     # A complete ready file whose holder or owner line does not parse cannot be checked, so it is never an admission
     # (r4 sol B1), and neither can one heavy-slot left partial or empty ($What 'ready file incomplete', r5): the stop file
-    # goes, heavy-slot is given up to 60 s to end, and nothing is built.
+    # is written, heavy-slot is given up to 60 s to end, and nothing is built. The stop file then stays unless the holder is
+    # proven gone (r8, 3e68ca85-A1): a partial record may belong to a holder that is still publishing it.
     Send-HeavySlotStop $Lease
     $code = Get-HeavySlotExitCode $Lease
     Send-HeavySlotLines $Lease
     Remove-HeavySlotLeaseFiles $Lease
-    Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code=1 reason={1} (heavy-slot exit {2}) utc={3}' -f $Label, $What, $code, [DateTime]::UtcNow.ToString('o'))
+    Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code=1 reason={1} (heavy-slot exit {2}) utc={3}' -f $Label, $What, $code, [DateTime]::UtcNow.ToString('o'))
     exit 1
 }
 
@@ -775,7 +841,8 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     $actual = if (Test-Path -LiteralPath $cli -PathType Leaf) { (Get-FileHash -LiteralPath $cli -Algorithm SHA256).Hash.ToLowerInvariant() } else { 'missing' }
     $expected = ([string]$Options.HeavySlotSha256).Trim().ToLowerInvariant()
     if ($actual -ne $expected) {
-        Write-Output ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=pin-mismatch expected={1} actual={2} cli={3} utc={4}' -f $Label, $expected, $actual, $cli, [DateTime]::UtcNow.ToString('o'))
+        # Nothing is taken yet, but an ancestor's slot may be held until this guard ends, so the line is bounded (r8, 3e68ca85-A2).
+        Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=pin-mismatch expected={1} actual={2} cli={3} utc={4}' -f $Label, $expected, $actual, $cli, [DateTime]::UtcNow.ToString('o'))
         exit 3
     }
     # A relative -LockPath is resolved first, so its parent is never empty (adversary A1).
@@ -795,7 +862,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Label = 'mlv:{0}:build' -f (Get-HeavySlotLane); BuildLabel = $Label
         Ready = Join-Path $dir "$id.ready"; Stop = Join-Path $dir "$id.stop"; ExitFile = Join-Path $dir "$id.exit.json"
         Log = Join-Path $dir "$id.log"; Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''; LogUnread = $false; Holder = $null
-        Owner = $null; Gone = ''; Tail = ''; ReadySeen = $false
+        Owner = $null; Gone = ''; Tail = ''; StopHolder = $null; StopSent = $false
     }
     # heavy-slot ends its own wait (a marked 75) and its admit cap; this bound only catches a hung tool. It is numeric even
     # when a Library caller passes the minutes as a string, and monotonic, so a wall-clock step cannot move it. It is
@@ -822,7 +889,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         $giveUp = [TimeSpan]::FromMinutes($waitMin + $script:HeavySlotGiveUpSlackMinutes)
     } catch { $why = $_.Exception.Message }
     if ($null -eq $giveUp) {
-        Write-Output ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} ({3}) utc={4}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
+        Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} ({3}) utc={4}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
         exit 2
     }
     # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a
@@ -858,7 +925,6 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         return $null
     }
     $admitted = $false
-    $stopSent = $false
     # The cleanup try begins at the first statement after the launch, so nothing between them can skip its finally.
     try {
         # The wait printed is the one heavy-slot was given, never the raw option (fable r6b note).
@@ -868,7 +934,6 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             Send-HeavySlotLines $lease
             # The ready file admits only while the holder it names still runs (checked after the file is seen, and again below).
             if (Test-Path -LiteralPath $lease.Ready) {
-                $lease.ReadySeen = $true
                 $holder = Get-HeavySlotHolderState $lease
                 if ($holder -eq 'alive') { break }
                 if ($holder -eq 'unreadable') { Exit-HeavySlotUnreadable $lease $Label }
@@ -877,7 +942,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             $why = ''
             $code = 1
             if ($lease.Process.HasExited) {
-                if (Test-Path -LiteralPath $lease.Ready) { $lease.ReadySeen = $true; Exit-HeavySlotHolderGone $lease }
+                if (Test-Path -LiteralPath $lease.Ready) { Exit-HeavySlotHolderGone $lease }
                 Send-HeavySlotLines $lease
                 $code = $lease.Process.ExitCode
                 if ($code -eq 9009) {
@@ -889,7 +954,9 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
                 $why = Test-HeavySlotMarker $lease $code
                 if (-not $why) {
                     Remove-HeavySlotFiles $lease
-                    Write-Output ('BUILD_HEAVY_SLOT_REQUEUE label={0} code={1} ticket={2} reason={3} utc={4}' -f $Label, $code, $lease.Ticket, ($lease.Reason -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
+                    # The stop goes before the typed line here too (r8, 3e68ca85-A2 sibling).
+                    if (Test-HeavySlotStopNeeded $lease) { Send-HeavySlotStop $lease }
+                    Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REQUEUE label={0} code={1} ticket={2} reason={3} utc={4}' -f $Label, $code, $lease.Ticket, ($lease.Reason -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
                     exit 3
                 }
                 if ($code -lt 75 -or $code -gt 77) { $why = 'heavy-slot ended before admitting the build' }
@@ -899,8 +966,8 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             if ($why) {
                 if ($code -eq 0) { $code = 1 }
                 # The stop goes BEFORE the typed line (r6 sol B1): a stdout nobody drains may block that line, never the slot.
-                if (Test-HeavySlotStopNeeded $lease) { Send-HeavySlotStop $lease; $stopSent = $true }
-                Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code={1} reason={2} utc={3}' -f $Label, $code, $why, [DateTime]::UtcNow.ToString('o'))
+                if (Test-HeavySlotStopNeeded $lease) { Send-HeavySlotStop $lease }
+                Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code={1} reason={2} utc={3}' -f $Label, $code, $why, [DateTime]::UtcNow.ToString('o'))
                 exit $code
             }
             Start-Sleep -Milliseconds 250
@@ -913,14 +980,14 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             # Its lines (a PIN MISMATCH among them) cannot be checked, so the slot is given back and nothing is built.
             $what = if ($lease.LogUnread) { 'heavy-slot log unreadable at admission' } else { 'heavy-slot log line unfinished at admission' }
             Exit-HeavySlot $lease
-            Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code=1 reason={1} utc={2}' -f $Label, $what, [DateTime]::UtcNow.ToString('o'))
+            Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code=1 reason={1} utc={2}' -f $Label, $what, [DateTime]::UtcNow.ToString('o'))
             exit 1
         }
         # heavy-slot only warns when the script it runs is not the pin (it may have changed after the hash above), so
         # its own PIN MISMATCH line refuses here too, after the slot is given back (r1 adversary A4).
         if (@($lease.Lines | Where-Object { $_ -match 'PIN MISMATCH' }).Count -gt 0) {
             Exit-HeavySlot $lease
-            Write-Output ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=pin-mismatch-at-run cli={1} utc={2}' -f $Label, $cli, [DateTime]::UtcNow.ToString('o'))
+            Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=pin-mismatch-at-run cli={1} utc={2}' -f $Label, $cli, [DateTime]::UtcNow.ToString('o'))
             exit 3
         }
         Write-BuildGuardLog ('heavy-slot: admitted label={0} held={1}' -f $lease.Label, ((Get-Content -LiteralPath $lease.Ready -Raw -ErrorAction SilentlyContinue) -replace '\s', ''))
@@ -930,8 +997,9 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         # Every way out before admission (exit, throw, Ctrl+C) leaves the stop file while heavy-slot still runs, even when a
         # ready file appeared after the last check, so its holder ends at once instead of holding the machine slot
         # (adversary A2; r1 adversary A1). A holder that outlived heavy-slot (its slot owner killed) gets it too.
-        # It is written last, after any lease-file cleanup above, and nothing deletes it on this path.
-        if (-not $admitted -and -not $stopSent -and (Test-HeavySlotStopNeeded $lease)) { Send-HeavySlotStop $lease }
+        # It is written last, after any lease-file cleanup above, unless a stop was already sent (that one stays until its
+        # holder is proven gone, Remove-HeavySlotFiles), and nothing deletes it on this path.
+        if (-not $admitted -and -not $lease['StopSent'] -and (Test-HeavySlotStopNeeded $lease)) { Send-HeavySlotStop $lease }
     }
 }
 
@@ -946,8 +1014,9 @@ function Exit-HeavySlot($Lease) {
     if ($lost) {
         $line = 'HEAVY_SLOT_LOST_DURING_ACTION label={0} code={1} utc={2}' -f $Lease.BuildLabel, (Get-HeavySlotExitCode $Lease), [DateTime]::UtcNow.ToString('o')
         Write-BuildGuardLog $line
-        # Warning-only (r6b adversary A2): a stdout that is closed or gone never turns a finished action into a throw.
-        try { [Console]::Out.WriteLine($line) } catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} stdout not written ({1})' -f $Lease.Label, ($_.Exception.Message -replace '\s+', ' ')) }
+        # Warning-only (r6b adversary A2) and bounded (r8, 3e68ca85-A2): a stdout that is closed, gone or undrained never turns a
+        # finished action into a throw or a wait.
+        Write-BuildGuardTyped $line
     }
     if ($Lease.Process.WaitForExit(60000)) {
         Send-HeavySlotLines $Lease
@@ -1016,9 +1085,9 @@ function Invoke-BuildGuard {
                 Exit-HeavySlot $heavy
                 $heavy = $null
                 if (-not $memOk) {
-                    Write-Output ('BUILD_MEM_REFUSED label={0} freePhysGB={1} freeCommitGB={2} need={3}/{4} waitedSec={5} utc={6}' -f $Label, $mem.PhysGB, $mem.CommitGB, $o.MinFreePhysGB, $o.MinFreeCommitGB, $waited, [DateTime]::UtcNow.ToString('o'))
+                    Write-BuildGuardTyped ('BUILD_MEM_REFUSED label={0} freePhysGB={1} freeCommitGB={2} need={3}/{4} waitedSec={5} utc={6}' -f $Label, $mem.PhysGB, $mem.CommitGB, $o.MinFreePhysGB, $o.MinFreeCommitGB, $waited, [DateTime]::UtcNow.ToString('o'))
                 } else {
-                    Write-Output ('BUILD_SLOT_BUSY label={0} heldBy=[{1}] waitedSec={2} utc={3}' -f $Label, $held, $waited, [DateTime]::UtcNow.ToString('o'))
+                    Write-BuildGuardTyped ('BUILD_SLOT_BUSY label={0} heldBy=[{1}] waitedSec={2} utc={3}' -f $Label, $held, $waited, [DateTime]::UtcNow.ToString('o'))
                 }
                 exit 3
             }
@@ -1051,8 +1120,8 @@ function Invoke-BuildGuard {
             Remove-BuildSlot $ticket
         }
     } finally {
-        # Queued guard lines go out last, once nothing is held (r7b, adversary 8d0c73bd-A1).
-        try { Exit-HeavySlot $heavy } finally { Complete-BuildGuardStderr }
+        # Queued guard lines go out last, once nothing is held (r7b, adversary 8d0c73bd-A1), the typed lines with them (r8).
+        try { Exit-HeavySlot $heavy } finally { Complete-BuildGuardOutput }
     }
 }
 
@@ -1082,8 +1151,11 @@ if ($PrintJobs) {
     exit 0
 }
 
+# The two usage errors are bounded like every guard line (r8, 3e68ca85-A2 sibling): an ancestor's heavy slot may be held until
+# this guard ends.
 if (-not $Command.Trim()) {
-    [Console]::Error.WriteLine('build-guard: no build command given. Use -PrintJobs, or: build-guard.ps1 -Command "<fragment with {JOBS}>"')
+    Write-BuildGuardStderr 'build-guard: no build command given. Use -PrintJobs, or: build-guard.ps1 -Command "<fragment with {JOBS}>"'
+    Complete-BuildGuardStderr
     exit 2
 }
 
@@ -1182,7 +1254,8 @@ function Resolve-BuildGuardFragmentVerdict {
 }
 
 if ($PSVersionTable.PSVersion -lt [version]'7.4') {
-    [Console]::Error.WriteLine("build-guard: command mode needs PowerShell 7.4+ (native exit codes stop the fragment); this is $($PSVersionTable.PSVersion)")
+    Write-BuildGuardStderr "build-guard: command mode needs PowerShell 7.4+ (native exit codes stop the fragment); this is $($PSVersionTable.PSVersion)"
+    Complete-BuildGuardStderr
     exit 2
 }
 $script:BuildGuardCommandExit = 0
