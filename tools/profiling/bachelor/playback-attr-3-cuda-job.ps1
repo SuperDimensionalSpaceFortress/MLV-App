@@ -1548,14 +1548,15 @@ function Get-PresentMonProcessSnapshot() {
     foreach ($candidate in @(Get-Process -ErrorAction Stop)) {
         $candidateId = [int]$candidate.Id
         if ($candidateId -eq $PID) { $jobSession = Get-PresentMonProcessSessionId $candidate; continue }
-        # r5 (sol B1): a process is (pid, creation instant). StartTime opens the pid at the moment it is read, as Path does, so it is read before and after the path: an instant that is
+        # r5 (sol B1): a process is (pid, creation instant). Path opens the pid at the moment it is read, so the instant is read before the path and again after it: an instant that is
         # unreadable or that changed means the path may be another process's, and it is not used (an unreadable path only ever keeps a process live or held, never clears it)
         $started = $null
         try { $started = ConvertTo-PresentMonUtcInstant $candidate.StartTime } catch { $started = $null }
         $candidatePath = ''
         try { $candidatePath = [string]$candidate.Path } catch { $candidatePath = '' }
         $startedAfterPath = $null
-        try { $startedAfterPath = ConvertTo-PresentMonUtcInstant $candidate.StartTime } catch { $startedAfterPath = $null }
+        # r5 adversary A1 on 5e3d8a4c: Process.StartTime is cached by the object after its first read, so the second read is a FRESH process object for the pid (an exited pid throws)
+        try { $startedAfterPath = ConvertTo-PresentMonUtcInstant (Get-Process -Id $candidateId -ErrorAction Stop).StartTime } catch { $startedAfterPath = $null }
         if ($null -eq $started -or $started -ne $startedAfterPath) { $candidatePath = '' }
         $pathReadable = ($candidatePath -ne '')
         $candidateName = [string]$candidate.Name

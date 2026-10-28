@@ -516,11 +516,12 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
                   go_live_command_line: str | None = None, pm_name: str = STUB_EXE, presentmon_sha: str | None = None,
                   pinned_copies: tuple[Path, ...] = (), session_ids: dict[int, int | str | None] | None = None,
                   job_session: int | str | None = None, command_line_names: dict[int, str] | None = None, start_times: dict | None = None,
-                  cim_created: dict | None = None, go_live_from_snapshot: int = 0) -> tuple[int, dict, Path, str]:
+                  cim_created: dict | None = None, go_live_from_snapshot: int = 0, reread_start_times: dict | None = None) -> tuple[int, dict, Path, str]:
         # r5 (sol B1 on 2c226cd8): a process is (pid, creation instant). Every Get-Process row has a StartTime and every Win32_Process row a CreationDate; by default both are the same
         # instant (the pid's `processes` creation stamp, else 2026-10-27T00:00 + pid seconds), so a row read before the enumeration is that process's. `start_times` overrides a pid's
         # StartTime (None: unreadable) and `cim_created` its command-line row's CreationDate (a reused pid: another, earlier process); stamps are written as for `processes`.
-        # `go_live_from_snapshot`=N makes the go-live process (and its command-line row) appear from the Nth Get-Process / command-line query on (1 the scope choice, 2 the post-listing check)
+        # `reread_start_times` gives the StartTime a FRESH `Get-Process -Id` read returns for a pid (the process exited and another took the pid between the snapshot's two reads)
+        # go_live_from_snapshot=N makes the go-live process (and its command-line row) appear from the Nth Get-Process / command-line query on (1 the scope choice, 2 the post-listing check)
         # r4: `session_ids` gives a process row (others / go_live_as, by pid) its SessionId: an int, None (a null value) or SESSION_THROWS (the getter throws); a pid not in it has none at all.
         # `job_session` adds the sweeping job's own row ($PID) to Get-Process with that SessionId (None: no row, as before -- the job's session is then unknown)
         # r2: `processes` are the Win32_Process rows (id, name, parent id, creation minute or None for an unreadable CreationDate) the parent read sees; `go_live_as` is the process that appears
@@ -660,8 +661,9 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "function Write-JobTrace([string]$Message) { Add-Content -LiteralPath $traceFile -Value $Message }\n"
             + denied_type +
             "function Get-Process {\n"
-            "    [CmdletBinding()] param([string[]]$Name)\n"
-            "    $global:getProcessCalls = 1 + [int]$global:getProcessCalls\n"
+            "    [CmdletBinding()] param([string[]]$Name, [int[]]$Id)\n"
+            # r5: a fresh -Id read is no new snapshot (the counter counts snapshots)
+            "    if (-not $Id) { $global:getProcessCalls = 1 + [int]$global:getProcessCalls }\n"
             + ("    throw 'stub Get-Process failure'\n" if get_process_throws else
                "    $all = @()\n"
                f"    if {go_live_when} {{ $all += {go_live_row} }}\n"
@@ -670,7 +672,13 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
                + f"        foreach ($p in @({pids})) {{ $all += [pscustomobject]@{{ Id = [int]$p; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null; StartTime = (Get-Date '2026-10-27T00:00:00').AddSeconds([int]$p) }} }}\n"
                "    }\n"
                # the real cmdlet honours -Name (a wildcard on the image name): a process whose name does not match is never returned
-               "    $all | Where-Object { $p = $_; (-not $Name) -or (@($Name | Where-Object { $p.Name -like $_ }).Count -gt 0) }\n")
+               + ("    if ($Id) {\n"
+                  "        $found = @($all | Where-Object { $Id -contains [int]$_.Id })\n"
+                  "        if ($found.Count -eq 0) { Write-Error \"Cannot find a process with the process identifier $Id.\"; return }\n"
+                  + "".join(f"        if ($Id -contains {i}) {{ return [pscustomobject]@{{ Id = {i}; Name = $found[0].Name; StartTime = {stamp(s)} }} }}\n" for i, s in (reread_start_times or {}).items())
+                  + "        return $found\n"
+                  "    }\n")
+               + "    $all | Where-Object { $p = $_; (-not $Name) -or (@($Name | Where-Object { $p.Name -like $_ }).Count -gt 0) }\n")
             + "}\n"
             # the real cmdlet reads Win32_Service by a WQL filter; a failure is a non-terminating error that -ErrorAction Stop turns into a throw
             "function Get-CimInstance {\n"
@@ -1248,6 +1256,17 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "logman stop is never issued under the reused pid's live capture")
         self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
         self.assertEqual(sweep["abortedBefore"], "MLVAttr3-killed-a:logman_stop")
+
+    def test_r5_a1_a_pid_reused_between_the_two_start_time_reads_is_no_identity(self) -> None:
+        # r5 adversary A1 on 5e3d8a4c: the row and the first StartTime are the old capture's (one instant), then it exits and a capture created later takes pid 6200 and owns the session.
+        # Process.StartTime is cached by the object, so re-reading it from the same object saw the old instant again; the second read is a fresh Get-Process -Id now
+        code, sweep, d, out = self.run_start("r5-a1-reread", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                             go_live_as=self.REUSED, go_live_command_line=self.REUSED_CMD, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                             job_session=1, session_ids={6200: 1}, reread_start_times={6200: "2026-10-28T00:20:00Z"})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"], "the replacement's live session is never terminated")
+        self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
+        self.assertEqual(sweep["unidentifiedCaptureOwnerIds"], [6200])
 
     def test_r5_b1_an_unreadable_start_time_is_no_identity(self) -> None:
         # the command line's row is right, but the enumerated process's creation instant cannot be read: nothing binds the row to it
