@@ -41,6 +41,8 @@ from tools.repo_hygiene.test_dve_presentmon_evidence import PARSE_END, PARSE_STA
 
 STUB_EXE = "PresentMon-stub.cmd"
 UNREADABLE = "<path getter throws>"
+SESSION_THROWS = "<session getter throws>"
+JOB_IMAGE = "C:\\pwsh\\pwsh.exe"
 NEW_MODULE_FUNCTIONS = ("Get-AttrCudaPresentMonOrphanSessionName", "Get-AttrCudaEtsSessionListing", "Invoke-AttrCudaLogman", "Stop-AttrCudaEtsSession", "Get-AttrCudaTextEncodingFromHead",
                         "Get-AttrCudaPresentMonEventsLost", "Add-AttrCudaPresentMonEventsLostDetail", "Add-AttrCudaPresentMonEventsLostDetailToReport",
                         "Add-AttrCudaPresentMonOrphanSweepDetailToReport")
@@ -482,7 +484,10 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
                   processes: tuple[tuple[int, str, int, int | None], ...] = (), process_lookup_fails: bool = False,
                   go_live_as: tuple[int, str, str | None] | None = None, command_lines: tuple[tuple[int | str, str], ...] = (), command_line_query_fails_from: int = 0,
                   go_live_command_line: str | None = None, pm_name: str = STUB_EXE, presentmon_sha: str | None = None,
-                  pinned_copies: tuple[Path, ...] = ()) -> tuple[int, dict, Path, str]:
+                  pinned_copies: tuple[Path, ...] = (), session_ids: dict[int, int | str | None] | None = None,
+                  job_session: int | str | None = None) -> tuple[int, dict, Path, str]:
+        # r4: `session_ids` gives a process row (others / go_live_as, by pid) its SessionId: an int, None (a null value) or SESSION_THROWS (the getter throws); a pid not in it has none at all.
+        # `job_session` adds the sweeping job's own row ($PID) to Get-Process with that SessionId (None: no row, as before -- the job's session is then unknown)
         # r2: `processes` are the Win32_Process rows (id, name, parent id, creation minute or None for an unreadable CreationDate) the parent read sees; `go_live_as` is the process that appears
         # once live_after_terminate_of is terminated (default: the pinned image, pid 5151)
         # r3: `command_lines` are the rows (pid, CommandLine) of the snapshot's ONE unfiltered Win32_Process query (a process without a row reads as an unreadable command line);
@@ -544,17 +549,34 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         extra = ""
         denied_type = ""
 
+        sessions = dict(session_ids or {})
+        if job_session is not None:
+            sessions["$PID"] = job_session
+
+        def session_member(i: int | str) -> str:
+            if i not in sessions or sessions[i] == SESSION_THROWS:
+                return ""
+            return f"; SessionId = {('$null' if sessions[i] is None else sessions[i])}"
+
         def process_row(i: int, n: str, pth: str | None) -> str:
             nonlocal denied_type
-            if pth == UNREADABLE:
+            throws = sessions.get(i) == SESSION_THROWS
+            if pth == UNREADABLE or throws:
                 # a .NET property that throws, like Process.Path on a process the caller may not open (PowerShell reads a throwing getter as $null -- measured on pwsh 7.6 -- which is also what a real unreadable Path yields)
-                denied_type = ("Add-Type -TypeDefinition 'public class MlvDeniedProcess { public int Id; public string Name; "
-                               "public string Path { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } }'\n")
-                return f"[MlvDeniedProcess]@{{ Id = {i}; Name = '{n}' }}"
-            return f"[pscustomobject]@{{ Id = {i}; Name = '{n}'; Path = {('$null' if pth is None else ps_quote(pth))} }}"
+                # r4: MlvDeniedSessionProcess's SessionId getter throws too (the session probe's failure case); MlvDeniedProcess's SessionId is a plain value (null when not given)
+                denied_type = ("Add-Type -TypeDefinition 'public class MlvDeniedProcess { public int Id; public string Name; public object SessionId; "
+                               "public string Path { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } } "
+                               "public class MlvDeniedSessionProcess { public int Id; public string Name; "
+                               "public string Path { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } "
+                               "public object SessionId { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } }'\n")
+                return f"[{'MlvDeniedSessionProcess' if throws else 'MlvDeniedProcess'}]@{{ Id = {i}; Name = '{n}'{session_member(i)} }}"
+            return f"[pscustomobject]@{{ Id = {i}; Name = '{n}'; Path = {('$null' if pth is None else ps_quote(pth))}{session_member(i)} }}"
 
         for i, n, pth in others:
             extra += f"    $all += {process_row(i, n, pth)}\n"
+        if job_session is not None:
+            job_row = process_row("$PID", "pwsh", JOB_IMAGE)
+            extra += f"    $all += {job_row}\n"
         go_live_row = (process_row(*go_live_as) if go_live_as is not None
                        else "[pscustomobject]@{ Id = 5151; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }")
         service_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}' }}" for i, n in services)
@@ -1030,6 +1052,125 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual((sweep["scope"], sweep["deferred"], sweep["unreadableCommandLineCount"]), ("harness_sessions", ["PresentMon"], 0))
         self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
 
+    # --- r4 regressions (Dot advisory on a79a5a89, hub-confirmed): a process whose path is unreadable AND whose command line reads empty, under a name no route matches, was dropped with
+    # no record. Beside the identified Intel service the scope was harness_sessions and the sweep could terminate that capture's live MLVAttr3-* session (base 038ba335 skipped).
+    UNIDENTIFIED = (6200, "capture", UNREADABLE)
+
+    def assert_refused_unidentified(self, sweep: dict, d: Path, label: str = "") -> None:
+        self.assertFalse(sweep["ran"], (label, sweep))
+        self.assertEqual(sweep["skippedReason"], "capture_owner_unidentified", (label, sweep))
+        self.assertIsNone(sweep["scope"], "no harness_sessions scope")
+        self.assertEqual(sweep["unidentifiedCaptureOwnerIds"], [6200], label)
+        self.assert_nothing_destructive(d)
+
+    def test_r4_u1_an_unidentified_capture_beside_the_intel_service_refuses_the_harness_scope(self) -> None:
+        # the capture runs in the job's own session; with the job's session unknown or 0, a session-0 process has no evidence either
+        for label, job_session, capture_session in (("same-session", 1, 1), ("job-session-unknown", None, 0), ("job-in-session-0", 0, 0), ("other-interactive-session", 1, 2)):
+            code, sweep, d, out = self.run_start(f"r4-u1-{label}", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.UNIDENTIFIED), processes=self.INTEL_TREE,
+                                                 job_session=job_session, session_ids={6200: capture_session})
+            self.assertEqual(code, 0, out)
+            self.assert_refused_unidentified(sweep, d, label)
+            self.assertEqual([(u["pid"], u["name"], u["sessionId"]) for u in sweep["unidentifiedCaptureOwners"]], [(6200, "capture", capture_session)], label)
+            trace = (d / "trace.log").read_text(encoding="utf-8")
+            self.assertIn("skipped=capture_owner_unidentified", trace, label)
+            self.assertIn("unidentifiedBlocking=6200", trace, label)
+
+    def test_r4_u2_an_unidentified_capture_that_appears_before_a_terminate_aborts_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r4-u2-mid-terminate", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                             go_live_as=self.UNIDENTIFIED, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, job_session=1, session_ids={6200: 1})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"], "the unidentified capture's session is never terminated")
+        self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-other-harness-live:presentmon_terminate")
+        self.assertEqual(sweep["unidentifiedCaptureOwnerIds"], [6200])
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "no logman stop after an abort")
+        self.assertEqual(sweep["remaining"], ["MLVAttr3-other-harness-live"])
+
+    def test_r4_u3_an_unidentified_capture_that_appears_before_a_logman_stop_aborts_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r4-u3-before-stop", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), helper_works=False,
+                                             live_after_terminate_of="MLVAttr3-other-harness-live", go_live_as=self.UNIDENTIFIED, others=(self.SERVICE_UNREADABLE,),
+                                             processes=self.INTEL_TREE, job_session=1, session_ids={6200: 1})
+        self.assertEqual(code, 0, out)
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "logman stop is never issued under the unidentified capture")
+        self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-killed-a:logman_stop")
+        self.assertEqual(sweep["remaining"], ["MLVAttr3-killed-a", "MLVAttr3-other-harness-live"])
+
+    def test_r4_u4_a_session_probe_that_fails_is_no_evidence(self) -> None:
+        # the capture's own session unreadable (getter throws, or a null value), or the JOB's session unreadable while the capture reads session 0: fail closed, never a made-up session
+        for label, job_session, capture_session in (("capture-getter-throws", 1, SESSION_THROWS), ("capture-session-null", 1, None), ("job-getter-throws", SESSION_THROWS, 0)):
+            code, sweep, d, out = self.run_start(f"r4-u4-{label}", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.UNIDENTIFIED), processes=self.INTEL_TREE,
+                                                 job_session=job_session, session_ids={6200: capture_session})
+            self.assertEqual(code, 0, out)
+            self.assert_refused_unidentified(sweep, d, label)
+            owner = sweep["unidentifiedCaptureOwners"][0]
+            if label == "job-getter-throws":
+                self.assertEqual(sweep["unidentifiedNonOwnership"]["jobSessionError"], "session_id_unreadable", label)
+            else:
+                self.assertIsNone(owner["sessionId"], label)
+                self.assertEqual(owner["sessionError"], "session_id_unreadable", label)
+
+    # controls: GREEN on a79a5a89 and after (they read only fields both heads record)
+    def test_r4_control_an_unreadable_process_in_session_0_beside_the_intel_service_does_not_block(self) -> None:
+        # the positive non-ownership evidence: session 0 while the job runs in session 1 (the measured host shape: every service and system process)
+        code, sweep, d, out = self.run_start("r4-c-session-0", others=(self.SERVICE_UNREADABLE, (6201, "svchost", UNREADABLE)), processes=self.INTEL_TREE,
+                                             job_session=1, session_ids={6201: 0})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(sweep["scope"], "harness_sessions")
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"], "the r1b repair: the harness orphan is swept")
+
+    def test_r4_control_an_unreadable_registered_service_beside_the_intel_service_does_not_block(self) -> None:
+        # the job's session unknown, so only the registration covers it
+        code, sweep, d, out = self.run_start("r4-c-service", others=(self.SERVICE_UNREADABLE, (6202, "SomeVendorService", UNREADABLE)), processes=self.INTEL_TREE,
+                                             services=((6202, "SomeVendorSvc"),))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
+    def test_r4_control_scope_all_is_unchanged_by_an_unidentified_process(self) -> None:
+        # no live candidate at all: scope 'all' keeps its behaviour (card r4 item 1)
+        code, sweep, d, out = self.run_start("r4-c-scope-all", others=(self.UNIDENTIFIED,), job_session=1, session_ids={6200: 1})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(sweep["scope"], "all")
+        self.assertEqual(self.terminated_names(self.calls(d)), ["PresentMon", "MLVAttr3-old-killed-job"])
+
+    def test_r4_the_evidence_is_recorded(self) -> None:
+        code, sweep, d, out = self.run_start("r4-evidence", others=(self.SERVICE_UNREADABLE, (6201, "svchost", UNREADABLE), (6202, "SomeVendorService", UNREADABLE)),
+                                             processes=self.INTEL_TREE, services=((6202, "SomeVendorSvc"),), job_session=1, session_ids={6201: 0, 6202: 1})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(sweep["unidentifiedCaptureOwners"], [])
+        self.assertEqual(sweep["unidentifiedNonOwnership"], {"jobSessionId": 1, "jobSessionError": None, "sessionZeroCount": 1, "registeredServiceCount": 1})
+
+    def test_mutation_without_the_unreadable_identity_hold_the_unidentified_capture_is_swept_again(self) -> None:
+        mutated = mutate(TEMPLATE, "{ $unreadableIdentity += [pscustomobject]@{", "{ $null = [pscustomobject]@{")
+        _code, sweep, d, _out = self.run_start("mut-r4-no-hold", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.UNIDENTIFIED), processes=self.INTEL_TREE,
+                                               job_session=1, session_ids={6200: 1}, text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)), "Dot's residual: the live session is terminated")
+
+    def test_mutation_without_the_held_service_lookup_a_registered_service_blocks_the_harness_scope(self) -> None:
+        mutated = mutate(TEMPLATE, "if ($heldService.Count -gt 0) {", "if ($false) {")
+        _code, sweep, d, _out = self.run_start("mut-r4-held-service", others=(self.SERVICE_UNREADABLE, (6202, "SomeVendorService", UNREADABLE)), processes=self.INTEL_TREE,
+                                               services=((6202, "SomeVendorSvc"),), text=mutated)
+        self.assertEqual(sweep["skippedReason"], "capture_owner_unidentified", "the registration is what cleared it")
+
+    def test_mutation_session_0_without_the_job_session_condition_is_no_evidence(self) -> None:
+        mutated = mutate(TEMPLATE, "$held.session.sessionId -eq 0 -and $jobSession.sessionId -ne 0", "$held.session.sessionId -eq 0")
+        _code, sweep, d, _out = self.run_start("mut-r4-session", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.UNIDENTIFIED), processes=self.INTEL_TREE,
+                                               job_session=0, session_ids={6200: 0}, text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)), "a harness job in session 0 owns captures in session 0")
+
+    def test_mutation_rechecks_that_ignore_the_unidentified_terminate_under_it(self) -> None:
+        mutated = TEMPLATE
+        for old in ("            if (@($recheck.unidentified).Count -gt 0) {\n                $record['unidentifiedCaptureOwnerIds'] = @($recheck.unidentified)\n                $record['abortedReason']",
+                    "                if (@($recheck.unidentified).Count -gt 0) {\n                    $record['unidentifiedCaptureOwnerIds'] = @($recheck.unidentified)\n                    $record['abortedReason']"):
+            mutated = mutate(mutated, old, old.replace("if (@($recheck.unidentified).Count -gt 0) {", "if ($false) {"))
+        _code, sweep, d, _out = self.run_start("mut-r4-recheck", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                               go_live_as=self.UNIDENTIFIED, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, job_session=1, session_ids={6200: 1}, text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)))
+
     def test_mutation_the_presentmon_star_enumeration_terminates_a_renamed_live_capture_again(self) -> None:
         mutated = mutate(TEMPLATE, "foreach ($candidate in @(Get-Process -ErrorAction Stop)) {", "foreach ($candidate in @(Get-Process -Name 'PresentMon*' -ErrorAction Stop)) {")
         _code, sweep, d, _out = self.run_start("mut-r3-name-only", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.CAPTURE), processes=self.INTEL_TREE,
@@ -1046,7 +1187,10 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         mutated = mutate(TEMPLATE, "        if ($null -ne $snapshot.commandLineError) {\n            $record['skippedReason'] = 'capture_owner_command_lines_unreadable'",
                          "        if ($false) {\n            $record['skippedReason'] = 'capture_owner_command_lines_unreadable'")
         _code, sweep, d, _out = self.run_start("mut-r3-cim-open", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, command_line_query_fails_from=1, text=mutated)
-        self.assertEqual(sweep["scope"], "harness_sessions", "the mutation chooses a scope on an enumeration it could not complete")
+        # r4: the scope choice now asks the shared helper, which throws on the same error, so the mutation loses the TYPED skip (an untyped error is left) but still touches nothing
+        self.assertIsNone(sweep["skippedReason"], "the mutation drops the typed fail-closed skip")
+        self.assertIn("capture_owner_command_lines_unreadable", str(sweep["error"]))
+        self.assert_nothing_destructive(d)
 
     def test_mutation_a_recheck_that_ignores_the_failed_query_terminates_on_it(self) -> None:
         mutated = mutate(TEMPLATE, "if ($null -ne $snapshot.commandLineError) { throw ('capture_owner_command_lines_unreadable: ' + $snapshot.commandLineError) }", "")
@@ -1078,15 +1222,16 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(self.terminated_names(self.calls(d)), [])
 
     def test_mutation_the_service_child_skips_the_whole_sweep_again(self) -> None:
-        mutated = mutate(TEMPLATE, "if (@(Get-PresentMonCaptureBlockerId $snapshot).Count -gt 0) {", "if ($true) {")
+        mutated = mutate(TEMPLATE, "if (@($initial.live).Count -gt 0) {", "if ($true) {")
         _code, sweep, d, _out = self.run_start("mut-service-child", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
         self.assertFalse(sweep["ran"], "the 2026-10-27 Bachelor state: the orphan of a killed leg is never swept")
         self.assertEqual(self.terminated_names(self.calls(d)), [])
 
     def test_mutation_rechecks_that_count_every_live_process_abort_the_harness_sweep(self) -> None:
-        mutated = mutate(TEMPLATE, "if ($Scope -eq 'harness_sessions') { return @(Get-PresentMonCaptureBlockerId $snapshot) }", "")
+        mutated = mutate(TEMPLATE, "if ($Scope -eq 'harness_sessions') { return [pscustomobject]@{ live = @(Get-PresentMonCaptureBlockerId $snapshot);", "if ($false) { return [pscustomobject]@{ live = @(Get-PresentMonCaptureBlockerId $snapshot);")
         _code, sweep, d, _out = self.run_start("mut-recheck-scope", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
-        self.assertEqual(sweep["skippedReason"], "presentmon_process_started_during_sweep")
+        # r4: the scope choice asks the same helper now, so the mutation refuses there already (was: at the first re-check)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
         self.assertEqual(self.terminated_names(self.calls(d)), [])
 
     def test_mutation_without_the_scope_filter_the_default_session_is_swept_under_an_unidentified_process(self) -> None:

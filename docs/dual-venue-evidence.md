@@ -300,7 +300,14 @@ the sweep stopped its `MLVAttr3-*` session). Every process is enumerated, and on
 pinned cache path, the pinned SHA-256 (read best-effort), or a command line (`Win32_Process.CommandLine`) naming an `MLVAttr3-` session or a `--session_name`/`-session_name`
 argument (reason `capture_session_command_line`). The sweeping job itself is never a candidate. One snapshot serves the scope choice and every re-check. If the command-line query fails,
 the sweep fails closed: `skippedReason = capture_owner_command_lines_unreadable` at the scope choice, and an `error` with that prefix on a re-check. Command lines that read empty are
-counted in `orphanSweep.unreadableCommandLineCount`. A display-report
+counted in `orphanSweep.unreadableCommandLineCount`.
+r4: a process whose path is unreadable AND whose command line reads empty, under a name no route matches, is an UNIDENTIFIED possible owner. Before r4 it was dropped without a
+record, so beside the Intel child the sweep could stop that capture's live `MLVAttr3-*` session. Only positive non-ownership evidence clears it: the process runs in session 0 while the
+job runs in another session (both read from `Process.SessionId` in the same enumeration; an unread session is no evidence), or its pid is a registered service's. In scope
+`harness_sessions` any unidentified owner left stops the sweep: `skippedReason = capture_owner_unidentified` at the scope choice and after the listing, `abortedReason` with that value
+before a terminate or a `logman stop`. `orphanSweep.unidentifiedCaptureOwnerIds` names the pids, `unidentifiedCaptureOwners` gives name, pid and session, and
+`unidentifiedNonOwnership` holds the job's session and the counts each kind of evidence cleared. Scope `all` is unchanged. A non-elevated agent cannot read the path of the session's own
+system processes (csrss, winlogon, dwm, fontdrvhost), so on such a host the Intel-only sweep now usually refuses. The r4 run summary has the measurement. A display-report
 failure whose sweep did not leave the host clean (skipped, aborted, `remaining`, `deferred`, a listing or sweep error) gains a typed `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE` detail.
 
 The sweep can never stop a live capture or a session it did not list as an orphan (round 2): it acts only on the names listed before its second liveness check -- a name a
