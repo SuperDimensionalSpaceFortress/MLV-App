@@ -154,12 +154,70 @@ TEST(ClipOpenAbortCallers, SessionClipRefusedByPrepTakesNothingFromTheLoadedClip
     const SessionClipOpenFailurePlan opened = sessionClipOpenPlan(kMlvErrNone, 0);
     ASSERT_TRUE(opened.applySliders && opened.takeThumbnail && opened.activateClip);
     ASSERT_FALSE(opened.restoreLastOpened);
-    // nothing of this session loaded yet: the reset sliders take the clip's own settings
+    // adversary A3: nothing of this session loaded yet. setSliders would run ReceiptSafety against the
+    // retained clip and rewrite the XML receipt (Dual ISO valid/Fast -> invalid/off), so it still takes no sliders.
     const SessionClipOpenFailurePlan first = sessionClipOpenPlan(kClipOpenAbortedPrepBusy, -1);
-    ASSERT_TRUE(first.applySliders);
+    ASSERT_FALSE(first.applySliders);
     ASSERT_FALSE(first.takeThumbnail);
     ASSERT_FALSE(first.activateClip);
     ASSERT_FALSE(first.restoreLastOpened);
+}
+
+TEST(ClipOpenAbortCallersWiring, OpenSessionWithNoClipOpenedReopensTheActiveClipLater)
+{
+    const QString source = mainWindowSource();
+    const QString body = bodyBetween(source, QStringLiteral("void MainWindow::openSession(QString fileNameSession)"),
+                                     QStringLiteral("void MainWindow::saveSession(QString fileName)"));
+    ASSERT_FALSE(body.isEmpty());
+    const int warn = body.indexOf(QStringLiteral("if( !prepRefusedClips.isEmpty() )"));
+    const int retry = body.indexOf(QStringLiteral(
+        "if( lastOpenedRow < 0 && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );"));
+    ASSERT_TRUE(warn >= 0);
+    ASSERT_TRUE(retry > warn);
+}
+
+// adversary A1: a refused import must not save the retained clip's sliders into the new clip's receipt
+// (deleteFileFromSession -> setReceipt( ACTIVE_RECEIPT )) nor offer the corrupt-file delete dialog.
+TEST(ClipOpenAbortCallersWiring, RefusedImportLeavesTheSessionWithoutAReceiptSaveOrDeleteDialog)
+{
+    const QString source = mainWindowSource();
+    const QString body = bodyBetween(source, QStringLiteral("void MainWindow::importNewMlv(QString fileName)"),
+                                     QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
+    ASSERT_FALSE(body.isEmpty());
+    const int before = body.indexOf(QStringLiteral("const int previousActive = SESSION_CLIP_COUNT > 0 ? SESSION_ACTIVE_CLIP_ROW : -1;"));
+    const int add = body.indexOf(QStringLiteral("addFileToSession( fileName );"));
+    const int refused = body.indexOf(QStringLiteral("if( clipOpenAbortedForPrep( ret ) )"));
+    const int opened = body.indexOf(QStringLiteral("else if( !ret )"));
+    const int corrupt = body.indexOf(QStringLiteral("deleteFileFromSession();"));
+    ASSERT_TRUE(before >= 0);
+    ASSERT_TRUE(add > before);
+    ASSERT_TRUE(refused > add);
+    ASSERT_TRUE(opened > refused);
+    ASSERT_TRUE(corrupt > opened);
+    const QString branch = body.mid(refused, opened - refused);
+    ASSERT_TRUE(branch.contains(QStringLiteral("m_pModel->removeRow( SESSION_CLIP_COUNT - 1, QModelIndex() );")));
+    ASSERT_TRUE(branch.contains(QStringLiteral(
+        "if( previousActive >= 0 && previousActive < SESSION_CLIP_COUNT ) SET_ACTIVE_CLIP_IDX( previousActive );")));
+    ASSERT_FALSE(branch.contains(QStringLiteral("setReceipt(")));
+    ASSERT_FALSE(branch.contains(QStringLiteral("deleteFileFromSession")));
+}
+
+// adversary A2: the empty object a refused open (or the rename / delete close) leaves behind has no
+// processing attached; a receipt save must not dereference it.
+TEST(ClipOpenAbortCallersWiring, SetReceiptNeverReadsLevelsFromAnObjectWithoutProcessing)
+{
+    const QString source = mainWindowSource();
+    const QString body = bodyBetween(source, QStringLiteral("void MainWindow::setReceipt( ReceiptSettings *receipt )"),
+                                     QStringLiteral("void MainWindow::replaceReceipt("));
+    ASSERT_FALSE(body.isEmpty());
+    const int attached = body.indexOf(QStringLiteral("const bool clipProcessingAttached = m_pMlvObject && m_pMlvObject->processing;"));
+    ASSERT_TRUE(attached >= 0);
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "if( clipProcessingAttached ) receipt->setDualIsoForced( llrpGetDualIsoValidity( m_pMlvObject ) );")));
+    const int guard = body.indexOf(QStringLiteral("    if( clipProcessingAttached )\n    {\n        receipt->setDualIsoWhite("));
+    ASSERT_TRUE(guard > attached);
+    ASSERT_EQ(body.count(QStringLiteral("m_pMlvObject->processing )")), 2);
+    ASSERT_EQ(body.count(QStringLiteral("llrpGetDualIsoValidity(")), 1);
 }
 
 TEST(ClipOpenAbortCallersWiring, OpenSessionGatesSlidersThumbnailAndActiveRowOnTheOpenResult)

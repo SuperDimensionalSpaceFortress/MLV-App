@@ -48,6 +48,8 @@ inline ShowFileOpenFailurePlan showFileOpenFailurePlan( int openResult, int row,
 
 // openSession: a clip whose open failed gets its receipt from the XML, but neither its settings nor its
 // thumbnail are taken from the clip that is still loaded, and it does not become the active row.
+// setSliders runs ReceiptSafety against the loaded clip and rewrites the receipt (adversary A3), so a
+// failed clip never takes sliders; when no session clip opened, the last one is reopened later instead.
 struct SessionClipOpenFailurePlan
 {
     bool applySliders = false;
@@ -67,9 +69,6 @@ inline SessionClipOpenFailurePlan sessionClipOpenPlan( int openResult, int lastO
         return plan;
     }
     plan.restoreLastOpened = lastOpenedRow >= 0;
-    // No clip of this session is loaded yet: the sliders hold reset values, so they take this clip's own
-    // settings (nothing of another session clip is overwritten) and a session save keeps its receipt.
-    plan.applySliders = lastOpenedRow < 0;
     return plan;
 }
 

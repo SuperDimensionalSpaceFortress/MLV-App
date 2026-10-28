@@ -11033,6 +11033,8 @@ void MainWindow::importNewMlv(QString fileName)
     }
     else
     {
+        const int previousActive = SESSION_CLIP_COUNT > 0 ? SESSION_ACTIVE_CLIP_ROW : -1;
+
         //Add to SessionList
         addFileToSession( fileName );
 
@@ -11041,7 +11043,19 @@ void MainWindow::importNewMlv(QString fileName)
         if( ui->actionFastOpen->isChecked() ) ret = openMlvForPreview( fileName );
         else ret = openMlv( fileName );
 
-        if( !ret )
+        if( clipOpenAbortedForPrep( ret ) )
+        {
+            // r3 (adversary A1): nothing of the new clip was loaded. It leaves the session without the
+            // corrupt-file dialog and without a receipt save, and the clip the sliders describe is active again.
+            m_pModel->removeRow( SESSION_CLIP_COUNT - 1, QModelIndex() );
+            if( previousActive >= 0 && previousActive < SESSION_CLIP_COUNT ) SET_ACTIVE_CLIP_IDX( previousActive );
+            else if( SESSION_CLIP_COUNT == 0 ) deleteSession();
+            listViewSessionUpdate();
+            QMessageBox::warning( this, tr( "Import MLV" ),
+                                  tr( "%1 was not imported because playback was still preparing a frame. Import it again." )
+                                  .arg( QFileInfo( fileName ).fileName() ) );
+        }
+        else if( !ret )
         {
             //Save last file name
             m_lastMlvOpenFileName = fileName;
@@ -14585,6 +14599,8 @@ void MainWindow::openSession(QString fileNameSession)
                               tr( "These clips were not opened because playback was still preparing a frame. "
                                   "Their settings are kept; select a clip to open it.\n%1" )
                               .arg( prepRefusedClips.join( "\n" ) ) );
+        // No session clip opened: the active (last) clip has not taken any sliders yet; open it later.
+        if( lastOpenedRow < 0 && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );
     }
 
     if (Rxml.hasError())
@@ -18634,7 +18650,10 @@ void MainWindow::setReceipt( ReceiptSettings *receipt )
     receipt->setPatternNoise( toolButtonPatternNoiseCurrentIndex() );
     receipt->setUpsideDown( toolButtonUpsideDownCurrentIndex() );
     receipt->setDeflickerTarget( ui->spinBoxDeflickerTarget->value() );
-    receipt->setDualIsoForced( llrpGetDualIsoValidity( m_pMlvObject ) );
+    // r3 (adversary A2): a refused open can leave the empty object (no processing attached); the
+    // receipt then keeps its own clip-local Dual ISO validity and levels.
+    const bool clipProcessingAttached = m_pMlvObject && m_pMlvObject->processing;
+    if( clipProcessingAttached ) receipt->setDualIsoForced( llrpGetDualIsoValidity( m_pMlvObject ) );
     receipt->setDualIso( toolButtonDualIsoCurrentIndex() );
     receipt->setDualIsoPattern( ui->DualIsoPatternComboBox->currentIndex() );
     receipt->setDualIsoEvCorrection( ui->horizontalSliderDualIsoEvCorrection->value() );
@@ -18642,8 +18661,11 @@ void MainWindow::setReceipt( ReceiptSettings *receipt )
     receipt->setDualIsoInterpolation( toolButtonDualIsoInterpolationCurrentIndex() );
     receipt->setDualIsoAliasMap( toolButtonDualIsoAliasMapCurrentIndex() );
     receipt->setDualIsoFrBlending( toolButtonDualIsoFullresBlendingCurrentIndex() );
-    receipt->setDualIsoWhite( processingGetWhiteLevel( m_pMlvObject->processing ) );
-    receipt->setDualIsoBlack( processingGetBlackLevel( m_pMlvObject->processing ) );
+    if( clipProcessingAttached )
+    {
+        receipt->setDualIsoWhite( processingGetWhiteLevel( m_pMlvObject->processing ) );
+        receipt->setDualIsoBlack( processingGetBlackLevel( m_pMlvObject->processing ) );
+    }
     receipt->setDarkFrameFileName( ui->lineEditDarkFrameFile->text() );
     receipt->setDarkFrameEnabled( toolButtonDarkFrameSubtractionCurrentIndex() );
     receipt->setRawBlack( ui->horizontalSliderRawBlack->value() );
