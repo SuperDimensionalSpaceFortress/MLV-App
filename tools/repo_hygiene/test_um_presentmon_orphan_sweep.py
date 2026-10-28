@@ -1359,7 +1359,9 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         snapshot = _slice(TEMPLATE, "function Get-PresentMonProcessSnapshot(", "\nfunction Get-PresentMonLiveProcessId(")
         # r3: every process is enumerated (no -Name filter), and the command lines are read with -ErrorAction Stop too
         self.assertIn("foreach ($candidate in @(Get-Process -ErrorAction Stop)) {", snapshot)
-        self.assertIn("Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine -ErrorAction Stop", snapshot)
+        # r4: the row's image name is read too (a command line counts only for the process it was read from), and the service list is one throwing query
+        self.assertIn("Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine, Name -ErrorAction Stop", snapshot)
+        self.assertIn("Get-CimInstance -ClassName Win32_Service -Property ProcessId, Name -ErrorAction Stop", snapshot)
         self.assertNotIn("SilentlyContinue", snapshot, "an unreadable list must never read as 'no capture alive'")
 
     def test_the_pinned_image_name_drops_only_the_exe_extension_of_the_real_pinned_name(self) -> None:
