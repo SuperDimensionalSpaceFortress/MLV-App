@@ -889,7 +889,21 @@ foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.s
 # r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
 if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { $_.sourceCommit -ceq $b.Key })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
 # r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted (the preflight guard just resolved it), for Get-ReceiptDestinationRefusal
-foreach ($g in $script:guardedInputs) { $g | Add-Member -NotePropertyName accepted -NotePropertyValue $(try { [pscustomobject]@{ phys = (Get-PhysicalPath $g.path); key = (Get-FileIdentity $g.path).key } } catch { $null }) }
+# r8 pass 2 (adversary r8 A1): an input with no accepted identity was skipped by every destination check (renamed away and re-linked, it was written through). One that will not identify
+# is asked again (a save-as-rename's moment), at most three times, and one that still will not is refused here, before any claim, in its unresolved type.
+foreach ($g in $script:guardedInputs) {
+    $acc = $null
+    for ($ask = 1; $ask -le 3 -and $null -eq $acc; $ask++) {
+        $acc = $(try { [pscustomobject]@{ phys = (Get-PhysicalPath $g.path); key = (Get-FileIdentity $g.path).key } } catch { $null })
+        if ($null -eq $acc -and $ask -lt 3) { Start-Sleep -Milliseconds 200 }
+    }
+    $g | Add-Member -NotePropertyName accepted -NotePropertyValue $acc
+    if ($null -eq $acc) {
+        $code = Get-InputUnresolvedCode $g.path -SkipRead:($g.kind -ceq 'build'); if (-not $code) { $code = 'INPUT_UNREADABLE' }
+        $label = $(if ($g.kind -ceq 'plan') { 'the plan file' } elseif ($g.kind -ceq 'build') { 'the staged build manifest' } else { 'the leg spec' })
+        Stop-InputIsOutput ([pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = $code; path = $g.path; why = "$label '$($g.path)' could not be identified as it was accepted (no destination could be compared with it)" })
+    }
+}
 if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }
 # The scalar form's one build rides on every leg, so each leg is launched with its own build in either form.
 if (-not $legPlanMode) { foreach ($p in $plan) { $p | Add-Member -NotePropertyName sourceCommit -NotePropertyValue $SourceCommit; $p | Add-Member -NotePropertyName buildManifestSha256 -NotePropertyValue $BuildManifestSha256 } }
@@ -942,12 +956,17 @@ function Get-OpenDispatchRefusal([string]$NotAfterUtc) {
     # (b) the claim bounds the admission: the agent may admit the open until its notAfterUtc. An admission that could come after the claim's last good expiry is refused unless the
     #     keeper is renewing it on schedule (live, not lost, no renewal failed: none due yet, or the last one RENEWED; -ClaimRenewSec is at most half the TTL, so one is due first).
     #     Get-VenueClaimKeeperLoss asked AT the open's notAfterUtc: $null = the claim's last good expiry is later than any admission.
+    #     r8 pass 2 (adversary r8 A2): on schedule also means the last good expiry is more than one -ClaimRenewSec away NOW, so a claim already expired (a first renewal stalled, a
+    #     RENEWED long ago) or about to (an overdue keeper) never vouches for the open.
     $s = $claimKeeper.state
     $atLatest = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc -NowUtc $NotAfterUtc
     if ($null -eq $atLatest) { return $null }
-    $renewing = $script:keeperLive -and -not $s.lost -and [int]$s.errors -eq 0 -and ([int]$s.runs -eq 0 -or [string]$s.last -ceq 'RENEWED')
+    $now = [DateTime]::UtcNow
+    $withinRenew = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc -NowUtc $now.AddSeconds($ClaimRenewSec)
+    $renewing = $script:keeperLive -and -not $s.lost -and [int]$s.errors -eq 0 -and ([int]$s.runs -eq 0 -or [string]$s.last -ceq 'RENEWED') -and $null -eq $withinRenew
     if ($renewing) { return $null }
-    [pscustomobject]@{ reason = $(if ($s.lost) { 'CLAIM_LOST' } else { 'OPEN_OUTLIVES_CLAIM' }); code = 9; detail = "the open may be admitted until its notAfterUtc=$NotAfterUtc, when the claim is lost unless renewed ($($atLatest.detail)), and the keeper is not renewing it (live=$([bool]$script:keeperLive) runs=$($s.runs))" }
+    $lostNow = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc -NowUtc $now
+    [pscustomobject]@{ reason = $(if ($lostNow) { 'CLAIM_LOST' } else { 'OPEN_OUTLIVES_CLAIM' }); code = 9; detail = "the open may be admitted until its notAfterUtc=$NotAfterUtc, when the claim is lost unless renewed ($($atLatest.detail)), and the keeper is not renewing it on schedule (live=$([bool]$script:keeperLive) runs=$($s.runs) renewSec=$ClaimRenewSec$(if ($lostNow) { "; lost now: $($lostNow.detail)" } elseif ($withinRenew) { '; the last good expiry is within one renewal interval' }))" }
 }
 
 function Submit-AgentJob([string]$JobId, [string]$Body, [int]$TimeoutSec, [int]$WaitSec, [string]$NotAfterUtc = '', [switch]$Open) {

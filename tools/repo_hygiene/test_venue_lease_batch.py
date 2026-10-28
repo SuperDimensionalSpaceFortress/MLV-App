@@ -3351,6 +3351,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "control: last renewal RENEWED": ("$claimKeeper.state.runs = 1; $claimKeeper.state.ok = 1; $claimKeeper.state.renews = 1; $claimKeeper.state.last = 'RENEWED'",
                                               ("-ClaimTtlSec", "60"), True),
             "control: keeper stopped, the claim outlasts notAfterUtc": (stop, (), True),
+            # adversary r8 A2: a keeper that has not renewed yet (runs=0) or RENEWED long ago does not vouch for a claim already expired or within one renewal of it
+            "first renewal overdue, the claim already expired": ("$claim.expiresUtc = [DateTime]::UtcNow.AddSeconds(-1).ToString('o')", ("-ClaimTtlSec", "60"), "CLAIM_LOST"),
+            "RENEWED long ago, the expiry within one renewal": ("$claimKeeper.state.runs = 1; $claimKeeper.state.ok = 1; $claimKeeper.state.renews = 1; $claimKeeper.state.last = 'RENEWED'; "
+                                                                "$claimKeeper.state.expiresUtc = [DateTime]::UtcNow.AddSeconds(5).ToString('o')", ("-ClaimTtlSec", "60"), False),
         }
         for name, (make, extra, sent) in cases.items():
             with self.subTest(case=name):
@@ -3361,15 +3365,36 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertFalse(self.claim_path.exists(), "the claim was left behind\n" + out)
                 k = [x.split(":")[0] for x in self.kinds()]
                 res = batch_result(r.stdout)
-                if sent:
+                if sent is True:
                     self.assertEqual((r.returncode, k[0], k[-1]), (0, "OPEN", "CLOSE"), out)
                     continue
+                reason = sent or "OPEN_OUTLIVES_CLAIM"
                 self.assertEqual(k, [], "an open that could be admitted after the claim's expiry was sent\n" + out)
                 self.assertEqual(self._r8_open_jobs_written(), [], out)
                 self.assertEqual(r.returncode, 9, out)
                 [b1] = self.batches()
-                self.assertEqual((res["stopReason"], b1["endReason"], b1["leaseId"]), ("OPEN_OUTLIVES_CLAIM", "OPEN_OUTLIVES_CLAIM", None), b1)
+                self.assertEqual((res["stopReason"], b1["endReason"], b1["leaseId"]), (reason, reason, None), b1)
                 self.assertIn("notAfterUtc=", b1["endDetail"])
+
+    def test_r8_adv_a1_an_input_that_cannot_be_identified_as_accepted_is_refused_before_the_claim(self) -> None:
+        # adversary r8 A1: the spec is renamed away while its accepted identity is taken and put back after. The snapshot failure was swallowed (accepted = null), so every destination
+        # check skipped that input as accepted, and once renamed and re-linked at the end, a receipt was written through it. Now: asked again, then refused before any claim.
+        # RED on 81ad0482: the run goes on (exit 0) with an input no destination can be compared with.
+        self._stage_case()
+        a = self._r5_spec("fx-a.json", self.specs[0])
+        away = a.with_name("fx-a.away")
+        args, e = self.plan_cmd(self.write_plan([self.item(a, "A", self.commit_a)]))
+        before = "# r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted"
+        after = "if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }"
+        args[args.index("-File") + 1] = str(self._patched_runner(before, f"Move-Item -LiteralPath '{psq(a)}' -Destination '{psq(away)}'\n" + before,
+                                                                 (after, f"Move-Item -LiteralPath '{psq(away)}' -Destination '{psq(a)}'\n" + after)))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=INPUT_VANISHED item=1 ", r.stderr)
+        self.assertIn("could not be identified as it was accepted", r.stderr)
+        self.assertEqual(self.kinds(), [], "a claim, open or leg followed an input with no accepted identity\n" + out)
+        self.assertFalse(self.claim_path.exists(), out)
 
     def test_r7_adv2_a4_a_preflight_refusal_with_an_uninspectable_zone_appends_nothing_to_the_plan(self) -> None:
         # adversary r7 pass 2 A4: the plan file IS RunDir\batch.log (one name) and RunDir\gate.log is a link to nothing, so the preflight guard types OUTPUT_ZONE_UNRESOLVED; before any input
