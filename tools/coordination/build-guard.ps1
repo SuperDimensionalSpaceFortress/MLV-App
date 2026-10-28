@@ -104,7 +104,9 @@
 # smaller than the guard allows, never larger.
 #
 # Log lines go to stderr; typed lines (BUILD_MEM_REFUSED, BUILD_SLOT_BUSY) go to stdout, except
-# BUILD_GUARD_COMMAND_FAILED, which goes to stderr beside the error it reports.
+# BUILD_GUARD_COMMAND_FAILED, which goes to stderr beside the error it reports. Output can never hold a slot (r6 sol B1): a
+# stderr line waits at most 2 s for its reader and then queues behind it (bounded, see Write-BuildGuardStderr), and every
+# typed refusal is printed only after the machine heavy slot was given back (or its stop file written).
 # Test seams (used by tests/coordination/test_build_guard.py, no real probe needed):
 #   -MemoryProbeFile   JSON array of {"freePhysGB":n,"freeCommitGB":n}, one sample per poll, last repeats
 #   -ProcessTableFile  JSON array of {"ProcessId":n,"Name":"cc1plus.exe","CreationDate":"<iso>"}
@@ -162,8 +164,61 @@ $script:HeavySlotInstallCmd = 'C:\ProgramData\HeavySlot\bin\heavy-slot.cmd'
 $script:HeavySlotMaxMinutes = 10080
 $script:HeavySlotGiveUpSlackMinutes = 15
 
+# r6 sol B1 (INV-13): a guard diagnostic can never block the guard. A full, open stderr pipe blocks not only a write: every
+# synchronous call on that handle (even the redirect check inside [Console]::OpenStandardError, or the first [Console]::Error)
+# waits behind the blocked writer, because an inherited pipe handle shares one file object. So this thread never touches the
+# handle. The raw stderr stream is opened on the thread pool, through a .NET delegate, and each line is written with
+# Stream.WriteAsync, which runs the write on the thread pool and keeps the lines in order; the guard waits at most
+# $script:BuildGuardLogWaitMs for it. A stderr nobody drains costs one bounded wait; while a write is still pending, later
+# lines queue without waiting, at most $script:BuildGuardLogMaxPending of them (the rest are dropped and counted in
+# $script:BuildGuardLogDropped), so admission polling, the hung-tool bound and every release keep running. A drained stderr
+# has each line written before the guard goes on, as before.
+$script:BuildGuardLogWaitMs = 2000
+$script:BuildGuardLogMaxPending = 256
+$script:BuildGuardLogDropped = 0
+$script:BuildGuardLogOpen = $null
+$script:BuildGuardLogBytes = [System.Collections.Generic.Queue[byte[]]]::new()
+$script:BuildGuardLogPending = [System.Collections.Generic.Queue[System.Threading.Tasks.Task]]::new()
+
+function Write-BuildGuardStderr([string]$Line) {
+    try {
+        $q = $script:BuildGuardLogPending
+        while ($q.Count -gt 0 -and $q.Peek().IsCompleted) { [void]$q.Dequeue() }
+        $waiting = $script:BuildGuardLogBytes
+        if ($q.Count + $waiting.Count -ge $script:BuildGuardLogMaxPending) { $script:BuildGuardLogDropped++; return }
+        $waiting.Enqueue([Console]::OutputEncoding.GetBytes($Line + [Environment]::NewLine))
+        # Stalled: an earlier line (or the open) is still pending, so this one only queues behind it.
+        $stalled = $q.Count -gt 0 -or ($script:BuildGuardLogOpen -and -not $script:BuildGuardLogOpen.IsCompleted)
+        if (-not $script:BuildGuardLogOpen) {
+            $open = [Delegate]::CreateDelegate([Func[System.IO.Stream]], [Console].GetMethod('OpenStandardError', [Type[]]@()))
+            $script:BuildGuardLogOpen = [System.Threading.Tasks.Task]::Run($open)
+        }
+        $open = $script:BuildGuardLogOpen
+        if (-not $stalled -and -not $open.IsCompleted) { [void]$open.Wait($script:BuildGuardLogWaitMs) }
+        if (-not $open.IsCompleted) { return }
+        $stream = $open.Result
+        $task = $null
+        while ($waiting.Count -gt 0) {
+            $bytes = $waiting.Dequeue()
+            $task = $stream.WriteAsync($bytes, 0, $bytes.Length)
+            $q.Enqueue($task)
+        }
+        if (-not $stalled) { [void]$task.Wait($script:BuildGuardLogWaitMs) }
+    } catch { }
+}
+
 function Write-BuildGuardLog([string]$Message) {
-    [Console]::Error.WriteLine("[build-guard] $Message")
+    Write-BuildGuardStderr "[build-guard] $Message"
+}
+
+function Get-BuildGuardJsonField($Object, [string]$Name) {
+    # r6 sol B2: one field of a parsed JSON record, or $null when the record is not one object or has no such field. It reads
+    # through PSObject.Properties, never a direct member access, so a strict-mode host gets $null, never a
+    # PropertyNotFoundException.
+    if ($Object -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    $p = $Object.PSObject.Properties[$Name]
+    if ($p) { return $p.Value }
+    return $null
 }
 
 function Add-BuildGuardLogLine([string]$Path, [string]$Line, [Text.Encoding]$Encoding) {
@@ -188,7 +243,8 @@ function Get-BuildGuardMemory([hashtable]$Options) {
         if ($samples.Count -eq 0) { return @{ PhysGB = 0.0; CommitGB = 0.0 } }
         $i = [math]::Min($script:BuildGuardProbeIndex, $samples.Count - 1)
         $script:BuildGuardProbeIndex++
-        return @{ PhysGB = [double]$samples[$i].freePhysGB; CommitGB = [double]$samples[$i].freeCommitGB }
+        # A sample without a field reads 0 (fail closed), in a strict-mode host too (r6 sol B2 sweep).
+        return @{ PhysGB = [double](Get-BuildGuardJsonField $samples[$i] 'freePhysGB'); CommitGB = [double](Get-BuildGuardJsonField $samples[$i] 'freeCommitGB') }
     }
     $os = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec $script:BuildGuardCimTimeoutSec -ErrorAction SilentlyContinue
     if (-not $os) { return @{ PhysGB = 0.0; CommitGB = 0.0 } }
@@ -201,7 +257,12 @@ function Get-BuildGuardMemory([hashtable]$Options) {
 function Get-BuildGuardJobs([hashtable]$Options, [int]$SelfPid) {
     # 4 by default; 2 when another live cc1plus / mingw32-make exists. Peers are pid@startUtc.
     if ($Options.ProcessTableFile) {
-        $table = @(Get-Content -LiteralPath $Options.ProcessTableFile -Raw | ConvertFrom-Json)
+        # Each row is read field by field, so a row without one reads $null in a strict-mode host too (r6 sol B2 sweep).
+        $table = @(Get-Content -LiteralPath $Options.ProcessTableFile -Raw | ConvertFrom-Json | ForEach-Object {
+                $r = $_
+                [pscustomobject]@{ ProcessId = Get-BuildGuardJsonField $r 'ProcessId'; ParentProcessId = Get-BuildGuardJsonField $r 'ParentProcessId'
+                    Name = Get-BuildGuardJsonField $r 'Name'; CreationDate = Get-BuildGuardJsonField $r 'CreationDate' }
+            })
     } else {
         $table = @(Get-CimInstance Win32_Process -OperationTimeoutSec $script:BuildGuardCimTimeoutSec -ErrorAction SilentlyContinue |
             Select-Object ProcessId, ParentProcessId, Name, CreationDate)
@@ -243,7 +304,17 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
         $path = $Options.LockPath
         if (Test-Path -LiteralPath $path) {
             $info = $null
-            try { $info = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { $info = $null }
+            # The record is read field by field and cast inside the catch (r6 sol B2 sweep): one that is not an object, lacks
+            # its owner or holds a field that is not a number is unreadable (reclaimed once old), in a strict-mode host too,
+            # never a throw.
+            try {
+                $rec = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                $recOwner = Get-BuildGuardJsonField $rec 'ownerPid'
+                if ($recOwner) {
+                    $info = @{ ownerPid = [int]$recOwner; startTicks = [long](Get-BuildGuardJsonField $rec 'startTicks')
+                        expiresTicks = [long](Get-BuildGuardJsonField $rec 'expiresTicks'); label = [string](Get-BuildGuardJsonField $rec 'label') }
+                }
+            } catch { $info = $null }
             $nowTicks = [DateTime]::UtcNow.Ticks
             $reclaim = ''
             if (-not $info -or -not $info.ownerPid) {
@@ -396,7 +467,7 @@ function Send-HeavySlotLines($Lease) {
     if ($last) { if ($Lease.Process -and $Lease.Process.HasExited) { $all += $last } else { $Lease.Tail = $last } }
     for ($i = $Lease.Lines.Count; $i -lt $all.Count; $i++) {
         $Lease.Lines.Add([string]$all[$i])
-        [Console]::Error.WriteLine([string]$all[$i])
+        Write-BuildGuardStderr ([string]$all[$i])
     }
 }
 
@@ -409,12 +480,21 @@ function Test-HeavySlotMarker($Lease, [int]$Code) {
     foreach ($l in $Lease.Lines) { if ($l -match '^HEAVY-SLOT TICKET (\S+) ([0-9a-f]{32})\s*$') { $ticket = $Matches[1]; $nonce = $Matches[2] } }
     if (-not $ticket) { return 'no HEAVY-SLOT TICKET line on stderr' }
     $Lease.Ticket = $ticket
-    try { $m = Get-Content -LiteralPath $Lease.ExitFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return 'no readable exit marker' }
-    if ([string]$m.source -ne 'heavy-slot' -or [string]$m.code -ne [string]$Code -or [string]$m.ticket -ne $ticket -or [string]$m.nonce -ne $nonce) {
-        return ('the exit marker does not name this run (source={0} code={1} ticket={2})' -f $m.source, $m.code, $m.ticket)
-    }
-    $Lease.Reason = [string]$m.reason
-    return ''
+    # r6 sol B2: only ONE JSON object counts (-NoEnumerate keeps '[{...}]' an array), and its fields are read through
+    # Get-BuildGuardJsonField inside the second try. {}, [], null, a scalar or an object missing an identity field is a
+    # reason string (so COULD_NOT_CHECK) in a strict-mode host too, never a PropertyNotFoundException; an absent reason is ''
+    # and never changes the identity verdict.
+    try { $m = Get-Content -LiteralPath $Lease.ExitFile -Raw -ErrorAction Stop | ConvertFrom-Json -NoEnumerate -ErrorAction Stop } catch { return 'no readable exit marker' }
+    try {
+        if ($m -isnot [System.Management.Automation.PSCustomObject]) { return 'the exit marker is not one JSON object' }
+        $f = @{}
+        foreach ($n in 'source', 'code', 'ticket', 'nonce', 'reason') { $f[$n] = [string](Get-BuildGuardJsonField $m $n) }
+        if ($f['source'] -ne 'heavy-slot' -or $f['code'] -ne [string]$Code -or $f['ticket'] -ne $ticket -or $f['nonce'] -ne $nonce) {
+            return ('the exit marker does not name this run (source={0} code={1} ticket={2})' -f $f['source'], $f['code'], $f['ticket'])
+        }
+        $Lease.Reason = $f['reason']
+        return ''
+    } catch { return ('the exit marker could not be checked ({0})' -f ($_.Exception.Message -replace '\s+', ' ')) }
 }
 
 function Remove-HeavySlotFiles($Lease) {
@@ -636,15 +716,17 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # A guarded build always takes the canonical machine slot: an inherited mutex name, slot count, state dir or keeper
     # owner would let it queue on other slots, or beside the canonical holder (r5b adversary A1).
     foreach ($v in 'HEAVY_SLOT_NAME', 'HEAVY_SLOT_COUNT', 'HEAVY_SLOT_DIR', 'HEAVY_SLOT_KEEPER_OWNER') { $null = $psi.Environment.Remove($v) }
+    # The hung-tool clock starts before the launch and before any diagnostic line (r6 sol B1).
+    $waitClock = [System.Diagnostics.Stopwatch]::StartNew()
     try { $lease.Process = [System.Diagnostics.Process]::Start($psi) } catch {
         Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=$cmd start-failed: $($_.Exception.Message); building WITHOUT the machine heavy slot (fail open)"
         return $null
     }
     $admitted = $false
+    $stopSent = $false
     # The cleanup try begins at the first statement after the launch, so nothing between them can skip its finally.
     try {
         Write-BuildGuardLog ('heavy-slot: waiting label={0} wait={1}m exit-file={2} shim={3}' -f $lease.Label, $Options.HeavySlotWaitMinutes, $lease.ExitFile, $cmd)
-        $waitClock = [System.Diagnostics.Stopwatch]::StartNew()
         while ($true) {
             Send-HeavySlotLines $lease
             # The ready file admits only while the holder it names still runs (checked after the file is seen, and again below).
@@ -678,6 +760,8 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             }
             if ($why) {
                 if ($code -eq 0) { $code = 1 }
+                # The stop goes BEFORE the typed line (r6 sol B1): a stdout nobody drains may block that line, never the slot.
+                if (-not $lease.Process.HasExited -or ($lease.Holder -and (Test-HeavySlotIdentity $lease.Holder))) { Send-HeavySlotStop $lease; $stopSent = $true }
                 Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code={1} reason={2} utc={3}' -f $Label, $code, $why, [DateTime]::UtcNow.ToString('o'))
                 exit $code
             }
@@ -708,7 +792,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         # Every way out before admission (exit, throw, Ctrl+C) leaves the stop file while heavy-slot still runs, even when a
         # ready file appeared after the last check, so its holder ends at once instead of holding the machine slot
         # (adversary A2; r1 adversary A1). A holder that outlived heavy-slot (its slot owner killed) gets it too.
-        if (-not $admitted -and (-not $lease.Process.HasExited -or ($lease.Holder -and (Test-HeavySlotIdentity $lease.Holder)))) { Send-HeavySlotStop $lease }
+        if (-not $admitted -and -not $stopSent -and (-not $lease.Process.HasExited -or ($lease.Holder -and (Test-HeavySlotIdentity $lease.Holder)))) { Send-HeavySlotStop $lease }
     }
 }
 
@@ -787,6 +871,10 @@ function Invoke-BuildGuard {
             }
             if ([DateTime]::UtcNow -ge $deadline) {
                 $waited = [int]([DateTime]::UtcNow - $started).TotalSeconds
+                # The machine heavy slot is given back BEFORE the typed refusal (r6 sol B1): a stdout nobody drains may block
+                # that line, never the slot. Nothing is built after it; $heavy is cleared only once the release has run.
+                Exit-HeavySlot $heavy
+                $heavy = $null
                 if (-not $memOk) {
                     Write-Output ('BUILD_MEM_REFUSED label={0} freePhysGB={1} freeCommitGB={2} need={3}/{4} waitedSec={5} utc={6}' -f $Label, $mem.PhysGB, $mem.CommitGB, $o.MinFreePhysGB, $o.MinFreeCommitGB, $waited, [DateTime]::UtcNow.ToString('o'))
                 } else {
@@ -948,7 +1036,7 @@ function Resolve-BuildGuardFragmentVerdict {
     } else {
         $reason = $Unrecorded
     }
-    [Console]::Error.WriteLine(('BUILD_GUARD_COMMAND_FAILED label={0} lastNativeExit={1} errors={2} exit={3} via={4} reason={5}' -f $Label, [int]$global:LASTEXITCODE, ($records.Count + $unreported), $verdict, $Via, ($reason -replace '\s+', ' ')))
+    Write-BuildGuardStderr (('BUILD_GUARD_COMMAND_FAILED label={0} lastNativeExit={1} errors={2} exit={3} via={4} reason={5}' -f $Label, [int]$global:LASTEXITCODE, ($records.Count + $unreported), $verdict, $Via, ($reason -replace '\s+', ' ')))
     return $verdict
 }
 

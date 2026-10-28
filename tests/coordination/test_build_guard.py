@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -1750,6 +1751,263 @@ def test_the_guard_pins_the_installed_heavy_slot_sha() -> None:
     text = GUARD.read_text(encoding="ascii")
     assert text.count(f"'{PINNED_HEAVY_SLOT_SHA}'") == 2, "the param default and the library default"
     assert "'--', $exe" in text and "heavy-slot.cmd" in text, "the shim with a quoted '--', never a bare -- to '&'"
+
+
+# r6 sol r5b B2: the --exit-file marker is judged by the real admission-loop tail (stub mode 'marked': a matching marker,
+# then the heavy-slot code) in a Library host, strict or not. Get-Content is shadowed for the marker file only, so the guard
+# reads the shape under test; every other read reaches the disk.
+_MARKER_SHAPES = {
+    "as-written": "$text",
+    "empty-object": "'{}'",
+    "array": "'[]'",
+    "null": "'null'",
+    "scalar": "'75'",
+    "no-reason": "($text | ConvertFrom-Json -AsHashtable | ForEach-Object { $_.Remove('reason'); $_ } | ConvertTo-Json -Compress)",
+    "one-element-array": "('[' + $text.Trim() + ']')",
+}
+
+
+def _marker_shape_seam(shape: str) -> str:
+    return (
+        "function Get-Content { param([string]$LiteralPath, [switch]$Raw, $ErrorAction = 'Continue')\n"
+        "    $text = Microsoft.PowerShell.Management\\Get-Content -LiteralPath $LiteralPath -Raw:$Raw -ErrorAction $ErrorAction\n"
+        "    if ($LiteralPath -notlike '*.exit.json') { return $text }\n"
+        f"    return {_MARKER_SHAPES[shape]} }}\n"
+    )
+
+
+@pytest.mark.parametrize("strict", [True, False], ids=["strict", "non-strict"])
+@pytest.mark.parametrize("shape, code, verdict", [
+    ("empty-object", 75, "could-not-check"),
+    ("array", 75, "could-not-check"),
+    ("null", 75, "could-not-check"),
+    ("scalar", 75, "could-not-check"),
+    ("one-element-array", 75, "could-not-check"),
+    ("no-reason", 75, "requeue"),
+    ("as-written", 75, "requeue"),
+    ("as-written", 76, "requeue"),
+])
+def test_a_marker_of_any_shape_is_a_typed_verdict_in_a_strict_mode_host(box, shape, code, verdict, strict) -> None:
+    # {}, [], null and a scalar parse, then threw PropertyNotFoundException in a strict-mode host before the typed
+    # classification; a matching marker without 'reason' threw on that optional field. Every shape is now a typed verdict,
+    # and the optional reason never changes the identity verdict. Only one JSON object counts ('[{...}]' is not one).
+    done = _library_driver(
+        box,
+        ("Set-StrictMode -Version Latest\n" if strict else "") + _marker_shape_seam(shape)
+        + f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+        extra={"STUB_HEAVY_SLOT_MODE": "marked", "STUB_HEAVY_SLOT_CODE": str(code)},
+    )
+    out = done.stdout + done.stderr
+    assert "PropertyNotFound" not in out and "cannot be found on this object" not in out, out
+    if verdict == "requeue":
+        assert done.returncode == 3, out
+        assert f"BUILD_HEAVY_SLOT_REQUEUE label=build code={code} ticket=stub-" in done.stdout, out
+        reason = "reason= utc=" if shape == "no-reason" else "reason=timed out after 3600s waiting for the slot utc="
+        assert reason in done.stdout, out
+    else:
+        assert done.returncode == code, out
+        assert f"BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code={code} reason=" in done.stdout, out
+        assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout, out
+    assert not box["marker"].exists() and not box["lock"].exists(), "nothing is built on a marker verdict"
+
+
+def test_a_foreign_marker_in_a_strict_mode_host_is_refused_as_foreign(box) -> None:
+    done = _library_driver(
+        box,
+        "Set-StrictMode -Version Latest\n"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+        extra={"STUB_HEAVY_SLOT_MODE": "forged75"},
+    )
+    assert done.returncode == 75, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=75 reason=the exit marker does not name this run" in done.stdout
+    assert not box["marker"].exists()
+
+
+@pytest.mark.parametrize("text", ["{}", "[]", "5", "null", '{"ownerPid":"x"}'])
+def test_the_other_json_records_read_in_a_strict_mode_host_never_throw(box, text) -> None:
+    # r6 B2 class sweep: the build-slot lock record (any process can write it), the memory probe and the process table are read
+    # field by field. A malformed lock is unreadable (held while fresh, reclaimed once old), a field-less memory sample reads
+    # 0 (fail closed) and a field-less process row is no peer, in a strict-mode host too.
+    lock = box["lock"]
+    lock.write_text(text, encoding="ascii")
+    mem = _write_json(box["dir"] / "memory.json", [{}])
+    table = _write_json(box["dir"] / "table.json", [{"ProcessId": 5}])
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\nSet-StrictMode -Version Latest\n"
+                f"$o = @{{ LockPath = '{lock}'; MutexName = 'Local\\MLV-BuildGuardTest-{os.getpid()}-{abs(hash(text))}'; LockExpiryMinutes = 90; "
+                f"MemoryProbeFile = '{mem}'; ProcessTableFile = '{table}' }}\n"
+                "try { $r = Invoke-BuildSlotAcquire -Options $o -Label t; Write-Output \"fresh acquired=$($r.Acquired) held=$($r.Held)\" }"
+                " catch { Write-Output \"threw=$($_.Exception.GetType().Name)\" }\n"
+                f"(Get-Item -LiteralPath '{lock}').LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(-5)\n"
+                "try { $r = Invoke-BuildSlotAcquire -Options $o -Label t; Write-Output \"old acquired=$($r.Acquired)\" }"
+                " catch { Write-Output \"threw=$($_.Exception.GetType().Name)\" }\n"
+                "try { $m = Get-BuildGuardMemory -Options $o; Write-Output \"mem=$($m.PhysGB)/$($m.CommitGB)\" } catch { Write-Output \"threw=$($_.Exception.GetType().Name)\" }\n"
+                "try { $j = Get-BuildGuardJobs -Options $o -SelfPid $PID; Write-Output \"jobs=$($j.Jobs)\" } catch { Write-Output \"threw=$($_.Exception.GetType().Name)\" }\n"])
+    out = done.stdout + done.stderr
+    assert "threw=" not in done.stdout, out
+    if text != "null":
+        assert "fresh acquired=False held=lock-being-written" in done.stdout, out
+    assert "old acquired=True" in done.stdout, out
+    assert "mem=0/0" in done.stdout and "jobs=4" in done.stdout, out
+
+
+# r6 sol r5b B1 (card BUILD-GUARD-UNDRAINED-PIPE-SLOT-RELEASE-1): an inherited stdout or stderr that is open, full and never
+# read. The guard's diagnostics must not block admission polling, the hung-tool bound or a release, and every typed refusal
+# is printed only after the machine heavy slot was given back.
+def _full_pipe():
+    """A pipe whose buffer is full and which nobody reads: a thread stays blocked writing 128 KiB into it (nothing reaches
+    disk). _release_pipe drains it afterwards."""
+    read_fd, write_fd = os.pipe()
+
+    def fill():
+        try:
+            os.write(write_fd, b"#" * 131072)
+        except OSError:
+            pass
+
+    filler = threading.Thread(target=fill, daemon=True)
+    filler.start()
+    time.sleep(0.5)
+    assert filler.is_alive(), "the pipe never filled"
+    return read_fd, write_fd, filler
+
+
+def _release_pipe(pipe, guard) -> str:
+    read_fd, write_fd, filler = pipe
+    chunks = []
+
+    def drain():
+        while True:
+            try:
+                data = os.read(read_fd, 65536)
+            except OSError:
+                return
+            if not data:
+                return
+            chunks.append(data)
+
+    drainer = threading.Thread(target=drain, daemon=True)
+    drainer.start()
+    try:
+        guard.wait(timeout=120)
+    except subprocess.TimeoutExpired:
+        guard.kill()
+        guard.wait()
+    filler.join(timeout=30)
+    os.close(write_fd)
+    drainer.join(timeout=60)
+    if not drainer.is_alive():
+        os.close(read_fd)
+    return b"".join(chunks).decode("ascii", "replace")
+
+
+def _heavy_popen(box: dict, mode_args: list, memory: list = None, **streams) -> subprocess.Popen:
+    memory_file = _write_json(box["dir"] / "memory.json", OK_MEMORY if memory is None else memory)
+    table_file = _write_json(box["dir"] / "table.json", [])
+    env = _env(heavy_slot=HEAVY_STUB, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log")})
+    return subprocess.Popen(
+        [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GUARD),
+         "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(box["lock"]),
+         "-ExemptLogPath", str(box["exempt_log"]), "-HeavySlotSha256", _stub_sha(), *mode_args],
+        stdout=streams.get("stdout", subprocess.DEVNULL), stderr=streams.get("stderr", subprocess.DEVNULL), env=env,
+    )
+
+
+def _released_within(box: dict, seconds: float) -> bool:
+    # The stub logs its call (with the holder's end time) once heavy-slot ends, so the slot is given back.
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            calls = _stub_calls(box)
+        except ValueError:
+            calls = []   # read while the stub was still writing its line
+        if calls and calls[0]["childEnd"]:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+
+
+_RELEASE_BOUND_S = 60
+
+
+def test_an_undrained_full_stderr_never_keeps_the_heavy_slot(box) -> None:
+    # sol r5b B1 repro 1: -HeavySlotWaitMinutes 0 -Command 'exit 0' with stderr open, full and never read. The waiting line
+    # used to block before the hung-tool clock started, so the admitted holder was never stopped. Now the guard admits, builds,
+    # releases within the bound and exits 0, all while the pipe stays full.
+    pipe = _full_pipe()
+    started = time.monotonic()
+    guard = _heavy_popen(box, ["-HeavySlotWaitMinutes", "0", "-Command", "exit 0"], stderr=pipe[1])
+    try:
+        released = _released_within(box, _RELEASE_BOUND_S)
+        took = time.monotonic() - started
+        try:
+            code = guard.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            code = None
+    finally:
+        _release_pipe(pipe, guard)
+    assert released, f"the heavy slot was still held {_RELEASE_BOUND_S} s after launch behind an undrained stderr"
+    assert took < _RELEASE_BOUND_S
+    assert code == 0, "the guard stayed blocked on its own diagnostics after the release"
+    assert not box["lock"].exists()
+
+
+def test_an_undrained_full_stdout_gives_the_heavy_slot_back_before_the_refusal(box) -> None:
+    # sol r5b B1 repro 2 (same class, G:791-795): the memory refusal goes to a stdout open, full and never read. The slot is
+    # given back first, so it is free within the bound even while that line is still blocked; once read, the line is there.
+    pipe = _full_pipe()
+    guard = _heavy_popen(box, ["-DeadlineMinutes", "0", "-Command", _marker_command(box)],
+                         memory=[{"freePhysGB": 0, "freeCommitGB": 0}], stdout=pipe[1])
+    try:
+        released = _released_within(box, _RELEASE_BOUND_S)
+    finally:
+        out = _release_pipe(pipe, guard)
+    assert released, "the heavy slot was still held while the refusal line waited on an undrained stdout"
+    assert guard.returncode == 3, out
+    assert "BUILD_MEM_REFUSED label=build freePhysGB=0 freeCommitGB=0" in out, out
+    assert not box["marker"].exists() and not box["lock"].exists()
+
+
+@pytest.mark.parametrize("stream", ["stderr", "stdout"])
+def test_a_closed_output_reader_still_gives_the_typed_verdict(box, stream) -> None:
+    # Control: a reader that has already closed its end is a different failure (the write fails at once). The guard still
+    # releases the slot and exits with its typed code.
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    if stream == "stderr":
+        args, memory, code = ["-Command", "exit 0"], None, 0
+    else:
+        args, memory, code = ["-DeadlineMinutes", "0", "-Command", _marker_command(box)], [{"freePhysGB": 0, "freeCommitGB": 0}], 3
+    try:
+        guard = _heavy_popen(box, args, memory=memory, **{stream: write_fd})
+    finally:
+        os.close(write_fd)
+    assert guard.wait(timeout=90) == code
+    assert _released_within(box, 5)
+    assert not box["marker"].exists() and not box["lock"].exists()
+
+
+def test_a_drained_stderr_keeps_every_guard_line_in_order(box) -> None:
+    # Control: with a reader, each guard line is written before the guard goes on, so the order is the order of events.
+    done = _heavy(box, "run", ["-Command", "exit 0"])
+    assert done.returncode == 0, done.stdout + done.stderr
+    marks = ["heavy-slot: waiting label=", "HEAVY-SLOT TICKET stub-", "heavy-slot: admitted label=", "[build-guard] admitted label=build",
+             "heavy-slot: released label="]
+    at = [done.stderr.index(m) for m in marks]
+    assert at == sorted(at), done.stderr
+
+
+def test_the_hung_tool_clock_starts_before_any_diagnostic_line() -> None:
+    # r6 B1: the clock starts before the launch, and no guard stderr line bypasses the bounded writer while a slot can be held
+    # (the two left are usage errors, written before any slot is taken).
+    text = GUARD.read_text(encoding="ascii")
+    body = text[text.index("function Enter-HeavySlot"):text.index("function Exit-HeavySlot(")]
+    clock = body.index("$waitClock = [System.Diagnostics.Stopwatch]::StartNew()")
+    assert clock < body.index("[System.Diagnostics.Process]::Start($psi)") < body.index("heavy-slot: waiting label=")
+    assert text.count("[Console]::Error.WriteLine(") == 2, "a guard stderr line must go through Write-BuildGuardStderr"
 
 
 # --- hygiene pin: no local launcher defaults to -j8 --------------------------------------------
