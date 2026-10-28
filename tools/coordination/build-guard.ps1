@@ -679,6 +679,14 @@ function Get-HeavySlotHolderState($Lease) {
     return 'alive'
 }
 
+function Test-HeavySlotStopNeeded($Lease) {
+    # Before admission, whether a holder may still read the stop file: heavy-slot's cmd wrapper still runs, the holder it
+    # named still runs, or no ready file was ever seen. The last one covers a wrapper that ended while the heavy-slot child it
+    # started outlived it, still queued: that child may start this run's holder later, which nothing else would stop while
+    # this host lives (r7b adversary 01aa4e7b-A1). Once a ready file was seen, the run's one holder has started.
+    return (-not $Lease.Process.HasExited -or -not $Lease.ReadySeen -or ($Lease.Holder -and (Test-HeavySlotIdentity $Lease.Holder)))
+}
+
 function Send-HeavySlotStop($Lease) {
     # Writes the stop file. When it cannot be written, heavy-slot's process tree is ended instead (the OS then frees its
     # slot mutex), so a holder that would never see the file cannot keep the machine slot.
@@ -786,7 +794,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Label = 'mlv:{0}:build' -f (Get-HeavySlotLane); BuildLabel = $Label
         Ready = Join-Path $dir "$id.ready"; Stop = Join-Path $dir "$id.stop"; ExitFile = Join-Path $dir "$id.exit.json"
         Log = Join-Path $dir "$id.log"; Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''; LogUnread = $false; Holder = $null
-        Owner = $null; Gone = ''; Tail = ''
+        Owner = $null; Gone = ''; Tail = ''; ReadySeen = $false
     }
     # heavy-slot ends its own wait (a marked 75) and its admit cap; this bound only catches a hung tool. It is numeric even
     # when a Library caller passes the minutes as a string, and monotonic, so a wall-clock step cannot move it. It is
@@ -859,6 +867,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             Send-HeavySlotLines $lease
             # The ready file admits only while the holder it names still runs (checked after the file is seen, and again below).
             if (Test-Path -LiteralPath $lease.Ready) {
+                $lease.ReadySeen = $true
                 $holder = Get-HeavySlotHolderState $lease
                 if ($holder -eq 'alive') { break }
                 if ($holder -eq 'unreadable') { Exit-HeavySlotUnreadable $lease $Label }
@@ -867,7 +876,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             $why = ''
             $code = 1
             if ($lease.Process.HasExited) {
-                if (Test-Path -LiteralPath $lease.Ready) { Exit-HeavySlotHolderGone $lease }
+                if (Test-Path -LiteralPath $lease.Ready) { $lease.ReadySeen = $true; Exit-HeavySlotHolderGone $lease }
                 Send-HeavySlotLines $lease
                 $code = $lease.Process.ExitCode
                 if ($code -eq 9009) {
@@ -889,7 +898,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             if ($why) {
                 if ($code -eq 0) { $code = 1 }
                 # The stop goes BEFORE the typed line (r6 sol B1): a stdout nobody drains may block that line, never the slot.
-                Send-HeavySlotStop $lease; $stopSent = $true
+                if (Test-HeavySlotStopNeeded $lease) { Send-HeavySlotStop $lease; $stopSent = $true }
                 Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code={1} reason={2} utc={3}' -f $Label, $code, $why, [DateTime]::UtcNow.ToString('o'))
                 exit $code
             }
@@ -920,10 +929,8 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         # Every way out before admission (exit, throw, Ctrl+C) leaves the stop file while heavy-slot still runs, even when a
         # ready file appeared after the last check, so its holder ends at once instead of holding the machine slot
         # (adversary A2; r1 adversary A1). A holder that outlived heavy-slot (its slot owner killed) gets it too.
-        # The stop file is written even when heavy-slot's cmd wrapper has ended (r7b adversary 01aa4e7b-A1): the heavy-slot
-        # child it started may outlive it, still queued, and admit a holder later that no one else would stop while this host
-        # lives. Nothing deletes it on this path; it is written last, after any lease-file cleanup above.
-        if (-not $admitted -and -not $stopSent) { Send-HeavySlotStop $lease }
+        # It is written last, after any lease-file cleanup above, and nothing deletes it on this path.
+        if (-not $admitted -and -not $stopSent -and (Test-HeavySlotStopNeeded $lease)) { Send-HeavySlotStop $lease }
     }
 }
 
