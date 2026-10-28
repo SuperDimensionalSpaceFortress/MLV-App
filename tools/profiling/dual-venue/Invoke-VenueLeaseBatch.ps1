@@ -375,9 +375,10 @@ function Get-RunDirOutputRefusal([string]$Path) {
     # '' when $Path is not a file this run writes; else the sentence for the refusal. r10 (adversary r9 A1): PHYSICAL paths on both sides (Get-PhysicalPath), so neither a spelling of -RunDir
     # (\.\, ..\, a trailing \) nor a junction or symlink that reaches it (the input, an ancestor of it, or -RunDir itself) slips past. Every caller goes through here, and so does the
     # re-check once the claim is held (Get-InputOutputRefusal). r11: and the same for each zone of Get-OutputZones (-RunDir, then the claim dir).
-    $hardLinkOf = ''; $hardLinkZone = $null
+    # r5b (adversary r5b A2): $script:refusalInputUnopened says whether a refusal came from the input ITSELF not opening (Get-InputOutputRefusal never calls that an alias)
+    $hardLinkOf = ''; $hardLinkZone = $null; $script:refusalInputUnopened = $false
     try {
-        $full = Get-PhysicalPath $Path
+        try { $full = Get-PhysicalPath $Path } catch { $script:refusalInputUnopened = $true; throw }
         $zones = @(Get-OutputZones)
         foreach ($z in $zones) {
             # a runner-owned name inside the zone that is itself a link: what the runner writes under that name lands at the link's target, so the target is the output
@@ -408,7 +409,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
         }
         # r10 (adversary r10 A1): and a HARD link is a second name for the same file, with its own final path, so the paths differ while the file is the one the runner writes. Compare file
         # identity: only an input with more than one name can be one, and then only the outputs that already exist can be its other name.
-        $id = Get-FileIdentity $full
+        try { $id = Get-FileIdentity $full } catch { $script:refusalInputUnopened = $true; throw }
         # r13 (Dot A2''): the identity of every directory above the input, nearest first, for the zone and owned-directory comparisons below
         $aboveIds = [System.Collections.Generic.List[string]]::new()
         $a = [IO.Path]::GetDirectoryName($full)
@@ -472,7 +473,8 @@ function Get-InputUnresolvedCode([string]$Path) {
     # r5 (opus r4b B1, the second trigger): Get-RunDirOutputRefusal refuses an input it cannot open, which is right before any claim, but once the claim is held a spec deleted after
     # its leg ran, or a plan briefly gone in a save-as-rename, is not a runner output. '' when the input itself opens (its refusal stands); INPUT_VANISHED when nothing is left at its
     # name and the folder it was in still resolves; INPUT_UNREADABLE for an input that is there but will not open (a dangling link, a share not answering).
-    try { $null = Get-PhysicalPath $Path; $null = Get-FileIdentity $Path; return '' } catch { }
+    # r5b (adversary r5b A1): or that is no file any more: a folder at its name opens like one (BACKUP_SEMANTICS) and reads as nothing, so it is INPUT_UNREADABLE too.
+    try { $null = Get-PhysicalPath $Path; $null = Get-FileIdentity $Path; if ([IO.Directory]::Exists($Path)) { return 'INPUT_UNREADABLE' }; return '' } catch { }
     $entry = $true
     try { $null = Get-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { $entry = $false }
     if (-not $entry) { try { $null = Get-PhysicalPath ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))); return 'INPUT_VANISHED' } catch { } }
@@ -485,16 +487,25 @@ function Get-InputOutputRefusal {
     # r5: an input that cannot be opened any more is its own hit (kind unresolved, Get-InputUnresolvedCode), never "an input is a runner output", and a real alias outranks it.
     $unresolved = $null
     foreach ($g in $script:guardedInputs) {
-        # a staged build manifest that is gone has no location to compare; Get-InputContentRefusal types that (BUILD_NOT_STAGED)
-        if ($g.kind -ceq 'build' -and -not (Test-Path -LiteralPath $g.path -PathType Leaf)) { continue }
-        $why = Get-RunDirOutputRefusal $g.path
-        if (-not $why) { continue }
-        $code = Get-InputUnresolvedCode $g.path
-        if (-not $code) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why } }
+        # a staged build manifest that is gone has no location to compare; Get-InputContentRefusal types that (BUILD_NOT_STAGED). r5b (adversary r5b A1): a folder at its name is not gone.
+        if ($g.kind -ceq 'build' -and -not (Test-Path -LiteralPath $g.path)) { continue }
+        # r5b (adversary r5b A2): only a refusal reached with the input itself open is an alias. An input that did not open while the guard ran got no answer from it (a save-as-rename's
+        # moment): the guard is asked again, at most three times, and an input that never stays open is unresolved, never a runner output.
+        $code = ''
+        for ($ask = 1; $ask -le 3; $ask++) {
+            $why = Get-RunDirOutputRefusal $g.path
+            if (-not $why -or -not $script:refusalInputUnopened) { break }
+            $code = Get-InputUnresolvedCode $g.path
+            if ($code) { break }
+        }
+        if ($why -and $script:refusalInputUnopened -and -not $code) { $code = 'INPUT_UNREADABLE' }
+        # r5b (adversary r5b A1): no output, but the input may be a folder now (it opens, and reads as nothing)
+        if (-not $why) { $code = Get-InputUnresolvedCode $g.path }
+        if (-not $code) { if ($why) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why } }; continue }
         if (-not $unresolved) {
             $label = $(if ($g.kind -ceq 'plan') { 'the plan file' } elseif ($g.kind -ceq 'build') { 'the staged build manifest' } else { 'the leg spec' })
             $unresolved = [pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = $code; path = $g.path
-                why = "$label '$($g.path)' $(if ($code -ceq 'INPUT_VANISHED') { 'is gone (nothing at that name any more)' } else { 'can no longer be opened' }) since it was accepted" }
+                why = "$label '$($g.path)' $(if ($code -ceq 'INPUT_VANISHED') { 'is gone (nothing at that name any more)' } else { 'can no longer be opened as a file' }) since it was accepted" }
         }
     }
     if ($unresolved) { return $unresolved }

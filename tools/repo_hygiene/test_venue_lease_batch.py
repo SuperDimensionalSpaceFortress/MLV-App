@@ -2860,6 +2860,50 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(len(self.batches()), 1)
         self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=INPUT_UNREADABLE item=1 ", r.stderr)
 
+    def test_r5b_adv_a1_an_input_replaced_by_a_folder_during_the_final_batch_is_input_unreadable_never_exit_0(self) -> None:
+        # adversary r5b A1: a folder opens like a file (BACKUP_SEMANTICS), is no runner output and (scalar form, the plan file) has no content check, so an accepted input replaced by an
+        # empty folder after its leg ran was no hit at all and the run ended exit 0. Each input kind: the spec (both forms), the plan file, the staged build manifest.
+        for form in ("scalar spec", "plan spec", "plan file", "build manifest"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                if form == "scalar spec":
+                    args, e = self.batch_cmd([spec])
+                else:
+                    args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                target = {"plan file": self.case / "plan.json", "build manifest": self._staged_manifest(self.commit_a)}.get(form, spec)
+                r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Delete('{psq(target)}'); [void][IO.Directory]::CreateDirectory('{psq(target)}')")
+                self.assertTrue(target.is_dir(), "the input is a folder now (the case under test)\n" + r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 2, "an input that is a folder now was an exit 0\n" + r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"], res["logWriteFailures"]), (2, "INPUT_UNREADABLE", 1, [], 0))
+                self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+                self.assertTrue((self.run_dir / "batch-01.json").is_file(), "a folder at an input's name suppresses no receipt")
+                self.assertEqual(len(self.batches()), 1)
+                self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=INPUT_UNREADABLE", r.stderr)
+
+    def test_r5b_adv_a2_a_plan_missing_only_while_one_guard_ran_is_no_alias_and_suppresses_nothing(self) -> None:
+        # adversary r5b A2: the guard failed to open the plan (moved away in a save-as-rename), the plan was back before Get-InputUnresolvedCode probed it, and that stale failure was
+        # labelled LEG_PLAN_IS_RUN_OUTPUT: both receipts suppressed, exit 2. Only a refusal reached with the input itself open is an alias; this one is asked again and is clean.
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+        args, e = self.plan_cmd(plan)
+        p, away = psq(plan), psq(plan) + ".away"
+        anchor = "function Get-InputUnresolvedCode([string]$Path) {\n"
+        restore = anchor + f"    if ([IO.File]::Exists('{away}')) {{ [IO.File]::Move('{away}', '{p}') }}\n"
+        new = f"        if ($true) {{ [IO.File]::Move('{p}', '{away}') }}\n" + self._FINAL_RECEIPT
+        args[args.index("-File") + 1] = str(self._patched_runner(self._FINAL_RECEIPT, new, (anchor, restore)))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        self.assertTrue(plan.is_file() and not Path(str(plan) + ".away").exists(), "the plan was moved away and back (the case under test)\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["receiptPersistFailures"], res["logWriteFailures"]), (0, None, [], 0))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+        self.assertNotIn("BATCH_RECEIPT_WRITE_SKIPPED", r.stderr)
+        self.assertTrue((self.run_dir / "batch-01.json").is_file())
+        self.assertEqual(len(self.batches()), 1)
+
     def test_r5_b1_a_leg_plan_moved_away_during_the_final_batch_is_input_vanished_and_one_replaced_in_full_is_clean(self) -> None:
         spec = self._r5_spec("fx-a.json", self.specs[0])
         plan = self.write_plan([self.item(spec, "A", self.commit_a)])
