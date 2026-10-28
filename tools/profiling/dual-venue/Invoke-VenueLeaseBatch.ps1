@@ -171,7 +171,7 @@ param(
     [string]$ArtifactProbeScript = '',
     # r4 (sol r3 B1): '<claim|open>:<existence|identity|spec>=<sec>' makes that guard's read of that kind take <sec> longer, so a test can time a slow file system read inside
     # the guard. Offline only: refused with the real um-run.ps1, like the two probe seams above. r5 (sol r4 B1): '<guard>:rundir=<sec>' delays every read of -RunDir itself, in that
-    # guard's worker and on the main thread after it (Wait-RunDirReadSeam), as a -RunDir that stopped answering would.
+    # guard's worker and on the main thread after it (Wait-RunDirReadSeam), as a -RunDir that stopped answering would. r6: and every TEMP read after it that reaches -RunDir (Get-TempReadSeamMs).
     [string]$GuardReadDelay = ''
 )
 $ErrorActionPreference = 'Stop'
@@ -357,6 +357,26 @@ public static class VenueLeaseBatchFinalPath {
         System.Threading.Tasks.Task<string[]> t = System.Threading.Tasks.Task.Run(() => { if (delayMs > 0) { System.Threading.Thread.Sleep(delayMs); } uint l; string k = Identity(path, out l); return new string[] { Resolve(path), k }; });
         try { if (!t.Wait(timeoutMs)) { return false; } } catch (AggregateException) { return false; }
         physical = t.Result[0]; key = t.Result[1];
+        return true;
+    }
+    // r6 (sol r5 B1 = key3 r5 B1): TEMP's final path, then the identity of each folder in ancestors that exists ("" for one that does not), read on a pool thread the caller waits for
+    // with Finish and gives up on at its bound, so a TEMP that reaches a -RunDir that stopped answering (a junction into it, a second name for it) cannot hold the caller.
+    // resolveDelayMs / identityDelayMs are the offline -GuardReadDelay seam (0 in production).
+    public static System.Threading.Tasks.Task<string[]> StartWalk(string path, string[] ancestors, int resolveDelayMs, int identityDelayMs) {
+        return System.Threading.Tasks.Task.Run(() => {
+            if (resolveDelayMs > 0) { System.Threading.Thread.Sleep(resolveDelayMs); }
+            string[] r = new string[ancestors.Length + 1];
+            r[0] = Resolve(path);
+            if (identityDelayMs > 0) { System.Threading.Thread.Sleep(identityDelayMs); }
+            for (int i = 0; i < ancestors.Length; i++) { uint l; r[i + 1] = System.IO.Directory.Exists(ancestors[i]) ? Identity(ancestors[i], out l) : ""; }
+            return r;
+        });
+    }
+    // false = no answer within timeoutMs (0: only one already in), or the walk failed (error says why)
+    public static bool Finish(System.Threading.Tasks.Task<string[]> t, int timeoutMs, out string[] result, out string error) {
+        result = null; error = null;
+        try { if (!t.Wait(Math.Max(0, timeoutMs))) { return false; } } catch (AggregateException e) { error = e.InnerException != null ? e.InnerException.Message : e.Message; return false; }
+        result = t.Result;
         return true;
     }
 }
@@ -592,6 +612,27 @@ function Invoke-InputGuard {
     } finally { if ($null -ne $ps -and -not $abandoned) { $ps.Dispose() } }
 }
 
+function Assert-TempOutsideRunDir([string]$RunDirPath, [string]$TempPath, [string]$Shown) {
+    # TEMP set inside -RunDir would put the close redirect back in it: a pure comparison of two spellings (no file system call), thrown as the redirect's failure
+    $runDirPrefix = Remove-TrailingSeparator $RunDirPath; if (-not $runDirPrefix.EndsWith('\')) { $runDirPrefix += '\' }
+    $tp = Remove-TrailingSeparator ([IO.Path]::GetFullPath($TempPath)); if (-not $tp.EndsWith('\')) { $tp += '\' }
+    if ($tp.StartsWith($runDirPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "TEMP ($Shown) is inside -RunDir (physical $TempPath)" }
+}
+
+function Get-TempReadSeamMs([string]$TempFull, [Collections.Generic.List[string]]$Ancestors) {
+    # r6: the -GuardReadDelay seam's '<guard>:rundir' on the TEMP reads after that guard, as a -RunDir that stopped answering holds the reads that reach it: TEMP's final path when
+    # TEMP is inside -RunDir (a junction into it), the identity reads when a folder from TEMP up IS -RunDir (a second name: \\localhost\C$\<RunDir>). Offline only: it reads the
+    # (answering) test folders on this thread to decide, and says the delays on stderr; production passes no seam and gets 0, 0 with no read at all.
+    $d = $script:guardDelaySeam
+    if ($null -eq $d -or $d.read -cne 'rundir' -or $d.guard -cne $script:lastGuardSeam -or $null -eq $script:runDirKnown) { return @(0, 0) }
+    $resolveMs = 0; $identityMs = 0
+    $p = $null; try { $p = Get-PhysicalPath $TempFull } catch { }
+    if ($p) { try { Assert-TempOutsideRunDir $script:runDirKnown.physical $p $TempFull } catch { $resolveMs = $d.ms } }
+    foreach ($a in $Ancestors) { try { if ((Test-Path -LiteralPath $a -PathType Container) -and (Get-FileIdentity $a).key -ceq $script:runDirKnown.idKey) { $identityMs = $d.ms; break } } catch { } }
+    if ($resolveMs -or $identityMs) { [Console]::Error.WriteLine("TEMP_READ_DELAY_SEAM resolve=$resolveMs identity=$identityMs (TEMP reaches the stalled -RunDir)") }
+    @($resolveMs, $identityMs)
+}
+
 function Test-OpenOutputAlias {
     # r14 (Dot 2e6eb21d; adversary r13 pass 3 A1, A2): the guard run once the open returns, WHATEVER it returned (a failed open, one with no lease batch, one still held in the gate, one
     # held to the deadline), before anything more is written. A location hit means a runner output IS an accepted input, so it turns the write suppression on by itself: the log and
@@ -621,27 +662,40 @@ function Test-OpenOutputAlias {
             # does not answer in that does not answer at all, so nothing that does (TEMP, the redirect) can be inside it; TEMP is then still kept out of where the preflight found -RunDir
             # ($script:runDirKnown). Neither known fails the redirect closed (the close job then cannot be written: JOB_WRITE_FAILED).
             $unknownLoc = [bool]$hit.locationUnknown
-            $runLoc = $null
+            # r16 (fable r15 H1): and by identity, as Get-RunDirOutputRefusal compares (volume serial + file index): a loopback UNC TEMP (\\localhost\C$\<RunDir>) has no
+            # prefix in common with -RunDir by spelling or by final path, so every existing folder from TEMP up is compared with -RunDir itself
+            $tempFull = Remove-TrailingSeparator ([IO.Path]::GetFullPath($tempDir))
+            $ancestors = [Collections.Generic.List[string]]::new(); $up = $tempFull
+            while ($up) { $ancestors.Add($up); $up = [IO.Path]::GetDirectoryName($up) }
             if ($unknownLoc) {
+                # r6 (sol r5 B1 = key3 r5 B1): nor is TEMP read here unbounded, for TEMP can reach that -RunDir too. It is first kept out of -RunDir by SPELLING alone (as given, and
+                # where the preflight found it): a TEMP nested in a -RunDir that stopped answering fails closed at once, before any file system call on it. Its final path and the
+                # identity of every folder from it up are then read on a pool thread (StartWalk) raced against the 2 s re-read of -RunDir and given up on at the same 2 s, so a
+                # TEMP that does not answer in that (a junction into the stalled -RunDir, a second name for it whose identity read stalls) fails the redirect closed too.
+                foreach ($root in @($RunDir, $(if ($script:runDirKnown) { $script:runDirKnown.physical })) | Where-Object { $_ }) { Assert-TempOutsideRunDir $root $tempFull $tempDir }
+                $tempSeam = Get-TempReadSeamMs $tempFull $ancestors
+                $walkClock = [Diagnostics.Stopwatch]::StartNew()
+                $walk = [VenueLeaseBatchFinalPath]::StartWalk($tempFull, $ancestors.ToArray(), $tempSeam[0], $tempSeam[1])
                 $d = $script:guardDelaySeam
                 $seamMs = $(if ($null -ne $d -and $d.read -ceq 'rundir' -and $d.guard -ceq $script:lastGuardSeam) { $d.ms } else { 0 })
                 $ph = $null; $ik = $null
                 if ([VenueLeaseBatchFinalPath]::LocateWithin([IO.Path]::GetFullPath($RunDir), $seamMs, 2000, [ref]$ph, [ref]$ik)) { $runLoc = [pscustomobject]@{ physical = $ph; idKey = $ik } }
                 else { $runLoc = $script:runDirKnown }
                 if ($null -eq $runLoc) { throw "-RunDir's location was never resolved and does not answer now" }
-            }
-            foreach ($pair in @(@($RunDir, $tempDir), @($(if ($unknownLoc) { $runLoc.physical } else { Wait-RunDirReadSeam; Get-PhysicalPath $RunDir }), (Get-PhysicalPath $tempDir)))) {
-                $runDirPrefix = Remove-TrailingSeparator $pair[0]; if (-not $runDirPrefix.EndsWith('\')) { $runDirPrefix += '\' }
-                $tp = Remove-TrailingSeparator ([IO.Path]::GetFullPath($pair[1])); if (-not $tp.EndsWith('\')) { $tp += '\' }
-                if ($tp.StartsWith($runDirPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "TEMP ($tempDir) is inside -RunDir (physical $($pair[1]))" }
-            }
-            # r16 (fable r15 H1): and by identity, as Get-RunDirOutputRefusal compares (volume serial + file index): a loopback UNC TEMP (\\localhost\C$\<RunDir>) has no
-            # prefix in common with -RunDir by spelling or by final path, so every existing folder from TEMP up is compared with -RunDir itself
-            $runDirId = $(if ($unknownLoc) { $runLoc.idKey } else { Wait-RunDirReadSeam; (Get-FileIdentity $RunDir).key })
-            $up = Remove-TrailingSeparator ([IO.Path]::GetFullPath($tempDir))
-            while ($up) {
-                if ((Test-Path -LiteralPath $up -PathType Container) -and (Get-FileIdentity $up).key -ceq $runDirId) { throw "TEMP ($tempDir) is inside -RunDir ($up is -RunDir by file identity)" }
-                $up = [IO.Path]::GetDirectoryName($up)
+                Assert-TempOutsideRunDir $runLoc.physical $tempFull $tempDir
+                $walked = $null; $walkError = $null
+                if (-not [VenueLeaseBatchFinalPath]::Finish($walk, [int](2000 - $walkClock.ElapsedMilliseconds), [ref]$walked, [ref]$walkError)) {
+                    throw "TEMP ($tempDir) $(if ($walkError) { "could not be read ($walkError)" } else { 'did not answer within 2 s' }) once the guard gave up on a location: it is not known to be outside -RunDir"
+                }
+                Assert-TempOutsideRunDir $runLoc.physical $walked[0] $tempDir
+                for ($i = 0; $i -lt $ancestors.Count; $i++) { if ($walked[$i + 1] -and $walked[$i + 1] -ceq $runLoc.idKey) { throw "TEMP ($tempDir) is inside -RunDir ($($ancestors[$i]) is -RunDir by file identity)" } }
+            } else {
+                Assert-TempOutsideRunDir $RunDir $tempFull $tempDir
+                Wait-RunDirReadSeam; Assert-TempOutsideRunDir (Get-PhysicalPath $RunDir) (Get-PhysicalPath $tempDir) $tempDir
+                Wait-RunDirReadSeam; $runDirId = (Get-FileIdentity $RunDir).key
+                foreach ($up in $ancestors) {
+                    if ((Test-Path -LiteralPath $up -PathType Container) -and (Get-FileIdentity $up).key -ceq $runDirId) { throw "TEMP ($tempDir) is inside -RunDir ($up is -RunDir by file identity)" }
+                }
             }
             $null = New-Item -ItemType Directory -Path $redirect -ErrorAction Stop
             $script:jobDir = $redirect; $script:batchLog = Join-Path $redirect 'batch.log'

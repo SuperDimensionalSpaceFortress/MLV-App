@@ -3194,6 +3194,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             if kind == "UMRUN":
                 ticks.setdefault("open" if rest.startswith("lease-batch-open-") else "close", int(t))
         self.assertIn("open", ticks, r.stdout + r.stderr)
+        if "close" not in ticks and env.get("NO_CLOSE_EXPECTED"):
+            # r6: a close redirect that failed closed submits no close job (JOB_WRITE_FAILED); the hold then ends when the run does
+            done = datetime.fromisoformat(batch_result(r.stdout)["finishedUtc"].replace("Z", "+00:00"))
+            ticks["close"] = (done - datetime(1, 1, 1, tzinfo=timezone.utc)) // timedelta(microseconds=1) * 10
         self.assertIn("close", ticks, r.stdout + r.stderr)
         return r, (ticks["close"] - ticks["open"]) / 1e7
 
@@ -3546,6 +3550,55 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("cannot be resolved to a physical path", se)
         self.assertIn("BATCH_OUTPUT_ALIASED", se)
         self.assertEqual(self.leg_calls(), [])
+
+    # r6 (sol r5 B1 = key3 r5 B1; new catalogue row: TEMP reaches a -RunDir that stalls after the open): after a location-unknown guard result -RunDir was re-read bounded, but TEMP
+    # was not. The pair list resolved TEMP (CreateFileW) before the spelling check that rejects a nested TEMP at once, and the identity walk from TEMP up ran on the main thread too,
+    # so a TEMP inside the stalled -RunDir held the typed refusal and the close. '<guard>:rundir=<sec>' now stalls every TEMP read that reaches -RunDir (TEMP_READ_DELAY_SEAM on
+    # stderr says it was armed). RED on 52bd3050's logic with that seam: the 40 s stall is waited for before the close.
+    def _stalled_rundir_temp_run(self, temp: Path, expect: str, armed: bool = True) -> None:
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75", TEMP=str(temp), TMP=str(temp), NO_CLOSE_EXPECTED="1")
+        self.assertNotIn("GUARD_READ_DELAY_SEAM", r.stderr, "a -RunDir read ran on the main thread after the guard gave up on that location")
+        self.assertIn('"closeOutcome":"JOB_WRITE_FAILED"', r.stderr, "the failed redirect leaves the close job unwritable, typed")
+        if armed:
+            self.assertIn("TEMP_READ_DELAY_SEAM", r.stderr, "the seam never stalled a TEMP read: this row would pass vacuously")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE ", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertEqual(self.leg_calls(), [])
+        # the 14 s room, the close, and the 2 s bound on the -RunDir re-read and the TEMP walk (raced, one bound), never the 40 s stall
+        self.assertLess(held, 75 - 60 + 4 + 2, f"the lease was held {held:.1f} s before the close: a TEMP read that reached the stalled -RunDir was waited for")
+        self.assertIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, "the redirect fails closed")
+        self.assertIn(expect, r.stderr)
+        self.assertEqual([str(x) for x in self.run_dir.rglob("venue-lease-batch-close-*")], [], "a close redirect was made inside -RunDir")
+        self.assertFalse(self.claim_path.exists(), "the claim was released (full cleanup)")
+
+    def test_artifact_preflight_r6_b1_a_temp_nested_in_a_stalled_rundir_fails_the_redirect_closed_by_spelling_before_any_temp_read(self) -> None:
+        temp = self.run_dir / "tmp"
+        temp.mkdir(parents=True, exist_ok=True)
+        # spelling alone rejects it now, before any TEMP read, so the seam is never reached on the fixed code
+        self._stalled_rundir_temp_run(temp, "is inside -RunDir", armed=False)
+
+    def test_artifact_preflight_r6_b1_a_temp_junction_into_a_stalled_rundir_fails_the_redirect_closed_within_2s(self) -> None:
+        alias = self.case / "r6-temp-junction"
+        self._junction(alias, self.run_dir / "tmp")
+        self.addCleanup(lambda: os.path.lexists(alias) and os.rmdir(alias))
+        self._stalled_rundir_temp_run(alias, "did not answer within 2 s")
+
+    def test_artifact_preflight_r6_b1_a_temp_whose_identity_read_stalls_fails_the_redirect_closed_within_2s(self) -> None:
+        # TEMP's final path answers and is not -RunDir's (\\localhost\C$\<RunDir>\tmp); the identity read of the folder that IS -RunDir stalls with it
+        (self.run_dir / "tmp").mkdir(parents=True, exist_ok=True)
+        self._stalled_rundir_temp_run(self._loopback_unc(self.run_dir) / "tmp", "did not answer within 2 s")
+
+    def test_artifact_preflight_r6_b1_control_an_independent_answering_temp_still_gets_the_redirect_fast(self) -> None:
+        # sol r5 INV-4 row 1: the same stalled -RunDir, TEMP elsewhere and answering: the cached -RunDir location is used and the redirect is made
+        temp = self.case / "r6-temp-elsewhere"
+        temp.mkdir(parents=True, exist_ok=True)
+        r, held = self._post_open_hash_run(0, "-GuardReadDelay", "open:rundir=40", cap="75", TEMP=str(temp), TMP=str(temp))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertNotIn("TEMP_READ_DELAY_SEAM", r.stderr)
+        self.assertNotIn("BATCH_OUTPUT_REDIRECT_FAILED", r.stderr, r.stderr)
+        self.assertEqual(len(list(temp.glob("venue-lease-batch-close-*"))), 1, r.stderr)
+        self.assertLess(held, 75 - 60 + 4 + 2, f"the lease was held {held:.1f} s before the close")
 
     # r5 adversary A2 (pass 1 on 8559ef31): no content read starts with under 2 s of the guard's room, but Get-VenueStagedBuildManifest started the hash with 1 s left of its call.
     # cap 66 / leg 60 / margin 0 leaves the post-open guard about 5 s (one build: a 4 s read); the manifest read takes 2.2 s once the open is answered, so the hash would start with 1.8 s.
