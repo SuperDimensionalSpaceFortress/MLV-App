@@ -170,6 +170,29 @@ class ThermalGateModuleTests(unittest.TestCase):
         got = ps_json(f"$h = Get-VenueHeavyLegKeys -Rows @(ConvertFrom-Json -InputObject '{rows}'); [pscustomobject]$h")
         self.assertEqual(got, {"failed|cpu": 1})
 
+    def test_adversary_r2b_a4_the_thermal_clock_is_monotonic_not_the_wall_clock(self) -> None:
+        # a wall clock that stepped back 120 s between probes used to read the elapsed wait as 0 (cap not consumed, overshoot 0): the elapsed time now comes
+        # from the Stopwatch timestamps alone, so 100 s of them are 100 s whatever UtcNow says
+        got = ps("$f = [datetime]::new(2026,10,28,0,0,0,[DateTimeKind]::Utc); $fq = [Diagnostics.Stopwatch]::Frequency; "
+                 "(Get-VenueThermalNowUtc -FirstHotUtc $f -FirstHotTimestamp 1000 -NowTimestamp (1000 + 100 * $fq)).ToString('o'); "
+                 "(Get-VenueThermalNowUtc -FirstHotUtc $f -FirstHotTimestamp 1000 -NowTimestamp 500).ToString('o')")
+        self.assertEqual(got.splitlines(), ["2026-10-28T00:01:40.0000000Z", "2026-10-28T00:00:00.0000000Z"], got)
+        runner = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("[DateTime]::UtcNow - $thw.firstHotUtc", runner, "the probe-wait clamp must not time the wait on the wall clock")
+        for line in runner.splitlines():
+            if "Get-VenueThermalGateStep -Heat" in line:
+                self.assertNotIn("-NowUtc ([DateTime]::UtcNow)", line, "the gate step must not be fed the wall clock once a first hot reading exists")
+        self.assertGreaterEqual(runner.count("Get-VenueThermalNowUtc"), 2)
+
+    def test_adversary_r2b_a5_a_null_list_parameter_is_empty_not_a_startup_crash(self) -> None:
+        # -HeatFrom $null / -LegSpec $null (or a null entry) bind fine, and Test-Path -LiteralPath $null THROWS; the normalizing line must drop nulls first
+        runner = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        lines = [l for l in runner.splitlines() if re.match(r"^\$(HeatFrom|LegSpec) = @\(", l)]
+        self.assertEqual(len(lines), 4, lines)   # a null filter and the pinned normalizing line, for each of the two
+        script = "$ErrorActionPreference='Stop'; $HeatFrom = $null; $LegSpec = @($null, 'a.json,b.json'); " + "; ".join(lines) + "; \"$($HeatFrom.Count)|$($LegSpec -join ';')\""
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual((r.returncode, r.stdout.strip()), (0, "0|a.json;b.json"), r.stdout + r.stderr)
+
     def test_gate_step_paths_wait_cool_run_and_cap_skip(self) -> None:
         # a stub clock and a stub heat sequence through the pure step: wait (hot, under the cap), cool (clear -> run, waitSec kept), cap skip (hot at 180 s)
         got = ps_json(
@@ -316,6 +339,20 @@ class ThermalGateRunnerTests(unittest.TestCase):
         self.assertEqual((row["status"], row["heatAtLaunch"]), ("RAN", "clear"), row)
         self.assertGreater(row["thermalWaitSec"], 12, row)
         self.assertEqual(row["thermalWaitOvershootSec"], row["thermalWaitSec"] - 12, row)
+
+    def test_adversary_r2b_a1_a_hot_cooldown_probe_during_a_thermal_wait_is_held_to_the_cap(self) -> None:
+        # first probe QUIET and hot (the thermal wait starts), every later probe COOLDOWN_UNMET and hot: these used to retry in the lease with no limit, past the cap,
+        # with no skip and no receipt; now the cap governs them and the leg is skipped hot, never run. A short deadline bounds the pre-fix run.
+        from datetime import datetime, timedelta, timezone
+        deadline = tvlb.utc_iso(datetime.now(timezone.utc) + timedelta(seconds=60))
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "4", "-ThermalPollSec", "1", "-ThermalRequeueMax", "0", "-DeadlineUtc", deadline,
+                           FAKE_HEAT="9", FAKE_QUIET_MODES="QUIET,COOLDOWN", FAKE_PROBE_SLEEP="1")
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        [b] = self.batches()
+        [row] = b["legs"]
+        self.assertEqual(row["status"], "THERMAL_HOT_SKIPPED", row)
+        self.assertGreater(row["thermalWaitSec"], 0, row)
+        self.assertLess(len([x for x in self.kinds() if x.startswith("QUIET")]), 10, "the probes stop at the cap")
 
     def test_no_overshoot_is_recorded_as_zero_when_the_wait_ends_inside_the_cap(self) -> None:
         r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "120", FAKE_HEAT="9,0")

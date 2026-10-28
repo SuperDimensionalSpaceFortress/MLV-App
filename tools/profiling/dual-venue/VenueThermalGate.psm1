@@ -85,6 +85,18 @@ function Get-VenueThermalGateStep {
     [pscustomobject]@{ step = $step; firstHotUtc = $first; waitSec = $waited; remainingSec = $(if ($step -ceq 'WAIT') { $CapSec - $waited } else { 0 }) }
 }
 
+function Get-VenueThermalNowUtc {
+    # adversary r2b A4: the thermal wait is timed on the monotonic Stopwatch clock, not the wall clock. The wall clock can step (NTP, a VM resume, an operator), and a step
+    # back made the elapsed wait read 0 (the cap not consumed, the next quiet wait too long, the overshoot receipt 0). This returns the instant the gate should treat as
+    # now: -FirstHotUtc plus the Stopwatch time since -FirstHotTimestamp ([Diagnostics.Stopwatch]::GetTimestamp() taken when the first hot reading was recorded).
+    param(
+        [Parameter(Mandatory)][DateTime]$FirstHotUtc,
+        [Parameter(Mandatory)][long]$FirstHotTimestamp,
+        [long]$NowTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
+    )
+    $FirstHotUtc.AddSeconds([Math]::Max(0.0, ($NowTimestamp - $FirstHotTimestamp) / [double][Diagnostics.Stopwatch]::Frequency))
+}
+
 function Get-VenueLegKeyFromName {
     # A runner leg name -> legId|backend. Names are NN-<legId>-<backend> (scalar) or NN-<legId>-<backend>-<arm> (-LegPlan), Invoke-VenueLeaseBatch.ps1.
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Name, [AllowEmptyString()][string]$Backend = '', [AllowEmptyString()][string]$Arm = '')
@@ -190,5 +202,5 @@ function Get-VenueThermalSpreadOrder {
     [pscustomobject]@{ items = @($out | ForEach-Object { , $Items[$_] }); heavy = $newHeavy; heavyAdjacent = (Measure-VenueHeavyAdjacency -Heavy $newHeavy); heavyAdjacentBefore = (Measure-VenueHeavyAdjacency -Heavy $Heavy) }
 }
 
-Export-ModuleMember -Function Get-VenueHeatVerdict, ConvertFrom-VenueProbeHeatLine, Get-VenueThermalGateStep, Get-VenueLegKeyFromName, Get-VenueHeavyLegKeys, Read-VenueLegHeatHistory,
+Export-ModuleMember -Function Get-VenueHeatVerdict, ConvertFrom-VenueProbeHeatLine, Get-VenueThermalGateStep, Get-VenueThermalNowUtc, Get-VenueLegKeyFromName, Get-VenueHeavyLegKeys, Read-VenueLegHeatHistory,
     Measure-VenueHeavyAdjacency, Get-VenueThermalSpreadOrder

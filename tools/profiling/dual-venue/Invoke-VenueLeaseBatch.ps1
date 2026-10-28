@@ -187,6 +187,8 @@ function Stop-Usage([string]$Message) { [Console]::Error.WriteLine("BATCH_USAGE 
 
 # `pwsh -File` passes an array argument as ONE string, so -LegSpec a.json,b.json is split on commas (an entry that is itself an existing path is kept whole;
 # PWSH-FILE-ARRAY-PASSTHRU-1, test_pwsh_string_array_file_params.py).
+# adversary r2b A5: a $null list (-HeatFrom $null) or null entry binds, and Test-Path -LiteralPath $null throws: nulls are dropped first, on their own line so the pinned line below is unchanged
+$LegSpec = @($LegSpec | Where-Object { $_ })
 $LegSpec = @($LegSpec | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 if (-not $QuietScript) { $QuietScript = Join-Path $here 'Wait-VenueQuiet.ps1' }
 if (-not $LegScript) { $LegScript = Join-Path $here 'Invoke-VenueLeg.ps1' }
@@ -205,6 +207,7 @@ if (2 * $LivenessRenewSec -gt $LivenessWindowSec) { Stop-Usage "-LivenessRenewSe
 $legPlanMode = ($PSCmdlet.ParameterSetName -ceq 'Plan')
 # -PlanOrder binds case-insensitively; every later test of it is case-sensitive, so name the canonical spelling once (sol r3 A1)
 $PlanOrder = @('AsGiven', 'Interleave', 'ThermalSpread') | Where-Object { $_ -ieq $PlanOrder } | Select-Object -First 1
+$HeatFrom = @($HeatFrom | Where-Object { $_ })
 $HeatFrom = @($HeatFrom | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 if ($HeatFrom.Count -gt 0 -and $PlanOrder -cne 'ThermalSpread') { Stop-Usage '-HeatFrom is read only by -PlanOrder ThermalSpread' }
 if (-not $legPlanMode -and (($LegSpec.Count -gt 0) -eq [bool]$LegSet)) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
@@ -1069,8 +1072,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # job's own queue limits still run and are not bounded here: the cap is a soft budget (cap + one probe), see the sleepFit comment below
                 $thw = $legThermal[$leg.name]
                 if ($ThermalWaitCapSec -gt 0 -and $null -ne $thw -and $null -ne $thw.firstHotUtc -and $thw.batch -eq $batchNo) {
-                    $probeWait = [int][Math]::Max(0, [Math]::Min($probeWait, $ThermalWaitCapSec - [Math]::Floor(([DateTime]::UtcNow - $thw.firstHotUtc).TotalSeconds)))
+                    $probeWait = [int][Math]::Max(0, [Math]::Min($probeWait, $ThermalWaitCapSec - [Math]::Floor(((Get-VenueThermalNowUtc -FirstHotUtc $thw.firstHotUtc -FirstHotTimestamp $thw.firstHotTs) - $thw.firstHotUtc).TotalSeconds)))
                 }
+                $thermalActive = ($ThermalWaitCapSec -gt 0 -and $null -ne $thw -and $null -ne $thw.firstHotUtc -and $thw.batch -eq $batchNo)
                 $tProbe = [DateTime]::UtcNow
                 $q = Invoke-QuietProbe $leg.name "b$('{0:00}' -f $batchNo)-a$attempt" $probeWait
                 $probeSec = [int][Math]::Ceiling(([DateTime]::UtcNow - $tProbe).TotalSeconds)
@@ -1080,7 +1084,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($q.verdict -ceq 'GATE_UNREADABLE') { $b.endReason = 'PROBE_GATE_UNREADABLE'; Set-Stop 'GATE_UNREADABLE' 4; break }
                 if ($q.verdict -ceq 'HOST_MISMATCH') { $b.endReason = 'PROBE_HOST_MISMATCH'; Set-Stop 'HOST_MISMATCH' 5; break }
                 if ($q.verdict -ceq 'VENUE_QUIET_UNKNOWN') { $b.endReason = 'PROBE_VENUE_QUIET_UNKNOWN'; $b.endDetail = $q.reason; Set-Stop 'VENUE_QUIET_UNKNOWN' 6; break }
-                if ($q.verdict -cne 'QUIET') {
+                # adversary r2b A1: while a thermal wait is active, a hot reading is the cap's business whatever the probe's quiet verdict (a COOLDOWN_UNMET probe that
+                # reads hot used to retry here without limit, past the cap and unrecorded): it falls through to the gate below, which waits or skips the leg
+                if ($q.verdict -cne 'QUIET' -and -not ($thermalActive -and $q.heat -ceq 'hot')) {
                     # COOLDOWN_UNMET (a measured busy desktop, a foreign floor included) or GATE_BUSY: retry INSIDE this lease, never a release and a new request.
                     $b.retries++; $b.probeRetries++
                     # r3 (fable r2): with less room left after the leg's budget than one -RecheckSec, a busy probe ends the batch (the leg goes to the next one)
@@ -1098,11 +1104,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # hot -> re-probe every -ThermalPollSec up to -ThermalWaitCapSec from the first hot reading in this batch; still hot then -> THERMAL_HOT_SKIPPED and
                 # re-queued at the end (at most -ThermalRequeueMax times, then the leg is THERMAL_HOT_SKIPPED for good), never run and discarded. Unknown heat runs.
                 $th = $legThermal[$leg.name]
-                if ($null -eq $th) { $th = [ordered]@{ firstHeat = $null; firstHeatText = $null; firstHotUtc = $null; batch = $batchNo; waitSec = 0; polls = 0; skips = 0 }; $legThermal[$leg.name] = $th }
+                if ($null -eq $th) { $th = [ordered]@{ firstHeat = $null; firstHeatText = $null; firstHotUtc = $null; firstHotTs = 0L; batch = $batchNo; waitSec = 0; polls = 0; skips = 0 }; $legThermal[$leg.name] = $th }
                 # adversary r1 A6: the first reading belongs to the leg's CURRENT predecessor, so it is taken again after a re-queue or in a new batch
                 if ($th.batch -ne $batchNo) { $th.firstHotUtc = $null; $th.firstHeat = $null; $th.batch = $batchNo }
                 if ($null -eq $th.firstHeat) { $th.firstHeat = $q.heat; $th.firstHeatText = $q.heatText }
-                $gs = $(if ($ThermalWaitCapSec -gt 0) { Get-VenueThermalGateStep -Heat $q.heat -FirstHotUtc $th.firstHotUtc -NowUtc ([DateTime]::UtcNow) -CapSec $ThermalWaitCapSec } else { [pscustomobject]@{ step = 'RUN'; firstHotUtc = $null; waitSec = 0; remainingSec = 0 } })
+                $gs = $(if ($ThermalWaitCapSec -gt 0) { Get-VenueThermalGateStep -Heat $q.heat -FirstHotUtc $th.firstHotUtc -NowUtc $(if ($null -ne $th.firstHotUtc) { Get-VenueThermalNowUtc -FirstHotUtc $th.firstHotUtc -FirstHotTimestamp $th.firstHotTs } else { [DateTime]::UtcNow }) -CapSec $ThermalWaitCapSec } else { [pscustomobject]@{ step = 'RUN'; firstHotUtc = $null; waitSec = 0; remainingSec = 0 } })
+                if ($null -eq $th.firstHotUtc -and $null -ne $gs.firstHotUtc) { $th.firstHotTs = [Diagnostics.Stopwatch]::GetTimestamp() }
                 $th.firstHotUtc = $gs.firstHotUtc; $th.waitSec = $gs.waitSec
                 # adversary r1 A9 / r1b A2: a re-probe is started only if the PREVIOUS probe's duration says it can end inside the cap: the sleep is shortened to fit,
                 # and only when not even a 1 s sleep fits is the leg skipped now. r2 (Dot P2): that is an estimate, not a guarantee. The probe's remote sample window
