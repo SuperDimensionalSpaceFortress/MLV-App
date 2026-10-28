@@ -6,18 +6,24 @@ adversarial swarm. A formal review round has two keys:
 | Key | Lane | Why |
 |---|---|---|
 | A | `sol` | Found 51 blockers `fable` missed against 1 the other way, over 191 paired reviews. Also co-planner with `opus`. |
-| B | `opus`, **unless the PR's implementing lane was `opus`, then `fable`** | No self-review. `fable` stays the planning/guidance lane and the fallback key B. |
+| B | `opus`, **unless `opus` wrote ANY round of the card, then `fable`** | No self-review. `fable` stays the planning/guidance lane and the fallback key B. |
 
 `astra` is the tie-breaker on a contested design, never a key. `sonnet` is the default implementer
 (83 % DONE at USD 1.37 a round against `opus` at 48 % and USD 7.97), so most cards get `opus` as key B.
 
 ## The tracked helper
 
-`tools/coordination/Select-ReviewKeyB.ps1 -Card <CARD> [-Json]` reads the producer from the card's
-**newest producer receipt**: a `*.receipt.json` under `.claude-state/fleet-runs/<run>/` whose `card`
+`tools/coordination/Select-ReviewKeyB.ps1 -Card <CARD> [-Json]` reads the producers from the card's
+**producer receipts**: every `*.receipt.json` under `.claude-state/fleet-runs/<run>/` whose `card`
 equals the card and whose `allowEdits` is `true` (a review key never edits, so a key receipt can
-never name the producer), newest by `startedUtc`. It prints the key-B lane name, or with `-Json`:
-`card, keyA, keyB, producerLane, producerKnown, producerReceipt, reason, warnings`.
+never name a producer). **Any-opus rule (card KEYB-SELECTOR-ANY-OPUS-ROUND-1):** key B is `fable`
+when ANY producer receipt has lane `opus`, not only the newest. PR #453 r3 is the incident: opus
+rounds r2/r2b wrote the C++, the newest round (sonnet r3) was a provenance rebind, the selector
+returned `opus`, and the hub overrode it to `fable` by hand. `producerLane`/`producerReceipt` still
+name the newest producer receipt by `startedUtc`; `opusRounds` counts the opus ones (0 with
+`-ProducerLane`, which reads no receipt) and `reason` names the newest opus receipt when it forced
+`fable` over a non-opus newest producer. It prints the key-B lane name, or with `-Json`:
+`card, keyA, keyB, producerLane, producerKnown, producerReceipt, opusRounds, reason, warnings`.
 
 - No readable matching producer receipt (a hand-written PR): `keyB = fable`, `producerKnown = false`,
   and one warning. An unknown producer fails toward `fable`, because the producer may have been `opus`
