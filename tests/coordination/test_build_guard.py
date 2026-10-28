@@ -1648,7 +1648,55 @@ def test_inherited_slot_selection_variables_never_reach_heavy_slot(box) -> None:
     )
     assert done.returncode == 0 and "built=4" in done.stdout, done.stdout + done.stderr
     [call] = _stub_calls(box)
-    assert call["slotEnv"] == {"name": None, "count": None, "dir": None, "keeperOwner": None}, call["slotEnv"]
+    assert call["slotEnv"] == {"name": None, "count": None, "dir": None, "keeperOwner": None,
+                               "held": None, "heldStart": None, "heldName": None}, call["slotEnv"]
+
+
+def test_an_inherited_holder_not_proven_canonical_never_reaches_heavy_slot(box) -> None:
+    # r7b adversary 01aa4e7b-A2: an ancestor run with HEAVY_SLOT_COUNT=2 holds slot 1 and exports its genuine HEAVY_SLOT_HELD.
+    # heavy-slot would pass it through (it checks the slot set and ancestry, not the slot), admitting this build beside the
+    # canonical holder. The guard keeps an inherited holder only when its held record proves slot 0 of one; this one has none.
+    held = "20261028T000000000Z-4242-abcdef:4242"
+    done = _heavy(box, "run", ["-Command", "exit 0"],
+                  extra={"HEAVY_SLOT_HELD": held, "HEAVY_SLOT_HELD_START": "2026-10-28T00:00:00.0000000Z",
+                         "HEAVY_SLOT_HELD_NAME": "Global\\HeavySlot"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert call["slotEnv"]["held"] is None and call["slotEnv"]["heldStart"] is None and call["slotEnv"]["heldName"] is None, call
+    assert f"[build-guard] heavy-slot: inherited HEAVY_SLOT_HELD={held} not passed through" in done.stderr, done.stderr
+
+
+def test_only_a_held_record_for_slot_0_of_one_counts_as_the_canonical_slot(tmp_path) -> None:
+    # r7b adversary 01aa4e7b-A2, the record check: slot 0 of the one-slot Global\HeavySlot set passes; slot 1 of two, another
+    # slot set, a missing or unreadable record and a malformed value do not.
+    records = {
+        "canon": {"slotName": "Global\\HeavySlot", "slotCount": 1, "slots": [0]},
+        "two": {"slotName": "Global\\HeavySlot", "slotCount": 2, "slots": [1]},
+        "zeroOfTwo": {"slotName": "Global\\HeavySlot", "slotCount": 2, "slots": [0]},
+        "other": {"slotName": "Global\\HeavySlotTest", "slotCount": 1, "slots": [0]},
+    }
+    for ticket, rec in records.items():
+        _write_json(tmp_path / f"{ticket}.json", rec)
+    (tmp_path / "junk.json").write_text("{", encoding="ascii")
+    probes = ["canon:1", "two:1", "zeroOfTwo:1", "other:1", "missing:1", "junk:1", "no-pid"]
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n$script:HeavySlotHeldDir = '{tmp_path}'\n"
+                + "".join(f"Write-Output ('{p} -> ' + [string](Test-HeavySlotHeldCanonical '{p}'))\n" for p in probes)])
+    out = done.stdout + done.stderr
+    assert re.search(r"^canon:1 -> $", done.stdout, re.M), out
+    for p in probes[1:]:
+        assert re.search(rf"^{re.escape(p)} -> \S", done.stdout, re.M), out
+
+
+def test_a_heavy_slot_wrapper_that_ends_before_admission_still_leaves_the_stop_file(box) -> None:
+    # r7b adversary 01aa4e7b-A1: heavy-slot's cmd wrapper ends (exit 1, no marker, no ready file) while the heavy-slot child it
+    # started may still be queued. That child could admit a holder later, which a persistent host would never stop; the stop
+    # file is written on every way out before admission, so the holder ends as soon as it starts.
+    done = _heavy(box, "bare", ["-Command", "exit 0"], extra={"STUB_HEAVY_SLOT_CODE": "1"})
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=1" in done.stdout, done.stdout
+    stops = list((box["dir"] / "heavy-slot").glob("*.stop"))
+    assert len(stops) == 1, f"no stop file was left for a surviving heavy-slot child: {list((box['dir'] / 'heavy-slot').iterdir())}"
 
 
 def test_a_heavy_slot_tree_kill_at_release_keeps_the_callers_exit_code(box) -> None:

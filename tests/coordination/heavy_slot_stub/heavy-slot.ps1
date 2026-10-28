@@ -37,7 +37,8 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
     if ($argv[$i] -eq '--') { $command = @($argv | Select-Object -Skip ($i + 1)); break }
 }
 $record = [ordered]@{ argv = $argv; expectSha = $env:HEAVY_SLOT_EXPECT_SHA256; expectKeeper = $env:HEAVY_SLOT_EXPECT_KEEPER; mode = $mode; childStart = $null; childEnd = $null
-    slotEnv = [ordered]@{ name = $env:HEAVY_SLOT_NAME; count = $env:HEAVY_SLOT_COUNT; dir = $env:HEAVY_SLOT_DIR; keeperOwner = $env:HEAVY_SLOT_KEEPER_OWNER } }
+    slotEnv = [ordered]@{ name = $env:HEAVY_SLOT_NAME; count = $env:HEAVY_SLOT_COUNT; dir = $env:HEAVY_SLOT_DIR; keeperOwner = $env:HEAVY_SLOT_KEEPER_OWNER
+        held = $env:HEAVY_SLOT_HELD; heldStart = $env:HEAVY_SLOT_HELD_START; heldName = $env:HEAVY_SLOT_HELD_NAME } }
 function Write-StubMarker([string]$Nonce, [int]$Code = 75) {
     $marker = [ordered]@{ source = 'heavy-slot'; code = $Code; reason = 'timed out after 3600s waiting for the slot'; ticket = $ticket; nonce = $Nonce; pid = $PID }
     if ($exitFile) { Set-Content -LiteralPath $exitFile -Value ($marker | ConvertTo-Json -Compress) -Encoding ascii }

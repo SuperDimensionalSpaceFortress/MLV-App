@@ -162,6 +162,8 @@ $script:BuildGuardDefaults = @{
 }
 $script:BuildGuardCimTimeoutSec = 30
 $script:HeavySlotInstallCmd = 'C:\ProgramData\HeavySlot\bin\heavy-slot.cmd'
+# heavy-slot's held records in its default state dir (a test seam: a Library driver may set it after dot-sourcing).
+$script:HeavySlotHeldDir = [IO.Path]::Combine([string]$env:ProgramData, 'HeavySlot', 'held')
 # The largest --wait / --eta passed to heavy-slot (one week; heavy-slot's own --max-hold is 90 min), and the slack the
 # hung-tool bound adds to the wait. The slack is a test seam: a Library driver may set it after dot-sourcing.
 $script:HeavySlotMaxMinutes = 10080
@@ -493,6 +495,22 @@ function Resolve-HeavySlotCmd([hashtable]$Options) {
     return ''
 }
 
+function Test-HeavySlotHeldCanonical([string]$Held) {
+    # $null when the holder an inherited HEAVY_SLOT_HELD (<ticket>:<pid>) names holds the canonical machine slot: its held record
+    # in heavy-slot's default state dir (the guard strips HEAVY_SLOT_DIR) says slot set Global\HeavySlot, one slot, slot 0.
+    # Otherwise why not (r7b adversary 01aa4e7b-A2). heavy-slot itself still verifies the holder's identity and ancestry.
+    if ($Held -notmatch '^([0-9A-Za-z-]+):(\d+)$') { return "malformed value '$Held'" }
+    $path = Join-Path $script:HeavySlotHeldDir ($Matches[1] + '.json')
+    try { $rec = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return "no readable held record at $path" }
+    $name = [string](Get-BuildGuardJsonField $rec 'slotName')
+    $count = [string](Get-BuildGuardJsonField $rec 'slotCount')
+    $slots = @(Get-BuildGuardJsonField $rec 'slots')
+    if ($name -ne 'Global\HeavySlot' -or $count -ne '1' -or $slots.Count -ne 1 -or [string]$slots[0] -ne '0') {
+        return "its held record names slot set '$name' x$count slots=[$($slots -join ',')], not Global\HeavySlot x1 slot 0"
+    }
+    return $null
+}
+
 function Get-HeavySlotLane {
     # <lane> of mlv:<lane>:build: lane-<CARD>-rN-<stamp> under MLV_LANE_RUN_DIR gives <CARD>; no run dir is the hub.
     $run = ([string]$env:MLV_LANE_RUN_DIR).TrimEnd('\', '/')
@@ -679,6 +697,9 @@ function Send-HeavySlotStop($Lease) {
         finally {
             if ($last) { $global:LASTEXITCODE = $keep } else { Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore }
         }
+    } elseif (-not $Lease.Holder) {
+        # Its tree is gone, so a heavy-slot child that outlived the wrapper cannot be found from here (r7b, 01aa4e7b-A1 sibling).
+        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} heavy-slot wrapper pid {1} already ended: a heavy-slot child that outlived it is not stopped' -f $Lease.Label, $Lease.Process.Id)
     }
     # (The wrapper's pid cannot be reused here: $Lease.Process has held its handle since Process.Start.)
     # A holder that outlived heavy-slot is no longer in that tree: it is ended by its own identity (r3b adversary A2), and only
@@ -809,6 +830,18 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # A guarded build always takes the canonical machine slot: an inherited mutex name, slot count, state dir or keeper
     # owner would let it queue on other slots, or beside the canonical holder (r5b adversary A1).
     foreach ($v in 'HEAVY_SLOT_NAME', 'HEAVY_SLOT_COUNT', 'HEAVY_SLOT_DIR', 'HEAVY_SLOT_KEEPER_OWNER') { $null = $psi.Environment.Remove($v) }
+    # heavy-slot passes an inherited HEAVY_SLOT_HELD through for a live ancestor that holds ANY slot of the set, whatever its
+    # slot count, so an ancestor run with HEAVY_SLOT_COUNT=2 on slot 1 would admit this build beside the canonical holder. The
+    # holder is kept only when its held record proves slot 0 of the one-slot set; otherwise heavy-slot takes slot 0 for this
+    # build (r7b adversary 01aa4e7b-A2). The line is logged after the launch, so the hung-tool clock still starts first.
+    $heldDropped = ''
+    if ($env:HEAVY_SLOT_HELD) {
+        $notCanonical = Test-HeavySlotHeldCanonical $env:HEAVY_SLOT_HELD
+        if ($notCanonical) {
+            foreach ($v in 'HEAVY_SLOT_HELD', 'HEAVY_SLOT_HELD_START', 'HEAVY_SLOT_HELD_NAME') { $null = $psi.Environment.Remove($v) }
+            $heldDropped = 'heavy-slot: inherited HEAVY_SLOT_HELD={0} not passed through ({1}); taking the canonical slot' -f $env:HEAVY_SLOT_HELD, $notCanonical
+        }
+    }
     # The hung-tool clock starts before the launch and before any diagnostic line (r6 sol B1).
     $waitClock = [System.Diagnostics.Stopwatch]::StartNew()
     try { $lease.Process = [System.Diagnostics.Process]::Start($psi) } catch {
@@ -821,6 +854,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     try {
         # The wait printed is the one heavy-slot was given, never the raw option (fable r6b note).
         Write-BuildGuardLog ('heavy-slot: waiting label={0} wait={1} exit-file={2} shim={3}' -f $lease.Label, $waitArg, $lease.ExitFile, $cmd)
+        if ($heldDropped) { Write-BuildGuardLog $heldDropped }
         while ($true) {
             Send-HeavySlotLines $lease
             # The ready file admits only while the holder it names still runs (checked after the file is seen, and again below).
@@ -855,7 +889,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             if ($why) {
                 if ($code -eq 0) { $code = 1 }
                 # The stop goes BEFORE the typed line (r6 sol B1): a stdout nobody drains may block that line, never the slot.
-                if (-not $lease.Process.HasExited -or ($lease.Holder -and (Test-HeavySlotIdentity $lease.Holder))) { Send-HeavySlotStop $lease; $stopSent = $true }
+                Send-HeavySlotStop $lease; $stopSent = $true
                 Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code={1} reason={2} utc={3}' -f $Label, $code, $why, [DateTime]::UtcNow.ToString('o'))
                 exit $code
             }
@@ -886,7 +920,10 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         # Every way out before admission (exit, throw, Ctrl+C) leaves the stop file while heavy-slot still runs, even when a
         # ready file appeared after the last check, so its holder ends at once instead of holding the machine slot
         # (adversary A2; r1 adversary A1). A holder that outlived heavy-slot (its slot owner killed) gets it too.
-        if (-not $admitted -and -not $stopSent -and (-not $lease.Process.HasExited -or ($lease.Holder -and (Test-HeavySlotIdentity $lease.Holder)))) { Send-HeavySlotStop $lease }
+        # The stop file is written even when heavy-slot's cmd wrapper has ended (r7b adversary 01aa4e7b-A1): the heavy-slot
+        # child it started may outlive it, still queued, and admit a holder later that no one else would stop while this host
+        # lives. Nothing deletes it on this path; it is written last, after any lease-file cleanup above.
+        if (-not $admitted -and -not $stopSent) { Send-HeavySlotStop $lease }
     }
 }
 
