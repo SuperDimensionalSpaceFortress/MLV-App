@@ -3018,6 +3018,29 @@ def test_save_dirty_worktree_evidence_never_writes_a_temp_by_its_name(tmp_path, 
 
 
 @dirty_save_only
+@pytest.mark.parametrize("prefix", ["dirty-worktree-saving-", "dirty-worktree-status-", "dirty-worktree-staging-", "dirty-worktree-merge-state-saving-"])
+def test_save_dirty_worktree_evidence_never_writes_through_a_hard_link_added_to_a_held_temp(tmp_path, prefix):
+    # r12 (adversary b38245c1-A1): adding a hard link needs no share access, so after a temp's one-link check another process can give the HELD temp a second name in the
+    # worktree. WriteHeld then wrote the evidence bytes through the hold into that worktree name. The write now refuses a held file with more than one name
+    # (temp-file-linked), so the worktree name keeps the empty bytes it was linked with.
+    wt, dest = _dirty_save_repo(tmp_path)
+    if prefix == "dirty-worktree-staging-":
+        git(wt, "add", "src/a.txt")
+        (wt / "src" / "a.txt").write_text("three\n")
+    if prefix == "dirty-worktree-merge-state-saving-":
+        _leave_a_conflicted_merge(wt)
+    alias = wt / "alias.txt"
+    shim = ("$script:RealNT = (Get-Command New-DirtyHeldTemp -CommandType Function).ScriptBlock; $script:Linked = $false; "
+            "function New-DirtyHeldTemp { $t = & $script:RealNT @args; "
+            f"if ($t.Path -and (Split-Path -Leaf $t.Path) -like '{prefix}*') {{ $null = New-Item -ItemType HardLink -Path '{alias}' -Value $t.Path; $script:Linked = $true }}; $t }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output \"linked=$script:Linked\"")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] == "linked=True", (out.stdout, out.stderr)
+    assert alias.read_bytes() == b"", ("the evidence was written through a second name in the worktree", out.stdout, out.stderr)
+    assert lines[0].startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=temp-file-linked"), (out.stdout, out.stderr)
+
+
+@dirty_save_only
 def test_save_dirty_worktree_evidence_never_writes_through_a_temp_turned_into_a_symbolic_link(tmp_path):
     # r11 (sol r10 B1, the repro itself): after the empty status temp is created, it is turned in place into a symbolic link to the untracked worktree file orphan.txt.
     # Needs SeCreateSymbolicLinkPrivilege; the unprivileged model above covers every temp. The write goes through the hold and refuses a reparse point.

@@ -268,15 +268,26 @@ public static class DirtyFinalPath {
     // Writes bytes into a held file through a handle opened FROM the held one (ReOpenFile: no name is looked up, a link at the name is not followed), and refuses before
     // writing when that file is a reparse point now. The name is never reopened for writing, so a held temp converted in place into a symbolic link to a worktree file can
     // never have that file truncated (r11, sol r10 B1). Returns null, or the typed reason.
+    // Adding a hard link needs no share access, so another process can give the HELD file a second name (in the worktree, say) after its one-name check: the write refuses
+    // a file with more than one name, and a name added during the write gets the file emptied again, the bytes it was linked with (every temp is written once, right after
+    // it is created empty), before temp-file-linked is returned (r12, adversary b38245c1-A1).
     public static string WriteHeld(IntPtr held, byte[] bytes) {
         if (held == IntPtr.Zero) return "temp-not-held";
         IntPtr w = ReOpenFile(held, 0x40000000 | 0x80, 3, 0x00200000);  // GENERIC_WRITE | FILE_READ_ATTRIBUTES, share READ|WRITE (the hold's own READ), FILE_FLAG_OPEN_REPARSE_POINT
         if (w == (IntPtr)(-1)) return "temp-not-held:" + Marshal.GetLastWin32Error().ToString();
         using (Microsoft.Win32.SafeHandles.SafeFileHandle safe = new Microsoft.Win32.SafeHandles.SafeFileHandle(w, true)) {
             if (HandleIsReparse(w)) return "temp-reparse-point";
-            using (System.IO.FileStream fs = new System.IO.FileStream(safe, System.IO.FileAccess.Write)) { fs.SetLength(0); fs.Write(bytes, 0, bytes.Length); fs.Flush(true); }
+            if (!HasOneName(w)) return "temp-file-linked";
+            using (System.IO.FileStream fs = new System.IO.FileStream(safe, System.IO.FileAccess.Write)) {
+                fs.SetLength(0); fs.Write(bytes, 0, bytes.Length); fs.Flush(true);
+                if (!HasOneName(w)) { fs.SetLength(0); fs.Flush(true); return "temp-file-linked"; }
+            }
         }
         return null;
+    }
+    static bool HasOneName(IntPtr h) {
+        ByHandleInfo i;
+        return h != IntPtr.Zero && GetFileInformationByHandle(h, out i) && i.Links == 1 && (i.Attributes & 0x400) == 0;
     }
     // Renames <from> to <to>, both one name inside the held directory, through a handle on <from> opened inside that directory (DELETE, a link not followed), and only while
     // that handle has the file with this identity, one name and no reparse point; the target is named relative to the same held directory (FILE_RENAME_INFO.RootDirectory),
@@ -485,7 +496,7 @@ function Remove-DirtyTemp($Temp) {
 # Writes bytes into a held temp THROUGH ITS HOLD (DirtyFinalPath.WriteHeld): the name is never reopened for writing, so a temp turned into a symbolic link to a worktree file
 # after it was created cannot have that file truncated or written (r11, sol r10 B1). Returns the SHA-256 of the bytes it wrote: that is the digest the file must hash to when
 # it is placed, never a re-read of the file, which another writer could have rewritten in between (r10 iter 1, adversary 76fcbf8b-A3); or, when it refuses, the typed reason
-# (temp-not-held / temp-reparse-point), which is not a digest and is reported as it is.
+# (temp-not-held / temp-reparse-point / temp-file-linked: a second name added to the held file, r12 adversary b38245c1-A1), which is not a digest and is reported as it is.
 function Write-DirtyTempBytes($Temp, [byte[]]$Bytes) {
     if ($null -eq $Bytes) { $Bytes = [byte[]]::new(0) }
     if ($null -eq $Temp.Handle) { return 'temp-not-held' }
