@@ -4706,7 +4706,7 @@ function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadD
         if ($null -eq $p -or $null -eq $lt -or $lt -le 0 -or $null -eq $lm -or $null -eq $sk -or $sk -lt 0 -or $null -eq $rd) { return & $no 'feed-window-start-unverified' }
         $inv = [Globalization.CultureInfo]::InvariantCulture; $sty = [Globalization.DateTimeStyles]::AssumeLocal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
         $fmt = [string[]]@('d.M.yyyy H:mm:ss', 'd.M.yyyy H:mm:ss.FFFFFFF')
-        $keep = [Collections.Generic.List[string]]::new(); $out = 0
+        $keep = [Collections.Generic.List[string]]::new(); $out = 0; $prevAt = $null
         foreach ($ln in @($Lines)) {
             if ([string]::IsNullOrEmpty($ln)) { continue }
             $c = $ln.Split(',')
@@ -4715,6 +4715,11 @@ function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadD
             if (-not [DateTime]::TryParseExact(($c[0].Trim() + ' ' + $c[1].Trim()), $fmt, $inv, $sty, [ref]$t)) { return & $no 'feed-row-stamp-unparseable' }
             $at = $lm + ($t.Ticks - $lt) / 1e4
             if ($at -gt $rd + $sk + [math]::Max(0.0, $StampResolutionMs)) { return & $no 'feed-row-stamp-unverified' }
+            # adversary r13c (b252e9a4) A1: the sampler appends its rows in time order, so a stamp earlier than the row before it (beyond twice the
+            # skew plus the resolution) shows a clock excursion no skew sample caught, which can stamp a startup row into playback:
+            # feed-row-stamp-unverified. LIMIT: an excursion on the last startup row before the first playback row breaks no order.
+            if ($null -ne $prevAt -and $at -lt $prevAt - 2 * $sk - [math]::Max(0.0, $StampResolutionMs)) { return & $no 'feed-row-stamp-unverified' }
+            $prevAt = $at
             # adversary r13c (a8c04609) A2: the anchor and the row are two wall-clock stamps, each up to the skew off the monotonic clock, so
             # they can disagree by twice it (as the overlap check's 2 x skew does)
             if ($at -ge $p + 2 * $sk) { $keep.Add($ln) } else { $out++ }

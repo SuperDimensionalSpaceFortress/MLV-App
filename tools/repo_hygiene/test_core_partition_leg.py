@@ -2602,6 +2602,11 @@ $sk = $anchor.Clone(); $sk.skewMs = 400.0
 # sampled at 59500 is stamped 1000 ms late (60500): one skew of margin (60000) keeps it, twice the skew (61000) excludes it
 $a2 = @{ startMonoMs = 59000.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.0; skewMs = 1000.0 }
 $r.selA2TwoStampsTwiceTheSkew = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 60500) + ',5,30,10,No,No'), ((Hw 61000) + ',5,80,100,No,No')) $a2 82000)
+# adversary r13c (b252e9a4) A1, on a 1 Hz feed: a +50000 ms excursion between two helper polls stamps the startup row sampled at 11500 as 61500,
+# inside playback (anchor 61000); the next startup row (12500) is stamped earlier than it, so the order break refuses the window
+$a1c = @{ startMonoMs = 61000.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.0; skewMs = 0.0 }
+$r.selA1cExcursionBreaksTheOrder = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 10500) + ',5,30,10,No,No'), ((Hw 61500) + ',5,30,10,No,No'), ((Hw 12500) + ',5,30,10,No,No'), ((Hw 62000) + ',5,80,100,No,No')) $a1c 92000)
+$r.selA1cInOrderControl = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 10500) + ',5,30,10,No,No'), ((Hw 11500) + ',5,30,10,No,No'), ((Hw 12500) + ',5,30,10,No,No'), ((Hw 62000) + ',5,80,100,No,No')) $a1c 92000)
 $r.selSkewExcludesTheBoundaryRow = PickSel (Select-CorePartitionFeedRowsFromStart $rows $sk 26000)
 $r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @(($L.AddSeconds(-60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,30,10,No,No'), ($L.AddSeconds(60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,80,100,No,No')) $anchor 62000)
 $r.selUnparseableStamp = PickSel (Select-CorePartitionFeedRowsFromStart @('10/24/2026,08:00:02,5,80,100,No,No') $anchor 26000)
@@ -2745,6 +2750,8 @@ class CorePartitionR13StartTests(unittest.TestCase):
         self.assertEqual(r["selAtAndAfter"], ["", 1, 2])
         self.assertEqual(r["selSkewExcludesTheBoundaryRow"], ["", 2, 1])
         self.assertEqual(r["selA2TwoStampsTwiceTheSkew"], ["", 1, 1])
+        self.assertEqual(r["selA1cExcursionBreaksTheOrder"], ["feed-row-stamp-unverified", None, 0])
+        self.assertEqual(r["selA1cInOrderControl"], ["", 3, 1])
         self.assertEqual(r["selSecondsOnly"], ["", 1, 1])
         self.assertEqual(r["selUnparseableStamp"], ["feed-row-stamp-unparseable", None, 0])
         self.assertEqual(r["selRowFromTheFuture"], ["feed-row-stamp-unverified", None, 0])
