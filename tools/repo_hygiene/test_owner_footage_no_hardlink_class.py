@@ -37,9 +37,13 @@ NTFS by test_owner_footage_identity_delete.py.
 from __future__ import annotations
 
 import ast
+import json
 import re
+import shutil
+import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / "tools"
@@ -230,21 +234,73 @@ LANE_DIRTY_SAVE_ADD_TYPE_LINE = "Add-Type -TypeDefinition @'"
 _ADD_TYPE_ANY_RE = re.compile(r"Add-Type", re.IGNORECASE)
 _HERE_STRING_OPEN_RE = re.compile(r"@['\"][ \t]*\r?$", re.MULTILINE)
 _HERE_STRING_CLOSE_RE = re.compile(r"^['\"]@", re.MULTILINE)
-# Code compiled, loaded or evaluated anywhere but that one payload is outside the census, so each such route fails closed (r14 iter 1, A3 siblings).
-_DYNAMIC_CODE_RE = re.compile(
-    r"Invoke-Expression|\biex\b|\[scriptblock\]::Create|NewScriptBlock|Assembly\]?::Load\w*|\bLoad(?:From|File)\b|CodeDom|CodeProvider|CodeAnalysis"
-    r"|Import-Module|\bipmo\b", re.IGNORECASE)
-# PowerShell can name a member or a command by a value computed at run time ($t.('Get'+'Method'), & ('Add-'+'Type')) or rebind a name (an alias or function
-# called Add-Type), and no text census follows either, so each SITE of dynamic dispatch fails closed (r14 iter 2, adversary 27186cee-A1/A2). The saver's own
-# shapes stay allowed: & $scriptblockVariable, & git, and Get-Command git -CommandType Application.
-_DYNAMIC_DISPATCH_RE = re.compile(
-    r"(?:\$\w+|[A-Za-z_\]\)])(?:\.|::)[(\$'\"]"  # a member named by an expression, a variable or a string
-    r"|(?:^|[\s;|({=])&\s*[('\"]"  # the call operator on an expression or a string
-    r"|(?:^|[;{])[ \t]*\.[ \t]+\S"  # dot-sourcing at the start of a statement
-    r"|Set-Alias|New-Alias|Import-Alias|\bsal\b|\bnal\b|\balias:|\bfunction:"  # a name rebound (Add-Type -> a wrapper)
-    r"|\bGet-Command\b(?! git -CommandType Application\))|\bgcm\b|InvokeCommand|ExecutionContext|SessionState|\bpsobject\b"
-    r"|-MemberName\b|ForEach-Object\s+[('\"$]|\|\s*%\s+[('\"$]"  # a method invoked by a computed name through the pipeline
-    r"|EncodedCommand|FromBase64", re.IGNORECASE | re.MULTILINE)
+# Code compiled or loaded at run time by the C# payload is outside the census, so each such route fails closed (r14 iter 1, A3 siblings). The PowerShell
+# routes (Invoke-Expression, [scriptblock]::Create, Import-Module, an assembly load) are r15's AST census below; this text rule stays for the C# the AST cannot see.
+_CS_DYNAMIC_CODE_RE = re.compile(r"Assembly\]?::Load\w*|\bLoad(?:From|File)?\s*\(|\bLoad(?:From|File)\b|CodeDom|CodeProvider|CodeAnalysis", re.IGNORECASE)
+# A C0 control other than tab, CR and LF: str.splitlines() would split a line there while every line number here counts only LF (fable r14 finding 2).
+_CONTROL_CHARACTER_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# ---- r15 (sol r14 B1/B2, fable r14 HARDLINK-CENSUS-PS-DISPATCH-AST-1; folds LANE-DIRTY-SAVE-CENSUS-PS-AST-1): the PowerShell half is DEFAULT-DENY over the AST.
+# r12-r14 closed the adversary's spellings one regex at a time, and every pass found more: whitespace or a backtick-newline after a member dot, a variable
+# command, ForEach-Object -m, A`dd-Type. The real parser (ps_ast_inventory.ps1) has already resolved backticks, whitespace, quoting and escapes, so the census
+# reads the names PowerShell binds and ALLOWS only what is pinned here: every command, member, static member, type, function and scriptblock variable the
+# saver uses today. Anything computed (a member or command named by an expression, a variable or an expandable string), anything not pinned, and any name
+# rebound (a function or alias over a pinned command, a function: or alias: path) is a violation, whatever its spelling. A new name in the saver therefore
+# fails this test until it is pinned here, which is the review step. The text rules that stay are the ones the AST cannot see: the non-ASCII and control-
+# character rules, the C# rules (escapes, natives, externs, reflection, run-time loading, link names: the payload is one string to the PowerShell parser) and
+# the here-string payload checks (the payload the C# census reads is the one Add-Type compiles).
+PS_AST_INVENTORY = ROOT / "tools" / "repo_hygiene" / "ps_ast_inventory.ps1"
+# external commands (the saver's own functions are LANE_DIRTY_SAVE_PS_FUNCTIONS); each with a shape rule below where an argument could reach code
+LANE_DIRTY_SAVE_PS_COMMANDS = {
+    "Add-Type", "ForEach-Object", "Get-Command", "Get-Content", "Get-FileHash", "Get-Item", "git", "Join-Path", "New-Object", "Remove-Item",
+    "Resolve-Path", "Set-Item", "Split-Path", "Test-Path", "Where-Object",
+}
+LANE_DIRTY_SAVE_PS_FUNCTIONS = {
+    "Add-DirtyReuseHold", "ConvertTo-DirtySingleQuoted", "Format-DirtyResolved", "Get-DirtyDirIdentity", "Get-DirtyHeldIdentity", "Get-DirtyKernelPath",
+    "Get-DirtyReapplyCommand", "Get-DirtyRegularDigest", "Get-DirtyRepoSample", "Invoke-DirtyDestCheckpoint", "Invoke-DirtyFileMove", "Invoke-DirtyGitCapture",
+    "Lock-DirtyDirectory", "Lock-DirtyFile", "Move-DirtyEvidenceToFreeName", "New-DirtyHeldTemp", "Read-DirtyEvidence", "Remove-DirtyTemp",
+    "Resolve-DirtyRealPath", "Save-DirtyWorktreeEvidence", "Save-DirtyWorktreeEvidenceInGate", "Test-DirtyDestStable", "Test-DirtyDiffHasGitlink",
+    "Test-DirtyEvidenceUnchanged", "Test-DirtyPatchComplete", "Test-DirtyPathInside", "Test-DirtyTempHeld", "Test-DirtyUncLocalHost", "Test-DirtyUnderIdentity",
+    "Unlock-DirtyDirectory", "Unlock-DirtyTemp", "Write-DirtyTempBytes", "Write-DirtyTempLines",
+}
+# `& $name` is allowed only for these, and only while every value they can hold is a scriptblock literal (rules in _ps_ast_violations)
+LANE_DIRTY_SAVE_PS_CALL_VARIABLES = {"Guard", "isUnc", "placeFailed", "repoCheck"}
+LANE_DIRTY_SAVE_PS_MEMBERS = {
+    "Absent", "Add", "Address", "ArgumentList", "Attributes", "BaseStream", "Bytes", "CommonDir", "CommonId", "ComputeHash", "ContainsKey", "CopyTo", "Count",
+    "CreateNoWindow", "Dir", "Dispose", "EndsWith", "Exception", "Exit", "ExitCode", "FileName", "FullName", "GetBytes", "GetIPProperties", "GitId", "Groups",
+    "Handle", "Hash", "HResult", "Id", "InnerException", "IPAddressToString", "Keys", "Length", "LinkTarget", "LinkType", "Message", "Moved", "Path", "Placed",
+    "ProviderPath", "ReadLine", "ReadToEndAsync", "Reason", "RedirectStandardError", "RedirectStandardOutput", "ResolveLinkTarget", "Source", "Split",
+    "StandardError", "StandardOutput", "StartsWith", "Substring", "Success", "ToArray", "ToLowerInvariant", "ToString", "Trim", "TrimEnd", "UnicastAddresses",
+    "UseShellExecute", "Value", "WaitForExit",
+}
+LANE_DIRTY_SAVE_PS_STATIC_MEMBERS = {
+    "BitConverter::ToString", "byte[]::new", "Console::OutputEncoding", "DirtyFinalPath::CreateHeld", "DirtyFinalPath::CreateHeldIn",
+    "DirtyFinalPath::DeleteIfIdentity", "DirtyFinalPath::DeleteIfIdentityIn", "DirtyFinalPath::FileIdentity", "DirtyFinalPath::HandleFileIdentity",
+    "DirtyFinalPath::HandleIdentity", "DirtyFinalPath::HandleIsReparse", "DirtyFinalPath::Identity", "DirtyFinalPath::MoveIn", "DirtyFinalPath::Pin",
+    "DirtyFinalPath::PinFile", "DirtyFinalPath::RegularFileDigest", "DirtyFinalPath::RegularFileDigestHeld", "DirtyFinalPath::Resolve", "DirtyFinalPath::Unpin",
+    "DirtyFinalPath::WriteHeld", "Environment::NewLine", "Guid::NewGuid", "IntPtr::Zero", "regex::Match", "regex::Replace", "string::Intern",
+    "System.Collections.Generic.List[object]::new", "System.ComponentModel.Win32Exception::new", "System.Diagnostics.Process::Start",
+    "System.InvalidOperationException::new", "System.IO.Directory::GetFileSystemEntries", "System.IO.File::Move", "System.IO.File::ReadAllBytes",
+    "System.IO.File::ReadAllText", "System.IO.FileAttributes::ReparsePoint", "System.IO.IOException::new", "System.IO.MemoryStream::new",
+    "System.IO.Path::Combine", "System.IO.Path::DirectorySeparatorChar", "System.IO.Path::GetDirectoryName", "System.IO.Path::GetFullPath",
+    "System.IO.Path::GetPathRoot", "System.IO.StreamReader::new", "System.Net.Dns::GetHostAddresses",
+    "System.Net.NetworkInformation.NetworkInterface::GetAllNetworkInterfaces", "System.Runtime.InteropServices.COMException::new",
+    "System.Security.Cryptography.SHA256::Create", "System.StringComparison::Ordinal", "System.StringComparison::OrdinalIgnoreCase",
+    "System.StringSplitOptions::RemoveEmptyEntries", "System.Threading.Monitor::Exit", "System.Threading.Monitor::IsEntered", "System.Threading.Monitor::TryEnter",
+}
+LANE_DIRTY_SAVE_PS_TYPES = {
+    "BitConverter", "bool", "byte[]", "char", "char[]", "Console", "DirtyFinalPath", "Environment", "Guid", "hashtable", "IntPtr", "long", "ref", "regex",
+    "scriptblock", "string", "string[]", "System.Collections.Generic.List[object]", "System.ComponentModel.Win32Exception", "System.Diagnostics.Process",
+    "System.InvalidOperationException", "System.IO.Directory", "System.IO.DirectoryInfo", "System.IO.File", "System.IO.FileAttributes", "System.IO.IOException",
+    "System.IO.MemoryStream", "System.IO.Path", "System.IO.StreamReader", "System.Management.Automation.MethodInvocationException", "System.Net.Dns",
+    "System.Net.NetworkInformation.NetworkInterface", "System.Runtime.InteropServices.COMException", "System.Security.Cryptography.SHA256",
+    "System.StringComparison", "System.StringSplitOptions", "System.Threading.Monitor", "type", "void",
+}
+LANE_DIRTY_SAVE_PS_NEW_OBJECT_TYPES = {"System.Diagnostics.ProcessStartInfo", "System.IO.MemoryStream", "System.Text.UTF8Encoding"}
+# common parameters that write a variable by NAME (-OutVariable guard would put a pipeline's output into a call variable)
+_PS_VARIABLE_WRITING_PARAMETERS = ("outvariable", "errorvariable", "warningvariable", "informationvariable", "pipelinevariable")
+_PS_VARIABLE_WRITING_ALIASES = {"ov", "ev", "wv", "iv", "pv"}
+_PS_INVENTORY_TIMEOUT = 600
 _VERBATIM_IDENTIFIER_RE = re.compile(r"(?<![\w\"'])@[A-Za-z_]")
 _REFLECTION_RE = re.compile(
     r"\b(?:GetMethods?|GetMembers?|GetMember|GetRuntimeMethods?|GetDeclaredMethods?|GetTypeInfo|InvokeMember|MethodInfo|MethodBase|BindingFlags"
@@ -296,7 +352,7 @@ def _native_census(text: str, pattern: re.Pattern, declaration: str, class_at: i
     declarations, calls, violations, spans = [], [], [], []
     for match in pattern.finditer(text):
         number = text.count("\n", 0, match.start()) + 1
-        line = text.splitlines()[number - 1].strip()
+        line = text.split("\n")[number - 1].strip()
         if match.group(0) != declaration:
             violations.append(f"{number}: a spelling other than {declaration}: {line}")
             continue
@@ -325,19 +381,159 @@ def _native_census(text: str, pattern: re.Pattern, declaration: str, class_at: i
     return declarations, calls, violations, spans
 
 
-def lane_dirty_save_violations(text: str) -> list[str]:
+def _ps_inventories(texts: list[str]) -> list[dict] | str:
+    """One inventory per text from the real PowerShell parser (ps_ast_inventory.ps1), or why none could be read; the census then fails closed."""
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        return "pwsh is not on PATH"
+    try:
+        proc = subprocess.run(
+            [pwsh, "-NoProfile", "-NonInteractive", "-File", str(PS_AST_INVENTORY)],
+            input=json.dumps(texts).encode("ascii"), capture_output=True, timeout=_PS_INVENTORY_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"the parser did not run: {type(error).__name__}: {error}"
+    if proc.returncode != 0:
+        return f"the parser exited {proc.returncode}: {proc.stderr.decode('utf-8', 'replace').strip()[:300]}"
+    try:
+        inventories = json.loads(proc.stdout.decode("ascii"))
+    except ValueError as error:
+        return f"the parser's output is not ASCII JSON: {error}"
+    if not isinstance(inventories, list) or len(inventories) != len(texts):
+        return f"the parser returned {len(inventories) if isinstance(inventories, list) else 'no'} inventories for {len(texts)} text(s)"
+    return inventories
+
+
+def _ps_member_name_violation(member: dict) -> str | None:
+    """sol r14 B1: a member named by an expression, a variable or a string built at run time ([T]. ('Get'+'Method'), with any whitespace or a backtick-newline
+    after the dot) can reach any method, so the census cannot bound it. The parser reports the member node, not its spelling."""
+    if member["name"] is None:
+        return f"{member['line']}: a member named at run time ({member['kind']})"
+    return None
+
+
+def _ps_ast_violations(inv: dict, payload_bodies: list[str]) -> list[str]:
+    """The default-deny census of one saver text's PowerShell AST inventory (see the r15 block above LANE_DIRTY_SAVE_PS_COMMANDS)."""
+    def lowered(names) -> set[str]:
+        return {name.lower() for name in names}
+
+    commands, functions = lowered(LANE_DIRTY_SAVE_PS_COMMANDS), lowered(LANE_DIRTY_SAVE_PS_FUNCTIONS)
+    call_variables, members = lowered(LANE_DIRTY_SAVE_PS_CALL_VARIABLES), lowered(LANE_DIRTY_SAVE_PS_MEMBERS)
+    static_members, types = lowered(LANE_DIRTY_SAVE_PS_STATIC_MEMBERS), lowered(LANE_DIRTY_SAVE_PS_TYPES)
+    violations = [f"{error['line']}: the PowerShell parser rejects the text: {error['message']}" for error in inv["errors"]]
+    violations += [f"{using['line']}: a using statement loads code the census cannot see: {using['text']}" for using in inv["using"]]
+    violations += [f"#Requires loads {count} {kind}" for kind, count in inv["requires"].items() if count]
+    violations += [f"{other['line']}: a {other['kind']} defines code outside the census" for other in inv["other"]]
+    defined: set[str] = set()
+    for function in inv["functions"]:
+        name = function["name"].lower()
+        if name not in functions:
+            violations.append(f"{function['line']}: a function outside the pinned set (it can rebind a command): {function['name']}")
+        elif name in defined:
+            violations.append(f"{function['line']}: a function defined a second time (the later body rebinds the name): {function['name']}")
+        defined.add(name)
+    add_types = []
+    for command in inv["commands"]:
+        line, name, elements = command["line"], command["name"], command["elements"]
+        if name is None:
+            static_block = command["head"] == "ScriptBlockExpressionAst" and command["operator"] in ("Ampersand", "Dot")
+            call_variable = command["operator"] == "Ampersand" and (command["head_var"] or "").lower() in call_variables
+            if not (static_block or call_variable):
+                violations.append(f"{line}: a command named at run time ({command['head']}): {command['text']}")
+            continue
+        key = name.lower()
+        if key == "add-type" or key.endswith("\\add-type"):
+            add_types.append(command)
+        if key not in commands and key not in functions:
+            violations.append(f"{line}: a command outside the pinned set: {name}")
+            continue
+        for element in elements:
+            parameter = (element["param"] or "").lower()
+            if element["splatted"]:
+                violations.append(f"{line}: {name} is splatted (its parameters are chosen at run time)")
+            if parameter and (parameter in _PS_VARIABLE_WRITING_ALIASES or any(full.startswith(parameter) for full in _PS_VARIABLE_WRITING_PARAMETERS)):
+                violations.append(f"{line}: {name} -{element['param']} writes a variable by name")
+            if element["kind"] == "StringConstantExpressionAst" and (element["value"] or "").lower() in call_variables:
+                violations.append(f"{line}: {name} names the call variable {element['value']!r}")
+        kinds = [element["kind"] for element in elements]
+        if key in ("foreach-object", "where-object") and (not kinds or set(kinds) != {"ScriptBlockExpressionAst"}):
+            violations.append(f"{line}: {name} with anything but scriptblocks (a member name, -MemberName or any prefix of it invokes a method by name)")
+        elif key == "get-command" and [(e["kind"], e["param"], e["value"], e["param_arg"]) for e in elements] != [
+                ("StringConstantExpressionAst", None, "git", None), ("CommandParameterAst", "CommandType", None, None),
+                ("StringConstantExpressionAst", None, "Application", None)]:
+            violations.append(f"{line}: Get-Command other than 'Get-Command git -CommandType Application'")
+        elif key == "new-object" and (not elements or elements[0]["kind"] != "StringConstantExpressionAst"
+                                      or elements[0]["value"] not in LANE_DIRTY_SAVE_PS_NEW_OBJECT_TYPES or "CommandParameterAst" in kinds):
+            violations.append(f"{line}: New-Object of a type outside {sorted(LANE_DIRTY_SAVE_PS_NEW_OBJECT_TYPES)}")
+        elif key in ("set-item", "remove-item"):
+            allowed = {"value", "erroraction"} if key == "set-item" else {"erroraction"}
+            shape = (len(elements) >= 2 and elements[0]["param"] == "LiteralPath" and elements[0]["param_arg"] is None
+                     and elements[1]["kind"] in ("StringConstantExpressionAst", "ExpandableStringExpressionAst")
+                     and (elements[1]["value"] or "").lower().startswith("env:") and len(elements) % 2 == 0)
+            for index in range(2, len(elements) - 1, 2):
+                shape = shape and (elements[index]["param"] or "").lower() in allowed and elements[index]["param_arg"] is None \
+                    and elements[index + 1]["kind"] != "CommandParameterAst"
+            if not shape:
+                violations.append(f"{line}: {name} other than -LiteralPath \"env:...\" (a function: or alias: path rebinds a command)")
+    if len(add_types) != 1:
+        violations.append(f"Add-Type must be invoked exactly once, found lines {[command['line'] for command in add_types]}")
+    else:
+        site = add_types[0]
+        shape = [(e["kind"], e["param"], e["param_arg"], e["string_type"]) for e in site["elements"]]
+        body = site["elements"][-1]["value"] if site["elements"] else None
+        if (site["text"] != "Add-Type" or site["operator"] != "Unknown" or site["pipeline"] != 1
+                or shape != [("CommandParameterAst", "TypeDefinition", None, None), ("StringConstantExpressionAst", None, None, "SingleQuotedHereString")]):
+            violations.append(f"{site['line']}: the one Add-Type must be exactly {LANE_DIRTY_SAVE_ADD_TYPE_LINE!r} with its here-string, alone in its pipeline")
+        elif len(payload_bodies) != 1 or body.replace("\r\n", "\n") != payload_bodies[0].replace("\r\n", "\n"):
+            violations.append(f"{site['line']}: the text Add-Type compiles is not the payload the C# census read")
+    for member in inv["members"]:
+        named = _ps_member_name_violation(member)
+        if named:
+            violations.append(named)
+        if member["name"] is None:
+            continue  # a computed name is the rule above; the pinned sets below hold literal names only
+        if member["static"]:
+            if member["on"] is None:
+                violations.append(f"{member['line']}: a static member read from a type chosen at run time: ::{member['name']}")
+            elif f"{member['on']}::{member['name']}".lower() not in static_members:
+                violations.append(f"{member['line']}: a static member outside the pinned set: [{member['on']}]::{member['name']}")
+        elif member["name"].lower() not in members:
+            violations.append(f"{member['line']}: a member outside the pinned set: .{member['name']}")
+    violations += [f"{t['line']}: a type outside the pinned set ({t['where']}): [{t['name']}]" for t in inv["types"] if t["name"].lower() not in types]
+    violations += [f"{v['line']}: a ${{{v['path']}}} reference (only env: is allowed; function: and alias: rebind commands)"
+                   for v in inv["drive_vars"] if (v["drive"] or "").lower() != "env"]
+    for assignment in inv["assignments"]:
+        if any(name.lower() in call_variables for name in assignment["names"]) and not (
+                len(assignment["names"]) == 1 and (assignment["name"] or "").lower() in call_variables
+                and assignment["operator"] == "Equals" and assignment["right"] == "ScriptBlockExpressionAst"):
+            violations.append(f"{assignment['line']}: a call variable is given something other than a scriptblock literal ({assignment['right']})")
+    for parameter in inv["params"]:
+        if parameter["name"].lower() in call_variables and [t.lower() for t in parameter["types"]] != ["scriptblock"]:
+            violations.append(f"{parameter['line']}: the call variable parameter ${parameter['name']} is not typed [scriptblock]")
+    violations += [f"{row['line']}: the call variable ${row['name']} is set by foreach" for row in inv["foreach_vars"] if row["name"].lower() in call_variables]
+    violations += [f"{row['line']}: the call variable ${row['name']} is passed by [ref]" for row in inv["ref_vars"] if row["name"].lower() in call_variables]
+    return violations
+
+
+def _resolve_cs_escape(match: re.Match) -> str:
+    code = int(match.group(0)[2:], 16)
+    return chr(code) if code <= 0x10FFFF else chr(0xFFFD)  # reported as a violation already; an out-of-range escape must not raise (sol r14 hardening)
+
+
+def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
+    """(the text rules' violations, the Add-Type payload bodies) for one saver text: the rules the PowerShell AST cannot see."""
     violations = []
     for match in _NON_ASCII_RE.finditer(text):
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a non-ASCII character: U+{ord(match.group(0)):04X}")
+    for match in _CONTROL_CHARACTER_RE.finditer(text):
+        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a control character: U+{ord(match.group(0)):04X}")
     for match in _CS_ESCAPE_RE.finditer(text):
-        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: an escaped identifier character: {match.group(0)}")
+        outside = " (outside Unicode)" if int(match.group(0)[2:], 16) > 0x10FFFF else ""
+        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: an escaped identifier character{outside}: {match.group(0)}")
     for match in _REFLECTION_RE.finditer(text):
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a reflection lookup: {match.group(0)}")
-    for match in _DYNAMIC_CODE_RE.finditer(text):
-        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: code compiled, loaded or evaluated outside the one payload: {match.group(0)}")
-    for match in _DYNAMIC_DISPATCH_RE.finditer(text):
-        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a member or command named at run time, or a name rebound: {match.group(0).strip()}")
-    lines = text.splitlines()
+    for match in _CS_DYNAMIC_CODE_RE.finditer(text):
+        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: code compiled or loaded at run time: {match.group(0)}")
+    lines = text.split("\n")
     add_types = [text.count("\n", 0, m.start()) + 1 for m in _ADD_TYPE_ANY_RE.finditer(text)]
     opens = [text.count("\n", 0, m.start()) + 1 for m in _HERE_STRING_OPEN_RE.finditer(text)]
     closes = [text.count("\n", 0, m.start()) + 1 for m in _HERE_STRING_CLOSE_RE.finditer(text)]
@@ -347,13 +543,15 @@ def lane_dirty_save_violations(text: str) -> list[str]:
         violations.append(f"the one here-string must be the Add-Type payload; here-strings open on lines {opens}")
     if len(closes) != 1 or lines[closes[0] - 1].rstrip() != "'@":
         violations.append(f"the payload's terminator must stand alone on its line as '@; terminators on lines {closes}")
+    bodies = []
     for payload in _ADD_TYPE_PAYLOAD_RE.finditer(text):
         body, at = payload.group("body"), payload.start("body")
+        bodies.append(body)
         for regex, what in ((_VERBATIM_IDENTIFIER_RE, "a verbatim identifier"), (_LITERAL_JOIN_RE, "a string built from pieces")):
             for match in regex.finditer(body):
                 violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: {what} inside an Add-Type payload: {match.group(0)}")
     # the census proper runs on the text C# compiles: every escape resolved
-    text = _CS_ESCAPE_RE.sub(lambda m: chr(int(m.group(0)[2:], 16)), text)
+    text = _CS_ESCAPE_RE.sub(_resolve_cs_escape, text)
     _, nt_calls, nt_violations, nt_spans = _native_census(
         text, _NATIVE_SET_INFO_RE, "NtSetInformationFile", LANE_DIRTY_SAVE_NT_ARITY - 1, LANE_DIRTY_SAVE_NT_CLASSES, LANE_DIRTY_SAVE_NT_ARITY)
     _, _, k32_violations, _ = _native_census(
@@ -376,7 +574,100 @@ def lane_dirty_save_violations(text: str) -> list[str]:
         masked = masked[:start] + " " * (end - start) + masked[end:]
     extra = [f"{number}: {line}" for number, line in hard_link_text_hits(masked)]
     violations += [f"a hard-link scan hit outside the counted rename: {hit}" for hit in extra]
-    return violations
+    return violations, bodies
+
+
+def lane_dirty_save_violations_many(sources: list[str | bytes]) -> list[list[str]]:
+    """lane_dirty_save_violations for many saver texts with one PowerShell parser run. Bytes are decoded as UTF-8; a decode failure is a violation."""
+    texts, results, bodies = [], [], []
+    for source in sources:
+        if isinstance(source, bytes):
+            try:
+                source = source.decode("utf-8")
+            except UnicodeDecodeError as error:
+                texts.append("")
+                line = source.count(b"\n", 0, error.start) + 1
+                results.append([f"{line}: not UTF-8 at byte {error.start}: {error.reason}"])
+                bodies.append(None)
+                continue
+        texts.append(source)
+        violations, payloads = _lane_dirty_save_text_violations(source)
+        results.append(violations)
+        bodies.append(payloads)
+    inventories = _ps_inventories(texts)
+    for index, payloads in enumerate(bodies):
+        if payloads is None:
+            continue
+        if isinstance(inventories, str):
+            results[index].append(f"the PowerShell AST census could not run, so nothing is proven: {inventories}")
+        else:
+            results[index] += _ps_ast_violations(inventories[index], payloads)
+    return results
+
+
+def lane_dirty_save_violations(source: str | bytes) -> list[str]:
+    return lane_dirty_save_violations_many([source])[0]
+
+
+def r15_census_rows(text: str) -> dict[str, tuple[str, str]]:
+    """name -> (the saver with one sol r14 / fable r14 attack applied, a diagnostic it must produce or '' for any). Each returned [] from the r14 census."""
+    lines = text.splitlines(keepends=True)
+    at_line_50 = lambda inserted: "".join(lines[:49]) + inserted + "\n" + "".join(lines[49:])  # noqa: E731
+    invoke_11 = "; $null = $m.Invoke($null,[object[]]@([IntPtr]::Zero,$null,[IntPtr]::Zero,[uint32]0,11))"
+    swap = " { param([string]$TypeDefinition) Microsoft.PowerShell.Utility\\Add`-Type -TypeDefinition ($TypeDefinition -replace ', 10\\);', ', 11);') }"
+    computed = "a member named at run time"
+    return {
+        # sol r14 B1: whitespace or a continuation after the member dot, then a computed name
+        "B1 a space after the dot": (at_line_50("$m = [DirtyFinalPath]. ('Get'+'Method')(('NtSet'+'InformationFile'),40)" + invoke_11), computed),
+        "B1 a tab after the dot": (at_line_50("$m = [DirtyFinalPath].\t('Get'+'Method')(('NtSet'+'InformationFile'),40)" + invoke_11), computed),
+        "B1 a backtick-newline after the dot": (at_line_50("$m = [DirtyFinalPath].`\n('Get'+'Method')(('NtSet'+'InformationFile'),40)" + invoke_11), ""),
+        "B1 a continued member named by a variable": (at_line_50("$n = 'Get' + 'Method'; $t = [DirtyFinalPath]; $m = $t. $n('x', 40)" + invoke_11), computed),
+        "B1 a static member named by an expression after a space": (at_line_50("[DirtyFinalPath]:: ('Re'+'solve')($p)"), computed),
+        # sol r14 B1 siblings: a variable command, an abbreviated -MemberName, escaped evaluation
+        "B1 a variable command": (at_line_50("$c = 'Invoke-Ex'+'pression'; & $c $s"), "a command named at run time"),
+        "B1 a variable command by dot-sourcing": (at_line_50("$c = 'x.ps1'; . $c"), "a command named at run time"),
+        "B1 ForEach-Object -m": (at_line_50("$m = [DirtyFinalPath] | ForEach-Object -m $n 'x' 40"), "ForEach-Object with anything but scriptblocks"),
+        "B1 ForEach-Object -Mem": (at_line_50("$m = [DirtyFinalPath] | ForEach-Object -Mem GetMethod 'x' 40"), "ForEach-Object with anything but scriptblocks"),
+        "B1 ForEach-Object with a positional member name": (at_line_50("$m = [DirtyFinalPath] | ForEach-Object GetMethod 'x' 40"), "ForEach-Object with anything but scriptblocks"),
+        "B1 Where-Object with a property name": (at_line_50("$m = @($a) | Where-Object Length -gt 0"), "Where-Object with anything but scriptblocks"),
+        "B1 an escaped Invoke-Expression": (at_line_50("Invo`ke-Expression $s"), "a command outside the pinned set: Invoke-Expression"),
+        "B1 an escaped iex": (at_line_50("ie`x $s"), "a command outside the pinned set: iex"),
+        "B1 an escaped Invoke-Expression tail": (at_line_50("Invoke-Ex`pression $s"), "a command outside the pinned set: Invoke-Expression"),
+        "B1 the % alias": (at_line_50("$m = [DirtyFinalPath] | % -m GetMethod 'x' 40"), "a command outside the pinned set: %"),
+        "B1 a scriptblock created from text": (at_line_50("[scriptblock]::Create($s).InvokeReturnAsIs()"), "a static member outside the pinned set"),
+        "B1 a splatted ForEach-Object": (at_line_50("$p = @{ MemberName = 'GetMethod' }; $m = [DirtyFinalPath] | ForEach-Object @p"), "splatted"),
+        "B1 a magic ForEach by name": (at_line_50("$m = @([DirtyFinalPath]).ForEach('GetMethod', 'x')"), "a member outside the pinned set: .ForEach"),
+        # sol r14 B2: an escaped function name rebinding Add-Type
+        "B2 function Add`-Type": (text + "\nfunction Add`-Type" + swap + "\n", "a function outside the pinned set"),
+        "B2 function A`dd-Type": (text + "\nfunction A`dd-Type" + swap + "\n", "a function outside the pinned set"),
+        "B2 function Add-T`ype": (text + "\nfunction Add-T`ype" + swap + "\n", "a function outside the pinned set"),
+        "B2 an escaped Set-Alias": (text + "\nfunction Invoke-CensusSwap" + swap + "\nSet`-Alias -Name Add-Type -Value Invoke-CensusSwap\n", "a command outside the pinned set: Set-Alias"),
+        "B2 a function named like the saver's own, defined twice": (text + "\nfunction Get-DirtyKernelPath([string]$Path) { $Path }\n", "defined a second time"),
+        # fable r14 finding 1 rows
+        "F using module": ("using module C:\\x\\Shadow.psm1\n" + text, "a using statement"),
+        "F #Requires -Modules": ("#Requires -Modules Shadow\n" + text, "#Requires loads"),
+        "F Set-Item on a computed function: path": (text + "\nSet-Item -Path ('func'+'tion:Add-T'+'ype') -Value { param($TypeDefinition) }\n", "Set-Item other than"),
+        "F Set-Item on a literal function: path": (text + "\nSet-Item -LiteralPath function:Add-Type -Value { param($TypeDefinition) }\n", "Set-Item other than"),
+        "F a function: variable": (text + "\n${function:Add-Type} = { param($TypeDefinition) }\n", "only env: is allowed"),
+        "F an AppDomain load": (at_line_50("[AppDomain]::CurrentDomain.Load($bytes)"), "a type outside the pinned set"),
+        "F & a joined name": (at_line_50("$c = 'Invoke-Ex'+'pression'; & $c $s"), "a command named at run time"),
+        # the call variables can hold only scriptblock literals
+        "C a call variable given a string": (at_line_50("$guard = 'Invoke-Expression'"), "a call variable is given something other than a scriptblock"),
+        "C a call variable in a multiple assignment": (at_line_50("$isUnc, $x = 'iex', 1"), "a call variable is given something other than a scriptblock"),
+        "C a call variable set by -OutVariable": (at_line_50("Get-Item $p -OutVariable repoCheck"), "writes a variable by name"),
+        "C a call variable set by -ov": (at_line_50("Get-Item $p -ov placeFailed"), "writes a variable by name"),
+        "C a call variable set by foreach": (at_line_50("foreach ($guard in @('iex')) { }"), "set by foreach"),
+        "C a call variable by [ref]": (at_line_50("$null = [DirtyFinalPath]::Pin([ref]$guard)"), "passed by [ref]"),
+        "C a call variable parameter without [scriptblock]": (at_line_50("function Invoke-DirtyDestCheckpoint2($Guard) { & $Guard }"), "not typed [scriptblock]"),
+        # anything else outside the pinned names
+        "P New-Object of a computed type": (at_line_50("$a = New-Object ('System.Ref'+'lection.Assembly')"), "New-Object of a type outside"),
+        "P New-Object -TypeName": (at_line_50("$a = New-Object -TypeName System.Management.Automation.PowerShell"), "New-Object of a type outside"),
+        "P Get-Command Add-Type": (at_line_50("$c = Get-Command Add-Type"), "Get-Command other than"),
+        "P a PowerShell class": (text + "\nclass Shadow { [void] Run() { } }\n", "defines code outside the census"),
+        "P a quoted member name": (at_line_50("$m = [DirtyFinalPath].'GetMethod'('x', 40)"), "a member outside the pinned set: .GetMethod"),
+        "P a second Add-Type by the call operator": (at_line_50("& 'Add-Type' -TypeDefinition $s"), "Add-Type must be invoked exactly once"),
+        "P a module-qualified Add-Type": (at_line_50("Microsoft.PowerShell.Utility\\Add-Type -TypeDefinition $s"), "a command outside the pinned set"),
+    }
 
 
 class NoHardLinkCreationTests(unittest.TestCase):
@@ -401,7 +692,7 @@ class NoHardLinkCreationTests(unittest.TestCase):
 
     def test_the_lane_dirty_saver_keeps_exactly_its_one_rename_call(self) -> None:
         # HARD_LINK_ALLOWED is keyed by file; this keeps the allowance to the one class-10 rename (PR #698 r12).
-        self.assertEqual(lane_dirty_save_violations(LANE_DIRTY_SAVE.read_text(encoding="utf-8")), [])
+        self.assertEqual(lane_dirty_save_violations(LANE_DIRTY_SAVE.read_bytes()), [])
 
     def test_the_lane_dirty_saver_census_goes_red_on_every_widening(self) -> None:
         text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
@@ -463,10 +754,11 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "ln on the call line": text.replace(call, call + ' Process.Start("sh", "-c \\"ln src dst\\"");'),
             "cp -l on the call line": text.replace(call, call + ' Process.Start("sh", "-c \\"cp -al src dst\\"");'),
         }
+        found = dict(zip(mutants, lane_dirty_save_violations_many(list(mutants.values()))))
         for name, mutant in mutants.items():
             with self.subTest(mutant=name):
                 self.assertNotEqual(mutant, text, "the mutant did not apply")
-                self.assertTrue(lane_dirty_save_violations(mutant), f"the census missed: {name}")
+                self.assertTrue(found[name], f"the census missed: {name}")
 
     def test_the_lane_dirty_saver_census_rejects_a_literal_non_ascii_character(self) -> None:
         # r14 (Dot on 3e52cb20, HARDLINK-CENSUS-LITERAL-FORMAT-CHAR-1): C# removes a Cf character from an identifier, so each literal below binds the counted
@@ -485,11 +777,12 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "a literal U+FEFF in the name": (extra("NtSet" + chr(0xFEFF) + "InformationFile", "11"), 0xFEFF),
             "a non-ASCII character in a comment only": (text.replace(call, call + " // caf" + chr(0x00E9)), 0x00E9),
         }
+        found = dict(zip(mutants, lane_dirty_save_violations_many([mutant for mutant, _ in mutants.values()])))
         for name, (mutant, code_point) in mutants.items():
             with self.subTest(mutant=name):
                 self.assertNotEqual(mutant, text, "the mutant did not apply")
                 line = mutant.count("\n", 0, mutant.index(chr(code_point))) + 1
-                self.assertIn(f"{line}: a non-ASCII character: U+{code_point:04X}", lane_dirty_save_violations(mutant), f"the census missed: {name}")
+                self.assertIn(f"{line}: a non-ASCII character: U+{code_point:04X}", found[name], f"the census missed: {name}")
         # control: an ASCII renamed extra call is still caught by the spelling rule, and is not reported as non-ASCII
         ascii_rename = extra("NtSetInformationFileX", "11")
         violations = lane_dirty_save_violations(ascii_rename)
@@ -561,10 +854,65 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "iter2 A2 a Get-Command lookup": text + "\n& (Get-Command ('Add-'+'Type'))\n",
             "iter2 A2 a lowercase gcm": text + "\n& (gcm *-Type)\n",
         })
+        found = dict(zip(mutants, lane_dirty_save_violations_many(list(mutants.values()))))
         for name, mutant in mutants.items():
             with self.subTest(mutant=name):
                 self.assertNotEqual(mutant, text, "the mutant did not apply")
-                self.assertTrue(lane_dirty_save_violations(mutant), f"the census missed: {name}")
+                self.assertTrue(found[name], f"the census missed: {name}")
+
+    def _assert_r15_rows_rejected(self) -> None:
+        """Every row of r15_census_rows() gives a violation, and each B1 member row names its member as computed (the class rule, not a pinned-name miss)."""
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        rows = r15_census_rows(text)
+        found = dict(zip(rows, lane_dirty_save_violations_many([mutant for mutant, _ in rows.values()])))
+        for name, (mutant, expected) in rows.items():
+            with self.subTest(mutant=name):
+                self.assertNotEqual(mutant, text, "the mutant did not apply")
+                self.assertTrue(found[name], f"the census missed: {name}")
+                if expected:
+                    self.assertTrue(any(expected in violation for violation in found[name]), f"{name}: no {expected!r} in {found[name]}")
+
+    def test_the_lane_dirty_saver_census_rejects_sol_r14_dispatch_and_rebinding(self) -> None:
+        # r15 (sol r14 B1/B2 = r14 OPEN A1/A2, fable r14 finding 1): each row returned [] from the r14 regex census; the AST census rejects each by class.
+        self._assert_r15_rows_rejected()
+
+    def test_dropping_the_computed_member_rule_turns_the_b1_rows_red(self) -> None:
+        # mutation test: without the computed-member rule the B1 rows lose their class diagnostic, so the row test above fails
+        with mock.patch(f"{__name__}._ps_member_name_violation", lambda member: None):
+            with self.assertRaises(AssertionError):
+                self._assert_r15_rows_rejected_quietly()
+
+    def _assert_r15_rows_rejected_quietly(self) -> None:
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        rows = {name: row for name, row in r15_census_rows(text).items() if name.startswith("B1 ") and row[1] == "a member named at run time"}
+        self.assertGreaterEqual(len(rows), 3)
+        for (name, (_, expected)), violations in zip(rows.items(), lane_dirty_save_violations_many([mutant for mutant, _ in rows.values()])):
+            self.assertTrue(any(expected in violation for violation in violations), f"{name}: no {expected!r} in {violations}")
+
+    def test_the_lane_dirty_saver_census_reports_bad_text_instead_of_raising(self) -> None:
+        # sol r14 hardening / fable r14 finding 2: an out-of-range escape, a stray control character and invalid UTF-8 are diagnostics, never an exception
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        escape, control, undecodable = lane_dirty_save_violations_many([
+            text + "\n# \\U00110000\n",
+            text.replace("Add-Type -TypeDefinition @'", "\x0c\nAdd-Type -TypeDefinition @'"),
+            LANE_DIRTY_SAVE.read_bytes() + b"\n# \xff\n",
+        ])
+        self.assertTrue(any("outside Unicode" in violation for violation in escape), escape)
+        self.assertTrue(any("a control character: U+000C" in violation for violation in control), control)
+        self.assertTrue(any("not UTF-8" in violation for violation in undecodable), undecodable)
+
+    def test_the_lane_dirty_saver_census_fails_closed_without_the_parser(self) -> None:
+        with mock.patch(f"{__name__}.shutil.which", lambda name: None):
+            violations = lane_dirty_save_violations(LANE_DIRTY_SAVE.read_bytes())
+        self.assertTrue(any("could not run" in violation for violation in violations), violations)
+
+    def test_a_harmless_ascii_edit_to_the_saver_stays_clean(self) -> None:
+        # control: the AST census pins names, not text, so a comment, a message string and whitespace change nothing
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        edited = text.replace("reason=dest-unc-unproven", "reason=dest-unc-not-proven", 1) + "\n# a harmless trailing comment\n\n"
+        self.assertNotEqual(edited, text)
+        self.assertEqual(lane_dirty_save_violations(edited), [])
+        self.assertEqual(sum(byte > 127 for byte in PS_AST_INVENTORY.read_bytes()), 0, "the inventory helper must stay ASCII")
 
     def test_every_named_hard_link_exception_still_matches(self) -> None:
         present = {path.relative_to(ROOT).as_posix() for path in _tool_sources() if hard_link_hits(path)}
