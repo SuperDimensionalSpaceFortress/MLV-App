@@ -2310,7 +2310,13 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
         [AllowNull()][object]$EventsLost
     )
 
-    $current = [string]$Report.reason
+    # r6 adversary A2 on c1521d3c: a dictionary's reason is read by its key (a Dictionary[object,object] has no `reason` member: strict mode threw, and without it the reason read
+    # empty and the original was lost), by ContainsKey where it exists and Contains otherwise (as the sweep record is read); an object's by its property
+    $current = ''
+    if ($Report -is [System.Collections.IDictionary]) {
+        if ($null -ne $Report.PSObject.Methods['ContainsKey']) { if ($Report.ContainsKey('reason')) { $current = [string]$Report['reason'] } }
+        elseif ($Report.Contains('reason')) { $current = [string]$Report['reason'] }
+    } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value } }
     $detailed = Add-AttrCudaPresentMonEventsLostDetail -Reason $current -EventsLost $EventsLost
     if ($detailed -ceq $current) { return $Report }
     # r3 (sol B1, the sibling copy): a dictionary report keeps its entries; either shape comes back as the same pscustomobject
@@ -2323,8 +2329,10 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
         # into the very structures the plain copy uses and any entry they merge sends the report down the exact-key path
         $probe = [ordered]@{}
         foreach ($key in $keys) { $probe[[string]$key] = $true }
-        $probeNames = @(([pscustomobject]$probe).PSObject.Properties)
-        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $keys.Count -or $probeNames.Count -ne $keys.Count) {
+        # r6 adversary A1 on c1521d3c: a key no pscustomobject can carry (the empty name) throws in the conversion; a conversion that fails is a merge too (the exact-key path)
+        $probeCount = -1
+        try { $probeCount = @(([pscustomobject]$probe).PSObject.Properties).Count } catch { $probeCount = -1 }
+        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $keys.Count -or $probeCount -ne $keys.Count) {
             # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
             $values = @($Report.PSBase.Values)
             $exact = [System.Collections.Specialized.OrderedDictionary]::new()
@@ -2358,7 +2366,13 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     )
 
     if ($null -eq $Sweep) { return $Report }
-    $current = [string]$Report.reason
+    # r6 adversary A2 on c1521d3c: a dictionary's reason is read by its key (a Dictionary[object,object] has no `reason` member: strict mode threw, and without it the reason read
+    # empty and the original was lost), by ContainsKey where it exists and Contains otherwise (as the sweep record is read); an object's by its property
+    $current = ''
+    if ($Report -is [System.Collections.IDictionary]) {
+        if ($null -ne $Report.PSObject.Methods['ContainsKey']) { if ($Report.ContainsKey('reason')) { $current = [string]$Report['reason'] } }
+        elseif ($Report.Contains('reason')) { $current = [string]$Report['reason'] }
+    } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value } }
     # r3 (adversary A2): the token is the detail this helper writes (a bare prefix, or bracketed after a reason), never a path or a word that merely contains the name
     if ($current.StartsWith('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:') -or $current.Contains('[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:')) { return $Report }
     # the record is the job's [ordered] table (a key may be absent: the job's default before Start-PresentMonCapture ran has two) or an object; strict mode throws on an absent member, so read by name.
@@ -2406,8 +2420,10 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
         # into the very structures the plain copy uses and any entry they merge sends the report down the exact-key path
         $probe = [ordered]@{}
         foreach ($key in $keys) { $probe[[string]$key] = $true }
-        $probeNames = @(([pscustomobject]$probe).PSObject.Properties)
-        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $keys.Count -or $probeNames.Count -ne $keys.Count) {
+        # r6 adversary A1 on c1521d3c: a key no pscustomobject can carry (the empty name) throws in the conversion; a conversion that fails is a merge too (the exact-key path)
+        $probeCount = -1
+        try { $probeCount = @(([pscustomobject]$probe).PSObject.Properties).Count } catch { $probeCount = -1 }
+        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $keys.Count -or $probeCount -ne $keys.Count) {
             # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
             $values = @($Report.PSBase.Values)
             $exact = [System.Collections.Specialized.OrderedDictionary]::new()

@@ -427,6 +427,36 @@ class ModuleFunctionTests(unittest.TestCase):
         self.assertTrue(got["reason"].startswith("PresentMon output does not exist: X [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: recordUnreadable="), got["reason"])
         self.assertIn("record-read-denied", got["reason"])
 
+    # --- r6 (adversary A1 / A2 on c1521d3c): both report helpers, every dictionary report kept whole and its own reason read.
+    ENTRIES = ("$isDictionary = $r -is [System.Collections.IDictionary]\n"
+               "$entries = if ($isDictionary) { $v = @($r.PSBase.Values); $k = @($r.PSBase.Keys); @(for ($i = 0; $i -lt $k.Count; $i++) { \"$($k[$i].GetType().Name):$($k[$i])=$($v[$i])\" }) }"
+               " else { @($r.PSObject.Properties | ForEach-Object { \"String:$($_.Name)=$($_.Value)\" }) }\n"
+               "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ entries = @($entries); same = [object]::ReferenceEquals($r, $report) }) -Compress))")
+    APPENDED = {"sweep": "missing [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive]", "events": "missing [PRESENTMON_EVENTS_LOST: 12 lost]"}
+
+    def test_r6_a1_a_report_with_an_empty_key_keeps_every_entry_in_both_helpers(self) -> None:
+        # A1: the probe's [pscustomobject] conversion threw on the empty name before the exact-key path was chosen (ordered and hashtable reports alike)
+        for shape in ("[ordered]@{ reason = 'missing'; status = 'PRESENTMON_UNAVAILABLE'; '' = 'keep' }", "@{ reason = 'missing'; status = 'PRESENTMON_UNAVAILABLE'; '' = 'keep' }"):
+            for helper in self.HELPERS:
+                with self.subTest(shape=shape[:2], helper=helper):
+                    got = self.call(f"$report = {shape}\n$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
+                    self.assertEqual(sorted(got["entries"]), sorted([f"String:reason={self.APPENDED[helper]}", "String:status=PRESENTMON_UNAVAILABLE", "String:=keep"]))
+
+    def test_r6_a2_a_non_string_key_dictionary_reports_own_reason_is_read_by_both_helpers(self) -> None:
+        # A2: `$Report.reason` on a Dictionary[object,object] is no member (strict mode throws; without it the reason read empty and the original was lost)
+        report = ("$report = [System.Collections.Generic.Dictionary[object,object]]::new(); $report.Add('reason', 'missing'); $report.Add('status', 'PRESENTMON_UNAVAILABLE');"
+                  " $report.Add(1, 'keep')\n")
+        for helper in self.HELPERS:
+            with self.subTest(helper=helper):
+                got = self.call(f"{report}$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
+                self.assertEqual(got["entries"], [f"String:reason={self.APPENDED[helper]}", "String:status=PRESENTMON_UNAVAILABLE", "Int32:1=keep"])
+        # the sweep detail goes after an events-lost detail the reason already carries, and the events helper sees its own token and adds nothing
+        report = report.replace("'missing'", "'missing [PRESENTMON_EVENTS_LOST: 12 lost]'")
+        got = self.call(f"{report}$r = {self.HELPERS['sweep']}\n" + self.ENTRIES)
+        self.assertEqual(got["entries"][0], "String:reason=missing [PRESENTMON_EVENTS_LOST: 12 lost] [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive]")
+        got = self.call(f"{report}$r = {self.HELPERS['events']}\n" + self.ENTRIES)
+        self.assertTrue(got["same"], got)
+
     def test_mutation_the_property_only_copy_loses_a_dictionary_reports_fields_again(self) -> None:
         module = MODULE.read_text(encoding="utf-8")
         branch = ("    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }\n"
