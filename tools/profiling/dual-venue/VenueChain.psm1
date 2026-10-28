@@ -674,6 +674,8 @@ function Get-VenueStagedBuildManifest {
                         # a read that fails ends the read (UNREACHABLE), never "absent": an unreadable file is not a missing one
                         $ErrorActionPreference = 'Stop'
                         foreach ($i in $items) {
+                            # r7 adversary A2: -ArtifactMinSec is the least EACH file's read may start with, not only the first: a slow packageZip left the exe and the dll under it
+                            if ($null -ne $i.clock -and ($i.endSec - $i.clock.Elapsed.TotalSeconds) -lt $i.minSec) { 'NOTIME:' + $i.label + ':' + $i.name; break }
                             if (-not (Test-Path -LiteralPath $i.path -PathType Leaf)) { 'MISSING:' + $i.label + ':' + $i.name; continue }
                             $fs = [IO.File]::Open($i.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
                             try {
@@ -692,11 +694,17 @@ function Get-VenueStagedBuildManifest {
                 if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Round([Math]::Max(0, $left), 2)) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null } }
                 $artSec = $left
             }
+            # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file
+            $hashEnd = $callClock.Elapsed.TotalSeconds + $artSec
+            foreach ($it in $items) { $it.clock = $callClock; $it.endSec = $hashEnd; $it.minSec = $ArtifactMinSec }
             $ar =Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec
             if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null } }
             $lines = @($ar.value | ForEach-Object { [string]$_ })
             $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
             $differs = @($lines | Where-Object { $_.StartsWith('MISMATCH:') } | ForEach-Object { $p = $_.Split(':', 4); "$($p[1]) $($p[2]) hashes to $($p[3])" })
+            $notime = @($lines | Where-Object { $_.StartsWith('NOTIME:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
+            # a file found absent or different before the time ran out is still that typed problem; with none, a file never started is a hash that did not finish (UNREACHABLE)
+            if (-not $missing.Count -and -not $differs.Count -and $notime.Count) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) to start hashing $($notime[0]) (under $ArtifactMinSec s left)"; contentProblem = $null; artifactProblem = $null } }
             $artifactProblem = $(if ($missing.Count) { "BUILD_ARTIFACT_MISSING the cached artifact is absent from $cacheDir`: $($missing -join '; ') (the leg job hashes it against the build manifest and throws after the lease opened)" }
                 elseif ($differs.Count) { "BUILD_ARTIFACT_MISMATCH the cached artifact does not hash to the build manifest's digest in ${cacheDir}: $($differs -join '; ') (the leg job throws after the lease opened)" }
                 else { '' })

@@ -765,8 +765,10 @@ function Get-InputContentRefusal {
             # read (and a lease that opened charged with no leg). Each read still ends inside the budget (its bound is what is left), and a slow one leaves the next build "no time"
             # r7 (sol r6 B1): the remainder goes over as the sub-second quantity it is, never floored: a 2.8 s room floored to 2 here and again to 1 after a 100 ms manifest read
             # left the hash under its 2 s minimum, and a healthy build was refused with no hash. Get-VenueStagedBuildManifest rounds nothing either.
+            # r7 adversary A1: under a budget the share is all that is left of it, up to the preflight's own bounds for the same two reads (its manifest read's -TimeoutSec 30 plus its
+            # hash's -ArtifactTimeoutSec 300): a hash the preflight accepted (310 s of a 519 s room) is never refused for a 300 s cap under the room
             $share = 300
-            if ($null -ne $script:guardBudget) { $share = [Math]::Min(300, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) }
+            if ($null -ne $script:guardBudget) { $share = [Math]::Min(330, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) }
             if ($share -lt $script:GuardReadMinSec) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
             # r5 (key3 r4 B1): no artifact hash while no claim is held (a budget with artifactsOff); the manifest itself is still re-read and compared
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)

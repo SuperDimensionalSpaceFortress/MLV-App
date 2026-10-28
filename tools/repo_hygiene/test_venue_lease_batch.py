@@ -3701,7 +3701,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"$stagedBuildProbe = {{ param($p) [IO.File]::AppendAllText('{reads}', 'm' + [Environment]::NewLine); [Threading.Thread]::Sleep({manifest_ms}); {facts} }}\n"
                   f"$artifactProbe = {{ param($i) [IO.File]::AppendAllText('{hashes}', 'h' + [Environment]::NewLine); [Threading.Thread]::Sleep({hash_ms}) }}\n"
                   # warm the runspace machinery first, so the room measures the reads and not the first runspace's start
-                  "$null = Invoke-VenueBoundedRead -ScriptText '1' -Argument 0 -TimeoutSec 30\n"
+                  # (adversary r7 A3: the helper is not exported, so it is called inside the module)
+                  "$null = & (Get-Module VenueChain) { Invoke-VenueBoundedRead -ScriptText '1' -Argument 0 -TimeoutSec 30 }\n"
                   f"$script:guardBudget = New-GuardBudget {room} 'the test room' 'LEG_BUDGET_EXCEEDS_LEASE' $false 'open'\n"
                   "$hit = Get-InputContentRefusal\n"
                   "ConvertTo-Json -Compress -InputObject @{ code = [string]$hit.code; why = [string]$hit.why; ms = [int]$script:guardBudget.clock.Elapsed.TotalMilliseconds }\n"
@@ -3736,6 +3737,43 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual((got["code"], got["reads"], got["hashes"]), ("SHARE_UNREACHABLE", 1, 0), got)
         self.assertIn("no time is left of -TimeoutSec", got["why"])
         self.assertLess(got["ms"], 2300, got)
+
+    # r7 adversary A2 (pass 1 on dbe8a7a0): -ArtifactMinSec was checked once, before the three-file hash worker, so after a slow packageZip the exe and the dll started with under
+    # the minimum. The worker now checks it before EACH file. A hash bound (-ArtifactTimeoutSec 1) under the minimum (-ArtifactMinSec 2) starts no file at all; RED on dbe8a7a0,
+    # which hashed all three (STAGED, no problem) inside that 1 s.
+    def test_artifact_preflight_r7_adv_a2_no_artifact_file_starts_hashing_with_under_the_minimum_left(self) -> None:
+        c = self.commit_a
+        for k in ("packageZip", "exe", "dll"):
+            self.assertTrue(self.artifact_path(c, k).exists(), k)
+        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 1 -ArtifactMinSec 2\n"
+                  "ConvertTo-Json -Compress -InputObject @{ state = $r.state; error = [string]$r.error; problem = [string]$r.artifactProblem }\n"
+                  "Complete-VenueProcess -ExitCode 0\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["state"], "UNREACHABLE", got)
+        self.assertIn("to start hashing packageZip", got["error"])
+        # control: the same build with room for every file is STAGED and matches
+        script = script.replace(" -ArtifactTimeoutSec 1 -ArtifactMinSec 2", "")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        self.assertEqual((got["state"], got["problem"]), ("STAGED", ""), got)
+
+    # r7 adversary A1 (pass 1 on dbe8a7a0): the guard capped a build's share at 300 s while the room was larger, so a 310 s post-open hash (one the preflight's 30 s + 300 s
+    # bounds accept) in a 519 s room was refused SHARE_UNREACHABLE and the lease charged with no leg. The cap is now the preflight's own 330 s. The adversary's input, literally
+    # (about 6 minutes: the hash sleeps 310 s).
+    def test_artifact_preflight_r7_adv_a1_a_310s_post_open_hash_in_a_519s_room_runs_the_leg(self) -> None:
+        r, held = self._post_open_hash_run(310, "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=900)), cap="1000", leg="360", margin="120")
+        self.assertNotIn("LEG_PLAN_REFUSED", r.stderr, r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsRan"]), ("ALL_LEGS_DONE", 1), b)
+
+    def test_artifact_preflight_r7_adv_a1_the_guard_share_cap_is_the_preflights_own_bounds(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        guard = text[text.index("function Get-InputContentRefusal"):text.index("function Stop-InputIsOutput")]
+        self.assertIn("$share = [Math]::Min(330, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds)", guard)
+        self.assertIn("-TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }", text, "the preflight's bounds the cap is the sum of")
 
     def test_artifact_preflight_r4_the_guard_read_delay_seam_is_refused_with_the_real_um_run_and_checked_for_shape(self) -> None:
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", "open:spec=5")
