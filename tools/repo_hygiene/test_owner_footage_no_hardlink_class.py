@@ -203,8 +203,10 @@ LANE_DIRTY_SAVE = ROOT / "tools" / "coordination" / "lane-dirty-save.ps1"
 LANE_DIRTY_SAVE_NT_CLASSES = {"10"}  # NtSetInformationFile: FileRenameInformation. 11 (FileLinkInformation) creates a hard link.
 LANE_DIRTY_SAVE_NT_CALLS = 1
 LANE_DIRTY_SAVE_K32_CLASSES = {"4"}  # SetFileInformationByHandle: FileDispositionInfo (that enum has no link class; pinned anyway).
-_NATIVE_SET_INFO_RE = re.compile(r"\b(?:Nt|Zw)SetInformationFile\w*")
-_K32_SET_INFO_RE = re.compile(r"\bSetFileInformationByHandle\w*")
+# Every regex the saver census runs is case-INSENSITIVE: PowerShell resolves command, type and member names without case, so [T]::ntsetinformationfile, add-type
+# and .getmethod(...) reach what the exact spellings name (r14 iter 1, adversary ea865d3b-A2). C# is case-sensitive, so a case variant there only fails closed.
+_NATIVE_SET_INFO_RE = re.compile(r"\b(?:Nt|Zw)SetInformationFile\w*", re.IGNORECASE)
+_K32_SET_INFO_RE = re.compile(r"\bSetFileInformationByHandle\w*", re.IGNORECASE)
 # Every link spelling the wide scan knows, on the raw text (a comment or a string counts), so one appended to a counted line is never excused by it (r13,
 # HARDLINK-CENSUS-SAME-LINE-SPELLING-1).
 _LINK_NAME_RE = re.compile(
@@ -220,11 +222,22 @@ _CS_ESCAPE_RE = re.compile(r"\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8}")
 # NtSet<ZWNJ>InformationFile binds the counted native while no regex here sees the name. The saver is ASCII-only, so ANY code point above 127 anywhere
 # (comment, string or Add-Type payload) FAILS CLOSED; that covers every Cf character and identifier look-alike in one rule, with no normalization.
 _NON_ASCII_RE = re.compile(r"[^\x00-\x7F]")
-_ADD_TYPE_PAYLOAD_RE = re.compile(r"Add-Type\b[^\n]*?@(['\"])\r?\n(?P<body>.*?)\r?\n\1@", re.DOTALL)
+_ADD_TYPE_PAYLOAD_RE = re.compile(r"Add-Type\b[^\n]*?@(['\"])\r?\n(?P<body>.*?)\r?\n\1@", re.DOTALL | re.IGNORECASE)
+# The census reads the payload as written, so what Add-Type compiles must BE that text (r14 iter 1, adversary ea865d3b-A3: "(@'...'@ -replace ', 10\);', ', 11);')"
+# left the checked call at 10 and compiled 11). The one Add-Type is exactly this line, it opens the one here-string in the file, and that here-string's
+# terminator stands alone on its line, so no operator, parenthesis or continuation can touch the text between them.
+LANE_DIRTY_SAVE_ADD_TYPE_LINE = "Add-Type -TypeDefinition @'"
+_ADD_TYPE_ANY_RE = re.compile(r"Add-Type", re.IGNORECASE)
+_HERE_STRING_OPEN_RE = re.compile(r"@['\"][ \t]*\r?$", re.MULTILINE)
+_HERE_STRING_CLOSE_RE = re.compile(r"^['\"]@", re.MULTILINE)
+# Code compiled, loaded or evaluated anywhere but that one payload is outside the census, so each such route fails closed (r14 iter 1, A3 siblings).
+_DYNAMIC_CODE_RE = re.compile(
+    r"Invoke-Expression|\biex\b|\[scriptblock\]::Create|NewScriptBlock|Assembly\]?::Load\w*|\bLoad(?:From|File)\b|CodeDom|CodeProvider|CodeAnalysis"
+    r"|Import-Module|\bipmo\b", re.IGNORECASE)
 _VERBATIM_IDENTIFIER_RE = re.compile(r"(?<![\w\"'])@[A-Za-z_]")
 _REFLECTION_RE = re.compile(
     r"\b(?:GetMethods?|GetMembers?|GetMember|GetRuntimeMethods?|GetDeclaredMethods?|GetTypeInfo|InvokeMember|MethodInfo|MethodBase|BindingFlags"
-    r"|CreateDelegate|DynamicMethod|DynamicInvoke|System\.Reflection|Reflection\.Emit|Expression\.Call)\b")
+    r"|CreateDelegate|DynamicMethod|DynamicInvoke|System\.Reflection|Reflection\.Emit|Expression\.Call)\b", re.IGNORECASE)
 _LITERAL_JOIN_RE = re.compile(r"\"\s*\+\s*@?\$?\"|'\s*\+\s*'")
 # The parameter count of each counted native, so an extra trailing argument cannot move the class out of the checked position (r13, HARDLINK-CENSUS-ARITY-1).
 LANE_DIRTY_SAVE_NT_ARITY = 5  # (handle, out iosb, info, length, infoClass)
@@ -235,8 +248,12 @@ LANE_DIRTY_SAVE_NATIVES = {
     "CreateFileW", "GetFinalPathNameByHandleW", "CloseHandle", "GetFileInformationByHandle", "NtCreateFile",
     "RtlNtStatusToDosError", "ReOpenFile", "NtSetInformationFile", "SetFileInformationByHandle",
 }
-_EXTERN_RE = re.compile(r"\bextern\b(?P<head>[^;(]*)\(")
-_NATIVE_LOOKUP_RE = re.compile(r"\bEntryPoint\b|GetProcAddress|GetDelegateForFunctionPointer|\bNativeLibrary\b|\bLibraryImport\b|\bcalli\b")
+_EXTERN_RE = re.compile(r"\bextern\b(?P<head>[^;(]*)\(", re.IGNORECASE)
+_NATIVE_LOOKUP_RE = re.compile(
+    r"\bEntryPoint\b|GetProcAddress|GetDelegateForFunctionPointer|\bNativeLibrary\b|\bLibraryImport\b|\bcalli\b", re.IGNORECASE)
+# Each argument of a counted call or declaration is plain tokens only: a comment, string, directive or any other punctuation inside one could hide the ')' or
+# ',' the parser counts, so "(uint)size /*, 10)*/, 11" read as class 10 while C# compiled 11 (r14 iter 1, adversary ea865d3b-A1).
+_PLAIN_ARGUMENT_RE = re.compile(r"[A-Za-z0-9_ \t()]+")
 
 
 def _call_arguments(text: str, at: int) -> list[str] | None:
@@ -273,6 +290,9 @@ def _native_census(text: str, pattern: re.Pattern, declaration: str, class_at: i
             violations.append(f"{number}: a spelling other than {declaration}: {line}")
             continue
         args = _call_arguments(text, match.end())
+        for arg in args or []:
+            if not _PLAIN_ARGUMENT_RE.fullmatch(arg):
+                violations.append(f"{number}: {declaration} has an argument that is not plain tokens (a comment, string or directive): {arg!r}")
         if re.search(r"\bstatic\s+extern\b[^\n;]*$", text[text.rfind("\n", 0, match.start()) + 1: match.start()]):
             declarations.append(number)
             spans.append(match.span())
@@ -302,6 +322,18 @@ def lane_dirty_save_violations(text: str) -> list[str]:
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: an escaped identifier character: {match.group(0)}")
     for match in _REFLECTION_RE.finditer(text):
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a reflection lookup: {match.group(0)}")
+    for match in _DYNAMIC_CODE_RE.finditer(text):
+        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: code compiled, loaded or evaluated outside the one payload: {match.group(0)}")
+    lines = text.splitlines()
+    add_types = [text.count("\n", 0, m.start()) + 1 for m in _ADD_TYPE_ANY_RE.finditer(text)]
+    opens = [text.count("\n", 0, m.start()) + 1 for m in _HERE_STRING_OPEN_RE.finditer(text)]
+    closes = [text.count("\n", 0, m.start()) + 1 for m in _HERE_STRING_CLOSE_RE.finditer(text)]
+    if len(add_types) != 1 or lines[add_types[0] - 1].strip() != LANE_DIRTY_SAVE_ADD_TYPE_LINE:
+        violations.append(f"Add-Type must appear exactly once, as the line {LANE_DIRTY_SAVE_ADD_TYPE_LINE!r}; found lines {add_types}")
+    if opens != add_types[:1]:
+        violations.append(f"the one here-string must be the Add-Type payload; here-strings open on lines {opens}")
+    if len(closes) != 1 or lines[closes[0] - 1].rstrip() != "'@":
+        violations.append(f"the payload's terminator must stand alone on its line as '@; terminators on lines {closes}")
     for payload in _ADD_TYPE_PAYLOAD_RE.finditer(text):
         body, at = payload.group("body"), payload.start("body")
         for regex, what in ((_VERBATIM_IDENTIFIER_RE, "a verbatim identifier"), (_LITERAL_JOIN_RE, "a string built from pieces")):
@@ -451,6 +483,48 @@ class NoHardLinkCreationTests(unittest.TestCase):
         self.assertTrue(any("a spelling other than NtSetInformationFile" in v for v in violations), violations)
         self.assertFalse(any("non-ASCII" in v for v in violations), violations)
         self.assertEqual(sum(byte > 127 for byte in THIS_FILE.read_bytes()), 0, "this test file must stay ASCII")
+
+    def test_the_lane_dirty_saver_census_rejects_what_the_r14_adversary_compiled_past_it(self) -> None:
+        # r14 iter 1 (adversary ea865d3b): each input below returned [] while C# or PowerShell would reach class 11 or an uncounted native.
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        call = "NtSetInformationFile(h, out io, info, (uint)size, 10);"
+        dispose = "SetFileInformationByHandle(h, 4, ref d, 1)"
+        payload_close = "\n'@\n"
+        self.assertIn(call, text)
+        self.assertIn(dispose, text)
+        self.assertIn(payload_close, text)
+        mutants = {
+            # A1: comment punctuation inside the arguments moved the counted class
+            "A1 a block comment hides the class": text.replace(call, "NtSetInformationFile(h, out io, info, (uint)size /*, 10)*/, 11);"),
+            "A1 a disposition block comment": text.replace(dispose, "SetFileInformationByHandle(h /*, 4, ref d, 1)*/, 11, ref d, 1)", 1),
+            "A1 a line comment hides the class": text.replace(call, "NtSetInformationFile(h, out io, info, (uint)size //, 10)\n, 11);"),
+            "A1 a directive picks the class": text.replace(call, "NtSetInformationFile(h, out io, info, (uint)size,\n#if NEVER\n10\n#else\n11\n#endif\n);"),
+            "A1 a string in an argument": text.replace(call, 'NtSetInformationFile(h, out io, info, (uint)Q(")"), 10);'),
+            # A2: PowerShell resolves names without case
+            "A2 a lowercase reflective getmethod": text + "\n[DirtyFinalPath].getmethod(('NtSet'+'InformationFile'),40)\n",
+            "A2 a lowercase nativelibrary load": text + "\n[system.runtime.interopservices.nativelibrary]::load('ntdll.dll');\n",
+            "A2 a lowercase add-type with a verbatim identifier": text.replace(
+                "Add-Type -TypeDefinition @'", "add-type -TypeDefinition @'").replace(call, call + "\npublic static int @CensusProbe = 0;"),
+            "A2 a lowercase native call from PowerShell": text + "\n[DirtyFinalPath]::ntsetinformationfile($h, [ref]$io, $p, 24, 11)\n",
+            "A2 a lowercase extern outside the named set": text.replace(call, call + '\n[DllImport("ntdll.dll")] static EXTERN int NtQuietSet(IntPtr h, int c);'),
+            "A2 a lowercase getprocaddress": text + "\n$p = [K]::getprocaddress($m, 'x')\n",
+            # A3: the compiled text differs from the checked text
+            "A3 a -replace on the payload": text.replace("Add-Type -TypeDefinition @'", "Add-Type -TypeDefinition (@'").replace(
+                payload_close, "\n'@ -replace ', 10\\);', ', 11);')\n", 1),
+            "A3 a payload from a variable": text.replace("Add-Type -TypeDefinition @'", "$src = @'").replace(
+                payload_close, "\n'@\nAdd-Type -TypeDefinition ($src -replace ', 10\\);', ', 11);')\n", 1),
+            "A3 a second Add-Type from a path": text + "\nAdd-Type -Path $env:TEMP\\x.cs\n",
+            "A3 a second here-string": text + "\n$x = @'\nNtSetInformationFile\n'@\n",
+            "A3 an Invoke-Expression": text + "\nInvoke-Expression ('Add-' + 'Type -TypeDefinition $s')\n",
+            "A3 a lowercase iex": text + "\niex $s\n",
+            "A3 a scriptblock create": text + "\n& ([scriptblock]::Create($s))\n",
+            "A3 an assembly load": text + "\n[Reflection.Assembly]::LoadFile($dll)\n",
+            "A3 an Import-Module of a dll": text + "\nImport-Module $dll\n",
+        }
+        for name, mutant in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertNotEqual(mutant, text, "the mutant did not apply")
+                self.assertTrue(lane_dirty_save_violations(mutant), f"the census missed: {name}")
 
     def test_every_named_hard_link_exception_still_matches(self) -> None:
         present = {path.relative_to(ROOT).as_posix() for path in _tool_sources() if hard_link_hits(path)}
