@@ -457,6 +457,17 @@ class ModuleFunctionTests(unittest.TestCase):
         got = self.call(f"{report}$r = {self.HELPERS['events']}\n" + self.ENTRIES)
         self.assertTrue(got["same"], got)
 
+    def test_r6_a1b_the_exact_key_copy_updates_the_reason_key_the_report_holds(self) -> None:
+        # adversary A1 on ce87d0f8: a case-insensitive report holding `Reason` (and a key that forces the exact-key copy) came back with Reason unchanged and a new `reason` added
+        for helper in self.HELPERS:
+            with self.subTest(helper=helper):
+                got = self.call(f"$report = [ordered]@{{ Reason = 'missing'; status = 'PRESENTMON_UNAVAILABLE'; '' = 'keep' }}\n$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
+                self.assertEqual(got["entries"], [f"String:Reason={self.APPENDED[helper]}", "String:status=PRESENTMON_UNAVAILABLE", "String:=keep"])
+        # control: an ordinal report with no key its own comparer calls `reason` gains one (it had no reason to update)
+        got = self.call("$report = [System.Collections.Generic.Dictionary[object,object]]::new(); $report.Add('Reason', 'other'); $report.Add(1, 'keep')\n"
+                        f"$r = {self.HELPERS['sweep']}\n" + self.ENTRIES)
+        self.assertEqual(got["entries"], ["String:Reason=other", "Int32:1=keep", "String:reason=PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive"])
+
     def test_mutation_the_property_only_copy_loses_a_dictionary_reports_fields_again(self) -> None:
         module = MODULE.read_text(encoding="utf-8")
         branch = ("    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }\n"

@@ -2312,10 +2312,16 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
 
     # r6 adversary A2 on c1521d3c: a dictionary's reason is read by its key (a Dictionary[object,object] has no `reason` member: strict mode threw, and without it the reason read
     # empty and the original was lost), by ContainsKey where it exists and Contains otherwise (as the sweep record is read); an object's by its property
+    # r6 adversary A1 on ce87d0f8: the exact-key copy updates the key the report's own comparer matched (a case-insensitive report's `Reason`), never adds a second one
     $current = ''
+    $reasonKey = 'reason'
     if ($Report -is [System.Collections.IDictionary]) {
-        if ($null -ne $Report.PSObject.Methods['ContainsKey']) { if ($Report.ContainsKey('reason')) { $current = [string]$Report['reason'] } }
-        elseif ($Report.Contains('reason')) { $current = [string]$Report['reason'] }
+        $hasReason = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
+        if ($hasReason) {
+            $current = [string]$Report['reason']
+            $named = @(@($Report.PSBase.Keys) | Where-Object { $_ -is [string] -and $_ -eq 'reason' })
+            if ($named.Count -gt 0 -and @($named | Where-Object { $_ -ceq 'reason' }).Count -eq 0) { $reasonKey = $named[0] }
+        }
     } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value } }
     $detailed = Add-AttrCudaPresentMonEventsLostDetail -Reason $current -EventsLost $EventsLost
     if ($detailed -ceq $current) { return $Report }
@@ -2337,7 +2343,7 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
             $values = @($Report.PSBase.Values)
             $exact = [System.Collections.Specialized.OrderedDictionary]::new()
             for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
-            $exact['reason'] = $detailed
+            $exact[$reasonKey] = $detailed
             return $exact
         }
     }
@@ -2368,10 +2374,16 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     if ($null -eq $Sweep) { return $Report }
     # r6 adversary A2 on c1521d3c: a dictionary's reason is read by its key (a Dictionary[object,object] has no `reason` member: strict mode threw, and without it the reason read
     # empty and the original was lost), by ContainsKey where it exists and Contains otherwise (as the sweep record is read); an object's by its property
+    # r6 adversary A1 on ce87d0f8: the exact-key copy updates the key the report's own comparer matched (a case-insensitive report's `Reason`), never adds a second one
     $current = ''
+    $reasonKey = 'reason'
     if ($Report -is [System.Collections.IDictionary]) {
-        if ($null -ne $Report.PSObject.Methods['ContainsKey']) { if ($Report.ContainsKey('reason')) { $current = [string]$Report['reason'] } }
-        elseif ($Report.Contains('reason')) { $current = [string]$Report['reason'] }
+        $hasReason = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
+        if ($hasReason) {
+            $current = [string]$Report['reason']
+            $named = @(@($Report.PSBase.Keys) | Where-Object { $_ -is [string] -and $_ -eq 'reason' })
+            if ($named.Count -gt 0 -and @($named | Where-Object { $_ -ceq 'reason' }).Count -eq 0) { $reasonKey = $named[0] }
+        }
     } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value } }
     # r3 (adversary A2): the token is the detail this helper writes (a bare prefix, or bracketed after a reason), never a path or a word that merely contains the name
     if ($current.StartsWith('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:') -or $current.Contains('[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:')) { return $Report }
@@ -2428,7 +2440,7 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
             $values = @($Report.PSBase.Values)
             $exact = [System.Collections.Specialized.OrderedDictionary]::new()
             for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
-            $exact['reason'] = $reason
+            $exact[$reasonKey] = $reason
             return $exact
         }
     }
