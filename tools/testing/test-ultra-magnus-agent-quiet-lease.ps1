@@ -63,6 +63,12 @@ param(
 #               queuedjob-holder-lost-prelaunch, exit-release-pin): the queue-expired exit after admission and the pre-launch
 #               holder-lost refusal release the lease and record that release (leaseRelease) before Exit-HeavySlot, and every
 #               Exit-HeavySlot call site is either preceded by a recorded release or allowlisted with a reason.
+#   snapshot bound hardening - AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r1 (cases lease-snapshot-bound-straddle, lease-probe-watchdog-*): a slot
+#               snapshot probe is classified from one completion sample and the age sampled after it (sol r5 B1), and no probe starts
+#               without an armed watchdog: an Add-Type failure, a type that did not load, a constructor throw, a failed attach, a
+#               failed start and a failed registration each leave no unprotected probe (sol r5 B4).
+#               r3 (case lease-start-post-start-cleanup-throws, sol r2b B1): a cleanup Dispose that throws after a post-start failure never
+#               replaces the prepared exception, so the holder and job launch sites still get postStartStop and the child to stop again.
 # Prints one JSON object with status PASS, or throws.
 
 $ErrorActionPreference = 'Stop'
@@ -113,7 +119,10 @@ foreach ($name in $liftNotAfter) {
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
 # lease-batch r4 (the merge of not-after r1): the same, so batch-refusal-ends-batch fails on behaviour against an agent without it.
-foreach ($name in @('Close-LeaseBatchAfterRelease')) {
+foreach ($name in @('Close-LeaseBatchAfterRelease', 'ConvertTo-UtcDateTime', 'Get-LeaseWaitHeatField', 'Get-LeaseSlotAgeText', 'ConvertFrom-HeavySlotHolderText', 'Add-LeaseSlotSnapshot', 'Get-LeaseSnapshotHeadroomSec',
+        'Write-LeaseSlotSnapshotLine', 'Update-LeaseSlotSnapshots', 'Set-LeaseCoverageAtLaunch', 'Test-LeaseLocalFixedPath', 'Get-LeaseSlotSnapshotWaitMs', 'Initialize-LeaseProbeWatchdog',
+        'Stop-ProcessAfterStartFailure')) {   # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2: the post-start stop (sol r1 B4-post-start); absent on a base agent
+   # r5: the last one (the probe's own watchdog; called below, as the agent does at start). r4: the two before it (the local-path rule, the bound-capped wait); from ConvertTo-UtcDateTime on: AGENT-LEASE-PENDING-HEAT-TRACE-1 (ConvertTo-UtcDateTime: the headroom helper reads the sidecar bound with it; the last three: r3, the asynchronous probe and the coverage at launch)
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     if ($null -eq $fn) { $liftMissing.Add($name) } else { . ([scriptblock]::Create($fn.Extent.Text)) }
 }
@@ -137,8 +146,29 @@ except OSError:
 flag = os.path.join(d, "quiet-lease.json")
 def log(**k):
     k.update(argv=sys.argv[1:], pid=os.getpid(), held=os.environ.get("HEAVY_SLOT_HELD"), ts=time.time())
-    with open(os.path.join(d, "calls.jsonl"), "a", encoding="utf-8") as f:
-        f.write(json.dumps(k) + "\n")
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r5: the snapshot probes append here concurrently with the request wrapper. The C runtime's append is a seek to the
+    # end then a write, so two writers could overwrite each other (a torn line in calls.jsonl, seen in r4 and r5 runs). One write per line, under a
+    # byte-range lock past any content; the OS releases it if the writer is killed, and an unobtainable lock (2 s) degrades to the old unlocked write.
+    data = (json.dumps(k) + "\n").encode("utf-8")
+    fd = os.open(os.path.join(d, "calls.jsonl"), os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0))
+    try:
+        locked = False
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 1 << 30, 0)
+            for _ in range(200):
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    time.sleep(0.01)
+        os.write(fd, data)
+        if locked:
+            os.lseek(fd, 1 << 30, 0)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    finally:
+        os.close(fd)
 def read_flag():
     try:
         with open(flag, encoding="utf-8") as f:
@@ -199,7 +229,7 @@ if a[:2] == ["lease", "request"]:
             sys.exit(75)
     if mode == "active":
         time.sleep(float(ctl.get("active_after", 0.3)))
-        until = time.time() + 60 * float(a[a.index("--minutes") + 1])
+        until = time.time() + 60 * float(a[a.index("--minutes") + 1]) + float(ctl.get("until_offset_s", 0))   # until_offset_s: a lease granted short (heat-trace r3)
         write_flag({"label": label, "pid": me, "state": "active", "slot": 1, "renewed": time.time()})
         print("[heavy-slot] 1 acquired for %r" % label, file=sys.stderr, flush=True)
         print("[heavy-slot] lease active slot=1 held=1:%d until=%.0f" % (me, until), flush=True)
@@ -240,6 +270,30 @@ if a[:2] == ["lease", "release"]:
     while time.time() < t_end and read_flag() is not None:
         time.sleep(0.1)
     print(json.dumps({"state": "none"}), flush=True)
+    sys.exit(0)
+if a[:1] == ["status"]:
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: the slot snapshot's probe. fake-status.json (lines, rc, stderr, delay) is set per case.
+    st = {}
+    try:
+        with open(os.path.join(d, "fake-status.json"), encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        pass
+    log(cmd="status")
+    if st.get("orphan"):
+        # r5 (adversary r5-2ca9f68f A1): the root exits at once, leaving a 300 s child that holds its stdout and stderr.
+        import subprocess
+        c = subprocess.Popen([sys.executable, os.path.abspath(__file__), "sleep-child"], stdout=sys.stdout, stderr=sys.stderr)
+        log(cmd="status-orphan", child=c.pid)
+        sys.exit(0)
+    time.sleep(float(st.get("delay", 0)))
+    for line in st.get("lines", []):
+        print(line, flush=True)
+    if st.get("stderr"):
+        print(st["stderr"], file=sys.stderr, flush=True)
+    sys.exit(int(st.get("rc", 0)))
+if a[:1] == ["sleep-child"]:
+    time.sleep(300)
     sys.exit(0)
 log(cmd="unexpected")
 print("fake heavy-slot.py: unexpected argv %r" % (a,), file=sys.stderr)
@@ -297,7 +351,12 @@ $script:Exempt = 0
 # A case's hook runs inside the agent's own log call, so it can land an event at a known point of the gate loop.
 $script:LogHook = $null
 $script:LeaseNotAfterMinAdmitSec = 30
+# AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: the slot snapshots' probes in flight, and their bound (the agent assigns 30 s).
+$script:LeaseSlotSnapshots = [System.Collections.Generic.List[object]]::new()
+$script:LeaseSnapshotProbeSec = 30
 function Add-AgentLogLine([string]$Message) { $script:Log.Add($Message); if ($null -ne $script:LogHook) { & $script:LogHook $Message } }
+# r5: the agent compiles the snapshot probe watchdog once at start; so does the test (a base agent has none).
+$script:ProbeWatchdogReady = if (Get-Command Initialize-LeaseProbeWatchdog -ErrorAction SilentlyContinue) { [bool](Initialize-LeaseProbeWatchdog) } else { $false }
 function Write-AgentHeartbeat([string]$Activity = '') { $script:Beats.Add($Activity); if ($null -ne $script:BeatHook) { & $script:BeatHook $Activity } }
 function Get-QueueAgeSeconds { param($Job, $Metadata) return $script:Age }
 function Invoke-ExemptJobsDuringWait { param([string]$WaitingJobId, [double]$WaitedSec) $script:Exempt++; return 0 }
@@ -310,10 +369,12 @@ function Reset-Case([hashtable]$Control, [int]$GraceSec = 120) {
     # sequential request after the first was stopped). Python start-up on a loaded runner counts against that bound, so only the
     # case that EXERCISES the abandon keeps a tight grace; every other case gets a grace no start-up delay can cross.
     $script:LeasePendingGraceSec = $GraceSec
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: a slot-snapshot probe still in flight is killed before calls.jsonl is cleared (it never lands in the next case).
+    if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test reset' }
     if ($null -ne $script:LeaseBatch -and (Get-Command Close-LeaseBatch -ErrorAction SilentlyContinue)) { Close-LeaseBatch -Reason 'test-reset' }
     $script:LeaseBatch = $null; $script:LeaseBatchKeep = $false
     Set-Fake $Control
-    Remove-Item -LiteralPath (Join-Path $fx 'calls.jsonl'), (Join-Path $fx 'quiet-lease.json'), (Join-Path $fx 'last-lease-end.txt') -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $fx 'calls.jsonl'), (Join-Path $fx 'quiet-lease.json'), (Join-Path $fx 'last-lease-end.txt'), (Join-Path $fx 'fake-status.json') -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $fx -Filter 'lease-batch-*.jsonl' -File | Remove-Item -Force
     Get-ChildItem -LiteralPath $fx -Filter 'release-*' -File | Remove-Item -Force
     Get-ChildItem -LiteralPath (Join-Path $fx 'notafter') -File -ErrorAction SilentlyContinue | Remove-Item -Force
@@ -635,7 +696,7 @@ try {
     Reset-Case @{ request = 'hang' }
     $script:TokC = 'cccccccccccc'; $script:CloseQueuedAt = $null
     $script:AgeAfter = (Get-Date).AddSeconds(20)
-    function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return 0 }
+    function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return [int]$script:HtAge }   # HtAge: lease-pending-heat-trace sets a queue age (unset = 0)
     $admC = Wait-QuietLeaseAdmission -JobId "lease-batch-open-20261023T2200Z-lb$script:TokC" -Job ([pscustomobject]@{}) -Metadata $meta
     $reqC = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
     $lateC = @($reqC | Where-Object { $null -ne $script:CloseQueuedAt -and $_.ts -gt $script:CloseQueuedAt })
@@ -744,12 +805,16 @@ try {
         'liveness-absent-unchanged', 'liveness-unparseable-expired', 'liveness-pure', 'liveness-reader', 'liveness-ast-guard', 'liveness-queuedjob',
         'liveness-root-shape', 'liveness-lapse-latched',
         'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'exit-release-pin',
-        'batch-close-before-reuse', 'batch-runner-killed-liveness')
+        'batch-close-before-reuse', 'batch-runner-killed-liveness', 'lease-pending-heat-trace',
+        'lease-heat-trace-async-retry', 'lease-heat-trace-grant-coverage', 'queuedjob-lease-coverage-at-launch', 'lease-heat-trace-nonlocal-feed',
+        'lease-heat-trace-checked-python', 'lease-heat-trace-probe-watchdog',
+        'lease-snapshot-bound-straddle', 'lease-probe-watchdog-add-type-failure', 'lease-probe-watchdog-ctor-failure', 'lease-probe-watchdog-arm-paths',
+        'lease-start-post-start-failure', 'lease-start-post-start-cleanup-throws')
     foreach ($o in $Only) { Assert-True ($notAfterCases -contains $o) "-Only names a known case: '$o' (known: $($notAfterCases -join ', '))" }
     function Test-Case([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Name) }
     # Hang guard: an agent that ignores notAfterUtc would wait these cases out; the queue ceiling then ends them queue-expired
     # (a FAIL on the label assert), never a hang.
-    function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return 0 }
+    function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return [int]$script:HtAge }   # HtAge: lease-pending-heat-trace sets a queue age (unset = 0)
     function Get-FakeFlag { try { return ([IO.File]::ReadAllText((Join-Path $fx 'quiet-lease.json')) | ConvertFrom-Json) } catch { return $null } }
     function New-NotAfterMeta([double]$InSec) { return [pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 600; notAfterUtc = [DateTime]::UtcNow.AddSeconds($InSec).ToString('o') } }
     function Get-RequestArg($Call, [string]$Flag) { $a = @($Call.argv); $i = [Array]::IndexOf($a, $Flag); if ($i -lt 0) { return $null }; return $a[$i + 1] }
@@ -1065,7 +1130,8 @@ function Exit-HeavySlot {
     # what the verdict sees when the clock passes the deadline there.
     $qjCases = @('notafter-queuedjob-pregate', 'notafter-queuedjob-gate', 'notafter-queuedjob-post-admission', 'notafter-prelaunch-marker', 'notafter-prelaunch-confirm', 'notafter-meta-unreadable',
         'queuedjob-cancel-post-admission', 'notafter-meta-sticky', 'liveness-queuedjob', 'liveness-root-shape',
-        'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'batch-close-before-reuse')
+        'queuedjob-queue-expired-post-admission', 'queuedjob-holder-lost-prelaunch', 'batch-close-before-reuse', 'queuedjob-lease-coverage-at-launch',
+        'lease-start-post-start-cleanup-throws')
     if (@($qjCases | Where-Object { Test-Case $_ }).Count -gt 0) {
         # STAGE-JOB-LEASE-EXEMPT-1 r2: Invoke-QueuedJob classifies the job through Get-GateExemptClass, which reads both patterns.
         foreach ($name in @('Invoke-QueuedJob', 'Complete-AdmissionWaitMarker', 'Publish-GateUnlaunchedResult', 'Get-GateExemptClass')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
@@ -1105,6 +1171,7 @@ function Exit-HeavySlot {
         function Start-WindowlessRedirectedProcess {
             param([string]$FilePath, [string[]]$ArgumentList, [string]$OutFile, [string]$ErrFile, [string]$WorkingDirectory)
             $script:QJ.launches.Add("$FilePath $($ArgumentList -join ' ')")
+            if ($script:QJLaunchDelaySec -gt 0) { Start-Sleep -Milliseconds ([int](1000 * [double]$script:QJLaunchDelaySec)) }   # r5: the helper's out/err opens, slow on a share root
             throw 'unit: the child launch was reached'
         }
         function Publish-JobResult { param([string]$JobId, $Result) $script:QJ.published.Add($Result); return (Join-Path $outbox "$JobId.result.json") }
@@ -1258,6 +1325,36 @@ function Exit-HeavySlot {
         $reqs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
         Assert-True ($reqs.Count -eq 1 -and (Wait-Until { -not (Test-PidAlive ([int]$reqs[0].pid)) } 5) -and $null -eq $script:QuietLease -and $null -eq $script:QuietLeaseWaiting -and @(Get-ChildItem -LiteralPath $fx -Filter '*.lease.json' -File).Count -eq 0) "queuedjob-holder-lost-prelaunch: the wrapper is gone, its record removed, no lease kept"
         $results.queuedJobHolderLostPrelaunch = [ordered]@{ releasePhase = $evLr.phase; releaseRc = $evLr.releaseRc; holderLoss = $script:QJ.holderLoss[0] }
+    }
+
+    # ------------------------------------------------------------ queuedjob-lease-coverage-at-launch (AGENT-LEASE-PENDING-HEAT-TRACE-1 r3, Dot B2 / adversary r4 A2)
+    # admission.leaseCoversTimeout must be true AT LAUNCH. Time spent between the grant and the child's creation (here the launching marker's
+    # write, modelled by moving until= to 1790 s from now, for an 1800 s timeout) is counted: the admission reads not covered, with the typed
+    # line and the seconds left. The control run (nothing spent) keeps it covered and records what was left.
+    if (Test-Case 'queuedjob-lease-coverage-at-launch') {
+        $cov = [ordered]@{}
+        # r5 (adversary r5b-cb19d346 A3): 'slow' leaves 1803 s at the marker and the launch call itself takes 5 s (its out/err file opens on a share
+        # root): the child is created with ~1798 s left, so it is NOT covered; a reading taken before the launch call says covered.
+        foreach ($k in @('control', 'short', 'slow')) {
+            $job = Reset-QueuedJobCase @{ request = 'active' } "jQc$k" (New-NotAfterMetaJson 600)
+            $script:QJLaunchDelaySec = 0
+            if ($k -ceq 'short') { $script:QJ.markerHook = { $script:QuietLease.active.until = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 + 1790 } }
+            if ($k -ceq 'slow') { $script:QJ.markerHook = { $script:QuietLease.active.until = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0 + 1803 }; $script:QJLaunchDelaySec = 5 }
+            try { $null = Invoke-QueuedJob -Job $job }
+            finally {
+                $a = $script:Admission
+                $cov[$k] = [pscustomobject]@{ label = $a.label; covers = $a.leaseCoversTimeout; remaining = $a.leaseRemainingAtLaunchSec; launches = $script:QJ.launches.Count
+                    lines = @($script:Log | Where-Object { $_ -like "quiet-lease: lease-shorter-than-timeout job=jQc$k *" }) }
+                Exit-HeavySlot
+            }
+        }
+        Assert-True ($cov.control.launches -eq 1 -and $cov.short.launches -eq 1 -and $cov.control.label -ceq 'clear' -and $cov.short.label -ceq 'clear') "queuedjob-lease-coverage-at-launch: both runs are admitted clear and reach the child launch: $($cov | ConvertTo-Json -Compress -Depth 4)"
+        Assert-True ($cov.short.covers -eq $false -and $null -ne $cov.short.remaining -and $cov.short.remaining -ge 1780 -and $cov.short.remaining -le 1790) "queuedjob-lease-coverage-at-launch: 1790 s left at launch for an 1800 s timeout is NOT reported covered: $($cov.short | ConvertTo-Json -Compress)"
+        Assert-True ($cov.control.covers -eq $true -and $null -ne $cov.control.remaining -and $cov.control.remaining -ge 1800 -and $cov.control.lines.Count -eq 0) "queuedjob-lease-coverage-at-launch: control: covered at launch, the seconds left recorded: $($cov.control | ConvertTo-Json -Compress)"
+        Assert-True ($cov.short.lines.Count -eq 1 -and $cov.short.lines[0] -match ' phase=launch remaining=17[89]\ds timeoutSec=1800;') "queuedjob-lease-coverage-at-launch: one typed lease-shorter-than-timeout line at launch: $($cov.short.lines -join ' | ')"
+        $script:QJLaunchDelaySec = 0
+        Assert-True ($cov.slow.launches -eq 1 -and $cov.slow.covers -eq $false -and $null -ne $cov.slow.remaining -and $cov.slow.remaining -lt 1800 -and $cov.slow.lines.Count -eq 1) "queuedjob-lease-coverage-at-launch A3(r5): a 5 s launch call with 1803 s left for an 1800 s timeout is NOT reported covered (read as the call returns): $($cov.slow | ConvertTo-Json -Compress)"
+        $results.queuedJobLeaseCoverageAtLaunch = [ordered]@{ control = $cov.control.remaining; short = $cov.short.remaining; shortCovers = $cov.short.covers; slow = $cov.slow.remaining; slowCovers = $cov.slow.covers }
     }
 
     # ------------------------------------------------------------ notafter-prelaunch-marker: the deadline passes while the launching marker is written
@@ -2165,6 +2262,1004 @@ function Exit-HeavySlot {
             $script:LogHook = $null
             if (-not $writer.HasExited) { Stop-Process -Id $writer.Id -Force -ErrorAction SilentlyContinue; $null = $writer.WaitForExit(10000) }
             Remove-Item -LiteralPath $sideK -Force -ErrorAction SilentlyContinue
+        }
+    }
+    # AGENT-LEASE-PENDING-HEAT-TRACE-1 r3: the heat-trace cases' status answer (fake-status.json, read by the fake's `status`) and the poll of the
+    # snapshot probes the job monitor loop would make after the grant. Definitions only: each case sets its own answer.
+    function Sync-FakeStatus {
+        $st = $script:StatusStub
+        $o = [ordered]@{ lines = @($st.lines); rc = $(if ($st.ok) { 0 } else { [int]$st.rc }); stderr = $(if ($st.ok) { '' } else { [string]$st.error }); delay = [double]$script:StatusDelaySec; orphan = [bool]$script:StatusOrphan }
+        [IO.File]::WriteAllText((Join-Path $fx 'fake-status.json'), ($o | ConvertTo-Json -Compress -Depth 4))
+    }
+    function Complete-HtSnapshots {
+        # What the job monitor loop does after the grant: poll the snapshot probes until none is in flight (bounded). Then the probes the fake saw.
+        if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { $dl = (Get-Date).AddSeconds(20); while ($script:LeaseSlotSnapshots.Count -gt 0 -and (Get-Date) -lt $dl) { Update-LeaseSlotSnapshots; Start-Sleep -Milliseconds 50 } }
+        $script:StatusCalls = @(Get-Calls | Where-Object { $_.cmd -eq 'status' }).Count
+    }
+    function Invoke-HtWait([string]$JobId, $Metadata) {
+        $script:StatusCalls = 0
+        Sync-FakeStatus
+        $a = Wait-QuietLeaseAdmission -JobId $JobId -Job ([pscustomobject]@{}) -Metadata $Metadata
+        Complete-HtSnapshots
+        return $a
+    }
+    # ------------------------------------------------------------ lease-pending-heat-trace (AGENT-LEASE-PENDING-HEAT-TRACE-1 r1)
+    # Logging only. Three long quiet-lease waits on Bachelor (541 s, 672 s, 832 s) could not be attributed afterwards: the waiting
+    # line carried neither the heat reading nor who held the heavy slots. Every waiting line now carries the gate's heat fields
+    # (throttled/window, window mean C, feed age, or heat=unknown(<reason>)), and ONE bounded slot snapshot is logged at request
+    # and one at grant. Nothing it logs may throw, delay the grant past the status probe's own bound, or change a return value.
+    if (Test-Case 'lease-pending-heat-trace') {
+        $GateSustainedRows = [int]$paramDefaults['GateSustainedRows']; $GateMaxThrottledRows = [int]$paramDefaults['GateMaxThrottledRows']; $GateMeanMaxC = [double]$paramDefaults['GateMeanMaxC']
+        $script:QuietLeaseWaitLogSec = 1      # the agent logs a waiting line every 60 s; 1 s here so a short wait carries several
+        $script:FeedReads = 0; $script:StatusCalls = 0; $script:FeedStub = $null; $script:StatusStub = $null; $script:StatusThrows = $false; $script:FeedThrows = $false
+        $hotMetrics = [pscustomobject]@{ rows = 150; window = 60; throttled = 6; meanC = 88.2; max15C = 97; watts30 = 41.5 }
+        function Read-HeavySlotFeedMetrics { $script:FeedReads++; if ($script:FeedThrows -and $null -eq $script:QuietLease) { throw 'feed boom' }; return $script:FeedStub }   # throws only while waiting: the real reader never throws, and the grant's own read is not under test
+        $script:StatusDelaySec = 0
+        # r3: the probe is the REAL one -- the agent's own (asynchronous) status call, or a base agent's Invoke-HeavySlotStatus, lifted -- answered by the
+        # fake heavy-slot.py's `status` from fake-status.json: $script:StatusStub (ok/lines, or rc + error as its stderr) after $script:StatusDelaySec.
+        . ([scriptblock]::Create((Get-FunctionBody 'Invoke-HeavySlotStatus')))
+        $script:StartCliReal = ${function:Start-HeavySlotCli}
+        function Start-HeavySlotCli { param([string[]]$Arguments, [string]$Python = '', [string]$Script = '') if ($script:StatusThrows -and $Arguments[0] -ceq 'status') { throw 'status boom' }; return (& $script:StartCliReal @PSBoundParameters) }   # r5: the checked -Python/-Script pass through
+        $since = (Get-Date).AddSeconds(-300).ToString('yyyy-MM-dd HH:mm:ss')
+        $slotsOk = @{ ok = $true; error = $null; lines = @("slot 1: suite X (pid 77, since $since) [exclusive]", 'slot 2: free', 'thermal: max 99 C, throttled 6/15, 40 W over ~30 s', "queue 1: mlv j9 (pid 78, since $since)") }
+        function Invoke-HeatTraceCase([string]$JobId, [hashtable]$Control) {
+            Reset-Case $Control
+            $script:AgeAfter = (Get-Date).AddSeconds(60)
+            $script:FeedReads = 0; $script:StatusCalls = 0
+            $adm = Invoke-HtWait $JobId $meta
+            $script:Admission = $adm
+            return [pscustomobject]@{
+                adm = $adm; waits = @($script:Log | Where-Object { $_ -like "quiet-lease: waiting job=$JobId *" })
+                snaps = @($script:Log | Where-Object { $_ -like "quiet-lease: slots-snapshot job=$JobId *" })
+                active = @($script:Log | Where-Object { $_ -like "quiet-lease: active job=$JobId *" })
+            }
+        }
+        try {
+            # (a) a feed AT the pass line (throttled 6/60, mean 88.2 C): every waiting line carries the numbers the gate uses.
+            $script:FeedStub = @{ metrics = $hotMetrics; why = $null; ageSec = 12 }
+            $script:StatusStub = $slotsOk
+            $r = Invoke-HeatTraceCase 'jHt' @{ request = 'active'; active_after = 3.5 }
+            Assert-True ($r.adm.label -eq 'clear' -and $r.adm.mode -eq 'lease' -and $null -ne $script:QuietLease -and $r.active.Count -eq 1) "heat-trace: the job is still admitted clear in lease mode: $($r.adm.label)"
+            Assert-True ($r.waits.Count -ge 1) "heat-trace: the wait logged a waiting line: $($r.waits.Count)"
+            $bad = @($r.waits | Where-Object { $_ -notmatch ' heat=hot throttled=6/60 meanC=88\.2 feedAge=12s( |$)' })
+            Assert-True ($bad.Count -eq 0) "heat-trace: EVERY waiting line carries heat=<state> throttled=<n>/<window> meanC=<C> feedAge=<s>; without it: $($bad -join ' || ')"
+            Assert-True ($r.waits.Count -ge 2) "heat-trace: a 3.5 s wait at a 1 s cadence logs at least two waiting lines: $($r.waits.Count)"
+            Assert-True ($r.waits[0] -match '^quiet-lease: waiting job=jHt state=lease-pending why=\[.*\] waited=\d+s requests=1 requeues=0 leasePid=\d+') "heat-trace: the existing waiting-line fields are unchanged: $($r.waits[0])"
+            Assert-True ($script:FeedReads -eq $r.waits.Count + 1) "heat-trace: ONE feed read per waiting line, plus the grant's own (no extra read): reads=$($script:FeedReads) lines=$($r.waits.Count)"
+            Exit-HeavySlot
+            # the snapshots: exactly one at request, one at grant, each naming the holder slot, its owner and its age.
+            Assert-True ($script:StatusCalls -eq 2) "heat-trace: exactly two status probes (request, grant): $($script:StatusCalls)"
+            $sReq = @($r.snaps | Where-Object { $_ -match ' phase=request ' }); $sGrant = @($r.snaps | Where-Object { $_ -match ' phase=grant ' })
+            Assert-True ($r.snaps.Count -eq 2 -and $sReq.Count -eq 1 -and $sGrant.Count -eq 1) "heat-trace: exactly one slots-snapshot line at request and one at grant: $($r.snaps -join ' || ')"
+            foreach ($s in @($sReq[0], $sGrant[0])) {
+                Assert-True ($s -match 'slot 1: suite X pid=77 age=(29[5-9]|3[0-2]\d)s' -and $s -match 'slot 2: free') "heat-trace: the snapshot names each slot, the holder, its pid and its age (~300 s): $s"
+            }
+            # r5 (adversary r4-e98a2780 A3): order-independent. The request probe's LOG line lands whenever the loop next polls it, which on a loaded
+            # host can be after the activation; what is asserted is that its probe RAN while the request was pending (the fake's status call is
+            # stamped before the request's 3.5 s activation), and that the grant snapshot follows the grant line.
+            $iReq = $script:Log.IndexOf($sReq[0]); $iAct = $script:Log.IndexOf($r.active[0]); $iGrant = $script:Log.IndexOf($sGrant[0])
+            $stTs = @(Get-Calls | Where-Object { $_.cmd -eq 'status' } | ForEach-Object { [double]$_.ts } | Sort-Object)
+            $rqTs = @(Get-Calls | Where-Object { $_.cmd -eq 'request' } | ForEach-Object { [double]$_.ts })
+            Assert-True ($iReq -ge 0 -and $iAct -ge 0 -and $iAct -lt $iGrant -and $stTs.Count -eq 2 -and $rqTs.Count -eq 1 -and $stTs[0] -lt $rqTs[0] + 3.5) "heat-trace: the request probe ran while the request was pending (status at +$(if ($stTs.Count -ge 1 -and $rqTs.Count -ge 1) { [Math]::Round($stTs[0] - $rqTs[0], 2) }) s of a 3.5 s activation) and the grant snapshot follows the grant line"
+
+            # (b) feed unknown: stale, then a read that THROWS -- an explicit heat=unknown(<reason>), never a silent omission, never a throw.
+            $script:FeedStub = @{ metrics = $null; why = 'feed stale (400 s > 120 s)'; ageSec = 400 }
+            $r2 = Invoke-HeatTraceCase 'jHu' @{ request = 'active'; active_after = 2.5 }
+            Assert-True ($r2.adm.label -eq 'clear' -and $r2.waits.Count -ge 1) "heat-trace: a stale feed still admits and logs: $($r2.adm.label)"
+            Assert-True (@($r2.waits | Where-Object { $_ -notmatch ' heat=unknown\(feed stale \(400 s > 120 s\)\) feedAge=400s( |$)' }).Count -eq 0) "heat-trace: a stale feed is heat=unknown(<reason>) feedAge=<s> on every waiting line: $($r2.waits -join ' || ')"
+            Exit-HeavySlot
+            $script:FeedStub = @{ metrics = $null; why = 'feed missing (x)' }
+            $r3 = Invoke-HeatTraceCase 'jHm' @{ request = 'active'; active_after = 2.5 }
+            Assert-True (@($r3.waits | Where-Object { $_ -notmatch ' heat=unknown\(feed missing \(x\)\) feedAge=unknown( |$)' }).Count -eq 0 -and $r3.waits.Count -ge 1) "heat-trace: a missing feed is heat=unknown(<reason>) feedAge=unknown: $($r3.waits -join ' || ')"
+            Exit-HeavySlot
+            $script:FeedThrows = $true
+            $r4 = Invoke-HeatTraceCase 'jHx' @{ request = 'active'; active_after = 2.5 }
+            $script:FeedThrows = $false
+            Assert-True ($r4.adm.label -eq 'clear' -and $r4.waits.Count -ge 1 -and @($r4.waits | Where-Object { $_ -notmatch ' heat=unknown\(.*feed boom.*\)( |$)' }).Count -eq 0) "heat-trace: a feed read that throws is logged as heat=unknown(...) and the wait goes on: $($r4.adm.label) $($r4.waits -join ' || ')"
+            Exit-HeavySlot
+
+            # (c) the status probe times out / fails / throws: slots=unknown(...) on both snapshots, the job is still admitted and the lease is the same.
+            $script:FeedStub = @{ metrics = $hotMetrics; why = $null; ageSec = 12 }
+            # r3: the bound is the agent's LeaseSnapshotProbeSec (30 s), 1 s here; the fake answers after 4 s, so both probes are killed at the bound.
+            $script:StatusStub = $slotsOk; $script:StatusDelaySec = 4; $script:LeaseSnapshotProbeSec = 1
+            $r5 = Invoke-HeatTraceCase 'jHt5' @{ request = 'active'; active_after = 1.5 }
+            $script:StatusDelaySec = 0; $script:LeaseSnapshotProbeSec = 30
+            Assert-True ($r5.adm.label -eq 'clear' -and $r5.snaps.Count -eq 2 -and @($r5.snaps | Where-Object { $_ -notmatch ' slots=unknown\(timeout 1 s; killed at \d+\.\d s\)$' }).Count -eq 0) "heat-trace: a timed-out probe is slots=unknown(timeout <bound> s; killed at <age> s) at request and at grant, and the job is admitted: $($r5.adm.label) $($r5.snaps -join ' || ')"
+            Assert-True ($script:StatusCalls -eq 2) "heat-trace: both timed-out probes really ran: $($script:StatusCalls)"
+            Exit-HeavySlot
+            $script:StatusStub = @{ ok = $false; rc = 3; error = 'status boom'; lines = @() }
+            $r5b = Invoke-HeatTraceCase 'jHt5b' @{ request = 'active'; active_after = 1.5 }
+            Assert-True ($r5b.adm.label -eq 'clear' -and $r5b.snaps.Count -eq 2 -and @($r5b.snaps | Where-Object { $_ -notmatch ' slots=unknown\(status exit 3: status boom\)$' }).Count -eq 0) "heat-trace: a probe that exits non-zero is slots=unknown(status exit <rc>: <stderr>): $($r5b.adm.label) $($r5b.snaps -join ' || ')"
+            Exit-HeavySlot
+            $script:StatusStub = $slotsOk
+            $script:StatusThrows = $true
+            $r6 = Invoke-HeatTraceCase 'jHt6' @{ request = 'active'; active_after = 1.5 }
+            $script:StatusThrows = $false
+            Assert-True ($r6.adm.label -eq 'clear' -and $r6.snaps.Count -eq 2 -and @($r6.snaps | Where-Object { $_ -notmatch ' slots=unknown\(.*status boom.*\)$' }).Count -eq 0) "heat-trace: a probe that throws is slots=unknown(...) and never stops the grant: $($r6.adm.label) $($r6.snaps -join ' || ')"
+            Exit-HeavySlot
+
+            # (d) a refused request that is asked again still snapshots ONCE at request (one per job, not one per ask).
+            $script:StatusStub = $slotsOk
+            $r7 = Invoke-HeatTraceCase 'jHt7' @{ request = 'refuse_then_active'; refuse_count = 1 }
+            Assert-True ($r7.adm.label -eq 'clear' -and @(Get-Calls | Where-Object { $_.cmd -eq 'request' }).Count -eq 2) "heat-trace: the refused request was asked again and then admitted: $($r7.adm.label)"
+            Assert-True (@($r7.snaps | Where-Object { $_ -match ' phase=request ' }).Count -eq 1 -and @($r7.snaps | Where-Object { $_ -match ' phase=grant ' }).Count -eq 1 -and $script:StatusCalls -eq 2) "heat-trace: one request snapshot and one grant snapshot across a refuse-then-active job: $($r7.snaps -join ' || ') calls=$($script:StatusCalls)"
+            Exit-HeavySlot
+            # (e) adversary r1 A1: heavy-slot.py may add fields after the timestamp (", held 5 min"): the age is still read.
+            $since = (Get-Date).AddSeconds(-300).ToString('yyyy-MM-dd HH:mm:ss')   # r3: re-stamped, as the cases above now run real probes and take longer than the age window
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @("slot 1: suite X (pid 77, since $since, held 5 min) [exclusive]", 'slot 2: free') }
+            $r8 = Invoke-HeatTraceCase 'jHt8' @{ request = 'active'; active_after = 1.5 }
+            Assert-True (@($r8.snaps | Where-Object { $_ -notmatch 'slot 1: suite X pid=77 age=(29[5-9]|3[0-2]\d)s' }).Count -eq 0 -and $r8.snaps.Count -eq 2) "heat-trace A1: a status line with a field after 'since <ts>' still yields the age: $($r8.snaps -join ' || ')"
+            Exit-HeavySlot
+            $script:StatusStub = $slotsOk
+
+            # (f) adversary r1 A2: a probe (up to 30 s) is never made when a deadline, the queue ceiling or the lease end is within 70 s -- it
+            # would turn an admission into expired-not-after / queue-expired. The skip is logged, the admission is unchanged.
+            $r9 = $null
+            Reset-Case @{ request = 'active'; active_after = 1.0 }
+            $script:AgeAfter = (Get-Date).AddSeconds(60); $script:StatusCalls = 0
+            $adm9 = Invoke-HtWait 'jHt9' (New-NotAfterMeta 50)
+            $script:Admission = $adm9
+            $sk9 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHt9 *' })
+            Assert-True ($adm9.label -eq 'clear' -and $script:StatusCalls -eq 0 -and $sk9.Count -eq 2 -and @($sk9 | Where-Object { $_ -notmatch ' slots=skipped\(' }).Count -eq 0) "heat-trace A2: 50 s before notAfterUtc, no probe is made (calls=$($script:StatusCalls)) and the admission stays clear: $($adm9.label) $($sk9 -join ' || ')"
+            Exit-HeavySlot
+            Reset-Case @{ request = 'active'; active_after = 1.0 }
+            $script:AgeAfter = (Get-Date).AddSeconds(60); $script:StatusCalls = 0
+            $adm10 = Invoke-HtWait 'jHt10' ([pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 60 })
+            $script:Admission = $adm10
+            $sk10 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHt10 phase=request *' })
+            Assert-True ($adm10.label -eq 'clear' -and $sk10.Count -eq 1 -and $sk10[0] -match ' slots=skipped\(') "heat-trace A2: a queue ceiling within 70 s skips the request probe: $($adm10.label) $($sk10 -join ' || ')"
+            Exit-HeavySlot
+            $script:LeaseSnapshotSkipBelowSec = 7200       # the 31 min lease (1860 s) is then within the skip window at grant
+            Reset-Case @{ request = 'active'; active_after = 1.0 }
+            $script:AgeAfter = (Get-Date).AddSeconds(60); $script:StatusCalls = 0
+            $adm11 = Invoke-HtWait 'jHt11' $meta
+            $script:Admission = $adm11
+            $script:LeaseSnapshotSkipBelowSec = 70
+            $sk11 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHt11 phase=grant *' })
+            Assert-True ($adm11.label -eq 'clear' -and $script:StatusCalls -eq 0 -and $sk11.Count -eq 1 -and $sk11[0] -match ' slots=skipped\(') "heat-trace A2: a lease end within the skip window skips the grant probe: calls=$($script:StatusCalls) $($sk11 -join ' || ')"
+            Exit-HeavySlot
+            $pureHead = Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'none'; remainingSec = $null; livenessState = 'absent'; livenessUntilUtc = $null })
+            Assert-True ([double]::IsPositiveInfinity($pureHead) -and (Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 12.5 })) -eq 12.5 -and (Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'none'; livenessState = 'live'; livenessUntilUtc = [DateTime]::UtcNow.AddSeconds(8).ToString('o') })) -lt 9 -and (Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'none'; livenessState = 'live'; livenessUntilUtc = 'not a date' })) -eq 0) "heat-trace A2: headroom is the least of the open notAfter, the live sidecar bound and the lease; an unreadable bound is no headroom"
+
+            # (g) adversary r1 A3: a feed stamped far in the future (age negative, huge) keeps its readable heat; and a status age that overflows Int32 is per-slot, not a whole-snapshot failure.
+            $script:FeedStub = @{ metrics = $hotMetrics; why = $null; ageSec = -2309511600.0 }
+            $r12 = Invoke-HeatTraceCase 'jHt12' @{ request = 'active'; active_after = 1.5 }
+            Assert-True ($r12.waits.Count -ge 1 -and @($r12.waits | Where-Object { $_ -notmatch ' heat=hot throttled=6/60 meanC=88\.2 feedAge=unknown( |$)' }).Count -eq 0) "heat-trace A3: a far-future feed stamp keeps the readable heat and reports feedAge=unknown: $($r12.waits -join ' || ')"
+            Exit-HeavySlot
+            $script:FeedStub = @{ metrics = $hotMetrics; why = $null; ageSec = 12 }
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: suite X (pid 77, since 0100-01-02 00:00:00) [exclusive]', 'slot 2: free') }
+            $r13 = Invoke-HeatTraceCase 'jHt13' @{ request = 'active'; active_after = 1.5 }
+            Assert-True ($r13.snaps.Count -eq 2 -and @($r13.snaps | Where-Object { $_ -notmatch 'slot 1: suite X pid=77 age=\d{10,}s; slot 2: free' }).Count -eq 0) "heat-trace A3: a status age beyond Int32 is logged, not a whole-snapshot failure: $($r13.snaps -join ' || ')"
+            Exit-HeavySlot
+            $script:StatusStub = $slotsOk
+
+            # (h) adversary r2 A1: the GRANT probe also respects the queue ceiling (a job 570 s into a 600 s ceiling would be queue-expired by the probe's 30 s).
+            $script:HtAge = 570
+            Reset-Case @{ request = 'active'; active_after = 1.0 }
+            $script:AgeAfter = (Get-Date).AddSeconds(60); $script:StatusCalls = 0
+            $adm14 = Invoke-HtWait 'jHt14' $meta
+            $script:HtAge = 0
+            $script:Admission = $adm14
+            $sk14 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHt14 *' })
+            Assert-True ($adm14.label -eq 'clear' -and $script:StatusCalls -eq 0 -and $sk14.Count -eq 2 -and @($sk14 | Where-Object { $_ -notmatch ' slots=skipped\(' }).Count -eq 0) "heat-trace A1(r2): 30 s of queue headroom skips BOTH probes (request and grant): calls=$($script:StatusCalls) $($sk14 -join ' || ')"
+            Exit-HeavySlot
+
+            # (i) adversary r2 A2: the age is counted across a DST change (TimeZoneInfo, not local DateTime subtraction); an ambiguous or non-existent local time is unknown.
+            $cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+            $spring = Get-LeaseSlotAgeText -Since '2026-03-08 01:55:00' -NowUtc ([DateTime]::new(2026, 3, 8, 8, 5, 0, [DateTimeKind]::Utc)) -Zone $cst
+            $fall = Get-LeaseSlotAgeText -Since '2026-11-01 01:45:00' -NowUtc ([DateTime]::new(2026, 11, 1, 7, 15, 0, [DateTimeKind]::Utc)) -Zone $cst
+            $gap = Get-LeaseSlotAgeText -Since '2026-03-08 02:30:00' -NowUtc ([DateTime]::new(2026, 3, 8, 9, 0, 0, [DateTimeKind]::Utc)) -Zone $cst
+            $plain = Get-LeaseSlotAgeText -Since '2026-10-25 10:00:00' -NowUtc ([DateTime]::new(2026, 10, 25, 16, 5, 0, [DateTimeKind]::Utc)) -Zone $cst
+            $future = Get-LeaseSlotAgeText -Since '2026-10-25 12:00:00' -NowUtc ([DateTime]::new(2026, 10, 25, 16, 5, 0, [DateTimeKind]::Utc)) -Zone $cst
+            Assert-True ($spring -ceq '600s' -and $fall -ceq 'unknown' -and $gap -ceq 'unknown' -and $plain -ceq '3900s' -and $future -ceq 'unknown' -and (Get-LeaseSlotAgeText -Since 'x') -ceq 'unknown') "heat-trace A2(r2): spring-forward 01:55 CST -> 03:05 CDT is 600 s (not 4200), the ambiguous/non-existent hours are unknown, a plain age is exact: spring=$spring fall=$fall gap=$gap plain=$plain future=$future"
+            # (j) adversary r3 A2: an owner label may contain '(pid N)' (job id 'suite (pid 12)' -> label 'mlv suite (pid 12)'): the metadata group is the LAST one before [mode].
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @("slot 1: mlv suite (pid 12) (pid 77, since $since, held 5 min) [exclusive]", 'slot 2: free') }
+            $r15 = Invoke-HeatTraceCase 'jHt15' @{ request = 'active'; active_after = 1.5 }
+            Assert-True ($r15.snaps.Count -eq 2 -and @($r15.snaps | Where-Object { $_ -notmatch 'slot 1: mlv suite \(pid 12\) pid=77 age=(29\d|3\d\d)s; slot 2: free' }).Count -eq 0) "heat-trace A2(r3): a label containing '(pid 12)' is named whole with the real owner pid 77 and its age: $($r15.snaps -join ' || ')"
+            Exit-HeavySlot
+            $script:StatusStub = $slotsOk
+
+            # (k) adversary r3 A1: the request-time probe must not consume admission time. A refusal that lands while a slow probe runs is asked again
+            # LeaseRetrySec after the refusal (as without the probe), not after the probe: otherwise the job crosses its queue ceiling and is queue-expired.
+            # Scaled: retry 5 s, ceiling 9 s, probe 5 s; the fake refuses the first request at once. Without the probe the second request is made at ~5 s.
+            $savedRetry = $LeaseRetrySec; $LeaseRetrySec = 5
+            $script:LeaseSnapshotSkipBelowSec = 1
+            $script:HtT0 = Get-Date
+            function Get-QueueAgeSeconds { param($Job, $Metadata) return [int]((Get-Date) - $script:HtT0).TotalSeconds }
+            try {
+                $metaQ = [pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 9 }
+                $out = @{}
+                foreach ($delay in @(0, 5)) {
+                    $script:StatusDelaySec = $delay
+                    Reset-Case @{ request = 'refuse_then_active'; refuse_count = 1 }
+                    $script:AgeAfter = (Get-Date).AddSeconds(120); $script:StatusCalls = 0; $script:HtT0 = Get-Date
+                    $admK = Invoke-HtWait "jHtK$delay" $metaQ
+                    $script:Admission = $admK
+                    $out[$delay] = [pscustomobject]@{ label = $admK.label; requests = $admK.leaseRequests; calls = $script:StatusCalls }
+                    if ($null -ne $script:QuietLease) { Exit-HeavySlot }
+                }
+                Assert-True ($out[0].label -eq 'clear' -and $out[0].requests -eq 2) "heat-trace A1(r3) baseline: with an instant probe the refused job is asked again and admitted: $($out[0] | ConvertTo-Json -Compress)"
+                Assert-True ($out[5].calls -ge 1) "heat-trace A1(r3): the slow probe really ran (calls=$($out[5].calls))"
+                Assert-True ($out[5].label -eq $out[0].label -and $out[5].requests -eq $out[0].requests) "heat-trace A1(r3): a 5 s probe changes neither the admission outcome nor the number of requests: instant=$($out[0] | ConvertTo-Json -Compress) slow=$($out[5] | ConvertTo-Json -Compress)"
+            }
+            finally {
+                $LeaseRetrySec = $savedRetry; $script:LeaseSnapshotSkipBelowSec = 70; $script:StatusDelaySec = 0
+                function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return [int]$script:HtAge }
+            }
+            $results.leasePendingHeatTrace = [ordered]@{ waitLines = $r.waits.Count; sample = $r.waits[0]; requestSnapshot = $sReq[0]; grantSnapshot = $sGrant[0]; staleSample = $r2.waits[0]; timeoutSample = $r5.snaps[0] }
+        }
+        finally {
+            $script:FeedThrows = $false; $script:StatusThrows = $false; $script:StatusDelaySec = 0; $script:LeaseSnapshotProbeSec = 30
+            if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test case end' }
+            Set-Item -LiteralPath Function:\Start-HeavySlotCli -Value $script:StartCliReal
+            Remove-Item -LiteralPath Function:\Invoke-HeavySlotStatus -ErrorAction SilentlyContinue
+            function Read-HeavySlotFeedMetrics { return @{ metrics = $null; why = 'feed missing (unit)' } }
+        }
+    }
+    # ------------------------------------------------------------ lease-heat-trace-async-retry (AGENT-LEASE-PENDING-HEAT-TRACE-1 r3, Dot B1 / adversary r4 A1)
+    # The request-time snapshot probe must not hold the wait loop. A refusal that lands while a slow probe runs is asked again on the base
+    # schedule, so a second request that needs time to turn active is still admitted before the queue ceiling. Scaled from the adversary's
+    # input (LeaseRetrySec 1, ceiling 75 s, probe 30 s, activation 50 s): retry 1 s, ceiling 16 s, probe 12 s, activation 7 s. A probe that
+    # holds the loop asks again only at ~12 s and turns active at ~19 s (queue-expired); one that does not asks at ~1-2 s and is active at ~9 s.
+    # r5: widened from ceiling 12 s / probe 6 s, which left ~3 s for python start-up and failed on a host at 100% CPU (the e98a2780 agent too).
+    if (Test-Case 'lease-heat-trace-async-retry') {
+        . ([scriptblock]::Create((Get-FunctionBody 'Invoke-HeavySlotStatus')))   # a base agent's synchronous probe runs for real, so its RED is the real one
+        $savedRetry = $LeaseRetrySec; $LeaseRetrySec = 1
+        $script:LeaseSnapshotSkipBelowSec = 1   # the 12 s ceiling is inside the default 70 s skip window; the probe must run
+        $script:HtT0 = Get-Date
+        function Get-QueueAgeSeconds { param($Job, $Metadata) return [int]((Get-Date) - $script:HtT0).TotalSeconds }
+        try {
+            Reset-Case @{ request = 'refuse_then_active'; refuse_count = 1; active_after = 7 }
+            $sinceA = (Get-Date).AddSeconds(-300).ToString('yyyy-MM-dd HH:mm:ss')
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @("slot 1: suite X (pid 77, since $sinceA) [exclusive]", 'slot 2: free') }; $script:StatusDelaySec = 12
+            $script:AgeAfter = (Get-Date).AddSeconds(120); $script:HtT0 = Get-Date
+            $admA = Invoke-HtWait 'jHtA' ([pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 16 })
+            $script:Admission = $admA
+            $reqsA = @(Get-Calls | Where-Object { $_.cmd -eq 'request' })
+            $gapA = if ($reqsA.Count -ge 2) { [double]$reqsA[1].ts - [double]$reqsA[0].ts } else { -1.0 }
+            $snapA = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtA phase=request *' })
+            Assert-True ($script:StatusCalls -ge 1) "heat-trace B1: the slow request probe really ran (status calls=$($script:StatusCalls))"
+            Assert-True ($reqsA.Count -eq 2 -and $gapA -ge 0 -and $gapA -le ($LeaseRetrySec + 5)) "heat-trace B1: the refused request is asked again on the base schedule (within LeaseRetrySec + 5 s), not after the 12 s probe: requests=$($reqsA.Count) gap=$([Math]::Round($gapA, 2)) s"
+            Assert-True ($admA.label -ceq 'clear') "heat-trace B1: admitted before the 16 s queue ceiling, not expired by the probe: label=$($admA.label) why=$($admA.why)"
+            Assert-True ($snapA.Count -eq 1 -and $snapA[0] -match 'slot 1: suite X pid=77 age=\d+s; slot 2: free') "heat-trace B1: the request snapshot is still logged, from the loop's poll: $($snapA -join ' || ')"
+            if ($null -ne $script:QuietLease) { Exit-HeavySlot }
+            # adversary r3-a96d3fe5 A1: the probe's bound is checked FIRST (a probe first OBSERVED after it is classified a timeout, not a success), and a
+            # caller about to sleep past the bound (HorizonSec, the inbox loop's poll) has a still-running probe stopped now. Bound 1 s here.
+            # r4 (Dot): this is LATE-OBSERVATION classification. The fake answers at once; what is delayed past the bound is the poll that observes the
+            # exited probe, not the probe's completion. A probe that really completes late is the timeout cases above (StatusDelaySec 4, bound 1 s).
+            $script:LeaseSnapshotProbeSec = 1; $script:StatusDelaySec = 0; Sync-FakeStatus
+            $cLate = Start-HeavySlotCli -Arguments @('status', '--slots', '2')
+            $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = 'jHtL'; phase = 'grant'; call = $cLate; clock = [System.Diagnostics.Stopwatch]::StartNew() })
+            $null = $cLate.proc.WaitForExit(10000); Start-Sleep -Milliseconds 1100   # it has exited (rc 0, slot lines); the first poll to observe it comes after its 1 s bound
+            Update-LeaseSlotSnapshots
+            $lateL = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtL *' })
+            Assert-True ($lateL.Count -eq 1 -and $lateL[0] -match ' slots=unknown\(timeout 1 s; seen at (1\.[1-9]|[2-9]\.\d|\d{2,}\.\d) s\)$') "heat-trace A1(r3): a probe first observed only after its bound (late observation) is classified a timeout, never a success, with the age it was seen at (r5): $($lateL -join ' || ')"
+            $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 8; Sync-FakeStatus
+            Add-LeaseSlotSnapshot -JobId 'jHtH' -Phase 'grant'
+            Start-Sleep -Milliseconds 300
+            $pidH = $script:LeaseSlotSnapshots[$script:LeaseSlotSnapshots.Count - 1].call.proc.Id
+            Update-LeaseSlotSnapshots -HorizonSec 60
+            $horL = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtH *' })
+            Assert-True ($script:LeaseSlotSnapshots.Count -eq 0 -and $horL.Count -eq 1 -and $horL[0] -match " slots=unknown\(stopped at \d+ s: the agent's next poll is past the 30 s bound\)$" -and (Wait-Until { -not (Test-PidAlive $pidH) } 5)) "heat-trace A1(r3): a running probe whose bound falls inside the next 60 s sleep is stopped now, not left running: $($horL -join ' || ')"
+            $results.leaseHeatTraceAsyncRetry = [ordered]@{ label = $admA.label; requests = $reqsA.Count; retryGapSec = [Math]::Round($gapA, 2); waitedSec = $admA.waitedSec; requestSnapshot = $snapA[0]; lateProbe = $lateL[0]; horizon = $horL[0] }
+        }
+        finally {
+            $LeaseRetrySec = $savedRetry; $script:LeaseSnapshotSkipBelowSec = 70; $script:StatusDelaySec = 0; $script:LeaseSnapshotProbeSec = 30
+            if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test case end' }
+            function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return [int]$script:HtAge }
+            Remove-Item -LiteralPath Function:\Invoke-HeavySlotStatus -ErrorAction SilentlyContinue
+        }
+    }
+    # ------------------------------------------------------------ lease-heat-trace-grant-coverage (AGENT-LEASE-PENDING-HEAT-TRACE-1 r3, Dot B2 / adversary r4 A2)
+    # A lease the wait reports as covering the job timeout must still cover it when the wait hands it over: no probe may eat its time first.
+    # The fake grants the 31 min lease 58 s short (1802 s left at activation, for an 1800 s timeout); each status probe takes 3 s. A wait that
+    # runs the request and grant probes synchronously hands it over with ~1796 s left while reporting leaseCoversTimeout=true.
+    if (Test-Case 'lease-heat-trace-grant-coverage') {
+        . ([scriptblock]::Create((Get-FunctionBody 'Invoke-HeavySlotStatus')))
+        try {
+            Reset-Case @{ request = 'active'; active_after = 0.3; until_offset_s = -58 }
+            $sinceG = (Get-Date).AddSeconds(-300).ToString('yyyy-MM-dd HH:mm:ss')
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @("slot 1: suite X (pid 77, since $sinceG) [exclusive]", 'slot 2: free') }; $script:StatusDelaySec = 3
+            $script:AgeAfter = (Get-Date).AddSeconds(120)
+            Sync-FakeStatus
+            $admG = Wait-QuietLeaseAdmission -JobId 'jHtG' -Job ([pscustomobject]@{}) -Metadata $meta
+            $remG = [double]$admG.leaseUntil - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0   # read the moment the wait returns
+            $script:Admission = $admG
+            Complete-HtSnapshots
+            $snapG = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtG *' })
+            Assert-True ($admG.label -ceq 'clear' -and $admG.leaseMinutes -eq 31) "heat-trace B2: the job is admitted on its 31 min lease: $($admG.label) minutes=$($admG.leaseMinutes)"
+            Assert-True ($script:StatusCalls -eq 2 -and $snapG.Count -eq 2) "heat-trace B2: both probes ran and were logged: calls=$($script:StatusCalls) $($snapG -join ' || ')"
+            Assert-True ((-not $admG.leaseCoversTimeout) -or $remG -ge 1800) "heat-trace B2: a lease reported as covering the 1800 s timeout has at least 1800 s left when the wait hands it over: covers=$($admG.leaseCoversTimeout) remaining=$([Math]::Round($remG, 1)) s"
+            $results.leaseHeatTraceGrantCoverage = [ordered]@{ covers = $admG.leaseCoversTimeout; remainingAtReturnSec = [Math]::Round($remG, 1); waitedSec = $admG.waitedSec }
+            Exit-HeavySlot
+        }
+        finally {
+            $script:StatusDelaySec = 0
+            if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test case end' }
+            Remove-Item -LiteralPath Function:\Invoke-HeavySlotStatus -ErrorAction SilentlyContinue
+        }
+    }
+    # ------------------------------------------------------------ lease-heat-trace-nonlocal-feed (AGENT-LEASE-PENDING-HEAT-TRACE-1 r4, Dot B4 / r3 adversary A2)
+    # The waiting line's heat read must never hold the wait loop. Read-HeavySlotFeedMetrics is a synchronous stat/open/read with no timeout, and the
+    # first pending iteration reads (lastLog starts at MinValue). Scaled from Dot's shape (a UNC feed stalled 30 s, ceiling 20 s, active at 5 s): the
+    # stubbed read stalls 8 s while waiting, the ceiling is 6 s, the request turns active at 2 s. A loop that reads a UNC feed is queue-expired at ~8 s;
+    # one that skips it (heat=skipped reason=non-local-feed) is admitted on the baseline schedule (a local feed, whose read does not stall).
+    if (Test-Case 'lease-heat-trace-nonlocal-feed') {
+        $savedFeed = $HeavySlotFeed
+        $script:LeaseSnapshotSkipBelowSec = 70   # the 6 s ceiling is inside it: neither snapshot probe runs, so only the heat read is under test
+        $script:HtT0 = Get-Date
+        function Get-QueueAgeSeconds { param($Job, $Metadata) return [int]((Get-Date) - $script:HtT0).TotalSeconds }
+        $script:FeedReads = 0; $script:FeedStallSec = 0
+        function Read-HeavySlotFeedMetrics { $script:FeedReads++; if ($null -eq $script:QuietLease -and $script:FeedStallSec -gt 0) { Start-Sleep -Seconds $script:FeedStallSec }; return @{ metrics = $null; why = 'feed missing (stub)'; ageSec = $null } }   # stalls only while waiting: the grant's own read is not under test
+        $jn = Join-Path $fx 'heat-jn'
+        try {
+            $metaN = [pscustomobject]@{ timeoutSec = 1800; maxQueueAgeSec = 6 }
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: free', 'slot 2: free') }; $script:StatusDelaySec = 0
+            $outN = [ordered]@{}
+            foreach ($k in @('local', 'unc')) {
+                $HeavySlotFeed = if ($k -eq 'local') { Join-Path $fx 'feed-local.csv' } else { '\\heat-trace-unc.invalid\share\hwinfo-log-adapter.csv' }
+                $script:FeedStallSec = if ($k -eq 'local') { 0 } else { 8 }
+                Reset-Case @{ request = 'active'; active_after = 2 }
+                $script:AgeAfter = (Get-Date).AddSeconds(120); $script:FeedReads = 0; $script:HtT0 = Get-Date
+                $admN = Invoke-HtWait "jHtN$k" $metaN
+                $script:Admission = $admN
+                $outN[$k] = [pscustomobject]@{ label = $admN.label; waitedSec = $admN.waitedSec; why = $admN.why; reads = $script:FeedReads; waits = @($script:Log | Where-Object { $_ -like "quiet-lease: waiting job=jHtN$k *" }) }
+                if ($null -ne $script:QuietLease) { Exit-HeavySlot }
+            }
+            $script:FeedStallSec = 0
+            Assert-True ($outN.local.label -ceq 'clear' -and $outN.local.waits.Count -ge 1 -and @($outN.local.waits | Where-Object { $_ -notmatch ' heat=unknown\(feed missing \(stub\)\) feedAge=unknown$' }).Count -eq 0) "heat-trace B4 baseline: a local feed is read on the waiting line and the job is admitted: label=$($outN.local.label) $($outN.local.waits -join ' || ')"
+            Assert-True ($outN.unc.label -ceq 'clear') "heat-trace B4: a stalled UNC feed read never holds the wait past its 6 s queue ceiling: label=$($outN.unc.label) why=$($outN.unc.why)"
+            # r5: +4 s, not +2: at 100% host CPU the python start-up alone moved either run by 2-3 s (local 2-5 s, unc 2-4 s, both agents); a read of
+            # the stalled feed adds its 8 s, so the bound still tells the two apart (and the label above already fails a queue-expired run).
+            Assert-True ($outN.unc.waitedSec -le $outN.local.waitedSec + 4) "heat-trace B4: the activation is processed on the baseline schedule: unc=$($outN.unc.waitedSec)s local=$($outN.local.waitedSec)s"
+            Assert-True ($outN.unc.waits.Count -ge 1 -and @($outN.unc.waits | Where-Object { $_ -notmatch ' heat=skipped reason=non-local-feed$' }).Count -eq 0) "heat-trace B4: the heat field stays on every waiting line, as heat=skipped reason=non-local-feed: $($outN.unc.waits -join ' || ')"
+            Assert-True ($outN.unc.reads -eq 1) "heat-trace B4: a UNC feed is never read while waiting (the one read is the grant's own): reads=$($outN.unc.reads)"
+            # The path rule, called directly: only a fully-qualified drive-letter path on a fixed disk with no reparse point on the way is read.
+            $jReal = Join-Path $fx 'heat-jn-target'
+            New-Item -ItemType Directory -Force -Path $jReal | Out-Null
+            New-Item -ItemType Junction -Path $jn -Target $jReal | Out-Null
+            $script:FeedReads = 0
+            $pathCases = [ordered]@{ unc = '\\srv\share\f.csv'; slashUnc = '//srv/share/f.csv'; device = '\\?\C:\temp\f.csv'; dotDevice = '\\.\C:\temp\f.csv'; relative = 'feed.csv'; driveRelative = 'C:feed.csv'; empty = ''; junction = (Join-Path $jn 'f.csv') }
+            foreach ($pc in $pathCases.Keys) {
+                $HeavySlotFeed = $pathCases[$pc]
+                $f = Get-LeaseWaitHeatField
+                Assert-True ($f -ceq 'heat=skipped reason=non-local-feed') "heat-trace B4: a $pc feed path is skipped, not read: '$($pathCases[$pc])' -> $f"
+            }
+            Assert-True ($script:FeedReads -eq 0) "heat-trace B4: none of the non-local paths was read: reads=$($script:FeedReads)"
+            $HeavySlotFeed = Join-Path $fx 'feed-local.csv'
+            $fLocal = Get-LeaseWaitHeatField
+            Assert-True ($script:FeedReads -eq 1 -and $fLocal -match '^heat=unknown\(feed missing \(stub\)\)') "heat-trace B4: a local fixed-disk path is read: reads=$($script:FeedReads) $fLocal"
+            # adversary r4-6abf870f A3: the snapshot's Start-HeavySlotCli checks heavy-slot.py and python synchronously, before the probe's bound
+            # exists. A script or configured python off a local fixed disk is slots=skipped(...), and no probe is started.
+            $savedScript = $HeavySlotScript; $savedPy = $HeavySlotPython
+            $cliReal = ${function:Start-HeavySlotCli}
+            $script:CliCalls = 0
+            function Start-HeavySlotCli { param([string[]]$Arguments) $script:CliCalls++; return [pscustomobject]@{ ok = $false; why = 'stub: not started' } }
+            try {
+                $HeavySlotScript = '\\heat-trace-unc.invalid\share\heavy-slot.py'
+                Add-LeaseSlotSnapshot -JobId 'jHtS1' -Phase 'grant'
+                $HeavySlotScript = $savedScript; $HeavySlotPython = '\\heat-trace-unc.invalid\share\python.exe'
+                Add-LeaseSlotSnapshot -JobId 'jHtS2' -Phase 'request'
+            }
+            finally { $HeavySlotScript = $savedScript; $HeavySlotPython = $savedPy; Set-Item -LiteralPath Function:\Start-HeavySlotCli -Value $cliReal }
+            $sS = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtS*' })
+            Assert-True ($script:CliCalls -eq 0 -and $sS.Count -eq 2 -and @($sS | Where-Object { $_ -notmatch ' slots=skipped\(heavy-slot\.py or its python is not on a local fixed disk\)$' }).Count -eq 0) "heat-trace A3(r4): a UNC heavy-slot.py or python starts no snapshot probe and logs slots=skipped(...): cli=$($script:CliCalls) $($sS -join ' || ')"
+            # adversary r4-6abf870f A2: a caller about to wait (the job monitor loop's slice, the wait loop's sleep) wakes at the earliest probe's bound,
+            # so a probe 29.5 s into its 30 s bound is killed at ~30 s, not a 5 s slice later. Pure, on a private probe list; then both callers use it.
+            Assert-True ($null -ne (Get-Command Get-LeaseSlotSnapshotWaitMs -ErrorAction SilentlyContinue)) "heat-trace A2(r4): the agent defines Get-LeaseSlotSnapshotWaitMs"
+            $savedSnaps = $script:LeaseSlotSnapshots
+            try {
+                $script:LeaseSlotSnapshots = [System.Collections.Generic.List[object]]::new()
+                $wNone = Get-LeaseSlotSnapshotWaitMs -MaxMs 5000
+                $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = 'jHtW'; phase = 'grant'; call = $null; clock = [pscustomobject]@{ Elapsed = [TimeSpan]::FromSeconds(29.5) } })
+                $wNear = Get-LeaseSlotSnapshotWaitMs -MaxMs 5000
+                $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = 'jHtW2'; phase = 'grant'; call = $null; clock = [pscustomobject]@{ Elapsed = [TimeSpan]::FromSeconds(31) } })
+                $wPast = Get-LeaseSlotSnapshotWaitMs -MaxMs 5000
+            }
+            finally { $script:LeaseSlotSnapshots = $savedSnaps }
+            Assert-True ($wNone -eq 5000 -and $wNear -ge 1 -and $wNear -le 500 -and $wPast -eq 1) "heat-trace A2(r4): the wait is capped at the earliest bound: none=$wNone near(29.5 s)=$wNear past=$wPast"
+            Assert-True ($agentText.Contains('Start-Sleep -Milliseconds (Get-LeaseSlotSnapshotWaitMs -MaxMs $script:GateLoopSleepMs)') -and $agentText.Contains('$remainingMs = Get-LeaseSlotSnapshotWaitMs -MaxMs $remainingMs')) "heat-trace A2(r4): the wait loop's sleep and the job monitor loop's slice are both capped by it"
+            # adversary r4-52d0e792 A1: a heavy-slot.py that is a leaf symlink (here to a missing UNC target) and a configured python that does not
+            # exist (Resolve-HeavySlotPython would search PATH) start no probe either. The symlink half needs the right to create one; without it,
+            # that half is recorded as not run.
+            $cliReal = ${function:Start-HeavySlotCli}
+            $script:CliCalls = 0
+            function Start-HeavySlotCli { param([string[]]$Arguments) $script:CliCalls++; return [pscustomobject]@{ ok = $false; why = 'stub: not started' } }
+            $lnk = Join-Path $fx 'heavy-slot-link.py'
+            $symlinkRan = $false
+            try {
+                try { New-Item -ItemType SymbolicLink -Path $lnk -Target '\\heat-trace-unc.invalid\share\heavy-slot.py' -ErrorAction Stop | Out-Null; $symlinkRan = $true } catch { }
+                if ($symlinkRan) { $HeavySlotScript = $lnk; Add-LeaseSlotSnapshot -JobId 'jHtS3' -Phase 'grant'; $HeavySlotScript = $savedScript }
+                $HeavySlotPython = Join-Path $fx 'no-such-python.exe'
+                Add-LeaseSlotSnapshot -JobId 'jHtS4' -Phase 'request'
+            }
+            finally {
+                $HeavySlotScript = $savedScript; $HeavySlotPython = $savedPy; Set-Item -LiteralPath Function:\Start-HeavySlotCli -Value $cliReal
+                if (Test-Path -LiteralPath $lnk) { [IO.File]::Delete($lnk) }   # the link only
+            }
+            $sS2 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtS3 *' -or $_ -like 'quiet-lease: slots-snapshot job=jHtS4 *' })
+            Assert-True ($script:CliCalls -eq 0 -and $sS2.Count -eq $(if ($symlinkRan) { 2 } else { 1 }) -and @($sS2 | Where-Object { $_ -notmatch ' slots=skipped\(heavy-slot\.py or its python is not on a local fixed disk\)$' }).Count -eq 0) "heat-trace A1(r4b): a symlinked heavy-slot.py (ran=$symlinkRan) and a missing configured python start no probe: cli=$($script:CliCalls) $($sS2 -join ' || ')"
+            # adversary r4-52d0e792 A3: the headroom reads the absolute notAfterUtc against the clock now, not only the remainingSec sampled with the verdict.
+            $hStale = Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 75; notAfterUtc = [DateTime]::UtcNow.AddSeconds(25).ToString('o') })
+            $hBad = Get-LeaseSnapshotHeadroomSec -Verdict ([pscustomobject]@{ state = 'open'; remainingSec = 75; notAfterUtc = 'not a date' })
+            Assert-True ($hStale -le 26 -and $hStale -gt 20 -and $hBad -eq 0) "heat-trace A3(r4b): a verdict sampled 50 s ago (remainingSec 75, notAfterUtc now+25 s) is ~25 s of headroom, an unreadable one none: stale=$hStale bad=$hBad"
+            Assert-True ($agentText.Contains('[double]$maxAge - [double](Get-QueueAgeSeconds -Job $Job -Metadata $Metadata) } else { [double]::PositiveInfinity }))   # r4 (adversary A3)')) "heat-trace A3(r4b): the request snapshot's queue headroom is the age read after the request started"
+            # adversary r4-6abf870f A4 (advisory, fixed in scope): a held field past Int32 is read, one past Int64 is unknown; neither throws.
+            $hBig = $null; $hHuge = $null; $hErr = $null
+            try { $hBig = ConvertFrom-HeavySlotHolderText -Text 'suite (pid 77, held 2147483648 min)'; $hHuge = ConvertFrom-HeavySlotHolderText -Text 'suite (pid 77, held 99999999999999999999 min)' } catch { $hErr = $_.Exception.Message }
+            Assert-True ($null -eq $hErr -and $hBig.heldMin -eq 2147483648 -and $hBig.ownerPid -ceq '77' -and $null -ne $hHuge -and $null -eq $hHuge.heldMin) "heat-trace A4(r4): an Int32-overflowing held field never throws: err=$hErr big=$($hBig.heldMin) huge=$($hHuge.heldMin)"
+            # adversary r4-6abf870f A5 (advisory, fixed in scope): with no job timeout, Set-LeaseCoverageAtLaunch changes nothing.
+            $adZ = [pscustomobject]@{ mode = 'lease'; leaseCoversTimeout = $true }
+            Set-LeaseCoverageAtLaunch -JobId 'jHtZ' -Admission $adZ -Lease ([pscustomobject]@{ active = [pscustomobject]@{ until = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 100 } }) -TimeoutSec 0
+            Assert-True ($null -eq $adZ.PSObject.Properties['leaseRemainingAtLaunchSec'] -and $adZ.leaseCoversTimeout -eq $true) "heat-trace A5(r4): TimeoutSec 0 adds no field and keeps leaseCoversTimeout: $($adZ | ConvertTo-Json -Compress)"
+            $results.leaseHeatTraceNonlocalFeed = [ordered]@{ local = $outN.local.waitedSec; unc = $outN.unc.waitedSec; uncLabel = $outN.unc.label; uncSample = $outN.unc.waits[0]; scriptSkip = $sS[0]; waitNearMs = $wNear }
+        }
+        finally {
+            $HeavySlotFeed = $savedFeed; $script:FeedStallSec = 0
+            if (Test-Path -LiteralPath $jn) { [IO.Directory]::Delete($jn) }   # the junction only, never its target's contents
+            function Get-QueueAgeSeconds { param($Job, $Metadata) if ((Get-Date) -ge $script:AgeAfter) { return 9999 } return [int]$script:HtAge }
+            function Read-HeavySlotFeedMetrics { return @{ metrics = $null; why = 'feed missing (unit)' } }
+            if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test case end' }
+        }
+    }
+    # ------------------------------------------------------------ lease-heat-trace-checked-python (AGENT-LEASE-PENDING-HEAT-TRACE-1 r5, sol r4 S2 = adversary r4-e98a2780 A2)
+    # The interpreter the snapshot checked is the one it starts. Sol's shape: HeavySlotPython=C:\probe\python.exe passes the check, is renamed before
+    # the probe starts, and PATH begins with \\review-server\tools. The rename is made as the probe starts (a wrapper around the agent's own
+    # Start-HeavySlotCli); a python.exe PATH search is recorded (Get-Command shadowed for that name only), never made.
+    if (Test-Case 'lease-heat-trace-checked-python') {
+        $savedPy = $HeavySlotPython; $savedPath = $env:PATH
+        $script:CliRealP = ${function:Start-HeavySlotCli}
+        $pyDir = Join-Path $fx 'probe-py'
+        try {
+            New-Item -ItemType Directory -Force -Path $pyDir | Out-Null
+            $pyChecked = Join-Path $pyDir 'python.exe'
+            [IO.File]::WriteAllText($pyChecked, 'not an interpreter')   # exists, so the snapshot's check passes; renamed before it could be started
+            $HeavySlotPython = $pyChecked
+            $env:PATH = '\\heat-trace-unc.invalid\tools;' + $savedPath
+            $script:PathSearches = 0; $script:RenameAt = $pyChecked; $script:Renamed = $false
+            function Get-Command { if (@($args) -contains 'python.exe') { $script:PathSearches++; return $null }; Microsoft.PowerShell.Core\Get-Command @args }
+            function Start-HeavySlotCli { param([string[]]$Arguments, [string]$Python = '', [string]$Script = '') if (Test-Path -LiteralPath $script:RenameAt) { Move-Item -LiteralPath $script:RenameAt -Destination ($script:RenameAt + '.renamed'); $script:Renamed = $true }; return (& $script:CliRealP @PSBoundParameters) }
+            $nBefore = $script:LeaseSlotSnapshots.Count
+            Add-LeaseSlotSnapshot -JobId 'jHtP2' -Phase 'request'
+            $nAfter = $script:LeaseSlotSnapshots.Count
+            Remove-Item -LiteralPath Function:\Get-Command
+            Set-Item -LiteralPath Function:\Start-HeavySlotCli -Value $script:CliRealP
+            $env:PATH = $savedPath; $HeavySlotPython = $savedPy
+            $lS2 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtP2 *' })
+            Assert-True ($script:Renamed) "probe-watchdog S2: the checked python was renamed between the snapshot's check and the probe's start"
+            Assert-True ($script:PathSearches -eq 0) "probe-watchdog S2: a checked python gone at launch is never re-resolved through PATH (which begins with a UNC entry): python.exe PATH searches=$($script:PathSearches)"
+            Assert-True ($nAfter -eq $nBefore -and $lS2.Count -eq 1 -and $lS2[0] -match ([regex]::Escape(" slots=unknown(python not found at its checked path ($pyChecked); no PATH search)") + '$')) "probe-watchdog S2: no probe starts, and the line names the checked path: $($lS2 -join ' || ')"
+            Assert-True ($agentText.Contains('-Python $HeavySlotPython -Script $HeavySlotScript')) "probe-watchdog S2: the snapshot starts the paths it checked"
+            $results.leaseHeatTraceCheckedPython = [ordered]@{ line = $lS2[0]; pathSearches = $script:PathSearches }
+        }
+        finally {
+            if (Test-Path -LiteralPath Function:\Get-Command) { Remove-Item -LiteralPath Function:\Get-Command }
+            Set-Item -LiteralPath Function:\Start-HeavySlotCli -Value $script:CliRealP
+            $env:PATH = $savedPath; $HeavySlotPython = $savedPy
+        }
+    }
+    # ------------------------------------------------------------ lease-heat-trace-probe-watchdog (AGENT-LEASE-PENDING-HEAT-TRACE-1 r5, sol r4 S1 = adversary r4-e98a2780 A1)
+    # A probe terminates within its bound whether or not the agent polls. Sol's shape (request active at 0.3 s, status delay 300 s, a 30 s renew that
+    # does not poll, bound 30 s), scaled: bound 2 s, the fake's renew sleeps 6 s inside the agent's own Complete-HeavySlotCli. The probe must be dead
+    # when the renew returns, before any poll, and its line gives the age it was killed at. A poll that finds a probe past its bound gives the real
+    # age too (sol's 31 s: 31.4 s of a 30 s bound).
+    if (Test-Case 'lease-heat-trace-probe-watchdog') {
+        $script:CliRealP = ${function:Start-HeavySlotCli}
+        $script:OrphanKids = [System.Collections.Generic.List[int]]::new()
+        try {
+            $script:LeaseSnapshotProbeSec = 2; $script:StatusDelaySec = 300
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: free', 'slot 2: free') }
+            Reset-Case @{ request = 'active'; active_after = 0.3; renew_sleep = 6 }
+            Sync-FakeStatus
+            Add-LeaseSlotSnapshot -JobId 'jHtP1' -Phase 'grant'
+            $e1 = @($script:LeaseSlotSnapshots | Where-Object { $_.jobId -eq 'jHtP1' })
+            Assert-True ($e1.Count -eq 1) "probe-watchdog S1: the grant probe started: $($e1.Count)"
+            $pidP = $e1[0].call.proc.Id
+            $tB = [Diagnostics.Stopwatch]::StartNew()
+            $rn = Complete-HeavySlotCli -Call (Start-HeavySlotCli -Arguments @('lease', 'renew', '--label', $script:QuietLeaseLabel)) -TimeoutSec 15 -HeartbeatActivity 'pre-launch job=jHtP1'
+            $blockedSec = $tB.Elapsed.TotalSeconds
+            $exitedAtRenewEnd = $e1[0].call.proc.HasExited
+            $aliveAtRenewEnd = Test-PidAlive $pidP
+            $ageAtRenewEnd = $e1[0].clock.Elapsed.TotalSeconds
+            Update-LeaseSlotSnapshots
+            $lP = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtP1 *' })
+            Assert-True ($rn.done -and $blockedSec -ge 5.5) "probe-watchdog S1: the pre-launch renew really held the agent without polling: $([Math]::Round($blockedSec, 2)) s (done=$($rn.done))"
+            Assert-True ($exitedAtRenewEnd -and -not $aliveAtRenewEnd) "probe-watchdog S1: the probe was killed at its 2 s bound while the renew held the agent and nothing polled (exited=$exitedAtRenewEnd alive=$aliveAtRenewEnd, age $([Math]::Round($ageAtRenewEnd, 1)) s)"
+            Assert-True ($lP.Count -eq 1 -and $lP[0] -match ' slots=unknown\(timeout 2 s; killed at (2\.\d|3\.[0-4]) s\)$') "probe-watchdog S1: the line gives the age it was killed at (the bound plus timer slack), not the age it was polled at: $($lP -join ' || ')"
+            # The poll's own bound check (a probe with no watchdog) gives the real age too: sol's 31 s, bound 30 s.
+            $script:LeaseSnapshotProbeSec = 30
+            $cL = & $script:CliRealP -Arguments @('status', '--slots', '2')
+            Assert-True ($cL.ok) "probe-watchdog S1: a status probe started for the poll case: $($cL.why)"
+            $pidL = $cL.proc.Id
+            $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = 'jHtP3'; phase = 'grant'; call = $cL; clock = [pscustomobject]@{ Elapsed = [TimeSpan]::FromSeconds(31.4) }; dog = $null })
+            Update-LeaseSlotSnapshots
+            $lP3 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtP3 *' })
+            Assert-True ($lP3.Count -eq 1 -and $lP3[0] -match ' slots=unknown\(timeout 30 s; killed at 31\.4 s\)$' -and (Wait-Until { -not (Test-PidAlive $pidL) } 5)) "probe-watchdog S1: a probe the poll kills past its bound is logged with its real age (31.4 s of a 30 s bound): $($lP3 -join ' || ')"
+            # adversary r5-2ca9f68f A1: a status root that exits at once, leaving a 300 s child holding its stdout/stderr, is not done: the
+            # watchdog (nothing polls) and the poll's own bound kill both end that child. Bound 5 s here so a slow python start-up still spawns it.
+            $script:LeaseSnapshotProbeSec = 5; $script:StatusDelaySec = 0; $script:StatusOrphan = $true
+            Reset-Case @{ request = 'active' }
+            Sync-FakeStatus
+            Add-LeaseSlotSnapshot -JobId 'jHtP4' -Phase 'grant'
+            $null = Wait-Until { $script:Kc = @(Get-Calls | Where-Object { $_.cmd -eq 'status-orphan' }); $script:Kc.Count -ge 1 } 10
+            Assert-True ($script:Kc.Count -eq 1) "probe-watchdog A1(r5): the status root spawned its orphan child: $($script:Kc.Count)"
+            $kid4 = [int]$script:Kc[0].child; $script:OrphanKids.Add($kid4)
+            $kid4Gone = Wait-Until { -not (Test-PidAlive $kid4) } 10   # nothing polls meanwhile
+            $age4 = ($script:LeaseSlotSnapshots | Where-Object { $_.jobId -eq 'jHtP4' } | Select-Object -First 1).clock.Elapsed.TotalSeconds
+            Update-LeaseSlotSnapshots
+            $lP4 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtP4 *' })
+            Assert-True ($kid4Gone) "probe-watchdog A1(r5): the child a finished root left holding the probe's pipes is killed at the bound with no poll (alive after $([Math]::Round([double]$age4, 1)) s of a 5 s bound)"
+            Assert-True ($lP4.Count -eq 1 -and $lP4[0] -match ' slots=unknown\(timeout 5 s; killed at (5\.\d|6\.[0-4]) s\)$') "probe-watchdog A1(r5): the watchdog's kill is logged with its age: $($lP4 -join ' || ')"
+            $script:LeaseSnapshotProbeSec = 30
+            Reset-Case @{ request = 'active' }
+            Sync-FakeStatus
+            $cO = & $script:CliRealP -Arguments @('status', '--slots', '2')
+            $null = Wait-Until { $script:Kc = @(Get-Calls | Where-Object { $_.cmd -eq 'status-orphan' }); $script:Kc.Count -ge 1 -and $cO.proc.HasExited } 10
+            Assert-True ($script:Kc.Count -eq 1 -and $cO.proc.HasExited) "probe-watchdog A1(r5): the poll-case root spawned its child and exited: $($script:Kc.Count)"
+            $kid5 = [int]$script:Kc[0].child; $script:OrphanKids.Add($kid5)
+            $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = 'jHtP5'; phase = 'grant'; call = $cO; clock = [pscustomobject]@{ Elapsed = [TimeSpan]::FromSeconds(31.4) }; dog = $null })
+            Update-LeaseSlotSnapshots
+            $lP5 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtP5 *' })
+            Assert-True ((Wait-Until { -not (Test-PidAlive $kid5) } 5) -and $lP5.Count -eq 1 -and $lP5[0] -match ' slots=unknown\(timeout 30 s; killed at 31\.4 s\)$') "probe-watchdog A1(r5): the poll's kill past the bound ends the child of an exited root too, logged as killed (not seen): $($lP5 -join ' || ')"
+            $script:StatusOrphan = $false
+            Assert-True ($script:ProbeWatchdogReady) "probe-watchdog S1: the agent defines Initialize-LeaseProbeWatchdog and it compiles"
+            $results.leaseHeatTraceProbeWatchdog = [ordered]@{ renewBlockedSec = [Math]::Round($blockedSec, 2); probeAgeAtRenewEnd = [Math]::Round($ageAtRenewEnd, 2); line = $lP[0]; pollLine = $lP3[0]; orphanLine = $lP4[0]; orphanPollLine = $lP5[0] }
+        }
+        finally {
+            $script:StatusOrphan = $false
+            foreach ($k in @($script:OrphanKids)) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
+            $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 0
+            if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test case end' }
+        }
+    }
+    # ------------------------------------------------------------ lease-snapshot-bound-straddle (AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r1, sol r5 B1)
+    # A probe's outcome comes from ONE completion sample and the age sampled AFTER it, never a re-read. Sol's shape: bound 30 s, the poll samples
+    # 29.990 s with the probe not done, the probe completes at 30.010 s, and a second completion read accepts a success past the bound. Designed:
+    # done with an age under the bound is a success; done with an age AT or past it is a timeout (seen), since when it finished inside the last
+    # poll interval is unknown; not done past it is a timeout (killed). Controlled dependencies: a fake probe whose completion lands at a chosen
+    # read and a fake clock; the agent's own Update-LeaseSlotSnapshots classifies it (Stop-/Receive-HeavySlotCli stubbed and counted).
+    if (Test-Case 'lease-snapshot-bound-straddle') {
+        $script:BsStopReal = ${function:Stop-HeavySlotCli}; $script:BsRecvReal = ${function:Receive-HeavySlotCli}
+        $bsFails = [System.Collections.Generic.List[string]]::new()
+        try {
+            $script:LeaseSnapshotProbeSec = 30
+            Update-LeaseSlotSnapshots -Abandon 'test case start'
+            function Stop-HeavySlotCli { param($Call) $script:BsStops++ }
+            function Receive-HeavySlotCli { param($Call) $script:BsRecv++; return [pscustomobject]@{ done = $true; rc = 0; stdout = "slot 1: free`nslot 2: free"; stderr = ''; why = $null } }
+            function Add-BsProbe([string]$JobId, [double[]]$Ages, [string]$Land) {
+                # Land: 'start' (done before the poll) | 'age1' (lands right after the first age read) | 'done1' (right after the first completion read) | 'never'
+                $st = [pscustomobject]@{ done = ($Land -eq 'start'); ages = [System.Collections.Generic.Queue[double]]::new([double[]]$Ages); last = 0.0; land = $Land; ageReads = 0; doneReads = 0 }
+                $clock = [pscustomobject]@{ st = $st }
+                $clock | Add-Member -MemberType ScriptProperty -Name Elapsed -Value { $s = $this.st; if ($s.ages.Count -gt 0) { $s.last = $s.ages.Dequeue() }; $s.ageReads++; if ($s.land -eq 'age1' -and $s.ageReads -eq 1) { $s.done = $true }; [TimeSpan]::FromSeconds($s.last) }
+                $proc = [pscustomobject]@{ st = $st }
+                $proc | Add-Member -MemberType ScriptProperty -Name HasExited -Value { $s = $this.st; $d = $s.done; $s.doneReads++; if ($s.land -eq 'done1' -and $s.doneReads -eq 1) { $s.done = $true }; $d }
+                $pipe = [pscustomobject]@{ st = $st }
+                $pipe | Add-Member -MemberType ScriptProperty -Name IsCompleted -Value { $this.st.done }
+                $script:LeaseSlotSnapshots.Add([pscustomobject]@{ jobId = $JobId; phase = 'grant'; call = [pscustomobject]@{ ok = $true; proc = $proc; out = $pipe; err = $pipe }; clock = $clock; dog = $null })
+            }
+            function Invoke-BsPoll([string]$JobId) {
+                $script:BsStops = 0; $script:BsRecv = 0
+                $n0 = $script:Log.Count
+                Update-LeaseSlotSnapshots
+                return [pscustomobject]@{ lines = @($script:Log | Select-Object -Skip $n0 | Where-Object { $_ -like "quiet-lease: slots-snapshot job=$JobId *" }); stops = $script:BsStops; recv = $script:BsRecv; inFlight = @($script:LeaseSlotSnapshots | Where-Object { $_.jobId -eq $JobId }).Count }
+            }
+            $bsOk = ' slots=[slot 1: free; slot 2: free] queued=0'
+            $bsSeen = ' slots=unknown(timeout 30 s; seen at 30.0 s)'
+            $bsRes = [ordered]@{}
+            # (a) sol's replay: sampled not done at 29.990 s; the completion lands right after that completion sample (30.010 s); next poll 30.025 s.
+            # (b) the completion lands between the age sample and the completion sample, so an age read before the completion would be stale.
+            foreach ($land in @('done1', 'age1')) {
+                $j = "jBs-$land"
+                Add-BsProbe $j @(29.990, 30.025) $land
+                $p1 = Invoke-BsPoll $j
+                if ($p1.lines.Count -ne 0 -or $p1.recv -ne 0 -or $p1.inFlight -ne 1) { $bsFails.Add("($land) a completion that lands after the poll's 29.990 s sample is not a success at that poll: lines=[$($p1.lines -join ' || ')] received=$($p1.recv) inFlight=$($p1.inFlight)") }
+                else {
+                    $p2 = Invoke-BsPoll $j
+                    if ($p2.lines.Count -ne 1 -or -not $p2.lines[0].EndsWith($bsSeen) -or $p2.recv -ne 0 -or $p2.inFlight -ne 0) { $bsFails.Add("($land) the next poll (30.025 s) sees it done past the bound, a timeout: lines=[$($p2.lines -join ' || ')] received=$($p2.recv)") }
+                    $bsRes[$land] = @($p2.lines)
+                }
+                $script:LeaseSlotSnapshots.Clear()
+            }
+            # (c) done before the 29.990 s sample: a success.
+            Add-BsProbe 'jBs-in' @(29.990) 'start'
+            $pc = Invoke-BsPoll 'jBs-in'
+            if ($pc.lines.Count -ne 1 -or -not $pc.lines[0].EndsWith($bsOk) -or $pc.recv -ne 1 -or $pc.stops -ne 0) { $bsFails.Add("(in) done with its age under the bound is a success: lines=[$($pc.lines -join ' || ')] received=$($pc.recv) stops=$($pc.stops)") }
+            $script:LeaseSlotSnapshots.Clear()
+            # (d) done, age sampled exactly at the bound: a timeout (seen), by design.
+            Add-BsProbe 'jBs-at' @(30.000) 'start'
+            $pd = Invoke-BsPoll 'jBs-at'
+            if ($pd.lines.Count -ne 1 -or -not $pd.lines[0].EndsWith($bsSeen) -or $pd.recv -ne 0 -or $pd.stops -ne 1) { $bsFails.Add("(at) done with its age sampled at the bound is a timeout (seen): lines=[$($pd.lines -join ' || ')] received=$($pd.recv) stops=$($pd.stops)") }
+            $script:LeaseSlotSnapshots.Clear()
+            # (e) not done past the bound: a timeout (killed).
+            Add-BsProbe 'jBs-past' @(30.010) 'never'
+            $pe = Invoke-BsPoll 'jBs-past'
+            if ($pe.lines.Count -ne 1 -or -not $pe.lines[0].EndsWith(' slots=unknown(timeout 30 s; killed at 30.0 s)') -or $pe.stops -ne 1) { $bsFails.Add("(past) not done past the bound is a timeout (killed): lines=[$($pe.lines -join ' || ')] stops=$($pe.stops)") }
+            $script:LeaseSlotSnapshots.Clear()
+            $bsRes.in = @($pc.lines); $bsRes.at = @($pd.lines); $bsRes.past = @($pe.lines)
+            Assert-True ($bsFails.Count -eq 0) "bound-straddle (sol r5 B1): $($bsFails -join ' ;; ')"
+            $results.leaseSnapshotBoundStraddle = $bsRes
+        }
+        finally {
+            $script:LeaseSlotSnapshots.Clear()
+            Set-Item -LiteralPath Function:\Stop-HeavySlotCli -Value $script:BsStopReal
+            Set-Item -LiteralPath Function:\Receive-HeavySlotCli -Value $script:BsRecvReal
+        }
+    }
+    # ------------------------------------------------------------ lease-probe-watchdog-add-type-failure (AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r1, sol r5 B4)
+    # No watchdog, no probe. The watchdog type is compiled once per process, and this process already has it, so the Add-Type failure runs in a
+    # fresh pwsh: the agent's own Initialize-LeaseProbeWatchdog and Add-LeaseSlotSnapshot, with Add-Type shadowed to throw (throw) or to return
+    # without loading the type (noop: the null type). Start-HeavySlotCli is a counting stub: a call to it is a probe started.
+    if (Test-Case 'lease-probe-watchdog-add-type-failure') {
+        $atFails = [System.Collections.Generic.List[string]]::new()
+        $atChild = @'
+param([string]$Agent, [string]$Mode, [string]$Py)
+$ErrorActionPreference = 'Stop'
+$tk = $null; $pe = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Agent, [ref]$tk, [ref]$pe)
+foreach ($n in @('Initialize-LeaseProbeWatchdog', 'Add-LeaseSlotSnapshot')) {
+    $fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true)
+    . ([scriptblock]::Create($fn.Extent.Text))
+}
+$script:Log = [System.Collections.Generic.List[string]]::new()
+function Add-AgentLogLine([string]$Message) { $script:Log.Add($Message) }
+if ($Mode -eq 'throw') { function Add-Type { throw 'unit: Add-Type failed (no compiler)' } } else { function Add-Type { } }
+function Test-LeaseLocalFixedPath { param([string]$Path, [switch]$LeafLinkOk) return $true }
+$script:Starts = 0
+function Start-HeavySlotCli { param([string[]]$Arguments, [string]$Python = '', [string]$Script = '') $script:Starts++; return [pscustomobject]@{ ok = $true; proc = $null; out = $null; err = $null; started = (Get-Date); why = $null } }
+$HeavySlotScript = $Agent; $HeavySlotPython = $Py; $HeavySlotCount = 2
+$script:LeaseSlotSnapshots = [System.Collections.Generic.List[object]]::new()
+$script:LeaseSnapshotProbeSec = 30
+$script:LeaseSnapshotSkipBelowSec = 70
+$ready = Initialize-LeaseProbeWatchdog
+$typeLoaded = $null -ne ('MlvApp.Agent.LeaseProbeWatchdog' -as [type])
+$threw = $null; $out = @()
+try { $out = @(Add-LeaseSlotSnapshot -JobId 'jB4a' -Phase 'request') } catch { $threw = [string]$_.Exception.Message }
+[pscustomobject]@{ ready = [bool]$ready; typeLoaded = $typeLoaded; starts = $script:Starts; registered = $script:LeaseSlotSnapshots.Count; output = $out.Count; threw = $threw; log = @($script:Log) } | ConvertTo-Json -Compress -Depth 4
+'@
+        $atPath = Join-Path $fx 'add-type-failure-child.ps1'
+        [IO.File]::WriteAllText($atPath, $atChild, [Text.UTF8Encoding]::new($false))
+        $pwshExe = (Get-Process -Id $PID).Path
+        $atRes = [ordered]@{}
+        foreach ($mode in @('throw', 'noop')) {
+            $raw = @(& { $ErrorActionPreference = 'Continue'; & $pwshExe -NoProfile -NonInteractive -File $atPath -Agent $agentScript -Mode $mode -Py $Python 2>&1 } | ForEach-Object { [string]$_ })
+            $r = $null; try { $r = ($raw | Where-Object { $_.StartsWith('{') } | Select-Object -Last 1) | ConvertFrom-Json } catch { $r = $null }
+            if ($null -eq $r) { $atFails.Add("($mode) the child reported: $($raw -join ' | ')"); continue }
+            $u = @($r.log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4a *' })
+            if ($r.typeLoaded) { $atFails.Add("($mode) setup: the watchdog type must not load here") }
+            if ($r.ready) { $atFails.Add("($mode) Initialize-LeaseProbeWatchdog reports the watchdog unavailable: ready=$($r.ready)") }
+            if ($r.starts -ne 0 -or $r.registered -ne 0) { $atFails.Add("($mode) no probe is started without a watchdog: Start-HeavySlotCli calls=$($r.starts) registered=$($r.registered)") }
+            if ($u.Count -ne 1 -or $u[0] -notmatch ' phase=request slots=unknown\(watchdog unavailable\)$') { $atFails.Add("($mode) the snapshot line is slots=unknown(watchdog unavailable): [$($u -join ' || ')]") }
+            if ($r.threw -or $r.output -ne 0) { $atFails.Add("($mode) the snapshot neither throws nor returns anything (the wait goes on unchanged): threw=$($r.threw) output=$($r.output)") }
+            $atRes[$mode] = $r
+        }
+        Assert-True ($atFails.Count -eq 0) "watchdog Add-Type failure (sol r5 B4): $($atFails -join ' ;; ')"
+        $results.leaseProbeWatchdogAddTypeFailure = $atRes
+    }
+    # ------------------------------------------------------------ lease-probe-watchdog-ctor-failure (AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r1, sol r5 B4)
+    # The agent's own watchdog constructor throws: its Timer rejects a due time past 4294967294 ms, so a 5,000,000 s bound is a real throw of the
+    # real type. No probe starts (the fake heavy-slot.py logs every status call it gets), the line is slots=unknown(watchdog unavailable), and a
+    # whole wait with both snapshots failing closed admits the job exactly as before.
+    if (Test-Case 'lease-probe-watchdog-ctor-failure') {
+        $ctFails = [System.Collections.Generic.List[string]]::new()
+        try {
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: free', 'slot 2: free') }; $script:StatusDelaySec = 20
+            Reset-Case @{ request = 'active' }
+            Sync-FakeStatus
+            $script:LeaseSnapshotProbeSec = 5000000
+            $n0 = $script:LeaseSlotSnapshots.Count
+            $o1 = @(Add-LeaseSlotSnapshot -JobId 'jB4c' -Phase 'request')
+            $reg = $script:LeaseSlotSnapshots.Count - $n0
+            $null = Wait-Until { @(Get-Calls | Where-Object { $_.cmd -eq 'status' }).Count -gt 0 } 4
+            $sc = @(Get-Calls | Where-Object { $_.cmd -eq 'status' }).Count
+            $l1 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4c *' })
+            if ($reg -ne 0 -or $sc -ne 0) { $ctFails.Add("(probe) no probe is started when the watchdog's constructor throws: registered=$reg statusCalls=$sc") }
+            if ($l1.Count -ne 1 -or $l1[0] -notmatch ' phase=request slots=unknown\(watchdog unavailable\)$') { $ctFails.Add("(probe) the line is slots=unknown(watchdog unavailable): [$($l1 -join ' || ')]") }
+            if ($o1.Count -ne 0) { $ctFails.Add("(probe) the snapshot returns nothing: $($o1.Count)") }
+            Update-LeaseSlotSnapshots -Abandon 'test step'
+            $script:StatusDelaySec = 0
+            Reset-Case @{ request = 'active'; active_after = 0.3 }
+            $script:AgeAfter = (Get-Date).AddSeconds(120)
+            Sync-FakeStatus
+            $admC = Wait-QuietLeaseAdmission -JobId 'jB4w' -Job ([pscustomobject]@{}) -Metadata $meta
+            $script:Admission = $admC
+            $null = Wait-Until { @(Get-Calls | Where-Object { $_.cmd -eq 'status' }).Count -gt 0 } 3
+            $scW = @(Get-Calls | Where-Object { $_.cmd -eq 'status' }).Count
+            $lW = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4w *' })
+            if ($admC.label -cne 'clear' -or $admC.mode -ne 'lease' -or $admC.leaseMinutes -ne 31 -or -not $admC.leaseCoversTimeout) { $ctFails.Add("(wait) the job is admitted on its lease as without the snapshots: $($admC | ConvertTo-Json -Compress -Depth 3)") }
+            if ($scW -ne 0 -or $lW.Count -ne 2 -or @($lW | Where-Object { $_ -match ' phase=(request|grant) slots=unknown\(watchdog unavailable\)$' }).Count -ne 2) { $ctFails.Add("(wait) request and grant each log slots=unknown(watchdog unavailable) and start no probe: statusCalls=$scW [$($lW -join ' || ')]") }
+            Exit-HeavySlot
+            Assert-True ($ctFails.Count -eq 0) "watchdog constructor failure (sol r5 B4): $($ctFails -join ' ;; ')"
+            $results.leaseProbeWatchdogCtorFailure = [ordered]@{ probeLine = $l1; waitLines = $lW; admitted = $admC.label }
+        }
+        finally {
+            $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 0
+            Update-LeaseSlotSnapshots -Abandon 'test case end'
+        }
+    }
+    # ------------------------------------------------------------ lease-probe-watchdog-arm-paths (AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r1, sol r5 B4)
+    # The remedy's own failure paths. The watchdog is armed BEFORE the probe starts (a wrapper around the agent's own Start-HeavySlotCli reads the
+    # snapshot's $dog at the moment of the start) and the started probe is then attached to it, so:
+    #   attach - the started probe cannot be attached (its stderr task is null): it is stopped at once, never registered;
+    #   start  - the probe fails to start: the armed watchdog is disarmed (a probe attached to it later past its bound is not killed);
+    #   early  - the watchdog fires before the attach: the attach kills the probe at once and records the kill;
+    #   list   - the registration throws after the attach: the probe is stopped at once (snapshot failed).
+    if (Test-Case 'lease-probe-watchdog-arm-paths') {
+        $apFails = [System.Collections.Generic.List[string]]::new()
+        $script:ApCliReal = ${function:Start-HeavySlotCli}
+        $apSavedList = $script:LeaseSlotSnapshots
+        $script:ApProcs = [System.Collections.Generic.List[int]]::new()   # pids: the agent disposes the Process objects it stops
+        try {
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: free', 'slot 2: free') }; $script:StatusDelaySec = 300
+            Reset-Case @{ request = 'active' }
+            Sync-FakeStatus
+            $script:ApMode = 'attach'
+            function Start-HeavySlotCli {
+                param([string[]]$Arguments, [string]$Python = '', [string]$Script = '')
+                $script:ApArmed = Get-Variable -Name dog -Scope 1 -ValueOnly -ErrorAction SilentlyContinue
+                if ($script:ApMode -eq 'start') { return [pscustomobject]@{ ok = $false; why = 'unit: start failed' } }
+                $c = & $script:ApCliReal @PSBoundParameters
+                if ($c.ok) { $script:ApProcs.Add($c.proc.Id) }
+                if ($script:ApMode -eq 'attach' -and $c.ok) { return [pscustomobject]@{ ok = $true; proc = $c.proc; out = $c.out; err = $null; started = $c.started; why = $null } }
+                return $c
+            }
+            # attach
+            $script:ApArmed = $null; $script:ApProcs.Clear()
+            $n0 = $script:LeaseSlotSnapshots.Count
+            Add-LeaseSlotSnapshot -JobId 'jB4at' -Phase 'grant'
+            $regA = $script:LeaseSlotSnapshots.Count - $n0
+            $lA = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4at *' })
+            $pA = @($script:ApProcs)
+            if ($null -eq $script:ApArmed) { $apFails.Add('(attach) a watchdog is armed when the probe starts') }
+            if ($regA -ne 0 -or $pA.Count -ne 1 -or -not (Wait-Until { -not (Test-PidAlive $pA[0]) } 3)) { $apFails.Add("(attach) the probe that cannot be attached is stopped at once and not registered: registered=$regA started=$($pA.Count)") }
+            if ($lA.Count -ne 1 -or $lA[0] -notmatch ' phase=grant slots=unknown\(watchdog unavailable\)$') { $apFails.Add("(attach) the line is slots=unknown(watchdog unavailable): [$($lA -join ' || ')]") }
+            Update-LeaseSlotSnapshots -Abandon 'test step'
+            # start
+            $script:ApMode = 'start'; $script:ApArmed = $null; $script:LeaseSnapshotProbeSec = 1
+            Add-LeaseSlotSnapshot -JobId 'jB4st' -Phase 'grant'
+            $dS = $script:ApArmed
+            $lS = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4st *' })
+            if ($lS.Count -ne 1 -or $lS[0] -notmatch ' slots=unknown\(unit: start failed\)$') { $apFails.Add("(start) the start failure is logged as before: [$($lS -join ' || ')]") }
+            if ($null -eq $dS) { $apFails.Add('(start) a watchdog is armed when the probe starts') }
+            else {
+                Start-Sleep -Milliseconds 1500
+                $cS = & $script:ApCliReal -Arguments @('status', '--slots', '2')
+                if ($cS.ok) { $script:ApProcs.Add($cS.proc.Id) }
+                try { $dS.Attach($cS.proc, $cS.out, $cS.err) } catch { $apFails.Add("(start) a disarmed watchdog still takes an attach: $($_.Exception.Message)") }
+                $killedS = $cS.proc.WaitForExit(1500)
+                if ($killedS -or $dS.KilledAtMs -ge 0) { $apFails.Add("(start) the watchdog of a probe that failed to start is disarmed (it kills nothing past its bound): exited=$killedS killedAtMs=$($dS.KilledAtMs)") }
+                if (-not $cS.proc.HasExited) { try { $cS.proc.Kill($true) } catch { } }
+            }
+            # early
+            $dogT = 'MlvApp.Agent.LeaseProbeWatchdog' -as [type]
+            $dE = $null
+            try { $dE = $dogT::new([System.Diagnostics.Stopwatch]::StartNew(), [long]0) } catch { $apFails.Add("(early) the watchdog is constructed before its probe: $($_.Exception.Message)") }
+            if ($null -ne $dE) {
+                Start-Sleep -Milliseconds 300
+                $cE = & $script:ApCliReal -Arguments @('status', '--slots', '2')
+                if ($cE.ok) { $script:ApProcs.Add($cE.proc.Id) }
+                try { $dE.Attach($cE.proc, $cE.out, $cE.err) } catch { $apFails.Add("(early) attach: $($_.Exception.Message)") }
+                $killedE = $cE.proc.WaitForExit(3000)
+                if (-not $killedE -or $dE.KilledAtMs -lt 0) { $apFails.Add("(early) a watchdog that fired before its probe was attached kills it at the attach: exited=$killedE killedAtMs=$($dE.KilledAtMs)") }
+                $dE.Disarm()
+            }
+            # list
+            $script:ApMode = 'list'; $script:ApProcs.Clear(); $script:LeaseSnapshotProbeSec = 30
+            $script:LeaseSlotSnapshots = [pscustomobject]@{ Count = 0 }
+            $script:LeaseSlotSnapshots | Add-Member -MemberType ScriptMethod -Name Add -Value { throw 'unit: registration failed' }
+            Add-LeaseSlotSnapshot -JobId 'jB4ls' -Phase 'grant'
+            $script:LeaseSlotSnapshots = $apSavedList
+            $pL = @($script:ApProcs)
+            $lL = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jB4ls *' })
+            if ($pL.Count -ne 1 -or -not (Wait-Until { -not (Test-PidAlive $pL[0]) } 3)) { $apFails.Add("(list) a probe whose registration throws is stopped at once: started=$($pL.Count)") }
+            if ($lL.Count -ne 1 -or $lL[0] -notmatch ' slots=unknown\(snapshot failed: .*unit: registration failed.*\)$') { $apFails.Add("(list) the line is snapshot failed: [$($lL -join ' || ')]") }
+            Assert-True ($apFails.Count -eq 0) "watchdog arm paths (sol r5 B4 remedy): $($apFails -join ' ;; ')"
+            $results.leaseProbeWatchdogArmPaths = [ordered]@{ attach = $lA; start = $lS; list = $lL }
+        }
+        finally {
+            $script:LeaseSlotSnapshots = $apSavedList
+            Set-Item -LiteralPath Function:\Start-HeavySlotCli -Value $script:ApCliReal
+            foreach ($k in @($script:ApProcs)) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
+            $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 0
+            Update-LeaseSlotSnapshots -Abandon 'test case end'
+        }
+    }
+    # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2 (sol r1 B4-post-start): Process.Start returns a live child and a LATER statement in the launch
+    # helper throws. Sol's seam: Get-Date's -Date defaults to 'not-a-date' only while the named helper is on the call stack, with WarningPreference
+    # Stop (the failed default binding is a warning, so Stop makes it a throw); the seam records the helper's $p, the child it had started. Each
+    # child must be stopped before the failure is reported (RED on 88c907eb: alive, stopCalls=0):
+    #   snapshot - Add-LeaseSlotSnapshot (the B4 caller, HeadroomSec 600): not registered, the line names postStartStop=stopped;
+    #   direct   - Start-HeavySlotCli: ok=$false, postStartStop=stopped, no proc handed back;
+    #   complete - Complete-HeavySlotCli over that start (the release and pre-launch renew callers): done=$false;
+    #   renew    - Update-QuietLeaseRenew (the renew caller; the fake's renew hangs 30 s): no renewCall, renewFailures 1;
+    #   request  - Start-QuietLeaseRequest, its timestamp after the start (the wrapper waits for a release): ok=$false, its record removed;
+    #   status   - Invoke-HeavySlotStatus, its deadline after the start: ok=$false naming postStartStop=stopped.
+    if (Test-Case 'lease-start-post-start-failure') {
+        $psFails = [System.Collections.Generic.List[string]]::new()
+        $script:PsSeamFn = ''
+        $script:PsSeamPids = [System.Collections.Generic.List[int]]::new()
+        $script:PsStops = 0
+        $script:PsStopCliReal = ${function:Stop-HeavySlotCli}
+        $script:PsStopAfterReal = ${function:Stop-ProcessAfterStartFailure}   # $null on a base agent
+        $psStatusReal = ${function:Invoke-HeavySlotStatus}
+        $psSavedList = $script:LeaseSlotSnapshots
+        $psSavedWarn = $WarningPreference
+        function Stop-HeavySlotCli { param($Call) $script:PsStops++; & $script:PsStopCliReal @PSBoundParameters }
+        if ($null -ne $script:PsStopAfterReal) { function Stop-ProcessAfterStartFailure { param($Process) $script:PsStops++; return (& $script:PsStopAfterReal @PSBoundParameters) } }
+        function Invoke-PsSeam([string]$Fn, [scriptblock]$Body) {
+            # Returns @{ out; threw; pids; alive; stops }: alive is the started children still running 3 s after the helper returned.
+            $script:PsSeamFn = $Fn; $script:PsSeamPids.Clear(); $script:PsStops = 0
+            $out = $null; $threw = $null
+            $PSDefaultParameterValues['Get-Date:Date'] = {
+                $f = @(Get-PSCallStack | Where-Object { $_.Command -eq $script:PsSeamFn }) | Select-Object -First 1
+                if ($null -eq $f) { return [DateTime]::Now }
+                $v = $null
+                try { $v = $f.GetFrameVariables()['p'] } catch { }
+                if ($null -ne $v -and $v.Value -is [System.Diagnostics.Process]) { try { if (-not $script:PsSeamPids.Contains($v.Value.Id)) { $script:PsSeamPids.Add($v.Value.Id) } } catch { } }
+                'not-a-date'
+            }
+            $WarningPreference = 'Stop'
+            try { $out = & $Body 3>$null } catch { $threw = $_.Exception.Message }   # 3>$null: the seam's warning still throws (Stop), unprinted (the -UnitOnly caller parses stdout)
+            finally { $PSDefaultParameterValues.Remove('Get-Date:Date'); $WarningPreference = $psSavedWarn; $script:PsSeamFn = '' }
+            $pids = @($script:PsSeamPids)
+            $null = Wait-Until { @($pids | Where-Object { Test-PidAlive $_ }).Count -eq 0 } 3
+            return [pscustomobject]@{ out = $out; threw = $threw; pids = $pids; alive = @($pids | Where-Object { Test-PidAlive $_ }); stops = $script:PsStops }
+        }
+        function Test-PsStopped([string]$Case, $R) {
+            if ($R.pids.Count -ne 1) { $psFails.Add("($Case) the seam fired after Process.Start returned exactly one child: pids=[$($R.pids -join ',')] threw=[$($R.threw)]"); return }
+            if ($R.alive.Count -ne 0 -or $R.stops -lt 1) { $psFails.Add("($Case) the started child is stopped before the failure is reported: alive=[$($R.alive -join ',')] stopCalls=$($R.stops)") }
+        }
+        try {
+            $script:StatusStub = @{ ok = $true; error = $null; lines = @('slot 1: free', 'slot 2: free') }; $script:StatusDelaySec = 300
+            Reset-Case @{ request = 'active' }
+            Sync-FakeStatus
+            # snapshot
+            $n0 = $script:LeaseSlotSnapshots.Count
+            $rS = Invoke-PsSeam 'Start-HeavySlotCli' { Add-LeaseSlotSnapshot -JobId 'jPsSn' -Phase 'grant' -HeadroomSec 600 }
+            $regS = $script:LeaseSlotSnapshots.Count - $n0
+            $lS = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jPsSn *' })
+            Test-PsStopped 'snapshot' $rS
+            if ($regS -ne 0) { $psFails.Add("(snapshot) a probe whose start failed is not registered: registered=$regS") }
+            if ($lS.Count -ne 1 -or $lS[0] -notmatch ' phase=grant slots=unknown\(heavy-slot\.py status --slots \d+ failed to start: .*postStartStop=stopped\)\)?$') { $psFails.Add("(snapshot) the line names postStartStop=stopped: [$($lS -join ' || ')]") }
+            # direct
+            $rD = Invoke-PsSeam 'Start-HeavySlotCli' { Start-HeavySlotCli -Arguments @('status', '--slots', '2') }
+            Test-PsStopped 'direct' $rD
+            if ($null -eq $rD.out -or $rD.out.ok -ne $false -or [string]$rD.out.postStartStop -cne 'stopped' -or $null -ne $rD.out.proc -or [string]$rD.out.why -notmatch 'postStartStop=stopped') { $psFails.Add("(direct) ok=False postStartStop=stopped and no proc: ok=$($rD.out.ok) postStartStop=$($rD.out.postStartStop) proc=$($null -ne $rD.out.proc) why=[$($rD.out.why)]") }
+            # complete
+            $rC = Invoke-PsSeam 'Start-HeavySlotCli' { Complete-HeavySlotCli -Call (Start-HeavySlotCli -Arguments @('status', '--slots', '2')) -TimeoutSec 5 }
+            Test-PsStopped 'complete' $rC
+            if ($null -eq $rC.out -or $rC.out.done -ne $false) { $psFails.Add("(complete) done=False: [$($rC.out | ConvertTo-Json -Compress)] threw=[$($rC.threw)]") }
+            # renew
+            Reset-Case @{ request = 'active'; renew_hang = $true }
+            $me = [System.Diagnostics.Process]::GetCurrentProcess()
+            $lR = [pscustomobject]@{ jobId = 'jPsRn'; label = 'quiet-lease mlv'; proc = $me; active = [pscustomobject]@{ slot = 1 }; renewCall = $null
+                lastRenewStart = [DateTime]::Now.AddSeconds(-600); renewMaxGapSec = 0; renewStarts = 0; renewFailures = 0; renewSlow = 0; renewsOk = 0 }
+            $rR = Invoke-PsSeam 'Start-HeavySlotCli' { Update-QuietLeaseRenew -Lease $lR }
+            Test-PsStopped 'renew' $rR
+            if ($null -ne $lR.renewCall -or $lR.renewFailures -ne 1) { $psFails.Add("(renew) a failed start is a renew failure, never a renew in flight: renewCall=$($null -ne $lR.renewCall) renewFailures=$($lR.renewFailures)") }
+            if ($null -ne $lR.renewCall) { try { $lR.renewCall.proc.Kill($true) } catch { } }
+            # request
+            Reset-Case @{ request = 'active' }
+            $recs0 = @(Get-ChildItem -LiteralPath $slotHolders -Filter '*.lease.json' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name })
+            $rQ = Invoke-PsSeam 'Start-QuietLeaseRequest' { Start-QuietLeaseRequest -JobId 'jPsRq' -Minutes 5 -AdmitTimeoutSec 60 }
+            $recsNew = @(Get-ChildItem -LiteralPath $slotHolders -Filter '*.lease.json' -File -ErrorAction SilentlyContinue | Where-Object { $recs0 -notcontains $_.Name })
+            Test-PsStopped 'request' $rQ
+            if ($null -eq $rQ.out -or $rQ.out.ok -ne $false -or [string]$rQ.out.postStartStop -cne 'stopped' -or [string]$rQ.out.why -notmatch 'postStartStop=stopped') { $psFails.Add("(request) ok=False postStartStop=stopped: ok=$($rQ.out.ok) why=[$($rQ.out.why)] threw=[$($rQ.threw)]") }
+            if ($recsNew.Count -ne 0) { $psFails.Add("(request) a stopped wrapper's record is removed: [$($recsNew.Name -join ',')]") }
+            foreach ($f in $recsNew) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
+            # status
+            . ([scriptblock]::Create((Get-FunctionBody 'Invoke-HeavySlotStatus')))
+            Reset-Case @{ request = 'active' }
+            Sync-FakeStatus
+            $rT = Invoke-PsSeam 'Invoke-HeavySlotStatus' { Invoke-HeavySlotStatus -HeartbeatActivity 'unit' }
+            Test-PsStopped 'status' $rT
+            if ($null -eq $rT.out -or $rT.out.ok -ne $false -or [string]$rT.out.error -notmatch 'postStartStop=stopped') { $psFails.Add("(status) ok=False naming postStartStop=stopped: ok=$($rT.out.ok) error=[$($rT.out.error)]") }
+            # partial (adversary r2-7778595e A1): Kill(true) ends the root but throws AggregateException for a descendant it could not end;
+            # that is stop-failed (the caller keeps the process), never stopped. A fake process: Kill throws, WaitForExit says the root exited.
+            if ($null -eq $script:PsStopAfterReal) { $psFails.Add("(partial) Stop-ProcessAfterStartFailure exists") }
+            else {
+                $fake = [pscustomobject]@{ HasExited = $false }
+                $fake | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($t) throw [System.AggregateException]::new('unit: not all processes in the tree could be terminated') }
+                $fake | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) return $true }
+                $pp = & $script:PsStopAfterReal -Process $fake
+                if ([string]$pp -cne 'stop-failed') { $psFails.Add("(partial) a tree Kill that threw AggregateException is stop-failed: got [$pp]") }
+            }
+            Assert-True ($psFails.Count -eq 0) "post-start failure stops the started child (sol r1 B4-post-start): $($psFails -join ' ;; ')"
+            $results.leaseStartPostStartFailure = [ordered]@{ snapshot = $lS; direct = $rD.out.why; request = $rQ.out.why; status = $rT.out.error }
+        }
+        finally {
+            $PSDefaultParameterValues.Remove('Get-Date:Date')
+            $WarningPreference = $psSavedWarn
+            $script:LeaseSlotSnapshots = $psSavedList
+            Set-Item -LiteralPath Function:\Stop-HeavySlotCli -Value $script:PsStopCliReal
+            if ($null -ne $script:PsStopAfterReal) { Set-Item -LiteralPath Function:\Stop-ProcessAfterStartFailure -Value $script:PsStopAfterReal }
+            if ($null -ne $psStatusReal) { Set-Item -LiteralPath Function:\Invoke-HeavySlotStatus -Value $psStatusReal }
+            foreach ($k in @($script:PsSeamPids)) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
+            $script:StatusDelaySec = 0
+            Update-LeaseSlotSnapshots -Abandon 'test case end'
+        }
+    }
+    # AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r3 (sol r2b B1): a child that started, then a failed setup, then a cleanup Dispose that throws (a buffered
+    # FileStream flushes on Dispose). Controlled objects, not a real child or a real disk fault: a fake Process whose stop is stopped or stop-failed
+    # and fake out/err streams, one of whose Dispose throws IOException. One table, {out, err} Dispose throws x {stop-failed, stopped}; every cell:
+    #   helper  - Start-WindowlessRedirectedProcess's catch body, replayed from the agent's AST: the exception delivered is the prepared one (never the
+    #             Dispose's), postStartStop is present, Data.process is present on stop-failed, and the other disposal still ran;
+    #   holder  - Start-HeavySlotHolder RUN over that throw (A:2643): on stop-failed it stops the handed-back holder again and writes its release file;
+    #   post    - Start-HeavySlotHolder RUN with a launch whose record setup throws (A:2671): it stops the holder (deleting that call goes RED), keeps
+    #             a stop-failed launch with its release file, and disposes both streams and the process of a stopped one, the throwing one included;
+    #   job     - Invoke-QueuedJob RUN over that throw (A:4330): on stop-failed it stops the handed-back child again; its stderr names postStartStop.
+    # RED on 3d793edb: the Dispose's exception replaced the prepared one (no postStartStop, no Data.process) and skipped the later disposal.
+    if (Test-Case 'lease-start-post-start-cleanup-throws') {
+        $pcFails = [System.Collections.Generic.List[string]]::new()
+        $pcLaunchReal = ${function:Start-WindowlessRedirectedProcess}   # the queued-job cases' stub
+        foreach ($name in @('Start-HeavySlotHolder', 'New-HeavySlotSentinelCommand')) { . ([scriptblock]::Create((Get-FunctionBody $name))) }
+        $pcSavedAgentProcess = $script:AgentProcess
+        $script:AgentProcess = [System.Diagnostics.Process]::GetCurrentProcess()   # the sentinel command reads the agent's start time (never run here)
+        $pcFn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-WindowlessRedirectedProcess' }, $true)
+        $pcTry = $pcFn.Body.Find({ param($n) $n -is [System.Management.Automation.Language.TryStatementAst] }, $true)
+        Assert-True ($null -ne $pcTry -and $pcTry.CatchClauses.Count -eq 1) "Start-WindowlessRedirectedProcess has one try with one catch"
+        $script:PcReplay = [scriptblock]::Create("param(`$process, `$outStream, `$errStream, [bool]`$started)`ntry { throw 'unit: the pipe copy failed after the start' }`ncatch $($pcTry.CatchClauses[0].Body.Extent.Text)")
+        function New-PcFake([string]$Stop, [string]$Throws, [string]$Id = '') {
+            $proc = [pscustomobject]@{ tag = "pc-$([guid]::NewGuid().ToString('N').Substring(0, 8))"; HasExited = $false; Id = $Id; kills = 0; disposed = 0; exits = ($Stop -ceq 'stopped') }
+            $proc | Add-Member -MemberType ScriptMethod -Name Kill -Value { param($t) $this.kills++ }
+            $proc | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) return [bool]$this.exits }
+            $proc | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.disposed++ }
+            $streams = foreach ($n in @('out', 'err')) {
+                $s = [pscustomobject]@{ name = $n; disposed = 0; throws = ($Throws -ceq $n) }
+                $s | Add-Member -MemberType ScriptMethod -Name Dispose -Value { $this.disposed++; if ($this.throws) { throw [System.IO.IOException]::new('unit: flush failed') } }
+                $s
+            }
+            return [pscustomobject]@{ proc = $proc; out = $streams[0]; err = $streams[1] }
+        }
+        function Get-PcDataValue($Exception, [string]$Key) { try { return $Exception.Data[$Key] } catch { return $null } }
+        $pcRows = [ordered]@{}
+        try {
+            foreach ($cell in @(@('out', 'stop-failed'), @('err', 'stop-failed'), @('out', 'stopped'), @('err', 'stopped'))) {
+                $throws = $cell[0]; $stop = $cell[1]; $c = "$throws/$stop"; $k = "$($throws.Substring(0, 1))$(if ($stop -ceq 'stopped') { 's' } else { 'f' })"
+                # helper
+                $f = New-PcFake $stop $throws
+                $got = $null
+                try { & $script:PcReplay $f.proc $f.out $f.err $true } catch { $got = $_.Exception }
+                $gotProc = Get-PcDataValue $got 'process'
+                if ($got -isnot [System.InvalidOperationException] -or [string](Get-PcDataValue $got 'postStartStop') -cne $stop) { $pcFails.Add("($c helper) the prepared exception is delivered with postStartStop=${stop}: got $(if ($null -ne $got) { $got.GetType().Name }) [$(if ($null -ne $got) { $got.Message })]") }
+                if ($stop -ceq 'stop-failed' -and ($null -eq $gotProc -or [string]$gotProc.tag -cne $f.proc.tag)) { $pcFails.Add("($c helper) Data.process is the undisposed child: present=$($null -ne $gotProc)") }
+                if ($stop -ceq 'stopped' -and ($null -ne $gotProc -or $f.proc.disposed -ne 1)) { $pcFails.Add("($c helper) a stopped child is disposed, not handed back: handed=$($null -ne $gotProc) disposed=$($f.proc.disposed)") }
+                if ($f.out.disposed -ne 1 -or $f.err.disposed -ne 1) { $pcFails.Add("($c helper) both streams are disposed when one Dispose throws: out=$($f.out.disposed) err=$($f.err.disposed)") }
+                if (@(Get-PcDataValue $got 'cleanupErrors') -join ' ' -notmatch 'flush failed') { $pcFails.Add("($c helper) the Dispose failure is appended as Data.cleanupErrors: [$(@(Get-PcDataValue $got 'cleanupErrors') -join ' | ')]") }
+                # holder (A:2643)
+                $script:PcF = New-PcFake $stop $throws
+                function Start-WindowlessRedirectedProcess { param([string]$FilePath, [string[]]$ArgumentList, [string]$OutFile, [string]$ErrFile, [string]$WorkingDirectory, [hashtable]$Environment) & $script:PcReplay $script:PcF.proc $script:PcF.out $script:PcF.err $true }
+                $h = Start-HeavySlotHolder -JobId "jPcH$k" -Label 'unit pc'
+                $hRel = @(Get-ChildItem -LiteralPath $fx -Filter "jPcH$k.*.release" -File -ErrorAction SilentlyContinue)
+                if ($null -eq $h -or $h.ok -ne $false) { $pcFails.Add("($c holder) ok=False: $($h | ConvertTo-Json -Compress -Depth 2)") }
+                if ($stop -ceq 'stop-failed' -and ($script:PcF.proc.kills -ne 2 -or $hRel.Count -ne 1)) { $pcFails.Add("($c holder) the handed-back holder is stopped again and its release file written: kills=$($script:PcF.proc.kills) release=$($hRel.Count) why=[$($h.why)]") }
+                if ($stop -ceq 'stopped' -and ($script:PcF.proc.kills -ne 1 -or [string]$h.why -notmatch 'postStartStop=stopped')) { $pcFails.Add("($c holder) a stopped holder is reported stopped: kills=$($script:PcF.proc.kills) why=[$($h.why)]") }
+                # post (A:2671): the launch returned; Get-ProcessIdentity's [int] binding of a non-numeric pid throws inside the record setup.
+                $script:PcF = New-PcFake $stop $throws 'unit-not-a-pid'
+                function Start-WindowlessRedirectedProcess { param([string]$FilePath, [string[]]$ArgumentList, [string]$OutFile, [string]$ErrFile, [string]$WorkingDirectory, [hashtable]$Environment) return [pscustomobject]@{ Process = $script:PcF.proc; OutStream = $script:PcF.out; ErrStream = $script:PcF.err } }
+                $hp = Start-HeavySlotHolder -JobId "jPcP$k" -Label 'unit pc'
+                $pRel = @(Get-ChildItem -LiteralPath $fx -Filter "jPcP$k.*.release" -File -ErrorAction SilentlyContinue)
+                $pp = $script:PcF
+                if ($null -eq $hp -or $hp.ok -ne $false -or [string]$hp.postStartStop -cne $stop -or $pp.proc.kills -ne 1) { $pcFails.Add("($c post) the holder is stopped once and reported postStartStop=${stop}: ok=$($hp.ok) postStartStop=$($hp.postStartStop) kills=$($pp.proc.kills)") }
+                if ($stop -ceq 'stop-failed' -and ($null -eq $hp.launch -or [string]$hp.launch.Process.tag -cne $pp.proc.tag -or $pRel.Count -ne 1 -or $pp.out.disposed + $pp.err.disposed + $pp.proc.disposed -ne 0)) { $pcFails.Add("($c post) a stop-failed holder is kept undisposed with its release file: launch=$($null -ne $hp.launch) release=$($pRel.Count) disposed=$($pp.out.disposed)/$($pp.err.disposed)/$($pp.proc.disposed)") }
+                if ($stop -ceq 'stopped' -and ($null -ne $hp.launch -or $pp.out.disposed -ne 1 -or $pp.err.disposed -ne 1 -or $pp.proc.disposed -ne 1)) { $pcFails.Add("($c post) a stopped holder's streams and process are all disposed: launch=$($null -ne $hp.launch) disposed=$($pp.out.disposed)/$($pp.err.disposed)/$($pp.proc.disposed)") }
+                # job (A:4330)
+                $job = Reset-QueuedJobCase @{ request = 'active' } "jPcJ$k" (New-NotAfterMetaJson 600)
+                $script:PcF = New-PcFake $stop $throws
+                function Start-WindowlessRedirectedProcess { param([string]$FilePath, [string[]]$ArgumentList, [string]$OutFile, [string]$ErrFile, [string]$WorkingDirectory, [hashtable]$Environment) $script:QJ.launches.Add("$FilePath $($ArgumentList -join ' ')"); & $script:PcReplay $script:PcF.proc $script:PcF.out $script:PcF.err $true }
+                try { $null = Invoke-QueuedJob -Job $job } finally { Exit-HeavySlot }
+                $jp = @($script:QJ.published)
+                if ($script:QJ.launches.Count -ne 1 -or $jp.Count -ne 1 -or [string]$jp[0].stderr -notmatch "postStartStop=$stop") { $pcFails.Add("($c job) the launch is reached once and its stderr names postStartStop=${stop}: launches=$($script:QJ.launches.Count) stderr=[$(if ($jp.Count -gt 0) { $jp[0].stderr })]") }
+                if ($stop -ceq 'stop-failed' -and ($script:PcF.proc.kills -ne 2 -or $script:PcF.proc.disposed -ne 1)) { $pcFails.Add("($c job) the handed-back child is stopped again and then disposed: kills=$($script:PcF.proc.kills) disposed=$($script:PcF.proc.disposed)") }
+                if ($stop -ceq 'stopped' -and $script:PcF.proc.kills -ne 1) { $pcFails.Add("($c job) a stopped child is not stopped again: kills=$($script:PcF.proc.kills)") }
+                $pcRows[$c] = [ordered]@{ delivered = $(if ($null -ne $got) { $got.GetType().Name }); postStartStop = (Get-PcDataValue $got 'postStartStop'); holderWhy = $h.why; post = $hp.postStartStop }
+            }
+            Assert-True ($pcFails.Count -eq 0) "post-start handoff survives a throwing cleanup Dispose (sol r2b B1): $($pcFails -join ' ;; ')"
+            $results.leaseStartPostStartCleanupThrows = $pcRows
+        }
+        finally {
+            Set-Item -LiteralPath Function:\Start-WindowlessRedirectedProcess -Value $pcLaunchReal
+            $script:AgentProcess = $pcSavedAgentProcess
+            foreach ($f2 in @(Get-ChildItem -LiteralPath $fx -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'jPc[HP]*' })) { Remove-Item -LiteralPath $f2.FullName -Force -ErrorAction SilentlyContinue }
         }
     }
     if ($Only.Count -gt 0) { $results.only = @($Only) }
