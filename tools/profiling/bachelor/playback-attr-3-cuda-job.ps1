@@ -1548,8 +1548,16 @@ function Get-PresentMonParentIdentity([int]$ProcessId, [string]$Name) {
         if ($parentRows.Count -ne 1) { $result['identityError'] = "parent_row_count=$($parentRows.Count)"; return $result }
         $result['parentName'] = [string]$parentRows[0].Name
         if ($null -eq $self[0].CreationDate -or $null -eq $parentRows[0].CreationDate) { $result['identityError'] = 'creation_date_unreadable'; return $result }
-        if (([datetime]$parentRows[0].CreationDate) -gt ([datetime]$self[0].CreationDate)) { $result['identityError'] = 'parent_started_after_child'; return $result }
+        # r2 (adversary A1): compare INSTANTS, never wall clocks (a parent started after the child across a DST change reads earlier on the wall clock): a DateTimeOffset by its UtcDateTime, a
+        # DateTime by ToUniversalTime() (CIM's local DateTime keeps its daylight/standard side, so the repeated hour converts to the right instant)
+        $instants = @()
+        foreach ($stamp in @($self[0].CreationDate, $parentRows[0].CreationDate)) {
+            if ($stamp -is [DateTimeOffset]) { $instants += $stamp.UtcDateTime }
+            else { $instants += ([datetime]$stamp).ToUniversalTime() }
+        }
+        if ($instants[1] -gt $instants[0]) { $result['identityError'] = 'parent_started_after_child'; return $result }
         if ($result.parentName -ieq 'IntelGraphicsSoftware.Service.exe') { $result['nonCaptureIdentity'] = 'intel_graphics_presentmonservice' }
+        else { $result['identityError'] = 'parent_not_intel_graphics_service' }
     } catch {
         $result['nonCaptureIdentity'] = $null
         $result['identityError'] = 'parent_read_failed: ' + $_.Exception.Message

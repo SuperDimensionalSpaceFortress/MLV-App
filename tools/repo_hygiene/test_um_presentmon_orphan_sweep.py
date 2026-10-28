@@ -307,6 +307,11 @@ class ModuleFunctionTests(unittest.TestCase):
         for part in ("aborted=presentmon_process_started_during_sweep", "remaining=MLVAttr3-b", "deferred=PresentMon", "livePids=7001"):
             self.assertIn(part, got["reason"])
 
+    def test_a2_a_session_that_appeared_after_the_scan_is_named_in_the_detail(self) -> None:
+        # adversary A2: nothing skipped, aborted, remaining or deferred, but the final listing holds a session the first did not -- the host was never verified clean
+        got = self.sweep_detail("[ordered]@{ ran = $true; skippedReason = $null; abortedReason = $null; remaining = @(); deferred = @(); newlyListed = @('MLVAttr3-other-killed-job'); listError = $null; error = $null; livePresentMonProcessIds = @(7001) }")
+        self.assertEqual(got["reason"], "PresentMon output does not exist: X [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: newlyListed=MLVAttr3-other-killed-job livePids=7001]")
+
     def test_a_sweep_that_left_the_host_clean_adds_nothing(self) -> None:
         for sweep in ("[ordered]@{ ran = $true; skippedReason = $null; abortedReason = $null; remaining = @(); deferred = @(); listError = $null; error = $null }", "$null"):
             got = self.sweep_detail(sweep)
@@ -480,7 +485,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         go_live_row = (process_row(*go_live_as) if go_live_as is not None
                        else "[pscustomobject]@{ Id = 5151; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }")
         service_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}' }}" for i, n in services)
-        process_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}'; ParentProcessId = {pp}; CreationMinute = {('$null' if m is None else m)} }}" for i, n, pp, m in processes)
+        # a creation stamp is a minute offset (a local DateTime), None (unreadable), or an ISO string with an offset (a DateTimeOffset: the instant is fixed whatever the host's zone)
+        process_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}'; ParentProcessId = {pp}; CreationMinute = {('$null' if m is None else (ps_quote(m) if isinstance(m, str) else m))} }}" for i, n, pp, m in processes)
         script = d / "probe.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
@@ -513,7 +519,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             f"    if ($ClassName -eq 'Win32_Process') {{\n"
             f"        $processRows = @({process_rows})\n"
             "        foreach ($r in $processRows) { if ($r.ProcessId -eq $want) { [pscustomobject]@{ Name = $r.Name; ProcessId = $r.ProcessId; ParentProcessId = $r.ParentProcessId; "
-            "CreationDate = $(if ($null -eq $r.CreationMinute) { $null } else { (Get-Date '2026-10-27T00:00:00').AddMinutes([int]$r.CreationMinute) }) } } }\n"
+            "CreationDate = $(if ($null -eq $r.CreationMinute) { $null } elseif ($r.CreationMinute -is [string] -and $r.CreationMinute.StartsWith('local:')) { [DateTimeOffset]::Parse($r.CreationMinute.Substring(6)).LocalDateTime } elseif ($r.CreationMinute -is [string]) { [DateTimeOffset]::Parse($r.CreationMinute) } else { (Get-Date '2026-10-27T00:00:00').AddMinutes([int]$r.CreationMinute) }) } } }\n"
             "        return\n"
             "    }\n"
             + "    if ($ClassName -ne 'Win32_Service') { throw \"the sweep asked CIM for $ClassName\" }\n"
@@ -521,7 +527,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "    foreach ($s in $services) { if ($s.ProcessId -eq $want) { [pscustomobject]@{ Name = $s.Name; ProcessId = $s.ProcessId } } }\n"
             "}\n"
             # the sweep's wrappers run an executable (bounded by a deadline), so the stub is one: a .cmd shim around a pwsh script
-            f"$presentMonLogmanPath = '{ps(logman_stub)}'\n"
+            + f"$presentMonLogmanPath = '{ps(logman_stub)}'\n"
             + (f"$presentMonLogmanTimeoutSeconds = {logman_timeout_seconds}\n" if logman_timeout_seconds else "")
             + f"$Cache ='{ps(d / 'cache')}'\n$PresentMonName = '{STUB_EXE}'\n$ExeName = 'MLVApp.exe'\n$PresentMonTimedSeconds = 60\n"
             "$PresentMonSessionName = 'MLVAttr3-the-new-job'\n$PresentMonTerminateOnProcExit = $true\n"
@@ -700,8 +706,26 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
 
     def test_h3_a_presentmonservice_under_another_parent_is_a_blocker(self) -> None:
         detail, _d = self.h3("h3-other-parent", processes=((7001, "PresentMonService", 901, 10), (901, "explorer.exe", 4, 5)))
-        self.assertEqual((detail.get("parentName"), detail.get("parentPid"), detail.get("identityError")), ("explorer.exe", 901, None))
+        # adversary A5: the refusal says why
+        self.assertEqual((detail.get("parentName"), detail.get("parentPid"), detail.get("identityError")), ("explorer.exe", 901, "parent_not_intel_graphics_service"))
 
+    def test_a1_a_parent_started_after_the_child_across_an_offset_change_is_no_evidence(self) -> None:
+        # adversary A1's input: the child started 06:55Z (01:55-05:00, daylight), its parent exited, and pid 900 now belongs to an Intel service started 07:10Z (01:10-06:00, standard). On the
+        # wall clock the replacement parent reads EARLIER than the child; as instants it is later, so it is no evidence
+        detail, _d = self.h3("a1-offset-change", processes=((7001, "PresentMonService", 900, "2026-11-01T01:55:00-05:00"), (900, "IntelGraphicsSoftware.Service.exe", 4, "2026-11-01T01:10:00-06:00")))
+        self.assertEqual(detail.get("identityError"), "parent_started_after_child")
+
+    def test_a1_the_cim_shape_a_local_datetime_is_compared_as_an_instant(self) -> None:
+        # the real Win32_Process CreationDate is a LOCAL DateTime (the same instants converted to the host's zone). On a host whose zone leaves daylight time at 2026-11-01T07:00Z (US Central,
+        # the venues' zone) the parent's wall clock reads 01:10 and the child's 01:55, so a wall-clock compare accepts the reused pid; on a UTC host the wall clocks already agree with the instants
+        detail, _d = self.h3("a1-local", processes=((7001, "PresentMonService", 900, "local:2026-11-01T06:55:00Z"), (900, "IntelGraphicsSoftware.Service.exe", 4, "local:2026-11-01T07:10:00Z")))
+        self.assertEqual(detail.get("identityError"), "parent_started_after_child")
+
+    def test_a1_the_same_offsets_in_the_right_order_still_identify_the_intel_child(self) -> None:
+        code, sweep, d, out = self.run_start("a1-offset-ok", others=(self.SERVICE_UNREADABLE,), processes=((7001, "PresentMonService", 900, "2026-11-01T01:10:00-06:00"), (900, "IntelGraphicsSoftware.Service.exe", 4, "2026-11-01T01:55:00-05:00")))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["livePresentMonProcesses"][0]["nonCaptureIdentity"], "intel_graphics_presentmonservice", sweep)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
     def test_h3_a_presentmonservice_whose_parent_read_throws_is_a_blocker_with_the_reason(self) -> None:
         detail, _d = self.h3("h3-read-throws", processes=self.INTEL_TREE, process_lookup_fails=True)
         self.assertIn("parent_read_failed", str(detail.get("identityError")))
@@ -794,7 +818,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertTrue(sweep["ran"])
 
     def test_mutation_without_the_creation_order_check_a_reused_parent_pid_identifies_the_service(self) -> None:
-        mutated = mutate(TEMPLATE, "if (([datetime]$parentRows[0].CreationDate) -gt ([datetime]$self[0].CreationDate)) {", "if ($false) {")
+        mutated = mutate(TEMPLATE, "if ($instants[1] -gt $instants[0]) {", "if ($false) {")
         _code, sweep, _d, _out = self.run_start("mut-creation", others=(self.SERVICE_UNREADABLE,), processes=((7001, "PresentMonService", 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 20)), text=mutated)
         self.assertTrue(sweep["ran"])
 

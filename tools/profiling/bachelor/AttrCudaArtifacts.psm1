@@ -2343,7 +2343,7 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     $field = @{}
     $parts = @()
     try {
-        foreach ($name in @('skippedReason', 'abortedReason', 'remaining', 'deferred', 'listError', 'error', 'livePresentMonProcessIds')) {
+        foreach ($name in @('skippedReason', 'abortedReason', 'remaining', 'deferred', 'newlyListed', 'listError', 'error', 'livePresentMonProcessIds')) {
             if ($Sweep -is [System.Collections.IDictionary]) { if ($Sweep.Contains($name)) { $field[$name] = $Sweep[$name] } }
             else { $property = $Sweep.PSObject.Properties[$name]; if ($null -ne $property) { $field[$name] = $property.Value } }
         }
@@ -2355,6 +2355,9 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
         if ($remaining.Count -gt 0) { $parts += "remaining=$($remaining -join ',')" }
         $deferred = @(@($field['deferred']) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
         if ($deferred.Count -gt 0) { $parts += "deferred=$($deferred -join ',')" }
+        # r2 (adversary A2): a session the final listing shows that the first did not (another job's capture, or an orphan its kill left mid-sweep) means the host was never verified clean
+        $newlyListed = @(@($field['newlyListed']) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        if ($newlyListed.Count -gt 0) { $parts += "newlyListed=$($newlyListed -join ',')" }
         $listError = [string]$field['listError']
         if (-not [string]::IsNullOrEmpty($listError)) { $parts += "listError=$listError" }
         $sweepError = [string]$field['error']
