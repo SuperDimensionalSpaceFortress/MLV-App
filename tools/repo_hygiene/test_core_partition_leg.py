@@ -174,7 +174,10 @@ $pre = [regex]::Replace($pre, '(?m)^\$CorePartitionHelperAffinity = \[int64\]\d+
 function Write-JobTrace([string]$Message) { }
 function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText($Path, $Value) }
 function New-AttrCudaDirectory { param([string]$Path) }
-function Save-Json { param($Object, $Path) $global:cpSaved = $Object }
+# r13c (Dot 6456731376): each publication is captured BY VALUE (serialized as the real Save-Json does, at call time), so a later change to the
+# record object cannot make an earlier publication look republished; $global:cpSaveThrowOn makes that call (1-based) throw instead of publishing
+function Save-Json { param($Object, $Path) $global:cpSaveCalls++; if ($global:cpSaveThrowOn -eq $global:cpSaveCalls) { throw 'save-json-refused-by-test' }
+    $global:cpSaved = $Object | ConvertTo-Json -Depth 30 | ConvertFrom-Json -AsHashtable; $global:cpSaves.Add($global:cpSaved) }
 function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) $p = Join-Path $ContainingRoot 'run.log'; if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'run log unresolvable' }; [pscustomobject]@{ path = $p; sha256 = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() } }
 $exePath = 'C:\no\such\MLVApp.exe'
 $SmokeProcessTimeoutMs = 60000
@@ -188,7 +191,8 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     $pf = $env:ProgramFiles
     if ($mode -eq 'start-throws') { $env:ProgramFiles = Join-Path $Work 'no-such-program-files' }
     try { . ([scriptblock]::Create($pre)) } finally { $env:ProgramFiles = $pf }
-    [IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, "26.10.2026,01:00:02,x,70.0,45.0,No,No`n")
+    # r13c (rule (a)): the window row carries its HWiNFO stamp (local time), 400 ms after the measured launch, after the playback start (100 ms)
+    [IO.File]::AppendAllText($env:HEAVY_SLOT_FEED, $corePartitionMeasuredLaunchUtc.AddMilliseconds(400).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) + ",x,70.0,45.0,No,No`n")
     $resultPath = Join-Path $Work 'result.json'
     if ($mode -like 'good*') {
         # r11 B1: the stand-in helper writes no record, so the driver writes the genuine helper's (signed under the job's key, the runner's pid,
@@ -204,15 +208,19 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
         # r13b (A1): and its summary, whose stamp less the start's equals its monotonic elapsed_ms
         [IO.File]::WriteAllText((Join-Path $Work 'run.log'), '[' + $corePartitionMeasuredLaunchUtc.AddMilliseconds(100).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.start session=1 worker_threads=16`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(110).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.measured_session id=1`n[" + $corePartitionMeasuredLaunchUtc.AddMilliseconds(150).ToString('yyyy-MM-ddTHH:mm:ss.fffZ') + "] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=50.000 presented_frames=1`n")
     }
-    $global:cpSaved = $null
+    $global:cpSaved = $null; $global:cpSaves = [Collections.Generic.List[object]]::new(); $global:cpSaveCalls = 0
+    $global:cpSaveThrowOn = $(if ($mode -eq 'good-rebound-republish-throws') { 2 } else { 0 })
     . ([scriptblock]::Create($regions[1]))
     # r13b (A2 binding): the metrics read the same run log the start verdict read
     $rawLog = $(if (Test-Path -LiteralPath (Join-Path $Work 'run.log')) { [IO.File]::ReadAllText((Join-Path $Work 'run.log')) } else { "playback_smoke.start session=1 worker_threads=16`n" })
     # r13b (adversary r13b e02b23e3 A1): good-rebound's metrics read a different snapshot than the start verdict did
-    if ($mode -eq 'good-rebound') { $rawLog = $rawLog.Replace('worker_threads=16', 'worker_threads=8') }
+    if ($mode -like 'good-rebound*') { $rawLog = $rawLog.Replace('worker_threads=16', 'worker_threads=8') }
     . ([scriptblock]::Create($regions[2]))
     $ps = $global:cpSaved.feed.summary; $sc = $corePartitionScalars
+    $saves = @(foreach ($sv in $global:cpSaves) { $ss = $sv.feed.summary
+        , @($ss.rows, $ss.pkgWattsMean, $ss.pkgTempCMean, [string]$sv.feed.startWhy, @(foreach ($fw in @('rows', 'pkgWattsMean', 'pkgWattsMax', 'pkgTempCMean', 'pkgTempCMax', 'pkgThrottledRows')) { [string]$ss.reasons[$fw] })) })
     $out[$mode] = [ordered]@{
+        saveCalls = $global:cpSaveCalls; saves = $saves; publishWhy = [string]$corePartitionPublishWhy
         started = ($null -ne $corePartitionHelper); ready = [bool]$corePartitionHelperLaunch.ready; readyWhy = [string]$corePartitionHelperLaunch['readyWhy']
         notReady = [bool]$corePartitionHelperNotReady; helperWhy = [string]$corePartitionHelperWhy; publishedNotReady = [bool]$global:cpSaved.helperNotReady
         published = @($ps.rows, $ps.pkgWattsMean, $ps.pkgTempCMean, [string]$ps.reasons['pkgWattsMean']); startWhy = [string]$global:cpSaved.feed.startWhy; pkg = @($sc.pkgWattsMean, $sc.pkgWattsMax, $sc.pkgTempCMean, $sc.pkgTempCMax)
@@ -221,7 +229,7 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     if ($null -ne $corePartitionHelper -and -not $corePartitionHelper.HasExited) { $corePartitionHelper.Kill() }
   } catch { $out[$mode] = [ordered]@{ threw = [string]$_.Exception.Message + ' @ ' + [string]$_.InvocationInfo.PositionMessage } }
 }
-$out | ConvertTo-Json -Compress -Depth 5
+$out | ConvertTo-Json -Compress -Depth 8
 """
 
 
@@ -757,7 +765,7 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         work.mkdir()
         driver = self.tmp / "marker-driver.ps1"
         driver.write_text(LIFT + MARKER_DRIVER, encoding="ascii")
-        modes = ["start-throws", "directory", "foreign-key", "pre-r8-text", "empty", "good", "good-rebound"]
+        modes = ["start-throws", "directory", "foreign-key", "pre-r8-text", "empty", "good", "good-rebound", "good-rebound-republish-throws"]
         proc = run_pwsh(["-File", str(driver)], env_extra={"CP_JOB": str(self.out["a"]), "CP_OPEN": OPEN, "CP_CLOSE": CLOSE, "CP_FAKE_HELPER": MARKER_HELPER,
                                                            "CP_WORK": str(work), "CP_MODES": ",".join(modes), "CP_GEN": str(GENERATOR)})
         self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
@@ -790,6 +798,9 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertNotIn("threw", good, good)
         self.assertEqual([good["ready"], good["notReady"], good["readyWhy"]], [True, False, ""], good)
         self.assertEqual(good["published"][:3], [1, 45.0, 70.0], f"the right marker no longer opens the feed: {good}")
+        # r13c (Dot 6456731376 d): the good control publishes core-partition.json exactly once
+        self.assertEqual([good["saveCalls"], len(good["saves"])], [1, 1], good)
+        self.assertEqual(good["saves"][0][:4], [1, 45.0, 70.0, ""], good)
         # r13b (adversary r13b e02b23e3 A1): the same good run whose metrics read a different run-log text than the start verdict: on e02b23e3
         # core-partition.json kept rows 1 / 45 W / 70 C with startWhy null; now it is published again refused, as the summary is
         rebound = got["good-rebound"]
@@ -797,6 +808,23 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(rebound["published"], [None, None, None, "run-log-snapshot-mismatch"], rebound)
         self.assertEqual(rebound["startWhy"], "run-log-snapshot-mismatch", rebound)
         self.assertEqual(rebound["pkg"], [None] * 4, rebound)
+        # r13c (Dot 6456731376 a/b): each publication captured by value. Two publications: the first is the good window, the second (the
+        # republish) carries run-log-snapshot-mismatch on every window field and as startWhy. With the republish deleted there is one.
+        self.assertEqual([rebound["saveCalls"], len(rebound["saves"])], [2, 2], f"a snapshot mismatch did not publish core-partition.json again: {rebound}")
+        self.assertEqual(rebound["saves"][0][:4], [1, 45.0, 70.0, ""], rebound)
+        self.assertEqual(rebound["saves"][1][:4], [None, None, None, "run-log-snapshot-mismatch"], rebound)
+        self.assertEqual(rebound["saves"][1][4], ["run-log-snapshot-mismatch"] * 6, rebound)
+        self.assertEqual(rebound["publishWhy"], "", rebound)
+        # r13c (Dot 6456731376 c): the republish itself fails (the second Save-Json throws): the only publication on disk is the good window, so
+        # the summary must not stand on it: core-partition-json-unpublished, the republish error recorded, and no package-feed value
+        failed = got["good-rebound-republish-throws"]
+        self.assertNotIn("threw", failed, failed)
+        self.assertEqual([failed["saveCalls"], len(failed["saves"])], [2, 1], failed)
+        self.assertEqual(failed["publishWhy"], "core-partition-json-unpublished", failed)
+        self.assertIn("republish: save-json-refused-by-test", failed["errors"], failed)
+        self.assertEqual(failed["pkg"], [None] * 4, failed)
+        self.assertIn("pkgWattsMean=run-log-snapshot-mismatch", failed["why"], failed)
+        self.assertIn("core-partition-json-unpublished", failed["why"], failed)
 
     def test_the_jobs_key_reaches_only_the_helper(self) -> None:
         """sol r6 CP-06: the per-job key is drawn at run time, handed to the helper by environment (never the command line), never traced or
@@ -900,7 +928,8 @@ class CorePartitionGeneratorTests(unittest.TestCase):
                 # r10 B2: the feed window ends at the smoke run's monotonic end, with the declared 2000 ms slack for the end read; r11 B1: that end is
                 # stamped before the affinity restore and cross-checked against the app's last observed-alive poll, with the declared 10000 ms slack
                 self.assertIn("$corePartitionSmokeEndMonoMs = Get-CorePartitionMonoMs\n", text)
-                self.assertIn("(Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppAliveMonoMs 10000)", text)
+                # r13c (rule (a)): and its window opens at the verified playback start ($cpStartAnchor)
+                self.assertIn("$cpFeedWindow = Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppAliveMonoMs 10000 $cpStartAnchor\n", text)
                 self.assertLess(text.index("$corePartitionSmokeEndMonoMs = Get-CorePartitionMonoMs\n"), text.index("$corePartitionJobProc.ProcessorAffinity = [IntPtr][Convert]::ToInt64("))
                 self.assertLess(text.index("$corePartitionSmokeEndMonoMs = Get-CorePartitionMonoMs\n"), text.index("$corePartitionFeedEnd = Read-CorePartitionFeedSince"))
         # adversary r9 (5592421d) A1: the final pass enumerates same-path processes before it looks for the stop file
@@ -2307,6 +2336,10 @@ foreach ($k in $cases.Keys) {
     $now = [DateTime]::UtcNow
     $L = $now.AddMilliseconds(1000 - $c[0])
     $W = { param([double]$m) $L.AddMilliseconds($m - 1000).Ticks }
+    # r13c (CP-FEED-START-ANCHOR, rule (a)): a feed row's HWiNFO stamp (local d.M.yyyy,H:mm:ss.fff) for monotonic $m; the window row is stamped
+    # at 2000, after the measured session's playback start (1500)
+    $H = { param([double]$m) [DateTime]::new((& $W $m), [DateTimeKind]::Utc).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+    $row = (& $H 2000) + ",x,99,99,Yes,Yes`n"
     $corePartitionMeasuredLaunchUtc = $L; $corePartitionPreHelperUtc = $L.AddSeconds(-1)
     $corePartitionClockPairs = [Collections.Generic.List[object]]::new(); $corePartitionClockPairs.Add(@($corePartitionMeasuredLaunchUtc.Ticks, [double]1000))
     $corePartitionMeasuredLaunchMonoMs = [double]1000
@@ -2458,7 +2491,8 @@ def _r13_start_driver() -> str:
             ("(& $W 20850)", "(& $W 90850)"),
             ("$global:cpLog = Join-Path $dir 'run.log'; $global:cpSwap = $null\n",
              "$global:cpLog = $(if ($c[5] -eq -1) { $null } else { Join-Path $dir 'run.log' }); $global:cpSwap = $null\n"
-             "    $global:cpWindow = ('26.10.2026,12:00:00,x,30,10,No,No' + \"`n\") * $c[6] + ('26.10.2026,12:01:00,x,80,100,No,No' + \"`n\") * $c[7]\n"),
+             "    $pbAt = $(if ($null -eq $c[5] -or $c[5] -eq -1) { 61000 } else { $c[5] })\n"
+             "    $global:cpWindow = (@(for ($i = 0; $i -lt $c[6]; $i++) { (& $H (1500 + 1000 * $i)) + ',x,30,10,No,No' }) + @(for ($j = 0; $j -lt $c[7]; $j++) { (& $H ($pbAt + 500 + 1000 * $j)) + ',x,80,100,No,No' }) | ForEach-Object { $_ + \"`n\" }) -join ''\n"),
             (write_line,
              "    $Body = { param($ps, $pe) $(if ($null -eq $c[5]) { '' } else { '[' + (& $S $ps) + \"] [info] [0x1] playback_smoke.start session=1 position=0`n\" }) + '[' + (& $S 1600) + \"] [info] [0x1] playback_smoke.measured_session id=1`n\""
              " + $(if ($null -eq $c[5]) { '' } else { '[' + (& $S $pe) + \"] [info] [0x1] playback_smoke.summary session=1 reason=play-stop elapsed_ms=\" + (90500 - $c[5]).ToString('0.000', [Globalization.CultureInfo]::InvariantCulture) + \" presented_frames=1`n\" }) }\n"
@@ -2467,7 +2501,7 @@ def _r13_start_driver() -> str:
              "        if ($c.Count -gt 9 -and $c[9]) { $global:cpSwap = & $Body ($c[5] - 57000) (90500 - 57000) }\n"
              "    }\n"),
             ("    $out[$k] = [ordered]@{ end = $corePartitionSmokeEndMonoMs;",
-             "    $out[$k] = [ordered]@{ wattsMean = $f.pkgWattsMean; tempMean = $f.pkgTempCMean; start = @($pf.startGapMs, $pf.startSlackMs, [string]$pf.startWhy, $pf.playbackSession, ($null -ne $pf.playbackStartUtcTicks)); start2 = @($pf.startStampDisagreeMs, $pf.startGapMonoMaxMs); errors = @($corePartitionErrors); swapped = $(if ($null -ne $global:cpLog) { [IO.File]::ReadAllText($global:cpLog) -eq $global:cpSwap } else { $false }); end = $corePartitionSmokeEndMonoMs;")):
+             "    $out[$k] = [ordered]@{ wattsMean = $f.pkgWattsMean; tempMean = $f.pkgTempCMean; start = @($pf.startGapMs, [string]$pf.startWhy, $pf.playbackSession, ($null -ne $pf.playbackStartUtcTicks)); start2 = @($pf.startStampDisagreeMs, $pf.startGapMonoMaxMs); excluded = $pf.startExcludedRows; slackPublished = $pf.Contains('startSlackMs'); publishedRows = $pf.summary.rows; errors = @($corePartitionErrors); swapped = $(if ($null -ne $global:cpLog) { [IO.File]::ReadAllText($global:cpLog) -eq $global:cpSwap } else { $false }); end = $corePartitionSmokeEndMonoMs;")):
         if d.count(old) != 1:
             raise AssertionError(f"R11_CLEANUP changed shape near {old!r}")
         d = d.replace(old, new)
@@ -2476,6 +2510,7 @@ def _r13_start_driver() -> str:
     return d[:at] + """$cases = [ordered]@{
     'dot-60s-idle-then-30s-playback' = @(91000, 0, 90900, 90750, 2000, 61000, 60, 30)
     'playback-within-slack-control' = @(91000, 0, 90900, 90750, 2000, 4000, 3, 87)
+    'real-shape-first-line-to-start-23600' = @(91000, 0, 90900, 90750, 2000, 24600, 23, 66)
     'no-playback-start-line' = @(91000, 0, 90900, 90750, 2000, $null, 60, 30)
     'no-run-log' = @(91000, 0, 90900, 90750, 2000, -1, 60, 30)
     'adversary-r13-a1-utc-step-at-the-start-line' = @(91000, 0, 90900, 90750, 2000, 61000, 60, 30, 4000)
@@ -2495,47 +2530,104 @@ function Sm([double]$At, [string]$Elapsed, [int]$Sid = 1) { Ln $At ('playback_sm
 function Pick2($v) { @([string]$v.why, $v.gapMs, $v.stampDisagreeMs, $v.gapMonoMaxMs) }
 $m1 = (Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30000.000')
 $r = [ordered]@{}
-$r.withinSlackNoSkew = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 41000)
-$r.skewCountsAgainstTheBound = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 1500 10000 41000)
-$r.startMarkReadBeforeTheLaunch = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 2500 1000 0 10000 42500)
-$r.namedSlack = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 8000 41000)
-$r.beforeTheWindow = Pick (Get-CorePartitionPlaybackStart ((Ln -5000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 100 'playback_smoke.measured_session id=1') + "`n" + (Sm 25000 '30000.000')) $L.Ticks 1000 1000 100 10000 41000)
-$r.warmupSessionIgnored = Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=1 position=0'), (Sm 29000 '28000.000' 1), (Ln 30000 'playback_smoke.start session=2 position=0'), (Ln 30100 'playback_smoke.measured_session id=2'), (Sm 60000 '30000.000' 2)) -join "`n") $L.Ticks 1000 1000 0 10000 62000)
-$r.sessionPrefixIsNotTheSession = Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=12 position=0'), (Ln 1100 'playback_smoke.measured_session id=1'), (Sm 31000 '30000.000')) -join "`r`n") $L.Ticks 1000 1000 0 10000 41000)
-$r.summaryFallback = Pick (Get-CorePartitionPlaybackStart (@((Ln 2000 'playback_smoke.start session=3 position=0'), (Sm 40000 '38000.000' 3)) -join "`n") $L.Ticks 1000 1000 0 10000 42000)
-$r.unknownSkew = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 $null 10000 41000)
-$r.noSinkStamp = Pick (Get-CorePartitionPlaybackStart "playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0 10000 41000)
-$r.unparseableStamp = Pick (Get-CorePartitionPlaybackStart "[not-a-time] [info] [0x1] playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0 10000 41000)
-$r.noSession = Pick (Get-CorePartitionPlaybackStart (Ln 1000 'playback_smoke.start session=1 position=0') $L.Ticks 1000 1000 0 10000 41000)
-$r.emptyLog = Pick (Get-CorePartitionPlaybackStart '' $L.Ticks 1000 1000 0 10000 41000)
+$r.withinSlackNoSkew = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 41000)
+$r.skewCountsAgainstTheBound = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 1500 41000)
+$r.startMarkReadBeforeTheLaunch = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 2500 1000 0 42500)
+$r.beforeTheWindow = Pick (Get-CorePartitionPlaybackStart ((Ln -5000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 100 'playback_smoke.measured_session id=1') + "`n" + (Sm 25000 '30000.000')) $L.Ticks 1000 1000 100 41000)
+$r.warmupSessionIgnored = Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=1 position=0'), (Sm 29000 '28000.000' 1), (Ln 30000 'playback_smoke.start session=2 position=0'), (Ln 30100 'playback_smoke.measured_session id=2'), (Sm 60000 '30000.000' 2)) -join "`n") $L.Ticks 1000 1000 0 62000)
+$r.sessionPrefixIsNotTheSession = Pick (Get-CorePartitionPlaybackStart (@((Ln 1000 'playback_smoke.start session=12 position=0'), (Ln 1100 'playback_smoke.measured_session id=1'), (Sm 31000 '30000.000')) -join "`r`n") $L.Ticks 1000 1000 0 41000)
+$r.summaryFallback = Pick (Get-CorePartitionPlaybackStart (@((Ln 2000 'playback_smoke.start session=3 position=0'), (Sm 40000 '38000.000' 3)) -join "`n") $L.Ticks 1000 1000 0 42000)
+$r.unknownSkew = Pick (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 $null 41000)
+$r.noSinkStamp = Pick (Get-CorePartitionPlaybackStart "playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0 41000)
+$r.unparseableStamp = Pick (Get-CorePartitionPlaybackStart "[not-a-time] [info] [0x1] playback_smoke.start session=1 position=0`nplayback_smoke.measured_session id=1" $L.Ticks 1000 1000 0 41000)
+$r.noSession = Pick (Get-CorePartitionPlaybackStart (Ln 1000 'playback_smoke.start session=1 position=0') $L.Ticks 1000 1000 0 41000)
+$r.emptyLog = Pick (Get-CorePartitionPlaybackStart '' $L.Ticks 1000 1000 0 41000)
 # r13b (adversary r13 028f4619 A1): the stamp is trusted only when the app's monotonic elapsed_ms agrees with it, and the stamped gap is under the
 # job's monotonic ceiling. The adversary's input: playback really starts at L+60000 (mono 61000); a backward step between two polls stamps it L+3000.
 $a1 = @((Ln 3000 'playback_smoke.start session=1 position=0 worker_threads=8'), (Ln 3010 'playback_smoke.measured_session id=1'), (Sm 89500 '29500.000')) -join "`n"
-$r.a1StepAtTheStartLine = Pick2 (Get-CorePartitionPlaybackStart $a1 $L.Ticks 1000 1000 0 10000 91000)
-$r.a1StepAtTheSummaryLine = Pick2 (Get-CorePartitionPlaybackStart (@((Ln 9000 'playback_smoke.start session=1 position=0'), (Ln 9100 'playback_smoke.measured_session id=1'), (Sm 20000 '30000.000')) -join "`n") $L.Ticks 1000 1000 0 10000 41000)
-$r.a1NoSummary = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1')) $L.Ticks 1000 1000 0 10000 41000)
-$r.a1SummaryWithoutElapsed = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Ln 39000 'playback_smoke.summary session=1 reason=play-stop paced_elapsed_ms=30000.000')) $L.Ticks 1000 1000 0 10000 41000)
-$r.a1AnotherSessionsSummary = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30000.000' 2)) $L.Ticks 1000 1000 0 10000 41000)
-$r.a1WithinTolerance = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30200.000')) $L.Ticks 1000 1000 0 10000 41000)
-$r.a1PastTolerance = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30300.000')) $L.Ticks 1000 1000 0 10000 41000)
-$r.a1SkewWidensTolerance = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30300.000')) $L.Ticks 1000 1000 100 10000 41000)
-$r.a1NoWindowEnd = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 $null)
-$r.a1StampPastTheMonotonicCeiling = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 35000)
-$r.a1Consistent = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 10000 41000)
+$r.a1StepAtTheStartLine = Pick2 (Get-CorePartitionPlaybackStart $a1 $L.Ticks 1000 1000 0 91000)
+$r.a1StepAtTheSummaryLine = Pick2 (Get-CorePartitionPlaybackStart (@((Ln 9000 'playback_smoke.start session=1 position=0'), (Ln 9100 'playback_smoke.measured_session id=1'), (Sm 20000 '30000.000')) -join "`n") $L.Ticks 1000 1000 0 41000)
+$r.a1NoSummary = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1')) $L.Ticks 1000 1000 0 41000)
+$r.a1SummaryWithoutElapsed = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Ln 39000 'playback_smoke.summary session=1 reason=play-stop paced_elapsed_ms=30000.000')) $L.Ticks 1000 1000 0 41000)
+$r.a1AnotherSessionsSummary = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30000.000' 2)) $L.Ticks 1000 1000 0 41000)
+$r.a1WithinTolerance = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30200.000')) $L.Ticks 1000 1000 0 41000)
+$r.a1PastTolerance = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30300.000')) $L.Ticks 1000 1000 0 41000)
+$r.a1SkewWidensTolerance = Pick2 (Get-CorePartitionPlaybackStart ((Ln 9000 'playback_smoke.start session=1 position=0') + "`n" + (Ln 9100 'playback_smoke.measured_session id=1') + "`n" + (Sm 39000 '30300.000')) $L.Ticks 1000 1000 100 41000)
+$r.a1NoWindowEnd = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 $null)
+$r.a1StampPastTheMonotonicCeiling = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 35000)
+$r.a1Consistent = Pick2 (Get-CorePartitionPlaybackStart $m1 $L.Ticks 1000 1000 0 41000)
 # adversary r13b (82510ec1) A1, its exact input: a -60000 ms excursion covers BOTH stamps (start T+3000, summary T+23000, elapsed_ms 20000, so
 # they agree); launch mono 100000, start mark 99990, the smoke returned at mono 185000. The ceiling (65010 ms) is past slack + teardown (30000).
 $a1b = @((Ln 3000 'playback_smoke.start session=1 position=0'), (Ln 3010 'playback_smoke.measured_session id=1'), (Sm 23000 '20000.000')) -join "`n"
-$r.a1bExcursionCoversBothStamps = Pick2 (Get-CorePartitionPlaybackStart $a1b $L.Ticks 100000 99990 0 10000 185000)
-$r.a1bNamedTeardownSlack = Pick2 (Get-CorePartitionPlaybackStart $a1b $L.Ticks 100000 99990 0 10000 185000 250 60000)
+$r.a1bExcursionCoversBothStamps = Pick2 (Get-CorePartitionPlaybackStart $a1b $L.Ticks 100000 99990 0 185000)
+$r.a1bNamedTeardownSlack = Pick2 (Get-CorePartitionPlaybackStart $a1b $L.Ticks 100000 99990 0 185000 250 70000)
+# r13c (HUB RULING 20261028T0021Z, rule (a)): the real venue shape, playback 23600 ms after the start mark (the app's first log line to
+# playback_smoke.start, 23.6 s in 95ccf29f), and the start anchor the window opens at (startMonoMs, on the job's clock)
+$real = @((Ln 23600 'playback_smoke.start session=1 position=0'), (Ln 23610 'playback_smoke.measured_session id=1'), (Sm 53600 '30000.000')) -join "`n"
+$rs = Get-CorePartitionPlaybackStart $real $L.Ticks 1000 1000 0 64000
+$r.realShape = @([string]$rs.why, $rs.gapMs, $rs.gapMonoMaxMs, $rs.startMonoMs, $rs.Contains('slackMs'))
+# r13c: a stamp-consistent start whose clock-proof ceiling exceeds the stamped gap by more than the teardown slack (an unsampled excursion over
+# both stamps) is still unverified; within it, the start is trusted however late it is
+$r.ceilingOverGapPastTeardown = Pick2 (Get-CorePartitionPlaybackStart $real $L.Ticks 1000 1000 0 86000)
+$r.ceilingOverGapWithinTeardown = Pick2 (Get-CorePartitionPlaybackStart $real $L.Ticks 1000 1000 0 74000)
+# r13c: Select-CorePartitionFeedRowsFromStart, pure. A row's HWiNFO stamp (local d.M.yyyy,H:mm:ss[.fff]) is placed on the job's monotonic clock at
+# the measured launch's clock pair (launch UTC $L, mono 1000), as the playback start is; a row counts only at or after the anchor plus the skew
+function Hw([double]$Mono) { $L.AddMilliseconds($Mono - 1000).ToLocalTime().ToString('d.M.yyyy,H:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture) }
+$anchor = @{ startMonoMs = 24600.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.0; skewMs = 0.0 }
+$rows = @('Date,Time,Total CPU Usage [%],CPU Package [C],CPU Package Power [W],Core Thermal Throttling (avg) [Yes/No],Package/Ring Thermal Throttling [Yes/No]', ((Hw 24000) + ',5,30,10,No,No'), ((Hw 24600) + ',5,80,100,No,No'), ((Hw 25600) + ',5,81,101,No,No'), '')
+function PickSel($v) { @([string]$v.why, $v.excluded, @($v.lines).Count) }
+$r.selAtAndAfter = PickSel (Select-CorePartitionFeedRowsFromStart $rows $anchor 26000)
+$sk = $anchor.Clone(); $sk.skewMs = 700.0
+$r.selSkewExcludesTheBoundaryRow = PickSel (Select-CorePartitionFeedRowsFromStart $rows $sk 26000)
+$r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @(($L.AddSeconds(-60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,30,10,No,No'), ($L.AddSeconds(60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,80,100,No,No')) $anchor 62000)
+$r.selUnparseableStamp = PickSel (Select-CorePartitionFeedRowsFromStart @('10/24/2026,08:00:02,5,80,100,No,No') $anchor 26000)
+$r.selRowFromTheFuture = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 24600) + ',5,80,100,No,No'), ((Hw 40000) + ',5,80,100,No,No')) $anchor 26000)
+$r.selNoAnchor = PickSel (Select-CorePartitionFeedRowsFromStart $rows $null 26000)
+$r.selNoReadEnd = PickSel (Select-CorePartitionFeedRowsFromStart $rows $anchor $null)
 $feed = [ordered]@{ rows = 3; pkgWattsMean = 40.0; pkgWattsMax = 100.0; pkgTempCMean = 46.67; pkgTempCMax = 80.0; pkgThrottledRows = 0; pkgTempCAtStart = 30.0; reasons = [ordered]@{ pkgThrottledRows = 'feed-unparseable' } }
-$late = Get-CorePartitionStartBoundFeed $feed @{ why = 'feed-window-start-late' }
+$late = Get-CorePartitionStartBoundFeed $feed @{ why = 'feed-window-start-unverified' }
 $r.bound = @($late.rows, $late.pkgWattsMean, $late.pkgTempCMean, $late.pkgTempCAtStart, $late.reasons['rows'], $late.reasons['pkgTempCMean'], $late.reasons['pkgThrottledRows'], $late.reasons.Contains('pkgTempCAtStart'))
-$r.boundTwice = @((Get-CorePartitionStartBoundFeed $late @{ why = 'feed-window-start-late' }).reasons['rows'])
+$r.boundTwice = @((Get-CorePartitionStartBoundFeed $late @{ why = 'feed-window-start-unverified' }).reasons['rows'])
 $r.missingVerdict = @((Get-CorePartitionStartBoundFeed $feed $null).reasons['pkgWattsMean'])
 $ok = Get-CorePartitionStartBoundFeed $feed @{ why = $null }
 $r.passThrough = @($ok.rows, $ok.pkgWattsMean, $ok.reasons.Contains('rows'))
 $r | ConvertTo-Json -Compress -Depth 5
 """
+
+
+# r13c (hosted CI run 40605556724, windows shard 4/8): the feed readers' monoMs is the Stopwatch read taken BEFORE the read, so it can never be
+# later than a clock read taken after the reader returns. 52282f47 rounds it to the nearest ms, up to 0.5 ms into the future; the measured
+# launch's mono read right after the start mark then sits before it, and Get-CorePartitionPlaybackStart refuses ($LaunchMonoMs < $StartMarkMonoMs).
+R13C_MONO_READ = r"""
+$f = Join-Path $env:CP_DIR 'feed.csv'
+[IO.File]::WriteAllText($f, "26.10.2026,12:00:00,x,30,10,No,No`n")
+$n = 400; $markLate = 0; $sinceLate = 0
+for ($i = 0; $i -lt $n; $i++) {
+    $m = Read-CorePartitionFeedMark $f; $after = Get-CorePartitionMonoMs
+    if ($m.monoMs -gt $after) { $markLate++ }
+    $e = Read-CorePartitionFeedSince $f 0 ''; $after2 = Get-CorePartitionMonoMs
+    if ($e.monoMs -gt $after2) { $sinceLate++ }
+}
+[ordered]@{ n = $n; markLate = $markLate; sinceLate = $sinceLate } | ConvertTo-Json -Compress
+"""
+
+
+@requires_windows_pwsh
+class CorePartitionR13cMonoStampTests(unittest.TestCase):
+    """r13c (Item 3): the red hosted shard 4/8 was this diff's own race, not a flake."""
+
+    def test_r13c_a_feed_reads_monotonic_stamp_is_never_later_than_the_next_clock_read(self) -> None:
+        """Run 40605556724 job 122544486886: the marker suite's good mode published feed-window-start-unverified on the hosted runner (errors
+        empty). Read-CorePartitionFeedMark stamped monoMs with [int64] (round to nearest), so on a fast read the start mark landed up to 0.5 ms
+        after the measured launch's mono read that follows it. 400 reads each: no reader's monoMs is ever past a clock read taken after it
+        returns. RED on 52282f47."""
+        with tempfile.TemporaryDirectory(prefix="core-partition-r13c-mono-") as tmp:
+            script = Path(tmp) / "mono.ps1"
+            script.write_text(LIFT + R13C_MONO_READ, encoding="utf-8")
+            proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": tmp})
+            self.assertEqual(proc.returncode, 0, proc.stdout[-3000:] + proc.stderr[-3000:])
+            got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual([got["markLate"], got["sinceLate"]], [0, 0], got)
 
 
 @requires_windows_pwsh
@@ -2560,24 +2652,36 @@ class CorePartitionR13StartTests(unittest.TestCase):
         for case, got in self.r.items():
             self.assertNotIn("threw", got, f"{case}: {got}")
 
-    def test_r13_dot_counterexample_a_pre_playback_idle_span_is_refused_not_averaged(self) -> None:
+    def test_r13c_dot_counterexample_reports_the_playback_means_not_a_refusal(self) -> None:
         """Dot 6452868627 (literal): 60 s of startup rows (10 W / 30 C) then 30 s of playback rows (100 W / 80 C) in a 90 s window that passes the
-        120 s freshness bound and every END bound. On a751394f the window means are 40 W / 46.67 C (rows 90, no reason). The measured session's
-        playback starts 60000 ms after the start mark, past the declared 10000 ms slack: every window field is null with feed-window-start-late, and
-        core-partition.json publishes the gap, the slack and the verdict."""
+        120 s freshness bound and every END bound. On a751394f the window means are 40 W / 46.67 C (rows 90, no reason); on 52282f47 every window
+        field is refused feed-window-start-late. r13c (HUB RULING 20261028T0021Z, rule (a)): the verified playback start is the window START, so the
+        60 startup rows stamped before it are excluded and the window reports the PLAYBACK means, 100 W / 80 C over 30 rows; core-partition.json
+        publishes the gap (telemetry, no longer a refusal), the excluded row count and a null start verdict, and no start slack."""
         got = self.r["dot-60s-idle-then-30s-playback"]
-        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [None, None, None, "feed-window-start-late"], got)
-        gap, slack, why, session, stamped = got["start"]
-        self.assertEqual([slack, why, session, stamped], [10000, "feed-window-start-late", 1, True], got)
+        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [30, 100.0, 80.0, ""], got)
+        gap, why, session, stamped = got["start"]
+        self.assertEqual([why, session, stamped, got["excluded"], got["publishedRows"], got["slackPublished"]], ["", 1, True, 60, 30, False], got)
         self.assertAlmostEqual(gap, 60000, delta=1, msg=got)
 
+    def test_r13c_the_real_venue_start_gap_publishes_the_window(self) -> None:
+        """r13c (HUB RULING 20261028T0021Z): the real shape. In the 2026-10-27 venue logs (95ccf29f / 705ca6f7) the app's first log line to
+        playback_smoke.start is 23.6 s / 23.0 s, past r13b's 10000 ms slack, so 52282f47 refuses EVERY real run feed-window-start-late and the
+        opt-in leg never publishes a window. Here playback starts 23600 ms after the start mark: the window publishes the 66 playback rows'
+        means (100 W / 80 C), the 23 startup rows are excluded, and startGapMs (about 23600) is published as telemetry."""
+        got = self.r["real-shape-first-line-to-start-23600"]
+        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [66, 100.0, 80.0, ""], got)
+        gap, why, _session, _stamped = got["start"]
+        self.assertEqual([why, got["excluded"]], ["", 23], got)
+        self.assertAlmostEqual(gap, 23600, delta=1, msg=got)
+
     def test_r13_control_playback_within_the_slack_keeps_todays_means(self) -> None:
-        """No-delay control: playback starts 3000 ms after the start mark (inside the slack); the window is published exactly as before r13 (rows
-        90, 97 W / 78.33 C means), with the gap and a null start verdict beside it."""
+        """No-delay control: playback starts 3000 ms after the start mark. r13c: the 3 startup rows stamped before it are excluded too (before
+        r13c they were averaged in: rows 90, 97 W / 78.33 C); the 87 playback rows publish 100 W / 80 C, with the gap and a null start verdict."""
         got = self.r["playback-within-slack-control"]
-        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [90, 97.0, 78.33, ""], got)
-        gap, slack, why, _session, _stamped = got["start"]
-        self.assertEqual([slack, why], [10000, ""], got)
+        self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [87, 100.0, 80.0, ""], got)
+        gap, why, _session, _stamped = got["start"]
+        self.assertEqual([why, got["excluded"]], ["", 3], got)
         self.assertAlmostEqual(gap, 3000, delta=1, msg=got)
 
     def test_r13_no_playback_start_signal_is_a_typed_refusal_never_a_measured_value(self) -> None:
@@ -2587,13 +2691,17 @@ class CorePartitionR13StartTests(unittest.TestCase):
             with self.subTest(case=case):
                 got = self.r[case]
                 self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [None, None, None, "feed-window-start-unverified"], got)
-                self.assertEqual(got["start"][:3], [None, 10000, "feed-window-start-unverified"], got)
+                self.assertEqual(got["start"][:2], [None, "feed-window-start-unverified"], got)
+                self.assertIsNone(got["excluded"], got)
 
     def test_r13_the_start_rule(self) -> None:
-        """Get-CorePartitionPlaybackStart and Get-CorePartitionStartBoundFeed, pure: the clock skew counts against the slack, the slack is a named
-        parameter, the gap runs from the start mark (not the launch stamp), only the measured session's start line counts (session=12 is not
-        session=1; a warmup session's earlier start is not the measured one), the summary-session fallback, and every missing or unusable signal
-        is feed-window-start-unverified. The bound nulls the window fields only, keeps a reason already there and leaves pkgTempCAtStart."""
+        """Get-CorePartitionPlaybackStart and Get-CorePartitionStartBoundFeed, pure: the gap runs from the start mark (not the launch stamp), only
+        the measured session's start line counts (session=12 is not session=1; a warmup session's earlier start is not the measured one), the
+        summary-session fallback, and every missing or unusable signal is feed-window-start-unverified. The bound nulls the window fields only,
+        keeps a reason already there and leaves pkgTempCAtStart. r13c (rule (a)): a late start is no refusal (no slack; the skew no longer counts
+        against one); the verdict carries the anchor (startMonoMs); the clock-proof ceiling may exceed the stamped gap by at most the teardown slack.
+        Select-CorePartitionFeedRowsFromStart: rows stamped before the anchor (plus the skew) are excluded; an unparseable stamp, a row from after
+        the end read, or no anchor / no end read is a typed refusal."""
         script = self.tmp / "r13-pure.ps1"
         script.write_text(LIFT + R13_PURE, encoding="utf-8")
         proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR)})
@@ -2601,11 +2709,22 @@ class CorePartitionR13StartTests(unittest.TestCase):
         r = json.loads(proc.stdout.strip().splitlines()[-1])
         unverified = "feed-window-start-unverified"
         self.assertEqual(r["withinSlackNoSkew"], ["", 9000, 1])
-        self.assertEqual(r["skewCountsAgainstTheBound"], ["feed-window-start-late", 9000, 1])
-        self.assertEqual(r["startMarkReadBeforeTheLaunch"], ["feed-window-start-late", 10500, 1])
-        self.assertEqual(r["namedSlack"], ["feed-window-start-late", 9000, 1])
+        self.assertEqual(r["skewCountsAgainstTheBound"], ["", 9000, 1])
+        self.assertEqual(r["startMarkReadBeforeTheLaunch"], ["", 10500, 1])
+        self.assertNotIn("namedSlack", r)
         self.assertEqual(r["beforeTheWindow"], [unverified, -5000, 1])
-        self.assertEqual(r["warmupSessionIgnored"], ["feed-window-start-late", 30000, 2])
+        self.assertEqual(r["warmupSessionIgnored"], ["", 30000, 2])
+        # r13c: the real venue shape (23600 ms) is trusted and anchored; no slack is published
+        self.assertEqual(r["realShape"], ["", 23600, 33000, 24600, False])
+        self.assertEqual(r["ceilingOverGapPastTeardown"], [unverified, 23600, 0, 55000])
+        self.assertEqual(r["ceilingOverGapWithinTeardown"], ["", 23600, 0, 43000])
+        self.assertEqual(r["selAtAndAfter"], ["", 1, 2])
+        self.assertEqual(r["selSkewExcludesTheBoundaryRow"], ["", 2, 1])
+        self.assertEqual(r["selSecondsOnly"], ["", 1, 1])
+        self.assertEqual(r["selUnparseableStamp"], ["feed-row-stamp-unparseable", None, 0])
+        self.assertEqual(r["selRowFromTheFuture"], ["feed-row-stamp-unverified", None, 0])
+        self.assertEqual(r["selNoAnchor"], [unverified, None, 0])
+        self.assertEqual(r["selNoReadEnd"], [unverified, None, 0])
         self.assertEqual(r["sessionPrefixIsNotTheSession"], [unverified, None, 1])
         self.assertEqual(r["summaryFallback"], ["", 2000, 3])
         self.assertEqual(r["unknownSkew"], [unverified, None, 1])
@@ -2613,8 +2732,8 @@ class CorePartitionR13StartTests(unittest.TestCase):
         self.assertEqual(r["unparseableStamp"], [unverified, None, 1])
         self.assertEqual(r["noSession"], [unverified, None, None])
         self.assertEqual(r["emptyLog"], [unverified, None, None])
-        self.assertEqual(r["bound"], [None, None, None, 30.0, "feed-window-start-late", "feed-window-start-late", "feed-unparseable", False])
-        self.assertEqual(r["boundTwice"], ["feed-window-start-late"])
+        self.assertEqual(r["bound"], [None, None, None, 30.0, unverified, unverified, "feed-unparseable", False])
+        self.assertEqual(r["boundTwice"], [unverified])
         self.assertEqual(r["missingVerdict"], [unverified])
         self.assertEqual(r["passThrough"], [3, 40.0, False])
         # r13b (A1): the stamp agrees with the app's monotonic elapsed_ms and sits under the job's monotonic ceiling, or it is unverified
@@ -2632,6 +2751,8 @@ class CorePartitionR13StartTests(unittest.TestCase):
         # adversary r13b (82510ec1) A1: an excursion over both stamps; the clock-proof ceiling (start gap + teardown) bounds it
         self.assertEqual(r["a1bExcursionCoversBothStamps"], [unverified, 3010, 0, 65010])
         self.assertEqual(r["a1bNamedTeardownSlack"], ["", 3010, 0, 65010])
+        # r13c: no publication of feed-window-start-late is left for any input above
+        self.assertNotIn("feed-window-start-late", json.dumps(r))
 
     def test_r13b_adversary_a1_a_backward_utc_step_at_the_start_line_is_refused_not_averaged(self) -> None:
         """adversary r13 (028f4619) A1, its exact input: playback really starts at mono 61000 (60000 ms after the start mark), but a backward UTC
@@ -2640,7 +2761,7 @@ class CorePartitionR13StartTests(unittest.TestCase):
         86500 ms stamp span) by 57000 ms: every window field is null with feed-window-start-unverified, and the disagreement is published."""
         got = self.r["adversary-r13-a1-utc-step-at-the-start-line"]
         self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [None, None, None, "feed-window-start-unverified"], got)
-        self.assertEqual(got["start"][1:3], [10000, "feed-window-start-unverified"], got)
+        self.assertEqual(got["start"][1], "feed-window-start-unverified", got)
         self.assertAlmostEqual(got["start2"][0], 57000, delta=1, msg=got)
 
     def test_r13b_adversary_a2_a_swap_after_validate_is_never_read(self) -> None:

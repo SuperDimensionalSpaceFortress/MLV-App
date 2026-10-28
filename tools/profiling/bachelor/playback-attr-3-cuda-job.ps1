@@ -4442,8 +4442,11 @@ function Test-CorePartitionFeedMarkAccounted($Mark) {
 # on the same monotonic base (Get-CorePartitionAppAliveMonoMs; the earliest the app can have exited, adversary r11 5f75e044 A1: never the poll
 # that saw it gone, which a descheduled helper makes late). A window end more than $EndLagSlackMs (the declared slack for the runner's own
 # post-exit work, 10000 ms) after it is feed-window-end-late; no such evidence is feed-window-end-unverified. Either way no window row is published.
-function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $null, $WindowEndMs = $null, [double]$SlackMs = 2000, $AppAliveMs = $null, [double]$EndLagSlackMs = 10000) {
-    $s = [ordered]@{ rows = $null; pkgWattsMean = $null; pkgWattsMax = $null; pkgTempCMean = $null; pkgTempCMax = $null; pkgThrottledRows = $null; pkgTempCAtStart = $null; reasons = [ordered]@{} }
+# r13c (HUB RULING 20261028T0021Z, CP-FEED-START-ANCHOR rule (a)): $StartAnchor, when given, is the verified playback start on the job's
+# monotonic clock (Get-CorePartitionPlaybackStart's startMonoMs with the launch clock pair and skew); the window's rows are only those sampled
+# at or after it (Select-CorePartitionFeedRowsFromStart, its refusal typed on every window field), and startExcludedRows counts the rest.
+function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $null, $WindowEndMs = $null, [double]$SlackMs = 2000, $AppAliveMs = $null, [double]$EndLagSlackMs = 10000, $StartAnchor = $null) {
+    $s = [ordered]@{ rows = $null; pkgWattsMean = $null; pkgWattsMax = $null; pkgTempCMean = $null; pkgTempCMax = $null; pkgThrottledRows = $null; pkgTempCAtStart = $null; startExcludedRows = $null; reasons = [ordered]@{} }
     $windowFields = @('rows', 'pkgWattsMean', 'pkgWattsMax', 'pkgTempCMean', 'pkgTempCMax', 'pkgThrottledRows')
     $code = $null
     # sol r6 CP-07 (class): the marks' numbers go through the one guarded parse as well
@@ -4473,8 +4476,12 @@ function Get-CorePartitionFeedSummary($Start, $End, [double]$StaleSec, $Base = $
     if ($null -eq $code) {
         $lines = Split-CorePartitionFeedLines ([string]$End.window)
         if ($End.windowStartsMidRow) { $lines = @($lines | Select-Object -Skip 1) }
+        # r13c (rule (a)): only the rows sampled at or after the verified playback start
+        $selWhy = $null
+        if ($null -ne $StartAnchor) { $sel = Select-CorePartitionFeedRowsFromStart $lines $StartAnchor $End.doneMs; $selWhy = $sel.why; $s.startExcludedRows = $sel.excluded; $lines = @($sel.lines) }
         $parsed = ConvertFrom-CorePartitionFeedRows $lines
-        if ($null -eq $parsed.rows) { $code = $parsed.why }
+        if ($selWhy) { $code = $selWhy }
+        elseif ($null -eq $parsed.rows) { $code = $parsed.why }
         # sol r6 CP-09 (was wall-clock ageSec, which a clock step shrinks): every window row is a complete row appended to the same file after the
         # start mark's read, so the end mark is fresh on the monotonic clock when that span is at most the limit.
         else { $code = Test-CorePartitionFeedFresh $Start $End $StaleSec $true }
@@ -4610,10 +4617,14 @@ function Get-CorePartitionAppAliveMonoMs($Helper, $AppVerdict) {
 # playback_smoke.measured_session marker, else the first playback_smoke.summary session), stamped by the app's log sink in UTC with ms
 # (CrashForensics.cpp writeLogLine: "[<ISODateWithMs UTC>] [level] [thread] message"). gapMs is that start on the job's monotonic clock less the start
 # mark's read: $LaunchMonoMs + (stamp - $LaunchUtcTicks) - $StartMarkMonoMs, the wall span converted at the launch's own clock pair. The wall clock
-# can drift from the monotonic one by up to $ClockSkewMs (Get-CorePartitionClockSkewMs) over the job, which is counted against the bound: a gap
-# over $StartSlackMs once the skew is added is feed-window-start-late. No session, no start line, an unparseable stamp, an unknown skew or clock
-# read, or a start before the window opened (beyond the skew) is feed-window-start-unverified. Returns @{ why; gapMs; gapMonoMaxMs;
-# stampDisagreeMs; playbackStartUtcTicks; session; slackMs }; gapMs is reported whenever it is computable, refused or not. Never throws.
+# can drift from the monotonic one by up to $ClockSkewMs (Get-CorePartitionClockSkewMs) over the job. No session, no start line, an unparseable
+# stamp, an unknown skew or clock read, or a start before the window opened (beyond the skew) is feed-window-start-unverified. Returns @{ why;
+# gapMs; gapMonoMaxMs; stampDisagreeMs; playbackStartUtcTicks; session; startMonoMs }; gapMs is reported whenever it is computable, refused or
+# not. Never throws.
+# r13c (HUB RULING 20261028T0021Z, rule (a)): a trusted start is the window's START, not a bound on it: startMonoMs (the start mark's read plus
+# gapMs, on the job's monotonic clock) is the anchor Get-CorePartitionFeedSummary excludes every earlier feed row by. A late start is no refusal
+# (the r13 slack and its feed-window-start-late are retired: the venue logs of 2026-10-27, 95ccf29f / 705ca6f7, put 23.6 s / 23.0 s between the
+# app's first log line and playback_smoke.start, so every real run was refused); the gap is telemetry.
 # r13b (adversary r13 028f4619 A1): the stamp is one wall-clock read, and a step that comes and goes between two skew samples (the job's three, the
 # helper's 200 ms polls) is never sampled, so a 60000 ms startup could read as 3000 ms. The stamp is therefore trusted only when the app's own
 # MONOTONIC clock agrees with it: the same session's playback_smoke.summary line carries elapsed_ms, measured on QPC (mlv_stage_timing_now) from
@@ -4625,11 +4636,12 @@ function Get-CorePartitionAppAliveMonoMs($Helper, $AppVerdict) {
 # gap past that ceiling (beyond the same tolerance) is the clocks disagreeing too: feed-window-start-unverified. No window end is unverified.
 # adversary r13b (82510ec1) A1: an excursion that covers BOTH stamps (and that no poll sampled) keeps them consistent with elapsed_ms, so the
 # ceiling itself is bounded too: it is the start gap plus the teardown after the summary (the app's post-summary work, 2.4 s and 9.1 s to the last
-# log line in the 2026-10-27 venue logs 705ca6f7 / 95ccf29f, plus the runner's post-exit work, which the END bound allows up to 10000 ms), so a
-# ceiling over $StartSlackMs + $TeardownSlackMs (20000 ms) cannot show the start within the slack whatever the stamps say:
-# feed-window-start-unverified. LIMIT: an unsampled excursion can still hide up to $TeardownSlackMs less the real teardown of startup.
-function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $LaunchMonoMs, $StartMarkMonoMs, $ClockSkewMs, [double]$StartSlackMs = 10000, $WindowEndMonoMs = $null, [double]$StampToleranceMs = 250, [double]$TeardownSlackMs = 20000) {
-    $r = [ordered]@{ why = 'feed-window-start-unverified'; gapMs = $null; gapMonoMaxMs = $null; stampDisagreeMs = $null; playbackStartUtcTicks = $null; session = $null; slackMs = $StartSlackMs }
+# log line in the 2026-10-27 venue logs 705ca6f7 / 95ccf29f, plus the runner's post-exit work, which the END bound allows up to 10000 ms).
+# r13c (rule (a)): so a ceiling more than $TeardownSlackMs (20000 ms) past the stamped gap means the stamps put the start earlier than the
+# monotonic clock allows by more than any teardown: feed-window-start-unverified (an anchor that early would let startup rows in). LIMIT: an
+# unsampled excursion can still move the anchor up to $TeardownSlackMs less the real teardown earlier.
+function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $LaunchMonoMs, $StartMarkMonoMs, $ClockSkewMs, $WindowEndMonoMs = $null, [double]$StampToleranceMs = 250, [double]$TeardownSlackMs = 20000) {
+    $r = [ordered]@{ why = 'feed-window-start-unverified'; gapMs = $null; gapMonoMaxMs = $null; stampDisagreeMs = $null; playbackStartUtcTicks = $null; session = $null; startMonoMs = $null }
     try {
         if ([string]::IsNullOrEmpty($LogText)) { return $r }
         $lines = @($LogText -split "`r?`n")
@@ -4667,12 +4679,46 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
         $ceiling = $we - $el - $sm
         $r.gapMonoMaxMs = [math]::Round($ceiling, 1)
         if ($gap -gt $ceiling + $tol) { return $r }
-        if ($gap + $sk -gt $StartSlackMs) { $r.why = 'feed-window-start-late'; return $r }
-        # adversary r13b A1: the clock-proof bound
-        if ($ceiling -gt $StartSlackMs + [math]::Max(0.0, $TeardownSlackMs)) { return $r }
+        # adversary r13b A1 (r13c: against the stamped gap, not a slack): the clock-proof bound
+        if ($ceiling - $gap -gt [math]::Max(0.0, $TeardownSlackMs)) { return $r }
+        $r.startMonoMs = $sm + $gap
         $r.why = $null
         $r
     } catch { $r }
+}
+
+# PURE. r13c (HUB RULING 20261028T0021Z, CP-FEED-START-ANCHOR rule (a)): the feed window's data rows that were sampled at or after the playback
+# start. Each row carries the HWiNFO sampler's own stamp, Date and Time in local time (d.M.yyyy and H:mm:ss with or without .fff, the CSV the
+# adapter writes); it is placed on the job's monotonic clock exactly as the playback start is, at the measured launch's clock pair
+# ($Anchor.launchUtcTicks / launchMonoMs), and the comparison is made there: a row counts only at or after $Anchor.startMonoMs plus
+# $Anchor.skewMs (the wall clock's measured drift, so a row the drift could have moved past the start is excluded, never averaged in). Every
+# window row was appended before the end read completed ($ReadDoneMs), so a row placed past it (beyond the skew plus $StampResolutionMs) is a
+# stamp that does not map onto the job's clock (another time zone, a clock step): feed-row-stamp-unverified; a data row whose stamp does not
+# parse is feed-row-stamp-unparseable; no anchor or end read is feed-window-start-unverified. Lines that are not data rows (the header, an empty
+# line) are dropped. Returns @{ lines; excluded; why }: lines empty and excluded $null on a refusal. Never throws.
+function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadDoneMs, [double]$StampResolutionMs = 1000) {
+    $no = { param($w) @{ lines = @(); excluded = $null; why = $w } }
+    try {
+        if ($null -eq $Anchor) { return & $no 'feed-window-start-unverified' }
+        $p = (ConvertFrom-CorePartitionNumber $Anchor.startMonoMs 'double').value; $lt = (ConvertFrom-CorePartitionNumber $Anchor.launchUtcTicks 'int64').value
+        $lm = (ConvertFrom-CorePartitionNumber $Anchor.launchMonoMs 'double').value; $sk = (ConvertFrom-CorePartitionNumber $Anchor.skewMs 'double').value
+        $rd = (ConvertFrom-CorePartitionNumber $ReadDoneMs 'double').value
+        if ($null -eq $p -or $null -eq $lt -or $lt -le 0 -or $null -eq $lm -or $null -eq $sk -or $sk -lt 0 -or $null -eq $rd) { return & $no 'feed-window-start-unverified' }
+        $inv = [Globalization.CultureInfo]::InvariantCulture; $sty = [Globalization.DateTimeStyles]::AssumeLocal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+        $fmt = [string[]]@('d.M.yyyy H:mm:ss', 'd.M.yyyy H:mm:ss.FFFFFFF')
+        $keep = [Collections.Generic.List[string]]::new(); $out = 0
+        foreach ($ln in @($Lines)) {
+            if ([string]::IsNullOrEmpty($ln)) { continue }
+            $c = $ln.Split(',')
+            if ($c.Count -lt 7 -or $c[0].Length -lt 1 -or -not [char]::IsDigit($c[0], 0)) { continue }
+            $t = [DateTime]::MinValue
+            if (-not [DateTime]::TryParseExact(($c[0].Trim() + ' ' + $c[1].Trim()), $fmt, $inv, $sty, [ref]$t)) { return & $no 'feed-row-stamp-unparseable' }
+            $at = $lm + ($t.Ticks - $lt) / 1e4
+            if ($at -gt $rd + $sk + [math]::Max(0.0, $StampResolutionMs)) { return & $no 'feed-row-stamp-unverified' }
+            if ($at -ge $p + $sk) { $keep.Add($ln) } else { $out++ }
+        }
+        @{ lines = $keep.ToArray(); excluded = $out; why = $null }
+    } catch { & $no 'feed-window-start-unverified' }
 }
 
 # PURE. r13 (CP-FEED-START-ANCHOR): a feed whose window start is not bound to the playback start ($PlaybackStart from
@@ -4974,7 +5020,8 @@ function Read-CorePartitionFeedMark([string]$Path) {
         try {
             $id = Get-CorePartitionFeedHandleInfo $fs
             # sol r6 CP-09: the read's monotonic time (Stopwatch) and wall time, taken together; freshness is judged on the first (Test-CorePartitionFeedFresh)
-            $mono = [int64]([Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000); $readUtc = [DateTime]::UtcNow.Ticks
+            # r13c (hosted run 40605556724): floored, never rounded; a stamp rounded up sat after the next clock read (the measured launch's)
+            $mono = [int64][math]::Floor([Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000); $readUtc = [DateTime]::UtcNow.Ticks
             $len = $fs.Length
             $from = [Math]::Max([int64]0, $len - 4096)
             [void]$fs.Seek($from, [IO.SeekOrigin]::Begin)
@@ -5000,7 +5047,8 @@ function Read-CorePartitionFeedSince([string]$Path, [int64]$Offset, [string]$Exp
         try {
             $id = Get-CorePartitionFeedHandleInfo $fs
             # sol r6 CP-09: the read's monotonic time (Stopwatch) and wall time, taken together; freshness is judged on the first (Test-CorePartitionFeedFresh)
-            $mono = [int64]([Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000); $readUtc = [DateTime]::UtcNow.Ticks
+            # r13c: floored, as the start mark's is
+            $mono = [int64][math]::Floor([Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency * 1000); $readUtc = [DateTime]::UtcNow.Ticks
             $len = $fs.Length
             $text = ''; $mid = $false; $replaced = $false; $truncated = $false; $short = $false
             if ($len -ge $Offset) {
@@ -5993,10 +6041,10 @@ try {
     try { $cpAppVerdict = Test-CorePartitionMeasuredApp $corePartitionHelperRecord $corePartitionMeasuredPid $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs } catch { $corePartitionErrors.Add("measured-app: $([string]$_.Exception.Message)") }
     $corePartitionAppAliveMonoMs = Get-CorePartitionAppAliveMonoMs $corePartitionHelperRecord $cpAppVerdict
     # r13 (Dot 6452868627, CP-FEED-START-ANCHOR): the window's start is bound to the measured session's playback start, read from the run log the
-    # result names (the same hash-checked snapshot the metrics read; unresolvable is feed-window-start-unverified). The declared slack, 10000 ms,
-    # covers the runner's own start, the app launch, the clip load and the runner's 2500 ms settle; past it the startup rows would dilute the
-    # playback means, so the window fields are refused (feed-window-start-late). The gap is published either way (feed.startGapMs).
-    $corePartitionStartSlackMs = 10000
+    # result names (the same hash-checked snapshot the metrics read; unresolvable is feed-window-start-unverified). r13c (HUB RULING
+    # 20261028T0021Z, rule (a)): that start, once trusted, is the window START: the feed rows sampled before it (the runner's start, the app
+    # launch, the clip load, the settle) are excluded on the job's monotonic clock, so they never dilute the playback means and a late start
+    # is no refusal. The gap is published as telemetry (feed.startGapMs), with the count of rows excluded (feed.startExcludedRows).
     $cpRunLogText = $null
     # r13b (adversary r13 028f4619 A2): the resolver hashes the snapshot and returns its path, so the bytes read here are hashed again and used
     # only when they are the bytes it checked (its sha256, bound to result.json's evidence.runLogSnapshot); a same-length rewrite between the
@@ -6013,8 +6061,11 @@ try {
     # r13b (A1): the skew counted against the start is the larger of the job's own (three reads) and the helper's (its 200 ms polls), when it has one
     $cpStartSkewMs = $corePartitionJobClockSkewMs
     if ($null -ne $corePartitionHelperRecord -and $null -ne $cpStartSkewMs) { $cpHelperSkew = (ConvertFrom-CorePartitionNumber $corePartitionHelperRecord.clockSkewMaxMs 'double').value; if ($null -ne $cpHelperSkew) { $cpStartSkewMs = [math]::Max([double]$cpStartSkewMs, [math]::Abs($cpHelperSkew)) } }
-    $corePartitionPlaybackStart = Get-CorePartitionPlaybackStart $cpRunLogText $corePartitionMeasuredLaunchUtc.Ticks $corePartitionMeasuredLaunchMonoMs $corePartitionFeedStart.monoMs $cpStartSkewMs $corePartitionStartSlackMs $corePartitionSmokeEndMonoMs
-    $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionStartBoundFeed (Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppAliveMonoMs 10000) $corePartitionPlaybackStart) $corePartitionHelperNotReady
+    $corePartitionPlaybackStart = Get-CorePartitionPlaybackStart $cpRunLogText $corePartitionMeasuredLaunchUtc.Ticks $corePartitionMeasuredLaunchMonoMs $corePartitionFeedStart.monoMs $cpStartSkewMs $corePartitionSmokeEndMonoMs
+    # r13c (rule (a)): the anchor, only for a trusted start (a refused one publishes no window field: Get-CorePartitionStartBoundFeed)
+    $cpStartAnchor = $(if ($null -ne $corePartitionPlaybackStart -and -not $corePartitionPlaybackStart.why) { @{ startMonoMs = $corePartitionPlaybackStart.startMonoMs; launchUtcTicks = $corePartitionMeasuredLaunchUtc.Ticks; launchMonoMs = $corePartitionMeasuredLaunchMonoMs; skewMs = $cpStartSkewMs } })
+    $cpFeedWindow = Get-CorePartitionFeedSummary $corePartitionFeedStart $corePartitionFeedEnd 120 $corePartitionFeedPreHelper $corePartitionSmokeEndMonoMs 2000 $corePartitionAppAliveMonoMs 10000 $cpStartAnchor
+    $corePartitionFeedSummary = Get-CorePartitionReadyFeed (Get-CorePartitionStartBoundFeed $cpFeedWindow $corePartitionPlaybackStart) $corePartitionHelperNotReady
     # sol r4 CP-05: set until core-partition.json is saved, so any failure on the way leaves every acceptance flag false with this reason.
     $corePartitionPublishWhy = 'core-partition-json-unpublished'
     try {
@@ -6046,9 +6097,12 @@ try {
                 windowEndMonoMs = $corePartitionSmokeEndMonoMs; endReadSlackMs = 2000; appLastAliveMonoMs = $corePartitionAppAliveMonoMs
                 windowEndLagMs = $(if ($null -ne $corePartitionAppAliveMonoMs) { $corePartitionSmokeEndMonoMs - $corePartitionAppAliveMonoMs }); endLagSlackMs = 10000
                 # r13 (CP-FEED-START-ANCHOR): the start side of the same boundary: the measured session's playback start (UTC ticks, from its
-                # playback_smoke.start log stamp), its gap after the start mark in ms (published refused or not), the declared slack and the verdict
+                # playback_smoke.start log stamp), its gap after the start mark in ms (published refused or not) and the verdict. r13c (rule (a)):
+                # the window opens at that start (startMonoMs, the job's monotonic clock); startExcludedRows is the count of feed rows sampled
+                # before it and left out (null when no trusted start anchored the window); no slack bounds the gap any more
                 playbackStartUtcTicks = $corePartitionPlaybackStart.playbackStartUtcTicks; playbackSession = $corePartitionPlaybackStart.session
-                startGapMs = $corePartitionPlaybackStart.gapMs; startSlackMs = $corePartitionStartSlackMs; startWhy = $corePartitionPlaybackStart.why
+                startGapMs = $corePartitionPlaybackStart.gapMs; startWhy = $corePartitionPlaybackStart.why
+                startMonoMs = $corePartitionPlaybackStart.startMonoMs; startExcludedRows = $cpFeedWindow.startExcludedRows
                 # r13b (A1): the start stamp's disagreement with the app's monotonic elapsed_ms, and the gap's clock-proof ceiling on the job's clock
                 startStampDisagreeMs = $corePartitionPlaybackStart.stampDisagreeMs; startGapMonoMaxMs = $corePartitionPlaybackStart.gapMonoMaxMs
                 summary = $corePartitionFeedSummary
