@@ -455,6 +455,12 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }
         # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count, for any leg (not only a forced-look pace leg).
         if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
+        # BACHELOR-CORE-PARTITION-AB-1: the core-partition A/B (bench affinity, the MLV-owned E-core load, the telemetry helper), for any leg; the generator refuses a bad combination, typed.
+        if ($spec.generatorArgs.PSObject.Properties['benchAffinityMask']) { $gen['BenchAffinityMask'] = [string]$spec.generatorArgs.benchAffinityMask }
+        if ($spec.generatorArgs.PSObject.Properties['partitionLoadMask']) { $gen['PartitionLoadMask'] = [string]$spec.generatorArgs.partitionLoadMask }
+        if ($spec.generatorArgs.PSObject.Properties['partitionLoadThreads']) { $gen['PartitionLoadThreads'] = [int]$spec.generatorArgs.partitionLoadThreads }
+        if ($spec.generatorArgs.PSObject.Properties['corePartitionTelemetry'] -and [bool]$spec.generatorArgs.corePartitionTelemetry) { $gen['CorePartitionTelemetry'] = $true }
+        if ($spec.generatorArgs.PSObject.Properties['corePartitionHelperMask']) { $gen['CorePartitionHelperMask'] = [string]$spec.generatorArgs.corePartitionHelperMask }
         # GPU-EVENT153-ROOTCAUSE-2: the CUDA per-launch timer and its line threshold, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['cudaLaunchTimingMinMs']) { $gen['CudaLaunchTimingMinMs'] = [double]$spec.generatorArgs.cudaLaunchTimingMinMs }
         # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the injected device loss, the safe-start clear, the shared settings store and the pre-launches of the self-heal proof, for any leg.
@@ -502,7 +508,8 @@ try {
         # receipt, recorded as its TOKEN only (a message may echo a value). Anything untyped is a runner error.
         $first = ([string]$_.Exception.Message -split '\s+')[0]
         # ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING (CPU-LEG-SMOKE-CEILING-1): an input too large for a bounded leg at the measured read rate is a typed refusal, not a runner error.
-        if ($first -match '^((PLAYBACK_ATTR3|DUAL_VENUE)_[A-Z0-9_]+|ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING)$') { Stop-Refused "GENERATOR_REFUSED_$first" }
+        # BACHELOR-CORE-PARTITION-AB-1: the generator's CORE_PARTITION_* mask / combination refusals are typed too (dot B3).
+        if ($first -match '^((PLAYBACK_ATTR3|DUAL_VENUE|CORE_PARTITION)_[A-Z0-9_]+|ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING)$') { Stop-Refused "GENERATOR_REFUSED_$first" }
         throw
     }
     $generated = $genOut[-1]
