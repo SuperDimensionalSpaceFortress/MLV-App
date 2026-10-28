@@ -1222,7 +1222,7 @@
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageNightlyTests": 146.7,
    "tools.repo_hygiene.test_venue_stage_nightly.VenueStageReuseModuleTests": 1.2,
    "tools.repo_hygiene.test_venue_thermal_gate.ThermalGateModuleTests": 6.0,
-   "tools.repo_hygiene.test_venue_thermal_gate.ThermalGateRunnerTests": 125.0,
+   "tools.repo_hygiene.test_venue_thermal_gate.ThermalGateRunnerTests": 120.0,
    "tools.repo_hygiene.test_venue_thermal_gate.ThermalSpreadPlanTests": 12.0,
    "tools.repo_hygiene.test_verify_consented_footage.VerifyConsentedFootageTests": 0.0,
    "tools.repo_hygiene.test_wmi_create_hidden_guard.WmiCreateHiddenGuardR2Tests": 2.0,
