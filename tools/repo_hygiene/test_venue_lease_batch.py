@@ -2966,6 +2966,116 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertTrue((self.run_dir / "batch-01.json").is_file())
         self.assertEqual(len(self.batches()), 1)
 
+    # PR 704 r6 (sol r5b B1 = Dot A1 = adversary dc9b06a6 OPEN A1; card LEASE-BATCH-ZONE-UNRESOLVED-LABEL-1; catalogue RPF-06): an OUTPUT the guard could not inspect at the final receipt write
+    # (a dangling runner-owned link in -RunDir, a link that will not resolve, a zone that will not list, an output that will not identify) was caught as "the input cannot be resolved" and
+    # labelled an input alias: both writable receipts suppressed, stop LEG_*_IS_RUN_OUTPUT, though no input aliased an output. It is OUTPUT_ZONE_UNRESOLVED now, exit 2, the receipts written.
+    _RPF06_ZONE_LIST = "            foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {\n"
+    _RPF06_SCAN_ID = "                    if (((Get-FileIdentity $c.FullName).key -ceq $id.key)"
+    _RPF06_RESOLVE = "[VenueLeaseBatchFinalPath]::Resolve([IO.Path]::GetFullPath($Path))"
+
+    def _rpf06_dangling(self, at: Path) -> str:
+        """PowerShell that makes `at` a junction to a folder that no longer exists (the link is there; nothing resolves through it)."""
+        nowhere = psq(self.case / "rpf06-no-such-folder")
+        return f"[void][IO.Directory]::CreateDirectory('{nowhere}'); New-Item -ItemType Junction -Path '{psq(at)}' -Value '{nowhere}' | Out-Null; [IO.Directory]::Delete('{nowhere}')"
+
+    def _rpf06_run(self, args: list[str], e: dict, inject: str, *more: tuple[str, str]) -> subprocess.CompletedProcess:
+        args[args.index("-File") + 1] = str(self._patched_runner(self._FINAL_RECEIPT, f"        if ($true) {{ {inject} }}\n" + self._FINAL_RECEIPT, *more))
+        return subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+
+    def _rpf06_assert_typed_and_written(self, r: subprocess.CompletedProcess) -> dict:
+        self.assertEqual(r.returncode, 2, "an output that could not be inspected was not its own typed stop\n" + r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"]), (2, "OUTPUT_ZONE_UNRESOLVED", 1, []), r.stderr)
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr, "no input aliases an output")
+        self.assertNotIn("BATCH_RECEIPT_WRITE_SKIPPED", r.stderr)
+        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "a receipt no real alias threatens is written")
+        self.assertEqual(len(self.batches()), 1, "batches.jsonl has its line")
+        self.assertIn("BATCH_RECEIPT_OUTPUT_UNRESOLVED batch=1 reason=OUTPUT_ZONE_UNRESOLVED", r.stderr)
+        self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=OUTPUT_ZONE_UNRESOLVED", r.stderr)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        return res
+
+    def test_rpf06_b1_a_dangling_runner_owned_link_at_the_final_receipt_is_output_zone_unresolved_never_an_input_alias(self) -> None:
+        # (a) scalar spec, (b) plan: RunDir\gate.log (runner-owned) becomes a link to nothing after the final BATCH_END; the inputs are untouched and open
+        for form in ("scalar spec", "plan"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                args, e = self.batch_cmd([spec]) if form == "scalar spec" else self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                gate = self.run_dir / "gate.log"
+                r = self._rpf06_run(args, e, f"[IO.File]::Delete('{psq(gate)}'); " + self._rpf06_dangling(gate))
+                self.assertTrue(os.path.lexists(gate) and not gate.exists(), "gate.log is a dangling link (the case under test)\n" + r.stdout + r.stderr)
+                self._rpf06_assert_typed_and_written(r)
+
+    def test_rpf06_c_an_output_that_will_not_identify_in_a_build_manifests_hard_link_scan_is_output_zone_unresolved(self) -> None:
+        # (c) the staged build manifest has a second name (outside every zone), so only its guard scans the outputs by identity, and that scan throws: BUILD_MANIFEST_IS_RUN_OUTPUT before
+        manifest = self._staged_manifest(self.commit_a)
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        other = self.case / "rpf06-manifest-second-name.json"
+        r = self._rpf06_run(args, e, f"New-Item -ItemType HardLink -Path '{psq(other)}' -Value '{psq(manifest)}' | Out-Null; $script:rpf06ScanThrow = $true",
+                            (self._RPF06_SCAN_ID, "                    if ($script:rpf06ScanThrow) { throw 'injected: an output will not identify' }\n" + self._RPF06_SCAN_ID))
+        self.assertTrue(other.is_file(), "the manifest has a second name (the case under test)\n" + r.stdout + r.stderr)
+        self._rpf06_assert_typed_and_written(r)
+        self.assertIn("injected: an output will not identify", r.stderr, "the reason names the output's failure")
+
+    def test_rpf06_d_an_output_link_whose_resolution_throws_after_the_inputs_open_is_output_zone_unresolved(self) -> None:
+        # (d) gate.log is a junction to a folder that exists (outside every input), and resolving it throws: the inputs opened first, so the throw is the output's
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        gate, there = self.run_dir / "gate.log", self.case / "rpf06-gate-target"
+        r = self._rpf06_run(args, e, f"[IO.File]::Delete('{psq(gate)}'); [void][IO.Directory]::CreateDirectory('{psq(there)}'); New-Item -ItemType Junction -Path '{psq(gate)}' -Value '{psq(there)}' | Out-Null; $script:rpf06ResolveThrow = $true",
+                            (self._RPF06_RESOLVE, f"if ($script:rpf06ResolveThrow -and $Path -like '*\\gate.log') {{ throw 'injected: the output link will not resolve' }}; " + self._RPF06_RESOLVE))
+        self.assertTrue(gate.is_dir(), "gate.log is a junction (the case under test)\n" + r.stdout + r.stderr)
+        self._rpf06_assert_typed_and_written(r)
+
+    def test_rpf06_e_an_output_zone_that_will_not_list_at_the_final_receipt_is_output_zone_unresolved(self) -> None:
+        # (e) the -RunDir zone's listing throws (scalar and plan)
+        for form in ("scalar spec", "plan"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                args, e = self.batch_cmd([spec]) if form == "scalar spec" else self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                r = self._rpf06_run(args, e, "$script:rpf06ZoneThrow = $true",
+                                    (self._RPF06_ZONE_LIST, "            if ($script:rpf06ZoneThrow) { throw 'injected: the zone will not list' }\n" + self._RPF06_ZONE_LIST))
+                self._rpf06_assert_typed_and_written(r)
+
+    def test_rpf06_f_a_dangling_link_at_a_receipts_own_name_suppresses_that_receipt_only(self) -> None:
+        # the file-by-file check: batch-01.json itself is a link to nothing, so where its write lands is unknown: that receipt is suppressed (typed), batches.jsonl is still written
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        per = self.run_dir / "batch-01.json"
+        r = self._rpf06_run(args, e, self._rpf06_dangling(per))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"]), (2, "OUTPUT_ZONE_UNRESOLVED", 1))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+        self.assertEqual([Path(f["file"]).name for f in res["receiptPersistFailures"]], ["batch-01.json"], res["receiptPersistFailures"])
+        [f] = res["receiptPersistFailures"]
+        self.assertEqual(f["suppressedBy"], "OUTPUT_ZONE_UNRESOLVED")
+        self.assertIn("this receipt file only", f["reason"])
+        self.assertEqual(len(self.batches()), 1, "batches.jsonl is still written")
+
+    def test_rpf06_g_a_real_alias_the_unlistable_zone_hides_still_suppresses_every_write(self) -> None:
+        # the control the per-file check must keep: the zone will not list, so the guard cannot see that the spec is a hard link to batch.log; the batch.log check sees it and turns the
+        # suppression on: no receipt is written, nothing is appended to batch.log, both lost receipts are named, exit 2
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        link, snap = self._r5_link_to_batch_log(spec)
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        r = self._rpf06_run(args, e, link + "; $script:rpf06ZoneThrow = $true",
+                            (self._RPF06_ZONE_LIST, "            if ($script:rpf06ZoneThrow) { throw 'injected: the zone will not list' }\n" + self._RPF06_ZONE_LIST))
+        self.assertTrue(snap.exists(), "the link was made (the case under test)\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (2, "OUTPUT_ZONE_UNRESOLVED"))
+        self._r5_assert_suppressed(res, "OUTPUT_ZONE_UNRESOLVED")
+        self.assertFalse((self.run_dir / "batch-01.json").exists())
+        self.assertFalse((self.run_dir / "batches.jsonl").exists())
+        self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes(), "nothing was appended to the linked batch.log")
+        self.assertIn("BATCH_OUTPUT_UNVOUCHED batch=1 reason=OUTPUT_ZONE_UNRESOLVED", r.stderr)
+
     def _r5_two_batch_args(self) -> tuple[list[str], dict, Path, Path]:
         a, b = self._r5_spec("fx-a.json", self.specs[0]), self._r5_spec("fx-b.json", self.specs[1])
         args, e = self.plan_cmd(self.write_plan([self.item(a, "A", self.commit_a), self.item(b, "A", self.commit_a)]), FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")

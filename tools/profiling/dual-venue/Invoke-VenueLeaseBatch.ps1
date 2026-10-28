@@ -115,6 +115,8 @@
 # receiptPersistFailures, and every other code keeps its own meaning (13 replaces only a clean 0), so a lost receipt is never an exit 0. Each receipt is serialized with the live logWriteFailures (the diagnostic itself can fail to log).
 # r5: a receipt write the input guard skipped (an accepted input is a runner output) is a receiptPersistFailures entry too (reason WRITE_SUPPRESSED <stop reason>), and a hit seen at a receipt
 # write that no later claim guard consumed is the run's typed stop (exit 2) on the final batch. An input that can no longer be opened is INPUT_VANISHED / INPUT_UNREADABLE (exit 2), never an alias.
+# r6: an OUTPUT that cannot be inspected (a dangling runner-owned link in -RunDir, a zone that will not list) is OUTPUT_ZONE_UNRESOLVED (exit 2), never an alias; at a receipt write each receipt
+# file (and batch.log) is then checked on its own, so a receipt no real alias threatens is still written. Before the lease, and at the open, it still refuses and suppresses as before.
 # Once a batch receipt exists, every end prints LEASE_BATCH_RESULT: a log line between batches is best effort, and an input refused at a later claim (exit 2) prints the summary first.
 # -QuietScript / -LegScript / -UmRunScript / -AgentShare / -ClaimDir are seams for the offline tests (tools/repo_hygiene/test_venue_lease_batch.py).
 [CmdletBinding(DefaultParameterSetName = 'Scalar')]
@@ -376,7 +378,9 @@ function Get-RunDirOutputRefusal([string]$Path) {
     # (\.\, ..\, a trailing \) nor a junction or symlink that reaches it (the input, an ancestor of it, or -RunDir itself) slips past. Every caller goes through here, and so does the
     # re-check once the claim is held (Get-InputOutputRefusal). r11: and the same for each zone of Get-OutputZones (-RunDir, then the claim dir).
     # r5b (adversary r5b A2): $script:refusalInputUnopened says whether a refusal came from the input ITSELF not opening (Get-InputOutputRefusal never calls that an alias)
-    $hardLinkOf = ''; $hardLinkZone = $null; $script:refusalInputUnopened = $false
+    # r6 (sol r5b B1 = Dot A1; card LEASE-BATCH-ZONE-UNRESOLVED-LABEL-1; RPF-06): $script:refusalOutputUnresolved says the input opened but an OUTPUT could not be inspected (a dangling
+    # runner-owned link, a zone that will not list or identify): the guard has no answer about this input, which is OUTPUT_ZONE_UNRESOLVED, never "the input is a runner output"
+    $hardLinkOf = ''; $hardLinkZone = $null; $script:refusalInputUnopened = $false; $script:refusalOutputUnresolved = $false
     try {
         try { $full = Get-PhysicalPath $Path } catch { $script:refusalInputUnopened = $true; throw }
         $zones = @(Get-OutputZones)
@@ -413,7 +417,7 @@ function Get-RunDirOutputRefusal([string]$Path) {
         # r13 (Dot A2''): the identity of every directory above the input, nearest first, for the zone and owned-directory comparisons below
         $aboveIds = [System.Collections.Generic.List[string]]::new()
         $a = [IO.Path]::GetDirectoryName($full)
-        while ($a) { $aboveIds.Add((Get-FileIdentity $a).key); $a = [IO.Path]::GetDirectoryName($a) }
+        try { while ($a) { $aboveIds.Add((Get-FileIdentity $a).key); $a = [IO.Path]::GetDirectoryName($a) } } catch { $script:refusalInputUnopened = $true; throw }   # r6: the input's own folders
         if ($id.links -gt 1) {
             foreach ($z in $zones) {
                 $scan = [System.Collections.Generic.List[object]]::new()
@@ -432,7 +436,12 @@ function Get-RunDirOutputRefusal([string]$Path) {
                 if ($hardLinkOf) { break }
             }
         }
-    } catch { return "'$Path' cannot be resolved to a physical path ($($_.Exception.Message -replace '\s+', ' ')); an input whose location is unknown is refused" }
+    } catch {
+        $m = $_.Exception.Message -replace '\s+', ' '
+        if ($script:refusalInputUnopened) { return "'$Path' cannot be resolved to a physical path ($m); an input whose location is unknown is refused" }
+        $script:refusalOutputUnresolved = $true
+        return "'$Path' cannot be checked against this run's outputs: an output location could not be resolved ($m); the input itself opens, and outputs whose location is unknown are refused"
+    }
     $shown = $(if ($full -ieq [IO.Path]::GetFullPath($Path)) { "'$full'" } else { "'$Path' (physical path '$full')" })
     if ($hardLinkOf) { return "$shown is a hard link to $hardLinkOf, a file this run writes under $($hardLinkZone.label)" }
     $parent = Remove-TrailingSeparator ([IO.Path]::GetDirectoryName($full))
@@ -451,6 +460,11 @@ function Get-RunDirOutputRefusal([string]$Path) {
         }
     }
     ''
+}
+
+function Get-OutputRefusalCode([string]$AliasCode) {
+    # r6 (RPF-06): the typed reason of the refusal Get-RunDirOutputRefusal just returned: the alias code, or OUTPUT_ZONE_UNRESOLVED when it came from an output that could not be inspected
+    $(if ($script:refusalOutputUnresolved) { 'OUTPUT_ZONE_UNRESOLVED' } else { $AliasCode })
 }
 
 function Get-OutputNameRefusal([string]$LegName) {
@@ -492,7 +506,9 @@ function Get-InputOutputRefusal {
     # r11 (sol r10 blocker 3): the first validated input (the plan file, then each leg spec) that is now a file this run writes; $null when none is. Defined once the plan is built;
     # the very guard the preflight uses (Get-RunDirOutputRefusal), run again once the claim is held, because an alias can appear while the batch waits for a foreign claim.
     # r5: an input that cannot be opened any more is its own hit (kind unresolved, Get-InputUnresolvedCode), never "an input is a runner output", and a real alias outranks it.
-    $unresolved = $null
+    # r6 (sol r5b B1 = Dot A1; RPF-06): an output that could not be inspected is its own hit (kind output, OUTPUT_ZONE_UNRESOLVED), never an alias; a real alias outranks it, and it
+    # outranks an unresolved input and a content hit (an output zone nobody inspected is never hidden behind them: the receipt guard asks file by file when it sees one)
+    $unresolved = $null; $outputUnresolved = $null
     foreach ($g in $script:guardedInputs) {
         # a staged build manifest that is gone has no location to compare; Get-InputContentRefusal types that (BUILD_NOT_STAGED). r5b (adversary r5b A1): a folder at its name is not gone.
         if ($g.kind -ceq 'build' -and -not (Test-Path -LiteralPath $g.path)) { continue }
@@ -506,6 +522,10 @@ function Get-InputOutputRefusal {
             if ($code) { break }
         }
         if ($why -and $script:refusalInputUnopened -and -not $code) { $code = 'INPUT_UNREADABLE' }
+        if ($why -and $script:refusalOutputUnresolved) {
+            if (-not $outputUnresolved) { $outputUnresolved = [pscustomobject]@{ kind = 'output'; input = $g.kind; item = $g.item; code = 'OUTPUT_ZONE_UNRESOLVED'; path = $g.path; why = $why } }
+            $why = ''   # no answer about this input: it is still checked as an input below
+        }
         # r5b (adversary r5b A1): no output, but the input may be a folder now (it opens, and reads as nothing)
         if (-not $why) { $code = Get-InputUnresolvedCode $g.path -SkipRead:($g.kind -ceq 'build') }
         if (-not $code) { if ($why) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = $why } }; continue }
@@ -515,18 +535,38 @@ function Get-InputOutputRefusal {
                 why = "$label '$($g.path)' $(if ($code -ceq 'INPUT_VANISHED') { 'is gone (nothing at that name any more)' } else { 'can no longer be opened as a file' }) since it was accepted" }
         }
     }
+    if ($outputUnresolved) { return $outputUnresolved }
     if ($unresolved) { return $unresolved }
     Get-InputContentRefusal
 }
 
 function Test-AliasHit($Hit) {
-    # r5: a guard hit that means an accepted input IS a runner output (the hits that suppress every write into -RunDir); a content or unresolved hit is not one
-    [bool]($Hit -and $Hit.kind -cne 'content' -and $Hit.kind -cne 'unresolved')
+    # r5: a guard hit that means an accepted input IS a runner output (the hits that suppress every write into -RunDir); a content, unresolved or (r6) output hit is not one
+    [bool]($Hit -and $Hit.kind -cne 'content' -and $Hit.kind -cne 'unresolved' -and $Hit.kind -cne 'output')
+}
+
+function Test-SuppressingHit($Hit) {
+    # r6 (RPF-06): the hits that turn the write suppression on at the open and the claim guard: an alias, and an output that could not be inspected (nothing there vouches for a write,
+    # the pre-r6 rule kept). The receipt guard asks file by file instead (Get-ReceiptDestinationRefusal), so a receipt no real alias threatens is still written.
+    [bool]((Test-AliasHit $Hit) -or ($Hit -and $Hit.kind -ceq 'output'))
+}
+
+function Get-ReceiptDestinationRefusal([string]$Path) {
+    # r6 (sol r5b B1; RPF-06): '' when a write to $Path cannot land in an accepted input, asked for that one file when the output zone could not be inspected as a whole. Nothing at the
+    # name: the write makes a new file, which is no accepted input. Something there (a link too, dangling or not): its physical path and file identity are compared with every accepted
+    # input that resolves (one that does not cannot be reached through it), and a name that will not resolve is refused, since where the write lands is unknown.
+    if ([int]([IO.FileInfo]::new($Path)).Attributes -eq -1) { return '' }
+    try { $phys = Get-PhysicalPath $Path; $key = (Get-FileIdentity $Path).key } catch { return "'$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write to it lands is unknown" }
+    foreach ($g in $script:guardedInputs) {
+        try { $gp = Get-PhysicalPath $g.path; $gk = (Get-FileIdentity $g.path).key } catch { continue }
+        if ($phys -ieq $gp -or $key -ceq $gk) { return "'$Path' is the accepted input '$($g.path)'" }
+    }
+    ''
 }
 
 function Get-HitRefusal($Hit) {
     # r5: the typed reason, plan item and sentence of a guard hit, in ONE place (the claim guard, the open, the receipt guard and the summary name a hit alike)
-    if ($Hit.kind -ceq 'content' -or $Hit.kind -ceq 'unresolved') { return $Hit.code, $Hit.item, $Hit.why }
+    if ($Hit.kind -ceq 'content' -or $Hit.kind -ceq 'unresolved' -or $Hit.kind -ceq 'output') { return $Hit.code, $Hit.item, $Hit.why }
     if ($Hit.kind -ceq 'plan') { return 'LEG_PLAN_IS_RUN_OUTPUT', 0, "the plan file $($Hit.why)" }
     if ($Hit.kind -ceq 'build') { return 'BUILD_MANIFEST_IS_RUN_OUTPUT', $Hit.item, "the staged build manifest $($Hit.why)" }
     return 'LEG_SPEC_IS_RUN_OUTPUT', $Hit.item, "the leg spec $($Hit.why)"
@@ -540,7 +580,7 @@ function Test-OpenOutputAlias {
     # suppressed by then, so the run must still end in the refusal: no probe or leg ever runs once an alias was found.
     if ($script:openAliasHit) { return $script:openAliasHit }
     $hit = Get-InputOutputRefusal
-    if ((Test-AliasHit $hit) -and -not $script:RunOutputAliased) {
+    if ((Test-SuppressingHit $hit) -and -not $script:RunOutputAliased) {
         $script:openAliasHit = $hit; $script:suppressionHit = $hit
         # Suppression first, so nothing below can leave it off: no batch.log at all until a redirect exists (r5: the result line is then on stdout only, and no log failure).
         $script:RunOutputAliased = $true; $script:batchLog = $null
@@ -659,7 +699,7 @@ if ($legPlanMode) {
         $planPath = $(if (Test-Path -LiteralPath $LegPlan -PathType Leaf) { (Resolve-Path -LiteralPath $LegPlan).Path } else { $null })
         if (-not $planPath) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "no plan file at '$LegPlan'" }
         $outputRefusal = Get-RunDirOutputRefusal $planPath   # r9: the plan is an input too (leg-plan.json is written over it once the claim is held)
-        if ($outputRefusal) { Stop-PlanRefused 'LEG_PLAN_IS_RUN_OUTPUT' 0 "the plan file $outputRefusal" }
+        if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'LEG_PLAN_IS_RUN_OUTPUT') 0 "the plan file $outputRefusal" }
         $doc = try { [IO.File]::ReadAllText($planPath) | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
         # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
         $rawItems = $null
@@ -685,7 +725,7 @@ if ($legPlanMode) {
             if (-not $path) { Stop-PlanRefused 'LEG_SPEC_MISSING' $n "no leg spec at '$ref'" }
             # adversary r7 pass 2 A1, r9: a spec that IS one of the files this run writes under -RunDir (the one list above) would be overwritten after the lease opened.
             $outputRefusal = Get-RunDirOutputRefusal $path
-            if ($outputRefusal) { Stop-PlanRefused 'LEG_SPEC_IS_RUN_OUTPUT' $n "the leg spec $outputRefusal" }
+            if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'LEG_SPEC_IS_RUN_OUTPUT') $n "the leg spec $outputRefusal" }
             $specRefusal = Get-LegSpecRefusal $path $be
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant() })
@@ -702,7 +742,7 @@ if ($legPlanMode) {
             # (leg-plan.json, a batch receipt, ...) would have it overwritten after the lease opened. r16 (adversary r16 A1): BEFORE its digest and content refusals, as the specs' guard
             # comes before theirs: a manifest that is batch.log was appended to by the BUILD_MANIFEST_MISMATCH refusal's own log line.
             $outputRefusal = Get-RunDirOutputRefusal $st.path
-            if ($outputRefusal) { Stop-PlanRefused 'BUILD_MANIFEST_IS_RUN_OUTPUT' $it.item "the staged build manifest for $short $outputRefusal" }
+            if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'BUILD_MANIFEST_IS_RUN_OUTPUT') $it.item "the staged build manifest for $short $outputRefusal" }
             if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
             # r5 (adversary A2): and the manifest must be one the leg job's validator accepts (its commit, dll pair digest and symbol presence), not only the one named by hash
             if ($st.contentProblem) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short at $($st.path) is not one the leg job accepts: $($st.contentProblem)" }
@@ -728,7 +768,7 @@ if ($legPlanMode) {
         $path = Resolve-LegSpecPath $ref ''
         if (-not $path) { Stop-Usage "no leg spec at '$ref'" }
         $outputRefusal = Get-RunDirOutputRefusal $path   # r9: the same guard as a -LegPlan item's spec
-        if ($outputRefusal) { Stop-Usage "LEG_SPEC_IS_RUN_OUTPUT the leg spec $outputRefusal" }
+        if ($outputRefusal) { Stop-Usage "$(Get-OutputRefusalCode 'LEG_SPEC_IS_RUN_OUTPUT') the leg spec $outputRefusal" }
         $legId = Get-LegSpecId $path
         for ($r = 1; $r -le $Repeats; $r++) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })
@@ -863,9 +903,9 @@ $script:receiptPersistFailures = [System.Collections.Generic.List[object]]::new(
 # no claim guard consumed is the run's typed stop in Write-RunSummary. An input that cannot be opened (INPUT_VANISHED / INPUT_UNREADABLE) is no alias: the receipts are written, and the
 # hit is still kept, so the run ends on it, never exit 0.
 $script:receiptGuardHit = $null
-function Add-SuppressedReceipt([int]$Batch, [string]$Path) {
-    $hr = $(if ($script:suppressionHit) { Get-HitRefusal $script:suppressionHit } else { 'RUN_OUTPUT_ALIASED', 0, 'an accepted input is a runner output' })
-    $reason = "WRITE_SUPPRESSED $($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" }): $($hr[2] -replace '\s+', ' ') (nothing more is written into -RunDir)"
+function Add-SuppressedReceipt([int]$Batch, [string]$Path, $Hit = $script:suppressionHit, [string]$Detail = '') {
+    $hr = $(if ($Hit) { Get-HitRefusal $Hit } else { 'RUN_OUTPUT_ALIASED', 0, 'an accepted input is a runner output' })
+    $reason = "WRITE_SUPPRESSED $($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" }): $($hr[2] -replace '\s+', ' ') $(if ($Detail) { "($($Detail -replace '\s+', ' '); this receipt file only)" } else { '(nothing more is written into -RunDir)' })"
     $script:receiptPersistFailures.Add([ordered]@{ batch = $Batch; file = $Path; reason = $reason; suppressedBy = $hr[0] })
     [Console]::Error.WriteLine("BATCH_RECEIPT_WRITE_SKIPPED batch=$Batch file=$Path reason=$reason")
 }
@@ -876,7 +916,20 @@ function Test-ReceiptWriteSuppressed([int]$Batch, [string]$Path) {
             # r5b pass 2 (adversary A1): a content hit is kept too (a staged manifest gone after the final leg is BUILD_NOT_STAGED there), so no hit seen here is dropped
             if ($guardHit -and -not $script:receiptGuardHit) {
                 $script:receiptGuardHit = $guardHit
-                [Console]::Error.WriteLine("BATCH_RECEIPT_INPUT_$(if ($guardHit.kind -ceq 'unresolved') { 'UNRESOLVED' } else { 'CHANGED' }) batch=$Batch reason=$($guardHit.code) item=$($guardHit.item) $($guardHit.why) (no alias: the receipt is still written; the run ends on it)")
+                [Console]::Error.WriteLine("BATCH_RECEIPT_$(if ($guardHit.kind -ceq 'output') { 'OUTPUT_UNRESOLVED' } elseif ($guardHit.kind -ceq 'unresolved') { 'INPUT_UNRESOLVED' } else { 'INPUT_CHANGED' }) batch=$Batch reason=$($guardHit.code) item=$($guardHit.item) $($guardHit.why) (no alias: the receipt is still written$(if ($guardHit.kind -ceq 'output') { ' when its own file reaches no accepted input' }); the run ends on it)")
+            }
+            # r6 (sol r5b B1 = Dot A1; RPF-06): an output that could not be inspected says no input is a runner output, so the receipts are not all suppressed: each write is asked about its
+            # own file, and batch.log too (every diagnostic below appends there). batch.log reaching an input, or not resolving, turns the suppression on as an alias would.
+            if ($guardHit -and $guardHit.kind -ceq 'output') {
+                $logWhy = $(if ($script:batchLog) { Get-ReceiptDestinationRefusal $script:batchLog } else { '' })
+                if ($logWhy) {
+                    $script:suppressionHit = $guardHit; $script:RunOutputAliased = $true; $script:batchLog = $null
+                    [Console]::Error.WriteLine("BATCH_OUTPUT_UNVOUCHED batch=$Batch reason=$($guardHit.code) $logWhy (batch.log: nothing more is written into -RunDir)")
+                    Add-SuppressedReceipt $Batch $Path
+                    return $true
+                }
+                $destWhy = Get-ReceiptDestinationRefusal $Path
+                if ($destWhy) { Add-SuppressedReceipt $Batch $Path $guardHit $destWhy; return $true }
             }
             return $false
         }
@@ -1027,7 +1080,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             # exit 2. A location hit turns the write suppression on first (Test-OpenOutputAlias's rule): the refused input may be batch.log itself, so nothing more goes into -RunDir.
             # r3 pass 3 (adversary r3 A1): the summary runs inside the refusal, AFTER its own log line, so the logWriteFailures it reports counts that line too.
             if ($batches.Count -gt 0) {
-                if (Test-AliasHit $hit) { $script:RunOutputAliased = $true; $script:batchLog = $null; $script:suppressionHit = $hit }
+                if (Test-SuppressingHit $hit) { $script:RunOutputAliased = $true; $script:batchLog = $null; $script:suppressionHit = $hit }
                 Set-Stop (Get-HitRefusal $hit)[0] 2
                 $script:summaryBeforeExit = { Write-RunSummary }
             }
