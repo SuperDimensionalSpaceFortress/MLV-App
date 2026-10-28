@@ -202,6 +202,38 @@ TEST(ClipOpenAbortCallersWiring, RefusedImportLeavesTheSessionWithoutAReceiptSav
     ASSERT_FALSE(branch.contains(QStringLiteral("deleteFileFromSession")));
 }
 
+// adversary 64a60a72 A1/A2: a refused reopen applies no receipt against the empty / job clip (ReceiptSafety
+// rewrites it), and sliders that describe no receipt are never saved into one.
+TEST(ClipOpenAbortCallersWiring, SlidersThatDescribeNoReceiptAreNeverSaved)
+{
+    const QString source = mainWindowSource();
+    const QString setReceipt = bodyBetween(source, QStringLiteral("void MainWindow::setReceipt( ReceiptSettings *receipt )"),
+                                           QStringLiteral("receipt->setContrast("));
+    ASSERT_TRUE(setReceipt.contains(QStringLiteral("if( m_slidersDetachedFromReceipt ) return;")));
+    ASSERT_TRUE(setReceipt.indexOf(QStringLiteral("if( m_slidersDetachedFromReceipt ) return;"))
+                < setReceipt.indexOf(QStringLiteral("receipt->setExposure(")));
+    const QString setSliders = bodyBetween(source, QStringLiteral("void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)"),
+                                           QStringLiteral("ui->horizontalSliderExposure->setValue("));
+    ASSERT_TRUE(setSliders.contains(QStringLiteral("m_slidersDetachedFromReceipt = false;")));
+
+    const QString exportEnd = bodyBetween(source, QStringLiteral("//Open last file which was opened before export"),
+                                          QStringLiteral("//Unblock GUI"));
+    ASSERT_TRUE(exportEnd.contains(QStringLiteral(
+        "if( clipOpenAbortedForPrep( reopenResult ) ) m_slidersDetachedFromReceipt = true;\n"
+        "        else setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );")));
+    const QString rename = bodyBetween(source, QStringLiteral("void MainWindow::renameActiveClip( void )"),
+                                       QStringLiteral("void MainWindow::retryClipReopenAfterPrepAbort( int row )"));
+    ASSERT_TRUE(rename.contains(QStringLiteral(
+        "if( !clipOpenAbortedForPrep( reopenResult ) ) setSliders( ACTIVE_RECEIPT, false );")));
+    ASSERT_EQ(rename.count(QStringLiteral("setSliders(")), 1);
+    const QString session = bodyBetween(source, QStringLiteral("void MainWindow::openSession(QString fileNameSession)"),
+                                        QStringLiteral("void MainWindow::saveSession(QString fileName)"));
+    ASSERT_TRUE(session.contains(QStringLiteral(
+        "else if( plan.restoreLastOpened ) m_pModel->setActiveRow( lastOpenedRow );\n"
+        "                        // No clip opened yet: the reset sliders describe no receipt (adversary 64a60a72 A2).\n"
+        "                        else m_slidersDetachedFromReceipt = true;")));
+}
+
 // adversary A2: the empty object a refused open (or the rename / delete close) leaves behind has no
 // processing attached; a receipt save must not dereference it.
 TEST(ClipOpenAbortCallersWiring, SetReceiptNeverReadsLevelsFromAnObjectWithoutProcessing)

@@ -893,6 +893,8 @@ private:
     // r3: an export job whose open a busy prep task refused is retried, not dropped.
     bool m_exportRetryHeadJob = false;
     int m_exportOpenAbortRetries = 0;
+    // r3: true while the sliders describe no receipt (a prep-refused open left them); setReceipt is a no-op.
+    bool m_slidersDetachedFromReceipt = false;
     bool m_zoomTo100Center;
     bool m_zoomModeChanged;
     bool m_playbackStopped;

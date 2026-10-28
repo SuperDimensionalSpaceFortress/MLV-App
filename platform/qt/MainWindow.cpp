@@ -14562,6 +14562,8 @@ void MainWindow::openSession(QString fileNameSession)
                             lastOpenedRow = SESSION_CLIP_COUNT - 1;
                         }
                         else if( plan.restoreLastOpened ) m_pModel->setActiveRow( lastOpenedRow );
+                        // No clip opened yet: the reset sliders describe no receipt (adversary 64a60a72 A2).
+                        else m_slidersDetachedFromReceipt = true;
                         if( clipOpenAbortedForPrep( openResult ) ) prepRefusedClips.append( fileName );
                     }
                     else
@@ -15704,6 +15706,7 @@ void MainWindow::pasteReceiptFromClipboardTo(int row)
 //Set the edit sliders to settings
 void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
 {
+    m_slidersDetachedFromReceipt = false;
     invalidateGpuPreviewProcessingConfigCache();
     m_setSliders = true;
     ui->horizontalSliderExposure->setValue( receipt->exposure() );
@@ -18582,6 +18585,9 @@ void MainWindow::resetSliders( void )
 //Set the receipt from sliders
 void MainWindow::setReceipt( ReceiptSettings *receipt )
 {
+    // r3 (adversary 64a60a72 A2): after a prep-refused open the sliders can describe no receipt
+    // (reset values, or an export job's settings); nothing is saved from them until setSliders runs.
+    if( m_slidersDetachedFromReceipt ) return;
     receipt->setExposure( ui->horizontalSliderExposure->value() );
     receipt->setContrast( ui->horizontalSliderContrast->value() );
     receipt->setPivot( ui->horizontalSliderPivot->value() );
@@ -23847,7 +23853,8 @@ void MainWindow::renameActiveClip( void )
     //Open the clip again without rendering
     const int reopenResult = openMlv( ACTIVE_CLIP->getPath() );
     m_frameChanged = false;
-    setSliders( ACTIVE_RECEIPT, false );
+    // A refused reopen applies nothing to the empty object; the sliders were saved into this receipt above.
+    if( !clipOpenAbortedForPrep( reopenResult ) ) setSliders( ACTIVE_RECEIPT, false );
     if( clipOpenAbortedForPrep( reopenResult ) ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );
 }
 
@@ -24508,9 +24515,10 @@ void MainWindow::exportHandler( void )
         m_pStatusDialog->close();
         //Open last file which was opened before export
         const int reopenResult = openMlv( GET_RECEIPT( m_lastClipBeforeExport )->fileName() );
-        // The sliders keep mirroring the active receipt even when the reopen failed, so no later
-        // setReceipt( ACTIVE_RECEIPT ) saves an export job's settings into this clip.
-        setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );
+        // A refused reopen applies nothing (ReceiptSafety would validate this receipt against the job's
+        // clip): the sliders still hold the last job's settings, so no receipt is saved from them.
+        if( clipOpenAbortedForPrep( reopenResult ) ) m_slidersDetachedFromReceipt = true;
+        else setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );
         SET_ACTIVE_CLIP_IDX( m_lastClipBeforeExport );
         if( clipOpenAbortedForPrep( reopenResult ) ) retryClipReopenAfterPrepAbort( m_lastClipBeforeExport );
         //Unblock GUI
