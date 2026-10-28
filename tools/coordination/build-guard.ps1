@@ -523,12 +523,12 @@ function Resolve-HeavySlotCmd([hashtable]$Options) {
     foreach ($named in @($Options.HeavySlotCmd, $env:MLV_HEAVY_SLOT_CMD)) {
         if (-not ([string]$named).Trim()) { continue }
         # Stop-scoped and caught (r8 adversary f99852cb-A1 sibling): an error record would reach stderr past the bounded writer.
-        if (Test-Path -LiteralPath $named -PathType Leaf) { try { return (Resolve-Path -LiteralPath $named -ErrorAction Stop).ProviderPath } catch { return '' } }
+        if (Test-Path -LiteralPath $named -PathType Leaf -ErrorAction Ignore) { try { return (Resolve-Path -LiteralPath $named -ErrorAction Stop).ProviderPath } catch { return '' } }
         return ''
     }
     $found = Get-Command -Name 'heavy-slot.cmd' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($found) { return $found.Source }
-    if (Test-Path -LiteralPath $script:HeavySlotInstallCmd -PathType Leaf) { return $script:HeavySlotInstallCmd }
+    if (Test-Path -LiteralPath $script:HeavySlotInstallCmd -PathType Leaf -ErrorAction Ignore) { return $script:HeavySlotInstallCmd }
     return ''
 }
 
@@ -553,7 +553,7 @@ function Get-HeavySlotLane {
     # <lane> of mlv:<lane>:build: lane-<CARD>-rN-<stamp> under MLV_LANE_RUN_DIR gives <CARD>; no run dir is the hub.
     $run = ([string]$env:MLV_LANE_RUN_DIR).TrimEnd('\', '/')
     if (-not $run) { return 'hub' }
-    $leaf = Split-Path -Leaf $run
+    $leaf = Split-Path -Leaf $run -ErrorAction Ignore
     if ($leaf -match '^lane-(.+)-r\d+-\d{8}T\d{4,6}Z$') { $leaf = $Matches[1] }
     return ($leaf -replace '[^A-Za-z0-9._-]', '-')
 }
@@ -607,7 +607,7 @@ function Send-HeavySlotLines($Lease) {
     # has ended, its last line is complete with or without a newline.
     try { $raw = [string](Get-Content -LiteralPath $Lease.Log -Raw -ErrorAction Stop); $Lease.LogUnread = $false } catch {
         $raw = ''
-        $Lease.LogUnread = [bool](Test-Path -LiteralPath $Lease.Log)
+        $Lease.LogUnread = [bool](Test-Path -LiteralPath $Lease.Log -ErrorAction Ignore)
     }
     $all = @($raw -split '\r?\n')
     $last = $all[-1]
@@ -854,7 +854,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # A CLI that cannot be hashed (held open without read sharing, say) is a pin mismatch, never an error record: the host would
     # write one to stderr synchronously, past the bounded writer, while an ancestor's slot is held (r8 adversary f99852cb-A1).
     $actual = 'missing'
-    if (Test-Path -LiteralPath $cli -PathType Leaf) {
+    if (Test-Path -LiteralPath $cli -PathType Leaf -ErrorAction Ignore) {
         try { $actual = (Get-FileHash -LiteralPath $cli -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() }
         catch { $actual = 'unreadable(' + ($_.Exception.Message -replace '\s+', ' ') + ')' }
     }
@@ -877,7 +877,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     }
     # A lease directory that cannot be created is a shim that cannot be run: fail open like start-failed, never an error record
     # (r8 adversary f99852cb-A1 sibling).
-    try { if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null } } catch {
+    try { if (-not (Test-Path -LiteralPath $dir -ErrorAction Ignore)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null } } catch {
         Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} shim={1} lease-dir-failed: {2}; building WITHOUT the machine heavy slot (fail open)' -f $Label, $cmd, ($_.Exception.Message -replace '\s+', ' '))
         return $null
     }
@@ -957,7 +957,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         while ($true) {
             Send-HeavySlotLines $lease
             # The ready file admits only while the holder it names still runs (checked after the file is seen, and again below).
-            if (Test-Path -LiteralPath $lease.Ready) {
+            if (Test-Path -LiteralPath $lease.Ready -ErrorAction Ignore) {
                 $holder = Get-HeavySlotHolderState $lease
                 if ($holder -eq 'alive') { break }
                 if ($holder -eq 'unreadable') { Exit-HeavySlotUnreadable $lease $Label }
@@ -966,7 +966,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
             $why = ''
             $code = 1
             if ($lease.Process.HasExited) {
-                if (Test-Path -LiteralPath $lease.Ready) { Exit-HeavySlotHolderGone $lease }
+                if (Test-Path -LiteralPath $lease.Ready -ErrorAction Ignore) { Exit-HeavySlotHolderGone $lease }
                 Send-HeavySlotLines $lease
                 $code = $lease.Process.ExitCode
                 if ($code -eq 9009) {
@@ -1073,8 +1073,8 @@ function Invoke-BuildGuard {
         $line = 'BUILD_GUARD_EXEMPT label={0} reason={1} utc={2} pid={3}' -f $Label, $exempt, [DateTime]::UtcNow.ToString('o'), $PID
         Write-BuildGuardLog $line
         try {
-            $logDir = Split-Path -Parent $o.ExemptLogPath
-            if ($logDir -and -not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null }
+            $logDir = Split-Path -Parent $o.ExemptLogPath -ErrorAction Stop
+            if ($logDir -and -not (Test-Path -LiteralPath $logDir -ErrorAction Ignore)) { New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null }
             Add-BuildGuardLogLine -Path $o.ExemptLogPath -Line $line -Encoding ([Text.Encoding]::ASCII)
         } catch { Write-BuildGuardLog "exemption log not written: $($_.Exception.Message)" }
     }

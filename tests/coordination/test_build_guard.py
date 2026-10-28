@@ -2183,6 +2183,27 @@ def test_a_cli_that_cannot_be_hashed_is_a_typed_pin_refusal(box) -> None:
     assert not box["marker"].exists()
 
 
+def test_a_caller_path_with_a_nul_writes_no_error_record_under_continue(box) -> None:
+    # r8 adversary d97e22c4-A1 (siblings: the lease-dir and exemption-dir probes): a path holding a NUL makes Test-Path write a
+    # non-terminating error record, which the host renders to stderr synchronously, past the bounded writer, while an
+    # ancestor's slot is held. Every guard probe of a caller path is Ignore-scoped or Stop-scoped and caught: no record.
+    bad = "('C:\\bad' + [char]0 + '\\heavy-slot.cmd')"
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n$ErrorActionPreference = 'Continue'\n"
+                f"$r = @(Resolve-HeavySlotCmd @{{ HeavySlotCmd = {bad} }} 2>&1)\n"
+                "Write-Output (\"resolve errors={0} value=[{1}]\" -f @($r | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }).Count, "
+                "(@($r | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join ','))\n"
+                f"$o = @{{ HeavySlotCmd = '{NO_HEAVY_SLOT}'; MemoryProbeFile = '{_write_json(box['dir'] / 'memory.json', OK_MEMORY)}'; "
+                f"ProcessTableFile = '{_write_json(box['dir'] / 'table.json', [])}'; LockPath = '{box['lock']}'; "
+                f"MutexName = 'Local\\MLV-R8-NUL-{os.getpid()}'; ExemptLogPath = ('C:\\bad' + [char]0 + '\\exempt.log') }}\n"
+                "$b = @(Invoke-BuildGuard -Label t -ExemptReason 'r8 test' -Options $o -Action { param($Jobs) 'built' } 2>&1)\n"
+                "Write-Output (\"guard errors={0} built={1}\" -f @($b | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }).Count, "
+                "(@($b | Where-Object { $_ -eq 'built' }).Count))\n"])
+    out = done.stdout + done.stderr
+    assert "resolve errors=0 value=[]" in done.stdout, out
+    assert "guard errors=0 built=1" in done.stdout, out
+
+
 def test_a_holder_that_cannot_be_inspected_keeps_its_stop_file(box) -> None:
     # r8 adversary f99852cb-A2: the wrapper has ended and the verified holder still runs, but its handle cannot be opened
     # (access denied). That is not proof it is gone, so the stop file is still needed and cleanup keeps it.
