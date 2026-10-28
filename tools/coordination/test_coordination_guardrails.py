@@ -3041,6 +3041,29 @@ def test_save_dirty_worktree_evidence_never_writes_through_a_hard_link_added_to_
 
 
 @dirty_save_only
+@pytest.mark.parametrize("then", ["returns", "throws"])
+def test_save_dirty_worktree_evidence_empties_a_held_temp_given_a_second_name_during_its_write(tmp_path, then):
+    # r12 iter 2 (adversary 9ffb95df-A1): a hard link added to the held status temp AFTER the write's one-name check, followed by a flush that fails (ERROR_IO_DEVICE), skipped
+    # the emptying and left the evidence bytes in the worktree name. The seam runs between the write and the flush: it adds the link and then returns or throws. Either way the
+    # temp is emptied before the save fails, so the worktree name keeps the empty bytes it was linked with.
+    wt, dest = _dirty_save_repo(tmp_path)
+    alias = wt / "alias.txt"
+    throw = "throw [System.IO.IOException]::new('flush failed: ERROR_IO_DEVICE')" if then == "throws" else ""
+    shim = ("$script:RealNT = (Get-Command New-DirtyHeldTemp -CommandType Function).ScriptBlock; $script:Seam = $false; "
+            "function New-DirtyHeldTemp { $t = & $script:RealNT @args; "
+            "if ($t.Path -and (Split-Path -Leaf $t.Path) -like 'dirty-worktree-status-*') { $script:StatPath = $t.Path; "
+            f"[DirtyFinalPath]::AfterWriteForTest = [Action[IntPtr]]{{ param($h) [DirtyFinalPath]::AfterWriteForTest = $null; $script:Seam = $true; "
+            f"$null = New-Item -ItemType HardLink -Path '{alias}' -Value $script:StatPath; {throw} }} }}; $t }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; Write-Output \"seam=$script:Seam\"")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] == "seam=True", (out.stdout, out.stderr)
+    assert alias.read_bytes() == b"", ("the evidence stayed in a name added during the write", out.stdout, out.stderr)
+    assert lines[0].startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=") and "DIRTY_TREE_SAVED" not in out.stdout, (out.stdout, out.stderr)
+    if then == "returns":
+        assert lines[0].startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=temp-file-linked"), (out.stdout, out.stderr)
+
+
+@dirty_save_only
 def test_save_dirty_worktree_evidence_never_writes_through_a_temp_turned_into_a_symbolic_link(tmp_path):
     # r11 (sol r10 B1, the repro itself): after the empty status temp is created, it is turned in place into a symbolic link to the untracked worktree file orphan.txt.
     # Needs SeCreateSymbolicLinkPrivilege; the unprivileged model above covers every temp. The write goes through the hold and refuses a reparse point.

@@ -270,7 +270,9 @@ public static class DirtyFinalPath {
     // never have that file truncated (r11, sol r10 B1). Returns null, or the typed reason.
     // Adding a hard link needs no share access, so another process can give the HELD file a second name (in the worktree, say) after its one-name check: the write refuses
     // a file with more than one name, and a name added during the write gets the file emptied again, the bytes it was linked with (every temp is written once, right after
-    // it is created empty), before temp-file-linked is returned (r12, adversary b38245c1-A1).
+    // it is created empty), before temp-file-linked is returned (r12, adversary b38245c1-A1). The emptying runs in a finally, so a write or flush that throws after bytes went
+    // in is emptied too before the throw goes on (r12 iter 2, adversary 9ffb95df-A1); a device that also refuses the truncation is the one case left.
+    public static Action<IntPtr> AfterWriteForTest;  // test seam: runs between the write and the flush (null in production)
     public static string WriteHeld(IntPtr held, byte[] bytes) {
         if (held == IntPtr.Zero) return "temp-not-held";
         IntPtr w = ReOpenFile(held, 0x40000000 | 0x80, 3, 0x00200000);  // GENERIC_WRITE | FILE_READ_ATTRIBUTES, share READ|WRITE (the hold's own READ), FILE_FLAG_OPEN_REPARSE_POINT
@@ -278,9 +280,17 @@ public static class DirtyFinalPath {
         using (Microsoft.Win32.SafeHandles.SafeFileHandle safe = new Microsoft.Win32.SafeHandles.SafeFileHandle(w, true)) {
             if (HandleIsReparse(w)) return "temp-reparse-point";
             if (!HasOneName(w)) return "temp-file-linked";
-            using (System.IO.FileStream fs = new System.IO.FileStream(safe, System.IO.FileAccess.Write)) {
-                fs.SetLength(0); fs.Write(bytes, 0, bytes.Length); fs.Flush(true);
-                if (!HasOneName(w)) { fs.SetLength(0); fs.Flush(true); return "temp-file-linked"; }
+            using (System.IO.FileStream fs = new System.IO.FileStream(safe, System.IO.FileAccess.Write, 1)) {  // unbuffered: the emptying below never has to flush a buffer first
+                bool kept = false;
+                try {
+                    fs.SetLength(0); fs.Write(bytes, 0, bytes.Length);
+                    if (AfterWriteForTest != null) AfterWriteForTest(w);
+                    fs.Flush(true);
+                    kept = HasOneName(w);
+                    if (!kept) return "temp-file-linked";
+                } finally {
+                    if (!kept) { try { fs.SetLength(0); fs.Flush(true); } catch { } }
+                }
             }
         }
         return null;

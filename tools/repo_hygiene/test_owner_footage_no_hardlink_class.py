@@ -206,6 +206,14 @@ LANE_DIRTY_SAVE_K32_CLASSES = {"4"}  # SetFileInformationByHandle: FileDispositi
 _NATIVE_SET_INFO_RE = re.compile(r"\b(?:Nt|Zw)SetInformationFile\w*")
 _K32_SET_INFO_RE = re.compile(r"\bSetFileInformationByHandle\w*")
 _LINK_NAME_RE = re.compile(r"FileLinkInfo\w*|CreateHardLink\w*|\bHardLink\b", re.IGNORECASE)
+# Every native the saver binds, by its own name: an EntryPoint alias or a runtime lookup could bind NtSetInformationFile under any
+# name (built from string pieces) and dodge the census (r12 iter 2, adversary 9ffb95df-A4).
+LANE_DIRTY_SAVE_NATIVES = {
+    "CreateFileW", "GetFinalPathNameByHandleW", "CloseHandle", "GetFileInformationByHandle", "NtCreateFile",
+    "RtlNtStatusToDosError", "ReOpenFile", "NtSetInformationFile", "SetFileInformationByHandle",
+}
+_EXTERN_RE = re.compile(r"\bextern\b(?P<head>[^;(]*)\(")
+_NATIVE_LOOKUP_RE = re.compile(r"\bEntryPoint\b|GetProcAddress|GetDelegateForFunctionPointer|\bNativeLibrary\b|\bLibraryImport\b|\bcalli\b")
 
 
 def _call_arguments(text: str, at: int) -> list[str] | None:
@@ -264,6 +272,12 @@ def lane_dirty_save_violations(text: str) -> list[str]:
         violations.append(f"NtSetInformationFile must be called exactly {LANE_DIRTY_SAVE_NT_CALLS} time(s), found lines {nt_calls}")
     for match in _LINK_NAME_RE.finditer(text):
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a link name: {match.group(0)}")
+    for match in _NATIVE_LOOKUP_RE.finditer(text):
+        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a native bound by alias or at run time: {match.group(0)}")
+    for match in _EXTERN_RE.finditer(text):
+        name = (re.findall(r"\w+", match.group("head")) or [""])[-1]
+        if name not in LANE_DIRTY_SAVE_NATIVES:
+            violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: an extern outside the named set: {name!r}")
     # the file-keyed allowance covers exactly the declaration and the counted call, never another hard-link spelling
     extra = [f"{number}: {line}" for number, line in hard_link_text_hits(text) if number not in set(nt_decl) | set(nt_calls)]
     violations += [f"a hard-link scan hit outside the counted rename: {hit}" for hit in extra]
@@ -319,6 +333,13 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "a mention in a comment": text.replace(call, call + " // NtSetInformationFile again"),
             "a CreateHardLinkW call": text.replace(call, call + "\nCreateHardLinkW(a, b, IntPtr.Zero);"),
             "a New-Item hard link": text + "\nNew-Item -ItemType HardLink -Path $a -Value $b\n",
+            # adversary 9ffb95df-A4: a native bound under another name, its entry point built from string pieces
+            "a concatenated EntryPoint alias": text.replace(call, call + '\n[DllImport("ntdll.dll", EntryPoint = "NtSet" + "InformationFile")] '
+                                                          "static extern int Alias(IntPtr h, out IoStatusBlock io, IntPtr p, uint l, int c);\nAlias(h, out io, info, 24, 11);"),
+            "a concatenated disposition alias": text.replace(call, call + '\n[DllImport("kernel32.dll", EntryPoint = "SetFileInformation" + "ByHandle")] '
+                                                            "static extern bool Quiet(IntPtr h, int c, IntPtr p, uint s);\nQuiet(h, 999, info, 24);"),
+            "an extern outside the named set": text.replace(call, call + '\n[DllImport("ntdll.dll")] static extern int NtQuietSet(IntPtr h, int c);'),
+            "a runtime lookup": text.replace(call, call + '\nIntPtr p = GetProcAddress(GetModuleHandle("ntdll.dll"), "NtSet" + "InformationFile");'),
         }
         for name, mutant in mutants.items():
             with self.subTest(mutant=name):
