@@ -605,10 +605,11 @@ function Get-VenueStagedBuildManifest {
     .OUTPUTS
     [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
-    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][int]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
-        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1, 600)][int]$ArtifactMinSec = 1)
-    # -ArtifactTimeoutSec 0 (the default): the artifact hash gets the whole seconds left of -TimeoutSec after the manifest read (under one left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
+        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1, 600)][double]$ArtifactMinSec = 1)
+    # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (under -ArtifactMinSec left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
+    # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
     $callClock = [Diagnostics.Stopwatch]::StartNew()
     $path = $AgentShare.TrimEnd('\') + '\cache\playback-attr-3-cuda-' + $SourceCommit.Substring(0, 12) + '-build.json'
     # -ProbeScript is the offline test seam for a read that never answers; production passes none.
@@ -682,13 +683,14 @@ function Get-VenueStagedBuildManifest {
                             if ($got -cne $i.sha) { 'MISMATCH:' + $i.label + ':' + $i.name + ':' + $got }
                         }
                     } })
-            # adversary r2 A2: with no explicit bound the hash gets whole seconds of what is LEFT of -TimeoutSec, and none when less than a second is left (a 1 s floor would run the call past its own bound)
+            # adversary r2 A2: with no explicit bound the hash gets what is LEFT of -TimeoutSec, and none when less than -ArtifactMinSec is left (a 1 s floor would run the call past its own bound)
             $artSec = $ArtifactTimeoutSec
             if ($artSec -le 0) {
-                $left = [Math]::Floor($TimeoutSec - $callClock.Elapsed.TotalSeconds)
-                # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its 2 s (no content read starts with under 2 s left)
-                if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $TimeoutSec after the manifest read"; contentProblem = $null; artifactProblem = $null } }
-                $artSec = [int]$left
+                # r7 (sol r6 B1): the exact remainder, not its whole seconds (2.7 s left was floored to 1, under the guard's 2 s minimum, and a healthy hash never started)
+                $left = $TimeoutSec - $callClock.Elapsed.TotalSeconds
+                # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its own minimum ($script:GuardReadMinSec, the same rule)
+                if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Round([Math]::Max(0, $left), 2)) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null } }
+                $artSec = $left
             }
             $ar =Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec
             if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null } }
@@ -736,7 +738,8 @@ function Invoke-VenueBoundedRead {
     .OUTPUTS
     [pscustomobject]@{ answered; value (the script's output as an array); error }
     #>
-    param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1, 600)][int]$TimeoutSec)
+    # r7 (sol r6 B1): -TimeoutSec keeps its fraction (a caller's exact remainder), so no bound is rounded up past the caller's deadline or down under its minimum
+    param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1, 600)][double]$TimeoutSec)
     $ps = [powershell]::Create()
     $abandoned = $false
     try {
@@ -747,7 +750,7 @@ function Invoke-VenueBoundedRead {
             $abandoned = $true
             $script:VenueAbandonedReads++
             try { [void]$ps.BeginStop($null, $null) } catch { }
-            return [pscustomobject]@{ answered = $false; value = @(); error = "no answer in $TimeoutSec s" }
+            return [pscustomobject]@{ answered = $false; value = @(); error = "no answer in $([Math]::Round($TimeoutSec, 2)) s" }
         }
         [pscustomobject]@{ answered = $true; value = @($ps.EndInvoke($async)); error = $null }
     } catch {
