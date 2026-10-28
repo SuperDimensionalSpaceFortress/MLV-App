@@ -234,6 +234,17 @@ _HERE_STRING_CLOSE_RE = re.compile(r"^['\"]@", re.MULTILINE)
 _DYNAMIC_CODE_RE = re.compile(
     r"Invoke-Expression|\biex\b|\[scriptblock\]::Create|NewScriptBlock|Assembly\]?::Load\w*|\bLoad(?:From|File)\b|CodeDom|CodeProvider|CodeAnalysis"
     r"|Import-Module|\bipmo\b", re.IGNORECASE)
+# PowerShell can name a member or a command by a value computed at run time ($t.('Get'+'Method'), & ('Add-'+'Type')) or rebind a name (an alias or function
+# called Add-Type), and no text census follows either, so each SITE of dynamic dispatch fails closed (r14 iter 2, adversary 27186cee-A1/A2). The saver's own
+# shapes stay allowed: & $scriptblockVariable, & git, and Get-Command git -CommandType Application.
+_DYNAMIC_DISPATCH_RE = re.compile(
+    r"(?:\$\w+|[A-Za-z_\]\)])(?:\.|::)[(\$'\"]"  # a member named by an expression, a variable or a string
+    r"|(?:^|[\s;|({=])&\s*[('\"]"  # the call operator on an expression or a string
+    r"|(?:^|[;{])[ \t]*\.[ \t]+\S"  # dot-sourcing at the start of a statement
+    r"|Set-Alias|New-Alias|Import-Alias|\bsal\b|\bnal\b|\balias:|\bfunction:"  # a name rebound (Add-Type -> a wrapper)
+    r"|\bGet-Command\b(?! git -CommandType Application\))|\bgcm\b|InvokeCommand|ExecutionContext|SessionState|\bpsobject\b"
+    r"|-MemberName\b|ForEach-Object\s+[('\"$]|\|\s*%\s+[('\"$]"  # a method invoked by a computed name through the pipeline
+    r"|EncodedCommand|FromBase64", re.IGNORECASE | re.MULTILINE)
 _VERBATIM_IDENTIFIER_RE = re.compile(r"(?<![\w\"'])@[A-Za-z_]")
 _REFLECTION_RE = re.compile(
     r"\b(?:GetMethods?|GetMembers?|GetMember|GetRuntimeMethods?|GetDeclaredMethods?|GetTypeInfo|InvokeMember|MethodInfo|MethodBase|BindingFlags"
@@ -324,6 +335,8 @@ def lane_dirty_save_violations(text: str) -> list[str]:
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a reflection lookup: {match.group(0)}")
     for match in _DYNAMIC_CODE_RE.finditer(text):
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: code compiled, loaded or evaluated outside the one payload: {match.group(0)}")
+    for match in _DYNAMIC_DISPATCH_RE.finditer(text):
+        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a member or command named at run time, or a name rebound: {match.group(0).strip()}")
     lines = text.splitlines()
     add_types = [text.count("\n", 0, m.start()) + 1 for m in _ADD_TYPE_ANY_RE.finditer(text)]
     opens = [text.count("\n", 0, m.start()) + 1 for m in _HERE_STRING_OPEN_RE.finditer(text)]
@@ -521,6 +534,33 @@ class NoHardLinkCreationTests(unittest.TestCase):
             "A3 an assembly load": text + "\n[Reflection.Assembly]::LoadFile($dll)\n",
             "A3 an Import-Module of a dll": text + "\nImport-Module $dll\n",
         }
+        # r14 iter 2 (adversary 27186cee): a member or command named at run time, or Add-Type rebound to a wrapper, inserted into the real saver
+        lines = text.splitlines(keepends=True)
+        at_line_50 = lambda inserted: "".join(lines[:49]) + inserted + "\n" + "".join(lines[49:])  # noqa: E731
+        mutants.update({
+            "iter2 A1 a reflective GetMethod built from pieces": at_line_50(
+                "$t = [DirtyFinalPath]; $m = $t.('Get'+'Method')(('NtSet'+'InformationFile'),40); "
+                "$null = $m.Invoke($null,[object[]]@([IntPtr]::Zero,$null,[IntPtr]::Zero,[uint32]0,11))"),
+            "iter2 A1 a member named by a variable": at_line_50("$n = 'Get' + 'Method'; $m = [DirtyFinalPath].$n('x', 40)"),
+            "iter2 A1 a member named by a string": at_line_50("$m = [DirtyFinalPath].'GetMethod'('x', 40)"),
+            "iter2 A1 a static member named by an expression": at_line_50("[DirtyFinalPath]::('Re'+'solve')($p)"),
+            "iter2 A1 a member invoked through ForEach-Object": at_line_50("$m = [DirtyFinalPath] | ForEach-Object ('Get'+'Method') 'x' 40"),
+            "iter2 A1 a member invoked through -MemberName": at_line_50("$m = [DirtyFinalPath] | ForEach-Object -MemberName $n 'x' 40"),
+            "iter2 A1 a computed scriptblock": at_line_50("$sb = $ExecutionContext.InvokeCommand.NewScriptBlock($s); & $sb"),
+            "iter2 A1 a computed module import": at_line_50("& ('Import-'+'Module') $dll"),
+            "iter2 A1 an encoded child": at_line_50("& pwsh -EncodedCommand $b"),
+            "iter2 A1 a dot-sourced script": at_line_50(". $env:TEMP\\x.ps1"),
+            "iter2 A1 a psobject method lookup": at_line_50("$m = $t.psobject.Methods['GetMethod']"),
+            "iter2 A2 Add-Type rebound by a computed alias": text + (
+                "\nfunction Invoke-CensusSwap {\n    param([string]$TypeDefinition)\n"
+                "    & ('Microsoft.PowerShell.Utility\\Add-'+'Type') -TypeDefinition ($TypeDefinition -replace ', 10\\);', ', 11);')\n}\n"
+                "Set-Alias -Name ('Add-'+'Type') -Value Invoke-CensusSwap\n"),
+            "iter2 A2 an alias by New-Alias": text + "\nNew-Alias -Name $n -Value Invoke-CensusSwap\n",
+            "iter2 A2 a lowercase sal": text + "\nsal $n Invoke-CensusSwap\n",
+            "iter2 A2 a function drive entry": text + "\nNew-Item -Path function:\\$n -Value { param($TypeDefinition) }\n",
+            "iter2 A2 a Get-Command lookup": text + "\n& (Get-Command ('Add-'+'Type'))\n",
+            "iter2 A2 a lowercase gcm": text + "\n& (gcm *-Type)\n",
+        })
         for name, mutant in mutants.items():
             with self.subTest(mutant=name):
                 self.assertNotEqual(mutant, text, "the mutant did not apply")
