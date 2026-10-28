@@ -363,9 +363,30 @@ class ModuleFunctionTests(unittest.TestCase):
                         "Write-Output ('JSON=' + (ConvertTo-Json -InputObject @($r.PSObject.Properties.Name) -Compress))")
         self.assertEqual(got, ["status", "reason", "chains", "selectedChain"])
 
+    def test_r3_a3_a_dictionary_report_with_a_keys_entry_keeps_every_field(self) -> None:
+        # adversary A3 on 3ae8ebb2: `$Report.Keys` on a dictionary holding a 'Keys' entry reads that entry, so chains (and Keys itself) were dropped; PSBase.Keys is the real key collection
+        for helper in self.HELPERS:
+            got = self.call("$report = [ordered]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'r'; chains = @(1, 2); Keys = 'status' }\n"
+                            f"$r = {self.HELPERS[helper]}\n"
+                            "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ names = @($r.PSObject.Properties.Name); chains = @($r.chains); keys = $r.Keys }) -Compress))")
+            self.assertEqual((got["names"], got["chains"], got["keys"]), (["status", "reason", "chains", "Keys"], [1, 2], "status"), helper)
+
+    def test_r3_a2_a_path_that_contains_the_token_name_still_gets_the_detail(self) -> None:
+        # adversary A2 on 3ae8ebb2: the already-annotated check matched any substring, so a CSV path under a folder named like the token suppressed the whole detail
+        got = self.call("$report = [pscustomobject]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'PresentMon output does not exist: C:\\mlvtmp\\PRESENTMON_ORPHAN_SWEEP_INCOMPLETE\\run\\presentmon.csv' }\n"
+                        "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ ran = $false; skippedReason = 'presentmon_process_alive'; livePresentMonProcessIds = @(6100) }\n"
+                        "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ reason = $r.reason }) -Compress))")
+        self.assertTrue(got["reason"].endswith("[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive livePids=6100]"), got["reason"])
+
+    def test_r3_a2_a_bare_detail_reason_is_still_never_annotated_twice(self) -> None:
+        got = self.call("$report = [pscustomobject]@{ reason = 'PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=a' }\n"
+                        "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ ran = $false; skippedReason = 'b' }\n"
+                        "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ same = [object]::ReferenceEquals($r, $report) }) -Compress))")
+        self.assertTrue(got["same"])
+
     def test_mutation_the_property_only_copy_loses_a_dictionary_reports_fields_again(self) -> None:
         module = MODULE.read_text(encoding="utf-8")
-        branch = ("    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.Keys)) { $copy[[string]$key] = $Report[$key] } }\n"
+        branch = ("    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }\n"
                   "    else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }\n")
         self.assertEqual(module.count(branch), 2, "both report helpers carry the dictionary branch")
         mutated = module.replace(branch, "    foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value }\n", 2)

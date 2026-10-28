@@ -2315,7 +2315,7 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
     if ($detailed -ceq $current) { return $Report }
     # r3 (sol B1, the sibling copy): a dictionary report keeps its entries; either shape comes back as the same pscustomobject
     $copy = [ordered]@{}
-    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.Keys)) { $copy[[string]$key] = $Report[$key] } }
+    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }
     else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }
     $copy['reason'] = $detailed
     return [pscustomobject]$copy
@@ -2340,7 +2340,8 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
 
     if ($null -eq $Sweep) { return $Report }
     $current = [string]$Report.reason
-    if ($current.Contains('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE')) { return $Report }
+    # r3 (adversary A2): the token is the detail this helper writes (a bare prefix, or bracketed after a reason), never a path or a word that merely contains the name
+    if ($current.StartsWith('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:') -or $current.Contains('[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:')) { return $Report }
     # the record is the job's [ordered] table (a key may be absent: the job's default before Start-PresentMonCapture ran has two) or an object; strict mode throws on an absent member, so read by name.
     # r2: copied into a plain table first (no call operator: the job splices this body and the spliced-body scan, R3, rejects `& <scriptblock>`); an absent key reads as $null
     $field = @{}
@@ -2374,7 +2375,7 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     $detail = "PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: $($parts -join ' ')"
     # r3 (sol B1): a dictionary report keeps its entries (PSObject.Properties of a dictionary are its own members, not its keys); either shape comes back as the same pscustomobject
     $copy = [ordered]@{}
-    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.Keys)) { $copy[[string]$key] = $Report[$key] } }
+    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }
     else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }
     $copy['reason'] = if ([string]::IsNullOrEmpty($current)) { $detail } else { "$current [$detail]" }
     return [pscustomobject]$copy
