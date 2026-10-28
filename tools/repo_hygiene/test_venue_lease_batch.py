@@ -3109,6 +3109,31 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                     for p in (target.parent, target):
                         subprocess.run(["icacls", str(p), "/remove:d", os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")], capture_output=True)
 
+    def test_r6_adv2_a1_a_log_that_is_an_input_whose_own_path_will_not_resolve_is_never_written(self) -> None:
+        # adversary r6 pass 2 A1: the spec's own path stops resolving (as a share that now denies it; injected, since a share needs admin) while the file is batch.log by another name.
+        # The guard has no answer for that input (INPUT_UNREADABLE, no alias), so nothing compared batch.log with it and the summary was appended INTO the spec. batch.log is now
+        # asked on its own: as the input was accepted (batch.log re-linked to it), or, while the input does not resolve, any batch.log with another name: nothing is written into -RunDir.
+        for form in ("input re-linked to batch.log", "batch.log re-linked to the input"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                s, log = psq(spec), psq(self.run_dir / "batch.log")
+                snap = self.case / "rpf06-spec.snap"
+                relink = (f"[IO.File]::Delete('{s}'); New-Item -ItemType HardLink -Path '{s}' -Value '{log}' | Out-Null" if form.startswith("input")
+                          else f"[IO.File]::Copy('{log}', '{s}', $true); [IO.File]::Delete('{log}'); New-Item -ItemType HardLink -Path '{log}' -Value '{s}' | Out-Null")
+                inject = f"{relink}; Copy-Item -LiteralPath '{s}' -Destination '{psq(snap)}'; $script:rpf06DenySpec = $true"
+                deny = (self._RPF06_RESOLVE, f"if ($script:rpf06DenySpec -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE)
+                r = self._rpf06_run(args, e, inject, deny)
+                self.assertTrue(snap.exists(), "the case under test was set up\n" + r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"]), (2, "INPUT_UNREADABLE"), r.stderr)
+                self.assertEqual(spec.read_bytes(), snap.read_bytes(), "nothing was written into the input through batch.log")
+                self._r5_assert_suppressed(res, "INPUT_UNREADABLE")
+                self.assertIn("BATCH_OUTPUT_UNVOUCHED batch=1 reason=INPUT_UNREADABLE", r.stderr)
+
     def _r5_two_batch_args(self) -> tuple[list[str], dict, Path, Path]:
         a, b = self._r5_spec("fx-a.json", self.specs[0]), self._r5_spec("fx-b.json", self.specs[1])
         args, e = self.plan_cmd(self.write_plan([self.item(a, "A", self.commit_a), self.item(b, "A", self.commit_a)]), FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")

@@ -561,11 +561,19 @@ function Get-ReceiptDestinationRefusal([string]$Path) {
     # r6 (sol r5b B1; RPF-06): '' when a write to $Path cannot land in an accepted input, asked for that one file when the output zone could not be inspected as a whole. Nothing at the
     # name: the write makes a new file, which is no accepted input. Something there (a link too, dangling or not): its physical path and file identity are compared with every accepted
     # input that resolves (one that does not cannot be reached through it), and a name that will not resolve is refused, since where the write lands is unknown.
+    # r6 pass 3 (adversary r6 pass 2 A1): an input whose own path stops resolving (a share that now denies it) is still compared, by the physical path and identity it had when
+    # accepted ($g.accepted); and while it does not resolve, only a destination with one name and no link (it can be no other file) is let through.
     if (Test-NothingAtName $Path) { return '' }
-    try { $phys = Get-PhysicalPath $Path; $key = (Get-FileIdentity $Path).key } catch { return "'$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write to it lands is unknown" }
+    try { $phys = Get-PhysicalPath $Path; $di = Get-FileIdentity $Path; $plain = ($di.links -le 1) -and -not ([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint) }
+    catch { return "'$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write to it lands is unknown" }
     foreach ($g in $script:guardedInputs) {
-        try { $gp = Get-PhysicalPath $g.path; $gk = (Get-FileIdentity $g.path).key } catch { continue }
-        if ($phys -ieq $gp -or $key -ceq $gk) { return "'$Path' is the accepted input '$($g.path)'" }
+        if ($g.accepted -and ($phys -ieq $g.accepted.phys -or $di.key -ceq $g.accepted.key)) { return "'$Path' is the accepted input '$($g.path)' (as it was accepted)" }
+        if (Test-NothingAtName $g.path) { continue }
+        try { $gp = Get-PhysicalPath $g.path; $gk = (Get-FileIdentity $g.path).key } catch {
+            if ($plain) { continue }
+            return "'$Path' has another name or is a link, and the accepted input '$($g.path)' cannot be resolved to compare it with ($($_.Exception.Message -replace '\s+', ' '))"
+        }
+        if ($phys -ieq $gp -or $di.key -ceq $gk) { return "'$Path' is the accepted input '$($g.path)'" }
     }
     ''
 }
@@ -796,6 +804,8 @@ if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPat
 foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend }) }
 # r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
 if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { $_.sourceCommit -ceq $b.Key })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
+# r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted (the preflight guard just resolved it), for Get-ReceiptDestinationRefusal
+foreach ($g in $script:guardedInputs) { $g | Add-Member -NotePropertyName accepted -NotePropertyValue $(try { [pscustomobject]@{ phys = (Get-PhysicalPath $g.path); key = (Get-FileIdentity $g.path).key } } catch { $null }) }
 if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }
 # The scalar form's one build rides on every leg, so each leg is launched with its own build in either form.
 if (-not $legPlanMode) { foreach ($p in $plan) { $p | Add-Member -NotePropertyName sourceCommit -NotePropertyValue $SourceCommit; $p | Add-Member -NotePropertyName buildManifestSha256 -NotePropertyValue $BuildManifestSha256 } }
@@ -926,7 +936,8 @@ function Test-ReceiptWriteSuppressed([int]$Batch, [string]$Path) {
             }
             # r6 (sol r5b B1 = Dot A1; RPF-06): an output that could not be inspected says no input is a runner output, so the receipts are not all suppressed: each write is asked about its
             # own file, and batch.log too (every diagnostic below appends there). batch.log reaching an input, or not resolving, turns the suppression on as an alias would.
-            if ($guardHit -and $guardHit.kind -ceq 'output') {
+            # r6 pass 3 (adversary r6 pass 2 A1, sibling): an input that did not resolve was never compared with the outputs either, so its hit is asked file by file the same way
+            if ($guardHit -and ($guardHit.kind -ceq 'output' -or $guardHit.kind -ceq 'unresolved')) {
                 $logWhy = $(if ($script:batchLog) { Get-ReceiptDestinationRefusal $script:batchLog } else { '' })
                 if ($logWhy) {
                     $script:suppressionHit = $guardHit; $script:RunOutputAliased = $true; $script:batchLog = $null
