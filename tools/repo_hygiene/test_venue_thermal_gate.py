@@ -227,6 +227,29 @@ class ThermalGateModuleTests(unittest.TestCase):
         self.assertTrue(any(bad in s for s in got["skipped"]), got["skipped"])
         self.assertFalse(os.path.exists(bad))
 
+    def test_adversary_r3p1_a1_a2_history_rows_read_the_agents_heat_and_a_relative_dir_resolves_against_the_powershell_location(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-hist-rel-"))
+        row = {"name": "01-a-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "jobId": "job-1"}
+        row2 = {"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "jobId": "job-2"}
+        (d / "batches.jsonl").write_text(json.dumps({"batch": 1, "token": "t1", "legs": [row, row2]}) + "\n", encoding="utf-8")
+        (d / "agent-result-job-1.json").write_text(json.dumps({"admission": {"heat": "clear"}}), encoding="utf-8")
+        (d / "agent-result-job-2.json").write_text(json.dumps({"admission": {"heat": "hot"}}), encoding="utf-8")
+        tail = "[pscustomobject]@{ heat = @($h.rows | ForEach-Object { $_.heat }); skipped = @($h.skipped) }"
+        # r3 pass 1 A1: a row with a jobId and no heatAtProbe takes the agent's admission.heat; the reader used `(try { } catch { })` as an expression, which PowerShell runs as a COMMAND
+        got = ps_json(f"$h = Read-VenueLegHeatHistory -RunDir @('{d}'); {tail}")
+        self.assertEqual((got["heat"], got["skipped"]), (["clear", "hot"], []), got)
+        # r3 pass 1 A2: -HeatFrom '.' is relative to the POWERSHELL location; File.ReadAllLines resolved it against the process directory and reported the dir unreadable
+        got = ps_json(f"Set-Location -LiteralPath '{d}'; $h = Read-VenueLegHeatHistory -RunDir @('.'); {tail}")
+        self.assertEqual((got["heat"], got["skipped"]), (["clear", "hot"], []), got)
+        # a relative dir with a sub-path and a dir that does not exist are both resolved the same way (the second is skipped and named, never a throw)
+        got = ps_json(f"Set-Location -LiteralPath '{d.parent}'; $h = Read-VenueLegHeatHistory -RunDir @('{d.name}', 'no-such-dir'); {tail}")
+        self.assertEqual((got["heat"], len(got["skipped"])), (["clear", "hot"], 1), got)
+        # r3 pass 1 A4 (minor): a requested sleep below one second is refused at the parameter, not widened to one
+        with self.assertRaises(AssertionError) as cm:
+            ps("Get-VenueThermalProbeBudget -CapSec 1 -ElapsedSec 0 -SlowestReprobeSec 0 -WantSleepSec 0")
+        self.assertIn("WantSleepSec", str(cm.exception))
+
     def test_adversary_r3_a1_b2_one_function_decides_whether_another_probe_may_start(self) -> None:
         got = ps_json(
             "$b = { param($cap, $e, $slow, $want) $r = Get-VenueThermalProbeBudget -CapSec $cap -ElapsedSec $e -SlowestReprobeSec $slow -WantSleepSec $want; \"$($r.mayStartProbe)|$($r.fitSec)|$($r.sleepSec)\" }; "

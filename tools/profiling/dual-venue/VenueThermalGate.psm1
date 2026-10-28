@@ -103,7 +103,7 @@ function Get-VenueThermalProbeBudget {
         [Parameter(Mandatory)][ValidateRange(0, 86400)][int]$CapSec,
         [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$ElapsedSec,
         [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$SlowestReprobeSec,
-        [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$WantSleepSec
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$WantSleepSec
     )
     $fit = [long]$CapSec - [long]$ElapsedSec - [long]$SlowestReprobeSec
     $may = ($fit -ge 1)
@@ -149,6 +149,18 @@ function Get-VenueHeavyLegKeys {
     $heavy
 }
 
+function Resolve-VenueHistoryChild {
+    # r3 (pass 1 A2): -Dir\-Child as an absolute path, string-only. A relative -Dir (-HeatFrom '.') is relative to the POWERSHELL location, which File.ReadAllLines does not follow
+    # (it uses the process directory), so it is resolved here against Get-Location. No drive is touched (an unmounted one is not an error here), and a path that cannot be
+    # built (an empty entry, illegal characters) is $null, never a throw: the caller skips and names it.
+    param([AllowNull()][AllowEmptyString()][string]$Dir, [Parameter(Mandatory)][string]$Child)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Dir)) { return $null }
+        $base = (Get-Location -PSProvider FileSystem).ProviderPath
+        [IO.Path]::GetFullPath([IO.Path]::Combine($base, $Dir, $Child))
+    } catch { $null }
+}
+
 function Read-VenueLegHeatHistory {
     # The leg rows of earlier lease-batch runs, in run order, for Get-VenueHeavyLegKeys. Each -RunDir's batches.jsonl (mlv-app/venue-lease-batch/v1); a row's
     # heat is its own heatAtProbe (written by this gate), else the agent's admission.heat from agent-result-<jobId>.json beside it, else 'unknown'.
@@ -160,7 +172,7 @@ function Read-VenueLegHeatHistory {
         $d++
         # adversary r3 A3: every path is built and probed INSIDE the protected read. Join-Path resolves the drive and throws DriveNotFoundException for an unmounted one (and for an
         # empty entry), which refused the whole plan as LEG_PLAN_INVALID; [IO.Path]::Combine is string-only, and a path that cannot be built or probed is skipped and named
-        $f = try { if ([string]::IsNullOrWhiteSpace($dir)) { $null } else { [IO.Path]::Combine([string]$dir, 'batches.jsonl') } } catch { $null }
+        $f = Resolve-VenueHistoryChild -Dir $dir -Child 'batches.jsonl'
         $isFile = $(if ($null -eq $f) { $false } else { try { [bool](Test-Path -LiteralPath $f -PathType Leaf) } catch { $false } })
         if (-not $isFile) { $skipped.Add("$dir (no batches.jsonl)"); continue }
         # adversary r1 A7: a file that cannot be read (held exclusively, gone) is skipped and named, never a throw that refuses the whole plan
@@ -182,8 +194,10 @@ function Read-VenueLegHeatHistory {
                 $heat = 'unknown'
                 if ($l.PSObject.Properties['heatAtProbe'] -and [string]$l.heatAtProbe -cin @('hot', 'clear')) { $heat = [string]$l.heatAtProbe }
                 elseif ($l.PSObject.Properties['jobId'] -and $l.jobId) {
-                    $ar = try { [IO.Path]::Combine([string]$dir, "agent-result-$($l.jobId).json") } catch { $null }
-                    if ($null -ne $ar -and (try { [bool](Test-Path -LiteralPath $ar -PathType Leaf) } catch { $false })) {
+                    $ar = Resolve-VenueHistoryChild -Dir $dir -Child "agent-result-$($l.jobId).json"
+                    # r3 pass 1 A1: `(try { } catch { })` is not an expression (PowerShell ran `try` as a command): the probe is its own statement
+                    $arOk = $(if ($null -eq $ar) { $false } else { try { [bool](Test-Path -LiteralPath $ar -PathType Leaf) } catch { $false } })
+                    if ($arOk) {
                         $a = try { [IO.File]::ReadAllText($ar) | ConvertFrom-Json } catch { $null }
                         if ($null -ne $a -and $a.PSObject.Properties['admission'] -and $null -ne $a.admission -and $a.admission.PSObject.Properties['heat'] -and [string]$a.admission.heat -cin @('hot', 'clear')) { $heat = [string]$a.admission.heat }
                     }
