@@ -3081,6 +3081,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         with open(self.artifact_path(c, "packageZip"), "r+b"):
             self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", c, manifest=manifest)]), "SHARE_UNREACHABLE item=1 ")
 
+    # r8b adversary pass 2 on 29c63516, A1: the hash worker checked -ArtifactMinSec before the existence check only, so a Test-Path that used the time still opened and hashed the file
+    # with less than the minimum left. The minimum is now checked again between the existence check and the open.
+    def test_artifact_preflight_r8b_adv_a1_the_hash_worker_checks_the_minimum_again_after_the_existence_check(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        start = text.index("# a read that fails ends the read (UNREACHABLE), never \"absent\"")
+        worker = text[start:text.index("Invoke-VenueBoundedRead -ScriptText $probe.ToString()", start)]
+        exists, opened = worker.index("Test-Path -LiteralPath $i.path"), worker.index("[IO.File]::Open($i.path")
+        checks = [m.start() for m in re.finditer(r"-lt \$i\.minSec\) \{ 'NOTIME:'", worker)]
+        self.assertEqual(len(checks), 2, "the minimum is checked before the existence check and again before the open")
+        self.assertTrue(checks[0] < exists < checks[1] < opened, (checks, exists, opened))
+
     def test_artifact_preflight_the_refusal_names_the_artifact_and_a_fully_staged_build_still_opens_the_lease(self) -> None:
         c = "3" * 40
         manifest = self.stage(c, "named")
