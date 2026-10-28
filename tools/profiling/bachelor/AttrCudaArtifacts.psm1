@@ -2299,7 +2299,7 @@ function Add-AttrCudaPresentMonEventsLostDetail {
 function Add-AttrCudaPresentMonEventsLostDetailToReport {
     <#
     .SYNOPSIS
-    A PresentMon display report (a pscustomobject, or a dictionary, with a `reason`; the copy is a pscustomobject either way) whose reason carries the typed PRESENTMON_EVENTS_LOST detail; the same object when there is nothing to add.
+    A PresentMon display report (a pscustomobject, or a dictionary, with a `reason`; the copy is a pscustomobject, or an exact-key ordered dictionary for a dictionary whose keys differ only by case or are no strings) whose reason carries the typed PRESENTMON_EVENTS_LOST detail; the same object when there is nothing to add.
     .DESCRIPTION
     UM-PRESENTMON-ORPHAN-SWEEP-1: the display-report failure branch reads `$displayReport.reason` in two places, and the scanned template may not assign to a member (R5), so the
     report is replaced by a copy (properties and their order unchanged, only `reason` different) -- a plain variable assignment at the call site.
@@ -2314,6 +2314,21 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
     $detailed = Add-AttrCudaPresentMonEventsLostDetail -Reason $current -EventsLost $EventsLost
     if ($detailed -ceq $current) { return $Report }
     # r3 (sol B1, the sibling copy): a dictionary report keeps its entries; either shape comes back as the same pscustomobject
+    # r5 (sol B2 on 2c226cd8): a pscustomobject (and [ordered]) names its members case-insensitively, so a dictionary whose keys differ only by case (an Ordinal Dictionary with status and
+    # Status) or are no strings (1 and '1') cannot become one without losing an entry: it comes back as an ordered dictionary that compares its keys exactly (EqualityComparer[object]),
+    # every entry and its order kept, only `reason` set
+    if ($Report -is [System.Collections.IDictionary]) {
+        $keys = @($Report.PSBase.Keys)
+        $folded = @($keys | ForEach-Object { if ($_ -is [string]) { $_.ToLowerInvariant() } else { $null } })
+        if ($folded -contains $null -or @($folded | Select-Object -Unique).Count -ne $keys.Count) {
+            # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
+            $values = @($Report.PSBase.Values)
+            $exact = [System.Collections.Specialized.OrderedDictionary]::new()
+            for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
+            $exact['reason'] = $detailed
+            return $exact
+        }
+    }
     $copy = [ordered]@{}
     if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }
     else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }
@@ -2330,7 +2345,7 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     sweep had been skipped on every leg -- the summary named the symptom and never the sweep. The detail names what was left: skipped=<reason>, aborted=<reason>, remaining=<names>,
     deferred=<names>, listError, error, and the live PresentMon pids. A sweep that ran and left nothing (or no sweep record at all) adds nothing; a reason that already carries the token is never
     given it twice. Like Add-AttrCudaPresentMonEventsLostDetailToReport, the report is replaced by a copy (properties and their order unchanged, only `reason` different). The report is a pscustomobject or a dictionary (r3, sol B1: its entries are kept); the copy
-    is a pscustomobject either way.
+    is a pscustomobject (r5, sol B2: an exact-key ordered dictionary when the keys differ only by case or are no strings). A sweep record that cannot be read adds recordUnreadable=<message> (r5, sol B3).
     #>
     [CmdletBinding()]
     param(
@@ -2347,8 +2362,12 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     $field = @{}
     $parts = @()
     try {
+        # r5 (sol B3 on 2c226cd8): a generic Dictionary[string,object] implements IDictionary.Contains explicitly, so `$Sweep.Contains($name)` threw and the catch dropped the whole detail:
+        # a dictionary with ContainsKey (Dictionary, Hashtable, any generic IDictionary) is asked by it, another IDictionary (OrderedDictionary) by Contains, anything else by its properties
+        $hasContainsKey = ($null -ne $Sweep.PSObject.Methods['ContainsKey'])
         foreach ($name in @('skippedReason', 'abortedReason', 'remaining', 'deferred', 'newlyListed', 'listError', 'error', 'livePresentMonProcessIds')) {
-            if ($Sweep -is [System.Collections.IDictionary]) { if ($Sweep.Contains($name)) { $field[$name] = $Sweep[$name] } }
+            if ($hasContainsKey) { if ($Sweep.ContainsKey($name)) { $field[$name] = $Sweep[$name] } }
+            elseif ($Sweep -is [System.Collections.IDictionary]) { if ($Sweep.Contains($name)) { $field[$name] = $Sweep[$name] } }
             else { $property = $Sweep.PSObject.Properties[$name]; if ($null -ne $property) { $field[$name] = $property.Value } }
         }
         $skipped = [string]$field['skippedReason']
@@ -2370,14 +2389,29 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
         $livePids = @(@($field['livePresentMonProcessIds']) | Where-Object { $null -ne $_ })
         if ($livePids.Count -gt 0) { $parts += "livePids=$($livePids -join ',')" }
     } catch {
-        return $Report
+        # r5 (sol B3): a record that cannot be read is no clean sweep -- the typed detail is kept and names the read failure (it never silently returns the bare report)
+        $parts = @("recordUnreadable=$($_.Exception.Message -replace '\s+', ' ')")
     }
     $detail = "PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: $($parts -join ' ')"
+    $reason = if ([string]::IsNullOrEmpty($current)) { $detail } else { "$current [$detail]" }
     # r3 (sol B1): a dictionary report keeps its entries (PSObject.Properties of a dictionary are its own members, not its keys); either shape comes back as the same pscustomobject
+    # r5 (sol B2): a dictionary whose keys differ only by case or are no strings comes back as an exact-key ordered dictionary instead (as in Add-AttrCudaPresentMonEventsLostDetailToReport)
+    if ($Report -is [System.Collections.IDictionary]) {
+        $keys = @($Report.PSBase.Keys)
+        $folded = @($keys | ForEach-Object { if ($_ -is [string]) { $_.ToLowerInvariant() } else { $null } })
+        if ($folded -contains $null -or @($folded | Select-Object -Unique).Count -ne $keys.Count) {
+            # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
+            $values = @($Report.PSBase.Values)
+            $exact = [System.Collections.Specialized.OrderedDictionary]::new()
+            for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
+            $exact['reason'] = $reason
+            return $exact
+        }
+    }
     $copy = [ordered]@{}
     if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }
     else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }
-    $copy['reason'] = if ([string]::IsNullOrEmpty($current)) { $detail } else { "$current [$detail]" }
+    $copy['reason'] = $reason
     return [pscustomobject]$copy
 }
 

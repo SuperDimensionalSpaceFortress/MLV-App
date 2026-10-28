@@ -1533,7 +1533,9 @@ function Get-PresentMonProcessSnapshot() {
     try {
         # r4 (adversary A1 on 9ebee964): the row's image name is kept so a command line is used only for the process it was read from (a pid reused between this query and the
         # enumeration below carries another image name; its stale command line then counts as unreadable and the process is held)
-        foreach ($row in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine, Name -ErrorAction Stop)) { $commandLines[[int]$row.ProcessId] = [pscustomobject]@{ commandLine = [string]$row.CommandLine; name = [string]$row.Name } }
+        # r5 (sol B1 on 2c226cd8, folds ATTR-CUDA-PRESENTMON-SAME-NAME-PID-GENERATION-1): the name is no identity -- a capture.exe that exits and a later capture.exe at the same pid share
+        # it. Each row keeps its CreationDate as a UTC instant; the command line is used only when that instant equals the enumerated process's own StartTime (UTC), read below
+        foreach ($row in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine, Name, CreationDate -ErrorAction Stop)) { $commandLines[[int]$row.ProcessId] = [pscustomobject]@{ commandLine = [string]$row.CommandLine; name = [string]$row.Name; created = (ConvertTo-PresentMonUtcInstant $row.CreationDate) } }
     } catch {
         $commandLineError = $_.Exception.Message
     }
@@ -1546,24 +1548,33 @@ function Get-PresentMonProcessSnapshot() {
     foreach ($candidate in @(Get-Process -ErrorAction Stop)) {
         $candidateId = [int]$candidate.Id
         if ($candidateId -eq $PID) { $jobSession = Get-PresentMonProcessSessionId $candidate; continue }
+        # r5 (sol B1): a process is (pid, creation instant). StartTime opens the pid at the moment it is read, as Path does, so it is read before and after the path: an instant that is
+        # unreadable or that changed means the path may be another process's, and it is not used (an unreadable path only ever keeps a process live or held, never clears it)
+        $started = $null
+        try { $started = ConvertTo-PresentMonUtcInstant $candidate.StartTime } catch { $started = $null }
         $candidatePath = ''
         try { $candidatePath = [string]$candidate.Path } catch { $candidatePath = '' }
+        $startedAfterPath = $null
+        try { $startedAfterPath = ConvertTo-PresentMonUtcInstant $candidate.StartTime } catch { $startedAfterPath = $null }
+        if ($null -eq $started -or $started -ne $startedAfterPath) { $candidatePath = '' }
         $pathReadable = ($candidatePath -ne '')
         $candidateName = [string]$candidate.Name
         $commandLine = ''
-        if ($commandLines.ContainsKey($candidateId) -and (([string]$commandLines[$candidateId].name -replace '\.exe$', '') -ieq $candidateName)) { $commandLine = [string]$commandLines[$candidateId].commandLine }
+        # the CIM row (read BEFORE this enumeration) is this process's only when its name AND its creation instant equal the enumerated process's: one instant read at both ends means
+        # one process held the pid throughout, so the enumerated name and session are its too. Anything unreadable leaves the command line unread (held below, never "same process")
+        if ($commandLines.ContainsKey($candidateId) -and (([string]$commandLines[$candidateId].name -replace '\.exe$', '') -ieq $candidateName) -and $null -ne $started -and $null -ne $commandLines[$candidateId].created -and $commandLines[$candidateId].created -eq $started -and $started -eq $startedAfterPath) { $commandLine = [string]$commandLines[$candidateId].commandLine }
         if ($null -eq $commandLineError -and $commandLine.Trim() -eq '') { $unreadableCommandLineCount = $unreadableCommandLineCount + 1 }
         $namesSession = ($commandLine -match $sessionCommandLinePattern)
         $pinnedHash = $false
         if ($pathReadable -and $null -ne $pinnedLength) {
             try {
-                if ((Get-ChildItem -LiteralPath $candidatePath -ErrorAction Stop).Length -eq $pinnedLength) { $pinnedHash = ((Get-AttrCudaFileSha256Blocks -Path $candidatePath -Label 'presentmon-candidate-image-hash').sha256 -ieq $pinnedSha) }
+                if ((Get-ChildItem -LiteralPath $candidatePath -ErrorAction Stop).Length -eq $pinnedLength) { $pinnedHash = ((Get-AttrCudaFileSha256Blocks -Path $candidatePath -TracePath $Trace -Label 'presentmon-candidate-image-hash').sha256 -ieq $pinnedSha) }
             } catch { $pinnedHash = $false }
         }
         if (-not (($candidateName -like 'PresentMon*') -or ($candidateName -ieq $pinnedName) -or ($pathReadable -and $candidatePath -ieq $pinnedPath) -or $pinnedHash -or $namesSession)) {
             # r4: no route names it, but with no readable command line nothing says it is no capture either (a readable path is no identity: a renamed, non-pinned copy has one --
             # r4 adversary A1): held for the non-ownership evidence below
-            if ($null -eq $commandLineError -and $commandLine.Trim() -eq '') { $unreadableIdentity += [pscustomobject]@{ name = $candidateName; pid = $candidateId; pathReadable = $pathReadable; session = (Get-PresentMonProcessSessionId $candidate) } }
+            if ($null -eq $commandLineError -and $commandLine.Trim() -eq '') { $unreadableIdentity += [pscustomobject]@{ name = $candidateName; pid = $candidateId; pathReadable = $pathReadable; session = (Get-PresentMonProcessSessionId $candidate); started = $started } }
             continue
         }
         $reason = $null
@@ -1580,7 +1591,7 @@ function Get-PresentMonProcessSnapshot() {
                 if (-not $pathReadable) { $reason = 'unreadable_path_not_a_registered_service' }
                 elseif ($candidateName -imatch $captureImagePattern) { $reason = 'capture_image_name' }
                 else { $reason = 'readable_path_not_a_registered_service' }
-                $parent = Get-PresentMonParentIdentity -ProcessId $candidateId -Name $candidateName
+                $parent = Get-PresentMonParentIdentity -ProcessId $candidateId -Name $candidateName -Started $started
             }
         }
         if ($null -ne $reason) {
@@ -1601,12 +1612,25 @@ function Get-PresentMonProcessSnapshot() {
     }
     foreach ($held in $unreadableIdentity) {
         if ($servicePids.ContainsKey([int]$held.pid)) { $serviceCount = $serviceCount + 1; continue }
-        $unidentified += [ordered]@{ name = $held.name; pid = $held.pid; pathReadable = $held.pathReadable; sessionId = $held.session.sessionId; sessionError = $held.session.error }
+        $unidentified += [ordered]@{ name = $held.name; pid = $held.pid; pathReadable = $held.pathReadable; sessionId = $held.session.sessionId; sessionError = $held.session.error; startedUtc = $held.started }
     }
     $nonOwnership = [ordered]@{ jobSessionId = $jobSession.sessionId; jobSessionError = $jobSession.error; heldCount = $unreadableIdentity.Count; registeredServiceCount = $serviceCount }
     return [pscustomobject]@{ live = @($live); liveDetail = @($liveDetail); excluded = @($excluded); commandLineError = $commandLineError; unreadableCommandLineCount = $unreadableCommandLineCount; unidentified = @($unidentified); unidentifiedNonOwnership = $nonOwnership }
 }
 
+function ConvertTo-PresentMonUtcInstant($Stamp) {
+    # r5 (sol B1): a creation stamp (Win32_Process.CreationDate, Process.StartTime) as the text of its UTC instant truncated to the microsecond CIM carries
+    # (yyyy-MM-ddTHH:mm:ss.ffffffZ), so the two reads of one process compare equal; $null when it is missing or no date. A DateTimeOffset gives its UtcDateTime, a DateTime its ToUniversalTime()
+    if ($null -eq $Stamp) { return $null }
+    $utc = $null
+    try {
+        if ($Stamp -is [DateTimeOffset]) { $utc = $Stamp.UtcDateTime }
+        elseif ($Stamp -is [datetime]) { $utc = $Stamp.ToUniversalTime() }
+    } catch { $utc = $null }
+    if ($null -eq $utc) { return $null }
+    # the round-trip text (culture-invariant) cut to its six fractional digits: one string per instant, compared with -eq
+    return ($utc.ToString('o').Substring(0, 26) + 'Z')
+}
 function Get-PresentMonProcessSessionId($Process) {
     # r4: the typed session probe, recorded for the diagnosis only (never evidence) -- Process.SessionId comes from the system's process list (no handle on the process is opened, so it
     # reads for a process whose path does not). A null process, a missing or null value, a getter that throws (PowerShell reads it as null), or a value that is no integer is an error.
@@ -1622,7 +1646,7 @@ function Get-PresentMonProcessSessionId($Process) {
     return [pscustomobject]$probe
 }
 
-function Get-PresentMonParentIdentity([int]$ProcessId, [string]$Name) {
+function Get-PresentMonParentIdentity([int]$ProcessId, [string]$Name, $Started = $null) {
     # BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 r2: the ONE positive identity that lets a live, unregistered PresentMon* out of the harness_sessions blockers -- the Bachelor shape, image name exactly
     # PresentMonService AND its parent (Win32_Process ParentProcessId, then that process's Name) exactly IntelGraphicsSoftware.Service.exe. Any other name reads no parent and has no identity. The
     # parent must have started no later than the child (CreationDate), so a parent pid reused after the real parent exited is no evidence. Every read that fails, throws, finds no single row or no
@@ -1632,6 +1656,11 @@ function Get-PresentMonParentIdentity([int]$ProcessId, [string]$Name) {
     try {
         $self = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop | Where-Object { [int]$_.ProcessId -eq $ProcessId })
         if ($self.Count -ne 1) { $result['identityError'] = "process_row_count=$($self.Count)"; return $result }
+        # r5 (sol B1): this row is read after the enumeration; it is the enumerated process's only when its name and its creation instant equal that process's (Name, StartTime as UTC):
+        # a pid reused in between (the Intel service restarted, or another process under the name) carries another instant. An unreadable StartTime is no identity (fail closed)
+        if (([string]$self[0].Name -replace '\.exe$', '') -ine $Name) { $result['identityError'] = 'process_row_name_changed'; return $result }
+        $selfCreated = ConvertTo-PresentMonUtcInstant $self[0].CreationDate
+        if ($null -ne $self[0].CreationDate -and ($null -eq $Started -or $null -eq $selfCreated -or $selfCreated -ne $Started)) { $result['identityError'] = 'process_creation_instant_unbound'; return $result }
         $parentId = [int]$self[0].ParentProcessId
         $result['parentPid'] = $parentId
         $parentRows = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $parentId" -ErrorAction Stop | Where-Object { [int]$_.ProcessId -eq $parentId })

@@ -386,6 +386,36 @@ class ModuleFunctionTests(unittest.TestCase):
                         "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ same = [object]::ReferenceEquals($r, $report) }) -Compress))")
         self.assertTrue(got["same"])
 
+    # --- r5 (sol B2 on 2c226cd8, case-distinct-report-keys): an accepted Ordinal dictionary with status='S' and Status='OTHER' was copied into a case-insensitive table: one key was lost
+    # and the output's status read OTHER. Every entry is kept now (an exact-key ordered dictionary), the status unchanged, only `reason` set -- in BOTH sibling helpers.
+    def test_r5_b2_case_distinct_report_keys_are_kept_by_both_helpers(self) -> None:
+        for helper in self.HELPERS:
+            got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                            "$report.Add('status', 'S'); $report.Add('Status', 'OTHER'); $report.Add('reason', 'r'); $report.Add('chains', @(1, 2))\n"
+                            f"$r = {self.HELPERS[helper]}\n"
+                            "$isDictionary = $r -is [System.Collections.IDictionary]\n"
+                            "$names = if ($isDictionary) { @($r.PSBase.Keys) } else { @($r.PSObject.Properties.Name) }\n"
+                            "$status = if ($isDictionary) { $r['status'] } else { $r.status }\n"
+                            "$upper = if ($isDictionary) { $r['Status'] } else { $null }\n"
+                            "$reason = if ($isDictionary) { $r['reason'] } else { $r.reason }\n"
+                            "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ names = @($names); status = $status; upper = $upper; reason = $reason; original = $report['reason'] }) -Compress))")
+            self.assertEqual(got["names"], ["status", "Status", "reason", "chains"], helper)
+            self.assertEqual((got["status"], got["upper"], got["original"]), ("S", "OTHER", "r"), helper)
+            self.assertTrue(got["reason"].startswith("r ["), (helper, got["reason"]))
+
+    # --- r5 (sol B3 on 2c226cd8, generic-sweep-record): IDictionary.Contains(string) on a Dictionary[string,object] threw, and the silent catch returned the bare report: the typed
+    # PRESENTMON_ORPHAN_SWEEP_INCOMPLETE detail was lost. A generic record is read now; a record that cannot be read at all is named in the detail, never dropped.
+    def test_r5_b3_a_generic_dictionary_sweep_record_keeps_the_detail(self) -> None:
+        got = self.sweep_detail("[System.Collections.Generic.Dictionary[string,object]]::new(); $s.Add('skippedReason', 'capture_owner_unidentified')")
+        self.assertEqual(got["reason"], "PresentMon output does not exist: X [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=capture_owner_unidentified]")
+
+    def test_r5_b3_a_sweep_record_that_cannot_be_read_keeps_a_typed_detail(self) -> None:
+        # a dictionary whose lookup throws (a ScriptProperty that throws reads as $null in PowerShell, so it cannot model this)
+        got = self.sweep_detail("$(Add-Type -TypeDefinition 'public class MlvThrowingRecord : System.Collections.Hashtable { public override bool ContainsKey(object key) "
+                                "{ throw new System.UnauthorizedAccessException(\"record-read-denied\"); } }'; [MlvThrowingRecord]::new())")
+        self.assertTrue(got["reason"].startswith("PresentMon output does not exist: X [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: recordUnreadable="), got["reason"])
+        self.assertIn("record-read-denied", got["reason"])
+
     def test_mutation_the_property_only_copy_loses_a_dictionary_reports_fields_again(self) -> None:
         module = MODULE.read_text(encoding="utf-8")
         branch = ("    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }\n"
@@ -485,7 +515,12 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
                   go_live_as: tuple[int, str, str | None] | None = None, command_lines: tuple[tuple[int | str, str], ...] = (), command_line_query_fails_from: int = 0,
                   go_live_command_line: str | None = None, pm_name: str = STUB_EXE, presentmon_sha: str | None = None,
                   pinned_copies: tuple[Path, ...] = (), session_ids: dict[int, int | str | None] | None = None,
-                  job_session: int | str | None = None, command_line_names: dict[int, str] | None = None) -> tuple[int, dict, Path, str]:
+                  job_session: int | str | None = None, command_line_names: dict[int, str] | None = None, start_times: dict | None = None,
+                  cim_created: dict | None = None, go_live_from_snapshot: int = 0) -> tuple[int, dict, Path, str]:
+        # r5 (sol B1 on 2c226cd8): a process is (pid, creation instant). Every Get-Process row has a StartTime and every Win32_Process row a CreationDate; by default both are the same
+        # instant (the pid's `processes` creation stamp, else 2026-10-27T00:00 + pid seconds), so a row read before the enumeration is that process's. `start_times` overrides a pid's
+        # StartTime (None: unreadable) and `cim_created` its command-line row's CreationDate (a reused pid: another, earlier process); stamps are written as for `processes`.
+        # `go_live_from_snapshot`=N makes the go-live process (and its command-line row) appear from the Nth Get-Process / command-line query on (1 the scope choice, 2 the post-listing check)
         # r4: `session_ids` gives a process row (others / go_live_as, by pid) its SessionId: an int, None (a null value) or SESSION_THROWS (the getter throws); a pid not in it has none at all.
         # `job_session` adds the sweeping job's own row ($PID) to Get-Process with that SessionId (None: no row, as before -- the job's session is then unknown)
         # r2: `processes` are the Win32_Process rows (id, name, parent id, creation minute or None for an unreadable CreationDate) the parent read sees; `go_live_as` is the process that appears
@@ -558,19 +593,42 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
                 return ""
             return f"; SessionId = {('$null' if sessions[i] is None else sessions[i])}"
 
+        created_by_pid = {i: m for i, _n, _pp, m in processes if m is not None}
+
+        def stamp(v) -> str:
+            # a creation stamp as PowerShell: None ($null), ("sec", n) (base + n seconds), an int (base + n minutes, local), "local:<iso>" (that instant as a local DateTime), an ISO string
+            if v is None:
+                return "$null"
+            if isinstance(v, tuple):
+                return f"(Get-Date '2026-10-27T00:00:00').AddSeconds({v[1]})"
+            if isinstance(v, str) and v.startswith("local:"):
+                return f"[DateTimeOffset]::Parse('{v[6:]}').LocalDateTime"
+            if isinstance(v, str):
+                return f"[DateTimeOffset]::Parse('{v}')"
+            return f"(Get-Date '2026-10-27T00:00:00').AddMinutes({v})"
+
+        def default_created(i: int | str):
+            return created_by_pid.get(i, ("sec", i if isinstance(i, int) else 0))
+
+        def start_expr(i: int | str) -> str:
+            return stamp((start_times or {})[i]) if i in (start_times or {}) else stamp(default_created(i))
+
+        def cim_created_expr(i: int | str) -> str:
+            return stamp((cim_created or {})[i]) if i in (cim_created or {}) else stamp(default_created(i))
+
         def process_row(i: int, n: str, pth: str | None) -> str:
             nonlocal denied_type
             throws = sessions.get(i) == SESSION_THROWS
             if pth == UNREADABLE or throws:
                 # a .NET property that throws, like Process.Path on a process the caller may not open (PowerShell reads a throwing getter as $null -- measured on pwsh 7.6 -- which is also what a real unreadable Path yields)
                 # r4: MlvDeniedSessionProcess's SessionId getter throws too (the session probe's failure case); MlvDeniedProcess's SessionId is a plain value (null when not given)
-                denied_type = ("Add-Type -TypeDefinition 'public class MlvDeniedProcess { public int Id; public string Name; public object SessionId; "
+                denied_type = ("Add-Type -TypeDefinition 'public class MlvDeniedProcess { public int Id; public string Name; public object SessionId; public object StartTime; "
                                "public string Path { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } } "
-                               "public class MlvDeniedSessionProcess { public int Id; public string Name; "
+                               "public class MlvDeniedSessionProcess { public int Id; public string Name; public object StartTime; "
                                "public string Path { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } "
                                "public object SessionId { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } }'\n")
-                return f"[{'MlvDeniedSessionProcess' if throws else 'MlvDeniedProcess'}]@{{ Id = {i}; Name = '{n}'{session_member(i)} }}"
-            return f"[pscustomobject]@{{ Id = {i}; Name = '{n}'; Path = {('$null' if pth is None else ps_quote(pth))}{session_member(i)} }}"
+                return f"[{'MlvDeniedSessionProcess' if throws else 'MlvDeniedProcess'}]@{{ Id = {i}; Name = '{n}'; StartTime = {start_expr(i)}{session_member(i)} }}"
+            return f"[pscustomobject]@{{ Id = {i}; Name = '{n}'; Path = {('$null' if pth is None else ps_quote(pth))}; StartTime = {start_expr(i)}{session_member(i)} }}"
 
         for i, n, pth in others:
             extra += f"    $all += {process_row(i, n, pth)}\n"
@@ -584,7 +642,10 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             return (command_line_names or {}).get(i, names_by_pid.get(i, "") + ".exe")
 
         go_live_row = (process_row(*go_live_as) if go_live_as is not None
-                       else "[pscustomobject]@{ Id = 5151; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }")
+                       else f"[pscustomobject]@{{ Id = 5151; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null; StartTime = {start_expr(5151)} }}")
+        go_live_pid = (go_live_as or (5151,))[0]
+        go_live_when = (f"((Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') -or ({go_live_from_snapshot} -gt 0 -and $global:getProcessCalls -ge {go_live_from_snapshot}))")
+        go_live_cim_when = (f"((Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') -or ({go_live_from_snapshot} -gt 0 -and $global:commandLineQueries -ge {go_live_from_snapshot}))")
         service_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}' }}" for i, n in services)
         # a creation stamp is a minute offset (a local DateTime), None (unreadable), or an ISO string with an offset (a DateTimeOffset: the instant is fixed whatever the host's zone)
         process_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}'; ParentProcessId = {pp}; CreationMinute = {('$null' if m is None else (ps_quote(m) if isinstance(m, str) else m))} }}" for i, n, pp, m in processes)
@@ -594,6 +655,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             f"Import-Module '{ps(MODULE)}' -Force\n"
             "function Test-AttrCudaPresentMonTraceReady($Proc) { [pscustomobject]@{ ready = $true; detail = 'stub' } }\n"
             f"$traceFile = '{ps(d / 'trace.log')}'\n"
+            # r5 (BACHELOR-CUDA-CANDIDATE-HASH-TRACE-1): the job's own trace file, which the module's traced readers (Get-AttrCudaFileSha256Blocks -TracePath $Trace) write to
+            f"$Trace = '{ps(d / 'job-trace.txt')}'\n"
             "function Write-JobTrace([string]$Message) { Add-Content -LiteralPath $traceFile -Value $Message }\n"
             + denied_type +
             "function Get-Process {\n"
@@ -601,10 +664,10 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "    $global:getProcessCalls = 1 + [int]$global:getProcessCalls\n"
             + ("    throw 'stub Get-Process failure'\n" if get_process_throws else
                "    $all = @()\n"
-               f"    if (Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') {{ $all += {go_live_row} }}\n"
+               f"    if {go_live_when} {{ $all += {go_live_row} }}\n"
                + extra
                + ("    if ($global:getProcessCalls -ge 2) {\n" if live_from_second_check else "    if ($true) {\n")
-               + f"        foreach ($p in @({pids})) {{ $all += [pscustomobject]@{{ Id = [int]$p; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }} }}\n"
+               + f"        foreach ($p in @({pids})) {{ $all += [pscustomobject]@{{ Id = [int]$p; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null; StartTime = (Get-Date '2026-10-27T00:00:00').AddSeconds([int]$p) }} }}\n"
                "    }\n"
                # the real cmdlet honours -Name (a wildcard on the image name): a process whose name does not match is never returned
                "    $all | Where-Object { $p = $_; (-not $Name) -or (@($Name | Where-Object { $p.Name -like $_ }).Count -gt 0) }\n")
@@ -618,8 +681,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "        $global:commandLineQueries = 1 + [int]$global:commandLineQueries\n"
             f"        if ({command_line_query_fails_from} -gt 0 -and $global:commandLineQueries -ge {command_line_query_fails_from}) {{ Write-Error 'stub Win32_Process command-line query failure'; return }}\n"
             # r4: each row carries its image name (<name>.exe, from the process table above; command_line_names overrides it -- a reused pid's stale row)
-            + "".join(f"        [pscustomobject]@{{ ProcessId = {i}; CommandLine = {ps_quote(c)}; Name = {ps_quote(cim_name(i))} }}\n" for i, c in command_lines)
-            + (f"        if (Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') {{ [pscustomobject]@{{ ProcessId = {(go_live_as or (5151,))[0]}; CommandLine = {ps_quote(go_live_command_line)}; Name = {ps_quote((go_live_as[1] if go_live_as else '') + '.exe')} }} }}\n" if go_live_command_line else "")
+            + "".join(f"        [pscustomobject]@{{ ProcessId = {i}; CommandLine = {ps_quote(c)}; Name = {ps_quote(cim_name(i))}; CreationDate = {cim_created_expr(i)} }}\n" for i, c in command_lines)
+            + (f"        if {go_live_cim_when} {{ [pscustomobject]@{{ ProcessId = {go_live_pid}; CommandLine = {ps_quote(go_live_command_line)}; Name = {ps_quote((go_live_as[1] if go_live_as else '') + '.exe')}; CreationDate = {cim_created_expr(go_live_pid)} }} }}\n" if go_live_command_line else "")
             + "        return\n"
             "    }\n"
             + ("    if ($ClassName -eq 'Win32_Service') { Write-Error 'stub Get-CimInstance failure'; return }\n" if service_lookup_fails else "")
@@ -1135,11 +1198,99 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assert_refused_unidentified(sweep, d)
 
     def test_mutation_a_command_line_used_for_any_process_under_its_pid_sweeps_the_reused_pid_again(self) -> None:
-        mutated = mutate(TEMPLATE, "if ($commandLines.ContainsKey($candidateId) -and (([string]$commandLines[$candidateId].name -replace '\\.exe$', '') -ieq $candidateName)) {",
+        mutated = mutate(TEMPLATE, "if ($commandLines.ContainsKey($candidateId) -and (([string]$commandLines[$candidateId].name -replace '\\.exe$', '') -ieq $candidateName) -and $null -ne $started -and $null -ne $commandLines[$candidateId].created -and $commandLines[$candidateId].created -eq $started -and $started -eq $startedAfterPath) {",
                          "if ($commandLines.ContainsKey($candidateId)) {")
         _code, sweep, d, _out = self.run_start("mut-r4-a1b", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6200, "capture", "C:\\other-harness\\cache\\capture.exe")),
                                                processes=self.INTEL_TREE, command_lines=((6200, "C:\\Windows\\explorer.exe /factory"),), command_line_names={6200: "explorer.exe"}, text=mutated)
         self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)))
+
+    # --- r5 (sol B1 on 2c226cd8; folds ATTR-CUDA-PRESENTMON-SAME-NAME-PID-GENERATION-1): the command-line query read capture.exe's row for pid 6200 (created 00:01Z); that capture exited
+    # and a LATER capture.exe took pid 6200 (StartTime 00:20Z) owning MLVAttr3-other-harness-live. The name matched, so the stale `capture.exe --help` (no session named) counted as the new
+    # process's: no candidate, no hold, and the sweep terminated (or logman-stopped) the other harness's live session. Identity is (pid, creation instant) now.
+    REUSED = (6200, "capture", UNREADABLE)
+    REUSED_CMD = "capture.exe --help"
+    REUSED_STAMPS = {"start_times": {6200: "2026-10-28T00:20:00Z"}, "cim_created": {6200: "2026-10-28T00:01:00Z"}}
+
+    def test_r5_b1_scope_choice_a_same_name_reused_pid_is_no_identity(self) -> None:
+        code, sweep, d, out = self.run_start("r5-b1-scope", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.REUSED), processes=self.INTEL_TREE,
+                                             command_lines=((6200, self.REUSED_CMD),), job_session=1, session_ids={6200: 1}, **self.REUSED_STAMPS)
+        self.assertEqual(code, 0, out)
+        self.assert_refused_unidentified(sweep, d, "scope choice")
+        self.assertEqual(sweep["unidentifiedCaptureOwners"][0]["startedUtc"], "2026-10-28T00:20:00.000000Z", "the instant read with the process is recorded")
+
+    def test_r5_b1_post_listing_a_same_name_reused_pid_is_no_identity(self) -> None:
+        code, sweep, d, out = self.run_start("r5-b1-post-listing", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                             go_live_as=self.REUSED, go_live_command_line=self.REUSED_CMD, go_live_from_snapshot=2, job_session=1, session_ids={6200: 1},
+                                             **self.REUSED_STAMPS)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "capture_owner_unidentified", sweep)
+        self.assertEqual(sweep["unidentifiedCaptureOwnerIds"], [6200])
+        self.assert_nothing_destructive(d)
+
+    def test_r5_b1_pre_terminate_a_same_name_reused_pid_is_no_identity(self) -> None:
+        # sol's repro verbatim: beside the identified Intel child, HEAD 2c226cd8 issued terminate:MLVAttr3-other-harness-live
+        code, sweep, d, out = self.run_start("r5-b1-pre-terminate", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                             go_live_as=self.REUSED, go_live_command_line=self.REUSED_CMD, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                             job_session=1, session_ids={6200: 1}, **self.REUSED_STAMPS)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"], "the other harness's live session is never terminated")
+        self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-other-harness-live:presentmon_terminate")
+        self.assertEqual(sweep["unidentifiedCaptureOwnerIds"], [6200])
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "")
+
+    def test_r5_b1_pre_logman_stop_a_same_name_reused_pid_is_no_identity(self) -> None:
+        # sol's fallback replay: HEAD 2c226cd8 also issued stop:MLVAttr3-other-harness-live
+        code, sweep, d, out = self.run_start("r5-b1-pre-stop", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), helper_works=False,
+                                             live_after_terminate_of="MLVAttr3-other-harness-live", go_live_as=self.REUSED, go_live_command_line=self.REUSED_CMD,
+                                             others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, job_session=1, session_ids={6200: 1}, **self.REUSED_STAMPS)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "logman stop is never issued under the reused pid's live capture")
+        self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-killed-a:logman_stop")
+
+    def test_r5_b1_an_unreadable_start_time_is_no_identity(self) -> None:
+        # the command line's row is right, but the enumerated process's creation instant cannot be read: nothing binds the row to it
+        code, sweep, d, out = self.run_start("r5-b1-start-unreadable", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.REUSED), processes=self.INTEL_TREE,
+                                             command_lines=((6200, self.REUSED_CMD),), job_session=1, session_ids={6200: 1}, start_times={6200: None})
+        self.assertEqual(code, 0, out)
+        self.assert_refused_unidentified(sweep, d, "start time unreadable")
+
+    def test_r5_b1_an_intel_child_whose_row_was_created_at_another_instant_is_no_identity(self) -> None:
+        # the parent read's own row for pid 7001 is read after the enumeration: a PresentMonService created at another instant (the service restarted under the same pid, or another
+        # process under the name) is not the enumerated one, so it earns no Intel identity and stays a blocker
+        code, sweep, d, out = self.run_start("r5-b1-intel-rebound", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, start_times={7001: 30})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive", sweep)
+        self.assertEqual({r["pid"]: r["identityError"] for r in sweep["livePresentMonProcesses"]}[7001], "process_creation_instant_unbound")
+        self.assert_nothing_destructive(d)
+
+    def test_r5_control_a_same_name_process_with_the_same_creation_instant_keeps_its_command_line(self) -> None:
+        # the healthy control: the same capture.exe read twice (one creation instant) -- its command line names no session, so it is no candidate and the sweep runs
+        code, sweep, d, out = self.run_start("r5-c-same-instant", others=(self.SERVICE_UNREADABLE, self.REUSED), processes=self.INTEL_TREE,
+                                             command_lines=((6200, self.REUSED_CMD),), job_session=1, session_ids={6200: 1})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(sweep["unidentifiedCaptureOwners"], [])
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
+    def test_mutation_a_command_line_bound_by_name_alone_terminates_the_reused_pid_again(self) -> None:
+        mutated = mutate(TEMPLATE, " -and $null -ne $started -and $null -ne $commandLines[$candidateId].created -and $commandLines[$candidateId].created -eq $started -and $started -eq $startedAfterPath) {",
+                         ") {")
+        _code, sweep, d, _out = self.run_start("mut-r5-b1", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                               go_live_as=self.REUSED, go_live_command_line=self.REUSED_CMD, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                               job_session=1, session_ids={6200: 1}, text=mutated, **self.REUSED_STAMPS)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)), "sol B1 on 2c226cd8")
+
+    def test_r5_candidate_hash_trace_the_pinned_image_hash_is_traced(self) -> None:
+        # BACHELOR-CUDA-CANDIDATE-HASH-TRACE-1 (ledger 15:50:50Z, CoS ACK 6473698354): the candidate-image hash passes -TracePath $Trace like every other hash in the job
+        image = self.stmp / "r5-hash-trace-other-harness" / "capture.exe"
+        code, sweep, d, out = self.run_start("r5-hash-trace", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6100, "capture", str(image))), processes=self.INTEL_TREE,
+                                             presentmon_sha="PINNED", pinned_copies=(image,))
+        self.assertEqual(code, 0, out)
+        self.assertEqual({r["pid"]: r["reason"] for r in sweep["livePresentMonProcesses"]}[6100], "pinned_image_sha256")
+        trace = (d / "job-trace.txt").read_text(encoding="utf-8") if (d / "job-trace.txt").exists() else ""
+        self.assertIn("presentmon-candidate-image-hash start bytes=", trace)
 
     # controls: GREEN on a79a5a89 and after (they read only fields both heads record)
     def test_r4_control_an_unreadable_registered_service_beside_the_intel_service_does_not_block(self) -> None:
@@ -1360,7 +1511,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         # r3: every process is enumerated (no -Name filter), and the command lines are read with -ErrorAction Stop too
         self.assertIn("foreach ($candidate in @(Get-Process -ErrorAction Stop)) {", snapshot)
         # r4: the row's image name is read too (a command line counts only for the process it was read from), and the service list is one throwing query
-        self.assertIn("Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine, Name -ErrorAction Stop", snapshot)
+        # r5: and its CreationDate (a command line counts only for the process with that creation instant)
+        self.assertIn("Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine, Name, CreationDate -ErrorAction Stop", snapshot)
         self.assertIn("Get-CimInstance -ClassName Win32_Service -Property ProcessId, Name -ErrorAction Stop", snapshot)
         self.assertNotIn("SilentlyContinue", snapshot, "an unreadable list must never read as 'no capture alive'")
 

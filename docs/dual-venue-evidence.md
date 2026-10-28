@@ -308,8 +308,14 @@ registered service's pid (one `Win32_Service` query per snapshot). The session i
 before a terminate or a `logman stop`. `orphanSweep.unidentifiedCaptureOwnerIds` names the pids, `unidentifiedCaptureOwners` gives name, pid and session, and
 `unidentifiedNonOwnership` holds the job's session, how many processes were held and how many a service registration cleared. Scope `all` is unchanged. A non-elevated agent cannot
 read the command line of system processes (csrss, winlogon, dwm, fontdrvhost and most of session 0), and most are no registered service, so beside the Intel child the sweep now
-refuses on such a host. The r4 run summary has the measurement. A display-report
-failure whose sweep did not leave the host clean (skipped, aborted, `remaining`, `deferred`, a listing or sweep error) gains a typed `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE` detail.
+refuses on such a host. The r4 run summary has the measurement.
+r5: a process is its pid AND its creation instant, never its pid and name. A `capture.exe` that exits and a later `capture.exe` under the same pid share both, so a command line counts
+for an enumerated process only when the row's `CreationDate` equals that process's own `StartTime` (both as UTC, to the microsecond). One instant read before and after the enumeration
+means one process held the pid throughout. An unreadable or different instant leaves the command line unread, so the process is held as above. The path is read between two
+`StartTime` reads and is dropped when they differ. The Intel child's own `Win32_Process` row must carry that process's name and instant too (`identityError =
+process_creation_instant_unbound`). `unidentifiedCaptureOwners` records `startedUtc`. A display-report
+failure whose sweep did not leave the host clean (skipped, aborted, `remaining`, `deferred`, `newlyListed`, a listing or sweep error) gains a typed `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE`
+detail, and a sweep record that cannot be read names `recordUnreadable=` there instead of being dropped. A dictionary report whose keys differ only by case keeps every entry.
 
 The sweep can never stop a live capture or a session it did not list as an orphan (round 2): it acts only on the names listed before its second liveness check -- a name a
 later listing shows (another job's capture starting meanwhile) is recorded as `newlyListed` and left alone -- and it re-checks that no PresentMon process exists immediately
