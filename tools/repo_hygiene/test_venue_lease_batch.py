@@ -3092,6 +3092,108 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(len(checks), 2, "the minimum is checked before the existence check and again before the open")
         self.assertTrue(checks[0] < exists < checks[1] < opened, (checks, exists, opened))
 
+    # r9 B1 (sol r8b = opus = fable H2 = Dot): `[ValidateRange(1, 600)]` on a `[double]` has Int32 endpoints, so PowerShell validates a ROUNDED INTEGER copy of the value: 0.6 and 600.5
+    # bound while the original value went on to the helper (a 0.6 s bound under the 1 s the contract names, a 600.5 s one over the 600 s cap). Double endpoints validate the value as given.
+    # Sites: Get-VenueStagedBuildManifest -TimeoutSec / -ArtifactMinSec and Invoke-VenueBoundedRead -TimeoutSec. Fractional budgets in range (2.8) must still bind.
+    def _binding_outcomes(self, calls: dict[str, str]) -> dict[str, str]:
+        lines = ["Import-Module '" + str(MODULE) + "' -Force -DisableNameChecking", "$out = [ordered]@{}"]
+        for key, call in calls.items():
+            lines.append("try { $null = " + call + "; $out['" + key + "'] = 'BOUND' } catch { $out['" + key + "'] = if ($_.FullyQualifiedErrorId -like 'ParameterArgumentValidationError*') { 'REFUSED' } else { 'OTHER:' + $_.FullyQualifiedErrorId } }")
+        lines += ["ConvertTo-Json -Compress -InputObject $out", "Complete-VenueProcess -ExitCode 0"]
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "\n".join(lines)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return json.loads(out.stdout.strip().splitlines()[-1])
+
+    def test_artifact_preflight_r9_b1_a_fractional_timeout_outside_the_range_is_refused_at_binding_not_rounded_into_it(self) -> None:
+        manifest = "Get-VenueStagedBuildManifest -AgentShare '" + str(self.share) + "' -SourceCommit ('a' * 40) -ProbeScript { param($p) '' } "
+        bounded = "& (Get-Module VenueChain) { Invoke-VenueBoundedRead -ScriptText '1' -Argument 0 "
+        got = self._binding_outcomes({
+            "manifest_timeout_0.6": manifest + "-TimeoutSec 0.6",
+            "manifest_timeout_600.5": manifest + "-TimeoutSec 600.5",
+            "manifest_minsec_0.6": manifest + "-ArtifactMinSec 0.6",
+            "manifest_minsec_600.5": manifest + "-ArtifactMinSec 600.5",
+            "bounded_timeout_0.6": bounded + "-TimeoutSec 0.6 }",
+            "bounded_timeout_600.5": bounded + "-TimeoutSec 600.5 }",
+            # controls: the range's own ends and a fractional budget inside it still bind
+            "manifest_timeout_1": manifest + "-TimeoutSec 1",
+            "manifest_timeout_2.8": manifest + "-TimeoutSec 2.8",
+            "manifest_timeout_600": manifest + "-TimeoutSec 600",
+            "manifest_minsec_1": manifest + "-ArtifactMinSec 1",
+            "manifest_minsec_2.8": manifest + "-ArtifactMinSec 2.8",
+            "bounded_timeout_1": bounded + "-TimeoutSec 1 }",
+            "bounded_timeout_2.8": bounded + "-TimeoutSec 2.8 }",
+            "bounded_timeout_600": bounded + "-TimeoutSec 600 }",
+        })
+        refused = {k: v for k, v in got.items() if k.rsplit("_", 1)[1] in ("0.6", "600.5")}
+        bound = {k: v for k, v in got.items() if k not in refused}
+        self.assertEqual(set(refused.values()), {"REFUSED"}, got)
+        self.assertEqual(set(bound.values()), {"BOUND"}, got)
+
+    def test_artifact_preflight_r9_b1_no_double_parameter_of_the_dual_venue_scripts_has_integer_range_endpoints(self) -> None:
+        # the class, not the three sites: any `[ValidateRange(<int>, <int>)][double]` in the dual-venue scripts validates a rounded copy
+        bad = []
+        for path in sorted(DV.glob("*.ps*1")):
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                for m in re.finditer(r"\[ValidateRange\(([^)]*)\)\]\s*\[(?:double|single|float|decimal)\]", line):
+                    if any(re.fullmatch(r"-?\d+", e.strip()) for e in m.group(1).split(",")):
+                        bad.append(f"{path.name}:{n}: {m.group(0)}")
+        self.assertEqual(bad, [], "a [double] parameter's ValidateRange endpoints must be doubles (1.0, 600.0)")
+
+    # r9 hardening (sol r7 + sol r8b + fable H3 + Dot P3): the per-file minimum re-check was pinned by source position only, so a label-gated mutation (the NOTIME check restricted to
+    # packageZip) passed the pin. Behavioural: the production worker scriptblock (lifted from the module's AST) runs on three files with a fake clock (no real sleeps) and a Test-Path
+    # shadow that spends fake time, window 4 s / minimum 2 s. Every file has the minimum checked before its existence check AND again after it, for EACH label; the wrong digest makes
+    # a file that was opened and hashed visible as a MISMATCH line, so "no open" is an observable absence. The shadow also records which files had an existence read STARTED: the check
+    # before it is what keeps a file from even being looked at with the window spent (a UNC Test-Path can itself block), and an absent file shows it as NOTIME, never MISSING.
+    def _artifact_worker_run(self, case: str, end_sec: float = 4.0, start_now: float = 0.0, delay_label: str = "", consume_label: str = "", absent_label: str = "") -> tuple[list[str], list[str]]:
+        d = self.case / ("worker-files-" + case)
+        d.mkdir(exist_ok=True)
+        for label in ("packageZip", "exe", "dll"):
+            if label != absent_label:
+                (d / f"{label}.bin").write_bytes(f"{label} bytes".encode("utf-8"))
+        script = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "$ast = [System.Management.Automation.Language.Parser]::ParseFile('" + str(MODULE) + "', [ref]$null, [ref]$null)\n"
+            "$w = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.ScriptBlockExpressionAst] -and $x.Extent.Text -match '^\\{\\s*param\\(\\$items\\)' }, $true).ScriptBlock.GetScriptBlock()\n"
+            "$global:clk = [pscustomobject]@{ now = " + repr(start_now) + " }\n"
+            "$clock = [pscustomobject]@{}\n"
+            "Add-Member -InputObject $clock -MemberType ScriptProperty -Name Elapsed -Value { [pscustomobject]@{ TotalSeconds = $global:clk.now } }\n"
+            "$global:delayPath = '" + (str(d / f"{delay_label}.bin") if delay_label else "") + "'\n"
+            "$global:tp = [System.Collections.Generic.List[string]]::new()\n"
+            "function Test-Path { param([string]$LiteralPath, [string]$PathType) $global:tp.Add((Split-Path -Leaf $LiteralPath)); if ($global:delayPath -and $LiteralPath -ceq $global:delayPath) { $global:clk.now += 3 }; Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath -PathType $PathType }\n"
+            "$items = foreach ($label in 'packageZip', 'exe', 'dll') {\n"
+            "    $it = [pscustomobject]@{ label = $label; name = \"$label.bin\"; path = '" + str(d) + "\\' + $label + '.bin'; clock = $clock; endSec = " + repr(end_sec) + "; minSec = 2.0 }\n"
+            "    if ($label -ceq '" + consume_label + "') { Add-Member -InputObject $it -MemberType ScriptProperty -Name sha -Value { $global:clk.now += 3; ('0' * 64) } }\n"
+            "    else { Add-Member -InputObject $it -MemberType NoteProperty -Name sha -Value ('0' * 64) }\n"
+            "    $it\n"
+            "}\n"
+            "$lines = @(& $w $items | ForEach-Object { [string]$_ })\n"
+            "ConvertTo-Json -Compress -InputObject @{ lines = $lines; tp = @($global:tp) }\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, case + "\n" + out.stdout + out.stderr)
+        got = json.loads(out.stdout.strip().splitlines()[-1])
+        return [":".join(line.split(":")[:2]) for line in got["lines"]], [t.removesuffix(".bin") for t in got["tp"]]
+
+    def test_artifact_preflight_r9_the_hash_worker_checks_the_minimum_behaviourally_before_and_after_the_existence_check_for_every_file(self) -> None:
+        order = ["packageZip", "exe", "dll"]
+        # control: nothing spends time, so every file is looked at, opened and hashed (the wrong digest shows as MISMATCH) and none is NOTIME
+        self.assertEqual(self._artifact_worker_run("control"), ([f"MISMATCH:{k}" for k in order], order))
+        # the existence check of file L takes 3 s of the 4 s window: L is NOTIME and was not opened (no MISMATCH:L); the files before it were hashed
+        for i, label in enumerate(order):
+            with self.subTest(existence_check_spends_the_window=label):
+                self.assertEqual(self._artifact_worker_run("exists-" + label, delay_label=label), ([f"MISMATCH:{k}" for k in order[:i]] + [f"NOTIME:{label}"], order[:i + 1]))
+        # the hash of file L spends the window: the NEXT file starts with 1 s left, under the 2 s minimum, so it is NOTIME with NO existence read started on it, and a file that is
+        # also absent is still NOTIME (not MISSING: nothing was looked at)
+        for i, label in enumerate(order[:-1]):
+            nxt = order[i + 1]
+            with self.subTest(hash_spends_the_window=label):
+                self.assertEqual(self._artifact_worker_run("hash-" + label, consume_label=label), ([f"MISMATCH:{k}" for k in order[:i + 1]] + [f"NOTIME:{nxt}"], order[:i + 1]))
+                self.assertEqual(self._artifact_worker_run("hash-" + label + "-next-absent", consume_label=label, absent_label=nxt), ([f"MISMATCH:{k}" for k in order[:i + 1]] + [f"NOTIME:{nxt}"], order[:i + 1]))
+        # the first file with the window already spent is NOTIME and never looked at
+        self.assertEqual(self._artifact_worker_run("late", start_now=3.0), (["NOTIME:packageZip"], []))
+        # the contract's own boundary stays: under the minimum left (0.9 s of a 2 s minimum) is NOTIME and nothing is read; exactly the minimum left is read
+        self.assertEqual(self._artifact_worker_run("boundary-under", end_sec=0.9), (["NOTIME:packageZip"], []))
+        self.assertEqual(self._artifact_worker_run("boundary-at", end_sec=2.0), ([f"MISMATCH:{k}" for k in order], order))
+
     def test_artifact_preflight_the_refusal_names_the_artifact_and_a_fully_staged_build_still_opens_the_lease(self) -> None:
         c = "3" * 40
         manifest = self.stage(c, "named")

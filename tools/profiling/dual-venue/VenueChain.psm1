@@ -605,8 +605,8 @@ function Get-VenueStagedBuildManifest {
     .OUTPUTS
     [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
     #>
-    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
-        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1, 600)][double]$ArtifactMinSec = 1)
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1.0, 600.0)][double]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null,
+        [switch]$VerifyArtifacts, [ValidateRange(0, 600)][int]$ArtifactTimeoutSec = 0, [scriptblock]$ArtifactProbeScript = $null, [ValidateRange(1.0, 600.0)][double]$ArtifactMinSec = 1)
     # -ArtifactTimeoutSec 0 (the default): the artifact hash gets what is left of -TimeoutSec after the manifest read (under -ArtifactMinSec left, no hash: UNREACHABLE), so the whole call stays inside -TimeoutSec, as
     # every caller that passes 30 relies on. A caller that can afford more (the pre-claim plan preflight) or must afford less (the post-claim guard) says so.
     # r7 (sol r6 B1): -TimeoutSec and what is left of it are seconds with their fraction, never floored: the lease batch guard hands over a 2.8 s remainder as 2.8.
@@ -750,7 +750,7 @@ function Invoke-VenueBoundedRead {
     [pscustomobject]@{ answered; value (the script's output as an array); error }
     #>
     # r7 (sol r6 B1): -TimeoutSec keeps its fraction (a caller's exact remainder), so no bound is rounded up past the caller's deadline or down under its minimum
-    param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1, 600)][double]$TimeoutSec)
+    param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1.0, 600.0)][double]$TimeoutSec)
     $ps = [powershell]::Create()
     $abandoned = $false
     try {
