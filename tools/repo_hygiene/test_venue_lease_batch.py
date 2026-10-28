@@ -3076,6 +3076,39 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes(), "nothing was appended to the linked batch.log")
         self.assertIn("BATCH_OUTPUT_UNVOUCHED batch=1 reason=OUTPUT_ZONE_UNRESOLVED", r.stderr)
 
+    def test_r6_adv_a1_an_input_whose_lookup_is_denied_is_input_unreadable_never_input_vanished(self) -> None:
+        # adversary r6 A1: the input is still there, but its own ACL denies everything and its folder denies listing, so resolving it AND looking it up are access denied. Get-Item (and,
+        # for a staged manifest, Test-Path) read that as "nothing there": INPUT_VANISHED / skipped as gone. Only "not found" is gone: INPUT_UNREADABLE, the receipts written, exit 2.
+        for form in ("scalar spec", "build manifest"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                if form == "scalar spec":
+                    args, e = self.batch_cmd([spec])
+                    target = spec
+                else:
+                    args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                    target = self._staged_manifest(self.commit_a)
+                me = "([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+                for p in (target, target.parent):
+                    self.addCleanup(subprocess.run, ["icacls", str(p), "/remove:d", os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")], capture_output=True)
+                deny = (f"$null = icacls '{psq(target)}' /deny ({me} + ':(F)'); $null = icacls '{psq(target.parent)}' /deny ({me} + ':(RD)')")
+                r = self._rpf06_run(args, e, deny)
+                try:
+                    with self.assertRaises(PermissionError, msg="the input's lookup is denied (the case under test)"):
+                        os.stat(target)
+                    self.assertEqual(r.returncode, 2, "an input whose lookup was denied ended exit 0\n" + r.stdout + r.stderr)
+                    res = batch_result(r.stdout)
+                    self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"]), (2, "INPUT_UNREADABLE", 1, []), r.stderr)
+                    self.assertNotIn("INPUT_VANISHED", r.stdout + r.stderr, "an input that is still there is not gone")
+                    self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+                    self.assertTrue((self.run_dir / "batch-01.json").is_file())
+                    self.assertEqual(len(self.batches()), 1)
+                finally:
+                    for p in (target.parent, target):
+                        subprocess.run(["icacls", str(p), "/remove:d", os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")], capture_output=True)
+
     def _r5_two_batch_args(self) -> tuple[list[str], dict, Path, Path]:
         a, b = self._r5_spec("fx-a.json", self.specs[0]), self._r5_spec("fx-b.json", self.specs[1])
         args, e = self.plan_cmd(self.write_plan([self.item(a, "A", self.commit_a), self.item(b, "A", self.commit_a)]), FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")

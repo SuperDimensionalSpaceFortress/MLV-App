@@ -496,10 +496,15 @@ function Get-InputUnresolvedCode([string]$Path, [switch]$SkipRead) {
         if (-not $SkipRead) { $fs = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)); $fs.Dispose() }
         return ''
     } catch { }
-    $entry = $true
-    try { $null = Get-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { $entry = $false }
-    if (-not $entry) { try { $null = Get-PhysicalPath ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))); return 'INPUT_VANISHED' } catch { } }
+    # r6 (adversary r6 A1): only "not found" is gone; an input whose lookup is DENIED is there and will not open (Test-NothingAtName)
+    if (Test-NothingAtName $Path) { try { $null = Get-PhysicalPath ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path))); return 'INPUT_VANISHED' } catch { } }
     'INPUT_UNREADABLE'
+}
+
+function Test-NothingAtName([string]$Path) {
+    # r6 (adversary r6 A1): $true only when the file system says nothing is at $Path (file or folder not found). Access denied, a sharing violation or any other error is an entry
+    # that is there but will not answer, never "gone" (Get-Item and Test-Path said gone for a lookup that was denied). A link is the entry itself: its target is not followed.
+    try { $null = [IO.File]::GetAttributes($Path); $false } catch [IO.FileNotFoundException] { $true } catch [IO.DirectoryNotFoundException] { $true } catch { $false }
 }
 
 function Get-InputOutputRefusal {
@@ -511,7 +516,8 @@ function Get-InputOutputRefusal {
     $unresolved = $null; $outputUnresolved = $null
     foreach ($g in $script:guardedInputs) {
         # a staged build manifest that is gone has no location to compare; Get-InputContentRefusal types that (BUILD_NOT_STAGED). r5b (adversary r5b A1): a folder at its name is not gone.
-        if ($g.kind -ceq 'build' -and -not (Test-Path -LiteralPath $g.path)) { continue }
+        # r6 (adversary r6 A1 sibling): gone means not found; a manifest whose lookup is denied is still there (Test-Path said gone)
+        if ($g.kind -ceq 'build' -and (Test-NothingAtName $g.path)) { continue }
         # r5b (adversary r5b A2): only a refusal reached with the input itself open is an alias. An input that did not open while the guard ran got no answer from it (a save-as-rename's
         # moment): the guard is asked again, at most three times, and an input that never stays open is unresolved, never a runner output.
         $code = ''
@@ -555,7 +561,7 @@ function Get-ReceiptDestinationRefusal([string]$Path) {
     # r6 (sol r5b B1; RPF-06): '' when a write to $Path cannot land in an accepted input, asked for that one file when the output zone could not be inspected as a whole. Nothing at the
     # name: the write makes a new file, which is no accepted input. Something there (a link too, dangling or not): its physical path and file identity are compared with every accepted
     # input that resolves (one that does not cannot be reached through it), and a name that will not resolve is refused, since where the write lands is unknown.
-    if ([int]([IO.FileInfo]::new($Path)).Attributes -eq -1) { return '' }
+    if (Test-NothingAtName $Path) { return '' }
     try { $phys = Get-PhysicalPath $Path; $key = (Get-FileIdentity $Path).key } catch { return "'$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write to it lands is unknown" }
     foreach ($g in $script:guardedInputs) {
         try { $gp = Get-PhysicalPath $g.path; $gk = (Get-FileIdentity $g.path).key } catch { continue }
