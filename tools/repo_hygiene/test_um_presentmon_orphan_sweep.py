@@ -28,6 +28,7 @@ functions are called directly. Every item has a mutation test.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import tempfile
@@ -333,6 +334,45 @@ class ModuleFunctionTests(unittest.TestCase):
             "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ same = [object]::ReferenceEquals($r, $report) }) -Compress))")
         self.assertTrue(got["same"])
 
+    # --- r3 (sol B1 on 2519ce4f, report-copy-shape): both report helpers accept [object]; a dictionary report used to lose status and chains (PSObject.Properties of a dictionary are its
+    # own members, not its keys). Every accepted shape now comes back as the same pscustomobject: the report's fields, only `reason` changed.
+    SHAPES = {"pscustomobject": "[pscustomobject]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'r'; chains = @(1, 2) }",
+              "ordered": "[ordered]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'r'; chains = @(1, 2) }",
+              "hashtable": "@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'r'; chains = @(1, 2) }"}
+    HELPERS = {"sweep": "Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ skippedReason = 'presentmon_process_alive' }",
+               "events": "Add-AttrCudaPresentMonEventsLostDetailToReport -Report $report -EventsLost ([pscustomobject]@{ detected = $true; detail = 'PRESENTMON_EVENTS_LOST: 12 lost' })"}
+
+    def shaped(self, shape: str, helper: str, module_text: str | None = None) -> dict:
+        return self.call(f"$report = {self.SHAPES[shape]}\n$r = {self.HELPERS[helper]}\n"
+                         "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ type = $r.GetType().Name; names = @(@($r.PSObject.Properties.Name) | Sort-Object); "
+                         "status = $r.status; reason = $r.reason; chains = @($r.chains); original = $report.reason }) -Compress))", module_text)
+
+    def test_r3_b1_every_report_shape_keeps_its_fields_and_changes_only_the_reason(self) -> None:
+        for helper in self.HELPERS:
+            outputs = {shape: self.shaped(shape, helper) for shape in self.SHAPES}
+            for shape, got in outputs.items():
+                self.assertEqual((got["type"], got["names"], got["status"], got["chains"]), ("PSCustomObject", ["chains", "reason", "status"], "PRESENTMON_UNAVAILABLE", [1, 2]), (helper, shape))
+                self.assertTrue(got["reason"].startswith("r ["), (helper, shape, got["reason"]))
+                self.assertEqual(got["original"], "r", "the input report is never mutated")
+            self.assertEqual(outputs["ordered"], outputs["pscustomobject"], helper)
+            self.assertEqual(outputs["hashtable"], outputs["pscustomobject"], helper)
+
+    def test_r3_b1_an_ordered_report_keeps_its_key_order(self) -> None:
+        got = self.call("$report = [ordered]@{ status = 'S'; reason = 'r'; chains = @(); selectedChain = $null }\n"
+                        "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ skippedReason = 'x' }\n"
+                        "Write-Output ('JSON=' + (ConvertTo-Json -InputObject @($r.PSObject.Properties.Name) -Compress))")
+        self.assertEqual(got, ["status", "reason", "chains", "selectedChain"])
+
+    def test_mutation_the_property_only_copy_loses_a_dictionary_reports_fields_again(self) -> None:
+        module = MODULE.read_text(encoding="utf-8")
+        branch = ("    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.Keys)) { $copy[[string]$key] = $Report[$key] } }\n"
+                  "    else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }\n")
+        self.assertEqual(module.count(branch), 2, "both report helpers carry the dictionary branch")
+        mutated = module.replace(branch, "    foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value }\n", 2)
+        for helper in self.HELPERS:
+            got = self.shaped("ordered", helper, module_text=mutated)
+            self.assertIsNone(got["status"], f"sol's B1 repro ({helper}): status is lost")
+
     # --- the wrappers run logman as a child process under a deadline (UM-SWEEP-LOGMAN-BOUND-1); the tests hand them a stub executable
     HANGING_STUB = "Start-Sleep -Seconds 6\nexit 0\n"
 
@@ -419,9 +459,15 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
                   logman_hangs: bool = False, logman_stop_hangs: bool = False, logman_timeout_seconds: int = 0,
                   others: tuple[tuple[int, str, str | None], ...] = (), services: tuple[tuple[int, str], ...] = (), service_lookup_fails: bool = False,
                   processes: tuple[tuple[int, str, int, int | None], ...] = (), process_lookup_fails: bool = False,
-                  go_live_as: tuple[int, str, str | None] | None = None) -> tuple[int, dict, Path, str]:
+                  go_live_as: tuple[int, str, str | None] | None = None, command_lines: tuple[tuple[int | str, str], ...] = (), command_line_query_fails_from: int = 0,
+                  go_live_command_line: str | None = None, pm_name: str = STUB_EXE, presentmon_sha: str | None = None,
+                  pinned_copies: tuple[Path, ...] = ()) -> tuple[int, dict, Path, str]:
         # r2: `processes` are the Win32_Process rows (id, name, parent id, creation minute or None for an unreadable CreationDate) the parent read sees; `go_live_as` is the process that appears
         # once live_after_terminate_of is terminated (default: the pinned image, pid 5151)
+        # r3: `command_lines` are the rows (pid, CommandLine) of the snapshot's ONE unfiltered Win32_Process query (a process without a row reads as an unreadable command line);
+        # `go_live_command_line` is the go-live process's row once it appears; command_line_query_fails_from=N makes that query fail from its Nth call on (0: never); `pm_name` is the
+        # configured -PresentMonName (the stub executable's name in the cache); `presentmon_sha` is the job's pinned $PresentMonSha (None: unset; "PINNED": the stub's own SHA-256);
+        # `pinned_copies` are byte copies of the stub written elsewhere (another harness's renamed copy of the pinned binary)
         d = self.stmp / name
         (d / "cache").mkdir(parents=True)
         (d / "legOut").mkdir()
@@ -432,12 +478,18 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         record = f"echo %2>>\"{d / 'terminated.txt'}\"\r\n" if helper_works else ""
         # a PresentMon process that appears once the helper has been asked to terminate this session (another capture starting mid-sweep)
         goes_live = f"if /i \"%2\"==\"{live_after_terminate_of}\" echo x>\"{d / 'go-live.txt'}\"\r\n" if live_after_terminate_of else ""
-        (d / "cache" / STUB_EXE).write_text(
+        (d / "cache" / pm_name).write_text(
             "@echo off\r\n"
             f"echo %*>>\"{d / 'calls.log'}\"\r\n"
             "echo %* | findstr /c:\"--terminate_existing_session\" >nul\r\n"
             "if errorlevel 1 exit /b 0\r\n"
             + goes_live + record + ("exit /b 0\r\n" if helper_works else "exit /b 1\r\n"), encoding="ascii")
+        pinned_bytes = (d / "cache" / pm_name).read_bytes()
+        for copy in pinned_copies:
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            copy.write_bytes(pinned_bytes)
+        if presentmon_sha == "PINNED":
+            presentmon_sha = hashlib.sha256(pinned_bytes).hexdigest().upper()
         exits = "; ".join(f"{k} = {v}" for k, v in (query_exits or {}).items())
         logman_stub = write_logman_stub(d, (
             f"$d = '{ps(d)}'\n"
@@ -510,8 +562,16 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             + "}\n"
             # the real cmdlet reads Win32_Service by a WQL filter; a failure is a non-terminating error that -ErrorAction Stop turns into a throw
             "function Get-CimInstance {\n"
-            "    [CmdletBinding()] param([string]$ClassName, [string]$Filter)\n"
+            "    [CmdletBinding()] param([string]$ClassName, [string]$Filter, [string[]]$Property)\n"
             "    $global:getCimCalls = 1 + [int]$global:getCimCalls\n"
+            # r3: the snapshot's unfiltered command-line query (ProcessId, CommandLine for every process); a failure is the whole query failing, as for an access-denied WMI namespace
+            "    if ($ClassName -eq 'Win32_Process' -and -not $Filter) {\n"
+            "        $global:commandLineQueries = 1 + [int]$global:commandLineQueries\n"
+            f"        if ({command_line_query_fails_from} -gt 0 -and $global:commandLineQueries -ge {command_line_query_fails_from}) {{ Write-Error 'stub Win32_Process command-line query failure'; return }}\n"
+            + "".join(f"        [pscustomobject]@{{ ProcessId = {i}; CommandLine = {ps_quote(c)} }}\n" for i, c in command_lines)
+            + (f"        if (Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') {{ [pscustomobject]@{{ ProcessId = {(go_live_as or (5151,))[0]}; CommandLine = {ps_quote(go_live_command_line)} }} }}\n" if go_live_command_line else "")
+            + "        return\n"
+            "    }\n"
             + ("    if ($ClassName -eq 'Win32_Service') { Write-Error 'stub Get-CimInstance failure'; return }\n" if service_lookup_fails else "")
             + ("    if ($ClassName -eq 'Win32_Process') { Write-Error 'stub Win32_Process failure'; return }\n" if process_lookup_fails else "")
             + "    $want = [int]([regex]::Match($Filter, 'ProcessId\\s*=\\s*(\\d+)').Groups[1].Value)\n"
@@ -529,8 +589,9 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             # the sweep's wrappers run an executable (bounded by a deadline), so the stub is one: a .cmd shim around a pwsh script
             + f"$presentMonLogmanPath = '{ps(logman_stub)}'\n"
             + (f"$presentMonLogmanTimeoutSeconds = {logman_timeout_seconds}\n" if logman_timeout_seconds else "")
-            + f"$Cache ='{ps(d / 'cache')}'\n$PresentMonName = '{STUB_EXE}'\n$ExeName = 'MLVApp.exe'\n$PresentMonTimedSeconds = 60\n"
-            "$PresentMonSessionName = 'MLVAttr3-the-new-job'\n$PresentMonTerminateOnProcExit = $true\n"
+            + f"$Cache ='{ps(d / 'cache')}'\n$PresentMonName = '{pm_name}'\n$ExeName = 'MLVApp.exe'\n$PresentMonTimedSeconds = 60\n"
+            + (f"$PresentMonSha = '{presentmon_sha}'\n" if presentmon_sha else "")
+            + "$PresentMonSessionName = 'MLVAttr3-the-new-job'\n$PresentMonTerminateOnProcExit = $true\n"
             f"$legOut = '{ps(d / 'legOut')}'\n"
             "$presentMonPath = Join-Path $legOut 'presentmon.csv'\n"
             "$presentMonStdoutPath = Join-Path $legOut 'presentmon-stdout.txt'\n$presentMonStderrPath = Join-Path $legOut 'presentmon-stderr.txt'\n"
@@ -844,6 +905,134 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         _code, sweep, _d, _out = self.run_start("mut-newly", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
         self.assertEqual(sweep["newlyListed"], ["PresentMon"])
 
+    # --- r3 regressions (sol B2 on 2519ce4f, Dot advisory, hub-confirmed): -PresentMonName accepts any <name>.exe, so a second harness's LIVE capture can run as capture.exe. Beside the
+    # identified Intel service the r2 scope was harness_sessions and the PresentMon*-only enumeration never saw it: its live MLVAttr3-* session was terminated (base 038ba335 skipped instead).
+    OTHER_SESSIONS = ("PresentMon", "MLVAttr3-old-killed-job", "MLVAttr3-other-harness-live")
+    CAPTURE = (6100, "capture", "C:\\other-harness\\cache\\capture.exe")
+    CAPTURE_CMD = ('"C:\\other-harness\\cache\\capture.exe" --process_name MLVApp.exe --output_file C:\\other-harness\\out\\presentmon.csv --timed 60 --terminate_after_timed '
+                   '--session_name MLVAttr3-other-harness-live --stop_existing_session --no_console_stats')
+
+    def assert_nothing_destructive(self, d: Path) -> None:
+        self.assertEqual(self.terminated_names(self.calls(d)), [], "the other harness's live MLVAttr3-* capture is never terminated")
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "and logman stop is never issued")
+        self.assertEqual(len([c for c in self.calls(d) if "--process_name" in c]), 1, "the capture itself still starts")
+
+    def test_r3_r1_a_renamed_capture_beside_the_intel_service_refuses_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r3-r1-renamed-beside-intel", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.CAPTURE), processes=self.INTEL_TREE,
+                                             command_lines=((6100, self.CAPTURE_CMD),))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive", "as on base 038ba335: no harness_sessions scope")
+        self.assertIsNone(sweep["scope"])
+        self.assertIn(6100, sweep["livePresentMonProcessIds"])
+        self.assertEqual({r["pid"]: r["reason"] for r in sweep["livePresentMonProcesses"]}[6100], "capture_session_command_line")
+        self.assert_nothing_destructive(d)
+
+    def test_r3_r1_a_renamed_capture_whose_command_line_is_unreadable_is_found_by_its_image_hash(self) -> None:
+        # the same capture, its command line unreadable (no row): a copy of the pinned binary under another name and path is found by the pinned SHA-256
+        image = self.stmp / "r3-r1-hash-other-harness" / "capture.exe"
+        code, sweep, d, out = self.run_start("r3-r1-hash", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6100, "capture", str(image))), processes=self.INTEL_TREE,
+                                             presentmon_sha="PINNED", pinned_copies=(image,))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual({r["pid"]: r["reason"] for r in sweep["livePresentMonProcesses"]}[6100], "pinned_image_sha256")
+        self.assertEqual(sweep["unreadableCommandLineCount"], 2, "the Intel child and the capture had no readable command line; recorded, neither a blocker by that alone")
+        self.assert_nothing_destructive(d)
+
+    def test_r3_r1_a_capture_under_the_configured_name_is_live_whatever_its_prefix(self) -> None:
+        # this harness configured with -PresentMonName capture.exe (here a .cmd stub): its own pinned image never matched PresentMon* and was invisible too
+        code, sweep, d, out = self.run_start("r3-r1-configured", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6101, "capture", UNREADABLE)), processes=self.INTEL_TREE,
+                                             pm_name="capture.cmd")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual({r["pid"]: r["reason"] for r in sweep["livePresentMonProcesses"]}[6101], "pinned_image_name")
+        self.assert_nothing_destructive(d)
+
+    def test_r3_r1_a_single_dash_session_name_argument_is_a_candidate_too(self) -> None:
+        code, sweep, d, out = self.run_start("r3-r1-single-dash", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6102, "pm", "C:\\x\\pm.exe")), processes=self.INTEL_TREE,
+                                             command_lines=((6102, "pm.exe -session_name OtherCapture -process_name MLVApp.exe"),))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assert_nothing_destructive(d)
+
+    def test_r3_r1_the_sweeping_job_itself_is_never_a_candidate(self) -> None:
+        # the job's own process ($PID) owns no ETW session; were it a candidate, a job whose command line names its session would never sweep
+        code, sweep, d, out = self.run_start("r3-r1-self", others=(self.SERVICE_UNREADABLE, ("$PID", "pwsh", "C:\\pwsh\\pwsh.exe")), processes=self.INTEL_TREE,
+                                             command_lines=(("$PID", "pwsh -File job.ps1 MLVAttr3-the-new-job"),))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
+    def test_r3_r2_a_renamed_capture_that_appears_before_a_terminate_aborts_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r3-r2-renamed-mid-terminate", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                             go_live_as=self.CAPTURE, go_live_command_line=self.CAPTURE_CMD, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"], "the other harness's session is never terminated")
+        self.assertEqual(sweep["abortedReason"], "presentmon_process_started_during_sweep")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-other-harness-live:presentmon_terminate")
+        self.assertEqual(sweep["livePresentMonProcessIds"], [6100])
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "")
+
+    def test_r3_r3_a_renamed_capture_that_appears_before_a_logman_stop_aborts_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r3-r3-renamed-before-stop", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), helper_works=False,
+                                             live_after_terminate_of="MLVAttr3-other-harness-live", go_live_as=self.CAPTURE, go_live_command_line=self.CAPTURE_CMD,
+                                             others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "logman stop is never issued under the other harness's live capture")
+        self.assertEqual(sweep["abortedReason"], "presentmon_process_started_during_sweep")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-killed-a:logman_stop")
+        self.assertEqual(sweep["remaining"], ["MLVAttr3-killed-a", "MLVAttr3-other-harness-live"])
+
+    def test_r3_r4_a_command_line_query_that_fails_is_a_typed_fail_closed_skip(self) -> None:
+        for label, others, processes in (("beside-intel", (self.SERVICE_UNREADABLE,), self.INTEL_TREE), ("no-presentmon", (), ())):
+            code, sweep, d, out = self.run_start(f"r3-r4-{label}", others=others, processes=processes, command_line_query_fails_from=1)
+            self.assertEqual(code, 0, out)
+            self.assertFalse(sweep["ran"], (label, sweep))
+            self.assertEqual(sweep["skippedReason"], "capture_owner_command_lines_unreadable", label)
+            self.assertIsNone(sweep["scope"], "no scope is chosen, harness_sessions least of all")
+            self.assertIn("stub Win32_Process command-line query failure", sweep["commandLineError"], label)
+            self.assert_nothing_destructive(d)
+
+    def test_r3_r4_a_command_line_query_that_fails_on_a_recheck_stops_the_sweep_with_a_typed_error(self) -> None:
+        # queries: 1 the scope choice, 2 the post-listing recheck, 3 the recheck before the first terminate -- it fails there
+        code, sweep, d, out = self.run_start("r3-r4-recheck", sessions=("MLVAttr3-killed-a", "MLVAttr3-killed-b"), others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                             command_line_query_fails_from=3)
+        self.assertEqual(code, 0, out)
+        self.assertIn("capture_owner_command_lines_unreadable", str(sweep["error"]))
+        self.assert_nothing_destructive(d)
+
+    def test_r3_the_intel_service_alone_still_sweeps_with_readable_command_lines(self) -> None:
+        # the healthy control with the command-line route active: the Intel child's own command line names no session
+        code, sweep, d, out = self.run_start("r3-intel-readable", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                             command_lines=((7001, "\"C:\\Program Files\\Intel\\PresentMonService.exe\""),))
+        self.assertEqual(code, 0, out)
+        self.assertEqual((sweep["scope"], sweep["deferred"], sweep["unreadableCommandLineCount"]), ("harness_sessions", ["PresentMon"], 0))
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
+    def test_mutation_the_presentmon_star_enumeration_terminates_a_renamed_live_capture_again(self) -> None:
+        mutated = mutate(TEMPLATE, "foreach ($candidate in @(Get-Process -ErrorAction Stop)) {", "foreach ($candidate in @(Get-Process -Name 'PresentMon*' -ErrorAction Stop)) {")
+        _code, sweep, d, _out = self.run_start("mut-r3-name-only", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.CAPTURE), processes=self.INTEL_TREE,
+                                               command_lines=((6100, self.CAPTURE_CMD),), text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)), "sol B2: the live session is terminated")
+
+    def test_mutation_without_the_command_line_route_a_renamed_capture_is_invisible_again(self) -> None:
+        mutated = mutate(TEMPLATE, "$namesSession = ($commandLine -match $sessionCommandLinePattern)", "$namesSession = $false")
+        _code, sweep, d, _out = self.run_start("mut-r3-no-cmdline", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.CAPTURE), processes=self.INTEL_TREE,
+                                               command_lines=((6100, self.CAPTURE_CMD),), text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)))
+
+    def test_mutation_a_failed_command_line_query_read_as_none_is_not_fail_closed(self) -> None:
+        mutated = mutate(TEMPLATE, "        if ($null -ne $snapshot.commandLineError) {\n            $record['skippedReason'] = 'capture_owner_command_lines_unreadable'",
+                         "        if ($false) {\n            $record['skippedReason'] = 'capture_owner_command_lines_unreadable'")
+        _code, sweep, d, _out = self.run_start("mut-r3-cim-open", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, command_line_query_fails_from=1, text=mutated)
+        self.assertEqual(sweep["scope"], "harness_sessions", "the mutation chooses a scope on an enumeration it could not complete")
+
+    def test_mutation_a_recheck_that_ignores_the_failed_query_terminates_on_it(self) -> None:
+        mutated = mutate(TEMPLATE, "if ($null -ne $snapshot.commandLineError) { throw ('capture_owner_command_lines_unreadable: ' + $snapshot.commandLineError) }", "")
+        _code, sweep, d, _out = self.run_start("mut-r3-recheck-open", sessions=("MLVAttr3-killed-a", "MLVAttr3-killed-b"), others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                               command_line_query_fails_from=3, text=mutated)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a", "MLVAttr3-killed-b"], "the mutation terminates under a blind recheck")
+
     def test_the_bachelor_service_child_never_aborts_the_harness_sweep_on_its_rechecks(self) -> None:
         # the service is alive through EVERY liveness re-check; in harness scope it is positively identified, so both leftover job sessions go
         code, sweep, d, out = self.run_start("service-child-rechecks", sessions=("MLVAttr3-killed-a", "MLVAttr3-killed-b"), others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
@@ -935,12 +1124,21 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "pinned_image_path")
         self.assertEqual(self.terminated_names(self.calls(d)), [])
 
-    def test_a_process_whose_name_does_not_start_with_presentmon_is_never_examined(self) -> None:
-        # the stub honours -Name like the real cmdlet: this is the honest scope of the enumeration (sol, fable UM-SWEEP-PATH-ARM-REALISM-1)
-        code, sweep, d, out = self.run_start("not-enumerated", others=((4344, "renamed-capture", str(self.stmp / "not-enumerated" / "cache" / STUB_EXE)),))
+    def test_a_renamed_copy_at_the_pinned_path_is_live_whatever_its_name(self) -> None:
+        # r3 (sol B2): the enumeration used to be Get-Process -Name 'PresentMon*' (the stub honours -Name like the real cmdlet), so this process was never examined and the sweep ran
+        code, sweep, d, out = self.run_start("renamed-at-pinned-path", others=((4344, "renamed-capture", str(self.stmp / "renamed-at-pinned-path" / "cache" / STUB_EXE)),))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["livePresentMonProcessIds"], [4344])
+        self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "pinned_image_path")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_a_process_that_is_no_candidate_by_any_route_is_never_a_blocker(self) -> None:
+        # the honest scope of the wider enumeration: another name, another path, another hash, and a command line naming no session -- not examined, the sweep runs
+        code, sweep, d, out = self.run_start("not-a-candidate", others=((4345, "explorer", "C:\\Windows\\explorer.exe"),), command_lines=((4345, "C:\\Windows\\explorer.exe /factory"),))
         self.assertEqual(code, 0, out)
         self.assertTrue(sweep["ran"], sweep)
-        self.assertEqual((sweep["livePresentMonProcessIds"], sweep["excludedPresentMonProcesses"]), ([], []))
+        self.assertEqual((sweep["livePresentMonProcessIds"], sweep["excludedPresentMonProcesses"], sweep["scope"]), ([], [], "all"))
 
     def test_the_pinned_name_is_live_whatever_its_path_looks_like(self) -> None:
         # the path may read as a long name while $Cache is spelled short (8.3: RUNNER~1), or not read at all: the image name decides and the capture is live either way
@@ -970,7 +1168,9 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
 
     def test_the_process_list_is_read_with_an_error_action_that_throws(self) -> None:
         snapshot = _slice(TEMPLATE, "function Get-PresentMonProcessSnapshot(", "\nfunction Get-PresentMonLiveProcessId(")
-        self.assertIn("Get-Process -Name 'PresentMon*' -ErrorAction Stop", snapshot)
+        # r3: every process is enumerated (no -Name filter), and the command lines are read with -ErrorAction Stop too
+        self.assertIn("foreach ($candidate in @(Get-Process -ErrorAction Stop)) {", snapshot)
+        self.assertIn("Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine -ErrorAction Stop", snapshot)
         self.assertNotIn("SilentlyContinue", snapshot, "an unreadable list must never read as 'no capture alive'")
 
     def test_the_pinned_image_name_drops_only_the_exe_extension_of_the_real_pinned_name(self) -> None:

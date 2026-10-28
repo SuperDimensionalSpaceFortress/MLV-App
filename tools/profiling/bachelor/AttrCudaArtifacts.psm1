@@ -2299,7 +2299,7 @@ function Add-AttrCudaPresentMonEventsLostDetail {
 function Add-AttrCudaPresentMonEventsLostDetailToReport {
     <#
     .SYNOPSIS
-    A PresentMon display report (a pscustomobject with a `reason`) whose reason carries the typed PRESENTMON_EVENTS_LOST detail; the same object when there is nothing to add.
+    A PresentMon display report (a pscustomobject, or a dictionary, with a `reason`; the copy is a pscustomobject either way) whose reason carries the typed PRESENTMON_EVENTS_LOST detail; the same object when there is nothing to add.
     .DESCRIPTION
     UM-PRESENTMON-ORPHAN-SWEEP-1: the display-report failure branch reads `$displayReport.reason` in two places, and the scanned template may not assign to a member (R5), so the
     report is replaced by a copy (properties and their order unchanged, only `reason` different) -- a plain variable assignment at the call site.
@@ -2313,8 +2313,10 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
     $current = [string]$Report.reason
     $detailed = Add-AttrCudaPresentMonEventsLostDetail -Reason $current -EventsLost $EventsLost
     if ($detailed -ceq $current) { return $Report }
+    # r3 (sol B1, the sibling copy): a dictionary report keeps its entries; either shape comes back as the same pscustomobject
     $copy = [ordered]@{}
-    foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value }
+    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.Keys)) { $copy[[string]$key] = $Report[$key] } }
+    else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }
     $copy['reason'] = $detailed
     return [pscustomobject]$copy
 }
@@ -2327,7 +2329,8 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 (Bachelor, 2026-10-27): 16 of 16 cuda legs ended "PresentMon output does not exist" while an orphaned MLVAttr3-* session starved every capture and the
     sweep had been skipped on every leg -- the summary named the symptom and never the sweep. The detail names what was left: skipped=<reason>, aborted=<reason>, remaining=<names>,
     deferred=<names>, listError, error, and the live PresentMon pids. A sweep that ran and left nothing (or no sweep record at all) adds nothing; a reason that already carries the token is never
-    given it twice. Like Add-AttrCudaPresentMonEventsLostDetailToReport, the report is replaced by a copy (properties and their order unchanged, only `reason` different).
+    given it twice. Like Add-AttrCudaPresentMonEventsLostDetailToReport, the report is replaced by a copy (properties and their order unchanged, only `reason` different). The report is a pscustomobject or a dictionary (r3, sol B1: its entries are kept); the copy
+    is a pscustomobject either way.
     #>
     [CmdletBinding()]
     param(
@@ -2369,8 +2372,10 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
         return $Report
     }
     $detail = "PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: $($parts -join ' ')"
+    # r3 (sol B1): a dictionary report keeps its entries (PSObject.Properties of a dictionary are its own members, not its keys); either shape comes back as the same pscustomobject
     $copy = [ordered]@{}
-    foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value }
+    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.Keys)) { $copy[[string]$key] = $Report[$key] } }
+    else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }
     $copy['reason'] = if ([string]::IsNullOrEmpty($current)) { $detail } else { "$current [$detail]" }
     return [pscustomobject]$copy
 }

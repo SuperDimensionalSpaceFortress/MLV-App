@@ -294,7 +294,13 @@ permitted `-PresentMonName PresentMon-custom.exe`, which no capture-image patter
 no `CreationDate`, or names another parent leaves the process a blocker (`identityError` says why). So when every live process is positively identified, the sweep runs in
 `orphanSweep.scope = harness_sessions`: it terminates the `MLVAttr3-*` orphans, leaves the default `PresentMon` session (recorded in `orphanSweep.deferred`), and stops on a re-check
 (the same blocker helper before every terminate and every `logman stop`) for any process without that identity. With no PresentMon process alive the scope is `all`, as before.
-`newlyListed` is what the full initial listing lacked, so a deferred session is never reported as new. A display-report
+`newlyListed` is what the full initial listing lacked, so a deferred session is never reported as new.
+r3: the processes examined are no longer only `PresentMon*`, because `-PresentMonName` accepts any `<name>.exe` (a live `capture.exe` beside the Intel child was invisible, and
+the sweep stopped its `MLVAttr3-*` session). Every process is enumerated, and one is a candidate when ANY of these holds: a `PresentMon*` name, the configured `-PresentMonName`, the
+pinned cache path, the pinned SHA-256 (read best-effort), or a command line (`Win32_Process.CommandLine`) naming an `MLVAttr3-` session or a `--session_name`/`-session_name`
+argument (reason `capture_session_command_line`). The sweeping job itself is never a candidate. One snapshot serves the scope choice and every re-check. If the command-line query fails,
+the sweep fails closed: `skippedReason = capture_owner_command_lines_unreadable` at the scope choice, and an `error` with that prefix on a re-check. Command lines that read empty are
+counted in `orphanSweep.unreadableCommandLineCount`. A display-report
 failure whose sweep did not leave the host clean (skipped, aborted, `remaining`, `deferred`, a listing or sweep error) gains a typed `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE` detail.
 
 The sweep can never stop a live capture or a session it did not list as an orphan (round 2): it acts only on the names listed before its second liveness check -- a name a

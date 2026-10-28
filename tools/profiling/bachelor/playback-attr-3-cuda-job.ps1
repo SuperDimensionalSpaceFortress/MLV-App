@@ -1405,7 +1405,7 @@ function Start-PresentMonCapture([string]$CsvPath, [int]$ReadyTimeoutSeconds = 1
         $sweepResult = Invoke-PresentMonOrphanSweep
         foreach ($key in @($sweepResult.Keys)) { $presentMonOrphanSweep[$key] = $sweepResult[$key] }
         $sweepActionText = @($sweepResult['actions'] | ForEach-Object { $_.session + ':' + $_.method + ':' + $_.exitCode }) -join ';'
-        Write-JobTrace "step presentmon-orphan-sweep ran=$($sweepResult['ran']) skipped=$($sweepResult['skippedReason']) livePids=$(@($sweepResult['livePresentMonProcessIds']) -join ',') excluded=$(@($sweepResult['excludedPresentMonProcesses'] | Where-Object { $null -ne $_ } | ForEach-Object { $_['name'] + ':' + $_['pid'] }) -join ',') listed=$(@($sweepResult['listed']) -join ',') actions=$sweepActionText aborted=$($sweepResult['abortedReason']) abortedBefore=$($sweepResult['abortedBefore']) remaining=$(@($sweepResult['remaining']) -join ',') newlyListed=$(@($sweepResult['newlyListed']) -join ',') listError=$($sweepResult['listError']) error=$($sweepResult['error']) scope=$($sweepResult['scope']) deferred=$(@($sweepResult['deferred']) -join ',') identified=$(@($sweepResult['livePresentMonProcesses'] | Where-Object { $null -ne $_ -and $null -ne $_['nonCaptureIdentity'] } | ForEach-Object { $_['name'] + ':' + $_['pid'] + ':' + $_['nonCaptureIdentity'] + ':' + $_['parentName'] }) -join ',')"
+        Write-JobTrace "step presentmon-orphan-sweep ran=$($sweepResult['ran']) skipped=$($sweepResult['skippedReason']) livePids=$(@($sweepResult['livePresentMonProcessIds']) -join ',') excluded=$(@($sweepResult['excludedPresentMonProcesses'] | Where-Object { $null -ne $_ } | ForEach-Object { $_['name'] + ':' + $_['pid'] }) -join ',') listed=$(@($sweepResult['listed']) -join ',') actions=$sweepActionText aborted=$($sweepResult['abortedReason']) abortedBefore=$($sweepResult['abortedBefore']) remaining=$(@($sweepResult['remaining']) -join ',') newlyListed=$(@($sweepResult['newlyListed']) -join ',') listError=$($sweepResult['listError']) error=$($sweepResult['error']) scope=$($sweepResult['scope']) deferred=$(@($sweepResult['deferred']) -join ',') identified=$(@($sweepResult['livePresentMonProcesses'] | Where-Object { $null -ne $_ -and $null -ne $_['nonCaptureIdentity'] } | ForEach-Object { $_['name'] + ':' + $_['pid'] + ':' + $_['nonCaptureIdentity'] + ':' + $_['parentName'] }) -join ',') unreadableCommandLines=$($sweepResult['unreadableCommandLineCount'])"
     }
     # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     # Direct child: inherits this job's TEMP/TMP. -PassThru so the exit code is checked.
@@ -1495,23 +1495,57 @@ function Get-PresentMonProcessSnapshot() {
     # the same agent account has one -- so a readable-path process that is no service and no capture image is LIVE now (reason readable_path_not_a_registered_service), never excluded on its path.
     # Excluded (not live at all) is a registered service only. A live process may still be no capture blocker for scope harness_sessions, but only on POSITIVE identity recorded in
     # nonCaptureIdentity (Get-PresentMonParentIdentity: the Intel PresentMonService under IntelGraphicsSoftware.Service.exe); Get-PresentMonCaptureBlockerId reads nothing else.
+    # r3 (sol B2 on 2519ce4f, Dot advisory, hub-confirmed): the enumeration was `Get-Process -Name 'PresentMon*'`, but -PresentMonName accepts any `<name>.exe` (capture.exe): a live capture
+    # under such a name was never seen, so beside the identified Intel service the scope was harness_sessions and the sweep terminated that harness's LIVE MLVAttr3-* session. Every process is
+    # enumerated now; a process is a CANDIDATE capture owner when ANY of these holds: its image name starts with PresentMon; it equals the configured -PresentMonName (case-insensitive, no
+    # extension); its image path is the pinned cache path; its main module's SHA-256 is the pinned one (read best-effort, only for a readable path whose file has the pinned file's length);
+    # its command line (Win32_Process.CommandLine) names an MLVAttr3- session or a --session_name / -session_name argument. A candidate is classified exactly as before (live, or excluded as a
+    # registered service), except that a session-naming command line is live with no identity read (reason capture_session_command_line). The sweeping job itself ($PID) is never a candidate.
+    # The command lines are ONE Win32_Process query: if it throws, commandLineError is set and every consumer fails closed (no scope, no destructive action); a single process whose command
+    # line reads empty is no candidate by that alone, and is counted in unreadableCommandLineCount.
     $pinnedName = ([string]$PresentMonName) -replace '\.[A-Za-z0-9]{1,4}$', ''
     $pinnedPath = Join-Path ([string]$Cache) ([string]$PresentMonName)
     $captureImagePattern = '^PresentMon([-_.]?(\d|x64|x86|console|capture|cli)|$)'
+    $sessionCommandLinePattern = '(?i)(MLVAttr3-|(^|[\s"])--?session_name([\s"=]|$))'
+    $pinnedSha = [string]$PresentMonSha
+    $pinnedLength = $null
+    try { if ($pinnedSha.Trim() -ne '' -and (Test-Path -LiteralPath $pinnedPath)) { $pinnedLength = (Get-ChildItem -LiteralPath $pinnedPath -ErrorAction Stop).Length } } catch { $pinnedLength = $null }
+    $commandLines = @{}
+    $commandLineError = $null
+    try {
+        foreach ($row in @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine -ErrorAction Stop)) { $commandLines[[int]$row.ProcessId] = [string]$row.CommandLine }
+    } catch {
+        $commandLineError = $_.Exception.Message
+    }
+    $unreadableCommandLineCount = 0
     $live = @()
     $liveDetail = @()
     $excluded = @()
-    foreach ($candidate in @(Get-Process -Name 'PresentMon*' -ErrorAction Stop)) {
+    foreach ($candidate in @(Get-Process -ErrorAction Stop)) {
+        $candidateId = [int]$candidate.Id
+        if ($candidateId -eq $PID) { continue }
         $candidatePath = ''
         try { $candidatePath = [string]$candidate.Path } catch { $candidatePath = '' }
         $pathReadable = ($candidatePath -ne '')
         $candidateName = [string]$candidate.Name
-        $candidateId = [int]$candidate.Id
+        $commandLine = ''
+        if ($commandLines.ContainsKey($candidateId)) { $commandLine = [string]$commandLines[$candidateId] }
+        if ($null -eq $commandLineError -and $commandLine.Trim() -eq '') { $unreadableCommandLineCount = $unreadableCommandLineCount + 1 }
+        $namesSession = ($commandLine -match $sessionCommandLinePattern)
+        $pinnedHash = $false
+        if ($pathReadable -and $null -ne $pinnedLength) {
+            try {
+                if ((Get-ChildItem -LiteralPath $candidatePath -ErrorAction Stop).Length -eq $pinnedLength) { $pinnedHash = ((Get-FileHash -LiteralPath $candidatePath -Algorithm SHA256 -ErrorAction Stop).Hash -ieq $pinnedSha) }
+            } catch { $pinnedHash = $false }
+        }
+        if (-not (($candidateName -like 'PresentMon*') -or ($candidateName -ieq $pinnedName) -or ($pathReadable -and $candidatePath -ieq $pinnedPath) -or $pinnedHash -or $namesSession)) { continue }
         $reason = $null
         $serviceName = $null
         $parent = [ordered]@{ nonCaptureIdentity = $null; parentName = $null; parentPid = $null; identityError = $null }
         if ($candidateName -ieq $pinnedName) { $reason = 'pinned_image_name' }
         elseif ($pathReadable -and $candidatePath -ieq $pinnedPath) { $reason = 'pinned_image_path' }
+        elseif ($pinnedHash) { $reason = 'pinned_image_sha256' }
+        elseif ($namesSession) { $reason = 'capture_session_command_line' }
         else {
             $registered = @(Get-CimInstance -ClassName Win32_Service -Filter "ProcessId = $candidateId" -ErrorAction Stop | Where-Object { [int]$_.ProcessId -eq $candidateId })
             if ($registered.Count -gt 0) { $serviceName = [string]$registered[0].Name }
@@ -1529,7 +1563,7 @@ function Get-PresentMonProcessSnapshot() {
             $excluded += [ordered]@{ name = $candidateName; pid = $candidateId; service = $serviceName; pathReadable = $pathReadable; nonCaptureIdentity = 'registered_service' }
         }
     }
-    return [pscustomobject]@{ live = @($live); liveDetail = @($liveDetail); excluded = @($excluded) }
+    return [pscustomobject]@{ live = @($live); liveDetail = @($liveDetail); excluded = @($excluded); commandLineError = $commandLineError; unreadableCommandLineCount = $unreadableCommandLineCount }
 }
 
 function Get-PresentMonParentIdentity([int]$ProcessId, [string]$Name) {
@@ -1586,7 +1620,9 @@ function Get-PresentMonCaptureBlockerId($Snapshot) {
 function Get-PresentMonSweepBlockerId([string]$Scope) {
     # the processes that stop a sweep of this scope: every live PresentMon for 'all' (the default session is among the names), every live one without positive non-capture identity for
     # 'harness_sessions' (MLVAttr3-* names only) -- the same helper the scope choice uses
+    # r3: a snapshot whose command lines could not be read cannot see a capture under a name outside PresentMon*: it throws, so the sweep records the typed error and touches nothing more
     $snapshot = Get-PresentMonProcessSnapshot
+    if ($null -ne $snapshot.commandLineError) { throw ('capture_owner_command_lines_unreadable: ' + $snapshot.commandLineError) }
     if ($Scope -eq 'harness_sessions') { return @(Get-PresentMonCaptureBlockerId $snapshot) }
     return @($snapshot.live)
 }
@@ -1630,7 +1666,7 @@ function Invoke-PresentMonOrphanSweep() {
     # terminate and EACH logman stop: the first process that appears stops the sweep (abortedReason / abortedBefore) and what is left is still listed in `remaining`.
     # BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: scope is 'all' (no PresentMon process alive) or 'harness_sessions' (every live process positively identified as no capture, Get-PresentMonCaptureBlockerId): the
     # harness's own MLVAttr3-* orphans are swept then, and the default session is left untouched and recorded in deferred. Every re-check asks the blockers of the sweep's own scope.
-    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); livePresentMonProcesses = @(); excludedPresentMonProcesses = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null; scope = $null; deferred = @() }
+    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); livePresentMonProcesses = @(); excludedPresentMonProcesses = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null; scope = $null; deferred = @(); unreadableCommandLineCount = $null; commandLineError = $null }
     try {
         $snapshot = Get-PresentMonProcessSnapshot
         $live = @($snapshot.live)
@@ -1639,6 +1675,13 @@ function Invoke-PresentMonOrphanSweep() {
         # PresentMonService: name, pid, service, pathReadable) -- evidence only, never a path; the excluded ones never skip the sweep
         $record['livePresentMonProcesses'] = @($snapshot.liveDetail)
         $record['excludedPresentMonProcesses'] = @($snapshot.excluded)
+        # r3: the command lines are what finds a capture under a name outside PresentMon*; when they cannot be read at all, no scope is chosen (fail closed, a typed skip)
+        $record['unreadableCommandLineCount'] = $snapshot.unreadableCommandLineCount
+        $record['commandLineError'] = $snapshot.commandLineError
+        if ($null -ne $snapshot.commandLineError) {
+            $record['skippedReason'] = 'capture_owner_command_lines_unreadable'
+            return $record
+        }
         $scope = 'all'
         if ($live.Count -gt 0) {
             if (@(Get-PresentMonCaptureBlockerId $snapshot).Count -gt 0) {
