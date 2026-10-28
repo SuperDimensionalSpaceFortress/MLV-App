@@ -5,12 +5,18 @@ Select-ReviewKeyB.ps1 - pick the lane that holds review key B for a card (no sel
 .DESCRIPTION
 MODEL-POSTURE-R16-1 hub ruling 2026-10-12. A formal review round has two keys:
   key A = sol   (found 51 blockers fable missed vs 1 the other way over 191 paired reviews)
-  key B = opus, EXCEPT when the PR's implementing lane was opus -> then fable (no self-review).
+  key B = opus, EXCEPT when opus wrote ANY round of the card -> then fable (no self-review).
 fable stays the fallback key B and the planning/guidance lane.
 
-The producer is read from the card's NEWEST PRODUCER receipt: every receipt under
+ANY-OPUS RULE (card KEYB-SELECTOR-ANY-OPUS-ROUND-1, ledger line 4730): key B is fable when ANY
+producer receipt of the card has lane opus, not only the newest one. A sonnet fix or rebind round on
+code that opus wrote would otherwise flip key B to opus and let opus review its own code (PR #453 r3:
+opus rounds r2/r2b wrote the C++, sonnet r3 was a provenance rebind, the selector said opus).
+
+The producers are read from the card's PRODUCER receipts: every receipt under
 <RunsDir>\<run>\*.receipt.json whose `card` equals -Card and whose `allowEdits` is true (a review
-key never edits, so its receipts can never name the producer), ordered by `startedUtc`. Run
+key never edits, so its receipts can never name a producer). The NEWEST by `startedUtc` is reported
+as producerLane/producerReceipt; the opus ones are counted in opusRounds. Run
 directories are named after their card by the dispatch convention, so only directories whose name
 contains the card are opened; the receipt's own `card` field still has to match exactly. A card
 with no producer receipt (a PR written by hand outside the lane runner) gets key B = fable with
@@ -22,7 +28,8 @@ Run it as a CHILD PROCESS, never dot-sourced: its param block (-Card, -RunsDir, 
 -Json) would overwrite the same-named variables of the script that dot-sources it.
     pwsh -NoProfile -File Select-ReviewKeyB.ps1 -Card <CARD> [-RunsDir DIR] [-ProducerLane LANE] [-Json]
 It prints the key-B lane name (or, with -Json, one object: card, keyA, keyB, producerLane,
-producerKnown, producerReceipt, reason, warnings). Exit 0 on a selection, 2 on a usage error
+producerKnown, producerReceipt, opusRounds, reason, warnings). With -ProducerLane no receipt is read,
+so opusRounds is 0. Exit 0 on a selection, 2 on a usage error
 (unreadable RunsDir, empty card, unknown -ProducerLane).
 
 HUB WIRING: see tools\coordination\review-key-pairing.md for the exact patch to
@@ -52,11 +59,12 @@ function Get-DefaultFleetRunsDir {
     return (Join-Path (Get-Location).Path '.claude-state\fleet-runs')
 }
 
-# -> the newest producer receipt of the card as @{ lane; path; startedUtc }, or $null. Never throws
-# on one bad receipt: an unreadable or lane-less file is skipped.
+# -> @{ newest = @{ lane; path; started }; opus = @(opus producer receipts, newest first) }, or $null when
+# the card has no producer receipt. Never throws on one bad receipt: an unreadable or lane-less file is skipped.
 function Get-CardProducerReceipt {
     param([Parameter(Mandatory = $true)][string]$Card, [Parameter(Mandatory = $true)][string]$RunsDir)
     $best = $null
+    $opus = [System.Collections.Generic.List[object]]::new()
     $dirs = @(Get-ChildItem -LiteralPath $RunsDir -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name.IndexOf($Card, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
     foreach ($dir in $dirs) {
@@ -73,12 +81,13 @@ function Get-CardProducerReceipt {
             if ($null -eq $startedProp -or -not [DateTimeOffset]::TryParse([string]$startedProp.Value,
                     [System.Globalization.CultureInfo]::InvariantCulture,
                     [System.Globalization.DateTimeStyles]::AssumeUniversal, [ref]$started)) { continue }
-            if ($null -eq $best -or $started -gt $best.started) {
-                $best = @{ lane = [string]$props['lane'].Value; path = $file.FullName; started = $started }
-            }
+            $entry = @{ lane = [string]$props['lane'].Value; path = $file.FullName; started = $started }
+            if ($null -eq $best -or $started -gt $best.started) { $best = $entry }
+            if ($entry.lane -ceq 'opus') { $opus.Add($entry) }
         }
     }
-    return $best
+    if ($null -eq $best) { return $null }
+    return @{ newest = $best; opus = @($opus | Sort-Object -Property { $_.started } -Descending) }
 }
 
 function Select-ReviewKeyB {
@@ -91,6 +100,7 @@ function Select-ReviewKeyB {
     if ([string]::IsNullOrWhiteSpace($Card)) { throw 'Select-ReviewKeyB: -Card is required' }
     $warnings = [System.Collections.Generic.List[string]]::new()
     $chosenProducer = $null; $chosenReceipt = $null; $reason = $null
+    $opusRounds = 0; $newestOpus = $null
     if ($ProducerLane) {
         if ($SELECT_KEY_B_VALID_LANES -cnotcontains $ProducerLane) {
             throw "Select-ReviewKeyB: unknown -ProducerLane '$ProducerLane' (expected one of $($SELECT_KEY_B_VALID_LANES -join ', '))"
@@ -101,20 +111,28 @@ function Select-ReviewKeyB {
         if (-not (Test-Path -LiteralPath $RunsDir -PathType Container)) { throw "Select-ReviewKeyB: RunsDir not found: $RunsDir" }
         $found = Get-CardProducerReceipt -Card $Card -RunsDir $RunsDir
         if ($null -ne $found) {
-            $chosenProducer = $found.lane; $chosenReceipt = $found.path; $reason = 'producer-receipt'
+            $chosenProducer = $found.newest.lane; $chosenReceipt = $found.newest.path; $reason = 'producer-receipt'
+            $opusRounds = @($found.opus).Count
+            if ($opusRounds -gt 0) { $newestOpus = @($found.opus)[0] }
         } else {
             $reason = 'no-producer-receipt'
             $warnings.Add("no producer receipt (allowEdits=true, card '$Card') under $RunsDir; the no-self-review check had no evidence, so key B fails toward fable (the producer may have been opus)")
         }
     }
     # An unknown producer fails toward fable (HUB RULING, HUB-TICK 20261013T0321Z): the producer may have been opus.
-    $keyB = if ($chosenProducer -ceq 'opus' -or $null -eq $chosenProducer) { 'fable' } else { 'opus' }
-    if ($chosenProducer -ceq 'opus') { $reason += '; opus implemented, so key B falls back to fable (no self-review)' }
+    # Any opus producer round forces fable, not only the newest one (card KEYB-SELECTOR-ANY-OPUS-ROUND-1).
+    $opusWrote = ($chosenProducer -ceq 'opus') -or ($opusRounds -gt 0)
+    $keyB = if ($opusWrote -or $null -eq $chosenProducer) { 'fable' } else { 'opus' }
+    if ($chosenProducer -ceq 'opus') {
+        $reason += '; opus implemented, so key B falls back to fable (no self-review)'
+    } elseif ($opusRounds -gt 0) {
+        $reason += "; opus implemented an earlier round ($($newestOpus.path); $opusRounds opus round(s)) though the newest producer is $chosenProducer, so key B falls back to fable (no self-review)"
+    }
     if ($chosenProducer -ceq $SELECT_KEY_B_KEY_A) { $warnings.Add('producer lane is sol, which is also key A: key A would review its own work; the hub must pick another key A') }
     return [pscustomobject][ordered]@{
         card = $Card; keyA = $SELECT_KEY_B_KEY_A; keyB = $keyB; producerLane = $chosenProducer
         producerKnown = ($null -ne $chosenProducer); producerReceipt = $chosenReceipt
-        reason = $reason; warnings = @($warnings)
+        opusRounds = $opusRounds; reason = $reason; warnings = @($warnings)
     }
 }
 

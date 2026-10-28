@@ -385,10 +385,14 @@ class OwnershipProofIsMandatoryTests(unittest.TestCase):
 
 
 class PathnameDeleteCensusTests(unittest.TestCase):
-    def _hits(self) -> set[tuple[str, str]]:
+    def _hits(self, inject: dict[str, list[str]] | None = None) -> set[tuple[str, str]]:
+        """inject: file name -> extra source lines appended to that file's real text (negative controls only)."""
         found = set()
         for path in family_sources(".ps1", ".psm1"):
-            for line in strip_comments(path.read_bytes().decode("utf-8", errors="ignore")):
+            text = path.read_bytes().decode("utf-8", errors="ignore")
+            if inject and path.name in inject:
+                text += "\n" + "\n".join(inject[path.name]) + "\n"
+            for line in strip_comments(text):
                 if line and PATHNAME_DELETE.search(line):
                     found.add((path.name, line))
         return found
@@ -405,9 +409,25 @@ class PathnameDeleteCensusTests(unittest.TestCase):
         stale = sorted(set(PATHNAME_DELETE_ALLOWED) - self._hits())
         self.assertEqual(stale, [], "an exception no longer matches any line: delete it from PATHNAME_DELETE_ALLOWED")
 
+    def test_a_new_delete_in_the_core_partition_generator_is_still_caught(self) -> None:
+        # BACHELOR-CORE-PARTITION-AB-1 r13d (Dot 6459551437): the r13c stale-record removal is gone (no inventory entry was added for it),
+        # so the census must still flag it, an unrelated owner-path delete and a delete of the new status file in the same generator
+        generator = "playback-attr-3-cuda-job.ps1"
+        self.assertEqual(sorted(self._hits() - set(PATHNAME_DELETE_ALLOWED)), [])
+        for injected in (
+            "try { if (Test-Path -LiteralPath (Join-Path $Pub 'core-partition.json') -PathType Leaf) { Remove-Item -LiteralPath (Join-Path $Pub 'core-partition.json') -Force -ErrorAction Stop } }",
+            "Remove-Item -LiteralPath $ownerClipPath -Force",
+            "[IO.File]::Delete((Join-Path $Pub 'core-partition-unpublished.json'))",
+        ):
+            with self.subTest(line=injected):
+                self.assertEqual(sorted(self._hits({generator: [injected]}) - set(PATHNAME_DELETE_ALLOWED)), [(generator, injected)])
+        self.assertFalse(any(name == generator and "core-partition" in line for name, line in PATHNAME_DELETE_ALLOWED),
+                         "a core-partition artifact delete was inventoried; r13d publishes a typed status instead of removing a file")
+
 
 class RecursiveDeleteCensusTests(unittest.TestCase):
-    def _hits(self) -> set[tuple[str, str]]:
+    def _hits(self, inject: dict[str, list[str]] | None = None) -> set[tuple[str, str]]:
+        """inject: path relative to tools/profiling -> extra source lines appended to that file's real text (negative controls only)."""
         found = set()
         for path in sorted(PROFILING.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in RECURSIVE_SCANNED_SUFFIXES:
@@ -415,10 +435,11 @@ class RecursiveDeleteCensusTests(unittest.TestCase):
             if path.name.startswith("test_"):
                 continue  # Python tests build and clean their own synthetic temp trees
             relative = path.relative_to(PROFILING).as_posix()
+            extra = "\n" + "\n".join(inject[relative]) + "\n" if inject and relative in inject else ""
             if path.suffix.lower() == ".py":
-                lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                lines = (path.read_text(encoding="utf-8", errors="ignore") + extra).splitlines()
             else:
-                lines = strip_comments(path.read_bytes().decode("utf-8", errors="ignore"))
+                lines = strip_comments(path.read_bytes().decode("utf-8", errors="ignore") + extra)
             for line in lines:
                 stripped = line.strip()
                 if stripped and RECURSIVE_DELETE_RE.search(stripped):
@@ -437,6 +458,17 @@ class RecursiveDeleteCensusTests(unittest.TestCase):
     def test_every_allowlisted_recursive_delete_still_matches_a_line(self) -> None:
         stale = sorted(set(RECURSIVE_DELETE_ALLOWED) - self._hits())
         self.assertEqual(stale, [], "an exception no longer matches any line: delete it from RECURSIVE_DELETE_ALLOWED")
+
+    def test_an_extra_recursive_delete_site_is_still_caught(self) -> None:
+        # BACHELOR-CORE-PARTITION-AB-1 r13d negative control: one more recursive site in the core-partition generator, and an allowlisted
+        # line copied into a file it is not allowlisted for, are each flagged
+        generator = "bachelor/playback-attr-3-cuda-job.ps1"
+        for relative, injected in (
+            (generator, "Remove-Item -LiteralPath $Pub -Recurse -Force"),
+            (generator, "Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue"),
+        ):
+            with self.subTest(file=relative, line=injected):
+                self.assertEqual(sorted(self._hits({relative: [injected]}) - set(RECURSIVE_DELETE_ALLOWED)), [(relative, injected)])
 
     def test_the_scan_catches_every_spelling_it_claims_to(self) -> None:
         for line in (
