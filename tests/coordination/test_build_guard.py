@@ -2064,6 +2064,60 @@ def test_one_stderr_line_waits_at_most_the_bound_for_open_and_write_together() -
     assert second < 500, out
 
 
+@pytest.mark.parametrize("ending", ["return", "exit 7"])
+def test_a_line_queued_behind_a_late_open_is_written_when_the_guard_ends(box, ending) -> None:
+    # r7b (adversary 8d0c73bd-A1): the shim is missing, so the fail-open HEAVY_SLOT_WARN is the first line; the stderr open
+    # completes only during the action, after the admitted line, and the action logs nothing. Every queued line still reaches
+    # stderr when the guard ends, by return or by exit. The stream is an unbuffered file, so a line written before an exit
+    # is on disk afterwards.
+    out_file = box["dir"] / "stderr.bin"
+    memory = _write_json(box["dir"] / "memory.json", OK_MEMORY)
+    table = _write_json(box["dir"] / "table.json", [])
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n"
+                "$tcs = [System.Threading.Tasks.TaskCompletionSource[System.IO.Stream]]::new()\n"
+                "function New-BuildGuardStderrOpen { return $tcs.Task }\n"
+                "$script:BuildGuardLogWaitMs = 300\n"
+                f"$fs = [System.IO.FileStream]::new('{out_file}', 'Create', 'Write', 'Read', 1)\n"
+                f"$o = @{{ HeavySlotCmd = '{NO_HEAVY_SLOT}'; MemoryProbeFile = '{memory}'; ProcessTableFile = '{table}'; "
+                f"LockPath = '{box['lock']}'; MutexName = 'Local\\MLV-R7B-A1-{os.getpid()}'; ExemptLogPath = '{box['exempt_log']}' }}\n"
+                "Invoke-BuildGuard -Label t -Options $o -Action { param($Jobs) [void]$tcs.TrySetResult($fs); "
+                + ("" if ending == "return" else ending) + " }\n"
+                "Write-Output (\"queued={0} dropped={1}\" -f $script:BuildGuardLogBytes.Count, $script:BuildGuardLogDropped)\n"])
+    out = done.stdout + done.stderr
+    written = out_file.read_bytes().decode("ascii", "replace") if out_file.exists() else ""
+    if ending == "return":
+        assert done.returncode == 0, out
+        assert "queued=0 dropped=0" in done.stdout, out
+    else:
+        assert done.returncode == 7, out
+    warn = written.find("[build-guard] HEAVY_SLOT_WARN label=t shim=missing")
+    admitted = written.find("[build-guard] admitted label=t ")
+    assert warn >= 0 and admitted > warn, f"queued guard lines were never written: stderr={written!r} {out}"
+
+
+def test_a_stderr_that_cannot_be_opened_or_written_counts_every_line_it_drops() -> None:
+    # r7b (fable r6b note on :189-195): an open that faults takes no line, and a write that fails loses its line. Each one
+    # is counted in BuildGuardLogDropped, never left queued until the cap and lost silently.
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n"
+                "$tcs = [System.Threading.Tasks.TaskCompletionSource[System.IO.Stream]]::new()\n"
+                "[void]$tcs.TrySetException([System.IO.IOException]::new('no stderr'))\n"
+                "function New-BuildGuardStderrOpen { return $tcs.Task }\n"
+                "Write-BuildGuardLog 'one'; Write-BuildGuardLog 'two'; Write-BuildGuardLog 'three'\n"
+                "Complete-BuildGuardStderr\n"
+                "Write-Output (\"faulted-open queued={0} dropped={1}\" -f $script:BuildGuardLogBytes.Count, $script:BuildGuardLogDropped)\n"
+                "$ms = [System.IO.MemoryStream]::new(); $ms.Dispose()\n"
+                "$script:BuildGuardLogOpen = [System.Threading.Tasks.Task]::FromResult([System.IO.Stream]$ms)\n"
+                "$script:BuildGuardLogDropped = 0\n"
+                "Write-BuildGuardLog 'four'; Write-BuildGuardLog 'five'\n"
+                "Complete-BuildGuardStderr\n"
+                "Write-Output (\"failed-write pending={0} dropped={1}\" -f $script:BuildGuardLogPending.Count, $script:BuildGuardLogDropped)\n"])
+    out = done.stdout + done.stderr
+    assert "faulted-open queued=0 dropped=3" in done.stdout, out
+    assert "failed-write pending=0 dropped=2" in done.stdout, out
+
+
 def test_a_build_slot_release_never_throws_past_the_heavy_slot_stop(tmp_path) -> None:
     # r6b adversary A1 (pass 2): the build-slot mutex name is taken by another kernel object, so opening it throws. The release
     # stays inside its catch (a Library host with ErrorActionPreference=Stop sees no throw), and the before-action loss path

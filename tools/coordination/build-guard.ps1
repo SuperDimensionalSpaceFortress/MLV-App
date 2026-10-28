@@ -175,7 +175,8 @@ $script:HeavySlotGiveUpSlackMinutes = 15
 # $script:BuildGuardLogWaitMs per line, for the open and the write together. A stderr nobody drains costs one bounded wait; while a write is still pending, later
 # lines queue without waiting, at most $script:BuildGuardLogMaxPending of them (the rest are dropped and counted in
 # $script:BuildGuardLogDropped), so admission polling, the hung-tool bound and every release keep running. A drained stderr
-# has each line written before the guard goes on, as before.
+# has each line written before the guard goes on, as before. Lines still queued when the guard ends go out in
+# Complete-BuildGuardStderr, after every slot is given back (r7b); a line an open or a write failed on is counted as dropped.
 $script:BuildGuardLogWaitMs = 2000
 $script:BuildGuardLogMaxPending = 256
 $script:BuildGuardLogDropped = 0
@@ -193,15 +194,35 @@ function Send-BuildGuardStderrQueue {
     # Once the stream is open, every queued line goes out (WriteAsync, in order); returns the last write task, or $null.
     $open = $script:BuildGuardLogOpen
     if (-not $open -or -not $open.IsCompleted) { return $null }
+    $waiting = $script:BuildGuardLogBytes
+    if ($open.Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion -or $null -eq $open.Result) {
+        # A stderr that could not be opened takes no line: each one is counted as dropped, never lost silently (r7b, fable r6b note).
+        $script:BuildGuardLogDropped += $waiting.Count
+        $waiting.Clear()
+        return $null
+    }
     $stream = $open.Result
     $task = $null
-    $waiting = $script:BuildGuardLogBytes
     while ($waiting.Count -gt 0) {
         $bytes = $waiting.Dequeue()
-        $task = $stream.WriteAsync($bytes, 0, $bytes.Length)
+        try { $task = $stream.WriteAsync($bytes, 0, $bytes.Length) } catch { $script:BuildGuardLogDropped++; continue }
         $script:BuildGuardLogPending.Enqueue($task)
     }
     return $task
+}
+
+function Wait-BuildGuardStderrTask($Task, $Clock) {
+    # Waits for one open or write task, at most what is left of $script:BuildGuardLogWaitMs on $Clock; a faulted task never throws.
+    $left = [int][math]::Max(0, $script:BuildGuardLogWaitMs - $Clock.ElapsedMilliseconds)
+    [void][System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($Task), $left)
+}
+
+function Clear-BuildGuardStderrDone {
+    # Finished writes leave the pending queue; one that failed lost its line, which is counted as dropped (r7b).
+    $q = $script:BuildGuardLogPending
+    while ($q.Count -gt 0 -and $q.Peek().IsCompleted) {
+        if ($q.Dequeue().Status -ne [System.Threading.Tasks.TaskStatus]::RanToCompletion) { $script:BuildGuardLogDropped++ }
+    }
 }
 
 function Write-BuildGuardStderr([string]$Line) {
@@ -213,16 +234,33 @@ function Write-BuildGuardStderr([string]$Line) {
         # Lines queued while the open was still pending go out before the capacity check, so a stderr that recovers gets
         # them and every later line instead of dropping all of them (r6b adversary A1).
         [void](Send-BuildGuardStderrQueue)
-        while ($q.Count -gt 0 -and $q.Peek().IsCompleted) { [void]$q.Dequeue() }
+        Clear-BuildGuardStderrDone
         if ($q.Count + $waiting.Count -ge $script:BuildGuardLogMaxPending) { $script:BuildGuardLogDropped++; return }
         $waiting.Enqueue([Console]::OutputEncoding.GetBytes($Line + [Environment]::NewLine))
         # Stalled: an earlier line (or the open) is still pending, so this one only queues behind it.
         $stalled = $q.Count -gt 0 -or ($script:BuildGuardLogOpen -and -not $script:BuildGuardLogOpen.IsCompleted)
         if (-not $script:BuildGuardLogOpen) { $script:BuildGuardLogOpen = New-BuildGuardStderrOpen }
         $open = $script:BuildGuardLogOpen
-        if (-not $stalled -and -not $open.IsCompleted) { [void]$open.Wait([int][math]::Max(0, $script:BuildGuardLogWaitMs - $clock.ElapsedMilliseconds)) }
+        if (-not $stalled -and -not $open.IsCompleted) { Wait-BuildGuardStderrTask $open $clock }
         $task = Send-BuildGuardStderrQueue
-        if (-not $stalled -and $task) { [void]$task.Wait([int][math]::Max(0, $script:BuildGuardLogWaitMs - $clock.ElapsedMilliseconds)) }
+        if (-not $stalled -and $task) { Wait-BuildGuardStderrTask $task $clock }
+    } catch { }
+}
+
+function Complete-BuildGuardStderr {
+    # r7b (adversary 8d0c73bd-A1): a line can still be queued when the guard is done, because its open completed after the
+    # last line was logged and no later line sent it (a fail-open warning before a quiet action, say). Invoke-BuildGuard
+    # calls this last, in its outermost finally, after both slots are given back, on every way out (an exit included): the
+    # queue goes out and the guard waits for it, at most $script:BuildGuardLogWaitMs in all, the open and the writes together.
+    # A stderr still not open after that keeps its lines queued (a later line sends them); one that failed counts them dropped.
+    try {
+        $open = $script:BuildGuardLogOpen
+        if (-not $open) { return }
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        if ($script:BuildGuardLogBytes.Count -gt 0 -and -not $open.IsCompleted) { Wait-BuildGuardStderrTask $open $clock }
+        [void](Send-BuildGuardStderrQueue)
+        foreach ($t in @($script:BuildGuardLogPending.ToArray())) { Wait-BuildGuardStderrTask $t $clock }
+        Clear-BuildGuardStderrDone
     } catch { }
 }
 
@@ -781,7 +819,8 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     $stopSent = $false
     # The cleanup try begins at the first statement after the launch, so nothing between them can skip its finally.
     try {
-        Write-BuildGuardLog ('heavy-slot: waiting label={0} wait={1}m exit-file={2} shim={3}' -f $lease.Label, $Options.HeavySlotWaitMinutes, $lease.ExitFile, $cmd)
+        # The wait printed is the one heavy-slot was given, never the raw option (fable r6b note).
+        Write-BuildGuardLog ('heavy-slot: waiting label={0} wait={1} exit-file={2} shim={3}' -f $lease.Label, $waitArg, $lease.ExitFile, $cmd)
         while ($true) {
             Send-HeavySlotLines $lease
             # The ready file admits only while the holder it names still runs (checked after the file is seen, and again below).
@@ -967,7 +1006,8 @@ function Invoke-BuildGuard {
             Remove-BuildSlot $ticket
         }
     } finally {
-        Exit-HeavySlot $heavy
+        # Queued guard lines go out last, once nothing is held (r7b, adversary 8d0c73bd-A1).
+        try { Exit-HeavySlot $heavy } finally { Complete-BuildGuardStderr }
     }
 }
 
