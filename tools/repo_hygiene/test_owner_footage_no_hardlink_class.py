@@ -216,6 +216,10 @@ _LINK_NAME_RE = re.compile(
 # reflection lookup anywhere (GetMethod("NtSet" + "InformationFile", ...).Invoke(..., 11) needs no declaration or call the census counts) and a string literal
 # joined to another inside a payload (a name built from pieces) are each a violation; the census below then also runs on the text with every escape resolved.
 _CS_ESCAPE_RE = re.compile(r"\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8}")
+# r14 (Dot on 3e52cb20, HARDLINK-CENSUS-LITERAL-FORMAT-CHAR-1): C# drops a formatting (Cf) character from an identifier, so a LITERAL U+200C inside
+# NtSet<ZWNJ>InformationFile binds the counted native while no regex here sees the name. The saver is ASCII-only, so ANY code point above 127 anywhere
+# (comment, string or Add-Type payload) FAILS CLOSED; that covers every Cf character and identifier look-alike in one rule, with no normalization.
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7F]")
 _ADD_TYPE_PAYLOAD_RE = re.compile(r"Add-Type\b[^\n]*?@(['\"])\r?\n(?P<body>.*?)\r?\n\1@", re.DOTALL)
 _VERBATIM_IDENTIFIER_RE = re.compile(r"(?<![\w\"'])@[A-Za-z_]")
 _REFLECTION_RE = re.compile(
@@ -292,6 +296,8 @@ def _native_census(text: str, pattern: re.Pattern, declaration: str, class_at: i
 
 def lane_dirty_save_violations(text: str) -> list[str]:
     violations = []
+    for match in _NON_ASCII_RE.finditer(text):
+        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a non-ASCII character: U+{ord(match.group(0)):04X}")
     for match in _CS_ESCAPE_RE.finditer(text):
         violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: an escaped identifier character: {match.group(0)}")
     for match in _REFLECTION_RE.finditer(text):
@@ -416,6 +422,35 @@ class NoHardLinkCreationTests(unittest.TestCase):
             with self.subTest(mutant=name):
                 self.assertNotEqual(mutant, text, "the mutant did not apply")
                 self.assertTrue(lane_dirty_save_violations(mutant), f"the census missed: {name}")
+
+    def test_the_lane_dirty_saver_census_rejects_a_literal_non_ascii_character(self) -> None:
+        # r14 (Dot on 3e52cb20, HARDLINK-CENSUS-LITERAL-FORMAT-CHAR-1): C# removes a Cf character from an identifier, so each literal below binds the counted
+        # native beside the original declaration and class-10 call while the name regex sees nothing. Built with chr() so this file stays ASCII.
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        call = re.search(r"NtSetInformationFile\(h, out io, info, \(uint\)size, 10\);", text).group(0)
+
+        def extra(name: str, info_class: str) -> str:
+            return text.replace(call, call + f"\n{name}(h, out io, info, (uint)size, {info_class});")
+
+        mutants = {
+            "a literal ZWNJ extra call with class 11": (extra("NtSet" + chr(0x200C) + "InformationFile", "11"), 0x200C),
+            "a literal ZWNJ extra call with class 10": (extra("NtSet" + chr(0x200C) + "InformationFile", "10"), 0x200C),
+            "a literal ZWJ in the name": (extra("NtSet" + chr(0x200D) + "InformationFile", "11"), 0x200D),
+            "a literal soft hyphen in the name": (extra("NtSet" + chr(0x00AD) + "InformationFile", "11"), 0x00AD),
+            "a literal U+FEFF in the name": (extra("NtSet" + chr(0xFEFF) + "InformationFile", "11"), 0xFEFF),
+            "a non-ASCII character in a comment only": (text.replace(call, call + " // caf" + chr(0x00E9)), 0x00E9),
+        }
+        for name, (mutant, code_point) in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertNotEqual(mutant, text, "the mutant did not apply")
+                line = mutant.count("\n", 0, mutant.index(chr(code_point))) + 1
+                self.assertIn(f"{line}: a non-ASCII character: U+{code_point:04X}", lane_dirty_save_violations(mutant), f"the census missed: {name}")
+        # control: an ASCII renamed extra call is still caught by the spelling rule, and is not reported as non-ASCII
+        ascii_rename = extra("NtSetInformationFileX", "11")
+        violations = lane_dirty_save_violations(ascii_rename)
+        self.assertTrue(any("a spelling other than NtSetInformationFile" in v for v in violations), violations)
+        self.assertFalse(any("non-ASCII" in v for v in violations), violations)
+        self.assertEqual(sum(byte > 127 for byte in THIS_FILE.read_bytes()), 0, "this test file must stay ASCII")
 
     def test_every_named_hard_link_exception_still_matches(self) -> None:
         present = {path.relative_to(ROOT).as_posix() for path in _tool_sources() if hard_link_hits(path)}
