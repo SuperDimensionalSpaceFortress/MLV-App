@@ -3867,7 +3867,7 @@ def test_save_dirty_worktree_evidence_reapply_command_survives_apply_whitespace_
     git(wt, "config", "core.whitespace", "trailing-space")
     (wt / "src" / "a.txt").write_bytes(b"two   \n")
     out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
-    saved = re.search(r" reapply=(git -C .+)$", out.stdout.strip())
+    saved = re.search(r" reapply=(& \{ .+)$", out.stdout.strip())
     assert out.stdout.startswith("DIRTY_TREE_SAVED") and saved, (out.stdout, out.stderr)
     git(wt, "checkout", "--", "src/a.txt")
     again = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", saved.group(1)], text=True, capture_output=True)
@@ -3884,11 +3884,205 @@ def test_save_dirty_worktree_evidence_reapply_command_survives_an_inherited_git_
         (wt / "src" / "a.txt").write_text("two\n")
         out = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command",
                               f". '{DIRTY_SAVE_LIB}'; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1"], text=True, capture_output=True, env=env)
-        saved = re.search(r" reapply=(git -C .+)$", out.stdout.strip())
+        saved = re.search(r" reapply=(& \{ .+)$", out.stdout.strip())
         assert out.stdout.startswith("DIRTY_TREE_SAVED") and saved, (inherited, out.stdout, out.stderr)
         git(wt, "checkout", "--", "src/a.txt")
         again = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", saved.group(1)], text=True, capture_output=True, env=env)
         assert again.returncode == 0 and (wt / "src" / "a.txt").read_text().replace("\r\n", "\n") == "two\n", (inherited, saved.group(1), again.stdout, again.stderr)
+
+
+# r13 (sol r12 B2): the advertised command clears every repository-selecting GIT_* variable for its one git call, so it also works pasted where the saver put an
+# inherited GIT_COMMON_DIR back (that variable beats --git-dir and has no option of its own; the old command exited 128).
+_DIRTY_REAPPLY_RE = r" reapply=(& \{ .+)$"
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_reapply_command_survives_an_inherited_git_common_dir(tmp_path):
+    wt, dest = _dirty_save_repo(tmp_path)
+    for inherited in ({"GIT_COMMON_DIR": str(tmp_path / "missing-common-dir")},
+                      {"GIT_COMMON_DIR": str(tmp_path / "missing-common-dir"), "GIT_DIR": str(tmp_path / "missing-git-dir"), "GIT_WORK_TREE": str(tmp_path)}):
+        env = dict(os.environ, **inherited)
+        (wt / "src" / "a.txt").write_text("two\n")
+        out = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command",
+                              f". '{DIRTY_SAVE_LIB}'; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1"], text=True, capture_output=True, env=env)
+        saved = re.search(_DIRTY_REAPPLY_RE, out.stdout.strip())
+        assert out.stdout.startswith("DIRTY_TREE_SAVED") and saved, (inherited, out.stdout, out.stderr)
+        git(wt, "checkout", "--", "src/a.txt")
+        again = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", saved.group(1) + "; exit $LASTEXITCODE"], text=True, capture_output=True, env=env)
+        assert again.returncode == 0 and (wt / "src" / "a.txt").read_text().replace("\r\n", "\n") == "two\n", (inherited, saved.group(1), again.stdout, again.stderr)
+        # the paster's own variables are put back after the one call
+        probe = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", saved.group(1).replace("apply --whitespace", "apply --check -R --whitespace")
+                                + "; Write-Output \"after=$env:GIT_COMMON_DIR\""], text=True, capture_output=True, env=env)
+        assert probe.stdout.strip().splitlines()[-1] == "after=" + inherited["GIT_COMMON_DIR"], (probe.stdout, probe.stderr)
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_staged_only_save_advertises_the_staged_diff_not_an_empty_patch(tmp_path):
+    # r13 (sol r12 B2): HEAD and working a.txt='one', index 'two' -> the main patch is empty and the old line advertised applying it (git apply: exit 128).
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "add", "src/a.txt")
+    (wt / "src" / "a.txt").write_text("one\n")
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVED") and " bytes=0 " in line, (out.stdout, out.stderr)
+    staged = re.search(r" staged=(.+?\.diff) ", line).group(1)
+    saved = re.search(_DIRTY_REAPPLY_RE, line)
+    assert saved and staged in saved.group(1) and "apply --cached" in saved.group(1), line
+    git(wt, "reset", "-q")
+    assert git(wt, "diff", "--cached") == ""
+    again = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", saved.group(1) + "; exit $LASTEXITCODE"], text=True, capture_output=True)
+    assert again.returncode == 0, (saved.group(1), again.stdout, again.stderr)
+    assert "+two" in git(wt, "diff", "--cached"), "the staged change must be back in the index"
+    assert (wt / "src" / "a.txt").read_text().replace("\r\n", "\n") == "one\n"
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_untracked_only_save_names_the_untracked_set_not_an_empty_patch(tmp_path):
+    # r13 (sol r12 B2): only an untracked orphan -> an empty main patch, and the old line advertised applying it (exit 128). Their content is not saved, so the
+    # line names the status file that lists them instead of a command.
+    wt, dest = _dirty_save_repo(tmp_path)
+    git(wt, "checkout", "--", "src/a.txt")
+    (wt / "orphan.txt").write_text("orphan\n")
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    line = out.stdout.strip()
+    assert line.startswith("DIRTY_TREE_SAVED") and " bytes=0 " in line, (out.stdout, out.stderr)
+    status = re.search(r" status=(.+?\.status\.txt) ", line).group(1)
+    assert line.endswith(f" reapply=none untracked={status}"), line
+    assert "apply" not in line.split(" reapply=", 1)[1]
+    assert "?? orphan.txt" in Path(status).read_text(encoding="utf-8")
+
+
+_DIRTY_REUSE_SITES = {
+    "patch": (r"^dirty-worktree-[0-9a-f]{8}\.patch$", "patch", r"\.patch"),
+    "status": (r"^dirty-worktree-[0-9a-f]{8}\.status\.txt$", "status", r"\.txt"),
+    "staged": (r"^dirty-worktree-staged-[0-9a-f]{8}\.diff$", "staged", r"\.diff"),
+    "merge-state": (r"^dirty-worktree-merge-state-[0-9a-f]{8}\.txt$", "merge-state", r"\.txt"),
+}
+
+
+def _dirty_reuse_fixture(tmp_path, site):
+    wt, dest = _dirty_save_repo(tmp_path)
+    if site == "staged":
+        git(wt, "add", "src/a.txt")
+        (wt / "src" / "a.txt").write_text("three\n")
+    if site == "merge-state":
+        _leave_a_conflicted_merge(wt)
+    first = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1")
+    target = [p for p in dest.iterdir() if re.search(_DIRTY_REUSE_SITES[site][0], p.name)]
+    assert len(target) == 1, (first.stdout, first.stderr, sorted(p.name for p in dest.iterdir()))
+    return wt, dest, target[0]
+
+
+@dirty_save_only
+@pytest.mark.parametrize("site", sorted(_DIRTY_REUSE_SITES))
+def test_save_dirty_worktree_evidence_holds_a_reused_name_from_its_digest_to_the_cleanup(tmp_path, site):
+    # r13 (sol r12 B1 = e0c1acf9-A1, card LANE-DIRTY-SAVE-DIGEST-HANDLE-RETAIN-1): an occupied name holding the same bytes was reused on a digest whose handle had
+    # already closed, so the name could be swapped (a link to the temp, which the cleanup then deleted; or other bytes) between the digest and the reuse, and the swap
+    # was reported as the evidence. The digest's handle is now held (no write, rename or delete sharing) through the decision and the cleanup. Every evidence site
+    # (patch, status, merge-state, staged) reuses through the same branch: right after the digest of the occupied name, the shim renames it away and puts other
+    # bytes there. That swap must be refused, and the name the line reports must still hold the bytes the first save placed.
+    wt, dest, target = _dirty_reuse_fixture(tmp_path, site)
+    original = target.read_bytes()
+    shim = ("$script:RealDigest = ${function:Get-DirtyRegularDigest}; $script:Swap = 'not-reached'; "
+            "function Get-DirtyRegularDigest { $d = & $script:RealDigest @args; "
+            f"if ($script:Swap -eq 'not-reached' -and [System.IO.Path]::GetFileName([string]$args[0]) -eq '{target.name}') {{ "
+            f"try {{ [System.IO.File]::Move('{target}', '{target}.old'); [System.IO.File]::WriteAllText('{target}', 'SWAPPED'); $script:Swap = 'swapped' }} "
+            "catch { $script:Swap = 'denied' } }; $d }")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r2; Write-Output \"swap=$script:Swap\"")
+    lines = out.stdout.strip().splitlines()
+    assert lines[-1] in ("swap=denied", "swap=swapped"), (out.stdout, out.stderr)
+    line = lines[0]
+    _, key, ext = _DIRTY_REUSE_SITES[site]
+    reported = re.search(rf" {key}=(.+?{ext})(?: |$)", line)
+    assert reported, (out.stdout, out.stderr)
+    if Path(reported.group(1)).name == target.name:
+        assert target.read_bytes() == original, ("the reused name was swapped after its digest and reported as the evidence", line)
+    assert lines[-1] == "swap=denied", ("the reused name was not held from its digest on", out.stdout)
+    assert not list(dest.glob("*.tmp")), sorted(p.name for p in dest.iterdir())
+
+
+@dirty_save_only
+@pytest.mark.parametrize("site", sorted(_DIRTY_REUSE_SITES))
+def test_save_dirty_worktree_evidence_still_reuses_identical_evidence_and_leaves_no_temp(tmp_path, site):
+    # r13 control for the hold above: an unswapped second save over unchanged work reuses every name, adds no sibling and leaves no temp behind.
+    wt, dest, target = _dirty_reuse_fixture(tmp_path, site)
+    before = sorted(p.name for p in dest.iterdir())
+    out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r2")
+    line = out.stdout.strip()
+    _, key, ext = _DIRTY_REUSE_SITES[site]
+    reported = re.search(rf" {key}=(.+?{ext})(?: |$)", line)
+    assert reported and Path(reported.group(1)).name == target.name, (out.stdout, out.stderr)
+    assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=unmerged-index " if site == "merge-state" else "DIRTY_TREE_SAVED"), line
+    assert sorted(p.name for p in dest.iterdir()) == before, "a reuse must add nothing and leave no temp"
+
+
+_DIRTY_OVERLAP_SCRIPT = r"""
+$lib = 'LIB'
+function Start-Saver([string]$Wt, [string]$Dest, $Paused, $Go) {
+    $rs = [runspacefactory]::CreateRunspace(); $rs.Open()
+    $rs.SessionStateProxy.SetVariable('Paused', $Paused); $rs.SessionStateProxy.SetVariable('Go', $Go)
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    $null = $ps.AddScript(". '$lib'; `$global:n = 0; function Invoke-DirtyDestCheckpoint([string]`$Stage) { if (`$Stage -eq 'before-write' -and `$global:n -eq 0) { `$global:n = 1; `$Paused.Set(); `$null = `$Go.Wait(120000) } }; Save-DirtyWorktreeEvidence -Wt '$Wt' -Dest '$Dest' -CardName X -RoundName r1")
+    return @{ PS = $ps; Async = $ps.BeginInvoke() }
+}
+$aP = [System.Threading.ManualResetEventSlim]::new($false); $aG = [System.Threading.ManualResetEventSlim]::new($false)
+$bP = [System.Threading.ManualResetEventSlim]::new($false); $bG = [System.Threading.ManualResetEventSlim]::new($false)
+$a = Start-Saver 'WTA' 'DESTA' $aP $aG
+if (-not $aP.Wait(120000)) { 'A never reached its first before-write check' }
+$b = Start-Saver 'WTB' 'DESTB' $bP $bG
+$which = [System.Threading.WaitHandle]::WaitAny(@($bP.WaitHandle, $b.Async.AsyncWaitHandle), 120000)
+'b-state=' + $(if ($which -eq 0) { 'paused-holding-its-pins' } elseif ($which -eq 1) { 'returned' } else { 'timeout' })
+$aG.Set()
+'A=' + (@($a.PS.EndInvoke($a.Async)) -join '|')
+$bG.Set()
+'B=' + (@($b.PS.EndInvoke($b.Async)) -join '|')
+"""
+
+
+def _two_dirty_repos(tmp_path):
+    (tmp_path / "A").mkdir()
+    (tmp_path / "B").mkdir()
+    wt_a, dest_a = _dirty_save_repo(tmp_path / "A")
+    wt_b, dest_b = _dirty_save_repo(tmp_path / "B")
+    (wt_b / "src" / "a.txt").write_text("bee\n")
+    return wt_a, dest_a, wt_b, dest_b
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_refuses_a_second_save_overlapping_in_the_same_process(tmp_path):
+    # r13 (sol r12 B4): the saver pins GIT_DIR / GIT_COMMON_DIR / GIT_WORK_TREE in the process environment. Save A pauses at its first before-write check (pins set);
+    # save B starts in another runspace of the same process. On e0c1acf9 B reached its own check holding B's pins, A resumed and its git calls read B while its
+    # guards still checked A: A reported B's '+bee' as its evidence. B now refuses at entry (concurrent-save-in-process), before any change, and A saves its own work.
+    wt_a, dest_a, wt_b, dest_b = _two_dirty_repos(tmp_path)
+    script = (_DIRTY_OVERLAP_SCRIPT.replace("LIB", str(DIRTY_SAVE_LIB)).replace("WTA", str(wt_a)).replace("DESTA", str(dest_a))
+              .replace("WTB", str(wt_b)).replace("DESTB", str(dest_b)))
+    out = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", script], text=True, capture_output=True, timeout=600)
+    lines = out.stdout.strip().splitlines()
+    a_line = next((x[2:] for x in lines if x.startswith("A=")), "")
+    b_line = next((x[2:] for x in lines if x.startswith("B=")), "")
+    patch = re.search(r" patch=(.+?\.patch) ", a_line)
+    assert a_line.startswith("DIRTY_TREE_SAVED card=X ") and patch, (out.stdout, out.stderr)
+    text = Path(patch.group(1)).read_text(encoding="utf-8")
+    assert "+two" in text and "+bee" not in text, ("save A published another repository's evidence", text, out.stdout)
+    assert b_line == "DIRTY_TREE_SAVE_FAILED card=X reason=concurrent-save-in-process", (out.stdout, out.stderr)
+    assert "b-state=returned" in lines, out.stdout
+    assert not list(dest_b.iterdir()), "the refused save must write nothing"
+
+
+@dirty_save_only
+def test_save_dirty_worktree_evidence_runs_two_sequential_saves_in_one_process(tmp_path):
+    # r13 control for the gate above: one process saving two repositories one after the other saves both, each with its own work, and leaves the caller's env alone.
+    wt_a, dest_a, wt_b, dest_b = _two_dirty_repos(tmp_path)
+    env = dict(os.environ, GIT_COMMON_DIR=str(tmp_path / "callers-common-dir"))
+    out = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command",
+                          f". '{DIRTY_SAVE_LIB}'; Save-DirtyWorktreeEvidence -Wt '{wt_a}' -Dest '{dest_a}' -CardName A -RoundName r1; "
+                          f"Save-DirtyWorktreeEvidence -Wt '{wt_b}' -Dest '{dest_b}' -CardName B -RoundName r1; Write-Output \"env=$env:GIT_COMMON_DIR\""],
+                         text=True, capture_output=True, env=env)
+    lines = out.stdout.strip().splitlines()
+    assert len(lines) == 3 and lines[0].startswith("DIRTY_TREE_SAVED card=A ") and lines[1].startswith("DIRTY_TREE_SAVED card=B "), (out.stdout, out.stderr)
+    assert "+two" in Path(re.search(r" patch=(.+?\.patch) ", lines[0]).group(1)).read_text(encoding="utf-8")
+    assert "+bee" in Path(re.search(r" patch=(.+?\.patch) ", lines[1]).group(1)).read_text(encoding="utf-8")
+    assert lines[2] == "env=" + str(tmp_path / "callers-common-dir")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="an SMB share spelling is a Windows namespace")
@@ -3987,7 +4181,7 @@ def test_save_dirty_worktree_evidence_reapply_command_survives_dollar_signs_and_
     dest = base / "r$round"
     dest.mkdir()
     out = dirty_save_pwsh(f"Save-DirtyWorktreeEvidence -Wt '{str(wt).replace(chr(39), chr(39) * 2)}' -Dest '{str(dest).replace(chr(39), chr(39) * 2)}' -CardName C1 -RoundName r1")
-    saved = re.search(r" reapply=(git -C .+)$", out.stdout.strip())
+    saved = re.search(r" reapply=(& \{ .+)$", out.stdout.strip())
     assert out.stdout.startswith("DIRTY_TREE_SAVED") and saved, out.stdout + out.stderr
     git(wt, "checkout", "--", "src/a.txt")
     again = subprocess.run([DIRTY_SAVE_PWSH, "-NoProfile", "-NonInteractive", "-Command", saved.group(1)], text=True, capture_output=True)

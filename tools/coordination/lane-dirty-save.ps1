@@ -6,7 +6,8 @@
 #                                      untracked set for the same patch is kept beside it as dirty-worktree-<sha8>.status-<status sha8>.txt
 #   dirty-worktree-staged-<sha8>.diff  git diff --cached --binary, only when something is staged (covers staged work the working tree no longer has)
 #   dirty-worktree-merge-state-<sha8>.txt  MERGE_HEAD / CHERRY_PICK_HEAD / REVERT_HEAD and `git ls-files -u`, only when the index is unmerged (see below)
-# It RETURNS one line (the caller prints it): DIRTY_TREE_SAVED ... staged=<path|none> verified=reverse-apply-ok|empty-diff|reverse-apply-FAILED reapply=<command>, or DIRTY_TREE_SAVE_FAILED reason=<why>.
+# It RETURNS one line (the caller prints it): DIRTY_TREE_SAVED ... staged=<path|none> verified=reverse-apply-ok|empty-diff|reverse-apply-FAILED reapply=<command|none untracked=<status>>
+# (Get-DirtyReapplyCommand), or DIRTY_TREE_SAVE_FAILED reason=<why>. One save runs at a time per process (reason=concurrent-save-in-process otherwise).
 # A staged diff that cannot be written whole (git exit, empty or truncated file, no `git apply --cached --check -R` against the index) is DIRTY_TREE_SAVE_FAILED, never SAVED; no evidence name is ever overwritten.
 # An unmerged index (a lane that died mid `git merge`) has no staged diff to write: `git diff --cached` prints only '* Unmerged path <file>' and exits 0. That state is recorded in the merge-state file and the
 # line is DIRTY_TREE_SAVE_FAILED reason=unmerged-index. Every DIRTY_TREE_SAVE_FAILED that comes after evidence was placed ends with the files already there: patch=<path> status=<path> merge-state=<path>,
@@ -33,7 +34,9 @@
 # hub-autopilot\dispatch-fix-round.ps1; keep the two in step.
 # Moves $Tmp to <Dir>\<Stem><first 8|16|32|64 hex of $Full><Ext> and returns @{ Path; Id; Moved }, or @{ Path = $null; Reason } when it cannot place it (below).
 # The move fails rather than overwrites, so an occupied name is compared by hash (same bytes = reuse, anything else = lengthen the name) and never clobbered.
-# When the name already holds these exact bytes, $Tmp is left for the caller's cleanup. A non-empty $FirstName is tried before the hash-derived names.
+# When the name already holds these exact bytes it is reused: the result then carries ReuseHold (the open handle those bytes were hashed through, which the caller
+# keeps until after its cleanup and releases with Unlock-DirtyDirectory) and ReuseId, and a -Hold temp is deleted at once (r13, sol r12 B1); without -Hold, $Tmp is
+# left for the caller's cleanup. A non-empty $FirstName is tried before the hash-derived names.
 # It always returns a hashtable: Path is the placed (or reused) file, or $null with Reason = name-collision (every length is taken by a DIFFERENT file) or
 # move-failed:<HResult> <message> (the move threw, and not an IOException over an existing target: a sharing violation, an AV lock or access denied on $Tmp, not a name clash).
 # A file moved into place whose bytes cannot be proven to hash to $Full comes back as Path = $null, Placed = <that file> and Reason = evidence-changed-before-publish:<file>
@@ -60,10 +63,19 @@ function Invoke-DirtyFileMove([string]$From, [string]$To, $DirHandle = $null, [s
 # -Hold is the caller's New-DirtyHeldTemp record for $Tmp: right before the move the held file must still have one name, the hold is released (a held file cannot be
 # renamed), and the file moved into place must be that file (same volume serial + file index, one name); otherwise Placed = <it> and Reason = evidence-identity-changed:<it> (r10, sol r9 B3).
 # "<identity>/<links>|<sha256>" of a regular file at $Path read through one handle that never follows a link (inside the held directory when -DirHandle is a handle); $null otherwise.
-function Get-DirtyRegularDigest([string]$Path, $DirHandle = $null) {
+# Given -Held ([ref]), the handle the digest was read through is left open and returned there ($null when none): sharing READ only, it keeps the file from being
+# written, renamed or deleted until Unlock-DirtyDirectory (r13, sol r12 B1).
+function Get-DirtyRegularDigest([string]$Path, $DirHandle = $null, $Held = $null) {
     if (-not ('DirtyFinalPath' -as [type])) { $null = Get-DirtyKernelPath $Path }  # defines the type on Windows
     if ('DirtyFinalPath' -as [type]) {
-        try { return [DirtyFinalPath]::RegularFileDigest($(if ($DirHandle -is [IntPtr]) { $DirHandle } else { [IntPtr]::Zero }), $Path) } catch { return $null }
+        try {
+            $dir = $(if ($DirHandle -is [IntPtr]) { $DirHandle } else { [IntPtr]::Zero })
+            if ($Held -isnot [ref]) { return [DirtyFinalPath]::RegularFileDigest($dir, $Path) }
+            $h = [IntPtr]::Zero
+            $digest = [DirtyFinalPath]::RegularFileDigestHeld($dir, $Path, [ref]$h)
+            $Held.Value = $(if ($h -ne [IntPtr]::Zero) { $h } else { $null })
+            return $digest
+        } catch { return $null }
     }
     # No handle API off Windows; the saver itself refuses there (no-directory-hold-on-this-platform), and only a direct call of the placement helper reaches this.
     try {
@@ -100,11 +112,25 @@ function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem,
                 # An occupied name that cannot be read is not proven to hold these bytes, so the next length is tried (r8, adversary 98e161fc-A3 sibling :48: the hash used to throw out of the helper).
                 # Only a regular file that is not the temp itself is reused: a link at the name (refused by Get-DirtyRegularDigest) or the temp under a second name would be
                 # gone, or emptied of its only other name, once the caller's cleanup deletes the temp (r11 iter 1, adversary 6fa0fae3-A1).
-                $digest = $null
-                try { if (Test-Path -LiteralPath $cand -PathType Leaf) { $digest = Get-DirtyRegularDigest $cand $DirHandle } } catch { $digest = $null }
+                # The handle the digest was read through stays open (sharing READ only) from the digest through the reuse decision to the end of the save, so the name
+                # cannot be swapped for a link to the temp, or for other bytes, once these are approved; the caller re-checks it before SAVED and releases it after
+                # its cleanup (ReuseHold). Only a file with one name is reused, and the temp is deleted here, while the reused file is held and proven not to be it
+                # (r13, sol r12 B1 = e0c1acf9-A1: the digest's handle closed first, and a link swapped in after it was reported, then emptied by the cleanup).
+                $digest = $null; $reuseHold = $null
+                try { if (Test-Path -LiteralPath $cand -PathType Leaf) { $digest = Get-DirtyRegularDigest $cand $DirHandle ([ref]$reuseHold) } } catch { $digest = $null }
                 $held = if ($digest) { $digest.Split('|')[1] } else { $null }
-                $isTemp = $Hold -and $digest -and $digest.Split('/')[0] -ceq $Hold.Id
-                if ($held -ceq $Full -and -not $isTemp) { return @{ Path = $cand; Placed = $null; Id = $pair[1]; Moved = $false } }
+                $reuseId = if ($digest) { $digest.Split('|')[0] } else { '' }
+                $isTemp = $Hold -and $digest -and $reuseId.Split('/')[0] -ceq $Hold.Id
+                $holdable = [bool]('DirtyFinalPath' -as [type])  # no handle API off Windows: the saver refuses there before any placement
+                if ($held -ceq $Full -and -not $isTemp -and $reuseId.EndsWith('/1') -and ($null -ne $reuseHold -or -not $holdable)) {
+                    if ($Hold) { Remove-DirtyTemp $Hold }
+                    if ($null -ne $reuseHold -and [DirtyFinalPath]::HandleFileIdentity([IntPtr]$reuseHold) -cne $reuseId) {
+                        Unlock-DirtyDirectory $reuseHold
+                        return @{ Path = $null; Placed = $null; Reason = "evidence-identity-changed:$cand" }
+                    }
+                    return @{ Path = $cand; Placed = $null; Id = $pair[1]; Moved = $false; ReuseHold = $reuseHold; ReuseId = $reuseId }
+                }
+                Unlock-DirtyDirectory $reuseHold
                 continue
             }
             # Placed. The bytes published must be the bytes validated: a temp file rewritten after its checks would otherwise be placed and reported (r7 iter 2, adversary 43a1998e-A1).
@@ -335,18 +361,32 @@ public static class DirtyFinalPath {
     // given. Sharing READ only, so the bytes cannot change while they are hashed (r11 iter 1, adversary 6fa0fae3-A1: a symbolic link at an occupied name, to the temp
     // itself, hashed equal through the link and was reused, and the temp cleanup then deleted what the reported patch named).
     public static string RegularFileDigest(IntPtr dir, string path) {
+        IntPtr held;
+        string digest = RegularFileDigestHeld(dir, path, out held);
+        if (held != IntPtr.Zero) CloseHandle(held);
+        return digest;
+    }
+    // RegularFileDigest that keeps the handle it hashed through open and returns it in held (IntPtr.Zero with a null digest): sharing READ only, so while it is held
+    // nobody can write, rename or delete that file, and a name reused on this digest keeps naming these bytes until Unpin (r13, sol r12 B1: the digest's handle was
+    // closed before the reuse decision, and a symbolic link to the temp swapped onto the name in between was reported as the evidence, then emptied by the cleanup).
+    public static string RegularFileDigestHeld(IntPtr dir, string path, out IntPtr held) {
         int error; IntPtr h;
+        held = IntPtr.Zero;
         if (dir != IntPtr.Zero) h = OpenIn(dir, System.IO.Path.GetFileName(path), 0x80000000, 1, 1, out error);
         else { h = CreateFileW(Long(path), 0x80000000, 1, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero); if (h == (IntPtr)(-1)) h = IntPtr.Zero; }
         if (h == IntPtr.Zero) return null;
-        using (Microsoft.Win32.SafeHandles.SafeFileHandle safe = new Microsoft.Win32.SafeHandles.SafeFileHandle(h, true)) {
+        bool keep = false;
+        try {
             string id = HandleFileIdentity(h);
             if (id == null || id.EndsWith("/R")) return null;
-            using (System.IO.FileStream fs = new System.IO.FileStream(safe, System.IO.FileAccess.Read))
+            using (Microsoft.Win32.SafeHandles.SafeFileHandle view = new Microsoft.Win32.SafeHandles.SafeFileHandle(h, false))
+            using (System.IO.FileStream fs = new System.IO.FileStream(view, System.IO.FileAccess.Read, 1))
             using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create()) {
-                return id + "|" + BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
+                string digest = id + "|" + BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
+                keep = true; held = h;
+                return digest;
             }
-        }
+        } finally { if (!keep) CloseHandle(h); }
     }
     // DeleteIfIdentity for a name inside the held directory, opened there (r11 class sweep: the cleanup no longer walks the destination path either).
     public static bool DeleteIfIdentityIn(IntPtr dir, string name, string identity) {
@@ -648,8 +688,44 @@ function Test-DirtyDiffHasGitlink([byte[]]$Bytes) {
     } finally { $reader.Dispose() }
 }
 
+# Keeps a reused evidence file's open handle (Move-DirtyEvidenceToFreeName's ReuseHold) for the re-check before SAVED and the release after the cleanup (r13, sol r12 B1).
+function Add-DirtyReuseHold($List, $Placed) {
+    if ($Placed -is [hashtable] -and $Placed.ContainsKey('ReuseHold') -and $null -ne $Placed['ReuseHold']) { $List.Add(@{ Handle = $Placed['ReuseHold']; Id = $Placed['ReuseId']; Path = $Placed['Path'] }) }
+}
+
+# The reapply= value of a SAVED line. It must work where it is pasted, which is where the saver put the caller's GIT_* variables back: an inherited GIT_COMMON_DIR beats
+# --git-dir and has no option of its own, so the command clears every repository-selecting variable for the one git call and puts each back after it (r13, sol r12 B2).
+# --git-dir / --work-tree beat a core.worktree; nowarn: apply.whitespace=error would refuse a line with trailing blanks that the saver verified (r5, r6 adversary A1).
+# An empty main patch (git apply refuses it, exit 128) is never advertised: a staged-only save reapplies the staged diff to the index (--cached), and with nothing
+# staged either the line names the status file, whose untracked names are all there is (their content is not saved).
+function Get-DirtyReapplyCommand([string]$Wt, [string]$Patch, [long]$PatchBytes, [string]$Staged, [string]$Status) {
+    if ($PatchBytes -ne 0) { $what = "apply --whitespace=nowarn $(ConvertTo-DirtySingleQuoted $Patch)" }
+    elseif ($Staged -and $Staged -ne 'none') { $what = "apply --cached --whitespace=nowarn $(ConvertTo-DirtySingleQuoted $Staged)" }
+    else { return "none untracked=$Status" }
+    $names = "'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX'"
+    $git = "git -C $(ConvertTo-DirtySingleQuoted $Wt) --git-dir $(ConvertTo-DirtySingleQuoted (Join-Path $Wt '.git')) --work-tree $(ConvertTo-DirtySingleQuoted $Wt) $what"
+    # Removed, never set to $null: PowerShell passes $null to a .NET string parameter as '', and git reads an empty GIT_COMMON_DIR / GIT_INDEX_FILE as a path.
+    return "& { `$n = $names; `$o = @{}; foreach (`$v in `$n) { `$o[`$v] = [Environment]::GetEnvironmentVariable(`$v); Remove-Item -LiteralPath `"Env:`$v`" -ErrorAction SilentlyContinue }; " +
+        "try { $git } finally { foreach (`$v in `$n) { if (`$null -ne `$o[`$v]) { Set-Item -LiteralPath `"Env:`$v`" -Value `$o[`$v] } } } }"
+}
+
+# One save at a time per process (r13, sol r12 B4). The saver pins GIT_DIR / GIT_COMMON_DIR / GIT_WORK_TREE and [Console]::OutputEncoding, which are process-wide, so a
+# second save running at the same time in another runspace of the same process would point the first one's git calls at its own repository while the first one's
+# guards still check the first. Every dispatcher starts each save in its own pwsh process, so overlap is not a supported embedding; this makes it impossible rather
+# than unsupported: the gate is taken before anything changes, and a second entrant, on any thread, returns DIRTY_TREE_SAVE_FAILED reason=concurrent-save-in-process
+# without touching the first. The gate is a process-wide lock object (an interned string), never a named kernel object another process could take.
 function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardName = '', [string]$RoundName = '') {
+    $gate = [string]::Intern('MLV-App lane-dirty-save: one save per process')
+    if ([System.Threading.Monitor]::IsEntered($gate) -or -not [System.Threading.Monitor]::TryEnter($gate)) {
+        return "DIRTY_TREE_SAVE_FAILED card=$($CardName -replace '\s+', ' ') reason=concurrent-save-in-process"
+    }
+    try { return (Save-DirtyWorktreeEvidenceInGate -Wt $Wt -Dest $Dest -CardName $CardName -RoundName $RoundName) }
+    finally { [System.Threading.Monitor]::Exit($gate) }
+}
+
+function Save-DirtyWorktreeEvidenceInGate([string]$Wt, [string]$Dest, [string]$CardName = '', [string]$RoundName = '') {
     $tmp = $null; $stagedTmp = $null; $statTmp = $null; $mergeTmp = $null; $destLock = $null; $wtLock = $null; $prevEnc = $null; $metaLocks = @()
+    $reuseHolds = [System.Collections.Generic.List[object]]::new()  # @{ Handle; Id; Path } of each evidence file reused rather than moved (Add-DirtyReuseHold)
     $PSNativeCommandUseErrorActionPreference = $false  # local to this call: every git exit code below is judged here, never thrown (git diff --cached --quiet exits 1 when something is staged)
     $evidence = ''  # ' patch=.. status=..' for the files placed so far; every failure after the first placement ends with it
     $CardName = $CardName -replace '\s+', ' '; $RoundName = $RoundName -replace '\s+', ' '  # the result is one line
@@ -824,6 +900,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $placed = Move-DirtyEvidenceToFreeName -Tmp $tmp.Path -Dir $Dest -Stem 'dirty-worktree-' -Ext '.patch' -Full $full -Guard $guard -Hold $tmp -DirHandle $destDir
         if (-not $placed.Path) { if ($placed.Placed) { $tmp = $null }; return (& $placeFailed $placed) }
         if ($placed.Moved) { $tmp = $null }
+        Add-DirtyReuseHold $reuseHolds $placed
         $id = $placed.Id
         $patch = $placed.Path
         $evidence = " patch=$patch"
@@ -843,6 +920,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         $statPlaced = Move-DirtyEvidenceToFreeName -Tmp $statTmp.Path -Dir $Dest -Stem "dirty-worktree-$id.status-" -Ext '.txt' -Full $statFull -FirstName "dirty-worktree-$id.status.txt" -Guard $guard -Hold $statTmp -DirHandle $destDir
         if (-not $statPlaced.Path) { if ($statPlaced.Placed) { $statTmp = $null }; return (& $placeFailed $statPlaced) }
         if ($statPlaced.Moved) { $statTmp = $null }
+        Add-DirtyReuseHold $reuseHolds $statPlaced
         $stat = $statPlaced.Path
         $evidence += " status=$stat"
         # An unmerged index (a lane that died mid `git merge fork/master`) has stages 1-3 and no stage 0 for the file: `git diff --cached` writes only '* Unmerged path <file>' and exits 0,
@@ -867,6 +945,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             $mergePlaced = Move-DirtyEvidenceToFreeName -Tmp $mergeTmp.Path -Dir $Dest -Stem 'dirty-worktree-merge-state-' -Ext '.txt' -Full $mergeFull -Guard $guard -Hold $mergeTmp -DirHandle $destDir
             if (-not $mergePlaced.Path) { if ($mergePlaced.Placed) { $mergeTmp = $null }; return (& $placeFailed $mergePlaced) }
             if ($mergePlaced.Moved) { $mergeTmp = $null }
+            Add-DirtyReuseHold $reuseHolds $mergePlaced
             return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=unmerged-index$evidence merge-state=$($mergePlaced.Path)"
         }
         # Staged content the working tree no longer has (staged, then edited back) is invisible to diff HEAD; keep it in its own file when it exists.
@@ -903,6 +982,7 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
             $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp.Path -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull -Guard $guard -Hold $stagedTmp -DirHandle $destDir
             if (-not $stagedPlaced.Path) { if ($stagedPlaced.Placed) { $stagedTmp = $null }; return (& $placeFailed $stagedPlaced) }
             if ($stagedPlaced.Moved) { $stagedTmp = $null }
+            Add-DirtyReuseHold $reuseHolds $stagedPlaced
             $stagedOut = $stagedPlaced.Path
             $evidence += " staged=$stagedOut"
         }
@@ -916,13 +996,18 @@ function Save-DirtyWorktreeEvidence([string]$Wt, [string]$Dest, [string]$CardNam
         # After the last git call: the repository every call read must still be the one sampled before the first (r10, sol r9 B1/B2).
         $why = & $repoCheck
         if ($why) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$why$evidence" }
-        return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=git -C $(ConvertTo-DirtySingleQuoted $Wt) --git-dir $(ConvertTo-DirtySingleQuoted (Join-Path $Wt '.git')) --work-tree $(ConvertTo-DirtySingleQuoted $Wt) apply --whitespace=nowarn $(ConvertTo-DirtySingleQuoted $patch)"
-        # nowarn: apply.whitespace=error would refuse a line with trailing blanks that the saver verified. --git-dir / --work-tree: the saver clears GIT_DIR and GIT_WORK_TREE only
-        # for its own calls, and the command is pasted where they are back; the explicit options beat them (r6 adversary A1).
+        # Every reused evidence file is still the file its digest was read from, with one name and no reparse point, read from the handle held since (r13, sol r12 B1).
+        foreach ($r in $reuseHolds) {
+            $now = $null
+            try { $now = [DirtyFinalPath]::HandleFileIdentity([IntPtr]$r.Handle) } catch { $now = $null }
+            if ($now -cne $r.Id) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=evidence-identity-changed:$($r.Path)$evidence" }
+        }
+        return "DIRTY_TREE_SAVED card=$CardName round=$RoundName files=$($status.Count) bytes=$bytes staged=$stagedOut verified=$verified patch=$patch status=$stat reapply=$(Get-DirtyReapplyCommand -Wt $Wt -Patch $patch -PatchBytes $bytes -Staged $stagedOut -Status $stat)"
     }
     catch { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=$($_.Exception.Message -replace '\s+', ' ')$evidence" }  # a throw after a placement still names what was placed (r4 adversary A2)
     finally {
         foreach ($t in $tmp, $stagedTmp, $statTmp, $mergeTmp) { Remove-DirtyTemp $t }  # only the file each name was created for (r10 class sweep: the cleanup used to delete whatever the name held)
+        foreach ($r in $reuseHolds) { Unlock-DirtyDirectory $r.Handle }  # each reused evidence file stays held through the cleanup above (r13, sol r12 B1)
         if ($null -ne $prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { } }
         foreach ($h in $metaLocks) { Unlock-DirtyDirectory $h }
         Unlock-DirtyDirectory $wtLock; Unlock-DirtyDirectory $destLock  # released only after the temp cleanup, which still runs inside the held destination

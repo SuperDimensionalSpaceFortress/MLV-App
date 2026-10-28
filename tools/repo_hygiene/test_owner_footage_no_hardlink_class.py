@@ -205,7 +205,26 @@ LANE_DIRTY_SAVE_NT_CALLS = 1
 LANE_DIRTY_SAVE_K32_CLASSES = {"4"}  # SetFileInformationByHandle: FileDispositionInfo (that enum has no link class; pinned anyway).
 _NATIVE_SET_INFO_RE = re.compile(r"\b(?:Nt|Zw)SetInformationFile\w*")
 _K32_SET_INFO_RE = re.compile(r"\bSetFileInformationByHandle\w*")
-_LINK_NAME_RE = re.compile(r"FileLinkInfo\w*|CreateHardLink\w*|\bHardLink\b", re.IGNORECASE)
+# Every link spelling the wide scan knows, on the raw text (a comment or a string counts), so one appended to a counted line is never excused by it (r13,
+# HARDLINK-CENSUS-SAME-LINE-SPELLING-1).
+_LINK_NAME_RE = re.compile(
+    r"FileLinkInfo\w*|CreateHardLink\w*|\bHardLink\b|\bmklink(?:\.exe)?\s+/[hH]\b|\bfs\.link(?:Sync)?\b|\bcreate_hard_link\b"
+    r"|\bcp\s+(?:-\w*\s+)*-\w*l\w*\b|(?<![\w$.\-])ln\s+(?!-\w*s)[\w./\"'$~-]+\s+[\w./\"'$~-]+|\bfsutil(?:\.exe)?\s+hardlink\b",
+    re.IGNORECASE)
+# r13 (sol r12 B3, HARDLINK-CENSUS-ESCAPED-IDENTIFIER-1): a text census cannot follow reflection or a C# escaped identifier, so each FAILS CLOSED. A \u / \U
+# escape anywhere (C# resolves it inside an identifier, NtSetInformationFile is the native), a verbatim identifier (@name) inside an Add-Type payload, a
+# reflection lookup anywhere (GetMethod("NtSet" + "InformationFile", ...).Invoke(..., 11) needs no declaration or call the census counts) and a string literal
+# joined to another inside a payload (a name built from pieces) are each a violation; the census below then also runs on the text with every escape resolved.
+_CS_ESCAPE_RE = re.compile(r"\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8}")
+_ADD_TYPE_PAYLOAD_RE = re.compile(r"Add-Type\b[^\n]*?@(['\"])\r?\n(?P<body>.*?)\r?\n\1@", re.DOTALL)
+_VERBATIM_IDENTIFIER_RE = re.compile(r"(?<![\w\"'])@[A-Za-z_]")
+_REFLECTION_RE = re.compile(
+    r"\b(?:GetMethods?|GetMembers?|GetMember|GetRuntimeMethods?|GetDeclaredMethods?|GetTypeInfo|InvokeMember|MethodInfo|MethodBase|BindingFlags"
+    r"|CreateDelegate|DynamicMethod|DynamicInvoke|System\.Reflection|Reflection\.Emit|Expression\.Call)\b")
+_LITERAL_JOIN_RE = re.compile(r"\"\s*\+\s*@?\$?\"|'\s*\+\s*'")
+# The parameter count of each counted native, so an extra trailing argument cannot move the class out of the checked position (r13, HARDLINK-CENSUS-ARITY-1).
+LANE_DIRTY_SAVE_NT_ARITY = 5  # (handle, out iosb, info, length, infoClass)
+LANE_DIRTY_SAVE_K32_ARITY = 4  # (handle, infoClass, ref info, size)
 # Every native the saver binds, by its own name: an EntryPoint alias or a runtime lookup could bind NtSetInformationFile under any
 # name (built from string pieces) and dodge the census (r12 iter 2, adversary 9ffb95df-A4).
 LANE_DIRTY_SAVE_NATIVES = {
@@ -237,37 +256,58 @@ def _call_arguments(text: str, at: int) -> list[str] | None:
     return None
 
 
-def _native_census(text: str, pattern: re.Pattern, declaration: str, class_at: int, allowed: set[str]):
-    """(declaration lines, call lines, violations) for one native entry point in `text`."""
-    declarations, calls, violations = [], [], []
+def _native_census(text: str, pattern: re.Pattern, declaration: str, class_at: int, allowed: set[str], arity: int):
+    """(declaration lines, call lines, violations, spans of the counted name tokens) for one native entry point in `text`.
+
+    The declaration and every call must have exactly `arity` parameters / arguments, and the class is read at its fixed position `class_at`
+    (r13, HARDLINK-CENSUS-ARITY-1: an extra trailing argument used to leave a checked '10' last while 11 sat in the class position)."""
+    declarations, calls, violations, spans = [], [], [], []
     for match in pattern.finditer(text):
         number = text.count("\n", 0, match.start()) + 1
         line = text.splitlines()[number - 1].strip()
         if match.group(0) != declaration:
             violations.append(f"{number}: a spelling other than {declaration}: {line}")
             continue
+        args = _call_arguments(text, match.end())
         if re.search(r"\bstatic\s+extern\b[^\n;]*$", text[text.rfind("\n", 0, match.start()) + 1: match.start()]):
             declarations.append(number)
+            spans.append(match.span())
+            if args is None or len(args) != arity:
+                violations.append(f"{number}: {declaration} declared with {len(args or [])} parameter(s), not {arity}: {line}")
             continue
-        args = _call_arguments(text, match.end())
         if args is None:
             violations.append(f"{number}: {declaration} named but not called (a string, delegate or comment): {line}")
             continue
         calls.append(number)
-        info_class = args[class_at] if -len(args) <= class_at < len(args) else ""
+        spans.append(match.span())
+        if len(args) != arity:
+            violations.append(f"{number}: {declaration} called with {len(args)} argument(s), not {arity}: {line}")
+        info_class = args[class_at] if 0 <= class_at < len(args) else ""
         if info_class not in allowed:
             violations.append(f"{number}: info class {info_class!r} is not a literal from {sorted(allowed)}: {line}")
     if len(declarations) != 1:
         violations.append(f"{declaration} must be declared exactly once, found lines {declarations}")
-    return declarations, calls, violations
+    return declarations, calls, violations, spans
 
 
 def lane_dirty_save_violations(text: str) -> list[str]:
-    nt_decl, nt_calls, violations = _native_census(
-        text, _NATIVE_SET_INFO_RE, "NtSetInformationFile", -1, LANE_DIRTY_SAVE_NT_CLASSES)
-    _, _, k32_violations = _native_census(
-        text, _K32_SET_INFO_RE, "SetFileInformationByHandle", 1, LANE_DIRTY_SAVE_K32_CLASSES)
-    violations += k32_violations
+    violations = []
+    for match in _CS_ESCAPE_RE.finditer(text):
+        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: an escaped identifier character: {match.group(0)}")
+    for match in _REFLECTION_RE.finditer(text):
+        violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: a reflection lookup: {match.group(0)}")
+    for payload in _ADD_TYPE_PAYLOAD_RE.finditer(text):
+        body, at = payload.group("body"), payload.start("body")
+        for regex, what in ((_VERBATIM_IDENTIFIER_RE, "a verbatim identifier"), (_LITERAL_JOIN_RE, "a string built from pieces")):
+            for match in regex.finditer(body):
+                violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: {what} inside an Add-Type payload: {match.group(0)}")
+    # the census proper runs on the text C# compiles: every escape resolved
+    text = _CS_ESCAPE_RE.sub(lambda m: chr(int(m.group(0)[2:], 16)), text)
+    _, nt_calls, nt_violations, nt_spans = _native_census(
+        text, _NATIVE_SET_INFO_RE, "NtSetInformationFile", LANE_DIRTY_SAVE_NT_ARITY - 1, LANE_DIRTY_SAVE_NT_CLASSES, LANE_DIRTY_SAVE_NT_ARITY)
+    _, _, k32_violations, _ = _native_census(
+        text, _K32_SET_INFO_RE, "SetFileInformationByHandle", 1, LANE_DIRTY_SAVE_K32_CLASSES, LANE_DIRTY_SAVE_K32_ARITY)
+    violations += nt_violations + k32_violations
     if len(nt_calls) != LANE_DIRTY_SAVE_NT_CALLS:
         violations.append(f"NtSetInformationFile must be called exactly {LANE_DIRTY_SAVE_NT_CALLS} time(s), found lines {nt_calls}")
     for match in _LINK_NAME_RE.finditer(text):
@@ -278,8 +318,12 @@ def lane_dirty_save_violations(text: str) -> list[str]:
         name = (re.findall(r"\w+", match.group("head")) or [""])[-1]
         if name not in LANE_DIRTY_SAVE_NATIVES:
             violations.append(f"{text.count(chr(10), 0, match.start()) + 1}: an extern outside the named set: {name!r}")
-    # the file-keyed allowance covers exactly the declaration and the counted call, never another hard-link spelling
-    extra = [f"{number}: {line}" for number, line in hard_link_text_hits(text) if number not in set(nt_decl) | set(nt_calls)]
+    # the file-keyed allowance covers exactly the declaration's and the counted call's NtSetInformationFile TOKENS, never their whole lines: those tokens are
+    # blanked and the wide scan re-run, so another spelling on either line still counts (r13, HARDLINK-CENSUS-SAME-LINE-SPELLING-1)
+    masked = text
+    for start, end in nt_spans:
+        masked = masked[:start] + " " * (end - start) + masked[end:]
+    extra = [f"{number}: {line}" for number, line in hard_link_text_hits(masked)]
     violations += [f"a hard-link scan hit outside the counted rename: {hit}" for hit in extra]
     return violations
 
@@ -340,6 +384,33 @@ class NoHardLinkCreationTests(unittest.TestCase):
                                                             "static extern bool Quiet(IntPtr h, int c, IntPtr p, uint s);\nQuiet(h, 999, info, 24);"),
             "an extern outside the named set": text.replace(call, call + '\n[DllImport("ntdll.dll")] static extern int NtQuietSet(IntPtr h, int c);'),
             "a runtime lookup": text.replace(call, call + '\nIntPtr p = GetProcAddress(GetModuleHandle("ntdll.dll"), "NtSet" + "InformationFile");'),
+            # r13 (sol r12 B3, HARDLINK-CENSUS-ESCAPED-IDENTIFIER-1): reflection and escaped identifiers reach the native with no counted spelling
+            "a split-name reflective invoke": text.replace(call, 'typeof(DirtyFinalPath).GetMethod("NtSet"+"InformationFile", System.Reflection.BindingFlags.Static '
+                                                         "| System.Reflection.BindingFlags.NonPublic).Invoke(null,new object[]{h,default(IoStatusBlock),info,(uint)size,11});\n" + call),
+            "a reflective invoke through a variable name": text.replace(call, 'string n="NtSet"+"InformationFile"; typeof(DirtyFinalPath).GetMethod(n,System.Reflection.BindingFlags.Static '
+                                                                       "| System.Reflection.BindingFlags.NonPublic).Invoke(null,new object[]{h,default(IoStatusBlock),info,(uint)size,11});\n" + call),
+            "a reflective invoke with numeric flags": text.replace(call, 'var m=typeof(DirtyFinalPath).GetMethod("NtSet"+"InformationFile",(System.Reflection.BindingFlags)40); '
+                                                                  "m.Invoke(null,new object[]{h,default(IoStatusBlock),info,(uint)size,11});\n" + call),
+            "a reflective InvokeMember": text.replace(call, 'typeof(DirtyFinalPath).InvokeMember(N, (System.Reflection.BindingFlags)296, null, null, a);\n' + call),
+            "a \\u-escaped identifier": text.replace(call, call + "\nN\\u0074SetInformationFile(h, out io, info, (uint)size, 11);"),
+            "a \\U-escaped identifier": text.replace(call, call + "\nN\\U00000074SetInformationFile(h, out io, info, (uint)size, 11);"),
+            "a verbatim identifier": text.replace(call, "@" + call),
+            "a name joined from literals in the payload": text.replace(call, call + '\nstring q = "NtSet" + "InformationFile";'),
+            # r13 (HARDLINK-CENSUS-ARITY-1): one more parameter puts 11 in the class position while the last argument stays 10
+            "an extra trailing parameter": text.replace(
+                "static extern int NtSetInformationFile(IntPtr handle, out IoStatusBlock iosb, IntPtr info, uint length, int infoClass);",
+                "static extern int NtSetInformationFile(IntPtr handle, out IoStatusBlock iosb, IntPtr info, uint length, int infoClass, int reserved);").replace(
+                call, call.replace(", 10)", ", 11, 10)")),
+            "a call with one argument too many": text.replace(call, call.replace(", 10)", ", 11, 10)")),
+            "a disposition call with one argument too many": text.replace("SetFileInformationByHandle(h, 4, ref d, 1)", "SetFileInformationByHandle(h, 11, 4, ref d, 1)", 1),
+            # r13 (HARDLINK-CENSUS-SAME-LINE-SPELLING-1): another spelling on the counted call or declaration line is not excused by its line number
+            "mklink /H on the call line": text.replace(call, call + ' Process.Start("cmd", "/c mklink /H a b");'),
+            "fs.link on the call line": text.replace(call, call + " // fs.link(a, b)"),
+            "create_hard_link on the declaration line": text.replace(
+                "static extern int NtSetInformationFile(IntPtr handle, out IoStatusBlock iosb, IntPtr info, uint length, int infoClass);",
+                "static extern int NtSetInformationFile(IntPtr handle, out IoStatusBlock iosb, IntPtr info, uint length, int infoClass); // create_hard_link"),
+            "ln on the call line": text.replace(call, call + ' Process.Start("sh", "-c \\"ln src dst\\"");'),
+            "cp -l on the call line": text.replace(call, call + ' Process.Start("sh", "-c \\"cp -al src dst\\"");'),
         }
         for name, mutant in mutants.items():
             with self.subTest(mutant=name):
