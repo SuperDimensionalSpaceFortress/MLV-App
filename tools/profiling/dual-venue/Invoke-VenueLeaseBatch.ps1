@@ -575,9 +575,11 @@ function Get-WriteDestinationHit([string]$Path, [switch]$Directory) {
     if (Test-NothingAtName $Path) { return $null }
     try { $phys = (Get-PhysicalPath $Path).TrimEnd('\'); $di = Get-FileIdentity $Path }
     catch { return [pscustomobject]@{ kind = 'output'; input = ''; item = 0; code = 'OUTPUT_ZONE_UNRESOLVED'; path = $Path; why = "'$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write to it lands is unknown" } }
+    $inputKeys = @{}   # r7 pass 2: file identity -> input, for the files already under a -Directory destination
     foreach ($g in $script:guardedInputs) {
         $at = { param($p, $k) $p -and ($phys -ieq $p -or $di.key -ceq $k -or ($Directory -and ($p + '\').StartsWith($phys + '\', [StringComparison]::OrdinalIgnoreCase))) }
         if ($g.accepted -and (& $at $g.accepted.phys $g.accepted.key)) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = "'$($g.path)' (as it was accepted) is reached by a write to '$Path', a file this run writes" } }
+        if ($g.accepted) { $inputKeys[$g.accepted.key] = $g }
         if (Test-NothingAtName $g.path) { continue }
         try { $gp = Get-PhysicalPath $g.path; $gk = (Get-FileIdentity $g.path).key } catch {
             $label = $(if ($g.kind -ceq 'plan') { 'the plan file' } elseif ($g.kind -ceq 'build') { 'the staged build manifest' } else { 'the leg spec' })
@@ -585,6 +587,17 @@ function Get-WriteDestinationHit([string]$Path, [switch]$Directory) {
                 why = "$label '$($g.path)' is there but cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')): a link on its side may reach '$Path', so nothing is written there" }
         }
         if (& $at $gp $gk) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = "'$($g.path)' is reached by a write to '$Path', a file this run writes" } }
+        $inputKeys[$gk] = $g
+    }
+    if ($Directory) {
+        # r7 pass 2 (adversary r7 A2): a folder's writer (Wait-VenueQuiet in quiet\, the job files) opens names inside it, and a file already there under such a name (a hard link or a
+        # link to an input) is written through: every file under it is compared by identity with every input. One that will not identify: where a write lands is unknown.
+        try {
+            foreach ($c in @(Get-ChildItem -LiteralPath $Path -Force -Recurse -File -ErrorAction Stop)) {
+                $ci = Get-FileIdentity $c.FullName
+                if ($inputKeys.ContainsKey($ci.key)) { $g = $inputKeys[$ci.key]; return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = "'$($g.path)' is '$($c.FullName)' (another name for it) inside '$Path', a folder this run writes into" } }
+            }
+        } catch { return [pscustomobject]@{ kind = 'output'; input = ''; item = 0; code = 'OUTPUT_ZONE_UNRESOLVED'; path = $Path; why = "a file inside '$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write into it lands is unknown" } }
     }
     $null
 }
@@ -1003,8 +1016,11 @@ function Test-ReceiptWriteSuppressed([int]$Batch, [string]$Path) {
                     Add-SuppressedReceipt $Batch $Path
                     return $true
                 }
-                $destWhy = Get-ReceiptDestinationRefusal $Path
-                if ($destWhy) { Add-SuppressedReceipt $Batch $Path $guardHit $destWhy; return $true }
+                # r7 pass 2 (adversary r7 A1): only a receipt file that will not resolve itself is this file's alone; one that IS an accepted input (or may be, an input that is there
+                # will not resolve) is an alias found by a writer: the suppression turns on for every write and the hit is kept (Test-RunDirWrite)
+                $dh = Get-WriteDestinationHit $Path
+                if ($dh -and $dh.kind -ceq 'output') { Add-SuppressedReceipt $Batch $Path $guardHit $dh.why; return $true }
+                if ($dh) { $null = Test-RunDirWrite $Path; Add-SuppressedReceipt $Batch $Path; return $true }
             }
             # r7: with no such hit the receipt's own file is still asked about right before the write, as every writer's is (Test-RunDirWrite)
             elseif (-not (Test-RunDirWrite $Path)) { Add-SuppressedReceipt $Batch $Path; return $true }
@@ -1211,6 +1227,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         $legPlanFile = Join-Path $RunDir 'leg-plan.json'   # r7: asked right before it is written (a refusal: the open's guard below ends the batch in that stop)
         if ($legPlanMode -and (Test-RunDirWrite $legPlanFile)) { [IO.File]::WriteAllText($legPlanFile, ($planRecord | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false)) }
         # (2) OPEN: the lease first. Nothing is probed or run before the agent reports this batch's lease active.
+        # r7 pass 2 (adversary r7 A3): a write refused before the open (CLAIM_TAKEN, leg-plan.json) stopped the claim keeper: no open is submitted then (it could outlive the claim);
+        # the batch ends in that typed stop (the catch below), the claim is released and nothing was sent
+        if ($script:RunOutputAliased) { $script:preOpenRefused = $true; throw 'a write into -RunDir was refused before the open' }
         $b.openJobId = "lease-batch-open-$stamp-lb$token"
         $wait = [int][Math]::Max(60, [Math]::Min($OpenAdmissionWaitSec, ($deadline - [DateTime]::UtcNow).TotalSeconds))
         L "BATCH_OPEN_SUBMIT batch=$batchNo token=$token job=$($b.openJobId) admissionWaitSec=$wait (the agent requests the lease; heavy-slot.py's cooldown is waited out there)"
@@ -1468,6 +1487,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             }
         }
     } catch {
+        # r7 pass 2: the refusal before the open is its own typed stop, never BATCH_ERROR
+        if ($script:preOpenRefused) { $script:preOpenRefused = $false; Stop-BatchOnSuppression $b } else {
         # r5 (key3 F1): an unexpected throw anywhere in the batch is a typed stop, not an unhandled exit 1 that skips the summary. The finally below runs first; 12 replaces every code.
         $b.endReason = 'BATCH_ERROR'; $b.endDetail = ($_.Exception.Message -replace '\s+', ' ')
         $script:stopReason = 'BATCH_ERROR'; $script:exitCode = 12
@@ -1481,6 +1502,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             }
         } catch { }
         LogBest "BATCH_ERROR batch=$batchNo $($b.endDetail)"   # a batch.log another process holds must not turn the typed stop back into an unhandled throw
+        }
     } finally {
         # (4) END: release the lease now (a light close job), read the agent's receipt for it, release the claim, write the batch receipt.
         # r3 (sol r2 B1): an open with no result in hand (um-run gave up on it, the deadline came while its result was awaited, or this batch threw) may still

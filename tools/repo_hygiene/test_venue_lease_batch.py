@@ -3239,6 +3239,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                           "New-Item -ItemType HardLink -Path (Join-Path $RunDir 'leg-plan.json') -Value '{b}' | Out-Null"),
         "lease ledger": ("                $b.ledger = $row\n",
                          "$lg = Get-VenueLeaseLedgerPath -Venue $Venue -ClaimDir $ClaimDir; if (Test-Path -LiteralPath $lg) {{ [IO.File]::Delete($lg) }}; New-Item -ItemType HardLink -Path $lg -Value '{b}' | Out-Null"),
+        # adversary r7 A2: a name inside the probe's work folder (Wait-VenueQuiet writes its job files there) is already a hard link to the spec
+        "probe work folder (a name inside it)": ("    $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript,",
+                                                 "$null = New-Item -ItemType Directory -Force -Path (Join-Path $RunDir 'quiet'); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'quiet\\venue-quiet-probe-r7.job.ps1') -Value '{b}' | Out-Null"),
     }
 
     def test_r7_every_writer_asks_the_guard_right_before_it_writes(self) -> None:
@@ -3258,6 +3261,29 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
                 self.assertIn("BATCH_WRITE_REFUSED ", r.stderr)
                 self.assertEqual(batch_result(r.stdout)["stopReason"], "LEG_SPEC_IS_RUN_OUTPUT")
+                self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+                if name == "leg-plan.json":
+                    # adversary r7 A3: a refusal before the open stopped the claim keeper, so no open is submitted after it (it could outlive the claim)
+                    self.assertNotIn("OPEN:", " ".join(self.kinds()), "an open was submitted after a write was refused before it")
+
+    def test_r7_adv_a1_a_receipt_file_that_is_an_accepted_input_as_accepted_suppresses_every_write(self) -> None:
+        # adversary r7 A1: after the final leg the spec is renamed to a.old and RunDir\batch-01.json is made a hard link to a.old (batch.log plain, batches.jsonl absent). The guard reads the
+        # spec as INPUT_VANISHED and asks file by file: batch-01.json is the accepted input as accepted, which suppressed that one receipt only and kept the writes on.
+        for form in ("scalar spec", "plan"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                old = spec.with_name("fx-a.json.old")
+                args, e = self.batch_cmd([spec]) if form == "scalar spec" else self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                r = self._rpf06_run(args, e, f"[IO.File]::Move('{psq(spec)}', '{psq(old)}'); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch-01.json') -Value '{psq(old)}' | Out-Null")
+                self.assertTrue(old.is_file() and not spec.exists(), "the spec was renamed and linked (the case under test)\n" + r.stdout + r.stderr)
+                self.assertEqual(old.read_bytes(), self.specs[0].read_bytes(), "a receipt was written into the accepted input")
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"]), (2, "LEG_SPEC_IS_RUN_OUTPUT"), r.stderr)
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), "the writes stayed on after an alias was found")
+                self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
 
     # r7: the static half: every write primitive in the runner is either asked about first (Test-RunDirWrite on the same line or the two before it) or listed here with why it needs no
     # ask. A new writer that is neither fails this test, so the next unguarded writer is found here, not by a reviewer.
