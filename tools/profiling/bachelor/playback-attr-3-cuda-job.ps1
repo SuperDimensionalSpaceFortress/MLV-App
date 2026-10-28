@@ -5910,7 +5910,11 @@ if (-not [string]::IsNullOrEmpty($ScopesDuringPlayback)) {
 #   3. one summary line per scalar after the summary's cpuFrames line;
 #   4. (r14, sol r13d B1) at the top of the job's outer finally: every exit that did not reach (2) publishes core-partition.json there, once,
 #      after the same comparison (Publish-CorePartitionRecord).
-if ($CorePartitionTelemetry) {
+# BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 r6: $corePartitionEmit is the ONE seam every core-partition emission routes through (the five
+# arguments reach the job only inside this if; Assert-CorePartitionArgs above only validates). test_core_partition_leg turns this line off in
+# a copy of the generator and requires a job with the arguments set but the seam off to be byte-for-byte the job without them.
+$corePartitionEmit = [bool]$CorePartitionTelemetry
+if ($corePartitionEmit) {
     $cpOpen = '# BACHELOR-CORE-PARTITION-AB-1 >>>'
     $cpClose = '# BACHELOR-CORE-PARTITION-AB-1 <<<'
     $cpEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
