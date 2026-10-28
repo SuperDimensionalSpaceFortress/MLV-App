@@ -21,6 +21,7 @@
 #include "PlaybackFrameRange.h"
 #include "PlaybackGatePolicy.h"
 #include "PlaybackPrepPresentationPolicy.h"
+#include "ClipOpenAbortPolicy.h"
 #include "debug/StageTiming.h"
 extern "C" {
 #include "../../src/mlv/pipeline_stage_capture.h"
@@ -11068,6 +11069,7 @@ int MainWindow::openMlvForPreview(QString fileName)
     char mlvErrMsg[256] = { 0 };
 
     mlvObject_t * new_MlvObject;
+    bool isMcraw = false;
 
     if (QFileInfo( fileName ).isDir())
     {
@@ -11085,8 +11087,8 @@ int MainWindow::openMlvForPreview(QString fileName)
 #else
         new_MlvObject = initMlvObjectWithMcrawClip( fileName.toLatin1().data(), MLV_OPEN_PREVIEW, &mlvErr, mlvErrMsg );
 #endif
-        ui->comboBoxUseCameraMatrix->setCurrentIndex(0);
-        on_comboBoxUseCameraMatrix_currentIndexChanged(0);
+        // r3 (key3 INV-1, Dot B2): the camera-matrix / EXR reset is applied after the guards below.
+        isMcraw = true;
     }
     else
     {
@@ -11109,7 +11111,7 @@ int MainWindow::openMlvForPreview(QString fileName)
     if( !playbackPrepQuiescentBeforeClipReplacement( "clip-open-preview" ) )
     {
         freeMlvObject( new_MlvObject );
-        return MLV_ERR_IO;
+        return kClipOpenAbortedPrepBusy;
     }
 
     //disable drawing and kill old timer and old WaveFormMonitor
@@ -11132,11 +11134,17 @@ int MainWindow::openMlvForPreview(QString fileName)
         freeMlvObject( new_MlvObject );
         m_pMlvObject = initMlvObject();
         m_clipLifecycleBarrier.reopen();
-        return MLV_ERR_IO;
+        return kClipOpenAbortedPrepBusyAfterFree;
     }
     /* Set to NEW object with a NEW MLV clip! */
     m_pMlvObject = new_MlvObject;
     m_clipLifecycleBarrier.reopen();
+
+    if( isMcraw )
+    {
+        ui->comboBoxUseCameraMatrix->setCurrentIndex(0);
+        on_comboBoxUseCameraMatrix_currentIndexChanged(0);
+    }
 
     /* If use has terminal this is useful */
 #ifndef STDOUT_SILENT
@@ -11341,7 +11349,7 @@ int MainWindow::openMlv( QString fileName )
     if( !playbackPrepQuiescentBeforeClipReplacement( "clip-open" ) )
     {
         freeMlvObject( new_MlvObject );
-        return MLV_ERR_IO;
+        return kClipOpenAbortedPrepBusy;
     }
 
     //Set window title to filename
@@ -11369,7 +11377,7 @@ int MainWindow::openMlv( QString fileName )
         freeMlvObject( new_MlvObject );
         m_pMlvObject = initMlvObject();
         m_clipLifecycleBarrier.reopen();
-        return MLV_ERR_IO;
+        return kClipOpenAbortedPrepBusyAfterFree;
     }
     /* Set to NEW object with a NEW MLV clip! */
     m_pMlvObject = new_MlvObject;
@@ -14429,6 +14437,9 @@ void MainWindow::openSession(QString fileNameSession)
 
     //Version of settings (values may be interpreted differently)
     int versionMasxml = 0;
+    //Last session clip that opened, and the clips a busy playback-prep task refused to open
+    int lastOpenedRow = -1;
+    QStringList prepRefusedClips;
 
     //Clear the last session
     deleteSession();
@@ -14518,16 +14529,26 @@ void MainWindow::openSession(QString fileNameSession)
                         //Add file to Sessionlist
                         addFileToSession( fileName );
                         //Open the file
-                        if( ui->actionFastOpen->isChecked() ) openMlvForPreview( fileName );
-                        else openMlv( fileName );
+                        int openResult;
+                        if( ui->actionFastOpen->isChecked() ) openResult = openMlvForPreview( fileName );
+                        else openResult = openMlv( fileName );
                         SESSION_LAST_CLIP->setFileName( fileName );
                         SESSION_LAST_CLIP->setMark( mark );
 
                         readXmlElementsFromFile( &Rxml, SESSION_LAST_CLIP, versionMasxml );
-                        setSliders( SESSION_LAST_CLIP, false );
-                        previewPicture( SESSION_CLIP_COUNT - 1 );
+                        // r3 (key3 INV-2, Dot B3): a failed open takes no settings, thumbnail or active row from
+                        // the clip that is still loaded.
+                        const SessionClipOpenFailurePlan plan = sessionClipOpenPlan( openResult, lastOpenedRow );
+                        if( plan.applySliders ) setSliders( SESSION_LAST_CLIP, false );
+                        if( plan.takeThumbnail ) previewPicture( SESSION_CLIP_COUNT - 1 );
                         setMarkColor( SESSION_CLIP_COUNT - 1, mark );
-                        m_pModel->setActiveRow( SESSION_CLIP_COUNT - 1 );
+                        if( plan.activateClip )
+                        {
+                            m_pModel->setActiveRow( SESSION_CLIP_COUNT - 1 );
+                            lastOpenedRow = SESSION_CLIP_COUNT - 1;
+                        }
+                        else if( plan.restoreLastOpened ) m_pModel->setActiveRow( lastOpenedRow );
+                        if( clipOpenAbortedForPrep( openResult ) ) prepRefusedClips.append( fileName );
                     }
                     else
                     {
@@ -14557,6 +14578,14 @@ void MainWindow::openSession(QString fileNameSession)
 
     //Caching is in which state? Set it!
     if( ui->actionCaching->isChecked() ) on_actionCaching_triggered();
+
+    if( !prepRefusedClips.isEmpty() )
+    {
+        QMessageBox::warning( this, tr( "Open Session" ),
+                              tr( "These clips were not opened because playback was still preparing a frame. "
+                                  "Their settings are kept; select a clip to open it.\n%1" )
+                              .arg( prepRefusedClips.join( "\n" ) ) );
+    }
 
     if (Rxml.hasError())
     {
@@ -18837,16 +18866,21 @@ int MainWindow::showFileInEditor(int row)
     int oldActive = SESSION_ACTIVE_CLIP_ROW;
     SET_ACTIVE_CLIP_IDX( row );
     //Open new MLV
-    if( openMlv( GET_CLIP( row )->getPath() ) )
+    const int openResult = openMlv( GET_CLIP( row )->getPath() );
+    if( openResult )
     {
+        // r3 (key3 INV-2, Dot B3): the sliders still describe oldActive, so it is the active row again
+        // before anything saves a receipt; a clip a busy prep task kept loaded is not reopened.
+        const ShowFileOpenFailurePlan plan = showFileOpenFailurePlan(
+            openResult, row, oldActive, selectedClipsList().size(), SESSION_CLIP_COUNT,
+            oldActive >= 0 && oldActive < SESSION_CLIP_COUNT && GET_RECEIPT( oldActive )->wasNeverLoaded() );
+        if( plan.restoreOldActive ) SET_ACTIVE_CLIP_IDX( oldActive );
         //If one file is selected, reselect the last one, else do nothing (export)
-        //And if there is another file we can switch to...
-        if( selectedClipsList().size() <= 1
-         && SESSION_CLIP_COUNT > 1)
+        if( plan.reselectOld )
         {
             m_pSelectionModel->setCurrentIndex( m_pProxyModel->mapFromSource( m_pModel->index( oldActive, 0, QModelIndex() ) ), QItemSelectionModel::ClearAndSelect );
-            if( !GET_CLIP( oldActive )->getReceipt()->wasNeverLoaded() ) showFileInEditor( oldActive );
         }
+        if( plan.reopenOld ) showFileInEditor( oldActive );
         return 1;
     }
     //Now set it was loaded once
@@ -23789,9 +23823,21 @@ void MainWindow::renameActiveClip( void )
     }
 
     //Open the clip again without rendering
-    openMlv( ACTIVE_CLIP->getPath() );
+    const int reopenResult = openMlv( ACTIVE_CLIP->getPath() );
     m_frameChanged = false;
     setSliders( ACTIVE_RECEIPT, false );
+    if( clipOpenAbortedForPrep( reopenResult ) ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );
+}
+
+// r3 (key3 INV-2 sweep): a reopen a busy playback-prep task refused is retried once through
+// showFileInEditor, which saves the (already mirrored) sliders into the active receipt first.
+void MainWindow::retryClipReopenAfterPrepAbort( int row )
+{
+    logInteractionEvent( QStringLiteral("playback_prep.clip_reopen_retry"), QStringLiteral("row=%1").arg( row ) );
+    QTimer::singleShot( kClipReopenAbortRetryDelayMs, this, [this, row]()
+    {
+        if( row >= 0 && row < SESSION_CLIP_COUNT && row == SESSION_ACTIVE_CLIP_ROW ) showFileInEditor( row );
+    } );
 }
 
 //Shows the file, which is selected via contextmenu
@@ -24338,8 +24384,9 @@ void MainWindow::exportHandler( void )
     //Was started?
     if( exportRunning )
     {
-        //Cut first job!
-        if( !m_exportQueue.empty() ) //Only to avoid crashes
+        //Cut first job! (unless its open is being retried)
+        if( m_exportRetryHeadJob ) m_exportRetryHeadJob = false;
+        else if( !m_exportQueue.empty() ) //Only to avoid crashes
         {
             ReceiptSettings *receipt = m_exportQueue.takeFirst();
             delete receipt;
@@ -24366,12 +24413,32 @@ void MainWindow::exportHandler( void )
         exportRunning = true;
         jobNumber++;
         //Open file and settings
-        if( openMlv( m_exportQueue.first()->fileName() ) )
+        const int openResult = openMlv( m_exportQueue.first()->fileName() );
+        if( openResult )
         {
+            // r3 (key3 INV-2): a busy playback-prep task refused the open; the job is retried, then reported.
+            switch( exportOpenFailureAction( openResult, m_exportOpenAbortRetries ) )
+            {
+            case ExportOpenFailureAction::RetryJob:
+                m_exportOpenAbortRetries++;
+                jobNumber--;
+                m_exportRetryHeadJob = true;
+                QTimer::singleShot( kExportOpenAbortRetryDelayMs, this, &MainWindow::exportHandler );
+                return;
+            case ExportOpenFailureAction::ReportAndSkipJob:
+                QMessageBox::warning( this, tr( "Export" ),
+                                      tr( "%1 was not exported: playback was still preparing a frame." )
+                                      .arg( QFileInfo( m_exportQueue.first()->fileName() ).fileName() ) );
+                break;
+            case ExportOpenFailureAction::SkipCorruptJob:
+                break;
+            }
+            m_exportOpenAbortRetries = 0;
             //auto skip corrupted file
             emit exportReady();
             return;
         }
+        m_exportOpenAbortRetries = 0;
         //Set sliders to receipt
         setSliders( m_exportQueue.first(), false );
         //Fill label in StatusDialog
@@ -24418,9 +24485,12 @@ void MainWindow::exportHandler( void )
         //Hide Status Dialog
         m_pStatusDialog->close();
         //Open last file which was opened before export
-        openMlv( GET_RECEIPT( m_lastClipBeforeExport )->fileName() );
+        const int reopenResult = openMlv( GET_RECEIPT( m_lastClipBeforeExport )->fileName() );
+        // The sliders keep mirroring the active receipt even when the reopen failed, so no later
+        // setReceipt( ACTIVE_RECEIPT ) saves an export job's settings into this clip.
         setSliders( GET_RECEIPT( m_lastClipBeforeExport ), false );
         SET_ACTIVE_CLIP_IDX( m_lastClipBeforeExport );
+        if( clipOpenAbortedForPrep( reopenResult ) ) retryClipReopenAfterPrepAbort( m_lastClipBeforeExport );
         //Unblock GUI
         setEnabled( true );
         //Export is ready

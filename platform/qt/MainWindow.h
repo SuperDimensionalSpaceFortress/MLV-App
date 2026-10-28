@@ -890,6 +890,9 @@ private:
     bool m_audioExportEnabled;
     bool m_hdrExport;
     bool m_exportAbortPressed;
+    // r3: an export job whose open a busy prep task refused is retried, not dropped.
+    bool m_exportRetryHeadJob = false;
+    int m_exportOpenAbortRetries = 0;
     bool m_zoomTo100Center;
     bool m_zoomModeChanged;
     bool m_playbackStopped;
@@ -1873,6 +1876,7 @@ private:
     void replaceReceipt(ReceiptSettings *receiptTarget, ReceiptSettings *receiptSource , bool paste);
     void resetReceiptWithDefault( ReceiptSettings *receipt );
     int showFileInEditor(int row);
+    void retryClipReopenAfterPrepAbort( int row );
     void addClipToExportQueue( int row, QString fileName );
     void previewPicture( int row );
     void setPreviewMode( void );
