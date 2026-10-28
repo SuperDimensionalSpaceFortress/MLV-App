@@ -2338,30 +2338,29 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     if ($null -eq $Sweep) { return $Report }
     $current = [string]$Report.reason
     if ($current.Contains('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE')) { return $Report }
-    # the record is the job's [ordered] table (a key may be absent: the job's default before Start-PresentMonCapture ran has two) or an object; strict mode throws on an absent member, so read by name
-    $field = {
-        param([string]$Name)
-        if ($Sweep -is [System.Collections.IDictionary]) { if ($Sweep.Contains($Name)) { return $Sweep[$Name] }; return $null }
-        $property = $Sweep.PSObject.Properties[$Name]
-        if ($null -ne $property) { return $property.Value }
-        return $null
-    }
+    # the record is the job's [ordered] table (a key may be absent: the job's default before Start-PresentMonCapture ran has two) or an object; strict mode throws on an absent member, so read by name.
+    # r2: copied into a plain table first (no call operator: the job splices this body and the spliced-body scan, R3, rejects `& <scriptblock>`); an absent key reads as $null
+    $field = @{}
     $parts = @()
     try {
-        $skipped = [string](& $field 'skippedReason')
+        foreach ($name in @('skippedReason', 'abortedReason', 'remaining', 'deferred', 'listError', 'error', 'livePresentMonProcessIds')) {
+            if ($Sweep -is [System.Collections.IDictionary]) { if ($Sweep.Contains($name)) { $field[$name] = $Sweep[$name] } }
+            else { $property = $Sweep.PSObject.Properties[$name]; if ($null -ne $property) { $field[$name] = $property.Value } }
+        }
+        $skipped = [string]$field['skippedReason']
         if (-not [string]::IsNullOrEmpty($skipped)) { $parts += "skipped=$skipped" }
-        $aborted = [string](& $field 'abortedReason')
+        $aborted = [string]$field['abortedReason']
         if (-not [string]::IsNullOrEmpty($aborted)) { $parts += "aborted=$aborted" }
-        $remaining = @(@(& $field 'remaining') | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        $remaining = @(@($field['remaining']) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
         if ($remaining.Count -gt 0) { $parts += "remaining=$($remaining -join ',')" }
-        $deferred = @(@(& $field 'deferred') | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        $deferred = @(@($field['deferred']) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
         if ($deferred.Count -gt 0) { $parts += "deferred=$($deferred -join ',')" }
-        $listError = [string](& $field 'listError')
+        $listError = [string]$field['listError']
         if (-not [string]::IsNullOrEmpty($listError)) { $parts += "listError=$listError" }
-        $sweepError = [string](& $field 'error')
+        $sweepError = [string]$field['error']
         if (-not [string]::IsNullOrEmpty($sweepError)) { $parts += "error=$sweepError" }
         if ($parts.Count -eq 0) { return $Report }
-        $livePids = @(@(& $field 'livePresentMonProcessIds') | Where-Object { $null -ne $_ })
+        $livePids = @(@($field['livePresentMonProcessIds']) | Where-Object { $null -ne $_ })
         if ($livePids.Count -gt 0) { $parts += "livePids=$($livePids -join ',')" }
     } catch {
         return $Report

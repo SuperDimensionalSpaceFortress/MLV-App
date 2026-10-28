@@ -1541,18 +1541,18 @@ function Get-PresentMonParentIdentity([int]$ProcessId, [string]$Name) {
     if ($Name -ine 'PresentMonService') { return $result }
     try {
         $self = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop | Where-Object { [int]$_.ProcessId -eq $ProcessId })
-        if ($self.Count -ne 1) { $result.identityError = "process_row_count=$($self.Count)"; return $result }
+        if ($self.Count -ne 1) { $result['identityError'] = "process_row_count=$($self.Count)"; return $result }
         $parentId = [int]$self[0].ParentProcessId
-        $result.parentPid = $parentId
+        $result['parentPid'] = $parentId
         $parentRows = @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $parentId" -ErrorAction Stop | Where-Object { [int]$_.ProcessId -eq $parentId })
-        if ($parentRows.Count -ne 1) { $result.identityError = "parent_row_count=$($parentRows.Count)"; return $result }
-        $result.parentName = [string]$parentRows[0].Name
-        if ($null -eq $self[0].CreationDate -or $null -eq $parentRows[0].CreationDate) { $result.identityError = 'creation_date_unreadable'; return $result }
-        if (([datetime]$parentRows[0].CreationDate) -gt ([datetime]$self[0].CreationDate)) { $result.identityError = 'parent_started_after_child'; return $result }
-        if ($result.parentName -ieq 'IntelGraphicsSoftware.Service.exe') { $result.nonCaptureIdentity = 'intel_graphics_presentmonservice' }
+        if ($parentRows.Count -ne 1) { $result['identityError'] = "parent_row_count=$($parentRows.Count)"; return $result }
+        $result['parentName'] = [string]$parentRows[0].Name
+        if ($null -eq $self[0].CreationDate -or $null -eq $parentRows[0].CreationDate) { $result['identityError'] = 'creation_date_unreadable'; return $result }
+        if (([datetime]$parentRows[0].CreationDate) -gt ([datetime]$self[0].CreationDate)) { $result['identityError'] = 'parent_started_after_child'; return $result }
+        if ($result.parentName -ieq 'IntelGraphicsSoftware.Service.exe') { $result['nonCaptureIdentity'] = 'intel_graphics_presentmonservice' }
     } catch {
-        $result.nonCaptureIdentity = $null
-        $result.identityError = 'parent_read_failed: ' + $_.Exception.Message
+        $result['nonCaptureIdentity'] = $null
+        $result['identityError'] = 'parent_read_failed: ' + $_.Exception.Message
     }
     return $result
 }

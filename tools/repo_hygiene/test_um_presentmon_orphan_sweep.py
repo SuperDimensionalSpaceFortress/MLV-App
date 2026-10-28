@@ -799,8 +799,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertTrue(sweep["ran"])
 
     def test_mutation_a_parent_read_failure_read_as_identity_is_not_fail_closed(self) -> None:
-        mutated = mutate(TEMPLATE, "        $result.nonCaptureIdentity = $null\n        $result.identityError = 'parent_read_failed: ' + $_.Exception.Message",
-                         "        $result.nonCaptureIdentity = 'intel_graphics_presentmonservice'\n        $result.identityError = 'parent_read_failed: ' + $_.Exception.Message")
+        mutated = mutate(TEMPLATE, "        $result['nonCaptureIdentity'] = $null\n        $result['identityError'] = 'parent_read_failed: ' + $_.Exception.Message",
+                         "        $result['nonCaptureIdentity'] = 'intel_graphics_presentmonservice'\n        $result['identityError'] = 'parent_read_failed: ' + $_.Exception.Message")
         _code, sweep, _d, _out = self.run_start("mut-read-open", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, process_lookup_fails=True, text=mutated)
         self.assertTrue(sweep["ran"], "the mutation sweeps on a parent it could not read")
 
