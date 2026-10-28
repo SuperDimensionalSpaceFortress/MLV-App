@@ -2633,15 +2633,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(re.findall(r'(?<![\w-])L "[A-Z_]+', between), [], "a direct L call outside the batch try throws out of the script on a held batch.log")
         self.assertIn('LogBest "BATCH_WAIT batch=', between)
 
-    def _two_batch_plan(self, inject: str) -> tuple[list[str], dict, tuple[str, str]]:
+    def _two_batch_plan(self, inject: str, occupy: tuple = ("batches.jsonl",), extra: tuple = ()) -> tuple[list[str], dict, tuple[str, str]]:
         """A two-leg plan whose first lease holds one leg (two batches), batches.jsonl a directory: (args, env, the runner patch that runs `inject` (PowerShell) in batch 2 just before
         the claim-time input guard)."""
-        self._occupy_with_directory("batches.jsonl")
+        self._occupy_with_directory(*occupy)
         spec2 = self.case / "fx-b-copy.json"
         spec2.write_text(self.specs[1].read_text(encoding="utf-8"), encoding="utf-8")
         plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(spec2, "A", self.commit_a)])
-        anchor = "        $hit = Get-InputOutputRefusal\n        if ($hit) {\n"
-        args, e = self.plan_cmd(plan, FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
+        anchor = "        $hit = Get-InputOutputRefusal\n"   # the claim-time guard (the only 8-space one); independent of what follows it, so the same fixture runs on a runner without the sticky hit
+        args, e = self.plan_cmd(plan, *extra, FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
         return args, e, (anchor, f"        if ($batchNo -eq 2) {{ {inject} }}\n" + anchor)
 
     def _two_batch_plan_refused_at_batch_2(self, inject: str) -> tuple[subprocess.CompletedProcess, Path]:
@@ -2707,9 +2707,61 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertTrue(snap.exists(), "the link was made inside the diagnostic (the case under test)\n" + r.stdout + r.stderr)
         self.assertEqual((self.run_dir / "batch-01.json").read_bytes(), snap.read_bytes(), "the receipt rewrite went through the new link and overwrote the accepted input\n" + r.stdout + r.stderr)
-        self.assertIn("BATCH_RECEIPT_REWRITE_SKIPPED batch=1 ", r.stderr)
+        self.assertIn("BATCH_RECEIPT_WRITE_SKIPPED batch=1 ", r.stderr)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_SPEC_IS_RUN_OUTPUT", r.stderr + r.stdout)
+
+    def _link_spec2_to_a_receipt_inside_the_first_diagnostic(self, target: str, occupy: tuple, restore: bool = False, extra: tuple = ()) -> tuple[subprocess.CompletedProcess, Path, Path]:
+        """Two batches (batch 1 ran one leg); `occupy` receipt files are directories. The first RECEIPT_PERSIST_FAILED line, inside a copy of the runner, makes the second leg's spec a hard link to
+        RunDir\\<target> (snapshotting the receipt `target` first when it exists); with `restore`, batch 2's claim guard first unlinks it and puts the original spec bytes back.
+        Returns (result, the spec, the snapshot of the spec's original bytes)."""
+        spec2, original = self.case / "fx-b-copy.json", self.case / "fx-b-copy.json.orig"
+        ps2 = psq(spec2)
+        args, e, (guard_old, guard_new) = self._two_batch_plan("", occupy, extra)
+        original.write_bytes(spec2.read_bytes())
+        # a receipt that does not exist yet (batches.jsonl, batch-02.json) is created AS the link to the spec; one that exists (batch-01.json) is linked from the spec's path
+        make = (f"New-Item -ItemType HardLink -Path (Join-Path $RunDir '{target}') -Value '{ps2}' | Out-Null" if target != "batch-01.json"
+                else f"[IO.File]::Delete('{ps2}'); New-Item -ItemType HardLink -Path '{ps2}' -Value (Join-Path $RunDir '{target}') | Out-Null")
+        link = (f"if (-not $script:LinkDone -and $Message.StartsWith('RECEIPT_PERSIST_FAILED', [StringComparison]::Ordinal)) {{ $script:LinkDone = $true; {make}; "
+                "throw [IO.IOException]::new('locked') }")
+        anchor_l = "function L([string]$Message) {\n"
+        patches = [(anchor_l, anchor_l + "    " + link + "\n")]
+        if restore:
+            undo = f"[IO.File]::Delete('{ps2}'); [IO.File]::Copy('{psq(original)}', '{ps2}')"
+            patches.append((guard_old, f"        if ($batchNo -eq 2) {{ {undo} }}\n" + guard_old))
+        args[args.index("-File") + 1] = str(self._patched_runner(*patches[0], *patches[1:]))
+        return subprocess.run(args, capture_output=True, text=True, timeout=120, env=e), spec2, original
+
+    def test_r4_adv2_a1_the_jsonl_line_is_not_appended_to_an_input_that_became_a_link_to_batches_jsonl_during_the_diagnostic(self) -> None:
+        # adversary r4 pass 2 A1: the batches.jsonl append (and the pre-claim deadline path's receipt writes) had no alias guard, only the rewrite did. batch-01.json is a directory, so its
+        # diagnostic runs first; in it the second leg's spec becomes batches.jsonl itself. Every receipt write now asks (Write-ReceiptFile), so the append is skipped.
+        r, spec2, original = self._link_spec2_to_a_receipt_inside_the_first_diagnostic("batches.jsonl", ("batch-01.json",))
+        self.assertEqual(spec2.read_bytes(), original.read_bytes(), "the receipt line was appended into the accepted input\n" + r.stdout + r.stderr)
+        self.assertIn("BATCH_RECEIPT_WRITE_SKIPPED batch=1 ", r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_SPEC_IS_RUN_OUTPUT", r.stderr + r.stdout)
+
+    def test_r4_adv2_a1_the_pre_claim_deadline_receipt_is_not_written_through_an_input_that_became_a_link_to_it(self) -> None:
+        # adversary r4 pass 2 A1, sibling (the pre-claim deadline path, which writes batch-02.json before any claim guard): the second leg's spec becomes batch-02.json inside batch 1's
+        # diagnostic, and a 1800 s cooldown sends batch 2 to the deadline path, whose receipt write would overwrite the spec.
+        r, spec2, original = self._link_spec2_to_a_receipt_inside_the_first_diagnostic("batch-02.json", ("batch-01.json",), extra=("-LeaseCooldownSec", "1800"))
+        self.assertEqual(spec2.read_bytes(), original.read_bytes(), "the deadline path's receipt was written into the accepted input\n" + r.stdout + r.stderr)
+        self.assertIn("BATCH_RECEIPT_WRITE_SKIPPED batch=1 ", r.stderr)   # batch-01.json is a directory (no rewrite guard behind it): the batches.jsonl append is the guarded write
+        self.assertIn("BATCH_RECEIPT_NOT_WRITTEN batch=2 ", r.stderr)
+
+    def test_r4_adv2_a2_an_alias_seen_while_a_receipt_was_written_stays_seen_after_the_link_is_gone(self) -> None:
+        # adversary r4 pass 2 A2: the skipped rewrite turned the suppression on but saved no hit, so a link removed (and the spec restored) before batch 2's claim guard let batch 2 write
+        # leg-plan.json, open a lease and run a probe and a leg despite the announced suppression. The hit is sticky: batch 2's guard re-reports it, so the run ends in the typed refusal.
+        r, spec2, original = self._link_spec2_to_a_receipt_inside_the_first_diagnostic("batch-01.json", ("batches.jsonl",), restore=True)
+        self.assertEqual(spec2.read_bytes(), original.read_bytes(), "the spec was restored by the test before batch 2's guard (the case under test)")
+        m = re.search(r"LEG_PLAN_REFUSED reason=(\S+) item=2 ", r.stderr)
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        self.assertEqual(m.group(1), "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, "no lease is opened for batch 2")
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (2, "LEG_SPEC_IS_RUN_OUTPUT", 1, 1))
 
     def test_r4_adv_a1_the_batch_receipt_rewrite_still_happens_when_no_input_is_a_run_output(self) -> None:
         # the control: the same diagnostic log failure with no link rewrites batch-01.json with the count (r2's second per-batch write), so the new guard changes nothing else
@@ -2719,7 +2771,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
         self.assertGreaterEqual(json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))["logWriteFailures"], 1, "batch-01.json was rewritten with the diagnostic's log failure")
-        self.assertNotIn("BATCH_RECEIPT_REWRITE_SKIPPED", r.stderr)
+        self.assertNotIn("BATCH_RECEIPT_WRITE_SKIPPED", r.stderr)
 
     # r3 (sol r2b B2 = catalogue RPF-02): the lock helper took batch.log after its marker wait expired or was cancelled, whether or not the runner had paused, so a slow start was
     # locked ahead of the pause (and died on its next direct L), and 'locked' was written for a runner that never paused. These drive the helper alone: no runner, no pause marker.

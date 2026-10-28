@@ -803,8 +803,24 @@ $batchNo = 0
 # RESULT, not a throw. Each write is tried on its own; a failure keeps the in-memory row ($batches) and its error here, is logged once as RECEIPT_PERSIST_FAILED file=<path> reason=<msg>,
 # and reaches the summary (receiptPersistFailures) and the exit code (13 when nothing worse was selected), so the summary is never skipped and a lost receipt is never exit 0.
 $script:receiptPersistFailures = [System.Collections.Generic.List[object]]::new()
+# adversary r4 A1/A2 (the class of the rewrite alias): an accepted input (the next leg's spec, the plan) can become a link to a receipt file in the window between the last alias guard and ANY receipt
+# write, most easily inside the diagnostic of the write before it. So every receipt write asks first (this is the one function they all go through), a location hit skips the write and turns the
+# suppression on (Test-OpenOutputAlias's rule: nothing more goes into -RunDir), and the hit is STICKY ($script:receiptAliasHit): the next batch's claim guard re-reports it even if the link
+# is gone by then, so no probe, leg or write follows an alias that was seen. A content hit is no alias: the write goes on. Writes to stderr only (never the output stream).
+$script:receiptAliasHit = $null
+function Test-ReceiptWriteSuppressed([int]$Batch, [string]$Path) {
+    if (-not $script:RunOutputAliased) {
+        $aliasHit = Get-InputOutputRefusal
+        if (-not ($aliasHit -and $aliasHit.kind -cne 'content')) { return $false }
+        $script:receiptAliasHit = $aliasHit
+        $script:RunOutputAliased = $true; $script:batchLog = $null
+    }
+    [Console]::Error.WriteLine("BATCH_RECEIPT_WRITE_SKIPPED batch=$Batch file=$Path (an accepted input is a runner output; nothing more is written into -RunDir)")
+    $true
+}
 function Write-ReceiptFile([int]$Batch, [string]$Path, [scriptblock]$Write) {
     $script:receiptFileWritten = $false   # not a return value: L writes its line to the output stream, which a captured return would swallow
+    if (Test-ReceiptWriteSuppressed $Batch $Path) { return }
     try { & $Write; $script:receiptFileWritten = $true } catch {
         $why = ($_.Exception.Message -replace '\s+', ' ')
         $script:receiptPersistFailures.Add([ordered]@{ batch = $Batch; file = $Path; reason = $why })
@@ -824,16 +840,7 @@ function Write-BatchReceipt([System.Collections.IDictionary]$B) {
     Write-ReceiptFile $B.batch $perBatch $putPerBatch
     $perBatchOk = $script:receiptFileWritten
     Write-ReceiptFile $B.batch $jsonl { $rec.logWriteFailures = $script:logWriteFailures; Add-Content -LiteralPath $jsonl -Value ($rec | ConvertTo-Json -Compress -Depth 8) -ErrorAction Stop }
-    if ($perBatchOk -and $snap.perBatch -ne $script:logWriteFailures) {
-        # adversary r4 A1: the rewrite is a write the base never made, and the diagnostic before it can take time: an accepted input (the next leg's spec) can have become a link to batch-NN.json
-        # since the last alias guard ran, and WriteAllText would overwrite it. The guard runs again right before the rewrite; a location hit skips the write and turns the suppression on
-        # (Test-OpenOutputAlias's rule), so nothing more goes into -RunDir and the next batch's own guard ends the run in the typed refusal. A content hit is no alias: the rewrite goes on.
-        $aliasHit = Get-InputOutputRefusal
-        if ($aliasHit -and $aliasHit.kind -cne 'content') {
-            $script:RunOutputAliased = $true; $script:batchLog = $null
-            [Console]::Error.WriteLine("BATCH_RECEIPT_REWRITE_SKIPPED batch=$($B.batch) file=$perBatch (an accepted input is a runner output; nothing more is written into -RunDir)")
-        } else { Write-ReceiptFile $B.batch $perBatch $putPerBatch }
-    }
+    if ($perBatchOk -and $snap.perBatch -ne $script:logWriteFailures) { Write-ReceiptFile $B.batch $perBatch $putPerBatch }   # guarded like every receipt write, right before the write
 }
 # BACHELOR-DEDICATED-CAPS-RUNNER-1: the caps are Bachelor's heavy-slot.lease.json (the owner moves them), so they are READ, not mirrored: one light exempt job
 # (GateExemptJobPattern ^venue-quiet-probe-: no lease, no slot, no venue claim) prints the file; anything unreadable or invalid is the old constants (the tightest ever
@@ -931,6 +938,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         # r11 (sol r10 blocker 3): the preflight guard ran before this wait, which can be long, and an alias to an output can appear in it. The same guard runs again after every attempt,
         # before the first write (the CLAIM_* log lines, leg-plan.json): a hit releases a claim just taken, opens no lease and ends in the typed refusal (exit 2).
         $hit = Get-InputOutputRefusal
+        if (-not $hit -and $script:receiptAliasHit) { $hit = $script:receiptAliasHit }   # adversary r4 A2: an alias seen while a receipt was written stays seen, whatever the link is by now
         if ($hit) {
             if ($req.granted) { try { [void](Release-VenueClaim -Venue $Venue -Nonce $req.claim.nonce -ClaimDir $ClaimDir) } catch { } }
             # r3 (opus r2b H3): once a batch receipt exists, this refusal ends the run like any other stop: the summary (receiptPersistFailures included) is printed before the typed
