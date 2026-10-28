@@ -156,6 +156,9 @@ PATHNAME_DELETE_ALLOWED = {
         "(Get-ChildItem -Filter '*.holder.json' / '*.lease.json').",
     ("ultra-magnus-agent.ps1", "Remove-Item -LiteralPath $Lease.recordFile -Force -ErrorAction SilentlyContinue"):
         "Stop-QuietLease: slot-holders\\<jobId>.<guid>.lease.json, the ended quiet lease's own record (BACHELOR-AGENT-QUIET-LEASE-1).",
+    ("ultra-magnus-agent.ps1", "if ($recordFile) { Remove-Item -LiteralPath $recordFile -Force -ErrorAction SilentlyContinue }"):
+        "Start-HeavySlotHolder / Start-QuietLeaseRequest post-start failure: slot-holders\\<jobId>.<guid>.holder.json or .lease.json, "
+        "the record this call just wrote for a child it has now stopped (AGENT-LEASE-HEAT-TRACE-BOUND-HARDEN-1 r2).",
     ("ultra-magnus-agent.ps1", "Get-ChildItem -LiteralPath $slotHolders -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '\\.(acquired\\.json|release|tmp)$' } | Remove-Item -Force -ErrorAction SilentlyContinue"):
         "slot-holders\\ side files only (*.acquired.json, *.release, *.tmp) left by a dead agent's holders.",
     ("ultra-magnus-agent.ps1", "Remove-Item Env:\\MLV_AGENT_ADMISSION, Env:\\MLV_AGENT_ADMISSION_THERMAL, Env:\\MLV_AGENT_ADMISSION_WAIT_SEC, Env:\\HEAVY_SLOT_HELD -ErrorAction SilentlyContinue"):
