@@ -36,6 +36,9 @@ requires_windows_pwsh = tvlb.requires_windows_pwsh
 # The stub thermal source: the fake quiet probe prints a "tele heat" line in Wait-VenueQuiet's format. FAKE_HEAT is a comma list per probe call (the last
 # repeats): a throttled row count (mean 70 C), NA (an unreadable feed), or HOT_UNTIL_SKIP (hot until batch.log carries a THERMAL_HOT_SKIPPED line).
 HEAT_STUB = r"""
+# FAKE_PROBE_SLEEP: seconds this probe call takes (a comma list per call, the last repeats): the probe's own duration, so a later probe can be slower than the earlier ones
+$sleepSpec = @(([string]$env:FAKE_PROBE_SLEEP) -split ',' | Where-Object { $_ })
+if ($sleepSpec.Count -gt 0) { Start-Sleep -Seconds ([int]$sleepSpec[[Math]::Min($n, $sleepSpec.Count - 1)]) }
 $heatSpec = @(([string]$env:FAKE_HEAT) -split ',' | Where-Object { $_ })
 if ($heatSpec.Count -gt 0) {
     $hv = $heatSpec[[Math]::Min($n, $heatSpec.Count - 1)]
@@ -284,6 +287,41 @@ class ThermalGateRunnerTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         [b] = self.batches()
         self.assertEqual((b["legs"][0]["status"], b["legs"][0]["heatAtLaunch"], b["thermalWaits"], b["thermalSkips"]), ("RAN", "clear", 1, 0), b["legs"])
+
+    # BACHELOR-THERMAL-GATE-WAIT-1 r2 (Dot P2 on a523d461): the cap is a SOFT budget, cap + one probe. The runner bounds when a re-probe STARTS (from the
+    # previous probe's duration) and the probe's wait for quiet, but not the probe's own sample window, so a later probe slower than the earlier ones ends past
+    # the cap. The receipt names the overshoot (thermalWaitOvershootSec = max(0, thermalWaitSec - cap)); a leg still hot then is skipped, never run hot.
+    # Cap 12 s, poll 3 s, probes of about 2 s (plus the stub's start-up) then one of 8 s: the third probe was predicted to end inside the cap and ends at ~18 s.
+    SLOW_LATER = dict(FAKE_PROBE_SLEEP="2,2,8")
+
+    def test_dot_p2_a_slower_later_probe_ends_past_the_cap_and_the_skip_names_the_overshoot(self) -> None:
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "12", "-ThermalPollSec", "3", "-ThermalRequeueMax", "0", FAKE_HEAT="9", **self.SLOW_LATER)
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        self.assertEqual([x for x in self.kinds() if x.startswith("LEG:")], [], "a leg still hot after the slow probe is never launched")
+        [b] = self.batches()
+        [row] = b["legs"]
+        self.assertEqual(row["status"], "THERMAL_HOT_SKIPPED", row)
+        self.assertGreater(row["thermalWaitSec"], 12, "the slow probe really ended past the cap (else this test proves nothing)")
+        self.assertEqual(row["thermalWaitOvershootSec"], row["thermalWaitSec"] - 12, row)
+        # soft budget = cap + ONE probe: the overshoot is no more than the slow probe (8 s + stub start-up), never a second one
+        self.assertLessEqual(row["thermalWaitOvershootSec"], 8 + 7, row)
+        self.assertIn(f"overshootSec={row['thermalWaitOvershootSec']}", self.log())
+        self.assertIn("softBudget=cap+oneProbe", self.log())
+
+    def test_dot_p2_a_slow_probe_that_reads_clear_runs_the_leg_and_records_the_overshoot(self) -> None:
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "12", "-ThermalPollSec", "3", FAKE_HEAT="9,9,0", **self.SLOW_LATER)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [row] = b["legs"]
+        self.assertEqual((row["status"], row["heatAtLaunch"]), ("RAN", "clear"), row)
+        self.assertGreater(row["thermalWaitSec"], 12, row)
+        self.assertEqual(row["thermalWaitOvershootSec"], row["thermalWaitSec"] - 12, row)
+
+    def test_no_overshoot_is_recorded_as_zero_when_the_wait_ends_inside_the_cap(self) -> None:
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "120", FAKE_HEAT="9,0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual(b["legs"][0]["thermalWaitOvershootSec"], 0, b["legs"][0])
 
     def test_unknown_heat_is_not_gated(self) -> None:
         r = self.run_batch([self.specs[0]], FAKE_HEAT="NA")

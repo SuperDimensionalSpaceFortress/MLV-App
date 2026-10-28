@@ -101,8 +101,11 @@
 #      directly after a CPU-saturating leg. a. WAIT FOR COOL: a QUIET in-lease probe whose own "tele heat" reading (the agent's heavy-slot feed and hot rule)
 #      is hot is re-probed every -ThermalPollSec for up to -ThermalWaitCapSec (180) from its first hot reading in the batch; still hot then, the leg is
 #      THERMAL_HOT_SKIPPED and re-queued at the end of the run (at most -ThermalRequeueMax times; past that it stays THERMAL_HOT_SKIPPED, uncounted, exit 7).
-#      Unknown heat is not gated. Each RAN row records thermalWaitSec, heatAtProbe (the first reading), heatAtLaunch and the agent's heatAtGrant; the batch
-#      receipt counts thermalWaits and thermalSkips. b. SPREAD: -PlanOrder ThermalSpread -HeatFrom <earlier run dirs> measures heavy leg keys from those
+#      THE CAP IS A SOFT BUDGET, cap + one probe (Dot P2 on a523d461): no re-probe is started unless the previous probe's duration says it can end inside the
+#      cap, and a re-probe's wait for quiet is cut to what is left of the cap, but a probe's own remote sample window and job queue limits (Wait-VenueQuiet.ps1)
+#      cannot be bounded from here, so a later probe slower than the one before can end past it. thermalWaitOvershootSec records exactly that (0 inside the cap).
+#      Unknown heat is not gated. Each RAN row records thermalWaitSec, thermalWaitOvershootSec, heatAtProbe (the first reading), heatAtLaunch and the agent's
+#      heatAtGrant; a skipped row records thermalWaitSec and thermalWaitOvershootSec; the batch receipt counts thermalWaits and thermalSkips. b. SPREAD: -PlanOrder ThermalSpread -HeatFrom <earlier run dirs> measures heavy leg keys from those
 #      receipts (a key whose next leg on the same lease read hot) and orders the plan so no two heavy legs are adjacent (leg-plan.json thermalSpread).
 #      The inter-lease cooldown (CAPS b) is untouched.
 # It changes nothing on Bachelor: not heavy-slot.py's caps, not its lease file, not the quiet threshold. A batch run needs the lease-batch agent deployed.
@@ -135,7 +138,8 @@ param(
     [Parameter(ParameterSetName = 'Plan')][ValidateSet('AsGiven', 'Interleave', 'ThermalSpread')][string]$PlanOrder = 'AsGiven',
     # BACHELOR-THERMAL-GATE-WAIT-1 (item 10): the earlier lease-batch run dirs whose receipts measure which legs are heavy (-PlanOrder ThermalSpread)
     [Parameter(ParameterSetName = 'Plan')][string[]]$HeatFrom = @(),
-    # item 10: a QUIET probe that reads hot is re-probed for up to this long before the leg is THERMAL_HOT_SKIPPED and re-queued (0 = no thermal gate)
+    # item 10: a QUIET probe that reads hot is re-probed for up to this long before the leg is THERMAL_HOT_SKIPPED and re-queued (0 = no thermal gate).
+    # A SOFT budget, cap + one probe: a probe's own sample window cannot be bounded from here (receipts name the overshoot as thermalWaitOvershootSec)
     [ValidateRange(0, 1800)][int]$ThermalWaitCapSec = 180,
     [ValidateRange(1, 600)][int]$ThermalPollSec = 30,
     [ValidateRange(0, 5)][int]$ThermalRequeueMax = 1,
@@ -1061,7 +1065,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 $attempt++
                 $probeWait = [int][Math]::Max(0, [Math]::Min($ProbeMaxWaitSec, $room - $legBudget))
-                # adversary r1b A1: a re-probe during a thermal wait may wait for quiet only for what is left of the thermal cap (its fixed sample window still runs)
+                # adversary r1b A1: a re-probe during a thermal wait may wait for quiet only for what is left of the thermal cap. Its fixed sample window and the remote
+                # job's own queue limits still run and are not bounded here: the cap is a soft budget (cap + one probe), see the sleepFit comment below
                 $thw = $legThermal[$leg.name]
                 if ($ThermalWaitCapSec -gt 0 -and $null -ne $thw -and $null -ne $thw.firstHotUtc -and $thw.batch -eq $batchNo) {
                     $probeWait = [int][Math]::Max(0, [Math]::Min($probeWait, $ThermalWaitCapSec - [Math]::Floor(([DateTime]::UtcNow - $thw.firstHotUtc).TotalSeconds)))
@@ -1099,8 +1104,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($null -eq $th.firstHeat) { $th.firstHeat = $q.heat; $th.firstHeatText = $q.heatText }
                 $gs = $(if ($ThermalWaitCapSec -gt 0) { Get-VenueThermalGateStep -Heat $q.heat -FirstHotUtc $th.firstHotUtc -NowUtc ([DateTime]::UtcNow) -CapSec $ThermalWaitCapSec } else { [pscustomobject]@{ step = 'RUN'; firstHotUtc = $null; waitSec = 0; remainingSec = 0 } })
                 $th.firstHotUtc = $gs.firstHotUtc; $th.waitSec = $gs.waitSec
-                # adversary r1 A9 / r1b A2: a re-probe is started only if it can end inside the cap (the last probe's own duration counts): the sleep is shortened
-                # to fit, and only when not even a 1 s sleep fits is the leg skipped now
+                # adversary r1 A9 / r1b A2: a re-probe is started only if the PREVIOUS probe's duration says it can end inside the cap: the sleep is shortened to fit,
+                # and only when not even a 1 s sleep fits is the leg skipped now. r2 (Dot P2): that is an estimate, not a guarantee. The probe's remote sample window
+                # and job queue limits cannot be bounded from here, so a later probe slower than the one before can end past the cap. The cap is therefore a SOFT
+                # budget, cap + one probe: a leg still hot then is skipped (never run hot), and a leg that reads clear then runs, and the receipt records the excess
+                # as thermalWaitOvershootSec (max(0, waitSec - cap)) so no row claims a wait inside the cap that was not
                 $sleepFit = $ThermalWaitCapSec - $gs.waitSec - $probeSec
                 if ($gs.step -ceq 'WAIT' -and $sleepFit -lt 1) { $gs = [pscustomobject]@{ step = 'SKIP'; firstHotUtc = $gs.firstHotUtc; waitSec = $gs.waitSec; remainingSec = 0 } }
                 if ($gs.step -ceq 'WAIT') {
@@ -1120,11 +1128,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $th.skips++; $requeue = ($th.skips -le $ThermalRequeueMax); $th.firstHotUtc = $null
                     $skipFirstHeat = $th.firstHeat; $skipFirstHeatText = $th.firstHeatText; $th.firstHeat = $null; $th.firstHeatText = $null
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'THERMAL_HOT_SKIPPED'; outcome = 'NOT_RUN'; class = 'THERMAL_HOT_SKIPPED'; counted = $false
-                        thermalWaitSec = $gs.waitSec; heatAtProbe = $skipFirstHeat; heatAtProbeText = $skipFirstHeatText; heatAtSkip = $q.heatText; skips = $th.skips; requeued = $requeue }
+                        thermalWaitSec = $gs.waitSec; thermalWaitOvershootSec = [int][Math]::Max(0, $gs.waitSec - $ThermalWaitCapSec); heatAtProbe = $skipFirstHeat; heatAtProbeText = $skipFirstHeatText; heatAtSkip = $q.heatText; skips = $th.skips; requeued = $requeue }
                     $b.legs.Add([pscustomobject]$row); Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg; $b.thermalSkips++
                     $pending.RemoveAt(0)
                     if ($requeue) { $pending.Add($leg) } else { Add-Result $leg 'THERMAL_HOT_SKIPPED' $row; if ($exitCode -eq 0) { $exitCode = 7 } }
-                    L "LEG $($leg.name) THERMAL_HOT_SKIPPED batch=$batchNo heat=hot ($($q.heatText)) waitSec=$($gs.waitSec) capSec=$ThermalWaitCapSec skips=$($th.skips) requeued=$requeue (not run: never run and discarded)"
+                    L "LEG $($leg.name) THERMAL_HOT_SKIPPED batch=$batchNo heat=hot ($($q.heatText)) waitSec=$($gs.waitSec) capSec=$ThermalWaitCapSec overshootSec=$([int][Math]::Max(0, $gs.waitSec - $ThermalWaitCapSec)) softBudget=cap+oneProbe skips=$($th.skips) requeued=$requeue (not run: never run and discarded)"
                     continue
                 }
                 # QUIET under the lease: the leg, on the same lease (r5b, Grok G1: while the claim is still this run's).
@@ -1227,7 +1235,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($legFF) { $row['foreignFloorLine'] = $legForeign[$leg.name] }
                 if ($detail) { $row['outcomeDetail'] = $detail }
                 # item 10: the thermal gate's receipt per leg: how long it waited for heat, the first and the launch reading, and the agent's own at grant
-                $row['thermalWaitSec'] = $th.waitSec; $row['thermalSkips'] = $th.skips; $row['heatAtProbe'] = $th.firstHeat; $row['heatAtProbeText'] = $th.firstHeatText; $row['heatAtLaunch'] = $q.heat
+                $row['thermalWaitSec'] = $th.waitSec; $row['thermalWaitOvershootSec'] = $(if ($ThermalWaitCapSec -gt 0) { [int][Math]::Max(0, $th.waitSec - $ThermalWaitCapSec) } else { 0 }); $row['thermalSkips'] = $th.skips; $row['heatAtProbe'] = $th.firstHeat; $row['heatAtProbeText'] = $th.firstHeatText; $row['heatAtLaunch'] = $q.heat
                 $row['heatAtGrant'] = $(if ($null -ne $ja -and $ja.PSObject.Properties['heat'] -and $ja.heat) { [string]$ja.heat } else { 'unknown' })
                 if ($agentStop) { $row['leaseStop'] = $agentStop }
                 if ($withdraw) { $row['withdraw'] = $withdraw }
