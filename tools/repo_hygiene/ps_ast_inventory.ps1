@@ -67,7 +67,7 @@ function Get-Inventory([string]$Text) {
                 if ($head -is [System.Management.Automation.Language.VariableExpressionAst] -and -not $head.Splatted) { $headVar = Get-UnqualifiedName $head.VariablePath }
                 $elements = @()
                 foreach ($el in @($node.CommandElements | Select-Object -Skip 1)) {
-                    $row = [ordered]@{ kind = $el.GetType().Name; param = $null; param_arg = $null; value = $null; string_type = $null; splatted = $false }
+                    $row = [ordered]@{ kind = $el.GetType().Name; text = $el.Extent.Text; param = $null; param_arg = $null; value = $null; string_type = $null; splatted = $false }
                     if ($el -is [System.Management.Automation.Language.CommandParameterAst]) {
                         $row.param = $el.ParameterName
                         if ($null -ne $el.Argument) {
@@ -98,10 +98,12 @@ function Get-Inventory([string]$Text) {
                 if ($node.Member -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $name = $node.Member.Value }
                 $invoke = $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]
                 $on = $null
+                $onVar = $null
+                if ($node.Expression -is [System.Management.Automation.Language.VariableExpressionAst]) { $onVar = Get-UnqualifiedName $node.Expression.VariablePath }
                 if ($node.Static -and $node.Expression -is [System.Management.Automation.Language.TypeExpressionAst]) { $on = $node.Expression.TypeName.FullName }
                 $argKinds = @()
                 if ($invoke) { foreach ($a in @($node.Arguments)) { if ($null -ne $a) { $argKinds += $a.GetType().Name } } }
-                $inv.members += [ordered]@{ line = $line; name = $name; kind = $node.Member.GetType().Name; static = [bool]$node.Static; on = $on; invoke = $invoke; args = $argKinds }
+                $inv.members += [ordered]@{ line = $line; name = $name; kind = $node.Member.GetType().Name; text = $node.Extent.Text; static = [bool]$node.Static; on = $on; on_var = $onVar; invoke = $invoke; args = $argKinds }
                 break
             }
             { $_ -is [System.Management.Automation.Language.FunctionDefinitionAst] } { $inv.functions += [ordered]@{ line = $line; name = $node.Name }; break }
@@ -119,10 +121,12 @@ function Get-Inventory([string]$Text) {
                 if ($left -is [System.Management.Automation.Language.VariableExpressionAst]) { $name = Get-UnqualifiedName $left.VariablePath }
                 # every variable named anywhere on the left ($a, $b = ..., $x.P = ..., $h[$k] = ...), so a multiple assignment cannot hide a target
                 $names = @($node.Left.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { Get-UnqualifiedName $_.VariablePath })
-                $inv.assignments += [ordered]@{ line = $line; name = $name; names = $names; operator = $node.Operator.ToString(); right = (Get-ExpressionKind $node.Right) }
+                $drive = $null
+                if ($left -is [System.Management.Automation.Language.VariableExpressionAst] -and $left.VariablePath.IsDriveQualified) { $drive = $left.VariablePath.UserPath }
+                $inv.assignments += [ordered]@{ line = $line; name = $name; names = $names; drive = $drive; operator = $node.Operator.ToString(); right = (Get-ExpressionKind $node.Right); left_text = $node.Left.Extent.Text; right_text = $node.Right.Extent.Text }
                 break
             }
-            { $_ -is [System.Management.Automation.Language.ForEachStatementAst] } { $inv.foreach_vars += [ordered]@{ line = $line; name = (Get-UnqualifiedName $node.Variable.VariablePath) }; break }
+            { $_ -is [System.Management.Automation.Language.ForEachStatementAst] } { $inv.foreach_vars += [ordered]@{ line = $line; name = (Get-UnqualifiedName $node.Variable.VariablePath); in_text = $node.Condition.Extent.Text }; break }
             { $_ -is [System.Management.Automation.Language.ParameterAst] } {
                 $types = @($node.Attributes | Where-Object { $_ -is [System.Management.Automation.Language.TypeConstraintAst] } | ForEach-Object { $_.TypeName.FullName })
                 $inv.params += [ordered]@{ line = $line; name = (Get-UnqualifiedName $node.Name.VariablePath); types = $types }

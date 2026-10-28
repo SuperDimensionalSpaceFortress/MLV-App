@@ -296,7 +296,65 @@ LANE_DIRTY_SAVE_PS_TYPES = {
     "System.Net.NetworkInformation.NetworkInterface", "System.Runtime.InteropServices.COMException", "System.Security.Cryptography.SHA256",
     "System.StringComparison", "System.StringSplitOptions", "System.Threading.Monitor", "type", "void",
 }
-LANE_DIRTY_SAVE_PS_NEW_OBJECT_TYPES = {"System.Diagnostics.ProcessStartInfo", "System.IO.MemoryStream", "System.Text.UTF8Encoding"}
+# each New-Object by its whole text: a constructor argument can set what a launch runs (ProcessStartInfo('pwsh'), r15 iter 1)
+LANE_DIRTY_SAVE_PS_NEW_OBJECTS = {"New-Object System.Diagnostics.ProcessStartInfo", "New-Object System.IO.MemoryStream", "New-Object System.Text.UTF8Encoding ($false)"}
+# r15 iter 1 (adversary 99ae3557-A1/A2): a child process runs code no census here reads ([Process]::Start('pwsh', ...), git -c alias.x=!cmd, an env
+# var git executes such as GIT_EXTERNAL_DIFF). So every launch is pinned EXACTLY: each git, git-capture and env-write call by its whole argument text,
+# every write to a variable that reaches one (assignment, foreach source, parameter type, method call), the one Process::Start, and no process start in
+# the C# payload. A changed git argument, env name or launch variable fails until it is re-pinned here, which is the review step.
+LANE_DIRTY_SAVE_PS_LAUNCHES = {
+    "git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir",
+    "git -C $Wt rev-parse --show-prefix",
+    "git -C $Wt rev-parse --show-toplevel",
+    "git -C $Wt diff $side --raw --no-renames --no-ext-diff --ignore-submodules=none",
+    "git -C $Wt -c core.quotepath=false status --porcelain --untracked-files=all --ignore-submodules=none",
+    "git -C $Wt -c core.quotepath=false ls-files -u",
+    "git -C $Wt rev-parse -q --verify $ref",
+    "git -C $Wt diff --cached --quiet --no-ext-diff --ignore-submodules=none",
+    "git -C $Wt apply --cached --check -R --whitespace=nowarn $stagedTmp.Path",
+    "git -C $Wt apply --check -R --whitespace=nowarn $patch",
+    "Invoke-DirtyGitCapture -Wt $Wt -GitArgs (@('diff', 'HEAD') + $shape)",
+    "Invoke-DirtyGitCapture -Wt $Wt -GitArgs (@('diff', '--cached') + $shape)",
+    "Test-DirtyPatchComplete -Wt $Wt -Full $full -GitDiffArgs (@('diff', 'HEAD') + $shape)",
+    "Test-DirtyPatchComplete -Wt $Wt -Full $stagedFull -GitDiffArgs (@('diff', '--cached') + $shape)",
+    "Remove-Item -LiteralPath \"Env:$v\"",
+    "Remove-Item -LiteralPath \"Env:$v\" -ErrorAction SilentlyContinue",
+    "Set-Item -LiteralPath \"Env:$v\" -Value $savedEnv[$v]",
+}
+_PS_LAUNCH_COMMANDS = {"git", "invoke-dirtygitcapture", "test-dirtypatchcomplete", "set-item", "remove-item"}
+LANE_DIRTY_SAVE_PS_LAUNCH_VARIABLES = {
+    "Wt", "side", "ref", "patch", "stagedTmp", "shape", "savedEnv", "gitEnv", "gitDir", "psi", "a", "GitArgs", "GitDiffArgs", "v",
+}
+LANE_DIRTY_SAVE_PS_LAUNCH_WRITES = {
+    # assignments (left = right), including every env: write
+    "$psi = New-Object System.Diagnostics.ProcessStartInfo",
+    "$psi.FileName = @(Get-Command git -CommandType Application)[0].Source",
+    "$psi.UseShellExecute = $false", "$psi.RedirectStandardOutput = $true", "$psi.RedirectStandardError = $true", "$psi.CreateNoWindow = $true",
+    "$stagedTmp = $null",
+    "$gitEnv = 'GIT_DIFF_OPTS', 'GIT_EXTERNAL_DIFF', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX'",
+    "$savedEnv = @{}",
+    "$savedEnv[$v] = (Get-Item -LiteralPath \"Env:$v\").Value",
+    "$Wt = (Resolve-Path -LiteralPath $Wt).ProviderPath",
+    "$Wt = $wtReal",
+    "$gitDir = @(& git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir 2>$null)",
+    "$shape = @('--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--submodule=short', '--ignore-submodules=none', '-U3', "
+    "'--src-prefix=a/', '--dst-prefix=b/')",
+    "$patch = $placed.Path",
+    "$stagedTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-staging-' + [Guid]::NewGuid().ToString('N') + '.tmp') $destDir",
+    "$env:GIT_DIR = $gitDir[0]", "$env:GIT_COMMON_DIR = $gitDir[1]", "$env:GIT_WORK_TREE = $Wt",
+    # foreach sources (name in collection)
+    "foreach $a in (@('-C', $Wt) + $GitArgs)", "foreach $a in $target", "foreach $a in (@('-C', $Wt) + $GitDiffArgs)", "foreach $v in $gitEnv",
+    "foreach $side in 'HEAD', '--cached'", "foreach $ref in 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD'",
+    "foreach $v in 'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE'", "foreach $v in $savedEnv.Keys",
+    # parameters (name: types) and method calls on a launch variable
+    "param $Wt: string", "param $GitArgs: string[]", "param $GitDiffArgs: string[]", "param $GitDir: string", "param $Patch: string",
+    "call $a.StartsWith('127.')",
+    "[System.Diagnostics.Process]::Start($psi)",
+}
+# a process started, or code reached at run time, from inside the C# payload (the AST cannot see the payload; payload-only so the PowerShell lines that
+# legitimately name ProcessStartInfo do not count)
+_PAYLOAD_PROCESS_RE = re.compile(
+    r"\bProcess\b|ProcessStartInfo|ShellExecute|CreateProcess|WinExec|\bActivator\b|\bdynamic\b|\bGetType\s*\(|SetEnvironmentVariable")  # C# is case-sensitive: a case variant does not compile
 # common parameters that write a variable by NAME (-OutVariable guard would put a pipeline's output into a call variable)
 _PS_VARIABLE_WRITING_PARAMETERS = ("outvariable", "errorvariable", "warningvariable", "informationvariable", "pipelinevariable")
 _PS_VARIABLE_WRITING_ALIASES = {"ov", "ev", "wv", "iv", "pv"}
@@ -418,6 +476,7 @@ def _ps_ast_violations(inv: dict, payload_bodies: list[str]) -> list[str]:
 
     commands, functions = lowered(LANE_DIRTY_SAVE_PS_COMMANDS), lowered(LANE_DIRTY_SAVE_PS_FUNCTIONS)
     call_variables, members = lowered(LANE_DIRTY_SAVE_PS_CALL_VARIABLES), lowered(LANE_DIRTY_SAVE_PS_MEMBERS)
+    launch_variables = lowered(LANE_DIRTY_SAVE_PS_LAUNCH_VARIABLES)
     static_members, types = lowered(LANE_DIRTY_SAVE_PS_STATIC_MEMBERS), lowered(LANE_DIRTY_SAVE_PS_TYPES)
     violations = [f"{error['line']}: the PowerShell parser rejects the text: {error['message']}" for error in inv["errors"]]
     violations += [f"{using['line']}: a using statement loads code the census cannot see: {using['text']}" for using in inv["using"]]
@@ -461,19 +520,12 @@ def _ps_ast_violations(inv: dict, payload_bodies: list[str]) -> list[str]:
                 ("StringConstantExpressionAst", None, "git", None), ("CommandParameterAst", "CommandType", None, None),
                 ("StringConstantExpressionAst", None, "Application", None)]:
             violations.append(f"{line}: Get-Command other than 'Get-Command git -CommandType Application'")
-        elif key == "new-object" and (not elements or elements[0]["kind"] != "StringConstantExpressionAst"
-                                      or elements[0]["value"] not in LANE_DIRTY_SAVE_PS_NEW_OBJECT_TYPES or "CommandParameterAst" in kinds):
-            violations.append(f"{line}: New-Object of a type outside {sorted(LANE_DIRTY_SAVE_PS_NEW_OBJECT_TYPES)}")
-        elif key in ("set-item", "remove-item"):
-            allowed = {"value", "erroraction"} if key == "set-item" else {"erroraction"}
-            shape = (len(elements) >= 2 and elements[0]["param"] == "LiteralPath" and elements[0]["param_arg"] is None
-                     and elements[1]["kind"] in ("StringConstantExpressionAst", "ExpandableStringExpressionAst")
-                     and (elements[1]["value"] or "").lower().startswith("env:") and len(elements) % 2 == 0)
-            for index in range(2, len(elements) - 1, 2):
-                shape = shape and (elements[index]["param"] or "").lower() in allowed and elements[index]["param_arg"] is None \
-                    and elements[index + 1]["kind"] != "CommandParameterAst"
-            if not shape:
-                violations.append(f"{line}: {name} other than -LiteralPath \"env:...\" (a function: or alias: path rebinds a command)")
+        elif key == "new-object" and " ".join([name] + [element["text"] for element in elements]) not in LANE_DIRTY_SAVE_PS_NEW_OBJECTS:
+            violations.append(f"{line}: New-Object of a type or with arguments outside {sorted(LANE_DIRTY_SAVE_PS_NEW_OBJECTS)}")
+        elif key in _PS_LAUNCH_COMMANDS:
+            launch = " ".join([name] + [element["text"] for element in elements])
+            if launch not in LANE_DIRTY_SAVE_PS_LAUNCHES:
+                violations.append(f"{line}: a process launch or env write outside the pinned set (a function: path or a git -c alias reaches code): {launch}")
     if len(add_types) != 1:
         violations.append(f"Add-Type must be invoked exactly once, found lines {[command['line'] for command in add_types]}")
     else:
@@ -491,6 +543,9 @@ def _ps_ast_violations(inv: dict, payload_bodies: list[str]) -> list[str]:
             violations.append(named)
         if member["name"] is None:
             continue  # a computed name is the rule above; the pinned sets below hold literal names only
+        if (member["invoke"] and (member["on_var"] or "").lower() in launch_variables and f"call {member['text']}" not in LANE_DIRTY_SAVE_PS_LAUNCH_WRITES) or (
+                f"{member['on']}::{member['name']}".lower() == "system.diagnostics.process::start" and member["text"] not in LANE_DIRTY_SAVE_PS_LAUNCH_WRITES):
+            violations.append(f"{member['line']}: a launch variable or Process::Start used outside the pinned set: {member['text']}")
         if member["static"]:
             if member["on"] is None:
                 violations.append(f"{member['line']}: a static member read from a type chosen at run time: ::{member['name']}")
@@ -511,6 +566,19 @@ def _ps_ast_violations(inv: dict, payload_bodies: list[str]) -> list[str]:
             violations.append(f"{parameter['line']}: the call variable parameter ${parameter['name']} is not typed [scriptblock]")
     violations += [f"{row['line']}: the call variable ${row['name']} is set by foreach" for row in inv["foreach_vars"] if row["name"].lower() in call_variables]
     violations += [f"{row['line']}: the call variable ${row['name']} is passed by [ref]" for row in inv["ref_vars"] if row["name"].lower() in call_variables]
+    # r15 iter 1: every write to what reaches a child process is pinned exactly (LANE_DIRTY_SAVE_PS_LAUNCH_WRITES)
+    for assignment in inv["assignments"]:
+        if assignment["drive"] or any(name.lower() in launch_variables for name in assignment["names"]):
+            write = f"{assignment['left_text']} = {assignment['right_text']}"
+            if assignment["operator"] != "Equals" or write not in LANE_DIRTY_SAVE_PS_LAUNCH_WRITES:
+                violations.append(f"{assignment['line']}: a launch variable or env var written outside the pinned set: {write}")
+    for row in inv["foreach_vars"]:
+        if row["name"].lower() in launch_variables and f"foreach ${row['name']} in {row['in_text']}" not in LANE_DIRTY_SAVE_PS_LAUNCH_WRITES:
+            violations.append(f"{row['line']}: a launch variable set by foreach outside the pinned set: ${row['name']} in {row['in_text']}")
+    for parameter in inv["params"]:
+        if parameter["name"].lower() in launch_variables and f"param ${parameter['name']}: {'/'.join(parameter['types'])}" not in LANE_DIRTY_SAVE_PS_LAUNCH_WRITES:
+            violations.append(f"{parameter['line']}: a launch variable parameter outside the pinned set: ${parameter['name']}")
+    violations += [f"{row['line']}: the launch variable ${row['name']} is passed by [ref]" for row in inv["ref_vars"] if row["name"].lower() in launch_variables]
     return violations
 
 
@@ -547,7 +615,8 @@ def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
     for payload in _ADD_TYPE_PAYLOAD_RE.finditer(text):
         body, at = payload.group("body"), payload.start("body")
         bodies.append(body)
-        for regex, what in ((_VERBATIM_IDENTIFIER_RE, "a verbatim identifier"), (_LITERAL_JOIN_RE, "a string built from pieces")):
+        for regex, what in ((_VERBATIM_IDENTIFIER_RE, "a verbatim identifier"), (_LITERAL_JOIN_RE, "a string built from pieces"),
+                            (_PAYLOAD_PROCESS_RE, "a process start or run-time binding")):
             for match in regex.finditer(body):
                 violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: {what} inside an Add-Type payload: {match.group(0)}")
     # the census proper runs on the text C# compiles: every escape resolved
@@ -616,6 +685,9 @@ def r15_census_rows(text: str) -> dict[str, tuple[str, str]]:
     invoke_11 = "; $null = $m.Invoke($null,[object[]]@([IntPtr]::Zero,$null,[IntPtr]::Zero,[uint32]0,11))"
     swap = " { param([string]$TypeDefinition) Microsoft.PowerShell.Utility\\Add`-Type -TypeDefinition ($TypeDefinition -replace ', 10\\);', ', 11);') }"
     computed = "a member named at run time"
+    call = "NtSetInformationFile(h, out io, info, (uint)size, 10);"
+    launch_file = "$psi.FileName = @(Get-Command git -CommandType Application)[0].Source"
+    launch_info = "$psi = New-Object System.Diagnostics.ProcessStartInfo"
     return {
         # sol r14 B1: whitespace or a continuation after the member dot, then a computed name
         "B1 a space after the dot": (at_line_50("$m = [DirtyFinalPath]. ('Get'+'Method')(('NtSet'+'InformationFile'),40)" + invoke_11), computed),
@@ -646,8 +718,8 @@ def r15_census_rows(text: str) -> dict[str, tuple[str, str]]:
         # fable r14 finding 1 rows
         "F using module": ("using module C:\\x\\Shadow.psm1\n" + text, "a using statement"),
         "F #Requires -Modules": ("#Requires -Modules Shadow\n" + text, "#Requires loads"),
-        "F Set-Item on a computed function: path": (text + "\nSet-Item -Path ('func'+'tion:Add-T'+'ype') -Value { param($TypeDefinition) }\n", "Set-Item other than"),
-        "F Set-Item on a literal function: path": (text + "\nSet-Item -LiteralPath function:Add-Type -Value { param($TypeDefinition) }\n", "Set-Item other than"),
+        "F Set-Item on a computed function: path": (text + "\nSet-Item -Path ('func'+'tion:Add-T'+'ype') -Value { param($TypeDefinition) }\n", "a process launch or env write outside the pinned set"),
+        "F Set-Item on a literal function: path": (text + "\nSet-Item -LiteralPath function:Add-Type -Value { param($TypeDefinition) }\n", "a process launch or env write outside the pinned set"),
         "F a function: variable": (text + "\n${function:Add-Type} = { param($TypeDefinition) }\n", "only env: is allowed"),
         "F an AppDomain load": (at_line_50("[AppDomain]::CurrentDomain.Load($bytes)"), "a type outside the pinned set"),
         "F & a joined name": (at_line_50("$c = 'Invoke-Ex'+'pression'; & $c $s"), "a command named at run time"),
@@ -660,13 +732,34 @@ def r15_census_rows(text: str) -> dict[str, tuple[str, str]]:
         "C a call variable by [ref]": (at_line_50("$null = [DirtyFinalPath]::Pin([ref]$guard)"), "passed by [ref]"),
         "C a call variable parameter without [scriptblock]": (at_line_50("function Invoke-DirtyDestCheckpoint2($Guard) { & $Guard }"), "not typed [scriptblock]"),
         # anything else outside the pinned names
-        "P New-Object of a computed type": (at_line_50("$a = New-Object ('System.Ref'+'lection.Assembly')"), "New-Object of a type outside"),
-        "P New-Object -TypeName": (at_line_50("$a = New-Object -TypeName System.Management.Automation.PowerShell"), "New-Object of a type outside"),
+        "P New-Object of a computed type": (at_line_50("$a = New-Object ('System.Ref'+'lection.Assembly')"), "New-Object of a type or with arguments outside"),
+        "P New-Object -TypeName": (at_line_50("$a = New-Object -TypeName System.Management.Automation.PowerShell"), "New-Object of a type or with arguments outside"),
         "P Get-Command Add-Type": (at_line_50("$c = Get-Command Add-Type"), "Get-Command other than"),
         "P a PowerShell class": (text + "\nclass Shadow { [void] Run() { } }\n", "defines code outside the census"),
         "P a quoted member name": (at_line_50("$m = [DirtyFinalPath].'GetMethod'('x', 40)"), "a member outside the pinned set: .GetMethod"),
         "P a second Add-Type by the call operator": (at_line_50("& 'Add-Type' -TypeDefinition $s"), "Add-Type must be invoked exactly once"),
         "P a module-qualified Add-Type": (at_line_50("Microsoft.PowerShell.Utility\\Add-Type -TypeDefinition $s"), "a command outside the pinned set"),
+        # r15 iter 1 (adversary 99ae3557): a child process runs code the census never reads (the adversary's paths are replaced by fixture names: the census
+        # never reads a path value, and no footage path belongs in code)
+        "A1 Process::Start of pwsh": (text + "\n$null = [System.Diagnostics.Process]::Start('pwsh.exe', ('-NoProfile -NonInteractive -Command \"New-Item -ItemType "
+                                      "{0}{1} -Path C:/fixture/out/alias -Value C:/fixture/src.bin\"' -f 'Hard','Link'))\n", "Process::Start used outside the pinned set"),
+        "A1 a ProcessStartInfo FileName other than git": (text.replace(launch_file, "$psi.FileName = 'pwsh.exe'", 1), "written outside the pinned set"),
+        "A1 a ProcessStartInfo constructor argument": (text.replace(launch_info, launch_info + " 'pwsh.exe'", 1), "New-Object of a type or with arguments outside"),
+        "A1 ProcessStartInfo.Arguments": (text.replace(launch_file, launch_file + "; $psi.Arguments = '-c x'", 1), "written outside the pinned set"),
+        "A1 a process started from the C# payload": (text.replace(call, call + '\nSystem.Diagnostics.Process.Start("pwsh.exe", "-c x");', 1), "a process start"),
+        "A1 Activator from the C# payload": (text.replace(call, call + '\nobject o = Activator.CreateInstance(Type.GetType(n));', 1), "a process start"),
+        "A2 git -c alias": (text + "\ngit -c ('alias.attack=!pwsh -NoProfile -NonInteractive -Command ''New-Item -ItemType {0}{1} -Path C:/fixture/out/alias -Value "
+                            "C:/fixture/src.bin''' -f 'Hard','Link') attack\n", "a process launch or env write outside the pinned set"),
+        "A2 an extra git argument on a pinned call": (text.replace("rev-parse --show-toplevel", "rev-parse --show-toplevel -c alias.x=!sh", 1),
+                                                      "a process launch or env write outside the pinned set"),
+        "A2 a git-capture call with other arguments": (at_line_50("$x = Invoke-DirtyGitCapture -Wt $Wt -GitArgs @('-c', 'alias.x=!sh', 'x')"),
+                                                       "a process launch or env write outside the pinned set"),
+        "A2 GIT_EXTERNAL_DIFF set": (at_line_50("$env:GIT_EXTERNAL_DIFF = 'pwsh -c x'"), "env var written outside the pinned set"),
+        "A2 Set-Item of another env var": (at_line_50("Set-Item -LiteralPath Env:GIT_SSH_COMMAND -Value x"), "a process launch or env write outside the pinned set"),
+        "A2 a git argument list widened": (at_line_50("$shape += '--ext-diff'"), "written outside the pinned set"),
+        "A2 a foreach source widened": (text.replace("foreach ($side in 'HEAD', '--cached')", "foreach ($side in 'HEAD', '--ext-diff')", 1), "set by foreach outside"),
+        "A2 a saved env value planted": (at_line_50("$savedEnv['GIT_EXTERNAL_DIFF'] = 'pwsh -c x'"), "written outside the pinned set"),
+        "A2 a saved env value added by a method": (at_line_50("$savedEnv.Add('GIT_EXTERNAL_DIFF', 'pwsh -c x')"), "used outside the pinned set"),
     }
 
 
