@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "why": "CI-WINDOWS-UNITTEST-SHARD-8-1: the heaviest measured windows classes run in the job repo-hygiene-python-windows-unittest-heavy, split into `parts` legs; the windows 7-way partition excludes exactly these. test_ci_unittest_shard.HeavySetTests and ShardDurationBudgetTests pin both sides.",
+  "profiles": {
+    "windows": {
+      "parts": 2,
+      "classes": [
+        "tools.repo_hygiene.test_brokered_closeout.BrokeredCloseoutTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.EvidenceBoundReceiptTests",
+        "tools.repo_hygiene.test_hub_vm_no_local_playback.PromptLintTests",
+        "tools.repo_hygiene.test_playback_clip_length_gate.RuntimeBackstopBehaviourTests",
+        "tools.repo_hygiene.test_venue_chain_runner.VenueChainRunnerTests"
+      ]
+    }
+  }
+}

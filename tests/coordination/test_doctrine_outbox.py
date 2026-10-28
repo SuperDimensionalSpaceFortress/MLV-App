@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -50,9 +51,42 @@ def dated(seconds_ago: float) -> dict[str, str]:
     return {"GIT_AUTHOR_DATE": stamp, "GIT_COMMITTER_DATE": stamp}
 
 
+# COST (CI-SHARD8-GUARDRAILS-COST-1): the bus and source fixtures below were rebuilt from scratch for every
+# test -- eight to ten git processes each, about 0.1 s apiece on a hosted Windows runner -- and this file
+# builds them for well over a hundred tests. Each distinct fixture is now built ONCE per pytest session by
+# the original builder (`_build_bus` / `_build_source`, bodies unchanged) and every test gets its own
+# private copy of that directory tree, so no test can see another's writes. The one absolute path a copy
+# carries (the clone's `origin` url) is repointed at the copy's own bare repo.
+_FIXTURE_TEMPLATES: dict = {}
+_TEMPLATE_BASE: dict = {}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _fixture_template_base(tmp_path_factory):
+    _TEMPLATE_BASE["dir"] = tmp_path_factory.getbasetemp()
+
+
+def _fixture_template(key: tuple, build):
+    """Build `key`'s fixture once under a fresh directory in the session's base temp dir, then reuse it."""
+    if key not in _FIXTURE_TEMPLATES:
+        _FIXTURE_TEMPLATES[key] = build(Path(tempfile.mkdtemp(prefix="outbox-fixture-template-", dir=_TEMPLATE_BASE["dir"])))
+    return _FIXTURE_TEMPLATES[key]
+
+
 def init_bus(tmp_path: Path, crlf_target: str | None = None, name: str = "bus",
              traps: str | None = None) -> tuple[Path, Path]:
     """A bare repo as the bus 'origin', and a clone of it as the bus working repo."""
+    template_bare, template_clone = _fixture_template(
+        ("bus", crlf_target, traps), lambda root: _build_bus(root, crlf_target, "bus", traps))
+    bare = tmp_path / f"{name}-origin.git"
+    clone = tmp_path / f"{name}-clone"
+    shutil.copytree(template_bare, bare)
+    shutil.copytree(template_clone, clone)
+    git(clone, "remote", "set-url", "origin", str(bare))
+    return bare, clone
+
+
+def _build_bus(tmp_path: Path, crlf_target: str | None, name: str, traps: str | None) -> tuple[Path, Path]:
     bare = tmp_path / f"{name}-origin.git"
     clone = tmp_path / f"{name}-clone"
     subprocess.run(["git", "init", "--bare", "-b", "master", str(bare)], check=True, capture_output=True, text=True)
@@ -74,6 +108,13 @@ def init_bus(tmp_path: Path, crlf_target: str | None = None, name: str = "bus",
 
 def init_source(tmp_path: Path, name: str = "source", with_tool: bool = True) -> Path:
     """A small source repo on master. With the tool committed, as on a ref that has adopted it."""
+    template = _fixture_template(("source", with_tool), lambda root: _build_source(root, "source", with_tool))
+    src = tmp_path / name
+    shutil.copytree(template, src)
+    return src
+
+
+def _build_source(tmp_path: Path, name: str, with_tool: bool) -> Path:
     src = tmp_path / name
     src.mkdir()
     subprocess.run(["git", "init", "-b", "master", str(src)], check=True, capture_output=True, text=True)
@@ -3005,3 +3046,38 @@ def test_a_card_the_validator_rejects_is_named_with_its_reason(tmp_path):
     assert re.search(rf"card is \d+ bytes; the limit is {max_bytes}", refusals[0])
     assert "applies names 'every board that retires worktrees', which is not a fleet member" in refusals[0]
     assert refusals[1] == "doctrine-outbox/Bad Name.md: OUTBOX_ITEM_INVALID: ITEM_BAD_FILENAME: Bad Name.md"
+
+
+# ---------- drain: the sent-ledger read is typed and fail-closed (OUTBOX-SENT-GUARD-LEDGER-READ-HARDENING-1 r2) ----------
+
+@pytest.mark.parametrize("content, code", [
+    (b"\xff\n", "sent-ledger-unreadable"),                                    # not UTF-8: used to be a traceback
+    (b'{"key": "0123456789abcdef"}\n{bad\n', "sent-ledger-partial"),          # a corrupt row was silently dropped
+    (b'{"key": ""}\n', "sent-ledger-partial"),                                # an empty key was accepted as a key
+])
+def test_drain_on_an_unreadable_or_corrupt_ledger_is_a_typed_unknown_and_publishes_nothing(tmp_path, capsys, content, code):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    ledger.write_bytes(content)
+    before = git(bare, "rev-parse", "master")
+
+    rc = ob.main(["--repo", str(src), "drain", "--bus", str(clone), "--ref", "HEAD", "--ledger", str(ledger), "--push"])
+
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert f"[doctrine-outbox] UNKNOWN {code}" in err and "Traceback" not in err, err
+    assert git(bare, "rev-parse", "master") == before
+    assert ledger.read_bytes() == content
+
+
+def test_drain_kernel_filing_shares_the_strict_ledger_read(tmp_path):
+    bare, clone = init_bus(tmp_path)
+    src = init_source(tmp_path)
+    add_item(src, "20260925-example.md")
+    ledger = tmp_path / "sent.jsonl"
+    ledger.write_bytes(b"\xff\n")
+    with pytest.raises(ob.Unknown) as excinfo:
+        ob.drain_kernel_filing(src, clone, "HEAD", ledger, [], push=False)
+    assert excinfo.value.code == "sent-ledger-unreadable"

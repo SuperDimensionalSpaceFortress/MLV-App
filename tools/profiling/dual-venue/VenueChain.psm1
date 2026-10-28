@@ -392,6 +392,34 @@ function Request-VenueClaim {
         Add-Member -NotePropertyName position -NotePropertyValue $position -PassThru | Add-Member -NotePropertyName staleTickets -NotePropertyValue @($removed) -PassThru
 }
 
+function Update-VenueClaim {
+    <#
+    .SYNOPSIS
+    BACHELOR-LEASE-BATCH-LEGS-1 r5 (dot 242171b3 B1): move the expiry of the venue's claim to now + -TtlSec, if it is still the one with -Nonce. The file is opened
+    exclusively (FileShare.None: a reader sees BUSY, never a half-written claim), re-read, and only its expiresUtc is rewritten in place; every other byte stays, so a
+    breaker that judged the old text finds it CHANGED and never removes a renewed claim. Returns @{ state (RENEWED | NOT_OURS | ABSENT | BUSY); expiresUtc }.
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [ValidateRange(60, 86400)][int]$TtlSec = 10800, [string]$ClaimDir = '')
+    $path = Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return [pscustomobject]@{ state = 'ABSENT'; expiresUtc = $null } }
+        $fs = $null
+        try { $fs = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) } catch { Start-Sleep -Milliseconds (50 * $attempt); continue }
+        try {
+            $sr = [IO.StreamReader]::new($fs, [Text.UTF8Encoding]::new($false), $false, 4096, $true)
+            $text = $sr.ReadToEnd(); $sr.Dispose()
+            $j = $null; try { $j = $text | ConvertFrom-Json -ErrorAction Stop } catch { $j = $null }
+            if ($null -eq $j -or [string]$j.nonce -cne $Nonce -or $text -cnotmatch '"expiresUtc":"[^"]*"') { return [pscustomobject]@{ state = 'NOT_OURS'; expiresUtc = $null } }
+            $expires = [DateTime]::UtcNow.AddSeconds($TtlSec).ToString('o')
+            $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($text -creplace '"expiresUtc":"[^"]*"', ('"expiresUtc":"' + $expires + '"')))
+            $fs.SetLength(0); $fs.Position = 0
+            $fs.Write($bytes, 0, $bytes.Length); $fs.Flush($true)
+            return [pscustomobject]@{ state = 'RENEWED'; expiresUtc = $expires }
+        } finally { $fs.Dispose() }
+    }
+    [pscustomobject]@{ state = 'BUSY'; expiresUtc = $null }
+}
+
 function Get-VenueClaimStatus {
     <#
     .SYNOPSIS
@@ -530,6 +558,680 @@ function Select-VenueQuietWindow {
     [pscustomobject]$out
 }
 
-Export-ModuleMember -Function Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
+# SUPPLEMENTARY LEGS (VENUE-UM-SUPPLEMENTARY-WHEN-BACHELOR-HELD-1). A Bachelor chain may offer the same leg on ultra-magnus as a SUPPLEMENTARY run (Invoke-VenueChain.ps1).
+# These helpers only READ (the spec, the venue's claim and line, the venue's staged-build cache) or run one bounded child; none of them claims, stages, builds or submits.
+
+function Get-VenueSupplementarySpecSkip {
+    <#
+    .SYNOPSIS
+    $null when the leg spec carries a criteria.supplementary block for the backend (an empty list counts: the leg is informational there), else the typed skip reason:
+    SPEC_UNREADABLE | BACKEND_NOT_IN_SPEC | NO_SUPPLEMENTARY_CRITERIA. -Backend '' means the spec's first backend, as Invoke-VenueLeg does.
+    #>
+    param([Parameter(Mandatory)][string]$SpecPath, [string]$Backend = '')
+    $spec = $null
+    try { $spec = [IO.File]::ReadAllText($SpecPath) | ConvertFrom-Json -ErrorAction Stop } catch { return 'SPEC_UNREADABLE' }
+    $backends = @($spec.backends | Where-Object { $_ })
+    $b = $(if ($Backend) { $Backend } elseif ($backends.Count -gt 0) { [string]$backends[0] } else { '' })
+    if ($backends.Count -gt 0 -and $backends -cnotcontains $b) { return 'BACKEND_NOT_IN_SPEC' }
+    $block = $null
+    if ($null -ne $spec.criteria -and $null -ne $spec.criteria.supplementary -and $b) { $block = $spec.criteria.supplementary.PSObject.Properties[$b] }
+    if ($null -eq $block) { return 'NO_SUPPLEMENTARY_CRITERIA' }
+    $null
+}
+
+function Get-VenueSupplementaryIdle {
+    <#
+    .SYNOPSIS
+    Is the venue idle for a supplementary leg? Read-only, from the venue's own claim and line (never a process scan): idle when its claim is FREE or STALE and no LIVE ticket
+    queues. .holder names the live claim or the queue when it is not. -OwnNonce: the caller already holds the claim with that nonce (it does not count as held), so the
+    answer is "still no live ticket" -- the revalidation a supplementary claim makes BEFORE any work (Dot 180e287f: a waiter may queue between the first check and the claim).
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', [string]$OwnNonce = '')
+    $s = Get-VenueClaimStatus -Venue $Venue -ClaimDir $ClaimDir
+    $live = @($s.tickets | Where-Object { $_.state -cne 'STALE' })
+    $held = ($s.claim.state -cin @('LIVE', 'BUSY')) -and -not ($OwnNonce -and $s.claim.claim -and [string]$s.claim.claim.nonce -ceq $OwnNonce)
+    $holder = $(if ($s.claim.claim) { "pid=$($s.claim.claim.ownerPid) runDir=$($s.claim.claim.runDir)" } else { "claimState=$($s.claim.state)" })
+    [pscustomobject]@{ idle = (-not $held -and $live.Count -eq 0); claimState = [string]$s.claim.state; liveTickets = $live.Count; holder = $holder }
+}
+
+function Get-VenueStagedBuildManifest {
+    <#
+    .SYNOPSIS
+    The sha256 of the build manifest already staged on a venue (<AgentShare>\cache\playback-attr-3-cuda-<sha12>-build.json, the file Invoke-VenueLeg hashes), read
+    on a worker thread and given up after -TimeoutSec (a UNC path of a host that is down can block a Test-Path for minutes). Never stages anything.
+    r5 (adversary A2): the same read also reports what the leg job's own validator (Assert-AttrCudaBuildManifest) needs INSIDE the file: it parses, it declares
+    -SourceCommit, its dllPairManifestSha256 is 64 hex and its pendingSymbolPresence is a boolean. contentProblem says which fails ('' = none; $null = not checked,
+    which is what an offline -ProbeScript that returns only a hash gets).
+    .OUTPUTS
+    [pscustomobject]@{ state (STAGED | NOT_STAGED | UNREACHABLE); sha256; path; error; contentProblem }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceCommit, [ValidateRange(1, 600)][int]$TimeoutSec = 30, [scriptblock]$ProbeScript = $null)
+    $path = $AgentShare.TrimEnd('\') + '\cache\playback-attr-3-cuda-' + $SourceCommit.Substring(0, 12) + '-build.json'
+    # -ProbeScript is the offline test seam for a read that never answers; production passes none.
+    $read = $(if ($null -ne $ProbeScript) { $ProbeScript } else {
+            {
+                param($p)
+                # r13 (Dot A1''): a read that fails (a manifest a writer holds open, a share error) ends the read, so it is UNREACHABLE with its own error. Under the runspace's default
+                # Continue, a failed byte read went on with no bytes and the read reported NOT_STAGED, a manifest it never looked at.
+                $ErrorActionPreference = 'Stop'
+                if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { return '' }
+                # ONE read: the digest and the facts below come from the same bytes (a file replaced between two reads would pair one version's hash with another's content)
+                $bytes = [IO.File]::ReadAllBytes($p)
+                $sha = [Security.Cryptography.SHA256]::Create()
+                try { ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+                # r6 (adversary A1): decoded exactly as Assert-AttrCudaBuildManifest's own file read does (UTF-8 default, ONE BOM consumed, UTF-16/32 by BOM), from the bytes already hashed
+                $m = try { [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.Encoding]::UTF8, $true).ReadToEnd() | ConvertFrom-Json } catch { $null }
+                if ($null -eq $m) { 'UNPARSEABLE'; return }
+                $c = $m.PSObject.Properties['sourceCommit']; 'C:' + $(if ($null -eq $c) { '' } else { [string]$c.Value })
+                $d = $m.PSObject.Properties['dllPairManifestSha256']; 'D:' + $(if ($null -eq $d) { '' } else { ([string]$d.Value).ToLowerInvariant() })
+                $s = $m.PSObject.Properties['pendingSymbolPresence']; 'S:' + $(if ($null -ne $s -and $s.Value -is [bool]) { 'bool' } else { 'bad' })
+                # r13 (adversary r13 A1): and the three artifact digests the job hashes the cached artifacts against (playback-attr-3-cuda-job.ps1 $manifestChecks): a string of
+                # 64 hex, the only value Get-Sha's digest can ever equal; a blank one makes the job throw, a non-string one throws in ToUpperInvariant.
+                foreach ($k in 'packageZip', 'exe', 'dll') {
+                    $o = $m.PSObject.Properties[$k]; $v = $(if ($null -ne $o -and $o.Value -is [System.Management.Automation.PSCustomObject] -and $o.Value.PSObject.Properties['sha256']) { $o.Value.sha256 } else { $null })
+                    'A:' + $k + '=' + $(if ($v -is [string] -and $v -match '^[0-9a-fA-F]{64}\z') { 'ok' } else { 'bad' })
+                }
+            } })
+    $r = Invoke-VenueBoundedRead -ScriptText $read.ToString() -Argument $path -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = $r.error; contentProblem = $null } }
+    $sha = $(if ($r.value.Count -gt 0) { [string]$r.value[0] } else { '' })
+    if ($sha -cmatch '^[0-9a-f]{64}$') {
+        $problem = $null
+        if ($r.value.Count -gt 1) {
+            $facts = @($r.value | Select-Object -Skip 1 | ForEach-Object { [string]$_ })
+            $commit = @($facts | Where-Object { $_.StartsWith('C:') }) | Select-Object -First 1
+            $dll = @($facts | Where-Object { $_.StartsWith('D:') }) | Select-Object -First 1
+            $sym = @($facts | Where-Object { $_.StartsWith('S:') }) | Select-Object -First 1
+            $problem = $(if ($facts -contains 'UNPARSEABLE') { 'ATTRCUDA_BUILD_MANIFEST_UNPARSEABLE the staged manifest is not JSON' }
+                elseif ($commit.Substring(2) -ne $SourceCommit) { "ATTRCUDA_BUILD_MANIFEST_COMMIT_MISMATCH the staged manifest declares '$($commit.Substring(2))', expected '$SourceCommit'" }
+                elseif ($dll.Substring(2) -notmatch '^[0-9a-f]{64}$') { "ATTRCUDA_BUILD_MANIFEST_DLLPAIR_UNBOUND the staged manifest carries no well-formed dllPairManifestSha256 (got '$($dll.Substring(2))')" }
+                elseif ($sym -ne 'S:bool') { 'ATTRCUDA_BUILD_MANIFEST_SYMBOL_PRESENCE_INVALID the staged manifest pendingSymbolPresence is not a boolean' }
+                elseif ($badArt = @('packageZip', 'exe', 'dll' | Where-Object { $facts -cnotcontains "A:$_=ok" })) { "ATTRCUDA_BUILD_MANIFEST_ARTIFACT_SHA_MISSING the staged manifest carries no 64-hex sha256 for $($badArt -join ', ') (the leg job hashes the cached artifact against it)" }
+                else { '' })
+        }
+        return [pscustomobject]@{ state = 'STAGED'; sha256 = $sha; path = $path; error = $null; contentProblem = $problem }
+    }
+    [pscustomobject]@{ state = 'NOT_STAGED'; sha256 = $null; path = $path; error = $null; contentProblem = $null }
+}
+
+$script:VenueAbandonedReads = 0
+
+function Complete-VenueProcess {
+    <#
+    .SYNOPSIS
+    The last call of a script that used Invoke-VenueBoundedRead. An abandoned read is still a live (foreground) thread, and the host waits for it when the script ends, so a read
+    stuck on a dead UNC host would hold the process for as long as it lasts. When one was abandoned, flush and exit NOW with -ExitCode (everything was already written); else return.
+    #>
+    param([Parameter(Mandatory)][int]$ExitCode)
+    if ($script:VenueAbandonedReads -gt 0) { [Console]::Out.Flush(); [Console]::Error.Flush(); [Environment]::Exit($ExitCode) }
+}
+
+function Invoke-VenueBoundedRead {
+    <#
+    .SYNOPSIS
+    Run one share read (-ScriptText, handed -Argument) on a worker runspace and give up on it after -TimeoutSec: .answered is $false and .error says so. A worker that does not
+    answer is ABANDONED, never joined: BeginStop only asks it to stop, and it is never Dispose()d (Dispose() stops a running pipeline SYNCHRONOUSLY and waits for it, so one read
+    stuck in the kernel on a dead UNC host would hold the caller for as long as the read lasts and break the bound). The leaked runspace dies with the process.
+    .OUTPUTS
+    [pscustomobject]@{ answered; value (the script's output as an array); error }
+    #>
+    param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1, 600)][int]$TimeoutSec)
+    $ps = [powershell]::Create()
+    $abandoned = $false
+    try {
+        [void]$ps.AddScript($ScriptText)
+        [void]$ps.AddArgument($Argument)
+        $async = $ps.BeginInvoke()
+        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSec))) {
+            $abandoned = $true
+            $script:VenueAbandonedReads++
+            try { [void]$ps.BeginStop($null, $null) } catch { }
+            return [pscustomobject]@{ answered = $false; value = @(); error = "no answer in $TimeoutSec s" }
+        }
+        [pscustomobject]@{ answered = $true; value = @($ps.EndInvoke($async)); error = $null }
+    } catch {
+        [pscustomobject]@{ answered = $false; value = @(); error = $_.Exception.Message }
+    } finally { if (-not $abandoned) { $ps.Dispose() } }
+}
+
+function Get-VenueRemoteJobIds {
+    <#
+    .SYNOPSIS
+    The remote job ids a (killed) client printed before it went silent: every `DVE_JOB_ID=<id>` line of its stdout, in order, distinct. A line whose id is not a plain file name
+    (the id becomes a file name on the venue share) is kept as an EMPTY string, so the caller knows a job was named that it cannot look up. Nothing printed = no ids.
+    #>
+    param([string]$Text)
+    $ids = [System.Collections.Generic.List[string]]::new()
+    foreach ($m in [regex]::Matches([string]$Text, '(?m)^DVE_JOB_ID=([^\r\n]*?)[ \t]*\r?$')) {
+        $id = $m.Groups[1].Value
+        if ($id -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { $id = '' }
+        if (-not $ids.Contains($id)) { $ids.Add($id) }
+    }
+    $ids.ToArray()
+}
+
+function Get-VenueRemoteJobState {
+    <#
+    .SYNOPSIS
+    Has every remote job a killed client submitted landed its result on the venue? Read by NAME only (<AgentShare>\outbox\<jobId>.result.json, the file um-run.ps1 waits for;
+    the share is never listed), on one bounded worker. A released local claim says nothing about the remote job: FINISHED needs every id's result present, and everything else is
+    busy -- NOT_FINISHED (some result absent: queued, running or lost), UNKNOWN (no job id recoverable, an unusable id, or the share did not answer in -TimeoutSec). None of them is idle.
+    .OUTPUTS
+    [pscustomobject]@{ state (FINISHED | NOT_FINISHED | UNKNOWN); jobIds; pending; error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [string[]]$JobId = @(), [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    $ids = @($JobId)
+    $out = { param($state, $pending, $err) [pscustomobject]@{ state = $state; jobIds = $ids; pending = @($pending); error = $err } }
+    if ($ids.Count -eq 0) { return & $out 'UNKNOWN' @() 'no remote job id recoverable from what the client printed' }
+    if (@($ids | Where-Object { $_ -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$' }).Count -gt 0) { return & $out 'UNKNOWN' @() 'a printed remote job id is not a usable file name' }
+    $paths = @($ids | ForEach-Object { $AgentShare.TrimEnd('\') + '\outbox\' + $_ + '.result.json' })
+    $r = Invoke-VenueBoundedRead -ScriptText '$o = foreach ($p in $args[0]) { Test-Path -LiteralPath $p -PathType Leaf }; $o' -Argument $paths -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return & $out 'UNKNOWN' @() $r.error }
+    $landed = @($r.value | ForEach-Object { [bool]$_ })
+    if ($landed.Count -ne $ids.Count) { return & $out 'UNKNOWN' @() "the share answered $($landed.Count) of $($ids.Count) reads" }
+    $pending = @(for ($i = 0; $i -lt $ids.Count; $i++) { if (-not $landed[$i]) { $ids[$i] } })
+    if ($pending.Count -eq 0) { return & $out 'FINISHED' @() $null }
+    & $out 'NOT_FINISHED' $pending $null
+}
+
+function Get-VenueJobResult {
+    <#
+    .SYNOPSIS
+    One venue job's result.json, read by NAME (<AgentShare>\outbox\<JobId>.result.json; the share is never listed) on one bounded worker (BACHELOR-LEASE-BATCH-LEGS-1: the
+    batch runner reads a leg's admission from it, to prove the leg ran on the batch's lease).
+    .OUTPUTS
+    [pscustomobject]@{ state (FOUND | ABSENT | UNKNOWN); result (the parsed result when FOUND); error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [string]$JobId = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    if ($JobId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = 'no usable job id' } }
+    $path = $AgentShare.TrimEnd('\') + '\outbox\' + $JobId + '.result.json'
+    $r = Invoke-VenueBoundedRead -ScriptText 'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { [IO.File]::ReadAllText($args[0]) } else { "<ABSENT>" }' -Argument $path -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = $r.error } }
+    $text = [string](@($r.value) -join "`n")
+    if ($text -ceq '<ABSENT>') { return [pscustomobject]@{ state = 'ABSENT'; result = $null; error = $null } }
+    try { return [pscustomobject]@{ state = 'FOUND'; result = ($text | ConvertFrom-Json); error = $null } }
+    catch { return [pscustomobject]@{ state = 'UNKNOWN'; result = $null; error = "result.json does not parse: $($_.Exception.Message)" } }
+}
+
+function Request-VenueJobCancel {
+    <#
+    .SYNOPSIS
+    Ask the venue agent to cancel one job (BACHELOR-LEASE-BATCH-LEGS-1 r3): <AgentShare>\cancel\<JobId>.cancel, the agent's cooperative cancel request (ultra-magnus-agent.ps1
+    header). Created with FileMode.CreateNew, so it never replaces a file, on one bounded worker, then checked by name. The agent reads it at the top of every loop of its
+    admission gate (before any lease request), again after admission and before launch, and every slice of a running job. The cancel folder is the agent's: it is never created here.
+    .OUTPUTS
+    [pscustomobject]@{ state (REQUESTED | UNKNOWN); path; error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [string]$JobId = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    if ($JobId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { return [pscustomobject]@{ state = 'UNKNOWN'; path = $null; error = 'no usable job id' } }
+    $path = $AgentShare.TrimEnd('\') + '\cancel\' + $JobId + '.cancel'
+    $write = @'
+$p = $args[0]
+if (-not (Test-Path -LiteralPath (Split-Path -Parent $p) -PathType Container)) { '<NO_CANCEL_DIR>'; return }
+if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+    try { $fs = [IO.File]::Open($p, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None); try { $bytes = [Text.Encoding]::ASCII.GetBytes('cancel'); $fs.Write($bytes, 0, $bytes.Length) } finally { $fs.Dispose() } } catch [IO.IOException] { }
+}
+if (Test-Path -LiteralPath $p -PathType Leaf) { '<PRESENT>' } else { '<ABSENT>' }
+'@
+    $r = Invoke-VenueBoundedRead -ScriptText $write -Argument $path -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNKNOWN'; path = $path; error = $r.error } }
+    $said = [string](@($r.value) -join '')
+    if ($said -ceq '<PRESENT>') { return [pscustomobject]@{ state = 'REQUESTED'; path = $path; error = $null } }
+    [pscustomobject]@{ state = 'UNKNOWN'; path = $path; error = $(if ($said -ceq '<NO_CANCEL_DIR>') { 'the agent share has no cancel folder' } else { 'the cancel file is not there after the write' }) }
+}
+
+# BACHELOR-LEASE-BATCH-LEGS-1 r5. KEEPERS: an in-process worker runspace that runs one step every -EverySec while its owner lives, so a renewal goes on while the
+# owner's own thread is blocked (in um-run.ps1, a by-name wait, a leg). It dies with the owner's process, which is the point: what it renews then lapses.
+$script:VenueKeeperLoop = @'
+param($S, $Body, $A, $Module)
+Import-Module $Module -DisableNameChecking
+$step = [scriptblock]::Create($Body)
+while (-not $S.stop -and -not $S.done) {
+    $until = [DateTime]::UtcNow.AddSeconds($S.everySec)
+    while (-not $S.stop -and [DateTime]::UtcNow -lt $until) { Start-Sleep -Milliseconds 100 }
+    if ($S.stop) { break }
+    try { $S.last = [string](& $step $A $S); $S.ok++ } catch { $S.errors++; $S.lastError = ($_.Exception.Message -replace '\s+', ' ') }
+    $S.runs++
+}
+'@
+
+function Start-VenueKeeper {
+    # One keeper: runs -StepText (param($A, $S); this module is imported) every -EverySec, the first one -EverySec from now, until Stop-VenueKeeper or until a step
+    # sets $S.done. $S is a synchronized
+    # hashtable: runs, ok, errors, last, lastError, plus whatever the step keeps there.
+    param([Parameter(Mandatory)][string]$StepText, $Argument = $null, [Parameter(Mandatory)][ValidateRange(1, 3600)][int]$EverySec, [hashtable]$State = @{})
+    $s = [hashtable]::Synchronized(@{ stop = $false; done = $false; everySec = $EverySec; runs = 0; ok = 0; errors = 0; last = $null; lastError = $null })
+    foreach ($k in $State.Keys) { $s[$k] = $State[$k] }
+    $ps = [powershell]::Create()
+    [void]$ps.AddScript($script:VenueKeeperLoop).AddArgument($s).AddArgument($StepText).AddArgument($Argument).AddArgument((Join-Path $PSScriptRoot 'VenueChain.psm1'))
+    [pscustomobject]@{ ps = $ps; async = $ps.BeginInvoke(); state = $s }
+}
+
+function Stop-VenueKeeper {
+    # Stops a keeper and waits up to -TimeoutSec for its step to finish. A step that does not finish (a share write stuck on a dead host) is ABANDONED as
+    # Invoke-VenueBoundedRead abandons a read: never Dispose()d, counted, so Complete-VenueProcess ends the process. Returns $true when it stopped in time.
+    param($Keeper, [ValidateRange(1, 600)][int]$TimeoutSec = 15)
+    if ($null -eq $Keeper) { return $true }
+    $Keeper.state.stop = $true
+    if ($Keeper.async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSec))) {
+        try { [void]$Keeper.ps.EndInvoke($Keeper.async) } catch { }
+        $Keeper.ps.Dispose()
+        return $true
+    }
+    $script:VenueAbandonedReads++
+    try { [void]$Keeper.ps.BeginStop($null, $null) } catch { }
+    $false
+}
+
+function Start-VenueClaimKeeper {
+    <#
+    .SYNOPSIS
+    r5 (dot 242171b3 B1): renew the venue claim (Update-VenueClaim) every -RenewSec while the owner lives, so a wait longer than -TtlSec (a foreign-refusal wait for the
+    lease, a by-name wait, the legs) never lets Get-VenueClaimStaleReason call a live owner's claim expired. A claim found NOT_OURS or ABSENT is lost: renewing stops.
+    #>
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [ValidateRange(60, 86400)][int]$TtlSec = 10800, [ValidateRange(1, 3600)][int]$RenewSec = 600, [string]$ClaimDir = '')
+    $step = @'
+param($A, $S)
+$r = Update-VenueClaim -Venue $A.venue -Nonce $A.nonce -TtlSec $A.ttlSec -ClaimDir $A.claimDir
+if ($r.state -ceq 'RENEWED') { $S.renews++; $S.expiresUtc = $r.expiresUtc }
+elseif ($r.state -ceq 'NOT_OURS' -or $r.state -ceq 'ABSENT') { $S.lost = $r.state; $S.done = $true }
+$r.state
+'@
+    Start-VenueKeeper -StepText $step -Argument ([pscustomobject]@{ venue = $Venue; nonce = $Nonce; ttlSec = $TtlSec; claimDir = $ClaimDir }) -EverySec $RenewSec -State @{ renews = 0; expiresUtc = $null; lost = $null; renewSec = $RenewSec; ttlSec = $TtlSec }
+}
+
+function Get-VenueClaimKeeperLoss {
+    <#
+    .SYNOPSIS
+    r5b (Grok G1, 6389240991): is a claim held under Start-VenueClaimKeeper still the holder's? $null while it is. Lost when the keeper found it NOT_OURS or ABSENT, or
+    when the last good expiry has passed (the keeper's last renewal, else -ClaimExpiresUtc, the expiry the claim was taken with; an unreadable one counts as passed):
+    renewals that keep coming back BUSY or throwing leave the claim to expire. Returns @{ reason (NOT_OURS | ABSENT | EXPIRED); lastGoodExpiresUtc; detail }.
+    #>
+    param([Parameter(Mandatory)]$Keeper, $ClaimExpiresUtc = $null, $NowUtc = $null)
+    $s = $Keeper.state
+    $exp = ConvertTo-VenueUtc $(if ($s.expiresUtc) { $s.expiresUtc } else { $ClaimExpiresUtc })
+    $why = $(if ($s.lost) { [string]$s.lost } elseif ($null -eq $exp -or (Resolve-VenueNow $NowUtc) -ge $exp) { 'EXPIRED' } else { $null })
+    if ($null -eq $why) { return $null }
+    $expText = $(if ($null -ne $exp) { $exp.ToString('o') } else { 'UNKNOWN' })
+    [pscustomobject]@{ reason = $why; lastGoodExpiresUtc = $(if ($null -ne $exp) { $expText }); detail = "claim=$why lastGoodExpiresUtc=$expText renews=$($s.renews) errors=$($s.errors) lastRenew=$($s.last)$(if ($s.lastError) { " lastError=$($s.lastError)" })" }
+}
+
+# r5 (sol B1, the runner side of LEASE-BATCH-OPEN-RUNNER-LIVENESS-1 #663): the open's runner-liveness sidecar, <AgentShare>\notafter\<jobId>.json, in exactly the shape
+# the agent's Read-JobNotAfterSidecar / Get-JobNotAfterVerdict read (schema mlv-app/job-notafter-sidecar/v1, an object root, UTF-8, under 4096 bytes). Written to a tmp
+# name beside it and moved over it in one replacing rename (the agent reads with FileShare ReadWrite|Delete, so the rename never waits on a read). The notafter folder
+# is the agent's: it is never created here.
+$script:LivenessWriteText = @'
+param($A)
+$dir = Split-Path -Parent $A.path
+if (-not (Test-Path -LiteralPath $dir -PathType Container)) { '<NO_NOTAFTER_DIR>'; return }
+$tmp = $A.path + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+# r5b: '<WRITTEN>' only after both calls returned. A .NET exception is statement-terminating, so try/finally alone ran on past a denied write and said WRITTEN.
+try {
+    [IO.File]::WriteAllText($tmp, $A.json, [Text.UTF8Encoding]::new($false))
+    [IO.File]::Move($tmp, $A.path, $true)
+    '<WRITTEN>'
+} catch { '<WRITE_FAILED> ' + ($_.Exception.Message -replace '\s+', ' ') } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
+'@
+
+function New-VenueJobLivenessWrite {
+    # The argument for one sidecar write: path and JSON text for -JobId alive until -AliveUntilUtc, write number -Seq.
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][string]$JobId, [Parameter(Mandatory)][DateTime]$AliveUntilUtc, [long]$Seq = 1)
+    $json = [ordered]@{ schema = 'mlv-app/job-notafter-sidecar/v1'; jobId = $JobId; aliveUntilUtc = $AliveUntilUtc.ToUniversalTime().ToString('o'); writtenUtc = [DateTime]::UtcNow.ToString('o')
+        seq = $Seq; writerPid = $PID; writerHost = [string]$env:COMPUTERNAME } | ConvertTo-Json -Compress
+    [pscustomobject]@{ path = ($AgentShare.TrimEnd('\') + '\notafter\' + $JobId + '.json'); json = $json }
+}
+
+function Write-VenueJobLiveness {
+    <#
+    .SYNOPSIS
+    One sidecar write on a bounded worker (the owner's thread is never held by a dead share). Returns @{ state (WRITTEN | NO_NOTAFTER_DIR | UNKNOWN); path; aliveUntilUtc; error }.
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [string]$JobId = '', [Parameter(Mandatory)][DateTime]$AliveUntilUtc, [long]$Seq = 1, [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    if ($JobId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$') { return [pscustomobject]@{ state = 'UNKNOWN'; path = $null; aliveUntilUtc = $null; error = 'no usable job id' } }
+    $w = New-VenueJobLivenessWrite -AgentShare $AgentShare -JobId $JobId -AliveUntilUtc $AliveUntilUtc -Seq $Seq
+    $r = Invoke-VenueBoundedRead -ScriptText $script:LivenessWriteText -Argument $w -TimeoutSec $TimeoutSec
+    $said = [string](@($r.value) -join '')
+    $state = $(if (-not $r.answered) { 'UNKNOWN' } elseif ($said -ceq '<WRITTEN>') { 'WRITTEN' } elseif ($said -ceq '<NO_NOTAFTER_DIR>') { 'NO_NOTAFTER_DIR' } else { 'UNKNOWN' })
+    [pscustomobject]@{ state = $state; path = $w.path; aliveUntilUtc = $AliveUntilUtc.ToUniversalTime().ToString('o'); error = $(if ($state -ceq 'NO_NOTAFTER_DIR') { 'the agent share has no notafter folder' } elseif ($said -clike '<WRITE_FAILED>*') { $said.Substring(15) } else { $r.error }) }
+}
+
+# r6 (LEASE-BATCH-SIDECAR-READBACK-1, Grok G2 on #633): WRITTEN only says the write call returned. The sidecar is read back with the AGENT's own reader and verdict
+# (Read-JobNotAfterSidecar + Get-JobNotAfterVerdict, lifted by AST from ultra-magnus-agent.ps1, never a second parser), so a file the agent would read as absent,
+# unreadable, not an object, the wrong schema or job, without a parseable aliveUntilUtc, or already lapsed is caught before the open is submitted.
+$script:LivenessReadbackText = @'
+param($A)
+foreach ($t in $A.functions) { . ([scriptblock]::Create($t)) }
+$notAfterDir = $A.dir
+$v = Get-JobNotAfterVerdict -Metadata ([pscustomobject]@{ notAfterUtc = $A.notAfterUtc }) -Sidecar (Read-JobNotAfterSidecar -JobId $A.jobId)
+[ordered]@{ state = $v.state; livenessState = $v.livenessState; livenessUntilUtc = $v.livenessUntilUtc; why = $v.why } | ConvertTo-Json -Compress
+'@
+
+function Test-VenueJobLivenessReadback {
+    <#
+    .SYNOPSIS
+    Read the job's sidecar back from the agent share on a bounded worker and judge it with the agent's own functions. Returns @{ live; state; livenessState; livenessUntilUtc; why; error; agentScriptSha256 }.
+    live is true only when the agent's verdict calls the sidecar live and the job still open (or unbounded); anything else, including a worker that does not answer or an
+    agent script whose functions cannot be lifted, is not live (fail closed). A live sidecar with state 'passed' means the job's own notAfterUtc has passed (the deadline
+    crossed): the caller types that DEADLINE, not a liveness failure.
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][string]$JobId, [string]$NotAfterUtc = '', [string]$AgentScript = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    # r2: agentScriptSha256 is the hash of the checkout's agent script the parser was lifted from, so a later drift between the checkout and the deployed agent shows in the receipt.
+    $sha = $null
+    $no = { param($why) [pscustomobject]@{ live = $false; state = 'UNKNOWN'; livenessState = 'UNKNOWN'; livenessUntilUtc = $null; why = $why; error = $why; agentScriptSha256 = $sha } }
+    # r3 (Dot B1 on 46768a21): a hash or read that throws after Test-Path succeeded (the script locked or vanished) is a not-live answer like any other. It never
+    # reaches the runner as an exception, which the runner's cleanup would read as a sent open.
+    try {
+        if (-not $AgentScript) { $AgentScript = Join-Path $PSScriptRoot '..\bachelor\ultra-magnus-agent.ps1' }
+        if (-not (Test-Path -LiteralPath $AgentScript -PathType Leaf)) { return & $no "the agent script is not at $AgentScript" }
+        $sha = (Get-FileHash -LiteralPath $AgentScript -Algorithm SHA256).Hash.ToLowerInvariant()
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($AgentScript, [ref]$null, [ref]$null)
+        $fns = @(foreach ($n in 'Get-JobNotAfterVerdict', 'Read-JobNotAfterSidecar') {
+            $f = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true)
+            if ($null -ne $f) { $f.Extent.Text }
+        })
+        if ($fns.Count -ne 2) { return & $no 'the agent script does not define both Get-JobNotAfterVerdict and Read-JobNotAfterSidecar' }
+        $arg = [pscustomobject]@{ functions = $fns; dir = ($AgentShare.TrimEnd('\') + '\notafter'); jobId = $JobId; notAfterUtc = $NotAfterUtc }
+        $r = Invoke-VenueBoundedRead -ScriptText $script:LivenessReadbackText -Argument $arg -TimeoutSec $TimeoutSec
+        if (-not $r.answered) { return & $no "read-back: $($r.error)" }
+        $v = try { [string](@($r.value) -join '') | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+        if ($null -eq $v -or $null -eq $v.livenessState) { return & $no "read-back gave no verdict: $([string](@($r.value) -join ''))" }
+        [pscustomobject]@{ live = ([string]$v.livenessState -ceq 'live' -and [string]$v.state -cin @('open', 'none')); state = [string]$v.state; livenessState = [string]$v.livenessState; livenessUntilUtc = $v.livenessUntilUtc; why = [string]$v.why; error = $null; agentScriptSha256 = $sha }
+    } catch { return & $no "read-back threw: $($_.Exception.Message -replace '\s+', ' ')" }
+}
+
+function Start-VenueJobLiveness {
+    <#
+    .SYNOPSIS
+    r5: while the caller owns a submitted job, keep its runner-liveness sidecar -WindowSec ahead: one write now (bounded), then a keeper rewrites it every -RenewSec
+    (seq 2, 3, ...). The keeper dies with the caller's process, so a runner killed early stops renewing and the agent ends the job's gate wait, and releases a pending
+    or just-active lease, once aliveUntilUtc passes (#663). Stop it with Stop-VenueJobLiveness.
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][string]$JobId, [ValidateRange(5, 1800)][int]$WindowSec = 120, [ValidateRange(1, 600)][int]$RenewSec = 30)
+    $first = Write-VenueJobLiveness -AgentShare $AgentShare -JobId $JobId -AliveUntilUtc ([DateTime]::UtcNow.AddSeconds($WindowSec)) -Seq 1
+    $step = @'
+param($A, $S)
+$S.seq++
+$until = [DateTime]::UtcNow.AddSeconds($A.windowSec)
+$w = New-VenueJobLivenessWrite -AgentShare $A.share -JobId $A.jobId -AliveUntilUtc $until -Seq $S.seq
+$said = [string](@(& ([scriptblock]::Create($A.writeText)) $w) -join '')
+if ($said -ceq '<WRITTEN>') { $S.writes++; $S.aliveUntilUtc = $until.ToString('o') } else { $S.writeFailures++ }
+$said
+'@
+    $arg = [pscustomobject]@{ share = $AgentShare; jobId = $JobId; windowSec = $WindowSec; writeText = $script:LivenessWriteText }
+    $k = Start-VenueKeeper -StepText $step -Argument $arg -EverySec $RenewSec -State @{ seq = 1; writes = $(if ($first.state -ceq 'WRITTEN') { 1 } else { 0 }); writeFailures = $(if ($first.state -ceq 'WRITTEN') { 0 } else { 1 })
+        aliveUntilUtc = $(if ($first.state -ceq 'WRITTEN') { $first.aliveUntilUtc } else { $null }); windowSec = $WindowSec; renewSec = $RenewSec }
+    $k | Add-Member -NotePropertyName first -NotePropertyValue $first -PassThru | Add-Member -NotePropertyName jobId -NotePropertyValue $JobId -PassThru | Add-Member -NotePropertyName share -NotePropertyValue $AgentShare -PassThru
+}
+
+function Stop-VenueJobLiveness {
+    <#
+    .SYNOPSIS
+    r5: the caller no longer owns the job, so the sidecar stops being renewed. -Remove deletes it (the job's result is in hand: the agent will not read it again);
+    otherwise it is rewritten lapsed (aliveUntilUtc = now), so an agent still holding the job ends it at its next check, and left for the agent to read (it never
+    deletes one). Idempotent. Returns @{ end (REMOVED | ABSENT | LAPSED | UNKNOWN | NONE); writes; writeFailures; lastSeq; lastAliveUntilUtc; stoppedInTime; error }.
+    #>
+    param($Liveness, [switch]$Remove)
+    if ($null -eq $Liveness) { return [pscustomobject]@{ end = 'NONE'; writes = 0; writeFailures = 0; lastSeq = $null; lastAliveUntilUtc = $null; stoppedInTime = $true; error = $null } }
+    if ($null -ne $Liveness.PSObject.Properties['stopped']) { return $Liveness.stopped }
+    $inTime = Stop-VenueKeeper -Keeper $Liveness
+    $s = $Liveness.state
+    $end = 'UNKNOWN'; $err = $null
+    if ($Remove) {
+        $path = $Liveness.share.TrimEnd('\') + '\notafter\' + $Liveness.jobId + '.json'
+        $r = Invoke-VenueBoundedRead -ScriptText 'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { Remove-Item -LiteralPath $args[0] -Force; if (Test-Path -LiteralPath $args[0]) { "<PRESENT>" } else { "<REMOVED>" } } else { "<ABSENT>" }' -Argument $path -TimeoutSec 30
+        $said = [string](@($r.value) -join '')
+        $end = $(if ($said -ceq '<REMOVED>') { 'REMOVED' } elseif ($said -ceq '<ABSENT>') { 'ABSENT' } else { 'UNKNOWN' }); $err = $r.error
+    } else {
+        $w = Write-VenueJobLiveness -AgentShare $Liveness.share -JobId $Liveness.jobId -AliveUntilUtc ([DateTime]::UtcNow) -Seq ([long]$s.seq + 1)
+        $end = $(if ($w.state -ceq 'WRITTEN') { 'LAPSED' } else { 'UNKNOWN' }); $err = $w.error
+    }
+    $out = [pscustomobject]@{ end = $end; writes = $s.writes; writeFailures = $s.writeFailures; lastSeq = $s.seq; lastAliveUntilUtc = $s.aliveUntilUtc; stoppedInTime = $inTime; error = $err }
+    $Liveness | Add-Member -NotePropertyName stopped -NotePropertyValue $out -Force
+    $out
+}
+
+function Read-VenueLeaseBatchReceipt {
+    <#
+    .SYNOPSIS
+    The venue agent's own receipt for one batch lease (ultra-magnus-agent.ps1 lease-batch item 5): the line of <AgentShare>\logs\lease-batch-<Token>.jsonl whose leaseId is
+    -LeaseId, read by NAME on one bounded worker.
+    .OUTPUTS
+    [pscustomobject]@{ state (FOUND | ABSENT | UNKNOWN); record; error }
+    #>
+    param([Parameter(Mandatory)][string]$AgentShare, [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{12}$')][string]$Token, [string]$LeaseId = '', [ValidateRange(1, 600)][int]$TimeoutSec = 30)
+    $path = $AgentShare.TrimEnd('\') + '\logs\lease-batch-' + $Token + '.jsonl'
+    $r = Invoke-VenueBoundedRead -ScriptText 'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { [IO.File]::ReadAllLines($args[0]) } else { "<ABSENT>" }' -Argument $path -TimeoutSec $TimeoutSec
+    if (-not $r.answered) { return [pscustomobject]@{ state = 'UNKNOWN'; record = $null; error = $r.error } }
+    $lines = @($r.value | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    if ($lines.Count -eq 1 -and $lines[0] -ceq '<ABSENT>') { return [pscustomobject]@{ state = 'ABSENT'; record = $null; error = $null } }
+    foreach ($line in $lines) {
+        $rec = try { $line | ConvertFrom-Json } catch { $null }
+        if ($null -ne $rec -and [string]$rec.leaseId -ceq $LeaseId) { return [pscustomobject]@{ state = 'FOUND'; record = $rec; error = $null } }
+    }
+    [pscustomobject]@{ state = 'ABSENT'; record = $null; error = "no line for lease $LeaseId among $($lines.Count)" }
+}
+
+function Get-VenueInterleavedLegPlan {
+    <#
+    .SYNOPSIS
+    LEASE-BATCH-MULTI-BUILD-1: a lease-batch leg plan with its arms INTERLEAVED (A B A B ...) instead of run in blocks, so lease position and venue heat fall on
+    every arm alike. Arms are taken in order of first appearance, one leg each per round, each arm's legs keeping their own order; an arm with more legs than the
+    others runs its remainder at the end (A A A B -> A B A A). Every item is returned once; nothing is added or dropped.
+    .OUTPUTS
+    The -Items objects, reordered.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Items)
+    # An arm label is case-sensitive (the plan validates it with -cnotmatch, so A and a are two labels): an [ordered]@{} would key them case-insensitively and merge them.
+    $queues = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.Queue[object]]]::new([StringComparer]::Ordinal)
+    $armOrder = [System.Collections.Generic.List[string]]::new()
+    foreach ($it in $Items) {
+        $arm = [string]$it.arm
+        if (-not $queues.ContainsKey($arm)) { $queues[$arm] = [System.Collections.Generic.Queue[object]]::new(); $armOrder.Add($arm) }
+        $queues[$arm].Enqueue($it)
+    }
+    $left = $Items.Count
+    while ($left -gt 0) {
+        # the comma keeps an array-valued item ONE output object (a bare Dequeue() result would be enumerated into its elements)
+        foreach ($arm in $armOrder) { $q = $queues[$arm]; if ($q.Count -gt 0) { , $q.Dequeue(); $left-- } }
+    }
+}
+
+function Get-VenueLegPreLoadMean {
+    <#
+    .SYNOPSIS
+    The leg's own pre-load mean, read from the run's summary.json (cpuQuiescence.timeMeanPercent), never from the receipt file. Invoke-VenueLeg writes the receipt as
+    <root>\<card>\<legId>\<venue>\<receiptId>.json and the run evidence to <parent of root>\evidence\<receiptId>. $null when absent. (Same rule as Invoke-VenueChain's own.)
+    #>
+    param([string]$ReceiptPath)
+    try {
+        if (-not $ReceiptPath) { return $null }
+        $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
+        $summary = Join-Path (Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))) 'summary.json'
+        if (-not (Test-Path -LiteralPath $summary -PathType Leaf)) { return $null }
+        $q = ([IO.File]::ReadAllText($summary) | ConvertFrom-Json).cpuQuiescence
+        if ($null -eq $q -or $null -eq $q.timeMeanPercent) { return $null }
+        [double]$q.timeMeanPercent
+    } catch { $null }
+}
+
+function Get-VenueLeaseLedgerPath {
+    # BACHELOR-LEASE-BATCH-LEGS-1 r2: <ClaimDir>\<venue>.lease-ledger.jsonl, one line per quiet lease a lease-batch run took (any run on this host), beside the claim.
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '')
+    Join-Path (Split-Path -Parent (Get-VenueClaimPath -Venue $Venue -ClaimDir $ClaimDir)) "$Venue.lease-ledger.jsonl"
+}
+
+function Read-VenueLeaseLedger {
+    # The ledger's leases that end after -SinceUtc, as @{ startUtc; endUtc; leaseId } (UTC DateTime). A line that does not parse is skipped. Written only under the
+    # venue claim, so one writer at a time.
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $SinceUtc = $null)
+    $path = Get-VenueLeaseLedgerPath -Venue $Venue -ClaimDir $ClaimDir
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @() }
+    $since = $(if ($null -ne $SinceUtc) { ConvertTo-VenueUtc $SinceUtc } else { [DateTime]::MinValue })
+    @(foreach ($line in [IO.File]::ReadAllLines($path)) {
+            $r = try { $line | ConvertFrom-Json } catch { $null }
+            if ($null -eq $r) { continue }
+            $s = ConvertTo-VenueUtc $r.startUtc; $e = ConvertTo-VenueUtc $r.endUtc
+            if ($null -ne $s -and $null -ne $e -and $e -gt $s -and $e -gt $since) { [pscustomobject]@{ startUtc = $s; endUtc = $e; leaseId = [string]$r.leaseId } }
+        })
+}
+
+function Add-VenueLeaseLedger {
+    # Appends one lease to the ledger (the caller holds the venue claim).
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', [Parameter(Mandatory)]$Row)
+    $path = Get-VenueLeaseLedgerPath -Venue $Venue -ClaimDir $ClaimDir
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+    [IO.File]::AppendAllText($path, (($Row | ConvertTo-Json -Compress -Depth 4) + "`n"), [Text.UTF8Encoding]::new($false))
+}
+
+function Get-VenueLeaseBudgetWait {
+    <#
+    .SYNOPSIS
+    How long to wait before asking Bachelor's heavy-slot.py for the next quiet lease (BACHELOR-LEASE-BATCH-LEGS-1 r2; its caps, CAPS-ADDENDUM 2026-10-23: a lease is at
+    most -CapSec (45 min), none starts within -CooldownSec (30 min) of the last one's end, and leased time is at most -BudgetSec (90 min) in any -WindowSec (3 h)).
+    The open time is the first moment, on a -StepSec grid, that is past the cooldown and whose WORST window (the one ending when a full-length lease opened then would
+    end) holds at most BudgetSec - CapSec of the -Leases already taken. Pure: -Leases are @{ startUtc; endUtc }, -NowUtc is passed in.
+    .OUTPUTS
+    [pscustomobject]@{ reason (NONE | COOLDOWN | BUDGET); waitSec; openUtc; usedSec (in that window at openUtc); budgetRoomSec (at most CapSec); lastEndUtc }
+    #>
+    param([object[]]$Leases = @(), [Parameter(Mandatory)]$NowUtc, [int]$CapSec = 2700, [int]$CooldownSec = 1800, [int]$WindowSec = 10800, [int]$BudgetSec = 5400,
+        [ValidateRange(1, 600)][int]$StepSec = 30)
+    $now = ConvertTo-VenueUtc $NowUtc
+    $rows = @(foreach ($l in @($Leases)) {
+            if ($null -eq $l) { continue }
+            $s = ConvertTo-VenueUtc $l.startUtc; $e = ConvertTo-VenueUtc $l.endUtc
+            if ($null -ne $s -and $null -ne $e -and $e -gt $s) { [pscustomobject]@{ s = $s; e = $e } }
+        })
+    $used = {
+        param([DateTime]$T)
+        $from = $T.AddSeconds($CapSec - $WindowSec)
+        $sum = 0.0
+        foreach ($r in $rows) {
+            $a = $(if ($r.s -gt $from) { $r.s } else { $from }); $z = $(if ($r.e -lt $T) { $r.e } else { $T })
+            if ($z -gt $a) { $sum += ($z - $a).TotalSeconds }
+        }
+        $sum
+    }
+    $lastEnd = $(if ($rows.Count -gt 0) { ($rows | Sort-Object e | Select-Object -Last 1).e } else { $null })
+    $t = $now; $reason = 'NONE'
+    if ($null -ne $lastEnd -and $lastEnd.AddSeconds($CooldownSec) -gt $t) { $t = $lastEnd.AddSeconds($CooldownSec); $reason = 'COOLDOWN' }
+    $limit = $t.AddSeconds($WindowSec)
+    while ((& $used $t) + $CapSec -gt $BudgetSec -and $t -lt $limit) { $t = $t.AddSeconds($StepSec); $reason = 'BUDGET' }
+    $u = [int][Math]::Round((& $used $t))
+    [pscustomobject]@{ reason = $reason; waitSec = [int][Math]::Ceiling(($t - $now).TotalSeconds); openUtc = $t; usedSec = $u; budgetRoomSec = [int][Math]::Min($CapSec, $BudgetSec - $u); lastEndUtc = $lastEnd }
+}
+
+function Get-VenueLeaseCaps {
+    <#
+    .SYNOPSIS
+    BACHELOR-DEDICATED-CAPS-RUNNER-1: Bachelor's heavy-slot.py lease caps, read from the text of its heavy-slot.lease.json (printed by the runner's exempt probe job) with
+    the rules heavy-slot.py applies: enabled is true; max_minutes, pending_max_minutes, cooldown_minutes, max_fraction_per_3h and renew_stale_s are numbers >= 0;
+    max_minutes > 0. Anything else (empty, missing file, not JSON, invalid) is the FALLBACK: the old mirrored constants, which are the tightest the owner ever set, so
+    an unreadable file never loosens a cap. cooldown = cooldown_minutes*60, budget = max_fraction_per_3h*10800 (at most 10800), cap = min(MaxCapSec, max_minutes*60).
+    r2 (CoS/Dot B1 on affa0d1a): the budget basis is ALWAYS the fixed 3 h window heavy-slot.py uses (10800 s), never the caller's -WindowSec, so a caller can never loosen
+    it: a longer -WindowSec leaves the budget alone (Get-VenueLeaseBudgetWait then counts more of the earlier leases against it, which only tightens), and a shorter one
+    can only shrink it (fraction * that window, never above the 3 h figure).
+    r2 (B1b): a cooldown is never silently shortened. cooldown_minutes*60 is kept exactly (2880 min = 172800 s); only a value no int of seconds can hold is
+    unrepresentable, and that is the FALLBACK (reason cooldown_minutes-unrepresentable), the old constants, logged as capsFallbackReason.
+    .OUTPUTS
+    [pscustomobject]@{ source (live | fallback); reason ($null when live); cooldownSec; budgetSec; capSec }
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Text = '', [int]$WindowSec = 10800, [int]$FallbackCooldownSec = 1800, [int]$FallbackBudgetSec = 5400, [int]$MaxCapSec = 2700,
+        [int]$BudgetBasisSec = 10800)
+    $fallback = { param([string]$Why) [pscustomobject]@{ source = 'fallback'; reason = $Why; cooldownSec = $FallbackCooldownSec; budgetSec = $FallbackBudgetSec; capSec = $MaxCapSec } }
+    if ([string]::IsNullOrWhiteSpace($Text)) { return (& $fallback 'probe-printed-nothing') }
+    $j = try { $Text | ConvertFrom-Json -ErrorAction Stop } catch { $null }
+    if ($null -eq $j -or $j -isnot [pscustomobject]) { return (& $fallback 'not-a-json-object') }
+    if ($j.enabled -isnot [bool] -or -not $j.enabled) { return (& $fallback 'enabled-is-not-true') }
+    $v = @{}
+    foreach ($k in 'max_minutes', 'pending_max_minutes', 'cooldown_minutes', 'max_fraction_per_3h', 'renew_stale_s') {
+        $x = $j.$k
+        $num = ($x -is [int] -or $x -is [long] -or $x -is [double] -or $x -is [decimal])
+        if (-not $num -or $x -lt 0) { return (& $fallback "$k-is-not-a-number-at-least-0") }
+        $v[$k] = [double]$x
+    }
+    if ($v['max_minutes'] -le 0) { return (& $fallback 'max_minutes-is-not-above-0') }
+    $cooldownSec = [Math]::Ceiling($v['cooldown_minutes'] * 60)
+    if ($cooldownSec -gt [int]::MaxValue) { return (& $fallback 'cooldown_minutes-unrepresentable') }
+    $f = $v['max_fraction_per_3h']
+    $fixedBudget = [Math]::Min($BudgetBasisSec, $f * $BudgetBasisSec)
+    $windowBudget = [Math]::Min($WindowSec, $f * $WindowSec)
+    [pscustomobject]@{ source = 'live'; reason = $null
+        cooldownSec = [int]$cooldownSec
+        budgetSec = [int][Math]::Floor([Math]::Min($fixedBudget, $windowBudget))
+        capSec = [int][Math]::Floor([Math]::Min($MaxCapSec, $v['max_minutes'] * 60)) }
+}
+
+function New-VenueCapsProbeId {
+    <#
+    .SYNOPSIS
+    The job id of the run's one caps probe: venue-quiet-probe-caps-<UTC stamp>-<12 hex of a fresh GUID>. The stamp alone is one-second resolution, so two runs that start in
+    the same second would submit the same id (UmRunDrop refuses a job id already in use, and the run would read the fallback caps). Still matches the agent's
+    GateExemptJobPattern ^(venue-quiet-probe|agent-swap)- and UmRunDrop's job id rule ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$.
+    #>
+    'venue-quiet-probe-caps-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
+}
+
+function Resolve-VenueLeaseCaps {
+    <#
+    .SYNOPSIS
+    The caps a run uses: the live ones (Get-VenueLeaseCaps), unless the caller passed one explicitly. A caller may only TIGHTEN: a cooldown shorter than the live one, or a
+    budget above it, is LEASE_CAP_RELAXED, except with -AllowRelax (an offline stub um-run, the old shortening rule). The lease cap is the smaller of -CapSec and the live one.
+    .OUTPUTS
+    [pscustomobject]@{ ok; error; cooldownSec; budgetSec; capSec }
+    #>
+    param([Parameter(Mandatory)]$Caps, [int]$CooldownSec, [bool]$CooldownExplicit = $false, [int]$BudgetSec, [bool]$BudgetExplicit = $false, [int]$CapSec = 2700, [bool]$AllowRelax = $false)
+    $bad = { param([string]$Msg) [pscustomobject]@{ ok = $false; error = "LEASE_CAP_RELAXED $Msg"; cooldownSec = $null; budgetSec = $null; capSec = $null } }
+    $cd = $Caps.cooldownSec; $bud = $Caps.budgetSec
+    if ($CooldownExplicit) {
+        if ($CooldownSec -lt $Caps.cooldownSec -and -not $AllowRelax) { return (& $bad "-LeaseCooldownSec $CooldownSec is shorter than Bachelor's cooldown ($($Caps.cooldownSec) s, source=$($Caps.source))") }
+        $cd = $CooldownSec
+    }
+    if ($BudgetExplicit) {
+        if ($BudgetSec -gt $Caps.budgetSec -and -not $AllowRelax) { return (& $bad "-LeaseBudgetSec $BudgetSec is above Bachelor's budget ($($Caps.budgetSec) s per window, source=$($Caps.source))") }
+        $bud = $BudgetSec
+    }
+    [pscustomobject]@{ ok = $true; error = $null; cooldownSec = [int]$cd; budgetSec = [int]$bud; capSec = [int][Math]::Min($CapSec, $Caps.capSec) }
+}
+
+function Invoke-VenueBoundedProcess {
+    <#
+    .SYNOPSIS
+    Run one child process and give up on it after -TimeoutSec (the child and its tree are killed). .exit is $null when it timed out.
+    .OUTPUTS
+    [pscustomobject]@{ exit; timedOut; stdout; stderr }
+    #>
+    param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec)
+    $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
+    foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    $p.StandardInput.Close()
+    $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
+    $timedOut = -not $p.WaitForExit($TimeoutSec * 1000)
+    if ($timedOut) { try { $p.Kill($true) } catch { }; [void]$p.WaitForExit(15000) }
+    [void]$outTask.Wait(15000); [void]$errTask.Wait(15000)
+    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut
+        stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
+}
+
+function Get-VenueDriverScriptMissing {
+    <#
+    .SYNOPSIS
+    LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: '' when every script a venue driver is about to launch exists, else the typed line
+    `VENUE_DRIVER_SCRIPT_MISSING path=<first missing path>`. A driver (Invoke-VenueChain, or a lane-local detached driver that imported
+    this module at start, so the check survives its worktree being removed) calls it before each launch and STOPS on a non-empty answer:
+    a missing script is not "the venue was not measured" (2026-10-24: a driver logged VENUE_QUIET_UNKNOWN every 5 min for 40 min instead).
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Path)
+    foreach ($p in $Path) {
+        if ($p -and -not (Test-Path -LiteralPath $p -PathType Leaf)) { return "VENUE_DRIVER_SCRIPT_MISSING path=$p" }
+    }
+    return ''
+}
+
+Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
-    ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow
+    ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
+    Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
+    Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

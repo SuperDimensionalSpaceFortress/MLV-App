@@ -28,6 +28,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <thread>
 #include <string>
 #include <utility>
@@ -695,8 +696,7 @@ class ScopedAsyncWriterEnvironment
 {
 public:
     ScopedAsyncWriterEnvironment()
-    {
-        static const char * const keys[] = {
+        : ScopedAsyncWriterEnvironment({
             "MLVAPP_EXPORT_STAGE_PROFILER",
             "MLVAPP_EXPORT_STAGE_PROFILE_FILE",
             "MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID",
@@ -705,7 +705,14 @@ public:
             "MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH",
             "MLVAPP_CDNG_EXPORT_ASYNC_WRITER_THREADS",
             "MLVAPP_CDNG_EXPORT_ASYNC_WRITER_COMPRESS"
-        };
+        })
+    {
+    }
+
+    /* Saves and restores an arbitrary key set: a key that was unset stays unset,
+     * a key that was set gets its prior value back. */
+    ScopedAsyncWriterEnvironment(std::initializer_list<const char *> keys)
+    {
         for(const char * key : keys)
         {
             Entry entry;
@@ -4458,6 +4465,9 @@ TEST(DualIsoPipeline, DngFrameAsyncWriterDebugDelayCanFillConfiguredQueue)
     qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER", QByteArrayLiteral("1"));
     qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH", QByteArrayLiteral("2"));
     qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS", QByteArrayLiteral("2000"));
+    // Ordering guarantee: the writer holds frame 1 until the queue is full, so the fill no
+    // longer depends on the producer enqueuing frame 2 within the 2000 ms delay.
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS", QByteArrayLiteral("30000"));
     qunsetenv("MLVAPP_CDNG_EXPORT_PAYLOAD_HANDOFF");
 
     MlvPipelineFixture fixture;
@@ -4486,6 +4496,9 @@ TEST(DualIsoPipeline, DngFrameAsyncWriterDebugDelayCanFillConfiguredQueue)
                                                    0,
                                                    second_path_bytes.data(),
                                                    nullptr));
+    // The hold must have been released by a full queue, not by finish or its bound.
+    ASSERT_EQ(DNG_PAYLOAD_WRITER_DEBUG_HOLD_FILLED,
+              dngPayloadWriterDebugWaitHoldResult(writer, 60000u));
     ASSERT_EQ(0, finishDngPayloadWriter(writer));
     freeDngObject(dng);
 
@@ -4508,7 +4521,234 @@ TEST(DualIsoPipeline, DngFrameAsyncWriterDebugDelayCanFillConfiguredQueue)
     qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH");
     qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_THREADS");
     qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS");
     qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_COMPRESS");
+}
+
+// RED variant for the 2026-10-16 flake: a producer that is slower than the 2000 ms debug
+// delay between its two enqueues (a loaded host). On the sleep-only hook the writer dequeues
+// frame 1 before frame 2 arrives and async_writer_max_queued stays 1; the hold makes the fill
+// an ordering guarantee, so the same stall must still report 2.
+TEST(DualIsoPipeline, DngFrameAsyncWriterQueueFillSurvivesProducerStallPastDebugDelay)
+{
+    QTemporaryDir temp_dir;
+    ASSERT_TRUE(temp_dir.isValid());
+
+    const QString first_path = temp_dir.filePath(QStringLiteral("async-stall-first.dng"));
+    const QString second_path = temp_dir.filePath(QStringLiteral("async-stall-second.dng"));
+    const QString profile_path = temp_dir.filePath(QStringLiteral("async-stall-profile.json"));
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILER", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE", profile_path.toLocal8Bit());
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID", QByteArrayLiteral("async-stall-test"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH", QByteArrayLiteral("2"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS", QByteArrayLiteral("2000"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS", QByteArrayLiteral("30000"));
+    qunsetenv("MLVAPP_CDNG_EXPORT_PAYLOAD_HANDOFF");
+
+    MlvPipelineFixture fixture;
+    assert_fixture_ready(fixture);
+    std::vector<uint16_t> frame = fixture.renderFrame16(0, 1);
+    ASSERT_TRUE(!frame.empty());
+
+    int32_t par[4] = { 1, 1, 1, 1 };
+    dngObject_t * dng = initDngObject(fixture.video(), UNCOMPRESSED_RAW, 1.0, par);
+    ASSERT_TRUE(dng != nullptr);
+
+    dngPayloadWriter_t * writer = createDngPayloadWriter();
+    ASSERT_TRUE(writer != nullptr);
+
+    QByteArray first_path_bytes = first_path.toLocal8Bit();
+    QByteArray second_path_bytes = second_path.toLocal8Bit();
+    ASSERT_EQ(0, saveDngFrameViaAsyncPayloadWriter(writer,
+                                                   fixture.video(),
+                                                   dng,
+                                                   0,
+                                                   first_path_bytes.data(),
+                                                   nullptr));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    ASSERT_EQ(0, saveDngFrameViaAsyncPayloadWriter(writer,
+                                                   fixture.video(),
+                                                   dng,
+                                                   0,
+                                                   second_path_bytes.data(),
+                                                   nullptr));
+    ASSERT_EQ(DNG_PAYLOAD_WRITER_DEBUG_HOLD_FILLED,
+              dngPayloadWriterDebugWaitHoldResult(writer, 60000u));
+    ASSERT_EQ(0, finishDngPayloadWriter(writer));
+    freeDngObject(dng);
+
+    const QByteArray json_bytes = read_all_bytes(profile_path);
+    const QJsonDocument doc = QJsonDocument::fromJson(json_bytes);
+    ASSERT_TRUE(doc.isObject());
+    const QJsonObject root = doc.object();
+    ASSERT_EQ(2, root.value(QStringLiteral("async_writer_queue_capacity")).toInt());
+    ASSERT_EQ(2, root.value(QStringLiteral("async_writer_max_queued")).toInt());
+    ASSERT_EQ(2, root.value(QStringLiteral("async_writer_jobs_started")).toInt());
+    ASSERT_EQ(2, root.value(QStringLiteral("async_writer_jobs_finished")).toInt());
+
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILER");
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE");
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS");
+}
+
+// The hold is bounded and fails loudly: a queue that never fills (one frame into a depth-2
+// queue, producer still running) must surface as a failed finish, not a silent pass or a hang.
+// Ordering, not a sleep: finish (which sets stopping) is called only after the writer has
+// acknowledged that its hold timed out and recorded the error. writer_delay_ms, when given,
+// starts the writer late (the debug delay runs before the hold) to prove the ordering holds
+// however late the writer thread gets to the hold.
+static void run_async_writer_debug_hold_timeout_case(const char * tag, const QByteArray & writer_delay_ms)
+{
+    QTemporaryDir temp_dir;
+    ASSERT_TRUE(temp_dir.isValid());
+
+    const QString first_path = temp_dir.filePath(QStringLiteral("%1.dng").arg(QLatin1String(tag)));
+    const QString profile_path = temp_dir.filePath(QStringLiteral("%1-profile.json").arg(QLatin1String(tag)));
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILER", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE", profile_path.toLocal8Bit());
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID", QByteArray(tag));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH", QByteArrayLiteral("2"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS", QByteArrayLiteral("300"));
+    if(writer_delay_ms.isEmpty())
+    {
+        qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS");
+    }
+    else
+    {
+        qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS", writer_delay_ms);
+    }
+    qunsetenv("MLVAPP_CDNG_EXPORT_PAYLOAD_HANDOFF");
+
+    MlvPipelineFixture fixture;
+    assert_fixture_ready(fixture);
+    std::vector<uint16_t> frame = fixture.renderFrame16(0, 1);
+    ASSERT_TRUE(!frame.empty());
+
+    int32_t par[4] = { 1, 1, 1, 1 };
+    dngObject_t * dng = initDngObject(fixture.video(), UNCOMPRESSED_RAW, 1.0, par);
+    ASSERT_TRUE(dng != nullptr);
+
+    dngPayloadWriter_t * writer = createDngPayloadWriter();
+    ASSERT_TRUE(writer != nullptr);
+
+    QByteArray first_path_bytes = first_path.toLocal8Bit();
+    ASSERT_EQ(0, saveDngFrameViaAsyncPayloadWriter(writer,
+                                                   fixture.video(),
+                                                   dng,
+                                                   0,
+                                                   first_path_bytes.data(),
+                                                   nullptr));
+    // Wait (bounded, loud on expiry: the result stays PENDING) until the writer reports that the
+    // 300 ms hold ran out with the producer still active; only then call finish.
+    ASSERT_EQ(DNG_PAYLOAD_WRITER_DEBUG_HOLD_TIMED_OUT,
+              dngPayloadWriterDebugWaitHoldResult(writer, 60000u));
+    ASSERT_NE(0, finishDngPayloadWriter(writer));
+    freeDngObject(dng);
+
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILER");
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE");
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS");
+}
+
+TEST(DualIsoPipeline, DngFrameAsyncWriterDebugHoldTimeoutFailsLoudly)
+{
+    run_async_writer_debug_hold_timeout_case("async-hold-timeout", QByteArray());
+}
+
+// Review r1 repro: the writer thread reaches the hold only after the producer's old 1200 ms
+// wait (here the 3000 ms debug delay runs first). A test that sleeps and then calls finish
+// sets stopping before the hold can time out, the hold ends as STOPPED and finish returns 0;
+// waiting on the acknowledgement keeps the timeout loud however late the writer is.
+TEST(DualIsoPipeline, DngFrameAsyncWriterDebugHoldTimeoutFailsLoudlyWhenWriterStartsLate)
+{
+    run_async_writer_debug_hold_timeout_case("async-hold-timeout-late", QByteArrayLiteral("3000"));
+}
+
+// The debug ms envs are parsed strictly: a sign, leading whitespace or trailing characters turn
+// the hook off instead of arming it with the numeric prefix ("1garbage" used to arm a 1 ms hold).
+TEST(DualIsoPipeline, DngFrameAsyncWriterDebugMsEnvRejectsMalformedValues)
+{
+    QTemporaryDir temp_dir;
+    ASSERT_TRUE(temp_dir.isValid());
+
+    const QString first_path = temp_dir.filePath(QStringLiteral("async-debug-env-strict.dng"));
+    const QString profile_path = temp_dir.filePath(QStringLiteral("async-debug-env-strict-profile.json"));
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILER", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE", profile_path.toLocal8Bit());
+    qputenv("MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID", QByteArrayLiteral("async-debug-env-strict-test"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER", QByteArrayLiteral("1"));
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH", QByteArrayLiteral("2"));
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS");
+    qunsetenv("MLVAPP_CDNG_EXPORT_PAYLOAD_HANDOFF");
+
+    // Every value is checked and every writer finished before the one assertion, so a run names
+    // each value that arms the hook rather than stopping at the first. Values are quoted so
+    // " 300" and "300 " read apart. " " is the whitespace-only value; an empty value is not
+    // testable here because qputenv("") reads as unset on Windows.
+    const char * const malformed[] = { "1garbage", " 300", "300 ", "+300", "-300", "0x10", " " };
+    std::string armed_by;
+    for(const char * value : malformed)
+    {
+        qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS", QByteArray(value));
+        dngPayloadWriter_t * writer = createDngPayloadWriter();
+        ASSERT_TRUE(writer != nullptr);
+        const int hold = dngPayloadWriterDebugWaitHoldResult(writer, 0u);
+        const int finish_rc = finishDngPayloadWriter(writer);
+        if(hold != DNG_PAYLOAD_WRITER_DEBUG_HOLD_OFF || finish_rc != 0)
+        {
+            armed_by += std::string(armed_by.empty() ? "" : "; ") + "\"" + value + "\" hold="
+                + std::to_string(hold) + " finish=" + std::to_string(finish_rc);
+        }
+    }
+    ASSERT_EQ(std::string(), armed_by);
+
+    // A well-formed bound still arms the hold (control for the cases above).
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS", QByteArrayLiteral("300"));
+    dngPayloadWriter_t * armed = createDngPayloadWriter();
+    ASSERT_TRUE(armed != nullptr);
+    ASSERT_EQ(DNG_PAYLOAD_WRITER_DEBUG_HOLD_PENDING, dngPayloadWriterDebugWaitHoldResult(armed, 0u));
+    ASSERT_EQ(0, finishDngPayloadWriter(armed));
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_HOLD_UNTIL_FULL_MS");
+
+    // The delay shares the parser: "5garbage" reports no delay in the profile.
+    qputenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS", QByteArrayLiteral("5garbage"));
+    MlvPipelineFixture fixture;
+    assert_fixture_ready(fixture);
+    int32_t par[4] = { 1, 1, 1, 1 };
+    dngObject_t * dng = initDngObject(fixture.video(), UNCOMPRESSED_RAW, 1.0, par);
+    ASSERT_TRUE(dng != nullptr);
+    dngPayloadWriter_t * writer = createDngPayloadWriter();
+    ASSERT_TRUE(writer != nullptr);
+    QByteArray first_path_bytes = first_path.toLocal8Bit();
+    ASSERT_EQ(0, saveDngFrameViaAsyncPayloadWriter(writer,
+                                                   fixture.video(),
+                                                   dng,
+                                                   0,
+                                                   first_path_bytes.data(),
+                                                   nullptr));
+    ASSERT_EQ(0, finishDngPayloadWriter(writer));
+    freeDngObject(dng);
+
+    const QJsonDocument doc = QJsonDocument::fromJson(read_all_bytes(profile_path));
+    ASSERT_TRUE(doc.isObject());
+    ASSERT_EQ(0, doc.object().value(QStringLiteral("async_writer_debug_delay_ms")).toInt(-1));
+
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILER");
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILE_FILE");
+    qunsetenv("MLVAPP_EXPORT_STAGE_PROFILE_BUILD_ID");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_QUEUE_DEPTH");
+    qunsetenv("MLVAPP_CDNG_EXPORT_ASYNC_WRITER_DEBUG_DELAY_MS");
 }
 
 TEST(DualIsoPipeline, ExportStageProfilerRecordsQueueIdleBetweenFrameSaves)
@@ -9241,6 +9481,198 @@ public:
     }
 };
 
+/* DUALISO-PREFETCH-TEST-ENV-RESTORE-ON-FAIL-1: scope for the process state the
+ * processed8 prefetch tests mutate. Declare it BEFORE the first set and before
+ * the fixture, so every exit path (a failing ASSERT_* returning early, an
+ * exception, the normal end) restores the prior env values and returns the
+ * playback preview modes to off after the fixture has been torn down. */
+class ScopedProcessed8PrefetchTestState
+{
+public:
+    ScopedProcessed8PrefetchTestState()
+        : env_({
+            "MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH",
+            "MLVAPP_PROCESSED8_PREFETCH_INDIRECT",
+            "MLVAPP_PREFETCH_INDIRECT_X2",
+            "MLVAPP_DISABLE_QUARTERRES_X2_PROCESSING"
+        })
+    {
+    }
+
+    ~ScopedProcessed8PrefetchTestState()
+    {
+        processingSetPlaybackPreviewMode(0);
+        processingSetPlaybackAggressivePreviewMode(0);
+    }
+
+private:
+    ScopedAsyncWriterEnvironment env_;
+};
+
+/* DUALISO-PREFETCH-TEST-ENV-GUARD-FOLLOWUPS-1: the regression for the guard
+ * above. It covers every restoration path the guard owns: each of the four env
+ * keys (two that were set before the body, two that were unset) and both
+ * playback preview modes (plain and aggressive). The outer
+ * ScopedProcessed8PrefetchTestState snapshots the env values the process had on
+ * entry (a developer's exported MLVAPP_* key included) and gives them back on
+ * every exit path of this test: a key that was set gets its exact value back and
+ * a key that was unset is unset again. The playback preview modes are not
+ * snapshotted; the guard resets both to zero. It is the same guard type, not a
+ * second one: it already snapshots and restores. The early-return case is here;
+ * the exception-unwind case is the test right after it. */
+TEST(DualIsoPipeline, Processed8PrefetchTestStateRestoresEnvAndPreviewModeOnEarlyReturn)
+{
+    constexpr const char * kPrefetch = "MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH";
+    constexpr const char * kIndirect = "MLVAPP_PROCESSED8_PREFETCH_INDIRECT";
+    constexpr const char * kIndirectX2 = "MLVAPP_PREFETCH_INDIRECT_X2";
+    constexpr const char * kQuarterResX2 = "MLVAPP_DISABLE_QUARTERRES_X2_PROCESSING";
+
+    struct Incoming
+    {
+        bool was_set;
+        QByteArray value;
+    };
+    const auto read_incoming = [](const char * key) {
+        return Incoming{ qEnvironmentVariableIsSet(key), qgetenv(key) };
+    };
+    const Incoming incoming_prefetch = read_incoming(kPrefetch);
+    const Incoming incoming_indirect = read_incoming(kIndirect);
+    const Incoming incoming_indirect_x2 = read_incoming(kIndirectX2);
+    const Incoming incoming_quarter_x2 = read_incoming(kQuarterResX2);
+
+    {
+        ScopedProcessed8PrefetchTestState outer;
+
+        /* Baseline the inner guard must hand back: two keys set, two unset. */
+        MLVAPP_TEST_SETENV(kPrefetch, "prior-prefetch");
+        MLVAPP_TEST_UNSETENV(kIndirect);
+        MLVAPP_TEST_SETENV(kIndirectX2, "prior-indirect-x2");
+        MLVAPP_TEST_UNSETENV(kQuarterResX2);
+        processingSetPlaybackPreviewMode(0);
+        processingSetPlaybackAggressivePreviewMode(0);
+
+        /* Models a test whose ASSERT_* fails after the sets: it returns without
+         * reaching any straight-line restore at the end of the body. */
+        const auto body_that_returns_early = []() {
+            ScopedProcessed8PrefetchTestState state;
+            MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
+            MLVAPP_TEST_SETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT", "0");
+            MLVAPP_TEST_SETENV("MLVAPP_PREFETCH_INDIRECT_X2", "1");
+            MLVAPP_TEST_SETENV("MLVAPP_DISABLE_QUARTERRES_X2_PROCESSING", "1");
+            processingSetPlaybackPreviewMode(1);
+            processingSetPlaybackAggressivePreviewMode(1);
+            return;
+        };
+        body_that_returns_early();
+
+        ASSERT_TRUE(qEnvironmentVariableIsSet(kPrefetch) && qgetenv(kPrefetch) == QByteArray("prior-prefetch"));
+        ASSERT_TRUE(!qEnvironmentVariableIsSet(kIndirect));
+        ASSERT_TRUE(qEnvironmentVariableIsSet(kIndirectX2) && qgetenv(kIndirectX2) == QByteArray("prior-indirect-x2"));
+        ASSERT_TRUE(!qEnvironmentVariableIsSet(kQuarterResX2));
+        ASSERT_EQ(0, processingPlaybackPreviewModeEnabled());
+        ASSERT_EQ(0, processingPlaybackAggressivePreviewModeEnabled());
+    }
+
+    /* The outer guard is gone: the env values this process entered the test
+     * with are back (a set key with its exact value, an unset key unset), and
+     * both playback preview modes are reset to zero, not to any incoming value. */
+    const auto matches_incoming = [](const char * key, const Incoming & incoming) {
+        return qEnvironmentVariableIsSet(key) == incoming.was_set
+            && (!incoming.was_set || qgetenv(key) == incoming.value);
+    };
+    ASSERT_TRUE(matches_incoming(kPrefetch, incoming_prefetch));
+    ASSERT_TRUE(matches_incoming(kIndirect, incoming_indirect));
+    ASSERT_TRUE(matches_incoming(kIndirectX2, incoming_indirect_x2));
+    ASSERT_TRUE(matches_incoming(kQuarterResX2, incoming_quarter_x2));
+    ASSERT_EQ(0, processingPlaybackPreviewModeEnabled());
+    ASSERT_EQ(0, processingPlaybackAggressivePreviewModeEnabled());
+}
+
+/* DUALISO-PREFETCH-TEST-ENV-GUARD-UNWIND-1 (Dot advisory c380b3c9 on #579): the
+ * same restoration contract as the early-return test above, for the exception
+ * path. A body that throws after the sets unwinds through the guard's
+ * destructor, which must give the env keys back and reset both preview modes to
+ * zero before the catch below runs. The test target is built with exceptions
+ * (the minitest runner itself throws and catches Failure/Skip). */
+TEST(DualIsoPipeline, Processed8PrefetchTestStateRestoresEnvAndPreviewModeOnExceptionUnwind)
+{
+    constexpr const char * kPrefetch = "MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH";
+    constexpr const char * kIndirect = "MLVAPP_PROCESSED8_PREFETCH_INDIRECT";
+    constexpr const char * kIndirectX2 = "MLVAPP_PREFETCH_INDIRECT_X2";
+    constexpr const char * kQuarterResX2 = "MLVAPP_DISABLE_QUARTERRES_X2_PROCESSING";
+
+    struct Incoming
+    {
+        bool was_set;
+        QByteArray value;
+    };
+    const auto read_incoming = [](const char * key) {
+        return Incoming{ qEnvironmentVariableIsSet(key), qgetenv(key) };
+    };
+    const Incoming incoming_prefetch = read_incoming(kPrefetch);
+    const Incoming incoming_indirect = read_incoming(kIndirect);
+    const Incoming incoming_indirect_x2 = read_incoming(kIndirectX2);
+    const Incoming incoming_quarter_x2 = read_incoming(kQuarterResX2);
+
+    {
+        ScopedProcessed8PrefetchTestState outer;
+
+        /* Same baseline as the early-return test: two keys set, two unset. */
+        MLVAPP_TEST_SETENV(kPrefetch, "prior-prefetch");
+        MLVAPP_TEST_UNSETENV(kIndirect);
+        MLVAPP_TEST_SETENV(kIndirectX2, "prior-indirect-x2");
+        MLVAPP_TEST_UNSETENV(kQuarterResX2);
+        processingSetPlaybackPreviewMode(0);
+        processingSetPlaybackAggressivePreviewMode(0);
+
+        struct UnwindProbe
+        {
+        };
+        /* Models a body that throws after the sets, e.g. a fixture call that
+         * raises: control leaves through stack unwinding, not through return. */
+        const auto body_that_throws = []() {
+            ScopedProcessed8PrefetchTestState state;
+            MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
+            MLVAPP_TEST_SETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT", "0");
+            MLVAPP_TEST_SETENV("MLVAPP_PREFETCH_INDIRECT_X2", "1");
+            MLVAPP_TEST_SETENV("MLVAPP_DISABLE_QUARTERRES_X2_PROCESSING", "1");
+            processingSetPlaybackPreviewMode(1);
+            processingSetPlaybackAggressivePreviewMode(1);
+            throw UnwindProbe();
+        };
+        bool caught = false;
+        try
+        {
+            body_that_throws();
+        }
+        catch(const UnwindProbe &)
+        {
+            caught = true;
+        }
+        ASSERT_TRUE(caught);
+
+        ASSERT_TRUE(qEnvironmentVariableIsSet(kPrefetch) && qgetenv(kPrefetch) == QByteArray("prior-prefetch"));
+        ASSERT_TRUE(!qEnvironmentVariableIsSet(kIndirect));
+        ASSERT_TRUE(qEnvironmentVariableIsSet(kIndirectX2) && qgetenv(kIndirectX2) == QByteArray("prior-indirect-x2"));
+        ASSERT_TRUE(!qEnvironmentVariableIsSet(kQuarterResX2));
+        ASSERT_EQ(0, processingPlaybackPreviewModeEnabled());
+        ASSERT_EQ(0, processingPlaybackAggressivePreviewModeEnabled());
+    }
+
+    /* The outer guard is gone: incoming env values are back and both preview
+     * modes are zero. */
+    const auto matches_incoming = [](const char * key, const Incoming & incoming) {
+        return qEnvironmentVariableIsSet(key) == incoming.was_set
+            && (!incoming.was_set || qgetenv(key) == incoming.value);
+    };
+    ASSERT_TRUE(matches_incoming(kPrefetch, incoming_prefetch));
+    ASSERT_TRUE(matches_incoming(kIndirect, incoming_indirect));
+    ASSERT_TRUE(matches_incoming(kIndirectX2, incoming_indirect_x2));
+    ASSERT_TRUE(matches_incoming(kQuarterResX2, incoming_quarter_x2));
+    ASSERT_EQ(0, processingPlaybackPreviewModeEnabled());
+    ASSERT_EQ(0, processingPlaybackAggressivePreviewModeEnabled());
+}
+
 /* Phase: Mean23 playback override (this commit). The receipt asks for AMaZE
  * (dualIsoInterpolation == 0). With the playback-only override clear the HQ
  * recon must run AMaZE; flipping diso_playback_force_mean23=1 must redirect
@@ -9361,6 +9793,7 @@ extern "C" int llrpReinitMean23OverrideDispatchForTesting(void);
  * without having to also strip the override from the receipt path. */
 TEST(DualIsoPipeline, Phase4A_TestProcessed8CacheScaleKeyIsolation)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     /* Phase 4A/4B: render at scale=1, then at scale=2, then again at
      * scale=1. The cache key MUST differ between scale=1 and scale=2
      * (Phase 4A guarantee). Phase 4B further makes the scale=2 output
@@ -9447,8 +9880,6 @@ TEST(DualIsoPipeline, Phase4A_TestProcessed8CacheScaleKeyIsolation)
      * the public-API surface stays compatible. */
     const std::vector<uint8_t> nonScaled_frame = fixture.renderFrame8(0, 1);
     ASSERT_TRUE(scale1_frame == nonScaled_frame);
-
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, DualIsoPlaybackOverrideRespectsMean23DisableEnv)
@@ -11644,6 +12075,7 @@ TEST(DualIsoPipeline, Processed8PrefetchEnablesAggressiveScaleOneTwoAndFour)
 
 TEST(DualIsoPipeline, Processed8PrefetchEnablesStandardScaleTwoFourAndEightButNotOne)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MlvPipelineFixture fixture;
     QString error_message;
     ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
@@ -11670,8 +12102,99 @@ TEST(DualIsoPipeline, Processed8PrefetchEnablesStandardScaleTwoFourAndEightButNo
 
     fixture.video()->playback_scale_factor_active = 8;
     ASSERT_EQ(1, getMlvProcessed8PrefetchEnabledForTesting(fixture.video()));
+}
 
-    processingSetPlaybackPreviewMode(0);
+/* DUALISO-PREFETCH-INDIRECT-WORKER-HIT-ORACLE-FLAKE-1: wait until the
+ * processed8 prefetch worker is idle, failing loudly only on a HANG.
+ *
+ * The idle wait is condition-driven (it returns the instant the worker has
+ * no pending request and is not busy: 0 ms for every wait after the first),
+ * so its timeout was never meant to assert a latency. The old fixed 5000 ms
+ * bound did exactly that for the worker's COLD first task (thread start,
+ * processing-object init, first indirect render): on a CPU-starved host that
+ * task took 5.8 s and 16.9 s (2 logical CPUs, 8 busy loops), the wait timed
+ * out at busy=0 pending=1, and merge_group 39092417197 bounced an unrelated
+ * PR. The worker always finished; nothing was wrong with its pixels.
+ *
+ * The bound below is a hang detector. A worker that never goes idle still
+ * fails the test, and the failure prints the worker state so the hang is
+ * attributable. It does not weaken what the tests prove: every hit is still
+ * byte-compared against the foreground reference and a forced fresh render. */
+static bool waitForProcessed8PrefetchIdleOrHang(mlvObject_t * video)
+{
+    constexpr uint32_t kHangGuardMs = 120000;
+    if (mlvWaitForProcessed8PrefetchIdleForTesting(video, kHangGuardMs))
+    {
+        return true;
+    }
+
+    pthread_mutex_lock(&video->processed8_prefetch_mutex);
+    const int started = video->processed8_prefetch_thread_started;
+    const int busy = video->processed8_prefetch_worker_busy;
+    const int pending = video->processed8_prefetch_request_pending;
+    pthread_mutex_unlock(&video->processed8_prefetch_mutex);
+    std::fprintf(stderr,
+                 "Processed8Prefetch idle wait HUNG for %u ms: thread_started=%d worker_busy=%d request_pending=%d\n",
+                 static_cast<unsigned>(kHangGuardMs),
+                 started,
+                 busy,
+                 pending);
+    return false;
+}
+
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2: wait until a test idle waiter
+ * is parked on processed8_prefetch_cond. The waiter raises the idle-waiter
+ * count and enters the cond wait under one hold of the mutex, so a count above
+ * zero seen under the mutex means it is inside the wait. The budget is a
+ * steady_clock deadline, not an iteration cap: a 1 ms sleep runs at the
+ * Windows timer granularity, and r1's 5000 x 1 ms cap ran 80-91 s. */
+static bool waitForProcessed8IdleWaiterParked(mlvObject_t * video, const char * test_name)
+{
+    constexpr auto kParkBudget = std::chrono::milliseconds(5000);
+    const auto park_start = std::chrono::steady_clock::now();
+    const auto park_deadline = park_start + kParkBudget;
+    for (;;)
+    {
+        pthread_mutex_lock(&video->processed8_prefetch_mutex);
+        const bool parked = video->processed8_prefetch_test_idle_waiters > 0;
+        pthread_mutex_unlock(&video->processed8_prefetch_mutex);
+        if (parked)
+        {
+            return true;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= park_deadline)
+        {
+            std::fprintf(stderr,
+                         "%s: INCONCLUSIVE: the idle waiter did not park within the %lld ms steady_clock budget (waited %.1f ms)\n",
+                         test_name,
+                         static_cast<long long>(kParkBudget.count()),
+                         std::chrono::duration<double, std::milli>(now - park_start).count());
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+/* Sets the processed8 slice-wait seams and zeroes the expired-slice counter.
+ * slice_ms 0 keeps the production 50 ms slice; wall_clock_skew_ns 0 is none. */
+static void setProcessed8WaitSeams(mlvObject_t * video,
+                                   uint32_t slice_ms,
+                                   int64_t wall_clock_skew_ns)
+{
+    pthread_mutex_lock(&video->processed8_prefetch_mutex);
+    video->processed8_prefetch_test_wait_slice_ms = slice_ms;
+    video->processed8_prefetch_test_wall_clock_skew_ns = wall_clock_skew_ns;
+    video->processed8_prefetch_test_slice_expiries = 0;
+    pthread_mutex_unlock(&video->processed8_prefetch_mutex);
+}
+
+static int readProcessed8SliceExpiries(mlvObject_t * video)
+{
+    pthread_mutex_lock(&video->processed8_prefetch_mutex);
+    const int expiries = video->processed8_prefetch_test_slice_expiries;
+    pthread_mutex_unlock(&video->processed8_prefetch_mutex);
+    return expiries;
 }
 
 /* 2026-06-11: the prefetch worker learned the indirect processed16->8 render
@@ -11688,6 +12211,7 @@ TEST(DualIsoPipeline, Processed8PrefetchEnablesStandardScaleTwoFourAndEightButNo
  * consumes is carried by the prefetch state copy. */
 TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundReference)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     processingSetPlaybackPreviewMode(1);
@@ -11708,8 +12232,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundRefere
     if ((reference_fixture.width() % 4) != 0 || (reference_fixture.height() % 4) != 0)
     {
         std::printf("Processed8PrefetchIndirect: fixture not x4-divisible, guarded out\n");
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -11763,7 +12285,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundRefere
                     }
                 }
             }
-            ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+            ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
         }
     }
 
@@ -11778,7 +12300,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundRefere
      * same frame and processing state. This catches a worker snapshot that
      * is internally key-consistent but pixel-incomplete. */
     ASSERT_FALSE(first_prefetched_bytes.empty());
-    ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "0");
     invalidateMlvProcessedPreviewCache(fixture.video());
     const std::vector<uint8_t> forced_fresh =
@@ -11786,9 +12308,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundRefere
     ASSERT_EQ(0, getMlvLastProcessed8CacheHit());
     ASSERT_EQ(0, getMlvLastProcessed8PrefetchHit());
     ASSERT_TRUE(first_prefetched_bytes == forced_fresh);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 /* Iteration 4 (2026-06-11): aggressive x4/x8 consult the cache again, served
@@ -11796,6 +12315,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectWorkerHitMatchesForegroundRefere
  * test above, under ambient Aggressive Performance. */
 TEST(DualIsoPipeline, Processed8PrefetchIndirectAggressiveX4WorkerHitMatchesReference)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     ScopedAggressivePreviewMode aggressivePreview(1);
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
@@ -11814,8 +12334,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectAggressiveX4WorkerHitMatchesRefe
     if ((reference_fixture.width() % 4) != 0 || (reference_fixture.height() % 4) != 0)
     {
         std::printf("Processed8PrefetchIndirectAggressive: fixture not x4-divisible, guarded out\n");
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -11864,7 +12382,7 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectAggressiveX4WorkerHitMatchesRefe
                     }
                 }
             }
-            ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+            ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
         }
     }
 
@@ -11873,13 +12391,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectAggressiveX4WorkerHitMatchesRefe
                 static_cast<unsigned long long>(mismatched_bytes));
     ASSERT_TRUE(prefetched_hits >= 1);
     ASSERT_EQ(static_cast<std::uint64_t>(0), mismatched_bytes);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, Processed8PrefetchIndirectDisableEnvKeepsSkip)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_SETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT", "0");
     processingSetPlaybackPreviewMode(1);
@@ -11896,9 +12412,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectDisableEnvKeepsSkip)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -11917,14 +12430,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectDisableEnvKeepsSkip)
     }
 
     ASSERT_EQ(0, prefetched_hits);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, Processed8PrefetchIndirectUnsupportedStateKeepsSkip)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     processingSetPlaybackPreviewMode(1);
@@ -11944,8 +12454,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectUnsupportedStateKeepsSkip)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -11966,12 +12474,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectUnsupportedStateKeepsSkip)
     ASSERT_EQ(0, prefetched_hits);
 
     fixture.processing()->lut_on = 0;
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, Processed8PrefetchIndirectClarityKeepsSkip)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     processingSetPlaybackPreviewMode(1);
@@ -11989,8 +12496,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectClarityKeepsSkip)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12001,16 +12506,14 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectClarityKeepsSkip)
     {
         (void)fixture.renderFrame8Scaled(f, 1, 4);
         prefetched_hits += getMlvLastProcessed8PrefetchHit() ? 1 : 0;
-        ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+        ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
     }
     ASSERT_EQ(0, prefetched_hits);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
 }
 
 TEST(DualIsoPipeline, Processed8InvalidationIsGenerationBarrierAndForcesSnapshotRefresh)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     processingSetPlaybackPreviewMode(1);
     processingSetPlaybackAggressivePreviewMode(0);
@@ -12024,13 +12527,11 @@ TEST(DualIsoPipeline, Processed8InvalidationIsGenerationBarrierAndForcesSnapshot
 
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
     (void)fixture.renderFrame8Scaled(0, 1, 4);
-    ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
     ASSERT_EQ(0, fixture.video()->processed8_prefetch_snapshot_dirty);
 
     /* pre_calc_levels is copied into the worker snapshot but deliberately is
@@ -12073,14 +12574,12 @@ TEST(DualIsoPipeline, Processed8InvalidationIsGenerationBarrierAndForcesSnapshot
     pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
     ASSERT_EQ(0, dirty_after_request);
     ASSERT_EQ(replacement, snapshot_level);
-    ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
 }
 
 TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAndWakesWaiter)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     processingSetPlaybackPreviewMode(1);
     processingSetPlaybackAggressivePreviewMode(0);
@@ -12095,8 +12594,6 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
     if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0
         || getMlvFrames(fixture.video()) < 2)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12109,7 +12606,7 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
 
     invalidateMlvProcessedPreviewCache(fixture.video());
     mlvSetProcessed8PrefetchPauseBeforeStoreForTesting(fixture.video(), 0);
-    ASSERT_TRUE(mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000));
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
 
     pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
     bool any_published_slot = false;
@@ -12135,7 +12632,10 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
     ASSERT_EQ(0, getMlvLastProcessed8PrefetchHit());
 
     /* Also pin the condition-variable contract: an idle waiter blocked only
-     * by a pending request must wake when invalidation clears and broadcasts. */
+     * by a pending request must wake when invalidation clears and broadcasts.
+     * The fallback slice is widened to the whole budget, so the waiter can
+     * only return early on a broadcast, never on a slice re-check. */
+    setProcessed8WaitSeams(fixture.video(), 5000, 0);
     pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
     fixture.video()->processed8_prefetch_request_pending = 1;
     pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
@@ -12146,17 +12646,8 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
         waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000);
     });
 
-    bool waiter_is_blocked = false;
-    for (int attempt = 0; attempt < 5000 && !waiter_is_blocked; ++attempt)
-    {
-        pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
-        waiter_is_blocked = fixture.video()->processed8_prefetch_test_idle_waiters > 0;
-        pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
-        if (!waiter_is_blocked)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
+    bool waiter_is_blocked = waitForProcessed8IdleWaiterParked(
+        fixture.video(), "Processed8InvalidationRejectsInFlightOldGenerationStoreAndWakesWaiter");
     if (!waiter_is_blocked)
     {
         invalidateMlvProcessedPreviewCache(fixture.video());
@@ -12170,11 +12661,381 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
     }
     const double waiter_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - waiter_start).count();
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
     ASSERT_EQ(1, waiter_result);
     ASSERT_TRUE(waiter_ms < 1000.0);
+    /* Woken by the invalidation broadcast, not by a slice running out. */
+    ASSERT_EQ(0, slice_expiries);
+}
 
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1: when the worker's cache prepare
+ * fails it clears request_pending. An idle waiter parked only on that pending
+ * request must wake promptly; before the fix the failure path never broadcast
+ * and the timed wait never re-checked, so the waiter slept to its deadline and
+ * reported a false hang.
+ *
+ * The worker is woken with pthread_cond_signal, retried, never a broadcast: a
+ * broadcast would also wake the parked waiter, which then races the worker for
+ * the mutex; if the worker cleared pending first, the unfixed waiter would see
+ * idle and return promptly, and this test could not fail. A signal the waiter
+ * absorbs only re-parks it (pending is still 1), so the next one is sent until
+ * the worker has consumed the armed failure, and nothing is sent after it.
+ *
+ * The waiter is parked before the request exists, on a test-held worker_busy:
+ * the worker's own loop waits on pending alone, so it stays parked, and a
+ * worker that has not yet re-parked after the idle wait cannot consume the
+ * failure before the waiter is waiting. pending=1 and busy=0 are then set in
+ * one critical section, leaving the waiter parked on the pending request. */
+TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails)
+{
+    ScopedProcessed8PrefetchTestState process8_state;
+    MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
+    processingSetPlaybackPreviewMode(1);
+    processingSetPlaybackAggressivePreviewMode(0);
+
+    QString error_message;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_preview.marxml"),
+                                    &error_message));
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+
+    if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
+    {
+        return;
+    }
+
+    (void)fixture.renderFrame8Scaled(0, 1, 4);
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
+
+    /* Arm one worker prepare failure; the worker only consumes it on a pending
+     * request, and none exists yet. */
+    mlvSetProcessed8PrefetchPrepareFailuresForTesting(fixture.video(), 1);
+    /* r2: widen the fallback slice to the whole budget, so only the
+     * prepare-failure broadcast can return the waiter early (a 50 ms slice
+     * re-check would otherwise hide a missing broadcast). */
+    setProcessed8WaitSeams(fixture.video(), 5000, 0);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 1;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    int waiter_result = 0;
+    const auto waiter_start = std::chrono::steady_clock::now();
+    std::thread waiter([&]() {
+        waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), 5000);
+    });
+
+    bool waiter_is_blocked = waitForProcessed8IdleWaiterParked(
+        fixture.video(), "Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails");
+
+    /* Hand the waiter's predicate from the test-held busy to the pending
+     * request in one critical section, without waking anyone. */
+    int armed_when_blocked = -1;
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    if (waiter_is_blocked)
+    {
+        waiter_is_blocked = fixture.video()->processed8_prefetch_test_idle_waiters > 0;
+        armed_when_blocked = fixture.video()->processed8_prefetch_test_prepare_failures;
+        fixture.video()->processed8_prefetch_request_pending = 1;
+    }
+    fixture.video()->processed8_prefetch_worker_busy = 0;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    /* Wake the worker; stop as soon as it has taken the prepare-failure path. */
+    int failures_left = -1;
+    if (waiter_is_blocked && armed_when_blocked == 1)
+    {
+        for (int signal_attempt = 0; signal_attempt < 100 && failures_left != 0; ++signal_attempt)
+        {
+            pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+            pthread_cond_signal(&fixture.video()->processed8_prefetch_cond);
+            pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+            for (int poll = 0; poll < 50; ++poll)
+            {
+                pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+                failures_left = fixture.video()->processed8_prefetch_test_prepare_failures;
+                pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+                if (failures_left == 0)
+                {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+    waiter.join();
+    const double waiter_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - waiter_start).count();
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    failures_left = fixture.video()->processed8_prefetch_test_prepare_failures;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
+    std::fprintf(stderr,
+                 "Processed8PrefetchIdleWaitWakesWhenWorkerPrepareFails: waiter_result=%d waiter_ms=%.1f armed_when_blocked=%d failures_left=%d slice_expiries=%d\n",
+                 waiter_result,
+                 waiter_ms,
+                 armed_when_blocked,
+                 failures_left,
+                 slice_expiries);
+
+    ASSERT_TRUE(waiter_is_blocked);
+    /* Inconclusive guard: the failure was still armed when the pending request
+     * appeared under a waiter already parked, so the waiter waits on the very
+     * request the failure path clears. */
+    ASSERT_EQ(1, armed_when_blocked);
+    /* The worker really took the prepare-failure path. */
+    ASSERT_EQ(0, failures_left);
+    ASSERT_EQ(1, waiter_result);
+    ASSERT_TRUE(waiter_ms < 1000.0);
+    /* Woken by the prepare-failure broadcast, not by a slice running out:
+     * deleting that broadcast leaves the waiter asleep for the whole slice. */
+    ASSERT_EQ(0, slice_expiries);
+}
+
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, broadcast pin for
+ * mlv_reset_processed8_prefetch_locked. mlvCancelPreviewPrefetch clears the
+ * pending request through that helper and broadcasts nowhere else (the
+ * invalidation path broadcasts a second time, so it cannot pin this one).
+ * The waiter is parked first on a test-held worker_busy, then handed to a
+ * pending request no one wakes the worker for, exactly as in the
+ * prepare-failure test. With the fallback slice widened to the budget, only
+ * the reset broadcast can return the waiter before the budget runs out. */
+TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesOnCancelClear)
+{
+    ScopedProcessed8PrefetchTestState process8_state;
+    MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
+    processingSetPlaybackPreviewMode(1);
+    processingSetPlaybackAggressivePreviewMode(0);
+
+    QString error_message;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_preview.marxml"),
+                                    &error_message));
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+
+    if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
+    {
+        return;
+    }
+
+    (void)fixture.renderFrame8Scaled(0, 1, 4);
+    ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
+
+    constexpr uint32_t kBudgetMs = 5000;
+    setProcessed8WaitSeams(fixture.video(), kBudgetMs, 0);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 1;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    int waiter_result = 0;
+    std::thread waiter([&]() {
+        waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), kBudgetMs);
+    });
+    const bool waiter_is_blocked = waitForProcessed8IdleWaiterParked(
+        fixture.video(), "Processed8PrefetchIdleWaitWakesOnCancelClear");
+
+    /* Hand the waiter's predicate to a pending request, without waking anyone. */
+    int pending_before_cancel = -1;
+    int busy_before_cancel = -1;
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    if (waiter_is_blocked)
+    {
+        fixture.video()->processed8_prefetch_request_pending = 1;
+    }
+    fixture.video()->processed8_prefetch_worker_busy = 0;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    pending_before_cancel = fixture.video()->processed8_prefetch_request_pending;
+    busy_before_cancel = fixture.video()->processed8_prefetch_worker_busy;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    const auto clear_start = std::chrono::steady_clock::now();
+    mlvCancelPreviewPrefetch(fixture.video());
+    waiter.join();
+    const double wake_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - clear_start).count();
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
+    std::fprintf(stderr,
+                 "Processed8PrefetchIdleWaitWakesOnCancelClear: waiter_result=%d wake_ms=%.1f pending_before_cancel=%d busy_before_cancel=%d slice_expiries=%d\n",
+                 waiter_result,
+                 wake_ms,
+                 pending_before_cancel,
+                 busy_before_cancel,
+                 slice_expiries);
+
+    ASSERT_TRUE(waiter_is_blocked);
+    /* Inconclusive guards: the worker had not taken the request, so only the
+     * cancel can clear the waiter's predicate. */
+    ASSERT_EQ(1, pending_before_cancel);
+    ASSERT_EQ(0, busy_before_cancel);
+    ASSERT_EQ(1, waiter_result);
+    ASSERT_EQ(0, slice_expiries);
+    ASSERT_TRUE(wake_ms < 1000.0);
+}
+
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, broadcast pin for
+ * mlv_processed8_prefetch_note_request. A repeat request for the same frame
+ * at the same threads, scale and state takes no reset path (the next frame
+ * would not do: this clip's state signature changes from frame 0 to 1), so the
+ * request broadcast is the only thing that wakes the parked worker; without
+ * it the worker never runs, pending stays set and the idle wait reports a
+ * hang. The generation guard proves the reset path (which broadcasts too)
+ * did not run. */
+TEST(DualIsoPipeline, Processed8PrefetchIdleWaitWakesWorkerOnRepeatRequest)
+{
+    ScopedProcessed8PrefetchTestState process8_state;
+    MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
+    processingSetPlaybackPreviewMode(1);
+    processingSetPlaybackAggressivePreviewMode(0);
+
+    QString error_message;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+    ASSERT_TRUE(fixture.loadReceipt(QStringLiteral("tests/fixtures/receipts/tiny_dual_iso_preview.marxml"),
+                                    &error_message));
+    ASSERT_TRUE(fixture.applyReceipt(&error_message));
+
+    if ((fixture.width() % 4) != 0 || (fixture.height() % 4) != 0)
+    {
+        return;
+    }
+
+    /* Two warm-up requests: the first render settles state the signature
+     * covers, so only the third request is a true repeat. */
+    for (int warm = 0; warm < 2; ++warm)
+    {
+        (void)fixture.renderFrame8Scaled(0, 1, 4);
+        ASSERT_TRUE(waitForProcessed8PrefetchIdleOrHang(fixture.video()));
+    }
+
+    constexpr uint32_t kBudgetMs = 10000;
+    setProcessed8WaitSeams(fixture.video(), kBudgetMs, 0);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    const uint32_t generation_before = fixture.video()->processed8_prefetch_generation;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    (void)fixture.renderFrame8Scaled(0, 1, 4);
+
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    const uint32_t generation_after = fixture.video()->processed8_prefetch_generation;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    const int waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), kBudgetMs);
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    const int pending_after = fixture.video()->processed8_prefetch_request_pending;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
+    std::fprintf(stderr,
+                 "Processed8PrefetchIdleWaitWakesWorkerOnRepeatRequest: waiter_result=%d generation_before=%u generation_after=%u pending_after=%d slice_expiries=%d\n",
+                 waiter_result,
+                 static_cast<unsigned>(generation_before),
+                 static_cast<unsigned>(generation_after),
+                 pending_after,
+                 slice_expiries);
+
+    /* Inconclusive guard: no reset path, so no other broadcast. */
+    ASSERT_EQ(generation_before, generation_after);
+    ASSERT_EQ(1, waiter_result);
+    ASSERT_EQ(0, pending_after);
+    ASSERT_EQ(0, slice_expiries);
+}
+
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, timeout branch (sol r1
+ * catalogue row): busy predicate, 1000 ms budget, the wall clock steps back
+ * 60 s after the slice deadline is read, no notification. The step is driven
+ * by the wall-clock skew seam: a CLOCK_REALTIME read 60 s ahead of the clock
+ * the cond waits on is exactly what a 60 s backward step after the read
+ * leaves behind. The waiter must time out within the monotonic budget plus
+ * one slice (the margin below is scheduler slack; the defect waits 60 s), and
+ * must not return before the budget while the predicate is still busy. No
+ * worker is started, and the test holds worker_busy, so nothing notifies. */
+TEST(DualIsoPipeline, Processed8PrefetchIdleWaitTimesOutWithinMonotonicBudgetWhenWallClockStepsBack)
+{
+    QString error_message;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+
+    constexpr uint32_t kBudgetMs = 1000;
+    constexpr double kSliceMs = 50.0;
+    constexpr double kSchedulerSlackMs = 950.0;
+    constexpr int64_t kWallClockStepBackNs = 60LL * 1000000000LL;
+    setProcessed8WaitSeams(fixture.video(), 0, kWallClockStepBackNs);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 1;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    const auto wait_start = std::chrono::steady_clock::now();
+    const int waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), kBudgetMs);
+    const double waited_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - wait_start).count();
+
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 0;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
+    std::fprintf(stderr,
+                 "Processed8PrefetchIdleWaitTimesOutWithinMonotonicBudgetWhenWallClockStepsBack: waiter_result=%d waited_ms=%.1f slice_expiries=%d\n",
+                 waiter_result,
+                 waited_ms,
+                 slice_expiries);
+
+    /* Still busy, so the predicate re-check reports a hang. */
+    ASSERT_EQ(0, waiter_result);
+    /* Returned through slices running out, not through a wake. */
+    ASSERT_TRUE(slice_expiries >= 1);
+    ASSERT_TRUE(waited_ms >= static_cast<double>(kBudgetMs) - 10.0);
+    ASSERT_TRUE(waited_ms < static_cast<double>(kBudgetMs) + kSliceMs + kSchedulerSlackMs);
+}
+
+/* PROCESSED8-IDLE-WAIT-PREDICATE-RECHECK-1 r2, slice fallback (fable r1
+ * catalogue row, silent-clear arm): a parked waiter's predicate is cleared
+ * under the mutex WITHOUT a broadcast. The production 50 ms slice must still
+ * return it long before its 5000 ms budget, and it must be a slice that ran
+ * out (not a wake) that returned it. The broadcast-present arms above return
+ * with zero expired slices. */
+TEST(DualIsoPipeline, Processed8PrefetchIdleWaitSilentClearReturnsOnSliceRecheck)
+{
+    QString error_message;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(fixture.openTinyDualIso(&error_message));
+
+    constexpr uint32_t kBudgetMs = 5000;
+    setProcessed8WaitSeams(fixture.video(), 0, 0);
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 1;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+
+    int waiter_result = 0;
+    std::thread waiter([&]() {
+        waiter_result = mlvWaitForProcessed8PrefetchIdleForTesting(fixture.video(), kBudgetMs);
+    });
+    const bool waiter_is_blocked = waitForProcessed8IdleWaiterParked(
+        fixture.video(), "Processed8PrefetchIdleWaitSilentClearReturnsOnSliceRecheck");
+
+    pthread_mutex_lock(&fixture.video()->processed8_prefetch_mutex);
+    fixture.video()->processed8_prefetch_worker_busy = 0;
+    pthread_mutex_unlock(&fixture.video()->processed8_prefetch_mutex);
+    const auto clear_start = std::chrono::steady_clock::now();
+    waiter.join();
+    const double return_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - clear_start).count();
+    const int slice_expiries = readProcessed8SliceExpiries(fixture.video());
+    std::fprintf(stderr,
+                 "Processed8PrefetchIdleWaitSilentClearReturnsOnSliceRecheck: waiter_result=%d return_ms=%.1f slice_expiries=%d\n",
+                 waiter_result,
+                 return_ms,
+                 slice_expiries);
+
+    ASSERT_TRUE(waiter_is_blocked);
+    ASSERT_EQ(1, waiter_result);
+    ASSERT_TRUE(slice_expiries >= 1);
+    ASSERT_TRUE(return_ms < 1000.0);
 }
 
 /* Round-2 item 2 (2026-06-12): the indirect worker render at x2 SHARP was
@@ -12186,6 +13047,7 @@ TEST(DualIsoPipeline, Processed8InvalidationRejectsInFlightOldGenerationStoreAnd
  * incompatible lanes never consult the main cache). */
 TEST(DualIsoPipeline, Processed8PrefetchIndirectX2WorkerHitMatchesForegroundReference)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     MLVAPP_TEST_SETENV("MLVAPP_PREFETCH_INDIRECT_X2", "1");
@@ -12209,8 +13071,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2WorkerHitMatchesForegroundRefe
     if ((reference_fixture.width() % 4) != 0 || (reference_fixture.height() / 16) * 16 < 16)
     {
         std::printf("Processed8PrefetchIndirectX2: fixture not quarter-core compatible, guarded out\n");
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
         return;
     }
 
@@ -12268,14 +13128,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2WorkerHitMatchesForegroundRefe
                 static_cast<unsigned long long>(mismatched_bytes));
     ASSERT_TRUE(prefetched_hits >= 1);
     ASSERT_EQ(static_cast<std::uint64_t>(0), mismatched_bytes);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
-    MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
 }
 
 TEST(DualIsoPipeline, Processed8PrefetchIndirectX2DefaultKeepsSkip)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
@@ -12293,9 +13150,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2DefaultKeepsSkip)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() / 16) * 16 < 16)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
-        MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
         return;
     }
 
@@ -12314,14 +13168,11 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2DefaultKeepsSkip)
     }
 
     ASSERT_EQ(0, prefetched_hits);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
-    MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
 }
 
 TEST(DualIsoPipeline, Processed8PrefetchIndirectX2AggressiveKeepsSkip)
 {
+    ScopedProcessed8PrefetchTestState process8_state;
     MLVAPP_TEST_SETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH", "1");
     MLVAPP_TEST_UNSETENV("MLVAPP_PROCESSED8_PREFETCH_INDIRECT");
     /* Opted IN deliberately: aggressive must keep skipping even then. */
@@ -12340,9 +13191,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2AggressiveKeepsSkip)
 
     if ((fixture.width() % 4) != 0 || (fixture.height() / 16) * 16 < 16)
     {
-        processingSetPlaybackPreviewMode(0);
-        MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
-        MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
         return;
     }
 
@@ -12361,10 +13209,6 @@ TEST(DualIsoPipeline, Processed8PrefetchIndirectX2AggressiveKeepsSkip)
     }
 
     ASSERT_EQ(0, prefetched_hits);
-
-    processingSetPlaybackPreviewMode(0);
-    MLVAPP_TEST_UNSETENV("MLVAPP_EXPERIMENTAL_PROCESSED8_PREFETCH");
-    MLVAPP_TEST_UNSETENV("MLVAPP_PREFETCH_INDIRECT_X2");
 }
 
 TEST(DualIsoPipeline, Phase4B_NonDualIsoScaleEightAggressiveSkipsProcessed8CacheBookkeeping)

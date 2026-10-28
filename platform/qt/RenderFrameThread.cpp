@@ -1932,8 +1932,16 @@ void RenderFrameThread::stopReconWorkerLocked( void )
 
 bool RenderFrameThread::phase3WorkInFlightLocked( void ) const
 {
+    // Row W: a queued paused warm run is not pipeline work (it has no slot and never publishes a frame) and is dropped
+    // as it starts when real work is pending; a RUNNING one is, because it reads m_pMlvObject and its llrawproc settings
+    // (lock() and isIdle() wait it out before a clip change or a raw-level change). r3 (U-02): a clip close drops the
+    // queued ones itself (detachClipBeforeFree)
+    if( m_warmRunning ) return true;
+    const bool reconWorkQueued =
+        std::any_of( m_reconRequests.begin(), m_reconRequests.end(),
+                     []( const ReconQueueEntry &entry ) { return !entry.warm; } );
     if( !m_decodeRequests.empty()
-     || !m_reconRequests.empty()
+     || reconWorkQueued
      || !m_decodeReadySlots.empty()
      || !m_processReadySlots.empty() ) return true;
     for( const FrameSlot &slot : m_frameSlots )
@@ -2159,6 +2167,12 @@ bool RenderFrameThread::takeReconRequestForWorker( ReconQueueEntry *entry )
     const int takenSlotIndex = m_reconRequests.front().slotIndex;
     if( entry ) *entry = m_reconRequests.front();
     m_reconRequests.pop_front();
+    // Row W: real requests always win -- a warm that finds any work pending as it starts is dropped (and reported)
+    if( entry && entry->warm )
+    {
+        entry->warmRealRequestPending = realWorkPendingLocked();
+        m_warmRunning = !entry->warmRealRequestPending;
+    }
     if( heldForRender ) m_overlapMeter.noteReconHeldForRender();
     m_overlapMeter.upstreamBegin( mlv_stage_timing_now() * 1000.0,
                                   downstreamFrameInFlightLocked( takenSlotIndex ),
@@ -2166,9 +2180,98 @@ bool RenderFrameThread::takeReconRequestForWorker( ReconQueueEntry *entry )
     return true;
 }
 
+bool RenderFrameThread::realWorkPendingLocked( void ) const
+{
+    return m_renderingFrame || !m_renderRequests.empty() || phase3WorkInFlightLocked();
+}
+
+playback_recon_warm_run::Reason RenderFrameThread::requestPlaybackReconWarm( uint32_t frameNumber,
+                                                                             int scale,
+                                                                             quint64 clipGeneration )
+{
+    QMutexLocker locker( &m_mutex );
+    if( realWorkPendingLocked() ) return playback_recon_warm_run::Reason::RealRequestPending;
+    ReconQueueEntry entry;
+    entry.slotIndex = -1;
+    entry.request.frameNumber = frameNumber;
+    entry.warm = true;
+    entry.warmScale = scale;
+    entry.warmClipGeneration = clipGeneration;
+    m_reconRequests.push_back( entry );
+    m_reconWaitCondition.wakeOne();
+    return playback_recon_warm_run::Reason::None;
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r3 (U-02, sol r2 = fable r2): the clip close's barrier waits for
+ * isIdle() / lock(), which do not count a queued warm. Without this the worker could take that warm after the free and
+ * read the freed clip (m_pMlvObject->cpu_cores, run()). A dropped warm was never admitted and retained nothing, so no
+ * playbackReconWarmDone is owed for it (the next clip re-arms the warm: MainWindow::armPlaybackRoutePrewarm). */
+void RenderFrameThread::detachClipBeforeFree( void )
+{
+    QMutexLocker locker( &m_mutex );
+    playback_recon_warm_run::dropQueuedWarms( m_reconRequests );
+    // taken between the barrier and here: m_warmRunning is cleared before the worker's slot -1 completion wakes us
+    while( m_warmRunning ) m_waitCondition.wait( &m_mutex );
+    m_pMlvObject = nullptr;
+}
+
+/* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: the paused warm, on the recon worker that will run Play frame 0
+ * (its worker state keys set_luts). No slot, no frameReady, no cache, and m_active* is never touched; the outcome --
+ * with any retained token, which the GUI releases -- is posted to this object's (GUI) thread. */
+void RenderFrameThread::warmReconForWorker( const ReconQueueEntry &entry,
+                                            llrawprocWorkerState_t *workerState )
+{
+    const double startStageTime = mlv_stage_timing_now();
+    PlaybackReconWarmDone done;
+    done.clipGeneration = entry.warmClipGeneration;
+    done.frameNumber = entry.request.frameNumber;
+    done.outcome.scale = entry.warmScale;
+    if( entry.warmRealRequestPending )
+    {
+        done.outcome.reason = playback_recon_warm_run::Reason::RealRequestPending;
+    }
+    else if( llrpGpuCudaSuppressed() )
+    {
+        // GPU-DEVICE-LOSS-SELF-HEAL: the policy checked on the GUI thread; the seam checks again under its lock
+        done.outcome.reason = playback_recon_warm_run::Reason::CudaSuppressed;
+    }
+    else
+    {
+        done.outcome = playback_recon_warm_run::run( m_pMlvObject,
+                                                     entry.request.frameNumber,
+                                                     entry.warmScale,
+                                                     m_imageWidth,
+                                                     m_imageHeight,
+                                                     workerState,
+                                                     m_pMlvObject ? qMax( 1, m_pMlvObject->cpu_cores ) : 1,
+                                                     m_warmRawScratch,
+                                                     m_warmReducedScratch );
+    }
+    // what the first recon present would be handed (drawFrame: the texture route's black level and WB). r2 (sol r1
+    // B2): a warm dropped at take never held m_warmRunning, so a clip close may already be past isIdle(): it reads
+    // nothing of the clip (nothing reads its black level: it has no output). r3: not even the pointer, which a clip close
+    // clears under m_mutex (detachClipBeforeFree)
+    done.blackLevel = ( !entry.warmRealRequestPending && m_pMlvObject ) ? getMlvBlackLevel( m_pMlvObject ) : 0;
+    done.wbMultipliers = normalizedWbMultipliers6500();
+    done.renderMs = ( mlv_stage_timing_now() - startStageTime ) * 1000.0;
+    {
+        QMutexLocker locker( &m_mutex );
+        // signalReconDoneFromWorker wakes lock() / isIdle() waiters next; from here on the clip may be freed, so
+        // nothing below (nor that slot -1 completion) reads it
+        m_warmRunning = false;
+        done.realRequestArrivedDuringWarm = !entry.warmRealRequestPending && realWorkPendingLocked();
+    }
+    QMetaObject::invokeMethod( this, [this, done]() { emit playbackReconWarmDone( done ); }, Qt::QueuedConnection );
+}
+
 void RenderFrameThread::reconFrameForWorker( const ReconQueueEntry &entry,
                                              llrawprocWorkerState_t *workerState )
 {
+    if( entry.warm )
+    {
+        warmReconForWorker( entry, workerState );
+        return;
+    }
     if( entry.slotIndex < 0 || entry.slotIndex >= static_cast<int>( m_frameSlots.size() ) )
     {
         return;
@@ -2813,8 +2916,11 @@ void RenderFrameThread::signalReconDoneFromWorker( int slotIndex )
     /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1 r2/r3: on the recon worker thread,
      * right after reconFrameForWorker: the HQ dual-ISO state and llrawproc
      * settings now, and whether this thread's last llrawproc run used the CUDA
-     * playback recon (debayered16ReconDoneStamp, shared with the tests). */
-    const Debayered16ReconDoneStamp reconDone = debayered16ReconDoneStamp( m_pMlvObject );
+     * playback recon (debayered16ReconDoneStamp, shared with the tests).
+     * PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 r2 (sol r1 B2): only a slot is stamped. A paused warm
+     * (slot -1) has already released m_warmRunning, so a clip close may have freed the clip: it reads nothing. */
+    const Debayered16ReconDoneStamp reconDone = debayered16ReconDoneStampForEntry(
+        slotIndex, [this]() { return debayered16ReconDoneStamp( m_pMlvObject ); } );
     QMutexLocker locker( &m_mutex );
     m_overlapMeter.upstreamEnd( mlv_stage_timing_now() * 1000.0,
                                 playback_overlap::UpstreamStage::Recon );
@@ -3868,6 +3974,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * CPU render entries, all called from the render dispatch below), so this
      * cannot clear a legitimate "ran" from the same frame. */
     llrpResetLastPreDualIsoFixTelemetry();
+    /* PROCESSED8-MS-TELEMETRY-STUCK-1: the processing timers (g_processing_last_*)
+     * are thread-local and only rewritten when this thread runs processing. A frame
+     * that never does (OutputDebayered16, GPU texture no-readback) would otherwise
+     * report the previous processed render's timings. Nothing earlier in this
+     * function runs processing. */
+    processingResetLastTimingTelemetry();
     if( preserveGpuPlaybackReconTextureSnapshot )
     {
         slot.gpuPlaybackReconTextureNoReadbackCandidate = true;
@@ -4855,6 +4967,11 @@ void RenderFrameThread::drawFrame( int slotIndex,
             r16AmazeTextureAvailability.rendererDescription );
     }
 
+    /* PROCESSED8-MS-TELEMETRY-STUCK-1: whether this draw ran the processed8 /
+     * processed16 stage; the g_mlv_last_processed8_* / processed16_* getters are
+     * thread-local and stale otherwise. */
+    bool renderThreadProcessed8StageRan = false;
+    bool renderThreadProcessed16StageRan = false;
     if( skipCpuDebayerForGpuTextureNoReadback )
     {
         slot.usedGpuAmazeDebayer = true;
@@ -4883,6 +5000,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
     else if ( outputMode == OutputProcessed16 && !slot.rawImage16.empty() )
     {
+        renderThreadProcessed16StageRan = true;
         getMlvProcessedFrame16Scaled( m_pMlvObject,
                                       frameNumber,
                                       slot.rawImage16.data(),
@@ -5281,6 +5399,8 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
     else if( !slot.rawImage8.empty() )
     {
+        // Every path below reaches one getMlvProcessedFrame8* entry.
+        renderThreadProcessed8StageRan = true;
         bool renderedFromPhase3Raw = false;
         bool renderedFromReducedRecon = false;
         bool renderedFromGpuTextureNoReadbackStatePath = false;
@@ -6837,6 +6957,28 @@ void RenderFrameThread::drawFrame( int slotIndex,
                                       processed8CacheHitScale );
     slot.stageTimingTelemetry.insert( QStringLiteral("processed8_prefetch_hit"),
                                       processed8PrefetchHit );
+    // PROCESSED8-MS-TELEMETRY-STUCK-1: a stage this draw did not run reports 0.0 plus
+    // a false *_stage_measured flag, never the previous processed render's carryover
+    // (every getMlvProcessedFrame8* entry resets and rewrites the processed16 timers too).
+    const bool processed8StageMeasured = renderThreadProcessed8StageRan;
+    const bool processed16StageMeasured =
+        renderThreadProcessed8StageRan || renderThreadProcessed16StageRan;
+    slot.stageTimingTelemetry.insert( QStringLiteral("processed8_stage_measured"),
+                                      processed8StageMeasured );
+    slot.stageTimingTelemetry.insert( QStringLiteral("processed16_stage_measured"),
+                                      processed16StageMeasured );
+    if( !processed8StageMeasured )
+    {
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed8_total_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed8_cache_store_ms"), 0.0 );
+    }
+    if( !processed16StageMeasured )
+    {
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_total_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_for_8bit_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_to_8bit_ms"), 0.0 );
+        slot.stageTimingTelemetry.insert( QStringLiteral("processed16_cache_store_ms"), 0.0 );
+    }
     if( skipCpuDebayerForGpuTextureNoReadback )
     {
         // The no-readback GPU AMaZE texture path does not run the CPU debayer, so the

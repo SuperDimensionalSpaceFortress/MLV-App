@@ -52,7 +52,9 @@ Run only the console/pipeline suite the acceptance test lives in (`tests/README.
 ## Shell rules and known environment (read before your first command)
 - Run builds and tests in the FOREGROUND, in one call, with a long timeout. Never background them, never use
   Monitor, and never end your turn waiting for a notification: when your turn ends your process tree is killed and
-  background work is lost, while your receipt can still read complete.
+  background work is lost, while your receipt can still read complete. The one exception is a child launched DETACHED
+  through WMI (`Win32_Process.Create`, ShowWindow 0, one Create per pwsh process: `hub-tools\Start-HiddenDetached.ps1`),
+  which survives your exit; a `Start-Process` child does not (`docs/lane-containment.md`, "Detached children").
 - Prefer the Read and Grep tools over shell `grep` or `cat` for reading files.
 - `.github/workflows/tests.yml` is the source of truth for building and running the console, pipeline and GUI
   tests, including every environment variable its GUI test job sets. Copy from it rather than reconstructing it.

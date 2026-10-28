@@ -364,7 +364,8 @@ param(
 
     # LOOK-ASSIST-FILM-FLAVOR-2 r2: a LOOK leg's receipt file (Invoke-VenueLeg writes the bytes COMMITTED for the leg spec's look.receipt). The job
     # embeds it base64 with its sha256, writes it into its work dir, re-verifies the hash and passes it to the smoke runner as -Receipt, so the app
-    # applies it before playback. Only with -ForceLookAssist -ContactSheet. Empty (the default) adds nothing: the job is the text it was before.
+    # applies it before playback. Only with -ForceLookAssist -ContactSheet (a look leg) or -ForceLookAssist -LookPaceLeg (a capture-free pace leg,
+    # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1). Empty (the default) adds nothing: the job is the text it was before.
     [string]$LookReceiptPath = '',
 
     # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the device-loss self-heal proof (L1..L4 in ONE job, so two losses land inside the breaker's 10-minute window).
@@ -428,10 +429,19 @@ param(
     # frame before the measured Play and the first present after its swap, both into the contact-sheet dir as identity-*). Absent: nothing is
     # set and the emitted job is the text it was before this parameter.
     [switch]$FirstPresentCapture,
+    # PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: the app's opt-in warm-reuse miss dump
+    # (MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR=<published artifacts>\warm-reuse-miss: on a content miss the app writes the warm's and Play's
+    # AMaZE input words and their difference there, and logs one playback_warm_output_reuse_miss_dump line). Absent: nothing is set and the
+    # emitted job is the text it was before this parameter.
+    [switch]$WarmReuseMissDump,
     # CUDA-HEADROOM-1: an unpaced throughput leg (MLVAPP_PLAYBACK_UNPACED=1 lifts the app's pace guard in an automation run, and the
     # smoke runs with -DropFrameMode off, so every frame is rendered and presented as fast as the pipeline allows). Absent: nothing is
     # set and the emitted job is the text it was before this parameter.
     [switch]$Unpaced,
+    # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the #680 prep pointwise fast path's kill switch (MLVAPP_DISABLE_PREP_POINTWISE_FAST=1: the app
+    # runs the reference loop), so one staged build measures the fast path on and off. Absent: nothing is set and the emitted job is the text it
+    # was before this parameter.
+    [switch]$DisablePrepPointwiseFast,
 
     # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on (the smoke runner's -Scope -> the app's --scope, which also shows the
     # edit area). '' or 'none' (the default) keeps -Scope none: the emitted job is the text it was before this parameter.
@@ -4185,8 +4195,8 @@ if ($ForceLookAssist -and -not $ContactSheet -and -not $LookPaceLeg) {
     throw 'DUAL_VENUE_LOOK_REQUIRES_CONTACT_SHEET -ForceLookAssist (a LOOK leg) needs -ContactSheet: the look is judged on the contact sheet'
 }
 $hasLookReceipt = -not [string]::IsNullOrEmpty($LookReceiptPath)
-if ($hasLookReceipt -and -not ($ForceLookAssist -and $ContactSheet)) {
-    throw 'DUAL_VENUE_LOOK_RECEIPT_REQUIRES_LOOK_LEG -LookReceiptPath is only for a LOOK leg (-ForceLookAssist -ContactSheet)'
+if ($hasLookReceipt -and -not ($ForceLookAssist -and ($ContactSheet -or $LookPaceLeg))) {
+    throw 'DUAL_VENUE_LOOK_RECEIPT_REQUIRES_LOOK_LEG -LookReceiptPath is only for a LOOK leg (-ForceLookAssist -ContactSheet) or a capture-free pace leg (-ForceLookAssist -LookPaceLeg)'
 }
 if ($hasLookReceipt) {
     $lookReceiptBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LookReceiptPath).ProviderPath)
@@ -4501,6 +4511,17 @@ if ($FirstPresentCapture) {
     })
 }
 
+# PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1 F-diag: the same env-list site gains the miss-dump directory, under the job's own
+# published artifacts (so the dump comes back with them), only when asked.
+if ($WarmReuseMissDump) {
+    $missDumpAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($missDumpAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_WARM_REUSE_MISS_DUMP_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR to' }
+    $text = $missDumpAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "('MLVAPP_PLAYBACK_WARM_REUSE_MISS_DUMP_DIR=' + (Join-Path `$Pub 'warm-reuse-miss'))," + $m.Groups['nl'].Value
+    })
+}
+
 # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the self-heal proof (see the parameters). Everything below is added to the expanded text and only when asked, so
 # every other job is the text it always was. Each anchor must match exactly once, or the generator throws.
 # `pwsh -File` passes an array argument as ONE string, so -GpuPreLaunches a,b is split on commas.
@@ -4660,6 +4681,18 @@ if ($Unpaced) {
     $text = $unpacedCmdAnchor.Replace($text, ' -DropFrameMode off -UsePersistedPlaybackSettings ')
 }
 
+# VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the fast-path kill-switch arm adds MLVAPP_DISABLE_PREP_POINTWISE_FAST=1 at the same env-list
+# site, only when asked. The anchor must match exactly once, or the generator throws (a template refactor can never silently run the
+# kill-switch arm with the fast path on; the lane also checks the app's own prep_summary refusal counts).
+if ($DisablePrepPointwiseFast) {
+    $pointwiseKillEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
+    if ($pointwiseKillEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_DISABLE_PREP_POINTWISE_FAST_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_DISABLE_PREP_POINTWISE_FAST to' }
+    $text = $pointwiseKillEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        $m.Value + $m.Groups['ind'].Value + "'MLVAPP_DISABLE_PREP_POINTWISE_FAST=1'," + $m.Groups['nl'].Value
+    })
+}
+
 # PLAYBACK-VISUAL-INSPECTION-1: a visual-capture leg gains three bracketed regions, on the expanded text and only when asked (like --windowed
 # above), so every other job is the text it always was. Each anchor must match exactly once (Edit-DualVenueTemplate throws otherwise):
 #   1. before PresentMon starts: the four module helpers (spliced here, not into the default embed list) and the feature probe + argument;
@@ -4753,6 +4786,7 @@ $clipContentSha256 = if ($isFixtureRehearsal) {
     presentTrace = [bool]$PresentTrace
     firstPresentCapture = [bool]$FirstPresentCapture
     unpaced = [bool]$Unpaced
+    disablePrepPointwiseFast = [bool]$DisablePrepPointwiseFast
     scope =$(if ([string]::IsNullOrEmpty($Scope)) { 'none' } else { $Scope })
     scopeIntervalMs = $(if ($ScopeIntervalMs -ge 0) { $ScopeIntervalMs } else { $null })
     scopesDuringPlayback = $(if ([string]::IsNullOrEmpty($ScopesDuringPlayback)) { $null } else { $ScopesDuringPlayback })

@@ -923,7 +923,7 @@ class RepoHygieneTests(unittest.TestCase):
         bridge_workflow = (ROOT / ".github" / "workflows" / "factory-bridge.yml").read_text(
             encoding="utf-8"
         )
-        self.assertEqual(workflow.count('python-version-file: ".python-version"'), 7)
+        self.assertEqual(workflow.count('python-version-file: ".python-version"'), 9)
         self.assertEqual(bridge_workflow.count('python-version-file: ".python-version"'), 1)
         # The moved job retains the same locked dependency policy; count both
         # reviewed workflow surfaces so relocation cannot weaken its checks.
@@ -942,7 +942,7 @@ class RepoHygieneTests(unittest.TestCase):
             for line in workflow.splitlines()
             if "-m pip install " in line
         ]
-        self.assertEqual(len(install_lines), 15)
+        self.assertEqual(len(install_lines), 19)
         for line in install_lines:
             for required_flag in (
                 "--disable-pip-version-check",
@@ -954,7 +954,7 @@ class RepoHygieneTests(unittest.TestCase):
                 self.assertIn(required_flag, line, f"unsafe Python install command: {line}")
             lock_path = line.rsplit(" -r ", 1)[1].strip()
             self.assertIn(lock_path, allowed_locks, f"unapproved Python lock: {lock_path}")
-        self.assertEqual(workflow.count("python -m pip check"), 7)
+        self.assertEqual(workflow.count("python -m pip check"), 9)
 
         observed_locks: dict[str, dict[str, str]] = {}
         for relative_path, roots in PYTHON_LOCK_ROOTS.items():
@@ -1061,6 +1061,8 @@ class RepoHygieneTests(unittest.TestCase):
             "repo-hygiene-python": 5,
             "repo-hygiene-python-windows-shard": 50,
             "repo-hygiene-python-windows-containment": 45,
+            "repo-hygiene-python-windows-coordination-heavy": 45,
+            "repo-hygiene-python-windows-unittest-heavy": 50,
             "repo-hygiene-python-windows": 5,
             "windows-product-oracles-part": 60,
             "windows-product-oracles": 5,
@@ -1075,7 +1077,7 @@ class RepoHygieneTests(unittest.TestCase):
         expected_remote_uses = [
             ("actions/checkout", "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09", "v5"),
             ("actions/setup-python", "ece7cb06caefa5fff74198d8649806c4678c61a1", "v6"),
-        ] * 7 + [
+        ] * 9 + [
             ("actions/upload-artifact", "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a", "v7"),
         ] * 3
         uses_entries = []
@@ -1114,7 +1116,7 @@ class RepoHygieneTests(unittest.TestCase):
             r"\s+persist-credentials: false\s*$",
             workflow,
         )
-        self.assertEqual(len(checkout_blocks), 7)
+        self.assertEqual(len(checkout_blocks), 9)
 
         aqt_steps = re.findall(
             r"(?ms)^      - name: Install Qt 6\.10\.2 \+ MinGW 13\.1\r?\n"
@@ -1288,11 +1290,19 @@ class RepoHygieneTests(unittest.TestCase):
                 if os_name == "windows":
                     # The lane containment job gates the same required check as the shards.
                     self.assertIn(
-                        f"    needs: [{shard_id}, repo-hygiene-python-windows-containment]",
+                        f"    needs: [{shard_id}, repo-hygiene-python-windows-containment, "
+                        "repo-hygiene-python-windows-coordination-heavy, "
+                        "repo-hygiene-python-windows-unittest-heavy]",
                         aggregator,
                     )
                     self.assertIn("needs.repo-hygiene-python-windows-containment.result", aggregator)
                     self.assertIn('test "$CONTAINMENT_RESULT" = "success"', aggregator)
+                    # So does the heavy coordination job.
+                    self.assertIn("needs.repo-hygiene-python-windows-coordination-heavy.result", aggregator)
+                    self.assertIn('test "$HEAVY_RESULT" = "success"', aggregator)
+                    # And the unittest heavy job (CI-WINDOWS-UNITTEST-SHARD-8-1).
+                    self.assertIn("needs.repo-hygiene-python-windows-unittest-heavy.result", aggregator)
+                    self.assertIn('test "$UNITTEST_HEAVY_RESULT" = "success"', aggregator)
                 else:
                     self.assertIn(f"    needs: {shard_id}", aggregator)
                 self.assertIn(f"needs.{shard_id}.result", aggregator)
@@ -1358,7 +1368,15 @@ class RepoHygieneTests(unittest.TestCase):
             return re.sub(r"(?m)^\s*#.*$", "", text)
 
         # Shard 8 ignores exactly the file the containment job runs.
-        self.assertEqual(re.findall(r"--ignore=(\S+)", strip_comments(shard_job)), [containment_path])
+        heavy_paths = [
+            "tests\\coordination\\test_doctrine_outbox.py",
+            "tests\\coordination\\test_doctrine_outbox_concerns.py",
+            "tests\\coordination\\test_doctrine_outbox_hooks.py",
+            "tests\\coordination\\test_retire_lane_worktree.py",
+        ]
+        self.assertEqual(
+            re.findall(r"--ignore=(\S+)", strip_comments(shard_job)), [containment_path, *heavy_paths]
+        )
         self.assertEqual(re.findall(r"pytest (\S+)", strip_comments(containment_job)), [containment_path])
 
         # Exactly one job collects the file: it is named as a run target, or its directory is
@@ -1386,6 +1404,55 @@ class RepoHygieneTests(unittest.TestCase):
         # A condition would let the job skip, and the aggregate would then be the only guard.
         self.assertNotRegex(strip_comments(containment_job), r"(?m)^    if:")
 
+    def test_heavy_coordination_files_run_in_exactly_one_windows_job(self) -> None:
+        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
+        heavy_id = "repo-hygiene-python-windows-coordination-heavy"
+        heavy_paths = [
+            "tests\\coordination\\test_doctrine_outbox.py",
+            "tests\\coordination\\test_doctrine_outbox_concerns.py",
+            "tests\\coordination\\test_doctrine_outbox_hooks.py",
+            "tests\\coordination\\test_retire_lane_worktree.py",
+        ]
+        shard_job = self._workflow_job(workflow, "repo-hygiene-python-windows-shard")
+        heavy_job = self._workflow_job(workflow, heavy_id)
+
+        def strip_comments(text: str) -> str:
+            return re.sub(r"(?m)^\s*#.*$", "", text)
+
+        # The heavy job runs exactly the four files shard 8 ignores, as named targets and nothing else.
+        heavy_tokens = strip_comments(heavy_job).replace("`", " ").split()
+        self.assertEqual([t for t in heavy_tokens if t.startswith("tests\\")], heavy_paths)
+        self.assertEqual(sum(1 for t in heavy_tokens if t == "pytest"), 1)
+        self.assertNotIn("--ignore", " ".join(heavy_tokens))
+        for path in heavy_paths:
+            self.assertIn(f"--ignore={path}", strip_comments(shard_job).replace("`", " ").split())
+
+        # Each file is collected by exactly one job: named as a run target, or its directory is a
+        # run target and it is not ignored in that job.
+        jobs_text = workflow[workflow.index("\njobs:") :]
+        job_ids = re.findall(r"(?m)^  ([a-z0-9-]+):\r?$", jobs_text)
+        self.assertIn(heavy_id, job_ids)
+        for path in heavy_paths:
+            with self.subTest(path=path):
+                collectors = []
+                for job_id in job_ids:
+                    tokens = strip_comments(self._workflow_job(workflow, job_id)).replace("`", " ").split()
+                    ignored = f"--ignore={path}" in tokens
+                    if path in tokens or ("tests\\coordination" in tokens and not ignored):
+                        collectors.append(job_id)
+                self.assertEqual(collectors, [heavy_id])
+
+        # Same setup as a shard, byte for byte, up to the job's own work.
+        def setup_steps(job: str, first_own_step: str) -> str:
+            return job[job.index("      - uses: actions/checkout@") : job.index(first_own_step)]
+
+        self.assertEqual(
+            setup_steps(heavy_job, "      - name: Run heavy coordination tests"),
+            setup_steps(shard_job, "      - name: Prove the unittest shards cover every discovered test"),
+        )
+        # A condition would let the job skip, and the aggregate would then be the only guard.
+        self.assertNotRegex(strip_comments(heavy_job), r"(?m)^    if:")
+
     def test_shard_8_guardrails_step_keeps_all_four_of_its_paths(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
         shard_job = self._workflow_job(workflow, "repo-hygiene-python-windows-shard")
@@ -1400,6 +1467,9 @@ class RepoHygieneTests(unittest.TestCase):
             "tests\\docs",
         ):
             self.assertIn(path, tokens)
+        # STUCK-QUEUE-HANG-AND-CI-REVERT-1 r4: the stuck-queue suite stays collected in this step
+        # (hosted CI); the r2 assertNotIn that pinned its removal is reversed.
+        # No local-only exemption exists for it in test_ci_collects_every_test.py.
 
     def test_product_oracles_are_split_into_parts_behind_the_required_name(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
@@ -1963,10 +2033,10 @@ class RepoHygieneTests(unittest.TestCase):
 
         expected_remote_inventory = Counter(
             {
-                ("actions/checkout", "v5"): 12,
-                ("actions/setup-python", "v6"): 12,
+                ("actions/checkout", "v5"): 15,
+                ("actions/setup-python", "v6"): 14,
                 ("actions/upload-artifact", "v7"): 13,
-                ("ConorMacBride/install-package", "v1"): 2,
+                ("ConorMacBride/install-package", "v1"): 3,
             }
         )
         observed_remote_inventory: Counter[tuple[str, str]] = Counter()
@@ -4037,6 +4107,65 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertNotIn("orphan_quarantine", candidate["allowed_actions"])
         self.assertTrue(candidate["evidence"]["is_reparse_point"])
         self.assertTrue(candidate["evidence"]["inventory"]["refused_reparse_point"])
+
+    # LANE-RETIRE-LIVE-DETACHED-DRIVER-GUARD-1: apply_worktree_remove asks the shared live-reference guard (Get-WorktreeLiveRefusal in
+    # tools/coordination/Retire-LaneWorktree.ps1) right before `git worktree remove`. The guard's process table is faked here.
+    def test_worktree_live_refusal_is_none_when_the_guard_answers_free(self) -> None:
+        from .core import worktree_live_refusal
+
+        calls = []
+
+        def runner(args, **kw):
+            calls.append((args, kw))
+            return subprocess.CompletedProcess(args, 0, stdout="FREE\n", stderr="")
+
+        self.assertIsNone(worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"), runner=runner))
+        self.assertEqual(calls[0][1]["env"]["MLV_GUARD_PATH"], str(Path("C:/mlvtmp/lane-X-1")))
+        self.assertEqual(calls[0][1]["env"]["MLV_GUARD_RUNS"], str(Path("C:/r") / ".claude-state" / "fleet-runs"))
+
+    def test_worktree_live_refusal_returns_the_typed_refusal(self) -> None:
+        from .core import worktree_live_refusal
+
+        refusal = {"reason": "live-driver", "processId": 43484, "via": "rundir-pid:venue-cpu17v9-ab.pid",
+                   "matchedPath": "C:\\run", "line": "REFUSED worktree-removal reason=live-driver pid=43484"}
+
+        def runner(args, **kw):
+            return subprocess.CompletedProcess(args, 0, stdout=json.dumps(refusal) + "\n", stderr="")
+
+        self.assertEqual(worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"), runner=runner), refusal)
+
+    def test_worktree_live_refusal_fails_closed_on_every_unknown(self) -> None:
+        from .core import worktree_live_refusal
+
+        def nonzero(args, **kw):
+            return subprocess.CompletedProcess(args, 1, stdout="", stderr="boom")
+
+        def garbage(args, **kw):
+            return subprocess.CompletedProcess(args, 0, stdout="not json\n", stderr="")
+
+        def timeout(args, **kw):
+            raise subprocess.TimeoutExpired(args, 1)
+
+        for runner in (nonzero, garbage, timeout):
+            r = worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"), runner=runner)
+            self.assertEqual(r["reason"], "census-failed", runner.__name__)
+        with patch("tools.repo_hygiene.core.shutil.which", return_value=None):
+            self.assertEqual(worktree_live_refusal(Path("C:/r"), Path("C:/mlvtmp/lane-X-1"))["reason"], "census-failed")
+
+    def test_apply_worktree_remove_refuses_a_live_reference_and_never_runs_git_remove(self) -> None:
+        from .core import apply_worktree_remove
+
+        repo = self.init_repo()
+        wt = repo.parent / f"{repo.name}-lane-X-1"
+        git(repo, "worktree", "add", "--detach", str(wt))
+        self.addCleanup(lambda: subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)], capture_output=True))
+        refusal = {"reason": "live-driver", "line": "REFUSED worktree-removal reason=live-driver pid=43484"}
+        with patch("tools.repo_hygiene.core.worktree_live_refusal", return_value=refusal) as guard:
+            with self.assertRaises(HygieneError) as ctx:
+                apply_worktree_remove(repo, load_config(repo), {"path": str(wt)})
+        guard.assert_called_once()
+        self.assertIn("reason=live-driver", str(ctx.exception))
+        self.assertTrue(wt.exists(), "a refused worktree must not be removed")
 
 
 if __name__ == "__main__":

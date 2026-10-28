@@ -124,6 +124,13 @@ param(
     # %TEMP% (which every project on this box shares). C:\mlvtmp is a DiskGuard-registered
     # MLV root. The run's own scratch dir is removed when the lane exits unless -KeepScratch;
     # its size is recorded in the receipt either way.
+    # LANE-HOOK-DENY-RECURRENCE-1: when -ScratchRoot is NOT passed, the run's scratch dir goes under
+    # <WorkDir>\.claude-state\ls\<8-hex run hash> instead (short on purpose: a longer TEMP breaks git in pytest
+    # tmp_path repos at MAX_PATH). The harness names TEMP as the lane's scratchpad, and
+    # tools\hooks\mlv-never-authorized.py NA-7 admits writes under only the hook's own worktree and the
+    # board, so every scratchpad write under this shared root was denied. .claude-state/ is git-ignored on
+    # every branch and pruned by the repo's own tree walks. The value below stays the shared root that
+    # Remove-LaneBulkScratch.ps1 refuses to touch. -ScratchRoot <dir> overrides; -ScratchRoot '' turns it off.
     [string]$ScratchRoot = 'C:\mlvtmp\lane-scratch',
     # LANE-RECEIPT-SCRATCH-CLEANUP-1: bulk scratch a lane creates OUTSIDE -ScratchRoot (asm, shadow-build,
     # probe dirs) is listed one absolute path per line in <RunDir>\scratch-paths.txt, normally through
@@ -201,13 +208,18 @@ if (Test-HubHost) {
 #   sol    -- review key A (found 51 blockers fable missed vs 1 the other way, 191 paired reviews)
 #             and co-planner with opus.
 #   luna   -- breadth recon.
-#   astra  -- tie-breaker / design arbiter on contested designs; never xhigh.
+#   astra  -- optional diversity seat (MODEL-POSTURE-2026-10-22, bus R19.1): never a default, never a
+#             gate, never the only Codex seat a procedure waits for; a round using it records
+#             `astra: diversity`. Design-pass and arbiter duties go to the sol tier. Never xhigh.
 $LANES = @{
     opus   = @{ engine = 'claude'; model = 'opus';   effort = 'high'; role = 'orchestrator-design-planner-review-key-b' }
     sonnet = @{ engine = 'claude'; model = 'sonnet'; effort = 'high'; role = 'default-implementer' }
     fable  = @{ engine = 'claude'; model = 'fable';  effort = 'high'; role = 'planning-guidance-fallback-key-b' }
     sol    = @{ engine = 'codex';  tier = 'sol';     effort = 'high'; role = 'review-key-a-co-planner' }
     luna   = @{ engine = 'codex';  tier = 'luna';    effort = 'high'; role = 'breadth-recon' }
+    # LEGACY LABEL: the astra role string below is kept verbatim for receipt compatibility (a
+    # guardrail test pins it). It is a machine-readable label, NOT current routing authority; the
+    # posture is the comment block above (optional diversity seat; design/arbiter duties -> sol).
     astra  = @{ engine = 'codex';  tier = 'astra';   effort = 'high'; role = 'tie-breaker-design-arbiter' }
 }
 
@@ -798,6 +810,32 @@ function Get-TrackedDirtyContentIdentity([string]$WorkDir) {
     return [ordered]@{ ok = $true; map = $map; reason = $null }
 }
 
+# LANE-RUNNER-IDLE-AFTER-CHILD-EXIT-1: a bounded drain of the child's redirected stdout/stderr. The caller starts
+# `$proc.StandardOutput.BaseStream.CopyToAsync($buf)` (not ReadToEndAsync) so what has arrived so far is always in a
+# MemoryStream. This waits at most $GraceMs for both copies to reach EOF; past that a descendant is holding a pipe open, so
+# the read ends are disposed (the copies stop appending) and the bytes read so far are returned with the typed flag
+# `timedOut`. Never throws.
+function Complete-BoundedOutputDrain {
+    param(
+        [Parameter(Mandatory = $true)]$OutTask, [Parameter(Mandatory = $true)]$ErrTask,
+        [Parameter(Mandatory = $true)]$OutBuf, [Parameter(Mandatory = $true)]$ErrBuf,
+        [Parameter(Mandatory = $true)]$OutStream, [Parameter(Mandatory = $true)]$ErrStream,
+        [Parameter(Mandatory = $true)][int]$GraceMs
+    )
+    $both = [System.Threading.Tasks.Task[]]@($OutTask, $ErrTask)
+    try { [void][System.Threading.Tasks.Task]::WaitAll($both, $GraceMs) } catch { }
+    $outOpen = -not $OutTask.IsCompleted
+    $errOpen = -not $ErrTask.IsCompleted
+    if ($outOpen -or $errOpen) {
+        foreach ($s in @($OutStream, $ErrStream)) { try { $s.Dispose() } catch { } }
+        try { [void][System.Threading.Tasks.Task]::WaitAll($both, 2000) } catch { }
+    }
+    $enc = [System.Text.UTF8Encoding]::new($false)
+    $outText = try { $enc.GetString($OutBuf.ToArray()) } catch { '' }
+    $errText = try { $enc.GetString($ErrBuf.ToArray()) } catch { '' }
+    return [ordered]@{ stdout = $outText; stderr = $errText; timedOut = ($outOpen -or $errOpen); stdoutOpen = $outOpen; stderrOpen = $errOpen }
+}
+
 function Write-Utf8NoBom([string]$Path, [string]$Content) {
     # UTF-8 WITHOUT BOM: a BOM has broken JSON consumers on this box before.
     [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
@@ -848,7 +886,8 @@ function Write-Utf8NoBomAtomic([string]$Path, [string]$Content) {
 }
 
 # Windows job ownership is established around an inert PowerShell host before that
-# host receives any provider configuration. Descendants then inherit kill-on-close.
+# host receives any provider configuration. Descendants then inherit kill-on-close. This is the Claude-engine path only: a Codex lane is started
+# without a job object, so nothing here contains its descendants.
 if (-not ('MlvLaneJob' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -1198,7 +1237,9 @@ $hostPid = $null
 $OWNER_ABSENT_NO_HOST_BUDGET = 'launch-budget-exhausted'  # unchanged text: line ~471's throw message, asserted verbatim since PR #105 round 3
 $LAUNCH_NO_CHILD = 'launch-no-child'                      # receipt.failure when the claude child was never created (LANE-LAUNCH-NO-CHILD-TYPED-1)
 $launchNoChild = $null
-$awaitingChild = $false   # true only from the launch-frame write until the child control file is seen (r2: phase, not message, decides "no child")
+$outputDrain = $null          # LANE-RUNNER-IDLE-AFTER-CHILD-EXIT-1: set at harvest; stays null on a path that never reached it
+$outputDrainTimedOut = $false
+$awaitingChild = $false  # true only from the launch-frame write until the child control file is seen (r2: phase, not message, decides "no child")
 $OWNER_ABSENT_NO_HOST_START_THREW = 'start-threw'        # Process::Start itself threw; no host was ever created
 $OWNER_ABSENT_POST_START_UNRECORDED = 'post-start-unrecorded'  # Start returned (a host EXISTS) but $containedHost's own construction threw -- the genuinely ambiguous state
 # Outcome of the PRE-ASSIGNMENT kill at line ~677 (host started but never
@@ -1213,7 +1254,12 @@ $ownerKillDetail = $null
 $OWNER_KILL_OUTCOME_ALREADY_EXITED = 'already-exited'  # host had already exited before the pre-assignment kill was attempted
 $OWNER_KILL_OUTCOME_KILLED = 'killed'                  # Kill() did not throw AND WaitForExit's own return value was $true -- the host was OBSERVED to exit within the bounded wait
 $OWNER_KILL_OUTCOME_KILL_WAIT_TIMEOUT = 'kill-wait-timeout'  # Kill() did not throw, but WaitForExit's return value was $false -- the bounded wait expired before the host was observed to exit. It MAY STILL BE ALIVE. (PR #105 final: WaitForExit(Int32) returns a bool and round 5 discarded it with [void], so a host that outlived the wait was misreported as 'killed' -- worse than the bare catch{} it replaced, since it manufactured false evidence instead of merely omitting true evidence.)
-$OWNER_KILL_OUTCOME_KILL_THREW = 'kill-threw'          # Kill() or WaitForExit itself threw -- see ownerKillDetail for the raw message
+# LANE-RUNNER-IDLE-AFTER-CHILD-EXIT-1: how long a runner (and the contained host) keeps draining the child's stdout/stderr AFTER the
+# direct child has exited. A descendant that inherited those pipes (an MCP server, a node helper) keeps them open long after the child is gone,
+# and a bare `ReadToEndAsync().Result` waits for EOF, not for the process (Process.WaitForExit() does NOT: measured 27 ms against a
+# pipe-holding descendant that kept ReadToEndAsync open for 20 s). Keep the literal on its own line: test_lane_containment.py shortens it.
+$OUTPUT_DRAIN_GRACE_MS = 10000
+$OWNER_KILL_OUTCOME_KILL_THREW = 'kill-threw'         # Kill() or WaitForExit itself threw -- see ownerKillDetail for the raw message
 $childIdentity = $null
 $deadlineUtc = $startedUtc.AddSeconds($TimeoutSec)
 $containment = $null
@@ -1643,10 +1689,23 @@ if ($cfg.engine -eq 'claude') {
 # background work; see docs/lane-containment.md.
 # Per-run lane scratch under an MLV-owned root instead of the shared %TEMP%.
 $scratchDir = $null
-if ($ScratchRoot) {
-    $scratchDir = Join-Path $ScratchRoot ('{0}-{1}' -f (Split-Path $RunDir -Leaf), (Split-Path $base -Leaf))
+$scratchBase = if ($PSBoundParameters.ContainsKey('ScratchRoot')) { $ScratchRoot } else { Join-Path $WorkDir '.claude-state\ls' }
+if ($scratchBase) {
+    $scratchLeaf = '{0}-{1}' -f (Split-Path $RunDir -Leaf), (Split-Path $base -Leaf)
+    if (-not $PSBoundParameters.ContainsKey('ScratchRoot')) {
+        # Short fixed-width leaf: TEMP is the prefix of every path a lane's pytest tmp_path repo creates, and git
+        # fails past MAX_PATH. 8 hex of sha256(run dir + lane slot) is unique per run and lane, 8 chars at any card length.
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $scratchLeaf = ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($scratchLeaf.ToLowerInvariant()))) -replace '-', '').Substring(0, 8).ToLowerInvariant() } finally { $sha.Dispose() }
+    }
+    $scratchDir = Join-Path $scratchBase $scratchLeaf
     New-Item -ItemType Directory -Force -Path $scratchDir | Out-Null
     foreach ($v in 'TEMP', 'TMP', 'TMPDIR') { $psi.Environment[$v] = $scratchDir }
+    # T-03: the default scratch root is inside the lane's git worktree, so git repo discovery from a pytest tmp_path or
+    # tempfile dir would climb into the worktree. A ceiling at the scratch root stops it there and leaves git run from
+    # the worktree itself alone. An inherited ceiling is kept: the scratch root is appended with ';'.
+    $ceiling = if ($psi.Environment.ContainsKey('GIT_CEILING_DIRECTORIES')) { [string]$psi.Environment['GIT_CEILING_DIRECTORIES'] } else { '' }
+    $psi.Environment['GIT_CEILING_DIRECTORIES'] = if ($ceiling.Trim(';')) { '{0};{1}' -f $ceiling.TrimEnd(';'), $scratchBase } else { $scratchBase }
 }
 $psi.Environment['MLV_LANE_RUN_DIR'] = $RunDir
 $psi.Environment['MLV_LANE_SCRATCH_MANIFEST'] = (Join-Path $RunDir 'scratch-paths.txt')
@@ -1662,7 +1721,7 @@ if ($sw.Elapsed.TotalMilliseconds -ge ($TimeoutSec * 1000.0)) {
 
 if ($cfg.engine -eq 'claude') {
     # This trusted host is inert until it reads frame one. It is assigned to the job
-    # before frame one is sent, so the provider and every descendant inherit the job.
+    # before frame one is sent, so the provider and every descendant inherit the job. Claude-engine lanes only: the Codex branch below has no job.
     $hostSource = @'
 $ErrorActionPreference='Stop'; Set-StrictMode -Version Latest
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -1674,7 +1733,9 @@ $p.WorkingDirectory=[string]$launch.cwd; $p.UseShellExecute=$false
 $p.CreateNoWindow=$true
 $p.RedirectStandardInput=$true; $p.RedirectStandardOutput=$true; $p.RedirectStandardError=$true
 $p.StandardOutputEncoding=[Text.UTF8Encoding]::new($false); $p.StandardErrorEncoding=[Text.UTF8Encoding]::new($false)
-$child=[Diagnostics.Process]::Start($p); $ot=$child.StandardOutput.ReadToEndAsync(); $et=$child.StandardError.ReadToEndAsync()
+$child=[Diagnostics.Process]::Start($p);
+$ob=[IO.MemoryStream]::new(); $eb=[IO.MemoryStream]::new(); $os=$child.StandardOutput.BaseStream; $es=$child.StandardError.BaseStream
+$ot=$os.CopyToAsync($ob); $et=$es.CopyToAsync($eb)
 $control=[ordered]@{schema='mlv-lane-child/v1';pid=$child.Id;createdUtc=$child.StartTime.ToUniversalTime().ToString('o')}|ConvertTo-Json -Compress
 $tmp=[string]$launch.controlPath+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
 [IO.File]::WriteAllText($tmp,$control,[Text.UTF8Encoding]::new($false)); [IO.File]::Move($tmp,[string]$launch.controlPath)
@@ -1682,7 +1743,16 @@ $line=[Console]::In.ReadLine(); if([string]::IsNullOrWhiteSpace($line)){throw 'p
 $frame=$line|ConvertFrom-Json; if([string]$frame.schema -ne 'mlv-lane-prompt/v1'){throw 'prompt-frame-schema'}
 $prompt=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$frame.promptBase64))
 $child.StandardInput.Write($prompt); $child.StandardInput.Close(); $child.WaitForExit()
-[Console]::Out.Write($ot.GetAwaiter().GetResult()); [Console]::Error.Write($et.GetAwaiter().GetResult()); exit $child.ExitCode
+$both=[Threading.Tasks.Task[]]@($ot,$et); try{[void][Threading.Tasks.Task]::WaitAll($both,[int]$launch.drainGraceMs)}catch{}
+if(-not($ot.IsCompleted -and $et.IsCompleted)){
+  $drain=[ordered]@{schema='mlv-lane-drain/v1';stdoutOpen=(-not $ot.IsCompleted);stderrOpen=(-not $et.IsCompleted);graceMs=[int]$launch.drainGraceMs}|ConvertTo-Json -Compress
+  $tmp=[string]$launch.drainPath+'.'+[guid]::NewGuid().ToString('N')+'.tmp'
+  [IO.File]::WriteAllText($tmp,$drain,[Text.UTF8Encoding]::new($false)); [IO.File]::Move($tmp,[string]$launch.drainPath)
+  foreach($s in @($os,$es)){try{$s.Dispose()}catch{}}
+  try{[void][Threading.Tasks.Task]::WaitAll($both,2000)}catch{}
+}
+$enc=[Text.UTF8Encoding]::new($false)
+[Console]::Out.Write($enc.GetString($ob.ToArray())); [Console]::Error.Write($enc.GetString($eb.ToArray())); exit $child.ExitCode
 '@
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($hostSource))
     $psi.FileName = (Get-Command pwsh.exe -ErrorAction Stop).Source
@@ -1716,15 +1786,24 @@ $child.StandardInput.Write($prompt); $child.StandardInput.Close(); $child.WaitFo
 # Start the async reads BEFORE waiting: a child that fills a redirected pipe
 # buffer blocks forever if nobody is draining it, and the timeout below would
 # then measure a deadlock we caused rather than a slow lane.
-$outTask = $proc.StandardOutput.ReadToEndAsync()
-$errTask = $proc.StandardError.ReadToEndAsync()
+#
+# LANE-RUNNER-IDLE-AFTER-CHILD-EXIT-1: the streams are copied into MemoryStreams (CopyToAsync), not read with ReadToEndAsync, so
+# what arrived is recoverable if a descendant that inherited a pipe keeps it open after the child exits; harvest waits a bounded
+# $OUTPUT_DRAIN_GRACE_MS for EOF (Complete-BoundedOutputDrain) instead of an unbounded `.Result`.
+$outStream = $proc.StandardOutput.BaseStream
+$errStream = $proc.StandardError.BaseStream
+$outBuf = [System.IO.MemoryStream]::new()
+$errBuf = [System.IO.MemoryStream]::new()
+$outTask = $outStream.CopyToAsync($outBuf)
+$errTask = $errStream.CopyToAsync($errBuf)
+$hostDrainPath = "$base.host-drain.json"
 
 # The prompt reaches claude this way; codex gets an empty stdin that is CLOSED,
 # which is what stops it waiting on "Reading additional input from stdin...".
 if ($cfg.engine -eq 'claude') {
     $controlPath = "$base.child.json"
     if (Test-Path -LiteralPath $controlPath) { throw "control-path-exists: $controlPath" }
-    $launchFrame = [ordered]@{ schema='mlv-lane-launch/v1'; exe=$exe; argv=$argv; cwd=$WorkDir; controlPath=$controlPath } | ConvertTo-Json -Compress -Depth 5
+    $launchFrame = [ordered]@{ schema='mlv-lane-launch/v1'; exe=$exe; argv=$argv; cwd=$WorkDir; controlPath=$controlPath; drainPath=$hostDrainPath; drainGraceMs=$OUTPUT_DRAIN_GRACE_MS } | ConvertTo-Json -Compress -Depth 5
     $awaitingChild = $true
     $proc.StandardInput.WriteLine($launchFrame); $proc.StandardInput.Flush()
     $controlDeadlineMs = [math]::Min($sw.Elapsed.TotalMilliseconds + 10000.0, $TimeoutSec * 1000.0)
@@ -1775,7 +1854,8 @@ $timedOut = $false
 $remainingMs = [math]::Max(0, [math]::Floor(($TimeoutSec * 1000.0) - $sw.Elapsed.TotalMilliseconds))
 if ($remainingMs -eq 0 -or -not $proc.WaitForExit([int]$remainingMs)) {
     $timedOut = $true
-    # Closing the job is the authoritative descendant cleanup. Do it before
+    # Closing the job is the authoritative descendant cleanup for a Claude-engine lane (a Codex lane has no
+    # job, so $jobHandle is zero and only the Kill($true) tree kill below applies). Do it before
     # harvesting pipes, which descendants could otherwise keep open indefinitely.
     if ($jobHandle -ne [IntPtr]::Zero) {
         [void][MlvLaneJob]::CloseHandle($jobHandle)
@@ -1788,10 +1868,23 @@ $sw.Stop()
 $exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }
 
 # ---------------------------------------------------------------- harvest
-$stdout = try { $outTask.Result } catch { '' }
-if ($null -eq $stdout) { $stdout = '' }
-$stderrText = try { $errTask.Result } catch { '' }
-if ($null -eq $stderrText) { $stderrText = '' }
+# Bounded: the direct child is gone (or was killed) by here, so only a descendant that inherited a pipe can still hold EOF back.
+# Never report the lane finished before its child exited (the wait above), and never drop the child's exit code ($exitCode is already read).
+$drain = Complete-BoundedOutputDrain -OutTask $outTask -ErrTask $errTask -OutBuf $outBuf -ErrBuf $errBuf `
+    -OutStream $outStream -ErrStream $errStream -GraceMs $OUTPUT_DRAIN_GRACE_MS
+$stdout = [string]$drain.stdout
+$stderrText = [string]$drain.stderr
+# The contained host runs the same bounded drain on the CHILD's pipes and leaves this marker when it had to give up on them.
+$hostDrain = $null
+if ($cfg.engine -eq 'claude' -and (Test-Path -LiteralPath $hostDrainPath)) {
+    $hostDrain = try { [System.IO.File]::ReadAllText($hostDrainPath) | ConvertFrom-Json } catch { [pscustomobject]@{ unreadable = $true } }
+}
+$outputDrainTimedOut = [bool]($drain.timedOut -or $null -ne $hostDrain)
+$outputDrain = [ordered]@{
+    graceMs = $OUTPUT_DRAIN_GRACE_MS
+    runnerStdoutOpen = [bool]$drain.stdoutOpen; runnerStderrOpen = [bool]$drain.stderrOpen
+    hostReportedTimeout = ($null -ne $hostDrain)
+}
 Write-Utf8NoBom $outPath $stdout
 Write-Utf8NoBom $errPath $stderrText
 # Classify BEFORE parsing the answer: a refused run has no answer, and the 2026-09-07 sol
@@ -2060,7 +2153,7 @@ catch {
                     [void]$proc.WaitForExit(5000)
                 }
                 if ($errTask.Wait(2000)) {
-                    $errHead = [string]$errTask.Result
+                    $errHead = [System.Text.UTF8Encoding]::new($false).GetString($errBuf.ToArray())
                     $launchNoChild.hostStderrHead = if ($errHead.Length -gt 400) { $errHead.Substring(0, 400) } else { $errHead }
                 }
             }
@@ -2230,6 +2323,17 @@ if ($AllowEdits -and $cfg.engine -eq 'claude') {
         }
     }
 }
+# LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1 r2 (sol r1 blocker): a worktree this lane leaves standing must not keep a daemon. Without
+# extensions.worktreeConfig the launch-time disable is skipped, so every `git status` above (the retire gate's, the sweep's, and the post-exit
+# dirty check) restarts the daemon. This stop therefore comes AFTER the last git call that touches $WorkDir; add no git call below it (a test pins
+# that). Fail-soft, and recorded in the receipt: a no-op once the worktree is retired (path absent).
+$fsmonitorStop = $null
+try {
+    $fsmonitorStopResult = Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir
+    $fsmonitorStop = [ordered]@{ action = [string]$fsmonitorStopResult.action; reason = $fsmonitorStopResult.reason }
+} catch {
+    $fsmonitorStop = [ordered]@{ action = 'failed'; reason = "cannot-determine: $($_.Exception.Message)" }
+}
 # LANE-NO-BACKGROUND-END-TURN-1 round 7 (sol major 3): the copy this lane's hook actually ran
 # against sits in the per-run reserved slot specifically so it is outside the lane's own
 # writable worktree -- but an editing lane keeps Bash for its whole session, and Bash is not
@@ -2296,6 +2400,9 @@ $receipt = [ordered]@{
                    elseif ($processEnded) { 'ended-incomplete' }
                    else { 'incomplete' }
     lane         = $Lane
+    # `role` copies the $LANES label. For astra that label (`tie-breaker-design-arbiter`) is a
+    # LEGACY machine-readable value kept for receipt compatibility; a reader must not take it as
+    # current routing authority (astra is an optional diversity seat -- see the $LANES comments).
     role         = $cfg.role
     engine       = $cfg.engine
     # LANE-MODEL-CURRENCY-1: requestedModel is the table's alias/tier (the lane's
@@ -2336,6 +2443,12 @@ $receipt = [ordered]@{
     endedUtc     = (Get-Date).ToUniversalTime().ToString('o')
     durationSec  = [math]::Round($sw.Elapsed.TotalSeconds, 1)
     timedOut     = $timedOut
+    # LANE-RUNNER-IDLE-AFTER-CHILD-EXIT-1: true when a descendant still held the child's stdout/stderr open $OUTPUT_DRAIN_GRACE_MS after the
+    # child exited (the runner or the contained host abandoned the pipes and kept what had been read). The exit code and `complete` are
+    # unaffected; a reader that needs the full transcript must treat true as "output may be truncated". outputDrain is null when the
+    # run never reached harvest.
+    outputDrainTimedOut = $outputDrainTimedOut
+    outputDrain  = $outputDrain
     timeoutSec   = $TimeoutSec
     exitCode     = $exitCode
     promptSha256 = Get-Sha256 $Prompt
@@ -2357,6 +2470,9 @@ $receipt = [ordered]@{
     bulkScratch  = $bulkScratch
     worktreeDisposition = $worktreeDisposition
     worktreeSweep = $worktreeSweep
+    # LANE-FSMONITOR-PIN-AND-RETIRE-HARDENING-1 r2: {action, reason} of the lane-end daemon stop (stopped | none | skipped | failed). Absence of a
+    # daemon is 'none'; 'failed' means one may still be running.
+    fsmonitorStop = $fsmonitorStop
     processEnded = $processEnded
     complete     = $workCompleted
     workEvidence = $workEvidence

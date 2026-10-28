@@ -111,10 +111,47 @@
 # over-refusal, listed in the PR body: any earlier clause, sentence, list item or heading of the block that is not one of those
 # shapes ("Run the build, then run playback locally on Bachelor.", "Replay the arms on Bachelor, then ...", a '## Steps' heading
 # above the venue sentence); put such text in a block of its own. Rules 3, 3b and 4 are unchanged.
+# Per-launcher scope (r14; NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS post-merge Blocker on PR #448, ask 6216180502). Rule 4 used to read only the
+# FIRST launcher occurrence of each pattern, so a venue-routed first launcher exempted an unrouted second one in the same sentence
+# ("<launcher> -Backend cpu on Bachelor; then run <launcher> -Backend cpu." passed). Rule 4 now scores EVERY launcher occurrence on its
+# own: a venue locus exempts only the launcher it routes, so a later launcher after ; / , then / then / and / or needs its own route.
+# Two launchers in one clause are split at the next launcher's start (the first launcher's stretch also holds the clause lead-in). The
+# two greedy gaps of the direct patterns are lazy, so a first match cannot swallow the second launcher. Rules 2, 3 and 3b are unchanged.
+# r2 (CoS review of 75cb00e1): lazy was not enough -- a gap that cannot match on its own still ran over a ';' into the next launcher and the
+# merged span took the first clause's venue route. A launcher's gap now stops at ';' and at the next pwsh / powershell / app token, and
+# spans that start in different clauses are never merged. Rule 4 calls Test-VenueExempts (the same helper as rule 3) for the clause test.
 # Rules 3, 3b and 4 keep master's weak-negation exemption (not / no / without in the marker's clause, narrowed from the whole sentence to
 # the clause), so they refuse at least what master refuses. Anything that is not E1 / E2 / E3 / a prohibition keeps master's verdict.
 # A contrast word still CUTS the sentence (the head clause is judged without its complement) and the complement ends at its next comma; the
 # clause after that comma inherits from the HEAD clause, so a leading "Never run playback ..." still reaches "..., locally or on this host".
+# Sentence split and code span (NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1, CoS review 6231429063 soft notes on #465). Rule 4 reads one
+# sentence at a time, so `Run <app> <clip>. Add <mode>.` was never one launch. A mode flag that no app launch of its own sentence holds
+# (an ORPHAN flag) now reaches the ADJACENT sentences of its block (a heading ends it): an app call there is scored as if the flag stood
+# in its own sentence (the r10 reading), and so is an app token that ends its sentence (`Run <app>. Add <mode>.`). A flag that a launch
+# holds reaches nothing, so `Build <app>. Then run <app> <clip> <mode> on Bachelor.` passes; two sentences away is out of reach. The app
+# and tracked-script tokens close with a backtick like the other app tokens (a markdown code span), so ``Run `<app>` <mode>.`` is a
+# direct launch. Refuse-only: the pin 2f8d1a97 passes every row this adds a refusal for.
+#
+# Compile step and read-only mention (LOCAL-PLAYBACK-LINT-COMPILE-WORD-FP-1 / LOCAL-PLAYBACK-LINT-PARAM-MENTION-FP-1; accept-only, both fail
+# closed, both listed in the PR body). C1: "..., assemble locally (-j2), stage to Bachelor, stage the smoke runner, then run" (the chains on
+# the next line) was refused as run-playback-locally because `locally` sat in a sentence with a playback word and a launch verb. Rule 2 now
+# skips a marker that is the adverb of a compile step (Test-CompileStepLocally: CompileVerbs, no launch verb in the marker's clause) when every
+# OTHER launch clause of the sentence is a venue-chain drive (DriveObjects, or the bare verb at the end of its line). C2: "Confirm from the runner
+# (<launcher> -Param ValidateSet), ..." was refused as a direct launch. Rule 4 now skips the bare `<launcher> -Param` form inside a parenthesis
+# that a ReadOnlyVerbs word introduces, in a sentence with no launch verb outside a prohibition (Test-ReadOnlyLauncherMention); `pwsh -File`,
+# the call operator, an explicit relative path, any word but MentionParenWords before the launcher, a colon or prose still refuse. Rules 3, 3b
+# and the app patterns are unchanged. Accepted over-refusal: a read-only mention outside a parenthesis ("Read <launcher> -Param to see ...").
+# r3 (sol r2 on 31e0d567, both refuse-only): C1 no longer exempts on the launch verb alone. A bare verb at the end of a line is a drive only
+# when the NEXT line of the same block opens with a DriveObjects word and holds no launch verb and no rule trigger ("then run\n<the app's
+# smoke mode>" and "then run" with no next line refuse again: the c1-real-line negative now refuses, the c1-real-paragraph one still
+# passes). C2 exempts a MENTION, never an invocation: the launcher's parameter must be followed by a MentionParamWords word (the parameter's
+# declaration, never a value) and the closing parenthesis, and the sentence must hold no InvokeWords word and no locally / host / here marker
+# ("Verify playback on this host by calling (<launcher> -Param cuda)" refuses again).
+# r4 (sol r3 on 3799f0de, refuse-only): C1 skipped a verbless clause, so "..., then run the chains and the smoke runner here" rode the
+# drive's verb unchecked. A verbless clause after a launch clause now passes only as a drive object or with its own venue route; the rest
+# of a drive object holds no app / runner / smoke / clip / playback word; and any other local-host reference in the sentence (or on the
+# next line of a bare verb) voids C1. Accepted over-refusal: a launch clause with a verb of its own and a venue route ("..., then run the
+# smoke runner on Bachelor") is still no drive, as in r1-r3.
 #
 # ASCII only (PowerShell 5.1 reads a BOM-less file as the ANSI code page). No Set-StrictMode here: a dot-sourced file would leak it into the caller.
 
@@ -167,9 +204,9 @@ function Remove-NoLocalPlaybackSection {
 function Get-LintClauses {
     param([string]$Sentence, [string]$Separator, [string]$Contrast, [string]$LaunchVerb, [string]$StrongNeg, [string]$WeakNeg, [string]$VenueQualified)
     $cuts = New-Object System.Collections.Generic.List[object]
-    foreach ($m in [regex]::Matches($Sentence, $Separator)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $false; Disjunct = ($m.Value.Trim() -ieq 'or'); Hard = ($m.Value -ceq ';') }) }
+    foreach ($m in (Get-LintRegex $Separator).Matches($Sentence)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $false; Disjunct = ($m.Value.Trim() -ieq 'or'); Hard = ($m.Value -ceq ';') }) }
     if ($Contrast) {
-        foreach ($m in [regex]::Matches($Sentence, $Contrast)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $true; Disjunct = $false; Hard = $false }) }
+        foreach ($m in (Get-LintRegex $Contrast).Matches($Sentence)) { $cuts.Add([pscustomobject]@{ Index = $m.Index; Length = $m.Length; Contrast = $true; Disjunct = $false; Hard = $false }) }
     }
     $ordered = @($cuts | Sort-Object -Property @{ Expression = 'Index'; Descending = $false }, @{ Expression = 'Length'; Descending = $true })
     $spans = New-Object System.Collections.Generic.List[object]
@@ -252,7 +289,7 @@ function Get-VenueRoutedLocallyEnd {
     param([string]$Sentence, [object]$Clause, [int]$Index, [string]$VenueLocus, [string]$Prepositions)
     if ($Index -lt $Clause.Start -or $Index -ge $Clause.End) { return -1 }
     $tail = $Sentence.Substring($Index, $Clause.End - $Index)
-    $m = [regex]::Match($tail, "(?i)^locally\s+(?:${Prepositions})\s+(?:(?:the|a|an)\s+)?${VenueLocus}")
+    $m = (Get-LintRegex "(?i)^locally\s+(?:${Prepositions})\s+(?:(?:the|a|an)\s+)?${VenueLocus}").Match($tail)
     if (-not $m.Success) { return -1 }
     return $Index + $m.Length
 }
@@ -331,7 +368,7 @@ function Test-LocalHostInScope {
         }
         elseif ($k.Contrast -or $k.Strong -or $k.Weak) { continue }
         foreach ($pattern in $HostPatterns) {
-            foreach ($m in [regex]::Matches($k.Text, $pattern)) {
+            foreach ($m in (Get-LintRegex $pattern).Matches($k.Text)) {
                 if (-not (Test-ContrastLead -Sentence $Sentence -Clause $k -Index ($k.Start + $m.Index))) { return $true }
             }
         }
@@ -344,6 +381,85 @@ function Test-VenueExempts {
     param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [string[]]$HostPatterns)
     if (-not $Clause.Venue) { return $false }
     return -not (Test-LocalHostInScope -Sentence $Sentence -Clauses $Clauses -Clause $Clause -HostPatterns $HostPatterns)
+}
+
+# C1 (LOCAL-PLAYBACK-LINT-COMPILE-WORD-FP-1): `locally` as the adverb of a COMPILE step ("..., assemble locally (-j2), stage to Bachelor,
+# stage the smoke runner, then run"). The marker's own clause holds no launch verb, and the text since the marker's last comma / colon /
+# semicolon / open parenthesis is a listed compile verb plus up to four plain words ($CompilePiece). Fail closed on the REST of the
+# sentence: every other clause that holds a launch verb (a prohibition aside) must be a venue-chain drive ($DriveTail: the verb alone at the
+# end of its clause, or the verb + a listed DriveObjects word and no second launch verb). "Assemble locally and run playback", "Build locally,
+# then play the clip" and "Run playback, then assemble locally" keep their verdict. This exempts the marker only; rules 3, 3b and 4 still read
+# the sentence ("..., then run the chains on this host" is refused by rule 3).
+# r3 (sol r2 C1): the verb ALONE is never a drive. It is one only when it is the last word of the sentence, the sentence ends its line, and
+# $NextLine (the next line of the same block, $null when there is none) opens with a DriveObjects word ($DriveNext) and holds no launch verb
+# and no rule trigger ($NextDefeaters: the next line is linted on its own, without the verb, so "then run\nthe chains on this host" would
+# otherwise pass). "Build MLVApp locally, then run\nit with <the smoke mode>." and "..., then run" with no next line refuse.
+# r4 (sol r3 C1 on 3799f0de): a verbless coordinated clause after a launch clause ("..., then run the chains and the smoke runner here")
+# inherits that launch verb, so it is read for its OWN object: it passes only when it is itself a drive object ($DriveNext, nothing in its
+# rest a $LaunchObject) or names its own venue route (Test-VenueExempts). A drive object's rest (after the DriveObjects word, here and on
+# the next line) holds no $LaunchObject ("run the chains with the smoke runner" refuses). Any local-host reference in the sentence but the
+# marker itself ($HostPatterns: here, this host, my machine, a second locally) voids the exemption, and so does one on the next line.
+function Test-DriveObjectClause {
+    param([string]$Text, [string]$Pattern, [string]$LaunchObject)
+    $m = (Get-LintRegex $Pattern).Match($Text)
+    if (-not $m.Success) { return $false }
+    $rest = $Text.Substring($m.Length)
+    if ($rest -match $LaunchObject) { return $false }
+    return $true
+}
+
+function Test-CompileStepLocally {
+    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [int]$Index, [string]$CompilePiece, [string]$DriveTail, [string]$DriveBare,
+        [string]$DriveNext, [object[]]$NextDefeaters, [AllowNull()][string]$NextLine, [string]$LaunchObject, [string[]]$HostPatterns)
+    if ($Clause.HasVerb -or $Clause.Contrast -or $Index -lt $Clause.Start) { return $false }
+    if (-not (Get-LintRegex $CompilePiece).IsMatch($Sentence.Substring($Clause.Start, $Index - $Clause.Start))) { return $false }
+    foreach ($pattern in $HostPatterns) {
+        foreach ($hm in (Get-LintRegex $pattern).Matches($Sentence)) {
+            if ($hm.Index -ne $Index) { return $false }
+        }
+    }
+    $launched = $false
+    foreach ($k in $Clauses) {
+        if ([object]::ReferenceEquals($k, $Clause) -or $k.Strong) { continue }
+        $kText = $Sentence.Substring($k.Start, $k.End - $k.Start)
+        if (-not $k.HasVerb) {
+            if ($launched -and -not (Test-DriveObjectClause -Text $kText -Pattern $DriveNext -LaunchObject $LaunchObject) -and
+                -not (Test-VenueExempts -Sentence $Sentence -Clauses $Clauses -Clause $k -HostPatterns $HostPatterns)) { return $false }
+            continue
+        }
+        $launched = $true
+        if (Test-DriveObjectClause -Text $kText -Pattern $DriveTail -LaunchObject $LaunchObject) { continue }
+        if ($k.End -ne $Sentence.Length -or [string]::IsNullOrEmpty($NextLine) -or -not (Get-LintRegex $DriveBare).IsMatch($kText)) { return $false }
+        if (-not (Test-DriveObjectClause -Text $NextLine -Pattern $DriveNext -LaunchObject $LaunchObject)) { return $false }
+        foreach ($rx in $NextDefeaters) { if ($rx.IsMatch($NextLine)) { return $false } }
+        foreach ($pattern in $HostPatterns) { if ((Get-LintRegex $pattern).IsMatch($NextLine)) { return $false } }
+    }
+    return $true
+}
+
+# C2 (LOCAL-PLAYBACK-LINT-PARAM-MENTION-FP-1): a tracked launcher named with a parameter INSIDE a parenthetical that a read-only verb
+# introduces ("Confirm from the runner (<launcher> -Param ValidateSet), ...") is a mention, not a launch. Fail closed: the occurrence is
+# the bare `<launcher> -Param` form only (not `pwsh -File`, not the call operator, not an explicit relative path), the sentence holds no
+# launch verb outside a prohibition, a ReadOnlyVerbs word stands in the occurrence's clause before the parenthesis that holds it (balanced
+# one-level parentheses may sit between), nothing but one MentionParenWords word stands between that parenthesis and the launcher, and the
+# parenthesis closes after it. A mention with no read-only verb ("Then (<launcher> -Param cuda)"), after a colon, or in prose stays a launch.
+# r3 (sol r2 C2): a read-only verb is not enough. The parameter must be followed by a MentionParamWords word and the closing parenthesis
+# ($MentionPost: the parameter's declaration is named, no value is passed), and the sentence must hold no InvokeWords word and no locally /
+# host / here marker ($MentionDefeaters). "Verify playback on this host by calling (<launcher> -Param cuda)" is an invocation and refuses.
+function Test-ReadOnlyLauncherMention {
+    param([string]$Sentence, [object[]]$Clauses, [object]$Clause, [int]$SpanStart, [string]$SpanValue, [string]$MentionPre, [string]$Relative,
+        [string]$MentionPost, [object[]]$MentionDefeaters)
+    foreach ($k in $Clauses) { if ($k.HasVerb -and -not $k.Strong) { return $false } }
+    foreach ($rx in $MentionDefeaters) { if ($rx.IsMatch($Sentence)) { return $false } }
+    $spanEnd = $SpanStart + $SpanValue.Length
+    if ($spanEnd -gt $Sentence.Length -or -not (Get-LintRegex $MentionPost).IsMatch($Sentence.Substring($spanEnd))) { return $false }
+    if ($SpanValue.Contains('&') -or (Get-LintRegex $Relative).IsMatch($SpanValue)) { return $false }
+    $lead = if ($SpanValue -match '^[\s`&(]') { 1 } else { 0 }
+    $opened = (Get-LintRegex '^[(\x60\x27\x22\[]*').Match($SpanValue.Substring($lead)).Value
+    $to = $SpanStart + $lead + $opened.Length
+    if ($to -lt $Clause.Start -or $to -gt $Sentence.Length) { return $false }
+    if (-not (Get-LintRegex $MentionPre).IsMatch($Sentence.Substring($Clause.Start, $to - $Clause.Start))) { return $false }
+    return ($Sentence.IndexOf(')', $to) -ge 0)
 }
 
 # The CLOSED word lists the exemptions depend on (r5). Every pattern in Get-LocalPlaybackPromptFindings is built from these lists, and
@@ -397,6 +513,20 @@ function Get-LocalPlaybackLintWordLists {
         HeadJoiners                = @('and', 'or', 'then', 'but', 'so')
         HeadProhibitions           = @('never', 'do not', "don't", 'must not', "mustn't", 'may not')
         HeadContrasts              = @('rather than', 'instead of', 'not', 'never', 'nor')
+        # LOCAL-PLAYBACK-LINT-COMPILE-WORD-FP-1 (C1) and LOCAL-PLAYBACK-LINT-PARAM-MENTION-FP-1 (C2). Closed lists, they only ADMIT; none of
+        # them may hold a LaunchVerbs member (a launch verb here would exempt a launch).
+        #   CompileVerbs       the verb of a compile step whose adverb is `locally` ("assemble locally (-j2), stage to Bachelor, ...").
+        #   DriveObjects       what a LATER launch clause of that sentence may run: the venue chain / leg itself, never a clip, an app or a runner.
+        #   ReadOnlyVerbs      the verb of a read-only clause that may name a tracked launcher with a parameter ("Confirm from the runner (<launcher> -Param ...)").
+        #   MentionParenWords  the only word that may stand between the opening parenthesis and the launcher in that mention ("(see <launcher> -Param ...)").
+        CompileVerbs               = @('assemble', 'assembles', 'assembling', 'build', 'builds', 'building', 'compile', 'compiles', 'compiling', 'rebuild', 'rebuilds', 'rebuilding')
+        DriveObjects               = @('chain', 'chains', 'venue chain', 'venue chains', 'leg', 'legs', 'venue leg', 'venue legs', 'chain runner')
+        ReadOnlyVerbs              = @('confirm', 'confirms', 'check', 'checks', 'verify', 'verifies', 'inspect', 'inspects', 'read', 'reads', 'review', 'reviews', 'see', 'grep', 'compare', 'cite', 'quote')
+        MentionParenWords          = @('see', 'per', 'in', 'from', 'cf')
+        # r3 (sol r2 C2). MentionParamWords only ADMITS: the word that must follow the parameter, a declaration (never a value the
+        # parameter could be passed). InvokeWords only DEFEATS: a sentence that holds one calls the launcher, whatever its read-only verb.
+        MentionParamWords          = @('ValidateSet', 'ValidateRange', 'ValidatePattern', 'ValidateScript')
+        InvokeWords                = @('call', 'calls', 'calling', 'called', 'use', 'uses', 'using', 'used', 'trigger', 'triggers', 'triggering', 'spawn', 'spawns', 'spawning', 'fire', 'fires', 'firing', 'exec', 'dot-source', 'dot-sourcing')
     }
 }
 
@@ -409,11 +539,51 @@ function ConvertTo-LintAlternation {
     return (($sorted | ForEach-Object { [regex]::Escape($_).Replace('\ ', $gap) }) -join '|')
 }
 
-function Get-LocalPlaybackPromptFindings {
-    [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+# r11 (NA2-RULE4-PER-LAUNCHER-SCOPE-1, merge_group 39021953705 timed the coordination step out): no behaviour change, only cost.
+# Every pattern below is a pure function of the closed word lists, so the whole set is built ONCE per process (Get-LintPatternSet) instead
+# of once per call (~90 string builds and six regex constructions, ~15-30 ms a call), and the two big grammars are built only when an
+# E1 marker reaches them (-WithGrammars). Every static [regex]::Match / Matches / IsMatch went through .NET's 15-entry static regex
+# cache; the rule-4 patterns pushed the distinct patterns one sentence reads past 15, so each call re-parsed the big ones. Get-LintRegex
+# keeps one Regex per pattern string for the life of the process (default options, exactly what the static calls used).
+# r14b (culture fail-open, sol r12d): a case-insensitive Regex fixes its case table when it is CONSTRUCTED, from the thread's CurrentCulture
+# (tr-TR: I matches only the dotless i, so "ON THIS HOST" no longer matches "this host"). The static calls built it under the culture of each
+# call; a cached one kept the culture of the call that warmed it, so a process warmed under tr-TR allowed under en-US what dc124533 refused.
+# r14c measured both halves (CultureIndependenceTests): the table is read at CONSTRUCTION only (a Regex built under en-US matches the same under
+# tr-TR, and the reverse), and every culture but tr / az folds like en-US. New-LintRegex therefore builds EVERY cached Regex under en-US,
+# the behaviour dc124533 had under every non-Turkish culture, and restores the caller's culture, so the result depends on neither the
+# warm-time nor the call-time culture. RegexOptions.CultureInvariant is NOT used: it folds U+0130 differently from en-US (dc124533 under
+# en-US refuses a dotted capital I in the host phrase, invariant does not), which would let a row through. A runtime without en-US data
+# (invariant-globalization mode) has no Turkish table either, so the pattern is then built under the culture it already has.
+# The other case-folding the lint does (-match, -ieq, -contains, -split, -replace) is PowerShell's own culture-invariant comparison, and its
+# only sorts are by length and index, so a Regex built here is the one culture-dependent object (CultureIndependenceTests pins that too).
+$script:LintBuildCulture = try { [System.Globalization.CultureInfo]::GetCultureInfo('en-US') } catch { $null }
+function New-LintRegex {
+    param([string]$Pattern)
+    if ($null -eq $script:LintBuildCulture) { return [regex]::new($Pattern) }
+    $saved = [System.Globalization.CultureInfo]::CurrentCulture
+    try {
+        [System.Globalization.CultureInfo]::CurrentCulture = $script:LintBuildCulture
+        return [regex]::new($Pattern)
+    }
+    finally { [System.Globalization.CultureInfo]::CurrentCulture = $saved }
+}
+$script:LintPatternSet = $null
+$script:LintRegexCache = [hashtable]::new([System.StringComparer]::Ordinal)
+function Get-LintRegex {
+    param([string]$Pattern)
+    $rx = $script:LintRegexCache[$Pattern]
+    if ($null -eq $rx) {
+        $rx = New-LintRegex $Pattern
+        $script:LintRegexCache[$Pattern] = $rx
+    }
+    return $rx
+}
 
-    $scan = Remove-NoLocalPlaybackSection -Text $Text
+function Get-LintPatternSet {
+    [CmdletBinding()]
+    param([switch]$WithGrammars)
+
+    if ($null -ne $script:LintPatternSet -and (-not $WithGrammars -or $script:LintPatternSet.ContainsKey('TailGrammar'))) { return $script:LintPatternSet }
     # A verb or product word is bounded by non-word, non-hyphen characters, so "run-release-gui-smoke" is not the verb "run" and
     # "MLVAPP_C1_VECTORS_DIR" is not the app.
     $b = '(?<![\w\-])'; $e = '(?![\w\-])'
@@ -492,6 +662,33 @@ function Get-LocalPlaybackPromptFindings {
         $hostLocusRef += "|(?<!${b}(?:${destinationPreposition})\s+(?:${hostDeterminer})\s+)${b}(?:$(ConvertTo-LintAlternation -Words $nounNames -Loose))(?!\w)"
     }
     $hostDefeatersLaunch = @($hostMarker, $hereDefeater, $hostLocusRef)
+    # C1 (Test-CompileStepLocally): the text before `locally` ends in a compile step, and a launch clause elsewhere in the sentence is a
+    # venue-chain drive. The compile piece starts at a comma / colon / semicolon / parenthesis (or the clause start), an optional list mark
+    # and filler words; the object is up to four plain words. The drive tail is read from the clause's first token: a launch verb, then
+    # nothing at all (the object is on the next line) or a listed DriveObjects word with no second launch verb after it.
+    $compileVerb = ConvertTo-LintAlternation -Words @($lists.CompileVerbs)
+    $driveObject = ConvertTo-LintAlternation -Words @($lists.DriveObjects)
+    $compilePiece = "(?i)(?:^|[,(:;])\s*(?:(?:[-*+>]|\d{1,3}[.)])\s+)?(?:(?:please|just|also|now)\s+)*(?:${compileVerb})${e}(?:\s+[\w'.+\-]+){0,4}\s*\z"
+    # r3 (sol r2 C1): the bare verb is no longer an alternative of the drive tail. $driveBare is the verb with nothing after it, a drive only
+    # when $driveNext (a DriveObjects word, no launch verb after it) opens the next line (Test-CompileStepLocally).
+    $driveLead = "(?i)^\W*(?:(?:then|and|just|also|please|so)\s+)*(?:${verbs})${e}"
+    $driveTail = "${driveLead}\s+(?:(?:the|a|an)\s+)?(?:${driveObject})${e}(?!.*${b}(?:${verbs})${e})"
+    $driveBare = "${driveLead}\s*\z"
+    $driveNext = "(?i)^\W*(?:(?:the|a|an)\s+)?(?:${driveObject})${e}(?!.*${b}(?:${verbs})${e})"
+    # r4 (sol r3 C1): what the rest of a drive clause may not name -- a playback word, or an app / runner / smoke / clip object.
+    $launchObject = "${playbackWord}|${b}(?:app|apps|runner|runners|smoke|clip|clips)${e}"
+    # C2 (Test-ReadOnlyLauncherMention): a ReadOnlyVerbs word, then the clause up to the parenthesis that holds the launcher (one level of
+    # balanced parentheses may sit between), then that parenthesis, at most one MentionParenWords word and quote / backtick marks, and the end.
+    $readVerb = ConvertTo-LintAlternation -Words @($lists.ReadOnlyVerbs)
+    $parenWord = ConvertTo-LintAlternation -Words @($lists.MentionParenWords)
+    $mentionPre = "(?i)${b}(?:${readVerb})${e}(?:[^()]|\([^()]*\))*\(\s*(?:(?:${parenWord})${e}\s+)?[\x60\x27\x22]*\z"
+    $mentionRelative = '(?<![\w.])\.{1,2}[\\/]'
+    # r3 (sol r2 C2): what follows the `-Param` of the span -- one MentionParamWords word, quote / backtick marks and the closing parenthesis
+    # -- and the InvokeWords that void the mention anywhere in the sentence.
+    $mentionPost = "(?i)^\s+(?:$(ConvertTo-LintAlternation -Words @($lists.MentionParamWords)))${e}[\x60\x27\x22]*\s*\)"
+    $mentionInvoke = "(?i)${b}(?:$(ConvertTo-LintAlternation -Words @($lists.InvokeWords)))${e}"
+    $tailGrammar = $null; $headGrammar = $null; $itemGrammar = $null
+    if ($WithGrammars) {
     # r10: the closed allow-grammar of the strictly terminal E1 (Test-VenueTerminalTail), a whitelist tokenizer as ONE anchored regex.
     # Every token is a word from a list followed by a token end ($tb); each fragment and each separator is atomic, so the match runs left
     # to right without backtracking into what it has read and stops at the first token the grammar does not name. Two fragments need a
@@ -512,10 +709,7 @@ function Get-LocalPlaybackPromptFindings {
     $tailFragC = "(?:${tailNegation})${tb}\s+${tailHostTarget}"
     $tailSep = "(?:[.!?;:,]+(?=\s|\z)|(?<=\s|^)-{1,2}(?=\s)|(?:${tailJoiner})${tb})"
     $tailFrag = "(?:${tailFragA}|${tailFragC}|${tailLocus})"
-    $tailState = @{
-        Grammar   = [regex]::new("(?i)^\s*(?:(?>${tailSep})\s*)*(?:(?>${tailFrag})(?:\s*(?>${tailSep}))+\s*)*(?:(?>${tailFrag})\s*)?\z")
-        NextDirty = $null
-    }
+    $tailGrammar = New-LintRegex ("(?i)^\s*(?:(?>${tailSep})\s*)*(?:(?>${tailFrag})(?:\s*(?>${tailSep}))+\s*)*(?:(?>${tailFrag})\s*)?\z")
     # r12: the closed HEAD grammar (see the header, Test-HeadGrammar), built from the same token machinery as the tail grammar. A head
     # piece is parsed LEFT TO RIGHT from its first character and every fragment is atomic: the first token no list names ends the match
     # and the piece is dirty. Fragments, in order (the first that matches wins, so a longer shape is listed before its own prefix):
@@ -549,17 +743,105 @@ function Get-LocalPlaybackPromptFindings {
     # a list marker or heading marks at the start of an item: "## ", "* ", "> ", "1. ", "2) " ("- " is a spaced dash, a separator)
     $headListMark = "(?:#{1,6}|[*+>]+|\d{1,3}[.)])\s+"
     $headOpen = "(?i)^\s*(?:${headListMark})*(?:(?>${headSep})\s*)*(?:(?>${headFrag})(?:\s*(?>${headSep}))+\s*)*"
-    # r12: the state of the head check of E1: both grammars and the cursor of the single forward pass over the earlier items
-    # (Test-EarlierItemDirty). The marker's own head may end in a bare launch; an earlier item may not.
-    $headState = @{
-        HeadGrammar = [regex]::new("${headOpen}(?:(?>${headFrag}|${headBareLaunch})\s*)?\z")
-        ItemGrammar = [regex]::new("${headOpen}(?:(?>${headFrag})\s*)?\z")
-        Cursor = 0; Block = -1; Flag = $false
+    # r12: the head check of E1 reads both grammars with a cursor over the earlier items (Test-EarlierItemDirty; the per-call state is
+    # built in Get-LocalPlaybackPromptFindings, r11). The marker's own head may end in a bare launch; an earlier item may not.
+    $headGrammar = New-LintRegex "${headOpen}(?:(?>${headFrag}|${headBareLaunch})\s*)?\z"
+    $itemGrammar = New-LintRegex "${headOpen}(?:(?>${headFrag})\s*)?\z"
     }
+    # r2 (NA2-RULE4-PER-LAUNCHER-SCOPE-1, CoS review of 75cb00e1): a launcher's gap can never reach across a `;` or into the NEXT launcher.
+    # The r1 gaps ([^\n]{0,80}? after pwsh, up to 12 argument tokens after the app) could run over `; pwsh ...` / `; <app> ...`, so a first
+    # launcher that did not match on its own swallowed the second one and the merged span took the FIRST clause's venue route.
+    # r4 (sol r3 + Iverson on 4b9c9387): a gap stops only at a launcher TOKEN that its own pattern anchors on -- the whole argument is
+    # the launcher (optionally quoted, after & or a path), followed by white space -- never at a launcher name inside a path argument
+    # ("--log C:\MLVApp\out.txt", "-WorkingDirectory C:\pwsh\w" stopped the gap and hid the launch). A stop is fail-closed because the
+    # stopping token is matched on its own over the rest of the same gap. The app gap stops at the next app token, the pwsh gap at the
+    # next pwsh / powershell token; a launcher of the other family does not stop a gap (it may not be a launch of its own).
+    # r8: a backtick opens or closes an app token like a quote does (a markdown code span), so the next app launcher stops a gap in either spelling.
+    $appStop = "[&('`"``]*(?:[^\s;]*[\\/])?MLVApp(?:Release)?\.exe['`"``]?\s"
+    $pwshStop = "(?<![^\s&('`"\\/])(?:pwsh|powershell)(?:\.exe)?['`"]?\s"
+    $pwshGap = "(?:(?!;)(?!${pwshStop})[^\n]){0,80}?"
+    $appArg = "(?:(?!/\s)(?!${appStop})[^\s;]+\s+){0,12}?"
+    # r4: the quoted call-operator spelling (& '<script>' -Param, & "<app>" ...) is a launcher too.
+    # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (amend (a), RULE4-DIRECT-APP-BACKTICK-CLOSE-1): the app and the script token close with ' " or
+    # a backtick (a markdown code span closed right after the token: ``Run `<app>` <mode>.``); the class used to hold ' and " only.
     $direct = @(
-        "(?i)${b}MLVApp(Release)?\.exe\s+(?:(?!/\s)\S+\s+){0,12}--(gui-smoke-playback|profile-playback)",
-        "(?i)(pwsh|powershell)(\.exe)?${e}[^\n]{0,80}-File\s+\S*$scripts",
-        "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts\s+-\w+")
+        "(?i)${b}MLVApp(Release)?\.exe['`"``]?\s+${appArg}--(gui-smoke-playback|profile-playback)",
+        "(?i)(pwsh|powershell)(\.exe)?${e}${pwshGap}-File\s+\S*$scripts",
+        "(?i)(^|[\s``&(])(&\s*)?\.{0,2}[\\/]?\S*$scripts['`"``]?\s+-\w+")
+    # r4b (hub ruling, HUB-TICK 20261016T2244Z): the app + a clip / file argument ("Run <app> take01.dat") is an app LAUNCH too, so its
+    # own clause must carry the venue: a route on the NEXT launcher ("... and run <app> take01.dat <mode> on Bachelor") never covers it.
+    # It is scored only in a sentence that holds a direct launch above (it is no trigger of its own), it starts at the app token like the
+    # app pattern, and an app call whose gap reaches a playback mode is the app pattern's, not this one.
+    # (r9: a verbless "<app> <clip>" is a launch of its own too; the 15 r2 rows that held one as a non-launcher lead now refuse.)
+    # r7 (CoS review of 0fb1eb8c, B3 + N1 + N2): the pattern no longer enumerates clip shapes. r4b took a bare clip, r6 added options, a quoted
+    # path and a separator-only token, and each list left a form out (`--clip=<clip>`, `/clip <clip>`, a bare token with no extension, seven
+    # options before the clip). Master's reading is the rule: ANY first argument after the app that is not the next app launcher makes the
+    # call a launch of its own, in a call whose gap holds no playback mode (that one is the app pattern's, the lookahead below). So an
+    # attached `--opt=value`, a `/opt`, a bare token, a number, a quoted value and a chain of any length are covered by construction, and
+    # nothing in this pattern reads the shape of the argument. The next app launcher stays out of it, so a second launcher never reads as
+    # the first one's argument (it is scored on its own route). An app token with no argument after it is no launch here (needs `\s+<arg>`).
+    # r9 (CoS review 6230178238 on d30d1365, B5; hub ruling): the pattern reads NO lead at all. r4b..r8 required a listed launch verb and a
+    # lead (r8: openers, plain words, one path) before the app token, and every shape the lead grammar did not name hid the FIRST launch
+    # of a sentence and let a later routed launcher's venue cover it: an unquoted path with a space, a word with an apostrophe or a
+    # hyphen, punctuation in the lead, a clause with no verb right before the app (`Run: .\<app> <clip>`, `Then <app> <clip>`). Four
+    # rounds of widening the lead (B1, B3, B4, B5) each left the next form out, so the lead is gone: an app token is a launch of its own
+    # when ITS OWN argument gap (up to the next separator or launcher) holds an argument and no playback mode, whatever stands in front of it.
+    # A path before the app token is part of the token (the left bound is a non-word, non-hyphen character). Accepted over-refusal, named
+    # in the PR body: an app call with an argument and no route of its own refuses even when a later launcher in the sentence is routed
+    # (`<app> <clip>; <routed script> on Bachelor.`), and so does an app mention with an argument that no verb launches.
+    $clipLaunch = "(?i)${b}MLVApp(Release)?\.exe['`"``]?\s+(?!${appArg}--(?:gui-smoke-playback|profile-playback))(?!${appStop})[^\s;]"
+    # r10 (CoS review 6230713095 on 96cdd148, B6; hub ruling): the clip launch above was scored only in a sentence that already held a direct
+    # launch. A `;` between the app's argument and its playback mode cuts the app gap (r2, right for the r1 cross-`;` Blocker), so the
+    # mode flag was out of reach, the sentence held no direct launch, the app-plus-argument call was never scored and the sentence
+    # passed (`Run <app> <clip>; add <mode>.`). Now the clip launch is scored whenever the sentence holds a playback mode flag ANYWHERE
+    # ($modeFlag, also a trigger below), so that call must carry its own route. The same hole one character over, an app token with no
+    # argument and the `;` glued to it or spaced after it (`Run <app>; add <mode>.`), is $appBare: a tightening (the pin passes it). It is
+    # scored only when the sentence holds a mode flag and NO direct launch: a bare app mention before a routed launch (`Build <app>; then
+    # run <app> <mode> on Bachelor.`) is a build step, not a launch, and keeps passing (the pin passes it too).
+    $modeFlag = "(?i)--(?:gui-smoke-playback|profile-playback)"
+    $appBare = "(?i)${b}MLVApp(Release)?\.exe['`"``]?\s*;"
+    # The mention path ($clipMention) reads an app token in prose: `Grep for <app> / --seconds / <mode> in every launcher.` lists the
+    # app and the flags with a bare ` / ` between them, and a separator slash is no argument (appArg stops at one for the same reason).
+    # It is scored only where there is no direct launch, so the r9 reading of $clipLaunch in a launch sentence is unchanged.
+    $clipMention = "(?i)${b}MLVApp(Release)?\.exe['`"``]?\s+(?!/\s)(?!${appArg}--(?:gui-smoke-playback|profile-playback))(?!${appStop})[^\s;]"
+    # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1: the no-argument twin across a sentence (`Run <app>. Add <mode>.`), an app token that ends
+    # its sentence; scored only next to an orphan mode flag (see Get-LocalPlaybackPromptFindings), like $appBare next to its `;`.
+    $appEnd = "(?i)${b}MLVApp(Release)?\.exe['`"``]?[.!?]*\z"
+    $set = @{
+        Separator = $separator; Contrast = $contrast; LaunchVerb = $launchVerb; StrongNeg = $strongNeg; WeakNeg = $weakNeg
+        VenueQualified = $venueQualified; PlaybackWord = $playbackWord; VenueLocus = $venueLocus; RoutingLocally = $routingLocally
+        Incident = $incident; LocalMarker = $localMarker; HostMarker = $hostMarker; HereMarker = $hereMarker
+        HostDefeaters = $hostDefeaters; HostDefeatersLaunch = $hostDefeatersLaunch
+        CompilePiece = $compilePiece; DriveTail = $driveTail; DriveBare = $driveBare; DriveNext = $driveNext; LaunchObject = $launchObject
+        MentionPre = $mentionPre; MentionRelative = $mentionRelative; MentionPost = $mentionPost
+        MentionDefeaters = @((New-LintRegex $mentionInvoke), (New-LintRegex $localMarker), (New-LintRegex $hostMarker), (New-LintRegex $hereMarker))
+        Direct = $direct; ClipLaunch = $clipLaunch; ClipMention = $clipMention; AppBare = $appBare; AppEnd = $appEnd; ModeFlag = $modeFlag
+        # the rule triggers, in the order they were always tried (the incident phrase, the three markers, the mode flag, then the launch patterns)
+        Triggers = @((New-LintRegex $incident), (New-LintRegex $localMarker), (New-LintRegex $hostMarker), (New-LintRegex $hereMarker), (New-LintRegex $modeFlag)) + @($direct | ForEach-Object { New-LintRegex $_ })
+    }
+    if ($WithGrammars) { $set.TailGrammar = $tailGrammar; $set.HeadGrammar = $headGrammar; $set.ItemGrammar = $itemGrammar }
+    $script:LintPatternSet = $set
+    return $set
+}
+
+function Get-LocalPlaybackPromptFindings {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+
+    $scan = Remove-NoLocalPlaybackSection -Text $Text
+    $patterns = Get-LintPatternSet
+    $separator = $patterns.Separator; $contrast = $patterns.Contrast; $launchVerb = $patterns.LaunchVerb
+    $strongNeg = $patterns.StrongNeg; $weakNeg = $patterns.WeakNeg; $venueQualified = $patterns.VenueQualified
+    $playbackWord = $patterns.PlaybackWord; $venueLocus = $patterns.VenueLocus; $routingLocally = $patterns.RoutingLocally
+    $localMarker = $patterns.LocalMarker; $hostMarker = $patterns.HostMarker; $hereMarker = $patterns.HereMarker
+    $hostDefeaters = $patterns.HostDefeaters; $hostDefeatersLaunch = $patterns.HostDefeatersLaunch
+    $modeFlag = $patterns.ModeFlag
+    $triggers = $patterns.Triggers
+    # (incident, direct, clipLaunch, clipMention, appBare and appEnd are read as $patterns.<Name> below: tools/repo_hygiene's quote-class pin
+    # evaluates the LAST assignment of each of those names in this file, which must stay the pattern itself, not a copy out of the set)
+    # the per-call state of the two E1 grammars (the cursor and the memo are mutated while one prompt is read); built when an E1 marker needs it
+    $tailState = $null
+    $headState = $null
     $findings = New-Object System.Collections.Generic.List[string]
     # A "sentence" is a line, cut again at '. ' so one bullet carrying several instructions is judged piece by piece. A semicolon is NOT a
     # sentence boundary since r6: it is a hard clause cut (no inheritance, per-group playback test) that the defeater scan reads across.
@@ -569,23 +851,43 @@ function Get-LocalPlaybackPromptFindings {
     # cannot hide behind formatting.
     $items = New-Object System.Collections.Generic.List[object]
     $blockId = 0
+    # r3 (sol r2 C1): every item knows its line, so the compile-step exemption can read the line that continues a bare launch verb.
+    $lineNo = 0
     foreach ($line in ($scan -split "\r?\n")) {
+        $lineNo++
         if ($line -match '^\s*#{1,6}\s') { $blockId++ }
         foreach ($piece in ($line -split '(?<=[.!?])\s+')) {
-            if ($piece.Trim()) { $items.Add([pscustomobject]@{ Text = $piece.Trim(); Block = $blockId }) }
+            if ($piece.Trim()) { $items.Add([pscustomobject]@{ Text = $piece.Trim(); Block = $blockId; Line = $lineNo; LineText = $line }) }
+        }
+    }
+    # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1: an item holds an ORPHAN mode flag when one of its mode flags sits in no app launch match of
+    # that item (`Add <mode>.`). Such a flag reaches the adjacent items of the same block (rule 4 below and the trigger test).
+    $modeRx = Get-LintRegex $modeFlag
+    $appLaunchRx = Get-LintRegex $patterns.Direct[0]
+    $orphanMode = New-Object 'bool[]' $items.Count
+    for ($j = 0; $j -lt $items.Count; $j++) {
+        $t = $items[$j].Text
+        if (-not $modeRx.IsMatch($t)) { continue }
+        $held = @($appLaunchRx.Matches($t))
+        foreach ($mf in $modeRx.Matches($t)) {
+            $inLaunch = $false
+            foreach ($h in $held) { if ($mf.Index -ge $h.Index -and $mf.Index -lt $h.Index + $h.Length) { $inLaunch = $true; break } }
+            if (-not $inLaunch) { $orphanMode[$j] = $true; break }
         }
     }
     # r10: no per-item copy of the rest of the block (r9 kept one per item: O(n^2) in time and retained memory on a large heading-free
     # prompt). The sentence-terminal E1 reads later items through their index (Test-VenueTerminalTail, $tailState.NextDirty).
     # A sentence that holds none of the rule triggers (the incident phrase, `locally`, an on-this-host marker, a bare `here`, a direct
     # launch pattern) cannot be refused by any rule below, so it skips the clause analysis: same verdict, linear cost on long prompts.
-    $triggers = @([regex]::new($incident), [regex]::new($localMarker), [regex]::new($hostMarker), [regex]::new($hereMarker)) + @($direct | ForEach-Object { [regex]::new($_) })
     for ($itemIndex = 0; $itemIndex -lt $items.Count; $itemIndex++) {
         foreach ($sentence in @($items[$itemIndex].Text)) {
             $s = $sentence.Trim()
             if ($s.Length -lt 8) { continue }
-            $triggered = $false
-            foreach ($rx in $triggers) { if ($rx.IsMatch($s)) { $triggered = $true; break } }
+            $block = $items[$itemIndex].Block
+            $neighbourMode = ($itemIndex -gt 0 -and $orphanMode[$itemIndex - 1] -and $items[$itemIndex - 1].Block -eq $block) -or
+                ($itemIndex + 1 -lt $items.Count -and $orphanMode[$itemIndex + 1] -and $items[$itemIndex + 1].Block -eq $block)
+            $triggered = $neighbourMode
+            if (-not $triggered) { foreach ($rx in $triggers) { if ($rx.IsMatch($s)) { $triggered = $true; break } } }
             if (-not $triggered) { continue }
             $clauses = @(Get-LintClauses -Sentence $s -Separator $separator -Contrast $contrast -LaunchVerb $launchVerb -StrongNeg $strongNeg -WeakNeg $weakNeg -VenueQualified $venueQualified)
             # Playback test per semicolon group: "Build MLVApp; run the tests on this host" is two instructions, as it was when ';' split sentences.
@@ -604,30 +906,41 @@ function Get-LocalPlaybackPromptFindings {
             $hit = $null
             # (1) the incident phrase: "where a GUI desktop session and the clip exist" and its relatives. A phrase that opens with a quote
             # mark is a QUOTATION of the old wording (an incident report), not an instruction; the clause holding "where" must not be a prohibition.
-            $m1 = [regex]::Match($s, $incident)
+            $m1 = (Get-LintRegex $patterns.Incident).Match($s)
             if ($m1.Success -and -not (Get-ClauseAt -Clauses $clauses -Index $m1.Index).Strong) { $hit = 'where-a-gui-session-exists' }
             # (2) "locally" attached to a playback / smoke / MLVApp / arm instruction. FAIL CLOSED: its own clause must be a prohibition, or
             # match E1 (locally + routing preposition + venue word) or E2 (the marker opens a contrast complement). A venue word elsewhere
             # in the clause ("locally since Bachelor is busy") exempts nothing.
             if (-not $hit) {
-                foreach ($m in [regex]::Matches($s, $localMarker)) {
+                foreach ($m in (Get-LintRegex $localMarker).Matches($s)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
                     if (-not $groupPlayback[[int]$c.Group]) { continue }
                     # A prohibition exempts the marker only when it GOVERNS it: inherited from an earlier clause, or its own negation word sits
                     # before the marker. A negation that comes AFTER the marker in the same clause ("..., don't wait, then run it here") is
                     # a qualifier of something else and hides nothing (r8; it used to exempt the whole clause).
                     if ($c.Strong) {
-                        if (-not [regex]::IsMatch($c.Text, $strongNeg)) { continue }
-                        if ([regex]::IsMatch($s.Substring($c.Start, [Math]::Max(0, $m.Index - $c.Start)), $strongNeg)) { continue }
+                        $strongNegRx = Get-LintRegex $strongNeg
+                        if (-not $strongNegRx.IsMatch($c.Text)) { continue }
+                        if ($strongNegRx.IsMatch($s.Substring($c.Start, [Math]::Max(0, $m.Index - $c.Start)))) { continue }
                     }
                     if ((Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index) -and
                         -not (Test-LocalHostInScope -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters)) { continue }
+                    # C1: `locally` is the adverb of a compile step and nothing else in the sentence launches except a venue-chain drive
+                    # r3: a bare launch verb ending the line reads its object on the NEXT line (adjacent, same block; none -> $null)
+                    $nextLine = $null
+                    if ($itemIndex + 1 -lt $items.Count -and $items[$itemIndex + 1].Line -eq $items[$itemIndex].Line + 1 -and $items[$itemIndex + 1].Block -eq $block) { $nextLine = $items[$itemIndex + 1].LineText.Trim() }
+                    if (Test-CompileStepLocally -Sentence $s -Clauses $clauses -Clause $c -Index $m.Index -CompilePiece $patterns.CompilePiece -DriveTail $patterns.DriveTail -DriveBare $patterns.DriveBare -DriveNext $patterns.DriveNext -NextDefeaters $triggers -NextLine $nextLine -LaunchObject $patterns.LaunchObject -HostPatterns $hostDefeaters) { continue }
                     # E1 is strictly terminal (r10): the rest of the sentence and of the block must be in the closed, verbless allow-grammar
                     # (Test-VenueTerminalTail). r12: the HEAD is read the same way -- everything of this sentence before `locally` (every
                     # earlier clause, every earlier ';' group, the marker clause's own prefix) must be in the closed head grammar, and so
                     # must every earlier item of the block. The head grammar has no host list to miss: a word it does not name voids E1.
                     $e1End = Get-VenueRoutedLocallyEnd -Sentence $s -Clause $c -Index $m.Index -VenueLocus $venueLocus -Prepositions $routingLocally
                     if ($e1End -ge 0) {
+                        if ($null -eq $headState) {
+                            $grammars = Get-LintPatternSet -WithGrammars
+                            $tailState = @{ Grammar = $grammars.TailGrammar; NextDirty = $null }
+                            $headState = @{ HeadGrammar = $grammars.HeadGrammar; ItemGrammar = $grammars.ItemGrammar; Cursor = 0; Block = -1; Flag = $false }
+                        }
                         $headBenign = (Test-HeadGrammar -Head $s.Substring(0, $m.Index) -Grammar $headState.HeadGrammar) -and
                             (-not (Test-EarlierItemDirty -Items $items -Index $itemIndex -State $headState))
                         if ($headBenign -and (Test-VenueTerminalTail -Remainder $s.Substring($e1End) -Items $items -Index $itemIndex -State $tailState)) { continue }
@@ -638,7 +951,7 @@ function Get-LocalPlaybackPromptFindings {
             # (3) "on this host / the hub (VM)" attached to a playback launch; a negation or a venue word in that clause exempts it (master's
             # exemption, clause-scoped), as does E2
             if (-not $hit) {
-                foreach ($m in [regex]::Matches($s, $hostMarker)) {
+                foreach ($m in (Get-LintRegex $hostMarker).Matches($s)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
                     if (-not $groupPlayback[[int]$c.Group]) { continue }
                     if (-not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-on-this-host'; break }
@@ -646,18 +959,83 @@ function Get-LocalPlaybackPromptFindings {
             }
             # (3b) a bare "here" is weak evidence, so the launch verb and the playback word must sit in the same clause as the word
             if (-not $hit) {
-                foreach ($m in [regex]::Matches($s, $hereMarker)) {
+                foreach ($m in (Get-LintRegex $hereMarker).Matches($s)) {
                     $c = Get-ClauseAt -Clauses $clauses -Index $m.Index
                     if ($c.HasVerb -and ($c.Text -match $playbackWord) -and -not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeaters) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m.Index))) { $hit = 'run-playback-here'; break }
                 }
             }
-            # (4) a direct command line: the app with a playback mode, or a tracked launcher called with a parameter
+            # (4) a direct command line: the app with a playback mode, or a tracked launcher called with a parameter.
+            # r14 (NA2-RULE4-PER-LAUNCHER-SCOPE-1): EVERY launcher occurrence is scored on its own. [regex]::Match returned only the first
+            # occurrence of each pattern, so a venue-routed first launcher ended the scan and exempted an unrouted second one after a
+            # semicolon / "then" / "and". One launcher is often matched by two patterns (pwsh -File <script>, <script> -Param): spans that
+            # overlap are ONE occurrence.
             if (-not $hit) {
-                foreach ($pattern in $direct) {
-                    $m4 = [regex]::Match($s, $pattern)
-                    if (-not $m4.Success) { continue }
-                    $c = Get-ClauseAt -Clauses $clauses -Index $m4.Index
-                    if (-not ($c.Strong -or $c.Weak -or (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeatersLaunch) -or (Test-ContrastLead -Sentence $s -Clause $c -Index $m4.Index))) { $hit = 'direct-playback-launch'; break }
+                $launchSpans = New-Object System.Collections.Generic.List[object]
+                for ($pi = 0; $pi -lt $patterns.Direct.Count; $pi++) {
+                    foreach ($m4 in (Get-LintRegex $patterns.Direct[$pi]).Matches($s)) {
+                        # NA2-RULE4-SENTENCE-SPLIT-AND-CODESPAN-APP-1 (refuse-only): an app or script token closed by a backtick right after it is a
+                        # launch only since amend (a). Such a span does not count as the sentence's direct launch below, so the r10 reading the
+                        # sentence had without it (ClipMention and AppBare next to a mode flag) still runs: `Build `<app>`; then run `<app>` <clip>
+                        # <mode> on Bachelor.` stays refused.
+                        $tokenEnd = if ($pi -eq 0) { $m4.Value.IndexOf('.exe', [StringComparison]::OrdinalIgnoreCase) + 4 } elseif ($pi -eq 2) { $m4.Value.LastIndexOf('.ps1', [StringComparison]::OrdinalIgnoreCase) + 4 } else { -1 }
+                        $spanOnly = $tokenEnd -ge 4 -and $tokenEnd -lt $m4.Value.Length -and $m4.Value[$tokenEnd] -eq [char]96
+                        $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = ($pi -eq 0); CodeSpanOnly = $spanOnly; Pi = $pi; Value = [string]$m4.Value })
+                    }
+                }
+                # r4b: an app launch with a clip argument is one launcher of its own (an app span: it never merges)
+                # r10 (B6): scored in a sentence that holds a direct launch OR a playback mode flag anywhere (a `;` may cut the two apart)
+                # (an orphan mode flag of an adjacent sentence counts as one of this sentence: `Run <app> <clip>. Add <mode>.`)
+                $hasModeFlag = $modeRx.IsMatch($s) -or $neighbourMode
+                $hasDirectLaunch = @($launchSpans | Where-Object { -not $_.CodeSpanOnly }).Count -gt 0
+                if ($hasDirectLaunch) {
+                    foreach ($m4 in (Get-LintRegex $patterns.ClipLaunch).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
+                }
+                elseif ($hasModeFlag) {
+                    # no direct launch: the mode flag was cut off by the `;` or sits out of the app's reach. An app token with no argument is a
+                    # mention, not a launch, unless NOTHING else in the sentence is. With a direct launch present, `Build <app>; then run <app>
+                    # <mode> on Bachelor.` stays a pass.
+                    foreach ($m4 in (Get-LintRegex $patterns.ClipMention).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
+                    foreach ($m4 in (Get-LintRegex $patterns.AppBare).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
+                    if ($neighbourMode) {
+                        foreach ($m4 in (Get-LintRegex $patterns.AppEnd).Matches($s)) { $launchSpans.Add([pscustomobject]@{ Start = [int]$m4.Index; End = [int]($m4.Index + $m4.Length); App = $true }) }
+                    }
+                }
+                $occurrences = New-Object System.Collections.Generic.List[object]
+                foreach ($sp in @($launchSpans | Sort-Object -Property @{ Expression = 'Start'; Descending = $false }, @{ Expression = 'End'; Descending = $true })) {
+                    $last = if ($occurrences.Count -gt 0) { $occurrences[$occurrences.Count - 1] } else { $null }
+                    $spClause = Get-ClauseAt -Clauses $clauses -Index $sp.Start
+                    # r2: spans that START in different clauses are different launchers, however they overlap; only same-clause spans merge.
+                    # r4: and only the two spans of ONE pwsh call merge (pwsh -File <script>, <script> -Param); an app span is one launcher per
+                    # match and never absorbs, or is absorbed by, another span (its gap no longer stops at a pwsh token).
+                    if ($last -and -not $last.App -and -not $sp.App -and $sp.Start -lt $last.End -and [object]::ReferenceEquals($last.Clause, $spClause)) { $last.Merged = $true; if ($sp.End -gt $last.End) { $last.End = $sp.End } }
+                    else { $occurrences.Add([pscustomobject]@{ Start = $sp.Start; End = $sp.End; Clause = $spClause; App = $sp.App; Pi = $sp.Pi; Value = $sp.Value; Merged = $false }) }
+                }
+                # r4 (Dot advisory 68040a98): the occurrences are sorted by start and a clause is a contiguous range, so the launchers of one
+                # clause are one contiguous run; each run is read once (r3 rescanned every occurrence for its clause mates: quadratic).
+                $i = 0
+                while (-not $hit -and $i -lt $occurrences.Count) {
+                    $c = $occurrences[$i].Clause
+                    $j = $i
+                    while ($j + 1 -lt $occurrences.Count -and [object]::ReferenceEquals($occurrences[$j + 1].Clause, $c)) { $j++ }
+                    for ($k = $i; $k -le $j; $k++) {
+                        $occ = $occurrences[$k]
+                        if ($j -eq $i) { $routed = $true }
+                        else {
+                            # Two launchers in ONE clause ("... -Backend cpu on Bachelor, ... -Backend cuda"): a venue locus routes only the launcher
+                            # whose own stretch of the clause holds it (the first launcher's stretch also holds the clause lead-in).
+                            $segStart = if ($k -eq $i) { [int]$c.Start } else { [int]$occ.Start }
+                            $segEnd = if ($k -lt $j) { [int]$occurrences[$k + 1].Start } else { [int]$c.End }
+                            # Never wider than the clause test: Test-VenueExempts below must hold for the clause AND this launcher's own stretch must be routed.
+                            $routed = [bool]($segEnd -gt $segStart -and $s.Substring($segStart, $segEnd - $segStart) -match $venueQualified)
+                        }
+                        $exempt = $c.Strong -or $c.Weak -or
+                            ($routed -and (Test-VenueExempts -Sentence $s -Clauses $clauses -Clause $c -HostPatterns $hostDefeatersLaunch)) -or
+                            (Test-ContrastLead -Sentence $s -Clause $c -Index $occ.Start) -or
+                            # C2: the bare `<launcher> -Param` form inside a parenthetical that a read-only verb introduces is a mention
+                            (($occ.Pi -eq 2) -and -not $occ.Merged -and (Test-ReadOnlyLauncherMention -Sentence $s -Clauses $clauses -Clause $c -SpanStart $occ.Start -SpanValue $occ.Value -MentionPre $patterns.MentionPre -Relative $patterns.MentionRelative -MentionPost $patterns.MentionPost -MentionDefeaters $patterns.MentionDefeaters))
+                        if (-not $exempt) { $hit = 'direct-playback-launch'; break }
+                    }
+                    $i = $j + 1
                 }
             }
             if ($hit) {

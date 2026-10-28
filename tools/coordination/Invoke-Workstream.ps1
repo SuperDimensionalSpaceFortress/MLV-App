@@ -357,6 +357,23 @@ function Write-DispatchReservation {
     return [pscustomobject]$row
 }
 
+function Add-DispatchLogRow {
+    # LEDGER-APPEND-ATOMIC-WORKSTREAM-LOG-1: pwsh 7 Add-Content (FileMode.Append) loses rows when two dispatches
+    # finish together (~14 % across 6 writers). Same machine-wide mutex as Write-DispatchReservation above, so
+    # the dispatch log needs no second lock order; Add-Content is kept, so the bytes are unchanged.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Record)
+    $logMutex = [Threading.Mutex]::new($false, 'Global\MLV-App-DispatchLedger')
+    $logHeld = $false
+    try {
+        try { $logHeld = $logMutex.WaitOne(30000) } catch [Threading.AbandonedMutexException] { $logHeld = $true }
+        if (-not $logHeld) { throw 'dispatch log lock timeout' }
+        Add-Content -LiteralPath $Path -Value ($Record | ConvertTo-Json -Compress) -Encoding UTF8
+    } finally {
+        if ($logHeld) { $logMutex.ReleaseMutex() }
+        $logMutex.Dispose()
+    }
+}
+
 function Test-KillSwitchArmed { return (Test-Path -LiteralPath $KillSwitch) }
 
 function Test-RatioDispatchPermission {
@@ -986,6 +1003,12 @@ contradicting a deployment claim. A control proving your HASH CHECK discriminate
 prove you tested the right MACHINE: a falsifier on the mechanism is not a falsifier on the
 venue. (Measured 2026-09-04: a lane read PresentMon MISSING at C:\mlvtmp\mlv-agent\cache\
 from this VM and reported it as contradicting the card, while the GPU host was unreachable.)
+NEVER LIST \\bachelor\mlv-agent\processed OR \outbox UNBOUNDED (ls, ls -t, dir, find, or
+Get-ChildItem without a bound): they hold thousands of entries, and ``ls -t`` opens every file over
+SMB so Defender scans each one (2026-10-17: one listing ran >10 min at about one host core). Probe
+one job by exact name (outbox\<jobId>.result.json), or run
+tools\profiling\agent-share\Get-AgentShareRecent.ps1 -Directory outbox -First 20 (or -JobId <id>).
+Entries older than 14 days are moved under <share>\archive\<dir>\<yyyy-MM>\ (-IncludeArchive).
 
 ## MEASUREMENT DISCIPLINE THAT ALREADY COST THIS BOARD REAL TIME
 - EVERY PLAYBACK NUMBER CARRIES ITS CONFIGURATION OR IT CARRIES NOTHING. Legs here have run with
@@ -1094,7 +1117,7 @@ $fence
         laneCostUsd     = $reservationRecord.laneCostUsd
         laneCostReported = $reservationRecord.laneCostReported
     }
-    Add-Content -LiteralPath $LogPath -Value ($record | ConvertTo-Json -Compress) -Encoding UTF8
+    Add-DispatchLogRow -Path $LogPath -Record $record
 
     Write-DispatchAttempt -Outcome 'launched' -Cause 'lane-returned' -ExitCode 0 -LaneExitCode $laneExit
     Write-Output "WORKSTREAM: dispatched, laneExit=$laneExit runDir=$runDir"
@@ -1448,7 +1471,7 @@ $fence
         laneCostUsd     = $reservationRecord.laneCostUsd
         laneCostReported = $reservationRecord.laneCostReported
     }
-    Add-Content -LiteralPath $LogPath -Value ($record | ConvertTo-Json -Compress) -Encoding UTF8
+    Add-DispatchLogRow -Path $LogPath -Record $record
 
     Write-DispatchAttempt -Outcome 'launched' -Cause 'lane-returned' -ExitCode 0 -LaneExitCode $laneExit
     Write-Output "WORKSTREAM: dispatched, laneExit=$laneExit runDir=$runDir workDir=$laneWorkDir"

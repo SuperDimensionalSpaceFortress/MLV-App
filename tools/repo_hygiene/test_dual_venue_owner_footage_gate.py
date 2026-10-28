@@ -164,8 +164,18 @@ ROUTE_DELETE_ALLOWED = {
         "publishes a share-side `.sidepart` this call wrote and hash-verified into the inbox, no -Force (a dual-venue leg submits no side file).",
     ("UmRunDrop.psm1", "if (Test-Path -LiteralPath $part) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }"):
         "removes the same share-side `.sidepart` copy this call made when its publish failed.",
-    ("UmRunDrop.psm1", "if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }"):
-        "removes this call's own job-script temp file in the inbox (two sites share the line).",
+    ("UmRunDrop.psm1", "if (-not $jobPlaced -and (Test-Path -LiteralPath $tmp)) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }"):
+        "LEASE-NOT-AFTER-SUBMITTER-DEADLINE-TIMING-1 r6 (Dot 77250bdf): the job temp after a failed placement (or a failed copy), the only removal "
+        "site for it. $tmp is assigned once, Join-Path $Inbox \"$id.$nonce.job.tmp\": a leaf in this drop's own inbox named with this call's fresh "
+        "GUID nonce and a JobId that passed UMRUN_JOBID_INVALID (no separator), so only a file this call created can carry it; after a successful "
+        "rename ($jobPlaced) nothing is touched.",
+    ("UmRunDrop.psm1", "[IO.File]::Move($repubTmp, $metaFinal, $true)"):
+        "r6 (Dot 77250bdf): the not-after re-publish. Source $repubTmp = $metaTmp, this call's own claim temp name (Join-Path $Inbox "
+        "\"$id.$nonce.meta.tmp\"), written and read back one step earlier; destination $metaFinal = Join-Path $Inbox \"$id.meta.json\", this call's "
+        "own claim, replaced only after the nonce read back from it is this call's. Both are leaves of the drop's own inbox; neither can be footage.",
+    ("UmRunDrop.psm1", "if (Test-Path -LiteralPath $repubTmp) { Remove-Item -LiteralPath $repubTmp -Force -ErrorAction SilentlyContinue }"):
+        "r6 (Dot 77250bdf): removes the same re-publish temp ($repubTmp = $metaTmp, this call's own nonce-named claim temp in its own inbox) when "
+        "the re-publish above failed before its Move.",
     ("UmRunDrop.psm1", "Move-Item -LiteralPath $tmp -Destination $final -ErrorAction Stop"):
         "publishes the job script into the inbox, no -Force: a job is never replaced.",
     ("UmRunDrop.psm1", "Remove-Item -LiteralPath $metaFinal -Force -ErrorAction Stop"):
@@ -187,9 +197,73 @@ ROUTE_DELETE_ALLOWED = {
         "(<claim dir>\\<venue>.tickets) filtered by the ticket-name pattern or the ticket object New-VenueTicket returned, and the delete runs only after the open "
         "handle re-read the file's own JSON (its nonce, or the exact stale bytes judged); a footage name cannot equal either. test_venue_chain_runner and "
         "test_venue_claim_fifo pin release, stale-break, ticket end and ticket sweep.",
+    ("VenueChain.psm1", "[IO.File]::Move($tmp, $A.path, $true)"):
+        "BACHELOR-LEASE-BATCH-LEGS-1 r5: the runner-liveness sidecar writer ($script:LivenessWriteText) publishes the tmp file it wrote one line earlier "
+        "($A.path + '.' + <guid> + '.tmp') over the job's own sidecar <AgentShare>\\notafter\\<jobId>.json in one replacing rename. $A.path is built only by "
+        "New-VenueJobLivenessWrite from the agent share, the fixed folder notafter and the job id the batch runner minted for its own lease open "
+        "(lease-batch-open-<stamp>-lb<token>); the destination is that one sidecar, never a clip, and the notafter folder is never created here.",
+    ("VenueChain.psm1", "} catch { '<WRITE_FAILED> ' + ($_.Exception.Message -replace '\\s+', ' ') } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }"):
+        "BACHELOR-LEASE-BATCH-LEGS-1 r5b: the same sidecar writer's finally clause removes only $tmp, the `<jobId>.json.<guid>.tmp` copy this call made beside the "
+        "job's own sidecar, and only while it is still there (a successful move has already consumed it). Fixed-name leaf, no wildcard, no -Recurse; the guid "
+        "suffix means a footage name cannot equal it.",
+    ("VenueChain.psm1", '$r = Invoke-VenueBoundedRead -ScriptText \'if (Test-Path -LiteralPath $args[0] -PathType Leaf) { Remove-Item -LiteralPath $args[0] -Force; if (Test-Path -LiteralPath $args[0]) { "<PRESENT>" } else { "<REMOVED>" } } else { "<ABSENT>" }\' -Argument $path -TimeoutSec 30'):
+        "BACHELOR-LEASE-BATCH-LEGS-1 r5: Stop-VenueJobLiveness -Remove deletes the one file <AgentShare>\\notafter\\<jobId>.json, the runner-liveness sidecar this "
+        "run kept for its own lease open (jobId = lease-batch-open-<stamp>-lb<token>, minted by Invoke-VenueLeaseBatch), after the open's result is in hand or its "
+        "lease receipt was found. The path is the Start-VenueJobLiveness share plus the fixed folder and the .json suffix, only when it is a leaf, no wildcard, no "
+        "-Recurse; the sidecar is the runner's own liveness note, never a clip.",
 }
 
 TRAILING_COMMENT = re.compile(r"\s+#\s.*$")
+
+# ---- the leg submits no side file --------------------------------------------------------------------
+
+# A dual-venue file that hands um-run side files -> why none of them can be owner footage. An entry holds only while side_file_problems() below finds the file
+# OFF the owner-leg route (no leg source names it), naming no clip / footage / consent, and refusing every side file that is not its build package before the
+# side-file list is built. Everything else under dual-venue/ still may not pass one.
+SIDE_FILE_ALLOWED = {
+    "Invoke-VenueStageNightly.ps1":
+        "UM-REGULAR-BASELINE-STAGE-1: the nightly stager puts a BUILD into the venue cache and is not a leg. Its side files are this sha's build package (the "
+        "DLL-pair source zip and the four artifacts playback-attr-3-cuda-stage-job.ps1 verifies as inboxSideFiles), and Assert-StagePackageSideFile refuses "
+        "any other leaf name, or any path outside -BuildRoot, before um-run is called.",
+}
+# The sources a dual-venue owner leg actually runs (besides ROUTE_PS_SOURCES / ROUTE_PY_SOURCES); none may name a SIDE_FILE_ALLOWED file.
+LEG_SOURCES = ("Invoke-VenueLeg.ps1", "DualVenueRunner.psm1", "New-VenueSheetPair.ps1")
+SIDE_FILE_GUARD = {"Invoke-VenueStageNightly.ps1": "Assert-StagePackageSideFile -Side $Side"}
+FOOTAGE_NAME = re.compile(r"(?i)clip|footage|consent")
+
+
+def _code_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+
+
+def side_file_problems(profiling: Path = PROFILING) -> list[str]:
+    """What breaks "an owner leg hands um-run no side file" under `profiling`/dual-venue."""
+    dual_venue = profiling / "dual-venue"
+    problems = []
+    for path in sorted(dual_venue.glob("*.ps*1")):
+        if "-SideFile" in path.read_text(encoding="utf-8") and path.name not in SIDE_FILE_ALLOWED:
+            problems.append(f"{path.name}: names -SideFile; an owner leg must never hand um-run a side file")
+    leg = [dual_venue / name for name in LEG_SOURCES] + [profiling / name for name in ROUTE_PS_SOURCES + ROUTE_PY_SOURCES]
+    for name in SIDE_FILE_ALLOWED:
+        path = dual_venue / name
+        if not path.is_file():
+            problems.append(f"{name}: SIDE_FILE_ALLOWED names a file that does not exist; delete the entry")
+            continue
+        text = path.read_text(encoding="utf-8")
+        code = "\n".join(_code_lines(text))
+        if "-SideFile" not in code:
+            problems.append(f"{name}: no longer passes a side file; delete its SIDE_FILE_ALLOWED entry")
+            continue
+        for source in leg:
+            if source.is_file() and name in "\n".join(_code_lines(source.read_text(encoding="utf-8"))):
+                problems.append(f"{name}: the leg source {source.name} names it, so it is on the owner-leg route and may not pass a side file")
+        hit = FOOTAGE_NAME.search(code)
+        if hit:
+            problems.append(f"{name}: names {hit.group(0)!r} in code; a side-file sender must take no clip, footage or consent")
+        guard = SIDE_FILE_GUARD.get(name, "")
+        if not guard or guard not in code or code.index(guard) > code.index("-SideFile"):
+            problems.append(f"{name}: the package-only side-file refusal ({guard or 'none named'}) must run before the side-file list is built")
+    return problems
 
 
 def route_sources(profiling: Path = PROFILING) -> list[Path]:
@@ -323,10 +397,9 @@ class RouteDeleteSurfaceTests(unittest.TestCase):
 
     def test_the_leg_submits_no_side_file(self) -> None:
         # The staged-copy path (UmRunDrop's .sidepart) is for packages; an owner leg must never hand um-run a side file, or the clip's
-        # bytes would be copied through a share the leg does not control.
-        for path in (PROFILING / "dual-venue").glob("*.ps*1"):
-            text = path.read_text(encoding="utf-8")
-            self.assertNotIn("-SideFile", text, path.name)
+        # bytes would be copied through a share the leg does not control. A package stager off the leg route is listed in SIDE_FILE_ALLOWED.
+        self.assertEqual(side_file_problems(), [])
+        self.assertNotIn("-SideFile", (PROFILING / "dual-venue" / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8"))
 
     # ---- mutations ----------------------------------------------------------------------------
 
@@ -353,6 +426,61 @@ class RouteDeleteSurfaceTests(unittest.TestCase):
                     self.assertIn(("Invoke-VenueLeg.ps1", payload), caught, payload)
                 finally:
                     target.write_bytes(original)
+
+    def test_mutation_an_unrelated_delete_in_the_drop_is_caught_beside_its_allowed_sites(self) -> None:
+        # r6 (Dot 77250bdf): the three UmRunDrop.psm1 entries are exact lines, never a pattern -- a delete or move of any other target, or of the same
+        # temp spelled differently, still fails the guard. Mutates a copy, never the real file.
+        with tempfile.TemporaryDirectory() as tmp:
+            profiling = Path(tmp) / "profiling"
+            shutil.copytree(PROFILING / "dual-venue", profiling / "dual-venue")
+            for name in ROUTE_PS_SOURCES + ROUTE_PY_SOURCES:
+                shutil.copyfile(PROFILING / name, profiling / name)
+            self.assertEqual(sorted(route_hits(route_sources(profiling)) - set(ROUTE_DELETE_ALLOWED)), [], "the unmutated copy must pass")
+            for payload in (
+                "Remove-Item -LiteralPath $ScriptPath -Force",
+                "Remove-Item -LiteralPath $clip -Force -ErrorAction SilentlyContinue",
+                "Remove-Item -LiteralPath $repubTmp -Force",
+                "if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }",
+                "[IO.File]::Move($tmp, $metaFinal, $true)",
+                "[IO.File]::Move($repubTmp, $final, $true)",
+            ):
+                target = profiling / "UmRunDrop.psm1"
+                original = target.read_bytes()
+                try:
+                    target.write_bytes(original + b"\n" + payload.encode("utf-8") + b"\n")
+                    caught = route_hits(route_sources(profiling)) - set(ROUTE_DELETE_ALLOWED)
+                    self.assertIn(("UmRunDrop.psm1", payload), caught, payload)
+                finally:
+                    target.write_bytes(original)
+
+    def _route_copy(self, tmp: str) -> Path:
+        profiling = Path(tmp) / "profiling"
+        shutil.copytree(PROFILING / "dual-venue", profiling / "dual-venue")
+        for name in ROUTE_PS_SOURCES + ROUTE_PY_SOURCES:
+            shutil.copyfile(PROFILING / name, profiling / name)
+        self.assertEqual(side_file_problems(profiling), [], "the unmutated copy must pass")
+        return profiling
+
+    def test_mutation_a_side_file_on_the_leg_or_an_unguarded_stager_is_caught(self) -> None:
+        stager = "Invoke-VenueStageNightly.ps1"
+        guard = SIDE_FILE_GUARD[stager]
+        mutations = (
+            ("Invoke-VenueLeg.ps1", lambda t: t + "\n$r = & $umRun -ScriptPath $job -JobId $id -SideFile $clip\n", "Invoke-VenueLeg.ps1: names -SideFile"),
+            ("Invoke-VenueLeg.ps1", lambda t: t + f"\n& (Join-Path $PSScriptRoot '{stager}')\n", "on the owner-leg route"),
+            (stager, lambda t: t.replace(guard, "$null = $Side"), "must run before the side-file list is built"),
+            (stager, lambda t: t + "\n$ClipId = 'x'\n", "names 'Clip'"),
+            (stager, lambda t: t.replace("-SideFile", "-NoSideFile"), "no longer passes a side file"),
+        )
+        for victim, mutate, expected in mutations:
+            with self.subTest(victim=victim, expected=expected), tempfile.TemporaryDirectory() as tmp:
+                profiling = self._route_copy(tmp)
+                target = profiling / "dual-venue" / victim
+                text = target.read_text(encoding="utf-8")
+                mutated = mutate(text)
+                self.assertNotEqual(mutated, text)
+                target.write_text(mutated, encoding="utf-8")
+                problems = side_file_problems(profiling)
+                self.assertTrue(any(expected in p for p in problems), problems)
 
     def test_mutation_a_deleted_primitive_makes_its_exception_stale(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -38,8 +38,10 @@
 #include "PlaybackScopesDuringPlayback.h"
 #include "PlaybackSlipHistogram.h"
 #include "PlaybackStartupSplit.h"
+#include "PlaybackGpuClockKickPolicy.h"
 #include "PlaybackFirstPresentIdentity.h"
 #include "PlaybackRoutePrewarmPolicy.h"
+#include "PlaybackReconWarmRunPolicy.h"
 #include "../../src/mlv_include.h"
 #include "InfoDialog.h"
 #include "StatusDialog.h"
@@ -1213,6 +1215,10 @@ private:
     };
     QElapsedTimer m_contactSheetCaptureClock;
     QVector<qint64> m_contactSheetCaptureTargetMs;
+    // VENUE-LEG-AGXOFF-UNPACED-HEADROOM-1 r2: an unpaced measured Play keys its targets to source frames consumed
+    // (contactSheetInPassTargetDue), so a run that outpaces the wall-clock centres still takes them before it stops.
+    QVector<qint64> m_contactSheetCaptureTargetSourceFrames;
+    bool m_contactSheetCaptureUnpaced = false;
     QVector<ContactSheetPendingGrab> m_contactSheetPendingGrabs;
     int m_contactSheetCaptureNextTargetIndex = 0;
     int m_contactSheetCaptureStartFrame = 0;
@@ -1266,6 +1272,10 @@ private:
     double m_playbackSmokePresentPacingSumMs = 0.0;
     double m_playbackSmokeLlrawprocSumMs = 0.0;
     double m_playbackSmokeProcessed8SumMs = 0.0;
+    // PROCESSED8-MS-TELEMETRY-STUCK-1: presented frames whose render ran the
+    // processed8 / processed16 stage; the divisors of the processed8/16 averages.
+    int m_playbackSmokeProcessed8MeasuredFrames = 0;
+    int m_playbackSmokeProcessed16MeasuredFrames = 0;
     double m_playbackSmokeProcessed8CacheStoreSumMs = 0.0;
     double m_playbackSmokeRawUint16SumMs = 0.0;
     double m_playbackSmokeRawUint16DecompressSumMs = 0.0;
@@ -1465,6 +1475,12 @@ private:
         QString downscaleBranchLast;
         QMap<QString, quint64> refusalCounts;
         QMap<QString, quint64> downscaleBranchCounts;
+        // CPU-LOOKASSIST-PLAYBACK-COST-1: the pointwise fast path (empty refusal = it ran).
+        quint64 pointwiseFastFrames = 0;
+        double pointwiseOmpThreadsSum = 0.0;
+        int pointwiseOmpThreadsLast = 0;
+        QString pointwiseFastRefusalLast;
+        QMap<QString, quint64> pointwiseFastRefusalCounts;
     };
     PlaybackSmokePrepSpanTotals m_playbackSmokePrepSpans;
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
@@ -1560,6 +1576,8 @@ private:
     bool m_headlessPlaybackProfileActive = false;
     uint64_t m_nextRenderRequestSerial = 1;
     uint64_t m_lastPresentedRequestSerial = 0;
+    // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: the requestSerial whose pixmap m_pGraphicsItem holds (0: none / a placeholder).
+    uint64_t m_graphicsItemPresentedSerial = 0;
     GpuPreviewProcessingBackendRequest m_gpuPreviewProcessingBackendRequest =
         GpuPreviewProcessingBackendRequest::Auto;
     GpuBilinearDebayerBackendRequest m_gpuBilinearDebayerBackendRequest =
@@ -1687,6 +1705,30 @@ private:
     void runPlaybackRoutePrewarm( quint64 clipGeneration );
     bool m_playbackRoutePrewarmArmed = false;
     quint64 m_playbackRoutePrewarmClipGeneration = 0;
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-PRESENT-SETUP-1 Row B: this clip's prewarm loaded the recon backend (first_present_split)
+    bool m_playbackReconBackendPreloaded = false;
+    // PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W (PlaybackReconWarmRunPolicy.h): after the prewarm, ONE paused recon
+    // warm run per clip on the recon worker; a skip for real work pending is re-posted kRepostDelayMs later.
+    void postPlaybackReconWarm( quint64 clipGeneration );
+    void onPlaybackReconWarmDone( const RenderFrameThread::PlaybackReconWarmDone &done );
+    void schedulePlaybackReconWarmRepost( playback_recon_warm_run::Reason reason, quint64 clipGeneration );
+    bool m_playbackReconWarmPrewarmRan = false;   // this clip's route prewarm decided Run
+    int m_playbackReconWarmScale = 1;             // the Play-time scale the prewarm sized for
+    int m_playbackReconWarmPosts = 0;             // posts this clip (PlaybackReconWarmRunPolicy.h kMaxPosts)
+    bool m_playbackReconWarmRepostArmed = false;  // a re-post timer is pending
+    bool m_playbackReconWarmRan = false;          // first_present_split warm_run
+    // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K (PlaybackGpuClockKickPolicy.h): at Play, before the play-start
+    // frame request, one bounded GPU clock kick on the loaded AMaZE backend; ended (and logged) at the first present,
+    // Play stop, a clip change, a device loss, the next Play or its deadline. Also arms Row 0's session probe.
+    void beginPlaybackGpuClockKick();
+    void endPlaybackGpuClockKick( const char *site );
+    bool m_playbackGpuClockKickActive = false;
+    playback_gpu_clock_kick::Decision m_playbackGpuClockKickDecision;   // this Play's (first_present_split)
+    double m_playbackGpuClockKickBeginSteadyMs = 0.0;
+    quint64 m_playbackGpuClockKickSerial = 0;     // cancels a stale deadline timer
+    quint64 m_playbackGpuClockKickSession = 0;
+    QString m_playbackGpuClockKickEndedAt;         // the first site that asked for the end (ended_at)
+    int m_playbackGpuClockKickPendingRetries = 0;  // collects that found the feeder still draining
     void writeFirstPresentIdentity( const QString &dir, int startPosition );
     // --gui-smoke-playback only (CUDA-PERF-PLAYBACK-FOREGROUND-1): forces the main window
     // and the GPU display window to the OS foreground and verifies with

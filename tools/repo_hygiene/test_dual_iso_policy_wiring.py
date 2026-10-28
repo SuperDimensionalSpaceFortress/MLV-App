@@ -73,6 +73,63 @@ class DualIsoPolicyWiringTest(unittest.TestCase):
             % (symbols,),
         )
 
+    def _should_sync_arguments(self, source):
+        # POLICY-CALLSITE-FULL-ARG-PINS-1: the whole argument list of the one
+        # shouldSync( call, split at top-level commas, comments dropped and
+        # whitespace collapsed, so an inverted, swapped, dropped or literal
+        # argument fails here even though every substring above still matches.
+        block = self._config_bake_block(source)
+        call = "dual_iso_level_sync_policy::shouldSync("
+        at = block.index(call) + len(call)
+        depth, args, current = 1, [], []
+        for ch in block[at:]:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            if ch == "," and depth == 1:
+                args.append("".join(current))
+                current = []
+            else:
+                current.append(ch)
+        args.append("".join(current))
+        return [" ".join(re.sub(r"/\*.*?\*/", " ", a, flags=re.S).split()) for a in args]
+
+    def test_should_sync_call_pins_every_argument_by_position(self):
+        block = self._config_bake_block(self.source)
+        self.assertIn(
+            "const bool dualIsoLevelSyncSourceReady = m_pMlvObject && m_fileLoaded;",
+            block,
+        )
+        self.assertIn("/* bakePending */ true,", block)
+        self.assertEqual(
+            self._should_sync_arguments(self.source),
+            [
+                # sourceReady
+                "dualIsoLevelSyncSourceReady",
+                # bakePending
+                "true",
+                # levelsOutOfSync
+                "dualIsoLevelSyncSourceReady && mlvProcessingDualIsoBlackWhiteLevelsOutOfSync( m_pMlvObject )",
+            ],
+        )
+
+    def test_should_sync_argument_pin_rejects_an_inverted_argument(self):
+        block = self._config_bake_block(self.source)
+        broken = block.replace(
+            "shouldSync(\n                dualIsoLevelSyncSourceReady,",
+            "shouldSync(\n                !dualIsoLevelSyncSourceReady,",
+            1,
+        )
+        self.assertNotEqual(block, broken)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                self._should_sync_arguments(self.source.replace(block, broken, 1)),
+                self._should_sync_arguments(self.source),
+            )
+
     def test_call_site_preserves_wait_sync_invalidate_bake_order(self):
         self._assert_call_site_order(self.source)
 
