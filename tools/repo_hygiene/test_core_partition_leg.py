@@ -2633,6 +2633,9 @@ foreach ($k in $cases.Keys) {
     $Pub = $dir; $CorePartitionBenchMask = [int64]4095; $CorePartitionLoadMask = [int64]1044480; $CorePartitionLoadThreads = 8; $CorePartitionHelperMask = [int64]1044480
     $global:cpSaved = $null
     . ([scriptblock]::Create($post))
+    # r14 (sol r13d B1): the cleanup region only builds the record; the job publishes it once, after the snapshot comparison (the lifted
+    # Publish-CorePartitionRecord). These cases read the run log once, so the later read is that same snapshot: the success path's matching control.
+    if ($null -eq $global:cpSaved -and (Get-Command Publish-CorePartitionRecord -ea 0)) { [void](Publish-CorePartitionRecord $corePartitionRecord $corePartitionFeedSummary ([string]$cpRunLogText) ([string]$cpRunLogText) $Pub $corePartitionErrors) }
     $f = $corePartitionFeedSummary; $pf = $global:cpSaved.feed
     $out[$k] = [ordered]@{ end = $corePartitionSmokeEndMonoMs; endRead = @($corePartitionFeedEnd.monoMs, $corePartitionFeedEnd.doneMs); rows = $f.rows; watts = $f.pkgWattsMax; temp = $f.pkgTempCMax
         why = [string]$f.reasons['rows']; helperWhy = [string]$corePartitionHelperWhy; published = @($pf.windowEndMonoMs, $pf.endReadSlackMs, $pf.appLastAliveMonoMs, $pf.windowEndLagMs, $pf.endLagSlackMs) }
