@@ -619,18 +619,21 @@ function Assert-TempOutsideRunDir([string]$RunDirPath, [string]$TempPath, [strin
     if ($tp.StartsWith($runDirPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "TEMP ($Shown) is inside -RunDir (physical $TempPath)" }
 }
 
-function Get-TempReadSeamMs([string]$TempFull, [Collections.Generic.List[string]]$Ancestors) {
+function Get-TempReadSeamPlan {
     # r6: the -GuardReadDelay seam's '<guard>:rundir' on the TEMP reads after that guard, as a -RunDir that stopped answering holds the reads that reach it: TEMP's final path when
-    # TEMP is inside -RunDir (a junction into it), the identity reads when a folder from TEMP up IS -RunDir (a second name: \\localhost\C$\<RunDir>). Offline only: it reads the
-    # (answering) test folders on this thread to decide, and says the delays on stderr; production passes no seam and gets 0, 0 with no read at all.
+    # TEMP is inside -RunDir (a junction into it), the identity reads when a folder from TEMP up IS -RunDir (a second name: \\localhost\C$\<RunDir>). Offline only, and decided ONCE at
+    # the preflight (adversary r6 A4: its own reads never run after the guard); $null, and no read at all, without that seam (production).
     $d = $script:guardDelaySeam
-    if ($null -eq $d -or $d.read -cne 'rundir' -or $d.guard -cne $script:lastGuardSeam -or $null -eq $script:runDirKnown) { return @(0, 0) }
+    if ($null -eq $d -or $d.read -cne 'rundir' -or $null -eq $script:runDirKnown) { return $null }
     $resolveMs = 0; $identityMs = 0
-    $p = $null; try { $p = Get-PhysicalPath $TempFull } catch { }
-    if ($p) { try { Assert-TempOutsideRunDir $script:runDirKnown.physical $p $TempFull } catch { $resolveMs = $d.ms } }
-    foreach ($a in $Ancestors) { try { if ((Test-Path -LiteralPath $a -PathType Container) -and (Get-FileIdentity $a).key -ceq $script:runDirKnown.idKey) { $identityMs = $d.ms; break } } catch { } }
-    if ($resolveMs -or $identityMs) { [Console]::Error.WriteLine("TEMP_READ_DELAY_SEAM resolve=$resolveMs identity=$identityMs (TEMP reaches the stalled -RunDir)") }
-    @($resolveMs, $identityMs)
+    $up = Remove-TrailingSeparator ([IO.Path]::GetFullPath([IO.Path]::GetTempPath()))
+    $p = $null; try { $p = Get-PhysicalPath $up } catch { }
+    if ($p) { try { Assert-TempOutsideRunDir $script:runDirKnown.physical $p $up } catch { $resolveMs = $d.ms } }
+    while ($up -and -not $identityMs) {
+        try { if ((Test-Path -LiteralPath $up -PathType Container) -and (Get-FileIdentity $up).key -ceq $script:runDirKnown.idKey) { $identityMs = $d.ms } } catch { }
+        $up = [IO.Path]::GetDirectoryName($up)
+    }
+    ,@($resolveMs, $identityMs)
 }
 
 function Test-OpenOutputAlias {
@@ -673,7 +676,11 @@ function Test-OpenOutputAlias {
                 # identity of every folder from it up are then read on a pool thread (StartWalk) raced against the 2 s re-read of -RunDir and given up on at the same 2 s, so a
                 # TEMP that does not answer in that (a junction into the stalled -RunDir, a second name for it whose identity read stalls) fails the redirect closed too.
                 foreach ($root in @($RunDir, $(if ($script:runDirKnown) { $script:runDirKnown.physical })) | Where-Object { $_ }) { Assert-TempOutsideRunDir $root $tempFull $tempDir }
-                $tempSeam = Get-TempReadSeamMs $tempFull $ancestors
+                $tempSeam = @(0, 0)
+                if ($null -ne $script:tempSeamPlan -and $script:guardDelaySeam.guard -ceq $script:lastGuardSeam -and ($script:tempSeamPlan[0] -or $script:tempSeamPlan[1])) {
+                    $tempSeam = $script:tempSeamPlan
+                    [Console]::Error.WriteLine("TEMP_READ_DELAY_SEAM resolve=$($tempSeam[0]) identity=$($tempSeam[1]) (TEMP reaches the stalled -RunDir)")
+                }
                 $walkClock = [Diagnostics.Stopwatch]::StartNew()
                 $walk = [VenueLeaseBatchFinalPath]::StartWalk($tempFull, $ancestors.ToArray(), $tempSeam[0], $tempSeam[1])
                 $d = $script:guardDelaySeam
@@ -924,6 +931,7 @@ if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hi
 # r5 (sol r4 B1, key3 H-B): -RunDir's physical path and file identity as the preflight found them, read ONCE here, before any claim. A guard that gave up on a location read
 # (locationUnknown) may have given up on -RunDir itself, so Test-OpenOutputAlias then compares TEMP against these and never reads -RunDir again (a stalled UNC or junction would hold it).
 $script:runDirKnown = $(try { [pscustomobject]@{ physical = (Get-PhysicalPath $RunDir); idKey = (Get-FileIdentity $RunDir).key } } catch { $null })
+$script:tempSeamPlan = Get-TempReadSeamPlan   # r6: offline seam only ($null in production, no read)
 # The scalar form's one build rides on every leg, so each leg is launched with its own build in either form.
 if (-not $legPlanMode) { foreach ($p in $plan) { $p | Add-Member -NotePropertyName sourceCommit -NotePropertyValue $SourceCommit; $p | Add-Member -NotePropertyName buildManifestSha256 -NotePropertyValue $BuildManifestSha256 } }
 
