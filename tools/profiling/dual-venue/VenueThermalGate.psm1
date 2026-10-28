@@ -36,15 +36,31 @@ function Get-VenueHeatVerdict {
 }
 
 function ConvertFrom-VenueProbeHeatLine {
-    # The LAST "tele heat" line of a quiet probe's stdout -> @{ heat; throttled; window; meanC; text }. No line, or n/a values -> heat 'unknown'.
+    # A quiet probe's stdout -> @{ heat; throttled; window; meanC; text; source }. adversary r1 A2/A3: the probe's raw JSON (its "  raw <path>" line) carries
+    # heat{} as numbers (mean_c to 0.01, culture-invariant JSON), so it is read FIRST; the "tele heat" display line (mean to 0.1 C, in the probe's culture,
+    # a decimal comma included) is only the fallback. Neither readable, or n/a values -> heat 'unknown'.
     param([AllowNull()][AllowEmptyCollection()][string[]]$Lines)
+    $rawLine = @($Lines | Where-Object { $_ -match '^\s*raw (?!UNWRITABLE )(.+\.json)\s*$' }) | Select-Object -Last 1
+    if ($rawLine -and $rawLine -match '^\s*raw (.+\.json)\s*$') {
+        $h = try { $p = $Matches[1].Trim(); if (Test-Path -LiteralPath $p -PathType Leaf) { ([IO.File]::ReadAllText($p) | ConvertFrom-Json).heat } else { $null } } catch { $null }
+        if ($null -ne $h -and $h.PSObject.Properties['mean_c'] -and $h.PSObject.Properties['throttled'] -and $h.PSObject.Properties['window_rows']) {
+            $v = Get-VenueHeatVerdict -Throttled $h.throttled -MeanC $h.mean_c
+            if ($v -cne 'unknown') {
+                $thr = [int]$h.throttled; $win = $(if ($null -ne $h.window_rows) { [int]$h.window_rows } else { $null }); $mean = [double]$h.mean_c
+                return [pscustomobject]@{ heat = $v; throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.00', $script:Inv)) C"; source = 'raw-json' }
+            }
+        }
+    }
     $line = @($Lines | Where-Object { $_ -match '^\s*tele heat ' }) | Select-Object -Last 1
-    $none = [pscustomobject]@{ heat = 'unknown'; throttled = $null; window = $null; meanC = $null; text = $(if ($line) { ([string]$line).Trim() } else { 'no tele heat line' }) }
+    $none = [pscustomobject]@{ heat = 'unknown'; throttled = $null; window = $null; meanC = $null; text = $(if ($line) { ([string]$line).Trim() } else { 'no tele heat line' }); source = 'none' }
     if (-not $line) { return $none }
-    $m = [regex]::Match([string]$line, '\smean=([0-9]+(?:\.[0-9]+)?)C\s+throttled=([0-9]+)/([0-9]+)(?:\s|$)')
+    $m = [regex]::Match([string]$line, '\smean=([0-9]+(?:[.,][0-9]+)?)C\s+throttled=([0-9]+)/([0-9]+)(?:\s|$)')
     if (-not $m.Success) { return $none }
-    $mean = [double]::Parse($m.Groups[1].Value, $script:Inv); $thr = [int]::Parse($m.Groups[2].Value, $script:Inv); $win = [int]::Parse($m.Groups[3].Value, $script:Inv)
-    [pscustomobject]@{ heat = (Get-VenueHeatVerdict -Throttled $thr -MeanC $mean); throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.0', $script:Inv)) C" }
+    $mean = 0.0; $thr = 0; $win = 0
+    if (-not [double]::TryParse(($m.Groups[1].Value -replace ',', '.'), [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)) { return $none }
+    if (-not [int]::TryParse($m.Groups[2].Value, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$thr)) { return $none }   # advisory A10: an overflow is unknown, never a throw
+    if (-not [int]::TryParse($m.Groups[3].Value, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$win)) { return $none }
+    [pscustomobject]@{ heat = (Get-VenueHeatVerdict -Throttled $thr -MeanC $mean); throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.0', $script:Inv)) C"; source = 'tele-line' }
 }
 
 function Get-VenueThermalGateStep {
@@ -98,12 +114,20 @@ function Read-VenueLegHeatHistory {
         $d++
         $f = Join-Path $dir 'batches.jsonl'
         if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { $skipped.Add("$dir (no batches.jsonl)"); continue }
-        foreach ($line in [IO.File]::ReadAllLines($f)) {
+        # adversary r1 A7: a file that cannot be read (held exclusively, gone) is skipped and named, never a throw that refuses the whole plan
+        $lines = try { [IO.File]::ReadAllLines($f) } catch { $skipped.Add("$f (unreadable: $($_.Exception.Message -replace '\s+', ' '))"); continue }
+        foreach ($line in $lines) {
             if (-not $line.Trim()) { continue }
             $b = try { $line | ConvertFrom-Json } catch { $null }
-            if ($null -eq $b -or -not $b.PSObject.Properties['legs']) { $skipped.Add("$f (unreadable line)"); continue }
+            if ($null -eq $b -or $b -isnot [System.Management.Automation.PSCustomObject] -or -not $b.PSObject.Properties['legs']) { $skipped.Add("$f (unreadable line)"); continue }
+            # adversary r1 A8: one lease is one batch receipt (token), not one batch number: a reused -RunDir numbers its batches from 1 again
+            $lease = $(if ($b.PSObject.Properties['token'] -and $b.token) { [string]$b.token } elseif ($b.PSObject.Properties['batch']) { "batch$($b.batch)" } else { "line$($rows.Count)" })
+            $unnamed = 0
             foreach ($l in @($b.legs)) {
-                if ($null -eq $l -or -not $l.PSObject.Properties['name']) { continue }
+                if ($null -eq $l -or $l -isnot [System.Management.Automation.PSCustomObject]) { continue }
+                # adversary r1 A5: a scalar-run row carries no leg name (Add-PlanIdentity names -LegPlan rows only): counted and named in .skipped, never silently dropped
+                if (-not $l.PSObject.Properties['name'] -or -not $l.name) { $unnamed++; continue }
+                if (-not $l.PSObject.Properties['status']) { $unnamed++; continue }
                 $backend = $(if ($l.PSObject.Properties['backend']) { [string]$l.backend } else { '' })
                 $arm = $(if ($l.PSObject.Properties['arm']) { [string]$l.arm } else { '' })
                 $heat = 'unknown'
@@ -115,8 +139,9 @@ function Read-VenueLegHeatHistory {
                         if ($null -ne $a -and $a.PSObject.Properties['admission'] -and $null -ne $a.admission -and $a.admission.PSObject.Properties['heat'] -and [string]$a.admission.heat -cin @('hot', 'clear')) { $heat = [string]$a.admission.heat }
                     }
                 }
-                $rows.Add([pscustomobject]@{ batch = "$d.$($b.batch)"; key = (Get-VenueLegKeyFromName -Name ([string]$l.name) -Backend $backend -Arm $arm); name = [string]$l.name; status = [string]$l.status; heat = $heat })
+                $rows.Add([pscustomobject]@{ batch = "$d.$lease"; key = (Get-VenueLegKeyFromName -Name ([string]$l.name) -Backend $backend -Arm $arm); name = [string]$l.name; status = [string]$l.status; heat = $heat })
             }
+            if ($unnamed -gt 0) { $skipped.Add("$f lease $lease ($unnamed leg rows with no leg name or status: a scalar run's rows cannot be keyed)") }
         }
     }
     [pscustomobject]@{ rows = @($rows); skipped = @($skipped) }

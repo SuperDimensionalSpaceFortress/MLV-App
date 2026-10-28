@@ -112,6 +112,37 @@ class ThermalGateModuleTests(unittest.TestCase):
         self.assertEqual(na["heat"], "unknown")
         self.assertEqual(ps_json("ConvertFrom-VenueProbeHeatLine -Lines @('QUIET mean=5.0%')")["heat"], "unknown")
 
+    def test_adversary_a2_a3_a10_raw_json_first_decimal_comma_and_overflow(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-raw-"))
+        raw = d / "venue-quiet-probe-x.json"
+        # A2: the agent's mean 87.96 is clear; the display line rounds it to 88.0C, which alone would read hot. The raw JSON is read first.
+        raw.write_text(json.dumps({"heat": {"mean_c": 87.96, "throttled": 0, "window_rows": 60}}), encoding="utf-8")
+        got = ps_json(f"ConvertFrom-VenueProbeHeatLine -Lines @('  raw {raw}', '  tele heat source=x age=1.0s hottest=50.0C max15=60.0C mean=88.0C throttled=0/60 W=1')")
+        self.assertEqual((got["heat"], got["source"], got["meanC"]), ("clear", "raw-json", 87.96))
+        # A3: a probe in a decimal-comma culture prints mean=89,0C: hot, not unknown
+        got = ps_json("ConvertFrom-VenueProbeHeatLine -Lines @('  tele heat source=x age=1,0s hottest=50,0C max15=60,0C mean=89,0C throttled=0/60 W=1')")
+        self.assertEqual(got["heat"], "hot")
+        # A10: an overflowing count is unknown, never a throw
+        got = ps_json("ConvertFrom-VenueProbeHeatLine -Lines @('  tele heat mean=70.0C throttled=2147483648/60 W=1')")
+        self.assertEqual(got["heat"], "unknown")
+
+    def test_adversary_a5_a7_a8_history_is_lease_scoped_and_never_throws(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-hist-"))
+        # A8: a reused run dir numbers its batches from 1 again: two leases (tokens) with batch=1 never chain a key across them
+        recs = [{"batch": 1, "token": "t1", "legs": [{"name": "01-a-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": "clear"}]},
+                {"batch": 1, "token": "t2", "legs": [{"name": "01-b-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": "hot"}]},
+                # A7: rows missing batch / status are skipped, not a strict-mode throw
+                {"legs": [{"name": "01-c-cpu-A", "backend": "cpu", "arm": "A"}]},
+                # A5: a scalar run's rows carry no name: named in skipped, not silently dropped
+                {"batch": 3, "token": "t3", "legs": [{"status": "RAN", "class": "QUIET_PRELOAD_OK"}, {"status": "RAN"}]}]
+        (d / "batches.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n", encoding="utf-8")
+        got = ps_json(f"$h = Read-VenueLegHeatHistory -RunDir @('{d}'); $k = Get-VenueHeavyLegKeys -Rows @($h.rows); [pscustomobject]@{{ rows = @($h.rows).Count; heavy = @($k.Keys); skipped = @($h.skipped) }}")
+        self.assertEqual((got["rows"], got["heavy"]), (2, []), got)
+        self.assertTrue(any("2 leg rows with no leg name" in s for s in got["skipped"]), got["skipped"])
+        self.assertTrue(any("1 leg rows with no leg name or status" in s for s in got["skipped"]), got["skipped"])
+
     def test_gate_step_paths_wait_cool_run_and_cap_skip(self) -> None:
         # a stub clock and a stub heat sequence through the pure step: wait (hot, under the cap), cool (clear -> run, waitSec kept), cap skip (hot at 180 s)
         got = ps_json(
@@ -195,7 +226,7 @@ class ThermalGateRunnerTests(unittest.TestCase):
         self.assertIn("heat=hot (throttled 9/60, mean 70.0 C)", self.log())
 
     def test_cap_skip_requeues_the_hot_leg_and_runs_the_next_one_first(self) -> None:
-        r = self.run_batch(self.specs[:2], "-ThermalWaitCapSec", "2", FAKE_HEAT="HOT_UNTIL_SKIP")
+        r = self.run_batch(self.specs[:2], "-ThermalWaitCapSec", "3", FAKE_HEAT="HOT_UNTIL_SKIP")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         legs = [x.split(":")[1] for x in self.kinds() if x.startswith("LEG:")]
         self.assertEqual(legs, ["fx-b", "fx-a"], "fx-a skipped hot and re-queued: fx-b ran first, fx-a after, and neither ran hot")
@@ -203,11 +234,14 @@ class ThermalGateRunnerTests(unittest.TestCase):
         skip = [l for l in b["legs"] if l["status"] == "THERMAL_HOT_SKIPPED"]
         self.assertEqual(len(skip), 1, b["legs"])
         self.assertEqual((skip[0]["requeued"], skip[0]["outcome"], skip[0]["counted"], skip[0]["heatAtProbe"]), (True, "NOT_RUN", False, "hot"))
-        self.assertGreaterEqual(skip[0]["thermalWaitSec"], 2)
+        # adversary r1 A9: the skip never waits past the cap (a re-probe that could not end inside it is not started)
+        self.assertLessEqual(skip[0]["thermalWaitSec"], 3, skip[0])
         ran = [l for l in b["legs"] if l["status"] == "RAN"]
         self.assertEqual([l["heatAtLaunch"] for l in ran], ["clear", "clear"])
+        # adversary r1 A6: the re-queued fx-a's first reading is taken again after its new predecessor (fx-b), not kept from before the skip
         self.assertEqual(b["thermalSkips"], 1)
         res = tvlb.batch_result(r.stdout)
+        self.assertEqual([(l["name"], l["heatAtProbe"]) for l in res["legs"]], [("02-fx-b-spec", "clear"), ("01-fx-a-spec", "clear")], res["legs"])
         self.assertEqual((res["ran"], res["thermalSkipped"], res["notRun"]), (2, 0, 0))
         self.assertIn("LEG 01-fx-a-spec THERMAL_HOT_SKIPPED batch=1 heat=hot", self.log())
 

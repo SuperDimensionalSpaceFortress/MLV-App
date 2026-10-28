@@ -1061,7 +1061,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 $attempt++
                 $probeWait = [int][Math]::Max(0, [Math]::Min($ProbeMaxWaitSec, $room - $legBudget))
+                $tProbe = [DateTime]::UtcNow
                 $q = Invoke-QuietProbe $leg.name "b$('{0:00}' -f $batchNo)-a$attempt" $probeWait
+                $probeSec = [int][Math]::Ceiling(([DateTime]::UtcNow - $tProbe).TotalSeconds)
                 if ($q.foreignFloor -and -not $legForeign.ContainsKey($leg.name)) { $legForeign[$leg.name] = $q.foreignFloorLine }
                 L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease exit=$($q.code) verdict=$($q.verdict) mean=$(Format-Mean $q.mean) maxWaitSec=$probeWait roomSec=$room$(if ($q.reason) { " reason=$($q.reason)" })$(if ($q.foreignFloor) { ' foreignFloor=1' })"
                 if ($q.verdict -ceq 'USAGE') { $b.endReason = 'PROBE_USAGE'; Set-Stop 'USAGE' 2; break }
@@ -1086,10 +1088,14 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # hot -> re-probe every -ThermalPollSec up to -ThermalWaitCapSec from the first hot reading in this batch; still hot then -> THERMAL_HOT_SKIPPED and
                 # re-queued at the end (at most -ThermalRequeueMax times, then the leg is THERMAL_HOT_SKIPPED for good), never run and discarded. Unknown heat runs.
                 $th = $legThermal[$leg.name]
-                if ($null -eq $th) { $th = [ordered]@{ firstHeat = $q.heat; firstHeatText = $q.heatText; firstHotUtc = $null; batch = $batchNo; waitSec = 0; polls = 0; skips = 0 }; $legThermal[$leg.name] = $th }
-                if ($th.batch -ne $batchNo) { $th.firstHotUtc = $null; $th.batch = $batchNo }
+                if ($null -eq $th) { $th = [ordered]@{ firstHeat = $null; firstHeatText = $null; firstHotUtc = $null; batch = $batchNo; waitSec = 0; polls = 0; skips = 0 }; $legThermal[$leg.name] = $th }
+                # adversary r1 A6: the first reading belongs to the leg's CURRENT predecessor, so it is taken again after a re-queue or in a new batch
+                if ($th.batch -ne $batchNo) { $th.firstHotUtc = $null; $th.firstHeat = $null; $th.batch = $batchNo }
+                if ($null -eq $th.firstHeat) { $th.firstHeat = $q.heat; $th.firstHeatText = $q.heatText }
                 $gs = $(if ($ThermalWaitCapSec -gt 0) { Get-VenueThermalGateStep -Heat $q.heat -FirstHotUtc $th.firstHotUtc -NowUtc ([DateTime]::UtcNow) -CapSec $ThermalWaitCapSec } else { [pscustomobject]@{ step = 'RUN'; firstHotUtc = $null; waitSec = 0; remainingSec = 0 } })
                 $th.firstHotUtc = $gs.firstHotUtc; $th.waitSec = $gs.waitSec
+                # adversary r1 A9: a re-probe is started only if it can end inside the cap (the last probe's own duration counts), so a skip never waits past it
+                if ($gs.step -ceq 'WAIT' -and ($gs.waitSec + [Math]::Min($ThermalPollSec, $gs.remainingSec) + $probeSec) -gt $ThermalWaitCapSec) { $gs = [pscustomobject]@{ step = 'SKIP'; firstHotUtc = $gs.firstHotUtc; waitSec = $gs.waitSec; remainingSec = 0 } }
                 if ($gs.step -ceq 'WAIT') {
                     $roomNow = [int](($leaseEnd - [DateTime]::UtcNow).TotalSeconds) - $LeaseMarginSec
                     if (($roomNow - $legBudget) -lt 1) {
@@ -1104,8 +1110,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 if ($gs.step -ceq 'SKIP') {
                     $th.skips++; $requeue = ($th.skips -le $ThermalRequeueMax); $th.firstHotUtc = $null
+                    $skipFirstHeat = $th.firstHeat; $skipFirstHeatText = $th.firstHeatText; $th.firstHeat = $null; $th.firstHeatText = $null
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'THERMAL_HOT_SKIPPED'; outcome = 'NOT_RUN'; class = 'THERMAL_HOT_SKIPPED'; counted = $false
-                        thermalWaitSec = $gs.waitSec; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText; heatAtSkip = $q.heatText; skips = $th.skips; requeued = $requeue }
+                        thermalWaitSec = $gs.waitSec; heatAtProbe = $skipFirstHeat; heatAtProbeText = $skipFirstHeatText; heatAtSkip = $q.heatText; skips = $th.skips; requeued = $requeue }
                     $b.legs.Add([pscustomobject]$row); Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg; $b.thermalSkips++
                     $pending.RemoveAt(0)
                     if ($requeue) { $pending.Add($leg) } else { Add-Result $leg 'THERMAL_HOT_SKIPPED' $row; if ($exitCode -eq 0) { $exitCode = 7 } }
@@ -1225,7 +1232,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
             }
             if ($null -eq $b.endReason -and $pending.Count -eq 0) { $b.endReason = 'ALL_LEGS_DONE' }
             # A FRESH lease with no room for even one leg can never run it: stop rather than open lease after lease.
-            if ($b.endReason -ceq 'LEASE_REMAINING_SHORT' -and $b.legsAttempted -eq 0 -and $b.probeRetries -eq 0) {
+            # adversary r1 A1: a batch that ran out of room WAITING FOR HEAT (or skipping hot legs) had room for a leg: not a leg budget no lease can hold
+            if ($b.endReason -ceq 'LEASE_REMAINING_SHORT' -and $b.legsAttempted -eq 0 -and $b.probeRetries -eq 0 -and $b.thermalWaits -eq 0 -and $b.thermalSkips -eq 0) {
                 $b.endReason = 'LEG_BUDGET_EXCEEDS_LEASE'; Set-Stop 'LEG_BUDGET_EXCEEDS_LEASE' 2
             }
         }
