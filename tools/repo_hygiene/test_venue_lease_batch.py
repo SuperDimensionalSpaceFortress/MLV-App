@@ -2854,10 +2854,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertTrue(os.path.lexists(spec) and not spec.exists(), "the spec is a dangling junction (the case under test)\n" + r.stdout + r.stderr)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         res = batch_result(r.stdout)
-        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"], res["logWriteFailures"]), (2, "INPUT_UNREADABLE", 1, [], 0))
+        # r7 (sol r6 B2; RPF-09): an input that is there and will not resolve may reach any destination through a link on its side, so no existing receipt destination is written
+        # any more: both receipts are typed suppressed (batch.log, which exists, turns the suppression on), never written. The typing r5b set is unchanged.
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["logWriteFailures"]), (2, "INPUT_UNREADABLE", 1, 0))
+        self._r5_assert_suppressed(res, "INPUT_UNREADABLE")
         self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr, "an input that will not open is not a runner output")
-        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "an unreadable input suppresses no receipt")
-        self.assertEqual(len(self.batches()), 1)
+        self.assertFalse((self.run_dir / "batch-01.json").exists(), "no receipt is written while an input that is there will not resolve")
         self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=INPUT_UNREADABLE item=1 ", r.stderr)
 
     def test_r5b_adv_a1_an_input_replaced_by_a_folder_during_the_final_batch_is_input_unreadable_never_exit_0(self) -> None:
@@ -3100,11 +3102,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                         os.stat(target)
                     self.assertEqual(r.returncode, 2, "an input whose lookup was denied ended exit 0\n" + r.stdout + r.stderr)
                     res = batch_result(r.stdout)
-                    self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"]), (2, "INPUT_UNREADABLE", 1, []), r.stderr)
+                    # r7 (sol r6 B2; RPF-09): the input is there and will not resolve, so no existing destination is written (typed suppressed, never written); the typing is unchanged
+                    self.assertEqual((res["exitCode"], res["stopReason"], res["ran"]), (2, "INPUT_UNREADABLE", 1), r.stderr)
+                    self._r5_assert_suppressed(res, "INPUT_UNREADABLE")
                     self.assertNotIn("INPUT_VANISHED", r.stdout + r.stderr, "an input that is still there is not gone")
                     self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
-                    self.assertTrue((self.run_dir / "batch-01.json").is_file())
-                    self.assertEqual(len(self.batches()), 1)
+                    self.assertFalse((self.run_dir / "batch-01.json").exists())
                 finally:
                     for p in (target.parent, target):
                         subprocess.run(["icacls", str(p), "/remove:d", os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")], capture_output=True)
@@ -3133,6 +3136,156 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertEqual(spec.read_bytes(), snap.read_bytes(), "nothing was written into the input through batch.log")
                 self._r5_assert_suppressed(res, "INPUT_UNREADABLE")
                 self.assertIn("BATCH_OUTPUT_UNVOUCHED batch=1 reason=INPUT_UNREADABLE", r.stderr)
+
+    # PR 704 r7 (key3 opus r6 = sol r6 B1/B2 = Dot 16:48Z; catalogue RPF-08, RPF-09; folds LEASE-BATCH-INPUT-ALIAS-RESOLUTION-FAIL-REGRESSION-1): an accepted input that no longer resolves
+    # (INPUT_VANISHED / INPUT_UNREADABLE) turned no write suppression on at the open or at a later claim, so the finally's log lines and the summary were appended into a batch.log that was
+    # that input; and a destination with one name and no link was written while an input that is there would not resolve. Every writer into -RunDir now asks one guard right before it writes.
+    def _r7_wait_for_event(self, p: subprocess.Popen, kind: str) -> None:
+        end = time.monotonic() + 120
+        while time.monotonic() < end and p.poll() is None and not (self.events.exists() and f" {kind} " in self.events.read_text(encoding="utf-8")):
+            time.sleep(0.05)
+        self.assertTrue(self.events.exists() and f" {kind} " in self.events.read_text(encoding="utf-8"), f"no {kind} event (the case under test)")
+
+    def test_r7_dot_a_spec_renamed_and_batch_log_relinked_during_the_real_open_wait_is_never_appended_to(self) -> None:
+        # Dot 16:48Z, no resolver mock: spec A is accepted; while the open waits in the agent's gate (FAKE_OPEN_SLEEP) A is renamed to A.old, batch.log is replaced by a hard link to
+        # A.old and A stays absent. The guard reads A as INPUT_VANISHED, which suppressed nothing, so the finally's log lines went into A.old.
+        for form in ("plan", "scalar"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                old = spec.with_name("fx-a.json.old")
+                args, e = (self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), FAKE_OPEN_SLEEP="8") if form == "plan"
+                           else self.batch_cmd([spec], FAKE_OPEN_SLEEP="8"))
+                p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                try:
+                    self._r7_wait_for_event(p, "OPENWAIT")
+                    os.rename(spec, old)
+                    log = self.run_dir / "batch.log"
+                    log.unlink()
+                    os.link(old, log)
+                    snap = old.read_bytes()
+                    out, err = p.communicate(timeout=300)
+                finally:
+                    if p.poll() is None:
+                        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                        p.communicate(timeout=60)
+                self.assertFalse(spec.exists(), "A stays absent (the case under test)")
+                self.assertEqual(old.read_bytes(), snap, "a write landed in the accepted input through batch.log\n" + out + err)
+                self.assertEqual(p.returncode, 2, out + err)
+                res = batch_result(out)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"]), (2, "INPUT_VANISHED", 0), err)
+                self.assertNotIn("IS_RUN_OUTPUT", out + err)
+
+    def test_r7_sol_b2_a_one_name_receipt_is_not_written_while_an_input_that_is_there_will_not_resolve(self) -> None:
+        # sol r6 B2 (RPF-09): the spec is accepted through a junction (cur -> orig). Before the final receipt the junction is retargeted at -RunDir, where a one-name copy of the spec sits
+        # at the receipt's name, and resolving the input path is denied (injected, as a share that now denies it). links == 1 and no reparse point prove nothing about the input side.
+        orig, cur, snap = self.case / "r7" / "orig", self.case / "r7" / "cur", self.case / "r7-spec.snap"
+        orig.mkdir(parents=True)
+        (orig / "batch-01.json").write_bytes(self.specs[0].read_bytes())
+        subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", f"New-Item -ItemType Junction -Path '{psq(cur)}' -Value '{psq(orig)}' | Out-Null"], check=True, capture_output=True)
+        spec = cur / "batch-01.json"
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        s, c = psq(spec), psq(cur)
+        retarget = (f"[IO.File]::Copy('{psq(orig / 'batch-01.json')}', (Join-Path $RunDir 'batch-01.json'), $true); [IO.Directory]::Delete('{c}'); "
+                    f"New-Item -ItemType Junction -Path '{c}' -Value $RunDir | Out-Null; Copy-Item -LiteralPath '{s}' -Destination '{psq(snap)}'; $script:rpf06DenySpec = $true")
+        deny = (self._RPF06_RESOLVE, f"if ($script:rpf06DenySpec -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE)
+        r = self._rpf06_run(args, e, retarget, deny)
+        self.assertTrue(snap.exists(), "the junction was retargeted (the case under test)\n" + r.stdout + r.stderr)
+        self.assertEqual(spec.read_bytes(), snap.read_bytes(), "a receipt was written into the file the accepted input's path now reaches\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (2, "INPUT_UNREADABLE"), r.stderr)
+        self._r5_assert_suppressed(res, "INPUT_UNREADABLE")
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+
+    def test_r7_sol_b1_a_later_claims_unresolved_input_refusal_appends_no_summary_into_the_input(self) -> None:
+        # sol r6 B1 = key3 opus r6 (RPF-08): batches.jsonl is a directory (a receipt-persistence failure), then before batch 2's claim guard batch.log becomes a hard link to the next
+        # leg's spec and the spec's own path stops resolving (denied: injected) or the spec is renamed away (vanished: no mock). The refusal printed the summary into batch.log: the
+        # NOT_RUN line and LEASE_BATCH_RESULT landed in the input.
+        for how in ("denied", "vanished"):
+            with self.subTest(how=how):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec2 = self.case / "fx-b-copy.json"
+                target = spec2 if how == "denied" else self.case / "fx-b-copy.json.old"
+                s, t, log, snap = psq(spec2), psq(target), psq(self.run_dir / "batch.log"), self.case / "r7-b1.snap"
+                move = "" if how == "denied" else f"[IO.File]::Move('{s}', '{t}'); "
+                inject = (f"{move}[IO.File]::Delete('{log}'); New-Item -ItemType HardLink -Path '{log}' -Value '{t}' | Out-Null; Copy-Item -LiteralPath '{t}' -Destination '{psq(snap)}'"
+                          + ("; $script:rpf06DenySpec = $true" if how == "denied" else ""))
+                args, e, patch = self._two_batch_plan(inject)
+                patches = [patch]
+                if how == "denied":
+                    patches.append((self._RPF06_RESOLVE, f"if ($script:rpf06DenySpec -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE))
+                args[args.index("-File") + 1] = str(self._patched_runner(*patches[0], *patches[1:]))
+                r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+                self.assertTrue(snap.exists(), "batch.log was relinked to the input (the case under test)\n" + r.stdout + r.stderr)
+                self.assertEqual(target.read_bytes(), snap.read_bytes(), "the summary was appended into the accepted input\n" + r.stdout + r.stderr)
+                code = "INPUT_UNREADABLE" if how == "denied" else "INPUT_VANISHED"
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(f"LEG_PLAN_REFUSED reason={code} item=2 ", r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (2, code, 1, 1))
+
+    # r7: one case per writer into -RunDir (and the claim dir's ledger): right before the writer, its destination becomes a hard link to the second leg's spec (an accepted input not yet
+    # run). No guard ran in between, so only the writer's own guard can see it. (anchor kept by the runner, PowerShell run once just before it)
+    _R7_WRITERS = {
+        "batch.log (L)": ('                L "LEG $($leg.name) RUN batch=',
+                          "[IO.File]::Delete((Join-Path $RunDir 'batch.log')); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch.log') -Value '{b}' | Out-Null"),
+        "leg output": ("                try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {\n",
+                       "New-Item -ItemType HardLink -Path $out -Value '{b}' | Out-Null"),
+        "probe output": ("    $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript,", "New-Item -ItemType HardLink -Path $out -Value '{b}' | Out-Null"),
+        "leg-plan.json": ('        L "CLAIM_TAKEN batch=$batchNo',
+                          "New-Item -ItemType HardLink -Path (Join-Path $RunDir 'leg-plan.json') -Value '{b}' | Out-Null"),
+        "lease ledger": ("                $b.ledger = $row\n",
+                         "$lg = Get-VenueLeaseLedgerPath -Venue $Venue -ClaimDir $ClaimDir; if (Test-Path -LiteralPath $lg) {{ [IO.File]::Delete($lg) }}; New-Item -ItemType HardLink -Path $lg -Value '{b}' | Out-Null"),
+    }
+
+    def test_r7_every_writer_asks_the_guard_right_before_it_writes(self) -> None:
+        for name, (anchor, make) in self._R7_WRITERS.items():
+            with self.subTest(writer=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                a, b = self._r5_spec("fx-a.json", self.specs[0]), self._r5_spec("fx-b.json", self.specs[1])
+                snap = self.case / "r7-writer.snap"
+                args, e = self.plan_cmd(self.write_plan([self.item(a, "A", self.commit_a), self.item(b, "A", self.commit_a)]))
+                indent = re.match(r"\s*", anchor).group(0)
+                inject = f"{indent}if (-not $script:r7Done) {{ $script:r7Done = $true; {make.format(b=psq(b))}; Copy-Item -LiteralPath '{psq(b)}' -Destination '{psq(snap)}' }}\n"
+                args[args.index("-File") + 1] = str(self._patched_runner(anchor, inject + anchor))
+                r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+                self.assertTrue(snap.exists(), "the destination was linked to the spec (the case under test)\n" + r.stdout + r.stderr)
+                self.assertEqual(b.read_bytes(), snap.read_bytes(), f"the {name} writer wrote into the accepted input\n" + r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_WRITE_REFUSED ", r.stderr)
+                self.assertEqual(batch_result(r.stdout)["stopReason"], "LEG_SPEC_IS_RUN_OUTPUT")
+
+    # r7: the static half: every write primitive in the runner is either asked about first (Test-RunDirWrite on the same line or the two before it) or listed here with why it needs no
+    # ask. A new writer that is neither fails this test, so the next unguarded writer is found here, not by a reviewer.
+    _R7_UNGUARDED_OK = {
+        "New-Item -ItemType Directory -Force -Path $RunDir": "creates -RunDir before any input is accepted",
+        "New-Item -ItemType Directory -Force -Path $jobDir": "creates batch-jobs before any input is accepted",
+        "$null = New-Item -ItemType Directory -Path $redirect": "the output redirect: a NEW folder under TEMP, never -RunDir",
+        "[IO.File]::Open($f, [IO.FileMode]::CreateNew": "the job file: CreateNew in a folder the guard just asked about (or the TEMP redirect); it never opens an existing file",
+        "[IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read": "a read",
+        "Add-Content -LiteralPath $batchLog -Value $resultLine": "the summary line: asked ($logOk) before the summary is serialized, or the TEMP redirect",
+        "$putPerBatch = {": "a receipt: run only by Write-ReceiptFile, right after Test-ReceiptWriteSuppressed asks about its file",
+        "Write-ReceiptFile $B.batch $jsonl {": "a receipt: run only by Write-ReceiptFile, right after Test-ReceiptWriteSuppressed asks about its file",
+    }
+
+    def test_r7_every_write_primitive_in_the_runner_is_guarded_or_listed(self) -> None:
+        lines = RUNNER.read_text(encoding="utf-8").splitlines()
+        prim = re.compile(r"Add-Content|Set-Content|Out-File|WriteAllText|AppendAllText|WriteAllBytes|WriteAllLines|\[IO\.File\]::(Open|Create|Copy|Move)\(|New-Item\b|Copy-Item|Move-Item|\*>|(?<![<>-])>\s*\$(?!null)|Add-VenueLeaseLedger")
+        bad = []
+        for i, line in enumerate(lines):
+            code = line.split("#", 1)[0] if not line.lstrip().startswith("#") else ""
+            if not prim.search(code) or "Add-Type" in code:
+                continue
+            if any(k in code for k in self._R7_UNGUARDED_OK):
+                continue
+            if any("Test-RunDirWrite" in l for l in lines[max(0, i - 2):i + 1]):
+                continue
+            bad.append(f"{i + 1}: {line.strip()}")
+        self.assertEqual(bad, [], "a write primitive with no Test-RunDirWrite right before it (guard it, or list it in _R7_UNGUARDED_OK with why)")
 
     def _r5_two_batch_args(self) -> tuple[list[str], dict, Path, Path]:
         a, b = self._r5_spec("fx-a.json", self.specs[0]), self._r5_spec("fx-b.json", self.specs[1])
