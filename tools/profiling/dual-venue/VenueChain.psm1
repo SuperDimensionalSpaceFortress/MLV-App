@@ -677,7 +677,8 @@ function Get-VenueStagedBuildManifest {
                             # r7 adversary A2: -ArtifactMinSec is the least EACH file's read may start with, not only the first: a slow packageZip left the exe and the dll under it
                             if ($null -ne $i.clock -and ($i.endSec - $i.clock.Elapsed.TotalSeconds) -lt $i.minSec) { 'NOTIME:' + $i.label + ':' + $i.name; break }
                             if (-not (Test-Path -LiteralPath $i.path -PathType Leaf)) { 'MISSING:' + $i.label + ':' + $i.name; continue }
-                            $fs = [IO.File]::Open($i.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+                            # r8b adversary A1: FileShare.Read, as the leg job hashes it (AttrCudaArtifacts.psm1 Get-Sha): a writer holding the file open fails this read as it would fail the leg
+                            $fs = [IO.File]::Open($i.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
                             try {
                                 $sha = [Security.Cryptography.SHA256]::Create()
                                 try { $got = ([BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }

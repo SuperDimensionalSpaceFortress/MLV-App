@@ -3072,6 +3072,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.artifact_path(c, label).write_bytes(b"a different build's bytes")
                 self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(self.specs[1], "B", c, manifest=manifest)]), "BUILD_ARTIFACT_MISMATCH item=2 ")
 
+    # r8b adversary A1 (pass 1 on a2c32874): the verifier opened each cached artifact with FileShare.ReadWrite, but the leg job hashes it with FileShare.Read
+    # (AttrCudaArtifacts.psm1 Get-Sha), which a retained writer handle refuses. A build with a writer open was STAGED here and threw after the lease opened. It is now read the way
+    # the leg job reads it, so the writer makes the read fail and the plan is refused SHARE_UNREACHABLE (an unreadable file is not a missing or matching one) before any claim.
+    def test_artifact_preflight_r8b_adv_a1_a_cached_artifact_a_writer_holds_open_is_refused_as_the_leg_job_would_fail_on_it(self) -> None:
+        c = "3" * 40
+        manifest = self.stage(c, "writer open")
+        with open(self.artifact_path(c, "packageZip"), "r+b"):
+            self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", c, manifest=manifest)]), "SHARE_UNREACHABLE item=1 ")
+
     def test_artifact_preflight_the_refusal_names_the_artifact_and_a_fully_staged_build_still_opens_the_lease(self) -> None:
         c = "3" * 40
         manifest = self.stage(c, "named")
