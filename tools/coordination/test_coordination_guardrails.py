@@ -3037,6 +3037,38 @@ def test_save_dirty_worktree_evidence_never_writes_through_a_temp_turned_into_a_
 
 
 @dirty_save_only
+@pytest.mark.parametrize("kind", ["SymbolicLink", "HardLink"])
+def test_save_dirty_worktree_evidence_never_reuses_an_occupied_name_that_is_the_temp_itself(tmp_path, kind):
+    # r11 iter 1 (adversary 6fa0fae3-A1): at the first before-publish checkpoint a symbolic link to the main patch temp is put at dirty-worktree-<H8>.patch. The rename
+    # refuses the occupied name, its hash THROUGH the link equals the temp's, so it was reused (Moved=false), and the temp cleanup then deleted the file the reported
+    # patch named: SAVED with a dangling patch. The occupied name is now read through one handle on the name itself (a link refused) and must not be the temp under
+    # another name: the evidence is placed under a longer name, or the save fails typed. The symbolic link needs SeCreateSymbolicLinkPrivilege (skips on the hub VM,
+    # runs on hosted Windows CI); the hard-link sibling runs without it and pins the same outcome (MoveIn's one-name check already refuses it on the r11 head).
+    wt, dest = _dirty_save_repo(tmp_path)
+    shim = ("$script:Planted = 'not-reached'; $script:PlantedAt = ''; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
+            "if ($Stage -eq 'before-publish' -and $script:Planted -eq 'not-reached') { "
+            f"$t = @(Get-ChildItem -LiteralPath '{dest}' -Filter 'dirty-worktree-saving-*.tmp')[0]; "
+            "$h = (Get-FileHash -LiteralPath $t.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); "
+            f"$script:PlantedAt = [System.IO.Path]::Combine('{dest}', 'dirty-worktree-' + $h.Substring(0, 8) + '.patch'); "
+            f"try {{ $null = New-Item -ItemType {kind} -Path $script:PlantedAt -Target $t.FullName -ErrorAction Stop; $script:Planted = 'yes' }} catch {{ $script:Planted = 'denied' }} }} }}")
+    out = dirty_save_pwsh(f"{shim}; Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; "
+                          "Write-Output \"planted=$script:Planted\"; Write-Output \"at=$script:PlantedAt\"")
+    lines = out.stdout.strip().splitlines()
+    if lines and lines[-2] == "planted=denied":
+        pytest.skip(f"cannot create a {kind} here")
+    assert lines[-2] == "planted=yes", (out.stdout, out.stderr)
+    planted = Path(lines[-1][len("at="):]).name  # by name: the line carries the resolved long path, the fixture may carry an 8.3 spelling
+    line = lines[0]
+    reported = re.search(r" patch=(.+?\.patch)( |$)", line)
+    assert not (reported and Path(reported.group(1)).name == planted), ("the temp itself was reused as the evidence", line)
+    if line.startswith("DIRTY_TREE_SAVED"):
+        patch = Path(re.search(r" patch=(.+?\.patch) ", line).group(1))
+        assert patch.is_file() and not patch.is_symlink() and "+two" in patch.read_text(encoding="utf-8"), (line, sorted(p.name for p in dest.iterdir()))
+    else:
+        assert line.startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=evidence-identity-changed:"), (out.stdout, out.stderr)
+
+
+@dirty_save_only
 @pytest.mark.parametrize("when", ["after-guard", "at-create", "control"])
 def test_save_dirty_worktree_evidence_creates_nothing_through_a_destination_turned_into_a_junction_after_its_guard(tmp_path, when):
     # r11 (sol r10 B2): the held destination shares WRITE, so an EMPTY destination can be turned IN PLACE into a junction to the worktree after the before-write guard

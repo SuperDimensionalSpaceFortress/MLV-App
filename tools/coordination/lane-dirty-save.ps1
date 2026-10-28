@@ -55,6 +55,15 @@ function Invoke-DirtyFileMove([string]$From, [string]$To, $DirHandle = $null, [s
 # that does not exist) is placement-failed:<HResult> <message>, with Placed naming a file already moved into place.
 # -Hold is the caller's New-DirtyHeldTemp record for $Tmp: right before the move the held file must still have one name, the hold is released (a held file cannot be
 # renamed), and the file moved into place must be that file (same volume serial + file index, one name); otherwise Placed = <it> and Reason = evidence-identity-changed:<it> (r10, sol r9 B3).
+# "<identity>/<links>|<sha256>" of a regular file at $Path read through one handle that never follows a link (inside the held directory when -DirHandle is a handle); $null otherwise.
+function Get-DirtyRegularDigest([string]$Path, $DirHandle = $null) {
+    if (-not ('DirtyFinalPath' -as [type])) { $null = Get-DirtyKernelPath $Path }  # defines the type on Windows
+    if ('DirtyFinalPath' -as [type]) {
+        try { return [DirtyFinalPath]::RegularFileDigest($(if ($DirHandle -is [IntPtr]) { $DirHandle } else { [IntPtr]::Zero }), $Path) } catch { return $null }
+    }
+    # No handle API off Windows; the saver itself refuses there (no-directory-hold-on-this-platform), and only a direct call of the placement helper reaches this.
+    try { return 'path/1|' + (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch { return $null }
+}
 # -DirHandle is the saver's hold on $Dir: the rename is then done inside the held directory (Invoke-DirtyFileMove; r11, sol r10 B2).
 function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem, [string]$Ext, [string]$Full, [string]$FirstName = '', [scriptblock]$Guard = $null, $Hold = $null, $DirHandle = $null) {
     $placedNow = $null
@@ -81,9 +90,13 @@ function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem,
                 $moveFailed = @{ Path = $null; Placed = $null; Reason = ('move-failed:0x{0:X8} {1}' -f $ex.HResult, ($ex.Message -replace '\s+', ' ')) }
                 if ($ex -isnot [System.IO.IOException] -or -not (Test-Path -LiteralPath $cand)) { return $moveFailed }
                 # An occupied name that cannot be read is not proven to hold these bytes, so the next length is tried (r8, adversary 98e161fc-A3 sibling :48: the hash used to throw out of the helper).
-                $held = $null
-                try { if (Test-Path -LiteralPath $cand -PathType Leaf) { $held = (Get-FileHash -LiteralPath $cand -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } } catch { $held = $null }
-                if ($held -ceq $Full) { return @{ Path = $cand; Placed = $null; Id = $pair[1]; Moved = $false } }
+                # Only a regular file that is not the temp itself is reused: a link at the name (refused by Get-DirtyRegularDigest) or the temp under a second name would be
+                # gone, or emptied of its only other name, once the caller's cleanup deletes the temp (r11 iter 1, adversary 6fa0fae3-A1).
+                $digest = $null
+                try { if (Test-Path -LiteralPath $cand -PathType Leaf) { $digest = Get-DirtyRegularDigest $cand $DirHandle } } catch { $digest = $null }
+                $held = if ($digest) { $digest.Split('|')[1] } else { $null }
+                $isTemp = $Hold -and $digest -and $digest.Split('/')[0] -ceq $Hold.Id
+                if ($held -ceq $Full -and -not $isTemp) { return @{ Path = $cand; Placed = $null; Id = $pair[1]; Moved = $false } }
                 continue
             }
             # Placed. The bytes published must be the bytes validated: a temp file rewritten after its checks would otherwise be placed and reported (r7 iter 2, adversary 43a1998e-A1).
@@ -95,8 +108,10 @@ function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem,
                 if ($placedId -cne ($Hold.Id + '/1')) { return @{ Path = $null; Placed = $cand; Reason = "evidence-identity-changed:$cand" } }
             }
             $now = $null
-            try { $now = (Get-FileHash -LiteralPath $cand -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch { $now = $null }
+            $digest = Get-DirtyRegularDigest $cand $DirHandle  # through one handle on the name itself, a link refused (r11 iter 1 class sweep)
+            if ($digest) { $now = $digest.Split('|')[1] }
             if ($null -eq $now) { return @{ Path = $null; Placed = $cand; Reason = 'evidence-unverified-after-publish' } }
+            if ($Hold -and $digest.Split('|')[0] -cne ($Hold.Id + '/1')) { return @{ Path = $null; Placed = $cand; Reason = "evidence-identity-changed:$cand" } }
             if ($now -cne $Full) { return @{ Path = $null; Placed = $cand; Reason = "evidence-changed-before-publish:$cand" } }
             return @{ Path = $cand; Placed = $null; Id = $pair[1]; Moved = $true }
         }
@@ -283,6 +298,24 @@ public static class DirtyFinalPath {
                 return st < 0 ? RtlNtStatusToDosError(st) : 0;
             } finally { Marshal.FreeHGlobal(info); }
         } finally { CloseHandle(h); }
+    }
+    // The SHA-256 of a regular file read through ONE handle on the name itself (a link at the name is opened as itself and refused, never followed), with that handle's
+    // identity: "<volume>:<index>/<links>|<sha256 hex>", or null when it cannot be opened or read, or is a reparse point. Opened inside the held directory when dir is
+    // given. Sharing READ only, so the bytes cannot change while they are hashed (r11 iter 1, adversary 6fa0fae3-A1: a symbolic link at an occupied name, to the temp
+    // itself, hashed equal through the link and was reused, and the temp cleanup then deleted what the reported patch named).
+    public static string RegularFileDigest(IntPtr dir, string path) {
+        int error; IntPtr h;
+        if (dir != IntPtr.Zero) h = OpenIn(dir, System.IO.Path.GetFileName(path), 0x80000000, 1, 1, out error);
+        else { h = CreateFileW(Long(path), 0x80000000, 1, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero); if (h == (IntPtr)(-1)) h = IntPtr.Zero; }
+        if (h == IntPtr.Zero) return null;
+        using (Microsoft.Win32.SafeHandles.SafeFileHandle safe = new Microsoft.Win32.SafeHandles.SafeFileHandle(h, true)) {
+            string id = HandleFileIdentity(h);
+            if (id == null || id.EndsWith("/R")) return null;
+            using (System.IO.FileStream fs = new System.IO.FileStream(safe, System.IO.FileAccess.Read))
+            using (System.Security.Cryptography.SHA256 sha = System.Security.Cryptography.SHA256.Create()) {
+                return id + "|" + BitConverter.ToString(sha.ComputeHash(fs)).Replace("-", "").ToLowerInvariant();
+            }
+        }
     }
     // DeleteIfIdentity for a name inside the held directory, opened there (r11 class sweep: the cleanup no longer walks the destination path either).
     public static bool DeleteIfIdentityIn(IntPtr dir, string name, string identity) {
