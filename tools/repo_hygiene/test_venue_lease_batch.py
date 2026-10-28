@@ -2146,16 +2146,25 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         [b] = self.batches()
         self.assertEqual(b["endReason"], "BATCH_ERROR")
 
-    def _runner_paused_at_claim_taken(self, message: str = "CLAIM_TAKEN", release_at: str = "", more: tuple = ()) -> tuple[Path, Path, Path]:
-        """A copy of the runner that PAUSES when it is about to log a line starting `message` (CLAIM_TAKEN by default): it writes `paused` and waits (at most 60 s) for `locked` to appear.
+    _EXPIRED_MARKER, _ACK_MARKER = "runner-pause-expired.marker", "runner-ack.marker"
+
+    def _runner_paused_at_claim_taken(self, message: str = "CLAIM_TAKEN", release_at: str = "", more: tuple = (), pause_s: float = 60) -> tuple[Path, Path, Path]:
+        """A copy of the runner that PAUSES when it is about to log a line starting `message` (CLAIM_TAKEN by default): it writes `paused` (holding an attempt nonce it generates) and waits (at most
+        `pause_s`, 60 by default) for `locked` to appear. Seeing `locked` inside the window, it probes batch.log itself and, only if the log really is held, writes `ack` = `<nonce> held`; a pause that
+        runs out with no `locked` writes `expired` = `<nonce> expired` and the runner carries on. The pause happens once per run (a later matching line, e.g. batch 2's, never re-pauses or re-acks). A pause marker that survives the expiry is therefore never a handshake (sol r3 B1; Dot on #704).
         With `release_at`, the first line starting with it once `locked` exists writes `release-wanted` and waits (at most 60 s) for `released`: the lock holder lets go there.
         Returns (runner, paused, locked). Dot on #684: the lock helper used to poll for the claim file and hope to win the race with the runner's next log line; the handshake makes the order a fact.
         r3 (sol r2b hardening; adversary r2 A5): the prefix is compared ordinally (a `[` in it is no -like wildcard) and both waits run on a monotonic Stopwatch, not wall-clock UTC."""
         paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
         wanted, released = self.case / "release-wanted.marker", self.case / "log-released.marker"
         anchor = "function L([string]$Message) {\n"
-        pause = (f"    if ($Message.StartsWith('{psq(message)}', [StringComparison]::Ordinal)) {{ Set-Content -LiteralPath '{psq(paused)}' -Value 'paused'; $sw = [Diagnostics.Stopwatch]::StartNew(); "
-                 f"while (-not (Test-Path -LiteralPath '{psq(locked)}') -and $sw.Elapsed.TotalSeconds -lt 60) {{ Start-Sleep -Milliseconds 20 }} }}\n")
+        expired, ack = self.case / self._EXPIRED_MARKER, self.case / self._ACK_MARKER
+        pause = (f"    if (-not $script:PauseDone -and $Message.StartsWith('{psq(message)}', [StringComparison]::Ordinal)) {{ $script:PauseDone = $true; $n = [guid]::NewGuid().ToString('N'); Set-Content -LiteralPath '{psq(paused)}' -Value $n; "
+                 f"$sw = [Diagnostics.Stopwatch]::StartNew(); $seen = $false; "
+                 f"while ($sw.Elapsed.TotalSeconds -lt {pause_s}) {{ if (Test-Path -LiteralPath '{psq(locked)}') {{ $seen = $true; break }}; Start-Sleep -Milliseconds 20 }}\n"
+                 f"        if ($seen) {{ $held = $false; try {{ [IO.File]::Open($batchLog, 'Open', 'Read', 'ReadWrite').Dispose() }} catch [IO.IOException] {{ $held = $true }}; "
+                 f"if ($held) {{ Set-Content -LiteralPath '{psq(ack)}' -Value ($n + ' held') }} }} "
+                 f"else {{ Set-Content -LiteralPath '{psq(expired)}' -Value ($n + ' expired') }} }}\n")
         if release_at:
             pause += (f"    if ($Message.StartsWith('{psq(release_at)}', [StringComparison]::Ordinal) -and (Test-Path -LiteralPath '{psq(locked)}') -and -not (Test-Path -LiteralPath '{psq(released)}')) {{ "
                       f"Set-Content -LiteralPath '{psq(wanted)}' -Value 'release'; $sw = [Diagnostics.Stopwatch]::StartNew(); "
@@ -2167,7 +2176,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         until the returned event is set or the runner writes `release-wanted` (then the lock is let go and `log-released.marker` written). Windows only (CreateFileW). Returns
         (done, thread, state); state["outcome"] is locked / lock-failed (`locked` still written, so the runner never waits out its 60 s) / never-paused / cancelled, and
         state["released"] says whether the runner asked for the release. r3 (sol r2b B2): a wait that expired or was cancelled before `paused` appeared takes NO lock and writes NO
-        `locked`: the caller fails on _assert_handshake's named message instead of a log locked ahead of the pause. The handle is closed in a finally."""
+        `locked`: the caller fails on _assert_handshake's named message instead of a log locked ahead of the pause; a pause the runner already gave up on (its `expired` marker) takes no
+        lock either (outcome pause-expired). The handle is closed in a finally."""
         import ctypes
         from ctypes import wintypes
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -2177,6 +2187,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         done = threading.Event()
         state: dict = {"outcome": "pending", "released": False, "give_up_s": give_up_s}
         wanted, released = paused.parent / "release-wanted.marker", paused.parent / "log-released.marker"
+        expired, ack = paused.parent / self._EXPIRED_MARKER, paused.parent / self._ACK_MARKER
+        state["markers"] = {"paused": paused, "expired": expired, "ack": ack}
         invalid = wintypes.HANDLE(-1).value
 
         def hold() -> None:
@@ -2187,6 +2199,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                     seen = not done.is_set() and time.monotonic() < end   # adversary r3 pass 2 A2: a look that returned after the deadline does not count
                     break
                 done.wait(0.01)
+            if seen and expired.exists():   # the runner's own pause ran out and it carried on: a surviving `paused` marker is no handshake (sol r3 B1)
+                state["outcome"] = "pause-expired"
+                return
             if not seen:
                 state["outcome"] = "cancelled" if done.is_set() else "never-paused"
                 return
@@ -2214,7 +2229,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         out = "" if r is None else "\n" + r.stdout + r.stderr
         self.assertNotEqual(state["outcome"], "never-paused", f"the runner never paused at {message!r} within {state['give_up_s']} s: the lock was not taken{out}")
         self.assertNotEqual(state["outcome"], "cancelled", f"the runner ended before it paused at {message!r}: the lock was not taken{out}")
+        self.assertNotEqual(state["outcome"], "pause-expired", f"the runner's pause at {message!r} expired with no lock: the surviving pause marker is no handshake{out}")
         self.assertEqual(state["outcome"], "locked", f"the handshake: the runner paused at {message!r} and resumed only once the lock was held{out}")
+        # sol r3 B1 / Dot on #704: the runner must itself have seen the lock WHILE still paused. Its `expired` marker (the pause ran out first; a helper delayed past it still locks) refuses the
+        # attempt; so does an `ack` that is missing or carries another attempt's nonce (the runner writes `<nonce> held` only after probing batch.log and finding it held).
+        mk = state["markers"]
+        self.assertFalse(mk["expired"].exists(), f"the runner's pause at {message!r} expired before the lock was taken: no handshake{out}")
+        nonce = mk["paused"].read_text(encoding="utf-8").strip() if mk["paused"].exists() else ""
+        got = mk["ack"].read_text(encoding="utf-8").strip() if mk["ack"].exists() else None
+        self.assertTrue(nonce and got == f"{nonce} held", f"no attempt-specific acknowledgment from the paused runner at {message!r} (want {nonce!r} + ' held', got {got!r}){out}")
 
     def test_r6_b5_a_batch_log_another_process_holds_after_the_claim_cannot_skip_the_release_the_receipt_or_the_summary(self) -> None:
         # Dot r5 B5: the finally logged CLAIM_RENEW before Release-VenueClaim; with batch.log held exclusively after the claim was taken, that log call threw out of the
@@ -2715,6 +2738,95 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         finally:
             done.set()
             t.join(5)
+
+    # r4 (sol r3 B1; Dot 6457592181 on #704): the pause marker survived the runner's 60 s pause, so a helper delayed past it still locked, recorded `locked`, and the test certified a handshake
+    # the runner never took part in. The runner now records its own expiry and acknowledges only a lock it probed while still paused; _assert_handshake demands that acknowledgment.
+    def _handshake_state(self, outcome: str = "locked", paused: str | None = "n-1", ack: str | None = "n-1 held", expired: str | None = None) -> dict:
+        """A lock-helper state over real marker files (the runner and the helper are not run): the handshake assert is decided by what the markers say."""
+        d = Path(tempfile.mkdtemp(prefix="hs-", dir=self.tmp))
+        mk = {"paused": d / "p.marker", "expired": d / self._EXPIRED_MARKER, "ack": d / self._ACK_MARKER}
+        for k, v in (("paused", paused), ("ack", ack), ("expired", expired)):
+            if v is not None:
+                mk[k].write_text(v, encoding="utf-8")
+        return {"outcome": outcome, "released": False, "give_up_s": 1, "markers": mk}
+
+    def test_r4_b1_the_handshake_assert_accepts_only_a_lock_the_paused_runner_acknowledged_with_its_own_nonce(self) -> None:
+        self._assert_handshake(self._handshake_state(), "CLAIM_TAKEN")   # the control: locked, acknowledged with the runner's nonce, no expiry
+        cases = {
+            "the runner's pause expired and the helper locked after it (sol r3 B1)": self._handshake_state(expired="n-1 expired", ack=None),
+            "the pause expired although an ack exists": self._handshake_state(expired="n-1 expired"),
+            "locked with no acknowledgment at all": self._handshake_state(ack=None),
+            "an ack carrying another attempt's nonce": self._handshake_state(ack="n-0 held"),
+            "an ack that is not a held lock": self._handshake_state(ack="n-1 free"),
+            "no pause marker to bind the ack to": self._handshake_state(paused=None),
+            "the helper itself refused the expired pause": self._handshake_state(outcome="pause-expired", expired="n-1 expired", ack=None),
+        }
+        for label, st in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(AssertionError):
+                    self._assert_handshake(st, "CLAIM_TAKEN")
+
+    def test_r4_b1_a_lock_helper_that_sees_the_pause_marker_after_the_runners_pause_expired_takes_no_lock(self) -> None:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        log = self.run_dir / "batch.log"
+        log.write_text("", encoding="utf-8")
+        paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
+        paused.write_text("n-1", encoding="utf-8")
+        (self.case / self._EXPIRED_MARKER).write_text("n-1 expired", encoding="utf-8")   # the runner gave up and carried on; its pause marker is left behind
+        done, t, state = self._lock_log_while_the_runner_is_paused(log, paused, locked, give_up_s=5)
+        try:
+            t.join(10)
+            self.assertEqual(state["outcome"], "pause-expired")
+            self.assertFalse(locked.exists(), "a pause the runner had already given up on was locked on")
+            with open(log, "a", encoding="utf-8") as f:   # PermissionError here = the lock was taken
+                f.write("")
+            with self.assertRaises(AssertionError):
+                self._assert_handshake(state, "CLAIM_TAKEN")
+        finally:
+            done.set()
+            t.join(5)
+
+    def test_r4_b1_a_helper_delayed_past_the_runners_pause_is_refused_and_the_runner_resumes_without_a_lock(self) -> None:
+        # the real runner pauses for 2 s here (60 s in the other tests); the helper first sees the pause marker at 12 s (the runner starts its pause a few seconds in), the case sol r3 B1 describes at t=61 s of 60 s. The runner has
+        # recorded its expiry by then: no lock is taken, no acknowledgment exists, and the attempt is refused by name.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "batch.log").write_text("", encoding="utf-8")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        runner, paused, locked = self._runner_paused_at_claim_taken(pause_s=2)
+        args[args.index("-File") + 1] = str(runner)
+        t0 = time.monotonic()
+
+        class Delayed:
+            parent = paused.parent
+
+            def exists(self) -> bool:
+                return time.monotonic() - t0 >= 12 and paused.exists()
+
+        done, t, state = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", Delayed(), locked, give_up_s=60)
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+            t.join(30)
+        finally:
+            done.set()
+            t.join(5)
+        state["markers"]["paused"] = paused
+        self.assertEqual(state["outcome"], "pause-expired", r.stdout + r.stderr)
+        self.assertFalse(locked.exists(), "no lock was taken for an expired pause")
+        self.assertTrue(paused.exists() and (self.case / self._EXPIRED_MARKER).read_text(encoding="utf-8").strip() == paused.read_text(encoding="utf-8").strip() + " expired",
+                        "the runner recorded that its pause expired with no lock, under its own nonce")
+        self.assertFalse((self.case / self._ACK_MARKER).exists(), "an expired pause is never acknowledged")
+        with self.assertRaises(AssertionError):
+            self._assert_handshake(state, "CLAIM_TAKEN", r)
+        self.assertEqual(r.returncode, 0, "the runner resumed without a lock and the batch ran normally\n" + r.stdout + r.stderr)
+
+    def test_r4_b1_a_prompt_helper_is_acknowledged_by_the_runner_with_its_own_nonce_while_the_log_is_held(self) -> None:
+        # the successful-handshake control on the real runner: paused, locked, the runner probes batch.log (held), writes `<nonce> held`, and only then resumes
+        r, state = self._run_plan_with_log_held_at("CLAIM_TAKEN")
+        self._assert_handshake(state, "CLAIM_TAKEN", r)
+        mk = state["markers"]
+        self.assertEqual(mk["ack"].read_text(encoding="utf-8").strip(), mk["paused"].read_text(encoding="utf-8").strip() + " held")
+        self.assertFalse(mk["expired"].exists())
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
 
     def test_r3_b2_the_lock_is_let_go_when_the_locked_marker_cannot_be_written(self) -> None:
         # sol r2b hardening: an exception writing the marker after CreateFileW skipped CloseHandle. The marker path is a directory, so the write raises; the handle is closed anyway.
