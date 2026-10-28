@@ -6119,7 +6119,13 @@ try {
         }
         Save-Json $corePartitionRecord (Join-Path $Pub 'core-partition.json')
         $corePartitionPublishWhy = $null
-    } catch { $corePartitionErrors.Add("publish: $([string]$_.Exception.Message)") }
+    } catch {
+        $corePartitionErrors.Add("publish: $([string]$_.Exception.Message)")
+        # r13d (Dot 6458932346): this error comes after the record's error snapshot, so a typed status beside the record carries it durably
+        # (staleRecordOnDisk: a core-partition.json file stands there all the same; it is not this run's verdict)
+        try { Save-Json ([ordered]@{ schema = 'mlv-app/core-partition-unpublished/v1'; card = 'BACHELOR-CORE-PARTITION-AB-1'; why = 'core-partition-json-unpublished'; stage = 'publish'; staleRecordOnDisk = (Test-Path -LiteralPath (Join-Path $Pub 'core-partition.json') -PathType Leaf); startWhy = $corePartitionPlaybackStart.why; errors = $corePartitionErrors.ToArray() }) (Join-Path $Pub 'core-partition-unpublished.json') }
+        catch { $corePartitionErrors.Add("unpublished-status: $([string]$_.Exception.Message)") }
+    }
     Write-JobTrace "step core-partition done helperWhy=$corePartitionHelperWhy publishWhy=$corePartitionPublishWhy jobAffinityRestored=$($corePartitionJob.affinityRestored) errors=$($corePartitionErrors.Count)"
 '@ + "`n" + $cpClose + "`n" + @'
 }
@@ -6135,8 +6141,9 @@ Write-JobTrace "step smoke-launch done rc=$smokeRc"
 if (-not [string]::Equals([string]$rawLog, [string]$cpRunLogText, [StringComparison]::Ordinal)) {
     $corePartitionFeedSummary = Get-CorePartitionStartBoundFeed $corePartitionFeedSummary @{ why = 'run-log-snapshot-mismatch' }
     # adversary r13c (a8c04609) A3: a republish that fails (a reader holding the file) would leave the first, unrefused publication on disk, so it
-    # is tried three times 250 ms apart (a transient scan lock), and when every try fails the stale file is removed; a file that cannot be
-    # removed either stays, named in the errors (republish-stale-kept), with the summary refused core-partition-json-unpublished.
+    # is tried three times 250 ms apart (a transient scan lock). r13d (Dot 6459551437): when every try fails nothing is removed by pathname (each
+    # try already replaced the slot through Publish-AttrCudaText's checked slot, and failed); the summary is refused core-partition-json-unpublished
+    # and a typed status beside the record (Dot 6458932346) names the record left on disk stale and carries the republish errors durably.
     $cpRepublished = $false
     for ($cpTry = 1; $cpTry -le 3 -and -not $cpRepublished; $cpTry++) {
         try {
@@ -6148,8 +6155,8 @@ if (-not [string]::Equals([string]$rawLog, [string]$cpRunLogText, [StringCompari
     }
     if (-not $cpRepublished) {
         $corePartitionPublishWhy = 'core-partition-json-unpublished'
-        try { if (Test-Path -LiteralPath (Join-Path $Pub 'core-partition.json') -PathType Leaf) { Remove-Item -LiteralPath (Join-Path $Pub 'core-partition.json') -Force -ErrorAction Stop } }
-        catch { $corePartitionErrors.Add("republish-stale-kept: $([string]$_.Exception.Message)") }
+        try { Save-Json ([ordered]@{ schema = 'mlv-app/core-partition-unpublished/v1'; card = 'BACHELOR-CORE-PARTITION-AB-1'; why = 'core-partition-json-unpublished'; stage = 'republish'; staleRecordOnDisk = (Test-Path -LiteralPath (Join-Path $Pub 'core-partition.json') -PathType Leaf); startWhy = 'run-log-snapshot-mismatch'; errors = $corePartitionErrors.ToArray() }) (Join-Path $Pub 'core-partition-unpublished.json') }
+        catch { $corePartitionErrors.Add("unpublished-status: $([string]$_.Exception.Message)") }
     }
 }
 $corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs

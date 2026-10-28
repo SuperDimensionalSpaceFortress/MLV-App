@@ -177,7 +177,11 @@ function New-AttrCudaDirectory { param([string]$Path) }
 # r13c (Dot 6456731376): each publication is captured BY VALUE (serialized as the real Save-Json does, at call time), so a later change to the
 # record object cannot make an earlier publication look republished; from call $global:cpSaveThrowOn (1-based) on, every call throws instead of
 # publishing. adversary r13c (a8c04609) A3: each publication is written to its path too, so the file left on disk is observable
-function Save-Json { param($Object, $Path) $global:cpSaveCalls++; if ($global:cpSaveThrowOn -gt 0 -and $global:cpSaveCalls -ge $global:cpSaveThrowOn) { throw 'save-json-refused-by-test' }
+function Save-Json { param($Object, $Path)
+    # r13d (Dot 6458932346): a write to any other name (the typed core-partition-unpublished.json status) is not a publication of the record: it is
+    # written to its path and never counted; the throw models a reader holding core-partition.json, so only that name refuses
+    if ((Split-Path -Leaf $Path) -ne 'core-partition.json') { [IO.File]::WriteAllText($Path, ($Object | ConvertTo-Json -Depth 30)); return }
+    $global:cpSaveCalls++; if ($global:cpSaveThrowOn -gt 0 -and $global:cpSaveCalls -ge $global:cpSaveThrowOn) { throw 'save-json-refused-by-test' }
     $j = $Object | ConvertTo-Json -Depth 30; [IO.File]::WriteAllText($Path, $j); $global:cpSaved = $j | ConvertFrom-Json -AsHashtable; $global:cpSaves.Add($global:cpSaved) }
 function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) $p = Join-Path $ContainingRoot 'run.log'; if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'run log unresolvable' }; [pscustomobject]@{ path = $p; sha256 = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() } }
 $exePath = 'C:\no\such\MLVApp.exe'
@@ -221,7 +225,10 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     $saves = @(foreach ($sv in $global:cpSaves) { $ss = $sv.feed.summary
         , @($ss.rows, $ss.pkgWattsMean, $ss.pkgTempCMean, [string]$sv.feed.startWhy, @(foreach ($fw in @('rows', 'pkgWattsMean', 'pkgWattsMax', 'pkgTempCMean', 'pkgTempCMax', 'pkgThrottledRows')) { [string]$ss.reasons[$fw] })) })
     $cpOnDisk = Join-Path $Work 'core-partition.json'
+    $cpStatusOnDisk = Join-Path $Work 'core-partition-unpublished.json'
+    $cpStatus = $(if (Test-Path -LiteralPath $cpStatusOnDisk -PathType Leaf) { [IO.File]::ReadAllText($cpStatusOnDisk) | ConvertFrom-Json -AsHashtable })
     $out[$mode] = [ordered]@{
+        status = $(if ($null -ne $cpStatus) { [ordered]@{ schema = $cpStatus.schema; why = $cpStatus.why; stage = $cpStatus.stage; staleRecordOnDisk = $cpStatus.staleRecordOnDisk; startWhy = $cpStatus.startWhy; errors = @($cpStatus.errors) } })
         saveCalls = $global:cpSaveCalls; saves = $saves; publishWhy = [string]$corePartitionPublishWhy
         onDisk = @((Test-Path -LiteralPath $cpOnDisk -PathType Leaf), $(if (Test-Path -LiteralPath $cpOnDisk -PathType Leaf) { [string](([IO.File]::ReadAllText($cpOnDisk) | ConvertFrom-Json -AsHashtable).feed.startWhy) } else { $null }))
         started = ($null -ne $corePartitionHelper); ready = [bool]$corePartitionHelperLaunch.ready; readyWhy = [string]$corePartitionHelperLaunch['readyWhy']
@@ -820,18 +827,29 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(rebound["publishWhy"], "", rebound)
         self.assertEqual(rebound["onDisk"], [True, "run-log-snapshot-mismatch"], rebound)
         self.assertEqual(good["onDisk"], [True, ""], good)
-        # r13c (Dot 6456731376 c): the republish itself fails (every Save-Json after the first throws): the summary must not stand on the first
-        # publication: core-partition-json-unpublished, the republish error recorded, and no package-feed value. adversary r13c (a8c04609) A3:
-        # the republish is tried three times, then the stale, unrefused first publication is removed from disk (on a8c04609 it stays, 45 W / 70 C)
+        # r13d (Dot 6458932346): a published run writes no unpublished status
+        self.assertIsNone(good["status"], good)
+        self.assertIsNone(rebound["status"], rebound)
+        # r13c (Dot 6456731376 c): the republish itself fails (every Save-Json of core-partition.json after the first throws): the summary must not
+        # stand on the first publication: core-partition-json-unpublished, the republish error recorded, and no package-feed value. adversary r13c
+        # (a8c04609) A3: the republish is tried three times.
         failed = got["good-rebound-republish-throws"]
         self.assertNotIn("threw", failed, failed)
         self.assertEqual([failed["saveCalls"], len(failed["saves"])], [4, 1], failed)
-        self.assertEqual(failed["onDisk"], [False, None], f"the stale unrefused core-partition.json was left on disk: {failed}")
         self.assertEqual(failed["publishWhy"], "core-partition-json-unpublished", failed)
         self.assertEqual(failed["errors"].count("republish: save-json-refused-by-test"), 3, failed)
         self.assertEqual(failed["pkg"], [None] * 4, failed)
         self.assertIn("pkgWattsMean=run-log-snapshot-mismatch", failed["why"], failed)
         self.assertIn("core-partition-json-unpublished", failed["why"], failed)
+        # r13d (Dot 6459551437, CI red on 51c90c3d): nothing is removed by pathname. The first, unrefused publication stays on disk, and a typed
+        # status beside it (Dot 6458932346, the durable late-error channel) names it stale, refuses it core-partition-json-unpublished and carries
+        # the three republish errors raised after the record's own error snapshot; on 51c90c3d those errors were in memory only (no status file)
+        self.assertEqual(failed["onDisk"], [True, ""], failed)
+        st = failed["status"]
+        self.assertIsNotNone(st, f"the republish failure left no durable status: {failed}")
+        self.assertEqual([st["schema"], st["why"], st["stage"], st["staleRecordOnDisk"], st["startWhy"]],
+                         ["mlv-app/core-partition-unpublished/v1", "core-partition-json-unpublished", "republish", True, "run-log-snapshot-mismatch"], st)
+        self.assertEqual(st["errors"].count("republish: save-json-refused-by-test"), 3, st)
 
     def test_the_jobs_key_reaches_only_the_helper(self) -> None:
         """sol r6 CP-06: the per-job key is drawn at run time, handed to the helper by environment (never the command line), never traced or
@@ -1335,6 +1353,8 @@ function Save-Json {
     param($Object, $Path)
     if ($global:cpPublish -eq 'throw') { throw [IO.IOException]::new('injected publisher IOException') }
     if (Test-Path -LiteralPath $Path -PathType Container) { throw [IO.IOException]::new("'$Path' is a directory") }
+    # r13d (Dot 6458932346): the typed unpublished status is not the record; it is captured apart (by value)
+    if ((Split-Path -Leaf $Path) -eq 'core-partition-unpublished.json') { $global:cpStatus = $Object | ConvertTo-Json -Depth 30 | ConvertFrom-Json -AsHashtable; return }
     $global:cpSaved = $Object
 }
 # sol r6 CP-06: the double's exit as the job reads it: exit -> 0, exit-nonzero -> 1, a killed helper -> -1, a failed wait -> not exited (unread).
@@ -1448,7 +1468,7 @@ foreach ($c in $cases) {
     # r8 A1: the pre-launch region's (wall, monotonic) pairs at the pre-helper and measured-launch reads (absent before r8)
     $corePartitionClockPairs = [Collections.Generic.List[object]]::new()
     if (Get-Command Get-CorePartitionMonoMs -ErrorAction SilentlyContinue) { foreach ($n in 1, 2) { $corePartitionClockPairs.Add(@([DateTime]::UtcNow.Ticks, (Get-CorePartitionMonoMs))) } }
-    $global:cpSaved = $null
+    $global:cpSaved = $null; $global:cpStatus = $null
     foreach ($l in $preLines) { if (-not $l.StartsWith('if ')) { . ([scriptblock]::Create($l)) } }
     $corePartitionHelper = $(if ($c.mode -ne 'none') { New-HelperDouble $c.mode })
     $corePartitionHelperLaunch = [ordered]@{ pid = $(if ($c.launchPid -ne 'null') { 4242 }); ready = $c.ready; readyWaitMs = 30000 }
@@ -1466,6 +1486,7 @@ foreach ($c in $cases) {
         # core-partition.json carries no refused record, and the summary scalars were computed (the summary line's input)
         publishedHelper = $(if ($null -ne $global:cpSaved) { $null -ne $global:cpSaved.helper } else { 'not-published' })
         scalars = ($null -ne $s -and @($s.Keys).Count -eq 20)
+        status = $(if ($null -ne $global:cpStatus) { [ordered]@{ why = $global:cpStatus.why; stage = $global:cpStatus.stage; staleRecordOnDisk = $global:cpStatus.staleRecordOnDisk; errors = @($global:cpStatus.errors) } })
     }
   } catch { $out[$c.name] = [ordered]@{ threw = [string]$_.Exception.Message } }
 }
@@ -1831,6 +1852,17 @@ class CorePartitionPureHelperTests(unittest.TestCase):
                 for flag in ("corePartitionTopologyOk", "benchAffinityApplied", "partitionLoadApplied"):
                     self.assertIn(f"{flag}=core-partition-json-unpublished", c["why"])
                 self.assertTrue(any(e.startswith("publish: ") for e in c["errors"]), c)
+        # r13d (Dot 6458932346, the class of the late errors): the publish error is raised after the record's error snapshot, so a typed status
+        # beside it carries it durably (on 51c90c3d it was in memory only). A directory at core-partition.json leaves the status name writable.
+        st = got["publish-directory"]["status"]
+        self.assertIsNotNone(st, f"a failed publication left no durable status: {got['publish-directory']}")
+        self.assertEqual([st["why"], st["stage"], st["staleRecordOnDisk"]], ["core-partition-json-unpublished", "publish", False], st)
+        self.assertTrue(any(e.startswith("publish: ") and "is a directory" in e for e in st["errors"]), st)
+        # a publisher that refuses every write cannot write the status either: that error is named in memory, nothing is claimed durable
+        io = got["publish-io-exception"]
+        self.assertIsNone(io["status"], io)
+        self.assertIn("unpublished-status: injected publisher IOException", io["errors"], io)
+        self.assertIsNone(control["status"], control)
 
     def test_an_unknown_measured_pid_through_the_job_cleanup_binds_nothing(self) -> None:
         """sol r4 CP-02 through the job's cleanup block: no runner result.json, so no measured pid, so no app evidence is accepted."""
