@@ -494,11 +494,18 @@ function Send-HeavySlotStop($Lease) {
     try { Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -ErrorAction Stop; return } catch { $why = $_.Exception.Message }
     Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} stop file not written ({1}); ending heavy-slot pid {2} and its children' -f $Lease.Label, $why, $Lease.Process.Id)
     # taskkill sets the global $LASTEXITCODE, which a Library caller may exit with after the release, so it is kept
-    # (r5b adversary A3).
+    # (r5b adversary A3), and left unset when it was unset, which strict mode cannot read (r5b pass 2 A2). taskkill's own
+    # failure (heavy-slot ended after the HasExited check) never throws, even under $PSNativeCommandUseErrorActionPreference
+    # (r5b pass 2 A3): the release stays warning-only and the holder fallback below still runs.
     if (-not $Lease.Process.HasExited) {
-        $keep = $global:LASTEXITCODE
-        $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $Lease.Process.Id /T /F 2>&1
-        $global:LASTEXITCODE = $keep
+        $last = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
+        $keep = if ($last) { $last.Value } else { $null }
+        $PSNativeCommandUseErrorActionPreference = $false
+        try { $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $Lease.Process.Id /T /F 2>&1 }
+        catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} taskkill of heavy-slot pid {1} failed ({2})' -f $Lease.Label, $Lease.Process.Id, $_.Exception.Message) }
+        finally {
+            if ($last) { $global:LASTEXITCODE = $keep } else { Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore }
+        }
     }
     # (The wrapper's pid cannot be reused here: $Lease.Process has held its handle since Process.Start.)
     # A holder that outlived heavy-slot is no longer in that tree: it is ended by its own identity (r3b adversary A2), and only
@@ -603,8 +610,12 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         foreach ($d in @(@('HeavySlotWaitMinutes', $waitMin), @('HeavySlotEtaMinutes', $etaMin))) {
             if (-not ($d[1] -ge 0 -and $d[1] -le $script:HeavySlotMaxMinutes)) { throw ('{0} is not a number from 0 to {1}' -f $d[0], $script:HeavySlotMaxMinutes) }
         }
+        # -0.0 is in range but formats as '-0' (r5b pass 2 A1); Abs makes it 0. Each value then goes out only in the form
+        # heavy-slot's parser reads.
+        $waitMin = [Math]::Abs($waitMin); $etaMin = [Math]::Abs($etaMin)
         $waitArg = $waitMin.ToString('0.##########', $inv) + 'm'
         $etaArg = $etaMin.ToString('0.##########', $inv) + 'm'
+        foreach ($a in $waitArg, $etaArg) { if ($a -cnotmatch '^\d+(\.\d+)?m$') { throw "'$a' is not a duration heavy-slot reads" } }
         $giveUp = [TimeSpan]::FromMinutes($waitMin + $script:HeavySlotGiveUpSlackMinutes)
     } catch { $why = $_.Exception.Message }
     if ($null -eq $giveUp) {

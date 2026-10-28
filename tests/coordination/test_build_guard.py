@@ -1665,6 +1665,49 @@ def test_a_heavy_slot_tree_kill_at_release_keeps_the_callers_exit_code(box) -> N
     assert done.returncode == 9, done.stdout + done.stderr
 
 
+@pytest.mark.parametrize("option", ["HeavySlotWaitMinutes", "HeavySlotEtaMinutes"])
+def test_negative_zero_minutes_reach_heavy_slot_as_a_readable_duration(box, option) -> None:
+    # r5b adversary eef65194-A1: -0.0 is in range but formats as '-0m', which heavy-slot's parser refuses after the launch.
+    # It is zero, so it goes out as '0m' and the build runs.
+    done = _library_driver(
+        box,
+        f"$opts.{option} = -0.0\n"
+        "Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs) Write-Output \"built=$Jobs\" }\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 0 and "built=4" in done.stdout, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    argv = call["argv"]
+    flag = "--wait" if option == "HeavySlotWaitMinutes" else "--eta"
+    assert argv[argv.index(flag) + 1] == "0m", argv
+
+
+@pytest.mark.parametrize("host", [
+    # eef65194-A2: strict mode and no $LASTEXITCODE yet (no native command ran in this host).
+    "Set-StrictMode -Version Latest\n",
+    # eef65194-A3: taskkill fails (the wrapper ended after the HasExited check) under a host that makes a failing native
+    # command throw.
+    "$global:LASTEXITCODE = 9; $ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true\n",
+])
+def test_a_failed_stop_file_falls_back_to_taskkill_without_a_throw_or_a_changed_exit_code(box, host) -> None:
+    # r5b adversary eef65194-A2/A3: the stop file cannot be written, so heavy-slot is ended by taskkill. Neither reading
+    # the caller's $LASTEXITCODE nor taskkill's own failure may throw out of the release; the caller's code is kept (and
+    # stays unset when it was unset).
+    stop = box["dir"] / "x.stop"
+    stop.mkdir()
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n" + host +
+                "$p = [pscustomobject]@{ Id = 2147483646; HasExited = $false }\n"
+                f"$lease = @{{ Label = 'mlv:t:build'; Stop = '{stop}'; Process = $p; Holder = $null }}\n"
+                "$had = [bool](Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore)\n"
+                "try { Send-HeavySlotStop $lease; Write-Output \"returned had=$had now=$([bool](Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore)) code=$(if ($had) { $global:LASTEXITCODE })\" }\n"
+                "catch { Write-Output \"threw=$($_.Exception.GetType().Name): $($_.Exception.Message)\" }\n"])
+    assert "stop file not written" in done.stderr, done.stdout + done.stderr
+    assert "threw=" not in done.stdout, done.stdout + done.stderr
+    expected = "returned had=True now=True code=9" if "= 9" in host else "returned had=False now=False code="
+    assert expected in done.stdout, done.stdout + done.stderr
+
+
 def test_explicit_empty_inputs_reach_the_guard_as_given(box) -> None:
     # sol hardening (r3b review): _heavy(memory=[]) and sha='' are test inputs, not requests for the defaults.
     done = _heavy(box, "run", ["-Command", _marker_command(box)], sha="", memory=[])
