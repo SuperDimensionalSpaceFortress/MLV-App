@@ -824,7 +824,16 @@ function Write-BatchReceipt([System.Collections.IDictionary]$B) {
     Write-ReceiptFile $B.batch $perBatch $putPerBatch
     $perBatchOk = $script:receiptFileWritten
     Write-ReceiptFile $B.batch $jsonl { $rec.logWriteFailures = $script:logWriteFailures; Add-Content -LiteralPath $jsonl -Value ($rec | ConvertTo-Json -Compress -Depth 8) -ErrorAction Stop }
-    if ($perBatchOk -and $snap.perBatch -ne $script:logWriteFailures) { Write-ReceiptFile $B.batch $perBatch $putPerBatch }
+    if ($perBatchOk -and $snap.perBatch -ne $script:logWriteFailures) {
+        # adversary r4 A1: the rewrite is a write the base never made, and the diagnostic before it can take time: an accepted input (the next leg's spec) can have become a link to batch-NN.json
+        # since the last alias guard ran, and WriteAllText would overwrite it. The guard runs again right before the rewrite; a location hit skips the write and turns the suppression on
+        # (Test-OpenOutputAlias's rule), so nothing more goes into -RunDir and the next batch's own guard ends the run in the typed refusal. A content hit is no alias: the rewrite goes on.
+        $aliasHit = Get-InputOutputRefusal
+        if ($aliasHit -and $aliasHit.kind -cne 'content') {
+            $script:RunOutputAliased = $true; $script:batchLog = $null
+            [Console]::Error.WriteLine("BATCH_RECEIPT_REWRITE_SKIPPED batch=$($B.batch) file=$perBatch (an accepted input is a runner output; nothing more is written into -RunDir)")
+        } else { Write-ReceiptFile $B.batch $perBatch $putPerBatch }
+    }
 }
 # BACHELOR-DEDICATED-CAPS-RUNNER-1: the caps are Bachelor's heavy-slot.lease.json (the owner moves them), so they are READ, not mirrored: one light exempt job
 # (GateExemptJobPattern ^venue-quiet-probe-: no lease, no slot, no venue claim) prints the file; anything unreadable or invalid is the old constants (the tightest ever

@@ -2148,9 +2148,20 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     _EXPIRED_MARKER, _ACK_MARKER = "runner-pause-expired.marker", "runner-ack.marker"
 
+    def _pause_snippet(self, message: str, pause_s: float) -> str:
+        """The PowerShell the runner copy runs at its first log line starting `message` (see _runner_paused_at_claim_taken); its own method so a test can run it alone."""
+        paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
+        expired, ack = self.case / self._EXPIRED_MARKER, self.case / self._ACK_MARKER
+        return (f"    if (-not $script:PauseDone -and $Message.StartsWith('{psq(message)}', [StringComparison]::Ordinal)) {{ $script:PauseDone = $true; $n = [guid]::NewGuid().ToString('N'); Set-Content -LiteralPath '{psq(paused)}' -Value $n; "
+                 f"$sw = [Diagnostics.Stopwatch]::StartNew(); $seen = $false; "
+                 f"while ($sw.Elapsed.TotalSeconds -lt {pause_s}) {{ if (Test-Path -LiteralPath '{psq(locked)}') {{ $seen = $sw.Elapsed.TotalSeconds -lt {pause_s}; break }}; Start-Sleep -Milliseconds 20 }}\n"
+                 f"        if ($seen) {{ $held = $false; try {{ [IO.File]::Open($batchLog, 'Open', 'Read', 'ReadWrite').Dispose() }} catch [IO.IOException] {{ $held = $true }}; "
+                 f"if ($held -and $sw.Elapsed.TotalSeconds -lt {pause_s}) {{ Set-Content -LiteralPath '{psq(ack)}' -Value ($n + ' held') }} elseif ($held) {{ $seen = $false }} }} "
+                 f"if (-not $seen) {{ Set-Content -LiteralPath '{psq(expired)}' -Value ($n + ' expired') }} }}\n")
+
     def _runner_paused_at_claim_taken(self, message: str = "CLAIM_TAKEN", release_at: str = "", more: tuple = (), pause_s: float = 60) -> tuple[Path, Path, Path]:
         """A copy of the runner that PAUSES when it is about to log a line starting `message` (CLAIM_TAKEN by default): it writes `paused` (holding an attempt nonce it generates) and waits (at most
-        `pause_s`, 60 by default) for `locked` to appear. Seeing `locked` inside the window, it probes batch.log itself and, only if the log really is held, writes `ack` = `<nonce> held`; a pause that
+        `pause_s`, 60 by default) for `locked` to appear. Seeing `locked` inside the window (the clock is read after the look, and again after the probe: adversary r4 A2), it probes batch.log itself and, only if the log really is held, writes `ack` = `<nonce> held`; a pause that
         runs out with no `locked` writes `expired` = `<nonce> expired` and the runner carries on. The pause happens once per run (a later matching line, e.g. batch 2's, never re-pauses or re-acks). A pause marker that survives the expiry is therefore never a handshake (sol r3 B1; Dot on #704).
         With `release_at`, the first line starting with it once `locked` exists writes `release-wanted` and waits (at most 60 s) for `released`: the lock holder lets go there.
         Returns (runner, paused, locked). Dot on #684: the lock helper used to poll for the claim file and hope to win the race with the runner's next log line; the handshake makes the order a fact.
@@ -2158,13 +2169,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
         wanted, released = self.case / "release-wanted.marker", self.case / "log-released.marker"
         anchor = "function L([string]$Message) {\n"
-        expired, ack = self.case / self._EXPIRED_MARKER, self.case / self._ACK_MARKER
-        pause = (f"    if (-not $script:PauseDone -and $Message.StartsWith('{psq(message)}', [StringComparison]::Ordinal)) {{ $script:PauseDone = $true; $n = [guid]::NewGuid().ToString('N'); Set-Content -LiteralPath '{psq(paused)}' -Value $n; "
-                 f"$sw = [Diagnostics.Stopwatch]::StartNew(); $seen = $false; "
-                 f"while ($sw.Elapsed.TotalSeconds -lt {pause_s}) {{ if (Test-Path -LiteralPath '{psq(locked)}') {{ $seen = $true; break }}; Start-Sleep -Milliseconds 20 }}\n"
-                 f"        if ($seen) {{ $held = $false; try {{ [IO.File]::Open($batchLog, 'Open', 'Read', 'ReadWrite').Dispose() }} catch [IO.IOException] {{ $held = $true }}; "
-                 f"if ($held) {{ Set-Content -LiteralPath '{psq(ack)}' -Value ($n + ' held') }} }} "
-                 f"else {{ Set-Content -LiteralPath '{psq(expired)}' -Value ($n + ' expired') }} }}\n")
+        pause = self._pause_snippet(message, pause_s)
         if release_at:
             pause += (f"    if ($Message.StartsWith('{psq(release_at)}', [StringComparison]::Ordinal) -and (Test-Path -LiteralPath '{psq(locked)}') -and -not (Test-Path -LiteralPath '{psq(released)}')) {{ "
                       f"Set-Content -LiteralPath '{psq(wanted)}' -Value 'release'; $sw = [Diagnostics.Stopwatch]::StartNew(); "
@@ -2687,6 +2692,35 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap_log.read_bytes(), "nothing was appended to batch.log after the alias was found")
         self.assertEqual((self.run_dir / "batch-01.json").read_bytes(), snap_rec.read_bytes(), "the linked input is byte-unchanged")
 
+    def test_r4_adv_a1_the_batch_receipt_rewrite_does_not_overwrite_an_input_that_became_a_link_to_it_during_the_diagnostic(self) -> None:
+        # adversary r4 A1: batch-01.json is rewritten when the batches.jsonl diagnostic's own log failure bumped logWriteFailures. The diagnostic is the window: the next leg's spec becomes
+        # a hard link to batch-01.json there, after every alias guard has run, and the unconditional rewrite then overwrote the accepted input. The guard now runs right before the rewrite.
+        # The diagnostic's log line is made to fail (counted) and to link the spec first, inside a copy of the runner; the linked receipt must stay what the first write left.
+        snap = self.case / "batch-01.json.snap"
+        spec2 = psq(self.case / "fx-b-copy.json")
+        inject = (f"if (-not $script:LinkDone -and $Message.StartsWith('RECEIPT_PERSIST_FAILED', [StringComparison]::Ordinal)) {{ $script:LinkDone = $true; [IO.File]::Delete('{spec2}'); "
+                  f"New-Item -ItemType HardLink -Path '{spec2}' -Value (Join-Path $RunDir 'batch-01.json') | Out-Null; Copy-Item -LiteralPath (Join-Path $RunDir 'batch-01.json') -Destination '{psq(snap)}'; "
+                  "throw [IO.IOException]::new('locked') }")
+        args, e, _ = self._two_batch_plan("")
+        anchor_l = "function L([string]$Message) {\n"
+        args[args.index("-File") + 1] = str(self._patched_runner(anchor_l, anchor_l + "    " + inject + "\n"))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertTrue(snap.exists(), "the link was made inside the diagnostic (the case under test)\n" + r.stdout + r.stderr)
+        self.assertEqual((self.run_dir / "batch-01.json").read_bytes(), snap.read_bytes(), "the receipt rewrite went through the new link and overwrote the accepted input\n" + r.stdout + r.stderr)
+        self.assertIn("BATCH_RECEIPT_REWRITE_SKIPPED batch=1 ", r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_SPEC_IS_RUN_OUTPUT", r.stderr + r.stdout)
+
+    def test_r4_adv_a1_the_batch_receipt_rewrite_still_happens_when_no_input_is_a_run_output(self) -> None:
+        # the control: the same diagnostic log failure with no link rewrites batch-01.json with the count (r2's second per-batch write), so the new guard changes nothing else
+        anchor_l = "function L([string]$Message) {\n"
+        args, e, _ = self._two_batch_plan("")
+        args[args.index("-File") + 1] = str(self._patched_runner(anchor_l, anchor_l + "    if ($Message.StartsWith('RECEIPT_PERSIST_FAILED', [StringComparison]::Ordinal)) { throw [IO.IOException]::new('locked') }\n"))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        self.assertGreaterEqual(json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))["logWriteFailures"], 1, "batch-01.json was rewritten with the diagnostic's log failure")
+        self.assertNotIn("BATCH_RECEIPT_REWRITE_SKIPPED", r.stderr)
+
     # r3 (sol r2b B2 = catalogue RPF-02): the lock helper took batch.log after its marker wait expired or was cancelled, whether or not the runner had paused, so a slow start was
     # locked ahead of the pause (and died on its next direct L), and 'locked' was written for a runner that never paused. These drive the helper alone: no runner, no pause marker.
     def test_r3_b2_an_expired_or_cancelled_marker_wait_takes_no_lock_and_signals_nothing(self) -> None:
@@ -2818,6 +2852,22 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         with self.assertRaises(AssertionError):
             self._assert_handshake(state, "CLAIM_TAKEN", r)
         self.assertEqual(r.returncode, 0, "the runner resumed without a lock and the batch ran normally\n" + r.stdout + r.stderr)
+
+    def test_r4_adv_a2_a_lock_the_runner_looks_at_after_its_pause_ran_out_is_expired_not_acknowledged(self) -> None:
+        # adversary r4 A2: the pause loop checked the clock BEFORE the look, so a look that returned after the window (here 2 s into a 1 s pause) still counted as seen, was probed and
+        # acknowledged, and no expiry was recorded. The clock is read after the look, and again after the probe. The pause snippet runs alone; Test-Path is a function that returns late.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        log = self.run_dir / "batch.log"
+        log.write_text("", encoding="utf-8")
+        snippet = self._pause_snippet("CLAIM_TAKEN", 1)
+        script = self.case / "pause-snippet.ps1"
+        script.write_text("function Test-Path { param([string]$LiteralPath) Start-Sleep -Seconds 2; $true }\n"
+                          f"$batchLog = '{psq(log)}'\n$Message = 'CLAIM_TAKEN batch=1'\n" + snippet + "\n'done'\n", encoding="utf-8-sig")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        expired, ack = self.case / self._EXPIRED_MARKER, self.case / self._ACK_MARKER
+        self.assertTrue(expired.exists(), "a look that returned after the window is an expired pause")
+        self.assertFalse(ack.exists(), "a late look is never acknowledged")
 
     def test_r4_b1_a_prompt_helper_is_acknowledged_by_the_runner_with_its_own_nonce_while_the_log_is_held(self) -> None:
         # the successful-handshake control on the real runner: paused, locked, the runner probes batch.log (held), writes `<nonce> held`, and only then resumes
