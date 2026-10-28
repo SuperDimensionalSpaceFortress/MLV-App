@@ -169,7 +169,7 @@ $script:HeavySlotGiveUpSlackMinutes = 15
 # waits behind the blocked writer, because an inherited pipe handle shares one file object. So this thread never touches the
 # handle. The raw stderr stream is opened on the thread pool, through a .NET delegate, and each line is written with
 # Stream.WriteAsync, which runs the write on the thread pool and keeps the lines in order; the guard waits at most
-# $script:BuildGuardLogWaitMs for it. A stderr nobody drains costs one bounded wait; while a write is still pending, later
+# $script:BuildGuardLogWaitMs per line, for the open and the write together. A stderr nobody drains costs one bounded wait; while a write is still pending, later
 # lines queue without waiting, at most $script:BuildGuardLogMaxPending of them (the rest are dropped and counted in
 # $script:BuildGuardLogDropped), so admission polling, the hung-tool bound and every release keep running. A drained stderr
 # has each line written before the guard goes on, as before.
@@ -180,30 +180,46 @@ $script:BuildGuardLogOpen = $null
 $script:BuildGuardLogBytes = [System.Collections.Generic.Queue[byte[]]]::new()
 $script:BuildGuardLogPending = [System.Collections.Generic.Queue[System.Threading.Tasks.Task]]::new()
 
+function New-BuildGuardStderrOpen {
+    # The task that opens the raw stderr stream on the thread pool (a test seam: a test replaces it to open a slow stream).
+    $open = [Delegate]::CreateDelegate([Func[System.IO.Stream]], [Console].GetMethod('OpenStandardError', [Type[]]@()))
+    return [System.Threading.Tasks.Task]::Run($open)
+}
+
+function Send-BuildGuardStderrQueue {
+    # Once the stream is open, every queued line goes out (WriteAsync, in order); returns the last write task, or $null.
+    $open = $script:BuildGuardLogOpen
+    if (-not $open -or -not $open.IsCompleted) { return $null }
+    $stream = $open.Result
+    $task = $null
+    $waiting = $script:BuildGuardLogBytes
+    while ($waiting.Count -gt 0) {
+        $bytes = $waiting.Dequeue()
+        $task = $stream.WriteAsync($bytes, 0, $bytes.Length)
+        $script:BuildGuardLogPending.Enqueue($task)
+    }
+    return $task
+}
+
 function Write-BuildGuardStderr([string]$Line) {
     try {
+        # One deadline for the whole line, the open and the write together (r6b adversary A2).
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
         $q = $script:BuildGuardLogPending
-        while ($q.Count -gt 0 -and $q.Peek().IsCompleted) { [void]$q.Dequeue() }
         $waiting = $script:BuildGuardLogBytes
+        # Lines queued while the open was still pending go out before the capacity check, so a stderr that recovers gets
+        # them and every later line instead of dropping all of them (r6b adversary A1).
+        [void](Send-BuildGuardStderrQueue)
+        while ($q.Count -gt 0 -and $q.Peek().IsCompleted) { [void]$q.Dequeue() }
         if ($q.Count + $waiting.Count -ge $script:BuildGuardLogMaxPending) { $script:BuildGuardLogDropped++; return }
         $waiting.Enqueue([Console]::OutputEncoding.GetBytes($Line + [Environment]::NewLine))
         # Stalled: an earlier line (or the open) is still pending, so this one only queues behind it.
         $stalled = $q.Count -gt 0 -or ($script:BuildGuardLogOpen -and -not $script:BuildGuardLogOpen.IsCompleted)
-        if (-not $script:BuildGuardLogOpen) {
-            $open = [Delegate]::CreateDelegate([Func[System.IO.Stream]], [Console].GetMethod('OpenStandardError', [Type[]]@()))
-            $script:BuildGuardLogOpen = [System.Threading.Tasks.Task]::Run($open)
-        }
+        if (-not $script:BuildGuardLogOpen) { $script:BuildGuardLogOpen = New-BuildGuardStderrOpen }
         $open = $script:BuildGuardLogOpen
-        if (-not $stalled -and -not $open.IsCompleted) { [void]$open.Wait($script:BuildGuardLogWaitMs) }
-        if (-not $open.IsCompleted) { return }
-        $stream = $open.Result
-        $task = $null
-        while ($waiting.Count -gt 0) {
-            $bytes = $waiting.Dequeue()
-            $task = $stream.WriteAsync($bytes, 0, $bytes.Length)
-            $q.Enqueue($task)
-        }
-        if (-not $stalled) { [void]$task.Wait($script:BuildGuardLogWaitMs) }
+        if (-not $stalled -and -not $open.IsCompleted) { [void]$open.Wait([int][math]::Max(0, $script:BuildGuardLogWaitMs - $clock.ElapsedMilliseconds)) }
+        $task = Send-BuildGuardStderrQueue
+        if (-not $stalled -and $task) { [void]$task.Wait([int][math]::Max(0, $script:BuildGuardLogWaitMs - $clock.ElapsedMilliseconds)) }
     } catch { }
 }
 

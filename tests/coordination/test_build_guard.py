@@ -2000,6 +2000,70 @@ def test_a_drained_stderr_keeps_every_guard_line_in_order(box) -> None:
     assert at == sorted(at), done.stderr
 
 
+# r6b adversary A1/A2: the bounded stderr writer, driven in memory. A stream whose writes never complete, and an open that
+# completes after a delay, stand in for an inherited stderr nobody drains (no pipe, nothing on disk).
+_STDERR_SEAMS = (
+    "Add-Type -TypeDefinition @'\n"
+    "using System; using System.IO; using System.Threading; using System.Threading.Tasks;\n"
+    "public class BuildGuardStuckStream : Stream {\n"
+    "    public int Writes;\n"
+    "    public override bool CanRead { get { return false; } } public override bool CanSeek { get { return false; } }\n"
+    "    public override bool CanWrite { get { return true; } } public override long Length { get { return 0; } }\n"
+    "    public override long Position { get { return 0; } set { } } public override void Flush() { }\n"
+    "    public override int Read(byte[] b, int o, int c) { throw new NotSupportedException(); }\n"
+    "    public override long Seek(long o, SeekOrigin s) { throw new NotSupportedException(); }\n"
+    "    public override void SetLength(long v) { } public override void Write(byte[] b, int o, int c) { Thread.Sleep(-1); }\n"
+    "    public override Task WriteAsync(byte[] b, int o, int c, CancellationToken t) {\n"
+    "        Interlocked.Increment(ref Writes); return new TaskCompletionSource<object>().Task; }\n"
+    "}\n"
+    "public static class BuildGuardSlowOpen {\n"
+    "    public static Task<Stream> After(int ms, Stream s) { return Task.Delay(ms).ContinueWith(t => s); }\n"
+    "}\n"
+    "'@\n"
+)
+
+
+def test_a_stderr_that_recovers_after_a_full_queue_gets_every_line() -> None:
+    # r6b adversary A1: 256 lines queued behind a pending open, then the open completes with a writable stream. The next line
+    # (here the missing-shim fail-open warning) flushes the queue and is written itself; nothing is dropped.
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n"
+                "$tcs = [System.Threading.Tasks.TaskCompletionSource[System.IO.Stream]]::new()\n"
+                "$script:BuildGuardLogOpen = $tcs.Task\n"
+                "for ($i = 0; $i -lt 256; $i++) { Write-BuildGuardStderr ('queued-{0}' -f $i) }\n"
+                "$ms = [System.IO.MemoryStream]::new()\n"
+                "[void]$tcs.TrySetResult($ms)\n"
+                "$lease = Enter-HeavySlot -Options @{ HeavySlotCmd = 'C:\\no-such-heavy-slot-for-review\\heavy-slot.cmd' } -Label t\n"
+                "Write-Output (\"lease-null={0} dropped={1}\" -f ($null -eq $lease), $script:BuildGuardLogDropped)\n"
+                "Write-Output ([Text.Encoding]::ASCII.GetString($ms.ToArray()))\n"])
+    out = done.stdout + done.stderr
+    assert "lease-null=True dropped=0" in done.stdout, out
+    lines = [ln for ln in done.stdout.splitlines() if ln.startswith(("queued-", "[build-guard]"))]
+    assert lines[:256] == [f"queued-{i}" for i in range(256)], out
+    assert lines[256].startswith("[build-guard] HEAVY_SLOT_WARN label=t shim=missing"), out
+
+
+def test_one_stderr_line_waits_at_most_the_bound_for_open_and_write_together() -> None:
+    # r6b adversary A2: the first line, the open completes after 1500 ms and the write never does. The line waits at most
+    # BuildGuardLogWaitMs (2000 ms) in total, not 1500 + 2000; the next line, behind the stuck write, does not wait at all.
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n" + _STDERR_SEAMS +
+                "$stuck = [BuildGuardStuckStream]::new()\n"
+                "function New-BuildGuardStderrOpen { return [BuildGuardSlowOpen]::After(1500, $stuck) }\n"
+                "$sw = [System.Diagnostics.Stopwatch]::StartNew()\n"
+                "Write-BuildGuardLog 'first'\n"
+                "$first = $sw.ElapsedMilliseconds\n"
+                "$sw.Restart(); Write-BuildGuardLog 'second'; $second = $sw.ElapsedMilliseconds\n"
+                "Write-Output (\"first={0} second={1} writes={2}\" -f $first, $second, $stuck.Writes)\n"])
+    out = done.stdout + done.stderr
+    m = re.search(r"first=(\d+) second=(\d+) writes=(\d+)", done.stdout)
+    assert m, out
+    first, second, writes = (int(g) for g in m.groups())
+    assert writes >= 1, f"the slow open was never used: {out}"
+    assert 1400 <= first <= 2600, f"one line waited {first} ms for the open and the write together (bound 2000 ms): {out}"
+    assert second < 500, out
+
+
 def test_the_hung_tool_clock_starts_before_any_diagnostic_line() -> None:
     # r6 B1: the clock starts before the launch, and no guard stderr line bypasses the bounded writer while a slot can be held
     # (the two left are usage errors, written before any slot is taken).
