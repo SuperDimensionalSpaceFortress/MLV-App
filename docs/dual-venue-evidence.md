@@ -275,10 +275,11 @@ longer cleared it. Before the spawn the job now terminates the default `PresentM
 PresentMon's own `--terminate_existing_session` (`logman stop <name> -ets` only for a session still listed afterwards) -- but only when no PresentMon process is alive on the host
 (checked before the listing and again right after it); otherwise it records that it did not run. "A PresentMon process" is every `PresentMon*` process except one POSITIVELY
 identified as not a capture (UM-SWEEP-OWNER-PRESENTMONSERVICE-1): the owner's always-running `PresentMonService` (Bachelor) is recognised because its pid is the `ProcessId` of a
-registered Windows service (`Win32_Service`), and a process with a readable path that is neither the pinned image/path nor a capture image is excluded too. The pinned capture executable
-(image name equal to the pinned one, case-insensitive, or the pinned cache path), a foreign capture image, and any process whose path cannot be read and that is no registered service
-are live (the sweep is skipped, with the reason recorded in `orphanSweep.livePresentMonProcesses`: name, pid, `pathReadable`, reason). Excluded processes are recorded in
-`orphanSweep.excludedPresentMonProcesses` (name, pid, service, `pathReadable`; never a path). A process list or a service lookup that cannot be read stops the sweep with
+registered Windows service (`Win32_Service`). Every other `PresentMon*` process is live: the pinned capture executable (image name equal to the pinned one, case-insensitive, or the pinned
+cache path), a foreign capture image, a process whose path cannot be read, and (since BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 r2) a readable-path process that is no capture image -- a
+readable path is no identity, because a second harness under the same agent account has one. The reasons are recorded in `orphanSweep.livePresentMonProcesses` (name, pid, `pathReadable`,
+reason, `nonCaptureIdentity`, `parentName`, `parentPid`, `identityError`). Excluded processes are recorded in
+`orphanSweep.excludedPresentMonProcesses` (name, pid, service, `pathReadable`, `nonCaptureIdentity = registered_service`; never a path). A process list or a service lookup that cannot be read stops the sweep with
 `error`. A job-issued `Kill()` is followed by the terminate of the job's own named
 session (both stop paths). `presentmon-capture.json` carries `orphanSweep` (ran, skippedReason, live pids, listed, matching listing lines, every action with its exit code,
 what remains) and `eventsLost` (PresentMon's stderr reported lost events: message count and largest count); the failure terminals' PresentMon reason gains a typed
@@ -287,9 +288,13 @@ what remains) and `eventsLost` (PresentMon's stderr reported lost events: messag
 *The harness's own sessions are swept even beside an unidentified non-capture PresentMon (BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1).* On Bachelor the `PresentMonService` is
 no registered service: it is a child of `IntelGraphicsSoftware.Service.exe`, and the agent cannot read its path. So it stayed live and skipped the whole sweep on every leg. On
 2026-10-27 at 20:06:20Z a lease demotion tree-killed a cpu leg mid-capture, leaving `MLVAttr3-...-150416` running, and every later capture on the host wrote no CSV (16 of 16
-cuda legs, `PRESENTMON_UNAVAILABLE`). Only a capture image (the pinned image by name or path, or any `PresentMon[-_.]<version|x64|...>` name) can own an `MLVAttr3-*` session.
-So when every live process is no capture image, the sweep runs in `orphanSweep.scope = harness_sessions`: it terminates the `MLVAttr3-*` orphans, leaves the default `PresentMon`
-session (recorded in `orphanSweep.deferred`), and stops on a re-check only for a capture image. With no PresentMon process alive the scope is `all`, as before. A display-report
+cuda legs, `PRESENTMON_UNAVAILABLE`). A live process is left out of the `MLVAttr3-*` blockers only on POSITIVE identity (r2; a name test is not enough: a second harness may run the
+permitted `-PresentMonName PresentMon-custom.exe`, which no capture-image pattern matches). The identity is `nonCaptureIdentity = intel_graphics_presentmonservice`: image name exactly
+`PresentMonService` AND, per `Win32_Process`, a parent named exactly `IntelGraphicsSoftware.Service.exe` that started no later than the child. A parent read that fails, finds no row or
+no `CreationDate`, or names another parent leaves the process a blocker (`identityError` says why). So when every live process is positively identified, the sweep runs in
+`orphanSweep.scope = harness_sessions`: it terminates the `MLVAttr3-*` orphans, leaves the default `PresentMon` session (recorded in `orphanSweep.deferred`), and stops on a re-check
+(the same blocker helper before every terminate and every `logman stop`) for any process without that identity. With no PresentMon process alive the scope is `all`, as before.
+`newlyListed` is what the full initial listing lacked, so a deferred session is never reported as new. A display-report
 failure whose sweep did not leave the host clean (skipped, aborted, `remaining`, `deferred`, a listing or sweep error) gains a typed `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE` detail.
 
 The sweep can never stop a live capture or a session it did not list as an orphan (round 2): it acts only on the names listed before its second liveness check -- a name a
