@@ -2645,7 +2645,17 @@ $r.selUnparseableStamp = PickSel (Select-CorePartitionFeedRowsFromStart @('10/24
 $r.selRowFromTheFuture = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 24600) + ',5,80,100,No,No'), ((Hw 40000) + ',5,80,100,No,No')) $anchor 26000)
 $r.selNoAnchor = PickSel (Select-CorePartitionFeedRowsFromStart $rows $null 26000)
 $r.selNoReadEnd = PickSel (Select-CorePartitionFeedRowsFromStart $rows $anchor $null)
-$feed = [ordered]@{ rows = 3; pkgWattsMean = 40.0; pkgWattsMax = 100.0; pkgTempCMean = 46.67; pkgTempCMax = 80.0; pkgThrottledRows = 0; pkgTempCAtStart = 30.0; reasons = [ordered]@{ pkgThrottledRows = 'feed-unparseable' } }
+# adversary r13d (73da8085) A1, its exact input: Central time, launch 2026-11-01T07:04:30Z (mono 1000), playback start 07:05:00Z (mono 31000), skew 0,
+# read done 62600. The row stamped 1:05:01 local was sampled at 06:05:01Z in the first of the two 1 o'clock hours, but the stamp also names
+# 07:05:01Z in the second; on 73da8085 the zone's standard-time reading kept it as a playback row (rows 1, 10 W / 30 C). A stamp the zone marks
+# ambiguous (fall back) or invalid (spring forward) is refused feed-row-stamp-ambiguous; the same row in a zone without DST is kept (control)
+$cst = [TimeZoneInfo]::FindSystemTimeZoneById('Central Standard Time')
+$dstL = [DateTime]::new(2026, 11, 1, 7, 4, 30, [DateTimeKind]::Utc)
+$dstA = @{ startMonoMs = 31000.0; launchUtcTicks = $dstL.Ticks; launchMonoMs = 1000.0; skewMs = 0.0 }
+$r.selA1dRepeatedHourRow = PickSel (Select-CorePartitionFeedRowsFromStart @('1.11.2026,1:05:01.000,5,30,10,No,No') $dstA 62600 1000 $cst)
+$r.selA1dSpringForwardGapRow = PickSel (Select-CorePartitionFeedRowsFromStart @('8.3.2026,2:30:00.000,5,30,10,No,No') $dstA 62600 1000 $cst)
+$r.selA1dUnambiguousControl = PickSel (Select-CorePartitionFeedRowsFromStart @('1.11.2026,7:05:01.000,5,30,10,No,No') $dstA 62600 1000 ([TimeZoneInfo]::Utc))
+$feed =[ordered]@{ rows = 3; pkgWattsMean = 40.0; pkgWattsMax = 100.0; pkgTempCMean = 46.67; pkgTempCMax = 80.0; pkgThrottledRows = 0; pkgTempCAtStart = 30.0; reasons = [ordered]@{ pkgThrottledRows = 'feed-unparseable' } }
 $late = Get-CorePartitionStartBoundFeed $feed @{ why = 'feed-window-start-unverified' }
 $r.bound = @($late.rows, $late.pkgWattsMean, $late.pkgTempCMean, $late.pkgTempCAtStart, $late.reasons['rows'], $late.reasons['pkgTempCMean'], $late.reasons['pkgThrottledRows'], $late.reasons.Contains('pkgTempCAtStart'))
 $r.boundTwice = @((Get-CorePartitionStartBoundFeed $late @{ why = 'feed-window-start-unverified' }).reasons['rows'])
@@ -2789,6 +2799,10 @@ class CorePartitionR13StartTests(unittest.TestCase):
         self.assertEqual(r["selRowFromTheFuture"], ["feed-row-stamp-unverified", None, 0])
         self.assertEqual(r["selNoAnchor"], [unverified, None, 0])
         self.assertEqual(r["selNoReadEnd"], [unverified, None, 0])
+        # adversary r13d (73da8085) A1: a local stamp in the repeated fall-back hour, or in the skipped spring-forward hour, names no one instant
+        self.assertEqual(r["selA1dRepeatedHourRow"], ["feed-row-stamp-ambiguous", None, 0])
+        self.assertEqual(r["selA1dSpringForwardGapRow"], ["feed-row-stamp-ambiguous", None, 0])
+        self.assertEqual(r["selA1dUnambiguousControl"], ["", 0, 1])
         self.assertEqual(r["sessionPrefixIsNotTheSession"], [unverified, None, 1])
         self.assertEqual(r["summaryFallback"], ["", 2000, 3])
         self.assertEqual(r["unknownSkew"], [unverified, None, 1])

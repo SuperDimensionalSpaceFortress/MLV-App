@@ -4696,7 +4696,10 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
 # stamp that does not map onto the job's clock (another time zone, a clock step): feed-row-stamp-unverified; a data row whose stamp does not
 # parse is feed-row-stamp-unparseable; no anchor or end read is feed-window-start-unverified. Lines that are not data rows (the header, an empty
 # line) are dropped. Returns @{ lines; excluded; why }: lines empty and excluded $null on a refusal. Never throws.
-function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadDoneMs, [double]$StampResolutionMs = 1000) {
+# adversary r13d (73da8085) A1: a local stamp names one instant only when $Zone (default the machine's) marks it neither ambiguous (the repeated
+# hour after a fall-back: a row sampled in the first copy reads as the second, up to an hour late, into playback) nor invalid (the hour skipped by
+# a spring-forward): either is feed-row-stamp-ambiguous. LIMIT: a run whose window crosses a fall-back hour publishes no window.
+function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadDoneMs, [double]$StampResolutionMs = 1000, $Zone = $null) {
     $no = { param($w) @{ lines = @(); excluded = $null; why = $w } }
     try {
         if ($null -eq $Anchor) { return & $no 'feed-window-start-unverified' }
@@ -4704,7 +4707,8 @@ function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadD
         $lm = (ConvertFrom-CorePartitionNumber $Anchor.launchMonoMs 'double').value; $sk = (ConvertFrom-CorePartitionNumber $Anchor.skewMs 'double').value
         $rd = (ConvertFrom-CorePartitionNumber $ReadDoneMs 'double').value
         if ($null -eq $p -or $null -eq $lt -or $lt -le 0 -or $null -eq $lm -or $null -eq $sk -or $sk -lt 0 -or $null -eq $rd) { return & $no 'feed-window-start-unverified' }
-        $inv = [Globalization.CultureInfo]::InvariantCulture; $sty = [Globalization.DateTimeStyles]::AssumeLocal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+        $inv = [Globalization.CultureInfo]::InvariantCulture; $sty = [Globalization.DateTimeStyles]::None
+        $tz = $(if ($Zone -is [TimeZoneInfo]) { $Zone } else { [TimeZoneInfo]::Local })
         $fmt = [string[]]@('d.M.yyyy H:mm:ss', 'd.M.yyyy H:mm:ss.FFFFFFF')
         $keep = [Collections.Generic.List[string]]::new(); $out = 0; $prevAt = $null
         foreach ($ln in @($Lines)) {
@@ -4713,6 +4717,8 @@ function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadD
             if ($c.Count -lt 7 -or $c[0].Length -lt 1 -or -not [char]::IsDigit($c[0], 0)) { continue }
             $t = [DateTime]::MinValue
             if (-not [DateTime]::TryParseExact(($c[0].Trim() + ' ' + $c[1].Trim()), $fmt, $inv, $sty, [ref]$t)) { return & $no 'feed-row-stamp-unparseable' }
+            if ($tz.IsAmbiguousTime($t) -or $tz.IsInvalidTime($t)) { return & $no 'feed-row-stamp-ambiguous' }
+            $t = [TimeZoneInfo]::ConvertTimeToUtc($t, $tz)
             $at = $lm + ($t.Ticks - $lt) / 1e4
             if ($at -gt $rd + $sk + [math]::Max(0.0, $StampResolutionMs)) { return & $no 'feed-row-stamp-unverified' }
             # adversary r13c (b252e9a4) A1: the sampler appends its rows in time order, so a stamp earlier than the row before it (beyond twice the
