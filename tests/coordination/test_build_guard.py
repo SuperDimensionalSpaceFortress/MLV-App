@@ -2108,6 +2108,87 @@ def test_the_hung_tool_clock_starts_before_any_diagnostic_line() -> None:
     assert text.count("[Console]::Error.WriteLine(") == 2, "a guard stderr line must go through Write-BuildGuardStderr"
 
 
+# r7 (a34e2098-A1, sol + fable r6b; folds BUILD-GUARD-NONTERMINATING-ERROR-STDERR-1): a non-terminating error the guard's own
+# cmdlets write while a slot is held is rendered by the host, synchronously, to stderr, past the bounded writer. Command mode
+# runs Invoke-BuildGuard under the default Continue, so a full undrained stderr blocked the release before the heavy-slot stop.
+def _hold_lock_fragment(box: dict) -> str:
+    # The action leaves build-slot.lock open with FileShare.Read (no Delete share), so the release cannot delete it.
+    return f"$global:BuildGuardR7Hold = [IO.File]::Open('{box['lock']}', 'Open', 'Read', 'Read'); exit 0"
+
+
+def test_a_build_slot_that_cannot_be_deleted_never_keeps_the_heavy_slot_behind_an_undrained_stderr(box) -> None:
+    pipe = _full_pipe()
+    guard = _heavy_popen(box, ["-Command", _hold_lock_fragment(box)], stderr=pipe[1])
+    try:
+        released = _released_within(box, _RELEASE_BOUND_S)
+        try:
+            code = guard.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            code = None
+    finally:
+        _release_pipe(pipe, guard)
+    assert released, f"the heavy slot was still held {_RELEASE_BOUND_S} s after the action: the release blocked on stderr"
+    assert code == 0, "the guard stayed blocked on a rendered error after the release"
+
+
+def test_a_build_slot_that_cannot_be_deleted_is_reported_through_the_guard_log(box) -> None:
+    # Control with a drained stderr: the failed delete is one [build-guard] line, never a host-rendered error record.
+    done = _heavy(box, "run", ["-Command", _hold_lock_fragment(box)])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "[build-guard] build slot not released" in done.stderr, done.stderr
+    assert "Remove-Item" not in done.stderr, done.stderr
+    assert "heavy-slot: released label=" in done.stderr, done.stderr
+
+
+def test_the_slot_functions_write_no_error_record_under_continue(box) -> None:
+    # The class (sol r6b sites :258 :277 :338 :350 :387 :392): every cmdlet the guard runs while a slot can be held either
+    # stops and is caught, or is silenced with its outcome checked and logged. Under the default Continue, none of them
+    # writes an error record to the PowerShell error stream (which the host renders to stderr, unbounded).
+    lock = box["lock"]
+    lock.write_text('{"ownerPid":1,"startTicks":1,"expiresTicks":1,"label":"stale"}', encoding="ascii")
+    missing = box["dir"] / "no-such-probe.json"
+    empty = box["dir"] / "empty.json"
+    empty.write_bytes(b"")
+    name =f"Local\\MLV-R7-{os.getpid()}"
+    taken = f"Local\\MLV-R7-taken-{os.getpid()}"
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n$ErrorActionPreference = 'Continue'\n"
+                f"$o = @{{ LockPath = '{lock}'; MutexName = '{name}'; LockExpiryMinutes = 90; "
+                f"MemoryProbeFile = '{missing}'; ProcessTableFile = '{missing}' }}\n"
+                f"$h = [IO.File]::Open('{lock}', 'Open', 'Read', 'Read')\n"
+                "function Show($what, $out) {\n"
+                "    $errs = @($out | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })\n"
+                "    $val = @($out | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })\n"
+                "    Write-Output (\"{0} errors={1} value={2}\" -f $what, $errs.Count, (($val | ForEach-Object {\n"
+                "        if ($_ -is [hashtable]) { ($_.Keys | Sort-Object | ForEach-Object { \"$_=$($val[0][$_])\" }) -join ';' } else { [string]$_ } }) -join '|'))\n"
+                "}\n"
+                "Show 'stale-held' (Invoke-BuildSlotAcquire -Options $o -Label t 2>&1)\n"
+                "Show 'release-held' (Remove-BuildSlot @{ MutexName = '" + name + "'; Path = '" + str(lock) + "'; OwnerPid = 1; StartTicks = 1 } 2>&1)\n"
+                "$h.Dispose()\n"
+                "Show 'memory' (Get-BuildGuardMemory -Options $o 2>&1)\n"
+                "Show 'jobs' (Get-BuildGuardJobs -Options $o -SelfPid $PID 2>&1)\n"
+                f"$o.MemoryProbeFile = '{empty}'; $o.ProcessTableFile = '{empty}'\n"
+                "Show 'memory-empty' (Get-BuildGuardMemory -Options $o 2>&1)\n"
+                "Show 'jobs-empty' (Get-BuildGuardJobs -Options $o -SelfPid $PID 2>&1)\n"
+                f"$ev =[System.Threading.EventWaitHandle]::new($false, 'AutoReset', '{taken}')\n"
+                f"$o.MutexName = '{taken}'\n"
+                "try { Show 'mutex-taken' (Invoke-BuildSlotAcquire -Options $o -Label t 2>&1) } catch { Write-Output \"mutex-taken threw\" }\n"])
+    out = done.stdout + done.stderr
+    for what in ("stale-held", "release-held", "memory", "jobs", "memory-empty", "jobs-empty"):
+        assert re.search(rf"^{what} errors=0 ", done.stdout, re.M), out
+    assert re.search(r"^memory-empty errors=0 value=CommitGB=0;PhysGB=0", done.stdout, re.M), out
+    assert re.search(r"^jobs-empty errors=0 value=.*Jobs=4", done.stdout, re.M), out
+    assert re.search(r"^stale-held errors=0 value=Acquired=False;Held=stale-lock-not-removed", done.stdout, re.M), out
+    assert re.search(r"^memory errors=0 value=CommitGB=0;PhysGB=0", done.stdout, re.M), out
+    assert re.search(r"^jobs errors=0 value=.*Jobs=4", done.stdout, re.M), out
+    # A mutex name taken by another kernel object refuses admission: it throws past the acquire (the caller's finally
+    # releases first), never an error record rendered while the slot is held.
+    assert "mutex-taken threw" in done.stdout, out
+    assert lock.exists(), "a lock that could not be deleted is left for reclaim"
+    for what in ("stale build slot not removed", "build slot not released", "memory probe unreadable", "process table unreadable"):
+        assert f"[build-guard] {what}" in done.stderr, out
+
+
 # --- hygiene pin: no local launcher defaults to -j8 --------------------------------------------
 
 

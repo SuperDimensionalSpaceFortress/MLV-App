@@ -106,7 +106,10 @@
 # Log lines go to stderr; typed lines (BUILD_MEM_REFUSED, BUILD_SLOT_BUSY) go to stdout, except
 # BUILD_GUARD_COMMAND_FAILED, which goes to stderr beside the error it reports. Output can never hold a slot (r6 sol B1): a
 # stderr line waits at most 2 s for its reader and then queues behind it (bounded, see Write-BuildGuardStderr), and every
-# typed refusal is printed only after the machine heavy slot was given back (or its stop file written).
+# typed refusal is printed only after the machine heavy slot was given back (or its stop file written). No guard cmdlet that
+# runs while a slot is held writes an error record, which the host renders to stderr synchronously, past that bound (r7,
+# a34e2098-A1): the memory probe, the process census, the build-slot acquire and its release are Stop-scoped, and each failure
+# is caught and logged, or refuses admission by a throw that the outer finally follows with the heavy-slot release.
 # Test seams (used by tests/coordination/test_build_guard.py, no real probe needed):
 #   -MemoryProbeFile   JSON array of {"freePhysGB":n,"freeCommitGB":n}, one sample per poll, last repeats
 #   -ProcessTableFile  JSON array of {"ProcessId":n,"Name":"cc1plus.exe","CreationDate":"<iso>"}
@@ -254,8 +257,15 @@ function ConvertTo-BuildGuardUtc($Value) {
 
 function Get-BuildGuardMemory([hashtable]$Options) {
     # Returns @{ PhysGB; CommitGB }. A probe that cannot be read reports 0 (fail closed, like dispatch-lane).
+    # r7 (a34e2098-A1): this runs while the machine heavy slot is held, so no cmdlet here may write an error record (the host
+    # renders it to stderr synchronously, past the bounded writer): each one stops and is caught, or is silenced and reported.
+    $ErrorActionPreference = 'Stop'
     if ($Options.MemoryProbeFile) {
-        $samples = @(Get-Content -LiteralPath $Options.MemoryProbeFile -Raw | ConvertFrom-Json)
+        try { $raw = Get-Content -LiteralPath $Options.MemoryProbeFile -Raw } catch {
+            Write-BuildGuardLog ('memory probe unreadable ({0}): reads 0 (fail closed)' -f ($_.Exception.Message -replace '\s+', ' '))
+            return @{ PhysGB = 0.0; CommitGB = 0.0 }
+        }
+        $samples = @(if ($null -ne $raw) { $raw | ConvertFrom-Json })
         if ($samples.Count -eq 0) { return @{ PhysGB = 0.0; CommitGB = 0.0 } }
         $i = [math]::Min($script:BuildGuardProbeIndex, $samples.Count - 1)
         $script:BuildGuardProbeIndex++
@@ -263,7 +273,10 @@ function Get-BuildGuardMemory([hashtable]$Options) {
         return @{ PhysGB = [double](Get-BuildGuardJsonField $samples[$i] 'freePhysGB'); CommitGB = [double](Get-BuildGuardJsonField $samples[$i] 'freeCommitGB') }
     }
     $os = Get-CimInstance Win32_OperatingSystem -OperationTimeoutSec $script:BuildGuardCimTimeoutSec -ErrorAction SilentlyContinue
-    if (-not $os) { return @{ PhysGB = 0.0; CommitGB = 0.0 } }
+    if (-not $os) {
+        Write-BuildGuardLog 'memory probe unreadable (Win32_OperatingSystem returned nothing): reads 0 (fail closed)'
+        return @{ PhysGB = 0.0; CommitGB = 0.0 }
+    }
     return @{
         PhysGB   = [math]::Round($os.FreePhysicalMemory / 1MB, 2)
         CommitGB = [math]::Round($os.FreeVirtualMemory / 1MB, 2)
@@ -272,9 +285,16 @@ function Get-BuildGuardMemory([hashtable]$Options) {
 
 function Get-BuildGuardJobs([hashtable]$Options, [int]$SelfPid) {
     # 4 by default; 2 when another live cc1plus / mingw32-make exists. Peers are pid@startUtc.
+    # It runs while both slots are held: Stop-scoped, and a table that cannot be read is logged (r7, a34e2098-A1).
+    $ErrorActionPreference = 'Stop'
     if ($Options.ProcessTableFile) {
+        try { $raw = Get-Content -LiteralPath $Options.ProcessTableFile -Raw } catch {
+            Write-BuildGuardLog ('process table unreadable ({0}): no peers counted' -f ($_.Exception.Message -replace '\s+', ' '))
+            $raw = $null
+        }
         # Each row is read field by field, so a row without one reads $null in a strict-mode host too (r6 sol B2 sweep).
-        $table = @(Get-Content -LiteralPath $Options.ProcessTableFile -Raw | ConvertFrom-Json | ForEach-Object {
+        # An empty file reads $null, which ConvertFrom-Json refuses: that is an empty table, as before.
+        $table = @($(if ($null -ne $raw) { $raw | ConvertFrom-Json }) | ForEach-Object {
                 $r = $_
                 [pscustomobject]@{ ProcessId = Get-BuildGuardJsonField $r 'ProcessId'; ParentProcessId = Get-BuildGuardJsonField $r 'ParentProcessId'
                     Name = Get-BuildGuardJsonField $r 'Name'; CreationDate = Get-BuildGuardJsonField $r 'CreationDate' }
@@ -282,6 +302,7 @@ function Get-BuildGuardJobs([hashtable]$Options, [int]$SelfPid) {
     } else {
         $table = @(Get-CimInstance Win32_Process -OperationTimeoutSec $script:BuildGuardCimTimeoutSec -ErrorAction SilentlyContinue |
             Select-Object ProcessId, ParentProcessId, Name, CreationDate)
+        if ($table.Count -eq 0) { Write-BuildGuardLog 'process table unreadable (Win32_Process returned nothing): no peers counted' }
     }
     # This process and its ancestors are not peers (a guard launched from make must not downgrade itself).
     $ancestors = New-Object 'System.Collections.Generic.HashSet[int]'
@@ -310,6 +331,10 @@ function Test-BuildGuardOwnerAlive([int]$OwnerPid, [long]$StartTicks) {
 function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
     # Returns @{ Acquired; Held; Ticket }. The whole read-check-reclaim-create runs under a named mutex so
     # two reclaimers cannot delete each other's fresh lock.
+    # It runs while the machine heavy slot is held, so it is Stop-scoped (r7, a34e2098-A1): an error record would be rendered
+    # to stderr past the bounded writer. A failure that should refuse admission throws to Invoke-BuildGuard, whose finally
+    # gives the heavy slot back first; a stale lock that cannot be removed is a slot still busy, logged.
+    $ErrorActionPreference = 'Stop'
     $dir = Split-Path -Parent $Options.LockPath
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $mutex = New-Object System.Threading.Mutex($false, $Options.MutexName)
@@ -334,8 +359,10 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
             $nowTicks = [DateTime]::UtcNow.Ticks
             $reclaim = ''
             if (-not $info -or -not $info.ownerPid) {
-                # empty or half-written; a writer finishes in milliseconds, so only an old file is stale
-                $age = ([DateTime]::UtcNow - (Get-Item -LiteralPath $path).LastWriteTimeUtc).TotalSeconds
+                # empty or half-written; a writer finishes in milliseconds, so only an old file is stale. One that vanished or
+                # cannot be stat'ed now is not reclaimed on this poll (the next one sees it again).
+                $age = 0
+                try { $age = ([DateTime]::UtcNow - (Get-Item -LiteralPath $path).LastWriteTimeUtc).TotalSeconds } catch { }
                 if ($age -gt 60) { $reclaim = 'unreadable' }
             } elseif ($nowTicks -ge [long]$info.expiresTicks) {
                 $reclaim = 'expired'
@@ -347,7 +374,11 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
                 return @{ Acquired = $false; Held = $held }
             }
             Write-BuildGuardLog "reclaiming stale build slot ($reclaim): $path"
-            Remove-Item -LiteralPath $path -Force
+            try { Remove-Item -LiteralPath $path -Force } catch {
+                $why = $_.Exception.Message -replace '\s+', ' '
+                Write-BuildGuardLog "stale build slot not removed ($reclaim): $path ($why)"
+                return @{ Acquired = $false; Held = "stale-lock-not-removed ($reclaim): $why" }
+            }
         }
         $self = Get-Process -Id $PID
         $startTicks = $self.StartTime.ToUniversalTime().Ticks
@@ -381,17 +412,22 @@ function Remove-BuildSlot($Ticket) {
     if (-not $Ticket) { return }
     # The mutex is opened inside the try too (r6b adversary A1): a name taken by another kernel object throws here, and a
     # release never throws past its caller, which still has the machine heavy slot to give back.
+    # Stop-scoped (r7, a34e2098-A1): a delete that fails (the lock held open without a Delete share) used to write an error
+    # record, which the host rendered to an undrained stderr before the heavy-slot stop. Now it is caught and logged through
+    # the bounded writer, and the lock is left for owner-dead reclaim.
+    $ErrorActionPreference = 'Stop'
     $mutex = $null
     $got = $false
     try {
         $mutex = New-Object System.Threading.Mutex($false, $Ticket.MutexName)
         try { $got = $mutex.WaitOne(15000) } catch [System.Threading.AbandonedMutexException] { $got = $true }
         if (-not $got) { Write-BuildGuardLog "release-mutex-busy: build slot left for owner-dead reclaim: $($Ticket.Path)"; return }
-        $info = Get-Content -LiteralPath $Ticket.Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $info = Get-Content -LiteralPath $Ticket.Path -Raw | ConvertFrom-Json
         if ([int]$info.ownerPid -eq $Ticket.OwnerPid -and [long]$info.startTicks -eq $Ticket.StartTicks) {
             Remove-Item -LiteralPath $Ticket.Path -Force
         }
     } catch {
+        Write-BuildGuardLog ('build slot not released: {0} ({1}); left for owner-dead reclaim' -f $Ticket.Path, ($_.Exception.Message -replace '\s+', ' '))
     } finally {
         if ($got) { $mutex.ReleaseMutex() }
         if ($mutex) { $mutex.Dispose() }
