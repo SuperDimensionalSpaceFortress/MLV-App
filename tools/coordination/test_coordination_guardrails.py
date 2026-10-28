@@ -3069,6 +3069,25 @@ def test_save_dirty_worktree_evidence_never_reuses_an_occupied_name_that_is_the_
 
 
 @dirty_save_only
+def test_save_dirty_worktree_evidence_reports_a_temp_it_cannot_rename_as_move_failed_when_every_name_is_taken(tmp_path):
+    # r11 iter 2 (adversary 1ef5cc23-A1): the in-directory rename opens the temp for DELETE; another process holding it open for reading with ReadWrite sharing (no
+    # DELETE) makes that open fail with a sharing violation, which was raised as an IOException, so with every candidate name taken by different bytes each attempt
+    # read as a name clash and the save reported name-collision. Only an existing target is a clash now: move-failed:0x80070020.
+    wt, dest = _dirty_save_repo(tmp_path)
+    shim = ("$script:Lock = $null; function Invoke-DirtyDestCheckpoint([string]$Stage) { "
+            "if ($Stage -eq 'before-publish' -and $null -eq $script:Lock) { "
+            f"$t = @(Get-ChildItem -LiteralPath '{dest}' -Filter 'dirty-worktree-saving-*.tmp')[0]; "
+            "$h = (Get-FileHash -LiteralPath $t.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); "
+            f"foreach ($n in 8, 16, 32, 64) {{ [System.IO.File]::WriteAllText([System.IO.Path]::Combine('{dest}', 'dirty-worktree-' + $h.Substring(0, $n) + '.patch'), 'different') }}; "
+            "$script:Lock = [System.IO.File]::Open($t.FullName, 'Open', 'Read', 'ReadWrite') } }")
+    out = dirty_save_pwsh(f"{shim}; $r = Save-DirtyWorktreeEvidence -Wt '{wt}' -Dest '{dest}' -CardName C1 -RoundName r1; if ($script:Lock) {{ $script:Lock.Dispose(); 'locked' }}; $r")
+    lines = out.stdout.strip().splitlines()
+    assert lines[0] == "locked", (out.stdout, out.stderr)
+    assert lines[1].startswith("DIRTY_TREE_SAVE_FAILED card=C1 reason=move-failed:0x80070020"), (out.stdout, out.stderr)
+    assert "name-collision" not in lines[1]
+
+
+@dirty_save_only
 @pytest.mark.parametrize("when", ["after-guard", "at-create", "control"])
 def test_save_dirty_worktree_evidence_creates_nothing_through_a_destination_turned_into_a_junction_after_its_guard(tmp_path, when):
     # r11 (sol r10 B2): the held destination shares WRITE, so an EMPTY destination can be turned IN PLACE into a junction to the worktree after the before-write guard

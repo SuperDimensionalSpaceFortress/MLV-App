@@ -48,7 +48,11 @@ function Invoke-DirtyFileMove([string]$From, [string]$To, $DirHandle = $null, [s
     if ($code -eq 0) { return }
     if ($code -eq -1) { throw [System.InvalidOperationException]::new("evidence-identity-changed:$From") }
     if ($code -eq 4390) { throw [System.InvalidOperationException]::new('dest-identity-changed') }
-    throw [System.IO.IOException]::new(([System.ComponentModel.Win32Exception]::new($code)).Message, (0x80070000 -bor $code))
+    $text = ([System.ComponentModel.Win32Exception]::new($code)).Message
+    # Only an existing target is an IOException (the caller's name-clash path); a temp that cannot be opened for the rename (a sharing violation, access denied) is not
+    # a clash with the target and stays move-failed:<HResult> however many names are taken (r11 iter 2, adversary 1ef5cc23-A1).
+    if ($code -in 80, 183) { throw [System.IO.IOException]::new($text, (0x80070000 -bor $code)) }
+    throw [System.Runtime.InteropServices.COMException]::new($text, (0x80070000 -bor $code))
 }
 
 # Nothing escapes it (r10, sol r9 B4): a move that throws anything but a name clash is move-failed, and a throw anywhere else (a -Guard that throws, Join-Path on a drive
@@ -62,7 +66,11 @@ function Get-DirtyRegularDigest([string]$Path, $DirHandle = $null) {
         try { return [DirtyFinalPath]::RegularFileDigest($(if ($DirHandle -is [IntPtr]) { $DirHandle } else { [IntPtr]::Zero }), $Path) } catch { return $null }
     }
     # No handle API off Windows; the saver itself refuses there (no-directory-hold-on-this-platform), and only a direct call of the placement helper reaches this.
-    try { return 'path/1|' + (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch { return $null }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.LinkType -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { return $null }  # a link is refused here too (adversary 1ef5cc23-A2)
+        return 'path/1|' + (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    } catch { return $null }
 }
 # -DirHandle is the saver's hold on $Dir: the rename is then done inside the held directory (Invoke-DirtyFileMove; r11, sol r10 B2).
 function Move-DirtyEvidenceToFreeName([string]$Tmp, [string]$Dir, [string]$Stem, [string]$Ext, [string]$Full, [string]$FirstName = '', [scriptblock]$Guard = $null, $Hold = $null, $DirHandle = $null) {
@@ -236,6 +244,7 @@ public static class DirtyFinalPath {
     static IntPtr OpenIn(IntPtr dir, string name, uint access, uint share, uint disposition, out int error) {
         error = 0;
         if (dir == IntPtr.Zero || string.IsNullOrEmpty(name) || name == "." || name == ".." || name.IndexOfAny(new char[] { '\\', '/', ':' }) >= 0) { error = 123; return IntPtr.Zero; }
+        if (name.Length > 255) { error = 206; return IntPtr.Zero; }  // one component; a longer one would wrap the 16-bit UNICODE_STRING lengths and name a shorter file (adversary 1ef5cc23-A3)
         IntPtr text = Marshal.StringToHGlobalUni(name);
         IntPtr us = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UnicodeString)));
         try {
