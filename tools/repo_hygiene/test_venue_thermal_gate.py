@@ -354,6 +354,33 @@ class ThermalGateRunnerTests(unittest.TestCase):
         self.assertGreater(row["thermalWaitSec"], 0, row)
         self.assertLess(len([x for x in self.kinds() if x.startswith("QUIET")]), 10, "the probes stop at the cap")
 
+    def test_adversary_r2b2_a1_busy_probes_that_read_clear_cannot_run_the_wait_past_the_cap(self) -> None:
+        # first probe QUIET and hot, then COOLDOWN_UNMET probes that read CLEAR: these used to retry in the lease with no limit and no cap accounting (a probe
+        # started at every 31 s past the cap, the final skip at 151 s under cap 90); once the cap has run out the next busy probe ends the wait: skipped, never run
+        from datetime import datetime, timedelta, timezone
+        deadline = tvlb.utc_iso(datetime.now(timezone.utc) + timedelta(seconds=60))
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "4", "-ThermalPollSec", "1", "-ThermalRequeueMax", "0", "-DeadlineUtc", deadline,
+                           FAKE_HEAT="9,0", FAKE_QUIET_MODES="QUIET,COOLDOWN", FAKE_PROBE_SLEEP="1")
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        [b] = self.batches()
+        [row] = b["legs"]
+        self.assertEqual(row["status"], "THERMAL_HOT_SKIPPED", row)
+        self.assertLess(len([x for x in self.kinds() if x.startswith("QUIET")]), 10, "the probes stop once the cap has run out")
+
+    def test_adversary_r2b2_a3_the_first_known_heat_reading_counts_even_from_a_busy_probe(self) -> None:
+        # the leg's first probe is COOLDOWN_UNMET and reads hot, the next QUIET and clear: heatAtProbe is the FIRST reading (hot), which the spread measures
+        # heavy keys from; it used to be overwritten by the later clear one because the state was only made after a QUIET probe
+        r = self.run_batch([self.specs[0]], FAKE_HEAT="9,0", FAKE_QUIET_MODES="COOLDOWN,QUIET")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [row] = b["legs"]
+        self.assertEqual((row["status"], row["heatAtProbe"], row["heatAtLaunch"]), ("RAN", "hot", "clear"), row)
+
+    def test_adversary_r2b2_a2_the_probe_duration_is_timed_on_the_monotonic_clock(self) -> None:
+        runner = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("[DateTime]::UtcNow - $tProbe", runner, "a wall-clock step made probeSec negative and the next sleep too long")
+        self.assertIn("$probeSec = [int][Math]::Ceiling([Math]::Max(0.0, ([Diagnostics.Stopwatch]::GetTimestamp() - $tProbeTs)", runner)
+
     def test_no_overshoot_is_recorded_as_zero_when_the_wait_ends_inside_the_cap(self) -> None:
         r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "120", FAKE_HEAT="9,0")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
