@@ -4690,8 +4690,8 @@ function Get-CorePartitionPlaybackStart([string]$LogText, $LaunchUtcTicks, $Laun
 # PURE. r13c (HUB RULING 20261028T0021Z, CP-FEED-START-ANCHOR rule (a)): the feed window's data rows that were sampled at or after the playback
 # start. Each row carries the HWiNFO sampler's own stamp, Date and Time in local time (d.M.yyyy and H:mm:ss with or without .fff, the CSV the
 # adapter writes); it is placed on the job's monotonic clock exactly as the playback start is, at the measured launch's clock pair
-# ($Anchor.launchUtcTicks / launchMonoMs), and the comparison is made there: a row counts only at or after $Anchor.startMonoMs plus
-# $Anchor.skewMs (the wall clock's measured drift, so a row the drift could have moved past the start is excluded, never averaged in). Every
+# ($Anchor.launchUtcTicks / launchMonoMs), and the comparison is made there: a row counts only at or after $Anchor.startMonoMs plus twice
+# $Anchor.skewMs (the wall clock's measured drift, on each stamp, so a row the drift could have moved past the start is excluded). Every
 # window row was appended before the end read completed ($ReadDoneMs), so a row placed past it (beyond the skew plus $StampResolutionMs) is a
 # stamp that does not map onto the job's clock (another time zone, a clock step): feed-row-stamp-unverified; a data row whose stamp does not
 # parse is feed-row-stamp-unparseable; no anchor or end read is feed-window-start-unverified. Lines that are not data rows (the header, an empty
@@ -4715,7 +4715,9 @@ function Select-CorePartitionFeedRowsFromStart([string[]]$Lines, $Anchor, $ReadD
             if (-not [DateTime]::TryParseExact(($c[0].Trim() + ' ' + $c[1].Trim()), $fmt, $inv, $sty, [ref]$t)) { return & $no 'feed-row-stamp-unparseable' }
             $at = $lm + ($t.Ticks - $lt) / 1e4
             if ($at -gt $rd + $sk + [math]::Max(0.0, $StampResolutionMs)) { return & $no 'feed-row-stamp-unverified' }
-            if ($at -ge $p + $sk) { $keep.Add($ln) } else { $out++ }
+            # adversary r13c (a8c04609) A2: the anchor and the row are two wall-clock stamps, each up to the skew off the monotonic clock, so
+            # they can disagree by twice it (as the overlap check's 2 x skew does)
+            if ($at -ge $p + 2 * $sk) { $keep.Add($ln) } else { $out++ }
         }
         @{ lines = $keep.ToArray(); excluded = $out; why = $null }
     } catch { & $no 'feed-window-start-unverified' }
@@ -5862,7 +5864,7 @@ if ($CorePartitionTelemetry) {
     # record HMAC took the helper past the earlier 30000).
     if ($cpHelperEncoded.Length -gt 32000) { throw "CORE_PARTITION_HELPER_TOO_LONG the encoded helper is $($cpHelperEncoded.Length) chars (limit 32000, one command line)" }
     $cpHelperAffinity = if ($corePartitionArgs.load -ne 0) { $corePartitionArgs.load } else { $corePartitionArgs.helper }
-    $cpJobFunctions = Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:ConvertFrom-CorePartitionNumber}, ${function:Get-CorePartitionEffectiveMHz}, ${function:ConvertFrom-CorePartitionFeedRows}, ${function:Split-CorePartitionFeedLines}, ${function:Test-CorePartitionFeedFresh}, ${function:Test-CorePartitionFeedRowAfter}, ${function:Test-CorePartitionFeedMarkAccounted}, ${function:Get-CorePartitionFeedSummary}, ${function:Get-CorePartitionCounterSummary}, ${function:Get-CorePartitionWorkerThreads}, ${function:Join-CorePartitionWhy}, ${function:Get-CorePartitionReadyFeed}, ${function:ConvertTo-CorePartitionUtcTicks}, ${function:Test-CorePartitionHelperRecordShape}, ${function:Test-CorePartitionHelperMac}, ${function:Test-CorePartitionHelperRecord}, ${function:Test-CorePartitionMeasuredApp}, ${function:Get-CorePartitionAppAliveMonoMs}, ${function:Get-CorePartitionPlaybackStart}, ${function:Get-CorePartitionStartBoundFeed}, ${function:Get-CorePartitionScalars}, ${function:Get-CorePartitionFeedHandleInfo}, ${function:Read-CorePartitionFeedBytes}, ${function:Read-CorePartitionFeedMark}, ${function:Read-CorePartitionFeedSince}, ${function:Get-CorePartitionReadyToken}, ${function:Get-CorePartitionClockSkewMs}, ${function:Get-CorePartitionMonoMs}, ${function:Test-CorePartitionReadyMarker}) "`n"
+    $cpJobFunctions = Get-CorePartitionFunctionSource @(${function:Format-CorePartitionMask}, ${function:ConvertFrom-CorePartitionNumber}, ${function:Get-CorePartitionEffectiveMHz}, ${function:ConvertFrom-CorePartitionFeedRows}, ${function:Split-CorePartitionFeedLines}, ${function:Test-CorePartitionFeedFresh}, ${function:Test-CorePartitionFeedRowAfter}, ${function:Test-CorePartitionFeedMarkAccounted}, ${function:Get-CorePartitionFeedSummary}, ${function:Get-CorePartitionCounterSummary}, ${function:Get-CorePartitionWorkerThreads}, ${function:Join-CorePartitionWhy}, ${function:Get-CorePartitionReadyFeed}, ${function:ConvertTo-CorePartitionUtcTicks}, ${function:Test-CorePartitionHelperRecordShape}, ${function:Test-CorePartitionHelperMac}, ${function:Test-CorePartitionHelperRecord}, ${function:Test-CorePartitionMeasuredApp}, ${function:Get-CorePartitionAppAliveMonoMs}, ${function:Get-CorePartitionPlaybackStart}, ${function:Get-CorePartitionStartBoundFeed}, ${function:Select-CorePartitionFeedRowsFromStart}, ${function:Get-CorePartitionScalars}, ${function:Get-CorePartitionFeedHandleInfo}, ${function:Read-CorePartitionFeedBytes}, ${function:Read-CorePartitionFeedMark}, ${function:Read-CorePartitionFeedSince}, ${function:Get-CorePartitionReadyToken}, ${function:Get-CorePartitionClockSkewMs}, ${function:Get-CorePartitionMonoMs}, ${function:Test-CorePartitionReadyMarker}) "`n"
     $cpLaunchOld = @'
 Write-JobTrace 'step smoke-launch start (app launch + load + playback)'
 try {
@@ -6127,11 +6129,23 @@ Write-JobTrace "step smoke-launch done rc=$smokeRc"
 # too, which is published again with the refused summary and startWhy run-log-snapshot-mismatch (a failed re-publish is core-partition-json-unpublished).
 if (-not [string]::Equals([string]$rawLog, [string]$cpRunLogText, [StringComparison]::Ordinal)) {
     $corePartitionFeedSummary = Get-CorePartitionStartBoundFeed $corePartitionFeedSummary @{ why = 'run-log-snapshot-mismatch' }
-    try {
-        if ($null -eq $corePartitionRecord) { throw 'no core-partition record to refuse' }
-        $corePartitionRecord.feed.summary = $corePartitionFeedSummary; $corePartitionRecord.feed.startWhy = 'run-log-snapshot-mismatch'
-        Save-Json $corePartitionRecord (Join-Path $Pub 'core-partition.json')
-    } catch { $corePartitionPublishWhy = 'core-partition-json-unpublished'; $corePartitionErrors.Add("republish: $([string]$_.Exception.Message)") }
+    # adversary r13c (a8c04609) A3: a republish that fails (a reader holding the file) would leave the first, unrefused publication on disk, so it
+    # is tried three times 250 ms apart (a transient scan lock), and when every try fails the stale file is removed; a file that cannot be
+    # removed either stays, named in the errors (republish-stale-kept), with the summary refused core-partition-json-unpublished.
+    $cpRepublished = $false
+    for ($cpTry = 1; $cpTry -le 3 -and -not $cpRepublished; $cpTry++) {
+        try {
+            if ($null -eq $corePartitionRecord) { throw 'no core-partition record to refuse' }
+            $corePartitionRecord.feed.summary = $corePartitionFeedSummary; $corePartitionRecord.feed.startWhy = 'run-log-snapshot-mismatch'
+            Save-Json $corePartitionRecord (Join-Path $Pub 'core-partition.json')
+            $cpRepublished = $true
+        } catch { $corePartitionErrors.Add("republish: $([string]$_.Exception.Message)"); if ($null -eq $corePartitionRecord) { break }; if ($cpTry -lt 3) { Start-Sleep -Milliseconds 250 } }
+    }
+    if (-not $cpRepublished) {
+        $corePartitionPublishWhy = 'core-partition-json-unpublished'
+        try { if (Test-Path -LiteralPath (Join-Path $Pub 'core-partition.json') -PathType Leaf) { Remove-Item -LiteralPath (Join-Path $Pub 'core-partition.json') -Force -ErrorAction Stop } }
+        catch { $corePartitionErrors.Add("republish-stale-kept: $([string]$_.Exception.Message)") }
+    }
 }
 $corePartitionScalars = Get-CorePartitionScalars $corePartitionHelperRecord $corePartitionFeedSummary $CorePartitionBenchMask $CorePartitionLoadMask $CorePartitionLoadThreads (Get-CorePartitionWorkerThreads $rawLog) $corePartitionHelperWhy $corePartitionHelperNotReady $corePartitionMeasuredPid $corePartitionPublishWhy $corePartitionMeasuredStartTicks $corePartitionMeasuredEndTicks $corePartitionJobClockSkewMs
 '@ + "`n" + $cpClose + "`n" + $cpMetricsAnchor)

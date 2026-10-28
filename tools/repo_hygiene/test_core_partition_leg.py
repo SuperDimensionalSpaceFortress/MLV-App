@@ -175,9 +175,10 @@ function Write-JobTrace([string]$Message) { }
 function Publish-AttrCudaText { param([string]$Path, [string]$Value) [IO.File]::WriteAllText($Path, $Value) }
 function New-AttrCudaDirectory { param([string]$Path) }
 # r13c (Dot 6456731376): each publication is captured BY VALUE (serialized as the real Save-Json does, at call time), so a later change to the
-# record object cannot make an earlier publication look republished; $global:cpSaveThrowOn makes that call (1-based) throw instead of publishing
-function Save-Json { param($Object, $Path) $global:cpSaveCalls++; if ($global:cpSaveThrowOn -eq $global:cpSaveCalls) { throw 'save-json-refused-by-test' }
-    $global:cpSaved = $Object | ConvertTo-Json -Depth 30 | ConvertFrom-Json -AsHashtable; $global:cpSaves.Add($global:cpSaved) }
+# record object cannot make an earlier publication look republished; from call $global:cpSaveThrowOn (1-based) on, every call throws instead of
+# publishing. adversary r13c (a8c04609) A3: each publication is written to its path too, so the file left on disk is observable
+function Save-Json { param($Object, $Path) $global:cpSaveCalls++; if ($global:cpSaveThrowOn -gt 0 -and $global:cpSaveCalls -ge $global:cpSaveThrowOn) { throw 'save-json-refused-by-test' }
+    $j = $Object | ConvertTo-Json -Depth 30; [IO.File]::WriteAllText($Path, $j); $global:cpSaved = $j | ConvertFrom-Json -AsHashtable; $global:cpSaves.Add($global:cpSaved) }
 function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) $p = Join-Path $ContainingRoot 'run.log'; if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'run log unresolvable' }; [pscustomobject]@{ path = $p; sha256 = (Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLowerInvariant() } }
 $exePath = 'C:\no\such\MLVApp.exe'
 $SmokeProcessTimeoutMs = 60000
@@ -219,8 +220,10 @@ foreach ($mode in ($env:CP_MODES -split ',')) {
     $ps = $global:cpSaved.feed.summary; $sc = $corePartitionScalars
     $saves = @(foreach ($sv in $global:cpSaves) { $ss = $sv.feed.summary
         , @($ss.rows, $ss.pkgWattsMean, $ss.pkgTempCMean, [string]$sv.feed.startWhy, @(foreach ($fw in @('rows', 'pkgWattsMean', 'pkgWattsMax', 'pkgTempCMean', 'pkgTempCMax', 'pkgThrottledRows')) { [string]$ss.reasons[$fw] })) })
+    $cpOnDisk = Join-Path $Work 'core-partition.json'
     $out[$mode] = [ordered]@{
         saveCalls = $global:cpSaveCalls; saves = $saves; publishWhy = [string]$corePartitionPublishWhy
+        onDisk = @((Test-Path -LiteralPath $cpOnDisk -PathType Leaf), $(if (Test-Path -LiteralPath $cpOnDisk -PathType Leaf) { [string](([IO.File]::ReadAllText($cpOnDisk) | ConvertFrom-Json -AsHashtable).feed.startWhy) } else { $null }))
         started = ($null -ne $corePartitionHelper); ready = [bool]$corePartitionHelperLaunch.ready; readyWhy = [string]$corePartitionHelperLaunch['readyWhy']
         notReady = [bool]$corePartitionHelperNotReady; helperWhy = [string]$corePartitionHelperWhy; publishedNotReady = [bool]$global:cpSaved.helperNotReady
         published = @($ps.rows, $ps.pkgWattsMean, $ps.pkgTempCMean, [string]$ps.reasons['pkgWattsMean']); startWhy = [string]$global:cpSaved.feed.startWhy; pkg = @($sc.pkgWattsMean, $sc.pkgWattsMax, $sc.pkgTempCMean, $sc.pkgTempCMax)
@@ -815,13 +818,17 @@ class CorePartitionGeneratorTests(unittest.TestCase):
         self.assertEqual(rebound["saves"][1][:4], [None, None, None, "run-log-snapshot-mismatch"], rebound)
         self.assertEqual(rebound["saves"][1][4], ["run-log-snapshot-mismatch"] * 6, rebound)
         self.assertEqual(rebound["publishWhy"], "", rebound)
-        # r13c (Dot 6456731376 c): the republish itself fails (the second Save-Json throws): the only publication on disk is the good window, so
-        # the summary must not stand on it: core-partition-json-unpublished, the republish error recorded, and no package-feed value
+        self.assertEqual(rebound["onDisk"], [True, "run-log-snapshot-mismatch"], rebound)
+        self.assertEqual(good["onDisk"], [True, ""], good)
+        # r13c (Dot 6456731376 c): the republish itself fails (every Save-Json after the first throws): the summary must not stand on the first
+        # publication: core-partition-json-unpublished, the republish error recorded, and no package-feed value. adversary r13c (a8c04609) A3:
+        # the republish is tried three times, then the stale, unrefused first publication is removed from disk (on a8c04609 it stays, 45 W / 70 C)
         failed = got["good-rebound-republish-throws"]
         self.assertNotIn("threw", failed, failed)
-        self.assertEqual([failed["saveCalls"], len(failed["saves"])], [2, 1], failed)
+        self.assertEqual([failed["saveCalls"], len(failed["saves"])], [4, 1], failed)
+        self.assertEqual(failed["onDisk"], [False, None], f"the stale unrefused core-partition.json was left on disk: {failed}")
         self.assertEqual(failed["publishWhy"], "core-partition-json-unpublished", failed)
-        self.assertIn("republish: save-json-refused-by-test", failed["errors"], failed)
+        self.assertEqual(failed["errors"].count("republish: save-json-refused-by-test"), 3, failed)
         self.assertEqual(failed["pkg"], [None] * 4, failed)
         self.assertIn("pkgWattsMean=run-log-snapshot-mismatch", failed["why"], failed)
         self.assertIn("core-partition-json-unpublished", failed["why"], failed)
@@ -900,6 +907,19 @@ class CorePartitionGeneratorTests(unittest.TestCase):
             self.assertIn("appAffinityObserved=coverage-endpoint-gap", control["why"])
         else:
             self.assertTrue(control["bench"], f"a full-window record was refused: {control}")
+
+    def test_r13c_every_core_partition_function_the_job_calls_is_emitted_into_it(self) -> None:
+        """adversary r13c (a8c04609) A1: the job is self-contained text run on the venue; a8c04609 called Select-CorePartitionFeedRowsFromStart
+        from Get-CorePartitionFeedSummary without emitting it ($cpJobFunctions), so a healthy run with a trusted start threw
+        CommandNotFoundException before core-partition.json was published. The class: every *-CorePartition* command the emitted job names is
+        defined in it."""
+        for key in ("a", "b1", "b2", "cuda-b2"):
+            with self.subTest(job=key):
+                text = lf(self.job(key))
+                defined = set(re.findall(r"(?m)^\s*function\s+([A-Za-z]+-CorePartition\w*)", text))
+                called = set(re.findall(r"\b([A-Z][a-z]+-CorePartition\w*)\b", text))
+                self.assertIn("Select-CorePartitionFeedRowsFromStart", called)
+                self.assertEqual(sorted(called - defined), [], f"called but not emitted: {sorted(called - defined)}")
 
     def test_the_helpers_self_deadline_is_monotonic_not_the_wall_clock(self) -> None:
         """r9 Dot 3 (= adversary r8 aeacec83 A3): with its parent lost and a wall-clock deadline an hour away (what a backward step makes of it), the
@@ -2577,7 +2597,11 @@ $anchor = @{ startMonoMs = 24600.0; launchUtcTicks = $L.Ticks; launchMonoMs = 10
 $rows = @('Date,Time,Total CPU Usage [%],CPU Package [C],CPU Package Power [W],Core Thermal Throttling (avg) [Yes/No],Package/Ring Thermal Throttling [Yes/No]', ((Hw 24000) + ',5,30,10,No,No'), ((Hw 24600) + ',5,80,100,No,No'), ((Hw 25600) + ',5,81,101,No,No'), '')
 function PickSel($v) { @([string]$v.why, $v.excluded, @($v.lines).Count) }
 $r.selAtAndAfter = PickSel (Select-CorePartitionFeedRowsFromStart $rows $anchor 26000)
-$sk = $anchor.Clone(); $sk.skewMs = 700.0
+$sk = $anchor.Clone(); $sk.skewMs = 400.0
+# adversary r13c (a8c04609) A2, its shape: skew 1000; the start stamp reads 1000 ms early (anchor 59000 for a real 60000) and a startup row
+# sampled at 59500 is stamped 1000 ms late (60500): one skew of margin (60000) keeps it, twice the skew (61000) excludes it
+$a2 = @{ startMonoMs = 59000.0; launchUtcTicks = $L.Ticks; launchMonoMs = 1000.0; skewMs = 1000.0 }
+$r.selA2TwoStampsTwiceTheSkew = PickSel (Select-CorePartitionFeedRowsFromStart @(((Hw 60500) + ',5,30,10,No,No'), ((Hw 61000) + ',5,80,100,No,No')) $a2 82000)
 $r.selSkewExcludesTheBoundaryRow = PickSel (Select-CorePartitionFeedRowsFromStart $rows $sk 26000)
 $r.selSecondsOnly = PickSel (Select-CorePartitionFeedRowsFromStart @(($L.AddSeconds(-60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,30,10,No,No'), ($L.AddSeconds(60).ToLocalTime().ToString('d.M.yyyy,H:mm:ss', [Globalization.CultureInfo]::InvariantCulture) + ',5,80,100,No,No')) $anchor 62000)
 $r.selUnparseableStamp = PickSel (Select-CorePartitionFeedRowsFromStart @('10/24/2026,08:00:02,5,80,100,No,No') $anchor 26000)
@@ -2720,6 +2744,7 @@ class CorePartitionR13StartTests(unittest.TestCase):
         self.assertEqual(r["ceilingOverGapWithinTeardown"], ["", 23600, 0, 43000])
         self.assertEqual(r["selAtAndAfter"], ["", 1, 2])
         self.assertEqual(r["selSkewExcludesTheBoundaryRow"], ["", 2, 1])
+        self.assertEqual(r["selA2TwoStampsTwiceTheSkew"], ["", 1, 1])
         self.assertEqual(r["selSecondsOnly"], ["", 1, 1])
         self.assertEqual(r["selUnparseableStamp"], ["feed-row-stamp-unparseable", None, 0])
         self.assertEqual(r["selRowFromTheFuture"], ["feed-row-stamp-unverified", None, 0])
