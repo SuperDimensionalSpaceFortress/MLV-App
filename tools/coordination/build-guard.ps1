@@ -522,7 +522,8 @@ function Resolve-HeavySlotCmd([hashtable]$Options) {
     # A named path that does not exist is missing (fail open); it never falls through to the live install.
     foreach ($named in @($Options.HeavySlotCmd, $env:MLV_HEAVY_SLOT_CMD)) {
         if (-not ([string]$named).Trim()) { continue }
-        if (Test-Path -LiteralPath $named -PathType Leaf) { return (Resolve-Path -LiteralPath $named).ProviderPath }
+        # Stop-scoped and caught (r8 adversary f99852cb-A1 sibling): an error record would reach stderr past the bounded writer.
+        if (Test-Path -LiteralPath $named -PathType Leaf) { try { return (Resolve-Path -LiteralPath $named -ErrorAction Stop).ProviderPath } catch { return '' } }
         return ''
     }
     $found = Get-Command -Name 'heavy-slot.cmd' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -743,7 +744,19 @@ function Test-HeavySlotStopNeeded($Lease) {
     # 01aa4e7b-A1). So unreadable or partial means keep the stop file, never clean it up.
     if (-not $Lease.Process.HasExited) { return $true }
     $known = Get-HeavySlotStopHolder $Lease
-    return (-not $known -or (Test-HeavySlotIdentity $known))
+    return (-not $known -or -not (Test-HeavySlotGone $known))
+}
+
+function Test-HeavySlotGone($Identity) {
+    # True only when the process named by pid + start ticks provably no longer runs: no process has that pid, the one that has
+    # it started at another time, or it has exited. One that cannot be inspected (its handle denied, it ended mid-read) proves
+    # nothing (r8 adversary f99852cb-A2): Test-HeavySlotIdentity's $false means "not proven alive", not "gone".
+    $p = Get-Process -Id $Identity.Pid -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $p) { return $true }
+    try {
+        if ($p.StartTime.ToUniversalTime().Ticks -ne [long]$Identity.Ticks) { return $true }
+        return [bool]$p.HasExited
+    } catch { return $false } finally { if ($p -is [IDisposable]) { $p.Dispose() } }
 }
 
 function Send-HeavySlotStop($Lease) {
@@ -838,7 +851,13 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         return $null
     }
     $cli = Join-Path (Split-Path -Parent $cmd) 'heavy-slot.ps1'
-    $actual = if (Test-Path -LiteralPath $cli -PathType Leaf) { (Get-FileHash -LiteralPath $cli -Algorithm SHA256).Hash.ToLowerInvariant() } else { 'missing' }
+    # A CLI that cannot be hashed (held open without read sharing, say) is a pin mismatch, never an error record: the host would
+    # write one to stderr synchronously, past the bounded writer, while an ancestor's slot is held (r8 adversary f99852cb-A1).
+    $actual = 'missing'
+    if (Test-Path -LiteralPath $cli -PathType Leaf) {
+        try { $actual = (Get-FileHash -LiteralPath $cli -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() }
+        catch { $actual = 'unreadable(' + ($_.Exception.Message -replace '\s+', ' ') + ')' }
+    }
     $expected = ([string]$Options.HeavySlotSha256).Trim().ToLowerInvariant()
     if ($actual -ne $expected) {
         # Nothing is taken yet, but an ancestor's slot may be held until this guard ends, so the line is bounded (r8, 3e68ca85-A2).
@@ -856,7 +875,12 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=$cmd path-has-percent: $pct; building WITHOUT the machine heavy slot (fail open)"
         return $null
     }
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    # A lease directory that cannot be created is a shim that cannot be run: fail open like start-failed, never an error record
+    # (r8 adversary f99852cb-A1 sibling).
+    try { if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null } } catch {
+        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} shim={1} lease-dir-failed: {2}; building WITHOUT the machine heavy slot (fail open)' -f $Label, $cmd, ($_.Exception.Message -replace '\s+', ' '))
+        return $null
+    }
     $id = '{0}-{1}' -f $PID, [Guid]::NewGuid().ToString('N')
     $lease = @{
         Label = 'mlv:{0}:build' -f (Get-HeavySlotLane); BuildLabel = $Label
@@ -1050,7 +1074,7 @@ function Invoke-BuildGuard {
         Write-BuildGuardLog $line
         try {
             $logDir = Split-Path -Parent $o.ExemptLogPath
-            if ($logDir -and -not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+            if ($logDir -and -not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null }
             Add-BuildGuardLogLine -Path $o.ExemptLogPath -Line $line -Encoding ([Text.Encoding]::ASCII)
         } catch { Write-BuildGuardLog "exemption log not written: $($_.Exception.Message)" }
     }

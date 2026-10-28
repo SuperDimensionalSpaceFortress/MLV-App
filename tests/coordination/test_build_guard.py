@@ -1483,10 +1483,10 @@ def test_the_stop_file_is_needed_until_its_holder_is_proven_gone(box) -> None:
         "ended-no-ready": (None, True),
         "ended-ticket-only": ("t-1:1`n", True),
         "ended-partial-live": ("t-1:1`nholder={live}`n", True),
-        "ended-partial-dead": ("t-1:1`nholder=8420@1`n", True),
-        "ended-complete-dead": ("t-1:1`nholder=8420@1`nowner=none`nend`n", True),
+        "ended-partial-dead": ("t-1:1`nholder=2147483646@1`n", True),
+        "ended-complete-dead": ("t-1:1`nholder=2147483646@1`nowner=none`nend`n", True),
         # A holder line with no newline yet may be cut short ('8420@1' of '8420@1234...'), so it proves nothing.
-        "ended-unfinished-line": ("t-1:1`nholder=8420@1", True),
+        "ended-unfinished-line": ("t-1:1`nholder=2147483646@1", True),
     }
     body = f". '{GUARD}' -Library\n$me = Get-Process -Id $PID; $live = '{{0}}@{{1}}' -f $PID, $me.StartTime.ToUniversalTime().Ticks\n"
     for name, (text, exited) in cases.items():
@@ -2038,10 +2038,10 @@ def _release_pipe(pipe, guard) -> str:
 
 
 def _heavy_popen(box: dict, mode_args: list, memory: list = None, sha: str = None, env_extra: dict = None,
-                 **streams) -> subprocess.Popen:
+                 shim: Path = HEAVY_STUB, **streams) -> subprocess.Popen:
     memory_file = _write_json(box["dir"] / "memory.json", OK_MEMORY if memory is None else memory)
     table_file = _write_json(box["dir"] / "table.json", [])
-    env = _env(heavy_slot=HEAVY_STUB, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log"),
+    env = _env(heavy_slot=shim, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log"),
                                              **(env_extra or {})})
     return subprocess.Popen(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GUARD),
@@ -2130,6 +2130,80 @@ def test_a_refusal_under_an_ancestor_slot_never_waits_on_an_undrained_stdout(box
         _release_pipe(pipe, guard)
     assert code == want, f"the {refusal} refusal waited on an undrained stdout while an ancestor held the machine heavy slot"
     assert not box["lock"].exists()
+
+
+def _open_exclusive(path: Path):
+    """Opens path for read with no sharing (FileShare.None), so another process can neither read nor hash it."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.HANDLE]
+    handle = k32.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)
+    assert handle and handle != ctypes.c_void_p(-1).value, f"could not lock {path}: {ctypes.get_last_error()}"
+    return lambda: k32.CloseHandle(wintypes.HANDLE(handle))
+
+
+def test_a_cli_that_cannot_be_hashed_is_a_bounded_pin_refusal_under_an_ancestor_slot(box) -> None:
+    # r8 adversary f99852cb-A1: heavy-slot.ps1 beside the shim is held open with no sharing, so Get-FileHash fails. That used
+    # to be a non-terminating error record, which the host wrote synchronously to a full, undrained stderr while an ancestor
+    # held the machine slot. Now it is a typed pin-mismatch refusal (actual=unreadable(...)), bounded, and the guard ends.
+    shim_dir = box["dir"] / "shim"
+    shutil.copytree(HEAVY_STUB_DIR, shim_dir)
+    unlock = _open_exclusive(shim_dir / "heavy-slot.ps1")
+    pipe = _full_pipe()
+    guard = None
+    try:
+        guard = _heavy_popen(box, ["-Command", "exit 0"], shim=shim_dir / "heavy-slot.cmd",
+                             env_extra={"HEAVY_SLOT_HELD": f"anc-1:{os.getpid()}"}, stderr=pipe[1])
+        try:
+            code = guard.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            code = None
+    finally:
+        if guard is not None:
+            _release_pipe(pipe, guard)
+        unlock()
+    assert code == 3, "the guard blocked on an error record while an ancestor held the machine heavy slot"
+
+
+def test_a_cli_that_cannot_be_hashed_is_a_typed_pin_refusal(box) -> None:
+    # Control with drained streams: the refusal names why, and no error record reaches stderr.
+    shim_dir = box["dir"] / "shim"
+    shutil.copytree(HEAVY_STUB_DIR, shim_dir)
+    unlock = _open_exclusive(shim_dir / "heavy-slot.ps1")
+    try:
+        done = _heavy(box, "run", ["-Command", _marker_command(box)], shim=shim_dir / "heavy-slot.cmd")
+    finally:
+        unlock()
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=pin-mismatch expected=" in done.stdout and "actual=unreadable(" in done.stdout, done.stdout
+    assert "Get-FileHash" not in done.stderr, done.stderr
+    assert not box["marker"].exists()
+
+
+def test_a_holder_that_cannot_be_inspected_keeps_its_stop_file(box) -> None:
+    # r8 adversary f99852cb-A2: the wrapper has ended and the verified holder still runs, but its handle cannot be opened
+    # (access denied). That is not proof it is gone, so the stop file is still needed and cleanup keeps it.
+    stop = box["dir"] / "x.stop"
+    stop.write_text("stop", encoding="ascii")
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n"
+                "function Get-Process { param([int]$Id, $ErrorAction)\n"
+                "    $p = [pscustomobject]@{ Id = $Id }\n"
+                "    $p | Add-Member -MemberType ScriptProperty -Name StartTime -Value { [DateTime]::new(638971000020000000, 'Utc') }\n"
+                "    foreach ($n in 'Handle', 'HasExited') { $p | Add-Member -MemberType ScriptProperty -Name $n -Value { throw [ComponentModel.Win32Exception]::new(5) } }\n"
+                "    $p }\n"
+                "$w = [pscustomobject]@{ Id = 1; HasExited = $true }\n"
+                f"$lease = @{{ Ready = '{box['dir'] / 'none.ready'}'; Stop = '{stop}'; ExitFile = '{box['dir'] / 'x.exit.json'}'; "
+                f"Log = '{box['dir'] / 'x.log'}'; Process = $w; Holder = @{{ Pid = 8420; Ticks = 638971000020000000 }} }}\n"
+                "Write-Output ('needed=' + (Test-HeavySlotStopNeeded $lease))\n"
+                "Remove-HeavySlotLeaseFiles $lease\n"
+                f"Write-Output ('kept=' + (Test-Path -LiteralPath '{stop}'))\n"])
+    out = done.stdout + done.stderr
+    assert "needed=True" in done.stdout, out
+    assert "kept=True" in done.stdout, out
 
 
 def test_a_pin_refusal_without_an_ancestor_slot_still_reaches_a_late_stdout_reader(box) -> None:
