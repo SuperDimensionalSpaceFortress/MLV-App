@@ -2319,6 +2319,60 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
     return [pscustomobject]$copy
 }
 
+function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
+    <#
+    .SYNOPSIS
+    A PresentMon display report whose reason carries the typed PRESENTMON_ORPHAN_SWEEP_INCOMPLETE detail when the pre-capture orphan sweep did not leave the host clean; the same object otherwise.
+    .DESCRIPTION
+    BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 (Bachelor, 2026-10-27): 16 of 16 cuda legs ended "PresentMon output does not exist" while an orphaned MLVAttr3-* session starved every capture and the
+    sweep had been skipped on every leg -- the summary named the symptom and never the sweep. The detail names what was left: skipped=<reason>, aborted=<reason>, remaining=<names>,
+    deferred=<names>, listError, error, and the live PresentMon pids. A sweep that ran and left nothing (or no sweep record at all) adds nothing; a reason that already carries the token is never
+    given it twice. Like Add-AttrCudaPresentMonEventsLostDetailToReport, the report is replaced by a copy (properties and their order unchanged, only `reason` different).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$Report,
+        [AllowNull()][object]$Sweep
+    )
+
+    if ($null -eq $Sweep) { return $Report }
+    $current = [string]$Report.reason
+    if ($current.Contains('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE')) { return $Report }
+    # the record is the job's [ordered] table (a key may be absent: the job's default before Start-PresentMonCapture ran has two) or an object; strict mode throws on an absent member, so read by name
+    $field = {
+        param([string]$Name)
+        if ($Sweep -is [System.Collections.IDictionary]) { if ($Sweep.Contains($Name)) { return $Sweep[$Name] }; return $null }
+        $property = $Sweep.PSObject.Properties[$Name]
+        if ($null -ne $property) { return $property.Value }
+        return $null
+    }
+    $parts = @()
+    try {
+        $skipped = [string](& $field 'skippedReason')
+        if (-not [string]::IsNullOrEmpty($skipped)) { $parts += "skipped=$skipped" }
+        $aborted = [string](& $field 'abortedReason')
+        if (-not [string]::IsNullOrEmpty($aborted)) { $parts += "aborted=$aborted" }
+        $remaining = @(@(& $field 'remaining') | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        if ($remaining.Count -gt 0) { $parts += "remaining=$($remaining -join ',')" }
+        $deferred = @(@(& $field 'deferred') | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+        if ($deferred.Count -gt 0) { $parts += "deferred=$($deferred -join ',')" }
+        $listError = [string](& $field 'listError')
+        if (-not [string]::IsNullOrEmpty($listError)) { $parts += "listError=$listError" }
+        $sweepError = [string](& $field 'error')
+        if (-not [string]::IsNullOrEmpty($sweepError)) { $parts += "error=$sweepError" }
+        if ($parts.Count -eq 0) { return $Report }
+        $livePids = @(@(& $field 'livePresentMonProcessIds') | Where-Object { $null -ne $_ })
+        if ($livePids.Count -gt 0) { $parts += "livePids=$($livePids -join ',')" }
+    } catch {
+        return $Report
+    }
+    $detail = "PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: $($parts -join ' ')"
+    $copy = [ordered]@{}
+    foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value }
+    $copy['reason'] = if ([string]::IsNullOrEmpty($current)) { $detail } else { "$current [$detail]" }
+    return [pscustomobject]$copy
+}
+
 function Publish-AttrCudaContactSheetRawCaptures {
     <#
     .SYNOPSIS
@@ -7156,6 +7210,7 @@ Export-ModuleMember -Function `
     Get-AttrCudaPresentMonEventsLost, `
     Add-AttrCudaPresentMonEventsLostDetail, `
     Add-AttrCudaPresentMonEventsLostDetailToReport, `
+    Add-AttrCudaPresentMonOrphanSweepDetailToReport, `
     Get-AttrCudaEtsSessionListing, `
     Invoke-AttrCudaLogman, `
     Get-AttrCudaTextEncodingFromHead, `

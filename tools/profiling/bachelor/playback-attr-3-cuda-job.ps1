@@ -962,7 +962,8 @@ $embeddedFunctions = $embeddedFunctions + "`r`n# UM-PRESENTMON-ORPHAN-SWEEP-1 >>
     'Get-AttrCudaTextEncodingFromHead',
     'Get-AttrCudaPresentMonEventsLost',
     'Add-AttrCudaPresentMonEventsLostDetail',
-    'Add-AttrCudaPresentMonEventsLostDetailToReport'
+    'Add-AttrCudaPresentMonEventsLostDetailToReport',
+    'Add-AttrCudaPresentMonOrphanSweepDetailToReport'
 )) +"`r`n# UM-PRESENTMON-ORPHAN-SWEEP-1 <<<"
 # VENUE-SESSION-LOCKED-REFUSAL-1: the console-lock read Start-AttrCudaDisplayWake makes first and the keep-alive loop re-reads every
 # tick, spliced inside its own sentinel brackets for the same byte-identity reason as the splice above.
@@ -1404,7 +1405,7 @@ function Start-PresentMonCapture([string]$CsvPath, [int]$ReadyTimeoutSeconds = 1
         $sweepResult = Invoke-PresentMonOrphanSweep
         foreach ($key in @($sweepResult.Keys)) { $presentMonOrphanSweep[$key] = $sweepResult[$key] }
         $sweepActionText = @($sweepResult['actions'] | ForEach-Object { $_.session + ':' + $_.method + ':' + $_.exitCode }) -join ';'
-        Write-JobTrace "step presentmon-orphan-sweep ran=$($sweepResult['ran']) skipped=$($sweepResult['skippedReason']) livePids=$(@($sweepResult['livePresentMonProcessIds']) -join ',') excluded=$(@($sweepResult['excludedPresentMonProcesses'] | Where-Object { $null -ne $_ } | ForEach-Object { $_['name'] + ':' + $_['pid'] }) -join ',') listed=$(@($sweepResult['listed']) -join ',') actions=$sweepActionText aborted=$($sweepResult['abortedReason']) abortedBefore=$($sweepResult['abortedBefore']) remaining=$(@($sweepResult['remaining']) -join ',') newlyListed=$(@($sweepResult['newlyListed']) -join ',') listError=$($sweepResult['listError']) error=$($sweepResult['error'])"
+        Write-JobTrace "step presentmon-orphan-sweep ran=$($sweepResult['ran']) skipped=$($sweepResult['skippedReason']) livePids=$(@($sweepResult['livePresentMonProcessIds']) -join ',') excluded=$(@($sweepResult['excludedPresentMonProcesses'] | Where-Object { $null -ne $_ } | ForEach-Object { $_['name'] + ':' + $_['pid'] }) -join ',') listed=$(@($sweepResult['listed']) -join ',') actions=$sweepActionText aborted=$($sweepResult['abortedReason']) abortedBefore=$($sweepResult['abortedBefore']) remaining=$(@($sweepResult['remaining']) -join ',') newlyListed=$(@($sweepResult['newlyListed']) -join ',') listError=$($sweepResult['listError']) error=$($sweepResult['error']) scope=$($sweepResult['scope']) deferred=$(@($sweepResult['deferred']) -join ',')"
     }
     # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     # Direct child: inherits this job's TEMP/TMP. -PassThru so the exit code is checked.
@@ -1527,6 +1528,23 @@ function Get-PresentMonLiveProcessId() {
     return @((Get-PresentMonProcessSnapshot).live)
 }
 
+function Get-PresentMonCaptureBlockerId($Snapshot) {
+    # BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 (Bachelor, 2026-10-27): the live processes that may own an MLVAttr3-* session. That namespace is this harness's own, and only a capture-mode PresentMon
+    # creates one: the pinned image (by name or path) or any capture image name (another pinned version, its path readable or not). A live PresentMon* whose image name is no capture image stays live
+    # for the default `PresentMon` session, which any console capture may own, but it can never own an MLVAttr3-* session. On Bachelor that process is Intel's PresentMonService (a child of
+    # IntelGraphicsSoftware.Service.exe, itself no registered service, its path unreadable to the agent): it skipped the whole sweep on every leg, so the MLVAttr3-* session a lease tree-kill left at
+    # 20:06:20Z starved every later capture (no CSV on 16 of 16 cuda legs).
+    $captureImagePattern = '^PresentMon([-_.]?(\d|x64|x86|console|capture|cli)|$)'
+    return @(@($Snapshot.liveDetail) | Where-Object { $null -ne $_ -and ($_.reason -in @('pinned_image_name', 'pinned_image_path', 'capture_image_name') -or ([string]$_.name) -imatch $captureImagePattern) } | ForEach-Object { [int]$_.pid })
+}
+
+function Get-PresentMonSweepBlockerId([string]$Scope) {
+    # the processes that stop a sweep of this scope: every live PresentMon for 'all' (the default session is among the names), only a capture image for 'harness_sessions' (MLVAttr3-* names only)
+    $snapshot = Get-PresentMonProcessSnapshot
+    if ($Scope -eq 'harness_sessions') { return @(Get-PresentMonCaptureBlockerId $snapshot) }
+    return @($snapshot.live)
+}
+
 function Get-PresentMonLogmanTimeoutSecond() {
     # UM-SWEEP-LOGMAN-BOUND-1: the deadline of every logman call the sweep makes -- 15 s (a test sets $presentMonLogmanTimeoutSeconds to shorten it)
     $configured = [int]$presentMonLogmanTimeoutSeconds
@@ -1564,7 +1582,9 @@ function Invoke-PresentMonOrphanSweep() {
     # r2 (sol blocker 1, fable UM-SWEEP-FALLBACK-SCOPE-1): the sweep acts ONLY on the names in $listed -- the orphan list captured before the second liveness check -- never on a name a later
     # listing shows (that is another job's capture that started meanwhile, recorded in newlyListed and left alone), and liveness (no PresentMon process) is re-checked immediately before EACH
     # terminate and EACH logman stop: the first process that appears stops the sweep (abortedReason / abortedBefore) and what is left is still listed in `remaining`.
-    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); livePresentMonProcesses = @(); excludedPresentMonProcesses = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null }
+    # BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: scope is 'all' (no PresentMon process alive) or 'harness_sessions' (only live processes that are no capture image, Get-PresentMonCaptureBlockerId): the
+    # harness's own MLVAttr3-* orphans are swept then, and the default session is left untouched and recorded in deferred. Every re-check asks the blockers of the sweep's own scope.
+    $record = [ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); livePresentMonProcesses = @(); excludedPresentMonProcesses = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null; scope = $null; deferred = @() }
     try {
         $snapshot = Get-PresentMonProcessSnapshot
         $live = @($snapshot.live)
@@ -1573,10 +1593,15 @@ function Invoke-PresentMonOrphanSweep() {
         # PresentMonService: name, pid, service, pathReadable) -- evidence only, never a path; the excluded ones never skip the sweep
         $record['livePresentMonProcesses'] = @($snapshot.liveDetail)
         $record['excludedPresentMonProcesses'] = @($snapshot.excluded)
+        $scope = 'all'
         if ($live.Count -gt 0) {
-            $record['skippedReason'] = 'presentmon_process_alive'
-            return $record
+            if (@(Get-PresentMonCaptureBlockerId $snapshot).Count -gt 0) {
+                $record['skippedReason'] = 'presentmon_process_alive'
+                return $record
+            }
+            $scope = 'harness_sessions'
         }
+        $record['scope'] = $scope
         $listing = Get-PresentMonEtsListing
         $record['listAttempts'] = $listing.attempts
         if ($null -ne $listing.error -or $listing.exitCode -ne 0) {
@@ -1585,9 +1610,13 @@ function Invoke-PresentMonOrphanSweep() {
         }
         $record['matchingListingLines'] = @(($listing.text -split "\r?\n") | Where-Object { $_ -match 'PresentMon|MLVAttr3-' } | Select-Object -First 20 | ForEach-Object { $_.Trim() })
         $listed = @(Get-AttrCudaPresentMonOrphanSessionName -ListingText $listing.text)
+        if ($scope -eq 'harness_sessions') {
+            $record['deferred'] = @($listed | Where-Object { $_ -notlike 'MLVAttr3-*' })
+            $listed = @($listed | Where-Object { $_ -like 'MLVAttr3-*' })
+        }
         $record['listed'] = $listed
         # a PresentMon that appeared while the listing ran is a capture that may own a session: nothing is touched
-        $liveNow = @(Get-PresentMonLiveProcessId)
+        $liveNow = @(Get-PresentMonSweepBlockerId $scope)
         if ($liveNow.Count -gt 0) {
             $record['livePresentMonProcessIds'] = $liveNow
             $record['skippedReason'] = 'presentmon_process_started_during_sweep'
@@ -1597,7 +1626,7 @@ function Invoke-PresentMonOrphanSweep() {
         $actions = @()
         $aborted = $false
         foreach ($name in $listed) {
-            $liveBeforeTerminate = @(Get-PresentMonLiveProcessId)
+            $liveBeforeTerminate = @(Get-PresentMonSweepBlockerId $scope)
             if ($liveBeforeTerminate.Count -gt 0) {
                 $record['livePresentMonProcessIds'] = $liveBeforeTerminate
                 $record['abortedReason'] = 'presentmon_process_started_during_sweep'
@@ -1615,7 +1644,7 @@ function Invoke-PresentMonOrphanSweep() {
         $stillListed = @($listed | Where-Object { $afterTerminateNames -contains $_ })
         if (-not $aborted) {
             foreach ($name in $stillListed) {
-                $liveBeforeStop = @(Get-PresentMonLiveProcessId)
+                $liveBeforeStop = @(Get-PresentMonSweepBlockerId $scope)
                 if ($liveBeforeStop.Count -gt 0) {
                     $record['livePresentMonProcessIds'] = $liveBeforeStop
                     $record['abortedReason'] = 'presentmon_process_started_during_sweep'
@@ -3646,6 +3675,8 @@ if ($displayReport.status -ne 'OK' -and -not $displayAsleepOverridden) {
     # UM-PRESENTMON-ORPHAN-SWEEP-1 >>>
     # UM-PRESENTMON-ORPHAN-SWEEP-1 item 3: a capture that lost its events reads as that cause in the PresentMon reason, not only as "output does not exist" (this branch ends the job).
     $displayReport = Add-AttrCudaPresentMonEventsLostDetailToReport -Report $displayReport -EventsLost $presentMonEventsLost
+    # BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: a pre-capture sweep that did not leave the host clean (skipped, aborted, a session remaining or deferred) is named in the reason, never a bare "does not exist"
+    $displayReport = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $displayReport -Sweep $presentMonOrphanSweep
     # UM-PRESENTMON-ORPHAN-SWEEP-1 <<<
     $displayFailure = [ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result=$displayReport.status

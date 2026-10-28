@@ -14,6 +14,10 @@ orphaned too.
      Every action and exit code lands in presentmon-capture.json (orphanSweep) and the trace;
   2. a job-issued Kill() is followed by the terminate of the job's own named session, in both stop paths, so a killed capture cannot orphan it;
   3. PresentMon's stderr saying "ETW events were lost" is a typed PRESENTMON_EVENTS_LOST detail in presentmon-capture.json and in the PresentMon reason of the failure terminals.
+  4. BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 (Bachelor, 2026-10-27): a live PresentMon* that is no capture image (Intel's PresentMonService, a child of IntelGraphicsSoftware.Service.exe, no
+     registered service, path unreadable) skipped the WHOLE sweep on every leg, so the MLVAttr3-* session a lease tree-kill left at 20:06:20Z starved 16 of 16 later cuda captures. Only a capture
+     image can own an MLVAttr3-* session: with no capture image alive the sweep runs in scope harness_sessions (MLVAttr3-* only; the default session is left and recorded in `deferred`), and its
+     re-checks stop only for a capture image. A sweep that did not leave the host clean is a typed PRESENTMON_ORPHAN_SWEEP_INCOMPLETE detail on the display-report failure reason.
 
 The job's text is EXECUTED (real slices of the generator's template run in pwsh against stubs: a .cmd PresentMon, function stubs for Get-Process and logman); the module's own
 functions are called directly. Every item has a mutation test.
@@ -34,7 +38,8 @@ from tools.repo_hygiene.test_dve_presentmon_evidence import PARSE_END, PARSE_STA
 STUB_EXE = "PresentMon-stub.cmd"
 UNREADABLE = "<path getter throws>"
 NEW_MODULE_FUNCTIONS = ("Get-AttrCudaPresentMonOrphanSessionName", "Get-AttrCudaEtsSessionListing", "Invoke-AttrCudaLogman", "Stop-AttrCudaEtsSession", "Get-AttrCudaTextEncodingFromHead",
-                        "Get-AttrCudaPresentMonEventsLost", "Add-AttrCudaPresentMonEventsLostDetail", "Add-AttrCudaPresentMonEventsLostDetailToReport")
+                        "Get-AttrCudaPresentMonEventsLost", "Add-AttrCudaPresentMonEventsLostDetail", "Add-AttrCudaPresentMonEventsLostDetailToReport",
+                        "Add-AttrCudaPresentMonOrphanSweepDetailToReport")
 OPEN = "UM-PRESENTMON-ORPHAN-SWEEP-1 >>>"
 CLOSE = "UM-PRESENTMON-ORPHAN-SWEEP-1 <<<"
 
@@ -279,6 +284,38 @@ class ModuleFunctionTests(unittest.TestCase):
         self.assertTrue(got["reason"].startswith("PresentMon output does not exist: X"))
         self.assertEqual((got["status"], got["chains"], got["same"]), ("PRESENTMON_UNAVAILABLE", [1, 2], False))
         self.assertEqual(got["original"], "PresentMon output does not exist: X", "the input report is never mutated")
+
+    # --- BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: a sweep that did not leave the host clean is a typed detail on the no-CSV terminal, never a silent "output does not exist"
+    def sweep_detail(self, sweep_ps: str) -> dict:
+        return self.call(
+            "$report = [pscustomobject]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'PresentMon output does not exist: X'; chains = @() }\n"
+            f"$s = {sweep_ps}\n"
+            "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep $s\n"
+            "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ names = @($r.PSObject.Properties.Name); reason = $r.reason; same = [object]::ReferenceEquals($r, $report); original = $report.reason }) -Compress))")
+
+    def test_a_skipped_sweep_is_a_typed_detail_on_the_reason(self) -> None:
+        got = self.sweep_detail("[ordered]@{ ran = $false; skippedReason = 'presentmon_process_alive'; livePresentMonProcessIds = @(43684); remaining = @(); deferred = @() }")
+        self.assertEqual(got["reason"], "PresentMon output does not exist: X [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive livePids=43684]")
+        self.assertEqual((got["names"], got["same"], got["original"]), (["status", "reason", "chains"], False, "PresentMon output does not exist: X"))
+
+    def test_a_left_session_is_named_in_the_detail(self) -> None:
+        got = self.sweep_detail("[ordered]@{ ran = $true; skippedReason = $null; abortedReason = 'presentmon_process_started_during_sweep'; remaining = @('MLVAttr3-b'); deferred = @('PresentMon'); livePresentMonProcessIds = @(7001) }")
+        self.assertIn("PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:", got["reason"])
+        for part in ("aborted=presentmon_process_started_during_sweep", "remaining=MLVAttr3-b", "deferred=PresentMon", "livePids=7001"):
+            self.assertIn(part, got["reason"])
+
+    def test_a_sweep_that_left_the_host_clean_adds_nothing(self) -> None:
+        for sweep in ("[ordered]@{ ran = $true; skippedReason = $null; abortedReason = $null; remaining = @(); deferred = @(); listError = $null; error = $null }", "$null"):
+            got = self.sweep_detail(sweep)
+            self.assertTrue(got["same"], sweep)
+            self.assertEqual(got["reason"], "PresentMon output does not exist: X")
+
+    def test_a_reason_that_already_carries_the_token_is_never_given_it_twice(self) -> None:
+        got = self.call(
+            "$report = [pscustomobject]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'x [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=a]' }\n"
+            "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep ([ordered]@{ ran = $false; skippedReason = 'b' })\n"
+            "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ same = [object]::ReferenceEquals($r, $report) }) -Compress))")
+        self.assertTrue(got["same"])
 
     def test_a_report_with_nothing_to_add_comes_back_as_the_same_object(self) -> None:
         got = self.call(
@@ -549,10 +586,12 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": False}])
 
     def test_a_service_registered_under_another_pid_does_not_excuse_a_process(self) -> None:
+        # still live, so the default session (which any console capture may own) is left; BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: the harness's own MLVAttr3-* orphan is swept all the same
         code, sweep, d, out = self.run_start("service-other-pid", others=(self.SERVICE_UNREADABLE,), services=((7002, "PresentMonService"),))
         self.assertEqual(code, 0, out)
-        self.assertFalse(sweep["ran"], sweep)
         self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
+        self.assertEqual(sweep["deferred"], ["PresentMon"])
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
 
     def test_a_live_pinned_capture_beside_the_service_still_skips_the_sweep(self) -> None:
         code, sweep, d, out = self.run_start("service-and-capture", live_pids=(4242,), others=(self.SERVICE,), services=self.SERVICE_ROW)
@@ -570,27 +609,75 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(sweep["abortedBefore"], "MLVAttr3-old-killed-job:presentmon_terminate")
         self.assertEqual(sweep["livePresentMonProcessIds"], [5151])
 
-    # --- sol's repro: the Path getter throws access denied (or is null), the process is not a registered service -> live, NO sweep, a recorded reason
-    def test_an_unreadable_path_that_is_no_registered_service_is_live_and_blocks_the_sweep(self) -> None:
+    # --- sol's repro: the Path getter throws access denied (or is null), the process is not a registered service -> live, a recorded reason, and the DEFAULT session is never swept under it.
+    # BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 (Bachelor, 2026-10-27): this is the real Bachelor shape (Intel's PresentMonService, a child of IntelGraphicsSoftware.Service.exe, is no registered
+    # service and its path is unreadable to the agent), so it skipped the WHOLE sweep on every leg; an agent tree-kill at 20:06:20Z then left MLVAttr3-...-150416 running and every later capture
+    # wrote no CSV. Its image name is no capture image, so it cannot own an MLVAttr3-* session: those are swept (scope harness_sessions); the default session is left and recorded as deferred.
+    def test_an_unreadable_path_that_is_no_registered_service_is_live_and_blocks_the_default_session_sweep(self) -> None:
         code, sweep, d, out = self.run_start("unreadable-no-service", others=(self.SERVICE_UNREADABLE,))
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.terminated_names(self.calls(d)), [], "an unidentifiable PresentMon may own a capture: nothing is terminated")
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"], "an unidentifiable PresentMon may own the default session, never an MLVAttr3-* one")
         self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "and logman stop is not used either")
-        self.assertFalse(sweep["ran"], sweep)
+        self.assertTrue(sweep["ran"], sweep)
         self.assertIsNone(sweep["error"])
-        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertIsNone(sweep["skippedReason"])
+        self.assertEqual(sweep["scope"], "harness_sessions")
+        self.assertEqual(sweep["listed"], ["MLVAttr3-old-killed-job"])
+        self.assertEqual(sweep["deferred"], ["PresentMon"])
+        self.assertEqual(sweep["remaining"], [])
         self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
         self.assertEqual(sweep["excludedPresentMonProcesses"], [])
         self.assertEqual(sweep["livePresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "pathReadable": False, "reason": "unreadable_path_not_a_registered_service"}])
         self.assertEqual(len([c for c in self.calls(d) if "--process_name" in c]), 1, "the capture itself still starts")
+        self.assertIn("scope=harness_sessions", (d / "trace.log").read_text(encoding="utf-8"))
+        self.assertIn("deferred=PresentMon", (d / "trace.log").read_text(encoding="utf-8"))
 
-    def test_a_null_path_that_is_no_registered_service_is_live_and_blocks_the_sweep(self) -> None:
+    def test_a_null_path_that_is_no_registered_service_is_live_and_blocks_the_default_session_sweep(self) -> None:
         code, sweep, d, out = self.run_start("null-no-service", others=((7001, "PresentMonService", None),))
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.terminated_names(self.calls(d)), [])
-        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+        self.assertEqual(sweep["deferred"], ["PresentMon"])
         self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
         self.assertFalse(sweep["livePresentMonProcesses"][0]["pathReadable"])
+
+    def test_the_bachelor_service_child_never_aborts_the_harness_sweep_on_its_rechecks(self) -> None:
+        # the service is alive through EVERY liveness re-check; in harness scope only a capture image stops the sweep, so both leftover job sessions go
+        code, sweep, d, out = self.run_start("service-child-rechecks", sessions=("MLVAttr3-killed-a", "MLVAttr3-killed-b"), others=(self.SERVICE_UNREADABLE,))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a", "MLVAttr3-killed-b"])
+        self.assertIsNone(sweep["abortedReason"], sweep)
+        self.assertEqual((sweep["deferred"], sweep["remaining"]), ([], []))
+
+    def test_in_harness_scope_a_capture_image_that_appears_mid_sweep_still_stops_it(self) -> None:
+        code, sweep, d, out = self.run_start("service-child-mid-sweep", sessions=("MLVAttr3-killed-a", "MLVAttr3-killed-b"), live_after_terminate_of="MLVAttr3-killed-a", others=(self.SERVICE_UNREADABLE,))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"])
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-killed-b:presentmon_terminate")
+        self.assertEqual(sweep["remaining"], ["MLVAttr3-killed-b"])
+
+    def test_a_capture_image_beside_the_service_child_still_skips_the_whole_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("service-child-and-capture", others=(self.SERVICE_UNREADABLE, (4900, "PresentMon-2.4.1-x64", UNREADABLE)))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_mutation_the_service_child_skips_the_whole_sweep_again(self) -> None:
+        mutated = mutate(TEMPLATE, "if (@(Get-PresentMonCaptureBlockerId $snapshot).Count -gt 0) {", "if ($true) {")
+        _code, sweep, d, _out = self.run_start("mut-service-child", others=(self.SERVICE_UNREADABLE,), text=mutated)
+        self.assertFalse(sweep["ran"], "the 2026-10-27 Bachelor state: the orphan of a killed leg is never swept")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_mutation_rechecks_that_count_every_live_process_abort_the_harness_sweep(self) -> None:
+        mutated = mutate(TEMPLATE, "if ($Scope -eq 'harness_sessions') { return @(Get-PresentMonCaptureBlockerId $snapshot) }", "")
+        _code, sweep, d, _out = self.run_start("mut-recheck-scope", others=(self.SERVICE_UNREADABLE,), text=mutated)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_started_during_sweep")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_mutation_without_the_scope_filter_the_default_session_is_swept_under_an_unidentified_process(self) -> None:
+        mutated = mutate(TEMPLATE, "$listed = @($listed | Where-Object { $_ -like 'MLVAttr3-*' })", "")
+        _code, sweep, d, _out = self.run_start("mut-scope-filter", others=(self.SERVICE_UNREADABLE,), text=mutated)
+        self.assertIn("PresentMon", self.terminated_names(self.calls(d)))
 
     def test_an_unreadable_foreign_capture_of_another_version_is_live(self) -> None:
         code, sweep, d, out = self.run_start("foreign-unreadable", others=((4900, "PresentMon-2.4.1-x64", UNREADABLE),))
@@ -691,15 +778,14 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
     def test_mutation_without_the_service_lookup_the_service_blocks_the_sweep_again(self) -> None:
         mutated = mutate(TEMPLATE, "if ($registered.Count -gt 0) {", "if ($false) {")
         _code, sweep, d, _out = self.run_start("mut-no-service", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW, text=mutated)
-        self.assertFalse(sweep["ran"])
-        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
-        self.assertEqual(self.terminated_names(self.calls(d)), [], "the Bachelor state: the service blocks the sweep")
+        self.assertEqual(sweep["deferred"], ["PresentMon"], "the registered service reads as unidentified: the default session is left")
+        self.assertNotIn("PresentMon", self.terminated_names(self.calls(d)))
 
     def test_mutation_an_unreadable_path_read_as_not_live_sweeps_under_an_unidentified_process(self) -> None:
         mutated = mutate(TEMPLATE, "elseif (-not $pathReadable) { $reason = 'unreadable_path_not_a_registered_service' }", "elseif (-not $pathReadable) { $serviceName = $null }")
         _code, sweep, d, _out = self.run_start("mut-unreadable", others=(self.SERVICE_UNREADABLE,), text=mutated)
         self.assertTrue(sweep["ran"], "sol's repro: ran=true, error=null, the sweep terminates under an unidentified PresentMon")
-        self.assertNotEqual(self.terminated_names(self.calls(d)), [])
+        self.assertIn("PresentMon", self.terminated_names(self.calls(d)), "the default session is terminated under an unidentified PresentMon")
 
     def test_mutation_a_failing_service_lookup_read_as_no_service_is_not_fail_closed(self) -> None:
         mutated = mutate(TEMPLATE, "Get-CimInstance -ClassName Win32_Service -Filter \"ProcessId = $candidateId\" -ErrorAction Stop", "Get-CimInstance -ClassName Win32_Service -Filter \"ProcessId = $candidateId\" -ErrorAction SilentlyContinue")
@@ -1287,6 +1373,23 @@ class EventsLostEvidenceInTheJobTests(_StopHarness, unittest.TestCase):
     def test_a_display_report_failure_without_a_loss_keeps_its_reason_verbatim(self) -> None:
         code, summary, _pub, out = self.run_parse_with_events("clean-parse")
         self.assertEqual(code, 23, out)
+        self.assertEqual(summary["reason"], UM2_REASON)
+
+    SWEEP_CALL = "$displayReport = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $displayReport -Sweep $presentMonOrphanSweep"
+    SKIPPED_SWEEP = "$presentMonOrphanSweep = [ordered]@{ ran = $false; skippedReason = 'presentmon_process_alive'; livePresentMonProcessIds = @(43684) }\n"
+
+    def test_a_display_report_failure_after_a_skipped_sweep_names_the_sweep(self) -> None:
+        # BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: the 16 Bachelor cuda legs of 2026-10-27 read only "PresentMon output does not exist" while the sweep had been skipped on every one
+        injected = mutate(TEMPLATE, self.SWEEP_CALL, self.SKIPPED_SWEEP + self.SWEEP_CALL)
+        code, summary, _pub, out = self.run_parse_with_events("skipped-sweep-parse", text=injected)
+        self.assertEqual(code, 23, out)
+        self.assertTrue(summary["reason"].startswith(UM2_REASON), summary["reason"])
+        self.assertIn("[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive livePids=43684]", summary["reason"])
+        self.assertIn("PRESENTMON_ORPHAN_SWEEP_INCOMPLETE", out, "and so is the RESULT line")
+
+    def test_mutation_without_the_sweep_detail_the_reason_is_bare_again(self) -> None:
+        injected = mutate(TEMPLATE, self.SWEEP_CALL, self.SKIPPED_SWEEP + "$null = $presentMonOrphanSweep")
+        _code, summary, _pub, _out = self.run_parse_with_events("mut-sweep-detail", text=injected)
         self.assertEqual(summary["reason"], UM2_REASON)
 
     def test_both_capture_json_statements_carry_the_orphan_sweep_and_the_events_lost_record(self) -> None:

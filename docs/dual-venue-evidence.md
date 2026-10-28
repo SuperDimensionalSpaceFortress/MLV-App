@@ -284,6 +284,14 @@ session (both stop paths). `presentmon-capture.json` carries `orphanSweep` (ran,
 what remains) and `eventsLost` (PresentMon's stderr reported lost events: message count and largest count); the failure terminals' PresentMon reason gains a typed
 `PRESENTMON_EVENTS_LOST` detail, so a recurrence reads as its cause instead of "output does not exist".
 
+*The harness's own sessions are swept even beside an unidentified non-capture PresentMon (BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1).* On Bachelor the `PresentMonService` is
+no registered service: it is a child of `IntelGraphicsSoftware.Service.exe`, and the agent cannot read its path. So it stayed live and skipped the whole sweep on every leg. On
+2026-10-27 at 20:06:20Z a lease demotion tree-killed a cpu leg mid-capture, leaving `MLVAttr3-...-150416` running, and every later capture on the host wrote no CSV (16 of 16
+cuda legs, `PRESENTMON_UNAVAILABLE`). Only a capture image (the pinned image by name or path, or any `PresentMon[-_.]<version|x64|...>` name) can own an `MLVAttr3-*` session.
+So when every live process is no capture image, the sweep runs in `orphanSweep.scope = harness_sessions`: it terminates the `MLVAttr3-*` orphans, leaves the default `PresentMon`
+session (recorded in `orphanSweep.deferred`), and stops on a re-check only for a capture image. With no PresentMon process alive the scope is `all`, as before. A display-report
+failure whose sweep did not leave the host clean (skipped, aborted, `remaining`, `deferred`, a listing or sweep error) gains a typed `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE` detail.
+
 The sweep can never stop a live capture or a session it did not list as an orphan (round 2): it acts only on the names listed before its second liveness check -- a name a
 later listing shows (another job's capture starting meanwhile) is recorded as `newlyListed` and left alone -- and it re-checks that no PresentMon process exists immediately
 before **each** terminate and **each** `logman stop`; the first process that appears ends the sweep (`abortedReason` / `abortedBefore`, with `remaining` still derived from a
