@@ -512,6 +512,14 @@ function Exit-HeavySlotHolderGone($Lease, [string]$When = 'after-ready') {
     # A ready file whose slot is gone (holder, slot owner or heavy-slot ended) is no admission: the machine slot is not
     # held, so nothing is built on it (Dot advisory pr-702). REQUEUE, like a marked 75. The stop file goes first, so a
     # holder that outlived its slot owner ends too, and it stays while that holder still runs.
+    # The REQUEUE names a holder, so it needs one read from a complete ready record. Every caller without one has seen
+    # heavy-slot end, so the record is read once more: a ready file still partial or empty then (its publication failed and
+    # the holder's trap ended it) never established admission, and is COULD_NOT_CHECK (r4 sol B1, r5).
+    if (-not $Lease.Holder) {
+        $state = Get-HeavySlotHolderState $Lease
+        if ($state -eq '') { Exit-HeavySlotUnreadable $Lease $Lease.BuildLabel 'ready file incomplete' }
+        if ($state -ne 'gone') { Exit-HeavySlotUnreadable $Lease $Lease.BuildLabel }
+    }
     Send-HeavySlotStop $Lease
     $code = Get-HeavySlotExitCode $Lease
     Send-HeavySlotLines $Lease
@@ -522,14 +530,15 @@ function Exit-HeavySlotHolderGone($Lease, [string]$When = 'after-ready') {
     exit 3
 }
 
-function Exit-HeavySlotUnreadable($Lease, [string]$Label) {
+function Exit-HeavySlotUnreadable($Lease, [string]$Label, [string]$What = 'ready file unreadable') {
     # A complete ready file whose holder or owner line does not parse cannot be checked, so it is never an admission
-    # (r4 sol B1): the stop file goes, heavy-slot is given up to 60 s to end, and nothing is built.
+    # (r4 sol B1), and neither can one heavy-slot left partial or empty ($What 'ready file incomplete', r5): the stop file
+    # goes, heavy-slot is given up to 60 s to end, and nothing is built.
     Send-HeavySlotStop $Lease
     $code = Get-HeavySlotExitCode $Lease
     Send-HeavySlotLines $Lease
     Remove-HeavySlotLeaseFiles $Lease
-    Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code=1 reason=ready file unreadable (heavy-slot exit {1}) utc={2}' -f $Label, $code, [DateTime]::UtcNow.ToString('o'))
+    Write-Output ('BUILD_HEAVY_SLOT_COULD_NOT_CHECK label={0} code=1 reason={1} (heavy-slot exit {2}) utc={3}' -f $Label, $What, $code, [DateTime]::UtcNow.ToString('o'))
     exit 1
 }
 

@@ -17,7 +17,9 @@
 #   readypartial  publish the ready file in two writes, like a reader catching it half written: first only the ticket and
 #              holder lines (no owner, no 'end'), then after STUB_HEAVY_SLOT_CHILD_S seconds (default 2) the complete record,
 #              whose owner=<pid>@1 names no running process (a dead slot owner); STUB_HEAVY_SLOT_FINAL=malformed writes a
-#              complete record whose holder line does not parse instead. Then it waits STUB_HEAVY_SLOT_HOLD_S and exits.
+#              complete record whose holder line does not parse instead. STUB_HEAVY_SLOT_FINAL=none never writes the complete
+#              record (the publication failed and the holder's trap ended it); =empty writes an empty ready file and nothing
+#              more. Then it waits STUB_HEAVY_SLOT_HOLD_S and exits STUB_HEAVY_SLOT_CODE.
 # The real-path modes (run, pinwarn, locklog) export HEAVY_SLOT_HELD and HEAVY_SLOT_HELD_START (this process's start time,
 # or STUB_HEAVY_SLOT_HELD_START, which stands in for a pid reused since the slot owner exported its start time).
 # STUB_HEAVY_SLOT_DELAY_S (run, pinwarn and readyexit) waits that many seconds before starting the child, like a queue wait for the slot.
@@ -76,11 +78,12 @@ switch ($mode) {
         $ready = Get-StubReadyPath
         $ticks = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
         $record.childStart = [DateTime]::UtcNow.ToString('o')
-        Set-Content -LiteralPath $ready -Value @("${ticket}:$PID", "holder=$PID@$ticks") -Encoding ascii
+        if ($env:STUB_HEAVY_SLOT_FINAL -eq 'empty') { [IO.File]::WriteAllText($ready, '') }
+        else { Set-Content -LiteralPath $ready -Value @("${ticket}:$PID", "holder=$PID@$ticks") -Encoding ascii }
         Start-Sleep -Seconds $(if ($env:STUB_HEAVY_SLOT_CHILD_S) { [double]$env:STUB_HEAVY_SLOT_CHILD_S } else { 2 })
         $final = if ($env:STUB_HEAVY_SLOT_FINAL -eq 'malformed') { @("${ticket}:$PID", "holder=$PID", 'owner=none', 'end') }
-                 else { @("${ticket}:$PID", "holder=$PID@$ticks", "owner=$PID@1", 'end') }
-        Set-Content -LiteralPath $ready -Value $final -Encoding ascii
+                 elseif ($env:STUB_HEAVY_SLOT_FINAL -notin 'none', 'empty') { @("${ticket}:$PID", "holder=$PID@$ticks", "owner=$PID@1", 'end') }
+        if ($final) { Set-Content -LiteralPath $ready -Value $final -Encoding ascii }
         if ($env:STUB_HEAVY_SLOT_HOLD_S) { Start-Sleep -Seconds ([double]$env:STUB_HEAVY_SLOT_HOLD_S) }
         $record.childEnd = [DateTime]::UtcNow.ToString('o')
         $code = $stubCode

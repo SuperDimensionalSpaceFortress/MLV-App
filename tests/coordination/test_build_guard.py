@@ -1379,6 +1379,46 @@ def test_a_complete_ready_file_that_does_not_parse_is_could_not_check(box) -> No
     assert not box["marker"].exists() and not box["lock"].exists()
 
 
+@pytest.mark.parametrize("final", ["none", "empty"])
+def test_an_incomplete_ready_file_left_by_an_ended_heavy_slot_is_could_not_check(box, final) -> None:
+    # sol r4 B1 (r5): the ready file was never completed (a failed Set-Content, then the holder's trap: 'none'), or is empty,
+    # and heavy-slot has ended with 1. No holder identity was ever read, so it is no identity-based REQUEUE.
+    done = _heavy(box, "readypartial", ["-Command", _marker_command(box)],
+                  extra={"STUB_HEAVY_SLOT_CHILD_S": "0", "STUB_HEAVY_SLOT_FINAL": final, "STUB_HEAVY_SLOT_CODE": "1"})
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=1 reason=ready file incomplete (heavy-slot exit 1)" in done.stdout, \
+        done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout and "heavy-slot: admitted" not in done.stderr
+    assert not box["marker"].exists() and not box["lock"].exists()
+    assert list((box["dir"] / "heavy-slot").iterdir()) == []
+
+
+@pytest.mark.parametrize("text, verdict", [
+    ("t:8420\nholder=8420@638971000020000000\n", "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=1 reason=ready file incomplete (heavy-slot exit 1)"),
+    ("", "BUILD_HEAVY_SLOT_COULD_NOT_CHECK label=build code=1 reason=ready file incomplete (heavy-slot exit 1)"),
+    # Control: a complete record whose holder is not running is the REQUEUE r4 designed.
+    ("t:8420\nholder=8420@638971000020000000\nowner=none\nend\n", "BUILD_HEAVY_SLOT_REQUEUE label=build code=1 ticket= reason=holder-exited-after-ready"),
+])
+def test_a_slot_gone_exit_without_a_holder_identity_never_requeues(box, text, verdict) -> None:
+    # sol r4 B1 (r5), sol's literal record: every holder-exited classification (the loop's ready-file branch, its
+    # wrapper-exited branch and the re-check after admission) goes through Exit-HeavySlotHolderGone. With an exited wrapper
+    # and no complete ready record, it is COULD_NOT_CHECK; it never names a holder it has not read.
+    ready = box["dir"] / "x.ready"
+    ready.write_bytes(text.encode("ascii"))
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n"
+                "$p = [pscustomobject]@{ Id = 1; HasExited = $true; ExitCode = 1 }\n"
+                "$p | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $true }\n"
+                f"$lease = @{{ Label = 'mlv:t:build'; BuildLabel = 'build'; Ready = '{ready}'; Stop = '{box['dir'] / 'x.stop'}'; "
+                f"ExitFile = '{box['dir'] / 'x.exit.json'}'; Log = '{box['dir'] / 'x.log'}'; Lines = [System.Collections.Generic.List[string]]::new(); "
+                "Process = $p; Ticket = ''; Holder = $null; Owner = $null; Gone = ''; Tail = ''; LogUnread = $false }\n"
+                "Exit-HeavySlotHolderGone $lease\n"])
+    assert verdict in done.stdout, done.stdout + done.stderr
+    assert done.returncode == (3 if "REQUEUE" in verdict else 1), done.stdout + done.stderr
+    if "REQUEUE" not in verdict:
+        assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
+
+
 def test_the_holder_binds_the_slot_owner_to_its_exported_start_time(box) -> None:
     # r4 sol B2: the holder names the owner only when the process under the HEAVY_SLOT_HELD pid started at the exported
     # HEAVY_SLOT_HELD_START. Another start time (the pid was reused) or no readable value is written as @-1, which no
