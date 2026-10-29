@@ -63,6 +63,9 @@
 #     or fail the build: the slot is a machine-concurrency throttle, not a correctness lock. The guard prints
 #     HEAVY_SLOT_LOST_DURING_ACTION label=<l> code=<heavy-slot exit> utc=<o> on stderr AND stdout, so a
 #     receipt can classify the build as unprotected, and the build's own exit code is returned unchanged.
+#     Only a loss after the action started is "during": one found by a release before it (a memory or path refusal, a
+#     pin mismatch at run, a throw before the action) prints BUILD_HEAVY_SLOT_REQUEUE reason=holder-exited-before-action
+#     instead, then that refusal's own typed line and exit code, unchanged (or the throw goes on).
 #   - A heavy-slot call inside a build action does not pass through (the holder is a child of this guard,
 #     not an ancestor of the action), so it would wait for its own guard: do not nest one there.
 #   - heavy-slot's output goes to a log file beside the lock, never a pipe, so it can never block while it
@@ -1131,22 +1134,26 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     }
 }
 
-function Exit-HeavySlot($Lease) {
+function Exit-HeavySlot($Lease, [switch]$ActionStarted) {
     # Gives the slot back: the holder sees the stop file and exits, so heavy-slot releases. The build's verdict
     # never depends on this; a release that does not end cleanly is a WARN only.
     if (-not $Lease) { return }
     # The holder (or heavy-slot) ended before the stop file: part of the build ran without the machine slot. The build
     # is not failed for it (the slot is a throttle, not a correctness lock), but the line lets a receipt call it unprotected.
+    # Only a release after the action started says so (r10, sol r9 B1): every other one ran nothing, so a lost holder there
+    # is the before-action REQUEUE line, and the caller's own refusal line and exit code follow it unchanged.
     $lost = $Lease.Process.HasExited -or (Get-HeavySlotHolderState $Lease) -ne 'alive'
     Send-HeavySlotStop $Lease
-    if ($lost) {
+    if ($lost -and $ActionStarted) {
         $line = 'HEAVY_SLOT_LOST_DURING_ACTION label={0} code={1} utc={2}' -f $Lease.BuildLabel, (Get-HeavySlotExitCode $Lease), [DateTime]::UtcNow.ToString('o')
         Write-BuildGuardLog $line
         # Warning-only (r6b adversary A2) and bounded (r8, 3e68ca85-A2): a stdout that is closed, gone or undrained never turns a
         # finished action into a throw or a wait.
         Write-BuildGuardTyped $line
     }
+    $code = 'unknown'
     if ($Lease.Process.WaitForExit(60000)) {
+        $code = [string]$Lease.Process.ExitCode
         Send-HeavySlotLines $Lease
         if ($lost) { Write-BuildGuardLog ('heavy-slot: ended before release label={0}' -f $Lease.Label) }
         elseif ($Lease.Process.ExitCode -ne 0) { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} heavy-slot ended with {1} after release' -f $Lease.Label, $Lease.Process.ExitCode) }
@@ -1156,6 +1163,12 @@ function Exit-HeavySlot($Lease) {
         # The stop file stays: a holder that has not been scheduled yet must still see it (adversary A3).
         Send-HeavySlotLines $Lease
         Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} heavy-slot did not end within 60 s of release; the stop file stays at {1}' -f $Lease.Label, $Lease.Stop)
+    }
+    if ($lost -and -not $ActionStarted) {
+        # The same line Exit-HeavySlotHolderGone prints before the action, written after the release like the refusals are.
+        foreach ($l in $Lease.Lines) { if ($l -match '^HEAVY-SLOT TICKET (\S+) ') { $Lease.Ticket = $Matches[1] } }
+        $gone = if ($Lease.Gone) { $Lease.Gone } else { 'holder-exited' }
+        Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REQUEUE label={0} code={1} ticket={2} reason={3}-before-action utc={4}' -f $Lease.BuildLabel, $code, $Lease.Ticket, $gone, [DateTime]::UtcNow.ToString('o'))
     }
 }
 
@@ -1198,6 +1211,8 @@ function Invoke-BuildGuard {
     # The machine heavy slot is the OUTERMOST lock of a build: the memory floor and the build slot below nest inside it,
     # and the outer finally gives it back on every way out, a throw a Library caller catches included (adversary A2).
     $heavy = $null
+    # Set only on the line before the action runs: a release reached before it never reports a loss "during" it (r10).
+    $actionStarted = $false
     if ($NoSlot) {
         # -NoSlot is for a caller that builds nothing (-PrintJobs): it takes neither slot, so the bypass is a typed line a
         # receipt can classify, never a silent one (r4 adversary A1).
@@ -1267,6 +1282,7 @@ function Invoke-BuildGuard {
                     Write-BuildGuardLog ('admitted label={0} jobs={1} reason={2} peers=[{3}] freePhysGB={4} freeCommitGB={5} slot={6}' -f $Label, $jobs, $choice.Reason, ($choice.Peers -join ','), $mem.PhysGB, $mem.CommitGB, $(if ($ticket) { 'held' } else { 'none' }))
                 }
             }
+            $actionStarted = $true
             & {
                 param($Jobs)
                 $PSDefaultParameterValues = $callerDefaults
@@ -1278,7 +1294,7 @@ function Invoke-BuildGuard {
         }
     } finally {
         # Queued guard lines go out last, once nothing is held (r7b, adversary 8d0c73bd-A1), the typed lines with them (r8).
-        try { Exit-HeavySlot $heavy } finally { Complete-BuildGuardOutput }
+        try { Exit-HeavySlot $heavy -ActionStarted:$actionStarted } finally { Complete-BuildGuardOutput }
     }
 }
 

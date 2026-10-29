@@ -1559,6 +1559,154 @@ def test_a_slot_lost_while_the_admitted_line_is_written_is_a_requeue_before_the_
     assert not box["marker"].exists() and not box["lock"].exists(), "nothing is built without a live heavy slot"
 
 
+# r10 (sol r9 B1, row 8): the loss label follows whether the action started. Every release reached before the action (the
+# memory deadline, a path refusal, a pin mismatch at run, a throw unwinding before the action) reports a lost holder as the
+# before-action REQUEUE shape, never HEAVY_SLOT_LOST_DURING_ACTION; the refusal's own typed line and exit code are unchanged.
+# The holder is ended from a shadowed guard function, so "lost before the decision" is deterministic, not a race.
+_KILL_HOLDER = (
+    "function Stop-TestHolder {\n"
+    "    if ($heavy -and $heavy.Holder -and -not $script:holderKilled) {\n"
+    "        $script:holderKilled = $true\n"
+    "        Stop-Process -Id $heavy.Holder.Pid -Force; Wait-Process -Id $heavy.Holder.Pid -Timeout 20 -ErrorAction Ignore } }\n"
+)
+
+
+def _assert_lost_before_the_action(box: dict, done: subprocess.CompletedProcess) -> None:
+    assert "heavy-slot: admitted" in done.stderr, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build " in done.stdout, done.stdout + done.stderr
+    assert "reason=holder-exited-before-action" in done.stdout, done.stdout
+    assert "HEAVY_SLOT_LOST_DURING_ACTION" not in done.stdout + done.stderr, "zero actions ran: nothing was lost during one"
+    assert not box["marker"].exists(), "the action never ran"
+
+
+def test_a_holder_lost_before_the_memory_deadline_refusal_is_not_lost_during_the_action(box) -> None:
+    # Sol r9 row 8, its literal input: DeadlineMinutes=0, memory {"freePhysGB":0,"freeCommitGB":0}, a live lease admitted,
+    # and the holder exits before the memory decision.
+    zero = _write_json(box["dir"] / "memory-zero.json", [{"freePhysGB": 0, "freeCommitGB": 0}])
+    done = _library_driver(
+        box,
+        _KILL_HOLDER
+        + "$script:origMem = ${function:Get-BuildGuardMemory}\n"
+        "function Get-BuildGuardMemory([hashtable]$Options) { Stop-TestHolder; & $script:origMem $Options }\n"
+        f"$opts.DeadlineMinutes = 0; $opts.MemoryProbeFile = '{zero}'\n"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 3, done.stdout + done.stderr
+    _assert_lost_before_the_action(box, done)
+    assert "BUILD_MEM_REFUSED label=build freePhysGB=0 freeCommitGB=0" in done.stdout, done.stdout
+    assert done.stdout.index("BUILD_HEAVY_SLOT_REQUEUE") < done.stdout.index("BUILD_MEM_REFUSED"), "the slot goes back first"
+    assert not box["lock"].exists()
+    assert list((box["dir"] / "heavy-slot").iterdir()) == []
+
+
+def test_a_holder_lost_while_memory_stays_low_is_a_before_action_loss_in_command_mode(box) -> None:
+    # The same class through command mode: the holder is alive at admission and ends during a 5 s memory poll; memory never
+    # passes, so the deadline refusal is the release.
+    done = _heavy(box, "readyexit", ["-PollSeconds", "5", "-DeadlineMinutes", "0.07", "-Command", _marker_command(box)],
+                  extra={"STUB_HEAVY_SLOT_HOLD_S": "3"}, memory=[{"freePhysGB": 0, "freeCommitGB": 0}])
+    assert done.returncode == 3, done.stdout + done.stderr
+    _assert_lost_before_the_action(box, done)
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build code=0 ticket=stub-" in done.stdout, done.stdout
+    assert "BUILD_MEM_REFUSED label=build freePhysGB=0 freeCommitGB=0" in done.stdout, done.stdout
+    assert list((box["dir"] / "heavy-slot").iterdir()) == []
+
+
+def test_a_throw_before_the_action_with_the_holder_gone_is_not_lost_during_the_action(box) -> None:
+    # Sibling (sol's sweep, G:1281): the process census throws after the holder ended; the outer finally releases a slot
+    # whose action never started. The throw still reaches the Library caller.
+    done = _library_driver(
+        box,
+        _KILL_HOLDER
+        + "function Get-BuildGuardJobs([hashtable]$Options, [int]$SelfPid) { Stop-TestHolder; throw 'census exploded' }\n"
+        "try { Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        f"    Set-Content -LiteralPath '{box['marker']}' -Value ran }} }} catch {{ Write-Output \"caught=$($_.Exception.Message)\" }}\n",
+        str(box["lock"]),
+    )
+    assert "caught=census exploded" in done.stdout, done.stdout + done.stderr
+    _assert_lost_before_the_action(box, done)
+    assert not box["lock"].exists()
+
+
+def test_a_holder_lost_before_a_path_refusal_is_not_lost_during_the_action(box) -> None:
+    # Sibling (sol's sweep, G:1227): the build slot refuses its path after the holder ended. The refusal keeps exit 2.
+    done = _library_driver(
+        box,
+        _KILL_HOLDER
+        + "function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {\n"
+        "    Stop-TestHolder; return @{ Acquired = $false; Held = ''; Refused = 'test refusal' } }\n"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 2, done.stdout + done.stderr
+    _assert_lost_before_the_action(box, done)
+    assert "BUILD_GUARD_PATH_REFUSED label=build option=LockPath " in done.stdout, done.stdout
+
+
+def test_a_holder_lost_before_a_pin_mismatch_at_run_is_not_lost_during_the_action(box) -> None:
+    # Sibling inside Enter-HeavySlot (G:1117): heavy-slot's own PIN MISMATCH refuses after admission's liveness check; the
+    # holder ends in between (the marker scan is the step between them). The refusal keeps exit 3.
+    done = _library_driver(
+        box,
+        "function Where-Object { param([scriptblock]$FilterScript, [Parameter(ValueFromPipeline = $true)] $InputObject)\n"
+        "    begin { if ($lease -and $lease.Holder -and -not $script:holderKilled) { $script:holderKilled = $true\n"
+        "        Stop-Process -Id $lease.Holder.Pid -Force; Wait-Process -Id $lease.Holder.Pid -Timeout 20 -ErrorAction Ignore } }\n"
+        "    process { if ($FilterScript.InvokeWithContext($null, [psvariable]::new('_', $InputObject))) { $InputObject } } }\n"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+        extra={"STUB_HEAVY_SLOT_MODE": "pinwarn"},
+    )
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=pin-mismatch-at-run" in done.stdout, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE label=build " in done.stdout and "reason=holder-exited-before-action" in done.stdout, done.stdout
+    assert "HEAVY_SLOT_LOST_DURING_ACTION" not in done.stdout + done.stderr
+    assert not box["marker"].exists()
+
+
+def test_control_a_live_holder_with_low_memory_gives_only_the_memory_refusal(box) -> None:
+    # Sol's control 1: nothing is lost, so no loss line of either shape.
+    done = _heavy(box, "run", ["-DeadlineMinutes", "0", "-Command", _marker_command(box)],
+                  memory=[{"freePhysGB": 0, "freeCommitGB": 0}])
+    assert done.returncode == 3, done.stdout + done.stderr
+    assert "BUILD_MEM_REFUSED label=build freePhysGB=0 freeCommitGB=0" in done.stdout, done.stdout
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
+    assert "HEAVY_SLOT_LOST_DURING_ACTION" not in done.stdout + done.stderr
+    assert not box["marker"].exists()
+
+
+def test_control_a_dead_holder_with_enough_memory_is_a_before_action_requeue(box) -> None:
+    # Sol's control 2: memory passes, the holder is gone at the last check: the existing before-action REQUEUE, exit 3.
+    done = _library_driver(
+        box,
+        _KILL_HOLDER
+        + "$script:origMem = ${function:Get-BuildGuardMemory}\n"
+        "function Get-BuildGuardMemory([hashtable]$Options) { Stop-TestHolder; & $script:origMem $Options }\n"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == 3, done.stdout + done.stderr
+    _assert_lost_before_the_action(box, done)
+    assert done.stdout.count("BUILD_HEAVY_SLOT_REQUEUE") == 1, done.stdout
+    assert "BUILD_MEM_REFUSED" not in done.stdout
+
+
+@pytest.mark.parametrize("code", [0, 7])
+def test_control_a_holder_lost_during_the_action_is_still_lost_during_the_action(box, code) -> None:
+    # Sol's row 10: the holder exits DURING the action; the loss stays LOST_DURING_ACTION and the action keeps its code.
+    done = _library_driver(
+        box,
+        _KILL_HOLDER
+        + "Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        f"    Stop-TestHolder; Set-Content -LiteralPath '{box['marker']}' -Value ran; $global:LASTEXITCODE = {code} }}\n"
+        "exit $LASTEXITCODE\n",
+        str(box["lock"]),
+    )
+    assert done.returncode == code, done.stdout + done.stderr
+    assert "HEAVY_SLOT_LOST_DURING_ACTION label=build " in done.stdout, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REQUEUE" not in done.stdout
+    assert box["marker"].exists(), "the action ran to its end"
+
+
 # r4 sol B4/B5 seams: Get-Process is shadowed so the pid's process can change between calls (a reused pid) or lose its start
 # time after the lookup (it ended). Stop-Process is shadowed too, so nothing real is ever stopped.
 _PROCESS_SEAM = (
@@ -2564,9 +2712,13 @@ def test_a_build_slot_release_never_throws_past_the_heavy_slot_stop(tmp_path) ->
     assert "try { Remove-BuildSlot $ticket } finally { $ticket = $null; Exit-HeavySlotHolderGone $lost 'before-action' }" in text
 
 
-def test_a_closed_stdout_never_turns_a_lost_slot_release_into_a_throw(tmp_path) -> None:
+@pytest.mark.parametrize("started, line", [("-ActionStarted", "HEAVY_SLOT_LOST_DURING_ACTION label=t"),
+                                           ("", "BUILD_HEAVY_SLOT_REQUEUE label=t code=0 ticket= reason=holder-exited-before-action")],
+                         ids=["during", "before"])
+def test_a_closed_stdout_never_turns_a_lost_slot_release_into_a_throw(tmp_path, started, line) -> None:
     # r6b adversary A2 (pass 2): the slot ended during the action and Console.Out is a writer the host has closed. The
-    # HEAVY_SLOT_LOST_DURING_ACTION line is warning-only: Exit-HeavySlot returns instead of throwing.
+    # HEAVY_SLOT_LOST_DURING_ACTION line is warning-only: Exit-HeavySlot returns instead of throwing. r10: the before-action
+    # shape a release without -ActionStarted prints is bounded the same way.
     stop = tmp_path / "stop"
     done = _ps(["-Command",
                 f". '{GUARD}' -Library\n$ErrorActionPreference = 'Stop'\n"
@@ -2576,10 +2728,13 @@ def test_a_closed_stdout_never_turns_a_lost_slot_release_into_a_throw(tmp_path) 
                 "Lines = [System.Collections.Generic.List[string]]::new() }\n"
                 "$keep = [Console]::Out\n"
                 "$w = [System.IO.StreamWriter]::new([System.IO.MemoryStream]::new()); $w.Dispose(); [Console]::SetOut($w)\n"
-                "try { Exit-HeavySlot $lease; $r = 'release=returned' } catch { $r = \"release=threw $($_.Exception.Message)\" }\n"
+                f"try {{ Exit-HeavySlot $lease {started}; $r = 'release=returned' }} catch {{ $r = \"release=threw $($_.Exception.Message)\" }}\n"
                 "[Console]::SetOut($keep)\nWrite-Output $r\n"])
     assert "release=returned" in done.stdout, done.stdout + done.stderr
-    assert "HEAVY_SLOT_LOST_DURING_ACTION label=t" in done.stderr, done.stderr
+    # The during line is logged to stderr too; the REQUEUE shape is typed only, like Exit-HeavySlotHolderGone's.
+    assert line in (done.stderr if started else done.stdout), done.stdout + done.stderr
+    other ="BUILD_HEAVY_SLOT_REQUEUE" if started else "HEAVY_SLOT_LOST_DURING_ACTION"
+    assert other not in done.stdout + done.stderr
     assert "Cannot write to a closed TextWriter" not in done.stdout, done.stdout
 
 
