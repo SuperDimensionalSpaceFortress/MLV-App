@@ -321,12 +321,21 @@ class CpuReceiptLegRunsProcessed8(unittest.TestCase):
         for needle in ("Get-AttrCpuProcessed8Route", "PROCESSED8_ROUTE_NOT_TAKEN", "$glViewportInheritedCleared"):
             self.assertNotIn(needle, text)
 
-    def test_cpu_jobs_without_receipt_carry_no_route_gate(self) -> None:
-        for extra in (["-Backend", "cpu", "-TelemetryArm", "HEAVY"], ["-Backend", "cpu", "-TelemetryArm", "HEAVY", "-PlaybackProcessing", "subset"]):
+    def test_the_gate_binds_only_a_job_whose_smoke_command_asks_for_receipt(self) -> None:
+        """The block is the same text in every cpu job (so -PlaybackProcessing receipt adds only its own token); the job reads whether it is a receipt job
+        from its own smoke command. A subset / default cpu job (Debayered16 by design) clears the GL flags too but is never refused for lacking Processed8."""
+        needle = "$processed8RouteRequired = $cmd.Contains(' -Playback' + 'Processing receipt ')"
+        for extra, required in ((spec_generator_args(NEW_SPEC), True), (CPU_RECEIPT_LIGHT, True),
+                                (["-Backend", "cpu", "-TelemetryArm", "HEAVY"], False),
+                                (["-Backend", "cpu", "-TelemetryArm", "HEAVY", "-PlaybackProcessing", "subset"], False)):
             with self.subTest(extra=extra):
                 text = self.generate(extra)
-                for needle in ("Get-AttrCpuProcessed8Route", "PROCESSED8_ROUTE_NOT_TAKEN", "$glViewportInheritedCleared"):
-                    self.assertNotIn(needle, text)
+                self.assertEqual(text.count(needle), 1)
+                self.assertIn("if ($processed8RouteRequired -and -not $processed8Route.taken) {", text)
+                smoke = [line for line in text.splitlines() if line.lstrip().startswith('$cmd = "& ')]
+                self.assertEqual(len(smoke), 1)
+                self.assertEqual(" -PlaybackProcessing receipt " in smoke[0], required)
+                self.assertEqual(self.child_gl_flags(extra, {flag: "1" for flag in GL_FLAGS}), {flag: None for flag in GL_FLAGS})
 
 
 class Processed8RouteMirrorsTheApp(unittest.TestCase):

@@ -5563,18 +5563,20 @@ if ($isVariant) {
 # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r5 (sol r4 B1, PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1): a cpu job with -PlaybackProcessing receipt exists to run
 # the Processed8 route. The smoke command passes -PreserveExperimentalEnvironment, so an MLVAPP_EXPERIMENTAL_GL_VIEWPORT or MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT
 # the venue worker inherited reached the app; it installs the GL surface, shouldUseGpu16PreviewPath() turns true (scopes are off) and every frame runs
-# OutputProcessed16 with processed8_measured=0 -- cpu frames and no gpu frame, so the exit-28 gate passed it. Two layers, every cpu receipt job (a cuda
-# job and a cpu job without receipt are the text they were):
-#   (a) the job removes both flags from its own process environment before the smoke child starts, so neither the runner nor the app inherits one. They
-#       are removed, not set to 0: platform/qt/main.cpp (shouldPreferDesktopOpenGl, shouldShareOpenGlContexts) tests them with qEnvironmentVariableIsSet,
-#       so a 0 would still switch shared GL contexts on for a cpu leg. Absent is the state every other cpu leg runs in.
-#   (b) after the run the measured session's playback_smoke.processed8_cache_summary line must show Processed8 frames and no Processed16-only frame
-#       (processed16_measured counts a Processed8 frame too: RenderFrameThread.cpp processed16StageMeasured), else PROCESSED8_ROUTE_NOT_TAKEN, exit 33.
-if ($isCpuBackend -and $PlaybackProcessing -eq 'receipt') {
+# OutputProcessed16 with processed8_measured=0 -- cpu frames and no gpu frame, so the exit-28 gate passed it. Two layers, every cpu job (a cuda job is the
+# text it was). The block is the SAME text in every cpu job, so -PlaybackProcessing receipt still adds exactly its own token to the job (pinned by
+# test_playback_processing_reaches_the_smoke_command_and_absent_changes_nothing); the job reads whether it is a receipt job from its own smoke command:
+#   (a) every cpu job removes both flags from its own process environment before the smoke child starts, so neither the runner nor the app inherits one
+#       (A1 above: the GL-window/viewport envs only serve the GPU presentation path). They are removed, not set to 0: platform/qt/main.cpp
+#       (shouldPreferDesktopOpenGl, shouldShareOpenGlContexts) tests them with qEnvironmentVariableIsSet, so a 0 would still switch shared GL contexts on.
+#   (b) a receipt job ($cmd carries '-PlaybackProcessing receipt ') requires the measured session's playback_smoke.processed8_cache_summary line to show
+#       Processed8 frames and no Processed16-only frame (processed16_measured counts a Processed8 frame too: RenderFrameThread.cpp
+#       processed16StageMeasured), else PROCESSED8_ROUTE_NOT_TAKEN, exit 33. A subset cpu job (Debayered16 by design) is not gated.
+if ($isCpuBackend) {
     $template = Edit-DualVenueTemplate $template @'
 $envList = "'" + ($envs -join "','") + "'"
 '@ @'
-# PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 (a): a cpu receipt leg runs Processed8, so an inherited GL viewport/window flag never reaches the smoke child.
+# PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 (a): a cpu leg presents no GL surface, so an inherited GL viewport/window flag never reaches the smoke child.
 $glViewportInheritedCleared = @()
 foreach ($glViewportFlag in @('MLVAPP_EXPERIMENTAL_GL_VIEWPORT', 'MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT')) {
     if ($null -ne [Environment]::GetEnvironmentVariable($glViewportFlag)) { $glViewportInheritedCleared += $glViewportFlag }
@@ -5613,8 +5615,10 @@ $envList = "'" + ($envs -join "','") + "'"
     $template = Edit-DualVenueTemplate $template '$stats = [ordered]@{}
 ' @'
 # PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 (b): a cpu receipt leg that did not run Processed8 (or ran the Processed16 route) is refused, never a Processed8 result.
+# The runner switch's name is split so a job without receipt never spells it (such a job's text is pinned free of the name).
+$processed8RouteRequired = $cmd.Contains(' -Playback' + 'Processing receipt ')
 $processed8Route = Get-AttrCpuProcessed8Route -RawLog $rawLog -MeasuredSessionId $measuredSmokeSessionId
-if (-not $processed8Route.taken) {
+if ($processed8RouteRequired -and -not $processed8Route.taken) {
     [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub)
     Save-Json ([ordered]@{
         schema='playback-attr-3-cuda-venue.v1'; result='PROCESSED8_ROUTE_NOT_TAKEN'
@@ -5634,6 +5638,7 @@ $stats = [ordered]@{}
 '@
     $template = Edit-DualVenueTemplate $template '    cpuFrames = $gpuSummary.cpuFrames
 ' '    cpuFrames = $gpuSummary.cpuFrames
+    processed8RouteRequired = $processed8RouteRequired
     processed8MeasuredFrames = $processed8Route.processed8MeasuredFrames
     processed16MeasuredFrames = $processed8Route.processed16MeasuredFrames
     processed16OnlyFrames = $processed8Route.processed16OnlyFrames
