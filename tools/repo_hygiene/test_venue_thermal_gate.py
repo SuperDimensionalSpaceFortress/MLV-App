@@ -452,6 +452,26 @@ class ThermalGateModuleTests(unittest.TestCase):
         got = ps_json("[pscustomobject](Get-VenueHeavyLegKeys -Rows @([pscustomobject]@{ batch = '1'; key = 'a|cpu'; status = 'RAN'; heat = 'clear' }, "
                       "[pscustomobject]@{ batch = '1'; status = 'RAN' }, [pscustomobject]@{ key = 'b|cpu'; status = 'RAN'; heat = 'hot' }))")
         self.assertEqual(got, {}, got)
+        # adversary efe7699b A3: two rows with no batch were both batch '' and so "the same lease"; each is a lease of its own
+        got = ps_json("[pscustomobject](Get-VenueHeavyLegKeys -Rows @([pscustomobject]@{ key = 'a|cpu'; status = 'RAN'; heat = 'clear' }, [pscustomobject]@{ key = 'b|cpu'; status = 'RAN'; heat = 'hot' }))")
+        self.assertEqual(got, {}, got)
+        # control: the same two rows on one named batch make a|cpu heavy
+        got = ps_json("[pscustomobject](Get-VenueHeavyLegKeys -Rows @([pscustomobject]@{ batch = '1'; key = 'a|cpu'; status = 'RAN'; heat = 'clear' }, [pscustomobject]@{ batch = '1'; key = 'b|cpu'; status = 'RAN'; heat = 'hot' }))")
+        self.assertEqual(got, {"a|cpu": 1}, got)
+
+    def test_r8_efe7699b_a2_two_receipts_with_no_token_are_two_leases_not_one_batch_number(self) -> None:
+        # adversary efe7699b A2: receipts with no token were grouped by batch number, so L1's batch 1 and L2's batch 1 became one sequence and L2's hot first leg
+        # was charged to L1's last: a|cpu heavy from a reading it never preceded
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-notoken-"))
+        l1 = {"batch": 1, "leaseId": "L1", "legs": [{"name": "01-a-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": "clear"}]}
+        l2 = {"batch": 1, "leaseId": "L2", "legs": [{"name": "01-b-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": "hot"}]}
+        q = f"$h = Read-VenueLegHeatHistory -RunDir @('{d}'); [pscustomobject](Get-VenueHeavyLegKeys -Rows @($h.rows))"
+        (d / "batches.jsonl").write_text(json.dumps(l1) + "\n" + json.dumps(l2) + "\n", encoding="utf-8")
+        self.assertEqual(ps_json(q), {}, "two token-less receipts were read as one lease")
+        # control: one token-less receipt holding both legs is one lease
+        (d / "batches.jsonl").write_text(json.dumps({**l1, "legs": l1["legs"] + l2["legs"]}) + "\n", encoding="utf-8")
+        self.assertEqual(ps_json(q), {"a|cpu": 1})
 
     def test_r6_a3_a_positive_infinity_mean_reaches_the_gate_as_hot_without_the_raw_json(self) -> None:
         # adversary r5 A3 on 09f9f657: a feed of 60 rows '2026,a,b,Infinity,10,No,No' is hot to the agent (+Infinity >= 88). The probe's JSON round trip turns the mean into the string

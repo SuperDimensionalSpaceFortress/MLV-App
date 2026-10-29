@@ -183,7 +183,9 @@ function Get-VenueHeavyLegKeys {
         if ($null -eq $r) { continue }
         # r8 (adversary r8 A3): every field is read through PSObject.Properties, so a row missing one is a barrier (no status, no key), never a strict-mode throw
         $f = @{}; foreach ($p in 'batch', 'key', 'status', 'heat') { $f[$p] = $(if ($r.PSObject.Properties[$p]) { $r.$p } else { $null }) }
-        if ([string]$f.batch -cne [string]$lastBatch) { $lastBatch = [string]$f.batch; $lastRanKey = $null }
+        # r8 (adversary efe7699b A3): a row with no batch is a lease of its own, so two such rows are never on "the same" lease
+        if ($null -eq $f.batch) { $lastBatch = $null; $lastRanKey = $null }
+        elseif ($lastBatch -isnot [string] -or [string]$f.batch -cne $lastBatch) { $lastBatch = [string]$f.batch; $lastRanKey = $null }
         if ([string]$f.heat -ceq 'hot' -and $null -ne $lastRanKey) { $heavy[$lastRanKey] = 1 + $(if ($heavy.Contains($lastRanKey)) { $heavy[$lastRanKey] } else { 0 }) }
         # adversary r1b A5: the predecessor is the last leg that LAUNCHED (RAN, LEG_FAILED, LEASE_EXPIRED); a row of unknown identity (a $null key) is a barrier, so
         # heat is never charged across it. A leg that never launched (THERMAL_HOT_SKIPPED, a RETRY whose own re-check failed) leaves the predecessor as it was.
@@ -237,12 +239,16 @@ function Read-VenueLegHeatHistory {
         if (-not $isFile) { $skipped.Add("$dir (no batches.jsonl)"); continue }
         # adversary r1 A7: a file that cannot be read (held exclusively, gone) is skipped and named, never a throw that refuses the whole plan
         $lines = try { [IO.File]::ReadAllLines($f) } catch { $skipped.Add("$f (unreadable: $($_.Exception.Message -replace '\s+', ' '))"); continue }
+        $lineNo = 0
         foreach ($line in $lines) {
             if (-not $line.Trim()) { continue }
             $b = try { $line | ConvertFrom-Json } catch { $null }
             if ($null -eq $b -or $b -isnot [System.Management.Automation.PSCustomObject] -or -not $b.PSObject.Properties['legs']) { $skipped.Add("$f (unreadable line)"); continue }
             # adversary r1 A8: one lease is one batch receipt (token), not one batch number: a reused -RunDir numbers its batches from 1 again
-            $lease = $(if ($b.PSObject.Properties['token'] -and $b.token) { [string]$b.token } elseif ($b.PSObject.Properties['batch']) { "batch$($b.batch)" } else { "line$($rows.Count)" })
+            # r8 (adversary efe7699b A2): a receipt with no token is a lease of its own (its line), never grouped with another by batch number: two leases L1 and L2
+            # both numbered batch 1 became one sequence and L2's hot first leg was charged to L1's last
+            $lineNo++
+            $lease = $(if ($b.PSObject.Properties['token'] -and $b.token) { [string]$b.token } else { "line$lineNo" })
             $unnamed = 0
             foreach ($l in @($b.legs)) {
                 # adversary r1 A5: a scalar-run row carries no leg name (Add-PlanIdentity names -LegPlan rows only): counted and named in .skipped, never silently dropped.
