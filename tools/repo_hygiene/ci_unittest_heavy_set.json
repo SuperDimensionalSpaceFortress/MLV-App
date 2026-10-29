@@ -10,6 +10,7 @@
         "tools.repo_hygiene.test_hub_vm_no_local_playback.PromptLintTests",
         "tools.repo_hygiene.test_playback_clip_length_gate.RuntimeBackstopBehaviourTests",
         "tools.repo_hygiene.test_venue_chain_runner.VenueChainRunnerTests",
+        "tools.repo_hygiene.test_venue_thermal_gate.ThermalDeadlineAdmissionTests",
         "tools.repo_hygiene.test_venue_thermal_gate.ThermalGateRunnerTests"
       ]
     }
