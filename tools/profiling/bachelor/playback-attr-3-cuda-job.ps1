@@ -2679,8 +2679,13 @@ $telemetryArmEnvs = if ($TelemetryArm -eq 'LIGHT') {
         'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1'
     )
 } else {
+    # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r2: HEAVY names the per-frame opt-out at its OFF value. The runner builds the app's environment from its own
+    # process environment plus this list, and the app suppresses the playback_smoke.frame rows for any value it does not read as off, so an inherited
+    # MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=1 (a shell, a Scheduled Task env block) would turn a HEAVY leg into a LIGHT one and Get-FrameRows
+    # would throw 'only 0 high-resolution frame rows' before the leg publishes. LIGHT is unchanged.
     @(
         'MLVAPP_PLAYBACK_SMOKE_TELEMETRY=1',
+        'MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=0',
         'MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY=1',
         'MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY=1',
         'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG=1',
