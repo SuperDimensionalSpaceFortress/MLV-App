@@ -164,6 +164,175 @@ class HeavyArmKeepsFrameRows(unittest.TestCase):
         )
 
 
+GL_FLAGS = ("MLVAPP_EXPERIMENTAL_GL_VIEWPORT", "MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT")
+ROUTE_FUNCTION = "function Get-AttrCpuProcessed8Route("
+ROUTE_CALL = "$processed8Route = Get-AttrCpuProcessed8Route -RawLog $rawLog -MeasuredSessionId $measuredSmokeSessionId"
+CPU_RECEIPT_LIGHT = ["-Backend", "cpu", "-TelemetryArm", "LIGHT", "-PlaybackProcessing", "receipt"]
+
+
+def child_env_value(envs: list[str], inherited: str | None, flag: str) -> str | None:
+    """child_flag_value for any flag: the runner writes each KEY=VALUE onto the environment it inherited, the last entry for a key wins."""
+    value = inherited
+    for entry in envs:
+        key, _, rest = entry.partition("=")
+        if key.strip().upper() == flag:
+            value = rest
+    return value
+
+
+def cache_summary_line(session: str, p8: str, p16: str) -> str:
+    """The app's one-shot playback_smoke.processed8_cache_summary line (MainWindow.cpp), with the two counters the route gate reads."""
+    return (f"[info] playback_smoke.processed8_cache_summary session={session} processed8_cache_hits=0 processed8_prefetch_hits=0 "
+            f"processed8_direct_path_frames=0 processed8_measured_frames={p8} processed16_measured_frames={p16}")
+
+
+@requires_windows_pwsh
+class CpuReceiptLegRunsProcessed8(unittest.TestCase):
+    """PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r5 (sol r4 B1, PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1). Catalogue row: CPU receipt HEAVY spec + inherited
+    GL viewport/window flag 1 -> retain Processed8 or refuse the leg explicitly; never accept Processed16 as the Processed8 measurement.
+
+    The smoke command passes -PreserveExperimentalEnvironment, so an inherited MLVAPP_EXPERIMENTAL_GL_VIEWPORT / _GL_WINDOW_VIEWPORT reached the app, which
+    installed the GL surface and ran OutputProcessed16 on every frame (processed8_measured=0, cpu frames and no gpu frame: the exit-28 gate passed it).
+    (a) every cpu receipt job removes both flags from its own process before the smoke child starts; (b) it refuses, typed, a measured session whose
+    processed8 counters show no Processed8 frame or a Processed16-only frame."""
+
+    setUpClass = classmethod(HeavyArmKeepsFrameRows.setUpClass.__func__)
+    tearDownClass = classmethod(HeavyArmKeepsFrameRows.tearDownClass.__func__)
+    generate = HeavyArmKeepsFrameRows.generate
+    arm_in = staticmethod(HeavyArmKeepsFrameRows.arm_in)
+
+    def child_gl_flags(self, extra: list[str], inherited: dict[str, str]) -> dict[str, str | None]:
+        """What the smoke child (and so the app) sees for each GL flag: the job's own slice runs in a pwsh whose environment carries `inherited`, then the
+        runner's rule (inherited process environment plus the -ExtraEnvironment list, last entry wins) is applied to what the job left behind."""
+        text = self.generate(extra)
+        start = text.index(SLICE_START)
+        end = text.index(SLICE_END, start)
+        script = self.tmp / "gl-slice.ps1"
+        report = "".join(
+            f"$v = [Environment]::GetEnvironmentVariable('{flag}'); if ($null -eq $v) {{ 'PROC {flag} <unset>' }} else {{ 'PROC {flag}=' + $v }}\n"
+            for flag in GL_FLAGS)
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n"
+            "$TelemetryArm = '" + self.arm_in(text) + "'\n$reconDll = 'recon.dll'\n$pkgDir = 'pkg'\n$DisablePaintPerSubmit = $false\n"
+            + text[start:end] + "\n$envs | ForEach-Object { 'ENV ' + $_ }\n" + report,
+            encoding="utf-8",
+        )
+        proc = run_pwsh(["-File", str(script)], env_extra=inherited)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = proc.stdout.splitlines()
+        envs = [line[4:] for line in lines if line.startswith("ENV ")]
+        seen: dict[str, str | None] = {}
+        for flag in GL_FLAGS:
+            row = next(line for line in lines if line.startswith(f"PROC {flag}"))
+            left = None if row.endswith(" <unset>") else row.split("=", 1)[1]
+            seen[flag] = child_env_value(envs, left, flag)
+        return seen
+
+    def route(self, log_lines: list[str], session: str = "7") -> dict:
+        """The job's own Get-AttrCpuProcessed8Route (cut from the generated cpu receipt job), run by pwsh over a stand-in app log."""
+        text = self.generate(spec_generator_args(NEW_SPEC))
+        self.assertTrue(ROUTE_FUNCTION in text, "the cpu receipt job carries no Processed8 route gate: a session that ran no Processed8 frame is not refused")
+        start = text.index(ROUTE_FUNCTION)
+        end = text.index('$envList = "', start)
+        log = self.tmp / "app.log"
+        log.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
+        script = self.tmp / "route.ps1"
+        script.write_text(
+            "$ErrorActionPreference = 'Stop'\n" + text[start:end]
+            + f"\n$r = Get-AttrCpuProcessed8Route -RawLog ([IO.File]::ReadAllText('{log}')) -MeasuredSessionId '{session}'\n$r | ConvertTo-Json -Compress\n",
+            encoding="utf-8",
+        )
+        proc = run_pwsh(["-File", str(script)])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    # --- (a) sol r4 catalogue row: the inherited flag never reaches the child ------------------------------------------------------------------------
+    def test_cpu_receipt_heavy_spec_plus_inherited_gl_viewport_flags_1_reach_no_child(self) -> None:
+        seen = self.child_gl_flags(spec_generator_args(NEW_SPEC), {flag: "1" for flag in GL_FLAGS})
+        self.assertEqual(seen, {flag: None for flag in GL_FLAGS}, "an inherited GL viewport/window flag reaches the app: it installs the GL surface and runs Processed16")
+
+    def test_every_cpu_receipt_shape_clears_each_flag_alone_under_every_inherited_value(self) -> None:
+        for extra in (spec_generator_args(NEW_SPEC), CPU_RECEIPT_LIGHT):
+            for flag in GL_FLAGS:
+                for inherited in ("1", "true", "yes", "0"):
+                    with self.subTest(extra=extra, flag=flag, inherited=inherited):
+                        # unset, never 0: main.cpp tests these flags with qEnvironmentVariableIsSet (shared GL contexts), so a 0 is not "off" there
+                        self.assertIsNone(self.child_gl_flags(extra, {flag: inherited})[flag])
+
+    # --- (b) a session that did not run Processed8 is refused, typed -------------------------------------------------------------------------------
+    def test_cpu_receipt_job_refuses_a_session_that_ran_no_processed8_frame(self) -> None:
+        cases = {
+            "processed16 route (sol's repro: processed8_measured stays 0)": ([cache_summary_line("7", "0", "600")], False, "PROCESSED8_NOT_MEASURED", 0, 600),
+            "no frame measured at all": ([cache_summary_line("7", "0", "0")], False, "PROCESSED8_NOT_MEASURED", 0, 0),
+            "some frames took the Processed16 route": ([cache_summary_line("7", "300", "600")], False, "PROCESSED16_ROUTE_FRAMES", 300, 600),
+            "no summary line": (["[info] playback_smoke.summary session=7"], False, "PROCESSED8_ROUTE_SUMMARY_MISSING", None, None),
+            "only another session's line": ([cache_summary_line("8", "600", "600")], False, "PROCESSED8_ROUTE_SUMMARY_MISSING", None, None),
+            "unparsable counter": ([cache_summary_line("7", "na", "600")], False, "PROCESSED8_ROUTE_SUMMARY_UNPARSABLE", None, None),
+            "processed16 below processed8 (every Processed8 frame counts in both)": ([cache_summary_line("7", "600", "10")], False, "PROCESSED8_ROUTE_SUMMARY_UNPARSABLE", None, None),
+            "Processed8 on every frame": ([cache_summary_line("7", "600", "600")], True, "NONE", 600, 600),
+            "the measured session's LAST line wins": ([cache_summary_line("7", "0", "600"), cache_summary_line("8", "0", "9"), cache_summary_line("7", "600", "600")], True, "NONE", 600, 600),
+        }
+        for name, (lines, taken, reason, p8, p16) in cases.items():
+            with self.subTest(case=name):
+                got = self.route(lines)
+                self.assertEqual((got["taken"], got["reason"]), (taken, reason))
+                self.assertEqual((got["processed8MeasuredFrames"], got["processed16MeasuredFrames"]), (p8, p16))
+                self.assertEqual(got["processed16OnlyFrames"], None if p8 is None else p16 - p8)
+
+    def test_the_route_gate_runs_after_the_exit_28_gate_and_before_any_success_summary(self) -> None:
+        for extra in (spec_generator_args(NEW_SPEC), CPU_RECEIPT_LIGHT):
+            with self.subTest(extra=extra):
+                text = self.generate(extra)
+                call = text.index(ROUTE_CALL)
+                self.assertGreater(call, text.index("RESULT=CPU_BACKEND_PATH_MISMATCH"))
+                self.assertLess(call, text.index("$stats = [ordered]@{}", call))
+                self.assertEqual(text.count(ROUTE_CALL), 1)
+                gate = text[call:text.index("$stats = [ordered]@{}", call)]
+                self.assertIn("RESULT=PROCESSED8_ROUTE_NOT_TAKEN", gate)
+                self.assertIn("exit 33", gate)
+                self.assertIn("    processed8MeasuredFrames = $processed8Route.processed8MeasuredFrames\n", text, "the success summary records the counters it was admitted on")
+                job = self.tmp / "parse.ps1"
+                job.write_text(text, encoding="utf-8")
+                proc = run_pwsh(["-Command", f"$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('{job}', [ref]$null, [ref]$e); $e.Count"])
+                self.assertEqual(proc.stdout.strip(), "0", proc.stdout + proc.stderr)
+
+    def test_the_refusal_is_never_a_pass(self) -> None:
+        module = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
+        proc = run_pwsh(["-Command", f"$m = Import-Module '{module}' -PassThru -Force; & $m {{ (Resolve-DvJobOutcome -ResultToken 'PROCESSED8_ROUTE_NOT_TAKEN' -ExitCode 33).outcome }}"])
+        self.assertEqual(proc.stdout.strip().splitlines()[-1], "FAIL", proc.stdout + proc.stderr)
+
+    # --- controls: the cuda legs and the cpu legs without receipt are the text they were -----------------------------------------------------------
+    def test_cuda_job_keeps_its_gl_window_viewport_and_carries_no_route_gate(self) -> None:
+        text = self.generate(["-TelemetryArm", "HEAVY"])
+        self.assertIn("'MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT=1',", text)
+        for needle in ("Get-AttrCpuProcessed8Route", "PROCESSED8_ROUTE_NOT_TAKEN", "$glViewportInheritedCleared"):
+            self.assertNotIn(needle, text)
+
+    def test_cpu_jobs_without_receipt_carry_no_route_gate(self) -> None:
+        for extra in (["-Backend", "cpu", "-TelemetryArm", "HEAVY"], ["-Backend", "cpu", "-TelemetryArm", "HEAVY", "-PlaybackProcessing", "subset"]):
+            with self.subTest(extra=extra):
+                text = self.generate(extra)
+                for needle in ("Get-AttrCpuProcessed8Route", "PROCESSED8_ROUTE_NOT_TAKEN", "$glViewportInheritedCleared"):
+                    self.assertNotIn(needle, text)
+
+
+class Processed8RouteMirrorsTheApp(unittest.TestCase):
+    """The gate's reading of the app is checked against the C++ it relies on, so the two cannot drift apart unseen."""
+
+    def test_the_counters_the_gate_reads_are_the_ones_the_app_prints(self) -> None:
+        main_window = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        self.assertIn('"playback_smoke.processed8_cache_summary session=%1 "', main_window)
+        self.assertIn('"processed8_measured_frames=%5 processed16_measured_frames=%6" )', main_window)
+        render = (ROOT / "platform" / "qt" / "RenderFrameThread.cpp").read_text(encoding="utf-8")
+        # a Processed8 frame counts in processed16_measured too, so processed16 - processed8 is the Processed16-only (OutputProcessed16) frames
+        self.assertIn("const bool processed16StageMeasured =\n        renderThreadProcessed8StageRan || renderThreadProcessed16StageRan;", lf(render))
+
+    def test_main_reads_the_gl_flags_as_set_or_unset_so_the_job_unsets_them(self) -> None:
+        main = (ROOT / "platform" / "qt" / "main.cpp").read_text(encoding="utf-8")
+        for flag in GL_FLAGS:
+            self.assertIn(f'qEnvironmentVariableIsSet("{flag}")', main)
+
+
 class FlagRuleMirrorsTheApp(unittest.TestCase):
     """The test's copy of the app's flag rule is checked against the C++ it mirrors, so the two cannot drift apart unseen."""
 

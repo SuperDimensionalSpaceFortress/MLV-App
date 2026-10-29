@@ -97,6 +97,8 @@
 # each exit code names one result).
 # BACHELOR-CORE-PARTITION-AB-1 r14: exit 32 = CORE_PARTITION_UNRECORDED (a -CorePartitionTelemetry job only: core-partition.json and its
 # typed unpublished status both failed to write, so the success summary is refused).
+# PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r5: exit 33 = PROCESSED8_ROUTE_NOT_TAKEN (a -Backend cpu -PlaybackProcessing receipt job only: the
+# measured session did not run the Processed8 stage, or ran the Processed16 route, so the leg is refused instead of standing as a Processed8 run).
 #
 # Usage (owner clip, id-only -- no -ClipPath, no -FixtureSha256):
 #   pwsh -NoProfile -File tools\profiling\bachelor\playback-attr-3-cuda-job.ps1 `
@@ -5557,6 +5559,84 @@ if ($isVariant) {
     lookFlavorReported = $(if ($LookLeg) { $lfReported = try { [string]$resultJson.log.visualState.look_assist_flavor } catch { '''' }; if ([string]::IsNullOrEmpty($lfReported)) { $lfReported = ''none'' }; $lfReported } else { $null })
     lookFlavorHonored = $(if ($LookLeg) { $lfReported -ceq $LookFlavor } else { $null })
 ' + $(if ($hasLookReceipt) { '    lookReceiptSha256 = $LookReceiptSha256' + "`n" } else { '' }))
+}
+# PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r5 (sol r4 B1, PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1): a cpu job with -PlaybackProcessing receipt exists to run
+# the Processed8 route. The smoke command passes -PreserveExperimentalEnvironment, so an MLVAPP_EXPERIMENTAL_GL_VIEWPORT or MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT
+# the venue worker inherited reached the app; it installs the GL surface, shouldUseGpu16PreviewPath() turns true (scopes are off) and every frame runs
+# OutputProcessed16 with processed8_measured=0 -- cpu frames and no gpu frame, so the exit-28 gate passed it. Two layers, every cpu receipt job (a cuda
+# job and a cpu job without receipt are the text they were):
+#   (a) the job removes both flags from its own process environment before the smoke child starts, so neither the runner nor the app inherits one. They
+#       are removed, not set to 0: platform/qt/main.cpp (shouldPreferDesktopOpenGl, shouldShareOpenGlContexts) tests them with qEnvironmentVariableIsSet,
+#       so a 0 would still switch shared GL contexts on for a cpu leg. Absent is the state every other cpu leg runs in.
+#   (b) after the run the measured session's playback_smoke.processed8_cache_summary line must show Processed8 frames and no Processed16-only frame
+#       (processed16_measured counts a Processed8 frame too: RenderFrameThread.cpp processed16StageMeasured), else PROCESSED8_ROUTE_NOT_TAKEN, exit 33.
+if ($isCpuBackend -and $PlaybackProcessing -eq 'receipt') {
+    $template = Edit-DualVenueTemplate $template @'
+$envList = "'" + ($envs -join "','") + "'"
+'@ @'
+# PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 (a): a cpu receipt leg runs Processed8, so an inherited GL viewport/window flag never reaches the smoke child.
+$glViewportInheritedCleared = @()
+foreach ($glViewportFlag in @('MLVAPP_EXPERIMENTAL_GL_VIEWPORT', 'MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT')) {
+    if ($null -ne [Environment]::GetEnvironmentVariable($glViewportFlag)) { $glViewportInheritedCleared += $glViewportFlag }
+    # [NullString]::Value, never $null: PowerShell binds $null to a .NET string parameter as '', which sets the flag to empty instead of removing it.
+    [Environment]::SetEnvironmentVariable($glViewportFlag, [NullString]::Value)
+}
+$envs = @($envs | Where-Object { $_ -notmatch '^\s*MLVAPP_EXPERIMENTAL_GL_(WINDOW_)?VIEWPORT\s*=' })
+function Get-AttrCpuProcessed8Route([string]$RawLog, [string]$MeasuredSessionId) {
+    # The app's one-shot session-end counters (MainWindow.cpp finishPlaybackSmokeTelemetry; LIGHT and HEAVY alike): the LAST line for the measured session.
+    $last = $null
+    foreach ($line in ($RawLog -split "`r?`n")) {
+        if ($line -notmatch 'playback_smoke\.processed8_cache_summary ') { continue }
+        $values = @{}
+        foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) { $values[$match.Groups['key'].Value] = $match.Groups['value'].Value }
+        if ($values.ContainsKey('session') -and $values['session'] -ne $MeasuredSessionId) { continue }
+        $last = $values
+    }
+    $p8 = [int64]-1; $p16 = [int64]-1
+    $reason = ''
+    if ($null -eq $last) { $reason = 'PROCESSED8_ROUTE_SUMMARY_MISSING' }
+    elseif (-not [int64]::TryParse([string]$last['processed8_measured_frames'], [ref]$p8) -or -not [int64]::TryParse([string]$last['processed16_measured_frames'], [ref]$p16) -or $p8 -lt 0 -or $p16 -lt $p8) { $reason = 'PROCESSED8_ROUTE_SUMMARY_UNPARSABLE' }
+    elseif ($p8 -le 0) { $reason = 'PROCESSED8_NOT_MEASURED' }
+    elseif ($p16 -gt $p8) { $reason = 'PROCESSED16_ROUTE_FRAMES' }
+    [pscustomobject]@{
+        taken = ($reason -eq '')
+        reason = $(if ($reason -eq '') { 'NONE' } else { $reason })
+        processed8MeasuredFrames = $(if ($reason -in @('', 'PROCESSED8_NOT_MEASURED', 'PROCESSED16_ROUTE_FRAMES')) { $p8 } else { $null })
+        processed16MeasuredFrames = $(if ($reason -in @('', 'PROCESSED8_NOT_MEASURED', 'PROCESSED16_ROUTE_FRAMES')) { $p16 } else { $null })
+        processed16OnlyFrames = $(if ($reason -in @('', 'PROCESSED8_NOT_MEASURED', 'PROCESSED16_ROUTE_FRAMES')) { $p16 - $p8 } else { $null })
+    }
+}
+$envList = "'" + ($envs -join "','") + "'"
+'@
+    $template = Edit-DualVenueTemplate $template '$stats = [ordered]@{}
+' @'
+# PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 (b): a cpu receipt leg that did not run Processed8 (or ran the Processed16 route) is refused, never a Processed8 result.
+$processed8Route = Get-AttrCpuProcessed8Route -RawLog $rawLog -MeasuredSessionId $measuredSmokeSessionId
+if (-not $processed8Route.taken) {
+    [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub)
+    Save-Json ([ordered]@{
+        schema='playback-attr-3-cuda-venue.v1'; result='PROCESSED8_ROUTE_NOT_TAKEN'
+        fixtureRehearsal=$FixtureRehearsal
+        displayWake=$displayWake
+        backend=$Backend
+        processed8RouteReason=$processed8Route.reason
+        processed8MeasuredFrames=$processed8Route.processed8MeasuredFrames; processed16MeasuredFrames=$processed8Route.processed16MeasuredFrames; processed16OnlyFrames=$processed8Route.processed16OnlyFrames
+        glViewportInheritedCleared=($glViewportInheritedCleared -join ',')
+        gpuSummary=$gpuSummary; gpuFramesTotal=$gpuFramesTotal; display=$displayBlock; sourceCommit=$SourceCommit; clipId=$ClipId; artifactRoot=$Pub
+    }) (Join-Path $Pub 'summary.json')
+    Write-Output "RESULT=PROCESSED8_ROUTE_NOT_TAKEN REASON=$($processed8Route.reason) PROCESSED8_MEASURED_FRAMES=$($processed8Route.processed8MeasuredFrames) PROCESSED16_ONLY_FRAMES=$($processed8Route.processed16OnlyFrames) $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
+    exit 33
+}
+$stats = [ordered]@{}
+
+'@
+    $template = Edit-DualVenueTemplate $template '    cpuFrames = $gpuSummary.cpuFrames
+' '    cpuFrames = $gpuSummary.cpuFrames
+    processed8MeasuredFrames = $processed8Route.processed8MeasuredFrames
+    processed16MeasuredFrames = $processed8Route.processed16MeasuredFrames
+    processed16OnlyFrames = $processed8Route.processed16OnlyFrames
+    glViewportInheritedCleared = ($glViewportInheritedCleared -join '','')
+'
 }
 
 # ATTR3-FOOTAGE-BIND-1 PR-B round 3 (STRUCTURAL): a single-pass substitution over the WHOLE
