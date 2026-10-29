@@ -2528,6 +2528,7 @@ function Start-AttrCudaHeapDumpWatch {
             [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file, out FileIdentity info);
             [DllImport("shell32.dll", SetLastError = true)] static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string commandLine, out int count);
             [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+            [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
             // BY_HANDLE_FILE_INFORMATION: thirteen DWORDs (each FILETIME is two)
             [StructLayout(LayoutKind.Sequential)] struct FileIdentity { public uint Attributes, C0, C1, A0, A1, W0, W1, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow; }
             const uint DBG_CONTINUE = 0x00010002;
@@ -2540,11 +2541,16 @@ function Start-AttrCudaHeapDumpWatch {
 
             // r11 (adversary r10 A7): the ONE handle every watcher log line is written through. OpenLog opens the slot Start published once and keeps it only
             // when the handle itself is that file: a plain file with one link (no hard link to another file) holding exactly the request line Start wrote.
+            // r11b (adversary r11 A1): the slot is opened with FILE_FLAG_OPEN_REPARSE_POINT, so a slot swapped for a symbolic link opens the LINK itself
+            // (never the file it names) and its reparse-point attribute refuses it; nothing is written through a link.
             static FileStream sink;
             public static int OpenLog(string path, string expected) {
                 FileStream stream = null;
                 try {
-                    stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+                    // GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL
+                    Microsoft.Win32.SafeHandles.SafeFileHandle handle = CreateFileW(path, 0xC0000000u, 1u, IntPtr.Zero, 3u, 0x00200080u, IntPtr.Zero);
+                    if (handle.IsInvalid) { handle.Dispose(); return 4; }
+                    stream = new FileStream(handle, FileAccess.ReadWrite);
                     FileIdentity id;
                     if (!GetFileInformationByHandle(stream.SafeFileHandle, out id) || id.Links != 1 || (id.Attributes & 0x400u) != 0 || stream.Length > 65536) { stream.Dispose(); return 2; }
                     byte[] bytes = new byte[(int)stream.Length];
@@ -2588,6 +2594,16 @@ function Start-AttrCudaHeapDumpWatch {
                 return false;
             }
 
+            // r11b (adversary r11 A3): only the attach's own break-in belongs to the debugger: the FIRST 0x80000003 (and, for a WOW64 target, the first
+            // 0x4000001F) is continued as handled. Every later breakpoint the app raises passes on unhandled like any other exception, and a
+            // second-chance one is captured. seen holds one bit per code already taken.
+            public static bool IsAttachBreak(uint exception, ref int seen) {
+                int bit = exception == 0x80000003u ? 1 : (exception == 0x4000001Fu ? 2 : 0);
+                if (bit == 0 || (seen & bit) != 0) return false;
+                seen |= bit;
+                return true;
+            }
+
             // r10 (adversary r10 A5): expectedCreationFileTime is the creation time (FILETIME, UTC) of the process the watcher selected. The handle just opened must
             // report that creation time. r11 (adversary r10 A3): WMI truncates it to the microsecond, so the handle's time may be at most 9 ticks (100 ns each) later
             // and never earlier; a pid recycled since the selection (created even 1 us apart) is never debugged.
@@ -2604,6 +2620,7 @@ function Start-AttrCudaHeapDumpWatch {
                 IntPtr debugEvent = Marshal.AllocHGlobal(512);
                 int result = 1;
                 long firstChance = 0;
+                int attachBreaks = 0;
                 bool dumped = false;
                 try {
                     while (true) {
@@ -2615,9 +2632,9 @@ function Start-AttrCudaHeapDumpWatch {
                         if (code == 1) {
                             uint exception = (uint)Marshal.ReadInt32(debugEvent, UnionOffset);
                             bool first = Marshal.ReadInt32(debugEvent, FirstChanceOffset) != 0;
-                            bool breakpoint = exception == 0x80000003u || exception == 0x4000001Fu;
-                            if (!breakpoint) { status = DBG_EXCEPTION_NOT_HANDLED; if (first) firstChance++; }
-                            bool trigger = exception == 0xC0000374u || exception == 0xC0000409u || (!first && !breakpoint);
+                            bool attachBreak = IsAttachBreak(exception, ref attachBreaks);
+                            if (!attachBreak) { status = DBG_EXCEPTION_NOT_HANDLED; if (first) firstChance++; }
+                            bool trigger = exception == 0xC0000374u || exception == 0xC0000409u || (!first && !attachBreak);
                             if (trigger) {
                                 Log("EXCEPTION code=0x" + exception.ToString("X8") + " first=" + (first ? 1 : 0) + " tid=" + tid
                                     + " address=0x" + Marshal.ReadInt64(debugEvent, UnionOffset + 16).ToString("X"));
@@ -2718,7 +2735,9 @@ function Start-AttrCudaHeapDumpWatch {
             'function HasHelpArg([string]$cl) { [MlvHeapDumpWatch.Debugger]::HasHelpArg($cl) }'
             # r9 pass 1 (A1): this run's instance descends from the process that asked for the watch (the job; the smoke runner it starts launches
             # MLVApp). Each parent link must be created no later than its child, so a recycled parent pid never counts. r11 (A4): no query past the budget.
-            'function Owned($p) { $c = $p; for ($i = 0; $i -lt 8 -and $null -ne $c; $i++) { if ([int]$c.ParentProcessId -eq $ownerPid) { return $true }; $budget = Left; if ($budget -lt 1) { return $false }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$c.ParentProcessId) -OperationTimeoutSec $budget -ErrorAction SilentlyContinue; if ($null -eq $n -or -not $n.CreationDate -or -not $c.CreationDate -or $n.CreationDate -gt $c.CreationDate) { return $false }; $c = $n }; return $false }'
+            # r11b (adversary r11 A4): the owner link is checked like every other, and the owner must also have been created no later than the request
+            # (it made it): a process that took the owner's pid after the owner exited was created after notBefore and never counts as the owner.
+            'function Owned($p) { $c = $p; for ($i = 0; $i -lt 8 -and $null -ne $c; $i++) { $budget = Left; if ($budget -lt 1) { return $false }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$c.ParentProcessId) -OperationTimeoutSec $budget -ErrorAction SilentlyContinue; if ($null -eq $n -or -not $n.CreationDate -or -not $c.CreationDate -or $n.CreationDate -gt $c.CreationDate) { return $false }; if ([int]$c.ParentProcessId -eq $ownerPid) { return ($n.CreationDate.ToUniversalTime() -le $notBefore) }; $c = $n }; return $false }'
             'W (''WATCH exe='' + $exeFull + '' notBefore='' + $notBefore.ToString(''o'') + '' owner='' + $ownerPid + '' match='' + $match + '' pid='' + $PID)'
             '$target = $null'
             'while ($null -eq $target) {'

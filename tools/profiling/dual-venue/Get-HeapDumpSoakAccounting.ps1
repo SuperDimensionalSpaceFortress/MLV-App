@@ -23,6 +23,24 @@ $ErrorActionPreference = 'Stop'
 # r10 (adversary r10 A3): a flag is true only as a JSON boolean true; the string 'false', whitespace and {} are PowerShell-truthy and never switch a leg group, a stop cycle or a crash on
 function Test-JsonTrue($v) { ($v -is [bool]) -and $v }
 
+# r11b (adversary r11 A2): an r6b/r7 record joins its log lines with ' | ', and a WATCH line carries free text (exe path, match), so a ' | ' inside it
+# is not a line break. A WATCH message ends at a newline, or at the ' | ' segment that closes with the watcher's own ' pid=<watcherPid>' (the record's
+# leading watcherPid= field); with no such close everything after it on that line is WATCH text. Only a segment outside every WATCH message whose
+# token right after the timestamp is DEBUGGER_ATTACHED is an attach.
+function Test-SoakLogAttached([string]$text) {
+    $watcherPid = $(if ($text -cmatch '^watcherPid=(?<p>\d+)\s') { $Matches['p'] } else { $null })
+    foreach ($line in [regex]::Split($text, '\r?\n')) {
+        $inWatch = $false
+        foreach ($segment in [regex]::Split($line, ' \| ')) {
+            $closes = ($null -ne $watcherPid) -and ($segment -cmatch ('\spid=' + $watcherPid + '$'))
+            if ($inWatch) { if ($closes) { $inWatch = $false }; continue }
+            if ($segment -cmatch '(^|\s)\S+ WATCH(\s|$)') { $inWatch = -not $closes; continue }
+            if ($segment -cmatch '^\S+ DEBUGGER_ATTACHED pid=\d+(\s|$)') { return $true }
+        }
+    }
+    return $false
+}
+
 function Get-SoakCaptureClass($r) {
     $p = $r.PSObject.Properties
     $pageHeap = ($null -ne $p['pageHeap']) -and (Test-JsonTrue $r.pageHeap)
@@ -41,8 +59,7 @@ function Get-SoakCaptureClass($r) {
     if ($null -ne $p['heapDumpWatch']) {
         # r8 (adversary A4): a verified legacy attach keeps a page-heap leg in pageheap, as the typed branch does
         # r10 (adversary r10 A2): the event is the token right after a log line's timestamp, never text inside another line (the WATCH line carries the exe path)
-        $logLines = [regex]::Split([string]$r.heapDumpWatch, '\r?\n| \| ')
-        if (@($logLines | Where-Object { $_ -cmatch '^\S+ DEBUGGER_ATTACHED pid=\d+(\s|$)' }).Count -eq 0) { return 'captureNotVerified' }
+        if (-not (Test-SoakLogAttached ([string]$r.heapDumpWatch))) { return 'captureNotVerified' }
         return $(if ($pageHeap) { 'pageheap' } else { 'attached' })
     }
     # r8 (CoS Iverson #432 item 2): a record that names a debugger watch but carries no capture evidence is not verified, never unattached
