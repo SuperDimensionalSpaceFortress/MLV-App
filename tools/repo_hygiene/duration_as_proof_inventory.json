@@ -262,6 +262,16 @@
       ]
     },
     {
+      "path": "platform/qt/PlaybackPrepInFlightGate.h",
+      "anchor": "std :: chrono :: milliseconds ( timeoutMs > 0 ? timeoutMs : 0 ) ,",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "drainLocked clamps its caller-supplied wait budget (a 2000 ms constant at every MainWindow drainPlaybackPrepInFlight call site) to zero before condition_variable::wait_for, so a negative argument cannot become an undefined wait. Whether the prep worker left its in-flight section is the gate's m_inFlight flag (the wait_for predicate and its return value), never this duration; on a timed-out drain playbackPrepBorrowFreeingMutationAllowed returns false and clip replacement aborts (r2, CoS B1).",
+      "lines": [
+        43
+      ]
+    },
+    {
       "path": "platform/qt/PlaybackQualityPolicy.h",
       "anchor": "return frameMs > 0.0 ? 1000.0 / frameMs : 0.0 ;",
       "class": "division_guard",

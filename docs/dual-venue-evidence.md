@@ -274,17 +274,81 @@ other-named session lose all of its events (15-17k "ETW events were lost" per 12
 longer cleared it. Before the spawn the job now terminates the default `PresentMon` session and every `MLVAttr3-*` session that `logman query -ets` lists, through the pinned
 PresentMon's own `--terminate_existing_session` (`logman stop <name> -ets` only for a session still listed afterwards) -- but only when no PresentMon process is alive on the host
 (checked before the listing and again right after it); otherwise it records that it did not run. "A PresentMon process" is every `PresentMon*` process except one POSITIVELY
-identified as not a capture (UM-SWEEP-OWNER-PRESENTMONSERVICE-1): the owner's always-running `PresentMonService` (Bachelor) is recognised because its pid is the `ProcessId` of a
-registered Windows service (`Win32_Service`), and a process with a readable path that is neither the pinned image/path nor a capture image is excluded too. The pinned capture executable
-(image name equal to the pinned one, case-insensitive, or the pinned cache path), a foreign capture image, and any process whose path cannot be read and that is no registered service
-are live (the sweep is skipped, with the reason recorded in `orphanSweep.livePresentMonProcesses`: name, pid, `pathReadable`, reason). Excluded processes are recorded in
-`orphanSweep.excludedPresentMonProcesses` (name, pid, service, `pathReadable`; never a path). A process list or a service lookup that cannot be read stops the sweep with
+identified as not a capture (UM-SWEEP-OWNER-PRESENTMONSERVICE-1): the owner's always-running `PresentMonService` is recognised on a host where it is a registered Windows service, because its pid is the `ProcessId` of that
+service (`Win32_Service`); on Bachelor it is no registered service and is recognised by the Intel parent identity below. Every other candidate process (r3 below: not only a
+`PresentMon*` name) is live: the pinned capture executable (image name equal to the pinned one, case-insensitive, or the pinned
+cache path), a foreign capture image, a process whose path cannot be read, and (since BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 r2) a readable-path process that is no capture image -- a
+readable path is no identity, because a second harness under the same agent account has one. The reasons are recorded in `orphanSweep.livePresentMonProcesses` (name, pid, `pathReadable`,
+reason, `nonCaptureIdentity`, `parentName`, `parentPid`, `identityError`). Excluded processes are recorded in
+`orphanSweep.excludedPresentMonProcesses` (name, pid, service, `pathReadable`, `nonCaptureIdentity = registered_service`; never a path). A process list or a service lookup that cannot be read stops the sweep with
 `error`. A job-issued `Kill()` is followed by the terminate of the job's own named
 session (both stop paths). `presentmon-capture.json` carries `orphanSweep` (ran, skippedReason, live pids, listed, matching listing lines, every action with its exit code,
 what remains) and `eventsLost` (PresentMon's stderr reported lost events: message count and largest count); the failure terminals' PresentMon reason gains a typed
 `PRESENTMON_EVENTS_LOST` detail, so a recurrence reads as its cause instead of "output does not exist".
 
-The sweep can never stop a live capture or a session it did not list as an orphan (round 2): it acts only on the names listed before its second liveness check -- a name a
+*The harness's own sessions are swept even beside a positively identified non-capture PresentMon (BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1).* On Bachelor the `PresentMonService` is
+no registered service: it is a child of `IntelGraphicsSoftware.Service.exe`, and the agent cannot read its path. So it stayed live and skipped the whole sweep on every leg. On
+2026-10-27 at 20:06:20Z a lease demotion tree-killed a cpu leg mid-capture, leaving `MLVAttr3-...-150416` running, and every later capture on the host wrote no CSV (16 of 16
+cuda legs, `PRESENTMON_UNAVAILABLE`). A live process is left out of the `MLVAttr3-*` blockers only on POSITIVE identity (r2; a name test is not enough: a second harness may run the
+permitted `-PresentMonName PresentMon-custom.exe`, which no capture-image pattern matches). The identity is `nonCaptureIdentity = intel_graphics_presentmonservice`: image name exactly
+`PresentMonService` AND, per `Win32_Process`, a parent named exactly `IntelGraphicsSoftware.Service.exe` that started no later than the child. A parent read that fails, finds no row or
+no `CreationDate`, or names another parent leaves the process a blocker (`identityError` says why). So when every live process is positively identified, the sweep runs in
+`orphanSweep.scope = harness_sessions`: it terminates the `MLVAttr3-*` orphans, leaves the default `PresentMon` session (recorded in `orphanSweep.deferred`), and stops on a re-check
+(the same blocker helper before every terminate and every `logman stop`) for any process without that identity. With no candidate process alive (r3: not only a `PresentMon*` name) the scope is `all`, as before.
+`newlyListed` is what the full initial listing lacked, so a deferred session is never reported as new.
+r3: the processes examined are no longer only `PresentMon*`, because `-PresentMonName` accepts any `<name>.exe` (a live `capture.exe` beside the Intel child was invisible, and
+the sweep stopped its `MLVAttr3-*` session). Every process is enumerated, and one is a candidate when ANY of these holds: a `PresentMon*` name, the configured `-PresentMonName`, the
+pinned cache path, the pinned SHA-256 (read best-effort), or a command line (`Win32_Process.CommandLine`) naming an `MLVAttr3-` session or a `--session_name`/`-session_name`
+argument (reason `capture_session_command_line`). The sweeping job itself is never a candidate. One snapshot serves the scope choice and every re-check. If the command-line query fails,
+the sweep fails closed: `skippedReason = capture_owner_command_lines_unreadable` at the scope choice, and an `error` with that prefix on a re-check. Command lines that read empty are
+counted in `orphanSweep.unreadableCommandLineCount`.
+r4: a process with no readable command line, under a name, path and hash no route matches, is an UNIDENTIFIED possible owner, whether its path reads or not. Before r4 it was
+dropped without a record, so beside the Intel child the sweep could stop that capture's live `MLVAttr3-*` session. Only positive non-ownership evidence clears it, and the one kind is a
+registered service's pid (one `Win32_Service` query per snapshot). The session is recorded but is no evidence: another harness may run its job, and so its capture, in session 0. In scope
+`harness_sessions` any unidentified owner left stops the sweep: `skippedReason = capture_owner_unidentified` at the scope choice and after the listing, `abortedReason` with that value
+before a terminate or a `logman stop`. `orphanSweep.unidentifiedCaptureOwnerIds` names the pids, `unidentifiedCaptureOwners` gives name, pid and session, and
+`unidentifiedNonOwnership` holds the job's session, how many processes were held and how many a service registration cleared. Scope `all` is unchanged. A non-elevated agent cannot
+read the command line of system processes (csrss, winlogon, dwm, fontdrvhost and most of session 0), and most are no registered service, so beside the Intel child the sweep now
+refuses on such a host. The r4 run summary has the measurement.
+r5: a process is its pid AND its creation instant, never its pid and name. A `capture.exe` that exits and a later `capture.exe` under the same pid share both, so a command line counts
+for an enumerated process only when the row's `CreationDate` equals that process's own `StartTime` (both as UTC, to the microsecond). One instant read before and after the enumeration
+means one process held the pid throughout. An unreadable or different instant leaves the command line unread, so the process is held as above. The path is read between two
+`StartTime` reads and is dropped when they differ. The Intel child's own `Win32_Process` row must carry that process's name and instant too (`identityError =
+process_creation_instant_unbound`). `unidentifiedCaptureOwners` records `startedUtc`. A display-report
+failure whose sweep did not leave the host clean (skipped, aborted, `remaining`, `deferred`, `newlyListed`, a listing or sweep error) gains a typed `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE`
+detail, and a sweep record that cannot be read names `recordUnreadable=` there instead of being dropped. A dictionary report whose keys differ only by case keeps every entry.
+
+**Report helper contract (r11).** It covers `Add-AttrCudaPresentMonEventsLostDetailToReport` and `Add-AttrCudaPresentMonOrphanSweepDetailToReport`, and replaces the r10
+sentence ("none dropped", which a containment dedupe broke). Both helpers carry the same block for it in `AttrCudaArtifacts.psm1`.
+- **Nothing to add.** With no detail to write (no sweep record, a clean sweep, no events record, no loss) the helper returns the report it was given.
+- **pscustomobject.** This is the job's own shape (`Get-AttrCudaPresentMonDisplayReport`), and r11 does not change it. It comes back as a pscustomobject copy with only `reason`
+  different. A reason that already carries the helper's token (`PRESENTMON_EVENTS_LOST`; the `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:` prefix or bracket) does not get it again.
+- **Dictionary.** It comes back as a NEW canonical report and is never returned by reference with the detail added. The input is never mutated.
+  - *Reason-like key.* This is a string key that equals `reason` under OrdinalIgnoreCase, or that the report's own public `Comparer` calls equal to `reason`. That second test
+    catches `rea<U+00AD>son` under a culture comparer. Some reports have no readable comparer (Hashtable, OrderedDictionary). If such a report's own lookup holds a `reason` that
+    no OrdinalIgnoreCase key explains, the one string key holding the text that lookup returns is reason-like.
+    A report whose key type is not string and that shows no public `Comparer` (`ReadOnlyDictionary[int,object]`, `ImmutableDictionary[int,object]`) cannot be asked for `reason`
+    (r13: the lookup binds to the key type and throws). With no string key among its keys it holds no `reason`, and it takes the canonical route like any other dictionary. A report
+    that has string keys and still cannot answer the lookup fails closed (below).
+  - *Fold.* All reason-like entries become one key, `reason`, at the place of the first one. Its text is their non-empty texts in enumeration order, joined by a space. A text
+    that is ordinally EQUAL to an earlier one is left out; containment never removes a text. Then ` [<detail>]` is appended once. It is skipped only if the folded text already
+    carries exactly this detail: it equals the detail, begins with `<detail> [`, or contains `[<detail>]`. No early return skips the write.
+  - *Other keys.* Each one is copied with its value. A non-string key is copied under its string form. The copy goes into an `[ordered]` table (OrdinalIgnoreCase on pwsh 7). It
+    is returned as a pscustomobject when every key can be a member name (the r3 shape), and as that table otherwise (for example when there is an empty key).
+  - *Collision rule (deterministic, no value dropped).* Two keys can collide in that table: case variants such as `status`/`Status`, `U+03A3`/`U+03C2`, or a string form equal
+    to another key, such as `1` and `'1'`. The report is then an exact-key `OrderedDictionary` that keeps every original key and value in order. The reason-like keys are still
+    folded into `reason`, so `.reason` reads the folded text. A second call keeps the same shape.
+  - *Fail closed.* In three cases the input comes back unchanged and the detail is not added: a held reason that no rule can tie to one key (r8: a report with no readable
+    comparer whose text two keys hold), a report with string keys whose `reason` lookup throws (r13), and an exact-key copy that its keys cannot build.
+- **Not promised.**
+  - `.Reason` or `.REASON` on an exact-key copy (only `reason` is spelled there).
+  - Lookalike matching for a dictionary whose comparer is not readable, apart from the one-holder rule above.
+  - The pscustomobject token rule is not exact-equality: it is the job path, left as it was.
+  - Windows PowerShell 5.1's culture-insensitive `[ordered]`: more keys collide there and take the exact-key rule.
+  - Comparers that throw: the report is then read as one without a readable comparer (OrdinalIgnoreCase plus the one-holder rule).
+
+The sweep is built not to stop a live capture or a session it did not list as an orphan (round 2; the r4 and r5 ownership refusals above hold the sweep when a capture owner cannot be
+identified, which is not a proof that none exists): it acts only on the names listed before its second liveness check -- a name a
 later listing shows (another job's capture starting meanwhile) is recorded as `newlyListed` and left alone -- and it re-checks that no PresentMon process exists immediately
 before **each** terminate and **each** `logman stop`; the first process that appears ends the sweep (`abortedReason` / `abortedBefore`, with `remaining` still derived from a
 final listing). A failing `logman query -ets` is asked for once more (`listAttempts`), a failed middle listing is a recorded verification failure, and every `logman` call runs

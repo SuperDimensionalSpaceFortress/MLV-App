@@ -394,6 +394,7 @@ HEADERS += MainWindow.h \
            PlaybackEnvFlags.h \
            PlaybackWorkerJoin.h \
            PlaybackPrepInFlightGate.h \
+           ClipOpenAbortPolicy.h \
            PlaybackPresentTrace.h \
            PlaybackSlotRelease.h \
            PlaybackSwapInterval.h \

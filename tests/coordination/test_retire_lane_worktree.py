@@ -2982,6 +2982,14 @@ ENCODED_LAUNCH_SITES = {
          "the UIA wake helper (-RunInnerWake body): a synchronous child, waited for at $TotalRuntimeTimeoutSeconds and killed on overrun; it drives "
          "the Codex Desktop window and holds no lane worktree, so it is never a lane driver the retire guard has to find"),
     ],
+    "tools/coordination/build-guard.ps1": [
+        ("'-EncodedCommand', (New-HeavySlotHolder $lease.Ready $lease.Stop)",
+         "EXECUTED (MLV-VM-HEAVY-SLOT-ADOPT-1 r3b): Enter-HeavySlot runs `cmd /c heavy-slot.cmd run --class shared ... --exit-file <f> -- "
+         "<this pwsh> -NoProfile -NonInteractive -EncodedCommand <New-HeavySlotHolder>`. The decoded holder only writes the ready file "
+         "(HEAVY_SLOT_HELD plus holder=<pid>@<start ticks>) and polls for the stop file or the guard's death (pid + start ticks). It is "
+         "the guard's own machine-slot lease, stopped by Exit-HeavySlot or the pre-admission finally. It runs no build, takes no lane "
+         "worktree and launches nothing"),
+    ],
     "tools/coordination/Invoke-Lane.ps1": [
         ("'-ExecutionPolicy','Bypass','-EncodedCommand',$encoded",
          "the Claude-engine job host (pwsh -EncodedCommand $hostSource) is not a driver: it waits on its claude.exe child, whose argv "
@@ -3000,6 +3008,15 @@ ENCODED_LAUNCH_SITES = {
     "tools/profiling/bachelor/ultra-magnus-agent.ps1": [
         ('"-EncodedCommand", (New-HeavySlotSentinelCommand',
          "the heavy-slot sentinel runs on the venue host, never against a hub lane worktree"),
+    ],
+}
+# MLV-VM-HEAVY-SLOT-ADOPT-1 r3b: sites the scanner reports as `encoded` that launch nothing. Unlike the inventories above, these
+# match the WHOLE site text exactly (not a substring), so a launch built around the same expression is still a site to classify.
+NOT_A_LAUNCH_SITES = {
+    "tests/coordination/heavy_slot_stub/heavy-slot.ps1": [
+        ("$encoded = $command[[array]::IndexOf($command, '-EncodedCommand') + 1]",
+         "the test stub of heavy-slot reads its own argv: it finds the base64 after '-EncodedCommand' in the command build-guard handed "
+         "it, then decodes it on the next line, only to learn the ready-file path. The assignment calls nothing"),
     ],
 }
 # Sites below that earlier censuses never saw (multi-line Start-Process under a backtick, or a root outside tools/coordination + tools/profiling)
@@ -3060,6 +3077,15 @@ UNRESOLVED_EXECUTED_SITES = {
         ('[scriptblock]::Create("[CmdletBinding()] param()`n" + $fragment)',
          "the -Command build fragment its caller hands build-guard (mingw32-make / qmake lines), run in-process and waited on under the host "
          "memory guard; a tracked caller passes it as a literal, which rule S scans in the caller's own file"),
+    ],
+    "tests/coordination/heavy_slot_stub/heavy-slot.ps1": [
+        ("& $command[0] -NoProfile -NonInteractive -Command \"Set-Content -LiteralPath '$ready'",
+         "MLV-VM-HEAVY-SLOT-ADOPT-1 r3b: the stub's readyorphan mode stands in for a holder child that writes its ready file and "
+         "ends. $command[0] is the pwsh build-guard put after '--'. The -Command string is a literal template whose only "
+         "interpolations are $ready (the ready path from the guard's own holder, with quotes doubled), the stub's own ${ticket} and "
+         "$PID, and $childS (a [double]). The backticked `$PID is the child's own pid. The stub waits for this synchronous child. It "
+         "is test-only, runs under pytest tmp dirs and never runs against a lane worktree "
+         "(test_launcher_census_stub_executed_string_interpolates_only_its_own_values)"),
     ],
     "tools/profiling/bachelor/AttrCudaArtifacts.psm1": [
         ("[void]$shell.AddScript($loopScript)",
@@ -3163,7 +3189,7 @@ def _census_sources():
 def test_launcher_census_every_encoded_command_launch_site_is_classified():
     src = _census_sources()
     assert src, "git ls-files returned no PowerShell scripts: the census would pass on nothing"
-    problems = _census_problems(src, ENCODED_LAUNCH_SITES, {}, kinds=("encoded",))
+    problems = _census_problems(src, ENCODED_LAUNCH_SITES, {}, kinds=("encoded",), not_a_launch=NOT_A_LAUNCH_SITES)
     assert not problems, ("\n".join(problems) + "\nStart a lane driver with -File and its run dir on the command line, or classify the "
                           "site in ENCODED_LAUNCH_SITES with the reason the retire guard still sees it (drop an entry whose site is gone).")
 
@@ -3199,6 +3225,60 @@ def test_launcher_census_invoke_lane_ties_its_encoded_host_child_to_the_run_dir(
     assert '$controlPath = "$base.child.json"' in t and "pid=$child.Id" in t, "child pid is no longer recorded in the run dir"
     host = t.split("$hostSource = @'", 1)[1].split("'@", 1)[0]
     assert "-File" not in host and "Start-Process" not in host and "WaitForExit()" in host, "the encoded host must only wait on its child"
+
+
+def test_launcher_census_build_guard_holder_is_its_one_encoded_launch_and_only_holds():
+    """r3b item 2: build-guard's one -EncodedCommand launch runs New-HeavySlotHolder, which writes a file and waits, nothing else."""
+    t = (REPO / "tools/coordination/build-guard.ps1").read_text(encoding="ascii")
+    assert t.count("'-EncodedCommand'") == 1, "build-guard.ps1 gained another -EncodedCommand launch: classify it"
+    fn = t.split("function New-HeavySlotHolder", 1)[1].split("\nfunction ", 1)[0]
+    # The encoded program is the $text lines; their only substitutions are the two quoted file paths.
+    body = fn.split("$text = @(", 1)[1].split(") -join", 1)[0]
+    assert body.count("$(& $quote $ReadyFile)") == 1 and body.count("$(& $quote $StopFile)") == 1
+    body = body.replace("$(& $quote $ReadyFile)", "'<ready>'").replace("$(& $quote $StopFile)", "'<stop>'")
+    assert "[Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($text))" in fn
+    for launch in ("Start-Process", "-File", "-Command", "-EncodedCommand", "Invoke-Expression", "Create(", "AddScript", "cmd", "& "):
+        assert launch not in body, f"the encoded holder body now carries {launch!r}: it must only write the ready file and wait"
+    assert "Set-Content -LiteralPath" in body and "Test-Path -LiteralPath" in body and "Start-Sleep -Milliseconds 500" in body
+
+
+def test_launcher_census_not_a_launch_is_exact_so_a_real_launch_of_that_shape_still_counts():
+    """r3b item 3: the stub's argv lookup is claimed only as the exact assignment; the same lookup feeding a launch is still a site."""
+    path = "tests/coordination/heavy_slot_stub/heavy-slot.ps1"
+    [(lookup, _why)] = NOT_A_LAUNCH_SITES[path]
+    expr = lookup.split(" = ", 1)[1]
+    assert lookup.startswith("$encoded = ") and "&" not in lookup and "Start-Process" not in lookup
+    assert lookup in (REPO / path).read_text(encoding="utf-8"), "the classified lookup is gone from the stub"
+    # Control: the lookup alone is claimed, so nothing is left over.
+    assert _census_problems({path: lookup + "\n"}, {}, {}, kinds=("encoded",), not_a_launch=NOT_A_LAUNCH_SITES) == []
+    # A real launch of that shape beside it: the lookup is still claimed, and the launch is not.
+    beside = _census_problems({path: lookup + "\n& pwsh.exe -NoProfile -EncodedCommand " + expr + "\n"}, {}, {}, kinds=("encoded",),
+                              not_a_launch=NOT_A_LAUNCH_SITES)
+    # (The scanner may report that line once per -EncodedCommand token in it; every report is the launch, unclassified.)
+    assert beside and all("unclassified launch site" in p and "& pwsh.exe" in p for p in beside), beside
+    # The lookup turned into a launch: the exact pin no longer matches, so it is both gone and unclassified.
+    turned = _census_problems({path: "$encoded = & pwsh.exe -NoProfile -EncodedCommand " + expr + "\n"}, {}, {}, kinds=("encoded",),
+                              not_a_launch=NOT_A_LAUNCH_SITES)
+    assert any("no longer found exactly" in p for p in turned) and any("unclassified launch site" in p for p in turned), turned
+    # Narrow: the pin claims nothing in any other file.
+    other = _census_problems({"tools/x.ps1": lookup + "\n"}, {}, {}, kinds=("encoded",), not_a_launch={})
+    assert len(other) == 1 and "unclassified launch site" in other[0], other
+
+
+def test_launcher_census_stub_executed_string_interpolates_only_its_own_values():
+    """r3b item 3: the stub's runtime-built -Command (UNRESOLVED_EXECUTED_SITES) interpolates only the values its census reason names."""
+    t = (REPO / "tests/coordination/heavy_slot_stub/heavy-slot.ps1").read_text(encoding="utf-8")
+    [(pin, _why)] = UNRESOLVED_EXECUTED_SITES["tests/coordination/heavy_slot_stub/heavy-slot.ps1"]
+    [line] = [ln.strip() for ln in t.splitlines() if pin in ln]
+    command = line.split(" -Command ", 1)[1]
+    assert command.startswith('"') and command.endswith('"') and command.count('"') == 2, "one double-quoted string, nothing after it"
+    names = set(re.findall(r"(?<!`)\$(\{\w+\}|\w+)", command))
+    assert names == {"ready", "{ticket}", "PID", "childS"}, names
+    assert "$ready = (Get-StubReadyPath) -replace \"'\", \"''\"" in t, "$ready is the ready path with its quotes doubled"
+    assert re.search(r"\$childS = if \(\$env:STUB_HEAVY_SLOT_CHILD_S\) \{ \[double\]\$env:STUB_HEAVY_SLOT_CHILD_S \} else \{ 0 \}", t)
+    assert "$ticket = 'stub-{0}' -f $PID" in t
+    for launch in ("Start-Process", "-EncodedCommand", "-File", "Invoke-Expression", "cmd "):
+        assert launch not in command, launch
 
 
 # --- LANE-RETIRE-LAUNCH-SITE-CENSUS-1 / LAUNCHER-CENSUS-ROOTS-AND-DOCTRINE-SCOPE-1: the census classifies launch SITES, not files.
@@ -3248,18 +3328,27 @@ def _unresolved_sites(text):
     return _sites(text, "unresolved")
 
 
-def _census_problems(sources, encoded_inventory, detached_inventory, kinds=("encoded", "detached", "unresolved"), unresolved_inventory=None):
+def _census_problems(sources, encoded_inventory, detached_inventory, kinds=("encoded", "detached", "unresolved"), unresolved_inventory=None,
+                     not_a_launch=None):
     """Per-SITE comparison: inventory[path] is a list of (pin, reason), one entry per expected site, the pin a substring of the site text.
     A site no entry claims is unclassified; an entry no site claims has vanished. Two identical sites need two entries. An `unresolved`
-    site (a string executed but built at run time) fails like an unclassified launch until UNRESOLVED_EXECUTED_SITES classifies it."""
+    site (a string executed but built at run time) fails like an unclassified launch until UNRESOLVED_EXECUTED_SITES classifies it.
+    not_a_launch (NOT_A_LAUNCH_SITES) claims an `encoded` site only when the whole site text equals its pin."""
     _scan_sites(sources.values())
     problems = []
     for kind, finder, inventory in (("encoded", _encoded_sites, encoded_inventory), ("detached", _detached_sites, detached_inventory),
                                     ("unresolved", _unresolved_sites, unresolved_inventory or {})):
         if kind not in kinds:
             continue
-        for path in sorted(set(sources) | set(inventory)):
+        exact = (not_a_launch or {}) if kind == "encoded" else {}
+        for path in sorted(set(sources) | set(inventory) | set(exact)):
             left = list(finder(sources[path])) if path in sources else []
+            for pin, _why in exact.get(path, ()):
+                hit = next((s for s in left if s[1].strip() == pin), None)
+                if hit is None:
+                    problems.append(f"{kind}: {path}: not-a-launch site no longer found exactly: {pin!r}")
+                else:
+                    left.remove(hit)
             for pin, _why in inventory.get(path, ()):
                 hit = next((s for s in left if pin in s[1]), None)
                 if hit is None:

@@ -1,7 +1,6 @@
 #ifndef PLAYBACKPREPINFLIGHTGATE_H
 #define PLAYBACKPREPINFLIGHTGATE_H
 
-#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -41,7 +40,7 @@ public:
     bool drainLocked( std::unique_lock<std::mutex> &lock, int timeoutMs )
     {
         return m_cv.wait_for( lock,
-                              std::chrono::milliseconds( std::max( timeoutMs, 0 ) ),
+                              std::chrono::milliseconds( timeoutMs > 0 ? timeoutMs : 0 ),
                               [this]{ return !m_inFlight; } );
     }
 
@@ -66,5 +65,37 @@ private:
     bool m_inFlight = false;
     uint64_t m_serial = 0;
 };
+
+// CPU-SCOPE-PLAYSTOP-LIFETIME-HARDENING-1 r2 (CoS B1): one drain, and what it allows.
+struct PlaybackPrepDrainOutcome
+{
+    bool waited = false;   // a task was in flight when the drain began
+    bool drained = true;   // false: still in flight when the budget ran out
+    uint64_t serial = 0;
+};
+
+// Takes the queue mutex, then waits (up to timeoutMs) for the in-flight task to leave.
+inline PlaybackPrepDrainOutcome playbackPrepDrainInFlight( std::mutex &queueMutex,
+                                                           PlaybackPrepInFlightGate &gate,
+                                                           int timeoutMs )
+{
+    PlaybackPrepDrainOutcome outcome;
+    std::unique_lock<std::mutex> lk( queueMutex );
+    outcome.waited = gate.inFlightLocked();
+    outcome.serial = gate.serialLocked();
+    if( outcome.waited ) outcome.drained = gate.drainLocked( lk, timeoutMs );
+    return outcome;
+}
+
+// Whether a core mutation that frees or reallocates memory an in-flight task borrows
+// may run after `outcome`. Clip replacement is one: setMlvProcessing reallocs
+// processing->gradient_mask (the task's config.gradientMaskData) and
+// RenderFrameThread::init re-assigns every slot buffer (the task's readyFrame
+// pointers). After a timed-out drain the task may still be reading either, so the
+// caller must abort (or defer) the mutation, never run it.
+inline bool playbackPrepBorrowFreeingMutationAllowed( const PlaybackPrepDrainOutcome &outcome )
+{
+    return outcome.drained;
+}
 
 #endif

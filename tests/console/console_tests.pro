@@ -36,6 +36,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_clip_lifecycle_barrier.cpp \
     $$REPO_ROOT/tests/console/test_playback_stop_lifetime.cpp \
     $$REPO_ROOT/tests/console/test_playback_prep_inflight_gate.cpp \
+    $$REPO_ROOT/tests/console/test_clip_open_abort_callers.cpp \
     $$REPO_ROOT/tests/console/test_playback_rgb8_source.cpp \
     $$REPO_ROOT/tests/console/test_export_dimensions.cpp \
     $$REPO_ROOT/tests/console/test_export_process.cpp \
@@ -123,6 +124,7 @@ HEADERS += \
     $$REPO_ROOT/platform/qt/PlaybackPrepPresentationPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackSlotRelease.h \
     $$REPO_ROOT/platform/qt/PlaybackPrepInFlightGate.h \
+    $$REPO_ROOT/platform/qt/ClipOpenAbortPolicy.h \
     $$REPO_ROOT/platform/qt/PlaybackGatePolicy.h \
     $$REPO_ROOT/platform/qt/AsyncH2dCounterContract.h \
     $$REPO_ROOT/platform/qt/GpuWindowSwapTelemetry.h \

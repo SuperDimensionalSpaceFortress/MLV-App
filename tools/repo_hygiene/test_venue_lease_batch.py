@@ -5004,6 +5004,27 @@ for _name in [n for n in vars(VenueLeaseBatchRunnerTests) if n.startswith("test_
 del _name
 
 
+# CI-WINDOWS-UNITTEST-HEAVY-PARTS-3-1: ci_unittest_shard places whole classes, and VenueLeaseBatchLegPlanTests measured 1039-1121 s on hosted windows (master
+# runs 40858861385, 40864893269, 40871917397, 40878296653), past the 1074 s one windows shard or heavy part holds under ShardDurationBudgetTests. Its test_r1_* ..
+# test_r8_* cases move, unchanged, into a sibling class on the same fixtures (the split #705 r13 staged), so no class is too heavy to place. Each case runs once.
+@requires_windows_pwsh
+class VenueLeaseBatchLegPlanEarlyRoundTests(VenueLeaseBatchLegPlanTests):
+    """The LegPlan cases named test_r1_* through test_r8_* (letter suffixes included)."""
+
+
+def _leg_plan_home(name: str) -> type:
+    lettered = re.match(r"test_r(\d+)", name)
+    if lettered and int(lettered.group(1)) <= 8:
+        return VenueLeaseBatchLegPlanEarlyRoundTests
+    return VenueLeaseBatchLegPlanTests
+
+
+for _name, _case in [(n, f) for n, f in vars(VenueLeaseBatchLegPlanTests).items() if n.startswith("test_") and callable(f)]:
+    for _cls in (VenueLeaseBatchLegPlanTests, VenueLeaseBatchLegPlanEarlyRoundTests):
+        setattr(_cls, _name, _case if _cls is _leg_plan_home(_name) else None)
+del _name, _case, _cls
+
+
 # 2026-10-25 LEASE-BATCH-LEASE-END-TZ-1: the agent's result reaches the runner through ConvertFrom-Json, which on PowerShell 7 turns "endedUtc": "...Z" into a
 # [DateTime] of Kind Utc. Get-LeaseEndUtc used to run it through [string] + DateTimeOffset.Parse, which drops the Kind and assumes the HOST's local offset, so on a
 # Central host every lease end landed 5 h early (roomSec=-15301) and no leg ever started. CI hosts are UTC (offset 0), where the old code passes, so the behavioural
