@@ -348,7 +348,6 @@ def batch_result(stdout: str) -> dict:
     return json.loads(lines[-1][len("LEASE_BATCH_RESULT="):])
 
 
-@requires_windows_pwsh
 # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r10: numeric-contract scanners for the dual-venue PowerShell. Both are tested on their own spellings below, so a pin cannot go blind
 # to the one adjacent spelling it was written against (fable key3 r9 P-02).
 def _ps_balanced(text: str, open_at: int, open_ch: str, close_ch: str) -> int:
@@ -402,7 +401,9 @@ _PS_INTEGRAL_OPERAND = re.compile(r"\s*(?:\[(?:int|int32|long|int64)\]|\[(?:syst
 
 
 def ps_integer_first_minmax(text: str) -> list[tuple[int, str]]:
-    """Every [Math]::Min/Max call whose first operand is not a double while its second one is: PowerShell picks the Int32 overload for it and ROUNDS the double (2.3 -> 2)."""
+    """Every [Math]::Min/Max call whose first operand is not a double while its second one is: PowerShell picks the Int32 overload for it and ROUNDS the double (2.3 -> 2).
+    Heuristic: a second operand is a double only when it names one (a TimeSpan total, a clock, a double literal or cast, the runner's budget names). An untyped variable product such as
+    `$f * $BudgetBasisSec` is invisible to it (VenueChain.psm1 Get-VenueLeaseCaps, carried as VENUE-LEASE-CAPS-MINMAX-OVERLOAD-1)."""
     hits = []
     for m in re.finditer(r"\[(?:system\.)?math\]::(?:min|max)\(", text, re.I):
         line_start = text.rfind("\n", 0, m.start()) + 1
@@ -460,6 +461,7 @@ def ps_float_validaterange_params(text: str) -> list[tuple[int, str, bool]]:
     return found
 
 
+@requires_windows_pwsh
 class VenueLeaseBatchRunnerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -4141,6 +4143,14 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             for line, call in ps_integer_first_minmax(path.read_text(encoding="utf-8")):
                 bad.append(f"{path.name}:{line}: {call}")
         self.assertEqual(bad, [], "make the first operand a double (330.0, [double]$x): an integer one selects the Int32 overload and rounds the double")
+
+    def test_artifact_preflight_r10_adv_a3_the_windows_pwsh_skip_stays_on_the_runner_class_and_no_helper_carries_it(self) -> None:
+        # a helper block inserted between `@requires_windows_pwsh` and its class moved the skip onto the helper's def (the helper then raised SkipTest, and the class ran unguarded
+        # on a host with no pwsh). The decorator belongs on VenueLeaseBatchRunnerTests; the scanners above it are plain functions.
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        decorated = {n.name: [ast.unparse(d) for d in n.decorator_list] for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
+        self.assertIn("requires_windows_pwsh", decorated["VenueLeaseBatchRunnerTests"])
+        self.assertEqual({name: d for name, d in decorated.items() if name.startswith(("ps_", "_ps_")) and d}, {})
 
     def test_artifact_preflight_r10_the_math_overload_scanner_sees_every_spelling(self) -> None:
         bad = [
