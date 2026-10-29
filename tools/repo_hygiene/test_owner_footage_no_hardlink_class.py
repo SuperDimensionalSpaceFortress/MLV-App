@@ -41,6 +41,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -458,7 +459,17 @@ LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED = {
     "System.IO.Path.GetFileName", "System.IO.Path.GetFullPath", "System.Runtime.InteropServices", "System.Security.Cryptography.SHA256",
     "System.Security.Cryptography.SHA256.Create", "System.Text",
 }
-_PAYLOAD_QUALIFIED_RE = re.compile(r"\b(?:System|Microsoft)(?:(?:\s|//[^\n]*)*\.(?:\s|//[^\n]*)*\w+)+")  # a line comment inside the name counts (iter 2)
+# a line comment inside the name counts (iter 2). r17 (CodeQL check-run 123193275334, inefficient regular expression): a comment runs to its newline and
+# takes it, so each separator run has exactly one parse; r16's `//[^\n]*` could stop anywhere, so a run of '//' split many ways inside the outer '+'
+_PAYLOAD_QUALIFIED_RE = re.compile(r"\b(?:System|Microsoft)(?:(?:\s|//[^\n]*\n)*\.(?:\s|//[^\n]*\n)*\w+)+")
+# the r16 pattern, kept only as the reference the r17 rewrite is compared with; it is exponential, so it is only ever run in a child under a timeout
+_PAYLOAD_QUALIFIED_R16_PATTERN = r"\b(?:System|Microsoft)(?:(?:\s|//[^\n]*)*\.(?:\s|//[^\n]*)*\w+)+"
+_FINDITER_CHILD = (
+    "import json, re, sys, time\n"
+    "texts = json.load(sys.stdin)\n"
+    "started = time.perf_counter()\n"
+    "found = [[[m.start(), m.end(), m.group(0)] for m in re.finditer(sys.argv[1], text)] for text in texts]\n"
+    "print(json.dumps({'found': found, 'seconds': time.perf_counter() - started}))\n")
 _PAYLOAD_USING_RE = re.compile(r"^\s*using\b(?!\s*\()[^\n]*", re.MULTILINE)
 # common parameters that write a variable by NAME (-OutVariable guard would put a pipeline's output into a call variable)
 _PS_VARIABLE_WRITING_PARAMETERS = ("outvariable", "errorvariable", "warningvariable", "informationvariable", "pipelinevariable")
@@ -484,6 +495,15 @@ _NATIVE_LOOKUP_RE = re.compile(
 # Each argument of a counted call or declaration is plain tokens only: a comment, string, directive or any other punctuation inside one could hide the ')' or
 # ',' the parser counts, so "(uint)size /*, 10)*/, 11" read as class 10 while C# compiled 11 (r14 iter 1, adversary ea865d3b-A1).
 _PLAIN_ARGUMENT_RE = re.compile(r"[A-Za-z0-9_ \t()]+")
+
+
+def _finditer_in_child(pattern: str, texts: list[str], timeout: float) -> dict:
+    """{'found': [[start, end, text] per match] per text, 'seconds': search time} for `pattern`, searched in a child so a pattern that backtracks
+    exponentially is killed at `timeout` instead of wedging the suite (r17)."""
+    proc = subprocess.run([sys.executable, "-I", "-c", _FINDITER_CHILD, pattern], input=json.dumps(texts).encode("ascii"), capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise AssertionError(f"the finditer child exited {proc.returncode}: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
+    return json.loads(proc.stdout)
 
 
 def _call_arguments(text: str, at: int) -> list[str] | None:
@@ -1296,6 +1316,32 @@ class NoHardLinkCreationTests(unittest.TestCase):
         with mock.patch(f"{__name__}._ps_binding_violations", lambda inv: []):
             with self.assertRaises(AssertionError):
                 self._assert_r16_rows_rejected()
+
+    def test_the_qualified_name_pattern_finds_what_the_r16_pattern_found_on_every_fixture(self) -> None:
+        # r17 (CodeQL check-run 123193275334): the rewrite keeps every r16 match on the saver's payload, every census row's payload and every string literal
+        # in this file (each inserted fixture fragment). The r16 pattern runs in a child, on these fixtures only (it finishes on them), never on the pumps.
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        sources = [text] + [mutant for rows in (r15_census_rows(text), r16_census_rows(text)) for mutant, _ in rows.values()]
+        fixtures = [payload.group("body") for source in sources for payload in _ADD_TYPE_PAYLOAD_RE.finditer(source)]
+        fixtures += [node.value for node in ast.walk(ast.parse(THIS_FILE.read_text(encoding="utf-8")))
+                     if isinstance(node, ast.Constant) and isinstance(node.value, str)]
+        new = [[[match.start(), match.end(), match.group(0)] for match in _PAYLOAD_QUALIFIED_RE.finditer(fixture)] for fixture in fixtures]
+        old = _finditer_in_child(_PAYLOAD_QUALIFIED_R16_PATTERN, fixtures, timeout=120)["found"]
+        self.assertEqual(new, old)
+        found = {match[2] for matches in new for match in matches}
+        self.assertIn("System// gap\n.IO.File.WriteAllText", found, "the iter-2 line-comment fixture is among the compared ones")
+        self.assertIn("System.Net.WebClient", found)
+
+    def test_the_qualified_name_pattern_is_linear_on_the_codeql_pump_strings(self) -> None:
+        # r17 (CodeQL check-run 123193275334): the r16 pattern ran past 20 s on N=24 of either pump (run red.txt); the rewrite finishes N=5000 at once.
+        # Run in a child too, so a regression fails at the timeout instead of hanging the suite.
+        pumps = ["System" + "//" * 5000 + "x", "System" + ". //" * 5000, "System" + "// x\n" * 5000 + "x"]
+        result = _finditer_in_child(_PAYLOAD_QUALIFIED_RE.pattern, pumps, timeout=60)
+        self.assertLess(result["seconds"], 1.0, result["seconds"])
+        self.assertEqual(result["found"], [[], [], []])
+        # control: a comment that runs to its newline still sits inside a name, and the census still strips it to the name C# compiles
+        name = _PAYLOAD_QUALIFIED_RE.search("x = System// a .b\n// c\n . IO // d\n.File.Create(p);").group(0)
+        self.assertEqual(re.sub(r"//[^\n]*|\s+", "", name), "System.IO.File.Create")
 
     def _assert_r15_rows_rejected_quietly(self) -> None:
         text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
