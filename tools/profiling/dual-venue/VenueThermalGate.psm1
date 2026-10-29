@@ -219,7 +219,9 @@ function Resolve-VenueHistoryChild {
 
 function Read-VenueLegHeatHistory {
     # The leg rows of earlier lease-batch runs, in run order, for Get-VenueHeavyLegKeys. Each -RunDir's batches.jsonl (mlv-app/venue-lease-batch/v1); a row's
-    # heat is its own heatAtProbe (written by this gate), else the agent's admission.heat from agent-result-<jobId>.json beside it, else 'unknown'.
+    # heat is its own heatAtProbe (written by this gate), else its own heatAtGrant (the agent's admission.heat, which the runner records on the row), else the
+    # agent's admission.heat from agent-result-<jobId>.json beside it, else 'unknown'. r7 (adversary r7 A2): heatAtGrant was never read, so a history
+    # without its sidecars read a hot grant as unknown.
     # A dir with no batches.jsonl, or an unreadable line, is skipped and named in .skipped (never a throw).
     param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$RunDir)
     $rows = [System.Collections.Generic.List[object]]::new(); $skipped = [System.Collections.Generic.List[string]]::new()
@@ -249,6 +251,7 @@ function Read-VenueLegHeatHistory {
                 $arm = $(if ($l.PSObject.Properties['arm']) { [string]$l.arm } else { '' })
                 $heat = 'unknown'
                 if ($l.PSObject.Properties['heatAtProbe'] -and [string]$l.heatAtProbe -cin @('hot', 'clear')) { $heat = [string]$l.heatAtProbe }
+                elseif ($l.PSObject.Properties['heatAtGrant'] -and [string]$l.heatAtGrant -cin @('hot', 'clear')) { $heat = [string]$l.heatAtGrant }
                 elseif ($l.PSObject.Properties['jobId'] -and $l.jobId) {
                     $ar = Resolve-VenueHistoryChild -Dir $dir -Child "agent-result-$($l.jobId).json"
                     # r3 pass 1 A1: `(try { } catch { })` is not an expression (PowerShell ran `try` as a command): the probe is its own statement

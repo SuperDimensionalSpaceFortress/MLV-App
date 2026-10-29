@@ -368,6 +368,35 @@ class ThermalGateModuleTests(unittest.TestCase):
         for st in ("RAN", "LEG_FAILED", "LEASE_EXPIRED"):
             self.assertEqual(ps_json(f"[pscustomobject](Get-VenueHeavyLegKeys -Rows @({rows(st)}))"), {"a|cpu": 1}, st)
 
+    def test_r7_a2_a_row_whose_probe_heat_is_unknown_reads_its_own_recorded_grant_heat(self) -> None:
+        # adversary r7 A2 on f558e2e2: the runner writes heatAtGrant (the agent's admission.heat) on every RAN row, but the reader took heatAtProbe and then only the
+        # agent-result-<jobId>.json sidecar. With the probe unreadable and no sidecar beside batches.jsonl, the hot grant was read unknown and a|cpu was never heavy.
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-grant-"))
+
+        def history(second: dict) -> None:
+            (d / "batches.jsonl").write_text(json.dumps({"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, "token": "t", "leaseId": "L", "legs": [
+                {"name": "01-a-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "jobId": "j1", "jobLease": "L", "onLease": True, "heatAtProbe": "clear", "heatAtGrant": "clear"},
+                {"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "jobId": "j2", "jobLease": "L", "onLease": True, **second}]}) + "\n", encoding="utf-8")
+
+        spread = ("$h = Read-VenueLegHeatHistory -RunDir @('<D>'); $hk = Get-VenueHeavyLegKeys -Rows @($h.rows); $items = @('a-A', 'a-B', 'b-A', 'b-B'); "
+                  "$flags = [bool[]]@($items | ForEach-Object { $hk.Contains(($_ -replace '-[AB]$', '') + '|cpu') }); "
+                  "[pscustomobject]@{ heat = @($h.rows | ForEach-Object { $_.heat }); heavy = @($hk.Keys); order = (@((Get-VenueThermalSpreadOrder -Items $items -Heavy $flags).items) -join ',') }")
+        run = lambda: ps_json(spread.replace("<D>", str(d)))  # noqa: E731
+        history({"heatAtProbe": "unknown", "heatAtGrant": "hot"})
+        got = run()
+        self.assertEqual((got["heat"], got["heavy"], got["order"]), (["clear", "hot"], ["a|cpu"], "a-A,b-A,a-B,b-B"), got)
+        # the probe's own reading still comes first, and the sidecar is still read when the row carries no usable grant heat
+        history({"heatAtProbe": "clear", "heatAtGrant": "hot"})
+        self.assertEqual(run()["heat"], ["clear", "clear"])
+        history({"heatAtProbe": "unknown", "heatAtGrant": "unknown"})
+        (d / "agent-result-j2.json").write_text(json.dumps({"admission": {"heat": "hot"}}), encoding="utf-8")
+        self.assertEqual(run()["heat"], ["clear", "hot"])
+        # a grant heat that is not hot or clear is never taken: the row stays unknown without a sidecar
+        (d / "agent-result-j2.json").unlink()
+        history({"heatAtProbe": "unknown", "heatAtGrant": "warm"})
+        self.assertEqual(run()["heat"], ["clear", "unknown"])
+
     def test_r6_a3_a_positive_infinity_mean_reaches_the_gate_as_hot_without_the_raw_json(self) -> None:
         # adversary r5 A3 on 09f9f657: a feed of 60 rows '2026,a,b,Infinity,10,No,No' is hot to the agent (+Infinity >= 88). The probe's JSON round trip turns the mean into the string
         # 'Infinity', the display printed 'mean=n/a' with no mean_exact, and with the raw JSON unwritable (a sharing violation) the gate read unknown and ran the leg.
