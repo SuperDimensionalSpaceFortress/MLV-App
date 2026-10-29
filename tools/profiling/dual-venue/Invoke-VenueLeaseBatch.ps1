@@ -564,7 +564,7 @@ function Test-AliasHit($Hit) {
 
 function Test-SuppressingHit($Hit) {
     # r6 (RPF-06): the hits that turn the write suppression on at the open and the claim guard: an alias, and an output that could not be inspected (nothing there vouches for a write,
-    # the pre-r6 rule kept). The receipt guard asks file by file instead (Get-ReceiptDestinationRefusal), so a receipt no real alias threatens is still written.
+    # the pre-r6 rule kept). The receipt guard asks file by file instead (Get-WriteDestinationHit, r9: the typed hit itself), so a receipt no real alias threatens is still written.
     # r7 (key3 opus r6 = sol r6 B1; RPF-08): and an accepted input that no longer resolves (INPUT_VANISHED / INPUT_UNREADABLE): nothing was compared with it, so nothing vouches for a write
     [bool]((Test-AliasHit $Hit) -or ($Hit -and ($Hit.kind -ceq 'output' -or $Hit.kind -ceq 'unresolved')))
 }
@@ -614,13 +614,6 @@ function Get-WriteDestinationHit([string]$Path, [switch]$Directory) {
         } catch { return [pscustomobject]@{ kind = 'output'; input = ''; item = 0; code = 'OUTPUT_ZONE_UNRESOLVED'; path = $Path; why = "a file inside '$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write into it lands is unknown" } }
     }
     $null
-}
-
-function Get-ReceiptDestinationRefusal([string]$Path) {
-    # r6 (sol r5b B1; RPF-06): '' when a write to $Path cannot land in an accepted input, asked for that one file when the output zone could not be inspected as a whole. r7: the
-    # sentence of Get-WriteDestinationHit, the one destination check every writer shares.
-    $h = Get-WriteDestinationHit $Path
-    $(if ($h) { $h.why } else { '' })
 }
 
 function Enable-WriteSuppression($Hit) {
@@ -888,7 +881,7 @@ if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPat
 foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend }) }
 # r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
 if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { $_.sourceCommit -ceq $b.Key })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
-# r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted (the preflight guard just resolved it), for Get-ReceiptDestinationRefusal
+# r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted (the preflight guard just resolved it), for Get-WriteDestinationHit
 # r8 pass 2 (adversary r8 A1): an input with no accepted identity was skipped by every destination check (renamed away and re-linked, it was written through). One that will not identify
 # is asked again (a save-as-rename's moment), at most three times, and one that still will not is refused here, before any claim, in its unresolved type.
 foreach ($g in $script:guardedInputs) {
@@ -1071,22 +1064,23 @@ function Test-ReceiptWriteSuppressed([int]$Batch, [string]$Path) {
             # r6 (sol r5b B1 = Dot A1; RPF-06): an output that could not be inspected says no input is a runner output, so the receipts are not all suppressed: each write is asked about its
             # own file, and batch.log too (every diagnostic below appends there). batch.log reaching an input, or not resolving, turns the suppression on as an alias would.
             # r6 pass 3 (adversary r6 pass 2 A1, sibling): an input that did not resolve was never compared with the outputs either, so its hit is asked file by file the same way
-            if ($guardHit -and ($guardHit.kind -ceq 'output' -or $guardHit.kind -ceq 'unresolved')) {
-                $logWhy = $(if ($script:batchLog) { Get-ReceiptDestinationRefusal $script:batchLog } else { '' })
-                if ($logWhy) {
-                    $script:suppressionHit = $guardHit; $script:RunOutputAliased = $true; $script:batchLog = $null
-                    [Console]::Error.WriteLine("BATCH_OUTPUT_UNVOUCHED batch=$Batch reason=$($guardHit.code) $logWhy (batch.log: nothing more is written into -RunDir)")
-                    Add-SuppressedReceipt $Batch $Path
+            # r9 (sol r8 B1; RPF-10): batch.log's OWN typed hit is the refusal (Register-WriteRefusal: the suppression's hit, and the stop's when it is an alias), never the earlier overall
+            # hit with batch.log's sentence attached: a batch.log that IS the accepted spec, plan or manifest is LEG_SPEC / LEG_PLAN / BUILD_MANIFEST_IS_RUN_OUTPUT, not OUTPUT_ZONE_UNRESOLVED
+            if ($guardHit -and ($guardHit.kind -ceq 'output' -or $guardHit.kind -ceq 'unresolved') -and $script:batchLog) {
+                $lh = Get-WriteDestinationHit $script:batchLog
+                if ($lh) {
+                    [Console]::Error.WriteLine("BATCH_OUTPUT_UNVOUCHED batch=$Batch reason=$((Get-HitRefusal $lh)[0]) $($lh.why) (batch.log: nothing more is written into -RunDir; overall guard hit $($guardHit.code))")
+                    Register-WriteRefusal $script:batchLog $lh; Add-SuppressedReceipt $Batch $Path
                     return $true
                 }
-                # r7 pass 2 (adversary r7 A1): only a receipt file that will not resolve itself is this file's alone; one that IS an accepted input (or may be, an input that is there
-                # will not resolve) is an alias found by a writer: the suppression turns on for every write and the hit is kept (Test-RunDirWrite)
-                $dh = Get-WriteDestinationHit $Path
-                if ($dh -and $dh.kind -ceq 'output') { Add-SuppressedReceipt $Batch $Path $guardHit $dh.why; return $true }
-                if ($dh) { Register-WriteRefusal $Path $dh; Add-SuppressedReceipt $Batch $Path; return $true }
             }
-            # r7: with no such hit the receipt's own file is still asked about right before the write, as every writer's is (Test-RunDirWrite)
-            elseif (-not (Test-RunDirWrite $Path)) { Add-SuppressedReceipt $Batch $Path; return $true }
+            # r7 pass 2 (adversary r7 A1): only a receipt file that will not resolve itself is this file's alone; one that IS an accepted input (or may be, an input that is there will not
+            # resolve) is an alias found by a writer: the suppression turns on for every write and the hit is kept (Register-WriteRefusal, the write guard's own path).
+            # r9 (sol r8 B2; RPF-11): whatever the overall hit (none, content, output or unresolved): a destination that will not resolve says nothing about any input or any other file, so
+            # only its own write is suppressed, typed by its own hit; the sibling receipt and the summary line are still written. It is no stop of its own: the lost receipt is exit 13.
+            $dh = Get-WriteDestinationHit $Path
+            if ($dh -and $dh.kind -ceq 'output') { Add-SuppressedReceipt $Batch $Path $dh 'its own destination'; return $true }
+            if ($dh) { Register-WriteRefusal $Path $dh; Add-SuppressedReceipt $Batch $Path; return $true }
             return $false
         }
         $script:receiptGuardHit = $guardHit; $script:suppressionHit = $guardHit

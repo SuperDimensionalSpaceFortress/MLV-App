@@ -3063,6 +3063,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_rpf06_g_a_real_alias_the_unlistable_zone_hides_still_suppresses_every_write(self) -> None:
         # the control the per-file check must keep: the zone will not list, so the guard cannot see that the spec is a hard link to batch.log; the batch.log check sees it and turns the
         # suppression on: no receipt is written, nothing is appended to batch.log, both lost receipts are named, exit 2
+        # r9 (sol r8 B1; RPF-10): typed by batch.log's own hit (the spec IS batch.log: LEG_SPEC_IS_RUN_OUTPUT), no longer by the earlier OUTPUT_ZONE_UNRESOLVED that hid it
         spec = self._r5_spec("fx-a.json", self.specs[0])
         link, snap = self._r5_link_to_batch_log(spec)
         args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
@@ -3071,12 +3072,95 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertTrue(snap.exists(), "the link was made (the case under test)\n" + r.stdout + r.stderr)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         res = batch_result(r.stdout)
-        self.assertEqual((res["exitCode"], res["stopReason"]), (2, "OUTPUT_ZONE_UNRESOLVED"))
-        self._r5_assert_suppressed(res, "OUTPUT_ZONE_UNRESOLVED")
+        self.assertEqual((res["exitCode"], res["stopReason"]), (2, "LEG_SPEC_IS_RUN_OUTPUT"))
+        self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
         self.assertFalse((self.run_dir / "batch-01.json").exists())
         self.assertFalse((self.run_dir / "batches.jsonl").exists())
         self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes(), "nothing was appended to the linked batch.log")
-        self.assertIn("BATCH_OUTPUT_UNVOUCHED batch=1 reason=OUTPUT_ZONE_UNRESOLVED", r.stderr)
+        self.assertIn("BATCH_OUTPUT_UNVOUCHED batch=1 reason=LEG_SPEC_IS_RUN_OUTPUT", r.stderr)
+        self.assertIn("overall guard hit OUTPUT_ZONE_UNRESOLVED", r.stderr)
+
+    # PR 704 r9 (sol r8 B1 = producer OPEN r8p2-A1; catalogue RPF-10): with an output the guard could not inspect, the receipt guard asked batch.log about its own destination but kept
+    # only the sentence of the hit it found (Get-ReceiptDestinationRefusal), and typed the suppression and the stop by the earlier OUTPUT_ZONE_UNRESOLVED hit: a batch.log that IS an
+    # accepted input was reported as an output nobody could inspect. The destination's own typed hit (kind, code, item) is the suppression's and the stop's now.
+    def test_r9_rpf10_a_batch_log_that_is_an_accepted_input_behind_an_unresolved_zone_is_typed_by_its_own_alias(self) -> None:
+        for form, code in (("spec", "LEG_SPEC_IS_RUN_OUTPUT"), ("plan", "LEG_PLAN_IS_RUN_OUTPUT"), ("build", "BUILD_MANIFEST_IS_RUN_OUTPUT")):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+                args, e = self.plan_cmd(plan)
+                target = {"spec": spec, "plan": plan, "build": self._staged_manifest(self.commit_a)}[form]
+                gate, log, snap = self.run_dir / "gate.log", self.run_dir / "batch.log", self.case / "r9-target.snap"
+                # after the final BATCH_END: gate.log (runner-owned) is a link to nothing, and batch.log is replaced by a hard link to the accepted input
+                inject = (f"[IO.File]::Delete('{psq(gate)}'); " + self._rpf06_dangling(gate) + f"; [IO.File]::Delete('{psq(log)}'); "
+                          f"New-Item -ItemType HardLink -Path '{psq(log)}' -Value '{psq(target)}' | Out-Null; Copy-Item -LiteralPath '{psq(target)}' -Destination '{psq(snap)}'")
+                r = self._rpf06_run(args, e, inject)
+                self.assertTrue(snap.exists() and os.path.lexists(gate) and not gate.exists(), "the case under test was set up\n" + r.stdout + r.stderr)
+                self.assertEqual(os.stat(log).st_ino, os.stat(target).st_ino, "batch.log is the accepted input (the case under test)")
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"]), (2, code), r.stderr)
+                self._r5_assert_suppressed(res, code)
+                self.assertEqual(target.read_bytes(), snap.read_bytes(), "nothing was written into the input through batch.log")
+                self.assertIn(f"BATCH_RECEIPT_GUARD_STOP reason={code}", r.stderr)
+                self.assertIn(f"BATCH_WRITE_REFUSED file={log} reason={code}", r.stderr)
+
+    # PR 704 r9 (sol r8 B2 = producer OPEN r8p2-A2; catalogue RPF-11): a receipt destination that is there but will not resolve (renamed between Test-NothingAtName and Get-PhysicalPath)
+    # says nothing about any input or any other file, yet with no overall hit (or a content one) the receipt guard asked the general write guard, which turned the suppression on for
+    # every write: the healthy sibling receipt and the summary's batch.log line were lost too. Only that destination's write is suppressed now, whatever the overall hit; a destination
+    # that IS an accepted input still suppresses every write. Injected I/O seam, no real race.
+    _R9_RESOLVE = "    try { $phys = (Get-PhysicalPath $Path).TrimEnd('\\'); $di = Get-FileIdentity $Path }\n"
+    _R9_JSONL_WRITE = "    Write-ReceiptFile $B.batch $jsonl { $rec.logWriteFailures"
+
+    def test_r9_rpf11_a_receipt_destination_that_will_not_resolve_suppresses_that_receipt_only(self) -> None:
+        # (form, the destination that will not resolve, made before the write, the overall hit's setup, expected exit and stop)
+        forms = (("initial, no overall hit", "batch-01.json", True, "", 13, "RECEIPT_PERSIST_FAILED"),
+                 ("jsonl, no overall hit", "batches.jsonl", True, "", 13, "RECEIPT_PERSIST_FAILED"),
+                 ("rewrite, no overall hit", "batch-01.json", False, "", 13, "RECEIPT_PERSIST_FAILED"),
+                 ("initial, content hit", "batch-01.json", True, "content", 2, "BUILD_NOT_STAGED"),
+                 ("jsonl, content hit", "batches.jsonl", True, "content", 2, "BUILD_NOT_STAGED"),
+                 ("initial, output hit (control)", "batch-01.json", True, "output", 2, "OUTPUT_ZONE_UNRESOLVED"))
+        for form, leaf, made, overall, exit_code, stop in forms:
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                dest, gate = self.run_dir / leaf, self.run_dir / "gate.log"
+                inject = f"$script:r9Throw = '{leaf}'"
+                if made:
+                    inject += f"; [IO.File]::WriteAllText('{psq(dest)}', '')"
+                else:
+                    inject += "; $script:r9Bump = $true"   # a log failure counted after the first write, so batch-NN.json is written once more (the rewrite destination)
+                if overall == "content":
+                    inject += f"; [IO.File]::Delete('{psq(self._staged_manifest(self.commit_a))}')"
+                elif overall == "output":
+                    inject += f"; [IO.File]::Delete('{psq(gate)}'); " + self._rpf06_dangling(gate)
+                r = self._rpf06_run(args, e, inject,
+                                    (self._R9_RESOLVE, "    try { if ($script:r9Throw -and [IO.Path]::GetFileName($Path) -ieq $script:r9Throw) { throw 'injected: the receipt was renamed between its observation and its resolution' }; $phys = (Get-PhysicalPath $Path).TrimEnd('\\'); $di = Get-FileIdentity $Path }\n"),
+                                    (self._R9_JSONL_WRITE, "    if ($script:r9Bump) { $script:logWriteFailures++ }\n" + self._R9_JSONL_WRITE))
+                self.assertEqual(r.returncode, exit_code, r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"]), (exit_code, stop, 1), r.stderr)
+                self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+                self.assertEqual([Path(f["file"]).name for f in res["receiptPersistFailures"]], [leaf], res["receiptPersistFailures"])
+                [f] = res["receiptPersistFailures"]
+                self.assertEqual(f["suppressedBy"], "OUTPUT_ZONE_UNRESOLVED", f)
+                self.assertIn("injected: the receipt was renamed", f["reason"], "the reason is the destination's own hit")
+                self.assertIn("this receipt file only", f["reason"])
+                if leaf == "batches.jsonl":
+                    self.assertEqual(self.batches(), [], "the destination that will not resolve is not written")
+                    self.assertTrue((self.run_dir / "batch-01.json").is_file(), "the healthy batch-01.json is written")
+                else:
+                    self.assertEqual(len(self.batches()), 1, "the healthy batches.jsonl is written")
+                    if made:
+                        self.assertEqual((self.run_dir / "batch-01.json").read_bytes(), b"", "the destination that will not resolve is not written")
+                    else:
+                        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "the first write landed before its rewrite was refused")
+                self.assertNotIn("BATCH_RESULT_NOT_LOGGED", r.stderr, "a destination-only refusal turned the suppression on for every write")
+                self.assertIn("LEASE_BATCH_RESULT=", (self.run_dir / "batch.log").read_text(encoding="utf-8"), "the summary line is still appended to batch.log")
 
     def test_r6_adv_a1_an_input_whose_lookup_is_denied_is_input_unreadable_never_input_vanished(self) -> None:
         # adversary r6 A1: the input is still there, but its own ACL denies everything and its folder denies listing, so resolving it AND looking it up are access denied. Get-Item (and,
@@ -3132,10 +3216,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertTrue(snap.exists(), "the case under test was set up\n" + r.stdout + r.stderr)
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
                 res = batch_result(r.stdout)
-                self.assertEqual((res["exitCode"], res["stopReason"]), (2, "INPUT_UNREADABLE"), r.stderr)
+                # r9 (sol r8 B1; RPF-10): typed by batch.log's own hit. Re-linked to the input, batch.log IS the spec as it was accepted (same file identity): LEG_SPEC_IS_RUN_OUTPUT,
+                # which the earlier INPUT_UNREADABLE hid. With the input re-linked to batch.log, batch.log keeps its own identity (the accepted spec file is gone) and the spec's path will not resolve: INPUT_UNREADABLE.
+                code = "INPUT_UNREADABLE" if form.startswith("input") else "LEG_SPEC_IS_RUN_OUTPUT"
+                self.assertEqual((res["exitCode"], res["stopReason"]), (2, code), r.stderr)
                 self.assertEqual(spec.read_bytes(), snap.read_bytes(), "nothing was written into the input through batch.log")
-                self._r5_assert_suppressed(res, "INPUT_UNREADABLE")
-                self.assertIn("BATCH_OUTPUT_UNVOUCHED batch=1 reason=INPUT_UNREADABLE", r.stderr)
+                self._r5_assert_suppressed(res, code)
+                self.assertIn(f"BATCH_OUTPUT_UNVOUCHED batch=1 reason={code}", r.stderr)
 
     # PR 704 r7 (key3 opus r6 = sol r6 B1/B2 = Dot 16:48Z; catalogue RPF-08, RPF-09; folds LEASE-BATCH-INPUT-ALIAS-RESOLUTION-FAIL-REGRESSION-1): an accepted input that no longer resolves
     # (INPUT_VANISHED / INPUT_UNREADABLE) turned no write suppression on at the open or at a later claim, so the finally's log lines and the summary were appended into a batch.log that was
