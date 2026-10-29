@@ -4014,9 +4014,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"$script:guardedInputs = @([pscustomobject]@{{ kind = 'build'; item = 1; path = 'manifest'; commit = '{c}'; sha256 = ('a' * 64) }})\n"
                   f"$stagedBuildProbe = {{ param($p) [IO.File]::AppendAllText('{reads}', 'm' + [Environment]::NewLine); [Threading.Thread]::Sleep({manifest_ms}); {facts} }}\n"
                   f"$artifactProbe = {{ param($i) [IO.File]::AppendAllText('{hashes}', 'h' + [Environment]::NewLine); [IO.File]::AppendAllText('{bounds}', ([string]($i[0].endSec - $i[0].clock.Elapsed.TotalSeconds) + [Environment]::NewLine)); [Threading.Thread]::Sleep({hash_ms}) }}\n"
-                  # warm the runspace machinery first, so the room measures the reads and not the first runspace's start
-                  # (adversary r7 A3: the helper is not exported, so it is called inside the module)
-                  "$null = & (Get-Module VenueChain) { Invoke-VenueBoundedRead -ScriptText '1' -Argument 0 -TimeoutSec 30 }\n"
+                  # r11 (hosted CI 40805584834): the room is measured on the real clock, and Invoke-VenueBoundedRead starts a runspace per read -- a cost the injected probes do not
+                  # control (warming the first one, adversary r7 A3, left every later start). A 2.3 s room holds only 0.3 s of it above the hash's 2 s minimum, and a loaded hosted runner
+                  # spent 190 ms there ("1.99 s left, under 2"). The room tests pin the BUDGET ARITHMETIC, so the reads run in-process here (the same script text, argument and result
+                  # shape; the runspace itself and its timeout are pinned by the bounded-read tests) and the only time a read takes is the probe's own sleep.
+                  "& (Get-Module VenueChain) { function script:Invoke-VenueBoundedRead { param([string]$ScriptText, $Argument, [double]$TimeoutSec) "
+                  "[pscustomobject]@{ answered = $true; value = @(& ([scriptblock]::Create($ScriptText)) $Argument); error = $null } } }\n"
                   f"$script:guardBudget = New-GuardBudget {room} 'the test room' 'LEG_BUDGET_EXCEEDS_LEASE' $false 'open'\n"
                   "$hit = Get-InputContentRefusal\n"
                   "ConvertTo-Json -Compress -InputObject @{ code = [string]$hit.code; why = [string]$hit.why; ms = [int]$script:guardBudget.clock.Elapsed.TotalMilliseconds }\n"
