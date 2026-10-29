@@ -30,6 +30,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tools.repo_hygiene import test_dual_venue_evidence as dve
 from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, write_synthetic_mlv
 from tools.repo_hygiene.test_dual_venue_evidence import (
     DV,
@@ -3232,7 +3233,13 @@ class CorePartitionSpecTests(unittest.TestCase):
 # generatorArgs.playbackMaxThreads (1..16) -> Invoke-VenueLeg -PlaybackMaxThreads -> the smoke runner's EXISTING -Threads <n> (which sets
 # MLVAPP_PLAYBACK_MAX_THREADS for the app and records playbackMaxThreads in its result.json). FAIL CLOSED: the leg is INVALID
 # (WORKER_THREADS_NOT_HONOURED) unless the measured session's worker_threads= and the job's proof fields all say n.
-# The commit this card branched from: a job generated without the key must still be this commit's job, byte for byte.
+# PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r4 (forced companion): this tree's default (HEAVY) job carries the bracketed HEAVY-FRAME-LOG-1 region the base commit
+# predates, so both sides are stripped with the SAME helper test_dual_venue_evidence's BASELINE_COMMIT comparison uses; every other byte must still match.
+def strip_dve_regions(text: str) -> tuple[str, dict[str, int]]:
+    return dve.GeneratorByteIdentityAndVariantTests.strip_regions(text)
+
+
+# The commit this card branched from: a job generated without the key must still be this commit's job, byte for byte (outside the region above).
 THREADS_BASE_COMMIT = "293b0b818dd268d81bc5aa667b3ae7a021f02b24"
 THREADS_OPEN = "# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 >>>"
 THREADS_CLOSE = "# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 <<<"
@@ -3297,10 +3304,13 @@ class PlaybackMaxThreadsGeneratorTests(unittest.TestCase):
         if not self.base_available:
             self.skipTest(f"base commit {THREADS_BASE_COMMIT} is not in this clone")
         for name in THREADS_SHAPES:
-            base = self.job(f"base-{name}")
+            base, base_counts = strip_dve_regions(self.job(f"base-{name}"))
+            self.assertEqual(base_counts["heavy-frame-log"], 0, "the base commit predates the HEAVY frame-log opt-out")
             for key in (f"head-{name}", f"zero-{name}"):
                 with self.subTest(job=key):
-                    self.assertEqual(self.job(key), base, f"{key}: a job without a playback thread cap changed")
+                    got, got_counts = strip_dve_regions(self.job(key))
+                    self.assertEqual(got_counts["heavy-frame-log"], dve.GeneratorByteIdentityAndVariantTests.HEAVY_FRAME_LOG_REGIONS, f"{key}: the default (HEAVY) job carries its bracketed HEAVY-FRAME-LOG-1 region")
+                    self.assertEqual(got, base, f"{key}: a job without a playback thread cap changed")
 
     def test_a_requested_cap_reaches_the_smoke_runner_as_its_existing_threads_argument(self) -> None:
         for name in THREADS_SHAPES:
