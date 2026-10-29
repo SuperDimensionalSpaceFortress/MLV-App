@@ -2596,6 +2596,11 @@ function Get-CorePartitionMonoMs { [double]$global:cpClk }
 function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) if (-not $global:cpLog) { throw 'run log unresolvable' }; $h = (Get-FileHash -LiteralPath $global:cpLog -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($null -ne $global:cpSwap) { [IO.File]::WriteAllText($global:cpLog, $global:cpSwap) }
     [pscustomobject]@{ path = $global:cpLog; sha256 = $h } }
+# CORE-PARTITION-B1-STALL-TEST-FLAKE-1: the job's wall clock reads (Get-Date) follow the fake monotonic clock, so the job's measured wall/mono gap
+# is 0 whatever real time the host spends between this driver's steps. Against the real clock that gap was the real time between $now (below)
+# and the job's own read: over 250 ms on a loaded hosted runner it moved the start bound (the rows sit 500 ms past the playback start) and the
+# case published feed-no-rows-in-window, or one row fewer, intermittently. CP_WALL_STALL_MS (below) injects exactly that real time.
+function Get-Date { $L.AddMilliseconds($global:cpClk - 1000) }
 $row = "26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
 function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
     $m = $global:cpClk; $global:cpClk += 500
@@ -2623,6 +2628,7 @@ foreach ($k in $cases.Keys) {
     $corePartitionJobProc | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
     $now = [DateTime]::UtcNow
     $L = $now.AddMilliseconds(1000 - $c[0])
+    if ($env:CP_WALL_STALL_MS) { Start-Sleep -Milliseconds ([int]$env:CP_WALL_STALL_MS) }
     $W = { param([double]$m) $L.AddMilliseconds($m - 1000).Ticks }
     # r13c (CP-FEED-START-ANCHOR, rule (a)): a feed row's HWiNFO stamp (local d.M.yyyy,H:mm:ss.fff) for monotonic $m; the window row is stamped
     # at 2000, after the measured session's playback start (1500)
@@ -2707,11 +2713,29 @@ class CorePartitionR11Tests(unittest.TestCase):
         proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(work)})
         cls.raw = proc
         cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+        # CORE-PARTITION-B1-STALL-TEST-FLAKE-1: the same driver with 600 ms of real time between its wall-clock anchor and the job's reads
+        stalled = cls.tmp / "cleanup-stalled"
+        stalled.mkdir()
+        cls.raw_stalled = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(stalled), "CP_WALL_STALL_MS": "600"})
+        cls.r_stalled = json.loads(cls.raw_stalled.stdout.strip().splitlines()[-1]) if cls.raw_stalled.returncode == 0 and cls.raw_stalled.stdout.strip() else None
 
     def setUp(self) -> None:
         self.assertIsNotNone(self.r, f"the lifted cleanup region did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
         for case, got in self.r.items():
             self.assertNotIn("threw", got, f"{case}: {got}")
+
+    def test_host_time_between_the_drivers_steps_is_not_the_jobs_clock_skew(self) -> None:
+        """CORE-PARTITION-B1-STALL-TEST-FLAKE-1 (CI run 40711418664, merge_group pr-708): the driver's fake monotonic clock is anchored on one
+        wall read, and the job reads the wall clock again at its end stamp; real host time between the two was the job's wall/mono skew. Over
+        250 ms (the control's rows sit 500 ms past the playback start, so the start bound's 2 x skew passes them) the control published
+        feed-no-rows-in-window. With 600 ms injected between the anchor and the job's reads, every case must read exactly as it does unstalled,
+        the control still publishing its in-window row and its published window boundary unmoved."""
+        self.assertIsNotNone(self.r_stalled, f"the stalled run did not run: {self.raw_stalled.stdout[-3000:]}{self.raw_stalled.stderr[-3000:]}")
+        for case, got in self.r_stalled.items():
+            self.assertNotIn("threw", got, f"{case}: {got}")
+        self.assertEqual(self.r_stalled, self.r, "600 ms of host time between the driver's steps changed a case's outcome")
+        control = self.r_stalled["zero-delay-control"]
+        self.assertEqual([control["rows"], control["watts"], control["temp"], control["why"]], [1, 99.0, 99.0, ""], control)
 
     def test_b1_a_stall_in_cleanup_after_the_smoke_returns_does_not_move_the_window_end(self) -> None:
         """B1 (sol r10 B1, literal): the smoke ends at 21000 and the job's affinity restore stalls 40 s (or 80 s); the 99 W / 99 C row appended
@@ -2956,11 +2980,30 @@ class CorePartitionR13StartTests(unittest.TestCase):
         proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(work)})
         cls.raw = proc
         cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+        # CORE-PARTITION-R13C-ROW-COUNT-FLAKE-1: the same driver with 600 ms of real time between its wall-clock anchor and the job's reads
+        stalled = cls.tmp / "cleanup-stalled"
+        stalled.mkdir()
+        cls.raw_stalled = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(stalled), "CP_WALL_STALL_MS": "600"})
+        cls.r_stalled = json.loads(cls.raw_stalled.stdout.strip().splitlines()[-1]) if cls.raw_stalled.returncode == 0 and cls.raw_stalled.stdout.strip() else None
 
     def setUp(self) -> None:
         self.assertIsNotNone(self.r, f"the lifted cleanup region did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
         for case, got in self.r.items():
             self.assertNotIn("threw", got, f"{case}: {got}")
+
+    def test_host_time_between_the_drivers_steps_does_not_move_the_start_bound(self) -> None:
+        """CORE-PARTITION-R13C-ROW-COUNT-FLAKE-1 (hosted run 40807694575, PR 709 shard 4/8: 29 != 30 and 65 != 66 rows): the same driver
+        anchor as the r11 cases, so the same mechanism. The playback rows sit 500 ms past the playback start and the start bound is the start
+        plus twice the job's wall/mono skew, so real host time between the driver's anchor and the job's wall read (over 250 ms) dropped the
+        first playback row. With 600 ms injected between them, the dot counterexample and the real venue shape still publish 30 and 66 rows,
+        and the stalled outcome of every case is the unstalled one."""
+        self.assertIsNotNone(self.r_stalled, f"the stalled run did not run: {self.raw_stalled.stdout[-3000:]}{self.raw_stalled.stderr[-3000:]}")
+        for case, got in self.r_stalled.items():
+            self.assertNotIn("threw", got, f"{case}: {got}")
+        for case, rows in (("dot-60s-idle-then-30s-playback", 30), ("real-shape-first-line-to-start-23600", 66)):
+            got = self.r_stalled[case]
+            self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [rows, 100.0, 80.0, ""], got)
+        self.assertEqual({k: v["why"] for k, v in self.r_stalled.items()}, {k: v["why"] for k, v in self.r.items()})
 
     def test_r13c_dot_counterexample_reports_the_playback_means_not_a_refusal(self) -> None:
         """Dot 6452868627 (literal): 60 s of startup rows (10 W / 30 C) then 30 s of playback rows (100 W / 80 C) in a 90 s window that passes the
