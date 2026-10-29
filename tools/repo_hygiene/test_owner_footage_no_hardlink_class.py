@@ -356,23 +356,23 @@ LANE_DIRTY_SAVE_PS_LAUNCH_WRITES = {
 # ps_ast_inventory.ps1 Get-UseSite), so a new alias or call is a new site. A reference by ANOTHER name (a provider path, SessionState) is the r16 rule below.
 LANE_DIRTY_SAVE_PS_LAUNCH_OBJECTS = {"psi", "savedEnv", "gitEnv", "shape", "stagedTmp", "gitDir", "GitArgs", "GitDiffArgs"}
 LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES = {
-    "gitargs @ (@('-C', $Wt) + $GitArgs)", "gitargs @ param [string[]]$GitArgs",
-    "gitdiffargs @ (@('-C', $Wt) + $GitDiffArgs)", "gitdiffargs @ param [string[]]$GitDiffArgs",
+    "gitargs @ foreach ($a in (@('-C', $Wt) + $GitArgs))", "gitargs @ param [string[]]$GitArgs",
+    "gitdiffargs @ foreach ($a in (@('-C', $Wt) + $GitDiffArgs))", "gitdiffargs @ param [string[]]$GitDiffArgs",
     "gitdir @ $cdFile = Join-Path $GitDir 'commondir'", "gitdir @ $common = $GitDir",
     "gitdir @ $common = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($GitDir, $text))", "gitdir @ $p = Join-Path $GitDir $n",
-    "gitdir @ @{ GitId = (Get-DirtyDirIdentity $GitDir); CommonDir = $common; CommonId = (Get-DirtyDirIdentity $common); Absent = $absent }", "gitdir @ param [string]$GitDir",
-    "gitdir @ $env:GIT_COMMON_DIR = $gitDir[1]", "gitdir @ $env:GIT_DIR = $gitDir[0]", "gitdir @ $gitDir",
+    "gitdir @ return @{ GitId = (Get-DirtyDirIdentity $GitDir); CommonDir = $common; CommonId = (Get-DirtyDirIdentity $common); Absent = $absent }", "gitdir @ param [string]$GitDir",
+    "gitdir @ $env:GIT_COMMON_DIR = $gitDir[1]", "gitdir @ $env:GIT_DIR = $gitDir[0]", "gitdir @ $gitDir | ForEach-Object { Get-DirtyDirIdentity $_ }",
     "gitdir @ $gitDir = @(& git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir 2>$null)",
     "gitdir @ $h = Lock-DirtyDirectory $gitDir[$i]", "gitdir @ $i -lt $gitDir.Count",
     "gitdir @ $LASTEXITCODE -ne 0 -or $again.Count -ne 2 -or $again[0] -cne $gitDir[0] -or $again[1] -cne $gitDir[1]",
     "gitdir @ $LASTEXITCODE -ne 0 -or $gitDir.Count -ne 2", "gitdir @ (Get-DirtyDirIdentity $gitDir[$i]) -cne $gitDirIds[$i]", "gitdir @ (Join-Path $Wt '.git'), (Join-Path $gitDir[0] 'commondir')",
-    "gitenv @ $gitEnv",
+    "gitenv @ foreach ($v in $gitEnv)",
     "gitenv @ $gitEnv = 'GIT_DIFF_OPTS', 'GIT_EXTERNAL_DIFF', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX'",
     "psi @ $p = [System.Diagnostics.Process]::Start($psi)", "psi @ $psi = New-Object System.Diagnostics.ProcessStartInfo",
     "psi @ $psi.CreateNoWindow = $true", "psi @ $psi.FileName = @(Get-Command git -CommandType Application)[0].Source",
     "psi @ $psi.RedirectStandardError = $true", "psi @ $psi.RedirectStandardOutput = $true", "psi @ $psi.UseShellExecute = $false",
     "psi @ [void]$psi.ArgumentList.Add($a)",
-    "savedenv @ $savedEnv = @{}", "savedenv @ $savedEnv.Keys", "savedenv @ $savedEnv[$v] = $found.Value",
+    "savedenv @ $savedEnv = @{}", "savedenv @ foreach ($v in $savedEnv.Keys)", "savedenv @ $savedEnv[$v] = $found.Value",
     "savedenv @ Set-Item -LiteralPath \"Env:$v\" -Value $savedEnv[$v]",
     "shape @ $cap = Invoke-DirtyGitCapture -Wt $Wt -GitArgs (@('diff', 'HEAD') + $shape)",
     "shape @ $shape = @('--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--submodule=short', '--ignore-submodules=none', '-U3', "
@@ -385,7 +385,7 @@ LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES = {
     "-Guard $guard -Hold $stagedTmp -DirHandle $destDir",
     "stagedtmp @ $stagedTmp = $null",
     "stagedtmp @ $stagedTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-staging-' + [Guid]::NewGuid().ToString('N') + '.tmp') $destDir",
-    "stagedtmp @ $tmp, $stagedTmp, $statTmp, $mergeTmp", "stagedtmp @ $why = $stagedTmp.Reason", "stagedtmp @ $why = Test-DirtyTempHeld $stagedTmp",
+    "stagedtmp @ foreach ($t in $tmp, $stagedTmp, $statTmp, $mergeTmp)", "stagedtmp @ $why = $stagedTmp.Reason", "stagedtmp @ $why = Test-DirtyTempHeld $stagedTmp",
     "stagedtmp @ & git -C $Wt apply --cached --check -R --whitespace=nowarn $stagedTmp.Path 2>$null", "stagedtmp @ -not $stagedTmp.Path",
     "stagedtmp @ -not (Test-DirtyEvidenceUnchanged -Path $stagedTmp.Path -Full $stagedFull)",
 }
@@ -439,7 +439,17 @@ _PAYLOAD_PROCESS_RE = re.compile(
     # r15 iter 2 (adversary 39a58424-A2): PowerShell itself is a default Add-Type reference, so its scripting API runs any script from C#
     r"|\bPowerShell\b|ScriptBlock|Runspace|AddScript|AddCommand|InvokeScript|InvokeCommand|System\.Management|\bCompile\s*\(|\bAppDomain\b|\bAssembly\b|Emit\b"
     # r16 (adversary a11c4459-A2): Microsoft.VisualBasic.Interaction.Shell starts a process; COM activation by ProgID / CLSID runs any registered server
-    r"|\bShell\b|Interaction|VisualBasic|GetTypeFrom\w*|\bglobal::|\bnamespace\b|\bextern\s+alias\b")  # C# is case-sensitive: a case variant does not compile
+    r"|\bShell\b|Interaction|VisualBasic|GetTypeFrom\w*|\bglobal::|\bnamespace\b|\bextern\s+alias\b"
+    # r16 iter 2 (adversary 31a40a36-A2/A3): a block comment can sit inside a qualified name (System/**/.IO.File); a library can be chosen or loaded by path
+    r"|/\*|LoadLibrary|SetDllDirectory|AddDllDirectory|DllImportSearchPath|DefaultDllImportSearchPaths")  # C# is case-sensitive: a case variant does not compile
+# r16 iter 2 (adversary 31a40a36-A3): an extern's NAME is pinned, so its LIBRARY must be too: a DllImport of another DLL runs that DLL's DllMain on the first
+# call, before any export is resolved. Every DllImport attribute is one of these texts, and there is one per extern.
+LANE_DIRTY_SAVE_PAYLOAD_DLLIMPORTS = {
+    '[DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]', '[DllImport("kernel32.dll", SetLastError = true)]',
+    '[DllImport("kernel32.dll")]', '[DllImport("ntdll.dll")]',
+}
+_PAYLOAD_DLLIMPORT_RE = re.compile(r"DllImport")
+_PAYLOAD_DLLIMPORT_ATTRIBUTE_RE = re.compile(r"\[DllImport\([^\]\n]*\)\]")
 # r16 (adversary a11c4459-A2), default-deny: the payload's using directives are exactly these, and every name it qualifies from System. or Microsoft. is
 # one of these, so a library outside them (Microsoft.VisualBasic, System.Diagnostics, System.Net, ...) cannot be reached by its full name or an alias
 LANE_DIRTY_SAVE_PAYLOAD_USINGS = ["using System;", "using System.Runtime.InteropServices;", "using System.Text;"]
@@ -448,7 +458,7 @@ LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED = {
     "System.IO.Path.GetFileName", "System.IO.Path.GetFullPath", "System.Runtime.InteropServices", "System.Security.Cryptography.SHA256",
     "System.Security.Cryptography.SHA256.Create", "System.Text",
 }
-_PAYLOAD_QUALIFIED_RE = re.compile(r"\b(?:System|Microsoft)(?:\s*\.\s*\w+)+")
+_PAYLOAD_QUALIFIED_RE = re.compile(r"\b(?:System|Microsoft)(?:(?:\s|//[^\n]*)*\.(?:\s|//[^\n]*)*\w+)+")  # a line comment inside the name counts (iter 2)
 _PAYLOAD_USING_RE = re.compile(r"^\s*using\b(?!\s*\()[^\n]*", re.MULTILINE)
 # common parameters that write a variable by NAME (-OutVariable guard would put a pipeline's output into a call variable)
 _PS_VARIABLE_WRITING_PARAMETERS = ("outvariable", "errorvariable", "warningvariable", "informationvariable", "pipelinevariable")
@@ -750,11 +760,17 @@ def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
                             (_PAYLOAD_PROCESS_RE, "a process start or run-time binding")):
             for match in regex.finditer(body):
                 violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: {what} inside an Add-Type payload: {match.group(0)}")
+        attributes = [match.group(0) for match in _PAYLOAD_DLLIMPORT_ATTRIBUTE_RE.finditer(body)]
+        externs = len(re.findall(r"\bextern\b", body))
+        if (len(_PAYLOAD_DLLIMPORT_RE.findall(body)) != len(attributes) or len(attributes) != externs
+                or any(attribute not in LANE_DIRTY_SAVE_PAYLOAD_DLLIMPORTS for attribute in attributes)):
+            violations.append(f"a process start or run-time binding inside an Add-Type payload: a DllImport outside the pinned libraries, or not one per extern "
+                              f"({len(attributes)} attribute(s), {externs} extern(s)): {sorted(set(attributes) - LANE_DIRTY_SAVE_PAYLOAD_DLLIMPORTS)}")
         usings = [match.group(0).strip() for match in _PAYLOAD_USING_RE.finditer(body)]
         if usings != LANE_DIRTY_SAVE_PAYLOAD_USINGS:
             violations.append(f"the Add-Type payload's using directives are not exactly {LANE_DIRTY_SAVE_PAYLOAD_USINGS}: {usings}")
         for match in _PAYLOAD_QUALIFIED_RE.finditer(body):
-            if re.sub(r"\s+", "", match.group(0)) not in LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED:
+            if re.sub(r"//[^\n]*|\s+", "", match.group(0)) not in LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED:
                 violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: a process start or run-time binding inside an Add-Type payload "
                                   f"(a qualified name outside the pinned set): {match.group(0)}")
     # the census proper runs on the text C# compiles: every escape resolved
@@ -1029,6 +1045,25 @@ def r16_census_rows(text: str) -> dict[str, tuple[str, str]]:
         "iter1 A4 $env:--": (text + "\n$env:GIT_CONFIG_COUNT--\n", "written outside the pinned set"),
         "iter1 A4 a launch variable incremented": (at_line_50("$gitDir[0]++"), "written outside the pinned set"),
         "iter1 A4 an env var by [ref]": (at_line_50("$null = [DirtyFinalPath]::Pin([ref]$env:GIT_CONFIG_COUNT)"), "passed by [ref]"),
+        # r16 iter 2 (adversary 31a40a36): a switch, foreach or pipeline hands the value on; a comment inside a qualified name; a DllImport of another library
+        "iter2 A1 a switch exports the launch object": (
+            text.replace(launch_info, "switch (" + launch_info.strip() + ") { default { $x = $_ } }", 1).replace(
+                LAUNCH_569, "    $x.FileName = 'C:/Windows/System32/cmd.exe'; [void]$x.ArgumentList.Add('/c')\n" + LAUNCH_569, 1),
+            "a launch object used at a site outside the pinned set"),
+        "iter2 A1 a foreach exports the launch object": (text.replace(launch_info, "foreach ($x in @((" + launch_info.strip() + "))) { $x.FileName = 'x' }", 1),
+                                                         "a launch object used at a site outside the pinned set"),
+        "iter2 A1 a pipeline exports the launch object": (before_line(LAUNCH_569, "$psi | ForEach-Object { $_.FileName = 'x' }"),
+                                                          "a launch object used at a site outside the pinned set"),
+        "iter2 A1 a pinned bare use piped on": (text.replace("$i -lt $gitDir.Count", "$i -lt ($gitDir | ForEach-Object { $_ }).Count", 1),
+                                                "a launch object used at a site outside the pinned set"),
+        "iter2 A2 a block comment inside a qualified name": (text.replace(call, call + '\nSystem/*gap*/.IO.File.WriteAllText("C:/fixture/wt/src/a.txt", "x");', 1),
+                                                             "a process start or run-time binding"),
+        "iter2 A2 a line comment inside a qualified name": (text.replace(call, call + '\nSystem// gap\n.IO.File.WriteAllText("C:/fixture/wt/src/a.txt", "x");', 1),
+                                                            "a qualified name outside the pinned set"),
+        "iter2 A3 a DllImport of another library": (text.replace('[DllImport("ntdll.dll")]', '[DllImport("C:/fixture/alternate.dll")]', 1), "a DllImport outside"),
+        "iter2 A3 a DllImport by EntryPoint-free alias attribute": (text.replace('[DllImport("ntdll.dll")]', '[DllImport("ntdll.dll", ExactSpelling = true)]', 1),
+                                                                     "a DllImport outside"),
+        "iter2 A3 LoadLibrary": (text.replace(call, call + '\nLoadLibrary("C:/fixture/alternate.dll");', 1), "a process start or run-time binding"),
     }
 
 

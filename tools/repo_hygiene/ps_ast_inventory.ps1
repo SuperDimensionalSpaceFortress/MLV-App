@@ -54,11 +54,14 @@ function Get-UseSite($Var) {
     $site = $null
     while ($null -ne $node) {
         if ($node -is [System.Management.Automation.Language.StatementBlockAst] -or $node -is [System.Management.Automation.Language.NamedBlockAst] -or $node -is [System.Management.Automation.Language.ScriptBlockAst]) { break }
-        if ($null -eq $site) {
-            if ($node -is [System.Management.Automation.Language.ParameterAst]) { return 'param ' + $node.Extent.Text }
-            if ($node -is [System.Management.Automation.Language.ForEachStatementAst]) { return 'foreach (' + $node.Variable.Extent.Text + ' in ' + $node.Condition.Extent.Text + ')' }
-        }
-        if ($node -is [System.Management.Automation.Language.AssignmentStatementAst] -or $node -is [System.Management.Automation.Language.CommandAst] -or $node -is [System.Management.Automation.Language.CommandExpressionAst]) { $site = $node.Extent.Text }
+        if ($null -eq $site -and $node -is [System.Management.Automation.Language.ParameterAst]) { return 'param ' + $node.Extent.Text }
+        # a foreach or switch header hands its value to its body ($a, $_), and so does a pipeline to its next element: each is the site, whatever is inside it
+        # (r16 iter 2, adversary 31a40a36-A1: switch ($psi = New-Object ...) { default { $x = $_ } })
+        if ($node -is [System.Management.Automation.Language.ForEachStatementAst]) { return 'foreach (' + $node.Variable.Extent.Text + ' in ' + $node.Condition.Extent.Text + ')' }
+        if ($node -is [System.Management.Automation.Language.SwitchStatementAst]) { return 'switch (' + $node.Condition.Extent.Text + ')' }
+        if ($node -is [System.Management.Automation.Language.AssignmentStatementAst] -or $node -is [System.Management.Automation.Language.CommandAst] -or $node -is [System.Management.Automation.Language.CommandExpressionAst] -or
+            $node -is [System.Management.Automation.Language.ReturnStatementAst] -or $node -is [System.Management.Automation.Language.ThrowStatementAst] -or $node -is [System.Management.Automation.Language.ExitStatementAst] -or
+            ($node -is [System.Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -gt 1)) { $site = $node.Extent.Text }
         $node = $node.Parent
     }
     return $site
