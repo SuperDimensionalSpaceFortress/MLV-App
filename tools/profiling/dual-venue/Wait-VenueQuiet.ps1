@@ -1259,9 +1259,12 @@ function Write-TelemetryLines($Probe) {
     try {
         if ([string]$Probe.telemetry_schema -cne $telemetrySchemaV1) { return }
         $h = $Probe.heat
+        # BACHELOR-THERMAL-GATE-WAIT-1 r6 (adversary r5 A3): mean_exact is printed for a non-finite mean too. The JSON round trip holds it as the string NaN / Infinity / -Infinity, which
+        # Format-TelNum prints as 'n/a' (as for a missing mean); mean_exact names it, so the lease-batch gate reads +Infinity as hot (the agent's >= 88 rule) and NaN / -Infinity as unknown.
         Write-Gate (("  tele heat source={0} age={1} hottest={2} max15={3} mean={4} throttled={5}/{6} W={7}" -f (ConvertTo-IdentToken $h.source), (Format-TelNum $h.sample_age_s 's'),
             (Format-TelNum $h.hottest_core_c 'C'), (Format-TelNum $h.max15_c 'C'), (Format-TelNum $h.mean_c 'C'), (ConvertTo-IdentToken $h.throttled), (ConvertTo-IdentToken $h.window_rows),
-            (Format-TelNum $h.package_w '')) + (Get-TelReasonSuffix $h) + $(if ($h.mean_c_exact -is [ValueType]) { ' mean_exact=' + ([double]$h.mean_c_exact).ToString('R', [Globalization.CultureInfo]::InvariantCulture) } else { '' }))
+            (Format-TelNum $h.package_w '')) + (Get-TelReasonSuffix $h) + $(if ($h.mean_c_exact -is [ValueType]) { ' mean_exact=' + ([double]$h.mean_c_exact).ToString('R', [Globalization.CultureInfo]::InvariantCulture) }
+            elseif ([string]$h.mean_c_exact -cin @('NaN', 'Infinity', '-Infinity')) { ' mean_exact=' + [string]$h.mean_c_exact } else { '' }))
         $g = $Probe.gpu
         Write-Gate (("  tele gpu state={0} skipped_wake_risk={1} util={2} temp={3} W={4} pstate={5}" -f (ConvertTo-IdentToken $g.state), $(if ($g.skipped_wake_risk -eq $true) { 'true' } elseif ($g.skipped_wake_risk -eq $false) { 'false' } else { 'n/a' }),
             (Format-TelNum $g.utilization_percent '%'), (Format-TelNum $g.temp_c 'C'), (Format-TelNum $g.power_w ''), (ConvertTo-IdentToken $g.pstate)) + $(if ($g.state_reason) { ' state_reason=' + (ConvertTo-IdentToken $g.state_reason) } else { '' }))

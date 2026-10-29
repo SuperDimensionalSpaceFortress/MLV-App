@@ -191,7 +191,9 @@ class ThermalGateModuleTests(unittest.TestCase):
         for line in runner.splitlines():
             if "Get-VenueThermalGateStep -Heat" in line:
                 self.assertNotIn("-NowUtc ([DateTime]::UtcNow)", line, "the gate step must not be fed the wall clock once a first hot reading exists")
-        self.assertGreaterEqual(runner.count("Get-VenueThermalNowUtc"), 2)
+        self.assertGreaterEqual(runner.count("Get-VenueThermalNowUtc"), 1)
+        # r6 (adversary r5 A1): the probe-wait clamp moved from the loop top to the dispatch, where it reads the same monotonic elapsed time as the admission
+        self.assertIn("$wait = [int][Math]::Max(0, [Math]::Min($wait, $ThermalWaitCapSec - $el))", runner)
 
     def test_adversary_r3_a2_the_heat_rule_is_applied_to_the_exact_mean_not_the_rounded_one(self) -> None:
         import tempfile
@@ -341,6 +343,45 @@ class ThermalGateModuleTests(unittest.TestCase):
         after = [l for l in fn[fn.index(marker) + len(marker):].splitlines() if l.strip() and not l.strip().startswith("#")]
         self.assertTrue(after[0].lstrip().startswith("$captured = @(& $pwshExe @qArgs *>&1"), after[0])
         self.assertIn("Set-Content -LiteralPath $out -Value $captured", fn)
+
+    def test_r6_a3_a_positive_infinity_mean_reaches_the_gate_as_hot_without_the_raw_json(self) -> None:
+        # adversary r5 A3 on 09f9f657: a feed of 60 rows '2026,a,b,Infinity,10,No,No' is hot to the agent (+Infinity >= 88). The probe's JSON round trip turns the mean into the string
+        # 'Infinity', the display printed 'mean=n/a' with no mean_exact, and with the raw JSON unwritable (a sharing violation) the gate read unknown and ran the leg.
+        # The probe's own functions are taken from Wait-VenueQuiet.ps1 (its feed reader, the telemetry line) and its JSON round trip is reproduced; the gate parses what it prints.
+        quiet = QUIET.read_text(encoding="utf-8")
+        self.assertIn("$telHeat.mean_c = [math]::Round([double]$r.m.meanC, 2); $telHeat.mean_c_exact = [double]$r.m.meanC", quiet, "the probe's heat block moved: update this test")
+        lines = quiet.splitlines()
+
+        def fn(name: str) -> str:
+            i = next(k for k, l in enumerate(lines) if l.startswith(f"function {name}"))
+            out, depth = [], 0
+            for l in lines[i:]:
+                out.append(l)
+                depth += l.count("{") - l.count("}")
+                if depth == 0:
+                    break
+            return "\n".join(out)
+
+        funcs = "\n".join(fn(n) for n in ("ConvertTo-IdentToken", "ConvertFrom-TelFeedRows", "Format-TelNum", "Get-TelReasonSuffix", "Write-TelemetryLines"))
+        script = (
+            "$HeatWindowRows = 60; $telemetrySchemaV1 = 'mlv-app/venue-quiet-probe-telemetry/v1'; function Write-Gate([string]$s) { $s }\n" + funcs + "\n"
+            "function Get-Case([string]$mean) {\n"
+            "  $r = ConvertFrom-TelFeedRows @(1..60 | ForEach-Object { \"2026,a,b,$mean,10,No,No\" })\n"
+            "  $h = [ordered]@{ source = 'C:\\temp\\hwinfo-log-adapter.csv'; sample_age_s = 1.0; hottest_core_c = [double]$r.m.lastC; max15_c = [double]$r.m.max15C; mean_c = [math]::Round([double]$r.m.meanC, 2)\n"
+            "    mean_c_exact = [double]$r.m.meanC; throttled = [int]$r.m.throttled; window_rows = [int]$r.m.window; package_w = [double]$r.m.watts30; reasons = [ordered]@{} }\n"
+            "  $p = [ordered]@{ telemetry_schema = $telemetrySchemaV1; heat = $h; gpu = [ordered]@{ state = 'absent' }; last_lease = [ordered]@{ event = 'none' } } | ConvertTo-Json -Depth 6 | ConvertFrom-Json\n"
+            "  $out = @('  raw UNWRITABLE The process cannot access the file because it is being used by another process.') + @(Write-TelemetryLines $p)\n"
+            "  [pscustomobject]@{ heat = (ConvertFrom-VenueProbeHeatLine -Lines $out).heat; line = [string](@($out | Where-Object { $_ -match '^\\s*tele heat ' })[0]) }\n"
+            "}\n"
+            "@((Get-Case 'Infinity'), (Get-Case 'NaN'), (Get-Case '-Infinity'), (Get-Case '70.5'), (Get-Case '90'))")
+        got = ps_json(script)
+        self.assertEqual([g["heat"] for g in got], ["hot", "unknown", "unknown", "clear", "hot"], got)
+        self.assertRegex(got[0]["line"], r" mean=n/a throttled=0/60 W=10\.0 mean_exact=Infinity$", "the probe names the non-finite mean it holds")
+        self.assertTrue(got[1]["line"].endswith(" mean_exact=NaN") and got[2]["line"].endswith(" mean_exact=-Infinity"), got)
+        self.assertTrue(got[3]["line"].endswith(" mean=70.5C throttled=0/60 W=10.0 mean_exact=70.5"), "a finite mean prints as before: " + got[3]["line"])
+        # the line parser reads a signed +Infinity as the agent does (hot); NaN and -Infinity never decide alone
+        tele = "(ConvertFrom-VenueProbeHeatLine -Lines @('  tele heat source=x age=1.0s hottest=n/a max15=n/a mean=n/a throttled=0/60 W=10.0 mean_exact={0}')).heat"
+        self.assertEqual(ps_json("@(" + ", ".join("(" + tele.format(v) + ")" for v in ("+Infinity", "Infinity", "NaN", "-Infinity")) + ")"), ["hot", "hot", "unknown", "unknown"])
 
     def test_r5_sol_b2_a6_a_drive_relative_history_dir_resolves_against_the_powershell_location_not_the_process_directory(self) -> None:
         import os
@@ -771,6 +812,27 @@ class ThermalDeadlineAdmissionTests(unittest.TestCase):
         self.assertEqual(got, [False, True, False, True, True, True, True, False, False, False], got)
         runner = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
         self.assertIn("mayDispatchNow", runner, "the dispatch check is the budget function's, not a second copy of the rule")
+
+    def test_r6_a1_a_reprobe_quiet_wait_is_cut_to_the_cap_left_at_its_dispatch(self) -> None:
+        # adversary r5 A1 on 09f9f657 (cap 180, poll 30, -ProbeMaxWaitSec 600, a 100 s probe-script Test-Path): the re-probe's quiet-wait allowance was fixed at the loop top (150) and
+        # dispatched after the stall although 50 s of the cap were left. Scaled: cap 10, poll 1, a 4 s stall before every probe. The fake probe records the -MaxWaitSec it was given:
+        # the re-probe's is at most what was left of the cap at its dispatch (10 - 4 - the 1 s sleep), never what was left at the loop top (about 9).
+        self._mirror_with_bad_sidecar(runner_patches=(("if (-not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) {", "Start-Sleep -Seconds 4; if (-not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) {"),))
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "10", "-ThermalPollSec", "1", "-ProbeMaxWaitSec", "600", "-ThermalRequeueMax", "0", FAKE_HEAT="9,0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        waits = [int(l.rsplit("maxWait=", 1)[1]) for l in self.events_raw() if " QUIET " in l]
+        self.assertEqual(len(waits), 2, self.events_raw())
+        self.assertGreater(waits[0], 10, "the first probe is no re-probe: the cap does not bound it")
+        self.assertLessEqual(waits[1], 10 - 4, f"the re-probe's quiet wait outlives the cap: {waits}")
+        [b] = self.batches()
+        self.assertEqual((b["legs"][0]["status"], b["legs"][0]["heatAtLaunch"]), ("RAN", "clear"), b["legs"])
+        self.assertIn(f"maxWaitSec={waits[1]} ", [l for l in self.log().splitlines() if " QUIET leg=" in l][1], "the QUIET line names the wait the probe was given")
+
+    def test_r6_a2_a_stalled_probe_evidence_write_after_the_first_hot_reading_counts_against_the_cap(self) -> None:
+        # adversary r5 A2 on 09f9f657 (a UNC RunDir whose captured-output Set-Content stalls 200 s, cap 180, -ThermalRequeueMax 0): the first hot reading was stamped after that write,
+        # so the stall was left out of the wait (waitSec 0) and bought another sleep and probe. It is stamped when the child's result is observed, before any evidence write.
+        r, b = self._expired_wait_run(("Set-Content -LiteralPath $out -Value $captured", "Start-Sleep -Seconds 3; Set-Content -LiteralPath $out -Value $captured"), FAKE_HEAT="9")
+        self._assert_typed_skip_without_another_probe(r, b, marker=False)
 
 
 @requires_windows_pwsh

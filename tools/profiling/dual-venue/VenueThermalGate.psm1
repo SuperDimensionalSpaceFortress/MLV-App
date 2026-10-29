@@ -79,11 +79,14 @@ function ConvertFrom-VenueProbeHeatLine {
     if (-not $m.Success) { return $none }
     $mean = 0.0; $thr = 0; $win = 0
     # r3 A2: the display mean is rounded to 0.1 C (87.96 prints 88.0): a probe that also prints mean_exact=<R> gives the exact value, which is what the heat rule is applied to
-    $mx = [regex]::Match([string]$line, '\smean_exact=(-?[0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?|NaN|-?Infinity)(?:\s|$)')
+    # r6 (adversary r5 A3): the probe prints mean_exact=Infinity / -Infinity / NaN for a non-finite mean (Wait-VenueQuiet.ps1 Format-TelMeanExact); a signed +Infinity is read too.
+    # +Infinity is hot as on the raw-json path; NaN and -Infinity never decide alone (Get-VenueHeatVerdict)
+    $mx = [regex]::Match([string]$line, '\smean_exact=(-?[0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?|NaN|[-+]?Infinity)(?:\s|$)')
     $meanText = $(if ($mx.Success) { $mx.Groups[1].Value } elseif ($m.Groups[1].Success) { $m.Groups[1].Value } else { 'n/a' })
     $inf = [string][char]0x221E
     if ($meanText -ceq $inf -or $meanText -ceq "+$inf") { $mean = [double]::PositiveInfinity }
     elseif ($meanText -ceq "-$inf") { $mean = [double]::NegativeInfinity }
+    elseif ($meanText -ceq '+Infinity') { $mean = [double]::PositiveInfinity }
     elseif ($meanText -match '^-?[0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?$' -or $meanText -cin @('NaN', 'Infinity', '-Infinity')) {
         if (-not [double]::TryParse(($meanText -replace ',', '.'), [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)) { return $none }
     }

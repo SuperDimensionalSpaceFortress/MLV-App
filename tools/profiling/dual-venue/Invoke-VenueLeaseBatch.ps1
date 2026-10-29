@@ -981,16 +981,25 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     # BACHELOR-THERMAL-GATE-WAIT-1 r6 (merge with #704): a thermal re-probe is a probe launch too, so it passes the same guards and the same launch-time claim and lease check
     $asked = (Test-RunDirWrite (Join-Path $RunDir 'gate.log')) -and (Test-RunDirWrite (Join-Path $RunDir 'quiet') -Directory)
     if (-not ($asked -and (Test-RunDirWrite $out))) { return [pscustomobject]@{ verdict = 'WRITE_REFUSED'; code = 'none'; mean = $null; reason = 'WRITE_REFUSED'; foreignFloor = $false; heat = 'unknown'; heatText = 'no probe' } }
-    $lv = Get-ProbeLaunchVerdict $MaxWaitSec; if ($lv.verdict) { return $lv }; $qArgs[$qArgs.IndexOf('-MaxWaitSec') + 1] = [string]$lv.maxWait
+    $lv = Get-ProbeLaunchVerdict $MaxWaitSec; if ($lv.verdict) { return $lv }; $wait = [int]$lv.maxWait
     # adversary r4 pass 2 A2: during a thermal wait the deadline is checked HERE, the last statement before the process starts (the Test-Path and the write guards above can stall on a
     # share): an expired wait dispatches nothing and the caller skips on the reading it already has
-    if ($null -ne $ThermalState -and -not (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec (Get-ThermalElapsedSec $ThermalState -Ceiling) -SlowestReprobeSec $ThermalState.slowProbeSec -WantSleepSec $ThermalPollSec).mayDispatchNow) {
+    # r6 (adversary r5 A1): the quiet-wait allowance is made HERE too, from the same clock reading, after every check that can stall: min(-ProbeMaxWaitSec, the lease room left
+    # (Get-ProbeLaunchVerdict), the cap left). Fixed at the loop top, a stall in between dispatched a wait that outlived the cap.
+    if ($null -ne $ThermalState) {
+        $el = Get-ThermalElapsedSec $ThermalState -Ceiling
+        $wait = [int][Math]::Max(0, [Math]::Min($wait, $ThermalWaitCapSec - $el))
+    }
+    $qArgs[$qArgs.IndexOf('-MaxWaitSec') + 1] = [string]$wait
+    if ($null -ne $ThermalState -and -not (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec $el -SlowestReprobeSec $ThermalState.slowProbeSec -WantSleepSec $ThermalPollSec).mayDispatchNow) {
         return [pscustomobject]@{ expiredBeforeDispatch = $true }
     }
     # r5 pass 1 A2: the probe's output is CAPTURED, not redirected to the file: a `*>` file redirect opens (creates) the file after the admission above, and that open can stall on a share (a
     # UNC RunDir), buying a probe past the deadline. Nothing but the process start follows the admission; the file is written (still the probe's evidence) after it returns.
     $captured = @(& $pwshExe @qArgs *>&1 | ForEach-Object { [string]$_ })
-    $code = $LASTEXITCODE
+    # r6 (adversary r5 A2): the child's result is observed HERE: this is the instant of its reading, taken before the evidence write and the parse below (either can stall on a share,
+    # and that time is part of the thermal wait, never left out of it)
+    $code = $LASTEXITCODE; $endTs = [Diagnostics.Stopwatch]::GetTimestamp(); $endUtc = [DateTime]::UtcNow
     # r6 (merge with #704 r7): the write guard is asked again right before the probe's evidence write, as before every -RunDir write
     if (Test-RunDirWrite $out) { try { Set-Content -LiteralPath $out -Value $captured -Encoding utf8 } catch { L "QUIET_OUT_UNWRITABLE path=$out reason=$($_.Exception.Message -replace '\s+', ' ')" } }
     $lines = $captured
@@ -1010,7 +1019,8 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     if ($v -and $v -match '\bmean=([0-9.]+)%') { $mean = [double]$Matches[1] }
     # item 10: the probe's own reading of the agent's heavy-slot feed (its "tele heat" line): the reading the thermal gate polls
     $ht = ConvertFrom-VenueProbeHeatLine -Lines $lines
-    [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff; heat = $ht.heat; heatText = $ht.text }
+    [pscustomobject]@{ verdict = $verdict; code = $code; mean = $mean; reason = $reason; foreignFloor = [bool]$ff; foreignFloorLine = [string]$ff; heat = $ht.heat; heatText = $ht.text
+        endTs = $endTs; endUtc = $endUtc; maxWaitSec = $wait }
 }
 
 function Get-OpenDispatchRefusal([string]$NotAfterUtc) {
@@ -1490,10 +1500,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $probeWait = [int][Math]::Max(0, [Math]::Min($ProbeMaxWaitSec, $room - $legBudget))
                 # adversary r1b A1: a re-probe during a thermal wait may wait for quiet only for what is left of the thermal cap. Its fixed sample window and the remote
                 # job's own queue limits still run and are not bounded here: the cap is a soft budget (cap + one probe), see the Get-VenueThermalProbeBudget comment
+                # r6 (adversary r5 A1): that cut is made at the dispatch (Invoke-QuietProbe), after every check that can stall, never here at the loop top
                 $thw = $legThermal[$leg.name]
-                if ($ThermalWaitCapSec -gt 0 -and $null -ne $thw -and $null -ne $thw.firstHotUtc -and $thw.batch -eq $batchNo) {
-                    $probeWait = [int][Math]::Max(0, [Math]::Min($probeWait, $ThermalWaitCapSec - [Math]::Floor(((Get-VenueThermalNowUtc -FirstHotUtc $thw.firstHotUtc -FirstHotTimestamp $thw.firstHotTs) - $thw.firstHotUtc).TotalSeconds)))
-                }
                 $thermalActive = ($ThermalWaitCapSec -gt 0 -and $null -ne $thw -and $null -ne $thw.firstHotUtc -and $thw.batch -eq $batchNo)
                 # r4 (adversary r3 pass 2 A1, Dot c5946322): the deadline is checked against the monotonic clock IMMEDIATELY before the dispatch. $thw.reprobePending is set by the sites
                 # that log, then sleep, then come back here to re-probe (the poll sleep and the busy retry), so the elapsed time they spent counts: a stalled log append or a late
@@ -1509,13 +1517,15 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $qNew = Invoke-QuietProbe $leg.name "b$('{0:00}' -f $batchNo)-a$attempt" $probeWait $(if ($thermalActive) { $thw } else { $null })
                 if ($qNew.expiredBeforeDispatch) { $expiredBeforeProbe = $true; $probeSec = 0 } else {
                 $q = $qNew
-                # adversary r4 A2: the instant the probe returned is the instant of its reading: the first hot reading starts the cap HERE, not after the QUIET log line below
-                $probeEndTs = [Diagnostics.Stopwatch]::GetTimestamp(); $probeEndUtc = [DateTime]::UtcNow
                 $probeSec = [int][Math]::Ceiling([Math]::Max(0.0, ([Diagnostics.Stopwatch]::GetTimestamp() - $tProbeTs) / [double][Diagnostics.Stopwatch]::Frequency))   # adversary r2b A2: monotonic
                 if ($q.verdict -ceq 'WRITE_REFUSED' -or $script:RunOutputAliased) { Stop-BatchOnSuppression $b; break }   # r7: the probe's outputs were refused
                 if ($q.verdict -ceq 'CLAIM_LOST') { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "at the probe's launch for leg $($leg.name): $($q.reason)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=probe-launch $($q.reason)"; break }
                 # r9 (adversary r9 A2): the lease ended while the probe's guards ran: no probe, the leg goes to the next batch, and that is no budget the lease cannot hold ($launchShort)
                 if ($q.verdict -ceq 'LEASE_SHORT') { $launchShort = $true; $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "at the probe's launch for leg $($leg.name): $($q.reason): it goes to the next batch"; break }
+                # adversary r4 A2: the instant the probe returned is the instant of its reading: the first hot reading starts the cap there, not after the QUIET log line below.
+                # r6 (adversary r5 A2): and not after the probe's evidence write either: the instant is the one Invoke-QuietProbe took when it observed the child's result
+                $probeEndTs = $q.endTs; $probeEndUtc = $q.endUtc
+                if ($null -ne $q.maxWaitSec) { $probeWait = $q.maxWaitSec }   # the wait the probe was given (cut at its dispatch), for the QUIET line
                 if ($q.foreignFloor -and -not $legForeign.ContainsKey($leg.name)) { $legForeign[$leg.name] = $q.foreignFloorLine }
                 L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease exit=$($q.code) verdict=$($q.verdict) mean=$(Format-Mean $q.mean) maxWaitSec=$probeWait roomSec=$room$(if ($q.reason) { " reason=$($q.reason)" })$(if ($q.foreignFloor) { ' foreignFloor=1' })"
                 }
