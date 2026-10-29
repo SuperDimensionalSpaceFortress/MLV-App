@@ -2499,8 +2499,11 @@ function Start-AttrCudaHeapDumpWatch {
     and log stay in -DumpDir. Never throws: the record says why no watcher runs. Returns the record Stop-AttrCudaHeapDumpWatch completes.
     -DumpType is the MINIDUMP_TYPE: the default 0x1826 is full memory + handles + unloaded modules + memory info + thread info.
     r7 (CoS #432): every write this function makes goes through the job's slot-checked helpers (New-AttrCudaDirectory, Publish-AttrCudaText);
-    the watcher log is CREATED here through Publish-AttrCudaText, so the hidden watcher only appends to a slot already proven a plain file,
-    and its dump is opened CreateNew (an existing name, a link included, is refused, never written through).
+    the watcher log is CREATED here through Publish-AttrCudaText, and its dump is opened CreateNew (an existing name, a link included, is
+    refused, never written through).
+    r11 (adversary r10 A7): the hidden watcher opens that log ONCE, and writes every line through that one handle, only after proving on the
+    handle that it is the file published here (one link, no reparse point, holding exactly the request line); a slot swapped for a link to
+    another file is never written (exit 7). r11 (CI, splice scan R1/R3/R4): the body uses only the scan's allowlisted commands and members.
     #>
     param([Parameter(Mandatory = $true)][string]$ExePath, [Parameter(Mandatory = $true)][string]$DumpDir, [ValidateRange(10, 7200)][int]$MaxWaitSec = 900,
         [string]$CommandLineMatch = '--gui-smoke-playback', [ValidateRange(0, 0x3FFFFF)][int]$DumpType = 0x1826, [string]$PwshPath = '', [int]$OwnerPid = $PID)
@@ -2522,6 +2525,11 @@ function Start-AttrCudaHeapDumpWatch {
             [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
             [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
             [DllImport("dbghelp.dll", SetLastError = true)] static extern bool MiniDumpWriteDump(IntPtr process, uint pid, IntPtr file, uint type, IntPtr exceptionParam, IntPtr userStream, IntPtr callback);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file, out FileIdentity info);
+            [DllImport("shell32.dll", SetLastError = true)] static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string commandLine, out int count);
+            [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+            // BY_HANDLE_FILE_INFORMATION: thirteen DWORDs (each FILETIME is two)
+            [StructLayout(LayoutKind.Sequential)] struct FileIdentity { public uint Attributes, C0, C1, A0, A1, W0, W1, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow; }
             const uint DBG_CONTINUE = 0x00010002;
             const uint DBG_EXCEPTION_NOT_HANDLED = 0x80010001;
             // x64 DEBUG_EVENT: code @0, pid @4, tid @8, union @16. EXCEPTION_RECORD is 152 bytes, so dwFirstChance is @168.
@@ -2530,29 +2538,76 @@ function Start-AttrCudaHeapDumpWatch {
             const int FirstChanceOffset = 168;
             const int ContextBytes = 1232;
 
-            static void Log(string path, string message) {
-                try { File.AppendAllText(path, DateTime.UtcNow.ToString("o") + " " + message + Environment.NewLine); } catch (Exception) { }
+            // r11 (adversary r10 A7): the ONE handle every watcher log line is written through. OpenLog opens the slot Start published once and keeps it only
+            // when the handle itself is that file: a plain file with one link (no hard link to another file) holding exactly the request line Start wrote.
+            static FileStream sink;
+            public static int OpenLog(string path, string expected) {
+                FileStream stream = null;
+                try {
+                    stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read);
+                    FileIdentity id;
+                    if (!GetFileInformationByHandle(stream.SafeFileHandle, out id) || id.Links != 1 || (id.Attributes & 0x400u) != 0 || stream.Length > 65536) { stream.Dispose(); return 2; }
+                    byte[] bytes = new byte[(int)stream.Length];
+                    int read = 0;
+                    while (read < bytes.Length) { int n = stream.Read(bytes, read, bytes.Length - read); if (n <= 0) break; read += n; }
+                    string text = new System.Text.UTF8Encoding(false).GetString(bytes, 0, read).TrimStart('﻿').TrimEnd('\r', '\n');
+                    if (!string.Equals(text, expected, StringComparison.Ordinal)) { stream.Dispose(); return 3; }
+                    sink = stream;
+                    return 0;
+                } catch (Exception) { if (stream != null) stream.Dispose(); return 4; }
+            }
+
+            public static void Log(string message) {
+                FileStream stream = sink;
+                if (stream == null) return;
+                try {
+                    lock (stream) {
+                        byte[] line = new System.Text.UTF8Encoding(false).GetBytes(DateTime.UtcNow.ToString("o") + " " + message + Environment.NewLine);
+                        stream.Seek(0, SeekOrigin.End);
+                        stream.Write(line, 0, line.Length);
+                        stream.Flush(true);
+                    }
+                } catch (Exception) { }
+            }
+
+            // r11 (adversary r10 A5): --help is refused as Windows itself splits the command line (CommandLineToArgvW: --he"lp" and "--he"lp are --help), and
+            // also as a plain quoted/unquoted token; a line that cannot be split is refused.
+            public static bool HasHelpArg(string commandLine) {
+                if (string.IsNullOrEmpty(commandLine)) return false;
+                int count;
+                IntPtr argv = CommandLineToArgvW(commandLine, out count);
+                if (argv == IntPtr.Zero) return true;
+                try {
+                    for (int i = 1; i < count; i++) {
+                        if (string.Equals(Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, i * IntPtr.Size)), "--help", StringComparison.OrdinalIgnoreCase)) return true;
+                    }
+                } finally { LocalFree(argv); }
+                foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(commandLine, "\"[^\"]*\"|\\S+")) {
+                    if (string.Equals(m.Value.Trim('"'), "--help", StringComparison.OrdinalIgnoreCase)) return true;
+                }
+                return false;
             }
 
             // r10 (adversary r10 A5): expectedCreationFileTime is the creation time (FILETIME, UTC) of the process the watcher selected. The handle just opened must
-            // report the same creation time (within 2 s: the selection carries WMI's microsecond resolution), so a pid recycled since the selection is never debugged.
-            public static int Run(uint pid, string dumpPath, uint dumpType, string logPath, long expectedCreationFileTime) {
+            // report that creation time. r11 (adversary r10 A3): WMI truncates it to the microsecond, so the handle's time may be at most 9 ticks (100 ns each) later
+            // and never earlier; a pid recycled since the selection (created even 1 us apart) is never debugged.
+            public static int Run(uint pid, string dumpPath, uint dumpType, long expectedCreationFileTime) {
                 IntPtr process = OpenProcess(0x1F0FFF, false, pid);
-                if (process == IntPtr.Zero) { Log(logPath, "OPEN_PROCESS_FAILED err=" + Marshal.GetLastWin32Error()); return 2; }
+                if (process == IntPtr.Zero) { Log("OPEN_PROCESS_FAILED err=" + Marshal.GetLastWin32Error()); return 2; }
                 long created, exited, kernelTime, userTime;
-                if (!GetProcessTimes(process, out created, out exited, out kernelTime, out userTime) || Math.Abs(created - expectedCreationFileTime) > 20000000L) {
-                    Log(logPath, "TARGET_IDENTITY_MISMATCH pid=" + pid); CloseHandle(process); return 6;
+                if (!GetProcessTimes(process, out created, out exited, out kernelTime, out userTime) || created - expectedCreationFileTime < 0L || created - expectedCreationFileTime > 9L) {
+                    Log("TARGET_IDENTITY_MISMATCH pid=" + pid); CloseHandle(process); return 6;
                 }
-                if (!DebugActiveProcess(pid)) { Log(logPath, "ATTACH_FAILED err=" + Marshal.GetLastWin32Error()); CloseHandle(process); return 2; }
+                if (!DebugActiveProcess(pid)) { Log("ATTACH_FAILED err=" + Marshal.GetLastWin32Error()); CloseHandle(process); return 2; }
                 DebugSetProcessKillOnExit(false);
-                Log(logPath, "DEBUGGER_ATTACHED pid=" + pid);
+                Log("DEBUGGER_ATTACHED pid=" + pid);
                 IntPtr debugEvent = Marshal.AllocHGlobal(512);
                 int result = 1;
                 long firstChance = 0;
                 bool dumped = false;
                 try {
                     while (true) {
-                        if (!WaitForDebugEvent(debugEvent, 0xFFFFFFFF)) { Log(logPath, "WAIT_FAILED err=" + Marshal.GetLastWin32Error()); return 4; }
+                        if (!WaitForDebugEvent(debugEvent, 0xFFFFFFFF)) { Log("WAIT_FAILED err=" + Marshal.GetLastWin32Error()); return 4; }
                         uint code = (uint)Marshal.ReadInt32(debugEvent, 0);
                         uint eventPid = (uint)Marshal.ReadInt32(debugEvent, 4);
                         uint tid = (uint)Marshal.ReadInt32(debugEvent, 8);
@@ -2564,18 +2619,18 @@ function Start-AttrCudaHeapDumpWatch {
                             if (!breakpoint) { status = DBG_EXCEPTION_NOT_HANDLED; if (first) firstChance++; }
                             bool trigger = exception == 0xC0000374u || exception == 0xC0000409u || (!first && !breakpoint);
                             if (trigger) {
-                                Log(logPath, "EXCEPTION code=0x" + exception.ToString("X8") + " first=" + (first ? 1 : 0) + " tid=" + tid
+                                Log("EXCEPTION code=0x" + exception.ToString("X8") + " first=" + (first ? 1 : 0) + " tid=" + tid
                                     + " address=0x" + Marshal.ReadInt64(debugEvent, UnionOffset + 16).ToString("X"));
                                 if (!dumped) {
                                     dumped = true;
-                                    result = WriteDump(process, pid, tid, debugEvent, dumpPath, dumpType, logPath) ? 0 : 3;
+                                    result = WriteDump(process, pid, tid, debugEvent, dumpPath, dumpType) ? 0 : 3;
                                 }
                             }
                         } else if (code == 3 || code == 6) {
                             IntPtr file = Marshal.ReadIntPtr(debugEvent, UnionOffset);
                             if (file != IntPtr.Zero) CloseHandle(file);
                         } else if (code == 5) {
-                            Log(logPath, "EXIT_PROCESS exitCode=" + Marshal.ReadInt32(debugEvent, UnionOffset) + " firstChanceExceptions=" + firstChance);
+                            Log("EXIT_PROCESS exitCode=" + Marshal.ReadInt32(debugEvent, UnionOffset) + " firstChanceExceptions=" + firstChance);
                             ContinueDebugEvent(eventPid, tid, status);
                             return result;
                         }
@@ -2587,7 +2642,7 @@ function Start-AttrCudaHeapDumpWatch {
                 }
             }
 
-            static bool WriteDump(IntPtr process, uint pid, uint tid, IntPtr debugEvent, string dumpPath, uint dumpType, string logPath) {
+            static bool WriteDump(IntPtr process, uint pid, uint tid, IntPtr debugEvent, string dumpPath, uint dumpType) {
                 IntPtr record = Marshal.AllocHGlobal(ExceptionRecordBytes);
                 IntPtr contextRaw = Marshal.AllocHGlobal(ContextBytes + 16);
                 IntPtr pointers = Marshal.AllocHGlobal(16);
@@ -2611,11 +2666,11 @@ function Start-AttrCudaHeapDumpWatch {
                     using (FileStream stream = new FileStream(dumpPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None)) {
                         bool ok = MiniDumpWriteDump(process, pid, stream.SafeFileHandle.DangerousGetHandle(), dumpType, haveContext ? info : IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
                         int error = Marshal.GetLastWin32Error();
-                        Log(logPath, (ok ? "DUMP_WRITTEN" : "DUMP_FAILED err=" + error) + " path=" + dumpPath + " bytes=" + stream.Length + " context=" + (haveContext ? 1 : 0));
+                        Log((ok ? "DUMP_WRITTEN" : "DUMP_FAILED err=" + error) + " path=" + dumpPath + " bytes=" + stream.Length + " context=" + (haveContext ? 1 : 0));
                         return ok;
                     }
                 } catch (Exception e) {
-                    Log(logPath, "DUMP_FAILED " + e.GetType().Name + ": " + e.Message);
+                    Log("DUMP_FAILED " + e.GetType().Name + ": " + e.Message);
                     return false;
                 } finally {
                     if (thread != IntPtr.Zero) CloseHandle(thread);
@@ -2630,41 +2685,46 @@ function Start-AttrCudaHeapDumpWatch {
         # r9 (adversary r8 A2): the watcher takes only THIS run's instance: the same full executable path, created no earlier than this request
         # (a same-named MLVApp from another run, or one already running, is never attached).
         $notBeforeUtc = [DateTime]::UtcNow
+        $requestLine = $notBeforeUtc.ToString('o') + ' WATCH_REQUESTED'
         [void](New-AttrCudaDirectory -Path $DumpDir)
-        [void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value ($notBeforeUtc.ToString('o') + ' WATCH_REQUESTED'))
-        $quote = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
+        [void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine)
         $exeFull = [IO.Path]::GetFullPath($ExePath)
         $exeName = Split-Path -Leaf $exeFull
+        # r11 (CI, splice scan R3): each value enters the watcher script as a single-quoted literal, quoted inline (no script-block call)
         $watcher = @(
             '$ErrorActionPreference = ''Continue'''
-            ('$exeName = ' + (& $quote $exeName))
-            ('$exeFull = ' + (& $quote $exeFull))
-            ('$notBefore = [DateTime]::Parse(' + (& $quote $notBeforeUtc.ToString('o')) + ', $null, [Globalization.DateTimeStyles]::RoundtripKind)')
-            ('$dumpDir = ' + (& $quote $DumpDir))
-            ('$match = ' + (& $quote $CommandLineMatch))
+            ('$exeName = ''' + $exeName.Replace("'", "''") + '''')
+            ('$exeFull = ''' + $exeFull.Replace("'", "''") + '''')
+            ('$notBefore = [DateTime]::Parse(''' + $notBeforeUtc.ToString('o') + ''', $null, [Globalization.DateTimeStyles]::RoundtripKind)')
+            ('$dumpDir = ''' + $DumpDir.Replace("'", "''") + '''')
+            ('$match = ''' + $CommandLineMatch.Replace("'", "''") + '''')
+            ('$requestLine = ''' + $requestLine + '''')
             ('$dumpType = [uint32]' + $DumpType)
             ('$ownerPid = ' + $OwnerPid)
             ('$maxWaitSec = ' + $MaxWaitSec)
             # r9 pass 1 (A7): the acquisition bound is elapsed time, never the wall clock (a clock step cannot stretch or cut it)
             '$clock = [Diagnostics.Stopwatch]::StartNew()'
             '$log = Join-Path $dumpDir ''watcher.log'''
-            'function W([string]$m) { Add-Content -LiteralPath $log -Value ([DateTime]::UtcNow.ToString(''o'') + '' '' + $m) }'
-            # r10 (adversary r10 A6): the budget still left, in whole seconds and never below 1; every CIM query below is bounded by it, so a stalled query cannot outlive MaxWaitSec
-            'function Left { [int][Math]::Max(1, [Math]::Ceiling($maxWaitSec - $clock.Elapsed.TotalSeconds)) }'
-            # r10 (adversary r10 A1): --help is refused only as a whole argument of the command line: split into quoted and unquoted tokens, so text inside a quoted path never counts
-            'function HasHelpArg([string]$cl) { foreach ($m in [regex]::Matches($cl, ''"[^"]*"|\S+'')) { if ($m.Value.Trim(''"'') -ieq ''--help'') { return $true } }; return $false }'
-            # r9 pass 1 (A1): this run's instance descends from the process that asked for the watch (the job; the smoke runner it starts launches
-            # MLVApp). Each parent link must be created no later than its child, so a recycled parent pid never counts.
-            'function Owned($p) { $c = $p; for ($i = 0; $i -lt 8 -and $null -ne $c; $i++) { if ([int]$c.ParentProcessId -eq $ownerPid) { return $true }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$c.ParentProcessId) -OperationTimeoutSec (Left) -ErrorAction SilentlyContinue; if ($null -eq $n -or -not $n.CreationDate -or -not $c.CreationDate -or $n.CreationDate -gt $c.CreationDate) { return $false }; $c = $n }; return $false }'
-            'W (''WATCH exe='' + $exeFull + '' notBefore='' + $notBefore.ToString(''o'') + '' owner='' + $ownerPid + '' match='' + $match + '' pid='' + $PID)'
             '$source = @'''
             $debuggerSource
             '''@'
-            'try { Add-Type -TypeDefinition $source -Language CSharp } catch { W (''COMPILE_FAILED '' + $_.Exception.Message); exit 5 }'
+            # r11 (adversary r10 A7): nothing is written before the log handle is proven, so a compile failure (exit 5) or an unproven slot (exit 7) writes nothing; Stop reads the exit code
+            'try { Add-Type -TypeDefinition $source -Language CSharp } catch { exit 5 }'
+            'if ([MlvHeapDumpWatch.Debugger]::OpenLog($log, $requestLine) -ne 0) { exit 7 }'
+            'function W([string]$m) { [MlvHeapDumpWatch.Debugger]::Log($m) }'
+            # r11 (adversary r10 A4): the whole seconds still left; a CIM query runs only with at least one left and is bounded by them, so no query outlives MaxWaitSec
+            'function Left { [int][Math]::Floor($maxWaitSec - $clock.Elapsed.TotalSeconds) }'
+            # r11 (adversary r10 A5): --help as Windows splits the command line (CommandLineToArgvW), and as a whole quoted or unquoted token
+            'function HasHelpArg([string]$cl) { [MlvHeapDumpWatch.Debugger]::HasHelpArg($cl) }'
+            # r9 pass 1 (A1): this run's instance descends from the process that asked for the watch (the job; the smoke runner it starts launches
+            # MLVApp). Each parent link must be created no later than its child, so a recycled parent pid never counts. r11 (A4): no query past the budget.
+            'function Owned($p) { $c = $p; for ($i = 0; $i -lt 8 -and $null -ne $c; $i++) { if ([int]$c.ParentProcessId -eq $ownerPid) { return $true }; $budget = Left; if ($budget -lt 1) { return $false }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$c.ParentProcessId) -OperationTimeoutSec $budget -ErrorAction SilentlyContinue; if ($null -eq $n -or -not $n.CreationDate -or -not $c.CreationDate -or $n.CreationDate -gt $c.CreationDate) { return $false }; $c = $n }; return $false }'
+            'W (''WATCH exe='' + $exeFull + '' notBefore='' + $notBefore.ToString(''o'') + '' owner='' + $ownerPid + '' match='' + $match + '' pid='' + $PID)'
             '$target = $null'
-            'while ($null -eq $target -and $clock.Elapsed.TotalSeconds -lt $maxWaitSec) {'
+            'while ($null -eq $target) {'
+            '    $budget = Left; if ($budget -lt 1) { break }'
             # r9 pass 1 (A2): --help is excluded only as a whole argument, never as a substring of a directory or file name (r10: tokenised, see HasHelpArg)
-            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -OperationTimeoutSec (Left) -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and -not (HasHelpArg $_.CommandLine) -and $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $exeFull, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $notBefore -and (Owned $_) } | Sort-Object CreationDate) | Select-Object -First 1'
+            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -OperationTimeoutSec $budget -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and -not (HasHelpArg $_.CommandLine) -and $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $exeFull, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $notBefore -and (Owned $_) } | Sort-Object CreationDate) | Select-Object -First 1'
             '    if ($null -eq $target) { Start-Sleep -Milliseconds 200 }'
             '}'
             '# r10 (adversary r10 A6): a target that only turned up after the budget was spent is not attached'
@@ -2672,24 +2732,22 @@ function Start-AttrCudaHeapDumpWatch {
             'if ($null -eq $target) { W ''NO_TARGET the smoke instance never appeared''; exit 3 }'
             'W (''ATTACH pid='' + $target.ProcessId)'
             '$dumpPath = Join-Path $dumpDir ([IO.Path]::GetFileNameWithoutExtension($exeName) + ''_'' + $target.ProcessId + ''_'' + [DateTime]::UtcNow.ToString(''yyyyMMddTHHmmss'') + ''.dmp'')'
-            '$rc = [MlvHeapDumpWatch.Debugger]::Run([uint32]$target.ProcessId, $dumpPath, $dumpType, $log, [long]$target.CreationDate.ToUniversalTime().ToFileTimeUtc())'
+            '$rc = [MlvHeapDumpWatch.Debugger]::Run([uint32]$target.ProcessId, $dumpPath, $dumpType, [long]$target.CreationDate.ToUniversalTime().ToFileTimeUtc())'
             'W (''DEBUGGER_EXIT rc='' + $rc)'
             'exit $rc'
         ) -join "`n"
         $watcherPath = Publish-AttrCudaText -Path (Join-Path $DumpDir 'heap-dump-watcher.ps1') -Value $watcher
-        $info = New-Object System.Diagnostics.ProcessStartInfo
-        $info.FileName = $PwshPath
-        $info.Arguments = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$watcherPath`""
-        $info.UseShellExecute = $false
-        $info.CreateNoWindow = $true
-        $process = [System.Diagnostics.Process]::Start($info)
+        # r11 (CI, splice scan R1/R4): started with the allowlisted Start-Process; -PassThru hands back the process with its handle, which is read at once
+        # (while the watcher is certainly alive) so every later wait or kill goes through it.
+        $process = Start-Process -FilePath $PwshPath -ArgumentList @('-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $watcherPath + '"')) -WindowStyle Hidden -PassThru -ErrorAction Stop
+        $handle = $process.Handle
         $record.watcherPid = $process.Id
         $record.startedUtc = [DateTime]::UtcNow.ToString('o')
         # r9 (adversary r8 A3): the handle is KEPT, so Stop waits for and kills this process and never a pid that was recycled since.
         # Stop removes it before the record is written out.
         $record.watcherProcess = $process
     } catch {
-        $record.reason = "WATCHER_START_FAILED $($_.Exception.GetType().Name)"
+        $record.reason = "WATCHER_START_FAILED $($_.CategoryInfo.Reason)"
     }
     return $record
 }
@@ -2710,8 +2768,9 @@ function Stop-AttrCudaHeapDumpWatch {
       STOP_FAILED        anything else: the watcher could not start, compile or attach, a trigger exception left no dump, the app's exit
                          was never seen, or this function itself failed.
     Only the first two are a verified capture: the runner fails any other leg HEAPDUMP_CAPTURE_FAILED (never a silent PASS).
+    r11 (adversary r10 A9): -Record is the dictionary Start returns; anything else is refused at binding, never half-processed.
     #>
-    param([Parameter(Mandatory = $true)]$Record, [ValidateRange(0, 1800)][int]$WaitSec = 300)
+    param([Parameter(Mandatory = $true)][System.Collections.IDictionary]$Record, [ValidateRange(0, 1800)][int]$WaitSec = 300)
     $killed = $false
     # r9 (adversary r8 A3, A13): the watcher is reached only through the handle Start kept, never re-acquired by a pid that may have been
     # recycled; and the finally below kills it if it is still running however this function leaves, so no throw skips the cleanup.
@@ -2734,29 +2793,41 @@ function Stop-AttrCudaHeapDumpWatch {
                 $Record['reason'] = $(if ($attached) { "WATCHER_KILLED still running $WaitSec s after the smoke run returned" } else { 'WATCHER_NO_TARGET the smoke instance never appeared before the run returned' })
             }
         }
+        # r11 (adversary r10 A7): a watcher that could not compile (5) or whose log slot was not the file Start published (7) wrote nothing
+        $exitCode = $null
+        if ($watcher -is [System.Diagnostics.Process] -and $Record['watcherExited'] -eq $true) { $exitCode = $watcher.ExitCode }
         $log = @()
         if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
             if (Test-Path -LiteralPath $logPath) { $log = @(Get-Content -LiteralPath $logPath); $Record['watcherLog'] = @($log | Select-Object -Last 20) }
             $Record['dumps'] = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.dmp' -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ name = $_.Name; bytes = $_.Length } })
         }
         # r9 pass 1 (A3): an event counts only as the token right after a line's timestamp, never as text inside another line (the WATCH line
-        # carries the exe path, which may contain any token)
-        $has = { param($token) $anchored = '^\S+ ' + [regex]::Escape($token.TrimStart()); @($log | Where-Object { $_ -cmatch $anchored }).Count -gt 0 }
+        # carries the exe path, which may contain any token). r11 (CI, splice scan R3): read once into the list of events, no script-block call.
+        $events = @($log | ForEach-Object { if ($_ -cmatch '^\S+ ([A-Z_]+)(?: |$)') { $Matches[1] } })
+        # r11 (adversary r10 A2): DUMPED is the dump the DUMP_WRITTEN line names, by file name and byte count, never any other *.dmp in the directory
+        $written = @($log | ForEach-Object { if ($_ -cmatch '^\S+ DUMP_WRITTEN path=(.+) bytes=(\d+) context=[01]$') { [ordered]@{ name = (Split-Path -Leaf $Matches[1]); bytes = [long]$Matches[2] } } })
+        $boundDump = @($Record['dumps'] | Where-Object { $d = $_; $d['bytes'] -gt 0 -and @($written | Where-Object { $_['name'] -ieq $d['name'] -and $_['bytes'] -eq $d['bytes'] }).Count -gt 0 })
         $Record['captureState'] = $(
             if ($null -eq $Record['watcherPid'] -or $watcher -isnot [System.Diagnostics.Process]) { 'STOP_FAILED' }
-            elseif ((& $has ' DUMP_WRITTEN ') -and @($Record['dumps'] | Where-Object { $_['bytes'] -gt 0 }).Count -gt 0) { 'DUMPED' }
+            elseif ($boundDump.Count -gt 0) { 'DUMPED' }
             elseif ($killed) { 'KILLED' }
-            elseif ((& $has ' NO_TARGET ') -or -not (& $has ' ATTACH pid=')) { $(if (& $has ' COMPILE_FAILED ') { 'STOP_FAILED' } else { 'NO_TARGET' }) }
-            elseif ((& $has ' DEBUGGER_ATTACHED pid=') -and (& $has ' EXIT_PROCESS ') -and -not (& $has ' EXCEPTION code=') -and $Record['watcherExited'] -eq $true) { 'ATTACHED_NO_CRASH' }
+            elseif ($exitCode -eq 5 -or $exitCode -eq 7) { 'STOP_FAILED' }
+            elseif (($events -ccontains 'NO_TARGET') -or -not ($events -ccontains 'ATTACH')) { 'NO_TARGET' }
+            elseif (($events -ccontains 'DEBUGGER_ATTACHED') -and ($events -ccontains 'EXIT_PROCESS') -and -not ($events -ccontains 'EXCEPTION') -and $Record['watcherExited'] -eq $true) { 'ATTACHED_NO_CRASH' }
             else { 'STOP_FAILED' })
         if ($Record['captureState'] -ceq 'STOP_FAILED' -and [string]::IsNullOrEmpty([string]$Record['reason'])) {
-            $Record['reason'] = 'WATCHER_CAPTURE_UNVERIFIED ' + $(if (& $has ' EXCEPTION code=') { 'a trigger exception left no dump' } elseif (-not (& $has ' DEBUGGER_ATTACHED pid=')) { 'the debugger never attached' } else { 'the app exit was never seen' })
+            $Record['reason'] = $(if ($exitCode -eq 5) { 'WATCHER_COMPILE_FAILED the debugger did not compile' }
+                elseif ($exitCode -eq 7) { 'WATCHER_LOG_UNPROVEN the watcher log slot was not the file Start published; nothing was written through it' }
+                elseif ($events -ccontains 'DUMP_WRITTEN') { 'WATCHER_CAPTURE_UNVERIFIED the dump the log names is not in the dump directory at its logged size' }
+                elseif ($events -ccontains 'EXCEPTION') { 'WATCHER_CAPTURE_UNVERIFIED a trigger exception left no dump' }
+                elseif (-not ($events -ccontains 'DEBUGGER_ATTACHED')) { 'WATCHER_CAPTURE_UNVERIFIED the debugger never attached' }
+                else { 'WATCHER_CAPTURE_UNVERIFIED the app exit was never seen' })
         }
         if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
             [void](Publish-AttrCudaText -Path (Join-Path $dir 'heap-dump.json') -Value ($Record | ConvertTo-Json -Depth 4))
         }
     } catch {
-        $Record['reason'] = "WATCHER_STOP_FAILED $($_.Exception.GetType().Name)"
+        $Record['reason'] = "WATCHER_STOP_FAILED $($_.CategoryInfo.Reason)"
         $Record['captureState'] = 'STOP_FAILED'
     } finally {
         if ($watcher -is [System.Diagnostics.Process]) {
