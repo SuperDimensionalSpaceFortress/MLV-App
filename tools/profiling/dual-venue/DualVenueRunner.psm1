@@ -1288,9 +1288,11 @@ function Get-DvWorkerThreadsEvidence {
     the app's own `playback_smoke.start` line for the MEASURED session (worker_threads=, Get-DvSmokeSessionLineFields) and from the job's summary.json proof
     fields: playbackMaxThreadsRequested (the cap the job was generated for), playbackMaxThreadsSmoke (the smoke runner's result.json playbackMaxThreads) and
     playbackWorkerThreadsRead (the job's own worker_threads= read). FAIL CLOSED: `blocks` is true when the leg asked for n and the run log's count is absent,
-    unparsable or not n, when there is no summary, when a SUCCESS summary (result *_CAPTURED) lacks a proof field, or when any proof field a summary states
-    is not n. A failure terminal's summary carries no proof fields (only the success summary gains them), so it is judged on the run log. A leg that does
-    not ask never blocks. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the hashed run log and summary.json.
+    unparsable or not n, when there is no summary, when a summary lacks a proof field and its result is not one of the runner's own product-failure
+    terminals ($script:FailureTerminals, compared exactly), or when any proof field a summary states is not n. Only such a terminal's summary may omit
+    the proof (only the success summary gains it), and it is then judged on the run log; a summary with no result or any other result must carry it
+    (adversary r1 A1). A leg that does not ask never blocks. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the
+    hashed run log and summary.json.
     #>
     param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText, [AllowNull()]$Summary)
     $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'playbackMaxThreads'
@@ -1302,7 +1304,8 @@ function Get-DvWorkerThreadsEvidence {
         $verdict = 'NOT_HONOURED'
         $f = Get-DvSmokeSessionLineFields -LogText $LogText -Marker 'start'
         $observed = ConvertTo-DvInt64 $f['worker_threads']
-        $captured = ([string](Get-DvProp $Summary 'result')) -cmatch '_CAPTURED$'
+        $resultToken = Get-DvProp $Summary 'result'
+        $mayOmit = ($resultToken -is [string]) -and ($resultToken -cin $script:FailureTerminals)
         $problems = [System.Collections.Generic.List[string]]::new()
         if ($null -eq $requested -or $requested -lt 1 -or $requested -gt 16) { $problems.Add("the spec's playbackMaxThreads '$raw' is not an integer from 1 to 16") }
         elseif ($f.Count -eq 0) { $problems.Add('the worker count is unreadable: the run log has no playback_smoke.start line for the measured session') }
@@ -1313,7 +1316,7 @@ function Get-DvWorkerThreadsEvidence {
             foreach ($name in @('playbackMaxThreadsRequested', 'playbackMaxThreadsSmoke', 'playbackWorkerThreadsRead')) {
                 $has = ($Summary -is [System.Collections.IDictionary] -and $Summary.Contains($name)) -or ($Summary -isnot [System.Collections.IDictionary] -and $null -ne $Summary.PSObject.Properties[$name])
                 $value = Get-DvProp $Summary $name
-                if (-not $has -and -not $captured) { continue }
+                if (-not $has -and $mayOmit) { continue }
                 if ($null -eq $value) { $problems.Add("the worker count is unreadable: summary.json $name is $(if ($has) { 'null' } else { 'absent' })"); continue }
                 $parsed = ConvertTo-DvInt64 $value
                 if ($null -eq $parsed -or $parsed -ne $requested) { $problems.Add("summary.json $name is '$value', not $requested") }

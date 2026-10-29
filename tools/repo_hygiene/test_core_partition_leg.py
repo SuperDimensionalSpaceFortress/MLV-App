@@ -3373,6 +3373,22 @@ class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
         self.assertTrue(self.verdict(self.CAPPED, self.log(self.start("16")), terminal)["blocks"])
         self.assertTrue(self.verdict(self.CAPPED, self.log(self.start("12")), dict(terminal, playbackWorkerThreadsRead=16))["blocks"], "a field it does state must agree")
 
+    def test_only_a_recognised_failure_terminal_may_omit_the_proof(self) -> None:
+        # adversary r1 A1 (2166f68a): a summary with no result, or a result that is not exactly a capture or a known failure terminal, skipped the proof
+        # checks and PASSed on the run log alone. Only the runner's own $script:FailureTerminals may omit the proof fields.
+        log = self.log(self.start("12"))
+        for name, summary in (("no result", {"backend": "cuda", "gpuFramesTotal": 600, "cpuFrames": 0}),
+                              ("lower-case capture", {"result": "measurement_captured"}),
+                              ("unknown token", {"result": "SOMETHING_ELSE"}),
+                              ("non-string result", {"result": 7}),
+                              ("lower-case terminal", {"result": "cpu_fallback_detected"})):
+            with self.subTest(case=name):
+                v = self.verdict(self.CAPPED, log, summary)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        for terminal in ("GPU_RECON_FRAMES_ZERO", "CPU_FALLBACK_DETECTED", "CPU_BACKEND_PATH_MISMATCH", "PRESENTMON_UNAVAILABLE"):
+            with self.subTest(terminal=terminal):
+                self.assertEqual(self.verdict(self.CAPPED, log, {"result": terminal})["verdict"], "HONOURED")
+
     def test_a_leg_that_does_not_ask_never_blocks(self) -> None:
         for spec in ({}, {"generatorArgs": {"unpaced": True}}):
             v = self.verdict(spec, self.log(self.start("16")), {"result": "MEASUREMENT_CAPTURED"})
