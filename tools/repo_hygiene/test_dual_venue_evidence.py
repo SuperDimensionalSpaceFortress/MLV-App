@@ -8670,22 +8670,32 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
                 f"$ErrorActionPreference = 'Stop'\n$text = Get-Content -LiteralPath '{ATTR_MODULE}' -Raw\n"
                 "$m = [regex]::Match($text, '(?s)\\$debuggerSource = @''\\r?\\n(.*?)\\r?\\n''@')\n"
                 "Add-Type -TypeDefinition $m.Groups[1].Value -Language CSharp\n"
-                f"$wrong = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 20' -WindowStyle Hidden -PassThru\n"
-                f"$wrongLog = '{d}\\wrong.log'; $rcWrong = [MlvHeapDumpWatch.Debugger]::Run([uint32]$wrong.Id, '{d}\\wrong.dmp', 0, $wrongLog, $wrong.StartTime.ToUniversalTime().ToFileTimeUtc() + 600000000)\n"
+                f"$log = '{d}\\watcher.log'; [IO.File]::WriteAllText($log, \"REQ WATCH_REQUESTED`n\")\n"
+                "Write-Output ('OPEN=' + [MlvHeapDumpWatch.Debugger]::OpenLog($log, 'REQ WATCH_REQUESTED'))\n"
+                f"$wrong = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 12' -WindowStyle Hidden -PassThru\n"
+                "$created = $wrong.StartTime.ToUniversalTime().ToFileTimeUtc()\n"
+                # r10: 60 s off; r11 (adversary r10 A3): a pid recycled ONE SECOND later, and a creation time 1 us (10 ticks) after or before the selected one
+                "foreach ($off in @(600000000, 10000000, -10, 10)) {\n"
+                f"    $rc = [MlvHeapDumpWatch.Debugger]::Run([uint32]$wrong.Id, '{d}\\wrong.dmp', 0, $created - $off)\n"
+                "    Write-Output ('WRONG_RC_' + $off + '=' + $rc)\n"
+                "}\n"
                 "$stillAlive = -not $wrong.HasExited; try { $wrong.Kill() } catch { }\n"
                 f"$right = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 3' -WindowStyle Hidden -PassThru\n"
-                f"$rightLog = '{d}\\right.log'; $rcRight = [MlvHeapDumpWatch.Debugger]::Run([uint32]$right.Id, '{d}\\right.dmp', 0, $rightLog, $right.StartTime.ToUniversalTime().ToFileTimeUtc())\n"
-                "Write-Output ('WRONG_RC=' + $rcWrong); Write-Output ('WRONG_ALIVE=' + $stillAlive)\n"
-                "Write-Output ('WRONG_LOG=' + ((Get-Content -LiteralPath $wrongLog) -join ' | '))\n"
-                "Write-Output ('RIGHT_LOG=' + ((Get-Content -LiteralPath $rightLog) -join ' | '))\n", encoding="ascii")
+                # the watcher selects by WMI's CreationDate, truncated to the microsecond: that value must still be the right process
+                "$wmi = (Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $right.Id)).CreationDate.ToUniversalTime().ToFileTimeUtc()\n"
+                f"$rcRight = [MlvHeapDumpWatch.Debugger]::Run([uint32]$right.Id, '{d}\\right.dmp', 0, $wmi)\n"
+                "Write-Output ('WRONG_ALIVE=' + $stillAlive); Write-Output ('WRONG=' + $wrong.Id); Write-Output ('RIGHT=' + $right.Id)\n"
+                "Write-Output ('LOG=' + ((Get-Content -LiteralPath $log) -join ' | '))\n", encoding="ascii")
             proc = run_pwsh(["-File", str(script)], timeout=240)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
-            self.assertEqual(out["WRONG_RC"], "6", proc.stdout)
+            self.assertEqual(out["OPEN"], "0", proc.stdout)
+            for off in ("600000000", "10000000", "-10", "10"):
+                self.assertEqual(out["WRONG_RC_" + off], "6", proc.stdout)
             self.assertEqual(out["WRONG_ALIVE"], "True", proc.stdout)
-            self.assertIn("TARGET_IDENTITY_MISMATCH", out["WRONG_LOG"], proc.stdout)
-            self.assertNotIn("DEBUGGER_ATTACHED", out["WRONG_LOG"], proc.stdout)
-            self.assertIn("DEBUGGER_ATTACHED", out["RIGHT_LOG"], proc.stdout)
+            self.assertIn(f"TARGET_IDENTITY_MISMATCH pid={out['WRONG']}", out["LOG"], proc.stdout)
+            self.assertNotIn(f"DEBUGGER_ATTACHED pid={out['WRONG']}", out["LOG"], proc.stdout)
+            self.assertIn(f"DEBUGGER_ATTACHED pid={out['RIGHT']}", out["LOG"], proc.stdout)
 
     # r10 adversary pass 1 A6: the acquisition bound holds against a stalled query, so every CIM query in the watcher carries the budget left and a
     # target found after the budget is spent is dropped. (A stalled local CIM cannot be produced on demand; this pins the shape that bounds it.)
@@ -8701,9 +8711,29 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
         queries = [l for l in watcher.splitlines() if "Get-CimInstance" in l]
         self.assertEqual(len(queries), 2, queries)
         for line in queries:
-            self.assertIn("-OperationTimeoutSec (Left)", line)
+            self.assertIn("-OperationTimeoutSec $budget", line)
         self.assertIn("function Left {", watcher)
         self.assertIn("if ($null -ne $target -and $clock.Elapsed.TotalSeconds -gt $maxWaitSec) { $target = $null }", watcher)
+
+    # r11 (adversary r10 A4): the adversary's input, in memory -- MaxWaitSec 10, a candidate reaching Owned at 9.5 s with eight ancestor links that never
+    # reach the owner, each parent query taking 0.9 s. The watcher's own Left and Owned (read from the script Start writes) must not run past 10 s.
+    def test_r11_a4_ancestor_queries_never_run_past_the_acquisition_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-deadline-") as d:
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 10\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+                f"$defs = @(Get-Content -LiteralPath '{d}\\hd\\heap-dump-watcher.ps1' | Where-Object {{ $_ -match '^function (Left|Owned)\\b' }})\n"
+                "$script:t = 9.5; $script:q = 0; $maxWaitSec = 10; $ownerPid = 1\n"
+                "$clock = [pscustomobject]@{}; $clock | Add-Member -MemberType ScriptProperty -Name Elapsed -Value { [TimeSpan]::FromSeconds($script:t) }\n"
+                "function Get-CimInstance { param([Parameter(Position = 0)]$ClassName, $Filter, $OperationTimeoutSec, $ErrorAction)\n"
+                "    $script:t += 0.9; $script:q++; [pscustomobject]@{ ParentProcessId = 100 + $script:q; CreationDate = ([datetime]'2026-01-01').AddSeconds(-$script:q) } }\n"
+                "foreach ($def in $defs) { . ([scriptblock]::Create($def)) }\n"
+                "$owned = Owned ([pscustomobject]@{ ParentProcessId = 100; CreationDate = [datetime]'2026-01-01' })\n"
+                "Write-Output ('DEFS=' + $defs.Count); Write-Output ('OWNED=' + $owned); Write-Output ('QUERIES=' + $script:q); Write-Output ('ELAPSED=' + $script:t)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["DEFS"], out["OWNED"]), ("2", "False"), proc.stdout)
+            self.assertLessEqual(float(out["ELAPSED"]), 10.0, proc.stdout)
 
     # r9 adversary pass 1 A3: an event token inside the WATCH line's exe path is never read as that event.
     def test_heap_dump_stop_never_reads_an_event_token_inside_the_exe_path(self) -> None:
@@ -8736,14 +8766,15 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
             self.assertEqual((out["EDITOR_ALIVE"], out["WATCHER_ALIVE"], out["CAPTURE"]), ("True", "False", "NO_TARGET"), proc.stdout)
 
-    # r9 (adversary r8 A13): Stop never leaves the watcher running, even when reading its log throws.
+    # r9 (adversary r8 A13): Stop never leaves the watcher running, even when a step inside it throws. r11: the running watcher now holds its log open
+    # (adversary r10 A7), so the throw is forced on the record Stop publishes instead: heap-dump.json held open with no sharing.
     def test_heap_dump_stop_kills_the_watcher_even_when_its_log_cannot_be_read(self) -> None:
         with tempfile.TemporaryDirectory(prefix="heap-lock-") as d:
             proc = self.run_module(
                 f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 600\n"
                 "$watcherPid = $r.watcherPid\n"
                 "Start-Sleep -Seconds 2\n"
-                f"$lock = [IO.File]::Open('{d}\\hd\\watcher.log', 'Open', 'ReadWrite', 'None')\n"
+                f"[IO.File]::WriteAllText('{d}\\hd\\heap-dump.json', 'x'); $lock = [IO.File]::Open('{d}\\hd\\heap-dump.json', 'Open', 'ReadWrite', 'None')\n"
                 "try { $r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5 } finally { $lock.Dispose() }\n"
                 "Start-Sleep -Milliseconds 500\n"
                 "Write-Output ('WATCHER_ALIVE=' + [bool](Get-Process -Id $watcherPid -ErrorAction SilentlyContinue)); Write-Output ('CAPTURE=' + $r.captureState)\n"
@@ -8756,22 +8787,87 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
 
     def test_heap_dump_watch_writes_only_through_the_publish_helpers(self) -> None:
         """r7 (CoS #432): Start-/Stop-AttrCudaHeapDumpWatch write nothing raw; the directory, the watcher log, the watcher script and
-        heap-dump.json go through New-AttrCudaDirectory / Publish-AttrCudaText. The hidden watcher's own appends (Add-Content in its W function,
-        the C# Log) go to the log slot Start created through Publish-AttrCudaText, and its dump is opened CreateNew."""
+        heap-dump.json go through New-AttrCudaDirectory / Publish-AttrCudaText. r11 (adversary r10 A7): the hidden watcher writes every log line
+        through ONE handle (OpenLog, proven on the handle to be the slot Start published), never by reopening the name, and its dump is opened CreateNew."""
         module = ATTR_MODULE.read_text(encoding="utf-8")
         bodies = {fn: re.search(r"(?ms)^function " + fn + r" \{.*?^\}", module).group(0) for fn in ("Start-AttrCudaHeapDumpWatch", "Stop-AttrCudaHeapDumpWatch")}
         for fn, body in bodies.items():
-            for raw in ("[IO.File]::WriteAllText", "[IO.File]::WriteAllBytes", "Set-Content", "Out-File", "Copy-Item", "Move-Item", "New-Item"):
+            for raw in ("[IO.File]::WriteAllText", "[IO.File]::WriteAllBytes", "Set-Content", "Out-File", "Copy-Item", "Move-Item", "New-Item",
+                        "Add-Content", "AppendAllText", "AppendText"):
                 self.assertNotIn(raw, body, f"{fn} writes raw with {raw}")
         start, stop = bodies["Start-AttrCudaHeapDumpWatch"], bodies["Stop-AttrCudaHeapDumpWatch"]
         self.assertIn("[void](New-AttrCudaDirectory -Path $DumpDir)", start)
-        self.assertIn("[void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log')", start)
+        self.assertIn("[void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine)", start)
         self.assertIn("$watcherPath = Publish-AttrCudaText -Path (Join-Path $DumpDir 'heap-dump-watcher.ps1') -Value $watcher", start)
-        self.assertEqual(start.count("Add-Content"), 1, "only the hidden watcher's W function appends")
+        self.assertIn("'if ([MlvHeapDumpWatch.Debugger]::OpenLog($log, $requestLine) -ne 0) { exit 7 }'", start)
+        self.assertIn("'function W([string]$m) { [MlvHeapDumpWatch.Debugger]::Log($m) }'", start)
         self.assertIn("FileMode.CreateNew", start)
         self.assertIn("[void](Publish-AttrCudaText -Path (Join-Path $dir 'heap-dump.json')", stop)
         for state in ("ATTACHED_NO_CRASH", "DUMPED", "NO_TARGET", "KILLED", "STOP_FAILED"):
             self.assertIn(f"'{state}'", stop, f"captureState {state} is not produced")
+
+    # r11 (adversary r10 A7): the published log slot is swapped, before the watcher's first write, for a hard link to an unrelated file on the same
+    # volume. The watcher never writes through it (exit 7, typed STOP_FAILED), and the unrelated file is untouched.
+    def test_r11_a7_the_watcher_never_writes_through_a_log_slot_swapped_for_a_link(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-link-") as d:
+            proc = self.run_module(
+                f"$unrelated = '{d}\\unrelated.txt'; [IO.File]::WriteAllText($unrelated, 'UNRELATED')\n"
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 20\n"
+                f"Move-Item -LiteralPath '{d}\\hd\\watcher.log' -Destination '{d}\\hd\\watcher.log.moved'\n"
+                f"[void](New-Item -ItemType HardLink -Path '{d}\\hd\\watcher.log' -Target $unrelated)\n"
+                "$deadline = (Get-Date).AddSeconds(60); while ((Get-Date) -lt $deadline -and -not $r.watcherProcess.HasExited) { Start-Sleep -Milliseconds 250 }\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+                "Write-Output ('UNRELATED=' + [IO.File]::ReadAllText($unrelated)); Write-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual(out["UNRELATED"], "UNRELATED", proc.stdout)
+            self.assertEqual(out["CAPTURE"], "STOP_FAILED", proc.stdout)
+            self.assertTrue(out["REASON"].startswith("WATCHER_LOG_UNPROVEN"), proc.stdout)
+
+    # r11 (adversary r10 A5): Windows splits --he"lp" into --help (CommandLineToArgvW), so an instance with that argument is a help probe, never the target
+    def test_r11_a5_an_instance_whose_argument_windows_reads_as_help_is_never_attached(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-helpquote-") as d:
+            target = Path(d) / "heap-helpquote-target.ps1"
+            target.write_text("Start-Sleep -Seconds 6\nexit 0\n", encoding="ascii")
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{target}','--he\"lp\"' -WindowStyle Hidden -PassThru\n"
+                "[void]$t.WaitForExit(90000)\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 30\n"
+                "Write-Output ('CAPTURE=' + $r.captureState); $r.watcherLog | ForEach-Object { Write-Output ('LOG=' + $_) }")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(any(" ATTACH pid=" in l for l in proc.stdout.splitlines() if l.startswith("LOG=")), proc.stdout)
+            self.assertIn("CAPTURE=NO_TARGET", proc.stdout.splitlines(), proc.stdout)
+
+    # r11 (adversary r10 A2, Stop sibling): DUMPED is the dump the DUMP_WRITTEN line names, at its logged size; another *.dmp in the directory is not it
+    def test_r11_a2_stop_types_dumped_only_for_the_dump_the_log_names(self) -> None:
+        ps51 = self._ps51()
+        for present, want in (("unrelated.dmp", "STOP_FAILED"), ("expected.dmp", "DUMPED")):
+            with self.subTest(present=present), tempfile.TemporaryDirectory(prefix="heap-bind-") as d:
+                hd = Path(d) / "hd"
+                hd.mkdir()
+                (hd / "watcher.log").write_text("\n".join([
+                    "2026-10-29T00:00:00Z WATCH_REQUESTED", "2026-10-29T00:00:01Z ATTACH pid=7", "2026-10-29T00:00:01Z DEBUGGER_ATTACHED pid=7",
+                    "2026-10-29T00:00:02Z EXCEPTION code=0xC0000374 first=1 tid=8 address=0x1",
+                    f"2026-10-29T00:00:03Z DUMP_WRITTEN path={hd}\\expected.dmp bytes=4096 context=1",
+                    "2026-10-29T00:00:04Z EXIT_PROCESS exitCode=-1073740940 firstChanceExceptions=1"]) + "\n", encoding="utf-8")
+                (hd / present).write_bytes(b"MDMP" + b"\x00" * 4092)
+                proc = self.run_module(
+                    f"$p = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-Command','exit 0' -WindowStyle Hidden -PassThru; [void]$p.WaitForExit(60000)\n"
+                    f"$r = [ordered]@{{ schema = 'mlv-app/heap-corruption-dump/v1'; requested = $true; dumpDir = '{hd}'; watcherPid = $p.Id; reason = $null; watcherExited = $null; captureState = $null; watcherLog = @(); dumps = @(); watcherProcess = $p }}\n"
+                    "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+                    "Write-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason)")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(f"CAPTURE={want}", proc.stdout.splitlines(), proc.stdout)
+
+    # r11 (adversary r10 A9, advisory): a Record that is not the dictionary Start returns is refused at binding, never half-processed
+    def test_r11_a9_stop_refuses_a_record_that_is_not_a_dictionary_at_binding(self) -> None:
+        proc = self.run_module(
+            "foreach ($bad in @(42, [pscustomobject]@{})) { try { [void](Stop-AttrCudaHeapDumpWatch -Record $bad -WaitSec 0); Write-Output 'BOUND=yes' }\n"
+            "    catch { Write-Output ('BOUND=' + $_.FullyQualifiedErrorId.Split(',')[0]) } }")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("BOUND=")], ["BOUND=ParameterArgumentTransformationError"] * 2, proc.stdout)
 
 
 @requires_windows_pwsh
@@ -8791,15 +8887,30 @@ class HeapDumpRunnerReceiptTests(RunnerHarness, unittest.TestCase):
         self.spec.write_text(json.dumps(spec), encoding="utf-8")
         self.write_artifacts()
 
-    def publish(self, record: dict | None, dump: bytes | None = None) -> None:
+    DUMP_NAME = "MLVApp_1_20261015T000000.dmp"
+
+    def watcher_log(self, state: str | None, dump: bytes | None = None, name: str | None = None) -> str:
+        """r11 (adversary r10 A1): the watcher log a real capture of `state` leaves (the runner verifies a capture from it, never from the record)."""
+        lines = ["2026-10-15T00:00:00Z WATCH_REQUESTED"]
+        if state in ("ATTACHED_NO_CRASH", "DUMPED"):
+            lines += ["2026-10-15T00:00:01Z ATTACH pid=1", "2026-10-15T00:00:01Z DEBUGGER_ATTACHED pid=1"]
+        if state == "DUMPED":
+            lines += ["2026-10-15T00:00:02Z EXCEPTION code=0xC0000374 first=1 tid=2 address=0x1",
+                      f"2026-10-15T00:00:03Z DUMP_WRITTEN path=C:\\w\\heapdump\\{name or self.DUMP_NAME} bytes={len(dump or b'')} context=1"]
+        if state in ("ATTACHED_NO_CRASH", "DUMPED"):
+            lines += ["2026-10-15T00:00:04Z EXIT_PROCESS exitCode=0 firstChanceExceptions=0", "2026-10-15T00:00:04Z DEBUGGER_EXIT rc=0"]
+        return "\n".join(lines) + "\n"
+
+    def publish(self, record: dict | None, dump: bytes | None = None, log: str | None = None, dump_name: str | None = None) -> None:
         hd = self.artifacts / "heapdump"
         shutil.rmtree(hd, ignore_errors=True)
         hd.mkdir(parents=True)
         if record is not None:
             (hd / "heap-dump.json").write_text(json.dumps(record), encoding="utf-8")
-        (hd / "watcher.log").write_text("2026-10-15T00:00:00Z WATCH_REQUESTED\n", encoding="utf-8")
+        state = record.get("captureState") if isinstance(record, dict) else None
+        (hd / "watcher.log").write_text(log if log is not None else self.watcher_log(state, dump), encoding="utf-8")
         if dump is not None:
-            (hd / "MLVApp_1_20261015T000000.dmp").write_bytes(dump)
+            (hd / (dump_name or self.DUMP_NAME)).write_bytes(dump)
 
     def record(self, state: str, **extra) -> dict:
         return dict({"schema": "mlv-app/heap-corruption-dump/v1", "requested": True, "watcherPid": 1, "watcherExited": True, "reason": None, "captureState": state, "dumps": []}, **extra)
@@ -8896,6 +9007,82 @@ class HeapDumpRunnerReceiptTests(RunnerHarness, unittest.TestCase):
             status, valid, reasons = ps_receipt_status(receipt, allow_offline=True)
             self.assertEqual((status, valid), ("INVALID", False))
             self.assertTrue(any(r.startswith("HEAPDUMP_DUMP_NOT_IN_EVIDENCE") for r in reasons), reasons)
+
+    def test_r11_a1_a_verified_state_the_watcher_log_does_not_show_is_never_a_verified_capture(self) -> None:
+        # r11 (adversary r10 A1), writer: a record that SAYS ATTACHED_NO_CRASH / DUMPED over a watcher log that only shows the request is not verified
+        dump = b"MDMP" + b"\x00" * 4092
+        for state, dump_bytes in (("ATTACHED_NO_CRASH", None), ("DUMPED", dump)):
+            with self.subTest(state=state):
+                rec = self.record(state, dumps=[{"name": self.DUMP_NAME, "bytes": len(dump)}] if dump_bytes else [])
+                self.publish(rec, dump=dump_bytes, log=self.watcher_log(None))
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((receipt["outcome"], receipt["heapDump"]["captureState"], receipt["heapDump"]["captureVerified"]),
+                                 ("HEAPDUMP_CAPTURE_FAILED", "STOP_FAILED", False), receipt["outcomeDetail"])
+                self.assertIn("CAPTURE_NOT_IN_WATCHER_LOG", receipt["heapDump"]["reason"])
+
+    def test_r11_a1_the_reader_re_derives_the_capture_from_the_hashed_watcher_log(self) -> None:
+        # r11 (adversary r10 A1), reader: the receipt's captureState / captureVerified never establish the capture. The adversary's input: a receipt
+        # that claims ATTACHED_NO_CRASH, verified, with heap-dump.json and watcher.log removed from the evidence.
+        self.publish(self.record("ATTACHED_NO_CRASH"))
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        status, valid, reasons = ps_receipt_status(receipt, allow_offline=True)
+        self.assertEqual((status, valid), ("VERIFIED_OFFLINE_TEST", True), reasons)
+        forged = json.loads(json.dumps(receipt))
+        forged["heapDump"] = {"requested": True, "captureVerified": True, "captureState": "ATTACHED_NO_CRASH", "watcherExited": False, "dumps": []}
+        status, valid, reasons = ps_receipt_status(forged, allow_offline=True)
+        self.assertEqual((status, valid), ("INVALID", False), reasons)
+        self.assertTrue(any(r.startswith("HEAPDUMP_CAPTURE_NOT_IN_EVIDENCE") for r in reasons), reasons)
+        heap = Path(receipt["evidence"]["localEvidenceDir"]) / "heapdump"
+        (heap / "heap-dump.json").unlink()
+        (heap / "watcher.log").unlink()
+        status, valid, reasons = ps_receipt_status(receipt, allow_offline=True)
+        self.assertEqual((status, valid), ("INVALID", False), reasons)
+        self.assertTrue(any(r.startswith("HEAPDUMP_CAPTURE_NOT_IN_EVIDENCE") for r in reasons), reasons)
+
+    def test_r11_a2_a_dumped_capture_never_verifies_on_a_dump_the_log_does_not_name(self) -> None:
+        # r11 (adversary r10 A2): the record and log name expected.dmp, which is absent; an unrelated MDMP file came back instead
+        dump = b"MDMP" + b"\x00" * 4092
+        rec = self.record("DUMPED", dumps=[{"name": "expected.dmp", "bytes": 4096}])
+        self.publish(rec, dump=dump, log=self.watcher_log("DUMPED", dump, name="expected.dmp"), dump_name="unrelated.dmp")
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((receipt["outcome"], receipt["heapDump"]["captureState"]), ("HEAPDUMP_CAPTURE_FAILED", "STOP_FAILED"), receipt["outcomeDetail"])
+        self.assertIn("DUMP_NOT_RETURNED", receipt["heapDump"]["reason"])
+        # the reader likewise: a DUMPED receipt whose only on-disk dump is not the logged one is not in the evidence
+        self.publish(self.record("DUMPED", dumps=[{"name": self.DUMP_NAME, "bytes": len(dump)}]), dump=dump)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        heap = Path(receipt["evidence"]["localEvidenceDir"]) / "heapdump"
+        log = (heap / "watcher.log").read_text(encoding="utf-8").replace(self.DUMP_NAME, "expected.dmp")
+        (heap / "watcher.log").write_text(log, encoding="utf-8")
+        forged = json.loads(json.dumps(receipt))
+        forged["heapDump"]["watcherLogSha256"] = hashlib.sha256((heap / "watcher.log").read_bytes()).hexdigest()
+        status, valid, reasons = ps_receipt_status(forged, allow_offline=True)
+        self.assertEqual((status, valid), ("INVALID", False), reasons)
+        self.assertTrue(any(r.startswith("HEAPDUMP_DUMP_NOT_IN_EVIDENCE") for r in reasons), reasons)
+
+    def test_r11_a8_a_dump_the_reader_cannot_open_is_a_typed_invalid_never_a_throw(self) -> None:
+        # r11 (adversary r10 A8): another process holds the evidence dump open with no sharing while the receipt is validated
+        import ctypes
+        from ctypes import wintypes
+        dump = b"MDMP" + b"\x00" * 4092
+        self.publish(self.record("DUMPED", dumps=[{"name": self.DUMP_NAME, "bytes": len(dump)}]), dump=dump)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.CreateFileW(str(Path(receipt["evidence"]["localEvidenceDir"]) / "heapdump" / self.DUMP_NAME), 0x80000000, 0, None, 3, 0, None)
+        self.assertNotEqual(handle, wintypes.HANDLE(-1).value, ctypes.get_last_error())
+        try:
+            status, valid, reasons = ps_receipt_status(receipt, allow_offline=True)
+        finally:
+            kernel32.CloseHandle(handle)
+        self.assertEqual((status, valid), ("INVALID", False), reasons)
+        self.assertTrue(any(r.startswith("HEAPDUMP_EVIDENCE_UNREADABLE") for r in reasons), reasons)
 
     def test_heap_dump_receipt_is_null_on_a_leg_that_did_not_ask(self) -> None:
         self.publish(None)
@@ -9004,6 +9191,21 @@ class HeapDumpSoakAccountingTests(unittest.TestCase):
         records += [dict(leg, name=f"A-{i}", arm="CTL-W", watch="debugger", captureState="ATTACHED_NO_CRASH", crash=i < 1000) for i in range(2000)]
         [c] = self.account(records)["comparisons"]
         self.assertEqual((c["stopCycles"], c["crashes"], c["unattachedRate"], c["pAtMostThisManyAtUnattachedRate"]), (2000, 1000, 0.5, 0.509))
+
+    def test_r11_a6_a_watch_none_record_with_debugger_evidence_is_never_unattached(self) -> None:
+        # r11 (adversary r10 A6): the adversary's two records -- watch 'none' with heapCorruptionDump true and a captureState, and watch 'none' with an
+        # r6b DEBUGGER_ATTACHED log -- contradict themselves; neither is pooled into the unattached stop-cycle rate
+        typed = {"status": "RAN", "name": "conflict", "arm": "CTL-U", "watch": "none", "heapCorruptionDump": True, "captureState": "ATTACHED_NO_CRASH",
+                 "stopCycle": True, "crash": True, "dumps": []}
+        legacy = {k: v for k, v in typed.items() if k != "captureState"}
+        legacy.update(name="conflict-legacy", heapDumpWatch="2026-10-29T00:00:00Z DEBUGGER_ATTACHED pid=7")
+        only_flag = {k: v for k, v in legacy.items() if k != "heapDumpWatch"}
+        only_flag["name"] = "conflict-flag"
+        clean = {"status": "RAN", "name": "U", "arm": "CTL-U", "watch": "none", "stopCycle": True, "crash": False, "dumps": []}
+        g = self.account([typed, legacy, only_flag, clean])["groups"]
+        self.assertEqual([n.split(" ")[0] for n in g["unattached"]["names"]], ["U"])
+        self.assertEqual((g["unattached"]["crashes"], g["unattached"]["stopCycleCrashes"]), (0, 0))
+        self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["conflict", "conflict-flag", "conflict-legacy"])
 
     def test_heap_dump_soak_accounting_rate_counts_only_stop_cycle_crashes(self) -> None:
         # r8 (adversary r8 A6): the binomial is over stop cycles, so its crash count is the crashes OF stop-cycle legs; a crash in a leg that never
