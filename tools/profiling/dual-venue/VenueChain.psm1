@@ -697,20 +697,20 @@ function Get-VenueStagedBuildManifest {
                 $left = $TimeoutSec - $callClock.Elapsed.TotalSeconds
                 # r10 (adversary pass 2 A3): the time left is printed rounded DOWN to hundredths -- Round(1.999, 2) printed "2 s left, under 2"
                 # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its own minimum ($script:GuardReadMinSec, the same rule)
-                if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null } }
+                if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
                 $artSec = $left
             }
             # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file
             $hashEnd = $callClock.Elapsed.TotalSeconds + $artSec
             foreach ($it in $items) { $it.clock = $callClock; $it.endSec = $hashEnd; $it.minSec = $ArtifactMinSec }
             $ar =Invoke-VenueBoundedRead -ScriptText $probe.ToString() -Argument $items -TimeoutSec $artSec
-            if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null } }
+            if (-not $ar.answered) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: $($ar.error)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
             $lines = @($ar.value | ForEach-Object { [string]$_ })
             $missing = @($lines | Where-Object { $_.StartsWith('MISSING:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
             $differs = @($lines | Where-Object { $_.StartsWith('MISMATCH:') } | ForEach-Object { $p = $_.Split(':', 4); "$($p[1]) $($p[2]) hashes to $($p[3])" })
             $notime = @($lines | Where-Object { $_.StartsWith('NOTIME:') } | ForEach-Object { $p = $_.Split(':', 3); "$($p[1]) $($p[2])" })
             # a file found absent or different before the time ran out is still that typed problem; with none, a file never started is a hash that did not finish (UNREACHABLE)
-            if (-not $missing.Count -and -not $differs.Count -and $notime.Count) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) to start hashing $($notime[0]) (under $ArtifactMinSec s left)"; contentProblem = $null; artifactProblem = $null } }
+            if (-not $missing.Count -and -not $differs.Count -and $notime.Count) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) to start hashing $($notime[0]) (under $ArtifactMinSec s left)"; contentProblem = $null; artifactProblem = $null; artifactsUnhashed = $true } }
             $artifactProblem = $(if ($missing.Count) { "BUILD_ARTIFACT_MISSING the cached artifact is absent from $cacheDir`: $($missing -join '; ') (the leg job hashes it against the build manifest and throws after the lease opened)" }
                 elseif ($differs.Count) { "BUILD_ARTIFACT_MISMATCH the cached artifact does not hash to the build manifest's digest in ${cacheDir}: $($differs -join '; ') (the leg job throws after the lease opened)" }
                 else { '' })

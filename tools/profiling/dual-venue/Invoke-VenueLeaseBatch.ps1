@@ -1090,13 +1090,16 @@ if ($legPlanMode) {
             if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }
             $st = $builds[$it.sourceCommit]
             $short = $it.sourceCommit.Substring(0, 12)
-            if ($st.state -ceq 'UNREACHABLE') { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
-            if ($st.state -cne 'STAGED') { Stop-PlanRefused 'BUILD_NOT_STAGED' $it.item "no staged build manifest for $short at $($st.path); the runner stages and builds nothing" }
+            # #705 r14 (adversary r14 pass 2 A1): a manifest that WAS read, whose cached artifacts could not be hashed (artifactsUnhashed: a locked or stalled artifact), is refused only
+            # after the manifest's own run-output guard below, so a manifest that is batch.log is never appended to by that refusal's log line (the order master had before the hash)
+            if ($st.state -ceq 'UNREACHABLE' -and -not $st.artifactsUnhashed) { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
+            if ($st.state -cne 'STAGED' -and -not $st.artifactsUnhashed) { Stop-PlanRefused 'BUILD_NOT_STAGED' $it.item "no staged build manifest for $short at $($st.path); the runner stages and builds nothing" }
             # r12 (adversary r12 A1): the manifest is an input the legs read, so it gets the guard the plan and the specs get: a hard link or a link that makes it one of the files this run writes
             # (leg-plan.json, a batch receipt, ...) would have it overwritten after the lease opened. r16 (adversary r16 A1): BEFORE its digest and content refusals, as the specs' guard
             # comes before theirs: a manifest that is batch.log was appended to by the BUILD_MANIFEST_MISMATCH refusal's own log line.
             $outputRefusal = Get-RunDirOutputRefusal $st.path
             if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'BUILD_MANIFEST_IS_RUN_OUTPUT') $it.item "the staged build manifest for $short $outputRefusal" }
+            if ($st.artifactsUnhashed) { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
             if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
             # r5 (adversary A2): and the manifest must be one the leg job's validator accepts (its commit, dll pair digest and symbol presence), not only the one named by hash
             if ($st.contentProblem) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short at $($st.path) is not one the leg job accepts: $($st.contentProblem)" }

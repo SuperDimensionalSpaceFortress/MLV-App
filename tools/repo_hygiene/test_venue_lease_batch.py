@@ -6101,6 +6101,37 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertIn("LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ", r.stderr)
                 self.assertEqual(self.kinds(), [], "nothing is submitted")
 
+    def test_artifact_preflight_r14_adv_p2_a1_a_manifest_that_links_to_batch_log_is_not_appended_to_when_its_artifacts_cannot_be_hashed(self) -> None:
+        # #705 r14 adversary pass 2 A1: the cached build.json is a symbolic link to a plain one-name batch.log, and its artifacts cannot be hashed (the read throws, as a package zip
+        # held with FileShare.None does). On 31ba19ee the preflight refused SHARE_UNREACHABLE BEFORE the manifest's run-output guard, and that refusal's log line was appended to
+        # batch.log, which is the manifest. The guard now comes first, as it did before the artifact hash existed. The hard-link case (two names, so never appended to) shows the same
+        # order on any host: it was refused SHARE_UNREACHABLE, never named as the run output it is; the symbolic-link case needs the privilege to make one (hosted CI has it).
+        import hashlib
+        c = "7" * 40
+        probe = self.case / "artifact-probe-throws.ps1"
+        probe.write_text("param($items)\nthrow 'the package zip is held with FileShare.None'\n", encoding="utf-8")
+        for how in ("hard link", "symbolic link"):
+            with self.subTest(how=how):
+                staged = self.stage(c, "linked build")
+                manifest = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
+                self._fresh_run_dir()
+                log = self.run_dir / "batch.log"
+                if how == "hard link":
+                    os.link(manifest, log)
+                else:
+                    log.write_bytes(manifest.read_bytes())
+                    manifest.unlink()
+                    try:
+                        os.symlink(log, manifest)
+                    except OSError as e:
+                        self.skipTest(f"file symlinks need the privilege here: {e}")
+                before = hashlib.sha256(log.read_bytes()).hexdigest()
+                r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c, manifest=staged)]), "-ArtifactProbeScript", str(probe))
+                self.assertEqual(hashlib.sha256(log.read_bytes()).hexdigest(), before, "the staged manifest was appended to through batch.log: " + r.stderr)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("LEG_PLAN_REFUSED reason=BUILD_MANIFEST_IS_RUN_OUTPUT item=1 ", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted")
+
     def test_r16_b2_a_temp_on_a_drive_that_does_not_exist_keeps_the_open_s_stop_and_writes_no_job_into_the_run_dir(self) -> None:
         free = [c for c in "ZYXWVUTSRQPONMLKJIHGFED" if not os.path.exists(f"{c}:\\")]
         if not free:
