@@ -723,6 +723,64 @@ class ModuleFunctionTests(unittest.TestCase):
         self.assertEqual(got["entries"], [f"String:reason=r [{self.EV_TEXT}]", "String:7=seven", "String:status=S"], got)
         self.assertEqual(got["dotReason"], f"r [{self.EV_TEXT}]", got)
 
+    # --- r13 (sol r12 B1 on d32a71f0; opus key3 / fable r12 REPORT-HELPER-TYPED-KEY-DICTIONARY-THROW-1): a dictionary whose key type cannot be a string and that shows no public Comparer
+    # (ReadOnlyDictionary[int,object], ImmutableDictionary[int,object], ImmutableSortedDictionary[int,object]) holds no `reason` by definition. The one-holder rule asked it
+    # `ContainsKey('reason')`, which bound to ContainsKey(int) and threw outside any try. It now takes the r11 canonical-report route like every other dictionary.
+    TYPED_KEY_SHAPES = {
+        "readonly-int": "$d = [System.Collections.Generic.Dictionary[int,object]]::new(); $d.Add(7, 'keep'); $report = [System.Collections.ObjectModel.ReadOnlyDictionary[int,object]]::new($d)",
+        "immutable-int": "$report = [System.Collections.Immutable.ImmutableDictionary[int,object]]::Empty.Add(7, 'keep')",
+        "immutable-sorted-int": "$report = [System.Collections.Immutable.ImmutableSortedDictionary[int,object]]::Empty.Add(7, 'keep')",
+        "readonly-guid": "$d = [System.Collections.Generic.Dictionary[guid,object]]::new(); $d.Add([guid]'00000000-0000-0000-0000-000000000007', 'keep'); $report = [System.Collections.ObjectModel.ReadOnlyDictionary[guid,object]]::new($d)",
+        # controls that already worked: a public Comparer answers (Dictionary, SortedDictionary, ConcurrentDictionary), or the key type admits a string (object-keyed read-only map)
+        "control-dictionary-int": "$report = [System.Collections.Generic.Dictionary[int,object]]::new(); $report.Add(7, 'keep')",
+        "control-sorted-int": "$report = [System.Collections.Generic.SortedDictionary[int,object]]::new(); $report.Add(7, 'keep')",
+        "control-concurrent-int": "$report = [System.Collections.Concurrent.ConcurrentDictionary[int,object]]::new(); $null = $report.TryAdd(7, 'keep')",
+        "control-readonly-object": "$d = [System.Collections.Generic.Dictionary[object,object]]::new(); $d.Add(7, 'keep'); $report = [System.Collections.ObjectModel.ReadOnlyDictionary[object,object]]::new($d)"}
+
+    def test_r13_a_typed_key_dictionary_with_no_public_comparer_takes_the_canonical_report_route(self) -> None:
+        for shape, ctor in self.TYPED_KEY_SHAPES.items():
+            for helper in self.HELPERS:
+                with self.subTest(shape=shape, helper=helper):
+                    got = self.call(f"{ctor}\n$r = {self.HELPERS[helper]}" + self.DOT_REASON + self.COMPOSED)
+                    # the canonical report stringifies the key: {'7'='keep'; reason=<detail>} (the Guid row under its string form)
+                    expected_key = "String:00000000-0000-0000-0000-000000000007=keep" if "guid" in shape else "String:7=keep"
+                    self.assertEqual(got["entries"], [expected_key, f"String:reason={self.ADDED[helper]}"], got)
+                    self.assertEqual(got["dotReason"], self.ADDED[helper], got)
+                    self.assertFalse(got["same"], "the input dictionary is never returned once the helper has a detail to write")
+
+    def test_r13_a_typed_key_dictionary_composes_in_either_helper_order(self) -> None:
+        for shape in ("readonly-int", "immutable-int", "immutable-sorted-int"):
+            for first, second in (("events", "sweep"), ("sweep", "events")):
+                with self.subTest(shape=shape, first=first, second=second):
+                    got = self.compose_on(self.TYPED_KEY_SHAPES[shape], first, second)
+                    texts = {"events": self.EV_TEXT, "sweep": self.SW_TEXT}
+                    self.assertEqual(got["entries"][0], "String:7=keep", got)
+                    self.assertEqual(self.reason_like(got["entries"]), [f"String:reason={texts[first]} [{texts[second]}]"], got)
+                    self.assertEqual(got["dotReason"], f"{texts[first]} [{texts[second]}]", got)
+
+    def test_r13_nothing_to_add_still_returns_a_typed_key_dictionary_itself(self) -> None:
+        for call in ("Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep $null",
+                     "Add-AttrCudaPresentMonEventsLostDetailToReport -Report $report -EventsLost $null"):
+            with self.subTest(call=call[:40]):
+                got = self.call(f"{self.TYPED_KEY_SHAPES['readonly-int']}\n$r = {call}\n" + self.ENTRIES)
+                self.assertTrue(got["same"], got)
+
+    def test_r13_a_report_with_string_keys_whose_reason_lookup_throws_fails_closed(self) -> None:
+        # the narrowing of the r13 guard: only a report with NO string key is treated as holding no `reason` when its lookup throws; one that has string keys and cannot answer comes back unchanged
+        ctor = ("class ThrowingReport : System.Collections.Specialized.OrderedDictionary { [bool] Contains([object]$key) { throw 'lookup refused' } }\n"
+                "$report = [ThrowingReport]::new(); $report.Add('status', 'S'); $report.Add(7, 'keep')")
+        for helper in self.HELPERS:
+            with self.subTest(helper=helper):
+                got = self.call(f"{ctor}\n$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
+                self.assertTrue(got["same"], got)
+                self.assertEqual(got["entries"], ["String:status=S", "Int32:7=keep"], got)
+
+    def test_r13_a_typed_key_sweep_record_is_unreadable_not_a_throw(self) -> None:
+        # the sweep record is read inside the r5 try: a record keyed by something other than strings has no field to read and is named, never thrown (documented r5 behaviour, pinned)
+        got = self.call(f"{self.TYPED_KEY_SHAPES['readonly-int']}\n$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report ([ordered]@{{ reason = 'r' }}) -Sweep $report"
+                        + "\n$dot = [string]$r.reason\nWrite-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ dotReason = $dot }) -Compress))")
+        self.assertTrue(got["dotReason"].startswith("r [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: recordUnreadable="), got)
+
     def test_r11_nothing_to_add_still_returns_the_dictionary_itself(self) -> None:
         # the contract's other half: with no detail to write (a clean sweep, no events record) the helper adds nothing and returns the report it was given
         for call in ("Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ remaining = @() }",

@@ -327,6 +327,9 @@ sentence ("none dropped", which a containment dedupe broke). Both helpers carry 
   - *Reason-like key.* This is a string key that equals `reason` under OrdinalIgnoreCase, or that the report's own public `Comparer` calls equal to `reason`. That second test
     catches `rea<U+00AD>son` under a culture comparer. Some reports have no readable comparer (Hashtable, OrderedDictionary). If such a report's own lookup holds a `reason` that
     no OrdinalIgnoreCase key explains, the one string key holding the text that lookup returns is reason-like.
+    A report whose key type is not string and that shows no public `Comparer` (`ReadOnlyDictionary[int,object]`, `ImmutableDictionary[int,object]`) cannot be asked for `reason`
+    (r13: the lookup binds to the key type and throws). With no string key among its keys it holds no `reason`, and it takes the canonical route like any other dictionary. A report
+    that has string keys and still cannot answer the lookup fails closed (below).
   - *Fold.* All reason-like entries become one key, `reason`, at the place of the first one. Its text is their non-empty texts in enumeration order, joined by a space. A text
     that is ordinally EQUAL to an earlier one is left out; containment never removes a text. Then ` [<detail>]` is appended once. It is skipped only if the folded text already
     carries exactly this detail: it equals the detail, begins with `<detail> [`, or contains `[<detail>]`. No early return skips the write.
@@ -335,8 +338,8 @@ sentence ("none dropped", which a containment dedupe broke). Both helpers carry 
   - *Collision rule (deterministic, no value dropped).* Two keys can collide in that table: case variants such as `status`/`Status`, `U+03A3`/`U+03C2`, or a string form equal
     to another key, such as `1` and `'1'`. The report is then an exact-key `OrderedDictionary` that keeps every original key and value in order. The reason-like keys are still
     folded into `reason`, so `.reason` reads the folded text. A second call keeps the same shape.
-  - *Fail closed.* In two cases the input comes back unchanged and the detail is not added: a held reason that no rule can tie to one key (r8: a report with no readable
-    comparer whose text two keys hold), and an exact-key copy that its keys cannot build.
+  - *Fail closed.* In three cases the input comes back unchanged and the detail is not added: a held reason that no rule can tie to one key (r8: a report with no readable
+    comparer whose text two keys hold), a report with string keys whose `reason` lookup throws (r13), and an exact-key copy that its keys cannot build.
 - **Not promised.**
   - `.Reason` or `.REASON` on an exact-key copy (only `reason` is spelled there).
   - Lookalike matching for a dictionary whose comparer is not readable, apart from the one-holder rule above.

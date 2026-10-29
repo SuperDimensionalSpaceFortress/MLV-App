@@ -2325,7 +2325,7 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
         #   copy: every other key with its value (a non-string key under its string form) into an [ordered] table (OrdinalIgnoreCase on pwsh 7), returned as a pscustomobject when
         #     every key can be a member name (the r3 shape) and as the table otherwise. Keys that collide in that table (case variants such as status/Status, or a string form equal to
         #     another key) drop no value: the report is an exact-key OrderedDictionary with every original key instead, the reason-like ones folded into `reason` the same way
-        #   fail closed (the input report comes back unchanged, the detail not added): a held reason no rule names one key for (r8), or an exact-key copy its keys cannot build
+        #   fail closed (the input report comes back unchanged, the detail not added): a held reason no rule names one key for (r8), a report with string keys whose own `reason` lookup throws (r13), or an exact-key copy its keys cannot build
         $keyList = @($Report.PSBase.Keys)
         $valueList = @($Report.PSBase.Values)
         $like = @(foreach ($key in $keyList) { $key -is [string] -and [string]::Equals($key, 'reason', [StringComparison]::OrdinalIgnoreCase) })
@@ -2344,7 +2344,12 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
             } catch { $asked = $false }
         }
         if (-not $asked -and @($like | Where-Object { $_ }).Count -eq 0) {
-            $held = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
+            # r13 (sol r12 B1 on d32a71f0; REPORT-HELPER-TYPED-KEY-DICTIONARY-THROW-1): a dictionary whose key type is not string and that shows no public Comparer (ReadOnlyDictionary[int,object],
+            # ImmutableDictionary[int,object]) cannot be asked for 'reason' -- ContainsKey binds to its key type and throws. With no string key among its keys it holds no `reason` by
+            # definition, so it takes the canonical route below; a report that does have string keys and still cannot answer fails closed (the input comes back unchanged, as in r8)
+            $held = $false
+            try { $held = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') } }
+            catch { if (@($keyList | Where-Object { $_ -is [string] }).Count -gt 0) { return $Report } }
             if ($held) {
                 $heldText = [string]$Report['reason']
                 $holders = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $heldText, [StringComparison]::Ordinal)) { $index } })
@@ -2476,7 +2481,7 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
         #   copy: every other key with its value (a non-string key under its string form) into an [ordered] table (OrdinalIgnoreCase on pwsh 7), returned as a pscustomobject when
         #     every key can be a member name (the r3 shape) and as the table otherwise. Keys that collide in that table (case variants such as status/Status, or a string form equal to
         #     another key) drop no value: the report is an exact-key OrderedDictionary with every original key instead, the reason-like ones folded into `reason` the same way
-        #   fail closed (the input report comes back unchanged, the detail not added): a held reason no rule names one key for (r8), or an exact-key copy its keys cannot build
+        #   fail closed (the input report comes back unchanged, the detail not added): a held reason no rule names one key for (r8), a report with string keys whose own `reason` lookup throws (r13), or an exact-key copy its keys cannot build
         $keyList = @($Report.PSBase.Keys)
         $valueList = @($Report.PSBase.Values)
         $like = @(foreach ($key in $keyList) { $key -is [string] -and [string]::Equals($key, 'reason', [StringComparison]::OrdinalIgnoreCase) })
@@ -2495,7 +2500,12 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
             } catch { $asked = $false }
         }
         if (-not $asked -and @($like | Where-Object { $_ }).Count -eq 0) {
-            $held = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
+            # r13 (sol r12 B1 on d32a71f0; REPORT-HELPER-TYPED-KEY-DICTIONARY-THROW-1): a dictionary whose key type is not string and that shows no public Comparer (ReadOnlyDictionary[int,object],
+            # ImmutableDictionary[int,object]) cannot be asked for 'reason' -- ContainsKey binds to its key type and throws. With no string key among its keys it holds no `reason` by
+            # definition, so it takes the canonical route below; a report that does have string keys and still cannot answer fails closed (the input comes back unchanged, as in r8)
+            $held = $false
+            try { $held = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') } }
+            catch { if (@($keyList | Where-Object { $_ -is [string] }).Count -gt 0) { return $Report } }
             if ($held) {
                 $heldText = [string]$Report['reason']
                 $holders = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $heldText, [StringComparison]::Ordinal)) { $index } })
