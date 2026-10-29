@@ -687,7 +687,10 @@ function Invoke-InputGuard {
             $abandoned = $true
             & (Get-Module VenueChain) { $script:VenueAbandonedReads++ }
             try { [void]$ps.BeginStop($null, $null) } catch { }
-            $unknown = -not $prog.locationsDone
+            # #705 r14 (adversary r14 A1): a worker given up on is still in a read of an input's share (a spec, a manifest or its artifacts, all on the shares the inputs live on), so where
+            # that input is cannot be read again on this thread inside the room either, even when its location was verified first: every location is left unknown, and nothing more is
+            # written into -RunDir (Get-WriteDestinationHit, behind each L and receipt write, would re-read every input's path unbounded)
+            $unknown = $true
             return [pscustomobject]@{ kind = 'content'; item = [int]$prog.item; code = $(if ($noRoom -and $gb.code) { $gb.code } else { 'SHARE_UNREACHABLE' }); locationUnknown = $unknown
                 why = "the guard's reads did not finish within $($gb.what) (still reading $($prog.at) after $([Math]::Round($gb.clock.Elapsed.TotalSeconds, 1)) s)$(if ($unknown) { '; an input whose location is unknown is refused, and nothing more is written into -RunDir' }); no leg runs on it" }
         }
@@ -976,9 +979,13 @@ function Get-InputContentRefusal {
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)
             # r12 (#704 merge): nor at a receipt write (Test-ReceiptWriteSuppressed): the legs already ran, and the artifacts were hashed under the claim and after the open
             if ($script:receiptGuardActive) { $verifyArtifacts = $false }
+            $abandonedBefore = & (Get-Module VenueChain) { $script:VenueAbandonedReads }
             $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ArtifactMinSec $script:GuardReadMinSec -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe
             $within = $(if ($null -ne $script:guardBudget) { "a $([Math]::Round($share, 2)) s share of $($script:guardBudget.what)" } else { "a ${share} s bound" })
-            if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short could not be read after the claim wait (or the open) within $within at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no leg runs on it" } }
+            # #705 r14 (adversary r14 A1 sibling): a bounded manifest read or hash given up on under a guard budget is a read still held on the manifest's share, so its location is
+            # left unknown as Invoke-InputGuard leaves it for a worker given up on (a "no time left" refusal gave up on no read, and keeps the location it verified)
+            $gaveUp = ($null -ne $script:guardBudget) -and ((& (Get-Module VenueChain) { $script:VenueAbandonedReads }) -gt $abandonedBefore)
+            if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; locationUnknown = $gaveUp; why = "the staged build manifest for $short could not be read after the claim wait (or the open) within $within at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no leg runs on it$(if ($gaveUp) { '; an input whose location is unknown is refused, and nothing more is written into -RunDir' })" } }
             if ($st.state -cne 'STAGED' -and $st.state -cne 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short read as '$($st.state)' after the claim wait; only STAGED with the validated digest opens a lease" } }
             if ($st.state -ceq 'NOT_STAGED') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_NOT_STAGED'; why = "no staged build manifest for $short at $($st.path) any more; the runner stages and builds nothing" } }
             if ($st.state -ceq 'STAGED' -and $st.sha256 -cne $g.sha256) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'BUILD_MANIFEST_MISMATCH'; why = "the staged build manifest for $short changed while the batch waited: sha256 $($st.sha256), not $($g.sha256)" } }

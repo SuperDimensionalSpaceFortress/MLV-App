@@ -5065,8 +5065,11 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
         self.assertIn("could not be hashed", r.stderr)
         self.assertIn("the lease's room after the open", r.stderr)
-        [b] = self.batches()
-        self.assertEqual((b["endReason"], b["legsAttempted"]), ("SHARE_UNREACHABLE", 0))
+        # #705 r14 (adversary r14 A1 sibling): the hash given up on is a read still held on the manifest's share, so the manifest's location is left unknown and nothing more is
+        # written into -RunDir (the receipt included); on 80df9163 the receipt was written through unbounded re-reads of every input's path
+        self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists() and self.batches(), "no receipt was written into -RunDir after a share read was given up on")
         self.assertEqual(self.leg_calls(), [])
         # refused while a leg budget was still left in the 75 s lease, not after the 20 s hash
         self.assertLess(held, 75 - 60 + 4, f"the lease was held {held:.1f} s before the close: the re-hash ran into the leg budget")
@@ -5210,11 +5213,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def test_artifact_preflight_r4_item2_a_delayed_spec_read_after_the_open_ends_share_unreachable_inside_the_room(self) -> None:
         r, held = self._delayed_guard_read_run("spec")
-        self._assert_delayed_read_refused_inside_the_room(r, held)
-        # every location was verified before the spec read: no suppression, the receipts are written as usual
-        self.assertNotIn("BATCH_OUTPUT_ALIASED", r.stderr)
-        [b] = self.batches()
-        self.assertEqual((b["endReason"], b["legsAttempted"]), ("SHARE_UNREACHABLE", 0))
+        self._assert_delayed_read_refused_inside_the_room(r, held, extra=2)
+        # #705 r14 (adversary r14 A1): every location was verified BEFORE the spec read, but the worker given up on is still in a read of the spec's share, so the spec's location
+        # cannot be read again on the main thread inside the room (each later L and receipt write would, through Get-WriteDestinationHit): it is left unknown and nothing more is
+        # written into -RunDir. On 80df9163 the suppression stayed off and the receipt was written through those unbounded reads.
+        self.assertIn("BATCH_OUTPUT_ALIASED", r.stderr)
+        self.assertIn("an input whose location is unknown is refused", r.stderr)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists() and self.batches(), "no receipt was written into -RunDir after the guard gave up on a share read")
 
     def test_artifact_preflight_r4_item2_fast_control_the_same_room_with_no_delay_runs_the_leg(self) -> None:
         r, held = self._post_open_hash_run(0, cap="75")
