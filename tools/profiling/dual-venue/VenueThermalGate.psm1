@@ -25,14 +25,20 @@ $script:HeatMeanMaxC = 88.0
 $script:Inv = [System.Globalization.CultureInfo]::InvariantCulture
 
 function Get-VenueHeatVerdict {
-    # 'hot' | 'clear' | 'unknown'. The agent's Get-SustainedHeatVerdict rule: hot when throttled > 6 or mean >= 88 C. A missing or non-finite value is unknown.
+    # 'hot' | 'clear' | 'unknown'. The agent's Get-SustainedHeatVerdict rule (ultra-magnus-agent.ps1:2436): hot when throttled > 6 or mean >= 88 C.
+    # r5 (sol r4 B1 / adversary A4): the throttled count is tested FIRST, so a mean that is NaN, missing or unparseable never masks a hot count (the feed parser accepts NaN and
+    # Infinity, Wait-VenueQuiet.ps1:629). A mean of +Infinity is >= 88 and is hot, as the agent's comparison says. With throttled <= 6, a NaN, -Infinity or missing mean stays
+    # unknown (fail closed, as before); so does a missing, unparseable or non-finite throttled count.
     param([AllowNull()][object]$Throttled, [AllowNull()][object]$MeanC)
-    if ($null -eq $Throttled -or $null -eq $MeanC) { return 'unknown' }
+    if ($null -eq $Throttled) { return 'unknown' }
     $t = 0.0; $m = 0.0
     if (-not [double]::TryParse([string]$Throttled, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$t)) { return 'unknown' }
+    if ([double]::IsNaN($t) -or [double]::IsInfinity($t) -or $t -lt 0) { return 'unknown' }
+    if ($t -gt $script:HeatMaxThrottledRows) { return 'hot' }
+    if ($null -eq $MeanC) { return 'unknown' }
     if (-not [double]::TryParse([string]$MeanC, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$m)) { return 'unknown' }
-    if ([double]::IsNaN($t) -or [double]::IsInfinity($t) -or $t -lt 0 -or [double]::IsNaN($m) -or [double]::IsInfinity($m)) { return 'unknown' }
-    if ($t -gt $script:HeatMaxThrottledRows -or $m -ge $script:HeatMeanMaxC) { 'hot' } else { 'clear' }
+    if ([double]::IsNaN($m) -or [double]::IsNegativeInfinity($m)) { return 'unknown' }
+    if ($m -ge $script:HeatMeanMaxC) { 'hot' } else { 'clear' }
 }
 
 function ConvertFrom-VenueProbeHeatLine {
@@ -53,7 +59,9 @@ function ConvertFrom-VenueProbeHeatLine {
             # mean_c_exact, is the heat decision's value when present; the rounded mean_c only for a probe that predates it
             $meanSrc = $(if ($h.PSObject.Properties['mean_c_exact'] -and $null -ne $h.mean_c_exact) { $h.mean_c_exact } else { $h.mean_c })
             $okM = [double]::TryParse([string]$meanSrc, [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)
-            $v = $(if ($okT -and $okW -and $okM) { Get-VenueHeatVerdict -Throttled $thr -MeanC $mean } else { 'unknown' })
+            # r5 (B1): an unparseable mean is NaN, not a reason to drop the throttled count: Get-VenueHeatVerdict tests the count first
+            if (-not $okM) { $mean = [double]::NaN }
+            $v = $(if ($okT -and $okW) { Get-VenueHeatVerdict -Throttled $thr -MeanC $mean } else { 'unknown' })
             if ($v -cne 'unknown') {
                 return [pscustomobject]@{ heat = $v; throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.00#', $script:Inv)) C"; source = 'raw-json' }
             }
@@ -63,13 +71,21 @@ function ConvertFrom-VenueProbeHeatLine {
     $none = [pscustomobject]@{ heat = 'unknown'; throttled = $null; window = $null; meanC = $null; text = $(if ($line) { ([string]$line).Trim() } else { 'no tele heat line' }); source = 'none' }
     if (-not $line) { return $none }
     # r3 pass 2 A4: the feed parser accepts signed temperatures (a sensor's -1 error value), so the mean may carry a sign: unsigned only, the line read unknown while throttled=7/60 is hot
-    $m = [regex]::Match([string]$line, '\smean=(-?[0-9]+(?:[.,][0-9]+)?)C\s+throttled=([0-9]+)/([0-9]+)(?:\s|$)')
+    # r5 (B1): and it accepts NaN and Infinity, which the display prints as NaN, the culture's infinity symbol (U+221E) or Infinity: any non-numeric mean token is read as a
+    # non-finite mean, so the throttled count that follows it still decides (hot > 6) instead of the whole line reading unknown
+    $m = [regex]::Match([string]$line, '\smean=(\S+?)C\s+throttled=([0-9]+)/([0-9]+)(?:\s|$)')
     if (-not $m.Success) { return $none }
     $mean = 0.0; $thr = 0; $win = 0
     # r3 A2: the display mean is rounded to 0.1 C (87.96 prints 88.0): a probe that also prints mean_exact=<R> gives the exact value, which is what the heat rule is applied to
-    $mx = [regex]::Match([string]$line, '\smean_exact=(-?[0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?)(?:\s|$)')
+    $mx = [regex]::Match([string]$line, '\smean_exact=(-?[0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?|NaN|-?Infinity)(?:\s|$)')
     $meanText = $(if ($mx.Success) { $mx.Groups[1].Value } else { $m.Groups[1].Value })
-    if (-not [double]::TryParse(($meanText -replace ',', '.'), [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)) { return $none }
+    $inf = [string][char]0x221E
+    if ($meanText -ceq $inf -or $meanText -ceq "+$inf") { $mean = [double]::PositiveInfinity }
+    elseif ($meanText -ceq "-$inf") { $mean = [double]::NegativeInfinity }
+    elseif ($meanText -match '^-?[0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?$' -or $meanText -cin @('NaN', 'Infinity', '-Infinity')) {
+        if (-not [double]::TryParse(($meanText -replace ',', '.'), [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)) { return $none }
+    }
+    else { $mean = [double]::NaN }
     if (-not [int]::TryParse($m.Groups[2].Value, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$thr)) { return $none }   # advisory A10: an overflow is unknown, never a throw
     if (-not [int]::TryParse($m.Groups[3].Value, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$win)) { return $none }
     [pscustomobject]@{ heat = (Get-VenueHeatVerdict -Throttled $thr -MeanC $mean); throttled = $thr; window = $win; meanC = $mean; text = "throttled $thr/$win, mean $($mean.ToString('0.0##', $script:Inv)) C"; source = 'tele-line' }
@@ -171,13 +187,24 @@ function Get-VenueHeavyLegKeys {
 
 function Resolve-VenueHistoryChild {
     # r3 (pass 1 A2): -Dir\-Child as an absolute path, string-only. A relative -Dir (-HeatFrom '.') is relative to the POWERSHELL location, which File.ReadAllLines does not follow
-    # (it uses the process directory), so it is resolved here against Get-Location. No drive is touched (an unmounted one is not an error here), and a path that cannot be
-    # built (an empty entry, illegal characters) is $null, never a throw: the caller skips and names it.
+    # (it uses the process directory), so it is resolved here. r5 (sol r4 B2 / adversary A6): the resolution is the PowerShell provider's own,
+    # GetUnresolvedProviderPathFromPSPath, so a drive-relative -Dir ('C:.', 'C:sub') follows that drive's PowerShell location too (Path.Combine and GetFullPath resolved it against
+    # the PROCESS directory). It is string-only: the path is not required to exist. A -Dir that does not resolve to a FileSystem path (the location sits in the registry) is relative
+    # to the FileSystem location; a fully qualified path on a drive PowerShell has not registered is taken as written. A path that cannot be built (an empty entry, illegal
+    # characters, an unmounted drive) is $null, never a throw: the caller skips and names it.
     param([AllowNull()][AllowEmptyString()][string]$Dir, [Parameter(Mandatory)][string]$Child)
     try {
         if ([string]::IsNullOrWhiteSpace($Dir)) { return $null }
-        $base = (Get-Location -PSProvider FileSystem).ProviderPath
-        [IO.Path]::GetFullPath([IO.Path]::Combine($base, $Dir, $Child))
+        $abs = $null
+        try {
+            $prov = $null; $drv = $null
+            $r = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Dir, [ref]$prov, [ref]$drv)
+            if ($null -ne $prov -and $prov.Name -ceq 'FileSystem') { $abs = $r }
+        } catch [System.Management.Automation.DriveNotFoundException] {
+            if ([IO.Path]::IsPathFullyQualified($Dir)) { $abs = $Dir }
+        }
+        if ($null -eq $abs) { $abs = [IO.Path]::Combine((Get-Location -PSProvider FileSystem).ProviderPath, $Dir) }
+        [IO.Path]::GetFullPath([IO.Path]::Combine($abs, $Child))
     } catch { $null }
 }
 

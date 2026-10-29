@@ -271,6 +271,82 @@ class ThermalGateModuleTests(unittest.TestCase):
         r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual((r.returncode, r.stdout.strip()), (0, "2|."), r.stdout + r.stderr)
 
+    def test_r5_sol_b1_a4_a_non_finite_mean_never_masks_a_hot_throttled_count_on_either_parse_path(self) -> None:
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-nonfinite-"))
+        # the verdict is the agent's rule in its order (ultra-magnus-agent.ps1:2436): the count first, +Infinity is >= 88 (hot), NaN / -Infinity / a missing mean never decide alone
+        got = ps_json(
+            "$nan = [double]::NaN; $pi = [double]::PositiveInfinity; $ni = [double]::NegativeInfinity; "
+            "@((Get-VenueHeatVerdict -Throttled 7 -MeanC $nan), (Get-VenueHeatVerdict -Throttled 0 -MeanC $pi), (Get-VenueHeatVerdict -Throttled 7 -MeanC $ni), "
+            "(Get-VenueHeatVerdict -Throttled 0 -MeanC $nan), (Get-VenueHeatVerdict -Throttled 0 -MeanC $ni), (Get-VenueHeatVerdict -Throttled 7 -MeanC $null), "
+            "(Get-VenueHeatVerdict -Throttled 7 -MeanC 'n/a'), (Get-VenueHeatVerdict -Throttled 0 -MeanC $null), "
+            "(Get-VenueHeatVerdict -Throttled 6 -MeanC 70), (Get-VenueHeatVerdict -Throttled 7 -MeanC 70), (Get-VenueHeatVerdict -Throttled 0 -MeanC 88), "
+            "(Get-VenueHeatVerdict -Throttled 0 -MeanC 87.9), (Get-VenueHeatVerdict -Throttled $nan -MeanC 90), (Get-VenueHeatVerdict -Throttled $pi -MeanC 90))")
+        self.assertEqual(got, ["hot", "hot", "hot", "unknown", "unknown", "hot", "hot", "unknown", "clear", "hot", "hot", "clear", "unknown", "unknown"], got)
+
+        def raw(thr: int, mean: str) -> str:
+            p = d / f"raw-{thr}-{mean}.json"
+            p.write_text(json.dumps({"heat": {"mean_c": mean, "mean_c_exact": mean, "throttled": thr, "window_rows": 60}}), encoding="utf-8")
+            return f"ConvertFrom-VenueProbeHeatLine -Lines @('  raw {p}')"
+
+        # the raw JSON path (the probe writes a non-finite double as the string "NaN" / "Infinity" / "-Infinity"), sol's 60-row case = throttled 7
+        for thr, mean, want in ((7, "NaN", "hot"), (7, "Infinity", "hot"), (7, "-Infinity", "hot"), (0, "Infinity", "hot"), (0, "NaN", "unknown"), (0, "-Infinity", "unknown")):
+            self.assertEqual(ps_json(raw(thr, mean))["heat"], want, (thr, mean))
+        self.assertEqual(ps_json(raw(7, "NaN"))["source"], "raw-json")
+
+        # the display-line fallback: NaN, the culture's infinity symbol (U+221E) or Infinity in mean=, NaN / Infinity in mean_exact=
+        # the line is double-quoted PowerShell so the infinity symbol can be passed as a [char] (the command line stays ASCII)
+        tele = lambda thr, disp, exact="": (  # noqa: E731
+            f'ConvertFrom-VenueProbeHeatLine -Lines @("  tele heat source=x age=1.0s hottest=50.0C max15=60.0C mean={disp}C throttled={thr}/60 W=10{exact}")')
+        sym = "$([char]0x221E)"
+        cases = [(7, "NaN", " mean_exact=NaN", "hot"), (7, "NaN", "", "hot"), (7, sym, "", "hot"), (7, "-" + sym, "", "hot"), (7, sym, " mean_exact=Infinity", "hot"),
+                 (7, "-" + sym, " mean_exact=-Infinity", "hot"), (0, sym, " mean_exact=Infinity", "hot"), (0, sym, "", "hot"), (0, "NaN", " mean_exact=NaN", "unknown"),
+                 (0, "-" + sym, " mean_exact=-Infinity", "unknown"), (7, "70.0", "", "hot"), (0, "70.0", "", "clear"), (0, "89,0", "", "hot"), (7, "-1.0", "", "hot")]
+        for thr, disp, exact, want in cases:
+            got_line = ps_json(tele(thr, disp, exact))
+            self.assertEqual(got_line["heat"], want, (thr, disp, exact, got_line))
+
+    def test_r5_sol_b2_a6_a_drive_relative_history_dir_resolves_against_the_powershell_location_not_the_process_directory(self) -> None:
+        import os
+        import tempfile
+        root = Path(tempfile.mkdtemp(prefix="thermal-driverel-"))
+        proc, psloc = root / "proc", root / "psloc"
+        proc.mkdir()
+        psloc.mkdir()
+
+        def history(where: Path, second_heat: str) -> None:
+            legs = [{"name": "01-fx-a-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": "clear"},
+                    {"name": "02-fx-b-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": second_heat}]
+            (where / "batches.jsonl").write_text(json.dumps({"batch": 1, "token": "t1", "legs": legs}) + "\n", encoding="utf-8")
+
+        history(psloc, "hot")     # the intended history: the leg after fx-a read hot, so fx-a is heavy
+        history(proc, "clear")    # the decoy at the process directory: nothing heavy
+        drive = os.path.splitdrive(str(root))[0]
+        tail = ("$h = Read-VenueLegHeatHistory -RunDir @(<DIRS>); $hk = Get-VenueHeavyLegKeys -Rows @($h.rows); $items = @('fx-a-A', 'fx-a-B', 'fx-b-A', 'fx-b-B'); "
+                "$flags = [bool[]]@($items | ForEach-Object { $hk.Contains(($_ -replace '-[AB]$', '') + '|cpu') }); $sp = Get-VenueThermalSpreadOrder -Items $items -Heavy $flags; "
+                "[pscustomobject]@{ order = (@($sp.items) -join ','); skipped = @($h.skipped).Count; resolved = (& (Get-Module VenueThermalGate) { Resolve-VenueHistoryChild -Dir '<DRIVE>.' -Child 'batches.jsonl' }) }")
+
+        def run(dirs: str, location: Path) -> dict:
+            script = f"$ErrorActionPreference='Stop'; Import-Module '{GATE}' -Force; Set-Location -LiteralPath '{location}'; ConvertTo-Json -Compress -InputObject $({tail.replace('<DIRS>', dirs).replace('<DRIVE>', drive)})"
+            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, cwd=str(proc))
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            return json.loads(r.stdout)
+
+        # the process directory is proc (the spawn cwd); the PowerShell location is psloc. A plain '.' and the drive-relative 'X:.' must both read psloc's history.
+        want_order = "fx-a-A,fx-b-A,fx-a-B,fx-b-B"
+        for spelling in ("'.'", f"'{drive}.'"):
+            got = run(spelling, psloc)
+            self.assertEqual(got["order"], want_order, (spelling, got))
+            self.assertEqual(got["skipped"], 0, got)
+        self.assertEqual(os.path.normcase(run("'.'", psloc)["resolved"]), os.path.normcase(str(psloc / "batches.jsonl")))
+        # control: with the PowerShell location AT the process directory the decoy (nothing heavy) is what is read, so the spread keeps the given order
+        self.assertEqual(run(f"'{drive}.'", proc)["order"], "fx-a-A,fx-a-B,fx-b-A,fx-b-B")
+        # a drive-relative spelling with a sub-path, and an absolute path, resolve the same way
+        (psloc / "sub").mkdir()
+        history(psloc / "sub", "hot")
+        self.assertEqual(run(f"'{drive}sub'", psloc)["order"], want_order)
+        self.assertEqual(run(f"'{psloc}'", proc)["order"], want_order)
+
     def test_adversary_r3_a1_b2_one_function_decides_whether_another_probe_may_start(self) -> None:
         got = ps_json(
             "$b = { param($cap, $e, $slow, $want) $r = Get-VenueThermalProbeBudget -CapSec $cap -ElapsedSec $e -SlowestReprobeSec $slow -WantSleepSec $want; \"$($r.mayStartProbe)|$($r.fitSec)|$($r.sleepSec)\" }; "
