@@ -1572,7 +1572,7 @@ function Get-PresentMonProcessSnapshot() {
                 if ((Get-ChildItem -LiteralPath $candidatePath -ErrorAction Stop).Length -eq $pinnedLength) { $pinnedHash = (Test-PresentMonIdentityText ([string](Get-AttrCudaFileSha256Blocks -Path $candidatePath -TracePath $Trace -Label 'presentmon-candidate-image-hash').sha256) $pinnedSha) }
             } catch { $pinnedHash = $false }
         }
-        if (-not ($candidateName.StartsWith('PresentMon', [StringComparison]::OrdinalIgnoreCase) -or (Test-PresentMonIdentityText $candidateName $pinnedName) -or ($pathReadable -and (Test-PresentMonIdentityText $candidatePath $pinnedPath)) -or $pinnedHash -or $namesSession)) {
+        if (-not ($candidateName.StartsWith('PresentMon', 'OrdinalIgnoreCase') -or (Test-PresentMonIdentityText $candidateName $pinnedName) -or ($pathReadable -and (Test-PresentMonIdentityText $candidatePath $pinnedPath)) -or $pinnedHash -or $namesSession)) {
             # r4: no route names it, but with no readable command line nothing says it is no capture either (a readable path is no identity: a renamed, non-pinned copy has one --
             # r4 adversary A1): held for the non-ownership evidence below
             if ($null -eq $commandLineError -and $commandLine.Trim() -eq '') { $unreadableIdentity += [pscustomobject]@{ name = $candidateName; pid = $candidateId; pathReadable = $pathReadable; session = (Get-PresentMonProcessSessionId $candidate); started = $started } }
@@ -1651,7 +1651,7 @@ function Test-PresentMonIdentityText([string]$Text, [string]$Expected) {
     # BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 r7 (r6 adversary A1 on 836a3d61): every name, path, hash and identity the sweep compares is compared ORDINALLY, case-insensitive. PowerShell's
     # -eq / -ieq / -in / -like are culture-sensitive and ignore U+00AD, U+200B and U+0000, so `PresentMonSer<U+00AD>vice` read as PresentMonService and got the Intel identity. Equal lengths plus
     # an OrdinalIgnoreCase prefix is String.Equals OrdinalIgnoreCase (that comparison maps each UTF-16 unit to one unit), in the members the template scan admits.
-    return ($Text.Length -eq $Expected.Length -and $Text.StartsWith($Expected, [StringComparison]::OrdinalIgnoreCase))
+    return ($Text.Length -eq $Expected.Length -and $Text.StartsWith($Expected, 'OrdinalIgnoreCase'))
 }
 
 function Get-PresentMonParentIdentity([int]$ProcessId, [string]$Name, $Started = $null) {
@@ -1809,8 +1809,8 @@ function Invoke-PresentMonOrphanSweep() {
         # r2 (Dot's improvement on #707): newlyListed is what the FULL initial listing lacked, so a deferred default session that was there all along is never reported as new
         $initialNames = @($listed)
         if (Test-PresentMonIdentityText $scope 'harness_sessions') {
-            $record['deferred'] = @($listed | Where-Object { -not ([string]$_).StartsWith('MLVAttr3-', [StringComparison]::OrdinalIgnoreCase) })
-            $listed = @($listed | Where-Object { ([string]$_).StartsWith('MLVAttr3-', [StringComparison]::OrdinalIgnoreCase) })
+            $record['deferred'] = @($listed | Where-Object { -not ([string]$_).StartsWith('MLVAttr3-', 'OrdinalIgnoreCase') })
+            $listed = @($listed | Where-Object { ([string]$_).StartsWith('MLVAttr3-', 'OrdinalIgnoreCase') })
         }
         $record['listed'] = $listed
         # a PresentMon that appeared while the listing ran is a capture that may own a session: nothing is touched

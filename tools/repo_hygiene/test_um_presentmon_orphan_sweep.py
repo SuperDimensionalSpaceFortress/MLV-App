@@ -1536,7 +1536,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(self.terminated_names(self.calls(d)), [])
 
     def test_mutation_without_the_scope_filter_the_default_session_is_swept_under_an_unidentified_process(self) -> None:
-        mutated = mutate(TEMPLATE, "$listed = @($listed | Where-Object { ([string]$_).StartsWith('MLVAttr3-', [StringComparison]::OrdinalIgnoreCase) })", "")
+        mutated = mutate(TEMPLATE, "$listed = @($listed | Where-Object { ([string]$_).StartsWith('MLVAttr3-', 'OrdinalIgnoreCase') })", "")
         _code, sweep, d, _out = self.run_start("mut-scope-filter", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
         self.assertIn("PresentMon", self.terminated_names(self.calls(d)))
 
