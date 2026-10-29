@@ -471,9 +471,10 @@ function Test-BuildGuardOwnerAlive([int]$OwnerPid, [long]$StartTicks) {
     return ([math]::Abs($actual - $StartTicks) -le [TimeSpan]::FromSeconds(2).Ticks)
 }
 
-function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
+function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label, [int]$MutexWaitMs = 15000) {
     # Returns @{ Acquired; Held; Ticket }. The whole read-check-reclaim-create runs under a named mutex so
-    # two reclaimers cannot delete each other's fresh lock.
+    # two reclaimers cannot delete each other's fresh lock. The mutex wait is what is left of the admission deadline when
+    # the caller has one (r12, sol r11 B2 sibling: a fixed 15 s wait held the machine slot past a 0.6 s deadline).
     # It runs while the machine heavy slot is held, so it is Stop-scoped (r7, a34e2098-A1): an error record would be rendered
     # to stderr past the bounded writer. A failure that should refuse admission throws to Invoke-BuildGuard, whose finally
     # gives the heavy slot back first; a stale lock that cannot be removed is a slot still busy, logged.
@@ -488,7 +489,7 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
     $mutex = New-Object System.Threading.Mutex($false, $Options.MutexName)
     $got = $false
     try {
-        try { $got = $mutex.WaitOne(15000) } catch [System.Threading.AbandonedMutexException] { $got = $true }
+        try { $got = $mutex.WaitOne([math]::Max(0, $MutexWaitMs)) } catch [System.Threading.AbandonedMutexException] { $got = $true }
         if (-not $got) { return @{ Acquired = $false; Held = 'acquire-mutex-busy' } }
         $path = $Options.LockPath
         if (Test-Path -LiteralPath $path) {
@@ -1261,25 +1262,43 @@ function Invoke-BuildGuard {
         }
         $started = [DateTime]::UtcNow
         $deadline = $started.AddMinutes($o.DeadlineMinutes)
+        # r12 (sol r11 B2): a positive deadline bounds the whole admission, the last look included. A deadline of 0 or less
+        # is one look, admitted or refused, as before.
+        $bounded = [double]$o.DeadlineMinutes -gt 0
         $ticket = $null
         $mem = @{ PhysGB = 0.0; CommitGB = 0.0 }
         while ($true) {
             $mem = Get-BuildGuardMemory -Options $o
             $memOk = [bool]$exempt -or ($mem.PhysGB -ge $o.MinFreePhysGB -and $mem.CommitGB -ge $o.MinFreeCommitGB)
             $held = ''
+            $admitted = $false
             if ($memOk) {
-                if ($NoSlot) { break }
-                $slot = Invoke-BuildSlotAcquire -Options $o -Label $Label
-                if ($slot.Acquired) { $ticket = $slot.Ticket; break }
-                if ($slot['Refused']) {
-                    # The heavy slot goes back before the typed refusal (r6 sol B1), as at the deadline below.
-                    Exit-HeavySlot $heavy
-                    $heavy = $null
-                    Exit-BuildGuardPathRefused $Label 'LockPath' $o.LockPath $slot.Refused
+                if ($NoSlot) {
+                    $admitted = $true
+                } else {
+                    $mutexWaitMs = 15000
+                    if ($bounded) { $mutexWaitMs = [int][math]::Max(0, [math]::Min(15000, [math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds))) }
+                    $slot = Invoke-BuildSlotAcquire -Options $o -Label $Label -MutexWaitMs $mutexWaitMs
+                    if ($slot.Acquired) { $ticket = $slot.Ticket; $admitted = $true }
+                    elseif ($slot['Refused']) {
+                        # The heavy slot goes back before the typed refusal (r6 sol B1), as at the deadline below.
+                        Exit-HeavySlot $heavy
+                        $heavy = $null
+                        Exit-BuildGuardPathRefused $Label 'LockPath' $o.LockPath $slot.Refused
+                    } else { $held = $slot.Held }
                 }
-                $held = $slot.Held
             }
-            if ([DateTime]::UtcNow -ge $deadline) {
+            # r12 (sol r11 B2): the one check after every way in, before the action. The clamped sleep wakes at the deadline,
+            # so a look that then passed (memory back, a slot freed, a slow acquisition) used to break out here and start the
+            # action after expiry. Past a positive deadline the build slot just taken goes back and the guard refuses below.
+            $expired = [DateTime]::UtcNow -ge $deadline
+            if ($admitted) {
+                if (-not ($expired -and $bounded)) { break }
+                Remove-BuildSlot $ticket
+                $ticket = $null
+                $held = 'deadline-expired-before-admission'
+            }
+            if ($expired) {
                 $waited = [int]([DateTime]::UtcNow - $started).TotalSeconds
                 # The machine heavy slot is given back BEFORE the typed refusal (r6 sol B1): a stdout nobody drains may block
                 # that line, never the slot. Nothing is built after it; $heavy is cleared only once the release has run.

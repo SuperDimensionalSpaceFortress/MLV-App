@@ -2767,6 +2767,130 @@ def test_sols_poll_override_repro_in_command_mode_refuses_within_the_deadline(bo
     assert elapsed < 60, f"the refusal took {elapsed:.1f} s"
 
 
+# r12 (sol r11 B2): the clamped sleep woke at the deadline, but a look that passed after it still admitted: a successful
+# acquisition broke out of the wait before the deadline check, so the action started after expiry (sol: 72.87 ms past with
+# memory that recovered, 14.89 ms with a busy-then-free build slot, and after an 800 ms acquisition). A positive deadline is
+# checked once more after every acquisition, before the action: past it, the build slot and the machine slot go back and the
+# guard refuses. Every acquisition wait is clamped to what is left (the slot mutex asked for 15 s against a 600 ms budget).
+_LATE = "BUILD_SLOT_BUSY label=build heldBy=[deadline-expired-before-admission]"
+
+
+def _assert_refused_after_the_deadline(box: dict, done: subprocess.CompletedProcess, slots: bool = True) -> None:
+    out = done.stdout + done.stderr
+    assert done.returncode == 3, out
+    assert _LATE in done.stdout, out
+    assert not box["marker"].exists(), "no action starts after the admission deadline"
+    assert "[build-guard] admitted label=" not in done.stderr, out
+    assert not box["lock"].exists(), "the build slot taken after the deadline is given back"
+    if not slots:
+        assert _stub_calls(box) == [], "-NoSlot takes no machine slot"
+        return
+    assert "heavy-slot: released label=" in done.stderr, out
+    assert _stub_calls(box)[0]["childEnd"], "the machine slot went back"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == []
+
+
+def test_sols_r11_repro_memory_that_recovers_after_the_deadline_never_starts_the_action(box) -> None:
+    # Sol r11 B2, its literal input, unshadowed: DeadlineMinutes=0.01, PollSeconds=3600, memory 0/0 then 10/20, the local
+    # slot free. The clamped sleep ends at the deadline; the next sample passes and the slot is free, after expiry.
+    started = time.monotonic()
+    done = _heavy(box, "run", ["-PollSeconds", "3600", "-DeadlineMinutes", "0.01", "-Command", _marker_command(box)],
+                  memory=[{"freePhysGB": 0, "freeCommitGB": 0}, {"freePhysGB": 10, "freeCommitGB": 20}])
+    _assert_refused_after_the_deadline(box, done)
+    assert time.monotonic() - started < 60
+
+
+# A Start-Sleep that wakes a little after what it was asked for (a loaded host), so the next look is past the deadline.
+_SLEEP_PAST = (
+    "function Start-Sleep { param([int]$Milliseconds, [double]$Seconds)\n"
+    "    [Threading.Thread]::Sleep([math]::Max(0, [math]::Min($Milliseconds, 5000)) + 50) }\n"
+)
+def _shadow_acquire(first_line: str) -> str:
+    # The real acquire runs after first_line, so a slot taken late is a real lock the release must delete.
+    return (
+        "$script:realAcquire = ${function:Invoke-BuildSlotAcquire}; $script:acquires = 0\n"
+        "function Invoke-BuildSlotAcquire { param([hashtable]$Options, [string]$Label, [int]$MutexWaitMs)\n"
+        f"    $script:acquires++; {first_line}\n"
+        "    & $script:realAcquire @PSBoundParameters }\n"
+    )
+
+
+@pytest.mark.parametrize("path", ["busy-then-free", "slow-acquisition", "no-slot-memory"])
+def test_an_admission_that_succeeds_after_the_deadline_gives_both_slots_back_and_refuses(box, path) -> None:
+    setup = _SLEEP_PAST + "$opts.PollSeconds = 3600; $opts.DeadlineMinutes = 0.01\n"
+    call = "Invoke-BuildGuard -Label 'build' -Options $opts"
+    if path == "busy-then-free":
+        setup += _shadow_acquire("if ($script:acquires -eq 1) { return @{ Acquired = $false; Held = 'pid=1 label=peer' } }")
+    elif path == "slow-acquisition":
+        setup += _shadow_acquire("[Threading.Thread]::Sleep(800)")
+    else:
+        mem = _write_json(box["dir"] / "memory-late.json", [{"freePhysGB": 0, "freeCommitGB": 0}, {"freePhysGB": 10, "freeCommitGB": 20}])
+        setup += f"$opts.MemoryProbeFile = '{mem}'\n"
+        call += " -NoSlot"
+    done = _library_driver(
+        box,
+        setup + call + f" -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+    )
+    _assert_refused_after_the_deadline(box, done, slots=path != "no-slot-memory")
+
+
+def test_the_slot_mutex_wait_is_clamped_to_the_admission_deadline(box) -> None:
+    # Sol r11 B2 sibling (G:491): the acquire helper waited WaitOne(15000) on the slot mutex with 600 ms left, so a held mutex
+    # kept the machine slot 15 s past the deadline. The mutex is held here by this test process for the whole run.
+    import ctypes
+    import uuid
+    name = f"Local\\mlv-build-guard-r12-{uuid.uuid4().hex}"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel32.CreateMutexW(None, True, name)
+    assert handle, ctypes.get_last_error()
+    try:
+        done = _library_driver(
+            box,
+            f"$opts.PollSeconds = 3600; $opts.DeadlineMinutes = 0.01; $opts.MutexName = '{name}'\n"
+            f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+            str(box["lock"]),
+        )
+    finally:
+        kernel32.ReleaseMutex(ctypes.c_void_p(handle))
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+    out = done.stdout + done.stderr
+    assert done.returncode == 3, out
+    waited = re.search(r"BUILD_SLOT_BUSY label=build heldBy=\[acquire-mutex-busy\] waitedSec=(\d+) ", done.stdout)
+    assert waited, out
+    assert int(waited.group(1)) <= 2, f"the mutex wait outlived a 0.6 s deadline: {waited.group(0)}"
+    assert not box["marker"].exists()
+    assert _stub_calls(box)[0]["childEnd"], "the machine slot went back"
+
+
+def test_the_hung_tool_bound_compares_the_exact_give_up_bound() -> None:
+    # Sol r11 BUILD-GUARD-HUNG-BOUND-EXACT-TOKEN-1: the substring check above stays green on '$giveUpBROKEN'.
+    text = GUARD.read_text(encoding="ascii")
+    body = text[text.index("function Enter-HeavySlot"):text.index("function Exit-HeavySlot(")]
+    assert re.search(r"\$waitClock\.Elapsed -ge \$giveUp(?![\w:])", body)
+
+
+def test_an_allscope_error_action_preference_comes_back_on_the_build_slot_path(box) -> None:
+    # Sol r11 hardening (adversary 6b8295aa-A3 had no reproduced RED): the build-slot sibling of the -NoSlot test above. A
+    # helper's plain '$ErrorActionPreference = Stop' stays in its own scope even for an AllScope variable; only a dot-sourced
+    # block reaches the caller's. So the falsifying input is a guard block that pins Stop without the restore: both tests go
+    # RED on it and stay GREEN with the restore (r12 run dir, mutations\mutation-results.txt).
+    done = _library_driver(
+        box,
+        "Set-Variable -Name ErrorActionPreference -Option AllScope -Value 'Continue'\n"
+        "$r = Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs) 'ACTION_PREF=' + $ErrorActionPreference; "
+        "Write-Error 'recoverable action error'; 'ACTION_TAIL' }\n"
+        "Write-Output $r\nWrite-Output \"CALLER_AFTER=$ErrorActionPreference\"\n",
+        str(box["lock"]),
+    )
+    out = done.stdout + done.stderr
+    assert "ACTION_PREF=Continue" in done.stdout, out
+    assert "ACTION_TAIL" in done.stdout, out
+    assert "CALLER_AFTER=Continue" in done.stdout, out
+    assert not box["lock"].exists()
+
+
 # r9 class guard (2ab4b1b6-A1 siblings :887 :888, which no input reaches once :868/:869 resolve): no function the guard runs
 # composes or resolves a path with a cmdlet that can write an error record or throw on a missing drive or another provider.
 # Paths are resolved by Resolve-BuildGuardPath only and composed with [IO.Path].
