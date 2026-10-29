@@ -27,6 +27,11 @@ function Get-SoakCaptureClass($r) {
     $p = $r.PSObject.Properties
     $pageHeap = ($null -ne $p['pageHeap']) -and (Test-JsonTrue $r.pageHeap)
     $watchNone = ($null -ne $p['watch']) -and ([string]$r.watch -ceq 'none')
+    # r11 (adversary r10 A6): a leg is unattached only when nothing in its record asks for or shows the debugger: no captureState, no r6b watcher log,
+    # heapCorruptionDump not true and no watch but 'none'. A record that says watch 'none' AND carries any of those contradicts itself: not verified.
+    $debuggerNamed = ($null -ne $p['captureState']) -or ($null -ne $p['heapDumpWatch']) -or
+        (($null -ne $p['heapCorruptionDump']) -and (Test-JsonTrue $r.heapCorruptionDump)) -or (($null -ne $p['watch']) -and -not $watchNone)
+    if ($watchNone -and $debuggerNamed) { return 'captureNotVerified' }
     if ($null -ne $p['captureState'] -and -not $watchNone) {
         $verified = ([string]$r.captureState -cin @('ATTACHED_NO_CRASH', 'DUMPED'))
         if (-not $verified) { return 'captureNotVerified' }

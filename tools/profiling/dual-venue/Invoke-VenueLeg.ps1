@@ -972,11 +972,30 @@ if ($heapDumpRequested) {
         $captureReason = $(if ($heapRecord.PSObject.Properties['reason']) { [string]$heapRecord.reason } else { '' })
         if ($captureState -ceq 'STOP_FAILED' -and -not $heapRecord.PSObject.Properties['captureState']) { $captureReason = 'HEAP_DUMP_RECORD_UNTYPED the record carries no captureState' }
         if ($captureState -ceq 'DUMPED' -and $heapDumpCopies.Count -eq 0) { $captureState = 'STOP_FAILED'; $captureReason = 'DUMP_NOT_RETURNED the record says DUMPED but no *.dmp came back to the evidence' }
-        elseif ($captureState -ceq 'DUMPED' -and @($heapDumpCopies | Where-Object { $_['minidump'] }).Count -eq 0) { $captureState = 'STOP_FAILED'; $captureReason = 'DUMP_NOT_A_MINIDUMP the record says DUMPED but no returned *.dmp is a non-empty minidump (MDMP signature)' }
+    }
+    # r11 (adversary r10 A1, A2, A8): a verified state is accepted only when the returned watcher log shows it (Get-DvHeapCaptureFromLog), and DUMPED only
+    # with the dump that log names -- same file name and byte count -- among the returned copies, as a minidump. The log's sha256 goes in the receipt so a
+    # reader re-derives the same verdict; a log that cannot be read or hashed is a typed STOP_FAILED, never an escape before the receipt.
+    $heapLogSha = $null
+    if ($captureState -cin @('ATTACHED_NO_CRASH', 'DUMPED')) {
+        try {
+            $heapLogLocal = Join-Path $evidenceDir 'heapdump\watcher.log'
+            $heapLogLines = @()
+            if (Test-Path -LiteralPath $heapLogLocal -PathType Leaf) { $heapLogSha = Get-DvSha256OfFile $heapLogLocal; $heapLogLines = @([IO.File]::ReadAllLines($heapLogLocal)) }
+            $fromLog = Get-DvHeapCaptureFromLog -State $captureState -LogLines $heapLogLines
+            if (-not $fromLog.consistent) { $captureState = 'STOP_FAILED'; $captureReason = $fromLog.reason }
+            elseif ($captureState -ceq 'DUMPED') {
+                $namedCopies = @($heapDumpCopies | Where-Object { $c = $_; @($fromLog.written | Where-Object { $_.name -ieq $c['name'] }).Count -gt 0 })
+                $boundCopies = @($namedCopies | Where-Object { $c = $_; $c['minidump'] -and @($fromLog.written | Where-Object { $_.name -ieq $c['name'] -and $_.bytes -eq $c['bytes'] }).Count -gt 0 })
+                if ($namedCopies.Count -eq 0) { $captureState = 'STOP_FAILED'; $captureReason = 'DUMP_NOT_RETURNED the dump the watcher log names (' + (@($fromLog.written | ForEach-Object { $_.name }) -join ', ') + ') did not come back to the evidence' }
+                elseif (@($namedCopies | Where-Object { $_['minidump'] }).Count -eq 0) { $captureState = 'STOP_FAILED'; $captureReason = 'DUMP_NOT_A_MINIDUMP the record says DUMPED but the returned *.dmp the watcher log names is not a non-empty minidump (MDMP signature)' }
+                elseif ($boundCopies.Count -eq 0) { $captureState = 'STOP_FAILED'; $captureReason = 'DUMP_NOT_RETURNED the returned dump is not the size the watcher log recorded' }
+            }
+        } catch { $captureState = 'STOP_FAILED'; $captureReason = "HEAP_DUMP_LOG_UNREADABLE $($_.Exception.GetType().Name): $($_.Exception.Message)" }
     }
     if ($heapDumpCopyError) { $captureState = 'STOP_FAILED'; $captureReason = $heapDumpCopyError }
     $receipt.heapDump = [ordered]@{ requested = $true; captureState = $captureState; captureVerified = ($captureState -cin @('ATTACHED_NO_CRASH', 'DUMPED')); reason = $captureReason
-        watcherExited = $(if ($null -ne $heapRecord -and $heapRecord.PSObject.Properties['watcherExited']) { $heapRecord.watcherExited } else { $null }); dumps = @($heapDumpCopies) }
+        watcherExited = $(if ($null -ne $heapRecord -and $heapRecord.PSObject.Properties['watcherExited']) { $heapRecord.watcherExited } else { $null }); watcherLogSha256 = $heapLogSha; dumps = @($heapDumpCopies) }
     if (-not $receipt.heapDump.captureVerified -and $outcome -cin @('PASS', 'FAIL', 'INVALID')) {
         $detail = "HEAPDUMP_CAPTURE_FAILED: captureState $captureState ($captureReason); the job result was $outcome ($detail). A leg that asked for the heap-corruption debugger and cannot show it was attached is no signal"
         $outcome = 'HEAPDUMP_CAPTURE_FAILED'

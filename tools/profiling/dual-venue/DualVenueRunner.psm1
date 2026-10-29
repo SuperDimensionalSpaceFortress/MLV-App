@@ -215,6 +215,26 @@ $script:BlanketScope = 'any clip id, any venue'
 $script:ConsentRelativePath = 'tools/profiling/dual-venue/venue-clip-consent.json'
 $script:VenueTableRelativePath = 'tools/profiling/dual-venue/venues.json'
 
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r11 (adversary r10 A1, A2): a heap capture is verified from the watcher's own log, never from a state or flag a record
+# or receipt asserts. An event is the token right after a line's timestamp. ATTACHED_NO_CRASH needs DEBUGGER_ATTACHED and EXIT_PROCESS with no EXCEPTION
+# and no DUMP_WRITTEN; DUMPED needs a DUMP_WRITTEN line, and its dumps are the files those lines name (file name and byte count), which the caller binds
+# to the returned copies. Writer (Invoke-VenueLeg.ps1) and reader (Test-DvReceiptValid) both judge with this one function.
+function Get-DvHeapCaptureFromLog {
+    param([string]$State, [AllowNull()][AllowEmptyCollection()][string[]]$LogLines)
+    $lines = @($LogLines | Where-Object { $null -ne $_ })
+    $events = @($lines | ForEach-Object { if ($_ -cmatch '^\S+ ([A-Z_]+)(?: |$)') { $Matches[1] } })
+    $written = @($lines | ForEach-Object { if ($_ -cmatch '^\S+ DUMP_WRITTEN path=(.+) bytes=(\d+) context=[01]$') { [pscustomobject]@{ name = [IO.Path]::GetFileName($Matches[1]); bytes = [long]$Matches[2] } } })
+    $consistent = $false; $reason = ''
+    if ($State -ceq 'ATTACHED_NO_CRASH') {
+        $consistent = ($events -ccontains 'DEBUGGER_ATTACHED') -and ($events -ccontains 'EXIT_PROCESS') -and -not ($events -ccontains 'EXCEPTION') -and -not ($events -ccontains 'DUMP_WRITTEN')
+        if (-not $consistent) { $reason = 'CAPTURE_NOT_IN_WATCHER_LOG the watcher log does not show DEBUGGER_ATTACHED and EXIT_PROCESS with no trigger exception' }
+    } elseif ($State -ceq 'DUMPED') {
+        $consistent = ($events -ccontains 'DEBUGGER_ATTACHED') -and $written.Count -gt 0
+        if (-not $consistent) { $reason = 'CAPTURE_NOT_IN_WATCHER_LOG the watcher log does not show DEBUGGER_ATTACHED and a DUMP_WRITTEN line naming the dump' }
+    } else { $reason = "CAPTURE_NOT_VERIFIED captureState '$State' is not a verified capture" }
+    [pscustomobject]@{ consistent = $consistent; reason = $reason; written = $written }
+}
+
 function Get-DvProp {
     # A property of a hashtable OR an object, $null when absent (StrictMode-safe). `return ,` keeps an empty array an
     # empty array (it is unrolled once by the caller, so a scalar still arrives as a scalar).
@@ -2508,21 +2528,40 @@ function Test-DvReceiptValid {
                 if (($heapVerified -isnot [bool]) -or -not $heapVerified -or $heapState -cnotin @('ATTACHED_NO_CRASH', 'DUMPED')) {
                     $invalid.Add("HEAPDUMP_CAPTURE_NOT_VERIFIED: the leg asked for the heap-corruption debugger and the receipt's capture is '$heapState' (verified: $heapVerified); a PASS/FAIL without a verified capture is no signal")
                 }
-                elseif ($heapState -ceq 'DUMPED') {
-                    $dumpOnDisk = $false
-                    $heapDumps = Get-DvProp $storedHeap 'dumps'
-                    foreach ($dmp in @($heapDumps)) {
-                        if ($null -eq $dmp) { continue }
-                        $dmpName = [IO.Path]::GetFileName([string](Get-DvProp $dmp 'name'))
-                        $dmpPath = $(if ($dmpName -like '*.dmp') { Join-Path $ev.dir ('heapdump\' + $dmpName) } else { '' })
-                        if (-not $dmpPath -or -not (Test-Path -LiteralPath $dmpPath -PathType Leaf) -or (Get-Item -LiteralPath $dmpPath).Length -le 0) { continue }
-                        if ((Get-DvSha256OfFile $dmpPath) -cne [string](Get-DvProp $dmp 'sha256')) { continue }
-                        $dmpHead = [byte[]]::new(4); $dmpRead = 0
-                        $dmpStream = [IO.File]::OpenRead($dmpPath)
-                        try { while ($dmpRead -lt 4) { $dmpN = $dmpStream.Read($dmpHead, $dmpRead, 4 - $dmpRead); if ($dmpN -le 0) { break }; $dmpRead += $dmpN } } finally { $dmpStream.Dispose() }
-                        if ($dmpRead -eq 4 -and [Text.Encoding]::ASCII.GetString($dmpHead) -ceq 'MDMP') { $dumpOnDisk = $true; break }
+                else {
+                    # r11 (adversary r10 A1): the capture is re-derived from the watcher log in the evidence, under the hash the receipt recorded; the
+                    # receipt's own captureState / captureVerified never establish it. r11 (adversary r10 A8): a read or hash failure is a typed INVALID.
+                    try {
+                        $heapLogPath = Join-Path $ev.dir 'heapdump\watcher.log'
+                        $heapLogSha = [string](Get-DvProp $storedHeap 'watcherLogSha256')
+                        if (-not (Test-Path -LiteralPath $heapLogPath -PathType Leaf) -or -not $heapLogSha -or (Get-DvSha256OfFile $heapLogPath) -cne $heapLogSha) {
+                            $invalid.Add("HEAPDUMP_CAPTURE_NOT_IN_EVIDENCE: the receipt says '$heapState' but the evidence holds no heapdump\watcher.log under the sha256 the receipt recorded")
+                        } else {
+                            $fromLog = Get-DvHeapCaptureFromLog -State $heapState -LogLines @([IO.File]::ReadAllLines($heapLogPath))
+                            if (-not $fromLog.consistent) { $invalid.Add("HEAPDUMP_CAPTURE_NOT_IN_EVIDENCE: $($fromLog.reason)") }
+                            elseif ($heapState -ceq 'DUMPED') {
+                                # r11 (adversary r10 A2): the dump on disk is the one the DUMP_WRITTEN line names (file name, byte count), never another *.dmp
+                                $dumpOnDisk = $false
+                                $heapDumps = Get-DvProp $storedHeap 'dumps'
+                                foreach ($dmp in @($heapDumps)) {
+                                    if ($null -eq $dmp) { continue }
+                                    $dmpName = [IO.Path]::GetFileName([string](Get-DvProp $dmp 'name'))
+                                    $dmpPath = $(if ($dmpName -like '*.dmp') { Join-Path $ev.dir ('heapdump\' + $dmpName) } else { '' })
+                                    if (-not $dmpPath -or -not (Test-Path -LiteralPath $dmpPath -PathType Leaf)) { continue }
+                                    $dmpBytes = (Get-Item -LiteralPath $dmpPath).Length
+                                    if ($dmpBytes -le 0 -or @($fromLog.written | Where-Object { $_.name -ieq $dmpName -and $_.bytes -eq $dmpBytes }).Count -eq 0) { continue }
+                                    if ((Get-DvSha256OfFile $dmpPath) -cne [string](Get-DvProp $dmp 'sha256')) { continue }
+                                    $dmpHead = [byte[]]::new(4); $dmpRead = 0
+                                    $dmpStream = [IO.File]::OpenRead($dmpPath)
+                                    try { while ($dmpRead -lt 4) { $dmpN = $dmpStream.Read($dmpHead, $dmpRead, 4 - $dmpRead); if ($dmpN -le 0) { break }; $dmpRead += $dmpN } } finally { $dmpStream.Dispose() }
+                                    if ($dmpRead -eq 4 -and [Text.Encoding]::ASCII.GetString($dmpHead) -ceq 'MDMP') { $dumpOnDisk = $true; break }
+                                }
+                                if (-not $dumpOnDisk) { $invalid.Add('HEAPDUMP_DUMP_NOT_IN_EVIDENCE: the receipt says DUMPED but the heapdump\*.dmp the watcher log names is not in the evidence as a non-empty minidump of its logged size under the sha256 the receipt recorded') }
+                            }
+                        }
+                    } catch {
+                        $invalid.Add("HEAPDUMP_EVIDENCE_UNREADABLE: the heap capture evidence could not be read or hashed ($($_.Exception.GetType().Name): $($_.Exception.Message))")
                     }
-                    if (-not $dumpOnDisk) { $invalid.Add('HEAPDUMP_DUMP_NOT_IN_EVIDENCE: the receipt says DUMPED but no heapdump\*.dmp in the evidence is a non-empty minidump under the sha256 the receipt recorded') }
                 }
             }
         }
@@ -3094,7 +3133,7 @@ function Write-DvReceipt {
     $path
 }
 
-Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
+Export-ModuleMember -Function Get-DvOutcomeEnum, Get-DvHeapCaptureFromLog, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
