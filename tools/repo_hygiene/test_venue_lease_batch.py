@@ -6268,12 +6268,21 @@ del _name
 # CI-WINDOWS-UNITTEST-HEAVY-PARTS-3-1: ci_unittest_shard places whole classes, and VenueLeaseBatchLegPlanTests measured 1039-1121 s on hosted windows (master
 # runs 40858861385, 40864893269, 40871917397, 40878296653), past the 1074 s one windows shard or heavy part holds under ShardDurationBudgetTests. Its test_r1_* ..
 # test_r8_* cases move, unchanged, into a sibling class on the same fixtures (the split #705 r13 staged), so no class is too heavy to place. Each case runs once.
+# LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r14: the 69 test_artifact_preflight_* cases measured 545.9 s on hosted windows (run 40861273862), which with the 79 cases
+# left in VenueLeaseBatchLegPlanTests is 1131 s, past the same 1074 s, so they move, unchanged, into a third sibling class on the same fixtures.
+@requires_windows_pwsh
+class VenueLeaseBatchArtifactPreflightTests(VenueLeaseBatchLegPlanTests):
+    """The LegPlan cases named test_artifact_preflight_* (LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1)."""
+
+
 @requires_windows_pwsh
 class VenueLeaseBatchLegPlanEarlyRoundTests(VenueLeaseBatchLegPlanTests):
     """The LegPlan cases named test_r1_* through test_r8_* (letter suffixes included)."""
 
 
 def _leg_plan_home(name: str) -> type:
+    if name.startswith("test_artifact_preflight_"):
+        return VenueLeaseBatchArtifactPreflightTests
     lettered = re.match(r"test_r(\d+)", name)
     if lettered and int(lettered.group(1)) <= 8:
         return VenueLeaseBatchLegPlanEarlyRoundTests
@@ -6281,7 +6290,7 @@ def _leg_plan_home(name: str) -> type:
 
 
 for _name, _case in [(n, f) for n, f in vars(VenueLeaseBatchLegPlanTests).items() if n.startswith("test_") and callable(f)]:
-    for _cls in (VenueLeaseBatchLegPlanTests, VenueLeaseBatchLegPlanEarlyRoundTests):
+    for _cls in (VenueLeaseBatchLegPlanTests, VenueLeaseBatchArtifactPreflightTests, VenueLeaseBatchLegPlanEarlyRoundTests):
         setattr(_cls, _name, _case if _cls is _leg_plan_home(_name) else None)
 del _name, _case, _cls
 
