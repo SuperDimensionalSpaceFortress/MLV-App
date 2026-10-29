@@ -221,7 +221,7 @@ function Read-VenueLegHeatHistory {
     # The leg rows of earlier lease-batch runs, in run order, for Get-VenueHeavyLegKeys. Each -RunDir's batches.jsonl (mlv-app/venue-lease-batch/v1); a row's
     # heat is its own heatAtProbe (written by this gate), else its own heatAtGrant (the agent's admission.heat, which the runner records on the row), else the
     # agent's admission.heat from agent-result-<jobId>.json beside it, else 'unknown'. r7 (adversary r7 A2): heatAtGrant was never read, so a history
-    # without its sidecars read a hot grant as unknown.
+    # without its sidecars read a hot grant as unknown. The agent's heat (either source) is taken only from a row not marked off the batch's lease.
     # A dir with no batches.jsonl, or an unreadable line, is skipped and named in .skipped (never a throw).
     param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$RunDir)
     $rows = [System.Collections.Generic.List[object]]::new(); $skipped = [System.Collections.Generic.List[string]]::new()
@@ -250,7 +250,12 @@ function Read-VenueLegHeatHistory {
                 $backend = $(if ($l.PSObject.Properties['backend']) { [string]$l.backend } else { '' })
                 $arm = $(if ($l.PSObject.Properties['arm']) { [string]$l.arm } else { '' })
                 $heat = 'unknown'
+                # r7 (adversary r7 A1 on 83fd79de): the agent's heat (heatAtGrant, or the sidecar's admission.heat) was read at the job's grant, which a row with onLease
+                # other than exactly true held on ANOTHER lease (a replacement after LEASE_LOST): charged to this lease's predecessor, it made a key heavy from a reading
+                # it never followed. Such a row keeps only the probe's reading, which is always this lease's. A row with no onLease field (LEG_FAILED) reads as before.
+                $offLease = ($l.PSObject.Properties['onLease'] -and -not ($l.onLease -is [bool] -and $l.onLease))
                 if ($l.PSObject.Properties['heatAtProbe'] -and [string]$l.heatAtProbe -cin @('hot', 'clear')) { $heat = [string]$l.heatAtProbe }
+                elseif ($offLease) { }
                 elseif ($l.PSObject.Properties['heatAtGrant'] -and [string]$l.heatAtGrant -cin @('hot', 'clear')) { $heat = [string]$l.heatAtGrant }
                 elseif ($l.PSObject.Properties['jobId'] -and $l.jobId) {
                     $ar = Resolve-VenueHistoryChild -Dir $dir -Child "agent-result-$($l.jobId).json"

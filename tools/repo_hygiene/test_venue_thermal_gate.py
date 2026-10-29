@@ -397,6 +397,41 @@ class ThermalGateModuleTests(unittest.TestCase):
         history({"heatAtProbe": "unknown", "heatAtGrant": "warm"})
         self.assertEqual(run()["heat"], ["clear", "unknown"])
 
+    def test_r7p2_a1_an_agent_heat_read_on_another_lease_is_never_charged_to_this_leases_predecessor(self) -> None:
+        # adversary r7 A1 on 83fd79de: b ran on a replacement lease (jobLease L2, onLease false, LEASE_LOST); its grant heat is L2's, yet the reader took it and charged it
+        # to a on L1, so a|cpu became heavy. The same holds for the agent-result sidecar's admission.heat (sibling): only a reading on the batch's own lease counts.
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-offlease-"))
+        a = {"name": "01-a-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "jobLease": "L1", "onLease": True, "heatAtProbe": "clear", "heatAtGrant": "clear"}
+
+        def history(b: dict) -> None:
+            (d / "batches.jsonl").write_text(json.dumps({"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, "token": "t", "leaseId": "L1", "legs": [a, b]}) + "\n", encoding="utf-8")
+
+        spread = ("$h = Read-VenueLegHeatHistory -RunDir @('<D>'); $hk = Get-VenueHeavyLegKeys -Rows @($h.rows); $items = @('a-A', 'a-B', 'b-A', 'b-B'); "
+                  "$flags = [bool[]]@($items | ForEach-Object { $hk.Contains(($_ -replace '-[AB]$', '') + '|cpu') }); "
+                  "[pscustomobject]@{ heat = @($h.rows | ForEach-Object { $_.heat }); heavy = @($hk.Keys); order = (@((Get-VenueThermalSpreadOrder -Items $items -Heavy $flags).items) -join ',') }")
+        run = lambda: ps_json(spread.replace("<D>", str(d)))  # noqa: E731
+        off = {"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "class": "LEASE_LOST", "counted": False, "jobLease": "L2", "onLease": False, "heatAtProbe": "unknown"}
+        history({**off, "heatAtGrant": "hot"})
+        got = run()
+        self.assertEqual((got["heat"], got["heavy"], got["order"]), (["clear", "unknown"], [], "a-A,a-B,b-A,b-B"), got)
+        # sibling: the sidecar's admission.heat of an off-lease job is not taken either
+        history({**off, "jobId": "j2", "heatAtGrant": "unknown"})
+        (d / "agent-result-j2.json").write_text(json.dumps({"admission": {"heat": "hot"}}), encoding="utf-8")
+        self.assertEqual(run()["heat"], ["clear", "unknown"])
+        # an onLease that is not exactly true (a string, null) is not proof of the same lease
+        for v in ("true", None):
+            history({**off, "onLease": v, "heatAtGrant": "hot"})
+            self.assertEqual(run()["heat"], ["clear", "unknown"], v)
+        # controls: on the batch's lease the grant and the sidecar are read; a row with no onLease field (LEG_FAILED, older receipts) keeps the sidecar read
+        history({**off, "jobLease": "L1", "onLease": True, "class": "QUIET_PRELOAD_OK", "heatAtGrant": "hot"})
+        self.assertEqual(run()["heat"], ["clear", "hot"])
+        history({"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "LEG_FAILED", "jobId": "j2", "heatAtProbe": "unknown"})
+        self.assertEqual(run()["heat"], ["clear", "hot"])
+        # the probe's own reading is the batch lease's, so it is kept whatever the job's lease
+        history({**off, "heatAtProbe": "hot"})
+        self.assertEqual(run()["heat"], ["clear", "hot"])
+
     def test_r6_a3_a_positive_infinity_mean_reaches_the_gate_as_hot_without_the_raw_json(self) -> None:
         # adversary r5 A3 on 09f9f657: a feed of 60 rows '2026,a,b,Infinity,10,No,No' is hot to the agent (+Infinity >= 88). The probe's JSON round trip turns the mean into the string
         # 'Infinity', the display printed 'mean=n/a' with no mean_exact, and with the raw JSON unwritable (a sharing violation) the gate read unknown and ran the leg.
