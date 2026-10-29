@@ -306,6 +306,42 @@ class ThermalGateModuleTests(unittest.TestCase):
             got_line = ps_json(tele(thr, disp, exact))
             self.assertEqual(got_line["heat"], want, (thr, disp, exact, got_line))
 
+    def test_r5p1_a1_a_display_line_with_mean_n_a_and_a_readable_count_still_decides_on_the_count(self) -> None:
+        # adversary r5 pass 1 A1: after the probe's JSON round trip a NaN / Infinity mean is a string, which Format-TelNum prints as 'n/a' WITHOUT the C unit and with no mean_exact:
+        # "mean=n/a throttled=7/60" matched no pattern, so the whole line read unknown and the gate ran the leg while the agent read hot
+        quiet = QUIET.read_text(encoding="utf-8")
+        self.assertIn("if ($null -eq $v -or -not ($v -is [ValueType])) { 'n/a' }", quiet)
+        line = lambda thr, rest="": f'"  tele heat source=x age=1.0s hottest=70.0C max15=70.0C mean=n/a throttled={thr}/60 W=10.0{rest}"'  # noqa: E731
+        got = ps_json(f"@((ConvertFrom-VenueProbeHeatLine -Lines @('  raw UNWRITABLE Access denied', {line(7)})), (ConvertFrom-VenueProbeHeatLine -Lines @({line(0)})), (ConvertFrom-VenueProbeHeatLine -Lines @({line(6)})), "
+                      "(ConvertFrom-VenueProbeHeatLine -Lines @('  tele heat source=unavailable age=n/a hottest=n/a max15=n/a mean=n/a throttled=n/a/n/a W=n/a')))")
+        self.assertEqual([g["heat"] for g in got], ["hot", "unknown", "unknown", "unknown"], got)
+        self.assertEqual((got[0]["throttled"], got[0]["window"], got[0]["source"]), (7, 60, "tele-line"))
+
+    def test_r5p1_a3_a_heat_from_entry_that_is_an_existing_path_is_kept_as_written(self) -> None:
+        # adversary r5 pass 1 A3: the normalizing line trimmed EVERY entry, an existing directory ' prior' included, so it became 'prior' (absent): the history was skipped and the
+        # plan kept its adjacent heavy legs. Only the pieces of a comma split are trimmed; an entry that is an existing path is left exactly as given.
+        import tempfile
+        root = Path(tempfile.mkdtemp(prefix="thermal-heatfrom-"))
+        (root / " prior").mkdir()
+        runner = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        line = [l for l in runner.splitlines() if re.match(r"^\$HeatFrom = @\(\$HeatFrom \| ForEach-Object", l)][0]
+        script = (f"$ErrorActionPreference='Stop'; Set-Location -LiteralPath '{root}'; $HeatFrom = @(' prior', ' no-such-a , no-such-b ', '.'); " + line
+                  + "; ConvertTo-Json -Compress -InputObject @($HeatFrom)")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads(r.stdout), [" prior", "no-such-a", "no-such-b", "."], r.stdout)
+
+    def test_r5p1_a2_nothing_but_the_process_start_follows_the_thermal_dispatch_admission(self) -> None:
+        # adversary r5 pass 1 A2: `& $pwshExe @qArgs *> $out` created the output file AFTER the admission, and that open can stall (a UNC RunDir): a probe was bought past the
+        # deadline. The probe's output is captured in the pipeline, and the file is written once it has returned.
+        runner = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8").replace("\r\n", "\n")
+        fn = runner[runner.index("function Invoke-QuietProbe("):runner.index("function Submit-AgentJob(")]
+        self.assertNotIn("*> $out", fn, "the redirect opens the output file after the admission")
+        marker = "return [pscustomobject]@{ expiredBeforeDispatch = $true }\n    }\n"
+        after = [l for l in fn[fn.index(marker) + len(marker):].splitlines() if l.strip() and not l.strip().startswith("#")]
+        self.assertTrue(after[0].lstrip().startswith("$captured = @(& $pwshExe @qArgs *>&1"), after[0])
+        self.assertIn("Set-Content -LiteralPath $out -Value $captured", fn)
+
     def test_r5_sol_b2_a6_a_drive_relative_history_dir_resolves_against_the_powershell_location_not_the_process_directory(self) -> None:
         import os
         import tempfile

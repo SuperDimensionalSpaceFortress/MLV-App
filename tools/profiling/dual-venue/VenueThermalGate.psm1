@@ -73,12 +73,14 @@ function ConvertFrom-VenueProbeHeatLine {
     # r3 pass 2 A4: the feed parser accepts signed temperatures (a sensor's -1 error value), so the mean may carry a sign: unsigned only, the line read unknown while throttled=7/60 is hot
     # r5 (B1): and it accepts NaN and Infinity, which the display prints as NaN, the culture's infinity symbol (U+221E) or Infinity: any non-numeric mean token is read as a
     # non-finite mean, so the throttled count that follows it still decides (hot > 6) instead of the whole line reading unknown
-    $m = [regex]::Match([string]$line, '\smean=(\S+?)C\s+throttled=([0-9]+)/([0-9]+)(?:\s|$)')
+    # r5 pass 1 A1: a probe whose telemetry went through its JSON round trip holds the non-finite mean as a string, which its display prints as 'n/a' with NO unit
+    # (Wait-VenueQuiet.ps1 Format-TelNum) and no mean_exact: 'mean=n/a throttled=7/60' is a non-finite mean with a readable count, so the count decides
+    $m = [regex]::Match([string]$line, '\smean=(?:(\S+?)C|n/a)\s+throttled=([0-9]+)/([0-9]+)(?:\s|$)')
     if (-not $m.Success) { return $none }
     $mean = 0.0; $thr = 0; $win = 0
     # r3 A2: the display mean is rounded to 0.1 C (87.96 prints 88.0): a probe that also prints mean_exact=<R> gives the exact value, which is what the heat rule is applied to
     $mx = [regex]::Match([string]$line, '\smean_exact=(-?[0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?|NaN|-?Infinity)(?:\s|$)')
-    $meanText = $(if ($mx.Success) { $mx.Groups[1].Value } else { $m.Groups[1].Value })
+    $meanText = $(if ($mx.Success) { $mx.Groups[1].Value } elseif ($m.Groups[1].Success) { $m.Groups[1].Value } else { 'n/a' })
     $inf = [string][char]0x221E
     if ($meanText -ceq $inf -or $meanText -ceq "+$inf") { $mean = [double]::PositiveInfinity }
     elseif ($meanText -ceq "-$inf") { $mean = [double]::NegativeInfinity }

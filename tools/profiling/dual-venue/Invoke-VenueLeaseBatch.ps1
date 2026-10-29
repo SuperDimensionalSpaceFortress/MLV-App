@@ -215,7 +215,7 @@ $legPlanMode = ($PSCmdlet.ParameterSetName -ceq 'Plan')
 $PlanOrder = @('AsGiven', 'Interleave', 'ThermalSpread') | Where-Object { $_ -ieq $PlanOrder } | Select-Object -First 1
 $HeatFrom = @($HeatFrom | Where-Object { $_ })
 # r3 pass 2 A5: a path Test-Path cannot probe (a NUL in it) is not an existing path, never a throw
-$HeatFrom = @($HeatFrom | ForEach-Object { $p = $_; $isPath = $(try { [bool](Test-Path -LiteralPath $p) } catch { $false }); if ($isPath) { $p } else { $p -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+$HeatFrom = @($HeatFrom | ForEach-Object { $p = $_; $isPath = $(try { [bool](Test-Path -LiteralPath $p) } catch { $false }); if ($isPath) { $p } else { $p -split ',' | ForEach-Object { $_.Trim() } } } | Where-Object { $_ })
 if ($HeatFrom.Count -gt 0 -and $PlanOrder -cne 'ThermalSpread') { Stop-Usage '-HeatFrom is read only by -PlanOrder ThermalSpread' }
 if (-not $legPlanMode -and (($LegSpec.Count -gt 0) -eq [bool]$LegSet)) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
 if (-not $AgentShare) { $AgentShare = try { [string](([IO.File]::ReadAllText((Join-Path $here 'venues.json')) | ConvertFrom-Json).venues.$Venue.agentShare) } catch { '' } }
@@ -757,9 +757,12 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $The
     if ($null -ne $ThermalState -and -not (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec (Get-ThermalElapsedSec $ThermalState -Ceiling) -SlowestReprobeSec $ThermalState.slowProbeSec -WantSleepSec $ThermalPollSec).mayDispatchNow) {
         return [pscustomobject]@{ expiredBeforeDispatch = $true }
     }
-    & $pwshExe @qArgs *> $out
+    # r5 pass 1 A2: the probe's output is CAPTURED, not redirected to the file: a `*>` file redirect opens (creates) the file after the admission above, and that open can stall on a share (a
+    # UNC RunDir), buying a probe past the deadline. Nothing but the process start follows the admission; the file is written (still the probe's evidence) after it returns.
+    $captured = @(& $pwshExe @qArgs *>&1 | ForEach-Object { [string]$_ })
     $code = $LASTEXITCODE
-    $lines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
+    try { Set-Content -LiteralPath $out -Value $captured -Encoding utf8 } catch { L "QUIET_OUT_UNWRITABLE path=$out reason=$($_.Exception.Message -replace '\s+', ' ')" }
+    $lines = $captured
     $v = $lines | Where-Object { $_ -match '^(QUIET|COOLDOWN_UNMET) mean=' } | Select-Object -Last 1
     $u = $lines | Where-Object { $_ -like 'VENUE_QUIET_UNKNOWN *' } | Select-Object -Last 1
     $ff = $lines | Where-Object { $_ -match '^FOREIGN_FLOOR ' } | Select-Object -Last 1
