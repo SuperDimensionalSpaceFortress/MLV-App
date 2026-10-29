@@ -8,6 +8,8 @@
         "tools.repo_hygiene.test_brokered_closeout.BrokeredCloseoutTests",
         "tools.repo_hygiene.test_dual_venue_evidence.EvidenceBoundReceiptTests",
         "tools.repo_hygiene.test_dual_venue_evidence.HeapDumpVenueHelperTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.ProductFailureTerminalsAreReceiptableTests",
+        "tools.repo_hygiene.test_dual_venue_evidence.ReceiptOracleVerdictTests",
         "tools.repo_hygiene.test_hub_vm_no_local_playback.PromptLintTests",
         "tools.repo_hygiene.test_playback_clip_length_gate.RuntimeBackstopBehaviourTests",
         "tools.repo_hygiene.test_venue_chain_runner.VenueChainRunnerTests"

@@ -147,7 +147,9 @@ HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip
                  "legs/m16-1457-headroom-stage-fullscreen-s1.json")
 # BACHELOR-CORE-PARTITION-AB-1: the core-partition legs (A whole machine, B1 P-cores, B2 P-cores + E-core load): the headroom unpaced windowed s1 shape
 # (a Cinematic Look-Assist pace leg at swap interval 0, so they carry the same presentTearingExpectedReason) plus the core-partition generatorArgs.
-PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload"))
+PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload",
+                                                                                              # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: A and B1 at a worker-thread cap of 12
+                                                                                              "a12", "b1-12-pcore"))
 # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: the live-histogram stop-cycle legs, cpu scale 1 at every-frame histogram, per display mode. Windowed runs Look Assist
 # OFF (the arm that computes the scope); fullscreen leaves Look Assist at the app's default, so it computes no scope and tests the stop with LA on.
 SCOPELIVE_LEGS = {f"legs/m16-1243-scopelive-cpu-{mode}-s1-histogram-i0.json": (mode, look_off) for mode, look_off in (("windowed", True), ("fullscreen", False))}
@@ -7000,7 +7002,8 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
             elif spec["card"] == "BACHELOR-CORE-PARTITION-AB-1":   # the core-partition A/B legs (cinematic pace legs), named by arm
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload)-unpaced-windowed-s1$", path.name)
+                # (VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 added a12 and b1-12-pcore: A and B1 at a worker-thread cap of 12)
+                self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload|a12|b1-12-pcore)-unpaced-windowed-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
@@ -11579,6 +11582,57 @@ class VenueProbeTelemetryGateTextTests(unittest.TestCase):
         proc = self.gate(dict(V2_PROBE, telemetry_schema=TEL_SCHEMA, heat="hot", gpu=7, last_lease=None))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+
+
+@requires_windows_pwsh
+class WorkerThreadsReceiptBlockIsReDerivedTests(EvidenceFactory, unittest.TestCase):
+    """VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 r2b (adversary A1): Test-DvReceiptValid re-derived the worker-thread VERDICT from the hashed run log and summary.json, but
+    never compared the receipt's own `workerThreads` block (requested / observed / verdict) to it, so a receipt could state a count the evidence does not carry."""
+
+    PROOF = {"playbackMaxThreadsRequested": 12, "playbackMaxThreadsSmoke": "12", "playbackWorkerThreadsRead": 12}
+    START = "playback_smoke.start session=3 position=0 scale_request=1 quality_mode=0 worker_threads=12 start_serial=2 env_force_threads=0"
+    BLOCK = {"requested": 12, "observed": 12, "verdict": "HONOURED"}
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def production(self, cap: int | None, with_block: dict | None):
+        spec = self.write_spec()
+        data = json.loads(spec.read_text(encoding="utf-8"))
+        if cap is not None:
+            data["generatorArgs"] = {"playbackMaxThreads": cap}
+        spec.write_text(json.dumps(data), encoding="utf-8")
+        repo = self.prod_repo(spec=spec)
+        ev = self.evidence("wt-" + hashlib.sha1(json.dumps([cap, with_block]).encode()).hexdigest()[:8], backend="cuda",
+                           extra_log_lines=[self.START] if cap is not None else [], summary=dict(self.PROOF) if cap is not None else None)
+        receipt = self.receipt_for(repo, ev, backend="cuda")
+        if with_block is not None:
+            receipt["workerThreads"] = dict(with_block)
+        return repo, receipt
+
+    def test_a_capped_receipt_whose_block_re_derives_is_advisory(self) -> None:
+        repo, receipt = self.production(12, self.BLOCK)
+        self.assertAdvisory(receipt, repo)
+
+    def test_a_receipt_that_misstates_the_worker_count_does_not_re_derive(self) -> None:
+        for name, block in (("count and verdict", {"requested": 16, "observed": 16, "verdict": "HONOURED"}),
+                            ("observed only", dict(self.BLOCK, observed=16)),
+                            ("requested only", dict(self.BLOCK, requested=16)),
+                            ("verdict only", dict(self.BLOCK, verdict="NOT_HONOURED")),
+                            ("observed erased", dict(self.BLOCK, observed=None))):
+            with self.subTest(case=name):
+                repo, receipt = self.production(12, block)
+                self.assertNotValid(receipt, repo, "WORKER_THREADS_NOT_FROM_EVIDENCE", status="INVALID")
+
+    def test_a_capped_receipt_with_no_block_is_incomplete(self) -> None:
+        repo, receipt = self.production(12, None)
+        self.assertNotValid(receipt, repo, "the receipt carries no workerThreads block", status="INCOMPLETE")
+
+    def test_an_uncapped_leg_is_unchanged_but_cannot_carry_a_block(self) -> None:
+        repo, receipt = self.production(None, None)
+        self.assertAdvisory(receipt, repo)
+        repo, receipt = self.production(None, self.BLOCK)
+        self.assertNotValid(receipt, repo, "WORKER_THREADS_NOT_FROM_EVIDENCE", status="INVALID")
 
 
 if __name__ == "__main__":

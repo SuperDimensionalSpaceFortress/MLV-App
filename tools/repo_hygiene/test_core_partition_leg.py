@@ -11,6 +11,7 @@ WHAT IS PINNED
   * the leg-spec schema accepts the three partition legs and refuses a bad mask or thread count;
   * the pure helpers (mask parse, topology class check, MHz math, feed window, counter summary, worker count, summary scalars) are lifted
     from the generator by AST and fed fixtures.
+VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 adds the playback worker-thread cap (generatorArgs.playbackMaxThreads -> -Threads <n>) and its fail-closed gate.
 No test launches MLVApp (owner rule 2026-10-11): the generator only writes job text, and the runner runs against stubs.
 """
 
@@ -2570,6 +2571,11 @@ function Get-CorePartitionMonoMs { [double]$global:cpClk }
 function Resolve-AttrCudaSmokeRunLog { param($ResultJsonPath, $ContainingRoot) if (-not $global:cpLog) { throw 'run log unresolvable' }; $h = (Get-FileHash -LiteralPath $global:cpLog -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($null -ne $global:cpSwap) { [IO.File]::WriteAllText($global:cpLog, $global:cpSwap) }
     [pscustomobject]@{ path = $global:cpLog; sha256 = $h } }
+# CORE-PARTITION-B1-STALL-TEST-FLAKE-1: the job's wall clock reads (Get-Date) follow the fake monotonic clock, so the job's measured wall/mono gap
+# is 0 whatever real time the host spends between this driver's steps. Against the real clock that gap was the real time between $now (below)
+# and the job's own read: over 250 ms on a loaded hosted runner it moved the start bound (the rows sit 500 ms past the playback start) and the
+# case published feed-no-rows-in-window, or one row fewer, intermittently. CP_WALL_STALL_MS (below) injects exactly that real time.
+function Get-Date { $L.AddMilliseconds($global:cpClk - 1000) }
 $row = "26.10.2026,12:01:00,x,99,99,Yes,Yes`n"
 function Read-CorePartitionFeedSince($Path, $Offset, $Before) {
     $m = $global:cpClk; $global:cpClk += 500
@@ -2597,6 +2603,7 @@ foreach ($k in $cases.Keys) {
     $corePartitionJobProc | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
     $now = [DateTime]::UtcNow
     $L = $now.AddMilliseconds(1000 - $c[0])
+    if ($env:CP_WALL_STALL_MS) { Start-Sleep -Milliseconds ([int]$env:CP_WALL_STALL_MS) }
     $W = { param([double]$m) $L.AddMilliseconds($m - 1000).Ticks }
     # r13c (CP-FEED-START-ANCHOR, rule (a)): a feed row's HWiNFO stamp (local d.M.yyyy,H:mm:ss.fff) for monotonic $m; the window row is stamped
     # at 2000, after the measured session's playback start (1500)
@@ -2681,11 +2688,29 @@ class CorePartitionR11Tests(unittest.TestCase):
         proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(work)})
         cls.raw = proc
         cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+        # CORE-PARTITION-B1-STALL-TEST-FLAKE-1: the same driver with 600 ms of real time between its wall-clock anchor and the job's reads
+        stalled = cls.tmp / "cleanup-stalled"
+        stalled.mkdir()
+        cls.raw_stalled = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(stalled), "CP_WALL_STALL_MS": "600"})
+        cls.r_stalled = json.loads(cls.raw_stalled.stdout.strip().splitlines()[-1]) if cls.raw_stalled.returncode == 0 and cls.raw_stalled.stdout.strip() else None
 
     def setUp(self) -> None:
         self.assertIsNotNone(self.r, f"the lifted cleanup region did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
         for case, got in self.r.items():
             self.assertNotIn("threw", got, f"{case}: {got}")
+
+    def test_host_time_between_the_drivers_steps_is_not_the_jobs_clock_skew(self) -> None:
+        """CORE-PARTITION-B1-STALL-TEST-FLAKE-1 (CI run 40711418664, merge_group pr-708): the driver's fake monotonic clock is anchored on one
+        wall read, and the job reads the wall clock again at its end stamp; real host time between the two was the job's wall/mono skew. Over
+        250 ms (the control's rows sit 500 ms past the playback start, so the start bound's 2 x skew passes them) the control published
+        feed-no-rows-in-window. With 600 ms injected between the anchor and the job's reads, every case must read exactly as it does unstalled,
+        the control still publishing its in-window row and its published window boundary unmoved."""
+        self.assertIsNotNone(self.r_stalled, f"the stalled run did not run: {self.raw_stalled.stdout[-3000:]}{self.raw_stalled.stderr[-3000:]}")
+        for case, got in self.r_stalled.items():
+            self.assertNotIn("threw", got, f"{case}: {got}")
+        self.assertEqual(self.r_stalled, self.r, "600 ms of host time between the driver's steps changed a case's outcome")
+        control = self.r_stalled["zero-delay-control"]
+        self.assertEqual([control["rows"], control["watts"], control["temp"], control["why"]], [1, 99.0, 99.0, ""], control)
 
     def test_b1_a_stall_in_cleanup_after_the_smoke_returns_does_not_move_the_window_end(self) -> None:
         """B1 (sol r10 B1, literal): the smoke ends at 21000 and the job's affinity restore stalls 40 s (or 80 s); the 99 W / 99 C row appended
@@ -2930,11 +2955,30 @@ class CorePartitionR13StartTests(unittest.TestCase):
         proc = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(work)})
         cls.raw = proc
         cls.r = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 and proc.stdout.strip() else None
+        # CORE-PARTITION-R13C-ROW-COUNT-FLAKE-1: the same driver with 600 ms of real time between its wall-clock anchor and the job's reads
+        stalled = cls.tmp / "cleanup-stalled"
+        stalled.mkdir()
+        cls.raw_stalled = run_pwsh(["-File", str(script)], env_extra={"CP_GEN": str(GENERATOR), "CP_DIR": str(stalled), "CP_WALL_STALL_MS": "600"})
+        cls.r_stalled = json.loads(cls.raw_stalled.stdout.strip().splitlines()[-1]) if cls.raw_stalled.returncode == 0 and cls.raw_stalled.stdout.strip() else None
 
     def setUp(self) -> None:
         self.assertIsNotNone(self.r, f"the lifted cleanup region did not run: {self.raw.stdout[-3000:]}{self.raw.stderr[-3000:]}")
         for case, got in self.r.items():
             self.assertNotIn("threw", got, f"{case}: {got}")
+
+    def test_host_time_between_the_drivers_steps_does_not_move_the_start_bound(self) -> None:
+        """CORE-PARTITION-R13C-ROW-COUNT-FLAKE-1 (hosted run 40807694575, PR 709 shard 4/8: 29 != 30 and 65 != 66 rows): the same driver
+        anchor as the r11 cases, so the same mechanism. The playback rows sit 500 ms past the playback start and the start bound is the start
+        plus twice the job's wall/mono skew, so real host time between the driver's anchor and the job's wall read (over 250 ms) dropped the
+        first playback row. With 600 ms injected between them, the dot counterexample and the real venue shape still publish 30 and 66 rows,
+        and the stalled outcome of every case is the unstalled one."""
+        self.assertIsNotNone(self.r_stalled, f"the stalled run did not run: {self.raw_stalled.stdout[-3000:]}{self.raw_stalled.stderr[-3000:]}")
+        for case, got in self.r_stalled.items():
+            self.assertNotIn("threw", got, f"{case}: {got}")
+        for case, rows in (("dot-60s-idle-then-30s-playback", 30), ("real-shape-first-line-to-start-23600", 66)):
+            got = self.r_stalled[case]
+            self.assertEqual([got["rows"], got["wattsMean"], got["tempMean"], got["why"]], [rows, 100.0, 80.0, ""], got)
+        self.assertEqual({k: v["why"] for k, v in self.r_stalled.items()}, {k: v["why"] for k, v in self.r.items()})
 
     def test_r13c_dot_counterexample_reports_the_playback_means_not_a_refusal(self) -> None:
         """Dot 6452868627 (literal): 60 s of startup rows (10 W / 30 C) then 30 s of playback rows (100 W / 80 C) in a 90 s window that passes the
@@ -3201,6 +3245,432 @@ class CorePartitionSpecTests(unittest.TestCase):
                 broken["generatorArgs"][key] = spec["generatorArgs"][key] + eol
                 with self.subTest(field=key, eol=eol), self.assertRaises(jsonschema.ValidationError):
                     jsonschema.validate(broken, self.schema)
+
+
+# --- VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: a leg sets the app's playback worker-thread cap ---------------------------------------------------
+# generatorArgs.playbackMaxThreads (1..16) -> Invoke-VenueLeg -PlaybackMaxThreads -> the smoke runner's EXISTING -Threads <n> (which sets
+# MLVAPP_PLAYBACK_MAX_THREADS for the app and records playbackMaxThreads in its result.json). FAIL CLOSED: the leg is INVALID
+# (WORKER_THREADS_NOT_HONOURED) unless the measured session's worker_threads= and the job's proof fields all say n.
+# The commit this card branched from: a job generated without the key must still be this commit's job, byte for byte.
+THREADS_BASE_COMMIT = "293b0b818dd268d81bc5aa667b3ae7a021f02b24"
+THREADS_OPEN = "# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 >>>"
+THREADS_CLOSE = "# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 <<<"
+THREADS_REGION = re.compile(r"(?ms)^[ \t]*" + re.escape(THREADS_OPEN) + r"\n.*?^[ \t]*" + re.escape(THREADS_CLOSE) + r"\n")
+# new leg -> (its source leg, the cap it adds)
+THREADS_LEGS = {
+    "legs/m16-1243-partition-a12-unpaced-windowed-s1.json": "legs/m16-1243-partition-a-unpaced-windowed-s1.json",
+    "legs/m16-1243-partition-b1-12-pcore-unpaced-windowed-s1.json": "legs/m16-1243-partition-b1-pcore-unpaced-windowed-s1.json",
+}
+THREADS_SHAPES = {"default": [], "b1": ARM_B1}
+
+
+@requires_windows_pwsh
+class PlaybackMaxThreadsGeneratorTests(unittest.TestCase):
+    """The generator forwards -PlaybackMaxThreads as the smoke runner's -Threads <n>; absent (or 0) the job is the base commit's, byte for byte."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="max-threads-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.head = git("rev-parse", "HEAD")
+        cls.repo = cls.tmp / "repo"
+        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(cls.repo)], check=True)
+        subprocess.run(["git", "-C", str(cls.repo), "sparse-checkout", "set", "--cone", "tools", "tests/fixtures/clips"], check=True)
+        subprocess.run(["git", "-C", str(cls.repo), "checkout", "-q", cls.head], check=True)
+        for stem in FIXTURE_IDS:
+            write_synthetic_mlv(cls.repo / "tests" / "fixtures" / "clips" / (stem + MLV_EXT), FRAMES_30S_AT_23976)
+        cls.base_available = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{THREADS_BASE_COMMIT}^{{commit}}"], capture_output=True).returncode == 0
+        base_root = cls.tmp / "base"
+        base_generator = base_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
+        if cls.base_available:
+            tar = cls.tmp / "base.tar"
+            subprocess.run(["git", "-C", str(ROOT), "archive", THREADS_BASE_COMMIT, "--format=tar", "-o", str(tar), "tools/profiling", "tools/gates"], check=True)
+            base_root.mkdir()
+            subprocess.run(["tar", "-xf", str(tar), "-C", str(base_root)], check=True)
+        requests: list[tuple[str, Path, list[str]]] = []
+        for name, shape in THREADS_SHAPES.items():
+            requests += [(f"head-{name}", GENERATOR, shape), (f"zero-{name}", GENERATOR, [*shape, "-PlaybackMaxThreads", "0"]),
+                         (f"t12-{name}", GENERATOR, [*shape, "-PlaybackMaxThreads", "12"])]
+            if cls.base_available:
+                requests.append((f"base-{name}", base_generator, shape))
+        requests += [(f"t{n}", GENERATOR, ["-PlaybackMaxThreads", str(n)]) for n in (1, 16, 17, -1)]
+        cls.out = {}
+        commands = []
+        for key, script, extra in requests:
+            out = cls.tmp / f"{key}.job.ps1"
+            cls.out[key] = out
+            commands.append(["-File", str(script), "-SourceCommit", cls.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0],
+                             "-FixtureSha256", "cd" * 32, "-RepoRoot", str(cls.repo), "-OutFile", str(out), *extra])
+        cls.proc = dict(zip([k for k, _s, _e in requests], run_pwsh_many(commands)))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def job(self, key: str) -> str:
+        proc = self.proc[key]
+        self.assertEqual(proc.returncode, 0, f"{key}: {proc.stdout[-2000:]}{proc.stderr[-2000:]}")
+        return self.out[key].read_bytes().decode("utf-8")
+
+    def test_an_absent_or_zero_cap_emits_the_base_commits_job_byte_for_byte(self) -> None:
+        if not self.base_available:
+            self.skipTest(f"base commit {THREADS_BASE_COMMIT} is not in this clone")
+        for name in THREADS_SHAPES:
+            base = self.job(f"base-{name}")
+            for key in (f"head-{name}", f"zero-{name}"):
+                with self.subTest(job=key):
+                    self.assertEqual(self.job(key), base, f"{key}: a job without a playback thread cap changed")
+
+    def test_a_requested_cap_reaches_the_smoke_runner_as_its_existing_threads_argument(self) -> None:
+        for name in THREADS_SHAPES:
+            with self.subTest(job=name):
+                job, plain = self.job(f"t12-{name}"), self.job(f"head-{name}")
+                self.assertEqual(job.count(" -Threads 12 "), 1, "the cap is passed exactly once")
+                smoke = [line for line in job.splitlines() if line.startswith("$cmd = \"& ") and " -Threads 12 " in line]
+                self.assertEqual(len(smoke), 1, "the -Threads argument sits on the smoke runner's command line")
+                self.assertIn(" -UsePersistedPlaybackSettings ", smoke[0])
+                self.assertEqual(job.count("MLVAPP_PLAYBACK_MAX_THREADS"), plain.count("MLVAPP_PLAYBACK_MAX_THREADS"), "no new environment variable route")
+                self.assertEqual(job.count("MLVAPP_FORCE_THREADS"), plain.count("MLVAPP_FORCE_THREADS"), "no new environment variable route")
+
+    def test_the_only_other_change_is_the_bracketed_proof_region(self) -> None:
+        for name in THREADS_SHAPES:
+            with self.subTest(job=name):
+                job = lf(self.job(f"t12-{name}"))
+                self.assertEqual(job.count(THREADS_OPEN), 2, "one proof block before the success summary and one key block inside it")
+                self.assertIn("    playbackMaxThreadsRequested = 12\n", job)
+                for key in ("playbackMaxThreadsSmoke", "playbackWorkerThreadsRead", "playbackWorkerThreadsReadWhy"):
+                    self.assertRegex(job, rf"(?m)^    {key} = \$playbackMaxThreadsProof\.", key)
+                self.assertIn("function Get-CorePartitionWorkerThreads(", job, "the job's own worker_threads= read is spliced in")
+                self.assertEqual(THREADS_REGION.sub("", job).replace(" -Threads 12 ", " ", 1), lf(self.job(f"head-{name}")))
+
+    def test_the_proof_region_reads_the_smoke_results_launch_block(self) -> None:
+        # adversary r1 A1 (5944348f): run-release-gui-smoke.ps1 writes playbackMaxThreads under launch.matchedUserShellDefaults; the job read a
+        # top-level matchedUserShellDefaults, so an honoured cap published playbackMaxThreadsSmoke=null and the leg went INVALID. Run the job's own region.
+        job = lf(self.job("t12-default"))
+        region = THREADS_REGION.search(job).group(0)
+        script = ("function Write-JobTrace([string]$Message) { }\n$rawLog = $env:MT_LOG\n$resultJson = $env:MT_RESULT | ConvertFrom-Json -Depth 100\n"
+                  ". ([scriptblock]::Create($env:MT_REGION))\n$playbackMaxThreadsProof | ConvertTo-Json -Compress")
+        log = "playback_smoke.start session=3 scale_request=1 worker_threads=12 start_serial=2\n"
+        for name, result, smoke in (("runner shape", {"launch": {"matchedUserShellDefaults": {"playbackMaxThreads": "12"}}}, "12"),
+                                    ("auto", {"launch": {"matchedUserShellDefaults": {"playbackMaxThreads": "auto/unset"}}}, "auto/unset"),
+                                    ("top level only", {"matchedUserShellDefaults": {"playbackMaxThreads": "12"}}, None)):
+            with self.subTest(case=name):
+                proc = run_pwsh(["-Command", script], env_extra={"MT_LOG": log, "MT_RESULT": json.dumps(result), "MT_REGION": region})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(json.loads(proc.stdout), {"smoke": smoke, "workers": 12, "why": None})
+        runner = (ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1").read_text(encoding="utf-8")
+        self.assertRegex(runner, r"(?s)\n    launch = \[pscustomobject\]@\{.*?\n        matchedUserShellDefaults = \[pscustomobject\]@\{\s*\n[^}]*?playbackMaxThreads = ",
+                         "the smoke runner still records playbackMaxThreads under launch.matchedUserShellDefaults")
+
+    def test_the_capped_jobs_parse(self) -> None:
+        paths = [str(self.out[f"t12-{name}"]) for name in THREADS_SHAPES if self.proc[f"t12-{name}"].returncode == 0]
+        self.assertEqual(len(paths), len(THREADS_SHAPES), "every capped job was generated")
+        script = ("$bad = @(); foreach ($p in $env:MT_JOBS.Split('|')) { $e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile($p, [ref]$null, [ref]$e); "
+                  "if ($e.Count) { $bad += \"$p $($e[0].Message)\" } }; $bad -join \"`n\"")
+        proc = run_pwsh(["-Command", script], env_extra={"MT_JOBS": "|".join(paths)})
+        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, ""), proc.stderr)
+
+    def test_the_cap_is_1_to_16(self) -> None:
+        for n in (1, 16):
+            with self.subTest(n=n):
+                self.assertIn(f" -Threads {n} ", self.job(f"t{n}"))
+        for n in (17, -1):
+            with self.subTest(n=n):
+                self.assertNotEqual(self.proc[f"t{n}"].returncode, 0, f"the generator accepted -PlaybackMaxThreads {n}")
+
+
+# --- VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 r2: every smoke-command edit is anchored on the ONE smoke command line -------------------------------
+# sol r1 (issuecomment-6486231859): -AgentRoot allows spaces, so an accepted root that spells ' -UsePersistedPlaybackSettings ' (or ' -Scope none ')
+# is substituted into the template, and a whole-text anchor then counts two matches and the generator refuses a legitimate leg. The class: the -Threads,
+# -Unpaced and -Scope edits all matched the whole expanded text; caller data elsewhere must never change their match count.
+ANCHOR_COLLISION_ROOTS = {
+    "persisted": "C:\\mlvtmp\\agent -UsePersistedPlaybackSettings x",
+    "scope": "C:\\mlvtmp\\agent -Scope none x",
+}
+ANCHOR_ORDINARY_ROOT = "C:\\mlvtmp\\agent"
+
+
+@requires_windows_pwsh
+class SmokeCommandAnchorScopeTests(unittest.TestCase):
+    """The smoke-command edits (-Threads, -Unpaced -DropFrameMode off, -Scope) touch the smoke command line only, whatever -AgentRoot spells."""
+
+    CASES = {
+        **{f"threads{n}-persisted": ("persisted", ["-PlaybackMaxThreads", str(n)]) for n in (1, 12, 16)},
+        "threads12-scope": ("scope", ["-PlaybackMaxThreads", "12"]),
+        "unpaced-persisted": ("persisted", ["-Unpaced"]),
+        "scope-scope": ("scope", ["-Scope", "histogram"]),
+        "scope-persisted": ("persisted", ["-Scope", "histogram"]),
+        "all-persisted": ("persisted", ["-Unpaced", "-Scope", "histogram", "-PlaybackMaxThreads", "12"]),
+        "all-scope": ("scope", ["-Unpaced", "-Scope", "histogram", "-PlaybackMaxThreads", "12"]),
+    }
+    CONTROLS = {
+        **{f"threads{n}-ordinary": ["-PlaybackMaxThreads", str(n)] for n in (1, 12, 16)},
+        "unpaced-ordinary": ["-Unpaced"],
+        "scope-ordinary": ["-Scope", "histogram"],
+        "all-ordinary": ["-Unpaced", "-Scope", "histogram", "-PlaybackMaxThreads", "12"],
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="smoke-anchor-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.head = git("rev-parse", "HEAD")
+        cls.repo = cls.tmp / "repo"
+        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(cls.repo)], check=True)
+        subprocess.run(["git", "-C", str(cls.repo), "sparse-checkout", "set", "--cone", "tools", "tests/fixtures/clips"], check=True)
+        subprocess.run(["git", "-C", str(cls.repo), "checkout", "-q", cls.head], check=True)
+        for stem in FIXTURE_IDS:
+            write_synthetic_mlv(cls.repo / "tests" / "fixtures" / "clips" / (stem + MLV_EXT), FRAMES_30S_AT_23976)
+        requests: list[tuple[str, list[str]]] = []
+        for key, (root, extra) in cls.CASES.items():
+            requests.append((key, ["-AgentRoot", ANCHOR_COLLISION_ROOTS[root], *extra]))
+        for root, spelled in ANCHOR_COLLISION_ROOTS.items():
+            requests.append((f"plain-{root}", ["-AgentRoot", spelled]))
+        for key, extra in cls.CONTROLS.items():
+            requests.append((key, ["-AgentRoot", ANCHOR_ORDINARY_ROOT, *extra]))
+        cls.out = {}
+        commands = []
+        for key, extra in requests:
+            out = cls.tmp / f"{key}.job.ps1"
+            cls.out[key] = out
+            commands.append(["-File", str(GENERATOR), "-SourceCommit", cls.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0],
+                             "-FixtureSha256", "cd" * 32, "-RepoRoot", str(cls.repo), "-OutFile", str(out), *extra])
+        cls.proc = dict(zip([k for k, _e in requests], run_pwsh_many(commands)))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def job(self, key: str) -> str:
+        proc = self.proc[key]
+        self.assertEqual(proc.returncode, 0, f"{key}: {proc.stdout[-2000:]}{proc.stderr[-2000:]}")
+        return self.out[key].read_bytes().decode("utf-8")
+
+    def smoke_lines(self, job: str) -> list[str]:
+        return [line for line in job.splitlines() if line.startswith('$cmd = "& ')]
+
+    def test_an_agent_root_spelling_an_anchor_does_not_change_the_edit(self) -> None:
+        for key, (root, extra) in self.CASES.items():
+            with self.subTest(job=key):
+                job, plain = self.job(key), self.job(f"plain-{root}")
+                smoke = self.smoke_lines(job)
+                self.assertEqual(len(smoke), 1, "one smoke command line")
+                cap = "12"
+                if "-PlaybackMaxThreads" in extra:
+                    cap = extra[extra.index("-PlaybackMaxThreads") + 1]
+                    self.assertEqual(job.count(f" -Threads {cap} "), 1, "the cap is passed exactly once")
+                    self.assertIn(f" -Threads {cap} -UsePersistedPlaybackSettings ", smoke[0])
+                if "-Unpaced" in extra:
+                    self.assertEqual(smoke[0].count(" -DropFrameMode off "), 1)
+                if "-Scope" in extra:
+                    self.assertEqual(smoke[0].count(" -Scope histogram "), 1)
+                    self.assertNotIn(" -Scope none ", smoke[0])
+                # caller data is never edited: every spelling of the root survives, and no edit lands in it
+                self.assertEqual(job.count(ANCHOR_COLLISION_ROOTS[root]), plain.count(ANCHOR_COLLISION_ROOTS[root]))
+                spelled = ANCHOR_COLLISION_ROOTS[root]
+                for anchor, edit in ((" -UsePersistedPlaybackSettings ", " -DropFrameMode off -UsePersistedPlaybackSettings "),
+                                     (" -UsePersistedPlaybackSettings ", f" -Threads {cap} -UsePersistedPlaybackSettings "), (" -Scope none ", " -Scope histogram ")):
+                    if anchor in spelled:
+                        self.assertNotIn(spelled.replace(anchor, edit), job, f"an edit landed inside the -AgentRoot text ({edit.strip()})")
+
+    def test_ordinary_roots_still_get_the_same_single_edit(self) -> None:
+        for key, extra in self.CONTROLS.items():
+            with self.subTest(job=key):
+                job = self.job(key)
+                smoke = self.smoke_lines(job)
+                self.assertEqual(len(smoke), 1)
+                if "-PlaybackMaxThreads" in extra:
+                    cap = extra[extra.index("-PlaybackMaxThreads") + 1]
+                    self.assertEqual(job.count(f" -Threads {cap} "), 1)
+                    self.assertIn(f" -Threads {cap} -UsePersistedPlaybackSettings ", smoke[0])
+                if "-Unpaced" in extra:
+                    self.assertEqual(job.count(" -DropFrameMode off "), 1)
+                if "-Scope" in extra:
+                    self.assertEqual(job.count(" -Scope histogram "), 1)
+
+    def test_the_colliding_root_job_is_the_ordinary_root_job_with_the_root_swapped(self) -> None:
+        # the same leg on a colliding root differs from the ordinary-root job only by the root text itself
+        for key, ordinary in (("all-persisted", "all-ordinary"), ("all-scope", "all-ordinary")):
+            root = ANCHOR_COLLISION_ROOTS[self.CASES[key][0]]
+            with self.subTest(job=key):
+                self.assertEqual(self.job(key).replace(root, ANCHOR_ORDINARY_ROOT), self.job(ordinary))
+
+
+@requires_windows_pwsh
+class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
+    """Get-DvWorkerThreadsEvidence, pure: a capped leg counts only when the measured session's worker_threads= and the job's proof fields all say n."""
+
+    CAPPED = {"generatorArgs": {"playbackMaxThreads": 12}}
+    PROOF = {"result": "MEASUREMENT_CAPTURED", "playbackMaxThreadsRequested": 12, "playbackMaxThreadsSmoke": "12", "playbackWorkerThreadsRead": 12}
+
+    def verdict(self, spec: dict, log: str, summary: dict | None) -> dict:
+        from tools.repo_hygiene.test_dual_venue_evidence import run_pwsh_json
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n$m = $env:DVE_SUMMARY | ConvertFrom-Json\n"
+                                  "(Get-DvWorkerThreadsEvidence -Spec $s -LogText $env:DVE_LOG -Summary $m) | ConvertTo-Json -Compress",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log, DVE_SUMMARY=json.dumps(summary))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    @staticmethod
+    def log(*start: str) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", *start, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+
+    @staticmethod
+    def start(workers: str, session: int = 3) -> str:
+        return f"playback_smoke.start session={session} position=0 scale_request=1 quality_mode=0 worker_threads={workers} start_serial=2 env_force_threads=0"
+
+    def test_honoured_only_when_the_log_and_every_proof_field_say_n(self) -> None:
+        v = self.verdict(self.CAPPED, self.log(self.start("12")), self.PROOF)
+        self.assertEqual((v["requested"], v["observed"], v["verdict"], v["blocks"]), (12, 12, "HONOURED", False))
+
+    def test_a_mismatched_worker_count_blocks(self) -> None:
+        for name, log, summary in (("log 16", self.log(self.start("16")), self.PROOF),
+                                   ("job read 16", self.log(self.start("12")), dict(self.PROOF, playbackWorkerThreadsRead=16)),
+                                   ("smoke auto", self.log(self.start("12")), dict(self.PROOF, playbackMaxThreadsSmoke="auto/unset")),
+                                   ("job generated for 16", self.log(self.start("12")), dict(self.PROOF, playbackMaxThreadsRequested=16))):
+            with self.subTest(case=name):
+                v = self.verdict(self.CAPPED, log, summary)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("worker_threads=16", self.verdict(self.CAPPED, self.log(self.start("16")), self.PROOF)["reason"])
+
+    def test_an_unreadable_worker_count_blocks_never_passes(self) -> None:
+        for name, log, summary in (("no start line", self.log(), self.PROOF),
+                                   ("not a number", self.log(self.start("abc")), self.PROOF),
+                                   ("another session's line", self.log(self.start("12", session=2)), self.PROOF),
+                                   ("no log", "", self.PROOF),
+                                   ("no summary", self.log(self.start("12")), None),
+                                   ("job read null", self.log(self.start("12")), dict(self.PROOF, playbackWorkerThreadsRead=None)),
+                                   ("captured summary without the proof", self.log(self.start("12")), {"result": "MEASUREMENT_CAPTURED"})):
+            with self.subTest(case=name):
+                v = self.verdict(self.CAPPED, log, summary)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("unreadable", self.verdict(self.CAPPED, self.log(), self.PROOF)["reason"])
+
+    def test_a_failure_terminal_summary_without_the_proof_is_judged_on_the_run_log(self) -> None:
+        terminal = {"result": "CPU_FALLBACK_DETECTED"}
+        self.assertEqual(self.verdict(self.CAPPED, self.log(self.start("12")), terminal)["verdict"], "HONOURED")
+        self.assertTrue(self.verdict(self.CAPPED, self.log(self.start("16")), terminal)["blocks"])
+        self.assertTrue(self.verdict(self.CAPPED, self.log(self.start("12")), dict(terminal, playbackWorkerThreadsRead=16))["blocks"], "a field it does state must agree")
+
+    def test_only_a_recognised_failure_terminal_may_omit_the_proof(self) -> None:
+        # adversary r1 A1 (2166f68a): a summary with no result, or a result that is not exactly a capture or a known failure terminal, skipped the proof
+        # checks and PASSed on the run log alone. Only the runner's own $script:FailureTerminals may omit the proof fields.
+        log = self.log(self.start("12"))
+        for name, summary in (("no result", {"backend": "cuda", "gpuFramesTotal": 600, "cpuFrames": 0}),
+                              ("lower-case capture", {"result": "measurement_captured"}),
+                              ("unknown token", {"result": "SOMETHING_ELSE"}),
+                              ("non-string result", {"result": 7}),
+                              ("lower-case terminal", {"result": "cpu_fallback_detected"})):
+            with self.subTest(case=name):
+                v = self.verdict(self.CAPPED, log, summary)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        for terminal in ("GPU_RECON_FRAMES_ZERO", "CPU_FALLBACK_DETECTED", "CPU_BACKEND_PATH_MISMATCH", "PRESENTMON_UNAVAILABLE"):
+            with self.subTest(terminal=terminal):
+                self.assertEqual(self.verdict(self.CAPPED, log, {"result": terminal})["verdict"], "HONOURED")
+
+    def test_a_leg_that_does_not_ask_never_blocks(self) -> None:
+        for spec in ({}, {"generatorArgs": {"unpaced": True}}):
+            v = self.verdict(spec, self.log(self.start("16")), {"result": "MEASUREMENT_CAPTURED"})
+            self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), spec)
+
+    def test_the_runner_and_the_validator_both_gate_on_it(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $ev.logText -Summary $ev.summary", module)
+        self.assertIn('if ($workerThreadsVerdict.blocks) { $invalid.Add("WORKER_THREADS_NOT_HONOURED:', module)
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $runLogText -Summary $summary", runner)
+        self.assertIn("WORKER_THREADS_NOT_HONOURED", runner)
+
+
+THREADS_STUB_GENERATOR = STUB_GENERATOR.replace(PARAMS_ANCHOR, "$AutomationSettingsDir,$GpuPreLaunches,$PlaybackMaxThreads)")
+
+
+@requires_windows_pwsh
+class PlaybackMaxThreadsRunnerTests(RunnerHarness, unittest.TestCase):
+    """The full runner path (offline test mode, stub generator and job artifacts): the key is mapped, and the leg's outcome is gated on the proof."""
+
+    PROOF = PlaybackWorkerThreadsEvidenceTests.PROOF
+
+    def setUp(self) -> None:
+        self.assertEqual(STUB_GENERATOR.count(PARAMS_ANCHOR), 1, "the stub generator's param list moved")
+        self.make_harness()
+        self.gen.write_text(THREADS_STUB_GENERATOR, encoding="utf-8")
+
+    def spec_with(self, args: dict | None, leg_id: str) -> Path:
+        path = self.write_spec(leg_id=leg_id)
+        spec = json.loads(path.read_text(encoding="utf-8"))
+        if args is not None:
+            spec["generatorArgs"] = args
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def leg(self, args: dict | None, leg_id: str, workers: str | None, summary: dict | None) -> dict:
+        start = [PlaybackWorkerThreadsEvidenceTests.start(workers)] if workers is not None else []
+        self.write_artifacts(summary=summary, extra_log_lines=start)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec_with(args, leg_id), extra=["-Backend", "cpu"])
+        self.assertIsNotNone(receipt, proc.stdout[-2000:] + proc.stderr[-2000:])
+        return receipt
+
+    def test_the_key_is_mapped_and_an_absent_key_maps_nothing(self) -> None:
+        self.leg({"playbackMaxThreads": 12}, "mt-mapped", "12", self.PROOF)
+        self.assertIn("PlaybackMaxThreads=12", self.generator_calls()[-1])
+        self.leg(None, "mt-absent", "16", None)
+        self.assertNotIn("PlaybackMaxThreads=", self.generator_calls()[-1])
+
+    def test_an_honoured_cap_passes_and_the_receipt_says_so(self) -> None:
+        receipt = self.leg({"playbackMaxThreads": 12}, "mt-ok", "12", self.PROOF)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertEqual((receipt["workerThreads"]["requested"], receipt["workerThreads"]["observed"], receipt["workerThreads"]["verdict"]), (12, 12, "HONOURED"))
+
+    def test_a_mismatched_receipt_is_invalid_worker_threads_not_honoured(self) -> None:
+        receipt = self.leg({"playbackMaxThreads": 12}, "mt-16", "16", dict(self.PROOF, playbackWorkerThreadsRead=16))
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("WORKER_THREADS_NOT_HONOURED", receipt["outcomeDetail"])
+        self.assertEqual(receipt["workerThreads"]["verdict"], "NOT_HONOURED")
+
+    def test_an_unreadable_receipt_is_invalid_never_pass(self) -> None:
+        receipt = self.leg({"playbackMaxThreads": 12}, "mt-none", None, {"playbackMaxThreadsRequested": 12})
+        self.assertEqual(receipt["outcome"], "INVALID", receipt["outcomeDetail"])
+        self.assertIn("WORKER_THREADS_NOT_HONOURED", receipt["outcomeDetail"])
+
+    def test_a_leg_without_the_key_is_unchanged(self) -> None:
+        receipt = self.leg(None, "mt-legacy", "16", None)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertNotIn("workerThreads", receipt)
+
+
+class PlaybackMaxThreadsSpecTests(unittest.TestCase):
+    def setUp(self) -> None:
+        try:
+            import jsonschema  # noqa: F401
+        except ImportError:
+            self.skipTest("jsonschema is not installed")
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def test_each_new_leg_is_its_source_plus_only_the_cap_of_12(self) -> None:
+        import jsonschema
+        for rel, source_rel in THREADS_LEGS.items():
+            with self.subTest(leg=rel):
+                spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+                source = json.loads((DV / source_rel).read_text(encoding="utf-8"))
+                jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertEqual(spec["generatorArgs"].get("playbackMaxThreads"), 12)
+                self.assertTrue(spec["generatorArgs"]["forceLookAssist"], "Look Assist stays on, as in the source (D4b)")
+                want = json.loads(json.dumps(source))
+                want["legId"] = spec["legId"]
+                want["generatorArgs"]["playbackMaxThreads"] = 12
+                self.assertEqual(spec, want)
+
+    def test_the_schema_accepts_1_to_16_and_refuses_the_rest(self) -> None:
+        import jsonschema
+        spec = json.loads((DV / next(iter(THREADS_LEGS))).read_text(encoding="utf-8"))
+        for n in (1, 16):
+            with self.subTest(n=n):
+                jsonschema.validate(dict(spec, generatorArgs=dict(spec["generatorArgs"], playbackMaxThreads=n)), self.schema)
+        for bad in (0, 17, -1, "12", 12.5, True):
+            with self.subTest(bad=bad), self.assertRaises(jsonschema.ValidationError):
+                jsonschema.validate(dict(spec, generatorArgs=dict(spec["generatorArgs"], playbackMaxThreads=bad)), self.schema)
 
 
 if __name__ == "__main__":

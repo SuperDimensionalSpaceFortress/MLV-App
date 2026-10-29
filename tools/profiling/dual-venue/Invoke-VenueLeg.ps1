@@ -461,6 +461,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['partitionLoadThreads']) { $gen['PartitionLoadThreads'] = [int]$spec.generatorArgs.partitionLoadThreads }
         if ($spec.generatorArgs.PSObject.Properties['corePartitionTelemetry'] -and [bool]$spec.generatorArgs.corePartitionTelemetry) { $gen['CorePartitionTelemetry'] = $true }
         if ($spec.generatorArgs.PSObject.Properties['corePartitionHelperMask']) { $gen['CorePartitionHelperMask'] = [string]$spec.generatorArgs.corePartitionHelperMask }
+        # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: the app's playback worker-thread cap (the smoke runner's -Threads <n>), for any leg; judged below by the run's own worker count.
+        if ($spec.generatorArgs.PSObject.Properties['playbackMaxThreads']) { $gen['PlaybackMaxThreads'] = [int]$spec.generatorArgs.playbackMaxThreads }
         # GPU-EVENT153-ROOTCAUSE-2: the CUDA per-launch timer and its line threshold, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['cudaLaunchTimingMinMs']) { $gen['CudaLaunchTimingMinMs'] = [double]$spec.generatorArgs.cudaLaunchTimingMinMs }
         # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the injected device loss, the safe-start clear, the shared settings store and the pre-launches of the self-heal proof, for any leg.
@@ -871,6 +873,14 @@ if ($outcome -in @('PASS', 'FAIL') -and $display.blocks) {
 $unpacedVerdict = Get-DvUnpacedEvidence -Spec $spec -LogText $runLogText
 if ($outcome -in @('PASS', 'FAIL') -and $unpacedVerdict.blocks) {
     $detail = "INVALID: the job result was $outcome ($detail) but UNPACED_NOT_HONOURED: $($unpacedVerdict.reason). A paced run is no throughput measurement"
+    $outcome = 'INVALID'
+}
+# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1, FAIL CLOSED: a leg that asks for a worker-thread cap of n counts only when the measured session's own worker count and the
+# job's proof fields all say n; a mismatch or an unreadable count is a typed INVALID, never a PASS or FAIL. A leg that does not ask for it is unchanged.
+$workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $runLogText -Summary $summary
+if ($workerThreadsVerdict.requested) { $receipt['workerThreads'] = [ordered]@{ requested = $workerThreadsVerdict.requested; observed = $workerThreadsVerdict.observed; verdict = $workerThreadsVerdict.verdict } }
+if ($outcome -in @('PASS', 'FAIL') -and $workerThreadsVerdict.blocks) {
+    $detail = "INVALID: the job result was $outcome ($detail) but WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason). A run at another worker count is no measurement under the cap this leg names"
     $outcome = 'INVALID'
 }
 # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2 (D4b), FAIL CLOSED: a leg whose spec says Look Assist ON (a look leg, or generatorArgs.forceLookAssist) but whose run log does

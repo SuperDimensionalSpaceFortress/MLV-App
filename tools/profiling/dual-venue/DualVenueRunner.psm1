@@ -1283,6 +1283,52 @@ function Get-DvUnpacedEvidence {
     [ordered]@{ requested = $requested; active = $active; dropFrame = $dropFrame; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+function Get-DvWorkerThreadsEvidence {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: did a leg that asks for a playback worker-thread cap (generatorArgs.playbackMaxThreads = n) run at n workers? Read from
+    the app's own `playback_smoke.start` line for the MEASURED session (worker_threads=, Get-DvSmokeSessionLineFields) and from the job's summary.json proof
+    fields: playbackMaxThreadsRequested (the cap the job was generated for), playbackMaxThreadsSmoke (the smoke runner's result.json playbackMaxThreads) and
+    playbackWorkerThreadsRead (the job's own worker_threads= read). FAIL CLOSED: `blocks` is true when the leg asked for n and the run log's count is absent,
+    unparsable or not n, when there is no summary, when a summary lacks a proof field and its result is not one of the runner's own product-failure
+    terminals ($script:FailureTerminals, compared exactly), or when any proof field a summary states is not n. Only such a terminal's summary may omit
+    the proof (only the success summary gains it), and it is then judged on the run log; a summary with no result or any other result must carry it
+    (adversary r1 A1). A leg that does not ask never blocks. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from the
+    hashed run log and summary.json.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText, [AllowNull()]$Summary)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'playbackMaxThreads'
+    $requested = ConvertTo-DvInt64 $raw
+    $observed = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    if ($null -ne $raw) {
+        $verdict = 'NOT_HONOURED'
+        $f = Get-DvSmokeSessionLineFields -LogText $LogText -Marker 'start'
+        $observed = ConvertTo-DvInt64 $f['worker_threads']
+        $resultToken = Get-DvProp $Summary 'result'
+        $mayOmit = ($resultToken -is [string]) -and ($resultToken -cin $script:FailureTerminals)
+        $problems = [System.Collections.Generic.List[string]]::new()
+        if ($null -eq $requested -or $requested -lt 1 -or $requested -gt 16) { $problems.Add("the spec's playbackMaxThreads '$raw' is not an integer from 1 to 16") }
+        elseif ($f.Count -eq 0) { $problems.Add('the worker count is unreadable: the run log has no playback_smoke.start line for the measured session') }
+        elseif ($null -eq $observed) { $problems.Add("the worker count is unreadable: the measured session's playback_smoke.start line has no integer worker_threads= ('$($f['worker_threads'])')") }
+        elseif ($observed -ne $requested) { $problems.Add("the measured session's playback_smoke.start says worker_threads=$observed, not the $requested the leg names") }
+        if ($null -eq $Summary) { $problems.Add('the worker count is unreadable: the job published no summary.json to carry its proof') }
+        else {
+            foreach ($name in @('playbackMaxThreadsRequested', 'playbackMaxThreadsSmoke', 'playbackWorkerThreadsRead')) {
+                $has = ($Summary -is [System.Collections.IDictionary] -and $Summary.Contains($name)) -or ($Summary -isnot [System.Collections.IDictionary] -and $null -ne $Summary.PSObject.Properties[$name])
+                $value = Get-DvProp $Summary $name
+                if (-not $has -and $mayOmit) { continue }
+                if ($null -eq $value) { $problems.Add("the worker count is unreadable: summary.json $name is $(if ($has) { 'null' } else { 'absent' })"); continue }
+                $parsed = ConvertTo-DvInt64 $value
+                if ($null -eq $parsed -or $parsed -ne $requested) { $problems.Add("summary.json $name is '$value', not $requested") }
+            }
+        }
+        if ($problems.Count -eq 0) { $verdict = 'HONOURED' } else { $reason = $problems -join '; ' }
+    }
+    [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
 function Get-DvLookAssistEvidence {
     <#
     .SYNOPSIS
@@ -2431,6 +2477,21 @@ function Test-DvReceiptValid {
             # CUDA-HEADROOM-1: an unpaced leg the app did not run unpaced is the pace wall, not throughput (Get-DvUnpacedEvidence).
             $unpacedVerdict = Get-DvUnpacedEvidence -Spec $spec -LogText $ev.logText
             if ($unpacedVerdict.blocks) { $invalid.Add("UNPACED_NOT_HONOURED: $($unpacedVerdict.reason); a paced run is no throughput measurement") }
+            # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: a capped leg the app did not run at the cap (or whose count is unreadable) is no measurement under it.
+            $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $ev.logText -Summary $ev.summary
+            if ($workerThreadsVerdict.blocks) { $invalid.Add("WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason); a run at another worker count is no measurement under the cap its leg names") }
+            # adversary r2b A1: the receipt's own workerThreads block is re-derived like the display block, so a receipt cannot state a count (or a verdict) the
+            # hashed evidence does not; the writer emits the block exactly when the spec asks for a cap (Invoke-VenueLeg.ps1), so the same condition decides here.
+            $storedWorkerThreads = Get-DvProp $Receipt 'workerThreads'
+            if ($workerThreadsVerdict.requested) {
+                if ($null -eq $storedWorkerThreads) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no workerThreads block (requested / observed / verdict) and its committed spec names a playbackMaxThreads') }
+                else {
+                    foreach ($f in @('requested', 'observed', 'verdict')) {
+                        if (-not (Test-DvJsonEquivalent (Get-DvProp $storedWorkerThreads $f) $workerThreadsVerdict[$f])) { $invalid.Add("WORKER_THREADS_NOT_FROM_EVIDENCE: workerThreads.$f is not what the hashed run log, summary.json and the committed leg spec derive") }
+                    }
+                }
+            }
+            elseif ($null -ne $storedWorkerThreads) { $invalid.Add('WORKER_THREADS_NOT_FROM_EVIDENCE: the receipt carries a workerThreads block but its committed leg spec names no playbackMaxThreads') }
         }
 
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
@@ -3004,6 +3065,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt
