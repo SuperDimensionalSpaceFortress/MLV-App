@@ -5100,7 +5100,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
-            time.sleep(1)
+            self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
             with open(manifest, "a", encoding="utf-8") as f:
                 f.write("\n")
             so, se = p.communicate(timeout=240)
@@ -5396,6 +5396,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            # r15 (hosted CI 40963950528): the open's job file is written into -RunDir\batch-jobs AFTER the read-back line, so a repoint made at that line raced it and, on a slow
+            # runner, the job write met the new target first (OUTPUT_ZONE_UNRESOLVED, the open never submitted). The repoint lands inside the open's wait, as the case means.
+            self._wait_for_open_wait()
             os.rmdir(link)                 # the junction itself, not its target
             self._junction(link, new)      # -RunDir now IS TEMP
             so, se = p.communicate(timeout=240)
@@ -5424,6 +5427,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         try:
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
+            # r15: inside the open's wait, after its job file is written (see the r5 adversary A1 case above)
+            self._wait_for_open_wait()
             if repoint:
                 os.rmdir(link)                 # the junction itself, not its target
                 self._junction(link, new)      # -RunDir now IS TEMP
@@ -5591,6 +5596,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   # shape; the runspace itself and its timeout are pinned by the bounded-read tests) and the only time a read takes is the probe's own sleep.
                   "& (Get-Module VenueChain) { function script:Invoke-VenueBoundedRead { param([string]$ScriptText, $Argument, [double]$TimeoutSec) "
                   "[pscustomobject]@{ answered = $true; value = @(& ([scriptblock]::Create($ScriptText)) $Argument); error = $null } } }\n"
+                  # r15 (hosted CI 40963950528: "bound 1.91397" in a 2.3 s room; reproduced on Virtual-Ten as "2.25 s share ... 1.93 s left"): the first pass through the guard, the
+                  # module and the probes pays PowerShell's one-time parse and compile cost, up to 0.3 s on a loaded host, on the room's real clock. One identical pass in a 30 s room
+                  # first, its probe lines discarded, so the measured pass is charged only what the probes sleep and the budget arithmetic is what the room tests pin.
+                  "$script:guardBudget = New-GuardBudget 30 'the warm-up room' 'LEG_BUDGET_EXCEEDS_LEASE' $false 'open'\n"
+                  "$null = Get-InputContentRefusal\n"
+                  f"foreach ($f in '{reads}', '{hashes}', '{bounds}') {{ if (Test-Path -LiteralPath $f) {{ Remove-Item -LiteralPath $f }} }}\n"
                   f"$script:guardBudget = New-GuardBudget {room} 'the test room' 'LEG_BUDGET_EXCEEDS_LEASE' $false 'open'\n"
                   "$hit = Get-InputContentRefusal\n"
                   "ConvertTo-Json -Compress -InputObject @{ code = [string]$hit.code; why = [string]$hit.why; ms = [int]$script:guardBudget.clock.Elapsed.TotalMilliseconds }\n"
@@ -5833,7 +5844,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         try:
             # the last line before um-run blocks (FAKE_OPEN_SLEEP); a link made before it is written through at once, the race no re-check closes
             self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
-            time.sleep(2)
+            self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
             (self.run_dir / leaf).unlink(missing_ok=True)
             os.link(spec, self.run_dir / leaf)
             so, se = p.communicate(timeout=240)
@@ -5918,7 +5929,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             args[args.index("-ClaimDir") + 1] = str(claim_dir)
         p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
         self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
-        time.sleep(2)
+        self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
         return p, spec, hashlib.sha256
 
     def _finish(self, p) -> tuple[str, str]:
@@ -6014,7 +6025,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=ef, text=True, env=e)
             try:
                 self._wait_for_log("BATCH_OPEN_LIVENESS_READBACK")
-                time.sleep(2)
+                self._wait_for_open_wait()   # r15: the open's wait itself, never a fixed sleep after the read-back line
                 (self.run_dir / "batch.log").unlink(missing_ok=True)
                 os.link(spec, self.run_dir / "batch.log")
                 end = time.monotonic() + 90
