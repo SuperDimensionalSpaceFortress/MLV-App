@@ -332,14 +332,16 @@ jobs:
     # assignment. The shard job's partition proof step checks the 7 shards plus these parts are
     # an exact cover of `unittest discover`. The aggregate `Repo Hygiene Python (windows-latest)`
     # below requires this job, so a failed, cancelled or skipped part still fails the check.
-    name: Repo Hygiene Python windows unittest heavy ${{ matrix.part }}/2
+    # Six parts since CI-WINDOWS-UNITTEST-HEAVY-PARTS-3-1: re-derived from hosted master logs the
+    # windows suite weighs 12047 s, past the 9666 s that 7 shards plus 2 parts hold at the 85 % limit.
+    name: Repo Hygiene Python windows unittest heavy ${{ matrix.part }}/6
     runs-on: windows-latest
-    # The shard job's cap and budget: each part is expected at about 16-17 min including setup.
+    # The shard job's cap and budget: each part is expected at about 16-18 min including setup.
     timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2]
+        part: [1, 2, 3, 4, 5, 6]
 
     steps:
       - name: Record the job start for the shard budget clock
@@ -365,7 +367,7 @@ jobs:
           python -m pip install --disable-pip-version-check --no-input --only-binary=:all: --require-hashes -r .github/requirements/repo-hygiene.txt
           python -m pip check
 
-      - name: Run repo hygiene heavy unittest part ${{ matrix.part }}/2
+      - name: Run repo hygiene heavy unittest part ${{ matrix.part }}/6
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
         run: python -m tools.repo_hygiene.ci_unittest_shard --profile windows --heavy-part ${{ matrix.part }}
 
