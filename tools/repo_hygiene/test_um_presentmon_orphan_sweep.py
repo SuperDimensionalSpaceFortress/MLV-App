@@ -14,6 +14,13 @@ orphaned too.
      Every action and exit code lands in presentmon-capture.json (orphanSweep) and the trace;
   2. a job-issued Kill() is followed by the terminate of the job's own named session, in both stop paths, so a killed capture cannot orphan it;
   3. PresentMon's stderr saying "ETW events were lost" is a typed PRESENTMON_EVENTS_LOST detail in presentmon-capture.json and in the PresentMon reason of the failure terminals.
+  4. BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 (Bachelor, 2026-10-27): a live PresentMon* that is no capture image (Intel's PresentMonService, a child of IntelGraphicsSoftware.Service.exe, no
+     registered service, path unreadable) skipped the WHOLE sweep on every leg, so the MLVAttr3-* session a lease tree-kill left at 20:06:20Z starved 16 of 16 later cuda captures. Only a capture
+     image can own an MLVAttr3-* session: with no capture image alive the sweep runs in scope harness_sessions (MLVAttr3-* only; the default session is left and recorded in `deferred`), and its
+     re-checks stop only for a capture image. A sweep that did not leave the host clean is a typed PRESENTMON_ORPHAN_SWEEP_INCOMPLETE detail on the display-report failure reason.
+     r2 (Dot advisory on #707, hub-confirmed): "no capture image" was a NAME test, so a second harness's live PresentMon-custom (a permitted -PresentMonName) was no blocker and the sweep stopped
+     its live MLVAttr3-* capture. A live process now leaves the harness_sessions blockers only on POSITIVE identity (a registered service, or image PresentMonService under
+     IntelGraphicsSoftware.Service.exe per Win32_Process); a failed parent read, a readable path alone or any other name is a blocker. newlyListed compares with the FULL initial listing.
 
 The job's text is EXECUTED (real slices of the generator's template run in pwsh against stubs: a .cmd PresentMon, function stubs for Get-Process and logman); the module's own
 functions are called directly. Every item has a mutation test.
@@ -21,6 +28,7 @@ functions are called directly. Every item has a mutation test.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import tempfile
@@ -33,8 +41,17 @@ from tools.repo_hygiene.test_dve_presentmon_evidence import PARSE_END, PARSE_STA
 
 STUB_EXE = "PresentMon-stub.cmd"
 UNREADABLE = "<path getter throws>"
+SESSION_THROWS = "<session getter throws>"
+# r8 (r7 adversary A1): a creation stamp read DURING the sweep -- the probe's clock at the first read of any LATE stamp (after the sweep recorded its start), one instant for every read
+LATE = "<stamped during the sweep>"
+# r8 (hosted shard 6/8 on 6d30ac14): the probe's own $PID is a real pid; when it equals a fixture pid the job takes that fixture process for itself and the verdict is wrong. The probe
+# exits with this code before it does anything, and run_start runs it again (a new pwsh, a new pid)
+PID_COLLISION_EXIT = 97
+PID_COLLISION_ATTEMPTS = 5
+JOB_IMAGE = "C:\\pwsh\\pwsh.exe"
 NEW_MODULE_FUNCTIONS = ("Get-AttrCudaPresentMonOrphanSessionName", "Get-AttrCudaEtsSessionListing", "Invoke-AttrCudaLogman", "Stop-AttrCudaEtsSession", "Get-AttrCudaTextEncodingFromHead",
-                        "Get-AttrCudaPresentMonEventsLost", "Add-AttrCudaPresentMonEventsLostDetail", "Add-AttrCudaPresentMonEventsLostDetailToReport")
+                        "Get-AttrCudaPresentMonEventsLost", "Add-AttrCudaPresentMonEventsLostDetail", "Add-AttrCudaPresentMonEventsLostDetailToReport",
+                        "Add-AttrCudaPresentMonOrphanSweepDetailToReport")
 OPEN = "UM-PRESENTMON-ORPHAN-SWEEP-1 >>>"
 CLOSE = "UM-PRESENTMON-ORPHAN-SWEEP-1 <<<"
 
@@ -280,6 +297,43 @@ class ModuleFunctionTests(unittest.TestCase):
         self.assertEqual((got["status"], got["chains"], got["same"]), ("PRESENTMON_UNAVAILABLE", [1, 2], False))
         self.assertEqual(got["original"], "PresentMon output does not exist: X", "the input report is never mutated")
 
+    # --- BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: a sweep that did not leave the host clean is a typed detail on the no-CSV terminal, never a silent "output does not exist"
+    def sweep_detail(self, sweep_ps: str) -> dict:
+        return self.call(
+            "$report = [pscustomobject]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'PresentMon output does not exist: X'; chains = @() }\n"
+            f"$s = {sweep_ps}\n"
+            "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep $s\n"
+            "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ names = @($r.PSObject.Properties.Name); reason = $r.reason; same = [object]::ReferenceEquals($r, $report); original = $report.reason }) -Compress))")
+
+    def test_a_skipped_sweep_is_a_typed_detail_on_the_reason(self) -> None:
+        got = self.sweep_detail("[ordered]@{ ran = $false; skippedReason = 'presentmon_process_alive'; livePresentMonProcessIds = @(43684); remaining = @(); deferred = @() }")
+        self.assertEqual(got["reason"], "PresentMon output does not exist: X [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive livePids=43684]")
+        self.assertEqual((got["names"], got["same"], got["original"]), (["status", "reason", "chains"], False, "PresentMon output does not exist: X"))
+
+    def test_a_left_session_is_named_in_the_detail(self) -> None:
+        got = self.sweep_detail("[ordered]@{ ran = $true; skippedReason = $null; abortedReason = 'presentmon_process_started_during_sweep'; remaining = @('MLVAttr3-b'); deferred = @('PresentMon'); livePresentMonProcessIds = @(7001) }")
+        self.assertIn("PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:", got["reason"])
+        for part in ("aborted=presentmon_process_started_during_sweep", "remaining=MLVAttr3-b", "deferred=PresentMon", "livePids=7001"):
+            self.assertIn(part, got["reason"])
+
+    def test_a2_a_session_that_appeared_after_the_scan_is_named_in_the_detail(self) -> None:
+        # adversary A2: nothing skipped, aborted, remaining or deferred, but the final listing holds a session the first did not -- the host was never verified clean
+        got = self.sweep_detail("[ordered]@{ ran = $true; skippedReason = $null; abortedReason = $null; remaining = @(); deferred = @(); newlyListed = @('MLVAttr3-other-killed-job'); listError = $null; error = $null; livePresentMonProcessIds = @(7001) }")
+        self.assertEqual(got["reason"], "PresentMon output does not exist: X [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: newlyListed=MLVAttr3-other-killed-job livePids=7001]")
+
+    def test_a_sweep_that_left_the_host_clean_adds_nothing(self) -> None:
+        for sweep in ("[ordered]@{ ran = $true; skippedReason = $null; abortedReason = $null; remaining = @(); deferred = @(); listError = $null; error = $null }", "$null"):
+            got = self.sweep_detail(sweep)
+            self.assertTrue(got["same"], sweep)
+            self.assertEqual(got["reason"], "PresentMon output does not exist: X")
+
+    def test_a_reason_that_already_carries_the_token_is_never_given_it_twice(self) -> None:
+        got = self.call(
+            "$report = [pscustomobject]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'x [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=a]' }\n"
+            "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep ([ordered]@{ ran = $false; skippedReason = 'b' })\n"
+            "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ same = [object]::ReferenceEquals($r, $report) }) -Compress))")
+        self.assertTrue(got["same"])
+
     def test_a_report_with_nothing_to_add_comes_back_as_the_same_object(self) -> None:
         got = self.call(
             "$report = [pscustomobject]@{ status = 'DISPLAY_ASLEEP'; reason = 'r' }\n"
@@ -287,6 +341,483 @@ class ModuleFunctionTests(unittest.TestCase):
             "$r = Add-AttrCudaPresentMonEventsLostDetailToReport -Report $report -EventsLost $e\n"
             "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ same = [object]::ReferenceEquals($r, $report) }) -Compress))")
         self.assertTrue(got["same"])
+
+    # --- r3 (sol B1 on 2519ce4f, report-copy-shape): both report helpers accept [object]; a dictionary report used to lose status and chains (PSObject.Properties of a dictionary are its
+    # own members, not its keys). Every accepted shape now comes back as the same pscustomobject: the report's fields, only `reason` changed.
+    SHAPES = {"pscustomobject": "[pscustomobject]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'r'; chains = @(1, 2) }",
+              "ordered": "[ordered]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'r'; chains = @(1, 2) }",
+              "hashtable": "@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'r'; chains = @(1, 2) }"}
+    HELPERS = {"sweep": "Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ skippedReason = 'presentmon_process_alive' }",
+               "events": "Add-AttrCudaPresentMonEventsLostDetailToReport -Report $report -EventsLost ([pscustomobject]@{ detected = $true; detail = 'PRESENTMON_EVENTS_LOST: 12 lost' })"}
+
+    def shaped(self, shape: str, helper: str, module_text: str | None = None) -> dict:
+        return self.call(f"$report = {self.SHAPES[shape]}\n$r = {self.HELPERS[helper]}\n"
+                         "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ type = $r.GetType().Name; names = @(@($r.PSObject.Properties.Name) | Sort-Object); "
+                         "status = $r.status; reason = $r.reason; chains = @($r.chains); original = $report.reason }) -Compress))", module_text)
+
+    def test_r3_b1_every_report_shape_keeps_its_fields_and_changes_only_the_reason(self) -> None:
+        for helper in self.HELPERS:
+            outputs = {shape: self.shaped(shape, helper) for shape in self.SHAPES}
+            for shape, got in outputs.items():
+                self.assertEqual((got["type"], got["names"], got["status"], got["chains"]), ("PSCustomObject", ["chains", "reason", "status"], "PRESENTMON_UNAVAILABLE", [1, 2]), (helper, shape))
+                self.assertTrue(got["reason"].startswith("r ["), (helper, shape, got["reason"]))
+                self.assertEqual(got["original"], "r", "the input report is never mutated")
+            self.assertEqual(outputs["ordered"], outputs["pscustomobject"], helper)
+            self.assertEqual(outputs["hashtable"], outputs["pscustomobject"], helper)
+
+    def test_r3_b1_an_ordered_report_keeps_its_key_order(self) -> None:
+        got = self.call("$report = [ordered]@{ status = 'S'; reason = 'r'; chains = @(); selectedChain = $null }\n"
+                        "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ skippedReason = 'x' }\n"
+                        "Write-Output ('JSON=' + (ConvertTo-Json -InputObject @($r.PSObject.Properties.Name) -Compress))")
+        self.assertEqual(got, ["status", "reason", "chains", "selectedChain"])
+
+    def test_r3_a3_a_dictionary_report_with_a_keys_entry_keeps_every_field(self) -> None:
+        # adversary A3 on 3ae8ebb2: `$Report.Keys` on a dictionary holding a 'Keys' entry reads that entry, so chains (and Keys itself) were dropped; PSBase.Keys is the real key collection
+        for helper in self.HELPERS:
+            got = self.call("$report = [ordered]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'r'; chains = @(1, 2); Keys = 'status' }\n"
+                            f"$r = {self.HELPERS[helper]}\n"
+                            "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ names = @($r.PSObject.Properties.Name); chains = @($r.chains); keys = $r.Keys }) -Compress))")
+            self.assertEqual((got["names"], got["chains"], got["keys"]), (["status", "reason", "chains", "Keys"], [1, 2], "status"), helper)
+
+    def test_r3_a2_a_path_that_contains_the_token_name_still_gets_the_detail(self) -> None:
+        # adversary A2 on 3ae8ebb2: the already-annotated check matched any substring, so a CSV path under a folder named like the token suppressed the whole detail
+        got = self.call("$report = [pscustomobject]@{ status = 'PRESENTMON_UNAVAILABLE'; reason = 'PresentMon output does not exist: C:\\mlvtmp\\PRESENTMON_ORPHAN_SWEEP_INCOMPLETE\\run\\presentmon.csv' }\n"
+                        "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ ran = $false; skippedReason = 'presentmon_process_alive'; livePresentMonProcessIds = @(6100) }\n"
+                        "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ reason = $r.reason }) -Compress))")
+        self.assertTrue(got["reason"].endswith("[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive livePids=6100]"), got["reason"])
+
+    def test_r3_a2_a_bare_detail_reason_is_still_never_annotated_twice(self) -> None:
+        got = self.call("$report = [pscustomobject]@{ reason = 'PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=a' }\n"
+                        "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ ran = $false; skippedReason = 'b' }\n"
+                        "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ same = [object]::ReferenceEquals($r, $report) }) -Compress))")
+        self.assertTrue(got["same"])
+
+    # --- r5 (sol B2 on 2c226cd8, case-distinct-report-keys): an accepted Ordinal dictionary with status='S' and Status='OTHER' was copied into a case-insensitive table: one key was lost
+    # and the output's status read OTHER. Every entry is kept now (an exact-key ordered dictionary), the status unchanged, only `reason` set -- in BOTH sibling helpers.
+    def test_r5_b2_case_distinct_report_keys_are_kept_by_both_helpers(self) -> None:
+        for helper in self.HELPERS:
+            got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                            "$report.Add('status', 'S'); $report.Add('Status', 'OTHER'); $report.Add('reason', 'r'); $report.Add('chains', @(1, 2))\n"
+                            f"$r = {self.HELPERS[helper]}\n"
+                            "$isDictionary = $r -is [System.Collections.IDictionary]\n"
+                            "$names = if ($isDictionary) { @($r.PSBase.Keys) } else { @($r.PSObject.Properties.Name) }\n"
+                            "$status = if ($isDictionary) { $r['status'] } else { $r.status }\n"
+                            "$upper = if ($isDictionary) { $r['Status'] } else { $null }\n"
+                            "$reason = if ($isDictionary) { $r['reason'] } else { $r.reason }\n"
+                            "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ names = @($names); status = $status; upper = $upper; reason = $reason; original = $report['reason'] }) -Compress))")
+            self.assertEqual(got["names"], ["status", "Status", "reason", "chains"], helper)
+            self.assertEqual((got["status"], got["upper"], got["original"]), ("S", "OTHER", "r"), helper)
+            self.assertTrue(got["reason"].startswith("r ["), (helper, got["reason"]))
+
+    def test_r5_a1_keys_that_merge_only_in_upper_case_are_kept_by_both_helpers(self) -> None:
+        # r5 adversary A1 on c1186f3e: U+03A3 and U+03C2 differ in lower case, so a lower-case fold saw no collision, but the case-insensitive copy merged them and FIRST was lost
+        for helper in self.HELPERS:
+            got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                            "$report.Add('status', 'S'); $report.Add('reason', 'r'); $report.Add([string][char]0x03A3, 'FIRST'); $report.Add([string][char]0x03C2, 'SECOND')\n"
+                            f"$r = {self.HELPERS[helper]}\n"
+                            "$isDictionary = $r -is [System.Collections.IDictionary]\n"
+                            "$values = if ($isDictionary) { @($r.PSBase.Values) } else { @($r.PSObject.Properties.Value) }\n"
+                            "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ count = @($values).Count; values = @($values | ForEach-Object { [string]$_ } | Where-Object { $_ -in @('S', 'FIRST', 'SECOND') }) }) -Compress))")
+            self.assertEqual((got["count"], got["values"]), (4, ["S", "FIRST", "SECOND"]), helper)
+
+    # --- r5 (sol B3 on 2c226cd8, generic-sweep-record): IDictionary.Contains(string) on a Dictionary[string,object] threw, and the silent catch returned the bare report: the typed
+    # PRESENTMON_ORPHAN_SWEEP_INCOMPLETE detail was lost. A generic record is read now; a record that cannot be read at all is named in the detail, never dropped.
+    def test_r5_b3_a_generic_dictionary_sweep_record_keeps_the_detail(self) -> None:
+        got = self.sweep_detail("[System.Collections.Generic.Dictionary[string,object]]::new(); $s.Add('skippedReason', 'capture_owner_unidentified')")
+        self.assertEqual(got["reason"], "PresentMon output does not exist: X [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=capture_owner_unidentified]")
+
+    def test_r5_b3_a_sweep_record_that_cannot_be_read_keeps_a_typed_detail(self) -> None:
+        # a dictionary whose lookup throws (a ScriptProperty that throws reads as $null in PowerShell, so it cannot model this)
+        got = self.sweep_detail("$(Add-Type -TypeDefinition 'public class MlvThrowingRecord : System.Collections.Hashtable { public override bool ContainsKey(object key) "
+                                "{ throw new System.UnauthorizedAccessException(\"record-read-denied\"); } }'; [MlvThrowingRecord]::new())")
+        self.assertTrue(got["reason"].startswith("PresentMon output does not exist: X [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: recordUnreadable="), got["reason"])
+        self.assertIn("record-read-denied", got["reason"])
+
+    # --- r6 (adversary A1 / A2 on c1521d3c): both report helpers, every dictionary report kept whole and its own reason read.
+    ENTRIES = ("$isDictionary = $r -is [System.Collections.IDictionary]\n"
+               "$entries = if ($isDictionary) { $v = @($r.PSBase.Values); $k = @($r.PSBase.Keys); @(for ($i = 0; $i -lt $k.Count; $i++) { \"$($k[$i].GetType().Name):$($k[$i])=$($v[$i])\" }) }"
+               " else { @($r.PSObject.Properties | ForEach-Object { \"String:$($_.Name)=$($_.Value)\" }) }\n"
+               "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ entries = @($entries); same = [object]::ReferenceEquals($r, $report) }) -Compress))")
+    APPENDED = {"sweep": "missing [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive]", "events": "missing [PRESENTMON_EVENTS_LOST: 12 lost]"}
+
+    def test_r6_a1_a_report_with_an_empty_key_keeps_every_entry_in_both_helpers(self) -> None:
+        # A1: the probe's [pscustomobject] conversion threw on the empty name before the exact-key path was chosen (ordered and hashtable reports alike)
+        for shape in ("[ordered]@{ reason = 'missing'; status = 'PRESENTMON_UNAVAILABLE'; '' = 'keep' }", "@{ reason = 'missing'; status = 'PRESENTMON_UNAVAILABLE'; '' = 'keep' }"):
+            for helper in self.HELPERS:
+                with self.subTest(shape=shape[:2], helper=helper):
+                    got = self.call(f"$report = {shape}\n$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
+                    self.assertEqual(sorted(got["entries"]), sorted([f"String:reason={self.APPENDED[helper]}", "String:status=PRESENTMON_UNAVAILABLE", "String:=keep"]))
+
+    def test_r6_a2_a_non_string_key_dictionary_reports_own_reason_is_read_by_both_helpers(self) -> None:
+        # A2: `$Report.reason` on a Dictionary[object,object] is no member (strict mode throws; without it the reason read empty and the original was lost)
+        report = ("$report = [System.Collections.Generic.Dictionary[object,object]]::new(); $report.Add('reason', 'missing'); $report.Add('status', 'PRESENTMON_UNAVAILABLE');"
+                  " $report.Add(1, 'keep')\n")
+        # r11 (report helper contract): a non-string key that collides with no other is copied under its string form
+        for helper in self.HELPERS:
+            with self.subTest(helper=helper):
+                got = self.call(f"{report}$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
+                self.assertEqual(got["entries"], [f"String:reason={self.APPENDED[helper]}", "String:status=PRESENTMON_UNAVAILABLE", "String:1=keep"])
+        # the sweep detail goes after an events-lost detail the reason already carries, and the events helper sees its own exact detail and adds nothing (r11: to a NEW canonical
+        # report -- a dictionary is never returned by reference once a helper has a detail to write)
+        report = report.replace("'missing'", "'missing [PRESENTMON_EVENTS_LOST: 12 lost]'")
+        got = self.call(f"{report}$r = {self.HELPERS['sweep']}\n" + self.ENTRIES)
+        self.assertEqual(got["entries"][0], "String:reason=missing [PRESENTMON_EVENTS_LOST: 12 lost] [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive]")
+        got = self.call(f"{report}$r = {self.HELPERS['events']}\n" + self.ENTRIES)
+        self.assertEqual(got["entries"], ["String:reason=missing [PRESENTMON_EVENTS_LOST: 12 lost]", "String:status=PRESENTMON_UNAVAILABLE", "String:1=keep"], got)
+        self.assertFalse(got["same"], got)
+
+    def test_r6_a1b_the_exact_key_copy_updates_the_reason_key_the_report_holds(self) -> None:
+        # adversary A1 on ce87d0f8: a case-insensitive report holding `Reason` (and a key that forces the exact-key copy) came back with Reason unchanged and a new `reason` added
+        for helper in self.HELPERS:
+            with self.subTest(helper=helper):
+                got = self.call(f"$report = [ordered]@{{ Reason = 'missing'; status = 'PRESENTMON_UNAVAILABLE'; '' = 'keep' }}\n$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
+                # r11: the reason-like entry is folded into the one key `reason`, in its place
+                self.assertEqual(got["entries"], [f"String:reason={self.APPENDED[helper]}", "String:status=PRESENTMON_UNAVAILABLE", "String:=keep"])
+        # r10 (sol B1): an ordinal report whose own comparer calls no key `reason` but which holds `Reason` has its reason there: the detail is appended to that text, never added beside it
+        got = self.call("$report = [System.Collections.Generic.Dictionary[object,object]]::new(); $report.Add('Reason', 'other'); $report.Add(1, 'keep')\n"
+                        f"$r = {self.HELPERS['sweep']}\n" + self.ENTRIES)
+        self.assertEqual(got["entries"], ["String:reason=other [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive]", "String:1=keep"])
+
+    # --- r7 (r6 adversary A2 / A3 on 836a3d61, Dot 54d909b1): the reason key is chosen by ordinal comparison and the report's own comparer, never by PowerShell's culture-sensitive
+    # -eq (which ignores U+00AD, U+200B and U+0000), and a copy never lets an added `reason` overwrite a distinct entry. Ignorable characters are tagged before the JSON leaves pwsh.
+    TAGGED = ENTRIES.replace("entries = @($entries)", "entries = @($entries | ForEach-Object { $_.Replace([string][char]0xAD, '<AD>').Replace([string][char]0x200B, '<200B>').Replace([string][char]0, '<0>') })")
+    ADDED = {"sweep": "PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive", "events": "PRESENTMON_EVENTS_LOST: 12 lost"}
+
+    def test_r7_a2_the_exact_key_copy_updates_the_key_the_comparer_matches_never_an_ignorable_lookalike(self) -> None:
+        for char, tag in (("0xAD", "<AD>"), ("0x200B", "<200B>"), ("0", "<0>")):
+            for helper in self.HELPERS:
+                with self.subTest(char=tag, helper=helper):
+                    got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)\n"
+                                    f"$report.Add('rea' + [char]{char} + 'son', 'OTHER'); $report.Add('Reason', 'missing'); $report.Add('', 'keep')\n"
+                                    f"$r = {self.HELPERS[helper]}\n" + self.TAGGED)
+                    self.assertEqual(got["entries"], [f"String:rea{tag}son=OTHER", f"String:reason={self.APPENDED[helper]}", "String:=keep"])
+
+    def test_r7_a3_an_added_reason_never_overwrites_a_distinct_reason_entry(self) -> None:
+        # r10 (sol B1): the distinct `Reason` is never overwritten -- and no `reason` is added beside it either: its text carries the detail (r11: folded into the one key `reason`)
+        for helper in self.HELPERS:
+            with self.subTest(helper=helper):
+                got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                                f"$report.Add('Reason', 'original'); $report.Add('status', 'S')\n$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
+                self.assertEqual(got["entries"], [f"String:reason=original [{self.ADDED[helper]}]", "String:status=S"])
+
+    def test_r7_the_original_reason_survives_whatever_comparer_the_report_uses(self) -> None:
+        # the report's own comparer names the reason entry: it carries the detail, never duplicated, under Ordinal, OrdinalIgnoreCase and InvariantCultureIgnoreCase (r11: in the one
+        # canonical key `reason`, whatever the input spelling)
+        cases = {"Ordinal": ("reason", "[StringComparer]::Ordinal"), "OrdinalIgnoreCase": ("Reason", "[StringComparer]::OrdinalIgnoreCase"),
+                 "InvariantCultureIgnoreCase": ("REA<AD>SON", "[StringComparer]::InvariantCultureIgnoreCase")}
+        for name, (key, comparer) in cases.items():
+            for helper in self.HELPERS:
+                with self.subTest(comparer=name, helper=helper):
+                    ps_key = key.replace("<AD>", "' + [char]0xAD + '")
+                    got = self.call(f"$report = [System.Collections.Generic.Dictionary[string,object]]::new({comparer})\n"
+                                    f"$report.Add('{ps_key}', 'missing'); $report.Add('status', 'S')\n$r = {self.HELPERS[helper]}\n" + self.TAGGED)
+                    self.assertEqual(sorted(got["entries"]), sorted([f"String:reason={self.APPENDED[helper]}", "String:status=S"]))
+
+    def test_r7_b_a2_the_comparer_names_the_reason_key_when_its_text_is_ambiguous(self) -> None:
+        # adversary A2 on 0805902c: `status` holds the same text as the culture-matched `rea<U+00AD>son`, so the value step was ambiguous and the OrdinalIgnoreCase step found nothing:
+        # a fourth entry was added. The report's own comparer names the key now (Dictionary's Comparer, and SortedDictionary's IComparer)
+        for kind, ctor in (("Dictionary", "[System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::InvariantCultureIgnoreCase)"),
+                           ("SortedDictionary", "[System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::InvariantCultureIgnoreCase)")):
+            for helper in self.HELPERS:
+                with self.subTest(kind=kind, helper=helper):
+                    got = self.call(f"$report = {ctor}\n$report.Add('rea' + [char]0xAD + 'son', 'missing'); $report.Add('status', 'missing'); $report.Add('', 'keep')\n"
+                                    f"$r = {self.HELPERS[helper]}\n" + self.TAGGED)
+                    self.assertEqual(sorted(got["entries"]), sorted([f"String:reason={self.APPENDED[helper]}", "String:status=missing", "String:=keep"]))
+
+    def test_r8_a2_an_unreadable_comparer_with_an_ambiguous_reason_key_leaves_the_report_unchanged(self) -> None:
+        # r7 adversary A2 on 6d30ac14: a Hashtable / OrderedDictionary built with InvariantCultureIgnoreCase exposes no comparer; `status` holds the same text as the culture-matched
+        # `rea<U+00AD>son`, so no step names the key, and the copy added a fourth entry (`reason`) beside the untouched one. Fail closed: the same report, every entry as it was
+        for kind, ctor in (("Hashtable", "[System.Collections.Hashtable]::new([StringComparer]::InvariantCultureIgnoreCase)"),
+                           ("OrderedDictionary", "[System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::InvariantCultureIgnoreCase)")):
+            for helper in self.HELPERS:
+                with self.subTest(kind=kind, helper=helper):
+                    got = self.call(f"$report = {ctor}\n$report.Add('rea' + [char]0xAD + 'son', 'missing'); $report.Add('status', 'missing'); $report.Add('', 'keep')\n"
+                                    f"$r = {self.HELPERS[helper]}\n" + self.TAGGED)
+                    self.assertEqual(sorted(got["entries"]), sorted(["String:rea<AD>son=missing", "String:status=missing", "String:=keep"]))
+                    self.assertTrue(got["same"], "the report itself comes back")
+        # control: the same unreadable comparer with ONE holder of the text still names that key (r11: folded into the one key `reason`, in its place)
+        for helper in self.HELPERS:
+            with self.subTest(control=helper):
+                got = self.call("$report = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::InvariantCultureIgnoreCase)\n"
+                                f"$report.Add('rea' + [char]0xAD + 'son', 'missing'); $report.Add('status', 'S'); $report.Add('', 'keep')\n$r = {self.HELPERS[helper]}\n" + self.TAGGED)
+                self.assertEqual(got["entries"], [f"String:reason={self.APPENDED[helper]}", "String:status=S", "String:=keep"])
+
+    # --- r10 (sol B1 on bca900cb, report-helper-composition): the exact-key copy of a case-insensitive report (an [ordered] `Reason` plus a key a pscustomobject cannot carry) is a
+    # case-sensitive dictionary, so the NEXT helper call asked it for `reason`, found nothing, and added a `reason` beside `Reason`: the original text and the earlier diagnostic stayed
+    # stranded under `Reason`. A later call finds the reason entry under the key it already has (any casing), appends to that one entry, and adds no second reason-like key.
+    EV_TEXT = "PRESENTMON_EVENTS_LOST: 12 lost"
+    SW_TEXT = "PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=capture_owner_unidentified"
+    STEPS = {"events": "$r = Add-AttrCudaPresentMonEventsLostDetailToReport -Report $r -EventsLost $e",
+             "sweep": "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $r -Sweep @{ skippedReason = 'capture_owner_unidentified' }"}
+    COMPOSED = ENTRIES.replace("same = ", "dotReason = $dot; same = ")
+    EVENTS_RECORD = "$e = [pscustomobject]@{ detected = $true; detail = 'PRESENTMON_EVENTS_LOST: 12 lost' }\n"
+    DOT_REASON = "\n$dot = try { [string]$r.reason } catch { '<throws>' }\n"
+
+    def compose_on(self, report_statement: str, *steps: str) -> dict:
+        return self.call(report_statement + "\n" + self.EVENTS_RECORD + "$r = $report\n" + "\n".join(self.STEPS[step] for step in steps) + self.DOT_REASON + self.COMPOSED)
+
+    def compose(self, report_ps: str, *steps: str) -> dict:
+        return self.compose_on("$report = " + report_ps, *steps)
+
+    @staticmethod
+    def reason_like(entries: list[str]) -> list[str]:
+        return [e for e in entries if e.split(":", 1)[1].split("=", 1)[0].lower() == "reason"]
+
+    def test_r10_b1_sols_repro_events_then_sweep_keeps_one_accumulated_reason(self) -> None:
+        for name, report in (("empty-key", "[ordered]@{ Reason = 'r'; status = 'S'; '' = 'keep' }"), ("integer-key", "[ordered]@{ Reason = 'r'; 1 = 'keep' }")):
+            with self.subTest(report=name):
+                got = self.compose(report, "events", "sweep")
+                accumulated = f"r [{self.EV_TEXT}] [{self.SW_TEXT}]"
+                self.assertEqual(self.reason_like(got["entries"]), [f"String:reason={accumulated}"], got)
+                self.assertEqual(len(got["entries"]), 3 if name == "empty-key" else 2, got)
+                self.assertEqual(got["dotReason"], accumulated, "`.reason` still reads the accumulated text (the copy keeps the report's case-insensitive lookup)")
+
+    def test_r10_b1_either_helper_applied_twice_changes_nothing_the_second_time(self) -> None:
+        for step in self.STEPS:
+            for name, report in (("empty-key", "[ordered]@{ Reason = 'r'; status = 'S'; '' = 'keep' }"), ("integer-key", "[ordered]@{ Reason = 'r'; 1 = 'keep' }"),
+                                 ("hashtable", "@{ Reason = 'r'; status = 'S'; '' = 'keep' }")):
+                with self.subTest(step=step, report=name):
+                    once = self.compose(report, step)
+                    twice = self.compose(report, step, step)
+                    self.assertEqual(len(self.reason_like(once["entries"])), 1, once)
+                    self.assertEqual(sorted(twice["entries"]), sorted(once["entries"]), twice)
+
+    def test_r10_b1_the_helpers_compose_in_either_order_without_losing_text(self) -> None:
+        for first, second in (("events", "sweep"), ("sweep", "events"), ("sweep", "sweep"), ("events", "events")):
+            with self.subTest(first=first, second=second):
+                got = self.compose("[ordered]@{ Reason = 'r'; status = 'S'; '' = 'keep' }", first, second)
+                (entry,) = self.reason_like(got["entries"])
+                for step in {first, second}:
+                    self.assertIn(self.EV_TEXT if step == "events" else self.SW_TEXT, entry)
+                self.assertTrue(entry.startswith("String:reason=r ["), entry)
+                self.assertEqual(got["dotReason"], entry[len("String:reason="):], got)
+
+    def test_r10_b1_a_case_sensitive_dictionary_holding_reason_and_Reason_keeps_both_texts(self) -> None:
+        # r11 rule: every reason-like entry's text in enumeration order (an exact repeat left out) folds into the one key `reason`, at the place of the first; no text is lost and no
+        # second reason-like key remains, across a second helper call too
+        ctor = ("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                "$report.Add('Reason', 'first'); $report.Add('status', 'S'); $report.Add('reason', 'second')")
+        for step in self.STEPS:
+            with self.subTest(step=step):
+                got = self.compose_on(ctor, step)
+                added = self.EV_TEXT if step == "events" else self.SW_TEXT
+                self.assertEqual(got["entries"], [f"String:reason=first second [{added}]", "String:status=S"], got)
+                self.assertEqual(got["dotReason"], f"first second [{added}]", got)
+        got = self.compose_on(ctor, "events", "sweep")
+        self.assertEqual(got["entries"], [f"String:reason=first second [{self.EV_TEXT}] [{self.SW_TEXT}]", "String:status=S"], got)
+        self.assertEqual(got["dotReason"], f"first second [{self.EV_TEXT}] [{self.SW_TEXT}]", got)
+
+    def test_r10_b1_two_case_variants_with_no_exact_reason_write_to_the_first_and_keep_both(self) -> None:
+        # r11 (sol r10 B2 b): the two texts fold into the one key `reason`, and `.reason` (the dotted read) returns them -- it read '' before
+        ctor = ("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                "$report.Add('Reason', 'first'); $report.Add('REASON', 'second')")
+        for step in self.STEPS:
+            with self.subTest(step=step):
+                got = self.compose_on(ctor, step)
+                added = self.EV_TEXT if step == "events" else self.SW_TEXT
+                self.assertEqual(got["entries"], [f"String:reason=first second [{added}]"], got)
+                self.assertEqual(got["dotReason"], f"first second [{added}]", got)
+
+    def test_r10_b1_controls_a_lowercase_reason_and_an_ordinary_report_compose_as_before(self) -> None:
+        accumulated = f"r [{self.EV_TEXT}] [{self.SW_TEXT}]"
+        got = self.compose("[ordered]@{ reason = 'r'; status = 'S'; '' = 'keep' }", "events", "sweep")
+        self.assertEqual(sorted(got["entries"]), sorted([f"String:reason={accumulated}", "String:status=S", "String:=keep"]), got)
+        for report in ("[pscustomobject]@{ status = 'S'; reason = 'r' }", "[ordered]@{ status = 'S'; reason = 'r' }", "@{ status = 'S'; reason = 'r' }"):
+            with self.subTest(report=report[:16]):
+                got = self.compose(report, "events", "sweep")
+                self.assertEqual(sorted(got["entries"]), sorted([f"String:reason={accumulated}", "String:status=S"]), got)
+                self.assertEqual(got["dotReason"], accumulated)
+
+    def test_r10_b1_a_report_with_no_reason_still_gains_exactly_one(self) -> None:
+        got = self.compose("[ordered]@{ status = 'S'; '' = 'keep' }", "events", "sweep")
+        self.assertEqual(self.reason_like(got["entries"]), [f"String:reason={self.EV_TEXT} [{self.SW_TEXT}]"], got)
+
+    # --- r11 (sol r10 B1/B2 on 218fceaa, fable key3 REPORT-HELPER-ACCUMULATION-EXACT-DEDUPE-1; hub convergence ruling): the report helper contract (r11). A dictionary report comes
+    # back as a NEW canonical report whose one key `reason` holds every reason-like text (exact-equality dedupe) plus the diagnostic once; `.reason` (the dotted read) is asserted on
+    # every row. Catalogue rows: report-helper-preannotated-holder, report-helper-culture-composition, report-helper-uppercase-dot-reason.
+    PREANNOTATED = {"sweep": "Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ skippedReason = 'capture_owner_unidentified' }",
+                    "events": "Add-AttrCudaPresentMonEventsLostDetailToReport -Report $report -EventsLost ([pscustomobject]@{ detected = $true; detail = 'PRESENTMON_EVENTS_LOST: 12 lost' })"}
+
+    def test_r11_b1_sols_preannotated_holder_keeps_every_text_and_the_diagnostic(self) -> None:
+        # sol r10 B1: another reason-like entry already holding a diagnostic made both helpers return the input dictionary with `.reason` = 'first'
+        holders = {"sweep": ("second [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=x]", f"first second [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=x] [{self.SW_TEXT}]"),
+                   "events": (f"second [{self.EV_TEXT}]", f"first second [{self.EV_TEXT}]")}
+        for helper, (holder, expected) in holders.items():
+            with self.subTest(helper=helper):
+                got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                                f"$report.Add('reason', 'first'); $report.Add('Reason', '{holder}')\n$r = {self.PREANNOTATED[helper]}" + self.DOT_REASON + self.COMPOSED)
+                self.assertEqual(got["entries"], [f"String:reason={expected}"], got)
+                self.assertEqual(got["dotReason"], expected, got)
+                self.assertFalse(got["same"], "a dictionary is never returned by reference once the helper has a detail to write")
+
+    def test_r11_b2a_a_culture_comparer_lookalike_composes_in_either_order(self) -> None:
+        # sol r10 B2 (a): the first helper left the lookalike key in the copy, so the second added `reason` beside it and stranded the first diagnostic
+        ctor = ("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::InvariantCultureIgnoreCase)\n"
+                "$report.Add('rea' + [char]0xAD + 'son', 'r'); $report.Add('status', 'S'); $report.Add('', 'keep')")
+        for first, second in (("events", "sweep"), ("sweep", "events")):
+            with self.subTest(first=first, second=second):
+                got = self.compose_on(ctor, first, second)
+                texts = {"events": self.EV_TEXT, "sweep": self.SW_TEXT}
+                expected = f"r [{texts[first]}] [{texts[second]}]"
+                self.assertEqual(got["entries"], [f"String:reason={expected}", "String:status=S", "String:=keep"], got)
+                self.assertEqual(got["dotReason"], expected, got)
+
+    def test_r11_b2b_two_uppercase_variants_read_through_the_dotted_reason_in_either_order(self) -> None:
+        # sol r10 B2 (b): an ordinal Reason='first' and REASON='second' returned `.reason` = '' in both composition orders
+        ctor = ("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                "$report.Add('Reason', 'first'); $report.Add('REASON', 'second')")
+        for first, second in (("events", "sweep"), ("sweep", "events")):
+            with self.subTest(first=first, second=second):
+                got = self.compose_on(ctor, first, second)
+                texts = {"events": self.EV_TEXT, "sweep": self.SW_TEXT}
+                expected = f"first second [{texts[first]}] [{texts[second]}]"
+                self.assertEqual(self.reason_like(got["entries"]), [f"String:reason={expected}"], got)
+                self.assertEqual(got["dotReason"], expected, got)
+
+    def test_r11_fable_the_accumulated_reason_dedupes_on_exact_equality_never_containment(self) -> None:
+        # fable key3: PRESENTMON_UNAVAILABLE and 'PRESENTMON_UNAVAILABLE: no rows' read as one under substring containment, and the shorter text was lost
+        for helper in self.HELPERS:
+            with self.subTest(helper=helper):
+                got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                                "$report.Add('reason', 'PRESENTMON_UNAVAILABLE'); $report.Add('Reason', 'PRESENTMON_UNAVAILABLE: no rows'); $report.Add('REASON', 'PRESENTMON_UNAVAILABLE')\n"
+                                f"$r = {self.HELPERS[helper]}" + self.DOT_REASON + self.COMPOSED)
+                expected = f"PRESENTMON_UNAVAILABLE PRESENTMON_UNAVAILABLE: no rows [{self.ADDED[helper]}]"
+                self.assertEqual(got["entries"], [f"String:reason={expected}"], got)
+                self.assertEqual(got["dotReason"], expected, got)
+
+    def test_r11_a_dictionary_report_is_a_new_object_and_the_input_is_never_mutated(self) -> None:
+        shapes = {"ordered": "$report = [ordered]@{ reason = 'r'; status = 'S' }",
+                  "hashtable": "$report = @{ reason = 'r'; status = 'S' }",
+                  "ordinal": "$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal); $report.Add('reason', 'r'); $report.Add('status', 'S')",
+                  "culture": "$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::InvariantCultureIgnoreCase); $report.Add('reason', 'r'); $report.Add('status', 'S')",
+                  "sorted": "$report = [System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::Ordinal); $report.Add('reason', 'r'); $report.Add('status', 'S')",
+                  "object-keys": "$report = [System.Collections.Generic.Dictionary[object,object]]::new(); $report.Add('reason', 'r'); $report.Add('status', 'S')",
+                  "colliding": "$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal); $report.Add('reason', 'r'); $report.Add('status', 'S'); $report.Add('Status', 'T')",
+                  "empty-key": "$report = [ordered]@{ reason = 'r'; status = 'S'; '' = 'keep' }"}
+        for shape, ctor in shapes.items():
+            for helper in self.HELPERS:
+                with self.subTest(shape=shape, helper=helper):
+                    got = self.call(f"{ctor}\n$r = {self.HELPERS[helper]}" + self.DOT_REASON +
+                                    "Write-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ same = [object]::ReferenceEquals($r, $report); dotReason = $dot;"
+                                    " inputReason = [string]$report['reason']; inputCount = $report.Count }) -Compress))")
+                    self.assertFalse(got["same"], got)
+                    self.assertEqual(got["dotReason"], f"r [{self.ADDED[helper]}]", got)
+                    self.assertEqual((got["inputReason"], got["inputCount"]), ("r", {"colliding": 3, "empty-key": 3}.get(shape, 2)), "the input report is never mutated")
+
+    def test_r11_keys_that_collide_take_the_exact_key_rule_and_keep_every_value(self) -> None:
+        # the documented collision rule: no value is dropped; the report is an exact-key OrderedDictionary, the reason-like entries folded into `reason`, and a second call is stable
+        cases = {"case-variants": ("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                                   "$report.Add('status', 'S'); $report.Add('Status', 'OTHER'); $report.Add('Reason', 'r')",
+                                   ["String:status=S", "String:Status=OTHER", "String:reason={}"]),
+                 "string-form": ("$report = [System.Collections.Generic.Dictionary[object,object]]::new()\n$report.Add('reason', 'r'); $report.Add(1, 'int'); $report.Add('1', 'str')",
+                                 ["String:reason={}", "Int32:1=int", "String:1=str"])}
+        for name, (ctor, entries) in cases.items():
+            with self.subTest(case=name):
+                got = self.compose_on(ctor, "sweep", "events", "events")
+                expected = f"r [{self.SW_TEXT}] [{self.EV_TEXT}]"
+                self.assertEqual(got["entries"], [e.format(expected) for e in entries], got)
+                self.assertEqual(got["dotReason"], expected, got)
+
+    def test_r11_a_non_string_key_that_collides_with_nothing_is_copied_under_its_string_form(self) -> None:
+        got = self.compose("[ordered]@{ Reason = 'r'; 7 = 'seven'; status = 'S' }", "events")
+        self.assertEqual(got["entries"], [f"String:reason=r [{self.EV_TEXT}]", "String:7=seven", "String:status=S"], got)
+        self.assertEqual(got["dotReason"], f"r [{self.EV_TEXT}]", got)
+
+    # --- r13 (sol r12 B1 on d32a71f0; opus key3 / fable r12 REPORT-HELPER-TYPED-KEY-DICTIONARY-THROW-1): a dictionary whose key type cannot be a string and that shows no public Comparer
+    # (ReadOnlyDictionary[int,object], ImmutableDictionary[int,object], ImmutableSortedDictionary[int,object]) holds no `reason` by definition. The one-holder rule asked it
+    # `ContainsKey('reason')`, which bound to ContainsKey(int) and threw outside any try. It now takes the r11 canonical-report route like every other dictionary.
+    TYPED_KEY_SHAPES = {
+        "readonly-int": "$d = [System.Collections.Generic.Dictionary[int,object]]::new(); $d.Add(7, 'keep'); $report = [System.Collections.ObjectModel.ReadOnlyDictionary[int,object]]::new($d)",
+        "immutable-int": "$report = [System.Collections.Immutable.ImmutableDictionary[int,object]]::Empty.Add(7, 'keep')",
+        "immutable-sorted-int": "$report = [System.Collections.Immutable.ImmutableSortedDictionary[int,object]]::Empty.Add(7, 'keep')",
+        "readonly-guid": "$d = [System.Collections.Generic.Dictionary[guid,object]]::new(); $d.Add([guid]'00000000-0000-0000-0000-000000000007', 'keep'); $report = [System.Collections.ObjectModel.ReadOnlyDictionary[guid,object]]::new($d)",
+        # controls that already worked: a public Comparer answers (Dictionary, SortedDictionary, ConcurrentDictionary), or the key type admits a string (object-keyed read-only map)
+        "control-dictionary-int": "$report = [System.Collections.Generic.Dictionary[int,object]]::new(); $report.Add(7, 'keep')",
+        "control-sorted-int": "$report = [System.Collections.Generic.SortedDictionary[int,object]]::new(); $report.Add(7, 'keep')",
+        "control-concurrent-int": "$report = [System.Collections.Concurrent.ConcurrentDictionary[int,object]]::new(); $null = $report.TryAdd(7, 'keep')",
+        "control-readonly-object": "$d = [System.Collections.Generic.Dictionary[object,object]]::new(); $d.Add(7, 'keep'); $report = [System.Collections.ObjectModel.ReadOnlyDictionary[object,object]]::new($d)"}
+
+    def test_r13_a_typed_key_dictionary_with_no_public_comparer_takes_the_canonical_report_route(self) -> None:
+        for shape, ctor in self.TYPED_KEY_SHAPES.items():
+            for helper in self.HELPERS:
+                with self.subTest(shape=shape, helper=helper):
+                    got = self.call(f"{ctor}\n$r = {self.HELPERS[helper]}" + self.DOT_REASON + self.COMPOSED)
+                    # the canonical report stringifies the key: {'7'='keep'; reason=<detail>} (the Guid row under its string form)
+                    expected_key = "String:00000000-0000-0000-0000-000000000007=keep" if "guid" in shape else "String:7=keep"
+                    self.assertEqual(got["entries"], [expected_key, f"String:reason={self.ADDED[helper]}"], got)
+                    self.assertEqual(got["dotReason"], self.ADDED[helper], got)
+                    self.assertFalse(got["same"], "the input dictionary is never returned once the helper has a detail to write")
+
+    def test_r13_a_typed_key_dictionary_composes_in_either_helper_order(self) -> None:
+        for shape in ("readonly-int", "immutable-int", "immutable-sorted-int"):
+            for first, second in (("events", "sweep"), ("sweep", "events")):
+                with self.subTest(shape=shape, first=first, second=second):
+                    got = self.compose_on(self.TYPED_KEY_SHAPES[shape], first, second)
+                    texts = {"events": self.EV_TEXT, "sweep": self.SW_TEXT}
+                    self.assertEqual(got["entries"][0], "String:7=keep", got)
+                    self.assertEqual(self.reason_like(got["entries"]), [f"String:reason={texts[first]} [{texts[second]}]"], got)
+                    self.assertEqual(got["dotReason"], f"{texts[first]} [{texts[second]}]", got)
+
+    def test_r13_nothing_to_add_still_returns_a_typed_key_dictionary_itself(self) -> None:
+        for call in ("Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep $null",
+                     "Add-AttrCudaPresentMonEventsLostDetailToReport -Report $report -EventsLost $null"):
+            with self.subTest(call=call[:40]):
+                got = self.call(f"{self.TYPED_KEY_SHAPES['readonly-int']}\n$r = {call}\n" + self.ENTRIES)
+                self.assertTrue(got["same"], got)
+
+    def test_r13_a_report_with_string_keys_whose_reason_lookup_throws_fails_closed(self) -> None:
+        # the narrowing of the r13 guard: only a report with NO string key is treated as holding no `reason` when its lookup throws; one that has string keys and cannot answer comes back unchanged
+        ctor = ("class ThrowingReport : System.Collections.Specialized.OrderedDictionary { [bool] Contains([object]$key) { throw 'lookup refused' } }\n"
+                "$report = [ThrowingReport]::new(); $report.Add('status', 'S'); $report.Add(7, 'keep')")
+        for helper in self.HELPERS:
+            with self.subTest(helper=helper):
+                got = self.call(f"{ctor}\n$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
+                self.assertTrue(got["same"], got)
+                self.assertEqual(got["entries"], ["String:status=S", "Int32:7=keep"], got)
+
+    def test_r13_a_typed_key_sweep_record_is_unreadable_not_a_throw(self) -> None:
+        # the sweep record is read inside the r5 try: a record keyed by something other than strings has no field to read and is named, never thrown (documented r5 behaviour, pinned)
+        got = self.call(f"{self.TYPED_KEY_SHAPES['readonly-int']}\n$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report ([ordered]@{{ reason = 'r' }}) -Sweep $report"
+                        + "\n$dot = [string]$r.reason\nWrite-Output ('JSON=' + (ConvertTo-Json -InputObject ([ordered]@{ dotReason = $dot }) -Compress))")
+        self.assertTrue(got["dotReason"].startswith("r [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: recordUnreadable="), got)
+
+    def test_r11_nothing_to_add_still_returns_the_dictionary_itself(self) -> None:
+        # the contract's other half: with no detail to write (a clean sweep, no events record) the helper adds nothing and returns the report it was given
+        for call in ("Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep @{ remaining = @() }",
+                     "Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $report -Sweep $null",
+                     "Add-AttrCudaPresentMonEventsLostDetailToReport -Report $report -EventsLost ([pscustomobject]@{ detected = $false; detail = $null })",
+                     "Add-AttrCudaPresentMonEventsLostDetailToReport -Report $report -EventsLost $null"):
+            with self.subTest(call=call[:60]):
+                got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal); $report.Add('Reason', 'a'); $report.Add('REASON', 'b')\n"
+                                f"$r = {call}\n" + self.ENTRIES)
+                self.assertTrue(got["same"], got)
+
+    def test_mutation_a_canonical_copy_without_the_other_keys_loses_a_dictionary_reports_fields_again(self) -> None:
+        module = MODULE.read_text(encoding="utf-8")
+        branch = "if ($canonical.Contains($name)) { $collides = $true } else { $canonical.Add($name, $valueList[$index]) }"
+        self.assertEqual(module.count(branch), 2, "both report helpers carry the canonical copy of every other key")
+        mutated = module.replace(branch, "$collides = $false", 2)
+        for helper in self.HELPERS:
+            got = self.shaped("ordered", helper, module_text=mutated)
+            self.assertIsNone(got["status"], f"sol's r3 B1 repro ({helper}): status is lost")
+        for helper in self.HELPERS:
+            got = self.shaped("ordered", helper)
+            self.assertEqual(got["status"], "PRESENTMON_UNAVAILABLE", f"control ({helper})")
+
+    def test_mutation_containment_dedupe_loses_a_text_again(self) -> None:
+        # fable key3: the exact-equality dedupe is what keeps the shorter text; a containment test drops it
+        module = MODULE.read_text(encoding="utf-8")
+        anchor = "foreach ($kept in $texts) { if ([string]::Equals($kept, $text, [StringComparison]::Ordinal)) { $repeat = $true } }"
+        self.assertEqual(module.count(anchor), 2, "both report helpers carry the exact dedupe")
+        mutated = module.replace(anchor, "foreach ($kept in $texts) { if ($kept.Contains($text) -or $text.Contains($kept)) { $repeat = $true } }", 2)
+        got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                        "$report.Add('reason', 'PRESENTMON_UNAVAILABLE: no rows'); $report.Add('Reason', 'PRESENTMON_UNAVAILABLE')\n"
+                        f"$r = {self.HELPERS['sweep']}" + self.DOT_REASON + self.COMPOSED, module_text=mutated)
+        self.assertEqual(got["dotReason"], f"PRESENTMON_UNAVAILABLE: no rows [{self.ADDED['sweep']}]", "the mutation drops the shorter text")
+        got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                        "$report.Add('reason', 'PRESENTMON_UNAVAILABLE: no rows'); $report.Add('Reason', 'PRESENTMON_UNAVAILABLE')\n"
+                        f"$r = {self.HELPERS['sweep']}" + self.DOT_REASON + self.COMPOSED)
+        self.assertEqual(got["dotReason"], f"PRESENTMON_UNAVAILABLE: no rows PRESENTMON_UNAVAILABLE [{self.ADDED['sweep']}]", "control: the real module keeps both")
 
     # --- the wrappers run logman as a child process under a deadline (UM-SWEEP-LOGMAN-BOUND-1); the tests hand them a stub executable
     HANGING_STUB = "Start-Sleep -Seconds 6\nexit 0\n"
@@ -372,7 +903,27 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
                   helper_works: bool = True, logman_stop_works: bool = True, enabled: bool = True, get_process_throws: bool = False, logman_query_fails: bool = False, live_from_second_check: bool = False,
                   text: str | None = None, extra_from_query: int = 0, live_after_terminate_of: str | None = None, query_exits: dict[int, int] | None = None,
                   logman_hangs: bool = False, logman_stop_hangs: bool = False, logman_timeout_seconds: int = 0,
-                  others: tuple[tuple[int, str, str | None], ...] = (), services: tuple[tuple[int, str], ...] = (), service_lookup_fails: bool = False) -> tuple[int, dict, Path, str]:
+                  others: tuple[tuple[int, str, str | None], ...] = (), services: tuple[tuple[int, str], ...] = (), service_lookup_fails: bool = False,
+                  processes: tuple[tuple[int, str, int, int | None], ...] = (), process_lookup_fails: bool = False,
+                  go_live_as: tuple[int, str, str | None] | None = None, command_lines: tuple[tuple[int | str, str], ...] = (), command_line_query_fails_from: int = 0,
+                  go_live_command_line: str | None = None, pm_name: str = STUB_EXE, presentmon_sha: str | None = None,
+                  pinned_copies: tuple[Path, ...] = (), session_ids: dict[int, int | str | None] | None = None,
+                  job_session: int | str | None = None, command_line_names: dict[int, str] | None = None, start_times: dict | None = None,
+                  cim_created: dict | None = None, go_live_from_snapshot: int = 0, reread_start_times: dict | None = None,
+                  extra_guard_pids: tuple[str, ...] = ()) -> tuple[int, dict, Path, str]:
+        # r5 (sol B1 on 2c226cd8): a process is (pid, creation instant). Every Get-Process row has a StartTime and every Win32_Process row a CreationDate; by default both are the same
+        # instant (the pid's `processes` creation stamp, else 2026-10-27T00:00 + pid seconds), so a row read before the enumeration is that process's. `start_times` overrides a pid's
+        # StartTime (None: unreadable) and `cim_created` its command-line row's CreationDate (a reused pid: another, earlier process); stamps are written as for `processes`.
+        # `reread_start_times` gives the StartTime a FRESH `Get-Process -Id` read returns for a pid (the process exited and another took the pid between the snapshot's two reads)
+        # go_live_from_snapshot=N makes the go-live process (and its command-line row) appear from the Nth Get-Process / command-line query on (1 the scope choice, 2 the post-listing check)
+        # r4: `session_ids` gives a process row (others / go_live_as, by pid) its SessionId: an int, None (a null value) or SESSION_THROWS (the getter throws); a pid not in it has none at all.
+        # `job_session` adds the sweeping job's own row ($PID) to Get-Process with that SessionId (None: no row, as before -- the job's session is then unknown)
+        # r2: `processes` are the Win32_Process rows (id, name, parent id, creation minute or None for an unreadable CreationDate) the parent read sees; `go_live_as` is the process that appears
+        # once live_after_terminate_of is terminated (default: the pinned image, pid 5151)
+        # r3: `command_lines` are the rows (pid, CommandLine) of the snapshot's ONE unfiltered Win32_Process query (a process without a row reads as an unreadable command line);
+        # `go_live_command_line` is the go-live process's row once it appears; command_line_query_fails_from=N makes that query fail from its Nth call on (0: never); `pm_name` is the
+        # configured -PresentMonName (the stub executable's name in the cache); `presentmon_sha` is the job's pinned $PresentMonSha (None: unset; "PINNED": the stub's own SHA-256);
+        # `pinned_copies` are byte copies of the stub written elsewhere (another harness's renamed copy of the pinned binary)
         d = self.stmp / name
         (d / "cache").mkdir(parents=True)
         (d / "legOut").mkdir()
@@ -383,12 +934,18 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         record = f"echo %2>>\"{d / 'terminated.txt'}\"\r\n" if helper_works else ""
         # a PresentMon process that appears once the helper has been asked to terminate this session (another capture starting mid-sweep)
         goes_live = f"if /i \"%2\"==\"{live_after_terminate_of}\" echo x>\"{d / 'go-live.txt'}\"\r\n" if live_after_terminate_of else ""
-        (d / "cache" / STUB_EXE).write_text(
+        (d / "cache" / pm_name).write_text(
             "@echo off\r\n"
             f"echo %*>>\"{d / 'calls.log'}\"\r\n"
             "echo %* | findstr /c:\"--terminate_existing_session\" >nul\r\n"
             "if errorlevel 1 exit /b 0\r\n"
             + goes_live + record + ("exit /b 0\r\n" if helper_works else "exit /b 1\r\n"), encoding="ascii")
+        pinned_bytes = (d / "cache" / pm_name).read_bytes()
+        for copy in pinned_copies:
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            copy.write_bytes(pinned_bytes)
+        if presentmon_sha == "PINNED":
+            presentmon_sha = hashlib.sha256(pinned_bytes).hexdigest().upper()
         exits = "; ".join(f"{k} = {v}" for k, v in (query_exits or {}).items())
         logman_stub = write_logman_stub(d, (
             f"$d = '{ps(d)}'\n"
@@ -421,51 +978,144 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         # UNREADABLE is a real unreadable path: the Path getter throws, as it does for a SYSTEM process read by a non-elevated agent.
         extra = ""
         denied_type = ""
-        for i, n, pth in others:
-            if pth == UNREADABLE:
+
+        sessions = dict(session_ids or {})
+        if job_session is not None:
+            sessions["$PID"] = job_session
+
+        def session_member(i: int | str) -> str:
+            if i not in sessions or sessions[i] == SESSION_THROWS:
+                return ""
+            return f"; SessionId = {('$null' if sessions[i] is None else sessions[i])}"
+
+        created_by_pid = {i: m for i, _n, _pp, m in processes if m is not None}
+
+        def stamp(v) -> str:
+            # a creation stamp as PowerShell: None ($null), ("sec", n) (base + n seconds), an int (base + n minutes, local), "local:<iso>" (that instant as a local DateTime), an ISO string
+            if v is None:
+                return "$null"
+            if v == LATE:
+                return "(Get-MlvLateStamp)"
+            if isinstance(v, tuple):
+                return f"(Get-Date '2026-10-27T00:00:00').AddSeconds({v[1]})"
+            if isinstance(v, str) and v.startswith("local:"):
+                return f"[DateTimeOffset]::Parse('{v[6:]}').LocalDateTime"
+            if isinstance(v, str):
+                return f"[DateTimeOffset]::Parse('{v}')"
+            return f"(Get-Date '2026-10-27T00:00:00').AddMinutes({v})"
+
+        def default_created(i: int | str):
+            return created_by_pid.get(i, ("sec", i if isinstance(i, int) else 0))
+
+        def start_expr(i: int | str) -> str:
+            return stamp((start_times or {})[i]) if i in (start_times or {}) else stamp(default_created(i))
+
+        def cim_created_expr(i: int | str) -> str:
+            return stamp((cim_created or {})[i]) if i in (cim_created or {}) else stamp(default_created(i))
+
+        def process_row(i: int, n: str, pth: str | None) -> str:
+            nonlocal denied_type
+            throws = sessions.get(i) == SESSION_THROWS
+            if pth == UNREADABLE or throws:
                 # a .NET property that throws, like Process.Path on a process the caller may not open (PowerShell reads a throwing getter as $null -- measured on pwsh 7.6 -- which is also what a real unreadable Path yields)
-                extra += f"    $all += [MlvDeniedProcess]@{{ Id = {i}; Name = '{n}' }}\n"
-                denied_type = ("Add-Type -TypeDefinition 'public class MlvDeniedProcess { public int Id; public string Name; "
-                               "public string Path { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } }'\n")
-            else:
-                extra += f"    $all += [pscustomobject]@{{ Id = {i}; Name = '{n}'; Path = {('$null' if pth is None else ps_quote(pth))} }}\n"
+                # r4: MlvDeniedSessionProcess's SessionId getter throws too (the session probe's failure case); MlvDeniedProcess's SessionId is a plain value (null when not given)
+                denied_type = ("Add-Type -TypeDefinition 'public class MlvDeniedProcess { public int Id; public string Name; public object SessionId; public object StartTime; "
+                               "public string Path { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } } "
+                               "public class MlvDeniedSessionProcess { public int Id; public string Name; public object StartTime; "
+                               "public string Path { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } "
+                               "public object SessionId { get { throw new System.UnauthorizedAccessException(\"Access is denied\"); } } }'\n")
+                return f"[{'MlvDeniedSessionProcess' if throws else 'MlvDeniedProcess'}]@{{ Id = {i}; Name = '{n}'; StartTime = {start_expr(i)}{session_member(i)} }}"
+            return f"[pscustomobject]@{{ Id = {i}; Name = '{n}'; Path = {('$null' if pth is None else ps_quote(pth))}; StartTime = {start_expr(i)}{session_member(i)} }}"
+
+        for i, n, pth in others:
+            extra += f"    $all += {process_row(i, n, pth)}\n"
+        if job_session is not None:
+            job_row = process_row("$PID", "pwsh", JOB_IMAGE)
+            extra += f"    $all += {job_row}\n"
+        names_by_pid: dict[int | str, str] = {i: n for i, n, _p in others}
+        names_by_pid["$PID"] = "pwsh"
+
+        def cim_name(i: int | str) -> str:
+            return (command_line_names or {}).get(i, names_by_pid.get(i, "") + ".exe")
+
+        go_live_row = (process_row(*go_live_as) if go_live_as is not None
+                       else f"[pscustomobject]@{{ Id = 5151; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null; StartTime = {start_expr(5151)} }}")
+        go_live_pid = (go_live_as or (5151,))[0]
+        go_live_when = (f"((Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') -or ({go_live_from_snapshot} -gt 0 -and $global:getProcessCalls -ge {go_live_from_snapshot}))")
+        go_live_cim_when = (f"((Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') -or ({go_live_from_snapshot} -gt 0 -and $global:commandLineQueries -ge {go_live_from_snapshot}))")
         service_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}' }}" for i, n in services)
+        # a creation stamp is a minute offset (a local DateTime), None (unreadable), or an ISO string with an offset (a DateTimeOffset: the instant is fixed whatever the host's zone)
+        process_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}'; ParentProcessId = {pp}; CreationMinute = {('$null' if m is None else (ps_quote(m) if isinstance(m, str) else m))} }}" for i, n, pp, m in processes)
+        fixture_pids = sorted({p for p in (*(i for i, _n, _p in others), *(i for i, _n, _pp, _m in processes), *(pp for _i, _n, pp, _m in processes), *live_pids, go_live_pid,
+                                           *(i for i, _n in services), *(i for i, _c in command_lines), *(session_ids or {}), *(start_times or {}), *(cim_created or {}),
+                                           *(reread_start_times or {})) if isinstance(p, int)})
+        guard_pids = ", ".join([str(p) for p in fixture_pids] + list(extra_guard_pids))
         script = d / "probe.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
+            f"if (@({guard_pids}) -contains $PID) {{ Write-Output \"PID_COLLISION=$PID\"; exit {PID_COLLISION_EXIT} }}\n"
+            "function Get-MlvLateStamp { if ($null -eq $global:mlvLateStamp) { $global:mlvLateStamp = Get-Date }; return $global:mlvLateStamp }\n"
             f"Import-Module '{ps(MODULE)}' -Force\n"
             "function Test-AttrCudaPresentMonTraceReady($Proc) { [pscustomobject]@{ ready = $true; detail = 'stub' } }\n"
             f"$traceFile = '{ps(d / 'trace.log')}'\n"
+            # r5 (BACHELOR-CUDA-CANDIDATE-HASH-TRACE-1): the job's own trace file, which the module's traced readers (Get-AttrCudaFileSha256Blocks -TracePath $Trace) write to
+            f"$Trace = '{ps(d / 'job-trace.txt')}'\n"
             "function Write-JobTrace([string]$Message) { Add-Content -LiteralPath $traceFile -Value $Message }\n"
             + denied_type +
             "function Get-Process {\n"
-            "    [CmdletBinding()] param([string[]]$Name)\n"
-            "    $global:getProcessCalls = 1 + [int]$global:getProcessCalls\n"
+            "    [CmdletBinding()] param([string[]]$Name, [int[]]$Id)\n"
+            # r5: a fresh -Id read is no new snapshot (the counter counts snapshots)
+            "    if (-not $Id) { $global:getProcessCalls = 1 + [int]$global:getProcessCalls }\n"
             + ("    throw 'stub Get-Process failure'\n" if get_process_throws else
                "    $all = @()\n"
-               f"    if (Test-Path -LiteralPath '{ps(d / 'go-live.txt')}') {{ $all += [pscustomobject]@{{ Id = 5151; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }} }}\n"
+               f"    if {go_live_when} {{ $all += {go_live_row} }}\n"
                + extra
                + ("    if ($global:getProcessCalls -ge 2) {\n" if live_from_second_check else "    if ($true) {\n")
-               + f"        foreach ($p in @({pids})) {{ $all += [pscustomobject]@{{ Id = [int]$p; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null }} }}\n"
+               + f"        foreach ($p in @({pids})) {{ $all += [pscustomobject]@{{ Id = [int]$p; Name = [IO.Path]::GetFileNameWithoutExtension($PresentMonName); Path = $null; StartTime = (Get-Date '2026-10-27T00:00:00').AddSeconds([int]$p) }} }}\n"
                "    }\n"
                # the real cmdlet honours -Name (a wildcard on the image name): a process whose name does not match is never returned
-               "    $all | Where-Object { $p = $_; (-not $Name) -or (@($Name | Where-Object { $p.Name -like $_ }).Count -gt 0) }\n")
+               + ("    if ($Id) {\n"
+                  "        $found = @($all | Where-Object { $Id -contains [int]$_.Id })\n"
+                  "        if ($found.Count -eq 0) { Write-Error \"Cannot find a process with the process identifier $Id.\"; return }\n"
+                  + "".join(f"        if ($Id -contains {i}) {{ return [pscustomobject]@{{ Id = {i}; Name = $found[0].Name; StartTime = {stamp(s)} }} }}\n" for i, s in (reread_start_times or {}).items())
+                  + "        return $found\n"
+                  "    }\n")
+               + "    $all | Where-Object { $p = $_; (-not $Name) -or (@($Name | Where-Object { $p.Name -like $_ }).Count -gt 0) }\n")
             + "}\n"
             # the real cmdlet reads Win32_Service by a WQL filter; a failure is a non-terminating error that -ErrorAction Stop turns into a throw
             "function Get-CimInstance {\n"
-            "    [CmdletBinding()] param([string]$ClassName, [string]$Filter)\n"
+            "    [CmdletBinding()] param([string]$ClassName, [string]$Filter, [string[]]$Property)\n"
             "    $global:getCimCalls = 1 + [int]$global:getCimCalls\n"
-            + ("    Write-Error 'stub Get-CimInstance failure'; return\n" if service_lookup_fails else "")
+            # r3: the snapshot's unfiltered command-line query (ProcessId, CommandLine for every process); a failure is the whole query failing, as for an access-denied WMI namespace
+            "    if ($ClassName -eq 'Win32_Process' -and -not $Filter) {\n"
+            "        $global:commandLineQueries = 1 + [int]$global:commandLineQueries\n"
+            f"        if ({command_line_query_fails_from} -gt 0 -and $global:commandLineQueries -ge {command_line_query_fails_from}) {{ Write-Error 'stub Win32_Process command-line query failure'; return }}\n"
+            # r4: each row carries its image name (<name>.exe, from the process table above; command_line_names overrides it -- a reused pid's stale row)
+            + "".join(f"        [pscustomobject]@{{ ProcessId = {i}; CommandLine = {ps_quote(c)}; Name = {ps_quote(cim_name(i))}; CreationDate = {cim_created_expr(i)} }}\n" for i, c in command_lines)
+            + (f"        if {go_live_cim_when} {{ [pscustomobject]@{{ ProcessId = {go_live_pid}; CommandLine = {ps_quote(go_live_command_line)}; Name = {ps_quote((go_live_as[1] if go_live_as else '') + '.exe')}; CreationDate = {cim_created_expr(go_live_pid)} }} }}\n" if go_live_command_line else "")
+            + "        return\n"
+            "    }\n"
+            + ("    if ($ClassName -eq 'Win32_Service') { Write-Error 'stub Get-CimInstance failure'; return }\n" if service_lookup_fails else "")
+            + ("    if ($ClassName -eq 'Win32_Process') { Write-Error 'stub Win32_Process failure'; return }\n" if process_lookup_fails else "")
+            + "    $want = [int]([regex]::Match($Filter, 'ProcessId\\s*=\\s*(\\d+)').Groups[1].Value)\n"
+            # r2: the parent read (Win32_Process: ParentProcessId, Name, CreationDate as a DateTime, like the real CIM class)
+            f"    if ($ClassName -eq 'Win32_Process') {{\n"
+            f"        $processRows = @({process_rows})\n"
+            "        foreach ($r in $processRows) { if ($r.ProcessId -eq $want) { [pscustomobject]@{ Name = $r.Name; ProcessId = $r.ProcessId; ParentProcessId = $r.ParentProcessId; "
+            "CreationDate = $(if ($null -eq $r.CreationMinute) { $null } elseif ($r.CreationMinute -is [string] -and $r.CreationMinute -ceq '" + LATE + "') { Get-MlvLateStamp } elseif ($r.CreationMinute -is [string] -and $r.CreationMinute.StartsWith('local:')) { [DateTimeOffset]::Parse($r.CreationMinute.Substring(6)).LocalDateTime } elseif ($r.CreationMinute -is [string]) { [DateTimeOffset]::Parse($r.CreationMinute) } else { (Get-Date '2026-10-27T00:00:00').AddMinutes([int]$r.CreationMinute) }) } } }\n"
+            "        return\n"
+            "    }\n"
             + "    if ($ClassName -ne 'Win32_Service') { throw \"the sweep asked CIM for $ClassName\" }\n"
             f"    $services = @({service_rows})\n"
-            "    $want = [int]([regex]::Match($Filter, 'ProcessId\\s*=\\s*(\\d+)').Groups[1].Value)\n"
-            "    foreach ($s in $services) { if ($s.ProcessId -eq $want) { [pscustomobject]@{ Name = $s.Name; ProcessId = $s.ProcessId } } }\n"
+            # r4: the held-process check reads every service in ONE unfiltered query
+            "    foreach ($s in $services) { if (-not $Filter -or $s.ProcessId -eq $want) { [pscustomobject]@{ Name = $s.Name; ProcessId = $s.ProcessId } } }\n"
             "}\n"
             # the sweep's wrappers run an executable (bounded by a deadline), so the stub is one: a .cmd shim around a pwsh script
-            f"$presentMonLogmanPath = '{ps(logman_stub)}'\n"
+            + f"$presentMonLogmanPath = '{ps(logman_stub)}'\n"
             + (f"$presentMonLogmanTimeoutSeconds = {logman_timeout_seconds}\n" if logman_timeout_seconds else "")
-            + f"$Cache ='{ps(d / 'cache')}'\n$PresentMonName = '{STUB_EXE}'\n$ExeName = 'MLVApp.exe'\n$PresentMonTimedSeconds = 60\n"
-            "$PresentMonSessionName = 'MLVAttr3-the-new-job'\n$PresentMonTerminateOnProcExit = $true\n"
+            + f"$Cache ='{ps(d / 'cache')}'\n$PresentMonName = '{pm_name}'\n$ExeName = 'MLVApp.exe'\n$PresentMonTimedSeconds = 60\n"
+            + (f"$PresentMonSha = '{presentmon_sha}'\n" if presentmon_sha else "")
+            + "$PresentMonSessionName = 'MLVAttr3-the-new-job'\n$PresentMonTerminateOnProcExit = $true\n"
             f"$legOut = '{ps(d / 'legOut')}'\n"
             "$presentMonPath = Join-Path $legOut 'presentmon.csv'\n"
             "$presentMonStdoutPath = Join-Path $legOut 'presentmon-stdout.txt'\n$presentMonStderrPath = Join-Path $legOut 'presentmon-stderr.txt'\n"
@@ -475,7 +1125,12 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "$proc = Start-PresentMonCapture $presentMonPath\n"
             "[void]$proc.WaitForExit(20000)\n"
             "if ($null -ne $presentMonOrphanSweep) { Write-Output ('SWEEP=' + ($presentMonOrphanSweep | ConvertTo-Json -Depth 6 -Compress)) }\n", encoding="utf-8")
-        proc = run_pwsh(["-File", str(script)])
+        for _attempt in range(PID_COLLISION_ATTEMPTS):
+            proc = run_pwsh(["-File", str(script)])
+            if not (proc.returncode == PID_COLLISION_EXIT and "PID_COLLISION=" in proc.stdout):
+                break
+        else:
+            raise AssertionError(f"the probe's $PID equalled a fixture pid on every one of {PID_COLLISION_ATTEMPTS} attempts: {proc.stdout}")
         sweep: dict = {}
         for line in proc.stdout.splitlines():
             if line.startswith("SWEEP="):
@@ -527,6 +1182,13 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
     SERVICE = (7001, "PresentMonService", "C:\\Program Files\\Intel\\PresentMonService.exe")
     SERVICE_ROW = ((7001, "PresentMonService"),)
     SERVICE_UNREADABLE = (7001, "PresentMonService", UNREADABLE)
+    # r2: the Bachelor shape as Win32_Process sees it -- PresentMonService (7001) under IntelGraphicsSoftware.Service.exe (900), the parent started first
+    INTEL_TREE = ((7001, "PresentMonService", 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 5))
+    INTEL_DETAIL = {"name": "PresentMonService", "pid": 7001, "pathReadable": False, "reason": "unreadable_path_not_a_registered_service",
+                    "nonCaptureIdentity": "intel_graphics_presentmonservice", "parentName": "IntelGraphicsSoftware.Service.exe", "parentPid": 900, "identityError": None}
+    # Dot's repro (#707): a second harness started with the permitted -PresentMonName PresentMon-custom.exe owns a live MLVAttr3-* capture; the name misses the capture-image pattern
+    CUSTOM_UNREADABLE = (6100, "PresentMon-custom", UNREADABLE)
+    CUSTOM_READABLE = (6100, "PresentMon-custom", "C:\\other-harness\\cache\\PresentMon-custom.exe")
 
     def test_an_owner_presentmonservice_does_not_skip_the_sweep(self) -> None:
         # Bachelor, 2026-10-03: the always-running PresentMonService matched `PresentMon*` and skipped the sweep on both legs
@@ -536,7 +1198,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertTrue(sweep["ran"], sweep)
         self.assertIsNone(sweep["skippedReason"])
         self.assertEqual(sweep["livePresentMonProcessIds"], [], "the service is not a live capture")
-        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": True}], "recorded as evidence: name, pid, service, pathReadable (never the path)")
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": True, "nonCaptureIdentity": "registered_service"}], "recorded as evidence: name, pid, service, pathReadable (never the path)")
         self.assertEqual(sweep["remaining"], [])
         self.assertIn("excluded=PresentMonService:7001", (d / "trace.log").read_text(encoding="utf-8"))
 
@@ -546,13 +1208,15 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertTrue(sweep["ran"], sweep)
         self.assertEqual(self.terminated_names(self.calls(d)), ["PresentMon", "MLVAttr3-old-killed-job"])
-        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": False}])
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": False, "nonCaptureIdentity": "registered_service"}])
 
     def test_a_service_registered_under_another_pid_does_not_excuse_a_process(self) -> None:
+        # still live, and (r2) with no positive identity it is a blocker for the harness sessions too: nothing is swept
         code, sweep, d, out = self.run_start("service-other-pid", others=(self.SERVICE_UNREADABLE,), services=((7002, "PresentMonService"),))
         self.assertEqual(code, 0, out)
-        self.assertFalse(sweep["ran"], sweep)
         self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
 
     def test_a_live_pinned_capture_beside_the_service_still_skips_the_sweep(self) -> None:
         code, sweep, d, out = self.run_start("service-and-capture", live_pids=(4242,), others=(self.SERVICE,), services=self.SERVICE_ROW)
@@ -561,7 +1225,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertFalse(sweep["ran"])
         self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
         self.assertEqual(sweep["livePresentMonProcessIds"], [4242], "only the pinned capture counts as live")
-        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": True}])
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": True, "nonCaptureIdentity": "registered_service"}])
 
     def test_a_pinned_capture_that_appears_mid_sweep_still_stops_it_with_the_service_running(self) -> None:
         code, sweep, d, out = self.run_start("service-mid-sweep", live_after_terminate_of="PresentMon", others=(self.SERVICE,), services=self.SERVICE_ROW)
@@ -570,27 +1234,666 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(sweep["abortedBefore"], "MLVAttr3-old-killed-job:presentmon_terminate")
         self.assertEqual(sweep["livePresentMonProcessIds"], [5151])
 
-    # --- sol's repro: the Path getter throws access denied (or is null), the process is not a registered service -> live, NO sweep, a recorded reason
-    def test_an_unreadable_path_that_is_no_registered_service_is_live_and_blocks_the_sweep(self) -> None:
-        code, sweep, d, out = self.run_start("unreadable-no-service", others=(self.SERVICE_UNREADABLE,))
+    # --- sol's repro: the Path getter throws access denied (or is null), the process is not a registered service -> live, a recorded reason, and the DEFAULT session is never swept under it.
+    # BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 (Bachelor, 2026-10-27): this is the real Bachelor shape (Intel's PresentMonService, a child of IntelGraphicsSoftware.Service.exe, is no registered
+    # service and its path is unreadable to the agent), so it skipped the WHOLE sweep on every leg; an agent tree-kill at 20:06:20Z then left MLVAttr3-...-150416 running and every later capture
+    # wrote no CSV. r2 (Dot advisory on #707): it is let out of the harness_sessions blockers only on POSITIVE identity -- image PresentMonService AND parent IntelGraphicsSoftware.Service.exe
+    # (Win32_Process) -- so its MLVAttr3-* orphans are swept (scope harness_sessions) and the default session is left and recorded as deferred.
+    def test_h1_the_intel_presentmonservice_sweeps_the_harness_orphan_and_defers_the_default_session(self) -> None:
+        code, sweep, d, out = self.run_start("h1-intel-child", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.terminated_names(self.calls(d)), [], "an unidentifiable PresentMon may own a capture: nothing is terminated")
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"], "the r1b repair: the 16-of-16 missing-CSV orphan is swept")
         self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "and logman stop is not used either")
-        self.assertFalse(sweep["ran"], sweep)
+        self.assertTrue(sweep["ran"], sweep)
         self.assertIsNone(sweep["error"])
-        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertIsNone(sweep["skippedReason"])
+        self.assertEqual(sweep["scope"], "harness_sessions")
+        self.assertEqual(sweep["listed"], ["MLVAttr3-old-killed-job"])
+        self.assertEqual(sweep["deferred"], ["PresentMon"])
+        self.assertEqual(sweep["remaining"], [])
         self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
         self.assertEqual(sweep["excludedPresentMonProcesses"], [])
-        self.assertEqual(sweep["livePresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "pathReadable": False, "reason": "unreadable_path_not_a_registered_service"}])
+        self.assertEqual(len([c for c in self.calls(d) if "--process_name" in c]), 1, "the capture itself still starts")
+        trace = (d / "trace.log").read_text(encoding="utf-8")
+        self.assertIn("scope=harness_sessions", trace)
+        self.assertIn("deferred=PresentMon", trace)
+
+    def test_h1_the_identity_evidence_is_recorded_in_the_snapshot_detail(self) -> None:
+        _code, sweep, d, _out = self.run_start("h1-evidence", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(sweep["livePresentMonProcesses"], [self.INTEL_DETAIL])
+        self.assertIn("identified=PresentMonService:7001:intel_graphics_presentmonservice:IntelGraphicsSoftware.Service.exe", (d / "trace.log").read_text(encoding="utf-8"))
+
+    def test_h1_a_null_path_intel_child_is_identified_too(self) -> None:
+        code, sweep, d, out = self.run_start("h1-null-path", others=((7001, "PresentMonService", None),), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+        self.assertEqual(sweep["deferred"], ["PresentMon"])
+        self.assertFalse(sweep["livePresentMonProcesses"][0]["pathReadable"])
+
+    def test_h2_a_registered_service_presentmon_is_unchanged(self) -> None:
+        # the registered-service arm (UM-SWEEP-OWNER-PRESENTMONSERVICE-1) is not live at all: scope all, the default session and the orphan both go, and no parent is read for it
+        code, sweep, d, out = self.run_start("h2-registered", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW, process_lookup_fails=True)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((sweep["scope"], sweep["skippedReason"], sweep["error"]), ("all", None, None))
+        self.assertEqual(self.terminated_names(self.calls(d)), ["PresentMon", "MLVAttr3-old-killed-job"])
+        self.assertEqual([(r["name"], r["pid"], r["service"], r["pathReadable"]) for r in sweep["excludedPresentMonProcesses"]], [("PresentMonService", 7001, "PresentMonService", False)])
+
+    def test_h2_the_registered_service_record_names_its_identity(self) -> None:
+        _code, sweep, _d, _out = self.run_start("h2-identity", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW)
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": False, "nonCaptureIdentity": "registered_service"}])
+
+    def h3(self, name: str, others: tuple = (), **kw) -> tuple[dict, Path]:
+        code, sweep, d, out = self.run_start(name, others=others or (self.SERVICE_UNREADABLE,), **kw)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive", "no positive identity: a blocker, nothing is swept")
+        self.assertIsNone(sweep["error"], "a refused identity is no sweep error: the process is simply a blocker")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "")
+        self.assertEqual(len([c for c in self.calls(d) if "--process_name" in c]), 1, "the capture itself still starts")
+        self.assertIsNone(sweep["livePresentMonProcesses"][0].get("nonCaptureIdentity"))
+        return sweep["livePresentMonProcesses"][0], d
+
+    def test_h3_a_presentmonservice_under_another_parent_is_a_blocker(self) -> None:
+        detail, _d = self.h3("h3-other-parent", processes=((7001, "PresentMonService", 901, 10), (901, "explorer.exe", 4, 5)))
+        # adversary A5: the refusal says why
+        self.assertEqual((detail.get("parentName"), detail.get("parentPid"), detail.get("identityError")), ("explorer.exe", 901, "parent_not_intel_graphics_service"))
+
+    def test_a1_a_parent_started_after_the_child_across_an_offset_change_is_no_evidence(self) -> None:
+        # adversary A1's input: the child started 06:55Z (01:55-05:00, daylight), its parent exited, and pid 900 now belongs to an Intel service started 07:10Z (01:10-06:00, standard). On the
+        # wall clock the replacement parent reads EARLIER than the child; as instants it is later, so it is no evidence
+        detail, _d = self.h3("a1-offset-change", processes=((7001, "PresentMonService", 900, "2025-11-02T01:55:00-05:00"), (900, "IntelGraphicsSoftware.Service.exe", 4, "2025-11-02T01:10:00-06:00")))
+        self.assertEqual(detail.get("identityError"), "parent_started_after_child")
+
+    def test_a1_the_cim_shape_a_local_datetime_is_compared_as_an_instant(self) -> None:
+        # the real Win32_Process CreationDate is a LOCAL DateTime (the same instants converted to the host's zone). On a host whose zone leaves daylight time at 2025-11-02T07:00Z (US Central,
+        # the venues' zone) the parent's wall clock reads 01:10 and the child's 01:55, so a wall-clock compare accepts the reused pid; on a UTC host the wall clocks already agree with the instants
+        detail, _d = self.h3("a1-local", processes=((7001, "PresentMonService", 900, "local:2025-11-02T06:55:00Z"), (900, "IntelGraphicsSoftware.Service.exe", 4, "local:2025-11-02T07:10:00Z")))
+        self.assertEqual(detail.get("identityError"), "parent_started_after_child")
+
+    def test_a1_the_same_offsets_in_the_right_order_still_identify_the_intel_child(self) -> None:
+        code, sweep, d, out = self.run_start("a1-offset-ok", others=(self.SERVICE_UNREADABLE,), processes=((7001, "PresentMonService", 900, "2025-11-02T01:10:00-06:00"), (900, "IntelGraphicsSoftware.Service.exe", 4, "2025-11-02T01:55:00-05:00")))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["livePresentMonProcesses"][0]["nonCaptureIdentity"], "intel_graphics_presentmonservice", sweep)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+    def test_h3_a_presentmonservice_whose_parent_read_throws_is_a_blocker_with_the_reason(self) -> None:
+        detail, _d = self.h3("h3-read-throws", processes=self.INTEL_TREE, process_lookup_fails=True)
+        self.assertIn("parent_read_failed", str(detail.get("identityError")))
+        self.assertIn("stub Win32_Process failure", str(detail.get("identityError")))
+
+    def test_h3_a_presentmonservice_with_no_process_row_is_a_blocker(self) -> None:
+        detail, _d = self.h3("h3-no-row")
+        self.assertEqual(detail.get("identityError"), "process_row_count=0")
+
+    def test_h3_a_presentmonservice_whose_parent_is_gone_is_a_blocker(self) -> None:
+        detail, _d = self.h3("h3-parent-gone", processes=((7001, "PresentMonService", 900, 10),))
+        self.assertEqual((detail.get("parentPid"), detail.get("identityError")), (900, "parent_row_count=0"))
+
+    def test_h3_a_parent_pid_reused_after_the_child_started_is_no_evidence(self) -> None:
+        detail, _d = self.h3("h3-pid-reuse", processes=((7001, "PresentMonService", 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 20)))
+        self.assertEqual((detail.get("parentName"), detail.get("identityError")), ("IntelGraphicsSoftware.Service.exe", "parent_started_after_child"))
+
+    def test_h3_an_unreadable_creation_date_is_no_evidence(self) -> None:
+        detail, _d = self.h3("h3-no-date", processes=((7001, "PresentMonService", 900, None), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)))
+        self.assertEqual(detail.get("identityError"), "creation_date_unreadable")
+
+    def test_h3_only_the_exact_presentmonservice_name_can_carry_the_intel_identity(self) -> None:
+        # the same Intel parent is no identity for any other image name
+        code, sweep, d, out = self.run_start("h3-other-name", others=((7001, "PresentMonServiceX", UNREADABLE),), processes=((7001, "PresentMonServiceX", 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        detail = sweep["livePresentMonProcesses"][0]
+        self.assertEqual((detail.get("nonCaptureIdentity"), detail.get("parentName")), (None, None), "no parent is read for another name")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    # --- r7 (r6 adversary A1 on 836a3d61, Dot 54d909b1): the name gates compare ordinally. PowerShell's -ieq/-ine is culture-sensitive and ignores U+00AD, so a soft-hyphen lookalike of
+    # PresentMonService under the Intel parent (or the real child under a soft-hyphen lookalike parent) got the Intel identity and its live MLVAttr3-* session was terminated.
+    SHY_CHILD = "PresentMonSer­vice"
+
+    def test_r7_a1_a_soft_hyphen_presentmonservice_lookalike_is_no_intel_child(self) -> None:
+        detail, _d = self.h3("r7-a1-shy-child", others=((7001, self.SHY_CHILD, UNREADABLE),), processes=((7001, self.SHY_CHILD, 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)))
+        # (the record crosses the console code page, where U+00AD may read back as '-': the identity outcome is what is asserted)
+        self.assertEqual((detail.get("pid"), detail.get("parentName"), detail.get("identityError")), (7001, None, None), "no parent is read for another name")
+
+    def test_r7_a1_a_soft_hyphen_intel_parent_lookalike_gives_no_identity(self) -> None:
+        detail, _d = self.h3("r7-a1-shy-parent", processes=((7001, "PresentMonService", 900, 10), (900, "IntelGraphicsSoftware.Ser­vice.exe", 4, 5)))
+        self.assertEqual((detail.get("parentPid"), detail.get("identityError")), (900, "parent_not_intel_graphics_service"))
+
+    def test_r7_a1_a_process_row_whose_name_differs_only_by_a_soft_hyphen_is_another_process(self) -> None:
+        detail, _d = self.h3("r7-a1-shy-row", processes=((7001, self.SHY_CHILD, 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)))
+        self.assertEqual(detail.get("identityError"), "process_row_name_changed")
+
+    def test_r7_b_a1_a_creation_stamp_after_now_is_no_order_evidence(self) -> None:
+        # adversary A1 on 0805902c: the child started 10:01Z, the clock stepped back, and an unrelated Intel service reused the parent pid at 09:01Z -- it reads earlier than the child. The
+        # child's stamp is later than now (the step is visible), so the order is no evidence (the stamps are set in the future here to stand for "now is before the child's stamp")
+        detail, _d = self.h3("r7-b-a1-clock-step", processes=((7001, "PresentMonService", 900, "2099-01-01T10:01:00Z"), (900, "IntelGraphicsSoftware.Service.exe", 4, "2099-01-01T09:01:00Z")))
+        self.assertEqual((detail.get("parentPid"), detail.get("identityError")), (900, "creation_instant_after_now"))
+
+    def test_r7_a1_control_the_exact_pair_is_still_recognised(self) -> None:
+        code, sweep, d, out = self.run_start("r7-a1-control", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["livePresentMonProcesses"], [self.INTEL_DETAIL])
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
+    # --- r8 (r7 adversary A1 on 6d30ac14, hub ruling): the Intel parent identity needs PROVEN order -- both stamps strictly before the sweep's own start, no step seen during the sweep,
+    # the parent strictly earlier. On 6d30ac14 a child stamped during the sweep (not later than now) under an older reused Intel pid got the identity and the sweep ran harness_sessions.
+    def test_r8_a1_a_child_stamped_during_the_sweep_under_an_older_intel_pid_is_no_identity(self) -> None:
+        detail, _d = self.h3("r8-a1-child-during-sweep", processes=((7001, "PresentMonService", 900, LATE), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)))
+        self.assertEqual((detail.get("parentPid"), detail.get("identityError")), (900, "creation_instant_not_before_sweep_start"))
+
+    def test_r8_a1_a_parent_stamped_with_the_child_is_no_order_evidence(self) -> None:
+        detail, _d = self.h3("r8-a1-equal-stamps", processes=((7001, "PresentMonService", 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 10)))
+        self.assertEqual(detail.get("identityError"), "parent_started_with_child")
+
+    def test_r8_a1_a_clock_that_stepped_back_during_the_sweep_is_no_order_evidence(self) -> None:
+        # the sweep's recorded start reads later than now: the clock stepped back since the sweep began (a start an hour ahead stands for the step)
+        mutated = mutate(TEMPLATE, "$script:presentMonSweepStartUtc = (Get-Date).ToUniversalTime()", "$script:presentMonSweepStartUtc = (Get-Date).ToUniversalTime().AddHours(1)")
+        detail, _d = self.h3("r8-a1-step-during-sweep", processes=self.INTEL_TREE, text=mutated)
+        self.assertEqual(detail.get("identityError"), "clock_stepped_back_during_sweep")
+
+    def test_r8_a1_an_unrecorded_sweep_start_is_no_proof(self) -> None:
+        mutated = mutate(TEMPLATE, "$script:presentMonSweepStartUtc = (Get-Date).ToUniversalTime()", "$script:presentMonSweepStartUtc = $null")
+        detail, _d = self.h3("r8-a1-no-sweep-start", processes=self.INTEL_TREE, text=mutated)
+        self.assertEqual(detail.get("identityError"), "sweep_start_unknown")
+
+    def test_r8_ci_a_probe_whose_pid_is_a_fixture_pid_is_run_again_never_judged(self) -> None:
+        # hosted shard 6/8 on 6d30ac14: the probe's $PID was 6200, so the job skipped the unidentified capture as itself and swept. A collision is now detected before anything runs;
+        # one that never clears (forced here) fails the harness loudly instead of returning a verdict
+        with self.assertRaisesRegex(AssertionError, "equalled a fixture pid on every one of 5 attempts"):
+            self.run_start("r8-ci-pid-collision", others=(self.SERVICE_UNREADABLE, self.UNIDENTIFIED), processes=self.INTEL_TREE, extra_guard_pids=("$PID",))
+
+    # --- r2 regressions (Dot advisory on #707, hub-confirmed on cd2a518d): a second harness's live PresentMon-custom must stop the harness_sessions sweep at every one of its three gates
+    def test_r1_a_live_presentmon_custom_with_an_unreadable_path_refuses_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r1-custom-unreadable", others=(self.CUSTOM_UNREADABLE,))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive", "as on base 038ba335")
+        self.assertEqual(sweep["livePresentMonProcessIds"], [6100])
+        self.assertEqual(self.terminated_names(self.calls(d)), [], "the other harness's live MLVAttr3-* capture is never terminated")
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "")
+
+    def test_r1_a_live_presentmon_custom_with_a_readable_path_refuses_the_sweep(self) -> None:
+        # the realistic form: the other harness runs under the same agent account, so its path IS readable; a readable path alone was an exclusion before r2 (scope all swept its session)
+        code, sweep, d, out = self.run_start("r1-custom-readable", others=(self.CUSTOM_READABLE,))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [])
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_r1_a_presentmon_custom_beside_the_intel_child_still_refuses_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r1-custom-beside-intel", others=(self.SERVICE_UNREADABLE, self.CUSTOM_UNREADABLE), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_r2_a_presentmon_custom_that_appears_before_a_terminate_aborts_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r2-custom-mid-terminate", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                             go_live_as=self.CUSTOM_UNREADABLE, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"], "the other harness's session is never terminated")
+        self.assertEqual(sweep["abortedReason"], "presentmon_process_started_during_sweep")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-other-harness-live:presentmon_terminate")
+        self.assertEqual(sweep["livePresentMonProcessIds"], [6100])
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "")
+
+    def test_r3_a_presentmon_custom_that_appears_before_a_logman_stop_aborts_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r3-custom-before-stop", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), helper_works=False,
+                                             live_after_terminate_of="MLVAttr3-other-harness-live", go_live_as=self.CUSTOM_UNREADABLE, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "logman stop is never issued under the other harness's live capture")
+        self.assertEqual(sweep["abortedReason"], "presentmon_process_started_during_sweep")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-killed-a:logman_stop")
+        self.assertEqual(sweep["remaining"], ["MLVAttr3-killed-a", "MLVAttr3-other-harness-live"])
+
+    def test_mutation_a_name_filter_on_the_blockers_lets_the_sweep_stop_a_live_custom_capture_again(self) -> None:
+        # the cd2a518d filter, restored: only capture-image names block -> Dot's repro
+        mutated = mutate(TEMPLATE, "return @(@($Snapshot.live) | Where-Object { $identified -notcontains [int]$_ } | ForEach-Object { [int]$_ })",
+                         "return @(@($Snapshot.liveDetail) | Where-Object { ([string]$_.name) -imatch '^PresentMon([-_.]?(\\d|x64|x86|console|capture|cli)|$)' } | ForEach-Object { [int]$_.pid })")
+        _code, sweep, d, _out = self.run_start("mut-name-filter", others=(self.CUSTOM_UNREADABLE,), text=mutated)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"], "the mutation terminates the other harness's live session")
+
+    def test_mutation_without_the_parent_name_check_any_parent_identifies_the_service(self) -> None:
+        mutated = mutate(TEMPLATE, "if (Test-PresentMonIdentityText $result.parentName 'IntelGraphicsSoftware.Service.exe') {", "if ($true) {")
+        _code, sweep, _d, _out = self.run_start("mut-parent-name", others=(self.SERVICE_UNREADABLE,), processes=((7001, "PresentMonService", 901, 10), (901, "explorer.exe", 4, 5)), text=mutated)
+        self.assertTrue(sweep["ran"], "the mutation lets a PresentMonService under any parent out of the blockers")
+
+    def test_mutation_without_the_name_check_any_image_under_the_intel_parent_is_identified(self) -> None:
+        mutated = mutate(TEMPLATE, "if (-not (Test-PresentMonIdentityText $Name 'PresentMonService')) { return $result }", "")
+        _code, sweep, _d, _out = self.run_start("mut-child-name", others=((7001, "PresentMonServiceX", UNREADABLE),), processes=((7001, "PresentMonServiceX", 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)), text=mutated)
+        self.assertTrue(sweep["ran"])
+
+    def test_mutation_without_the_creation_order_check_a_reused_parent_pid_identifies_the_service(self) -> None:
+        mutated = mutate(TEMPLATE, "if ($instants[1] -gt $instants[0]) {", "if ($false) {")
+        _code, sweep, _d, _out = self.run_start("mut-creation", others=(self.SERVICE_UNREADABLE,), processes=((7001, "PresentMonService", 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 20)), text=mutated)
+        self.assertTrue(sweep["ran"])
+
+    def test_mutation_a_parent_read_failure_read_as_identity_is_not_fail_closed(self) -> None:
+        mutated = mutate(TEMPLATE, "        $result['nonCaptureIdentity'] = $null\n        $result['identityError'] = 'parent_read_failed: ' + $_.Exception.Message",
+                         "        $result['nonCaptureIdentity'] = 'intel_graphics_presentmonservice'\n        $result['identityError'] = 'parent_read_failed: ' + $_.Exception.Message")
+        _code, sweep, _d, _out = self.run_start("mut-read-open", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, process_lookup_fails=True, text=mutated)
+        self.assertTrue(sweep["ran"], "the mutation sweeps on a parent it could not read")
+
+    # --- r2 item 3 (Dot's improvement on #707): newlyListed is what the FULL initial listing lacked
+    def test_item3_a_deferred_default_session_is_never_reported_as_newly_listed(self) -> None:
+        _code, sweep, _d, _out = self.run_start("item3-deferred-not-new", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(sweep["deferred"], ["PresentMon"])
+        self.assertEqual(sweep["newlyListed"], [], "the default session was in the first listing: it is not new")
+
+    def test_item3_a_session_that_really_appeared_is_still_newly_listed_in_harness_scope(self) -> None:
+        _code, sweep, d, _out = self.run_start("item3-really-new", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, extra_from_query=2)
+        self.assertEqual(sweep["newlyListed"], ["MLVAttr3-another-live-job"])
+        self.assertNotIn("MLVAttr3-another-live-job", self.terminated_names(self.calls(d)))
+
+    def test_mutation_newly_listed_against_the_filtered_list_reports_the_deferred_session_again(self) -> None:
+        mutated = mutate(TEMPLATE, "$record['newlyListed'] = @($finalNames | Where-Object { $finalName = [string]$_; @($initialNames | Where-Object { Test-PresentMonIdentityText ([string]$_) $finalName }).Count -eq 0 })", "$record['newlyListed'] = @($finalNames | Where-Object { $listed -notcontains $_ })")
+        _code, sweep, _d, _out = self.run_start("mut-newly", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
+        self.assertEqual(sweep["newlyListed"], ["PresentMon"])
+
+    # --- r3 regressions (sol B2 on 2519ce4f, Dot advisory, hub-confirmed): -PresentMonName accepts any <name>.exe, so a second harness's LIVE capture can run as capture.exe. Beside the
+    # identified Intel service the r2 scope was harness_sessions and the PresentMon*-only enumeration never saw it: its live MLVAttr3-* session was terminated (base 038ba335 skipped instead).
+    OTHER_SESSIONS = ("PresentMon", "MLVAttr3-old-killed-job", "MLVAttr3-other-harness-live")
+    CAPTURE = (6100, "capture", "C:\\other-harness\\cache\\capture.exe")
+    CAPTURE_CMD = ('"C:\\other-harness\\cache\\capture.exe" --process_name MLVApp.exe --output_file C:\\other-harness\\out\\presentmon.csv --timed 60 --terminate_after_timed '
+                   '--session_name MLVAttr3-other-harness-live --stop_existing_session --no_console_stats')
+
+    def assert_nothing_destructive(self, d: Path) -> None:
+        self.assertEqual(self.terminated_names(self.calls(d)), [], "the other harness's live MLVAttr3-* capture is never terminated")
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "and logman stop is never issued")
         self.assertEqual(len([c for c in self.calls(d) if "--process_name" in c]), 1, "the capture itself still starts")
 
-    def test_a_null_path_that_is_no_registered_service_is_live_and_blocks_the_sweep(self) -> None:
-        code, sweep, d, out = self.run_start("null-no-service", others=((7001, "PresentMonService", None),))
+    def test_r3_r1_a_renamed_capture_beside_the_intel_service_refuses_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r3-r1-renamed-beside-intel", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.CAPTURE), processes=self.INTEL_TREE,
+                                             command_lines=((6100, self.CAPTURE_CMD),))
         self.assertEqual(code, 0, out)
-        self.assertEqual(self.terminated_names(self.calls(d)), [])
         self.assertFalse(sweep["ran"], sweep)
-        self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
-        self.assertFalse(sweep["livePresentMonProcesses"][0]["pathReadable"])
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive", "as on base 038ba335: no harness_sessions scope")
+        self.assertIsNone(sweep["scope"])
+        self.assertIn(6100, sweep["livePresentMonProcessIds"])
+        self.assertEqual({r["pid"]: r["reason"] for r in sweep["livePresentMonProcesses"]}[6100], "capture_session_command_line")
+        self.assert_nothing_destructive(d)
+
+    def test_r3_r1_a_renamed_capture_whose_command_line_is_unreadable_is_found_by_its_image_hash(self) -> None:
+        # the same capture, its command line unreadable (no row): a copy of the pinned binary under another name and path is found by the pinned SHA-256
+        image = self.stmp / "r3-r1-hash-other-harness" / "capture.exe"
+        code, sweep, d, out = self.run_start("r3-r1-hash", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6100, "capture", str(image))), processes=self.INTEL_TREE,
+                                             presentmon_sha="PINNED", pinned_copies=(image,))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual({r["pid"]: r["reason"] for r in sweep["livePresentMonProcesses"]}[6100], "pinned_image_sha256")
+        self.assertEqual(sweep["unreadableCommandLineCount"], 2, "the Intel child and the capture had no readable command line; recorded, neither a blocker by that alone")
+        self.assert_nothing_destructive(d)
+
+    def test_r3_r1_a_capture_under_the_configured_name_is_live_whatever_its_prefix(self) -> None:
+        # this harness configured with -PresentMonName capture.exe (here a .cmd stub): its own pinned image never matched PresentMon* and was invisible too
+        code, sweep, d, out = self.run_start("r3-r1-configured", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6101, "capture", UNREADABLE)), processes=self.INTEL_TREE,
+                                             pm_name="capture.cmd")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual({r["pid"]: r["reason"] for r in sweep["livePresentMonProcesses"]}[6101], "pinned_image_name")
+        self.assert_nothing_destructive(d)
+
+    def test_r3_r1_a_single_dash_session_name_argument_is_a_candidate_too(self) -> None:
+        code, sweep, d, out = self.run_start("r3-r1-single-dash", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6102, "pm", "C:\\x\\pm.exe")), processes=self.INTEL_TREE,
+                                             command_lines=((6102, "pm.exe -session_name OtherCapture -process_name MLVApp.exe"),))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assert_nothing_destructive(d)
+
+    def test_r3_r1_the_sweeping_job_itself_is_never_a_candidate(self) -> None:
+        # the job's own process ($PID) owns no ETW session; were it a candidate, a job whose command line names its session would never sweep
+        code, sweep, d, out = self.run_start("r3-r1-self", others=(self.SERVICE_UNREADABLE, ("$PID", "pwsh", "C:\\pwsh\\pwsh.exe")), processes=self.INTEL_TREE,
+                                             command_lines=(("$PID", "pwsh -File job.ps1 MLVAttr3-the-new-job"),))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
+    def test_r3_r2_a_renamed_capture_that_appears_before_a_terminate_aborts_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r3-r2-renamed-mid-terminate", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                             go_live_as=self.CAPTURE, go_live_command_line=self.CAPTURE_CMD, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"], "the other harness's session is never terminated")
+        self.assertEqual(sweep["abortedReason"], "presentmon_process_started_during_sweep")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-other-harness-live:presentmon_terminate")
+        self.assertEqual(sweep["livePresentMonProcessIds"], [6100])
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "")
+
+    def test_r3_r3_a_renamed_capture_that_appears_before_a_logman_stop_aborts_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r3-r3-renamed-before-stop", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), helper_works=False,
+                                             live_after_terminate_of="MLVAttr3-other-harness-live", go_live_as=self.CAPTURE, go_live_command_line=self.CAPTURE_CMD,
+                                             others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "logman stop is never issued under the other harness's live capture")
+        self.assertEqual(sweep["abortedReason"], "presentmon_process_started_during_sweep")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-killed-a:logman_stop")
+        self.assertEqual(sweep["remaining"], ["MLVAttr3-killed-a", "MLVAttr3-other-harness-live"])
+
+    def test_r3_r4_a_command_line_query_that_fails_is_a_typed_fail_closed_skip(self) -> None:
+        for label, others, processes in (("beside-intel", (self.SERVICE_UNREADABLE,), self.INTEL_TREE), ("no-presentmon", (), ())):
+            code, sweep, d, out = self.run_start(f"r3-r4-{label}", others=others, processes=processes, command_line_query_fails_from=1)
+            self.assertEqual(code, 0, out)
+            self.assertFalse(sweep["ran"], (label, sweep))
+            self.assertEqual(sweep["skippedReason"], "capture_owner_command_lines_unreadable", label)
+            self.assertIsNone(sweep["scope"], "no scope is chosen, harness_sessions least of all")
+            self.assertIn("stub Win32_Process command-line query failure", sweep["commandLineError"], label)
+            self.assert_nothing_destructive(d)
+
+    def test_r3_r4_a_command_line_query_that_fails_on_a_recheck_stops_the_sweep_with_a_typed_error(self) -> None:
+        # queries: 1 the scope choice, 2 the post-listing recheck, 3 the recheck before the first terminate -- it fails there
+        code, sweep, d, out = self.run_start("r3-r4-recheck", sessions=("MLVAttr3-killed-a", "MLVAttr3-killed-b"), others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                             command_line_query_fails_from=3)
+        self.assertEqual(code, 0, out)
+        self.assertIn("capture_owner_command_lines_unreadable", str(sweep["error"]))
+        self.assert_nothing_destructive(d)
+
+    def test_r3_the_intel_service_alone_still_sweeps_with_readable_command_lines(self) -> None:
+        # the healthy control with the command-line route active: the Intel child's own command line names no session
+        code, sweep, d, out = self.run_start("r3-intel-readable", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                             command_lines=((7001, "\"C:\\Program Files\\Intel\\PresentMonService.exe\""),))
+        self.assertEqual(code, 0, out)
+        self.assertEqual((sweep["scope"], sweep["deferred"], sweep["unreadableCommandLineCount"]), ("harness_sessions", ["PresentMon"], 0))
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
+    # --- r4 regressions (Dot advisory on a79a5a89, hub-confirmed): a process whose path is unreadable AND whose command line reads empty, under a name no route matches, was dropped with
+    # no record. Beside the identified Intel service the scope was harness_sessions and the sweep could terminate that capture's live MLVAttr3-* session (base 038ba335 skipped).
+    UNIDENTIFIED = (6200, "capture", UNREADABLE)
+
+    def assert_refused_unidentified(self, sweep: dict, d: Path, label: str = "") -> None:
+        self.assertFalse(sweep["ran"], (label, sweep))
+        self.assertEqual(sweep["skippedReason"], "capture_owner_unidentified", (label, sweep))
+        self.assertIsNone(sweep["scope"], "no harness_sessions scope")
+        self.assertEqual(sweep["unidentifiedCaptureOwnerIds"], [6200], label)
+        self.assert_nothing_destructive(d)
+
+    def test_r4_u1_an_unidentified_capture_beside_the_intel_service_refuses_the_harness_scope(self) -> None:
+        # whatever session the capture or the job runs in: a session is no evidence (r4 adversary A2: session 0 beside a job in session 1 is the case that was swept on 87f6b16c)
+        for label, job_session, capture_session in (("same-session", 1, 1), ("job-session-unknown", None, 0), ("job-in-session-0", 0, 0), ("other-interactive-session", 1, 2),
+                                                    ("a2-session-0-beside-job-session-1", 1, 0)):
+            code, sweep, d, out = self.run_start(f"r4-u1-{label}", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.UNIDENTIFIED), processes=self.INTEL_TREE,
+                                                 job_session=job_session, session_ids={6200: capture_session})
+            self.assertEqual(code, 0, out)
+            self.assert_refused_unidentified(sweep, d, label)
+            self.assertEqual([(u["pid"], u["name"], u["sessionId"]) for u in sweep["unidentifiedCaptureOwners"]], [(6200, "capture", capture_session)], label)
+            trace = (d / "trace.log").read_text(encoding="utf-8")
+            self.assertIn("skipped=capture_owner_unidentified", trace, label)
+            self.assertIn("unidentifiedBlocking=6200", trace, label)
+
+    def test_r4_u2_an_unidentified_capture_that_appears_before_a_terminate_aborts_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r4-u2-mid-terminate", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                             go_live_as=self.UNIDENTIFIED, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, job_session=1, session_ids={6200: 1})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"], "the unidentified capture's session is never terminated")
+        self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-other-harness-live:presentmon_terminate")
+        self.assertEqual(sweep["unidentifiedCaptureOwnerIds"], [6200])
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "no logman stop after an abort")
+        self.assertEqual(sweep["remaining"], ["MLVAttr3-other-harness-live"])
+
+    def test_r4_u3_an_unidentified_capture_that_appears_before_a_logman_stop_aborts_the_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("r4-u3-before-stop", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), helper_works=False,
+                                             live_after_terminate_of="MLVAttr3-other-harness-live", go_live_as=self.UNIDENTIFIED, others=(self.SERVICE_UNREADABLE,),
+                                             processes=self.INTEL_TREE, job_session=1, session_ids={6200: 1})
+        self.assertEqual(code, 0, out)
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "logman stop is never issued under the unidentified capture")
+        self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-killed-a:logman_stop")
+        self.assertEqual(sweep["remaining"], ["MLVAttr3-killed-a", "MLVAttr3-other-harness-live"])
+
+    def test_r4_u4_a_session_probe_that_fails_is_no_evidence(self) -> None:
+        # the capture's own session unreadable (getter throws, or a null value), or the JOB's session unreadable while the capture reads session 0: fail closed, never a made-up session
+        for label, job_session, capture_session in (("capture-getter-throws", 1, SESSION_THROWS), ("capture-session-null", 1, None), ("job-getter-throws", SESSION_THROWS, 0)):
+            code, sweep, d, out = self.run_start(f"r4-u4-{label}", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.UNIDENTIFIED), processes=self.INTEL_TREE,
+                                                 job_session=job_session, session_ids={6200: capture_session})
+            self.assertEqual(code, 0, out)
+            self.assert_refused_unidentified(sweep, d, label)
+            owner = sweep["unidentifiedCaptureOwners"][0]
+            if label == "job-getter-throws":
+                self.assertEqual(sweep["unidentifiedNonOwnership"]["jobSessionError"], "session_id_unreadable", label)
+            else:
+                self.assertIsNone(owner["sessionId"], label)
+                self.assertEqual(owner["sessionError"], "session_id_unreadable", label)
+
+    def test_r4_a1_a_readable_path_with_no_command_line_and_no_route_is_unidentified_too(self) -> None:
+        # r4 adversary A1 on 87f6b16c: a renamed copy that is NOT the pinned binary (another length, so no hash match) has a readable path; with no command line nothing names it
+        code, sweep, d, out = self.run_start("r4-a1-readable", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6200, "capture", "C:\\other-harness\\cache\\capture.exe")),
+                                             processes=self.INTEL_TREE, job_session=1, session_ids={6200: 1})
+        self.assertEqual(code, 0, out)
+        self.assert_refused_unidentified(sweep, d)
+        self.assertTrue(sweep["unidentifiedCaptureOwners"][0]["pathReadable"])
+
+    def test_r4_a1b_a_reused_pids_stale_command_line_is_no_identity(self) -> None:
+        # r4 adversary A1 on 9ebee964: the command-line query read explorer's row for pid 6100; before the enumeration the pid was reused by a renamed capture
+        code, sweep, d, out = self.run_start("r4-a1b-reused-pid", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6200, "capture", "C:\\other-harness\\cache\\capture.exe")),
+                                             processes=self.INTEL_TREE, command_lines=((6200, "C:\\Windows\\explorer.exe /factory"),), command_line_names={6200: "explorer.exe"})
+        self.assertEqual(code, 0, out)
+        self.assert_refused_unidentified(sweep, d)
+
+    def test_mutation_a_command_line_used_for_any_process_under_its_pid_sweeps_the_reused_pid_again(self) -> None:
+        mutated = mutate(TEMPLATE, "if ($commandLines.ContainsKey($candidateId) -and (Test-PresentMonIdentityText ([string]$commandLines[$candidateId].name -replace '\\.exe$', '') $candidateName) -and $null -ne $started -and $null -ne $commandLines[$candidateId].created -and $commandLines[$candidateId].created -eq $started -and $started -eq $startedAfterPath) {",
+                         "if ($commandLines.ContainsKey($candidateId)) {")
+        _code, sweep, d, _out = self.run_start("mut-r4-a1b", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6200, "capture", "C:\\other-harness\\cache\\capture.exe")),
+                                               processes=self.INTEL_TREE, command_lines=((6200, "C:\\Windows\\explorer.exe /factory"),), command_line_names={6200: "explorer.exe"}, text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)))
+
+    # --- r5 (sol B1 on 2c226cd8; folds ATTR-CUDA-PRESENTMON-SAME-NAME-PID-GENERATION-1): the command-line query read capture.exe's row for pid 6200 (created 00:01Z); that capture exited
+    # and a LATER capture.exe took pid 6200 (StartTime 00:20Z) owning MLVAttr3-other-harness-live. The name matched, so the stale `capture.exe --help` (no session named) counted as the new
+    # process's: no candidate, no hold, and the sweep terminated (or logman-stopped) the other harness's live session. Identity is (pid, creation instant) now.
+    REUSED = (6200, "capture", UNREADABLE)
+    REUSED_CMD = "capture.exe --help"
+    REUSED_STAMPS = {"start_times": {6200: "2026-10-28T00:20:00Z"}, "cim_created": {6200: "2026-10-28T00:01:00Z"}}
+
+    def test_r5_b1_scope_choice_a_same_name_reused_pid_is_no_identity(self) -> None:
+        code, sweep, d, out = self.run_start("r5-b1-scope", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.REUSED), processes=self.INTEL_TREE,
+                                             command_lines=((6200, self.REUSED_CMD),), job_session=1, session_ids={6200: 1}, **self.REUSED_STAMPS)
+        self.assertEqual(code, 0, out)
+        self.assert_refused_unidentified(sweep, d, "scope choice")
+        self.assertEqual(sweep["unidentifiedCaptureOwners"][0]["startedUtc"], "2026-10-28T00:20:00.000000Z", "the instant read with the process is recorded")
+
+    def test_r5_b1_post_listing_a_same_name_reused_pid_is_no_identity(self) -> None:
+        code, sweep, d, out = self.run_start("r5-b1-post-listing", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                             go_live_as=self.REUSED, go_live_command_line=self.REUSED_CMD, go_live_from_snapshot=2, job_session=1, session_ids={6200: 1},
+                                             **self.REUSED_STAMPS)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "capture_owner_unidentified", sweep)
+        self.assertEqual(sweep["unidentifiedCaptureOwnerIds"], [6200])
+        self.assert_nothing_destructive(d)
+
+    def test_r5_b1_pre_terminate_a_same_name_reused_pid_is_no_identity(self) -> None:
+        # sol's repro verbatim: beside the identified Intel child, HEAD 2c226cd8 issued terminate:MLVAttr3-other-harness-live
+        code, sweep, d, out = self.run_start("r5-b1-pre-terminate", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                             go_live_as=self.REUSED, go_live_command_line=self.REUSED_CMD, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                             job_session=1, session_ids={6200: 1}, **self.REUSED_STAMPS)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"], "the other harness's live session is never terminated")
+        self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-other-harness-live:presentmon_terminate")
+        self.assertEqual(sweep["unidentifiedCaptureOwnerIds"], [6200])
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "")
+
+    def test_r5_b1_pre_logman_stop_a_same_name_reused_pid_is_no_identity(self) -> None:
+        # sol's fallback replay: HEAD 2c226cd8 also issued stop:MLVAttr3-other-harness-live
+        code, sweep, d, out = self.run_start("r5-b1-pre-stop", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), helper_works=False,
+                                             live_after_terminate_of="MLVAttr3-other-harness-live", go_live_as=self.REUSED, go_live_command_line=self.REUSED_CMD,
+                                             others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, job_session=1, session_ids={6200: 1}, **self.REUSED_STAMPS)
+        self.assertEqual(code, 0, out)
+        self.assertEqual((d / "stopped.txt").read_text(encoding="utf-8").strip(), "", "logman stop is never issued under the reused pid's live capture")
+        self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-killed-a:logman_stop")
+
+    def test_r5_a1_a_pid_reused_between_the_two_start_time_reads_is_no_identity(self) -> None:
+        # r5 adversary A1 on 5e3d8a4c: the row and the first StartTime are the old capture's (one instant), then it exits and a capture created later takes pid 6200 and owns the session.
+        # Process.StartTime is cached by the object, so re-reading it from the same object saw the old instant again; the second read is a fresh Get-Process -Id now
+        code, sweep, d, out = self.run_start("r5-a1-reread", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                             go_live_as=self.REUSED, go_live_command_line=self.REUSED_CMD, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                             job_session=1, session_ids={6200: 1}, reread_start_times={6200: "2026-10-28T00:20:00Z"})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"], "the replacement's live session is never terminated")
+        self.assertEqual(sweep["abortedReason"], "capture_owner_unidentified")
+        self.assertEqual(sweep["unidentifiedCaptureOwnerIds"], [6200])
+
+    def test_r5_b1_an_unreadable_start_time_is_no_identity(self) -> None:
+        # the command line's row is right, but the enumerated process's creation instant cannot be read: nothing binds the row to it
+        code, sweep, d, out = self.run_start("r5-b1-start-unreadable", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.REUSED), processes=self.INTEL_TREE,
+                                             command_lines=((6200, self.REUSED_CMD),), job_session=1, session_ids={6200: 1}, start_times={6200: None})
+        self.assertEqual(code, 0, out)
+        self.assert_refused_unidentified(sweep, d, "start time unreadable")
+
+    def test_r5_b1_an_intel_child_whose_row_was_created_at_another_instant_is_no_identity(self) -> None:
+        # the parent read's own row for pid 7001 is read after the enumeration: a PresentMonService created at another instant (the service restarted under the same pid, or another
+        # process under the name) is not the enumerated one, so it earns no Intel identity and stays a blocker
+        code, sweep, d, out = self.run_start("r5-b1-intel-rebound", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, start_times={7001: 30})
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive", sweep)
+        self.assertEqual({r["pid"]: r["identityError"] for r in sweep["livePresentMonProcesses"]}[7001], "process_creation_instant_unbound")
+        self.assert_nothing_destructive(d)
+
+    def test_r5_control_a_same_name_process_with_the_same_creation_instant_keeps_its_command_line(self) -> None:
+        # the healthy control: the same capture.exe read twice (one creation instant) -- its command line names no session, so it is no candidate and the sweep runs
+        code, sweep, d, out = self.run_start("r5-c-same-instant", others=(self.SERVICE_UNREADABLE, self.REUSED), processes=self.INTEL_TREE,
+                                             command_lines=((6200, self.REUSED_CMD),), job_session=1, session_ids={6200: 1})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(sweep["unidentifiedCaptureOwners"], [])
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
+    def test_mutation_a_command_line_bound_by_name_alone_terminates_the_reused_pid_again(self) -> None:
+        mutated = mutate(TEMPLATE, " -and $null -ne $started -and $null -ne $commandLines[$candidateId].created -and $commandLines[$candidateId].created -eq $started -and $started -eq $startedAfterPath) {",
+                         ") {")
+        _code, sweep, d, _out = self.run_start("mut-r5-b1", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                               go_live_as=self.REUSED, go_live_command_line=self.REUSED_CMD, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                               job_session=1, session_ids={6200: 1}, text=mutated, **self.REUSED_STAMPS)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)), "sol B1 on 2c226cd8")
+
+    def test_r5_candidate_hash_trace_the_pinned_image_hash_is_traced(self) -> None:
+        # BACHELOR-CUDA-CANDIDATE-HASH-TRACE-1 (ledger 15:50:50Z, CoS ACK 6473698354): the candidate-image hash passes -TracePath $Trace like every other hash in the job
+        image = self.stmp / "r5-hash-trace-other-harness" / "capture.exe"
+        code, sweep, d, out = self.run_start("r5-hash-trace", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6100, "capture", str(image))), processes=self.INTEL_TREE,
+                                             presentmon_sha="PINNED", pinned_copies=(image,))
+        self.assertEqual(code, 0, out)
+        self.assertEqual({r["pid"]: r["reason"] for r in sweep["livePresentMonProcesses"]}[6100], "pinned_image_sha256")
+        trace = (d / "job-trace.txt").read_text(encoding="utf-8") if (d / "job-trace.txt").exists() else ""
+        self.assertIn("presentmon-candidate-image-hash start bytes=", trace)
+
+    # controls: GREEN on a79a5a89 and after (they read only fields both heads record)
+    def test_r4_control_an_unreadable_registered_service_beside_the_intel_service_does_not_block(self) -> None:
+        # the job's session unknown, so only the registration covers it
+        code, sweep, d, out = self.run_start("r4-c-service", others=(self.SERVICE_UNREADABLE, (6202, "SomeVendorService", UNREADABLE)), processes=self.INTEL_TREE,
+                                             services=((6202, "SomeVendorSvc"),))
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
+    def test_r4_control_scope_all_is_unchanged_by_an_unidentified_process(self) -> None:
+        # no live candidate at all: scope 'all' keeps its behaviour (card r4 item 1)
+        code, sweep, d, out = self.run_start("r4-c-scope-all", others=(self.UNIDENTIFIED,), job_session=1, session_ids={6200: 1})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(sweep["scope"], "all")
+        self.assertEqual(self.terminated_names(self.calls(d)), ["PresentMon", "MLVAttr3-old-killed-job"])
+
+    def test_r4_the_evidence_is_recorded(self) -> None:
+        code, sweep, d, out = self.run_start("r4-evidence", others=(self.SERVICE_UNREADABLE, (6202, "SomeVendorService", UNREADABLE)),
+                                             processes=self.INTEL_TREE, services=((6202, "SomeVendorSvc"),), job_session=1, session_ids={6202: 0})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(sweep["ran"], sweep)
+        self.assertEqual(sweep["unidentifiedCaptureOwners"], [])
+        self.assertEqual(sweep["unidentifiedNonOwnership"], {"jobSessionId": 1, "jobSessionError": None, "heldCount": 1, "registeredServiceCount": 1})
+
+    def test_mutation_the_unreadable_path_condition_back_on_the_hold_sweeps_the_readable_copy_again(self) -> None:
+        mutated = mutate(TEMPLATE, "if ($null -eq $commandLineError -and $commandLine.Trim() -eq '') { $unreadableIdentity +=",
+                         "if (-not $pathReadable -and $null -eq $commandLineError -and $commandLine.Trim() -eq '') { $unreadableIdentity +=")
+        _code, sweep, d, _out = self.run_start("mut-r4-a1", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6200, "capture", "C:\\other-harness\\cache\\capture.exe")),
+                                               processes=self.INTEL_TREE, job_session=1, session_ids={6200: 1}, text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)), "adversary A1 on 87f6b16c")
+
+    def test_mutation_without_the_unreadable_identity_hold_the_unidentified_capture_is_swept_again(self) -> None:
+        mutated = mutate(TEMPLATE, "{ $unreadableIdentity += [pscustomobject]@{", "{ $null = [pscustomobject]@{")
+        _code, sweep, d, _out = self.run_start("mut-r4-no-hold", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.UNIDENTIFIED), processes=self.INTEL_TREE,
+                                               job_session=1, session_ids={6200: 1}, text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)), "Dot's residual: the live session is terminated")
+
+    def test_mutation_without_the_held_service_lookup_a_registered_service_blocks_the_harness_scope(self) -> None:
+        mutated = mutate(TEMPLATE, "if ($servicePids.ContainsKey([int]$held.pid)) {", "if ($false) {")
+        _code, sweep, d, _out = self.run_start("mut-r4-held-service", others=(self.SERVICE_UNREADABLE, (6202, "SomeVendorService", UNREADABLE)), processes=self.INTEL_TREE,
+                                               services=((6202, "SomeVendorSvc"),), text=mutated)
+        self.assertEqual(sweep["skippedReason"], "capture_owner_unidentified", "the registration is what cleared it")
+
+    def test_mutation_rechecks_that_ignore_the_unidentified_terminate_under_it(self) -> None:
+        mutated = TEMPLATE
+        for old in ("            if (@($recheck.unidentified).Count -gt 0) {\n                $record['unidentifiedCaptureOwnerIds'] = @($recheck.unidentified)\n                $record['abortedReason']",
+                    "                if (@($recheck.unidentified).Count -gt 0) {\n                    $record['unidentifiedCaptureOwnerIds'] = @($recheck.unidentified)\n                    $record['abortedReason']"):
+            mutated = mutate(mutated, old, old.replace("if (@($recheck.unidentified).Count -gt 0) {", "if ($false) {"))
+        _code, sweep, d, _out = self.run_start("mut-r4-recheck", sessions=("MLVAttr3-killed-a", "MLVAttr3-other-harness-live"), live_after_terminate_of="MLVAttr3-killed-a",
+                                               go_live_as=self.UNIDENTIFIED, others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, job_session=1, session_ids={6200: 1}, text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)))
+
+    def test_mutation_the_presentmon_star_enumeration_terminates_a_renamed_live_capture_again(self) -> None:
+        mutated = mutate(TEMPLATE, "foreach ($candidate in @(Get-Process -ErrorAction Stop)) {", "foreach ($candidate in @(Get-Process -Name 'PresentMon*' -ErrorAction Stop)) {")
+        _code, sweep, d, _out = self.run_start("mut-r3-name-only", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.CAPTURE), processes=self.INTEL_TREE,
+                                               command_lines=((6100, self.CAPTURE_CMD),), text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)), "sol B2: the live session is terminated")
+
+    def test_mutation_without_the_command_line_route_a_renamed_capture_is_invisible_again(self) -> None:
+        mutated = mutate(TEMPLATE, "$namesSession = ($commandLine -match $sessionCommandLinePattern)", "$namesSession = $false")
+        _code, sweep, d, _out = self.run_start("mut-r3-no-cmdline", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, self.CAPTURE), processes=self.INTEL_TREE,
+                                               command_lines=((6100, self.CAPTURE_CMD),), text=mutated)
+        self.assertIn("MLVAttr3-other-harness-live", self.terminated_names(self.calls(d)))
+
+    def test_mutation_a_failed_command_line_query_read_as_none_is_not_fail_closed(self) -> None:
+        mutated = mutate(TEMPLATE, "        if ($null -ne $snapshot.commandLineError) {\n            $record['skippedReason'] = 'capture_owner_command_lines_unreadable'",
+                         "        if ($false) {\n            $record['skippedReason'] = 'capture_owner_command_lines_unreadable'")
+        _code, sweep, d, _out = self.run_start("mut-r3-cim-open", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, command_line_query_fails_from=1, text=mutated)
+        # r4: the scope choice now asks the shared helper, which throws on the same error, so the mutation loses the TYPED skip (an untyped error is left) but still touches nothing
+        self.assertIsNone(sweep["skippedReason"], "the mutation drops the typed fail-closed skip")
+        self.assertIn("capture_owner_command_lines_unreadable", str(sweep["error"]))
+        self.assert_nothing_destructive(d)
+
+    def test_mutation_a_recheck_that_ignores_the_failed_query_terminates_on_it(self) -> None:
+        mutated = mutate(TEMPLATE, "if ($null -ne $snapshot.commandLineError) { throw ('capture_owner_command_lines_unreadable: ' + $snapshot.commandLineError) }", "")
+        _code, sweep, d, _out = self.run_start("mut-r3-recheck-open", sessions=("MLVAttr3-killed-a", "MLVAttr3-killed-b"), others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE,
+                                               command_line_query_fails_from=3, text=mutated)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a", "MLVAttr3-killed-b"], "the mutation terminates under a blind recheck")
+
+    def test_the_bachelor_service_child_never_aborts_the_harness_sweep_on_its_rechecks(self) -> None:
+        # the service is alive through EVERY liveness re-check; in harness scope it is positively identified, so both leftover job sessions go
+        code, sweep, d, out = self.run_start("service-child-rechecks", sessions=("MLVAttr3-killed-a", "MLVAttr3-killed-b"), others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a", "MLVAttr3-killed-b"])
+        self.assertIsNone(sweep["abortedReason"], sweep)
+        self.assertEqual((sweep["deferred"], sweep["remaining"]), ([], []))
+
+    def test_in_harness_scope_a_capture_image_that_appears_mid_sweep_still_stops_it(self) -> None:
+        code, sweep, d, out = self.run_start("service-child-mid-sweep", sessions=("MLVAttr3-killed-a", "MLVAttr3-killed-b"), live_after_terminate_of="MLVAttr3-killed-a",
+                                             others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-killed-a"])
+        self.assertEqual(sweep["abortedBefore"], "MLVAttr3-killed-b:presentmon_terminate")
+        self.assertEqual(sweep["remaining"], ["MLVAttr3-killed-b"])
+
+    def test_a_capture_image_beside_the_service_child_still_skips_the_whole_sweep(self) -> None:
+        code, sweep, d, out = self.run_start("service-child-and-capture", others=(self.SERVICE_UNREADABLE, (4900, "PresentMon-2.4.1-x64", UNREADABLE)), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_mutation_the_service_child_skips_the_whole_sweep_again(self) -> None:
+        mutated = mutate(TEMPLATE, "if (@($initial.live).Count -gt 0) {", "if ($true) {")
+        _code, sweep, d, _out = self.run_start("mut-service-child", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
+        self.assertFalse(sweep["ran"], "the 2026-10-27 Bachelor state: the orphan of a killed leg is never swept")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_mutation_rechecks_that_count_every_live_process_abort_the_harness_sweep(self) -> None:
+        mutated = mutate(TEMPLATE, "if (Test-PresentMonIdentityText $Scope 'harness_sessions') { return [pscustomobject]@{ live = @(Get-PresentMonCaptureBlockerId $snapshot);", "if ($false) { return [pscustomobject]@{ live = @(Get-PresentMonCaptureBlockerId $snapshot);")
+        _code, sweep, d, _out = self.run_start("mut-recheck-scope", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
+        # r4: the scope choice asks the same helper now, so the mutation refuses there already (was: at the first re-check)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_mutation_without_the_scope_filter_the_default_session_is_swept_under_an_unidentified_process(self) -> None:
+        mutated = mutate(TEMPLATE, "$listed = @($listed | Where-Object { ([string]$_).StartsWith('MLVAttr3-', 'OrdinalIgnoreCase') })", "")
+        _code, sweep, d, _out = self.run_start("mut-scope-filter", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
+        self.assertIn("PresentMon", self.terminated_names(self.calls(d)))
 
     def test_an_unreadable_foreign_capture_of_another_version_is_live(self) -> None:
         code, sweep, d, out = self.run_start("foreign-unreadable", others=((4900, "PresentMon-2.4.1-x64", UNREADABLE),))
@@ -609,11 +1912,14 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertTrue(all(r["pathReadable"] for r in sweep["livePresentMonProcesses"]))
         self.assertEqual(self.terminated_names(self.calls(d)), [])
 
-    def test_a_readable_path_that_is_neither_a_service_nor_a_capture_image_is_excluded_and_recorded(self) -> None:
+    def test_a_readable_path_that_is_neither_a_service_nor_a_capture_image_is_live(self) -> None:
+        # r2: a readable path is no identity (a second harness under the same account has one), so this is live and, with no positive identity, a blocker for every scope
         code, sweep, d, out = self.run_start("readable-helper", others=((4950, "PresentMonOverlayHelper", "C:\\Program Files\\Vendor\\overlay.exe"),))
         self.assertEqual(code, 0, out)
-        self.assertTrue(sweep["ran"], sweep)
-        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonOverlayHelper", "pid": 4950, "service": None, "pathReadable": True}])
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
+        self.assertEqual(sweep["excludedPresentMonProcesses"], [])
+        self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "readable_path_not_a_registered_service")
 
     def test_a_service_lookup_that_fails_touches_nothing(self) -> None:
         code, sweep, d, out = self.run_start("lookup-fails", others=(self.SERVICE,), services=self.SERVICE_ROW, service_lookup_fails=True)
@@ -640,12 +1946,21 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "pinned_image_path")
         self.assertEqual(self.terminated_names(self.calls(d)), [])
 
-    def test_a_process_whose_name_does_not_start_with_presentmon_is_never_examined(self) -> None:
-        # the stub honours -Name like the real cmdlet: this is the honest scope of the enumeration (sol, fable UM-SWEEP-PATH-ARM-REALISM-1)
-        code, sweep, d, out = self.run_start("not-enumerated", others=((4344, "renamed-capture", str(self.stmp / "not-enumerated" / "cache" / STUB_EXE)),))
+    def test_a_renamed_copy_at_the_pinned_path_is_live_whatever_its_name(self) -> None:
+        # r3 (sol B2): the enumeration used to be Get-Process -Name 'PresentMon*' (the stub honours -Name like the real cmdlet), so this process was never examined and the sweep ran
+        code, sweep, d, out = self.run_start("renamed-at-pinned-path", others=((4344, "renamed-capture", str(self.stmp / "renamed-at-pinned-path" / "cache" / STUB_EXE)),))
+        self.assertEqual(code, 0, out)
+        self.assertFalse(sweep["ran"], sweep)
+        self.assertEqual(sweep["livePresentMonProcessIds"], [4344])
+        self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "pinned_image_path")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_a_process_that_is_no_candidate_by_any_route_is_never_a_blocker(self) -> None:
+        # the honest scope of the wider enumeration: another name, another path, another hash, and a command line naming no session -- not examined, the sweep runs
+        code, sweep, d, out = self.run_start("not-a-candidate", others=((4345, "explorer", "C:\\Windows\\explorer.exe"),), command_lines=((4345, "C:\\Windows\\explorer.exe /factory"),))
         self.assertEqual(code, 0, out)
         self.assertTrue(sweep["ran"], sweep)
-        self.assertEqual((sweep["livePresentMonProcessIds"], sweep["excludedPresentMonProcesses"]), ([], []))
+        self.assertEqual((sweep["livePresentMonProcessIds"], sweep["excludedPresentMonProcesses"], sweep["scope"]), ([], [], "all"))
 
     def test_the_pinned_name_is_live_whatever_its_path_looks_like(self) -> None:
         # the path may read as a long name while $Cache is spelled short (8.3: RUNNER~1), or not read at all: the image name decides and the capture is live either way
@@ -662,8 +1977,9 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         stub = Path(STUB_EXE).stem
         code, sweep, d, out = self.run_start("exact-name", others=((4401, f"{stub}-helper", "C:\\Vendor\\helper.exe"), (4402, stub.upper(), "C:\\Vendor\\copy.exe")))
         self.assertEqual(code, 0, out)
-        self.assertEqual(sweep["livePresentMonProcessIds"], [4402], "an upper-case image name of the pinned executable is live")
-        self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": f"{stub}-helper", "pid": 4401, "service": None, "pathReadable": True}], "a longer name that merely starts with the pinned one is not")
+        # r2: both are live now (a readable path is no identity); the exact name decides only WHICH reason
+        self.assertEqual({r["pid"]: r["reason"] for r in sweep["livePresentMonProcesses"]}, {4401: "readable_path_not_a_registered_service", 4402: "pinned_image_name"},
+                         "an upper-case image name of the pinned executable is the pinned image; a longer name that merely starts with it is not")
 
     def test_an_unreadable_process_list_still_touches_nothing(self) -> None:
         code, sweep, d, out = self.run_start("service-list-throws", get_process_throws=True, others=(self.SERVICE,), services=self.SERVICE_ROW)
@@ -674,7 +1990,12 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
 
     def test_the_process_list_is_read_with_an_error_action_that_throws(self) -> None:
         snapshot = _slice(TEMPLATE, "function Get-PresentMonProcessSnapshot(", "\nfunction Get-PresentMonLiveProcessId(")
-        self.assertIn("Get-Process -Name 'PresentMon*' -ErrorAction Stop", snapshot)
+        # r3: every process is enumerated (no -Name filter), and the command lines are read with -ErrorAction Stop too
+        self.assertIn("foreach ($candidate in @(Get-Process -ErrorAction Stop)) {", snapshot)
+        # r4: the row's image name is read too (a command line counts only for the process it was read from), and the service list is one throwing query
+        # r5: and its CreationDate (a command line counts only for the process with that creation instant)
+        self.assertIn("Get-CimInstance -ClassName Win32_Process -Property ProcessId, CommandLine, Name, CreationDate -ErrorAction Stop", snapshot)
+        self.assertIn("Get-CimInstance -ClassName Win32_Service -Property ProcessId, Name -ErrorAction Stop", snapshot)
         self.assertNotIn("SilentlyContinue", snapshot, "an unreadable list must never read as 'no capture alive'")
 
     def test_the_pinned_image_name_drops_only_the_exe_extension_of_the_real_pinned_name(self) -> None:
@@ -691,21 +2012,22 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
     def test_mutation_without_the_service_lookup_the_service_blocks_the_sweep_again(self) -> None:
         mutated = mutate(TEMPLATE, "if ($registered.Count -gt 0) {", "if ($false) {")
         _code, sweep, d, _out = self.run_start("mut-no-service", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW, text=mutated)
-        self.assertFalse(sweep["ran"])
-        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
-        self.assertEqual(self.terminated_names(self.calls(d)), [], "the Bachelor state: the service blocks the sweep")
+        self.assertEqual(sweep["skippedReason"], "presentmon_process_alive", "the registered service reads as unidentified: nothing is swept")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
 
     def test_mutation_an_unreadable_path_read_as_not_live_sweeps_under_an_unidentified_process(self) -> None:
-        mutated = mutate(TEMPLATE, "elseif (-not $pathReadable) { $reason = 'unreadable_path_not_a_registered_service' }", "elseif (-not $pathReadable) { $serviceName = $null }")
+        mutated = mutate(TEMPLATE, "if (-not $pathReadable) { $reason = 'unreadable_path_not_a_registered_service' }", "if (-not $pathReadable) { $serviceName = $null }")
         _code, sweep, d, _out = self.run_start("mut-unreadable", others=(self.SERVICE_UNREADABLE,), text=mutated)
         self.assertTrue(sweep["ran"], "sol's repro: ran=true, error=null, the sweep terminates under an unidentified PresentMon")
-        self.assertNotEqual(self.terminated_names(self.calls(d)), [])
+        self.assertIn("PresentMon", self.terminated_names(self.calls(d)), "the default session is terminated under an unidentified PresentMon")
 
     def test_mutation_a_failing_service_lookup_read_as_no_service_is_not_fail_closed(self) -> None:
         mutated = mutate(TEMPLATE, "Get-CimInstance -ClassName Win32_Service -Filter \"ProcessId = $candidateId\" -ErrorAction Stop", "Get-CimInstance -ClassName Win32_Service -Filter \"ProcessId = $candidateId\" -ErrorAction SilentlyContinue")
         _code, sweep, d, _out = self.run_start("mut-lookup", others=((4950, "PresentMonOverlayHelper", "C:\\Program Files\\Vendor\\overlay.exe"),), service_lookup_fails=True, text=mutated)
-        self.assertTrue(sweep["ran"], "the mutation reads a failed lookup as 'not a service' and goes on with a readable-path process")
-        self.assertIsNone(sweep["error"])
+        # r2: the readable-path process is live either way, so the mutation no longer sweeps; what it loses is the evidence -- the failed lookup no longer reaches `error`
+        self.assertIsNone(sweep["error"], "the mutation reads a failed lookup as 'not a service' silently")
+        _code, sweep, _d, _out = self.run_start("unmut-lookup", others=((4950, "PresentMonOverlayHelper", "C:\\Program Files\\Vendor\\overlay.exe"),), service_lookup_fails=True)
+        self.assertIn("stub Get-CimInstance failure", sweep["error"])
 
     def test_a_path_getter_that_throws_reads_as_unreadable_not_as_an_error(self) -> None:
         # measured on pwsh 7.6: PowerShell turns a throwing .NET property getter into $null (so the job's try/catch around .Path is defence in depth and removing it changes nothing a test can see);
@@ -713,38 +2035,52 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         code, sweep, d, out = self.run_start("getter-throws", others=((4361, "PresentMon-2.4.1-x64", UNREADABLE),))
         self.assertEqual(code, 0, out)
         self.assertIsNone(sweep["error"])
-        self.assertEqual(sweep["livePresentMonProcesses"], [{"name": "PresentMon-2.4.1-x64", "pid": 4361, "pathReadable": False, "reason": "unreadable_path_not_a_registered_service"}])
+        self.assertEqual(sweep["livePresentMonProcesses"], [{"name": "PresentMon-2.4.1-x64", "pid": 4361, "pathReadable": False, "reason": "unreadable_path_not_a_registered_service",
+                                                             "nonCaptureIdentity": None, "parentName": None, "parentPid": None, "identityError": None}])
 
-    def test_mutation_a_readable_foreign_capture_image_read_as_excluded_is_swept_under(self) -> None:
+    def test_mutation_a_readable_foreign_capture_image_loses_only_its_reason_label(self) -> None:
+        # r2: a readable path is no identity, so the capture-image arm decides the recorded reason only; the foreign capture stays live and the sweep stays off it
         mutated = mutate(TEMPLATE, "elseif ($candidateName -imatch $captureImagePattern) { $reason = 'capture_image_name' }", "elseif ($false) { $reason = 'capture_image_name' }")
         _code, sweep, d, _out = self.run_start("mut-capture-image", others=((4901, "PresentMon-2.4.1-x64", "C:\\tools\\PresentMon-2.4.1-x64.exe"),), text=mutated)
-        self.assertTrue(sweep["ran"], "the mutation sweeps under a foreign console capture")
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "readable_path_not_a_registered_service")
+        self.assertEqual(self.terminated_names(self.calls(d)), [])
+
+    def test_mutation_a_readable_unidentified_process_read_as_excluded_sweeps_under_a_second_harness(self) -> None:
+        # the base rule, restored: a readable path that is no capture image was excluded, so scope all stopped the other harness's live session
+        mutated = mutate(TEMPLATE, "else { $reason = 'readable_path_not_a_registered_service' }", "else { $reason = $null }")
+        _code, sweep, d, _out = self.run_start("mut-readable-excluded", others=(self.CUSTOM_READABLE,), text=mutated)
+        self.assertTrue(sweep["ran"])
+        self.assertIn("MLVAttr3-old-killed-job", self.terminated_names(self.calls(d)))
 
     def test_mutation_a_name_prefix_match_lets_every_presentmon_star_process_be_live(self) -> None:
         # the converse of the Bachelor bug: a registered service must not be recognised by name alone, so the name arm is the pinned name only
-        mutated = mutate(TEMPLATE, "if ($candidateName -ieq $pinnedName) {", "if ($candidateName -like 'PresentMon*') {")
+        mutated = mutate(TEMPLATE, "if (Test-PresentMonIdentityText $candidateName $pinnedName) {", "if ($candidateName -like 'PresentMon*') {")
         _code, sweep, d, _out = self.run_start("mut-prefix", others=(self.SERVICE,), services=self.SERVICE_ROW, text=mutated)
         self.assertFalse(sweep["ran"])
         self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
 
     def test_mutation_without_the_path_match_a_pinned_path_copy_reads_as_no_capture(self) -> None:
-        mutated = mutate(TEMPLATE, "elseif ($pathReadable -and $candidatePath -ieq $pinnedPath) { $reason = 'pinned_image_path' }", "elseif ($false) { $reason = 'pinned_image_path' }")
+        mutated = mutate(TEMPLATE, "elseif ($pathReadable -and (Test-PresentMonIdentityText $candidatePath $pinnedPath)) { $reason = 'pinned_image_path' }", "elseif ($false) { $reason = 'pinned_image_path' }")
         _code, sweep, d, _out = self.run_start("mut-path", others=((4343, "PresentMon-renamed", str(self.stmp / "mut-path" / "cache" / STUB_EXE)),), text=mutated)
-        self.assertTrue(sweep["ran"], "without the path arm a live copy of the pinned binary would be swept under")
-        self.assertNotEqual(self.terminated_names(self.calls(d)), [])
+        # r2: the copy stays live through the fail-closed readable-path arm; without the path arm the record loses the evidence that it IS the pinned binary
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "readable_path_not_a_registered_service")
 
-    def test_mutation_a_case_sensitive_name_match_misses_a_live_capture(self) -> None:
+    def test_mutation_a_case_sensitive_name_match_misses_the_pinned_image(self) -> None:
         stub = Path(STUB_EXE).stem
-        mutated = mutate(TEMPLATE, "if ($candidateName -ieq $pinnedName) {", "if ($candidateName -ceq $pinnedName) {")
-        # a readable path elsewhere: with an unreadable one the fail-closed arm would keep it live and hide this mutation
+        mutated = mutate(TEMPLATE, "if (Test-PresentMonIdentityText $candidateName $pinnedName) {", "if ($candidateName -ceq $pinnedName) {")
         _code, sweep, d, _out = self.run_start("mut-case", others=((4402, stub.upper(), "C:\\Vendor\\copy.exe"),), text=mutated)
-        self.assertTrue(sweep["ran"], "the mutation sweeps under a live capture")
+        self.assertFalse(sweep["ran"], "r2: still live (no identity), so still never swept under")
+        self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "readable_path_not_a_registered_service", "the mutation no longer recognises the pinned image")
 
-    def test_mutation_without_the_name_match_a_pinned_capture_with_an_aliased_path_reads_as_no_capture(self) -> None:
+    def test_mutation_without_the_name_match_a_pinned_capture_with_an_aliased_path_is_not_recognised(self) -> None:
         stub = Path(STUB_EXE).stem
-        mutated = mutate(TEMPLATE, "if ($candidateName -ieq $pinnedName) { $reason = 'pinned_image_name' }", "if ($false) { $reason = 'pinned_image_name' }")
+        mutated = mutate(TEMPLATE, "if (Test-PresentMonIdentityText $candidateName $pinnedName) { $reason = 'pinned_image_name' }", "if ($false) { $reason = 'pinned_image_name' }")
         _code, sweep, d, _out = self.run_start("mut-alias", others=((4360, stub, "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\cache\\" + STUB_EXE),), text=mutated)
-        self.assertTrue(sweep["ran"], "the path arm alone cannot match a path spelled another way (8.3 versus long); only the name arm keeps the capture live")
+        self.assertFalse(sweep["ran"])
+        self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "readable_path_not_a_registered_service",
+                         "the path arm alone cannot match a path spelled another way (8.3 versus long); only the name arm records it as the pinned image")
 
     def test_mutation_without_the_excluded_record_the_service_leaves_no_evidence(self) -> None:
         mutated = mutate(TEMPLATE, "$record['excludedPresentMonProcesses'] = @($snapshot.excluded)", "$null = $snapshot")
@@ -752,7 +2088,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(sweep["excludedPresentMonProcesses"], [])
 
     def test_mutation_without_the_path_readable_flag_the_record_cannot_tell_an_unreadable_path(self) -> None:
-        mutated = mutate(TEMPLATE, "service = $serviceName; pathReadable = $pathReadable }", "service = $serviceName; pathReadable = $true }")
+        mutated = mutate(TEMPLATE, "service = $serviceName; pathReadable = $pathReadable;", "service = $serviceName; pathReadable = $true;")
         _code, sweep, _d, _out = self.run_start("mut-readable", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW, text=mutated)
         self.assertTrue(sweep["excludedPresentMonProcesses"][0]["pathReadable"], "the mutation reports an unreadable path as readable")
         _code, sweep, _d, _out = self.run_start("unmut-readable", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW)
@@ -1287,6 +2623,23 @@ class EventsLostEvidenceInTheJobTests(_StopHarness, unittest.TestCase):
     def test_a_display_report_failure_without_a_loss_keeps_its_reason_verbatim(self) -> None:
         code, summary, _pub, out = self.run_parse_with_events("clean-parse")
         self.assertEqual(code, 23, out)
+        self.assertEqual(summary["reason"], UM2_REASON)
+
+    SWEEP_CALL = "$displayReport = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $displayReport -Sweep $presentMonOrphanSweep"
+    SKIPPED_SWEEP = "$presentMonOrphanSweep = [ordered]@{ ran = $false; skippedReason = 'presentmon_process_alive'; livePresentMonProcessIds = @(43684) }\n"
+
+    def test_a_display_report_failure_after_a_skipped_sweep_names_the_sweep(self) -> None:
+        # BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: the 16 Bachelor cuda legs of 2026-10-27 read only "PresentMon output does not exist" while the sweep had been skipped on every one
+        injected = mutate(TEMPLATE, self.SWEEP_CALL, self.SKIPPED_SWEEP + self.SWEEP_CALL)
+        code, summary, _pub, out = self.run_parse_with_events("skipped-sweep-parse", text=injected)
+        self.assertEqual(code, 23, out)
+        self.assertTrue(summary["reason"].startswith(UM2_REASON), summary["reason"])
+        self.assertIn("[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive livePids=43684]", summary["reason"])
+        self.assertIn("PRESENTMON_ORPHAN_SWEEP_INCOMPLETE", out, "and so is the RESULT line")
+
+    def test_mutation_without_the_sweep_detail_the_reason_is_bare_again(self) -> None:
+        injected = mutate(TEMPLATE, self.SWEEP_CALL, self.SKIPPED_SWEEP + "$null = $presentMonOrphanSweep")
+        _code, summary, _pub, _out = self.run_parse_with_events("mut-sweep-detail", text=injected)
         self.assertEqual(summary["reason"], UM2_REASON)
 
     def test_both_capture_json_statements_carry_the_orphan_sweep_and_the_events_lost_record(self) -> None:

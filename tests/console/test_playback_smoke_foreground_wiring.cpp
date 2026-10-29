@@ -71,7 +71,7 @@ TEST(PlaybackSmokeForegroundWiring, ForegroundRequestIsCalledOnlyFromGuiPlayback
 
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
     ASSERT_TRUE(smokeBody.contains(QStringLiteral("forcePlaybackSmokeWindowForeground();")));
 
@@ -96,7 +96,7 @@ TEST(PlaybackSmokeForegroundWiring, ForegroundRequestRunsBeforeTheMeasuredPlayTr
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
     const QString smokeBody = functionBody(source,
         QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
-        QStringLiteral("void MainWindow::importNewMlv(QString fileName)"));
+        QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
     ASSERT_FALSE(smokeBody.isEmpty());
 
     const int forceAt = smokeBody.indexOf(QStringLiteral("forcePlaybackSmokeWindowForeground();"));
