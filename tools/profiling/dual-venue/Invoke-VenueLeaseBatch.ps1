@@ -745,13 +745,18 @@ function Add-PlanIdentity([object]$Row, [object]$Leg) {
 
 function Format-Mean($m) { if ($null -eq $m) { 'UNKNOWN' } else { '{0:0.0}' -f $m } }
 
-function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
+function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec, $ThermalState = $null) {
     # One Wait-VenueQuiet run (its probe job is light: the agent runs it under the parked batch lease). verdict: QUIET | COOLDOWN_UNMET | GATE_BUSY |
     # GATE_UNREADABLE | HOST_MISMATCH | USAGE | VENUE_QUIET_UNKNOWN (not measured). The same exit-code reading as Invoke-VenueChain's probe.
     $out = Join-Path $RunDir "quiet-$Name-$Phase.out.txt"
     if (-not (Test-Path -LiteralPath $QuietScript -PathType Leaf)) { return [pscustomobject]@{ verdict = 'VENUE_QUIET_UNKNOWN'; code = 'none'; mean = $null; reason = 'PROBE_SCRIPT_MISSING'; foreignFloor = $false; heat = 'unknown'; heatText = 'no probe' } }
     $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript, '-Venue', $Venue, '-WorkDir', (Join-Path $RunDir 'quiet'), '-GateLog', (Join-Path $RunDir 'gate.log'),
         '-ThresholdPercent', [string]$ThresholdPercent, '-MaxWaitSec', [string]$MaxWaitSec, '-RecheckSec', [string]$RecheckSec, '-MaxAdmissionWaitSec', '120')
+    # adversary r4 pass 2 A2: during a thermal wait the deadline is checked HERE, the last statement before the process starts (the Test-Path above can stall on a share): an expired wait
+    # dispatches nothing and the caller skips on the reading it already has
+    if ($null -ne $ThermalState -and -not (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec (Get-ThermalElapsedSec $ThermalState -Ceiling) -SlowestReprobeSec $ThermalState.slowProbeSec -WantSleepSec $ThermalPollSec).mayDispatchNow) {
+        return [pscustomobject]@{ expiredBeforeDispatch = $true }
+    }
     & $pwshExe @qArgs *> $out
     $code = $LASTEXITCODE
     $lines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
@@ -1098,12 +1103,15 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $probeEndUtc = $null; $probeEndTs = 0L
                 if ($expiredBeforeProbe) { $probeSec = 0 } else {
                 $tProbeTs = [Diagnostics.Stopwatch]::GetTimestamp()
-                $q = Invoke-QuietProbe $leg.name "b$('{0:00}' -f $batchNo)-a$attempt" $probeWait
+                $qNew = Invoke-QuietProbe $leg.name "b$('{0:00}' -f $batchNo)-a$attempt" $probeWait $(if ($thermalActive) { $thw } else { $null })
+                if ($qNew.expiredBeforeDispatch) { $expiredBeforeProbe = $true; $probeSec = 0 } else {
+                $q = $qNew
                 # adversary r4 A2: the instant the probe returned is the instant of its reading: the first hot reading starts the cap HERE, not after the QUIET log line below
                 $probeEndTs = [Diagnostics.Stopwatch]::GetTimestamp(); $probeEndUtc = [DateTime]::UtcNow
                 $probeSec = [int][Math]::Ceiling([Math]::Max(0.0, ([Diagnostics.Stopwatch]::GetTimestamp() - $tProbeTs) / [double][Diagnostics.Stopwatch]::Frequency))   # adversary r2b A2: monotonic
                 if ($q.foreignFloor -and -not $legForeign.ContainsKey($leg.name)) { $legForeign[$leg.name] = $q.foreignFloorLine }
                 L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease exit=$($q.code) verdict=$($q.verdict) mean=$(Format-Mean $q.mean) maxWaitSec=$probeWait roomSec=$room$(if ($q.reason) { " reason=$($q.reason)" })$(if ($q.foreignFloor) { ' foreignFloor=1' })"
+                }
                 }
                 if ($q.verdict -ceq 'USAGE') { $b.endReason = 'PROBE_USAGE'; Set-Stop 'USAGE' 2; break }
                 if ($q.verdict -ceq 'GATE_UNREADABLE') { $b.endReason = 'PROBE_GATE_UNREADABLE'; Set-Stop 'GATE_UNREADABLE' 4; break }
@@ -1112,9 +1120,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # adversary r2b A3: the leg's thermal state is made here, so the first KNOWN heat reading counts even from a busy (COOLDOWN_UNMET) probe: heatAtProbe is
                 # the leg's reading right after its predecessor, which the spread measures heavy keys from
                 $th = $legThermal[$leg.name]
-                if ($null -eq $th) { $th = [ordered]@{ firstHeat = $null; firstHeatText = $null; firstHotUtc = $null; firstHotTs = 0L; batch = $batchNo; waitSec = 0; slowProbeSec = 0; reprobePending = $false; polls = 0; skips = 0 }; $legThermal[$leg.name] = $th }
+                if ($null -eq $th) { $th = [ordered]@{ firstHeat = $null; firstHeatText = $null; firstHotUtc = $null; firstHotTs = 0L; batch = $batchNo; waitSec = 0; slowProbeSec = 0; reprobePending = $false; doneWaitSec = 0; doneOvershootSec = 0; polls = 0; skips = 0 }; $legThermal[$leg.name] = $th }
                 # adversary r1 A6: the first reading belongs to the leg's CURRENT predecessor, so it is taken again after a re-queue or in a new batch
-                if ($th.batch -ne $batchNo) { $th.firstHotUtc = $null; $th.firstHeat = $null; $th.slowProbeSec = 0; $th.batch = $batchNo }
+                if ($th.batch -ne $batchNo) { $th.firstHotUtc = $null; $th.firstHeat = $null; $th.slowProbeSec = 0; $th.doneWaitSec = 0; $th.doneOvershootSec = 0; $th.batch = $batchNo }
                 if ($null -eq $th.firstHeat -and ($q.verdict -ceq 'QUIET' -or $q.heat -cne 'unknown')) { $th.firstHeat = $q.heat; $th.firstHeatText = $q.heatText }
                 # adversary r3 A1 / Dot B2: ONE function (Get-VenueThermalProbeBudget) decides whether another probe may start. A probe that ran DURING the wait is a re-probe and feeds
                 # the slowest-so-far; the probe that made the first hot reading is not counted, so the first hot reading always gets a cooling sleep and one re-probe
@@ -1142,7 +1150,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                         $busySleep = [int][Math]::Max(1, [Math]::Min($ClaimPollSec, $room - $legBudget))
                         # adversary r3 A1: during a thermal wait the next probe starts no later than the deadline less the slowest re-probe (the same budget function as the poll sleep).
                         # r4: read the clock AFTER the log write, so a stalled append shortens (or removes) the sleep instead of being added to it
-                        if ($thermalActive) { $busySleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec (Get-ThermalElapsedSec $th -Ceiling) -SlowestReprobeSec $th.slowProbeSec -WantSleepSec $busySleep).sleepSec }
+                        if ($thermalActive) { $busySleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec (Get-ThermalElapsedSec $th) -SlowestReprobeSec $th.slowProbeSec -WantSleepSec $busySleep).sleepSec }
                         if ($busySleep -gt 0) { Start-Sleep -Seconds $busySleep }
                     }
                     continue
@@ -1179,7 +1187,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     # r4 (adversary r3 pass 2 A1, Dot c5946322): the sleep was planned BEFORE the log write above, which may have stalled. The budget is asked again with the clock read
                     # now and the sleep is cut to what is left of the allowance (none at all when it is gone); the next iteration then re-checks the deadline before it dispatches.
                     $th.reprobePending = $true
-                    $sleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec (Get-ThermalElapsedSec $th -Ceiling) -SlowestReprobeSec ([int]$th.slowProbeSec) -WantSleepSec $sleep).sleepSec
+                    $sleep = (Get-VenueThermalProbeBudget -CapSec $ThermalWaitCapSec -ElapsedSec (Get-ThermalElapsedSec $th) -SlowestReprobeSec ([int]$th.slowProbeSec) -WantSleepSec $sleep).sleepSec
                     if ($sleep -gt 0) { Start-Sleep -Seconds $sleep }
                     continue
                 }
@@ -1196,6 +1204,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 # adversary r4 A1: the wait ends here (the reading was clear, or the gate is off): a retry of this leg after VENUE_NOT_QUIESCENT starts from no wait, and a hot
                 # reading then starts a fresh one. Left set, the finished wait's deadline would govern the retry's probe (no admission, a quiet wait clamped to 0).
+                # adversary r4 pass 2 A5: what that wait cost stays in the leg's receipt totals (a retry's fresh gate overwrote waitSec with 0 and the receipt lost it)
+                $th.doneWaitSec = [int]($th.doneWaitSec + $th.waitSec); $th.doneOvershootSec = [int]($th.doneOvershootSec + [Math]::Max(0, $th.waitSec - $ThermalWaitCapSec)); $th.waitSec = 0
                 $th.firstHotUtc = $null; $th.slowProbeSec = 0; $th.reprobePending = $false
                 # QUIET under the lease: the leg, on the same lease (r5b, Grok G1: while the claim is still this run's).
                 $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc
@@ -1280,7 +1290,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($outcome -ceq 'VENUE_NOT_QUIESCENT') {
                     # The leg's own <= 20 % re-check at its start failed: it never played. Retry INSIDE the same lease (on a lost or demoted lease, in the next batch).
                     $b.retries++; $b.legRetries++
-                    $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef; withdraw = $withdraw })
+                    $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; thermalWaitSec = $th.doneWaitSec; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef; withdraw = $withdraw })
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT receipt=$receipt onLease=$onLease $leaseWhy"
                     if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
@@ -1297,7 +1307,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($legFF) { $row['foreignFloorLine'] = $legForeign[$leg.name] }
                 if ($detail) { $row['outcomeDetail'] = $detail }
                 # item 10: the thermal gate's receipt per leg: how long it waited for heat, the first and the launch reading, and the agent's own at grant
-                $row['thermalWaitSec'] = $th.waitSec; $row['thermalWaitOvershootSec'] = $(if ($ThermalWaitCapSec -gt 0) { [int][Math]::Max(0, $th.waitSec - $ThermalWaitCapSec) } else { 0 }); $row['thermalSkips'] = $th.skips; $row['heatAtProbe'] = $th.firstHeat; $row['heatAtProbeText'] = $th.firstHeatText; $row['heatAtLaunch'] = $q.heat
+                $row['thermalWaitSec'] = $th.doneWaitSec; $row['thermalWaitOvershootSec'] = $th.doneOvershootSec; $row['thermalSkips'] = $th.skips; $row['heatAtProbe'] = $th.firstHeat; $row['heatAtProbeText'] = $th.firstHeatText; $row['heatAtLaunch'] = $q.heat
                 $row['heatAtGrant'] = $(if ($null -ne $ja -and $ja.PSObject.Properties['heat'] -and $ja.heat) { [string]$ja.heat } else { 'unknown' })
                 if ($agentStop) { $row['leaseStop'] = $agentStop }
                 if ($withdraw) { $row['withdraw'] = $withdraw }
