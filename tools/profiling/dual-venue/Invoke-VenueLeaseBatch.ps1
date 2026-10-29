@@ -924,11 +924,10 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
     $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript, '-Venue', $Venue, '-WorkDir', (Join-Path $RunDir 'quiet'), '-GateLog', (Join-Path $RunDir 'gate.log'),
         '-ThresholdPercent', [string]$ThresholdPercent, '-MaxWaitSec', [string]$MaxWaitSec, '-RecheckSec', [string]$RecheckSec, '-MaxAdmissionWaitSec', '120')
     # r7: the probe writes its output here, and Wait-VenueQuiet its gate log and work folder: each is asked first (a refusal runs no probe: the batch ends in its typed stop)
+    # r8 pass 3 (adversary r8 pass 2 A3): these guards can block on a share, so the claim is asked again after them, at the probe's launch itself (no probe without the claim)
     $asked = (Test-RunDirWrite (Join-Path $RunDir 'gate.log')) -and (Test-RunDirWrite (Join-Path $RunDir 'quiet') -Directory)
     if (-not ($asked -and (Test-RunDirWrite $out))) { return [pscustomobject]@{ verdict = 'WRITE_REFUSED'; code = 'none'; mean = $null; reason = 'WRITE_REFUSED'; foreignFloor = $false } }
-    # r8 pass 3 (adversary r8 pass 2 A3): the guards above can block on a share, so the claim is asked again at the probe's launch itself (no probe without the claim)
-    $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc
-    if ($cl) { return [pscustomobject]@{ verdict = 'CLAIM_LOST'; code = 'none'; mean = $null; reason = $cl.detail; foreignFloor = $false } }
+    $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc; if ($cl) { return [pscustomobject]@{ verdict = 'CLAIM_LOST'; code = 'none'; mean = $null; reason = $cl.detail; foreignFloor = $false } }
     & $pwshExe @qArgs *> $out
     $code = $LASTEXITCODE
     $lines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
