@@ -1683,7 +1683,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 if ($legCode -ne 0) {
                     # Invoke-VenueLeg exits 0 whenever it wrote a receipt; non-zero means it died without one. Not evidence: LEG_FAILED, the run goes on.
-                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }   # r6 (adversary r6 A2)
+                    # r6 (adversary r6 A2): the row keeps heatAtProbe. r7: this note sits on its own line, because the failing-action body pin
+                    # (test_playback_receipt_run_binding.CONSUMER_FAILING_ACTION) reads the row's closing brace straight into $b.legs.Add.
+                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEG_FAILED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "LEG $($leg.name) LEG_FAILED batch=$batchNo exit=$legCode outcome=INVALID printedOutcome=$outcome (the leg exited non-zero: no usable receipt)"

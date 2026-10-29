@@ -33,6 +33,14 @@ QUIET = DV / "Wait-VenueQuiet.ps1"
 PWSH = tvlb.PWSH
 requires_windows_pwsh = tvlb.requires_windows_pwsh
 
+
+def canonical_path(path: str | Path) -> str:
+    """One spelling of a path for an equality check. r7 (hosted CI run 40867081400): the windows runner's TEMP is the 8.3 short name C:\\Users\\RUNNER~1\\...,
+    which Python 3.13's tempfile keeps and .NET's GetFullPath expands, so two spellings of one directory compared unequal. realpath expands the short names
+    of the parts that exist (on both sides), normcase folds the case."""
+    import os
+    return os.path.normcase(os.path.realpath(str(path)))
+
 # The stub thermal source: the fake quiet probe prints a "tele heat" line in Wait-VenueQuiet's format. FAKE_HEAT is a comma list per probe call (the last
 # repeats): a throttled row count (mean 70 C), NA (an unreadable feed), or HOT_UNTIL_SKIP (hot until batch.log carries a THERMAL_HOT_SKIPPED line).
 HEAT_STUB = r"""
@@ -431,7 +439,7 @@ class ThermalGateModuleTests(unittest.TestCase):
             got = run(spelling, psloc)
             self.assertEqual(got["order"], want_order, (spelling, got))
             self.assertEqual(got["skipped"], 0, got)
-        self.assertEqual(os.path.normcase(run("'.'", psloc)["resolved"]), os.path.normcase(str(psloc / "batches.jsonl")))
+        self.assertEqual(canonical_path(run("'.'", psloc)["resolved"]), canonical_path(psloc / "batches.jsonl"))
         # control: with the PowerShell location AT the process directory the decoy (nothing heavy) is what is read, so the spread keeps the given order
         self.assertEqual(run(f"'{drive}.'", proc)["order"], "fx-a-A,fx-a-B,fx-b-A,fx-b-B")
         # a drive-relative spelling with a sub-path, and an absolute path, resolve the same way
