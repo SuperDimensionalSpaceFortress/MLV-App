@@ -1241,7 +1241,7 @@ TEST(PlaybackWarmReconDeterminismWiring, NoWarmEntryReadsTheClipAfterItsLifetime
 TEST(PlaybackWarmReconDeterminismWiring, AClipCloseDropsEveryQueuedWarmBeforeTheClipIsFreed)
 {
     const QString main = codeLinesOnly(bodyBetween(sourceFile("platform/qt/MainWindow.cpp"),
-                                                   QStringLiteral("void MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )"),
+                                                   QStringLiteral("bool MainWindow::freeActiveMlvObjectAfterLifecycleBarrier( const char *reason )"),
                                                    QStringLiteral("\n}\n")));
     ASSERT_FALSE(main.isEmpty());
     const int barrier = main.indexOf(QStringLiteral("waitForRenderThreadIdleBeforeCoreMutation( barrierReason );"));
