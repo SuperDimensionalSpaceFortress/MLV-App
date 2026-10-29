@@ -615,7 +615,7 @@ $artifactsShare = $null
 if ($stdout -match 'ARTIFACTS=(?<p>\S+)') { $artifactsShare = ConvertTo-ShareSidePath $Matches['p'] }
 $summary = $null; $manifest = $null
 $resultJson = $null; $runLogText = $null; $runLogSha = $null
-$heapDumpCopies = @()
+$heapDumpCopies = @(); $heapDumpCopyError = $null
 $evidenceDir = Join-Path $evidenceBase $receipt.receiptId
 if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
@@ -650,7 +650,10 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
     # the time its copy and its hash took are kept for the receipt (a full-memory dump is copied off the share, not moved: CoS #432 row b).
     $heapDumpShare = Join-Path $artifactsShare 'heapdump'
     $heapDumpCopies = @()
-    if (Test-Path -LiteralPath $heapDumpShare -PathType Container) {
+    # r9 (adversary r8 A7): a copy, hash, header or stat failure here (a dump held open, or gone since the listing) never escapes before the
+    # receipt: it is kept as $heapDumpCopyError and the capture below is STOP_FAILED / HEAP_DUMP_COPY_FAILED.
+    $heapDumpCopyError = $null
+    if (Test-Path -LiteralPath $heapDumpShare -PathType Container) { try {
         New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'heapdump') | Out-Null
         Get-ChildItem -LiteralPath $heapDumpShare -File | Where-Object { $_.Name -match '^(heap-dump\.json|watcher\.log|[^\\/]+\.dmp)$' } | ForEach-Object {
             $heapDumpLocal = Join-Path $evidenceDir "heapdump\$($_.Name)"
@@ -670,7 +673,7 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
                     minidump = ($dumpHeadRead -eq 4 -and [Text.Encoding]::ASCII.GetString($dumpHead) -ceq 'MDMP') }
             }
         }
-    }
+    } catch { $heapDumpCopyError = "HEAP_DUMP_COPY_FAILED $($_.Exception.GetType().Name): $($_.Exception.Message)" } }
     # The job's exit code and RESULT token are not in any file the job wrote: record them as a hashed file too, so the outcome is
     # re-derivable (a capture that exited non-zero is not evidence).
     $umRunLocal = Join-Path $evidenceDir 'um-run.json'
@@ -970,6 +973,7 @@ if ($heapDumpRequested) {
         if ($captureState -ceq 'DUMPED' -and $heapDumpCopies.Count -eq 0) { $captureState = 'STOP_FAILED'; $captureReason = 'DUMP_NOT_RETURNED the record says DUMPED but no *.dmp came back to the evidence' }
         elseif ($captureState -ceq 'DUMPED' -and @($heapDumpCopies | Where-Object { $_['minidump'] }).Count -eq 0) { $captureState = 'STOP_FAILED'; $captureReason = 'DUMP_NOT_A_MINIDUMP the record says DUMPED but no returned *.dmp is a non-empty minidump (MDMP signature)' }
     }
+    if ($heapDumpCopyError) { $captureState = 'STOP_FAILED'; $captureReason = $heapDumpCopyError }
     $receipt.heapDump = [ordered]@{ requested = $true; captureState = $captureState; captureVerified = ($captureState -cin @('ATTACHED_NO_CRASH', 'DUMPED')); reason = $captureReason
         watcherExited = $(if ($null -ne $heapRecord -and $heapRecord.PSObject.Properties['watcherExited']) { $heapRecord.watcherExited } else { $null }); dumps = @($heapDumpCopies) }
     if (-not $receipt.heapDump.captureVerified -and $outcome -cin @('PASS', 'FAIL', 'INVALID')) {

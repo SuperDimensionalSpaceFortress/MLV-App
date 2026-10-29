@@ -2620,27 +2620,33 @@ function Start-AttrCudaHeapDumpWatch {
 '@
     try {
         if ([string]::IsNullOrWhiteSpace($PwshPath)) { $PwshPath = Join-Path $env:ProgramFiles 'PowerShell\7\pwsh.exe' }
+        # r9 (adversary r8 A2): the watcher takes only THIS run's instance: the same full executable path, created no earlier than this request
+        # (a same-named MLVApp from another run, or one already running, is never attached).
+        $notBeforeUtc = [DateTime]::UtcNow
         [void](New-AttrCudaDirectory -Path $DumpDir)
-        [void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value ([DateTime]::UtcNow.ToString('o') + ' WATCH_REQUESTED'))
+        [void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value ($notBeforeUtc.ToString('o') + ' WATCH_REQUESTED'))
         $quote = { param($s) "'" + ([string]$s).Replace("'", "''") + "'" }
-        $exeName = Split-Path -Leaf $ExePath
+        $exeFull = [IO.Path]::GetFullPath($ExePath)
+        $exeName = Split-Path -Leaf $exeFull
         $watcher = @(
             '$ErrorActionPreference = ''Continue'''
             ('$exeName = ' + (& $quote $exeName))
+            ('$exeFull = ' + (& $quote $exeFull))
+            ('$notBefore = [DateTime]::Parse(' + (& $quote $notBeforeUtc.ToString('o')) + ', $null, [Globalization.DateTimeStyles]::RoundtripKind)')
             ('$dumpDir = ' + (& $quote $DumpDir))
             ('$match = ' + (& $quote $CommandLineMatch))
             ('$dumpType = [uint32]' + $DumpType)
             ('$deadline = [DateTime]::UtcNow.AddSeconds(' + $MaxWaitSec + ')')
             '$log = Join-Path $dumpDir ''watcher.log'''
             'function W([string]$m) { Add-Content -LiteralPath $log -Value ([DateTime]::UtcNow.ToString(''o'') + '' '' + $m) }'
-            'W (''WATCH exe='' + $exeName + '' match='' + $match + '' pid='' + $PID)'
+            'W (''WATCH exe='' + $exeFull + '' notBefore='' + $notBefore.ToString(''o'') + '' match='' + $match + '' pid='' + $PID)'
             '$source = @'''
             $debuggerSource
             '''@'
             'try { Add-Type -TypeDefinition $source -Language CSharp } catch { W (''COMPILE_FAILED '' + $_.Exception.Message); exit 5 }'
             '$target = $null'
             'while ($null -eq $target -and [DateTime]::UtcNow -lt $deadline) {'
-            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and $_.CommandLine -notmatch ''--help'' }) | Select-Object -First 1'
+            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and $_.CommandLine -notmatch ''--help'' -and $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $exeFull, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $notBefore } | Sort-Object CreationDate) | Select-Object -First 1'
             '    if ($null -eq $target) { Start-Sleep -Milliseconds 200 }'
             '}'
             'if ($null -eq $target) { W ''NO_TARGET the smoke instance never appeared''; exit 3 }'
@@ -2659,7 +2665,9 @@ function Start-AttrCudaHeapDumpWatch {
         $process = [System.Diagnostics.Process]::Start($info)
         $record.watcherPid = $process.Id
         $record.startedUtc = [DateTime]::UtcNow.ToString('o')
-        $process.Dispose()
+        # r9 (adversary r8 A3): the handle is KEPT, so Stop waits for and kills this process and never a pid that was recycled since.
+        # Stop removes it before the record is written out.
+        $record.watcherProcess = $process
     } catch {
         $record.reason = "WATCHER_START_FAILED $($_.Exception.GetType().Name)"
     }
@@ -2685,16 +2693,22 @@ function Stop-AttrCudaHeapDumpWatch {
     #>
     param([Parameter(Mandatory = $true)]$Record, [ValidateRange(0, 1800)][int]$WaitSec = 300)
     $killed = $false
+    # r9 (adversary r8 A3, A13): the watcher is reached only through the handle Start kept, never re-acquired by a pid that may have been
+    # recycled; and the finally below kills it if it is still running however this function leaves, so no throw skips the cleanup.
+    $watcher = $null
     try {
+        if ($Record.Contains('watcherProcess')) { $watcher = $Record['watcherProcess']; $Record.Remove('watcherProcess') }
         $dir = [string]$Record['dumpDir']
         $logPath = if ($dir) { Join-Path $dir 'watcher.log' } else { $null }
-        if ($null -ne $Record['watcherPid']) {
+        if ($null -ne $Record['watcherPid'] -and $watcher -isnot [System.Diagnostics.Process]) {
+            $Record['watcherExited'] = $null
+            $Record['reason'] = 'WATCHER_HANDLE_MISSING the record carries no watcher handle; the watcher is never reached by its pid'
+        } elseif ($null -ne $Record['watcherPid']) {
             $attached = $logPath -and (Test-Path -LiteralPath $logPath) -and [bool](Select-String -LiteralPath $logPath -SimpleMatch -Pattern ' ATTACH pid=' -Quiet)
-            $watcher = Get-Process -Id ([int]$Record['watcherPid']) -ErrorAction SilentlyContinue
-            if ($null -eq $watcher) { $Record['watcherExited'] = $true }
+            if ($watcher.HasExited) { $Record['watcherExited'] = $true }
             elseif ($attached -and $watcher.WaitForExit($WaitSec * 1000)) { $Record['watcherExited'] = $true }
             else {
-                try { & taskkill.exe /PID $Record['watcherPid'] /T /F 2>&1 | Out-Null } catch { }
+                try { $watcher.Kill($true) } catch { try { $watcher.Kill() } catch { } }
                 $Record['watcherExited'] = $false
                 $killed = [bool]$attached
                 $Record['reason'] = $(if ($attached) { "WATCHER_KILLED still running $WaitSec s after the smoke run returned" } else { 'WATCHER_NO_TARGET the smoke instance never appeared before the run returned' })
@@ -2707,7 +2721,7 @@ function Stop-AttrCudaHeapDumpWatch {
         }
         $has = { param($token) @($log | Where-Object { $_.Contains($token) }).Count -gt 0 }
         $Record['captureState'] = $(
-            if ($null -eq $Record['watcherPid']) { 'STOP_FAILED' }
+            if ($null -eq $Record['watcherPid'] -or $watcher -isnot [System.Diagnostics.Process]) { 'STOP_FAILED' }
             elseif ((& $has ' DUMP_WRITTEN ') -and @($Record['dumps'] | Where-Object { $_['bytes'] -gt 0 }).Count -gt 0) { 'DUMPED' }
             elseif ($killed) { 'KILLED' }
             elseif ((& $has ' NO_TARGET ') -or -not (& $has ' ATTACH pid=')) { $(if (& $has ' COMPILE_FAILED ') { 'STOP_FAILED' } else { 'NO_TARGET' }) }
@@ -2722,6 +2736,11 @@ function Stop-AttrCudaHeapDumpWatch {
     } catch {
         $Record['reason'] = "WATCHER_STOP_FAILED $($_.Exception.GetType().Name)"
         $Record['captureState'] = 'STOP_FAILED'
+    } finally {
+        if ($watcher -is [System.Diagnostics.Process]) {
+            try { if (-not $watcher.HasExited) { $Record['watcherExited'] = $false; try { $watcher.Kill($true) } catch { $watcher.Kill() } } } catch { }
+            try { $watcher.Dispose() } catch { }
+        }
     }
     return $Record
 }

@@ -8545,6 +8545,82 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             self.assertEqual((out["CAPTURE"], out["JSONSTATE"]), ("STOP_FAILED", "STOP_FAILED"), proc.stdout)
             self.assertTrue(out["REASON"].startswith("WATCHER_START_FAILED"), out["REASON"])
 
+    # r9 (adversary r8 A2): the watcher binds to THIS run's instance -- the same full executable path, created no earlier than the request.
+    def test_heap_dump_watch_never_attaches_a_same_named_instance_at_another_path(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-path-") as d:
+            target = Path(d) / "heap-path-target.ps1"
+            target.write_text("Start-Sleep -Seconds 6\nexit 0\n", encoding="ascii")
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{d}\\other-run\\{ps51.name}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{target}' -WindowStyle Hidden -PassThru\n"
+                "[void]$t.WaitForExit(90000)\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 30\n"
+                "Write-Output ('CAPTURE=' + $r.captureState); $r.watcherLog | ForEach-Object { Write-Output ('LOG=' + $_) }")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(any(" ATTACH pid=" in l for l in proc.stdout.splitlines() if l.startswith("LOG=")), proc.stdout)
+            self.assertIn("CAPTURE=NO_TARGET", proc.stdout.splitlines(), proc.stdout)
+
+    def test_heap_dump_watch_never_attaches_an_instance_that_was_already_running(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-old-") as d:
+            target = Path(d) / "heap-old-target.ps1"
+            target.write_text("Start-Sleep -Seconds 8\nexit 0\n", encoding="ascii")
+            args = f"'-NoProfile','-ExecutionPolicy','Bypass','-File','{target}'"
+            proc = self.run_module(
+                f"$old = Start-Process -FilePath '{ps51}' -ArgumentList {args} -WindowStyle Hidden -PassThru\n"
+                "Start-Sleep -Seconds 1\n"
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$deadline = (Get-Date).AddSeconds(15); while ((Get-Date) -lt $deadline -and -not (Select-String -LiteralPath '{d}\\hd\\watcher.log' -SimpleMatch -Pattern ' ATTACH pid=' -Quiet)) {{ Start-Sleep -Milliseconds 250 }}\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList {args} -WindowStyle Hidden -PassThru\n"
+                "[void]$t.WaitForExit(90000); [void]$old.WaitForExit(90000)\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 60\n"
+                "Write-Output ('OLD=' + $old.Id); Write-Output ('TARGET=' + $t.Id); Write-Output ('CAPTURE=' + $r.captureState)\n"
+                "$r.watcherLog | ForEach-Object { Write-Output ('LOG=' + $_) }")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            lines = proc.stdout.splitlines()
+            out = dict(l.split("=", 1) for l in lines if "=" in l and not l.startswith("LOG="))
+            attaches = [l for l in lines if l.startswith("LOG=") and " ATTACH pid=" in l]
+            self.assertEqual(len(attaches), 1, proc.stdout)
+            self.assertTrue(attaches[0].endswith(f"ATTACH pid={out['TARGET']}"), proc.stdout)
+            self.assertEqual(out["CAPTURE"], "ATTACHED_NO_CRASH", proc.stdout)
+
+    # r9 (adversary r8 A3): cleanup reaches the watcher only through the handle Start kept, never by a pid that may have been recycled.
+    def test_heap_dump_stop_never_kills_a_process_that_reuses_the_watcher_pid(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-pid-") as d:
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 600\n"
+                f"$editor = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60' -WindowStyle Hidden -PassThru\n"
+                "$watcherPid = $r.watcherPid; $r.watcherPid = $editor.Id\n"
+                "Start-Sleep -Seconds 2\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+                "Start-Sleep -Milliseconds 500\n"
+                "Write-Output ('EDITOR_ALIVE=' + (-not $editor.HasExited)); Write-Output ('WATCHER_ALIVE=' + [bool](Get-Process -Id $watcherPid -ErrorAction SilentlyContinue))\n"
+                "Write-Output ('CAPTURE=' + $r.captureState)\n"
+                "try { $editor.Kill() } catch { }")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["EDITOR_ALIVE"], out["WATCHER_ALIVE"], out["CAPTURE"]), ("True", "False", "NO_TARGET"), proc.stdout)
+
+    # r9 (adversary r8 A13): Stop never leaves the watcher running, even when reading its log throws.
+    def test_heap_dump_stop_kills_the_watcher_even_when_its_log_cannot_be_read(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-lock-") as d:
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 600\n"
+                "$watcherPid = $r.watcherPid\n"
+                "Start-Sleep -Seconds 2\n"
+                f"$lock = [IO.File]::Open('{d}\\hd\\watcher.log', 'Open', 'ReadWrite', 'None')\n"
+                "try { $r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5 } finally { $lock.Dispose() }\n"
+                "Start-Sleep -Milliseconds 500\n"
+                "Write-Output ('WATCHER_ALIVE=' + [bool](Get-Process -Id $watcherPid -ErrorAction SilentlyContinue)); Write-Output ('CAPTURE=' + $r.captureState)\n"
+                "Write-Output ('EXITED=' + $r.watcherExited)\n"
+                "Get-Process -Id $watcherPid -ErrorAction SilentlyContinue | Stop-Process -Force\n"
+                "exit 0")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["WATCHER_ALIVE"], out["CAPTURE"], out["EXITED"]), ("False", "STOP_FAILED", "False"), proc.stdout)
+
     def test_heap_dump_watch_writes_only_through_the_publish_helpers(self) -> None:
         """r7 (CoS #432): Start-/Stop-AttrCudaHeapDumpWatch write nothing raw; the directory, the watcher log, the watcher script and
         heap-dump.json go through New-AttrCudaDirectory / Publish-AttrCudaText. The hidden watcher's own appends (Add-Content in its W function,
@@ -8643,6 +8719,27 @@ class HeapDumpRunnerReceiptTests(RunnerHarness, unittest.TestCase):
                 self.assertIn("DUMP_NOT_A_MINIDUMP", receipt["heapDump"]["reason"])
                 [d] = receipt["heapDump"]["dumps"]
                 self.assertEqual((d["bytes"], d["minidump"]), (len(dump), False))
+
+    def test_heap_dump_receipt_is_typed_stop_failed_when_the_dump_copy_fails(self) -> None:
+        # r9 (adversary r8 A7): a dump another process holds open with no sharing makes the evidence copy throw; the leg still ends with a typed
+        # receipt (STOP_FAILED / HEAP_DUMP_COPY_FAILED, the leg HEAPDUMP_CAPTURE_FAILED), never a runner that dies before Complete-Receipt
+        import ctypes
+        from ctypes import wintypes
+        dump = b"MDMP" + b"\x00" * 64
+        self.publish(self.record("DUMPED", dumps=[{"name": "MLVApp_1_20261015T000000.dmp", "bytes": len(dump)}]), dump=dump)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype = wintypes.HANDLE
+        kernel32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.CreateFileW(str(self.artifacts / "heapdump" / "MLVApp_1_20261015T000000.dmp"), 0x80000000, 0, None, 3, 0, None)  # GENERIC_READ, no sharing, OPEN_EXISTING
+        self.assertNotEqual(handle, wintypes.HANDLE(-1).value, ctypes.get_last_error())
+        try:
+            proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+        finally:
+            kernel32.CloseHandle(handle)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((receipt["outcome"], receipt["heapDump"]["captureState"]), ("HEAPDUMP_CAPTURE_FAILED", "STOP_FAILED"), receipt["outcomeDetail"])
+        self.assertTrue(receipt["heapDump"]["reason"].startswith("HEAP_DUMP_COPY_FAILED "), receipt["heapDump"]["reason"])
 
     def test_heap_dump_receipt_is_null_on_a_leg_that_did_not_ask(self) -> None:
         self.publish(None)
