@@ -522,7 +522,7 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
                 return @{ Acquired = $false; Held = $held }
             }
             Write-BuildGuardLog "reclaiming stale build slot ($reclaim): $path"
-            try { Remove-Item -LiteralPath $path -Force } catch {
+            try { Remove-Item -LiteralPath $path -Force -WhatIf:$false -Confirm:$false } catch {
                 $why = $_.Exception.Message -replace '\s+', ' '
                 Write-BuildGuardLog "stale build slot not removed ($reclaim): $path ($why)"
                 return @{ Acquired = $false; Held = "stale-lock-not-removed ($reclaim): $why" }
@@ -575,7 +575,7 @@ function Remove-BuildSlot($Ticket) {
         if (-not $got) { Write-BuildGuardLog "release-mutex-busy: build slot left for owner-dead reclaim: $($Ticket.Path)"; return }
         $info = Get-Content -LiteralPath $Ticket.Path -Raw | ConvertFrom-Json
         if ([int]$info.ownerPid -eq $Ticket.OwnerPid -and [long]$info.startTicks -eq $Ticket.StartTicks) {
-            Remove-Item -LiteralPath $Ticket.Path -Force
+            Remove-Item -LiteralPath $Ticket.Path -Force -WhatIf:$false -Confirm:$false
         }
     } catch {
         Write-BuildGuardLog ('build slot not released: {0} ({1}); left for owner-dead reclaim' -f $Ticket.Path, ($_.Exception.Message -replace '\s+', ' '))
@@ -731,8 +731,8 @@ function Remove-HeavySlotFiles($Lease) {
     # The one place a stop file is deleted (r8, adversary 3e68ca85-A1): only once Test-HeavySlotStopNeeded proves no holder
     # can still read it, decided before the ready file that names the holder goes. The other lease files go either way.
     $keepStop = Test-HeavySlotStopNeeded $Lease
-    foreach ($f in @($Lease.Ready, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-    if (-not $keepStop) { Remove-Item -LiteralPath $Lease.Stop -Force -ErrorAction SilentlyContinue }
+    foreach ($f in @($Lease.Ready, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue }
+    if (-not $keepStop) { Remove-Item -LiteralPath $Lease.Stop -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue }
 }
 
 function Remove-HeavySlotLeaseFiles($Lease) {
@@ -844,7 +844,7 @@ function Send-HeavySlotStop($Lease) {
     # Writes the stop file. When it cannot be written, heavy-slot's process tree is ended instead (the OS then frees its
     # slot mutex), so a holder that would never see the file cannot keep the machine slot.
     $Lease['StopSent'] = $true
-    try { Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -ErrorAction Stop; return } catch { $why = $_.Exception.Message }
+    try { Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -WhatIf:$false -Confirm:$false -ErrorAction Stop; return } catch { $why = $_.Exception.Message }
     Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} stop file not written ({1}); ending heavy-slot pid {2} and its children' -f $Lease.Label, $why, $Lease.Process.Id)
     # taskkill sets the global $LASTEXITCODE, which a Library caller may exit with after the release, so it is kept
     # (r5b adversary A3), and left unset when it was unset, which strict mode cannot read (r5b pass 2 A2). taskkill's own
@@ -858,7 +858,7 @@ function Send-HeavySlotStop($Lease) {
         try { $null = & ([IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'taskkill.exe')) /PID $Lease.Process.Id /T /F 2>&1 }
         catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} taskkill of heavy-slot pid {1} failed ({2})' -f $Lease.Label, $Lease.Process.Id, $_.Exception.Message) }
         finally {
-            if ($last) { $global:LASTEXITCODE = $keep } else { Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore }
+            if ($last) { $global:LASTEXITCODE = $keep } else { Remove-Variable -Name LASTEXITCODE -Scope Global -WhatIf:$false -Confirm:$false -ErrorAction Ignore }
         }
     }
     # (The wrapper's pid cannot be reused here: $Lease.Process has held its handle since Process.Start.)
@@ -1187,13 +1187,27 @@ function Invoke-BuildGuard {
     # host renders synchronously, past the bounded writers). Both are local to this call; the action gets the caller's back.
     # r10 (adversary a2bdda36-A1): nor WhatIf or a confirm prompt (an inherited $WhatIfPreference=$true made the stop file's
     # Set-Content a silent no-op, so the holder kept the slot after the release).
+    # r11 (sol r10 B1): a caller's AllScope preference or defaults is ONE variable in every scope, so handing the action the
+    # caller's value also handed it to every release after the action: the stop file's Set-Content and the lock and lease-file
+    # deletes became successful WhatIf no-ops and the holder kept the machine slot. So the guard's own values are set again
+    # after the action, before any release, and the caller's come back last, once both slots are given back. Both are
+    # dot-sourced (they assign in the scope that runs them) and are plain assignments, never a cmdlet (r10, a2bdda36-A2).
     $callerDefaults = $PSDefaultParameterValues
     $callerPrefs = @{ VerbosePreference = $VerbosePreference; DebugPreference = $DebugPreference; WarningPreference = $WarningPreference
         InformationPreference = $InformationPreference; WhatIfPreference = $WhatIfPreference; ConfirmPreference = $ConfirmPreference }
-    $PSDefaultParameterValues = @{}
-    $VerbosePreference = 'SilentlyContinue'; $DebugPreference = 'SilentlyContinue'
-    $WarningPreference = 'SilentlyContinue'; $InformationPreference = 'SilentlyContinue'
-    $WhatIfPreference = $false; $ConfirmPreference = 'None'
+    $guardPrefs = {
+        $PSDefaultParameterValues = @{}
+        $VerbosePreference = 'SilentlyContinue'; $DebugPreference = 'SilentlyContinue'
+        $WarningPreference = 'SilentlyContinue'; $InformationPreference = 'SilentlyContinue'
+        $WhatIfPreference = $false; $ConfirmPreference = 'None'
+    }
+    $callerPrefsBack = {
+        $VerbosePreference = $callerPrefs.VerbosePreference; $DebugPreference = $callerPrefs.DebugPreference
+        $WarningPreference = $callerPrefs.WarningPreference; $InformationPreference = $callerPrefs.InformationPreference
+        $WhatIfPreference = $callerPrefs.WhatIfPreference; $ConfirmPreference = $callerPrefs.ConfirmPreference
+        $PSDefaultParameterValues = $callerDefaults
+    }
+    . $guardPrefs
     $o = @{}
     foreach ($k in $script:BuildGuardDefaults.Keys) { $o[$k] = $script:BuildGuardDefaults[$k] }
     foreach ($k in $Options.Keys) { $o[$k] = $Options[$k] }
@@ -1261,7 +1275,12 @@ function Invoke-BuildGuard {
                 }
                 exit 3
             }
-            Start-Sleep -Milliseconds ([int]($o.PollSeconds * 1000))
+            # r11 (sol r10 B2): never past the deadline, on the memory wait and the local-slot-busy path alike: a -PollSeconds
+            # longer than what is left (3600 against 0.6 s) slept that long with the machine heavy slot held. The next look is
+            # at the deadline, which gives the slot back and refuses above. A NaN or negative poll is no sleep.
+            $sleepMs = [math]::Min([double]$o.PollSeconds * 1000,[math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds))
+            if (-not ($sleepMs -gt 0)) { $sleepMs = 0 }
+            Start-Sleep -Milliseconds ([int][math]::Min($sleepMs, [int]::MaxValue))
         }
         try {
             $choice = Get-BuildGuardJobs -Options $o -SelfPid $PID
@@ -1290,18 +1309,22 @@ function Invoke-BuildGuard {
                 param($Jobs)
                 # Plain assignments, never a cmdlet: one run with the caller's defaults just restored ('Set-Variable:PassThru',
                 # say) would write into the action's output (r10, adversary a2bdda36-A2).
-                $VerbosePreference = $callerPrefs.VerbosePreference; $DebugPreference = $callerPrefs.DebugPreference
-                $WarningPreference = $callerPrefs.WarningPreference; $InformationPreference = $callerPrefs.InformationPreference
-                $WhatIfPreference = $callerPrefs.WhatIfPreference; $ConfirmPreference = $callerPrefs.ConfirmPreference
-                $PSDefaultParameterValues = $callerDefaults
+                . $callerPrefsBack
                 & $Action $Jobs
             } $jobs
         } finally {
+            # The guard's own values again before the build-slot release: an AllScope caller value restored above is the one
+            # this scope reads too, and so is anything the action set in one (r11).
+            . $guardPrefs
             Remove-BuildSlot $ticket
         }
     } finally {
         # Queued guard lines go out last, once nothing is held (r7b, adversary 8d0c73bd-A1), the typed lines with them (r8).
-        try { Exit-HeavySlot $heavy -ActionStarted:$actionStarted } finally { Complete-BuildGuardOutput }
+        # The caller's preferences come back after both (r11): for an AllScope one this is the caller's own variable.
+        . $guardPrefs
+        try {
+            try { Exit-HeavySlot $heavy -ActionStarted:$actionStarted } finally { Complete-BuildGuardOutput }
+        } finally { . $callerPrefsBack }
     }
 }
 

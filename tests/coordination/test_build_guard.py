@@ -2543,6 +2543,116 @@ def test_restoring_caller_defaults_adds_nothing_to_the_action_output(box) -> Non
     assert "count=1 types=String first=ACTION jobs=4 pt=True" in done.stdout, done.stdout + done.stderr
 
 
+# r11 (sol r10 B1): an AllScope variable is one variable in every scope, so the action's restore of the caller's preference or
+# defaults was also the value every release after the action read: the stop file's Set-Content and the lock and lease-file
+# deletes became successful WhatIf no-ops (StopSent=True, no stop on disk) and the holder kept the machine slot. The ordinary
+# preference is the control. Each variant is the caller's own value, so the action sees it and the caller has it back after.
+@pytest.mark.parametrize("setup, action_sees, after", [
+    ("$WhatIfPreference = $true", "whatif=True", "whatif=True"),
+    ("Set-Variable -Name WhatIfPreference -Option AllScope -Value $true", "whatif=True", "whatif=True"),
+    ("Set-Variable -Name PSDefaultParameterValues -Option AllScope -Value @{ 'Set-Content:WhatIf' = $true }",
+     "defaults=Set-Content:WhatIf", "defaults=Set-Content:WhatIf"),
+    ("Set-Variable -Name PSDefaultParameterValues -Option AllScope -Value @{ '*:WhatIf' = $true }",
+     "defaults=*:WhatIf", "defaults=*:WhatIf"),
+    ("Set-Variable -Name ConfirmPreference -Option AllScope -Value 'Low'", "confirm=Low", "confirm=Low"),
+], ids=["ordinary-whatif", "allscope-whatif", "allscope-default-set-content", "allscope-default-all-whatif", "allscope-confirm"])
+def test_an_allscope_caller_preference_never_suppresses_the_release(box, setup, action_sees, after) -> None:
+    show = ("whatif=$WhatIfPreference confirm=$ConfirmPreference "
+            "defaults=$(@($PSDefaultParameterValues.Keys) -join ',')")
+    done = _library_driver(
+        box,
+        setup + "\n"
+        f"$r = Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Write-Output \"built=$Jobs {show}\" }}\n"
+        "Write-Output $r\n"
+        f"Write-Output \"after {show}\"\n",
+        str(box["lock"]),
+        host_tail=(
+            "$d = (Get-Date).AddSeconds(20)\n"
+            f"while (-not (Test-Path -LiteralPath '{box['dir'] / 'stub.log'}') -and (Get-Date) -lt $d) {{ Start-Sleep -Milliseconds 200 }}\n"
+            f"Write-Output \"released=$(Test-Path -LiteralPath '{box['dir'] / 'stub.log'}')\"\n"
+        ),
+    )
+    out = done.stdout + done.stderr
+    built = next((line for line in done.stdout.splitlines() if line.startswith("built=4 ")), "")
+    assert built and action_sees in built, out
+    after_line = next((line for line in done.stdout.splitlines() if line.startswith("after ")), "")
+    assert after in after_line, f"the caller's own value is back after the guard: {after_line!r}\n{out}"
+    assert "released=True" in done.stdout, out
+    assert "did not end within 60 s of release" not in out, out
+    assert "stop file not written" not in out, out
+    assert "What if:" not in out, out
+    assert not box["lock"].exists(), "the build slot's lock is deleted on release"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == [], "every lease file is deleted on release"
+    assert _stub_calls(box)[0]["childEnd"]
+
+
+# r11 (sol r10 B2): the admission wait slept a whole -PollSeconds while it held the machine heavy slot, so PollSeconds=3600 with
+# DeadlineMinutes=0.01 asked for a one-hour sleep past a 0.6 s deadline. Every sleep is now at most what is left of the
+# deadline, on the memory wait and the local-slot-busy path alike, and the expired deadline gives the slot back and refuses.
+# Start-Sleep is shadowed: each request of the admission wait (the caller whose $deadline is set; heavy-slot's own ready-file
+# poll has none) is recorded beside the time left, and the shadow sleeps at most 50 ms of any request.
+_RECORD_SLEEPS = (
+    "function Start-Sleep { param([int]$Milliseconds, [double]$Seconds)\n"
+    "    if ($deadline -is [DateTime]) {\n"
+    "        $left = [int][math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds)\n"
+    "        [IO.File]::AppendAllText($SleepLog, ('{0} {1}' -f $Milliseconds, $left) + [Environment]::NewLine) }\n"
+    "    [Threading.Thread]::Sleep([math]::Max(0, [math]::Min($Milliseconds, 50))) }\n"
+)
+
+
+def _recorded_sleeps(path: Path) -> list:
+    return [tuple(int(v) for v in line.split()) for line in path.read_text(encoding="ascii").splitlines()] if path.exists() else []
+
+
+@pytest.mark.parametrize("path", ["memory-wait", "local-slot-busy"])
+def test_a_poll_longer_than_the_deadline_is_clamped_and_the_slot_goes_back(box, path) -> None:
+    sleeps = box["dir"] / "sleeps.txt"
+    zero = _write_json(box["dir"] / "memory-zero.json", [{"freePhysGB": 0, "freeCommitGB": 0}])
+    setup = f"$SleepLog = '{sleeps}'\n" + _RECORD_SLEEPS + "$opts.PollSeconds = 3600; $opts.DeadlineMinutes = 0.01\n"
+    if path == "memory-wait":
+        setup += f"$opts.MemoryProbeFile = '{zero}'\n"
+        refusal = "BUILD_MEM_REFUSED label=build freePhysGB=0 freeCommitGB=0"
+    else:
+        setup += "function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) { @{ Acquired = $false; Held = 'pid=1 label=peer' } }\n"
+        refusal = "BUILD_SLOT_BUSY label=build heldBy=[pid=1 label=peer]"
+    started = time.monotonic()
+    done = _library_driver(
+        box,
+        setup + f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+    )
+    out = done.stdout + done.stderr
+    recorded = _recorded_sleeps(sleeps)
+    assert recorded, out
+    # The shadow reads the time left a little after the guard did (the call itself, cold on its first run), so a request may
+    # pass the shadow's figure by that lag, never by more: 100 ms against the 3,600,000 ms the unclamped wait asked for.
+    assert all(ms <= max(0, left) + 100 for ms, left in recorded), f"a sleep outlived the deadline: {recorded[:5]}"
+    assert max(ms for ms, _ in recorded) <= 600, recorded[:5]
+    assert done.returncode == 3, out
+    assert refusal in done.stdout, out
+    assert "heavy-slot: released label=" in done.stderr, out
+    assert "HEAVY_SLOT_LOST_DURING_ACTION" not in out, "no action ran, and the holder lived until the release"
+    assert not box["marker"].exists(), "nothing is built after a refusal"
+    assert _stub_calls(box)[0]["childEnd"], "the machine slot went back"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == []
+    assert time.monotonic() - started < 60, out
+
+
+def test_sols_poll_override_repro_in_command_mode_refuses_within_the_deadline(box) -> None:
+    # Sol r10 B2, its literal input, unshadowed: PollSeconds=3600, DeadlineMinutes=0.01, memory 0/0, Command 'exit 0'. Before
+    # the clamp this slept an hour with the machine slot held (the test's 120 s subprocess bound fired first).
+    started = time.monotonic()
+    done = _heavy(box, "run", ["-PollSeconds", "3600", "-DeadlineMinutes", "0.01", "-Command", "exit 0"],
+                  memory=[{"freePhysGB": 0, "freeCommitGB": 0}])
+    elapsed = time.monotonic() - started
+    out = done.stdout + done.stderr
+    assert done.returncode == 3, out
+    assert "BUILD_MEM_REFUSED label=build freePhysGB=0 freeCommitGB=0" in done.stdout, out
+    assert "heavy-slot: released label=" in done.stderr, out
+    assert _stub_calls(box)[0]["childEnd"]
+    assert elapsed < 60, f"the refusal took {elapsed:.1f} s"
+
+
 # r9 class guard (2ab4b1b6-A1 siblings :887 :888, which no input reaches once :868/:869 resolve): no function the guard runs
 # composes or resolves a path with a cmdlet that can write an error record or throw on a missing drive or another provider.
 # Paths are resolved by Resolve-BuildGuardPath only and composed with [IO.Path].
