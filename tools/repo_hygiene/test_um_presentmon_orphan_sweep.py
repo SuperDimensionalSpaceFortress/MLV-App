@@ -991,17 +991,17 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
     def test_a1_a_parent_started_after_the_child_across_an_offset_change_is_no_evidence(self) -> None:
         # adversary A1's input: the child started 06:55Z (01:55-05:00, daylight), its parent exited, and pid 900 now belongs to an Intel service started 07:10Z (01:10-06:00, standard). On the
         # wall clock the replacement parent reads EARLIER than the child; as instants it is later, so it is no evidence
-        detail, _d = self.h3("a1-offset-change", processes=((7001, "PresentMonService", 900, "2026-11-01T01:55:00-05:00"), (900, "IntelGraphicsSoftware.Service.exe", 4, "2026-11-01T01:10:00-06:00")))
+        detail, _d = self.h3("a1-offset-change", processes=((7001, "PresentMonService", 900, "2025-11-02T01:55:00-05:00"), (900, "IntelGraphicsSoftware.Service.exe", 4, "2025-11-02T01:10:00-06:00")))
         self.assertEqual(detail.get("identityError"), "parent_started_after_child")
 
     def test_a1_the_cim_shape_a_local_datetime_is_compared_as_an_instant(self) -> None:
-        # the real Win32_Process CreationDate is a LOCAL DateTime (the same instants converted to the host's zone). On a host whose zone leaves daylight time at 2026-11-01T07:00Z (US Central,
+        # the real Win32_Process CreationDate is a LOCAL DateTime (the same instants converted to the host's zone). On a host whose zone leaves daylight time at 2025-11-02T07:00Z (US Central,
         # the venues' zone) the parent's wall clock reads 01:10 and the child's 01:55, so a wall-clock compare accepts the reused pid; on a UTC host the wall clocks already agree with the instants
-        detail, _d = self.h3("a1-local", processes=((7001, "PresentMonService", 900, "local:2026-11-01T06:55:00Z"), (900, "IntelGraphicsSoftware.Service.exe", 4, "local:2026-11-01T07:10:00Z")))
+        detail, _d = self.h3("a1-local", processes=((7001, "PresentMonService", 900, "local:2025-11-02T06:55:00Z"), (900, "IntelGraphicsSoftware.Service.exe", 4, "local:2025-11-02T07:10:00Z")))
         self.assertEqual(detail.get("identityError"), "parent_started_after_child")
 
     def test_a1_the_same_offsets_in_the_right_order_still_identify_the_intel_child(self) -> None:
-        code, sweep, d, out = self.run_start("a1-offset-ok", others=(self.SERVICE_UNREADABLE,), processes=((7001, "PresentMonService", 900, "2026-11-01T01:10:00-06:00"), (900, "IntelGraphicsSoftware.Service.exe", 4, "2026-11-01T01:55:00-05:00")))
+        code, sweep, d, out = self.run_start("a1-offset-ok", others=(self.SERVICE_UNREADABLE,), processes=((7001, "PresentMonService", 900, "2025-11-02T01:10:00-06:00"), (900, "IntelGraphicsSoftware.Service.exe", 4, "2025-11-02T01:55:00-05:00")))
         self.assertEqual(code, 0, out)
         self.assertEqual(sweep["livePresentMonProcesses"][0]["nonCaptureIdentity"], "intel_graphics_presentmonservice", sweep)
         self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
