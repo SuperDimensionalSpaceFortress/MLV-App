@@ -8421,9 +8421,24 @@ class HeapDumpGeneratorTests(unittest.TestCase):
         at = [on.index(s) for s in order]
         self.assertEqual(at, sorted(at), "watcher after PresentMon, before the launch; completed after the launch, before the failed-run exit")
 
+    def test_the_runner_reads_the_heap_dump_flag_only_as_a_json_boolean(self) -> None:
+        # r10 (adversary r10 A3): the string "false", whitespace and {} are PowerShell-truthy; only a JSON true arms the watch and the receipt request
+        lines = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8").splitlines()
+        mapping = next(l.strip() for l in lines if "$gen['HeapCorruptionDump'] = $true" in l)
+        requested = next(l.strip() for l in lines if l.startswith("$heapDumpRequested = "))
+        for raw, expected in (('"false"', False), ('" "', False), ("{}", False), ("false", False), ("true", True)):
+            with tempfile.TemporaryDirectory(prefix="heap-flag-") as d:
+                script = Path(d) / "flag.ps1"
+                script.write_text("$spec = '{\"generatorArgs\":{\"heapCorruptionDump\":" + raw + "}}' | ConvertFrom-Json\n$gen = @{}\n"
+                                  + mapping + "\n" + requested + "\n"
+                                  "Write-Output ('MAPPED=' + $gen.ContainsKey('HeapCorruptionDump'))\nWrite-Output ('REQUESTED=' + $heapDumpRequested)\n", encoding="ascii")
+                proc = run_pwsh(["-File", str(script)])
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(proc.stdout.split(), [f"MAPPED={expected}", f"REQUESTED={expected}"], raw)
+
     def test_the_runner_schema_and_scopelive_leg_carry_the_heap_dump(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
-        mapping = ("if ($spec.generatorArgs.PSObject.Properties['heapCorruptionDump'] -and [bool]$spec.generatorArgs.heapCorruptionDump) "
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['heapCorruptionDump'] -and $spec.generatorArgs.heapCorruptionDump -is [bool] -and $spec.generatorArgs.heapCorruptionDump) "
                    "{ $gen['HeapCorruptionDump'] = $true }")
         self.assertIn(mapping, runner)
         self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
@@ -8630,6 +8645,66 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("CAPTURE=ATTACHED_NO_CRASH", proc.stdout.splitlines(), proc.stdout)
 
+    # r10 adversary pass 1 A1: --help inside a QUOTED path with spaces is part of a name, not an argument.
+    def test_heap_dump_watch_attaches_an_instance_whose_quoted_path_holds_help_between_spaces(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-quoted-") as d:
+            target = Path(d) / "my --help file.ps1"
+            target.write_text("Start-Sleep -Seconds 6\nexit 0\n", encoding="ascii")
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{target}\"' -WindowStyle Hidden -PassThru\n"
+                "[void]$t.WaitForExit(90000)\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 60\n"
+                "Write-Output ('CAPTURE=' + $r.captureState)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("CAPTURE=ATTACHED_NO_CRASH", proc.stdout.splitlines(), proc.stdout)
+
+    # r10 adversary pass 1 A5: the debugger attaches only to the process whose creation time the watcher selected, so a pid recycled between the selection
+    # and the attach (a different process with the same pid) is refused on the handle itself.
+    def test_heap_dump_debugger_refuses_a_process_whose_creation_time_is_not_the_selected_one(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-identity-") as d:
+            script = Path(d) / "identity.ps1"
+            script.write_text(
+                f"$ErrorActionPreference = 'Stop'\n$text = Get-Content -LiteralPath '{ATTR_MODULE}' -Raw\n"
+                "$m = [regex]::Match($text, '(?s)\\$debuggerSource = @''\\r?\\n(.*?)\\r?\\n''@')\n"
+                "Add-Type -TypeDefinition $m.Groups[1].Value -Language CSharp\n"
+                f"$wrong = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 20' -WindowStyle Hidden -PassThru\n"
+                f"$wrongLog = '{d}\\wrong.log'; $rcWrong = [MlvHeapDumpWatch.Debugger]::Run([uint32]$wrong.Id, '{d}\\wrong.dmp', 0, $wrongLog, $wrong.StartTime.ToUniversalTime().ToFileTimeUtc() + 600000000)\n"
+                "$stillAlive = -not $wrong.HasExited; try { $wrong.Kill() } catch { }\n"
+                f"$right = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 3' -WindowStyle Hidden -PassThru\n"
+                f"$rightLog = '{d}\\right.log'; $rcRight = [MlvHeapDumpWatch.Debugger]::Run([uint32]$right.Id, '{d}\\right.dmp', 0, $rightLog, $right.StartTime.ToUniversalTime().ToFileTimeUtc())\n"
+                "Write-Output ('WRONG_RC=' + $rcWrong); Write-Output ('WRONG_ALIVE=' + $stillAlive)\n"
+                "Write-Output ('WRONG_LOG=' + ((Get-Content -LiteralPath $wrongLog) -join ' | '))\n"
+                "Write-Output ('RIGHT_LOG=' + ((Get-Content -LiteralPath $rightLog) -join ' | '))\n", encoding="ascii")
+            proc = run_pwsh(["-File", str(script)], timeout=240)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual(out["WRONG_RC"], "6", proc.stdout)
+            self.assertEqual(out["WRONG_ALIVE"], "True", proc.stdout)
+            self.assertIn("TARGET_IDENTITY_MISMATCH", out["WRONG_LOG"], proc.stdout)
+            self.assertNotIn("DEBUGGER_ATTACHED", out["WRONG_LOG"], proc.stdout)
+            self.assertIn("DEBUGGER_ATTACHED", out["RIGHT_LOG"], proc.stdout)
+
+    # r10 adversary pass 1 A6: the acquisition bound holds against a stalled query, so every CIM query in the watcher carries the budget left and a
+    # target found after the budget is spent is dropped. (A stalled local CIM cannot be produced on demand; this pins the shape that bounds it.)
+    def test_heap_dump_watcher_bounds_every_cim_query_by_the_budget_left(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-bound-") as d:
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 600\n"
+                "Start-Sleep -Seconds 3\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+                "Write-Output ('CAPTURE=' + $r.captureState)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            watcher = (Path(d) / "hd" / "heap-dump-watcher.ps1").read_text(encoding="utf-8")
+        queries = [l for l in watcher.splitlines() if "Get-CimInstance" in l]
+        self.assertEqual(len(queries), 2, queries)
+        for line in queries:
+            self.assertIn("-OperationTimeoutSec (Left)", line)
+        self.assertIn("function Left {", watcher)
+        self.assertIn("if ($null -ne $target -and $clock.Elapsed.TotalSeconds -gt $maxWaitSec) { $target = $null }", watcher)
+
     # r9 adversary pass 1 A3: an event token inside the WATCH line's exe path is never read as that event.
     def test_heap_dump_stop_never_reads_an_event_token_inside_the_exe_path(self) -> None:
         with tempfile.TemporaryDirectory(prefix="heap-token-") as d:
@@ -8799,6 +8874,29 @@ class HeapDumpRunnerReceiptTests(RunnerHarness, unittest.TestCase):
         self.assertEqual((receipt["outcome"], receipt["heapDump"]["captureState"]), ("HEAPDUMP_CAPTURE_FAILED", "STOP_FAILED"), receipt["outcomeDetail"])
         self.assertTrue(receipt["heapDump"]["reason"].startswith("HEAP_DUMP_COPY_FAILED "), receipt["heapDump"]["reason"])
 
+    def test_the_receipt_reader_refuses_a_heap_dump_pass_whose_capture_or_dump_is_not_in_the_evidence(self) -> None:
+        # r10 (adversary r10 A9): Test-DvReceiptValid re-checks the heap evidence itself, not only the writer's gate
+        dump = b"MDMP" + b"\x00" * 4096
+        self.publish(self.record("DUMPED", dumps=[{"name": "MLVApp_1_20261015T000000.dmp", "bytes": len(dump)}]), dump=dump)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        status, valid, reasons = ps_receipt_status(receipt, allow_offline=True)
+        self.assertEqual((status, valid), ("VERIFIED_OFFLINE_TEST", True), reasons)
+        # a forged capture: the receipt keeps its PASS but says the capture was never verified
+        forged = json.loads(json.dumps(receipt))
+        forged["heapDump"]["captureVerified"] = False
+        forged["heapDump"]["captureState"] = "NO_TARGET"
+        status, valid, reasons = ps_receipt_status(forged, allow_offline=True)
+        self.assertEqual((status, valid), ("INVALID", False))
+        self.assertTrue(any(r.startswith("HEAPDUMP_CAPTURE_NOT_VERIFIED") for r in reasons), reasons)
+        # the dump removed or emptied after the receipt was written
+        evidence = Path(receipt["evidence"]["localEvidenceDir"]) / "heapdump" / "MLVApp_1_20261015T000000.dmp"
+        for damage in (lambda: evidence.write_bytes(b""), lambda: evidence.write_bytes(b"PK\x03\x04" + b"\x00" * 64), lambda: evidence.unlink()):
+            damage()
+            status, valid, reasons = ps_receipt_status(receipt, allow_offline=True)
+            self.assertEqual((status, valid), ("INVALID", False))
+            self.assertTrue(any(r.startswith("HEAPDUMP_DUMP_NOT_IN_EVIDENCE") for r in reasons), reasons)
+
     def test_heap_dump_receipt_is_null_on_a_leg_that_did_not_ask(self) -> None:
         self.publish(None)
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
@@ -8870,6 +8968,34 @@ class HeapDumpSoakAccountingTests(unittest.TestCase):
                "heapDumpWatch": "2026-10-29T00:00:00Z DEBUGGER_ATTACHED pid=7"}
         g = self.account([rec])["groups"]
         self.assertEqual((g["pageheap"]["legs"], g["attached"]["legs"]), (1, 0))
+
+    def test_heap_dump_soak_accounting_never_reads_an_event_token_inside_the_watch_line_as_an_attach(self) -> None:
+        # r10 (adversary r10 A2): the exe path on the WATCH line may hold any token; only an event right after a line's timestamp counts, and an
+        # explicit ATTACH_FAILED is never an attach
+        rec = {"status": "RAN", "name": "W", "arm": "FIX-W", "watch": "debugger", "stopCycle": True, "crash": False, "dumps": [],
+               "heapDumpWatch": "2026-10-29T00:00:00Z WATCH exe=C:\\x\\ DEBUGGER_ATTACHED pid=7\\MLVApp.exe\n2026-10-29T00:00:01Z ATTACH_FAILED err=5"}
+        legacy = {k: v for k, v in rec.items() if k != "watch"}
+        g = self.account([rec, legacy])["groups"]
+        self.assertEqual((g["attached"]["legs"], g["captureNotVerified"]["legs"]), (0, 2))
+
+    def test_heap_dump_soak_accounting_flags_are_true_only_as_json_booleans(self) -> None:
+        # r10 (adversary r10 A3): the string "false", whitespace and {} are PowerShell-truthy and must not switch a group, a stop cycle or a crash on
+        leg = {"status": "RAN", "name": "F", "arm": "FIX-W", "watch": "debugger", "captureState": "ATTACHED_NO_CRASH", "dumps": []}
+        stringy = dict(leg, pageHeap="false", stopCycle="false", crash="false")
+        wordy = dict(leg, name="G", pageHeap=" ", stopCycle={}, crash=" ")
+        bare = {"status": "RAN", "name": "H", "arm": "UN-W", "stopCycle": True, "crash": False, "dumps": [], "heapCorruptionDump": "false"}
+        g = self.account([stringy, wordy, bare])["groups"]
+        self.assertEqual((g["pageheap"]["legs"], g["attached"]["legs"], g["unattached"]["legs"], g["captureNotVerified"]["legs"]), (0, 2, 1, 0))
+        self.assertEqual((g["attached"]["stopCycles"], g["attached"]["crashes"], g["attached"]["stopCycleCrashes"]), (0, 0, 0))
+
+    def test_heap_dump_soak_accounting_counts_a_dump_only_when_an_entry_names_a_file(self) -> None:
+        # r10 (adversary r10 A4): dumps null, [null], "" and {} are not dumps; an entry that names one is
+        leg = {"status": "RAN", "arm": "FIX-W", "stopCycle": True, "crash": False, "watch": "debugger", "captureState": "ATTACHED_NO_CRASH"}
+        records = [dict(leg, name="D-null", dumps=None), dict(leg, name="D-listnull", dumps=[None]), dict(leg, name="D-empty", dumps=""),
+                   dict(leg, name="D-obj", dumps={}), dict(leg, name="D-none", dumps=[]),
+                   dict(leg, name="D-real", dumps=[{"name": "MLVApp_1_20261015T000000.dmp", "bytes": 5}])]
+        g = self.account(records)["groups"]
+        self.assertEqual((g["attached"]["legs"], g["attached"]["dumps"]), (6, 1))
 
     def test_heap_dump_soak_accounting_binomial_does_not_underflow_at_large_n(self) -> None:
         # r8 (adversary r8 A5): 0.5^2000 underflows a double; P(X <= 1000 | n=2000, p=0.5) is 0.5089..., never 0

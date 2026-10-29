@@ -20,9 +20,12 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
+# r10 (adversary r10 A3): a flag is true only as a JSON boolean true; the string 'false', whitespace and {} are PowerShell-truthy and never switch a leg group, a stop cycle or a crash on
+function Test-JsonTrue($v) { ($v -is [bool]) -and $v }
+
 function Get-SoakCaptureClass($r) {
     $p = $r.PSObject.Properties
-    $pageHeap = ($null -ne $p['pageHeap']) -and [bool]$r.pageHeap
+    $pageHeap = ($null -ne $p['pageHeap']) -and (Test-JsonTrue $r.pageHeap)
     $watchNone = ($null -ne $p['watch']) -and ([string]$r.watch -ceq 'none')
     if ($null -ne $p['captureState'] -and -not $watchNone) {
         $verified = ([string]$r.captureState -cin @('ATTACHED_NO_CRASH', 'DUMPED'))
@@ -32,11 +35,13 @@ function Get-SoakCaptureClass($r) {
     if ($watchNone) { return $(if ($pageHeap) { 'pageheap' } else { 'unattached' }) }
     if ($null -ne $p['heapDumpWatch']) {
         # r8 (adversary A4): a verified legacy attach keeps a page-heap leg in pageheap, as the typed branch does
-        if ([string]$r.heapDumpWatch -notmatch 'DEBUGGER_ATTACHED pid=\d+') { return 'captureNotVerified' }
+        # r10 (adversary r10 A2): the event is the token right after a log line's timestamp, never text inside another line (the WATCH line carries the exe path)
+        $logLines = [regex]::Split([string]$r.heapDumpWatch, '\r?\n| \| ')
+        if (@($logLines | Where-Object { $_ -cmatch '^\S+ DEBUGGER_ATTACHED pid=\d+(\s|$)' }).Count -eq 0) { return 'captureNotVerified' }
         return $(if ($pageHeap) { 'pageheap' } else { 'attached' })
     }
     # r8 (CoS Iverson #432 item 2): a record that names a debugger watch but carries no capture evidence is not verified, never unattached
-    if (($null -ne $p['watch']) -or (($null -ne $p['heapCorruptionDump']) -and [bool]$r.heapCorruptionDump)) { return 'captureNotVerified' }
+    if (($null -ne $p['watch']) -or (($null -ne $p['heapCorruptionDump']) -and (Test-JsonTrue $r.heapCorruptionDump))) { return 'captureNotVerified' }
     return $(if ($pageHeap) { 'pageheap' } else { 'unattached' })
 }
 
@@ -75,12 +80,13 @@ foreach ($file in $LegsJsonl) {
         if ([string]$r.status -cne 'RAN') { $notRun += $name; continue }
         $g = $groups[(Get-SoakCaptureClass $r)]
         $g.legs++
-        $stopCycle = ($null -ne $r.PSObject.Properties['stopCycle']) -and [bool]$r.stopCycle
+        $stopCycle = ($null -ne $r.PSObject.Properties['stopCycle']) -and (Test-JsonTrue $r.stopCycle)
         if ($stopCycle) { $g.stopCycles++ }
-        $crash = ($null -ne $r.PSObject.Properties['crash']) -and [bool]$r.crash
+        $crash = ($null -ne $r.PSObject.Properties['crash']) -and (Test-JsonTrue $r.crash)
         if ($crash) { $g.crashes++ }
         if ($crash -and $stopCycle) { $g.stopCycleCrashes++ }
-        if ($null -ne $r.PSObject.Properties['dumps'] -and @($r.dumps).Count -gt 0) { $g.dumps++ }
+        # r10 (adversary r10 A4): a dump is an entry that names a file; null, "" and {} entries are not dumps
+        if ($null -ne $r.PSObject.Properties['dumps'] -and @(@($r.dumps) | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['name'] -and -not [string]::IsNullOrWhiteSpace([string]$_.name) }).Count -gt 0) { $g.dumps++ }
         $arm = [string]$r.arm
         if (-not $g.arms.Contains($arm)) { $g.arms[$arm] = [ordered]@{ legs = 0; crashes = 0 } }
         $g.arms[$arm].legs++

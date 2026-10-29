@@ -488,7 +488,8 @@ try {
         # PLAYBACK-SCOPES-OPTION-1 r4: the app's playback scopes mode (a scope leg on a Hide-default build must pin it), for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scopesDuringPlayback']) { $gen['ScopesDuringPlayback'] = [string]$spec.generatorArgs.scopesDuringPlayback }
         # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a debugger watcher keeps one full dump of the app's first heap-corruption exception, for any leg.
-        if ($spec.generatorArgs.PSObject.Properties['heapCorruptionDump'] -and [bool]$spec.generatorArgs.heapCorruptionDump) { $gen['HeapCorruptionDump'] = $true }
+        # r10 (adversary r10 A3): only a JSON boolean true arms it; the string "false", whitespace and {} are PowerShell-truthy and never do.
+        if ($spec.generatorArgs.PSObject.Properties['heapCorruptionDump'] -and $spec.generatorArgs.heapCorruptionDump -is [bool] -and $spec.generatorArgs.heapCorruptionDump) { $gen['HeapCorruptionDump'] = $true }
         # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a SPEED leg may force Look Assist (a capture-free pace leg: no contact-sheet grab in the timed Play).
         if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist) {
             $gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true
@@ -960,7 +961,7 @@ if ($outcome -in @('PASS', 'FAIL') -and $selfHealLaunches.Count -gt 0) {
 # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r7: a leg that asked for the heap-corruption debugger watch carries its typed capture (Stop-AttrCudaHeapDumpWatch's
 # captureState, from the job's own heap-dump.json). Only ATTACHED_NO_CRASH and DUMPED are a verified capture; any other state -- or no record at all, or a
 # DUMPED record whose dump did not come back -- turns a PASS, FAIL or INVALID into HEAPDUMP_CAPTURE_FAILED, the earlier result kept in the detail.
-$heapDumpRequested = ($null -ne $spec.PSObject.Properties['generatorArgs']) -and ($null -ne $spec.generatorArgs.PSObject.Properties['heapCorruptionDump']) -and [bool]$spec.generatorArgs.heapCorruptionDump
+$heapDumpRequested = ($null -ne $spec.PSObject.Properties['generatorArgs']) -and ($null -ne $spec.generatorArgs.PSObject.Properties['heapCorruptionDump']) -and ($spec.generatorArgs.heapCorruptionDump -is [bool]) -and $spec.generatorArgs.heapCorruptionDump
 if ($heapDumpRequested) {
     $heapRecord = $null
     $heapRecordPath = Join-Path $evidenceDir 'heapdump\heap-dump.json'

@@ -2494,6 +2494,39 @@ function Test-DvReceiptValid {
             elseif ($null -ne $storedWorkerThreads) { $invalid.Add('WORKER_THREADS_NOT_FROM_EVIDENCE: the receipt carries a workerThreads block but its committed leg spec names no playbackMaxThreads') }
         }
 
+        # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r10 (adversary r10 A9): a PASS/FAIL for a leg that asked for the heap-corruption debugger is valid only with a
+        # verified capture, and a DUMPED capture only with its dump still on disk in the evidence, non-empty, a minidump, under the hash the receipt recorded.
+        # The writer enforces this once (Invoke-VenueLeg.ps1); a reader and the writer's own callers must not trust that it did.
+        $storedHeap = Get-DvProp $Receipt 'heapDump'
+        $specAsksHeap = ($null -ne $spec) -and ($null -ne $spec.PSObject.Properties['generatorArgs']) -and ($null -ne $spec.generatorArgs.PSObject.Properties['heapCorruptionDump']) -and ($spec.generatorArgs.heapCorruptionDump -is [bool]) -and $spec.generatorArgs.heapCorruptionDump
+        $receiptAsksHeap = ($null -ne $storedHeap) -and ((Get-DvProp $storedHeap 'requested') -is [bool]) -and (Get-DvProp $storedHeap 'requested')
+        if ($specAsksHeap -or $receiptAsksHeap) {
+            if ($null -eq $storedHeap) { $invalid.Add('HEAPDUMP_RECORD_ABSENT: the leg asked for the heap-corruption debugger and the receipt carries no heapDump block') }
+            else {
+                $heapState = [string](Get-DvProp $storedHeap 'captureState')
+                $heapVerified = Get-DvProp $storedHeap 'captureVerified'
+                if (($heapVerified -isnot [bool]) -or -not $heapVerified -or $heapState -cnotin @('ATTACHED_NO_CRASH', 'DUMPED')) {
+                    $invalid.Add("HEAPDUMP_CAPTURE_NOT_VERIFIED: the leg asked for the heap-corruption debugger and the receipt's capture is '$heapState' (verified: $heapVerified); a PASS/FAIL without a verified capture is no signal")
+                }
+                elseif ($heapState -ceq 'DUMPED') {
+                    $dumpOnDisk = $false
+                    $heapDumps = Get-DvProp $storedHeap 'dumps'
+                    foreach ($dmp in @($heapDumps)) {
+                        if ($null -eq $dmp) { continue }
+                        $dmpName = [IO.Path]::GetFileName([string](Get-DvProp $dmp 'name'))
+                        $dmpPath = $(if ($dmpName -like '*.dmp') { Join-Path $ev.dir ('heapdump\' + $dmpName) } else { '' })
+                        if (-not $dmpPath -or -not (Test-Path -LiteralPath $dmpPath -PathType Leaf) -or (Get-Item -LiteralPath $dmpPath).Length -le 0) { continue }
+                        if ((Get-DvSha256OfFile $dmpPath) -cne [string](Get-DvProp $dmp 'sha256')) { continue }
+                        $dmpHead = [byte[]]::new(4); $dmpRead = 0
+                        $dmpStream = [IO.File]::OpenRead($dmpPath)
+                        try { while ($dmpRead -lt 4) { $dmpN = $dmpStream.Read($dmpHead, $dmpRead, 4 - $dmpRead); if ($dmpN -le 0) { break }; $dmpRead += $dmpN } } finally { $dmpStream.Dispose() }
+                        if ($dmpRead -eq 4 -and [Text.Encoding]::ASCII.GetString($dmpHead) -ceq 'MDMP') { $dumpOnDisk = $true; break }
+                    }
+                    if (-not $dumpOnDisk) { $invalid.Add('HEAPDUMP_DUMP_NOT_IN_EVIDENCE: the receipt says DUMPED but no heapdump\*.dmp in the evidence is a non-empty minidump under the sha256 the receipt recorded') }
+                }
+            }
+        }
+
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
         $resolved = $null
         if ($null -ne $exit) {

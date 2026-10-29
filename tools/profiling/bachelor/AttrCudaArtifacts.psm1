@@ -2520,6 +2520,7 @@ function Start-AttrCudaHeapDumpWatch {
             [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenThread(uint access, bool inherit, uint tid);
             [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetThreadContext(IntPtr thread, IntPtr context);
             [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr handle);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetProcessTimes(IntPtr process, out long creation, out long exit, out long kernel, out long user);
             [DllImport("dbghelp.dll", SetLastError = true)] static extern bool MiniDumpWriteDump(IntPtr process, uint pid, IntPtr file, uint type, IntPtr exceptionParam, IntPtr userStream, IntPtr callback);
             const uint DBG_CONTINUE = 0x00010002;
             const uint DBG_EXCEPTION_NOT_HANDLED = 0x80010001;
@@ -2533,9 +2534,15 @@ function Start-AttrCudaHeapDumpWatch {
                 try { File.AppendAllText(path, DateTime.UtcNow.ToString("o") + " " + message + Environment.NewLine); } catch (Exception) { }
             }
 
-            public static int Run(uint pid, string dumpPath, uint dumpType, string logPath) {
+            // r10 (adversary r10 A5): expectedCreationFileTime is the creation time (FILETIME, UTC) of the process the watcher selected. The handle just opened must
+            // report the same creation time (within 2 s: the selection carries WMI's microsecond resolution), so a pid recycled since the selection is never debugged.
+            public static int Run(uint pid, string dumpPath, uint dumpType, string logPath, long expectedCreationFileTime) {
                 IntPtr process = OpenProcess(0x1F0FFF, false, pid);
                 if (process == IntPtr.Zero) { Log(logPath, "OPEN_PROCESS_FAILED err=" + Marshal.GetLastWin32Error()); return 2; }
+                long created, exited, kernelTime, userTime;
+                if (!GetProcessTimes(process, out created, out exited, out kernelTime, out userTime) || Math.Abs(created - expectedCreationFileTime) > 20000000L) {
+                    Log(logPath, "TARGET_IDENTITY_MISMATCH pid=" + pid); CloseHandle(process); return 6;
+                }
                 if (!DebugActiveProcess(pid)) { Log(logPath, "ATTACH_FAILED err=" + Marshal.GetLastWin32Error()); CloseHandle(process); return 2; }
                 DebugSetProcessKillOnExit(false);
                 Log(logPath, "DEBUGGER_ATTACHED pid=" + pid);
@@ -2642,9 +2649,13 @@ function Start-AttrCudaHeapDumpWatch {
             '$clock = [Diagnostics.Stopwatch]::StartNew()'
             '$log = Join-Path $dumpDir ''watcher.log'''
             'function W([string]$m) { Add-Content -LiteralPath $log -Value ([DateTime]::UtcNow.ToString(''o'') + '' '' + $m) }'
+            # r10 (adversary r10 A6): the budget still left, in whole seconds and never below 1; every CIM query below is bounded by it, so a stalled query cannot outlive MaxWaitSec
+            'function Left { [int][Math]::Max(1, [Math]::Ceiling($maxWaitSec - $clock.Elapsed.TotalSeconds)) }'
+            # r10 (adversary r10 A1): --help is refused only as a whole argument of the command line: split into quoted and unquoted tokens, so text inside a quoted path never counts
+            'function HasHelpArg([string]$cl) { foreach ($m in [regex]::Matches($cl, ''"[^"]*"|\S+'')) { if ($m.Value.Trim(''"'') -ieq ''--help'') { return $true } }; return $false }'
             # r9 pass 1 (A1): this run's instance descends from the process that asked for the watch (the job; the smoke runner it starts launches
             # MLVApp). Each parent link must be created no later than its child, so a recycled parent pid never counts.
-            'function Owned($p) { $c = $p; for ($i = 0; $i -lt 8 -and $null -ne $c; $i++) { if ([int]$c.ParentProcessId -eq $ownerPid) { return $true }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$c.ParentProcessId) -ErrorAction SilentlyContinue; if ($null -eq $n -or -not $n.CreationDate -or -not $c.CreationDate -or $n.CreationDate -gt $c.CreationDate) { return $false }; $c = $n }; return $false }'
+            'function Owned($p) { $c = $p; for ($i = 0; $i -lt 8 -and $null -ne $c; $i++) { if ([int]$c.ParentProcessId -eq $ownerPid) { return $true }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$c.ParentProcessId) -OperationTimeoutSec (Left) -ErrorAction SilentlyContinue; if ($null -eq $n -or -not $n.CreationDate -or -not $c.CreationDate -or $n.CreationDate -gt $c.CreationDate) { return $false }; $c = $n }; return $false }'
             'W (''WATCH exe='' + $exeFull + '' notBefore='' + $notBefore.ToString(''o'') + '' owner='' + $ownerPid + '' match='' + $match + '' pid='' + $PID)'
             '$source = @'''
             $debuggerSource
@@ -2652,14 +2663,16 @@ function Start-AttrCudaHeapDumpWatch {
             'try { Add-Type -TypeDefinition $source -Language CSharp } catch { W (''COMPILE_FAILED '' + $_.Exception.Message); exit 5 }'
             '$target = $null'
             'while ($null -eq $target -and $clock.Elapsed.TotalSeconds -lt $maxWaitSec) {'
-            # r9 pass 1 (A2): --help is excluded only as a whole argument, never as a substring of a directory or file name
-            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and $_.CommandLine -notmatch ''(?:^|[\s"''''])--help(?:$|[\s"''''])'' -and $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $exeFull, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $notBefore -and (Owned $_) } | Sort-Object CreationDate) | Select-Object -First 1'
+            # r9 pass 1 (A2): --help is excluded only as a whole argument, never as a substring of a directory or file name (r10: tokenised, see HasHelpArg)
+            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -OperationTimeoutSec (Left) -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and -not (HasHelpArg $_.CommandLine) -and $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $exeFull, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $notBefore -and (Owned $_) } | Sort-Object CreationDate) | Select-Object -First 1'
             '    if ($null -eq $target) { Start-Sleep -Milliseconds 200 }'
             '}'
+            '# r10 (adversary r10 A6): a target that only turned up after the budget was spent is not attached'
+            'if ($null -ne $target -and $clock.Elapsed.TotalSeconds -gt $maxWaitSec) { $target = $null }'
             'if ($null -eq $target) { W ''NO_TARGET the smoke instance never appeared''; exit 3 }'
             'W (''ATTACH pid='' + $target.ProcessId)'
             '$dumpPath = Join-Path $dumpDir ([IO.Path]::GetFileNameWithoutExtension($exeName) + ''_'' + $target.ProcessId + ''_'' + [DateTime]::UtcNow.ToString(''yyyyMMddTHHmmss'') + ''.dmp'')'
-            '$rc = [MlvHeapDumpWatch.Debugger]::Run([uint32]$target.ProcessId, $dumpPath, $dumpType, $log)'
+            '$rc = [MlvHeapDumpWatch.Debugger]::Run([uint32]$target.ProcessId, $dumpPath, $dumpType, $log, [long]$target.CreationDate.ToUniversalTime().ToFileTimeUtc())'
             'W (''DEBUGGER_EXIT rc='' + $rc)'
             'exit $rc'
         ) -join "`n"
