@@ -2325,6 +2325,16 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
             $keyList = @($Report.PSBase.Keys)
             $valueList = @($Report.PSBase.Values)
             $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::Ordinal) })
+            # r7 (adversary A2 on 0805902c): a dictionary that exposes its comparer (Dictionary, ConcurrentDictionary, SortedDictionary) is asked which key it matched; one that does not,
+            # or whose comparer cannot answer, falls through to the value and OrdinalIgnoreCase steps
+            $comparerProperty = $Report.PSObject.Properties['Comparer']
+            $comparer = if ($null -ne $comparerProperty) { $comparerProperty.Value } else { $null }
+            if ($named.Count -eq 0 -and $null -ne $comparer) {
+                try {
+                    if ($comparer -is [System.Collections.IEqualityComparer] -or $comparer -is [System.Collections.Generic.IEqualityComparer[string]]) { $named = @($keyList | Where-Object { $_ -is [string] -and $comparer.Equals($_, 'reason') }) }
+                    elseif ($comparer -is [System.Collections.IComparer] -or $comparer -is [System.Collections.Generic.IComparer[string]]) { $named = @($keyList | Where-Object { $_ -is [string] -and $comparer.Compare($_, 'reason') -eq 0 }) }
+                } catch { $named = @() }
+            }
             if ($named.Count -eq 0) { $named = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $current, [StringComparison]::Ordinal)) { $keyList[$index] } }) }
             if ($named.Count -ne 1) { $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::OrdinalIgnoreCase) }) }
             if ($named.Count -gt 0) { $reasonKey = $named[0] }
@@ -2398,6 +2408,16 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
             $keyList = @($Report.PSBase.Keys)
             $valueList = @($Report.PSBase.Values)
             $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::Ordinal) })
+            # r7 (adversary A2 on 0805902c): a dictionary that exposes its comparer (Dictionary, ConcurrentDictionary, SortedDictionary) is asked which key it matched; one that does not,
+            # or whose comparer cannot answer, falls through to the value and OrdinalIgnoreCase steps
+            $comparerProperty = $Report.PSObject.Properties['Comparer']
+            $comparer = if ($null -ne $comparerProperty) { $comparerProperty.Value } else { $null }
+            if ($named.Count -eq 0 -and $null -ne $comparer) {
+                try {
+                    if ($comparer -is [System.Collections.IEqualityComparer] -or $comparer -is [System.Collections.Generic.IEqualityComparer[string]]) { $named = @($keyList | Where-Object { $_ -is [string] -and $comparer.Equals($_, 'reason') }) }
+                    elseif ($comparer -is [System.Collections.IComparer] -or $comparer -is [System.Collections.Generic.IComparer[string]]) { $named = @($keyList | Where-Object { $_ -is [string] -and $comparer.Compare($_, 'reason') -eq 0 }) }
+                } catch { $named = @() }
+            }
             if ($named.Count -eq 0) { $named = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $current, [StringComparison]::Ordinal)) { $keyList[$index] } }) }
             if ($named.Count -ne 1) { $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::OrdinalIgnoreCase) }) }
             if ($named.Count -gt 0) { $reasonKey = $named[0] }

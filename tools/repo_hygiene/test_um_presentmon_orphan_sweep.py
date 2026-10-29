@@ -501,6 +501,17 @@ class ModuleFunctionTests(unittest.TestCase):
                                     f"$report.Add('{ps_key}', 'missing'); $report.Add('status', 'S')\n$r = {self.HELPERS[helper]}\n" + self.TAGGED)
                     self.assertEqual(sorted(got["entries"]), sorted([f"String:{key}={self.APPENDED[helper]}", "String:status=S"]))
 
+    def test_r7_b_a2_the_comparer_names_the_reason_key_when_its_text_is_ambiguous(self) -> None:
+        # adversary A2 on 0805902c: `status` holds the same text as the culture-matched `rea<U+00AD>son`, so the value step was ambiguous and the OrdinalIgnoreCase step found nothing:
+        # a fourth entry was added. The report's own comparer names the key now (Dictionary's Comparer, and SortedDictionary's IComparer)
+        for kind, ctor in (("Dictionary", "[System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::InvariantCultureIgnoreCase)"),
+                           ("SortedDictionary", "[System.Collections.Generic.SortedDictionary[string,object]]::new([StringComparer]::InvariantCultureIgnoreCase)")):
+            for helper in self.HELPERS:
+                with self.subTest(kind=kind, helper=helper):
+                    got = self.call(f"$report = {ctor}\n$report.Add('rea' + [char]0xAD + 'son', 'missing'); $report.Add('status', 'missing'); $report.Add('', 'keep')\n"
+                                    f"$r = {self.HELPERS[helper]}\n" + self.TAGGED)
+                    self.assertEqual(sorted(got["entries"]), sorted([f"String:rea<AD>son={self.APPENDED[helper]}", "String:status=missing", "String:=keep"]))
+
     def test_mutation_the_property_only_copy_loses_a_dictionary_reports_fields_again(self) -> None:
         module = MODULE.read_text(encoding="utf-8")
         branch = ("    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }\n"
@@ -1040,6 +1051,12 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
     def test_r7_a1_a_process_row_whose_name_differs_only_by_a_soft_hyphen_is_another_process(self) -> None:
         detail, _d = self.h3("r7-a1-shy-row", processes=((7001, self.SHY_CHILD, 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)))
         self.assertEqual(detail.get("identityError"), "process_row_name_changed")
+
+    def test_r7_b_a1_a_creation_stamp_after_now_is_no_order_evidence(self) -> None:
+        # adversary A1 on 0805902c: the child started 10:01Z, the clock stepped back, and an unrelated Intel service reused the parent pid at 09:01Z -- it reads earlier than the child. The
+        # child's stamp is later than now (the step is visible), so the order is no evidence (the stamps are set in the future here to stand for "now is before the child's stamp")
+        detail, _d = self.h3("r7-b-a1-clock-step", processes=((7001, "PresentMonService", 900, "2099-01-01T10:01:00Z"), (900, "IntelGraphicsSoftware.Service.exe", 4, "2099-01-01T09:01:00Z")))
+        self.assertEqual((detail.get("parentPid"), detail.get("identityError")), (900, "creation_instant_after_now"))
 
     def test_r7_a1_control_the_exact_pair_is_still_recognised(self) -> None:
         code, sweep, d, out = self.run_start("r7-a1-control", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)

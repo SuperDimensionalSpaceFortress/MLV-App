@@ -228,6 +228,9 @@ _allow("Get-AttrCudaFileSha256Blocks",
 _allow("Get-AttrCudaPresentMonEventsLost",
        "reads the head and tail of PresentMon's stderr (File.Open Open/Read/ReadWrite-share); the byte buffers are in memory",
        ("R1", "New-Object byte[]", 2), ("R4", "IO.File::Open", 1))
+for _name in ("Add-AttrCudaPresentMonEventsLostDetailToReport", "Add-AttrCudaPresentMonOrphanSweepDetailToReport"):
+    _allow(_name, "asks the report dictionary's own key comparer (its public Comparer) which key it matched for `reason`; pure in-memory comparison, read-only",
+           ("R4", ".Equals()", 1), ("R4", ".Compare()", 1))
 _allow("Open-AttrCudaReadOnlyHandle",
        "File.Open with FileMode.Open / FileAccess.Read / FileShare.Read: the read-only pin on an owner original; it cannot write",
        ("R4", "IO.File::Open", 1))

@@ -1682,6 +1682,10 @@ function Get-PresentMonParentIdentity([int]$ProcessId, [string]$Name, $Started =
             if ($stamp -is [DateTimeOffset]) { $instants += $stamp.UtcDateTime }
             else { $instants += ([datetime]$stamp).ToUniversalTime() }
         }
+        # r7 (adversary A1 on 0805902c): the stamps are wall-clock, so a stamp later than now means the clock stepped back since that process started -- a parent pid reused after the
+        # step can then read EARLIER than the child -- and their order is no evidence (fail closed)
+        $nowUtc = (Get-Date).ToUniversalTime()
+        if ($instants[0] -gt $nowUtc -or $instants[1] -gt $nowUtc) { $result['identityError'] = 'creation_instant_after_now'; return $result }
         if ($instants[1] -gt $instants[0]) { $result['identityError'] = 'parent_started_after_child'; return $result }
         if (Test-PresentMonIdentityText $result.parentName 'IntelGraphicsSoftware.Service.exe') { $result['nonCaptureIdentity'] = 'intel_graphics_presentmonservice' }
         else { $result['identityError'] = 'parent_not_intel_graphics_service' }
