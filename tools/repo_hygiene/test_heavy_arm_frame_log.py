@@ -326,6 +326,13 @@ class CpuReceiptLegRunsProcessed8(unittest.TestCase):
                 (False, "PROCESSED8_ROUTE_SUMMARY_MISSING", None, None)),
             "a whole key that merely ends the same way is a different key and is ignored": (
                 [failing + " xprocessed8_measured_frames=600"], refused),
+            # adversary r7 A1 (advisory, same class): the line selector is a token too, so a `not-playback_smoke...` event is no cache-summary event
+            "an event name with a not- prefix is no cache summary (adversary r7 A1)": (
+                ["[2026-10-29T12:00:00.000Z] [INFO] [0x1] " + failing,
+                 "[2026-10-29T12:00:00.000Z] [INFO] [0x1] not-playback_smoke.processed8_cache_summary session=7 processed8_measured_frames=600 processed16_measured_frames=600"],
+                refused),
+            "a real event after a log prefix is still read": (
+                ["[2026-10-29T12:00:00.000Z] [INFO] [0x1] " + cache_summary_line("7", "600", "600")], (True, "NONE", 600, 600)),
         }
         for name, (lines, (taken, reason, p8, p16)) in cases.items():
             with self.subTest(case=name):

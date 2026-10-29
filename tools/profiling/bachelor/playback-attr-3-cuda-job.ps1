@@ -5593,7 +5593,7 @@ function Get-AttrCpuProcessed8Route([string]$RawLog, [string]$MeasuredSessionId)
     # at all) is no evidence for this session and never replaces its counters.
     $last = $null
     foreach ($line in ($RawLog -split "`r?`n")) {
-        if ($line -notmatch 'playback_smoke\.processed8_cache_summary ') { continue }
+        if ($line -notmatch '(?<!\S)playback_smoke\.processed8_cache_summary ') { continue }
         $values = @{}
         # A key is a whole token (sol r6): it starts at the line start or after whitespace, so the tail of `not-session=7` is not `session=7`.
         foreach ($match in [regex]::Matches($line, '(?<!\S)(?<key>[A-Za-z0-9_]+)=(?<value>\S+)')) { $values[$match.Groups['key'].Value] = $match.Groups['value'].Value }
