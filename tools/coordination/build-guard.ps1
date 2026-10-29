@@ -1192,50 +1192,55 @@ function Invoke-BuildGuard {
     # deletes became successful WhatIf no-ops and the holder kept the machine slot. So the guard's own values are set again
     # after the action, before any release, and the caller's come back last, once both slots are given back. Both are
     # dot-sourced (they assign in the scope that runs them) and are plain assignments, never a cmdlet (r10, a2bdda36-A2).
+    # Neither ever throws (r11 adversary 08736d55-A2): a variable the action made ReadOnly or Constant is skipped, never a
+    # throw before a release; every release write also passes -WhatIf:$false -Confirm:$false itself. The guard's values are
+    # set inside the try whose finally gives the caller's back, so no throw after them leaves them (08736d55-A1).
     $callerDefaults = $PSDefaultParameterValues
     $callerPrefs = @{ VerbosePreference = $VerbosePreference; DebugPreference = $DebugPreference; WarningPreference = $WarningPreference
         InformationPreference = $InformationPreference; WhatIfPreference = $WhatIfPreference; ConfirmPreference = $ConfirmPreference }
     $guardPrefs = {
+        trap { continue }
         $PSDefaultParameterValues = @{}
         $VerbosePreference = 'SilentlyContinue'; $DebugPreference = 'SilentlyContinue'
         $WarningPreference = 'SilentlyContinue'; $InformationPreference = 'SilentlyContinue'
         $WhatIfPreference = $false; $ConfirmPreference = 'None'
     }
     $callerPrefsBack = {
+        trap { continue }
         $VerbosePreference = $callerPrefs.VerbosePreference; $DebugPreference = $callerPrefs.DebugPreference
         $WarningPreference = $callerPrefs.WarningPreference; $InformationPreference = $callerPrefs.InformationPreference
         $WhatIfPreference = $callerPrefs.WhatIfPreference; $ConfirmPreference = $callerPrefs.ConfirmPreference
         $PSDefaultParameterValues = $callerDefaults
-    }
-    . $guardPrefs
-    $o = @{}
-    foreach ($k in $script:BuildGuardDefaults.Keys) { $o[$k] = $script:BuildGuardDefaults[$k] }
-    foreach ($k in $Options.Keys) { $o[$k] = $Options[$k] }
-    $exempt = Get-BuildGuardExemptReason $ExemptReason
-    if (-not $exempt) { $exempt = Get-BuildGuardExemptReason $env:MLV_BUILD_GUARD_EXEMPT }
-    if ($exempt) {
-        $line = 'BUILD_GUARD_EXEMPT label={0} reason={1} utc={2} pid={3}' -f $Label, $exempt, [DateTime]::UtcNow.ToString('o'), $PID
-        Write-BuildGuardLog $line
-        try {
-            # Through the one resolver (r9): a log path that cannot be used is logged, never an error record.
-            $log = Resolve-BuildGuardPath $o.ExemptLogPath -NeedParent
-            if ($log.Why) { throw $log.Why }
-            $why = New-BuildGuardDirectory $log.Parent
-            if ($why) { throw $why }
-            Add-BuildGuardLogLine -Path $log.Full -Line $line -Encoding ([Text.Encoding]::ASCII)
-        } catch { Write-BuildGuardLog "exemption log not written: $($_.Exception.Message)" }
     }
     # The machine heavy slot is the OUTERMOST lock of a build: the memory floor and the build slot below nest inside it,
     # and the outer finally gives it back on every way out, a throw a Library caller catches included (adversary A2).
     $heavy = $null
     # Set only on the line before the action runs: a release reached before it never reports a loss "during" it (r10).
     $actionStarted = $false
-    if ($NoSlot) {
-        # -NoSlot is for a caller that builds nothing (-PrintJobs): it takes neither slot, so the bypass is a typed line a
-        # receipt can classify, never a silent one (r4 adversary A1).
-        Write-BuildGuardLog ('BUILD_GUARD_NO_SLOT label={0} reason=-NoSlot: no machine heavy slot and no build slot taken; for callers that build nothing' -f $Label)
-    }
     try {
+        . $guardPrefs
+        $o = @{}
+        foreach ($k in $script:BuildGuardDefaults.Keys) { $o[$k] = $script:BuildGuardDefaults[$k] }
+        foreach ($k in $Options.Keys) { $o[$k] = $Options[$k] }
+        $exempt = Get-BuildGuardExemptReason $ExemptReason
+        if (-not $exempt) { $exempt = Get-BuildGuardExemptReason $env:MLV_BUILD_GUARD_EXEMPT }
+        if ($exempt) {
+            $line = 'BUILD_GUARD_EXEMPT label={0} reason={1} utc={2} pid={3}' -f $Label, $exempt, [DateTime]::UtcNow.ToString('o'), $PID
+            Write-BuildGuardLog $line
+            try {
+                # Through the one resolver (r9): a log path that cannot be used is logged, never an error record.
+                $log = Resolve-BuildGuardPath $o.ExemptLogPath -NeedParent
+                if ($log.Why) { throw $log.Why }
+                $why = New-BuildGuardDirectory $log.Parent
+                if ($why) { throw $why }
+                Add-BuildGuardLogLine -Path $log.Full -Line $line -Encoding ([Text.Encoding]::ASCII)
+            } catch { Write-BuildGuardLog "exemption log not written: $($_.Exception.Message)" }
+        }
+        if ($NoSlot) {
+            # -NoSlot is for a caller that builds nothing (-PrintJobs): it takes neither slot, so the bypass is a typed line a
+            # receipt can classify, never a silent one (r4 adversary A1).
+            Write-BuildGuardLog ('BUILD_GUARD_NO_SLOT label={0} reason=-NoSlot: no machine heavy slot and no build slot taken; for callers that build nothing' -f $Label)
+        }
         if (-not $NoSlot) {
             # The lock path is resolved once, before anything is taken, and every later use is the full path (r9, 2ab4b1b6-A1):
             # one that cannot be is a typed refusal here, never a throw the host renders past the bounded writer.

@@ -2586,6 +2586,60 @@ def test_an_allscope_caller_preference_never_suppresses_the_release(box, setup, 
     assert _stub_calls(box)[0]["childEnd"]
 
 
+# r11 adversary 08736d55-A1: the guard's values were set before the try whose finally gives the caller's back, so a throw in
+# between (strict mode reading -Options $null) left an AllScope caller value overwritten. The throw still reaches the caller.
+@pytest.mark.parametrize("setup, after", [
+    ("Set-Variable -Name WhatIfPreference -Option AllScope -Value $true", "whatif=True"),
+    ("Set-Variable -Name PSDefaultParameterValues -Option AllScope -Value @{ 'Set-Content:WhatIf' = $true }",
+     "defaults=Set-Content:WhatIf"),
+], ids=["allscope-whatif", "allscope-defaults"])
+def test_a_throw_before_the_slots_gives_an_allscope_caller_value_back(box, setup, after) -> None:
+    done = _library_driver(
+        box,
+        "Set-StrictMode -Version Latest\n" + setup + "\n"
+        "try { Invoke-BuildGuard -NoSlot -Label 'build' -Options $null -Action { 'ACTION' } } "
+        "catch { Write-Output \"caught=$($_.FullyQualifiedErrorId)\" }\n"
+        "Write-Output \"after whatif=$WhatIfPreference defaults=$(@($PSDefaultParameterValues.Keys) -join ',')\"\n",
+        str(box["lock"]),
+    )
+    out = done.stdout + done.stderr
+    assert "caught=" in done.stdout, out
+    assert "ACTION" not in done.stdout, out
+    after_line = next((line for line in done.stdout.splitlines() if line.startswith("after ")), "")
+    assert after in after_line, f"the caller's own value is back after the throw: {after_line!r}\n{out}"
+
+
+# r11 adversary 08736d55-A2: an action that makes an AllScope preference ReadOnly made the guard's own values throw when they
+# were set again after the action, before the build-slot release and before the heavy-slot release: neither ran. A value that
+# cannot be written is now skipped, and a ReadOnly WhatIf left at $true cannot stop a release either (every release write
+# passes -WhatIf:$false itself).
+@pytest.mark.parametrize("locked", ["$false", "$true"], ids=["readonly-false", "readonly-true"])
+def test_an_action_that_locks_an_allscope_preference_never_skips_a_release(box, locked) -> None:
+    done = _library_driver(
+        box,
+        "$ErrorActionPreference = 'Stop'\n"
+        "Set-Variable -Name WhatIfPreference -Option AllScope -Value $false\n"
+        "try { $r = Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        f"    Set-Variable -Name WhatIfPreference -Option AllScope,ReadOnly -Value {locked} -Force; Write-Output \"built=$Jobs\" }}\n"
+        "    Write-Output $r } catch { Write-Output \"caught=$($_.FullyQualifiedErrorId)\" }\n",
+        str(box["lock"]),
+        host_tail=(
+            "$d = (Get-Date).AddSeconds(20)\n"
+            f"while (-not (Test-Path -LiteralPath '{box['dir'] / 'stub.log'}') -and (Get-Date) -lt $d) {{ Start-Sleep -Milliseconds 200 }}\n"
+            f"Write-Output \"released=$(Test-Path -LiteralPath '{box['dir'] / 'stub.log'}')\"\n"
+        ),
+    )
+    out = done.stdout + done.stderr
+    assert "built=4" in done.stdout, out
+    assert "caught=" not in done.stdout, out
+    assert "released=True" in done.stdout, out
+    assert "did not end within 60 s of release" not in out, out
+    assert "What if:" not in out, out
+    assert not box["lock"].exists(), "the build slot's lock is deleted on release"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == [], "every lease file is deleted on release"
+    assert _stub_calls(box)[0]["childEnd"]
+
+
 # r11 (sol r10 B2): the admission wait slept a whole -PollSeconds while it held the machine heavy slot, so PollSeconds=3600 with
 # DeadlineMinutes=0.01 asked for a one-hour sleep past a 0.6 s deadline. Every sleep is now at most what is left of the
 # deadline, on the memory wait and the local-slot-busy path alike, and the expired deadline gives the slot back and refuses.
