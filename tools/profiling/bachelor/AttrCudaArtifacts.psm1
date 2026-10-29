@@ -2652,7 +2652,7 @@ function Start-AttrCudaHeapDumpWatch {
             'try { Add-Type -TypeDefinition $source -Language CSharp } catch { W (''COMPILE_FAILED '' + $_.Exception.Message); exit 5 }'
             '$target = $null'
             'while ($null -eq $target -and $clock.Elapsed.TotalSeconds -lt $maxWaitSec) {'
-            # r9 pass 1 (A2): --help is excluded only as a whole argument, never as a substring of a directory or clip name
+            # r9 pass 1 (A2): --help is excluded only as a whole argument, never as a substring of a directory or file name
             '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and $_.CommandLine -notmatch ''(?:^|[\s"''''])--help(?:$|[\s"''''])'' -and $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $exeFull, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $notBefore -and (Owned $_) } | Sort-Object CreationDate) | Select-Object -First 1'
             '    if ($null -eq $target) { Start-Sleep -Milliseconds 200 }'
             '}'
