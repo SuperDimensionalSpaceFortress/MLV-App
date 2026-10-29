@@ -1168,6 +1168,16 @@ function Invoke-BuildGuard {
         [switch]$NoSlot,
         [hashtable]$Options = @{}
     )
+    # r9 (adversary 46f83a19-A1, A2): the guard's own cmdlets run with no caller parameter defaults (a caller's
+    # 'Get-Content:ErrorAction'='Continue' outranked every helper's Stop scope, so an error record reached the host) and no
+    # verbose, debug, warning or information records (-Verbose on the command line made the CIM probes write verbose records the
+    # host renders synchronously, past the bounded writers). Both are local to this call; the action gets the caller's back.
+    $callerDefaults = $PSDefaultParameterValues
+    $callerPrefs = @{ VerbosePreference = $VerbosePreference; DebugPreference = $DebugPreference; WarningPreference = $WarningPreference
+        InformationPreference = $InformationPreference }
+    $PSDefaultParameterValues = @{}
+    $VerbosePreference = 'SilentlyContinue'; $DebugPreference = 'SilentlyContinue'
+    $WarningPreference = 'SilentlyContinue'; $InformationPreference = 'SilentlyContinue'
     $o = @{}
     foreach ($k in $script:BuildGuardDefaults.Keys) { $o[$k] = $script:BuildGuardDefaults[$k] }
     foreach ($k in $Options.Keys) { $o[$k] = $Options[$k] }
@@ -1257,7 +1267,12 @@ function Invoke-BuildGuard {
                     Write-BuildGuardLog ('admitted label={0} jobs={1} reason={2} peers=[{3}] freePhysGB={4} freeCommitGB={5} slot={6}' -f $Label, $jobs, $choice.Reason, ($choice.Peers -join ','), $mem.PhysGB, $mem.CommitGB, $(if ($ticket) { 'held' } else { 'none' }))
                 }
             }
-            & $Action $jobs
+            & {
+                param($Jobs)
+                $PSDefaultParameterValues = $callerDefaults
+                foreach ($p in $callerPrefs.Keys) { Set-Variable -Name $p -Value $callerPrefs[$p] }
+                & $Action $Jobs
+            } $jobs
         } finally {
             Remove-BuildSlot $ticket
         }

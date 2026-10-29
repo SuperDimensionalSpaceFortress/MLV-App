@@ -2324,6 +2324,38 @@ def test_a_lease_dir_that_denies_new_files_fails_open_within_the_bound_under_an_
     assert not _stub_calls(box), "nothing is launched when the guard cannot make its log"
 
 
+def test_caller_parameter_defaults_never_make_a_guard_cmdlet_write_an_error_record(box) -> None:
+    # r9 adversary 46f83a19-A1: a caller's $PSDefaultParameterValues 'Get-Content:ErrorAction'='Continue' outranked the memory
+    # probe's Stop scope, so a missing probe file wrote an error record the host renders past the bounded writer. The guard's
+    # own cmdlets now run with no caller defaults; the action still gets them back.
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n$ErrorActionPreference = 'Continue'\n"
+                "$PSDefaultParameterValues = @{ 'Get-Content:ErrorAction' = 'Continue'; 'Get-Item:ErrorAction' = 'Continue' }\n"
+                f"$o = @{{ HeavySlotCmd = '{NO_HEAVY_SLOT}'; MemoryProbeFile = '{box['dir'] / 'no-such-memory.json'}'; "
+                f"ProcessTableFile = '{box['dir'] / 'no-such-table.json'}'; LockPath = '{box['lock']}'; "
+                f"MutexName = 'Local\\MLV-R9-DEFAULTS-{os.getpid()}'; ExemptLogPath = '{box['exempt_log']}' }}\n"
+                "$b = @(Invoke-BuildGuard -Label t -ExemptReason 'r9 test' -Options $o -Action { param($Jobs) 'built'; "
+                "'defaults=' + $PSDefaultParameterValues['Get-Content:ErrorAction'] } 2>&1)\n"
+                "Write-Output (\"guard errors={0} built={1}\" -f @($b | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }).Count, "
+                "(@($b | Where-Object { $_ -eq 'built' }).Count))\n"
+                "Write-Output (@($b | Where-Object { \"$_\" -like 'defaults=*' }) -join ',')\n"])
+    out = done.stdout + done.stderr
+    assert "guard errors=0 built=1" in done.stdout, out
+    assert "defaults=Continue" in done.stdout, "the action runs with the caller's own parameter defaults"
+
+
+def test_verbose_on_the_command_line_writes_no_unbounded_records(box) -> None:
+    # r9 adversary 46f83a19-A2: -Verbose reached Get-CimInstance (the real memory probe and process census), whose verbose
+    # records the host renders synchronously, past the bounded writers, while a slot is held. The guard silences its own
+    # cmdlets' informational streams.
+    done = _ps(["-File", str(GUARD), "-Verbose", "-LockPath", str(box["lock"]), "-ExemptLogPath", str(box["exempt_log"]),
+                "-ExemptReason", "r9 verbose test", "-DeadlineMinutes", "0", "-Command", _marker_command(box)])
+    out = done.stdout + done.stderr
+    assert done.returncode == 0, out
+    assert box["marker"].exists(), out
+    assert "VERBOSE:" not in out, out
+
+
 # r9 class guard (2ab4b1b6-A1 siblings :887 :888, which no input reaches once :868/:869 resolve): no function the guard runs
 # composes or resolves a path with a cmdlet that can write an error record or throw on a missing drive or another provider.
 # Paths are resolved by Resolve-BuildGuardPath only and composed with [IO.Path].
