@@ -2478,6 +2478,18 @@ function Test-DvReceiptValid {
             # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: a capped leg the app did not run at the cap (or whose count is unreadable) is no measurement under it.
             $workerThreadsVerdict = Get-DvWorkerThreadsEvidence -Spec $spec -LogText $ev.logText -Summary $ev.summary
             if ($workerThreadsVerdict.blocks) { $invalid.Add("WORKER_THREADS_NOT_HONOURED: $($workerThreadsVerdict.reason); a run at another worker count is no measurement under the cap its leg names") }
+            # adversary r2b A1: the receipt's own workerThreads block is re-derived like the display block, so a receipt cannot state a count (or a verdict) the
+            # hashed evidence does not; the writer emits the block exactly when the spec asks for a cap (Invoke-VenueLeg.ps1), so the same condition decides here.
+            $storedWorkerThreads = Get-DvProp $Receipt 'workerThreads'
+            if ($workerThreadsVerdict.requested) {
+                if ($null -eq $storedWorkerThreads) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no workerThreads block (requested / observed / verdict) and its committed spec names a playbackMaxThreads') }
+                else {
+                    foreach ($f in @('requested', 'observed', 'verdict')) {
+                        if (-not (Test-DvJsonEquivalent (Get-DvProp $storedWorkerThreads $f) $workerThreadsVerdict[$f])) { $invalid.Add("WORKER_THREADS_NOT_FROM_EVIDENCE: workerThreads.$f is not what the hashed run log, summary.json and the committed leg spec derive") }
+                    }
+                }
+            }
+            elseif ($null -ne $storedWorkerThreads) { $invalid.Add('WORKER_THREADS_NOT_FROM_EVIDENCE: the receipt carries a workerThreads block but its committed leg spec names no playbackMaxThreads') }
         }
 
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
