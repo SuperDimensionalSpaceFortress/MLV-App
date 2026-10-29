@@ -51,6 +51,10 @@ if ($WorkDir.Contains('``')) { throw "WORKDIR_INVALID two backticks in a row in 
 if ($Head -cnotmatch '\A[0-9a-f]{40}\z') { throw "HEAD_INVALID -Head must be exactly 40 lowercase hex" }
 if ([string]::IsNullOrWhiteSpace($Base) -or $Base -match $unsafe -or $Base.Contains('"') -or $Base.StartsWith('-') -or $Base.Contains('``')) { throw "BASE_INVALID blank, control or separator character, double quote, leading '-' or two backticks in -Base" }
 
+# Both paths follow the PowerShell location: [IO.File] below resolves a relative path against the process cwd, which
+# differs from the PowerShell location after Set-Location.
+$TemplatePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TemplatePath)
+$OutPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutPath)
 $tpl = Get-Content -LiteralPath $TemplatePath -Raw
 $tpl = [regex]::Replace($tpl, '(?s)<!--.*?-->[ \t]*\r?\n?', '')
 $map = @{
