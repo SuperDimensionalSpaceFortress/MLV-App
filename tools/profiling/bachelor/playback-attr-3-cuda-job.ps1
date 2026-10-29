@@ -5565,7 +5565,9 @@ if ($isVariant) {
 # the venue worker inherited reached the app; it installs the GL surface, shouldUseGpu16PreviewPath() turns true (scopes are off) and every frame runs
 # OutputProcessed16 with processed8_measured=0 -- cpu frames and no gpu frame, so the exit-28 gate passed it. Two layers, every cpu job (a cuda job is the
 # text it was). The block is the SAME text in every cpu job, so -PlaybackProcessing receipt still adds exactly its own token to the job (pinned by
-# test_playback_processing_reaches_the_smoke_command_and_absent_changes_nothing); the job reads whether it is a receipt job from its own smoke command:
+# test_playback_processing_reaches_the_smoke_command_and_absent_changes_nothing); the job reads whether it is a receipt job from its own smoke command.
+# r6: the block is three bracketed regions (PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 >>> / <<<), so the base-commit byte pins (strip_regions in
+# test_dual_venue_evidence, shared by test_core_partition_leg) compare a cpu job outside them like every other card's lines:
 #   (a) every cpu job removes both flags from its own process environment before the smoke child starts, so neither the runner nor the app inherits one
 #       (A1 above: the GL-window/viewport envs only serve the GPU presentation path). They are removed, not set to 0: platform/qt/main.cpp
 #       (shouldPreferDesktopOpenGl, shouldShareOpenGlContexts) tests them with qEnvironmentVariableIsSet, so a 0 would still switch shared GL contexts on.
@@ -5576,6 +5578,7 @@ if ($isCpuBackend) {
     $template = Edit-DualVenueTemplate $template @'
 $envList = "'" + ($envs -join "','") + "'"
 '@ @'
+# PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 >>>
 # PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 (a): a cpu leg presents no GL surface, so an inherited GL viewport/window flag never reaches the smoke child.
 $glViewportInheritedCleared = @()
 foreach ($glViewportFlag in @('MLVAPP_EXPERIMENTAL_GL_VIEWPORT', 'MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT')) {
@@ -5610,10 +5613,12 @@ function Get-AttrCpuProcessed8Route([string]$RawLog, [string]$MeasuredSessionId)
         processed16OnlyFrames = $(if ($reason -in @('', 'PROCESSED8_NOT_MEASURED', 'PROCESSED16_ROUTE_FRAMES')) { $p16 - $p8 } else { $null })
     }
 }
+# PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 <<<
 $envList = "'" + ($envs -join "','") + "'"
 '@
     $template = Edit-DualVenueTemplate $template '$stats = [ordered]@{}
 ' @'
+# PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 >>>
 # PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 (b): a cpu receipt leg that did not run Processed8 (or ran the Processed16 route) is refused, never a Processed8 result.
 # The runner switch's name is split so a job without receipt never spells it (such a job's text is pinned free of the name).
 $processed8RouteRequired = $cmd.Contains(' -Playback' + 'Processing receipt ')
@@ -5633,16 +5638,19 @@ if ($processed8RouteRequired -and -not $processed8Route.taken) {
     Write-Output "RESULT=PROCESSED8_ROUTE_NOT_TAKEN REASON=$($processed8Route.reason) PROCESSED8_MEASURED_FRAMES=$($processed8Route.processed8MeasuredFrames) PROCESSED16_ONLY_FRAMES=$($processed8Route.processed16OnlyFrames) $(Get-AttrCudaDisplayResultTail $displayBlock) ARTIFACTS=$Pub"
     exit 33
 }
+# PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 <<<
 $stats = [ordered]@{}
 
 '@
     $template = Edit-DualVenueTemplate $template '    cpuFrames = $gpuSummary.cpuFrames
 ' '    cpuFrames = $gpuSummary.cpuFrames
+    # PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 >>>
     processed8RouteRequired = $processed8RouteRequired
     processed8MeasuredFrames = $processed8Route.processed8MeasuredFrames
     processed16MeasuredFrames = $processed8Route.processed16MeasuredFrames
     processed16OnlyFrames = $processed8Route.processed16OnlyFrames
     glViewportInheritedCleared = ($glViewportInheritedCleared -join '','')
+    # PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 <<<
 '
 }
 
