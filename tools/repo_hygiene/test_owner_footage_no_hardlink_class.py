@@ -37,11 +37,14 @@ NTFS by test_owner_footage_identity_delete.py.
 from __future__ import annotations
 
 import ast
+import bisect
 import json
+import random
 import re
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -450,7 +453,9 @@ LANE_DIRTY_SAVE_PAYLOAD_DLLIMPORTS = {
     '[DllImport("kernel32.dll")]', '[DllImport("ntdll.dll")]',
 }
 _PAYLOAD_DLLIMPORT_RE = re.compile(r"DllImport")
-_PAYLOAD_DLLIMPORT_ATTRIBUTE_RE = re.compile(r"\[DllImport\([^\]\n]*\)\]")
+# r17b (sweep of adversary a0436b16-A2's class): a '[' ends a candidate too, so each '[DllImport(' scans only to the next '[' and a line of them is not rescanned
+# once per candidate; an attribute holding '[' no longer matches, so the count check below denies it
+_PAYLOAD_DLLIMPORT_ATTRIBUTE_RE = re.compile(r"\[DllImport\([^\[\]\n]*\)\]")
 # r16 (adversary a11c4459-A2), default-deny: the payload's using directives are exactly these, and every name it qualifies from System. or Microsoft. is
 # one of these, so a library outside them (Microsoft.VisualBasic, System.Diagnostics, System.Net, ...) cannot be reached by its full name or an alias
 LANE_DIRTY_SAVE_PAYLOAD_USINGS = ["using System;", "using System.Runtime.InteropServices;", "using System.Text;"]
@@ -476,7 +481,15 @@ _FINDITER_CHILD = (
     "started = time.perf_counter()\n"
     "found = [[[m.start(), m.end(), m.group(0)] for m in re.finditer(request['pattern'], text)] for text in request['texts']]\n"
     "print(json.dumps({'found': found, 'seconds': time.perf_counter() - started}))\n")
-_PAYLOAD_USING_RE = re.compile(r"^\s*using\b(?!\s*\()[^\n]*", re.MULTILINE)
+# r17b (adversary a0436b16-A1): every `using` token in the payload, read to its ';' or line end, wherever it stands. The r16 scanner anchored at an LF-started
+# line, so a directive after a CR-only line end (or after `global`) was never read, and an alias of System qualified names the census does not root at
+# System. A `using (` is a statement (a disposal scope, never a name), so it is skipped; any other token outside the pinned three is a violation.
+_PAYLOAD_USING_RE = re.compile(rf"\busing\b(?!\s*\()[^;{_CS_LINE_END}]*;?")
+# r17b (adversary a0436b16-A2): the pieces _payload_qualified_names walks; it gives _PAYLOAD_QUALIFIED_RE's matches without rescanning a comment per root
+_PAYLOAD_QUALIFIED_ROOT_RE = re.compile(r"\b(?:System|Microsoft)")
+_CS_LINE_END_RE = re.compile(f"[{_CS_LINE_END}]")
+_SPACE_RE = re.compile(r"\s")
+_WORD_RE = re.compile(r"\w+")
 # common parameters that write a variable by NAME (-OutVariable guard would put a pipeline's output into a call variable)
 _PS_VARIABLE_WRITING_PARAMETERS = ("outvariable", "errorvariable", "warningvariable", "informationvariable", "pipelinevariable")
 _PS_VARIABLE_WRITING_ALIASES = {"ov", "ev", "wv", "iv", "pv"}
@@ -511,6 +524,41 @@ def _finditer_in_child(pattern: str, texts: list[str], timeout: float) -> dict:
     if proc.returncode != 0:
         raise AssertionError(f"the finditer child exited {proc.returncode}: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
     return json.loads(proc.stdout)
+
+
+def _payload_qualified_names(body: str) -> list[tuple[int, int, str]]:
+    """(start, end, text) of each match _PAYLOAD_QUALIFIED_RE.finditer gives on `body`, in near-linear time (r17b, adversary a0436b16-A2).
+    The regex retries every root, and a root inside a comment scans the rest of that comment before it fails, so '//' + 'System//' * N took quadratic
+    time. Here a comment is crossed in one step to its line end, and where a separator run ends is remembered by where it starts, so a run is read once."""
+    ends = [match.start() for match in _CS_LINE_END_RE.finditer(body)]
+    after_separators: dict[int, int] = {}
+
+    def skip(at: int) -> int:
+        # whitespace and line comments have one parse each, so the run that ends at the first other character is the only one the regex can take
+        path = []
+        while at not in after_separators:
+            path.append(at)
+            if _SPACE_RE.match(body, at):
+                at += 1
+            elif body.startswith("//", at) and (end := bisect.bisect_left(ends, at + 2)) < len(ends):
+                at = ends[end] + 1
+            else:
+                after_separators[at] = at
+        for seen in path:
+            after_separators[seen] = after_separators[at]
+        return after_separators[at]
+
+    found, taken = [], 0
+    for root in _PAYLOAD_QUALIFIED_ROOT_RE.finditer(body):
+        if root.start() < taken:
+            continue
+        at = root.end()
+        while body.startswith(".", dot := skip(at)) and (word := _WORD_RE.match(body, skip(dot + 1))):
+            at = word.end()
+        if at != root.end():
+            found.append((root.start(), at, body[root.start():at]))
+            taken = at
+    return found
 
 
 def _call_arguments(text: str, at: int) -> list[str] | None:
@@ -796,10 +844,10 @@ def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
         usings = [match.group(0).strip() for match in _PAYLOAD_USING_RE.finditer(body)]
         if usings != LANE_DIRTY_SAVE_PAYLOAD_USINGS:
             violations.append(f"the Add-Type payload's using directives are not exactly {LANE_DIRTY_SAVE_PAYLOAD_USINGS}: {usings}")
-        for match in _PAYLOAD_QUALIFIED_RE.finditer(body):
-            if re.sub(rf"{_CS_LINE_COMMENT}|\s+", "", match.group(0)) not in LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED:
-                violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: a process start or run-time binding inside an Add-Type payload "
-                                  f"(a qualified name outside the pinned set): {match.group(0)}")
+        for start, _, name in _payload_qualified_names(body):
+            if re.sub(rf"{_CS_LINE_COMMENT}|\s+", "", name) not in LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED:
+                violations.append(f"{text.count(chr(10), 0, at + start) + 1}: a process start or run-time binding inside an Add-Type payload "
+                                  f"(a qualified name outside the pinned set): {name}")
     # the census proper runs on the text C# compiles: every escape resolved
     text = _CS_ESCAPE_RE.sub(_resolve_cs_escape, text)
     _, nt_calls, nt_violations, nt_spans = _native_census(
@@ -1335,6 +1383,8 @@ class NoHardLinkCreationTests(unittest.TestCase):
         new = [[[match.start(), match.end(), match.group(0)] for match in _PAYLOAD_QUALIFIED_RE.finditer(fixture)] for fixture in fixtures]
         old = _finditer_in_child(_PAYLOAD_QUALIFIED_R16_PATTERN, fixtures, timeout=120)["found"]
         self.assertEqual(new, old)
+        # r17b: the census's walker gives the same matches as the regex
+        self.assertEqual([[list(name) for name in _payload_qualified_names(fixture)] for fixture in fixtures], new)
         found = {match[2] for matches in new for match in matches}
         self.assertIn("System// gap\n.IO.File.WriteAllText", found, "the iter-2 line-comment fixture is among the compared ones")
         self.assertIn("System.Net.WebClient", found)
@@ -1350,6 +1400,35 @@ class NoHardLinkCreationTests(unittest.TestCase):
         # control: a comment that runs to its line end (LF, CR, CRLF or LS) still sits inside a name, and the census strips it to the name C# compiles
         name = _PAYLOAD_QUALIFIED_RE.search("x = System// a .b\n// c\r . IO // d\r\n.File// e\u2028.Create(p);").group(0)
         self.assertEqual(re.sub(rf"{_CS_LINE_COMMENT}|\s+", "", name), "System.IO.File.Create")
+        self.assertEqual([found[2] for found in _payload_qualified_names("x = System// a .b\n// c\r . IO // d\r\n.File// e\u2028.Create(p);")], [name])
+
+    def test_the_payload_scanners_are_near_linear_on_the_r17_adversary_pumps(self) -> None:
+        # r17b (adversary a0436b16-A2 and its sweep): the r17 regex took 2.9 s on '//' + 'System//' * 8000 + LF and 11.9 s on 16000, the DllImport attribute
+        # regex 1.9 s on '[DllImport(' * 8000 and the r16 using regex 1.5 s on 32000 line feeds (run red.txt). Each is a scanner the census runs on the payload.
+        pumps = ["//" + "System//" * 16000 + "\n", "//" + "Microsoft //" * 16000 + "\r" + "\n" * 16000 + "x", "System" + " " * 16000 + "x",
+                 "// " + "System " * 16000 + "\n" + "\n" * 16000 + ".", "System" + "\n// x" * 16000]
+        started = time.perf_counter()
+        self.assertEqual([_payload_qualified_names(pump) for pump in pumps], [[]] * len(pumps))
+        self.assertLess(time.perf_counter() - started, 1.0)
+        for regex, pump in ((_PAYLOAD_DLLIMPORT_ATTRIBUTE_RE, "[DllImport(" * 16000 + "\n"), (_PAYLOAD_USING_RE, "\n" * 64000 + "x"),
+                            (_PAYLOAD_USING_RE, "using" + " x" * 16000 + "\n")):
+            result = _finditer_in_child(regex.pattern, [pump], timeout=60)
+            self.assertLess(result["seconds"], 1.0, (regex.pattern, result["seconds"]))
+        # the whole census on the adversary's accepted saver variant: it finishes, and a comment full of System roots is not a qualified name
+        text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
+        started = time.perf_counter()
+        self.assertEqual(lane_dirty_save_violations(text.replace("public static class DirtyFinalPath {",
+                                                                 "//" + "System//" * 8000 + "\npublic static class DirtyFinalPath {", 1)), [])
+        self.assertLess(time.perf_counter() - started, 10.0)
+
+    def test_the_qualified_name_walker_matches_the_regex_on_generated_text(self) -> None:
+        # r17b: the walker replaces the regex in the census, so it must give the regex's matches exactly; seeded, so a failure reproduces
+        rng = random.Random(20261029)
+        pieces = ["System", "Microsoft", ".", "//", "/", " ", "\n", "\r", "\u2028", "x", "IO", "S", "_", "\t", "System.", "// a\n", "#"]
+        texts = ["".join(rng.choice(pieces) for _ in range(rng.randint(0, 24))) for _ in range(4000)]
+        expected = [[[match.start(), match.end(), match.group(0)] for match in _PAYLOAD_QUALIFIED_RE.finditer(sample)] for sample in texts]
+        self.assertEqual([[list(name) for name in _payload_qualified_names(sample)] for sample in texts], expected)
+        self.assertGreater(sum(map(len, expected)), 1000, "the generated texts hold many qualified names")
 
     def test_the_lane_dirty_saver_census_rejects_what_the_r17_adversary_compiled_past_it(self) -> None:
         # r17 iter 1 (adversary 4b76fdba): each insertion returned [] while Roslyn parsed System.IO.File.WriteAllText. Built from the saver's raw bytes, so a
@@ -1377,6 +1456,30 @@ class NoHardLinkCreationTests(unittest.TestCase):
         self.assertEqual(missed, [], {name: found[name] for name in missed})
         # control: the saver as it is has no '#' in its payload and stays clean
         self.assertEqual(lane_dirty_save_violations(LANE_DIRTY_SAVE.read_bytes()), [])
+
+    def test_the_lane_dirty_saver_census_rejects_a_using_directive_the_r17_scanner_missed(self) -> None:
+        # r17b (adversary a0436b16-A1): the census returned [] while Roslyn read a fourth using directive after a CR-only line end, and X.IO.File through
+        # its alias. Built from the saver's raw bytes, so a CR stays a CR.
+        text = LANE_DIRTY_SAVE.read_bytes().decode("utf-8")
+        head, anchor = "public static class DirtyFinalPath {", "public static string Identity(string path) {"
+        self.assertIn(head, text)
+        self.assertIn(anchor, text)
+        write = '\nX.IO.File.WriteAllText("C:/fixture/wt/src/a.txt", "x");'
+        rows = {
+            "A1 the adversary's input": "// gap\rusing X = System;\r// gap\n",
+            "A1 a CR-only line end before the directive": "\rusing X = System;\r",
+            "A1 a directive after `global`": "global using X = System;\n",
+            "A1 a directive after a pinned one on its line": "using System.Text; using X = System;\n",
+            "A1 a static directive": "using static System.IO.File;\n",
+            "A1 a directive after a block": "{ }using X = System;\n",
+        }
+        mutants = {name: text.replace(head, inserted + head, 1).replace(anchor, anchor + write, 1) for name, inserted in rows.items()}
+        found = dict(zip(rows, lane_dirty_save_violations_many(list(mutants.values()))))
+        missed = [name for name in rows if mutants[name] == text or not any("using directives are not exactly" in violation for violation in found[name])]
+        self.assertEqual(missed, [], {name: found[name] for name in missed})
+        # control: the saver's own three directives are read as exactly the pinned list, whatever its line ends are
+        body = _ADD_TYPE_PAYLOAD_RE.search(text).group("body")
+        self.assertEqual([match.group(0).strip() for match in _PAYLOAD_USING_RE.finditer(body.replace("\n", "\r"))], LANE_DIRTY_SAVE_PAYLOAD_USINGS)
 
     def _assert_r15_rows_rejected_quietly(self) -> None:
         text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
