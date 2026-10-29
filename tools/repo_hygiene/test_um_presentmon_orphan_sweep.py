@@ -468,6 +468,39 @@ class ModuleFunctionTests(unittest.TestCase):
                         f"$r = {self.HELPERS['sweep']}\n" + self.ENTRIES)
         self.assertEqual(got["entries"], ["String:Reason=other", "Int32:1=keep", "String:reason=PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive"])
 
+    # --- r7 (r6 adversary A2 / A3 on 836a3d61, Dot 54d909b1): the reason key is chosen by ordinal comparison and the report's own comparer, never by PowerShell's culture-sensitive
+    # -eq (which ignores U+00AD, U+200B and U+0000), and a copy never lets an added `reason` overwrite a distinct entry. Ignorable characters are tagged before the JSON leaves pwsh.
+    TAGGED = ENTRIES.replace("entries = @($entries)", "entries = @($entries | ForEach-Object { $_.Replace([string][char]0xAD, '<AD>').Replace([string][char]0x200B, '<200B>').Replace([string][char]0, '<0>') })")
+    ADDED = {"sweep": "PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive", "events": "PRESENTMON_EVENTS_LOST: 12 lost"}
+
+    def test_r7_a2_the_exact_key_copy_updates_the_key_the_comparer_matches_never_an_ignorable_lookalike(self) -> None:
+        for char, tag in (("0xAD", "<AD>"), ("0x200B", "<200B>"), ("0", "<0>")):
+            for helper in self.HELPERS:
+                with self.subTest(char=tag, helper=helper):
+                    got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)\n"
+                                    f"$report.Add('rea' + [char]{char} + 'son', 'OTHER'); $report.Add('Reason', 'missing'); $report.Add('', 'keep')\n"
+                                    f"$r = {self.HELPERS[helper]}\n" + self.TAGGED)
+                    self.assertEqual(got["entries"], [f"String:rea{tag}son=OTHER", f"String:Reason={self.APPENDED[helper]}", "String:=keep"])
+
+    def test_r7_a3_an_added_reason_never_overwrites_a_distinct_reason_entry(self) -> None:
+        for helper in self.HELPERS:
+            with self.subTest(helper=helper):
+                got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                                f"$report.Add('Reason', 'original'); $report.Add('status', 'S')\n$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
+                self.assertEqual(got["entries"], ["String:Reason=original", "String:status=S", f"String:reason={self.ADDED[helper]}"])
+
+    def test_r7_the_original_reason_survives_whatever_comparer_the_report_uses(self) -> None:
+        # the report's own comparer names the reason entry: it is updated in place (its spelling kept), never duplicated, under Ordinal, OrdinalIgnoreCase and InvariantCultureIgnoreCase
+        cases = {"Ordinal": ("reason", "[StringComparer]::Ordinal"), "OrdinalIgnoreCase": ("Reason", "[StringComparer]::OrdinalIgnoreCase"),
+                 "InvariantCultureIgnoreCase": ("REA<AD>SON", "[StringComparer]::InvariantCultureIgnoreCase")}
+        for name, (key, comparer) in cases.items():
+            for helper in self.HELPERS:
+                with self.subTest(comparer=name, helper=helper):
+                    ps_key = key.replace("<AD>", "' + [char]0xAD + '")
+                    got = self.call(f"$report = [System.Collections.Generic.Dictionary[string,object]]::new({comparer})\n"
+                                    f"$report.Add('{ps_key}', 'missing'); $report.Add('status', 'S')\n$r = {self.HELPERS[helper]}\n" + self.TAGGED)
+                    self.assertEqual(sorted(got["entries"]), sorted([f"String:{key}={self.APPENDED[helper]}", "String:status=S"]))
+
     def test_mutation_the_property_only_copy_loses_a_dictionary_reports_fields_again(self) -> None:
         module = MODULE.read_text(encoding="utf-8")
         branch = ("    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }\n"
@@ -927,8 +960,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         _code, sweep, _d, _out = self.run_start("h2-identity", others=(self.SERVICE_UNREADABLE,), services=self.SERVICE_ROW)
         self.assertEqual(sweep["excludedPresentMonProcesses"], [{"name": "PresentMonService", "pid": 7001, "service": "PresentMonService", "pathReadable": False, "nonCaptureIdentity": "registered_service"}])
 
-    def h3(self, name: str, **kw) -> tuple[dict, Path]:
-        code, sweep, d, out = self.run_start(name, others=(self.SERVICE_UNREADABLE,), **kw)
+    def h3(self, name: str, others: tuple = (), **kw) -> tuple[dict, Path]:
+        code, sweep, d, out = self.run_start(name, others=others or (self.SERVICE_UNREADABLE,), **kw)
         self.assertEqual(code, 0, out)
         self.assertFalse(sweep["ran"], sweep)
         self.assertEqual(sweep["skippedReason"], "presentmon_process_alive", "no positive identity: a blocker, nothing is swept")
@@ -991,6 +1024,29 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual((detail.get("nonCaptureIdentity"), detail.get("parentName")), (None, None), "no parent is read for another name")
         self.assertEqual(self.terminated_names(self.calls(d)), [])
 
+    # --- r7 (r6 adversary A1 on 836a3d61, Dot 54d909b1): the name gates compare ordinally. PowerShell's -ieq/-ine is culture-sensitive and ignores U+00AD, so a soft-hyphen lookalike of
+    # PresentMonService under the Intel parent (or the real child under a soft-hyphen lookalike parent) got the Intel identity and its live MLVAttr3-* session was terminated.
+    SHY_CHILD = "PresentMonSer­vice"
+
+    def test_r7_a1_a_soft_hyphen_presentmonservice_lookalike_is_no_intel_child(self) -> None:
+        detail, _d = self.h3("r7-a1-shy-child", others=((7001, self.SHY_CHILD, UNREADABLE),), processes=((7001, self.SHY_CHILD, 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)))
+        # (the record crosses the console code page, where U+00AD may read back as '-': the identity outcome is what is asserted)
+        self.assertEqual((detail.get("pid"), detail.get("parentName"), detail.get("identityError")), (7001, None, None), "no parent is read for another name")
+
+    def test_r7_a1_a_soft_hyphen_intel_parent_lookalike_gives_no_identity(self) -> None:
+        detail, _d = self.h3("r7-a1-shy-parent", processes=((7001, "PresentMonService", 900, 10), (900, "IntelGraphicsSoftware.Ser­vice.exe", 4, 5)))
+        self.assertEqual((detail.get("parentPid"), detail.get("identityError")), (900, "parent_not_intel_graphics_service"))
+
+    def test_r7_a1_a_process_row_whose_name_differs_only_by_a_soft_hyphen_is_another_process(self) -> None:
+        detail, _d = self.h3("r7-a1-shy-row", processes=((7001, self.SHY_CHILD, 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)))
+        self.assertEqual(detail.get("identityError"), "process_row_name_changed")
+
+    def test_r7_a1_control_the_exact_pair_is_still_recognised(self) -> None:
+        code, sweep, d, out = self.run_start("r7-a1-control", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sweep["livePresentMonProcesses"], [self.INTEL_DETAIL])
+        self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
     # --- r2 regressions (Dot advisory on #707, hub-confirmed on cd2a518d): a second harness's live PresentMon-custom must stop the harness_sessions sweep at every one of its three gates
     def test_r1_a_live_presentmon_custom_with_an_unreadable_path_refuses_the_sweep(self) -> None:
         code, sweep, d, out = self.run_start("r1-custom-unreadable", others=(self.CUSTOM_UNREADABLE,))
@@ -1043,12 +1099,12 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"], "the mutation terminates the other harness's live session")
 
     def test_mutation_without_the_parent_name_check_any_parent_identifies_the_service(self) -> None:
-        mutated = mutate(TEMPLATE, "if ($result.parentName -ieq 'IntelGraphicsSoftware.Service.exe') {", "if ($true) {")
+        mutated = mutate(TEMPLATE, "if (Test-PresentMonIdentityText $result.parentName 'IntelGraphicsSoftware.Service.exe') {", "if ($true) {")
         _code, sweep, _d, _out = self.run_start("mut-parent-name", others=(self.SERVICE_UNREADABLE,), processes=((7001, "PresentMonService", 901, 10), (901, "explorer.exe", 4, 5)), text=mutated)
         self.assertTrue(sweep["ran"], "the mutation lets a PresentMonService under any parent out of the blockers")
 
     def test_mutation_without_the_name_check_any_image_under_the_intel_parent_is_identified(self) -> None:
-        mutated = mutate(TEMPLATE, "if ($Name -ine 'PresentMonService') { return $result }", "")
+        mutated = mutate(TEMPLATE, "if (-not (Test-PresentMonIdentityText $Name 'PresentMonService')) { return $result }", "")
         _code, sweep, _d, _out = self.run_start("mut-child-name", others=((7001, "PresentMonServiceX", UNREADABLE),), processes=((7001, "PresentMonServiceX", 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)), text=mutated)
         self.assertTrue(sweep["ran"])
 
@@ -1075,7 +1131,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertNotIn("MLVAttr3-another-live-job", self.terminated_names(self.calls(d)))
 
     def test_mutation_newly_listed_against_the_filtered_list_reports_the_deferred_session_again(self) -> None:
-        mutated = mutate(TEMPLATE, "$record['newlyListed'] = @($finalNames | Where-Object { $initialNames -notcontains $_ })", "$record['newlyListed'] = @($finalNames | Where-Object { $listed -notcontains $_ })")
+        mutated = mutate(TEMPLATE, "$record['newlyListed'] = @($finalNames | Where-Object { $finalName = [string]$_; @($initialNames | Where-Object { Test-PresentMonIdentityText ([string]$_) $finalName }).Count -eq 0 })", "$record['newlyListed'] = @($finalNames | Where-Object { $listed -notcontains $_ })")
         _code, sweep, _d, _out = self.run_start("mut-newly", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
         self.assertEqual(sweep["newlyListed"], ["PresentMon"])
 
@@ -1258,7 +1314,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assert_refused_unidentified(sweep, d)
 
     def test_mutation_a_command_line_used_for_any_process_under_its_pid_sweeps_the_reused_pid_again(self) -> None:
-        mutated = mutate(TEMPLATE, "if ($commandLines.ContainsKey($candidateId) -and (([string]$commandLines[$candidateId].name -replace '\\.exe$', '') -ieq $candidateName) -and $null -ne $started -and $null -ne $commandLines[$candidateId].created -and $commandLines[$candidateId].created -eq $started -and $started -eq $startedAfterPath) {",
+        mutated = mutate(TEMPLATE, "if ($commandLines.ContainsKey($candidateId) -and (Test-PresentMonIdentityText ([string]$commandLines[$candidateId].name -replace '\\.exe$', '') $candidateName) -and $null -ne $started -and $null -ne $commandLines[$candidateId].created -and $commandLines[$candidateId].created -eq $started -and $started -eq $startedAfterPath) {",
                          "if ($commandLines.ContainsKey($candidateId)) {")
         _code, sweep, d, _out = self.run_start("mut-r4-a1b", sessions=self.OTHER_SESSIONS, others=(self.SERVICE_UNREADABLE, (6200, "capture", "C:\\other-harness\\cache\\capture.exe")),
                                                processes=self.INTEL_TREE, command_lines=((6200, "C:\\Windows\\explorer.exe /factory"),), command_line_names={6200: "explorer.exe"}, text=mutated)
@@ -1473,14 +1529,14 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(self.terminated_names(self.calls(d)), [])
 
     def test_mutation_rechecks_that_count_every_live_process_abort_the_harness_sweep(self) -> None:
-        mutated = mutate(TEMPLATE, "if ($Scope -eq 'harness_sessions') { return [pscustomobject]@{ live = @(Get-PresentMonCaptureBlockerId $snapshot);", "if ($false) { return [pscustomobject]@{ live = @(Get-PresentMonCaptureBlockerId $snapshot);")
+        mutated = mutate(TEMPLATE, "if (Test-PresentMonIdentityText $Scope 'harness_sessions') { return [pscustomobject]@{ live = @(Get-PresentMonCaptureBlockerId $snapshot);", "if ($false) { return [pscustomobject]@{ live = @(Get-PresentMonCaptureBlockerId $snapshot);")
         _code, sweep, d, _out = self.run_start("mut-recheck-scope", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
         # r4: the scope choice asks the same helper now, so the mutation refuses there already (was: at the first re-check)
         self.assertEqual(sweep["skippedReason"], "presentmon_process_alive")
         self.assertEqual(self.terminated_names(self.calls(d)), [])
 
     def test_mutation_without_the_scope_filter_the_default_session_is_swept_under_an_unidentified_process(self) -> None:
-        mutated = mutate(TEMPLATE, "$listed = @($listed | Where-Object { $_ -like 'MLVAttr3-*' })", "")
+        mutated = mutate(TEMPLATE, "$listed = @($listed | Where-Object { ([string]$_).StartsWith('MLVAttr3-', [StringComparison]::OrdinalIgnoreCase) })", "")
         _code, sweep, d, _out = self.run_start("mut-scope-filter", others=(self.SERVICE_UNREADABLE,), processes=self.INTEL_TREE, text=mutated)
         self.assertIn("PresentMon", self.terminated_names(self.calls(d)))
 
@@ -1644,13 +1700,13 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
 
     def test_mutation_a_name_prefix_match_lets_every_presentmon_star_process_be_live(self) -> None:
         # the converse of the Bachelor bug: a registered service must not be recognised by name alone, so the name arm is the pinned name only
-        mutated = mutate(TEMPLATE, "if ($candidateName -ieq $pinnedName) {", "if ($candidateName -like 'PresentMon*') {")
+        mutated = mutate(TEMPLATE, "if (Test-PresentMonIdentityText $candidateName $pinnedName) {", "if ($candidateName -like 'PresentMon*') {")
         _code, sweep, d, _out = self.run_start("mut-prefix", others=(self.SERVICE,), services=self.SERVICE_ROW, text=mutated)
         self.assertFalse(sweep["ran"])
         self.assertEqual(sweep["livePresentMonProcessIds"], [7001])
 
     def test_mutation_without_the_path_match_a_pinned_path_copy_reads_as_no_capture(self) -> None:
-        mutated = mutate(TEMPLATE, "elseif ($pathReadable -and $candidatePath -ieq $pinnedPath) { $reason = 'pinned_image_path' }", "elseif ($false) { $reason = 'pinned_image_path' }")
+        mutated = mutate(TEMPLATE, "elseif ($pathReadable -and (Test-PresentMonIdentityText $candidatePath $pinnedPath)) { $reason = 'pinned_image_path' }", "elseif ($false) { $reason = 'pinned_image_path' }")
         _code, sweep, d, _out = self.run_start("mut-path", others=((4343, "PresentMon-renamed", str(self.stmp / "mut-path" / "cache" / STUB_EXE)),), text=mutated)
         # r2: the copy stays live through the fail-closed readable-path arm; without the path arm the record loses the evidence that it IS the pinned binary
         self.assertFalse(sweep["ran"])
@@ -1658,14 +1714,14 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
 
     def test_mutation_a_case_sensitive_name_match_misses_the_pinned_image(self) -> None:
         stub = Path(STUB_EXE).stem
-        mutated = mutate(TEMPLATE, "if ($candidateName -ieq $pinnedName) {", "if ($candidateName -ceq $pinnedName) {")
+        mutated = mutate(TEMPLATE, "if (Test-PresentMonIdentityText $candidateName $pinnedName) {", "if ($candidateName -ceq $pinnedName) {")
         _code, sweep, d, _out = self.run_start("mut-case", others=((4402, stub.upper(), "C:\\Vendor\\copy.exe"),), text=mutated)
         self.assertFalse(sweep["ran"], "r2: still live (no identity), so still never swept under")
         self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "readable_path_not_a_registered_service", "the mutation no longer recognises the pinned image")
 
     def test_mutation_without_the_name_match_a_pinned_capture_with_an_aliased_path_is_not_recognised(self) -> None:
         stub = Path(STUB_EXE).stem
-        mutated = mutate(TEMPLATE, "if ($candidateName -ieq $pinnedName) { $reason = 'pinned_image_name' }", "if ($false) { $reason = 'pinned_image_name' }")
+        mutated = mutate(TEMPLATE, "if (Test-PresentMonIdentityText $candidateName $pinnedName) { $reason = 'pinned_image_name' }", "if ($false) { $reason = 'pinned_image_name' }")
         _code, sweep, d, _out = self.run_start("mut-alias", others=((4360, stub, "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\cache\\" + STUB_EXE),), text=mutated)
         self.assertFalse(sweep["ran"])
         self.assertEqual(sweep["livePresentMonProcesses"][0]["reason"], "readable_path_not_a_registered_service",

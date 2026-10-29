@@ -2313,18 +2313,25 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
     # r6 adversary A2 on c1521d3c: a dictionary's reason is read by its key (a Dictionary[object,object] has no `reason` member: strict mode threw, and without it the reason read
     # empty and the original was lost), by ContainsKey where it exists and Contains otherwise (as the sweep record is read); an object's by its property
     # r6 adversary A1 on ce87d0f8: the exact-key copy updates the key the report's own comparer matched (a case-insensitive report's `Reason`), never adds a second one
+    # r7 (r6 adversary A2 on 836a3d61): that key is chosen by ORDINAL comparison, never -eq/-ceq (culture-sensitive: U+00AD, U+200B and U+0000 are ignored, so `rea<U+00AD>son` read as
+    # `reason`): an exact `reason` first; else the one string key whose value is the text the comparer returned (the matched key holds it, so a unique holder is that key); else, the
+    # text being ambiguous, the key OrdinalIgnoreCase matches (PowerShell's @{} and [ordered] comparer)
     $current = ''
     $reasonKey = 'reason'
     if ($Report -is [System.Collections.IDictionary]) {
         $hasReason = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
         if ($hasReason) {
             $current = [string]$Report['reason']
-            $named = @(@($Report.PSBase.Keys) | Where-Object { $_ -is [string] -and $_ -eq 'reason' })
-            if ($named.Count -gt 0 -and @($named | Where-Object { $_ -ceq 'reason' }).Count -eq 0) { $reasonKey = $named[0] }
+            $keyList = @($Report.PSBase.Keys)
+            $valueList = @($Report.PSBase.Values)
+            $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::Ordinal) })
+            if ($named.Count -eq 0) { $named = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $current, [StringComparison]::Ordinal)) { $keyList[$index] } }) }
+            if ($named.Count -ne 1) { $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::OrdinalIgnoreCase) }) }
+            if ($named.Count -gt 0) { $reasonKey = $named[0] }
         }
-    } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value } }
+    } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name } }
     $detailed = Add-AttrCudaPresentMonEventsLostDetail -Reason $current -EventsLost $EventsLost
-    if ($detailed -ceq $current) { return $Report }
+    if ([string]::Equals($detailed, $current, [StringComparison]::Ordinal)) { return $Report }
     # r3 (sol B1, the sibling copy): a dictionary report keeps its entries; either shape comes back as the same pscustomobject
     # r5 (sol B2 on 2c226cd8): a pscustomobject (and [ordered]) names its members case-insensitively, so a dictionary whose keys differ only by case (an Ordinal Dictionary with status and
     # Status) or are no strings (1 and '1') cannot become one without losing an entry: it comes back as an ordered dictionary that compares its keys exactly (EqualityComparer[object]),
@@ -2335,10 +2342,15 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
         # into the very structures the plain copy uses and any entry they merge sends the report down the exact-key path
         $probe = [ordered]@{}
         foreach ($key in $keys) { $probe[[string]$key] = $true }
+        # r7 (r6 adversary A3 on 836a3d61): the key the copy sets is probed too -- an added `reason` that the case-insensitive copy would merge into a distinct entry (an Ordinal report's
+        # `Reason`) sends the report down the exact-key path, where that entry keeps its value and `reason` is added beside it
+        $reasonHeld = (@($keys | Where-Object { $_ -is [string] -and [string]::Equals($_, $reasonKey, [StringComparison]::Ordinal) }).Count -gt 0)
+        $expected = $keys.Count
+        if (-not $reasonHeld) { $probe[[string]$reasonKey] = $true; $expected = $expected + 1 }
         # r6 adversary A1 on c1521d3c: a key no pscustomobject can carry (the empty name) throws in the conversion; a conversion that fails is a merge too (the exact-key path)
         $probeCount = -1
         try { $probeCount = @(([pscustomobject]$probe).PSObject.Properties).Count } catch { $probeCount = -1 }
-        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $keys.Count -or $probeCount -ne $keys.Count) {
+        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $expected -or $probeCount -ne $expected) {
             # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
             $values = @($Report.PSBase.Values)
             $exact = [System.Collections.Specialized.OrderedDictionary]::new()
@@ -2350,7 +2362,7 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
     $copy = [ordered]@{}
     if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }
     else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }
-    $copy['reason'] = $detailed
+    $copy[$reasonKey] = $detailed
     return [pscustomobject]$copy
 }
 
@@ -2375,18 +2387,25 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     # r6 adversary A2 on c1521d3c: a dictionary's reason is read by its key (a Dictionary[object,object] has no `reason` member: strict mode threw, and without it the reason read
     # empty and the original was lost), by ContainsKey where it exists and Contains otherwise (as the sweep record is read); an object's by its property
     # r6 adversary A1 on ce87d0f8: the exact-key copy updates the key the report's own comparer matched (a case-insensitive report's `Reason`), never adds a second one
+    # r7 (r6 adversary A2 on 836a3d61): that key is chosen by ORDINAL comparison, as in Add-AttrCudaPresentMonEventsLostDetailToReport (an exact `reason`; else the unique holder of the
+    # text the comparer returned; else the OrdinalIgnoreCase match)
     $current = ''
     $reasonKey = 'reason'
     if ($Report -is [System.Collections.IDictionary]) {
         $hasReason = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
         if ($hasReason) {
             $current = [string]$Report['reason']
-            $named = @(@($Report.PSBase.Keys) | Where-Object { $_ -is [string] -and $_ -eq 'reason' })
-            if ($named.Count -gt 0 -and @($named | Where-Object { $_ -ceq 'reason' }).Count -eq 0) { $reasonKey = $named[0] }
+            $keyList = @($Report.PSBase.Keys)
+            $valueList = @($Report.PSBase.Values)
+            $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::Ordinal) })
+            if ($named.Count -eq 0) { $named = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $current, [StringComparison]::Ordinal)) { $keyList[$index] } }) }
+            if ($named.Count -ne 1) { $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::OrdinalIgnoreCase) }) }
+            if ($named.Count -gt 0) { $reasonKey = $named[0] }
         }
-    } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value } }
+    } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name } }
     # r3 (adversary A2): the token is the detail this helper writes (a bare prefix, or bracketed after a reason), never a path or a word that merely contains the name
-    if ($current.StartsWith('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:') -or $current.Contains('[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:')) { return $Report }
+    # r7: the prefix is compared ordinally (String.StartsWith(string) is culture-sensitive: a soft hyphen inside the token would read as the token and drop the detail)
+    if ($current.StartsWith('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:', [StringComparison]::Ordinal) -or $current.Contains('[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:')) { return $Report }
     # the record is the job's [ordered] table (a key may be absent: the job's default before Start-PresentMonCapture ran has two) or an object; strict mode throws on an absent member, so read by name.
     # r2: copied into a plain table first (no call operator: the job splices this body and the spliced-body scan, R3, rejects `& <scriptblock>`); an absent key reads as $null
     $field = @{}
@@ -2432,10 +2451,15 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
         # into the very structures the plain copy uses and any entry they merge sends the report down the exact-key path
         $probe = [ordered]@{}
         foreach ($key in $keys) { $probe[[string]$key] = $true }
+        # r7 (r6 adversary A3 on 836a3d61): the key the copy sets is probed too (as in Add-AttrCudaPresentMonEventsLostDetailToReport): an Ordinal report's distinct `Reason` is never
+        # overwritten by an added `reason`
+        $reasonHeld = (@($keys | Where-Object { $_ -is [string] -and [string]::Equals($_, $reasonKey, [StringComparison]::Ordinal) }).Count -gt 0)
+        $expected = $keys.Count
+        if (-not $reasonHeld) { $probe[[string]$reasonKey] = $true; $expected = $expected + 1 }
         # r6 adversary A1 on c1521d3c: a key no pscustomobject can carry (the empty name) throws in the conversion; a conversion that fails is a merge too (the exact-key path)
         $probeCount = -1
         try { $probeCount = @(([pscustomobject]$probe).PSObject.Properties).Count } catch { $probeCount = -1 }
-        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $keys.Count -or $probeCount -ne $keys.Count) {
+        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $expected -or $probeCount -ne $expected) {
             # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
             $values = @($Report.PSBase.Values)
             $exact = [System.Collections.Specialized.OrderedDictionary]::new()
@@ -2447,7 +2471,7 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     $copy = [ordered]@{}
     if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }
     else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }
-    $copy['reason'] = $reason
+    $copy[$reasonKey] = $reason
     return [pscustomobject]$copy
 }
 
