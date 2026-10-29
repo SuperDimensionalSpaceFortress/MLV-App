@@ -145,13 +145,16 @@ SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json
 HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip in ("m16-1243", "m16-1457") for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  *(f"legs/m16-1243-headroom-stage-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  "legs/m16-1457-headroom-stage-fullscreen-s1.json")
+# BACHELOR-CORE-PARTITION-AB-1: the core-partition legs (A whole machine, B1 P-cores, B2 P-cores + E-core load): the headroom unpaced windowed s1 shape
+# (a Cinematic Look-Assist pace leg at swap interval 0, so they carry the same presentTearingExpectedReason) plus the core-partition generatorArgs.
+PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload"))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", "legs/m16-1243-look-scale2-vision50d.json",
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS,
+                *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *PARTITION_LEGS,
                 *IDENTITY_LEGS, *MISSDUMP_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
@@ -165,6 +168,13 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, SELF_HEAL_LEG)
 # paced source. A look leg, because only a look leg carries a look receipt; not in AGXOFF_LEGS, whose members are byte copies of their source.
 AGXOFF_UNPACED_LEGS = {"legs/m16-1243-look-scale2-cinematic-agxoff-unpaced.json": "legs/m16-1243-look-scale2-cinematic-agxoff.json"}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_UNPACED_LEGS)
+# VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the capture-free twin of the unpaced AgX-off look leg (a pace leg carrying the same look receipt in
+# generatorArgs), and the #680 fast-path kill-switch arm of each (generatorArgs.disablePrepPointwiseFast), keyed to the leg each one twins or kills.
+AGXOFF_UNPACED_PACE_LEG = "legs/m16-1243-pace-cinematic-agxoff-unpaced.json"
+AGXOFF_UNPACED_NOFAST_LEGS = {"legs/m16-1243-look-scale2-cinematic-agxoff-unpaced-nofast.json": "legs/m16-1243-look-scale2-cinematic-agxoff-unpaced.json",
+                              "legs/m16-1243-pace-cinematic-agxoff-unpaced-nofast.json": AGXOFF_UNPACED_PACE_LEG}
+AGXOFF_REMEASURE_LEGS = (AGXOFF_UNPACED_PACE_LEG, *AGXOFF_UNPACED_NOFAST_LEGS)
+SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_REMEASURE_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -893,6 +903,39 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertLess(runner.index("DISPLAY_MODE_NOT_HONOURED"), runner.index(gate))
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["unpaced"]["type"], "boolean")
+
+    def test_the_pointwise_fast_kill_switch_reaches_the_apps_env_only_when_asked(self) -> None:
+        """VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: -DisablePrepPointwiseFast adds MLVAPP_DISABLE_PREP_POINTWISE_FAST=1 to the app's env list
+        exactly once, beside an unpaced leg's own line too; absent, the job is the text it was. The runner maps generatorArgs.disablePrepPointwiseFast
+        true for any leg (outside the forceLookAssist branch); the schema declares it."""
+        plain = self.generate(GENERATOR, "pk-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_DISABLE_PREP_POINTWISE_FAST", plain)
+        job = self.generate(GENERATOR, "pk-on.job.ps1", ["-DisablePrepPointwiseFast"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_DISABLE_PREP_POINTWISE_FAST=1',\n"
+        self.assertEqual(text.count("MLVAPP_DISABLE_PREP_POINTWISE_FAST"), 1)
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the kill switch is the only difference from the plain job")
+        for name, extra in (("unpaced", ["-Unpaced", "-SwapInterval", "0"]),
+                            ("unpaced-look", ["-Unpaced", "-SwapInterval", "0", "-ForceLookAssist", "-ContactSheet", "-ContactSheetFrames", "1", "-LookFlavor", "cinematic"]),
+                            ("unpaced-pace", ["-Unpaced", "-SwapInterval", "0", "-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic"])):
+            with self.subTest(variant=name):
+                off = self.generate(GENERATOR, f"pk-{name}-off.job.ps1", extra).read_text(encoding="utf-8").replace("\r\n", "\n")
+                on_job = self.generate(GENERATOR, f"pk-{name}-on.job.ps1", [*extra, "-DisablePrepPointwiseFast"])
+                self.assertEqual(self.parse_errors(on_job), 0, name)
+                on = on_job.read_text(encoding="utf-8").replace("\r\n", "\n")
+                self.assertEqual(on.count("'MLVAPP_DISABLE_PREP_POINTWISE_FAST=1',"), 1, name)
+                self.assertEqual(on.count("'MLVAPP_PLAYBACK_UNPACED=1',"), 1, name)
+                self.assertEqual(on.replace(line, ""), off, f"{name}: the kill switch is the only difference from the same job without it")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and $spec.generatorArgs.disablePrepPointwiseFast -is [bool] "
+                   "-and $spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disablePrepPointwiseFast"]["type"], "boolean")
 
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -6830,12 +6873,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *AGXOFF_UNPACED_LEGS):
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *AGXOFF_UNPACED_LEGS):
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -6878,6 +6921,13 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
                 self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
                 self.assertEqual(spec["look"]["receipt"], "look-receipts/agx-off.marxml", path.name)
+            elif spec["card"] == "VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1":   # its capture-free pace twin and the fast-path kill-switch arms
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-(look-scale2|pace)-cinematic-agxoff-unpaced(-nofast)?$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+                self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
+                self.assertEqual((spec.get("look") or {}).get("receipt", spec["generatorArgs"].get("lookReceipt")), "look-receipts/agx-off.marxml", path.name)
+                self.assertEqual(spec["generatorArgs"].get("disablePrepPointwiseFast", False), spec["legId"].endswith("-nofast"), path.name)
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
@@ -6889,6 +6939,10 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "CUDA-HEADROOM-1":   # the unpaced throughput and stage legs, named by clip, kind and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-(1243|1457)-headroom-(unpaced|stage)-(fullscreen|windowed)-s[124]$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+            elif spec["card"] == "BACHELOR-CORE-PARTITION-AB-1":   # the core-partition A/B legs (cinematic pace legs), named by arm
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload)-unpaced-windowed-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
@@ -7092,7 +7146,8 @@ NO_PACE_TWIN_BY_DESIGN = {
     "m16-1243-look-scale2-vision50d": "Vision50d flavor-parity contact-sheet leg at scale 2; no merged PR cites an absolute figure from it",
     **{f"m16-1243-look-scale2-{flavor}-agxoff": "carries a look receipt (agx-off.marxml) that a speed leg cannot carry, so no speed leg can be the same condition"
        for flavor in ("cinematic", "film", "vision50d")},
-    "m16-1243-look-scale2-cinematic-agxoff-unpaced": "an unpaced headroom leg carrying a look receipt; no speed leg can carry the receipt, and its timing claim is the unpaced rate, not a paced figure",
+    "m16-1243-look-scale2-cinematic-agxoff-unpaced": "an unpaced headroom leg carrying a look receipt; its capture-free twin is m16-1243-pace-cinematic-agxoff-unpaced (an unpaced pace leg carrying the receipt in generatorArgs), which this paced-only rule does not see",
+    "m16-1243-look-scale2-cinematic-agxoff-unpaced-nofast": "the unpaced AgX-off leg with the #680 fast path killed; its capture-free twin is m16-1243-pace-cinematic-agxoff-unpaced-nofast, which this paced-only rule does not see",
 }
 
 
@@ -7333,6 +7388,68 @@ class LookReceiptLegSpecTests(unittest.TestCase):
                 text = lambda r: (DV / r).read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
                 self.assertEqual(text(rel).split('"criteria"', 1)[1], text(source_rel).split('"criteria"', 1)[1], "criteria are a byte copy")
 
+    def test_the_agxoff_unpaced_pace_leg_is_the_look_leg_without_the_contact_sheet(self) -> None:
+        """VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the capture-free twin of the unpaced AgX-off look leg is a SPEED leg (the pace-twin rule of
+        test_each_cpu_reduced_pace_leg_is_its_cpu_reduced_cell_without_the_contact_sheet): the look leg minus its look block, plus forceLookAssist at the
+        look's flavor and the look's own receipt and bound hash as generatorArgs.lookReceipt / lookReceiptSha256, same clip, window, backends, scale,
+        display mode, timeouts and criteria. visualCapture is off (an unpaced capture tail blurs the rate) with the unpaced speed legs' reason."""
+        [look_rel] = AGXOFF_UNPACED_LEGS
+        pace = json.loads((DV / AGXOFF_UNPACED_PACE_LEG).read_text(encoding="utf-8"))
+        look = json.loads((DV / look_rel).read_text(encoding="utf-8"))
+        self.jsonschema.validate(pace, self.schema)
+        self.assertEqual(pace["legId"], Path(AGXOFF_UNPACED_PACE_LEG).stem)
+        self.assertEqual(pace["card"], "VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1")
+        self.assertEqual(pace["legType"], "speed")
+        self.assertNotIn("look", pace)
+        self.assertEqual(pace["generatorArgs"], dict(look["generatorArgs"], forceLookAssist=True, lookFlavor=look["look"]["lookFlavor"],
+                                                     lookReceipt=look["look"]["receipt"], lookReceiptSha256=look["look"]["receiptSha256"]))
+        self.assertEqual(pace["generatorArgs"]["lookReceiptSha256"], self.receipt_sha, "the spec binds the committed receipt's bytes")
+        for key in ("clipId", "playSeconds", "backends", "scaleFactor", "timeouts", "criteria", "presentTearingExpectedReason"):
+            self.assertEqual(pace[key], look[key], key)
+        self.assertEqual(pace.get("displayMode"), look.get("displayMode"), "displayMode")
+        self.assertEqual(pace.get("acceptedEffectiveScale"), look.get("acceptedEffectiveScale"))
+        headroom = json.loads((DV / "legs" / "m16-1243-headroom-unpaced-fullscreen-s2.json").read_text(encoding="utf-8"))
+        self.assertIs(pace["visualCapture"], False)
+        self.assertEqual(pace["visualCaptureOptOutReason"], headroom["visualCaptureOptOutReason"])
+        self.assertEqual(set(pace) - set(look), {"visualCapture", "visualCaptureOptOutReason"})
+        self.assertEqual(set(look) - set(pace), {"look"})
+
+    def test_each_agxoff_unpaced_nofast_leg_differs_from_its_twin_only_in_the_kill_switch(self) -> None:
+        """VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: each kill-switch arm (the #680 pointwise fast path off on the same staged build) differs from
+        the leg it kills only in its legId, its card and generatorArgs.disablePrepPointwiseFast true; the twin sets no kill switch."""
+        self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["disablePrepPointwiseFast"]["type"], "boolean")
+        for rel, twin_rel in AGXOFF_UNPACED_NOFAST_LEGS.items():
+            with self.subTest(leg=rel):
+                arm = json.loads((DV / rel).read_text(encoding="utf-8"))
+                twin = json.loads((DV / twin_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(arm, self.schema)
+                self.assertNotIn("disablePrepPointwiseFast", twin["generatorArgs"], twin_rel)
+                self.assertEqual(arm["legId"], twin["legId"] + "-nofast")
+                self.assertEqual(arm["card"], "VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1")
+                self.assertIs(arm["generatorArgs"].pop("disablePrepPointwiseFast"), True)
+                self.assertEqual(dict(arm, legId=twin["legId"], card=twin["card"]), twin)
+                self.assertEqual(list(arm), list(twin), "the twin's keys in the twin's order")
+
+    def test_the_schema_admits_a_pace_receipt_only_on_a_forced_look_speed_leg_and_whole(self) -> None:
+        """VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: generatorArgs.lookReceipt needs lookReceiptSha256 and forceLookAssist true and a speed leg;
+        the hash alone, a look leg, or a speed leg that does not force Look Assist is refused."""
+        pace = json.loads((DV / AGXOFF_UNPACED_PACE_LEG).read_text(encoding="utf-8"))
+        self.jsonschema.validate(pace, self.schema)
+        args = pace["generatorArgs"]
+        drop = lambda *keys: {k: v for k, v in args.items() if k not in keys}
+        look = json.loads((DV / next(iter(AGXOFF_UNPACED_LEGS))).read_text(encoding="utf-8"))
+        for name, bad in (("receipt without its hash", dict(pace, generatorArgs=drop("lookReceiptSha256"))),
+                          ("hash without its receipt", dict(pace, generatorArgs=drop("lookReceipt"))),
+                          ("receipt without forceLookAssist", dict(pace, generatorArgs=drop("forceLookAssist", "lookFlavor"))),
+                          ("receipt with forceLookAssist false", dict(pace, generatorArgs=dict(args, forceLookAssist=False))),
+                          ("receipt on a look leg", dict(look, generatorArgs=dict(look["generatorArgs"], forceLookAssist=True, lookReceipt=args["lookReceipt"],
+                                                                                    lookReceiptSha256=args["lookReceiptSha256"]))),
+                          ("a path outside look-receipts", dict(pace, generatorArgs=dict(args, lookReceipt="../agx-off.marxml"))),
+                          ("a short hash", dict(pace, generatorArgs=dict(args, lookReceiptSha256="ab")))):
+            with self.subTest(case=name):
+                with self.assertRaises(self.jsonschema.ValidationError):
+                    self.jsonschema.validate(bad, self.schema)
+
     def test_no_leg_spec_that_existed_at_the_base_changed(self) -> None:
         if not _base_commit_available():
             self.skipTest(f"base commit {LOOK_RECEIPT_BASE[:12]} is not in this clone")
@@ -7434,6 +7551,40 @@ class LookReceiptRunnerTests(RunnerHarness, unittest.TestCase):
         [call] = self.generator_calls()
         self.assertNotIn("LookReceiptPath", call)
 
+    # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: a capture-free pace leg names the receipt in generatorArgs and is read the same way.
+    def pace_spec(self, leg_type: str = "speed", **gen_args) -> Path:
+        spec = json.loads(self.write_spec(leg_type=leg_type, flavor="cinematic", scale=2).read_text(encoding="utf-8"))
+        spec["generatorArgs"] = dict(gen_args)
+        path = self.tmp / f"spec-pace-receipt-{leg_type}-{hashlib.sha1(json.dumps(gen_args, sort_keys=True).encode()).hexdigest()[:10]}.json"
+        path.write_text(json.dumps(spec), encoding="utf-8")
+        return path
+
+    def test_a_pace_legs_committed_receipt_bytes_reach_the_generator(self) -> None:
+        sha = hashlib.sha256(self.committed).hexdigest()
+        proc, receipt, submitted = self.run_receipt_leg(self.pace_spec(forceLookAssist=True, lookFlavor="cinematic", lookReceipt="look-receipts/agx-off.marxml",
+                                                                       lookReceiptSha256=sha), gen_refusal="DUAL_VENUE_UNIT_STOP")
+        self.assertEqual(receipt["refusal"], "GENERATOR_REFUSED_DUAL_VENUE_UNIT_STOP", proc.stdout + proc.stderr)
+        [call] = self.generator_calls()
+        found = re.search(r"(?:^|;)LookReceiptPath=([^;]+)", call)
+        self.assertIsNotNone(found, call)
+        self.assertEqual(Path(found.group(1)).read_bytes(), self.committed, "the generator is handed the COMMITTED bytes, not the working copy")
+        self.assertIn("ForceLookAssist=True", call)
+        self.assertNotIn("ContactSheet=", call)
+        self.assertEqual(submitted, [])
+
+    def test_a_pace_receipt_unbound_or_off_a_forced_look_speed_leg_is_refused(self) -> None:
+        sha = hashlib.sha256(self.committed).hexdigest()
+        force = {"forceLookAssist": True, "lookFlavor": "cinematic"}
+        for name, leg_type, args in (("working-copy hash", "speed", dict(force, lookReceipt="look-receipts/agx-off.marxml", lookReceiptSha256=hashlib.sha256(self.working).hexdigest())),
+                                     ("hash alone", "speed", dict(force, lookReceiptSha256=sha)),
+                                     ("receipt alone", "speed", dict(force, lookReceipt="look-receipts/agx-off.marxml")),
+                                     ("both null (adversary A2)", "speed", dict(force, lookReceipt=None, lookReceiptSha256=None)),
+                                     ("both empty", "speed", dict(force, lookReceipt="", lookReceiptSha256="")),
+                                     ("not forcing Look Assist", "speed", {"lookReceipt": "look-receipts/agx-off.marxml", "lookReceiptSha256": sha}),
+                                     ("on a look leg", "look", {"lookReceipt": "look-receipts/agx-off.marxml", "lookReceiptSha256": sha})):
+            with self.subTest(case=name):
+                self.assertUnbound(self.pace_spec(leg_type, **args))
+
 
 @requires_windows_pwsh
 class LookReceiptValidatorTests(EvidenceFactory, ModuleMutationMixin, unittest.TestCase):
@@ -7478,6 +7629,55 @@ class LookReceiptValidatorTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         rc, pl = self.cases(module=mutated)
         self.expect(rc[1], "ADVISORY", "with the rule removed a foreign receipt hash is believed -- so the rule is what refuses it")
         self.expect(pl[1], "ADVISORY", "with the rule removed a receipt hash on a plain leg is believed")
+
+    # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the same rule for a capture-free pace leg, whose spec names its receipt in generatorArgs.
+    PACE_RULE = "if ([string](Get-DvProp (Get-DvProp $spec 'generatorArgs') 'lookReceiptSha256') -cne $paceRunReceipt"
+
+    def pace_failure_evidence(self, name: str, receipt_sha: str | None) -> Path:
+        summary = dict(real_failure_summary("GPU_RECON_FRAMES_ZERO"))
+        if receipt_sha is not None:
+            summary["lookReceiptSha256"] = receipt_sha
+        ev = self.evidence(name, source_frames=False, exact_summary=summary, token="GPU_RECON_FRAMES_ZERO", exit_code=13)
+        (ev / "evidence-manifest.json").unlink()   # the job writes none on a product-failure terminal
+        return ev
+
+    def pace_cases(self, module: Path | None = None) -> tuple[list, list]:
+        spec = json.loads(self.write_spec(leg_type="speed").read_text(encoding="utf-8"))
+        spec["generatorArgs"] = {"forceLookAssist": True, "lookFlavor": "cinematic", "lookReceipt": "look-receipts/agx-off.marxml", "lookReceiptSha256": self.sha}
+        receipt_spec = self.tmp / "spec-pace-receipt.json"
+        receipt_spec.write_text(json.dumps(spec), encoding="utf-8")
+        plain_repo = self.prod_repo(leg_type="speed")
+        plain_spec = self.spec_path
+        receipt_repo = self.prod_repo(leg_type="speed", spec=receipt_spec)
+        bound = self.evidence("pr-bound", backend="cpu", summary={"lookReceiptSha256": self.sha})
+        foreign = self.evidence("pr-foreign", backend="cpu", summary={"lookReceiptSha256": "0" * 64})
+        none = self.evidence("pr-none", backend="cpu")
+        # (a product-failure terminal: its summary states a hash only when the job wrote one; a stated hash is held to the spec's)
+        ft_foreign = self.pace_failure_evidence("pr-ft-foreign", "0" * 64)
+        ft_bound = self.pace_failure_evidence("pr-ft-bound", self.sha)
+        ft_none = self.pace_failure_evidence("pr-ft-none", None)
+        rc = self.status_batch(receipt_repo, [(self.receipt_for(receipt_repo, ev, backend="cpu", spec_path=receipt_spec), None) for ev in (bound, foreign, none)]
+                               + [(self.receipt_for(receipt_repo, ev, outcome="FAIL", spec_path=receipt_spec), None) for ev in (ft_foreign, ft_bound, ft_none)], module=module)
+        pl = self.status_batch(plain_repo, [(self.receipt_for(plain_repo, ev, backend="cpu", spec_path=plain_spec), None) for ev in (none, bound)], module=module)
+        return rc, pl
+
+    def test_a_pace_leg_run_receipt_hash_is_accepted_only_where_the_committed_spec_names_it(self) -> None:
+        rc, pl = self.pace_cases()
+        self.expect(rc[0], "ADVISORY", "the pace spec's receipt, bound in the hashed summary")
+        self.expect(rc[1], "INVALID", "another receipt hash", "LOOK_RECEIPT_MISMATCH")
+        self.expect(rc[2], "INVALID", "a pace receipt leg whose run recorded none", "LOOK_RECEIPT_MISMATCH")
+        self.expect(rc[3], "INVALID", "a failure terminal stating another receipt hash (adversary A1)", "LOOK_RECEIPT_MISMATCH")
+        self.expect(rc[4], "ADVISORY", "a failure terminal stating the spec's receipt hash")
+        self.expect(rc[5], "ADVISORY", "a failure terminal stating none (the variant edit reaches the success summary only)")
+        self.expect(pl[0], "ADVISORY", "no receipt on either side (every earlier speed leg)")
+        self.expect(pl[1], "INVALID", "a receipt hash on a speed leg whose spec names none", "LOOK_RECEIPT_MISMATCH")
+
+    def test_mutation_without_the_pace_rule_a_foreign_pace_receipt_hash_is_advisory(self) -> None:
+        mutated = self.mutated_module([(self.PACE_RULE, self.PACE_RULE.replace("if (", "if ($false -and ", 1))])
+        rc, pl = self.pace_cases(module=mutated)
+        self.expect(rc[1], "ADVISORY", "with the pace rule removed a foreign receipt hash is believed -- so the rule is what refuses it")
+        self.expect(rc[3], "ADVISORY", "with the pace rule removed a failure terminal's foreign hash is believed")
+        self.expect(pl[1], "ADVISORY", "with the pace rule removed a receipt hash on a plain speed leg is believed")
 
 
 @requires_windows_pwsh
@@ -7570,13 +7770,37 @@ class LookReceiptGeneratorTests(unittest.TestCase):
         parsed = run_pwsh(["-Command", f"$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('{self.tmp / 'receipt.job.ps1'}', [ref]$null, [ref]$e); $e.Count"])
         self.assertEqual(parsed.stdout.strip(), "0", parsed.stdout + parsed.stderr)
 
-    def test_a_receipt_off_a_look_leg_is_refused_before_anything_is_emitted(self) -> None:
-        for name, extra in (("speed", []), ("pace", ["-ForceLookAssist", "-LookPaceLeg"])):
+    def test_a_receipt_off_a_look_or_pace_leg_is_refused_before_anything_is_emitted(self) -> None:
+        # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: a capture-free pace leg (-ForceLookAssist -LookPaceLeg) may carry one now; a plain speed leg still may not.
+        for name, extra in (("speed", []), ("unpaced speed", ["-Unpaced", "-SwapInterval", "0"])):
             with self.subTest(leg=name):
-                proc, out = self.run_generator(GENERATOR, f"refused-{name}.job.ps1", [*extra, "-LookReceiptPath", str(self.receipt)])
+                proc, out = self.run_generator(GENERATOR, f"refused-{name.replace(' ', '-')}.job.ps1", [*extra, "-LookReceiptPath", str(self.receipt)])
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("DUAL_VENUE_LOOK_RECEIPT_REQUIRES_LOOK_LEG", proc.stdout + proc.stderr)
                 self.assertFalse(out.exists())
+
+    def test_a_pace_leg_receipt_is_embedded_passed_once_and_recorded_like_a_look_legs(self) -> None:
+        """VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: on a capture-free pace leg (-ForceLookAssist -LookPaceLeg, unpaced, no contact sheet) the
+        receipt ships the way a look leg's does: base64 + sha256, -Receipt exactly once, written and re-verified before the smoke command, its hash in
+        the success summary; the summary still says lookLeg false (a pace leg)."""
+        sha = hashlib.sha256(self.receipt.read_bytes()).hexdigest()
+        pace = ["-Backend", "cpu", "-ScaleFactor", "2", "-ExpectedScaleRequest", "2", "-TelemetryArm", "LIGHT", "-CpuQuiescenceThresholdPercent", "95",
+                "-ForceLookAssist", "-LookPaceLeg", "-LookFlavor", "cinematic", "-Unpaced", "-SwapInterval", "0"]
+        plain = self.generate(GENERATOR, "pace-plain.job.ps1", pace).read_text(encoding="utf-8")
+        self.assertNotIn("LookReceipt", plain)
+        text = self.generate(GENERATOR, "pace-receipt.job.ps1", [*pace, "-LookReceiptPath", str(self.receipt)]).read_text(encoding="utf-8")
+        [b64] = re.findall(r"(?m)^\$LookReceiptBase64 = '([A-Za-z0-9+/=]+)'\r?$", text)
+        import base64
+        self.assertEqual(base64.b64decode(b64), self.receipt.read_bytes())
+        self.assertEqual(re.findall(r"(?m)^\$LookReceiptSha256 = '([0-9a-f]{64})'\r?$", text), [sha])
+        self.assertEqual(text.count(" -Receipt "), 1, "the smoke runner is passed -Receipt exactly once")
+        self.assertIn("-RequireLookAssist:`$true -Receipt $(ConvertTo-PsSingleQuoted $LookReceiptJobPath) -Scope none", text)
+        self.assertEqual(text.count("    lookReceiptSha256 = $LookReceiptSha256\n") + text.count("    lookReceiptSha256 = $LookReceiptSha256\r\n"), 1, "the success summary records the hash")
+        self.assertIn("    lookLeg = ($LookLeg -and -not $LookPaceLeg)", text)
+        self.assertLess(text.index("$LookReceiptJobPath = Join-Path $Work 'look-receipt.marxml'"), text.index(" -Receipt $(ConvertTo-PsSingleQuoted $LookReceiptJobPath)"))
+        self.assertEqual(text.count("'MLVAPP_PLAYBACK_UNPACED=1',"), 1)
+        parsed = run_pwsh(["-Command", f"$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('{self.tmp / 'pace-receipt.job.ps1'}', [ref]$null, [ref]$e); $e.Count"])
+        self.assertEqual(parsed.stdout.strip(), "0", parsed.stdout + parsed.stderr)
 
 
 # ---------------------------------------------------------------------------------------------------

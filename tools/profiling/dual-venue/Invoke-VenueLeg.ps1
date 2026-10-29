@@ -411,11 +411,20 @@ try {
     }
     # LOOK-ASSIST-FILM-FLAVOR-2 r2: a look leg's optional receipt (the GUI smoke applies it before playback). Its bytes are the blob COMMITTED at the admission
     # head (offline test mode: the repo's HEAD), never the working copy, and must hash to look.receiptSha256, which legSpecSha256 binds.
+    # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: a capture-free pace leg (a speed leg forcing Look Assist) may name the same receipt in
+    # generatorArgs.lookReceipt / lookReceiptSha256, read the same way. Named anywhere else (a look leg, or a speed leg not forcing Look Assist) it is refused, never ignored.
     $lookReceiptPath = $null
-    if ($isLook) {
+    $paceReceiptLook = $null
+    if ($null -ne $spec.PSObject.Properties['generatorArgs'] -and ($spec.generatorArgs.PSObject.Properties['lookReceipt'] -or $spec.generatorArgs.PSObject.Properties['lookReceiptSha256'])) {
+        if ($isLook -or -not ($spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist)) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
+        $paceReceiptLook = [pscustomobject]@{ receipt = [string]$spec.generatorArgs.lookReceipt; receiptSha256 = [string]$spec.generatorArgs.lookReceiptSha256 }
+    }
+    if ($isLook -or $null -ne $paceReceiptLook) {
         $receiptCommit = if ($OfflineTestMode) { [string](& git -C $RepoRoot rev-parse --verify HEAD 2>$null) } else { [string]$sources.headCommit }
-        $lookReceipt = Read-DvCommittedLookReceipt -RepoRoot $RepoRoot -Commit $receiptCommit.Trim() -Look $spec.look
+        $lookReceipt = Read-DvCommittedLookReceipt -RepoRoot $RepoRoot -Commit $receiptCommit.Trim() -Look $(if ($isLook) { $spec.look } else { $paceReceiptLook })
         if (-not $lookReceipt.ok) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
+        # (a pace leg that names the keys must name a receipt: empty or null values are refused, never read as "no receipt")
+        if ($null -ne $paceReceiptLook -and -not $lookReceipt.present) { Stop-Refused 'LOOK_RECEIPT_UNBOUND' }
         if ($lookReceipt.present) {
             $lookReceiptPath = Join-Path $workDirResolved "$jobStem.look-receipt.marxml"
             [IO.File]::WriteAllBytes($lookReceiptPath, $lookReceipt.bytes)
@@ -446,6 +455,12 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['swapInterval']) { $gen['SwapInterval'] = [int]$spec.generatorArgs.swapInterval }
         # PLAYBACK-LJ92-DECODE-THROUGHPUT-1: the raw-uint16 prefetch decoder count, for any leg (not only a forced-look pace leg).
         if ($spec.generatorArgs.PSObject.Properties['rawPrefetchDecoders']) { $gen['RawPrefetchDecoders'] = [int]$spec.generatorArgs.rawPrefetchDecoders }
+        # BACHELOR-CORE-PARTITION-AB-1: the core-partition A/B (bench affinity, the MLV-owned E-core load, the telemetry helper), for any leg; the generator refuses a bad combination, typed.
+        if ($spec.generatorArgs.PSObject.Properties['benchAffinityMask']) { $gen['BenchAffinityMask'] = [string]$spec.generatorArgs.benchAffinityMask }
+        if ($spec.generatorArgs.PSObject.Properties['partitionLoadMask']) { $gen['PartitionLoadMask'] = [string]$spec.generatorArgs.partitionLoadMask }
+        if ($spec.generatorArgs.PSObject.Properties['partitionLoadThreads']) { $gen['PartitionLoadThreads'] = [int]$spec.generatorArgs.partitionLoadThreads }
+        if ($spec.generatorArgs.PSObject.Properties['corePartitionTelemetry'] -and [bool]$spec.generatorArgs.corePartitionTelemetry) { $gen['CorePartitionTelemetry'] = $true }
+        if ($spec.generatorArgs.PSObject.Properties['corePartitionHelperMask']) { $gen['CorePartitionHelperMask'] = [string]$spec.generatorArgs.corePartitionHelperMask }
         # GPU-EVENT153-ROOTCAUSE-2: the CUDA per-launch timer and its line threshold, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['cudaLaunchTimingMinMs']) { $gen['CudaLaunchTimingMinMs'] = [double]$spec.generatorArgs.cudaLaunchTimingMinMs }
         # GPU-DEVICE-LOSS-SELF-HEAL-1 r2: the injected device loss, the safe-start clear, the shared settings store and the pre-launches of the self-heal proof, for any leg.
@@ -463,6 +478,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['warmReuseMissDump'] -and [bool]$spec.generatorArgs.warmReuseMissDump) { $gen['WarmReuseMissDump'] = $true }
         # CUDA-HEADROOM-1: an unpaced throughput leg (no pace guard, drop-frame off), for any leg; judged below by the app's own pace_unpaced line.
         if ($spec.generatorArgs.PSObject.Properties['unpaced'] -and [bool]$spec.generatorArgs.unpaced) { $gen['Unpaced'] = $true }
+        # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the #680 prep pointwise fast path's kill switch, for any leg. Only a JSON true arms it (a string "false" is not true).
+        if ($spec.generatorArgs.PSObject.Properties['disablePrepPointwiseFast'] -and $spec.generatorArgs.disablePrepPointwiseFast -is [bool] -and $spec.generatorArgs.disablePrepPointwiseFast) { $gen['DisablePrepPointwiseFast'] = $true }
         # PLAYBACK-SCOPES-OPTION-1: the live scope the smoke forces on, and the app's playback scope throttle interval, for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scope']) { $gen['Scope'] = [string]$spec.generatorArgs.scope }
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }
@@ -473,6 +490,8 @@ try {
             $gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true
             if ($spec.generatorArgs.PSObject.Properties['lookFlavor']) { $gen['LookFlavor'] = [string]$spec.generatorArgs.lookFlavor }
             if ($spec.generatorArgs.PSObject.Properties['playbackRenderLookaheadFrames']) { $gen['PlaybackRenderLookaheadFrames'] = [int]$spec.generatorArgs.playbackRenderLookaheadFrames }
+            # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the pace leg's committed look receipt (read and bound above).
+            if ($null -ne $lookReceiptPath) { $gen['LookReceiptPath'] = $lookReceiptPath }
         }
     }
     # PLAYBACK-VISUAL-INSPECTION-1: the post-measurement window capture, for every speed leg that does not opt out.
@@ -489,7 +508,8 @@ try {
         # receipt, recorded as its TOKEN only (a message may echo a value). Anything untyped is a runner error.
         $first = ([string]$_.Exception.Message -split '\s+')[0]
         # ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING (CPU-LEG-SMOKE-CEILING-1): an input too large for a bounded leg at the measured read rate is a typed refusal, not a runner error.
-        if ($first -match '^((PLAYBACK_ATTR3|DUAL_VENUE)_[A-Z0-9_]+|ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING)$') { Stop-Refused "GENERATOR_REFUSED_$first" }
+        # BACHELOR-CORE-PARTITION-AB-1: the generator's CORE_PARTITION_* mask / combination refusals are typed too (dot B3).
+        if ($first -match '^((PLAYBACK_ATTR3|DUAL_VENUE|CORE_PARTITION)_[A-Z0-9_]+|ATTRCUDA_TIMEBUDGET_EXCEEDS_SMOKE_CEILING)$') { Stop-Refused "GENERATOR_REFUSED_$first" }
         throw
     }
     $generated = $genOut[-1]

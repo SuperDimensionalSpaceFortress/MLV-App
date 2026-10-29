@@ -44,7 +44,7 @@ function Want([string]$Name) { return ($Only.Count -eq 0 -or $Only -contains $Na
 $tokens = $null; $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($agentScript, [ref]$tokens, [ref]$parseErrors)
 Assert-True ($parseErrors.Count -eq 0) "agent parses ($($parseErrors.Count) errors)"
-foreach ($name in @('ConvertFrom-HeavySlotFeedRows', 'Get-SustainedHeatVerdict', 'Get-HeavySlotOccupancy', 'Get-HeavySlotVerdict')) {
+foreach ($name in @('ConvertFrom-HeavySlotFeedRows', 'ConvertFrom-HeavySlotHolderText', 'Get-SustainedHeatVerdict', 'Get-HeavySlotOccupancy', 'Get-HeavySlotVerdict')) {
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     Assert-True ($null -ne $fn) "agent defines $name"
     . ([scriptblock]::Create($fn.Extent.Text))
@@ -125,10 +125,18 @@ Assert-True ($vLabel.state -eq 'holder-lost') "same owner pid, other label is ho
 $vBare = Get-HeavySlotVerdict -Status $statusOwn -Feed $clearFeed -OwnSlot 1
 Assert-True ($vBare.state -eq 'holder-lost' -and $vBare.busy -eq 1) "an own slot with no owner identity to verify is never excluded: $($vBare.state)"
 $unit.ownerCheck = [ordered]@{ foreignOwner = $vTaken.state; otherPid = $vPid.state; otherLabel = $vLabel.state; noIdentity = $vBare.state }
+# AGENT-LEASE-PENDING-HEAT-TRACE-1 (adversary r3 A2): an owner label may itself contain "(pid N)" (job id 'suite (pid 12)' -> label 'mlv suite (pid 12)'); the
+# metadata group is the LAST "(pid N, since ..., held M min)" before the optional [mode] tag, so the own slot is still recognised as this holder's.
+$statusParen = @{ ok = $true; error = $null; lines = @('slot 1: mlv suite (pid 12) (pid 77, since 2026-10-25 10:00:00, held 5 min) [exclusive]', 'slot 2: free') }
+$oParen = Get-HeavySlotOccupancy -Status $statusParen -OwnSlot 1 -OwnPid 77 -Label 'mlv suite (pid 12)'
+Assert-True ($oParen.ok -and -not $oParen.ownLost -and $oParen.busy -eq 0) "label containing '(pid 12)': the own slot is still this holder's (ownLost=$($oParen.ownLost) busy=$($oParen.busy) why=$($oParen.why))"
+$oParenOther = Get-HeavySlotOccupancy -Status $statusParen -OwnSlot 1 -OwnPid 78 -Label 'mlv suite (pid 12)'
+Assert-True ($oParenOther.ownLost -and $oParenOther.busy -eq 1) "label containing '(pid 12)', other owner pid 78: still holder-lost (ownLost=$($oParenOther.ownLost))"
+$unit.ownerParenLabel = [ordered]@{ own = $oParen.ownLost; otherPid = $oParenOther.ownLost }
 
 # r2: sol's exact repro, through the agent's REAL Wait-HeavySlotAdmission / Get-HeavySlotHolderState /
 # Test-HeavySlotHolderHeld / Confirm-HeavySlotHeldForLaunch, with the holder process, status and feed mocked.
-foreach ($name in @('Read-JsonFile', 'Get-HeavySlotHolderState', 'Test-HeavySlotHolderHeld', 'Add-HeavySlotHolderLoss', 'Add-HeavySlotHolderLossToAdmission', 'Wait-HeavySlotAdmission', 'Confirm-HeavySlotHeldForLaunch', 'Invoke-ExemptJobsDuringWait', 'Get-HeavySlotLabel', 'Format-HeavySlotHolderNote')) {
+foreach ($name in @('Read-JsonFile', 'Get-HeavySlotHolderState', 'Test-HeavySlotHolderHeld', 'Add-HeavySlotHolderLoss', 'Add-HeavySlotHolderLossToAdmission', 'Wait-HeavySlotAdmission', 'Confirm-HeavySlotHeldForLaunch', 'Invoke-ExemptJobsDuringWait', 'Get-HeavySlotLabel', 'ConvertFrom-HeavySlotHolderText', 'Format-HeavySlotHolderNote')) {
     $fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $true)
     Assert-True ($null -ne $fn) "agent defines $name"
     . ([scriptblock]::Create($fn.Extent.Text))
@@ -427,6 +435,7 @@ try {
     Assert-True ((Format-HeavySlotHolderNote -Holders @("suite X (pid 77, since 2026-10-11 18:00:00, held 62 min) [exclusive]")) -ceq ' holder=suite X held=62m') "holder note: plain holder"
     Assert-True ((Format-HeavySlotHolderNote -Holders @("a (pid 1, since S, held 3 min)", "b (pid 2, since S, held 70 min) [exclusive]", "c (pid 3, since S, held 9 min)")) -ceq ' holder=b held=70m') "holder note: the longest-held holder is named"
     Assert-True ((Format-HeavySlotHolderNote -Holders @("old (pid 4, since 2026-10-11 18:00:00) [exclusive]")) -ceq ' holder=old held=?m') "holder note: a status line without a held field gives held=?m"
+    Assert-True ((Format-HeavySlotHolderNote -Holders @('mlv suite (pid 12) (pid 77, since 2026-10-25 10:00:00, held 5 min) [exclusive]')) -ceq ' holder=mlv suite (pid 12) held=5m') "holder note (adversary r3 A2): a label containing '(pid 12)' is kept whole and the held minutes are read from the LAST group"
     Assert-True ((Format-HeavySlotHolderNote -Holders @()) -ceq '') "holder note: no holder, no field"
     Assert-True ((Format-HeavySlotHolderNote -Holders $null) -ceq '') "holder note: null holders, no field"
     $label64 = 'x' * 64
