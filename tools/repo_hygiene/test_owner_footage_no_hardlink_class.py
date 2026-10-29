@@ -356,16 +356,16 @@ LANE_DIRTY_SAVE_PS_LAUNCH_WRITES = {
 # ps_ast_inventory.ps1 Get-UseSite), so a new alias or call is a new site. A reference by ANOTHER name (a provider path, SessionState) is the r16 rule below.
 LANE_DIRTY_SAVE_PS_LAUNCH_OBJECTS = {"psi", "savedEnv", "gitEnv", "shape", "stagedTmp", "gitDir", "GitArgs", "GitDiffArgs"}
 LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES = {
-    "gitargs @ @('-C', $Wt) + $GitArgs", "gitargs @ param [string[]]$GitArgs",
-    "gitdiffargs @ @('-C', $Wt) + $GitDiffArgs", "gitdiffargs @ param [string[]]$GitDiffArgs",
+    "gitargs @ (@('-C', $Wt) + $GitArgs)", "gitargs @ param [string[]]$GitArgs",
+    "gitdiffargs @ (@('-C', $Wt) + $GitDiffArgs)", "gitdiffargs @ param [string[]]$GitDiffArgs",
     "gitdir @ $cdFile = Join-Path $GitDir 'commondir'", "gitdir @ $common = $GitDir",
     "gitdir @ $common = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($GitDir, $text))", "gitdir @ $p = Join-Path $GitDir $n",
-    "gitdir @ Get-DirtyDirIdentity $GitDir", "gitdir @ param [string]$GitDir",
+    "gitdir @ @{ GitId = (Get-DirtyDirIdentity $GitDir); CommonDir = $common; CommonId = (Get-DirtyDirIdentity $common); Absent = $absent }", "gitdir @ param [string]$GitDir",
     "gitdir @ $env:GIT_COMMON_DIR = $gitDir[1]", "gitdir @ $env:GIT_DIR = $gitDir[0]", "gitdir @ $gitDir",
     "gitdir @ $gitDir = @(& git -C $Wt rev-parse --path-format=absolute --absolute-git-dir --git-common-dir 2>$null)",
     "gitdir @ $h = Lock-DirtyDirectory $gitDir[$i]", "gitdir @ $i -lt $gitDir.Count",
     "gitdir @ $LASTEXITCODE -ne 0 -or $again.Count -ne 2 -or $again[0] -cne $gitDir[0] -or $again[1] -cne $gitDir[1]",
-    "gitdir @ $LASTEXITCODE -ne 0 -or $gitDir.Count -ne 2", "gitdir @ Get-DirtyDirIdentity $gitDir[$i]", "gitdir @ Join-Path $gitDir[0] 'commondir'",
+    "gitdir @ $LASTEXITCODE -ne 0 -or $gitDir.Count -ne 2", "gitdir @ (Get-DirtyDirIdentity $gitDir[$i]) -cne $gitDirIds[$i]", "gitdir @ (Join-Path $Wt '.git'), (Join-Path $gitDir[0] 'commondir')",
     "gitenv @ $gitEnv",
     "gitenv @ $gitEnv = 'GIT_DIFF_OPTS', 'GIT_EXTERNAL_DIFF', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX'",
     "psi @ $p = [System.Diagnostics.Process]::Start($psi)", "psi @ $psi = New-Object System.Diagnostics.ProcessStartInfo",
@@ -378,7 +378,8 @@ LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES = {
     "shape @ $shape = @('--binary', '--no-ext-diff', '--no-textconv', '--no-color', '--no-renames', '--submodule=short', '--ignore-submodules=none', '-U3', "
     "'--src-prefix=a/', '--dst-prefix=b/')",
     "shape @ $stagedCap = Invoke-DirtyGitCapture -Wt $Wt -GitArgs (@('diff', '--cached') + $shape)",
-    "shape @ @('diff', '--cached') + $shape", "shape @ @('diff', 'HEAD') + $shape",
+    "shape @ -not (Test-DirtyPatchComplete -Wt $Wt -Full $stagedFull -GitDiffArgs (@('diff', '--cached') + $shape))",
+    "shape @ -not (Test-DirtyPatchComplete -Wt $Wt -Full $full -GitDiffArgs (@('diff', 'HEAD') + $shape))",
     "stagedtmp @ $stagedFull = Write-DirtyTempBytes $stagedTmp $stagedCap.Bytes",
     "stagedtmp @ $stagedPlaced = Move-DirtyEvidenceToFreeName -Tmp $stagedTmp.Path -Dir $Dest -Stem 'dirty-worktree-staged-' -Ext '.diff' -Full $stagedFull "
     "-Guard $guard -Hold $stagedTmp -DirHandle $destDir",
@@ -386,7 +387,7 @@ LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES = {
     "stagedtmp @ $stagedTmp = New-DirtyHeldTemp $Dest ('dirty-worktree-staging-' + [Guid]::NewGuid().ToString('N') + '.tmp') $destDir",
     "stagedtmp @ $tmp, $stagedTmp, $statTmp, $mergeTmp", "stagedtmp @ $why = $stagedTmp.Reason", "stagedtmp @ $why = Test-DirtyTempHeld $stagedTmp",
     "stagedtmp @ & git -C $Wt apply --cached --check -R --whitespace=nowarn $stagedTmp.Path 2>$null", "stagedtmp @ -not $stagedTmp.Path",
-    "stagedtmp @ Test-DirtyEvidenceUnchanged -Path $stagedTmp.Path -Full $stagedFull",
+    "stagedtmp @ -not (Test-DirtyEvidenceUnchanged -Path $stagedTmp.Path -Full $stagedFull)",
 }
 # r16 (sol r15b B1): every pin above follows a NAME, and PowerShell reaches a binding by other names too: (Get-Item Variable:psi).Value IS $psi, and
 # Set-Item Variable:isUnc rebinds a call variable. The whole provider / session-state binding class is therefore DEFAULT-DENY, whatever the variable:
@@ -436,7 +437,19 @@ _PS_USE_NAMES = sorted(LANE_DIRTY_SAVE_PS_LAUNCH_OBJECTS | LANE_DIRTY_SAVE_PS_PR
 _PAYLOAD_PROCESS_RE = re.compile(
     r"\bProcess\b|ProcessStartInfo|ShellExecute|CreateProcess|WinExec|\bActivator\b|\bdynamic\b|\bGetType\s*\(|SetEnvironmentVariable"
     # r15 iter 2 (adversary 39a58424-A2): PowerShell itself is a default Add-Type reference, so its scripting API runs any script from C#
-    r"|\bPowerShell\b|ScriptBlock|Runspace|AddScript|AddCommand|InvokeScript|InvokeCommand|System\.Management|\bCompile\s*\(|\bAppDomain\b|\bAssembly\b|Emit\b")  # C# is case-sensitive: a case variant does not compile
+    r"|\bPowerShell\b|ScriptBlock|Runspace|AddScript|AddCommand|InvokeScript|InvokeCommand|System\.Management|\bCompile\s*\(|\bAppDomain\b|\bAssembly\b|Emit\b"
+    # r16 (adversary a11c4459-A2): Microsoft.VisualBasic.Interaction.Shell starts a process; COM activation by ProgID / CLSID runs any registered server
+    r"|\bShell\b|Interaction|VisualBasic|GetTypeFrom\w*|\bglobal::|\bnamespace\b|\bextern\s+alias\b")  # C# is case-sensitive: a case variant does not compile
+# r16 (adversary a11c4459-A2), default-deny: the payload's using directives are exactly these, and every name it qualifies from System. or Microsoft. is
+# one of these, so a library outside them (Microsoft.VisualBasic, System.Diagnostics, System.Net, ...) cannot be reached by its full name or an alias
+LANE_DIRTY_SAVE_PAYLOAD_USINGS = ["using System;", "using System.Runtime.InteropServices;", "using System.Text;"]
+LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED = {
+    "Microsoft.Win32.SafeHandles.SafeFileHandle", "System.IO.FileAccess.Read", "System.IO.FileAccess.Write", "System.IO.FileStream",
+    "System.IO.Path.GetFileName", "System.IO.Path.GetFullPath", "System.Runtime.InteropServices", "System.Security.Cryptography.SHA256",
+    "System.Security.Cryptography.SHA256.Create", "System.Text",
+}
+_PAYLOAD_QUALIFIED_RE = re.compile(r"\b(?:System|Microsoft)(?:\s*\.\s*\w+)+")
+_PAYLOAD_USING_RE = re.compile(r"^\s*using\b(?!\s*\()[^\n]*", re.MULTILINE)
 # common parameters that write a variable by NAME (-OutVariable guard would put a pipeline's output into a call variable)
 _PS_VARIABLE_WRITING_PARAMETERS = ("outvariable", "errorvariable", "warningvariable", "informationvariable", "pipelinevariable")
 _PS_VARIABLE_WRITING_ALIASES = {"ov", "ev", "wv", "iv", "pv"}
@@ -661,6 +674,7 @@ def _ps_ast_violations(inv: dict, payload_bodies: list[str]) -> list[str]:
         if parameter["name"].lower() in launch_variables and f"param ${parameter['name']}: {'/'.join(parameter['types'])}" not in LANE_DIRTY_SAVE_PS_LAUNCH_WRITES:
             violations.append(f"{parameter['line']}: a launch variable parameter outside the pinned set: ${parameter['name']}")
     violations += [f"{row['line']}: the launch variable ${row['name']} is passed by [ref]" for row in inv["ref_vars"] if row["name"].lower() in launch_variables]
+    violations += [f"{row['line']}: an env or drive variable is passed by [ref]: ${row['name']}" for row in inv["ref_vars"] if ":" in row["name"]]  # r16 A4 sibling
     launch_objects = lowered(LANE_DIRTY_SAVE_PS_LAUNCH_OBJECTS)
     for use in inv["uses"]:
         if use["name"].lower() in launch_objects and f"{use['name'].lower()} @ {use['site']}" not in LANE_DIRTY_SAVE_PS_LAUNCH_OBJECT_USES:
@@ -736,6 +750,13 @@ def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
                             (_PAYLOAD_PROCESS_RE, "a process start or run-time binding")):
             for match in regex.finditer(body):
                 violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: {what} inside an Add-Type payload: {match.group(0)}")
+        usings = [match.group(0).strip() for match in _PAYLOAD_USING_RE.finditer(body)]
+        if usings != LANE_DIRTY_SAVE_PAYLOAD_USINGS:
+            violations.append(f"the Add-Type payload's using directives are not exactly {LANE_DIRTY_SAVE_PAYLOAD_USINGS}: {usings}")
+        for match in _PAYLOAD_QUALIFIED_RE.finditer(body):
+            if re.sub(r"\s+", "", match.group(0)) not in LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED:
+                violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: a process start or run-time binding inside an Add-Type payload "
+                                  f"(a qualified name outside the pinned set): {match.group(0)}")
     # the census proper runs on the text C# compiles: every escape resolved
     text = _CS_ESCAPE_RE.sub(_resolve_cs_escape, text)
     _, nt_calls, nt_violations, nt_spans = _native_census(
@@ -923,6 +944,8 @@ def r16_census_rows(text: str) -> dict[str, tuple[str, str]]:
     gitfile_first = "            $m = if ($first.Count -eq 1)"
     file_name = "(Get-Item Variable:psi).Value.FileName = 'C:/fixture/alternate.exe'"
     expected = "binding access"
+    launch_info = "$psi = New-Object System.Diagnostics.ProcessStartInfo"
+    call = "NtSetInformationFile(h, out io, info, (uint)size, 10);"
     return {
         # sol r15b B1, verbatim (the saver's launch sites are lines 569 and 667 at 48959b31; the UNC check is found by its text)
         "sol B1 Get-Item Variable:psi FileName before 569": (before_line(LAUNCH_569, file_name), expected),
@@ -984,6 +1007,28 @@ def r16_census_rows(text: str) -> dict[str, tuple[str, str]]:
         # fable r15 hardening (LANE-DIRTY-SAVE-CENSUS-PREFERENCE-WRITES-1): a parameter default reaches a pinned cmdlet without touching its call text
         "S $PSDefaultParameterValues": (at_line_50("$PSDefaultParameterValues['Add-Type:OutputAssembly'] = 'x.dll'"), expected),
         "S $global:PSDefaultParameterValues": (at_line_50("$global:PSDefaultParameterValues.Add('Resolve-Path:Relative', $true)"), expected),
+        # r16 iter 1 (adversary a11c4459): an assignment used as a value exports the object; a unary write; a VB / COM process start in the payload
+        "iter1 A1 an assignment used as a value exports the launch object": (
+            text.replace(launch_info, "$x = (" + launch_info + ")", 1).replace(LAUNCH_569, "    $x.FileName = 'alternate.exe'; [void]$x.ArgumentList.Add('--review-probe')\n" + LAUNCH_569, 1),
+            "a launch object used at a site outside the pinned set"),
+        "iter1 A1 an assignment passed as an argument": (text.replace(launch_info, "Add-DirtyReuseHold $list ($psi = New-Object System.Diagnostics.ProcessStartInfo)", 1),
+                                                          "a launch object used at a site outside the pinned set"),
+        "iter1 A1 a provider result exported by an outer assignment": (
+            text.replace("        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop",
+                         "        $Path = 'Vari' + 'able:psi'; $q = ($item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop); $q.Value.FileName = 'alternate.exe'", 1), expected),
+        "iter1 A2 VisualBasic Interaction.Shell": (text.replace(call, call + '\nMicrosoft.VisualBasic.Interaction.Shell(string.Format("pwsh.exe -NoProfile -Command \\"New-Item '
+                                                                 '-ItemType {0}{1} -Path C:/fixture/alias -Value C:/fixture/source.bin\\"", "Hard", "Link"), '
+                                                                 'Microsoft.VisualBasic.AppWinStyle.Hide, true, -1);', 1), "a process start or run-time binding"),
+        "iter1 A2 a using alias": (text.replace("using System.Text;", "using System.Text;\nusing VB = Microsoft.VisualBasic.Interaction;", 1),
+                                   "using directives are not exactly"),
+        "iter1 A2 a qualified name outside the set": (text.replace(call, call + '\nSystem.Net.WebClient c = null;', 1), "a qualified name outside the pinned set"),
+        "iter1 A2 COM by ProgID": (text.replace(call, call + '\nobject o = Type.GetTypeFromProgID("WScript.Shell");', 1), "a process start or run-time binding"),
+        "iter1 A4 ++$env:": (text + "\n++$env:GIT_CONFIG_COUNT\n", "written outside the pinned set"),
+        "iter1 A4 $env:++": (text + "\n$env:GIT_CONFIG_COUNT++\n", "written outside the pinned set"),
+        "iter1 A4 --$env:": (text + "\n--$env:GIT_CONFIG_COUNT\n", "written outside the pinned set"),
+        "iter1 A4 $env:--": (text + "\n$env:GIT_CONFIG_COUNT--\n", "written outside the pinned set"),
+        "iter1 A4 a launch variable incremented": (at_line_50("$gitDir[0]++"), "written outside the pinned set"),
+        "iter1 A4 an env var by [ref]": (at_line_50("$null = [DirtyFinalPath]::Pin([ref]$env:GIT_CONFIG_COUNT)"), "passed by [ref]"),
     }
 
 

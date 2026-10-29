@@ -47,18 +47,18 @@ function Get-ExpressionKind($Statement) {
 }
 
 function Get-UseSite($Var) {
-    # where a variable is used: the enclosing assignment if there is one within its statement, else the nearest command, expression statement,
-    # parameter or foreach header, so an alias ($x = $psi) or a call through it ($psi.ArgumentList.Add(...)) is its own site
+    # where a variable is used: the OUTERMOST assignment, command or expression statement that holds it within its statement, else its parameter or
+    # foreach header, so an alias ($x = $psi), a call through it ($psi.ArgumentList.Add(...)) and an assignment used as a value ($x = ($psi = ...),
+    # r16 adversary a11c4459-A1) are each their own site
     $node = $Var.Parent
     $site = $null
     while ($null -ne $node) {
         if ($node -is [System.Management.Automation.Language.StatementBlockAst] -or $node -is [System.Management.Automation.Language.NamedBlockAst] -or $node -is [System.Management.Automation.Language.ScriptBlockAst]) { break }
-        if ($node -is [System.Management.Automation.Language.AssignmentStatementAst]) { return $node.Extent.Text }
         if ($null -eq $site) {
             if ($node -is [System.Management.Automation.Language.ParameterAst]) { return 'param ' + $node.Extent.Text }
             if ($node -is [System.Management.Automation.Language.ForEachStatementAst]) { return 'foreach (' + $node.Variable.Extent.Text + ' in ' + $node.Condition.Extent.Text + ')' }
-            if ($node -is [System.Management.Automation.Language.CommandAst] -or $node -is [System.Management.Automation.Language.CommandExpressionAst]) { $site = $node.Extent.Text }
         }
+        if ($node -is [System.Management.Automation.Language.AssignmentStatementAst] -or $node -is [System.Management.Automation.Language.CommandAst] -or $node -is [System.Management.Automation.Language.CommandExpressionAst]) { $site = $node.Extent.Text }
         $node = $node.Parent
     }
     return $site
@@ -154,6 +154,19 @@ function Get-Inventory([string]$Text) {
                 $drive = $null
                 if ($left -is [System.Management.Automation.Language.VariableExpressionAst] -and $left.VariablePath.IsDriveQualified) { $drive = $left.VariablePath.UserPath }
                 $inv.assignments += [ordered]@{ line = $line; name = $name; names = $names; drive = $drive; operator = $node.Operator.ToString(); right = (Get-ExpressionKind $node.Right); left_text = $node.Left.Extent.Text; right_text = $node.Right.Extent.Text }
+                break
+            }
+            { $_ -is [System.Management.Automation.Language.UnaryExpressionAst] -and $_.TokenKind -in 'PlusPlus', 'MinusMinus', 'PostfixPlusPlus', 'PostfixMinusMinus' } {
+                # ++$x / $x-- write $x too: reported as an assignment whose operator is the token (r16 adversary a11c4459-A4)
+                $left = $node.Child
+                $name = $null
+                $drive = $null
+                if ($left -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                    $name = Get-UnqualifiedName $left.VariablePath
+                    if ($left.VariablePath.IsDriveQualified) { $drive = $left.VariablePath.UserPath }
+                }
+                $names = @($left.FindAll({ param($n) $n -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) | ForEach-Object { Get-UnqualifiedName $_.VariablePath })
+                $inv.assignments += [ordered]@{ line = $line; name = $name; names = $names; drive = $drive; operator = $node.TokenKind.ToString(); right = 'UnaryExpressionAst'; left_text = $left.Extent.Text; right_text = '' }
                 break
             }
             { $_ -is [System.Management.Automation.Language.ForEachStatementAst] } { $inv.foreach_vars += [ordered]@{ line = $line; name = (Get-UnqualifiedName $node.Variable.VariablePath); in_text = $node.Condition.Extent.Text }; break }

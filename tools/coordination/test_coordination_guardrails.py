@@ -4255,11 +4255,13 @@ def _dirty_save_env_capture_probe(tmp_path, shadow):
     for GIT_EXTERNAL_DIFF, the second variable the saver captures. Returns the result line and each variable as the caller sees it afterwards."""
     body = (
         "$ErrorActionPreference = 'Stop'; $env:GIT_DIFF_OPTS = '--unified=0'; $env:GIT_EXTERNAL_DIFF = 'review-placeholder'; "
+        "$env:GIT_DIR = 'C:\\fixture\\caller.git'; $env:GIT_COMMON_DIR = 'C:\\fixture\\common'; $env:GIT_WORK_TREE = 'C:\\fixture\\caller'; "
         "function Test-Path { param([string]$LiteralPath, [string]$PathType = 'Any') "
         "$r = Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath -PathType $PathType; "
         f"if ($r -and $LiteralPath -eq 'Env:GIT_EXTERNAL_DIFF') {{ {shadow} }}; $r }}; "
         f"$out = try {{ Save-DirtyWorktreeEvidence -Wt '{tmp_path}' -Dest '{tmp_path / 'missing'}' -CardName C1 }} catch {{ 'THREW ' + $_.Exception.GetType().Name }}; "
-        "'RESULT ' + $out; 'DIFF_OPTS ' + [string]$env:GIT_DIFF_OPTS; 'EXTERNAL ' + [string]$env:GIT_EXTERNAL_DIFF"
+        "'RESULT ' + $out; 'DIFF_OPTS ' + [string]$env:GIT_DIFF_OPTS; 'EXTERNAL ' + [string]$env:GIT_EXTERNAL_DIFF; "
+        "'REPO ' + [string]$env:GIT_DIR + '|' + [string]$env:GIT_COMMON_DIR + '|' + [string]$env:GIT_WORK_TREE"
     )
     result = dirty_save_pwsh(body)
     return result.stdout.splitlines(), result.stdout + result.stderr
@@ -4273,6 +4275,7 @@ def test_save_dirty_worktree_evidence_treats_a_variable_gone_between_check_and_r
     assert "RESULT DIRTY_TREE_SAVE_FAILED card=C1 reason=no-run-dir" in lines, shown
     assert "DIFF_OPTS --unified=0" in lines, shown  # the earlier capture is put back
     assert "EXTERNAL " in lines, shown  # gone before it was read: absent, so nothing to put back
+    assert "REPO C:\\fixture\\caller.git|C:\\fixture\\common|C:\\fixture\\caller" in lines, shown  # captured, cleared and put back
 
 
 @dirty_save_only
@@ -4282,6 +4285,8 @@ def test_save_dirty_worktree_evidence_fails_typed_and_restores_when_the_capture_
     assert "RESULT DIRTY_TREE_SAVE_FAILED card=C1 reason=capture check failed" in lines, shown
     assert "DIFF_OPTS --unified=0" in lines, shown
     assert "EXTERNAL review-placeholder" in lines, shown  # never captured, so never removed
+    # r16 iter 1 (adversary a11c4459-A3): the repository variables were not captured yet, so the cleanup must not remove them
+    assert "REPO C:\\fixture\\caller.git|C:\\fixture\\common|C:\\fixture\\caller" in lines, shown
 
 
 def test_continuation_reuses_a_clean_existing_worktree(tmp_path):

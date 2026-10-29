@@ -711,8 +711,9 @@ function Get-DirtyReapplyCommand([string]$Wt, [string]$Patch, [long]$PatchBytes,
     $names = "'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_PREFIX'"
     $git = "git -C $(ConvertTo-DirtySingleQuoted $Wt) --git-dir $(ConvertTo-DirtySingleQuoted (Join-Path $Wt '.git')) --work-tree $(ConvertTo-DirtySingleQuoted $Wt) $what"
     # Removed, never set to $null: PowerShell passes $null to a .NET string parameter as '', and git reads an empty GIT_COMMON_DIR / GIT_INDEX_FILE as a path.
-    return "& { `$n = $names; `$o = @{}; foreach (`$v in `$n) { `$o[`$v] = [Environment]::GetEnvironmentVariable(`$v); Remove-Item -LiteralPath `"Env:`$v`" -ErrorAction SilentlyContinue }; " +
-        "try { $git } finally { foreach (`$v in `$n) { if (`$null -ne `$o[`$v]) { Set-Item -LiteralPath `"Env:`$v`" -Value `$o[`$v] } } } }"
+    # Captured inside the try whose finally puts them back, so a throw while capturing restores every one already removed (r16 adversary a11c4459-A3).
+    return "& { `$n = $names; `$o = @{}; try { foreach (`$v in `$n) { `$o[`$v] = [Environment]::GetEnvironmentVariable(`$v); Remove-Item -LiteralPath `"Env:`$v`" -ErrorAction SilentlyContinue }; " +
+        "$git } finally { foreach (`$v in `$n) { if (`$null -ne `$o[`$v]) { Set-Item -LiteralPath `"Env:`$v`" -Value `$o[`$v] } } } }"
 }
 
 # One save at a time per process (r13, sol r12 B4). The saver pins GIT_DIR / GIT_COMMON_DIR / GIT_WORK_TREE and [Console]::OutputEncoding, which are process-wide, so a
@@ -739,6 +740,7 @@ function Save-DirtyWorktreeEvidenceInGate([string]$Wt, [string]$Dest, [string]$C
     # These variables change which repository git reads or the shape of the diff it writes; GIT_DIFF_OPTS=--unified=0, for one, beats the explicit -U3.
     $gitEnv = 'GIT_DIFF_OPTS', 'GIT_EXTERNAL_DIFF', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_COMMON_DIR', 'GIT_PREFIX'
     $savedEnv = @{}
+    $captured = $false  # the pins below are cleared in the finally only once the capture is complete: before that they are still the caller's own values (r16 adversary a11c4459-A3)
     try {
         # Captured INSIDE the try whose finally restores them (r16, sol r15b B2): a throw here is DIRTY_TREE_SAVE_FAILED with every variable captured so far put back.
         # A variable gone between its check and its read was not there to save: it is absent, and nothing is put back for it. Removed, not emptied: git reads an empty GIT_DIR as a path.
@@ -749,6 +751,7 @@ function Save-DirtyWorktreeEvidenceInGate([string]$Wt, [string]$Dest, [string]$C
             $savedEnv[$v] = $found.Value
             Remove-Item -LiteralPath "Env:$v" -ErrorAction SilentlyContinue
         }
+        $captured = $true
         # PowerShell decodes git's output with [Console]::OutputEncoding; under an ASCII or OEM console a UTF-8 file name would come back as '??' and be saved under the wrong name (r5 adversary A4).
         try { $prevEnc = [Console]::OutputEncoding; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch { $prevEnc = $null }
         if (-not (Test-Path -LiteralPath $Dest -PathType Container)) { return "DIRTY_TREE_SAVE_FAILED card=$CardName reason=no-run-dir" }
@@ -1025,7 +1028,7 @@ function Save-DirtyWorktreeEvidenceInGate([string]$Wt, [string]$Dest, [string]$C
         if ($null -ne $prevEnc) { try { [Console]::OutputEncoding = $prevEnc } catch { } }
         foreach ($h in $metaLocks) { Unlock-DirtyDirectory $h }
         Unlock-DirtyDirectory $wtLock; Unlock-DirtyDirectory $destLock  # released only after the temp cleanup, which still runs inside the held destination
-        foreach ($v in 'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE') { Remove-Item -LiteralPath "Env:$v" -ErrorAction SilentlyContinue }  # the pins set above; the caller's own values come back next
+        if ($captured) { foreach ($v in 'GIT_DIR', 'GIT_COMMON_DIR', 'GIT_WORK_TREE') { Remove-Item -LiteralPath "Env:$v" -ErrorAction SilentlyContinue } }  # the pins set above; the caller's own values come back next
         foreach ($v in $savedEnv.Keys) { try { Set-Item -LiteralPath "Env:$v" -Value $savedEnv[$v] } catch { } }  # one that cannot be put back never stops the rest, nor throws out of a fail-soft helper (r16)
     }
 }
