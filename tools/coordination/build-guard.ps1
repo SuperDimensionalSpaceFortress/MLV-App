@@ -1185,12 +1185,15 @@ function Invoke-BuildGuard {
     # 'Get-Content:ErrorAction'='Continue' outranked every helper's Stop scope, so an error record reached the host) and no
     # verbose, debug, warning or information records (-Verbose on the command line made the CIM probes write verbose records the
     # host renders synchronously, past the bounded writers). Both are local to this call; the action gets the caller's back.
+    # r10 (adversary a2bdda36-A1): nor WhatIf or a confirm prompt (an inherited $WhatIfPreference=$true made the stop file's
+    # Set-Content a silent no-op, so the holder kept the slot after the release).
     $callerDefaults = $PSDefaultParameterValues
     $callerPrefs = @{ VerbosePreference = $VerbosePreference; DebugPreference = $DebugPreference; WarningPreference = $WarningPreference
-        InformationPreference = $InformationPreference }
+        InformationPreference = $InformationPreference; WhatIfPreference = $WhatIfPreference; ConfirmPreference = $ConfirmPreference }
     $PSDefaultParameterValues = @{}
     $VerbosePreference = 'SilentlyContinue'; $DebugPreference = 'SilentlyContinue'
     $WarningPreference = 'SilentlyContinue'; $InformationPreference = 'SilentlyContinue'
+    $WhatIfPreference = $false; $ConfirmPreference = 'None'
     $o = @{}
     foreach ($k in $script:BuildGuardDefaults.Keys) { $o[$k] = $script:BuildGuardDefaults[$k] }
     foreach ($k in $Options.Keys) { $o[$k] = $Options[$k] }
@@ -1285,8 +1288,12 @@ function Invoke-BuildGuard {
             $actionStarted = $true
             & {
                 param($Jobs)
+                # Plain assignments, never a cmdlet: one run with the caller's defaults just restored ('Set-Variable:PassThru',
+                # say) would write into the action's output (r10, adversary a2bdda36-A2).
+                $VerbosePreference = $callerPrefs.VerbosePreference; $DebugPreference = $callerPrefs.DebugPreference
+                $WarningPreference = $callerPrefs.WarningPreference; $InformationPreference = $callerPrefs.InformationPreference
+                $WhatIfPreference = $callerPrefs.WhatIfPreference; $ConfirmPreference = $callerPrefs.ConfirmPreference
                 $PSDefaultParameterValues = $callerDefaults
-                foreach ($p in $callerPrefs.Keys) { Set-Variable -Name $p -Value $callerPrefs[$p] }
                 & $Action $Jobs
             } $jobs
         } finally {

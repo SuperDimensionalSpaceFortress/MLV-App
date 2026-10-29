@@ -2504,6 +2504,45 @@ def test_verbose_on_the_command_line_writes_no_unbounded_records(box) -> None:
     assert "VERBOSE:" not in out, out
 
 
+def test_a_caller_whatif_preference_never_suppresses_the_release(box) -> None:
+    # r10 adversary a2bdda36-A1: an inherited $WhatIfPreference=$true turned the stop file's Set-Content into a no-op that
+    # returns, so the release skipped its fallback and the holder kept the slot after the guard returned (siblings: every
+    # guard cmdlet that writes or removes). The guard runs its own cmdlets with WhatIf off and no confirm prompt; the action
+    # gets the caller's preferences back.
+    done = _library_driver(
+        box,
+        "$WhatIfPreference = $true\n"
+        "Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs) Write-Output \"built=$Jobs whatif=$WhatIfPreference\" }\n",
+        str(box["lock"]),
+        host_tail=(
+            "$d = (Get-Date).AddSeconds(20)\n"
+            f"while (-not (Test-Path -LiteralPath '{box['dir'] / 'stub.log'}') -and (Get-Date) -lt $d) {{ Start-Sleep -Milliseconds 200 }}\n"
+            f"Write-Output \"released=$(Test-Path -LiteralPath '{box['dir'] / 'stub.log'}')\"\n"
+        ),
+    )
+    out = done.stdout + done.stderr
+    assert "built=4 whatif=True" in done.stdout, out
+    assert "released=True" in done.stdout, out
+    assert "did not end within 60 s of release" not in out, out
+    assert "What if:" not in out, out
+    assert _stub_calls(box)[0]["childEnd"]
+
+
+def test_restoring_caller_defaults_adds_nothing_to_the_action_output(box) -> None:
+    # r10 adversary a2bdda36-A2: with the caller's 'Set-Variable:PassThru'=$true restored, the guard's own Set-Variable calls
+    # that hand the action the caller's preferences each wrote a PSVariable into the action's output (one action string
+    # became five objects). The action still sees the caller's defaults.
+    done = _library_driver(
+        box,
+        "$PSDefaultParameterValues = @{ 'Set-Variable:PassThru' = $true }\n"
+        "$out = @(Invoke-BuildGuard -NoSlot -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        "    \"ACTION jobs=$Jobs pt=$($PSDefaultParameterValues['Set-Variable:PassThru'])\" })\n"
+        "Write-Output (\"count={0} types={1} first={2}\" -f $out.Count, (($out | ForEach-Object { $_.GetType().Name }) -join ','), $out[0])\n",
+        str(box["lock"]),
+    )
+    assert "count=1 types=String first=ACTION jobs=4 pt=True" in done.stdout, done.stdout + done.stderr
+
+
 # r9 class guard (2ab4b1b6-A1 siblings :887 :888, which no input reaches once :868/:869 resolve): no function the guard runs
 # composes or resolves a path with a cmdlet that can write an error record or throw on a missing drive or another provider.
 # Paths are resolved by Resolve-BuildGuardPath only and composed with [IO.Path].
