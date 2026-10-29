@@ -147,7 +147,9 @@ HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip
                  "legs/m16-1457-headroom-stage-fullscreen-s1.json")
 # BACHELOR-CORE-PARTITION-AB-1: the core-partition legs (A whole machine, B1 P-cores, B2 P-cores + E-core load): the headroom unpaced windowed s1 shape
 # (a Cinematic Look-Assist pace leg at swap interval 0, so they carry the same presentTearingExpectedReason) plus the core-partition generatorArgs.
-PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload"))
+PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload",
+                                                                                              # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: A and B1 at a worker-thread cap of 12
+                                                                                              "a12", "b1-12-pcore"))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
@@ -6942,7 +6944,8 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
             elif spec["card"] == "BACHELOR-CORE-PARTITION-AB-1":   # the core-partition A/B legs (cinematic pace legs), named by arm
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload)-unpaced-windowed-s1$", path.name)
+                # (VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 added a12 and b1-12-pcore: A and B1 at a worker-thread cap of 12)
+                self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload|a12|b1-12-pcore)-unpaced-windowed-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)

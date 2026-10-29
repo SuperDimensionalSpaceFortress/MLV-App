@@ -469,7 +469,12 @@ param(
     [string]$PartitionLoadMask = '',
     [int]$PartitionLoadThreads = 0,
     [switch]$CorePartitionTelemetry,
-    [string]$CorePartitionHelperMask = ''
+    [string]$CorePartitionHelperMask = '',
+
+    # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: the app's playback worker-thread cap for the run, forwarded as the smoke runner's EXISTING -Threads <n> (the
+    # runner sets MLVAPP_PLAYBACK_MAX_THREADS=<n> for the app and records playbackMaxThreads in its result.json). 0 (the default) passes nothing: the
+    # emitted job is the text it was before this parameter.
+    [ValidateRange(0, 16)][int]$PlaybackMaxThreads = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -5891,6 +5896,36 @@ if (-not [string]::IsNullOrEmpty($ScopesDuringPlayback)) {
         param($m)
         $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK=$ScopesDuringPlayback'," + $m.Groups['nl'].Value
     })
+}
+
+# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: a capped leg passes the smoke runner's EXISTING -Threads <n> (no new environment route) and gains two bracketed
+# regions, on the expanded text and only when asked, so every other job is the text it always was. Each anchor must match exactly once, or the generator throws:
+#   1. before the SUCCESS summary: the job's own worker_threads= read of the run log (Get-CorePartitionWorkerThreads) and the smoke result.json's playbackMaxThreads;
+#   2. four proof lines after the summary's cpuFrames line. The runner fails the leg closed (WORKER_THREADS_NOT_HONOURED) unless they and the run log all say n.
+if ($PlaybackMaxThreads -gt 0) {
+    $mtOpen = '# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 >>>'
+    $mtClose = '# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 <<<'
+    $mtEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $mtCmdAnchor = [regex]' -UsePersistedPlaybackSettings '
+    if ($mtCmdAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_PLAYBACK_MAX_THREADS_ANCHOR_MISSING the job template has no single -UsePersistedPlaybackSettings site to add -Threads to' }
+    $text = $mtCmdAnchor.Replace($text, " -Threads $PlaybackMaxThreads -UsePersistedPlaybackSettings ")
+    $mtMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
+    $mtRead = @'
+$playbackMaxThreadsRead = Get-CorePartitionWorkerThreads $rawLog
+$playbackMaxThreadsSmoke = $null
+try { $playbackMaxThreadsSmoke = $resultJson.matchedUserShellDefaults.playbackMaxThreads } catch { }
+$playbackMaxThreadsProof = [ordered]@{ smoke = $(if ($null -ne $playbackMaxThreadsSmoke) { [string]$playbackMaxThreadsSmoke }); workers = $playbackMaxThreadsRead.value; why = $playbackMaxThreadsRead.why }
+Write-JobTrace "step playback-max-threads requested=__CAP__ smoke=$($playbackMaxThreadsProof.smoke) workers=$($playbackMaxThreadsProof.workers) why=$($playbackMaxThreadsProof.why)"
+'@
+    $text = Edit-DualVenueTemplate $text $mtMetricsAnchor ($mtOpen + "`n" + (Get-CorePartitionFunctionSource @(${function:Get-CorePartitionWorkerThreads}) "`n") + "`n" +
+        $mtRead.Replace('__CAP__', [string]$PlaybackMaxThreads) + "`n" + $mtClose + "`n" + $mtMetricsAnchor)
+    $mtMetricsAt = $text.IndexOf($mtMetricsAnchor, [StringComparison]::Ordinal)
+    $mtKeysAnchor = '    cpuFrames = $gpuSummary.cpuFrames' + $mtEol
+    $mtKeysAt = $text.IndexOf($mtKeysAnchor, $mtMetricsAt, [StringComparison]::Ordinal)
+    if ($mtKeysAt -lt 0) { throw 'DUAL_VENUE_PLAYBACK_MAX_THREADS_ANCHOR_MISSING the success summary has no cpuFrames line to put the worker-thread proof after' }
+    $mtKeyLines = @("    $mtOpen", "    playbackMaxThreadsRequested = $PlaybackMaxThreads", '    playbackMaxThreadsSmoke = $playbackMaxThreadsProof.smoke',
+        '    playbackWorkerThreadsRead = $playbackMaxThreadsProof.workers', '    playbackWorkerThreadsReadWhy = $playbackMaxThreadsProof.why', "    $mtClose")
+    $text = $text.Substring(0, $mtKeysAt + $mtKeysAnchor.Length) + (($mtKeyLines -join $mtEol) + $mtEol) + $text.Substring($mtKeysAt + $mtKeysAnchor.Length)
 }
 
 # BACHELOR-CORE-PARTITION-AB-1: a core-partition leg gains three bracketed regions, on the expanded text and only when -CorePartitionTelemetry
