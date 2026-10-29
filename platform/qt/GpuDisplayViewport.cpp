@@ -9,6 +9,7 @@
 #include "GpuDisplayWindow.h"
 #include "GpuFieldTelemetry.h"
 #include "PlaybackSwapInterval.h"
+#include "PreviewPaintTiming.h"
 
 #include <algorithm>
 #include <cmath>
@@ -465,6 +466,8 @@ bool GpuDisplayViewport::eventFilter(QObject *watched, QEvent *event)
     {
         // Invoke Qt's paint-event path, which binds the widget FBO, calls paintGL,
         // and schedules composition. Calling paintGL directly skips that setup.
+        // Consumed here, so GraphicsZoomView::paintEvent never sees it: time it here.
+        const preview_paint_timing::Scope paintTiming;
         QOpenGLWidget::event(event);
         return true;
     }

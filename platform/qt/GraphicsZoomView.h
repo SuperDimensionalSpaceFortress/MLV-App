@@ -14,6 +14,7 @@
 #include <Qt>
 #include <QDebug>
 #include <QShortcut>
+#include "PreviewPaintTiming.h"
 
 class GraphicsZoomView : public QGraphicsView
 {
@@ -28,13 +29,8 @@ public:
     void setBpPickerActive(bool on);
     void setCrossCursorActive(bool on);
 
-    //Wall time of each viewport paint (playback_smoke.gui_present_summary)
-    struct PaintTiming
-    {
-        quint64 paints = 0;
-        double sumMs = 0.0;
-        double maxMs = 0.0;
-    };
+    //Wall time of every preview paint (playback_smoke.gui_present_summary)
+    using PaintTiming = preview_paint_timing::Totals;
     PaintTiming paintTiming(void) const;
     void resetPaintTiming(void);
 
@@ -58,7 +54,6 @@ protected:
     void wheelEvent(QWheelEvent *event);
     void paintEvent(QPaintEvent *event) override;
     void setPipetteCursor();
-    PaintTiming m_paintTiming;
     bool m_isZoomEnabled;
     PickerState m_pickerState;
     bool m_isMousePressed;

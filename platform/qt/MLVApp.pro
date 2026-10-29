@@ -480,6 +480,7 @@ HEADERS += MainWindow.h \
            ReconWorker.h \
            ResizeLabel.h \
     GraphicsZoomView.h \
+    PreviewPaintTiming.h \
     DarkStyle.h \
     JumpSlider.h \
     AudioPlayback.h \

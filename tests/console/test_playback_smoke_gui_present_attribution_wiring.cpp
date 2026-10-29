@@ -207,13 +207,17 @@ TEST(GuiPresentAttributionWiring, PreviewViewportPaintIsTimedAroundTheBasePaint)
     const QString source = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.cpp"));
     const QString paint = bracedBlockAfter(source, QStringLiteral("void GraphicsZoomView::paintEvent(QPaintEvent *event)"));
     ASSERT_FALSE(paint.isEmpty());
-    const int startAt = paint.indexOf(QStringLiteral("timer.start();"));
+    const int scopeAt = paint.indexOf(QStringLiteral("const preview_paint_timing::Scope timing;"));
     const int baseAt = paint.indexOf(QStringLiteral("QGraphicsView::paintEvent(event);"));
-    const int readAt = paint.indexOf(QStringLiteral("timer.nsecsElapsed()"));
-    ASSERT_TRUE(startAt >= 0);
-    ASSERT_TRUE(baseAt > startAt);
-    ASSERT_TRUE(readAt > baseAt);
+    ASSERT_TRUE(scopeAt >= 0);
+    ASSERT_TRUE(baseAt > scopeAt);
     ASSERT_EQ(1, paint.count(QStringLiteral("QGraphicsView::paintEvent(event);")));
+
+    // The view reads and resets the one shared sink, not a count of its own paints only.
+    ASSERT_TRUE(bracedBlockAfter(source, QStringLiteral("GraphicsZoomView::PaintTiming GraphicsZoomView::paintTiming() const"))
+                    .contains(QStringLiteral("return preview_paint_timing::totals();")));
+    ASSERT_TRUE(bracedBlockAfter(source, QStringLiteral("void GraphicsZoomView::resetPaintTiming()"))
+                    .contains(QStringLiteral("preview_paint_timing::reset();")));
 
     // The session resets it and the summary reads it.
     ASSERT_TRUE(beginSmokeBody().contains(QStringLiteral("ui->graphicsView->resetPaintTiming();")));
@@ -288,11 +292,42 @@ TEST(GuiPresentAttributionWiring, PendingDispatcherWaitIsIdleWhenTheResultArrive
     const QString close = closeGapBody();
     ASSERT_FALSE(close.isEmpty());
     const QRegularExpressionMatch pending = QRegularExpression(QStringLiteral(
-        "if\( m_guiPresentGapBlockStartNs >= 0 \)\s*"
-        "m_guiPresentGapIdleNs \+= nowNs - m_guiPresentGapBlockStartNs;")).match(close);
+        "if\\( m_guiPresentGapBlockStartNs >= 0 \\)\\s*"
+        "m_guiPresentGapIdleNs \\+= nowNs - m_guiPresentGapBlockStartNs;")).match(close);
     ASSERT_TRUE(pending.hasMatch());
     const int idleAt = close.indexOf(QStringLiteral("const double idleMs ="));
     ASSERT_TRUE(idleAt > pending.capturedStart());
     ASSERT_TRUE(close.indexOf(QStringLiteral("const qint64 nowNs = m_guiPresentGapClock.nsecsElapsed();"))
                 < pending.capturedStart());
+}
+
+TEST(GuiPresentAttributionWiring, GlViewportAndGlWindowPaintsReachTheSamePaintSink)
+{
+    // Adversary A1 (3614eb25): with the GL viewport installed, its event filter consumes Paint
+    // while a GPU frame is pending, so GraphicsZoomView::paintEvent never ran and that paint was
+    // charged to other busy; the GL window paints the preview outside the view entirely. Both
+    // time their paint into the shared sink.
+    const QString viewport = readRepoFile(QStringLiteral("platform/qt/GpuDisplayViewport.cpp"));
+    ASSERT_TRUE(viewport.contains(QStringLiteral("#include \"PreviewPaintTiming.h\"")));
+    const QString consumed = bracedBlockAfter(
+        viewport,
+        QStringLiteral("if ( watched == this && event->type() == QEvent::Paint && hasPendingFrame() )"));
+    ASSERT_FALSE(consumed.isEmpty());
+    const int scopeAt = consumed.indexOf(QStringLiteral("const preview_paint_timing::Scope paintTiming;"));
+    const int eventAt = consumed.indexOf(QStringLiteral("QOpenGLWidget::event(event);"));
+    ASSERT_TRUE(scopeAt >= 0);
+    ASSERT_TRUE(eventAt > scopeAt);
+
+    const QString window = readRepoFile(QStringLiteral("platform/qt/GpuDisplayWindow.cpp"));
+    ASSERT_TRUE(window.contains(QStringLiteral("#include \"PreviewPaintTiming.h\"")));
+    const QString paintGl = bracedBlockAfter(window, QStringLiteral("void GpuDisplayWindow::paintGL()"));
+    ASSERT_FALSE(paintGl.isEmpty());
+    const int windowScopeAt = paintGl.indexOf(QStringLiteral("const preview_paint_timing::Scope paintTiming;"));
+    ASSERT_TRUE(windowScopeAt >= 0);
+    ASSERT_TRUE(windowScopeAt < paintGl.indexOf(QStringLiteral("glClear(")));
+
+    // The sink is header-only: gui_tests links GpuDisplayViewport/Window without GraphicsZoomView.
+    const QString sink = readRepoFile(QStringLiteral("platform/qt/PreviewPaintTiming.h"));
+    ASSERT_TRUE(sink.contains(QStringLiteral("inline Totals &totals()")));
+    ASSERT_TRUE(sink.contains(QStringLiteral("~Scope()")));
 }

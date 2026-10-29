@@ -7,7 +7,6 @@
 
 #include "GraphicsZoomView.h"
 #include <QCursor>
-#include <QElapsedTimer>
 #include <QPixmap>
 
 //Constructor
@@ -197,23 +196,19 @@ void GraphicsZoomView::wheelEvent(QWheelEvent *event)
 //Viewport paint, timed for the playback smoke telemetry; the paint itself is unchanged
 void GraphicsZoomView::paintEvent(QPaintEvent *event)
 {
-    QElapsedTimer timer;
-    timer.start();
+    const preview_paint_timing::Scope timing;
     QGraphicsView::paintEvent(event);
-    const double ms = static_cast<double>( timer.nsecsElapsed() ) / 1000000.0;
-    ++m_paintTiming.paints;
-    m_paintTiming.sumMs += ms;
-    if( ms > m_paintTiming.maxMs ) m_paintTiming.maxMs = ms;
 }
 
+//The shared preview paint sink, which also counts the GL viewport's and GL window's paints
 GraphicsZoomView::PaintTiming GraphicsZoomView::paintTiming() const
 {
-    return m_paintTiming;
+    return preview_paint_timing::totals();
 }
 
 void GraphicsZoomView::resetPaintTiming()
 {
-    m_paintTiming = PaintTiming();
+    preview_paint_timing::reset();
 }
 
 //Show the wb picker icon as cursor
