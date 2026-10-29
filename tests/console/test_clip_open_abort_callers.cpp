@@ -951,7 +951,7 @@ TEST(ClipOpenAbortR5Wiring, EveryImportCallerShowsTheLastRowOnlyFromTheBatchOutc
         "if( m_slidersDetachedFromReceipt && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );")));
     // r6 (adversary e11815a5 A1): a FileOpen inside this import's event pumps can append and show another clip;
     // the refused clip's own row is removed, and the sliders stay attached only while previousActive is loaded
-    const int lookup = importBody.indexOf(QStringLiteral("if( GET_CLIP( i )->getPath() == fileName ) { importedRow = i; break; }"));
+    const int lookup = importBody.indexOf(QStringLiteral("if( GET_CLIP( i ) == importedClip ) { importedRow = i; break; }"));
     const int removed = importBody.indexOf(QStringLiteral("m_pModel->removeRow( importedRow, QModelIndex() );"));
     ASSERT_TRUE(lookup >= 0 && removed > lookup);
     ASSERT_TRUE(importBody.contains(QStringLiteral(
@@ -1084,13 +1084,13 @@ TEST(ClipOpenAbortR7Wiring, RefusedImportFindsItsRowAndThePreviousClipByPathAndR
     const QString importBody = bodyBetween(source, QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"),
                                            QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
     ASSERT_FALSE(importBody.isEmpty());
-    const int path = importBody.indexOf(QStringLiteral("const QString previousActivePath ="));
+    const int path = importBody.indexOf(QStringLiteral("ClipInformation *previousClip ="));
     const int add = importBody.indexOf(QStringLiteral("addFileToSession( fileName );"));
     ASSERT_TRUE(path >= 0 && add > path);
     ASSERT_TRUE(importBody.contains(QStringLiteral("int importedRow = -1;")));
     ASSERT_FALSE(importBody.contains(QStringLiteral("int importedRow = SESSION_CLIP_COUNT - 1;")));
     const int removed = importBody.indexOf(QStringLiteral("if( importedRow >= 0 ) m_pModel->removeRow( importedRow, QModelIndex() );"));
-    const int found = importBody.indexOf(QStringLiteral("if( GET_CLIP( i )->getPath() == previousActivePath ) { previousRow = i; break; }"));
+    const int found = importBody.indexOf(QStringLiteral("if( GET_CLIP( i ) == previousClip ) { previousRow = i; break; }"));
     const int kept = importBody.indexOf(QStringLiteral(
         "const bool keptPrevious = clipOpenFailureKeptRetainedClip( ret ) && loadedClipIsRow( previousRow );"));
     const int retry = importBody.indexOf(QStringLiteral(
@@ -1111,12 +1111,49 @@ TEST(ClipOpenAbortR7Wiring, RefusedImportFindsItsRowAndThePreviousClipByPathAndR
     const QString guard = QStringLiteral("if( row < 0 || row >= SESSION_CLIP_COUNT ) continue;");
     const int rowRead = del.indexOf(QStringLiteral("int row = list.at( i - 1 ).data( ROLE_REALINDEX ).toInt();"));
     const int firstGuard = del.indexOf(guard, rowRead);
-    const int trash = del.indexOf(QStringLiteral("MoveToTrash( GET_RECEIPT(row)->fileName() )"));
-    const int secondGuard = del.indexOf(guard, firstGuard + 1);
+    const int trash = del.indexOf(QStringLiteral("MoveToTrash( clipFileName )"));
+    const int secondGuard = del.indexOf(QStringLiteral("if( row < 0 ) continue;"), trash);
     const int delRemove = del.indexOf(QStringLiteral("m_pModel->removeRow( row, QModelIndex() );"));
     ASSERT_TRUE(rowRead >= 0);
     ASSERT_TRUE(firstGuard > rowRead && trash > firstGuard);
     ASSERT_TRUE(secondGuard > trash && delRemove > secondGuard);
+}
+
+// adversary a30fd547 A1: inside addFileToSession( B )'s event pump a FileOpen opens replacement.masxml, which clears
+// the session and adds a new B (same path, its own receipt). The refused import must remove only the B object it
+// appended, so both rows are found by object, never by path; the delete loop re-finds its clip the same way.
+TEST(ClipOpenAbortR7Wiring, RefusedImportAndTheDeleteLoopFindTheirClipsByObject)
+{
+    const QString source = mainWindowSource();
+    ASSERT_TRUE(source.contains(QStringLiteral("ClipInformation *MainWindow::addFileToSession(QString fileName)")));
+    const QString add = bodyBetween(source, QStringLiteral("ClipInformation *MainWindow::addFileToSession(QString fileName)"),
+                                    QStringLiteral("int MainWindow::askToSaveCurrentSession()"));
+    ASSERT_FALSE(add.isEmpty());
+    const int appended = add.indexOf(QStringLiteral("m_pModel->append( clipInfo );"));
+    const int pumped = add.indexOf(QStringLiteral("qApp->processEvents();"));
+    const int returned = add.indexOf(QStringLiteral("return clipInfo;"));
+    ASSERT_TRUE(appended >= 0 && pumped > appended && returned > pumped);
+
+    const QString importBody = bodyBetween(source, QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"),
+                                           QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
+    ASSERT_FALSE(importBody.isEmpty());
+    ASSERT_TRUE(importBody.contains(QStringLiteral("ClipInformation *importedClip = addFileToSession( fileName );")));
+    ASSERT_TRUE(importBody.contains(QStringLiteral("if( GET_CLIP( i ) == importedClip ) { importedRow = i; break; }")));
+    ASSERT_TRUE(importBody.contains(QStringLiteral("if( GET_CLIP( i ) == previousClip ) { previousRow = i; break; }")));
+    ASSERT_FALSE(importBody.contains(QStringLiteral("GET_CLIP( i )->getPath() == fileName")));
+    ASSERT_FALSE(importBody.contains(QStringLiteral("previousActivePath")));
+
+    const QString del = bodyBetween(source, QStringLiteral("void MainWindow::deleteFileFromSession( void )"),
+                                    QStringLiteral("//if there is at least one..."));
+    ASSERT_FALSE(del.isEmpty());
+    const int captured = del.indexOf(QStringLiteral("ClipInformation *clip = GET_CLIP( row );"));
+    const int name = del.indexOf(QStringLiteral("const QString clipFileName = GET_RECEIPT( row )->fileName();"));
+    const int trash = del.indexOf(QStringLiteral("MoveToTrash( clipFileName )"));
+    const int refind = del.indexOf(QStringLiteral("if( GET_CLIP( k ) == clip ) { row = k; break; }"));
+    const int removed = del.indexOf(QStringLiteral("m_pModel->removeRow( row, QModelIndex() );"));
+    ASSERT_TRUE(captured >= 0 && name > captured && trash > name);
+    ASSERT_TRUE(refind > trash && removed > refind);
+    ASSERT_FALSE(del.contains(QStringLiteral("GET_RECEIPT(row)->fileName()")));
 }
 
 // adversary 7354a575 A1: session [A,B,C], A active and loaded with exposure 20, B never loaded and corrupt.

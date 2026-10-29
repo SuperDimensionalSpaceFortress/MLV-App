@@ -1830,7 +1830,7 @@ private:
     void startExportCdng( QString fileName );
     void startExportMlv( QString fileName );
     void startExportAVFoundation( QString fileName );
-    void addFileToSession( QString fileName );
+    ClipInformation *addFileToSession( QString fileName );
     int askToSaveCurrentSession( void );
     void openSession(QString fileNameSession );
     void saveSession( QString fileName );

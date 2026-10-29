@@ -11045,13 +11045,14 @@ bool MainWindow::importNewMlv(QString fileName)
     else
     {
         const int previousActive = SESSION_CLIP_COUNT > 0 ? SESSION_ACTIVE_CLIP_ROW : -1;
-        // r7 (adversary 7fd2d2f1 A2): a FileOpen inside this import can delete rows or open another session, so the
-        // previous clip is found again by its path, never by its old row.
-        const QString previousActivePath = previousActive >= 0 && previousActive < SESSION_CLIP_COUNT
-                                         ? GET_CLIP( previousActive )->getPath() : QString();
+        // r7 (adversary 7fd2d2f1 A2, a30fd547 A1): a FileOpen inside this import can delete rows or open another
+        // session, even one with a clip of the same path, so both clips are found again by object, never by row or path
+        // (session clips are never freed, so an object is never reused).
+        ClipInformation *previousClip = previousActive >= 0 && previousActive < SESSION_CLIP_COUNT
+                                      ? GET_CLIP( previousActive ) : nullptr;
 
         //Add to SessionList
-        addFileToSession( fileName );
+        ClipInformation *importedClip = addFileToSession( fileName );
 
         //Open MLV
         int ret;
@@ -11067,12 +11068,12 @@ bool MainWindow::importNewMlv(QString fileName)
             // r7 (adversary 7fd2d2f1 A2): a nested Open Session can have removed it already; then nothing is removed.
             int importedRow = -1;
             for( int i = 0; i < SESSION_CLIP_COUNT; i++ )
-                if( GET_CLIP( i )->getPath() == fileName ) { importedRow = i; break; }
+                if( GET_CLIP( i ) == importedClip ) { importedRow = i; break; }
             const int activeBeforeRemoval = SESSION_ACTIVE_CLIP_ROW;
             if( importedRow >= 0 ) m_pModel->removeRow( importedRow, QModelIndex() );
             int previousRow = -1;
-            for( int i = 0; i < SESSION_CLIP_COUNT && !previousActivePath.isEmpty(); i++ )
-                if( GET_CLIP( i )->getPath() == previousActivePath ) { previousRow = i; break; }
+            for( int i = 0; i < SESSION_CLIP_COUNT && previousClip; i++ )
+                if( GET_CLIP( i ) == previousClip ) { previousRow = i; break; }
             // r7 (sol r6 CO-ACTIVE-ROW-EMPTY-NESTED): removeRow keeps the stored active row, so it is set here.
             const int restoredActive = refusedImportActiveRow( previousRow, activeBeforeRemoval, importedRow, SESSION_CLIP_COUNT );
             if( restoredActive >= 0 ) SET_ACTIVE_CLIP_IDX( restoredActive );
@@ -14431,7 +14432,8 @@ void MainWindow::startExportAVFoundation(QString fileName)
 #endif
 
 //Adds the fileName to the Session List
-void MainWindow::addFileToSession(QString fileName)
+// r7 (adversary a30fd547 A1): returns the clip it appended; the event pump below can change every row of the session.
+ClipInformation *MainWindow::addFileToSession(QString fileName)
 {
     //Save settings of actual clip (if there is one)
     if( SESSION_CLIP_COUNT > 0 )
@@ -14453,6 +14455,7 @@ void MainWindow::addFileToSession(QString fileName)
     //Update App
     listViewSessionUpdate();
     qApp->processEvents();
+    return clipInfo;
 }
 
 int MainWindow::askToSaveCurrentSession()
@@ -23820,6 +23823,9 @@ void MainWindow::deleteFileFromSession( void )
         // r7 (adversary 7fd2d2f1 A2 sibling): a FileOpen inside a dialog of this loop can change the session; a row
         // that is no longer in it is never read or removed.
         if( row < 0 || row >= SESSION_CLIP_COUNT ) continue;
+        // r7 (adversary a30fd547 A1 sibling): the dialogs below pump events, so the clip is held by object and name.
+        ClipInformation *clip = GET_CLIP( row );
+        const QString clipFileName = GET_RECEIPT( row )->fileName();
         //Delete file from disk when wanted
         if( msg.clickedButton() == deleteButton )
         {
@@ -23830,9 +23836,9 @@ void MainWindow::deleteFileFromSession( void )
             m_clipLifecycleBarrier.reopen();
             m_slidersDetachedFromReceipt = true; // r4: an empty object is loaded until the next successful open
 #endif
-            if( MoveToTrash( GET_RECEIPT(row)->fileName() ) ) QMessageBox::critical( this, tr( "%1 - Delete clip from disk" ).arg( APPNAME ), tr( "Delete clip failed!" ) );
+            if( MoveToTrash( clipFileName ) ) QMessageBox::critical( this, tr( "%1 - Delete clip from disk" ).arg( APPNAME ), tr( "Delete clip failed!" ) );
             //MAPP
-            QString mappName = GET_RECEIPT(row)->fileName();
+            QString mappName = clipFileName;
             mappName.chop( 4 );
             mappName.append( ".MAPP" );
             if( QFileInfo( mappName ).exists() )
@@ -23855,7 +23861,10 @@ void MainWindow::deleteFileFromSession( void )
                 }
             }
         }
-        if( row < 0 || row >= SESSION_CLIP_COUNT ) continue;
+        row = -1;
+        for( int k = 0; k < SESSION_CLIP_COUNT; k++ )
+            if( GET_CLIP( k ) == clip ) { row = k; break; }
+        if( row < 0 ) continue;
         int delrow = m_pProxyModel->mapFromSource( m_pModel->index( row, 0, QModelIndex() ) ).row();
         //Remove item from Session List & Remove slider memory
         m_pModel->removeRow( row, QModelIndex() );
