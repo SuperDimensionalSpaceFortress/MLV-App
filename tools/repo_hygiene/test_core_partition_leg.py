@@ -3300,6 +3300,25 @@ class PlaybackMaxThreadsGeneratorTests(unittest.TestCase):
                 self.assertIn("function Get-CorePartitionWorkerThreads(", job, "the job's own worker_threads= read is spliced in")
                 self.assertEqual(THREADS_REGION.sub("", job).replace(" -Threads 12 ", " ", 1), lf(self.job(f"head-{name}")))
 
+    def test_the_proof_region_reads_the_smoke_results_launch_block(self) -> None:
+        # adversary r1 A1 (5944348f): run-release-gui-smoke.ps1 writes playbackMaxThreads under launch.matchedUserShellDefaults; the job read a
+        # top-level matchedUserShellDefaults, so an honoured cap published playbackMaxThreadsSmoke=null and the leg went INVALID. Run the job's own region.
+        job = lf(self.job("t12-default"))
+        region = THREADS_REGION.search(job).group(0)
+        script = ("function Write-JobTrace([string]$Message) { }\n$rawLog = $env:MT_LOG\n$resultJson = $env:MT_RESULT | ConvertFrom-Json -Depth 100\n"
+                  ". ([scriptblock]::Create($env:MT_REGION))\n$playbackMaxThreadsProof | ConvertTo-Json -Compress")
+        log = "playback_smoke.start session=3 scale_request=1 worker_threads=12 start_serial=2\n"
+        for name, result, smoke in (("runner shape", {"launch": {"matchedUserShellDefaults": {"playbackMaxThreads": "12"}}}, "12"),
+                                    ("auto", {"launch": {"matchedUserShellDefaults": {"playbackMaxThreads": "auto/unset"}}}, "auto/unset"),
+                                    ("top level only", {"matchedUserShellDefaults": {"playbackMaxThreads": "12"}}, None)):
+            with self.subTest(case=name):
+                proc = run_pwsh(["-Command", script], env_extra={"MT_LOG": log, "MT_RESULT": json.dumps(result), "MT_REGION": region})
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(json.loads(proc.stdout), {"smoke": smoke, "workers": 12, "why": None})
+        runner = (ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1").read_text(encoding="utf-8")
+        self.assertRegex(runner, r"(?s)\n    launch = \[pscustomobject\]@\{.*?\n        matchedUserShellDefaults = \[pscustomobject\]@\{\s*\n[^}]*?playbackMaxThreads = ",
+                         "the smoke runner still records playbackMaxThreads under launch.matchedUserShellDefaults")
+
     def test_the_capped_jobs_parse(self) -> None:
         paths = [str(self.out[f"t12-{name}"]) for name in THREADS_SHAPES if self.proc[f"t12-{name}"].returncode == 0]
         self.assertEqual(len(paths), len(THREADS_SHAPES), "every capped job was generated")

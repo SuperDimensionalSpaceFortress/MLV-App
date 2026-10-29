@@ -5913,7 +5913,7 @@ if ($PlaybackMaxThreads -gt 0) {
     $mtRead = @'
 $playbackMaxThreadsRead = Get-CorePartitionWorkerThreads $rawLog
 $playbackMaxThreadsSmoke = $null
-try { $playbackMaxThreadsSmoke = $resultJson.matchedUserShellDefaults.playbackMaxThreads } catch { }
+try { $playbackMaxThreadsSmoke = $resultJson.launch.matchedUserShellDefaults.playbackMaxThreads } catch { }
 $playbackMaxThreadsProof = [ordered]@{ smoke = $(if ($null -ne $playbackMaxThreadsSmoke) { [string]$playbackMaxThreadsSmoke }); workers = $playbackMaxThreadsRead.value; why = $playbackMaxThreadsRead.why }
 Write-JobTrace "step playback-max-threads requested=__CAP__ smoke=$($playbackMaxThreadsProof.smoke) workers=$($playbackMaxThreadsProof.workers) why=$($playbackMaxThreadsProof.why)"
 '@
