@@ -2864,6 +2864,53 @@ def test_the_slot_mutex_wait_is_clamped_to_the_admission_deadline(box) -> None:
     assert _stub_calls(box)[0]["childEnd"], "the machine slot went back"
 
 
+@pytest.mark.parametrize("slots", [True, False])
+def test_a_census_that_ends_after_the_deadline_never_starts_the_action(box, slots) -> None:
+    # r12 adversary d4a586f2-A1, its input: memory 10/20, DeadlineMinutes=0.01, a census that takes 800 ms. The deadline check
+    # sat before the census, so the action ran at 898 ms against 600 ms. It is now checked at the gate, after the census.
+    setup = ("$opts.PollSeconds = 3600; $opts.DeadlineMinutes = 0.01\n"
+             "function Get-BuildGuardJobs { param([hashtable]$Options, [int]$SelfPid)\n"
+             "    [Threading.Thread]::Sleep(800); @{ Jobs = 4; Reason = 'default'; Peers = @() } }\n")
+    call = "Invoke-BuildGuard -Label 'build' -Options $opts" + ("" if slots else " -NoSlot")
+    done = _library_driver(
+        box,
+        setup + call + f" -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran }}\n",
+        str(box["lock"]),
+    )
+    _assert_refused_after_the_deadline(box, done, slots=slots)
+
+
+def test_a_lock_path_that_is_a_directory_is_refused_and_kept(box) -> None:
+    # r12 adversary d4a586f2-A2, its input: LockPath an existing empty directory two minutes old, DeadlineMinutes=0. It read as
+    # an unreadable stale lock, was deleted and replaced by the lock file, and the release deleted that.
+    lock_dir = box["dir"] / "existing-empty-directory"
+    lock_dir.mkdir()
+    old = time.time() - 120
+    os.utime(lock_dir, (old, old))
+    done = _heavy(box, "run", ["-DeadlineMinutes", "0", "-Command", _marker_command(box)], lock=lock_dir)
+    out = done.stdout + done.stderr
+    assert done.returncode == 2, out
+    assert "BUILD_GUARD_PATH_REFUSED label=build option=LockPath value=" in done.stdout and "is a directory" in done.stdout, out
+    assert lock_dir.is_dir() and not box["marker"].exists(), out
+    assert _stub_calls(box) == [], "refused before the machine slot is taken"
+
+
+def test_a_directory_made_at_the_lock_path_after_the_check_is_refused_at_acquire(box) -> None:
+    # The same class at the acquire (G:514/526): a directory that appears after the path was checked is never reclaimed.
+    lock_dir = box["dir"] / "late-directory"
+    lock_dir.mkdir()
+    old = time.time() - 120
+    os.utime(lock_dir, (old, old))
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n"
+                f"$r = Invoke-BuildSlotAcquire -Options @{{ LockPath = '{lock_dir}'; MutexName = 'Local\\mlv-r12-dir-{os.getpid()}'; "
+                "LockExpiryMinutes = 90 } -Label 'build'\n"
+                "Write-Output ('acquired=' + $r.Acquired + ' refused=' + $r['Refused'])\n"])
+    out = done.stdout + done.stderr
+    assert "acquired=False refused=" in done.stdout and "is a directory" in done.stdout, out
+    assert lock_dir.is_dir(), out
+
+
 def test_the_hung_tool_bound_compares_the_exact_give_up_bound() -> None:
     # Sol r11 BUILD-GUARD-HUNG-BOUND-EXACT-TOKEN-1: the substring check above stays green on '$giveUpBROKEN'.
     text = GUARD.read_text(encoding="ascii")

@@ -380,6 +380,9 @@ function Get-BuildGuardLockPath([hashtable]$Options, [string]$Label) {
     # anything is taken.
     $lock = Resolve-BuildGuardPath $Options.LockPath -NeedParent
     if ($lock.Why) { Exit-BuildGuardPathRefused $Label 'LockPath' $Options.LockPath $lock.Why }
+    # A directory is never a lock (r12, adversary d4a586f2-A2): an old empty one read as an unreadable stale lock, was deleted
+    # and replaced by the lock file, and the release then deleted that.
+    if ([IO.Directory]::Exists($lock.Full)) { Exit-BuildGuardPathRefused $Label 'LockPath' $Options.LockPath 'it is a directory, not a lock file' }
     return $lock
 }
 
@@ -492,6 +495,8 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label, [int]$Mute
         try { $got = $mutex.WaitOne([math]::Max(0, $MutexWaitMs)) } catch [System.Threading.AbandonedMutexException] { $got = $true }
         if (-not $got) { return @{ Acquired = $false; Held = 'acquire-mutex-busy' } }
         $path = $Options.LockPath
+        # One made after the path was checked is refused here, under the mutex, never reclaimed (r12, d4a586f2-A2).
+        if ([IO.Directory]::Exists($path)) { return @{ Acquired = $false; Held = ''; Refused = "$path is a directory, not a lock file" } }
         if (Test-Path -LiteralPath $path) {
             $info = $null
             # The record is read field by field and cast inside the catch (r6 sol B2 sweep): one that is not an object, lacks
@@ -1271,34 +1276,22 @@ function Invoke-BuildGuard {
             $mem = Get-BuildGuardMemory -Options $o
             $memOk = [bool]$exempt -or ($mem.PhysGB -ge $o.MinFreePhysGB -and $mem.CommitGB -ge $o.MinFreeCommitGB)
             $held = ''
-            $admitted = $false
             if ($memOk) {
-                if ($NoSlot) {
-                    $admitted = $true
-                } else {
-                    $mutexWaitMs = 15000
-                    if ($bounded) { $mutexWaitMs = [int][math]::Max(0, [math]::Min(15000, [math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds))) }
-                    $slot = Invoke-BuildSlotAcquire -Options $o -Label $Label -MutexWaitMs $mutexWaitMs
-                    if ($slot.Acquired) { $ticket = $slot.Ticket; $admitted = $true }
-                    elseif ($slot['Refused']) {
-                        # The heavy slot goes back before the typed refusal (r6 sol B1), as at the deadline below.
-                        Exit-HeavySlot $heavy
-                        $heavy = $null
-                        Exit-BuildGuardPathRefused $Label 'LockPath' $o.LockPath $slot.Refused
-                    } else { $held = $slot.Held }
+                if ($NoSlot) { break }
+                # Never past the deadline (r12, sol r11 B2 sibling): the slot mutex waits at most what is left of it.
+                $mutexWaitMs = 15000
+                if ($bounded) { $mutexWaitMs = [int][math]::Max(0, [math]::Min(15000, [math]::Ceiling(($deadline - [DateTime]::UtcNow).TotalMilliseconds))) }
+                $slot = Invoke-BuildSlotAcquire -Options $o -Label $Label -MutexWaitMs $mutexWaitMs
+                if ($slot.Acquired) { $ticket = $slot.Ticket; break }
+                if ($slot['Refused']) {
+                    # The heavy slot goes back before the typed refusal (r6 sol B1), as at the deadline below.
+                    Exit-HeavySlot $heavy
+                    $heavy = $null
+                    Exit-BuildGuardPathRefused $Label 'LockPath' $o.LockPath $slot.Refused
                 }
+                $held = $slot.Held
             }
-            # r12 (sol r11 B2): the one check after every way in, before the action. The clamped sleep wakes at the deadline,
-            # so a look that then passed (memory back, a slot freed, a slow acquisition) used to break out here and start the
-            # action after expiry. Past a positive deadline the build slot just taken goes back and the guard refuses below.
-            $expired = [DateTime]::UtcNow -ge $deadline
-            if ($admitted) {
-                if (-not ($expired -and $bounded)) { break }
-                Remove-BuildSlot $ticket
-                $ticket = $null
-                $held = 'deadline-expired-before-admission'
-            }
-            if ($expired) {
+            if ([DateTime]::UtcNow -ge $deadline) {
                 $waited = [int]([DateTime]::UtcNow - $started).TotalSeconds
                 # The machine heavy slot is given back BEFORE the typed refusal (r6 sol B1): a stdout nobody drains may block
                 # that line, never the slot. Nothing is built after it; $heavy is cleared only once the release has run.
@@ -1335,6 +1328,17 @@ function Invoke-BuildGuard {
                     # The stop is sent even when the build-slot release throws (r6b adversary A1): $heavy is already
                     # cleared, so the outer finally would not send it.
                     try { Remove-BuildSlot $ticket } finally { $ticket = $null; Exit-HeavySlotHolderGone $lost 'before-action' }
+                }
+                # r12 (sol r11 B2, adversary d4a586f2-A1): the one deadline check after every way in, at the gate itself.
+                # The clamped sleep wakes at the deadline, so a look that then passed (memory back, a slot freed, a slow
+                # acquisition) broke out of the wait and started the action after expiry, and so did a slow census. Past a
+                # positive deadline the build slot goes back, then the machine slot, then the typed refusal; nothing is built.
+                if ($bounded -and [DateTime]::UtcNow -ge $deadline) {
+                    try { Remove-BuildSlot $ticket } finally { $ticket = $null }
+                    Exit-HeavySlot $heavy
+                    $heavy = $null
+                    Write-BuildGuardTyped ('BUILD_SLOT_BUSY label={0} heldBy=[deadline-expired-before-admission] waitedSec={1} utc={2}' -f $Label, [int]([DateTime]::UtcNow - $started).TotalSeconds, [DateTime]::UtcNow.ToString('o'))
+                    exit 3
                 }
                 if ($check -eq 1) {
                     Write-BuildGuardLog ('admitted label={0} jobs={1} reason={2} peers=[{3}] freePhysGB={4} freeCommitGB={5} slot={6}' -f $Label, $jobs, $choice.Reason, ($choice.Peers -join ','), $mem.PhysGB, $mem.CommitGB, $(if ($ticket) { 'held' } else { 'none' }))
