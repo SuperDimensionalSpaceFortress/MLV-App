@@ -419,6 +419,11 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
     HFR_10S_OPEN = "HFR-10S-1 >>>"
     HFR_10S_CLOSE = "HFR-10S-1 <<<"
     HFR_10S_REGIONS = 2
+    # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r2: the one HEAVY-arm environment entry (MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG=0) and its comment, so an
+    # inherited 1 cannot suppress the per-frame rows. One region in the template's HEAVY branch; the LIGHT branch and every baseline line stay verbatim outside it.
+    HEAVY_FRAME_LOG_OPEN = "HEAVY-FRAME-LOG-1 >>>"
+    HEAVY_FRAME_LOG_CLOSE = "HEAVY-FRAME-LOG-1 <<<"
+    HEAVY_FRAME_LOG_REGIONS = 1
 
     @classmethod
     def strip_regions(cls, text: str) -> tuple[str, dict[str, int]]:
@@ -430,7 +435,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                     "session-locked": (cls.SESSION_LOCKED_OPEN, cls.SESSION_LOCKED_CLOSE),
                     "playback-vsync": (cls.PLAYBACK_VSYNC_OPEN, cls.PLAYBACK_VSYNC_CLOSE),
                     "hfr-conform-oracles": (cls.HFR_CONFORM_OPEN, cls.HFR_CONFORM_CLOSE),
-                    "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE)}
+                    "hfr-10s-floor": (cls.HFR_10S_OPEN, cls.HFR_10S_CLOSE),
+                    "heavy-frame-log": (cls.HEAVY_FRAME_LOG_OPEN, cls.HEAVY_FRAME_LOG_CLOSE)}
         kept: list[str] = []
         inside: str | None = None
         counts = {name: 0 for name in families}
@@ -481,6 +487,8 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
         self.assertEqual(old_counts["hfr-conform-oracles"], self.HFR_CONFORM_REGIONS, "the baseline (the pinned GPU-PREF-REGISTRY-STOP-AND-PRUNE-1 generator commit) carries the same bracketed regions")
         self.assertEqual(new_counts["hfr-10s-floor"], self.HFR_10S_REGIONS, "the default job carries exactly the pinned number of bracketed PLAYBACK-CLIP-LENGTH-HFR-10S-1 regions")
         self.assertEqual(old_counts["hfr-10s-floor"], 0, "the baseline predates the owner's HFR 10 s amendment")
+        self.assertEqual(new_counts["heavy-frame-log"], self.HEAVY_FRAME_LOG_REGIONS, "the default (HEAVY) job carries exactly the pinned number of bracketed HEAVY-FRAME-LOG-1 regions")
+        self.assertEqual(old_counts["heavy-frame-log"], 0, "the baseline predates the HEAVY frame-log opt-out")
         self.assertEqual(stripped, old_stripped,
                          "the DEFAULT (bachelor/cuda) emitted job changed outside the bracketed regions -- it must stay byte-identical to the pinned baseline")
 
@@ -7785,6 +7793,9 @@ class LookReceiptGeneratorTests(unittest.TestCase):
                 # PLAYBACK-CLIP-LENGTH-HFR-10S-1's region: in the new job only (the base predates the owner's 2026-10-15 amendment).
                 self.assertEqual((new_counts.pop("hfr-10s-floor"), old_counts.pop("hfr-10s-floor")),
                                  (GeneratorByteIdentityAndVariantTests.HFR_10S_REGIONS, 0), name)
+                # PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1 r2's region: in the new job only (the base predates the HEAVY frame-log opt-out).
+                self.assertEqual((new_counts.pop("heavy-frame-log"), old_counts.pop("heavy-frame-log")),
+                                 (GeneratorByteIdentityAndVariantTests.HEAVY_FRAME_LOG_REGIONS, 0), name)
                 self.assertEqual(new_counts, old_counts, f"{name}: the job without -LookReceiptPath carries the base generator's bracketed regions")
                 self.assertEqual(kept, old_kept, f"{name}: the job without -LookReceiptPath must be the base generator's bytes")
                 self.assertNotIn(b"LookReceipt", new)
