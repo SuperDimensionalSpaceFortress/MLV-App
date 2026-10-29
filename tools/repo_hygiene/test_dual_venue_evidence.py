@@ -145,13 +145,18 @@ SCOPE_LA_LEGS = tuple(f"legs/m16-1243-scopes-{backend}-windowed-s1-{arm}-la.json
 HEADROOM_LEGS = (*(f"legs/{clip}-headroom-unpaced-{mode}-s{scale}.json" for clip in ("m16-1243", "m16-1457") for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  *(f"legs/m16-1243-headroom-stage-{mode}-s{scale}.json" for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)),
                  "legs/m16-1457-headroom-stage-fullscreen-s1.json")
+# BACHELOR-CORE-PARTITION-AB-1: the core-partition legs (A whole machine, B1 P-cores, B2 P-cores + E-core load): the headroom unpaced windowed s1 shape
+# (a Cinematic Look-Assist pace leg at swap interval 0, so they carry the same presentTearingExpectedReason) plus the core-partition generatorArgs.
+PARTITION_LEGS = tuple(f"legs/m16-1243-partition-{cell}-unpaced-windowed-s1.json" for cell in ("a", "b1-pcore", "b2-pcore-eload",
+                                                                                              # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: A and B1 at a worker-thread cap of 12
+                                                                                              "a12", "b1-12-pcore"))
 # LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1 added the scale-2 Cinematic twin of the scale-2 look leg (the Bachelor CPU Classic | Cinematic look pair).
 SHIPPED_LEGS = ("legs/m16-1243-speed.json", "legs/m16-1243-look.json", "legs/m16-1243-look-scale2.json", "legs/m16-1243-look-cinematic.json", *DISPLAY_MATRIX_LEGS, *PACE_LEGS,
                 *LOOKAHEAD_LEGS, *HEAVY_LEGS, *DECODER_LEGS, "legs/m16-1243-look-scale2-cinematic.json", "legs/m16-1243-look-film.json",
                 "legs/m16-1243-look-scale2-film.json", "legs/m16-1243-look-scale2-vision50d.json",
                 *(f"legs/m16-1243-look-scale2-{flavor}-agxoff.json" for flavor in ("cinematic", "film", "vision50d")),
                 *(f"legs/m16-1243-display-{mode}-s{scale}-vsync1.json" for scale in (1, 2, 4) for mode in ("fullscreen", "windowed")),
-                *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS,
+                *CPU_REDUCED_LEGS, *CPU_REDUCED_PACE_LEGS, *UPSTREAM_BASELINE_LEGS, *PTRACE_LEGS, *VISUAL_LEGS, *VISUAL_TWIN_LEGS, *SCOPE_LEGS, *SCOPE_LA_LEGS, *HEADROOM_LEGS, *PARTITION_LEGS,
                 *IDENTITY_LEGS, *MISSDUMP_LEGS)
 # PLAYBACK-VSYNC-DEFAULT-1: the swap-interval-1 twins of the six display-matrix legs (the vsync A/B; the originals stay at the app's default 0).
 VSYNC1_LEGS = tuple(rel.replace(".json", "-vsync1.json") for rel in DISPLAY_MATRIX_LEGS)
@@ -6870,12 +6875,12 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS):
+        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS):
+            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS):
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -6936,6 +6941,11 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "CUDA-HEADROOM-1":   # the unpaced throughput and stage legs, named by clip, kind and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-(1243|1457)-headroom-(unpaced|stage)-(fullscreen|windowed)-s[124]$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+            elif spec["card"] == "BACHELOR-CORE-PARTITION-AB-1":   # the core-partition A/B legs (cinematic pace legs), named by arm
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                # (VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 added a12 and b1-12-pcore: A and B1 at a worker-thread cap of 12)
+                self.assertRegex(spec["legId"], r"^m16-1243-partition-(a|b1-pcore|b2-pcore-eload|a12|b1-12-pcore)-unpaced-windowed-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
             else:   # the scale-4 flavored look leg, or its scale-2 twin (LOOK-ASSIST-CINEMATIC-BENCH-PAIR-1), or that twin's AgX-off copy (LOOK-ASSIST-FILM-FLAVOR-2 r2)
                 self.assertIn(spec["legId"], (f"m16-1243-look-{flavor}", f"m16-1243-look-scale2-{flavor}", f"m16-1243-look-scale2-{flavor}-agxoff"), path.name)
@@ -11146,6 +11156,57 @@ class VenueProbeTelemetryGateTextTests(unittest.TestCase):
         proc = self.gate(dict(V2_PROBE, telemetry_schema=TEL_SCHEMA, heat="hot", gpu=7, last_lease=None))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertRegex(proc.stdout, r"(?m)^COOLDOWN_UNMET mean=50\.0% ")
+
+
+@requires_windows_pwsh
+class WorkerThreadsReceiptBlockIsReDerivedTests(EvidenceFactory, unittest.TestCase):
+    """VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 r2b (adversary A1): Test-DvReceiptValid re-derived the worker-thread VERDICT from the hashed run log and summary.json, but
+    never compared the receipt's own `workerThreads` block (requested / observed / verdict) to it, so a receipt could state a count the evidence does not carry."""
+
+    PROOF = {"playbackMaxThreadsRequested": 12, "playbackMaxThreadsSmoke": "12", "playbackWorkerThreadsRead": 12}
+    START = "playback_smoke.start session=3 position=0 scale_request=1 quality_mode=0 worker_threads=12 start_serial=2 env_force_threads=0"
+    BLOCK = {"requested": 12, "observed": 12, "verdict": "HONOURED"}
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def production(self, cap: int | None, with_block: dict | None):
+        spec = self.write_spec()
+        data = json.loads(spec.read_text(encoding="utf-8"))
+        if cap is not None:
+            data["generatorArgs"] = {"playbackMaxThreads": cap}
+        spec.write_text(json.dumps(data), encoding="utf-8")
+        repo = self.prod_repo(spec=spec)
+        ev = self.evidence("wt-" + hashlib.sha1(json.dumps([cap, with_block]).encode()).hexdigest()[:8], backend="cuda",
+                           extra_log_lines=[self.START] if cap is not None else [], summary=dict(self.PROOF) if cap is not None else None)
+        receipt = self.receipt_for(repo, ev, backend="cuda")
+        if with_block is not None:
+            receipt["workerThreads"] = dict(with_block)
+        return repo, receipt
+
+    def test_a_capped_receipt_whose_block_re_derives_is_advisory(self) -> None:
+        repo, receipt = self.production(12, self.BLOCK)
+        self.assertAdvisory(receipt, repo)
+
+    def test_a_receipt_that_misstates_the_worker_count_does_not_re_derive(self) -> None:
+        for name, block in (("count and verdict", {"requested": 16, "observed": 16, "verdict": "HONOURED"}),
+                            ("observed only", dict(self.BLOCK, observed=16)),
+                            ("requested only", dict(self.BLOCK, requested=16)),
+                            ("verdict only", dict(self.BLOCK, verdict="NOT_HONOURED")),
+                            ("observed erased", dict(self.BLOCK, observed=None))):
+            with self.subTest(case=name):
+                repo, receipt = self.production(12, block)
+                self.assertNotValid(receipt, repo, "WORKER_THREADS_NOT_FROM_EVIDENCE", status="INVALID")
+
+    def test_a_capped_receipt_with_no_block_is_incomplete(self) -> None:
+        repo, receipt = self.production(12, None)
+        self.assertNotValid(receipt, repo, "the receipt carries no workerThreads block", status="INCOMPLETE")
+
+    def test_an_uncapped_leg_is_unchanged_but_cannot_carry_a_block(self) -> None:
+        repo, receipt = self.production(None, None)
+        self.assertAdvisory(receipt, repo)
+        repo, receipt = self.production(None, self.BLOCK)
+        self.assertNotValid(receipt, repo, "WORKER_THREADS_NOT_FROM_EVIDENCE", status="INVALID")
 
 
 if __name__ == "__main__":
