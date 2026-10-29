@@ -358,6 +358,7 @@ class ThermalGateRunnerTests(unittest.TestCase):
     kinds = tvlb.VenueLeaseBatchRunnerTests.kinds
     batches = tvlb.VenueLeaseBatchRunnerTests.batches
     events_raw = tvlb.VenueLeaseBatchRunnerTests.events_raw
+    _mirror_with_bad_sidecar = tvlb.VenueLeaseBatchRunnerTests._mirror_with_bad_sidecar
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -515,6 +516,58 @@ class ThermalGateRunnerTests(unittest.TestCase):
         [row] = b["legs"]
         self.assertEqual((row["status"], row["heatAtProbe"], row["heatAtLaunch"], b["thermalWaits"], b["thermalSkips"]), ("RAN", "hot", "clear", 1, 0), row)
         self.assertGreaterEqual(row["thermalWaitSec"], 1, row)
+
+    # BACHELOR-THERMAL-GATE-WAIT-1 r4 (adversary r3 pass 2 A1, Dot c5946322 on 528221bd): the probe budget was decided BEFORE the THERMAL_WAIT / RETRY_IN_LEASE log line and the
+    # sleep, and the next iteration never rejected an expired thermal deadline, so a log append that stalled (a UNC RunDir) or a wakeup that came late started another probe past
+    # the deadline. Dot's numbers (elapsed 100, cap 180, sleep 30, a 200 s stall) are scaled here (first hot reading at 0 s, cap 4, a 6 s stall): the runner copy under
+    # test has the stall injected as a Start-Sleep at the exact site, so the delay is in the runner and the test stays cheap.
+    LOG_THERMAL_WAIT = 'L "THERMAL_WAIT leg=$($leg.name)'
+    LOG_RETRY = 'L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=$($q.verdict)'
+
+    def _expired_wait_run(self, patch: tuple[str, str], **env: str) -> tuple[subprocess.CompletedProcess, dict]:
+        self._mirror_with_bad_sidecar(runner_patches=(patch,))
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "4", "-ThermalPollSec", "1", "-ClaimPollSec", "1", "-ThermalRequeueMax", "0", **env)
+        [b] = self.batches()
+        return r, b
+
+    def _assert_typed_skip_without_another_probe(self, r: subprocess.CompletedProcess, b: dict, quiet_before: int = 1) -> None:
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        self.assertEqual([x for x in self.kinds() if x.startswith("LEG:")], [], "a leg whose wait expired is never launched")
+        [row] = b["legs"]
+        self.assertEqual((row["status"], row["outcome"], row["counted"]), ("THERMAL_HOT_SKIPPED", "NOT_RUN", False), row)
+        self.assertGreater(row["thermalWaitSec"], 4, "the injected stall really carried the wait past the cap (else this test proves nothing)")
+        self.assertEqual(len([x for x in self.kinds() if x.startswith("QUIET")]), quiet_before, f"runner delay must never buy another probe: {self.kinds()}")
+        self.assertIn("expiredBeforeProbe=1", self.log())
+
+    def test_adversary_r3p2_a1_dot_a_log_append_that_stalls_past_the_deadline_starts_no_further_probe(self) -> None:
+        r, b = self._expired_wait_run((self.LOG_THERMAL_WAIT, "Start-Sleep -Seconds 6; " + self.LOG_THERMAL_WAIT), FAKE_HEAT="9")
+        self._assert_typed_skip_without_another_probe(r, b)
+
+    def test_adversary_r3p2_a1_dot_a_sleep_that_wakes_late_past_the_deadline_starts_no_further_probe(self) -> None:
+        r, b = self._expired_wait_run(("Start-Sleep -Seconds $sleep", "Start-Sleep -Seconds ($sleep + 6)"), FAKE_HEAT="9")
+        self._assert_typed_skip_without_another_probe(r, b)
+
+    def test_adversary_r3p2_a1_dot_the_busy_retry_path_log_stall_starts_no_further_probe(self) -> None:
+        # first probe QUIET and hot, every later probe GATE_BUSY: the RETRY_IN_LEASE log stalls past the deadline
+        r, b = self._expired_wait_run((self.LOG_RETRY, "Start-Sleep -Seconds 6; " + self.LOG_RETRY), FAKE_HEAT="9,NA", FAKE_QUIET_MODES="QUIET,BUSY")
+        self._assert_typed_skip_without_another_probe(r, b, quiet_before=2)
+
+    def test_adversary_r3p2_a1_dot_the_busy_retry_path_late_wakeup_starts_no_further_probe(self) -> None:
+        r, b = self._expired_wait_run(("Start-Sleep -Seconds $busySleep", "Start-Sleep -Seconds ($busySleep + 6)"), FAKE_HEAT="9,NA", FAKE_QUIET_MODES="QUIET,BUSY")
+        self._assert_typed_skip_without_another_probe(r, b, quiet_before=2)
+
+    def test_adversary_r3p2_a1_the_admission_check_is_part_of_the_one_budget_function_and_keeps_the_first_cooling_attempt(self) -> None:
+        got = ps_json(
+            "$d = { param($cap, $e, $slow) (Get-VenueThermalProbeBudget -CapSec $cap -ElapsedSec $e -SlowestReprobeSec $slow -WantSleepSec 30).mayDispatchNow }; "
+            # Dot: elapsed 100 + sleep 30, then a 200 s stall: 330 s on a cap of 180 is expired
+            "@((& $d 180 330 0), (& $d 180 181 0), (& $d 180 183 0), "
+            # a sleep cut to fit starts the probe AT the deadline less the slowest re-probe (plus a second of timer granularity): that probe is admitted
+            "(& $d 180 180 0), (& $d 3 3 0), (& $d 180 177 3), (& $d 180 178 3), "
+            # past it, or with the slowest re-probe no longer fitting, it is not; a cap of 0 never starts one
+            "(& $d 180 179 3), (& $d 180 150 40), (& $d 0 0 0))")
+        self.assertEqual(got, [False, True, False, True, True, True, True, False, False, False], got)
+        runner = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertIn("mayDispatchNow", runner, "the dispatch check is the budget function's, not a second copy of the rule")
 
     def test_unknown_heat_is_not_gated(self) -> None:
         r = self.run_batch([self.specs[0]], FAKE_HEAT="NA")

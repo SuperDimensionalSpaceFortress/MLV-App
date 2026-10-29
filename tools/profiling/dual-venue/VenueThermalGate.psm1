@@ -100,15 +100,22 @@ function Get-VenueThermalProbeBudget {
     # has truly passed. A later re-probe is started only if the slowest so far predicts it ends inside the deadline: fitSec = cap - elapsed - slowest, and the sleep is
     # min(-WantSleepSec, fitSec), so the next probe starts no later than deadline - slowest. A probe's own duration cannot be bounded from the runner: the budget is
     # cap + one probe (the receipt names the excess as thermalWaitOvershootSec).
+    # r4 (adversary r3 pass 2 A1, Dot c5946322): the sleep length above is only a PLAN. A log append that stalls or a wakeup that comes late moves the real start past it, so
+    # the same function also answers mayDispatchNow, asked by the runner with the clock read IMMEDIATELY before the probe is dispatched (after any log write and any sleep):
+    # the probe is admitted only if it starts no later than deadline - slowest, plus -DispatchGraceSec (default 1) for the whole-second elapsed the plan was computed from.
+    # An expired deadline therefore ends the wait as a skip with no further probe: the soft budget is cap + at most ONE probe already started before the deadline, plus
+    # that second; runner delay never buys another probe.
     param(
         [Parameter(Mandatory)][ValidateRange(0, 86400)][int]$CapSec,
         [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$ElapsedSec,
         [Parameter(Mandatory)][ValidateRange(0, [int]::MaxValue)][int]$SlowestReprobeSec,
-        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$WantSleepSec
+        [Parameter(Mandatory)][ValidateRange(1, [int]::MaxValue)][int]$WantSleepSec,
+        [ValidateRange(0, 60)][int]$DispatchGraceSec = 1
     )
     $fit = [long]$CapSec - [long]$ElapsedSec - [long]$SlowestReprobeSec
     $may = ($fit -ge 1)
-    [pscustomobject]@{ mayStartProbe = $may; fitSec = [int][Math]::Max([long][int]::MinValue, [Math]::Min([long][int]::MaxValue, $fit)); sleepSec = $(if ($may) { [int][Math]::Max(1L, [Math]::Min([long]$WantSleepSec, $fit)) } else { 0 }) }
+    $dispatch = ($CapSec -ge 1 -and ($fit + [long]$DispatchGraceSec) -ge 0)
+    [pscustomobject]@{ mayStartProbe = $may; mayDispatchNow = $dispatch; fitSec = [int][Math]::Max([long][int]::MinValue, [Math]::Min([long][int]::MaxValue, $fit)); sleepSec = $(if ($may) { [int][Math]::Max(1L, [Math]::Min([long]$WantSleepSec, $fit)) } else { 0 }) }
 }
 
 function Get-VenueThermalNowUtc {
