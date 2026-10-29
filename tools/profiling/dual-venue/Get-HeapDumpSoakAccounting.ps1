@@ -31,7 +31,9 @@ function Get-SoakCaptureClass($r) {
     }
     if ($watchNone) { return $(if ($pageHeap) { 'pageheap' } else { 'unattached' }) }
     if ($null -ne $p['heapDumpWatch']) {
-        return $(if ([string]$r.heapDumpWatch -match 'DEBUGGER_ATTACHED pid=\d+') { 'attached' } else { 'captureNotVerified' })
+        # r8 (adversary A4): a verified legacy attach keeps a page-heap leg in pageheap, as the typed branch does
+        if ([string]$r.heapDumpWatch -notmatch 'DEBUGGER_ATTACHED pid=\d+') { return 'captureNotVerified' }
+        return $(if ($pageHeap) { 'pageheap' } else { 'attached' })
     }
     # r8 (CoS Iverson #432 item 2): a record that names a debugger watch but carries no capture evidence is not verified, never unattached
     if (($null -ne $p['watch']) -or (($null -ne $p['heapCorruptionDump']) -and [bool]$r.heapCorruptionDump)) { return 'captureNotVerified' }
@@ -44,18 +46,25 @@ function Get-BinomialCdf([int]$n, [int]$k, [double]$p) {
     if ($n -le 0 -or $k -ge $n -or $p -le 0.0) { return 1.0 }
     # r8 (CoS Iverson #432 item 4): at p = 1 every trial succeeds, so P(X <= k < n) = 0 (the loop's (1-p)^n start is 0 there and its ratio divides by 0)
     if ($p -ge 1.0) { return 0.0 }
-    $sum = 0.0
-    $term = [math]::Pow(1.0 - $p, $n)
+    # r8 (adversary A5): the terms are summed in log space, so (1-p)^n underflowing a double (0.5^2000) cannot zero the whole sum
+    $logTerm = $n * [math]::Log(1.0 - $p)
+    $logRatio = [math]::Log($p / (1.0 - $p))
+    $logTerms = [Collections.Generic.List[double]]::new()
     for ($i = 0; $i -le $k; $i++) {
-        $sum += $term
-        $term = $term * (($n - $i) / ($i + 1.0)) * ($p / (1.0 - $p))
+        $logTerms.Add($logTerm)
+        $logTerm += [math]::Log(($n - $i) / ($i + 1.0)) + $logRatio
     }
-    [math]::Min(1.0, $sum)
+    $max = [double]::NegativeInfinity
+    foreach ($l in $logTerms) { if ($l -gt $max) { $max = $l } }
+    $scaled = 0.0
+    foreach ($l in $logTerms) { $scaled += [math]::Exp($l - $max) }
+    [math]::Min(1.0, [math]::Exp($max + [math]::Log($scaled)))
 }
 
 $groupNames = @('attached', 'unattached', 'pageheap', 'captureNotVerified')
 $groups = [ordered]@{}
-foreach ($g in $groupNames) { $groups[$g] = [ordered]@{ legs = 0; stopCycles = 0; crashes = 0; dumps = 0; arms = [ordered]@{}; names = @() } }
+# r8 (adversary A6): stopCycleCrashes counts the crashes of stop-cycle legs only; the binomial rate and comparisons use it (crashes stays the total)
+foreach ($g in $groupNames) { $groups[$g] = [ordered]@{ legs = 0; stopCycles = 0; crashes = 0; stopCycleCrashes = 0; dumps = 0; arms = [ordered]@{}; names = @() } }
 $notRun = @()
 foreach ($file in $LegsJsonl) {
     $source = Split-Path -Leaf $file
@@ -66,9 +75,11 @@ foreach ($file in $LegsJsonl) {
         if ([string]$r.status -cne 'RAN') { $notRun += $name; continue }
         $g = $groups[(Get-SoakCaptureClass $r)]
         $g.legs++
-        if ($null -ne $r.PSObject.Properties['stopCycle'] -and [bool]$r.stopCycle) { $g.stopCycles++ }
+        $stopCycle = ($null -ne $r.PSObject.Properties['stopCycle']) -and [bool]$r.stopCycle
+        if ($stopCycle) { $g.stopCycles++ }
         $crash = ($null -ne $r.PSObject.Properties['crash']) -and [bool]$r.crash
         if ($crash) { $g.crashes++ }
+        if ($crash -and $stopCycle) { $g.stopCycleCrashes++ }
         if ($null -ne $r.PSObject.Properties['dumps'] -and @($r.dumps).Count -gt 0) { $g.dumps++ }
         $arm = [string]$r.arm
         if (-not $g.arms.Contains($arm)) { $g.arms[$arm] = [ordered]@{ legs = 0; crashes = 0 } }
@@ -79,13 +90,13 @@ foreach ($file in $LegsJsonl) {
 }
 
 $un = $groups['unattached']
-$unRate = $(if ($un.stopCycles -gt 0) { $un.crashes / [double]$un.stopCycles } else { $null })
+$unRate = $(if ($un.stopCycles -gt 0) { $un.stopCycleCrashes / [double]$un.stopCycles } else { $null })
 $comparisons = @()
 foreach ($gn in 'attached', 'pageheap') {
     $g = $groups[$gn]
     if ($null -ne $unRate -and $g.stopCycles -gt 0) {
-        $comparisons += [ordered]@{ group = $gn; stopCycles = $g.stopCycles; crashes = $g.crashes; unattachedRate = [math]::Round($unRate, 4)
-            pAtMostThisManyAtUnattachedRate = [math]::Round((Get-BinomialCdf $g.stopCycles $g.crashes $unRate), 3) }
+        $comparisons += [ordered]@{ group = $gn; stopCycles = $g.stopCycles; crashes = $g.stopCycleCrashes; unattachedRate = [math]::Round($unRate, 4)
+            pAtMostThisManyAtUnattachedRate = [math]::Round((Get-BinomialCdf $g.stopCycles $g.stopCycleCrashes $unRate), 3) }
     }
 }
 $result = [ordered]@{ schema = 'mlv-app/heap-dump-soak-accounting/v1'; sources = @($LegsJsonl | ForEach-Object { Split-Path -Leaf $_ }); groups = $groups; notRun = $notRun; comparisons = $comparisons }

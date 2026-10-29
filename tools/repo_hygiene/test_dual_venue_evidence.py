@@ -8706,6 +8706,32 @@ class HeapDumpSoakAccountingTests(unittest.TestCase):
             [c] = self.account([dict(leg, name="U-0", arm="CTL-U", watch="none", crash=False), *attached(0)])["comparisons"]
             self.assertEqual((c["unattachedRate"], c["pAtMostThisManyAtUnattachedRate"]), (0.0, 1.0))
 
+    def test_heap_dump_soak_accounting_keeps_a_legacy_attached_page_heap_leg_in_pageheap(self) -> None:
+        # r8 (adversary r8 A4): the r6b watcher-log branch honours pageHeap like the typed branch
+        rec = {"status": "RAN", "name": "P", "arm": "PH-W", "stopCycle": True, "crash": False, "dumps": [], "pageHeap": True,
+               "heapDumpWatch": "2026-10-29T00:00:00Z DEBUGGER_ATTACHED pid=7"}
+        g = self.account([rec])["groups"]
+        self.assertEqual((g["pageheap"]["legs"], g["attached"]["legs"]), (1, 0))
+
+    def test_heap_dump_soak_accounting_binomial_does_not_underflow_at_large_n(self) -> None:
+        # r8 (adversary r8 A5): 0.5^2000 underflows a double; P(X <= 1000 | n=2000, p=0.5) is 0.5089..., never 0
+        leg = {"status": "RAN", "stopCycle": True, "dumps": []}
+        records = [dict(leg, name="U-1", arm="CTL-U", watch="none", crash=True), dict(leg, name="U-2", arm="CTL-U", watch="none", crash=False)]
+        records += [dict(leg, name=f"A-{i}", arm="CTL-W", watch="debugger", captureState="ATTACHED_NO_CRASH", crash=i < 1000) for i in range(2000)]
+        [c] = self.account(records)["comparisons"]
+        self.assertEqual((c["stopCycles"], c["crashes"], c["unattachedRate"], c["pAtMostThisManyAtUnattachedRate"]), (2000, 1000, 0.5, 0.509))
+
+    def test_heap_dump_soak_accounting_rate_counts_only_stop_cycle_crashes(self) -> None:
+        # r8 (adversary r8 A6): the binomial is over stop cycles, so its crash count is the crashes OF stop-cycle legs; a crash in a leg that never
+        # reached the stop cycle stays in crashes but not in the rate (which could otherwise exceed 1)
+        records = [{"name": "U-stop", "arm": "CTL-U", "status": "RAN", "watch": "none", "stopCycle": True, "crash": False, "dumps": []},
+                   {"name": "U-load-crash", "arm": "CTL-U", "status": "RAN", "watch": "none", "stopCycle": False, "crash": True, "dumps": []},
+                   {"name": "A-stop", "arm": "CTL-W", "status": "RAN", "watch": "debugger", "captureState": "ATTACHED_NO_CRASH", "stopCycle": True, "crash": False, "dumps": []}]
+        out = self.account(records)
+        self.assertEqual((out["groups"]["unattached"]["crashes"], out["groups"]["unattached"]["stopCycleCrashes"]), (1, 0))
+        [c] = out["comparisons"]
+        self.assertEqual((c["unattachedRate"], c["pAtMostThisManyAtUnattachedRate"]), (0.0, 1.0))
+
 
 @requires_windows_pwsh
 class VisualCaptureVenueHelperTests(unittest.TestCase):
