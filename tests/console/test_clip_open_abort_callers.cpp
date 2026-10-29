@@ -199,7 +199,7 @@ TEST(ClipOpenAbortCallersWiring, RefusedImportLeavesTheSessionWithoutAReceiptSav
     ASSERT_TRUE(branch.contains(QStringLiteral("m_pModel->removeRow( importedRow, QModelIndex() );")));
     // r7: previousActive is restored through refusedImportActiveRow (ClipOpenAbortR7 covers its rows)
     ASSERT_TRUE(branch.contains(QStringLiteral(
-        "const int restoredActive = refusedImportActiveRow( previousActive, activeBeforeRemoval, importedRow, SESSION_CLIP_COUNT );")));
+        "const int restoredActive = refusedImportActiveRow( previousRow, activeBeforeRemoval, importedRow, SESSION_CLIP_COUNT );")));
     ASSERT_FALSE(branch.contains(QStringLiteral("setReceipt(")));
     ASSERT_FALSE(branch.contains(QStringLiteral("deleteFileFromSession")));
 }
@@ -948,14 +948,14 @@ TEST(ClipOpenAbortR5Wiring, EveryImportCallerShowsTheLastRowOnlyFromTheBatchOutc
     ASSERT_TRUE(warning >= 0);
     ASSERT_TRUE(refused > warning);
     ASSERT_TRUE(importBody.contains(QStringLiteral(
-        "if( !keptPrevious && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );")));
+        "if( m_slidersDetachedFromReceipt && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );")));
     // r6 (adversary e11815a5 A1): a FileOpen inside this import's event pumps can append and show another clip;
     // the refused clip's own row is removed, and the sliders stay attached only while previousActive is loaded
     const int lookup = importBody.indexOf(QStringLiteral("if( GET_CLIP( i )->getPath() == fileName ) { importedRow = i; break; }"));
     const int removed = importBody.indexOf(QStringLiteral("m_pModel->removeRow( importedRow, QModelIndex() );"));
     ASSERT_TRUE(lookup >= 0 && removed > lookup);
     ASSERT_TRUE(importBody.contains(QStringLiteral(
-        "const bool keptPrevious = clipOpenFailureKeptRetainedClip( ret ) && loadedClipIsRow( previousActive );")));
+        "const bool keptPrevious = clipOpenFailureKeptRetainedClip( ret ) && loadedClipIsRow( previousRow );")));
     ASSERT_TRUE(importBody.contains(QStringLiteral("    }\n    return true;\n}")));
 
     const QString show = QStringLiteral("if( SESSION_CLIP_COUNT && imports.showLastRow() ) showFileInEditor( SESSION_CLIP_COUNT - 1 );");
@@ -1030,7 +1030,7 @@ TEST(ClipOpenAbortR7Wiring, RefusedImportSetsTheActiveRowFromThePolicyAfterTheRe
     const int before = importBody.indexOf(QStringLiteral("const int activeBeforeRemoval = SESSION_ACTIVE_CLIP_ROW;"));
     const int removed = importBody.indexOf(QStringLiteral("m_pModel->removeRow( importedRow, QModelIndex() );"));
     const int policy = importBody.indexOf(QStringLiteral(
-        "const int restoredActive = refusedImportActiveRow( previousActive, activeBeforeRemoval, importedRow, SESSION_CLIP_COUNT );"));
+        "const int restoredActive = refusedImportActiveRow( previousRow, activeBeforeRemoval, importedRow, SESSION_CLIP_COUNT );"));
     const int applied = importBody.indexOf(QStringLiteral(
         "if( restoredActive >= 0 ) SET_ACTIVE_CLIP_IDX( restoredActive );\n            else deleteSession();"));
     const int retry = importBody.indexOf(QStringLiteral("retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );"));
@@ -1040,6 +1040,83 @@ TEST(ClipOpenAbortR7Wiring, RefusedImportSetsTheActiveRowFromThePolicyAfterTheRe
     ASSERT_TRUE(applied > policy);
     ASSERT_TRUE(retry > applied);
     ASSERT_FALSE(importBody.contains(QStringLiteral("else if( SESSION_CLIP_COUNT == 0 ) deleteSession();")));
+}
+
+// adversary 7fd2d2f1 A1: session [A], A loaded and attached. Import B; inside addFileToSession's processEvents a
+// duplicate FileOpen( A ) shows the last row B, whose open is refused (B never loaded: the sliders detach, a retry is
+// scheduled for row 1). The outer refusal removes B and restores A while A is still loaded. The sliders are still
+// detached, so A must be reopened later; otherwise every later edit of A is dropped by setReceipt.
+TEST(ClipOpenAbortR7, ANestedRefusalThatDetachedTheSlidersReopensTheRestoredClipLater)
+{
+    // showFileInEditor's sibling: the old row is restored and still loaded, but an open inside openMlv's event pump
+    // already detached the sliders
+    const ShowFileOpenFailurePlan nested = showFileOpenFailurePlan(kClipOpenAbortedPrepBusy, 1, 0, 1, 2, false, true, true);
+    ASSERT_FALSE(nested.detachSliders);
+    ASSERT_TRUE(nested.retryReopenLater);
+    // unchanged without a nested detach, and an ordinary failure never schedules a reopen
+    ASSERT_FALSE(showFileOpenFailurePlan(kClipOpenAbortedPrepBusy, 1, 0, 1, 2, false, true, false).retryReopenLater);
+    ASSERT_FALSE(showFileOpenFailurePlan(kMlvErrCorrupted, 1, 0, 1, 2, false, true, true).retryReopenLater);
+    // a plan that reopens the old clip now needs no later reopen
+    ASSERT_FALSE(showFileOpenFailurePlan(kClipOpenAbortedPrepBusyAfterFree, 1, 0, 1, 2, false, false, true).retryReopenLater);
+}
+
+// adversary 7fd2d2f1 A2: inside addFileToSession( B )'s event pump a FileOpen opens a session file; that clears A
+// and B. B's open is refused, but its row is gone: nothing is removed and no index of the old session is used.
+TEST(ClipOpenAbortR7, ARefusedImportWhoseRowIsGoneRemovesNothing)
+{
+    ASSERT_EQ(refusedImportActiveRow(-1, -1, -1, 0), -1); // the nested session is empty: deleteSession
+    ASSERT_EQ(refusedImportActiveRow(-1, 1, -1, 2), 1);   // the nested session [X,Y], Y active: kept
+    ASSERT_EQ(refusedImportActiveRow(-1, 5, -1, 2), 1);   // a stale active row: the last row
+    ASSERT_EQ(refusedImportActiveRow(0, 1, -1, 2), 0);    // the previous clip, found again by path at row 0
+    for (int n = 0; n <= 3; ++n)
+        for (int before = -1; before <= n; ++before)
+        {
+            const int row = refusedImportActiveRow(-1, before, -1, n);
+            if (n == 0) ASSERT_EQ(row, -1);
+            else ASSERT_TRUE(row >= 0 && row < n);
+            if (n > 0 && before >= 0 && before < n) ASSERT_EQ(row, before);
+        }
+}
+
+TEST(ClipOpenAbortR7Wiring, RefusedImportFindsItsRowAndThePreviousClipByPathAndRetriesWhileDetached)
+{
+    const QString source = mainWindowSource();
+    const QString importBody = bodyBetween(source, QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"),
+                                           QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
+    ASSERT_FALSE(importBody.isEmpty());
+    const int path = importBody.indexOf(QStringLiteral("const QString previousActivePath ="));
+    const int add = importBody.indexOf(QStringLiteral("addFileToSession( fileName );"));
+    ASSERT_TRUE(path >= 0 && add > path);
+    ASSERT_TRUE(importBody.contains(QStringLiteral("int importedRow = -1;")));
+    ASSERT_FALSE(importBody.contains(QStringLiteral("int importedRow = SESSION_CLIP_COUNT - 1;")));
+    const int removed = importBody.indexOf(QStringLiteral("if( importedRow >= 0 ) m_pModel->removeRow( importedRow, QModelIndex() );"));
+    const int found = importBody.indexOf(QStringLiteral("if( GET_CLIP( i )->getPath() == previousActivePath ) { previousRow = i; break; }"));
+    const int kept = importBody.indexOf(QStringLiteral(
+        "const bool keptPrevious = clipOpenFailureKeptRetainedClip( ret ) && loadedClipIsRow( previousRow );"));
+    const int retry = importBody.indexOf(QStringLiteral(
+        "if( m_slidersDetachedFromReceipt && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );"));
+    ASSERT_TRUE(removed >= 0);
+    ASSERT_TRUE(found > removed);
+    ASSERT_TRUE(kept > found);
+    ASSERT_TRUE(retry > kept);
+
+    const QString show = bodyBetween(source, QStringLiteral("int MainWindow::showFileInEditor(int row)"),
+                                     QStringLiteral("bool MainWindow::addClipToExportQueue(int row, QString fileName)"));
+    ASSERT_TRUE(show.contains(QStringLiteral("oldClipStillLoaded, m_slidersDetachedFromReceipt );")));
+
+    // the delete loop (sibling): a row that is no longer in the session is never read or removed
+    const QString del = bodyBetween(source, QStringLiteral("void MainWindow::deleteFileFromSession( void )"),
+                                    QStringLiteral("//if there is at least one..."));
+    ASSERT_FALSE(del.isEmpty());
+    const QString guard = QStringLiteral("if( row < 0 || row >= SESSION_CLIP_COUNT ) continue;");
+    const int rowRead = del.indexOf(QStringLiteral("int row = list.at( i - 1 ).data( ROLE_REALINDEX ).toInt();"));
+    const int firstGuard = del.indexOf(guard, rowRead);
+    const int trash = del.indexOf(QStringLiteral("MoveToTrash( GET_RECEIPT(row)->fileName() )"));
+    const int secondGuard = del.indexOf(guard, firstGuard + 1);
+    const int delRemove = del.indexOf(QStringLiteral("m_pModel->removeRow( row, QModelIndex() );"));
+    ASSERT_TRUE(rowRead >= 0);
+    ASSERT_TRUE(firstGuard > rowRead && trash > firstGuard);
+    ASSERT_TRUE(secondGuard > trash && delRemove > secondGuard);
 }
 
 // adversary 7354a575 A1: session [A,B,C], A active and loaded with exposure 20, B never loaded and corrupt.
@@ -1114,7 +1191,7 @@ TEST(ClipOpenAbortR6Wiring, ShowFileInEditorTellsThePlanWhetherTheOldClipIsStill
     ASSERT_TRUE(open >= 0);
     ASSERT_TRUE(loadedIsOld > open);   // read after openMlv returns: a re-entrant open has already run
     ASSERT_TRUE(plan > loadedIsOld);
-    ASSERT_TRUE(body.mid(plan, 400).contains(QStringLiteral("oldClipStillLoaded );")));
+    ASSERT_TRUE(body.mid(plan, 400).contains(QStringLiteral("oldClipStillLoaded, m_slidersDetachedFromReceipt );")));
 }
 
 // adversary 7354a575 A2: the Play-stop drain waits for the prep worker (up to 2 s). The smoke telemetry samples

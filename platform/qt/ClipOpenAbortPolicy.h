@@ -109,13 +109,14 @@ struct ImportBatchOutcome
 // sliders describe (previousActive) is active again when it exists. Otherwise (the session was empty and a FileOpen
 // inside the import added a clip) the active row follows the clip it named across the removal; when that was the
 // removed row or no row, the last row (the clip a nested import showed last). -1: the session is empty.
+// r7 (adversary 7fd2d2f1 A2): removedRow -1 = the row was already gone (a nested Open Session), nothing was removed.
 inline int refusedImportActiveRow( int previousActive, int activeBeforeRemoval, int removedRow, int clipCountAfterRemoval )
 {
     if( clipCountAfterRemoval <= 0 ) return -1;
     if( previousActive >= 0 && previousActive < clipCountAfterRemoval ) return previousActive;
     int row = activeBeforeRemoval;
-    if( row == removedRow ) row = -1;
-    else if( row > removedRow ) row--;
+    if( removedRow >= 0 && row == removedRow ) row = -1;
+    else if( removedRow >= 0 && row > removedRow ) row--;
     if( row < 0 || row >= clipCountAfterRemoval ) row = clipCountAfterRemoval - 1;
     return row;
 }
@@ -138,7 +139,8 @@ struct ShowFileOpenFailurePlan
 
 inline ShowFileOpenFailurePlan showFileOpenFailurePlan( int openResult, int row, int oldActive,
                                                         int selectedCount, int clipCount, bool oldNeverLoaded,
-                                                        bool oldClipStillLoaded = true )
+                                                        bool oldClipStillLoaded = true,
+                                                        bool slidersAlreadyDetached = false )
 {
     ShowFileOpenFailurePlan plan;
     const bool oldIsOther = oldActive >= 0 && oldActive < clipCount && oldActive != row;
@@ -152,7 +154,10 @@ inline ShowFileOpenFailurePlan showFileOpenFailurePlan( int openResult, int row,
     const bool oldIsRowItself = oldActive >= 0 && oldActive < clipCount && oldActive == row;
     plan.detachSliders = !( ( plan.restoreOldActive || oldIsRowItself ) && !oldNeverLoaded
                             && clipOpenFailureKeptRetainedClip( openResult ) && oldClipStillLoaded );
-    plan.retryReopenLater = plan.detachSliders && !plan.reopenOld && clipOpenAbortedForPrep( openResult );
+    // r7 (adversary 7fd2d2f1 A1 sibling): an open inside openMlv's event pump can have detached the sliders already;
+    // the restored clip is then reopened later too, or every later edit of it is dropped.
+    plan.retryReopenLater = ( plan.detachSliders || slidersAlreadyDetached ) && !plan.reopenOld
+                            && clipOpenAbortedForPrep( openResult );
     return plan;
 }
 

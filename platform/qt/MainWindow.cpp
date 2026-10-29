@@ -11045,6 +11045,10 @@ bool MainWindow::importNewMlv(QString fileName)
     else
     {
         const int previousActive = SESSION_CLIP_COUNT > 0 ? SESSION_ACTIVE_CLIP_ROW : -1;
+        // r7 (adversary 7fd2d2f1 A2): a FileOpen inside this import can delete rows or open another session, so the
+        // previous clip is found again by its path, never by its old row.
+        const QString previousActivePath = previousActive >= 0 && previousActive < SESSION_CLIP_COUNT
+                                         ? GET_CLIP( previousActive )->getPath() : QString();
 
         //Add to SessionList
         addFileToSession( fileName );
@@ -11060,22 +11064,27 @@ bool MainWindow::importNewMlv(QString fileName)
             // corrupt-file dialog and without a receipt save, and the clip the sliders describe is active again.
             // r6 (adversary e11815a5 A1): a FileOpen inside addFileToSession's or the open's event pump can append
             // and show another clip, so the refused clip's own row is removed, not the last one.
-            int importedRow = SESSION_CLIP_COUNT - 1;
+            // r7 (adversary 7fd2d2f1 A2): a nested Open Session can have removed it already; then nothing is removed.
+            int importedRow = -1;
             for( int i = 0; i < SESSION_CLIP_COUNT; i++ )
                 if( GET_CLIP( i )->getPath() == fileName ) { importedRow = i; break; }
             const int activeBeforeRemoval = SESSION_ACTIVE_CLIP_ROW;
-            m_pModel->removeRow( importedRow, QModelIndex() );
+            if( importedRow >= 0 ) m_pModel->removeRow( importedRow, QModelIndex() );
+            int previousRow = -1;
+            for( int i = 0; i < SESSION_CLIP_COUNT && !previousActivePath.isEmpty(); i++ )
+                if( GET_CLIP( i )->getPath() == previousActivePath ) { previousRow = i; break; }
             // r7 (sol r6 CO-ACTIVE-ROW-EMPTY-NESTED): removeRow keeps the stored active row, so it is set here.
-            const int restoredActive = refusedImportActiveRow( previousActive, activeBeforeRemoval, importedRow, SESSION_CLIP_COUNT );
+            const int restoredActive = refusedImportActiveRow( previousRow, activeBeforeRemoval, importedRow, SESSION_CLIP_COUNT );
             if( restoredActive >= 0 ) SET_ACTIVE_CLIP_IDX( restoredActive );
             else deleteSession();
             // r4 (adversary A1 sibling): refused after the free, an empty object is loaded, not previousActive.
             // r6: so is any clip that opened inside this import; the sliders then describe no restored receipt.
-            const bool keptPrevious = clipOpenFailureKeptRetainedClip( ret ) && loadedClipIsRow( previousActive );
+            const bool keptPrevious = clipOpenFailureKeptRetainedClip( ret ) && loadedClipIsRow( previousRow );
             if( !keptPrevious ) m_slidersDetachedFromReceipt = true;
             // r5 (adversary 4b41aa22 A1): the caller shows no other row, so the restored clip is reopened later
             // (a no-op once any other clip opens first).
-            if( !keptPrevious && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );
+            // r7 (adversary 7fd2d2f1 A1): also when an open inside this import's event pumps detached them already.
+            if( m_slidersDetachedFromReceipt && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );
             listViewSessionUpdate();
             QMessageBox::warning( this, tr( "Import MLV" ),
                                   tr( "%1 was not imported because playback was still preparing a frame. Import it again." )
@@ -18965,7 +18974,7 @@ int MainWindow::showFileInEditor(int row)
         const ShowFileOpenFailurePlan plan = showFileOpenFailurePlan(
             openResult, row, oldActive, selectedClipsList().size(), SESSION_CLIP_COUNT,
             oldActive >= 0 && oldActive < SESSION_CLIP_COUNT && GET_RECEIPT( oldActive )->wasNeverLoaded(),
-            oldClipStillLoaded );
+            oldClipStillLoaded, m_slidersDetachedFromReceipt );
         if( plan.restoreOldActive ) SET_ACTIVE_CLIP_IDX( oldActive );
         // r4 (adversary A1): the delete path pre-activates the row that failed, so oldActive == row; the
         // sliders then describe no receipt, and saveSession / setReceipt must not write them into this row.
@@ -23808,6 +23817,9 @@ void MainWindow::deleteFileFromSession( void )
         if( ui->tableViewSession->isRowHidden( list.at(i-1).row() ) ) continue;
 
         int row = list.at( i - 1 ).data( ROLE_REALINDEX ).toInt();
+        // r7 (adversary 7fd2d2f1 A2 sibling): a FileOpen inside a dialog of this loop can change the session; a row
+        // that is no longer in it is never read or removed.
+        if( row < 0 || row >= SESSION_CLIP_COUNT ) continue;
         //Delete file from disk when wanted
         if( msg.clickedButton() == deleteButton )
         {
@@ -23843,6 +23855,7 @@ void MainWindow::deleteFileFromSession( void )
                 }
             }
         }
+        if( row < 0 || row >= SESSION_CLIP_COUNT ) continue;
         int delrow = m_pProxyModel->mapFromSource( m_pModel->index( row, 0, QModelIndex() ) ).row();
         //Remove item from Session List & Remove slider memory
         m_pModel->removeRow( row, QModelIndex() );
