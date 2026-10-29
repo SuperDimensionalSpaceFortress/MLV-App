@@ -2700,6 +2700,81 @@ def test_an_action_that_locks_error_action_preference_never_skips_the_build_slot
     assert list((box["dir"] / "heavy-slot").iterdir()) == [], "every lease file is deleted on release"
 
 
+# r13 (sol r12 B2, adversary fd39a45c-A1): an action that locks the restored AllScope defaults ReadOnly left them on for every
+# release cmdlet: 'Set-Content:PassThru' wrote 'stop' into the action's output and 'Remove-Item:Exclude'='*' kept the lock and
+# lease files. The release now switches the defaults off through the dictionary's own 'Disabled' key, and gives that key back.
+@pytest.mark.parametrize("lock_it", [True, False], ids=["action-locks-defaults", "control-unlocked"])
+def test_an_action_that_locks_allscope_defaults_never_changes_the_release(box, lock_it) -> None:
+    lock = "Set-Variable PSDefaultParameterValues -Option AllScope,ReadOnly -Value $PSDefaultParameterValues -Force; " if lock_it else ""
+    done = _library_driver(
+        box,
+        "Set-Variable -Name PSDefaultParameterValues -Option AllScope "
+        "-Value @{ 'Remove-Item:Exclude' = '*'; 'Set-Content:PassThru' = $true }\n"
+        "try { $r = @(Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        f"    {lock}'ACTION' }})\n"
+        "    Write-Output (\"count={0} values={1}\" -f $r.Count, ($r -join ',')) } catch { Write-Output \"caught=$($_.FullyQualifiedErrorId)\" }\n"
+        "Write-Output \"after defaults=$(@($PSDefaultParameterValues.Keys | Sort-Object) -join ',')\"\n",
+        str(box["lock"]),
+        host_tail=(
+            "$d = (Get-Date).AddSeconds(20)\n"
+            f"while (-not (Test-Path -LiteralPath '{box['dir'] / 'stub.log'}') -and (Get-Date) -lt $d) {{ Start-Sleep -Milliseconds 200 }}\n"
+            f"Write-Output \"released=$(Test-Path -LiteralPath '{box['dir'] / 'stub.log'}')\"\n"
+        ),
+    )
+    out = done.stdout + done.stderr
+    assert "caught=" not in done.stdout, out
+    assert "count=1 values=ACTION" in done.stdout, f"the action's output is exactly the action's\n{out}"
+    assert "after defaults=Remove-Item:Exclude,Set-Content:PassThru" in done.stdout, f"the caller's defaults come back unchanged\n{out}"
+    assert "released=True" in done.stdout, out
+    assert "did not end within 60 s of release" not in out, out
+    assert not box["lock"].exists(), "the build slot's lock is deleted on release"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == [], "every lease file is deleted on release"
+
+
+# r13 (sol r12 B3, adversary fd39a45c-A7): the stop file cannot be written and the action locked the global $LASTEXITCODE
+# ReadOnly at 7, so the taskkill fallback's restore threw outside its catch, past the warning-only release, and the
+# verified-holder fallback never ran. The restore is now a warning; the holder is still ended and the 7 is kept.
+def test_a_locked_lastexitcode_never_skips_the_holder_fallback(box) -> None:
+    stop = box["dir"] / "x.stop"
+    stop.mkdir()
+    holder = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-Command", "Start-Sleep -Seconds 120"])
+    try:
+        done = _ps(["-Command",
+                    f". '{GUARD}' -Library\n"
+                    f"$h = Get-Process -Id {holder.pid}\n"
+                    "$p = [pscustomobject]@{ Id = 2147483646; HasExited = $false }\n"
+                    f"$lease = @{{ Label = 'mlv:t:build'; Stop = '{stop}'; Process = $p; Holder = @{{ Pid = $h.Id; Ticks = $h.StartTime.ToUniversalTime().Ticks }} }}\n"
+                    "Set-Variable -Name LASTEXITCODE -Scope Global -Option ReadOnly -Value 7 -Force\n"
+                    "try { Send-HeavySlotStop $lease; Write-Output \"returned code=$global:LASTEXITCODE\" }\n"
+                    "catch { Write-Output \"threw=$($_.Exception.GetType().Name): $($_.Exception.Message)\" }\n"])
+        out = done.stdout + done.stderr
+        assert "threw=" not in done.stdout, out
+        assert "returned code=7" in done.stdout, out
+        assert "stop file not written" in done.stderr, out
+        assert "$LASTEXITCODE not restored after taskkill" in done.stderr, out
+        holder.wait(timeout=20)
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+
+
+def test_a_locked_lastexitcode_in_a_library_action_keeps_the_release_warning_only(box) -> None:
+    # The same input end to end (sol's repro): the release stays warning-only and the action's own 7 is what the caller sees.
+    done = _library_driver(
+        box,
+        "try { $r = Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        "    New-Item -ItemType Directory -Path $heavy.Stop | Out-Null\n"
+        "    Set-Variable -Name LASTEXITCODE -Scope Global -Option ReadOnly -Value 7 -Force; 'ACTION' }\n"
+        "    Write-Output \"returned=$r code=$global:LASTEXITCODE\" } catch { Write-Output \"caught=$($_.Exception.Message)\" }\n",
+        str(box["lock"]),
+    )
+    out = done.stdout + done.stderr
+    assert "caught=" not in done.stdout, out
+    assert "returned=ACTION code=7" in done.stdout, out
+    assert "stop file not written" in done.stderr, out
+    assert not box["lock"].exists(), "the build slot's lock is deleted on release"
+
+
 # r11 (sol r10 B2): the admission wait slept a whole -PollSeconds while it held the machine heavy slot, so PollSeconds=3600 with
 # DeadlineMinutes=0.01 asked for a one-hour sleep past a 0.6 s deadline. Every sleep is now at most what is left of the
 # deadline, on the memory wait and the local-slot-busy path alike, and the expired deadline gives the slot back and refuses.

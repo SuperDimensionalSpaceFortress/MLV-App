@@ -867,7 +867,11 @@ function Send-HeavySlotStop($Lease) {
         try { $null = & ([IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'taskkill.exe')) /PID $Lease.Process.Id /T /F 2>&1 }
         catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} taskkill of heavy-slot pid {1} failed ({2})' -f $Lease.Label, $Lease.Process.Id, $_.Exception.Message) }
         finally {
-            if ($last) { $global:LASTEXITCODE = $keep } else { Remove-Variable -Name LASTEXITCODE -Scope Global -WhatIf:$false -Confirm:$false -ErrorAction Ignore }
+            # r13 (sol r12 B3): an action that made the global $LASTEXITCODE ReadOnly made this restore throw past the release,
+            # and the holder fallback below never ran. The value the action locked is the one it exits with, so a restore that
+            # cannot be made is a warning only.
+            try { if ($last) { $global:LASTEXITCODE = $keep } else { Remove-Variable -Name LASTEXITCODE -Scope Global -WhatIf:$false -Confirm:$false -ErrorAction Ignore } }
+            catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} $LASTEXITCODE not restored after taskkill ({1})' -f $Lease.Label, ($_.Exception.Message -replace '\s+', ' ')) }
         }
     }
     # (The wrapper's pid cannot be reused here: $Lease.Process has held its handle since Process.Start.)
@@ -1211,9 +1215,18 @@ function Invoke-BuildGuard {
     $callerPrefs = @{ VerbosePreference = $VerbosePreference; DebugPreference = $DebugPreference; WarningPreference = $WarningPreference
         InformationPreference = $InformationPreference; WhatIfPreference = $WhatIfPreference; ConfirmPreference = $ConfirmPreference
         ErrorActionPreference = $ErrorActionPreference }
+    # r13 (sol r12 B2): an action that locks the restored AllScope defaults (ReadOnly) makes the assignment below a no-op, and
+    # every release cmdlet ran under them ('Set-Content:PassThru' wrote 'stop' into the action's output, 'Remove-Item:Exclude'
+    # kept the lock and lease files). A ReadOnly variable still holds a dictionary that can be written, so its own 'Disabled'
+    # switch turns every default off for the release, and the caller's value of that key comes back with the rest.
+    $defaultsOff = $null
     $guardPrefs = {
         trap { continue }
         $PSDefaultParameterValues = @{}
+        if (-not $defaultsOff -and $PSDefaultParameterValues -is [System.Collections.IDictionary] -and $PSDefaultParameterValues.Count) {
+            $defaultsOff = @{ Map = $PSDefaultParameterValues; Had = $PSDefaultParameterValues.Contains('Disabled'); Value = $PSDefaultParameterValues['Disabled'] }
+            $PSDefaultParameterValues['Disabled'] = $true
+        }
         $VerbosePreference = 'SilentlyContinue'; $DebugPreference = 'SilentlyContinue'
         $WarningPreference = 'SilentlyContinue'; $InformationPreference = 'SilentlyContinue'
         $WhatIfPreference = $false; $ConfirmPreference = 'None'
@@ -1225,6 +1238,10 @@ function Invoke-BuildGuard {
         $WhatIfPreference = $callerPrefs.WhatIfPreference; $ConfirmPreference = $callerPrefs.ConfirmPreference
         $ErrorActionPreference = $callerPrefs.ErrorActionPreference
         $PSDefaultParameterValues = $callerDefaults
+        if ($defaultsOff) {
+            if ($defaultsOff.Had) { $defaultsOff.Map['Disabled'] = $defaultsOff.Value } else { $defaultsOff.Map.Remove('Disabled') }
+            $defaultsOff = $null
+        }
     }
     # The machine heavy slot is the OUTERMOST lock of a build: the memory floor and the build slot below nest inside it,
     # and the outer finally gives it back on every way out, a throw a Library caller catches included (adversary A2).
