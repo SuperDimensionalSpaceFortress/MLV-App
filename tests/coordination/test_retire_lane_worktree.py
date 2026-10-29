@@ -2995,6 +2995,12 @@ ENCODED_LAUNCH_SITES = {
          "the Claude-engine job host (pwsh -EncodedCommand $hostSource) is not a driver: it waits on its claude.exe child, whose argv "
          "names <RunDir> through --settings <RunDir>\\<lane>-NNN.settings.json and whose pid is written to <RunDir>\\<lane>-NNN.child.json"),
     ],
+    "tools/profiling/bachelor/playback-attr-3-cuda-job.ps1": [
+        ("-EncodedCommand $CorePartitionHelperEncoded",
+         "BACHELOR-CORE-PARTITION-AB-1: the venue-side core-partition telemetry helper (a bounded pwsh the playback job spawns, killed by pid "
+         "on a stop timeout and ended by its own deadline); read-only counters plus its ready / record files in the job's $Work, never a lane "
+         "driver and never run against a hub lane worktree"),
+    ],
     "tools/profiling/dual-venue/Invoke-VenueStageNightly.ps1": [
         ("'-NonInteractive', '-EncodedCommand', [Convert]::ToBase64String",
          "Invoke-Child -CommandText: a synchronous child, waited for and killed at -MaxTotalSec, never a detached driver"),
@@ -3094,6 +3100,12 @@ UNRESOLVED_EXECUTED_SITES = {
         ("-ExecutionPolicy Bypass -Command $preCmd 1>",
          "inside the self-heal pre-launch block this job writes into its own copy: $preCmd is $cmd with the output path and environment list "
          "swapped (.Replace), the same synchronous venue-side smoke call"),
+        ("-ExecutionPolicy Bypass -Command $cmd 1>",
+         "BACHELOR-CORE-PARTITION-AB-1: the generator's anchor here-string ($cpLaunchOld) holding the smoke launch above, byte for byte, "
+         "so the post-expansion edit can find it exactly once; the generator runs it never (it is text, not a statement it executes)"),
+        ("-ExecutionPolicy Bypass -Command $cmd 1>",
+         "BACHELOR-CORE-PARTITION-AB-1: the same smoke launch inside the bracketed replacement the generator emits (only with "
+         "-CorePartitionTelemetry), wrapped in a try / finally; the same synchronous venue-side child"),
     ],
     "tools/profiling/bachelor/reference-frame-runner-job.ps1": [
         ("-Command $captureCommand",
