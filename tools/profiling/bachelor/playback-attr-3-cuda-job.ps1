@@ -5571,7 +5571,7 @@ if ($isVariant) {
 #   (a) every cpu job removes both flags from its own process environment before the smoke child starts, so neither the runner nor the app inherits one
 #       (A1 above: the GL-window/viewport envs only serve the GPU presentation path). They are removed, not set to 0: platform/qt/main.cpp
 #       (shouldPreferDesktopOpenGl, shouldShareOpenGlContexts) tests them with qEnvironmentVariableIsSet, so a 0 would still switch shared GL contexts on.
-#   (b) a receipt job ($cmd carries '-PlaybackProcessing receipt ') requires the measured session's playback_smoke.processed8_cache_summary line to show
+#   (b) a receipt job (Test-AttrSmokeCommandAsksReceipt: $cmd carries the switch -PlaybackProcessing receipt outside its quoted literals, any case) requires the measured session's playback_smoke.processed8_cache_summary line to show
 #       Processed8 frames and no Processed16-only frame (processed16_measured counts a Processed8 frame too: RenderFrameThread.cpp
 #       processed16StageMeasured), else PROCESSED8_ROUTE_NOT_TAKEN, exit 33. A subset cpu job (Debayered16 by design) is not gated.
 if ($isCpuBackend) {
@@ -5613,6 +5613,14 @@ function Get-AttrCpuProcessed8Route([string]$RawLog, [string]$MeasuredSessionId)
         processed16OnlyFrames = $(if ($reason -in @('', 'PROCESSED8_NOT_MEASURED', 'PROCESSED16_ROUTE_FRAMES')) { $p16 - $p8 } else { $null })
     }
 }
+function Test-AttrSmokeCommandAsksReceipt([string]$SmokeCommand) {
+    # Only the switch itself counts (adversary r6 A1/A2). Every path and environment entry in the smoke command is a single-quoted literal (ConvertTo-PsSingleQuoted;
+    # a quote inside one is doubled), so those are blanked first: an agent root that spells the switch cannot make a subset run a receipt run. The value is matched
+    # without regard to case, as the runner's ValidateSet reads it: RECEIPT is a receipt run.
+    # The runner switch's name is split so a job without receipt never spells it (such a job's text is pinned free of the name).
+    $unquoted = [regex]::Replace($SmokeCommand, "'(?:[^']|'')*'", ' ')
+    return [regex]::IsMatch($unquoted, '(?i)\s-Playback' + 'Processing\s+receipt(\s|$)')
+}
 # PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 <<<
 $envList = "'" + ($envs -join "','") + "'"
 '@
@@ -5620,8 +5628,7 @@ $envList = "'" + ($envs -join "','") + "'"
 ' @'
 # PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 >>>
 # PROCESSED8-CPU-LEG-GL-VIEWPORT-ENV-CLEAR-1 (b): a cpu receipt leg that did not run Processed8 (or ran the Processed16 route) is refused, never a Processed8 result.
-# The runner switch's name is split so a job without receipt never spells it (such a job's text is pinned free of the name).
-$processed8RouteRequired = $cmd.Contains(' -Playback' + 'Processing receipt ')
+$processed8RouteRequired = Test-AttrSmokeCommandAsksReceipt $cmd
 $processed8Route = Get-AttrCpuProcessed8Route -RawLog $rawLog -MeasuredSessionId $measuredSmokeSessionId
 if ($processed8RouteRequired -and -not $processed8Route.taken) {
     [void](Publish-AttrCudaContactSheetRawCaptures -Enabled $ContactSheetEnabled -SourceDir $contactSheetDir -PubRoot $Pub)

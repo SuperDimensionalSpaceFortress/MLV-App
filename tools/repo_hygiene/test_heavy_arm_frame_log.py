@@ -167,6 +167,8 @@ class HeavyArmKeepsFrameRows(unittest.TestCase):
 GL_FLAGS = ("MLVAPP_EXPERIMENTAL_GL_VIEWPORT", "MLVAPP_EXPERIMENTAL_GL_WINDOW_VIEWPORT")
 ROUTE_FUNCTION = "function Get-AttrCpuProcessed8Route("
 ROUTE_CALL = "$processed8Route = Get-AttrCpuProcessed8Route -RawLog $rawLog -MeasuredSessionId $measuredSmokeSessionId"
+RECEIPT_FUNCTION = "function Test-AttrSmokeCommandAsksReceipt("
+RECEIPT_CALL = "$processed8RouteRequired = Test-AttrSmokeCommandAsksReceipt $cmd"
 CPU_RECEIPT_LIGHT = ["-Backend", "cpu", "-TelemetryArm", "LIGHT", "-PlaybackProcessing", "receipt"]
 
 
@@ -321,10 +323,45 @@ class CpuReceiptLegRunsProcessed8(unittest.TestCase):
         for needle in ("Get-AttrCpuProcessed8Route", "PROCESSED8_ROUTE_NOT_TAKEN", "$glViewportInheritedCleared"):
             self.assertNotIn(needle, text)
 
+    def receipt_required(self, smoke_command: str) -> bool:
+        """The job's own decision (cut from the generated cpu receipt job) whether `$cmd` is a Processed8 receipt command: its helper when it has one, then the
+        `$processed8RouteRequired` line, run by pwsh over a stand-in smoke command."""
+        text = self.generate(spec_generator_args(NEW_SPEC))
+        helper = ""
+        if RECEIPT_FUNCTION in text:
+            start = text.index(RECEIPT_FUNCTION)
+            helper = text[start:text.index("\n}\n", start) + 3]
+        line = next(line for line in text.splitlines() if line.startswith("$processed8RouteRequired = "))
+        script = self.tmp / "receipt-required.ps1"
+        script.write_text("$ErrorActionPreference = 'Stop'\n" + helper + "\n$cmd = @'\n" + smoke_command + "\n'@\n" + line + "\n[string]$processed8RouteRequired\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(script)])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout.strip().splitlines()[-1] == "True"
+
+    def test_the_receipt_switch_is_read_without_regard_to_case_and_never_from_a_quoted_path_or_environment_entry(self) -> None:
+        """Adversary r6 A1 (the runner's ValidateSet is case-insensitive: -PlaybackProcessing RECEIPT is a receipt run, and was not gated) and A2 (an agent root
+        whose text spells the switch made a subset run look like a receipt run, so it was refused at exit 33). Only the switch itself counts."""
+        smoke = "& 'C:\\mlv\\smoke.ps1' -ExePath 'C:\\mlv\\MLVApp.exe' -Input 'C:\\clips\\a.mlv' -Seconds 28 -ScaleFactor 1 -UsePersistedPlaybackSettings{pp} -RequireLookAssist:$false -Scope none -ExtraEnvironment @({env})"
+        trap = "C:\\mlvtmp\\ -PlaybackProcessing receipt \\mlv-agent"
+        for name, pp, env, expected in (
+                ("receipt", " -PlaybackProcessing receipt", "'A=1'", True),
+                ("upper-case receipt", " -PlaybackProcessing RECEIPT", "'A=1'", True),
+                ("mixed-case receipt", " -PlaybackProcessing Receipt", "'A=1'", True),
+                ("subset", " -PlaybackProcessing subset", "'A=1'", False),
+                ("no processing switch", "", "'A=1'", False),
+                ("subset, receipt spelled in a quoted path", " -PlaybackProcessing subset", "'A=1'", False),
+                ("subset, receipt spelled in an environment entry", " -PlaybackProcessing subset", "'X= -PlaybackProcessing receipt '", False),
+                ("receipt, with a quoted path that spells it too", " -PlaybackProcessing receipt", "'A=1'", True)):
+            with self.subTest(case=name):
+                command = smoke.format(pp=pp, env=env)
+                if "quoted path" in name:
+                    command = command.replace("C:\\mlv\\smoke.ps1", trap)
+                self.assertEqual(self.receipt_required(command), expected, command)
+
     def test_the_gate_binds_only_a_job_whose_smoke_command_asks_for_receipt(self) -> None:
         """The block is the same text in every cpu job (so -PlaybackProcessing receipt adds only its own token); the job reads whether it is a receipt job
         from its own smoke command. A subset / default cpu job (Debayered16 by design) clears the GL flags too but is never refused for lacking Processed8."""
-        needle = "$processed8RouteRequired = $cmd.Contains(' -Playback' + 'Processing receipt ')"
+        needle = RECEIPT_CALL
         for extra, required in ((spec_generator_args(NEW_SPEC), True), (CPU_RECEIPT_LIGHT, True),
                                 (["-Backend", "cpu", "-TelemetryArm", "HEAVY"], False),
                                 (["-Backend", "cpu", "-TelemetryArm", "HEAVY", "-PlaybackProcessing", "subset"], False)):
