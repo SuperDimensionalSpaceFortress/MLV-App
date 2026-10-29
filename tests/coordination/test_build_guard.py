@@ -2256,6 +2256,8 @@ _CALLER_PATH_CASES = {
     "lock-root": ([], "C:\\", 2, "BUILD_GUARD_PATH_REFUSED label=build option=LockPath"),
     "lock-env": ([], "Env:\\MLV_R9_SLOT_LOCK", 2, "BUILD_GUARD_PATH_REFUSED label=build option=LockPath"),
     "lock-dir": ([], "{file}\\sub\\slot.lock", 2, "BUILD_GUARD_PATH_REFUSED label=build option=LockPath"),
+    # 353c9a42-A3: a leaf no Windows file can have was read as a lock another build holds (BUILD_SLOT_BUSY).
+    "lock-name": ([], "{dir}\\bad?.lock", 2, "BUILD_GUARD_PATH_REFUSED label=build option=LockPath"),
     "mutex": (["-MutexName", "NoSuchNamespace\\slot"], None, 1, "BUILD_GUARD_ERROR label=build code=1"),
 }
 
@@ -2266,7 +2268,7 @@ def test_a_caller_path_that_cannot_be_used_is_a_typed_outcome_with_no_host_error
     a_file = box["dir"] / "a-file"
     a_file.write_text("x", encoding="ascii")
     if lock:
-        lock = lock.replace("{file}", str(a_file))
+        lock = lock.replace("{file}", str(a_file)).replace("{dir}", str(box["dir"]))
     done = _heavy(box, "run", [*args, "-DeadlineMinutes", "0", "-Command", _marker_command(box)], lock=lock,
                   extra={"HEAVY_SLOT_HELD": f"anc-1:{os.getpid()}"})
     out = done.stdout + done.stderr
@@ -2275,6 +2277,51 @@ def test_a_caller_path_that_cannot_be_used_is_a_typed_outcome_with_no_host_error
     assert line in (done.stderr if line.startswith("HEAVY_SLOT_WARN") else done.stdout), out
     assert not _host_error_lines(done.stderr), out
     assert box["marker"].exists() == (want == 0), out
+
+
+@pytest.mark.parametrize("leaf", ["heavy-slot", "HEAVY-SLOT"])
+def test_a_lock_file_named_like_the_lease_dir_still_builds(box, leaf) -> None:
+    # r9 adversary 353c9a42-A1: a lock file named heavy-slot was the lease directory itself, which the build-slot acquire read as
+    # an unreadable lock, always busy (BUILD_SLOT_BUSY, exit 3, nothing built). The lease directory now takes another name.
+    lock = box["dir"] / leaf
+    done = _heavy(box, "run", ["-DeadlineMinutes", "0", "-Command", _marker_command(box)], lock=lock)
+    out = done.stdout + done.stderr
+    assert done.returncode == 0, out
+    assert box["marker"].exists(), out
+    assert not lock.exists(), "the build slot is released after the build"
+    assert _stub_calls(box) and _stub_calls(box)[0]["childEnd"], out
+
+
+def test_a_lease_dir_that_denies_new_files_fails_open_within_the_bound_under_an_ancestor_slot(box) -> None:
+    # r9 adversary 353c9a42-A2: the lease directory exists but denies creating files, so cmd could not open its log and wrote
+    # that diagnostic to the stderr it inherited: with a full undrained stderr under an ancestor's slot the wrapper blocked and
+    # the guard waited out the hung-tool bound. The guard now makes the log itself first (fail open, nothing launched), and
+    # cmd's own streams never are the guard's.
+    lease_dir = box["dir"] / "heavy-slot"
+    lease_dir.mkdir()
+    user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ['USERNAME']}".lstrip("\\")
+    subprocess.run(["icacls", str(lease_dir), "/deny", f"{user}:(WD)"], check=True, capture_output=True)
+    pipe = _full_pipe()
+    guard = None
+    try:
+        guard = _heavy_popen(box, ["-HeavySlotWaitMinutes", "0", "-Command", _marker_command(box)],
+                             env_extra={"HEAVY_SLOT_HELD": f"anc-1:{os.getpid()}"}, stderr=pipe[1])
+        try:
+            code = guard.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            code = None
+        err = _release_pipe(pipe, guard)
+        # The same input with a drained stderr: the guard's own lines behind the full pipe above may be dropped.
+        drained = _heavy(box, "run", ["-HeavySlotWaitMinutes", "0", "-Command", _marker_command(box)])
+    finally:
+        if guard is not None and guard.returncode is None:
+            _release_pipe(pipe, guard)
+        subprocess.run(["icacls", str(lease_dir), "/remove:d", user], check=False, capture_output=True)
+    assert code == 0, f"the guard did not end within the bound behind an undrained stderr (code={code}): {err[-2000:]}"
+    assert box["marker"].exists()
+    assert drained.returncode == 0 and "lease-log-failed" in drained.stderr, drained.stdout + drained.stderr
+    assert not _host_error_lines(err.replace("#", "")), err[-2000:]
+    assert not _stub_calls(box), "nothing is launched when the guard cannot make its log"
 
 
 # r9 class guard (2ab4b1b6-A1 siblings :887 :888, which no input reaches once :868/:869 resolve): no function the guard runs

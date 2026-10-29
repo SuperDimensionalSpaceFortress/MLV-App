@@ -337,6 +337,8 @@ function Resolve-BuildGuardPath([string]$Path, [switch]$NeedParent) {
         if ($provider.Name -ne 'FileSystem') { throw ('it is a {0} path, not a file-system one' -f $provider.Name) }
         if ($full.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0) { throw 'it holds a character no file path may hold' }
         $full = [IO.Path]::GetFullPath($full)
+        # A leaf no Windows file can have ('bad?.lock') made CreateNew fail as if another build held the lock (353c9a42-A3).
+        if ([IO.Path]::GetFileName($full).IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0) { throw 'its last part holds a character no file name may hold' }
         $parent = [string][IO.Path]::GetDirectoryName($full)
         if ($NeedParent -and -not $parent) { throw 'it has no parent directory' }
         $r.Full = $full
@@ -948,8 +950,11 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         exit 3
     }
     # A relative -LockPath is resolved first, so its parent is never empty (adversary A1); one that cannot be is refused, with
-    # nothing taken (r9).
-    $dir = [IO.Path]::Combine((Get-BuildGuardLockPath $Options $Label).Parent, 'heavy-slot')
+    # nothing taken (r9). A lock file named heavy-slot would be the lease directory itself, read as a lock that is always busy
+    # (r9 adversary 353c9a42-A1): the lease directory then takes another name.
+    $lock = Get-BuildGuardLockPath $Options $Label
+    $dir = [IO.Path]::Combine($lock.Parent, 'heavy-slot')
+    if ([string]::Equals($dir, $lock.Full, [StringComparison]::OrdinalIgnoreCase)) { $dir = [IO.Path]::Combine($lock.Parent, 'heavy-slot.lease') }
     $exe = [Environment]::ProcessPath
     if (-not $exe) { $exe = (Get-Process -Id $PID).Path }
     # cmd expands %VAR% even inside quotes, so a path with '%' would not reach heavy-slot as given (r1 adversary A3).
@@ -1001,6 +1006,15 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} ({3}) utc={4}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
         exit 2
     }
+    # cmd opens the log for its own redirect and, when it cannot, writes that diagnostic to the stderr it inherited, past the
+    # bounded writer (r9 adversary 353c9a42-A2: a lease directory that denies creating files). The guard makes the log first,
+    # so a lease directory it cannot write fails open here with nothing launched.
+    try { [IO.File]::Open($lease.Log, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite).Dispose() } catch {
+        $e = $_.Exception
+        if ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} shim={1} lease-log-failed: {2}; building WITHOUT the machine heavy slot (fail open)' -f $Label, $cmd, ($e.Message -replace '\s+', ' '))
+        return $null
+    }
     # cmd quoting, as heavy-slot itself starts a batch child: each argument double-quoted. Its stdout and stderr go to a
     # file, never a pipe, so nothing it writes while it holds the slot can block it (adversary A4).
     $quoted = @($cmd, 'run', '--class', 'shared', '--label', $lease.Label, '--eta', $etaArg,
@@ -1009,6 +1023,10 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         ForEach-Object { '"' + ([string]$_ -replace '"', '""') + '"' }
     $psi = [System.Diagnostics.ProcessStartInfo]::new($env:ComSpec)
     $psi.UseShellExecute = $false
+    # cmd's own streams are pipes whose read ends the guard closes at once (r9, 353c9a42-A2 class): a diagnostic of cmd itself
+    # then fails at once, never waiting on a stdout or stderr the guard inherited. What heavy-slot writes goes to the log.
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
     $psi.Arguments = '/d /v:off /s /c "' + ($quoted -join ' ') + ' >"' + $lease.Log + '" 2>&1"'
     $psi.Environment['HEAVY_SLOT_EXPECT_SHA256'] = $expected
     $psi.Environment['HEAVY_SLOT_EXPECT_KEEPER'] = '1'
@@ -1036,6 +1054,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     $admitted = $false
     # The cleanup try begins at the first statement after the launch, so nothing between them can skip its finally.
     try {
+        foreach ($s in @($lease.Process.StandardOutput, $lease.Process.StandardError)) { try { $s.Close() } catch { } }
         # The wait printed is the one heavy-slot was given, never the raw option (fable r6b note).
         Write-BuildGuardLog ('heavy-slot: waiting label={0} wait={1} exit-file={2} shim={3}' -f $lease.Label, $waitArg, $lease.ExitFile, $cmd)
         if ($heldDropped) { Write-BuildGuardLog $heldDropped }
