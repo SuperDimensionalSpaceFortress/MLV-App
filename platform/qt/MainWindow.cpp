@@ -3161,9 +3161,10 @@ bool MainWindow::event(QEvent *event)
         }
         if( QFile(fileName).exists() && fileName.endsWith( ".mlv", Qt::CaseInsensitive ) )
         {
-            importNewMlv( fileName );
+            ImportBatchOutcome imports;
+            imports.note( importNewMlv( fileName ) );
             //Show last imported file
-            if( SESSION_CLIP_COUNT ) showFileInEditor( SESSION_CLIP_COUNT - 1 );
+            if( SESSION_CLIP_COUNT && imports.showLastRow() ) showFileInEditor( SESSION_CLIP_COUNT - 1 );
             //Caching is in which state? Set it!
             if( ui->actionCaching->isChecked() ) on_actionCaching_triggered();
         }
@@ -3294,6 +3295,7 @@ void MainWindow::openMlvSet( QStringList list )
     if( !sessionFileName.isEmpty() ) normalisedList.prepend( sessionFileName );
 
     QStringList importedMlvFiles;
+    ImportBatchOutcome imports;
     for( int i = 0; i < normalisedList.size(); i++ )
     {
         QString fileName = normalisedList.at(i);
@@ -3347,11 +3349,11 @@ void MainWindow::openMlvSet( QStringList list )
             }
             if( alreadyQueued || isFileInSession( fileName ) ) continue;
             importedMlvFiles.append( uniquePath );
-            importNewMlv( fileName );
+            imports.note( importNewMlv( fileName ) );
         }
     }
 
-    if( SESSION_CLIP_COUNT )
+    if( SESSION_CLIP_COUNT && imports.showLastRow() )
     {
         //Show last imported file
         showFileInEditor( SESSION_CLIP_COUNT - 1 );
@@ -11031,7 +11033,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
 }
 
 //Import a MLV, complete procedure
-void MainWindow::importNewMlv(QString fileName)
+// r5 (adversary 4b41aa22 A1): returns false only when a busy prep task refused the open; the previous clip is
+// active again and the caller must not show another row (ImportBatchOutcome).
+bool MainWindow::importNewMlv(QString fileName)
 {
     //File is already opened? Error!
     if( isFileInSession( fileName ) )
@@ -11059,10 +11063,14 @@ void MainWindow::importNewMlv(QString fileName)
             else if( SESSION_CLIP_COUNT == 0 ) deleteSession();
             // r4 (adversary A1 sibling): refused after the free, an empty object is loaded, not previousActive.
             if( !clipOpenFailureKeptRetainedClip( ret ) ) m_slidersDetachedFromReceipt = true;
+            // r5 (adversary 4b41aa22 A1): the caller shows no other row, so the restored clip is reopened later
+            // (a no-op once any other clip opens first).
+            if( !clipOpenFailureKeptRetainedClip( ret ) && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );
             listViewSessionUpdate();
             QMessageBox::warning( this, tr( "Import MLV" ),
                                   tr( "%1 was not imported because playback was still preparing a frame. Import it again." )
                                   .arg( QFileInfo( fileName ).fileName() ) );
+            return false;
         }
         else if( !ret )
         {
@@ -11086,6 +11094,7 @@ void MainWindow::importNewMlv(QString fileName)
             deleteFileFromSession();
         }
     }
+    return true;
 }
 
 //Short open MLV function, call only for making a preview!
@@ -11200,6 +11209,7 @@ int MainWindow::openMlvForPreview(QString fileName)
     //Raw black & white level (needed for preview picture)
     initRawBlackAndWhite();
 
+    m_loadedClipFileName = fileName;
     markClipOpenSucceeded();
     return MLV_ERR_NONE;
 }
@@ -11222,6 +11232,7 @@ void MainWindow::on_actionOpen_triggered()
 
     m_inOpeningProcess = true;
 
+    ImportBatchOutcome imports;
     for( int i = 0; i < files.size(); i++ )
     {
         QString fileName = files.at(i);
@@ -11231,11 +11242,11 @@ void MainWindow::on_actionOpen_triggered()
             !(fileName.endsWith( ".mlv", Qt::CaseInsensitive ) ||
               fileName.endsWith( ".mcraw", Qt::CaseInsensitive )) ) continue;
 
-        importNewMlv( fileName );
+        imports.note( importNewMlv( fileName ) );
     }
 
     //Show last imported file
-    if( SESSION_CLIP_COUNT ) showFileInEditor( SESSION_CLIP_COUNT - 1 );
+    if( SESSION_CLIP_COUNT && imports.showLastRow() ) showFileInEditor( SESSION_CLIP_COUNT - 1 );
 
     //Caching is in which state? Set it!
     if( ui->actionCaching->isChecked() ) on_actionCaching_triggered();
@@ -11267,10 +11278,11 @@ void MainWindow::openDngFolderDialog()
 
     //importNewMlv dedupes, adds to session, and routes a directory path to the
     //DNG-folder open branch added in openMlv()/openMlvForPreview().
-    importNewMlv( dir );
+    ImportBatchOutcome imports;
+    imports.note( importNewMlv( dir ) );
 
     //Show last imported clip
-    if( SESSION_CLIP_COUNT ) showFileInEditor( SESSION_CLIP_COUNT - 1 );
+    if( SESSION_CLIP_COUNT && imports.showLastRow() ) showFileInEditor( SESSION_CLIP_COUNT - 1 );
 
     //Caching is in which state? Set it!
     if( ui->actionCaching->isChecked() ) on_actionCaching_triggered();
@@ -11643,6 +11655,7 @@ int MainWindow::openMlv( QString fileName )
 
     m_frameChanged = true;
 
+    m_loadedClipFileName = fileName;
     markClipOpenSucceeded();
     return MLV_ERR_NONE;
 }
@@ -16326,7 +16339,8 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
              || SESSION_ACTIVE_CLIP_ROW < 0
              || !ACTIVE_RECEIPT
              || ACTIVE_RECEIPT != activeReceiptAtLoad
-             || !ACTIVE_RECEIPT->lookAssistEnabled() )
+             || !ACTIVE_RECEIPT->lookAssistEnabled()
+             || !receiptOwnedByLoadedClip( "look-assist-setsliders-frame-ready" ) )
             {
                 return;
             }
@@ -16352,7 +16366,8 @@ void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)
                  || !ACTIVE_RECEIPT
                  || ACTIVE_RECEIPT != activeReceiptAtLoad
                  || !ACTIVE_RECEIPT->lookAssistEnabled()
-                 || m_lookAssistApplied.isApplied( ACTIVE_RECEIPT ) )
+                 || m_lookAssistApplied.isApplied( ACTIVE_RECEIPT )
+                 || !receiptOwnedByLoadedClip( "look-assist-setsliders-frame-ready" ) )
                 {
                     return;
                 }
@@ -17421,6 +17436,13 @@ void MainWindow::applyLookAssistToReceipt( ReceiptSettings *receipt,
                 ReceiptSettings *activeReceipt = ( SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0 )
                                                ? ACTIVE_RECEIPT : nullptr;
                 if( !activeReceipt ) return;
+                // r5 (Dot 29eac4d5 A1): the analysed clip must still be the active row's own; like a dropped
+                // generation, the de-dupe marker is cleared so the next open analyses again.
+                if( !receiptOwnedByLoadedClip( "look-assist-async-apply" ) )
+                {
+                    m_lookAssistApplied.clearIf( receipt );
+                    return;
+                }
 
                 // Async has only pre-apply PROXY color stats here. The
                 // processed-floor-lifted-awb-risk guard fires on those proxy
@@ -23393,7 +23415,8 @@ void MainWindow::on_actionExportSettings_triggered()
 void MainWindow::on_actionResetReceipt_triggered()
 {
     // r4 (adversary A2 sibling): the loaded clip is not the active row's; its levels must not reset this receipt.
-    if( m_slidersDetachedFromReceipt )
+    // r5: the same ownership predicate as every other direct receipt write.
+    if( !receiptOwnedByLoadedClip( "reset-receipt" ) )
     {
         logInteractionEvent( QStringLiteral("playback_prep.reset_receipt_skipped"), QStringLiteral("reason=detached") );
         return;
@@ -23931,6 +23954,30 @@ void MainWindow::markClipOpenSucceeded( void )
 {
     m_slidersDetachedFromReceipt = false;
     ++m_clipOpenGeneration;
+}
+
+// r5 (Dot 29eac4d5 A1): the one ownership predicate for every write that goes straight into the active receipt
+// (around setReceipt). It holds while the sliders are attached (the r4 state) and the file the last successful
+// open loaded is the active row's. A refused write is a no-op, logged once per clip-open generation.
+bool MainWindow::receiptOwnedByLoadedClip( const char *site )
+{
+    const bool hasActiveReceipt = SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0
+                               && SESSION_ACTIVE_CLIP_ROW < SESSION_CLIP_COUNT && ACTIVE_RECEIPT;
+    const bool loadedIsActiveClip = hasActiveReceipt && !m_loadedClipFileName.isEmpty()
+        && ( m_loadedClipFileName == ACTIVE_CLIP->getPath() || m_loadedClipFileName == ACTIVE_RECEIPT->fileName() );
+    if( activeReceiptOwnsLoadedClip( m_slidersDetachedFromReceipt, m_fileLoaded && m_pMlvObject != nullptr,
+                                     hasActiveReceipt, loadedIsActiveClip ) )
+        return true;
+    if( m_receiptWriteSkipLoggedGeneration != m_clipOpenGeneration )
+    {
+        m_receiptWriteSkipLoggedGeneration = m_clipOpenGeneration;
+        logInteractionEvent( QStringLiteral("playback_prep.receipt_write_skipped"),
+                             QStringLiteral("site=%1 detached=%2 loaded_is_active=%3")
+                                 .arg( QString::fromLatin1( site ? site : "unknown" ) )
+                                 .arg( bool01( m_slidersDetachedFromReceipt ) )
+                                 .arg( bool01( loadedIsActiveClip ) ) );
+    }
+    return false;
 }
 
 // r3 (key3 INV-2 sweep): a reopen a busy playback-prep task refused is retried once through
@@ -30998,7 +31045,8 @@ LookAssistFlavor MainWindow::currentLookAssistFlavor()
 
 void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged( int )
 {
-    if( !m_fileLoaded || !ACTIVE_RECEIPT ) return;
+    // r5 (Dot 29eac4d5 A1): while the loaded clip is not the active row's, the selector writes nothing into it.
+    if( !m_fileLoaded || !ACTIVE_RECEIPT || !receiptOwnedByLoadedClip( "look-assist-flavor" ) ) return;
     ACTIVE_RECEIPT->setLookAssistFlavor( lookAssistFlavorName( currentLookAssistFlavor() ) );
     // A different grade over the same clip: the marker forgets it (otherwise the toggle's frame-ready step would
     // dedup_skip the new analysis after the baseline is restored and leave the clip ungraded under a receipt that
@@ -31014,7 +31062,7 @@ void MainWindow::on_comboBoxLookAssistFlavor_currentIndexChanged( int )
 void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
 {
     // r4 (adversary ddda72d6 A2): no Look Assist analysis or baseline pairs another clip with this receipt.
-    if( !m_fileLoaded || !ACTIVE_RECEIPT || m_slidersDetachedFromReceipt ) return;
+    if( !m_fileLoaded || !ACTIVE_RECEIPT || !receiptOwnedByLoadedClip( "look-assist-toggle" ) ) return;
 
     logInteractionEvent(
         QStringLiteral("look_assist.toggle.begin"),
@@ -31081,7 +31129,8 @@ void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )
              || SESSION_ACTIVE_CLIP_ROW < 0
              || !ACTIVE_RECEIPT
              || ACTIVE_RECEIPT != activeReceiptAtToggle
-             || !ACTIVE_RECEIPT->lookAssistEnabled() )
+             || !ACTIVE_RECEIPT->lookAssistEnabled()
+             || !receiptOwnedByLoadedClip( "look-assist-toggle-frame-ready" ) )
             {
                 return;
             }
@@ -33091,7 +33140,11 @@ void MainWindow::drawFrameReady()
     const int dualIsoToolMode = toolButtonDualIsoCurrentIndex();
     if( dualIsoToolMode > 0 )
     {
-        ACTIVE_RECEIPT->setDualIsoAutoCorrected( 1 );
+        // r5 (Dot 29eac4d5 A1): the frame may come from a retained clip that is not the active row's; only a
+        // receipt that owns the loaded clip takes its correction and pattern.
+        const DualIsoFrameReceiptWrites receiptWrites =
+            dualIsoFrameReceiptWrites( receiptOwnedByLoadedClip( "draw-frame-dual-iso" ), dualIsoToolMode, readyFrame.dualIsoPattern );
+        if( receiptWrites.autoCorrected ) ACTIVE_RECEIPT->setDualIsoAutoCorrected( 1 );
         int cachedPattern = m_dualIsoPlaybackUiCacheValid
             ? m_dualIsoPlaybackUiCache.pattern
             : -2;
@@ -33113,7 +33166,7 @@ void MainWindow::drawFrameReady()
                 ui->DualIsoPatternComboBox->setCurrentIndex( uiPattern );
                 ui->DualIsoPatternComboBox->blockSignals( false );
             }
-            ACTIVE_RECEIPT->setDualIsoPattern( uiPattern );
+            if( receiptWrites.pattern ) ACTIVE_RECEIPT->setDualIsoPattern( uiPattern );
             cachedPattern = uiPattern;
         }
 
@@ -33622,9 +33675,11 @@ bool MainWindow::normalizePlaybackCutRangeForLoadedClip( const char *where )
 
     if( normalized.changed )
     {
+        // r5 (Dot 29eac4d5 A1): the played range is clamped on any loaded clip; the receipt is saved only when
+        // it owns that clip (after a failed final export reopen the job's clip is loaded under the active row).
         ui->spinBoxCutIn->setValue( normalized.cutIn );
         ui->spinBoxCutOut->setValue( normalized.cutOut );
-        if( SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0 && ACTIVE_RECEIPT )
+        if( playbackCutRangeRepairWritesReceipt( normalized.changed, receiptOwnedByLoadedClip( "play-cut-range-repair" ) ) )
         {
             ACTIVE_RECEIPT->setCutIn( static_cast<uint32_t>( normalized.cutIn ) );
             ACTIVE_RECEIPT->setCutOut( static_cast<uint32_t>( normalized.cutOut ) );

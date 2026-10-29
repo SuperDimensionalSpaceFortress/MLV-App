@@ -899,6 +899,10 @@ private:
     // r4 (adversary A4): bumped by every successful clip open; a deferred reopen scheduled under an older value
     // is a no-op, and so is one that fires while an export holds a clip (GUI block to final reopen).
     unsigned long long m_clipOpenGeneration = 0;
+    // r5 (Dot 29eac4d5 A1): the file the last successful open loaded; receiptOwnedByLoadedClip compares it with
+    // the active row. A refused direct receipt write is logged once per clip-open generation.
+    QString m_loadedClipFileName;
+    unsigned long long m_receiptWriteSkipLoggedGeneration = ~0ull;
     bool m_exportInProgress = false;
     // r4 (adversary A3): bumped at each export batch start; a retry timer of an earlier batch is a no-op.
     unsigned long long m_exportBatchGeneration = 0;
@@ -1813,7 +1817,7 @@ private:
     QString playbackDebayerLabel( void ) const;
     QString selectedPlaybackProcessingLabel( void ) const;
     QString playbackProcessingLabel( void ) const;
-    void importNewMlv(QString fileName);
+    bool importNewMlv(QString fileName);
     int openMlvForPreview(QString fileName);
     int openMlv(QString fileName);
     void playbackHandling( int timeDiff );
@@ -1888,6 +1892,7 @@ private:
     void resetReceiptWithDefault( ReceiptSettings *receipt );
     int showFileInEditor(int row);
     void markClipOpenSucceeded( void );
+    bool receiptOwnedByLoadedClip( const char *site );
     void retryClipReopenAfterPrepAbort( int row );
     void scheduleClipReopenRetry( int row, unsigned long long generation, int deferrals );
     void resetExportOpenAbortRetries( void );

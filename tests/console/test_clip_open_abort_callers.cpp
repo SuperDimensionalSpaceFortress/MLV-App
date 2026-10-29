@@ -7,6 +7,7 @@
 #include "../common/repo_paths.h"
 
 #include "../../platform/qt/ClipOpenAbortPolicy.h"
+#include "../../platform/qt/PlaybackFrameRange.h"
 
 #include <QFile>
 #include <QRegularExpression>
@@ -181,7 +182,7 @@ TEST(ClipOpenAbortCallersWiring, OpenSessionWithNoClipOpenedReopensTheActiveClip
 TEST(ClipOpenAbortCallersWiring, RefusedImportLeavesTheSessionWithoutAReceiptSaveOrDeleteDialog)
 {
     const QString source = mainWindowSource();
-    const QString body = bodyBetween(source, QStringLiteral("void MainWindow::importNewMlv(QString fileName)"),
+    const QString body = bodyBetween(source, QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"),
                                      QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
     ASSERT_FALSE(body.isEmpty());
     const int before = body.indexOf(QStringLiteral("const int previousActive = SESSION_CLIP_COUNT > 0 ? SESSION_ACTIVE_CLIP_ROW : -1;"));
@@ -500,8 +501,9 @@ TEST(ClipOpenAbortR4Wiring, PasteAndResetWhileDetachedNeverTouchTheLoadedClip)
     ASSERT_TRUE(paste.contains(QStringLiteral("if( row == SESSION_ACTIVE_CLIP_ROW && !m_slidersDetachedFromReceipt )")));
     const QString reset = bodyBetween(source, QStringLiteral("void MainWindow::on_actionResetReceipt_triggered()"),
                                       QStringLiteral("ReceiptSettings *receipt = new ReceiptSettings(); //default"));
-    ASSERT_TRUE(reset.contains(QStringLiteral("if( m_slidersDetachedFromReceipt )")));
-    const QString importBody = bodyBetween(source, QStringLiteral("void MainWindow::importNewMlv(QString fileName)"),
+    // r5: the reset guard is the one ownership predicate (attached AND the loaded clip is the active row's)
+    ASSERT_TRUE(reset.contains(QStringLiteral("if( !receiptOwnedByLoadedClip( \"reset-receipt\" ) )")));
+    const QString importBody = bodyBetween(source, QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"),
                                            QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
     ASSERT_TRUE(importBody.contains(QStringLiteral(
         "if( !clipOpenFailureKeptRetainedClip( ret ) ) m_slidersDetachedFromReceipt = true;")));
@@ -625,7 +627,7 @@ TEST(ClipOpenAbortR4Wiring, DeferredReopenChecksGenerationAndExportBeforeShowing
     ASSERT_TRUE(handler.indexOf(QStringLiteral("m_exportInProgress = true;")) >= 0);
     // the other deferred entry that reaches a clip open (macOS FileOpen) is refused during an export
     const QString fileOpen = bodyBetween(source, QStringLiteral("bool MainWindow::event(QEvent *event)"),
-                                         QStringLiteral("importNewMlv( fileName );"));
+                                         QStringLiteral("imports.note( importNewMlv( fileName ) );"));
     ASSERT_TRUE(fileOpen.contains(QStringLiteral("if( m_exportInProgress )")));
 }
 
@@ -642,8 +644,10 @@ TEST(ClipOpenAbortR4Wiring, DetachedSlidersBlockEveryLoadedObjectReaderOfTheActi
     ASSERT_TRUE(capture.contains(QStringLiteral("if( !receipt || m_slidersDetachedFromReceipt ) return;")));
     const QString toggle = bodyBetween(source, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"),
                                        QStringLiteral("logInteractionEvent("));
-    ASSERT_TRUE(toggle.contains(QStringLiteral("if( !m_fileLoaded || !ACTIVE_RECEIPT || m_slidersDetachedFromReceipt ) return;")));
-    const QString importBody = bodyBetween(source, QStringLiteral("void MainWindow::importNewMlv(QString fileName)"),
+    // r5: the toggle guard is the one ownership predicate (attached AND the loaded clip is the active row's)
+    ASSERT_TRUE(toggle.contains(QStringLiteral(
+        "if( !m_fileLoaded || !ACTIVE_RECEIPT || !receiptOwnedByLoadedClip( \"look-assist-toggle\" ) ) return;")));
+    const QString importBody = bodyBetween(source, QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"),
                                            QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
     const int detach = importBody.lastIndexOf(QStringLiteral("m_slidersDetachedFromReceipt = true;"));
     const int remove = importBody.indexOf(QStringLiteral("deleteFileFromSession();"));
@@ -705,4 +709,244 @@ TEST(ClipOpenAbortCallersWiring, EveryOpenCallerKeepsTheResult)
     // only under the clip-open generation it was scheduled for, outside any export)
     ASSERT_TRUE(rename.contains(QStringLiteral(
         "switch( deferredClipReopenDecision( generation, m_clipOpenGeneration, clipHeld, row, SESSION_ACTIVE_CLIP_ROW, SESSION_CLIP_COUNT, deferrals ) )")));
+}
+
+// ---- r5: Dot 29eac4d5 A1 = adversary 008a3a27 A1 / 4b41aa22 A2 -------------------------------------------------
+// After a failed final export reopen the job's clip B stays loaded, the sliders are detached and A is the active
+// row again. Writes that go straight into ACTIVE_RECEIPT (around setReceipt) must not carry B's data into A.
+
+namespace
+{
+
+struct ReceiptModel
+{
+    int cutIn = 0;
+    int cutOut = 0;
+    int dualIsoAutoCorrected = 0;
+    int dualIsoPattern = 0;
+};
+
+// The MainWindow function whose definition is the nearest one above line index, and that definition's index.
+QString enclosingFunction(const QStringList & lines, int index, int * definitionIndex = nullptr)
+{
+    const QRegularExpression definition(QStringLiteral("^\\S.*MainWindow::(\\w+)\\s*\\("));
+    for (int i = index; i >= 0; --i)
+    {
+        const QRegularExpressionMatch m = definition.match(lines.at(i));
+        if (!m.hasMatch()) continue;
+        if (definitionIndex) *definitionIndex = i;
+        return m.captured(1);
+    }
+    return QString();
+}
+
+} // namespace
+
+// (a) A trim 20-40; B has 100 frames and trim 5-5; Play widens the PLAYED range to 5-100, A's receipt keeps 20-40.
+TEST(ClipOpenAbortR5, PlayAfterAFailedFinalReopenNeverWritesTheRetainedClipsRangeIntoTheActiveReceipt)
+{
+    ReceiptModel a;
+    a.cutIn = 20;
+    a.cutOut = 40;
+    const bool owns = activeReceiptOwnsLoadedClip(true, true, true, false); // detached, B loaded, A active
+    ASSERT_FALSE(owns);
+    const playback_frame_range::CutRange played = playback_frame_range::normalizeCutRange(5, 5, 100, true);
+    ASSERT_TRUE(played.valid);
+    ASSERT_TRUE(played.changed);
+    ASSERT_EQ(played.cutIn, 5);
+    ASSERT_EQ(played.cutOut, 100);
+    if (playbackCutRangeRepairWritesReceipt(played.changed, owns))
+    {
+        a.cutIn = played.cutIn;
+        a.cutOut = played.cutOut;
+    }
+    ASSERT_EQ(a.cutIn, 20);
+    ASSERT_EQ(a.cutOut, 40);
+    // attached, but the loaded clip is not the active row's (or nothing is loaded): still no write
+    ASSERT_FALSE(activeReceiptOwnsLoadedClip(false, true, true, false));
+    ASSERT_FALSE(activeReceiptOwnsLoadedClip(false, false, true, true));
+    ASSERT_FALSE(activeReceiptOwnsLoadedClip(false, true, false, true));
+    // the owning receipt still takes the repaired range (unchanged behaviour)
+    ASSERT_TRUE(playbackCutRangeRepairWritesReceipt(true, activeReceiptOwnsLoadedClip(false, true, true, true)));
+    ASSERT_FALSE(playbackCutRangeRepairWritesReceipt(false, true));
+}
+
+// (b) A has Dual ISO correction 0 and pattern 0; a retained-B frame with the tool on and pattern -2 writes neither.
+TEST(ClipOpenAbortR5, DrawFrameReadyNeverWritesARetainedClipsDualIsoCorrectionIntoTheActiveReceipt)
+{
+    ReceiptModel a;
+    const int uiPatternOfB = 2;
+    const DualIsoFrameReceiptWrites detached =
+        dualIsoFrameReceiptWrites(activeReceiptOwnsLoadedClip(true, true, true, false), 1, -2);
+    if (detached.autoCorrected) a.dualIsoAutoCorrected = 1;
+    if (detached.pattern) a.dualIsoPattern = uiPatternOfB;
+    ASSERT_EQ(a.dualIsoAutoCorrected, 0);
+    ASSERT_EQ(a.dualIsoPattern, 0);
+    // an owning receipt keeps the base behaviour: the flag always, the pattern only when the core detected one
+    const DualIsoFrameReceiptWrites owned = dualIsoFrameReceiptWrites(true, 1, -2);
+    ASSERT_TRUE(owned.autoCorrected);
+    ASSERT_TRUE(owned.pattern);
+    const DualIsoFrameReceiptWrites ownedFixed = dualIsoFrameReceiptWrites(true, 2, 0);
+    ASSERT_TRUE(ownedFixed.autoCorrected);
+    ASSERT_FALSE(ownedFixed.pattern);
+    const DualIsoFrameReceiptWrites toolOff = dualIsoFrameReceiptWrites(true, 0, -2);
+    ASSERT_FALSE(toolOff.autoCorrected);
+    ASSERT_FALSE(toolOff.pattern);
+}
+
+// (a) wiring: Play's repair clamps the spin boxes (what it plays) and writes the receipt only through the predicate.
+TEST(ClipOpenAbortR5Wiring, PlayCutRangeRepairWritesTheReceiptOnlyWhenItOwnsTheLoadedClip)
+{
+    const QString source = mainWindowSource();
+    const QString body = bodyBetween(source, QStringLiteral("bool MainWindow::normalizePlaybackCutRangeForLoadedClip( const char *where )"),
+                                     QStringLiteral("int MainWindow::normalizePlaybackRequestedFrame("));
+    ASSERT_FALSE(body.isEmpty());
+    const int clamp = body.indexOf(QStringLiteral("ui->spinBoxCutOut->setValue( normalized.cutOut );"));
+    const int gate = body.indexOf(QStringLiteral(
+        "if( playbackCutRangeRepairWritesReceipt( normalized.changed, receiptOwnedByLoadedClip( \"play-cut-range-repair\" ) ) )"));
+    const int write = body.indexOf(QStringLiteral("ACTIVE_RECEIPT->setCutIn("));
+    ASSERT_TRUE(clamp >= 0);
+    ASSERT_TRUE(gate > clamp);
+    ASSERT_TRUE(write > gate);
+    ASSERT_EQ(body.count(QStringLiteral("ACTIVE_RECEIPT->set")), 2);
+}
+
+// (b) wiring: drawFrameReady decides both Dual ISO receipt writes through the predicate.
+TEST(ClipOpenAbortR5Wiring, DrawFrameReadyWritesDualIsoIntoTheReceiptOnlyWhenItOwnsTheLoadedClip)
+{
+    const QString source = mainWindowSource();
+    const QString body = bodyBetween(source, QStringLiteral("void MainWindow::drawFrameReady()"),
+                                     QStringLiteral("ui->horizontalSliderDualIsoEvCorrection->setValue("));
+    ASSERT_FALSE(body.isEmpty());
+    const int decide = body.indexOf(QStringLiteral(
+        "dualIsoFrameReceiptWrites( receiptOwnedByLoadedClip( \"draw-frame-dual-iso\" ), dualIsoToolMode, readyFrame.dualIsoPattern );"));
+    const int flag = body.indexOf(QStringLiteral("if( receiptWrites.autoCorrected ) ACTIVE_RECEIPT->setDualIsoAutoCorrected( 1 );"));
+    const int pattern = body.indexOf(QStringLiteral("if( receiptWrites.pattern ) ACTIVE_RECEIPT->setDualIsoPattern( uiPattern );"));
+    ASSERT_TRUE(decide >= 0);
+    ASSERT_TRUE(flag > decide);
+    ASSERT_TRUE(pattern > flag);
+    ASSERT_EQ(body.count(QStringLiteral("ACTIVE_RECEIPT->set")), 2);
+}
+
+// (c) class sweep: every direct ACTIVE_RECEIPT / activeReceipt setter sits in a function that consults the one
+// predicate before it (or is a listed exemption that writes no loaded-clip data). A new site fails here until it
+// is guarded and listed in the run's direct-receipt-writes.md.
+TEST(ClipOpenAbortR5Wiring, EveryDirectActiveReceiptWriteConsultsTheOwnershipPredicate)
+{
+    const QString source = mainWindowSource();
+    ASSERT_FALSE(source.isEmpty());
+    struct Site { const char *function; const char *guard; };
+    const Site guarded[] = {
+        {"drawFrameReady", "receiptOwnedByLoadedClip( \"draw-frame-dual-iso\" )"},
+        {"normalizePlaybackCutRangeForLoadedClip", "receiptOwnedByLoadedClip( \"play-cut-range-repair\" )"},
+        {"applyLookAssistToReceipt", "receiptOwnedByLoadedClip( \"look-assist-async-apply\" )"},
+        {"on_actionResetReceipt_triggered", "receiptOwnedByLoadedClip( \"reset-receipt\" )"},
+        {"on_comboBoxLookAssistFlavor_currentIndexChanged", "receiptOwnedByLoadedClip( \"look-assist-flavor\" )"},
+        {"on_checkBoxLookAssistEnable_clicked", "receiptOwnedByLoadedClip( \"look-assist-toggle\" )"},
+    };
+    // write no loaded-clip data: the smoke harness forces Look Assist off; a new row's fresh receipt is marked forced
+    const QStringList exempt = {QStringLiteral("runGuiPlaybackSmoke"), QStringLiteral("addFileToSession")};
+
+    const QRegularExpression write(QStringLiteral("\\b(ACTIVE_RECEIPT|activeReceipt)\\s*->\\s*set\\w+\\s*\\("));
+    const QStringList lines = source.split(QLatin1Char('\n'));
+    QStringList offenders;
+    QStringList seen;
+    for (int i = 0; i < lines.size(); ++i)
+    {
+        const QString line = lines.at(i).trimmed();
+        if (line.startsWith(QStringLiteral("//")) || !write.match(line).hasMatch()) continue;
+        int start = 0;
+        const QString function = enclosingFunction(lines, i, &start);
+        if (!seen.contains(function)) seen << function;
+        if (exempt.contains(function)) continue;
+        bool ok = false;
+        for (const Site & site : guarded)
+        {
+            if (function != QLatin1String(site.function)) continue;
+            // the guard sits between the function's definition and this write
+            ok = lines.mid(start, i - start).join(QLatin1Char('\n')).contains(QLatin1String(site.guard));
+        }
+        if (!ok) offenders << QStringLiteral("%1 (%2): %3").arg(i + 1).arg(function, line);
+    }
+    if (!offenders.isEmpty()) fprintf(stderr, "unguarded direct receipt writes:\n%s\n", qPrintable(offenders.join(QLatin1Char('\n'))));
+    ASSERT_TRUE(offenders.isEmpty());
+    // every listed site still exists (the table is not stale)
+    for (const Site & site : guarded) ASSERT_TRUE(seen.contains(QLatin1String(site.function)));
+
+    // the deferred Look Assist applies write ACTIVE_RECEIPT through applyLookAssistToReceipt: their gates consult it
+    const QString setSliders = bodyBetween(source, QStringLiteral("void MainWindow::setSliders(ReceiptSettings *receipt, bool paste)"),
+                                           QStringLiteral("void MainWindow::captureLookAssistBaseline( ReceiptSettings *receipt )"));
+    ASSERT_EQ(setSliders.count(QStringLiteral("|| !receiptOwnedByLoadedClip( \"look-assist-setsliders-frame-ready\" )")), 2);
+    const QString toggle = bodyBetween(source, QStringLiteral("void MainWindow::on_checkBoxLookAssistEnable_clicked( bool checked )"),
+                                       QStringLiteral("applyLookAssistToReceipt( ACTIVE_RECEIPT, analysisFrame );"));
+    ASSERT_TRUE(toggle.contains(QStringLiteral("|| !receiptOwnedByLoadedClip( \"look-assist-toggle-frame-ready\" )")));
+
+    // the predicate reuses the r4 detachment state and compares the loaded file with the active row
+    const QString predicate = bodyBetween(source, QStringLiteral("bool MainWindow::receiptOwnedByLoadedClip( const char *site )"),
+                                          QStringLiteral("void MainWindow::retryClipReopenAfterPrepAbort( int row )"));
+    ASSERT_TRUE(predicate.contains(QStringLiteral("activeReceiptOwnsLoadedClip( m_slidersDetachedFromReceipt,")));
+    ASSERT_TRUE(predicate.contains(QStringLiteral("m_loadedClipFileName == ACTIVE_CLIP->getPath()")));
+    const QString preview = bodyBetween(source, QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"),
+                                        QStringLiteral("void MainWindow::on_actionOpen_triggered()"));
+    const QString full = bodyBetween(source, QStringLiteral("int MainWindow::openMlv( QString fileName )"),
+                                     QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"));
+    for (const QString & body : {preview, full})
+        ASSERT_TRUE(body.contains(QStringLiteral("m_loadedClipFileName = fileName;\n    markClipOpenSucceeded();")));
+}
+
+// adversary 4b41aa22 A1: session [A,B], A active and loaded; drop C, whose prep drain times out. importNewMlv
+// removes C and restores A; the drop handler must not then open B (the last row), which would free A.
+TEST(ClipOpenAbortR5, APrepRefusedImportLeavesTheRestoredClipShown)
+{
+    ImportBatchOutcome onlyRefused;
+    onlyRefused.note(false);
+    ASSERT_FALSE(onlyRefused.showLastRow());
+    // nothing imported (duplicates skipped) or an ordinary failure: the base shows the last row as before
+    ImportBatchOutcome none;
+    ASSERT_TRUE(none.showLastRow());
+    ImportBatchOutcome corrupt;
+    corrupt.note(true);
+    ASSERT_TRUE(corrupt.showLastRow());
+    // a refusal next to another import still shows the last row (that open makes any deferred reopen stale)
+    ImportBatchOutcome mixed;
+    mixed.note(false);
+    mixed.note(true);
+    ASSERT_TRUE(mixed.showLastRow());
+}
+
+TEST(ClipOpenAbortR5Wiring, EveryImportCallerShowsTheLastRowOnlyFromTheBatchOutcome)
+{
+    const QString source = mainWindowSource();
+    const QString importBody = bodyBetween(source, QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"),
+                                           QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
+    ASSERT_FALSE(importBody.isEmpty());
+    const int warning = importBody.indexOf(QStringLiteral("was not imported because playback was still preparing a frame"));
+    const int refused = importBody.indexOf(QStringLiteral("return false;"));
+    ASSERT_TRUE(warning >= 0);
+    ASSERT_TRUE(refused > warning);
+    ASSERT_TRUE(importBody.contains(QStringLiteral(
+        "if( !clipOpenFailureKeptRetainedClip( ret ) && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );")));
+    ASSERT_TRUE(importBody.contains(QStringLiteral("    }\n    return true;\n}")));
+
+    const QString show = QStringLiteral("if( SESSION_CLIP_COUNT && imports.showLastRow() ) showFileInEditor( SESSION_CLIP_COUNT - 1 );");
+    struct Caller { const char *start; const char *end; };
+    const Caller callers[] = {
+        {"bool MainWindow::event(QEvent *event)", "//Caching is in which state? Set it!"},
+        {"void MainWindow::on_actionOpen_triggered()", "void MainWindow::openDngFolderDialog()"},
+        {"void MainWindow::openDngFolderDialog()", "void MainWindow::on_actionFcpxmlImportAssistant_triggered()"},
+    };
+    for (const Caller & caller : callers)
+    {
+        const QString body = bodyBetween(source, QLatin1String(caller.start), QLatin1String(caller.end));
+        ASSERT_FALSE(body.isEmpty());
+        const int note = body.indexOf(QStringLiteral("imports.note( importNewMlv( "));
+        const int shown = body.indexOf(show);
+        ASSERT_TRUE(note >= 0);
+        ASSERT_TRUE(shown > note);
+    }
+    // the drop path (openMlvSet) shows the last row from the same outcome
+    const int dropShow = source.indexOf(QStringLiteral("if( SESSION_CLIP_COUNT && imports.showLastRow() )\n    {\n        //Show last imported file"));
+    const int dropNote = source.lastIndexOf(QStringLiteral("imports.note( importNewMlv( fileName ) );"), dropShow);
+    ASSERT_TRUE(dropShow >= 0);
+    ASSERT_TRUE(dropNote >= 0 && dropNote < dropShow);
 }

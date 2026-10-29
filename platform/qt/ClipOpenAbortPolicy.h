@@ -54,6 +54,57 @@ inline DeferredClipReopen deferredClipReopenDecision( unsigned long long schedul
     return DeferredClipReopen::Run;
 }
 
+// r5 (Dot 29eac4d5 A1 = adversary 008a3a27 A1): a write that goes straight into the active receipt, around
+// setReceipt (Play's cut-range repair, drawFrameReady's Dual ISO autocorrection, the deferred Look Assist apply,
+// the flavor selector), runs only while that receipt owns the loaded clip: the sliders are attached and the clip
+// that is open is the active row's. After a failed final export reopen the job's clip stays loaded under the
+// restored active row, so every such write is a no-op until a clip opens.
+inline bool activeReceiptOwnsLoadedClip( bool slidersDetached, bool clipLoaded, bool hasActiveReceipt,
+                                         bool loadedIsActiveClip )
+{
+    return !slidersDetached && clipLoaded && hasActiveReceipt && loadedIsActiveClip;
+}
+
+// Play's cut-range repair clamps the range it plays (the cut spin boxes) on any loaded clip; it saves that
+// range into the receipt only when the receipt owns the clip.
+inline bool playbackCutRangeRepairWritesReceipt( bool rangeChanged, bool receiptOwnsLoadedClip )
+{
+    return rangeChanged && receiptOwnsLoadedClip;
+}
+
+// drawFrameReady: the Dual ISO autocorrection flag and a detected pattern go into the receipt only when it owns
+// the clip the frame came from; the widgets still show the retained clip's frame.
+struct DualIsoFrameReceiptWrites
+{
+    bool autoCorrected = false;
+    bool pattern = false;
+};
+
+inline DualIsoFrameReceiptWrites dualIsoFrameReceiptWrites( bool receiptOwnsLoadedClip, int dualIsoToolMode,
+                                                            int readyFramePattern )
+{
+    DualIsoFrameReceiptWrites writes;
+    if( !receiptOwnsLoadedClip || dualIsoToolMode <= 0 ) return writes;
+    writes.autoCorrected = true;
+    writes.pattern = readyFramePattern < 0;
+    return writes;
+}
+
+// r5 (adversary 4b41aa22 A1): a batch import (drop, Open dialog, FileOpen event, DNG folder, FCPXML) shows the
+// session's last row afterwards unless every import it ran was refused by a busy prep task. Such a refusal removed
+// the new row and restored the clip the sliders describe; showing another row would free that clip.
+struct ImportBatchOutcome
+{
+    bool refused = false;
+    bool other = false;
+    void note( bool importNotRefusedForPrep )
+    {
+        if( importNotRefusedForPrep ) other = true;
+        else refused = true;
+    }
+    bool showLastRow( void ) const { return !refused || other; }
+};
+
 // showFileInEditor( row ) after openMlv( row ) failed. The active row moves back to the clip the sliders
 // still describe before anything saves a receipt, so a later setReceipt( ACTIVE_RECEIPT ) never writes
 // one clip's sliders into another clip's receipt. The old clip is reopened only when it is no longer loaded.
