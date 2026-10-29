@@ -175,6 +175,10 @@ AGXOFF_UNPACED_NOFAST_LEGS = {"legs/m16-1243-look-scale2-cinematic-agxoff-unpace
                               "legs/m16-1243-pace-cinematic-agxoff-unpaced-nofast.json": AGXOFF_UNPACED_PACE_LEG}
 AGXOFF_REMEASURE_LEGS = (AGXOFF_UNPACED_PACE_LEG, *AGXOFF_UNPACED_NOFAST_LEGS)
 SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_REMEASURE_LEGS)
+# PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1: the one leg that BOTH routes a cpu leg's frames down the Processed8 branch (playbackProcessing receipt) AND keeps the
+# per-frame playback_smoke.frame rows (telemetryArm HEAVY): the cpu-reduced pace twin at fullscreen s4 with the frame log kept.
+CPU_RECEIPT_HEAVY_LEG = "legs/m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy.json"
+SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -6722,6 +6726,34 @@ class LegSpecSchemaTests(unittest.TestCase):
             for key in ("clipId", "playSeconds", "backends", "scaleFactor", "displayMode", "timeouts", "criteria"):
                 self.assertEqual(pace[key], cell[key], f"{rel}: {key}")
 
+    def test_the_cpu_receipt_heavy_leg_is_the_cpu_reduced_pace_twin_with_the_frame_log_kept(self) -> None:
+        """PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1: the leg that routes a cpu leg's frames to Processed8 (playbackProcessing receipt; the default subset
+        routes them to Debayered16) AND logs per-frame rows (telemetryArm HEAVY; LIGHT disables the playback_smoke.frame line). It is the cpu-reduced fullscreen
+        s4 pace twin except legId, card and telemetryArm, so a later edit cannot quietly make it LIGHT, subset, or a cuda leg, or switch Look Assist off."""
+        arm = json.loads((DV / CPU_RECEIPT_HEAVY_LEG).read_text(encoding="utf-8"))
+        self.jsonschema.validate(arm, self.schema)
+        self.assertEqual(arm["legId"], Path(CPU_RECEIPT_HEAVY_LEG).stem)
+        self.assertEqual(arm["legType"], "speed")
+        self.assertEqual(arm["generatorArgs"]["telemetryArm"], "HEAVY")
+        self.assertEqual(arm["generatorArgs"]["playbackProcessing"], "receipt")
+        self.assertEqual(arm["backends"], ["cpu"])
+        self.assertEqual((arm["scaleFactor"], arm["displayMode"], arm["playSeconds"]), (4, "fullscreen", 25))
+        self.assertIs(arm["generatorArgs"]["forceLookAssist"], True, "Look Assist stays ON (D4b: the owner shape)")
+        self.assertEqual(arm["generatorArgs"]["lookFlavor"], "cinematic")
+        self.assertIn({"metric": "lookAssistForced", "op": "eq", "value": True}, arm["criteria"]["acceptance"]["cpu"])
+        self.assertIn({"metric": "lookFlavorReported", "op": "eq", "value": "cinematic"}, arm["criteria"]["acceptance"]["cpu"])
+        base = json.loads((DV / "legs" / "m16-1243-pace-cinematic-cpu-reduced-fullscreen-s4.json").read_text(encoding="utf-8"))
+        self.assertEqual(base["generatorArgs"]["telemetryArm"], "LIGHT")
+        self.assertEqual(arm["generatorArgs"].pop("telemetryArm"), "HEAVY")
+        base["generatorArgs"].pop("telemetryArm")
+        self.assertEqual(dict(arm, legId=base["legId"], card=base["card"]), base)
+        # the schema takes the combination as it stands: HEAVY and receipt together are valid, and each field still rejects a value outside its enum
+        for key, value in (("telemetryArm", "MEDIUM"), ("playbackProcessing", "fast")):
+            bad = json.loads((DV / CPU_RECEIPT_HEAVY_LEG).read_text(encoding="utf-8"))
+            bad["generatorArgs"][key] = value
+            with self.assertRaises(self.jsonschema.ValidationError, msg=key):
+                self.jsonschema.validate(bad, self.schema)
+
     def test_the_lookahead_leg_is_the_owner_shape_pace_leg_at_depth_3(self) -> None:
         """PLAYBACK-BACHELOR-PRESENT-JITTER-1: the lookahead A/B's depth-3 arm differs from the owner-shape pace leg only in its legId and
         generatorArgs.playbackRenderLookaheadFrames."""
@@ -6931,6 +6963,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             elif spec["card"] == "PLAYBACK-BACHELOR-PRESENT-JITTER-1":   # the capture-free pace legs, named by flavor and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], rf"^m16-1243-pace-{flavor}(-cpu-reduced)?-(fullscreen|windowed)-s[124](-la[0-3]|-heavy)?(-dec[0-4])?$", path.name)
+            elif spec["card"] == "PROCESSED8-MEASURED-BRANCH-HEAVY-LEG-SPEC-1":   # the cpu receipt pace leg that keeps the per-frame log, named by its cell
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertEqual(spec["legId"], "m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy", path.name)
             elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
