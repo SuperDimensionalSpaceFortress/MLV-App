@@ -273,6 +273,15 @@ def _wait_pid_gone(pid: int, timeout_s: float) -> bool:
     return not _pid_alive(pid)
 
 
+PS_SINGLE_QUOTES = "'‘’‚‛"   # the five characters PowerShell's tokenizer treats as a single quote
+
+
+def psq(value: object) -> str:
+    """`value` for the inside of a PowerShell single-quoted literal: every embedded single-quote character (the ASCII one and the four typographic ones PowerShell also accepts) is
+    doubled, so a temp dir or a message that carries an apostrophe cannot end the literal."""
+    return "".join(c * 2 if c in PS_SINGLE_QUOTES else c for c in str(value))
+
+
 def utc_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -481,7 +490,10 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def setUp(self) -> None:
-        self.case = Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp))
+        self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+
+    def _init_case(self, case: Path) -> None:
+        self.case = case
         self.share = self.case / "share"
         self.share.mkdir()
         (self.share / "cancel").mkdir()   # the agent's cooperative cancel folder (the agent creates it on the real share)
@@ -781,7 +793,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         def m(x: float) -> str:
             return utc_iso(now + timedelta(minutes=x))
         cases = {"none": [], "cooldown": [(m(-40), m(-10))], "budget": [(m(-120), m(-75)), (m(-45), m(0))], "old": [(m(-400), m(-355))]}
-        script = f"Import-Module '{MODULE}' -Force -DisableNameChecking\n$now = '{utc_iso(now)}'\n$o = [ordered]@{{}}\n"
+        script = f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n$now = '{utc_iso(now)}'\n$o = [ordered]@{{}}\n"
         for name, leases in cases.items():
             arr = ", ".join(f"[pscustomobject]@{{ startUtc = '{s}'; endUtc = '{e}' }}" for s, e in leases)
             script += f"$w = Get-VenueLeaseBudgetWait -Leases @({arr}) -NowUtc $now; $o['{name}'] = [ordered]@{{ reason = $w.reason; waitSec = $w.waitSec; usedSec = $w.usedSec }}\n"
@@ -891,7 +903,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         # Resolve-VenueLeaseCaps: against the real um-run an explicit cooldown below the live one, or a budget above it, is LEASE_CAP_RELAXED; tighter is kept;
         # only an offline stub may go looser. Get-VenueLeaseCaps reads the probe's text with heavy-slot.py's rules.
         live = json.dumps(self.LIVE_CAPS)
-        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+        script = f"""Import-Module '{psq(MODULE)}' -Force -DisableNameChecking
 $live = Get-VenueLeaseCaps -Text '{live}'
 $fb = Get-VenueLeaseCaps -Text 'HEAVY_SLOT_LEASE_JSON_MISSING'
 $o = [ordered]@{{ live = "$($live.source) $($live.cooldownSec) $($live.budgetSec) $($live.capSec)"; fb = "$($fb.source) $($fb.cooldownSec) $($fb.budgetSec) $($fb.capSec)" }}
@@ -929,7 +941,7 @@ $o | ConvertTo-Json -Compress
         # CoS/Dot B1 on affa0d1a: budget = max_fraction_per_3h * 10800 whatever -LeaseBudgetWindowSec says (it used to be fraction * the CALLER's window, so 21600 doubled
         # it). A longer window can only count MORE of the earlier leases against the same budget; a shorter one may only shrink the budget, never raise it.
         caps = json.dumps({**self.LIVE_CAPS, "cooldown_minutes": 0, "max_fraction_per_3h": 0.5})
-        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+        script = f"""Import-Module '{psq(MODULE)}' -Force -DisableNameChecking
 $now = [DateTime]::UtcNow
 $o = [ordered]@{{}}
 foreach ($w in 10800, 21600, 86400, 3600, 600) {{
@@ -961,7 +973,7 @@ $o | ConvertTo-Json -Compress -Depth 4
         # config is unrepresentable and is the FALLBACK with a typed reason (never a shorter cooldown than the one configured).
         def caps(minutes: float) -> str:
             return json.dumps({**self.LIVE_CAPS, "cooldown_minutes": minutes})
-        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+        script = f"""Import-Module '{psq(MODULE)}' -Force -DisableNameChecking
 $o = [ordered]@{{}}
 $i = 0
 foreach ($t in '{caps(1440)}', '{caps(2880)}', '{caps(10080)}', '{caps(0.5)}', '{caps(1e9)}') {{
@@ -980,7 +992,7 @@ $o | ConvertTo-Json -Compress
         self.assertTrue(got["c4"].startswith("fallback 1800 cooldown_minutes-unrepresentable"), got["c4"])
 
     def test_r2_i1_two_caps_probe_ids_built_in_the_same_second_differ_and_keep_the_agents_shapes(self) -> None:
-        script = f"""Import-Module '{MODULE}' -Force -DisableNameChecking
+        script = f"""Import-Module '{psq(MODULE)}' -Force -DisableNameChecking
 $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
 [ordered]@{{ ids = $ids; distinct = @($ids | Select-Object -Unique).Count }} | ConvertTo-Json -Compress
 """
@@ -1124,9 +1136,9 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
     def _agent_verdict(self, notafter_dir: Path, job_id: str, not_after_utc: str) -> dict:
         """The agent's OWN reader and verdict (Read-JobNotAfterSidecar, Get-JobNotAfterVerdict, lifted from ultra-magnus-agent.ps1) on a sidecar folder."""
         script = (
-            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{AGENT}', [ref]$null, [ref]$null)\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(AGENT)}', [ref]$null, [ref]$null)\n"
             "foreach ($n in 'Get-JobNotAfterVerdict', 'Read-JobNotAfterSidecar') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
-            f"$notAfterDir = '{notafter_dir}'\n"
+            f"$notAfterDir = '{psq(notafter_dir)}'\n"
             f"$v = Get-JobNotAfterVerdict -Metadata ([pscustomobject]@{{ notAfterUtc = '{not_after_utc}' }}) -Sidecar (Read-JobNotAfterSidecar -JobId '{job_id}')\n"
             "[ordered]@{ state = $v.state; source = $v.source; livenessState = $v.livenessState; livenessSeq = $v.livenessSeq; why = $v.why } | ConvertTo-Json -Compress\n"
         )
@@ -1389,7 +1401,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
             while datetime.now(timezone.utc) < claimed + timedelta(seconds=70):
                 time.sleep(0.5)
             self.assertIsNone(p.poll(), "the run is still in its open's wait at TTL + 10 s")
-            script = f"Import-Module '{MODULE}' -Force -DisableNameChecking\n$c = Get-VenueClaim -Venue bachelor -ClaimDir '{self.claims}'\n[ordered]@{{ state = $c.state; reason = $c.reason; nonce = $c.claim.nonce }} | ConvertTo-Json -Compress\n"
+            script = f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n$c = Get-VenueClaim -Venue bachelor -ClaimDir '{psq(self.claims)}'\n[ordered]@{{ state = $c.state; reason = $c.reason; nonce = $c.claim.nonce }} | ConvertTo-Json -Compress\n"
             out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
             seen = json.loads(out.stdout)
@@ -1414,15 +1426,15 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         # Update-VenueClaim renews only the claim with its nonce: another owner's claim (a new one after a break) is NOT_OURS and left byte for byte.
         self.claims.mkdir()
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-            f"$c = Request-VenueClaim -Venue bachelor -RunDir 'x' -TtlSec 60 -ClaimDir '{self.claims}'\n"
-            f"$before = [IO.File]::ReadAllText('{self.claim_path}')\n"
-            f"$other = Update-VenueClaim -Venue bachelor -Nonce 'not-the-nonce' -TtlSec 600 -ClaimDir '{self.claims}'\n"
-            f"$same = ([IO.File]::ReadAllText('{self.claim_path}') -ceq $before)\n"
-            f"$mine = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{self.claims}'\n"
-            f"$after = Get-VenueClaim -Venue bachelor -ClaimDir '{self.claims}'\n"
-            f"$rel = Release-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -ClaimDir '{self.claims}'\n"
-            f"$gone = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{self.claims}'\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$c = Request-VenueClaim -Venue bachelor -RunDir 'x' -TtlSec 60 -ClaimDir '{psq(self.claims)}'\n"
+            f"$before = [IO.File]::ReadAllText('{psq(self.claim_path)}')\n"
+            f"$other = Update-VenueClaim -Venue bachelor -Nonce 'not-the-nonce' -TtlSec 600 -ClaimDir '{psq(self.claims)}'\n"
+            f"$same = ([IO.File]::ReadAllText('{psq(self.claim_path)}') -ceq $before)\n"
+            f"$mine = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{psq(self.claims)}'\n"
+            f"$after = Get-VenueClaim -Venue bachelor -ClaimDir '{psq(self.claims)}'\n"
+            f"$rel = Release-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -ClaimDir '{psq(self.claims)}'\n"
+            f"$gone = Update-VenueClaim -Venue bachelor -Nonce $c.claim.nonce -TtlSec 600 -ClaimDir '{psq(self.claims)}'\n"
             "[ordered]@{ other = $other.state; same = $same; mine = $mine.state; live = $after.state; ttlLeft = [int](($after.claim.expiresUtc.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds); rel = $rel; gone = $gone.state } | ConvertTo-Json -Compress\n"
         )
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
@@ -1601,11 +1613,11 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         empty = self.case / "no-fns.ps1"
         empty.write_text("function Something-Else { 1 }\n", encoding="utf-8")
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             "[ordered]@{\n"
-            f"  noFns = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1' -AgentScript '{empty}'\n"
-            f"  noFile = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1' -AgentScript '{self.case / 'missing.ps1'}'\n"
-            f"  noSidecar = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1'\n"
+            f"  noFns = Test-VenueJobLivenessReadback -AgentShare '{psq(self.share)}' -JobId 'j1' -AgentScript '{psq(empty)}'\n"
+            f"  noFile = Test-VenueJobLivenessReadback -AgentShare '{psq(self.share)}' -JobId 'j1' -AgentScript '{psq(self.case / 'missing.ps1')}'\n"
+            f"  noSidecar = Test-VenueJobLivenessReadback -AgentShare '{psq(self.share)}' -JobId 'j1'\n"
             "} | ConvertTo-Json -Compress -Depth 4\n"
         )
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
@@ -1636,8 +1648,8 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         stall = self.case / "stalled-agent.ps1"
         stall.write_text("function Get-JobNotAfterVerdict { param($Metadata, $Sidecar) 1 }\nfunction Read-JobNotAfterSidecar { param($JobId) Start-Sleep -Seconds 120 }\n", encoding="utf-8")
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-            f"$t = [Diagnostics.Stopwatch]::StartNew(); $r = Test-VenueJobLivenessReadback -AgentShare '{self.share}' -JobId 'j1' -AgentScript '{stall}' -TimeoutSec 1; $t.Stop()\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$t = [Diagnostics.Stopwatch]::StartNew(); $r = Test-VenueJobLivenessReadback -AgentShare '{psq(self.share)}' -JobId 'j1' -AgentScript '{psq(stall)}' -TimeoutSec 1; $t.Stop()\n"
             "[ordered]@{ live = $r.live; state = $r.state; livenessState = $r.livenessState; error = $r.error; ms = $t.ElapsedMilliseconds } | ConvertTo-Json -Compress\n"
             "Complete-VenueProcess -ExitCode 0\n"
         )
@@ -1842,7 +1854,7 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         self.assertIn('$probeJobId = "$jobStem-health"', leg)
         stem = "dve-m16-1243-display-windowed-s1-bachelor-cpu-20261023184200-lb0123456789ab"
         script = (
-            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{AGENT}', [ref]$null, [ref]$null)\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(AGENT)}', [ref]$null, [ref]$null)\n"
             "foreach ($n in 'Get-LeaseBatchToken', 'Test-LeaseBatchCloseJobId') { . ([scriptblock]::Create($ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq $n }, $true).Extent.Text)) }\n"
             "$p = ($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'GateExemptJobPattern' }).DefaultValue.Value\n"
             f"[ordered]@{{ leg = Get-LeaseBatchToken '{stem}'; health = Get-LeaseBatchToken '{stem}-health'; healthLight = ('{stem}-health' -match $p); legLight = ('{stem}' -match $p)\n"
@@ -1868,8 +1880,8 @@ $ids = @(1..40 | ForEach-Object {{ New-VenueCapsProbeId }})
         (self.share / "logs" / "lease-batch-0123456789ab.jsonl").write_text(
             json.dumps({"leaseId": "L0", "endReason": "idle"}) + "\n" + json.dumps({"leaseId": "L1", "endReason": "closed"}) + "\n", encoding="utf-8")
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-            f"$s = '{self.share}'\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$s = '{psq(self.share)}'\n"
             "[ordered]@{ found = (Get-VenueJobResult -AgentShare $s -JobId 'j1').result.admission.leaseBatch.leaseId; absent = (Get-VenueJobResult -AgentShare $s -JobId 'j2').state\n"
             "  bad = (Get-VenueJobResult -AgentShare $s -JobId '..\\x').state; rec = (Read-VenueLeaseBatchReceipt -AgentShare $s -Token '0123456789ab' -LeaseId 'L1').record.endReason\n"
             "  none = (Read-VenueLeaseBatchReceipt -AgentShare $s -Token '0123456789ab' -LeaseId 'L9').state; nofile = (Read-VenueLeaseBatchReceipt -AgentShare $s -Token 'ffffffffffff' -LeaseId 'L1').state } | ConvertTo-Json -Compress\n"
@@ -1901,6 +1913,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def setUp(self) -> None:
         super().setUp()
+        self._stage_case()
+
+    def _stage_case(self) -> None:
         self.leg_args = self.case / "leg-args.jsonl"
         # two builds staged in the venue's cache, by the path Invoke-VenueLeg hashes
         self.manifests = {c: self.stage(c, f"build {c[:1]}") for c in (self.commit_a, self.commit_b)}
@@ -2098,7 +2113,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_r3_a2_arms_that_differ_only_in_case_are_separate_arms(self) -> None:
         # sol r3 A2: the arm label is validated case-sensitively (A and a are both legal) but the interleave keyed its queues case-insensitively, merging them.
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             "$items = 'AAaa'.ToCharArray() | ForEach-Object -Begin { $i = 0 } -Process { $i++; [pscustomobject]@{ arm = [string]$_; n = $i } }\n"
             "(@(Get-VenueInterleavedLegPlan -Items @($items)) | ForEach-Object { \"$($_.arm)$($_.n)\" }) -join ' '\n"
         )
@@ -2206,8 +2221,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.run_dir.mkdir(parents=True, exist_ok=True)
         keep = self.run_dir / "leg-plan.json"
         keep.write_text('{"preserved":"first invocation"}\n', encoding="utf-8")
-        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-                  f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\other-run' -Purpose foreign -TtlSec 3600 -ClaimDir '{self.claims}' -OwnerPid {os.getpid()}\n"
+        script = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+                  f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\other-run' -Purpose foreign -TtlSec 3600 -ClaimDir '{psq(self.claims)}' -OwnerPid {os.getpid()}\n"
                   "$r.granted\n")
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
@@ -2268,8 +2283,43 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         [b] = self.batches()
         self.assertEqual(b["endReason"], "BATCH_ERROR")
 
-    def _lock_log_once_the_claim_is_taken(self, log: Path, give_up_s: float = 120) -> tuple[threading.Event, threading.Thread]:
-        """Take `log` with share mode 0 as soon as the venue claim file exists, and hold it until the returned event is set. Windows only (CreateFileW)."""
+    _EXPIRED_MARKER, _ACK_MARKER = "runner-pause-expired.marker", "runner-ack.marker"
+
+    def _pause_snippet(self, message: str, pause_s: float) -> str:
+        """The PowerShell the runner copy runs at its first log line starting `message` (see _runner_paused_at_claim_taken); its own method so a test can run it alone."""
+        paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
+        expired, ack = self.case / self._EXPIRED_MARKER, self.case / self._ACK_MARKER
+        return (f"    if (-not $script:PauseDone -and $Message.StartsWith('{psq(message)}', [StringComparison]::Ordinal)) {{ $script:PauseDone = $true; $n = [guid]::NewGuid().ToString('N'); Set-Content -LiteralPath '{psq(paused)}' -Value $n; "
+                 f"$sw = [Diagnostics.Stopwatch]::StartNew(); $seen = $false; "
+                 f"while ($sw.Elapsed.TotalSeconds -lt {pause_s}) {{ if (Test-Path -LiteralPath '{psq(locked)}') {{ $seen = $sw.Elapsed.TotalSeconds -lt {pause_s}; break }}; Start-Sleep -Milliseconds 20 }}\n"
+                 f"        if ($seen) {{ $held = $false; try {{ [IO.File]::Open($batchLog, 'Open', 'Read', 'ReadWrite').Dispose() }} catch [IO.IOException] {{ $held = $true }}; "
+                 f"if ($held -and $sw.Elapsed.TotalSeconds -lt {pause_s}) {{ Set-Content -LiteralPath '{psq(ack)}' -Value ($n + ' held') }} elseif ($held) {{ $seen = $false }} }} "
+                 f"if (-not $seen) {{ Set-Content -LiteralPath '{psq(expired)}' -Value ($n + ' expired') }} }}\n")
+
+    def _runner_paused_at_claim_taken(self, message: str = "CLAIM_TAKEN", release_at: str = "", more: tuple = (), pause_s: float = 60) -> tuple[Path, Path, Path]:
+        """A copy of the runner that PAUSES when it is about to log a line starting `message` (CLAIM_TAKEN by default): it writes `paused` (holding an attempt nonce it generates) and waits (at most
+        `pause_s`, 60 by default) for `locked` to appear. Seeing `locked` inside the window (the clock is read after the look, and again after the probe: adversary r4 A2), it probes batch.log itself and, only if the log really is held, writes `ack` = `<nonce> held`; a pause that
+        runs out with no `locked` writes `expired` = `<nonce> expired` and the runner carries on. The pause happens once per run (a later matching line, e.g. batch 2's, never re-pauses or re-acks). A pause marker that survives the expiry is therefore never a handshake (sol r3 B1; Dot on #704).
+        With `release_at`, the first line starting with it once `locked` exists writes `release-wanted` and waits (at most 60 s) for `released`: the lock holder lets go there.
+        Returns (runner, paused, locked). Dot on #684: the lock helper used to poll for the claim file and hope to win the race with the runner's next log line; the handshake makes the order a fact.
+        r3 (sol r2b hardening; adversary r2 A5): the prefix is compared ordinally (a `[` in it is no -like wildcard) and both waits run on a monotonic Stopwatch, not wall-clock UTC."""
+        paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
+        wanted, released = self.case / "release-wanted.marker", self.case / "log-released.marker"
+        anchor = "function L([string]$Message) {\n"
+        pause = self._pause_snippet(message, pause_s)
+        if release_at:
+            pause += (f"    if ($Message.StartsWith('{psq(release_at)}', [StringComparison]::Ordinal) -and (Test-Path -LiteralPath '{psq(locked)}') -and -not (Test-Path -LiteralPath '{psq(released)}')) {{ "
+                      f"Set-Content -LiteralPath '{psq(wanted)}' -Value 'release'; $sw = [Diagnostics.Stopwatch]::StartNew(); "
+                      f"while (-not (Test-Path -LiteralPath '{psq(released)}') -and $sw.Elapsed.TotalSeconds -lt 60) {{ Start-Sleep -Milliseconds 20 }} }}\n")
+        return self._patched_runner(anchor, anchor + pause, *more), paused, locked
+
+    def _lock_log_while_the_runner_is_paused(self, log: Path, paused: Path, locked: Path, give_up_s: float = 120) -> tuple[threading.Event, threading.Thread, dict]:
+        """Wait (at most give_up_s, monotonic) for the runner's `paused` marker, take `log` with share mode 0, write the `locked` marker (the runner resumes only now), and hold the lock
+        until the returned event is set or the runner writes `release-wanted` (then the lock is let go and `log-released.marker` written). Windows only (CreateFileW). Returns
+        (done, thread, state); state["outcome"] is locked / lock-failed (`locked` still written, so the runner never waits out its 60 s) / never-paused / cancelled, and
+        state["released"] says whether the runner asked for the release. r3 (sol r2b B2): a wait that expired or was cancelled before `paused` appeared takes NO lock and writes NO
+        `locked`: the caller fails on _assert_handshake's named message instead of a log locked ahead of the pause; a pause the runner already gave up on (its `expired` marker) takes no
+        lock either (outcome pause-expired). The handle is closed in a finally."""
         import ctypes
         from ctypes import wintypes
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -2277,21 +2327,59 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
         k32.CloseHandle.argtypes = [wintypes.HANDLE]
         done = threading.Event()
+        state: dict = {"outcome": "pending", "released": False, "give_up_s": give_up_s}
+        wanted, released = paused.parent / "release-wanted.marker", paused.parent / "log-released.marker"
+        expired, ack = paused.parent / self._EXPIRED_MARKER, paused.parent / self._ACK_MARKER
+        state["markers"] = {"paused": paused, "expired": expired, "ack": ack}
+        invalid = wintypes.HANDLE(-1).value
 
         def hold() -> None:
-            end = time.monotonic() + give_up_s
+            # the decision is the loop's own observation (adversary r3 A1): a marker that appears only after the wait expired or was cancelled takes no lock either
+            end, seen = time.monotonic() + give_up_s, False
             while not done.is_set() and time.monotonic() < end:
-                if self.claim_path.exists() and log.exists():
-                    h = k32.CreateFileW(str(log), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
-                    if h != wintypes.HANDLE(-1).value:
-                        done.wait(give_up_s)
-                        k32.CloseHandle(h)
-                        return
-                time.sleep(0.02)
+                if paused.exists():
+                    seen = not done.is_set() and time.monotonic() < end   # adversary r3 pass 2 A2: a look that returned after the deadline does not count
+                    break
+                done.wait(0.01)
+            if seen and expired.exists():   # the runner's own pause ran out and it carried on: a surviving `paused` marker is no handshake (sol r3 B1)
+                state["outcome"] = "pause-expired"
+                return
+            if not seen:
+                state["outcome"] = "cancelled" if done.is_set() else "never-paused"
+                return
+            h = k32.CreateFileW(str(log), 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)   # GENERIC_READ|GENERIC_WRITE, share none, OPEN_EXISTING
+            try:
+                state["outcome"] = "locked" if h != invalid else "lock-failed"
+                locked.write_text(state["outcome"], encoding="utf-8")
+                if h != invalid:
+                    end = time.monotonic() + give_up_s
+                    while not done.is_set() and not wanted.exists() and time.monotonic() < end:
+                        done.wait(0.01)
+                    state["released"] = wanted.exists()
+            finally:
+                if h != invalid:
+                    k32.CloseHandle(h)
+            if state["released"]:
+                released.write_text("released", encoding="utf-8")
 
         t = threading.Thread(target=hold, daemon=True)
         t.start()
-        return done, t
+        return done, t, state
+
+    def _assert_handshake(self, state: dict, message: str, r: subprocess.CompletedProcess | None = None) -> None:
+        """r3 (sol r2b B2): the lock was taken only after the runner paused at `message`; a runner that never paused (slow start, early death) fails here by name."""
+        out = "" if r is None else "\n" + r.stdout + r.stderr
+        self.assertNotEqual(state["outcome"], "never-paused", f"the runner never paused at {message!r} within {state['give_up_s']} s: the lock was not taken{out}")
+        self.assertNotEqual(state["outcome"], "cancelled", f"the runner ended before it paused at {message!r}: the lock was not taken{out}")
+        self.assertNotEqual(state["outcome"], "pause-expired", f"the runner's pause at {message!r} expired with no lock: the surviving pause marker is no handshake{out}")
+        self.assertEqual(state["outcome"], "locked", f"the handshake: the runner paused at {message!r} and resumed only once the lock was held{out}")
+        # sol r3 B1 / Dot on #704: the runner must itself have seen the lock WHILE still paused. Its `expired` marker (the pause ran out first; a helper delayed past it still locks) refuses the
+        # attempt; so does an `ack` that is missing or carries another attempt's nonce (the runner writes `<nonce> held` only after probing batch.log and finding it held).
+        mk = state["markers"]
+        self.assertFalse(mk["expired"].exists(), f"the runner's pause at {message!r} expired before the lock was taken: no handshake{out}")
+        nonce = mk["paused"].read_text(encoding="utf-8").strip() if mk["paused"].exists() else ""
+        got = mk["ack"].read_text(encoding="utf-8").strip() if mk["ack"].exists() else None
+        self.assertTrue(nonce and got == f"{nonce} held", f"no attempt-specific acknowledgment from the paused runner at {message!r} (want {nonce!r} + ' held', got {got!r}){out}")
 
     def test_r6_b5_a_batch_log_another_process_holds_after_the_claim_cannot_skip_the_release_the_receipt_or_the_summary(self) -> None:
         # Dot r5 B5: the finally logged CLAIM_RENEW before Release-VenueClaim; with batch.log held exclusively after the claim was taken, that log call threw out of the
@@ -2299,7 +2387,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "batch.log").write_text("", encoding="utf-8")
         args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
-        done, t = self._lock_log_once_the_claim_is_taken(self.run_dir / "batch.log")
+        runner, paused, locked = self._runner_paused_at_claim_taken()
+        args[args.index("-File") + 1] = str(runner)
+        done, t, state = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", paused, locked)
         t0 = time.monotonic()
         try:
             r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
@@ -2309,6 +2399,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             elapsed = time.monotonic() - t0
             done.set()
             t.join(5)
+        self._assert_handshake(state, "CLAIM_TAKEN", r)
         self.assertLess(elapsed, 60, "bounded: the lock must not stretch the run")
         self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
         self.assertFalse(self.claim_path.exists(), "the claim was left behind")
@@ -2325,8 +2416,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # B5's class: Request-VenueClaim had granted the claim when CLAIM_STALE_BROKEN was logged, and that line sat outside the try, so a log failure there left the new
         # claim (and no keeper yet) behind with no release. The line is best effort now; the batch carries on and ends normally. The failure is injected into a copy of the runner.
         self.claims.mkdir(parents=True, exist_ok=True)
-        seed = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-                f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\dead-run' -Purpose dead -TtlSec 3600 -ClaimDir '{self.claims}' -OwnerPid {os.getpid()}\n"
+        seed = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+                f"$r = Request-VenueClaim -Venue bachelor -RunDir 'C:\\dead-run' -Purpose dead -TtlSec 3600 -ClaimDir '{psq(self.claims)}' -OwnerPid {os.getpid()}\n"
                 "$r.granted\n")
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", seed], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.stdout.strip(), "True", out.stdout + out.stderr)
@@ -2343,16 +2434,18 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual((res["ran"], res["notRun"]), (4, 0))
         self.assertIn("BATCH_LOG_FAILED", r.stderr)
 
-    def _patched_runner(self, old: str, new: str) -> Path:
-        """A copy of the dual-venue tree whose runner has `old` (found exactly once) replaced by `new`; returns the copy's runner."""
+    def _patched_runner(self, old: str, new: str, *more: tuple[str, str]) -> Path:
+        """A copy of the dual-venue tree whose runner has `old` (found exactly once) replaced by `new`, and each further (old, new) pair in `more` likewise; returns the copy's runner."""
         tree = self.case / "tree" / "tools" / "profiling"
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
         shutil.copy2(AGENT, tree / "bachelor" / AGENT.name)
         runner = tree / "dual-venue" / RUNNER.name
         text = runner.read_text(encoding="utf-8")
-        self.assertEqual(text.count(old), 1, "the runner line moved: update this fixture")
-        runner.write_text(text.replace(old, new), encoding="utf-8")
+        for o, n in ((old, new), *more):
+            self.assertEqual(text.count(o), 1, "the runner line moved: update this fixture")
+            text = text.replace(o, n)
+        runner.write_text(text, encoding="utf-8")
         return runner
 
     def test_r6_adv_a3_a_result_line_that_cannot_be_appended_to_the_log_is_still_said_on_stderr(self) -> None:
@@ -2416,6 +2509,1453 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual((b["endReason"], b["preOpenWait"]["reason"]), ("DEADLINE", "BUDGET"))
         self.assertEqual(b["logWriteFailures"], 1, "the BATCH_END failure is in the receipt written for that batch")
         self.assertEqual(batch_result(r.stdout)["logWriteFailures"], 1)
+
+    # LEASE-BATCH-RECEIPT-PERSIST-FAILURE-REPORTING-1 (Dot B6 on #684, DISTINGUISHed to this card): a receipt file the run cannot write (batches.jsonl, batch-NN.json or leg-plan.json
+    # occupied by a DIRECTORY) used to throw out of Write-BatchReceipt, which sits in the batch's finally (or, pre-claim, outside any try): the summary was skipped and the exit was
+    # an unhandled 1 instead of the typed code the outcome had selected. The error evidence is kept, said once as RECEIPT_PERSIST_FAILED, and the typed code is still the exit.
+    def _occupy_with_directory(self, *names: str) -> None:
+        for n in names:
+            (self.run_dir / n).mkdir(parents=True, exist_ok=True)
+
+    def _assert_persist_failure_said(self, r: subprocess.CompletedProcess, res: dict, *names: str) -> None:
+        for n in names:
+            want = f"RECEIPT_PERSIST_FAILED file={self.run_dir / n} reason="
+            self.assertIn(want, r.stdout, f"the typed line for {n}: {r.stdout}")
+            self.assertTrue(any(f["file"] == str(self.run_dir / n) and f["reason"] for f in res["receiptPersistFailures"]), res.get("receiptPersistFailures"))
+        self.assertEqual(len(res["receiptPersistFailures"]), len(names), res["receiptPersistFailures"])
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_persist_a_post_claim_batch_error_with_batches_jsonl_a_directory_still_emits_the_summary_and_exits_12(self) -> None:
+        # leg-plan.json is a directory: the plan write after the claim throws (BATCH_ERROR, exit 12). batches.jsonl is a directory too, so the receipt append in the finally threw
+        # out of it: no summary, exit 1. Now: the summary names the unwritten receipt, the in-memory results are kept, and the exit is the BATCH_ERROR 12.
+        self._occupy_with_directory("leg-plan.json", "batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (12, "BATCH_ERROR", 0, 4))
+        self._assert_persist_failure_said(r, res, "batches.jsonl")
+        self.assertEqual([x["endReason"] for x in res["batches"]], ["BATCH_ERROR"], "the in-memory batch row is kept")
+        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "the receipt that could be written was written")
+
+    def test_persist_a_post_claim_batch_error_with_only_leg_plan_json_a_directory_is_still_exit_12_with_a_summary(self) -> None:
+        # the sibling that already held: leg-plan.json alone is the BATCH_ERROR trigger and every receipt writes, so nothing is reported as a persist failure
+        self._occupy_with_directory("leg-plan.json")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
+        self.assertEqual(res["receiptPersistFailures"], [])
+        [b] = self.batches()
+        self.assertEqual(b["endReason"], "BATCH_ERROR")
+
+    def test_persist_a_pre_claim_deadline_with_batches_jsonl_and_leg_plan_json_directories_still_emits_the_summary_and_exits_3(self) -> None:
+        # the pre-claim DEADLINE exit (the 3 h budget is spent) wrote its receipt outside any try: an unwritable batches.jsonl threw out of the script. leg-plan.json as a directory is
+        # never touched on this path (it is written once the claim is held) and must change nothing.
+        self.claims.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        rows = [{"venue": "bachelor", "leaseId": "old-1", "startUtc": utc_iso(now - timedelta(minutes=105)), "endUtc": utc_iso(now - timedelta(minutes=60))},
+                {"venue": "bachelor", "leaseId": "old-2", "startUtc": utc_iso(now - timedelta(minutes=45)), "endUtc": utc_iso(now - timedelta(minutes=1))}]
+        (self.claims / "bachelor.lease-ledger.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
+        self._occupy_with_directory("leg-plan.json", "batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (3, "DEADLINE", 0, 4))
+        self._assert_persist_failure_said(r, res, "batches.jsonl")
+        self.assertEqual(self.kinds(), [], "no claim, no open")
+
+    def test_persist_an_otherwise_successful_batch_whose_receipt_cannot_be_written_exits_13_with_the_summary(self) -> None:
+        # nothing else went wrong: every leg ran. The receipt is not on disk, so the run must not claim success: exit 13, the legs still reported as RAN in the summary.
+        self._occupy_with_directory("batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["counted"], res["notRun"]), (13, "RECEIPT_PERSIST_FAILED", 4, 4, 0))
+        self._assert_persist_failure_said(r, res, "batches.jsonl")
+        self.assertEqual([x["endReason"] for x in res["batches"]], ["ALL_LEGS_DONE"])
+        self.assertTrue((self.run_dir / "batch-01.json").is_file())
+
+    def test_persist_a_batch_receipt_file_that_is_a_directory_is_reported_and_the_jsonl_line_is_still_written(self) -> None:
+        # the two receipt writes are independent: batch-01.json failing must not skip the batches.jsonl line (the other copy of the same record)
+        self._occupy_with_directory("batch-01.json")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["ran"]), (13, 4))
+        self._assert_persist_failure_said(r, res, "batch-01.json")
+        [b] = self.batches()
+        self.assertEqual(b["endReason"], "ALL_LEGS_DONE")
+
+    def test_persist_adv_a1_a_log_failure_in_the_persist_diagnostic_is_counted_in_the_receipt_written_after_it(self) -> None:
+        # adversary r1 A1: the batch snapshots logWriteFailures before Write-BatchReceipt; the RECEIPT_PERSIST_FAILED line for batch-01.json (a directory) then failed to log (batch.log held),
+        # which bumped the live counter, and the batches.jsonl line was serialized from the stale snapshot (0) while the summary said more. Each receipt is serialized with the live count.
+        self._occupy_with_directory("batch-01.json")
+        (self.run_dir / "batch.log").write_text("", encoding="utf-8")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        runner, paused, locked = self._runner_paused_at_claim_taken("RECEIPT_PERSIST_FAILED")
+        args[args.index("-File") + 1] = str(runner)
+        done, t, state = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", paused, locked)
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+        except subprocess.TimeoutExpired as ex:
+            self.fail(f"the process did not end within 90 s: {ex.stdout!r}")
+        finally:
+            done.set()
+            t.join(5)
+        self._assert_handshake(state, "RECEIPT_PERSIST_FAILED", r)
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertGreaterEqual(res["logWriteFailures"], 1)
+        [b] = self.batches()
+        self.assertGreaterEqual(b["logWriteFailures"], 1, "the surviving batches.jsonl line carries the failure the diagnostic itself hit")
+
+    def test_persist_a_leg_failure_keeps_its_exit_7_when_the_receipt_cannot_be_written_either(self) -> None:
+        # 13 replaces only a clean 0: a run that already selected a failing code keeps it, and the summary still names the unwritten receipt
+        self._occupy_with_directory("batches.jsonl")
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), FAKE_LEG_MODES="exit3")
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["failed"]), (7, None, 1))
+        self._assert_persist_failure_said(r, res, "batches.jsonl")
+
+    def test_persist_a_clean_run_reports_no_persist_failure(self) -> None:
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["receiptPersistFailures"], res["logWriteFailures"]), (0, [], 0))
+        self.assertNotIn("RECEIPT_PERSIST_FAILED", r.stdout)
+
+    # r2 (Dot advisory on #704): the generated-runner pause helper embedded its paths unescaped in a PowerShell single-quoted literal (an apostrophe in the temp dir broke the runner),
+    # and two receipt-write paths had no test: the batch-NN.json rewrite when only the diagnostic's own log write fails, and both receipt destinations failing at once.
+    def _run_with_log_held_at(self, args: list[str], e: dict, message: str, release_at: str = "", give_up_s: float = 120, more: tuple = ()) -> tuple[subprocess.CompletedProcess, dict]:
+        """Run `args` on a runner copy that pauses at the first log line starting `message`, with batch.log held exclusively from that moment (until the first line starting `release_at`
+        once held, else until the run ends); `more` is further (old, new) runner patches. Returns (result, the lock helper's state); the caller asserts it with _assert_handshake."""
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "batch.log").write_text("", encoding="utf-8")
+        runner, paused, locked = self._runner_paused_at_claim_taken(message, release_at, more)
+        args[args.index("-File") + 1] = str(runner)
+        done, t, state = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", paused, locked, give_up_s)
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+        except subprocess.TimeoutExpired as ex:
+            self.fail(f"the process did not end within 90 s: {ex.stdout!r}")
+        finally:
+            done.set()
+            t.join(5)
+        return r, state
+
+    def _run_plan_with_log_held_at(self, message: str, give_up_s: float = 120) -> tuple[subprocess.CompletedProcess, dict]:
+        """The A/B plan under _run_with_log_held_at."""
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        return self._run_with_log_held_at(args, e, message, give_up_s=give_up_s)
+
+    def test_r2_nit_a_case_dir_with_an_apostrophe_does_not_break_the_generated_runner_or_its_pause_markers(self) -> None:
+        # Dot nit (source-confirmed at 1a880fee): `-LiteralPath '{paused}'` and `'{locked}'` were embedded unescaped, so a temp dir such as C:\...\case-o'brien-x made the generated runner
+        # unparseable (the process died before it paused). Every path embedded in a generated PowerShell literal now goes through psq (the quote doubled).
+        self._init_case(Path(tempfile.mkdtemp(prefix="case-o'brien-", dir=self.tmp)))
+        self._stage_case()
+        self.assertIn("'", str(self.case))
+        self.assertEqual(psq("a'b''c"), "a''b''''c")
+        # r3 (sol r2b B2): no short give-up any more; a slow start is waited out (the run's own 90 s bound ends the wait), and a runner that never pauses fails by name
+        r, state = self._run_plan_with_log_held_at("CLAIM_TAKEN")
+        self._assert_handshake(state, "CLAIM_TAKEN", r)
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (12, "BATCH_ERROR"))
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_r2_adv_a1_psq_escapes_every_quote_character_powershell_treats_as_a_single_quote(self) -> None:
+        # adversary r2 A1 (advisory, introduced by psq): PowerShell's tokenizer also takes U+2018, U+2019, U+201A and U+201B as single quotes, so a temp dir such as C:\temp\o<U+2019>Brien
+        # ended the literal early even with the ASCII quote doubled. Each character, alone and inside a path, must parse and come back unchanged.
+        samples = ["C:\\temp\\o'Brien", "C:\\temp\\o\u2018Brien", "C:\\temp\\o\u2019Brien", "C:\\temp\\o\u201aBrien", "C:\\temp\\o\u201bBrien", "\u2019\u2019", "plain"]
+        lines = [f"$v = '{psq(s)}'; ($v.ToCharArray() | ForEach-Object {{ [int]$_ }}) -join ','" for s in samples]
+        script = self.case / "psq-probe.ps1"
+        script.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(r.stdout.split(), [",".join(str(ord(c)) for c in s) for s in samples], r.stdout + r.stderr)
+
+    def test_r2_cov_a_jsonl_append_failure_whose_diagnostic_cannot_be_logged_rewrites_batch_receipt_with_the_count_and_exits_13(self) -> None:
+        # batch-01.json is written first (count 0) and succeeds; the batches.jsonl append fails (a directory); its RECEIPT_PERSIST_FAILED line cannot be logged (batch.log held), which bumps
+        # logWriteFailures; so the already-written batch-01.json is rewritten with the live count (Write-BatchReceipt's second per-batch write). The typed record and exit 13 are unchanged.
+        self._occupy_with_directory("batches.jsonl")
+        r, state = self._run_plan_with_log_held_at("RECEIPT_PERSIST_FAILED")
+        self._assert_handshake(state, "RECEIPT_PERSIST_FAILED", r)
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["counted"]), (13, "RECEIPT_PERSIST_FAILED", 4, 4))
+        self._assert_persist_failure_said(r, res, "batches.jsonl")
+        self.assertGreaterEqual(res["logWriteFailures"], 1, "the diagnostic's own log failure is counted")
+        per_batch = json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))
+        self.assertEqual(per_batch["endReason"], "ALL_LEGS_DONE")
+        self.assertGreaterEqual(per_batch["logWriteFailures"], 1, "batch-01.json was rewritten once the diagnostic's log failure was counted")
+        self.assertLessEqual(per_batch["logWriteFailures"], res["logWriteFailures"], "lines logged after the rewrite (the result line) may add more, never fewer")
+
+    def test_r2_cov_both_receipt_destinations_failing_are_both_named_and_the_clean_run_exits_13(self) -> None:
+        self._occupy_with_directory("batch-01.json", "batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["counted"], res["notRun"]), (13, "RECEIPT_PERSIST_FAILED", 4, 4, 0))
+        self._assert_persist_failure_said(r, res, "batch-01.json", "batches.jsonl")
+        self.assertEqual(sorted(Path(f["file"]).name for f in res["receiptPersistFailures"]), ["batch-01.json", "batches.jsonl"])
+        self.assertEqual([x["endReason"] for x in res["batches"]], ["ALL_LEGS_DONE"], "the in-memory row is kept")
+
+    def test_r2_cov_both_receipt_destinations_failing_keep_exit_12_for_a_batch_error(self) -> None:
+        self._occupy_with_directory("leg-plan.json", "batch-01.json", "batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (12, "BATCH_ERROR", 0, 4))
+        self._assert_persist_failure_said(r, res, "batch-01.json", "batches.jsonl")
+
+    def test_r2_cov_both_receipt_destinations_failing_keep_exit_7_for_a_failed_leg(self) -> None:
+        self._occupy_with_directory("batch-01.json", "batches.jsonl")
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), FAKE_LEG_MODES="exit3")
+        self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["failed"]), (7, 1))
+        self._assert_persist_failure_said(r, res, "batch-01.json", "batches.jsonl")
+
+    def test_r2_cov_both_receipt_destinations_failing_keep_exit_3_for_a_pre_claim_deadline(self) -> None:
+        self.claims.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        rows = [{"venue": "bachelor", "leaseId": "old-1", "startUtc": utc_iso(now - timedelta(minutes=105)), "endUtc": utc_iso(now - timedelta(minutes=60))},
+                {"venue": "bachelor", "leaseId": "old-2", "startUtc": utc_iso(now - timedelta(minutes=45)), "endUtc": utc_iso(now - timedelta(minutes=1))}]
+        (self.claims / "bachelor.lease-ledger.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
+        self._occupy_with_directory("batch-01.json", "batches.jsonl")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (3, "DEADLINE", 0, 4))
+        self._assert_persist_failure_said(r, res, "batch-01.json", "batches.jsonl")
+
+    def test_r2_cov_both_receipt_destinations_failing_keep_exit_11_for_an_unreconciled_open(self) -> None:
+        self._occupy_with_directory("batch-01.json", "batches.jsonl")
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=12))
+        r = self.run_batch([self.specs[0]], "-DeadlineUtc", deadline, "-CancelReconcileSec", "3", FAKE_OPEN_MODES="gatehold")
+        self.assertEqual(r.returncode, 11, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (11, "OPEN_CANCEL_UNRECONCILED"))
+        self._assert_persist_failure_said(r, res, "batch-01.json", "batches.jsonl")
+
+    # r3 (sol r2b B1 = catalogue RPF-01): the receipt recovery returned, but the NEXT batch's BATCH_WAIT went through the throwing L outside the batch try, so a batch.log still held
+    # after the first RECEIPT_PERSIST_FAILED ended the script with an untyped exit 1 and no LEASE_BATCH_RESULT. This is a FULL-RUNNER run (the real runner, a copy that only adds the
+    # pause/release handshake to L), not an extracted replay: two batches (the first lease is too short for the second leg), a 4 s cooldown between them, batches.jsonl a directory,
+    # batch.log held from batch 1's RECEIPT_PERSIST_FAILED through batch 2's BATCH_WAIT and let go at batch 2's CLAIM_TAKEN.
+    def test_r3_b1_receipt_recovery_survives_a_later_batch_wait_whose_log_line_cannot_be_written(self) -> None:
+        self._occupy_with_directory("batches.jsonl")
+        args, e = self.batch_cmd(self.specs[:2], "-LeaseCooldownSec", "4", FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
+        r, state = self._run_with_log_held_at(args, e, "RECEIPT_PERSIST_FAILED", release_at="CLAIM_TAKEN batch=2 ")
+        self._assert_handshake(state, "RECEIPT_PERSIST_FAILED", r)
+        self.assertTrue(state["released"], "the lock was held through BATCH_WAIT and let go only at batch 2's CLAIM_TAKEN\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (13, "RECEIPT_PERSIST_FAILED", 2, 0))
+        self.assertEqual([(f["batch"], Path(f["file"]).name) for f in res["receiptPersistFailures"]], [(1, "batches.jsonl"), (2, "batches.jsonl")])
+        self.assertEqual([x["endReason"] for x in res["batches"]], ["LEASE_REMAINING_SHORT", "ALL_LEGS_DONE"])
+        self.assertIn(" BATCH_WAIT batch=2 reason=COOLDOWN", r.stdout, "the wait line still reaches stdout")
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        self.assertNotIn(" BATCH_WAIT batch=2 ", log, "the wait line was tried while batch.log was held (the case under test)")
+        self.assertIn(" CLAIM_TAKEN batch=2 ", log)
+        self.assertGreaterEqual(res["logWriteFailures"], 2, "the persist diagnostic and the wait line both failed to log")
+        self.assertIn("BATCH_LOG_FAILED", r.stderr)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_r3_b1_class_no_direct_log_call_sits_between_batches(self) -> None:
+        # the class of B1 (siblings CLAIM_LAPSED_IN_GUARD and CLAIM_HELD): between the top of the batch loop and the batch try, a log line is best effort (LogBest), never the throwing L
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("while ($pending.Count -gt 0 -and $null -eq $stopReason) {")
+        between = text[start:text.index('    try {\n        L "CLAIM_TAKEN', start)]
+        self.assertEqual(re.findall(r'(?<![\w-])L "[A-Z_]+', between), [], "a direct L call outside the batch try throws out of the script on a held batch.log")
+        self.assertIn('LogBest "BATCH_WAIT batch=', between)
+
+    def _two_batch_plan(self, inject: str, occupy: tuple = ("batches.jsonl",), extra: tuple = ()) -> tuple[list[str], dict, tuple[str, str]]:
+        """A two-leg plan whose first lease holds one leg (two batches), batches.jsonl a directory: (args, env, the runner patch that runs `inject` (PowerShell) in batch 2 just before
+        the claim-time input guard)."""
+        self._occupy_with_directory(*occupy)
+        spec2 = self.case / "fx-b-copy.json"
+        spec2.write_text(self.specs[1].read_text(encoding="utf-8"), encoding="utf-8")
+        plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(spec2, "A", self.commit_a)])
+        anchor = "        $hit = Get-InputOutputRefusal\n"   # the claim-time guard (the only 8-space one); independent of what follows it, so the same fixture runs on a runner without the sticky hit
+        args, e = self.plan_cmd(plan, *extra, FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
+        return args, e, (anchor, f"        if ($batchNo -eq 2) {{ {inject} }}\n" + anchor)
+
+    def _two_batch_plan_refused_at_batch_2(self, inject: str) -> tuple[subprocess.CompletedProcess, Path]:
+        args, e, patch = self._two_batch_plan(inject)
+        args[args.index("-File") + 1] = str(self._patched_runner(*patch))
+        return subprocess.run(args, capture_output=True, text=True, timeout=120, env=e), self.case / "fx-b-copy.json"
+
+    def test_r3_adv_a1_a_refusal_line_that_cannot_be_logged_is_in_the_count_the_summary_reports(self) -> None:
+        # adversary r3 pass 2 A1: the summary was printed BEFORE Stop-PlanRefused tried its own log line, and that append's failure was swallowed uncounted, so the authoritative
+        # result under-reported logWriteFailures. batch.log is held from batch 1's RECEIPT_PERSIST_FAILED to the end: that diagnostic, the refusal line, the NOT_RUN line and the
+        # result line all fail, and the summary, now the last thing written, counts all four.
+        args, e, patch = self._two_batch_plan("Set-Content -LiteralPath '{}' -Value '{{}}'".format(psq(self.case / "fx-b-copy.json")))
+        r, state = self._run_with_log_held_at(args, e, "RECEIPT_PERSIST_FAILED", more=(patch,))
+        self._assert_handshake(state, "RECEIPT_PERSIST_FAILED", r)
+        m = re.search(r"LEG_PLAN_REFUSED reason=(\S+) item=2 ", r.stderr)
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        self._assert_refused_at_batch_2_with_the_summary(r, m.group(1))
+        self.assertEqual(batch_result(r.stdout)["logWriteFailures"], 4, "the diagnostic, the refusal line, the NOT_RUN line and the result line\n" + r.stdout + r.stderr)
+        self.assertNotIn("LEG_PLAN_REFUSED", (self.run_dir / "batch.log").read_text(encoding="utf-8"), "the refusal line was tried while batch.log was held (the case under test)")
+
+    def _assert_refused_at_batch_2_with_the_summary(self, r: subprocess.CompletedProcess, reason: str) -> None:
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"LEG_PLAN_REFUSED reason={reason} item=2 ", r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (2, reason, 1, 1))
+        self.assertEqual([(f["batch"], Path(f["file"]).name) for f in res["receiptPersistFailures"]], [(1, "batches.jsonl")], "batch 1's lost receipt is summarized")
+        self.assertEqual([x["endReason"] for x in res["batches"]], ["LEASE_REMAINING_SHORT"])
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, "no lease is opened for batch 2")
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_r3_h3_an_input_refused_between_batches_after_a_persist_failure_still_prints_the_summary(self) -> None:
+        # opus r2b H3: Stop-InputIsOutput (exit 2) after batch 1's receipt could not be written printed no LEASE_BATCH_RESULT, so receiptPersistFailures was never summarized.
+        # A content refusal: the second leg's spec stops being a valid leg spec while batch 1 ran.
+        r, spec2 = self._two_batch_plan_refused_at_batch_2("Set-Content -LiteralPath '{}' -Value '{{}}'".format(psq(self.case / "fx-b-copy.json")))
+        m = re.search(r"LEG_PLAN_REFUSED reason=(\S+) item=2 ", r.stderr)
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        self._assert_refused_at_batch_2_with_the_summary(r, m.group(1))
+
+    def test_r3_h3_an_input_that_became_a_run_output_between_batches_prints_the_summary_and_writes_nothing_into_the_run_dir(self) -> None:
+        # the location refusal: the second leg's spec is now a hard link to batch-01.json. The summary is printed, and (Test-OpenOutputAlias's rule) nothing more is written into
+        # -RunDir: batch.log and the linked receipt are byte-for-byte what they were when the guard ran.
+        snap_log, snap_rec = self.case / "batch.log.snap", self.case / "batch-01.json.snap"
+        spec2 = psq(self.case / "fx-b-copy.json")
+        inject = (f"[IO.File]::Delete('{spec2}'); New-Item -ItemType HardLink -Path '{spec2}' -Value (Join-Path $RunDir 'batch-01.json') | Out-Null; "
+                  f"Copy-Item -LiteralPath $batchLog -Destination '{psq(snap_log)}'; Copy-Item -LiteralPath (Join-Path $RunDir 'batch-01.json') -Destination '{psq(snap_rec)}'")
+        r, _ = self._two_batch_plan_refused_at_batch_2(inject)
+        self._assert_refused_at_batch_2_with_the_summary(r, "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap_log.read_bytes(), "nothing was appended to batch.log after the alias was found")
+        self.assertEqual((self.run_dir / "batch-01.json").read_bytes(), snap_rec.read_bytes(), "the linked input is byte-unchanged")
+
+    def test_r4_adv_a1_the_batch_receipt_rewrite_does_not_overwrite_an_input_that_became_a_link_to_it_during_the_diagnostic(self) -> None:
+        # adversary r4 A1: batch-01.json is rewritten when the batches.jsonl diagnostic's own log failure bumped logWriteFailures. The diagnostic is the window: the next leg's spec becomes
+        # a hard link to batch-01.json there, after every alias guard has run, and the unconditional rewrite then overwrote the accepted input. The guard now runs right before the rewrite.
+        # The diagnostic's log line is made to fail (counted) and to link the spec first, inside a copy of the runner; the linked receipt must stay what the first write left.
+        snap = self.case / "batch-01.json.snap"
+        spec2 = psq(self.case / "fx-b-copy.json")
+        inject = (f"if (-not $script:LinkDone -and $Message.StartsWith('RECEIPT_PERSIST_FAILED', [StringComparison]::Ordinal)) {{ $script:LinkDone = $true; [IO.File]::Delete('{spec2}'); "
+                  f"New-Item -ItemType HardLink -Path '{spec2}' -Value (Join-Path $RunDir 'batch-01.json') | Out-Null; Copy-Item -LiteralPath (Join-Path $RunDir 'batch-01.json') -Destination '{psq(snap)}'; "
+                  "throw [IO.IOException]::new('locked') }")
+        args, e, _ = self._two_batch_plan("")
+        anchor_l = "function L([string]$Message) {\n"
+        args[args.index("-File") + 1] = str(self._patched_runner(anchor_l, anchor_l + "    " + inject + "\n"))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertTrue(snap.exists(), "the link was made inside the diagnostic (the case under test)\n" + r.stdout + r.stderr)
+        self.assertEqual((self.run_dir / "batch-01.json").read_bytes(), snap.read_bytes(), "the receipt rewrite went through the new link and overwrote the accepted input\n" + r.stdout + r.stderr)
+        self.assertIn("BATCH_RECEIPT_WRITE_SKIPPED batch=1 ", r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_SPEC_IS_RUN_OUTPUT", r.stderr + r.stdout)
+
+    def _link_spec2_to_a_receipt_inside_the_first_diagnostic(self, target: str, occupy: tuple, restore: bool = False, extra: tuple = ()) -> tuple[subprocess.CompletedProcess, Path, Path]:
+        """Two batches (batch 1 ran one leg); `occupy` receipt files are directories. The first RECEIPT_PERSIST_FAILED line, inside a copy of the runner, makes the second leg's spec a hard link to
+        RunDir\\<target> (snapshotting the receipt `target` first when it exists); with `restore`, batch 2's claim guard first unlinks it and puts the original spec bytes back.
+        Returns (result, the spec, the snapshot of the spec's original bytes)."""
+        spec2, original = self.case / "fx-b-copy.json", self.case / "fx-b-copy.json.orig"
+        ps2 = psq(spec2)
+        args, e, (guard_old, guard_new) = self._two_batch_plan("", occupy, extra)
+        original.write_bytes(spec2.read_bytes())
+        # a receipt that does not exist yet (batches.jsonl, batch-02.json) is created AS the link to the spec; one that exists (batch-01.json) is linked from the spec's path
+        make = (f"New-Item -ItemType HardLink -Path (Join-Path $RunDir '{target}') -Value '{ps2}' | Out-Null" if target != "batch-01.json"
+                else f"[IO.File]::Delete('{ps2}'); New-Item -ItemType HardLink -Path '{ps2}' -Value (Join-Path $RunDir '{target}') | Out-Null")
+        link = (f"if (-not $script:LinkDone -and $Message.StartsWith('RECEIPT_PERSIST_FAILED', [StringComparison]::Ordinal)) {{ $script:LinkDone = $true; {make}; "
+                "throw [IO.IOException]::new('locked') }")
+        anchor_l = "function L([string]$Message) {\n"
+        patches = [(anchor_l, anchor_l + "    " + link + "\n")]
+        if restore:
+            undo = f"[IO.File]::Delete('{ps2}'); [IO.File]::Copy('{psq(original)}', '{ps2}')"
+            patches.append((guard_old, f"        if ($batchNo -eq 2) {{ {undo} }}\n" + guard_old))
+        args[args.index("-File") + 1] = str(self._patched_runner(*patches[0], *patches[1:]))
+        return subprocess.run(args, capture_output=True, text=True, timeout=120, env=e), spec2, original
+
+    def test_r4_adv2_a1_the_jsonl_line_is_not_appended_to_an_input_that_became_a_link_to_batches_jsonl_during_the_diagnostic(self) -> None:
+        # adversary r4 pass 2 A1: the batches.jsonl append (and the pre-claim deadline path's receipt writes) had no alias guard, only the rewrite did. batch-01.json is a directory, so its
+        # diagnostic runs first; in it the second leg's spec becomes batches.jsonl itself. Every receipt write now asks (Write-ReceiptFile), so the append is skipped.
+        r, spec2, original = self._link_spec2_to_a_receipt_inside_the_first_diagnostic("batches.jsonl", ("batch-01.json",))
+        self.assertEqual(spec2.read_bytes(), original.read_bytes(), "the receipt line was appended into the accepted input\n" + r.stdout + r.stderr)
+        self.assertIn("BATCH_RECEIPT_WRITE_SKIPPED batch=1 ", r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_SPEC_IS_RUN_OUTPUT", r.stderr + r.stdout)
+
+    def test_r4_adv2_a1_the_pre_claim_deadline_receipt_is_not_written_through_an_input_that_became_a_link_to_it(self) -> None:
+        # adversary r4 pass 2 A1, sibling (the pre-claim deadline path, which writes batch-02.json before any claim guard): the second leg's spec becomes batch-02.json inside batch 1's
+        # diagnostic, and a 1800 s cooldown sends batch 2 to the deadline path, whose receipt write would overwrite the spec.
+        r, spec2, original = self._link_spec2_to_a_receipt_inside_the_first_diagnostic("batch-02.json", ("batch-01.json",), extra=("-LeaseCooldownSec", "1800"))
+        self.assertEqual(spec2.read_bytes(), original.read_bytes(), "the deadline path's receipt was written into the accepted input\n" + r.stdout + r.stderr)
+        self.assertIn("BATCH_RECEIPT_WRITE_SKIPPED batch=1 ", r.stderr)   # batch-01.json is a directory (no rewrite guard behind it): the batches.jsonl append is the guarded write
+        self.assertIn("BATCH_RECEIPT_NOT_WRITTEN batch=2 ", r.stderr)
+
+    def test_r4_adv2_a2_an_alias_seen_while_a_receipt_was_written_stays_seen_after_the_link_is_gone(self) -> None:
+        # adversary r4 pass 2 A2: the skipped rewrite turned the suppression on but saved no hit, so a link removed (and the spec restored) before batch 2's claim guard let batch 2 write
+        # leg-plan.json, open a lease and run a probe and a leg despite the announced suppression. The hit is sticky: batch 2's guard re-reports it, so the run ends in the typed refusal.
+        r, spec2, original = self._link_spec2_to_a_receipt_inside_the_first_diagnostic("batch-01.json", ("batches.jsonl",), restore=True)
+        self.assertEqual(spec2.read_bytes(), original.read_bytes(), "the spec was restored by the test before batch 2's guard (the case under test)")
+        m = re.search(r"LEG_PLAN_REFUSED reason=(\S+) item=2 ", r.stderr)
+        self.assertIsNotNone(m, r.stdout + r.stderr)
+        self.assertEqual(m.group(1), "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, "no lease is opened for batch 2")
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (2, "LEG_SPEC_IS_RUN_OUTPUT", 1, 1))
+
+    def test_r4_adv_a1_the_batch_receipt_rewrite_still_happens_when_no_input_is_a_run_output(self) -> None:
+        # the control: the same diagnostic log failure with no link rewrites batch-01.json with the count (r2's second per-batch write), so the new guard changes nothing else
+        anchor_l = "function L([string]$Message) {\n"
+        args, e, _ = self._two_batch_plan("")
+        args[args.index("-File") + 1] = str(self._patched_runner(anchor_l, anchor_l + "    if ($Message.StartsWith('RECEIPT_PERSIST_FAILED', [StringComparison]::Ordinal)) { throw [IO.IOException]::new('locked') }\n"))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 13, r.stdout + r.stderr)
+        self.assertGreaterEqual(json.loads((self.run_dir / "batch-01.json").read_text(encoding="utf-8"))["logWriteFailures"], 1, "batch-01.json was rewritten with the diagnostic's log failure")
+        self.assertNotIn("BATCH_RECEIPT_WRITE_SKIPPED", r.stderr)
+
+    # r5 (opus r4b B1 = sol r4b B1 = adversary r4b OPEN A1; catalogue RPF-04, RPF-05; folds LEASE-BATCH-FINAL-RECEIPT-ALIAS-EXIT-1): a receipt write the input guard skipped recorded nothing,
+    # and only the NEXT batch's claim guard read the saved hit, so on the final batch the run exited 0 with neither receipt on disk. And an input that could not be opened (a spec that already
+    # ran, deleted) was taken for "an input is a runner output". Each case changes an input inside a copy of the runner, at the receipt write it names.
+    _FINAL_RECEIPT = "        Write-BatchReceipt $b\n    }\n}\nWrite-RunSummary\n"
+    _PRECLAIM_DEADLINE = "reason=DEADLINE detail=$($b.endDetail)\"   # r7 (sol r6b): the line is tried before the receipt snapshots logWriteFailures\n"
+    _CLAIM_HELD_DEADLINE = "reason=DEADLINE detail=claim-held\"   # r7 (sol r6b): the line is tried before the receipt snapshots logWriteFailures\n"
+
+    def _r5_spec(self, name: str, src: Path) -> Path:
+        p = self.case / "r5" / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(src.read_bytes())
+        return p
+
+    def _r5_link_to_batch_log(self, spec: Path) -> tuple[str, Path]:
+        """PowerShell that makes `spec` a hard link to RunDir\\batch.log and snapshots batch.log; (the code, the snapshot)."""
+        snap, s = self.case / "r5-batch.log.snap", psq(spec)
+        return (f"[IO.File]::Delete('{s}'); New-Item -ItemType HardLink -Path '{s}' -Value (Join-Path $RunDir 'batch.log') | Out-Null; "
+                f"Copy-Item -LiteralPath (Join-Path $RunDir 'batch.log') -Destination '{psq(snap)}'"), snap
+
+    def _r5_run(self, args: list[str], e: dict, anchor: str, inject: str, batch: int = 0) -> subprocess.CompletedProcess:
+        """Run `args` on a runner copy that runs `inject` at `anchor` (before the final receipt write, in batch `batch` when > 0; after a deadline anchor's line)."""
+        if anchor == self._FINAL_RECEIPT:
+            new = f"        if ({'$true' if batch <= 0 else f'$batchNo -eq {batch}'}) {{ {inject} }}\n" + anchor
+        else:
+            new = anchor + ("            " if anchor == self._PRECLAIM_DEADLINE else "        ") + inject + "\n"
+        args[args.index("-File") + 1] = str(self._patched_runner(anchor, new))
+        return subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+
+    def _r5_assert_suppressed(self, res: dict, reason: str, batches: tuple = (1,)) -> None:
+        got = sorted((f["batch"], Path(f["file"]).name) for f in res["receiptPersistFailures"])
+        self.assertEqual(got, sorted((b, n) for b in batches for n in (f"batch-{b:02d}.json", "batches.jsonl")), res["receiptPersistFailures"])
+        for f in res["receiptPersistFailures"]:
+            self.assertTrue(f["reason"].startswith(f"WRITE_SUPPRESSED {reason}"), f)
+            self.assertEqual(f["suppressedBy"], reason, f)
+
+    def test_r5_b1_rpf04_a_final_batch_alias_seen_at_the_receipt_write_is_a_typed_nonzero_exit_naming_both_receipts(self) -> None:
+        for form in ("plan", "scalar"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                link, snap = self._r5_link_to_batch_log(spec)
+                args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)])) if form == "plan" else self.batch_cmd([spec])
+                r = self._r5_run(args, e, self._FINAL_RECEIPT, link)
+                self.assertTrue(snap.exists(), "the link was made before the final receipt write (the case under test)\n" + r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 2, "a lost receipt was an exit 0\n" + r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"]), (2, "LEG_SPEC_IS_RUN_OUTPUT", 1))
+                self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+                self.assertFalse((self.run_dir / "batch-01.json").exists())
+                self.assertFalse((self.run_dir / "batches.jsonl").exists())
+                self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes(), "nothing was appended to the linked batch.log")
+                self.assertEqual(res["logWriteFailures"], 0, "the suppressed result-line append is no log failure")
+                self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=LEG_SPEC_IS_RUN_OUTPUT", r.stderr)
+                self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+
+    def test_r5_b1_rpf05_a_final_batch_spec_that_already_ran_and_was_deleted_is_input_vanished_with_the_receipts_written(self) -> None:
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Delete('{psq(spec)}')")
+        self.assertFalse(spec.exists(), "the spec was deleted (the case under test)")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"], res["logWriteFailures"]), (2, "INPUT_VANISHED", 1, [], 0))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr, "a deleted input is not a runner output")
+        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "a deleted input suppresses no receipt")
+        [b] = self.batches()
+        self.assertEqual(b["endReason"], "ALL_LEGS_DONE")
+        self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=INPUT_VANISHED item=1 ", r.stderr)
+
+    def test_r5b_b1_a_final_batch_spec_that_is_there_but_will_not_open_is_input_unreadable_with_the_receipts_written(self) -> None:
+        # r5b (item (c)'s other half): a spec that already ran is replaced by a junction to a folder that does not exist: the name is there, nothing opens through it. INPUT_UNREADABLE, not a
+        # runner output: the receipts are written and the run still ends on it (exit 2), never exit 0.
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        nowhere = psq(self.case / "r5" / "no-such-folder")
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Delete('{psq(spec)}'); [void][IO.Directory]::CreateDirectory('{nowhere}'); "
+                         f"New-Item -ItemType Junction -Path '{psq(spec)}' -Value '{nowhere}' | Out-Null; [IO.Directory]::Delete('{nowhere}')")
+        self.assertTrue(os.path.lexists(spec) and not spec.exists(), "the spec is a dangling junction (the case under test)\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        # r7 (sol r6 B2; RPF-09): an input that is there and will not resolve may reach any destination through a link on its side, so no existing receipt destination is written
+        # any more: both receipts are typed suppressed (batch.log, which exists, turns the suppression on), never written. The typing r5b set is unchanged.
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["logWriteFailures"]), (2, "INPUT_UNREADABLE", 1, 0))
+        self._r5_assert_suppressed(res, "INPUT_UNREADABLE")
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr, "an input that will not open is not a runner output")
+        self.assertFalse((self.run_dir / "batch-01.json").exists(), "no receipt is written while an input that is there will not resolve")
+        self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=INPUT_UNREADABLE item=1 ", r.stderr)
+
+    def test_r5b_adv_a1_an_input_replaced_by_a_folder_during_the_final_batch_is_input_unreadable_never_exit_0(self) -> None:
+        # adversary r5b A1: a folder opens like a file (BACKUP_SEMANTICS), is no runner output and (scalar form, the plan file) has no content check, so an accepted input replaced by an
+        # empty folder after its leg ran was no hit at all and the run ended exit 0. Each input kind: the spec (both forms), the plan file, the staged build manifest.
+        for form in ("scalar spec", "plan spec", "plan file", "build manifest"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                if form == "scalar spec":
+                    args, e = self.batch_cmd([spec])
+                else:
+                    args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                target = {"plan file": self.case / "plan.json", "build manifest": self._staged_manifest(self.commit_a)}.get(form, spec)
+                r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Delete('{psq(target)}'); [void][IO.Directory]::CreateDirectory('{psq(target)}')")
+                self.assertTrue(target.is_dir(), "the input is a folder now (the case under test)\n" + r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 2, "an input that is a folder now was an exit 0\n" + r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"], res["logWriteFailures"]), (2, "INPUT_UNREADABLE", 1, [], 0))
+                self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+                self.assertTrue((self.run_dir / "batch-01.json").is_file(), "a folder at an input's name suppresses no receipt")
+                self.assertEqual(len(self.batches()), 1)
+                self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=INPUT_UNREADABLE", r.stderr)
+
+    def test_r5b_adv2_a1_a_staged_manifest_gone_after_the_final_leg_ends_the_run_on_it_never_exit_0(self) -> None:
+        # adversary r5b pass 2 A1: a staged manifest that is gone skips the location guard (BUILD_NOT_STAGED is the content guard's), and the receipt guard kept only unresolved hits,
+        # so that content hit was dropped and the run ended exit 0. Every hit the receipt guard sees is kept: the receipts are written and the run ends on it.
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        manifest = self._staged_manifest(self.commit_a)
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Delete('{psq(manifest)}')")
+        self.assertFalse(manifest.exists(), "the staged manifest was deleted (the case under test)")
+        self.assertEqual(r.returncode, 2, "a manifest gone after the final leg was an exit 0\n" + r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"]), (2, "BUILD_NOT_STAGED", 1, []))
+        self.assertTrue((self.run_dir / "batch-01.json").is_file())
+        self.assertEqual(len(self.batches()), 1)
+        self.assertIn("BATCH_RECEIPT_INPUT_CHANGED batch=1 reason=BUILD_NOT_STAGED", r.stderr)
+        self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=BUILD_NOT_STAGED", r.stderr)
+
+    def test_r5b_adv2_a2_a_spec_whose_data_cannot_be_read_is_input_unreadable_never_exit_0(self) -> None:
+        # adversary r5b pass 2 A2: the guard's opens ask for no access, so a spec whose FILE_READ_DATA is denied (metadata still readable) passed them, and the scalar form has no
+        # content check: exit 0. The input is now opened for reading: INPUT_UNREADABLE, the receipts written, exit 2.
+        for form in ("scalar", "plan"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                self.addCleanup(subprocess.run, ["icacls", str(spec), "/reset"], capture_output=True)
+                args, e = self.batch_cmd([spec]) if form == "scalar" else self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                deny = f"$null = icacls '{psq(spec)}' /deny ([Security.Principal.WindowsIdentity]::GetCurrent().Name + ':(RD)')"
+                r = self._r5_run(args, e, self._FINAL_RECEIPT, deny)
+                with self.assertRaises(PermissionError, msg="the spec's data cannot be read (the case under test)"):
+                    spec.read_bytes()
+                self.assertEqual(r.returncode, 2, "an unreadable spec was an exit 0\n" + r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"]), (2, "INPUT_UNREADABLE", 1, []))
+                self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+                self.assertTrue((self.run_dir / "batch-01.json").is_file())
+                subprocess.run(["icacls", str(spec), "/reset"], capture_output=True)
+
+    def test_r5b_adv_a2_a_plan_missing_only_while_one_guard_ran_is_no_alias_and_suppresses_nothing(self) -> None:
+        # adversary r5b A2: the guard failed to open the plan (moved away in a save-as-rename), the plan was back before Get-InputUnresolvedCode probed it, and that stale failure was
+        # labelled LEG_PLAN_IS_RUN_OUTPUT: both receipts suppressed, exit 2. Only a refusal reached with the input itself open is an alias; this one is asked again and is clean.
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+        args, e = self.plan_cmd(plan)
+        p, away = psq(plan), psq(plan) + ".away"
+        # the probe's own signature, whichever form the runner has (r5b pass 2 added -SkipRead)
+        anchor = next(a for a in ("function Get-InputUnresolvedCode([string]$Path, [switch]$SkipRead) {\n", "function Get-InputUnresolvedCode([string]$Path) {\n")
+                      if a in RUNNER.read_text(encoding="utf-8"))
+        restore = anchor + f"    if ([IO.File]::Exists('{away}')) {{ [IO.File]::Move('{away}', '{p}') }}\n"
+        new = f"        if ($true) {{ [IO.File]::Move('{p}', '{away}') }}\n" + self._FINAL_RECEIPT
+        args[args.index("-File") + 1] = str(self._patched_runner(self._FINAL_RECEIPT, new, (anchor, restore)))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        self.assertTrue(plan.is_file() and not Path(str(plan) + ".away").exists(), "the plan was moved away and back (the case under test)\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["receiptPersistFailures"], res["logWriteFailures"]), (0, None, [], 0))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+        self.assertNotIn("BATCH_RECEIPT_WRITE_SKIPPED", r.stderr)
+        self.assertTrue((self.run_dir / "batch-01.json").is_file())
+        self.assertEqual(len(self.batches()), 1)
+
+    def test_r5_b1_a_leg_plan_moved_away_during_the_final_batch_is_input_vanished_and_one_replaced_in_full_is_clean(self) -> None:
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+        args, e = self.plan_cmd(plan)
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Move('{psq(plan)}', '{psq(plan)}.away')")
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["stopReason"], res["receiptPersistFailures"]), ("INPUT_VANISHED", []))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+        self.assertTrue((self.run_dir / "batch-01.json").is_file())
+        # the control: the plan replaced in one step (rename over it) is never missing, so the run is clean: exit 0, both receipts on disk
+        self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+        self._stage_case()
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+        args, e = self.plan_cmd(plan)
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Copy('{psq(plan)}', '{psq(plan)}.new'); [IO.File]::Move('{psq(plan)}.new', '{psq(plan)}', $true)")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["receiptPersistFailures"]), (0, None, []))
+        self.assertTrue((self.run_dir / "batch-01.json").is_file())
+        self.assertEqual(len(self.batches()), 1)
+
+    # PR 704 r6 (sol r5b B1 = Dot A1 = adversary dc9b06a6 OPEN A1; card LEASE-BATCH-ZONE-UNRESOLVED-LABEL-1; catalogue RPF-06): an OUTPUT the guard could not inspect at the final receipt write
+    # (a dangling runner-owned link in -RunDir, a link that will not resolve, a zone that will not list, an output that will not identify) was caught as "the input cannot be resolved" and
+    # labelled an input alias: both writable receipts suppressed, stop LEG_*_IS_RUN_OUTPUT, though no input aliased an output. It is OUTPUT_ZONE_UNRESOLVED now, exit 2, the receipts written.
+    _RPF06_ZONE_LIST = "            foreach ($c in @(Get-ChildItem -LiteralPath $z.root -Force -ErrorAction Stop | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint })) {\n"
+    _RPF06_SCAN_ID = "                    if (((Get-FileIdentity $c.FullName).key -ceq $id.key)"
+    _RPF06_RESOLVE = "[VenueLeaseBatchFinalPath]::Resolve([IO.Path]::GetFullPath($Path))"
+
+    def _rpf06_dangling(self, at: Path) -> str:
+        """PowerShell that makes `at` a junction to a folder that no longer exists (the link is there; nothing resolves through it)."""
+        nowhere = psq(self.case / "rpf06-no-such-folder")
+        return f"[void][IO.Directory]::CreateDirectory('{nowhere}'); New-Item -ItemType Junction -Path '{psq(at)}' -Value '{nowhere}' | Out-Null; [IO.Directory]::Delete('{nowhere}')"
+
+    def _rpf06_run(self, args: list[str], e: dict, inject: str, *more: tuple[str, str]) -> subprocess.CompletedProcess:
+        args[args.index("-File") + 1] = str(self._patched_runner(self._FINAL_RECEIPT, f"        if ($true) {{ {inject} }}\n" + self._FINAL_RECEIPT, *more))
+        return subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+
+    def _rpf06_assert_typed_and_written(self, r: subprocess.CompletedProcess) -> dict:
+        self.assertEqual(r.returncode, 2, "an output that could not be inspected was not its own typed stop\n" + r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["receiptPersistFailures"]), (2, "OUTPUT_ZONE_UNRESOLVED", 1, []), r.stderr)
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr, "no input aliases an output")
+        self.assertNotIn("BATCH_RECEIPT_WRITE_SKIPPED", r.stderr)
+        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "a receipt no real alias threatens is written")
+        self.assertEqual(len(self.batches()), 1, "batches.jsonl has its line")
+        self.assertIn("BATCH_RECEIPT_OUTPUT_UNRESOLVED batch=1 reason=OUTPUT_ZONE_UNRESOLVED", r.stderr)
+        self.assertIn("BATCH_RECEIPT_GUARD_STOP reason=OUTPUT_ZONE_UNRESOLVED", r.stderr)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+        return res
+
+    def test_rpf06_b1_a_dangling_runner_owned_link_at_the_final_receipt_is_output_zone_unresolved_never_an_input_alias(self) -> None:
+        # (a) scalar spec, (b) plan: RunDir\gate.log (runner-owned) becomes a link to nothing after the final BATCH_END; the inputs are untouched and open
+        for form in ("scalar spec", "plan"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                args, e = self.batch_cmd([spec]) if form == "scalar spec" else self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                gate = self.run_dir / "gate.log"
+                r = self._rpf06_run(args, e, f"[IO.File]::Delete('{psq(gate)}'); " + self._rpf06_dangling(gate))
+                self.assertTrue(os.path.lexists(gate) and not gate.exists(), "gate.log is a dangling link (the case under test)\n" + r.stdout + r.stderr)
+                self._rpf06_assert_typed_and_written(r)
+
+    def test_rpf06_c_an_output_that_will_not_identify_in_a_build_manifests_hard_link_scan_is_output_zone_unresolved(self) -> None:
+        # (c) the staged build manifest has a second name (outside every zone), so only its guard scans the outputs by identity, and that scan throws: BUILD_MANIFEST_IS_RUN_OUTPUT before
+        manifest = self._staged_manifest(self.commit_a)
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        other = self.case / "rpf06-manifest-second-name.json"
+        r = self._rpf06_run(args, e, f"New-Item -ItemType HardLink -Path '{psq(other)}' -Value '{psq(manifest)}' | Out-Null; $script:rpf06ScanThrow = $true",
+                            (self._RPF06_SCAN_ID, "                    if ($script:rpf06ScanThrow) { throw 'injected: an output will not identify' }\n" + self._RPF06_SCAN_ID))
+        self.assertTrue(other.is_file(), "the manifest has a second name (the case under test)\n" + r.stdout + r.stderr)
+        self._rpf06_assert_typed_and_written(r)
+        self.assertIn("injected: an output will not identify", r.stderr, "the reason names the output's failure")
+
+    def test_rpf06_d_an_output_link_whose_resolution_throws_after_the_inputs_open_is_output_zone_unresolved(self) -> None:
+        # (d) gate.log is a junction to a folder that exists (outside every input), and resolving it throws: the inputs opened first, so the throw is the output's
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        gate, there = self.run_dir / "gate.log", self.case / "rpf06-gate-target"
+        r = self._rpf06_run(args, e, f"[IO.File]::Delete('{psq(gate)}'); [void][IO.Directory]::CreateDirectory('{psq(there)}'); New-Item -ItemType Junction -Path '{psq(gate)}' -Value '{psq(there)}' | Out-Null; $script:rpf06ResolveThrow = $true",
+                            (self._RPF06_RESOLVE, f"if ($script:rpf06ResolveThrow -and $Path -like '*\\gate.log') {{ throw 'injected: the output link will not resolve' }}; " + self._RPF06_RESOLVE))
+        self.assertTrue(gate.is_dir(), "gate.log is a junction (the case under test)\n" + r.stdout + r.stderr)
+        self._rpf06_assert_typed_and_written(r)
+
+    def test_rpf06_e_an_output_zone_that_will_not_list_at_the_final_receipt_is_output_zone_unresolved(self) -> None:
+        # (e) the -RunDir zone's listing throws (scalar and plan)
+        for form in ("scalar spec", "plan"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                args, e = self.batch_cmd([spec]) if form == "scalar spec" else self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                r = self._rpf06_run(args, e, "$script:rpf06ZoneThrow = $true",
+                                    (self._RPF06_ZONE_LIST, "            if ($script:rpf06ZoneThrow) { throw 'injected: the zone will not list' }\n" + self._RPF06_ZONE_LIST))
+                self._rpf06_assert_typed_and_written(r)
+
+    def test_rpf06_f_a_dangling_link_at_a_receipts_own_name_suppresses_that_receipt_only(self) -> None:
+        # the file-by-file check: batch-01.json itself is a link to nothing, so where its write lands is unknown: that receipt is suppressed (typed), batches.jsonl is still written
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        per = self.run_dir / "batch-01.json"
+        r = self._rpf06_run(args, e, self._rpf06_dangling(per))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"]), (2, "OUTPUT_ZONE_UNRESOLVED", 1))
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+        self.assertEqual([Path(f["file"]).name for f in res["receiptPersistFailures"]], ["batch-01.json"], res["receiptPersistFailures"])
+        [f] = res["receiptPersistFailures"]
+        self.assertEqual(f["suppressedBy"], "OUTPUT_ZONE_UNRESOLVED")
+        self.assertIn("this receipt file only", f["reason"])
+        self.assertEqual(len(self.batches()), 1, "batches.jsonl is still written")
+
+    def test_rpf06_g_a_real_alias_the_unlistable_zone_hides_still_suppresses_every_write(self) -> None:
+        # the control the per-file check must keep: the zone will not list, so the guard cannot see that the spec is a hard link to batch.log; the batch.log check sees it and turns the
+        # suppression on: no receipt is written, nothing is appended to batch.log, both lost receipts are named, exit 2
+        # r9 (sol r8 B1; RPF-10): typed by batch.log's own hit (the spec IS batch.log: LEG_SPEC_IS_RUN_OUTPUT), no longer by the earlier OUTPUT_ZONE_UNRESOLVED that hid it
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        link, snap = self._r5_link_to_batch_log(spec)
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        r = self._rpf06_run(args, e, link + "; $script:rpf06ZoneThrow = $true",
+                            (self._RPF06_ZONE_LIST, "            if ($script:rpf06ZoneThrow) { throw 'injected: the zone will not list' }\n" + self._RPF06_ZONE_LIST))
+        self.assertTrue(snap.exists(), "the link was made (the case under test)\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (2, "LEG_SPEC_IS_RUN_OUTPUT"))
+        self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertFalse((self.run_dir / "batch-01.json").exists())
+        self.assertFalse((self.run_dir / "batches.jsonl").exists())
+        self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes(), "nothing was appended to the linked batch.log")
+        self.assertIn("BATCH_OUTPUT_UNVOUCHED batch=1 reason=LEG_SPEC_IS_RUN_OUTPUT", r.stderr)
+        self.assertIn("overall guard hit OUTPUT_ZONE_UNRESOLVED", r.stderr)
+
+    # PR 704 r9 (sol r8 B1 = producer OPEN r8p2-A1; catalogue RPF-10): with an output the guard could not inspect, the receipt guard asked batch.log about its own destination but kept
+    # only the sentence of the hit it found (Get-ReceiptDestinationRefusal), and typed the suppression and the stop by the earlier OUTPUT_ZONE_UNRESOLVED hit: a batch.log that IS an
+    # accepted input was reported as an output nobody could inspect. The destination's own typed hit (kind, code, item) is the suppression's and the stop's now.
+    def test_r9_rpf10_a_batch_log_that_is_an_accepted_input_behind_an_unresolved_zone_is_typed_by_its_own_alias(self) -> None:
+        for form, code in (("spec", "LEG_SPEC_IS_RUN_OUTPUT"), ("plan", "LEG_PLAN_IS_RUN_OUTPUT"), ("build", "BUILD_MANIFEST_IS_RUN_OUTPUT")):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+                args, e = self.plan_cmd(plan)
+                target = {"spec": spec, "plan": plan, "build": self._staged_manifest(self.commit_a)}[form]
+                gate, log, snap = self.run_dir / "gate.log", self.run_dir / "batch.log", self.case / "r9-target.snap"
+                # after the final BATCH_END: gate.log (runner-owned) is a link to nothing, and batch.log is replaced by a hard link to the accepted input
+                inject = (f"[IO.File]::Delete('{psq(gate)}'); " + self._rpf06_dangling(gate) + f"; [IO.File]::Delete('{psq(log)}'); "
+                          f"New-Item -ItemType HardLink -Path '{psq(log)}' -Value '{psq(target)}' | Out-Null; Copy-Item -LiteralPath '{psq(target)}' -Destination '{psq(snap)}'")
+                r = self._rpf06_run(args, e, inject)
+                self.assertTrue(snap.exists() and os.path.lexists(gate) and not gate.exists(), "the case under test was set up\n" + r.stdout + r.stderr)
+                self.assertEqual(os.stat(log).st_ino, os.stat(target).st_ino, "batch.log is the accepted input (the case under test)")
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"]), (2, code), r.stderr)
+                self._r5_assert_suppressed(res, code)
+                self.assertEqual(target.read_bytes(), snap.read_bytes(), "nothing was written into the input through batch.log")
+                self.assertIn(f"BATCH_RECEIPT_GUARD_STOP reason={code}", r.stderr)
+                self.assertIn(f"BATCH_WRITE_REFUSED file={log} reason={code}", r.stderr)
+
+    def test_r9_adv_a1_an_earlier_input_that_will_not_resolve_never_hides_a_later_inputs_alias(self) -> None:
+        # adversary r9 A1 (the RPF-10 class inside Get-WriteDestinationHit): the destination check returned INPUT_UNREADABLE for the first input that would not resolve (the plan) before
+        # comparing a later input's accepted identity, so a batch.log that IS the accepted spec was typed INPUT_UNREADABLE and the stop stayed OUTPUT_ZONE_UNRESOLVED. RED on a01ce8f0.
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+        args, e = self.plan_cmd(plan)
+        gate, log, snap = self.run_dir / "gate.log", self.run_dir / "batch.log", self.case / "r9-spec.snap"
+        inject = (f"[IO.File]::Delete('{psq(gate)}'); " + self._rpf06_dangling(gate) + f"; [IO.File]::Delete('{psq(log)}'); "
+                  f"New-Item -ItemType HardLink -Path '{psq(log)}' -Value '{psq(spec)}' | Out-Null; Copy-Item -LiteralPath '{psq(spec)}' -Destination '{psq(snap)}'; $script:r9DenyPlan = $true")
+        deny = (self._RPF06_RESOLVE, f"if ($script:r9DenyPlan -and $Path -ieq '{psq(plan)}') {{ throw [UnauthorizedAccessException]::new('injected: the plan path will not resolve') }}; " + self._RPF06_RESOLVE)
+        r = self._rpf06_run(args, e, inject, deny)
+        self.assertTrue(snap.exists() and os.path.lexists(gate) and not gate.exists(), "the case under test was set up\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (2, "LEG_SPEC_IS_RUN_OUTPUT"), r.stderr)
+        self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual(spec.read_bytes(), snap.read_bytes(), "nothing was written into the spec through batch.log")
+
+    # PR 704 r9 (sol r8 B2 = producer OPEN r8p2-A2; catalogue RPF-11): a receipt destination that is there but will not resolve (renamed between Test-NothingAtName and Get-PhysicalPath)
+    # says nothing about any input or any other file, yet with no overall hit (or a content one) the receipt guard asked the general write guard, which turned the suppression on for
+    # every write: the healthy sibling receipt and the summary's batch.log line were lost too. Only that destination's write is suppressed now, whatever the overall hit; a destination
+    # that IS an accepted input still suppresses every write. Injected I/O seam, no real race.
+    _R9_RESOLVE = "    try { $phys = (Get-PhysicalPath $Path).TrimEnd('\\'); $di = Get-FileIdentity $Path }\n"
+    _R9_JSONL_WRITE = "    Write-ReceiptFile $B.batch $jsonl { $rec.logWriteFailures"
+
+    def test_r9_rpf11_a_receipt_destination_that_will_not_resolve_suppresses_that_receipt_only(self) -> None:
+        # (form, the destination that will not resolve, made before the write, the overall hit's setup, expected exit and stop)
+        forms = (("initial, no overall hit", "batch-01.json", True, "", 13, "RECEIPT_PERSIST_FAILED"),
+                 ("jsonl, no overall hit", "batches.jsonl", True, "", 13, "RECEIPT_PERSIST_FAILED"),
+                 ("rewrite, no overall hit", "batch-01.json", False, "", 13, "RECEIPT_PERSIST_FAILED"),
+                 ("initial, content hit", "batch-01.json", True, "content", 2, "BUILD_NOT_STAGED"),
+                 ("jsonl, content hit", "batches.jsonl", True, "content", 2, "BUILD_NOT_STAGED"),
+                 ("initial, output hit (control)", "batch-01.json", True, "output", 2, "OUTPUT_ZONE_UNRESOLVED"))
+        for form, leaf, made, overall, exit_code, stop in forms:
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                dest, gate = self.run_dir / leaf, self.run_dir / "gate.log"
+                inject = f"$script:r9Throw = '{leaf}'"
+                if made:
+                    inject += f"; [IO.File]::WriteAllText('{psq(dest)}', '')"
+                else:
+                    inject += "; $script:r9Bump = $true"   # a log failure counted after the first write, so batch-NN.json is written once more (the rewrite destination)
+                if overall == "content":
+                    inject += f"; [IO.File]::Delete('{psq(self._staged_manifest(self.commit_a))}')"
+                elif overall == "output":
+                    inject += f"; [IO.File]::Delete('{psq(gate)}'); " + self._rpf06_dangling(gate)
+                r = self._rpf06_run(args, e, inject,
+                                    (self._R9_RESOLVE, "    try { if ($script:r9Throw -and [IO.Path]::GetFileName($Path) -ieq $script:r9Throw) { throw 'injected: the receipt was renamed between its observation and its resolution' }; $phys = (Get-PhysicalPath $Path).TrimEnd('\\'); $di = Get-FileIdentity $Path }\n"),
+                                    (self._R9_JSONL_WRITE, "    if ($script:r9Bump) { $script:logWriteFailures++ }\n" + self._R9_JSONL_WRITE))
+                self.assertEqual(r.returncode, exit_code, r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"]), (exit_code, stop, 1), r.stderr)
+                self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+                self.assertEqual([Path(f["file"]).name for f in res["receiptPersistFailures"]], [leaf], res["receiptPersistFailures"])
+                [f] = res["receiptPersistFailures"]
+                self.assertEqual(f["suppressedBy"], "OUTPUT_ZONE_UNRESOLVED", f)
+                self.assertIn("injected: the receipt was renamed", f["reason"], "the reason is the destination's own hit")
+                self.assertIn("this receipt file only", f["reason"])
+                if leaf == "batches.jsonl":
+                    self.assertEqual(self.batches(), [], "the destination that will not resolve is not written")
+                    self.assertTrue((self.run_dir / "batch-01.json").is_file(), "the healthy batch-01.json is written")
+                else:
+                    self.assertEqual(len(self.batches()), 1, "the healthy batches.jsonl is written")
+                    if made:
+                        self.assertEqual((self.run_dir / "batch-01.json").read_bytes(), b"", "the destination that will not resolve is not written")
+                    else:
+                        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "the first write landed before its rewrite was refused")
+                self.assertNotIn("BATCH_RESULT_NOT_LOGGED", r.stderr, "a destination-only refusal turned the suppression on for every write")
+                self.assertIn("LEASE_BATCH_RESULT=", (self.run_dir / "batch.log").read_text(encoding="utf-8"), "the summary line is still appended to batch.log")
+
+    def test_r6_adv_a1_an_input_whose_lookup_is_denied_is_input_unreadable_never_input_vanished(self) -> None:
+        # adversary r6 A1: the input is still there, but its own ACL denies everything and its folder denies listing, so resolving it AND looking it up are access denied. Get-Item (and,
+        # for a staged manifest, Test-Path) read that as "nothing there": INPUT_VANISHED / skipped as gone. Only "not found" is gone: INPUT_UNREADABLE, the receipts written, exit 2.
+        for form in ("scalar spec", "build manifest"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                if form == "scalar spec":
+                    args, e = self.batch_cmd([spec])
+                    target = spec
+                else:
+                    args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                    target = self._staged_manifest(self.commit_a)
+                me = "([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+                for p in (target, target.parent):
+                    self.addCleanup(subprocess.run, ["icacls", str(p), "/remove:d", os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")], capture_output=True)
+                deny = (f"$null = icacls '{psq(target)}' /deny ({me} + ':(F)'); $null = icacls '{psq(target.parent)}' /deny ({me} + ':(RD)')")
+                r = self._rpf06_run(args, e, deny)
+                try:
+                    with self.assertRaises(PermissionError, msg="the input's lookup is denied (the case under test)"):
+                        os.stat(target)
+                    self.assertEqual(r.returncode, 2, "an input whose lookup was denied ended exit 0\n" + r.stdout + r.stderr)
+                    res = batch_result(r.stdout)
+                    # r7 (sol r6 B2; RPF-09): the input is there and will not resolve, so no existing destination is written (typed suppressed, never written); the typing is unchanged
+                    self.assertEqual((res["exitCode"], res["stopReason"], res["ran"]), (2, "INPUT_UNREADABLE", 1), r.stderr)
+                    self._r5_assert_suppressed(res, "INPUT_UNREADABLE")
+                    self.assertNotIn("INPUT_VANISHED", r.stdout + r.stderr, "an input that is still there is not gone")
+                    self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+                    self.assertFalse((self.run_dir / "batch-01.json").exists())
+                finally:
+                    for p in (target.parent, target):
+                        subprocess.run(["icacls", str(p), "/remove:d", os.environ.get("USERDOMAIN", "") + "\\" + os.environ.get("USERNAME", "")], capture_output=True)
+
+    def test_r6_adv2_a1_a_log_that_is_an_input_whose_own_path_will_not_resolve_is_never_written(self) -> None:
+        # adversary r6 pass 2 A1: the spec's own path stops resolving (as a share that now denies it; injected, since a share needs admin) while the file is batch.log by another name.
+        # The guard has no answer for that input (INPUT_UNREADABLE, no alias), so nothing compared batch.log with it and the summary was appended INTO the spec. batch.log is now
+        # asked on its own: as the input was accepted (batch.log re-linked to it), or, while the input does not resolve, any batch.log with another name: nothing is written into -RunDir.
+        for form in ("input re-linked to batch.log", "batch.log re-linked to the input"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                s, log = psq(spec), psq(self.run_dir / "batch.log")
+                snap = self.case / "rpf06-spec.snap"
+                relink = (f"[IO.File]::Delete('{s}'); New-Item -ItemType HardLink -Path '{s}' -Value '{log}' | Out-Null" if form.startswith("input")
+                          else f"[IO.File]::Copy('{log}', '{s}', $true); [IO.File]::Delete('{log}'); New-Item -ItemType HardLink -Path '{log}' -Value '{s}' | Out-Null")
+                inject = f"{relink}; Copy-Item -LiteralPath '{s}' -Destination '{psq(snap)}'; $script:rpf06DenySpec = $true"
+                deny = (self._RPF06_RESOLVE, f"if ($script:rpf06DenySpec -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE)
+                r = self._rpf06_run(args, e, inject, deny)
+                self.assertTrue(snap.exists(), "the case under test was set up\n" + r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                # r9 (sol r8 B1; RPF-10): typed by batch.log's own hit. Re-linked to the input, batch.log IS the spec as it was accepted (same file identity): LEG_SPEC_IS_RUN_OUTPUT,
+                # which the earlier INPUT_UNREADABLE hid. With the input re-linked to batch.log, batch.log keeps its own identity (the accepted spec file is gone) and the spec's path will not resolve: INPUT_UNREADABLE.
+                code = "INPUT_UNREADABLE" if form.startswith("input") else "LEG_SPEC_IS_RUN_OUTPUT"
+                self.assertEqual((res["exitCode"], res["stopReason"]), (2, code), r.stderr)
+                self.assertEqual(spec.read_bytes(), snap.read_bytes(), "nothing was written into the input through batch.log")
+                self._r5_assert_suppressed(res, code)
+                self.assertIn(f"BATCH_OUTPUT_UNVOUCHED batch=1 reason={code}", r.stderr)
+
+    # PR 704 r7 (key3 opus r6 = sol r6 B1/B2 = Dot 16:48Z; catalogue RPF-08, RPF-09; folds LEASE-BATCH-INPUT-ALIAS-RESOLUTION-FAIL-REGRESSION-1): an accepted input that no longer resolves
+    # (INPUT_VANISHED / INPUT_UNREADABLE) turned no write suppression on at the open or at a later claim, so the finally's log lines and the summary were appended into a batch.log that was
+    # that input; and a destination with one name and no link was written while an input that is there would not resolve. Every writer into -RunDir now asks one guard right before it writes.
+    def _r7_wait_for_event(self, p: subprocess.Popen, kind: str) -> None:
+        end = time.monotonic() + 120
+        while time.monotonic() < end and p.poll() is None and not (self.events.exists() and f" {kind} " in self.events.read_text(encoding="utf-8")):
+            time.sleep(0.05)
+        self.assertTrue(self.events.exists() and f" {kind} " in self.events.read_text(encoding="utf-8"), f"no {kind} event (the case under test)")
+
+    def test_r7_dot_a_spec_renamed_and_batch_log_relinked_during_the_real_open_wait_is_never_appended_to(self) -> None:
+        # Dot 16:48Z, no resolver mock: spec A is accepted; while the open waits in the agent's gate (FAKE_OPEN_SLEEP) A is renamed to A.old, batch.log is replaced by a hard link to
+        # A.old and A stays absent. The guard reads A as INPUT_VANISHED, which suppressed nothing, so the finally's log lines went into A.old.
+        for form in ("plan", "scalar"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                old = spec.with_name("fx-a.json.old")
+                args, e = (self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), FAKE_OPEN_SLEEP="8") if form == "plan"
+                           else self.batch_cmd([spec], FAKE_OPEN_SLEEP="8"))
+                p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+                try:
+                    self._r7_wait_for_event(p, "OPENWAIT")
+                    os.rename(spec, old)
+                    log = self.run_dir / "batch.log"
+                    log.unlink()
+                    os.link(old, log)
+                    snap = old.read_bytes()
+                    out, err = p.communicate(timeout=300)
+                finally:
+                    if p.poll() is None:
+                        subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"], capture_output=True, text=True, timeout=60)
+                        p.communicate(timeout=60)
+                self.assertFalse(spec.exists(), "A stays absent (the case under test)")
+                self.assertEqual(old.read_bytes(), snap, "a write landed in the accepted input through batch.log\n" + out + err)
+                self.assertEqual(p.returncode, 2, out + err)
+                res = batch_result(out)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"]), (2, "INPUT_VANISHED", 0), err)
+                self.assertNotIn("IS_RUN_OUTPUT", out + err)
+
+    def test_r7_sol_b2_a_one_name_receipt_is_not_written_while_an_input_that_is_there_will_not_resolve(self) -> None:
+        # sol r6 B2 (RPF-09): the spec is accepted through a junction (cur -> orig). Before the final receipt the junction is retargeted at -RunDir, where a one-name copy of the spec sits
+        # at the receipt's name, and resolving the input path is denied (injected, as a share that now denies it). links == 1 and no reparse point prove nothing about the input side.
+        orig, cur, snap = self.case / "r7" / "orig", self.case / "r7" / "cur", self.case / "r7-spec.snap"
+        orig.mkdir(parents=True)
+        (orig / "batch-01.json").write_bytes(self.specs[0].read_bytes())
+        subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", f"New-Item -ItemType Junction -Path '{psq(cur)}' -Value '{psq(orig)}' | Out-Null"], check=True, capture_output=True)
+        spec = cur / "batch-01.json"
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        s, c = psq(spec), psq(cur)
+        retarget = (f"[IO.File]::Copy('{psq(orig / 'batch-01.json')}', (Join-Path $RunDir 'batch-01.json'), $true); [IO.Directory]::Delete('{c}'); "
+                    f"New-Item -ItemType Junction -Path '{c}' -Value $RunDir | Out-Null; Copy-Item -LiteralPath '{s}' -Destination '{psq(snap)}'; $script:rpf06DenySpec = $true")
+        deny = (self._RPF06_RESOLVE, f"if ($script:rpf06DenySpec -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE)
+        r = self._rpf06_run(args, e, retarget, deny)
+        self.assertTrue(snap.exists(), "the junction was retargeted (the case under test)\n" + r.stdout + r.stderr)
+        self.assertEqual(spec.read_bytes(), snap.read_bytes(), "a receipt was written into the file the accepted input's path now reaches\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (2, "INPUT_UNREADABLE"), r.stderr)
+        self._r5_assert_suppressed(res, "INPUT_UNREADABLE")
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+
+    def test_r7_sol_b1_a_later_claims_unresolved_input_refusal_appends_no_summary_into_the_input(self) -> None:
+        # sol r6 B1 = key3 opus r6 (RPF-08): batches.jsonl is a directory (a receipt-persistence failure), then before batch 2's claim guard batch.log becomes a hard link to the next
+        # leg's spec and the spec's own path stops resolving (denied: injected) or the spec is renamed away (vanished: no mock). The refusal printed the summary into batch.log: the
+        # NOT_RUN line and LEASE_BATCH_RESULT landed in the input.
+        for how in ("denied", "vanished"):
+            with self.subTest(how=how):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec2 = self.case / "fx-b-copy.json"
+                target = spec2 if how == "denied" else self.case / "fx-b-copy.json.old"
+                s, t, log, snap = psq(spec2), psq(target), psq(self.run_dir / "batch.log"), self.case / "r7-b1.snap"
+                move = "" if how == "denied" else f"[IO.File]::Move('{s}', '{t}'); "
+                inject = (f"{move}[IO.File]::Delete('{log}'); New-Item -ItemType HardLink -Path '{log}' -Value '{t}' | Out-Null; Copy-Item -LiteralPath '{t}' -Destination '{psq(snap)}'"
+                          + ("; $script:rpf06DenySpec = $true" if how == "denied" else ""))
+                args, e, patch = self._two_batch_plan(inject)
+                patches = [patch]
+                if how == "denied":
+                    patches.append((self._RPF06_RESOLVE, f"if ($script:rpf06DenySpec -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE))
+                args[args.index("-File") + 1] = str(self._patched_runner(*patches[0], *patches[1:]))
+                r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+                self.assertTrue(snap.exists(), "batch.log was relinked to the input (the case under test)\n" + r.stdout + r.stderr)
+                self.assertEqual(target.read_bytes(), snap.read_bytes(), "the summary was appended into the accepted input\n" + r.stdout + r.stderr)
+                code = "INPUT_UNREADABLE" if how == "denied" else "INPUT_VANISHED"
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(f"LEG_PLAN_REFUSED reason={code} item=2 ", r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (2, code, 1, 1))
+
+    # r7: one case per writer into -RunDir (and the claim dir's ledger): right before the writer, its destination becomes a hard link to the second leg's spec (an accepted input not yet
+    # run). No guard ran in between, so only the writer's own guard can see it. (anchor kept by the runner, PowerShell run once just before it)
+    _R7_WRITERS = {
+        "batch.log (L)": ('                L "LEG $($leg.name) RUN batch=',
+                          "[IO.File]::Delete((Join-Path $RunDir 'batch.log')); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch.log') -Value '{b}' | Out-Null"),
+        "leg output": ("                try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {\n",
+                       "New-Item -ItemType HardLink -Path $out -Value '{b}' | Out-Null"),
+        "probe output": ("    $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript,", "New-Item -ItemType HardLink -Path $out -Value '{b}' | Out-Null"),
+        "leg-plan.json": ('        L "CLAIM_TAKEN batch=$batchNo',
+                          "New-Item -ItemType HardLink -Path (Join-Path $RunDir 'leg-plan.json') -Value '{b}' | Out-Null"),
+        "lease ledger": ("                $b.ledger = $row\n",
+                         "$lg = Get-VenueLeaseLedgerPath -Venue $Venue -ClaimDir $ClaimDir; if (Test-Path -LiteralPath $lg) {{ [IO.File]::Delete($lg) }}; New-Item -ItemType HardLink -Path $lg -Value '{b}' | Out-Null"),
+        # adversary r7 A2: a name inside the probe's work folder (Wait-VenueQuiet writes its job files there) is already a hard link to the spec
+        "probe work folder (a name inside it)": ("    $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript,",
+                                                 "$null = New-Item -ItemType Directory -Force -Path (Join-Path $RunDir 'quiet'); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'quiet\\venue-quiet-probe-r7.job.ps1') -Value '{b}' | Out-Null"),
+        # adversary r7 pass 2 A1: the open's own job folder holds a hard link to the spec when the open is submitted
+        "open job folder": ("            $op = Submit-AgentJob $b.openJobId ",
+                            "New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch-jobs\\keep.json') -Value '{b}' | Out-Null"),
+    }
+
+    def test_r7_every_writer_asks_the_guard_right_before_it_writes(self) -> None:
+        for name, (anchor, make) in self._R7_WRITERS.items():
+            with self.subTest(writer=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                a, b = self._r5_spec("fx-a.json", self.specs[0]), self._r5_spec("fx-b.json", self.specs[1])
+                snap = self.case / "r7-writer.snap"
+                args, e = self.plan_cmd(self.write_plan([self.item(a, "A", self.commit_a), self.item(b, "A", self.commit_a)]))
+                indent = re.match(r"\s*", anchor).group(0)
+                inject = f"{indent}if (-not $script:r7Done) {{ $script:r7Done = $true; {make.format(b=psq(b))}; Copy-Item -LiteralPath '{psq(b)}' -Destination '{psq(snap)}' }}\n"
+                args[args.index("-File") + 1] = str(self._patched_runner(anchor, inject + anchor))
+                r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+                self.assertTrue(snap.exists(), "the destination was linked to the spec (the case under test)\n" + r.stdout + r.stderr)
+                self.assertEqual(b.read_bytes(), snap.read_bytes(), f"the {name} writer wrote into the accepted input\n" + r.stdout + r.stderr)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_WRITE_REFUSED ", r.stderr)
+                self.assertEqual(batch_result(r.stdout)["stopReason"], "LEG_SPEC_IS_RUN_OUTPUT")
+                self.assertFalse(self.claim_path.exists(), "the claim was left behind")
+                if name in ("leg-plan.json", "open job folder"):
+                    # adversary r7 A3 / pass 2 A1: a refusal before the open stopped the claim keeper, so no open is submitted after it (it could outlive the claim)
+                    self.assertNotIn("OPEN:", " ".join(self.kinds()), "an open was submitted after a write was refused before it")
+
+    # r8 (Dot residual B2 on 9bbfaf75): a write refused before the open, by whichever writer, means no open is sent. The open's dispatch asks one predicate (Get-OpenDispatchRefusal) right
+    # before um-run is called, so a refusal found AFTER the pre-open check (a log line on the way to the open, the open's own job folder) ends the batch the same way.
+    _R8_OPEN_ANCHOR = "            $op = Submit-AgentJob $b.openJobId "
+
+    def _r8_run(self, anchor: str, make: str, *extra: str, legs: int = 1) -> tuple[subprocess.CompletedProcess, Path, Path]:
+        """One plan run with `make` (PowerShell; {b} = the last spec) run once just before `anchor`; (the run, the last spec, its snapshot taken right after `make`)."""
+        self._stage_case()
+        specs = [self._r5_spec(n, s) for n, s in (("fx-a.json", self.specs[0]), ("fx-b.json", self.specs[1]))][:max(1, legs)]
+        b, snap = specs[-1], self.case / "r8.snap"
+        args, e = self.plan_cmd(self.write_plan([self.item(s, "A", self.commit_a) for s in specs]), *extra)
+        indent = re.match(r"\s*", anchor).group(0)
+        inject = f"{indent}if (-not $script:r8Done) {{ $script:r8Done = $true; {make.format(b=psq(b))}; Copy-Item -LiteralPath '{psq(b)}' -Destination '{psq(snap)}' }}\n"
+        args[args.index("-File") + 1] = str(self._patched_runner(anchor, inject + anchor))
+        return subprocess.run(args, capture_output=True, text=True, timeout=240, env=e), b, snap
+
+    def _r8_open_jobs_written(self) -> list[str]:
+        jobs = self.run_dir / "batch-jobs"
+        return sorted(p.name for p in jobs.glob("lease-batch-open-*")) if jobs.is_dir() else []
+
+    def test_r8_b2_a_log_refusal_after_the_pre_open_check_sends_no_open(self) -> None:
+        # Dot B2 steps 1-3: batch.log becomes a hard link to the spec after the pre-open check, while the open's sidecar is written. The next log line refuses it (the keeper is
+        # stopped, the TEMP redirect made), and Submit-AgentJob then accepted the redirect and sent the OPEN. RED on dae24318: OPEN in the um-run calls.
+        relink = "[IO.File]::Delete((Join-Path $RunDir 'batch.log')); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch.log') -Value '{b}' | Out-Null"
+        for name, anchor in (("before BATCH_OPEN_SUBMIT", '        L "BATCH_OPEN_SUBMIT batch='),
+                             ("while the sidecar is written (Dot's route)", '        L "BATCH_OPEN_LIVENESS batch='),
+                             ("before the sidecar read-back line", '            L "BATCH_OPEN_LIVENESS_READBACK batch=')):
+            with self.subTest(at=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r, b, snap = self._r8_run(anchor, relink)
+                out = r.stdout + r.stderr
+                self.assertTrue(snap.exists(), "batch.log was relinked to the spec (the case under test)\n" + out)
+                self.assertEqual(b.read_bytes(), snap.read_bytes(), "a log line was appended into the accepted input\n" + out)
+                self.assertNotIn("OPEN:", " ".join(self.kinds()), "an OPEN was sent after a write was refused before it\n" + out)
+                self.assertEqual(self._r8_open_jobs_written(), [], "the open's job file was written under -RunDir")
+                self.assertIn("BATCH_WRITE_REFUSED ", r.stderr)
+                self.assertFalse(self.claim_path.exists(), "the claim was left behind\n" + out)
+                self.assertEqual(r.returncode, 2, out)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["stopReason"], res["batches"][0]["endReason"], res["batches"][0]["leaseId"]), ("LEG_SPEC_IS_RUN_OUTPUT", "LEG_SPEC_IS_RUN_OUTPUT", None), res)
+
+    def test_r8_b2_suppression_first_found_by_the_open_job_folder_guard_sends_no_open(self) -> None:
+        # Dot B2 (the :925 continuation): the open's job folder holds a hard link to the spec when the open is submitted; Submit-AgentJob's own guard is the first to see it.
+        # RED on 9bbfaf75 (the guard turned the suppression on and the open went out through the TEMP redirect); fixed on dae24318 by r7 pass 3 A1, kept by the r8 predicate.
+        r, b, snap = self._r8_run(self._R8_OPEN_ANCHOR, "New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch-jobs\\keep.json') -Value '{b}' | Out-Null")
+        out = r.stdout + r.stderr
+        self.assertTrue(snap.exists(), out)
+        self.assertEqual(b.read_bytes(), snap.read_bytes(), out)
+        self.assertNotIn("OPEN:", " ".join(self.kinds()), "an OPEN was sent after its own job folder was refused\n" + out)
+        self.assertEqual(self._r8_open_jobs_written(), [], out)
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind\n" + out)
+        self.assertEqual(r.returncode, 2, out)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["stopReason"], res["batches"][0]["endReason"]), ("LEG_SPEC_IS_RUN_OUTPUT", "LEG_SPEC_IS_RUN_OUTPUT"), res)
+
+    def test_r8_a_suppression_after_the_open_was_sent_still_submits_the_close(self) -> None:
+        # The close the run owes is kept: batch.log becomes a hard link to the spec once the open has returned with its lease. The guard refuses it, nothing is probed or run,
+        # and the CLOSE still goes out (its job file under the TEMP redirect, never under -RunDir).
+        r, b, snap = self._r8_run("        $adm = $(if ($null -ne $op.result) { $op.result.admission } else { $null })",
+                                  "[IO.File]::Delete((Join-Path $RunDir 'batch.log')); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch.log') -Value '{b}' | Out-Null")
+        out = r.stdout + r.stderr
+        self.assertTrue(snap.exists(), out)
+        self.assertEqual(b.read_bytes(), snap.read_bytes(), out)
+        k = [x.split(":")[0] for x in self.kinds()]
+        self.assertEqual(k, ["OPEN", "CLOSE"], "the open was sent, so its close is owed (and nothing ran)\n" + out)
+        jobs = self.run_dir / "batch-jobs"
+        self.assertEqual(sorted(p.name for p in jobs.glob("lease-batch-close-*")) if jobs.is_dir() else [], [], "the close job was written under -RunDir")
+        self.assertFalse(self.claim_path.exists(), "the claim was left behind\n" + out)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertEqual(batch_result(r.stdout)["stopReason"], "LEG_SPEC_IS_RUN_OUTPUT")
+
+    def test_r8_an_open_that_could_be_admitted_after_the_claim_expires_is_not_sent(self) -> None:
+        # Dot B2 step 4: the agent may admit the open until its notAfterUtc (the batch deadline, ~240 s here) and -ClaimTtlSec is 60. That is sent only while the keeper renews
+        # the claim on schedule; a keeper that is stopped or whose renewal failed refuses the open OPEN_OUTLIVES_CLAIM (exit 9), nothing sent, the claim released.
+        # RED on dae24318: the open is sent. Controls: a renewal that came back RENEWED, and a stopped keeper whose claim outlasts the open's notAfterUtc, still open.
+        stop = "$script:keeperStoppedEarly = $true; $script:keeperStoppedInTime = Stop-VenueKeeper -Keeper $claimKeeper; $script:keeperLive = $false"
+        cases = {
+            "keeper stopped": (stop, ("-ClaimTtlSec", "60"), False),
+            "last renewal BUSY": ("$claimKeeper.state.runs = 1; $claimKeeper.state.ok = 1; $claimKeeper.state.last = 'BUSY'", ("-ClaimTtlSec", "60"), False),
+            "a renewal threw": ("$claimKeeper.state.runs = 1; $claimKeeper.state.errors = 1; $claimKeeper.state.lastError = 'injected'", ("-ClaimTtlSec", "60"), False),
+            "control: last renewal RENEWED": ("$claimKeeper.state.runs = 1; $claimKeeper.state.ok = 1; $claimKeeper.state.renews = 1; $claimKeeper.state.last = 'RENEWED'",
+                                              ("-ClaimTtlSec", "60"), True),
+            "control: keeper stopped, the claim outlasts notAfterUtc": (stop, (), True),
+            # adversary r8 A2: a keeper that has not renewed yet (runs=0) or RENEWED long ago does not vouch for a claim already expired or within one renewal of it
+            "first renewal overdue, the claim already expired": ("$claim.expiresUtc = [DateTime]::UtcNow.AddSeconds(-1).ToString('o')", ("-ClaimTtlSec", "60"), "CLAIM_LOST"),
+            "RENEWED long ago, the expiry within one renewal": ("$claimKeeper.state.runs = 1; $claimKeeper.state.ok = 1; $claimKeeper.state.renews = 1; $claimKeeper.state.last = 'RENEWED'; "
+                                                                "$claimKeeper.state.expiresUtc = [DateTime]::UtcNow.AddSeconds(5).ToString('o')", ("-ClaimTtlSec", "60"), False),
+        }
+        for name, (make, extra, sent) in cases.items():
+            with self.subTest(case=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r, _b, snap = self._r8_run(self._R8_OPEN_ANCHOR, make, *extra)
+                out = r.stdout + r.stderr
+                self.assertTrue(snap.exists(), out)
+                self.assertFalse(self.claim_path.exists(), "the claim was left behind\n" + out)
+                k = [x.split(":")[0] for x in self.kinds()]
+                res = batch_result(r.stdout)
+                if sent is True:
+                    self.assertEqual((r.returncode, k[0], k[-1]), (0, "OPEN", "CLOSE"), out)
+                    continue
+                reason = sent or "OPEN_OUTLIVES_CLAIM"
+                self.assertEqual(k, [], "an open that could be admitted after the claim's expiry was sent\n" + out)
+                self.assertEqual(self._r8_open_jobs_written(), [], out)
+                self.assertEqual(r.returncode, 9, out)
+                [b1] = self.batches()
+                self.assertEqual((res["stopReason"], b1["endReason"], b1["leaseId"]), (reason, reason, None), b1)
+                self.assertIn("notAfterUtc=", b1["endDetail"])
+
+    def test_r8_adv2_a3_the_claim_and_the_lease_are_asked_again_at_the_launch_of_the_probe_and_the_leg(self) -> None:
+        # adversary r8 pass 2 A3: the guards between the top-of-loop checks and a launch (the leg's output and RUN line, the probe's gate log, work folder and output) can block on a
+        # share, so the claim can be lost and the lease end while they run. Injected right at the launch: nothing starts in batch 1, and batch 2 takes a fresh claim and lease and runs
+        # the leg. RED on f26a2f1c: the leg (or the probe) is started on a lost claim or an ended lease.
+        leg_anchor = "                if ($script:RunOutputAliased) { $b.legsAttempted--; Stop-BatchOnSuppression $b; break }   # r7: the RUN line itself was refused: the leg is not started"
+        cases = {
+            "leg: claim lost while its guards ran": (leg_anchor, "$claimKeeper.state.lost = 'NOT_OURS'", "CLAIM_LOST", ["OPEN", "QUIET", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
+            "leg: the lease ended while its guards ran": (leg_anchor, "$leaseEnd = [DateTime]::UtcNow.AddSeconds(-31)", "LEASE_REMAINING_SHORT", ["OPEN", "QUIET", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
+            "probe: claim lost while its guards ran": ("    if (-not ($asked -and (Test-RunDirWrite $out))) {","$claimKeeper.state.lost = 'NOT_OURS'", "CLAIM_LOST", ["OPEN", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
+            # r9 (adversary r9 A2 = OPEN r8p3-A1; LEASE-BATCH-PROBE-LAUNCH-LEASE-ROOM-1): the fourth combination. RED on a01ce8f0: the probe starts after the lease ended.
+            "probe: the lease ended while its guards ran": ("    if (-not ($asked -and (Test-RunDirWrite $out))) {", "$leaseEnd = [DateTime]::UtcNow.AddSeconds(-31)", "LEASE_REMAINING_SHORT", ["OPEN", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
+        }
+        for name, (anchor, make, reason, kinds) in cases.items():
+            with self.subTest(case=name):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                r, _b, _snap = self._r8_run(anchor, make)
+                out = r.stdout + r.stderr
+                self.assertEqual([x.split(":")[0] for x in self.kinds()], kinds, out)
+                self.assertEqual(r.returncode, 0, out)
+                b1, b2 = self.batches()
+                self.assertEqual((b1["endReason"], b1["legsAttempted"], b2["endReason"], b2["legsCounted"]), (reason, 0, "ALL_LEGS_DONE", 1), b1)
+                self.assertIn("launch", b1["endDetail"])
+
+    def test_r8_adv_a1_an_input_that_cannot_be_identified_as_accepted_is_refused_before_the_claim(self) -> None:
+        # adversary r8 A1: the spec is renamed away while its accepted identity is taken and put back after. The snapshot failure was swallowed (accepted = null), so every destination
+        # check skipped that input as accepted, and once renamed and re-linked at the end, a receipt was written through it. Now: asked again, then refused before any claim.
+        # RED on 81ad0482: the run goes on (exit 0) with an input no destination can be compared with.
+        self._stage_case()
+        a = self._r5_spec("fx-a.json", self.specs[0])
+        away = a.with_name("fx-a.away")
+        args, e = self.plan_cmd(self.write_plan([self.item(a, "A", self.commit_a)]))
+        before = "# r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted"
+        after = "if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }"
+        args[args.index("-File") + 1] = str(self._patched_runner(before, f"Move-Item -LiteralPath '{psq(a)}' -Destination '{psq(away)}'\n" + before,
+                                                                 (after, f"Move-Item -LiteralPath '{psq(away)}' -Destination '{psq(a)}'\n" + after)))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=INPUT_VANISHED item=1 ", r.stderr)
+        self.assertIn("could not be identified as it was accepted", r.stderr)
+        self.assertEqual(self.kinds(), [], "a claim, open or leg followed an input with no accepted identity\n" + out)
+        self.assertFalse(self.claim_path.exists(), out)
+
+    def test_r7_adv2_a4_a_preflight_refusal_with_an_uninspectable_zone_appends_nothing_to_the_plan(self) -> None:
+        # adversary r7 pass 2 A4: the plan file IS RunDir\batch.log (one name) and RunDir\gate.log is a link to nothing, so the preflight guard types OUTPUT_ZONE_UNRESOLVED; before any input
+        # is accepted nothing is compared, and the refusal line was appended into the plan
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+        log = self.run_dir / "batch.log"
+        log.write_bytes(plan.read_bytes())
+        snap = log.read_bytes()
+        subprocess.run([PWSH, "-NoProfile", "-NonInteractive", "-Command", self._rpf06_dangling(self.run_dir / "gate.log")], check=True, capture_output=True)
+        args, e = self.plan_cmd(log)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=OUTPUT_ZONE_UNRESOLVED", r.stderr)
+        self.assertEqual(log.read_bytes(), snap, "the refusal line was appended into the plan file\n" + r.stdout + r.stderr)
+
+    def test_r7_adv_a1_a_receipt_file_that_is_an_accepted_input_as_accepted_suppresses_every_write(self) -> None:
+        # adversary r7 A1: after the final leg the spec is renamed to a.old and RunDir\batch-01.json is made a hard link to a.old (batch.log plain, batches.jsonl absent). The guard reads the
+        # spec as INPUT_VANISHED and asks file by file: batch-01.json is the accepted input as accepted, which suppressed that one receipt only and kept the writes on.
+        for form in ("scalar spec", "plan"):
+            with self.subTest(form=form):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))
+                self._stage_case()
+                spec = self._r5_spec("fx-a.json", self.specs[0])
+                old = spec.with_name("fx-a.json.old")
+                args, e = self.batch_cmd([spec]) if form == "scalar spec" else self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+                r = self._rpf06_run(args, e, f"[IO.File]::Move('{psq(spec)}', '{psq(old)}'); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch-01.json') -Value '{psq(old)}' | Out-Null")
+                self.assertTrue(old.is_file() and not spec.exists(), "the spec was renamed and linked (the case under test)\n" + r.stdout + r.stderr)
+                self.assertEqual(old.read_bytes(), self.specs[0].read_bytes(), "a receipt was written into the accepted input")
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                res = batch_result(r.stdout)
+                self.assertEqual((res["exitCode"], res["stopReason"]), (2, "LEG_SPEC_IS_RUN_OUTPUT"), r.stderr)
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), "the writes stayed on after an alias was found")
+                self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+
+    # r7: the static half: every write primitive in the runner is either asked about first (Test-RunDirWrite on the same line or the two before it) or listed here with why it needs no
+    # ask. A new writer that is neither fails this test, so the next unguarded writer is found here, not by a reviewer.
+    _R7_UNGUARDED_OK = {
+        "New-Item -ItemType Directory -Force -Path $RunDir": "creates -RunDir before any input is accepted",
+        "New-Item -ItemType Directory -Force -Path $jobDir": "creates batch-jobs before any input is accepted",
+        "$null = New-Item -ItemType Directory -Path $redirect": "the output redirect: a NEW folder under TEMP, never -RunDir",
+        "[IO.File]::Open($f, [IO.FileMode]::CreateNew": "the job file: CreateNew in a folder the guard just asked about (or the TEMP redirect); it never opens an existing file",
+        "[IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read": "a read",
+        "Add-Content -LiteralPath $batchLog -Value $resultLine": "the summary line: asked ($logOk) before the summary is serialized, or the TEMP redirect",
+        "$putPerBatch = {": "a receipt: run only by Write-ReceiptFile, right after Test-ReceiptWriteSuppressed asks about its file",
+        "Write-ReceiptFile $B.batch $jsonl {": "a receipt: run only by Write-ReceiptFile, right after Test-ReceiptWriteSuppressed asks about its file",
+    }
+
+    def test_r7_every_write_primitive_in_the_runner_is_guarded_or_listed(self) -> None:
+        lines = RUNNER.read_text(encoding="utf-8").splitlines()
+        prim = re.compile(r"Add-Content|Set-Content|Out-File|WriteAllText|AppendAllText|WriteAllBytes|WriteAllLines|\[IO\.File\]::(Open|Create|Copy|Move)\(|New-Item\b|Copy-Item|Move-Item|\*>|(?<![<>-])>\s*\$(?!null)|Add-VenueLeaseLedger")
+        bad = []
+        for i, line in enumerate(lines):
+            code = line.split("#", 1)[0] if not line.lstrip().startswith("#") else ""
+            if not prim.search(code) or "Add-Type" in code:
+                continue
+            if any(k in code for k in self._R7_UNGUARDED_OK):
+                continue
+            if any("Test-RunDirWrite" in l for l in lines[max(0, i - 2):i + 1]):
+                continue
+            bad.append(f"{i + 1}: {line.strip()}")
+        self.assertEqual(bad, [], "a write primitive with no Test-RunDirWrite right before it (guard it, or list it in _R7_UNGUARDED_OK with why)")
+
+    def _r5_two_batch_args(self) -> tuple[list[str], dict, Path, Path]:
+        a, b = self._r5_spec("fx-a.json", self.specs[0]), self._r5_spec("fx-b.json", self.specs[1])
+        args, e = self.plan_cmd(self.write_plan([self.item(a, "A", self.commit_a), self.item(b, "A", self.commit_a)]), FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
+        return args, e, a, b
+
+    def test_r5_b1_mid_run_an_alias_seen_at_batch_1s_receipt_write_names_both_lost_receipts_and_stops_typed(self) -> None:
+        args, e, _a, b = self._r5_two_batch_args()
+        link, snap = self._r5_link_to_batch_log(b)
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, link, batch=1)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"]), (2, "LEG_SPEC_IS_RUN_OUTPUT", 1, 1))
+        self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, "no lease is opened for batch 2")
+        self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes())
+
+    def test_r5_b1_mid_run_a_spec_that_already_ran_and_was_deleted_stops_input_vanished_not_as_a_run_output(self) -> None:
+        args, e, a, _b = self._r5_two_batch_args()
+        r = self._r5_run(args, e, self._FINAL_RECEIPT, f"[IO.File]::Delete('{psq(a)}')", batch=1)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=INPUT_VANISHED item=1 ", r.stderr)
+        self.assertNotIn("IS_RUN_OUTPUT", r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"], res["ran"], res["notRun"], res["receiptPersistFailures"]), (2, "INPUT_VANISHED", 1, 1, []))
+        self.assertTrue((self.run_dir / "batch-01.json").is_file(), "batch 1's receipt is written")
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1)
+
+    def test_r5_b1_the_pre_claim_deadline_path_records_a_receipt_the_guard_suppressed(self) -> None:
+        self.claims.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        rows = [{"venue": "bachelor", "leaseId": "old-1", "startUtc": utc_iso(now - timedelta(minutes=105)), "endUtc": utc_iso(now - timedelta(minutes=60))},
+                {"venue": "bachelor", "leaseId": "old-2", "startUtc": utc_iso(now - timedelta(minutes=45)), "endUtc": utc_iso(now - timedelta(minutes=1))}]
+        (self.claims / "bachelor.lease-ledger.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows), encoding="utf-8")
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        link, snap = self._r5_link_to_batch_log(spec)
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]))
+        r = self._r5_run(args, e, self._PRECLAIM_DEADLINE, link)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (3, "DEADLINE"))
+        self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes())
+
+    def test_r5_b1_the_claim_held_deadline_path_records_a_receipt_the_guard_suppressed(self) -> None:
+        self._foreign_live_claim()
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        link, snap = self._r5_link_to_batch_log(spec)
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=12)))
+        r = self._r5_run(args, e, self._CLAIM_HELD_DEADLINE, link)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (3, "DEADLINE"))
+        self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual((self.run_dir / "batch.log").read_bytes(), snap.read_bytes())
+
+    # r3 (sol r2b B2 = catalogue RPF-02): the lock helper took batch.log after its marker wait expired or was cancelled, whether or not the runner had paused, so a slow start was
+    # locked ahead of the pause (and died on its next direct L), and 'locked' was written for a runner that never paused. These drive the helper alone: no runner, no pause marker.
+    def test_r3_b2_an_expired_or_cancelled_marker_wait_takes_no_lock_and_signals_nothing(self) -> None:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        log = self.run_dir / "batch.log"
+        log.write_text("", encoding="utf-8")
+        paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
+        for how in ("expired", "cancelled"):
+            with self.subTest(how=how):
+                done, t, *rest = self._lock_log_while_the_runner_is_paused(log, paused, locked, give_up_s=0.5 if how == "expired" else 30)
+                try:
+                    if how == "cancelled":
+                        done.set()
+                    time.sleep(1.5)
+                    self.assertFalse(locked.exists(), f"a {how} marker wait wrote the locked marker")
+                    with open(log, "a", encoding="utf-8") as f:   # a sharing violation (PermissionError) here = the lock was taken with no pause
+                        f.write("")
+                    if rest:
+                        self.assertEqual(rest[0]["outcome"], "never-paused" if how == "expired" else "cancelled")
+                finally:
+                    done.set()
+                    t.join(5)
+                    locked.unlink(missing_ok=True)
+
+    def test_r3_adv_a1_a_pause_marker_that_appears_only_after_the_wait_expired_takes_no_lock(self) -> None:
+        # adversary r3 A1: the helper re-checked the marker AFTER its wait loop, so a marker that appeared between the expiry and that check was locked on. The marker double is
+        # absent on its first look and present on every later one; with give_up_s=0 the wait has expired before any later look.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        log = self.run_dir / "batch.log"
+        log.write_text("", encoding="utf-8")
+        locked = self.case / "log-locked.marker"
+
+        class LateMarker:
+            parent = self.case
+            looks = 0
+
+            def exists(self) -> bool:
+                LateMarker.looks += 1
+                return LateMarker.looks > 1
+
+        done, t, *rest = self._lock_log_while_the_runner_is_paused(log, LateMarker(), locked, give_up_s=0)
+        try:
+            t.join(5)
+            self.assertFalse(locked.exists(), "a marker seen only after the wait expired was locked on")
+            with open(log, "a", encoding="utf-8") as f:   # PermissionError here = the lock was taken
+                f.write("")
+            if rest:
+                self.assertEqual(rest[0]["outcome"], "never-paused")
+        finally:
+            done.set()
+            t.join(5)
+
+    # r4 (sol r3 B1; Dot 6457592181 on #704): the pause marker survived the runner's 60 s pause, so a helper delayed past it still locked, recorded `locked`, and the test certified a handshake
+    # the runner never took part in. The runner now records its own expiry and acknowledges only a lock it probed while still paused; _assert_handshake demands that acknowledgment.
+    def _handshake_state(self, outcome: str = "locked", paused: str | None = "n-1", ack: str | None = "n-1 held", expired: str | None = None) -> dict:
+        """A lock-helper state over real marker files (the runner and the helper are not run): the handshake assert is decided by what the markers say."""
+        d = Path(tempfile.mkdtemp(prefix="hs-", dir=self.tmp))
+        mk = {"paused": d / "p.marker", "expired": d / self._EXPIRED_MARKER, "ack": d / self._ACK_MARKER}
+        for k, v in (("paused", paused), ("ack", ack), ("expired", expired)):
+            if v is not None:
+                mk[k].write_text(v, encoding="utf-8")
+        return {"outcome": outcome, "released": False, "give_up_s": 1, "markers": mk}
+
+    def test_r4_b1_the_handshake_assert_accepts_only_a_lock_the_paused_runner_acknowledged_with_its_own_nonce(self) -> None:
+        self._assert_handshake(self._handshake_state(), "CLAIM_TAKEN")   # the control: locked, acknowledged with the runner's nonce, no expiry
+        cases = {
+            "the runner's pause expired and the helper locked after it (sol r3 B1)": self._handshake_state(expired="n-1 expired", ack=None),
+            "the pause expired although an ack exists": self._handshake_state(expired="n-1 expired"),
+            "locked with no acknowledgment at all": self._handshake_state(ack=None),
+            "an ack carrying another attempt's nonce": self._handshake_state(ack="n-0 held"),
+            "an ack that is not a held lock": self._handshake_state(ack="n-1 free"),
+            "no pause marker to bind the ack to": self._handshake_state(paused=None),
+            "the helper itself refused the expired pause": self._handshake_state(outcome="pause-expired", expired="n-1 expired", ack=None),
+        }
+        for label, st in cases.items():
+            with self.subTest(case=label):
+                with self.assertRaises(AssertionError):
+                    self._assert_handshake(st, "CLAIM_TAKEN")
+
+    def test_r4_b1_a_lock_helper_that_sees_the_pause_marker_after_the_runners_pause_expired_takes_no_lock(self) -> None:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        log = self.run_dir / "batch.log"
+        log.write_text("", encoding="utf-8")
+        paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
+        paused.write_text("n-1", encoding="utf-8")
+        (self.case / self._EXPIRED_MARKER).write_text("n-1 expired", encoding="utf-8")   # the runner gave up and carried on; its pause marker is left behind
+        done, t, state = self._lock_log_while_the_runner_is_paused(log, paused, locked, give_up_s=5)
+        try:
+            t.join(10)
+            self.assertEqual(state["outcome"], "pause-expired")
+            self.assertFalse(locked.exists(), "a pause the runner had already given up on was locked on")
+            with open(log, "a", encoding="utf-8") as f:   # PermissionError here = the lock was taken
+                f.write("")
+            with self.assertRaises(AssertionError):
+                self._assert_handshake(state, "CLAIM_TAKEN")
+        finally:
+            done.set()
+            t.join(5)
+
+    def test_r4_b1_a_helper_delayed_past_the_runners_pause_is_refused_and_the_runner_resumes_without_a_lock(self) -> None:
+        # the real runner pauses for 2 s here (60 s in the other tests); the helper first sees the pause marker at 12 s (the runner starts its pause a few seconds in), the case sol r3 B1 describes at t=61 s of 60 s. The runner has
+        # recorded its expiry by then: no lock is taken, no acknowledgment exists, and the attempt is refused by name.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "batch.log").write_text("", encoding="utf-8")
+        args, e = self.plan_cmd(self.ab_block_plan(), "-PlanOrder", "Interleave")
+        runner, paused, locked = self._runner_paused_at_claim_taken(pause_s=2)
+        args[args.index("-File") + 1] = str(runner)
+        t0 = time.monotonic()
+
+        class Delayed:
+            parent = paused.parent
+
+            def exists(self) -> bool:
+                return time.monotonic() - t0 >= 12 and paused.exists()
+
+        done, t, state = self._lock_log_while_the_runner_is_paused(self.run_dir / "batch.log", Delayed(), locked, give_up_s=60)
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=90, env=e)
+            t.join(30)
+        finally:
+            done.set()
+            t.join(5)
+        state["markers"]["paused"] = paused
+        self.assertEqual(state["outcome"], "pause-expired", r.stdout + r.stderr)
+        self.assertFalse(locked.exists(), "no lock was taken for an expired pause")
+        self.assertTrue(paused.exists() and (self.case / self._EXPIRED_MARKER).read_text(encoding="utf-8").strip() == paused.read_text(encoding="utf-8").strip() + " expired",
+                        "the runner recorded that its pause expired with no lock, under its own nonce")
+        self.assertFalse((self.case / self._ACK_MARKER).exists(), "an expired pause is never acknowledged")
+        with self.assertRaises(AssertionError):
+            self._assert_handshake(state, "CLAIM_TAKEN", r)
+        self.assertEqual(r.returncode, 0, "the runner resumed without a lock and the batch ran normally\n" + r.stdout + r.stderr)
+
+    def test_r4_adv_a2_a_lock_the_runner_looks_at_after_its_pause_ran_out_is_expired_not_acknowledged(self) -> None:
+        # adversary r4 A2: the pause loop checked the clock BEFORE the look, so a look that returned after the window (here 2 s into a 1 s pause) still counted as seen, was probed and
+        # acknowledged, and no expiry was recorded. The clock is read after the look, and again after the probe. The pause snippet runs alone; Test-Path is a function that returns late.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        log = self.run_dir / "batch.log"
+        log.write_text("", encoding="utf-8")
+        snippet = self._pause_snippet("CLAIM_TAKEN", 1)
+        script = self.case / "pause-snippet.ps1"
+        script.write_text("function Test-Path { param([string]$LiteralPath) Start-Sleep -Seconds 2; $true }\n"
+                          f"$batchLog = '{psq(log)}'\n$Message = 'CLAIM_TAKEN batch=1'\n" + snippet + "\n'done'\n", encoding="utf-8-sig")
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        expired, ack = self.case / self._EXPIRED_MARKER, self.case / self._ACK_MARKER
+        self.assertTrue(expired.exists(), "a look that returned after the window is an expired pause")
+        self.assertFalse(ack.exists(), "a late look is never acknowledged")
+
+    def test_r4_b1_a_prompt_helper_is_acknowledged_by_the_runner_with_its_own_nonce_while_the_log_is_held(self) -> None:
+        # the successful-handshake control on the real runner: paused, locked, the runner probes batch.log (held), writes `<nonce> held`, and only then resumes
+        r, state = self._run_plan_with_log_held_at("CLAIM_TAKEN")
+        self._assert_handshake(state, "CLAIM_TAKEN", r)
+        mk = state["markers"]
+        self.assertEqual(mk["ack"].read_text(encoding="utf-8").strip(), mk["paused"].read_text(encoding="utf-8").strip() + " held")
+        self.assertFalse(mk["expired"].exists())
+        self.assertEqual(r.returncode, 12, r.stdout + r.stderr)
+
+    def test_r3_b2_the_lock_is_let_go_when_the_locked_marker_cannot_be_written(self) -> None:
+        # sol r2b hardening: an exception writing the marker after CreateFileW skipped CloseHandle. The marker path is a directory, so the write raises; the handle is closed anyway.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        log = self.run_dir / "batch.log"
+        log.write_text("", encoding="utf-8")
+        paused, locked = self.case / "runner-paused.marker", self.case / "log-locked.marker"
+        paused.write_text("paused", encoding="utf-8")
+        locked.mkdir()
+        raised: list = []
+        hook = threading.excepthook
+        threading.excepthook = lambda a: raised.append(a.exc_type)
+        try:
+            done, t, *_ = self._lock_log_while_the_runner_is_paused(log, paused, locked, give_up_s=5)
+            t.join(10)
+        finally:
+            threading.excepthook = hook
+            done.set()
+        self.assertTrue(raised, "the marker write raised (the case under test)")
+        with open(log, "a", encoding="utf-8") as f:   # PermissionError here = the handle leaked
+            f.write("")
 
     def test_r7_adv_a1_a_direct_log_line_that_cannot_be_appended_is_counted_and_said(self) -> None:
         # adversary r7 A1: L's own append threw into the batch catch without Register-LogFailure, so a held batch.log at CLAIM_TAKEN turned a healthy batch into
@@ -4626,8 +6166,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         c = "5" * 40
         p = self.share / "cache" / f"playback-attr-3-cuda-{c[:12]}-build.json"
         p.write_bytes(b"\xef\xbb\xbf" + json.dumps({"sourceCommit": c, "dllPairManifestSha256": "f" * 64, "pendingSymbolPresence": False, **ARTIFACT_SHAS}).encode("utf-8"))
-        script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30\n"
+        script = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+                  f"$r = Get-VenueStagedBuildManifest -AgentShare '{psq(self.share)}' -SourceCommit '{c}' -TimeoutSec 30\n"
                   "ConvertTo-Json -Compress -InputObject @{ state = $r.state; sha = $r.sha256; problem = $r.contentProblem }\n")
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -4651,9 +6191,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         for label, (data, expected) in cases.items():
             with self.subTest(case=label):
                 p.write_bytes(data)
-                script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-                          f"$r = Get-VenueStagedBuildManifest -AgentShare '{self.share}' -SourceCommit '{c}' -TimeoutSec 30\n"
-                          f"$oracle = try {{ $null -ne ([IO.File]::ReadAllText('{p}') | ConvertFrom-Json) }} catch {{ $false }}\n"
+                script = (f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+                          f"$r = Get-VenueStagedBuildManifest -AgentShare '{psq(self.share)}' -SourceCommit '{c}' -TimeoutSec 30\n"
+                          f"$oracle = try {{ $null -ne ([IO.File]::ReadAllText('{psq(p)}') | ConvertFrom-Json) }} catch {{ $false }}\n"
                           "ConvertTo-Json -Compress -InputObject @{ state = $r.state; problem = [string]$r.contentProblem; validatorParses = $oracle }\n")
                 out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
                 self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
@@ -4666,7 +6206,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_r5_h2_the_interleave_helper_keeps_an_array_valued_item_whole(self) -> None:
         # key3 H2 (sol): the bare Dequeue() output was enumerated, so one array-valued item came back as its elements.
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             "$items = [object[]]::new(2); $items[0] = @([pscustomobject]@{ arm = 'A' }, [pscustomobject]@{ arm = 'B' }); $items[1] = [pscustomobject]@{ arm = 'A' }\n"
             "$one = [object[]]::new(1); $one[0] = $items[0]\n"
             "[ordered]@{ one = @(Get-VenueInterleavedLegPlan -Items $one).Count; two = @(Get-VenueInterleavedLegPlan -Items $items).Count } | ConvertTo-Json -Compress\n"
@@ -4683,7 +6223,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def test_the_interleave_helper(self) -> None:
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
             "function P([string]$arms) { @($arms.ToCharArray() | ForEach-Object -Begin { $i = 0 } -Process { $i++; [pscustomobject]@{ arm = [string]$_; n = $i } }) }\n"
             "function S($items) { (@(Get-VenueInterleavedLegPlan -Items $items) | ForEach-Object { \"$($_.arm)$($_.n)\" }) -join ' ' }\n"
             "[ordered]@{ block = S (P 'AABB'); uneven = S (P 'AAAB'); three = S (P 'AABBCC'); one = S (P 'AAA'); mixed = S (P 'ABBA') } | ConvertTo-Json -Compress\n"
@@ -4714,8 +6254,8 @@ class LeaseEndUtcTimezoneTests(unittest.TestCase):
         """Seconds from now to the lease end Get-LeaseEndUtc returns, per input shape. The function is the runner's own text (AST), not a copy."""
         until = int(cls.ENDED.timestamp()) + cls.LEFT
         script = (
-            f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
-            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{RUNNER}', [ref]$null, [ref]$null)\n"
+            f"Import-Module '{psq(MODULE)}' -Force -DisableNameChecking\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{psq(RUNNER)}', [ref]$null, [ref]$null)\n"
             "$fn = $ast.Find({ param($x) $x -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $x.Name -eq 'Get-LeaseEndUtc' }, $true)\n"
             ". ([scriptblock]::Create($fn.Extent.Text))\n"
             f"$until = {until}\n"
