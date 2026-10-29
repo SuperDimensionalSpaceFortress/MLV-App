@@ -603,7 +603,9 @@ function Get-InputOutputRefusal {
         }
         if ($why -and $script:refusalInputUnopened -and -not $code) { $code = 'INPUT_UNREADABLE' }
         if ($why -and $script:refusalOutputUnresolved) {
-            if (-not $outputUnresolved) { $outputUnresolved = [pscustomobject]@{ kind = 'output'; input = $g.kind; item = $g.item; code = 'OUTPUT_ZONE_UNRESOLVED'; path = $g.path; why = $why } }
+            # r12 (#704 merge): an output zone that will not resolve (-RunDir itself, a junction to it gone) under a guard budget is a location left unknown too (#705 r5 adversary
+            # pass 2 A2), so -RunDir is not read again unbounded on the main thread (test_artifact_preflight_r5_adv_p2_a2_a_rundir_junction_removed_after_the_open_...)
+            if (-not $outputUnresolved) { $outputUnresolved = [pscustomobject]@{ kind = 'output'; input = $g.kind; item = $g.item; code = 'OUTPUT_ZONE_UNRESOLVED'; path = $g.path; why = $why; locationUnknown = ($null -ne $script:guardBudget) } }
             $why = ''   # no answer about this input: it is still checked as an input below
         }
         # r5b (adversary r5b A1): no output, but the input may be a folder now (it opens, and reads as nothing)
@@ -972,6 +974,8 @@ function Get-InputContentRefusal {
             if ($share -lt $script:GuardReadMinSec) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
             # r5 (key3 r4 B1): no artifact hash while no claim is held (a budget with artifactsOff); the manifest itself is still re-read and compared
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)
+            # r12 (#704 merge): nor at a receipt write (Test-ReceiptWriteSuppressed): the legs already ran, and the artifacts were hashed under the claim and after the open
+            if ($script:receiptGuardActive) { $verifyArtifacts = $false }
             $st = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $g.commit -TimeoutSec $share -VerifyArtifacts:$verifyArtifacts -ArtifactMinSec $script:GuardReadMinSec -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe
             $within = $(if ($null -ne $script:guardBudget) { "a $([Math]::Round($share, 2)) s share of $($script:guardBudget.what)" } else { "a ${share} s bound" })
             if ($st.state -ceq 'UNREACHABLE') { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = 'SHARE_UNREACHABLE'; why = "the staged build manifest for $short could not be read after the claim wait (or the open) within $within at $($st.path): $($st.error -replace '\s+', ' '); its digest cannot be re-validated, so no leg runs on it" } }
@@ -1317,7 +1321,7 @@ $script:receiptPersistFailures = [System.Collections.Generic.List[object]]::new(
 # batch (or a deadline path's) the run ended exit 0 with no receipt on disk. Every suppressed receipt write is now a typed receiptPersistFailures entry (Add-SuppressedReceipt), and a hit
 # no claim guard consumed is the run's typed stop in Write-RunSummary. An input that cannot be opened (INPUT_VANISHED / INPUT_UNREADABLE) is no alias: the receipts are written, and the
 # hit is still kept, so the run ends on it, never exit 0.
-$script:receiptGuardHit = $null
+$script:receiptGuardHit = $null; $script:receiptGuardActive = $false
 function Add-SuppressedReceipt([int]$Batch, [string]$Path, $Hit = $script:suppressionHit, [string]$Detail = '') {
     $hr = $(if ($Hit) { Get-HitRefusal $Hit } else { 'RUN_OUTPUT_ALIASED', 0, 'an accepted input is a runner output' })
     $reason = "WRITE_SUPPRESSED $($hr[0])$(if ($hr[1] -gt 0) { " item=$($hr[1])" }): $($hr[2] -replace '\s+', ' ') $(if ($Detail) { "($($Detail -replace '\s+', ' '); this receipt file only)" } else { '(nothing more is written into -RunDir)' })"
@@ -1326,7 +1330,9 @@ function Add-SuppressedReceipt([int]$Batch, [string]$Path, $Hit = $script:suppre
 }
 function Test-ReceiptWriteSuppressed([int]$Batch, [string]$Path) {
     if (-not $script:RunOutputAliased) {
-        $guardHit = Get-InputOutputRefusal
+        # r12 (#704 merge): locations and manifests only, no artifact hash (Get-InputContentRefusal reads $script:receiptGuardActive)
+        $script:receiptGuardActive = $true
+        try { $guardHit = Get-InputOutputRefusal } finally { $script:receiptGuardActive = $false }
         if (-not (Test-AliasHit $guardHit)) {
             # r5b pass 2 (adversary A1): a content hit is kept too (a staged manifest gone after the final leg is BUILD_NOT_STAGED there), so no hit seen here is dropped
             if ($guardHit -and -not $script:receiptGuardHit) {

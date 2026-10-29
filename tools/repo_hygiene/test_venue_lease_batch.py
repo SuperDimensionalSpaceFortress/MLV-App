@@ -2777,7 +2777,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         spec2 = self.case / "fx-b-copy.json"
         spec2.write_text(self.specs[1].read_text(encoding="utf-8"), encoding="utf-8")
         plan = self.write_plan([self.item(self.specs[0], "A", self.commit_a), self.item(spec2, "A", self.commit_a)])
-        anchor = "        $hit = Get-InputOutputRefusal\n"   # the claim-time guard (the only 8-space one); independent of what follows it, so the same fixture runs on a runner without the sticky hit
+        # the claim-time guard (r12, #705 merge: bounded by Invoke-InputGuard, found once); independent of what follows it, so the same fixture runs on a runner without the sticky hit
+        anchor = "        try { $hit = Invoke-InputGuard }\n"
         args, e = self.plan_cmd(plan, *extra, FAKE_LEASE_REMAIN="70,2700", FAKE_LEG_REMAIN="50,2600")
         return args, e, (anchor, f"        if ($batchNo -eq 2) {{ {inject} }}\n" + anchor)
 
@@ -5320,6 +5321,26 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         [b] = self.batches()
         self.assertEqual((b["endReason"], b["legsRan"]), ("ALL_LEGS_DONE", 1))
 
+    # r12 (#704 merge): #704's receipt guard (Test-ReceiptWriteSuppressed) re-runs Get-InputOutputRefusal before each receipt file, with no guard budget, so on the merged tree it
+    # hashed every cached artifact again (300 s bound) once per receipt file after the legs ran, and an artifact changed then would end a finished run in a typed stop. Neither parent
+    # did that: the receipt guard keeps its location and manifest checks, and the artifacts are hashed only by the preflight, the claim guard and the post-open guard.
+    def test_artifact_preflight_r12_the_receipt_guard_hashes_no_artifact(self) -> None:
+        self._fresh_run_dir()
+        state = self.share / "fake-agent-state.json"
+        artifact_calls = self.case / "r12-artifact-calls.txt"
+        manifest_probe, artifact_probe = self._timed_probes(0, 0)
+        artifact_probe.write_text("param($items)\n" + f"$w = $(if (Test-Path -LiteralPath '{state}' -PathType Leaf) {{ 'open' }} else {{ 'before-open' }})\n"
+                                  + f"[IO.File]::AppendAllText('{artifact_calls}', $w + [Environment]::NewLine)\n", encoding="utf-8")
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]),
+                                "-StagedBuildProbeScript", str(manifest_probe), "-ArtifactProbeScript", str(artifact_probe))
+        r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        calls = artifact_calls.read_text(encoding="utf-8").split() if artifact_calls.exists() else []
+        # the preflight and the claim guard (before the open), then the post-open guard: nothing at the receipts
+        self.assertEqual(calls, ["before-open", "before-open", "open"], r.stdout + r.stderr)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsRan"]), ("ALL_LEGS_DONE", 1))
+
     # r5 ITEM 2 (sol r4 B1; key3 r4 H-B): once Invoke-InputGuard gave up on a location read (locationUnknown), Test-OpenOutputAlias re-resolved -RunDir (Get-PhysicalPath) and read
     # its identity on the main thread, unbounded, and the claim-time refusal probed batch.log: a -RunDir that stopped answering (a UNC share, a junction whose target went away) then
     # held the run before the typed refusal and the lease close. '<guard>:rundir=<sec>' stalls every read of -RunDir in that guard and after it; GUARD_READ_DELAY_SEAM on stderr names
@@ -5458,7 +5479,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 p.wait(timeout=60)
         self.assertNotIn("GUARD_READ_DELAY_SEAM", se, "-RunDir was read again on the main thread after the guard could not resolve it")
         self.assertEqual(p.returncode, 2, so + se)
-        self.assertIn("cannot be resolved to a physical path", se)
+        # r12 (#704 merge, RPF-06): -RunDir's zone no longer resolves while the plan itself opens, so the hit is typed OUTPUT_ZONE_UNRESOLVED (no longer "cannot be resolved to a
+        # physical path"), and under the guard budget it is still a location left unknown (no main-thread re-read, asserted above)
+        self.assertIn("LEG_PLAN_REFUSED reason=OUTPUT_ZONE_UNRESOLVED ", se)
+        self.assertIn("an output location could not be resolved", se)
         self.assertIn("BATCH_OUTPUT_ALIASED", se)
         self.assertEqual(self.leg_calls(), [])
 
