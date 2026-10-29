@@ -11106,6 +11106,14 @@ int MainWindow::openMlvForPreview(QString fileName)
     mlvObject_t * new_MlvObject;
     bool isMcraw = false;
 
+    // r2 (CoS B1): abort, before any side effect, while a prep task still borrows the
+    // gradient mask or a slot buffer that setMlvProcessing / m_pRenderThread->init free.
+    // r5 (adversary 80ca1417 A2): before the loader too, which can write files next to the clip.
+    if( !playbackPrepQuiescentBeforeClipReplacement( "clip-open-preview" ) )
+    {
+        return kClipOpenAbortedPrepBusy;
+    }
+
     if (QFileInfo( fileName ).isDir())
     {
         /* CinemaDNG folder source: a directory of per-frame .dng files. */
@@ -11139,14 +11147,6 @@ int MainWindow::openMlvForPreview(QString fileName)
         QMessageBox::critical( this, tr( "MLV Error" ), tr( "%1" ).arg( mlvErrMsg ), QMessageBox::Cancel, QMessageBox::Cancel );
         freeMlvObject( new_MlvObject );
         return mlvErr;
-    }
-
-    // r2 (CoS B1): abort, before any side effect, while a prep task still borrows the
-    // gradient mask or a slot buffer that setMlvProcessing / m_pRenderThread->init free.
-    if( !playbackPrepQuiescentBeforeClipReplacement( "clip-open-preview" ) )
-    {
-        freeMlvObject( new_MlvObject );
-        return kClipOpenAbortedPrepBusy;
     }
 
     //disable drawing and kill old timer and old WaveFormMonitor
@@ -11351,6 +11351,14 @@ int MainWindow::openMlv( QString fileName )
 
     mlvObject_t * new_MlvObject;
 
+    // r2 (CoS B1): abort, before any side effect, while a prep task still borrows the
+    // gradient mask or a slot buffer that setMlvProcessing / m_pRenderThread->init free.
+    // r5 (adversary 80ca1417 A2): before the loader too, which writes the clip's MAPP index in MAPP mode.
+    if( !playbackPrepQuiescentBeforeClipReplacement( "clip-open" ) )
+    {
+        return kClipOpenAbortedPrepBusy;
+    }
+
     if (QFileInfo( fileName ).isDir())
     {
         /* CinemaDNG folder source: a directory of per-frame .dng files. */
@@ -11382,14 +11390,6 @@ int MainWindow::openMlv( QString fileName )
         QMessageBox::critical( this, tr( "MLV Error" ), tr( "%1" ).arg( mlvErrMsg ), QMessageBox::Cancel, QMessageBox::Cancel );
         freeMlvObject( new_MlvObject );
         return mlvErr;
-    }
-
-    // r2 (CoS B1): abort, before any side effect, while a prep task still borrows the
-    // gradient mask or a slot buffer that setMlvProcessing / m_pRenderThread->init free.
-    if( !playbackPrepQuiescentBeforeClipReplacement( "clip-open" ) )
-    {
-        freeMlvObject( new_MlvObject );
-        return kClipOpenAbortedPrepBusy;
     }
 
     //Set window title to filename

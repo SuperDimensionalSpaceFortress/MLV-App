@@ -296,6 +296,28 @@ TEST(ClipOpenAbortCallersWiring, McrawCameraMatrixResetRunsOnlyAfterBothGuards)
     ASSERT_EQ(body.count(QStringLiteral("on_comboBoxUseCameraMatrix_currentIndexChanged(")), 1);
 }
 
+// adversary 80ca1417 A2: with Create MAPP files on, the loader writes the clip's index map; the prep-busy refusal
+// runs before any loader call, so a refused open leaves nothing on disk (and needs no free of a new object).
+TEST(ClipOpenAbortR5Wiring, BothOpenPathsRefuseBeforeTheLoaderTouchesTheClip)
+{
+    const QString source = mainWindowSource();
+    const QString preview = bodyBetween(source, QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"),
+                                        QStringLiteral("void MainWindow::on_actionOpen_triggered()"));
+    const QString full = bodyBetween(source, QStringLiteral("int MainWindow::openMlv( QString fileName )"),
+                                     QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"));
+    for (const QString & body : {preview, full})
+    {
+        ASSERT_FALSE(body.isEmpty());
+        const int refused = body.indexOf(QStringLiteral("return kClipOpenAbortedPrepBusy;"));
+        const int loader = body.indexOf(QStringLiteral("new_MlvObject = initMlvObjectWith"));
+        ASSERT_TRUE(refused >= 0);
+        ASSERT_TRUE(loader > refused);
+        const int guard = body.lastIndexOf(QStringLiteral("if( !playbackPrepQuiescentBeforeClipReplacement( "), refused);
+        ASSERT_TRUE(guard >= 0);
+        ASSERT_FALSE(body.mid(guard, refused - guard).contains(QStringLiteral("freeMlvObject(")));
+    }
+}
+
 TEST(ClipOpenAbortCallersWiring, BothOpenPathsReturnTheRefusalCodesNotACorruptFileCode)
 {
     const QString source = mainWindowSource();
@@ -944,7 +966,7 @@ TEST(ClipOpenAbortR5Wiring, EveryImportCallerShowsTheLastRowOnlyFromTheBatchOutc
         ASSERT_TRUE(note >= 0);
         ASSERT_TRUE(shown > note);
     }
-    // the drop path (openMlvSet) shows the last row from the same outcome
+    // the drop path (openMlvSet) shows the last row from the same outcome (FCPXML import: OPEN, see r5 summary)
     const int dropShow = source.indexOf(QStringLiteral("if( SESSION_CLIP_COUNT && imports.showLastRow() )\n    {\n        //Show last imported file"));
     const int dropNote = source.lastIndexOf(QStringLiteral("imports.note( importNewMlv( fileName ) );"), dropShow);
     ASSERT_TRUE(dropShow >= 0);
