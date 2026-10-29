@@ -2534,10 +2534,16 @@ function Test-DvReceiptValid {
                     try {
                         $heapLogPath = Join-Path $ev.dir 'heapdump\watcher.log'
                         $heapLogSha = [string](Get-DvProp $storedHeap 'watcherLogSha256')
-                        if (-not (Test-Path -LiteralPath $heapLogPath -PathType Leaf) -or -not $heapLogSha -or (Get-DvSha256OfFile $heapLogPath) -cne $heapLogSha) {
+                        # r11b (adversary r11b A4): the log is read ONCE; the hash is taken over those bytes and the capture is derived from the same bytes,
+                        # so a file replaced between hashing and reading is never interpreted under the old hash
+                        $heapLogBytes = $(if (Test-Path -LiteralPath $heapLogPath -PathType Leaf) { [IO.File]::ReadAllBytes($heapLogPath) } else { $null })
+                        $heapLogBytesSha = $null
+                        if ($null -ne $heapLogBytes) { $heapSha = [System.Security.Cryptography.SHA256]::Create(); try { $heapLogBytesSha = ([BitConverter]::ToString($heapSha.ComputeHash($heapLogBytes)) -replace '-', '').ToLowerInvariant() } finally { $heapSha.Dispose() } }
+                        if ($null -eq $heapLogBytes -or -not $heapLogSha -or $heapLogBytesSha -cne $heapLogSha) {
                             $invalid.Add("HEAPDUMP_CAPTURE_NOT_IN_EVIDENCE: the receipt says '$heapState' but the evidence holds no heapdump\watcher.log under the sha256 the receipt recorded")
                         } else {
-                            $fromLog = Get-DvHeapCaptureFromLog -State $heapState -LogLines @([IO.File]::ReadAllLines($heapLogPath))
+                            $heapLogText = (New-Object System.Text.UTF8Encoding($false)).GetString($heapLogBytes).TrimStart([char]0xFEFF)
+                            $fromLog = Get-DvHeapCaptureFromLog -State $heapState -LogLines @([regex]::Split($heapLogText, '\r?\n') | Where-Object { $_ -ne '' })
                             if (-not $fromLog.consistent) { $invalid.Add("HEAPDUMP_CAPTURE_NOT_IN_EVIDENCE: $($fromLog.reason)") }
                             elseif ($heapState -ceq 'DUMPED') {
                                 # r11 (adversary r10 A2): the dump on disk is the one the DUMP_WRITTEN line names (file name, byte count), never another *.dmp

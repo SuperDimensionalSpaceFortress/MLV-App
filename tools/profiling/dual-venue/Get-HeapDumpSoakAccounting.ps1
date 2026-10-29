@@ -27,15 +27,20 @@ function Test-JsonTrue($v) { ($v -is [bool]) -and $v }
 # is not a line break. A WATCH message ends at a newline, or at the ' | ' segment that closes with the watcher's own ' pid=<watcherPid>' (the record's
 # leading watcherPid= field); with no such close everything after it on that line is WATCH text. Only a segment outside every WATCH message whose
 # token right after the timestamp is DEBUGGER_ATTACHED is an attach.
+# r11b (adversary r11b A1): the close must be UNAMBIGUOUS: when more than one segment from the WATCH opener on ends with that pid= (one of them forged inside
+# the WATCH text), nothing after the opener on that line is read.
 function Test-SoakLogAttached([string]$text) {
     $watcherPid = $(if ($text -cmatch '^watcherPid=(?<p>\d+)\s') { $Matches['p'] } else { $null })
     foreach ($line in [regex]::Split($text, '\r?\n')) {
-        $inWatch = $false
-        foreach ($segment in [regex]::Split($line, ' \| ')) {
-            $closes = ($null -ne $watcherPid) -and ($segment -cmatch ('\spid=' + $watcherPid + '$'))
-            if ($inWatch) { if ($closes) { $inWatch = $false }; continue }
-            if ($segment -cmatch '(^|\s)\S+ WATCH(\s|$)') { $inWatch = -not $closes; continue }
-            if ($segment -cmatch '^\S+ DEBUGGER_ATTACHED pid=\d+(\s|$)') { return $true }
+        $segments = @([regex]::Split($line, ' \| '))
+        for ($i = 0; $i -lt $segments.Count; $i++) {
+            if ($segments[$i] -cmatch '(^|\s)\S+ WATCH(\s|$)') {
+                $closes = @(for ($j = $i; $j -lt $segments.Count; $j++) { if (($null -ne $watcherPid) -and ($segments[$j] -cmatch ('\spid=' + $watcherPid + '$'))) { $j } })
+                if ($closes.Count -ne 1) { break }
+                $i = $closes[0]
+                continue
+            }
+            if ($segments[$i] -cmatch '^\S+ DEBUGGER_ATTACHED pid=\d+(\s|$)') { return $true }
         }
     }
     return $false

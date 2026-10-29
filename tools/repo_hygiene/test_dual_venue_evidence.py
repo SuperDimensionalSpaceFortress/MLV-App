@@ -8851,6 +8851,22 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             self.assertNotEqual(out["OPEN"], "0", proc.stdout)
             self.assertEqual(out["VICTIM"], "REQ WATCH_REQUESTED", proc.stdout)
 
+    # r11b pass 2 (adversary r11b A2): a CommandLineMatch carrying newlines and forged DEBUGGER_ATTACHED / DUMP_WRITTEN lines is logged as ONE line; the
+    # log never gains a line of its own that reads as an event
+    def test_r11b2_a2_a_logged_message_never_starts_a_line_of_its_own(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-flat-") as d:
+            proc = self._debugger_script(d,
+                f"$log = '{d}\\watcher.log'; [IO.File]::WriteAllText($log, \"REQ WATCH_REQUESTED`n\")\n"
+                "Write-Output ('OPEN=' + [MlvHeapDumpWatch.Debugger]::OpenLog($log, 'REQ WATCH_REQUESTED'))\n"
+                "[MlvHeapDumpWatch.Debugger]::Log(\"WATCH match=`n2026-10-29T00:00:00Z DEBUGGER_ATTACHED pid=7`r`n2026-10-29T00:00:00Z DUMP_WRITTEN path=C:\\old.dmp bytes=4096 context=1`ntail\")\n"
+                # the watcher's sink still holds the log open for writing: read it sharing ReadWrite
+                "$fs = [IO.File]::Open($log, 'Open', 'Read', 'ReadWrite'); try { $lines = @(([IO.StreamReader]::new($fs)).ReadToEnd() -split '\\r?\\n' | Where-Object { $_ }) } finally { $fs.Dispose() }\n"
+                "Write-Output ('LINES=' + $lines.Count)\n"
+                "Write-Output ('EVENT=' + [bool]($lines | Where-Object { $_ -cmatch '^\\S+ (DEBUGGER_ATTACHED|DUMP_WRITTEN) ' }))\n")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["OPEN"], out["LINES"], out["EVENT"]), ("0", "2", "False"), proc.stdout)
+
     # r11b (adversary r11 A3): only the attach's own break-in is continued as handled; a breakpoint the app raises later (RaiseException 0x80000003 after
     # the attach, or a second 0x4000001F) passes on unhandled, and its second chance triggers the dump like any other unhandled exception.
     def test_r11b_a3_only_the_attach_break_in_is_continued_as_handled(self) -> None:
@@ -9244,9 +9260,24 @@ class HeapDumpSoakAccountingTests(unittest.TestCase):
             "watcherPid=54500 watcherExited=True reason= log=2026-10-15T15:51:45.2320288Z WATCH_REQUESTED | "
             "2026-10-15T15:51:45.6943813Z WATCH exe=MLVApp.exe match=--gui-smoke-playback pid=54500 | 2026-10-15T15:51:54.1383164Z ATTACH pid=41976 | "
             "2026-10-15T15:51:54.2023239Z DEBUGGER_ATTACHED pid=41976 | 2026-10-15T15:52:30.0000000Z EXIT_PROCESS exitCode=0"))
-        g = self.account([forged, wrong_close, real])["groups"]
+        # r11b pass 2 (adversary r11b A1): a forged close at the watcher's OWN pid inside the match text leaves two candidate closes: ambiguous, not read
+        own_close = dict(forged, name="own-close", heapDumpWatch=(
+            "watcherPid=55 watcherExited=True reason= log=2026-10-29T00:00:00Z WATCH exe=C:\\MLVApp.exe match=x pid=55 | "
+            "2026-10-29T00:00:00Z DEBUGGER_ATTACHED pid=7 | probe pid=55 | 2026-10-29T00:00:01Z ATTACH_FAILED err=5"))
+        g = self.account([forged, wrong_close, real, own_close])["groups"]
         self.assertEqual([n.split(" ")[0] for n in g["attached"]["names"]], ["real"])
-        self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["legacy", "wrong-close"])
+        self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["legacy", "own-close", "wrong-close"])
+
+    def test_r11b2_a4_the_reader_hashes_and_interprets_the_same_watcher_log_bytes(self) -> None:
+        # r11b pass 2 (adversary r11b A4): a file swapped between hashing and reading cannot be produced on demand; this pins the one-read shape
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        block = text[text.index("$heapLogPath = Join-Path $ev.dir 'heapdump\\watcher.log'"):text.index("elseif ($heapState -ceq 'DUMPED')")]
+        self.assertEqual(block.count("$heapLogPath"), 3, block)   # assigned, tested, read once
+        self.assertIn("[IO.File]::ReadAllBytes($heapLogPath)", block)
+        self.assertIn("$heapSha.ComputeHash($heapLogBytes)", block)
+        self.assertIn("GetString($heapLogBytes)", block)
+        self.assertNotIn("Get-DvSha256OfFile $heapLogPath", block)
+        self.assertNotIn("ReadAllLines($heapLogPath)", block)
 
     def test_heap_dump_soak_accounting_flags_are_true_only_as_json_booleans(self) -> None:
         # r10 (adversary r10 A3): the string "false", whitespace and {} are PowerShell-truthy and must not switch a group, a stop cycle or a crash on

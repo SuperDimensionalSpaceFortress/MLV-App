@@ -2567,8 +2567,11 @@ function Start-AttrCudaHeapDumpWatch {
                 FileStream stream = sink;
                 if (stream == null) return;
                 try {
+                    // r11b (adversary r11b A2): one call is one log line: a CR or LF inside the message (the WATCH line's match or exe text) is escaped,
+                    // so no text the watcher logs can start a line of its own that reads as an event
+                    string flat = (message ?? "").Replace("\r", "\\r").Replace("\n", "\\n");
                     lock (stream) {
-                        byte[] line = new System.Text.UTF8Encoding(false).GetBytes(DateTime.UtcNow.ToString("o") + " " + message + Environment.NewLine);
+                        byte[] line = new System.Text.UTF8Encoding(false).GetBytes(DateTime.UtcNow.ToString("o") + " " + flat + Environment.NewLine);
                         stream.Seek(0, SeekOrigin.End);
                         stream.Write(line, 0, line.Length);
                         stream.Flush(true);
