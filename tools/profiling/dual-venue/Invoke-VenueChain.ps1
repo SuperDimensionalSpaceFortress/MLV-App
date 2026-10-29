@@ -451,7 +451,7 @@ foreach ($leg in $plan) {
             if ($w.action -ceq 'WAIT') {
                 Close-LegTicket $leg.name 'TICKET_DROPPED' 'waiting-for-a-better-window'
                 $until = [DateTimeOffset]::Parse($w.targetUtc, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime
-                while ([DateTime]::UtcNow -lt $until -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Seconds ([int][Math]::Max(1, [Math]::Min(60, ($until - [DateTime]::UtcNow).TotalSeconds))) }
+                while ([DateTime]::UtcNow -lt $until -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Seconds ([int][Math]::Max(1.0, [Math]::Min(60.0, ($until - [DateTime]::UtcNow).TotalSeconds))) }
                 continue
             }
         }

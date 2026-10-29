@@ -218,7 +218,7 @@ function Invoke-BoundedFetch {
     $startedAt = try { $p.StartTime } catch { $null }
     $p.StandardInput.Close()
     [void]$p.StandardOutput.ReadToEndAsync(); [void]$p.StandardError.ReadToEndAsync()
-    $done = $p.WaitForExit([int][Math]::Max(1000, ($deadline - [DateTime]::UtcNow).TotalMilliseconds))
+    $done = $p.WaitForExit([int][Math]::Max(1000.0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds))
     if (-not $done) { return (Stop-ProcessConfirmed $p $startedAt) }
     $null
 }
@@ -302,7 +302,7 @@ function Invoke-BoundedChain([string]$Backend) {
     $startedAt = try { $p.StartTime } catch { $null }
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
-    $waitMs = [int][Math]::Max(1000, ($deadline - [DateTime]::UtcNow).TotalMilliseconds + ($KillGraceSec * 1000))
+    $waitMs = [int][Math]::Max(1000.0, ($deadline - [DateTime]::UtcNow).TotalMilliseconds + ($KillGraceSec * 1000))
     $timedOut = -not $p.WaitForExit($waitMs)
     $kill = $null
     if ($timedOut) { $kill = Stop-ProcessConfirmed $p $startedAt }

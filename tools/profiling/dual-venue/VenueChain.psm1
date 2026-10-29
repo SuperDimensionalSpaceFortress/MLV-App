@@ -300,8 +300,8 @@ function Get-VenueTickets {
                     $why = Get-VenueTicketStaleReason -Ticket $t -NowUtc $now
                     if ($why) { $row.state = 'STALE'; $row.reason = $why }
                     $c = ConvertTo-VenueUtc $t.createdUtc; $b = ConvertTo-VenueUtc $t.heartbeatUtc
-                    if ($null -ne $c) { $row.ageSec = [int][Math]::Max(0, ($now - $c).TotalSeconds) }
-                    if ($null -ne $b) { $row.heartbeatAgeSec = [int][Math]::Max(0, ($now - $b).TotalSeconds) }
+                    if ($null -ne $c) { $row.ageSec = [int][Math]::Max(0.0, ($now - $c).TotalSeconds) }
+                    if ($null -ne $b) { $row.heartbeatAgeSec = [int][Math]::Max(0.0, ($now - $b).TotalSeconds) }
                 }
             }
             $rows.Add([pscustomobject]$row)
@@ -437,7 +437,7 @@ function Format-VenueClaimStatus {
     $held = ''
     if ($c.claim) {
         $claimed = ConvertTo-VenueUtc $c.claim.claimedUtc
-        $age = $(if ($null -ne $claimed) { [int][Math]::Max(0, ((ConvertTo-VenueUtc $Status.nowUtc) - $claimed).TotalSeconds) } else { 'UNKNOWN' })
+        $age = $(if ($null -ne $claimed) { [int][Math]::Max(0.0, ((ConvertTo-VenueUtc $Status.nowUtc) - $claimed).TotalSeconds) } else { 'UNKNOWN' })
         $held = " holderPid=$($c.claim.ownerPid) runDir=$($c.claim.runDir) purpose=$($c.claim.purpose) ageSec=$age expiresUtc=$((ConvertTo-VenueUtc $c.claim.expiresUtc).ToString('o'))"
     }
     "CLAIM_STATUS venue=$($Status.venue) state=$($c.state)$(if ($c.reason) { " reason=$($c.reason)" })$held"
@@ -694,7 +694,7 @@ function Get-VenueStagedBuildManifest {
                 # r7 (sol r6 B1): the exact remainder, not its whole seconds (2.7 s left was floored to 1, under the guard's 2 s minimum, and a healthy hash never started)
                 $left = $TimeoutSec - $callClock.Elapsed.TotalSeconds
                 # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its own minimum ($script:GuardReadMinSec, the same rule)
-                if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Round([Math]::Max(0, $left), 2)) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null } }
+                if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Round([Math]::Max(0.0, $left), 2)) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null } }
                 $artSec = $left
             }
             # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file

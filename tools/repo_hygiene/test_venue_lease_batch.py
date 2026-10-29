@@ -349,6 +349,117 @@ def batch_result(stdout: str) -> dict:
 
 
 @requires_windows_pwsh
+# LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r10: numeric-contract scanners for the dual-venue PowerShell. Both are tested on their own spellings below, so a pin cannot go blind
+# to the one adjacent spelling it was written against (fable key3 r9 P-02).
+def _ps_balanced(text: str, open_at: int, open_ch: str, close_ch: str) -> int:
+    """Index of the bracket that closes the one at open_at, or -1."""
+    depth = 0
+    for i in range(open_at, len(text)):
+        if text[i] == open_ch:
+            depth += 1
+        elif text[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _ps_balanced_back(text: str, close_at: int, open_ch: str, close_ch: str) -> int:
+    """Index of the bracket that opens the one closing at close_at, or -1."""
+    depth = 0
+    for i in range(close_at, -1, -1):
+        if text[i] == close_ch:
+            depth += 1
+        elif text[i] == open_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _ps_split_args(text: str) -> list[str]:
+    out, depth, cur = [], 0, []
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    out.append("".join(cur).strip())
+    return out
+
+
+# an operand that is (or contains) a [double]: a double literal, a [double] cast, a TimeSpan total, a monotonic clock, or the runner's own double budget names
+_PS_DOUBLE_OPERAND = re.compile(r"Total(?:Seconds|Milliseconds|Minutes)\b|\.Elapsed\b|\[(?:system\.)?double\]|(?<![\w.$])\d+\.\d+\b|\$(?:left|share)\b|\.sec\b", re.I)
+
+
+# a second operand that is whole by construction (an [int] / [long] cast, or a Floor / Ceiling / Truncate): the Int32 overload loses nothing on it
+_PS_INTEGRAL_OPERAND = re.compile(r"\s*(?:\[(?:int|int32|long|int64)\]|\[(?:system\.)?math\]::(?:floor|ceiling|truncate)\()", re.I)
+
+
+def ps_integer_first_minmax(text: str) -> list[tuple[int, str]]:
+    """Every [Math]::Min/Max call whose first operand is not a double while its second one is: PowerShell picks the Int32 overload for it and ROUNDS the double (2.3 -> 2)."""
+    hits = []
+    for m in re.finditer(r"\[(?:system\.)?math\]::(?:min|max)\(", text, re.I):
+        line_start = text.rfind("\n", 0, m.start()) + 1
+        if "#" in text[line_start:m.start()]:
+            continue  # a comment
+        close = _ps_balanced(text, m.end() - 1, "(", ")")
+        args = _ps_split_args(text[m.end():close]) if close > 0 else []
+        if len(args) == 2 and not _PS_DOUBLE_OPERAND.search(args[0]) and _PS_DOUBLE_OPERAND.search(args[1]) and not _PS_INTEGRAL_OPERAND.match(args[1]):
+            hits.append((text.count("\n", 0, m.start()) + 1, text[m.start():close + 1]))
+    return hits
+
+
+_PS_FLOAT_TYPE = re.compile(r"(?:system\.)?(?:double|single|float|decimal)", re.I)
+
+
+def ps_float_validaterange_params(text: str) -> list[tuple[int, str, bool]]:
+    """Every [ValidateRange(..)] on a floating-point parameter, as (line, text, has_integer_endpoint). The type may follow the attribute, precede it ([double][ValidateRange(..)]),
+    sit past other attributes ([Parameter()]) and the attribute may span lines."""
+    found = []
+    for m in re.finditer(r"\[ValidateRange\(", text, re.I):
+        close = _ps_balanced(text, m.end() - 1, "(", ")")
+        if close < 0:
+            continue
+        end = close + 1
+        while end < len(text) and text[end].isspace():
+            end += 1
+        if text[end:end + 1] != "]":
+            continue
+        groups = []
+        j = end + 1
+        while True:
+            while j < len(text) and text[j].isspace():
+                j += 1
+            if text[j:j + 1] != "[":
+                break
+            e = _ps_balanced(text, j, "[", "]")
+            if e < 0:
+                break
+            groups.append(text[j + 1:e].strip())
+            j = e + 1
+        i = m.start() - 1
+        while True:
+            while i >= 0 and text[i].isspace():
+                i -= 1
+            if i < 0 or text[i] != "]":
+                break
+            b = _ps_balanced_back(text, i, "[", "]")
+            if b < 0:
+                break
+            groups.append(text[b + 1:i].strip())
+            i = b - 1
+        if any(_PS_FLOAT_TYPE.fullmatch(g) for g in groups):
+            ends = _ps_split_args(text[m.end():close])
+            found.append((text.count("\n", 0, m.start()) + 1, text[m.start():end + 1], any(re.fullmatch(r"-?\d+", e) for e in ends)))
+    return found
+
+
 class VenueLeaseBatchRunnerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -3130,14 +3241,41 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(set(bound.values()), {"BOUND"}, got)
 
     def test_artifact_preflight_r9_b1_no_double_parameter_of_the_dual_venue_scripts_has_integer_range_endpoints(self) -> None:
-        # the class, not the three sites: any `[ValidateRange(<int>, <int>)][double]` in the dual-venue scripts validates a rounded copy
-        bad = []
+        # the class, not the three sites: any `[ValidateRange(<int>, <int>)]` on a floating-point parameter in the dual-venue scripts validates a rounded copy. r10 (fable key3 r9 P-02):
+        # whatever order, spelling or layout the declaration takes ([Parameter()] between, [double] before the attribute, [Double] / [System.Double], a multi-line attribute)
+        bad, seen = [], 0
         for path in sorted(DV.glob("*.ps*1")):
-            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-                for m in re.finditer(r"\[ValidateRange\(([^)]*)\)\]\s*\[(?:double|single|float|decimal)\]", line):
-                    if any(re.fullmatch(r"-?\d+", e.strip()) for e in m.group(1).split(",")):
-                        bad.append(f"{path.name}:{n}: {m.group(0)}")
-        self.assertEqual(bad, [], "a [double] parameter's ValidateRange endpoints must be doubles (1.0, 600.0)")
+            for line, text, integer_end in ps_float_validaterange_params(path.read_text(encoding="utf-8")):
+                seen += 1
+                if integer_end:
+                    bad.append(f"{path.name}:{line}: {text}")
+        self.assertEqual(bad, [], "a floating-point parameter's ValidateRange endpoints must be doubles (1.0, 600.0)")
+        self.assertGreaterEqual(seen, 3, "the scan found the r9 sites (Get-VenueStagedBuildManifest -TimeoutSec / -ArtifactMinSec, Invoke-VenueBoundedRead -TimeoutSec): it is not vacuous")
+
+    def test_artifact_preflight_r10_the_validaterange_scanner_sees_every_declaration_spelling(self) -> None:
+        bad = [
+            "param([ValidateRange(1, 600)][double]$T)",
+            "param([ValidateRange(1, 600)]  [Double]$T)",
+            "param([ValidateRange(1, 600)][System.Double]$T)",
+            "param([Parameter()][ValidateRange(1, 600)][double]$T)",
+            "param([Parameter(Mandatory)]\n  [ValidateRange(1, 600)]\n  [double]\n  $T)",
+            "param([double][ValidateRange(1, 600)]$T)",
+            "param([Parameter()][double][ValidateRange(1, 600)]$T)",
+            "param([ValidateRange(\n    1,\n    600.0)][double]$T)",
+            "param([ValidateRange(0.5, 600)][single]$T)",
+            "param([ValidateRange( 1 , 600 ) ][decimal]$T)",
+        ]
+        for text in bad:
+            self.assertEqual([x[2] for x in ps_float_validaterange_params(text)], [True], text)
+        good = [
+            "param([ValidateRange(1.0, 600.0)][double]$T)",
+            "param([double][ValidateRange(1.0, 600.0)]$T)",
+            "param([Parameter()]\n[ValidateRange(\n  1.0,\n  600.0)]\n[double]$T)",
+        ]
+        for text in good:
+            self.assertEqual([x[2] for x in ps_float_validaterange_params(text)], [False], text)
+        for text in ("param([ValidateRange(1, 600)][int]$T)", "param([int][ValidateRange(1, 600)]$T)", "param([ValidateRange(1, 600)][string]$T)"):
+            self.assertEqual(ps_float_validaterange_params(text), [], text)
 
     # r9 hardening (sol r7 + sol r8b + fable H3 + Dot P3): the per-file minimum re-check was pinned by source position only, so a label-gated mutation (the NOTIME check restricted to
     # packageZip) passed the pin. Behavioural: the production worker scriptblock (lifted from the module's AST) runs on three files with a fake clock (no real sleeps) and a Test-Path
@@ -3848,7 +3986,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # offline probes; each manifest read and each hash appends a line.
     def _guard_room_run(self, room: float, manifest_ms: int = 100, hash_ms: int = 100) -> dict:
         c = "3" * 40
-        reads, hashes = self.case / f"room-{room}-reads.txt", self.case / f"room-{room}-hashes.txt"
+        reads, hashes = self.case / f"room-{room}-{manifest_ms}-reads.txt", self.case / f"room-{room}-{manifest_ms}-hashes.txt"
+        bounds = self.case / f"room-{room}-{manifest_ms}-bounds.txt"
         facts = ("('a' * 64); 'C:" + c + "'; 'D:' + ('f' * 64); 'S:bool'; "
                  "'A:packageZip=ok'; 'H:packageZip=' + ('1' * 64); 'A:exe=ok'; 'H:exe=' + ('2' * 64); 'A:dll=ok'; 'H:dll=' + ('3' * 64)")
         script = (f"Import-Module '{MODULE}' -Force -DisableNameChecking\n"
@@ -3860,7 +3999,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                   f"$legPlanMode = $true; $AgentShare = '{self.share}'; $script:guardProgress = $null\n"
                   f"$script:guardedInputs = @([pscustomobject]@{{ kind = 'build'; item = 1; path = 'manifest'; commit = '{c}'; sha256 = ('a' * 64) }})\n"
                   f"$stagedBuildProbe = {{ param($p) [IO.File]::AppendAllText('{reads}', 'm' + [Environment]::NewLine); [Threading.Thread]::Sleep({manifest_ms}); {facts} }}\n"
-                  f"$artifactProbe = {{ param($i) [IO.File]::AppendAllText('{hashes}', 'h' + [Environment]::NewLine); [Threading.Thread]::Sleep({hash_ms}) }}\n"
+                  f"$artifactProbe = {{ param($i) [IO.File]::AppendAllText('{hashes}', 'h' + [Environment]::NewLine); [IO.File]::AppendAllText('{bounds}', ([string]($i[0].endSec - $i[0].clock.Elapsed.TotalSeconds) + [Environment]::NewLine)); [Threading.Thread]::Sleep({hash_ms}) }}\n"
                   # warm the runspace machinery first, so the room measures the reads and not the first runspace's start
                   # (adversary r7 A3: the helper is not exported, so it is called inside the module)
                   "$null = & (Get-Module VenueChain) { Invoke-VenueBoundedRead -ScriptText '1' -Argument 0 -TimeoutSec 30 }\n"
@@ -3873,6 +4012,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         got = json.loads(out.stdout.strip().splitlines()[-1])
         got["reads"] = len(reads.read_text(encoding="utf-8").split()) if reads.exists() else 0
         got["hashes"] = len(hashes.read_text(encoding="utf-8").split()) if hashes.exists() else 0
+        # the bound the (first) hash was given, on the call's own clock: what was left of the room after the manifest read
+        given = bounds.read_text(encoding="utf-8").split() if bounds.exists() else []
+        got["bound"] = float(given[0]) if given else None
         return got
 
     def test_artifact_preflight_r7_b1_a_healthy_build_in_a_2_8s_guard_room_is_validated_with_one_hash(self) -> None:
@@ -3891,6 +4033,49 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         got = self._guard_room_run(1.9)
         self.assertEqual((got["code"], got["reads"], got["hashes"]), ("LEG_BUDGET_EXCEEDS_LEASE", 0, 0), got)
         self.assertIn("no time is left in the test room", got["why"])
+
+    # r10 B1 (sol r9 = Dot cc5b2a97): `[Math]::Min(330, <double>)` takes the Int32 overload (an integer first operand), so a guard room of 2.3 / 2.4 / 2.49 s became a 2 s share, the hash was
+    # left under its 2 s minimum after a 100 ms manifest read and a healthy staged build was refused SHARE_UNREACHABLE with no hash (after the open, a lease closed and charged with no leg).
+    # A room of 2.8 rounded UP to 3 and hid it. The share keeps its fraction, and the hash is given what is left of the room, never more.
+    def _assert_fractional_room_validates(self, room: float) -> None:
+        got = self._guard_room_run(room)
+        self.assertEqual((got["code"], got["hashes"]), ("", 1), f"a {room} s room, a 100 ms read and a 100 ms hash: {got}")
+        self.assertIsNotNone(got["bound"], got)
+        self.assertGreaterEqual(got["bound"], 2.0, f"the hash started under its 2 s minimum: {got}")
+        self.assertLessEqual(got["bound"], room - 0.1, f"the hash was given more than the room left after the 100 ms read: {got}")
+
+    def test_artifact_preflight_r10_b1_a_healthy_build_in_a_2_3s_guard_room_is_validated_with_one_hash(self) -> None:
+        self._assert_fractional_room_validates(2.3)
+
+    def test_artifact_preflight_r10_b1_a_healthy_build_in_a_2_4s_guard_room_is_validated_with_one_hash(self) -> None:
+        self._assert_fractional_room_validates(2.4)
+
+    def test_artifact_preflight_r10_b1_a_healthy_build_in_a_2_49s_guard_room_is_validated_with_one_hash(self) -> None:
+        self._assert_fractional_room_validates(2.49)
+
+    def test_artifact_preflight_r10_b1_a_room_that_rounded_up_is_not_overshot_by_the_hash_bound(self) -> None:
+        # the other direction of the same defect: 2.6 and 2.8 rounded UP to a 3 s share, and the hash was given more than the room held
+        for room in (2.6, 2.8):
+            got = self._guard_room_run(room)
+            self.assertEqual((got["code"], got["hashes"]), ("", 1), got)
+            self.assertLessEqual(got["bound"], room - 0.1, f"a {room} s room: the hash was given more than it held: {got}")
+
+    def test_artifact_preflight_r10_b1_the_refusal_after_a_slow_read_names_the_fractional_bound_and_time_left(self) -> None:
+        # room 2.4 admits the read (2 s minimum) but a 500 ms read leaves the hash about 1.9 s: refused typed, and the message carries the sub-second quantities it measured
+        got = self._guard_room_run(2.4, manifest_ms=500)
+        self.assertEqual((got["code"], got["hashes"]), ("SHARE_UNREACHABLE", 0), got)
+        m = re.search(r"no time is left of -TimeoutSec (\d+(?:\.\d+)?) after the manifest read \((\d+(?:\.\d+)?) s left, under 2\)", got["why"])
+        self.assertIsNotNone(m, got["why"])
+        self.assertTrue(2.3 <= float(m.group(1)) <= 2.4, f"-TimeoutSec should name the 2.4 s room less the read start, not a rounded integer: {got['why']}")
+        self.assertTrue(1.5 < float(m.group(2)) < 2.0 and "." in m.group(2), f"the time left is under 2 and fractional, never rounded up to '2' or down to '1': {got['why']}")
+
+    def test_artifact_preflight_r10_b1_sibling_a_time_left_just_under_the_minimum_is_not_reported_as_the_minimum(self) -> None:
+        # [Math]::Max(0, $left) with an integer first operand rounded 1.9 to "2 s left, under 2"; room 3.0 and a 1 s read leave the hash just under 2 s
+        got = self._guard_room_run(3.0, manifest_ms=1000)
+        self.assertEqual((got["code"], got["hashes"]), ("SHARE_UNREACHABLE", 0), got)
+        m = re.search(r"\((\d+(?:\.\d+)?) s left, under 2\)", got["why"])
+        self.assertIsNotNone(m, got["why"])
+        self.assertLess(float(m.group(1)), 2.0, f"'{m.group(0)}' reports the time left rounded up to the minimum it is under: {got['why']}")
 
     def test_artifact_preflight_r7_b1_control_no_hash_starts_with_under_the_minimum_left_after_the_read(self) -> None:
         # the read is admitted (2.3 s left) but takes 600 ms: the hash would start with about 1.7 s, so none starts, and the call still ends inside the room
@@ -3939,10 +4124,51 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertLessEqual(max(given), 330, f"the post-open hash was given {max(given):.1f} s: over the preflight's own 330 s bounds")
 
     def test_artifact_preflight_r7_adv_a1_the_guard_share_cap_is_the_preflights_own_bounds(self) -> None:
+        # r10: the cap is pinned by its VALUE and its type, not by one spelling: `Min(330, ...)` with an integer first operand was the r9 B1 defect (Int32 overload), and any double
+        # spelling of the same cap (330.0, [double]330, 330.00) is the contract
         text = RUNNER.read_text(encoding="utf-8")
         guard = text[text.index("function Get-InputContentRefusal"):text.index("function Stop-InputIsOutput")]
-        self.assertIn("$share = [Math]::Min(330, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds)", guard)
+        m = re.search(r"\$share = \[Math\]::Min\((\[double\]\s*)?(\d+(?:\.\d+)?)\s*,\s*\$script:guardBudget\.sec\s*-\s*\$script:guardBudget\.clock\.Elapsed\.TotalSeconds\)", guard)
+        self.assertIsNotNone(m, "the guard's share is Min(<cap>, <budget> - <elapsed>)")
+        self.assertEqual(float(m.group(2)), 330.0, "the cap is the preflight's own 30 s + 300 s bounds")
+        self.assertTrue(m.group(1) or "." in m.group(2), "the cap is a double: an integer first operand takes the Int32 overload and rounds the room (2.3 s -> 2)")
         self.assertIn("-TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }", text, "the preflight's bounds the cap is the sum of")
+
+    def test_artifact_preflight_r10_no_dual_venue_math_min_or_max_rounds_a_double_through_an_integer_first_operand(self) -> None:
+        # the class, not the :771 instance: every [Math]::Min/Max in the dual-venue folder whose second operand is a double (a TimeSpan total, a clock, a budget) has a double first operand too
+        bad = []
+        for path in sorted(DV.glob("*.ps*1")):
+            for line, call in ps_integer_first_minmax(path.read_text(encoding="utf-8")):
+                bad.append(f"{path.name}:{line}: {call}")
+        self.assertEqual(bad, [], "make the first operand a double (330.0, [double]$x): an integer one selects the Int32 overload and rounds the double")
+
+    def test_artifact_preflight_r10_the_math_overload_scanner_sees_every_spelling(self) -> None:
+        bad = [
+            "[Math]::Min(330, $b.sec - $b.clock.Elapsed.TotalSeconds)",
+            "[math]::MAX( 0 , $left )",
+            "[System.Math]::Max(0, $left)",
+            "[Math]::Min($Wait, ($d - [DateTime]::UtcNow).TotalSeconds)",
+            "[int][Math]::Max(60, [Math]::Min($w, ($d - [DateTime]::UtcNow).TotalSeconds))",
+            "$x = [Math]::Max(1000, ($deadline - [DateTime]::UtcNow).TotalMilliseconds + 10)",
+            "[Math]::Min(2, [double]$remaining)",
+        ]
+        for text in bad:
+            self.assertTrue(ps_integer_first_minmax(text), text)
+        good = [
+            "[Math]::Min(330.0, $b.sec - $b.clock.Elapsed.TotalSeconds)",
+            "[Math]::Max(0.0, $left)",
+            "[Math]::Min([double]$Wait, ($d - [DateTime]::UtcNow).TotalSeconds)",
+            "[Math]::Min([double]330, $left)",
+            "[Math]::Max($a.TotalSeconds, 0)",
+            "[Math]::Min($LeaseCapSec, [Math]::Max(0, $bw.budgetRoomSec))",
+            "[Math]::Min($ClaimPollSec, 5)",
+            "[Math]::Min($Cap, [int][Math]::Floor(($d - [DateTime]::UtcNow).TotalSeconds))",
+            "[Math]::Max(1, [Math]::Floor(($e - [DateTime]::UtcNow).TotalSeconds))",
+            "# [Math]::Min(330, $b.sec - $b.clock.Elapsed.TotalSeconds) is the defect",
+            "$x = 1 # [Math]::Max(0, $left)",
+        ]
+        for text in good:
+            self.assertEqual(ps_integer_first_minmax(text), [], text)
 
     def test_artifact_preflight_r4_the_guard_read_delay_seam_is_refused_with_the_real_um_run_and_checked_for_shape(self) -> None:
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-GuardReadDelay", "open:spec=5")

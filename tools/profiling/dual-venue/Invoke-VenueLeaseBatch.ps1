@@ -768,7 +768,8 @@ function Get-InputContentRefusal {
             # r7 adversary A1: under a budget the share is all that is left of it, up to the preflight's own bounds for the same two reads (30 s for its manifest read plus 300 s
             # for its hash): a hash the preflight accepted (310 s of a 519 s room) is never refused for a 300 s cap under the room
             $share = 300
-            if ($null -ne $script:guardBudget) { $share = [Math]::Min(330, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) }
+            # r10 (sol r9 B1): 330.0, never 330 -- an integer first operand selects [Math]::Min's Int32 overload and rounds the double room (2.3 s -> 2, under the hash's 2 s minimum)
+            if ($null -ne $script:guardBudget) { $share = [Math]::Min(330.0, $script:guardBudget.sec - $script:guardBudget.clock.Elapsed.TotalSeconds) }
             if ($share -lt $script:GuardReadMinSec) { return [pscustomobject]@{ kind = 'content'; item = $g.item; code = $script:guardBudget.code; why = "no time is left in $($script:guardBudget.what) to read and hash the staged build for $short; no leg runs on it" } }
             # r5 (key3 r4 B1): no artifact hash while no claim is held (a budget with artifactsOff); the manifest itself is still re-read and compared
             $verifyArtifacts = -not ($null -ne $script:guardBudget -and $script:guardBudget.artifactsOff)
@@ -1177,7 +1178,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         if ($legPlanMode) { [IO.File]::WriteAllText((Join-Path $RunDir 'leg-plan.json'), ($planRecord | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false)) }
         # (2) OPEN: the lease first. Nothing is probed or run before the agent reports this batch's lease active.
         $b.openJobId = "lease-batch-open-$stamp-lb$token"
-        $wait = [int][Math]::Max(60, [Math]::Min($OpenAdmissionWaitSec, ($deadline - [DateTime]::UtcNow).TotalSeconds))
+        $wait = [int][Math]::Max(60.0, [Math]::Min([double]$OpenAdmissionWaitSec, ($deadline - [DateTime]::UtcNow).TotalSeconds))
         L "BATCH_OPEN_SUBMIT batch=$batchNo token=$token job=$($b.openJobId) admissionWaitSec=$wait (the agent requests the lease; heavy-slot.py's cooldown is waited out there)"
         $openSubmitUtc = [DateTime]::UtcNow
         # r4 (sol r3 B1): the open carries the batch deadline as notAfterUtc, so no lease is taken for it after the deadline, whether or not the agent answers
