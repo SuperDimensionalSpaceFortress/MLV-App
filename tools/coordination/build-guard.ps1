@@ -112,13 +112,19 @@
 # is caught and logged, or refuses admission by a throw that the outer finally follows with the heavy-slot release.
 # Typed lines are bounded the same way (r8, adversary 3e68ca85-A2), since a heavy slot an ancestor holds stays held until the
 # guard ends: see Write-BuildGuardTyped and Complete-BuildGuardOutput. A stop file is deleted only once its holder is proven
-# gone by pid + start ticks (r8, adversary 3e68ca85-A1): see Test-HeavySlotStopNeeded.
+# gone by pid + start ticks (r8, adversary 3e68ca85-A1): see Test-HeavySlotStopNeeded. Every caller or seam path is resolved
+# by Resolve-BuildGuardPath and composed with [IO.Path] (r9, adversary 2ab4b1b6-A1): a -LockPath that names no file-system file
+# with a parent directory (a missing drive, another provider, a drive root) or whose directory cannot be made prints
+# BUILD_GUARD_PATH_REFUSED and exits 2 with nothing taken (or after the heavy slot was given back). In command mode any other
+# throw out of the guard prints BUILD_GUARD_ERROR and exits 1, never an uncaught error the host renders; a Library caller
+# still gets the throw.
 # Test seams (used by tests/coordination/test_build_guard.py, no real probe needed):
 #   -MemoryProbeFile   JSON array of {"freePhysGB":n,"freeCommitGB":n}, one sample per poll, last repeats
 #   -ProcessTableFile  JSON array of {"ProcessId":n,"Name":"cc1plus.exe","CreationDate":"<iso>"}
 #   -LockPath / -MutexName / -PollSeconds / -DeadlineMinutes / -LockExpiryMinutes / -ExemptLogPath
 #   -HeavySlotCmd / env MLV_HEAVY_SLOT_CMD (a stub heavy-slot.cmd) and -HeavySlotSha256 (that stub's sha)
-# Exit codes: 3 = refused (memory, slot, heavy-slot REQUEUE or pin mismatch), 2 = usage, 1 = the command fragment failed without a non-zero
+# Exit codes: 3 = refused (memory, slot, heavy-slot REQUEUE or pin mismatch), 2 = usage (BUILD_GUARD_PATH_REFUSED included), 1 = the
+# guard itself failed (BUILD_GUARD_ERROR) or the command fragment failed without a non-zero
 # code of its own, otherwise the fragment's non-zero code (its failing native command's or its own 'exit'),
 # or, when the fragment ended with 0 after a native failure, the first failing native code (0 when nothing
 # failed). Continuation policy: HEAVY_SLOT_LOST_DURING_ACTION never changes the exit code (see MACHINE HEAVY SLOT).
@@ -316,6 +322,62 @@ function Get-BuildGuardJsonField($Object, [string]$Name) {
     return $null
 }
 
+function Resolve-BuildGuardPath([string]$Path, [switch]$NeedParent) {
+    # r9 (adversary 2ab4b1b6-A1 = 5334fd83-A2): the one resolver for a caller or seam path. Join-Path, Split-Path, Resolve-Path and
+    # the provider resolver write an error record or throw on a drive that does not exist or a path of another provider, and the
+    # host renders either to stderr synchronously, past the bounded writer, while an ancestor's heavy slot is held. This never
+    # throws and writes no record: it returns @{ Full; Parent; Why }, the full file-system path and its parent directory, or why
+    # there is none. Callers compose paths from it with [IO.Path] only.
+    $r = @{ Full = ''; Parent = ''; Why = '' }
+    try {
+        if (-not ([string]$Path).Trim()) { throw 'it is empty' }
+        $provider = $null
+        $drive = $null
+        $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path, [ref]$provider, [ref]$drive)
+        if ($provider.Name -ne 'FileSystem') { throw ('it is a {0} path, not a file-system one' -f $provider.Name) }
+        if ($full.IndexOfAny([IO.Path]::GetInvalidPathChars()) -ge 0) { throw 'it holds a character no file path may hold' }
+        $full = [IO.Path]::GetFullPath($full)
+        $parent = [string][IO.Path]::GetDirectoryName($full)
+        if ($NeedParent -and -not $parent) { throw 'it has no parent directory' }
+        $r.Full = $full
+        $r.Parent = $parent
+    } catch {
+        $e = $_.Exception
+        if ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+        $r.Why = $e.Message -replace '\s+', ' '
+    }
+    return $r
+}
+
+function New-BuildGuardDirectory([string]$Dir) {
+    # r9: creates a directory of a resolved path, or returns why it is not one. New-Item -Force returns nothing and writes no
+    # error for a directory under a file, so the test is [IO.Directory]::Exists afterwards. Never throws, writes no record.
+    try {
+        if (-not [IO.Directory]::Exists($Dir)) { [void][IO.Directory]::CreateDirectory($Dir) }
+        if ([IO.Directory]::Exists($Dir)) { return '' }
+        return "$Dir is not a directory"
+    } catch {
+        $e = $_.Exception
+        if ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+        return ('{0} not created ({1})' -f $Dir, ($e.Message -replace '\s+', ' '))
+    }
+}
+
+function Exit-BuildGuardPathRefused([string]$Label, [string]$Option, [string]$Value, [string]$Why) {
+    # r9: a caller path the guard cannot use is a typed refusal (exit 2, usage), bounded like every typed line. The caller gives
+    # back whatever it took first.
+    Write-BuildGuardTyped ('BUILD_GUARD_PATH_REFUSED label={0} option={1} value={2} reason={3} utc={4}' -f $Label, $Option, ($Value -replace '[\x00-\x1f]', '?'), $Why, [DateTime]::UtcNow.ToString('o'))
+    exit 2
+}
+
+function Get-BuildGuardLockPath([hashtable]$Options, [string]$Label) {
+    # r9: -LockPath through Resolve-BuildGuardPath; one that names no file-system file with a parent directory is refused before
+    # anything is taken.
+    $lock = Resolve-BuildGuardPath $Options.LockPath -NeedParent
+    if ($lock.Why) { Exit-BuildGuardPathRefused $Label 'LockPath' $Options.LockPath $lock.Why }
+    return $lock
+}
+
 function Add-BuildGuardLogLine([string]$Path, [string]$Line, [Text.Encoding]$Encoding) {
     # LEDGER-APPEND-ATOMIC-BUILD-LOGS-1: pwsh 7 Add-Content opens FileMode.Append, which records EOF as the
     # stream's own offset, so two concurrent writers overwrite each other's line (measured ~14 % lost across 6
@@ -411,8 +473,13 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
     # to stderr past the bounded writer. A failure that should refuse admission throws to Invoke-BuildGuard, whose finally
     # gives the heavy slot back first; a stale lock that cannot be removed is a slot still busy, logged.
     $ErrorActionPreference = 'Stop'
-    $dir = Split-Path -Parent $Options.LockPath
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    # A lock directory that cannot be made is a path refusal, never a throw (r9, 2ab4b1b6-A1 class): Invoke-BuildGuard gives the
+    # heavy slot back and prints it typed.
+    $dir = [IO.Path]::GetDirectoryName([string]$Options.LockPath)
+    if ($dir) {
+        $why = New-BuildGuardDirectory $dir
+        if ($why) { return @{ Acquired = $false; Held = ''; Refused = "lock directory $why" } }
+    }
     $mutex = New-Object System.Threading.Mutex($false, $Options.MutexName)
     $got = $false
     try {
@@ -472,6 +539,9 @@ function Invoke-BuildSlotAcquire([hashtable]$Options, [string]$Label) {
             try { $fs.Write($bytes, 0, $bytes.Length); $fs.Flush() } finally { $fs.Dispose() }
         } catch [System.IO.IOException] {
             return @{ Acquired = $false; Held = 'lock-created-by-another-process' }
+        } catch [System.UnauthorizedAccessException] {
+            # A lock another guard is still deleting refuses CreateNew this way: busy for this poll, never a throw (r9).
+            return @{ Acquired = $false; Held = 'lock-create-denied: ' + ($_.Exception.Message -replace '\s+', ' ') }
         }
         return @{ Acquired = $true; Held = ''; Ticket = @{ Path = $path; OwnerPid = $PID; StartTicks = $startTicks; MutexName = $Options.MutexName } }
     } finally {
@@ -522,8 +592,10 @@ function Resolve-HeavySlotCmd([hashtable]$Options) {
     # A named path that does not exist is missing (fail open); it never falls through to the live install.
     foreach ($named in @($Options.HeavySlotCmd, $env:MLV_HEAVY_SLOT_CMD)) {
         if (-not ([string]$named).Trim()) { continue }
-        # Stop-scoped and caught (r8 adversary f99852cb-A1 sibling): an error record would reach stderr past the bounded writer.
-        if (Test-Path -LiteralPath $named -PathType Leaf -ErrorAction Ignore) { try { return (Resolve-Path -LiteralPath $named -ErrorAction Stop).ProviderPath } catch { return '' } }
+        # Through the one resolver (r9, 2ab4b1b6-A1 sibling :853): a path of another provider (Env:\ComSpec is a leaf there) or on
+        # a missing drive is missing too, never an error record past the bounded writer (r8 adversary f99852cb-A1).
+        $shim = Resolve-BuildGuardPath $named
+        if (-not $shim.Why -and (Test-Path -LiteralPath $shim.Full -PathType Leaf -ErrorAction Ignore)) { return $shim.Full }
         return ''
     }
     $found = Get-Command -Name 'heavy-slot.cmd' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -538,7 +610,11 @@ function Test-HeavySlotHeldCanonical([string]$Held) {
     # Otherwise why not (r7b adversary 01aa4e7b-A2). The name is compared case-sensitively, as the kernel names its mutexes:
     # Global\HEAVYSLOT-0 is another slot (r7b adversary df03e61e-A1). heavy-slot still verifies the holder's identity and ancestry.
     if ($Held -notmatch '^([0-9A-Za-z-]+):(\d+)$') { return "malformed value '$Held'" }
-    $path = Join-Path $script:HeavySlotHeldDir ($Matches[1] + '.json')
+    $ticket = $Matches[1]
+    # The held dir goes through the one resolver (r9, 2ab4b1b6-A1 sibling :541): one on a missing drive is a reason, no record.
+    $dir = Resolve-BuildGuardPath $script:HeavySlotHeldDir
+    if ($dir.Why) { return "no readable held record: held dir $($script:HeavySlotHeldDir) unusable ($($dir.Why))" }
+    $path = [IO.Path]::Combine($dir.Full, $ticket + '.json')
     try { $rec = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { return "no readable held record at $path" }
     $name = [string](Get-BuildGuardJsonField $rec 'slotName')
     $count = [string](Get-BuildGuardJsonField $rec 'slotCount')
@@ -553,7 +629,7 @@ function Get-HeavySlotLane {
     # <lane> of mlv:<lane>:build: lane-<CARD>-rN-<stamp> under MLV_LANE_RUN_DIR gives <CARD>; no run dir is the hub.
     $run = ([string]$env:MLV_LANE_RUN_DIR).TrimEnd('\', '/')
     if (-not $run) { return 'hub' }
-    $leaf = Split-Path -Leaf $run -ErrorAction Ignore
+    $leaf = [IO.Path]::GetFileName($run)
     if ($leaf -match '^lane-(.+)-r\d+-\d{8}T\d{4,6}Z$') { $leaf = $Matches[1] }
     return ($leaf -replace '[^A-Za-z0-9._-]', '-')
 }
@@ -774,7 +850,7 @@ function Send-HeavySlotStop($Lease) {
         $last = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
         $keep = if ($last) { $last.Value } else { $null }
         $PSNativeCommandUseErrorActionPreference = $false
-        try { $null = & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $Lease.Process.Id /T /F 2>&1 }
+        try { $null = & ([IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'taskkill.exe')) /PID $Lease.Process.Id /T /F 2>&1 }
         catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} taskkill of heavy-slot pid {1} failed ({2})' -f $Lease.Label, $Lease.Process.Id, $_.Exception.Message) }
         finally {
             if ($last) { $global:LASTEXITCODE = $keep } else { Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore }
@@ -850,7 +926,14 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=missing: heavy-slot.cmd not found; building WITHOUT the machine heavy slot (fail open)"
         return $null
     }
-    $cli = Join-Path (Split-Path -Parent $cmd) 'heavy-slot.ps1'
+    # Every path below is resolved by Resolve-BuildGuardPath and composed with [IO.Path], which cannot throw or write an error
+    # record on a missing drive or another provider (r9, adversary 2ab4b1b6-A1 and its siblings :853 :869 :887 :888).
+    $shim = Resolve-BuildGuardPath $cmd -NeedParent
+    if ($shim.Why) {
+        Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=$cmd unusable: $($shim.Why); building WITHOUT the machine heavy slot (fail open)"
+        return $null
+    }
+    $cli = [IO.Path]::Combine($shim.Parent, 'heavy-slot.ps1')
     # A CLI that cannot be hashed (held open without read sharing, say) is a pin mismatch, never an error record: the host would
     # write one to stderr synchronously, past the bounded writer, while an ancestor's slot is held (r8 adversary f99852cb-A1).
     $actual = 'missing'
@@ -864,9 +947,9 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=pin-mismatch expected={1} actual={2} cli={3} utc={4}' -f $Label, $expected, $actual, $cli, [DateTime]::UtcNow.ToString('o'))
         exit 3
     }
-    # A relative -LockPath is resolved first, so its parent is never empty (adversary A1).
-    $lockFull = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Options.LockPath)
-    $dir = Join-Path (Split-Path -Parent $lockFull) 'heavy-slot'
+    # A relative -LockPath is resolved first, so its parent is never empty (adversary A1); one that cannot be is refused, with
+    # nothing taken (r9).
+    $dir = [IO.Path]::Combine((Get-BuildGuardLockPath $Options $Label).Parent, 'heavy-slot')
     $exe = [Environment]::ProcessPath
     if (-not $exe) { $exe = (Get-Process -Id $PID).Path }
     # cmd expands %VAR% even inside quotes, so a path with '%' would not reach heavy-slot as given (r1 adversary A3).
@@ -876,16 +959,18 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         return $null
     }
     # A lease directory that cannot be created is a shim that cannot be run: fail open like start-failed, never an error record
-    # (r8 adversary f99852cb-A1 sibling).
-    try { if (-not (Test-Path -LiteralPath $dir -ErrorAction Ignore)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null } } catch {
-        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} shim={1} lease-dir-failed: {2}; building WITHOUT the machine heavy slot (fail open)' -f $Label, $cmd, ($_.Exception.Message -replace '\s+', ' '))
+    # (r8 adversary f99852cb-A1 sibling). New-Item -Force made nothing and said nothing for a directory under a file, so cmd
+    # failed its own redirect into the inherited stderr (r9): the directory must exist afterwards.
+    $why = New-BuildGuardDirectory $dir
+    if ($why) {
+        Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} shim={1} lease-dir-failed: {2}; building WITHOUT the machine heavy slot (fail open)' -f $Label, $cmd, $why)
         return $null
     }
     $id = '{0}-{1}' -f $PID, [Guid]::NewGuid().ToString('N')
     $lease = @{
         Label = 'mlv:{0}:build' -f (Get-HeavySlotLane); BuildLabel = $Label
-        Ready = Join-Path $dir "$id.ready"; Stop = Join-Path $dir "$id.stop"; ExitFile = Join-Path $dir "$id.exit.json"
-        Log = Join-Path $dir "$id.log"; Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''; LogUnread = $false; Holder = $null
+        Ready = [IO.Path]::Combine($dir, "$id.ready"); Stop = [IO.Path]::Combine($dir, "$id.stop"); ExitFile = [IO.Path]::Combine($dir, "$id.exit.json")
+        Log = [IO.Path]::Combine($dir, "$id.log"); Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''; LogUnread = $false; Holder = $null
         Owner = $null; Gone = ''; Tail = ''; StopHolder = $null; StopSent = $false
     }
     # heavy-slot ends its own wait (a marked 75) and its admit cap; this bound only catches a hung tool. It is numeric even
@@ -1073,9 +1158,12 @@ function Invoke-BuildGuard {
         $line = 'BUILD_GUARD_EXEMPT label={0} reason={1} utc={2} pid={3}' -f $Label, $exempt, [DateTime]::UtcNow.ToString('o'), $PID
         Write-BuildGuardLog $line
         try {
-            $logDir = Split-Path -Parent $o.ExemptLogPath -ErrorAction Stop
-            if ($logDir -and -not (Test-Path -LiteralPath $logDir -ErrorAction Ignore)) { New-Item -ItemType Directory -Path $logDir -Force -ErrorAction Stop | Out-Null }
-            Add-BuildGuardLogLine -Path $o.ExemptLogPath -Line $line -Encoding ([Text.Encoding]::ASCII)
+            # Through the one resolver (r9): a log path that cannot be used is logged, never an error record.
+            $log = Resolve-BuildGuardPath $o.ExemptLogPath -NeedParent
+            if ($log.Why) { throw $log.Why }
+            $why = New-BuildGuardDirectory $log.Parent
+            if ($why) { throw $why }
+            Add-BuildGuardLogLine -Path $log.Full -Line $line -Encoding ([Text.Encoding]::ASCII)
         } catch { Write-BuildGuardLog "exemption log not written: $($_.Exception.Message)" }
     }
     # The machine heavy slot is the OUTERMOST lock of a build: the memory floor and the build slot below nest inside it,
@@ -1087,7 +1175,12 @@ function Invoke-BuildGuard {
         Write-BuildGuardLog ('BUILD_GUARD_NO_SLOT label={0} reason=-NoSlot: no machine heavy slot and no build slot taken; for callers that build nothing' -f $Label)
     }
     try {
-        if (-not $NoSlot) { $heavy = Enter-HeavySlot -Options $o -Label $Label }
+        if (-not $NoSlot) {
+            # The lock path is resolved once, before anything is taken, and every later use is the full path (r9, 2ab4b1b6-A1):
+            # one that cannot be is a typed refusal here, never a throw the host renders past the bounded writer.
+            $o.LockPath = (Get-BuildGuardLockPath $o $Label).Full
+            $heavy = Enter-HeavySlot -Options $o -Label $Label
+        }
         $started = [DateTime]::UtcNow
         $deadline = $started.AddMinutes($o.DeadlineMinutes)
         $ticket = $null
@@ -1100,6 +1193,12 @@ function Invoke-BuildGuard {
                 if ($NoSlot) { break }
                 $slot = Invoke-BuildSlotAcquire -Options $o -Label $Label
                 if ($slot.Acquired) { $ticket = $slot.Ticket; break }
+                if ($slot['Refused']) {
+                    # The heavy slot goes back before the typed refusal (r6 sol B1), as at the deadline below.
+                    Exit-HeavySlot $heavy
+                    $heavy = $null
+                    Exit-BuildGuardPathRefused $Label 'LockPath' $o.LockPath $slot.Refused
+                }
                 $held = $slot.Held
             }
             if ([DateTime]::UtcNow -ge $deadline) {
@@ -1151,6 +1250,19 @@ function Invoke-BuildGuard {
 
 if ($Library) { return }
 
+function Exit-BuildGuardError($ErrorRecord, [string]$Label) {
+    # r9 backstop (adversary 2ab4b1b6-A1 class): in command mode nothing caught a throw out of Invoke-BuildGuard, and the host
+    # rendered it to stderr synchronously, past the bounded writer, while an ancestor's heavy slot may be held. A Library caller
+    # still gets the throw. Invoke-BuildGuard's finally has given back every slot of its own by now, so the throw becomes one
+    # typed line, bounded like the others, and exit 1.
+    if ($ErrorRecord.Exception -is [System.Management.Automation.PipelineStoppedException]) { throw $ErrorRecord }
+    $e = $ErrorRecord.Exception
+    if ($e -is [System.Management.Automation.MethodInvocationException] -and $e.InnerException) { $e = $e.InnerException }
+    Write-BuildGuardTyped ('BUILD_GUARD_ERROR label={0} code=1 reason={1}: {2} utc={3}' -f $Label, $e.GetType().Name, ($e.Message -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
+    Complete-BuildGuardOutput
+    exit 1
+}
+
 $guardOptions = @{
     MinFreePhysGB     = $MinFreePhysGB
     MinFreeCommitGB   = $MinFreeCommitGB
@@ -1168,10 +1280,10 @@ $guardOptions = @{
     HeavySlotWaitMinutes = $HeavySlotWaitMinutes
 }
 if ($PrintJobs) {
-    Invoke-BuildGuard -Label $Label -RequestedJobs $RequestedJobs -ExemptReason $ExemptReason -NoSlot -Options $guardOptions -Action {
+    try { Invoke-BuildGuard -Label $Label -RequestedJobs $RequestedJobs -ExemptReason $ExemptReason -NoSlot -Options $guardOptions -Action {
         param($Jobs)
         Write-Output "-j$Jobs"
-    }
+    } } catch { Exit-BuildGuardError $_ $Label }
     exit 0
 }
 
@@ -1283,7 +1395,8 @@ if ($PSVersionTable.PSVersion -lt [version]'7.4') {
     exit 2
 }
 $script:BuildGuardCommandExit = 0
-Invoke-BuildGuard -Label $Label -RequestedJobs $RequestedJobs -ExemptReason $ExemptReason -Options $guardOptions -Action {
+# The action catches every way out of the fragment, so the backstop sees only an admission throw (r9).
+try { Invoke-BuildGuard -Label $Label -RequestedJobs $RequestedJobs -ExemptReason $ExemptReason -Options $guardOptions -Action {
     param($Jobs)
     $fragment = ConvertTo-BuildGuardFragment ($Command -replace '\{JOBS\}', [string]$Jobs)
     $script:BuildGuardFragmentExit = $null
@@ -1321,5 +1434,5 @@ Invoke-BuildGuard -Label $Label -RequestedJobs $RequestedJobs -ExemptReason $Exe
         # finally runs after this and releases the slot.
         if ($left) { exit $script:BuildGuardCommandExit }
     }
-}
+} } catch { Exit-BuildGuardError $_ $Label }
 exit $script:BuildGuardCommandExit

@@ -2038,14 +2038,14 @@ def _release_pipe(pipe, guard) -> str:
 
 
 def _heavy_popen(box: dict, mode_args: list, memory: list = None, sha: str = None, env_extra: dict = None,
-                 shim: Path = HEAVY_STUB, **streams) -> subprocess.Popen:
+                 shim: Path = HEAVY_STUB, lock: str = None, **streams) -> subprocess.Popen:
     memory_file = _write_json(box["dir"] / "memory.json", OK_MEMORY if memory is None else memory)
     table_file = _write_json(box["dir"] / "table.json", [])
     env = _env(heavy_slot=shim, extra={"STUB_HEAVY_SLOT_MODE": "run", "STUB_HEAVY_SLOT_LOG": str(box["dir"] / "stub.log"),
                                              **(env_extra or {})})
     return subprocess.Popen(
         [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(GUARD),
-         "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(box["lock"]),
+         "-MemoryProbeFile", memory_file, "-ProcessTableFile", table_file, "-LockPath", str(box["lock"] if lock is None else lock),
          "-ExemptLogPath", str(box["exempt_log"]), "-HeavySlotSha256", _stub_sha() if sha is None else sha, *mode_args],
         stdout=streams.get("stdout", subprocess.DEVNULL), stderr=streams.get("stderr", subprocess.DEVNULL), env=env,
     )
@@ -2202,6 +2202,93 @@ def test_a_caller_path_with_a_nul_writes_no_error_record_under_continue(box) -> 
     out = done.stdout + done.stderr
     assert "resolve errors=0 value=[]" in done.stdout, out
     assert "guard errors=0 built=1" in done.stdout, out
+
+
+def _host_error_lines(stderr: str) -> list:
+    # Every line the guard writes to stderr is a '[build-guard]' line or a relayed 'HEAVY-SLOT ' line from heavy-slot's log;
+    # anything else is an error the host rendered.
+    return [line for line in stderr.splitlines() if line.strip() and not line.startswith(("[build-guard]", "HEAVY-SLOT "))]
+
+
+def test_a_lock_path_on_a_missing_drive_is_a_bounded_refusal_under_an_ancestor_slot(box) -> None:
+    # r9 adversary 2ab4b1b6-A1 (= r7b 5334fd83-A2): -LockPath on a drive that does not exist made the lock-path resolver throw
+    # out of Invoke-BuildGuard. The host rendered that error to stderr synchronously, so with a full, undrained stderr under an
+    # ancestor's heavy slot neither the guard nor the ancestor could end. Now every caller path goes through one resolver: a
+    # typed refusal (exit 2) with nothing taken, and no host error record.
+    pipe = _full_pipe()
+    started = time.monotonic()
+    guard = _heavy_popen(box, ["-Command", _marker_command(box)], lock="NoSuchBuildDrive:\\slot.lock",
+                         env_extra={"HEAVY_SLOT_HELD": f"anc-1:{os.getpid()}"}, stderr=pipe[1])
+    try:
+        try:
+            code = guard.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            code = None
+        took = time.monotonic() - started
+    finally:
+        err = _release_pipe(pipe, guard)
+    assert code == 2, f"the guard did not end within the bound behind an undrained stderr (code={code}): {err[-2000:]}"
+    assert took < 30
+    assert not _host_error_lines(err.replace("#", "")), err[-2000:]
+    assert not box["marker"].exists()
+    assert not _stub_calls(box), "nothing may be taken for a lock path that does not resolve"
+
+
+def test_a_held_dir_on_a_missing_drive_returns_its_reason_with_no_error_record(tmp_path) -> None:
+    # r9 adversary 2ab4b1b6-A1 sibling :541: the held-record lookup under a HeavySlotHeldDir on a missing drive wrote one error
+    # record (Join-Path) before returning its reason. It now returns the reason only.
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n$ErrorActionPreference = 'Continue'\n$script:HeavySlotHeldDir = 'NoSuchBuildDrive:\\held'\n"
+                "$r = @(Test-HeavySlotHeldCanonical 'ticket-1:123' 2>&1)\n"
+                "Write-Output (\"held errors={0} value=[{1}]\" -f @($r | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }).Count, "
+                "(@($r | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join ','))\n"])
+    out = done.stdout + done.stderr
+    assert re.search(r"^held errors=0 value=\[.*NoSuchBuildDrive.+\]$", done.stdout, re.M), out
+
+
+# r9 (2ab4b1b6-A1 siblings :853 :869 and the build-slot lock dir): each caller path that cannot be used is a typed outcome on
+# stdout and no host error record. 'shim' is a heavy-slot shim on another provider (fails open: shim=missing, and builds);
+# 'lock-root' has no parent directory and 'lock-env' is not a file-system path (both refused, exit 2); 'lock-dir' needs a
+# directory under a file (refused, exit 2); 'mutex' is an option no path resolver sees, so it reaches the command-mode backstop
+# (BUILD_GUARD_ERROR, exit 1).
+_CALLER_PATH_CASES = {
+    "shim": (["-HeavySlotCmd", "Env:\\ComSpec"], None, 0, "HEAVY_SLOT_WARN label=build shim=missing"),
+    "lock-root": ([], "C:\\", 2, "BUILD_GUARD_PATH_REFUSED label=build option=LockPath"),
+    "lock-env": ([], "Env:\\MLV_R9_SLOT_LOCK", 2, "BUILD_GUARD_PATH_REFUSED label=build option=LockPath"),
+    "lock-dir": ([], "{file}\\sub\\slot.lock", 2, "BUILD_GUARD_PATH_REFUSED label=build option=LockPath"),
+    "mutex": (["-MutexName", "NoSuchNamespace\\slot"], None, 1, "BUILD_GUARD_ERROR label=build code=1"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_CALLER_PATH_CASES))
+def test_a_caller_path_that_cannot_be_used_is_a_typed_outcome_with_no_host_error(box, case) -> None:
+    args, lock, want, line = _CALLER_PATH_CASES[case]
+    a_file = box["dir"] / "a-file"
+    a_file.write_text("x", encoding="ascii")
+    if lock:
+        lock = lock.replace("{file}", str(a_file))
+    done = _heavy(box, "run", [*args, "-DeadlineMinutes", "0", "-Command", _marker_command(box)], lock=lock,
+                  extra={"HEAVY_SLOT_HELD": f"anc-1:{os.getpid()}"})
+    out = done.stdout + done.stderr
+    assert done.returncode == want, out
+    # The fail-open warning is a log line (stderr); every refusal is a typed line (stdout).
+    assert line in (done.stderr if line.startswith("HEAVY_SLOT_WARN") else done.stdout), out
+    assert not _host_error_lines(done.stderr), out
+    assert box["marker"].exists() == (want == 0), out
+
+
+# r9 class guard (2ab4b1b6-A1 siblings :887 :888, which no input reaches once :868/:869 resolve): no function the guard runs
+# composes or resolves a path with a cmdlet that can write an error record or throw on a missing drive or another provider.
+# Paths are resolved by Resolve-BuildGuardPath only and composed with [IO.Path].
+@pytest.mark.parametrize("function", ["Enter-HeavySlot", "Test-HeavySlotHeldCanonical", "Resolve-HeavySlotCmd", "Get-HeavySlotLane",
+                                      "Invoke-BuildSlotAcquire", "Send-HeavySlotStop", "Invoke-BuildGuard"])
+def test_guard_paths_are_composed_without_path_cmdlets(function) -> None:
+    text = GUARD.read_text(encoding="utf-8")
+    start = text.index(f"function {function}")
+    body = text[start:text.index("\nfunction ", start + 1)]
+    code = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
+    for cmdlet in ("Join-Path", "Split-Path", "Resolve-Path", "GetUnresolvedProviderPathFromPSPath"):
+        assert cmdlet not in code, f"{function} still calls {cmdlet}"
 
 
 def test_a_holder_that_cannot_be_inspected_keeps_its_stop_file(box) -> None:
