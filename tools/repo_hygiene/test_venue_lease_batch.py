@@ -3202,8 +3202,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         worker = text[start:text.index("Invoke-VenueBoundedRead -ScriptText $probe.ToString()", start)]
         exists, opened = worker.index("Test-Path -LiteralPath $i.path"), worker.index("[IO.File]::Open($i.path")
         checks = [m.start() for m in re.finditer(r"-lt \$i\.minSec\) \{ 'NOTIME:'", worker)]
-        self.assertEqual(len(checks), 2, "the minimum is checked before the existence check and again before the open")
-        self.assertTrue(checks[0] < exists < checks[1] < opened, (checks, exists, opened))
+        self.assertEqual(len(checks), 3, "the minimum is checked before the existence check, again before the open, and again once the file is open (r10 adversary A1)")
+        self.assertTrue(checks[0] < exists < checks[1] < opened < checks[2] < worker.index("ComputeHash"), (checks, exists, opened))
 
     # r9 B1 (sol r8b = opus = fable H2 = Dot): `[ValidateRange(1, 600)]` on a `[double]` has Int32 endpoints, so PowerShell validates a ROUNDED INTEGER copy of the value: 0.6 and 600.5
     # bound while the original value went on to the helper (a 0.6 s bound under the 1 s the contract names, a 600.5 s one over the 600 s cap). Double endpoints validate the value as given.
@@ -3284,7 +3284,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # shadow that spends fake time, window 4 s / minimum 2 s. Every file has the minimum checked before its existence check AND again after it, for EACH label; the wrong digest makes
     # a file that was opened and hashed visible as a MISMATCH line, so "no open" is an observable absence. The shadow also records which files had an existence read STARTED: the check
     # before it is what keeps a file from even being looked at with the window spent (a UNC Test-Path can itself block), and an absent file shows it as NOTIME, never MISSING.
-    def _artifact_worker_run(self, case: str, end_sec: float = 4.0, start_now: float = 0.0, delay_label: str = "", consume_label: str = "", absent_label: str = "") -> tuple[list[str], list[str]]:
+    def _artifact_worker_run(self, case: str, end_sec: float = 4.0, start_now: float = 0.0, delay_label: str = "", consume_label: str = "", absent_label: str = "", open_label: str = "") -> tuple[list[str], list[str]]:
         d = self.case / ("worker-files-" + case)
         d.mkdir(exist_ok=True)
         for label in ("packageZip", "exe", "dll"):
@@ -3302,6 +3302,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "function Test-Path { param([string]$LiteralPath, [string]$PathType) $global:tp.Add((Split-Path -Leaf $LiteralPath)); if ($global:delayPath -and $LiteralPath -ceq $global:delayPath) { $global:clk.now += 3 }; Microsoft.PowerShell.Management\\Test-Path -LiteralPath $LiteralPath -PathType $PathType }\n"
             "$items = foreach ($label in 'packageZip', 'exe', 'dll') {\n"
             "    $it = [pscustomobject]@{ label = $label; name = \"$label.bin\"; path = '" + str(d) + "\\' + $label + '.bin'; clock = $clock; endSec = " + repr(end_sec) + "; minSec = 2.0 }\n"
+            # r10 adversary A1: the open spends the window -- the 2nd read of .path is [IO.File]::Open's own argument (the 1st is Test-Path's), so the fake clock moves between the
+            # existence check and the open's return, exactly where a slow SMB open spends it
+            "    if ($label -ceq '" + open_label + "') { $p0 = $it.path; $it.PSObject.Properties.Remove('path'); Add-Member -InputObject $it -MemberType NoteProperty -Name _reads -Value 0; Add-Member -InputObject $it -MemberType NoteProperty -Name _p -Value $p0; Add-Member -InputObject $it -MemberType ScriptProperty -Name path -Value { $this._reads++; if ($this._reads -eq 2) { $global:clk.now += 3 }; $this._p } }\n"
             "    if ($label -ceq '" + consume_label + "') { Add-Member -InputObject $it -MemberType ScriptProperty -Name sha -Value { $global:clk.now += 3; ('0' * 64) } }\n"
             "    else { Add-Member -InputObject $it -MemberType NoteProperty -Name sha -Value ('0' * 64) }\n"
             "    $it\n"
@@ -3333,6 +3336,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # the contract's own boundary stays: under the minimum left (0.9 s of a 2 s minimum) is NOTIME and nothing is read; exactly the minimum left is read
         self.assertEqual(self._artifact_worker_run("boundary-under", end_sec=0.9), (["NOTIME:packageZip"], []))
         self.assertEqual(self._artifact_worker_run("boundary-at", end_sec=2.0), ([f"MISMATCH:{k}" for k in order], order))
+
+    # r10 adversary A1 (pass 2 on 3c341d79): the minimum was checked before the existence check and again before the open, but the OPEN can take the time too (an SMB open): a file
+    # whose open spent the window went on to ComputeHash with under the minimum left, and as the last matching artifact it was STAGED. The worker checks again once the file is open.
+    def test_artifact_preflight_r10_adv_a1_the_hash_worker_checks_the_minimum_again_after_the_open_for_every_file(self) -> None:
+        order = ["packageZip", "exe", "dll"]
+        for i, label in enumerate(order):
+            with self.subTest(open_spends_the_window=label):
+                # file L was looked at and opened (its Test-Path ran), then its open spent 3 of the 4 s: NOTIME:L, no hash of it (no MISMATCH:L), nothing after it touched
+                self.assertEqual(self._artifact_worker_run("open-" + label, open_label=label), ([f"MISMATCH:{k}" for k in order[:i]] + [f"NOTIME:{label}"], order[:i + 1]))
 
     def test_artifact_preflight_the_refusal_names_the_artifact_and_a_fully_staged_build_still_opens_the_lease(self) -> None:
         c = "3" * 40
@@ -4151,6 +4163,19 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         decorated = {n.name: [ast.unparse(d) for d in n.decorator_list] for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))}
         self.assertIn("requires_windows_pwsh", decorated["VenueLeaseBatchRunnerTests"])
         self.assertEqual({name: d for name, d in decorated.items() if name.startswith(("ps_", "_ps_")) and d}, {})
+
+    def test_artifact_preflight_r10_adv_a3_a_remainder_just_under_the_minimum_is_not_printed_as_the_minimum(self) -> None:
+        # the module's own refusal line, run with a remainder of 1.999 s (Round(.., 2) printed "2 s left, under 2"); the line is lifted from the source, not re-spelled here
+        line = next(l for l in MODULE.read_text(encoding="utf-8").splitlines() if "after the manifest read (" in l and "$left -lt $ArtifactMinSec" in l)
+        script = ("$left = 1.999; $TimeoutSec = 3; $ArtifactMinSec = 2; $path = 'p'\n"
+                  "$r = & { " + line.strip() + " }\n"
+                  "ConvertTo-Json -Compress -InputObject @{ error = [string]$r.error }\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        error = json.loads(out.stdout.strip().splitlines()[-1])["error"]
+        m = re.search(r"\((\d+(?:\.\d+)?) s left, under 2\)", error)
+        self.assertIsNotNone(m, error)
+        self.assertLess(float(m.group(1)), 2.0, error)
 
     def test_artifact_preflight_r10_the_math_overload_scanner_sees_every_spelling(self) -> None:
         bad = [

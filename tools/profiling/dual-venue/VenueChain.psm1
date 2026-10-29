@@ -682,6 +682,8 @@ function Get-VenueStagedBuildManifest {
                             # r8b adversary A1: FileShare.Read, as the leg job hashes it (AttrCudaArtifacts.psm1 Get-Sha): a writer holding the file open fails this read as it would fail the leg
                             $fs = [IO.File]::Open($i.path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
                             try {
+                                # r10 adversary A1: the open can take the time too (an SMB open), so the minimum is checked once more with the file open, before the hash starts
+                                if ($null -ne $i.clock -and ($i.endSec - $i.clock.Elapsed.TotalSeconds) -lt $i.minSec) { 'NOTIME:' + $i.label + ':' + $i.name; break }
                                 $sha = [Security.Cryptography.SHA256]::Create()
                                 try { $got = ([BitConverter]::ToString($sha.ComputeHash($fs)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
                             } finally { $fs.Dispose() }
@@ -693,8 +695,9 @@ function Get-VenueStagedBuildManifest {
             if ($artSec -le 0) {
                 # r7 (sol r6 B1): the exact remainder, not its whole seconds (2.7 s left was floored to 1, under the guard's 2 s minimum, and a healthy hash never started)
                 $left = $TimeoutSec - $callClock.Elapsed.TotalSeconds
+                # r10 (adversary pass 2 A3): the time left is printed rounded DOWN to hundredths -- Round(1.999, 2) printed "2 s left, under 2"
                 # r5 (adversary r5 A2): -ArtifactMinSec is the least a hash may START with; the lease batch guard asks for its own minimum ($script:GuardReadMinSec, the same rule)
-                if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Round([Math]::Max(0.0, $left), 2)) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null } }
+                if ($left -lt $ArtifactMinSec) { return [pscustomobject]@{ state = 'UNREACHABLE'; sha256 = $null; path = $path; error = "the cached artifacts could not be hashed: no time is left of -TimeoutSec $([Math]::Round($TimeoutSec, 2)) after the manifest read ($([Math]::Floor([Math]::Max(0.0, $left) * 100.0) / 100.0) s left, under $ArtifactMinSec)"; contentProblem = $null; artifactProblem = $null } }
                 $artSec = $left
             }
             # r7 adversary A2: the hash's end on the call's own clock, so the worker checks the minimum again before each file
