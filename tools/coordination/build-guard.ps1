@@ -566,16 +566,19 @@ function Remove-BuildSlot($Ticket) {
     # Stop-scoped (r7, a34e2098-A1): a delete that fails (the lock held open without a Delete share) used to write an error
     # record, which the host rendered to an undrained stderr before the heavy-slot stop. Now it is caught and logged through
     # the bounded writer, and the lock is left for owner-dead reclaim.
-    $ErrorActionPreference = 'Stop'
+    # A release never throws on a preference an action locked (r11 adversary 6b8295aa-A2: an AllScope, ReadOnly
+    # $ErrorActionPreference made this assignment throw before the try, so the lock was never deleted). Its own cmdlets say
+    # -ErrorAction Stop, so they are caught below whatever the preference holds.
+    try { $ErrorActionPreference = 'Stop' } catch { }
     $mutex = $null
     $got = $false
     try {
         $mutex = New-Object System.Threading.Mutex($false, $Ticket.MutexName)
         try { $got = $mutex.WaitOne(15000) } catch [System.Threading.AbandonedMutexException] { $got = $true }
         if (-not $got) { Write-BuildGuardLog "release-mutex-busy: build slot left for owner-dead reclaim: $($Ticket.Path)"; return }
-        $info = Get-Content -LiteralPath $Ticket.Path -Raw | ConvertFrom-Json
+        $info = Get-Content -LiteralPath $Ticket.Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         if ([int]$info.ownerPid -eq $Ticket.OwnerPid -and [long]$info.startTicks -eq $Ticket.StartTicks) {
-            Remove-Item -LiteralPath $Ticket.Path -Force -WhatIf:$false -Confirm:$false
+            Remove-Item -LiteralPath $Ticket.Path -Force -WhatIf:$false -Confirm:$false -ErrorAction Stop
         }
     } catch {
         Write-BuildGuardLog ('build slot not released: {0} ({1}); left for owner-dead reclaim' -f $Ticket.Path, ($_.Exception.Message -replace '\s+', ' '))
@@ -854,7 +857,7 @@ function Send-HeavySlotStop($Lease) {
     if (-not $ended) {
         $last = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
         $keep = if ($last) { $last.Value } else { $null }
-        $PSNativeCommandUseErrorActionPreference = $false
+        try { $PSNativeCommandUseErrorActionPreference = $false } catch { }  # locked by an action: the catch below still holds (r11, 6b8295aa-A2)
         try { $null = & ([IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'taskkill.exe')) /PID $Lease.Process.Id /T /F 2>&1 }
         catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} taskkill of heavy-slot pid {1} failed ({2})' -f $Lease.Label, $Lease.Process.Id, $_.Exception.Message) }
         finally {
@@ -1194,10 +1197,14 @@ function Invoke-BuildGuard {
     # dot-sourced (they assign in the scope that runs them) and are plain assignments, never a cmdlet (r10, a2bdda36-A2).
     # Neither ever throws (r11 adversary 08736d55-A2): a variable the action made ReadOnly or Constant is skipped, never a
     # throw before a release; every release write also passes -WhatIf:$false -Confirm:$false itself. The guard's values are
-    # set inside the try whose finally gives the caller's back, so no throw after them leaves them (08736d55-A1).
+    # set inside the try whose finally gives the caller's back, so no throw after them leaves them (08736d55-A1). Values the
+    # guard cannot set on the way in (the caller made one ReadOnly) are a throw before anything is taken, never a run under
+    # the caller's (6b8295aa-A1). $ErrorActionPreference comes back too: the guard's helpers set it to Stop, and an AllScope
+    # one is the caller's own variable (6b8295aa-A3).
     $callerDefaults = $PSDefaultParameterValues
     $callerPrefs = @{ VerbosePreference = $VerbosePreference; DebugPreference = $DebugPreference; WarningPreference = $WarningPreference
-        InformationPreference = $InformationPreference; WhatIfPreference = $WhatIfPreference; ConfirmPreference = $ConfirmPreference }
+        InformationPreference = $InformationPreference; WhatIfPreference = $WhatIfPreference; ConfirmPreference = $ConfirmPreference
+        ErrorActionPreference = $ErrorActionPreference }
     $guardPrefs = {
         trap { continue }
         $PSDefaultParameterValues = @{}
@@ -1210,6 +1217,7 @@ function Invoke-BuildGuard {
         $VerbosePreference = $callerPrefs.VerbosePreference; $DebugPreference = $callerPrefs.DebugPreference
         $WarningPreference = $callerPrefs.WarningPreference; $InformationPreference = $callerPrefs.InformationPreference
         $WhatIfPreference = $callerPrefs.WhatIfPreference; $ConfirmPreference = $callerPrefs.ConfirmPreference
+        $ErrorActionPreference = $callerPrefs.ErrorActionPreference
         $PSDefaultParameterValues = $callerDefaults
     }
     # The machine heavy slot is the OUTERMOST lock of a build: the memory floor and the build slot below nest inside it,
@@ -1219,6 +1227,10 @@ function Invoke-BuildGuard {
     $actionStarted = $false
     try {
         . $guardPrefs
+        if ($PSDefaultParameterValues.Count -or $WhatIfPreference -or $ConfirmPreference -ne 'None' -or $VerbosePreference -ne 'SilentlyContinue' -or
+            $DebugPreference -ne 'SilentlyContinue' -or $WarningPreference -ne 'SilentlyContinue' -or $InformationPreference -ne 'SilentlyContinue') {
+            throw 'build-guard: a caller preference or $PSDefaultParameterValues is read-only, so the guard cannot run under its own values; nothing was taken'
+        }
         $o = @{}
         foreach ($k in $script:BuildGuardDefaults.Keys) { $o[$k] = $script:BuildGuardDefaults[$k] }
         foreach ($k in $Options.Keys) { $o[$k] = $Options[$k] }

@@ -2640,6 +2640,66 @@ def test_an_action_that_locks_an_allscope_preference_never_skips_a_release(box, 
     assert _stub_calls(box)[0]["childEnd"]
 
 
+# r11 adversary 6b8295aa-A1: caller defaults locked ReadOnly before the call ('Get-Content:ErrorAction'='Continue') survived
+# the guard's own values, so a missing memory probe wrote a host error record. The guard now refuses before anything is taken.
+def test_a_read_only_caller_default_is_a_throw_before_anything_is_taken(box) -> None:
+    done = _library_driver(
+        box,
+        "Set-Variable -Name PSDefaultParameterValues -Option AllScope,ReadOnly -Force "
+        "-Value @{ 'Get-Content:ErrorAction' = 'Continue' }\n"
+        f"$opts.MemoryProbeFile = '{box['dir'] / 'no-such-memory.json'}'; $opts.DeadlineMinutes = 0\n"
+        "try { Invoke-BuildGuard -NoSlot -Label 'build' -Options $opts -Action { 'ACTION' } } "
+        "catch { Write-Output \"caught=$($_.Exception.Message)\" }\n",
+        str(box["lock"]),
+    )
+    out = done.stdout + done.stderr
+    assert "caught=build-guard: a caller preference or $PSDefaultParameterValues is read-only" in done.stdout, out
+    assert "ACTION" not in done.stdout and "BUILD_MEM_REFUSED" not in done.stdout, out
+    assert not _host_error_lines(done.stderr), out
+
+
+# r11 adversary 6b8295aa-A2 and A3: the guard's helpers set $ErrorActionPreference to Stop. For an AllScope one that was the
+# caller's own variable: the action ran under Stop and the caller kept it (A3); and one the action locked ReadOnly made the
+# build-slot release throw before it deleted the lock (A2).
+def test_an_allscope_error_action_preference_reaches_the_action_and_comes_back(box) -> None:
+    done = _library_driver(
+        box,
+        "Set-Variable -Name ErrorActionPreference -Option AllScope -Value 'Continue'\n"
+        f"$opts.MemoryProbeFile = '{box['dir'] / 'no-such-memory.json'}'; $opts.ProcessTableFile = '{box['dir'] / 'no-such-table.json'}'\n"
+        "$opts.MinFreePhysGB = 0; $opts.MinFreeCommitGB = 0\n"
+        "$r = Invoke-BuildGuard -NoSlot -Label 'build' -Options $opts -Action { 'ACTION_PREF=' + $ErrorActionPreference; "
+        "Write-Error 'recoverable action error'; 'ACTION_TAIL' }\n"
+        "Write-Output $r\nWrite-Output \"CALLER_AFTER=$ErrorActionPreference\"\n",
+        str(box["lock"]),
+    )
+    out = done.stdout + done.stderr
+    assert "ACTION_PREF=Continue" in done.stdout, out
+    assert "ACTION_TAIL" in done.stdout, out
+    assert "CALLER_AFTER=Continue" in done.stdout, out
+
+
+def test_an_action_that_locks_error_action_preference_never_skips_the_build_slot_release(box) -> None:
+    done = _library_driver(
+        box,
+        "Set-Variable -Name ErrorActionPreference -Option AllScope -Value 'Stop'\n"
+        "try { $r = Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        "    Set-Variable -Name ErrorActionPreference -Option AllScope,ReadOnly -Value Stop -Force; Write-Output \"built=$Jobs\" }\n"
+        "    Write-Output $r } catch { Write-Output \"caught=$($_.FullyQualifiedErrorId)\" }\n",
+        str(box["lock"]),
+        host_tail=(
+            "$d = (Get-Date).AddSeconds(20)\n"
+            f"while (-not (Test-Path -LiteralPath '{box['dir'] / 'stub.log'}') -and (Get-Date) -lt $d) {{ Start-Sleep -Milliseconds 200 }}\n"
+            f"Write-Output \"released=$(Test-Path -LiteralPath '{box['dir'] / 'stub.log'}')\"\n"
+        ),
+    )
+    out = done.stdout + done.stderr
+    assert "built=4" in done.stdout, out
+    assert "caught=" not in done.stdout, out
+    assert "released=True" in done.stdout, out
+    assert not box["lock"].exists(), "the build slot's lock is deleted on release"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == [], "every lease file is deleted on release"
+
+
 # r11 (sol r10 B2): the admission wait slept a whole -PollSeconds while it held the machine heavy slot, so PollSeconds=3600 with
 # DeadlineMinutes=0.01 asked for a one-hour sleep past a 0.6 s deadline. Every sleep is now at most what is left of the
 # deadline, on the memory wait and the local-slot-busy path alike, and the expired deadline gives the slot back and refuses.
