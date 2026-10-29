@@ -2758,6 +2758,74 @@ def test_an_action_that_installs_read_only_defaults_never_changes_the_release(bo
     assert list((box["dir"] / "heavy-slot").iterdir()) == [], "every lease file is deleted on release"
 
 
+# r13 adversary 92fc4bb2-A1 (and advisory A2): read-only defaults an action installs reached the release's READS too.
+# 'Get-Variable:ValueOnly' made the stop fallback save $null for the caller's $LASTEXITCODE (exit 0 instead of 7; a throw before
+# taskkill under strict mode), and 'Get-Content:Tail'=1 made the lock read throw, so the build slot's lock stayed. Those reads
+# are now session-state and .NET calls.
+@pytest.mark.parametrize("strict", [False, True], ids=["non-strict", "strict"])
+def test_read_only_get_variable_defaults_never_lose_the_callers_exit_code(box, strict) -> None:
+    done = _library_driver(
+        box,
+        ("Set-StrictMode -Version Latest\n" if strict else "") +
+        "Set-Variable -Name PSDefaultParameterValues -Option AllScope -Value @{}\n"
+        "try { $r = Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        "    New-Item -ItemType Directory -Path $heavy.Stop | Out-Null; $global:LASTEXITCODE = 7\n"
+        "    $ro = ([ordered]@{ 'Get-Variable:ValueOnly' = $true }).AsReadOnly()\n"
+        "    Set-Variable PSDefaultParameterValues -Option AllScope,ReadOnly -Value $ro -Force; 'ACTION' }\n"
+        "    Write-Output \"returned=$r code=$global:LASTEXITCODE\" } catch { Write-Output \"caught=$($_.Exception.Message)\" }\n",
+        str(box["lock"]),
+    )
+    out = done.stdout + done.stderr
+    assert "caught=" not in done.stdout, out
+    assert "returned=ACTION code=7" in done.stdout, out
+    assert "stop file not written" in done.stderr, out
+    assert not box["lock"].exists(), "the build slot's lock is deleted on release"
+
+
+@pytest.mark.parametrize("strict", [False, True], ids=["non-strict", "strict"])
+def test_the_stop_fallback_reads_lastexitcode_past_read_only_get_variable_defaults(box, strict) -> None:
+    # The same input on the stop fallback itself: the defaults are live when it runs, the stop file cannot be written.
+    stop = box["dir"] / "x.stop"
+    stop.mkdir()
+    done = _ps(["-Command",
+                f". '{GUARD}' -Library\n" + ("Set-StrictMode -Version Latest\n" if strict else "") +
+                "$global:LASTEXITCODE = 7\n"
+                "$ro = ([ordered]@{ 'Get-Variable:ValueOnly' = $true }).AsReadOnly()\n"
+                "Set-Variable PSDefaultParameterValues -Option AllScope,ReadOnly -Value $ro -Force\n"
+                "$p = [pscustomobject]@{ Id = 2147483646; HasExited = $false }\n"
+                f"$lease = @{{ Label = 'mlv:t:build'; Stop = '{stop}'; Process = $p; Holder = $null }}\n"
+                "try { Send-HeavySlotStop $lease; Write-Output \"returned code=$global:LASTEXITCODE\" }\n"
+                "catch { Write-Output \"threw=$($_.Exception.GetType().Name): $($_.Exception.Message)\" }\n"])
+    out = done.stdout + done.stderr
+    assert "threw=" not in done.stdout, out
+    assert "returned code=7" in done.stdout, out
+    assert "stop file not written" in done.stderr, out
+
+
+def test_read_only_get_content_defaults_never_keep_the_build_slot_lock(box) -> None:
+    done = _library_driver(
+        box,
+        "Set-Variable -Name PSDefaultParameterValues -Option AllScope -Value @{}\n"
+        "try { $r = Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        "    $ro = ([ordered]@{ 'Get-Content:Tail' = 1 }).AsReadOnly()\n"
+        "    Set-Variable PSDefaultParameterValues -Option AllScope,ReadOnly -Value $ro -Force; 'ACTION' }\n"
+        "    Write-Output \"returned=$r\" } catch { Write-Output \"caught=$($_.Exception.Message)\" }\n",
+        str(box["lock"]),
+        host_tail=(
+            "$d = (Get-Date).AddSeconds(20)\n"
+            f"while (-not (Test-Path -LiteralPath '{box['dir'] / 'stub.log'}') -and (Get-Date) -lt $d) {{ Start-Sleep -Milliseconds 200 }}\n"
+            f"Write-Output \"released=$(Test-Path -LiteralPath '{box['dir'] / 'stub.log'}')\"\n"
+        ),
+    )
+    out = done.stdout + done.stderr
+    assert "caught=" not in done.stdout, out
+    assert "returned=ACTION" in done.stdout, out
+    assert "build slot not released" not in out, out
+    assert "released=True" in done.stdout, out
+    assert not box["lock"].exists(), "the build slot's lock is deleted on release"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == [], "every lease file is deleted on release"
+
+
 # r13 (sol r12 B3, adversary fd39a45c-A7): the stop file cannot be written and the action locked the global $LASTEXITCODE
 # ReadOnly at 7, so the taskkill fallback's restore threw outside its catch, past the warning-only release, and the
 # verified-holder fallback never ran. The restore is now a warning; the holder is still ended and the 7 is kept.

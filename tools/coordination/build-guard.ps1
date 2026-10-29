@@ -582,7 +582,7 @@ function Remove-BuildSlot($Ticket) {
         $mutex = New-Object System.Threading.Mutex($false, $Ticket.MutexName)
         try { $got = $mutex.WaitOne(15000) } catch [System.Threading.AbandonedMutexException] { $got = $true }
         if (-not $got) { Write-BuildGuardLog "release-mutex-busy: build slot left for owner-dead reclaim: $($Ticket.Path)"; return }
-        $info = Get-Content -LiteralPath $Ticket.Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $info = Read-BuildGuardText $Ticket.Path | ConvertFrom-Json -ErrorAction Stop
         if ([int]$info.ownerPid -eq $Ticket.OwnerPid -and [long]$info.startTicks -eq $Ticket.StartTicks) {
             # A .NET delete, never a cmdlet (r13, adversary 16ea1ebb-A1): no default the caller or the action left in
             # $PSDefaultParameterValues can skip it, even in a dictionary the guard cannot switch off. It throws into the catch.
@@ -594,6 +594,17 @@ function Remove-BuildSlot($Ticket) {
         if ($got) { $mutex.ReleaseMutex() }
         if ($mutex) { $mutex.Dispose() }
     }
+}
+
+function Read-BuildGuardText([string]$Path) {
+    # A release read is a .NET call, never a cmdlet (r13, adversary 92fc4bb2-A2): an action can leave defaults such as
+    # 'Get-Content:Tail'=1 in a read-only dictionary the guard cannot switch off, and Get-Content -Raw then threw, so the lock
+    # was never deleted. The whole file as text, shared for read, write and delete like Get-Content; throws when unreadable.
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]'ReadWrite, Delete')
+    try {
+        $reader = [IO.StreamReader]::new($stream, $true)
+        try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+    } finally { $stream.Dispose() }
 }
 
 function Get-BuildGuardExemptReason([string]$Reason) {
@@ -697,9 +708,9 @@ function Send-HeavySlotLines($Lease) {
     # While heavy-slot runs, only newline-terminated lines are taken: a last line still being written stays in $Lease.Tail
     # for a later call, so a half-written line is never kept in place of the whole one (r4 adversary A2). Once heavy-slot
     # has ended, its last line is complete with or without a newline.
-    try { $raw = [string](Get-Content -LiteralPath $Lease.Log -Raw -ErrorAction Stop); $Lease.LogUnread = $false } catch {
+    try { $raw = [string](Read-BuildGuardText $Lease.Log); $Lease.LogUnread = $false } catch {
         $raw = ''
-        $Lease.LogUnread = [bool](Test-Path -LiteralPath $Lease.Log -ErrorAction Ignore)
+        $Lease.LogUnread = [IO.File]::Exists($Lease.Log) -or [IO.Directory]::Exists($Lease.Log)
     }
     $all = @($raw -split '\r?\n')
     $last = $all[-1]
@@ -795,7 +806,7 @@ function Get-HeavySlotHolderState($Lease) {
     # The first complete read is kept, so a ready file that later vanishes cannot hide a holder that has ended. A partial
     # read is never kept: its owner line may not be on disk yet, and owner validation must never be skipped (r4 sol B1).
     if (-not $Lease.Holder) {
-        $text = [string](Get-Content -LiteralPath $Lease.Ready -Raw -ErrorAction SilentlyContinue)
+        $text = try { [string](Read-BuildGuardText $Lease.Ready) } catch { '' }
         if (-not ($text -match '(?m)^end\s*$')) { return '' }
         # A pid or tick count too large for its type is unreadable too, never a throw (r4 adversary A3).
         [int]$n = 0; [long]$t = 0
@@ -826,7 +837,7 @@ function Get-HeavySlotStopHolder($Lease) {
     # The lease is read through its indexer, so a hand-built one without these keys reads $null in a strict-mode host too.
     if ($Lease['Holder']) { return $Lease['Holder'] }
     if (-not $Lease['StopHolder'] -and $Lease['Ready']) {
-        $text = [string](Get-Content -LiteralPath $Lease['Ready'] -Raw -ErrorAction SilentlyContinue)
+        $text = try { [string](Read-BuildGuardText $Lease['Ready']) } catch { '' }
         [int]$n = 0; [long]$t = 0
         if ($text -match '(?m)^holder=(\d+)@(\d+)\r?\n' -and [int]::TryParse($Matches[1], [ref]$n) -and [long]::TryParse($Matches[2], [ref]$t)) {
             $Lease['StopHolder'] = @{ Pid = $n; Ticks = $t }
@@ -875,7 +886,9 @@ function Send-HeavySlotStop($Lease) {
     # (r5b pass 2 A3): the release stays warning-only and the holder fallback below still runs.
     $ended = $Lease.Process.HasExited
     if (-not $ended) {
-        $last = Get-Variable -Name LASTEXITCODE -Scope Global -ErrorAction Ignore
+        # Read through the session state, never Get-Variable (r13, adversary 92fc4bb2-A1): an action's read-only
+        # 'Get-Variable:ValueOnly' default returned the bare 7, so $last.Value saved $null (and threw under strict mode).
+        $last = $ExecutionContext.SessionState.PSVariable.Get('global:LASTEXITCODE')
         $keep = if ($last) { $last.Value } else { $null }
         try { $PSNativeCommandUseErrorActionPreference = $false } catch { }  # locked by an action: the catch below still holds (r11, 6b8295aa-A2)
         try { $null = & ([IO.Path]::Combine([string]$env:SystemRoot, 'System32', 'taskkill.exe')) /PID $Lease.Process.Id /T /F 2>&1 }
@@ -884,7 +897,10 @@ function Send-HeavySlotStop($Lease) {
             # r13 (sol r12 B3): an action that made the global $LASTEXITCODE ReadOnly made this restore throw past the release,
             # and the holder fallback below never ran. The value the action locked is the one it exits with, so a restore that
             # cannot be made is a warning only.
-            try { if ($last) { $global:LASTEXITCODE = $keep } else { Remove-Variable -Name LASTEXITCODE -Scope Global -WhatIf:$false -Confirm:$false -ErrorAction Ignore } }
+            try {
+                if ($last) { $global:LASTEXITCODE = $keep }
+                elseif ($ExecutionContext.SessionState.PSVariable.Get('global:LASTEXITCODE')) { $ExecutionContext.SessionState.PSVariable.Remove('global:LASTEXITCODE') }
+            }
             catch { Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} $LASTEXITCODE not restored after taskkill ({1})' -f $Lease.Label, ($_.Exception.Message -replace '\s+', ' ')) }
         }
     }
