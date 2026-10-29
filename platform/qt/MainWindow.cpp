@@ -11063,9 +11063,12 @@ bool MainWindow::importNewMlv(QString fileName)
             int importedRow = SESSION_CLIP_COUNT - 1;
             for( int i = 0; i < SESSION_CLIP_COUNT; i++ )
                 if( GET_CLIP( i )->getPath() == fileName ) { importedRow = i; break; }
+            const int activeBeforeRemoval = SESSION_ACTIVE_CLIP_ROW;
             m_pModel->removeRow( importedRow, QModelIndex() );
-            if( previousActive >= 0 && previousActive < SESSION_CLIP_COUNT ) SET_ACTIVE_CLIP_IDX( previousActive );
-            else if( SESSION_CLIP_COUNT == 0 ) deleteSession();
+            // r7 (sol r6 CO-ACTIVE-ROW-EMPTY-NESTED): removeRow keeps the stored active row, so it is set here.
+            const int restoredActive = refusedImportActiveRow( previousActive, activeBeforeRemoval, importedRow, SESSION_CLIP_COUNT );
+            if( restoredActive >= 0 ) SET_ACTIVE_CLIP_IDX( restoredActive );
+            else deleteSession();
             // r4 (adversary A1 sibling): refused after the free, an empty object is loaded, not previousActive.
             // r6: so is any clip that opened inside this import; the sliders then describe no restored receipt.
             const bool keptPrevious = clipOpenFailureKeptRetainedClip( ret ) && loadedClipIsRow( previousActive );

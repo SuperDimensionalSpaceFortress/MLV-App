@@ -105,6 +105,21 @@ struct ImportBatchOutcome
     bool showLastRow( void ) const { return !refused || other; }
 };
 
+// r7 (sol r6 CO-ACTIVE-ROW-EMPTY-NESTED): the active row after a refused import removed its own row. The clip the
+// sliders describe (previousActive) is active again when it exists. Otherwise (the session was empty and a FileOpen
+// inside the import added a clip) the active row follows the clip it named across the removal; when that was the
+// removed row or no row, the last row (the clip a nested import showed last). -1: the session is empty.
+inline int refusedImportActiveRow( int previousActive, int activeBeforeRemoval, int removedRow, int clipCountAfterRemoval )
+{
+    if( clipCountAfterRemoval <= 0 ) return -1;
+    if( previousActive >= 0 && previousActive < clipCountAfterRemoval ) return previousActive;
+    int row = activeBeforeRemoval;
+    if( row == removedRow ) row = -1;
+    else if( row > removedRow ) row--;
+    if( row < 0 || row >= clipCountAfterRemoval ) row = clipCountAfterRemoval - 1;
+    return row;
+}
+
 // showFileInEditor( row ) after openMlv( row ) failed. The active row moves back to the clip the sliders
 // still describe before anything saves a receipt, so a later setReceipt( ACTIVE_RECEIPT ) never writes
 // one clip's sliders into another clip's receipt. The old clip is reopened only when it is no longer loaded.

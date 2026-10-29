@@ -197,8 +197,9 @@ TEST(ClipOpenAbortCallersWiring, RefusedImportLeavesTheSessionWithoutAReceiptSav
     ASSERT_TRUE(corrupt > opened);
     const QString branch = body.mid(refused, opened - refused);
     ASSERT_TRUE(branch.contains(QStringLiteral("m_pModel->removeRow( importedRow, QModelIndex() );")));
+    // r7: previousActive is restored through refusedImportActiveRow (ClipOpenAbortR7 covers its rows)
     ASSERT_TRUE(branch.contains(QStringLiteral(
-        "if( previousActive >= 0 && previousActive < SESSION_CLIP_COUNT ) SET_ACTIVE_CLIP_IDX( previousActive );")));
+        "const int restoredActive = refusedImportActiveRow( previousActive, activeBeforeRemoval, importedRow, SESSION_CLIP_COUNT );")));
     ASSERT_FALSE(branch.contains(QStringLiteral("setReceipt(")));
     ASSERT_FALSE(branch.contains(QStringLiteral("deleteFileFromSession")));
 }
@@ -980,6 +981,65 @@ TEST(ClipOpenAbortR5Wiring, EveryImportCallerShowsTheLastRowOnlyFromTheBatchOutc
     const int dropNote = source.lastIndexOf(QStringLiteral("imports.note( importNewMlv( fileName ) );"), dropShow);
     ASSERT_TRUE(dropShow >= 0);
     ASSERT_TRUE(dropNote >= 0 && dropNote < dropShow);
+}
+
+// sol r6 CO-ACTIVE-ROW-EMPTY-NESTED: an empty session imports B; inside addFileToSession's processEvents a FileOpen
+// imports and shows C (row 1, active 1). B's open is refused and B's row 0 is removed. The stored active row must
+// follow C to row 0: Save Session reads ACTIVE_RECEIPT, and the deferred retry must not drop an out-of-range row.
+TEST(ClipOpenAbortR7, ARefusedImportIntoAnEmptySessionKeepsTheNestedClipActive)
+{
+    std::vector<int> receipts = {7, 9}; // B (refused), C (nested import, shown)
+    const int previousActive = -1;      // the session was empty when B's import started
+    const int activeBeforeRemoval = 1;  // C
+    const int removedRow = 0;           // B's own row
+    receipts.erase(receipts.begin() + removedRow);
+    const int count = static_cast<int>(receipts.size());
+    const int active = refusedImportActiveRow(previousActive, activeBeforeRemoval, removedRow, count);
+    ASSERT_EQ(active, 0);
+    ASSERT_EQ(receipts.at(static_cast<size_t>(active)), 9); // Save Session reads C's receipt
+    ASSERT_TRUE(deferredClipReopenDecision(5, 5, false, active, active, count, 0) == DeferredClipReopen::Run);
+
+    // the sol r6 INV-9 rows: previousActive survives and is active again; an emptied session is cleared
+    ASSERT_EQ(refusedImportActiveRow(0, 1, 1, 1), 0);  // [A,B], previous A
+    ASSERT_EQ(refusedImportActiveRow(-1, 0, 0, 0), -1); // [B]
+    ASSERT_EQ(refusedImportActiveRow(0, 2, 1, 2), 0);  // [A,B,C], previous A, C active
+    // more nested imports: the active clip keeps its identity across the removal
+    ASSERT_EQ(refusedImportActiveRow(-1, 2, 0, 2), 1);  // [B,C,D], D active
+    ASSERT_EQ(refusedImportActiveRow(-1, 0, 1, 2), 0);  // an active row before the removed one keeps its index
+    // the removed row itself was active: the last surviving row (the clip a nested import showed last)
+    ASSERT_EQ(refusedImportActiveRow(-1, 0, 0, 2), 1);
+
+    // whatever the input, the result names a row of the session, and only an empty session gets -1
+    for (int n = 1; n <= 4; ++n)
+        for (int removed = 0; removed < n; ++removed)
+            for (int prev = -1; prev <= n; ++prev)
+                for (int before = -1; before <= n; ++before)
+                {
+                    const int row = refusedImportActiveRow(prev, before, removed, n - 1);
+                    if (n - 1 == 0) ASSERT_EQ(row, -1);
+                    else ASSERT_TRUE(row >= 0 && row < n - 1);
+                }
+}
+
+TEST(ClipOpenAbortR7Wiring, RefusedImportSetsTheActiveRowFromThePolicyAfterTheRemoval)
+{
+    const QString source = mainWindowSource();
+    const QString importBody = bodyBetween(source, QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"),
+                                           QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
+    ASSERT_FALSE(importBody.isEmpty());
+    const int before = importBody.indexOf(QStringLiteral("const int activeBeforeRemoval = SESSION_ACTIVE_CLIP_ROW;"));
+    const int removed = importBody.indexOf(QStringLiteral("m_pModel->removeRow( importedRow, QModelIndex() );"));
+    const int policy = importBody.indexOf(QStringLiteral(
+        "const int restoredActive = refusedImportActiveRow( previousActive, activeBeforeRemoval, importedRow, SESSION_CLIP_COUNT );"));
+    const int applied = importBody.indexOf(QStringLiteral(
+        "if( restoredActive >= 0 ) SET_ACTIVE_CLIP_IDX( restoredActive );\n            else deleteSession();"));
+    const int retry = importBody.indexOf(QStringLiteral("retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );"));
+    ASSERT_TRUE(before >= 0);
+    ASSERT_TRUE(removed > before);
+    ASSERT_TRUE(policy > removed);
+    ASSERT_TRUE(applied > policy);
+    ASSERT_TRUE(retry > applied);
+    ASSERT_FALSE(importBody.contains(QStringLiteral("else if( SESSION_CLIP_COUNT == 0 ) deleteSession();")));
 }
 
 // adversary 7354a575 A1: session [A,B,C], A active and loaded with exposure 20, B never loaded and corrupt.
