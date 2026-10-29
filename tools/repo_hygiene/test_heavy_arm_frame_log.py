@@ -43,10 +43,22 @@ def app_frame_rows_suppressed(value: str | None) -> bool:
     return value is not None and value.strip().lower() not in APP_OFF_VALUES
 
 
+def expand_env_pairs(envs: list[str]) -> list[str]:
+    """The runner's Add-EnvironmentPairs (run-release-gui-smoke.ps1) first splits an entry on commas and keeps the parts only when there is more than one and
+    every part is KEY=VALUE (HEAVY-FRAME-LOG-TEST-COMMA-PACKED-ENV-1); any other entry stays whole."""
+    pairs: list[str] = []
+    for raw in envs:
+        if not raw.strip():
+            continue
+        parts = raw.split(",")
+        pairs.extend(parts if len(parts) > 1 and all(part.find("=") >= 1 for part in parts) else [raw])
+    return pairs
+
+
 def child_flag_value(envs: list[str], inherited: str | None) -> str | None:
     """What the app sees: the runner's Add-EnvironmentPairs writes each KEY=VALUE onto the inherited environment, the last entry for a key wins."""
     value = inherited
-    for entry in envs:
+    for entry in expand_env_pairs(envs):
         key, _, rest = entry.partition("=")
         if key.strip().upper() == FLAG:
             value = rest
@@ -175,7 +187,7 @@ CPU_RECEIPT_LIGHT = ["-Backend", "cpu", "-TelemetryArm", "LIGHT", "-PlaybackProc
 def child_env_value(envs: list[str], inherited: str | None, flag: str) -> str | None:
     """child_flag_value for any flag: the runner writes each KEY=VALUE onto the environment it inherited, the last entry for a key wins."""
     value = inherited
-    for entry in envs:
+    for entry in expand_env_pairs(envs):
         key, _, rest = entry.partition("=")
         if key.strip().upper() == flag:
             value = rest
@@ -294,6 +306,33 @@ class CpuReceiptLegRunsProcessed8(unittest.TestCase):
         got = self.route([cache_summary_line("7", "600", "600")], session="")
         self.assertEqual((got["taken"], got["reason"]), (False, "PROCESSED8_ROUTE_SUMMARY_MISSING"), "no measured session id: nothing is admitted")
 
+    def test_a_key_suffix_token_is_never_the_session_or_a_counter(self) -> None:
+        """Sol r6 BLOCKER (on 7db6bf13). Catalogue row: a failing measured-session counter plus `not-session=<measured>` or `not-processed8_measured_frames=<positive>`
+        is still refused. The row was read for any `[A-Za-z0-9_]+=` match, so the tail `session=7` of `not-session=7` (and `processed8_measured_frames=600` of
+        `not-processed8_measured_frames=600`) was taken as the key and replaced the real one. A key is a whole token: it starts at the line start or after whitespace."""
+        failing = "playback_smoke.processed8_cache_summary session=7 processed8_measured_frames=0 processed16_measured_frames=600"
+        refused = (False, "PROCESSED8_NOT_MEASURED", 0, 600)
+        cases = {
+            "another session's row spells not-session=<measured> (sol repro 1)": (
+                [failing, "playback_smoke.processed8_cache_summary session=8 not-session=7 processed8_measured_frames=600 processed16_measured_frames=600"], refused),
+            "the measured row carries a not-processed8_measured_frames=600 suffix (sol repro 2)": (
+                [failing + " not-processed8_measured_frames=600"], refused),
+            "a not-processed16_measured_frames suffix cannot lift the Processed16 count": (
+                [cache_summary_line("7", "600", "600") + " not-processed16_measured_frames=1000"], (True, "NONE", 600, 600)),
+            "a dotted prefix is not a key boundary either": (
+                [failing, "playback_smoke.processed8_cache_summary session=8 x.session=7 processed8_measured_frames=600 processed16_measured_frames=600"], refused),
+            "a row whose only session= is a suffix token is no evidence for the session": (
+                ["playback_smoke.processed8_cache_summary not-session=7 processed8_measured_frames=600 processed16_measured_frames=600"],
+                (False, "PROCESSED8_ROUTE_SUMMARY_MISSING", None, None)),
+            "a whole key that merely ends the same way is a different key and is ignored": (
+                [failing + " xprocessed8_measured_frames=600"], refused),
+        }
+        for name, (lines, (taken, reason, p8, p16)) in cases.items():
+            with self.subTest(case=name):
+                got = self.route(lines)
+                self.assertEqual((got["taken"], got["reason"]), (taken, reason))
+                self.assertEqual((got["processed8MeasuredFrames"], got["processed16MeasuredFrames"]), (p8, p16))
+
     def test_the_route_gate_runs_after_the_exit_28_gate_and_before_any_success_summary(self) -> None:
         for extra in (spec_generator_args(NEW_SPEC), CPU_RECEIPT_LIGHT):
             with self.subTest(extra=extra):
@@ -390,6 +429,19 @@ class Processed8RouteMirrorsTheApp(unittest.TestCase):
         main = (ROOT / "platform" / "qt" / "main.cpp").read_text(encoding="utf-8")
         for flag in GL_FLAGS:
             self.assertIn(f'qEnvironmentVariableIsSet("{flag}")', main)
+
+
+class EnvModelExpandsCommaPackedPairs(unittest.TestCase):
+    """HEAVY-FRAME-LOG-TEST-COMMA-PACKED-ENV-1 (sol r6 hardening): the test model of the runner's environment reads a comma-packed entry as the separate pairs."""
+
+    def test_a_comma_packed_entry_is_read_as_its_pairs(self) -> None:
+        self.assertEqual(child_flag_value([f"{FLAG}=0,OTHER=1"], "1"), "0")
+        self.assertEqual(child_flag_value(["OTHER=1,B=2", f"{FLAG}=1,X=2"], None), "1")
+        self.assertEqual(child_env_value([f"A=1,{FLAG}=off"], "1", FLAG), "off")
+
+    def test_an_entry_that_is_not_all_pairs_stays_whole(self) -> None:
+        self.assertEqual(child_flag_value([f"{FLAG}=a,b"], None), "a,b")
+        self.assertEqual(expand_env_pairs(["", " ", "A=1"]), ["A=1"])
 
 
 class FlagRuleMirrorsTheApp(unittest.TestCase):

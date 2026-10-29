@@ -5595,7 +5595,8 @@ function Get-AttrCpuProcessed8Route([string]$RawLog, [string]$MeasuredSessionId)
     foreach ($line in ($RawLog -split "`r?`n")) {
         if ($line -notmatch 'playback_smoke\.processed8_cache_summary ') { continue }
         $values = @{}
-        foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) { $values[$match.Groups['key'].Value] = $match.Groups['value'].Value }
+        # A key is a whole token (sol r6): it starts at the line start or after whitespace, so the tail of `not-session=7` is not `session=7`.
+        foreach ($match in [regex]::Matches($line, '(?<!\S)(?<key>[A-Za-z0-9_]+)=(?<value>\S+)')) { $values[$match.Groups['key'].Value] = $match.Groups['value'].Value }
         if ([string]::IsNullOrWhiteSpace($MeasuredSessionId) -or -not $values.ContainsKey('session') -or $values['session'] -cne $MeasuredSessionId) { continue }
         $last = $values
     }
