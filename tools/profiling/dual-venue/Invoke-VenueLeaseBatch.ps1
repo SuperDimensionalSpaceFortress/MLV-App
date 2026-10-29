@@ -590,6 +590,9 @@ function Get-WriteDestinationHit([string]$Path, [switch]$Directory) {
     try { $phys = (Get-PhysicalPath $Path).TrimEnd('\'); $di = Get-FileIdentity $Path }
     catch { return [pscustomobject]@{ kind = 'output'; input = ''; item = 0; code = 'OUTPUT_ZONE_UNRESOLVED'; path = $Path; why = "'$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write to it lands is unknown" } }
     $inputKeys = @{}   # r7 pass 2: file identity -> input, for the files already under a -Directory destination
+    # r9 (adversary r9 A1, the RPF-10 class): an input that will not resolve is kept, not returned at once, so a LATER input the destination demonstrably is (its accepted identity, or
+    # its path now) still names the hit: an alias outranks an unresolved input, and an unresolved input outranks an output that will not resolve, as Get-InputOutputRefusal ranks them
+    $unresolvedHit = $null
     foreach ($g in $script:guardedInputs) {
         $at = { param($p, $k) $p -and ($phys -ieq $p -or $di.key -ceq $k -or ($Directory -and ($p + '\').StartsWith($phys + '\', [StringComparison]::OrdinalIgnoreCase))) }
         if ($g.accepted -and (& $at $g.accepted.phys $g.accepted.key)) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = "'$($g.path)' (as it was accepted) is reached by a write to '$Path', a file this run writes" } }
@@ -597,8 +600,9 @@ function Get-WriteDestinationHit([string]$Path, [switch]$Directory) {
         if (Test-NothingAtName $g.path) { continue }
         try { $gp = Get-PhysicalPath $g.path; $gk = (Get-FileIdentity $g.path).key } catch {
             $label = $(if ($g.kind -ceq 'plan') { 'the plan file' } elseif ($g.kind -ceq 'build') { 'the staged build manifest' } else { 'the leg spec' })
-            return [pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = 'INPUT_UNREADABLE'; path = $g.path
-                why = "$label '$($g.path)' is there but cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')): a link on its side may reach '$Path', so nothing is written there" }
+            if (-not $unresolvedHit) { $unresolvedHit = [pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = 'INPUT_UNREADABLE'; path = $g.path
+                why = "$label '$($g.path)' is there but cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')): a link on its side may reach '$Path', so nothing is written there" } }
+            continue
         }
         if (& $at $gp $gk) { return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = "'$($g.path)' is reached by a write to '$Path', a file this run writes" } }
         $inputKeys[$gk] = $g
@@ -611,9 +615,12 @@ function Get-WriteDestinationHit([string]$Path, [switch]$Directory) {
                 $ci = Get-FileIdentity $c.FullName
                 if ($inputKeys.ContainsKey($ci.key)) { $g = $inputKeys[$ci.key]; return [pscustomobject]@{ kind = $g.kind; item = $g.item; why = "'$($g.path)' is '$($c.FullName)' (another name for it) inside '$Path', a folder this run writes into" } }
             }
-        } catch { return [pscustomobject]@{ kind = 'output'; input = ''; item = 0; code = 'OUTPUT_ZONE_UNRESOLVED'; path = $Path; why = "a file inside '$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write into it lands is unknown" } }
+        } catch {
+            if ($unresolvedHit) { return $unresolvedHit }
+            return [pscustomobject]@{ kind = 'output'; input = ''; item = 0; code = 'OUTPUT_ZONE_UNRESOLVED'; path = $Path; why = "a file inside '$Path' cannot be resolved ($($_.Exception.Message -replace '\s+', ' ')), so where a write into it lands is unknown" }
+        }
     }
-    $null
+    $unresolvedHit
 }
 
 function Enable-WriteSuppression($Hit) {
@@ -909,6 +916,17 @@ function Add-PlanIdentity([object]$Row, [object]$Leg) {
 
 function Format-Mean($m) { if ($null -eq $m) { 'UNKNOWN' } else { '{0:0.0}' -f $m } }
 
+function Get-ProbeLaunchVerdict([int]$MaxWaitSec) {
+    # r8 pass 3 (adversary r8 pass 2 A3): no probe without the claim. r9 (adversary r9 A2 = OPEN r8p3-A1; LEASE-BATCH-PROBE-LAUNCH-LEASE-ROOM-1): nor past the lease, as the leg's own
+    # launch asks: the guards before the launch can block on a share, so the room is asked again here, and the probe's wait is cut to what is left beyond the leg's budget then.
+    # A verdict object ends the probe unrun (CLAIM_LOST, LEASE_SHORT); else .maxWait is the wait to pass.
+    $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc
+    if ($cl) { return [pscustomobject]@{ verdict = 'CLAIM_LOST'; code = 'none'; mean = $null; reason = $cl.detail; foreignFloor = $false } }
+    $roomAtLaunch = [int](($leaseEnd - [DateTime]::UtcNow).TotalSeconds) - $LeaseMarginSec
+    if ($roomAtLaunch -lt $legBudget) { return [pscustomobject]@{ verdict = 'LEASE_SHORT'; code = 'none'; mean = $null; reason = "roomSec=$roomAtLaunch < legBudgetSec=$legBudget (leaseMarginSec=$LeaseMarginSec)"; foreignFloor = $false } }
+    [pscustomobject]@{ verdict = $null; maxWait = [int][Math]::Max(0, [Math]::Min($MaxWaitSec, $roomAtLaunch - $legBudget)) }
+}
+
 function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
     # One Wait-VenueQuiet run (its probe job is light: the agent runs it under the parked batch lease). verdict: QUIET | COOLDOWN_UNMET | GATE_BUSY |
     # GATE_UNREADABLE | HOST_MISMATCH | USAGE | VENUE_QUIET_UNKNOWN (not measured). The same exit-code reading as Invoke-VenueChain's probe.
@@ -918,9 +936,10 @@ function Invoke-QuietProbe([string]$Name, [string]$Phase, [int]$MaxWaitSec) {
         '-ThresholdPercent', [string]$ThresholdPercent, '-MaxWaitSec', [string]$MaxWaitSec, '-RecheckSec', [string]$RecheckSec, '-MaxAdmissionWaitSec', '120')
     # r7: the probe writes its output here, and Wait-VenueQuiet its gate log and work folder: each is asked first (a refusal runs no probe: the batch ends in its typed stop)
     # r8 pass 3 (adversary r8 pass 2 A3): these guards can block on a share, so the claim is asked again after them, at the probe's launch itself (no probe without the claim)
+    # r9 (adversary r9 A2): and the lease's room (Get-ProbeLaunchVerdict), which also cuts the probe's wait to the room left then
     $asked = (Test-RunDirWrite (Join-Path $RunDir 'gate.log')) -and (Test-RunDirWrite (Join-Path $RunDir 'quiet') -Directory)
     if (-not ($asked -and (Test-RunDirWrite $out))) { return [pscustomobject]@{ verdict = 'WRITE_REFUSED'; code = 'none'; mean = $null; reason = 'WRITE_REFUSED'; foreignFloor = $false } }
-    $cl = Get-VenueClaimKeeperLoss -Keeper $claimKeeper -ClaimExpiresUtc $claim.expiresUtc; if ($cl) { return [pscustomobject]@{ verdict = 'CLAIM_LOST'; code = 'none'; mean = $null; reason = $cl.detail; foreignFloor = $false } }
+    $lv = Get-ProbeLaunchVerdict $MaxWaitSec; if ($lv.verdict) { return $lv }; $qArgs[$qArgs.IndexOf('-MaxWaitSec') + 1] = [string]$lv.maxWait
     & $pwshExe @qArgs *> $out
     $code = $LASTEXITCODE
     $lines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
@@ -1410,6 +1429,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $q = Invoke-QuietProbe $leg.name "b$('{0:00}' -f $batchNo)-a$attempt" $probeWait
                 if ($q.verdict -ceq 'WRITE_REFUSED' -or $script:RunOutputAliased) { Stop-BatchOnSuppression $b; break }   # r7: the probe's outputs were refused
                 if ($q.verdict -ceq 'CLAIM_LOST') { $b.endReason = 'CLAIM_LOST'; $b.endDetail = "at the probe's launch for leg $($leg.name): $($q.reason)"; L "CLAIM_LOST batch=$batchNo leg=$($leg.name) phase=probe-launch $($q.reason)"; break }
+                # r9 (adversary r9 A2): the lease ended while the probe's guards ran: no probe, the leg goes to the next batch, and that is no budget the lease cannot hold ($launchShort)
+                if ($q.verdict -ceq 'LEASE_SHORT') { $launchShort = $true; $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "at the probe's launch for leg $($leg.name): $($q.reason): it goes to the next batch"; break }
                 if ($q.foreignFloor -and -not $legForeign.ContainsKey($leg.name)) { $legForeign[$leg.name] = $q.foreignFloorLine }
                 L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease exit=$($q.code) verdict=$($q.verdict) mean=$(Format-Mean $q.mean) maxWaitSec=$probeWait roomSec=$room$(if ($q.reason) { " reason=$($q.reason)" })$(if ($q.foreignFloor) { ' foreignFloor=1' })"
                 if ($q.verdict -ceq 'USAGE') { $b.endReason = 'PROBE_USAGE'; Set-Stop 'USAGE' 2; break }

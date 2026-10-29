@@ -3107,6 +3107,24 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertIn(f"BATCH_RECEIPT_GUARD_STOP reason={code}", r.stderr)
                 self.assertIn(f"BATCH_WRITE_REFUSED file={log} reason={code}", r.stderr)
 
+    def test_r9_adv_a1_an_earlier_input_that_will_not_resolve_never_hides_a_later_inputs_alias(self) -> None:
+        # adversary r9 A1 (the RPF-10 class inside Get-WriteDestinationHit): the destination check returned INPUT_UNREADABLE for the first input that would not resolve (the plan) before
+        # comparing a later input's accepted identity, so a batch.log that IS the accepted spec was typed INPUT_UNREADABLE and the stop stayed OUTPUT_ZONE_UNRESOLVED. RED on a01ce8f0.
+        spec = self._r5_spec("fx-a.json", self.specs[0])
+        plan = self.write_plan([self.item(spec, "A", self.commit_a)])
+        args, e = self.plan_cmd(plan)
+        gate, log, snap = self.run_dir / "gate.log", self.run_dir / "batch.log", self.case / "r9-spec.snap"
+        inject = (f"[IO.File]::Delete('{psq(gate)}'); " + self._rpf06_dangling(gate) + f"; [IO.File]::Delete('{psq(log)}'); "
+                  f"New-Item -ItemType HardLink -Path '{psq(log)}' -Value '{psq(spec)}' | Out-Null; Copy-Item -LiteralPath '{psq(spec)}' -Destination '{psq(snap)}'; $script:r9DenyPlan = $true")
+        deny = (self._RPF06_RESOLVE, f"if ($script:r9DenyPlan -and $Path -ieq '{psq(plan)}') {{ throw [UnauthorizedAccessException]::new('injected: the plan path will not resolve') }}; " + self._RPF06_RESOLVE)
+        r = self._rpf06_run(args, e, inject, deny)
+        self.assertTrue(snap.exists() and os.path.lexists(gate) and not gate.exists(), "the case under test was set up\n" + r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        res = batch_result(r.stdout)
+        self.assertEqual((res["exitCode"], res["stopReason"]), (2, "LEG_SPEC_IS_RUN_OUTPUT"), r.stderr)
+        self._r5_assert_suppressed(res, "LEG_SPEC_IS_RUN_OUTPUT")
+        self.assertEqual(spec.read_bytes(), snap.read_bytes(), "nothing was written into the spec through batch.log")
+
     # PR 704 r9 (sol r8 B2 = producer OPEN r8p2-A2; catalogue RPF-11): a receipt destination that is there but will not resolve (renamed between Test-NothingAtName and Get-PhysicalPath)
     # says nothing about any input or any other file, yet with no overall hit (or a content one) the receipt guard asked the general write guard, which turned the suppression on for
     # every write: the healthy sibling receipt and the summary's batch.log line were lost too. Only that destination's write is suppressed now, whatever the overall hit; a destination
@@ -3472,6 +3490,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "leg: claim lost while its guards ran": (leg_anchor, "$claimKeeper.state.lost = 'NOT_OURS'", "CLAIM_LOST", ["OPEN", "QUIET", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
             "leg: the lease ended while its guards ran": (leg_anchor, "$leaseEnd = [DateTime]::UtcNow.AddSeconds(-31)", "LEASE_REMAINING_SHORT", ["OPEN", "QUIET", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
             "probe: claim lost while its guards ran": ("    if (-not ($asked -and (Test-RunDirWrite $out))) {","$claimKeeper.state.lost = 'NOT_OURS'", "CLAIM_LOST", ["OPEN", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
+            # r9 (adversary r9 A2 = OPEN r8p3-A1; LEASE-BATCH-PROBE-LAUNCH-LEASE-ROOM-1): the fourth combination. RED on a01ce8f0: the probe starts after the lease ended.
+            "probe: the lease ended while its guards ran": ("    if (-not ($asked -and (Test-RunDirWrite $out))) {", "$leaseEnd = [DateTime]::UtcNow.AddSeconds(-31)", "LEASE_REMAINING_SHORT", ["OPEN", "CLOSE", "OPEN", "QUIET", "LEG", "CLOSE"]),
         }
         for name, (anchor, make, reason, kinds) in cases.items():
             with self.subTest(case=name):
