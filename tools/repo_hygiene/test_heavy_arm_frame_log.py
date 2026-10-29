@@ -279,6 +279,19 @@ class CpuReceiptLegRunsProcessed8(unittest.TestCase):
                 self.assertEqual((got["processed8MeasuredFrames"], got["processed16MeasuredFrames"]), (p8, p16))
                 self.assertEqual(got["processed16OnlyFrames"], None if p8 is None else p16 - p8)
 
+    def test_a_sessionless_summary_row_never_replaces_the_measured_sessions_counters(self) -> None:
+        """Adversary r5 A1 (sol, on bab3f11c): a processed8_cache_summary row with no session= key was taken as the measured session's and, being later,
+        replaced its failing counters (taken=true). The app always prints session=, so a row without it is not the measured session's."""
+        lines = ["playback_smoke.measured_session id=7",
+                 "playback_smoke.processed8_cache_summary session=7 processed8_measured_frames=0 processed16_measured_frames=600",
+                 "playback_smoke.processed8_cache_summary processed8_measured_frames=600 processed16_measured_frames=600"]
+        got = self.route(lines)
+        self.assertEqual((got["taken"], got["reason"], got["processed8MeasuredFrames"]), (False, "PROCESSED8_NOT_MEASURED", 0))
+        got = self.route(lines[2:])
+        self.assertEqual((got["taken"], got["reason"]), (False, "PROCESSED8_ROUTE_SUMMARY_MISSING"), "a sessionless row alone is no measured-session evidence")
+        got = self.route([cache_summary_line("7", "600", "600")], session="")
+        self.assertEqual((got["taken"], got["reason"]), (False, "PROCESSED8_ROUTE_SUMMARY_MISSING"), "no measured session id: nothing is admitted")
+
     def test_the_route_gate_runs_after_the_exit_28_gate_and_before_any_success_summary(self) -> None:
         for extra in (spec_generator_args(NEW_SPEC), CPU_RECEIPT_LIGHT):
             with self.subTest(extra=extra):

@@ -5584,12 +5584,14 @@ foreach ($glViewportFlag in @('MLVAPP_EXPERIMENTAL_GL_VIEWPORT', 'MLVAPP_EXPERIM
 $envs = @($envs | Where-Object { $_ -notmatch '^\s*MLVAPP_EXPERIMENTAL_GL_(WINDOW_)?VIEWPORT\s*=' })
 function Get-AttrCpuProcessed8Route([string]$RawLog, [string]$MeasuredSessionId) {
     # The app's one-shot session-end counters (MainWindow.cpp finishPlaybackSmokeTelemetry; LIGHT and HEAVY alike): the LAST line for the measured session.
+    # Only a row that NAMES the measured session counts (adversary r5 A1): the app always prints session=, so a row without it (or no measured session id
+    # at all) is no evidence for this session and never replaces its counters.
     $last = $null
     foreach ($line in ($RawLog -split "`r?`n")) {
         if ($line -notmatch 'playback_smoke\.processed8_cache_summary ') { continue }
         $values = @{}
         foreach ($match in [regex]::Matches($line, '(?<key>[A-Za-z0-9_]+)=(?<value>[^\s]+)')) { $values[$match.Groups['key'].Value] = $match.Groups['value'].Value }
-        if ($values.ContainsKey('session') -and $values['session'] -ne $MeasuredSessionId) { continue }
+        if ([string]::IsNullOrWhiteSpace($MeasuredSessionId) -or -not $values.ContainsKey('session') -or $values['session'] -cne $MeasuredSessionId) { continue }
         $last = $values
     }
     $p8 = [int64]-1; $p16 = [int64]-1
