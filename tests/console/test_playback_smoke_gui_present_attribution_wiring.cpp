@@ -98,6 +98,11 @@ QString beginSmokeBody()
                         QStringLiteral("void MainWindow::notePlaybackSmokePresentedFrame("));
 }
 
+QString closeGapBody()
+{
+    return bracedBlockAfter(mainWindowSource(), QStringLiteral("void MainWindow::closeGuiPresentGap( void )"));
+}
+
 // The literal text of the one qInfo() line whose format string starts with `kind`.
 QString summaryFormat(const QString & finishBody, const QString & kind)
 {
@@ -236,4 +241,58 @@ TEST(GuiPresentAttributionWiring, GuiBusyGapOpensAfterPresentAndClosesOnTheNextR
     ASSERT_FALSE(gate.isEmpty());
     ASSERT_TRUE(gate.contains(QStringLiteral("&QAbstractEventDispatcher::aboutToBlock")));
     ASSERT_TRUE(gate.contains(QStringLiteral("&QAbstractEventDispatcher::awake")));
+}
+
+TEST(GuiPresentAttributionWiring, SmokeRunnerSleepIsReportedApartFromGuiBusy)
+{
+    // Adversary A1 (400865b1): the measured gui-smoke loop is processEvents(AllEvents) then
+    // QThread::msleep( 10 ). That sleep never reaches the dispatcher's aboutToBlock, so it was
+    // charged as GUI busy. Every runner sleep goes through the accounting helper, the gap keeps
+    // it apart, and busy excludes it.
+    const QString source = mainWindowSource();
+    const QString runners[][2] = {
+        { QStringLiteral("int MainWindow::runHeadlessPlaybackProfile(const PlaybackProfileOptions & options)"),
+          QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)") },
+        { QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
+          QStringLiteral("bool MainWindow::importNewMlv(QString fileName)") },
+    };
+    for (const auto & runner : runners)
+    {
+        const QString body = functionBody(source, runner[0], runner[1]);
+        ASSERT_FALSE(body.isEmpty());
+        ASSERT_EQ(0, body.count(QStringLiteral("QThread::msleep(")));
+        ASSERT_TRUE(body.count(QStringLiteral("sleepGuiThreadForSmokeRunner(")) > 0);
+    }
+
+    const QString helper = bracedBlockAfter(
+        source, QStringLiteral("void MainWindow::sleepGuiThreadForSmokeRunner( unsigned long ms )"));
+    ASSERT_FALSE(helper.isEmpty());
+    ASSERT_EQ(1, helper.count(QStringLiteral("QThread::msleep( ms );")));
+    ASSERT_TRUE(helper.contains(QStringLiteral("m_guiPresentGapRunnerSleepNs +=")));
+
+    const QString close = closeGapBody();
+    ASSERT_FALSE(close.isEmpty());
+    ASSERT_TRUE(close.contains(QStringLiteral("const double busyMs = gapMs - idleMs - runnerSleepMs;")));
+    ASSERT_TRUE(close.contains(QStringLiteral("gaps.runnerSleepSumMs += runnerSleepMs;")));
+
+    const QString format = summaryFormat(finishSmokeBody(),
+                                         QStringLiteral("playback_smoke.gui_present_summary session=%1"));
+    ASSERT_EQ(1, format.count(QStringLiteral("avg_gui_present_gap_runner_sleep_ms=")));
+}
+
+TEST(GuiPresentAttributionWiring, PendingDispatcherWaitIsIdleWhenTheResultArrivesFirst)
+{
+    // Adversary A2 (400865b1): a dispatcher that delivers the next result before it emits awake
+    // left the wait pending; the close dropped it and charged the whole wait as busy. The close
+    // now counts a pending wait as idle up to the close, before it derives idle.
+    const QString close = closeGapBody();
+    ASSERT_FALSE(close.isEmpty());
+    const QRegularExpressionMatch pending = QRegularExpression(QStringLiteral(
+        "if\( m_guiPresentGapBlockStartNs >= 0 \)\s*"
+        "m_guiPresentGapIdleNs \+= nowNs - m_guiPresentGapBlockStartNs;")).match(close);
+    ASSERT_TRUE(pending.hasMatch());
+    const int idleAt = close.indexOf(QStringLiteral("const double idleMs ="));
+    ASSERT_TRUE(idleAt > pending.capturedStart());
+    ASSERT_TRUE(close.indexOf(QStringLiteral("const qint64 nowNs = m_guiPresentGapClock.nsecsElapsed();"))
+                < pending.capturedStart());
 }

@@ -1518,6 +1518,7 @@ private:
         double gapSumMs = 0.0;
         double gapMaxMs = 0.0;
         double idleSumMs = 0.0;
+        double runnerSleepSumMs = 0.0;
         double busySumMs = 0.0;
         double busyMaxMs = 0.0;
         double otherBusySumMs = 0.0;
@@ -1527,6 +1528,7 @@ private:
     QElapsedTimer m_guiPresentGapClock;
     qint64 m_guiPresentGapStartNs = -1;
     qint64 m_guiPresentGapIdleNs = 0;
+    qint64 m_guiPresentGapRunnerSleepNs = 0;
     qint64 m_guiPresentGapBlockStartNs = -1;
     double m_guiPresentGapPaintStartMs = 0.0;
     bool m_guiPresentIdleProbeConnected = false;
@@ -1825,6 +1827,7 @@ private:
     void presentPlaybackPreparedFrame( const PlaybackPrepResult &result );
     void openGuiPresentGap( void );
     void closeGuiPresentGap( void );
+    void sleepGuiThreadForSmokeRunner( unsigned long ms );
     void finishPresentedFrame( uint64_t displayFrame,
                                RenderFrameThread::ReadyFrame &readyFrame,
                                const PresentationRequestContext &requestContext,
