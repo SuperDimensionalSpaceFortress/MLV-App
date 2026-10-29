@@ -3974,8 +3974,39 @@ void MainWindow::invalidatePlaybackPrepForDisplayChange( const char *reason )
     m_playbackPrepCv.notify_all();
 }
 
+// CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: wait for the prep worker to leave the task it
+// is computing (invalidate cannot see it). Never call this while holding the render
+// mutex: the worker's drop path takes it. On timeout it logs and returns, never hangs.
+// It logs (always, not trace-only) only when a task was in flight: at most once per
+// stop or core mutation.
+void MainWindow::drainPlaybackPrepInFlight( const char *reason, int timeoutMs )
+{
+    bool waited = false;
+    bool drained = true;
+    uint64_t serial = 0;
+    const double drainStart = mlv_stage_timing_now();
+    {
+        std::unique_lock<std::mutex> lk( m_playbackPrepMutex );
+        waited = m_playbackPrepInFlight.inFlightLocked();
+        serial = m_playbackPrepInFlight.serialLocked();
+        if( waited ) drained = m_playbackPrepInFlight.drainLocked( lk, timeoutMs );
+    }
+    if( !waited ) return;
+    logInteractionEvent(
+        drained ? QStringLiteral("playback_prep.drain")
+                : QStringLiteral("playback_prep.drain_timeout"),
+        QStringLiteral("reason=%1 serial=%2 waited_ms=%3 timeout_ms=%4")
+            .arg( reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified") )
+            .arg( static_cast<qulonglong>( serial ) )
+            .arg( ( mlv_stage_timing_now() - drainStart ) * 1000.0, 0, 'f', 2 )
+            .arg( timeoutMs ) );
+}
+
 void MainWindow::waitForRenderThreadIdleBeforeCoreMutation( const char *reason )
 {
+    // F2: the prep worker reads core processing state too; drain it BEFORE taking
+    // the render mutex below.
+    drainPlaybackPrepInFlight( reason, 2000 );
     const QString reasonText =
         reason && *reason ? QString::fromLatin1( reason ) : QStringLiteral("unspecified");
     const bool renderBusy = m_pRenderThread && !m_pRenderThread->isIdle();
@@ -4114,10 +4145,11 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
                     ? task.readyFrame.rawImage16
                     : nullptr);
     const uint8_t *rgb8DisplaySource =
-        (task.sourceImage != nullptr && task.sourceImageSize > 0
-         && task.sourceImageSize >= sourceImageBytes)
-            ? task.sourceImage
-            : task.readyFrame.rawImage8;
+        playbackSelectRgb8Source( task.sourceImage,
+                                  task.sourceImageSize,
+                                  task.readyFrame.rawImage8,
+                                  task.readyFrame.rawImage8Bytes,
+                                  sourceImageBytes );
     const bool playbackProcessingSubsetActive =
         (gpuPreviewProcessingActive || cpuPreviewProcessingActive)
         && gpuPreviewProcessingConfig.enabled;
@@ -4344,7 +4376,8 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
 
     const qint64 downscaleStartNs = prepSpanClock.nsecsElapsed();
     const char *downscaleBranch = preScaledPlaybackImageAvailable ? "prescaled" : "none";
-    if( displayImage.isNull() )
+    // F3: no sized 8-bit source -> no image; the present path drops it as present-nothing.
+    if( displayImage.isNull() && rgb8DisplaySource )
     {
         const bool playbackFastScalingActive =
             playbackPolicyActive
@@ -4526,7 +4559,8 @@ MainWindow::PlaybackPrepResult MainWindow::buildPlaybackPrepResult( const Playba
 
     if( useGpuImagePresentation && useGpuShaderZebras )
     {
-        underOver = scanZebrasRgb8( rgb8DisplaySource, displaySourceWidth, displaySourceHeight );
+        if( rgb8DisplaySource )
+            underOver = scanZebrasRgb8( rgb8DisplaySource, displaySourceWidth, displaySourceHeight );
     }
     else if( zebrasEnabled && !displayImage.isNull() && !displayImageOwnsData )
     {
@@ -4665,6 +4699,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             task = m_playbackPrepPending;
             task.rebindOwnedImagePointers();
             m_playbackPrepPendingValid = false;
+            m_playbackPrepInFlight.beginLocked( task.requestSerial );
         }
 
         const double workerStart = mlv_stage_timing_now();
@@ -4688,6 +4723,7 @@ void MainWindow::playbackPrepThreadLoop( void )
                 ++m_playbackPrepGenerationDropCount;
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( task.requestSerial );
+            m_playbackPrepInFlight.endLocked();
             continue;
         }
 
@@ -4708,12 +4744,15 @@ void MainWindow::playbackPrepThreadLoop( void )
             ++m_playbackPrepGenerationDropCount;
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
+            m_playbackPrepInFlight.endLocked();
             continue;
         }
         if( m_playbackPrepStop.load( std::memory_order_acquire ) )
         {
+            std::lock_guard<std::mutex> lk( m_playbackPrepMutex );
             if( m_pRenderThread )
                 m_pRenderThread->releasePresentedFrameForRequestSerial( result.task.requestSerial );
+            m_playbackPrepInFlight.endLocked();
             continue;
         }
 
@@ -4734,6 +4773,7 @@ void MainWindow::playbackPrepThreadLoop( void )
             }
             m_playbackPrepResults.push_back( std::move( result ) );
             m_playbackPrepResults.back().task.rebindOwnedImagePointers();
+            m_playbackPrepInFlight.endLocked();
         }
         emit playbackPrepResultReady();
     }
@@ -4910,10 +4950,11 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                     ? task.readyFrame.rawImage16
                     : nullptr);
     const uint8_t *rgb8DisplaySource =
-        (task.sourceImage != nullptr && task.sourceImageSize > 0
-         && task.sourceImageSize >= sourceImageBytes)
-            ? task.sourceImage
-            : task.readyFrame.rawImage8;
+        playbackSelectRgb8Source( task.sourceImage,
+                                  task.sourceImageSize,
+                                  task.readyFrame.rawImage8,
+                                  task.readyFrame.rawImage8Bytes,
+                                  sourceImageBytes );
     bool framePresentedByViewport = false;
     const size_t expectedAmazeTextureRawFloats =
         static_cast<size_t>( sourceWidth ) * static_cast<size_t>( sourceHeight );
@@ -29922,6 +29963,8 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 {
     invalidatePlaybackPrepForDisplayChange(
         checked ? "play-start" : "play-stop" );
+    // CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: the stop path mutates core state below.
+    if( !checked ) drainPlaybackPrepInFlight( "play-stop", 2000 );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
     logInteractionEvent(
@@ -31608,7 +31651,8 @@ void MainWindow::finishPresentedFrame( uint64_t displayFrame,
                 >= static_cast<double>( intervalMs );
         }
 
-        if( updateScopesNow )
+        // F3: no sized 8-bit source -> keep the previous scope image.
+        if( updateScopesNow && rgb8DisplaySource )
         {
             bool under = false;
             bool over = false;
@@ -32850,10 +32894,12 @@ void MainWindow::drawFrameReady()
         (sourceWidth > 0 && sourceHeight > 0)
             ? static_cast<size_t>( sourceWidth ) * static_cast<size_t>( sourceHeight ) * 3u
             : 0;
+    // F3: the slot buffer's real size, never the size the dims imply.
     task.sourceImage = readyFrame.rawImage8;
-    task.sourceImageSize = sourceImageBytes;
-    task.scopeSourceImage = task.sourceImage;
-    task.scopeSourceImageSize = sourceImageBytes;
+    task.sourceImageSize = readyFrame.rawImage8 ? readyFrame.rawImage8Bytes : 0;
+    task.scopeSourceImage =
+        task.sourceImageSize >= sourceImageBytes ? task.sourceImage : nullptr;
+    task.scopeSourceImageSize = task.scopeSourceImage ? sourceImageBytes : 0;
     const size_t sourceImage16Bytes =
         (sourceWidth > 0 && sourceHeight > 0)
             ? static_cast<size_t>( sourceWidth ) * static_cast<size_t>( sourceHeight ) * 3u

@@ -485,6 +485,8 @@ try {
         if ($spec.generatorArgs.PSObject.Properties['scopeIntervalMs']) { $gen['ScopeIntervalMs'] = [int]$spec.generatorArgs.scopeIntervalMs }
         # PLAYBACK-SCOPES-OPTION-1 r4: the app's playback scopes mode (a scope leg on a Hide-default build must pin it), for any leg.
         if ($spec.generatorArgs.PSObject.Properties['scopesDuringPlayback']) { $gen['ScopesDuringPlayback'] = [string]$spec.generatorArgs.scopesDuringPlayback }
+        # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a debugger watcher keeps one full dump of the app's first heap-corruption exception, for any leg.
+        if ($spec.generatorArgs.PSObject.Properties['heapCorruptionDump'] -and [bool]$spec.generatorArgs.heapCorruptionDump) { $gen['HeapCorruptionDump'] = $true }
         # PLAYBACK-BACHELOR-PRESENT-JITTER-1: a SPEED leg may force Look Assist (a capture-free pace leg: no contact-sheet grab in the timed Play).
         if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist'] -and [bool]$spec.generatorArgs.forceLookAssist) {
             $gen['ForceLookAssist'] = $true; $gen['LookPaceLeg'] = $true
@@ -611,6 +613,7 @@ $artifactsShare = $null
 if ($stdout -match 'ARTIFACTS=(?<p>\S+)') { $artifactsShare = ConvertTo-ShareSidePath $Matches['p'] }
 $summary = $null; $manifest = $null
 $resultJson = $null; $runLogText = $null; $runLogSha = $null
+$heapDumpCopies = @()
 $evidenceDir = Join-Path $evidenceBase $receipt.receiptId
 if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Container)) {
     New-Item -ItemType Directory -Force -Path $evidenceDir | Out-Null
@@ -640,6 +643,24 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
     if (Test-Path -LiteralPath $failedAppLogShare -PathType Leaf) {
         New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'logs') | Out-Null
         Copy-Item -LiteralPath $failedAppLogShare -Destination (Join-Path $evidenceDir 'logs\smoke-failed-app.log')
+    }
+    # CPU-SCOPE-LIVE-HEAP-CORRUPTION-1: a heap-corruption-dump leg's record, watcher log and any *.dmp come back whole. r7: each dump's bytes, sha256 and
+    # the time its copy and its hash took are kept for the receipt (a full-memory dump is copied off the share, not moved: CoS #432 row b).
+    $heapDumpShare = Join-Path $artifactsShare 'heapdump'
+    $heapDumpCopies = @()
+    if (Test-Path -LiteralPath $heapDumpShare -PathType Container) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $evidenceDir 'heapdump') | Out-Null
+        Get-ChildItem -LiteralPath $heapDumpShare -File | Where-Object { $_.Name -match '^(heap-dump\.json|watcher\.log|[^\\/]+\.dmp)$' } | ForEach-Object {
+            $heapDumpLocal = Join-Path $evidenceDir "heapdump\$($_.Name)"
+            $copyClock = [Diagnostics.Stopwatch]::StartNew()
+            Copy-Item -LiteralPath $_.FullName -Destination $heapDumpLocal
+            $copyMs = $copyClock.ElapsedMilliseconds
+            if ($_.Name -like '*.dmp') {
+                $hashClock = [Diagnostics.Stopwatch]::StartNew()
+                $dumpSha = Get-DvSha256OfFile $heapDumpLocal
+                $heapDumpCopies += [ordered]@{ name = $_.Name; bytes = (Get-Item -LiteralPath $heapDumpLocal).Length; sha256 = $dumpSha; copyMs = $copyMs; hashMs = $hashClock.ElapsedMilliseconds }
+            }
+        }
     }
     # The job's exit code and RESULT token are not in any file the job wrote: record them as a hashed file too, so the outcome is
     # re-derivable (a capture that exited non-zero is not evidence).
@@ -914,6 +935,28 @@ if ($outcome -in @('PASS', 'FAIL') -and $selfHealLaunches.Count -gt 0) {
     if ($badLaunches.Count -gt 0) {
         $detail = "INVALID: the job result was $outcome ($detail) but " + ($badLaunches -join '; ') + '. A fallback run whose picture is not OK is not counted, whatever the measured run says'
         $outcome = 'INVALID'
+    }
+}
+# CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 r7: a leg that asked for the heap-corruption debugger watch carries its typed capture (Stop-AttrCudaHeapDumpWatch's
+# captureState, from the job's own heap-dump.json). Only ATTACHED_NO_CRASH and DUMPED are a verified capture; any other state -- or no record at all, or a
+# DUMPED record whose dump did not come back -- turns a PASS, FAIL or INVALID into HEAPDUMP_CAPTURE_FAILED, the earlier result kept in the detail.
+$heapDumpRequested = ($null -ne $spec.PSObject.Properties['generatorArgs']) -and ($null -ne $spec.generatorArgs.PSObject.Properties['heapCorruptionDump']) -and [bool]$spec.generatorArgs.heapCorruptionDump
+if ($heapDumpRequested) {
+    $heapRecord = $null
+    $heapRecordPath = Join-Path $evidenceDir 'heapdump\heap-dump.json'
+    if (Test-Path -LiteralPath $heapRecordPath -PathType Leaf) { try { $heapRecord = [IO.File]::ReadAllText($heapRecordPath) | ConvertFrom-Json } catch { $heapRecord = $null } }
+    $captureState = 'STOP_FAILED'; $captureReason = 'HEAP_DUMP_RECORD_ABSENT the job returned no heapdump\heap-dump.json'
+    if ($null -ne $heapRecord) {
+        $captureState = $(if ($heapRecord.PSObject.Properties['captureState'] -and [string]$heapRecord.captureState -cin @('ATTACHED_NO_CRASH', 'DUMPED', 'NO_TARGET', 'KILLED', 'STOP_FAILED')) { [string]$heapRecord.captureState } else { 'STOP_FAILED' })
+        $captureReason = $(if ($heapRecord.PSObject.Properties['reason']) { [string]$heapRecord.reason } else { '' })
+        if ($captureState -ceq 'STOP_FAILED' -and -not $heapRecord.PSObject.Properties['captureState']) { $captureReason = 'HEAP_DUMP_RECORD_UNTYPED the record carries no captureState' }
+        if ($captureState -ceq 'DUMPED' -and $heapDumpCopies.Count -eq 0) { $captureState = 'STOP_FAILED'; $captureReason = 'DUMP_NOT_RETURNED the record says DUMPED but no *.dmp came back to the evidence' }
+    }
+    $receipt.heapDump = [ordered]@{ requested = $true; captureState = $captureState; captureVerified = ($captureState -cin @('ATTACHED_NO_CRASH', 'DUMPED')); reason = $captureReason
+        watcherExited = $(if ($null -ne $heapRecord -and $heapRecord.PSObject.Properties['watcherExited']) { $heapRecord.watcherExited } else { $null }); dumps = @($heapDumpCopies) }
+    if (-not $receipt.heapDump.captureVerified -and $outcome -cin @('PASS', 'FAIL', 'INVALID')) {
+        $detail = "HEAPDUMP_CAPTURE_FAILED: captureState $captureState ($captureReason); the job result was $outcome ($detail). A leg that asked for the heap-corruption debugger and cannot show it was attached is no signal"
+        $outcome = 'HEAPDUMP_CAPTURE_FAILED'
     }
 }
 Complete-Receipt $outcome $detail
