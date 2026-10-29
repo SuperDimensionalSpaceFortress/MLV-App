@@ -469,7 +469,12 @@ param(
     [string]$PartitionLoadMask = '',
     [int]$PartitionLoadThreads = 0,
     [switch]$CorePartitionTelemetry,
-    [string]$CorePartitionHelperMask = ''
+    [string]$CorePartitionHelperMask = '',
+
+    # VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: the app's playback worker-thread cap for the run, forwarded as the smoke runner's EXISTING -Threads <n> (the
+    # runner sets MLVAPP_PLAYBACK_MAX_THREADS=<n> for the app and records playbackMaxThreads in its result.json). 0 (the default) passes nothing: the
+    # emitted job is the text it was before this parameter.
+    [ValidateRange(0, 16)][int]$PlaybackMaxThreads = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -4449,6 +4454,19 @@ function Edit-DualVenueTemplate([string]$Text, [string]$Old, [string]$New) {
     $Text.Substring(0, $first) + $newText + $Text.Substring($first + $oldText.Length)
 }
 
+# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 r2: an edit to the smoke runner's arguments is anchored on the ONE smoke command line (the `$cmd = "& ...` line), never on
+# the whole expanded text. -AgentRoot (and any other substituted path) may spell an anchor text, so a whole-text match count changed with caller data and
+# refused a legitimate leg. The refusals stay typed and fail closed: the line must exist exactly once, and $Old must occur exactly once on it.
+function Edit-DualVenueSmokeCommand([string]$Text, [string]$Old, [string]$New, [string]$Code, [string]$Purpose) {
+    $lines = [regex]::Matches($Text, '(?m)^[ \t]*\$cmd = "& [^\r\n]*')
+    if ($lines.Count -ne 1) { throw "$Code the job template has no single smoke command line to $Purpose" }
+    $line = $lines[0]
+    $at = $line.Value.IndexOf($Old, [StringComparison]::Ordinal)
+    if ($at -lt 0 -or $line.Value.IndexOf($Old, $at + 1, [StringComparison]::Ordinal) -ge 0) { throw "$Code the smoke command line has no single '$($Old.Trim())' site to $Purpose" }
+    $edited = $line.Value.Substring(0, $at) + $New + $line.Value.Substring($at + $Old.Length)
+    $Text.Substring(0, $line.Index) + $edited + $Text.Substring($line.Index + $line.Length)
+}
+
 # --- BACHELOR-CORE-PARTITION-AB-1: core-partition helpers ----------------------------------------
 # The functions below are PURE except Get-CorePartitionTopology, Get-CorePartitionFeedHandleInfo and the two feed readers. The emitted
 # job and its helper carry their source verbatim (Get-CorePartitionFunctionSource), so a test lifts
@@ -6061,14 +6079,12 @@ if (-not [string]::IsNullOrEmpty($AutomationSettingsDir)) {
 # a paced leg and report the pace wall as throughput; the runner also fails closed on the app's own pace_unpaced line).
 if ($Unpaced) {
     $unpacedEnvAnchor = [regex]"(?<ind>[ \t]*)'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',(?<nl>\r?\n)"
-    $unpacedCmdAnchor = [regex]' -UsePersistedPlaybackSettings '
     if ($unpacedEnvAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_UNPACED_ANCHOR_MISSING the job template has no single env-list site to add MLVAPP_PLAYBACK_UNPACED to' }
-    if ($unpacedCmdAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_UNPACED_ANCHOR_MISSING the job template has no single -UsePersistedPlaybackSettings site to add -DropFrameMode off to' }
+    $text = Edit-DualVenueSmokeCommand $text ' -UsePersistedPlaybackSettings ' ' -DropFrameMode off -UsePersistedPlaybackSettings ' 'DUAL_VENUE_UNPACED_ANCHOR_MISSING' 'add -DropFrameMode off to'
     $text = $unpacedEnvAnchor.Replace($text, [System.Text.RegularExpressions.MatchEvaluator]{
         param($m)
         $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_UNPACED=1'," + $m.Groups['nl'].Value
     })
-    $text = $unpacedCmdAnchor.Replace($text, ' -DropFrameMode off -UsePersistedPlaybackSettings ')
 }
 
 # VENUE-LEG-AGXOFF-UNPACED-HEADROOM-REMEASURE-1: the fast-path kill-switch arm adds MLVAPP_DISABLE_PREP_POINTWISE_FAST=1 at the same env-list
@@ -6119,9 +6135,7 @@ $displayReport = Get-AttrCudaPresentMonDisplayReport -CsvPath $presentMonPath -R
 # PLAYBACK-SCOPES-OPTION-1: a scope leg swaps the smoke command's ONE '-Scope none' for the named scope, on the expanded text and only when asked
 # (like --windowed above), so every other job is the text it always was. The anchor must match exactly once, or the generator throws.
 if (-not [string]::IsNullOrEmpty($Scope) -and $Scope -cne 'none') {
-    $scopeAnchor = [regex]' -Scope none '
-    if ($scopeAnchor.Matches($text).Count -ne 1) { throw 'DUAL_VENUE_SCOPE_ANCHOR_MISSING the job template has no single -Scope none site to replace' }
-    $text = $scopeAnchor.Replace($text, " -Scope $Scope ")
+    $text = Edit-DualVenueSmokeCommand $text ' -Scope none ' " -Scope $Scope " 'DUAL_VENUE_SCOPE_ANCHOR_MISSING' 'replace'
 }
 
 # PLAYBACK-SCOPES-OPTION-1: the same env-list site gains the scope throttle interval, only when asked.
@@ -6142,6 +6156,34 @@ if (-not [string]::IsNullOrEmpty($ScopesDuringPlayback)) {
         param($m)
         $m.Value + $m.Groups['ind'].Value + "'MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK=$ScopesDuringPlayback'," + $m.Groups['nl'].Value
     })
+}
+
+# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1: a capped leg passes the smoke runner's EXISTING -Threads <n> (no new environment route) and gains two bracketed
+# regions, on the expanded text and only when asked, so every other job is the text it always was. Each anchor must match exactly once, or the generator throws:
+#   1. before the SUCCESS summary: the job's own worker_threads= read of the run log (Get-CorePartitionWorkerThreads) and the smoke result.json's playbackMaxThreads;
+#   2. four proof lines after the summary's cpuFrames line. The runner fails the leg closed (WORKER_THREADS_NOT_HONOURED) unless they and the run log all say n.
+if ($PlaybackMaxThreads -gt 0) {
+    $mtOpen = '# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 >>>'
+    $mtClose = '# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 <<<'
+    $mtEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $text = Edit-DualVenueSmokeCommand $text ' -UsePersistedPlaybackSettings ' " -Threads $PlaybackMaxThreads -UsePersistedPlaybackSettings " 'DUAL_VENUE_PLAYBACK_MAX_THREADS_ANCHOR_MISSING' 'add -Threads to'
+    $mtMetricsAnchor = '# A SUCCESS summary.json, which the failure paths above all write but the success path did not:'
+    $mtRead = @'
+$playbackMaxThreadsRead = Get-CorePartitionWorkerThreads $rawLog
+$playbackMaxThreadsSmoke = $null
+try { $playbackMaxThreadsSmoke = $resultJson.launch.matchedUserShellDefaults.playbackMaxThreads } catch { }
+$playbackMaxThreadsProof = [ordered]@{ smoke = $(if ($null -ne $playbackMaxThreadsSmoke) { [string]$playbackMaxThreadsSmoke }); workers = $playbackMaxThreadsRead.value; why = $playbackMaxThreadsRead.why }
+Write-JobTrace "step playback-max-threads requested=__CAP__ smoke=$($playbackMaxThreadsProof.smoke) workers=$($playbackMaxThreadsProof.workers) why=$($playbackMaxThreadsProof.why)"
+'@
+    $text = Edit-DualVenueTemplate $text $mtMetricsAnchor ($mtOpen + "`n" + (Get-CorePartitionFunctionSource @(${function:Get-CorePartitionWorkerThreads}) "`n") + "`n" +
+        $mtRead.Replace('__CAP__', [string]$PlaybackMaxThreads) + "`n" + $mtClose + "`n" + $mtMetricsAnchor)
+    $mtMetricsAt = $text.IndexOf($mtMetricsAnchor, [StringComparison]::Ordinal)
+    $mtKeysAnchor = '    cpuFrames = $gpuSummary.cpuFrames' + $mtEol
+    $mtKeysAt = $text.IndexOf($mtKeysAnchor, $mtMetricsAt, [StringComparison]::Ordinal)
+    if ($mtKeysAt -lt 0) { throw 'DUAL_VENUE_PLAYBACK_MAX_THREADS_ANCHOR_MISSING the success summary has no cpuFrames line to put the worker-thread proof after' }
+    $mtKeyLines = @("    $mtOpen", "    playbackMaxThreadsRequested = $PlaybackMaxThreads", '    playbackMaxThreadsSmoke = $playbackMaxThreadsProof.smoke',
+        '    playbackWorkerThreadsRead = $playbackMaxThreadsProof.workers', '    playbackWorkerThreadsReadWhy = $playbackMaxThreadsProof.why', "    $mtClose")
+    $text = $text.Substring(0, $mtKeysAt + $mtKeysAnchor.Length) + (($mtKeyLines -join $mtEol) + $mtEol) + $text.Substring($mtKeysAt + $mtKeysAnchor.Length)
 }
 
 # BACHELOR-CORE-PARTITION-AB-1: a core-partition leg gains three bracketed regions, on the expanded text and only when -CorePartitionTelemetry
