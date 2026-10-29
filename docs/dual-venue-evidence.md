@@ -316,8 +316,33 @@ means one process held the pid throughout. An unreadable or different instant le
 `StartTime` reads and is dropped when they differ. The Intel child's own `Win32_Process` row must carry that process's name and instant too (`identityError =
 process_creation_instant_unbound`). `unidentifiedCaptureOwners` records `startedUtc`. A display-report
 failure whose sweep did not leave the host clean (skipped, aborted, `remaining`, `deferred`, `newlyListed`, a listing or sweep error) gains a typed `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE`
-detail, and a sweep record that cannot be read names `recordUnreadable=` there instead of being dropped. A dictionary report whose keys differ only by case keeps every entry. r10: the two report helpers compose -- a later call finds the reason under the key the report already has (any casing),
-appends to that one entry and never adds a second reason-like key; when several reason-like keys exist their texts accumulate in key order into the one written, none dropped.
+detail, and a sweep record that cannot be read names `recordUnreadable=` there instead of being dropped. A dictionary report whose keys differ only by case keeps every entry.
+
+**Report helper contract (r11).** It covers `Add-AttrCudaPresentMonEventsLostDetailToReport` and `Add-AttrCudaPresentMonOrphanSweepDetailToReport`, and replaces the r10
+sentence ("none dropped", which a containment dedupe broke). Both helpers carry the same block for it in `AttrCudaArtifacts.psm1`.
+- **Nothing to add.** With no detail to write (no sweep record, a clean sweep, no events record, no loss) the helper returns the report it was given.
+- **pscustomobject.** This is the job's own shape (`Get-AttrCudaPresentMonDisplayReport`), and r11 does not change it. It comes back as a pscustomobject copy with only `reason`
+  different. A reason that already carries the helper's token (`PRESENTMON_EVENTS_LOST`; the `PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:` prefix or bracket) does not get it again.
+- **Dictionary.** It comes back as a NEW canonical report and is never returned by reference with the detail added. The input is never mutated.
+  - *Reason-like key.* This is a string key that equals `reason` under OrdinalIgnoreCase, or that the report's own public `Comparer` calls equal to `reason`. That second test
+    catches `rea<U+00AD>son` under a culture comparer. Some reports have no readable comparer (Hashtable, OrderedDictionary). If such a report's own lookup holds a `reason` that
+    no OrdinalIgnoreCase key explains, the one string key holding the text that lookup returns is reason-like.
+  - *Fold.* All reason-like entries become one key, `reason`, at the place of the first one. Its text is their non-empty texts in enumeration order, joined by a space. A text
+    that is ordinally EQUAL to an earlier one is left out; containment never removes a text. Then ` [<detail>]` is appended once. It is skipped only if the folded text already
+    carries exactly this detail: it equals the detail, begins with `<detail> [`, or contains `[<detail>]`. No early return skips the write.
+  - *Other keys.* Each one is copied with its value. A non-string key is copied under its string form. The copy goes into an `[ordered]` table (OrdinalIgnoreCase on pwsh 7). It
+    is returned as a pscustomobject when every key can be a member name (the r3 shape), and as that table otherwise (for example when there is an empty key).
+  - *Collision rule (deterministic, no value dropped).* Two keys can collide in that table: case variants such as `status`/`Status`, `U+03A3`/`U+03C2`, or a string form equal
+    to another key, such as `1` and `'1'`. The report is then an exact-key `OrderedDictionary` that keeps every original key and value in order. The reason-like keys are still
+    folded into `reason`, so `.reason` reads the folded text. A second call keeps the same shape.
+  - *Fail closed.* In two cases the input comes back unchanged and the detail is not added: a held reason that no rule can tie to one key (r8: a report with no readable
+    comparer whose text two keys hold), and an exact-key copy that its keys cannot build.
+- **Not promised.**
+  - `.Reason` or `.REASON` on an exact-key copy (only `reason` is spelled there).
+  - Lookalike matching for a dictionary whose comparer is not readable, apart from the one-holder rule above.
+  - The pscustomobject token rule is not exact-equality: it is the job path, left as it was.
+  - Windows PowerShell 5.1's culture-insensitive `[ordered]`: more keys collide there and take the exact-key rule.
+  - Comparers that throw: the report is then read as one without a readable comparer (OrdinalIgnoreCase plus the one-holder rule).
 
 The sweep is built not to stop a live capture or a session it did not list as an orphan (round 2; the r4 and r5 ownership refusals above hold the sweep when a capture owner cannot be
 identified, which is not a proof that none exists): it acts only on the names listed before its second liveness check -- a name a

@@ -2299,7 +2299,8 @@ function Add-AttrCudaPresentMonEventsLostDetail {
 function Add-AttrCudaPresentMonEventsLostDetailToReport {
     <#
     .SYNOPSIS
-    A PresentMon display report (a pscustomobject, or a dictionary, with a `reason`; the copy is a pscustomobject, or an exact-key ordered dictionary for a dictionary whose keys differ only by case or are no strings) whose reason carries the typed PRESENTMON_EVENTS_LOST detail; the same object when there is nothing to add.
+    A PresentMon display report whose reason carries the typed PRESENTMON_EVENTS_LOST detail; the same object when there is nothing to add. A pscustomobject comes back as a pscustomobject copy;
+    a dictionary as a NEW canonical report with one `reason` (r11: the report helper contract in the body, restated in docs/dual-venue-evidence.md).
     .DESCRIPTION
     UM-PRESENTMON-ORPHAN-SWEEP-1: the display-report failure branch reads `$displayReport.reason` in two places, and the scanned template may not assign to a member (R5), so the
     report is replaced by a copy (properties and their order unchanged, only `reason` different) -- a plain variable assignment at the call site.
@@ -2310,103 +2311,101 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
         [AllowNull()][object]$EventsLost
     )
 
-    # r6 adversary A2 on c1521d3c: a dictionary's reason is read by its key (a Dictionary[object,object] has no `reason` member: strict mode threw, and without it the reason read
-    # empty and the original was lost), by ContainsKey where it exists and Contains otherwise (as the sweep record is read); an object's by its property
-    # r6 adversary A1 on ce87d0f8: the exact-key copy updates the key the report's own comparer matched (a case-insensitive report's `Reason`), never adds a second one
-    # r7 (r6 adversary A2 on 836a3d61): that key is chosen by ORDINAL comparison, never -eq/-ceq (culture-sensitive: U+00AD, U+200B and U+0000 are ignored, so `rea<U+00AD>son` read as
-    # `reason`): an exact `reason` first; else the one string key whose value is the text the comparer returned (the matched key holds it, so a unique holder is that key); else, the
-    # text being ambiguous, the key OrdinalIgnoreCase matches (PowerShell's @{} and [ordered] comparer)
-    $current = ''
-    $reasonKey = 'reason'
     if ($Report -is [System.Collections.IDictionary]) {
-        $hasReason = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
+        # the typed detail alone (the scalar helper given no reason): empty when nothing was lost or there is no record, and the report comes back as it is
+        $detail = [string](Add-AttrCudaPresentMonEventsLostDetail -Reason '' -EventsLost $EventsLost)
+        if ([string]::IsNullOrEmpty($detail)) { return $Report }
+        # r11 (sol r10 B1/B2 on 218fceaa; fable key3 REPORT-HELPER-ACCUMULATION-EXACT-DEDUPE-1; hub convergence ruling). Report helper contract (r11): this block is the same in both
+        # report helpers and is restated in docs/dual-venue-evidence.md. A dictionary report comes back as a NEW canonical report, never the input dictionary with the detail added:
+        #   reason-like key: a string key OrdinalIgnoreCase-equal to `reason`, or one the report's own public Comparer calls equal to `reason`. A report whose comparer is not readable
+        #     (Hashtable, OrderedDictionary) and whose own lookup holds a `reason` that no such key explains names the ONE string key holding the text that lookup returns
+        #   fold: every reason-like entry becomes ONE key, `reason`, at the place of the first; its text is their non-empty texts in enumeration order, a text EQUAL (ordinal) to an
+        #     earlier one left out -- never containment -- then ` [<detail>]` appended unless the folded text already carries exactly this detail (is it, begins `<detail> [`, or holds
+        #     `[<detail>]`). No early return skips the write
+        #   copy: every other key with its value (a non-string key under its string form) into an [ordered] table (OrdinalIgnoreCase on pwsh 7), returned as a pscustomobject when
+        #     every key can be a member name (the r3 shape) and as the table otherwise. Keys that collide in that table (case variants such as status/Status, or a string form equal to
+        #     another key) drop no value: the report is an exact-key OrderedDictionary with every original key instead, the reason-like ones folded into `reason` the same way
+        #   fail closed (the input report comes back unchanged, the detail not added): a held reason no rule names one key for (r8), or an exact-key copy its keys cannot build
         $keyList = @($Report.PSBase.Keys)
         $valueList = @($Report.PSBase.Values)
-        if ($hasReason) {
-            $current = [string]$Report['reason']
-            $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::Ordinal) })
-            # r7 (adversary A2 on 0805902c): a dictionary that exposes its comparer (Dictionary, ConcurrentDictionary, SortedDictionary) is asked which key it matched; one that does not,
-            # or whose comparer cannot answer, falls through to the value and OrdinalIgnoreCase steps
-            $comparerProperty = $Report.PSObject.Properties['Comparer']
-            $comparer = if ($null -ne $comparerProperty) { $comparerProperty.Value } else { $null }
-            if ($named.Count -eq 0 -and $null -ne $comparer) {
-                try {
-                    if ($comparer -is [System.Collections.IEqualityComparer] -or $comparer -is [System.Collections.Generic.IEqualityComparer[string]]) { $named = @($keyList | Where-Object { $_ -is [string] -and $comparer.Equals($_, 'reason') }) }
-                    elseif ($comparer -is [System.Collections.IComparer] -or $comparer -is [System.Collections.Generic.IComparer[string]]) { $named = @($keyList | Where-Object { $_ -is [string] -and $comparer.Compare($_, 'reason') -eq 0 }) }
-                } catch { $named = @() }
-            }
-            if ($named.Count -eq 0) { $named = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $current, [StringComparison]::Ordinal)) { $keyList[$index] } }) }
-            if ($named.Count -ne 1) { $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::OrdinalIgnoreCase) }) }
-            # r8 (r7 adversary A2 on 6d30ac14): the report holds a reason (its own lookup said so) but no step names the ONE key it matched (a comparer that is not publicly readable,
-            # two holders of the text, no OrdinalIgnoreCase match): an added `reason` would be a second reason entry, so the report comes back unchanged (fail closed, every entry kept)
-            if ($named.Count -ne 1) { return $Report }
-            $reasonKey = $named[0]
-        }
-        # r10 (sol B1 on bca900cb): the reason is the text of EVERY reason-like entry, found whatever the dictionary's own lookup says. An exact-key copy of a case-insensitive report is a
-        # case-sensitive dictionary, so a second helper call asked `Contains('reason')`, read nothing under `Reason` and added a `reason` beside it, and the first call's text was lost from
-        # `.reason`. A reason-like key is a string key that OrdinalIgnoreCase matches `reason` (or the one key the report's own comparer matched). Rule when several exist: the accumulated
-        # reason is their non-empty texts in key order, a text that another one already contains left out (a repeat call never grows it); it is written to the key the comparer matched,
-        # else to the first of them; every entry (the other reason-like keys too) is kept, and no reason-like key is ever added beside them
-        $holders = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and ([string]::Equals($keyList[$index], 'reason', [StringComparison]::OrdinalIgnoreCase) -or ($hasReason -and [string]::Equals($keyList[$index], $reasonKey, [StringComparison]::Ordinal)))) { $index } })
-        if (-not $hasReason -and $holders.Count -gt 0) { $reasonKey = $keyList[$holders[0]] }
-        $texts = @(foreach ($index in $holders) { $text = [string]$valueList[$index]; if (-not [string]::IsNullOrEmpty($text)) { $text } })
-        $kept = @()
-        for ($first = 0; $first -lt $texts.Count; $first++) {
-            $covered = $false
-            for ($second = 0; $second -lt $texts.Count; $second++) {
-                if ($second -ne $first) {
-                    if ([string]::Equals($texts[$second], $texts[$first], [StringComparison]::Ordinal)) { if ($second -lt $first) { $covered = $true } }
-                    elseif ($texts[$second].Contains($texts[$first])) { $covered = $true }
+        $like = @(foreach ($key in $keyList) { $key -is [string] -and [string]::Equals($key, 'reason', [StringComparison]::OrdinalIgnoreCase) })
+        $comparerProperty = $Report.PSObject.Properties['Comparer']
+        $comparer = if ($null -ne $comparerProperty) { $comparerProperty.Value } else { $null }
+        $asked = $false
+        if ($null -ne $comparer) {
+            try {
+                $matched = $null
+                if ($comparer -is [System.Collections.IEqualityComparer] -or $comparer -is [System.Collections.Generic.IEqualityComparer[string]]) { $matched = @(foreach ($key in $keyList) { $key -is [string] -and $comparer.Equals($key, 'reason') }) }
+                elseif ($comparer -is [System.Collections.IComparer] -or $comparer -is [System.Collections.Generic.IComparer[string]]) { $matched = @(foreach ($key in $keyList) { $key -is [string] -and $comparer.Compare($key, 'reason') -eq 0 }) }
+                if ($null -ne $matched) {
+                    for ($index = 0; $index -lt $keyList.Count; $index++) { if ($matched[$index]) { $like[$index] = $true } }
+                    $asked = $true
                 }
-            }
-            if (-not $covered) { $kept += $texts[$first] }
+            } catch { $asked = $false }
         }
-        $current = $kept -join ' '
-    } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name } }
+        if (-not $asked -and @($like | Where-Object { $_ }).Count -eq 0) {
+            $held = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
+            if ($held) {
+                $heldText = [string]$Report['reason']
+                $holders = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $heldText, [StringComparison]::Ordinal)) { $index } })
+                # r8 (r7 adversary A2 on 6d30ac14): two holders of the text, so no rule names the key the report's lookup matched: fail closed, every entry as it was
+                if ($holders.Count -ne 1) { return $Report }
+                $like[$holders[0]] = $true
+            }
+        }
+        $texts = @()
+        for ($index = 0; $index -lt $keyList.Count; $index++) {
+            if ($like[$index]) {
+                $text = [string]$valueList[$index]
+                $repeat = [string]::IsNullOrEmpty($text)
+                foreach ($kept in $texts) { if ([string]::Equals($kept, $text, [StringComparison]::Ordinal)) { $repeat = $true } }
+                if (-not $repeat) { $texts += $text }
+            }
+        }
+        $folded = [string]($texts -join ' ')
+        $carried = [string]::Equals($folded, $detail, [StringComparison]::Ordinal) -or $folded.StartsWith("$detail [", [StringComparison]::Ordinal) -or $folded.Contains("[$detail]")
+        $reason = if ($carried) { $folded } elseif ([string]::IsNullOrEmpty($folded)) { $detail } else { "$folded [$detail]" }
+        $canonical = [ordered]@{}
+        $collides = $false
+        $placed = $false
+        for ($index = 0; $index -lt $keyList.Count; $index++) {
+            if ($like[$index]) {
+                if (-not $placed) { $placed = $true; if ($canonical.Contains('reason')) { $collides = $true } else { $canonical.Add('reason', $reason) } }
+            } else {
+                $name = [string]$keyList[$index]
+                if ($canonical.Contains($name)) { $collides = $true } else { $canonical.Add($name, $valueList[$index]) }
+            }
+        }
+        if (-not $placed) { if ($canonical.Contains('reason')) { $collides = $true } else { $canonical.Add('reason', $reason) } }
+        if (-not $collides) {
+            # a key no pscustomobject can carry (the empty name) throws in the conversion: the [ordered] table is the report then
+            $shaped = $null
+            try { $shaped = [pscustomobject]$canonical; if (@($shaped.PSObject.Properties).Count -ne $canonical.Count) { $shaped = $null } } catch { $shaped = $null }
+            if ($null -ne $shaped) { return $shaped }
+            return $canonical
+        }
+        try {
+            # an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1'); `reason` is its only reason-like key, so `.reason` reads it
+            $exact = [System.Collections.Specialized.OrderedDictionary]::new()
+            $placed = $false
+            for ($index = 0; $index -lt $keyList.Count; $index++) {
+                if (-not $like[$index]) { $exact.Add($keyList[$index], $valueList[$index]) }
+                elseif (-not $placed) { $exact.Add('reason', $reason); $placed = $true }
+            }
+            if (-not $placed) { $exact.Add('reason', $reason) }
+        } catch { return $Report }
+        return $exact
+    }
+    # a pscustomobject (the job's own shape, Get-AttrCudaPresentMonDisplayReport) is unchanged by r11: its reason is read by its property, and the detail is appended unless that reason
+    # already carries the PRESENTMON_EVENTS_LOST token
+    $current = ''
+    $reasonKey = 'reason'
+    $property = $Report.PSObject.Properties['reason']
+    if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name }
     $detailed = Add-AttrCudaPresentMonEventsLostDetail -Reason $current -EventsLost $EventsLost
     if ([string]::Equals($detailed, $current, [StringComparison]::Ordinal)) { return $Report }
-    # r3 (sol B1, the sibling copy): a dictionary report keeps its entries; either shape comes back as the same pscustomobject
-    # r5 (sol B2 on 2c226cd8): a pscustomobject (and [ordered]) names its members case-insensitively, so a dictionary whose keys differ only by case (an Ordinal Dictionary with status and
-    # Status) or are no strings (1 and '1') cannot become one without losing an entry: it comes back as an ordered dictionary that compares its keys exactly (EqualityComparer[object]),
-    # every entry and its order kept, only `reason` set
-    if ($Report -is [System.Collections.IDictionary]) {
-        $keys = @($Report.PSBase.Keys)
-        # r5 adversary A1 on c1186f3e: no hand-made case fold matches the copy's own comparer (U+03A3 and U+03C2 differ in lower case and merge in upper case), so the keys are put
-        # into the very structures the plain copy uses and any entry they merge sends the report down the exact-key path
-        $probe = [ordered]@{}
-        foreach ($key in $keys) { $probe[[string]$key] = $true }
-        # r7 (r6 adversary A3 on 836a3d61): the key the copy sets is probed too -- an added `reason` that the case-insensitive copy would merge into a distinct entry (an Ordinal report's
-        # `Reason`) sends the report down the exact-key path, where that entry keeps its value and `reason` is added beside it
-        $reasonHeld = (@($keys | Where-Object { $_ -is [string] -and [string]::Equals($_, $reasonKey, [StringComparison]::Ordinal) }).Count -gt 0)
-        $expected = $keys.Count
-        if (-not $reasonHeld) { $probe[[string]$reasonKey] = $true; $expected = $expected + 1 }
-        # r6 adversary A1 on c1521d3c: a key no pscustomobject can carry (the empty name) throws in the conversion; a conversion that fails is a merge too (the exact-key path)
-        $probeCount = -1
-        try { $probeCount = @(([pscustomobject]$probe).PSObject.Properties).Count } catch { $probeCount = -1 }
-        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $expected -or $probeCount -ne $expected) {
-            # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
-            $values = @($Report.PSBase.Values)
-            # r10 (sol B1): a report whose own lookup matched a reason key that differs from `reason` only in case (a case-insensitive [ordered] report's `Reason`) keeps that lookup in the
-            # copy (an [ordered] table compares string keys OrdinalIgnoreCase), so `.reason` and a later helper call still find the entry; a copy whose keys would collide under it, and
-            # every other report, is an exact-key dictionary as before. A key only the report's own culture comparer matched (an ignorable lookalike) stays an ordinary key in the copy
-            $exact = $null
-            if ($hasReason -and -not [string]::Equals($reasonKey, 'reason', [StringComparison]::Ordinal) -and [string]::Equals($reasonKey, 'reason', [StringComparison]::OrdinalIgnoreCase)) {
-                try {
-                    $exact = [ordered]@{}
-                    for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
-                } catch { $exact = $null }
-            }
-            if ($null -eq $exact) {
-                $exact = [System.Collections.Specialized.OrderedDictionary]::new()
-                for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
-            }
-            $exact[$reasonKey] = $detailed
-            return $exact
-        }
-    }
     $copy = [ordered]@{}
-    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }
-    else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }
+    foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value }
     $copy[$reasonKey] = $detailed
     return [pscustomobject]$copy
 }
@@ -2418,9 +2417,10 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     .DESCRIPTION
     BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 (Bachelor, 2026-10-27): 16 of 16 cuda legs ended "PresentMon output does not exist" while an orphaned MLVAttr3-* session starved every capture and the
     sweep had been skipped on every leg -- the summary named the symptom and never the sweep. The detail names what was left: skipped=<reason>, aborted=<reason>, remaining=<names>,
-    deferred=<names>, listError, error, and the live PresentMon pids. A sweep that ran and left nothing (or no sweep record at all) adds nothing; a reason that already carries the token is never
-    given it twice. Like Add-AttrCudaPresentMonEventsLostDetailToReport, the report is replaced by a copy (properties and their order unchanged, only `reason` different). The report is a pscustomobject or a dictionary (r3, sol B1: its entries are kept); the copy
-    is a pscustomobject (r5, sol B2: an exact-key ordered dictionary when the keys differ only by case or are no strings). A sweep record that cannot be read adds recordUnreadable=<message> (r5, sol B3).
+    deferred=<names>, listError, error, and the live PresentMon pids. A sweep that ran and left nothing (or no sweep record at all) adds nothing. Like
+    Add-AttrCudaPresentMonEventsLostDetailToReport, the report is replaced by a copy: a pscustomobject by a pscustomobject (properties and their order unchanged, only `reason` different;
+    a reason that already carries the token is never given it twice), a dictionary by a NEW canonical report with one `reason` (r11: the report helper contract in the body, restated in
+    docs/dual-venue-evidence.md). A sweep record that cannot be read adds recordUnreadable=<message> (r5, sol B3).
     #>
     [CmdletBinding()]
     param(
@@ -2429,61 +2429,6 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     )
 
     if ($null -eq $Sweep) { return $Report }
-    # r6 adversary A2 on c1521d3c: a dictionary's reason is read by its key (a Dictionary[object,object] has no `reason` member: strict mode threw, and without it the reason read
-    # empty and the original was lost), by ContainsKey where it exists and Contains otherwise (as the sweep record is read); an object's by its property
-    # r6 adversary A1 on ce87d0f8: the exact-key copy updates the key the report's own comparer matched (a case-insensitive report's `Reason`), never adds a second one
-    # r7 (r6 adversary A2 on 836a3d61): that key is chosen by ORDINAL comparison, as in Add-AttrCudaPresentMonEventsLostDetailToReport (an exact `reason`; else the unique holder of the
-    # text the comparer returned; else the OrdinalIgnoreCase match)
-    $current = ''
-    $reasonKey = 'reason'
-    if ($Report -is [System.Collections.IDictionary]) {
-        $hasReason = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
-        $keyList = @($Report.PSBase.Keys)
-        $valueList = @($Report.PSBase.Values)
-        if ($hasReason) {
-            $current = [string]$Report['reason']
-            $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::Ordinal) })
-            # r7 (adversary A2 on 0805902c): a dictionary that exposes its comparer (Dictionary, ConcurrentDictionary, SortedDictionary) is asked which key it matched; one that does not,
-            # or whose comparer cannot answer, falls through to the value and OrdinalIgnoreCase steps
-            $comparerProperty = $Report.PSObject.Properties['Comparer']
-            $comparer = if ($null -ne $comparerProperty) { $comparerProperty.Value } else { $null }
-            if ($named.Count -eq 0 -and $null -ne $comparer) {
-                try {
-                    if ($comparer -is [System.Collections.IEqualityComparer] -or $comparer -is [System.Collections.Generic.IEqualityComparer[string]]) { $named = @($keyList | Where-Object { $_ -is [string] -and $comparer.Equals($_, 'reason') }) }
-                    elseif ($comparer -is [System.Collections.IComparer] -or $comparer -is [System.Collections.Generic.IComparer[string]]) { $named = @($keyList | Where-Object { $_ -is [string] -and $comparer.Compare($_, 'reason') -eq 0 }) }
-                } catch { $named = @() }
-            }
-            if ($named.Count -eq 0) { $named = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $current, [StringComparison]::Ordinal)) { $keyList[$index] } }) }
-            if ($named.Count -ne 1) { $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::OrdinalIgnoreCase) }) }
-            # r8 (r7 adversary A2 on 6d30ac14): the report holds a reason (its own lookup said so) but no step names the ONE key it matched (a comparer that is not publicly readable,
-            # two holders of the text, no OrdinalIgnoreCase match): an added `reason` would be a second reason entry, so the report comes back unchanged (fail closed, every entry kept)
-            if ($named.Count -ne 1) { return $Report }
-            $reasonKey = $named[0]
-        }
-        # r10 (sol B1 on bca900cb): the reason is the text of EVERY reason-like entry, found whatever the dictionary's own lookup says. An exact-key copy of a case-insensitive report is a
-        # case-sensitive dictionary, so a second helper call asked `Contains('reason')`, read nothing under `Reason` and added a `reason` beside it, and the first call's text was lost from
-        # `.reason`. A reason-like key is a string key that OrdinalIgnoreCase matches `reason` (or the one key the report's own comparer matched). Rule when several exist: the accumulated
-        # reason is their non-empty texts in key order, a text that another one already contains left out (a repeat call never grows it); it is written to the key the comparer matched,
-        # else to the first of them; every entry (the other reason-like keys too) is kept, and no reason-like key is ever added beside them
-        $holders = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and ([string]::Equals($keyList[$index], 'reason', [StringComparison]::OrdinalIgnoreCase) -or ($hasReason -and [string]::Equals($keyList[$index], $reasonKey, [StringComparison]::Ordinal)))) { $index } })
-        if (-not $hasReason -and $holders.Count -gt 0) { $reasonKey = $keyList[$holders[0]] }
-        $texts = @(foreach ($index in $holders) { $text = [string]$valueList[$index]; if (-not [string]::IsNullOrEmpty($text)) { $text } })
-        $kept = @()
-        for ($first = 0; $first -lt $texts.Count; $first++) {
-            $covered = $false
-            for ($second = 0; $second -lt $texts.Count; $second++) {
-                if ($second -ne $first) {
-                    if ([string]::Equals($texts[$second], $texts[$first], [StringComparison]::Ordinal)) { if ($second -lt $first) { $covered = $true } }
-                    elseif ($texts[$second].Contains($texts[$first])) { $covered = $true }
-                }
-            }
-            if (-not $covered) { $kept += $texts[$first] }
-        }
-        $current = $kept -join ' '
-    } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name } }
-    # r3 (adversary A2): the token is the detail this helper writes (a bare prefix, or bracketed after a reason), never a path or a word that merely contains the name
-    # r7: the prefix is compared ordinally (String.StartsWith(string) is culture-sensitive: a soft hyphen inside the token would read as the token and drop the detail)
-    if ($current.StartsWith('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:', [StringComparison]::Ordinal) -or $current.Contains('[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:')) { return $Report }
     # the record is the job's [ordered] table (a key may be absent: the job's default before Start-PresentMonCapture ran has two) or an object; strict mode throws on an absent member, so read by name.
     # r2: copied into a plain table first (no call operator: the job splices this body and the spliced-body scan, R3, rejects `& <scriptblock>`); an absent key reads as $null
     $field = @{}
@@ -2520,47 +2465,99 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
         $parts = @("recordUnreadable=$($_.Exception.Message -replace '\s+', ' ')")
     }
     $detail = "PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: $($parts -join ' ')"
-    $reason = if ([string]::IsNullOrEmpty($current)) { $detail } else { "$current [$detail]" }
-    # r3 (sol B1): a dictionary report keeps its entries (PSObject.Properties of a dictionary are its own members, not its keys); either shape comes back as the same pscustomobject
-    # r5 (sol B2): a dictionary whose keys differ only by case or are no strings comes back as an exact-key ordered dictionary instead (as in Add-AttrCudaPresentMonEventsLostDetailToReport)
     if ($Report -is [System.Collections.IDictionary]) {
-        $keys = @($Report.PSBase.Keys)
-        # r5 adversary A1 on c1186f3e: no hand-made case fold matches the copy's own comparer (U+03A3 and U+03C2 differ in lower case and merge in upper case), so the keys are put
-        # into the very structures the plain copy uses and any entry they merge sends the report down the exact-key path
-        $probe = [ordered]@{}
-        foreach ($key in $keys) { $probe[[string]$key] = $true }
-        # r7 (r6 adversary A3 on 836a3d61): the key the copy sets is probed too (as in Add-AttrCudaPresentMonEventsLostDetailToReport): an Ordinal report's distinct `Reason` is never
-        # overwritten by an added `reason`
-        $reasonHeld = (@($keys | Where-Object { $_ -is [string] -and [string]::Equals($_, $reasonKey, [StringComparison]::Ordinal) }).Count -gt 0)
-        $expected = $keys.Count
-        if (-not $reasonHeld) { $probe[[string]$reasonKey] = $true; $expected = $expected + 1 }
-        # r6 adversary A1 on c1521d3c: a key no pscustomobject can carry (the empty name) throws in the conversion; a conversion that fails is a merge too (the exact-key path)
-        $probeCount = -1
-        try { $probeCount = @(([pscustomobject]$probe).PSObject.Properties).Count } catch { $probeCount = -1 }
-        if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $expected -or $probeCount -ne $expected) {
-            # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
-            $values = @($Report.PSBase.Values)
-            # r10 (sol B1): a report whose own lookup matched a reason key that differs from `reason` only in case (a case-insensitive [ordered] report's `Reason`) keeps that lookup in the
-            # copy (an [ordered] table compares string keys OrdinalIgnoreCase), so `.reason` and a later helper call still find the entry; a copy whose keys would collide under it, and
-            # every other report, is an exact-key dictionary as before. A key only the report's own culture comparer matched (an ignorable lookalike) stays an ordinary key in the copy
-            $exact = $null
-            if ($hasReason -and -not [string]::Equals($reasonKey, 'reason', [StringComparison]::Ordinal) -and [string]::Equals($reasonKey, 'reason', [StringComparison]::OrdinalIgnoreCase)) {
-                try {
-                    $exact = [ordered]@{}
-                    for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
-                } catch { $exact = $null }
-            }
-            if ($null -eq $exact) {
-                $exact = [System.Collections.Specialized.OrderedDictionary]::new()
-                for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
-            }
-            $exact[$reasonKey] = $reason
-            return $exact
+        # r11 (sol r10 B1/B2 on 218fceaa; fable key3 REPORT-HELPER-ACCUMULATION-EXACT-DEDUPE-1; hub convergence ruling). Report helper contract (r11): this block is the same in both
+        # report helpers and is restated in docs/dual-venue-evidence.md. A dictionary report comes back as a NEW canonical report, never the input dictionary with the detail added:
+        #   reason-like key: a string key OrdinalIgnoreCase-equal to `reason`, or one the report's own public Comparer calls equal to `reason`. A report whose comparer is not readable
+        #     (Hashtable, OrderedDictionary) and whose own lookup holds a `reason` that no such key explains names the ONE string key holding the text that lookup returns
+        #   fold: every reason-like entry becomes ONE key, `reason`, at the place of the first; its text is their non-empty texts in enumeration order, a text EQUAL (ordinal) to an
+        #     earlier one left out -- never containment -- then ` [<detail>]` appended unless the folded text already carries exactly this detail (is it, begins `<detail> [`, or holds
+        #     `[<detail>]`). No early return skips the write
+        #   copy: every other key with its value (a non-string key under its string form) into an [ordered] table (OrdinalIgnoreCase on pwsh 7), returned as a pscustomobject when
+        #     every key can be a member name (the r3 shape) and as the table otherwise. Keys that collide in that table (case variants such as status/Status, or a string form equal to
+        #     another key) drop no value: the report is an exact-key OrderedDictionary with every original key instead, the reason-like ones folded into `reason` the same way
+        #   fail closed (the input report comes back unchanged, the detail not added): a held reason no rule names one key for (r8), or an exact-key copy its keys cannot build
+        $keyList = @($Report.PSBase.Keys)
+        $valueList = @($Report.PSBase.Values)
+        $like = @(foreach ($key in $keyList) { $key -is [string] -and [string]::Equals($key, 'reason', [StringComparison]::OrdinalIgnoreCase) })
+        $comparerProperty = $Report.PSObject.Properties['Comparer']
+        $comparer = if ($null -ne $comparerProperty) { $comparerProperty.Value } else { $null }
+        $asked = $false
+        if ($null -ne $comparer) {
+            try {
+                $matched = $null
+                if ($comparer -is [System.Collections.IEqualityComparer] -or $comparer -is [System.Collections.Generic.IEqualityComparer[string]]) { $matched = @(foreach ($key in $keyList) { $key -is [string] -and $comparer.Equals($key, 'reason') }) }
+                elseif ($comparer -is [System.Collections.IComparer] -or $comparer -is [System.Collections.Generic.IComparer[string]]) { $matched = @(foreach ($key in $keyList) { $key -is [string] -and $comparer.Compare($key, 'reason') -eq 0 }) }
+                if ($null -ne $matched) {
+                    for ($index = 0; $index -lt $keyList.Count; $index++) { if ($matched[$index]) { $like[$index] = $true } }
+                    $asked = $true
+                }
+            } catch { $asked = $false }
         }
+        if (-not $asked -and @($like | Where-Object { $_ }).Count -eq 0) {
+            $held = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
+            if ($held) {
+                $heldText = [string]$Report['reason']
+                $holders = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $heldText, [StringComparison]::Ordinal)) { $index } })
+                # r8 (r7 adversary A2 on 6d30ac14): two holders of the text, so no rule names the key the report's lookup matched: fail closed, every entry as it was
+                if ($holders.Count -ne 1) { return $Report }
+                $like[$holders[0]] = $true
+            }
+        }
+        $texts = @()
+        for ($index = 0; $index -lt $keyList.Count; $index++) {
+            if ($like[$index]) {
+                $text = [string]$valueList[$index]
+                $repeat = [string]::IsNullOrEmpty($text)
+                foreach ($kept in $texts) { if ([string]::Equals($kept, $text, [StringComparison]::Ordinal)) { $repeat = $true } }
+                if (-not $repeat) { $texts += $text }
+            }
+        }
+        $folded = [string]($texts -join ' ')
+        $carried = [string]::Equals($folded, $detail, [StringComparison]::Ordinal) -or $folded.StartsWith("$detail [", [StringComparison]::Ordinal) -or $folded.Contains("[$detail]")
+        $reason = if ($carried) { $folded } elseif ([string]::IsNullOrEmpty($folded)) { $detail } else { "$folded [$detail]" }
+        $canonical = [ordered]@{}
+        $collides = $false
+        $placed = $false
+        for ($index = 0; $index -lt $keyList.Count; $index++) {
+            if ($like[$index]) {
+                if (-not $placed) { $placed = $true; if ($canonical.Contains('reason')) { $collides = $true } else { $canonical.Add('reason', $reason) } }
+            } else {
+                $name = [string]$keyList[$index]
+                if ($canonical.Contains($name)) { $collides = $true } else { $canonical.Add($name, $valueList[$index]) }
+            }
+        }
+        if (-not $placed) { if ($canonical.Contains('reason')) { $collides = $true } else { $canonical.Add('reason', $reason) } }
+        if (-not $collides) {
+            # a key no pscustomobject can carry (the empty name) throws in the conversion: the [ordered] table is the report then
+            $shaped = $null
+            try { $shaped = [pscustomobject]$canonical; if (@($shaped.PSObject.Properties).Count -ne $canonical.Count) { $shaped = $null } } catch { $shaped = $null }
+            if ($null -ne $shaped) { return $shaped }
+            return $canonical
+        }
+        try {
+            # an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1'); `reason` is its only reason-like key, so `.reason` reads it
+            $exact = [System.Collections.Specialized.OrderedDictionary]::new()
+            $placed = $false
+            for ($index = 0; $index -lt $keyList.Count; $index++) {
+                if (-not $like[$index]) { $exact.Add($keyList[$index], $valueList[$index]) }
+                elseif (-not $placed) { $exact.Add('reason', $reason); $placed = $true }
+            }
+            if (-not $placed) { $exact.Add('reason', $reason) }
+        } catch { return $Report }
+        return $exact
     }
+    # a pscustomobject (the job's own shape, Get-AttrCudaPresentMonDisplayReport) is unchanged by r11: its reason is read by its property
+    $current = ''
+    $reasonKey = 'reason'
+    $property = $Report.PSObject.Properties['reason']
+    if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name }
+    # r3 (adversary A2): the token is the detail this helper writes (a bare prefix, or bracketed after a reason), never a path or a word that merely contains the name
+    # r7: the prefix is compared ordinally (String.StartsWith(string) is culture-sensitive: a soft hyphen inside the token would read as the token and drop the detail)
+    if ($current.StartsWith('PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:', [StringComparison]::Ordinal) -or $current.Contains('[PRESENTMON_ORPHAN_SWEEP_INCOMPLETE:')) { return $Report }
+    $reason = if ([string]::IsNullOrEmpty($current)) { $detail } else { "$current [$detail]" }
     $copy = [ordered]@{}
-    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }
-    else { foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value } }
+    foreach ($property in $Report.PSObject.Properties) { $copy[$property.Name] = $property.Value }
     $copy[$reasonKey] = $reason
     return [pscustomobject]$copy
 }
