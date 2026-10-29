@@ -584,7 +584,9 @@ function Remove-BuildSlot($Ticket) {
         if (-not $got) { Write-BuildGuardLog "release-mutex-busy: build slot left for owner-dead reclaim: $($Ticket.Path)"; return }
         $info = Get-Content -LiteralPath $Ticket.Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         if ([int]$info.ownerPid -eq $Ticket.OwnerPid -and [long]$info.startTicks -eq $Ticket.StartTicks) {
-            Remove-Item -LiteralPath $Ticket.Path -Force -WhatIf:$false -Confirm:$false -ErrorAction Stop
+            # A .NET delete, never a cmdlet (r13, adversary 16ea1ebb-A1): no default the caller or the action left in
+            # $PSDefaultParameterValues can skip it, even in a dictionary the guard cannot switch off. It throws into the catch.
+            [IO.File]::Delete($Ticket.Path)
         }
     } catch {
         Write-BuildGuardLog ('build slot not released: {0} ({1}); left for owner-dead reclaim' -f $Ticket.Path, ($_.Exception.Message -replace '\s+', ' '))
@@ -740,8 +742,16 @@ function Remove-HeavySlotFiles($Lease) {
     # The one place a stop file is deleted (r8, adversary 3e68ca85-A1): only once Test-HeavySlotStopNeeded proves no holder
     # can still read it, decided before the ready file that names the holder goes. The other lease files go either way.
     $keepStop = Test-HeavySlotStopNeeded $Lease
-    foreach ($f in @($Lease.Ready, $Lease.ExitFile, $Lease.Log)) { Remove-Item -LiteralPath $f -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue }
-    if (-not $keepStop) { Remove-Item -LiteralPath $Lease.Stop -Force -WhatIf:$false -Confirm:$false -ErrorAction SilentlyContinue }
+    foreach ($f in @($Lease.Ready, $Lease.ExitFile, $Lease.Log)) { Remove-HeavySlotPath $f }
+    if (-not $keepStop) { Remove-HeavySlotPath $Lease.Stop }
+}
+
+function Remove-HeavySlotPath([string]$Path) {
+    # A release delete is a .NET call, never a cmdlet (r13, adversary 16ea1ebb-A1): an action can leave its own defaults
+    # ('Remove-Item:Exclude'='*') in a read-only dictionary the guard can neither replace nor switch off, and a cmdlet would
+    # obey them. As Remove-Item -Force without -Recurse did: a file or an empty directory goes; a failure is silent.
+    if (-not $Path) { return }
+    try { if ([IO.Directory]::Exists($Path)) { [IO.Directory]::Delete($Path) } else { [IO.File]::Delete($Path) } } catch { }
 }
 
 function Remove-HeavySlotLeaseFiles($Lease) {
@@ -853,7 +863,11 @@ function Send-HeavySlotStop($Lease) {
     # Writes the stop file. When it cannot be written, heavy-slot's process tree is ended instead (the OS then frees its
     # slot mutex), so a holder that would never see the file cannot keep the machine slot.
     $Lease['StopSent'] = $true
-    try { Set-Content -LiteralPath $Lease.Stop -Value stop -Encoding ascii -WhatIf:$false -Confirm:$false -ErrorAction Stop; return } catch { $why = $_.Exception.Message }
+    # The same bytes Set-Content -Encoding ascii wrote, through .NET (r13, adversary 16ea1ebb-A1): a 'Set-Content:PassThru'
+    # default the guard could not switch off put 'stop' into the action's output.
+    try { [IO.File]::WriteAllText($Lease.Stop, "stop`r`n", [Text.Encoding]::ASCII); return } catch {
+        $why = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+    }
     Write-BuildGuardLog ('HEAVY_SLOT_WARN label={0} stop file not written ({1}); ending heavy-slot pid {2} and its children' -f $Lease.Label, $why, $Lease.Process.Id)
     # taskkill sets the global $LASTEXITCODE, which a Library caller may exit with after the release, so it is kept
     # (r5b adversary A3), and left unset when it was unset, which strict mode cannot read (r5b pass 2 A2). taskkill's own
@@ -1206,7 +1220,7 @@ function Invoke-BuildGuard {
     # after the action, before any release, and the caller's come back last, once both slots are given back. Both are
     # dot-sourced (they assign in the scope that runs them) and are plain assignments, never a cmdlet (r10, a2bdda36-A2).
     # Neither ever throws (r11 adversary 08736d55-A2): a variable the action made ReadOnly or Constant is skipped, never a
-    # throw before a release; every release write also passes -WhatIf:$false -Confirm:$false itself. The guard's values are
+    # throw before a release; every release write and delete is a .NET call, never a cmdlet (r13). The guard's values are
     # set inside the try whose finally gives the caller's back, so no throw after them leaves them (08736d55-A1). Values the
     # guard cannot set on the way in (the caller made one ReadOnly) are a throw before anything is taken, never a run under
     # the caller's (6b8295aa-A1). $ErrorActionPreference comes back too: the guard's helpers set it to Stop, and an AllScope

@@ -2731,6 +2731,33 @@ def test_an_action_that_locks_allscope_defaults_never_changes_the_release(box, l
     assert list((box["dir"] / "heavy-slot").iterdir()) == [], "every lease file is deleted on release"
 
 
+# r13 adversary 16ea1ebb-A1: the action puts its own defaults in a READ-ONLY dictionary (OrderedDictionary.AsReadOnly()), so
+# neither the re-pin nor the 'Disabled' switch can change them. The release writes and deletes are .NET calls, so the
+# defaults cannot reach them: the action's output stays the action's and the lock and lease files still go.
+def test_an_action_that_installs_read_only_defaults_never_changes_the_release(box) -> None:
+    done = _library_driver(
+        box,
+        "Set-Variable -Name PSDefaultParameterValues -Option AllScope -Value @{}\n"
+        "try { $r = @(Invoke-BuildGuard -Label 'build' -Options $opts -Action { param($Jobs)\n"
+        "    $ro = ([ordered]@{ 'Remove-Item:Exclude' = '*'; 'Set-Content:PassThru' = $true }).AsReadOnly()\n"
+        "    Set-Variable PSDefaultParameterValues -Option AllScope,ReadOnly -Value $ro -Force; 'ACTION' })\n"
+        "    Write-Output (\"count={0} values={1}\" -f $r.Count, ($r -join ',')) } catch { Write-Output \"caught=$($_.FullyQualifiedErrorId)\" }\n",
+        str(box["lock"]),
+        host_tail=(
+            "$d = (Get-Date).AddSeconds(20)\n"
+            f"while (-not (Test-Path -LiteralPath '{box['dir'] / 'stub.log'}') -and (Get-Date) -lt $d) {{ Start-Sleep -Milliseconds 200 }}\n"
+            f"Write-Output \"released=$(Test-Path -LiteralPath '{box['dir'] / 'stub.log'}')\"\n"
+        ),
+    )
+    out = done.stdout + done.stderr
+    assert "caught=" not in done.stdout, out
+    assert "count=1 values=ACTION" in done.stdout, f"the action's output is exactly the action's\n{out}"
+    assert "released=True" in done.stdout, out
+    assert "did not end within 60 s of release" not in out, out
+    assert not box["lock"].exists(), "the build slot's lock is deleted on release"
+    assert list((box["dir"] / "heavy-slot").iterdir()) == [], "every lease file is deleted on release"
+
+
 # r13 (sol r12 B3, adversary fd39a45c-A7): the stop file cannot be written and the action locked the global $LASTEXITCODE
 # ReadOnly at 7, so the taskkill fallback's restore threw outside its catch, past the warning-only release, and the
 # verified-holder fallback never ran. The restore is now a warning; the holder is still ended and the 7 is kept.
