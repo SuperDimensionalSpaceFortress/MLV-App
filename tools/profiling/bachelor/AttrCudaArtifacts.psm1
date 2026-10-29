@@ -2782,6 +2782,9 @@ function Start-AttrCudaHeapDumpWatch {
             [DllImport("shell32.dll", SetLastError = true)] static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string commandLine, out int count);
             [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
             [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+            [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle file, System.Text.StringBuilder path, uint length, uint flags);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file, int infoClass, ref byte deleteFile, uint size);
+            [DllImport("kernel32.dll", SetLastError = true)] static extern bool IsWow64Process(IntPtr process, out bool wow64);
             // BY_HANDLE_FILE_INFORMATION: thirteen DWORDs (each FILETIME is two)
             [StructLayout(LayoutKind.Sequential)] struct FileIdentity { public uint Attributes, C0, C1, A0, A1, W0, W1, Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow; }
             const uint DBG_CONTINUE = 0x00010002;
@@ -2796,8 +2799,12 @@ function Start-AttrCudaHeapDumpWatch {
             // when the handle itself is that file: a plain file with one link (no hard link to another file) holding exactly the request line Start wrote.
             // r11b (adversary r11 A1): the slot is opened with FILE_FLAG_OPEN_REPARSE_POINT, so a slot swapped for a symbolic link opens the LINK itself
             // (never the file it names) and its reparse-point attribute refuses it; nothing is written through a link.
+            // r12 (adversary c525ecbc A1, b20cc814 A3): the reparse flag covers only the last path component; a junction swapped in for ANY ancestor
+            // directory still redirects the open. So the handle must also BE the file Start published: its volume serial and 64-bit file index equal the
+            // identity Start read off that file (Get-AttrCudaFileId) before the watcher ran. A copy of the log anywhere else is another file and is refused.
             static FileStream sink;
-            public static int OpenLog(string path, string expected) {
+            static string sinkDirectory;
+            public static int OpenLog(string path, string expected, uint volume, uint indexHigh, uint indexLow) {
                 FileStream stream = null;
                 try {
                     // GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_ATTRIBUTE_NORMAL
@@ -2806,14 +2813,28 @@ function Start-AttrCudaHeapDumpWatch {
                     stream = new FileStream(handle, FileAccess.ReadWrite);
                     FileIdentity id;
                     if (!GetFileInformationByHandle(stream.SafeFileHandle, out id) || id.Links != 1 || (id.Attributes & 0x400u) != 0 || stream.Length > 65536) { stream.Dispose(); return 2; }
+                    if (id.Volume != volume || id.IndexHigh != indexHigh || id.IndexLow != indexLow) { stream.Dispose(); return 2; }
+                    string directory = FinalDirectory(stream.SafeFileHandle);
+                    if (directory == null) { stream.Dispose(); return 2; }
                     byte[] bytes = new byte[(int)stream.Length];
                     int read = 0;
                     while (read < bytes.Length) { int n = stream.Read(bytes, read, bytes.Length - read); if (n <= 0) break; read += n; }
                     string text = new System.Text.UTF8Encoding(false).GetString(bytes, 0, read).TrimStart('﻿').TrimEnd('\r', '\n');
                     if (!string.Equals(text, expected, StringComparison.Ordinal)) { stream.Dispose(); return 3; }
                     sink = stream;
+                    sinkDirectory = directory;
                     return 0;
                 } catch (Exception) { if (stream != null) stream.Dispose(); return 4; }
+            }
+
+            // The directory an open handle's file really sits in, every link resolved (GetFinalPathNameByHandleW, VOLUME_NAME_DOS); null on failure.
+            static string FinalDirectory(Microsoft.Win32.SafeHandles.SafeFileHandle handle) {
+                System.Text.StringBuilder buffer = new System.Text.StringBuilder(1024);
+                uint length = GetFinalPathNameByHandleW(handle, buffer, (uint)buffer.Capacity, 0u);
+                if (length == 0 || length >= buffer.Capacity) return null;
+                string full = buffer.ToString();
+                int slash = full.LastIndexOf('\\');
+                return slash > 0 ? full.Substring(0, slash) : null;
             }
 
             public static void Log(string message) {
@@ -2853,8 +2874,10 @@ function Start-AttrCudaHeapDumpWatch {
             // r11b (adversary r11 A3): only the attach's own break-in belongs to the debugger: the FIRST 0x80000003 (and, for a WOW64 target, the first
             // 0x4000001F) is continued as handled. Every later breakpoint the app raises passes on unhandled like any other exception, and a
             // second-chance one is captured. seen holds one bit per code already taken.
-            public static bool IsAttachBreak(uint exception, ref int seen) {
-                int bit = exception == 0x80000003u ? 1 : (exception == 0x4000001Fu ? 2 : 0);
+            // r12 (adversary c525ecbc A3): 0x4000001F is the attach break only of a WOW64 target (IsWow64Process); on a native x64 target it is the
+            // app's own exception and passes on like any other.
+            public static bool IsAttachBreak(uint exception, ref int seen, bool wow64) {
+                int bit = exception == 0x80000003u ? 1 : (exception == 0x4000001Fu && wow64 ? 2 : 0);
                 if (bit == 0 || (seen & bit) != 0) return false;
                 seen |= bit;
                 return true;
@@ -2870,6 +2893,8 @@ function Start-AttrCudaHeapDumpWatch {
                 if (!GetProcessTimes(process, out created, out exited, out kernelTime, out userTime) || created - expectedCreationFileTime < 0L || created - expectedCreationFileTime > 9L) {
                     Log("TARGET_IDENTITY_MISMATCH pid=" + pid); CloseHandle(process); return 6;
                 }
+                bool wow64;
+                if (!IsWow64Process(process, out wow64)) wow64 = false;
                 if (!DebugActiveProcess(pid)) { Log("ATTACH_FAILED err=" + Marshal.GetLastWin32Error()); CloseHandle(process); return 2; }
                 DebugSetProcessKillOnExit(false);
                 Log("DEBUGGER_ATTACHED pid=" + pid);
@@ -2888,7 +2913,7 @@ function Start-AttrCudaHeapDumpWatch {
                         if (code == 1) {
                             uint exception = (uint)Marshal.ReadInt32(debugEvent, UnionOffset);
                             bool first = Marshal.ReadInt32(debugEvent, FirstChanceOffset) != 0;
-                            bool attachBreak = IsAttachBreak(exception, ref attachBreaks);
+                            bool attachBreak = IsAttachBreak(exception, ref attachBreaks, wow64);
                             if (!attachBreak) { status = DBG_EXCEPTION_NOT_HANDLED; if (first) firstChance++; }
                             bool trigger = exception == 0xC0000374u || exception == 0xC0000409u || (!first && !attachBreak);
                             if (trigger) {
@@ -2936,7 +2961,18 @@ function Start-AttrCudaHeapDumpWatch {
                     Marshal.WriteInt32(info, 0, (int)tid);
                     Marshal.WriteInt64(info, 4, pointers.ToInt64());
                     Marshal.WriteInt32(info, 12, 0);
-                    using (FileStream stream = new FileStream(dumpPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None)) {
+                    // r12 (adversary c525ecbc A1): CREATE_NEW with DELETE access, then the new file must sit in the very directory the proven log sits in
+                    // (both final paths, every link resolved); a dump directory or ancestor swapped for a junction since gets its new file deleted unwritten
+                    Microsoft.Win32.SafeHandles.SafeFileHandle created = CreateFileW(dumpPath, 0xC0010000u, 0u, IntPtr.Zero, 1u, 0x00000080u, IntPtr.Zero);
+                    if (created.IsInvalid) { int openError = Marshal.GetLastWin32Error(); created.Dispose(); Log("DUMP_FAILED err=" + openError + " path=" + dumpPath + " create"); return false; }
+                    using (FileStream stream = new FileStream(created, FileAccess.ReadWrite)) {
+                        string directory = FinalDirectory(stream.SafeFileHandle);
+                        if (directory == null || sinkDirectory == null || !string.Equals(directory, sinkDirectory, StringComparison.OrdinalIgnoreCase)) {
+                            byte delete = 1;
+                            SetFileInformationByHandle(stream.SafeFileHandle, 4, ref delete, 1u);
+                            Log("DUMP_FAILED REDIRECTED the dump path does not resolve to the watcher log's directory; nothing was written");
+                            return false;
+                        }
                         bool ok = MiniDumpWriteDump(process, pid, stream.SafeFileHandle.DangerousGetHandle(), dumpType, haveContext ? info : IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
                         int error = Marshal.GetLastWin32Error();
                         Log((ok ? "DUMP_WRITTEN" : "DUMP_FAILED err=" + error) + " path=" + dumpPath + " bytes=" + stream.Length + " context=" + (haveContext ? 1 : 0));
@@ -2960,7 +2996,13 @@ function Start-AttrCudaHeapDumpWatch {
         $notBeforeUtc = [DateTime]::UtcNow
         $requestLine = $notBeforeUtc.ToString('o') + ' WATCH_REQUESTED'
         [void](New-AttrCudaDirectory -Path $DumpDir)
-        [void](Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine)
+        $logSlot = Publish-AttrCudaText -Path (Join-Path $DumpDir 'watcher.log') -Value $requestLine
+        # r12 (adversary c525ecbc A1, b20cc814 A3): the identity of the file just published; the watcher writes only through a handle that is this file
+        $logId = Get-AttrCudaFileId -Path $logSlot
+        if ($logId.IsReparsePoint -or $logId.IsDirectory -or $logId.NumberOfLinks -ne 1) { throw 'ATTRCUDA_HEAPDUMP_LOG_UNPROVEN the published watcher log is not one plain file' }
+        # r12 (adversary b20cc814 A6): the owner's own creation time, read now while it is running; a later process on its pid is never the owner,
+        # whatever the clock did in between
+        $ownerCreated = (Get-Process -Id $OwnerPid -ErrorAction Stop).StartTime.ToUniversalTime().ToFileTimeUtc()
         $exeFull = [IO.Path]::GetFullPath($ExePath)
         $exeName = Split-Path -Leaf $exeFull
         # r11 (CI, splice scan R3): each value enters the watcher script as a single-quoted literal, quoted inline (no script-block call)
@@ -2974,6 +3016,10 @@ function Start-AttrCudaHeapDumpWatch {
             ('$requestLine = ''' + $requestLine + '''')
             ('$dumpType = [uint32]' + $DumpType)
             ('$ownerPid = ' + $OwnerPid)
+            ('$ownerCreated = [long]' + $ownerCreated)
+            ('$logVolume = [uint32]' + [uint32]$logId.VolumeSerialNumber)
+            ('$logIndexHigh = [uint32]' + [uint32]$logId.FileIndexHigh)
+            ('$logIndexLow = [uint32]' + [uint32]$logId.FileIndexLow)
             ('$maxWaitSec = ' + $MaxWaitSec)
             # r9 pass 1 (A7): the acquisition bound is elapsed time, never the wall clock (a clock step cannot stretch or cut it)
             '$clock = [Diagnostics.Stopwatch]::StartNew()'
@@ -2983,7 +3029,7 @@ function Start-AttrCudaHeapDumpWatch {
             '''@'
             # r11 (adversary r10 A7): nothing is written before the log handle is proven, so a compile failure (exit 5) or an unproven slot (exit 7) writes nothing; Stop reads the exit code
             'try { Add-Type -TypeDefinition $source -Language CSharp } catch { exit 5 }'
-            'if ([MlvHeapDumpWatch.Debugger]::OpenLog($log, $requestLine) -ne 0) { exit 7 }'
+            'if ([MlvHeapDumpWatch.Debugger]::OpenLog($log, $requestLine, $logVolume, $logIndexHigh, $logIndexLow) -ne 0) { exit 7 }'
             'function W([string]$m) { [MlvHeapDumpWatch.Debugger]::Log($m) }'
             # r11 (adversary r10 A4): the whole seconds still left; a CIM query runs only with at least one left and is bounded by them, so no query outlives MaxWaitSec
             'function Left { [int][Math]::Floor($maxWaitSec - $clock.Elapsed.TotalSeconds) }'
@@ -2993,7 +3039,9 @@ function Start-AttrCudaHeapDumpWatch {
             # MLVApp). Each parent link must be created no later than its child, so a recycled parent pid never counts. r11 (A4): no query past the budget.
             # r11b (adversary r11 A4): the owner link is checked like every other, and the owner must also have been created no later than the request
             # (it made it): a process that took the owner's pid after the owner exited was created after notBefore and never counts as the owner.
-            'function Owned($p) { $c = $p; for ($i = 0; $i -lt 8 -and $null -ne $c; $i++) { $budget = Left; if ($budget -lt 1) { return $false }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$c.ParentProcessId) -OperationTimeoutSec $budget -ErrorAction SilentlyContinue; if ($null -eq $n -or -not $n.CreationDate -or -not $c.CreationDate -or $n.CreationDate -gt $c.CreationDate) { return $false }; if ([int]$c.ParentProcessId -eq $ownerPid) { return ($n.CreationDate.ToUniversalTime() -le $notBefore) }; $c = $n }; return $false }'
+            # r12 (adversary b20cc814 A6): a clock stepped back can date a recycled pid before notBefore, so the owner link must also be the very process
+            # Start ran in: its creation time is the one Start read (WMI truncates it to the microsecond: at most 9 ticks earlier, never later).
+            'function Owned($p) { $c = $p; for ($i = 0; $i -lt 8 -and $null -ne $c; $i++) { $budget = Left; if ($budget -lt 1) { return $false }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$c.ParentProcessId) -OperationTimeoutSec $budget -ErrorAction SilentlyContinue; if ($null -eq $n -or -not $n.CreationDate -or -not $c.CreationDate -or $n.CreationDate -gt $c.CreationDate) { return $false }; if ([int]$c.ParentProcessId -eq $ownerPid) { $skew = $ownerCreated - $n.CreationDate.ToUniversalTime().ToFileTimeUtc(); return ($skew -ge 0 -and $skew -le 9 -and $n.CreationDate.ToUniversalTime() -le $notBefore) }; $c = $n }; return $false }'
             'W (''WATCH exe='' + $exeFull + '' notBefore='' + $notBefore.ToString(''o'') + '' owner='' + $ownerPid + '' match='' + $match + '' pid='' + $PID)'
             '$target = $null'
             'while ($null -eq $target) {'
@@ -3088,15 +3136,19 @@ function Stop-AttrCudaHeapDumpWatch {
             elseif ($killed) { 'KILLED' }
             elseif ($exitCode -eq 5 -or $exitCode -eq 7) { 'STOP_FAILED' }
             elseif (($events -ccontains 'NO_TARGET') -or -not ($events -ccontains 'ATTACH')) { 'NO_TARGET' }
-            elseif (($events -ccontains 'DEBUGGER_ATTACHED') -and ($events -ccontains 'EXIT_PROCESS') -and -not ($events -ccontains 'EXCEPTION') -and $Record['watcherExited'] -eq $true) { 'ATTACHED_NO_CRASH' }
+            # r12 (adversary c525ecbc A4): no crash is only the watcher's own no-trigger exit (Run returns 1); a DUMP_FAILED line or any other exit code
+            # (3: the dump write failed, even when the EXCEPTION line itself was lost) is a failed capture, never ATTACHED_NO_CRASH
+            elseif (($events -ccontains 'DEBUGGER_ATTACHED') -and ($events -ccontains 'EXIT_PROCESS') -and -not ($events -ccontains 'EXCEPTION') -and -not ($events -ccontains 'DUMP_FAILED') -and $exitCode -eq 1 -and $Record['watcherExited'] -eq $true) { 'ATTACHED_NO_CRASH' }
             else { 'STOP_FAILED' })
         if ($Record['captureState'] -ceq 'STOP_FAILED' -and [string]::IsNullOrEmpty([string]$Record['reason'])) {
             $Record['reason'] = $(if ($exitCode -eq 5) { 'WATCHER_COMPILE_FAILED the debugger did not compile' }
                 elseif ($exitCode -eq 7) { 'WATCHER_LOG_UNPROVEN the watcher log slot was not the file Start published; nothing was written through it' }
+                elseif ($events -ccontains 'DUMP_FAILED') { 'WATCHER_CAPTURE_FAILED the dump write failed (DUMP_FAILED)' }
                 elseif ($events -ccontains 'DUMP_WRITTEN') { 'WATCHER_CAPTURE_UNVERIFIED the dump the log names is not in the dump directory at its logged size' }
                 elseif ($events -ccontains 'EXCEPTION') { 'WATCHER_CAPTURE_UNVERIFIED a trigger exception left no dump' }
                 elseif (-not ($events -ccontains 'DEBUGGER_ATTACHED')) { 'WATCHER_CAPTURE_UNVERIFIED the debugger never attached' }
-                else { 'WATCHER_CAPTURE_UNVERIFIED the app exit was never seen' })
+                elseif (-not ($events -ccontains 'EXIT_PROCESS')) { 'WATCHER_CAPTURE_UNVERIFIED the app exit was never seen' }
+                else { "WATCHER_CAPTURE_UNVERIFIED the watcher exited $exitCode, not the no-crash exit 1" })
         }
         if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
             [void](Publish-AttrCudaText -Path (Join-Path $dir 'heap-dump.json') -Value ($Record | ConvertTo-Json -Depth 4))

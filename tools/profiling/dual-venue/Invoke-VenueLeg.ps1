@@ -663,15 +663,12 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
             $copyMs = $copyClock.ElapsedMilliseconds
             if ($_.Name -like '*.dmp') {
                 $hashClock = [Diagnostics.Stopwatch]::StartNew()
-                $dumpSha = Get-DvSha256OfFile $heapDumpLocal
-                $hashMs = $hashClock.ElapsedMilliseconds
                 # r8 (CoS Iverson #432 item 3): minidump is true only for a copy whose first four bytes are the MINIDUMP_HEADER signature 'MDMP'; an empty,
-                # short or foreign file is kept here but is no capture
-                $dumpHead = [byte[]]::new(4); $dumpHeadRead = 0
-                $dumpStream = [IO.File]::OpenRead($heapDumpLocal)
-                try { while ($dumpHeadRead -lt 4) { $dumpHeadN = $dumpStream.Read($dumpHead, $dumpHeadRead, 4 - $dumpHeadRead); if ($dumpHeadN -le 0) { break }; $dumpHeadRead += $dumpHeadN } } finally { $dumpStream.Dispose() }
-                $heapDumpCopies += [ordered]@{ name = $_.Name; bytes = (Get-Item -LiteralPath $heapDumpLocal).Length; sha256 = $dumpSha; copyMs = $copyMs; hashMs = $hashMs
-                    minidump = ($dumpHeadRead -eq 4 -and [Text.Encoding]::ASCII.GetString($dumpHead) -ceq 'MDMP') }
+                # short or foreign file is kept here but is no capture. r12 (adversary c525ecbc A2): bytes, signature and sha256 from ONE handle no writer shares.
+                $dumpFacts = Get-DvDumpFileFacts -Path $heapDumpLocal
+                $hashMs = $hashClock.ElapsedMilliseconds
+                $heapDumpCopies += [ordered]@{ name = $_.Name; bytes = $dumpFacts.bytes; sha256 = $dumpFacts.sha256; copyMs = $copyMs; hashMs = $hashMs
+                    minidump = $dumpFacts.minidump }
             }
         }
     } catch { $heapDumpCopyError = "HEAP_DUMP_COPY_FAILED $($_.Exception.GetType().Name): $($_.Exception.Message)" } }
@@ -981,7 +978,8 @@ if ($heapDumpRequested) {
         try {
             $heapLogLocal = Join-Path $evidenceDir 'heapdump\watcher.log'
             $heapLogLines = @()
-            if (Test-Path -LiteralPath $heapLogLocal -PathType Leaf) { $heapLogSha = Get-DvSha256OfFile $heapLogLocal; $heapLogLines = @([IO.File]::ReadAllLines($heapLogLocal)) }
+            # r12 (adversary b20cc814 A4 writer sibling): the log is read once; its sha256 and the lines judged are the same bytes
+            if (Test-Path -LiteralPath $heapLogLocal -PathType Leaf) { $heapLogFacts = Get-DvHeapLogFacts -Path $heapLogLocal; $heapLogSha = $heapLogFacts.sha256; $heapLogLines = @($heapLogFacts.lines) }
             $fromLog = Get-DvHeapCaptureFromLog -State $captureState -LogLines $heapLogLines
             if (-not $fromLog.consistent) { $captureState = 'STOP_FAILED'; $captureReason = $fromLog.reason }
             elseif ($captureState -ceq 'DUMPED') {

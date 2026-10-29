@@ -29,7 +29,7 @@ function Test-JsonTrue($v) { ($v -is [bool]) -and $v }
 # token right after the timestamp is DEBUGGER_ATTACHED is an attach.
 # r11b (adversary r11b A1): the close must be UNAMBIGUOUS: when more than one segment from the WATCH opener on ends with that pid= (one of them forged inside
 # the WATCH text), nothing after the opener on that line is read.
-function Test-SoakLogAttached([string]$text) {
+function Get-SoakLogEventSegments([string]$text) {
     $watcherPid = $(if ($text -cmatch '^watcherPid=(?<p>\d+)\s') { $Matches['p'] } else { $null })
     foreach ($line in [regex]::Split($text, '\r?\n')) {
         $segments = @([regex]::Split($line, ' \| '))
@@ -40,10 +40,19 @@ function Test-SoakLogAttached([string]$text) {
                 $i = $closes[0]
                 continue
             }
-            if ($segments[$i] -cmatch '^\S+ DEBUGGER_ATTACHED pid=\d+(\s|$)') { return $true }
+            $segments[$i]
         }
     }
-    return $false
+}
+
+function Test-SoakLogAttached([string]$text) {
+    return (@(Get-SoakLogEventSegments $text | Where-Object { $_ -cmatch '^\S+ DEBUGGER_ATTACHED pid=\d+(\s|$)' }).Count -gt 0)
+}
+
+# r12 (adversary c525ecbc A4): a log outside every WATCH message that shows a failed dump write (DUMP_FAILED) or a watcher exit other than the
+# no-crash 1 and the dumped 0 is a failed capture, whatever state the record names
+function Test-SoakLogCaptureFailed([string]$text) {
+    return (@(Get-SoakLogEventSegments $text | Where-Object { $_ -cmatch '^\S+ DUMP_FAILED(\s|$)' -or ($_ -cmatch '^\S+ DEBUGGER_EXIT rc=(?<rc>-?\d+)$' -and $Matches['rc'] -cnotin @('0', '1')) }).Count -gt 0)
 }
 
 function Get-SoakCaptureClass($r) {
@@ -58,13 +67,15 @@ function Get-SoakCaptureClass($r) {
     if ($null -ne $p['captureState'] -and -not $watchNone) {
         $verified = ([string]$r.captureState -cin @('ATTACHED_NO_CRASH', 'DUMPED'))
         if (-not $verified) { return 'captureNotVerified' }
+        # r12 (adversary c525ecbc A4): the record's own watcher log tail, when it carries one, can still show the capture failed
+        if (($null -ne $p['watcherLog']) -and (Test-SoakLogCaptureFailed (@($r.watcherLog | ForEach-Object { [string]$_ }) -join "`n"))) { return 'captureNotVerified' }
         return $(if ($pageHeap) { 'pageheap' } else { 'attached' })
     }
     if ($watchNone) { return $(if ($pageHeap) { 'pageheap' } else { 'unattached' }) }
     if ($null -ne $p['heapDumpWatch']) {
         # r8 (adversary A4): a verified legacy attach keeps a page-heap leg in pageheap, as the typed branch does
         # r10 (adversary r10 A2): the event is the token right after a log line's timestamp, never text inside another line (the WATCH line carries the exe path)
-        if (-not (Test-SoakLogAttached ([string]$r.heapDumpWatch))) { return 'captureNotVerified' }
+        if (-not (Test-SoakLogAttached ([string]$r.heapDumpWatch)) -or (Test-SoakLogCaptureFailed ([string]$r.heapDumpWatch))) { return 'captureNotVerified' }
         return $(if ($pageHeap) { 'pageheap' } else { 'attached' })
     }
     # r8 (CoS Iverson #432 item 2): a record that names a debugger watch but carries no capture evidence is not verified, never unattached

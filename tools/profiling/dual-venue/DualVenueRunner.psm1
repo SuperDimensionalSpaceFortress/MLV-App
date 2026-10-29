@@ -224,15 +224,46 @@ function Get-DvHeapCaptureFromLog {
     $lines = @($LogLines | Where-Object { $null -ne $_ })
     $events = @($lines | ForEach-Object { if ($_ -cmatch '^\S+ ([A-Z_]+)(?: |$)') { $Matches[1] } })
     $written = @($lines | ForEach-Object { if ($_ -cmatch '^\S+ DUMP_WRITTEN path=(.+) bytes=(\d+) context=[01]$') { [pscustomobject]@{ name = [IO.Path]::GetFileName($Matches[1]); bytes = [long]$Matches[2] } } })
+    # r12 (adversary c525ecbc A4): the watcher's own exit line. No crash is exactly one DEBUGGER_EXIT rc=1 (Run's no-trigger exit) and no DUMP_FAILED:
+    # a failed dump write (rc=3) whose EXCEPTION line was lost is a failed capture, never ATTACHED_NO_CRASH
+    $exits = @($lines | ForEach-Object { if ($_ -cmatch '^\S+ DEBUGGER_EXIT rc=(-?\d+)$') { $Matches[1] } })
     $consistent = $false; $reason = ''
     if ($State -ceq 'ATTACHED_NO_CRASH') {
-        $consistent = ($events -ccontains 'DEBUGGER_ATTACHED') -and ($events -ccontains 'EXIT_PROCESS') -and -not ($events -ccontains 'EXCEPTION') -and -not ($events -ccontains 'DUMP_WRITTEN')
-        if (-not $consistent) { $reason = 'CAPTURE_NOT_IN_WATCHER_LOG the watcher log does not show DEBUGGER_ATTACHED and EXIT_PROCESS with no trigger exception' }
+        $consistent = ($events -ccontains 'DEBUGGER_ATTACHED') -and ($events -ccontains 'EXIT_PROCESS') -and -not ($events -ccontains 'EXCEPTION') -and -not ($events -ccontains 'DUMP_WRITTEN') -and
+            -not ($events -ccontains 'DUMP_FAILED') -and $exits.Count -eq 1 -and $exits[0] -ceq '1'
+        if (-not $consistent) { $reason = 'CAPTURE_NOT_IN_WATCHER_LOG the watcher log does not show DEBUGGER_ATTACHED, EXIT_PROCESS and the no-crash DEBUGGER_EXIT rc=1 with no trigger exception or failed dump' }
     } elseif ($State -ceq 'DUMPED') {
-        $consistent = ($events -ccontains 'DEBUGGER_ATTACHED') -and $written.Count -gt 0
+        $consistent = ($events -ccontains 'DEBUGGER_ATTACHED') -and $written.Count -gt 0 -and -not ($events -ccontains 'DUMP_FAILED')
         if (-not $consistent) { $reason = 'CAPTURE_NOT_IN_WATCHER_LOG the watcher log does not show DEBUGGER_ATTACHED and a DUMP_WRITTEN line naming the dump' }
     } else { $reason = "CAPTURE_NOT_VERIFIED captureState '$State' is not a verified capture" }
     [pscustomobject]@{ consistent = $consistent; reason = $reason; written = $written }
+}
+
+# r12 (adversary c525ecbc A2): a dump's byte count, MDMP signature and sha256 come from ONE handle that denies every writer and deletion (FileShare.Read),
+# so the file cannot be rewritten, renamed or replaced between the checks: the hashed bytes are the bytes whose size and signature were read.
+# Writer (Invoke-VenueLeg.ps1) and reader (Test-DvReceiptValid) both use it.
+function Get-DvDumpFileFacts {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $length = $stream.Length
+        $head = [byte[]]::new(4); $read = 0
+        while ($read -lt 4) { $n = $stream.Read($head, $read, 4 - $read); if ($n -le 0) { break }; $read += $n }
+        [void]$stream.Seek(0, [IO.SeekOrigin]::Begin)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $hash = ([BitConverter]::ToString($sha.ComputeHash($stream)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+        [pscustomobject]@{ bytes = [long]$length; sha256 = $hash; minidump = ($read -eq 4 -and [Text.Encoding]::ASCII.GetString($head) -ceq 'MDMP') }
+    } finally { $stream.Dispose() }
+}
+
+# r12 (adversary b20cc814 A4, writer sibling): a watcher log read ONCE; its sha256 and its lines come from the same bytes.
+function Get-DvHeapLogFacts {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $hash = ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace '-', '').ToLowerInvariant() } finally { $sha.Dispose() }
+    $text = (New-Object System.Text.UTF8Encoding($false)).GetString($bytes).TrimStart([char]0xFEFF)
+    [pscustomobject]@{ sha256 = $hash; lines = @([regex]::Split($text, '\r?\n') | Where-Object { $_ -ne '' }) }
 }
 
 function Get-DvProp {
@@ -2554,13 +2585,11 @@ function Test-DvReceiptValid {
                                     $dmpName = [IO.Path]::GetFileName([string](Get-DvProp $dmp 'name'))
                                     $dmpPath = $(if ($dmpName -like '*.dmp') { Join-Path $ev.dir ('heapdump\' + $dmpName) } else { '' })
                                     if (-not $dmpPath -or -not (Test-Path -LiteralPath $dmpPath -PathType Leaf)) { continue }
-                                    $dmpBytes = (Get-Item -LiteralPath $dmpPath).Length
-                                    if ($dmpBytes -le 0 -or @($fromLog.written | Where-Object { $_.name -ieq $dmpName -and $_.bytes -eq $dmpBytes }).Count -eq 0) { continue }
-                                    if ((Get-DvSha256OfFile $dmpPath) -cne [string](Get-DvProp $dmp 'sha256')) { continue }
-                                    $dmpHead = [byte[]]::new(4); $dmpRead = 0
-                                    $dmpStream = [IO.File]::OpenRead($dmpPath)
-                                    try { while ($dmpRead -lt 4) { $dmpN = $dmpStream.Read($dmpHead, $dmpRead, 4 - $dmpRead); if ($dmpN -le 0) { break }; $dmpRead += $dmpN } } finally { $dmpStream.Dispose() }
-                                    if ($dmpRead -eq 4 -and [Text.Encoding]::ASCII.GetString($dmpHead) -ceq 'MDMP') { $dumpOnDisk = $true; break }
+                                    # r12 (adversary c525ecbc A2): size, signature and hash from one handle that no writer can share
+                                    $dmpFacts = Get-DvDumpFileFacts -Path $dmpPath
+                                    if ($dmpFacts.bytes -le 0 -or @($fromLog.written | Where-Object { $_.name -ieq $dmpName -and $_.bytes -eq $dmpFacts.bytes }).Count -eq 0) { continue }
+                                    if ($dmpFacts.sha256 -cne [string](Get-DvProp $dmp 'sha256')) { continue }
+                                    if ($dmpFacts.minidump) { $dumpOnDisk = $true; break }
                                 }
                                 if (-not $dumpOnDisk) { $invalid.Add('HEAPDUMP_DUMP_NOT_IN_EVIDENCE: the receipt says DUMPED but the heapdump\*.dmp the watcher log names is not in the evidence as a non-empty minidump of its logged size under the sha256 the receipt recorded') }
                             }
@@ -3139,7 +3168,7 @@ function Write-DvReceipt {
     $path
 }
 
-Export-ModuleMember -Function Get-DvOutcomeEnum, Get-DvHeapCaptureFromLog, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
+Export-ModuleMember -Function Get-DvOutcomeEnum, Get-DvHeapCaptureFromLog, Get-DvDumpFileFacts, Get-DvHeapLogFacts, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
