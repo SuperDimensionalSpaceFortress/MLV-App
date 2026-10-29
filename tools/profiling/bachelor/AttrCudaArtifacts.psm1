@@ -2503,7 +2503,7 @@ function Start-AttrCudaHeapDumpWatch {
     and its dump is opened CreateNew (an existing name, a link included, is refused, never written through).
     #>
     param([Parameter(Mandatory = $true)][string]$ExePath, [Parameter(Mandatory = $true)][string]$DumpDir, [ValidateRange(10, 7200)][int]$MaxWaitSec = 900,
-        [string]$CommandLineMatch = '--gui-smoke-playback', [ValidateRange(0, 0x3FFFFF)][int]$DumpType = 0x1826, [string]$PwshPath = '')
+        [string]$CommandLineMatch = '--gui-smoke-playback', [ValidateRange(0, 0x3FFFFF)][int]$DumpType = 0x1826, [string]$PwshPath = '', [int]$OwnerPid = $PID)
     $record = [ordered]@{ schema = 'mlv-app/heap-corruption-dump/v1'; requested = $true; dumpDir = $DumpDir; debugger = 'dbghelp-minidump'; dumpType = $DumpType
         watcherPid = $null; startedUtc = $null; reason = $null; watcherExited = $null; captureState = $null; watcherLog = @(); dumps = @() }
     $debuggerSource = @'
@@ -2636,17 +2636,24 @@ function Start-AttrCudaHeapDumpWatch {
             ('$dumpDir = ' + (& $quote $DumpDir))
             ('$match = ' + (& $quote $CommandLineMatch))
             ('$dumpType = [uint32]' + $DumpType)
-            ('$deadline = [DateTime]::UtcNow.AddSeconds(' + $MaxWaitSec + ')')
+            ('$ownerPid = ' + $OwnerPid)
+            ('$maxWaitSec = ' + $MaxWaitSec)
+            # r9 pass 1 (A7): the acquisition bound is elapsed time, never the wall clock (a clock step cannot stretch or cut it)
+            '$clock = [Diagnostics.Stopwatch]::StartNew()'
             '$log = Join-Path $dumpDir ''watcher.log'''
             'function W([string]$m) { Add-Content -LiteralPath $log -Value ([DateTime]::UtcNow.ToString(''o'') + '' '' + $m) }'
-            'W (''WATCH exe='' + $exeFull + '' notBefore='' + $notBefore.ToString(''o'') + '' match='' + $match + '' pid='' + $PID)'
+            # r9 pass 1 (A1): this run's instance descends from the process that asked for the watch (the job; the smoke runner it starts launches
+            # MLVApp). Each parent link must be created no later than its child, so a recycled parent pid never counts.
+            'function Owned($p) { $c = $p; for ($i = 0; $i -lt 8 -and $null -ne $c; $i++) { if ([int]$c.ParentProcessId -eq $ownerPid) { return $true }; $n = Get-CimInstance Win32_Process -Filter ("ProcessId = " + [int]$c.ParentProcessId) -ErrorAction SilentlyContinue; if ($null -eq $n -or -not $n.CreationDate -or -not $c.CreationDate -or $n.CreationDate -gt $c.CreationDate) { return $false }; $c = $n }; return $false }'
+            'W (''WATCH exe='' + $exeFull + '' notBefore='' + $notBefore.ToString(''o'') + '' owner='' + $ownerPid + '' match='' + $match + '' pid='' + $PID)'
             '$source = @'''
             $debuggerSource
             '''@'
             'try { Add-Type -TypeDefinition $source -Language CSharp } catch { W (''COMPILE_FAILED '' + $_.Exception.Message); exit 5 }'
             '$target = $null'
-            'while ($null -eq $target -and [DateTime]::UtcNow -lt $deadline) {'
-            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and $_.CommandLine -notmatch ''--help'' -and $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $exeFull, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $notBefore } | Sort-Object CreationDate) | Select-Object -First 1'
+            'while ($null -eq $target -and $clock.Elapsed.TotalSeconds -lt $maxWaitSec) {'
+            # r9 pass 1 (A2): --help is excluded only as a whole argument, never as a substring of a directory or clip name
+            '    $target = @(Get-CimInstance Win32_Process -Filter ("Name = ''" + $exeName + "''") -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($match) -and $_.CommandLine -notmatch ''(?:^|[\s"''''])--help(?:$|[\s"''''])'' -and $_.ExecutablePath -and [string]::Equals($_.ExecutablePath, $exeFull, [StringComparison]::OrdinalIgnoreCase) -and $_.CreationDate -and $_.CreationDate.ToUniversalTime() -ge $notBefore -and (Owned $_) } | Sort-Object CreationDate) | Select-Object -First 1'
             '    if ($null -eq $target) { Start-Sleep -Milliseconds 200 }'
             '}'
             'if ($null -eq $target) { W ''NO_TARGET the smoke instance never appeared''; exit 3 }'
@@ -2704,7 +2711,7 @@ function Stop-AttrCudaHeapDumpWatch {
             $Record['watcherExited'] = $null
             $Record['reason'] = 'WATCHER_HANDLE_MISSING the record carries no watcher handle; the watcher is never reached by its pid'
         } elseif ($null -ne $Record['watcherPid']) {
-            $attached = $logPath -and (Test-Path -LiteralPath $logPath) -and [bool](Select-String -LiteralPath $logPath -SimpleMatch -Pattern ' ATTACH pid=' -Quiet)
+            $attached = $logPath -and (Test-Path -LiteralPath $logPath) -and [bool](Select-String -LiteralPath $logPath -Pattern '^\S+ ATTACH pid=' -Quiet)
             if ($watcher.HasExited) { $Record['watcherExited'] = $true }
             elseif ($attached -and $watcher.WaitForExit($WaitSec * 1000)) { $Record['watcherExited'] = $true }
             else {
@@ -2719,7 +2726,9 @@ function Stop-AttrCudaHeapDumpWatch {
             if (Test-Path -LiteralPath $logPath) { $log = @(Get-Content -LiteralPath $logPath); $Record['watcherLog'] = @($log | Select-Object -Last 20) }
             $Record['dumps'] = @(Get-ChildItem -LiteralPath $dir -File -Filter '*.dmp' -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ name = $_.Name; bytes = $_.Length } })
         }
-        $has = { param($token) @($log | Where-Object { $_.Contains($token) }).Count -gt 0 }
+        # r9 pass 1 (A3): an event counts only as the token right after a line's timestamp, never as text inside another line (the WATCH line
+        # carries the exe path, which may contain any token)
+        $has = { param($token) $anchored = '^\S+ ' + [regex]::Escape($token.TrimStart()); @($log | Where-Object { $_ -cmatch $anchored }).Count -gt 0 }
         $Record['captureState'] = $(
             if ($null -eq $Record['watcherPid'] -or $watcher -isnot [System.Diagnostics.Process]) { 'STOP_FAILED' }
             elseif ((& $has ' DUMP_WRITTEN ') -and @($Record['dumps'] | Where-Object { $_['bytes'] -gt 0 }).Count -gt 0) { 'DUMPED' }

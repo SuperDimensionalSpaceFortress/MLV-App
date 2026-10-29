@@ -8585,6 +8585,64 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             self.assertTrue(attaches[0].endswith(f"ATTACH pid={out['TARGET']}"), proc.stdout)
             self.assertEqual(out["CAPTURE"], "ATTACHED_NO_CRASH", proc.stdout)
 
+    # r9 adversary pass 1 A1: a same-path instance started AFTER the request by a launcher that is not the requesting process is never taken.
+    def test_heap_dump_watch_never_attaches_an_instance_another_launcher_started(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-foreign-") as d:
+            target = Path(d) / "heap-foreign-target.ps1"
+            target.write_text("Start-Sleep -Seconds 8\nexit 0\n", encoding="ascii")
+            args = f"'-NoProfile','-ExecutionPolicy','Bypass','-File','{target}'"
+            # the run's own launcher R (the job's role) starts the real instance when told; this process (not R) starts the foreign one
+            runner = Path(d) / "heap-foreign-runner.ps1"
+            runner.write_text(f"while (-not (Test-Path -LiteralPath '{d}\\go')) {{ Start-Sleep -Milliseconds 100 }}\n"
+                              f"$t = Start-Process -FilePath '{ps51}' -ArgumentList {args} -WindowStyle Hidden -PassThru\n"
+                              f"Set-Content -LiteralPath '{d}\\tid' -Value $t.Id\n[void]$t.WaitForExit(90000)\n", encoding="ascii")
+            proc = self.run_module(
+                f"$runner = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{runner}' -WindowStyle Hidden -PassThru\n"
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90 -OwnerPid $runner.Id\n"
+                f"$foreign = Start-Process -FilePath '{ps51}' -ArgumentList {args} -WindowStyle Hidden -PassThru\n"
+                f"$deadline = (Get-Date).AddSeconds(12); while ((Get-Date) -lt $deadline -and -not (Select-String -LiteralPath '{d}\\hd\\watcher.log' -Pattern '^\\S+ ATTACH pid=' -Quiet)) {{ Start-Sleep -Milliseconds 250 }}\n"
+                f"Set-Content -LiteralPath '{d}\\go' -Value 1\n"
+                "[void]$runner.WaitForExit(90000); [void]$foreign.WaitForExit(90000)\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 60\n"
+                f"Write-Output ('TARGET=' + (Get-Content -LiteralPath '{d}\\tid' -Raw).Trim()); Write-Output ('CAPTURE=' + $r.captureState)\n"
+                "$r.watcherLog | ForEach-Object { Write-Output ('LOG=' + $_) }")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            lines = proc.stdout.splitlines()
+            out = dict(l.split("=", 1) for l in lines if "=" in l and not l.startswith("LOG="))
+            attaches = [l for l in lines if l.startswith("LOG=") and " ATTACH pid=" in l]
+            self.assertEqual(len(attaches), 1, proc.stdout)
+            self.assertTrue(attaches[0].endswith(f"ATTACH pid={out['TARGET']}"), proc.stdout)
+            self.assertEqual(out["CAPTURE"], "ATTACHED_NO_CRASH", proc.stdout)
+
+    # r9 adversary pass 1 A2: --help is refused as an argument only, never as part of a name in the command line.
+    def test_heap_dump_watch_attaches_an_instance_whose_command_line_names_help_as_a_substring(self) -> None:
+        ps51 = self._ps51()
+        with tempfile.TemporaryDirectory(prefix="heap-helpful-") as d:
+            target = Path(d) / "heap--helpful-target.ps1"
+            target.write_text("Start-Sleep -Seconds 6\nexit 0\n", encoding="ascii")
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath '{ps51}' -DumpDir '{d}\\hd' -CommandLineMatch '{target.name}' -DumpType 0 -MaxWaitSec 90\n"
+                f"$t = Start-Process -FilePath '{ps51}' -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{target}' -WindowStyle Hidden -PassThru\n"
+                "[void]$t.WaitForExit(90000)\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 60\n"
+                "Write-Output ('CAPTURE=' + $r.captureState)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("CAPTURE=ATTACHED_NO_CRASH", proc.stdout.splitlines(), proc.stdout)
+
+    # r9 adversary pass 1 A3: an event token inside the WATCH line's exe path is never read as that event.
+    def test_heap_dump_stop_never_reads_an_event_token_inside_the_exe_path(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-token-") as d:
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\ ATTACH pid=1 DEBUGGER_ATTACHED pid=1 EXIT_PROCESS x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 600\n"
+                "Start-Sleep -Seconds 3\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+                "Write-Output ('CAPTURE=' + $r.captureState); Write-Output ('REASON=' + $r.reason)")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual(out["CAPTURE"], "NO_TARGET", proc.stdout)
+            self.assertTrue(out["REASON"].startswith("WATCHER_NO_TARGET"), proc.stdout)
+
     # r9 (adversary r8 A3): cleanup reaches the watcher only through the handle Start kept, never by a pid that may have been recycled.
     def test_heap_dump_stop_never_kills_a_process_that_reuses_the_watcher_pid(self) -> None:
         ps51 = self._ps51()
