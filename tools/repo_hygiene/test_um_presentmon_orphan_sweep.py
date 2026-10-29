@@ -469,10 +469,10 @@ class ModuleFunctionTests(unittest.TestCase):
             with self.subTest(helper=helper):
                 got = self.call(f"$report = [ordered]@{{ Reason = 'missing'; status = 'PRESENTMON_UNAVAILABLE'; '' = 'keep' }}\n$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
                 self.assertEqual(got["entries"], [f"String:Reason={self.APPENDED[helper]}", "String:status=PRESENTMON_UNAVAILABLE", "String:=keep"])
-        # control: an ordinal report with no key its own comparer calls `reason` gains one (it had no reason to update)
+        # r10 (sol B1): an ordinal report whose own comparer calls no key `reason` but which holds `Reason` has its reason there: the detail is appended to that entry, never added beside it
         got = self.call("$report = [System.Collections.Generic.Dictionary[object,object]]::new(); $report.Add('Reason', 'other'); $report.Add(1, 'keep')\n"
                         f"$r = {self.HELPERS['sweep']}\n" + self.ENTRIES)
-        self.assertEqual(got["entries"], ["String:Reason=other", "Int32:1=keep", "String:reason=PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive"])
+        self.assertEqual(got["entries"], ["String:Reason=other [PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=presentmon_process_alive]", "Int32:1=keep"])
 
     # --- r7 (r6 adversary A2 / A3 on 836a3d61, Dot 54d909b1): the reason key is chosen by ordinal comparison and the report's own comparer, never by PowerShell's culture-sensitive
     # -eq (which ignores U+00AD, U+200B and U+0000), and a copy never lets an added `reason` overwrite a distinct entry. Ignorable characters are tagged before the JSON leaves pwsh.
@@ -489,11 +489,12 @@ class ModuleFunctionTests(unittest.TestCase):
                     self.assertEqual(got["entries"], [f"String:rea{tag}son=OTHER", f"String:Reason={self.APPENDED[helper]}", "String:=keep"])
 
     def test_r7_a3_an_added_reason_never_overwrites_a_distinct_reason_entry(self) -> None:
+        # r10 (sol B1): the distinct `Reason` is never overwritten -- and no `reason` is added beside it either: its text carries the detail (a later helper call must find it there)
         for helper in self.HELPERS:
             with self.subTest(helper=helper):
                 got = self.call("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
                                 f"$report.Add('Reason', 'original'); $report.Add('status', 'S')\n$r = {self.HELPERS[helper]}\n" + self.ENTRIES)
-                self.assertEqual(got["entries"], ["String:Reason=original", "String:status=S", f"String:reason={self.ADDED[helper]}"])
+                self.assertEqual(got["entries"], [f"String:Reason=original [{self.ADDED[helper]}]", "String:status=S"])
 
     def test_r7_the_original_reason_survives_whatever_comparer_the_report_uses(self) -> None:
         # the report's own comparer names the reason entry: it is updated in place (its spelling kept), never duplicated, under Ordinal, OrdinalIgnoreCase and InvariantCultureIgnoreCase
@@ -535,6 +536,91 @@ class ModuleFunctionTests(unittest.TestCase):
                 got = self.call("$report = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::InvariantCultureIgnoreCase)\n"
                                 f"$report.Add('rea' + [char]0xAD + 'son', 'missing'); $report.Add('status', 'S'); $report.Add('', 'keep')\n$r = {self.HELPERS[helper]}\n" + self.TAGGED)
                 self.assertEqual(got["entries"], [f"String:rea<AD>son={self.APPENDED[helper]}", "String:status=S", "String:=keep"])
+
+    # --- r10 (sol B1 on bca900cb, report-helper-composition): the exact-key copy of a case-insensitive report (an [ordered] `Reason` plus a key a pscustomobject cannot carry) is a
+    # case-sensitive dictionary, so the NEXT helper call asked it for `reason`, found nothing, and added a `reason` beside `Reason`: the original text and the earlier diagnostic stayed
+    # stranded under `Reason`. A later call finds the reason entry under the key it already has (any casing), appends to that one entry, and adds no second reason-like key.
+    EV_TEXT = "PRESENTMON_EVENTS_LOST: 12 lost"
+    SW_TEXT = "PRESENTMON_ORPHAN_SWEEP_INCOMPLETE: skipped=capture_owner_unidentified"
+    STEPS = {"events": "$r = Add-AttrCudaPresentMonEventsLostDetailToReport -Report $r -EventsLost $e",
+             "sweep": "$r = Add-AttrCudaPresentMonOrphanSweepDetailToReport -Report $r -Sweep @{ skippedReason = 'capture_owner_unidentified' }"}
+    COMPOSED = ENTRIES.replace("same = ", "dotReason = $dot; same = ")
+    EVENTS_RECORD = "$e = [pscustomobject]@{ detected = $true; detail = 'PRESENTMON_EVENTS_LOST: 12 lost' }\n"
+    DOT_REASON = "\n$dot = try { [string]$r.reason } catch { '<throws>' }\n"
+
+    def compose_on(self, report_statement: str, *steps: str) -> dict:
+        return self.call(report_statement + "\n" + self.EVENTS_RECORD + "$r = $report\n" + "\n".join(self.STEPS[step] for step in steps) + self.DOT_REASON + self.COMPOSED)
+
+    def compose(self, report_ps: str, *steps: str) -> dict:
+        return self.compose_on("$report = " + report_ps, *steps)
+
+    @staticmethod
+    def reason_like(entries: list[str]) -> list[str]:
+        return [e for e in entries if e.split(":", 1)[1].split("=", 1)[0].lower() == "reason"]
+
+    def test_r10_b1_sols_repro_events_then_sweep_keeps_one_accumulated_reason(self) -> None:
+        for name, report in (("empty-key", "[ordered]@{ Reason = 'r'; status = 'S'; '' = 'keep' }"), ("integer-key", "[ordered]@{ Reason = 'r'; 1 = 'keep' }")):
+            with self.subTest(report=name):
+                got = self.compose(report, "events", "sweep")
+                accumulated = f"r [{self.EV_TEXT}] [{self.SW_TEXT}]"
+                self.assertEqual(self.reason_like(got["entries"]), [f"String:Reason={accumulated}"], got)
+                self.assertEqual(len(got["entries"]), 3 if name == "empty-key" else 2, got)
+                self.assertEqual(got["dotReason"], accumulated, "`.reason` still reads the accumulated text (the copy keeps the report's case-insensitive lookup)")
+
+    def test_r10_b1_either_helper_applied_twice_changes_nothing_the_second_time(self) -> None:
+        for step in self.STEPS:
+            for name, report in (("empty-key", "[ordered]@{ Reason = 'r'; status = 'S'; '' = 'keep' }"), ("integer-key", "[ordered]@{ Reason = 'r'; 1 = 'keep' }"),
+                                 ("hashtable", "@{ Reason = 'r'; status = 'S'; '' = 'keep' }")):
+                with self.subTest(step=step, report=name):
+                    once = self.compose(report, step)
+                    twice = self.compose(report, step, step)
+                    self.assertEqual(len(self.reason_like(once["entries"])), 1, once)
+                    self.assertEqual(sorted(twice["entries"]), sorted(once["entries"]), twice)
+
+    def test_r10_b1_the_helpers_compose_in_either_order_without_losing_text(self) -> None:
+        for first, second in (("events", "sweep"), ("sweep", "events"), ("sweep", "sweep"), ("events", "events")):
+            with self.subTest(first=first, second=second):
+                got = self.compose("[ordered]@{ Reason = 'r'; status = 'S'; '' = 'keep' }", first, second)
+                (entry,) = self.reason_like(got["entries"])
+                for step in {first, second}:
+                    self.assertIn(self.EV_TEXT if step == "events" else self.SW_TEXT, entry)
+                self.assertTrue(entry.startswith("String:Reason=r ["), entry)
+
+    def test_r10_b1_a_case_sensitive_dictionary_holding_reason_and_Reason_keeps_both_texts(self) -> None:
+        # rule: the accumulated reason is every reason-like entry's text in key order (a text another already contains is left out), written to the key the comparer matched (`reason`);
+        # every entry is kept and no third reason-like key appears, across a second helper call too
+        ctor = ("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                "$report.Add('Reason', 'first'); $report.Add('status', 'S'); $report.Add('reason', 'second')")
+        for step in self.STEPS:
+            with self.subTest(step=step):
+                got = self.compose_on(ctor, step)
+                added = self.EV_TEXT if step == "events" else self.SW_TEXT
+                self.assertEqual(got["entries"], ["String:Reason=first", "String:status=S", f"String:reason=first second [{added}]"], got)
+        got = self.compose_on(ctor, "events", "sweep")
+        self.assertEqual(got["entries"], ["String:Reason=first", "String:status=S", f"String:reason=first second [{self.EV_TEXT}] [{self.SW_TEXT}]"], got)
+
+    def test_r10_b1_two_case_variants_with_no_exact_reason_write_to_the_first_and_keep_both(self) -> None:
+        ctor = ("$report = [System.Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)\n"
+                "$report.Add('Reason', 'first'); $report.Add('REASON', 'second')")
+        for step in self.STEPS:
+            with self.subTest(step=step):
+                got = self.compose_on(ctor, step)
+                added = self.EV_TEXT if step == "events" else self.SW_TEXT
+                self.assertEqual(got["entries"], [f"String:Reason=first second [{added}]", "String:REASON=second"], got)
+
+    def test_r10_b1_controls_a_lowercase_reason_and_an_ordinary_report_compose_as_before(self) -> None:
+        accumulated = f"r [{self.EV_TEXT}] [{self.SW_TEXT}]"
+        got = self.compose("[ordered]@{ reason = 'r'; status = 'S'; '' = 'keep' }", "events", "sweep")
+        self.assertEqual(sorted(got["entries"]), sorted([f"String:reason={accumulated}", "String:status=S", "String:=keep"]), got)
+        for report in ("[pscustomobject]@{ status = 'S'; reason = 'r' }", "[ordered]@{ status = 'S'; reason = 'r' }", "@{ status = 'S'; reason = 'r' }"):
+            with self.subTest(report=report[:16]):
+                got = self.compose(report, "events", "sweep")
+                self.assertEqual(sorted(got["entries"]), sorted([f"String:reason={accumulated}", "String:status=S"]), got)
+                self.assertEqual(got["dotReason"], accumulated)
+
+    def test_r10_b1_a_report_with_no_reason_still_gains_exactly_one(self) -> None:
+        got = self.compose("[ordered]@{ status = 'S'; '' = 'keep' }", "events", "sweep")
+        self.assertEqual(self.reason_like(got["entries"]), [f"String:reason={self.EV_TEXT} [{self.SW_TEXT}]"], got)
 
     def test_mutation_the_property_only_copy_loses_a_dictionary_reports_fields_again(self) -> None:
         module = MODULE.read_text(encoding="utf-8")

@@ -2320,10 +2320,10 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
     $reasonKey = 'reason'
     if ($Report -is [System.Collections.IDictionary]) {
         $hasReason = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
+        $keyList = @($Report.PSBase.Keys)
+        $valueList = @($Report.PSBase.Values)
         if ($hasReason) {
             $current = [string]$Report['reason']
-            $keyList = @($Report.PSBase.Keys)
-            $valueList = @($Report.PSBase.Values)
             $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::Ordinal) })
             # r7 (adversary A2 on 0805902c): a dictionary that exposes its comparer (Dictionary, ConcurrentDictionary, SortedDictionary) is asked which key it matched; one that does not,
             # or whose comparer cannot answer, falls through to the value and OrdinalIgnoreCase steps
@@ -2342,6 +2342,26 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
             if ($named.Count -ne 1) { return $Report }
             $reasonKey = $named[0]
         }
+        # r10 (sol B1 on bca900cb): the reason is the text of EVERY reason-like entry, found whatever the dictionary's own lookup says. An exact-key copy of a case-insensitive report is a
+        # case-sensitive dictionary, so a second helper call asked `Contains('reason')`, read nothing under `Reason` and added a `reason` beside it, and the first call's text was lost from
+        # `.reason`. A reason-like key is a string key that OrdinalIgnoreCase matches `reason` (or the one key the report's own comparer matched). Rule when several exist: the accumulated
+        # reason is their non-empty texts in key order, a text that another one already contains left out (a repeat call never grows it); it is written to the key the comparer matched,
+        # else to the first of them; every entry (the other reason-like keys too) is kept, and no reason-like key is ever added beside them
+        $holders = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and ([string]::Equals($keyList[$index], 'reason', [StringComparison]::OrdinalIgnoreCase) -or ($hasReason -and [string]::Equals($keyList[$index], $reasonKey, [StringComparison]::Ordinal)))) { $index } })
+        if (-not $hasReason -and $holders.Count -gt 0) { $reasonKey = $keyList[$holders[0]] }
+        $texts = @(foreach ($index in $holders) { $text = [string]$valueList[$index]; if (-not [string]::IsNullOrEmpty($text)) { $text } })
+        $kept = @()
+        for ($first = 0; $first -lt $texts.Count; $first++) {
+            $covered = $false
+            for ($second = 0; $second -lt $texts.Count; $second++) {
+                if ($second -ne $first) {
+                    if ([string]::Equals($texts[$second], $texts[$first], [StringComparison]::Ordinal)) { if ($second -lt $first) { $covered = $true } }
+                    elseif ($texts[$second].Contains($texts[$first])) { $covered = $true }
+                }
+            }
+            if (-not $covered) { $kept += $texts[$first] }
+        }
+        $current = $kept -join ' '
     } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name } }
     $detailed = Add-AttrCudaPresentMonEventsLostDetail -Reason $current -EventsLost $EventsLost
     if ([string]::Equals($detailed, $current, [StringComparison]::Ordinal)) { return $Report }
@@ -2366,8 +2386,20 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
         if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $expected -or $probeCount -ne $expected) {
             # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
             $values = @($Report.PSBase.Values)
-            $exact = [System.Collections.Specialized.OrderedDictionary]::new()
-            for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
+            # r10 (sol B1): a report whose own lookup matched a reason key that differs from `reason` only in case (a case-insensitive [ordered] report's `Reason`) keeps that lookup in the
+            # copy (an [ordered] table compares string keys OrdinalIgnoreCase), so `.reason` and a later helper call still find the entry; a copy whose keys would collide under it, and
+            # every other report, is an exact-key dictionary as before. A key only the report's own culture comparer matched (an ignorable lookalike) stays an ordinary key in the copy
+            $exact = $null
+            if ($hasReason -and -not [string]::Equals($reasonKey, 'reason', [StringComparison]::Ordinal) -and [string]::Equals($reasonKey, 'reason', [StringComparison]::OrdinalIgnoreCase)) {
+                try {
+                    $exact = [ordered]@{}
+                    for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
+                } catch { $exact = $null }
+            }
+            if ($null -eq $exact) {
+                $exact = [System.Collections.Specialized.OrderedDictionary]::new()
+                for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
+            }
             $exact[$reasonKey] = $detailed
             return $exact
         }
@@ -2406,10 +2438,10 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
     $reasonKey = 'reason'
     if ($Report -is [System.Collections.IDictionary]) {
         $hasReason = if ($null -ne $Report.PSObject.Methods['ContainsKey']) { $Report.ContainsKey('reason') } else { $Report.Contains('reason') }
+        $keyList = @($Report.PSBase.Keys)
+        $valueList = @($Report.PSBase.Values)
         if ($hasReason) {
             $current = [string]$Report['reason']
-            $keyList = @($Report.PSBase.Keys)
-            $valueList = @($Report.PSBase.Values)
             $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::Ordinal) })
             # r7 (adversary A2 on 0805902c): a dictionary that exposes its comparer (Dictionary, ConcurrentDictionary, SortedDictionary) is asked which key it matched; one that does not,
             # or whose comparer cannot answer, falls through to the value and OrdinalIgnoreCase steps
@@ -2428,6 +2460,26 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
             if ($named.Count -ne 1) { return $Report }
             $reasonKey = $named[0]
         }
+        # r10 (sol B1 on bca900cb): the reason is the text of EVERY reason-like entry, found whatever the dictionary's own lookup says. An exact-key copy of a case-insensitive report is a
+        # case-sensitive dictionary, so a second helper call asked `Contains('reason')`, read nothing under `Reason` and added a `reason` beside it, and the first call's text was lost from
+        # `.reason`. A reason-like key is a string key that OrdinalIgnoreCase matches `reason` (or the one key the report's own comparer matched). Rule when several exist: the accumulated
+        # reason is their non-empty texts in key order, a text that another one already contains left out (a repeat call never grows it); it is written to the key the comparer matched,
+        # else to the first of them; every entry (the other reason-like keys too) is kept, and no reason-like key is ever added beside them
+        $holders = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and ([string]::Equals($keyList[$index], 'reason', [StringComparison]::OrdinalIgnoreCase) -or ($hasReason -and [string]::Equals($keyList[$index], $reasonKey, [StringComparison]::Ordinal)))) { $index } })
+        if (-not $hasReason -and $holders.Count -gt 0) { $reasonKey = $keyList[$holders[0]] }
+        $texts = @(foreach ($index in $holders) { $text = [string]$valueList[$index]; if (-not [string]::IsNullOrEmpty($text)) { $text } })
+        $kept = @()
+        for ($first = 0; $first -lt $texts.Count; $first++) {
+            $covered = $false
+            for ($second = 0; $second -lt $texts.Count; $second++) {
+                if ($second -ne $first) {
+                    if ([string]::Equals($texts[$second], $texts[$first], [StringComparison]::Ordinal)) { if ($second -lt $first) { $covered = $true } }
+                    elseif ($texts[$second].Contains($texts[$first])) { $covered = $true }
+                }
+            }
+            if (-not $covered) { $kept += $texts[$first] }
+        }
+        $current = $kept -join ' '
     } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name } }
     # r3 (adversary A2): the token is the detail this helper writes (a bare prefix, or bracketed after a reason), never a path or a word that merely contains the name
     # r7: the prefix is compared ordinally (String.StartsWith(string) is culture-sensitive: a soft hyphen inside the token would read as the token and drop the detail)
@@ -2488,8 +2540,20 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
         if (@($keys | Where-Object { $_ -isnot [string] }).Count -gt 0 -or $probe.Count -ne $expected -or $probeCount -ne $expected) {
             # Keys and Values enumerate in the same order; an OrderedDictionary with no comparer compares keys by their own equality (ordinal for strings, 1 is not '1')
             $values = @($Report.PSBase.Values)
-            $exact = [System.Collections.Specialized.OrderedDictionary]::new()
-            for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
+            # r10 (sol B1): a report whose own lookup matched a reason key that differs from `reason` only in case (a case-insensitive [ordered] report's `Reason`) keeps that lookup in the
+            # copy (an [ordered] table compares string keys OrdinalIgnoreCase), so `.reason` and a later helper call still find the entry; a copy whose keys would collide under it, and
+            # every other report, is an exact-key dictionary as before. A key only the report's own culture comparer matched (an ignorable lookalike) stays an ordinary key in the copy
+            $exact = $null
+            if ($hasReason -and -not [string]::Equals($reasonKey, 'reason', [StringComparison]::Ordinal) -and [string]::Equals($reasonKey, 'reason', [StringComparison]::OrdinalIgnoreCase)) {
+                try {
+                    $exact = [ordered]@{}
+                    for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
+                } catch { $exact = $null }
+            }
+            if ($null -eq $exact) {
+                $exact = [System.Collections.Specialized.OrderedDictionary]::new()
+                for ($index = 0; $index -lt $keys.Count; $index++) { $exact.Add($keys[$index], $values[$index]) }
+            }
             $exact[$reasonKey] = $reason
             return $exact
         }
