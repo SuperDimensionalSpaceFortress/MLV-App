@@ -466,6 +466,7 @@ class ThermalGateRunnerTests(unittest.TestCase):
     """The runner with the stub thermal source: wait, cool, run; cap skip with re-queue; re-queues exhausted; unknown heat; ThermalSpread from receipts."""
 
     setUp = tvlb.VenueLeaseBatchRunnerTests.setUp
+    _init_case = tvlb.VenueLeaseBatchRunnerTests._init_case   # the shared setUp builds each case through it (#704)
     batch_cmd = tvlb.VenueLeaseBatchRunnerTests.batch_cmd
     kinds = tvlb.VenueLeaseBatchRunnerTests.kinds
     batches = tvlb.VenueLeaseBatchRunnerTests.batches
@@ -648,6 +649,7 @@ class ThermalDeadlineAdmissionTests(unittest.TestCase):
     probe-script check) never buys another probe. Its own class, outside the heavy set, so the regular shards carry its (real, scaled-down) waits."""
 
     setUp = tvlb.VenueLeaseBatchRunnerTests.setUp
+    _init_case = tvlb.VenueLeaseBatchRunnerTests._init_case   # the shared setUp builds each case through it (#704)
     batch_cmd = tvlb.VenueLeaseBatchRunnerTests.batch_cmd
     kinds = tvlb.VenueLeaseBatchRunnerTests.kinds
     batches = tvlb.VenueLeaseBatchRunnerTests.batches
@@ -781,6 +783,7 @@ class ThermalSpreadPlanTests(unittest.TestCase):
     leg_calls = tvlb.VenueLeaseBatchLegPlanTests.leg_calls
     kinds = tvlb.VenueLeaseBatchRunnerTests.kinds
     batches = tvlb.VenueLeaseBatchRunnerTests.batches
+    _init_case = tvlb.VenueLeaseBatchRunnerTests._init_case   # the shared setUp builds each case through it (#704)
 
     # the plan tests' own setUpClass / setUp, spelled out (theirs call super() on their class)
     @classmethod
