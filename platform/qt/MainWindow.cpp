@@ -11310,6 +11310,7 @@ void MainWindow::on_actionFcpxmlImportAssistant_triggered()
     //Open files
     m_inOpeningProcess = true;
 
+    ImportBatchOutcome imports;
     for( int i = 0; i < files.size(); i++ )
     {
         QString fileName = files.at(i);
@@ -11317,11 +11318,11 @@ void MainWindow::on_actionFcpxmlImportAssistant_triggered()
         //Exit if not an MLV file or aborted
         if( fileName == QString( "" ) || !fileName.endsWith( ".mlv", Qt::CaseInsensitive ) ) continue;
 
-        importNewMlv( fileName );
+        imports.note( importNewMlv( fileName ) );
     }
 
     //Show last imported file
-    if( SESSION_CLIP_COUNT ) showFileInEditor( SESSION_CLIP_COUNT - 1 );
+    if( SESSION_CLIP_COUNT && imports.showLastRow() ) showFileInEditor( SESSION_CLIP_COUNT - 1 );
 
     //Caching is in which state? Set it!
     if( ui->actionCaching->isChecked() ) on_actionCaching_triggered();

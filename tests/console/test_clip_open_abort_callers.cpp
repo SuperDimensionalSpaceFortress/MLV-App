@@ -956,6 +956,8 @@ TEST(ClipOpenAbortR5Wiring, EveryImportCallerShowsTheLastRowOnlyFromTheBatchOutc
         {"bool MainWindow::event(QEvent *event)", "//Caching is in which state? Set it!"},
         {"void MainWindow::on_actionOpen_triggered()", "void MainWindow::openDngFolderDialog()"},
         {"void MainWindow::openDngFolderDialog()", "void MainWindow::on_actionFcpxmlImportAssistant_triggered()"},
+        // r6 (adversary 80ca1417 / eb2146f4 A1): the FCPXML import assistant is the fifth caller
+        {"void MainWindow::on_actionFcpxmlImportAssistant_triggered()", "void MainWindow::on_actionFcpxmlSelectionAssistant_triggered()"},
     };
     for (const Caller & caller : callers)
     {
@@ -966,7 +968,7 @@ TEST(ClipOpenAbortR5Wiring, EveryImportCallerShowsTheLastRowOnlyFromTheBatchOutc
         ASSERT_TRUE(note >= 0);
         ASSERT_TRUE(shown > note);
     }
-    // the drop path (openMlvSet) shows the last row from the same outcome (FCPXML import: OPEN, see r5 summary)
+    // the drop path (openMlvSet) shows the last row from the same outcome
     const int dropShow = source.indexOf(QStringLiteral("if( SESSION_CLIP_COUNT && imports.showLastRow() )\n    {\n        //Show last imported file"));
     const int dropNote = source.lastIndexOf(QStringLiteral("imports.note( importNewMlv( fileName ) );"), dropShow);
     ASSERT_TRUE(dropShow >= 0);
