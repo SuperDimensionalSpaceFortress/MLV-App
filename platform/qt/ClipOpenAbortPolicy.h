@@ -122,14 +122,18 @@ struct ShowFileOpenFailurePlan
 };
 
 inline ShowFileOpenFailurePlan showFileOpenFailurePlan( int openResult, int row, int oldActive,
-                                                        int selectedCount, int clipCount, bool oldNeverLoaded )
+                                                        int selectedCount, int clipCount, bool oldNeverLoaded,
+                                                        bool oldClipStillLoaded = true )
 {
     ShowFileOpenFailurePlan plan;
     const bool oldIsOther = oldActive >= 0 && oldActive < clipCount && oldActive != row;
     plan.restoreOldActive = oldIsOther;
     plan.reselectOld = oldIsOther && selectedCount <= 1;
     plan.reopenOld = plan.reselectOld && !oldNeverLoaded && !clipOpenAbortKeptRetainedClip( openResult );
-    plan.detachSliders = !( plan.restoreOldActive && !oldNeverLoaded && clipOpenFailureKeptRetainedClip( openResult ) );
+    // r6 (adversary 7354a575 A1): an open that ran inside the failed open's error dialog (a FileOpen import)
+    // loaded another clip, so the sliders describe that clip and not the old row, whatever openResult says.
+    plan.detachSliders = !( plan.restoreOldActive && !oldNeverLoaded && clipOpenFailureKeptRetainedClip( openResult )
+                            && oldClipStillLoaded );
     plan.retryReopenLater = plan.detachSliders && !plan.reopenOld && clipOpenAbortedForPrep( openResult );
     return plan;
 }

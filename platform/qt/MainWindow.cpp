@@ -18949,9 +18949,14 @@ int MainWindow::showFileInEditor(int row)
     {
         // r3 (key3 INV-2, Dot B3): the sliders still describe oldActive, so it is the active row again
         // before anything saves a receipt; a clip a busy prep task kept loaded is not reopened.
+        // r6 (adversary 7354a575 A1): openMlv's error dialog runs an event loop, and a FileOpen there can load
+        // another clip; the sliders then describe that clip, so they are detached before the old row is reopened.
+        const bool oldClipStillLoaded = oldActive >= 0 && oldActive < SESSION_CLIP_COUNT
+            && ( m_loadedClipFileName == GET_CLIP( oldActive )->getPath() || m_loadedClipFileName == GET_RECEIPT( oldActive )->fileName() );
         const ShowFileOpenFailurePlan plan = showFileOpenFailurePlan(
             openResult, row, oldActive, selectedClipsList().size(), SESSION_CLIP_COUNT,
-            oldActive >= 0 && oldActive < SESSION_CLIP_COUNT && GET_RECEIPT( oldActive )->wasNeverLoaded() );
+            oldActive >= 0 && oldActive < SESSION_CLIP_COUNT && GET_RECEIPT( oldActive )->wasNeverLoaded(),
+            oldClipStillLoaded );
         if( plan.restoreOldActive ) SET_ACTIVE_CLIP_IDX( oldActive );
         // r4 (adversary A1): the delete path pre-activates the row that failed, so oldActive == row; the
         // sliders then describe no receipt, and saveSession / setReceipt must not write them into this row.
@@ -30292,8 +30297,6 @@ void MainWindow::on_actionPlay_toggled(bool checked)
 {
     invalidatePlaybackPrepForDisplayChange(
         checked ? "play-start" : "play-stop" );
-    // CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: the stop path mutates core state below.
-    if( !checked ) drainPlaybackPrepInFlight( "play-stop", 2000 );
     // PLAYBACK-CUDA-NATIVE-PACE-1: the pace clock re-arms at this Play's first engine tick.
     m_playbackPaceGuard.reset();
     logInteractionEvent(
@@ -30322,6 +30325,10 @@ void MainWindow::on_actionPlay_toggled(bool checked)
         // PLAYBACK-STARTUP-WAIT-S1-FIRST-AMAZE-AT-PLAY-1 Row K: a kick still held ends with its Play
         endPlaybackGpuClockKick( "play_stop" );
         finishPlaybackSmokeTelemetry( "play-stop" );
+        // CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 F2: selectDebayerAlgorithm and applyEffectiveDualIsoPlaybackSettings
+        // below mutate core state. r6 (adversary 7354a575 A2): drained after the telemetry has sampled its end
+        // time, so the up-to-2 s wait is not counted in the Play interval.
+        drainPlaybackPrepInFlight( "play-stop", 2000 );
         m_playbackStopped = true;
         m_playToFirstFramePending = false;
         m_playToFirstFrameTargetFrameValid = false;

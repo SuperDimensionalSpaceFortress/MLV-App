@@ -974,3 +974,85 @@ TEST(ClipOpenAbortR5Wiring, EveryImportCallerShowsTheLastRowOnlyFromTheBatchOutc
     ASSERT_TRUE(dropShow >= 0);
     ASSERT_TRUE(dropNote >= 0 && dropNote < dropShow);
 }
+
+// adversary 7354a575 A1: session [A,B,C], A active and loaded with exposure 20, B never loaded and corrupt.
+// showFileInEditor( B ) fails; while openMlv's error dialog runs its event loop, a FileOpen imports and shows C
+// (exposure 0). The failure plan restores A and reopens it, and that reopen must not save C's sliders into A.
+TEST(ClipOpenAbortR6, AClipShownDuringAFailedOpensDialogIsNeverSavedIntoTheRestoredRow)
+{
+    DetachingSessionModel s;
+    s.receipts = {20, 0, 0}; // A, B (never loaded), C (default receipt)
+    std::vector<bool> neverLoaded = {false, true, true};
+    s.sliders = 20;
+    s.active = 0;
+    int loaded = 0;
+    auto save = [&]() { if (!neverLoaded[s.active]) saveSlidersModel(s); };
+    auto openOk = [&](int row) { loaded = row; neverLoaded[row] = false; s.detached = false; s.sliders = s.receipts[row]; };
+
+    save();                      // showFileInEditor( B ): save A's sliders into A
+    const int oldActive = s.active;
+    s.active = 1;                // SET_ACTIVE_CLIP_IDX( B ), then openMlv( B ) shows its error dialog ...
+    save();                      // ... where FileOpen -> showFileInEditor( C ): B was never loaded, nothing saved
+    s.active = 2;
+    openOk(2);                   // C opens and is shown
+    const ShowFileOpenFailurePlan plan = showFileOpenFailurePlan(
+        kMlvErrCorrupted, 1, oldActive, 1, 3, false, loaded == oldActive);
+    if (plan.restoreOldActive) s.active = oldActive;
+    if (plan.detachSliders) s.detached = true;
+    if (plan.reopenOld)
+    {
+        save();                  // showFileInEditor( A ) saves the sliders into the active row first
+        s.active = oldActive;
+        openOk(oldActive);
+    }
+    ASSERT_EQ(s.receipts[0], 20); // A keeps its grade
+    ASSERT_EQ(s.receipts[2], 0);
+    ASSERT_EQ(s.active, 0);
+    ASSERT_EQ(loaded, 0);
+    ASSERT_EQ(s.sliders, 20);
+    // without a re-entrant open the plan is unchanged: A is still loaded, so the sliders stay attached
+    ASSERT_FALSE(showFileOpenFailurePlan(kMlvErrCorrupted, 1, 0, 1, 3, false, true).detachSliders);
+    ASSERT_FALSE(showFileOpenFailurePlan(kClipOpenAbortedPrepBusy, 1, 0, 1, 3, false, true).detachSliders);
+    // a prep refusal with another clip loaded detaches and retries A later
+    const ShowFileOpenFailurePlan prep = showFileOpenFailurePlan(kClipOpenAbortedPrepBusy, 1, 0, 1, 3, false, false);
+    ASSERT_TRUE(prep.detachSliders);
+    ASSERT_TRUE(prep.retryReopenLater);
+}
+
+TEST(ClipOpenAbortR6Wiring, ShowFileInEditorTellsThePlanWhetherTheOldClipIsStillLoaded)
+{
+    const QString source = mainWindowSource();
+    const QString body = bodyBetween(source, QStringLiteral("int MainWindow::showFileInEditor(int row)"),
+                                     QStringLiteral("bool MainWindow::addClipToExportQueue(int row, QString fileName)"));
+    ASSERT_FALSE(body.isEmpty());
+    const int open = body.indexOf(QStringLiteral("const int openResult = openMlv( GET_CLIP( row )->getPath() );"));
+    const int loadedIsOld = body.indexOf(QStringLiteral(
+        "m_loadedClipFileName == GET_CLIP( oldActive )->getPath() || m_loadedClipFileName == GET_RECEIPT( oldActive )->fileName()"));
+    const int plan = body.indexOf(QStringLiteral("showFileOpenFailurePlan("));
+    ASSERT_TRUE(open >= 0);
+    ASSERT_TRUE(loadedIsOld > open);   // read after openMlv returns: a re-entrant open has already run
+    ASSERT_TRUE(plan > loadedIsOld);
+    ASSERT_TRUE(body.mid(plan, 400).contains(QStringLiteral("oldClipStillLoaded );")));
+}
+
+// adversary 7354a575 A2: the Play-stop drain waits for the prep worker (up to 2 s). The smoke telemetry samples
+// its end time first, so the summary measures the Play interval, and the drain still precedes the core mutations.
+TEST(ClipOpenAbortR6Wiring, PlayStopDrainsThePrepWorkerAfterTheTelemetryEndpoint)
+{
+    const QString source = mainWindowSource();
+    const QString body = bodyBetween(source, QStringLiteral("void MainWindow::on_actionPlay_toggled(bool checked)"),
+                                     QStringLiteral("void MainWindow::on_actionShowZebras_triggered()"));
+    ASSERT_FALSE(body.isEmpty());
+    const QString drain = QStringLiteral("drainPlaybackPrepInFlight( \"play-stop\", 2000 );");
+    ASSERT_EQ(body.count(drain), 1);
+    const int stopBlock = body.indexOf(QStringLiteral("if( !checked )\n    {"));
+    const int finish = body.indexOf(QStringLiteral("finishPlaybackSmokeTelemetry( \"play-stop\" );"), stopBlock);
+    const int drained = body.indexOf(drain);
+    const int debayer = body.indexOf(QStringLiteral("selectDebayerAlgorithm();"), stopBlock);
+    const int dualIso = body.indexOf(QStringLiteral("applyEffectiveDualIsoPlaybackSettings();"), stopBlock);
+    ASSERT_TRUE(stopBlock >= 0);
+    ASSERT_TRUE(finish > stopBlock);
+    ASSERT_TRUE(drained > finish);
+    ASSERT_TRUE(debayer > drained);
+    ASSERT_TRUE(dualIso > drained);
+}
