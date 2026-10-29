@@ -1673,7 +1673,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     # Still running at the lease's end: killed with its tree. Never counted and never re-run (a leg that outlives a whole lease is not retried lease
                     # after lease). Its agent job is asked to cancel too, in case the agent's own bound has not stopped it yet. The batch ends: its lease is over.
                     $cx = $(if ($legJobId) { Request-VenueJobCancel -AgentShare $AgentShare -JobId $legJobId } else { [pscustomobject]@{ state = 'UNKNOWN'; error = 'the leg printed no job id' } })
-                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state }
+                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }   # r6 (adversary r6 A2): a launched row keeps the reading the spread measures heavy keys from
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEASE_EXPIRED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) was still running at the lease's end ($legSec s, bound $legBoundSec s): killed with its process tree; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
@@ -1683,7 +1683,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 if ($legCode -ne 0) {
                     # Invoke-VenueLeg exits 0 whenever it wrote a receipt; non-zero means it died without one. Not evidence: LEG_FAILED, the run goes on.
-                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec }
+                    $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; printedOutcome = $outcome; legExit = $legCode; jobId = $legJobId; counted = $false; legSec = $legSec; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }   # r6 (adversary r6 A2)
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEG_FAILED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "LEG $($leg.name) LEG_FAILED batch=$batchNo exit=$legCode outcome=INVALID printedOutcome=$outcome (the leg exited non-zero: no usable receipt)"
@@ -1719,7 +1719,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 if ($outcome -ceq 'VENUE_NOT_QUIESCENT') {
                     # The leg's own <= 20 % re-check at its start failed: it never played. Retry INSIDE the same lease (on a lost or demoted lease, in the next batch).
                     $b.retries++; $b.legRetries++
-                    $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; thermalWaitSec = $th.doneWaitSec; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef; withdraw = $withdraw })
+                    $b.legs.Add([pscustomobject][ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RETRY'; outcome = $outcome; thermalWaitSec = $th.doneWaitSec; receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; counted = $false; legSec = $legSec; exit75Refusals = $legRef; withdraw = $withdraw; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText })   # r6 (adversary r6 A2)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT receipt=$receipt onLease=$onLease $leaseWhy"
                     if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
@@ -1769,6 +1769,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
         try {
             if ($null -ne $inFlightLeg -and $pending.Contains($inFlightLeg)) {
                 $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; reason = 'BATCH_ERROR'; detail = $b.endDetail; counted = $false }
+                $ith = $legThermal[$inFlightLeg.name]; if ($null -ne $ith) { $row['heatAtProbe'] = $ith.firstHeat; $row['heatAtProbeText'] = $ith.firstHeatText }   # r6 (adversary r6 A2)
                 $b.legs.Add([pscustomobject]$row); Add-Result $inFlightLeg 'LEG_FAILED' $row; $null = $pending.Remove($inFlightLeg)
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $inFlightLeg
             }

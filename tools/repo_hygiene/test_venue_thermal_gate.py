@@ -687,6 +687,18 @@ class ThermalGateRunnerTests(unittest.TestCase):
         self.assertEqual((row["status"], row["heatAtProbe"], row["heatAtLaunch"], b["thermalWaits"], b["thermalSkips"]), ("RAN", "hot", "clear", 1, 0), row)
         self.assertGreaterEqual(row["thermalWaitSec"], 1, row)
 
+    def test_r6p2_a2_every_launched_row_keeps_the_heat_read_before_its_wait(self) -> None:
+        # adversary r6 A2 on dd425d1d: a leg that waited hot, cooled, launched and then failed (LEG_FAILED), or was re-tried (RETRY), recorded no heatAtProbe, so the history fell back to
+        # the clear heat at grant and its predecessor's key was never measured heavy. Every launched row carries the first reading (the one the spread measures heavy keys from).
+        for env, status in ((dict(FAKE_LEG_MODES="exit3"), "LEG_FAILED"), (dict(FAKE_LEG_OUTCOMES="VENUE_NOT_QUIESCENT,PASS"), "RETRY")):
+            with self.subTest(status=status):
+                tvlb.VenueLeaseBatchRunnerTests.setUp(self)
+                self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "120", FAKE_HEAT="9,0", **env)
+                [b] = self.batches()
+                row = [l for l in b["legs"] if l["status"] == status]
+                self.assertEqual(len(row), 1, b["legs"])
+                self.assertEqual(row[0].get("heatAtProbe"), "hot", row[0])
+
     def test_unknown_heat_is_not_gated(self) -> None:
         r = self.run_batch([self.specs[0]], FAKE_HEAT="NA")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
