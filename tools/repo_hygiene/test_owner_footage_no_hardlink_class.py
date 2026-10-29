@@ -459,16 +459,22 @@ LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED = {
     "System.IO.Path.GetFileName", "System.IO.Path.GetFullPath", "System.Runtime.InteropServices", "System.Security.Cryptography.SHA256",
     "System.Security.Cryptography.SHA256.Create", "System.Text",
 }
-# a line comment inside the name counts (iter 2). r17 (CodeQL check-run 123193275334, inefficient regular expression): a comment runs to its newline and
-# takes it, so each separator run has exactly one parse; r16's `//[^\n]*` could stop anywhere, so a run of '//' split many ways inside the outer '+'
-_PAYLOAD_QUALIFIED_RE = re.compile(r"\b(?:System|Microsoft)(?:(?:\s|//[^\n]*\n)*\.(?:\s|//[^\n]*\n)*\w+)+")
+# a line comment inside the name counts (iter 2). r17 (CodeQL check-run 123193275334, inefficient regular expression): a comment runs to its line end and
+# takes it, so each separator run has exactly one parse; r16's `//[^\n]*` could stop anywhere, so a run of '//' split many ways inside the outer '+'.
+# r17 iter 1 (adversary 4b76fdba-A1): a C# line ends at CR, LF, NEL, LS or PS, so a comment ends at any of them (a CR-only line end hid the name)
+_CS_LINE_END = "\r\n\x85\u2028\u2029"
+_CS_LINE_COMMENT = f"//[^{_CS_LINE_END}]*"
+_PAYLOAD_QUALIFIED_RE = re.compile(rf"\b(?:System|Microsoft)(?:(?:\s|{_CS_LINE_COMMENT}[{_CS_LINE_END}])*\.(?:\s|{_CS_LINE_COMMENT}[{_CS_LINE_END}])*\w+)+")
+# r17 iter 1 (adversary 4b76fdba-A2): a '#' line is a C# preprocessor directive, which can sit between the parts of a qualified name (System, #if true, #endif,
+# .IO.File) or choose the text that compiles. The payload has none, so any '#' in it is denied rather than modelled as a separator.
+_PAYLOAD_DIRECTIVE_RE = re.compile(r"#")
 # the r16 pattern, kept only as the reference the r17 rewrite is compared with; it is exponential, so it is only ever run in a child under a timeout
 _PAYLOAD_QUALIFIED_R16_PATTERN = r"\b(?:System|Microsoft)(?:(?:\s|//[^\n]*)*\.(?:\s|//[^\n]*)*\w+)+"
 _FINDITER_CHILD = (
     "import json, re, sys, time\n"
-    "texts = json.load(sys.stdin)\n"
+    "request = json.load(sys.stdin)\n"
     "started = time.perf_counter()\n"
-    "found = [[[m.start(), m.end(), m.group(0)] for m in re.finditer(sys.argv[1], text)] for text in texts]\n"
+    "found = [[[m.start(), m.end(), m.group(0)] for m in re.finditer(request['pattern'], text)] for text in request['texts']]\n"
     "print(json.dumps({'found': found, 'seconds': time.perf_counter() - started}))\n")
 _PAYLOAD_USING_RE = re.compile(r"^\s*using\b(?!\s*\()[^\n]*", re.MULTILINE)
 # common parameters that write a variable by NAME (-OutVariable guard would put a pipeline's output into a call variable)
@@ -500,7 +506,8 @@ _PLAIN_ARGUMENT_RE = re.compile(r"[A-Za-z0-9_ \t()]+")
 def _finditer_in_child(pattern: str, texts: list[str], timeout: float) -> dict:
     """{'found': [[start, end, text] per match] per text, 'seconds': search time} for `pattern`, searched in a child so a pattern that backtracks
     exponentially is killed at `timeout` instead of wedging the suite (r17)."""
-    proc = subprocess.run([sys.executable, "-I", "-c", _FINDITER_CHILD, pattern], input=json.dumps(texts).encode("ascii"), capture_output=True, timeout=timeout)
+    proc = subprocess.run([sys.executable, "-I", "-c", _FINDITER_CHILD], input=json.dumps({"pattern": pattern, "texts": texts}).encode("ascii"),
+                          capture_output=True, timeout=timeout)
     if proc.returncode != 0:
         raise AssertionError(f"the finditer child exited {proc.returncode}: {proc.stderr.decode('utf-8', 'replace')[-500:]}")
     return json.loads(proc.stdout)
@@ -777,7 +784,7 @@ def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
         body, at = payload.group("body"), payload.start("body")
         bodies.append(body)
         for regex, what in ((_VERBATIM_IDENTIFIER_RE, "a verbatim identifier"), (_LITERAL_JOIN_RE, "a string built from pieces"),
-                            (_PAYLOAD_PROCESS_RE, "a process start or run-time binding")):
+                            (_PAYLOAD_PROCESS_RE, "a process start or run-time binding"), (_PAYLOAD_DIRECTIVE_RE, "a preprocessor directive")):
             for match in regex.finditer(body):
                 violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: {what} inside an Add-Type payload: {match.group(0)}")
         attributes = [match.group(0) for match in _PAYLOAD_DLLIMPORT_ATTRIBUTE_RE.finditer(body)]
@@ -790,7 +797,7 @@ def _lane_dirty_save_text_violations(text: str) -> tuple[list[str], list[str]]:
         if usings != LANE_DIRTY_SAVE_PAYLOAD_USINGS:
             violations.append(f"the Add-Type payload's using directives are not exactly {LANE_DIRTY_SAVE_PAYLOAD_USINGS}: {usings}")
         for match in _PAYLOAD_QUALIFIED_RE.finditer(body):
-            if re.sub(r"//[^\n]*|\s+", "", match.group(0)) not in LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED:
+            if re.sub(rf"{_CS_LINE_COMMENT}|\s+", "", match.group(0)) not in LANE_DIRTY_SAVE_PAYLOAD_QUALIFIED:
                 violations.append(f"{text.count(chr(10), 0, at + match.start()) + 1}: a process start or run-time binding inside an Add-Type payload "
                                   f"(a qualified name outside the pinned set): {match.group(0)}")
     # the census proper runs on the text C# compiles: every escape resolved
@@ -1335,13 +1342,41 @@ class NoHardLinkCreationTests(unittest.TestCase):
     def test_the_qualified_name_pattern_is_linear_on_the_codeql_pump_strings(self) -> None:
         # r17 (CodeQL check-run 123193275334): the r16 pattern ran past 20 s on N=24 of either pump (run red.txt); the rewrite finishes N=5000 at once.
         # Run in a child too, so a regression fails at the timeout instead of hanging the suite.
-        pumps = ["System" + "//" * 5000 + "x", "System" + ". //" * 5000, "System" + "// x\n" * 5000 + "x"]
+        pumps = ["System" + "//" * 5000 + "x", "System" + ". //" * 5000, "System" + "// x\n" * 5000 + "x", "System" + "//\r" * 5000 + "x",
+                 "System" + "// x\r\n" * 5000 + "x"]
         result = _finditer_in_child(_PAYLOAD_QUALIFIED_RE.pattern, pumps, timeout=60)
         self.assertLess(result["seconds"], 1.0, result["seconds"])
-        self.assertEqual(result["found"], [[], [], []])
-        # control: a comment that runs to its newline still sits inside a name, and the census still strips it to the name C# compiles
-        name = _PAYLOAD_QUALIFIED_RE.search("x = System// a .b\n// c\n . IO // d\n.File.Create(p);").group(0)
-        self.assertEqual(re.sub(r"//[^\n]*|\s+", "", name), "System.IO.File.Create")
+        self.assertEqual(result["found"], [[]] * len(pumps))
+        # control: a comment that runs to its line end (LF, CR, CRLF or LS) still sits inside a name, and the census strips it to the name C# compiles
+        name = _PAYLOAD_QUALIFIED_RE.search("x = System// a .b\n// c\r . IO // d\r\n.File// e\u2028.Create(p);").group(0)
+        self.assertEqual(re.sub(rf"{_CS_LINE_COMMENT}|\s+", "", name), "System.IO.File.Create")
+
+    def test_the_lane_dirty_saver_census_rejects_what_the_r17_adversary_compiled_past_it(self) -> None:
+        # r17 iter 1 (adversary 4b76fdba): each insertion returned [] while Roslyn parsed System.IO.File.WriteAllText. Built from the saver's raw bytes, so a
+        # CR stays a CR (read_text would turn it into LF).
+        text = LANE_DIRTY_SAVE.read_bytes().decode("utf-8")
+        anchor = "public static string Identity(string path) {"
+        self.assertIn(anchor, text)
+        write = '.File.WriteAllText("C:/fixture/wt/src/a.txt", "x");'
+        rows = {
+            "A1 a CR ends the comment": ("\nSystem// gap\r.IO" + write, "a qualified name outside the pinned set"),
+            "A1 a CR-only line between the parts": ("\nSystem\r.IO" + write, "a qualified name outside the pinned set"),
+            "A1 a CR after the dot": ("\nSystem.// gap\rIO" + write, "a qualified name outside the pinned set"),
+            "A1 a CRLF ends the comment": ("\nSystem// gap\r\n.IO" + write, "a qualified name outside the pinned set"),
+            "A1 a NEL ends the comment": ("\nSystem// gap\x85.IO" + write, "a qualified name outside the pinned set"),
+            "A1 an LS ends the comment": ("\nSystem// gap\u2028.IO" + write, "a qualified name outside the pinned set"),
+            "A1 a PS ends the comment": ("\nSystem// gap\u2029.IO" + write, "a qualified name outside the pinned set"),
+            "A2 directives before the dot": ("\nSystem\n#if true\n#endif\n.IO" + write, "a preprocessor directive"),
+            "A2 directives after the dot": ("\nSystem.\n#if true\n#endif\nIO" + write, "a preprocessor directive"),
+            "A2 a directive after a CR": ("\nSystem\r#if true\r#endif\r.IO" + write, "a preprocessor directive"),
+            "A2 a #region between the parts": ("\nSystem\n  #region x\n  #endregion\n.IO" + write, "a preprocessor directive"),
+        }
+        mutants = {name: text.replace(anchor, anchor + inserted, 1) for name, (inserted, _) in rows.items()}
+        found = dict(zip(rows, lane_dirty_save_violations_many(list(mutants.values()))))
+        missed = [name for name, (_, expected) in rows.items() if mutants[name] == text or not any(expected in violation for violation in found[name])]
+        self.assertEqual(missed, [], {name: found[name] for name in missed})
+        # control: the saver as it is has no '#' in its payload and stays clean
+        self.assertEqual(lane_dirty_save_violations(LANE_DIRTY_SAVE.read_bytes()), [])
 
     def _assert_r15_rows_rejected_quietly(self) -> None:
         text = LANE_DIRTY_SAVE.read_text(encoding="utf-8")
