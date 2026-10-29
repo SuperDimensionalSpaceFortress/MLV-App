@@ -185,7 +185,11 @@ function Get-VenueHeavyLegKeys {
         if ([string]$r.heat -ceq 'hot' -and $null -ne $lastRanKey) { $heavy[$lastRanKey] = 1 + $(if ($heavy.Contains($lastRanKey)) { $heavy[$lastRanKey] } else { 0 }) }
         # adversary r1b A5: the predecessor is the last leg that LAUNCHED (RAN, LEG_FAILED, LEASE_EXPIRED); a row of unknown identity (a $null key) is a barrier, so
         # heat is never charged across it. A leg that never launched (THERMAL_HOT_SKIPPED, a RETRY whose own re-check failed) leaves the predecessor as it was.
-        if ([string]$r.status -cnotin @('THERMAL_HOT_SKIPPED', 'RETRY')) { $lastRanKey = $(if ($r.key) { [string]$r.key } else { $null }) }
+        # r6 (adversary r6 A2): only a row KNOWN to have launched becomes the predecessor; one known never to have launched (NOT_RUN too) is passed over, and any other status (null,
+        # empty, one this reader does not know) may or may not have launched, so it is a barrier like a row of unknown identity: heat after it is charged to nobody
+        $st = [string]$r.status
+        if ($st -cin @('RAN', 'LEG_FAILED', 'LEASE_EXPIRED')) { $lastRanKey = $(if ($r.key) { [string]$r.key } else { $null }) }
+        elseif ($st -cnotin @('THERMAL_HOT_SKIPPED', 'RETRY', 'NOT_RUN')) { $lastRanKey = $null }
     }
     $heavy
 }

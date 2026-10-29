@@ -344,6 +344,22 @@ class ThermalGateModuleTests(unittest.TestCase):
         self.assertTrue(after[0].lstrip().startswith("$captured = @(& $pwshExe @qArgs *>&1"), after[0])
         self.assertIn("Set-Content -LiteralPath $out -Value $captured", fn)
 
+    def test_r6p1_a2_only_a_launched_row_is_a_heavy_predecessor_and_an_unknown_status_is_a_barrier(self) -> None:
+        # adversary r6 A2 on 4dbd043e: a history row with status null (read as '') or NOT_RUN was taken as the launched predecessor, so the hot leg after it made its key heavy
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="thermal-status-"))
+        for status in (None, "NOT_RUN", "", "SOMETHING_NEW"):
+            with self.subTest(status=status):
+                (d / "batches.jsonl").write_text(json.dumps({"schema": "mlv-app/venue-lease-batch/v1", "batch": 1, "token": "t1", "legs": [
+                    {"name": "01-a-cpu-A", "backend": "cpu", "arm": "A", "status": status, "heatAtProbe": "clear"},
+                    {"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "RAN", "heatAtProbe": "hot"}]}) + "\n", encoding="utf-8")
+                got = ps_json(f"$h = Read-VenueLegHeatHistory -RunDir @('{d}'); [pscustomobject](Get-VenueHeavyLegKeys -Rows $h.rows)")
+                self.assertEqual(got, {}, f"a row that is not known to have launched made its key heavy: {got}")
+        # controls: each launched status is a predecessor; a known never-launched row (a thermal skip, a retry, NOT_RUN) is passed over to the launched row before it
+        rows = lambda st: f"[pscustomobject]@{{ batch = '1'; key = 'a|cpu'; status = '{st}'; heat = 'clear' }}, [pscustomobject]@{{ batch = '1'; key = 'x|cpu'; status = 'NOT_RUN'; heat = 'clear' }}, [pscustomobject]@{{ batch = '1'; key = 'b|cpu'; status = 'RAN'; heat = 'hot' }}"  # noqa: E731
+        for st in ("RAN", "LEG_FAILED", "LEASE_EXPIRED"):
+            self.assertEqual(ps_json(f"[pscustomobject](Get-VenueHeavyLegKeys -Rows @({rows(st)}))"), {"a|cpu": 1}, st)
+
     def test_r6_a3_a_positive_infinity_mean_reaches_the_gate_as_hot_without_the_raw_json(self) -> None:
         # adversary r5 A3 on 09f9f657: a feed of 60 rows '2026,a,b,Infinity,10,No,No' is hot to the agent (+Infinity >= 88). The probe's JSON round trip turns the mean into the string
         # 'Infinity', the display printed 'mean=n/a' with no mean_exact, and with the raw JSON unwritable (a sharing violation) the gate read unknown and ran the leg.
