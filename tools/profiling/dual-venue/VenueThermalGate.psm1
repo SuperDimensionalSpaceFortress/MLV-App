@@ -62,11 +62,12 @@ function ConvertFrom-VenueProbeHeatLine {
     $line = @($Lines | Where-Object { $_ -match '^\s*tele heat ' }) | Select-Object -Last 1
     $none = [pscustomobject]@{ heat = 'unknown'; throttled = $null; window = $null; meanC = $null; text = $(if ($line) { ([string]$line).Trim() } else { 'no tele heat line' }); source = 'none' }
     if (-not $line) { return $none }
-    $m = [regex]::Match([string]$line, '\smean=([0-9]+(?:[.,][0-9]+)?)C\s+throttled=([0-9]+)/([0-9]+)(?:\s|$)')
+    # r3 pass 2 A4: the feed parser accepts signed temperatures (a sensor's -1 error value), so the mean may carry a sign: unsigned only, the line read unknown while throttled=7/60 is hot
+    $m = [regex]::Match([string]$line, '\smean=(-?[0-9]+(?:[.,][0-9]+)?)C\s+throttled=([0-9]+)/([0-9]+)(?:\s|$)')
     if (-not $m.Success) { return $none }
     $mean = 0.0; $thr = 0; $win = 0
     # r3 A2: the display mean is rounded to 0.1 C (87.96 prints 88.0): a probe that also prints mean_exact=<R> gives the exact value, which is what the heat rule is applied to
-    $mx = [regex]::Match([string]$line, '\smean_exact=([0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?)(?:\s|$)')
+    $mx = [regex]::Match([string]$line, '\smean_exact=(-?[0-9]+(?:[.,][0-9]+)?(?:[eE][-+]?[0-9]+)?)(?:\s|$)')
     $meanText = $(if ($mx.Success) { $mx.Groups[1].Value } else { $m.Groups[1].Value })
     if (-not [double]::TryParse(($meanText -replace ',', '.'), [System.Globalization.NumberStyles]::Float, $script:Inv, [ref]$mean)) { return $none }
     if (-not [int]::TryParse($m.Groups[2].Value, [System.Globalization.NumberStyles]::None, $script:Inv, [ref]$thr)) { return $none }   # advisory A10: an overflow is unknown, never a throw
@@ -227,6 +228,15 @@ function Get-VenueThermalSpreadOrder {
     if ($Items.Count -ne $Heavy.Count) { throw "Get-VenueThermalSpreadOrder: $($Items.Count) items but $($Heavy.Count) heavy flags" }
     $left = [System.Collections.Generic.List[int]]::new(); for ($i = 0; $i -lt $Items.Count; $i++) { $left.Add($i) }
     $h = @($Heavy | Where-Object { $_ }).Count; $l = $Items.Count - $h
+    # r3 pass 2 A2: with more heavy items than light ones plus one, the EXCESS (the last heavy items in the given order) is set aside and appended at the end, so the rest is spread
+    # completely and the unavoidable adjacencies are exactly H - L - 1 (the greedy pick used to spend them early: L1,H1,H2,H3 gave two where H1,L1,H2,H3 needs one)
+    $defer = [System.Collections.Generic.List[int]]::new()
+    $excess = $h - ($l + 1)
+    if ($excess -gt 0) {
+        $heavyAt = @(for ($i = 0; $i -lt $Items.Count; $i++) { if ($Heavy[$i]) { $i } })
+        foreach ($i in @($heavyAt | Select-Object -Last $excess)) { $defer.Add([int]$i); [void]$left.Remove([int]$i) }
+        $h -= $excess
+    }
     $out = [System.Collections.Generic.List[int]]::new(); $lastHeavy = $false
     while ($left.Count -gt 0) {
         $pick = -1
@@ -241,6 +251,7 @@ function Get-VenueThermalSpreadOrder {
         if ($Heavy[$pick]) { $h-- } else { $l-- }
         $lastHeavy = $Heavy[$pick]
     }
+    foreach ($i in $defer) { $out.Add($i) }
     $newHeavy = [bool[]]@($out | ForEach-Object { $Heavy[$_] })
     [pscustomobject]@{ items = @($out | ForEach-Object { , $Items[$_] }); heavy = $newHeavy; heavyAdjacent = (Measure-VenueHeavyAdjacency -Heavy $newHeavy); heavyAdjacentBefore = (Measure-VenueHeavyAdjacency -Heavy $Heavy) }
 }

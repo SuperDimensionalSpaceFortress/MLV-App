@@ -211,7 +211,8 @@ $legPlanMode = ($PSCmdlet.ParameterSetName -ceq 'Plan')
 # -PlanOrder binds case-insensitively; every later test of it is case-sensitive, so name the canonical spelling once (sol r3 A1)
 $PlanOrder = @('AsGiven', 'Interleave', 'ThermalSpread') | Where-Object { $_ -ieq $PlanOrder } | Select-Object -First 1
 $HeatFrom = @($HeatFrom | Where-Object { $_ })
-$HeatFrom = @($HeatFrom | ForEach-Object { if (Test-Path -LiteralPath $_) { $_ } else { $_ -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+# r3 pass 2 A5: a path Test-Path cannot probe (a NUL in it) is not an existing path, never a throw
+$HeatFrom = @($HeatFrom | ForEach-Object { $p = $_; $isPath = $(try { [bool](Test-Path -LiteralPath $p) } catch { $false }); if ($isPath) { $p } else { $p -split ',' } } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 if ($HeatFrom.Count -gt 0 -and $PlanOrder -cne 'ThermalSpread') { Stop-Usage '-HeatFrom is read only by -PlanOrder ThermalSpread' }
 if (-not $legPlanMode -and (($LegSpec.Count -gt 0) -eq [bool]$LegSet)) { Stop-Usage 'name the legs with exactly one of -LegSpec <path>... or -LegSet <name>' }
 if (-not $AgentShare) { $AgentShare = try { [string](([IO.File]::ReadAllText((Join-Path $here 'venues.json')) | ConvertFrom-Json).venues.$Venue.agentShare) } catch { '' } }
