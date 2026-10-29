@@ -196,7 +196,7 @@ TEST(ClipOpenAbortCallersWiring, RefusedImportLeavesTheSessionWithoutAReceiptSav
     ASSERT_TRUE(opened > refused);
     ASSERT_TRUE(corrupt > opened);
     const QString branch = body.mid(refused, opened - refused);
-    ASSERT_TRUE(branch.contains(QStringLiteral("m_pModel->removeRow( SESSION_CLIP_COUNT - 1, QModelIndex() );")));
+    ASSERT_TRUE(branch.contains(QStringLiteral("m_pModel->removeRow( importedRow, QModelIndex() );")));
     ASSERT_TRUE(branch.contains(QStringLiteral(
         "if( previousActive >= 0 && previousActive < SESSION_CLIP_COUNT ) SET_ACTIVE_CLIP_IDX( previousActive );")));
     ASSERT_FALSE(branch.contains(QStringLiteral("setReceipt(")));
@@ -408,7 +408,7 @@ void deleteActiveClipModel(DetachingSessionModel & s, int openResult)
     if (openResult)
     {
         const ShowFileOpenFailurePlan plan = showFileOpenFailurePlan(
-            openResult, nearest, oldActive, 1, static_cast<int>(s.receipts.size()), false);
+            openResult, nearest, oldActive, 1, static_cast<int>(s.receipts.size()), false, false); // A is loaded, not B
         if (plan.restoreOldActive) s.active = oldActive;
         if (plan.detachSliders) s.detached = true;
     }
@@ -435,7 +435,7 @@ TEST(ClipOpenAbortR4, RefusedOpenAfterDeletingTheActiveClipNeverSavesItsSlidersI
     saveSlidersModel(s); // saveSession -> setReceipt( ACTIVE_RECEIPT )
     ASSERT_EQ(s.receipts[0], 22);
 
-    const ShowFileOpenFailurePlan sameRow = showFileOpenFailurePlan(kClipOpenAbortedPrepBusy, 0, 0, 1, 1, false);
+    const ShowFileOpenFailurePlan sameRow = showFileOpenFailurePlan(kClipOpenAbortedPrepBusy, 0, 0, 1, 1, false, false);
     ASSERT_TRUE(sameRow.detachSliders);
     ASSERT_TRUE(sameRow.retryReopenLater); // B is opened once more, later, which re-attaches the sliders
 }
@@ -528,7 +528,7 @@ TEST(ClipOpenAbortR4Wiring, PasteAndResetWhileDetachedNeverTouchTheLoadedClip)
     const QString importBody = bodyBetween(source, QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"),
                                            QStringLiteral("int MainWindow::openMlvForPreview(QString fileName)"));
     ASSERT_TRUE(importBody.contains(QStringLiteral(
-        "if( !clipOpenFailureKeptRetainedClip( ret ) ) m_slidersDetachedFromReceipt = true;")));
+        "if( !keptPrevious ) m_slidersDetachedFromReceipt = true;")));
 }
 
 // A3: the retry budget is per job: abort, completion and a new batch all reset it, and a retry timer from an
@@ -947,7 +947,14 @@ TEST(ClipOpenAbortR5Wiring, EveryImportCallerShowsTheLastRowOnlyFromTheBatchOutc
     ASSERT_TRUE(warning >= 0);
     ASSERT_TRUE(refused > warning);
     ASSERT_TRUE(importBody.contains(QStringLiteral(
-        "if( !clipOpenFailureKeptRetainedClip( ret ) && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );")));
+        "if( !keptPrevious && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );")));
+    // r6 (adversary e11815a5 A1): a FileOpen inside this import's event pumps can append and show another clip;
+    // the refused clip's own row is removed, and the sliders stay attached only while previousActive is loaded
+    const int lookup = importBody.indexOf(QStringLiteral("if( GET_CLIP( i )->getPath() == fileName ) { importedRow = i; break; }"));
+    const int removed = importBody.indexOf(QStringLiteral("m_pModel->removeRow( importedRow, QModelIndex() );"));
+    ASSERT_TRUE(lookup >= 0 && removed > lookup);
+    ASSERT_TRUE(importBody.contains(QStringLiteral(
+        "const bool keptPrevious = clipOpenFailureKeptRetainedClip( ret ) && loadedClipIsRow( previousActive );")));
     ASSERT_TRUE(importBody.contains(QStringLiteral("    }\n    return true;\n}")));
 
     const QString show = QStringLiteral("if( SESSION_CLIP_COUNT && imports.showLastRow() ) showFileInEditor( SESSION_CLIP_COUNT - 1 );");
@@ -1019,6 +1026,22 @@ TEST(ClipOpenAbortR6, AClipShownDuringAFailedOpensDialogIsNeverSavedIntoTheResto
     ASSERT_TRUE(prep.retryReopenLater);
 }
 
+// adversary e11815a5 A2: the active row A is opened again and fails with an ordinary error that keeps A loaded
+// (oldActive == row). The sliders still describe A, so a later edit is saved into A's receipt.
+TEST(ClipOpenAbortR6, ASameRowFailureThatKeepsTheClipLoadedLeavesTheSlidersAttached)
+{
+    const ShowFileOpenFailurePlan kept = showFileOpenFailurePlan(kMlvErrCorrupted, 0, 0, 1, 1, false, true);
+    ASSERT_FALSE(kept.detachSliders);
+    ASSERT_FALSE(kept.restoreOldActive);
+    ASSERT_FALSE(kept.reopenOld);
+    ASSERT_FALSE(showFileOpenFailurePlan(kClipOpenAbortedPrepBusy, 0, 0, 1, 1, false, true).detachSliders);
+    // the delete path (the loaded clip is the removed one) and a freed clip still detach
+    ASSERT_TRUE(showFileOpenFailurePlan(kMlvErrCorrupted, 0, 0, 1, 1, false, false).detachSliders);
+    ASSERT_TRUE(showFileOpenFailurePlan(kClipOpenAbortedPrepBusyAfterFree, 0, 0, 1, 1, false, true).detachSliders);
+    // a never-loaded row has no receipt the sliders describe
+    ASSERT_TRUE(showFileOpenFailurePlan(kMlvErrCorrupted, 0, 0, 1, 1, true, true).detachSliders);
+}
+
 TEST(ClipOpenAbortR6Wiring, ShowFileInEditorTellsThePlanWhetherTheOldClipIsStillLoaded)
 {
     const QString source = mainWindowSource();
@@ -1026,8 +1049,7 @@ TEST(ClipOpenAbortR6Wiring, ShowFileInEditorTellsThePlanWhetherTheOldClipIsStill
                                      QStringLiteral("bool MainWindow::addClipToExportQueue(int row, QString fileName)"));
     ASSERT_FALSE(body.isEmpty());
     const int open = body.indexOf(QStringLiteral("const int openResult = openMlv( GET_CLIP( row )->getPath() );"));
-    const int loadedIsOld = body.indexOf(QStringLiteral(
-        "m_loadedClipFileName == GET_CLIP( oldActive )->getPath() || m_loadedClipFileName == GET_RECEIPT( oldActive )->fileName()"));
+    const int loadedIsOld = body.indexOf(QStringLiteral("const bool oldClipStillLoaded = loadedClipIsRow( oldActive );"));
     const int plan = body.indexOf(QStringLiteral("showFileOpenFailurePlan("));
     ASSERT_TRUE(open >= 0);
     ASSERT_TRUE(loadedIsOld > open);   // read after openMlv returns: a re-entrant open has already run

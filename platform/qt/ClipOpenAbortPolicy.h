@@ -132,8 +132,11 @@ inline ShowFileOpenFailurePlan showFileOpenFailurePlan( int openResult, int row,
     plan.reopenOld = plan.reselectOld && !oldNeverLoaded && !clipOpenAbortKeptRetainedClip( openResult );
     // r6 (adversary 7354a575 A1): an open that ran inside the failed open's error dialog (a FileOpen import)
     // loaded another clip, so the sliders describe that clip and not the old row, whatever openResult says.
-    plan.detachSliders = !( plan.restoreOldActive && !oldNeverLoaded && clipOpenFailureKeptRetainedClip( openResult )
-                            && oldClipStillLoaded );
+    // r6 (adversary e11815a5 A2): reopening the active row itself (oldActive == row) that fails but keeps its
+    // clip loaded leaves the sliders describing that row; the delete path's row is not the loaded clip.
+    const bool oldIsRowItself = oldActive >= 0 && oldActive < clipCount && oldActive == row;
+    plan.detachSliders = !( ( plan.restoreOldActive || oldIsRowItself ) && !oldNeverLoaded
+                            && clipOpenFailureKeptRetainedClip( openResult ) && oldClipStillLoaded );
     plan.retryReopenLater = plan.detachSliders && !plan.reopenOld && clipOpenAbortedForPrep( openResult );
     return plan;
 }

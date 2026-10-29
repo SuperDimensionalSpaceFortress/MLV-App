@@ -11058,14 +11058,21 @@ bool MainWindow::importNewMlv(QString fileName)
         {
             // r3 (adversary A1): nothing of the new clip was loaded. It leaves the session without the
             // corrupt-file dialog and without a receipt save, and the clip the sliders describe is active again.
-            m_pModel->removeRow( SESSION_CLIP_COUNT - 1, QModelIndex() );
+            // r6 (adversary e11815a5 A1): a FileOpen inside addFileToSession's or the open's event pump can append
+            // and show another clip, so the refused clip's own row is removed, not the last one.
+            int importedRow = SESSION_CLIP_COUNT - 1;
+            for( int i = 0; i < SESSION_CLIP_COUNT; i++ )
+                if( GET_CLIP( i )->getPath() == fileName ) { importedRow = i; break; }
+            m_pModel->removeRow( importedRow, QModelIndex() );
             if( previousActive >= 0 && previousActive < SESSION_CLIP_COUNT ) SET_ACTIVE_CLIP_IDX( previousActive );
             else if( SESSION_CLIP_COUNT == 0 ) deleteSession();
             // r4 (adversary A1 sibling): refused after the free, an empty object is loaded, not previousActive.
-            if( !clipOpenFailureKeptRetainedClip( ret ) ) m_slidersDetachedFromReceipt = true;
+            // r6: so is any clip that opened inside this import; the sliders then describe no restored receipt.
+            const bool keptPrevious = clipOpenFailureKeptRetainedClip( ret ) && loadedClipIsRow( previousActive );
+            if( !keptPrevious ) m_slidersDetachedFromReceipt = true;
             // r5 (adversary 4b41aa22 A1): the caller shows no other row, so the restored clip is reopened later
             // (a no-op once any other clip opens first).
-            if( !clipOpenFailureKeptRetainedClip( ret ) && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );
+            if( !keptPrevious && SESSION_CLIP_COUNT > 0 ) retryClipReopenAfterPrepAbort( SESSION_ACTIVE_CLIP_ROW );
             listViewSessionUpdate();
             QMessageBox::warning( this, tr( "Import MLV" ),
                                   tr( "%1 was not imported because playback was still preparing a frame. Import it again." )
@@ -18951,8 +18958,7 @@ int MainWindow::showFileInEditor(int row)
         // before anything saves a receipt; a clip a busy prep task kept loaded is not reopened.
         // r6 (adversary 7354a575 A1): openMlv's error dialog runs an event loop, and a FileOpen there can load
         // another clip; the sliders then describe that clip, so they are detached before the old row is reopened.
-        const bool oldClipStillLoaded = oldActive >= 0 && oldActive < SESSION_CLIP_COUNT
-            && ( m_loadedClipFileName == GET_CLIP( oldActive )->getPath() || m_loadedClipFileName == GET_RECEIPT( oldActive )->fileName() );
+        const bool oldClipStillLoaded = loadedClipIsRow( oldActive );
         const ShowFileOpenFailurePlan plan = showFileOpenFailurePlan(
             openResult, row, oldActive, selectedClipsList().size(), SESSION_CLIP_COUNT,
             oldActive >= 0 && oldActive < SESSION_CLIP_COUNT && GET_RECEIPT( oldActive )->wasNeverLoaded(),
@@ -23965,6 +23971,15 @@ void MainWindow::markClipOpenSucceeded( void )
 // r5 (Dot 29eac4d5 A1): the one ownership predicate for every write that goes straight into the active receipt
 // (around setReceipt). It holds while the sliders are attached (the r4 state) and the file the last successful
 // open loaded is the active row's. A refused write is a no-op, logged once per clip-open generation.
+// r6 (adversary 7354a575 A1, e11815a5 A1): whether the loaded clip is the one in session row `row`. An open
+// that ran inside another open's event pump (a FileOpen during a dialog) can have replaced it.
+bool MainWindow::loadedClipIsRow( int row ) const
+{
+    if( row < 0 || row >= SESSION_CLIP_COUNT || !m_fileLoaded || m_pMlvObject == nullptr || m_loadedClipFileName.isEmpty() )
+        return false;
+    return m_loadedClipFileName == GET_CLIP( row )->getPath() || m_loadedClipFileName == GET_RECEIPT( row )->fileName();
+}
+
 bool MainWindow::receiptOwnedByLoadedClip( const char *site )
 {
     const bool hasActiveReceipt = SESSION_CLIP_COUNT > 0 && SESSION_ACTIVE_CLIP_ROW >= 0

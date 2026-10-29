@@ -1892,6 +1892,7 @@ private:
     void resetReceiptWithDefault( ReceiptSettings *receipt );
     int showFileInEditor(int row);
     void markClipOpenSucceeded( void );
+    bool loadedClipIsRow( int row ) const;
     bool receiptOwnedByLoadedClip( const char *site );
     void retryClipReopenAfterPrepAbort( int row );
     void scheduleClipReopenRetry( int row, unsigned long long generation, int deferrals );
