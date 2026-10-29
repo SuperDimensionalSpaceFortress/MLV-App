@@ -426,11 +426,32 @@ class ThermalGateModuleTests(unittest.TestCase):
         # controls: on the batch's lease the grant and the sidecar are read; a row with no onLease field (LEG_FAILED, older receipts) keeps the sidecar read
         history({**off, "jobLease": "L1", "onLease": True, "class": "QUIET_PRELOAD_OK", "heatAtGrant": "hot"})
         self.assertEqual(run()["heat"], ["clear", "hot"])
-        history({"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "LEG_FAILED", "jobId": "j2", "heatAtProbe": "unknown"})
+        # r8 (adversary r8 A2 on 598b6e6b): a row with no onLease field (LEG_FAILED, LEASE_EXPIRED) takes the sidecar's heat only when the sidecar shows the job on the
+        # batch's lease, the runner's own onLease rule (Invoke-VenueLeaseBatch.ps1: jobLease -ceq leaseId and slotContinuity not 'lost')
+        failed = {"name": "02-b-cpu-A", "backend": "cpu", "arm": "A", "status": "LEG_FAILED", "jobId": "j2", "heatAtProbe": "unknown"}
+        history(failed)
+        (d / "agent-result-j2.json").write_text(json.dumps({"admission": {"heat": "hot", "leaseBatch": {"leaseId": "L1"}, "slotContinuity": "kept"}}), encoding="utf-8")
         self.assertEqual(run()["heat"], ["clear", "hot"])
+        for adm in ({"heat": "hot", "leaseBatch": {"leaseId": "L2"}, "slotContinuity": "kept"}, {"heat": "hot", "leaseBatch": {"leaseId": "L1"}, "slotContinuity": "lost"},
+                    {"heat": "hot"}, {"heat": "hot", "leaseBatch": None}, {"heat": "hot", "leaseBatch": {"leaseId": "l1"}}):
+            (d / "agent-result-j2.json").write_text(json.dumps({"admission": adm}), encoding="utf-8")
+            got = run()
+            self.assertEqual((got["heat"], got["heavy"]), (["clear", "unknown"], []), adm)
+        # a recorded grant heat on a row with no onLease field is not proof of the batch's lease either
+        history({**failed, "heatAtGrant": "hot"})
+        self.assertEqual(run()["heat"], ["clear", "unknown"])
         # the probe's own reading is the batch lease's, so it is kept whatever the job's lease
         history({**off, "heatAtProbe": "hot"})
         self.assertEqual(run()["heat"], ["clear", "hot"])
+
+    def test_r8_a3_a_row_with_no_status_or_key_property_is_a_barrier_not_a_throw(self) -> None:
+        # adversary r8 advisory A3: Get-VenueHeavyLegKeys read .status/.key/.heat/.batch under strict mode, so a row missing one threw instead of being a barrier
+        got = ps_json("[pscustomobject](Get-VenueHeavyLegKeys -Rows @([pscustomobject]@{ batch = '1'; key = 'a|cpu'; status = 'RAN'; heat = 'clear' }, "
+                      "[pscustomobject]@{ batch = '1'; key = 'z|cpu'; heat = 'clear' }, [pscustomobject]@{ batch = '1'; key = 'b|cpu'; status = 'RAN'; heat = 'hot' }))")
+        self.assertEqual(got, {}, "a row with no status is not known to have launched: it is a barrier")
+        got = ps_json("[pscustomobject](Get-VenueHeavyLegKeys -Rows @([pscustomobject]@{ batch = '1'; key = 'a|cpu'; status = 'RAN'; heat = 'clear' }, "
+                      "[pscustomobject]@{ batch = '1'; status = 'RAN' }, [pscustomobject]@{ key = 'b|cpu'; status = 'RAN'; heat = 'hot' }))")
+        self.assertEqual(got, {}, got)
 
     def test_r6_a3_a_positive_infinity_mean_reaches_the_gate_as_hot_without_the_raw_json(self) -> None:
         # adversary r5 A3 on 09f9f657: a feed of 60 rows '2026,a,b,Infinity,10,No,No' is hot to the agent (+Infinity >= 88). The probe's JSON round trip turns the mean into the string

@@ -181,14 +181,16 @@ function Get-VenueHeavyLegKeys {
     $lastBatch = $null; $lastRanKey = $null
     foreach ($r in $Rows) {
         if ($null -eq $r) { continue }
-        if ([string]$r.batch -cne [string]$lastBatch) { $lastBatch = [string]$r.batch; $lastRanKey = $null }
-        if ([string]$r.heat -ceq 'hot' -and $null -ne $lastRanKey) { $heavy[$lastRanKey] = 1 + $(if ($heavy.Contains($lastRanKey)) { $heavy[$lastRanKey] } else { 0 }) }
+        # r8 (adversary r8 A3): every field is read through PSObject.Properties, so a row missing one is a barrier (no status, no key), never a strict-mode throw
+        $f = @{}; foreach ($p in 'batch', 'key', 'status', 'heat') { $f[$p] = $(if ($r.PSObject.Properties[$p]) { $r.$p } else { $null }) }
+        if ([string]$f.batch -cne [string]$lastBatch) { $lastBatch = [string]$f.batch; $lastRanKey = $null }
+        if ([string]$f.heat -ceq 'hot' -and $null -ne $lastRanKey) { $heavy[$lastRanKey] = 1 + $(if ($heavy.Contains($lastRanKey)) { $heavy[$lastRanKey] } else { 0 }) }
         # adversary r1b A5: the predecessor is the last leg that LAUNCHED (RAN, LEG_FAILED, LEASE_EXPIRED); a row of unknown identity (a $null key) is a barrier, so
         # heat is never charged across it. A leg that never launched (THERMAL_HOT_SKIPPED, a RETRY whose own re-check failed) leaves the predecessor as it was.
         # r6 (adversary r6 A2): only a row KNOWN to have launched becomes the predecessor; one known never to have launched (NOT_RUN too) is passed over, and any other status (null,
         # empty, one this reader does not know) may or may not have launched, so it is a barrier like a row of unknown identity: heat after it is charged to nobody
-        $st = [string]$r.status
-        if ($st -cin @('RAN', 'LEG_FAILED', 'LEASE_EXPIRED')) { $lastRanKey = $(if ($r.key) { [string]$r.key } else { $null }) }
+        $st = [string]$f.status
+        if ($st -cin @('RAN', 'LEG_FAILED', 'LEASE_EXPIRED')) { $lastRanKey = $(if ($f.key) { [string]$f.key } else { $null }) }
         elseif ($st -cnotin @('THERMAL_HOT_SKIPPED', 'RETRY', 'NOT_RUN')) { $lastRanKey = $null }
     }
     $heavy
@@ -252,18 +254,33 @@ function Read-VenueLegHeatHistory {
                 $heat = 'unknown'
                 # r7 (adversary r7 A1 on 83fd79de): the agent's heat (heatAtGrant, or the sidecar's admission.heat) was read at the job's grant, which a row with onLease
                 # other than exactly true held on ANOTHER lease (a replacement after LEASE_LOST): charged to this lease's predecessor, it made a key heavy from a reading
-                # it never followed. Such a row keeps only the probe's reading, which is always this lease's. A row with no onLease field (LEG_FAILED) reads as before.
-                $offLease = ($l.PSObject.Properties['onLease'] -and -not ($l.onLease -is [bool] -and $l.onLease))
+                # it never followed. Such a row keeps only the probe's reading, which is always this lease's.
+                # r8 (adversary r8 A2): a row with NO onLease field (LEG_FAILED, LEASE_EXPIRED: the runner never read their agent result) in a batch that names its leaseId
+                # is not known to be on that lease: its recorded grant heat is not taken, and its sidecar's admission.heat only when the sidecar itself shows the job on the
+                # batch's lease, by the runner's own onLease rule (admission.leaseBatch.leaseId -ceq the batch's leaseId and slotContinuity not 'lost'). A batch with no
+                # leaseId (receipts older than the lease id) reads as before.
+                $batchLease = $(if ($b.PSObject.Properties['leaseId'] -and $b.leaseId) { [string]$b.leaseId } else { $null })
+                $hasOnLease = [bool]$l.PSObject.Properties['onLease']
+                $offLease = ($hasOnLease -and -not ($l.onLease -is [bool] -and $l.onLease))
+                $needLeaseProof = (-not $hasOnLease -and $null -ne $batchLease)
                 if ($l.PSObject.Properties['heatAtProbe'] -and [string]$l.heatAtProbe -cin @('hot', 'clear')) { $heat = [string]$l.heatAtProbe }
                 elseif ($offLease) { }
-                elseif ($l.PSObject.Properties['heatAtGrant'] -and [string]$l.heatAtGrant -cin @('hot', 'clear')) { $heat = [string]$l.heatAtGrant }
+                elseif (-not $needLeaseProof -and $l.PSObject.Properties['heatAtGrant'] -and [string]$l.heatAtGrant -cin @('hot', 'clear')) { $heat = [string]$l.heatAtGrant }
                 elseif ($l.PSObject.Properties['jobId'] -and $l.jobId) {
                     $ar = Resolve-VenueHistoryChild -Dir $dir -Child "agent-result-$($l.jobId).json"
                     # r3 pass 1 A1: `(try { } catch { })` is not an expression (PowerShell ran `try` as a command): the probe is its own statement
                     $arOk = $(if ($null -eq $ar) { $false } else { try { [bool](Test-Path -LiteralPath $ar -PathType Leaf) } catch { $false } })
                     if ($arOk) {
                         $a = try { [IO.File]::ReadAllText($ar) | ConvertFrom-Json } catch { $null }
-                        if ($null -ne $a -and $a.PSObject.Properties['admission'] -and $null -ne $a.admission -and $a.admission.PSObject.Properties['heat'] -and [string]$a.admission.heat -cin @('hot', 'clear')) { $heat = [string]$a.admission.heat }
+                        $adm = $(if ($null -ne $a -and $a.PSObject.Properties['admission'] -and $a.admission -is [System.Management.Automation.PSCustomObject]) { $a.admission } else { $null })
+                        $sameLease = $true
+                        if ($needLeaseProof) {
+                            $lb = $(if ($null -ne $adm -and $adm.PSObject.Properties['leaseBatch'] -and $adm.leaseBatch -is [System.Management.Automation.PSCustomObject]) { $adm.leaseBatch } else { $null })
+                            $jl = $(if ($null -ne $lb -and $lb.PSObject.Properties['leaseId'] -and $null -ne $lb.leaseId) { [string]$lb.leaseId } else { $null })
+                            $sc = $(if ($null -ne $adm -and $adm.PSObject.Properties['slotContinuity']) { [string]$adm.slotContinuity } else { '' })
+                            $sameLease = ($null -ne $jl -and $jl -ceq $batchLease -and $sc -cne 'lost')
+                        }
+                        if ($sameLease -and $null -ne $adm -and $adm.PSObject.Properties['heat'] -and [string]$adm.heat -cin @('hot', 'clear')) { $heat = [string]$adm.heat }
                     }
                 }
                 $rows.Add([pscustomobject]@{ batch = "$d.$lease"; key = (Get-VenueLegKeyFromName -Name ([string]$l.name) -Backend $backend -Arm $arm); name = [string]$l.name; status = [string]$l.status; heat = $heat })
