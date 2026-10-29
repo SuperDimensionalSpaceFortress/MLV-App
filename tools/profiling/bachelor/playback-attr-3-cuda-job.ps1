@@ -1686,7 +1686,15 @@ function Get-PresentMonParentIdentity([int]$ProcessId, [string]$Name, $Started =
         # step can then read EARLIER than the child -- and their order is no evidence (fail closed)
         $nowUtc = (Get-Date).ToUniversalTime()
         if ($instants[0] -gt $nowUtc -or $instants[1] -gt $nowUtc) { $result['identityError'] = 'creation_instant_after_now'; return $result }
+        # r8 (r7 adversary A1 on 6d30ac14, hub ruling): the order is evidence only when it is PROVEN -- both stamps strictly before this sweep's own start instant (a process created
+        # during the sweep may follow a step the stamps cannot show), no step seen during the sweep (the clock now earlier than that start), and the parent strictly earlier than the
+        # child. A sweep start that was never recorded is no proof. Anything else is no identity: the pid stays a harness_sessions blocker (the pre-PR behaviour)
+        $sweepStartUtc = $script:presentMonSweepStartUtc
+        if (-not ($sweepStartUtc -is [datetime])) { $result['identityError'] = 'sweep_start_unknown'; return $result }
+        if ($nowUtc -lt $sweepStartUtc) { $result['identityError'] = 'clock_stepped_back_during_sweep'; return $result }
+        if ($instants[0] -ge $sweepStartUtc -or $instants[1] -ge $sweepStartUtc) { $result['identityError'] = 'creation_instant_not_before_sweep_start'; return $result }
         if ($instants[1] -gt $instants[0]) { $result['identityError'] = 'parent_started_after_child'; return $result }
+        if ($instants[1] -eq $instants[0]) { $result['identityError'] = 'parent_started_with_child'; return $result }
         if (Test-PresentMonIdentityText $result.parentName 'IntelGraphicsSoftware.Service.exe') { $result['nonCaptureIdentity'] = 'intel_graphics_presentmonservice' }
         else { $result['identityError'] = 'parent_not_intel_graphics_service' }
     } catch {
@@ -1769,6 +1777,8 @@ function Invoke-PresentMonOrphanSweep() {
     # r4: harness_sessions also needs every unidentified possible owner (no readable command line, no route, no service registration) to be absent: the scope choice skips with
     # capture_owner_unidentified, a re-check aborts with it (unidentifiedCaptureOwnerIds names the pids). Scope 'all' is unchanged.
     $record =[ordered]@{ ran = $false; skippedReason = $null; abortedReason = $null; abortedBefore = $null; livePresentMonProcessIds = @(); livePresentMonProcesses = @(); excludedPresentMonProcesses = @(); listed = @(); matchingListingLines = @(); listAttempts = 0; actions = @(); remaining = @(); newlyListed = @(); listError = $null; error = $null; scope = $null; deferred = @(); unreadableCommandLineCount = $null; commandLineError = $null; unidentifiedCaptureOwners = @(); unidentifiedCaptureOwnerIds = @(); unidentifiedNonOwnership = $null }
+    # r8 (r7 adversary A1): the sweep's own start instant, read before its first snapshot -- the Intel parent identity needs both creation stamps strictly before it
+    $script:presentMonSweepStartUtc = (Get-Date).ToUniversalTime()
     try {
         $snapshot = Get-PresentMonProcessSnapshot
         $live = @($snapshot.live)

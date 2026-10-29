@@ -42,6 +42,12 @@ from tools.repo_hygiene.test_dve_presentmon_evidence import PARSE_END, PARSE_STA
 STUB_EXE = "PresentMon-stub.cmd"
 UNREADABLE = "<path getter throws>"
 SESSION_THROWS = "<session getter throws>"
+# r8 (r7 adversary A1): a creation stamp read DURING the sweep -- the probe's clock at the first read of any LATE stamp (after the sweep recorded its start), one instant for every read
+LATE = "<stamped during the sweep>"
+# r8 (hosted shard 6/8 on 6d30ac14): the probe's own $PID is a real pid; when it equals a fixture pid the job takes that fixture process for itself and the verdict is wrong. The probe
+# exits with this code before it does anything, and run_start runs it again (a new pwsh, a new pid)
+PID_COLLISION_EXIT = 97
+PID_COLLISION_ATTEMPTS = 5
 JOB_IMAGE = "C:\\pwsh\\pwsh.exe"
 NEW_MODULE_FUNCTIONS = ("Get-AttrCudaPresentMonOrphanSessionName", "Get-AttrCudaEtsSessionListing", "Invoke-AttrCudaLogman", "Stop-AttrCudaEtsSession", "Get-AttrCudaTextEncodingFromHead",
                         "Get-AttrCudaPresentMonEventsLost", "Add-AttrCudaPresentMonEventsLostDetail", "Add-AttrCudaPresentMonEventsLostDetailToReport",
@@ -512,6 +518,24 @@ class ModuleFunctionTests(unittest.TestCase):
                                     f"$r = {self.HELPERS[helper]}\n" + self.TAGGED)
                     self.assertEqual(sorted(got["entries"]), sorted([f"String:rea<AD>son={self.APPENDED[helper]}", "String:status=missing", "String:=keep"]))
 
+    def test_r8_a2_an_unreadable_comparer_with_an_ambiguous_reason_key_leaves_the_report_unchanged(self) -> None:
+        # r7 adversary A2 on 6d30ac14: a Hashtable / OrderedDictionary built with InvariantCultureIgnoreCase exposes no comparer; `status` holds the same text as the culture-matched
+        # `rea<U+00AD>son`, so no step names the key, and the copy added a fourth entry (`reason`) beside the untouched one. Fail closed: the same report, every entry as it was
+        for kind, ctor in (("Hashtable", "[System.Collections.Hashtable]::new([StringComparer]::InvariantCultureIgnoreCase)"),
+                           ("OrderedDictionary", "[System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::InvariantCultureIgnoreCase)")):
+            for helper in self.HELPERS:
+                with self.subTest(kind=kind, helper=helper):
+                    got = self.call(f"$report = {ctor}\n$report.Add('rea' + [char]0xAD + 'son', 'missing'); $report.Add('status', 'missing'); $report.Add('', 'keep')\n"
+                                    f"$r = {self.HELPERS[helper]}\n" + self.TAGGED)
+                    self.assertEqual(sorted(got["entries"]), sorted(["String:rea<AD>son=missing", "String:status=missing", "String:=keep"]))
+                    self.assertTrue(got["same"], "the report itself comes back")
+        # control: the same unreadable comparer with ONE holder of the text still updates that key in place
+        for helper in self.HELPERS:
+            with self.subTest(control=helper):
+                got = self.call("$report = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::InvariantCultureIgnoreCase)\n"
+                                f"$report.Add('rea' + [char]0xAD + 'son', 'missing'); $report.Add('status', 'S'); $report.Add('', 'keep')\n$r = {self.HELPERS[helper]}\n" + self.TAGGED)
+                self.assertEqual(got["entries"], [f"String:rea<AD>son={self.APPENDED[helper]}", "String:status=S", "String:=keep"])
+
     def test_mutation_the_property_only_copy_loses_a_dictionary_reports_fields_again(self) -> None:
         module = MODULE.read_text(encoding="utf-8")
         branch = ("    if ($Report -is [System.Collections.IDictionary]) { foreach ($key in @($Report.PSBase.Keys)) { $copy[[string]$key] = $Report[$key] } }\n"
@@ -612,7 +636,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
                   go_live_command_line: str | None = None, pm_name: str = STUB_EXE, presentmon_sha: str | None = None,
                   pinned_copies: tuple[Path, ...] = (), session_ids: dict[int, int | str | None] | None = None,
                   job_session: int | str | None = None, command_line_names: dict[int, str] | None = None, start_times: dict | None = None,
-                  cim_created: dict | None = None, go_live_from_snapshot: int = 0, reread_start_times: dict | None = None) -> tuple[int, dict, Path, str]:
+                  cim_created: dict | None = None, go_live_from_snapshot: int = 0, reread_start_times: dict | None = None,
+                  extra_guard_pids: tuple[str, ...] = ()) -> tuple[int, dict, Path, str]:
         # r5 (sol B1 on 2c226cd8): a process is (pid, creation instant). Every Get-Process row has a StartTime and every Win32_Process row a CreationDate; by default both are the same
         # instant (the pid's `processes` creation stamp, else 2026-10-27T00:00 + pid seconds), so a row read before the enumeration is that process's. `start_times` overrides a pid's
         # StartTime (None: unreadable) and `cim_created` its command-line row's CreationDate (a reused pid: another, earlier process); stamps are written as for `processes`.
@@ -696,6 +721,8 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             # a creation stamp as PowerShell: None ($null), ("sec", n) (base + n seconds), an int (base + n minutes, local), "local:<iso>" (that instant as a local DateTime), an ISO string
             if v is None:
                 return "$null"
+            if v == LATE:
+                return "(Get-MlvLateStamp)"
             if isinstance(v, tuple):
                 return f"(Get-Date '2026-10-27T00:00:00').AddSeconds({v[1]})"
             if isinstance(v, str) and v.startswith("local:"):
@@ -746,9 +773,15 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         service_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}' }}" for i, n in services)
         # a creation stamp is a minute offset (a local DateTime), None (unreadable), or an ISO string with an offset (a DateTimeOffset: the instant is fixed whatever the host's zone)
         process_rows = "; ".join(f"@{{ ProcessId = {i}; Name = '{n}'; ParentProcessId = {pp}; CreationMinute = {('$null' if m is None else (ps_quote(m) if isinstance(m, str) else m))} }}" for i, n, pp, m in processes)
+        fixture_pids = sorted({p for p in (*(i for i, _n, _p in others), *(i for i, _n, _pp, _m in processes), *(pp for _i, _n, pp, _m in processes), *live_pids, go_live_pid,
+                                           *(i for i, _n in services), *(i for i, _c in command_lines), *(session_ids or {}), *(start_times or {}), *(cim_created or {}),
+                                           *(reread_start_times or {})) if isinstance(p, int)})
+        guard_pids = ", ".join([str(p) for p in fixture_pids] + list(extra_guard_pids))
         script = d / "probe.ps1"
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n"
+            f"if (@({guard_pids}) -contains $PID) {{ Write-Output \"PID_COLLISION=$PID\"; exit {PID_COLLISION_EXIT} }}\n"
+            "function Get-MlvLateStamp { if ($null -eq $global:mlvLateStamp) { $global:mlvLateStamp = Get-Date }; return $global:mlvLateStamp }\n"
             f"Import-Module '{ps(MODULE)}' -Force\n"
             "function Test-AttrCudaPresentMonTraceReady($Proc) { [pscustomobject]@{ ready = $true; detail = 'stub' } }\n"
             f"$traceFile = '{ps(d / 'trace.log')}'\n"
@@ -796,7 +829,7 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             f"    if ($ClassName -eq 'Win32_Process') {{\n"
             f"        $processRows = @({process_rows})\n"
             "        foreach ($r in $processRows) { if ($r.ProcessId -eq $want) { [pscustomobject]@{ Name = $r.Name; ProcessId = $r.ProcessId; ParentProcessId = $r.ParentProcessId; "
-            "CreationDate = $(if ($null -eq $r.CreationMinute) { $null } elseif ($r.CreationMinute -is [string] -and $r.CreationMinute.StartsWith('local:')) { [DateTimeOffset]::Parse($r.CreationMinute.Substring(6)).LocalDateTime } elseif ($r.CreationMinute -is [string]) { [DateTimeOffset]::Parse($r.CreationMinute) } else { (Get-Date '2026-10-27T00:00:00').AddMinutes([int]$r.CreationMinute) }) } } }\n"
+            "CreationDate = $(if ($null -eq $r.CreationMinute) { $null } elseif ($r.CreationMinute -is [string] -and $r.CreationMinute -ceq '" + LATE + "') { Get-MlvLateStamp } elseif ($r.CreationMinute -is [string] -and $r.CreationMinute.StartsWith('local:')) { [DateTimeOffset]::Parse($r.CreationMinute.Substring(6)).LocalDateTime } elseif ($r.CreationMinute -is [string]) { [DateTimeOffset]::Parse($r.CreationMinute) } else { (Get-Date '2026-10-27T00:00:00').AddMinutes([int]$r.CreationMinute) }) } } }\n"
             "        return\n"
             "    }\n"
             + "    if ($ClassName -ne 'Win32_Service') { throw \"the sweep asked CIM for $ClassName\" }\n"
@@ -819,7 +852,12 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
             "$proc = Start-PresentMonCapture $presentMonPath\n"
             "[void]$proc.WaitForExit(20000)\n"
             "if ($null -ne $presentMonOrphanSweep) { Write-Output ('SWEEP=' + ($presentMonOrphanSweep | ConvertTo-Json -Depth 6 -Compress)) }\n", encoding="utf-8")
-        proc = run_pwsh(["-File", str(script)])
+        for _attempt in range(PID_COLLISION_ATTEMPTS):
+            proc = run_pwsh(["-File", str(script)])
+            if not (proc.returncode == PID_COLLISION_EXIT and "PID_COLLISION=" in proc.stdout):
+                break
+        else:
+            raise AssertionError(f"the probe's $PID equalled a fixture pid on every one of {PID_COLLISION_ATTEMPTS} attempts: {proc.stdout}")
         sweep: dict = {}
         for line in proc.stdout.splitlines():
             if line.startswith("SWEEP="):
@@ -1063,6 +1101,33 @@ class SweepExecutedTests(SliceHarness, unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertEqual(sweep["livePresentMonProcesses"], [self.INTEL_DETAIL])
         self.assertEqual(self.terminated_names(self.calls(d)), ["MLVAttr3-old-killed-job"])
+
+    # --- r8 (r7 adversary A1 on 6d30ac14, hub ruling): the Intel parent identity needs PROVEN order -- both stamps strictly before the sweep's own start, no step seen during the sweep,
+    # the parent strictly earlier. On 6d30ac14 a child stamped during the sweep (not later than now) under an older reused Intel pid got the identity and the sweep ran harness_sessions.
+    def test_r8_a1_a_child_stamped_during_the_sweep_under_an_older_intel_pid_is_no_identity(self) -> None:
+        detail, _d = self.h3("r8-a1-child-during-sweep", processes=((7001, "PresentMonService", 900, LATE), (900, "IntelGraphicsSoftware.Service.exe", 4, 5)))
+        self.assertEqual((detail.get("parentPid"), detail.get("identityError")), (900, "creation_instant_not_before_sweep_start"))
+
+    def test_r8_a1_a_parent_stamped_with_the_child_is_no_order_evidence(self) -> None:
+        detail, _d = self.h3("r8-a1-equal-stamps", processes=((7001, "PresentMonService", 900, 10), (900, "IntelGraphicsSoftware.Service.exe", 4, 10)))
+        self.assertEqual(detail.get("identityError"), "parent_started_with_child")
+
+    def test_r8_a1_a_clock_that_stepped_back_during_the_sweep_is_no_order_evidence(self) -> None:
+        # the sweep's recorded start reads later than now: the clock stepped back since the sweep began (a start an hour ahead stands for the step)
+        mutated = mutate(TEMPLATE, "$script:presentMonSweepStartUtc = (Get-Date).ToUniversalTime()", "$script:presentMonSweepStartUtc = (Get-Date).ToUniversalTime().AddHours(1)")
+        detail, _d = self.h3("r8-a1-step-during-sweep", processes=self.INTEL_TREE, text=mutated)
+        self.assertEqual(detail.get("identityError"), "clock_stepped_back_during_sweep")
+
+    def test_r8_a1_an_unrecorded_sweep_start_is_no_proof(self) -> None:
+        mutated = mutate(TEMPLATE, "$script:presentMonSweepStartUtc = (Get-Date).ToUniversalTime()", "$script:presentMonSweepStartUtc = $null")
+        detail, _d = self.h3("r8-a1-no-sweep-start", processes=self.INTEL_TREE, text=mutated)
+        self.assertEqual(detail.get("identityError"), "sweep_start_unknown")
+
+    def test_r8_ci_a_probe_whose_pid_is_a_fixture_pid_is_run_again_never_judged(self) -> None:
+        # hosted shard 6/8 on 6d30ac14: the probe's $PID was 6200, so the job skipped the unidentified capture as itself and swept. A collision is now detected before anything runs;
+        # one that never clears (forced here) fails the harness loudly instead of returning a verdict
+        with self.assertRaisesRegex(AssertionError, "equalled a fixture pid on every one of 5 attempts"):
+            self.run_start("r8-ci-pid-collision", others=(self.SERVICE_UNREADABLE, self.UNIDENTIFIED), processes=self.INTEL_TREE, extra_guard_pids=("$PID",))
 
     # --- r2 regressions (Dot advisory on #707, hub-confirmed on cd2a518d): a second harness's live PresentMon-custom must stop the harness_sessions sweep at every one of its three gates
     def test_r1_a_live_presentmon_custom_with_an_unreadable_path_refuses_the_sweep(self) -> None:

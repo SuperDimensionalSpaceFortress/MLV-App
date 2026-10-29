@@ -2337,7 +2337,10 @@ function Add-AttrCudaPresentMonEventsLostDetailToReport {
             }
             if ($named.Count -eq 0) { $named = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $current, [StringComparison]::Ordinal)) { $keyList[$index] } }) }
             if ($named.Count -ne 1) { $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::OrdinalIgnoreCase) }) }
-            if ($named.Count -gt 0) { $reasonKey = $named[0] }
+            # r8 (r7 adversary A2 on 6d30ac14): the report holds a reason (its own lookup said so) but no step names the ONE key it matched (a comparer that is not publicly readable,
+            # two holders of the text, no OrdinalIgnoreCase match): an added `reason` would be a second reason entry, so the report comes back unchanged (fail closed, every entry kept)
+            if ($named.Count -ne 1) { return $Report }
+            $reasonKey = $named[0]
         }
     } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name } }
     $detailed = Add-AttrCudaPresentMonEventsLostDetail -Reason $current -EventsLost $EventsLost
@@ -2420,7 +2423,10 @@ function Add-AttrCudaPresentMonOrphanSweepDetailToReport {
             }
             if ($named.Count -eq 0) { $named = @(for ($index = 0; $index -lt $keyList.Count; $index++) { if ($keyList[$index] -is [string] -and [string]::Equals([string]$valueList[$index], $current, [StringComparison]::Ordinal)) { $keyList[$index] } }) }
             if ($named.Count -ne 1) { $named = @($keyList | Where-Object { $_ -is [string] -and [string]::Equals($_, 'reason', [StringComparison]::OrdinalIgnoreCase) }) }
-            if ($named.Count -gt 0) { $reasonKey = $named[0] }
+            # r8 (r7 adversary A2 on 6d30ac14): the report holds a reason (its own lookup said so) but no step names the ONE key it matched (a comparer that is not publicly readable,
+            # two holders of the text, no OrdinalIgnoreCase match): an added `reason` would be a second reason entry, so the report comes back unchanged (fail closed, every entry kept)
+            if ($named.Count -ne 1) { return $Report }
+            $reasonKey = $named[0]
         }
     } else { $property = $Report.PSObject.Properties['reason']; if ($null -ne $property) { $current = [string]$property.Value; $reasonKey = $property.Name } }
     # r3 (adversary A2): the token is the detail this helper writes (a bare prefix, or bracketed after a reason), never a path or a word that merely contains the name
