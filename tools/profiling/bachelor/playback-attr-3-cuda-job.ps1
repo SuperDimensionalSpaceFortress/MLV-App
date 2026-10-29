@@ -6162,7 +6162,11 @@ if (-not [string]::IsNullOrEmpty($ScopesDuringPlayback)) {
 # regions, on the expanded text and only when asked, so every other job is the text it always was. Each anchor must match exactly once, or the generator throws:
 #   1. before the SUCCESS summary: the job's own worker_threads= read of the run log (Get-CorePartitionWorkerThreads) and the smoke result.json's playbackMaxThreads;
 #   2. four proof lines after the summary's cpuFrames line. The runner fails the leg closed (WORKER_THREADS_NOT_HONOURED) unless they and the run log all say n.
-if ($PlaybackMaxThreads -gt 0) {
+# BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1 r12: $playbackMaxThreadsEmit is the ONE seam the cap reaches the job through (-PlaybackMaxThreads is read only
+# in the param block and inside this if). test_core_partition_leg turns this line off in a copy of the generator and requires a job with a cap set but
+# the seam off to be byte-for-byte the job without a cap (the $corePartitionEmit pattern below).
+$playbackMaxThreadsEmit = $PlaybackMaxThreads -gt 0
+if ($playbackMaxThreadsEmit) {
     $mtOpen = '# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 >>>'
     $mtClose = '# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 <<<'
     $mtEol = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }

@@ -3275,8 +3275,13 @@ class CorePartitionSpecTests(unittest.TestCase):
 # generatorArgs.playbackMaxThreads (1..16) -> Invoke-VenueLeg -PlaybackMaxThreads -> the smoke runner's EXISTING -Threads <n> (which sets
 # MLVAPP_PLAYBACK_MAX_THREADS for the app and records playbackMaxThreads in its result.json). FAIL CLOSED: the leg is INVALID
 # (WORKER_THREADS_NOT_HONOURED) unless the measured session's worker_threads= and the job's proof fields all say n.
-# The commit this card branched from: a job generated without the key must still be this commit's job, byte for byte.
-THREADS_BASE_COMMIT = "293b0b818dd268d81bc5aa667b3ae7a021f02b24"
+# A job generated without the key (or with 0) is byte-for-byte the job this tree's generator emits with its one cap seam ($playbackMaxThreadsEmit)
+# off. (r12 of BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1: this replaced a byte comparison with a frozen base commit's generator, 293b0b81, which every
+# later legitimate edit to the generator or a module it embeds turned red -- the class r6 fixed for the core-partition pin above.)
+THREADS_SEAM_ON = re.compile(r"(?m)^\$playbackMaxThreadsEmit = \$PlaybackMaxThreads -gt 0(?=\r?$)")
+THREADS_SEAM_OFF = "$playbackMaxThreadsEmit = $false"
+# Text no job without a cap may carry (case-sensitive): the region marks, the proof variables and summary keys, and the runner argument.
+THREADS_TOKENS = ("VENUE-LEG-PLAYBACK-MAX-THREADS", "playbackMaxThreads", "playbackWorkerThreadsRead", " -Threads ")
 THREADS_OPEN = "# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 >>>"
 THREADS_CLOSE = "# VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 <<<"
 THREADS_REGION = re.compile(r"(?ms)^[ \t]*" + re.escape(THREADS_OPEN) + r"\n.*?^[ \t]*" + re.escape(THREADS_CLOSE) + r"\n")
@@ -3290,7 +3295,8 @@ THREADS_SHAPES = {"default": [], "b1": ARM_B1}
 
 @requires_windows_pwsh
 class PlaybackMaxThreadsGeneratorTests(unittest.TestCase):
-    """The generator forwards -PlaybackMaxThreads as the smoke runner's -Threads <n>; absent (or 0) the job is the base commit's, byte for byte."""
+    """The generator forwards -PlaybackMaxThreads as the smoke runner's -Threads <n>; absent (or 0) the job is the one this tree's generator emits
+    with its cap seam off, byte for byte."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -3303,20 +3309,20 @@ class PlaybackMaxThreadsGeneratorTests(unittest.TestCase):
         subprocess.run(["git", "-C", str(cls.repo), "checkout", "-q", cls.head], check=True)
         for stem in FIXTURE_IDS:
             write_synthetic_mlv(cls.repo / "tests" / "fixtures" / "clips" / (stem + MLV_EXT), FRAMES_30S_AT_23976)
-        cls.base_available = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{THREADS_BASE_COMMIT}^{{commit}}"], capture_output=True).returncode == 0
-        base_root = cls.tmp / "base"
-        base_generator = base_root / "tools" / "profiling" / "bachelor" / "playback-attr-3-cuda-job.ps1"
-        if cls.base_available:
-            tar = cls.tmp / "base.tar"
-            subprocess.run(["git", "-C", str(ROOT), "archive", THREADS_BASE_COMMIT, "--format=tar", "-o", str(tar), "tools/profiling", "tools/gates"], check=True)
-            base_root.mkdir()
-            subprocess.run(["tar", "-xf", str(tar), "-C", str(base_root)], check=True)
+        # The seam-off generator: this tree's tools/profiling and tools/gates (everything the generator reads through $PSScriptRoot), with the
+        # one cap seam line turned off. Nothing else in the copy differs from the generator under test.
+        off_root = cls.tmp / "seam-off"
+        for part in ("profiling", "gates"):
+            shutil.copytree(ROOT / "tools" / part, off_root / "tools" / part, ignore=shutil.ignore_patterns("__pycache__"))
+        off_generator = off_root / GENERATOR.relative_to(ROOT)
+        source = GENERATOR.read_bytes().decode("utf-8")
+        cls.seam_sites = len(THREADS_SEAM_ON.findall(source))
+        off_generator.write_bytes(THREADS_SEAM_ON.sub(lambda _m: THREADS_SEAM_OFF, source).encode("utf-8"))
         requests: list[tuple[str, Path, list[str]]] = []
         for name, shape in THREADS_SHAPES.items():
             requests += [(f"head-{name}", GENERATOR, shape), (f"zero-{name}", GENERATOR, [*shape, "-PlaybackMaxThreads", "0"]),
-                         (f"t12-{name}", GENERATOR, [*shape, "-PlaybackMaxThreads", "12"])]
-            if cls.base_available:
-                requests.append((f"base-{name}", base_generator, shape))
+                         (f"t12-{name}", GENERATOR, [*shape, "-PlaybackMaxThreads", "12"]),
+                         (f"off-{name}", off_generator, shape), (f"off-t12-{name}", off_generator, [*shape, "-PlaybackMaxThreads", "12"])]
         requests += [(f"t{n}", GENERATOR, ["-PlaybackMaxThreads", str(n)]) for n in (1, 16, 17, -1)]
         cls.out = {}
         commands = []
@@ -3336,14 +3342,25 @@ class PlaybackMaxThreadsGeneratorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, f"{key}: {proc.stdout[-2000:]}{proc.stderr[-2000:]}")
         return self.out[key].read_bytes().decode("utf-8")
 
-    def test_an_absent_or_zero_cap_emits_the_base_commits_job_byte_for_byte(self) -> None:
-        if not self.base_available:
-            self.skipTest(f"base commit {THREADS_BASE_COMMIT} is not in this clone")
+    def test_an_absent_or_zero_cap_emits_the_job_the_generator_emits_with_its_cap_seam_off(self) -> None:
+        """r12 (BACHELOR-CUDA-PRESENTMON-CSV-MISSING-1): the no-cap job comes from this tree's own generator, so an edit elsewhere in the generator
+        or in a module it embeds moves both sides; only cap text that escapes the seam, or cap text in a job without a cap, makes this red."""
+        self.assertEqual(self.seam_sites, 1, "the generator must carry exactly one $playbackMaxThreadsEmit seam line")
         for name in THREADS_SHAPES:
-            base = self.job(f"base-{name}")
-            for key in (f"head-{name}", f"zero-{name}"):
+            plain = self.job(f"off-{name}")
+            # Control: the seam-off copy differs from the generator under test by nothing a job without a cap can see.
+            # Then: an absent or zero cap is that job; a cap of 12 with the seam off is that job too (the cap reaches the job only through the seam).
+            for key in (f"head-{name}", f"zero-{name}", f"off-t12-{name}"):
                 with self.subTest(job=key):
-                    self.assertEqual(self.job(key), base, f"{key}: a job without a playback thread cap changed")
+                    self.job(key)
+                    self.assertEqual(self.out[key].read_bytes(), self.out[f"off-{name}"].read_bytes(),
+                                     f"{key}: a job without a playback thread cap (or with the cap seam off) changed")
+            with self.subTest(job=f"t12-{name}"):
+                self.assertNotEqual(self.job(f"t12-{name}"), plain, f"t12-{name}: the cap seam is on in the generator under test")
+            for key in (f"head-{name}", f"zero-{name}"):
+                with self.subTest(job=key, check="tokens"):
+                    text = self.job(key)
+                    self.assertEqual([t for t in THREADS_TOKENS if t in text], [], f"{key}: a job without a playback thread cap carries cap text")
 
     def test_a_requested_cap_reaches_the_smoke_runner_as_its_existing_threads_argument(self) -> None:
         for name in THREADS_SHAPES:
