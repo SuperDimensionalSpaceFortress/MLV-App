@@ -1640,6 +1640,7 @@ static bool lookAssistProcessedFloorLiftedPostInvalidShouldFailClosed(
 #include "batch/BatchLogger.h"
 #include "batch/ReceiptLoader.h"
 #include "batch/ReceiptSafety.h"
+#include <QAbstractEventDispatcher>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QFile>
@@ -2475,6 +2476,24 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     {
         connect( qApp, &QGuiApplication::applicationStateChanged,
                  this, &MainWindow::onPlaybackSmokeApplicationStateChanged );
+        // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: the GUI event loop's blocked time inside an open
+        // present-to-next-result gap is idle, not busy (gui_present_summary avg_gui_busy_ms).
+        if( QAbstractEventDispatcher *dispatcher = QAbstractEventDispatcher::instance( thread() ) )
+        {
+            m_guiPresentGapClock.start();
+            connect( dispatcher, &QAbstractEventDispatcher::aboutToBlock, this, [this]()
+            {
+                if( m_guiPresentGapStartNs >= 0 )
+                    m_guiPresentGapBlockStartNs = m_guiPresentGapClock.nsecsElapsed();
+            } );
+            connect( dispatcher, &QAbstractEventDispatcher::awake, this, [this]()
+            {
+                if( m_guiPresentGapBlockStartNs < 0 ) return;
+                m_guiPresentGapIdleNs += m_guiPresentGapClock.nsecsElapsed() - m_guiPresentGapBlockStartNs;
+                m_guiPresentGapBlockStartNs = -1;
+            } );
+            m_guiPresentIdleProbeConnected = true;
+        }
     }
 
     //Init scripting engine
@@ -4827,6 +4846,7 @@ void MainWindow::onPlaybackPrepResultReady( void )
         result.task.rebindOwnedImagePointers();
         m_playbackPrepResults.pop_front();
     }
+    closeGuiPresentGap();
 
     const uint64_t latest = m_latestRequestedSerial.load( std::memory_order_acquire );
     const uint64_t activeGeneration =
@@ -4864,7 +4884,44 @@ void MainWindow::onPlaybackPrepResultReady( void )
     }
 
     presentPlaybackPreparedFrame( result );
+    openGuiPresentGap();
 }
+
+// CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: a gap opens when a worker prep present returns and
+// closes when the GUI thread takes the next prep result; only inside a smoke session whose
+// event-loop idle probe is connected. busy = wall - idle; other busy = busy - viewport paint.
+void MainWindow::openGuiPresentGap( void )
+{
+    m_guiPresentGapStartNs = -1;
+    m_guiPresentGapBlockStartNs = -1;
+    if( !m_playbackSmokeActive || !m_guiPresentIdleProbeConnected ) return;
+    m_guiPresentGapIdleNs = 0;
+    m_guiPresentGapPaintStartMs = ui->graphicsView->paintTiming().sumMs;
+    m_guiPresentGapStartNs = m_guiPresentGapClock.nsecsElapsed();
+}
+
+void MainWindow::closeGuiPresentGap( void )
+{
+    if( m_guiPresentGapStartNs < 0 ) return;
+    const double gapMs =
+        static_cast<double>( m_guiPresentGapClock.nsecsElapsed() - m_guiPresentGapStartNs ) / 1000000.0;
+    const double idleMs = qMin( gapMs, static_cast<double>( m_guiPresentGapIdleNs ) / 1000000.0 );
+    const double busyMs = gapMs - idleMs;
+    const double paintMs = qMax( 0.0, ui->graphicsView->paintTiming().sumMs - m_guiPresentGapPaintStartMs );
+    const double otherBusyMs = qMax( 0.0, busyMs - paintMs );
+    GuiPresentGapTotals &gaps = m_guiPresentGaps;
+    ++gaps.gaps;
+    gaps.gapSumMs += gapMs;
+    gaps.gapMaxMs = qMax( gaps.gapMaxMs, gapMs );
+    gaps.idleSumMs += idleMs;
+    gaps.busySumMs += busyMs;
+    gaps.busyMaxMs = qMax( gaps.busyMaxMs, busyMs );
+    gaps.otherBusySumMs += otherBusyMs;
+    gaps.otherBusyMaxMs = qMax( gaps.otherBusyMaxMs, otherBusyMs );
+    m_guiPresentGapStartNs = -1;
+    m_guiPresentGapBlockStartNs = -1;
+}
+
 void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result )
 {
     const PlaybackPrepTask &task = result.task;
@@ -4973,7 +5030,10 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
                 ? task.readyFrame.processedFrame16Signature
                 : display_frame));
 
-    m_lastDrawFrameReadyImageMs = result.imageBuildMs;
+    // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: the draw-image cost is this GUI thread's image
+    // region (set when it closes below), never the prep worker's build (that stays in
+    // playback_prep_worker_build_ms). A present-nothing return leaves no GUI image cost.
+    m_lastDrawFrameReadyImageMs = 0.0;
     const size_t sourceImageBytes = static_cast<size_t>( sourceWidth )
         * static_cast<size_t>( sourceHeight ) * 3u;
     const size_t sourceImage16Bytes = sourceImageBytes * sizeof( uint16_t );
@@ -6430,7 +6490,7 @@ void MainWindow::presentPlaybackPreparedFrame( const PlaybackPrepResult &result 
     readyFrame.stageTimingTelemetry.insert(
         QStringLiteral("playback_prep_region_image_ms"),
         prepRegionImageMs );
-    m_lastDrawFrameReadyImageMs = result.imageBuildMs;
+    m_lastDrawFrameReadyImageMs = prepRegionImageMs;
     mlv_stage_timing_note_elapsed("drawFrameReady.image", display_frame, m_lastDrawFrameReadyImageMs);
 
     const qint64 prepRegionPresentStartNs = prepRegionClock.nsecsElapsed();
@@ -25600,6 +25660,10 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokePrepWorkerQueueSumMs = 0.0;
     m_playbackSmokePrepWorkerBuildSumMs = 0.0;
     m_playbackSmokePrepSpans = PlaybackSmokePrepSpanTotals();
+    m_guiPresentGaps = GuiPresentGapTotals();
+    m_guiPresentGapStartNs = -1;
+    m_guiPresentGapBlockStartNs = -1;
+    ui->graphicsView->resetPaintTiming();
     m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     m_playbackSmokePrepResultQueueSumMs = 0.0;
     m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;
@@ -26769,6 +26833,14 @@ void MainWindow::notePlaybackSmokePresentedFrame(
             spans.refusalLast =
                 telemetryStringValue( timing, "playback_prep_reduced_refusal_reason" );
             ++spans.refusalCounts[spans.refusalLast];
+            // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread present regions.
+            spans.regionSetupMs += telemetryDoubleValue( timing, "playback_prep_region_setup_ms" );
+            spans.regionImageMs += telemetryDoubleValue( timing, "playback_prep_region_image_ms" );
+            spans.regionPresentMs += telemetryDoubleValue( timing, "playback_prep_region_present_ms" );
+            spans.regionFinishMs += telemetryDoubleValue( timing, "playback_prep_region_finish_ms" );
+            spans.regionTotalMs += telemetryDoubleValue( timing, "playback_prep_region_total_ms" );
+            spans.regionUnattributedMs +=
+                telemetryDoubleValue( timing, "playback_prep_region_unattributed_ms" );
         }
     }
     m_playbackSmokePrepWorkerTotalSumMs += prepWorkerTotalMs;
@@ -29824,6 +29896,14 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
              it != spans.pointwiseFastRefusalCounts.constEnd(); ++it )
             pointwiseFastRefusalCounts[it.key().isEmpty() ? QStringLiteral("none") : it.key()] += it.value();
         const double cpuRouteFrames = static_cast<double>( spans.cpuRouteFrames );
+        // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: the GUI-thread region spans are summed on
+        // CPU-route frames only, so they average over those frames.
+        const auto avgCpuRouteMs = [&spans]( double sum ) -> double
+        {
+            return spans.cpuRouteFrames > 0
+                ? sum / static_cast<double>( spans.cpuRouteFrames )
+                : 0.0;
+        };
         qInfo().noquote()
             << QStringLiteral(
                    "playback_smoke.prep_summary session=%1 frames=%2 cpu_route_frames=%3 "
@@ -29839,7 +29919,10 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    "playback_prep_stage_mask=%24 playback_prep_pointwise_fast_frames=%25 "
                    "playback_prep_pointwise_fast=%26 playback_prep_pointwise_omp_threads=%27 "
                    "playback_prep_pointwise_omp_threads_last=%28 playback_prep_pointwise_fast_refusal=%29 "
-                   "pointwise_fast_refusal_counts=%30" )
+                   "pointwise_fast_refusal_counts=%30 "
+                   "avg_playback_prep_region_setup_ms=%31 avg_playback_prep_region_image_ms=%32 "
+                   "avg_playback_prep_region_present_ms=%33 avg_playback_prep_region_finish_ms=%34 "
+                   "avg_playback_prep_region_total_ms=%35 avg_playback_prep_region_unattributed_ms=%36" )
                    .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
                    .arg( m_playbackSmokePresentedFrames )
                    .arg( spans.cpuRouteFrames )
@@ -29871,7 +29954,50 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( spans.cpuRouteFrames == 0 ? QStringLiteral("unset")
                          : ( spans.pointwiseFastRefusalLast.isEmpty() ? QStringLiteral("none")
                                                                       : spans.pointwiseFastRefusalLast ) )
-                   .arg( joinCounts( pointwiseFastRefusalCounts ) );
+                   .arg( joinCounts( pointwiseFastRefusalCounts ) )
+                   .arg( avgCpuRouteMs( spans.regionSetupMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionImageMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionPresentMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionFinishMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionTotalMs ), 0, 'f', 3 )
+                   .arg( avgCpuRouteMs( spans.regionUnattributedMs ), 0, 'f', 3 );
+    }
+
+    /* CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread present-side cost. The preview viewport
+     * paint (GraphicsZoomView::paintEvent, per paint) and the GUI thread's busy time between a
+     * worker prep present's exit and the next prep result's entry (wall gap less event-loop
+     * idle); other busy = busy less the viewport paint inside that gap. gui_idle_source=none
+     * means the idle probe was not connected and every gap field is 0. */
+    {
+        const GraphicsZoomView::PaintTiming paint = ui->graphicsView->paintTiming();
+        const GuiPresentGapTotals &gaps = m_guiPresentGaps;
+        const auto avgOver = []( double sum, quint64 count ) -> double
+        {
+            return count > 0 ? sum / static_cast<double>( count ) : 0.0;
+        };
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.gui_present_summary session=%1 frames=%2 "
+                   "preview_viewport_paints=%3 avg_preview_viewport_paint_ms=%4 "
+                   "max_preview_viewport_paint_ms=%5 gui_present_gaps=%6 "
+                   "avg_gui_present_gap_ms=%7 max_gui_present_gap_ms=%8 avg_gui_present_gap_idle_ms=%9 "
+                   "avg_gui_busy_ms=%10 max_gui_busy_ms=%11 "
+                   "avg_gui_other_busy_ms=%12 max_gui_other_busy_ms=%13 gui_idle_source=%14" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( m_playbackSmokePresentedFrames )
+                   .arg( paint.paints )
+                   .arg( avgOver( paint.sumMs, paint.paints ), 0, 'f', 3 )
+                   .arg( paint.maxMs, 0, 'f', 3 )
+                   .arg( gaps.gaps )
+                   .arg( avgOver( gaps.gapSumMs, gaps.gaps ), 0, 'f', 3 )
+                   .arg( gaps.gapMaxMs, 0, 'f', 3 )
+                   .arg( avgOver( gaps.idleSumMs, gaps.gaps ), 0, 'f', 3 )
+                   .arg( avgOver( gaps.busySumMs, gaps.gaps ), 0, 'f', 3 )
+                   .arg( gaps.busyMaxMs, 0, 'f', 3 )
+                   .arg( avgOver( gaps.otherBusySumMs, gaps.gaps ), 0, 'f', 3 )
+                   .arg( gaps.otherBusyMaxMs, 0, 'f', 3 )
+                   .arg( m_guiPresentIdleProbeConnected ? QStringLiteral("dispatcher")
+                                                        : QStringLiteral("none") );
     }
 
     /* CPU-DEBAYERED16-REUSE-PHASE3-RECON-1: debayered-16 frames whose render

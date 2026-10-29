@@ -1499,8 +1499,37 @@ private:
         int pointwiseOmpThreadsLast = 0;
         QString pointwiseFastRefusalLast;
         QMap<QString, quint64> pointwiseFastRefusalCounts;
+        // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: the GUI-thread prep-present regions
+        // (playback_prep_region_*_ms), CPU-route frames only.
+        double regionSetupMs = 0.0;
+        double regionImageMs = 0.0;
+        double regionPresentMs = 0.0;
+        double regionFinishMs = 0.0;
+        double regionTotalMs = 0.0;
+        double regionUnattributedMs = 0.0;
     };
     PlaybackSmokePrepSpanTotals m_playbackSmokePrepSpans;
+    // CPU-S2-WINDOWED-GUI-PRESENT-TELEMETRY-1: GUI-thread wall time from one prep present's exit to
+    // the next prep result's entry, less the event loop's blocked (idle) time in between, and less
+    // the preview viewport paint inside it for "other busy" (playback_smoke.gui_present_summary).
+    struct GuiPresentGapTotals
+    {
+        quint64 gaps = 0;
+        double gapSumMs = 0.0;
+        double gapMaxMs = 0.0;
+        double idleSumMs = 0.0;
+        double busySumMs = 0.0;
+        double busyMaxMs = 0.0;
+        double otherBusySumMs = 0.0;
+        double otherBusyMaxMs = 0.0;
+    };
+    GuiPresentGapTotals m_guiPresentGaps;
+    QElapsedTimer m_guiPresentGapClock;
+    qint64 m_guiPresentGapStartNs = -1;
+    qint64 m_guiPresentGapIdleNs = 0;
+    qint64 m_guiPresentGapBlockStartNs = -1;
+    double m_guiPresentGapPaintStartMs = 0.0;
+    bool m_guiPresentIdleProbeConnected = false;
     double m_playbackSmokePrepWorkerTotalSumMs = 0.0;
     double m_playbackSmokePrepResultQueueSumMs = 0.0;
     double m_playbackSmokePrepTotalBeforeFinishSumMs = 0.0;
@@ -1794,6 +1823,8 @@ private:
                                                 PlaybackPrepThreadState *threadState = nullptr );
     void playbackPrepThreadLoop( void );
     void presentPlaybackPreparedFrame( const PlaybackPrepResult &result );
+    void openGuiPresentGap( void );
+    void closeGuiPresentGap( void );
     void finishPresentedFrame( uint64_t displayFrame,
                                RenderFrameThread::ReadyFrame &readyFrame,
                                const PresentationRequestContext &requestContext,
