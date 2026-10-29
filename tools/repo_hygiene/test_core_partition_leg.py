@@ -3336,6 +3336,123 @@ class PlaybackMaxThreadsGeneratorTests(unittest.TestCase):
                 self.assertNotEqual(self.proc[f"t{n}"].returncode, 0, f"the generator accepted -PlaybackMaxThreads {n}")
 
 
+# --- VENUE-LEG-PLAYBACK-MAX-THREADS-ARG-1 r2: every smoke-command edit is anchored on the ONE smoke command line -------------------------------
+# sol r1 (issuecomment-6486231859): -AgentRoot allows spaces, so an accepted root that spells ' -UsePersistedPlaybackSettings ' (or ' -Scope none ')
+# is substituted into the template, and a whole-text anchor then counts two matches and the generator refuses a legitimate leg. The class: the -Threads,
+# -Unpaced and -Scope edits all matched the whole expanded text; caller data elsewhere must never change their match count.
+ANCHOR_COLLISION_ROOTS = {
+    "persisted": "C:\\mlvtmp\\agent -UsePersistedPlaybackSettings x",
+    "scope": "C:\\mlvtmp\\agent -Scope none x",
+}
+ANCHOR_ORDINARY_ROOT = "C:\\mlvtmp\\agent"
+
+
+@requires_windows_pwsh
+class SmokeCommandAnchorScopeTests(unittest.TestCase):
+    """The smoke-command edits (-Threads, -Unpaced -DropFrameMode off, -Scope) touch the smoke command line only, whatever -AgentRoot spells."""
+
+    CASES = {
+        **{f"threads{n}-persisted": ("persisted", ["-PlaybackMaxThreads", str(n)]) for n in (1, 12, 16)},
+        "threads12-scope": ("scope", ["-PlaybackMaxThreads", "12"]),
+        "unpaced-persisted": ("persisted", ["-Unpaced"]),
+        "scope-scope": ("scope", ["-Scope", "histogram"]),
+        "scope-persisted": ("persisted", ["-Scope", "histogram"]),
+        "all-persisted": ("persisted", ["-Unpaced", "-Scope", "histogram", "-PlaybackMaxThreads", "12"]),
+        "all-scope": ("scope", ["-Unpaced", "-Scope", "histogram", "-PlaybackMaxThreads", "12"]),
+    }
+    CONTROLS = {
+        **{f"threads{n}-ordinary": ["-PlaybackMaxThreads", str(n)] for n in (1, 12, 16)},
+        "unpaced-ordinary": ["-Unpaced"],
+        "scope-ordinary": ["-Scope", "histogram"],
+        "all-ordinary": ["-Unpaced", "-Scope", "histogram", "-PlaybackMaxThreads", "12"],
+    }
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory(prefix="smoke-anchor-")
+        cls.tmp = Path(cls._tmp.name)
+        cls.head = git("rev-parse", "HEAD")
+        cls.repo = cls.tmp / "repo"
+        subprocess.run(["git", "clone", "-q", "--shared", "--no-checkout", str(ROOT), str(cls.repo)], check=True)
+        subprocess.run(["git", "-C", str(cls.repo), "sparse-checkout", "set", "--cone", "tools", "tests/fixtures/clips"], check=True)
+        subprocess.run(["git", "-C", str(cls.repo), "checkout", "-q", cls.head], check=True)
+        for stem in FIXTURE_IDS:
+            write_synthetic_mlv(cls.repo / "tests" / "fixtures" / "clips" / (stem + MLV_EXT), FRAMES_30S_AT_23976)
+        requests: list[tuple[str, list[str]]] = []
+        for key, (root, extra) in cls.CASES.items():
+            requests.append((key, ["-AgentRoot", ANCHOR_COLLISION_ROOTS[root], *extra]))
+        for root, spelled in ANCHOR_COLLISION_ROOTS.items():
+            requests.append((f"plain-{root}", ["-AgentRoot", spelled]))
+        for key, extra in cls.CONTROLS.items():
+            requests.append((key, ["-AgentRoot", ANCHOR_ORDINARY_ROOT, *extra]))
+        cls.out = {}
+        commands = []
+        for key, extra in requests:
+            out = cls.tmp / f"{key}.job.ps1"
+            cls.out[key] = out
+            commands.append(["-File", str(GENERATOR), "-SourceCommit", cls.head, "-BuildManifestSha256", "ab" * 32, "-ClipId", FIXTURE_IDS[0],
+                             "-FixtureSha256", "cd" * 32, "-RepoRoot", str(cls.repo), "-OutFile", str(out), *extra])
+        cls.proc = dict(zip([k for k, _e in requests], run_pwsh_many(commands)))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def job(self, key: str) -> str:
+        proc = self.proc[key]
+        self.assertEqual(proc.returncode, 0, f"{key}: {proc.stdout[-2000:]}{proc.stderr[-2000:]}")
+        return self.out[key].read_bytes().decode("utf-8")
+
+    def smoke_lines(self, job: str) -> list[str]:
+        return [line for line in job.splitlines() if line.startswith('$cmd = "& ')]
+
+    def test_an_agent_root_spelling_an_anchor_does_not_change_the_edit(self) -> None:
+        for key, (root, extra) in self.CASES.items():
+            with self.subTest(job=key):
+                job, plain = self.job(key), self.job(f"plain-{root}")
+                smoke = self.smoke_lines(job)
+                self.assertEqual(len(smoke), 1, "one smoke command line")
+                cap = "12"
+                if "-PlaybackMaxThreads" in extra:
+                    cap = extra[extra.index("-PlaybackMaxThreads") + 1]
+                    self.assertEqual(job.count(f" -Threads {cap} "), 1, "the cap is passed exactly once")
+                    self.assertIn(f" -Threads {cap} -UsePersistedPlaybackSettings ", smoke[0])
+                if "-Unpaced" in extra:
+                    self.assertEqual(smoke[0].count(" -DropFrameMode off "), 1)
+                if "-Scope" in extra:
+                    self.assertEqual(smoke[0].count(" -Scope histogram "), 1)
+                    self.assertNotIn(" -Scope none ", smoke[0])
+                # caller data is never edited: every spelling of the root survives, and no edit lands in it
+                self.assertEqual(job.count(ANCHOR_COLLISION_ROOTS[root]), plain.count(ANCHOR_COLLISION_ROOTS[root]))
+                spelled = ANCHOR_COLLISION_ROOTS[root]
+                for anchor, edit in ((" -UsePersistedPlaybackSettings ", " -DropFrameMode off -UsePersistedPlaybackSettings "),
+                                     (" -UsePersistedPlaybackSettings ", f" -Threads {cap} -UsePersistedPlaybackSettings "), (" -Scope none ", " -Scope histogram ")):
+                    if anchor in spelled:
+                        self.assertNotIn(spelled.replace(anchor, edit), job, f"an edit landed inside the -AgentRoot text ({edit.strip()})")
+
+    def test_ordinary_roots_still_get_the_same_single_edit(self) -> None:
+        for key, extra in self.CONTROLS.items():
+            with self.subTest(job=key):
+                job = self.job(key)
+                smoke = self.smoke_lines(job)
+                self.assertEqual(len(smoke), 1)
+                if "-PlaybackMaxThreads" in extra:
+                    cap = extra[extra.index("-PlaybackMaxThreads") + 1]
+                    self.assertEqual(job.count(f" -Threads {cap} "), 1)
+                    self.assertIn(f" -Threads {cap} -UsePersistedPlaybackSettings ", smoke[0])
+                if "-Unpaced" in extra:
+                    self.assertEqual(job.count(" -DropFrameMode off "), 1)
+                if "-Scope" in extra:
+                    self.assertEqual(job.count(" -Scope histogram "), 1)
+
+    def test_the_colliding_root_job_is_the_ordinary_root_job_with_the_root_swapped(self) -> None:
+        # the same leg on a colliding root differs from the ordinary-root job only by the root text itself
+        for key, ordinary in (("all-persisted", "all-ordinary"), ("all-scope", "all-ordinary")):
+            root = ANCHOR_COLLISION_ROOTS[self.CASES[key][0]]
+            with self.subTest(job=key):
+                self.assertEqual(self.job(key).replace(root, ANCHOR_ORDINARY_ROOT), self.job(ordinary))
+
+
 @requires_windows_pwsh
 class PlaybackWorkerThreadsEvidenceTests(unittest.TestCase):
     """Get-DvWorkerThreadsEvidence, pure: a capped leg counts only when the measured session's worker_threads= and the job's proof fields all say n."""
