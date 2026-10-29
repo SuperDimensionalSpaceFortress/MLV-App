@@ -3455,11 +3455,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 s, t, log, snap = psq(spec2), psq(target), psq(self.run_dir / "batch.log"), self.case / "r7-b1.snap"
                 move = "" if how == "denied" else f"[IO.File]::Move('{s}', '{t}'); "
                 inject = (f"{move}[IO.File]::Delete('{log}'); New-Item -ItemType HardLink -Path '{log}' -Value '{t}' | Out-Null; Copy-Item -LiteralPath '{t}' -Destination '{psq(snap)}'"
-                          + ("; $script:rpf06DenySpec = $true" if how == "denied" else ""))
+                          + ("; $env:MLV_TEST_RPF06_DENY_SPEC = '1'" if how == "denied" else ""))
                 args, e, patch = self._two_batch_plan(inject)
                 patches = [patch]
                 if how == "denied":
-                    patches.append((self._RPF06_RESOLVE, f"if ($script:rpf06DenySpec -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE))
+                    # r12 (#705 merge): the claim guard runs on Invoke-InputGuard's worker runspace, which gets the patched function but not this run's script variables, so the
+                    # injected denial is a process-wide flag (as a real denied lookup reaches every thread)
+                    patches.append((self._RPF06_RESOLVE, f"if ($env:MLV_TEST_RPF06_DENY_SPEC -and $Path -ieq '{s}') {{ throw [UnauthorizedAccessException]::new('injected: access to the input path is denied') }}; " + self._RPF06_RESOLVE))
                 args[args.index("-File") + 1] = str(self._patched_runner(*patches[0], *patches[1:]))
                 r = subprocess.run(args, capture_output=True, text=True, timeout=240, env=e)
                 self.assertTrue(snap.exists(), "batch.log was relinked to the input (the case under test)\n" + r.stdout + r.stderr)
