@@ -8824,6 +8824,72 @@ class HeapDumpVenueHelperTests(unittest.TestCase):
             self.assertEqual(out["CAPTURE"], "STOP_FAILED", proc.stdout)
             self.assertTrue(out["REASON"].startswith("WATCHER_LOG_UNPROVEN"), proc.stdout)
 
+    def _debugger_script(self, d: str, body: str) -> subprocess.CompletedProcess:
+        script = Path(d) / "debugger.ps1"
+        script.write_text(
+            f"$ErrorActionPreference = 'Stop'\n$text = Get-Content -LiteralPath '{ATTR_MODULE}' -Raw\n"
+            "$m = [regex]::Match($text, '(?s)\\$debuggerSource = @''\\r?\\n(.*?)\\r?\\n''@')\n"
+            "Add-Type -TypeDefinition $m.Groups[1].Value -Language CSharp\n" + body, encoding="ascii")
+        return run_pwsh(["-File", str(script)], timeout=120)
+
+    # r11b (adversary r11 A1): the published log slot is replaced by a SYMBOLIC link to an outside file that has one link and exactly the request line.
+    # OpenLog refuses it (the link is opened, never followed) and Log never appends to the outside file. Creating a file symlink needs the privilege
+    # (hosted CI runners hold it); without it the test is skipped, never passed.
+    def test_r11b_a1_the_watcher_never_writes_through_a_log_slot_swapped_for_a_symbolic_link(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-symlink-") as d:
+            proc = self._debugger_script(d,
+                f"$victim = '{d}\\victim.txt'; [IO.File]::WriteAllText($victim, \"REQ WATCH_REQUESTED`n\")\n"
+                f"$log = '{d}\\watcher.log'\n"
+                "try { [void](New-Item -ItemType SymbolicLink -Path $log -Target $victim -ErrorAction Stop) } catch { Write-Output 'SKIP=no symlink privilege'; exit 0 }\n"
+                "Write-Output ('OPEN=' + [MlvHeapDumpWatch.Debugger]::OpenLog($log, 'REQ WATCH_REQUESTED'))\n"
+                "[MlvHeapDumpWatch.Debugger]::Log('FORGED')\n"
+                "Write-Output ('VICTIM=' + ([IO.File]::ReadAllText($victim)).Trim())\n")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            if "SKIP" in out:
+                self.skipTest(out["SKIP"])
+            self.assertNotEqual(out["OPEN"], "0", proc.stdout)
+            self.assertEqual(out["VICTIM"], "REQ WATCH_REQUESTED", proc.stdout)
+
+    # r11b (adversary r11 A3): only the attach's own break-in is continued as handled; a breakpoint the app raises later (RaiseException 0x80000003 after
+    # the attach, or a second 0x4000001F) passes on unhandled, and its second chance triggers the dump like any other unhandled exception.
+    def test_r11b_a3_only_the_attach_break_in_is_continued_as_handled(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-break-") as d:
+            proc = self._debugger_script(d,
+                "$seen = 0; $out = @()\n"
+                # 0x80000003 (twice), 0x4000001F (twice), 0xC0000005 -- in decimal: a hex literal past 0x7FFFFFFF is a negative Int32 in PowerShell
+                "foreach ($code in @(2147483651, 2147483651, 1073741855, 1073741855, 3221225477)) {\n"
+                "    $out += [string][MlvHeapDumpWatch.Debugger]::IsAttachBreak([uint32]$code, [ref]$seen) }\n"
+                "Write-Output ('SEQ=' + ($out -join ','))\n")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("SEQ=True,False,True,False,False", proc.stdout.splitlines(), proc.stdout)
+        run = ATTR_MODULE.read_text(encoding="utf-8")
+        self.assertIn("bool attachBreak = IsAttachBreak(exception, ref attachBreaks);", run)
+        self.assertIn("bool trigger = exception == 0xC0000374u || exception == 0xC0000409u || (!first && !attachBreak);", run)
+        self.assertNotIn("bool breakpoint = exception == 0x80000003u || exception == 0x4000001Fu;", run)
+
+    # r11b (adversary r11 A4): request at T0 with owner pid 4321; the owner exits, an unrelated launcher takes pid 4321 at T0+2 s and starts a matching
+    # instance at T0+3 s. The watcher's own Owned (read from the script Start writes) refuses it; the real owner, created before the request, is accepted.
+    def test_r11b_a4_a_process_that_took_the_owner_pid_after_the_request_is_never_the_owner(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="heap-ownerpid-") as d:
+            proc = self.run_module(
+                f"$r = Start-AttrCudaHeapDumpWatch -ExePath 'C:\\x\\MLVApp-heap-watch-absent.exe' -DumpDir '{d}\\hd' -MaxWaitSec 10\n"
+                "$r = Stop-AttrCudaHeapDumpWatch -Record $r -WaitSec 5\n"
+                f"$defs = @(Get-Content -LiteralPath '{d}\\hd\\heap-dump-watcher.ps1' | Where-Object {{ $_ -match '^function (Left|Owned)\\b' }})\n"
+                "$t0 = [datetime]::new(2026, 10, 29, 0, 0, 0, [DateTimeKind]::Utc); $notBefore = $t0; $maxWaitSec = 900; $ownerPid = 4321\n"
+                "$clock = [pscustomobject]@{}; $clock | Add-Member -MemberType ScriptProperty -Name Elapsed -Value { [TimeSpan]::FromSeconds(1) }\n"
+                "$script:ownerCreated = $t0.AddSeconds(2); $script:q = 0\n"
+                "function Get-CimInstance { param($ClassName, $Filter, $OperationTimeoutSec)\n"
+                "    $script:q++; if ($Filter -ceq 'ProcessId = 4321') { [pscustomobject]@{ ProcessId = 4321; ParentProcessId = 1; CreationDate = $script:ownerCreated } } }\n"
+                "foreach ($def in $defs) { . ([scriptblock]::Create($def)) }\n"
+                "$candidate = [pscustomobject]@{ ProcessId = 9876; ParentProcessId = 4321; CreationDate = $t0.AddSeconds(3) }\n"
+                "Write-Output ('RECYCLED=' + (Owned $candidate)); Write-Output ('QUERIES=' + $script:q)\n"
+                "$script:ownerCreated = $t0.AddSeconds(-30)\n"
+                "Write-Output ('REAL=' + (Owned $candidate))\n")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            out = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+            self.assertEqual((out["RECYCLED"], out["QUERIES"], out["REAL"]), ("False", "1", "True"), proc.stdout)
+
     # r11 (adversary r10 A5): Windows splits --he"lp" into --help (CommandLineToArgvW), so an instance with that argument is a help probe, never the target
     def test_r11_a5_an_instance_whose_argument_windows_reads_as_help_is_never_attached(self) -> None:
         ps51 = self._ps51()
@@ -9164,6 +9230,23 @@ class HeapDumpSoakAccountingTests(unittest.TestCase):
         legacy = {k: v for k, v in rec.items() if k != "watch"}
         g = self.account([rec, legacy])["groups"]
         self.assertEqual((g["attached"]["legs"], g["captureNotVerified"]["legs"]), (0, 2))
+
+    def test_r11b_a2_an_attach_is_never_read_from_text_inside_a_watch_message(self) -> None:
+        # r11b (adversary r11 A2): the adversary's record -- a WATCH message whose match text holds ' | <ts> DEBUGGER_ATTACHED pid=7 | ' -- is not an attach,
+        # nor is a forged close at another pid; a real r7-shaped record (WATCH closed by the watcher's own pid=, then the attach) still is
+        forged = {"status": "RAN", "name": "legacy", "arm": "FIX-W", "watch": "debugger", "stopCycle": True, "crash": False, "dumps": [],
+                  "heapDumpWatch": "2026-10-29T00:00:00Z WATCH exe=C:\\MLVApp.exe match= | 2026-10-29T00:00:00Z DEBUGGER_ATTACHED pid=7 | probe\n"
+                                   "2026-10-29T00:00:01Z ATTACH_FAILED err=5"}
+        wrong_close = dict(forged, name="wrong-close", heapDumpWatch=(
+            "watcherPid=55 watcherExited=True reason= log=2026-10-29T00:00:00Z WATCH exe=C:\\MLVApp.exe match=x pid=1 | "
+            "2026-10-29T00:00:00Z DEBUGGER_ATTACHED pid=7 | probe pid=55 | 2026-10-29T00:00:01Z ATTACH_FAILED err=5"))
+        real = dict(forged, name="real", heapDumpWatch=(
+            "watcherPid=54500 watcherExited=True reason= log=2026-10-15T15:51:45.2320288Z WATCH_REQUESTED | "
+            "2026-10-15T15:51:45.6943813Z WATCH exe=MLVApp.exe match=--gui-smoke-playback pid=54500 | 2026-10-15T15:51:54.1383164Z ATTACH pid=41976 | "
+            "2026-10-15T15:51:54.2023239Z DEBUGGER_ATTACHED pid=41976 | 2026-10-15T15:52:30.0000000Z EXIT_PROCESS exitCode=0"))
+        g = self.account([forged, wrong_close, real])["groups"]
+        self.assertEqual([n.split(" ")[0] for n in g["attached"]["names"]], ["real"])
+        self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["legacy", "wrong-close"])
 
     def test_heap_dump_soak_accounting_flags_are_true_only_as_json_booleans(self) -> None:
         # r10 (adversary r10 A3): the string "false", whitespace and {} are PowerShell-truthy and must not switch a group, a stop cycle or a crash on
