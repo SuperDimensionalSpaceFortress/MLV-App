@@ -658,7 +658,14 @@ if ($artifactsShare -and (Test-Path -LiteralPath $artifactsShare -PathType Conta
             if ($_.Name -like '*.dmp') {
                 $hashClock = [Diagnostics.Stopwatch]::StartNew()
                 $dumpSha = Get-DvSha256OfFile $heapDumpLocal
-                $heapDumpCopies += [ordered]@{ name = $_.Name; bytes = (Get-Item -LiteralPath $heapDumpLocal).Length; sha256 = $dumpSha; copyMs = $copyMs; hashMs = $hashClock.ElapsedMilliseconds }
+                $hashMs = $hashClock.ElapsedMilliseconds
+                # r8 (CoS Iverson #432 item 3): minidump is true only for a copy whose first four bytes are the MINIDUMP_HEADER signature 'MDMP'; an empty,
+                # short or foreign file is kept here but is no capture
+                $dumpHead = [byte[]]::new(4); $dumpHeadRead = 0
+                $dumpStream = [IO.File]::OpenRead($heapDumpLocal)
+                try { while ($dumpHeadRead -lt 4) { $dumpHeadN = $dumpStream.Read($dumpHead, $dumpHeadRead, 4 - $dumpHeadRead); if ($dumpHeadN -le 0) { break }; $dumpHeadRead += $dumpHeadN } } finally { $dumpStream.Dispose() }
+                $heapDumpCopies += [ordered]@{ name = $_.Name; bytes = (Get-Item -LiteralPath $heapDumpLocal).Length; sha256 = $dumpSha; copyMs = $copyMs; hashMs = $hashMs
+                    minidump = ($dumpHeadRead -eq 4 -and [Text.Encoding]::ASCII.GetString($dumpHead) -ceq 'MDMP') }
             }
         }
     }
@@ -951,6 +958,7 @@ if ($heapDumpRequested) {
         $captureReason = $(if ($heapRecord.PSObject.Properties['reason']) { [string]$heapRecord.reason } else { '' })
         if ($captureState -ceq 'STOP_FAILED' -and -not $heapRecord.PSObject.Properties['captureState']) { $captureReason = 'HEAP_DUMP_RECORD_UNTYPED the record carries no captureState' }
         if ($captureState -ceq 'DUMPED' -and $heapDumpCopies.Count -eq 0) { $captureState = 'STOP_FAILED'; $captureReason = 'DUMP_NOT_RETURNED the record says DUMPED but no *.dmp came back to the evidence' }
+        elseif ($captureState -ceq 'DUMPED' -and @($heapDumpCopies | Where-Object { $_['minidump'] }).Count -eq 0) { $captureState = 'STOP_FAILED'; $captureReason = 'DUMP_NOT_A_MINIDUMP the record says DUMPED but no returned *.dmp is a non-empty minidump (MDMP signature)' }
     }
     $receipt.heapDump = [ordered]@{ requested = $true; captureState = $captureState; captureVerified = ($captureState -cin @('ATTACHED_NO_CRASH', 'DUMPED')); reason = $captureReason
         watcherExited = $(if ($null -ne $heapRecord -and $heapRecord.PSObject.Properties['watcherExited']) { $heapRecord.watcherExited } else { $null }); dumps = @($heapDumpCopies) }

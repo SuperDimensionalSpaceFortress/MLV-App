@@ -8380,6 +8380,7 @@ class HeapDumpGeneratorTests(unittest.TestCase):
     setUpClass = classmethod(GeneratorByteIdentityAndVariantTests.setUpClass.__func__)
     tearDownClass = classmethod(GeneratorByteIdentityAndVariantTests.tearDownClass.__func__)
     generate = GeneratorByteIdentityAndVariantTests.generate
+    generator_command = classmethod(GeneratorByteIdentityAndVariantTests.generator_command.__func__)
     parse_errors = GeneratorByteIdentityAndVariantTests.parse_errors
 
     def test_the_heap_dump_job_is_the_default_job_plus_two_bracketed_regions(self) -> None:
@@ -8568,9 +8569,10 @@ class HeapDumpRunnerReceiptTests(RunnerHarness, unittest.TestCase):
 
     def setUp(self) -> None:
         self.make_harness()
-        param_tail = "$DisplayMode,[switch]$VisualCapture)"
-        self.assertIn(param_tail, STUB_GENERATOR, "STUB_GENERATOR param list changed; update this replace target")
-        self.gen.write_text(STUB_GENERATOR.replace(param_tail, "$DisplayMode,[switch]$VisualCapture,[switch]$HeapCorruptionDump)", 1), encoding="utf-8")
+        # r8: anchored on the END of the stub's param list (its ")" before the first "$cfg =" line), so a parameter master appends cannot move the target
+        param_end = ")\n$cfg = Get-Content"
+        self.assertEqual(STUB_GENERATOR.count(param_end), 1, "STUB_GENERATOR param list changed; update this replace target")
+        self.gen.write_text(STUB_GENERATOR.replace(param_end, ",[switch]$HeapCorruptionDump" + param_end, 1), encoding="utf-8")
         spec = json.loads(self.write_spec().read_text(encoding="utf-8"))
         spec["generatorArgs"] = {"heapCorruptionDump": True}
         self.spec = self.tmp / "spec-heap-dump.json"
@@ -8626,6 +8628,19 @@ class HeapDumpRunnerReceiptTests(RunnerHarness, unittest.TestCase):
         self.assertIsInstance(d["copyMs"], int)
         self.assertIsInstance(d["hashMs"], int)
 
+    def test_heap_dump_receipt_never_calls_an_empty_or_non_minidump_file_dumped(self) -> None:
+        # r8 (CoS Iverson #432 item 3): DUMPED needs a returned *.dmp that is non-empty and starts with the minidump signature MDMP; a zero-byte file or
+        # one that is not a minidump is kept in the receipt, but the capture is STOP_FAILED and the leg HEAPDUMP_CAPTURE_FAILED, never a PASS
+        for name, dump in (("empty", b""), ("not-a-minidump", b"PK\x03\x04" + b"\x00" * 64), ("short", b"MD")):
+            with self.subTest(dump=name):
+                self.publish(self.record("DUMPED", dumps=[{"name": "MLVApp_1_20261015T000000.dmp", "bytes": len(dump)}]), dump=dump)
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.spec)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((receipt["outcome"], receipt["heapDump"]["captureState"]), ("HEAPDUMP_CAPTURE_FAILED", "STOP_FAILED"), receipt["outcomeDetail"])
+                self.assertIn("DUMP_NOT_A_MINIDUMP", receipt["heapDump"]["reason"])
+                [d] = receipt["heapDump"]["dumps"]
+                self.assertEqual((d["bytes"], d["minidump"]), (len(dump), False))
+
     def test_heap_dump_receipt_is_null_on_a_leg_that_did_not_ask(self) -> None:
         self.publish(None)
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
@@ -8665,6 +8680,31 @@ class HeapDumpSoakAccountingTests(unittest.TestCase):
         self.assertEqual(g["pageheap"]["legs"], 1)
         self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["N-1", "N-2"])
         self.assertEqual(sum(g[k]["legs"] for k in g), 8, "every RAN leg is in exactly one group; the NO_CHAIN_RESULT leg is in none")
+
+    def test_heap_dump_soak_accounting_never_counts_a_debugger_leg_without_capture_evidence_as_unattached(self) -> None:
+        # r8 (CoS Iverson #432 item 2): a record that names a debugger watch (any watch but 'none', or heapCorruptionDump true) but carries neither a
+        # captureState nor an r6b watcher log is capture not verified; only a record with no watch evidence at all (r2 / r3) is unattached
+        leg = {"status": "RAN", "stopCycle": True, "dumps": [], "crash": False, "arm": "FIX-W"}
+        records = [dict(leg, name="D-1", watch="debugger"), dict(leg, name="D-2", heapCorruptionDump=True),
+                   dict(leg, name="D-3", watch="debugger", pageHeap=True), dict(leg, name="U-1")]
+        g = self.account(records)["groups"]
+        self.assertEqual(sorted(n.split(" ")[0] for n in g["captureNotVerified"]["names"]), ["D-1", "D-2", "D-3"])
+        self.assertEqual([n.split(" ")[0] for n in g["unattached"]["names"]], ["U-1"])
+        self.assertEqual(g["pageheap"]["legs"], 0)
+
+    def test_heap_dump_soak_accounting_binomial_is_exact_at_rate_zero_and_one(self) -> None:
+        # r8 (CoS Iverson #432 item 4): at an unattached rate of 1 every stop cycle crashes, so P(X <= n) = 1 and P(X <= k < n) = 0 (the old loop
+        # evaluated 0^n and broke, returning 0 for both); at rate 0, P(X <= k) = 1 for every k >= 0
+        leg = {"status": "RAN", "stopCycle": True, "dumps": []}
+        unattached_all_crash = [dict(leg, name=f"U-{i}", arm="CTL-U", watch="none", crash=True) for i in range(2)]
+        attached = lambda crashes: [dict(leg, name=f"A-{i}", arm="CTL-W", watch="debugger", captureState="ATTACHED_NO_CRASH", crash=i < crashes) for i in range(3)]
+        for crashes, want in ((3, 1.0), (2, 0.0), (0, 0.0)):
+            with self.subTest(rate=1, crashes=crashes):
+                [c] = self.account([*unattached_all_crash, *attached(crashes)])["comparisons"]
+                self.assertEqual((c["unattachedRate"], c["pAtMostThisManyAtUnattachedRate"]), (1.0, want))
+        with self.subTest(rate=0):
+            [c] = self.account([dict(leg, name="U-0", arm="CTL-U", watch="none", crash=False), *attached(0)])["comparisons"]
+            self.assertEqual((c["unattachedRate"], c["pAtMostThisManyAtUnattachedRate"]), (0.0, 1.0))
 
 
 @requires_windows_pwsh

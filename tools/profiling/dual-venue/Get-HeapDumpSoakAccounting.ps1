@@ -7,7 +7,8 @@
 #   unattached          no debugger watch: an r7 record with watch 'none', or an older record that carries no watch at all (r2 / r3);
 #   pageheap            a full-page-heap leg (pageHeap true) whose capture is verified or that ran without the debugger by design;
 #   captureNotVerified  the watch was asked for and is not verified ('capture not verified': NO_TARGET, KILLED, STOP_FAILED, or an r6b log
-#                       with no DEBUGGER_ATTACHED line -- e.g. the procdump-shim legs, whose ATTACH line names a target that was never attached).
+#                       with no DEBUGGER_ATTACHED line -- e.g. the procdump-shim legs, whose ATTACH line names a target that was never attached --
+#                       or, r8, a record that names a debugger watch (watch other than 'none', or heapCorruptionDump true) with neither).
 # Only legs with status RAN are counted; the rest are listed as notRun. A debugger attached to the app changes what it sees: CrashForensics'
 # SetUnhandledExceptionFilter minidump never runs under a debugger, and a heap fail-fast is a debugger-visible first-chance exception, so an
 # attached rate is never compared as if it were the unattached one. The binomial line says how likely the attached count is AT the
@@ -32,17 +33,21 @@ function Get-SoakCaptureClass($r) {
     if ($null -ne $p['heapDumpWatch']) {
         return $(if ([string]$r.heapDumpWatch -match 'DEBUGGER_ATTACHED pid=\d+') { 'attached' } else { 'captureNotVerified' })
     }
+    # r8 (CoS Iverson #432 item 2): a record that names a debugger watch but carries no capture evidence is not verified, never unattached
+    if (($null -ne $p['watch']) -or (($null -ne $p['heapCorruptionDump']) -and [bool]$r.heapCorruptionDump)) { return 'captureNotVerified' }
     return $(if ($pageHeap) { 'pageheap' } else { 'unattached' })
 }
 
 function Get-BinomialCdf([int]$n, [int]$k, [double]$p) {
     # P(X <= k) for X ~ Binomial(n, p)
-    if ($n -le 0) { return 1.0 }
+    if ($k -lt 0) { return 0.0 }
+    if ($n -le 0 -or $k -ge $n -or $p -le 0.0) { return 1.0 }
+    # r8 (CoS Iverson #432 item 4): at p = 1 every trial succeeds, so P(X <= k < n) = 0 (the loop's (1-p)^n start is 0 there and its ratio divides by 0)
+    if ($p -ge 1.0) { return 0.0 }
     $sum = 0.0
     $term = [math]::Pow(1.0 - $p, $n)
-    for ($i = 0; $i -le $k -and $i -le $n; $i++) {
+    for ($i = 0; $i -le $k; $i++) {
         $sum += $term
-        if ($p -ge 1.0) { break }
         $term = $term * (($n - $i) / ($i + 1.0)) * ($p / (1.0 - $p))
     }
     [math]::Min(1.0, $sum)
