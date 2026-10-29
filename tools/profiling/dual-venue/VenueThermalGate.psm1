@@ -131,6 +131,18 @@ function Get-VenueThermalNowUtc {
     try { $FirstHotUtc.AddSeconds([Math]::Max(0.0, ($NowTimestamp - $FirstHotTimestamp) / [double][Diagnostics.Stopwatch]::Frequency)) } catch { [DateTime]::SpecifyKind([DateTime]::MaxValue, $FirstHotUtc.Kind) }
 }
 
+function Get-VenueThermalElapsedSec {
+    # r4 (adversary r4 A3): whole seconds on the monotonic Stopwatch clock since -FirstHotTimestamp. The deadline admission reads it with -Ceiling, so a floored 181.5 s never
+    # reads as 181 and the one second of grace in Get-VenueThermalProbeBudget stays one second (the soft budget is cap + one probe + 1 s, not + almost 2 s).
+    param(
+        [Parameter(Mandatory)][long]$FirstHotTimestamp,
+        [long]$NowTimestamp = [Diagnostics.Stopwatch]::GetTimestamp(),
+        [switch]$Ceiling
+    )
+    $d = [Math]::Max(0.0, ($NowTimestamp - $FirstHotTimestamp) / [double][Diagnostics.Stopwatch]::Frequency)
+    [int][Math]::Min([double][int]::MaxValue, $(if ($Ceiling) { [Math]::Ceiling($d) } else { [Math]::Floor($d) }))
+}
+
 function Get-VenueLegKeyFromName {
     # A runner leg name -> legId|backend. Names are NN-<legId>-<backend> (scalar) or NN-<legId>-<backend>-<arm> (-LegPlan), Invoke-VenueLeaseBatch.ps1.
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Name, [AllowEmptyString()][string]$Backend = '', [AllowEmptyString()][string]$Arm = '')
@@ -263,5 +275,5 @@ function Get-VenueThermalSpreadOrder {
     [pscustomobject]@{ items = @($out | ForEach-Object { , $Items[$_] }); heavy = $newHeavy; heavyAdjacent = (Measure-VenueHeavyAdjacency -Heavy $newHeavy); heavyAdjacentBefore = (Measure-VenueHeavyAdjacency -Heavy $Heavy) }
 }
 
-Export-ModuleMember -Function Get-VenueHeatVerdict, ConvertFrom-VenueProbeHeatLine, Get-VenueThermalGateStep, Get-VenueThermalProbeBudget, Get-VenueThermalNowUtc, Get-VenueLegKeyFromName, Get-VenueHeavyLegKeys, Read-VenueLegHeatHistory,
+Export-ModuleMember -Function Get-VenueHeatVerdict, ConvertFrom-VenueProbeHeatLine, Get-VenueThermalGateStep, Get-VenueThermalProbeBudget, Get-VenueThermalNowUtc, Get-VenueThermalElapsedSec, Get-VenueLegKeyFromName, Get-VenueHeavyLegKeys, Read-VenueLegHeatHistory,
     Measure-VenueHeavyAdjacency, Get-VenueThermalSpreadOrder

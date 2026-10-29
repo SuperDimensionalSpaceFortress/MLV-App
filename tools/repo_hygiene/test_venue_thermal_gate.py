@@ -530,14 +530,42 @@ class ThermalGateRunnerTests(unittest.TestCase):
         [b] = self.batches()
         return r, b
 
-    def _assert_typed_skip_without_another_probe(self, r: subprocess.CompletedProcess, b: dict, quiet_before: int = 1) -> None:
+    def _assert_typed_skip_without_another_probe(self, r: subprocess.CompletedProcess, b: dict, quiet_before: int = 1, marker: bool = True) -> None:
         self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
         self.assertEqual([x for x in self.kinds() if x.startswith("LEG:")], [], "a leg whose wait expired is never launched")
         [row] = b["legs"]
         self.assertEqual((row["status"], row["outcome"], row["counted"]), ("THERMAL_HOT_SKIPPED", "NOT_RUN", False), row)
         self.assertGreater(row["thermalWaitSec"], 4, "the injected stall really carried the wait past the cap (else this test proves nothing)")
         self.assertEqual(len([x for x in self.kinds() if x.startswith("QUIET")]), quiet_before, f"runner delay must never buy another probe: {self.kinds()}")
-        self.assertIn("expiredBeforeProbe=1", self.log())
+        if marker:
+            self.assertIn("expiredBeforeProbe=1", self.log())
+
+    def test_adversary_r4_a2_a_stalled_quiet_log_after_the_first_hot_reading_counts_against_the_cap(self) -> None:
+        # the first hot reading is when its probe RETURNED, not when the runner got around to stamping it after the QUIET log line: a 6 s stall there (cap 4) used to be
+        # left out of the wait (waitSec 0), so another sleep and another probe were allowed; now the cap is already spent and the leg is skipped with that one probe
+        r, b = self._expired_wait_run(('L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease', 'Start-Sleep -Seconds 6; L "QUIET leg=$($leg.name) batch=$batchNo phase=in-lease'), FAKE_HEAT="9")
+        self._assert_typed_skip_without_another_probe(r, b, marker=False)
+
+    def test_adversary_r4_a1_a_leg_retry_after_a_cleared_wait_is_not_part_of_the_expired_wait(self) -> None:
+        # hot, then clear after a 1 s wait: the leg launches, which ends the thermal wait. It returns VENUE_NOT_QUIESCENT and the retry log stalls past the old deadline; the
+        # retry's probe used to inherit the finished wait (firstHotUtc kept) and dispatch with no admission and a quiet wait clamped to 0 (maxWaitSec=0)
+        self._mirror_with_bad_sidecar(runner_patches=(('L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT', 'Start-Sleep -Seconds 6; L "RETRY_IN_LEASE leg=$($leg.name) batch=$batchNo reason=LEG_NOT_QUIESCENT'),))
+        r = self.run_batch([self.specs[0]], "-ThermalWaitCapSec", "4", "-ThermalPollSec", "1", "-ThermalRequeueMax", "0", FAKE_HEAT="9,0", FAKE_LEG_OUTCOMES="VENUE_NOT_QUIESCENT,PASS")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        quiet = [l for l in self.log().splitlines() if " QUIET leg=" in l]
+        self.assertEqual(len(quiet), 3, quiet)
+        self.assertNotIn("maxWaitSec=0 ", quiet[2], "the retry probe still belongs to the finished thermal wait: " + quiet[2])
+        self.assertEqual([x.split(":")[0] for x in self.kinds() if x.startswith("LEG")], ["LEG", "LEG"], self.kinds())
+
+    def test_adversary_r4_a3_the_dispatch_check_reads_the_ceiling_of_the_elapsed_time_so_the_grace_is_at_most_one_second(self) -> None:
+        got = ps_json(
+            "$f = [Diagnostics.Stopwatch]::Frequency; "
+            "$d = { param($secs) $e = Get-VenueThermalElapsedSec -FirstHotTimestamp 0 -NowTimestamp ([long]($secs * $f)) -Ceiling; "
+            "\"$e|$((Get-VenueThermalProbeBudget -CapSec 180 -ElapsedSec $e -SlowestReprobeSec 0 -WantSleepSec 30).mayDispatchNow)\" }; "
+            # 181.5 s actual: the floor (181) plus a grace of 1 admitted it, almost 2 s after the deadline; the ceiling (182) does not
+            "$out = @((& $d 181.5), (& $d 181.0), (& $d 180.2), (& $d 181.01), (& $d 0)); "
+            "$out + (Get-VenueThermalElapsedSec -FirstHotTimestamp 0 -NowTimestamp ([long](181.5 * $f))) + (Get-VenueThermalElapsedSec -FirstHotTimestamp 100 -NowTimestamp 0)")
+        self.assertEqual(got, ["182|False", "181|True", "181|True", "182|False", "0|True", 181, 0], got)
 
     def test_adversary_r3p2_a1_dot_a_log_append_that_stalls_past_the_deadline_starts_no_further_probe(self) -> None:
         r, b = self._expired_wait_run((self.LOG_THERMAL_WAIT, "Start-Sleep -Seconds 6; " + self.LOG_THERMAL_WAIT), FAKE_HEAT="9")
