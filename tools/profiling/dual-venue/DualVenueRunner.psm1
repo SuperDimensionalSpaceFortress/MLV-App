@@ -1327,6 +1327,38 @@ function Get-DvWorkerThreadsEvidence {
     [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
 }
 
+function Get-DvPrepConflatedMoveEvidence {
+    <#
+    .SYNOPSIS
+    PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: did a leg that asks for the #397 prep-conflated-move switch (generatorArgs.prepConflatedMove = true, which sets
+    MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1) run with the switch active? Read from the app's own `playback_smoke.start` line for the MEASURED session
+    (Get-DvSmokeSessionLineFields), field prep_conflated_move_active (the app's decision, 0 or 1), never from the spec, the launcher's env block or the job's
+    summary: a switch value in a receipt is a request, not engagement. FAIL CLOSED: `blocks` is true when the leg asked and the line is absent, carries no
+    prep_conflated_move_active, or says anything but 1. A binary that emits no such field (#397 5fb4b801 emits none) therefore never counts; its reason
+    says ROUTE_NOT_ENGAGED. A leg that does not ask for it never blocks. Pure and shared: the runner gates on it and Test-DvReceiptValid re-derives it from
+    the hashed run log.
+    #>
+    param([Parameter(Mandatory)]$Spec, [AllowNull()][AllowEmptyString()][string]$LogText)
+    $raw = Get-DvProp (Get-DvProp $Spec 'generatorArgs') 'prepConflatedMove'
+    $requested = ($raw -is [bool]) -and $raw
+    $observed = $null
+    $verdict = 'NOT_REQUESTED'
+    $reason = $null
+    if ($requested) {
+        $verdict = 'NOT_HONOURED'
+        $f = Get-DvSmokeSessionLineFields -LogText $LogText -Marker 'start'
+        if ($f.Count -eq 0) { $reason = 'the switch state is unreadable: the run log has no playback_smoke.start line for the measured session' }
+        elseif (-not $f.ContainsKey('prep_conflated_move_active')) { $reason = 'ROUTE_NOT_ENGAGED: the measured session''s playback_smoke.start line has no prep_conflated_move_active= field, so the binary does not report which prep queue ran' }
+        else {
+            $observed = ConvertTo-DvInt64 $f['prep_conflated_move_active']
+            if ($null -eq $observed) { $reason = "the switch state is unreadable: prep_conflated_move_active='$($f['prep_conflated_move_active'])' is not an integer" }
+            elseif ($observed -ne 1) { $reason = "ROUTE_NOT_ENGAGED: the measured session's playback_smoke.start says prep_conflated_move_active=$observed, not the 1 the leg names" }
+            else { $verdict = 'HONOURED' }
+        }
+    }
+    [ordered]@{ requested = $requested; observed = $observed; verdict = $verdict; reason = $reason; blocks = ($verdict -ceq 'NOT_HONOURED') }
+}
+
 function Get-DvLookAssistEvidence {
     <#
     .SYNOPSIS
@@ -2490,6 +2522,20 @@ function Test-DvReceiptValid {
                 }
             }
             elseif ($null -ne $storedWorkerThreads) { $invalid.Add('WORKER_THREADS_NOT_FROM_EVIDENCE: the receipt carries a workerThreads block but its committed leg spec names no playbackMaxThreads') }
+            # PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: a leg that asks for the prep-conflated-move switch the app did not report active (or whose report is unreadable, or absent
+            # because the binary emits none) is no measurement of that arm; the receipt's own prepConflatedMove block is re-derived like the workerThreads block.
+            $prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $ev.logText
+            if ($prepConflatedMoveVerdict.blocks) { $invalid.Add("PREP_CONFLATED_MOVE_NOT_HONOURED: $($prepConflatedMoveVerdict.reason); a run that did not show the switch active is no measurement of the arm its leg names") }
+            $storedPrepConflatedMove = Get-DvProp $Receipt 'prepConflatedMove'
+            if ($prepConflatedMoveVerdict.requested) {
+                if ($null -eq $storedPrepConflatedMove) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no prepConflatedMove block (requested / observed / verdict) and its committed spec names a prepConflatedMove') }
+                else {
+                    foreach ($f in @('requested', 'observed', 'verdict')) {
+                        if (-not (Test-DvJsonEquivalent (Get-DvProp $storedPrepConflatedMove $f) $prepConflatedMoveVerdict[$f])) { $invalid.Add("PREP_CONFLATED_MOVE_NOT_FROM_EVIDENCE: prepConflatedMove.$f is not what the hashed run log and the committed leg spec derive") }
+                    }
+                }
+            }
+            elseif ($null -ne $storedPrepConflatedMove) { $invalid.Add('PREP_CONFLATED_MOVE_NOT_FROM_EVIDENCE: the receipt carries a prepConflatedMove block but its committed leg spec names no prepConflatedMove') }
         }
 
         # ---- the OUTCOME: re-derived from the job's result, its exit code, the verbatim metrics and the COMMITTED criteria -----------
@@ -3060,6 +3106,6 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvVisualVerdict, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvLookAssistEvidence, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvMatrixRates, Get-DvMatrixRow, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Test-DvCriteria, Get-DvVerbatimMetrics, New-DvReceipt, Write-DvReceipt

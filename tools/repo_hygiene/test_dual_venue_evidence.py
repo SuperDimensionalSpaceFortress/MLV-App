@@ -181,6 +181,11 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *AGXOFF_REMEASURE_LEGS)
 # per-frame playback_smoke.frame rows (telemetryArm HEAVY): the cpu-reduced pace twin at fullscreen s4 with the frame log kept.
 CPU_RECEIPT_HEAVY_LEG = "legs/m16-1243-pace-cinematic-cpu-receipt-fullscreen-s4-heavy.json"
 SHIPPED_LEGS = (*SHIPPED_LEGS, CPU_RECEIPT_HEAVY_LEG)
+# PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B (generatorArgs.prepConflatedMove true -> MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1),
+# one per display-matrix cell the CPU route runs at s2 and s4, keyed to the cell it twins. The OFF arm is the twinned cell itself (env unset).
+PREP_CONFLATED_MOVE_LEGS = {f"legs/m16-1243-display-{mode}-s{scale}-pcm.json": f"legs/m16-1243-display-{mode}-s{scale}.json"
+                            for mode in ("fullscreen", "windowed") for scale in (2, 4)}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *PREP_CONFLATED_MOVE_LEGS)
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
 MLV_EXT = "." + "mlv"  # never spelled as one literal token (the NA-4 gate trips on fixture basenames)
@@ -957,6 +962,28 @@ class GeneratorByteIdentityAndVariantTests(unittest.TestCase):
                         "the mapping must sit outside the forceLookAssist branch")
         schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
         self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["disablePrepPointwiseFast"]["type"], "boolean")
+
+    def test_the_prep_conflated_move_switch_reaches_the_apps_env_only_when_asked(self) -> None:
+        """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: -PrepConflatedMove adds MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1 to the app's env list exactly once;
+        absent, the job is the text it was (the OFF arm sets nothing: the app reads the variable as set-and-not-0). The runner maps
+        generatorArgs.prepConflatedMove true for any leg (outside the forceLookAssist branch); the schema declares it as the constant true."""
+        plain = self.generate(GENERATOR, "pcm-plain.job.ps1", []).read_text(encoding="utf-8").replace("\r\n", "\n")
+        self.assertNotIn("MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE", plain)
+        job = self.generate(GENERATOR, "pcm-on.job.ps1", ["-PrepConflatedMove"])
+        self.assertEqual(self.parse_errors(job), 0)
+        text = job.read_text(encoding="utf-8").replace("\r\n", "\n")
+        line = "    'MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE=1',\n"
+        self.assertEqual(text.count("MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE"), 1)
+        self.assertIn("'MLVAPP_PLAYBACK_PHASE3_UNATTENDED=1',\n" + line, text)
+        self.assertEqual(text.replace(line, ""), plain, "the switch is the only difference from the plain job")
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        mapping = ("if ($spec.generatorArgs.PSObject.Properties['prepConflatedMove'] -and $spec.generatorArgs.prepConflatedMove -is [bool] "
+                   "-and $spec.generatorArgs.prepConflatedMove) { $gen['PrepConflatedMove'] = $true }")
+        self.assertEqual(runner.count(mapping), 1)
+        self.assertLess(runner.index(mapping), runner.index("if (-not $isLook -and $spec.generatorArgs.PSObject.Properties['forceLookAssist']"),
+                        "the mapping must sit outside the forceLookAssist branch")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["generatorArgs"]["properties"]["prepConflatedMove"]["const"], True)
 
     def test_the_runner_passes_a_legs_swap_interval_to_the_generator(self) -> None:
         runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
@@ -6959,8 +6986,9 @@ class LegSpecSchemaTests(unittest.TestCase):
             if spec["card"] == "DUAL-VENUE-DISPLAY-MATRIX-1":   # the display-matrix legs are cinematic look legs named by their cell (display mode and scale)
                 self.assertEqual(spec["legId"], path.stem, path.name)   # (-ptrace: the cell with the present trace on, PTRACE_LEGS;
                 # -identity: the cell with the first-present identity capture on, IDENTITY_LEGS; -missdump: the warm-reuse miss dump on,
-                # MISSDUMP_LEGS)
-                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump)?$", path.name)
+                # MISSDUMP_LEGS; -pcm: the cell with the #397 prep-conflated-move switch on, PREP_CONFLATED_MOVE_LEGS)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump|-pcm)?$", path.name)
+                self.assertEqual(spec["generatorArgs"].get("prepConflatedMove", False), spec["legId"].endswith("-pcm"), path.name)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
@@ -11263,6 +11291,100 @@ class WorkerThreadsReceiptBlockIsReDerivedTests(EvidenceFactory, unittest.TestCa
         self.assertAdvisory(receipt, repo)
         repo, receipt = self.production(None, self.BLOCK)
         self.assertNotValid(receipt, repo, "WORKER_THREADS_NOT_FROM_EVIDENCE", status="INVALID")
+
+
+class PrepConflatedMoveLegSpecTests(unittest.TestCase):
+    """PLAYBACK-PREP-CONFLATED-MOVE-FR1B-AB-1: the ON arm of the #397 prep-conflated-move A/B is a named generatorArgs key; each ON twin differs from the cell it
+    twins only in legId and that key, so no receipted cell changes a byte."""
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def test_the_schema_names_the_key_as_the_constant_true(self) -> None:
+        self.assertEqual(self.schema["properties"]["generatorArgs"]["properties"]["prepConflatedMove"]["const"], True)
+
+    def test_each_on_twin_differs_from_its_cell_only_in_the_leg_id_and_the_key(self) -> None:
+        self.assertEqual(len(PREP_CONFLATED_MOVE_LEGS), 4, "fullscreen and windowed, s2 and s4")
+        for rel, cell_rel in PREP_CONFLATED_MOVE_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(twin, self.schema)
+                self.assertNotIn("prepConflatedMove", cell["generatorArgs"], cell_rel)
+                self.assertEqual(twin["legId"], cell["legId"] + "-pcm")
+                self.assertIs(twin["generatorArgs"].pop("prepConflatedMove"), True)
+                self.assertEqual(dict(twin, legId=cell["legId"]), cell)
+                self.assertEqual(list(twin), list(cell), "the cell's keys in the cell's order")
+                self.assertIn("cpu", twin["backends"], "the A/B runs on the CPU route")
+
+    def test_the_key_must_be_the_constant_true_so_an_off_arm_is_the_absent_key(self) -> None:
+        twin = json.loads((DV / next(iter(PREP_CONFLATED_MOVE_LEGS))).read_text(encoding="utf-8"))
+        for bad in (False, 0, 1, "1", "on", None):
+            with self.subTest(value=repr(bad)):
+                with self.assertRaises(self.jsonschema.ValidationError):
+                    self.jsonschema.validate(dict(twin, generatorArgs=dict(twin["generatorArgs"], prepConflatedMove=bad)), self.schema)
+
+    def test_the_runner_and_the_validator_both_gate_on_the_apps_own_readback(self) -> None:
+        module = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $ev.logText", module)
+        self.assertIn('if ($prepConflatedMoveVerdict.blocks) { $invalid.Add("PREP_CONFLATED_MOVE_NOT_HONOURED:', module)
+        self.assertIn("Get-DvPrepConflatedMoveEvidence", module.split("Export-ModuleMember", 1)[1])
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("$prepConflatedMoveVerdict = Get-DvPrepConflatedMoveEvidence -Spec $spec -LogText $runLogText", runner)
+        self.assertIn("PREP_CONFLATED_MOVE_NOT_HONOURED", runner)
+
+
+@requires_windows_pwsh
+class PrepConflatedMoveEvidenceTests(unittest.TestCase):
+    """Get-DvPrepConflatedMoveEvidence, pure: a leg that asks for the switch counts only when the measured session's own playback_smoke.start line reports
+    prep_conflated_move_active=1. A switch value in the launcher's env block is a request, not engagement (ruling 2026-10-28T15:50:51Z), and the binary under
+    test at the time of this card (#397 5fb4b801) emits no such field, so every ON leg on it is NOT_HONOURED rather than an unproven PASS."""
+
+    ON = {"generatorArgs": {"prepConflatedMove": True}}
+
+    def verdict(self, spec: dict, log: str) -> dict:
+        proc, out = run_pwsh_json("$s = $env:DVE_SPEC | ConvertFrom-Json\n(Get-DvPrepConflatedMoveEvidence -Spec $s -LogText $env:DVE_LOG) | ConvertTo-Json -Compress",
+                                  DVE_SPEC=json.dumps(spec), DVE_LOG=log)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        return out
+
+    @staticmethod
+    def log(*start: str) -> str:
+        return "\n".join(["playback_smoke.measured_session id=3", *start, "playback_smoke.summary session=3 reason=reached presented_frames=600"]) + "\n"
+
+    @staticmethod
+    def start(tail: str, session: int = 3) -> str:
+        return f"playback_smoke.start session={session} position=0 scale_request=2 quality_mode=0 worker_threads=12 start_serial=2 env_force_threads=0 {tail}".rstrip()
+
+    def test_honoured_only_when_the_measured_session_reports_the_switch_active(self) -> None:
+        v = self.verdict(self.ON, self.log(self.start("prep_conflated_move_active=1")))
+        self.assertEqual((v["requested"], v["observed"], v["verdict"], v["blocks"]), (True, 1, "HONOURED", False))
+
+    def test_the_binary_that_emits_no_field_is_not_engaged(self) -> None:
+        v = self.verdict(self.ON, self.log(self.start("")))
+        self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+        self.assertIn("ROUTE_NOT_ENGAGED", v["reason"])
+
+    def test_any_other_report_blocks_never_passes(self) -> None:
+        for name, log in (("switch off", self.log(self.start("prep_conflated_move_active=0"))),
+                          ("not a number", self.log(self.start("prep_conflated_move_active=yes"))),
+                          ("unset text", self.log(self.start("prep_conflated_move_active=unset"))),
+                          ("another session's line", self.log(self.start("prep_conflated_move_active=1", session=2))),
+                          ("no start line", self.log()),
+                          ("no log", "")):
+            with self.subTest(case=name):
+                v = self.verdict(self.ON, log)
+                self.assertEqual((v["verdict"], v["blocks"]), ("NOT_HONOURED", True), v)
+
+    def test_a_leg_that_does_not_ask_never_blocks(self) -> None:
+        for spec in ({}, {"generatorArgs": {"unpaced": True}}):
+            v = self.verdict(spec, self.log(self.start("prep_conflated_move_active=1")))
+            self.assertEqual((v["verdict"], v["blocks"]), ("NOT_REQUESTED", False), spec)
 
 
 if __name__ == "__main__":
